@@ -209,45 +209,46 @@ typedef enum {
 /* ── Embedded RC Header ────────────────────────────────────────────────────
    Every heap allocation prepends: [rc:int32 | tag_magic:int32]
    User pointer points past the header. RC ops are O(1) header dereferences.
-   Tag uses magic prefix 0x4E56xxxx ('NV') to distinguish from unmanaged ptrs. */
+   Tag uses magic prefix 0x4E56xxxx ('NV') to distinguish from unmanaged ptrs.
+   Layout for regular objects: [rc:4][tag:4][object data...]
+   Layout for fat strings:     [hash:8][len:8][rc:4][tag:4][char data...]
+   In both cases, RC macros index from the user pointer at [-2] and [-1]. */
 
 #define NOVA_RC_HDR_SIZE 8
 #define NOVA_RC_MAGIC    0x4E560000
 #define NOVA_RC_ENCODE(tag) (NOVA_RC_MAGIC | (int32_t)(tag))
 #define NOVA_RC_TAG(ptr)    ((NovaMemTag)(((const int32_t*)(ptr))[-1] & 0xFFFF))
-#define NOVA_RC_VALID(ptr)  ((((const int32_t*)(ptr))[-1] & 0xFFFF0000) == NOVA_RC_MAGIC)
+#define NOVA_RC_VALID(ptr)  ((((const int32_t*)(ptr))[-1] & 0xFFFF0000) == (uint32_t)NOVA_RC_MAGIC)
 #define NOVA_RC_COUNT(ptr)  (((int32_t*)(ptr))[-2])
 
 static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
-    char* base = (char*)malloc(NOVA_RC_HDR_SIZE + size);
+    size_t total = NOVA_RC_HDR_SIZE + size;
+    char* base;
+    if (!nova_slab_inited) nova_slab_init();
+    if (total <= SLAB_32_OBJ_SIZE)
+        base = (char*)nova_slab_alloc(&nova_slab_32);
+    else if (total <= SLAB_64_OBJ_SIZE)
+        base = (char*)nova_slab_alloc(&nova_slab_64);
+    else
+        base = (char*)calloc(1, total);
     if (!base) return NULL;
     ((int32_t*)base)[0] = 1;
     ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
+    nova_mem_total++;
     return base + NOVA_RC_HDR_SIZE;
 }
 
-/* ── Fat Strings: [rc_hdr:8][hash:8][len:8][char data...]['\0'] ──────────
+/* ── Fat Strings: [hash:8][len:8][rc:4][tag:4][char data...]['\0'] ────────
    Pointer returned to user code points to char data (offset +24 from base).
    This IS a valid const char* for printf, strcmp, memcpy, etc.
-   Hash/length accessible via negative indexing from the char pointer.
-   RC header is at ptr[-24...-16]. */
+   RC header at ptr[-8..0] (same position as all other objects).
+   Hash at ptr[-24..-16], len at ptr[-16..-8]. */
 
 #define NOVA_FAT_HDR_SIZE 16
-#define NOVA_FAT_HASH(p) (((const uint64_t*)(p))[-2])
-#define NOVA_FAT_LEN(p)  (((const int64_t*)(p))[-1])
+#define NOVA_FAT_HASH(p) (((const uint64_t*)(p))[-3])
+#define NOVA_FAT_LEN(p)  (((const int64_t*)(p))[-2])
 
-typedef struct {
-    void*      ptr;
-    NovaMemTag tag;
-    int32_t    rc;
-    int32_t    pad_;
-} NovaMemSlot;
-
-#define NOVA_MEM_HT_INIT_CAP 4096
-
-static NovaMemSlot* nova_mem_ht      = NULL;
-static int64_t      nova_mem_ht_cap  = 0;
-static int64_t      nova_mem_ht_used = 0;
+static int64_t      nova_mem_live    = 0;
 static int64_t      nova_mem_total   = 0;
 static volatile int nova_is_multithreaded = 0;
 
@@ -257,98 +258,8 @@ static CRITICAL_SECTION nova_mem_lock;
 static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
-static void nova_mem_lock_acquire(void) {
-    if (!nova_is_multithreaded) return;
-#ifdef _WIN32
-    EnterCriticalSection(&nova_mem_lock);
-#else
-    pthread_mutex_lock(&nova_mem_lock);
-#endif
-}
-
-static void nova_mem_lock_release(void) {
-    if (!nova_is_multithreaded) return;
-#ifdef _WIN32
-    LeaveCriticalSection(&nova_mem_lock);
-#else
-    pthread_mutex_unlock(&nova_mem_lock);
-#endif
-}
-
 void nova_rc_inc(int64_t val);
 void nova_rc_dec(int64_t val);
-
-static uint64_t nova_ptr_hash(void* p) {
-    uint64_t v = (uint64_t)(uintptr_t)p;
-    v ^= v >> 3;
-    v *= 0x9E3779B97F4A7C15ULL;
-    v ^= v >> 16;
-    return v;
-}
-
-static void nova_mem_ht_insert_internal(NovaMemSlot* ht, int64_t cap,
-                                         void* ptr, NovaMemTag tag, int32_t rc) {
-    uint64_t idx = nova_ptr_hash(ptr) & (uint64_t)(cap - 1);
-    while (ht[idx].ptr != NULL && ht[idx].ptr != ptr)
-        idx = (idx + 1) & (uint64_t)(cap - 1);
-    ht[idx].ptr = ptr;
-    ht[idx].tag = tag;
-    ht[idx].rc  = rc;
-}
-
-static void nova_mem_ht_grow(void) {
-    int64_t old_cap = nova_mem_ht_cap;
-    NovaMemSlot* old = nova_mem_ht;
-    int64_t new_cap = old_cap * 2;
-    NovaMemSlot* fresh = (NovaMemSlot*)calloc((size_t)new_cap, sizeof(NovaMemSlot));
-    if (!fresh) return;
-    int64_t live = 0;
-    for (int64_t i = 0; i < old_cap; i++) {
-        if (old[i].ptr) {
-            nova_mem_ht_insert_internal(fresh, new_cap, old[i].ptr, old[i].tag, old[i].rc);
-            live++;
-        }
-    }
-    nova_mem_ht = fresh;
-    nova_mem_ht_cap = new_cap;
-    nova_mem_ht_used = live;
-    free(old);
-}
-
-/* Robin Hood backward-shift deletion: removes entry at del_idx and
-   shifts subsequent entries back to preserve probe-chain continuity.
-   After this call, every non-NULL slot is a live tracked object —
-   there are no tombstones. This prevents stale RC decs from accidentally
-   hitting a reactivated slot for a different object. */
-static void nova_mem_ht_delete(uint64_t del_idx) {
-    uint64_t mask = (uint64_t)(nova_mem_ht_cap - 1);
-    nova_mem_ht[del_idx].ptr  = NULL;
-    nova_mem_ht[del_idx].rc   = 0;
-    nova_mem_ht[del_idx].pad_ = 0;
-    nova_mem_ht_used--;
-
-    uint64_t gap = del_idx;
-    uint64_t j   = (gap + 1) & mask;
-    while (nova_mem_ht[j].ptr != NULL) {
-        uint64_t h = nova_ptr_hash(nova_mem_ht[j].ptr) & mask;
-        /* Shift entry at j to gap if gap is on the probe path from h to j,
-           i.e., gap is closer to h than j is (in forward circular distance). */
-        if (((gap - h) & mask) < ((j - h) & mask)) {
-            nova_mem_ht[gap] = nova_mem_ht[j];
-            nova_mem_ht[j].ptr  = NULL;
-            nova_mem_ht[j].rc   = 0;
-            nova_mem_ht[j].pad_ = 0;
-            gap = j;
-        }
-        j = (j + 1) & mask;
-    }
-}
-
-static void nova_mem_track(void* ptr, NovaMemTag tag) {
-    (void)ptr; (void)tag;
-    nova_mem_total++;
-    nova_mem_ht_used++;
-}
 
 static NovaMemTag nova_mem_find_tag(void* ptr) {
     if (!ptr) return (NovaMemTag)-1;
@@ -357,7 +268,9 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
 }
 
 void nova_rt_track_raw(void* ptr) {
-    nova_mem_track(ptr, NOVA_MEM_RAW);
+    (void)ptr;
+    nova_mem_total++;
+    nova_mem_live++;
 }
 
 static int nova_is_readable_str(const void* ptr) {
@@ -473,14 +386,15 @@ static int nova_str_eq(const char* a, const char* b) {
 }
 
 /* ── Fat String Constructor ──────────────────────────────────────────────
-   Allocates [hash:8][len:8][data...]['\0'], returns pointer to data.
-   Hash is computed during the copy in a single pass — zero extra cost. */
+   Layout: [hash:8][len:8][rc:4][tag:4][char data...]['\0']
+   Returns pointer to char data. RC header is embedded between fat header
+   and data so RC macros work at the same offsets as regular objects. */
 
 static char* nova_fat_str_create(const char* src, size_t len) {
-    char* base = (char*)malloc(NOVA_FAT_HDR_SIZE + len + 1);
+    char* base = (char*)malloc(NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + len + 1);
     if (!base) return NULL;
+    char* str = base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE;
     uint64_t h = 14695981039346656037ULL;
-    char* str = base + NOVA_FAT_HDR_SIZE;
     for (size_t i = 0; i < len; i++) {
         str[i] = src[i];
         h ^= (uint64_t)(unsigned char)src[i];
@@ -489,15 +403,19 @@ static char* nova_fat_str_create(const char* src, size_t len) {
     str[len] = '\0';
     ((uint64_t*)base)[0] = h;
     ((int64_t*)base)[1] = (int64_t)len;
+    ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[0] = 1;
+    ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[1] = NOVA_RC_ENCODE(NOVA_MEM_FAT_STR);
+    nova_mem_total++;
+    nova_mem_live++;
     return str;
 }
 
 static char* nova_fat_str_concat(const char* sa, size_t la,
                                   const char* sb, size_t lb) {
     size_t total = la + lb;
-    char* base = (char*)malloc(NOVA_FAT_HDR_SIZE + total + 1);
+    char* base = (char*)malloc(NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + total + 1);
     if (!base) return NULL;
-    char* str = base + NOVA_FAT_HDR_SIZE;
+    char* str = base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE;
     uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < la; i++) {
         str[i] = sa[i];
@@ -512,6 +430,10 @@ static char* nova_fat_str_concat(const char* sa, size_t la,
     str[total] = '\0';
     ((uint64_t*)base)[0] = h;
     ((int64_t*)base)[1] = (int64_t)total;
+    ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[0] = 1;
+    ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[1] = NOVA_RC_ENCODE(NOVA_MEM_FAT_STR);
+    nova_mem_total++;
+    nova_mem_live++;
     return str;
 }
 
