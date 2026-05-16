@@ -1,0 +1,605 @@
+// NOVA Self-Hosting STRESS TEST
+// Production-grade compiler workloads:
+// - Real lexer handling NOVA syntax with operators, strings, comments, floats
+// - Recursive AST evaluator with arena-style nodes
+// - Scope chain symbol table with parent resolution
+// - Short-circuit edge cases that WILL crash if wrong
+// - Heavy allocation under complex control flow
+
+// ═══════════════════════════════════════════════════════════════════
+// PART 1: PRODUCTION LEXER
+// ═══════════════════════════════════════════════════════════════════
+
+enum Token
+    TInt(ival: int)
+    TFloat(ftext: string)
+    TStr(sval: string)
+    TIdent(iname: string)
+    TKeyword(kname: string)
+    TOp(sym: string)
+    TPunct(pch: string)
+    TEOF(dummy: int)
+
+fn tok_str(t)
+    match t
+        TInt(v)     => "INT:" + str(v)
+        TFloat(v)   => "FLT:" + v
+        TStr(v)     => "STR:" + v
+        TIdent(n)   => "ID:" + n
+        TKeyword(n) => "KW:" + n
+        TOp(s)      => "OP:" + s
+        TPunct(c)   => "P:" + c
+        TEOF(_)     => "EOF"
+        _           => "???"
+
+fn is_digit(ch)
+    c = ord(ch)
+    return c >= 48 and c <= 57
+
+fn is_alpha(ch)
+    c = ord(ch)
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or ch == "_"
+
+fn is_alnum(ch)
+    return is_digit(ch) or is_alpha(ch)
+
+fn is_kw(w)
+    if w == "fn" or w == "return" or w == "if" or w == "else"
+        return true
+    if w == "while" or w == "for" or w == "in" or w == "match"
+        return true
+    if w == "enum" or w == "type" or w == "import" or w == "spawn"
+        return true
+    if w == "true" or w == "false" or w == "and" or w == "or" or w == "not"
+        return true
+    if w == "break" or w == "continue" or w == "send" or w == "receive"
+        return true
+    return false
+
+fn lex(input)
+    tokens = []
+    chs = chars(input)
+    i = 0
+    while i < len(chs)
+        ch = chs[i]
+
+        // Skip spaces and tabs
+        if ch == " " or ch == "\t"
+            i = i + 1
+            continue
+
+        // Newlines
+        if ch == "\n"
+            i = i + 1
+            continue
+
+        // Single-line comment
+        if ch == "/" and i + 1 < len(chs) and chs[i + 1] == "/"
+            while i < len(chs) and chs[i] != "\n"
+                i = i + 1
+            continue
+
+        // Numbers (int and float)
+        if is_digit(ch)
+            num = ""
+            while i < len(chs) and is_digit(chs[i])
+                num = num + chs[i]
+                i = i + 1
+            if i < len(chs) and chs[i] == "." and i + 1 < len(chs) and is_digit(chs[i + 1])
+                num = num + "."
+                i = i + 1
+                while i < len(chs) and is_digit(chs[i])
+                    num = num + chs[i]
+                    i = i + 1
+                tokens.push(TFloat{ftext: num})
+            else
+                tokens.push(TInt{ival: int(num)})
+            continue
+
+        // String literals with escape handling
+        if ch == "\""
+            i = i + 1
+            s = ""
+            while i < len(chs) and chs[i] != "\""
+                if chs[i] == "\\" and i + 1 < len(chs)
+                    next = chs[i + 1]
+                    if next == "n"
+                        s = s + chr(10)
+                    else if next == "t"
+                        s = s + chr(9)
+                    else if next == "\\"
+                        s = s + "\\"
+                    else
+                        s = s + next
+                    i = i + 2
+                else
+                    s = s + chs[i]
+                    i = i + 1
+            i = i + 1
+            tokens.push(TStr{sval: s})
+            continue
+
+        // Identifiers and keywords
+        if is_alpha(ch)
+            word = ""
+            while i < len(chs) and is_alnum(chs[i])
+                word = word + chs[i]
+                i = i + 1
+            if is_kw(word)
+                tokens.push(TKeyword{kname: word})
+            else
+                tokens.push(TIdent{iname: word})
+            continue
+
+        // Multi-character operators (must check before single-char)
+        if i + 1 < len(chs)
+            two = ch + chs[i + 1]
+            if two == "==" or two == "!=" or two == "<=" or two == ">="
+                tokens.push(TOp{sym: two})
+                i = i + 2
+                continue
+            if two == "->" or two == "=>" or two == "|>" or two == ".."
+                tokens.push(TOp{sym: two})
+                i = i + 2
+                continue
+            if two == "+=" or two == "-=" or two == "**"
+                tokens.push(TOp{sym: two})
+                i = i + 2
+                continue
+
+        // Punctuation
+        lbrace = chr(123)
+        rbrace = chr(125)
+        if ch == "(" or ch == ")" or ch == "[" or ch == "]" or ch == lbrace or ch == rbrace or ch == "," or ch == ":" or ch == "."
+            tokens.push(TPunct{pch: ch})
+            i = i + 1
+            continue
+
+        // Single-character operators
+        if ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%" or ch == "=" or ch == "<" or ch == ">" or ch == "!"
+            tokens.push(TOp{sym: ch})
+            i = i + 1
+            continue
+
+        // Unknown character — skip
+        i = i + 1
+
+    tokens.push(TEOF{dummy: 0})
+    return tokens
+
+// ── TEST 1: Lex real function ───────────────────────────────────────────
+
+code1_lines = ["fn fibonacci(n)", "    if n <= 1", "        return n", "    return fibonacci(n - 1) + fibonacci(n - 2)"]
+code1 = join(code1_lines, chr(10))
+t1 = lex(code1)
+print("T1 Real function: " + str(len(t1)) + " tokens")
+print("  [0]=" + tok_str(t1[0]) + " [1]=" + tok_str(t1[1]) + " [2]=" + tok_str(t1[2]))
+
+// ── TEST 2: All operator types ──────────────────────────────────────────
+
+code2 = "x = a + b * c - d / e % f ** g"
+t2 = lex(code2)
+print("T2 Operators: " + str(len(t2)) + " tokens")
+
+// ── TEST 3: Multi-char operators ────────────────────────────────────────
+
+code3 = "x == 10 != 20 <= 30 >= 40 -> result => output |> transform"
+t3 = lex(code3)
+multi_count = 0
+mi = 0
+while mi < len(t3)
+    s = tok_str(t3[mi])
+    if starts_with(s, "OP:")
+        op_text = slice(s, 3, len(s))
+        if len(op_text) == 2
+            multi_count = multi_count + 1
+    mi = mi + 1
+print("T3 Multi-char ops: " + str(multi_count))
+
+// ── TEST 4: String literals ─────────────────────────────────────────────
+
+code4 = "msg = \"hello world\" + \"escaped \\n tab \\t done\""
+t4 = lex(code4)
+str_count = 0
+si = 0
+while si < len(t4)
+    s = tok_str(t4[si])
+    if starts_with(s, "STR:")
+        str_count = str_count + 1
+    si = si + 1
+print("T4 String literals: " + str(str_count))
+
+// ── TEST 5: Comments are skipped ────────────────────────────────────────
+
+code5_lines = ["x = 1 // comment", "y = 2 // another", "z = x + y"]
+code5 = join(code5_lines, chr(10))
+t5 = lex(code5)
+// Should have x = 1 y = 2 z = x + y EOF = 10 tokens, NO comment text
+comment_leak = false
+ci = 0
+while ci < len(t5)
+    s = tok_str(t5[ci])
+    if starts_with(s, "ID:comment") or starts_with(s, "ID:another")
+        comment_leak = true
+    ci = ci + 1
+print("T5 Comments skipped: " + str(not comment_leak) + " (" + str(len(t5)) + " tokens)")
+
+// ── TEST 6: Float literals ──────────────────────────────────────────────
+
+code6 = "pi = 3.14159 e = 2.71828 r = 10.0"
+t6 = lex(code6)
+float_count = 0
+fi = 0
+while fi < len(t6)
+    s = tok_str(t6[fi])
+    if starts_with(s, "FLT:")
+        float_count = float_count + 1
+    fi = fi + 1
+print("T6 Float literals: " + str(float_count))
+
+// ── TEST 7: Keywords vs identifiers ─────────────────────────────────────
+
+code7 = "fn my_fn for forEach if iffy while whileTrue match matching"
+t7 = lex(code7)
+kw_count = 0
+id_count = 0
+ki = 0
+while ki < len(t7)
+    s = tok_str(t7[ki])
+    if starts_with(s, "KW:")
+        kw_count = kw_count + 1
+    else if starts_with(s, "ID:")
+        id_count = id_count + 1
+    ki = ki + 1
+print("T7 KW:" + str(kw_count) + " ID:" + str(id_count))
+
+// ── TEST 8: Brackets and nesting ────────────────────────────────────────
+
+code8 = "result = func(arr[i], name)"
+t8 = lex(code8)
+print("T8 Brackets: " + str(len(t8)) + " tokens")
+
+
+// ═══════════════════════════════════════════════════════════════════
+// PART 2: RECURSIVE AST EVALUATOR (arena-style)
+// ═══════════════════════════════════════════════════════════════════
+
+enum AstNode
+    ANum(val: int)
+    AVar(name: string)
+    ABin(op: string, left: int, right: int)
+    ACall(name: string, arg: int)
+    ANeg(inner: int)
+
+ast_nodes = []
+
+fn mk(node)
+    idx = len(ast_nodes)
+    ast_nodes.push(node)
+    return idx
+
+fn eval_ast(idx, env)
+    node = ast_nodes[idx]
+    match node
+        ANum(v)  => v
+        AVar(n)  => int(env[n])
+        ANeg(inner) => 0 - eval_ast(inner, env)
+        ABin(op, l, r) => eval_bin(op, eval_ast(l, env), eval_ast(r, env))
+        ACall(name, arg) => eval_call(name, eval_ast(arg, env))
+        _ => 0
+
+fn eval_bin(op, lv, rv)
+    if op == "+"
+        return lv + rv
+    else if op == "-"
+        return lv - rv
+    else if op == "*"
+        return lv * rv
+    else if op == "/"
+        return lv / rv
+    else if op == "%"
+        return lv % rv
+    return 0
+
+fn eval_call(name, v)
+    if name == "abs"
+        if v < 0
+            return 0 - v
+        return v
+    else if name == "double"
+        return v * 2
+    else if name == "square"
+        return v * v
+    return 0
+
+// AST for: (x + 3) * (y - 1)
+n0 = mk(AVar{name: "x"})
+n1 = mk(ANum{val: 3})
+n2 = mk(ABin{op: "+", left: n0, right: n1})
+n3 = mk(AVar{name: "y"})
+n4 = mk(ANum{val: 1})
+n5 = mk(ABin{op: "-", left: n3, right: n4})
+n6 = mk(ABin{op: "*", left: n2, right: n5})
+
+env1 = {"x": "10", "y": "7"}
+r1 = eval_ast(n6, env1)
+print("T9 AST (10+3)*(7-1)=" + str(r1))
+
+// AST for: abs(square(x) - double(y))  with x=5 y=15
+n7 = mk(AVar{name: "x"})
+n8 = mk(ACall{name: "square", arg: n7})
+n9 = mk(AVar{name: "y"})
+n10 = mk(ACall{name: "double", arg: n9})
+n11 = mk(ABin{op: "-", left: n8, right: n10})
+n12 = mk(ACall{name: "abs", arg: n11})
+
+env2 = {"x": "5", "y": "15"}
+r2 = eval_ast(n12, env2)
+print("T10 AST abs(sq(5)-dbl(15))=" + str(r2))
+
+// Deeply nested: ((a + b) * (c - d)) / ((e + f) % (g - h))
+na = mk(AVar{name: "a"})
+nb = mk(AVar{name: "b"})
+nc = mk(AVar{name: "c"})
+nd = mk(AVar{name: "d"})
+ne = mk(AVar{name: "e"})
+nf = mk(AVar{name: "f"})
+ng = mk(AVar{name: "g"})
+nh = mk(AVar{name: "h"})
+nab = mk(ABin{op: "+", left: na, right: nb})
+ncd = mk(ABin{op: "-", left: nc, right: nd})
+nef = mk(ABin{op: "+", left: ne, right: nf})
+ngh = mk(ABin{op: "-", left: ng, right: nh})
+nleft = mk(ABin{op: "*", left: nab, right: ncd})
+nright = mk(ABin{op: "%", left: nef, right: ngh})
+nroot = mk(ABin{op: "/", left: nleft, right: nright})
+
+env3 = {"a": "10", "b": "5", "c": "20", "d": "8", "e": "7", "f": "3", "g": "11", "h": "4"}
+r3 = eval_ast(nroot, env3)
+// (10+5)*(20-8) = 15*12 = 180; (7+3)%(11-4) = 10%7 = 3; 180/3 = 60
+print("T11 Deep AST ((a+b)*(c-d))/((e+f)%(g-h))=" + str(r3))
+
+
+// ═══════════════════════════════════════════════════════════════════
+// PART 3: SCOPE CHAIN SYMBOL TABLE
+// Uses a single flat dict with composite keys "scopeId:name"
+// This is the pattern a real compiler would use for symbol tables
+// ═══════════════════════════════════════════════════════════════════
+
+scope_db = {"_seed": "1"}
+scope_ids = [0]
+
+fn new_scope(parent_idx)
+    id = len(scope_ids) - 1
+    scope_db[str(id) + ":__parent"] = str(parent_idx)
+    scope_ids.push(0)
+    return id
+
+fn scope_set(idx, name, val)
+    scope_db[str(idx) + ":" + name] = val
+
+fn scope_has_key(idx, name)
+    key = str(idx) + ":" + name
+    ks = scope_db.keys()
+    ki = 0
+    while ki < len(ks)
+        if ks[ki] == key
+            return true
+        ki = ki + 1
+    return false
+
+fn scope_lookup(idx, name)
+    if scope_has_key(idx, name)
+        return scope_db[str(idx) + ":" + name]
+    if scope_has_key(idx, "__parent")
+        parent = int(scope_db[str(idx) + ":__parent"])
+        if parent >= 0
+            return scope_lookup(parent, name)
+    return "UNDEF"
+
+// global -> fn_scope -> if_scope -> nested_if_scope
+g = new_scope(-1)
+scope_set(g, "PI", "314")
+scope_set(g, "MAX", "1000")
+scope_set(g, "VERSION", "1")
+
+f = new_scope(g)
+scope_set(f, "x", "42")
+scope_set(f, "y", "99")
+scope_set(f, "local_only", "secret")
+
+b = new_scope(f)
+scope_set(b, "temp", "7")
+
+deep = new_scope(b)
+scope_set(deep, "z", "999")
+
+print("T12 Scope chain:")
+print("  deep.z=" + scope_lookup(deep, "z"))
+print("  deep.temp=" + scope_lookup(deep, "temp"))
+print("  deep.x=" + scope_lookup(deep, "x"))
+print("  deep.PI=" + scope_lookup(deep, "PI"))
+print("  deep.UNDEF=" + scope_lookup(deep, "no_such_var"))
+print("  fn.local=" + scope_lookup(f, "local_only"))
+print("  global.VERSION=" + scope_lookup(g, "VERSION"))
+
+
+// ═══════════════════════════════════════════════════════════════════
+// PART 4: SHORT-CIRCUIT STRESS
+// ═══════════════════════════════════════════════════════════════════
+
+// Deeply chained guards
+fn safe_get(arr, idx)
+    if idx >= 0 and idx < len(arr)
+        return arr[idx]
+    return -1
+
+fn check_range(arr, idx, lo, hi)
+    return idx >= 0 and idx < len(arr) and arr[idx] >= lo and arr[idx] <= hi
+
+data = [5, 15, 25, 35, 45]
+print("T13 Short-circuit guards:")
+print("  check(2,20,30)=" + str(check_range(data, 2, 20, 30)))
+print("  check(-1,0,100)=" + str(check_range(data, -1, 0, 100)))
+print("  check(10,0,100)=" + str(check_range(data, 10, 0, 100)))
+print("  check(4,50,100)=" + str(check_range(data, 4, 50, 100)))
+print("  safe_get(-1)=" + str(safe_get(data, -1)))
+print("  safe_get(3)=" + str(safe_get(data, 3)))
+print("  safe_get(99)=" + str(safe_get(data, 99)))
+
+// Short-circuit OR chain
+fn first_of(items, a, b, c)
+    i = 0
+    while i < len(items)
+        if items[i] == a or items[i] == b or items[i] == c
+            return i
+        i = i + 1
+    return -1
+
+words = ["cat", "dog", "fish", "bird", "snake"]
+print("  first(dog)=" + str(first_of(words, "dog", "xxx", "yyy")))
+print("  first(bird)=" + str(first_of(words, "xxx", "yyy", "bird")))
+print("  first(none)=" + str(first_of(words, "xxx", "yyy", "zzz")))
+
+// Binary search with short-circuit guards in recursion
+fn bsearch(arr, target, lo, hi)
+    if lo > hi
+        return -1
+    mid = (lo + hi) / 2
+    if mid >= 0 and mid < len(arr) and arr[mid] == target
+        return mid
+    if mid >= 0 and mid < len(arr) and arr[mid] < target
+        return bsearch(arr, target, mid + 1, hi)
+    return bsearch(arr, target, lo, mid - 1)
+
+sorted = [2, 5, 8, 12, 16, 23, 38, 56, 72, 91]
+print("  bsearch(23)=" + str(bsearch(sorted, 23, 0, 9)))
+print("  bsearch(2)=" + str(bsearch(sorted, 2, 0, 9)))
+print("  bsearch(91)=" + str(bsearch(sorted, 91, 0, 9)))
+print("  bsearch(99)=" + str(bsearch(sorted, 99, 0, 9)))
+
+
+// ═══════════════════════════════════════════════════════════════════
+// PART 5: HEAVY ALLOCATION — lex a substantial program
+// ═══════════════════════════════════════════════════════════════════
+
+big_lines = []
+big_lines.push("fn process(items)")
+big_lines.push("    result = []")
+big_lines.push("    i = 0")
+big_lines.push("    while i < len(items)")
+big_lines.push("        x = items[i]")
+big_lines.push("        if x > 0 and x < 100")
+big_lines.push("            result.push(x * 2 + 1)")
+big_lines.push("        else if x >= 100")
+big_lines.push("            result.push(x / 2)")
+big_lines.push("        i = i + 1")
+big_lines.push("    return result")
+big_lines.push("")
+big_lines.push("fn transform(val)")
+big_lines.push("    if val > 50")
+big_lines.push("        return val ** 2")
+big_lines.push("    return val + 10")
+big_lines.push("")
+big_lines.push("fn main()")
+big_lines.push("    data = [1, 50, 100, 200, 0, -5, 99]")
+big_lines.push("    out = process(data)")
+big_lines.push("    total = 0")
+big_lines.push("    i = 0")
+big_lines.push("    while i < len(out)")
+big_lines.push("        total = total + transform(out[i])")
+big_lines.push("        i = i + 1")
+big_lines.push("    print(total)")
+big_code = join(big_lines, chr(10))
+
+big_tokens = lex(big_code)
+
+// Count token types
+tkw = 0
+tid = 0
+tint = 0
+tops = 0
+tbi = 0
+while tbi < len(big_tokens)
+    s = tok_str(big_tokens[tbi])
+    if starts_with(s, "KW:")
+        tkw = tkw + 1
+    else if starts_with(s, "ID:")
+        tid = tid + 1
+    else if starts_with(s, "INT:")
+        tint = tint + 1
+    else if starts_with(s, "OP:")
+        tops = tops + 1
+    tbi = tbi + 1
+print("T14 Big lex: " + str(len(big_tokens)) + " tokens (KW:" + str(tkw) + " ID:" + str(tid) + " INT:" + str(tint) + " OP:" + str(tops) + ")")
+
+
+// ═══════════════════════════════════════════════════════════════════
+// PART 6: LEX → RECONSTRUCT ROUND TRIP
+// ═══════════════════════════════════════════════════════════════════
+
+fn reconstruct(toks)
+    out = ""
+    ri = 0
+    while ri < len(toks)
+        t = toks[ri]
+        part = match t
+            TInt(v)     => str(v)
+            TFloat(v)   => v
+            TStr(v)     => "\"" + v + "\""
+            TIdent(n)   => n
+            TKeyword(n) => n
+            TOp(s)      => s
+            TPunct(c)   => c
+            TEOF(_)     => ""
+            _           => "?"
+        out = out + part
+        if ri < len(toks) - 1
+            out = out + " "
+        ri = ri + 1
+    return trim(out)
+
+simple_code = "x = func(a, b) + 42"
+simple_toks = lex(simple_code)
+rebuilt = reconstruct(simple_toks)
+print("T15 Reconstruct: " + rebuilt)
+
+// ═══════════════════════════════════════════════════════════════════
+// VERIFICATION
+// ═══════════════════════════════════════════════════════════════════
+
+// Hard-check specific values
+errors = 0
+if r1 != 78
+    print("FAIL: T9 expected 78 got " + str(r1))
+    errors = errors + 1
+if r2 != 5
+    print("FAIL: T10 expected 5 got " + str(r2))
+    errors = errors + 1
+if r3 != 60
+    print("FAIL: T11 expected 60 got " + str(r3))
+    errors = errors + 1
+if scope_lookup(deep, "z") != "999"
+    print("FAIL: T12 deep.z")
+    errors = errors + 1
+if scope_lookup(deep, "PI") != "314"
+    print("FAIL: T12 deep.PI")
+    errors = errors + 1
+if check_range(data, -1, 0, 100) != false
+    print("FAIL: T13 OOB left")
+    errors = errors + 1
+if check_range(data, 10, 0, 100) != false
+    print("FAIL: T13 OOB right")
+    errors = errors + 1
+if bsearch(sorted, 23, 0, 9) != 5
+    print("FAIL: T13 bsearch 23")
+    errors = errors + 1
+if bsearch(sorted, 99, 0, 9) != -1
+    print("FAIL: T13 bsearch 99")
+    errors = errors + 1
+
+print("")
+if errors == 0
+    print("=== SELF-HOST STRESS TEST PASSED (0 errors) ===")
+else
+    print("=== SELF-HOST STRESS TEST FAILED: " + str(errors) + " errors ===")
