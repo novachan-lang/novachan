@@ -8,6 +8,7 @@ declare noalias ptr @malloc(i64) nounwind allocsize(0)
 declare noalias ptr @calloc(i64, i64) nounwind
 declare ptr @realloc(ptr, i64) nounwind allocsize(1)
 declare void @free(ptr) nounwind
+declare ptr @nova_rt_struct_alloc(i64) nounwind
 declare i64 @llvm.smax.i64(i64, i64) nounwind readnone
 ; nova runtime — list ops
 declare i64 @nova_rt_list_create() nounwind
@@ -33,6 +34,7 @@ declare i64 @nova_rt_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_upper(i64) nounwind
 declare i64 @nova_rt_lower(i64) nounwind
 declare i64 @nova_rt_trim(i64) nounwind
+declare i64 @nova_rt_repeat(i64, i64) nounwind
 declare i64 @nova_rt_split(i64, i64) nounwind
 declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind readonly
@@ -82,10 +84,54 @@ declare i64 @nova_rt_json_stringify(i64) nounwind
 ; nova runtime — HTTP ops
 declare i64 @nova_rt_http_get(i64) nounwind
 declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+; nova runtime — time ops
+declare i64 @nova_rt_time_ms() nounwind
+declare i64 @nova_rt_clock_ns() nounwind
+declare void @nova_rt_sleep_ms(i64) nounwind
+declare void @nova_rt_assert(i64, i64) nounwind
 ; nova runtime — type dispatch
 declare i64 @nova_rt_any_to_str(i64) nounwind
 declare i64 @nova_rt_str_concat_safe(i64, i64) nounwind
+declare i64 @nova_rt_str_char_at(i64, i64) nounwind
 declare void @nova_rt_init() nounwind
+declare void @nova_rt_init_args(i64, i64) nounwind
+; nova runtime — system ops
+declare i64 @nova_rt_args() nounwind
+declare i64 @nova_rt_env(i64) nounwind
+declare i64 @nova_rt_random_int(i64, i64) nounwind
+declare i64 @nova_rt_random_float() nounwind
+declare i64 @nova_rt_shell(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_path_ext(i64) nounwind
+; nova runtime — regex ops
+declare i64 @nova_rt_regex_match(i64, i64) nounwind readonly
+declare i64 @nova_rt_regex_find(i64, i64) nounwind
+declare i64 @nova_rt_regex_replace(i64, i64, i64) nounwind
+declare i64 @nova_rt_regex_split(i64, i64) nounwind
+; nova runtime — network ops
+declare i64 @nova_rt_tcp_connect(i64, i64) nounwind
+declare i64 @nova_rt_tcp_listen(i64) nounwind
+declare i64 @nova_rt_tcp_accept(i64) nounwind
+declare i64 @nova_rt_tcp_send(i64, i64) nounwind
+declare i64 @nova_rt_tcp_recv(i64) nounwind
+declare void @nova_rt_tcp_close(i64) nounwind
+declare i64 @nova_rt_udp_bind(i64) nounwind
+declare i64 @nova_rt_udp_send(i64, i64, i64, i64) nounwind
+declare i64 @nova_rt_udp_recv(i64) nounwind
+; nova runtime — HTTP server
+declare i64 @nova_rt_http_listen(i64) nounwind
+declare i64 @nova_rt_http_accept(i64) nounwind
+declare void @nova_rt_http_respond(i64, i64, i64) nounwind
+; nova runtime — byte arrays
+declare i64 @nova_rt_bytes_create(i64) nounwind
+declare i64 @nova_rt_bytes_get(i64, i64) nounwind
+declare void @nova_rt_bytes_set(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_len(i64) nounwind
+declare i64 @nova_rt_bytes_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_to_str(i64) nounwind
+declare i64 @nova_rt_str_to_bytes(i64) nounwind
 ; nova runtime — channel/spawn ops
 declare i64 @nova_rt_channel_create() nounwind
 declare i64 @nova_rt_channel_send(i64, i64) nounwind
@@ -133,7 +179,14 @@ entry0:
   %slot.__mb1_lst = alloca i64, align 8
   %slot.__mb1_result = alloca i64, align 8
   %slot.__mb1_i = alloca i64, align 8
-  %slot.__mb0_result = alloca i64, align 8
+  %slot.__mb8_ret = alloca i64, align 8
+  %slot.__mb8_lst = alloca i64, align 8
+  %slot.__mb8_result = alloca i64, align 8
+  %slot.__mb8_i = alloca i64, align 8
+  %slot.__mb9_ret = alloca i64, align 8
+  %slot.__mb9_lst = alloca i64, align 8
+  %slot.__mb9_result = alloca i64, align 8
+  %slot.__mb9_i = alloca i64, align 8
   %slot.__mb2_ret = alloca i64, align 8
   %slot.__mb2_lst = alloca i64, align 8
   %slot.__mb2_val = alloca i64, align 8
@@ -163,6 +216,8 @@ entry0:
   store i64 0, ptr %slot.nums, align 8
   store i64 0, ptr %slot.__mb0_lst, align 8
   store i64 0, ptr %slot.__mb1_lst, align 8
+  store i64 0, ptr %slot.__mb8_lst, align 8
+  store i64 0, ptr %slot.__mb9_lst, align 8
   store i64 0, ptr %slot.__mb2_lst, align 8
   store i64 0, ptr %slot.__mb3_lst, align 8
   store i64 0, ptr %slot.__mb4_lst, align 8
@@ -280,123 +335,123 @@ __mb1_merge:
   %t27 = getelementptr inbounds [5 x i8], ptr @.str.0, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t27, i64 %r131)
   %r28 = load i64, ptr %slot.nums, align 8
-  br label %__mb0_entry0
+  br label %__mb8_entry0
 
-__mb0_entry0:
-  %t28 = load i64, ptr %slot.__mb0_lst, align 8
+__mb8_entry0:
+  %t28 = load i64, ptr %slot.__mb8_lst, align 8
   call void @nova_rc_dec(i64 %t28)
   call void @nova_rc_inc(i64 %r28)
-  store i64 %r28, ptr %slot.__mb0_lst, align 8
+  store i64 %r28, ptr %slot.__mb8_lst, align 8
   %t29 = inttoptr i64 %r28 to ptr
   %t30 = load ptr, ptr %t29, align 8, !tbaa !2
   %t31 = getelementptr i64, ptr %t30, i64 0
   %r368 = load i64, ptr %t31, align 8, !tbaa !4
-  store i64 %r368, ptr %slot.__mb0_result, align 8
-  store i64 1, ptr %slot.__mb0_i, align 8
-  %r374 = load i64, ptr %slot.__mb0_lst, align 8
-  br label %__mb0_while_header1
+  store i64 %r368, ptr %slot.__mb8_result, align 8
+  store i64 1, ptr %slot.__mb8_i, align 8
+  %r374 = load i64, ptr %slot.__mb8_lst, align 8
+  br label %__mb8_while_header1
 
-__mb0_while_header1:
-  %r375 = load i64, ptr %slot.__mb0_i, align 8
+__mb8_while_header1:
+  %r375 = load i64, ptr %slot.__mb8_i, align 8
   %r376 = call i64 @nova_rt_list_len(i64 %r374)
   %t32 = icmp slt i64 %r375, %r376
-  br i1 %t32, label %__mb0_while_body2, label %__mb0_while_exit3, !prof !90
+  br i1 %t32, label %__mb8_while_body2, label %__mb8_while_exit3, !prof !90
 
-__mb0_while_body2:
-  %r378 = load i64, ptr %slot.__mb0_i, align 8
+__mb8_while_body2:
+  %r378 = load i64, ptr %slot.__mb8_i, align 8
   %t33 = inttoptr i64 %r374 to ptr
   %t34 = load ptr, ptr %t33, align 8, !tbaa !2
   %t35 = getelementptr i64, ptr %t34, i64 %r378
   %r379 = load i64, ptr %t35, align 8, !tbaa !4
-  %r380 = load i64, ptr %slot.__mb0_result, align 8
+  %r380 = load i64, ptr %slot.__mb8_result, align 8
   %t36 = icmp slt i64 %r379, %r380
-  br i1 %t36, label %__mb0_ifb_then4, label %__mb0_ifb_else5
+  br i1 %t36, label %__mb8_ifb_then4, label %__mb8_ifb_else5
 
-__mb0_while_exit3:
-  %r382 = load i64, ptr %slot.__mb0_result, align 8
-  store i64 %r382, ptr %slot.__mb0_ret, align 8
-  br label %__mb0_merge
+__mb8_while_exit3:
+  %r382 = load i64, ptr %slot.__mb8_result, align 8
+  store i64 %r382, ptr %slot.__mb8_ret, align 8
+  br label %__mb8_merge
 
-__mb0_ifb_then4:
-  %r383 = load i64, ptr %slot.__mb0_i, align 8
+__mb8_ifb_then4:
+  %r383 = load i64, ptr %slot.__mb8_i, align 8
   %t37 = inttoptr i64 %r374 to ptr
   %t38 = load ptr, ptr %t37, align 8, !tbaa !2
   %t39 = getelementptr i64, ptr %t38, i64 %r383
   %r384 = load i64, ptr %t39, align 8, !tbaa !4
-  store i64 %r384, ptr %slot.__mb0_result, align 8
-  br label %__mb0_ifb_merge6
+  store i64 %r384, ptr %slot.__mb8_result, align 8
+  br label %__mb8_ifb_merge6
 
-__mb0_ifb_else5:
-  br label %__mb0_ifb_merge6
+__mb8_ifb_else5:
+  br label %__mb8_ifb_merge6
 
-__mb0_ifb_merge6:
-  %r388 = load i64, ptr %slot.__mb0_i, align 8
+__mb8_ifb_merge6:
+  %r388 = load i64, ptr %slot.__mb8_i, align 8
   %r390 = add i64 %r388, 1
-  store i64 %r390, ptr %slot.__mb0_i, align 8
-  br label %__mb0_while_header1, !llvm.loop !91
+  store i64 %r390, ptr %slot.__mb8_i, align 8
+  br label %__mb8_while_header1, !llvm.loop !91
 
-__mb0_merge:
-  %r392 = load i64, ptr %slot.__mb0_ret, align 8
+__mb8_merge:
+  %r392 = load i64, ptr %slot.__mb8_ret, align 8
   %t40 = getelementptr inbounds [5 x i8], ptr @.str.0, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t40, i64 %r392)
   %r31 = load i64, ptr %slot.nums, align 8
-  br label %__mb1_entry0
+  br label %__mb9_entry0
 
-__mb1_entry0:
-  %t41 = load i64, ptr %slot.__mb1_lst, align 8
+__mb9_entry0:
+  %t41 = load i64, ptr %slot.__mb9_lst, align 8
   call void @nova_rc_dec(i64 %t41)
   call void @nova_rc_inc(i64 %r31)
-  store i64 %r31, ptr %slot.__mb1_lst, align 8
+  store i64 %r31, ptr %slot.__mb9_lst, align 8
   %t42 = inttoptr i64 %r31 to ptr
   %t43 = load ptr, ptr %t42, align 8, !tbaa !2
   %t44 = getelementptr i64, ptr %t43, i64 0
   %r398 = load i64, ptr %t44, align 8, !tbaa !4
-  store i64 %r398, ptr %slot.__mb1_result, align 8
-  store i64 1, ptr %slot.__mb1_i, align 8
-  %r404 = load i64, ptr %slot.__mb1_lst, align 8
-  br label %__mb1_while_header1
+  store i64 %r398, ptr %slot.__mb9_result, align 8
+  store i64 1, ptr %slot.__mb9_i, align 8
+  %r404 = load i64, ptr %slot.__mb9_lst, align 8
+  br label %__mb9_while_header1
 
-__mb1_while_header1:
-  %r405 = load i64, ptr %slot.__mb1_i, align 8
+__mb9_while_header1:
+  %r405 = load i64, ptr %slot.__mb9_i, align 8
   %r406 = call i64 @nova_rt_list_len(i64 %r404)
   %t45 = icmp slt i64 %r405, %r406
-  br i1 %t45, label %__mb1_while_body2, label %__mb1_while_exit3, !prof !90
+  br i1 %t45, label %__mb9_while_body2, label %__mb9_while_exit3, !prof !90
 
-__mb1_while_body2:
-  %r408 = load i64, ptr %slot.__mb1_i, align 8
+__mb9_while_body2:
+  %r408 = load i64, ptr %slot.__mb9_i, align 8
   %t46 = inttoptr i64 %r404 to ptr
   %t47 = load ptr, ptr %t46, align 8, !tbaa !2
   %t48 = getelementptr i64, ptr %t47, i64 %r408
   %r409 = load i64, ptr %t48, align 8, !tbaa !4
-  %r410 = load i64, ptr %slot.__mb1_result, align 8
+  %r410 = load i64, ptr %slot.__mb9_result, align 8
   %t49 = icmp sgt i64 %r409, %r410
-  br i1 %t49, label %__mb1_ifb_then4, label %__mb1_ifb_else5
+  br i1 %t49, label %__mb9_ifb_then4, label %__mb9_ifb_else5
 
-__mb1_while_exit3:
-  %r412 = load i64, ptr %slot.__mb1_result, align 8
-  store i64 %r412, ptr %slot.__mb1_ret, align 8
-  br label %__mb1_merge
+__mb9_while_exit3:
+  %r412 = load i64, ptr %slot.__mb9_result, align 8
+  store i64 %r412, ptr %slot.__mb9_ret, align 8
+  br label %__mb9_merge
 
-__mb1_ifb_then4:
-  %r413 = load i64, ptr %slot.__mb1_i, align 8
+__mb9_ifb_then4:
+  %r413 = load i64, ptr %slot.__mb9_i, align 8
   %t50 = inttoptr i64 %r404 to ptr
   %t51 = load ptr, ptr %t50, align 8, !tbaa !2
   %t52 = getelementptr i64, ptr %t51, i64 %r413
   %r414 = load i64, ptr %t52, align 8, !tbaa !4
-  store i64 %r414, ptr %slot.__mb1_result, align 8
-  br label %__mb1_ifb_merge6
+  store i64 %r414, ptr %slot.__mb9_result, align 8
+  br label %__mb9_ifb_merge6
 
-__mb1_ifb_else5:
-  br label %__mb1_ifb_merge6
+__mb9_ifb_else5:
+  br label %__mb9_ifb_merge6
 
-__mb1_ifb_merge6:
-  %r418 = load i64, ptr %slot.__mb1_i, align 8
+__mb9_ifb_merge6:
+  %r418 = load i64, ptr %slot.__mb9_i, align 8
   %r420 = add i64 %r418, 1
-  store i64 %r420, ptr %slot.__mb1_i, align 8
-  br label %__mb1_while_header1, !llvm.loop !91
+  store i64 %r420, ptr %slot.__mb9_i, align 8
+  br label %__mb9_while_header1, !llvm.loop !91
 
-__mb1_merge:
-  %r422 = load i64, ptr %slot.__mb1_ret, align 8
+__mb9_merge:
+  %r422 = load i64, ptr %slot.__mb9_ret, align 8
   %t53 = getelementptr inbounds [5 x i8], ptr @.str.0, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t53, i64 %r422)
   %r34 = load i64, ptr %slot.nums, align 8
@@ -768,34 +823,40 @@ __mb7_merge:
   call void @nova_rc_dec(i64 %t135)
   %t136 = load i64, ptr %slot.__mb1_lst, align 8
   call void @nova_rc_dec(i64 %t136)
-  %t137 = load i64, ptr %slot.__mb2_lst, align 8
+  %t137 = load i64, ptr %slot.__mb8_lst, align 8
   call void @nova_rc_dec(i64 %t137)
-  %t138 = load i64, ptr %slot.__mb3_lst, align 8
+  %t138 = load i64, ptr %slot.__mb9_lst, align 8
   call void @nova_rc_dec(i64 %t138)
-  %t139 = load i64, ptr %slot.__mb4_lst, align 8
+  %t139 = load i64, ptr %slot.__mb2_lst, align 8
   call void @nova_rc_dec(i64 %t139)
-  %t140 = load i64, ptr %slot.__mb5_result, align 8
+  %t140 = load i64, ptr %slot.__mb3_lst, align 8
   call void @nova_rc_dec(i64 %t140)
-  %t141 = load i64, ptr %slot.__mb5_ret, align 8
+  %t141 = load i64, ptr %slot.__mb4_lst, align 8
   call void @nova_rc_dec(i64 %t141)
-  %t142 = load i64, ptr %slot.__mb6_lst, align 8
+  %t142 = load i64, ptr %slot.__mb5_result, align 8
   call void @nova_rc_dec(i64 %t142)
-  %t143 = load i64, ptr %slot.__mb6_result, align 8
+  %t143 = load i64, ptr %slot.__mb5_ret, align 8
   call void @nova_rc_dec(i64 %t143)
-  %t144 = load i64, ptr %slot.__mb6_ret, align 8
+  %t144 = load i64, ptr %slot.__mb6_lst, align 8
   call void @nova_rc_dec(i64 %t144)
-  %t145 = load i64, ptr %slot.__mb7_lst, align 8
+  %t145 = load i64, ptr %slot.__mb6_result, align 8
   call void @nova_rc_dec(i64 %t145)
-  %t146 = load i64, ptr %slot.__mb7_result, align 8
+  %t146 = load i64, ptr %slot.__mb6_ret, align 8
   call void @nova_rc_dec(i64 %t146)
-  %t147 = load i64, ptr %slot.__mb7_ret, align 8
+  %t147 = load i64, ptr %slot.__mb7_lst, align 8
   call void @nova_rc_dec(i64 %t147)
+  %t148 = load i64, ptr %slot.__mb7_result, align 8
+  call void @nova_rc_dec(i64 %t148)
+  %t149 = load i64, ptr %slot.__mb7_ret, align 8
+  call void @nova_rc_dec(i64 %t149)
   ret i64 0
 }
 
-define i32 @main() nounwind {
+define i32 @main(i32 %argc, ptr %argv) nounwind {
 entry:
-  call void @nova_rt_init()
+  %argc64 = sext i32 %argc to i64
+  %argv64 = ptrtoint ptr %argv to i64
+  call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
   call i64 @nova_main()
   call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()

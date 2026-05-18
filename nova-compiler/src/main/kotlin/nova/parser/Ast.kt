@@ -15,13 +15,15 @@ data class FnDecl(
     val returnType: TypeExpr?,
     val body: Block,
     override val span: SourceSpan,
-    val receiverType: String? = null
+    val receiverType: String? = null,
+    val typeParams: List<String> = emptyList()
 ) : Stmt()
 
 data class TypeDecl(
     val name: String,
     val fields: List<Field>,
-    override val span: SourceSpan
+    override val span: SourceSpan,
+    val typeParams: List<String> = emptyList()
 ) : Stmt()
 
 data class EnumDecl(
@@ -29,6 +31,14 @@ data class EnumDecl(
     val variants: List<EnumVariant>,
     override val span: SourceSpan
 ) : Stmt()
+
+data class TraitDecl(
+    val name: String,
+    val methods: List<TraitMethod>,
+    override val span: SourceSpan
+) : Stmt()
+
+data class TraitMethod(val name: String, val params: List<Param>, val returnType: TypeExpr?, val span: SourceSpan)
 
 data class ImportStmt(
     val path: List<String>,
@@ -61,6 +71,7 @@ data class WhileStmt(
 // Do NOT use in type inference or interpreter — use IfBlockExpr instead.
 
 data class ReturnStmt(val value: Expr?, override val span: SourceSpan) : Stmt()
+data class YieldStmt(val value: Expr, override val span: SourceSpan) : Stmt()
 data class BreakStmt(override val span: SourceSpan) : Stmt()
 data class ContinueStmt(override val span: SourceSpan) : Stmt()
 
@@ -208,7 +219,7 @@ data class Arg(
     val span: SourceSpan
 )
 
-data class MatchArm(val pattern: Pattern, val body: ForExprBody, val span: SourceSpan)
+data class MatchArm(val pattern: Pattern, val body: ForExprBody, val span: SourceSpan, val guard: Expr? = null)
 
 // Body for both lambda and for-expression: single expr or indented block.
 sealed class ForExprBody { abstract val span: SourceSpan }

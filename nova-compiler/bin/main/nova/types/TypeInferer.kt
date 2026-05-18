@@ -43,10 +43,19 @@ class TypeInferer {
     private var currentReturnVar: NovaType? = null
     private var currentProgram: Program? = null
 
+    // Current yield element type variable — set in generator functions (those containing yield)
+    // so YieldStmt can constrain the element type, and retVar gets TList(yieldVar).
+    private var currentYieldVar: NovaType? = null
+
     // Struct field registry: struct name → field map
     private val structRegistry = mutableMapOf<String, Map<String, NovaType>>()
+    // Generic struct registry: struct name → type param names
+    private val genericStructRegistry = mutableMapOf<String, List<String>>()
     // Method registry: struct name → (method name → mangled function name)
     val methodRegistry = mutableMapOf<String, MutableMap<String, String>>()
+    // Trait registry: trait name → list of (method name, param types, return type)
+    data class TraitMethodSig(val name: String, val paramTypes: List<NovaType>, val returnType: NovaType)
+    val traitRegistry = mutableMapOf<String, List<TraitMethodSig>>()
 
     // ── Entry point ───────────────────────────────────────────────────────────
 
@@ -124,18 +133,18 @@ class TypeInferer {
         return ids
     }
 
-    private fun collectFreeVars(t: NovaType, out: MutableSet<Int>) {
+    private fun collectFreeVars(t: NovaType, out: MutableSet<Int>, seen: MutableSet<String> = mutableSetOf()) {
         when (val w = env.walk(t)) {
             is TypeVar  -> out.add(w.id)
-            is TList    -> collectFreeVars(w.elem, out)
-            is TDict    -> { collectFreeVars(w.key, out); collectFreeVars(w.value, out) }
-            is TTuple   -> w.elements.forEach { collectFreeVars(it, out) }
-            is TChannel -> collectFreeVars(w.payload, out)
-            is TFn      -> { w.params.forEach { collectFreeVars(it, out) }; collectFreeVars(w.ret, out) }
-            is TStruct  -> w.fields.values.forEach { collectFreeVars(it, out) }
-            is TRecord  -> w.fields.values.forEach { collectFreeVars(it, out) }
-            is TSumType -> { collectFreeVars(w.ok, out); collectFreeVars(w.err, out) }
-            is TProcess -> collectFreeVars(w.yieldType, out)
+            is TList    -> collectFreeVars(w.elem, out, seen)
+            is TDict    -> { collectFreeVars(w.key, out, seen); collectFreeVars(w.value, out, seen) }
+            is TTuple   -> w.elements.forEach { collectFreeVars(it, out, seen) }
+            is TChannel -> collectFreeVars(w.payload, out, seen)
+            is TFn      -> { w.params.forEach { collectFreeVars(it, out, seen) }; collectFreeVars(w.ret, out, seen) }
+            is TStruct  -> { if (seen.add(w.name)) w.fields.values.forEach { collectFreeVars(it, out, seen) } }
+            is TRecord  -> w.fields.values.forEach { collectFreeVars(it, out, seen) }
+            is TSumType -> { collectFreeVars(w.ok, out, seen); collectFreeVars(w.err, out, seen) }
+            is TProcess -> collectFreeVars(w.yieldType, out, seen)
             else        -> {}
         }
     }
@@ -158,12 +167,22 @@ class TypeInferer {
                 for ((_, s) in frame) collectFreeVars(s.body, outerFree)
             }
 
+            // If explicit type params, create TypeVars for them in a temp scope
+            val tpScope = if (stmt.typeParams.isNotEmpty()) {
+                val m = mutableMapOf<String, TypeScheme>()
+                stmt.typeParams.forEach { name -> m[name] = TypeScheme.mono(fresh()) }
+                scope.addFirst(m)
+                m
+            } else null
+
             val paramTypes = stmt.params.map { p ->
                 val t = if (p.type != null) typeExprToType(p.type) else fresh()
                 if (p.default != null) constrain(t, inferExpr(p.default), p.span)
                 t
             }
             val retVar = if (stmt.returnType != null) typeExprToType(stmt.returnType) else fresh()
+
+            if (tpScope != null) scope.removeFirst()
 
             val isMethod = stmt.receiverType != null
             val mangledName = if (isMethod) "${stmt.receiverType}__${stmt.name}" else stmt.name
@@ -183,7 +202,16 @@ class TypeInferer {
 
             val savedReturnVar = currentReturnVar
             currentReturnVar = retVar
+            val savedYieldVar = currentYieldVar
+            val isGenerator = blockContainsYield(stmt.body)
+            val yieldElemVar = if (isGenerator) fresh() else null
+            currentYieldVar = yieldElemVar
+            if (isGenerator) {
+                constrain(retVar, TList(yieldElemVar!!), stmt.span)
+            }
             pushScope()
+            // Re-inject type param vars for body inference
+            tpScope?.forEach { (name, scheme) -> define(name, scheme) }
             if (selfType != null) {
                 define("self", TypeScheme.mono(selfType))
             }
@@ -191,11 +219,12 @@ class TypeInferer {
                 define(p.name, TypeScheme.mono(pt))
             }
             val bodyType = inferBlock(stmt.body)
-            if (bodyType != TUnit || !blockContainsReturn(stmt.body)) {
+            if (!isGenerator && (bodyType != TUnit || !blockContainsReturn(stmt.body))) {
                 constrain(retVar, bodyType, stmt.body.span)
             }
             popScope()
             currentReturnVar = savedReturnVar
+            currentYieldVar = savedYieldVar
 
             solve()
 
@@ -209,10 +238,24 @@ class TypeInferer {
         }
 
         is TypeDecl -> {
-            val fieldTypes = stmt.fields.associate { f -> f.name to typeExprToType(f.type) }
-            val structType = TStruct(stmt.name, fieldTypes)
-            structRegistry[stmt.name] = fieldTypes
-            define(stmt.name, TypeScheme.mono(TFn(fieldTypes.values.toList(), structType)))
+            if (stmt.typeParams.isNotEmpty()) {
+                val tpVars = stmt.typeParams.associateWith { fresh() }
+                pushScope()
+                tpVars.forEach { (name, tv) -> define(name, TypeScheme.mono(tv)) }
+                val fieldTypes = stmt.fields.associate { f -> f.name to typeExprToType(f.type) }
+                popScope()
+                val structType = TStruct(stmt.name, fieldTypes)
+                structRegistry[stmt.name] = fieldTypes
+                genericStructRegistry[stmt.name] = stmt.typeParams
+                val ctorType = TFn(fieldTypes.values.toList(), structType)
+                val quantified = tpVars.values.map { it.id }.toSet()
+                define(stmt.name, TypeScheme(quantified, ctorType))
+            } else {
+                val fieldTypes = stmt.fields.associate { f -> f.name to typeExprToType(f.type) }
+                val structType = TStruct(stmt.name, fieldTypes)
+                structRegistry[stmt.name] = fieldTypes
+                define(stmt.name, TypeScheme.mono(TFn(fieldTypes.values.toList(), structType)))
+            }
             TUnit
         }
 
@@ -224,6 +267,18 @@ class TypeInferer {
                 val ctorType = TFn(vFieldTypes, variantType)
                 define(v.name, TypeScheme.mono(ctorType))
             }
+            TUnit
+        }
+
+        is TraitDecl -> {
+            val methods = stmt.methods.map { m ->
+                val paramTypes = m.params.map { p ->
+                    if (p.type != null) typeExprToType(p.type) else fresh()
+                }
+                val retType = if (m.returnType != null) typeExprToType(m.returnType) else fresh()
+                TraitMethodSig(m.name, paramTypes, retType)
+            }
+            traitRegistry[stmt.name] = methods
             TUnit
         }
 
@@ -281,6 +336,12 @@ class TypeInferer {
                 constrain(currentReturnVar!!, valType, stmt.span)
             }
             TNothing
+        }
+        is YieldStmt     -> {
+            val valType = inferExpr(stmt.value)
+            val yv = currentYieldVar
+            if (yv != null) constrain(yv, valType, stmt.span)
+            TUnit
         }
         is BreakStmt     -> TUnit
         is ContinueStmt  -> TUnit
@@ -721,6 +782,10 @@ class TypeInferer {
         for (arm in expr.arms) {
             pushScope()
             bindPattern(arm.pattern, subjType)
+            if (arm.guard != null) {
+                val guardType = inferExpr(arm.guard)
+                constrain(guardType, TBool, arm.span)
+            }
             val armType = when (val b = arm.body) {
                 is ExprBody  -> inferExpr(b.expr)
                 is BlockBody -> inferBlock(b.block)
@@ -765,6 +830,7 @@ class TypeInferer {
         val walked = env.walk(iterType)
         when (walked) {
             TRange         -> constrain(elemVar, TInt, span)
+            TString        -> constrain(elemVar, TString, span)
             is TList       -> constrain(elemVar, walked.elem, span)
             is TDict       -> constrain(elemVar, walked.key, span)
             is TRecord     -> constrain(elemVar, TString, span)
@@ -779,7 +845,11 @@ class TypeInferer {
         is NamedType  -> when (te.name) {
             "int"    -> TInt;   "float"  -> TFloat;  "string" -> TString
             "bool"   -> TBool;  "byte"   -> TByte;   "Unit"   -> TUnit
-            else     -> lookup(te.name) ?: fresh()
+            else     -> {
+                val fields = structRegistry[te.name]
+                if (fields != null) TStruct(te.name, fields)
+                else lookup(te.name) ?: fresh()
+            }
         }
         is GenericType -> when (te.name) {
             "List"    -> TList(if (te.args.isNotEmpty()) typeExprToType(te.args[0]) else fresh())
@@ -788,7 +858,13 @@ class TypeInferer {
                 if (te.args.size > 1) typeExprToType(te.args[1]) else fresh()
             )
             "Channel" -> TChannel(if (te.args.isNotEmpty()) typeExprToType(te.args[0]) else fresh())
-            else      -> lookup(te.name) ?: fresh()
+            else      -> {
+                val scheme = scope.firstNotNullOfOrNull { it[te.name] }
+                    ?: Stdlib.functions[te.name]
+                if (scheme != null) {
+                    instantiate(scheme)
+                } else fresh()
+            }
         }
         is UnionType  -> TSumType(typeExprToType(te.left), typeExprToType(te.right))
         is OptionalType -> TSumType(typeExprToType(te.inner), TUnit)
@@ -819,6 +895,11 @@ class TypeInferer {
             solvedUpTo++
         }
     }
+
+    private fun blockContainsYield(block: Block): Boolean =
+        block.stmts.any { it is YieldStmt ||
+            (it is WhileStmt && blockContainsYield(it.body)) ||
+            (it is ForStmt && blockContainsYield(it.body)) }
 
     private fun blockContainsReturn(block: Block): Boolean =
         block.stmts.any { stmt -> when (stmt) {

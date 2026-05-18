@@ -8,6 +8,7 @@ declare noalias ptr @malloc(i64) nounwind allocsize(0)
 declare noalias ptr @calloc(i64, i64) nounwind
 declare ptr @realloc(ptr, i64) nounwind allocsize(1)
 declare void @free(ptr) nounwind
+declare ptr @nova_rt_struct_alloc(i64) nounwind
 declare i64 @llvm.smax.i64(i64, i64) nounwind readnone
 ; nova runtime — list ops
 declare i64 @nova_rt_list_create() nounwind
@@ -33,6 +34,7 @@ declare i64 @nova_rt_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_upper(i64) nounwind
 declare i64 @nova_rt_lower(i64) nounwind
 declare i64 @nova_rt_trim(i64) nounwind
+declare i64 @nova_rt_repeat(i64, i64) nounwind
 declare i64 @nova_rt_split(i64, i64) nounwind
 declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind readonly
@@ -82,10 +84,54 @@ declare i64 @nova_rt_json_stringify(i64) nounwind
 ; nova runtime — HTTP ops
 declare i64 @nova_rt_http_get(i64) nounwind
 declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+; nova runtime — time ops
+declare i64 @nova_rt_time_ms() nounwind
+declare i64 @nova_rt_clock_ns() nounwind
+declare void @nova_rt_sleep_ms(i64) nounwind
+declare void @nova_rt_assert(i64, i64) nounwind
 ; nova runtime — type dispatch
 declare i64 @nova_rt_any_to_str(i64) nounwind
 declare i64 @nova_rt_str_concat_safe(i64, i64) nounwind
+declare i64 @nova_rt_str_char_at(i64, i64) nounwind
 declare void @nova_rt_init() nounwind
+declare void @nova_rt_init_args(i64, i64) nounwind
+; nova runtime — system ops
+declare i64 @nova_rt_args() nounwind
+declare i64 @nova_rt_env(i64) nounwind
+declare i64 @nova_rt_random_int(i64, i64) nounwind
+declare i64 @nova_rt_random_float() nounwind
+declare i64 @nova_rt_shell(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_path_ext(i64) nounwind
+; nova runtime — regex ops
+declare i64 @nova_rt_regex_match(i64, i64) nounwind readonly
+declare i64 @nova_rt_regex_find(i64, i64) nounwind
+declare i64 @nova_rt_regex_replace(i64, i64, i64) nounwind
+declare i64 @nova_rt_regex_split(i64, i64) nounwind
+; nova runtime — network ops
+declare i64 @nova_rt_tcp_connect(i64, i64) nounwind
+declare i64 @nova_rt_tcp_listen(i64) nounwind
+declare i64 @nova_rt_tcp_accept(i64) nounwind
+declare i64 @nova_rt_tcp_send(i64, i64) nounwind
+declare i64 @nova_rt_tcp_recv(i64) nounwind
+declare void @nova_rt_tcp_close(i64) nounwind
+declare i64 @nova_rt_udp_bind(i64) nounwind
+declare i64 @nova_rt_udp_send(i64, i64, i64, i64) nounwind
+declare i64 @nova_rt_udp_recv(i64) nounwind
+; nova runtime — HTTP server
+declare i64 @nova_rt_http_listen(i64) nounwind
+declare i64 @nova_rt_http_accept(i64) nounwind
+declare void @nova_rt_http_respond(i64, i64, i64) nounwind
+; nova runtime — byte arrays
+declare i64 @nova_rt_bytes_create(i64) nounwind
+declare i64 @nova_rt_bytes_get(i64, i64) nounwind
+declare void @nova_rt_bytes_set(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_len(i64) nounwind
+declare i64 @nova_rt_bytes_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_to_str(i64) nounwind
+declare i64 @nova_rt_str_to_bytes(i64) nounwind
 ; nova runtime — channel/spawn ops
 declare i64 @nova_rt_channel_create() nounwind
 declare i64 @nova_rt_channel_send(i64, i64) nounwind
@@ -330,8 +376,10 @@ entry0:
   %slot.ci = alloca i64, align 8
   %slot.lpf_nums = alloca i64, align 8
   %slot.li = alloca i64, align 8
-  %slot.__mb0_count = alloca i64, align 8
-  %slot.__mb0_candidate = alloca i64, align 8
+  %slot.__mb37_ret = alloca i64, align 8
+  %slot.__mb37_n = alloca i64, align 8
+  %slot.__mb37_count = alloca i64, align 8
+  %slot.__mb37_candidate = alloca i64, align 8
   %slot.__mb15_ret = alloca i64, align 8
   %slot.__mb15_width = alloca i64, align 8
   %slot.__mb15_s = alloca i64, align 8
@@ -348,8 +396,11 @@ entry0:
   %slot.__mb17_n = alloca i64, align 8
   %slot.__mb17_result = alloca i64, align 8
   %slot.__mb17_i = alloca i64, align 8
-  %slot.__mb1_a = alloca i64, align 8
-  %slot.__mb1_b = alloca i64, align 8
+  %slot.__mb38_ret = alloca i64, align 8
+  %slot.__mb38_n = alloca i64, align 8
+  %slot.__mb38_a = alloca i64, align 8
+  %slot.__mb38_b = alloca i64, align 8
+  %slot.__mb38_i = alloca i64, align 8
   %slot.__sc_and_2 = alloca i64, align 8
   %slot.__inl4_title = alloca i64, align 8
   %slot.__mb18_ret = alloca i64, align 8
@@ -403,10 +454,16 @@ entry0:
   %slot.__mb27_result = alloca i64, align 8
   %slot.__mb27_i = alloca i64, align 8
   %slot.__sc_and_3 = alloca i64, align 8
-  %slot.__mb2_count = alloca i64, align 8
-  %slot.__mb2___sc_and_0 = alloca i64, align 8
-  %slot.__mb3_count = alloca i64, align 8
-  %slot.__mb3___sc_and_0 = alloca i64, align 8
+  %slot.__mb39_ret = alloca i64, align 8
+  %slot.__mb39_n = alloca i64, align 8
+  %slot.__mb39_count = alloca i64, align 8
+  %slot.__mb39_i = alloca i64, align 8
+  %slot.__mb39___sc_and_0 = alloca i64, align 8
+  %slot.__mb40_ret = alloca i64, align 8
+  %slot.__mb40_n = alloca i64, align 8
+  %slot.__mb40_count = alloca i64, align 8
+  %slot.__mb40_i = alloca i64, align 8
+  %slot.__mb40___sc_and_0 = alloca i64, align 8
   %slot.__inl6_title = alloca i64, align 8
   %slot.__mb28_ret = alloca i64, align 8
   %slot.__mb28_s = alloca i64, align 8
@@ -418,7 +475,9 @@ entry0:
   %slot.__mb29_n = alloca i64, align 8
   %slot.__mb29_result = alloca i64, align 8
   %slot.__mb29_i = alloca i64, align 8
-  %slot.__mb4_steps = alloca i64, align 8
+  %slot.__mb41_ret = alloca i64, align 8
+  %slot.__mb41_n = alloca i64, align 8
+  %slot.__mb41_steps = alloca i64, align 8
   %slot.__inl7_title = alloca i64, align 8
   %slot.__mb30_ret = alloca i64, align 8
   %slot.__mb30_s = alloca i64, align 8
@@ -430,8 +489,10 @@ entry0:
   %slot.__mb31_n = alloca i64, align 8
   %slot.__mb31_result = alloca i64, align 8
   %slot.__mb31_i = alloca i64, align 8
-  %slot.__mb5_result = alloca i64, align 8
-  %slot.__mb5_d = alloca i64, align 8
+  %slot.__mb42_ret = alloca i64, align 8
+  %slot.__mb42_n = alloca i64, align 8
+  %slot.__mb42_result = alloca i64, align 8
+  %slot.__mb42_d = alloca i64, align 8
   %slot.__inl8_title = alloca i64, align 8
   %slot.__mb32_ret = alloca i64, align 8
   %slot.__mb32_s = alloca i64, align 8
@@ -1376,62 +1437,59 @@ while_header1:
 
 while_body2:
   %r105 = load i64, ptr %slot.j, align 8
-  br label %__mb0_entry0
+  br label %__mb37_entry0
 
-__mb0_entry0:
-  store i64 %r105, ptr %slot.__mb0_n, align 8
-  store i64 0, ptr %slot.__mb0_count, align 8
-  store i64 2, ptr %slot.__mb0_candidate, align 8
-  %r2006 = load i64, ptr %slot.__mb0_n, align 8
-  br label %__mb0_while_header1
+__mb37_entry0:
+  store i64 %r105, ptr %slot.__mb37_n, align 8
+  store i64 0, ptr %slot.__mb37_count, align 8
+  store i64 2, ptr %slot.__mb37_candidate, align 8
+  %r2006 = load i64, ptr %slot.__mb37_n, align 8
+  br label %__mb37_while_header1
 
-__mb0_while_header1:
-  %r2007 = load i64, ptr %slot.__mb0_count, align 8
+__mb37_while_header1:
+  %r2007 = load i64, ptr %slot.__mb37_count, align 8
   %t142 = icmp slt i64 %r2007, %r2006
-  br i1 %t142, label %__mb0_while_body2, label %__mb0_while_exit3, !prof !90
+  br i1 %t142, label %__mb37_while_body2, label %__mb37_while_exit3, !prof !90
 
-__mb0_while_body2:
-  %r2009 = load i64, ptr %slot.__mb0_candidate, align 8
+__mb37_while_body2:
+  %r2009 = load i64, ptr %slot.__mb37_candidate, align 8
   %r2010 = call i64 @is_prime(i64 %r2009)
   %t143 = trunc i64 %r2010 to i1
-  br i1 %t143, label %__mb0_ifb_then4, label %__mb0_ifb_else5
+  br i1 %t143, label %__mb37_ifb_then4, label %__mb37_ifb_else5
 
-__mb0_while_exit3:
-  %r2011 = load i64, ptr %slot.__mb0_candidate, align 8
-  %t144 = load i64, ptr %slot.__mb0_ret, align 8
-  call void @nova_rc_dec(i64 %t144)
-  call void @nova_rc_inc(i64 %r2011)
-  store i64 %r2011, ptr %slot.__mb0_ret, align 8
-  br label %__mb0_merge
+__mb37_while_exit3:
+  %r2011 = load i64, ptr %slot.__mb37_candidate, align 8
+  store i64 %r2011, ptr %slot.__mb37_ret, align 8
+  br label %__mb37_merge
 
-__mb0_ifb_then4:
-  %r2012 = load i64, ptr %slot.__mb0_count, align 8
+__mb37_ifb_then4:
+  %r2012 = load i64, ptr %slot.__mb37_count, align 8
   %r2014 = add i64 %r2012, 1
-  store i64 %r2014, ptr %slot.__mb0_count, align 8
-  br label %__mb0_ifb_merge6
+  store i64 %r2014, ptr %slot.__mb37_count, align 8
+  br label %__mb37_ifb_merge6
 
-__mb0_ifb_else5:
-  br label %__mb0_ifb_merge6
+__mb37_ifb_else5:
+  br label %__mb37_ifb_merge6
 
-__mb0_ifb_merge6:
-  %r2018 = load i64, ptr %slot.__mb0_count, align 8
-  %t145 = icmp slt i64 %r2018, %r2006
-  br i1 %t145, label %__mb0_ifb_then7, label %__mb0_ifb_else8
+__mb37_ifb_merge6:
+  %r2018 = load i64, ptr %slot.__mb37_count, align 8
+  %t144 = icmp slt i64 %r2018, %r2006
+  br i1 %t144, label %__mb37_ifb_then7, label %__mb37_ifb_else8
 
-__mb0_ifb_then7:
-  %r2020 = load i64, ptr %slot.__mb0_candidate, align 8
+__mb37_ifb_then7:
+  %r2020 = load i64, ptr %slot.__mb37_candidate, align 8
   %r2022 = add i64 %r2020, 1
-  store i64 %r2022, ptr %slot.__mb0_candidate, align 8
-  br label %__mb0_ifb_merge9
+  store i64 %r2022, ptr %slot.__mb37_candidate, align 8
+  br label %__mb37_ifb_merge9
 
-__mb0_ifb_else8:
-  br label %__mb0_ifb_merge9
+__mb37_ifb_else8:
+  br label %__mb37_ifb_merge9
 
-__mb0_ifb_merge9:
-  br label %__mb0_while_header1, !llvm.loop !91
+__mb37_ifb_merge9:
+  br label %__mb37_while_header1, !llvm.loop !91
 
-__mb0_merge:
-  %r2026 = load i64, ptr %slot.__mb0_ret, align 8
+__mb37_merge:
+  %r2026 = load i64, ptr %slot.__mb37_ret, align 8
   store i64 %r2026, ptr %slot.p, align 8
   %r110 = load i64, ptr %slot.row, align 8
   %r111 = load i64, ptr %slot.p, align 8
@@ -1440,13 +1498,13 @@ __mb0_merge:
 __mb15_entry0:
   store i64 5, ptr %slot.__mb15_width, align 8
   %r1178 = call i64 @nova_rt_int_to_str(i64 %r111)
-  %t146 = load i64, ptr %slot.__mb15_s, align 8
-  call void @nova_rc_dec(i64 %t146)
+  %t145 = load i64, ptr %slot.__mb15_s, align 8
+  call void @nova_rc_dec(i64 %t145)
   store i64 %r1178, ptr %slot.__mb15_s, align 8
-  %t147 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1182 = ptrtoint ptr %t147 to i64
-  %t148 = load i64, ptr %slot.__mb15_result, align 8
-  call void @nova_rc_dec(i64 %t148)
+  %t146 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1182 = ptrtoint ptr %t146 to i64
+  %t147 = load i64, ptr %slot.__mb15_result, align 8
+  call void @nova_rc_dec(i64 %t147)
   store i64 %r1182, ptr %slot.__mb15_result, align 8
   %r1187 = call i64 @nova_rt_len(i64 %r1178)
   store i64 %r1187, ptr %slot.__mb15_i, align 8
@@ -1455,17 +1513,17 @@ __mb15_entry0:
 
 __mb15_while_header1:
   %r1191 = load i64, ptr %slot.__mb15_i, align 8
-  %t149 = icmp slt i64 %r1191, %r1960
-  br i1 %t149, label %__mb15_while_body2, label %__mb15_while_exit3, !prof !90
+  %t148 = icmp slt i64 %r1191, %r1960
+  br i1 %t148, label %__mb15_while_body2, label %__mb15_while_exit3, !prof !90
 
 __mb15_while_body2:
   %r1195 = load i64, ptr %slot.__mb15_result, align 8
-  %t150 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r1196 = ptrtoint ptr %t150 to i64
-  %t151 = call i64 @nova_rt_str_concat(i64 %r1195, i64 %r1196)
-  %t152 = load i64, ptr %slot.__mb15_result, align 8
-  call void @nova_rc_dec(i64 %t152)
-  store i64 %t151, ptr %slot.__mb15_result, align 8
+  %t149 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r1196 = ptrtoint ptr %t149 to i64
+  %t150 = call i64 @nova_rt_str_concat(i64 %r1195, i64 %r1196)
+  %t151 = load i64, ptr %slot.__mb15_result, align 8
+  call void @nova_rc_dec(i64 %t151)
+  store i64 %t150, ptr %slot.__mb15_result, align 8
   %r1200 = load i64, ptr %slot.__mb15_i, align 8
   %r1202 = add i64 %r1200, 1
   store i64 %r1202, ptr %slot.__mb15_i, align 8
@@ -1474,46 +1532,46 @@ __mb15_while_body2:
 __mb15_while_exit3:
   %r1206 = load i64, ptr %slot.__mb15_result, align 8
   %r1207 = load i64, ptr %slot.__mb15_s, align 8
-  %t153 = call i64 @nova_rt_str_concat(i64 %r1206, i64 %r1207)
-  %t154 = load i64, ptr %slot.__mb15_ret, align 8
-  call void @nova_rc_dec(i64 %t154)
-  store i64 %t153, ptr %slot.__mb15_ret, align 8
+  %t152 = call i64 @nova_rt_str_concat(i64 %r1206, i64 %r1207)
+  %t153 = load i64, ptr %slot.__mb15_ret, align 8
+  call void @nova_rc_dec(i64 %t153)
+  store i64 %t152, ptr %slot.__mb15_ret, align 8
   br label %__mb15_merge
 
 __mb15_merge:
   %r1209 = load i64, ptr %slot.__mb15_ret, align 8
-  %t155 = call i64 @nova_rt_str_concat(i64 %r110, i64 %r1209)
-  %t156 = load i64, ptr %slot.row, align 8
-  call void @nova_rc_dec(i64 %t156)
-  store i64 %t155, ptr %slot.row, align 8
+  %t154 = call i64 @nova_rt_str_concat(i64 %r110, i64 %r1209)
+  %t155 = load i64, ptr %slot.row, align 8
+  call void @nova_rc_dec(i64 %t155)
+  store i64 %t154, ptr %slot.row, align 8
   %r117 = load i64, ptr %slot.j, align 8
   %r119 = srem i64 %r117, 10
-  %t157 = icmp eq i64 %r119, 0
-  br i1 %t157, label %ifb_then4, label %ifb_else5
+  %t156 = icmp eq i64 %r119, 0
+  br i1 %t156, label %ifb_then4, label %ifb_else5
 
 while_exit3:
-  %t158 = getelementptr inbounds [53 x i8], ptr @.str.15, i64 0, i64 0
-  %r139 = ptrtoint ptr %t158 to i64
-  %t159 = load i64, ptr %slot.__inl3_title, align 8
-  call void @nova_rc_dec(i64 %t159)
+  %t157 = getelementptr inbounds [53 x i8], ptr @.str.15, i64 0, i64 0
+  %r139 = ptrtoint ptr %t157 to i64
+  %t158 = load i64, ptr %slot.__inl3_title, align 8
+  call void @nova_rc_dec(i64 %t158)
   store i64 %r139, ptr %slot.__inl3_title, align 8
-  %t160 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r533 = ptrtoint ptr %t160 to i64
-  %t161 = inttoptr i64 %r533 to ptr
-  call i32 @puts(ptr %t161)
-  %t162 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r535 = ptrtoint ptr %t162 to i64
+  %t159 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r533 = ptrtoint ptr %t159 to i64
+  %t160 = inttoptr i64 %r533 to ptr
+  call i32 @puts(ptr %t160)
+  %t161 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r535 = ptrtoint ptr %t161 to i64
   br label %__mb16_entry0
 
 __mb16_entry0:
-  %t163 = load i64, ptr %slot.__mb16_s, align 8
-  call void @nova_rc_dec(i64 %t163)
+  %t162 = load i64, ptr %slot.__mb16_s, align 8
+  call void @nova_rc_dec(i64 %t162)
   store i64 %r535, ptr %slot.__mb16_s, align 8
   store i64 48, ptr %slot.__mb16_n, align 8
-  %t164 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1217 = ptrtoint ptr %t164 to i64
-  %t165 = load i64, ptr %slot.__mb16_result, align 8
-  call void @nova_rc_dec(i64 %t165)
+  %t163 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1217 = ptrtoint ptr %t163 to i64
+  %t164 = load i64, ptr %slot.__mb16_result, align 8
+  call void @nova_rc_dec(i64 %t164)
   store i64 %r1217, ptr %slot.__mb16_result, align 8
   store i64 0, ptr %slot.__mb16_i, align 8
   %r1961 = load i64, ptr %slot.__mb16_n, align 8
@@ -1522,15 +1580,15 @@ __mb16_entry0:
 
 __mb16_while_header1:
   %r1225 = load i64, ptr %slot.__mb16_i, align 8
-  %t166 = icmp slt i64 %r1225, %r1961
-  br i1 %t166, label %__mb16_while_body2, label %__mb16_while_exit3, !prof !90
+  %t165 = icmp slt i64 %r1225, %r1961
+  br i1 %t165, label %__mb16_while_body2, label %__mb16_while_exit3, !prof !90
 
 __mb16_while_body2:
   %r1229 = load i64, ptr %slot.__mb16_result, align 8
-  %t167 = call i64 @nova_rt_str_concat(i64 %r1229, i64 %r1962)
-  %t168 = load i64, ptr %slot.__mb16_result, align 8
-  call void @nova_rc_dec(i64 %t168)
-  store i64 %t167, ptr %slot.__mb16_result, align 8
+  %t166 = call i64 @nova_rt_str_concat(i64 %r1229, i64 %r1962)
+  %t167 = load i64, ptr %slot.__mb16_result, align 8
+  call void @nova_rc_dec(i64 %t167)
+  store i64 %t166, ptr %slot.__mb16_result, align 8
   %r1234 = load i64, ptr %slot.__mb16_i, align 8
   %r1236 = add i64 %r1234, 1
   store i64 %r1236, ptr %slot.__mb16_i, align 8
@@ -1538,36 +1596,36 @@ __mb16_while_body2:
 
 __mb16_while_exit3:
   %r1240 = load i64, ptr %slot.__mb16_result, align 8
-  %t169 = load i64, ptr %slot.__mb16_ret, align 8
-  call void @nova_rc_dec(i64 %t169)
+  %t168 = load i64, ptr %slot.__mb16_ret, align 8
+  call void @nova_rc_dec(i64 %t168)
   call void @nova_rc_inc(i64 %r1240)
   store i64 %r1240, ptr %slot.__mb16_ret, align 8
   br label %__mb16_merge
 
 __mb16_merge:
   %r1241 = load i64, ptr %slot.__mb16_ret, align 8
-  %t170 = inttoptr i64 %r1241 to ptr
-  call i32 @puts(ptr %t170)
-  %t171 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r539 = ptrtoint ptr %t171 to i64
+  %t169 = inttoptr i64 %r1241 to ptr
+  call i32 @puts(ptr %t169)
+  %t170 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r539 = ptrtoint ptr %t170 to i64
   %r540 = load i64, ptr %slot.__inl3_title, align 8
-  %t172 = call i64 @nova_rt_str_concat(i64 %r539, i64 %r540)
-  %t173 = inttoptr i64 %t172 to ptr
-  call i32 @puts(ptr %t173)
-  call void @nova_rc_dec(i64 %t172)
-  %t174 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r543 = ptrtoint ptr %t174 to i64
+  %t171 = call i64 @nova_rt_str_concat(i64 %r539, i64 %r540)
+  %t172 = inttoptr i64 %t171 to ptr
+  call i32 @puts(ptr %t172)
+  call void @nova_rc_dec(i64 %t171)
+  %t173 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r543 = ptrtoint ptr %t173 to i64
   br label %__mb17_entry0
 
 __mb17_entry0:
-  %t175 = load i64, ptr %slot.__mb17_s, align 8
-  call void @nova_rc_dec(i64 %t175)
+  %t174 = load i64, ptr %slot.__mb17_s, align 8
+  call void @nova_rc_dec(i64 %t174)
   store i64 %r543, ptr %slot.__mb17_s, align 8
   store i64 48, ptr %slot.__mb17_n, align 8
-  %t176 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1249 = ptrtoint ptr %t176 to i64
-  %t177 = load i64, ptr %slot.__mb17_result, align 8
-  call void @nova_rc_dec(i64 %t177)
+  %t175 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1249 = ptrtoint ptr %t175 to i64
+  %t176 = load i64, ptr %slot.__mb17_result, align 8
+  call void @nova_rc_dec(i64 %t176)
   store i64 %r1249, ptr %slot.__mb17_result, align 8
   store i64 0, ptr %slot.__mb17_i, align 8
   %r1963 = load i64, ptr %slot.__mb17_n, align 8
@@ -1576,15 +1634,15 @@ __mb17_entry0:
 
 __mb17_while_header1:
   %r1257 = load i64, ptr %slot.__mb17_i, align 8
-  %t178 = icmp slt i64 %r1257, %r1963
-  br i1 %t178, label %__mb17_while_body2, label %__mb17_while_exit3, !prof !90
+  %t177 = icmp slt i64 %r1257, %r1963
+  br i1 %t177, label %__mb17_while_body2, label %__mb17_while_exit3, !prof !90
 
 __mb17_while_body2:
   %r1261 = load i64, ptr %slot.__mb17_result, align 8
-  %t179 = call i64 @nova_rt_str_concat(i64 %r1261, i64 %r1964)
-  %t180 = load i64, ptr %slot.__mb17_result, align 8
-  call void @nova_rc_dec(i64 %t180)
-  store i64 %t179, ptr %slot.__mb17_result, align 8
+  %t178 = call i64 @nova_rt_str_concat(i64 %r1261, i64 %r1964)
+  %t179 = load i64, ptr %slot.__mb17_result, align 8
+  call void @nova_rc_dec(i64 %t179)
+  store i64 %t178, ptr %slot.__mb17_result, align 8
   %r1266 = load i64, ptr %slot.__mb17_i, align 8
   %r1268 = add i64 %r1266, 1
   store i64 %r1268, ptr %slot.__mb17_i, align 8
@@ -1592,27 +1650,27 @@ __mb17_while_body2:
 
 __mb17_while_exit3:
   %r1272 = load i64, ptr %slot.__mb17_result, align 8
-  %t181 = load i64, ptr %slot.__mb17_ret, align 8
-  call void @nova_rc_dec(i64 %t181)
+  %t180 = load i64, ptr %slot.__mb17_ret, align 8
+  call void @nova_rc_dec(i64 %t180)
   call void @nova_rc_inc(i64 %r1272)
   store i64 %r1272, ptr %slot.__mb17_ret, align 8
   br label %__mb17_merge
 
 __mb17_merge:
   %r1273 = load i64, ptr %slot.__mb17_ret, align 8
-  %t182 = inttoptr i64 %r1273 to ptr
-  call i32 @puts(ptr %t182)
+  %t181 = inttoptr i64 %r1273 to ptr
+  call i32 @puts(ptr %t181)
   store i64 0, ptr %slot.k, align 8
   br label %while_header7, !llvm.loop !91
 
 ifb_then4:
   %r124 = load i64, ptr %slot.row, align 8
-  %t183 = inttoptr i64 %r124 to ptr
-  call i32 @puts(ptr %t183)
-  %t184 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r126 = ptrtoint ptr %t184 to i64
-  %t185 = load i64, ptr %slot.row, align 8
-  call void @nova_rc_dec(i64 %t185)
+  %t182 = inttoptr i64 %r124 to ptr
+  call i32 @puts(ptr %t182)
+  %t183 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r126 = ptrtoint ptr %t183 to i64
+  %t184 = load i64, ptr %slot.row, align 8
+  call void @nova_rc_dec(i64 %t184)
   store i64 %r126, ptr %slot.row, align 8
   br label %ifb_merge6
 
@@ -1627,104 +1685,102 @@ ifb_merge6:
 
 while_header7:
   %r145 = load i64, ptr %slot.k, align 8
-  %t186 = icmp sle i64 %r145, 20
-  br i1 %t186, label %while_body8, label %while_exit9, !prof !90
+  %t185 = icmp sle i64 %r145, 20
+  br i1 %t185, label %while_body8, label %while_exit9, !prof !90
 
 while_body8:
   %r149 = load i64, ptr %slot.k, align 8
-  br label %__mb1_entry0
+  br label %__mb38_entry0
 
-__mb1_entry0:
-  store i64 %r149, ptr %slot.__mb1_n, align 8
-  %t187 = icmp sle i64 %r149, 0
-  br i1 %t187, label %__mb1_ifb_then1, label %__mb1_ifb_else2
+__mb38_entry0:
+  store i64 %r149, ptr %slot.__mb38_n, align 8
+  %t186 = icmp sle i64 %r149, 0
+  br i1 %t186, label %__mb38_ifb_then1, label %__mb38_ifb_else2
 
-__mb1_ifb_then1:
-  %t188 = load i64, ptr %slot.__mb1_ret, align 8
-  call void @nova_rc_dec(i64 %t188)
-  store i64 0, ptr %slot.__mb1_ret, align 8
-  br label %__mb1_merge
+__mb38_ifb_then1:
+  store i64 0, ptr %slot.__mb38_ret, align 8
+  br label %__mb38_merge
 
-__mb1_ifb_else2:
-  br label %__mb1_ifb_merge3
+__mb38_ifb_else2:
+  br label %__mb38_ifb_merge3
 
-__mb1_ifb_merge3:
-  %r2038 = load i64, ptr %slot.__mb1_n, align 8
-  %t189 = icmp eq i64 %r2038, 1
-  br i1 %t189, label %__mb1_ifb_then5, label %__mb1_ifb_else6
+__mb38_ifb_merge3:
+  %r2038 = load i64, ptr %slot.__mb38_n, align 8
+  %t187 = icmp eq i64 %r2038, 1
+  br i1 %t187, label %__mb38_ifb_then5, label %__mb38_ifb_else6
 
-__mb1_ifb_then5:
-  store i64 1, ptr %slot.__mb1_ret, align 8
-  br label %__mb1_merge
+__mb38_ifb_then5:
+  store i64 1, ptr %slot.__mb38_ret, align 8
+  br label %__mb38_merge
 
-__mb1_ifb_else6:
-  br label %__mb1_ifb_merge7
+__mb38_ifb_else6:
+  br label %__mb38_ifb_merge7
 
-__mb1_ifb_merge7:
-  store i64 0, ptr %slot.__mb1_a, align 8
-  store i64 1, ptr %slot.__mb1_b, align 8
-  store i64 2, ptr %slot.__mb1_i, align 8
-  %r2049 = load i64, ptr %slot.__mb1_n, align 8
-  br label %__mb1_while_header9
+__mb38_ifb_merge7:
+  store i64 0, ptr %slot.__mb38_a, align 8
+  store i64 1, ptr %slot.__mb38_b, align 8
+  store i64 2, ptr %slot.__mb38_i, align 8
+  %r2049 = load i64, ptr %slot.__mb38_n, align 8
+  br label %__mb38_while_header9
 
-__mb1_while_header9:
-  %r2050 = load i64, ptr %slot.__mb1_i, align 8
-  %t190 = icmp sle i64 %r2050, %r2049
-  br i1 %t190, label %__mb1_while_body10, label %__mb1_while_exit11, !prof !90
+__mb38_while_header9:
+  %r2050 = load i64, ptr %slot.__mb38_i, align 8
+  %t188 = icmp sle i64 %r2050, %r2049
+  br i1 %t188, label %__mb38_while_body10, label %__mb38_while_exit11, !prof !90
 
-__mb1_while_body10:
-  %r2052 = load i64, ptr %slot.__mb1_a, align 8
-  %r2053 = load i64, ptr %slot.__mb1_b, align 8
+__mb38_while_body10:
+  %r2052 = load i64, ptr %slot.__mb38_a, align 8
+  %r2053 = load i64, ptr %slot.__mb38_b, align 8
   %r2054 = add i64 %r2052, %r2053
-  %r2055 = load i64, ptr %slot.__mb1_b, align 8
-  store i64 %r2055, ptr %slot.__mb1_a, align 8
-  store i64 %r2054, ptr %slot.__mb1_b, align 8
-  %r2058 = load i64, ptr %slot.__mb1_i, align 8
+  %r2055 = load i64, ptr %slot.__mb38_b, align 8
+  store i64 %r2055, ptr %slot.__mb38_a, align 8
+  store i64 %r2054, ptr %slot.__mb38_b, align 8
+  %r2058 = load i64, ptr %slot.__mb38_i, align 8
   %r2060 = add i64 %r2058, 1
-  store i64 %r2060, ptr %slot.__mb1_i, align 8
-  br label %__mb1_while_header9, !llvm.loop !91
+  store i64 %r2060, ptr %slot.__mb38_i, align 8
+  br label %__mb38_while_header9, !llvm.loop !91
 
-__mb1_while_exit11:
-  %r2062 = load i64, ptr %slot.__mb1_b, align 8
-  store i64 %r2062, ptr %slot.__mb1_ret, align 8
-  br label %__mb1_merge
+__mb38_while_exit11:
+  %r2062 = load i64, ptr %slot.__mb38_b, align 8
+  store i64 %r2062, ptr %slot.__mb38_ret, align 8
+  br label %__mb38_merge
 
-__mb1_merge:
-  %r2063 = load i64, ptr %slot.__mb1_ret, align 8
+__mb38_merge:
+  %r2063 = load i64, ptr %slot.__mb38_ret, align 8
   store i64 %r2063, ptr %slot.f, align 8
-  %t191 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r154 = ptrtoint ptr %t191 to i64
-  %t192 = load i64, ptr %slot.mark, align 8
-  call void @nova_rc_dec(i64 %t192)
+  %t189 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r154 = ptrtoint ptr %t189 to i64
+  %t190 = load i64, ptr %slot.mark, align 8
+  call void @nova_rc_dec(i64 %t190)
   store i64 %r154, ptr %slot.mark, align 8
   %r159 = call i64 @is_prime(i64 %r2063)
   store i64 0, ptr %slot.__sc_and_2, align 8
-  %t193 = icmp ne i64 %r159, 0
-  br i1 %t193, label %sc_and_right10, label %sc_and_merge11
+  %t191 = icmp ne i64 %r159, 0
+  br i1 %t191, label %sc_and_right10, label %sc_and_merge11
 
 while_exit9:
-  %t194 = getelementptr inbounds [58 x i8], ptr @.str.16, i64 0, i64 0
-  %r201 = ptrtoint ptr %t194 to i64
-  %t195 = load i64, ptr %slot.__inl4_title, align 8
-  call void @nova_rc_dec(i64 %t195)
+  %t192 = getelementptr inbounds [58 x i8], ptr @.str.16, i64 0, i64 0
+  %r201 = ptrtoint ptr %t192 to i64
+  %t193 = load i64, ptr %slot.__inl4_title, align 8
+  call void @nova_rc_dec(i64 %t193)
   store i64 %r201, ptr %slot.__inl4_title, align 8
-  %t196 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r550 = ptrtoint ptr %t196 to i64
-  %t197 = inttoptr i64 %r550 to ptr
-  call i32 @puts(ptr %t197)
-  %t198 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r552 = ptrtoint ptr %t198 to i64
+  %t194 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r550 = ptrtoint ptr %t194 to i64
+  %t195 = inttoptr i64 %r550 to ptr
+  call i32 @puts(ptr %t195)
+  %t196 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r552 = ptrtoint ptr %t196 to i64
   br label %__mb18_entry0
 
 __mb18_entry0:
-  %t199 = load i64, ptr %slot.__mb18_s, align 8
-  call void @nova_rc_dec(i64 %t199)
+  %t197 = load i64, ptr %slot.__mb18_s, align 8
+  call void @nova_rc_dec(i64 %t197)
   store i64 %r552, ptr %slot.__mb18_s, align 8
   store i64 48, ptr %slot.__mb18_n, align 8
-  %t200 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1281 = ptrtoint ptr %t200 to i64
-  %t201 = load i64, ptr %slot.__mb18_result, align 8
-  call void @nova_rc_dec(i64 %t201)
+  %t198 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1281 = ptrtoint ptr %t198 to i64
+  %t199 = load i64, ptr %slot.__mb18_result, align 8
+  call void @nova_rc_dec(i64 %t199)
   store i64 %r1281, ptr %slot.__mb18_result, align 8
   store i64 0, ptr %slot.__mb18_i, align 8
   %r1965 = load i64, ptr %slot.__mb18_n, align 8
@@ -1733,15 +1789,15 @@ __mb18_entry0:
 
 __mb18_while_header1:
   %r1289 = load i64, ptr %slot.__mb18_i, align 8
-  %t202 = icmp slt i64 %r1289, %r1965
-  br i1 %t202, label %__mb18_while_body2, label %__mb18_while_exit3, !prof !90
+  %t200 = icmp slt i64 %r1289, %r1965
+  br i1 %t200, label %__mb18_while_body2, label %__mb18_while_exit3, !prof !90
 
 __mb18_while_body2:
   %r1293 = load i64, ptr %slot.__mb18_result, align 8
-  %t203 = call i64 @nova_rt_str_concat(i64 %r1293, i64 %r1966)
-  %t204 = load i64, ptr %slot.__mb18_result, align 8
-  call void @nova_rc_dec(i64 %t204)
-  store i64 %t203, ptr %slot.__mb18_result, align 8
+  %t201 = call i64 @nova_rt_str_concat(i64 %r1293, i64 %r1966)
+  %t202 = load i64, ptr %slot.__mb18_result, align 8
+  call void @nova_rc_dec(i64 %t202)
+  store i64 %t201, ptr %slot.__mb18_result, align 8
   %r1298 = load i64, ptr %slot.__mb18_i, align 8
   %r1300 = add i64 %r1298, 1
   store i64 %r1300, ptr %slot.__mb18_i, align 8
@@ -1749,36 +1805,36 @@ __mb18_while_body2:
 
 __mb18_while_exit3:
   %r1304 = load i64, ptr %slot.__mb18_result, align 8
-  %t205 = load i64, ptr %slot.__mb18_ret, align 8
-  call void @nova_rc_dec(i64 %t205)
+  %t203 = load i64, ptr %slot.__mb18_ret, align 8
+  call void @nova_rc_dec(i64 %t203)
   call void @nova_rc_inc(i64 %r1304)
   store i64 %r1304, ptr %slot.__mb18_ret, align 8
   br label %__mb18_merge
 
 __mb18_merge:
   %r1305 = load i64, ptr %slot.__mb18_ret, align 8
-  %t206 = inttoptr i64 %r1305 to ptr
-  call i32 @puts(ptr %t206)
-  %t207 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r556 = ptrtoint ptr %t207 to i64
+  %t204 = inttoptr i64 %r1305 to ptr
+  call i32 @puts(ptr %t204)
+  %t205 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r556 = ptrtoint ptr %t205 to i64
   %r557 = load i64, ptr %slot.__inl4_title, align 8
-  %t208 = call i64 @nova_rt_str_concat(i64 %r556, i64 %r557)
-  %t209 = inttoptr i64 %t208 to ptr
-  call i32 @puts(ptr %t209)
-  call void @nova_rc_dec(i64 %t208)
-  %t210 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r560 = ptrtoint ptr %t210 to i64
+  %t206 = call i64 @nova_rt_str_concat(i64 %r556, i64 %r557)
+  %t207 = inttoptr i64 %t206 to ptr
+  call i32 @puts(ptr %t207)
+  call void @nova_rc_dec(i64 %t206)
+  %t208 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r560 = ptrtoint ptr %t208 to i64
   br label %__mb19_entry0
 
 __mb19_entry0:
-  %t211 = load i64, ptr %slot.__mb19_s, align 8
-  call void @nova_rc_dec(i64 %t211)
+  %t209 = load i64, ptr %slot.__mb19_s, align 8
+  call void @nova_rc_dec(i64 %t209)
   store i64 %r560, ptr %slot.__mb19_s, align 8
   store i64 48, ptr %slot.__mb19_n, align 8
-  %t212 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1313 = ptrtoint ptr %t212 to i64
-  %t213 = load i64, ptr %slot.__mb19_result, align 8
-  call void @nova_rc_dec(i64 %t213)
+  %t210 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1313 = ptrtoint ptr %t210 to i64
+  %t211 = load i64, ptr %slot.__mb19_result, align 8
+  call void @nova_rc_dec(i64 %t211)
   store i64 %r1313, ptr %slot.__mb19_result, align 8
   store i64 0, ptr %slot.__mb19_i, align 8
   %r1967 = load i64, ptr %slot.__mb19_n, align 8
@@ -1787,15 +1843,15 @@ __mb19_entry0:
 
 __mb19_while_header1:
   %r1321 = load i64, ptr %slot.__mb19_i, align 8
-  %t214 = icmp slt i64 %r1321, %r1967
-  br i1 %t214, label %__mb19_while_body2, label %__mb19_while_exit3, !prof !90
+  %t212 = icmp slt i64 %r1321, %r1967
+  br i1 %t212, label %__mb19_while_body2, label %__mb19_while_exit3, !prof !90
 
 __mb19_while_body2:
   %r1325 = load i64, ptr %slot.__mb19_result, align 8
-  %t215 = call i64 @nova_rt_str_concat(i64 %r1325, i64 %r1968)
-  %t216 = load i64, ptr %slot.__mb19_result, align 8
-  call void @nova_rc_dec(i64 %t216)
-  store i64 %t215, ptr %slot.__mb19_result, align 8
+  %t213 = call i64 @nova_rt_str_concat(i64 %r1325, i64 %r1968)
+  %t214 = load i64, ptr %slot.__mb19_result, align 8
+  call void @nova_rc_dec(i64 %t214)
+  store i64 %t213, ptr %slot.__mb19_result, align 8
   %r1330 = load i64, ptr %slot.__mb19_i, align 8
   %r1332 = add i64 %r1330, 1
   store i64 %r1332, ptr %slot.__mb19_i, align 8
@@ -1803,36 +1859,36 @@ __mb19_while_body2:
 
 __mb19_while_exit3:
   %r1336 = load i64, ptr %slot.__mb19_result, align 8
-  %t217 = load i64, ptr %slot.__mb19_ret, align 8
-  call void @nova_rc_dec(i64 %t217)
+  %t215 = load i64, ptr %slot.__mb19_ret, align 8
+  call void @nova_rc_dec(i64 %t215)
   call void @nova_rc_inc(i64 %r1336)
   store i64 %r1336, ptr %slot.__mb19_ret, align 8
   br label %__mb19_merge
 
 __mb19_merge:
   %r1337 = load i64, ptr %slot.__mb19_ret, align 8
-  %t218 = inttoptr i64 %r1337 to ptr
-  call i32 @puts(ptr %t218)
+  %t216 = inttoptr i64 %r1337 to ptr
+  call i32 @puts(ptr %t216)
   store i64 4, ptr %slot.even, align 8
   br label %while_header15, !llvm.loop !91
 
 sc_and_right10:
   %r165 = load i64, ptr %slot.f, align 8
-  %t219 = icmp sgt i64 %r165, 1
-  %r167 = zext i1 %t219 to i64
+  %t217 = icmp sgt i64 %r165, 1
+  %r167 = zext i1 %t217 to i64
   store i64 %r167, ptr %slot.__sc_and_2, align 8
   br label %sc_and_merge11
 
 sc_and_merge11:
   %r169 = load i64, ptr %slot.__sc_and_2, align 8
-  %t220 = trunc i64 %r169 to i1
-  br i1 %t220, label %ifb_then12, label %ifb_else13, !prof !90
+  %t218 = trunc i64 %r169 to i1
+  br i1 %t218, label %ifb_then12, label %ifb_else13, !prof !90
 
 ifb_then12:
-  %t221 = getelementptr inbounds [2 x i8], ptr @.str.17, i64 0, i64 0
-  %r172 = ptrtoint ptr %t221 to i64
-  %t222 = load i64, ptr %slot.mark, align 8
-  call void @nova_rc_dec(i64 %t222)
+  %t219 = getelementptr inbounds [2 x i8], ptr @.str.17, i64 0, i64 0
+  %r172 = ptrtoint ptr %t219 to i64
+  %t220 = load i64, ptr %slot.mark, align 8
+  call void @nova_rc_dec(i64 %t220)
   store i64 %r172, ptr %slot.mark, align 8
   br label %ifb_merge14
 
@@ -1840,21 +1896,21 @@ ifb_else13:
   br label %ifb_merge14
 
 ifb_merge14:
-  %t223 = getelementptr inbounds [7 x i8], ptr @.str.18, i64 0, i64 0
-  %r179 = ptrtoint ptr %t223 to i64
+  %t221 = getelementptr inbounds [7 x i8], ptr @.str.18, i64 0, i64 0
+  %r179 = ptrtoint ptr %t221 to i64
   %r180 = load i64, ptr %slot.k, align 8
   br label %__mb20_entry0
 
 __mb20_entry0:
   store i64 2, ptr %slot.__mb20_width, align 8
   %r1346 = call i64 @nova_rt_int_to_str(i64 %r180)
-  %t224 = load i64, ptr %slot.__mb20_s, align 8
-  call void @nova_rc_dec(i64 %t224)
+  %t222 = load i64, ptr %slot.__mb20_s, align 8
+  call void @nova_rc_dec(i64 %t222)
   store i64 %r1346, ptr %slot.__mb20_s, align 8
-  %t225 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1350 = ptrtoint ptr %t225 to i64
-  %t226 = load i64, ptr %slot.__mb20_result, align 8
-  call void @nova_rc_dec(i64 %t226)
+  %t223 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1350 = ptrtoint ptr %t223 to i64
+  %t224 = load i64, ptr %slot.__mb20_result, align 8
+  call void @nova_rc_dec(i64 %t224)
   store i64 %r1350, ptr %slot.__mb20_result, align 8
   %r1355 = call i64 @nova_rt_len(i64 %r1346)
   store i64 %r1355, ptr %slot.__mb20_i, align 8
@@ -1863,17 +1919,17 @@ __mb20_entry0:
 
 __mb20_while_header1:
   %r1359 = load i64, ptr %slot.__mb20_i, align 8
-  %t227 = icmp slt i64 %r1359, %r1969
-  br i1 %t227, label %__mb20_while_body2, label %__mb20_while_exit3, !prof !90
+  %t225 = icmp slt i64 %r1359, %r1969
+  br i1 %t225, label %__mb20_while_body2, label %__mb20_while_exit3, !prof !90
 
 __mb20_while_body2:
   %r1363 = load i64, ptr %slot.__mb20_result, align 8
-  %t228 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r1364 = ptrtoint ptr %t228 to i64
-  %t229 = call i64 @nova_rt_str_concat(i64 %r1363, i64 %r1364)
-  %t230 = load i64, ptr %slot.__mb20_result, align 8
-  call void @nova_rc_dec(i64 %t230)
-  store i64 %t229, ptr %slot.__mb20_result, align 8
+  %t226 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r1364 = ptrtoint ptr %t226 to i64
+  %t227 = call i64 @nova_rt_str_concat(i64 %r1363, i64 %r1364)
+  %t228 = load i64, ptr %slot.__mb20_result, align 8
+  call void @nova_rc_dec(i64 %t228)
+  store i64 %t227, ptr %slot.__mb20_result, align 8
   %r1368 = load i64, ptr %slot.__mb20_i, align 8
   %r1370 = add i64 %r1368, 1
   store i64 %r1370, ptr %slot.__mb20_i, align 8
@@ -1882,33 +1938,33 @@ __mb20_while_body2:
 __mb20_while_exit3:
   %r1374 = load i64, ptr %slot.__mb20_result, align 8
   %r1375 = load i64, ptr %slot.__mb20_s, align 8
-  %t231 = call i64 @nova_rt_str_concat(i64 %r1374, i64 %r1375)
-  %t232 = load i64, ptr %slot.__mb20_ret, align 8
-  call void @nova_rc_dec(i64 %t232)
-  store i64 %t231, ptr %slot.__mb20_ret, align 8
+  %t229 = call i64 @nova_rt_str_concat(i64 %r1374, i64 %r1375)
+  %t230 = load i64, ptr %slot.__mb20_ret, align 8
+  call void @nova_rc_dec(i64 %t230)
+  store i64 %t229, ptr %slot.__mb20_ret, align 8
   br label %__mb20_merge
 
 __mb20_merge:
   %r1377 = load i64, ptr %slot.__mb20_ret, align 8
-  %t233 = call i64 @nova_rt_str_concat(i64 %r179, i64 %r1377)
-  %t234 = getelementptr inbounds [5 x i8], ptr @.str.19, i64 0, i64 0
-  %r184 = ptrtoint ptr %t234 to i64
-  %t235 = call i64 @nova_rt_str_concat(i64 %t233, i64 %r184)
+  %t231 = call i64 @nova_rt_str_concat(i64 %r179, i64 %r1377)
+  %t232 = getelementptr inbounds [5 x i8], ptr @.str.19, i64 0, i64 0
+  %r184 = ptrtoint ptr %t232 to i64
+  %t233 = call i64 @nova_rt_str_concat(i64 %t231, i64 %r184)
+  call void @nova_rc_dec(i64 %t231)
   call void @nova_rc_dec(i64 %t233)
-  call void @nova_rc_dec(i64 %t235)
   %r186 = load i64, ptr %slot.f, align 8
   br label %__mb21_entry0
 
 __mb21_entry0:
   store i64 8, ptr %slot.__mb21_width, align 8
   %r1386 = call i64 @nova_rt_int_to_str(i64 %r186)
-  %t236 = load i64, ptr %slot.__mb21_s, align 8
-  call void @nova_rc_dec(i64 %t236)
+  %t234 = load i64, ptr %slot.__mb21_s, align 8
+  call void @nova_rc_dec(i64 %t234)
   store i64 %r1386, ptr %slot.__mb21_s, align 8
-  %t237 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1390 = ptrtoint ptr %t237 to i64
-  %t238 = load i64, ptr %slot.__mb21_result, align 8
-  call void @nova_rc_dec(i64 %t238)
+  %t235 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1390 = ptrtoint ptr %t235 to i64
+  %t236 = load i64, ptr %slot.__mb21_result, align 8
+  call void @nova_rc_dec(i64 %t236)
   store i64 %r1390, ptr %slot.__mb21_result, align 8
   %r1395 = call i64 @nova_rt_len(i64 %r1386)
   store i64 %r1395, ptr %slot.__mb21_i, align 8
@@ -1917,17 +1973,17 @@ __mb21_entry0:
 
 __mb21_while_header1:
   %r1399 = load i64, ptr %slot.__mb21_i, align 8
-  %t239 = icmp slt i64 %r1399, %r1970
-  br i1 %t239, label %__mb21_while_body2, label %__mb21_while_exit3, !prof !90
+  %t237 = icmp slt i64 %r1399, %r1970
+  br i1 %t237, label %__mb21_while_body2, label %__mb21_while_exit3, !prof !90
 
 __mb21_while_body2:
   %r1403 = load i64, ptr %slot.__mb21_result, align 8
-  %t240 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r1404 = ptrtoint ptr %t240 to i64
-  %t241 = call i64 @nova_rt_str_concat(i64 %r1403, i64 %r1404)
-  %t242 = load i64, ptr %slot.__mb21_result, align 8
-  call void @nova_rc_dec(i64 %t242)
-  store i64 %t241, ptr %slot.__mb21_result, align 8
+  %t238 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r1404 = ptrtoint ptr %t238 to i64
+  %t239 = call i64 @nova_rt_str_concat(i64 %r1403, i64 %r1404)
+  %t240 = load i64, ptr %slot.__mb21_result, align 8
+  call void @nova_rc_dec(i64 %t240)
+  store i64 %t239, ptr %slot.__mb21_result, align 8
   %r1408 = load i64, ptr %slot.__mb21_i, align 8
   %r1410 = add i64 %r1408, 1
   store i64 %r1410, ptr %slot.__mb21_i, align 8
@@ -1936,25 +1992,25 @@ __mb21_while_body2:
 __mb21_while_exit3:
   %r1414 = load i64, ptr %slot.__mb21_result, align 8
   %r1415 = load i64, ptr %slot.__mb21_s, align 8
-  %t243 = call i64 @nova_rt_str_concat(i64 %r1414, i64 %r1415)
-  %t244 = load i64, ptr %slot.__mb21_ret, align 8
-  call void @nova_rc_dec(i64 %t244)
-  store i64 %t243, ptr %slot.__mb21_ret, align 8
+  %t241 = call i64 @nova_rt_str_concat(i64 %r1414, i64 %r1415)
+  %t242 = load i64, ptr %slot.__mb21_ret, align 8
+  call void @nova_rc_dec(i64 %t242)
+  store i64 %t241, ptr %slot.__mb21_ret, align 8
   br label %__mb21_merge
 
 __mb21_merge:
   %r1417 = load i64, ptr %slot.__mb21_ret, align 8
-  %t245 = call i64 @nova_rt_str_concat(i64 %t235, i64 %r1417)
-  %t246 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r190 = ptrtoint ptr %t246 to i64
-  %t247 = call i64 @nova_rt_str_concat(i64 %t245, i64 %r190)
-  call void @nova_rc_dec(i64 %t245)
+  %t243 = call i64 @nova_rt_str_concat(i64 %t233, i64 %r1417)
+  %t244 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r190 = ptrtoint ptr %t244 to i64
+  %t245 = call i64 @nova_rt_str_concat(i64 %t243, i64 %r190)
+  call void @nova_rc_dec(i64 %t243)
   %r192 = load i64, ptr %slot.mark, align 8
-  %t248 = call i64 @nova_rt_str_concat(i64 %t247, i64 %r192)
-  call void @nova_rc_dec(i64 %t247)
-  %t249 = inttoptr i64 %t248 to ptr
-  call i32 @puts(ptr %t249)
-  call void @nova_rc_dec(i64 %t248)
+  %t246 = call i64 @nova_rt_str_concat(i64 %t245, i64 %r192)
+  call void @nova_rc_dec(i64 %t245)
+  %t247 = inttoptr i64 %t246 to ptr
+  call i32 @puts(ptr %t247)
+  call void @nova_rc_dec(i64 %t246)
   %r195 = load i64, ptr %slot.k, align 8
   %r197 = add i64 %r195, 1
   store i64 %r197, ptr %slot.k, align 8
@@ -1962,8 +2018,8 @@ __mb21_merge:
 
 while_header15:
   %r207 = load i64, ptr %slot.even, align 8
-  %t250 = icmp sle i64 %r207, 50
-  br i1 %t250, label %while_body16, label %while_exit17, !prof !90
+  %t248 = icmp sle i64 %r207, 50
+  br i1 %t248, label %while_body16, label %while_exit17, !prof !90
 
 while_body16:
   %r211 = load i64, ptr %slot.even, align 8
@@ -1977,15 +2033,15 @@ __mb22_entry0:
 
 __mb22_while_header1:
   %r1427 = load i64, ptr %slot.__mb22_p, align 8
-  %t251 = icmp slt i64 %r1427, %r1971
-  br i1 %t251, label %__mb22_while_body2, label %__mb22_while_exit3, !prof !90
+  %t249 = icmp slt i64 %r1427, %r1971
+  br i1 %t249, label %__mb22_while_body2, label %__mb22_while_exit3, !prof !90
 
 __mb22_while_body2:
   %r1431 = load i64, ptr %slot.__mb22_p, align 8
   %r1432 = call i64 @is_prime(i64 %r1431)
   store i64 0, ptr %slot.__mb22___sc_and_1, align 8
-  %t252 = icmp ne i64 %r1432, 0
-  br i1 %t252, label %__mb22_sc_and_right4, label %__mb22_sc_and_merge5
+  %t250 = icmp ne i64 %r1432, 0
+  br i1 %t250, label %__mb22_sc_and_right4, label %__mb22_sc_and_merge5
 
 __mb22_while_exit3:
   store i64 0, ptr %slot.__mb22_ret, align 8
@@ -2000,8 +2056,8 @@ __mb22_sc_and_right4:
 
 __mb22_sc_and_merge5:
   %r1445 = load i64, ptr %slot.__mb22___sc_and_1, align 8
-  %t253 = trunc i64 %r1445 to i1
-  br i1 %t253, label %__mb22_ifb_then6, label %__mb22_ifb_else7
+  %t251 = trunc i64 %r1445 to i1
+  br i1 %t251, label %__mb22_ifb_then6, label %__mb22_ifb_else7
 
 __mb22_ifb_then6:
   %r1448 = load i64, ptr %slot.__mb22_p, align 8
@@ -2023,21 +2079,21 @@ __mb22_merge:
   %r216 = load i64, ptr %slot.even, align 8
   %r218 = sub i64 %r216, %r1457
   store i64 %r218, ptr %slot.p2, align 8
-  %t254 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r222 = ptrtoint ptr %t254 to i64
+  %t252 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r222 = ptrtoint ptr %t252 to i64
   %r223 = load i64, ptr %slot.even, align 8
   br label %__mb23_entry0
 
 __mb23_entry0:
   store i64 3, ptr %slot.__mb23_width, align 8
   %r1467 = call i64 @nova_rt_int_to_str(i64 %r223)
-  %t255 = load i64, ptr %slot.__mb23_s, align 8
-  call void @nova_rc_dec(i64 %t255)
+  %t253 = load i64, ptr %slot.__mb23_s, align 8
+  call void @nova_rc_dec(i64 %t253)
   store i64 %r1467, ptr %slot.__mb23_s, align 8
-  %t256 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1471 = ptrtoint ptr %t256 to i64
-  %t257 = load i64, ptr %slot.__mb23_result, align 8
-  call void @nova_rc_dec(i64 %t257)
+  %t254 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1471 = ptrtoint ptr %t254 to i64
+  %t255 = load i64, ptr %slot.__mb23_result, align 8
+  call void @nova_rc_dec(i64 %t255)
   store i64 %r1471, ptr %slot.__mb23_result, align 8
   %r1476 = call i64 @nova_rt_len(i64 %r1467)
   store i64 %r1476, ptr %slot.__mb23_i, align 8
@@ -2046,17 +2102,17 @@ __mb23_entry0:
 
 __mb23_while_header1:
   %r1480 = load i64, ptr %slot.__mb23_i, align 8
-  %t258 = icmp slt i64 %r1480, %r1972
-  br i1 %t258, label %__mb23_while_body2, label %__mb23_while_exit3, !prof !90
+  %t256 = icmp slt i64 %r1480, %r1972
+  br i1 %t256, label %__mb23_while_body2, label %__mb23_while_exit3, !prof !90
 
 __mb23_while_body2:
   %r1484 = load i64, ptr %slot.__mb23_result, align 8
-  %t259 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r1485 = ptrtoint ptr %t259 to i64
-  %t260 = call i64 @nova_rt_str_concat(i64 %r1484, i64 %r1485)
-  %t261 = load i64, ptr %slot.__mb23_result, align 8
-  call void @nova_rc_dec(i64 %t261)
-  store i64 %t260, ptr %slot.__mb23_result, align 8
+  %t257 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r1485 = ptrtoint ptr %t257 to i64
+  %t258 = call i64 @nova_rt_str_concat(i64 %r1484, i64 %r1485)
+  %t259 = load i64, ptr %slot.__mb23_result, align 8
+  call void @nova_rc_dec(i64 %t259)
+  store i64 %t258, ptr %slot.__mb23_result, align 8
   %r1489 = load i64, ptr %slot.__mb23_i, align 8
   %r1491 = add i64 %r1489, 1
   store i64 %r1491, ptr %slot.__mb23_i, align 8
@@ -2065,33 +2121,33 @@ __mb23_while_body2:
 __mb23_while_exit3:
   %r1495 = load i64, ptr %slot.__mb23_result, align 8
   %r1496 = load i64, ptr %slot.__mb23_s, align 8
-  %t262 = call i64 @nova_rt_str_concat(i64 %r1495, i64 %r1496)
-  %t263 = load i64, ptr %slot.__mb23_ret, align 8
-  call void @nova_rc_dec(i64 %t263)
-  store i64 %t262, ptr %slot.__mb23_ret, align 8
+  %t260 = call i64 @nova_rt_str_concat(i64 %r1495, i64 %r1496)
+  %t261 = load i64, ptr %slot.__mb23_ret, align 8
+  call void @nova_rc_dec(i64 %t261)
+  store i64 %t260, ptr %slot.__mb23_ret, align 8
   br label %__mb23_merge
 
 __mb23_merge:
   %r1498 = load i64, ptr %slot.__mb23_ret, align 8
-  %t264 = call i64 @nova_rt_str_concat(i64 %r222, i64 %r1498)
-  %t265 = getelementptr inbounds [4 x i8], ptr @.str.20, i64 0, i64 0
-  %r227 = ptrtoint ptr %t265 to i64
-  %t266 = call i64 @nova_rt_str_concat(i64 %t264, i64 %r227)
+  %t262 = call i64 @nova_rt_str_concat(i64 %r222, i64 %r1498)
+  %t263 = getelementptr inbounds [4 x i8], ptr @.str.20, i64 0, i64 0
+  %r227 = ptrtoint ptr %t263 to i64
+  %t264 = call i64 @nova_rt_str_concat(i64 %t262, i64 %r227)
+  call void @nova_rc_dec(i64 %t262)
   call void @nova_rc_dec(i64 %t264)
-  call void @nova_rc_dec(i64 %t266)
   %r229 = load i64, ptr %slot.p1, align 8
   br label %__mb24_entry0
 
 __mb24_entry0:
   store i64 3, ptr %slot.__mb24_width, align 8
   %r1507 = call i64 @nova_rt_int_to_str(i64 %r229)
-  %t267 = load i64, ptr %slot.__mb24_s, align 8
-  call void @nova_rc_dec(i64 %t267)
+  %t265 = load i64, ptr %slot.__mb24_s, align 8
+  call void @nova_rc_dec(i64 %t265)
   store i64 %r1507, ptr %slot.__mb24_s, align 8
-  %t268 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1511 = ptrtoint ptr %t268 to i64
-  %t269 = load i64, ptr %slot.__mb24_result, align 8
-  call void @nova_rc_dec(i64 %t269)
+  %t266 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1511 = ptrtoint ptr %t266 to i64
+  %t267 = load i64, ptr %slot.__mb24_result, align 8
+  call void @nova_rc_dec(i64 %t267)
   store i64 %r1511, ptr %slot.__mb24_result, align 8
   %r1516 = call i64 @nova_rt_len(i64 %r1507)
   store i64 %r1516, ptr %slot.__mb24_i, align 8
@@ -2100,17 +2156,17 @@ __mb24_entry0:
 
 __mb24_while_header1:
   %r1520 = load i64, ptr %slot.__mb24_i, align 8
-  %t270 = icmp slt i64 %r1520, %r1973
-  br i1 %t270, label %__mb24_while_body2, label %__mb24_while_exit3, !prof !90
+  %t268 = icmp slt i64 %r1520, %r1973
+  br i1 %t268, label %__mb24_while_body2, label %__mb24_while_exit3, !prof !90
 
 __mb24_while_body2:
   %r1524 = load i64, ptr %slot.__mb24_result, align 8
-  %t271 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r1525 = ptrtoint ptr %t271 to i64
-  %t272 = call i64 @nova_rt_str_concat(i64 %r1524, i64 %r1525)
-  %t273 = load i64, ptr %slot.__mb24_result, align 8
-  call void @nova_rc_dec(i64 %t273)
-  store i64 %t272, ptr %slot.__mb24_result, align 8
+  %t269 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r1525 = ptrtoint ptr %t269 to i64
+  %t270 = call i64 @nova_rt_str_concat(i64 %r1524, i64 %r1525)
+  %t271 = load i64, ptr %slot.__mb24_result, align 8
+  call void @nova_rc_dec(i64 %t271)
+  store i64 %t270, ptr %slot.__mb24_result, align 8
   %r1529 = load i64, ptr %slot.__mb24_i, align 8
   %r1531 = add i64 %r1529, 1
   store i64 %r1531, ptr %slot.__mb24_i, align 8
@@ -2119,33 +2175,33 @@ __mb24_while_body2:
 __mb24_while_exit3:
   %r1535 = load i64, ptr %slot.__mb24_result, align 8
   %r1536 = load i64, ptr %slot.__mb24_s, align 8
-  %t274 = call i64 @nova_rt_str_concat(i64 %r1535, i64 %r1536)
-  %t275 = load i64, ptr %slot.__mb24_ret, align 8
-  call void @nova_rc_dec(i64 %t275)
-  store i64 %t274, ptr %slot.__mb24_ret, align 8
+  %t272 = call i64 @nova_rt_str_concat(i64 %r1535, i64 %r1536)
+  %t273 = load i64, ptr %slot.__mb24_ret, align 8
+  call void @nova_rc_dec(i64 %t273)
+  store i64 %t272, ptr %slot.__mb24_ret, align 8
   br label %__mb24_merge
 
 __mb24_merge:
   %r1538 = load i64, ptr %slot.__mb24_ret, align 8
-  %t276 = call i64 @nova_rt_str_concat(i64 %t266, i64 %r1538)
-  %t277 = getelementptr inbounds [4 x i8], ptr @.str.21, i64 0, i64 0
-  %r233 = ptrtoint ptr %t277 to i64
-  %t278 = call i64 @nova_rt_str_concat(i64 %t276, i64 %r233)
+  %t274 = call i64 @nova_rt_str_concat(i64 %t264, i64 %r1538)
+  %t275 = getelementptr inbounds [4 x i8], ptr @.str.21, i64 0, i64 0
+  %r233 = ptrtoint ptr %t275 to i64
+  %t276 = call i64 @nova_rt_str_concat(i64 %t274, i64 %r233)
+  call void @nova_rc_dec(i64 %t274)
   call void @nova_rc_dec(i64 %t276)
-  call void @nova_rc_dec(i64 %t278)
   %r235 = load i64, ptr %slot.p2, align 8
   br label %__mb25_entry0
 
 __mb25_entry0:
   store i64 3, ptr %slot.__mb25_width, align 8
   %r1547 = call i64 @nova_rt_int_to_str(i64 %r235)
-  %t279 = load i64, ptr %slot.__mb25_s, align 8
-  call void @nova_rc_dec(i64 %t279)
+  %t277 = load i64, ptr %slot.__mb25_s, align 8
+  call void @nova_rc_dec(i64 %t277)
   store i64 %r1547, ptr %slot.__mb25_s, align 8
-  %t280 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1551 = ptrtoint ptr %t280 to i64
-  %t281 = load i64, ptr %slot.__mb25_result, align 8
-  call void @nova_rc_dec(i64 %t281)
+  %t278 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1551 = ptrtoint ptr %t278 to i64
+  %t279 = load i64, ptr %slot.__mb25_result, align 8
+  call void @nova_rc_dec(i64 %t279)
   store i64 %r1551, ptr %slot.__mb25_result, align 8
   %r1556 = call i64 @nova_rt_len(i64 %r1547)
   store i64 %r1556, ptr %slot.__mb25_i, align 8
@@ -2154,17 +2210,17 @@ __mb25_entry0:
 
 __mb25_while_header1:
   %r1560 = load i64, ptr %slot.__mb25_i, align 8
-  %t282 = icmp slt i64 %r1560, %r1974
-  br i1 %t282, label %__mb25_while_body2, label %__mb25_while_exit3, !prof !90
+  %t280 = icmp slt i64 %r1560, %r1974
+  br i1 %t280, label %__mb25_while_body2, label %__mb25_while_exit3, !prof !90
 
 __mb25_while_body2:
   %r1564 = load i64, ptr %slot.__mb25_result, align 8
-  %t283 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
-  %r1565 = ptrtoint ptr %t283 to i64
-  %t284 = call i64 @nova_rt_str_concat(i64 %r1564, i64 %r1565)
-  %t285 = load i64, ptr %slot.__mb25_result, align 8
-  call void @nova_rc_dec(i64 %t285)
-  store i64 %t284, ptr %slot.__mb25_result, align 8
+  %t281 = getelementptr inbounds [2 x i8], ptr @.str.10, i64 0, i64 0
+  %r1565 = ptrtoint ptr %t281 to i64
+  %t282 = call i64 @nova_rt_str_concat(i64 %r1564, i64 %r1565)
+  %t283 = load i64, ptr %slot.__mb25_result, align 8
+  call void @nova_rc_dec(i64 %t283)
+  store i64 %t282, ptr %slot.__mb25_result, align 8
   %r1569 = load i64, ptr %slot.__mb25_i, align 8
   %r1571 = add i64 %r1569, 1
   store i64 %r1571, ptr %slot.__mb25_i, align 8
@@ -2173,46 +2229,46 @@ __mb25_while_body2:
 __mb25_while_exit3:
   %r1575 = load i64, ptr %slot.__mb25_result, align 8
   %r1576 = load i64, ptr %slot.__mb25_s, align 8
-  %t286 = call i64 @nova_rt_str_concat(i64 %r1575, i64 %r1576)
-  %t287 = load i64, ptr %slot.__mb25_ret, align 8
-  call void @nova_rc_dec(i64 %t287)
-  store i64 %t286, ptr %slot.__mb25_ret, align 8
+  %t284 = call i64 @nova_rt_str_concat(i64 %r1575, i64 %r1576)
+  %t285 = load i64, ptr %slot.__mb25_ret, align 8
+  call void @nova_rc_dec(i64 %t285)
+  store i64 %t284, ptr %slot.__mb25_ret, align 8
   br label %__mb25_merge
 
 __mb25_merge:
   %r1578 = load i64, ptr %slot.__mb25_ret, align 8
-  %t288 = call i64 @nova_rt_str_concat(i64 %t278, i64 %r1578)
-  %t289 = inttoptr i64 %t288 to ptr
-  call i32 @puts(ptr %t289)
-  call void @nova_rc_dec(i64 %t288)
+  %t286 = call i64 @nova_rt_str_concat(i64 %t276, i64 %r1578)
+  %t287 = inttoptr i64 %t286 to ptr
+  call i32 @puts(ptr %t287)
+  call void @nova_rc_dec(i64 %t286)
   %r240 = load i64, ptr %slot.even, align 8
   %r242 = add i64 %r240, 2
   store i64 %r242, ptr %slot.even, align 8
   br label %while_header15, !llvm.loop !91
 
 while_exit17:
-  %t290 = getelementptr inbounds [30 x i8], ptr @.str.22, i64 0, i64 0
-  %r246 = ptrtoint ptr %t290 to i64
-  %t291 = load i64, ptr %slot.__inl5_title, align 8
-  call void @nova_rc_dec(i64 %t291)
+  %t288 = getelementptr inbounds [30 x i8], ptr @.str.22, i64 0, i64 0
+  %r246 = ptrtoint ptr %t288 to i64
+  %t289 = load i64, ptr %slot.__inl5_title, align 8
+  call void @nova_rc_dec(i64 %t289)
   store i64 %r246, ptr %slot.__inl5_title, align 8
-  %t292 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r567 = ptrtoint ptr %t292 to i64
-  %t293 = inttoptr i64 %r567 to ptr
-  call i32 @puts(ptr %t293)
-  %t294 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r569 = ptrtoint ptr %t294 to i64
+  %t290 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r567 = ptrtoint ptr %t290 to i64
+  %t291 = inttoptr i64 %r567 to ptr
+  call i32 @puts(ptr %t291)
+  %t292 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r569 = ptrtoint ptr %t292 to i64
   br label %__mb26_entry0
 
 __mb26_entry0:
-  %t295 = load i64, ptr %slot.__mb26_s, align 8
-  call void @nova_rc_dec(i64 %t295)
+  %t293 = load i64, ptr %slot.__mb26_s, align 8
+  call void @nova_rc_dec(i64 %t293)
   store i64 %r569, ptr %slot.__mb26_s, align 8
   store i64 48, ptr %slot.__mb26_n, align 8
-  %t296 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1586 = ptrtoint ptr %t296 to i64
-  %t297 = load i64, ptr %slot.__mb26_result, align 8
-  call void @nova_rc_dec(i64 %t297)
+  %t294 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1586 = ptrtoint ptr %t294 to i64
+  %t295 = load i64, ptr %slot.__mb26_result, align 8
+  call void @nova_rc_dec(i64 %t295)
   store i64 %r1586, ptr %slot.__mb26_result, align 8
   store i64 0, ptr %slot.__mb26_i, align 8
   %r1975 = load i64, ptr %slot.__mb26_n, align 8
@@ -2221,15 +2277,15 @@ __mb26_entry0:
 
 __mb26_while_header1:
   %r1594 = load i64, ptr %slot.__mb26_i, align 8
-  %t298 = icmp slt i64 %r1594, %r1975
-  br i1 %t298, label %__mb26_while_body2, label %__mb26_while_exit3, !prof !90
+  %t296 = icmp slt i64 %r1594, %r1975
+  br i1 %t296, label %__mb26_while_body2, label %__mb26_while_exit3, !prof !90
 
 __mb26_while_body2:
   %r1598 = load i64, ptr %slot.__mb26_result, align 8
-  %t299 = call i64 @nova_rt_str_concat(i64 %r1598, i64 %r1976)
-  %t300 = load i64, ptr %slot.__mb26_result, align 8
-  call void @nova_rc_dec(i64 %t300)
-  store i64 %t299, ptr %slot.__mb26_result, align 8
+  %t297 = call i64 @nova_rt_str_concat(i64 %r1598, i64 %r1976)
+  %t298 = load i64, ptr %slot.__mb26_result, align 8
+  call void @nova_rc_dec(i64 %t298)
+  store i64 %t297, ptr %slot.__mb26_result, align 8
   %r1603 = load i64, ptr %slot.__mb26_i, align 8
   %r1605 = add i64 %r1603, 1
   store i64 %r1605, ptr %slot.__mb26_i, align 8
@@ -2237,36 +2293,36 @@ __mb26_while_body2:
 
 __mb26_while_exit3:
   %r1609 = load i64, ptr %slot.__mb26_result, align 8
-  %t301 = load i64, ptr %slot.__mb26_ret, align 8
-  call void @nova_rc_dec(i64 %t301)
+  %t299 = load i64, ptr %slot.__mb26_ret, align 8
+  call void @nova_rc_dec(i64 %t299)
   call void @nova_rc_inc(i64 %r1609)
   store i64 %r1609, ptr %slot.__mb26_ret, align 8
   br label %__mb26_merge
 
 __mb26_merge:
   %r1610 = load i64, ptr %slot.__mb26_ret, align 8
-  %t302 = inttoptr i64 %r1610 to ptr
-  call i32 @puts(ptr %t302)
-  %t303 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r573 = ptrtoint ptr %t303 to i64
+  %t300 = inttoptr i64 %r1610 to ptr
+  call i32 @puts(ptr %t300)
+  %t301 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r573 = ptrtoint ptr %t301 to i64
   %r574 = load i64, ptr %slot.__inl5_title, align 8
-  %t304 = call i64 @nova_rt_str_concat(i64 %r573, i64 %r574)
-  %t305 = inttoptr i64 %t304 to ptr
-  call i32 @puts(ptr %t305)
-  call void @nova_rc_dec(i64 %t304)
-  %t306 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r577 = ptrtoint ptr %t306 to i64
+  %t302 = call i64 @nova_rt_str_concat(i64 %r573, i64 %r574)
+  %t303 = inttoptr i64 %t302 to ptr
+  call i32 @puts(ptr %t303)
+  call void @nova_rc_dec(i64 %t302)
+  %t304 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r577 = ptrtoint ptr %t304 to i64
   br label %__mb27_entry0
 
 __mb27_entry0:
-  %t307 = load i64, ptr %slot.__mb27_s, align 8
-  call void @nova_rc_dec(i64 %t307)
+  %t305 = load i64, ptr %slot.__mb27_s, align 8
+  call void @nova_rc_dec(i64 %t305)
   store i64 %r577, ptr %slot.__mb27_s, align 8
   store i64 48, ptr %slot.__mb27_n, align 8
-  %t308 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1618 = ptrtoint ptr %t308 to i64
-  %t309 = load i64, ptr %slot.__mb27_result, align 8
-  call void @nova_rc_dec(i64 %t309)
+  %t306 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1618 = ptrtoint ptr %t306 to i64
+  %t307 = load i64, ptr %slot.__mb27_result, align 8
+  call void @nova_rc_dec(i64 %t307)
   store i64 %r1618, ptr %slot.__mb27_result, align 8
   store i64 0, ptr %slot.__mb27_i, align 8
   %r1977 = load i64, ptr %slot.__mb27_n, align 8
@@ -2275,15 +2331,15 @@ __mb27_entry0:
 
 __mb27_while_header1:
   %r1626 = load i64, ptr %slot.__mb27_i, align 8
-  %t310 = icmp slt i64 %r1626, %r1977
-  br i1 %t310, label %__mb27_while_body2, label %__mb27_while_exit3, !prof !90
+  %t308 = icmp slt i64 %r1626, %r1977
+  br i1 %t308, label %__mb27_while_body2, label %__mb27_while_exit3, !prof !90
 
 __mb27_while_body2:
   %r1630 = load i64, ptr %slot.__mb27_result, align 8
-  %t311 = call i64 @nova_rt_str_concat(i64 %r1630, i64 %r1978)
-  %t312 = load i64, ptr %slot.__mb27_result, align 8
-  call void @nova_rc_dec(i64 %t312)
-  store i64 %t311, ptr %slot.__mb27_result, align 8
+  %t309 = call i64 @nova_rt_str_concat(i64 %r1630, i64 %r1978)
+  %t310 = load i64, ptr %slot.__mb27_result, align 8
+  call void @nova_rc_dec(i64 %t310)
+  store i64 %t309, ptr %slot.__mb27_result, align 8
   %r1635 = load i64, ptr %slot.__mb27_i, align 8
   %r1637 = add i64 %r1635, 1
   store i64 %r1637, ptr %slot.__mb27_i, align 8
@@ -2291,20 +2347,20 @@ __mb27_while_body2:
 
 __mb27_while_exit3:
   %r1641 = load i64, ptr %slot.__mb27_result, align 8
-  %t313 = load i64, ptr %slot.__mb27_ret, align 8
-  call void @nova_rc_dec(i64 %t313)
+  %t311 = load i64, ptr %slot.__mb27_ret, align 8
+  call void @nova_rc_dec(i64 %t311)
   call void @nova_rc_inc(i64 %r1641)
   store i64 %r1641, ptr %slot.__mb27_ret, align 8
   br label %__mb27_merge
 
 __mb27_merge:
   %r1642 = load i64, ptr %slot.__mb27_ret, align 8
-  %t314 = inttoptr i64 %r1642 to ptr
-  call i32 @puts(ptr %t314)
-  %t315 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r248 = ptrtoint ptr %t315 to i64
-  %t316 = load i64, ptr %slot.row2, align 8
-  call void @nova_rc_dec(i64 %t316)
+  %t312 = inttoptr i64 %r1642 to ptr
+  call i32 @puts(ptr %t312)
+  %t313 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r248 = ptrtoint ptr %t313 to i64
+  %t314 = load i64, ptr %slot.row2, align 8
+  call void @nova_rc_dec(i64 %t314)
   store i64 %r248, ptr %slot.row2, align 8
   store i64 0, ptr %slot.pair_count, align 8
   store i64 2, ptr %slot.tp, align 8
@@ -2312,25 +2368,25 @@ __mb27_merge:
 
 while_header18:
   %r260 = load i64, ptr %slot.tp, align 8
-  %t317 = icmp sle i64 %r260, 198
-  br i1 %t317, label %while_body19, label %while_exit20, !prof !90
+  %t315 = icmp sle i64 %r260, 198
+  br i1 %t315, label %while_body19, label %while_exit20, !prof !90
 
 while_body19:
   %r264 = load i64, ptr %slot.tp, align 8
   %r265 = call i64 @is_prime(i64 %r264)
   store i64 0, ptr %slot.__sc_and_3, align 8
-  %t318 = icmp ne i64 %r265, 0
-  br i1 %t318, label %sc_and_right21, label %sc_and_merge22
+  %t316 = icmp ne i64 %r265, 0
+  br i1 %t316, label %sc_and_right21, label %sc_and_merge22
 
 while_exit20:
   %r327 = load i64, ptr %slot.row2, align 8
-  %t319 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r328 = ptrtoint ptr %t319 to i64
-  %t320 = inttoptr i64 %r327 to ptr
-  %t321 = inttoptr i64 %r328 to ptr
-  %t322 = call i32 @strcmp(ptr %t320, ptr %t321)
-  %t323 = icmp ne i32 %t322, 0
-  br i1 %t323, label %ifb_then29, label %ifb_else30
+  %t317 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r328 = ptrtoint ptr %t317 to i64
+  %t318 = inttoptr i64 %r327 to ptr
+  %t319 = inttoptr i64 %r328 to ptr
+  %t320 = call i32 @strcmp(ptr %t318, ptr %t319)
+  %t321 = icmp ne i32 %t320, 0
+  br i1 %t321, label %ifb_then29, label %ifb_else30
 
 sc_and_right21:
   %r271 = load i64, ptr %slot.tp, align 8
@@ -2341,42 +2397,42 @@ sc_and_right21:
 
 sc_and_merge22:
   %r276 = load i64, ptr %slot.__sc_and_3, align 8
-  %t324 = trunc i64 %r276 to i1
-  br i1 %t324, label %ifb_then23, label %ifb_else24
+  %t322 = trunc i64 %r276 to i1
+  br i1 %t322, label %ifb_then23, label %ifb_else24
 
 ifb_then23:
   %r279 = load i64, ptr %slot.row2, align 8
-  %t325 = getelementptr inbounds [2 x i8], ptr @.str.23, i64 0, i64 0
-  %r280 = ptrtoint ptr %t325 to i64
-  %t326 = call i64 @nova_rt_str_concat(i64 %r279, i64 %r280)
+  %t323 = getelementptr inbounds [2 x i8], ptr @.str.23, i64 0, i64 0
+  %r280 = ptrtoint ptr %t323 to i64
+  %t324 = call i64 @nova_rt_str_concat(i64 %r279, i64 %r280)
   %r282 = load i64, ptr %slot.tp, align 8
   %r283 = call i64 @nova_rt_int_to_str(i64 %r282)
-  %t327 = call i64 @nova_rt_str_concat(i64 %t326, i64 %r283)
-  call void @nova_rc_dec(i64 %t326)
+  %t325 = call i64 @nova_rt_str_concat(i64 %t324, i64 %r283)
+  call void @nova_rc_dec(i64 %t324)
   call void @nova_rc_dec(i64 %r283)
-  %t328 = getelementptr inbounds [2 x i8], ptr @.str.24, i64 0, i64 0
-  %r285 = ptrtoint ptr %t328 to i64
-  %t329 = call i64 @nova_rt_str_concat(i64 %t327, i64 %r285)
-  call void @nova_rc_dec(i64 %t327)
+  %t326 = getelementptr inbounds [2 x i8], ptr @.str.24, i64 0, i64 0
+  %r285 = ptrtoint ptr %t326 to i64
+  %t327 = call i64 @nova_rt_str_concat(i64 %t325, i64 %r285)
+  call void @nova_rc_dec(i64 %t325)
   %r287 = load i64, ptr %slot.tp, align 8
   %r289 = add i64 %r287, 2
   %r290 = call i64 @nova_rt_int_to_str(i64 %r289)
-  %t330 = call i64 @nova_rt_str_concat(i64 %t329, i64 %r290)
-  call void @nova_rc_dec(i64 %t329)
+  %t328 = call i64 @nova_rt_str_concat(i64 %t327, i64 %r290)
+  call void @nova_rc_dec(i64 %t327)
   call void @nova_rc_dec(i64 %r290)
-  %t331 = getelementptr inbounds [3 x i8], ptr @.str.25, i64 0, i64 0
-  %r292 = ptrtoint ptr %t331 to i64
-  %t332 = call i64 @nova_rt_str_concat(i64 %t330, i64 %r292)
-  call void @nova_rc_dec(i64 %t330)
-  %t333 = load i64, ptr %slot.row2, align 8
-  call void @nova_rc_dec(i64 %t333)
-  store i64 %t332, ptr %slot.row2, align 8
+  %t329 = getelementptr inbounds [3 x i8], ptr @.str.25, i64 0, i64 0
+  %r292 = ptrtoint ptr %t329 to i64
+  %t330 = call i64 @nova_rt_str_concat(i64 %t328, i64 %r292)
+  call void @nova_rc_dec(i64 %t328)
+  %t331 = load i64, ptr %slot.row2, align 8
+  call void @nova_rc_dec(i64 %t331)
+  store i64 %t330, ptr %slot.row2, align 8
   %r296 = load i64, ptr %slot.pair_count, align 8
   %r298 = add i64 %r296, 1
   store i64 %r298, ptr %slot.pair_count, align 8
   %r303 = srem i64 %r298, 4
-  %t334 = icmp eq i64 %r303, 0
-  br i1 %t334, label %ifb_then26, label %ifb_else27
+  %t332 = icmp eq i64 %r303, 0
+  br i1 %t332, label %ifb_then26, label %ifb_else27
 
 ifb_else24:
   br label %ifb_merge25
@@ -2389,12 +2445,12 @@ ifb_merge25:
 
 ifb_then26:
   %r308 = load i64, ptr %slot.row2, align 8
-  %t335 = inttoptr i64 %r308 to ptr
-  call i32 @puts(ptr %t335)
-  %t336 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r310 = ptrtoint ptr %t336 to i64
-  %t337 = load i64, ptr %slot.row2, align 8
-  call void @nova_rc_dec(i64 %t337)
+  %t333 = inttoptr i64 %r308 to ptr
+  call i32 @puts(ptr %t333)
+  %t334 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r310 = ptrtoint ptr %t334 to i64
+  %t335 = load i64, ptr %slot.row2, align 8
+  call void @nova_rc_dec(i64 %t335)
   store i64 %r310, ptr %slot.row2, align 8
   br label %ifb_merge28
 
@@ -2406,179 +2462,173 @@ ifb_merge28:
 
 ifb_then29:
   %r332 = load i64, ptr %slot.row2, align 8
-  %t338 = inttoptr i64 %r332 to ptr
-  call i32 @puts(ptr %t338)
+  %t336 = inttoptr i64 %r332 to ptr
+  call i32 @puts(ptr %t336)
   br label %ifb_merge31
 
 ifb_else30:
   br label %ifb_merge31
 
 ifb_merge31:
-  %t339 = getelementptr inbounds [34 x i8], ptr @.str.26, i64 0, i64 0
-  %r338 = ptrtoint ptr %t339 to i64
+  %t337 = getelementptr inbounds [34 x i8], ptr @.str.26, i64 0, i64 0
+  %r338 = ptrtoint ptr %t337 to i64
   %r339 = load i64, ptr %slot.pair_count, align 8
   %r340 = call i64 @nova_rt_int_to_str(i64 %r339)
-  %t340 = call i64 @nova_rt_str_concat(i64 %r338, i64 %r340)
+  %t338 = call i64 @nova_rt_str_concat(i64 %r338, i64 %r340)
   call void @nova_rc_dec(i64 %r340)
-  %t341 = inttoptr i64 %t340 to ptr
-  call i32 @puts(ptr %t341)
-  call void @nova_rc_dec(i64 %t340)
-  %t342 = getelementptr inbounds [35 x i8], ptr @.str.27, i64 0, i64 0
-  %r343 = ptrtoint ptr %t342 to i64
-  br label %__mb2_entry0
+  %t339 = inttoptr i64 %t338 to ptr
+  call i32 @puts(ptr %t339)
+  call void @nova_rc_dec(i64 %t338)
+  %t340 = getelementptr inbounds [35 x i8], ptr @.str.27, i64 0, i64 0
+  %r343 = ptrtoint ptr %t340 to i64
+  br label %__mb39_entry0
 
-__mb2_entry0:
-  store i64 1000, ptr %slot.__mb2_n, align 8
-  store i64 0, ptr %slot.__mb2_count, align 8
-  store i64 2, ptr %slot.__mb2_i, align 8
-  %r2076 = load i64, ptr %slot.__mb2_n, align 8
-  br label %__mb2_while_header1
+__mb39_entry0:
+  store i64 1000, ptr %slot.__mb39_n, align 8
+  store i64 0, ptr %slot.__mb39_count, align 8
+  store i64 2, ptr %slot.__mb39_i, align 8
+  %r2076 = load i64, ptr %slot.__mb39_n, align 8
+  br label %__mb39_while_header1
 
-__mb2_while_header1:
-  %r2077 = load i64, ptr %slot.__mb2_i, align 8
+__mb39_while_header1:
+  %r2077 = load i64, ptr %slot.__mb39_i, align 8
   %r2079 = sub i64 %r2076, 2
-  %t343 = icmp sle i64 %r2077, %r2079
-  br i1 %t343, label %__mb2_while_body2, label %__mb2_while_exit3, !prof !90
+  %t341 = icmp sle i64 %r2077, %r2079
+  br i1 %t341, label %__mb39_while_body2, label %__mb39_while_exit3, !prof !90
 
-__mb2_while_body2:
-  %r2081 = load i64, ptr %slot.__mb2_i, align 8
+__mb39_while_body2:
+  %r2081 = load i64, ptr %slot.__mb39_i, align 8
   %r2082 = call i64 @is_prime(i64 %r2081)
-  store i64 0, ptr %slot.__mb2___sc_and_0, align 8
-  %t344 = icmp ne i64 %r2082, 0
-  br i1 %t344, label %__mb2_sc_and_right4, label %__mb2_sc_and_merge5
+  store i64 0, ptr %slot.__mb39___sc_and_0, align 8
+  %t342 = icmp ne i64 %r2082, 0
+  br i1 %t342, label %__mb39_sc_and_right4, label %__mb39_sc_and_merge5
 
-__mb2_while_exit3:
-  %r2088 = load i64, ptr %slot.__mb2_count, align 8
-  %t345 = load i64, ptr %slot.__mb2_ret, align 8
-  call void @nova_rc_dec(i64 %t345)
-  call void @nova_rc_inc(i64 %r2088)
-  store i64 %r2088, ptr %slot.__mb2_ret, align 8
-  br label %__mb2_merge
+__mb39_while_exit3:
+  %r2088 = load i64, ptr %slot.__mb39_count, align 8
+  store i64 %r2088, ptr %slot.__mb39_ret, align 8
+  br label %__mb39_merge
 
-__mb2_sc_and_right4:
-  %r2089 = load i64, ptr %slot.__mb2_i, align 8
+__mb39_sc_and_right4:
+  %r2089 = load i64, ptr %slot.__mb39_i, align 8
   %r2091 = add i64 %r2089, 2
   %r2092 = call i64 @is_prime(i64 %r2091)
-  store i64 %r2092, ptr %slot.__mb2___sc_and_0, align 8
-  br label %__mb2_sc_and_merge5
+  store i64 %r2092, ptr %slot.__mb39___sc_and_0, align 8
+  br label %__mb39_sc_and_merge5
 
-__mb2_sc_and_merge5:
-  %r2094 = load i64, ptr %slot.__mb2___sc_and_0, align 8
-  %t346 = trunc i64 %r2094 to i1
-  br i1 %t346, label %__mb2_ifb_then6, label %__mb2_ifb_else7
+__mb39_sc_and_merge5:
+  %r2094 = load i64, ptr %slot.__mb39___sc_and_0, align 8
+  %t343 = trunc i64 %r2094 to i1
+  br i1 %t343, label %__mb39_ifb_then6, label %__mb39_ifb_else7
 
-__mb2_ifb_then6:
-  %r2095 = load i64, ptr %slot.__mb2_count, align 8
+__mb39_ifb_then6:
+  %r2095 = load i64, ptr %slot.__mb39_count, align 8
   %r2097 = add i64 %r2095, 1
-  store i64 %r2097, ptr %slot.__mb2_count, align 8
-  br label %__mb2_ifb_merge8
+  store i64 %r2097, ptr %slot.__mb39_count, align 8
+  br label %__mb39_ifb_merge8
 
-__mb2_ifb_else7:
-  br label %__mb2_ifb_merge8
+__mb39_ifb_else7:
+  br label %__mb39_ifb_merge8
 
-__mb2_ifb_merge8:
-  %r2101 = load i64, ptr %slot.__mb2_i, align 8
+__mb39_ifb_merge8:
+  %r2101 = load i64, ptr %slot.__mb39_i, align 8
   %r2103 = add i64 %r2101, 1
-  store i64 %r2103, ptr %slot.__mb2_i, align 8
-  br label %__mb2_while_header1, !llvm.loop !91
+  store i64 %r2103, ptr %slot.__mb39_i, align 8
+  br label %__mb39_while_header1, !llvm.loop !91
 
-__mb2_merge:
-  %r2105 = load i64, ptr %slot.__mb2_ret, align 8
+__mb39_merge:
+  %r2105 = load i64, ptr %slot.__mb39_ret, align 8
   %r346 = call i64 @nova_rt_int_to_str(i64 %r2105)
-  %t347 = call i64 @nova_rt_str_concat(i64 %r343, i64 %r346)
+  %t344 = call i64 @nova_rt_str_concat(i64 %r343, i64 %r346)
   call void @nova_rc_dec(i64 %r346)
-  %t348 = inttoptr i64 %t347 to ptr
-  call i32 @puts(ptr %t348)
-  call void @nova_rc_dec(i64 %t347)
-  %t349 = getelementptr inbounds [36 x i8], ptr @.str.28, i64 0, i64 0
-  %r349 = ptrtoint ptr %t349 to i64
-  br label %__mb3_entry0
+  %t345 = inttoptr i64 %t344 to ptr
+  call i32 @puts(ptr %t345)
+  call void @nova_rc_dec(i64 %t344)
+  %t346 = getelementptr inbounds [36 x i8], ptr @.str.28, i64 0, i64 0
+  %r349 = ptrtoint ptr %t346 to i64
+  br label %__mb40_entry0
 
-__mb3_entry0:
-  store i64 10000, ptr %slot.__mb3_n, align 8
-  store i64 0, ptr %slot.__mb3_count, align 8
-  store i64 2, ptr %slot.__mb3_i, align 8
-  %r2116 = load i64, ptr %slot.__mb3_n, align 8
-  br label %__mb3_while_header1
+__mb40_entry0:
+  store i64 10000, ptr %slot.__mb40_n, align 8
+  store i64 0, ptr %slot.__mb40_count, align 8
+  store i64 2, ptr %slot.__mb40_i, align 8
+  %r2116 = load i64, ptr %slot.__mb40_n, align 8
+  br label %__mb40_while_header1
 
-__mb3_while_header1:
-  %r2117 = load i64, ptr %slot.__mb3_i, align 8
+__mb40_while_header1:
+  %r2117 = load i64, ptr %slot.__mb40_i, align 8
   %r2119 = sub i64 %r2116, 2
-  %t350 = icmp sle i64 %r2117, %r2119
-  br i1 %t350, label %__mb3_while_body2, label %__mb3_while_exit3, !prof !90
+  %t347 = icmp sle i64 %r2117, %r2119
+  br i1 %t347, label %__mb40_while_body2, label %__mb40_while_exit3, !prof !90
 
-__mb3_while_body2:
-  %r2121 = load i64, ptr %slot.__mb3_i, align 8
+__mb40_while_body2:
+  %r2121 = load i64, ptr %slot.__mb40_i, align 8
   %r2122 = call i64 @is_prime(i64 %r2121)
-  store i64 0, ptr %slot.__mb3___sc_and_0, align 8
-  %t351 = icmp ne i64 %r2122, 0
-  br i1 %t351, label %__mb3_sc_and_right4, label %__mb3_sc_and_merge5
+  store i64 0, ptr %slot.__mb40___sc_and_0, align 8
+  %t348 = icmp ne i64 %r2122, 0
+  br i1 %t348, label %__mb40_sc_and_right4, label %__mb40_sc_and_merge5
 
-__mb3_while_exit3:
-  %r2128 = load i64, ptr %slot.__mb3_count, align 8
-  %t352 = load i64, ptr %slot.__mb3_ret, align 8
-  call void @nova_rc_dec(i64 %t352)
-  call void @nova_rc_inc(i64 %r2128)
-  store i64 %r2128, ptr %slot.__mb3_ret, align 8
-  br label %__mb3_merge
+__mb40_while_exit3:
+  %r2128 = load i64, ptr %slot.__mb40_count, align 8
+  store i64 %r2128, ptr %slot.__mb40_ret, align 8
+  br label %__mb40_merge
 
-__mb3_sc_and_right4:
-  %r2129 = load i64, ptr %slot.__mb3_i, align 8
+__mb40_sc_and_right4:
+  %r2129 = load i64, ptr %slot.__mb40_i, align 8
   %r2131 = add i64 %r2129, 2
   %r2132 = call i64 @is_prime(i64 %r2131)
-  store i64 %r2132, ptr %slot.__mb3___sc_and_0, align 8
-  br label %__mb3_sc_and_merge5
+  store i64 %r2132, ptr %slot.__mb40___sc_and_0, align 8
+  br label %__mb40_sc_and_merge5
 
-__mb3_sc_and_merge5:
-  %r2134 = load i64, ptr %slot.__mb3___sc_and_0, align 8
-  %t353 = trunc i64 %r2134 to i1
-  br i1 %t353, label %__mb3_ifb_then6, label %__mb3_ifb_else7
+__mb40_sc_and_merge5:
+  %r2134 = load i64, ptr %slot.__mb40___sc_and_0, align 8
+  %t349 = trunc i64 %r2134 to i1
+  br i1 %t349, label %__mb40_ifb_then6, label %__mb40_ifb_else7
 
-__mb3_ifb_then6:
-  %r2135 = load i64, ptr %slot.__mb3_count, align 8
+__mb40_ifb_then6:
+  %r2135 = load i64, ptr %slot.__mb40_count, align 8
   %r2137 = add i64 %r2135, 1
-  store i64 %r2137, ptr %slot.__mb3_count, align 8
-  br label %__mb3_ifb_merge8
+  store i64 %r2137, ptr %slot.__mb40_count, align 8
+  br label %__mb40_ifb_merge8
 
-__mb3_ifb_else7:
-  br label %__mb3_ifb_merge8
+__mb40_ifb_else7:
+  br label %__mb40_ifb_merge8
 
-__mb3_ifb_merge8:
-  %r2141 = load i64, ptr %slot.__mb3_i, align 8
+__mb40_ifb_merge8:
+  %r2141 = load i64, ptr %slot.__mb40_i, align 8
   %r2143 = add i64 %r2141, 1
-  store i64 %r2143, ptr %slot.__mb3_i, align 8
-  br label %__mb3_while_header1, !llvm.loop !91
+  store i64 %r2143, ptr %slot.__mb40_i, align 8
+  br label %__mb40_while_header1, !llvm.loop !91
 
-__mb3_merge:
-  %r2145 = load i64, ptr %slot.__mb3_ret, align 8
+__mb40_merge:
+  %r2145 = load i64, ptr %slot.__mb40_ret, align 8
   %r352 = call i64 @nova_rt_int_to_str(i64 %r2145)
-  %t354 = call i64 @nova_rt_str_concat(i64 %r349, i64 %r352)
+  %t350 = call i64 @nova_rt_str_concat(i64 %r349, i64 %r352)
   call void @nova_rc_dec(i64 %r352)
-  %t355 = inttoptr i64 %t354 to ptr
-  call i32 @puts(ptr %t355)
-  call void @nova_rc_dec(i64 %t354)
-  %t356 = getelementptr inbounds [43 x i8], ptr @.str.29, i64 0, i64 0
-  %r355 = ptrtoint ptr %t356 to i64
-  %t357 = load i64, ptr %slot.__inl6_title, align 8
-  call void @nova_rc_dec(i64 %t357)
+  %t351 = inttoptr i64 %t350 to ptr
+  call i32 @puts(ptr %t351)
+  call void @nova_rc_dec(i64 %t350)
+  %t352 = getelementptr inbounds [43 x i8], ptr @.str.29, i64 0, i64 0
+  %r355 = ptrtoint ptr %t352 to i64
+  %t353 = load i64, ptr %slot.__inl6_title, align 8
+  call void @nova_rc_dec(i64 %t353)
   store i64 %r355, ptr %slot.__inl6_title, align 8
-  %t358 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r584 = ptrtoint ptr %t358 to i64
-  %t359 = inttoptr i64 %r584 to ptr
-  call i32 @puts(ptr %t359)
-  %t360 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r586 = ptrtoint ptr %t360 to i64
+  %t354 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r584 = ptrtoint ptr %t354 to i64
+  %t355 = inttoptr i64 %r584 to ptr
+  call i32 @puts(ptr %t355)
+  %t356 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r586 = ptrtoint ptr %t356 to i64
   br label %__mb28_entry0, !llvm.loop !91
 
 __mb28_entry0:
-  %t361 = load i64, ptr %slot.__mb28_s, align 8
-  call void @nova_rc_dec(i64 %t361)
+  %t357 = load i64, ptr %slot.__mb28_s, align 8
+  call void @nova_rc_dec(i64 %t357)
   store i64 %r586, ptr %slot.__mb28_s, align 8
   store i64 48, ptr %slot.__mb28_n, align 8
-  %t362 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1650 = ptrtoint ptr %t362 to i64
-  %t363 = load i64, ptr %slot.__mb28_result, align 8
-  call void @nova_rc_dec(i64 %t363)
+  %t358 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1650 = ptrtoint ptr %t358 to i64
+  %t359 = load i64, ptr %slot.__mb28_result, align 8
+  call void @nova_rc_dec(i64 %t359)
   store i64 %r1650, ptr %slot.__mb28_result, align 8
   store i64 0, ptr %slot.__mb28_i, align 8
   %r1979 = load i64, ptr %slot.__mb28_n, align 8
@@ -2587,15 +2637,15 @@ __mb28_entry0:
 
 __mb28_while_header1:
   %r1658 = load i64, ptr %slot.__mb28_i, align 8
-  %t364 = icmp slt i64 %r1658, %r1979
-  br i1 %t364, label %__mb28_while_body2, label %__mb28_while_exit3, !prof !90
+  %t360 = icmp slt i64 %r1658, %r1979
+  br i1 %t360, label %__mb28_while_body2, label %__mb28_while_exit3, !prof !90
 
 __mb28_while_body2:
   %r1662 = load i64, ptr %slot.__mb28_result, align 8
-  %t365 = call i64 @nova_rt_str_concat(i64 %r1662, i64 %r1980)
-  %t366 = load i64, ptr %slot.__mb28_result, align 8
-  call void @nova_rc_dec(i64 %t366)
-  store i64 %t365, ptr %slot.__mb28_result, align 8
+  %t361 = call i64 @nova_rt_str_concat(i64 %r1662, i64 %r1980)
+  %t362 = load i64, ptr %slot.__mb28_result, align 8
+  call void @nova_rc_dec(i64 %t362)
+  store i64 %t361, ptr %slot.__mb28_result, align 8
   %r1667 = load i64, ptr %slot.__mb28_i, align 8
   %r1669 = add i64 %r1667, 1
   store i64 %r1669, ptr %slot.__mb28_i, align 8
@@ -2603,36 +2653,36 @@ __mb28_while_body2:
 
 __mb28_while_exit3:
   %r1673 = load i64, ptr %slot.__mb28_result, align 8
-  %t367 = load i64, ptr %slot.__mb28_ret, align 8
-  call void @nova_rc_dec(i64 %t367)
+  %t363 = load i64, ptr %slot.__mb28_ret, align 8
+  call void @nova_rc_dec(i64 %t363)
   call void @nova_rc_inc(i64 %r1673)
   store i64 %r1673, ptr %slot.__mb28_ret, align 8
   br label %__mb28_merge
 
 __mb28_merge:
   %r1674 = load i64, ptr %slot.__mb28_ret, align 8
-  %t368 = inttoptr i64 %r1674 to ptr
-  call i32 @puts(ptr %t368)
-  %t369 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r590 = ptrtoint ptr %t369 to i64
+  %t364 = inttoptr i64 %r1674 to ptr
+  call i32 @puts(ptr %t364)
+  %t365 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r590 = ptrtoint ptr %t365 to i64
   %r591 = load i64, ptr %slot.__inl6_title, align 8
-  %t370 = call i64 @nova_rt_str_concat(i64 %r590, i64 %r591)
-  %t371 = inttoptr i64 %t370 to ptr
-  call i32 @puts(ptr %t371)
-  call void @nova_rc_dec(i64 %t370)
-  %t372 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r594 = ptrtoint ptr %t372 to i64
+  %t366 = call i64 @nova_rt_str_concat(i64 %r590, i64 %r591)
+  %t367 = inttoptr i64 %t366 to ptr
+  call i32 @puts(ptr %t367)
+  call void @nova_rc_dec(i64 %t366)
+  %t368 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r594 = ptrtoint ptr %t368 to i64
   br label %__mb29_entry0
 
 __mb29_entry0:
-  %t373 = load i64, ptr %slot.__mb29_s, align 8
-  call void @nova_rc_dec(i64 %t373)
+  %t369 = load i64, ptr %slot.__mb29_s, align 8
+  call void @nova_rc_dec(i64 %t369)
   store i64 %r594, ptr %slot.__mb29_s, align 8
   store i64 48, ptr %slot.__mb29_n, align 8
-  %t374 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1682 = ptrtoint ptr %t374 to i64
-  %t375 = load i64, ptr %slot.__mb29_result, align 8
-  call void @nova_rc_dec(i64 %t375)
+  %t370 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1682 = ptrtoint ptr %t370 to i64
+  %t371 = load i64, ptr %slot.__mb29_result, align 8
+  call void @nova_rc_dec(i64 %t371)
   store i64 %r1682, ptr %slot.__mb29_result, align 8
   store i64 0, ptr %slot.__mb29_i, align 8
   %r1981 = load i64, ptr %slot.__mb29_n, align 8
@@ -2641,15 +2691,15 @@ __mb29_entry0:
 
 __mb29_while_header1:
   %r1690 = load i64, ptr %slot.__mb29_i, align 8
-  %t376 = icmp slt i64 %r1690, %r1981
-  br i1 %t376, label %__mb29_while_body2, label %__mb29_while_exit3, !prof !90
+  %t372 = icmp slt i64 %r1690, %r1981
+  br i1 %t372, label %__mb29_while_body2, label %__mb29_while_exit3, !prof !90
 
 __mb29_while_body2:
   %r1694 = load i64, ptr %slot.__mb29_result, align 8
-  %t377 = call i64 @nova_rt_str_concat(i64 %r1694, i64 %r1982)
-  %t378 = load i64, ptr %slot.__mb29_result, align 8
-  call void @nova_rc_dec(i64 %t378)
-  store i64 %t377, ptr %slot.__mb29_result, align 8
+  %t373 = call i64 @nova_rt_str_concat(i64 %r1694, i64 %r1982)
+  %t374 = load i64, ptr %slot.__mb29_result, align 8
+  call void @nova_rc_dec(i64 %t374)
+  store i64 %t373, ptr %slot.__mb29_result, align 8
   %r1699 = load i64, ptr %slot.__mb29_i, align 8
   %r1701 = add i64 %r1699, 1
   store i64 %r1701, ptr %slot.__mb29_i, align 8
@@ -2657,26 +2707,26 @@ __mb29_while_body2:
 
 __mb29_while_exit3:
   %r1705 = load i64, ptr %slot.__mb29_result, align 8
-  %t379 = load i64, ptr %slot.__mb29_ret, align 8
-  call void @nova_rc_dec(i64 %t379)
+  %t375 = load i64, ptr %slot.__mb29_ret, align 8
+  call void @nova_rc_dec(i64 %t375)
   call void @nova_rc_inc(i64 %r1705)
   store i64 %r1705, ptr %slot.__mb29_ret, align 8
   br label %__mb29_merge
 
 __mb29_merge:
   %r1706 = load i64, ptr %slot.__mb29_ret, align 8
-  %t380 = inttoptr i64 %r1706 to ptr
-  call i32 @puts(ptr %t380)
+  %t376 = inttoptr i64 %r1706 to ptr
+  call i32 @puts(ptr %t376)
   %r364 = call i64 @nova_rt_list_create()
-  %t381 = call i64 @nova_rt_list_append(i64 %r364, i64 6)
-  %t382 = call i64 @nova_rt_list_append(i64 %r364, i64 11)
-  %t383 = call i64 @nova_rt_list_append(i64 %r364, i64 27)
-  %t384 = call i64 @nova_rt_list_append(i64 %r364, i64 97)
-  %t385 = call i64 @nova_rt_list_append(i64 %r364, i64 871)
-  %t386 = call i64 @nova_rt_list_append(i64 %r364, i64 6171)
-  %t387 = call i64 @nova_rt_list_append(i64 %r364, i64 77031)
-  %t388 = load i64, ptr %slot.col_nums, align 8
-  call void @nova_rc_dec(i64 %t388)
+  %t377 = call i64 @nova_rt_list_append(i64 %r364, i64 6)
+  %t378 = call i64 @nova_rt_list_append(i64 %r364, i64 11)
+  %t379 = call i64 @nova_rt_list_append(i64 %r364, i64 27)
+  %t380 = call i64 @nova_rt_list_append(i64 %r364, i64 97)
+  %t381 = call i64 @nova_rt_list_append(i64 %r364, i64 871)
+  %t382 = call i64 @nova_rt_list_append(i64 %r364, i64 6171)
+  %t383 = call i64 @nova_rt_list_append(i64 %r364, i64 77031)
+  %t384 = load i64, ptr %slot.col_nums, align 8
+  call void @nova_rc_dec(i64 %t384)
   store i64 %r364, ptr %slot.col_nums, align 8
   store i64 0, ptr %slot.ci, align 8
   %r1983 = load i64, ptr %slot.col_nums, align 8
@@ -2684,107 +2734,107 @@ __mb29_merge:
 
 while_header32:
   %r372 = load i64, ptr %slot.ci, align 8
-  %t389 = icmp slt i64 %r372, 7
-  br i1 %t389, label %while_body33, label %while_exit34, !prof !90
+  %t385 = icmp slt i64 %r372, 7
+  br i1 %t385, label %while_body33, label %while_exit34, !prof !90
 
 while_body33:
   %r377 = load i64, ptr %slot.ci, align 8
-  %t390 = inttoptr i64 %r1983 to ptr
-  %t391 = load ptr, ptr %t390, align 8, !tbaa !2
-  %t392 = getelementptr i64, ptr %t391, i64 %r377
-  %r378 = load i64, ptr %t392, align 8, !tbaa !4
-  br label %__mb4_entry0
+  %t386 = inttoptr i64 %r1983 to ptr
+  %t387 = load ptr, ptr %t386, align 8, !tbaa !2
+  %t388 = getelementptr i64, ptr %t387, i64 %r377
+  %r378 = load i64, ptr %t388, align 8, !tbaa !4
+  br label %__mb41_entry0
 
-__mb4_entry0:
-  store i64 %r378, ptr %slot.__mb4_n, align 8
-  store i64 0, ptr %slot.__mb4_steps, align 8
-  br label %__mb4_while_header1
+__mb41_entry0:
+  store i64 %r378, ptr %slot.__mb41_n, align 8
+  store i64 0, ptr %slot.__mb41_steps, align 8
+  br label %__mb41_while_header1
 
-__mb4_while_header1:
-  %r2153 = load i64, ptr %slot.__mb4_n, align 8
-  %t393 = icmp ne i64 %r2153, 1
-  br i1 %t393, label %__mb4_while_body2, label %__mb4_while_exit3, !prof !90
+__mb41_while_header1:
+  %r2153 = load i64, ptr %slot.__mb41_n, align 8
+  %t389 = icmp ne i64 %r2153, 1
+  br i1 %t389, label %__mb41_while_body2, label %__mb41_while_exit3, !prof !90
 
-__mb4_while_body2:
-  %r2156 = load i64, ptr %slot.__mb4_n, align 8
+__mb41_while_body2:
+  %r2156 = load i64, ptr %slot.__mb41_n, align 8
   %r2158 = srem i64 %r2156, 2
-  %t394 = icmp eq i64 %r2158, 0
-  br i1 %t394, label %__mb4_ifb_then4, label %__mb4_ifb_else5
+  %t390 = icmp eq i64 %r2158, 0
+  br i1 %t390, label %__mb41_ifb_then4, label %__mb41_ifb_else5
 
-__mb4_while_exit3:
-  %r2161 = load i64, ptr %slot.__mb4_steps, align 8
-  store i64 %r2161, ptr %slot.__mb4_ret, align 8
-  br label %__mb4_merge
+__mb41_while_exit3:
+  %r2161 = load i64, ptr %slot.__mb41_steps, align 8
+  store i64 %r2161, ptr %slot.__mb41_ret, align 8
+  br label %__mb41_merge
 
-__mb4_ifb_then4:
-  %r2162 = load i64, ptr %slot.__mb4_n, align 8
+__mb41_ifb_then4:
+  %r2162 = load i64, ptr %slot.__mb41_n, align 8
   %r2164 = sdiv i64 %r2162, 2
-  store i64 %r2164, ptr %slot.__mb4_n, align 8
-  br label %__mb4_ifb_merge6
+  store i64 %r2164, ptr %slot.__mb41_n, align 8
+  br label %__mb41_ifb_merge6
 
-__mb4_ifb_else5:
-  %r2167 = load i64, ptr %slot.__mb4_n, align 8
+__mb41_ifb_else5:
+  %r2167 = load i64, ptr %slot.__mb41_n, align 8
   %r2169 = mul i64 %r2167, 3
   %r2171 = add i64 %r2169, 1
-  store i64 %r2171, ptr %slot.__mb4_n, align 8
-  br label %__mb4_ifb_merge6
+  store i64 %r2171, ptr %slot.__mb41_n, align 8
+  br label %__mb41_ifb_merge6
 
-__mb4_ifb_merge6:
-  %r2174 = load i64, ptr %slot.__mb4_steps, align 8
+__mb41_ifb_merge6:
+  %r2174 = load i64, ptr %slot.__mb41_steps, align 8
   %r2176 = add i64 %r2174, 1
-  store i64 %r2176, ptr %slot.__mb4_steps, align 8
-  br label %__mb4_while_header1, !llvm.loop !91
+  store i64 %r2176, ptr %slot.__mb41_steps, align 8
+  br label %__mb41_while_header1, !llvm.loop !91
 
-__mb4_merge:
-  %r2178 = load i64, ptr %slot.__mb4_ret, align 8
-  %t395 = getelementptr inbounds [11 x i8], ptr @.str.30, i64 0, i64 0
-  %r387 = ptrtoint ptr %t395 to i64
+__mb41_merge:
+  %r2178 = load i64, ptr %slot.__mb41_ret, align 8
+  %t391 = getelementptr inbounds [11 x i8], ptr @.str.30, i64 0, i64 0
+  %r387 = ptrtoint ptr %t391 to i64
   %r389 = call i64 @nova_rt_int_to_str(i64 %r378)
-  %t396 = call i64 @nova_rt_str_concat(i64 %r387, i64 %r389)
+  %t392 = call i64 @nova_rt_str_concat(i64 %r387, i64 %r389)
   call void @nova_rc_dec(i64 %r389)
-  %t397 = getelementptr inbounds [5 x i8], ptr @.str.19, i64 0, i64 0
-  %r391 = ptrtoint ptr %t397 to i64
-  %t398 = call i64 @nova_rt_str_concat(i64 %t396, i64 %r391)
-  call void @nova_rc_dec(i64 %t396)
+  %t393 = getelementptr inbounds [5 x i8], ptr @.str.19, i64 0, i64 0
+  %r391 = ptrtoint ptr %t393 to i64
+  %t394 = call i64 @nova_rt_str_concat(i64 %t392, i64 %r391)
+  call void @nova_rc_dec(i64 %t392)
   %r394 = call i64 @nova_rt_int_to_str(i64 %r2178)
-  %t399 = call i64 @nova_rt_str_concat(i64 %t398, i64 %r394)
-  call void @nova_rc_dec(i64 %t398)
+  %t395 = call i64 @nova_rt_str_concat(i64 %t394, i64 %r394)
+  call void @nova_rc_dec(i64 %t394)
   call void @nova_rc_dec(i64 %r394)
-  %t400 = getelementptr inbounds [7 x i8], ptr @.str.31, i64 0, i64 0
-  %r396 = ptrtoint ptr %t400 to i64
-  %t401 = call i64 @nova_rt_str_concat(i64 %t399, i64 %r396)
-  call void @nova_rc_dec(i64 %t399)
-  %t402 = inttoptr i64 %t401 to ptr
-  call i32 @puts(ptr %t402)
-  call void @nova_rc_dec(i64 %t401)
+  %t396 = getelementptr inbounds [7 x i8], ptr @.str.31, i64 0, i64 0
+  %r396 = ptrtoint ptr %t396 to i64
+  %t397 = call i64 @nova_rt_str_concat(i64 %t395, i64 %r396)
+  call void @nova_rc_dec(i64 %t395)
+  %t398 = inttoptr i64 %t397 to ptr
+  call i32 @puts(ptr %t398)
+  call void @nova_rc_dec(i64 %t397)
   %r399 = load i64, ptr %slot.ci, align 8
   %r401 = add i64 %r399, 1
   store i64 %r401, ptr %slot.ci, align 8
   br label %while_header32, !llvm.loop !91
 
 while_exit34:
-  %t403 = getelementptr inbounds [24 x i8], ptr @.str.32, i64 0, i64 0
-  %r405 = ptrtoint ptr %t403 to i64
-  %t404 = load i64, ptr %slot.__inl7_title, align 8
-  call void @nova_rc_dec(i64 %t404)
+  %t399 = getelementptr inbounds [24 x i8], ptr @.str.32, i64 0, i64 0
+  %r405 = ptrtoint ptr %t399 to i64
+  %t400 = load i64, ptr %slot.__inl7_title, align 8
+  call void @nova_rc_dec(i64 %t400)
   store i64 %r405, ptr %slot.__inl7_title, align 8
-  %t405 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r601 = ptrtoint ptr %t405 to i64
-  %t406 = inttoptr i64 %r601 to ptr
-  call i32 @puts(ptr %t406)
-  %t407 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r603 = ptrtoint ptr %t407 to i64
+  %t401 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r601 = ptrtoint ptr %t401 to i64
+  %t402 = inttoptr i64 %r601 to ptr
+  call i32 @puts(ptr %t402)
+  %t403 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r603 = ptrtoint ptr %t403 to i64
   br label %__mb30_entry0
 
 __mb30_entry0:
-  %t408 = load i64, ptr %slot.__mb30_s, align 8
-  call void @nova_rc_dec(i64 %t408)
+  %t404 = load i64, ptr %slot.__mb30_s, align 8
+  call void @nova_rc_dec(i64 %t404)
   store i64 %r603, ptr %slot.__mb30_s, align 8
   store i64 48, ptr %slot.__mb30_n, align 8
-  %t409 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1714 = ptrtoint ptr %t409 to i64
-  %t410 = load i64, ptr %slot.__mb30_result, align 8
-  call void @nova_rc_dec(i64 %t410)
+  %t405 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1714 = ptrtoint ptr %t405 to i64
+  %t406 = load i64, ptr %slot.__mb30_result, align 8
+  call void @nova_rc_dec(i64 %t406)
   store i64 %r1714, ptr %slot.__mb30_result, align 8
   store i64 0, ptr %slot.__mb30_i, align 8
   %r1984 = load i64, ptr %slot.__mb30_n, align 8
@@ -2793,15 +2843,15 @@ __mb30_entry0:
 
 __mb30_while_header1:
   %r1722 = load i64, ptr %slot.__mb30_i, align 8
-  %t411 = icmp slt i64 %r1722, %r1984
-  br i1 %t411, label %__mb30_while_body2, label %__mb30_while_exit3, !prof !90
+  %t407 = icmp slt i64 %r1722, %r1984
+  br i1 %t407, label %__mb30_while_body2, label %__mb30_while_exit3, !prof !90
 
 __mb30_while_body2:
   %r1726 = load i64, ptr %slot.__mb30_result, align 8
-  %t412 = call i64 @nova_rt_str_concat(i64 %r1726, i64 %r1985)
-  %t413 = load i64, ptr %slot.__mb30_result, align 8
-  call void @nova_rc_dec(i64 %t413)
-  store i64 %t412, ptr %slot.__mb30_result, align 8
+  %t408 = call i64 @nova_rt_str_concat(i64 %r1726, i64 %r1985)
+  %t409 = load i64, ptr %slot.__mb30_result, align 8
+  call void @nova_rc_dec(i64 %t409)
+  store i64 %t408, ptr %slot.__mb30_result, align 8
   %r1731 = load i64, ptr %slot.__mb30_i, align 8
   %r1733 = add i64 %r1731, 1
   store i64 %r1733, ptr %slot.__mb30_i, align 8
@@ -2809,36 +2859,36 @@ __mb30_while_body2:
 
 __mb30_while_exit3:
   %r1737 = load i64, ptr %slot.__mb30_result, align 8
-  %t414 = load i64, ptr %slot.__mb30_ret, align 8
-  call void @nova_rc_dec(i64 %t414)
+  %t410 = load i64, ptr %slot.__mb30_ret, align 8
+  call void @nova_rc_dec(i64 %t410)
   call void @nova_rc_inc(i64 %r1737)
   store i64 %r1737, ptr %slot.__mb30_ret, align 8
   br label %__mb30_merge
 
 __mb30_merge:
   %r1738 = load i64, ptr %slot.__mb30_ret, align 8
-  %t415 = inttoptr i64 %r1738 to ptr
-  call i32 @puts(ptr %t415)
-  %t416 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r607 = ptrtoint ptr %t416 to i64
+  %t411 = inttoptr i64 %r1738 to ptr
+  call i32 @puts(ptr %t411)
+  %t412 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r607 = ptrtoint ptr %t412 to i64
   %r608 = load i64, ptr %slot.__inl7_title, align 8
-  %t417 = call i64 @nova_rt_str_concat(i64 %r607, i64 %r608)
-  %t418 = inttoptr i64 %t417 to ptr
-  call i32 @puts(ptr %t418)
-  call void @nova_rc_dec(i64 %t417)
-  %t419 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r611 = ptrtoint ptr %t419 to i64
+  %t413 = call i64 @nova_rt_str_concat(i64 %r607, i64 %r608)
+  %t414 = inttoptr i64 %t413 to ptr
+  call i32 @puts(ptr %t414)
+  call void @nova_rc_dec(i64 %t413)
+  %t415 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r611 = ptrtoint ptr %t415 to i64
   br label %__mb31_entry0
 
 __mb31_entry0:
-  %t420 = load i64, ptr %slot.__mb31_s, align 8
-  call void @nova_rc_dec(i64 %t420)
+  %t416 = load i64, ptr %slot.__mb31_s, align 8
+  call void @nova_rc_dec(i64 %t416)
   store i64 %r611, ptr %slot.__mb31_s, align 8
   store i64 48, ptr %slot.__mb31_n, align 8
-  %t421 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1746 = ptrtoint ptr %t421 to i64
-  %t422 = load i64, ptr %slot.__mb31_result, align 8
-  call void @nova_rc_dec(i64 %t422)
+  %t417 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1746 = ptrtoint ptr %t417 to i64
+  %t418 = load i64, ptr %slot.__mb31_result, align 8
+  call void @nova_rc_dec(i64 %t418)
   store i64 %r1746, ptr %slot.__mb31_result, align 8
   store i64 0, ptr %slot.__mb31_i, align 8
   %r1986 = load i64, ptr %slot.__mb31_n, align 8
@@ -2847,15 +2897,15 @@ __mb31_entry0:
 
 __mb31_while_header1:
   %r1754 = load i64, ptr %slot.__mb31_i, align 8
-  %t423 = icmp slt i64 %r1754, %r1986
-  br i1 %t423, label %__mb31_while_body2, label %__mb31_while_exit3, !prof !90
+  %t419 = icmp slt i64 %r1754, %r1986
+  br i1 %t419, label %__mb31_while_body2, label %__mb31_while_exit3, !prof !90
 
 __mb31_while_body2:
   %r1758 = load i64, ptr %slot.__mb31_result, align 8
-  %t424 = call i64 @nova_rt_str_concat(i64 %r1758, i64 %r1987)
-  %t425 = load i64, ptr %slot.__mb31_result, align 8
-  call void @nova_rc_dec(i64 %t425)
-  store i64 %t424, ptr %slot.__mb31_result, align 8
+  %t420 = call i64 @nova_rt_str_concat(i64 %r1758, i64 %r1987)
+  %t421 = load i64, ptr %slot.__mb31_result, align 8
+  call void @nova_rc_dec(i64 %t421)
+  store i64 %t420, ptr %slot.__mb31_result, align 8
   %r1763 = load i64, ptr %slot.__mb31_i, align 8
   %r1765 = add i64 %r1763, 1
   store i64 %r1765, ptr %slot.__mb31_i, align 8
@@ -2863,26 +2913,26 @@ __mb31_while_body2:
 
 __mb31_while_exit3:
   %r1769 = load i64, ptr %slot.__mb31_result, align 8
-  %t426 = load i64, ptr %slot.__mb31_ret, align 8
-  call void @nova_rc_dec(i64 %t426)
+  %t422 = load i64, ptr %slot.__mb31_ret, align 8
+  call void @nova_rc_dec(i64 %t422)
   call void @nova_rc_inc(i64 %r1769)
   store i64 %r1769, ptr %slot.__mb31_ret, align 8
   br label %__mb31_merge
 
 __mb31_merge:
   %r1770 = load i64, ptr %slot.__mb31_ret, align 8
-  %t427 = inttoptr i64 %r1770 to ptr
-  call i32 @puts(ptr %t427)
+  %t423 = inttoptr i64 %r1770 to ptr
+  call i32 @puts(ptr %t423)
   %r414 = call i64 @nova_rt_list_create()
-  %t428 = call i64 @nova_rt_list_append(i64 %r414, i64 12)
-  %t429 = call i64 @nova_rt_list_append(i64 %r414, i64 100)
-  %t430 = call i64 @nova_rt_list_append(i64 %r414, i64 360)
-  %t431 = call i64 @nova_rt_list_append(i64 %r414, i64 1024)
-  %t432 = call i64 @nova_rt_list_append(i64 %r414, i64 9999)
-  %t433 = call i64 @nova_rt_list_append(i64 %r414, i64 123456)
-  %t434 = call i64 @nova_rt_list_append(i64 %r414, i64 1000000)
-  %t435 = load i64, ptr %slot.lpf_nums, align 8
-  call void @nova_rc_dec(i64 %t435)
+  %t424 = call i64 @nova_rt_list_append(i64 %r414, i64 12)
+  %t425 = call i64 @nova_rt_list_append(i64 %r414, i64 100)
+  %t426 = call i64 @nova_rt_list_append(i64 %r414, i64 360)
+  %t427 = call i64 @nova_rt_list_append(i64 %r414, i64 1024)
+  %t428 = call i64 @nova_rt_list_append(i64 %r414, i64 9999)
+  %t429 = call i64 @nova_rt_list_append(i64 %r414, i64 123456)
+  %t430 = call i64 @nova_rt_list_append(i64 %r414, i64 1000000)
+  %t431 = load i64, ptr %slot.lpf_nums, align 8
+  call void @nova_rc_dec(i64 %t431)
   store i64 %r414, ptr %slot.lpf_nums, align 8
   store i64 0, ptr %slot.li, align 8
   %r1988 = load i64, ptr %slot.lpf_nums, align 8
@@ -2890,118 +2940,118 @@ __mb31_merge:
 
 while_header35:
   %r422 = load i64, ptr %slot.li, align 8
-  %t436 = icmp slt i64 %r422, 7
-  br i1 %t436, label %while_body36, label %while_exit37, !prof !90
+  %t432 = icmp slt i64 %r422, 7
+  br i1 %t432, label %while_body36, label %while_exit37, !prof !90
 
 while_body36:
   %r427 = load i64, ptr %slot.li, align 8
-  %t437 = inttoptr i64 %r1988 to ptr
-  %t438 = load ptr, ptr %t437, align 8, !tbaa !2
-  %t439 = getelementptr i64, ptr %t438, i64 %r427
-  %r428 = load i64, ptr %t439, align 8, !tbaa !4
-  br label %__mb5_entry0
+  %t433 = inttoptr i64 %r1988 to ptr
+  %t434 = load ptr, ptr %t433, align 8, !tbaa !2
+  %t435 = getelementptr i64, ptr %t434, i64 %r427
+  %r428 = load i64, ptr %t435, align 8, !tbaa !4
+  br label %__mb42_entry0
 
-__mb5_entry0:
-  store i64 %r428, ptr %slot.__mb5_n, align 8
-  store i64 1, ptr %slot.__mb5_result, align 8
-  store i64 2, ptr %slot.__mb5_d, align 8
-  br label %__mb5_while_header1
+__mb42_entry0:
+  store i64 %r428, ptr %slot.__mb42_n, align 8
+  store i64 1, ptr %slot.__mb42_result, align 8
+  store i64 2, ptr %slot.__mb42_d, align 8
+  br label %__mb42_while_header1
 
-__mb5_while_header1:
-  %r2189 = load i64, ptr %slot.__mb5_d, align 8
-  %r2190 = load i64, ptr %slot.__mb5_d, align 8
+__mb42_while_header1:
+  %r2189 = load i64, ptr %slot.__mb42_d, align 8
+  %r2190 = load i64, ptr %slot.__mb42_d, align 8
   %r2191 = mul i64 %r2189, %r2190
-  %r2192 = load i64, ptr %slot.__mb5_n, align 8
-  %t440 = icmp sle i64 %r2191, %r2192
-  br i1 %t440, label %__mb5_while_body2, label %__mb5_while_exit3, !prof !90
+  %r2192 = load i64, ptr %slot.__mb42_n, align 8
+  %t436 = icmp sle i64 %r2191, %r2192
+  br i1 %t436, label %__mb42_while_body2, label %__mb42_while_exit3, !prof !90
 
-__mb5_while_body2:
-  %r2194 = load i64, ptr %slot.__mb5_d, align 8
-  br label %__mb5_while_header4
+__mb42_while_body2:
+  %r2194 = load i64, ptr %slot.__mb42_d, align 8
+  br label %__mb42_while_header4
 
-__mb5_while_exit3:
-  %r2195 = load i64, ptr %slot.__mb5_n, align 8
-  %t441 = icmp sgt i64 %r2195, 1
-  br i1 %t441, label %__mb5_ifb_then7, label %__mb5_ifb_else8
+__mb42_while_exit3:
+  %r2195 = load i64, ptr %slot.__mb42_n, align 8
+  %t437 = icmp sgt i64 %r2195, 1
+  br i1 %t437, label %__mb42_ifb_then7, label %__mb42_ifb_else8
 
-__mb5_while_header4:
-  %r2198 = load i64, ptr %slot.__mb5_n, align 8
+__mb42_while_header4:
+  %r2198 = load i64, ptr %slot.__mb42_n, align 8
   %r2199 = srem i64 %r2198, %r2194
-  %t442 = icmp eq i64 %r2199, 0
-  br i1 %t442, label %__mb5_while_body5, label %__mb5_while_exit6, !prof !90
+  %t438 = icmp eq i64 %r2199, 0
+  br i1 %t438, label %__mb42_while_body5, label %__mb42_while_exit6, !prof !90
 
-__mb5_while_body5:
-  store i64 %r2194, ptr %slot.__mb5_result, align 8
-  %r2203 = load i64, ptr %slot.__mb5_n, align 8
+__mb42_while_body5:
+  store i64 %r2194, ptr %slot.__mb42_result, align 8
+  %r2203 = load i64, ptr %slot.__mb42_n, align 8
   %r2204 = sdiv i64 %r2203, %r2194
-  store i64 %r2204, ptr %slot.__mb5_n, align 8
-  br label %__mb5_while_header4, !llvm.loop !91
+  store i64 %r2204, ptr %slot.__mb42_n, align 8
+  br label %__mb42_while_header4, !llvm.loop !91
 
-__mb5_while_exit6:
-  %r2206 = load i64, ptr %slot.__mb5_d, align 8
+__mb42_while_exit6:
+  %r2206 = load i64, ptr %slot.__mb42_d, align 8
   %r2208 = add i64 %r2206, 1
-  store i64 %r2208, ptr %slot.__mb5_d, align 8
-  br label %__mb5_while_header1, !llvm.loop !91
+  store i64 %r2208, ptr %slot.__mb42_d, align 8
+  br label %__mb42_while_header1, !llvm.loop !91
 
-__mb5_ifb_then7:
-  %r2210 = load i64, ptr %slot.__mb5_n, align 8
-  store i64 %r2210, ptr %slot.__mb5_result, align 8
-  br label %__mb5_ifb_merge9
+__mb42_ifb_then7:
+  %r2210 = load i64, ptr %slot.__mb42_n, align 8
+  store i64 %r2210, ptr %slot.__mb42_result, align 8
+  br label %__mb42_ifb_merge9
 
-__mb5_ifb_else8:
-  br label %__mb5_ifb_merge9
+__mb42_ifb_else8:
+  br label %__mb42_ifb_merge9
 
-__mb5_ifb_merge9:
-  %r2214 = load i64, ptr %slot.__mb5_result, align 8
-  store i64 %r2214, ptr %slot.__mb5_ret, align 8
-  br label %__mb5_merge
+__mb42_ifb_merge9:
+  %r2214 = load i64, ptr %slot.__mb42_result, align 8
+  store i64 %r2214, ptr %slot.__mb42_ret, align 8
+  br label %__mb42_merge
 
-__mb5_merge:
-  %r2215 = load i64, ptr %slot.__mb5_ret, align 8
-  %t443 = getelementptr inbounds [7 x i8], ptr @.str.33, i64 0, i64 0
-  %r436 = ptrtoint ptr %t443 to i64
+__mb42_merge:
+  %r2215 = load i64, ptr %slot.__mb42_ret, align 8
+  %t439 = getelementptr inbounds [7 x i8], ptr @.str.33, i64 0, i64 0
+  %r436 = ptrtoint ptr %t439 to i64
   %r438 = call i64 @nova_rt_int_to_str(i64 %r428)
-  %t444 = call i64 @nova_rt_str_concat(i64 %r436, i64 %r438)
+  %t440 = call i64 @nova_rt_str_concat(i64 %r436, i64 %r438)
   call void @nova_rc_dec(i64 %r438)
-  %t445 = getelementptr inbounds [5 x i8], ptr @.str.19, i64 0, i64 0
-  %r440 = ptrtoint ptr %t445 to i64
-  %t446 = call i64 @nova_rt_str_concat(i64 %t444, i64 %r440)
-  call void @nova_rc_dec(i64 %t444)
+  %t441 = getelementptr inbounds [5 x i8], ptr @.str.19, i64 0, i64 0
+  %r440 = ptrtoint ptr %t441 to i64
+  %t442 = call i64 @nova_rt_str_concat(i64 %t440, i64 %r440)
+  call void @nova_rc_dec(i64 %t440)
   %r443 = call i64 @nova_rt_int_to_str(i64 %r2215)
-  %t447 = call i64 @nova_rt_str_concat(i64 %t446, i64 %r443)
-  call void @nova_rc_dec(i64 %t446)
+  %t443 = call i64 @nova_rt_str_concat(i64 %t442, i64 %r443)
+  call void @nova_rc_dec(i64 %t442)
   call void @nova_rc_dec(i64 %r443)
-  %t448 = inttoptr i64 %t447 to ptr
-  call i32 @puts(ptr %t448)
-  call void @nova_rc_dec(i64 %t447)
+  %t444 = inttoptr i64 %t443 to ptr
+  call i32 @puts(ptr %t444)
+  call void @nova_rc_dec(i64 %t443)
   %r446 = load i64, ptr %slot.li, align 8
   %r448 = add i64 %r446, 1
   store i64 %r448, ptr %slot.li, align 8
   br label %while_header35, !llvm.loop !91
 
 while_exit37:
-  %t449 = getelementptr inbounds [37 x i8], ptr @.str.34, i64 0, i64 0
-  %r452 = ptrtoint ptr %t449 to i64
-  %t450 = load i64, ptr %slot.__inl8_title, align 8
-  call void @nova_rc_dec(i64 %t450)
+  %t445 = getelementptr inbounds [37 x i8], ptr @.str.34, i64 0, i64 0
+  %r452 = ptrtoint ptr %t445 to i64
+  %t446 = load i64, ptr %slot.__inl8_title, align 8
+  call void @nova_rc_dec(i64 %t446)
   store i64 %r452, ptr %slot.__inl8_title, align 8
-  %t451 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r618 = ptrtoint ptr %t451 to i64
-  %t452 = inttoptr i64 %r618 to ptr
-  call i32 @puts(ptr %t452)
-  %t453 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r620 = ptrtoint ptr %t453 to i64
+  %t447 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r618 = ptrtoint ptr %t447 to i64
+  %t448 = inttoptr i64 %r618 to ptr
+  call i32 @puts(ptr %t448)
+  %t449 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r620 = ptrtoint ptr %t449 to i64
   br label %__mb32_entry0
 
 __mb32_entry0:
-  %t454 = load i64, ptr %slot.__mb32_s, align 8
-  call void @nova_rc_dec(i64 %t454)
+  %t450 = load i64, ptr %slot.__mb32_s, align 8
+  call void @nova_rc_dec(i64 %t450)
   store i64 %r620, ptr %slot.__mb32_s, align 8
   store i64 48, ptr %slot.__mb32_n, align 8
-  %t455 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1778 = ptrtoint ptr %t455 to i64
-  %t456 = load i64, ptr %slot.__mb32_result, align 8
-  call void @nova_rc_dec(i64 %t456)
+  %t451 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1778 = ptrtoint ptr %t451 to i64
+  %t452 = load i64, ptr %slot.__mb32_result, align 8
+  call void @nova_rc_dec(i64 %t452)
   store i64 %r1778, ptr %slot.__mb32_result, align 8
   store i64 0, ptr %slot.__mb32_i, align 8
   %r1989 = load i64, ptr %slot.__mb32_n, align 8
@@ -3010,15 +3060,15 @@ __mb32_entry0:
 
 __mb32_while_header1:
   %r1786 = load i64, ptr %slot.__mb32_i, align 8
-  %t457 = icmp slt i64 %r1786, %r1989
-  br i1 %t457, label %__mb32_while_body2, label %__mb32_while_exit3, !prof !90
+  %t453 = icmp slt i64 %r1786, %r1989
+  br i1 %t453, label %__mb32_while_body2, label %__mb32_while_exit3, !prof !90
 
 __mb32_while_body2:
   %r1790 = load i64, ptr %slot.__mb32_result, align 8
-  %t458 = call i64 @nova_rt_str_concat(i64 %r1790, i64 %r1990)
-  %t459 = load i64, ptr %slot.__mb32_result, align 8
-  call void @nova_rc_dec(i64 %t459)
-  store i64 %t458, ptr %slot.__mb32_result, align 8
+  %t454 = call i64 @nova_rt_str_concat(i64 %r1790, i64 %r1990)
+  %t455 = load i64, ptr %slot.__mb32_result, align 8
+  call void @nova_rc_dec(i64 %t455)
+  store i64 %t454, ptr %slot.__mb32_result, align 8
   %r1795 = load i64, ptr %slot.__mb32_i, align 8
   %r1797 = add i64 %r1795, 1
   store i64 %r1797, ptr %slot.__mb32_i, align 8
@@ -3026,36 +3076,36 @@ __mb32_while_body2:
 
 __mb32_while_exit3:
   %r1801 = load i64, ptr %slot.__mb32_result, align 8
-  %t460 = load i64, ptr %slot.__mb32_ret, align 8
-  call void @nova_rc_dec(i64 %t460)
+  %t456 = load i64, ptr %slot.__mb32_ret, align 8
+  call void @nova_rc_dec(i64 %t456)
   call void @nova_rc_inc(i64 %r1801)
   store i64 %r1801, ptr %slot.__mb32_ret, align 8
   br label %__mb32_merge
 
 __mb32_merge:
   %r1802 = load i64, ptr %slot.__mb32_ret, align 8
-  %t461 = inttoptr i64 %r1802 to ptr
-  call i32 @puts(ptr %t461)
-  %t462 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
-  %r624 = ptrtoint ptr %t462 to i64
+  %t457 = inttoptr i64 %r1802 to ptr
+  call i32 @puts(ptr %t457)
+  %t458 = getelementptr inbounds [3 x i8], ptr @.str.3, i64 0, i64 0
+  %r624 = ptrtoint ptr %t458 to i64
   %r625 = load i64, ptr %slot.__inl8_title, align 8
-  %t463 = call i64 @nova_rt_str_concat(i64 %r624, i64 %r625)
-  %t464 = inttoptr i64 %t463 to ptr
-  call i32 @puts(ptr %t464)
-  call void @nova_rc_dec(i64 %t463)
-  %t465 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
-  %r628 = ptrtoint ptr %t465 to i64
+  %t459 = call i64 @nova_rt_str_concat(i64 %r624, i64 %r625)
+  %t460 = inttoptr i64 %t459 to ptr
+  call i32 @puts(ptr %t460)
+  call void @nova_rc_dec(i64 %t459)
+  %t461 = getelementptr inbounds [2 x i8], ptr @.str.7, i64 0, i64 0
+  %r628 = ptrtoint ptr %t461 to i64
   br label %__mb33_entry0
 
 __mb33_entry0:
-  %t466 = load i64, ptr %slot.__mb33_s, align 8
-  call void @nova_rc_dec(i64 %t466)
+  %t462 = load i64, ptr %slot.__mb33_s, align 8
+  call void @nova_rc_dec(i64 %t462)
   store i64 %r628, ptr %slot.__mb33_s, align 8
   store i64 48, ptr %slot.__mb33_n, align 8
-  %t467 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1810 = ptrtoint ptr %t467 to i64
-  %t468 = load i64, ptr %slot.__mb33_result, align 8
-  call void @nova_rc_dec(i64 %t468)
+  %t463 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1810 = ptrtoint ptr %t463 to i64
+  %t464 = load i64, ptr %slot.__mb33_result, align 8
+  call void @nova_rc_dec(i64 %t464)
   store i64 %r1810, ptr %slot.__mb33_result, align 8
   store i64 0, ptr %slot.__mb33_i, align 8
   %r1991 = load i64, ptr %slot.__mb33_n, align 8
@@ -3064,15 +3114,15 @@ __mb33_entry0:
 
 __mb33_while_header1:
   %r1818 = load i64, ptr %slot.__mb33_i, align 8
-  %t469 = icmp slt i64 %r1818, %r1991
-  br i1 %t469, label %__mb33_while_body2, label %__mb33_while_exit3, !prof !90
+  %t465 = icmp slt i64 %r1818, %r1991
+  br i1 %t465, label %__mb33_while_body2, label %__mb33_while_exit3, !prof !90
 
 __mb33_while_body2:
   %r1822 = load i64, ptr %slot.__mb33_result, align 8
-  %t470 = call i64 @nova_rt_str_concat(i64 %r1822, i64 %r1992)
-  %t471 = load i64, ptr %slot.__mb33_result, align 8
-  call void @nova_rc_dec(i64 %t471)
-  store i64 %t470, ptr %slot.__mb33_result, align 8
+  %t466 = call i64 @nova_rt_str_concat(i64 %r1822, i64 %r1992)
+  %t467 = load i64, ptr %slot.__mb33_result, align 8
+  call void @nova_rc_dec(i64 %t467)
+  store i64 %t466, ptr %slot.__mb33_result, align 8
   %r1827 = load i64, ptr %slot.__mb33_i, align 8
   %r1829 = add i64 %r1827, 1
   store i64 %r1829, ptr %slot.__mb33_i, align 8
@@ -3080,16 +3130,16 @@ __mb33_while_body2:
 
 __mb33_while_exit3:
   %r1833 = load i64, ptr %slot.__mb33_result, align 8
-  %t472 = load i64, ptr %slot.__mb33_ret, align 8
-  call void @nova_rc_dec(i64 %t472)
+  %t468 = load i64, ptr %slot.__mb33_ret, align 8
+  call void @nova_rc_dec(i64 %t468)
   call void @nova_rc_inc(i64 %r1833)
   store i64 %r1833, ptr %slot.__mb33_ret, align 8
   br label %__mb33_merge
 
 __mb33_merge:
   %r1834 = load i64, ptr %slot.__mb33_ret, align 8
-  %t473 = inttoptr i64 %r1834 to ptr
-  call i32 @puts(ptr %t473)
+  %t469 = inttoptr i64 %r1834 to ptr
+  call i32 @puts(ptr %t469)
   br label %__mb34_entry0
 
 __mb34_entry0:
@@ -3101,14 +3151,14 @@ __mb34_entry0:
 
 __mb34_while_header1:
   %r1848 = load i64, ptr %slot.__mb34_i, align 8
-  %t474 = icmp sle i64 %r1848, %r1993
-  br i1 %t474, label %__mb34_while_body2, label %__mb34_while_exit3, !prof !90
+  %t470 = icmp sle i64 %r1848, %r1993
+  br i1 %t470, label %__mb34_while_body2, label %__mb34_while_exit3, !prof !90
 
 __mb34_while_body2:
   %r1852 = load i64, ptr %slot.__mb34_i, align 8
   %r1853 = call i64 @is_prime(i64 %r1852)
-  %t475 = trunc i64 %r1853 to i1
-  br i1 %t475, label %__mb34_ifb_then4, label %__mb34_ifb_else5
+  %t471 = trunc i64 %r1853 to i1
+  br i1 %t471, label %__mb34_ifb_then4, label %__mb34_ifb_else5
 
 __mb34_while_exit3:
   %r1856 = load i64, ptr %slot.__mb34_count, align 8
@@ -3132,35 +3182,35 @@ __mb34_ifb_merge6:
 
 __mb34_merge:
   %r1872 = load i64, ptr %slot.__mb34_ret, align 8
-  %t476 = getelementptr inbounds [28 x i8], ptr @.str.35, i64 0, i64 0
-  %r459 = ptrtoint ptr %t476 to i64
+  %t472 = getelementptr inbounds [28 x i8], ptr @.str.35, i64 0, i64 0
+  %r459 = ptrtoint ptr %t472 to i64
   %r461 = call i64 @nova_rt_int_to_str(i64 %r1872)
-  %t477 = call i64 @nova_rt_str_concat(i64 %r459, i64 %r461)
+  %t473 = call i64 @nova_rt_str_concat(i64 %r459, i64 %r461)
   call void @nova_rc_dec(i64 %r461)
-  %t478 = inttoptr i64 %t477 to ptr
+  %t474 = inttoptr i64 %t473 to ptr
+  call i32 @puts(ptr %t474)
+  call void @nova_rc_dec(i64 %t473)
+  %t475 = getelementptr inbounds [53 x i8], ptr @.str.36, i64 0, i64 0
+  %r464 = ptrtoint ptr %t475 to i64
+  %t476 = inttoptr i64 %r464 to ptr
+  call i32 @puts(ptr %t476)
+  %t477 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r466 = ptrtoint ptr %t477 to i64
+  %t478 = inttoptr i64 %r466 to ptr
   call i32 @puts(ptr %t478)
-  call void @nova_rc_dec(i64 %t477)
-  %t479 = getelementptr inbounds [53 x i8], ptr @.str.36, i64 0, i64 0
-  %r464 = ptrtoint ptr %t479 to i64
-  %t480 = inttoptr i64 %r464 to ptr
-  call i32 @puts(ptr %t480)
-  %t481 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r466 = ptrtoint ptr %t481 to i64
-  %t482 = inttoptr i64 %r466 to ptr
-  call i32 @puts(ptr %t482)
-  %t483 = getelementptr inbounds [2 x i8], ptr @.str.1, i64 0, i64 0
-  %r468 = ptrtoint ptr %t483 to i64
+  %t479 = getelementptr inbounds [2 x i8], ptr @.str.1, i64 0, i64 0
+  %r468 = ptrtoint ptr %t479 to i64
   br label %__mb35_entry0
 
 __mb35_entry0:
-  %t484 = load i64, ptr %slot.__mb35_s, align 8
-  call void @nova_rc_dec(i64 %t484)
+  %t480 = load i64, ptr %slot.__mb35_s, align 8
+  call void @nova_rc_dec(i64 %t480)
   store i64 %r468, ptr %slot.__mb35_s, align 8
   store i64 56, ptr %slot.__mb35_n, align 8
-  %t485 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1880 = ptrtoint ptr %t485 to i64
-  %t486 = load i64, ptr %slot.__mb35_result, align 8
-  call void @nova_rc_dec(i64 %t486)
+  %t481 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1880 = ptrtoint ptr %t481 to i64
+  %t482 = load i64, ptr %slot.__mb35_result, align 8
+  call void @nova_rc_dec(i64 %t482)
   store i64 %r1880, ptr %slot.__mb35_result, align 8
   store i64 0, ptr %slot.__mb35_i, align 8
   %r1994 = load i64, ptr %slot.__mb35_n, align 8
@@ -3169,15 +3219,15 @@ __mb35_entry0:
 
 __mb35_while_header1:
   %r1888 = load i64, ptr %slot.__mb35_i, align 8
-  %t487 = icmp slt i64 %r1888, %r1994
-  br i1 %t487, label %__mb35_while_body2, label %__mb35_while_exit3, !prof !90
+  %t483 = icmp slt i64 %r1888, %r1994
+  br i1 %t483, label %__mb35_while_body2, label %__mb35_while_exit3, !prof !90
 
 __mb35_while_body2:
   %r1892 = load i64, ptr %slot.__mb35_result, align 8
-  %t488 = call i64 @nova_rt_str_concat(i64 %r1892, i64 %r1995)
-  %t489 = load i64, ptr %slot.__mb35_result, align 8
-  call void @nova_rc_dec(i64 %t489)
-  store i64 %t488, ptr %slot.__mb35_result, align 8
+  %t484 = call i64 @nova_rt_str_concat(i64 %r1892, i64 %r1995)
+  %t485 = load i64, ptr %slot.__mb35_result, align 8
+  call void @nova_rc_dec(i64 %t485)
+  store i64 %t484, ptr %slot.__mb35_result, align 8
   %r1897 = load i64, ptr %slot.__mb35_i, align 8
   %r1899 = add i64 %r1897, 1
   store i64 %r1899, ptr %slot.__mb35_i, align 8
@@ -3185,33 +3235,33 @@ __mb35_while_body2:
 
 __mb35_while_exit3:
   %r1903 = load i64, ptr %slot.__mb35_result, align 8
-  %t490 = load i64, ptr %slot.__mb35_ret, align 8
-  call void @nova_rc_dec(i64 %t490)
+  %t486 = load i64, ptr %slot.__mb35_ret, align 8
+  call void @nova_rc_dec(i64 %t486)
   call void @nova_rc_inc(i64 %r1903)
   store i64 %r1903, ptr %slot.__mb35_ret, align 8
   br label %__mb35_merge
 
 __mb35_merge:
   %r1904 = load i64, ptr %slot.__mb35_ret, align 8
-  %t491 = inttoptr i64 %r1904 to ptr
-  call i32 @puts(ptr %t491)
-  %t492 = getelementptr inbounds [54 x i8], ptr @.str.37, i64 0, i64 0
-  %r472 = ptrtoint ptr %t492 to i64
-  %t493 = inttoptr i64 %r472 to ptr
-  call i32 @puts(ptr %t493)
-  %t494 = getelementptr inbounds [2 x i8], ptr @.str.1, i64 0, i64 0
-  %r474 = ptrtoint ptr %t494 to i64
+  %t487 = inttoptr i64 %r1904 to ptr
+  call i32 @puts(ptr %t487)
+  %t488 = getelementptr inbounds [54 x i8], ptr @.str.37, i64 0, i64 0
+  %r472 = ptrtoint ptr %t488 to i64
+  %t489 = inttoptr i64 %r472 to ptr
+  call i32 @puts(ptr %t489)
+  %t490 = getelementptr inbounds [2 x i8], ptr @.str.1, i64 0, i64 0
+  %r474 = ptrtoint ptr %t490 to i64
   br label %__mb36_entry0
 
 __mb36_entry0:
-  %t495 = load i64, ptr %slot.__mb36_s, align 8
-  call void @nova_rc_dec(i64 %t495)
+  %t491 = load i64, ptr %slot.__mb36_s, align 8
+  call void @nova_rc_dec(i64 %t491)
   store i64 %r474, ptr %slot.__mb36_s, align 8
   store i64 56, ptr %slot.__mb36_n, align 8
-  %t496 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
-  %r1912 = ptrtoint ptr %t496 to i64
-  %t497 = load i64, ptr %slot.__mb36_result, align 8
-  call void @nova_rc_dec(i64 %t497)
+  %t492 = getelementptr inbounds [1 x i8], ptr @.str.2, i64 0, i64 0
+  %r1912 = ptrtoint ptr %t492 to i64
+  %t493 = load i64, ptr %slot.__mb36_result, align 8
+  call void @nova_rc_dec(i64 %t493)
   store i64 %r1912, ptr %slot.__mb36_result, align 8
   store i64 0, ptr %slot.__mb36_i, align 8
   %r1996 = load i64, ptr %slot.__mb36_n, align 8
@@ -3220,15 +3270,15 @@ __mb36_entry0:
 
 __mb36_while_header1:
   %r1920 = load i64, ptr %slot.__mb36_i, align 8
-  %t498 = icmp slt i64 %r1920, %r1996
-  br i1 %t498, label %__mb36_while_body2, label %__mb36_while_exit3, !prof !90
+  %t494 = icmp slt i64 %r1920, %r1996
+  br i1 %t494, label %__mb36_while_body2, label %__mb36_while_exit3, !prof !90
 
 __mb36_while_body2:
   %r1924 = load i64, ptr %slot.__mb36_result, align 8
-  %t499 = call i64 @nova_rt_str_concat(i64 %r1924, i64 %r1997)
-  %t500 = load i64, ptr %slot.__mb36_result, align 8
-  call void @nova_rc_dec(i64 %t500)
-  store i64 %t499, ptr %slot.__mb36_result, align 8
+  %t495 = call i64 @nova_rt_str_concat(i64 %r1924, i64 %r1997)
+  %t496 = load i64, ptr %slot.__mb36_result, align 8
+  call void @nova_rc_dec(i64 %t496)
+  store i64 %t495, ptr %slot.__mb36_result, align 8
   %r1929 = load i64, ptr %slot.__mb36_i, align 8
   %r1931 = add i64 %r1929, 1
   store i64 %r1931, ptr %slot.__mb36_i, align 8
@@ -3236,35 +3286,43 @@ __mb36_while_body2:
 
 __mb36_while_exit3:
   %r1935 = load i64, ptr %slot.__mb36_result, align 8
-  %t501 = load i64, ptr %slot.__mb36_ret, align 8
-  call void @nova_rc_dec(i64 %t501)
+  %t497 = load i64, ptr %slot.__mb36_ret, align 8
+  call void @nova_rc_dec(i64 %t497)
   call void @nova_rc_inc(i64 %r1935)
   store i64 %r1935, ptr %slot.__mb36_ret, align 8
   br label %__mb36_merge
 
 __mb36_merge:
   %r1936 = load i64, ptr %slot.__mb36_ret, align 8
-  %t502 = inttoptr i64 %r1936 to ptr
-  call i32 @puts(ptr %t502)
-  %t503 = load i64, ptr %slot.__inl0_title, align 8
+  %t498 = inttoptr i64 %r1936 to ptr
+  call i32 @puts(ptr %t498)
+  %t499 = load i64, ptr %slot.__inl0_title, align 8
+  call void @nova_rc_dec(i64 %t499)
+  %t500 = load i64, ptr %slot.__mb0_s, align 8
+  call void @nova_rc_dec(i64 %t500)
+  %t501 = load i64, ptr %slot.__mb0_result, align 8
+  call void @nova_rc_dec(i64 %t501)
+  %t502 = load i64, ptr %slot.__mb0_ret, align 8
+  call void @nova_rc_dec(i64 %t502)
+  %t503 = load i64, ptr %slot.__inl1_title, align 8
   call void @nova_rc_dec(i64 %t503)
-  %t504 = load i64, ptr %slot.__mb0_s, align 8
+  %t504 = load i64, ptr %slot.__mb1_s, align 8
   call void @nova_rc_dec(i64 %t504)
-  %t505 = load i64, ptr %slot.__mb0_result, align 8
+  %t505 = load i64, ptr %slot.__mb1_result, align 8
   call void @nova_rc_dec(i64 %t505)
-  %t506 = load i64, ptr %slot.__inl1_title, align 8
+  %t506 = load i64, ptr %slot.__mb1_ret, align 8
   call void @nova_rc_dec(i64 %t506)
-  %t507 = load i64, ptr %slot.__mb1_s, align 8
+  %t507 = load i64, ptr %slot.__mb2_s, align 8
   call void @nova_rc_dec(i64 %t507)
-  %t508 = load i64, ptr %slot.__mb1_result, align 8
+  %t508 = load i64, ptr %slot.__mb2_result, align 8
   call void @nova_rc_dec(i64 %t508)
-  %t509 = load i64, ptr %slot.__mb2_s, align 8
+  %t509 = load i64, ptr %slot.__mb2_ret, align 8
   call void @nova_rc_dec(i64 %t509)
-  %t510 = load i64, ptr %slot.__mb2_result, align 8
+  %t510 = load i64, ptr %slot.__mb3_s, align 8
   call void @nova_rc_dec(i64 %t510)
-  %t511 = load i64, ptr %slot.__mb3_s, align 8
+  %t511 = load i64, ptr %slot.__mb3_result, align 8
   call void @nova_rc_dec(i64 %t511)
-  %t512 = load i64, ptr %slot.__mb3_result, align 8
+  %t512 = load i64, ptr %slot.__mb3_ret, align 8
   call void @nova_rc_dec(i64 %t512)
   %t513 = load i64, ptr %slot.__mb10_s, align 8
   call void @nova_rc_dec(i64 %t513)
@@ -3443,9 +3501,11 @@ __mb36_merge:
   ret i64 0
 }
 
-define i32 @main() nounwind {
+define i32 @main(i32 %argc, ptr %argv) nounwind {
 entry:
-  call void @nova_rt_init()
+  %argc64 = sext i32 %argc to i64
+  %argv64 = ptrtoint ptr %argv to i64
+  call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
   call i64 @nova_main()
   call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()

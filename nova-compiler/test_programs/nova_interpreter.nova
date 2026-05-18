@@ -1,0 +1,502 @@
+// NOVA Interpreter written in NOVA
+// Demonstrates: NOVA can execute NOVA programs (tree-walking evaluator)
+// Supports: let bindings, arithmetic, comparisons, if/else, while, fn decl/call, recursion
+
+type Token
+    kind: string
+    value: string
+
+type Expr
+    tag: string
+    value: string
+    num: int
+    children: list
+
+type Stmt
+    tag: string
+    name: string
+    expr: Expr
+    body: list
+    params: list
+
+type ExprResult
+    expr: Expr
+    pos: int
+
+type StmtResult
+    stmt: Stmt
+    pos: int
+
+// Environment: uses parallel lists with string-encoded values to avoid type conflicts
+type Env
+    bindings: dict
+    parent: list
+
+fn env_new() -> Env
+    Env({}, [])
+
+fn env_set(e: Env, name: string, v: int) -> Env
+    e.bindings[name] = v
+    e
+
+fn env_get(e: Env, name: string) -> int
+    if contains(e.bindings, name)
+        return e.bindings[name]
+    if len(e.parent) > 0
+        return env_get(e.parent[0], name)
+    assert(false, "undefined variable: " + name)
+    0
+
+// --- Lexer (minimal for interpreter) ---
+
+fn is_alpha(ch: string) -> bool
+    let c = ord(ch)
+    (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or ch == "_"
+
+fn is_digit(ch: string) -> bool
+    let c = ord(ch)
+    c >= 48 and c <= 57
+
+fn is_alnum(ch: string) -> bool
+    is_alpha(ch) or is_digit(ch)
+
+fn tokenize(source: string) -> list
+    let tokens = []
+    let pos = 0
+    let length = len(source)
+    while pos < length
+        let ch = source[pos]
+        if ch == " " or ch == "\t" or ch == "\r"
+            pos = pos + 1
+        else if ch == "\n"
+            push(tokens, Token("NL", "\\n"))
+            pos = pos + 1
+        else if is_alpha(ch)
+            let word = ""
+            while pos < length and is_alnum(source[pos])
+                word = word + source[pos]
+                pos = pos + 1
+            let kind = if word == "let" or word == "if" or word == "else" or word == "while" or word == "fn" or word == "return" or word == "true" or word == "false" or word == "and" or word == "or" or word == "not"
+                "KW"
+            else
+                "ID"
+            push(tokens, Token(kind, word))
+        else if is_digit(ch)
+            let num = ""
+            while pos < length and is_digit(source[pos])
+                num = num + source[pos]
+                pos = pos + 1
+            push(tokens, Token("NUM", num))
+        else if ch == "(" or ch == ")" or ch == ","
+            push(tokens, Token("DLM", ch))
+            pos = pos + 1
+        else if ch == "+" or ch == "*" or ch == "/" or ch == "%"
+            push(tokens, Token("OP", ch))
+            pos = pos + 1
+        else if ch == "-"
+            push(tokens, Token("OP", "-"))
+            pos = pos + 1
+        else if ch == "="
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "=="))
+                pos = pos + 2
+            else
+                push(tokens, Token("EQ", "="))
+                pos = pos + 1
+        else if ch == "!"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "!="))
+                pos = pos + 2
+            else
+                pos = pos + 1
+        else if ch == "<"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "<="))
+                pos = pos + 2
+            else
+                push(tokens, Token("OP", "<"))
+                pos = pos + 1
+        else if ch == ">"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", ">="))
+                pos = pos + 2
+            else
+                push(tokens, Token("OP", ">"))
+                pos = pos + 1
+        else if ch == ":"
+            push(tokens, Token("COL", ":"))
+            pos = pos + 1
+        else
+            pos = pos + 1
+    push(tokens, Token("EOF", ""))
+    tokens
+
+// --- Parser ---
+
+fn tok_kind(tokens: list, pos: int) -> string
+    match tokens[pos]
+        Token(kind, value) => kind
+
+fn tok_val(tokens: list, pos: int) -> string
+    match tokens[pos]
+        Token(kind, value) => value
+
+fn prec(op: string) -> int
+    if op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">="
+        1
+    else if op == "+" or op == "-"
+        2
+    else if op == "*" or op == "/" or op == "%"
+        3
+    else
+        0
+
+fn skip_nl(tokens: list, pos: int) -> int
+    while tok_kind(tokens, pos) == "NL"
+        pos = pos + 1
+    pos
+
+fn parse_primary(tokens: list, pos: int) -> ExprResult
+    let kind = tok_kind(tokens, pos)
+    let val = tok_val(tokens, pos)
+    if kind == "NUM"
+        ExprResult(Expr("num", val, int(val), []), pos + 1)
+    else if kind == "KW" and val == "true"
+        ExprResult(Expr("num", "1", 1, []), pos + 1)
+    else if kind == "KW" and val == "false"
+        ExprResult(Expr("num", "0", 0, []), pos + 1)
+    else if kind == "ID"
+        // Check for function call
+        if pos + 1 < len(tokens) and tok_val(tokens, pos + 1) == "("
+            let args = []
+            let p = pos + 2
+            if tok_val(tokens, p) != ")"
+                let ar = parse_expr(tokens, p, 0)
+                push(args, ar.expr)
+                p = ar.pos
+                while tok_val(tokens, p) == ","
+                    let ar2 = parse_expr(tokens, p + 1, 0)
+                    push(args, ar2.expr)
+                    p = ar2.pos
+            assert(tok_val(tokens, p) == ")", "expected ) in call")
+            ExprResult(Expr("call", val, 0, args), p + 1)
+        else
+            ExprResult(Expr("var", val, 0, []), pos + 1)
+    else if kind == "DLM" and val == "("
+        let inner = parse_expr(tokens, pos + 1, 0)
+        assert(tok_val(tokens, inner.pos) == ")", "expected )")
+        ExprResult(inner.expr, inner.pos + 1)
+    else if kind == "OP" and val == "-"
+        let operand = parse_primary(tokens, pos + 1)
+        ExprResult(Expr("neg", "-", 0, [operand.expr]), operand.pos)
+    else if kind == "KW" and val == "not"
+        let operand = parse_primary(tokens, pos + 1)
+        ExprResult(Expr("not", "not", 0, [operand.expr]), operand.pos)
+    else
+        assert(false, "unexpected: " + kind + " " + val)
+        ExprResult(Expr("num", "0", 0, []), pos)
+
+fn parse_expr(tokens: list, pos: int, min_prec: int) -> ExprResult
+    let left_r = parse_primary(tokens, pos)
+    let left = left_r.expr
+    let cur = left_r.pos
+    while tok_kind(tokens, cur) == "OP" and prec(tok_val(tokens, cur)) > min_prec
+        let op = tok_val(tokens, cur)
+        let p = prec(op)
+        let right_r = parse_expr(tokens, cur + 1, p)
+        left = Expr("binop", op, 0, [left, right_r.expr])
+        cur = right_r.pos
+    // Handle 'and' / 'or' as low-precedence operators
+    while tok_kind(tokens, cur) == "KW" and (tok_val(tokens, cur) == "and" or tok_val(tokens, cur) == "or")
+        let op = tok_val(tokens, cur)
+        let right_r = parse_expr(tokens, cur + 1, 0)
+        left = Expr("logic", op, 0, [left, right_r.expr])
+        cur = right_r.pos
+    ExprResult(left, cur)
+
+// Parse block: sequence of statements at higher indentation (simplified: until dedent/else/EOF)
+fn parse_block(tokens: list, pos: int) -> StmtResult
+    let stmts = []
+    let p = skip_nl(tokens, pos)
+    // Parse single statement for now (simplified block = one expression/statement)
+    let sr = parse_stmt(tokens, p)
+    push(stmts, sr.stmt)
+    StmtResult(Stmt("block", "", Expr("num", "", 0, []), stmts, []), sr.pos)
+
+fn parse_stmt(tokens: list, pos: int) -> StmtResult
+    let kind = tok_kind(tokens, pos)
+    let val = tok_val(tokens, pos)
+
+    if kind == "KW" and val == "let"
+        let name = tok_val(tokens, pos + 1)
+        assert(tok_kind(tokens, pos + 2) == "EQ", "expected =")
+        let er = parse_expr(tokens, pos + 3, 0)
+        StmtResult(Stmt("let", name, er.expr, [], []), er.pos)
+    else if kind == "KW" and val == "return"
+        let er = parse_expr(tokens, pos + 1, 0)
+        StmtResult(Stmt("return", "", er.expr, [], []), er.pos)
+    else if kind == "KW" and val == "if"
+        let cond_r = parse_expr(tokens, pos + 1, 0)
+        let p = skip_nl(tokens, cond_r.pos)
+        let then_r = parse_stmt(tokens, p)
+        let p2 = skip_nl(tokens, then_r.pos)
+        // Check for else
+        if tok_kind(tokens, p2) == "KW" and tok_val(tokens, p2) == "else"
+            let p3 = skip_nl(tokens, p2 + 1)
+            let else_r = parse_stmt(tokens, p3)
+            StmtResult(Stmt("if", "", cond_r.expr, [then_r.stmt, else_r.stmt], []), else_r.pos)
+        else
+            StmtResult(Stmt("if", "", cond_r.expr, [then_r.stmt], []), p2)
+    else if kind == "KW" and val == "while"
+        let cond_r = parse_expr(tokens, pos + 1, 0)
+        let p = skip_nl(tokens, cond_r.pos)
+        let body_r = parse_stmt(tokens, p)
+        StmtResult(Stmt("while", "", cond_r.expr, [body_r.stmt], []), body_r.pos)
+    else if kind == "KW" and val == "fn"
+        let name = tok_val(tokens, pos + 1)
+        assert(tok_val(tokens, pos + 2) == "(", "expected ( after fn name")
+        let params = []
+        let p = pos + 3
+        if tok_val(tokens, p) != ")"
+            push(params, tok_val(tokens, p))
+            p = p + 1
+            // Skip type annotations
+            if tok_kind(tokens, p) == "COL"
+                p = p + 2
+            while tok_val(tokens, p) == ","
+                p = p + 1
+                push(params, tok_val(tokens, p))
+                p = p + 1
+                if tok_kind(tokens, p) == "COL"
+                    p = p + 2
+        assert(tok_val(tokens, p) == ")", "expected ) in fn params")
+        p = p + 1
+        // Skip return type annotation
+        if tok_kind(tokens, p) == "OP" and tok_val(tokens, p) == "-"
+            p = p + 3
+        let p2 = skip_nl(tokens, p)
+        let body_r = parse_stmt(tokens, p2)
+        StmtResult(Stmt("fn", name, Expr("num", "", 0, []), [body_r.stmt], params), body_r.pos)
+    else
+        // Expression statement
+        let er = parse_expr(tokens, pos, 0)
+        StmtResult(Stmt("expr", "", er.expr, [], []), er.pos)
+
+fn parse_program(tokens: list) -> list
+    let stmts = []
+    let pos = skip_nl(tokens, 0)
+    while tok_kind(tokens, pos) != "EOF"
+        let sr = parse_stmt(tokens, pos)
+        push(stmts, sr.stmt)
+        pos = skip_nl(tokens, sr.pos)
+    stmts
+
+// --- Evaluator ---
+
+type FnDef
+    name: string
+    params: list
+    body: Stmt
+
+fn eval_expr(e: Expr, env: Env, fns: list) -> int
+    match e
+        Expr(tag, value, num, children) =>
+            if tag == "num"
+                num
+            else if tag == "var"
+                env_get(env, value)
+            else if tag == "neg"
+                0 - eval_expr(children[0], env, fns)
+            else if tag == "not"
+                if eval_expr(children[0], env, fns) == 0
+                    1
+                else
+                    0
+            else if tag == "binop"
+                let l = eval_expr(children[0], env, fns)
+                let r = eval_expr(children[1], env, fns)
+                if value == "+"
+                    l + r
+                else if value == "-"
+                    l - r
+                else if value == "*"
+                    l * r
+                else if value == "/"
+                    l / r
+                else if value == "%"
+                    l % r
+                else if value == "=="
+                    if l == r
+                        1
+                    else
+                        0
+                else if value == "!="
+                    if l != r
+                        1
+                    else
+                        0
+                else if value == "<"
+                    if l < r
+                        1
+                    else
+                        0
+                else if value == ">"
+                    if l > r
+                        1
+                    else
+                        0
+                else if value == "<="
+                    if l <= r
+                        1
+                    else
+                        0
+                else
+                    if l >= r
+                        1
+                    else
+                        0
+            else if tag == "logic"
+                let l = eval_expr(children[0], env, fns)
+                if value == "and"
+                    if l == 0
+                        0
+                    else
+                        eval_expr(children[1], env, fns)
+                else
+                    if l != 0
+                        1
+                    else
+                        eval_expr(children[1], env, fns)
+            else if tag == "call"
+                // Find function
+                let fn_def = find_fn(fns, value)
+                let args = []
+                let i = 0
+                while i < len(children)
+                    push(args, eval_expr(children[i], env, fns))
+                    i = i + 1
+                call_fn(fn_def, args, fns)
+            else
+                0
+
+fn find_fn(fns: list, name: string) -> FnDef
+    let i = 0
+    while i < len(fns)
+        match fns[i]
+            FnDef(n, params, body) =>
+                if n == name
+                    return fns[i]
+        i = i + 1
+    assert(false, "undefined function: " + name)
+    fns[0]
+
+fn call_fn(fd: FnDef, args: list, fns: list) -> int
+    match fd
+        FnDef(name, params, body) =>
+            let local_env = env_new()
+            let i = 0
+            while i < len(params)
+                local_env = env_set(local_env, params[i], args[i])
+                i = i + 1
+            eval_stmt(body, local_env, fns)
+
+fn eval_stmt(s: Stmt, env: Env, fns: list) -> int
+    match s
+        Stmt(tag, name, expr, body, params) =>
+            if tag == "let"
+                let val = eval_expr(expr, env, fns)
+                env_set(env, name, val)
+                val
+            else if tag == "return"
+                eval_expr(expr, env, fns)
+            else if tag == "expr"
+                eval_expr(expr, env, fns)
+            else if tag == "if"
+                let cond = eval_expr(expr, env, fns)
+                if cond != 0
+                    eval_stmt(body[0], env, fns)
+                else if len(body) > 1
+                    eval_stmt(body[1], env, fns)
+                else
+                    0
+            else if tag == "while"
+                let result = 0
+                while eval_expr(expr, env, fns) != 0
+                    result = eval_stmt(body[0], env, fns)
+                result
+            else if tag == "block"
+                let result = 0
+                let i = 0
+                while i < len(body)
+                    result = eval_stmt(body[i], env, fns)
+                    i = i + 1
+                result
+            else
+                0
+
+// Execute a complete program
+fn run_program(source: string) -> int
+    let tokens = tokenize(source)
+    let stmts = parse_program(tokens)
+    let env = env_new()
+    let fns = []
+    let result = 0
+    let i = 0
+    while i < len(stmts)
+        match stmts[i]
+            Stmt(tag, name, expr, body, params) =>
+                if tag == "fn"
+                    push(fns, FnDef(name, params, body[0]))
+                else
+                    result = eval_stmt(stmts[i], env, fns)
+        i = i + 1
+    result
+
+// --- Tests ---
+
+fn run_tests()
+    // Test 1: Arithmetic
+    let r1 = run_program("3 + 4 * 2")
+    assert(r1 == 11, "3+4*2=" + str(r1))
+
+    // Test 2: Let binding
+    let r2 = run_program("let x = 10\nlet y = x + 5\ny")
+    assert(r2 == 15, "let binding=" + str(r2))
+
+    // Test 3: If/else
+    let r3 = run_program("let x = 5\nif x > 3\n10\nelse\n20")
+    assert(r3 == 10, "if/else=" + str(r3))
+
+    // Test 4: While loop (single-statement body — parser only handles one stmt per block)
+    let r4 = run_program("let x = 0\nwhile x < 10\nlet x = x + 1\nx")
+    assert(r4 == 10, "while loop=" + str(r4))
+
+    // Test 5: Function definition and call
+    let r5 = run_program("fn double(x: int) -> int\nreturn x * 2\ndouble(21)")
+    assert(r5 == 42, "fn call=" + str(r5))
+
+    // Test 6: Recursive function (fibonacci)
+    let r6 = run_program("fn fib(n: int) -> int\nif n < 2\nreturn n\nelse\nreturn fib(n - 1) + fib(n - 2)\nfib(10)")
+    assert(r6 == 55, "fib(10)=" + str(r6))
+
+    // Test 7: Nested function calls
+    let r7 = run_program("fn add(a: int, b: int) -> int\nreturn a + b\nfn mul(a: int, b: int) -> int\nreturn a * b\nadd(mul(3, 4), 5)")
+    assert(r7 == 17, "nested calls=" + str(r7))
+
+    // Test 8: Comparison operators
+    let r8 = run_program("let a = 10\nlet b = 20\nif a <= b\n1\nelse\n0")
+    assert(r8 == 1, "comparison=" + str(r8))
+
+    // Test 9: Logical operators
+    let r9 = run_program("let x = 5\nif x > 0 and x < 10\n1\nelse\n0")
+    assert(r9 == 1, "logic and=" + str(r9))
+
+    // Test 10: Factorial
+    let r10 = run_program("fn fact(n: int) -> int\nif n <= 1\nreturn 1\nelse\nreturn n * fact(n - 1)\nfact(7)")
+    assert(r10 == 5040, "fact(7)=" + str(r10))
+
+    print("NOVA Interpreter self-test: ALL PASSED")
+    print("10 programs interpreted successfully")
+    print("fib(10) = " + str(r6) + ", fact(7) = " + str(r10))
+
+run_tests()

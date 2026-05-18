@@ -27,6 +27,9 @@ enum class TokenType {
     SUPERVISE,  // `supervise worker restart: always`
     TRY,        // `try expr` — propagate error to caller
     CATCH,      // `expr catch e { block }` — handle error with binding
+    TRAIT,      // `trait Shape` — interface/trait declaration
+    MATCHES,    // `text matches "pattern"` — regex match operator
+    YIELD,      // `yield expr` — produce value from generator function
 
     // ── Literals ─────────────────────────────────────────────────────────────
     INT_LITERAL,    // 42, 1_000_000
@@ -50,6 +53,14 @@ enum class TokenType {
     SLASH,      // /
     PERCENT,    // %
     STAR_STAR,  // **  (power)
+
+    // ── Bitwise operators ────────────────────────────────────────────────────
+    AMPERSAND,  // &
+    PIPE,       // |
+    CARET,      // ^
+    TILDE,      // ~ (bitwise NOT, unary)
+    LSHIFT,     // <<
+    RSHIFT,     // >>
 
     // ── Comparison operators ──────────────────────────────────────────────────
     EQ,         // ==
@@ -145,4 +156,7 @@ val KEYWORDS: Map<String, TokenType> = mapOf(
     "supervise" to TokenType.SUPERVISE,
     "try"       to TokenType.TRY,
     "catch"     to TokenType.CATCH,
+    "trait"     to TokenType.TRAIT,
+    "matches"   to TokenType.MATCHES,
+    "yield"     to TokenType.YIELD,
 )

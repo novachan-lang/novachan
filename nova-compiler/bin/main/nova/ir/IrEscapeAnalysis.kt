@@ -91,6 +91,19 @@ class IrEscapeAnalysis {
             }
         }
 
+        // Build slot-to-slot dependency: if SlotLoad(A) is stored into slot B,
+        // then A feeds B. This captures nested if-branch merge patterns where
+        // inner __ifb_* results flow into outer __ifb_* slots.
+        val slotFeedsSlot = mutableMapOf<String, MutableSet<String>>() // target → sources
+        for (inst in allInsts) {
+            if (inst is IrInst.SlotStore && !inst.slot.isGlobal) {
+                val sourceSlot = slotLoadMap[inst.value]
+                if (sourceSlot != null) {
+                    slotFeedsSlot.getOrPut(inst.slot.name) { mutableSetOf() }.add(sourceSlot)
+                }
+            }
+        }
+
         // Any SlotLoad result used in escape position → the slot escapes
         for (inst in allInsts) {
             val escaping = getEscapingRefs(inst)
@@ -105,6 +118,18 @@ class IrEscapeAnalysis {
             if (term is IrTerminator.Return) {
                 val slotName = slotLoadMap[term.value]
                 if (slotName != null) escapedSlots.add(slotName)
+            }
+        }
+
+        // Transitive closure: if slot B escapes and slot A feeds into B, then A escapes too
+        var changed = true
+        while (changed) {
+            changed = false
+            for (slot in escapedSlots.toList()) {
+                val feeders = slotFeedsSlot[slot] ?: continue
+                for (feeder in feeders) {
+                    if (escapedSlots.add(feeder)) changed = true
+                }
             }
         }
 
@@ -195,6 +220,13 @@ class IrEscapeAnalysis {
                     escaped.add(inst.value)
                 }
             }
+            // MakeRecord: if a record ref is used as a field value in another record,
+            // it escapes (the outer record may be heap-allocated or returned)
+            is IrInst.MakeRecord -> {
+                for ((_, fieldRef) in inst.fields) {
+                    if (fieldRef in recordRefs) escaped.add(fieldRef)
+                }
+            }
             // These don't cause escape
             is IrInst.FieldGet -> { /* read-only, non-escaping */ }
             is IrInst.Const -> {}
@@ -202,7 +234,6 @@ class IrEscapeAnalysis {
             is IrInst.SlotLoad -> {}
             is IrInst.Binary -> {}
             is IrInst.Unary -> {}
-            is IrInst.MakeRecord -> {}
             is IrInst.StringConcat -> {}
             is IrInst.ToString -> {}
             is IrInst.Copy -> {}
@@ -370,6 +401,7 @@ class IrEscapeAnalysis {
         is IrInst.MakeList -> inst.elems
         is IrInst.MakeTuple -> inst.elems
         is IrInst.MakeDict -> inst.entries.flatMap { listOf(it.first, it.second) }
+        is IrInst.MakeRecord -> inst.fields.map { it.second }
         is IrInst.ListAppend -> listOf(inst.elem)
         is IrInst.IndexSet -> listOf(inst.value)
         is IrInst.ChannelSend -> listOf(inst.value)

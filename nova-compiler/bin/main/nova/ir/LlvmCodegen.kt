@@ -42,6 +42,7 @@ class LlvmCodegen {
     private val closureCaptures = mutableMapOf<IrRef, List<IrRef>>()
     private var blockLabels = mutableMapOf<BlockId, String>()
     private var moduleFnNames = emptySet<String>()
+    private var userExterns = listOf<Pair<String, Int>>()
     private val moduleFnParamCounts = mutableMapOf<String, Int>()
     private val slotTypes   = mutableMapOf<String, IrType>()
     private val fnReturnTypes = mutableMapOf<String, IrType>()
@@ -80,7 +81,9 @@ class LlvmCodegen {
         trampolines.clear(); moduleFnParamCounts.clear(); structDefs.clear()
         globalSlotNames.clear(); globalSlotTypes.clear()
         moduleFnNames = module.functions.map { it.name }.toSet()
+        userExterns = module.externFunctions
         for (fn in module.functions) moduleFnParamCounts[fn.name] = fn.params.size
+        for ((name, pc) in module.externFunctions) moduleFnParamCounts[name] = pc
         for ((name, fields) in module.structs) structDefs[name] = fields.map { it.first }
         collectStrings(module)
         collectFnReturnTypes(module)
@@ -120,9 +123,14 @@ class LlvmCodegen {
     private fun collectStrings(module: IrModule) {
         for (fn in module.functions)
             for (block in fn.blocks)
-                for (inst in block.instructions)
+                for (inst in block.instructions) {
                     if (inst is IrInst.Const && inst.value is IrConst.Str)
                         internString((inst.value as IrConst.Str).v)
+                    if (inst is IrInst.FieldGet)
+                        internString(inst.field)
+                    if (inst is IrInst.FieldSet)
+                        internString(inst.field)
+                }
     }
 
     private fun collectFnReturnTypes(module: IrModule) {
@@ -183,6 +191,7 @@ class LlvmCodegen {
         appendLine("declare noalias ptr @calloc(i64, i64) nounwind")
         appendLine("declare ptr @realloc(ptr, i64) nounwind allocsize(1)")
         appendLine("declare void @free(ptr) nounwind")
+        appendLine("declare ptr @nova_rt_struct_alloc(i64) nounwind")
         appendLine("declare i64 @llvm.smax.i64(i64, i64) nounwind readnone")
         appendLine("; nova runtime — list ops")
         appendLine("declare i64 @nova_rt_list_create() nounwind")
@@ -208,6 +217,7 @@ class LlvmCodegen {
         appendLine("declare i64 @nova_rt_upper(i64) nounwind")
         appendLine("declare i64 @nova_rt_lower(i64) nounwind")
         appendLine("declare i64 @nova_rt_trim(i64) nounwind")
+        appendLine("declare i64 @nova_rt_repeat(i64, i64) nounwind")
         appendLine("declare i64 @nova_rt_split(i64, i64) nounwind")
         appendLine("declare i64 @nova_rt_replace(i64, i64, i64) nounwind")
         appendLine("declare i64 @nova_rt_starts_with(i64, i64) nounwind readonly")
@@ -232,6 +242,8 @@ class LlvmCodegen {
         appendLine("declare i64 @nova_rt_chr(i64) nounwind")
         appendLine("; nova runtime — process control")
         appendLine("declare void @nova_rt_exit(i64) noreturn nounwind")
+        appendLine("declare i64 @nova_rt_system(i64) nounwind")
+        appendLine("declare i64 @nova_rt_exec(i64) nounwind")
         appendLine("declare i32 @strcmp(ptr, ptr) nounwind readonly")
         appendLine("; nova runtime — dict ops (hash map, O(1) avg lookup)")
         appendLine("declare i64 @nova_rt_dict_create() nounwind")
@@ -257,10 +269,57 @@ class LlvmCodegen {
         appendLine("; nova runtime — HTTP ops")
         appendLine("declare i64 @nova_rt_http_get(i64) nounwind")
         appendLine("declare i64 @nova_rt_http_post(i64, i64, i64) nounwind")
+        appendLine("; nova runtime — time ops")
+        appendLine("declare i64 @nova_rt_time_ms() nounwind")
+        appendLine("declare i64 @nova_rt_clock_ns() nounwind")
+        appendLine("declare void @nova_rt_sleep_ms(i64) nounwind")
+        appendLine("declare void @nova_rt_assert(i64, i64) nounwind")
         appendLine("; nova runtime — type dispatch")
         appendLine("declare i64 @nova_rt_any_to_str(i64) nounwind")
         appendLine("declare i64 @nova_rt_str_concat_safe(i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_str_char_at(i64, i64) nounwind")
         appendLine("declare void @nova_rt_init() nounwind")
+        appendLine("declare void @nova_rt_init_args(i64, i64) nounwind")
+        appendLine("; nova runtime — system ops")
+        appendLine("declare i64 @nova_rt_args() nounwind")
+        appendLine("declare i64 @nova_rt_env(i64) nounwind")
+        appendLine("declare i64 @nova_rt_random_int(i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_random_float() nounwind")
+        appendLine("declare i64 @nova_rt_shell(i64) nounwind")
+        appendLine("declare i64 @nova_rt_path_join(i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_path_parent(i64) nounwind")
+        appendLine("declare i64 @nova_rt_path_name(i64) nounwind")
+        appendLine("declare i64 @nova_rt_path_ext(i64) nounwind")
+        appendLine("declare i64 @nova_rt_mkdir(i64) nounwind")
+        appendLine("declare i64 @nova_rt_mkdir_p(i64) nounwind")
+        appendLine("declare i64 @nova_rt_path_exists(i64) nounwind")
+        appendLine("; nova runtime — regex ops")
+        appendLine("declare i64 @nova_rt_regex_match(i64, i64) nounwind readonly")
+        appendLine("declare i64 @nova_rt_regex_find(i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_regex_replace(i64, i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_regex_split(i64, i64) nounwind")
+        appendLine("; nova runtime — network ops")
+        appendLine("declare i64 @nova_rt_tcp_connect(i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_tcp_listen(i64) nounwind")
+        appendLine("declare i64 @nova_rt_tcp_accept(i64) nounwind")
+        appendLine("declare i64 @nova_rt_tcp_send(i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_tcp_recv(i64) nounwind")
+        appendLine("declare void @nova_rt_tcp_close(i64) nounwind")
+        appendLine("declare i64 @nova_rt_udp_bind(i64) nounwind")
+        appendLine("declare i64 @nova_rt_udp_send(i64, i64, i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_udp_recv(i64) nounwind")
+        appendLine("; nova runtime — HTTP server")
+        appendLine("declare i64 @nova_rt_http_listen(i64) nounwind")
+        appendLine("declare i64 @nova_rt_http_accept(i64) nounwind")
+        appendLine("declare void @nova_rt_http_respond(i64, i64, i64) nounwind")
+        appendLine("; nova runtime — byte arrays")
+        appendLine("declare i64 @nova_rt_bytes_create(i64) nounwind")
+        appendLine("declare i64 @nova_rt_bytes_get(i64, i64) nounwind")
+        appendLine("declare void @nova_rt_bytes_set(i64, i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_bytes_len(i64) nounwind")
+        appendLine("declare i64 @nova_rt_bytes_slice(i64, i64, i64) nounwind")
+        appendLine("declare i64 @nova_rt_bytes_to_str(i64) nounwind")
+        appendLine("declare i64 @nova_rt_str_to_bytes(i64) nounwind")
         appendLine("; nova runtime — channel/spawn ops")
         appendLine("declare i64 @nova_rt_channel_create() nounwind")
         appendLine("declare i64 @nova_rt_channel_send(i64, i64) nounwind")
@@ -290,6 +349,14 @@ class LlvmCodegen {
         appendLine("; nova error state — thread-local flag (safe for spawn/concurrent programs)")
         appendLine("@__nova_error_flag = thread_local global i64 0")
         appendLine("@__nova_error_msg = thread_local global i64 0")
+        // User-defined @extern function declarations
+        if (userExterns.isNotEmpty()) {
+            appendLine("; user extern (C FFI) declarations")
+            for ((name, paramCount) in userExterns) {
+                val params = (0 until paramCount).joinToString(", ") { "i64" }
+                appendLine("declare i64 @$name($params) nounwind")
+            }
+        }
     }
 
     private fun StringBuilder.emitStringGlobals() {
@@ -399,13 +466,28 @@ class LlvmCodegen {
         // Aliases: values that already have an owner elsewhere (another slot, a container, or a caller).
         // SlotLoad: owned by the source slot. Params: owned by the caller's slot.
         // IndexGet/FieldGet: owned by the container (list/dict/record).
+        // Multi-store: a value stored into 2+ RC-managed slots needs rc_inc on each
+        //   store because each slot will rc_dec independently at cleanup.
         aliasRefs = mutableSetOf()
         for (i in fn.params.indices)
             aliasRefs.add(IrRef(-(i + 1)))
+        val slotStoreTargets = mutableMapOf<IrRef, MutableSet<String>>()
         for (block in fn.blocks)
-            for (inst in block.instructions)
+            for (inst in block.instructions) {
                 if (inst is IrInst.SlotLoad || inst is IrInst.IndexGet || inst is IrInst.FieldGet)
                     aliasRefs.add(inst.result)
+                if (inst is IrInst.SlotStore && inst.slot.name in rcSlots)
+                    slotStoreTargets.getOrPut(inst.value) { mutableSetOf() }.add(inst.slot.name)
+            }
+        val constructFieldRefs = mutableSetOf<IrRef>()
+        for (block in fn.blocks)
+            for (inst in block.instructions) {
+                if (inst is IrInst.MakeRecord) inst.fields.forEach { constructFieldRefs.add(it.second) }
+                if (inst is IrInst.MakeTuple) inst.elems.forEach { constructFieldRefs.add(it) }
+                if (inst is IrInst.MakeDict) inst.entries.forEach { constructFieldRefs.add(it.first); constructFieldRefs.add(it.second) }
+            }
+        for ((ref, slots) in slotStoreTargets)
+            if (slots.size > 1 || ref in constructFieldRefs) aliasRefs.add(ref)
 
         // Pre-populate slotTypes by finding the type of values stored into each slot.
         // This ensures hoisted loads (from LICM) get correct type info.
@@ -834,6 +916,11 @@ class LlvmCodegen {
                     appendLine("  ${ref(inst.result)} = zext i1 $c to i64")
                 }
             }
+            BinOp.BIT_AND -> appendLine("  ${ref(inst.result)} = and i64 $l, $r")
+            BinOp.BIT_OR  -> appendLine("  ${ref(inst.result)} = or i64 $l, $r")
+            BinOp.BIT_XOR -> appendLine("  ${ref(inst.result)} = xor i64 $l, $r")
+            BinOp.SHL     -> appendLine("  ${ref(inst.result)} = shl i64 $l, $r")
+            BinOp.SHR     -> appendLine("  ${ref(inst.result)} = ashr i64 $l, $r")
         }
     }
 
@@ -904,6 +991,9 @@ class LlvmCodegen {
                 if (inst.result !in branchOnlyRefs) {
                     appendLine("  ${ref(inst.result)} = zext i1 $tmp to i64")
                 }
+            }
+            UnOp.BIT_NOT -> {
+                appendLine("  ${ref(inst.result)} = xor i64 ${v(inst.operand)}, -1")
             }
         }
     }
@@ -1051,6 +1141,16 @@ class LlvmCodegen {
                 inlineVals[inst.result] = "0"
                 return
             }
+            "nova_rt_sleep_ms" -> {
+                appendLine("  call void @nova_rt_sleep_ms(i64 ${v(inst.args[0])})")
+                inlineVals[inst.result] = "0"
+                return
+            }
+            "nova_rt_assert" -> {
+                appendLine("  call void @nova_rt_assert(i64 ${v(inst.args[0])}, i64 ${v(inst.args[1])})")
+                inlineVals[inst.result] = "0"
+                return
+            }
             // ── Type conversion builtins ─────────────────────────────────────────
             "int" -> { emitIntConv(inst); return }
             "float" -> { emitFloatConv(inst); return }
@@ -1094,15 +1194,18 @@ class LlvmCodegen {
         "nova_rt_int_to_str", "nova_rt_float_to_str", "nova_rt_bool_to_str",
         "nova_rt_read_line", "nova_rt_read_file", "nova_rt_json_stringify",
         "nova_rt_http_get", "nova_rt_http_post",
-        "nova_rt_join" -> IrType.Str
+        "nova_rt_join",
+        "nova_rt_regex_find", "nova_rt_regex_replace",
+        "nova_rt_tcp_recv", "nova_rt_udp_recv",
+        "nova_rt_bytes_to_str" -> IrType.Str
         "nova_rt_starts_with", "nova_rt_ends_with" -> IrType.Bool
         "nova_rt_find" -> IrType.I64
         "nova_rt_chars" -> IrType.List(IrType.Str)
-        "nova_rt_contains", "nova_rt_dict_has" -> IrType.Bool
+        "nova_rt_contains", "nova_rt_dict_has", "nova_rt_regex_match" -> IrType.Bool
         "nova_rt_iter_has_next" -> IrType.I64
         "nova_rt_str_len", "nova_rt_len", "nova_rt_list_len",
         "nova_rt_dict_len" -> IrType.I64
-        "nova_rt_split" -> IrType.List(IrType.Str)
+        "nova_rt_split", "nova_rt_regex_split" -> IrType.List(IrType.Str)
         "nova_rt_dict_keys" -> IrType.List(IrType.Str)
         "nova_rt_dict_values" -> IrType.List(IrType.Any)
         "nova_rt_dict_items" -> IrType.List(IrType.Any)
@@ -1517,6 +1620,10 @@ class LlvmCodegen {
                     refTypes[inst.result] = targetType.elem
                 }
             }
+            targetType == IrType.Str -> {
+                appendLine("  ${ref(inst.result)} = call i64 @nova_rt_str_char_at(i64 ${v(inst.target)}, i64 ${v(inst.index)})")
+                refTypes[inst.result] = IrType.Str
+            }
             else -> {
                 val idxType = refTypes[inst.index]
                 if (idxType == IrType.Str) {
@@ -1579,15 +1686,20 @@ class LlvmCodegen {
 
     private fun StringBuilder.emitMakeRecord(inst: IrInst.MakeRecord) {
         val fieldCount = inst.fields.size
-        val totalSize = fieldCount * 8L
+        val slotCount = fieldCount + 1
+        val totalSize = slotCount * 8L
         val isStackAlloc = inst.result in stackAllocRefs
         val mem = freshTmp()
         if (isStackAlloc) {
-            appendLine("  $mem = alloca i64, i64 $fieldCount, align 8")
+            appendLine("  $mem = alloca i64, i64 $slotCount, align 8")
         } else {
-            appendLine("  $mem = call ptr @malloc(i64 $totalSize)")
-            appendLine("  call void @nova_rt_track_raw(ptr $mem)")
+            appendLine("  $mem = call ptr @nova_rt_struct_alloc(i64 $totalSize)")
         }
+        val typeName = if (inst.type is IrType.Struct) (inst.type as IrType.Struct).name else ""
+        val hashVal = typeNameHash(typeName)
+        val hashGep = freshTmp()
+        appendLine("  $hashGep = getelementptr i64, ptr $mem, i64 0")
+        appendLine("  store i64 $hashVal, ptr $hashGep")
         val fieldOrder = if (inst.type is IrType.Struct) {
             structDefs[(inst.type as IrType.Struct).name] ?: inst.fields.map { it.first }
         } else {
@@ -1597,11 +1709,22 @@ class LlvmCodegen {
         for ((i, fieldName) in fieldOrder.withIndex()) {
             val fieldRef = fieldMap[fieldName] ?: continue
             val gep = freshTmp()
-            appendLine("  $gep = getelementptr i64, ptr $mem, i64 $i")
+            appendLine("  $gep = getelementptr i64, ptr $mem, i64 ${i + 1}")
             appendLine("  store i64 ${v(fieldRef)}, ptr $gep")
+            if (fieldRef in aliasRefs) {
+                appendLine("  call void @nova_rc_inc(i64 ${v(fieldRef)})")
+            }
         }
         appendLine("  ${ref(inst.result)} = ptrtoint ptr $mem to i64")
         refTypes[inst.result] = inst.type
+    }
+
+    private fun typeNameHash(name: String): Long {
+        var h = 5381L
+        for (c in name) {
+            h = h * 33 + c.code
+        }
+        return h
     }
 
     private fun StringBuilder.emitFieldGet(inst: IrInst.FieldGet) {
@@ -1645,9 +1768,10 @@ class LlvmCodegen {
     }
 
     private fun fieldIndex(type: IrType?, fieldName: String): Int {
+        if (fieldName == "__type_hash") return 0
         if (type is IrType.Struct) {
             val fields = structDefs[type.name]
-            if (fields != null) return fields.indexOf(fieldName).coerceAtLeast(0)
+            if (fields != null) return fields.indexOf(fieldName).coerceAtLeast(0) + 1
         }
         return 0
     }
@@ -1943,7 +2067,8 @@ class LlvmCodegen {
         "nova_rt_len", "nova_rt_len_any",
         "nova_rt_any_to_str", "nova_rt_value_to_str",
         "nova_rt_json_stringify",
-        "nova_rt_contains", "nova_rt_find"
+        "nova_rt_contains", "nova_rt_find",
+        "nova_rt_regex_match", "nova_rt_regex_find", "nova_rt_regex_replace", "nova_rt_regex_split"
     )
 
     private fun isSafeConsumer(inst: IrInst): Boolean = when (inst) {
@@ -2081,9 +2206,11 @@ class LlvmCodegen {
     private fun StringBuilder.emitMainWrapper(module: IrModule) {
         val hasNovaMain = module.functions.any { it.name == "nova_main" }
         if (!hasNovaMain) return
-        appendLine("define i32 @main() nounwind {")
+        appendLine("define i32 @main(i32 %argc, ptr %argv) nounwind {")
         appendLine("entry:")
-        appendLine("  call void @nova_rt_init()")
+        appendLine("  %argc64 = sext i32 %argc to i64")
+        appendLine("  %argv64 = ptrtoint ptr %argv to i64")
+        appendLine("  call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
         appendLine("  call i64 @nova_main()")
         appendLine("  call void @nova_rt_wait_all()")
         appendLine("  call void @nova_rt_cleanup()")

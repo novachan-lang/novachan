@@ -89,8 +89,24 @@ object Stdlib {
     val ORD_FN  = TypeScheme(emptySet(), TFn(listOf(TString), TInt))
     val CHR_FN  = TypeScheme(emptySet(), TFn(listOf(TInt), TString))
 
+    // ── Time operations ─────────────────────────────────────────────────────
+    val TIME_MS   = TypeScheme(emptySet(), TFn(emptyList(), TInt))
+    val CLOCK_NS  = TypeScheme(emptySet(), TFn(emptyList(), TInt))
+    val SLEEP_FN  = TypeScheme(emptySet(), TFn(listOf(TInt), TUnit))
+
     // ── Process control ──────────────────────────────────────────────────────
     val EXIT_FN = TypeScheme(emptySet(), TFn(listOf(TInt), TNothing))
+    val ASSERT_FN = TypeScheme(emptySet(), TFn(listOf(TBool, TString), TUnit))
+    val SYSTEM_FN = TypeScheme(emptySet(), TFn(listOf(TString), TInt))
+    val EXEC_FN = TypeScheme(emptySet(), TFn(listOf(TString), TString))
+
+    // ── Filesystem ────────────────────────────────────────────────────────────
+    val MKDIR_FN      = TypeScheme(emptySet(), TFn(listOf(TString), TInt))
+    val MKDIR_P_FN    = TypeScheme(emptySet(), TFn(listOf(TString), TInt))
+    val PATH_JOIN_FN  = TypeScheme(emptySet(), TFn(listOf(TString, TString), TString))
+    val PATH_EXISTS_FN = TypeScheme(emptySet(), TFn(listOf(TString), TInt))
+    val PATH_PARENT_FN = TypeScheme(emptySet(), TFn(listOf(TString), TString))
+    val PATH_NAME_FN  = TypeScheme(emptySet(), TFn(listOf(TString), TString))
 
     // ── Misc ──────────────────────────────────────────────────────────────────
     val BYTE_FN   = TypeScheme(emptySet(), TFn(listOf(TInt), TByte))
@@ -170,6 +186,20 @@ object Stdlib {
         "chr"         to CHR_FN,
         // Process control
         "exit"        to EXIT_FN,
+        "assert"      to ASSERT_FN,
+        "system"      to SYSTEM_FN,
+        "exec"        to EXEC_FN,
+        // Filesystem
+        "mkdir"       to MKDIR_FN,
+        "mkdir_p"     to MKDIR_P_FN,
+        "path_join"   to PATH_JOIN_FN,
+        "path_exists" to PATH_EXISTS_FN,
+        "path_parent" to PATH_PARENT_FN,
+        "path_name"   to PATH_NAME_FN,
+        // Time
+        "time_ms"     to TIME_MS,
+        "clock_ns"    to CLOCK_NS,
+        "sleep"       to SLEEP_FN,
         // Misc
         "Error"       to ERROR_FN,
     )

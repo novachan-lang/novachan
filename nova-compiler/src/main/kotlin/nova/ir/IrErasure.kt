@@ -33,6 +33,7 @@ class IrErasure {
         val optimized = IrOptimizer().optimize(module)
         val erased = IrModule(optimized.name)
         erased.structs.addAll(optimized.structs)
+        erased.externFunctions.addAll(optimized.externFunctions)
         for (fn in optimized.functions) {
             erased.functions.add(eraseFunction(fn))
         }

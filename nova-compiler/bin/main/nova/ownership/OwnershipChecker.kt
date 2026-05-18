@@ -367,8 +367,9 @@ class OwnershipChecker(
             is AnnotatedStmt -> checkStmt(stmt.stmt)
             is LowLevelBlock -> checkBlock(stmt.body)  // @low_level: handles are opaque, skip move tracking
 
+            is YieldStmt -> checkExpr(stmt.value)
             is BreakStmt, is ContinueStmt -> {}
-            is TypeDecl, is EnumDecl, is ImportStmt, is ErrorStmt -> {}
+            is TypeDecl, is EnumDecl, is TraitDecl, is ImportStmt, is ErrorStmt -> {}
         }
     }
 

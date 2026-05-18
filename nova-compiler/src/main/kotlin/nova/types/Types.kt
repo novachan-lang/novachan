@@ -99,28 +99,33 @@ class TypeEnv {
     }
 
     // Fully substitute all type variables in a type (deep walk).
-    fun apply(t: NovaType): NovaType = when (val w = walk(t)) {
-        is TypeVar  -> w            // unbound — leave as-is
-        is TList    -> TList(apply(w.elem))
-        is TTuple   -> TTuple(w.elements.map { apply(it) })
-        is TChannel -> TChannel(apply(w.payload))
-        is TFn      -> TFn(w.params.map { apply(it) }, apply(w.ret))
-        is TStruct  -> TStruct(w.name, w.fields.mapValues { apply(it.value) })
-        is TRecord  -> TRecord(w.fields.mapValues { apply(it.value) })
-        is TSumType -> TSumType(apply(w.ok), apply(w.err))
-        is TProcess -> TProcess(apply(w.yieldType))
-        is TDict    -> TDict(apply(w.key), apply(w.value))
-        else        -> w            // primitives, TUnit, TNothing, TRange
+    fun apply(t: NovaType): NovaType = applyInner(t, mutableSetOf())
+    private fun applyInner(t: NovaType, seen: MutableSet<String>): NovaType = when (val w = walk(t)) {
+        is TypeVar  -> w
+        is TList    -> TList(applyInner(w.elem, seen))
+        is TTuple   -> TTuple(w.elements.map { applyInner(it, seen) })
+        is TChannel -> TChannel(applyInner(w.payload, seen))
+        is TFn      -> TFn(w.params.map { applyInner(it, seen) }, applyInner(w.ret, seen))
+        is TStruct  -> if (seen.add(w.name)) {
+            val result = TStruct(w.name, w.fields.mapValues { applyInner(it.value, seen) })
+            seen.remove(w.name); result
+        } else w
+        is TRecord  -> TRecord(w.fields.mapValues { applyInner(it.value, seen) })
+        is TSumType -> TSumType(applyInner(w.ok, seen), applyInner(w.err, seen))
+        is TProcess -> TProcess(applyInner(w.yieldType, seen))
+        is TDict    -> TDict(applyInner(w.key, seen), applyInner(w.value, seen))
+        else        -> w
     }
 
     // Check if TypeVar v occurs in type t (occurs check — prevents infinite types).
+    // Named structs are heap-allocated (boxed), so recursion through them is safe.
     fun occurs(v: TypeVar, t: NovaType): Boolean = when (val w = walk(t)) {
         is TypeVar  -> w.id == v.id
         is TList    -> occurs(v, w.elem)
         is TTuple   -> w.elements.any { occurs(v, it) }
         is TChannel -> occurs(v, w.payload)
         is TFn      -> w.params.any { occurs(v, it) } || occurs(v, w.ret)
-        is TStruct  -> w.fields.values.any { occurs(v, it) }
+        is TStruct  -> false
         is TRecord  -> w.fields.values.any { occurs(v, it) }
         is TSumType -> occurs(v, w.ok) || occurs(v, w.err)
         is TProcess -> occurs(v, w.yieldType)

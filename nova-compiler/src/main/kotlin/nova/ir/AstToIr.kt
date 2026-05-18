@@ -39,6 +39,28 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
     private fun typeOf(expr: Expr): IrType =
         typeEnv[expr]?.let { novaTypeToIrType(it) } ?: IrType.Any
 
+    private fun typeExprToIrType(t: TypeExpr?): IrType = when {
+        t == null -> IrType.Any
+        t is NamedType -> when (t.name) {
+            "int" -> IrType.I64
+            "float" -> IrType.F64
+            "string" -> IrType.Str
+            "bool" -> IrType.Bool
+            "list" -> IrType.List(IrType.Any)
+            "dict" -> IrType.Dict(IrType.Str, IrType.Any)
+            else -> IrType.Any
+        }
+        t is GenericType -> when (t.name) {
+            "list" -> IrType.List(if (t.args.isNotEmpty()) typeExprToIrType(t.args[0]) else IrType.Any)
+            "dict" -> IrType.Dict(
+                if (t.args.isNotEmpty()) typeExprToIrType(t.args[0]) else IrType.Str,
+                if (t.args.size > 1) typeExprToIrType(t.args[1]) else IrType.Any
+            )
+            else -> IrType.Any
+        }
+        else -> IrType.Any
+    }
+
     // ── Module state ─────────────────────────────────────────────────────────
 
     private val module = IrModule("nova")
@@ -47,6 +69,7 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
     private var ifbCounter = 0
     private var scCounter = 0
     private val knownFunctions = mutableSetOf<String>()
+    private val externFunctions = mutableSetOf<String>()
     private val functionDefaults = mutableMapOf<String, List<Expr?>>()
     // struct name → (method name → mangled function name)
     private val methodRegistry = mutableMapOf<String, MutableMap<String, String>>()
@@ -100,7 +123,12 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
         for (stmt in program.stmts) {
             when (stmt) {
                 is TypeDecl -> {
-                    module.structs.add(stmt.name to stmt.fields.map { it.name to mapTypeExpr(it.type) })
+                    val tpSet = stmt.typeParams.toSet()
+                    module.structs.add(stmt.name to stmt.fields.map { f ->
+                        val ft = if (f.type is NamedType && (f.type as NamedType).name in tpSet) IrType.Any
+                                 else mapTypeExpr(f.type)
+                        f.name to ft
+                    })
                 }
                 is EnumDecl -> {
                     for (v in stmt.variants) {
@@ -139,24 +167,41 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
         // Hoist all top-level fn declarations into module functions first
         // so forward references resolve correctly.
         for (stmt in program.stmts) {
-            if (stmt is FnDecl) {
-                if (stmt.receiverType != null) {
-                    val mangledName = "${stmt.receiverType}__${stmt.name}"
+            val fnDecl = when {
+                stmt is FnDecl -> stmt
+                stmt is AnnotatedStmt && stmt.stmt is FnDecl -> stmt.stmt as FnDecl
+                else -> null
+            }
+            if (fnDecl != null) {
+                val isExtern = stmt is AnnotatedStmt &&
+                    (stmt as AnnotatedStmt).annotation.name == "extern"
+                if (fnDecl.receiverType != null) {
+                    val mangledName = "${fnDecl.receiverType}__${fnDecl.name}"
                     knownFunctions.add(mangledName)
-                    methodRegistry.getOrPut(stmt.receiverType) { mutableMapOf() }[stmt.name] = mangledName
-                    val defaults = stmt.params.map { it.default }
+                    methodRegistry.getOrPut(fnDecl.receiverType) { mutableMapOf() }[fnDecl.name] = mangledName
+                    val defaults = fnDecl.params.map { it.default }
                     if (defaults.any { it != null }) functionDefaults[mangledName] = defaults
+                    if (isExtern) {
+                        externFunctions.add(mangledName)
+                        module.externFunctions.add(mangledName to fnDecl.params.size)
+                    }
                 } else {
-                    knownFunctions.add(stmt.name)
-                    val defaults = stmt.params.map { it.default }
-                    if (defaults.any { it != null }) functionDefaults[stmt.name] = defaults
+                    knownFunctions.add(fnDecl.name)
+                    val defaults = fnDecl.params.map { it.default }
+                    if (defaults.any { it != null }) functionDefaults[fnDecl.name] = defaults
+                    if (isExtern) {
+                        externFunctions.add(fnDecl.name)
+                        module.externFunctions.add(fnDecl.name to fnDecl.params.size)
+                    }
                 }
-                lowerFnDecl(stmt, enclosingName = null)
+                if (!isExtern) lowerFnDecl(fnDecl, enclosingName = null)
             }
         }
 
         // Top-level non-fn statements go into nova_main.
-        val mainStmts = program.stmts.filter { it !is FnDecl }
+        val mainStmts = program.stmts.filter {
+            it !is FnDecl && !(it is AnnotatedStmt && it.stmt is FnDecl)
+        }
         if (mainStmts.isNotEmpty() || program.stmts.isEmpty()) {
             val mainFn = IrFunction("nova_main", emptyList(), IrType.Unit, span = program.span)
             module.functions.add(mainFn)
@@ -171,13 +216,45 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
 
     // ── Function lowering ────────────────────────────────────────────────────
 
+    private fun hasYield(block: Block): Boolean =
+        block.stmts.any { stmtHasYield(it) }
+
+    private fun stmtHasYield(stmt: Stmt): Boolean = when (stmt) {
+        is YieldStmt -> true
+        is WhileStmt -> hasYield(stmt.body)
+        is ForStmt -> hasYield(stmt.body)
+        is ExprStmt -> exprHasYield(stmt.expr)
+        is AnnotatedStmt -> stmtHasYield(stmt.stmt)
+        else -> false
+    }
+
+    private fun exprHasYield(expr: Expr): Boolean = when (expr) {
+        is IfBlockExpr -> {
+            hasYield(expr.thenBlock) || when (val ec = expr.elseClause) {
+                is ElseBlock -> hasYield(ec.body)
+                is ElseIf -> exprHasYield(ec.ifExpr)
+                null -> false
+            }
+        }
+        is ForExpr -> when (val b = expr.body) {
+            is BlockBody -> hasYield(b.block)
+            is ExprBody -> false
+        }
+        else -> false
+    }
+
+    // Name of the yield-accumulator slot for the current generator function (null if not a generator)
+    private var yieldSlotName: String? = null
+
     private fun lowerFnDecl(fn: FnDecl, enclosingName: String?): IrFunction {
         val isMethod = fn.receiverType != null
         val name = if (isMethod) "${fn.receiverType}__${fn.name}"
                    else if (enclosingName != null) "${enclosingName}\$${fn.name}" else fn.name
-        val explicitParams = fn.params.map { it.name to IrType.Any }
+        val explicitParams = fn.params.map { it.name to typeExprToIrType(it.type) }
         val params = if (isMethod) listOf("self" to IrType.Any) + explicitParams else explicitParams
-        val irFn = IrFunction(name, params, IrType.Any, span = fn.span)
+        val isGenerator = hasYield(fn.body)
+        val retType = if (isGenerator) IrType.List(IrType.Any) else IrType.Any
+        val irFn = IrFunction(name, params, retType, span = fn.span)
         module.functions.add(irFn)
         withFunction(irFn) {
             // Parameters are available as direct refs; no slot needed for params
@@ -189,6 +266,15 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                 val paramRef = paramRef(paramName, irFn)
                 emit(IrInst.SlotStore(freshRef(), IrType.Unit, slot, paramRef, fn.span))
             }
+            // Generator setup: create accumulation list
+            if (isGenerator) {
+                val ySlot = IrSlot("__yield_list")
+                slots["__yield_list"] = ySlot
+                emit(IrInst.SlotAlloc(freshRef(), IrType.Any, ySlot, fn.span))
+                val listRef = emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_list_create", emptyList(), fn.span))
+                emit(IrInst.SlotStore(freshRef(), IrType.Unit, ySlot, listRef, fn.span))
+                yieldSlotName = "__yield_list"
+            }
             // Nested fn declarations: hoist to module AND make callable from this scope.
             for (stmt in fn.body.stmts) {
                 if (stmt is FnDecl) {
@@ -199,7 +285,14 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                 }
             }
             val result = lowerBlock(fn.body, skipFnDecls = true)
-            terminateIfNeeded(IrTerminator.Return(result, fn.body.span))
+            if (isGenerator) {
+                // Return the accumulated yield list
+                val yList = emit(IrInst.SlotLoad(freshRef(), IrType.Any, slots["__yield_list"]!!, fn.span))
+                terminateIfNeeded(IrTerminator.Return(yList, fn.body.span))
+                yieldSlotName = null
+            } else {
+                terminateIfNeeded(IrTerminator.Return(result, fn.body.span))
+            }
         }
         return irFn
     }
@@ -283,6 +376,16 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                 val dead = currentFn!!.newBlock("dead")
                 currentBlock = dead
                 v
+            }
+
+            is YieldStmt -> {
+                val value = lowerExpr(stmt.value)
+                val ySlot = slots[yieldSlotName ?: "__yield_list"]
+                if (ySlot != null) {
+                    val listRef = emit(IrInst.SlotLoad(freshRef(), IrType.Any, ySlot, stmt.span))
+                    emit(IrInst.ListAppend(freshRef(), IrType.Unit, listRef, value, stmt.span))
+                }
+                unitRef(stmt.span)
             }
 
             is BreakStmt -> {
@@ -393,8 +496,18 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                 unitRef(stmt.span)
             }
 
+            is TraitDecl -> {
+                unitRef(stmt.span)
+            }
+
             is ImportStmt      -> unitRef(stmt.span)
-            is AnnotatedStmt   -> lowerStmt(stmt.stmt)
+            is AnnotatedStmt   -> {
+                if (stmt.annotation.name == "extern" && stmt.stmt is FnDecl) {
+                    unitRef(stmt.span)
+                } else {
+                    lowerStmt(stmt.stmt)
+                }
+            }
             is LowLevelBlock   -> lowerBlock(stmt.body)
             is ErrorStmt       -> unitRef(stmt.span)
         }
@@ -460,14 +573,13 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
         }
 
         val iterVal = lowerExpr(stmt.iterable)
+        val iterType = typeEnv[stmt.iterable]
 
         val headerBlock = currentFn!!.newBlock("for_header")
         val bodyBlock   = currentFn!!.newBlock("for_body")
         val exitBlock   = currentFn!!.newBlock("for_exit")
 
         // Store iter in a slot so it's available across basic blocks.
-        // A raw IrRef from lowerExpr may be coalesced away by the optimizer
-        // within its defining block, leaving it undefined in later blocks.
         val iterSlot = IrSlot("__for_iter_${slots.size}")
         emit(IrInst.SlotAlloc(freshRef(), IrType.Any, iterSlot, span))
         emit(IrInst.SlotStore(freshRef(), IrType.Unit, iterSlot, iterVal, span))
@@ -478,27 +590,49 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
         emit(IrInst.SlotStore(freshRef(), IrType.Unit, indexSlot,
             emit(IrInst.Const(freshRef(), IrType.I64, IrConst.Int(0), span)), span))
 
+        // For string iteration, compute length once and store it
+        val lenSlot: IrSlot?
+        if (iterType is nova.types.TString) {
+            lenSlot = IrSlot("__for_len_${slots.size}")
+            emit(IrInst.SlotAlloc(freshRef(), IrType.I64, lenSlot, span))
+            val lenVal = emit(IrInst.CallDirect(freshRef(), IrType.I64, "len", listOf(iterVal), span))
+            emit(IrInst.SlotStore(freshRef(), IrType.Unit, lenSlot, lenVal, span))
+        } else {
+            lenSlot = null
+        }
+
         terminateIfNeeded(IrTerminator.Goto(headerBlock.id, span))
         currentBlock = headerBlock
 
         // has_next check — reload iter and index from slots each iteration
         val iter0   = emit(IrInst.SlotLoad(freshRef(), IrType.Any, iterSlot, span))
-        val iterType = typeEnv[stmt.iterable]
-        val hasNextFn = if (iterType is nova.types.TList) "nova_rt_list_iter_has_next" else "nova_rt_iter_has_next"
-        val hasNext = emit(IrInst.CallDirect(freshRef(), IrType.Bool, hasNextFn,
-            listOf(iter0, emit(IrInst.SlotLoad(freshRef(), IrType.I64, indexSlot, span))), span))
+        val hasNext = if (iterType is nova.types.TString) {
+            val idx = emit(IrInst.SlotLoad(freshRef(), IrType.I64, indexSlot, span))
+            val len = emit(IrInst.SlotLoad(freshRef(), IrType.I64, lenSlot!!, span))
+            emit(IrInst.Binary(freshRef(), IrType.Bool, BinOp.LT, idx, len, span))
+        } else {
+            val hasNextFn = if (iterType is nova.types.TList) "nova_rt_list_iter_has_next" else "nova_rt_iter_has_next"
+            emit(IrInst.CallDirect(freshRef(), IrType.Bool, hasNextFn,
+                listOf(iter0, emit(IrInst.SlotLoad(freshRef(), IrType.I64, indexSlot, span))), span))
+        }
         terminateIfNeeded(IrTerminator.Branch(hasNext, bodyBlock.id, exitBlock.id, span))
 
         currentBlock = bodyBlock
         loopStack.addLast(LoopContext(headerBlock.id, exitBlock.id))
 
-        // Get current element — use iter_get for safety (handles lists and dicts)
+        // Get current element
         val iter1  = emit(IrInst.SlotLoad(freshRef(), IrType.Any, iterSlot, span))
         val idxRef = emit(IrInst.SlotLoad(freshRef(), IrType.I64, indexSlot, span))
-        val elem = if (iterType is nova.types.TList) {
-            emit(IrInst.IndexGet(freshRef(), IrType.Any, iter1, idxRef, span))
-        } else {
-            emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_iter_get", listOf(iter1, idxRef), span))
+        val elem = when {
+            iterType is nova.types.TString -> {
+                emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_str_char_at", listOf(iter1, idxRef), span))
+            }
+            iterType is nova.types.TList -> {
+                emit(IrInst.IndexGet(freshRef(), IrType.Any, iter1, idxRef, span))
+            }
+            else -> {
+                emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_iter_get", listOf(iter1, idxRef), span))
+            }
         }
         bindPattern(stmt.variable, elem, span)
 
@@ -610,6 +744,7 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
         is UnaryOp -> when (expr.op) {
             "-"    -> emit(IrInst.Unary(freshRef(), IrType.Any, UnOp.NEG, lowerExpr(expr.operand), expr.span))
             "not"  -> emit(IrInst.Unary(freshRef(), IrType.Bool, UnOp.NOT, lowerExpr(expr.operand), expr.span))
+            "~"    -> emit(IrInst.Unary(freshRef(), IrType.I64, UnOp.BIT_NOT, lowerExpr(expr.operand), expr.span))
             "copy" -> emit(IrInst.Copy(freshRef(), IrType.Any, lowerExpr(expr.operand), expr.span))
             else   -> lowerExpr(expr.operand)
         }
@@ -646,7 +781,12 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
 
         is MemberAccess -> {
             val target = lowerExpr(expr.target)
-            emit(IrInst.FieldGet(freshRef(), IrType.Any, target, expr.member, expr.span))
+            val targetNovaType = typeEnv[expr.target]
+            val fieldIrType = if (targetNovaType is nova.types.TStruct) {
+                val structFields = module.structs.firstOrNull { it.first == targetNovaType.name }?.second
+                structFields?.firstOrNull { it.first == expr.member }?.second ?: IrType.Any
+            } else IrType.Any
+            emit(IrInst.FieldGet(freshRef(), fieldIrType, target, expr.member, expr.span))
         }
 
         is Lambda -> {
@@ -824,6 +964,11 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                 val container = lowerExpr(expr.right)
                 emit(IrInst.CallDirect(freshRef(), IrType.Bool, "nova_rt_contains", listOf(container, item), span))
             }
+            "matches" -> {
+                val text = lowerExpr(expr.left)
+                val pattern = lowerExpr(expr.right)
+                emit(IrInst.CallDirect(freshRef(), IrType.Bool, "nova_rt_regex_match", listOf(text, pattern), span))
+            }
             else -> {
                 // Check if `+` is string concatenation before lowering operands
                 val isStringConcat = expr.op == "+" &&
@@ -842,6 +987,9 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                     "=="  -> BinOp.EQ;  "!="  -> BinOp.NE
                     "<"   -> BinOp.LT;  ">"   -> BinOp.GT
                     "<="  -> BinOp.LE;  ">="  -> BinOp.GE
+                    "&"   -> BinOp.BIT_AND; "|" -> BinOp.BIT_OR
+                    "^"   -> BinOp.BIT_XOR
+                    "<<"  -> BinOp.SHL; ">>"  -> BinOp.SHR
                     else  -> BinOp.ADD
                 }
                 emit(IrInst.Binary(freshRef(), irType, op, l, r, span))
@@ -1047,22 +1195,39 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
         emit(IrInst.SlotAlloc(freshRef(), IrType.Any, resultSlot, span))
 
         for ((i, arm) in expr.arms.withIndex()) {
-            val armBodyBlock = currentFn!!.newBlock("arm${i}_body")
             val nextCheckBlock = if (i < expr.arms.lastIndex)
                 currentFn!!.newBlock("arm${i}_next") else null
+            val elseTarget = nextCheckBlock?.id ?: mergeBlock.id
 
-            // Emit pattern test
-            val matched = testPattern(arm.pattern, subject, span)
-            if (matched != null) {
-                val elseTarget = nextCheckBlock?.id ?: mergeBlock.id
-                terminateIfNeeded(IrTerminator.Branch(matched, armBodyBlock.id, elseTarget, span))
+            if (arm.guard != null) {
+                val armGuardBlock = currentFn!!.newBlock("arm${i}_guard")
+                val armBodyBlock = currentFn!!.newBlock("arm${i}_body")
+
+                val matched = testPattern(arm.pattern, subject, span)
+                if (matched != null) {
+                    terminateIfNeeded(IrTerminator.Branch(matched, armGuardBlock.id, elseTarget, span))
+                } else {
+                    terminateIfNeeded(IrTerminator.Goto(armGuardBlock.id, span))
+                }
+
+                currentBlock = armGuardBlock
+                bindPatternVars(arm.pattern, subject, span)
+                val guardVal = lowerExpr(arm.guard)
+                terminateIfNeeded(IrTerminator.Branch(guardVal, armBodyBlock.id, elseTarget, span))
+
+                currentBlock = armBodyBlock
             } else {
-                // Wildcard — always matches
-                terminateIfNeeded(IrTerminator.Goto(armBodyBlock.id, span))
+                val armBodyBlock = currentFn!!.newBlock("arm${i}_body")
+                val matched = testPattern(arm.pattern, subject, span)
+                if (matched != null) {
+                    terminateIfNeeded(IrTerminator.Branch(matched, armBodyBlock.id, elseTarget, span))
+                } else {
+                    terminateIfNeeded(IrTerminator.Goto(armBodyBlock.id, span))
+                }
+                currentBlock = armBodyBlock
+                bindPatternVars(arm.pattern, subject, span)
             }
 
-            currentBlock = armBodyBlock
-            bindPatternVars(arm.pattern, subject, span)
             val armVal = when (val b = arm.body) {
                 is ExprBody  -> lowerExpr(b.expr)
                 is BlockBody -> lowerBlock(b.block)
@@ -1091,10 +1256,19 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
         is TuplePat -> null  // Tuples always match structurally; binding extracts elements
         is ConstructorPat -> {
             val structType = IrType.Struct(pat.name)
-            val tagRef = emit(IrInst.FieldGet(freshRef(), IrType.Str, subject, "__variant", span, objType = structType))
-            val expected = emit(IrInst.Const(freshRef(), IrType.Str, IrConst.Str(pat.name), span))
-            emit(IrInst.Binary(freshRef(), IrType.Bool, BinOp.EQ, tagRef, expected, span))
+            val hashRef = emit(IrInst.FieldGet(freshRef(), IrType.I64, subject, "__type_hash", span, objType = structType))
+            val expectedHash = typeNameHash(pat.name)
+            val expectedRef = emit(IrInst.Const(freshRef(), IrType.I64, IrConst.Int(expectedHash), span))
+            emit(IrInst.Binary(freshRef(), IrType.Bool, BinOp.EQ, hashRef, expectedRef, span))
         }
+    }
+
+    private fun typeNameHash(name: String): Long {
+        var h = 5381L
+        for (c in name) {
+            h = h * 33 + c.code
+        }
+        return h
     }
 
     // Bind pattern variables into slots (called after the pattern test passes).
@@ -1107,7 +1281,9 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                 bindPatternVars(p, elem, span)
             }
             is ConstructorPat -> pat.arg?.let { arg ->
-                val fields = enumVariants[pat.name] ?: emptyList()
+                val fields = enumVariants[pat.name]
+                    ?: module.structs.firstOrNull { it.first == pat.name }?.second
+                    ?: emptyList()
                 val structType = IrType.Struct(pat.name)
                 when {
                     arg is IdentPat && fields.size == 1 -> {
@@ -1309,6 +1485,30 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                     val args = expr.args.map { lowerExpr(it.value) }
                     return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_http_post", args, span))
                 }
+                "mkdir" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_mkdir", args, span))
+                }
+                "mkdir_p" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_mkdir_p", args, span))
+                }
+                "path_join" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_path_join", args, span))
+                }
+                "path_exists" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_path_exists", args, span))
+                }
+                "path_parent" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_path_parent", args, span))
+                }
+                "path_name" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_path_name", args, span))
+                }
                 "channel" -> return emit(IrInst.ChannelCreate(freshRef(), IrType.Channel, span))
                 "send" -> {
                     val ch  = lowerExpr(expr.args[0].value)
@@ -1360,10 +1560,206 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                     val args = expr.args.map { lowerExpr(it.value) }
                     return emit(IrInst.CallDirect(freshRef(), IrType.Unit, "nova_rt_exit", args, span))
                 }
+                // Time stdlib
+                "time_ms" -> return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_time_ms", emptyList(), span))
+                "clock_ns" -> return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_clock_ns", emptyList(), span))
+                "sleep" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Unit, "nova_rt_sleep_ms", args, span))
+                }
+                "assert" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Unit, "nova_rt_assert", args, span))
+                }
+                "system" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_system", args, span))
+                }
+                "exec" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_exec", args, span))
+                }
+                // System stdlib — args, env, random, shell
+                "args" -> return emit(IrInst.CallDirect(freshRef(), IrType.List(IrType.Str), "nova_rt_args", emptyList(), span))
+                "env" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_env", args, span))
+                }
+                "random" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return if (args.isEmpty()) {
+                        emit(IrInst.CallDirect(freshRef(), IrType.F64, "nova_rt_random_float", emptyList(), span))
+                    } else {
+                        emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_random_int", args, span))
+                    }
+                }
+                "shell" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_shell", args, span))
+                }
+                // Path stdlib
+                "path_join" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_path_join", args, span))
+                }
+                "path_parent" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_path_parent", args, span))
+                }
+                "path_name" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_path_name", args, span))
+                }
+                "path_ext" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_path_ext", args, span))
+                }
+                // Regex stdlib
+                "regex_find" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_regex_find", args, span))
+                }
+                "regex_replace" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_regex_replace", args, span))
+                }
+                "regex_split" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_regex_split", args, span))
+                }
+                // Network stdlib — TCP/UDP
+                "tcp_connect" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_tcp_connect", args, span))
+                }
+                "tcp_listen" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_tcp_listen", args, span))
+                }
+                "tcp_accept" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_tcp_accept", args, span))
+                }
+                "tcp_send" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_tcp_send", args, span))
+                }
+                "tcp_recv" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_tcp_recv", args, span))
+                }
+                "tcp_close" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Unit, "nova_rt_tcp_close", args, span))
+                }
+                "udp_bind" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_udp_bind", args, span))
+                }
+                "udp_send" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_udp_send", args, span))
+                }
+                "udp_recv" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_udp_recv", args, span))
+                }
+                // HTTP server stdlib
+                "http_listen" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_http_listen", args, span))
+                }
+                "http_accept" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_http_accept", args, span))
+                }
+                "http_respond" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Unit, "nova_rt_http_respond", args, span))
+                }
+                // Byte array stdlib
+                "bytes" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_bytes_create", args, span))
+                }
+                "bytes_get" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_bytes_get", args, span))
+                }
+                "bytes_set" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Unit, "nova_rt_bytes_set", args, span))
+                }
+                "bytes_len" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_bytes_len", args, span))
+                }
+                "bytes_slice" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_bytes_slice", args, span))
+                }
+                "bytes_to_str" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_bytes_to_str", args, span))
+                }
+                "str_to_bytes" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_str_to_bytes", args, span))
+                }
                 // List stdlib — free-function calls
                 "push", "concat", "sort", "map", "filter" -> {
                     val args = expr.args.map { lowerExpr(it.value) }
                     return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_${callee.name}", args, span))
+                }
+                "list_concat" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_list_concat", args, span))
+                }
+                "list_reverse" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_list_reverse", args, span))
+                }
+                "list_sort" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_list_sort", args, span))
+                }
+                "list_slice" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Any, "nova_rt_list_slice", args, span))
+                }
+                // Dict stdlib — free-function calls
+                "keys", "dict_keys" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.List(IrType.Str), "nova_rt_keys", args, span))
+                }
+                "values", "dict_values" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.List(IrType.Any), "nova_rt_values", args, span))
+                }
+                "dict_items" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.List(IrType.Any), "nova_rt_items", args, span))
+                }
+                // Conversion/introspection stdlib
+                "type_of" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_type_of", args, span))
+                }
+                "any_to_str" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.Str, "nova_rt_any_to_str", args, span))
+                }
+                "range" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.List(IrType.I64), "nova_rt_range", args, span))
+                }
+                "parse_int" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.I64, "nova_rt_parse_int", args, span))
+                }
+                "parse_float" -> {
+                    val args = expr.args.map { lowerExpr(it.value) }
+                    return emit(IrInst.CallDirect(freshRef(), IrType.F64, "nova_rt_parse_float", args, span))
                 }
                 "spawn" -> {
                     val enclosing = currentFn?.name ?: "nova_main"
@@ -1413,6 +1809,18 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
                 if (i < args.size) fields.add(fieldDef.first to args[i])
             }
             return emit(IrInst.MakeRecord(freshRef(), IrType.Struct(variantName), fields, span))
+        }
+
+        // Struct positional constructor: Pair(10, "ten") → MakeRecord.
+        if (callee is Ident) {
+            val structFieldDefs = module.structs.firstOrNull { it.first == callee.name }
+            if (structFieldDefs != null) {
+                val args = expr.args.map { lowerExpr(it.value) }
+                val fields = structFieldDefs.second.mapIndexed { i, (fname, _) ->
+                    fname to if (i < args.size) args[i] else emit(IrInst.Const(freshRef(), IrType.I64, IrConst.Int(0), span))
+                }
+                return emit(IrInst.MakeRecord(freshRef(), IrType.Struct(callee.name), fields, span))
+            }
         }
 
         // Module-qualified call: module.func(args) → CallDirect to the function
@@ -1586,12 +1994,14 @@ class AstToIr(private val typeEnv: Map<Expr, NovaType> = emptyMap()) {
     }
 
     private fun mapTypeExpr(te: TypeExpr): IrType = when (te) {
-        is NamedType -> when (te.name) {
-            "Int"    -> IrType.I64
-            "Float"  -> IrType.F64
-            "String" -> IrType.Str
-            "Bool"   -> IrType.Bool
-            "Byte"   -> IrType.Byte
+        is NamedType -> when (te.name.lowercase()) {
+            "int"    -> IrType.I64
+            "float"  -> IrType.F64
+            "string" -> IrType.Str
+            "bool"   -> IrType.Bool
+            "byte"   -> IrType.Byte
+            "list"   -> IrType.List(IrType.Any)
+            "dict"   -> IrType.Dict(IrType.Any, IrType.Any)
             else     -> IrType.Struct(te.name)
         }
         else -> IrType.Any

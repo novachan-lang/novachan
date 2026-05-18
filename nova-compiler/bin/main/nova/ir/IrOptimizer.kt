@@ -43,6 +43,7 @@ class IrOptimizer {
         eliminateUnusedFunctions(module)
         val result = IrModule(module.name)
         result.structs.addAll(module.structs)
+        result.externFunctions.addAll(module.externFunctions)
         for (fn in module.functions) {
             result.functions.add(optimizeFunction(fn))
         }
@@ -234,7 +235,10 @@ class IrOptimizer {
         var nextBlkId = maxBlockId + 1
         fun freshRef() = IrRef(nextRefId++)
         fun freshBlockId() = BlockId(nextBlkId++)
-        var inlineCount = 0
+        val mbRegex = Regex("^__mb(\\d+)_")
+        var inlineCount = fn.blocks.maxOfOrNull { b ->
+            mbRegex.find(b.label)?.groupValues?.get(1)?.toIntOrNull()?.plus(1) ?: 0
+        } ?: 0
 
         var blockIdx = 0
         while (blockIdx < fn.blocks.size) {
@@ -296,7 +300,8 @@ class IrOptimizer {
 
             // Build merge/continuation block
             val mergeInsts = mutableListOf<IrInst>()
-            mergeInsts.add(IrInst.SlotLoad(retLoadRef, IrType.Any, retSlot, callInst.span))
+            val retType = if (callee.returnType != IrType.Any && callee.returnType != IrType.Unit) callee.returnType else IrType.Any
+            mergeInsts.add(IrInst.SlotLoad(retLoadRef, retType, retSlot, callInst.span))
             val callSubst = mapOf(callInst.result to retLoadRef)
             for (ai in afterInsts) mergeInsts.add(applySubst(ai, callSubst))
             val mergeTerminator = origTerminator?.let { applySubstTerm(it, callSubst) } ?: origTerminator
@@ -816,6 +821,11 @@ class IrOptimizer {
                 BinOp.GT   -> IrConst.Bool(l.v >  r.v)
                 BinOp.LE   -> IrConst.Bool(l.v <= r.v)
                 BinOp.GE   -> IrConst.Bool(l.v >= r.v)
+                BinOp.BIT_AND -> IrConst.Int(l.v and r.v)
+                BinOp.BIT_OR  -> IrConst.Int(l.v or r.v)
+                BinOp.BIT_XOR -> IrConst.Int(l.v xor r.v)
+                BinOp.SHL     -> IrConst.Int(l.v shl r.v.toInt())
+                BinOp.SHR     -> IrConst.Int(l.v shr r.v.toInt())
                 else       -> return null
             }
             l is IrConst.Float && r is IrConst.Float -> when (inst.op) {
@@ -1239,7 +1249,11 @@ class IrOptimizer {
                 // Skip if the body includes the entry block (false loop / whole function)
                 if (entryId != null && entryId in bodyBlockIds && entryId != header.id) continue
 
-                var preheader: IrBlock? = null
+                // Find blocks outside the loop that jump to the header.
+                // A valid preheader must be the UNIQUE such block; if multiple
+                // outside blocks enter the header, hoisting to one would leave
+                // the other entry path with undefined values (SSA violation).
+                val outsideEntries = mutableListOf<IrBlock>()
                 for (ph in fn.blocks) {
                     if (ph.id in bodyBlockIds) continue
                     val phTargets = when (val t = ph.terminator) {
@@ -1247,12 +1261,10 @@ class IrOptimizer {
                         is IrTerminator.Branch -> listOf(t.thenBlock, t.elseBlock)
                         else -> emptyList()
                     }
-                    if (header.id in phTargets) {
-                        preheader = ph
-                    }
+                    if (header.id in phTargets) outsideEntries.add(ph)
                 }
-                if (preheader != null) {
-                    loops.add(Loop(preheader, header, bodyBlockIds))
+                if (outsideEntries.size == 1) {
+                    loops.add(Loop(outsideEntries[0], header, bodyBlockIds))
                 }
             }
         }

@@ -1,0 +1,549 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// NOVA Typed Intermediate Representation
+//
+// This module defines the IR that sits between parsing and LLVM emission.
+// Every instruction carries type information, enabling:
+// - Type inference (populate types, developer writes nothing)
+// - Direct arithmetic (int+int → add i64, not runtime call)
+// - Optimization passes (operate on structured IR, not string concatenation)
+// - Multi-target codegen (same IR → LLVM, WASM, GPU)
+// - Memory management (RC insertion based on escape analysis)
+// - Process erasure (single-process code → zero overhead)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── IR Types ─────────────────────────────────────────────────────────────────
+// Represents the type of every value in the program.
+// TypeVar enables inference: the solver fills in concrete types.
+
+type IrType
+    kind: string
+    name: string
+    params: list
+    id: int
+
+// Constructors:
+// IrType("int", "", [], 0)         → integer
+// IrType("float", "", [], 0)       → float64
+// IrType("bool", "", [], 0)        → boolean
+// IrType("str", "", [], 0)         → string
+// IrType("list", "", [elem_type], 0)  → List<T>
+// IrType("dict", "", [key_t, val_t], 0) → Dict<K,V>
+// IrType("struct", "Token", [field_types...], 0) → named struct
+// IrType("fn", "", [param_types..., ret_type], 0) → function type
+// IrType("channel", "", [payload_type], 0) → Channel<T>
+// IrType("process", "", [yield_type], 0) → Process<T>
+// IrType("typevar", "", [], 42)    → unresolved type variable #42
+// IrType("any", "", [], 0)         → untyped (pre-inference)
+// IrType("void", "", [], 0)        → no return value
+
+fn ir_type_int() -> IrType
+    IrType("int", "", [], 0)
+
+fn ir_type_float() -> IrType
+    IrType("float", "", [], 0)
+
+fn ir_type_bool() -> IrType
+    IrType("bool", "", [], 0)
+
+fn ir_type_str() -> IrType
+    IrType("str", "", [], 0)
+
+fn ir_type_any() -> IrType
+    IrType("any", "", [], 0)
+
+fn ir_type_void() -> IrType
+    IrType("void", "", [], 0)
+
+fn ir_type_list(elem: IrType) -> IrType
+    IrType("list", "", [elem], 0)
+
+fn ir_type_dict(key: IrType, val: IrType) -> IrType
+    IrType("dict", "", [key, val], 0)
+
+fn ir_type_struct(name: string, fields: list) -> IrType
+    IrType("struct", name, fields, 0)
+
+fn ir_type_fn(params: list, ret: IrType) -> IrType
+    let all = []
+    for p in params
+        push(all, p)
+    push(all, ret)
+    IrType("fn", "", all, 0)
+
+fn ir_type_channel(payload: IrType) -> IrType
+    IrType("channel", "", [payload], 0)
+
+fn ir_type_typevar(id: int) -> IrType
+    IrType("typevar", "", [], id)
+
+// ── IR Instructions ──────────────────────────────────────────────────────────
+// Each instruction produces a named result (SSA-like).
+// The `op` field determines semantics; other fields are op-specific.
+
+type IrInst
+    op: string
+    dest: string
+    type: IrType
+    args: list
+    value: string
+    num: int
+    effect: string
+
+// Op codes:
+// "const_int"    → dest = num (integer literal)
+// "const_float"  → dest = value (float literal as string)
+// "const_str"    → dest = value (string literal)
+// "const_bool"   → dest = num (0 or 1)
+// "const_null"   → dest = null value
+//
+// Arithmetic (direct, no runtime call for int/float):
+// "add"          → dest = args[0] + args[1]
+// "sub"          → dest = args[0] - args[1]
+// "mul"          → dest = args[0] * args[1]
+// "div"          → dest = args[0] / args[1]
+// "mod"          → dest = args[0] % args[1]
+// "neg"          → dest = -args[0]
+//
+// Comparison:
+// "eq"           → dest = args[0] == args[1]
+// "neq"          → dest = args[0] != args[1]
+// "lt"           → dest = args[0] < args[1]
+// "le"           → dest = args[0] <= args[1]
+// "gt"           → dest = args[0] > args[1]
+// "ge"           → dest = args[0] >= args[1]
+//
+// Logic:
+// "and"          → dest = args[0] and args[1] (short-circuit)
+// "or"           → dest = args[0] or args[1] (short-circuit)
+// "not"          → dest = not args[0]
+//
+// String (always runtime):
+// "str_concat"   → dest = args[0] + args[1] (string concatenation)
+//
+// Memory:
+// "slot_alloc"   → allocate local slot named `value`
+// "slot_load"    → dest = load from slot named `value`
+// "slot_store"   → store args[0] into slot named `value`
+// "slot_invalidate" → mark slot `value` as moved (ownership transfer)
+//
+// Struct:
+// "make_struct"  → dest = allocate struct, fields from args
+// "field_get"    → dest = args[0].field[num]
+// "field_set"    → args[0].field[num] = args[1]
+//
+// List/Dict:
+// "make_list"    → dest = new list from args
+// "make_dict"    → dest = new empty dict
+// "index_get"    → dest = args[0][args[1]]
+// "index_set"    → args[0][args[1]] = args[2]
+//
+// Function call:
+// "call"         → dest = call value(args...) (dynamic, may be runtime fn)
+// "call_direct"  → dest = call value(args...) (known function, can inline)
+//
+// Control flow (terminators — only one per block):
+// "branch"       → if args[0] then goto value else goto args[1]
+// "goto"         → unconditional jump to value
+// "return"       → return args[0]
+//
+// Concurrency:
+// "spawn"        → dest = spawn process calling value(args...)
+// "chan_create"   → dest = new channel
+// "chan_send"    → send args[1] on channel args[0] (consumes args[1])
+// "chan_recv"    → dest = receive from channel args[0]
+// "chan_select"  → dest = select over multiple channels
+//
+// Memory management:
+// "rc_inc"       → increment refcount of args[0]
+// "rc_dec"       → decrement refcount of args[0]
+//
+// Effect annotations: "pure", "side_effect", "process_spawn", "gpu_dispatch"
+
+fn ir_inst(op: string, dest: string, typ: IrType, args: list, value: string, num: int) -> IrInst
+    IrInst(op, dest, typ, args, value, num, "pure")
+
+fn ir_inst_effect(op: string, dest: string, typ: IrType, args: list, value: string, num: int, effect: string) -> IrInst
+    IrInst(op, dest, typ, args, value, num, effect)
+
+// ── IR Blocks and Functions ──────────────────────────────────────────────────
+
+type IrBlock
+    label: string
+    insts: list
+    terminator: IrInst
+
+type IrParam
+    name: string
+    type: IrType
+
+type IrFunction
+    name: string
+    params: list
+    ret_type: IrType
+    blocks: list
+    type_params: list
+    is_extern: int
+
+type IrModule
+    functions: list
+    structs: list
+    globals: list
+    string_constants: list
+
+// ── IR Builder ───────────────────────────────────────────────────────────────
+// Converts AST (Stmt/Expr) into typed IR.
+
+type IrBuilder
+    module: IrModule
+    current_fn: IrFunction
+    current_block: IrBlock
+    blocks: list
+    reg_count: int
+    label_count: int
+    type_var_count: int
+    fn_types: dict
+    struct_defs: dict
+    local_types: dict
+
+fn new_ir_builder() -> IrBuilder
+    let module = IrModule([], [], [], [])
+    let entry_block = IrBlock("entry", [], ir_inst("return", "", ir_type_void(), [], "", 0))
+    let empty_fn = IrFunction("", [], ir_type_void(), [], [], 0)
+    IrBuilder(module, empty_fn, entry_block, [], 0, 0, 0, {}, {}, {})
+
+fn ir_fresh_reg(b: IrBuilder) -> string
+    let name = "%r" + str(b.reg_count)
+    b.reg_count = b.reg_count + 1
+    name
+
+fn ir_fresh_label(b: IrBuilder, prefix: string) -> string
+    let name = prefix + str(b.label_count)
+    b.label_count = b.label_count + 1
+    name
+
+fn ir_fresh_typevar(b: IrBuilder) -> IrType
+    let id = b.type_var_count
+    b.type_var_count = b.type_var_count + 1
+    ir_type_typevar(id)
+
+fn ir_emit(b: IrBuilder, inst: IrInst)
+    push(b.current_block.insts, inst)
+
+fn ir_terminate(b: IrBuilder, term: IrInst)
+    b.current_block.terminator = term
+    push(b.blocks, b.current_block)
+    let next_label = ir_fresh_label(b, "bb")
+    b.current_block = IrBlock(next_label, [], ir_inst("return", "", ir_type_void(), [], "", 0))
+
+fn ir_start_block(b: IrBuilder, label: string)
+    b.current_block = IrBlock(label, [], ir_inst("return", "", ir_type_void(), [], "", 0))
+
+// ── Type Inference Engine (Minimal Bootstrap) ────────────────────────────────
+// For now: infer int for arithmetic, str for string ops, any for unknowns.
+// Full HM inference comes in Priority 3.
+
+fn infer_binop_type(op: string, left: IrType, right: IrType) -> IrType
+    if op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
+        if left.kind == "str" or right.kind == "str"
+            ir_type_str()
+        else
+            ir_type_int()
+    else if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">="
+        ir_type_bool()
+    else if op == "and" or op == "or"
+        ir_type_bool()
+    else
+        ir_type_any()
+
+// ── AST to IR Conversion ─────────────────────────────────────────────────────
+
+fn ir_build_expr(b: IrBuilder, expr: Expr) -> string
+    match expr
+        Expr(tag, value, num, children, fields) =>
+            if tag == "int"
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("const_int", dest, ir_type_int(), [], "", num))
+                dest
+            else if tag == "float"
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("const_float", dest, ir_type_float(), [], value, 0))
+                dest
+            else if tag == "string"
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("const_str", dest, ir_type_str(), [], value, 0))
+                dest
+            else if tag == "bool"
+                let dest = ir_fresh_reg(b)
+                let bval = if value == "true"
+                    1
+                else
+                    0
+                ir_emit(b, ir_inst("const_bool", dest, ir_type_bool(), [], "", bval))
+                dest
+            else if tag == "null"
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("const_null", dest, ir_type_any(), [], "", 0))
+                dest
+            else if tag == "ident"
+                let dest = ir_fresh_reg(b)
+                let var_type = ir_type_any()
+                if contains(b.local_types, value)
+                    var_type = b.local_types[value]
+                ir_emit(b, ir_inst("slot_load", dest, var_type, [], value, 0))
+                dest
+            else if tag == "binop"
+                let left_r = ir_build_expr(b, children[0])
+                let right_r = ir_build_expr(b, children[1])
+                let dest = ir_fresh_reg(b)
+                let op = value
+                if op == "+"
+                    // Determine: int add or string concat?
+                    // For now, use runtime add (handles both)
+                    // With type info: emit direct "add" for int, "str_concat" for str
+                    ir_emit(b, ir_inst("add", dest, ir_type_any(), [left_r, right_r], op, 0))
+                else if op == "-" or op == "*" or op == "/" or op == "%"
+                    let ir_op = if op == "-"
+                        "sub"
+                    else if op == "*"
+                        "mul"
+                    else if op == "/"
+                        "div"
+                    else
+                        "mod"
+                    ir_emit(b, ir_inst(ir_op, dest, ir_type_int(), [left_r, right_r], op, 0))
+                else if op == "==" or op == "!="
+                    let cmp_op = if op == "=="
+                        "eq"
+                    else
+                        "neq"
+                    ir_emit(b, ir_inst(cmp_op, dest, ir_type_bool(), [left_r, right_r], op, 0))
+                else if op == "<" or op == "<=" or op == ">" or op == ">="
+                    let cmp_op = if op == "<"
+                        "lt"
+                    else if op == "<="
+                        "le"
+                    else if op == ">"
+                        "gt"
+                    else
+                        "ge"
+                    ir_emit(b, ir_inst(cmp_op, dest, ir_type_bool(), [left_r, right_r], op, 0))
+                else if op == "and"
+                    ir_emit(b, ir_inst("and", dest, ir_type_bool(), [left_r, right_r], "", 0))
+                else if op == "or"
+                    ir_emit(b, ir_inst("or", dest, ir_type_bool(), [left_r, right_r], "", 0))
+                else
+                    ir_emit(b, ir_inst("call", dest, ir_type_any(), [left_r, right_r], "nova_rt_add", 0))
+                dest
+            else if tag == "unary"
+                let operand_r = ir_build_expr(b, children[0])
+                let dest = ir_fresh_reg(b)
+                if value == "-"
+                    ir_emit(b, ir_inst("neg", dest, ir_type_int(), [operand_r], "", 0))
+                else if value == "not"
+                    ir_emit(b, ir_inst("not", dest, ir_type_bool(), [operand_r], "", 0))
+                else
+                    ir_emit(b, ir_inst("neg", dest, ir_type_any(), [operand_r], value, 0))
+                dest
+            else if tag == "call"
+                let fn_name = ""
+                match children[0]
+                    Expr(ct, cv, cn, cc, cf) =>
+                        fn_name = cv
+                let call_args = []
+                let i = 1
+                while i < len(children)
+                    let arg_r = ir_build_expr(b, children[i])
+                    push(call_args, arg_r)
+                    i = i + 1
+                let dest = ir_fresh_reg(b)
+                let eff = "side_effect"
+                if fn_name == "len" or fn_name == "str" or fn_name == "int" or fn_name == "ord" or fn_name == "chr"
+                    eff = "pure"
+                ir_emit(b, ir_inst_effect("call", dest, ir_type_any(), call_args, fn_name, 0, eff))
+                dest
+            else if tag == "index"
+                let target_r = ir_build_expr(b, children[0])
+                let idx_r = ir_build_expr(b, children[1])
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("index_get", dest, ir_type_any(), [target_r, idx_r], "", 0))
+                dest
+            else if tag == "member"
+                let target_r = ir_build_expr(b, children[0])
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("field_get", dest, ir_type_any(), [target_r], value, num))
+                dest
+            else if tag == "list"
+                let elem_regs = []
+                for elem in children
+                    let er = ir_build_expr(b, elem)
+                    push(elem_regs, er)
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("make_list", dest, ir_type_list(ir_type_any()), elem_regs, "", 0))
+                dest
+            else if tag == "dict"
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("make_dict", dest, ir_type_dict(ir_type_any(), ir_type_any()), [], "", 0))
+                dest
+            else if tag == "ctor"
+                let struct_name = value
+                let field_regs = []
+                for arg in children
+                    let ar = ir_build_expr(b, arg)
+                    push(field_regs, ar)
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("make_struct", dest, ir_type_struct(struct_name, []), field_regs, struct_name, len(children)))
+                dest
+            else
+                let dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("const_int", dest, ir_type_int(), [], "", 0))
+                dest
+
+fn ir_build_stmt(b: IrBuilder, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            if tag == "assign" and name != ""
+                let val_r = ir_build_expr(b, expr)
+                ir_emit(b, ir_inst("slot_store", "", ir_type_void(), [val_r], name, 0))
+            else if tag == "assign" and len(annotations) > 0
+                // Complex assignment (index/field)
+                let val_r = ir_build_expr(b, expr)
+                match annotations[0]
+                    Expr(at, av, an, ac, af) =>
+                        if at == "index"
+                            let target_r = ir_build_expr(b, ac[0])
+                            let idx_r = ir_build_expr(b, ac[1])
+                            ir_emit(b, ir_inst_effect("index_set", "", ir_type_void(), [target_r, idx_r, val_r], "", 0, "side_effect"))
+                        else if at == "member"
+                            let target_r = ir_build_expr(b, ac[0])
+                            ir_emit(b, ir_inst_effect("field_set", "", ir_type_void(), [target_r, val_r], av, an, "side_effect"))
+            else if tag == "expr"
+                ir_build_expr(b, expr)
+            else if tag == "return"
+                let val_r = ir_build_expr(b, expr)
+                ir_terminate(b, ir_inst("return", "", ir_type_void(), [val_r], "", 0))
+            else if tag == "if"
+                let cond_r = ir_build_expr(b, expr)
+                let then_label = ir_fresh_label(b, "then")
+                let else_label = ir_fresh_label(b, "else")
+                let merge_label = ir_fresh_label(b, "merge")
+                ir_terminate(b, ir_inst("branch", "", ir_type_void(), [cond_r, else_label], then_label, 0))
+                ir_start_block(b, then_label)
+                for s in body
+                    ir_build_stmt(b, s)
+                ir_terminate(b, ir_inst("goto", "", ir_type_void(), [], merge_label, 0))
+                ir_start_block(b, else_label)
+                for s in else_body
+                    ir_build_stmt(b, s)
+                ir_terminate(b, ir_inst("goto", "", ir_type_void(), [], merge_label, 0))
+                ir_start_block(b, merge_label)
+            else if tag == "while"
+                let hdr_label = ir_fresh_label(b, "while_hdr")
+                let body_label = ir_fresh_label(b, "while_body")
+                let exit_label = ir_fresh_label(b, "while_exit")
+                ir_terminate(b, ir_inst("goto", "", ir_type_void(), [], hdr_label, 0))
+                ir_start_block(b, hdr_label)
+                let cond_r = ir_build_expr(b, expr)
+                ir_terminate(b, ir_inst("branch", "", ir_type_void(), [cond_r, exit_label], body_label, 0))
+                ir_start_block(b, body_label)
+                for s in body
+                    ir_build_stmt(b, s)
+                ir_terminate(b, ir_inst("goto", "", ir_type_void(), [], hdr_label, 0))
+                ir_start_block(b, exit_label)
+            else if tag == "for"
+                let iter_r = ir_build_expr(b, expr)
+                let len_dest = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("call", len_dest, ir_type_int(), [iter_r], "len", 0))
+                let idx_name = "__for_idx_" + str(b.label_count)
+                ir_emit(b, ir_inst("slot_store", "", ir_type_void(), ["0"], idx_name, 0))
+                let hdr_label = ir_fresh_label(b, "for_hdr")
+                let body_label = ir_fresh_label(b, "for_body")
+                let exit_label = ir_fresh_label(b, "for_exit")
+                ir_terminate(b, ir_inst("goto", "", ir_type_void(), [], hdr_label, 0))
+                ir_start_block(b, hdr_label)
+                let idx_r = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("slot_load", idx_r, ir_type_int(), [], idx_name, 0))
+                let cmp_r = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("lt", cmp_r, ir_type_bool(), [idx_r, len_dest], "", 0))
+                ir_terminate(b, ir_inst("branch", "", ir_type_void(), [cmp_r, exit_label], body_label, 0))
+                ir_start_block(b, body_label)
+                let elem_r = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("index_get", elem_r, ir_type_any(), [iter_r, idx_r], "", 0))
+                ir_emit(b, ir_inst("slot_store", "", ir_type_void(), [elem_r], name, 0))
+                for s in body
+                    ir_build_stmt(b, s)
+                let inc_r = ir_fresh_reg(b)
+                let cur_r = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("slot_load", cur_r, ir_type_int(), [], idx_name, 0))
+                ir_emit(b, ir_inst("const_int", inc_r, ir_type_int(), [], "", 1))
+                let new_r = ir_fresh_reg(b)
+                ir_emit(b, ir_inst("add", new_r, ir_type_int(), [cur_r, inc_r], "+", 0))
+                ir_emit(b, ir_inst("slot_store", "", ir_type_void(), [new_r], idx_name, 0))
+                ir_terminate(b, ir_inst("goto", "", ir_type_void(), [], hdr_label, 0))
+                ir_start_block(b, exit_label)
+            else if tag == "break"
+                // Will be handled by loop context
+                ir_emit(b, ir_inst("goto", "", ir_type_void(), [], "__break_target", 0))
+            else if tag == "continue"
+                ir_emit(b, ir_inst("goto", "", ir_type_void(), [], "__continue_target", 0))
+            else if tag == "match"
+                let subject_r = ir_build_expr(b, expr)
+                let merge_label = ir_fresh_label(b, "match_merge")
+                for arm in body
+                    match arm
+                        Stmt(at, an, pattern, arm_body, ap, ae, aa) =>
+                            match pattern
+                                Expr(pt, pv, pn, pchildren, pf) =>
+                                    if pt == "pat_ctor"
+                                        let fi = 0
+                                        for field_pat in pchildren
+                                            match field_pat
+                                                Expr(fpt, fpv, fpn, fpc, fpf) =>
+                                                    if fpv != "_"
+                                                        let field_r = ir_fresh_reg(b)
+                                                        ir_emit(b, ir_inst("field_get", field_r, ir_type_any(), [subject_r], fpv, fi))
+                                                        ir_emit(b, ir_inst("slot_store", "", ir_type_void(), [field_r], fpv, 0))
+                                            fi = fi + 1
+                            for s in arm_body
+                                ir_build_stmt(b, s)
+                ir_terminate(b, ir_inst("goto", "", ir_type_void(), [], merge_label, 0))
+                ir_start_block(b, merge_label)
+
+fn ir_build_function(b: IrBuilder, stmt: Stmt) -> IrFunction
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            b.reg_count = 0
+            b.blocks = []
+            b.local_types = {}
+            let ir_params = []
+            for p in params
+                match p
+                    Param(pname, ptype, pdefault) =>
+                        push(ir_params, IrParam(pname, ir_type_any()))
+                        b.local_types[pname] = ir_type_any()
+            let entry = IrBlock("entry", [], ir_inst("return", "", ir_type_void(), [], "", 0))
+            b.current_block = entry
+            let body_len = len(body)
+            let i = 0
+            while i < body_len
+                ir_build_stmt(b, body[i])
+                i = i + 1
+            // Ensure function has a return terminator
+            push(b.blocks, b.current_block)
+            IrFunction(name, ir_params, ir_type_any(), b.blocks, [], 0)
+
+// ── Simple Test ──────────────────────────────────────────────────────────────
+
+fn test_ir()
+    let b = new_ir_builder()
+    print("IR module created")
+    let t = ir_type_int()
+    match t
+        IrType(kind, name, params, id) =>
+            print("type: " + kind)
+    let inst = ir_inst("const_int", "%r0", ir_type_int(), [], "", 42)
+    match inst
+        IrInst(op, dest, typ, args, value, num, effect) =>
+            print("inst: " + op + " " + dest + " = " + str(num))
+    print("IR test passed")
+
+test_ir()

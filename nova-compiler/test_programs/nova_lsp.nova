@@ -1,0 +1,457 @@
+// NOVA Language Server Protocol (LSP) Server
+// Provides diagnostics, completion, and hover for NOVA source files.
+// Communicates via JSON-RPC 2.0 over stdin/stdout.
+
+// ── JSON Utilities ──────────────────────────────────────────────────────────
+
+fn json_escape(s: string) -> string
+    let result = ""
+    let i = 0
+    while i < len(s)
+        let ch = s[i]
+        if ch == "\""
+            result = result + "\\\""
+        else if ch == "\\"
+            result = result + "\\\\"
+        else if ch == "\n"
+            result = result + "\\n"
+        else if ch == "\r"
+            result = result + "\\r"
+        else if ch == "\t"
+            result = result + "\\t"
+        else
+            result = result + ch
+        i = i + 1
+    result
+
+fn json_str(key: string, val: string) -> string
+    "\"" + key + "\":\"" + json_escape(val) + "\""
+
+fn json_int(key: string, val: int) -> string
+    "\"" + key + "\":" + str(val)
+
+fn json_bool(key: string, val: int) -> string
+    if val == 1
+        "\"" + key + "\":true"
+    else
+        "\"" + key + "\":false"
+
+fn json_null(key: string) -> string
+    "\"" + key + "\":null"
+
+fn json_obj(pairs: list) -> string
+    "{" + join(pairs, ",") + "}"
+
+fn json_arr(items: list) -> string
+    "[" + join(items, ",") + "]"
+
+// ── JSON Parsing (minimal, sufficient for LSP messages) ─────────────────────
+
+fn skip_ws(s: string, pos: int) -> int
+    while pos < len(s)
+        let ch = s[pos]
+        if ch != " " and ch != "\t" and ch != "\n" and ch != "\r"
+            return pos
+        pos = pos + 1
+    pos
+
+fn parse_json_string(s: string, pos: int) -> list
+    if pos >= len(s) or s[pos] != "\""
+        return ["", pos]
+    pos = pos + 1
+    let result = ""
+    while pos < len(s)
+        let ch = s[pos]
+        if ch == "\""
+            return [result, pos + 1]
+        if ch == "\\"
+            pos = pos + 1
+            if pos < len(s)
+                let esc = s[pos]
+                if esc == "n"
+                    result = result + "\n"
+                else if esc == "r"
+                    result = result + "\r"
+                else if esc == "t"
+                    result = result + "\t"
+                else
+                    result = result + esc
+        else
+            result = result + ch
+        pos = pos + 1
+    [result, pos]
+
+fn parse_json_number(s: string, pos: int) -> list
+    let start = pos
+    if pos < len(s) and s[pos] == "-"
+        pos = pos + 1
+    while pos < len(s)
+        let ch = s[pos]
+        if ch >= "0" and ch <= "9"
+            pos = pos + 1
+        else
+            break
+    [slice(s, start, pos), pos]
+
+fn extract_json_field(json: string, field: string) -> string
+    let key = "\"" + field + "\""
+    let idx = find(json, key)
+    if idx < 0
+        return ""
+    let pos = idx + len(key)
+    pos = skip_ws(json, pos)
+    if pos >= len(json) or json[pos] != ":"
+        return ""
+    pos = skip_ws(json, pos + 1)
+    if pos >= len(json)
+        return ""
+    let ch = json[pos]
+    if ch == "\""
+        let res = parse_json_string(json, pos)
+        return res[0]
+    if ch == "{" or ch == "["
+        let depth = 0
+        let start = pos
+        while pos < len(json)
+            let c = json[pos]
+            if c == "{" or c == "["
+                depth = depth + 1
+            else if c == "}" or c == "]"
+                depth = depth - 1
+                if depth == 0
+                    return slice(json, start, pos + 1)
+            pos = pos + 1
+        return slice(json, start, pos)
+    if ch == "t"
+        return "true"
+    if ch == "f"
+        return "false"
+    if ch == "n"
+        return "null"
+    let nr = parse_json_number(json, pos)
+    nr[0]
+
+fn extract_json_int(json: string, field: string) -> int
+    let val = extract_json_field(json, field)
+    if len(val) > 0
+        return parse_int(val)
+    0
+
+// ── LSP Transport ───────────────────────────────────────────────────────────
+
+fn lsp_send(msg: string)
+    let content = msg
+    let header = "Content-Length: " + str(len(content)) + "\r\n\r\n"
+    // Write raw to stdout (no trailing newline)
+    system("echo|set /p=\"" + header + content + "\"")
+
+fn lsp_log(msg: string)
+    // stderr logging for debugging
+    0
+
+// ── NOVA Tokenizer (simplified for LSP) ─────────────────────────────────────
+
+fn lsp_tokenize(source: string) -> list
+    let tokens = []
+    let pos = 0
+    let line = 0
+    let col = 0
+    while pos < len(source)
+        let ch = source[pos]
+        if ch == " " or ch == "\t"
+            pos = pos + 1
+            col = col + 1
+            continue
+        if ch == "\n"
+            pos = pos + 1
+            line = line + 1
+            col = 0
+            continue
+        if ch == "\r"
+            pos = pos + 1
+            continue
+        if ch == "/" and pos + 1 < len(source) and source[pos + 1] == "/"
+            while pos < len(source) and source[pos] != "\n"
+                pos = pos + 1
+            continue
+        if ch == "\""
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            while pos < len(source) and source[pos] != "\""
+                if source[pos] == "\\"
+                    pos = pos + 1
+                    col = col + 1
+                pos = pos + 1
+                col = col + 1
+            if pos < len(source)
+                pos = pos + 1
+                col = col + 1
+            push(tokens, [line, start_col, "string"])
+            continue
+        if (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or ch == "_"
+            let start_col = col
+            let word = ""
+            while pos < len(source)
+                let wc = source[pos]
+                if (wc >= "a" and wc <= "z") or (wc >= "A" and wc <= "Z") or (wc >= "0" and wc <= "9") or wc == "_"
+                    word = word + wc
+                    pos = pos + 1
+                    col = col + 1
+                else
+                    break
+            push(tokens, [line, start_col, word])
+            continue
+        if ch >= "0" and ch <= "9"
+            let start_col = col
+            while pos < len(source) and source[pos] >= "0" and source[pos] <= "9"
+                pos = pos + 1
+                col = col + 1
+            push(tokens, [line, start_col, "number"])
+            continue
+        pos = pos + 1
+        col = col + 1
+    tokens
+
+// ── Diagnostic Analysis ─────────────────────────────────────────────────────
+
+fn lsp_check_source(source: string) -> list
+    let diags = []
+    let lines = split(source, "\n")
+    let indent_stack = [0]
+    let line_num = 0
+    for line in lines
+        let trimmed = trim(line)
+        // Check for common errors
+        if starts_with(trimmed, "fn ") and find(trimmed, "(") < 0 and len(trimmed) > 3
+            let fn_name = trim(slice(trimmed, 3, len(trimmed)))
+            if len(fn_name) > 0 and find(fn_name, " ") < 0
+                push(diags, [line_num, 0, "Function '" + fn_name + "' missing parameter list — add ()"])
+        // Check for unclosed strings
+        let in_str = 0
+        let ci = 0
+        while ci < len(trimmed)
+            let c = trimmed[ci]
+            if c == "\"" and (ci == 0 or trimmed[ci - 1] != "\\")
+                in_str = 1 - in_str
+            ci = ci + 1
+        if in_str == 1 and not starts_with(trimmed, "//")
+            push(diags, [line_num, 0, "Unclosed string literal"])
+        // Check for = vs == in if conditions
+        if starts_with(trimmed, "if ") or starts_with(trimmed, "while ")
+            let cond_part = ""
+            if starts_with(trimmed, "if ")
+                cond_part = slice(trimmed, 3, len(trimmed))
+            else
+                cond_part = slice(trimmed, 6, len(trimmed))
+            if find(cond_part, " = ") >= 0 and find(cond_part, " == ") < 0 and find(cond_part, " != ") < 0 and find(cond_part, " >= ") < 0 and find(cond_part, " <= ") < 0
+                push(diags, [line_num, 0, "Possible assignment in condition — did you mean '=='?"])
+        line_num = line_num + 1
+    diags
+
+// ── Completion ──────────────────────────────────────────────────────────────
+
+fn nova_keywords() -> list
+    let kws = split("fn,let,if,else,for,while,match,return,break,continue,type,enum,trait,import,as,try,catch,spawn,send,receive,channel,select,in,and,or,not,true,false,null,copy", ",")
+    kws
+
+fn nova_builtins() -> list
+    let bis = split("print,len,str,int,push,ord,chr,assert,contains,read_file,write_file,args,exit,split,join,upper,lower,trim,replace,starts_with,ends_with,slice,repeat,chars,time_ms,sleep,clock_ns,type_of,range,sort,keys,values,system,exec,http_get,http_post,mkdir,path_join,path_exists,parse_int,parse_float,file_exists,find,append_file,read_line", ",")
+    bis
+
+fn nova_types() -> list
+    let tys = split("int,string,float,bool,list,dict,any,void", ",")
+    tys
+
+fn build_completion_items() -> string
+    let items = []
+    for kw in nova_keywords()
+        let item = json_obj([json_str("label", kw), json_int("kind", 14), json_str("detail", "keyword")])
+        push(items, item)
+    for bi in nova_builtins()
+        let item = json_obj([json_str("label", bi), json_int("kind", 3), json_str("detail", "builtin function")])
+        push(items, item)
+    for ty in nova_types()
+        let item = json_obj([json_str("label", ty), json_int("kind", 25), json_str("detail", "type")])
+        push(items, item)
+    // Snippets
+    let fn_snip = json_obj([json_str("label", "fn"), json_int("kind", 15), json_str("detail", "function definition"), json_str("insertText", "fn ${1:name}(${2:params})\n    ${0}"), json_int("insertTextFormat", 2)])
+    push(items, fn_snip)
+    let for_snip = json_obj([json_str("label", "for"), json_int("kind", 15), json_str("detail", "for loop"), json_str("insertText", "for ${1:item} in ${2:list}\n    ${0}"), json_int("insertTextFormat", 2)])
+    push(items, for_snip)
+    let if_snip = json_obj([json_str("label", "if"), json_int("kind", 15), json_str("detail", "if statement"), json_str("insertText", "if ${1:condition}\n    ${0}"), json_int("insertTextFormat", 2)])
+    push(items, if_snip)
+    json_arr(items)
+
+// ── Hover ───────────────────────────────────────────────────────────────────
+
+fn hover_info(word: string) -> string
+    if word == "fn"
+        return "**fn** - Define a function\n\n```nova\nfn name(params) -> ReturnType\n    body\n```"
+    if word == "let"
+        return "**let** - Declare a variable\n\n```nova\nlet x = 42\nlet name = \"hello\"\n```"
+    if word == "print"
+        return "**print(value)** - Print a value to stdout\n\nAccepts any type."
+    if word == "len"
+        return "**len(x)** -> int - Get length of string, list, or dict"
+    if word == "push"
+        return "**push(list, value)** - Append a value to a list"
+    if word == "split"
+        return "**split(str, sep)** -> list - Split string by separator"
+    if word == "join"
+        return "**join(list, sep)** -> string - Join list elements with separator"
+    if word == "trim"
+        return "**trim(str)** -> string - Remove leading/trailing whitespace"
+    if word == "slice"
+        return "**slice(str, start, end)** -> string - Get substring"
+    if word == "http_get"
+        return "**http_get(url)** -> string - HTTP GET request"
+    if word == "spawn"
+        return "**spawn** - Create a concurrent process\n\n```nova\nlet p = spawn worker()\n```"
+    if word == "channel"
+        return "**channel()** -> Channel - Create a communication channel"
+    if word == "send"
+        return "**send(ch, value)** - Send a value on a channel"
+    if word == "receive"
+        return "**receive(ch)** -> value - Receive a value from a channel"
+    if word == "match"
+        return "**match** - Pattern matching\n\n```nova\nmatch value\n    Pattern1 => result1\n    Pattern2 => result2\n```"
+    if word == "try"
+        return "**try expr** - Propagate error to caller"
+    if word == "catch"
+        return "**expr catch e => handler** - Handle error"
+    if word == "import"
+        return "**import** - Import a module\n\n```nova\nimport math\nimport mylib as ml\n```"
+    if word == "type"
+        return "**type** - Define a struct\n\n```nova\ntype Point(x: int, y: int)\n```"
+    if word == "for"
+        return "**for** - Iterate over a collection\n\n```nova\nfor item in list\n    process(item)\n```"
+    if word == "while"
+        return "**while** - Loop while condition is true\n\n```nova\nwhile x > 0\n    x = x - 1\n```"
+    if word == "read_file"
+        return "**read_file(path)** -> string - Read file contents"
+    if word == "write_file"
+        return "**write_file(path, content)** - Write string to file"
+    if word == "mkdir"
+        return "**mkdir(path)** -> int - Create directory (1=ok, 0=fail)"
+    if word == "path_join"
+        return "**path_join(base, child)** -> string - Join path components"
+    ""
+
+// ── Request Handlers ────────────────────────────────────────────────────────
+
+fn handle_initialize(id: string) -> string
+    let sync = json_obj([json_int("openClose", 1), json_int("change", 1)])
+    let caps_parts = ["\"textDocumentSync\":" + sync, json_bool("completionProvider", 1), json_bool("hoverProvider", 1)]
+    let caps = json_obj(caps_parts)
+    let sinfo = json_obj([json_str("name", "nova-lsp"), json_str("version", "0.1.0")])
+    let result = json_obj(["\"capabilities\":" + caps, "\"serverInfo\":" + sinfo])
+    json_obj([json_str("jsonrpc", "2.0"), "\"id\":" + id, "\"result\":" + result])
+
+fn handle_completion(id: string) -> string
+    let items = build_completion_items()
+    json_obj([json_str("jsonrpc", "2.0"), "\"id\":" + id, "\"result\":" + items])
+
+fn handle_hover(id: string, params: string) -> string
+    let text_doc = extract_json_field(params, "textDocument")
+    let position = extract_json_field(params, "position")
+    // For now return empty — full hover requires source tracking
+    json_obj([json_str("jsonrpc", "2.0"), "\"id\":" + id, json_null("result")])
+
+fn build_diagnostics_notification(uri: string, diags: list) -> string
+    let diag_items = []
+    for d in diags
+        let line = d[0]
+        let col = d[1]
+        let msg = d[2]
+        let start_pos = json_obj([json_int("line", line), json_int("character", col)])
+        let end_pos = json_obj([json_int("line", line), json_int("character", col + 1)])
+        let range_obj = json_obj(["\"start\":" + start_pos, "\"end\":" + end_pos])
+        let diag = json_obj(["\"range\":" + range_obj, json_int("severity", 2), json_str("source", "nova"), json_str("message", msg)])
+        push(diag_items, diag)
+    let params = json_obj([json_str("uri", uri), "\"diagnostics\":" + json_arr(diag_items)])
+    json_obj([json_str("jsonrpc", "2.0"), json_str("method", "textDocument/publishDiagnostics"), "\"params\":" + params])
+
+// ── Document Store ──────────────────────────────────────────────────────────
+
+let documents = {}
+
+fn on_did_open(params: string)
+    let text_doc = extract_json_field(params, "textDocument")
+    let uri = extract_json_field(text_doc, "uri")
+    let text = extract_json_field(text_doc, "text")
+    documents[uri] = text
+    let diags = lsp_check_source(text)
+    let notif = build_diagnostics_notification(uri, diags)
+    lsp_send(notif)
+
+fn on_did_change(params: string)
+    let text_doc = extract_json_field(params, "textDocument")
+    let uri = extract_json_field(text_doc, "uri")
+    let changes = extract_json_field(params, "contentChanges")
+    let text = extract_json_field(changes, "text")
+    if len(text) > 0
+        documents[uri] = text
+        let diags = lsp_check_source(text)
+        let notif = build_diagnostics_notification(uri, diags)
+        lsp_send(notif)
+
+fn on_did_close(params: string)
+    let text_doc = extract_json_field(params, "textDocument")
+    let uri = extract_json_field(text_doc, "uri")
+    let empty_diags = build_diagnostics_notification(uri, [])
+    lsp_send(empty_diags)
+
+// ── Main Loop ───────────────────────────────────────────────────────────────
+
+fn main()
+    let running = 1
+    while running == 1
+        let header = read_line()
+        if len(header) == 0
+            running = 0
+            continue
+        let content_length = 0
+        if starts_with(header, "Content-Length:")
+            let len_str = trim(slice(header, 16, len(header)))
+            content_length = parse_int(len_str)
+        // Read until blank line (end of headers)
+        let h = read_line()
+        while len(trim(h)) > 0
+            h = read_line()
+        // Read content body
+        // Note: read_line doesn't work for binary-length reads
+        // For now, we read line by line and accumulate
+        // This is a limitation — proper LSP needs raw byte reads
+        let body = read_line()
+        // Process the JSON-RPC message
+        if len(body) == 0
+            continue
+        let method = extract_json_field(body, "method")
+        let id = extract_json_field(body, "id")
+        let params = extract_json_field(body, "params")
+        if method == "initialize"
+            let resp = handle_initialize(id)
+            lsp_send(resp)
+        else if method == "initialized"
+            0
+        else if method == "shutdown"
+            let resp = json_obj([json_str("jsonrpc", "2.0"), "\"id\":" + id, json_null("result")])
+            lsp_send(resp)
+        else if method == "exit"
+            running = 0
+        else if method == "textDocument/didOpen"
+            on_did_open(params)
+        else if method == "textDocument/didChange"
+            on_did_change(params)
+        else if method == "textDocument/didClose"
+            on_did_close(params)
+        else if method == "textDocument/completion"
+            let resp = handle_completion(id)
+            lsp_send(resp)
+        else if method == "textDocument/hover"
+            let resp = handle_hover(id, params)
+            lsp_send(resp)
+        else if len(id) > 0
+            let resp = json_obj([json_str("jsonrpc", "2.0"), "\"id\":" + id, json_null("result")])
+            lsp_send(resp)

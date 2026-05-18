@@ -89,11 +89,13 @@ class Parser(private val tokens: List<Token>) {
             FN       -> parseFnDecl(start)
             TYPE     -> parseTypeDecl(start)
             ENUM     -> parseEnumDecl(start)
+            TRAIT    -> parseTraitDecl(start)
             IMPORT   -> parseImport(start)
             SPAWN    -> parseSpawnStmt(start)
             FOR      -> parseForStmt(start)
             WHILE    -> parseWhileStmt(start)
             RETURN   -> parseReturnStmt(start)
+            YIELD    -> { advance(); val v = parseExpr(0); eat(NEWLINE); YieldStmt(v, spanFrom(start)) }
             BREAK    -> { advance(); eat(NEWLINE); BreakStmt(spanFrom(start)) }
             CONTINUE -> { advance(); eat(NEWLINE); ContinueStmt(spanFrom(start)) }
             // IF and all expressions: parse as expression-or-assignment
@@ -126,6 +128,13 @@ class Parser(private val tokens: List<Token>) {
     // ── fn ────────────────────────────────────────────────────────────────────
     private fun parseFnDecl(start: SourceSpan, annotations: List<Annotation> = emptyList()): FnDecl {
         expect(FN)
+        val typeParams = if (check(LT)) {
+            advance()
+            val tps = mutableListOf(expect(IDENT).value)
+            while (check(COMMA)) { advance(); tps.add(expect(IDENT).value) }
+            expect(GT)
+            tps
+        } else emptyList()
         val firstName = expect(IDENT).value
         var receiverType: String? = null
         val name: String
@@ -142,7 +151,7 @@ class Parser(private val tokens: List<Token>) {
         val returnType = if (check(THIN_ARROW)) { advance(); parseTypeExpr() } else null
         eat(NEWLINE)
         val body = parseBlock()
-        return FnDecl(annotations, name, params, returnType, body, spanFrom(start), receiverType)
+        return FnDecl(annotations, name, params, returnType, body, spanFrom(start), receiverType, typeParams)
     }
 
     private fun parseParamList(): List<Param> {
@@ -162,6 +171,13 @@ class Parser(private val tokens: List<Token>) {
     private fun parseTypeDecl(start: SourceSpan): TypeDecl {
         expect(TYPE)
         val name = expect(IDENT).value
+        val typeParams = if (check(LT)) {
+            advance()
+            val tps = mutableListOf(expect(IDENT).value)
+            while (check(COMMA)) { advance(); tps.add(expect(IDENT).value) }
+            expect(GT)
+            tps
+        } else emptyList()
         eat(NEWLINE)
         val fields = mutableListOf<Field>()
         if (check(INDENT)) {
@@ -170,7 +186,12 @@ class Parser(private val tokens: List<Token>) {
                 skipNewlines()
                 if (check(DEDENT, EOF)) break
                 val fs = cur().span
-                val fn_ = expect(IDENT).value
+                if (peek()?.type != COLON) {
+                    advance()
+                    eat(NEWLINE)
+                    continue
+                }
+                val fn_ = advance().value
                 expect(COLON)
                 val ft = parseTypeExpr()
                 fields.add(Field(fn_, ft, spanFrom(fs)))
@@ -178,7 +199,7 @@ class Parser(private val tokens: List<Token>) {
             }
             eat(DEDENT)
         }
-        return TypeDecl(name, fields, spanFrom(start))
+        return TypeDecl(name, fields, spanFrom(start), typeParams)
     }
 
     // ── enum ──────────────────────────────────────────────────────────────────
@@ -214,6 +235,39 @@ class Parser(private val tokens: List<Token>) {
             eat(DEDENT)
         }
         return EnumDecl(name, variants, spanFrom(start))
+    }
+
+    // ── trait ─────────────────────────────────────────────────────────────────
+    private fun parseTraitDecl(start: SourceSpan): TraitDecl {
+        expect(TRAIT)
+        val name = expect(IDENT).value
+        eat(NEWLINE)
+        val methods = mutableListOf<TraitMethod>()
+        if (check(INDENT)) {
+            advance()
+            while (!check(DEDENT, EOF)) {
+                skipNewlines()
+                if (check(DEDENT, EOF)) break
+                val ms = cur().span
+                expect(FN)
+                val mname = expect(IDENT).value
+                expect(LPAREN)
+                val params = mutableListOf<Param>()
+                while (!check(RPAREN, EOF)) {
+                    val ps = cur().span
+                    val pname = expect(IDENT).value
+                    val ptype = if (check(COLON)) { advance(); parseTypeExpr() } else null
+                    params.add(Param(pname, ptype, spanFrom(ps)))
+                    if (eat(COMMA) == null) break
+                }
+                expect(RPAREN)
+                val retType = if (check(THIN_ARROW)) { advance(); parseTypeExpr() } else null
+                methods.add(TraitMethod(mname, params, retType, spanFrom(ms)))
+                eat(NEWLINE)
+            }
+            eat(DEDENT)
+        }
+        return TraitDecl(name, methods, spanFrom(start))
     }
 
     // ── import ────────────────────────────────────────────────────────────────
@@ -329,10 +383,14 @@ class Parser(private val tokens: List<Token>) {
     //   |>            lbp=10, rbp=11  pipe (left-assoc)
     //   .. (range)    lbp=12, rbp=13  range — right side parses greedy (+/- bind)
     //   ==,!=,<,> etc lbp=14, rbp=15  comparison (non-assoc effectively)
-    //   +, -          lbp=16, rbp=17  additive (left-assoc)
-    //   *, /, %       lbp=18, rbp=19  multiplicative (left-assoc)
-    //   **            lbp=20, rbp=19  power (right-assoc)
-    //   . () []       lbp=24          postfix (left-assoc, highest)
+    //   |  (bit or)   lbp=16, rbp=17  bitwise OR (left-assoc)
+    //   ^  (bit xor)  lbp=18, rbp=19  bitwise XOR (left-assoc)
+    //   &  (bit and)  lbp=20, rbp=21  bitwise AND (left-assoc)
+    //   << >>          lbp=22, rbp=23  shifts (left-assoc)
+    //   +, -          lbp=24, rbp=25  additive (left-assoc)
+    //   *, /, %       lbp=26, rbp=27  multiplicative (left-assoc)
+    //   **            lbp=28, rbp=27  power (right-assoc)
+    //   . () []       lbp=32          postfix (left-assoc, highest)
     //
     // NOTE: thenExpr and elseExpr of single-line if use minBp=5 so that `else`
     // (lbp=4 < 5) does NOT bind inside them. The outer Pratt loop handles the
@@ -348,13 +406,17 @@ class Parser(private val tokens: List<Token>) {
         PIPE_GT                -> Pair(10, 11)
         DOT_DOT                -> Pair(12, 13)
         EQ, NEQ, LT, GT,
-        LEQ, GEQ, IN           -> Pair(14, 15)
-        PLUS, MINUS            -> Pair(16, 17)
-        STAR, SLASH, PERCENT   -> Pair(18, 19)
-        STAR_STAR              -> Pair(20, 19)
-        DOT                    -> Pair(24, 25)
-        LPAREN                 -> Pair(24, 0)
-        LBRACKET               -> Pair(24, 0)
+        LEQ, GEQ, IN, MATCHES -> Pair(14, 15)
+        PIPE                   -> Pair(16, 17)
+        CARET                  -> Pair(18, 19)
+        AMPERSAND              -> Pair(20, 21)
+        LSHIFT, RSHIFT         -> Pair(22, 23)
+        PLUS, MINUS            -> Pair(24, 25)
+        STAR, SLASH, PERCENT   -> Pair(26, 27)
+        STAR_STAR              -> Pair(28, 27)
+        DOT                    -> Pair(32, 33)
+        LPAREN                 -> Pair(32, 0)
+        LBRACKET               -> Pair(32, 0)
         else                   -> null
     }
 
@@ -448,6 +510,8 @@ class Parser(private val tokens: List<Token>) {
                 val v = when {
                     raw.startsWith("0x") || raw.startsWith("0X") ->
                         raw.substring(2).toLong(16)
+                    raw.startsWith("0b") || raw.startsWith("0B") ->
+                        raw.substring(2).toLong(2)
                     else -> raw.toLong()
                 }
                 IntLit(v, tok.span)
@@ -468,8 +532,9 @@ class Parser(private val tokens: List<Token>) {
                 Ident(tok.value, tok.span)
             }
 
-            MINUS -> { advance(); UnaryOp("-", parseExpr(22), spanFrom(start)) }
-            NOT   -> { advance(); UnaryOp("not", parseExpr(22), spanFrom(start)) }
+            MINUS -> { advance(); UnaryOp("-", parseExpr(30), spanFrom(start)) }
+            NOT   -> { advance(); UnaryOp("not", parseExpr(30), spanFrom(start)) }
+            TILDE -> { advance(); UnaryOp("~", parseExpr(30), spanFrom(start)) }
 
             COPY -> {
                 advance()
@@ -594,6 +659,7 @@ class Parser(private val tokens: List<Token>) {
         while (!check(DEDENT, EOF)) {
             val as_ = cur().span
             val pat = parsePattern()
+            val guard = if (check(IF)) { advance(); parseExpr(3) } else null
             expect(FAT_ARROW)
             val body: ForExprBody = if (check(NEWLINE)) {
                 advance(); BlockBody(parseBlock(), spanFrom(as_))
@@ -602,7 +668,7 @@ class Parser(private val tokens: List<Token>) {
                 eat(NEWLINE)
                 ExprBody(e, spanFrom(as_))
             }
-            arms.add(MatchArm(pat, body, spanFrom(as_)))
+            arms.add(MatchArm(pat, body, spanFrom(as_), guard))
             skipNewlines()
         }
         eat(DEDENT)

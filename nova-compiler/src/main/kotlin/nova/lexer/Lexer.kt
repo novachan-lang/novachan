@@ -26,6 +26,8 @@ class Lexer(private val source: String, private val file: String) {
     private var stringOpenPos = SourcePos(1, 1)
     // Whether the current string has had any {interpolation} yet
     private var stringHasInterp = false
+    // True when the current string was prefixed with f (f-string)
+    private var isFString = false
     // When > 0, we are inside a string interpolation. Tracks nested { } depth.
     // Returns to string mode when this hits 0.
     private var interpBraceDepth = 0
@@ -178,11 +180,12 @@ class Lexer(private val source: String, private val file: String) {
     }
 
     // ── String literals ───────────────────────────────────────────────────────
-    private fun startDoubleString(openPos: SourcePos) {
+    private fun startDoubleString(openPos: SourcePos, fString: Boolean = false) {
         inString = true
         stringBuf.clear()
         stringOpenPos = openPos
         stringHasInterp = false
+        isFString = fString
     }
 
     // Called repeatedly while inString == true
@@ -205,16 +208,21 @@ class Lexer(private val source: String, private val file: String) {
                 stringBuf.clear()
             }
             '{' -> {
-                // Start of interpolation
-                emit(STRING_PART, stringBuf.toString(), stringOpenPos)
-                stringBuf.clear()
-                stringHasInterp = true
-                val interpStart = startPos()
-                advance() // consume {
-                emit(INTERP_START, "{", interpStart)
-                inString = false
-                interpBraceDepth = 1
-                bracketDepth++ // suppress NEWLINE/INDENT/DEDENT inside interpolation
+                if (isFString) {
+                    // Start of interpolation (f-strings only)
+                    emit(STRING_PART, stringBuf.toString(), stringOpenPos)
+                    stringBuf.clear()
+                    stringHasInterp = true
+                    val interpStart = startPos()
+                    advance() // consume {
+                    emit(INTERP_START, "{", interpStart)
+                    inString = false
+                    interpBraceDepth = 1
+                    bracketDepth++ // suppress NEWLINE/INDENT/DEDENT inside interpolation
+                } else {
+                    stringBuf.append(c)
+                    advance()
+                }
             }
             '\\' -> {
                 advance() // consume backslash
@@ -274,6 +282,17 @@ class Lexer(private val source: String, private val file: String) {
             return
         }
 
+        // Binary literal
+        if (cur() == '0' && (peek() == 'b' || peek() == 'B')) {
+            buf.append(advance()); buf.append(advance()) // 0b
+            while (cur() == '0' || cur() == '1' || cur() == '_') {
+                if (cur() != '_') buf.append(cur())
+                advance()
+            }
+            emit(INT_LITERAL, buf.toString(), start)
+            return
+        }
+
         // Integer or float
         while (cur()?.isDigit() == true || cur() == '_') {
             if (cur() != '_') buf.append(cur())
@@ -306,6 +325,11 @@ class Lexer(private val source: String, private val file: String) {
             buf.append(advance())
         }
         val text = buf.toString()
+        if (text == "f" && cur() == '"') {
+            advance()
+            startDoubleString(start, fString = true)
+            return
+        }
         val kwType = KEYWORDS[text]
         emit(kwType ?: IDENT, text, start)
     }
@@ -353,16 +377,21 @@ class Lexer(private val source: String, private val file: String) {
             }
             '<' -> {
                 if (cur() == '=') { advance(); emit(LEQ, "<=", start) }
+                else if (cur() == '<') { advance(); emit(LSHIFT, "<<", start) }
                 else emit(LT, "<", start)
             }
             '>' -> {
                 if (cur() == '=') { advance(); emit(GEQ, ">=", start) }
+                else if (cur() == '>') { advance(); emit(RSHIFT, ">>", start) }
                 else emit(GT, ">", start)
             }
             '|' -> {
                 if (cur() == '>') { advance(); emit(PIPE_GT, "|>", start) }
-                else error("unexpected character '|'; did you mean '|>'?", start)
+                else emit(PIPE, "|", start)
             }
+            '&' -> emit(AMPERSAND, "&", start)
+            '^' -> emit(CARET, "^", start)
+            '~' -> emit(TILDE, "~", start)
             '.' -> {
                 if (cur() == '.') { advance(); emit(DOT_DOT, "..", start) }
                 else emit(DOT, ".", start)

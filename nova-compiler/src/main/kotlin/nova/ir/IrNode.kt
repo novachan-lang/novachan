@@ -26,10 +26,11 @@ data class BlockId(val id: Int) {
 enum class BinOp {
     ADD, SUB, MUL, DIV, MOD, POW,
     EQ, NE, LT, GT, LE, GE,
-    AND, OR, CONCAT
+    AND, OR, CONCAT,
+    BIT_AND, BIT_OR, BIT_XOR, SHL, SHR
 }
 
-enum class UnOp { NEG, NOT }
+enum class UnOp { NEG, NOT, BIT_NOT }
 
 // ── Instructions ─────────────────────────────────────────────────────────────
 //
@@ -379,5 +380,6 @@ data class IrFunction(
 data class IrModule(
     val name: String,
     val functions: MutableList<IrFunction> = mutableListOf(),
-    val structs: MutableList<Pair<String, List<Pair<String, IrType>>>> = mutableListOf()
+    val structs: MutableList<Pair<String, List<Pair<String, IrType>>>> = mutableListOf(),
+    val externFunctions: MutableList<Pair<String, Int>> = mutableListOf()  // (name, paramCount)
 )

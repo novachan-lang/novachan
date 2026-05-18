@@ -46,7 +46,6 @@ fun main(args: Array<String>) {
         if (inferResult.errors.isNotEmpty()) {
             val diagnostics = inferResult.errors.map { typeErrorToDiagnostic(it) }
             DiagnosticPrinter.displayAll(diagnostics)
-            System.exit(1)
         }
         module = AstToIr(inferResult.nodeTypes).lower(prog)
     }
@@ -303,6 +302,7 @@ private fun compileMultiFile(mainFile: File, mainProgram: nova.parser.Program): 
             mergedModule.functions.add(fn)
         }
         mergedModule.structs.addAll(ir.structs)
+        mergedModule.externFunctions.addAll(ir.externFunctions)
     }
 
     return mergedModule

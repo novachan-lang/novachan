@@ -17,7 +17,7 @@ dependencies {
 }
 
 application {
-    mainClass.set("nova.MainKt")
+    mainClass.set("nova.EmitLlvmKt")
 }
 
 tasks.register<Jar>("fatJar") {

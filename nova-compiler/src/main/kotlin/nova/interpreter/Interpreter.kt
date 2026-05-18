@@ -91,6 +91,8 @@ class Interpreter(
 
             is ImportStmt -> { /* stdlib modules handled in globals — no-op for now */ }
 
+            is TraitDecl -> { /* compile-time only — no runtime effect */ }
+
             is AssignStmt -> {
                 val value = evalExpr(stmt.value, env)
                 when {
@@ -120,6 +122,7 @@ class Interpreter(
                 throw ReturnSignal(v)
             }
 
+            is YieldStmt    -> { /* yield not supported in interpreter */ }
             is BreakStmt    -> throw BreakSignal()
             is ContinueStmt -> throw ContinueSignal()
 

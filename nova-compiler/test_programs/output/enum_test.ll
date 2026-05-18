@@ -33,6 +33,7 @@ declare i64 @nova_rt_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_upper(i64) nounwind
 declare i64 @nova_rt_lower(i64) nounwind
 declare i64 @nova_rt_trim(i64) nounwind
+declare i64 @nova_rt_repeat(i64, i64) nounwind
 declare i64 @nova_rt_split(i64, i64) nounwind
 declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind readonly
@@ -62,6 +63,8 @@ declare i32 @strcmp(ptr, ptr) nounwind readonly
 declare i64 @nova_rt_dict_create() nounwind
 declare i64 @nova_rt_dict_set(i64, i64, i64) nounwind
 declare i64 @nova_rt_dict_get(i64, i64) nounwind readonly
+declare i64 @nova_rt_dict_get_concat2(i64, i64, i64) nounwind readonly
+declare i64 @nova_rt_dict_set_concat2(i64, i64, i64, i64) nounwind
 declare i64 @nova_rt_dict_has(i64, i64) nounwind readonly
 declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_dict_len(i64) nounwind readonly
@@ -80,10 +83,54 @@ declare i64 @nova_rt_json_stringify(i64) nounwind
 ; nova runtime — HTTP ops
 declare i64 @nova_rt_http_get(i64) nounwind
 declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+; nova runtime — time ops
+declare i64 @nova_rt_time_ms() nounwind
+declare i64 @nova_rt_clock_ns() nounwind
+declare void @nova_rt_sleep_ms(i64) nounwind
+declare void @nova_rt_assert(i64, i64) nounwind
 ; nova runtime — type dispatch
 declare i64 @nova_rt_any_to_str(i64) nounwind
 declare i64 @nova_rt_str_concat_safe(i64, i64) nounwind
+declare i64 @nova_rt_str_char_at(i64, i64) nounwind
 declare void @nova_rt_init() nounwind
+declare void @nova_rt_init_args(i64, i64) nounwind
+; nova runtime — system ops
+declare i64 @nova_rt_args() nounwind
+declare i64 @nova_rt_env(i64) nounwind
+declare i64 @nova_rt_random_int(i64, i64) nounwind
+declare i64 @nova_rt_random_float() nounwind
+declare i64 @nova_rt_shell(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_path_ext(i64) nounwind
+; nova runtime — regex ops
+declare i64 @nova_rt_regex_match(i64, i64) nounwind readonly
+declare i64 @nova_rt_regex_find(i64, i64) nounwind
+declare i64 @nova_rt_regex_replace(i64, i64, i64) nounwind
+declare i64 @nova_rt_regex_split(i64, i64) nounwind
+; nova runtime — network ops
+declare i64 @nova_rt_tcp_connect(i64, i64) nounwind
+declare i64 @nova_rt_tcp_listen(i64) nounwind
+declare i64 @nova_rt_tcp_accept(i64) nounwind
+declare i64 @nova_rt_tcp_send(i64, i64) nounwind
+declare i64 @nova_rt_tcp_recv(i64) nounwind
+declare void @nova_rt_tcp_close(i64) nounwind
+declare i64 @nova_rt_udp_bind(i64) nounwind
+declare i64 @nova_rt_udp_send(i64, i64, i64, i64) nounwind
+declare i64 @nova_rt_udp_recv(i64) nounwind
+; nova runtime — HTTP server
+declare i64 @nova_rt_http_listen(i64) nounwind
+declare i64 @nova_rt_http_accept(i64) nounwind
+declare void @nova_rt_http_respond(i64, i64, i64) nounwind
+; nova runtime — byte arrays
+declare i64 @nova_rt_bytes_create(i64) nounwind
+declare i64 @nova_rt_bytes_get(i64, i64) nounwind
+declare void @nova_rt_bytes_set(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_len(i64) nounwind
+declare i64 @nova_rt_bytes_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_to_str(i64) nounwind
+declare i64 @nova_rt_str_to_bytes(i64) nounwind
 ; nova runtime — channel/spawn ops
 declare i64 @nova_rt_channel_create() nounwind
 declare i64 @nova_rt_channel_send(i64, i64) nounwind
@@ -116,18 +163,22 @@ declare void @nova_rc_dec(i64) nounwind
 
 @.str.0 = private unnamed_addr constant [7 x i8] c"Circle\00"
 @.str.1 = private unnamed_addr constant [10 x i8] c"Rectangle\00"
-@.str.2 = private unnamed_addr constant [6 x i8] c"Green\00"
-@.str.3 = private unnamed_addr constant [4 x i8] c"Red\00"
-@.str.4 = private unnamed_addr constant [4 x i8] c"red\00"
-@.str.5 = private unnamed_addr constant [6 x i8] c"green\00"
-@.str.6 = private unnamed_addr constant [5 x i8] c"Blue\00"
-@.str.7 = private unnamed_addr constant [5 x i8] c"blue\00"
-@.str.8 = private unnamed_addr constant [8 x i8] c"unknown\00"
-@.str.9 = private unnamed_addr constant [6 x i8] c"%lld\0A\00"
-@.str.10 = private unnamed_addr constant [4 x i8] c"%f\0A\00"
-@.str.11 = private unnamed_addr constant [4 x i8] c"%s\0A\00"
-@.str.12 = private unnamed_addr constant [5 x i8] c"true\00"
-@.str.13 = private unnamed_addr constant [6 x i8] c"false\00"
+@.str.2 = private unnamed_addr constant [10 x i8] c"__variant\00"
+@.str.3 = private unnamed_addr constant [7 x i8] c"radius\00"
+@.str.4 = private unnamed_addr constant [6 x i8] c"width\00"
+@.str.5 = private unnamed_addr constant [7 x i8] c"height\00"
+@.str.6 = private unnamed_addr constant [6 x i8] c"Green\00"
+@.str.7 = private unnamed_addr constant [4 x i8] c"Red\00"
+@.str.8 = private unnamed_addr constant [4 x i8] c"red\00"
+@.str.9 = private unnamed_addr constant [5 x i8] c"Blue\00"
+@.str.10 = private unnamed_addr constant [6 x i8] c"green\00"
+@.str.11 = private unnamed_addr constant [5 x i8] c"blue\00"
+@.str.12 = private unnamed_addr constant [8 x i8] c"unknown\00"
+@.str.13 = private unnamed_addr constant [6 x i8] c"%lld\0A\00"
+@.str.14 = private unnamed_addr constant [4 x i8] c"%f\0A\00"
+@.str.15 = private unnamed_addr constant [4 x i8] c"%s\0A\00"
+@.str.16 = private unnamed_addr constant [5 x i8] c"true\00"
+@.str.17 = private unnamed_addr constant [6 x i8] c"false\00"
 
 define i64 @nova_main() nounwind {
 entry0:
@@ -199,35 +250,38 @@ __mb0_entry0:
   %t16 = inttoptr i64 %r45 to ptr
   %t17 = call i32 @strcmp(ptr %t15, ptr %t16)
   %t18 = icmp eq i32 %t17, 0
-  br i1 %t18, label %__mb0_arm0_body2, label %__mb0_arm0_next3
+  br i1 %t18, label %__mb0_arm0_body3, label %__mb0_arm0_next2
 
-__mb0_arm0_body2:
+__mb0_arm0_next2:
   %t19 = inttoptr i64 %r42 to ptr
-  %t20 = getelementptr i64, ptr %t19, i64 1
+  %t20 = getelementptr i64, ptr %t19, i64 0
   %r50 = load i64, ptr %t20
-  %t21 = bitcast i64 4614256650576692846 to double
-  %t22 = bitcast i64 %r50 to double
-  %t23 = fmul double %t21, %t22
-  %r54 = bitcast double %t23 to i64
-  %t24 = bitcast i64 %r50 to double
-  %t25 = fmul double %t23, %t24
-  %r56 = bitcast double %t25 to i64
-  store i64 %r56, ptr %slot.__mb0___match_0, align 8
+  %t21 = getelementptr inbounds [10 x i8], ptr @.str.1, i64 0, i64 0
+  %r51 = ptrtoint ptr %t21 to i64
+  %t22 = inttoptr i64 %r50 to ptr
+  %t23 = inttoptr i64 %r51 to ptr
+  %t24 = call i32 @strcmp(ptr %t22, ptr %t23)
+  %t25 = icmp eq i32 %t24, 0
+  br i1 %t25, label %__mb0_arm1_body5, label %__mb0_arm1_next4
+
+__mb0_arm0_body3:
+  %t26 = inttoptr i64 %r42 to ptr
+  %t27 = getelementptr i64, ptr %t26, i64 1
+  %r53 = load i64, ptr %t27
+  %t28 = bitcast i64 4614256650576692846 to double
+  %t29 = bitcast i64 %r53 to double
+  %t30 = fmul double %t28, %t29
+  %r57 = bitcast double %t30 to i64
+  %t31 = bitcast i64 %r53 to double
+  %t32 = fmul double %t30, %t31
+  %r59 = bitcast double %t32 to i64
+  store i64 %r59, ptr %slot.__mb0___match_0, align 8
   br label %__mb0_match_merge1
 
-__mb0_arm0_next3:
-  %t26 = inttoptr i64 %r42 to ptr
-  %t27 = getelementptr i64, ptr %t26, i64 0
-  %r58 = load i64, ptr %t27
-  %t28 = getelementptr inbounds [10 x i8], ptr @.str.1, i64 0, i64 0
-  %r59 = ptrtoint ptr %t28 to i64
-  %t29 = inttoptr i64 %r58 to ptr
-  %t30 = inttoptr i64 %r59 to ptr
-  %t31 = call i32 @strcmp(ptr %t29, ptr %t30)
-  %t32 = icmp eq i32 %t31, 0
-  br i1 %t32, label %__mb0_arm1_body4, label %__mb0_arm1_next5
+__mb0_arm1_next4:
+  br label %__mb0_arm2_body6
 
-__mb0_arm1_body4:
+__mb0_arm1_body5:
   %t33 = inttoptr i64 %r42 to ptr
   %t34 = getelementptr i64, ptr %t33, i64 1
   %r61 = load i64, ptr %t34
@@ -240,9 +294,6 @@ __mb0_arm1_body4:
   %r67 = bitcast double %t39 to i64
   store i64 %r67, ptr %slot.__mb0___match_0, align 8
   br label %__mb0_match_merge1
-
-__mb0_arm1_next5:
-  br label %__mb0_arm2_body6
 
 __mb0_arm2_body6:
   store i64 0, ptr %slot.__mb0___match_0, align 8
@@ -258,7 +309,7 @@ __mb0_merge:
   %r72 = load i64, ptr %slot.__mb0_ret, align 8
   %t41 = bitcast i64 %r72 to double
   %t42 = bitcast i64 %r72 to double
-  %t43 = getelementptr inbounds [4 x i8], ptr @.str.10, i64 0, i64 0
+  %t43 = getelementptr inbounds [4 x i8], ptr @.str.14, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t43, double %t42)
   %r17 = load i64, ptr %slot.r, align 8
   br label %__mb1_entry0
@@ -278,35 +329,38 @@ __mb1_entry0:
   %t49 = inttoptr i64 %r81 to ptr
   %t50 = call i32 @strcmp(ptr %t48, ptr %t49)
   %t51 = icmp eq i32 %t50, 0
-  br i1 %t51, label %__mb1_arm0_body2, label %__mb1_arm0_next3
+  br i1 %t51, label %__mb1_arm0_body3, label %__mb1_arm0_next2
 
-__mb1_arm0_body2:
+__mb1_arm0_next2:
   %t52 = inttoptr i64 %r78 to ptr
-  %t53 = getelementptr i64, ptr %t52, i64 1
+  %t53 = getelementptr i64, ptr %t52, i64 0
   %r86 = load i64, ptr %t53
-  %t54 = bitcast i64 4614256650576692846 to double
-  %t55 = bitcast i64 %r86 to double
-  %t56 = fmul double %t54, %t55
-  %r90 = bitcast double %t56 to i64
-  %t57 = bitcast i64 %r86 to double
-  %t58 = fmul double %t56, %t57
-  %r92 = bitcast double %t58 to i64
-  store i64 %r92, ptr %slot.__mb1___match_0, align 8
+  %t54 = getelementptr inbounds [10 x i8], ptr @.str.1, i64 0, i64 0
+  %r87 = ptrtoint ptr %t54 to i64
+  %t55 = inttoptr i64 %r86 to ptr
+  %t56 = inttoptr i64 %r87 to ptr
+  %t57 = call i32 @strcmp(ptr %t55, ptr %t56)
+  %t58 = icmp eq i32 %t57, 0
+  br i1 %t58, label %__mb1_arm1_body5, label %__mb1_arm1_next4
+
+__mb1_arm0_body3:
+  %t59 = inttoptr i64 %r78 to ptr
+  %t60 = getelementptr i64, ptr %t59, i64 1
+  %r89 = load i64, ptr %t60
+  %t61 = bitcast i64 4614256650576692846 to double
+  %t62 = bitcast i64 %r89 to double
+  %t63 = fmul double %t61, %t62
+  %r93 = bitcast double %t63 to i64
+  %t64 = bitcast i64 %r89 to double
+  %t65 = fmul double %t63, %t64
+  %r95 = bitcast double %t65 to i64
+  store i64 %r95, ptr %slot.__mb1___match_0, align 8
   br label %__mb1_match_merge1
 
-__mb1_arm0_next3:
-  %t59 = inttoptr i64 %r78 to ptr
-  %t60 = getelementptr i64, ptr %t59, i64 0
-  %r94 = load i64, ptr %t60
-  %t61 = getelementptr inbounds [10 x i8], ptr @.str.1, i64 0, i64 0
-  %r95 = ptrtoint ptr %t61 to i64
-  %t62 = inttoptr i64 %r94 to ptr
-  %t63 = inttoptr i64 %r95 to ptr
-  %t64 = call i32 @strcmp(ptr %t62, ptr %t63)
-  %t65 = icmp eq i32 %t64, 0
-  br i1 %t65, label %__mb1_arm1_body4, label %__mb1_arm1_next5
+__mb1_arm1_next4:
+  br label %__mb1_arm2_body6
 
-__mb1_arm1_body4:
+__mb1_arm1_body5:
   %t66 = inttoptr i64 %r78 to ptr
   %t67 = getelementptr i64, ptr %t66, i64 1
   %r97 = load i64, ptr %t67
@@ -319,9 +373,6 @@ __mb1_arm1_body4:
   %r103 = bitcast double %t72 to i64
   store i64 %r103, ptr %slot.__mb1___match_0, align 8
   br label %__mb1_match_merge1
-
-__mb1_arm1_next5:
-  br label %__mb1_arm2_body6
 
 __mb1_arm2_body6:
   store i64 0, ptr %slot.__mb1___match_0, align 8
@@ -337,7 +388,7 @@ __mb1_merge:
   %r108 = load i64, ptr %slot.__mb1_ret, align 8
   %t74 = bitcast i64 %r108 to double
   %t75 = bitcast i64 %r108 to double
-  %t76 = getelementptr inbounds [4 x i8], ptr @.str.10, i64 0, i64 0
+  %t76 = getelementptr inbounds [4 x i8], ptr @.str.14, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t76, double %t75)
   %t77 = getelementptr inbounds [7 x i8], ptr @.str.0, i64 0, i64 0
   %r21 = ptrtoint ptr %t77 to i64
@@ -368,35 +419,38 @@ __mb2_entry0:
   %t87 = inttoptr i64 %r117 to ptr
   %t88 = call i32 @strcmp(ptr %t86, ptr %t87)
   %t89 = icmp eq i32 %t88, 0
-  br i1 %t89, label %__mb2_arm0_body2, label %__mb2_arm0_next3
+  br i1 %t89, label %__mb2_arm0_body3, label %__mb2_arm0_next2
 
-__mb2_arm0_body2:
+__mb2_arm0_next2:
   %t90 = inttoptr i64 %r114 to ptr
-  %t91 = getelementptr i64, ptr %t90, i64 1
+  %t91 = getelementptr i64, ptr %t90, i64 0
   %r122 = load i64, ptr %t91
-  %t92 = bitcast i64 4614256650576692846 to double
-  %t93 = bitcast i64 %r122 to double
-  %t94 = fmul double %t92, %t93
-  %r126 = bitcast double %t94 to i64
-  %t95 = bitcast i64 %r122 to double
-  %t96 = fmul double %t94, %t95
-  %r128 = bitcast double %t96 to i64
-  store i64 %r128, ptr %slot.__mb2___match_0, align 8
+  %t92 = getelementptr inbounds [10 x i8], ptr @.str.1, i64 0, i64 0
+  %r123 = ptrtoint ptr %t92 to i64
+  %t93 = inttoptr i64 %r122 to ptr
+  %t94 = inttoptr i64 %r123 to ptr
+  %t95 = call i32 @strcmp(ptr %t93, ptr %t94)
+  %t96 = icmp eq i32 %t95, 0
+  br i1 %t96, label %__mb2_arm1_body5, label %__mb2_arm1_next4
+
+__mb2_arm0_body3:
+  %t97 = inttoptr i64 %r114 to ptr
+  %t98 = getelementptr i64, ptr %t97, i64 1
+  %r125 = load i64, ptr %t98
+  %t99 = bitcast i64 4614256650576692846 to double
+  %t100 = bitcast i64 %r125 to double
+  %t101 = fmul double %t99, %t100
+  %r129 = bitcast double %t101 to i64
+  %t102 = bitcast i64 %r125 to double
+  %t103 = fmul double %t101, %t102
+  %r131 = bitcast double %t103 to i64
+  store i64 %r131, ptr %slot.__mb2___match_0, align 8
   br label %__mb2_match_merge1
 
-__mb2_arm0_next3:
-  %t97 = inttoptr i64 %r114 to ptr
-  %t98 = getelementptr i64, ptr %t97, i64 0
-  %r130 = load i64, ptr %t98
-  %t99 = getelementptr inbounds [10 x i8], ptr @.str.1, i64 0, i64 0
-  %r131 = ptrtoint ptr %t99 to i64
-  %t100 = inttoptr i64 %r130 to ptr
-  %t101 = inttoptr i64 %r131 to ptr
-  %t102 = call i32 @strcmp(ptr %t100, ptr %t101)
-  %t103 = icmp eq i32 %t102, 0
-  br i1 %t103, label %__mb2_arm1_body4, label %__mb2_arm1_next5
+__mb2_arm1_next4:
+  br label %__mb2_arm2_body6
 
-__mb2_arm1_body4:
+__mb2_arm1_body5:
   %t104 = inttoptr i64 %r114 to ptr
   %t105 = getelementptr i64, ptr %t104, i64 1
   %r133 = load i64, ptr %t105
@@ -409,9 +463,6 @@ __mb2_arm1_body4:
   %r139 = bitcast double %t110 to i64
   store i64 %r139, ptr %slot.__mb2___match_0, align 8
   br label %__mb2_match_merge1
-
-__mb2_arm1_next5:
-  br label %__mb2_arm2_body6
 
 __mb2_arm2_body6:
   store i64 0, ptr %slot.__mb2___match_0, align 8
@@ -427,9 +478,9 @@ __mb2_merge:
   %r144 = load i64, ptr %slot.__mb2_ret, align 8
   %t112 = bitcast i64 %r144 to double
   %t113 = bitcast i64 %r144 to double
-  %t114 = getelementptr inbounds [4 x i8], ptr @.str.10, i64 0, i64 0
+  %t114 = getelementptr inbounds [4 x i8], ptr @.str.14, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t114, double %t113)
-  %t115 = getelementptr inbounds [6 x i8], ptr @.str.2, i64 0, i64 0
+  %t115 = getelementptr inbounds [6 x i8], ptr @.str.6, i64 0, i64 0
   %r30 = ptrtoint ptr %t115 to i64
   %t116 = alloca i64, i64 1, align 8
   %t117 = getelementptr i64, ptr %t116, i64 0
@@ -450,67 +501,67 @@ __mb3_entry0:
   %t120 = inttoptr i64 %r150 to ptr
   %t121 = getelementptr i64, ptr %t120, i64 0
   %r152 = load i64, ptr %t121
-  %t122 = getelementptr inbounds [4 x i8], ptr @.str.3, i64 0, i64 0
+  %t122 = getelementptr inbounds [4 x i8], ptr @.str.7, i64 0, i64 0
   %r153 = ptrtoint ptr %t122 to i64
   %t123 = inttoptr i64 %r152 to ptr
   %t124 = inttoptr i64 %r153 to ptr
   %t125 = call i32 @strcmp(ptr %t123, ptr %t124)
   %t126 = icmp eq i32 %t125, 0
-  br i1 %t126, label %__mb3_arm0_body2, label %__mb3_arm0_next3
+  br i1 %t126, label %__mb3_arm0_body3, label %__mb3_arm0_next2
 
-__mb3_arm0_body2:
-  %t127 = getelementptr inbounds [4 x i8], ptr @.str.4, i64 0, i64 0
-  %r155 = ptrtoint ptr %t127 to i64
-  %t128 = load i64, ptr %slot.__mb3___match_1, align 8
-  call void @nova_rc_dec(i64 %t128)
-  store i64 %r155, ptr %slot.__mb3___match_1, align 8
+__mb3_arm0_next2:
+  %t127 = inttoptr i64 %r150 to ptr
+  %t128 = getelementptr i64, ptr %t127, i64 0
+  %r155 = load i64, ptr %t128
+  %t129 = getelementptr inbounds [6 x i8], ptr @.str.6, i64 0, i64 0
+  %r156 = ptrtoint ptr %t129 to i64
+  %t130 = inttoptr i64 %r155 to ptr
+  %t131 = inttoptr i64 %r156 to ptr
+  %t132 = call i32 @strcmp(ptr %t130, ptr %t131)
+  %t133 = icmp eq i32 %t132, 0
+  br i1 %t133, label %__mb3_arm1_body5, label %__mb3_arm1_next4
+
+__mb3_arm0_body3:
+  %t134 = getelementptr inbounds [4 x i8], ptr @.str.8, i64 0, i64 0
+  %r158 = ptrtoint ptr %t134 to i64
+  %t135 = load i64, ptr %slot.__mb3___match_1, align 8
+  call void @nova_rc_dec(i64 %t135)
+  store i64 %r158, ptr %slot.__mb3___match_1, align 8
   br label %__mb3_match_merge1
 
-__mb3_arm0_next3:
-  %t129 = inttoptr i64 %r150 to ptr
-  %t130 = getelementptr i64, ptr %t129, i64 0
-  %r157 = load i64, ptr %t130
-  %t131 = getelementptr inbounds [6 x i8], ptr @.str.2, i64 0, i64 0
-  %r158 = ptrtoint ptr %t131 to i64
-  %t132 = inttoptr i64 %r157 to ptr
-  %t133 = inttoptr i64 %r158 to ptr
-  %t134 = call i32 @strcmp(ptr %t132, ptr %t133)
-  %t135 = icmp eq i32 %t134, 0
-  br i1 %t135, label %__mb3_arm1_body4, label %__mb3_arm1_next5
+__mb3_arm1_next4:
+  %t136 = inttoptr i64 %r150 to ptr
+  %t137 = getelementptr i64, ptr %t136, i64 0
+  %r160 = load i64, ptr %t137
+  %t138 = getelementptr inbounds [5 x i8], ptr @.str.9, i64 0, i64 0
+  %r161 = ptrtoint ptr %t138 to i64
+  %t139 = inttoptr i64 %r160 to ptr
+  %t140 = inttoptr i64 %r161 to ptr
+  %t141 = call i32 @strcmp(ptr %t139, ptr %t140)
+  %t142 = icmp eq i32 %t141, 0
+  br i1 %t142, label %__mb3_arm2_body7, label %__mb3_arm2_next6
 
-__mb3_arm1_body4:
-  %t136 = getelementptr inbounds [6 x i8], ptr @.str.5, i64 0, i64 0
-  %r160 = ptrtoint ptr %t136 to i64
-  %t137 = load i64, ptr %slot.__mb3___match_1, align 8
-  call void @nova_rc_dec(i64 %t137)
-  store i64 %r160, ptr %slot.__mb3___match_1, align 8
+__mb3_arm1_body5:
+  %t143 = getelementptr inbounds [6 x i8], ptr @.str.10, i64 0, i64 0
+  %r163 = ptrtoint ptr %t143 to i64
+  %t144 = load i64, ptr %slot.__mb3___match_1, align 8
+  call void @nova_rc_dec(i64 %t144)
+  store i64 %r163, ptr %slot.__mb3___match_1, align 8
   br label %__mb3_match_merge1
 
-__mb3_arm1_next5:
-  %t138 = inttoptr i64 %r150 to ptr
-  %t139 = getelementptr i64, ptr %t138, i64 0
-  %r162 = load i64, ptr %t139
-  %t140 = getelementptr inbounds [5 x i8], ptr @.str.6, i64 0, i64 0
-  %r163 = ptrtoint ptr %t140 to i64
-  %t141 = inttoptr i64 %r162 to ptr
-  %t142 = inttoptr i64 %r163 to ptr
-  %t143 = call i32 @strcmp(ptr %t141, ptr %t142)
-  %t144 = icmp eq i32 %t143, 0
-  br i1 %t144, label %__mb3_arm2_body6, label %__mb3_arm2_next7
+__mb3_arm2_next6:
+  br label %__mb3_arm3_body8
 
-__mb3_arm2_body6:
-  %t145 = getelementptr inbounds [5 x i8], ptr @.str.7, i64 0, i64 0
+__mb3_arm2_body7:
+  %t145 = getelementptr inbounds [5 x i8], ptr @.str.11, i64 0, i64 0
   %r165 = ptrtoint ptr %t145 to i64
   %t146 = load i64, ptr %slot.__mb3___match_1, align 8
   call void @nova_rc_dec(i64 %t146)
   store i64 %r165, ptr %slot.__mb3___match_1, align 8
   br label %__mb3_match_merge1
 
-__mb3_arm2_next7:
-  br label %__mb3_arm3_body8
-
 __mb3_arm3_body8:
-  %t147 = getelementptr inbounds [8 x i8], ptr @.str.8, i64 0, i64 0
+  %t147 = getelementptr inbounds [8 x i8], ptr @.str.12, i64 0, i64 0
   %r167 = ptrtoint ptr %t147 to i64
   %t148 = load i64, ptr %slot.__mb3___match_1, align 8
   call void @nova_rc_dec(i64 %t148)
@@ -552,9 +603,11 @@ __mb3_merge:
   ret i64 0
 }
 
-define i32 @main() nounwind {
+define i32 @main(i32 %argc, ptr %argv) nounwind {
 entry:
-  call void @nova_rt_init()
+  %argc64 = sext i32 %argc to i64
+  %argv64 = ptrtoint ptr %argv to i64
+  call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
   call i64 @nova_main()
   call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()

@@ -146,12 +146,14 @@ class IrTypeRefiner {
                 BinOp.EQ, BinOp.NE, BinOp.LT, BinOp.GT, BinOp.LE, BinOp.GE,
                 BinOp.AND, BinOp.OR -> IrType.Bool
                 BinOp.CONCAT -> IrType.Str
+                BinOp.BIT_AND, BinOp.BIT_OR, BinOp.BIT_XOR, BinOp.SHL, BinOp.SHR -> IrType.I64
             }
         }
 
         is IrInst.Unary -> when (inst.op) {
             UnOp.NEG -> types[inst.operand]
             UnOp.NOT -> IrType.Bool
+            UnOp.BIT_NOT -> IrType.I64
         }
 
         is IrInst.SlotStore -> {
@@ -233,6 +235,7 @@ class IrTypeRefiner {
     private fun rewrite(module: IrModule): IrModule {
         val result = IrModule(module.name)
         result.structs.addAll(module.structs)
+        result.externFunctions.addAll(module.externFunctions)
 
         for (fn in module.functions) {
             val paramTypeList = fnParamTypes[fn.name]!!

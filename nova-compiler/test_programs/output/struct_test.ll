@@ -33,6 +33,7 @@ declare i64 @nova_rt_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_upper(i64) nounwind
 declare i64 @nova_rt_lower(i64) nounwind
 declare i64 @nova_rt_trim(i64) nounwind
+declare i64 @nova_rt_repeat(i64, i64) nounwind
 declare i64 @nova_rt_split(i64, i64) nounwind
 declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind readonly
@@ -62,6 +63,8 @@ declare i32 @strcmp(ptr, ptr) nounwind readonly
 declare i64 @nova_rt_dict_create() nounwind
 declare i64 @nova_rt_dict_set(i64, i64, i64) nounwind
 declare i64 @nova_rt_dict_get(i64, i64) nounwind readonly
+declare i64 @nova_rt_dict_get_concat2(i64, i64, i64) nounwind readonly
+declare i64 @nova_rt_dict_set_concat2(i64, i64, i64, i64) nounwind
 declare i64 @nova_rt_dict_has(i64, i64) nounwind readonly
 declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_dict_len(i64) nounwind readonly
@@ -80,10 +83,54 @@ declare i64 @nova_rt_json_stringify(i64) nounwind
 ; nova runtime — HTTP ops
 declare i64 @nova_rt_http_get(i64) nounwind
 declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+; nova runtime — time ops
+declare i64 @nova_rt_time_ms() nounwind
+declare i64 @nova_rt_clock_ns() nounwind
+declare void @nova_rt_sleep_ms(i64) nounwind
+declare void @nova_rt_assert(i64, i64) nounwind
 ; nova runtime — type dispatch
 declare i64 @nova_rt_any_to_str(i64) nounwind
 declare i64 @nova_rt_str_concat_safe(i64, i64) nounwind
+declare i64 @nova_rt_str_char_at(i64, i64) nounwind
 declare void @nova_rt_init() nounwind
+declare void @nova_rt_init_args(i64, i64) nounwind
+; nova runtime — system ops
+declare i64 @nova_rt_args() nounwind
+declare i64 @nova_rt_env(i64) nounwind
+declare i64 @nova_rt_random_int(i64, i64) nounwind
+declare i64 @nova_rt_random_float() nounwind
+declare i64 @nova_rt_shell(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_path_ext(i64) nounwind
+; nova runtime — regex ops
+declare i64 @nova_rt_regex_match(i64, i64) nounwind readonly
+declare i64 @nova_rt_regex_find(i64, i64) nounwind
+declare i64 @nova_rt_regex_replace(i64, i64, i64) nounwind
+declare i64 @nova_rt_regex_split(i64, i64) nounwind
+; nova runtime — network ops
+declare i64 @nova_rt_tcp_connect(i64, i64) nounwind
+declare i64 @nova_rt_tcp_listen(i64) nounwind
+declare i64 @nova_rt_tcp_accept(i64) nounwind
+declare i64 @nova_rt_tcp_send(i64, i64) nounwind
+declare i64 @nova_rt_tcp_recv(i64) nounwind
+declare void @nova_rt_tcp_close(i64) nounwind
+declare i64 @nova_rt_udp_bind(i64) nounwind
+declare i64 @nova_rt_udp_send(i64, i64, i64, i64) nounwind
+declare i64 @nova_rt_udp_recv(i64) nounwind
+; nova runtime — HTTP server
+declare i64 @nova_rt_http_listen(i64) nounwind
+declare i64 @nova_rt_http_accept(i64) nounwind
+declare void @nova_rt_http_respond(i64, i64, i64) nounwind
+; nova runtime — byte arrays
+declare i64 @nova_rt_bytes_create(i64) nounwind
+declare i64 @nova_rt_bytes_get(i64, i64) nounwind
+declare void @nova_rt_bytes_set(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_len(i64) nounwind
+declare i64 @nova_rt_bytes_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_bytes_to_str(i64) nounwind
+declare i64 @nova_rt_str_to_bytes(i64) nounwind
 ; nova runtime — channel/spawn ops
 declare i64 @nova_rt_channel_create() nounwind
 declare i64 @nova_rt_channel_send(i64, i64) nounwind
@@ -114,12 +161,16 @@ declare void @nova_rc_dec(i64) nounwind
 @__nova_error_flag = thread_local global i64 0
 @__nova_error_msg = thread_local global i64 0
 
-@.str.0 = private unnamed_addr constant [6 x i8] c"Alice\00"
-@.str.1 = private unnamed_addr constant [6 x i8] c"%lld\0A\00"
-@.str.2 = private unnamed_addr constant [4 x i8] c"%f\0A\00"
-@.str.3 = private unnamed_addr constant [4 x i8] c"%s\0A\00"
-@.str.4 = private unnamed_addr constant [5 x i8] c"true\00"
-@.str.5 = private unnamed_addr constant [6 x i8] c"false\00"
+@.str.0 = private unnamed_addr constant [2 x i8] c"x\00"
+@.str.1 = private unnamed_addr constant [2 x i8] c"y\00"
+@.str.2 = private unnamed_addr constant [6 x i8] c"Alice\00"
+@.str.3 = private unnamed_addr constant [5 x i8] c"name\00"
+@.str.4 = private unnamed_addr constant [4 x i8] c"age\00"
+@.str.5 = private unnamed_addr constant [6 x i8] c"%lld\0A\00"
+@.str.6 = private unnamed_addr constant [4 x i8] c"%f\0A\00"
+@.str.7 = private unnamed_addr constant [4 x i8] c"%s\0A\00"
+@.str.8 = private unnamed_addr constant [5 x i8] c"true\00"
+@.str.9 = private unnamed_addr constant [6 x i8] c"false\00"
 
 define i64 @nova_main() nounwind {
 entry0:
@@ -132,14 +183,14 @@ entry0:
   %t3 = inttoptr i64 %r3 to ptr
   %t4 = getelementptr i64, ptr %t3, i64 0
   %r8 = load i64, ptr %t4
-  %t5 = getelementptr inbounds [5 x i8], ptr @.str.1, i64 0, i64 0
+  %t5 = getelementptr inbounds [5 x i8], ptr @.str.5, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t5, i64 %r8)
   %t6 = inttoptr i64 %r3 to ptr
   %t7 = getelementptr i64, ptr %t6, i64 1
   %r11 = load i64, ptr %t7
-  %t8 = getelementptr inbounds [5 x i8], ptr @.str.1, i64 0, i64 0
+  %t8 = getelementptr inbounds [5 x i8], ptr @.str.5, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t8, i64 %r11)
-  %t9 = getelementptr inbounds [6 x i8], ptr @.str.0, i64 0, i64 0
+  %t9 = getelementptr inbounds [6 x i8], ptr @.str.2, i64 0, i64 0
   %r14 = ptrtoint ptr %t9 to i64
   %t10 = alloca i64, i64 2, align 8
   %t11 = getelementptr i64, ptr %t10, i64 0
@@ -155,14 +206,16 @@ entry0:
   %t16 = inttoptr i64 %r16 to ptr
   %t17 = getelementptr i64, ptr %t16, i64 1
   %r24 = load i64, ptr %t17
-  %t18 = getelementptr inbounds [5 x i8], ptr @.str.1, i64 0, i64 0
+  %t18 = getelementptr inbounds [5 x i8], ptr @.str.5, i64 0, i64 0
   call i32 (ptr, ...) @printf(ptr %t18, i64 %r24)
   ret i64 0
 }
 
-define i32 @main() nounwind {
+define i32 @main(i32 %argc, ptr %argv) nounwind {
 entry:
-  call void @nova_rt_init()
+  %argc64 = sext i32 %argc to i64
+  %argv64 = ptrtoint ptr %argv to i64
+  call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
   call i64 @nova_main()
   call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()
