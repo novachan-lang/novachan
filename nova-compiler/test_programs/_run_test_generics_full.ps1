@@ -1,0 +1,26 @@
+Set-Location $PSScriptRoot
+. "$PSScriptRoot\_proc_util.ps1"
+Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
+$compiler = ".\gen2_move.exe"
+$test = "generics_test"
+$cr = Invoke-Timed -FilePath (Resolve-Path $compiler).Path -Arguments "$test.nova" -TimeoutMs 30000
+Write-Host "Compile exit: $($cr.ExitCode)"
+if (!(Test-Path "$test.ll")) { Write-Host "FAIL: no .ll"; exit 1 }
+$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o $test.exe $test.ll nova_runtime.c -lws2_32" -TimeoutMs 60000
+Write-Host "Link exit: $($lr.ExitCode)"
+if ($lr.StdErr) {
+    $lines = $lr.StdErr -split "`n"
+    $errors = $lines | Where-Object { $_ -match "error:" }
+    if ($errors.Count -gt 0) {
+        Write-Host "LINK ERRORS:"
+        foreach ($e in $errors) { Write-Host $e.Trim() }
+    }
+}
+if (!(Test-Path "$test.exe")) { Write-Host "FAIL: no .exe"; exit 1 }
+$rr = Invoke-Timed -FilePath (Resolve-Path ".\$test.exe").Path -Arguments "" -TimeoutMs 10000
+Write-Host "Run exit: $($rr.ExitCode) Timeout: $($rr.TimedOut)"
+Write-Host "Output:"
+Write-Host $rr.StdOut
+if ($rr.StdErr) { Write-Host "Runtime stderr: $($rr.StdErr)" }
+Remove-Item "$test.ll","$test.exe" -Force -ErrorAction SilentlyContinue
+Remove-Item "nova_runtime.c" -Force -ErrorAction SilentlyContinue
