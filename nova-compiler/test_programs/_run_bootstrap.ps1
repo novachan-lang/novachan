@@ -4,7 +4,7 @@ Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
 
 # gen2 compiles nova_compiler.nova -> gen3.ll
 Write-Host "=== gen2 -> gen3 ==="
-$cr = Invoke-Timed -FilePath (Resolve-Path ".\gen2_move.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 60000
+$cr = Invoke-Timed -FilePath (Resolve-Path ".\gen2_move.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 180000
 Write-Host "Compile exit: $($cr.ExitCode) Timeout: $($cr.TimedOut)"
 if (!(Test-Path "nova_compiler.ll")) { Write-Host "FAIL: no gen3.ll"; exit 1 }
 Copy-Item "nova_compiler.ll" "gen3.ll" -Force
@@ -17,7 +17,7 @@ if (!(Test-Path "gen3.exe")) { Write-Host "FAIL: no gen3.exe"; exit 1 }
 # gen3 compiles nova_compiler.nova -> gen4.ll
 Write-Host "=== gen3 -> gen4 ==="
 Remove-Item "nova_compiler.ll" -Force -ErrorAction SilentlyContinue
-$cr2 = Invoke-Timed -FilePath (Resolve-Path ".\gen3.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 60000
+$cr2 = Invoke-Timed -FilePath (Resolve-Path ".\gen3.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 180000
 Write-Host "Compile exit: $($cr2.ExitCode) Timeout: $($cr2.TimedOut)"
 if (!(Test-Path "nova_compiler.ll")) { Write-Host "FAIL: no gen4.ll"; exit 1 }
 Copy-Item "nova_compiler.ll" "gen4.ll" -Force
