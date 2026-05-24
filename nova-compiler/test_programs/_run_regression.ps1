@@ -39,7 +39,7 @@ foreach ($test in $tests) {
         $fail++
         continue
     }
-    $lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o $test.exe $test.ll nova_runtime.c -lws2_32" -TimeoutMs 60000
+    $lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o $test.exe $test.ll nova_runtime.c $NovaLinkFlags" -TimeoutMs 60000
     if (!(Test-Path "$test.exe")) {
         Write-Host "FAIL link: $test"
         $fail++

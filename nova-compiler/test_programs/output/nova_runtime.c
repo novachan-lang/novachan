@@ -3,14 +3,18 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <math.h>
 #include <ctype.h>
 #include <errno.h>
 
 #ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <wincrypt.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -20,6 +24,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -52,6 +57,9 @@ static void nova_set_error(const char* msg) {
 #define SLAB_32_OBJ_SIZE  32
 #define SLAB_64_OBJ_SIZE  64
 #define SLAB_PAGE_OBJECTS 128
+
+static uintptr_t nova_heap_base;
+static uintptr_t nova_heap_top;
 
 typedef struct NovaSlabPage {
     struct NovaSlabPage* next;
@@ -93,8 +101,17 @@ static void nova_slab_init(void) {
 
 static void nova_slab_grow(NovaSlabPool* pool) {
     size_t page_data_size = (size_t)(SLAB_PAGE_OBJECTS * pool->obj_size);
-    NovaSlabPage* page = (NovaSlabPage*)malloc(sizeof(NovaSlabPage*) + page_data_size);
+    /* Reserve room for the `next` pointer header AND the data payload.
+       Use offsetof so we do not depend on the platform's padding rules. */
+    size_t header_size = offsetof(NovaSlabPage, data);
+    NovaSlabPage* page = (NovaSlabPage*)malloc(header_size + page_data_size);
     if (!page) return;
+    uintptr_t page_addr = (uintptr_t)page;
+    uintptr_t page_end = page_addr + header_size + page_data_size;
+    if (nova_heap_base && page_addr < nova_heap_base)
+        nova_heap_base = page_addr;
+    if (page_end > nova_heap_top)
+        nova_heap_top = page_end;
     page->next = pool->pages;
     pool->pages = page;
     char* base = page->data;
@@ -166,6 +183,43 @@ static int      nova_strpool_stack[NOVA_STRPOOL_COUNT];
 static int      nova_strpool_top = -1;
 static int      nova_strpool_inited = 0;
 
+/* Forward-declared so the inline lock helpers below can read it. */
+static volatile int nova_is_multithreaded;
+
+#ifdef _WIN32
+static CRITICAL_SECTION nova_strpool_lock;
+#else
+static pthread_mutex_t nova_strpool_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+static int nova_strpool_lock_inited = 0;
+
+static void nova_strpool_lock_init(void) {
+    if (nova_strpool_lock_inited) return;
+#ifdef _WIN32
+    InitializeCriticalSection(&nova_strpool_lock);
+#endif
+    nova_strpool_lock_inited = 1;
+}
+
+static inline void nova_strpool_acquire(void) {
+    if (!nova_is_multithreaded) return;
+    if (!nova_strpool_lock_inited) nova_strpool_lock_init();
+#ifdef _WIN32
+    EnterCriticalSection(&nova_strpool_lock);
+#else
+    pthread_mutex_lock(&nova_strpool_lock);
+#endif
+}
+
+static inline void nova_strpool_release(void) {
+    if (!nova_is_multithreaded) return;
+#ifdef _WIN32
+    LeaveCriticalSection(&nova_strpool_lock);
+#else
+    pthread_mutex_unlock(&nova_strpool_lock);
+#endif
+}
+
 static void nova_strpool_init(void) {
     for (int i = NOVA_STRPOOL_COUNT - 1; i >= 0; i--)
         nova_strpool_stack[++nova_strpool_top] = i;
@@ -178,31 +232,41 @@ static inline int nova_strpool_contains(const void* ptr) {
 }
 
 static inline char* nova_strpool_alloc(void) {
+    nova_strpool_acquire();
     if (!nova_strpool_inited) nova_strpool_init();
-    if (nova_strpool_top < 0) return NULL;
+    if (nova_strpool_top < 0) { nova_strpool_release(); return NULL; }
     int idx = nova_strpool_stack[nova_strpool_top--];
     nova_strpool_rc[idx] = 1;
-    return nova_strpool_data[idx];
+    char* result = nova_strpool_data[idx];
+    nova_strpool_release();
+    return result;
 }
 
 static inline void nova_strpool_free(char* ptr) {
+    nova_strpool_acquire();
     int idx = (int)((ptr - nova_strpool_data[0]) / NOVA_STRPOOL_SLOT_SIZE);
     nova_strpool_rc[idx] = 0;
     nova_strpool_stack[++nova_strpool_top] = idx;
+    nova_strpool_release();
 }
 
 static inline void nova_strpool_rc_inc(const void* ptr) {
+    nova_strpool_acquire();
     int idx = (int)(((const char*)ptr - nova_strpool_data[0]) / NOVA_STRPOOL_SLOT_SIZE);
     nova_strpool_rc[idx]++;
+    nova_strpool_release();
 }
 
 static inline int nova_strpool_rc_dec(const void* ptr) {
+    nova_strpool_acquire();
     int idx = (int)(((const char*)ptr - nova_strpool_data[0]) / NOVA_STRPOOL_SLOT_SIZE);
+    int freed = 0;
     if (--nova_strpool_rc[idx] <= 0) {
         nova_strpool_stack[++nova_strpool_top] = idx;
-        return 1;
+        freed = 1;
     }
-    return 0;
+    nova_strpool_release();
+    return freed;
 }
 
 /* ── Memory Registry (thread-safe hash map, O(1) lookup) ─────────────────── */
@@ -212,13 +276,15 @@ typedef enum {
     NOVA_MEM_LIST    = 1,
     NOVA_MEM_DICT    = 2,
     NOVA_MEM_CHANNEL = 3,
-    NOVA_MEM_FAT_STR = 4
+    NOVA_MEM_FAT_STR = 4,
+    NOVA_MEM_STRUCT  = 5,
+    NOVA_MEM_ITER    = 6
 } NovaMemTag;
 
 static int64_t      nova_mem_live    = 0;
 static int64_t      nova_mem_total   = 0;
 static volatile int nova_is_multithreaded = 0;
-static uintptr_t    nova_heap_base   = 0;  /* lowest address from CRT heap — fast filter for RC */
+/* nova_heap_base declared near slab allocator — tracks lowest heap address for fast RC filter */
 
 #ifdef _WIN32
 static CRITICAL_SECTION nova_mem_lock;
@@ -240,6 +306,10 @@ static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 #define NOVA_RC_TAG(ptr)    ((NovaMemTag)(((const int32_t*)(ptr))[-1] & 0xFFFF))
 #define NOVA_RC_VALID(ptr)  ((((const int32_t*)(ptr))[-1] & 0xFFFF0000) == (uint32_t)NOVA_RC_MAGIC)
 #define NOVA_RC_COUNT(ptr)  (((int32_t*)(ptr))[-2])
+/* Structs/closures pack their slot count into the tag word's free bits:
+   low 3 bits = kind (NOVA_MEM_STRUCT=5), bits 3..15 = slot count (0..8191).
+   Non-struct objects keep slot bits 0, so their tag stays exactly 0..4. */
+#define NOVA_STRUCT_NSLOTS(ptr) ((int64_t)((((const uint32_t*)(ptr))[-1] & 0xFFFFu) >> 3))
 
 static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     size_t total = NOVA_RC_HDR_SIZE + size;
@@ -249,8 +319,17 @@ static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
         base = (char*)nova_slab_alloc(&nova_slab_32);
     else if (tag == NOVA_MEM_DICT && total <= SLAB_64_OBJ_SIZE)
         base = (char*)nova_slab_alloc(&nova_slab_64);
-    else
+    else {
         base = (char*)calloc(1, total);
+        if (base) {
+            uintptr_t baddr = (uintptr_t)base;
+            if (nova_heap_base && baddr < nova_heap_base)
+                nova_heap_base = baddr;
+            uintptr_t bend = baddr + total;
+            if (bend > nova_heap_top)
+                nova_heap_top = bend;
+        }
+    }
     if (!base) return NULL;
     ((int32_t*)base)[0] = 1;
     ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
@@ -260,7 +339,13 @@ static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
 }
 
 void* nova_rt_struct_alloc(int64_t size) {
-    return nova_heap_alloc((size_t)size, NOVA_MEM_RAW);
+    /* Tag structs/closures distinctly and record their slot count so the
+       deep-copy path can walk their fields. size is always a multiple of 8. */
+    int64_t nslots = size / 8;
+    if (nslots < 0) nslots = 0;
+    if (nslots > 0x1FFF) nslots = 0x1FFF;
+    NovaMemTag packed = (NovaMemTag)(((int32_t)nslots << 3) | NOVA_MEM_STRUCT);
+    return nova_heap_alloc((size_t)size, packed);
 }
 
 /* ── Fat Strings: [hash:8][len:8][rc:4][tag:4][char data...]['\0'] ────────
@@ -286,6 +371,7 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
     uintptr_t addr = (uintptr_t)ptr;
     if (addr < 0x10000ULL) return (NovaMemTag)-1;
     if (nova_heap_base && addr < nova_heap_base) return (NovaMemTag)-1;
+    if (nova_heap_top && addr > nova_heap_top + 0x10000000000ULL) return (NovaMemTag)-1;
     if (nova_int_str_cache_inited &&
         (char*)ptr >= nova_int_str_cache[0] &&
         (char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
@@ -294,7 +380,8 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
 #ifdef _WIN32
     if (IsBadReadPtr((char*)ptr - NOVA_RC_HDR_SIZE, NOVA_RC_HDR_SIZE)) return (NovaMemTag)-1;
 #endif
-    if (NOVA_RC_VALID(ptr)) return NOVA_RC_TAG(ptr);
+    /* Mask to the low 3 kind bits: structs pack a slot count above them. */
+    if (NOVA_RC_VALID(ptr)) return (NovaMemTag)(NOVA_RC_TAG(ptr) & 0x7);
     return (NovaMemTag)-1;
 }
 
@@ -938,6 +1025,31 @@ int64_t nova_rt_list_concat(int64_t a, int64_t b) {
     return new_list;
 }
 
+int64_t nova_rt_range(int64_t n) {
+    if (n < 0) n = 0;
+    NovaList* list = (NovaList*)nova_heap_alloc(sizeof(NovaList), NOVA_MEM_LIST);
+    if (!list) return 0;
+    list->data = (n > 0) ? (int64_t*)malloc(n * sizeof(int64_t)) : NULL;
+    if (n > 0 && !list->data) return 0;
+    list->size = n;
+    list->cap  = n;
+    for (int64_t i = 0; i < n; i++) list->data[i] = i;
+    return (int64_t)(uintptr_t)list;
+}
+
+int64_t nova_rt_range_from_to(int64_t from, int64_t to) {
+    int64_t n = to - from;
+    if (n < 0) n = 0;
+    NovaList* list = (NovaList*)nova_heap_alloc(sizeof(NovaList), NOVA_MEM_LIST);
+    if (!list) return 0;
+    list->data = (n > 0) ? (int64_t*)malloc(n * sizeof(int64_t)) : NULL;
+    if (n > 0 && !list->data) return 0;
+    list->size = n;
+    list->cap  = n;
+    for (int64_t i = 0; i < n; i++) list->data[i] = from + i;
+    return (int64_t)(uintptr_t)list;
+}
+
 int64_t nova_rt_list_reverse(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t new_list = nova_rt_list_create();
@@ -1208,6 +1320,98 @@ int64_t nova_rt_dict_set_concat2(int64_t handle, int64_t a, int64_t b, int64_t v
     return 0;
 }
 
+/* ── Deep copy: ownership safety — send/spawn copy values across processes ──
+   Produces a structurally independent copy so two processes never share
+   mutable heap state. Strings (immutable) and channels are shared by ref.
+   A visited map handles cycles; a depth cap guards the C stack. */
+
+typedef struct { int64_t* olds; int64_t* news; int64_t n; int64_t cap; } NovaCopyMap;
+
+static int64_t nova_copymap_find(NovaCopyMap* m, int64_t key) {
+    for (int64_t i = 0; i < m->n; i++)
+        if (m->olds[i] == key) return m->news[i];
+    return 0;
+}
+
+static void nova_copymap_put(NovaCopyMap* m, int64_t key, int64_t val) {
+    if (m->n >= m->cap) {
+        int64_t nc = m->cap < 16 ? 16 : m->cap * 2;
+        int64_t* no = (int64_t*)realloc(m->olds, (size_t)nc * sizeof(int64_t));
+        if (!no) return;                 /* OOM: keep old map; depth cap backstops */
+        m->olds = no;
+        int64_t* nn = (int64_t*)realloc(m->news, (size_t)nc * sizeof(int64_t));
+        if (!nn) return;
+        m->news = nn;
+        m->cap = nc;
+    }
+    m->olds[m->n] = key; m->news[m->n] = val; m->n++;
+}
+
+static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
+    if ((uint64_t)v < 0x10000ULL) return v;
+    if (depth > 10000) { nova_rc_inc(v); return v; }   /* stack guard: share */
+    void* p = (void*)(uintptr_t)v;
+    NovaMemTag tag = nova_mem_find_tag(p);
+    if (tag == NOVA_MEM_LIST) {
+        int64_t hit = nova_copymap_find(m, v);
+        if (hit) { nova_rc_inc(hit); return hit; }
+        NovaList* src = (NovaList*)p;
+        int64_t dst = nova_rt_list_create();
+        if (!dst) { nova_rc_inc(v); return v; }
+        nova_copymap_put(m, v, dst);
+        for (int64_t i = 0; i < src->size; i++) {
+            int64_t e = nova_deep_copy_rec(src->data[i], m, depth + 1);
+            nova_rt_list_append(dst, e);
+            nova_rc_dec(e);
+        }
+        return dst;
+    }
+    if (tag == NOVA_MEM_DICT) {
+        int64_t hit = nova_copymap_find(m, v);
+        if (hit) { nova_rc_inc(hit); return hit; }
+        NovaDict* src = (NovaDict*)p;
+        int64_t dst = nova_rt_dict_create();
+        if (!dst) { nova_rc_inc(v); return v; }
+        nova_copymap_put(m, v, dst);
+        for (int64_t i = 0; i < src->size; i++) {
+            int64_t k   = nova_deep_copy_rec(src->keys[i], m, depth + 1);
+            int64_t val = nova_deep_copy_rec(src->vals[i], m, depth + 1);
+            nova_rt_dict_set(dst, k, val);
+            nova_rc_dec(k);
+            nova_rc_dec(val);
+        }
+        return dst;
+    }
+    if (tag == NOVA_MEM_STRUCT) {
+        int64_t hit = nova_copymap_find(m, v);
+        if (hit) { nova_rc_inc(hit); return hit; }
+        int64_t nslots = NOVA_STRUCT_NSLOTS(p);
+        int64_t* src = (int64_t*)p;
+        int64_t* dst = (int64_t*)nova_rt_struct_alloc(nslots * 8);
+        if (!dst) { nova_rc_inc(v); return v; }
+        nova_copymap_put(m, v, (int64_t)(uintptr_t)dst);
+        if (nslots > 0) dst[0] = src[0];               /* type hash / fn ptr */
+        for (int64_t i = 1; i < nslots; i++)
+            dst[i] = nova_deep_copy_rec(src[i], m, depth + 1);
+        return (int64_t)(uintptr_t)dst;
+    }
+    if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR || tag == NOVA_MEM_CHANNEL) {
+        /* strings are immutable; channels are the shared comm primitive */
+        nova_rc_inc(v);
+        return v;
+    }
+    return v;   /* unmanaged pointer or scalar — nothing to copy */
+}
+
+int64_t nova_rt_deep_copy(int64_t v) {
+    NovaCopyMap m;
+    m.olds = NULL; m.news = NULL; m.n = 0; m.cap = 0;
+    int64_t r = nova_deep_copy_rec(v, &m, 0);
+    free(m.olds);
+    free(m.news);
+    return r;
+}
+
 int64_t nova_rt_dict_len(int64_t handle) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     return d->size;
@@ -1239,6 +1443,16 @@ int64_t nova_rt_dict_items(int64_t handle) {
         nova_rt_list_append(list, pair);
     }
     return list;
+}
+
+int64_t nova_rt_for_iter_init(int64_t obj) {
+    if (obj == 0) return nova_rt_list_create();
+    void* ptr = (void*)(uintptr_t)obj;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_DICT) {
+        return nova_rt_dict_keys(obj);
+    }
+    return obj;
 }
 
 /* ── Character operations ────────────────────────────────────────────────── */
@@ -1414,7 +1628,53 @@ int64_t nova_rt_read_line(void) {
     if (!fgets(buf, 4096, stdin)) { buf[0] = '\0'; return (int64_t)(uintptr_t)buf; }
     size_t len = strlen(buf);
     if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+    if (len > 1 && buf[len-2] == '\r') buf[len-2] = '\0';
     return (int64_t)(uintptr_t)buf;
+}
+
+/* Read exactly N bytes from stdin. Returns a heap-tracked string. */
+int64_t nova_rt_stdin_read_n(int64_t n) {
+    if (n <= 0) return (int64_t)(uintptr_t)"";
+    size_t want = (size_t)n;
+    char* buf = (char*)nova_heap_alloc(want + 1, NOVA_MEM_RAW);
+    if (!buf) return (int64_t)(uintptr_t)"";
+    size_t got = 0;
+    while (got < want) {
+        size_t r = fread(buf + got, 1, want - got, stdin);
+        if (r == 0) break;
+        got += r;
+    }
+    buf[got] = '\0';
+    return (int64_t)(uintptr_t)buf;
+}
+
+/* Write raw bytes to stdout — no newline appended, no buffering surprises.
+   On Windows, the C runtime defaults stdout to text mode and translates
+   `\n` -> `\r\n`. For LSP/JSON-RPC framing where Content-Length must match
+   actual bytes, we put stdout in binary mode on first use. */
+static int nova_stdout_binary_inited = 0;
+void nova_rt_stdout_write(int64_t s_ptr) {
+    const char* s = (const char*)(uintptr_t)s_ptr;
+    if (!s) return;
+#ifdef _WIN32
+    if (!nova_stdout_binary_inited) {
+        _setmode(_fileno(stdout), 0x8000 /* _O_BINARY */);
+        nova_stdout_binary_inited = 1;
+    }
+#endif
+    size_t len = strlen(s);
+    fwrite(s, 1, len, stdout);
+    fflush(stdout);
+}
+
+/* Write raw bytes to stderr. Used by `write_raw` builtin so LSP servers and
+   other stdio-protocol tools can log without corrupting their stdout stream. */
+void nova_rt_write_raw(int64_t s_ptr) {
+    const char* s = (const char*)(uintptr_t)s_ptr;
+    if (!s) return;
+    size_t len = strlen(s);
+    fwrite(s, 1, len, stderr);
+    fflush(stderr);
 }
 
 int64_t nova_rt_read_file(int64_t path) {
@@ -1814,10 +2074,17 @@ int64_t nova_rt_any_to_str(int64_t val) {
         case NOVA_MEM_FAT_STR:  return val;
         case NOVA_MEM_LIST:     return nova_rt_list_to_str(val);
         case NOVA_MEM_DICT:     return nova_rt_json_stringify(val);
+        case NOVA_MEM_STRUCT:   return (int64_t)(uintptr_t)"<struct>";
+        case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"<iter>";
         default:
             if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
                 unsigned char c = *(unsigned char*)ptr;
                 if (c == 0 || (c >= 0x20 && c < 0x7F)) return val;
+            }
+            if (val < -(1LL << 52) || val > (1LL << 52)) {
+                uint64_t exp = ((uint64_t)val >> 52) & 0x7FF;
+                if (exp > 0 && exp < 0x7FF)
+                    return nova_rt_float_to_str(val);
             }
             return nova_rt_int_to_str(val);
     }
@@ -1839,6 +2106,24 @@ int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {
     return nova_rt_str_concat(sa, sb);
 }
 
+static inline int nova_is_likely_float(int64_t v) {
+    if (v == 0) return 0;
+    if (v > -(1LL << 52) && v < (1LL << 52)) return 0;
+    uint64_t exp = ((uint64_t)v >> 52) & 0x7FF;
+    return (exp > 0 && exp < 0x7FF);
+}
+
+static inline double nova_to_double(int64_t v) {
+    if (nova_is_likely_float(v)) {
+        double d; memcpy(&d, &v, 8); return d;
+    }
+    return (double)v;
+}
+
+static inline int64_t nova_from_double(double d) {
+    int64_t v; memcpy(&v, &d, 8); return v;
+}
+
 int64_t nova_rt_add(int64_t a, int64_t b) {
     void* pa = (void*)(uintptr_t)a;
     void* pb = (void*)(uintptr_t)b;
@@ -1850,28 +2135,119 @@ int64_t nova_rt_add(int64_t a, int64_t b) {
                     ((uint64_t)b > 0x10000 && tb == (NovaMemTag)-1 && nova_is_readable_str(pb)));
     if (a_is_str || b_is_str)
         return nova_rt_str_concat_safe(a, b);
+    if (nova_is_likely_float(a) || nova_is_likely_float(b))
+        return nova_from_double(nova_to_double(a) + nova_to_double(b));
     return a + b;
 }
 
+int64_t nova_rt_sub(int64_t a, int64_t b) {
+    if (nova_is_likely_float(a) || nova_is_likely_float(b))
+        return nova_from_double(nova_to_double(a) - nova_to_double(b));
+    return a - b;
+}
+
+int64_t nova_rt_mul(int64_t a, int64_t b) {
+    if (nova_is_likely_float(a) || nova_is_likely_float(b))
+        return nova_from_double(nova_to_double(a) * nova_to_double(b));
+    return a * b;
+}
+
+int64_t nova_rt_div(int64_t a, int64_t b) {
+    if (nova_is_likely_float(a) || nova_is_likely_float(b))
+        return nova_from_double(nova_to_double(a) / nova_to_double(b));
+    if (b == 0) return 0;
+    return a / b;
+}
+
+int64_t nova_rt_print_float(int64_t bits) {
+    int64_t s = nova_rt_float_to_str(bits);
+    puts((const char*)(uintptr_t)s);
+    return 0;
+}
+
 int64_t nova_rt_eq(int64_t a, int64_t b) {
+    if (a == b) return 1;
     void* pa = (void*)(uintptr_t)a;
     void* pb = (void*)(uintptr_t)b;
     NovaMemTag ta = nova_mem_find_tag(pa);
+    NovaMemTag tb = nova_mem_find_tag(pb);
     if (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
         ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa))) {
         if ((uint64_t)b < 0x10000) return 0;
         return (strcmp((const char*)pa, (const char*)pb) == 0) ? 1 : 0;
     }
-    return (a == b) ? 1 : 0;
+    if (ta == NOVA_MEM_LIST && tb == NOVA_MEM_LIST) {
+        NovaList* la = (NovaList*)(uintptr_t)a;
+        NovaList* lb = (NovaList*)(uintptr_t)b;
+        if (la->size != lb->size) return 0;
+        for (int64_t i = 0; i < la->size; i++) {
+            if (!nova_rt_eq(la->data[i], lb->data[i])) return 0;
+        }
+        return 1;
+    }
+    if (ta == NOVA_MEM_DICT && tb == NOVA_MEM_DICT) {
+        NovaDict* da = (NovaDict*)(uintptr_t)a;
+        NovaDict* db = (NovaDict*)(uintptr_t)b;
+        if (da->size != db->size) return 0;
+        for (int64_t i = 0; i < da->size; i++) {
+            int found = 0;
+            for (int64_t j = 0; j < db->size; j++) {
+                if (nova_rt_eq(da->keys[i], db->keys[j])) {
+                    if (!nova_rt_eq(da->vals[i], db->vals[j])) return 0;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) return 0;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 int64_t nova_rt_neq(int64_t a, int64_t b) {
     return nova_rt_eq(a, b) ? 0 : 1;
 }
 
+int64_t nova_rt_type_of(int64_t val) {
+    if (val == 0) return (int64_t)(uintptr_t)"int";
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    switch (tag) {
+        case NOVA_MEM_LIST:     return (int64_t)(uintptr_t)"list";
+        case NOVA_MEM_DICT:     return (int64_t)(uintptr_t)"dict";
+        case NOVA_MEM_CHANNEL:  return (int64_t)(uintptr_t)"channel";
+        case NOVA_MEM_RAW:      return (int64_t)(uintptr_t)"string";
+        case NOVA_MEM_FAT_STR:  return (int64_t)(uintptr_t)"string";
+        case NOVA_MEM_STRUCT:   return (int64_t)(uintptr_t)"struct";
+        case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"iter";
+        default:
+            if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr))
+                return (int64_t)(uintptr_t)"string";
+            return (int64_t)(uintptr_t)"int";
+    }
+}
+
 int64_t nova_rt_print_any(int64_t val) {
     int64_t s = nova_rt_any_to_str(val);
     puts((const char*)(uintptr_t)s);
+    return 0;
+}
+
+int64_t nova_rt_print_bool(int64_t val) {
+    puts(val ? "true" : "false");
+    return 0;
+}
+
+int64_t nova_rt_print_int(int64_t val) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)val);
+    puts(buf);
+    return 0;
+}
+
+int64_t nova_rt_print_str(int64_t val) {
+    puts((const char*)(uintptr_t)val);
     return 0;
 }
 
@@ -1936,6 +2312,39 @@ static int64_t channel_dequeue(NovaChannel* ch) {
 
 /* Returns 0 on success, -1 if channel is closed (sets __nova_error_flag). */
 int64_t nova_rt_channel_send(int64_t handle, int64_t value) {
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    /* Ownership: the receiver gets an independent deep copy, so sender and
+       receiver never share mutable heap state across the process boundary. */
+    int64_t copy = nova_rt_deep_copy(value);
+#ifdef _WIN32
+    EnterCriticalSection(&ch->lock);
+    if (ch->closed) {
+        LeaveCriticalSection(&ch->lock);
+        nova_rc_dec(copy);
+        return -1;
+    }
+    int was_empty = (ch->count == 0);
+    channel_enqueue(ch, copy);
+    if (was_empty) WakeConditionVariable(&ch->not_empty);
+    LeaveCriticalSection(&ch->lock);
+#else
+    pthread_mutex_lock(&ch->lock);
+    if (ch->closed) {
+        pthread_mutex_unlock(&ch->lock);
+        nova_rc_dec(copy);
+        return -1;
+    }
+    int was_empty = (ch->count == 0);
+    channel_enqueue(ch, copy);
+    if (was_empty) pthread_cond_signal(&ch->not_empty);
+    pthread_mutex_unlock(&ch->lock);
+#endif
+    return 0;
+}
+
+/* Move-send: compiler proved sender never uses value after this call,
+   so we skip the deep copy and transfer the value directly. */
+int64_t nova_rt_channel_send_move(int64_t handle, int64_t value) {
     NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
 #ifdef _WIN32
     EnterCriticalSection(&ch->lock);
@@ -2088,6 +2497,55 @@ int64_t nova_rt_channel_select(int64_t channels_ptr, int64_t count) {
     }
 }
 
+/* Select from a NovaList of channels. Returns NovaList [index, value].
+   If all channels are closed and empty, returns [-1, 0]. */
+int64_t nova_rt_select(int64_t list_handle) {
+    NovaList* channels = (NovaList*)(uintptr_t)list_handle;
+    if (!channels || channels->size == 0) {
+        int64_t result = nova_rt_list_create();
+        nova_rt_list_append(result, -1);
+        nova_rt_list_append(result, 0);
+        return result;
+    }
+
+    int64_t spins = 0;
+    int64_t value;
+
+    while (1) {
+        int64_t all_closed_empty = 1;
+        for (int64_t i = 0; i < channels->size; i++) {
+            NovaChannel* ch = (NovaChannel*)(uintptr_t)channels->data[i];
+            if (channel_try_recv(ch, &value)) {
+                int64_t result = nova_rt_list_create();
+                nova_rt_list_append(result, i);
+                nova_rt_list_append(result, value);
+                return result;
+            }
+            if (!channel_is_closed(ch) || ch->count > 0)
+                all_closed_empty = 0;
+        }
+        if (all_closed_empty) {
+            int64_t result = nova_rt_list_create();
+            nova_rt_list_append(result, -1);
+            nova_rt_list_append(result, 0);
+            return result;
+        }
+        if (++spins < 64) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        } else {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(500);
+#endif
+        }
+    }
+}
+
 /* Receive with timeout (milliseconds). Returns value on success,
    -1 on timeout or closed channel. */
 int64_t nova_rt_channel_recv_timeout(int64_t handle, int64_t timeout_ms) {
@@ -2158,8 +2616,22 @@ typedef struct {
 #endif
 } NovaProcessInfo;
 
+typedef struct NovaFuture {
+    int64_t result;
+    volatile int completed;
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE cv;
+#else
+    pthread_mutex_t lock;
+    pthread_cond_t cv;
+#endif
+} NovaFuture;
+
 typedef struct {
     NovaProcessInfo* proc;
+    NovaFuture* future;
+    int64_t closure;
 } NovaPoolTask;
 
 #define NOVA_POOL_QUEUE_CAP  4096
@@ -2228,15 +2700,27 @@ static DWORD WINAPI nova_pool_worker(LPVOID arg) {
         WakeConditionVariable(&pool->not_full);
         LeaveCriticalSection(&pool->lock);
 
-        NovaProcessInfo* proc = task.proc;
-        proc->fn(proc->ctx);
+        if (task.proc) {
+            NovaProcessInfo* proc = task.proc;
+            proc->fn(proc->ctx);
 
-        EnterCriticalSection(&proc->lock);
-        proc->exit_status = 0;
-        for (int64_t i = 0; i < proc->monitor_count; i++)
-            nova_rt_channel_send(proc->monitors[i], proc->exit_status);
-        proc->finished = 1;
-        LeaveCriticalSection(&proc->lock);
+            EnterCriticalSection(&proc->lock);
+            proc->exit_status = 0;
+            for (int64_t i = 0; i < proc->monitor_count; i++)
+                nova_rt_channel_send(proc->monitors[i], proc->exit_status);
+            proc->finished = 1;
+            LeaveCriticalSection(&proc->lock);
+        } else if (task.future) {
+            int64_t* rec = (int64_t*)(uintptr_t)task.closure;
+            nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+            int64_t result = fn(task.closure, 0);
+
+            EnterCriticalSection(&task.future->lock);
+            task.future->result = result;
+            task.future->completed = 1;
+            WakeAllConditionVariable(&task.future->cv);
+            LeaveCriticalSection(&task.future->lock);
+        }
 
         EnterCriticalSection(&pool->lock);
         pool->tasks_completed++;
@@ -2264,15 +2748,27 @@ static void* nova_pool_worker(void* arg) {
         pthread_cond_signal(&pool->not_full);
         pthread_mutex_unlock(&pool->lock);
 
-        NovaProcessInfo* proc = task.proc;
-        proc->fn(proc->ctx);
+        if (task.proc) {
+            NovaProcessInfo* proc = task.proc;
+            proc->fn(proc->ctx);
 
-        pthread_mutex_lock(&proc->lock);
-        proc->exit_status = 0;
-        for (int64_t i = 0; i < proc->monitor_count; i++)
-            nova_rt_channel_send(proc->monitors[i], proc->exit_status);
-        proc->finished = 1;
-        pthread_mutex_unlock(&proc->lock);
+            pthread_mutex_lock(&proc->lock);
+            proc->exit_status = 0;
+            for (int64_t i = 0; i < proc->monitor_count; i++)
+                nova_rt_channel_send(proc->monitors[i], proc->exit_status);
+            proc->finished = 1;
+            pthread_mutex_unlock(&proc->lock);
+        } else if (task.future) {
+            int64_t* rec = (int64_t*)(uintptr_t)task.closure;
+            nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+            int64_t result = fn(task.closure, 0);
+
+            pthread_mutex_lock(&task.future->lock);
+            task.future->result = result;
+            task.future->completed = 1;
+            pthread_cond_broadcast(&task.future->cv);
+            pthread_mutex_unlock(&task.future->lock);
+        }
 
         pthread_mutex_lock(&pool->lock);
         pool->tasks_completed++;
@@ -2374,11 +2870,10 @@ void nova_rt_init(void) {
     InitializeCriticalSection(&nova_proc_registry_lock);
 #endif
     nova_slab_init();
-    /* Probe heap base — all calloc/malloc addresses will be at or above this.
-       Integers from arithmetic (e.g. i*i) are far below this, enabling O(1) filter. */
     void* probe = malloc(64);
     if (probe) {
         nova_heap_base = (uintptr_t)probe;
+        nova_heap_top = (uintptr_t)probe + 64;
         free(probe);
     }
     srand((unsigned int)time(NULL));
@@ -2521,7 +3016,9 @@ int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
     NovaProcessInfo* proc = (NovaProcessInfo*)malloc(sizeof(NovaProcessInfo));
     if (!proc) return 0;
     proc->fn = (nova_spawn_entry)(uintptr_t)fn_ptr;
-    proc->ctx = (void*)(uintptr_t)ctx_ptr;
+    /* Ownership: the spawned process gets its own deep copy of the captured
+       environment, so it never shares mutable heap state with the spawner. */
+    proc->ctx = (void*)(uintptr_t)nova_rt_deep_copy(ctx_ptr);
     proc->monitors = NULL;
     proc->monitor_count = 0;
     proc->monitor_cap = 0;
@@ -2554,6 +3051,8 @@ int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
     while (pool->size >= NOVA_POOL_QUEUE_CAP)
         SleepConditionVariableCS(&pool->not_full, &pool->lock, INFINITE);
     pool->queue[pool->tail].proc = proc;
+    pool->queue[pool->tail].future = NULL;
+    pool->queue[pool->tail].closure = 0;
     pool->tail = (pool->tail + 1) % NOVA_POOL_QUEUE_CAP;
     pool->size++;
     pool->tasks_submitted++;
@@ -2564,6 +3063,8 @@ int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
     while (pool->size >= NOVA_POOL_QUEUE_CAP)
         pthread_cond_wait(&pool->not_full, &pool->lock);
     pool->queue[pool->tail].proc = proc;
+    pool->queue[pool->tail].future = NULL;
+    pool->queue[pool->tail].closure = 0;
     pool->tail = (pool->tail + 1) % NOVA_POOL_QUEUE_CAP;
     pool->size++;
     pool->tasks_submitted++;
@@ -2645,6 +3146,239 @@ void nova_rt_wait_all(void) {
     nova_pool_shutdown();
 }
 
+/* ── Auto-Parallelization Primitives ──────────────────────────────────────── */
+
+int64_t nova_rt_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int64_t n = (int64_t)si.dwNumberOfProcessors;
+    return n > 0 ? n : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int64_t)n : 1;
+#endif
+}
+
+typedef struct {
+    NovaList* input;
+    int64_t  start;
+    int64_t  end;
+    int64_t  closure;
+    int64_t* output;
+    uint8_t* keep;
+} NovaPTask;
+
+#ifdef _WIN32
+static DWORD WINAPI nova_pmap_worker(LPVOID arg) {
+#else
+static void* nova_pmap_worker(void* arg) {
+#endif
+    NovaPTask* t = (NovaPTask*)arg;
+    int64_t* rec = (int64_t*)(uintptr_t)t->closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = t->start; i < t->end; i++)
+        t->output[i] = fn(t->closure, t->input->data[i]);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI nova_pfilter_worker(LPVOID arg) {
+#else
+static void* nova_pfilter_worker(void* arg) {
+#endif
+    NovaPTask* t = (NovaPTask*)arg;
+    int64_t* rec = (int64_t*)(uintptr_t)t->closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = t->start; i < t->end; i++)
+        t->keep[i] = fn(t->closure, t->input->data[i]) ? 1 : 0;
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static int64_t nova_pmap_threshold = 256;
+
+static int nova_pmap_thread_count(int64_t n) {
+    int64_t cpus = nova_rt_cpu_count();
+    if (cpus < 1) cpus = 1;
+    if (cpus > 16) cpus = 16;
+    if (n < nova_pmap_threshold) return 1;
+    if (cpus > n) cpus = n;
+    return (int)cpus;
+}
+
+int64_t nova_rt_pmap(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create();
+    int64_t n = l->size;
+    int nt = nova_pmap_thread_count(n);
+    if (nt == 1) return nova_rt_list_map(handle, closure);
+
+    int64_t* output = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    if (!output) return nova_rt_list_map(handle, closure);
+
+    NovaPTask* tasks = (NovaPTask*)malloc((size_t)nt * sizeof(NovaPTask));
+    if (!tasks) { free(output); return nova_rt_list_map(handle, closure); }
+
+    int64_t chunk = n / nt;
+    for (int i = 0; i < nt; i++) {
+        tasks[i].input = l;
+        tasks[i].start = (int64_t)i * chunk;
+        tasks[i].end = (i == nt - 1) ? n : (int64_t)(i + 1) * chunk;
+        tasks[i].closure = closure;
+        tasks[i].output = output;
+        tasks[i].keep = NULL;
+    }
+
+#ifdef _WIN32
+    HANDLE* threads = (HANDLE*)malloc((size_t)nt * sizeof(HANDLE));
+    for (int i = 0; i < nt; i++)
+        threads[i] = CreateThread(NULL, 0, nova_pmap_worker, &tasks[i], 0, NULL);
+    WaitForMultipleObjects((DWORD)nt, threads, TRUE, INFINITE);
+    for (int i = 0; i < nt; i++) CloseHandle(threads[i]);
+    free(threads);
+#else
+    pthread_t* threads = (pthread_t*)malloc((size_t)nt * sizeof(pthread_t));
+    for (int i = 0; i < nt; i++)
+        pthread_create(&threads[i], NULL, nova_pmap_worker, &tasks[i]);
+    for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+    free(threads);
+#endif
+
+    int64_t result = nova_rt_list_create();
+    NovaList* res = (NovaList*)(uintptr_t)result;
+    if (n > res->cap) {
+        res->cap = n;
+        res->data = (int64_t*)realloc(res->data, (size_t)n * sizeof(int64_t));
+    }
+    memcpy(res->data, output, (size_t)n * sizeof(int64_t));
+    res->size = n;
+    /* Result list owns its elements: rc_inc each managed pointer so they survive
+       independently of the closure's transient returns. */
+    for (int64_t i = 0; i < n; i++) nova_rc_inc(res->data[i]);
+
+    free(output);
+    free(tasks);
+    return result;
+}
+
+int64_t nova_rt_pfilter(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create();
+    int64_t n = l->size;
+    int nt = nova_pmap_thread_count(n);
+    if (nt == 1) return nova_rt_list_filter(handle, closure);
+
+    uint8_t* keep = (uint8_t*)calloc((size_t)n, 1);
+    if (!keep) return nova_rt_list_filter(handle, closure);
+
+    NovaPTask* tasks = (NovaPTask*)malloc((size_t)nt * sizeof(NovaPTask));
+    if (!tasks) { free(keep); return nova_rt_list_filter(handle, closure); }
+
+    int64_t chunk = n / nt;
+    for (int i = 0; i < nt; i++) {
+        tasks[i].input = l;
+        tasks[i].start = (int64_t)i * chunk;
+        tasks[i].end = (i == nt - 1) ? n : (int64_t)(i + 1) * chunk;
+        tasks[i].closure = closure;
+        tasks[i].output = NULL;
+        tasks[i].keep = keep;
+    }
+
+#ifdef _WIN32
+    HANDLE* threads = (HANDLE*)malloc((size_t)nt * sizeof(HANDLE));
+    for (int i = 0; i < nt; i++)
+        threads[i] = CreateThread(NULL, 0, nova_pfilter_worker, &tasks[i], 0, NULL);
+    WaitForMultipleObjects((DWORD)nt, threads, TRUE, INFINITE);
+    for (int i = 0; i < nt; i++) CloseHandle(threads[i]);
+    free(threads);
+#else
+    pthread_t* threads = (pthread_t*)malloc((size_t)nt * sizeof(pthread_t));
+    for (int i = 0; i < nt; i++)
+        pthread_create(&threads[i], NULL, nova_pfilter_worker, &tasks[i]);
+    for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+    free(threads);
+#endif
+
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = 0; i < n; i++)
+        if (keep[i]) nova_rt_list_append(result, l->data[i]);
+
+    free(keep);
+    free(tasks);
+    return result;
+}
+
+typedef struct {
+    int64_t start;
+    int64_t end;
+    int64_t closure;
+} NovaPForTask;
+
+#ifdef _WIN32
+static DWORD WINAPI nova_pfor_worker(LPVOID arg) {
+#else
+static void* nova_pfor_worker(void* arg) {
+#endif
+    NovaPForTask* t = (NovaPForTask*)arg;
+    int64_t* rec = (int64_t*)(uintptr_t)t->closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    for (int64_t i = t->start; i < t->end; i++)
+        fn(t->closure, i);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+int64_t nova_rt_pfor(int64_t start, int64_t end, int64_t closure) {
+    int64_t n = end - start;
+    if (n <= 0) return 0;
+    int nt = nova_pmap_thread_count(n);
+    if (nt == 1) {
+        int64_t* rec = (int64_t*)(uintptr_t)closure;
+        nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+        for (int64_t i = start; i < end; i++) fn(closure, i);
+        return 0;
+    }
+
+    NovaPForTask* tasks = (NovaPForTask*)malloc((size_t)nt * sizeof(NovaPForTask));
+    if (!tasks) return 0;
+
+    int64_t chunk = n / nt;
+    for (int i = 0; i < nt; i++) {
+        tasks[i].start = start + (int64_t)i * chunk;
+        tasks[i].end = (i == nt - 1) ? end : start + (int64_t)(i + 1) * chunk;
+        tasks[i].closure = closure;
+    }
+
+#ifdef _WIN32
+    HANDLE* threads = (HANDLE*)malloc((size_t)nt * sizeof(HANDLE));
+    for (int i = 0; i < nt; i++)
+        threads[i] = CreateThread(NULL, 0, nova_pfor_worker, &tasks[i], 0, NULL);
+    WaitForMultipleObjects((DWORD)nt, threads, TRUE, INFINITE);
+    for (int i = 0; i < nt; i++) CloseHandle(threads[i]);
+    free(threads);
+#else
+    pthread_t* threads = (pthread_t*)malloc((size_t)nt * sizeof(pthread_t));
+    for (int i = 0; i < nt; i++)
+        pthread_create(&threads[i], NULL, nova_pfor_worker, &tasks[i]);
+    for (int i = 0; i < nt; i++) pthread_join(threads[i], NULL);
+    free(threads);
+#endif
+
+    free(tasks);
+    return 0;
+}
+
 /* ── Integer power (fast exponentiation by squaring) ─────────────────────── */
 
 int64_t nova_rt_int_pow(int64_t base, int64_t exp) {
@@ -2677,6 +3411,50 @@ int64_t nova_rt_exp(int64_t x)   { return f2i(exp(i2f(x))); }
 int64_t nova_rt_fabs(int64_t x)  { return f2i(fabs(i2f(x))); }
 int64_t nova_rt_fmod(int64_t x, int64_t y) { return f2i(fmod(i2f(x), i2f(y))); }
 int64_t nova_rt_round(int64_t x) { return f2i(round(i2f(x))); }
+int64_t nova_rt_sqrt(int64_t x)  { return f2i(sqrt(i2f(x))); }
+int64_t nova_rt_pow(int64_t x, int64_t y) { return f2i(pow(i2f(x), i2f(y))); }
+int64_t nova_rt_floor(int64_t x) { return (int64_t)floor(i2f(x)); }
+int64_t nova_rt_ceil(int64_t x)  { return (int64_t)ceil(i2f(x)); }
+int64_t nova_rt_abs(int64_t x) {
+    uint64_t ux = (uint64_t)x;
+    uint64_t exp = (ux >> 52) & 0x7FF;
+    if (exp > 0 && exp < 0x7FF) return (int64_t)(ux & 0x7FFFFFFFFFFFFFFFULL);
+    return x < 0 ? -x : x;
+}
+int64_t nova_rt_max(int64_t a, int64_t b) { return a > b ? a : b; }
+int64_t nova_rt_min(int64_t a, int64_t b) { return a < b ? a : b; }
+int64_t nova_rt_fmax(int64_t a, int64_t b) { return f2i(fmax(i2f(a), i2f(b))); }
+int64_t nova_rt_fmin(int64_t a, int64_t b) { return f2i(fmin(i2f(a), i2f(b))); }
+int64_t nova_rt_float_to_int(int64_t x) { return (int64_t)i2f(x); }
+int64_t nova_rt_int_to_float(int64_t x) { return f2i((double)x); }
+
+int64_t nova_rt_to_int(int64_t val) {
+    if (val == 0) return 0;
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR) return nova_rt_parse_int(val);
+    if ((uint64_t)val > 0x10000 && tag == (NovaMemTag)-1 && nova_is_readable_str(ptr)) {
+        unsigned char c = *(unsigned char*)ptr;
+        if (c >= 0x20 && c < 0x7F) return nova_rt_parse_int(val);
+    }
+    if (val < -(1LL << 52) || val > (1LL << 52)) {
+        uint64_t exp = ((uint64_t)val >> 52) & 0x7FF;
+        if (exp > 0 && exp < 0x7FF) return (int64_t)i2f(val);
+    }
+    return val;
+}
+
+int64_t nova_rt_to_float(int64_t val) {
+    if (val == 0) return f2i(0.0);
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR) return nova_rt_parse_float(val);
+    if ((uint64_t)val > 0x10000 && tag == (NovaMemTag)-1 && nova_is_readable_str(ptr)) {
+        unsigned char c = *(unsigned char*)ptr;
+        if (c >= 0x20 && c < 0x7F) return nova_rt_parse_float(val);
+    }
+    return f2i((double)val);
+}
 
 /* ── Reference Counting ────────────────────────────────────────────────── */
 
@@ -2781,7 +3559,15 @@ void nova_rc_inc(int64_t val) {
     int kind = nova_rc_is_managed(ptr);
     if (kind == 0) return;
     if (kind == -1) { nova_strpool_rc_inc(ptr); return; }
-    NOVA_RC_COUNT(ptr)++;
+    if (nova_is_multithreaded) {
+#ifdef _WIN32
+        InterlockedIncrement((volatile LONG*)&NOVA_RC_COUNT(ptr));
+#else
+        __sync_add_and_fetch(&NOVA_RC_COUNT(ptr), 1);
+#endif
+    } else {
+        NOVA_RC_COUNT(ptr)++;
+    }
 }
 
 static void nova_rc_dec_internal(int64_t val) {
@@ -2790,7 +3576,17 @@ static void nova_rc_dec_internal(int64_t val) {
     int kind = nova_rc_is_managed(ptr);
     if (kind == 0) return;
     if (kind == -1) { nova_strpool_rc_dec(ptr); return; }
-    if (--NOVA_RC_COUNT(ptr) <= 0) {
+    int32_t new_count;
+    if (nova_is_multithreaded) {
+#ifdef _WIN32
+        new_count = (int32_t)InterlockedDecrement((volatile LONG*)&NOVA_RC_COUNT(ptr));
+#else
+        new_count = __sync_sub_and_fetch(&NOVA_RC_COUNT(ptr), 1);
+#endif
+    } else {
+        new_count = --NOVA_RC_COUNT(ptr);
+    }
+    if (new_count <= 0) {
         nova_rc_free(ptr);
     }
 }
@@ -3733,6 +4529,112 @@ int64_t nova_rt_http_accept(int64_t server_val) {
     return list;
 }
 
+/* Read an HTTP request from an already-connected client socket. Returns the
+   raw request bytes (headers + body, up to Content-Length). Empty string on
+   connection error. Used by multi-threaded HTTP servers — accept first, then
+   spawn a worker that reads + parses + responds on a different thread. */
+int64_t nova_rt_http_read_request(int64_t client_val) {
+    NOVA_SOCKET client = (NOVA_SOCKET)client_val;
+    size_t cap = 65536;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return (int64_t)(uintptr_t)"";
+    size_t total = 0;
+    int header_done = 0;
+    size_t content_length = 0;
+    size_t body_start = 0;
+    while (total < cap - 1) {
+        int n = recv(client, buf + total, (int)(cap - 1 - total), 0);
+        if (n <= 0) break;
+        total += (size_t)n;
+        buf[total] = 0;
+        if (!header_done) {
+            char* end = strstr(buf, "\r\n\r\n");
+            if (end) {
+                header_done = 1;
+                body_start = (size_t)(end - buf) + 4;
+                char* cl = strstr(buf, "Content-Length:");
+                if (!cl) cl = strstr(buf, "content-length:");
+                if (cl) {
+                    cl += 15;
+                    while (*cl == ' ') cl++;
+                    content_length = (size_t)atol(cl);
+                }
+            }
+        }
+        if (header_done && total - body_start >= content_length) break;
+    }
+    char* tracked = (char*)nova_heap_alloc(total + 1, NOVA_MEM_RAW);
+    if (tracked) { memcpy(tracked, buf, total); tracked[total] = 0; }
+    else { tracked = (char*)""; }
+    free(buf);
+    return (int64_t)(uintptr_t)tracked;
+}
+
+/* Accept a connection and return [client_socket, raw_request_string].
+   Lets NOVA-side code parse HTTP without a C dependency on format details. */
+int64_t nova_rt_http_accept_raw(int64_t server_val) {
+    NOVA_SOCKET client = (NOVA_SOCKET)nova_rt_tcp_accept(server_val);
+    if ((int64_t)client == -1) return nova_rt_list_create();
+
+    /* Read up to 64K — enough for most requests including reasonable bodies */
+    size_t cap = 65536;
+    char* buf = (char*)malloc(cap);
+    if (!buf) { NOVA_CLOSE_SOCKET(client); return nova_rt_list_create(); }
+    size_t total = 0;
+    int header_done = 0;
+    size_t content_length = 0;
+    size_t body_start = 0;
+    while (total < cap - 1) {
+        int n = recv(client, buf + total, (int)(cap - 1 - total), 0);
+        if (n <= 0) break;
+        total += (size_t)n;
+        buf[total] = 0;
+        if (!header_done) {
+            char* end = strstr(buf, "\r\n\r\n");
+            if (end) {
+                header_done = 1;
+                body_start = (size_t)(end - buf) + 4;
+                /* Look for Content-Length */
+                char* cl = strstr(buf, "Content-Length:");
+                if (!cl) cl = strstr(buf, "content-length:");
+                if (cl) {
+                    cl += 15;
+                    while (*cl == ' ') cl++;
+                    content_length = (size_t)atol(cl);
+                }
+            }
+        }
+        if (header_done) {
+            if (total - body_start >= content_length) break;
+        }
+    }
+
+    int64_t list = nova_rt_list_create();
+    nova_rt_list_append(list, (int64_t)client);
+    char* tracked = (char*)nova_heap_alloc(total + 1, NOVA_MEM_RAW);
+    if (tracked) { memcpy(tracked, buf, total); tracked[total] = 0; }
+    else { tracked = (char*)""; }
+    nova_rt_list_append(list, (int64_t)(uintptr_t)tracked);
+    free(buf);
+    return list;
+}
+
+/* Send raw response bytes and close the connection.
+   The NOVA-side framework constructs the full response string. */
+void nova_rt_http_send_raw(int64_t client_val, int64_t response_ptr) {
+    NOVA_SOCKET client = (NOVA_SOCKET)client_val;
+    const char* response = (const char*)(uintptr_t)response_ptr;
+    if (!response) { NOVA_CLOSE_SOCKET(client); return; }
+    size_t len = strlen(response);
+    size_t sent = 0;
+    while (sent < len) {
+        int n = send(client, response + sent, (int)(len - sent), 0);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    NOVA_CLOSE_SOCKET(client);
+}
+
 void nova_rt_http_respond(int64_t client_val, int64_t status_val, int64_t body_ptr) {
     NOVA_SOCKET client = (NOVA_SOCKET)client_val;
     int status = (int)status_val;
@@ -3756,6 +4658,522 @@ void nova_rt_http_respond(int64_t client_val, int64_t status_val, int64_t body_p
     send(client, header, hlen, 0);
     if (body_len > 0) send(client, body, (int)body_len, 0);
     NOVA_CLOSE_SOCKET(client);
+}
+
+/* ── Extended Standard Library ──────────────────────────────────────────────── */
+
+typedef int64_t (*nova_fn2)(int64_t env, int64_t arg1, int64_t arg2);
+
+int64_t nova_rt_enumerate(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return nova_rt_list_create();
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t pair = nova_rt_list_create();
+        nova_rt_list_append(pair, i);
+        nova_rt_list_append(pair, l->data[i]);
+        nova_rt_list_append(result, pair);
+    }
+    return result;
+}
+
+int64_t nova_rt_zip(int64_t handle_a, int64_t handle_b) {
+    NovaList* a = (NovaList*)(uintptr_t)handle_a;
+    NovaList* b = (NovaList*)(uintptr_t)handle_b;
+    if (!a || !b) return nova_rt_list_create();
+    int64_t n = a->size < b->size ? a->size : b->size;
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = 0; i < n; i++) {
+        int64_t pair = nova_rt_list_create();
+        nova_rt_list_append(pair, a->data[i]);
+        nova_rt_list_append(pair, b->data[i]);
+        nova_rt_list_append(result, pair);
+    }
+    return result;
+}
+
+int64_t nova_rt_reduce(int64_t handle, int64_t closure, int64_t init) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
+    int64_t acc = init;
+    if (!l) return acc;
+    for (int64_t i = 0; i < l->size; i++) {
+        acc = fn(closure, acc, l->data[i]);
+    }
+    return acc;
+}
+
+int64_t nova_rt_any_match(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    if (!l) return 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (fn(closure, l->data[i])) return 1;
+    }
+    return 0;
+}
+
+int64_t nova_rt_all_match(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    if (!l) return 1;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (!fn(closure, l->data[i])) return 0;
+    }
+    return 1;
+}
+
+int64_t nova_rt_sum(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t acc = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        acc += l->data[i];
+    }
+    return acc;
+}
+
+int64_t nova_rt_index_of(int64_t handle, int64_t item) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return -1;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_rt_eq(l->data[i], item)) return i;
+    }
+    return -1;
+}
+
+static int64_t nova_sort_by_closure;
+static int nova_sort_by_cmp(const void* a, const void* b) {
+    int64_t va = *(const int64_t*)a;
+    int64_t vb = *(const int64_t*)b;
+    int64_t* rec = (int64_t*)(uintptr_t)nova_sort_by_closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t ka = fn(nova_sort_by_closure, va);
+    int64_t kb = fn(nova_sort_by_closure, vb);
+    if (ka < kb) return -1;
+    if (ka > kb) return 1;
+    return 0;
+}
+
+int64_t nova_rt_sort_by(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return handle;
+    int64_t new_list = nova_rt_list_create();
+    NovaList* result = (NovaList*)(uintptr_t)new_list;
+    result->cap = l->size;
+    result->data = realloc(result->data, (size_t)l->size * sizeof(int64_t));
+    memcpy(result->data, l->data, (size_t)l->size * sizeof(int64_t));
+    result->size = l->size;
+    for (int64_t i = 0; i < result->size; i++) nova_rc_inc(result->data[i]);
+    nova_sort_by_closure = closure;
+    qsort(result->data, (size_t)result->size, sizeof(int64_t), nova_sort_by_cmp);
+    return new_list;
+}
+
+int64_t nova_rt_dict_merge(int64_t handle_a, int64_t handle_b) {
+    int64_t result = nova_rt_dict_create();
+    NovaDict* a = (NovaDict*)(uintptr_t)handle_a;
+    NovaDict* b = (NovaDict*)(uintptr_t)handle_b;
+    if (a) {
+        for (int64_t i = 0; i < a->size; i++)
+            nova_rt_dict_set(result, a->keys[i], a->vals[i]);
+    }
+    if (b) {
+        for (int64_t i = 0; i < b->size; i++)
+            nova_rt_dict_set(result, b->keys[i], b->vals[i]);
+    }
+    return result;
+}
+
+int64_t nova_rt_str_count(int64_t s, int64_t sub) {
+    const char* str = (const char*)(uintptr_t)s;
+    const char* pat = (const char*)(uintptr_t)sub;
+    if (!str || !pat) return 0;
+    size_t plen = strlen(pat);
+    if (plen == 0) return 0;
+    int64_t count = 0;
+    const char* p = str;
+    while ((p = strstr(p, pat)) != NULL) {
+        count++;
+        p += plen;
+    }
+    return count;
+}
+
+int64_t nova_rt_lstrip(int64_t s) {
+    const char* str = (const char*)(uintptr_t)s;
+    if (!str) return (int64_t)(uintptr_t)"";
+    while (*str && isspace((unsigned char)*str)) str++;
+    size_t len = strlen(str);
+    char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!result) return (int64_t)(uintptr_t)"";
+    memcpy(result, str, len + 1);
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_rstrip(int64_t s) {
+    const char* str = (const char*)(uintptr_t)s;
+    if (!str) return (int64_t)(uintptr_t)"";
+    size_t len = strlen(str);
+    while (len > 0 && isspace((unsigned char)str[len - 1])) len--;
+    char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!result) return (int64_t)(uintptr_t)"";
+    memcpy(result, str, len);
+    result[len] = '\0';
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_pad_left(int64_t s, int64_t width, int64_t fill_char) {
+    const char* str = (const char*)(uintptr_t)s;
+    if (!str) str = "";
+    size_t slen = strlen(str);
+    int64_t w = width;
+    if (w < 0) w = 0;
+    if ((int64_t)slen >= w) {
+        char* r = (char*)nova_heap_alloc(slen + 1, NOVA_MEM_RAW);
+        if (!r) return s;
+        memcpy(r, str, slen + 1);
+        return (int64_t)(uintptr_t)r;
+    }
+    size_t pad = (size_t)(w - (int64_t)slen);
+    char fc = fill_char ? (char)(fill_char & 0xFF) : ' ';
+    char* result = (char*)nova_heap_alloc((size_t)w + 1, NOVA_MEM_RAW);
+    if (!result) return s;
+    memset(result, fc, pad);
+    memcpy(result + pad, str, slen);
+    result[w] = '\0';
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_pad_right(int64_t s, int64_t width, int64_t fill_char) {
+    const char* str = (const char*)(uintptr_t)s;
+    if (!str) str = "";
+    size_t slen = strlen(str);
+    int64_t w = width;
+    if (w < 0) w = 0;
+    if ((int64_t)slen >= w) {
+        char* r = (char*)nova_heap_alloc(slen + 1, NOVA_MEM_RAW);
+        if (!r) return s;
+        memcpy(r, str, slen + 1);
+        return (int64_t)(uintptr_t)r;
+    }
+    size_t pad = (size_t)(w - (int64_t)slen);
+    char fc = fill_char ? (char)(fill_char & 0xFF) : ' ';
+    char* result = (char*)nova_heap_alloc((size_t)w + 1, NOVA_MEM_RAW);
+    if (!result) return s;
+    memcpy(result, str, slen);
+    memset(result + slen, fc, pad);
+    result[w] = '\0';
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_cwd(void) {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD len = GetCurrentDirectoryA(sizeof(buf), buf);
+    if (len == 0 || len >= sizeof(buf)) return (int64_t)(uintptr_t)"";
+#else
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) return (int64_t)(uintptr_t)"";
+    size_t len = strlen(buf);
+#endif
+    char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!result) return (int64_t)(uintptr_t)"";
+    memcpy(result, buf, len);
+    result[len] = '\0';
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_list_dir(int64_t path_ptr) {
+    const char* path = (const char*)(uintptr_t)path_ptr;
+    int64_t list = nova_rt_list_create();
+    if (!path) return list;
+#ifdef _WIN32
+    char pattern[MAX_PATH + 3];
+    snprintf(pattern, sizeof(pattern), "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(pattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return list;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        size_t nlen = strlen(fd.cFileName);
+        char* name = (char*)nova_heap_alloc(nlen + 1, NOVA_MEM_RAW);
+        if (name) { memcpy(name, fd.cFileName, nlen + 1); }
+        else name = (char*)"";
+        nova_rt_list_append(list, (int64_t)(uintptr_t)name);
+    } while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
+#else
+    DIR* d = opendir(path);
+    if (!d) return list;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        size_t nlen = strlen(ent->d_name);
+        char* name = (char*)nova_heap_alloc(nlen + 1, NOVA_MEM_RAW);
+        if (name) { memcpy(name, ent->d_name, nlen + 1); }
+        else name = (char*)"";
+        nova_rt_list_append(list, (int64_t)(uintptr_t)name);
+    }
+    closedir(d);
+#endif
+    return list;
+}
+
+int64_t nova_rt_hash(int64_t val) {
+    if (val == 0) return 0;
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR ||
+        ((uint64_t)val > 0x10000 && tag == (NovaMemTag)-1 && nova_is_readable_str(ptr))) {
+        const char* s = (const char*)ptr;
+        uint64_t h = 14695981039346656037ULL;
+        while (*s) {
+            h ^= (uint64_t)(unsigned char)*s++;
+            h *= 1099511628211ULL;
+        }
+        return (int64_t)h;
+    }
+    uint64_t h = (uint64_t)val;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return (int64_t)h;
+}
+
+int64_t nova_rt_flatten(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (!l) return result;
+    for (int64_t i = 0; i < l->size; i++) {
+        void* ptr = (void*)(uintptr_t)l->data[i];
+        NovaMemTag tag = nova_mem_find_tag(ptr);
+        if (tag == NOVA_MEM_LIST) {
+            NovaList* sub = (NovaList*)ptr;
+            for (int64_t j = 0; j < sub->size; j++) {
+                nova_rt_list_append(result, sub->data[j]);
+            }
+        } else {
+            nova_rt_list_append(result, l->data[i]);
+        }
+    }
+    return result;
+}
+
+/* ── Tensor (n-dimensional double array) ──────────────────────────────────── */
+
+typedef struct {
+    double*  data;
+    int64_t* shape;     /* dimension sizes */
+    int64_t  rank;      /* number of dimensions */
+    int64_t  size;      /* total element count */
+} NovaTensor;
+
+static int64_t nova_tensor_size_from_shape(NovaList* shape) {
+    if (!shape || shape->size == 0) return 0;
+    int64_t s = 1;
+    for (int64_t i = 0; i < shape->size; i++) s *= shape->data[i];
+    return s;
+}
+
+int64_t nova_rt_tensor_zeros(int64_t shape_handle) {
+    NovaList* shape = (NovaList*)(uintptr_t)shape_handle;
+    if (!shape) return 0;
+    NovaTensor* t = (NovaTensor*)nova_heap_alloc(sizeof(NovaTensor), NOVA_MEM_RAW);
+    if (!t) return 0;
+    t->rank = shape->size;
+    t->size = nova_tensor_size_from_shape(shape);
+    t->shape = (int64_t*)malloc((size_t)t->rank * sizeof(int64_t));
+    t->data = (double*)calloc((size_t)t->size, sizeof(double));
+    if (!t->shape || !t->data) { free(t->shape); free(t->data); return 0; }
+    for (int64_t i = 0; i < t->rank; i++) t->shape[i] = shape->data[i];
+    return (int64_t)(uintptr_t)t;
+}
+
+int64_t nova_rt_tensor_from_list(int64_t data_handle, int64_t shape_handle) {
+    NovaList* data = (NovaList*)(uintptr_t)data_handle;
+    NovaList* shape = (NovaList*)(uintptr_t)shape_handle;
+    if (!data || !shape) return 0;
+    int64_t expected = nova_tensor_size_from_shape(shape);
+    if (data->size != expected) return 0;
+    int64_t handle = nova_rt_tensor_zeros(shape_handle);
+    NovaTensor* t = (NovaTensor*)(uintptr_t)handle;
+    if (!t) return 0;
+    for (int64_t i = 0; i < t->size; i++) {
+        /* Caller stored each element as either an int (raw bits) or float bits */
+        int64_t raw = data->data[i];
+        double d;
+        memcpy(&d, &raw, sizeof(double));
+        /* If the integer is "small" we treat it as an int value */
+        if (raw >= -1000000 && raw <= 1000000) {
+            d = (double)raw;
+        }
+        t->data[i] = d;
+    }
+    return handle;
+}
+
+int64_t nova_rt_tensor_shape(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return nova_rt_list_create();
+    int64_t list = nova_rt_list_create();
+    for (int64_t i = 0; i < t->rank; i++) nova_rt_list_append(list, t->shape[i]);
+    return list;
+}
+
+int64_t nova_rt_tensor_size(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    return t ? t->size : 0;
+}
+
+int64_t nova_rt_tensor_rank(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    return t ? t->rank : 0;
+}
+
+static int64_t nova_tensor_flat_index(NovaTensor* t, NovaList* indices) {
+    if (!t || !indices) return -1;
+    if (indices->size != t->rank) return -1;
+    int64_t flat = 0;
+    int64_t stride = 1;
+    for (int64_t i = t->rank - 1; i >= 0; i--) {
+        int64_t idx = indices->data[i];
+        if (idx < 0 || idx >= t->shape[i]) return -1;
+        flat += idx * stride;
+        stride *= t->shape[i];
+    }
+    return flat;
+}
+
+int64_t nova_rt_tensor_get(int64_t t_handle, int64_t indices_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    NovaList* indices = (NovaList*)(uintptr_t)indices_handle;
+    int64_t flat = nova_tensor_flat_index(t, indices);
+    if (flat < 0) return 0;
+    int64_t bits;
+    memcpy(&bits, &t->data[flat], sizeof(bits));
+    return bits;
+}
+
+void nova_rt_tensor_set(int64_t t_handle, int64_t indices_handle, int64_t val_bits) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    NovaList* indices = (NovaList*)(uintptr_t)indices_handle;
+    int64_t flat = nova_tensor_flat_index(t, indices);
+    if (flat < 0) return;
+    double d;
+    memcpy(&d, &val_bits, sizeof(d));
+    /* Accept ints stored as raw int64 too */
+    if (val_bits >= -1000000 && val_bits <= 1000000) d = (double)val_bits;
+    t->data[flat] = d;
+}
+
+static int nova_tensor_shapes_equal(NovaTensor* a, NovaTensor* b) {
+    if (!a || !b || a->rank != b->rank) return 0;
+    for (int64_t i = 0; i < a->rank; i++) if (a->shape[i] != b->shape[i]) return 0;
+    return 1;
+}
+
+static int64_t nova_tensor_alloc_like(NovaTensor* like) {
+    int64_t shape_list = nova_rt_list_create();
+    for (int64_t i = 0; i < like->rank; i++) nova_rt_list_append(shape_list, like->shape[i]);
+    return nova_rt_tensor_zeros(shape_list);
+}
+
+int64_t nova_rt_tensor_add(int64_t a_h, int64_t b_h) {
+    NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
+    NovaTensor* b = (NovaTensor*)(uintptr_t)b_h;
+    if (!nova_tensor_shapes_equal(a, b)) return 0;
+    int64_t r = nova_tensor_alloc_like(a);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    for (int64_t i = 0; i < a->size; i++) result->data[i] = a->data[i] + b->data[i];
+    return r;
+}
+
+int64_t nova_rt_tensor_mul(int64_t a_h, int64_t b_h) {
+    NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
+    NovaTensor* b = (NovaTensor*)(uintptr_t)b_h;
+    if (!nova_tensor_shapes_equal(a, b)) return 0;
+    int64_t r = nova_tensor_alloc_like(a);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    for (int64_t i = 0; i < a->size; i++) result->data[i] = a->data[i] * b->data[i];
+    return r;
+}
+
+int64_t nova_rt_tensor_scale(int64_t a_h, int64_t scalar_bits) {
+    NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
+    if (!a) return 0;
+    double s;
+    memcpy(&s, &scalar_bits, sizeof(s));
+    if (scalar_bits >= -1000000 && scalar_bits <= 1000000) s = (double)scalar_bits;
+    int64_t r = nova_tensor_alloc_like(a);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    for (int64_t i = 0; i < a->size; i++) result->data[i] = a->data[i] * s;
+    return r;
+}
+
+int64_t nova_rt_tensor_matmul(int64_t a_h, int64_t b_h) {
+    NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
+    NovaTensor* b = (NovaTensor*)(uintptr_t)b_h;
+    if (!a || !b || a->rank != 2 || b->rank != 2) return 0;
+    int64_t m = a->shape[0];
+    int64_t k = a->shape[1];
+    int64_t k2 = b->shape[0];
+    int64_t n = b->shape[1];
+    if (k != k2) return 0;
+
+    int64_t shape_list = nova_rt_list_create();
+    nova_rt_list_append(shape_list, m);
+    nova_rt_list_append(shape_list, n);
+    int64_t r = nova_rt_tensor_zeros(shape_list);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+
+    /* Standard ijk matmul. For larger sizes, blocked + parallel would be a win. */
+    for (int64_t i = 0; i < m; i++) {
+        for (int64_t kk = 0; kk < k; kk++) {
+            double aik = a->data[i * k + kk];
+            for (int64_t j = 0; j < n; j++) {
+                result->data[i * n + j] += aik * b->data[kk * n + j];
+            }
+        }
+    }
+    return r;
+}
+
+int64_t nova_rt_tensor_sum(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return 0;
+    double s = 0;
+    for (int64_t i = 0; i < t->size; i++) s += t->data[i];
+    int64_t bits;
+    memcpy(&bits, &s, sizeof(bits));
+    return bits;
+}
+
+int64_t nova_rt_tensor_relu(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return 0;
+    int64_t r = nova_tensor_alloc_like(t);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    for (int64_t i = 0; i < t->size; i++) result->data[i] = t->data[i] > 0 ? t->data[i] : 0;
+    return r;
+}
+
+int64_t nova_rt_tensor_to_list(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return nova_rt_list_create();
+    int64_t list = nova_rt_list_create();
+    for (int64_t i = 0; i < t->size; i++) {
+        int64_t bits;
+        memcpy(&bits, &t->data[i], sizeof(bits));
+        nova_rt_list_append(list, bits);
+    }
+    return list;
 }
 
 /* ── Byte Arrays ───────────────────────────────────────────────────────────── */
@@ -3854,6 +5272,15 @@ int64_t nova_rt_index_get(int64_t obj, int64_t index) {
     return nova_rt_str_char_at(obj, index);
 }
 
+int64_t nova_rt_slice_any(int64_t obj, int64_t start, int64_t end) {
+    void* ptr = (void*)(uintptr_t)obj;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_LIST) {
+        return nova_rt_list_slice(obj, start, end);
+    }
+    return nova_rt_slice(obj, start, end);
+}
+
 int64_t nova_rt_float_bits(int64_t str_val) {
     const char* s = (const char*)(uintptr_t)str_val;
     if (!s) return 0;
@@ -3873,4 +5300,1532 @@ int64_t nova_rt_index_set(int64_t obj, int64_t index, int64_t value) {
         return nova_rt_dict_set(obj, index, value);
     }
     return 0;
+}
+
+/* ── Result<T,E> and Option<T> ──────────────────────────────────────────── */
+
+typedef struct {
+    int64_t tag;   /* 0 = Ok/Some, 1 = Err/None */
+    int64_t value; /* payload (i64-encoded) */
+} NovaResult;
+
+static int64_t nova_result_pack(int64_t tag, int64_t value) {
+    NovaResult* r = (NovaResult*)nova_heap_alloc(sizeof(NovaResult), NOVA_MEM_RAW);
+    if (!r) { fprintf(stderr, "nova: OOM allocating Result\n"); exit(1); }
+    r->tag = tag;
+    r->value = value;
+    return (int64_t)(uintptr_t)r;
+}
+
+int64_t nova_rt_ok(int64_t value) {
+    return nova_result_pack(0, value);
+}
+
+int64_t nova_rt_err(int64_t value) {
+    return nova_result_pack(1, value);
+}
+
+int64_t nova_rt_some(int64_t value) {
+    return nova_result_pack(0, value);
+}
+
+int64_t nova_rt_none(void) {
+    return nova_result_pack(1, 0);
+}
+
+int64_t nova_rt_is_ok(int64_t handle) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    return r->tag == 0 ? 1 : 0;
+}
+
+int64_t nova_rt_is_err(int64_t handle) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    return r->tag == 1 ? 1 : 0;
+}
+
+int64_t nova_rt_is_some(int64_t handle) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    return r->tag == 0 ? 1 : 0;
+}
+
+int64_t nova_rt_is_none(int64_t handle) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    return r->tag == 1 ? 1 : 0;
+}
+
+int64_t nova_rt_unwrap(int64_t handle) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    if (r->tag != 0) {
+        if (r->value != 0) {
+            void* vp = (void*)(uintptr_t)r->value;
+            if (nova_strpool_contains(vp)) {
+                fprintf(stderr, "nova: unwrap called on Err/None: %s\n", (const char*)vp);
+            } else {
+                fprintf(stderr, "nova: unwrap called on Err/None (value=%lld)\n", (long long)r->value);
+            }
+        } else {
+            fprintf(stderr, "nova: unwrap called on None\n");
+        }
+        exit(1);
+    }
+    return r->value;
+}
+
+int64_t nova_rt_unwrap_err(int64_t handle) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    if (r->tag != 1) {
+        fprintf(stderr, "nova: unwrap_err called on Ok/Some\n");
+        exit(1);
+    }
+    return r->value;
+}
+
+int64_t nova_rt_unwrap_or(int64_t handle, int64_t default_val) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    if (r->tag == 0) return r->value;
+    return default_val;
+}
+
+int64_t nova_rt_result_tag(int64_t handle) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    return r->tag;
+}
+
+int64_t nova_rt_result_map(int64_t handle, int64_t closure) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    if (r->tag != 0) return handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    return nova_result_pack(0, fn(closure, r->value));
+}
+
+int64_t nova_rt_result_map_err(int64_t handle, int64_t closure) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    if (r->tag == 0) return handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    return nova_result_pack(1, fn(closure, r->value));
+}
+
+int64_t nova_rt_result_and_then(int64_t handle, int64_t closure) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    if (r->tag != 0) return handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    return fn(closure, r->value);
+}
+
+int64_t nova_rt_result_or_else(int64_t handle, int64_t closure) {
+    NovaResult* r = (NovaResult*)(uintptr_t)handle;
+    if (r->tag == 0) return handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    return fn(closure, r->value);
+}
+
+/* ── String formatting: format(template, args_list) ─────────────────────── */
+
+static void fmt_pad(char* out, int* pos, int max, const char* val, int vlen,
+                    int width, char fill, char align) {
+    if (width <= vlen || width <= 0) {
+        for (int i = 0; i < vlen && *pos < max - 1; i++)
+            out[(*pos)++] = val[i];
+        return;
+    }
+    int pad = width - vlen;
+    if (align == '>') {
+        for (int i = 0; i < pad && *pos < max - 1; i++) out[(*pos)++] = fill;
+        for (int i = 0; i < vlen && *pos < max - 1; i++) out[(*pos)++] = val[i];
+    } else if (align == '^') {
+        int lpad = pad / 2;
+        int rpad = pad - lpad;
+        for (int i = 0; i < lpad && *pos < max - 1; i++) out[(*pos)++] = fill;
+        for (int i = 0; i < vlen && *pos < max - 1; i++) out[(*pos)++] = val[i];
+        for (int i = 0; i < rpad && *pos < max - 1; i++) out[(*pos)++] = fill;
+    } else {
+        for (int i = 0; i < vlen && *pos < max - 1; i++) out[(*pos)++] = val[i];
+        for (int i = 0; i < pad && *pos < max - 1; i++) out[(*pos)++] = fill;
+    }
+}
+
+int64_t nova_rt_format(int64_t template_s, int64_t args_handle) {
+    const char* tmpl = (const char*)(uintptr_t)template_s;
+    NovaList* args = (NovaList*)(uintptr_t)args_handle;
+    int tlen = (int)strlen(tmpl);
+
+    char out[8192];
+    int pos = 0;
+    int arg_idx = 0;
+    int max = sizeof(out);
+
+    for (int i = 0; i < tlen && pos < max - 1; i++) {
+        if (tmpl[i] == '{' && i + 1 < tlen && tmpl[i+1] == '{') {
+            out[pos++] = '{';
+            i++;
+            continue;
+        }
+        if (tmpl[i] == '}' && i + 1 < tlen && tmpl[i+1] == '}') {
+            out[pos++] = '}';
+            i++;
+            continue;
+        }
+        if (tmpl[i] == '{') {
+            int spec_start = i + 1;
+            int spec_end = spec_start;
+            while (spec_end < tlen && tmpl[spec_end] != '}') spec_end++;
+            char spec[128] = {0};
+            int slen = spec_end - spec_start;
+            if (slen > 0 && slen < 127)
+                memcpy(spec, tmpl + spec_start, (size_t)slen);
+            i = spec_end;
+
+            int64_t val = (args && arg_idx < args->size) ? args->data[arg_idx++] : 0;
+
+            char fill = ' ';
+            char align = '<';
+            int width = 0;
+            int precision = -1;
+            char type_ch = 's';
+            int zero_pad = 0;
+
+            char* sp = spec;
+            if (*sp == ':') sp++;
+            if (sp[0] && sp[1] && (sp[1] == '<' || sp[1] == '>' || sp[1] == '^')) {
+                fill = sp[0];
+                align = sp[1];
+                sp += 2;
+            } else if (*sp == '<' || *sp == '>' || *sp == '^') {
+                align = *sp;
+                sp++;
+            }
+            if (*sp == '0') {
+                zero_pad = 1;
+                fill = '0';
+                align = '>';
+                sp++;
+            }
+            while (*sp >= '0' && *sp <= '9') {
+                width = width * 10 + (*sp - '0');
+                sp++;
+            }
+            if (*sp == '.') {
+                sp++;
+                precision = 0;
+                while (*sp >= '0' && *sp <= '9') {
+                    precision = precision * 10 + (*sp - '0');
+                    sp++;
+                }
+            }
+            if (*sp == 'd' || *sp == 'f' || *sp == 's' || *sp == 'x' || *sp == 'o' || *sp == 'b') {
+                type_ch = *sp;
+            } else if (*sp == 0 && slen == 0) {
+                type_ch = 0;
+            }
+
+            char vbuf[256];
+            int vlen = 0;
+
+            if (type_ch == 0 && precision < 0) {
+                int is_str = 0;
+                if (val != 0 && (uint64_t)val > 0x10000) {
+                    void* vp = (void*)(uintptr_t)val;
+                    NovaMemTag mt = nova_mem_find_tag(vp);
+                    if (mt == NOVA_MEM_RAW || mt == NOVA_MEM_FAT_STR) {
+                        is_str = 1;
+                    } else if (mt == (NovaMemTag)-1 && nova_is_readable_str(vp)) {
+                        is_str = 1;
+                    }
+                }
+                if (is_str) {
+                    const char* s = (const char*)(uintptr_t)val;
+                    if (s) { vlen = (int)strlen(s); if (vlen > 255) vlen = 255; memcpy(vbuf, s, (size_t)vlen); vbuf[vlen] = 0; }
+                } else {
+                    vlen = snprintf(vbuf, sizeof(vbuf), "%lld", (long long)val);
+                }
+            } else if (type_ch == 'd') {
+                vlen = snprintf(vbuf, sizeof(vbuf), "%lld", (long long)val);
+            } else if (type_ch == 'x') {
+                vlen = snprintf(vbuf, sizeof(vbuf), "%llx", (long long)val);
+            } else if (type_ch == 'o') {
+                vlen = snprintf(vbuf, sizeof(vbuf), "%llo", (long long)val);
+            } else if (type_ch == 'b') {
+                int64_t v = val;
+                if (v == 0) { vbuf[0] = '0'; vlen = 1; }
+                else {
+                    char tmp[66];
+                    int ti = 0;
+                    int64_t uv = v < 0 ? -v : v;
+                    while (uv > 0) { tmp[ti++] = '0' + (int)(uv & 1); uv >>= 1; }
+                    if (v < 0) { vbuf[0] = '-'; vlen = 1; }
+                    for (int j = ti - 1; j >= 0; j--) vbuf[vlen++] = tmp[j];
+                }
+                vbuf[vlen] = 0;
+            } else if (type_ch == 'f') {
+                double d;
+                memcpy(&d, &val, sizeof(d));
+                if (precision < 0) precision = 6;
+                vlen = snprintf(vbuf, sizeof(vbuf), "%.*f", precision, d);
+            } else if (type_ch == 's' || type_ch == 0) {
+                const char* s = (const char*)(uintptr_t)val;
+                if (s) {
+                    vlen = (int)strlen(s);
+                    if (precision >= 0 && vlen > precision) vlen = precision;
+                    if (vlen > 255) vlen = 255;
+                    memcpy(vbuf, s, (size_t)vlen);
+                    vbuf[vlen] = 0;
+                }
+            }
+
+            fmt_pad(out, &pos, max, vbuf, vlen, width, fill, align);
+        } else {
+            out[pos++] = tmpl[i];
+        }
+    }
+    out[pos] = 0;
+    char* result = nova_fat_str_create(out, (size_t)pos);
+    return result ? (int64_t)(uintptr_t)result : 0;
+}
+
+int64_t nova_rt_center(int64_t s_handle, int64_t width, int64_t fill_char) {
+    const char* s = (const char*)(uintptr_t)s_handle;
+    if (!s) s = "";
+    size_t slen = strlen(s);
+    int64_t w = width;
+    if (w < 0) w = 0;
+    if ((int64_t)slen >= w) {
+        char* r = (char*)nova_heap_alloc(slen + 1, NOVA_MEM_RAW);
+        if (!r) return s_handle;
+        memcpy(r, s, slen + 1);
+        return (int64_t)(uintptr_t)r;
+    }
+    char fc = fill_char ? (char)(fill_char & 0xFF) : ' ';
+    char* result = (char*)nova_heap_alloc((size_t)w + 1, NOVA_MEM_RAW);
+    if (!result) return s_handle;
+    size_t pad = (size_t)(w - (int64_t)slen);
+    size_t lpad = pad / 2;
+    size_t rpad = pad - lpad;
+    memset(result, fc, lpad);
+    memcpy(result + lpad, s, slen);
+    memset(result + lpad + slen, fc, rpad);
+    result[w] = '\0';
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_hex(int64_t val) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%llx", (long long)val);
+    char* r = nova_fat_str_create(buf, (size_t)len);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
+int64_t nova_rt_oct(int64_t val) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%llo", (long long)val);
+    char* r = nova_fat_str_create(buf, (size_t)len);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
+int64_t nova_rt_bin(int64_t val) {
+    char buf[68];
+    if (val == 0) {
+        char* r = nova_fat_str_create("0", 1);
+        return r ? (int64_t)(uintptr_t)r : 0;
+    }
+    int bpos = 0;
+    int64_t v = val < 0 ? -val : val;
+    char tmp[66];
+    int ti = 0;
+    while (v > 0) { tmp[ti++] = '0' + (int)(v & 1); v >>= 1; }
+    if (val < 0) buf[bpos++] = '-';
+    for (int j = ti - 1; j >= 0; j--) buf[bpos++] = tmp[j];
+    buf[bpos] = 0;
+    char* r = nova_fat_str_create(buf, (size_t)bpos);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
+/* ── Lazy Iterator Protocol ────────────────────────────────────────────────
+ *
+ * An iterator is a heap-allocated record (int64_t[]) tagged NOVA_MEM_ITER:
+ *   rec[0] = next function pointer (nova_fn1: (self, dummy) -> Option)
+ *   rec[1..N] = state (varies by iterator kind)
+ *
+ * Calling iter_next(it) invokes rec[0](it, 0) and returns some(val) or none().
+ * Transform iterators (map, filter, take, ...) wrap a source iterator and
+ * return a new iterator — no intermediate lists are created.
+ * Terminal operations (collect, reduce, sum, ...) consume the iterator.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static int64_t* nova_iter_alloc(int count) {
+    int64_t* rec = (int64_t*)nova_heap_alloc((size_t)count * sizeof(int64_t), NOVA_MEM_ITER);
+    if (!rec) { fprintf(stderr, "nova: OOM allocating iterator\n"); exit(1); }
+    return rec;
+}
+
+/* ── Source: array ─────────────────────────────────────────────────────── */
+/* rec: [next_fn, list_handle, index, length] */
+
+static int64_t nova_iter_array_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    int64_t idx = rec[2];
+    int64_t len = rec[3];
+    if (idx >= len) return nova_rt_none();
+    rec[2] = idx + 1;
+    NovaList* l = (NovaList*)(uintptr_t)rec[1];
+    return nova_rt_some(l->data[idx]);
+}
+
+int64_t nova_rt_iter(int64_t list_handle) {
+    NovaList* l = (NovaList*)(uintptr_t)list_handle;
+    int64_t len = l ? l->size : 0;
+    int64_t* rec = nova_iter_alloc(4);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_array_next;
+    rec[1] = list_handle;
+    rec[2] = 0;
+    rec[3] = len;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Source: range ─────────────────────────────────────────────────────── */
+/* rec: [next_fn, current, end, step] */
+
+static int64_t nova_iter_range_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    int64_t cur  = rec[1];
+    int64_t end  = rec[2];
+    int64_t step = rec[3];
+    if (step > 0 && cur >= end) return nova_rt_none();
+    if (step < 0 && cur <= end) return nova_rt_none();
+    if (step == 0) return nova_rt_none();
+    rec[1] = cur + step;
+    return nova_rt_some(cur);
+}
+
+int64_t nova_rt_iter_range(int64_t start, int64_t end) {
+    int64_t* rec = nova_iter_alloc(4);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_range_next;
+    rec[1] = start;
+    rec[2] = end;
+    rec[3] = 1;
+    return (int64_t)(uintptr_t)rec;
+}
+
+int64_t nova_rt_iter_range_step(int64_t start, int64_t end, int64_t step) {
+    int64_t* rec = nova_iter_alloc(4);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_range_next;
+    rec[1] = start;
+    rec[2] = end;
+    rec[3] = step;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: map ───────────────────────────────────────────────────── */
+/* rec: [next_fn, source_iter, transform_closure] */
+
+static int64_t nova_iter_map_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    int64_t src = rec[1];
+    int64_t* src_rec = (int64_t*)(uintptr_t)src;
+    nova_fn1 src_next = (nova_fn1)(uintptr_t)src_rec[0];
+    int64_t opt = src_next(src, 0);
+    if (nova_rt_is_none(opt)) return opt;
+    int64_t val = nova_rt_unwrap(opt);
+    int64_t* tf_rec = (int64_t*)(uintptr_t)rec[2];
+    nova_fn1 tf_fn = (nova_fn1)(uintptr_t)tf_rec[0];
+    return nova_rt_some(tf_fn(rec[2], val));
+}
+
+int64_t nova_rt_iter_map(int64_t iter, int64_t closure) {
+    int64_t* rec = nova_iter_alloc(3);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_map_next;
+    rec[1] = iter;
+    rec[2] = closure;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: filter ────────────────────────────────────────────────── */
+/* rec: [next_fn, source_iter, predicate_closure] */
+
+static int64_t nova_iter_filter_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    int64_t src = rec[1];
+    int64_t* src_rec = (int64_t*)(uintptr_t)src;
+    nova_fn1 src_next = (nova_fn1)(uintptr_t)src_rec[0];
+    int64_t* pred_rec = (int64_t*)(uintptr_t)rec[2];
+    nova_fn1 pred_fn = (nova_fn1)(uintptr_t)pred_rec[0];
+    for (;;) {
+        int64_t opt = src_next(src, 0);
+        if (nova_rt_is_none(opt)) return opt;
+        int64_t val = nova_rt_unwrap(opt);
+        if (pred_fn(rec[2], val)) return nova_rt_some(val);
+    }
+}
+
+int64_t nova_rt_iter_filter(int64_t iter, int64_t closure) {
+    int64_t* rec = nova_iter_alloc(3);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_filter_next;
+    rec[1] = iter;
+    rec[2] = closure;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: take ──────────────────────────────────────────────────── */
+/* rec: [next_fn, source_iter, remaining] */
+
+static int64_t nova_iter_take_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    if (rec[2] <= 0) return nova_rt_none();
+    rec[2]--;
+    int64_t* src_rec = (int64_t*)(uintptr_t)rec[1];
+    nova_fn1 src_next = (nova_fn1)(uintptr_t)src_rec[0];
+    return src_next(rec[1], 0);
+}
+
+int64_t nova_rt_iter_take(int64_t iter, int64_t n) {
+    int64_t* rec = nova_iter_alloc(3);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_take_next;
+    rec[1] = iter;
+    rec[2] = n;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: skip ──────────────────────────────────────────────────── */
+/* rec: [next_fn, source_iter, remaining_to_skip] */
+
+static int64_t nova_iter_skip_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    int64_t src = rec[1];
+    int64_t* src_rec = (int64_t*)(uintptr_t)src;
+    nova_fn1 src_next = (nova_fn1)(uintptr_t)src_rec[0];
+    while (rec[2] > 0) {
+        int64_t opt = src_next(src, 0);
+        if (nova_rt_is_none(opt)) return opt;
+        rec[2]--;
+    }
+    return src_next(src, 0);
+}
+
+int64_t nova_rt_iter_skip(int64_t iter, int64_t n) {
+    int64_t* rec = nova_iter_alloc(3);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_skip_next;
+    rec[1] = iter;
+    rec[2] = n;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: zip ───────────────────────────────────────────────────── */
+/* rec: [next_fn, iter1, iter2]  — yields [a, b] pairs as 2-element lists */
+
+static int64_t nova_iter_zip_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    int64_t* r1 = (int64_t*)(uintptr_t)rec[1];
+    int64_t* r2 = (int64_t*)(uintptr_t)rec[2];
+    nova_fn1 n1 = (nova_fn1)(uintptr_t)r1[0];
+    nova_fn1 n2 = (nova_fn1)(uintptr_t)r2[0];
+    int64_t o1 = n1(rec[1], 0);
+    if (nova_rt_is_none(o1)) return o1;
+    int64_t o2 = n2(rec[2], 0);
+    if (nova_rt_is_none(o2)) return o2;
+    int64_t pair = nova_rt_list_create();
+    nova_rt_list_append(pair, nova_rt_unwrap(o1));
+    nova_rt_list_append(pair, nova_rt_unwrap(o2));
+    return nova_rt_some(pair);
+}
+
+int64_t nova_rt_iter_zip(int64_t iter1, int64_t iter2) {
+    int64_t* rec = nova_iter_alloc(3);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_zip_next;
+    rec[1] = iter1;
+    rec[2] = iter2;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: chain ─────────────────────────────────────────────────── */
+/* rec: [next_fn, iter1, iter2, phase]  — phase 0=first, 1=second */
+
+static int64_t nova_iter_chain_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    if (rec[3] == 0) {
+        int64_t* r1 = (int64_t*)(uintptr_t)rec[1];
+        nova_fn1 n1 = (nova_fn1)(uintptr_t)r1[0];
+        int64_t opt = n1(rec[1], 0);
+        if (!nova_rt_is_none(opt)) return opt;
+        rec[3] = 1;
+    }
+    int64_t* r2 = (int64_t*)(uintptr_t)rec[2];
+    nova_fn1 n2 = (nova_fn1)(uintptr_t)r2[0];
+    return n2(rec[2], 0);
+}
+
+int64_t nova_rt_iter_chain(int64_t iter1, int64_t iter2) {
+    int64_t* rec = nova_iter_alloc(4);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_chain_next;
+    rec[1] = iter1;
+    rec[2] = iter2;
+    rec[3] = 0;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: enumerate ─────────────────────────────────────────────── */
+/* rec: [next_fn, source_iter, counter]  — yields [index, value] pairs */
+
+static int64_t nova_iter_enumerate_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    int64_t src = rec[1];
+    int64_t* src_rec = (int64_t*)(uintptr_t)src;
+    nova_fn1 src_next = (nova_fn1)(uintptr_t)src_rec[0];
+    int64_t opt = src_next(src, 0);
+    if (nova_rt_is_none(opt)) return opt;
+    int64_t idx = rec[2];
+    rec[2] = idx + 1;
+    int64_t pair = nova_rt_list_create();
+    nova_rt_list_append(pair, idx);
+    nova_rt_list_append(pair, nova_rt_unwrap(opt));
+    return nova_rt_some(pair);
+}
+
+int64_t nova_rt_iter_enumerate(int64_t iter) {
+    int64_t* rec = nova_iter_alloc(3);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_enumerate_next;
+    rec[1] = iter;
+    rec[2] = 0;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Transform: flat_map ──────────────────────────────────────────────── */
+/* rec: [next_fn, source_iter, transform_closure, current_inner_iter]
+ * transform returns an iterator; we flatten all inner iterators */
+
+static int64_t nova_iter_flat_map_next(int64_t self, int64_t dummy) {
+    int64_t* rec = (int64_t*)(uintptr_t)self;
+    for (;;) {
+        if (rec[3] != 0) {
+            int64_t* inner_rec = (int64_t*)(uintptr_t)rec[3];
+            nova_fn1 inner_next = (nova_fn1)(uintptr_t)inner_rec[0];
+            int64_t opt = inner_next(rec[3], 0);
+            if (!nova_rt_is_none(opt)) return opt;
+            rec[3] = 0;
+        }
+        int64_t src = rec[1];
+        int64_t* src_rec = (int64_t*)(uintptr_t)src;
+        nova_fn1 src_next = (nova_fn1)(uintptr_t)src_rec[0];
+        int64_t outer_opt = src_next(src, 0);
+        if (nova_rt_is_none(outer_opt)) return outer_opt;
+        int64_t* tf_rec = (int64_t*)(uintptr_t)rec[2];
+        nova_fn1 tf_fn = (nova_fn1)(uintptr_t)tf_rec[0];
+        rec[3] = tf_fn(rec[2], nova_rt_unwrap(outer_opt));
+    }
+}
+
+int64_t nova_rt_iter_flat_map(int64_t iter, int64_t closure) {
+    int64_t* rec = nova_iter_alloc(4);
+    rec[0] = (int64_t)(uintptr_t)nova_iter_flat_map_next;
+    rec[1] = iter;
+    rec[2] = closure;
+    rec[3] = 0;
+    return (int64_t)(uintptr_t)rec;
+}
+
+/* ── Terminal: next ───────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_next(int64_t iter) {
+    if (!iter) return nova_rt_none();
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    return next_fn(iter, 0);
+}
+
+/* ── Terminal: collect ────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_collect(int64_t iter) {
+    int64_t list = nova_rt_list_create();
+    if (!iter) return list;
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) break;
+        nova_rt_list_append(list, nova_rt_unwrap(opt));
+    }
+    return list;
+}
+
+/* ── Terminal: reduce ─────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_reduce(int64_t iter, int64_t init, int64_t closure) {
+    int64_t acc = init;
+    if (!iter) return acc;
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t* cf = (int64_t*)(uintptr_t)closure;
+    nova_fn2 fn = (nova_fn2)(uintptr_t)cf[0];
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) break;
+        acc = fn(closure, acc, nova_rt_unwrap(opt));
+    }
+    return acc;
+}
+
+/* ── Terminal: for_each ───────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_for_each(int64_t iter, int64_t closure) {
+    if (!iter) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t* cf = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)cf[0];
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) break;
+        fn(closure, nova_rt_unwrap(opt));
+    }
+    return 0;
+}
+
+/* ── Terminal: count ──────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_count(int64_t iter) {
+    if (!iter) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t n = 0;
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) break;
+        n++;
+    }
+    return n;
+}
+
+/* ── Terminal: sum ────────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_sum(int64_t iter) {
+    if (!iter) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t acc = 0;
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) break;
+        acc += nova_rt_unwrap(opt);
+    }
+    return acc;
+}
+
+/* ── Terminal: any ────────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_any(int64_t iter, int64_t closure) {
+    if (!iter) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t* cf = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)cf[0];
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) return 0;
+        if (fn(closure, nova_rt_unwrap(opt))) return 1;
+    }
+}
+
+/* ── Terminal: all ────────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_all(int64_t iter, int64_t closure) {
+    if (!iter) return 1;
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t* cf = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)cf[0];
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) return 1;
+        if (!fn(closure, nova_rt_unwrap(opt))) return 0;
+    }
+}
+
+/* ── Terminal: find ───────────────────────────────────────────────────── */
+
+int64_t nova_rt_iter_find(int64_t iter, int64_t closure) {
+    if (!iter) return nova_rt_none();
+    int64_t* rec = (int64_t*)(uintptr_t)iter;
+    nova_fn1 next_fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t* cf = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)cf[0];
+    for (;;) {
+        int64_t opt = next_fn(iter, 0);
+        if (nova_rt_is_none(opt)) return opt;
+        int64_t val = nova_rt_unwrap(opt);
+        if (fn(closure, val)) return nova_rt_some(val);
+    }
+}
+
+/* ── Async/Await (Future-based thread pool scheduling) ─────────────────────
+ *
+ * async(closure)      — submit closure to thread pool, returns future handle
+ * await(future)       — block until done, return result
+ * await_all(futures)  — block until all done, return list of results
+ * await_any(futures)  — block until first done, return [index, result]
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static NovaFuture* nova_future_create(void) {
+    NovaFuture* f = (NovaFuture*)calloc(1, sizeof(NovaFuture));
+    if (!f) { fprintf(stderr, "nova: OOM allocating future\n"); exit(1); }
+    f->result = 0;
+    f->completed = 0;
+#ifdef _WIN32
+    InitializeCriticalSection(&f->lock);
+    InitializeConditionVariable(&f->cv);
+#else
+    pthread_mutex_init(&f->lock, NULL);
+    pthread_cond_init(&f->cv, NULL);
+#endif
+    return f;
+}
+
+int64_t nova_rt_async(int64_t closure) {
+    if (!nova_pool) nova_pool_init();
+    NovaThreadPool* pool = nova_pool;
+    NovaFuture* f = nova_future_create();
+
+#ifdef _WIN32
+    EnterCriticalSection(&pool->lock);
+    while (pool->size >= NOVA_POOL_QUEUE_CAP)
+        SleepConditionVariableCS(&pool->not_full, &pool->lock, INFINITE);
+    pool->queue[pool->tail].proc = NULL;
+    pool->queue[pool->tail].future = f;
+    pool->queue[pool->tail].closure = closure;
+    pool->tail = (pool->tail + 1) % NOVA_POOL_QUEUE_CAP;
+    pool->size++;
+    pool->tasks_submitted++;
+    WakeConditionVariable(&pool->not_empty);
+    LeaveCriticalSection(&pool->lock);
+#else
+    pthread_mutex_lock(&pool->lock);
+    while (pool->size >= NOVA_POOL_QUEUE_CAP)
+        pthread_cond_wait(&pool->not_full, &pool->lock);
+    pool->queue[pool->tail].proc = NULL;
+    pool->queue[pool->tail].future = f;
+    pool->queue[pool->tail].closure = closure;
+    pool->tail = (pool->tail + 1) % NOVA_POOL_QUEUE_CAP;
+    pool->size++;
+    pool->tasks_submitted++;
+    pthread_cond_signal(&pool->not_empty);
+    pthread_mutex_unlock(&pool->lock);
+#endif
+
+    return (int64_t)(uintptr_t)f;
+}
+
+int64_t nova_rt_await(int64_t handle) {
+    NovaFuture* f = (NovaFuture*)(uintptr_t)handle;
+    if (!f) return 0;
+#ifdef _WIN32
+    EnterCriticalSection(&f->lock);
+    while (!f->completed)
+        SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
+    int64_t result = f->result;
+    LeaveCriticalSection(&f->lock);
+#else
+    pthread_mutex_lock(&f->lock);
+    while (!f->completed)
+        pthread_cond_wait(&f->cv, &f->lock);
+    int64_t result = f->result;
+    pthread_mutex_unlock(&f->lock);
+#endif
+    return result;
+}
+
+int64_t nova_rt_await_all(int64_t list_handle) {
+    NovaList* list = (NovaList*)(uintptr_t)list_handle;
+    int64_t results = nova_rt_list_create();
+    if (!list) return results;
+    for (int64_t i = 0; i < list->size; i++) {
+        int64_t r = nova_rt_await(list->data[i]);
+        nova_rt_list_append(results, r);
+    }
+    return results;
+}
+
+int64_t nova_rt_await_any(int64_t list_handle) {
+    NovaList* list = (NovaList*)(uintptr_t)list_handle;
+    if (!list || list->size == 0) return nova_rt_none();
+    for (;;) {
+        for (int64_t i = 0; i < list->size; i++) {
+            NovaFuture* f = (NovaFuture*)(uintptr_t)list->data[i];
+            if (f->completed) {
+                int64_t pair = nova_rt_list_create();
+                nova_rt_list_append(pair, i);
+                nova_rt_list_append(pair, f->result);
+                return pair;
+            }
+        }
+#ifdef _WIN32
+        NovaFuture* first = (NovaFuture*)(uintptr_t)list->data[0];
+        EnterCriticalSection(&first->lock);
+        if (!first->completed)
+            SleepConditionVariableCS(&first->cv, &first->lock, 1);
+        LeaveCriticalSection(&first->lock);
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000;
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        NovaFuture* first = (NovaFuture*)(uintptr_t)list->data[0];
+        pthread_mutex_lock(&first->lock);
+        if (!first->completed)
+            pthread_cond_timedwait(&first->cv, &first->lock, &ts);
+        pthread_mutex_unlock(&first->lock);
+#endif
+    }
+}
+
+/* ── Test Framework ────────────────────────────────────────────────────────
+ *
+ * assert_eq / assert_ne / assert_true / assert_false — track pass/fail
+ * test_run(name, closure) — runs a test, reports result
+ * test_summary() — prints totals, returns 0 if all pass, 1 if any fail
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static int64_t nova_test_pass = 0;
+static int64_t nova_test_fail = 0;
+
+static void nova_test_print_val(int64_t val) {
+    int64_t s = nova_rt_any_to_str(val);
+    const char* str = (const char*)(uintptr_t)s;
+    if (str) fprintf(stderr, "%s", str);
+    else fprintf(stderr, "%lld", (long long)val);
+}
+
+int64_t nova_rt_assert_eq(int64_t actual, int64_t expected) {
+    if (nova_rt_eq(actual, expected)) {
+        nova_test_pass++;
+        return 1;
+    }
+    nova_test_fail++;
+    fprintf(stderr, "  FAIL assert_eq: expected ");
+    nova_test_print_val(expected);
+    fprintf(stderr, " but got ");
+    nova_test_print_val(actual);
+    fprintf(stderr, "\n");
+    return 0;
+}
+
+int64_t nova_rt_assert_ne(int64_t actual, int64_t expected) {
+    if (!nova_rt_eq(actual, expected)) {
+        nova_test_pass++;
+        return 1;
+    }
+    nova_test_fail++;
+    fprintf(stderr, "  FAIL assert_ne: values should differ but both are ");
+    nova_test_print_val(actual);
+    fprintf(stderr, "\n");
+    return 0;
+}
+
+int64_t nova_rt_assert_true(int64_t val) {
+    if (val) {
+        nova_test_pass++;
+        return 1;
+    }
+    nova_test_fail++;
+    fprintf(stderr, "  FAIL assert_true: got falsy value\n");
+    return 0;
+}
+
+int64_t nova_rt_assert_false(int64_t val) {
+    if (!val) {
+        nova_test_pass++;
+        return 1;
+    }
+    nova_test_fail++;
+    fprintf(stderr, "  FAIL assert_false: got truthy value %lld\n", (long long)val);
+    return 0;
+}
+
+int64_t nova_rt_assert_near(int64_t actual_bits, int64_t expected_bits, int64_t eps_bits) {
+    double a, e, eps;
+    memcpy(&a, &actual_bits, sizeof(double));
+    memcpy(&e, &expected_bits, sizeof(double));
+    memcpy(&eps, &eps_bits, sizeof(double));
+    if (fabs(a - e) <= eps) {
+        nova_test_pass++;
+        return 1;
+    }
+    nova_test_fail++;
+    fprintf(stderr, "  FAIL assert_near: expected %.15g ± %.15g but got %.15g (diff=%.15g)\n",
+            e, eps, a, fabs(a - e));
+    return 0;
+}
+
+int64_t nova_rt_test_run(int64_t name, int64_t closure) {
+    const char* n = (const char*)(uintptr_t)name;
+    if (!n) n = "<unnamed>";
+    int64_t before_fail = nova_test_fail;
+    int64_t before_pass = nova_test_pass;
+
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    fn(closure, 0);
+
+    int64_t new_fails = nova_test_fail - before_fail;
+    int64_t new_pass  = nova_test_pass - before_pass;
+    if (new_fails > 0) {
+        fprintf(stderr, "FAIL %s (%lld passed, %lld failed)\n",
+                n, (long long)new_pass, (long long)new_fails);
+        return 0;
+    }
+    printf("  ok %s (%lld assertions)\n", n, (long long)new_pass);
+    return 1;
+}
+
+int64_t nova_rt_test_summary(void) {
+    int64_t total = nova_test_pass + nova_test_fail;
+    if (nova_test_fail == 0) {
+        printf("\nAll tests passed: %lld assertions in total\n", (long long)total);
+    } else {
+        fprintf(stderr, "\nTest results: %lld passed, %lld FAILED, %lld total\n",
+                (long long)nova_test_pass, (long long)nova_test_fail, (long long)total);
+    }
+    return nova_test_fail == 0 ? 0 : 1;
+}
+
+int64_t nova_rt_test_reset(void) {
+    nova_test_pass = 0;
+    nova_test_fail = 0;
+    return 0;
+}
+
+/* ── Date/Time Library ─────────────────────────────────────────────────── */
+
+int64_t nova_rt_datetime_now(void) {
+    time_t t = time(NULL);
+    struct tm* tm = localtime(&t);
+    if (!tm) return (int64_t)(uintptr_t)"1970-01-01T00:00:00";
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+                       tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                       tm->tm_hour, tm->tm_min, tm->tm_sec);
+    char* r = nova_fat_str_create(buf, (size_t)len);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
+int64_t nova_rt_datetime_timestamp(void) {
+    return (int64_t)time(NULL);
+}
+
+int64_t nova_rt_datetime_year(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    return tm ? (int64_t)(tm->tm_year + 1900) : 0;
+}
+
+int64_t nova_rt_datetime_month(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    return tm ? (int64_t)(tm->tm_mon + 1) : 0;
+}
+
+int64_t nova_rt_datetime_day(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    return tm ? (int64_t)tm->tm_mday : 0;
+}
+
+int64_t nova_rt_datetime_hour(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    return tm ? (int64_t)tm->tm_hour : 0;
+}
+
+int64_t nova_rt_datetime_minute(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    return tm ? (int64_t)tm->tm_min : 0;
+}
+
+int64_t nova_rt_datetime_second(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    return tm ? (int64_t)tm->tm_sec : 0;
+}
+
+int64_t nova_rt_datetime_weekday(int64_t ts) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    return tm ? (int64_t)tm->tm_wday : 0;
+}
+
+int64_t nova_rt_datetime_format(int64_t ts, int64_t fmt_str) {
+    time_t t = (time_t)ts;
+    struct tm* tm = localtime(&t);
+    if (!tm) return (int64_t)(uintptr_t)"";
+    const char* fmt = (const char*)(uintptr_t)fmt_str;
+    if (!fmt || *fmt == '\0') fmt = "%Y-%m-%d %H:%M:%S";
+    char buf[256];
+    size_t len = strftime(buf, sizeof(buf), fmt, tm);
+    if (len == 0) return (int64_t)(uintptr_t)"";
+    char* r = nova_fat_str_create(buf, len);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
+int64_t nova_rt_datetime_parse(int64_t str_val, int64_t fmt_str) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    const char* fmt = (const char*)(uintptr_t)fmt_str;
+    if (!s || !fmt) return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_isdst = -1;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    if (sscanf(s, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) >= 3 ||
+        sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) >= 3) {
+        tm.tm_year = y - 1900;
+        tm.tm_mon = mo - 1;
+        tm.tm_mday = d;
+        tm.tm_hour = h;
+        tm.tm_min = mi;
+        tm.tm_sec = se;
+        return (int64_t)mktime(&tm);
+    }
+    return 0;
+}
+
+int64_t nova_rt_datetime_diff(int64_t ts1, int64_t ts2) {
+    return ts1 - ts2;
+}
+
+int64_t nova_rt_datetime_add_days(int64_t ts, int64_t n) {
+    return ts + n * 86400;
+}
+
+int64_t nova_rt_datetime_add_hours(int64_t ts, int64_t n) {
+    return ts + n * 3600;
+}
+
+/* ── SHA-256 (FIPS 180-4, pure C, no external deps) ──────────────────────── */
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+static uint32_t sha256_rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+static uint32_t sha256_ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
+static uint32_t sha256_maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
+static uint32_t sha256_ep0(uint32_t x) { return sha256_rotr(x,2) ^ sha256_rotr(x,13) ^ sha256_rotr(x,22); }
+static uint32_t sha256_ep1(uint32_t x) { return sha256_rotr(x,6) ^ sha256_rotr(x,11) ^ sha256_rotr(x,25); }
+static uint32_t sha256_sig0(uint32_t x) { return sha256_rotr(x,7) ^ sha256_rotr(x,18) ^ (x >> 3); }
+static uint32_t sha256_sig1(uint32_t x) { return sha256_rotr(x,17) ^ sha256_rotr(x,19) ^ (x >> 10); }
+
+typedef struct {
+    uint32_t state[8];
+    uint8_t  buf[64];
+    uint64_t total;
+    size_t   buflen;
+} Sha256Ctx;
+
+static void sha256_init(Sha256Ctx* ctx) {
+    ctx->state[0] = 0x6a09e667; ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372; ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f; ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab; ctx->state[7] = 0x5be0cd19;
+    ctx->total = 0;
+    ctx->buflen = 0;
+}
+
+static void sha256_transform(Sha256Ctx* ctx, const uint8_t block[64]) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)block[i*4]<<24) | ((uint32_t)block[i*4+1]<<16) |
+                ((uint32_t)block[i*4+2]<<8) | (uint32_t)block[i*4+3];
+    for (int i = 16; i < 64; i++)
+        w[i] = sha256_sig1(w[i-2]) + w[i-7] + sha256_sig0(w[i-15]) + w[i-16];
+    uint32_t a=ctx->state[0], b=ctx->state[1], c=ctx->state[2], d=ctx->state[3];
+    uint32_t e=ctx->state[4], f=ctx->state[5], g=ctx->state[6], h=ctx->state[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = h + sha256_ep1(e) + sha256_ch(e,f,g) + sha256_k[i] + w[i];
+        uint32_t t2 = sha256_ep0(a) + sha256_maj(a,b,c);
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    ctx->state[0]+=a; ctx->state[1]+=b; ctx->state[2]+=c; ctx->state[3]+=d;
+    ctx->state[4]+=e; ctx->state[5]+=f; ctx->state[6]+=g; ctx->state[7]+=h;
+}
+
+static void sha256_update(Sha256Ctx* ctx, const uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        ctx->buf[ctx->buflen++] = data[i];
+        if (ctx->buflen == 64) { sha256_transform(ctx, ctx->buf); ctx->buflen = 0; }
+    }
+    ctx->total += len;
+}
+
+static void sha256_final(Sha256Ctx* ctx, uint8_t hash[32]) {
+    size_t i = ctx->buflen;
+    ctx->buf[i++] = 0x80;
+    if (i > 56) {
+        while (i < 64) ctx->buf[i++] = 0;
+        sha256_transform(ctx, ctx->buf);
+        i = 0;
+    }
+    while (i < 56) ctx->buf[i++] = 0;
+    uint64_t bits = ctx->total * 8;
+    for (int j = 7; j >= 0; j--)
+        ctx->buf[56 + (7-j)] = (uint8_t)(bits >> (j*8));
+    sha256_transform(ctx, ctx->buf);
+    for (int j = 0; j < 8; j++) {
+        hash[j*4]   = (uint8_t)(ctx->state[j] >> 24);
+        hash[j*4+1] = (uint8_t)(ctx->state[j] >> 16);
+        hash[j*4+2] = (uint8_t)(ctx->state[j] >> 8);
+        hash[j*4+3] = (uint8_t)(ctx->state[j]);
+    }
+}
+
+int64_t nova_rt_sha256(int64_t input) {
+    const char* s = (const char*)(uintptr_t)input;
+    if (!s) s = "";
+    Sha256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const uint8_t*)s, strlen(s));
+    uint8_t hash[32];
+    sha256_final(&ctx, hash);
+    static const char hex_chars[] = "0123456789abcdef";
+    char* out = (char*)malloc(65);
+    if (!out) return (int64_t)(uintptr_t)"";
+    for (int i = 0; i < 32; i++) {
+        out[i*2]   = hex_chars[hash[i] >> 4];
+        out[i*2+1] = hex_chars[hash[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_sha256_bytes(int64_t data, int64_t len_val) {
+    const uint8_t* ptr = (const uint8_t*)(uintptr_t)data;
+    size_t len = (size_t)len_val;
+    if (!ptr) { ptr = (const uint8_t*)""; len = 0; }
+    Sha256Ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, ptr, len);
+    uint8_t hash[32];
+    sha256_final(&ctx, hash);
+    static const char hex_chars[] = "0123456789abcdef";
+    char* out = (char*)malloc(65);
+    if (!out) return (int64_t)(uintptr_t)"";
+    for (int i = 0; i < 32; i++) {
+        out[i*2]   = hex_chars[hash[i] >> 4];
+        out[i*2+1] = hex_chars[hash[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+/* ── HMAC-SHA256 (RFC 2104) ──────────────────────────────────────────────── */
+
+int64_t nova_rt_hmac_sha256(int64_t key_val, int64_t msg_val) {
+    const char* key = (const char*)(uintptr_t)key_val;
+    const char* msg = (const char*)(uintptr_t)msg_val;
+    if (!key) key = "";
+    if (!msg) msg = "";
+    size_t key_len = strlen(key);
+    size_t msg_len = strlen(msg);
+    uint8_t k_pad[64];
+    memset(k_pad, 0, 64);
+    if (key_len > 64) {
+        Sha256Ctx hk;
+        sha256_init(&hk);
+        sha256_update(&hk, (const uint8_t*)key, key_len);
+        uint8_t kh[32];
+        sha256_final(&hk, kh);
+        memcpy(k_pad, kh, 32);
+    } else {
+        memcpy(k_pad, key, key_len);
+    }
+    uint8_t i_pad[64], o_pad[64];
+    for (int i = 0; i < 64; i++) {
+        i_pad[i] = k_pad[i] ^ 0x36;
+        o_pad[i] = k_pad[i] ^ 0x5c;
+    }
+    Sha256Ctx inner;
+    sha256_init(&inner);
+    sha256_update(&inner, i_pad, 64);
+    sha256_update(&inner, (const uint8_t*)msg, msg_len);
+    uint8_t inner_hash[32];
+    sha256_final(&inner, inner_hash);
+    Sha256Ctx outer;
+    sha256_init(&outer);
+    sha256_update(&outer, o_pad, 64);
+    sha256_update(&outer, inner_hash, 32);
+    uint8_t final_hash[32];
+    sha256_final(&outer, final_hash);
+    static const char hex_chars[] = "0123456789abcdef";
+    char* out = (char*)malloc(65);
+    if (!out) return (int64_t)(uintptr_t)"";
+    for (int i = 0; i < 32; i++) {
+        out[i*2]   = hex_chars[final_hash[i] >> 4];
+        out[i*2+1] = hex_chars[final_hash[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+/* ── Hex encode/decode ────────────────────────────────────────────────────── */
+
+int64_t nova_rt_hex_encode(int64_t input) {
+    const char* s = (const char*)(uintptr_t)input;
+    if (!s) return (int64_t)(uintptr_t)"";
+    size_t len = strlen(s);
+    char* out = (char*)malloc(len * 2 + 1);
+    if (!out) return (int64_t)(uintptr_t)"";
+    static const char hex_chars[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i*2]   = hex_chars[(uint8_t)s[i] >> 4];
+        out[i*2+1] = hex_chars[(uint8_t)s[i] & 0x0f];
+    }
+    out[len*2] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_hex_decode(int64_t input) {
+    const char* s = (const char*)(uintptr_t)input;
+    if (!s) return (int64_t)(uintptr_t)"";
+    size_t len = strlen(s);
+    if (len % 2 != 0) {
+        nova_set_error("hex_decode: odd-length input");
+        return (int64_t)(uintptr_t)"";
+    }
+    size_t out_len = len / 2;
+    char* out = (char*)malloc(out_len + 1);
+    if (!out) return (int64_t)(uintptr_t)"";
+    for (size_t i = 0; i < out_len; i++) {
+        int hi = s[i*2], lo = s[i*2+1];
+        int hv = (hi >= '0' && hi <= '9') ? hi-'0' : (hi >= 'a' && hi <= 'f') ? hi-'a'+10 : (hi >= 'A' && hi <= 'F') ? hi-'A'+10 : -1;
+        int lv = (lo >= '0' && lo <= '9') ? lo-'0' : (lo >= 'a' && lo <= 'f') ? lo-'a'+10 : (lo >= 'A' && lo <= 'F') ? lo-'A'+10 : -1;
+        if (hv < 0 || lv < 0) {
+            nova_set_error("hex_decode: invalid hex character");
+            free(out);
+            return (int64_t)(uintptr_t)"";
+        }
+        out[i] = (char)((hv << 4) | lv);
+    }
+    out[out_len] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+/* ── Base64 encode/decode (RFC 4648) ─────────────────────────────────────── */
+
+static const char b64_enc[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+int64_t nova_rt_base64_encode(int64_t input) {
+    const uint8_t* s = (const uint8_t*)(uintptr_t)input;
+    if (!s) return (int64_t)(uintptr_t)"";
+    size_t len = strlen((const char*)s);
+    size_t out_len = 4 * ((len + 2) / 3);
+    char* out = (char*)malloc(out_len + 1);
+    if (!out) return (int64_t)(uintptr_t)"";
+    size_t j = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t a = s[i];
+        uint32_t b = (i+1 < len) ? s[i+1] : 0;
+        uint32_t c = (i+2 < len) ? s[i+2] : 0;
+        uint32_t triple = (a << 16) | (b << 8) | c;
+        out[j++] = b64_enc[(triple >> 18) & 0x3f];
+        out[j++] = b64_enc[(triple >> 12) & 0x3f];
+        out[j++] = (i+1 < len) ? b64_enc[(triple >> 6) & 0x3f] : '=';
+        out[j++] = (i+2 < len) ? b64_enc[triple & 0x3f] : '=';
+    }
+    out[j] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+static int b64_decode_char(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+int64_t nova_rt_base64_decode(int64_t input) {
+    const char* s = (const char*)(uintptr_t)input;
+    if (!s) return (int64_t)(uintptr_t)"";
+    size_t len = strlen(s);
+    while (len > 0 && s[len-1] == '=') len--;
+    size_t out_len = (len * 3) / 4;
+    char* out = (char*)malloc(out_len + 1);
+    if (!out) return (int64_t)(uintptr_t)"";
+    size_t j = 0;
+    for (size_t i = 0; i < len; i += 4) {
+        int a = b64_decode_char(s[i]);
+        int b = (i+1 < len) ? b64_decode_char(s[i+1]) : 0;
+        int c = (i+2 < len) ? b64_decode_char(s[i+2]) : 0;
+        int d = (i+3 < len) ? b64_decode_char(s[i+3]) : 0;
+        if (a < 0 || b < 0 || c < 0 || d < 0) {
+            nova_set_error("base64_decode: invalid character");
+            free(out);
+            return (int64_t)(uintptr_t)"";
+        }
+        uint32_t triple = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6) | (uint32_t)d;
+        if (j < out_len) out[j++] = (char)((triple >> 16) & 0xff);
+        if (j < out_len) out[j++] = (char)((triple >> 8) & 0xff);
+        if (j < out_len) out[j++] = (char)(triple & 0xff);
+    }
+    out[j] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+/* ── UUID v4 (cryptographic random on Windows, /dev/urandom on Linux) ────── */
+
+static void nova_secure_random_bytes(uint8_t* buf, size_t len) {
+#ifdef _WIN32
+    HCRYPTPROV hProv = 0;
+    if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        CryptGenRandom(hProv, (DWORD)len, buf);
+        CryptReleaseContext(hProv, 0);
+    } else {
+        for (size_t i = 0; i < len; i++)
+            buf[i] = (uint8_t)(rand() & 0xff);
+    }
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) {
+        size_t got = fread(buf, 1, len, f);
+        fclose(f);
+        if (got < len) {
+            for (size_t i = got; i < len; i++)
+                buf[i] = (uint8_t)(rand() & 0xff);
+        }
+    } else {
+        for (size_t i = 0; i < len; i++)
+            buf[i] = (uint8_t)(rand() & 0xff);
+    }
+#endif
+}
+
+int64_t nova_rt_uuid4(void) {
+    uint8_t bytes[16];
+    nova_secure_random_bytes(bytes, 16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    char* out = (char*)malloc(37);
+    if (!out) return (int64_t)(uintptr_t)"";
+    static const char hx[] = "0123456789abcdef";
+    int pos = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out[pos++] = '-';
+        out[pos++] = hx[bytes[i] >> 4];
+        out[pos++] = hx[bytes[i] & 0x0f];
+    }
+    out[pos] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
+int64_t nova_rt_random_bytes(int64_t n) {
+    if (n <= 0 || n > 1048576) return (int64_t)(uintptr_t)"";
+    char* buf = (char*)malloc((size_t)n + 1);
+    if (!buf) return (int64_t)(uintptr_t)"";
+    nova_secure_random_bytes((uint8_t*)buf, (size_t)n);
+    buf[n] = '\0';
+    return (int64_t)(uintptr_t)buf;
+}
+
+/* ── Recursive directory walk ────────────────────────────────────────────── */
+
+int64_t nova_rt_dir_walk(int64_t path_val) {
+    const char* path = (const char*)(uintptr_t)path_val;
+    if (!path || !*path) return (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t result = nova_rt_list_create();
+
+#ifdef _WIN32
+    char pattern[MAX_PATH + 4];
+    size_t plen = strlen(path);
+    if (plen >= MAX_PATH) return result;
+    memcpy(pattern, path, plen);
+    if (plen > 0 && path[plen-1] != '\\' && path[plen-1] != '/') {
+        pattern[plen++] = '\\';
+    }
+    pattern[plen] = '*';
+    pattern[plen+1] = '\0';
+
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(pattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return result;
+
+    char stack_paths[256][MAX_PATH];
+    int stack_top = 0;
+    strncpy(stack_paths[0], path, MAX_PATH - 1);
+    stack_paths[0][MAX_PATH - 1] = '\0';
+    stack_top = 1;
+    FindClose(hFind);
+
+    while (stack_top > 0 && stack_top < 256) {
+        stack_top--;
+        char cur[MAX_PATH];
+        strncpy(cur, stack_paths[stack_top], MAX_PATH - 1);
+        cur[MAX_PATH - 1] = '\0';
+
+        size_t clen = strlen(cur);
+        char search[MAX_PATH + 4];
+        if (clen >= MAX_PATH) continue;
+        memcpy(search, cur, clen);
+        if (clen > 0 && cur[clen-1] != '\\') { search[clen++] = '\\'; }
+        search[clen] = '*';
+        search[clen+1] = '\0';
+
+        hFind = FindFirstFileA(search, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' ||
+                (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) continue;
+            char full[MAX_PATH * 2];
+            snprintf(full, sizeof(full), "%s\\%s", cur, fd.cFileName);
+            size_t flen = strlen(full);
+            char* dup = (char*)malloc(flen + 1);
+            if (dup) { memcpy(dup, full, flen + 1); nova_rt_list_append(result, (int64_t)(uintptr_t)dup); }
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && stack_top < 255) {
+                strncpy(stack_paths[stack_top], full, MAX_PATH - 1);
+                stack_paths[stack_top][MAX_PATH - 1] = '\0';
+                stack_top++;
+            }
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+#else
+    char stack_paths[256][4096];
+    int stack_top = 0;
+    strncpy(stack_paths[0], path, 4095);
+    stack_paths[0][4095] = '\0';
+    stack_top = 1;
+
+    while (stack_top > 0 && stack_top < 256) {
+        stack_top--;
+        DIR* d = opendir(stack_paths[stack_top]);
+        if (!d) continue;
+        char cur[4096];
+        strncpy(cur, stack_paths[stack_top], 4095);
+        cur[4095] = '\0';
+        struct dirent* ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' ||
+                (ent->d_name[1] == '.' && ent->d_name[2] == '\0'))) continue;
+            char full[8192];
+            snprintf(full, sizeof(full), "%s/%s", cur, ent->d_name);
+            size_t flen = strlen(full);
+            char* dup = (char*)malloc(flen + 1);
+            if (dup) { memcpy(dup, full, flen + 1); nova_rt_list_append(result, (int64_t)(uintptr_t)dup); }
+            struct stat st;
+            if (stat(full, &st) == 0 && S_ISDIR(st.st_mode) && stack_top < 255) {
+                strncpy(stack_paths[stack_top], full, 4095);
+                stack_paths[stack_top][4095] = '\0';
+                stack_top++;
+            }
+        }
+        closedir(d);
+    }
+#endif
+    return result;
 }

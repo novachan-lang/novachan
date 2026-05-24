@@ -62,3 +62,6 @@ function Invoke-Timed {
 # Resolve clang once; callers pass $ClangPath to Invoke-Timed.
 $ClangPath = (Get-Command clang -ErrorAction SilentlyContinue).Source
 if (-not $ClangPath) { $ClangPath = "clang" }
+
+# Standard link flags for NOVA runtime (ws2_32 for networking, advapi32 for crypto)
+$NovaLinkFlags = "-lws2_32 -ladvapi32"

@@ -10,7 +10,7 @@ if (!(Test-Path "nova_compiler.ll")) { Write-Host "FAIL: no gen3.ll"; exit 1 }
 Copy-Item "nova_compiler.ll" "gen3.ll" -Force
 
 # Link gen3
-$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o gen3.exe gen3.ll nova_runtime.c -lws2_32" -TimeoutMs 120000
+$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o gen3.exe gen3.ll nova_runtime.c -lws2_32 -ladvapi32" -TimeoutMs 120000
 Write-Host "Link gen3: exit=$($lr.ExitCode)"
 if (!(Test-Path "gen3.exe")) { Write-Host "FAIL: no gen3.exe"; exit 1 }
 
