@@ -47,6 +47,7 @@ declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind
 declare i64 @nova_rt_ends_with(i64, i64) nounwind
 declare i64 @nova_rt_print_any(i64) nounwind
+declare i64 @nova_rt_print_bool(i64) nounwind
 declare i64 @nova_rt_float_bits(i64) nounwind
 declare ptr @nova_rt_struct_alloc(i64) nounwind
 declare i64 @nova_rt_slice(i64, i64, i64) nounwind
@@ -56,15 +57,18 @@ declare i64 @nova_rt_time_ms() nounwind
 declare i64 @nova_rt_sleep_ms(i64) nounwind
 declare i64 @nova_rt_clock_ns() nounwind
 declare i64 @nova_rt_type_of(i64) nounwind
-declare i64 @nova_rt_range(i64, i64) nounwind
-declare i64 @nova_rt_sort(i64) nounwind
+declare i64 @nova_rt_range(i64) nounwind
+declare i64 @nova_rt_range_from_to(i64, i64) nounwind
 declare i64 @nova_rt_dict_keys(i64) nounwind
 declare i64 @nova_rt_dict_values(i64) nounwind
 declare i64 @nova_rt_dict_items(i64) nounwind
+declare i64 @nova_rt_dict_has(i64, i64) nounwind
+declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_system(i64) nounwind
 declare i64 @nova_rt_exec(i64) nounwind
 declare i64 @nova_rt_create_string(ptr) nounwind
 declare void @nova_rt_init_args(i64, i64) nounwind
+declare void @nova_rt_wait_all() nounwind
 declare void @nova_rt_cleanup() nounwind
 declare i64 @nova_rt_parse_float(i64) nounwind
 declare i64 @nova_rt_read_line() nounwind
@@ -75,6 +79,16 @@ declare i64 @nova_rt_list_concat(i64, i64) nounwind
 declare i64 @nova_rt_list_reverse(i64) nounwind
 declare i64 @nova_rt_list_sort(i64) nounwind
 declare i64 @nova_rt_list_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_http_get(i64) nounwind
+declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+declare i64 @nova_rt_mkdir(i64) nounwind
+declare i64 @nova_rt_mkdir_p(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_exists(i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_read_bytes(i64) nounwind
+declare i64 @nova_rt_write_raw(i64) nounwind
 
 define i64 @nova_user_main() nounwind {
 entry:
@@ -114,7 +128,7 @@ entry:
   %r15 = ptrtoint ptr %r15.p to i64
   %r16 = add i64 2, 0
   %r17 = add i64 3, 0
-  %r18 = call i64 @nova_rt_add(i64 %r16, i64 %r17)
+  %r18 = add i64 %r16, %r17
   %r19 = call i64 @nova_rt_any_to_str(i64 %r18)
   %r20 = call i64 @nova_rt_str_concat(i64 %r15, i64 %r19)
   %r21.p = getelementptr inbounds [1 x i8], ptr @.str.8, i64 0, i64 0
@@ -128,7 +142,7 @@ entry:
   %r25 = ptrtoint ptr %r25.p to i64
   %r26 = load i64, ptr %slot.config, align 8
   %r27 = load i64, ptr %slot.k, align 8
-  %r28 = call i64 @nova_rt_index_get(i64 %r26, i64 %r27)
+  %r28 = call i64 @nova_rt_dict_get(i64 %r26, i64 %r27)
   %r29 = call i64 @nova_rt_any_to_str(i64 %r28)
   %r30 = call i64 @nova_rt_str_concat(i64 %r25, i64 %r29)
   %r31.p = getelementptr inbounds [1 x i8], ptr @.str.8, i64 0, i64 0
@@ -140,7 +154,7 @@ entry:
   %r35 = load i64, ptr %slot.config, align 8
   %r36.p = getelementptr inbounds [5 x i8], ptr @.str.1, i64 0, i64 0
   %r36 = ptrtoint ptr %r36.p to i64
-  %r37 = call i64 @nova_rt_index_get(i64 %r35, i64 %r36)
+  %r37 = call i64 @nova_rt_dict_get(i64 %r35, i64 %r36)
   %r38 = call i64 @nova_rt_any_to_str(i64 %r37)
   %r39 = call i64 @nova_rt_str_concat(i64 %r34, i64 %r38)
   %r40.p = getelementptr inbounds [1 x i8], ptr @.str.8, i64 0, i64 0
@@ -156,6 +170,7 @@ entry:
 define i64 @nova_main() nounwind {
 entry:
   %r0 = call i64 @nova_user_main()
+  %r1 = call i64 @nova_user_main()
   ret i64 0
 }
 
@@ -165,6 +180,7 @@ entry:
   %argv64 = ptrtoint ptr %argv to i64
   call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
   call i64 @nova_main()
+  call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()
   ret i32 0
 }
@@ -181,3 +197,16 @@ entry:
 @.str.8 = private unnamed_addr constant [1 x i8] c"\00"
 @.str.9 = private unnamed_addr constant [8 x i8] c"host = \00"
 @.str.10 = private unnamed_addr constant [5 x i8] c"done\00"
+
+; TBAA metadata
+!0 = !{!"NOVA TBAA"}
+!1 = !{!"list_data_ptr", !0}
+!2 = !{!1, !1, i64 0}
+!3 = !{!"list_elem", !0}
+!4 = !{!3, !3, i64 0}
+!5 = !{!"list_size", !0}
+!6 = !{!5, !5, i64 0}
+!90 = !{!"branch_weights", i32 2000, i32 1}
+!91 = distinct !{!91, !92, !93}
+!92 = !{!"llvm.loop.unroll.enable"}
+!93 = !{!"llvm.loop.vectorize.enable", i1 true}

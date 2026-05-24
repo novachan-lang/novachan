@@ -47,6 +47,7 @@ declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind
 declare i64 @nova_rt_ends_with(i64, i64) nounwind
 declare i64 @nova_rt_print_any(i64) nounwind
+declare i64 @nova_rt_print_bool(i64) nounwind
 declare i64 @nova_rt_float_bits(i64) nounwind
 declare ptr @nova_rt_struct_alloc(i64) nounwind
 declare i64 @nova_rt_slice(i64, i64, i64) nounwind
@@ -56,15 +57,18 @@ declare i64 @nova_rt_time_ms() nounwind
 declare i64 @nova_rt_sleep_ms(i64) nounwind
 declare i64 @nova_rt_clock_ns() nounwind
 declare i64 @nova_rt_type_of(i64) nounwind
-declare i64 @nova_rt_range(i64, i64) nounwind
-declare i64 @nova_rt_sort(i64) nounwind
+declare i64 @nova_rt_range(i64) nounwind
+declare i64 @nova_rt_range_from_to(i64, i64) nounwind
 declare i64 @nova_rt_dict_keys(i64) nounwind
 declare i64 @nova_rt_dict_values(i64) nounwind
 declare i64 @nova_rt_dict_items(i64) nounwind
+declare i64 @nova_rt_dict_has(i64, i64) nounwind
+declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_system(i64) nounwind
 declare i64 @nova_rt_exec(i64) nounwind
 declare i64 @nova_rt_create_string(ptr) nounwind
 declare void @nova_rt_init_args(i64, i64) nounwind
+declare void @nova_rt_wait_all() nounwind
 declare void @nova_rt_cleanup() nounwind
 declare i64 @nova_rt_parse_float(i64) nounwind
 declare i64 @nova_rt_read_line() nounwind
@@ -75,6 +79,16 @@ declare i64 @nova_rt_list_concat(i64, i64) nounwind
 declare i64 @nova_rt_list_reverse(i64) nounwind
 declare i64 @nova_rt_list_sort(i64) nounwind
 declare i64 @nova_rt_list_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_http_get(i64) nounwind
+declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+declare i64 @nova_rt_mkdir(i64) nounwind
+declare i64 @nova_rt_mkdir_p(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_exists(i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_read_bytes(i64) nounwind
+declare i64 @nova_rt_write_raw(i64) nounwind
 
 define i64 @nova_user_main() nounwind {
 entry:
@@ -100,32 +114,29 @@ then0:
   %r6 = load i64, ptr %slot.name, align 8
   %r7 = call i64 @nova_rt_any_to_str(i64 %r6)
   %r8 = call i64 @nova_rt_str_concat(i64 %r5, i64 %r7)
-  %r9.p = getelementptr inbounds [1 x i8], ptr @.str.3, i64 0, i64 0
+  %r9.p = getelementptr inbounds [36 x i8], ptr @.str.3, i64 0, i64 0
   %r9 = ptrtoint ptr %r9.p to i64
   %r10 = call i64 @nova_rt_str_concat(i64 %r8, i64 %r9)
-  %r11.p = getelementptr inbounds [36 x i8], ptr @.str.4, i64 0, i64 0
-  %r11 = ptrtoint ptr %r11.p to i64
-  %r12 = load i64, ptr %slot.ver, align 8
-  %r13 = call i64 @nova_rt_any_to_str(i64 %r12)
-  %r14 = call i64 @nova_rt_str_concat(i64 %r11, i64 %r13)
-  %r15.p = getelementptr inbounds [2 x i8], ptr @.str.5, i64 0, i64 0
-  %r15 = ptrtoint ptr %r15.p to i64
-  %r16 = call i64 @nova_rt_str_concat(i64 %r14, i64 %r15)
-  %r17 = call i64 @nova_rt_any_to_str(i64 %r16)
-  %r18 = call i64 @nova_rt_str_concat(i64 %r10, i64 %r17)
-  %r19 = call i64 @nova_rt_print_any(i64 %r18)
+  %r11 = load i64, ptr %slot.ver, align 8
+  %r12 = call i64 @nova_rt_any_to_str(i64 %r11)
+  %r13 = call i64 @nova_rt_str_concat(i64 %r10, i64 %r12)
+  %r14.p = getelementptr inbounds [2 x i8], ptr @.str.4, i64 0, i64 0
+  %r14 = ptrtoint ptr %r14.p to i64
+  %r15 = call i64 @nova_rt_str_concat(i64 %r13, i64 %r14)
+  %r16 = call i64 @nova_rt_print_any(i64 %r15)
   br label %endif2
 else1:
   br label %endif2
 endif2:
-  %r20.p = getelementptr inbounds [5 x i8], ptr @.str.6, i64 0, i64 0
-  %r20 = ptrtoint ptr %r20.p to i64
-  %r21 = call i64 @nova_rt_print_any(i64 %r20)
-  ret i64 %r21
+  %r17.p = getelementptr inbounds [5 x i8], ptr @.str.5, i64 0, i64 0
+  %r17 = ptrtoint ptr %r17.p to i64
+  %r18 = call i64 @nova_rt_print_any(i64 %r17)
+  ret i64 %r18
 }
 
 define i64 @nova_main() nounwind {
 entry:
+  %r0 = call i64 @nova_user_main()
   ret i64 0
 }
 
@@ -135,6 +146,7 @@ entry:
   %argv64 = ptrtoint ptr %argv to i64
   call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
   call i64 @nova_main()
+  call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()
   ret i32 0
 }
@@ -143,7 +155,19 @@ entry:
 @.str.0 = private unnamed_addr constant [4 x i8] c"foo\00"
 @.str.1 = private unnamed_addr constant [4 x i8] c"1.0\00"
 @.str.2 = private unnamed_addr constant [10 x i8] c"Package '\00"
-@.str.3 = private unnamed_addr constant [1 x i8] c"\00"
-@.str.4 = private unnamed_addr constant [36 x i8] c"' already in dependencies (version \00"
-@.str.5 = private unnamed_addr constant [2 x i8] c")\00"
-@.str.6 = private unnamed_addr constant [5 x i8] c"done\00"
+@.str.3 = private unnamed_addr constant [36 x i8] c"' already in dependencies (version \00"
+@.str.4 = private unnamed_addr constant [2 x i8] c")\00"
+@.str.5 = private unnamed_addr constant [5 x i8] c"done\00"
+
+; TBAA metadata
+!0 = !{!"NOVA TBAA"}
+!1 = !{!"list_data_ptr", !0}
+!2 = !{!1, !1, i64 0}
+!3 = !{!"list_elem", !0}
+!4 = !{!3, !3, i64 0}
+!5 = !{!"list_size", !0}
+!6 = !{!5, !5, i64 0}
+!90 = !{!"branch_weights", i32 2000, i32 1}
+!91 = distinct !{!91, !92, !93}
+!92 = !{!"llvm.loop.unroll.enable"}
+!93 = !{!"llvm.loop.vectorize.enable", i1 true}

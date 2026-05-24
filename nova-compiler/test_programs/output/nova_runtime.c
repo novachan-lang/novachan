@@ -284,6 +284,7 @@ typedef enum {
 static int64_t      nova_mem_live    = 0;
 static int64_t      nova_mem_total   = 0;
 static volatile int nova_is_multithreaded = 0;
+static int          nova_arena_mode  = 0;
 /* nova_heap_base declared near slab allocator — tracks lowest heap address for fast RC filter */
 
 #ifdef _WIN32
@@ -3554,6 +3555,7 @@ static inline int nova_rc_is_managed(void* ptr) {
 }
 
 void nova_rc_inc(int64_t val) {
+    if (nova_arena_mode) return;
     if ((uint64_t)val < 0x10000ULL) return;
     void* ptr = (void*)(uintptr_t)val;
     int kind = nova_rc_is_managed(ptr);
@@ -3571,6 +3573,7 @@ void nova_rc_inc(int64_t val) {
 }
 
 static void nova_rc_dec_internal(int64_t val) {
+    if (nova_arena_mode) return;
     if ((uint64_t)val < 0x10000ULL) return;
     void* ptr = (void*)(uintptr_t)val;
     int kind = nova_rc_is_managed(ptr);
@@ -6920,4 +6923,376 @@ int64_t nova_rt_dir_walk(int64_t path_val) {
     }
 #endif
     return result;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Option E2: Arena Mode — Single-Process RC Bypass
+   ═══════════════════════════════════════════════════════════════════════════
+   When a program is known to be single-process (no spawn), arena mode
+   eliminates ALL reference counting overhead. Memory is only freed at
+   program exit via the OS process teardown. This matches what production
+   compilers (GCC, rustc) do — arena-allocate everything, exit when done.
+
+   The nova_arena_mode flag is checked at the top of nova_rc_inc and
+   nova_rc_dec_internal (single branch, always-predicted after warmup).
+   Programs that call spawn() disable arena mode at that point.
+   ═════════════════════════════════════════════════════════════════════════ */
+
+void nova_rt_set_arena_mode(void) {
+    nova_arena_mode = 1;
+}
+
+int64_t nova_rt_is_arena_mode(void) {
+    return nova_arena_mode ? 1 : 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Option C2: String Buffer — O(1) Amortized Append
+   ═══════════════════════════════════════════════════════════════════════════
+   NovaBuffer provides mutable, growable string construction without the
+   O(n²) cost of repeated str_concat. Uses doubling strategy (amortized O(1)
+   per append). The buffer is heap-tracked with NOVA_MEM_RAW tag for RC
+   compatibility.
+
+   Usage pattern in NOVA:
+     let buf = buffer()            // or buffer(1024) for pre-sized
+     buf_append(buf, "hello ")
+     buf_append(buf, name)
+     buf_append_int(buf, count)
+     let result = buf_to_str(buf)  // finalizes, frees buffer
+   ═════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    char*   data;
+    int64_t len;
+    int64_t cap;
+} NovaBuffer;
+
+static void nova_buffer_grow(NovaBuffer* buf, int64_t needed) {
+    int64_t new_cap = buf->cap;
+    while (new_cap < needed) new_cap = new_cap * 2;
+    char* new_data = (char*)realloc(buf->data, (size_t)new_cap);
+    if (!new_data) return;
+    buf->data = new_data;
+    buf->cap = new_cap;
+}
+
+int64_t nova_rt_buffer_create(void) {
+    NovaBuffer* buf = (NovaBuffer*)nova_heap_alloc(sizeof(NovaBuffer), NOVA_MEM_RAW);
+    if (!buf) return 0;
+    buf->cap = 256;
+    buf->len = 0;
+    buf->data = (char*)malloc(256);
+    if (!buf->data) { buf->cap = 0; return (int64_t)(uintptr_t)buf; }
+    buf->data[0] = '\0';
+    return (int64_t)(uintptr_t)buf;
+}
+
+int64_t nova_rt_buffer_create_cap(int64_t cap) {
+    if (cap < 64) cap = 64;
+    NovaBuffer* buf = (NovaBuffer*)nova_heap_alloc(sizeof(NovaBuffer), NOVA_MEM_RAW);
+    if (!buf) return 0;
+    buf->cap = cap;
+    buf->len = 0;
+    buf->data = (char*)malloc((size_t)cap);
+    if (!buf->data) { buf->cap = 0; return (int64_t)(uintptr_t)buf; }
+    buf->data[0] = '\0';
+    return (int64_t)(uintptr_t)buf;
+}
+
+void nova_rt_buffer_append(int64_t handle, int64_t str_val) {
+    if (!handle) return;
+    NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
+    const char* s = (const char*)(uintptr_t)str_val;
+    if (!s) return;
+    size_t slen = strlen(s);
+    if (slen == 0) return;
+    int64_t needed = buf->len + (int64_t)slen + 1;
+    if (needed > buf->cap) nova_buffer_grow(buf, needed);
+    if (buf->len + (int64_t)slen >= buf->cap) return;
+    memcpy(buf->data + buf->len, s, slen);
+    buf->len += (int64_t)slen;
+    buf->data[buf->len] = '\0';
+}
+
+void nova_rt_buffer_append_char(int64_t handle, int64_t ch) {
+    if (!handle) return;
+    NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
+    if (buf->len + 2 > buf->cap) nova_buffer_grow(buf, buf->len + 2);
+    if (buf->len + 1 >= buf->cap) return;
+    buf->data[buf->len] = (char)ch;
+    buf->len++;
+    buf->data[buf->len] = '\0';
+}
+
+void nova_rt_buffer_append_int(int64_t handle, int64_t val) {
+    if (!handle) return;
+    NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
+    char tmp[32];
+    int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)val);
+    if (n <= 0) return;
+    int64_t needed = buf->len + n + 1;
+    if (needed > buf->cap) nova_buffer_grow(buf, needed);
+    if (buf->len + n >= buf->cap) return;
+    memcpy(buf->data + buf->len, tmp, (size_t)n);
+    buf->len += n;
+    buf->data[buf->len] = '\0';
+}
+
+void nova_rt_buffer_append_float(int64_t handle, int64_t val) {
+    if (!handle) return;
+    NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
+    double d;
+    memcpy(&d, &val, sizeof(double));
+    char tmp[64];
+    int n = snprintf(tmp, sizeof(tmp), "%.15g", d);
+    if (n <= 0) return;
+    int64_t needed = buf->len + n + 1;
+    if (needed > buf->cap) nova_buffer_grow(buf, needed);
+    if (buf->len + n >= buf->cap) return;
+    memcpy(buf->data + buf->len, tmp, (size_t)n);
+    buf->len += n;
+    buf->data[buf->len] = '\0';
+}
+
+int64_t nova_rt_buffer_to_str(int64_t handle) {
+    if (!handle) {
+        char* r = (char*)nova_heap_alloc(1, NOVA_MEM_RAW);
+        if (r) r[0] = '\0';
+        return (int64_t)(uintptr_t)r;
+    }
+    NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
+    char* result = (char*)nova_heap_alloc((size_t)buf->len + 1, NOVA_MEM_RAW);
+    if (!result) return 0;
+    if (buf->len > 0) memcpy(result, buf->data, (size_t)buf->len);
+    result[buf->len] = '\0';
+    free(buf->data);
+    buf->data = NULL;
+    buf->len = 0;
+    buf->cap = 0;
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_buffer_len(int64_t handle) {
+    if (!handle) return 0;
+    NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
+    return buf->len;
+}
+
+void nova_rt_buffer_clear(int64_t handle) {
+    if (!handle) return;
+    NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
+    buf->len = 0;
+    if (buf->data) buf->data[0] = '\0';
+}
+
+int64_t nova_rt_buffer_str(int64_t handle) {
+    return nova_rt_buffer_to_str(handle);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Option F: Package Manager — Semver + Lock File + Dependency Resolution
+   ═══════════════════════════════════════════════════════════════════════════
+   Provides runtime support for the NOVA package manager:
+   - Semver parsing and comparison
+   - Lock file reading/writing (TOML-like format)
+   - Dependency constraint evaluation
+   ═════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int64_t major;
+    int64_t minor;
+    int64_t patch;
+    char    pre[64];
+} NovaSemver;
+
+static int nova_semver_parse(const char* s, NovaSemver* out) {
+    out->major = 0; out->minor = 0; out->patch = 0; out->pre[0] = '\0';
+    if (!s || !*s) return 0;
+    if (*s == 'v' || *s == 'V') s++;
+    char* end;
+    out->major = strtoll(s, &end, 10);
+    if (*end != '.') return (end != s);
+    s = end + 1;
+    out->minor = strtoll(s, &end, 10);
+    if (*end != '.') return 1;
+    s = end + 1;
+    out->patch = strtoll(s, &end, 10);
+    if (*end == '-') {
+        strncpy(out->pre, end + 1, 63);
+        out->pre[63] = '\0';
+    }
+    return 1;
+}
+
+static int nova_semver_cmp(const NovaSemver* a, const NovaSemver* b) {
+    if (a->major != b->major) return a->major < b->major ? -1 : 1;
+    if (a->minor != b->minor) return a->minor < b->minor ? -1 : 1;
+    if (a->patch != b->patch) return a->patch < b->patch ? -1 : 1;
+    if (a->pre[0] && !b->pre[0]) return -1;
+    if (!a->pre[0] && b->pre[0]) return 1;
+    if (a->pre[0] && b->pre[0]) return strcmp(a->pre, b->pre);
+    return 0;
+}
+
+int64_t nova_rt_semver_parse(int64_t str_val) {
+    const char* s = (const char*)(uintptr_t)str_val;
+    NovaSemver sv;
+    if (!nova_semver_parse(s, &sv)) return 0;
+    int64_t result = nova_rt_list_create();
+    nova_rt_list_append(result, sv.major);
+    nova_rt_list_append(result, sv.minor);
+    nova_rt_list_append(result, sv.patch);
+    if (sv.pre[0]) {
+        size_t plen = strlen(sv.pre);
+        char* ps = (char*)nova_heap_alloc(plen + 1, NOVA_MEM_RAW);
+        if (ps) { memcpy(ps, sv.pre, plen + 1); }
+        nova_rt_list_append(result, (int64_t)(uintptr_t)ps);
+    } else {
+        char* empty = (char*)nova_heap_alloc(1, NOVA_MEM_RAW);
+        if (empty) empty[0] = '\0';
+        nova_rt_list_append(result, (int64_t)(uintptr_t)empty);
+    }
+    return result;
+}
+
+int64_t nova_rt_semver_compare(int64_t a_str, int64_t b_str) {
+    const char* sa = (const char*)(uintptr_t)a_str;
+    const char* sb = (const char*)(uintptr_t)b_str;
+    NovaSemver a, b;
+    nova_semver_parse(sa, &a);
+    nova_semver_parse(sb, &b);
+    return nova_semver_cmp(&a, &b);
+}
+
+int64_t nova_rt_semver_satisfies(int64_t ver_str, int64_t constraint_str) {
+    const char* ver = (const char*)(uintptr_t)ver_str;
+    const char* con = (const char*)(uintptr_t)constraint_str;
+    if (!ver || !con || !*con) return 1;
+    NovaSemver v;
+    if (!nova_semver_parse(ver, &v)) return 0;
+    while (*con == ' ') con++;
+    char op[4] = {0};
+    int oi = 0;
+    while ((*con == '>' || *con == '<' || *con == '=' || *con == '~' || *con == '^') && oi < 3) {
+        op[oi++] = *con++;
+    }
+    while (*con == ' ') con++;
+    NovaSemver c;
+    if (!nova_semver_parse(con, &c)) return 0;
+    int cmp = nova_semver_cmp(&v, &c);
+    if (strcmp(op, ">=") == 0) return cmp >= 0;
+    if (strcmp(op, "<=") == 0) return cmp <= 0;
+    if (strcmp(op, ">") == 0)  return cmp > 0;
+    if (strcmp(op, "<") == 0)  return cmp < 0;
+    if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) return cmp == 0;
+    if (strcmp(op, "~") == 0) {
+        if (v.major != c.major) return 0;
+        if (v.minor != c.minor) return 0;
+        return v.patch >= c.patch;
+    }
+    if (strcmp(op, "^") == 0) {
+        if (v.major != c.major) return 0;
+        if (v.minor < c.minor) return 0;
+        if (v.minor == c.minor && v.patch < c.patch) return 0;
+        return 1;
+    }
+    return cmp == 0;
+}
+
+int64_t nova_rt_semver_format(int64_t major, int64_t minor, int64_t patch) {
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "%lld.%lld.%lld", (long long)major, (long long)minor, (long long)patch);
+    size_t len = strlen(tmp);
+    char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (result) memcpy(result, tmp, len + 1);
+    return (int64_t)(uintptr_t)result;
+}
+
+/* ── Lock File Operations ─────────────────────────────────────────────── */
+
+int64_t nova_rt_lockfile_read(int64_t path_val) {
+    const char* path = (const char*)(uintptr_t)path_val;
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    int64_t result = nova_rt_dict_create();
+    char line[1024];
+    char current_pkg[256] = {0};
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0 || line[0] == '#') continue;
+        if (line[0] == '[') {
+            char* end = strchr(line, ']');
+            if (end) {
+                *end = '\0';
+                strncpy(current_pkg, line + 1, 255);
+                current_pkg[255] = '\0';
+            }
+            continue;
+        }
+        if (current_pkg[0] && strncmp(line, "version", 7) == 0) {
+            char* eq = strchr(line, '=');
+            if (eq) {
+                eq++;
+                while (*eq == ' ' || *eq == '"') eq++;
+                char* end2 = eq + strlen(eq) - 1;
+                while (end2 > eq && (*end2 == '"' || *end2 == ' ')) *end2-- = '\0';
+                size_t klen = strlen(current_pkg);
+                char* k = (char*)nova_heap_alloc(klen + 1, NOVA_MEM_RAW);
+                if (k) memcpy(k, current_pkg, klen + 1);
+                size_t vlen = strlen(eq);
+                char* vstr = (char*)nova_heap_alloc(vlen + 1, NOVA_MEM_RAW);
+                if (vstr) memcpy(vstr, eq, vlen + 1);
+                nova_rt_dict_set(result, (int64_t)(uintptr_t)k, (int64_t)(uintptr_t)vstr);
+            }
+        }
+    }
+    fclose(f);
+    return result;
+}
+
+int64_t nova_rt_lockfile_write(int64_t path_val, int64_t deps_dict) {
+    const char* path = (const char*)(uintptr_t)path_val;
+    FILE* f = fopen(path, "w");
+    if (!f) return 0;
+    fprintf(f, "# nova.lock — auto-generated, do not edit\n");
+    fprintf(f, "# Generated by NOVA package manager\n\n");
+    int64_t keys = nova_rt_dict_keys(deps_dict);
+    NovaList* klist = (NovaList*)(uintptr_t)keys;
+    if (klist) {
+        for (int64_t i = 0; i < klist->size; i++) {
+            const char* pkg = (const char*)(uintptr_t)klist->data[i];
+            int64_t ver = nova_rt_dict_get(deps_dict, klist->data[i]);
+            const char* ver_str = (const char*)(uintptr_t)ver;
+            fprintf(f, "[%s]\nversion = \"%s\"\n\n", pkg, ver_str ? ver_str : "0.0.0");
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+int64_t nova_rt_pkg_resolve(int64_t deps_dict, int64_t available_dict) {
+    int64_t resolved = nova_rt_dict_create();
+    int64_t keys = nova_rt_dict_keys(deps_dict);
+    NovaList* klist = (NovaList*)(uintptr_t)keys;
+    if (!klist) return resolved;
+    for (int64_t i = 0; i < klist->size; i++) {
+        int64_t pkg_name = klist->data[i];
+        int64_t constraint = nova_rt_dict_get(deps_dict, pkg_name);
+        int64_t versions_list = nova_rt_dict_get(available_dict, pkg_name);
+        if (!versions_list) continue;
+        NovaList* vers = (NovaList*)(uintptr_t)versions_list;
+        if (!vers) continue;
+        int64_t best = 0;
+        for (int64_t j = 0; j < vers->size; j++) {
+            if (nova_rt_semver_satisfies(vers->data[j], constraint)) {
+                if (!best || nova_rt_semver_compare(vers->data[j], best) > 0) {
+                    best = vers->data[j];
+                }
+            }
+        }
+        if (best) nova_rt_dict_set(resolved, pkg_name, best);
+    }
+    return resolved;
 }

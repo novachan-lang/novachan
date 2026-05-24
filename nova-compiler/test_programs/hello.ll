@@ -47,6 +47,7 @@ declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind
 declare i64 @nova_rt_ends_with(i64, i64) nounwind
 declare i64 @nova_rt_print_any(i64) nounwind
+declare i64 @nova_rt_print_bool(i64) nounwind
 declare i64 @nova_rt_float_bits(i64) nounwind
 declare ptr @nova_rt_struct_alloc(i64) nounwind
 declare i64 @nova_rt_slice(i64, i64, i64) nounwind
@@ -56,15 +57,37 @@ declare i64 @nova_rt_time_ms() nounwind
 declare i64 @nova_rt_sleep_ms(i64) nounwind
 declare i64 @nova_rt_clock_ns() nounwind
 declare i64 @nova_rt_type_of(i64) nounwind
-declare i64 @nova_rt_range(i64, i64) nounwind
-declare i64 @nova_rt_sort(i64) nounwind
+declare i64 @nova_rt_range(i64) nounwind
+declare i64 @nova_rt_range_from_to(i64, i64) nounwind
 declare i64 @nova_rt_dict_keys(i64) nounwind
 declare i64 @nova_rt_dict_values(i64) nounwind
+declare i64 @nova_rt_dict_items(i64) nounwind
+declare i64 @nova_rt_dict_has(i64, i64) nounwind
+declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_system(i64) nounwind
 declare i64 @nova_rt_exec(i64) nounwind
 declare i64 @nova_rt_create_string(ptr) nounwind
 declare void @nova_rt_init_args(i64, i64) nounwind
 declare void @nova_rt_cleanup() nounwind
+declare i64 @nova_rt_parse_float(i64) nounwind
+declare i64 @nova_rt_read_line() nounwind
+declare i64 @nova_rt_append_file(i64, i64) nounwind
+declare i64 @nova_rt_file_exists(i64) nounwind
+declare i64 @nova_rt_find(i64, i64) nounwind
+declare i64 @nova_rt_list_concat(i64, i64) nounwind
+declare i64 @nova_rt_list_reverse(i64) nounwind
+declare i64 @nova_rt_list_sort(i64) nounwind
+declare i64 @nova_rt_list_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_http_get(i64) nounwind
+declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+declare i64 @nova_rt_mkdir(i64) nounwind
+declare i64 @nova_rt_mkdir_p(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_exists(i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_read_bytes(i64) nounwind
+declare i64 @nova_rt_write_raw(i64) nounwind
 
 define i64 @greet(i64 %p0) nounwind {
 entry:

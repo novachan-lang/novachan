@@ -47,6 +47,7 @@ declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind
 declare i64 @nova_rt_ends_with(i64, i64) nounwind
 declare i64 @nova_rt_print_any(i64) nounwind
+declare i64 @nova_rt_print_bool(i64) nounwind
 declare i64 @nova_rt_float_bits(i64) nounwind
 declare ptr @nova_rt_struct_alloc(i64) nounwind
 declare i64 @nova_rt_slice(i64, i64, i64) nounwind
@@ -56,15 +57,18 @@ declare i64 @nova_rt_time_ms() nounwind
 declare i64 @nova_rt_sleep_ms(i64) nounwind
 declare i64 @nova_rt_clock_ns() nounwind
 declare i64 @nova_rt_type_of(i64) nounwind
-declare i64 @nova_rt_range(i64, i64) nounwind
-declare i64 @nova_rt_sort(i64) nounwind
+declare i64 @nova_rt_range(i64) nounwind
+declare i64 @nova_rt_range_from_to(i64, i64) nounwind
 declare i64 @nova_rt_dict_keys(i64) nounwind
 declare i64 @nova_rt_dict_values(i64) nounwind
 declare i64 @nova_rt_dict_items(i64) nounwind
+declare i64 @nova_rt_dict_has(i64, i64) nounwind
+declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_system(i64) nounwind
 declare i64 @nova_rt_exec(i64) nounwind
 declare i64 @nova_rt_create_string(ptr) nounwind
 declare void @nova_rt_init_args(i64, i64) nounwind
+declare void @nova_rt_wait_all() nounwind
 declare void @nova_rt_cleanup() nounwind
 declare i64 @nova_rt_parse_float(i64) nounwind
 declare i64 @nova_rt_read_line() nounwind
@@ -75,6 +79,16 @@ declare i64 @nova_rt_list_concat(i64, i64) nounwind
 declare i64 @nova_rt_list_reverse(i64) nounwind
 declare i64 @nova_rt_list_sort(i64) nounwind
 declare i64 @nova_rt_list_slice(i64, i64, i64) nounwind
+declare i64 @nova_rt_http_get(i64) nounwind
+declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
+declare i64 @nova_rt_mkdir(i64) nounwind
+declare i64 @nova_rt_mkdir_p(i64) nounwind
+declare i64 @nova_rt_path_join(i64, i64) nounwind
+declare i64 @nova_rt_path_exists(i64) nounwind
+declare i64 @nova_rt_path_parent(i64) nounwind
+declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_read_bytes(i64) nounwind
+declare i64 @nova_rt_write_raw(i64) nounwind
 
 define i64 @risky_divide(i64 %p0, i64 %p1) nounwind {
 entry:
@@ -84,7 +98,8 @@ entry:
   store i64 %p1, ptr %slot.b, align 8
   %r0 = load i64, ptr %slot.b, align 8
   %r1 = add i64 0, 0
-  %r2 = call i64 @nova_rt_eq(i64 %r0, i64 %r1)
+  %r2.cmp = icmp eq i64 %r0, %r1
+  %r2 = zext i1 %r2.cmp to i64
   %br_then0 = icmp ne i64 %r2, 0
   br i1 %br_then0, label %then0, label %else1
 then0:
@@ -266,7 +281,7 @@ catch_err16:
   store i64 %r60, ptr %slot.b, align 8
   %r61 = load i64, ptr %slot.a, align 8
   %r62 = load i64, ptr %slot.b, align 8
-  %r63 = call i64 @nova_rt_add(i64 %r61, i64 %r62)
+  %r63 = add i64 %r61, %r62
   store i64 %r63, ptr %slot.__catch_15, align 8
   br label %catch_merge18
 catch_ok17:
@@ -293,6 +308,7 @@ catch_merge18:
 define i64 @nova_main() nounwind {
 entry:
   %r0 = call i64 @nova_user_main()
+  %r1 = call i64 @nova_user_main()
   ret i64 0
 }
 
@@ -302,6 +318,7 @@ entry:
   %argv64 = ptrtoint ptr %argv to i64
   call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
   call i64 @nova_main()
+  call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()
   ret i32 0
 }
@@ -316,3 +333,16 @@ entry:
 @.str.6 = private unnamed_addr constant [11 x i8] c"no-error: \00"
 @.str.7 = private unnamed_addr constant [11 x i8] c"computed: \00"
 @.str.8 = private unnamed_addr constant [5 x i8] c"done\00"
+
+; TBAA metadata
+!0 = !{!"NOVA TBAA"}
+!1 = !{!"list_data_ptr", !0}
+!2 = !{!1, !1, i64 0}
+!3 = !{!"list_elem", !0}
+!4 = !{!3, !3, i64 0}
+!5 = !{!"list_size", !0}
+!6 = !{!5, !5, i64 0}
+!90 = !{!"branch_weights", i32 2000, i32 1}
+!91 = distinct !{!91, !92, !93}
+!92 = !{!"llvm.loop.unroll.enable"}
+!93 = !{!"llvm.loop.vectorize.enable", i1 true}
