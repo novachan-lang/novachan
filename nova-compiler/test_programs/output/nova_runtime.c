@@ -4745,6 +4745,98 @@ int64_t nova_rt_index_of(int64_t handle, int64_t item) {
     return -1;
 }
 
+int64_t nova_rt_any_truthy(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (l->data[i] != 0) return 1;
+    }
+    return 0;
+}
+
+int64_t nova_rt_all_truthy(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 1;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (l->data[i] == 0) return 0;
+    }
+    return 1;
+}
+
+int64_t nova_rt_list_min(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t min_val = l->data[0];
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] < min_val) min_val = l->data[i];
+    }
+    return min_val;
+}
+
+int64_t nova_rt_list_max(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t max_val = l->data[0];
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] > max_val) max_val = l->data[i];
+    }
+    return max_val;
+}
+
+// Set implementation — backed by a list with equality checks via nova_rt_eq
+int64_t nova_rt_set_create(void) {
+    return nova_rt_list_create();
+}
+
+int64_t nova_rt_set_add(int64_t handle, int64_t item) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_rt_eq(l->data[i], item)) return 0;
+    }
+    nova_rt_list_append(handle, item);
+    return 0;
+}
+
+int64_t nova_rt_set_has(int64_t handle, int64_t item) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_rt_eq(l->data[i], item)) return 1;
+    }
+    return 0;
+}
+
+int64_t nova_rt_set_remove(int64_t handle, int64_t item) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_rt_eq(l->data[i], item)) {
+            nova_rc_dec(l->data[i]);
+            l->data[i] = l->data[l->size - 1];
+            l->size--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int64_t nova_rt_set_len(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return 0;
+    return l->size;
+}
+
+int64_t nova_rt_set_to_list(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return nova_rt_list_create();
+    int64_t result = nova_rt_list_create();
+    for (int64_t i = 0; i < l->size; i++) {
+        nova_rt_list_append(result, l->data[i]);
+    }
+    return result;
+}
+
 static int64_t nova_sort_by_closure;
 static int nova_sort_by_cmp(const void* a, const void* b) {
     int64_t va = *(const int64_t*)a;
