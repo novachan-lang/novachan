@@ -27,7 +27,7 @@ $cases = @(
     @{ name="too_few_args";       expect="err" }
     @{ name="unknown_field";      expect="err" }
     @{ name="duplicate_fn";       expect="err" }
-    @{ name="no_main";            expect="err" }  # nothing to run
+    @{ name="no_main";            expect="ok"  }  # library mode — compiles to a no-op exe
 )
 
 $pass = 0; $fail = 0
