@@ -6938,8 +6938,8 @@ int64_t nova_rt_dir_walk(int64_t path_val) {
    Programs that call spawn() disable arena mode at that point.
    ═════════════════════════════════════════════════════════════════════════ */
 
-void nova_rt_set_arena_mode(void) {
-    nova_arena_mode = 1;
+void nova_rt_set_arena_mode(int64_t flag) {
+    nova_arena_mode = (flag != 0) ? 1 : 0;
 }
 
 int64_t nova_rt_is_arena_mode(void) {
@@ -7200,9 +7200,12 @@ int64_t nova_rt_semver_satisfies(int64_t ver_str, int64_t constraint_str) {
     return cmp == 0;
 }
 
-int64_t nova_rt_semver_format(int64_t major, int64_t minor, int64_t patch) {
+int64_t nova_rt_semver_format(int64_t ver_str) {
+    const char* s = (const char*)(uintptr_t)ver_str;
+    NovaSemver v;
+    nova_semver_parse(s, &v);
     char tmp[64];
-    snprintf(tmp, sizeof(tmp), "%lld.%lld.%lld", (long long)major, (long long)minor, (long long)patch);
+    snprintf(tmp, sizeof(tmp), "%lld.%lld.%lld", (long long)v.major, (long long)v.minor, (long long)v.patch);
     size_t len = strlen(tmp);
     char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
     if (result) memcpy(result, tmp, len + 1);
