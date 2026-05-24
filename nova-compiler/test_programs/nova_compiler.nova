@@ -1578,7 +1578,6 @@ fn parse_if_chain(tokens: list, pos: int, base_col: int) -> StmtParseResult
     StmtParseResult(Stmt("if", "", cond_r.expr, then_body, [], else_body, [], ln), p2)
 
 fn parse_if_stmt(tokens: list, pos: int) -> StmtParseResult
-    let ln = tl(tokens, pos)
     parse_if_chain(tokens, pos, tok_col(tokens, pos))
 
 fn parse_while_stmt(tokens: list, pos: int) -> StmtParseResult
@@ -1621,7 +1620,6 @@ fn parse_for_stmt(tokens: list, pos: int) -> StmtParseResult
 
 fn parse_match_stmt(tokens: list, pos: int) -> StmtParseResult
     let ln = tl(tokens, pos)
-    let kw_col = tok_col(tokens, pos)
     let p = pos + 1
     let subject_r = parse_expr(tokens, p, 0)
     let p2 = skip_nl(tokens, subject_r.pos)
@@ -5921,7 +5919,7 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                     push(elem_types, ti_infer_expr(st, c))
                 return nt_tuple(elem_types)
             if tag == "index"
-                let container = ti_infer_expr(st, children[0])
+                ti_infer_expr(st, children[0])
                 ti_infer_expr(st, children[1])
                 return nt_any()
             if tag == "member"
@@ -6082,6 +6080,7 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                             is_nothing = true
                 if not is_nothing
                     ti_constrain(st, ret_var, last_t, sline)
+                unused_check_function(body, params, name, st)
                 ti_pop_scope(st)
                 st.ti_ret_var = saved_ret
                 ti_solve(st)
@@ -6391,6 +6390,95 @@ fn ti_to_ir_kind(t: NType) -> string
             if kind == "struct"
                 return "struct"
     "any"
+
+// ── Unused-variable analysis (catches typos like `counte = counter + 1`) ─────
+
+fn unused_reads_expr(e: Expr, reads: dict)
+    match e
+        Expr(tag, value, num, children, fields, line) =>
+            if tag == "ident"
+                reads[value] = 1
+            let ci = 0
+            while ci < len(children)
+                unused_reads_expr(children[ci], reads)
+                ci = ci + 1
+            let fi = 0
+            while fi < len(fields)
+                unused_reads_expr(fields[fi], reads)
+                fi = fi + 1
+
+fn unused_walk_stmt(s: Stmt, writes: dict, reads: dict)
+    match s
+        Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
+            let skip_lhs_idx = -1
+            if tag == "assign"
+                if name != ""
+                    if not contains(writes, name)
+                        writes[name] = sline
+                else if len(annotations) > 0
+                    let lhs = annotations[0]
+                    match lhs
+                        Expr(et, ev, en, ec, ef, eln) =>
+                            if et == "ident"
+                                if not contains(writes, ev)
+                                    writes[ev] = sline
+                                skip_lhs_idx = 0
+            else if tag == "compound_assign"
+                if len(annotations) > 0
+                    let lhs = annotations[0]
+                    match lhs
+                        Expr(et, ev, en, ec, ef, eln) =>
+                            if et == "ident"
+                                reads[ev] = 1
+            else if tag == "for"
+                reads[name] = 1
+            else if tag == "spawn"
+                if name != ""
+                    if not contains(writes, name)
+                        writes[name] = sline
+
+            unused_reads_expr(expr, reads)
+            let ai = 0
+            while ai < len(annotations)
+                if ai != skip_lhs_idx
+                    unused_reads_expr(annotations[ai], reads)
+                ai = ai + 1
+            let bi = 0
+            while bi < len(body)
+                unused_walk_stmt(body[bi], writes, reads)
+                bi = bi + 1
+            let ebi = 0
+            while ebi < len(else_body)
+                unused_walk_stmt(else_body[ebi], writes, reads)
+                ebi = ebi + 1
+            let pi = 0
+            while pi < len(params)
+                match params[pi]
+                    Param(ppn, ppt, ppd) =>
+                        unused_reads_expr(ppd, reads)
+                pi = pi + 1
+
+fn unused_check_function(body: list, params: list, fn_name: string, st: TiState)
+    let writes = {}
+    let reads = {}
+    let param_names = {}
+    let p_i = 0
+    while p_i < len(params)
+        match params[p_i]
+            Param(ppn, ppt, ppd) =>
+                param_names[ppn] = 1
+        p_i = p_i + 1
+    let i = 0
+    while i < len(body)
+        unused_walk_stmt(body[i], writes, reads)
+        i = i + 1
+    let wks = keys(writes)
+    let ki = 0
+    while ki < len(wks)
+        let wn = wks[ki]
+        if not contains(reads, wn) and not contains(param_names, wn) and not starts_with(wn, "_")
+            ti_error(st, "variable '" + wn + "' is assigned but never read (likely a typo)", writes[wn])
+        ki = ki + 1
 
 // ── Main entry point: infer types for a parsed program ───────────────────────
 
@@ -8613,9 +8701,6 @@ fn path_dir(path: string) -> string
     slice(path, 0, last_sep + 1)
 
 fn resolve_module_file(name: string, base_dir: string) -> string
-    let sep = "/"
-    if contains(base_dir, "\\")
-        sep = "\\"
     let candidate = base_dir + name + ".nova"
     let content = read_file(candidate)
     if len(content) > 0
