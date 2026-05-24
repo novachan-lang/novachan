@@ -2,7 +2,7 @@ Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
 Write-Host "=== Compile nova_compiler.nova ==="
-$cr = Invoke-Timed -FilePath (Resolve-Path ".\gen2_move.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 120000
+$cr = Invoke-Timed -FilePath (Resolve-Path ".\gen2_move.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 240000
 Write-Host "Compile exit: $($cr.ExitCode)"
 if ($cr.ExitCode -ne 0) {
     Write-Host "STDOUT: $($cr.StdOut)"
@@ -12,7 +12,7 @@ if ($cr.ExitCode -ne 0) {
 
 Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
 Write-Host "=== Link ==="
-$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o gen2_new.exe nova_compiler.ll nova_runtime.c -lws2_32" -TimeoutMs 120000
+$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o gen2_new.exe nova_compiler.ll nova_runtime.c -lws2_32" -TimeoutMs 240000
 Write-Host "Link exit: $($lr.ExitCode)"
 if (!(Test-Path "gen2_new.exe")) {
     Write-Host "Link failed"
