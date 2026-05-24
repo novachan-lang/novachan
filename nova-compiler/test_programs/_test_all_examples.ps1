@@ -1,7 +1,7 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
-$examples = @("01_hello", "02_data_processing", "04_crypto_web_token", "05_file_processor")
+$examples = @("01_hello", "02_data_processing", "03_concurrency", "04_crypto_web_token", "05_file_processor")
 $pass = 0; $fail = 0
 
 foreach ($ex in $examples) {
