@@ -33,8 +33,8 @@ $cases = @(
     @{ name="trailing_comma_list"; expect="ok" }   # `[1, 2, 3,]` should be accepted
     @{ name="if_no_else";         expect="ok"  }  # if without else is valid
     @{ name="else_no_if";         expect="err" }  # orphan else
-    @{ name="break_outside_loop"; expect="ok"  }  # KNOWN: inside-fn but outside-loop break needs loop-depth tracking (deferred)
-    @{ name="continue_outside_loop"; expect="ok" } # KNOWN: same
+    @{ name="break_outside_loop"; expect="err" }  # break_continue_check rejects
+    @{ name="continue_outside_loop"; expect="err" } # same
     @{ name="reserved_as_var";    expect="err" }  # let fn = 5 -- fn is keyword
     @{ name="string_plus_int";    expect="err" }  # E1001 type mismatch
     @{ name="list_plus_int";      expect="err" }  # E1001 type mismatch
