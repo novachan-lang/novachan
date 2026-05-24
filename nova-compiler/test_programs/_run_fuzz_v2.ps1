@@ -69,6 +69,10 @@ $cases = @(
     @{ name="match_arms_mismatch"; expect="err" } # arms returning int vs string
     @{ name="list_string_index";  expect="err" }  # xs["zero"] -- list needs int index
     @{ name="variant_on_int";     expect="err" }  # match int against enum variants
+    # --- Soundness probes (Option G: extended type hardening) ---
+    @{ name="for_on_int";         expect="err" }  # for x in 5 -- not iterable
+    @{ name="if_branches_mismatch"; expect="err" } # if branches return int vs string
+    @{ name="dict_wrong_key";     expect="err" }  # dict<string,int>[int_key]
 )
 
 $pass = 0; $fail = 0
