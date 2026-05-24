@@ -63,6 +63,12 @@ $cases = @(
     @{ name="raw_string";         expect="ok"  }
     @{ name="boolean_ops";        expect="ok"  }
     @{ name="unicode_string";     expect="ok"  }
+    # --- Soundness probes (Option A: type system hardening) ---
+    @{ name="index_on_int";       expect="err" }  # 5[0] -- type 'int' not indexable
+    @{ name="member_on_int";      expect="err" }  # 5.foo -- type 'int' has no field
+    @{ name="match_arms_mismatch"; expect="err" } # arms returning int vs string
+    @{ name="list_string_index";  expect="err" }  # xs["zero"] -- list needs int index
+    @{ name="variant_on_int";     expect="err" }  # match int against enum variants
 )
 
 $pass = 0; $fail = 0

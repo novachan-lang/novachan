@@ -5417,6 +5417,27 @@ fn ti_unify_d(st: TiState, a: NType, b: NType, line: int, depth: int)
 fn ti_unify(st: TiState, a: NType, b: NType, line: int)
     ti_unify_d(st, a, b, line, 0)
 
+// Tolerant arm-vs-arm unification for match expressions / branches.
+// Only enforces equality when BOTH sides are concrete, non-any, non-unit,
+// non-nothing. This catches arms that disagree on a real type (e.g. one arm
+// returns string, another returns int) while letting control-flow arms
+// (one prints, one returns a value — different "value-ness") pass through.
+fn ti_unify_arms(st: TiState, a: NType, b: NType, line: int)
+    let wa = ti_walk(st, a)
+    let wb = ti_walk(st, b)
+    let a_ok = false
+    let b_ok = false
+    match wa
+        NType(wak, wan, wap, wai) =>
+            if wak != "any" and wak != "var" and wak != "unit" and wak != "nothing"
+                a_ok = true
+    match wb
+        NType(wbk, wbn, wbp, wbi) =>
+            if wbk != "any" and wbk != "var" and wbk != "unit" and wbk != "nothing"
+                b_ok = true
+    if a_ok and b_ok
+        ti_constrain(st, a, b, line)
+
 fn ti_solve(st: TiState)
     let total = len(st.ti_constraints)
     let i = 0
@@ -5964,8 +5985,20 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                     push(elem_types, ti_infer_expr(st, c))
                 return nt_tuple(elem_types)
             if tag == "index"
-                ti_infer_expr(st, children[0])
-                ti_infer_expr(st, children[1])
+                let idx_subj = ti_infer_expr(st, children[0])
+                let idx_key = ti_infer_expr(st, children[1])
+                let idx_w = ti_walk(st, idx_subj)
+                match idx_w
+                    NType(iwk, iwn, iwp, iwi) =>
+                        if iwk == "int" or iwk == "float" or iwk == "bool" or iwk == "range"
+                            ti_error(st, "type '" + iwk + "' is not indexable; only list, dict, and string support [] access", eline)
+                        else if iwk == "list" or iwk == "string"
+                            // list and string both require integer indices.
+                            let kw = ti_walk(st, idx_key)
+                            match kw
+                                NType(kwk, kwn, kwp, kwi) =>
+                                    if kwk == "string" or kwk == "list" or kwk == "dict" or kwk == "struct" or kwk == "range"
+                                        ti_error(st, "type '" + iwk + "' requires an integer index, but found '" + kwk + "'", eline)
                 return nt_any()
             if tag == "member"
                 if len(children) > 0
@@ -5979,6 +6012,8 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                                     ti_error(st, "struct '" + wn + "' has no field '" + value + "'", eline)
                                 else
                                     return fields[value]
+                            else if wk == "int" or wk == "float" or wk == "bool" or wk == "range"
+                                ti_error(st, "type '" + wk + "' has no field '" + value + "' (field access requires a struct)", eline)
                 return nt_any()
             if tag == "if"
                 let cond = ti_infer_expr(st, children[0])
@@ -6014,6 +6049,8 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                                 if m_first
                                     m_result = m_armt
                                     m_first = false
+                                else
+                                    ti_unify_arms(st, m_result, m_armt, xal)
                     mci = mci + 1
                 ti_check_exhaustive(st, ex_pats, eline)
                 return m_result
@@ -6340,6 +6377,8 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                 if match_first
                                     match_t = arm_t
                                     match_first = false
+                                else
+                                    ti_unify_arms(st, match_t, arm_t, asln)
                 ti_check_exhaustive(st, ex_pats, sline)
                 // A match used as a function's last expression yields the
                 // value of its arms; report the first arm's value type.
@@ -6362,6 +6401,17 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
     match pat
         Expr(tag, value, num, children, fields, eline) =>
             if tag == "pat_var"
+                // A bare identifier in a pattern is normally a binder, but it
+                // may also name an enum variant (e.g. `match c { Red => ... }`
+                // where Red is a niladic variant). In the variant case, the
+                // subject must be of an enum/struct type — primitive subjects
+                // are a soundness hole.
+                if contains(st.ti_variant_enum, value)
+                    let pv_w = ti_walk(st, expected)
+                    match pv_w
+                        NType(pvk, pvn, pvp, pvi) =>
+                            if pvk == "int" or pvk == "float" or pvk == "bool" or pvk == "string" or pvk == "range" or pvk == "list" or pvk == "dict"
+                                ti_error(st, "cannot match enum variant '" + value + "' against subject of type '" + pvk + "'", eline)
                 ti_define(st, value, ti_mono(expected))
             else if tag == "pat_wild"
                 return
@@ -6370,6 +6420,12 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
             else if tag == "pat_str"
                 ti_constrain(st, expected, nt_string(), eline)
             else if tag == "pat_ctor"
+                if contains(st.ti_variant_enum, value)
+                    let pc_w = ti_walk(st, expected)
+                    match pc_w
+                        NType(pwk, pwn, pwp, pwi) =>
+                            if pwk == "int" or pwk == "float" or pwk == "bool" or pwk == "string" or pwk == "range" or pwk == "list" or pwk == "dict"
+                                ti_error(st, "cannot match enum variant '" + value + "' against subject of type '" + pwk + "'", eline)
                 for child in children
                     match child
                         Expr(ct, cv, cn, cc, cf, cln) =>
