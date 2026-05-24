@@ -115,14 +115,47 @@ if ($cr2.ExitCode -eq 0) {
     $spCount = ([regex]::Matches($ll2, "!DISubprogram")).Count
     $locCount = ([regex]::Matches($ll2, "!DILocation")).Count
     Write-Host "  DISubprogram: $spCount, DILocation: $locCount"
-    if ($spCount -gt 100 -and $locCount -eq $spCount) {
-        Write-Host "  PASS: $spCount functions with debug info"; $pass++
+    # With per-statement debug, locCount should be far greater than spCount
+    # (every statement in every function mints its own DILocation).
+    if ($spCount -gt 100 -and $locCount -ge ($spCount * 5)) {
+        Write-Host "  PASS: $spCount functions, $locCount per-statement locations"; $pass++
     } else {
-        Write-Host "  FAIL: mismatch or too few"; $fail++
+        Write-Host "  FAIL: expected locCount >= spCount*5, got $locCount vs $spCount"; $fail++
     }
 } else {
     Write-Host "  FAIL: compile error"; $fail++
 }
+
+# --- Test 4b: Per-statement DILocations point to actual statement lines ---
+Write-Host "`n=== Test 4b: Per-statement DILocations ==="
+$src4b = @"
+fn calc(n: int) -> int
+    let a = n + 1
+    let b = a * 2
+    let c = b - 3
+    c
+
+fn main()
+    print(str(calc(5)))
+"@
+Set-Content "t_perstmt.nova" $src4b -Encoding UTF8
+$cr4b = Invoke-Timed -FilePath (Resolve-Path ".\gen2_move.exe").Path -Arguments "t_perstmt.nova" -TimeoutMs 30000
+if ($cr4b.ExitCode -eq 0) {
+    $ll4b = Get-Content "t_perstmt.ll" -Raw
+    # Each of lines 2, 3, 4 should appear as a DILocation line:
+    $hits = 0
+    foreach ($n in 2,3,4) {
+        if ($ll4b -match "!DILocation\(line: $n,") { $hits++ }
+    }
+    if ($hits -eq 3) {
+        Write-Host "  PASS: lines 2,3,4 each have a DILocation"; $pass++
+    } else {
+        Write-Host "  FAIL: only $hits of lines 2,3,4 have DILocations"; $fail++
+    }
+} else {
+    Write-Host "  FAIL: compile error"; $fail++
+}
+Remove-Item "t_perstmt.nova","t_perstmt.ll" -Force -ErrorAction SilentlyContinue
 
 # --- Test 5: Correct line numbers ---
 Write-Host "`n=== Test 5: Line numbers correct ==="
