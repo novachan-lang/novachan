@@ -1438,24 +1438,34 @@ fn parse_fn_decl(tokens: list, pos: int) -> StmtParseResult
             for ep in params
                 push(self_params, ep)
             params = self_params
-    // Capture return type annotation (the base type name after ->)
+    // Capture return type annotation (full parametric type after ->)
     let ret_ann = ""
     if tk(tokens, p) == "ARROW"
         p = p + 1
         if tk(tokens, p) == "IDENT"
             ret_ann = tv(tokens, p)
-        while tk(tokens, p) == "IDENT" or tk(tokens, p) == "DELIM"
             p = p + 1
-        // Skip generic type arguments like List<T> or Map<K, V>
-        if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
-            let depth = 1
-            p = p + 1
-            while depth > 0 and tk(tokens, p) != "EOF" and tk(tokens, p) != "NEWLINE"
-                if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
-                    depth = depth + 1
-                else if tk(tokens, p) == "OP" and tv(tokens, p) == ">"
-                    depth = depth - 1
+            if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
+                ret_ann = ret_ann + "<"
+                let rdepth = 1
                 p = p + 1
+                while rdepth > 0 and tk(tokens, p) != "EOF" and tk(tokens, p) != "NEWLINE"
+                    let rtkk = tk(tokens, p)
+                    let rtvv = tv(tokens, p)
+                    if rtkk == "OP" and rtvv == "<"
+                        rdepth = rdepth + 1
+                        ret_ann = ret_ann + "<"
+                    else if rtkk == "OP" and rtvv == ">"
+                        rdepth = rdepth - 1
+                        ret_ann = ret_ann + ">"
+                    else if rtkk == "OP" and rtvv == ">>"
+                        rdepth = rdepth - 2
+                        ret_ann = ret_ann + ">>"
+                    else if rtkk == "DELIM" and rtvv == ","
+                        ret_ann = ret_ann + ","
+                    else if rtkk == "IDENT"
+                        ret_ann = ret_ann + rtvv
+                    p = p + 1
     let fn_col = 1
     let fn_tok = tokens[pos]
     match fn_tok
@@ -5999,19 +6009,21 @@ fn ti_lookup(st: TiState, vname: string, line: int) -> NType
 // ── Source type annotation to NType ──────────────────────────────────────────
 
 fn ti_ann_to_type(ann: string) -> NType
-    if ann == "int"
+    if ann == "int" or ann == "Int"
         return nt_int()
-    if ann == "string" or ann == "str"
+    if ann == "string" or ann == "str" or ann == "String" or ann == "Str"
         return nt_string()
-    if ann == "float"
+    if ann == "float" or ann == "Float"
         return nt_float()
-    if ann == "bool"
+    if ann == "bool" or ann == "Bool"
         return nt_bool()
-    if ann == "list"
+    if ann == "list" or ann == "List"
         return nt_list(nt_any())
-    if ann == "dict"
+    if ann == "dict" or ann == "Dict" or ann == "Map"
         return nt_dict(nt_string(), nt_any())
-    nt_any()
+    if ann == "" or ann == "any" or ann == "Any"
+        return nt_any()
+    nt_struct(ann)
 
 // Split a parametric annotation like "Map<string,int>" or "List<List<int>>"
 // at the comma separators of the OUTER pair of angle brackets.
@@ -6124,9 +6136,9 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                     while len(arg_types) < full_ar
                         push(arg_types, ti_fresh(st))
                 let ret_var = ti_fresh(st)
+                if value == "select"
+                    return ret_var
                 let expected_fn = nt_fn(arg_types, ret_var)
-                // The unify catch-all in ti_unify_d reports any arg/param
-                // type mismatch when this constraint is solved.
                 ti_constrain(st, fn_t, expected_fn, eline)
                 return ret_var
             if tag == "method_call"
@@ -6357,32 +6369,12 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 let ret_var = ti_fresh(st)
                 match expr
                     Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
-                        if rxt == "rettype"
-                            let ann_t = nt_any()
-                            let ann_known = false
-                            if rxv == "int"
-                                ann_t = nt_int()
-                                ann_known = true
-                            else if rxv == "string" or rxv == "str"
-                                ann_t = nt_string()
-                                ann_known = true
-                            else if rxv == "float"
-                                ann_t = nt_float()
-                                ann_known = true
-                            else if rxv == "bool"
-                                ann_t = nt_bool()
-                                ann_known = true
-                            else if rxv == "list"
-                                ann_t = nt_list(ti_fresh(st))
-                                ann_known = true
-                            else if rxv == "dict"
-                                ann_t = nt_dict(ti_fresh(st), ti_fresh(st))
-                                ann_known = true
-                            else if contains(gmap, rxv)
-                                ann_t = gmap[rxv]
-                                ann_known = true
-                            if ann_known
-                                ti_constrain(st, ret_var, ann_t, sline)
+                        if rxt == "rettype" and rxv != "" and rxv != "any"
+                            let ann_t = ti_ann_to_type_g(rxv, gmap)
+                            match ann_t
+                                NType(ak, an2, ap, ai) =>
+                                    if ak != "any"
+                                        ti_constrain(st, ret_var, ann_t, sline)
                 let fn_type = nt_fn(param_types, ret_var)
                 let fn_name = name
                 if fn_name == "main"
@@ -6945,6 +6937,7 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                     ti_error(st, "'continue' outside of a loop is not allowed", sl2)
         ti_infer_stmt(st, stmts[si])
         si = si + 1
+    ti_solve(st)
     st
 
 // ── Tail Call Optimization ───────────────────────────────────────────────────
@@ -8674,7 +8667,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     match expr
                         Expr(rtt, rtv, rtn, rtc, rtf, rtl) =>
                             if rtt == "rettype" and rtv != ""
-                                b.ir_fn_returns[name] = rtv
+                                let rt_base = rtv
+                                let rt_lt = find(rtv, "<")
+                                if rt_lt > 0
+                                    rt_base = slice(rtv, 0, rt_lt)
+                                b.ir_fn_returns[name] = rt_base
                     let dunder_pos = find(fn_name, "__")
                     if dunder_pos > 0
                         let method_suffix = fn_name[dunder_pos + 2:999999999]
