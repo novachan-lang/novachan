@@ -140,6 +140,42 @@ fn print_source_snippet(filename: string, line: int, col: int)
                 print("  " + lnum + " | " + snippet)
                 print("  " + pad + " |")
 
+// Returns a formatted source snippet string (line with surrounding bars).
+fn format_source_snippet(filename: string, line: int) -> string
+    if filename != "" and file_exists(filename) and line > 0
+        let content = read_file(filename)
+        if len(content) > 0
+            let lines = split(content, "\n")
+            if line <= len(lines)
+                let snippet = lines[line - 1]
+                let lnum = str(line)
+                let pad = ""
+                let pi = 0
+                while pi < len(lnum)
+                    pad = pad + " "
+                    pi = pi + 1
+                return "  " + pad + " |\n" + "  " + lnum + " | " + snippet + "\n" + "  " + pad + " |\n"
+    ""
+
+// Skip tokens forward to the next top-level sync point (next statement boundary).
+fn sync_to_stmt(tokens: list, pos: int) -> int
+    let p = pos
+    while p < len(tokens) - 1
+        let kind = tk(tokens, p)
+        if kind == "EOF"
+            return p
+        let col = tok_col(tokens, p)
+        if col <= 1 and kind == "NEWLINE"
+            return p + 1
+        if col <= 1 and kind == "KW"
+            return p
+        p = p + 1
+    len(tokens) - 1
+
+// Dummy "error" statement returned when a parse error occurs and recovery skips a construct.
+fn error_stmt(line: int) -> Stmt
+    Stmt("error", "", Expr("null", "", 0, [], [], 0), [], [], [], [], line)
+
 fn int_fits_i64(s: string) -> bool
     if len(s) == 0
         return true
@@ -664,19 +700,15 @@ fn tok_filename(tokens: list) -> string
                 return v
     ""
 
-// Reports a syntax error as a clean diagnostic and aborts compilation.
-// Used in place of internal assertions so malformed input never produces a
-// raw "Assertion failed" crash.
-fn syntax_error(tokens: list, pos: int, msg: string)
+// Records a syntax error (accumulate all, not exit-on-first).
+// Returns the position of the next top-level sync token for recovery.
+fn syntax_error(tokens: list, pos: int, msg: string, pe: list) -> int
     let ln = tok_line(tokens, pos)
     let cl = tok_col(tokens, pos)
     let raw_fname = tok_filename(tokens)
     let fname = raw_fname
     if fname == ""
         fname = "<source>"
-    print("error[E0001]: " + msg)
-    print("  --> " + fname + ":" + str(ln) + ":" + str(cl))
-    print_source_snippet(raw_fname, ln, cl)
     let help = ""
     if contains(msg, "expected ')'")
         help = "you may be missing a closing ')' or have an unbalanced expression"
@@ -688,14 +720,15 @@ fn syntax_error(tokens: list, pos: int, msg: string)
         help = "type annotations and dict literals use ':' between name and value"
     else if contains(msg, "unexpected")
         help = "check that the surrounding syntax (parens, braces, indentation) is balanced"
+    let out = "error[E0001]: " + msg + "\n  --> " + fname + ":" + str(ln) + ":" + str(cl) + "\n" + format_source_snippet(raw_fname, ln)
     if help != ""
-        print("  = help: " + help)
-    print("compilation failed: 1 error(s)")
-    exit(1)
+        out = out + "  = help: " + help + "\n"
+    push(pe, out)
+    sync_to_stmt(tokens, pos)
 
-fn expect(tokens: list, pos: int, expected_val: string) -> int
+fn expect(tokens: list, pos: int, expected_val: string, pe: list) -> int
     if tv(tokens, pos) != expected_val
-        syntax_error(tokens, pos, "expected '" + expected_val + "' but found '" + tv(tokens, pos) + "'")
+        return syntax_error(tokens, pos, "expected '" + expected_val + "' but found '" + tv(tokens, pos) + "'", pe)
     pos + 1
 
 // ── Operator Precedence (Pratt Parser) ───────────────────────────────────────
@@ -757,20 +790,20 @@ fn get_infix_op(tokens: list, pos: int) -> string
 fn null_expr() -> Expr
     Expr("null", "", 0, [], [], 0)
 
-fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
+fn parse_expr(tokens: list, pos: int, min_bp: int, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
-    let left_r = parse_prefix(tokens, pos)
+    let left_r = parse_prefix(tokens, pos, pe)
     let left = left_r.expr
     let cur = left_r.pos
 
     while cur < len(tokens) and tk(tokens, cur) != "EOF" and tk(tokens, cur) != "NEWLINE"
         // Check for postfix operations: function call, index, member access
         if tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "("
-            let call_r = parse_call_args(tokens, cur, left)
+            let call_r = parse_call_args(tokens, cur, left, pe)
             left = call_r.expr
             cur = call_r.pos
         else if tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "["
-            let idx_r = parse_index(tokens, cur, left)
+            let idx_r = parse_index(tokens, cur, left, pe)
             left = idx_r.expr
             cur = idx_r.pos
         else if tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "\{"
@@ -779,18 +812,18 @@ fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
                     if ltag == "ident"
                         let struct_fields = []
                         let sp = cur + 1
-                        while sp < len(tokens) and tv(tokens, sp) != "\}"
+                        while sp < len(tokens) and tv(tokens, sp) != "\}" and tk(tokens, sp) != "EOF"
                             if len(struct_fields) > 0
-                                sp = expect(tokens, sp, ",")
-                                if tv(tokens, sp) == "\}"
+                                sp = expect(tokens, sp, ",", pe)
+                                if tv(tokens, sp) == "\}" or tk(tokens, sp) == "EOF"
                                     break
                             let fname = tv(tokens, sp)
                             sp = sp + 1
-                            sp = expect(tokens, sp, ":")
-                            let fval_r = parse_expr(tokens, sp, 0)
+                            sp = expect(tokens, sp, ":", pe)
+                            let fval_r = parse_expr(tokens, sp, 0, pe)
                             push(struct_fields, Expr("field_init", fname, 0, [fval_r.expr], [], ln))
                             sp = fval_r.pos
-                        sp = expect(tokens, sp, "\}")
+                        sp = expect(tokens, sp, "\}", pe)
                         left = Expr("struct_init", lval, 0, struct_fields, [], ln)
                         cur = sp
                     else
@@ -801,7 +834,7 @@ fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
             cur = cur + 1
             // Check for method call: obj.method(args)
             if cur < len(tokens) and tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "("
-                let method_r = parse_call_args(tokens, cur, Expr("member", member_name, 0, [left], [], ln))
+                let method_r = parse_call_args(tokens, cur, Expr("member", member_name, 0, [left], [], ln), pe)
                 left = method_r.expr
                 cur = method_r.pos
             else
@@ -812,7 +845,7 @@ fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
         else if tk(tokens, cur) == "FAT_ARROW" and min_bp <= 1
             // Lambda: left => body (lowest precedence)
             cur = cur + 1
-            let body_r = parse_expr(tokens, cur, 0)
+            let body_r = parse_expr(tokens, cur, 0, pe)
             match left
                 Expr(ltag, lval, lnum, lchildren, lfields, lln) =>
                     if ltag == "ident"
@@ -839,7 +872,7 @@ fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
                     let body_col = tok_col(tokens, cur)
                     let body_stmts = []
                     while tk(tokens, cur) != "EOF" and tok_col(tokens, cur) >= body_col
-                        let sr = parse_stmt(tokens, cur)
+                        let sr = parse_stmt(tokens, cur, pe)
                         push(body_stmts, sr.stmt)
                         cur = skip_nl(tokens, sr.pos)
                     if len(body_stmts) > 1
@@ -851,11 +884,11 @@ fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
                     else
                         left = Expr("catch", err_var, 0, [left, null_expr()], [], ln)
                 else
-                    let handler_r = parse_expr(tokens, cur, 0)
+                    let handler_r = parse_expr(tokens, cur, 0, pe)
                     left = Expr("catch", err_var, 0, [left, handler_r.expr], [], ln)
                     cur = handler_r.pos
             else
-                let right_r = parse_expr(tokens, cur, rbp)
+                let right_r = parse_expr(tokens, cur, rbp, pe)
                 left = Expr("binop", op, 0, [left, right_r.expr], [], ln)
                 cur = right_r.pos
         else
@@ -863,7 +896,7 @@ fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
 
     ParseResult(left, cur)
 
-fn parse_prefix(tokens: list, pos: int) -> ParseResult
+fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let kind = tk(tokens, pos)
     let val = tv(tokens, pos)
@@ -890,74 +923,78 @@ fn parse_prefix(tokens: list, pos: int) -> ParseResult
             ParseResult(Expr("float", "-" + fv, 0, [], [], ln), pos + 2)
         else
             let rbp = prefix_bp("-")
-            let operand_r = parse_expr(tokens, pos + 1, rbp)
+            let operand_r = parse_expr(tokens, pos + 1, rbp, pe)
             ParseResult(Expr("unary", "-", 0, [operand_r.expr], [], ln), operand_r.pos)
     else if kind == "KW" and val == "not"
         let rbp = prefix_bp("not")
-        let operand_r = parse_expr(tokens, pos + 1, rbp)
+        let operand_r = parse_expr(tokens, pos + 1, rbp, pe)
         ParseResult(Expr("unary", "not", 0, [operand_r.expr], [], ln), operand_r.pos)
     else if kind == "OP" and val == "~"
         let rbp = prefix_bp("~")
-        let operand_r = parse_expr(tokens, pos + 1, rbp)
+        let operand_r = parse_expr(tokens, pos + 1, rbp, pe)
         ParseResult(Expr("unary", "~", 0, [operand_r.expr], [], ln), operand_r.pos)
     else if kind == "DELIM" and val == "("
         // Grouped expression or tuple
-        let inner_r = parse_expr(tokens, pos + 1, 0)
+        let inner_r = parse_expr(tokens, pos + 1, 0, pe)
         if tk(tokens, inner_r.pos) == "COMMA"
             // Tuple literal
             let elements = [inner_r.expr]
             let p = inner_r.pos
-            while tv(tokens, p) == ","
+            while tv(tokens, p) == "," and tk(tokens, p) != "EOF"
                 p = p + 1
-                let elem_r = parse_expr(tokens, p, 0)
+                let elem_r = parse_expr(tokens, p, 0, pe)
                 push(elements, elem_r.expr)
                 p = elem_r.pos
-            p = expect(tokens, p, ")")
+            p = expect(tokens, p, ")", pe)
             ParseResult(Expr("tuple", "", 0, elements, [], ln), p)
         else
-            let p2 = expect(tokens, inner_r.pos, ")")
+            let p2 = expect(tokens, inner_r.pos, ")", pe)
             ParseResult(inner_r.expr, p2)
     else if kind == "DELIM" and val == "["
         // List literal — trailing comma allowed: [1, 2, 3,]
         let elements = []
         let p = pos + 1
-        while tv(tokens, p) != "]"
+        while tv(tokens, p) != "]" and tk(tokens, p) != "EOF"
             if len(elements) > 0
-                p = expect(tokens, p, ",")
-                if tv(tokens, p) == "]"
+                p = expect(tokens, p, ",", pe)
+                if tv(tokens, p) == "]" or tk(tokens, p) == "EOF"
                     break
-            let elem_r = parse_expr(tokens, p, 0)
+            let elem_r = parse_expr(tokens, p, 0, pe)
             push(elements, elem_r.expr)
+            if elem_r.pos <= p
+                break
             p = elem_r.pos
-        p = expect(tokens, p, "]")
+        p = expect(tokens, p, "]", pe)
         ParseResult(Expr("list", "", 0, elements, [], ln), p)
     else if kind == "DELIM" and val == "\{"
         // Dict literal
         let entries = []
         let p = pos + 1
-        while tv(tokens, p) != "\}"
+        while tv(tokens, p) != "\}" and tk(tokens, p) != "EOF"
             if len(entries) > 0
-                p = expect(tokens, p, ",")
-                if tv(tokens, p) == "\}"
+                p = expect(tokens, p, ",", pe)
+                if tv(tokens, p) == "\}" or tk(tokens, p) == "EOF"
                     break
-            let key_r = parse_expr(tokens, p, 0)
-            p = expect(tokens, key_r.pos, ":")
-            let val_r = parse_expr(tokens, p, 0)
+            let key_r = parse_expr(tokens, p, 0, pe)
+            p = expect(tokens, key_r.pos, ":", pe)
+            let val_r = parse_expr(tokens, p, 0, pe)
             push(entries, Expr("pair", "", 0, [key_r.expr, val_r.expr], [], ln))
+            if val_r.pos <= p
+                break
             p = val_r.pos
-        p = expect(tokens, p, "\}")
+        p = expect(tokens, p, "\}", pe)
         ParseResult(Expr("dict", "", 0, entries, [], ln), p)
     else if kind == "INTERP_START"
         let parts = []
         push(parts, Expr("str", val, 0, [], [], ln))
         let p = pos + 1
-        let interp_expr_r = parse_expr(tokens, p, 0)
+        let interp_expr_r = parse_expr(tokens, p, 0, pe)
         push(parts, interp_expr_r.expr)
         p = interp_expr_r.pos
         while p < len(tokens) and tk(tokens, p) == "INTERP_MID"
             push(parts, Expr("str", tv(tokens, p), 0, [], [], ln))
             p = p + 1
-            let next_r = parse_expr(tokens, p, 0)
+            let next_r = parse_expr(tokens, p, 0, pe)
             push(parts, next_r.expr)
             p = next_r.pos
         if p < len(tokens) and tk(tokens, p) == "INTERP_END"
@@ -965,58 +1002,64 @@ fn parse_prefix(tokens: list, pos: int) -> ParseResult
             p = p + 1
         ParseResult(Expr("str_interp", "", 0, parts, [], ln), p)
     else if kind == "KW" and val == "try"
-        let inner_r = parse_expr(tokens, pos + 1, 5)
+        let inner_r = parse_expr(tokens, pos + 1, 5, pe)
         ParseResult(Expr("try", "", 0, [inner_r.expr], [], ln), inner_r.pos)
     else if kind == "KW" and val == "if"
-        parse_if_expr(tokens, pos)
+        parse_if_expr(tokens, pos, pe)
     else if kind == "KW" and val == "match"
-        parse_match_expr(tokens, pos)
+        parse_match_expr(tokens, pos, pe)
     else if kind == "KW" and val == "for"
-        parse_for_expr(tokens, pos)
+        parse_for_expr(tokens, pos, pe)
     else if kind == "KW" and (val == "send" or val == "receive" or val == "select" or val == "close" or val == "matches" or val == "monitor" or val == "recv" or val == "recv_timeout")
         ParseResult(Expr("ident", val, 0, [], [], ln), pos + 1)
     else if kind == "KW" and val == "fn"
         let fp = pos + 1
-        fp = expect(tokens, fp, "(")
+        fp = expect(tokens, fp, "(", pe)
         let fn_params = []
-        while tv(tokens, fp) != ")"
+        while tv(tokens, fp) != ")" and tk(tokens, fp) != "EOF"
             if len(fn_params) > 0
-                fp = expect(tokens, fp, ",")
+                fp = expect(tokens, fp, ",", pe)
+                if tk(tokens, fp) == "EOF"
+                    break
             push(fn_params, Expr("ident", tv(tokens, fp), 0, [], [], ln))
             fp = fp + 1
-        fp = expect(tokens, fp, ")")
-        let fn_body_r = parse_expr(tokens, fp, 0)
+        fp = expect(tokens, fp, ")", pe)
+        let fn_body_r = parse_expr(tokens, fp, 0, pe)
         ParseResult(Expr("lambda", "", 0, [fn_body_r.expr], fn_params, ln), fn_body_r.pos)
     else if kind == "KW" and val == "channel"
         let ch_p = pos + 1
         if ch_p < len(tokens) and tk(tokens, ch_p) == "DELIM" and tv(tokens, ch_p) == "("
-            ch_p = expect(tokens, ch_p + 1, ")")
+            ch_p = expect(tokens, ch_p + 1, ")", pe)
             ParseResult(Expr("call", "channel", 0, [], [], ln), ch_p)
         else
             ParseResult(Expr("ident", "channel", 0, [], [], ln), ch_p)
     else if kind == "KW" and val == "spawn"
-        let sp_r = parse_expr(tokens, pos + 1, 0)
+        let sp_r = parse_expr(tokens, pos + 1, 0, pe)
         ParseResult(Expr("spawn", "", 0, [sp_r.expr], [], ln), sp_r.pos)
     else if kind == "KW" and val == "yield"
-        let yd_r = parse_expr(tokens, pos + 1, 0)
+        let yd_r = parse_expr(tokens, pos + 1, 0, pe)
         ParseResult(Expr("call", "yield", 0, [yd_r.expr], [], ln), yd_r.pos)
     else if kind == "KW" and val == "trait"
         ParseResult(Expr("ident", "trait", 0, [], [], ln), pos + 1)
     else
-        syntax_error(tokens, pos, "unexpected " + kind + " '" + val + "' in expression")
-        ParseResult(null_expr(), pos)
+        let erp = syntax_error(tokens, pos, "unexpected " + kind + " '" + val + "' in expression", pe)
+        ParseResult(null_expr(), erp)
 
-fn parse_call_args(tokens: list, pos: int, callee: Expr) -> ParseResult
+fn parse_call_args(tokens: list, pos: int, callee: Expr, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     let cargs = []
-    while tv(tokens, p) != ")"
+    while tv(tokens, p) != ")" and tk(tokens, p) != "EOF"
         if len(cargs) > 0
-            p = expect(tokens, p, ",")
-        let arg_r = parse_expr(tokens, p, 0)
+            p = expect(tokens, p, ",", pe)
+            if tk(tokens, p) == "EOF"
+                break
+        let arg_r = parse_expr(tokens, p, 0, pe)
         push(cargs, arg_r.expr)
+        if arg_r.pos <= p
+            break
         p = arg_r.pos
-    p = expect(tokens, p, ")")
+    p = expect(tokens, p, ")", pe)
     // Determine call name from callee
     match callee
         Expr(tag, value, num, children, fields, eline) =>
@@ -1031,44 +1074,44 @@ fn parse_call_args(tokens: list, pos: int, callee: Expr) -> ParseResult
             else
                 ParseResult(Expr("dyn_call", "", 0, [callee] + cargs, [], ln), p)
 
-fn parse_index(tokens: list, pos: int, target: Expr) -> ParseResult
+fn parse_index(tokens: list, pos: int, target: Expr, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     if tk(tokens, p) == "COLON"
         p = p + 1
-        let end_r = parse_expr(tokens, p, 0)
-        p = expect(tokens, end_r.pos, "]")
+        let end_r = parse_expr(tokens, p, 0, pe)
+        p = expect(tokens, end_r.pos, "]", pe)
         return ParseResult(Expr("slice", "", 0, [target, Expr("int", "0", 0, [], [], ln), end_r.expr], [], ln), p)
-    let idx_r = parse_expr(tokens, p, 0)
+    let idx_r = parse_expr(tokens, p, 0, pe)
     if tk(tokens, idx_r.pos) == "COLON"
         let p2 = idx_r.pos + 1
         if tk(tokens, p2) == "DELIM" and tv(tokens, p2) == "]"
             p2 = p2 + 1
             return ParseResult(Expr("slice", "", 0, [target, idx_r.expr, Expr("int", "999999999", 999999999, [], [], ln)], [], ln), p2)
-        let end_r = parse_expr(tokens, p2, 0)
-        p2 = expect(tokens, end_r.pos, "]")
+        let end_r = parse_expr(tokens, p2, 0, pe)
+        p2 = expect(tokens, end_r.pos, "]", pe)
         return ParseResult(Expr("slice", "", 0, [target, idx_r.expr, end_r.expr], [], ln), p2)
-    p = expect(tokens, idx_r.pos, "]")
+    p = expect(tokens, idx_r.pos, "]", pe)
     ParseResult(Expr("index", "", 0, [target, idx_r.expr], [], ln), p)
 
-fn parse_if_expr(tokens: list, pos: int) -> ParseResult
+fn parse_if_expr(tokens: list, pos: int, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
-    let cond_r = parse_expr(tokens, p, 0)
+    let cond_r = parse_expr(tokens, p, 0, pe)
     let p2 = skip_nl(tokens, cond_r.pos)
-    let then_r = parse_expr(tokens, p2, 0)
+    let then_r = parse_expr(tokens, p2, 0, pe)
     let p3 = skip_nl(tokens, then_r.pos)
     if tk(tokens, p3) == "KW" and tv(tokens, p3) == "else"
         let p4 = skip_nl(tokens, p3 + 1)
-        let else_r = parse_expr(tokens, p4, 0)
+        let else_r = parse_expr(tokens, p4, 0, pe)
         ParseResult(Expr("if", "", 0, [cond_r.expr, then_r.expr, else_r.expr], [], ln), else_r.pos)
     else
         ParseResult(Expr("if", "", 0, [cond_r.expr, then_r.expr], [], ln), p3)
 
-fn parse_match_expr(tokens: list, pos: int) -> ParseResult
+fn parse_match_expr(tokens: list, pos: int, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
-    let subject_r = parse_expr(tokens, p, 0)
+    let subject_r = parse_expr(tokens, p, 0, pe)
     let p2 = skip_nl(tokens, subject_r.pos)
     let arms = []
     let arm_col = tok_col(tokens, p2)
@@ -1078,22 +1121,22 @@ fn parse_match_expr(tokens: list, pos: int) -> ParseResult
         let cur_kind = tk(tokens, p2)
         if cur_kind != "IDENT" and cur_kind != "INT" and cur_kind != "STR"
             break
-        let pat_r = parse_pattern(tokens, p2)
+        let pat_r = parse_pattern(tokens, p2, pe)
         p2 = skip_nl(tokens, pat_r.pos)
         let guard_expr = null_expr()
         if tk(tokens, p2) == "KW" and tv(tokens, p2) == "if"
             p2 = p2 + 1
-            let guard_r = parse_expr(tokens, p2, 2)
+            let guard_r = parse_expr(tokens, p2, 2, pe)
             guard_expr = guard_r.expr
             p2 = skip_nl(tokens, guard_r.pos)
-        p2 = expect(tokens, p2, "=>")
+        p2 = expect(tokens, p2, "=>", pe)
         p2 = skip_nl(tokens, p2)
-        let body_r = parse_expr(tokens, p2, 0)
+        let body_r = parse_expr(tokens, p2, 0, pe)
         push(arms, Expr("arm", "", 0, [pat_r.expr, body_r.expr, guard_expr], [], ln))
         p2 = skip_nl(tokens, body_r.pos)
     ParseResult(Expr("match", "", 0, [subject_r.expr] + arms, [], ln), p2)
 
-fn parse_pattern(tokens: list, pos: int) -> ParseResult
+fn parse_pattern(tokens: list, pos: int, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let kind = tk(tokens, pos)
     let val = tv(tokens, pos)
@@ -1103,12 +1146,14 @@ fn parse_pattern(tokens: list, pos: int) -> ParseResult
             let name = val
             let p = pos + 2
             let fields = []
-            while tv(tokens, p) != ")"
+            while tv(tokens, p) != ")" and tk(tokens, p) != "EOF"
                 if len(fields) > 0
-                    p = expect(tokens, p, ",")
+                    p = expect(tokens, p, ",", pe)
+                    if tk(tokens, p) == "EOF"
+                        break
                 push(fields, Expr("pat_var", tv(tokens, p), 0, [], [], ln))
                 p = p + 1
-            p = expect(tokens, p, ")")
+            p = expect(tokens, p, ")", pe)
             ParseResult(Expr("pat_ctor", name, 0, fields, [], ln), p)
         else if val == "_"
             ParseResult(Expr("pat_wild", "_", 0, [], [], ln), pos + 1)
@@ -1121,7 +1166,7 @@ fn parse_pattern(tokens: list, pos: int) -> ParseResult
     else
         ParseResult(Expr("pat_wild", "_", 0, [], [], ln), pos)
 
-fn parse_for_expr(tokens: list, pos: int) -> ParseResult
+fn parse_for_expr(tokens: list, pos: int, pe: list) -> ParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     let var_name = tv(tokens, p)
@@ -1129,19 +1174,19 @@ fn parse_for_expr(tokens: list, pos: int) -> ParseResult
     p = skip_nl(tokens, p)
     if tk(tokens, p) == "KW" and tv(tokens, p) == "in"
         p = p + 1
-    let iter_r = parse_expr(tokens, p, 0)
+    let iter_r = parse_expr(tokens, p, 0, pe)
     let p2 = skip_nl(tokens, iter_r.pos)
-    let body_r = parse_expr(tokens, p2, 0)
+    let body_r = parse_expr(tokens, p2, 0, pe)
     ParseResult(Expr("for", var_name, 0, [iter_r.expr, body_r.expr], [], ln), body_r.pos)
 
 // ── Statement Parser ─────────────────────────────────────────────────────────
 
-fn parse_block(tokens: list, pos: int) -> StmtParseResult
+fn parse_block(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let stmts = []
     let p = skip_nl(tokens, pos)
     while tk(tokens, p) != "EOF" and tk(tokens, p) != "KW"
-        let sr = parse_stmt(tokens, p)
+        let sr = parse_stmt(tokens, p, pe)
         push(stmts, sr.stmt)
         p = skip_nl(tokens, sr.pos)
         // Heuristic: stop block at dedent (no explicit INDENT/DEDENT in this tokenizer)
@@ -1149,7 +1194,7 @@ fn parse_block(tokens: list, pos: int) -> StmtParseResult
         break
     StmtParseResult(Stmt("block", "", null_expr(), stmts, [], [], [], ln), p)
 
-fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
+fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let kind = tk(tokens, pos)
     let val = tv(tokens, pos)
@@ -1158,7 +1203,7 @@ fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
         // Annotation: @name followed by statement
         let ann_name = tv(tokens, pos + 1)
         let p = skip_nl(tokens, pos + 2)
-        let inner_r = parse_stmt(tokens, p)
+        let inner_r = parse_stmt(tokens, p, pe)
         match inner_r.stmt
             Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
                 let new_anns = [ann_name]
@@ -1166,35 +1211,35 @@ fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
                     push(new_anns, a)
                 StmtParseResult(Stmt(tag, name, expr, body, params, else_body, new_anns, sline), inner_r.pos)
     else if kind == "KW" and val == "fn"
-        parse_fn_decl(tokens, pos)
+        parse_fn_decl(tokens, pos, pe)
     else if kind == "KW" and val == "extern"
-        parse_extern_decl(tokens, pos)
+        parse_extern_decl(tokens, pos, pe)
     else if kind == "KW" and val == "type"
-        parse_type_decl(tokens, pos)
+        parse_type_decl(tokens, pos, pe)
     else if kind == "KW" and val == "trait"
         parse_trait_decl(tokens, pos)
     else if kind == "KW" and val == "enum"
-        parse_enum_decl(tokens, pos)
+        parse_enum_decl(tokens, pos, pe)
     else if kind == "KW" and val == "spawn"
         let spawn_col = tok_col(tokens, pos)
         let sp = pos + 1
         if tk(tokens, sp) == "KW" and tv(tokens, sp) == "fn"
             sp = sp + 1
-            sp = expect(tokens, sp, "(")
+            sp = expect(tokens, sp, "(", pe)
             let sp_params = []
-            while tv(tokens, sp) != ")"
+            while tv(tokens, sp) != ")" and tk(tokens, sp) != "EOF"
                 if len(sp_params) > 0
-                    sp = expect(tokens, sp, ",")
+                    sp = expect(tokens, sp, ",", pe)
                 let sp_pname = tv(tokens, sp)
                 sp = sp + 1
                 push(sp_params, Param(sp_pname, "", null_expr()))
-            sp = expect(tokens, sp, ")")
+            sp = expect(tokens, sp, ")", pe)
             let sp2 = skip_nl(tokens, sp)
             let sp_body = []
             while tk(tokens, sp2) != "EOF"
                 if tok_col(tokens, sp2) <= spawn_col
                     break
-                let sp_r = parse_stmt(tokens, sp2)
+                let sp_r = parse_stmt(tokens, sp2, pe)
                 push(sp_body, sp_r.stmt)
                 sp2 = skip_nl(tokens, sp_r.pos)
             StmtParseResult(Stmt("spawn", "", null_expr(), sp_body, sp_params, [], [], ln), sp2)
@@ -1205,31 +1250,31 @@ fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
                 while tk(tokens, sp2) != "EOF"
                     if tok_col(tokens, sp2) <= spawn_col
                         break
-                    let sp_r = parse_stmt(tokens, sp2)
+                    let sp_r = parse_stmt(tokens, sp2, pe)
                     push(sp_body, sp_r.stmt)
                     sp2 = skip_nl(tokens, sp_r.pos)
                 StmtParseResult(Stmt("spawn", "", null_expr(), sp_body, [], [], [], ln), sp2)
             else
-                let sp_expr = parse_expr(tokens, sp2, 0)
+                let sp_expr = parse_expr(tokens, sp2, 0, pe)
                 StmtParseResult(Stmt("expr", "", Expr("spawn", "", 0, [sp_expr.expr], [], ln), [], [], [], [], ln), sp_expr.pos)
         else
-            let sp_expr = parse_expr(tokens, sp, 0)
+            let sp_expr = parse_expr(tokens, sp, 0, pe)
             StmtParseResult(Stmt("expr", "", Expr("spawn", "", 0, [sp_expr.expr], [], ln), [], [], [], [], ln), sp_expr.pos)
     else if kind == "KW" and val == "if"
-        parse_if_stmt(tokens, pos)
+        parse_if_stmt(tokens, pos, pe)
     else if kind == "KW" and val == "while"
-        parse_while_stmt(tokens, pos)
+        parse_while_stmt(tokens, pos, pe)
     else if kind == "KW" and val == "for"
-        parse_for_stmt(tokens, pos)
+        parse_for_stmt(tokens, pos, pe)
     else if kind == "KW" and val == "return"
         let p = pos + 1
         if tk(tokens, p) == "NEWLINE" or tk(tokens, p) == "EOF"
             StmtParseResult(Stmt("return", "", null_expr(), [], [], [], [], ln), p)
         else
-            let expr_r = parse_expr(tokens, p, 0)
+            let expr_r = parse_expr(tokens, p, 0, pe)
             StmtParseResult(Stmt("return", "", expr_r.expr, [], [], [], [], ln), expr_r.pos)
     else if kind == "KW" and val == "yield"
-        let expr_r = parse_expr(tokens, pos + 1, 0)
+        let expr_r = parse_expr(tokens, pos + 1, 0, pe)
         StmtParseResult(Stmt("yield", "", expr_r.expr, [], [], [], [], ln), expr_r.pos)
     else if kind == "KW" and val == "break"
         StmtParseResult(Stmt("break", "", null_expr(), [], [], [], [], ln), pos + 1)
@@ -1238,7 +1283,7 @@ fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
     else if kind == "KW" and val == "import"
         parse_import_stmt(tokens, pos)
     else if kind == "KW" and val == "match"
-        parse_match_stmt(tokens, pos)
+        parse_match_stmt(tokens, pos, pe)
     else if kind == "KW" and val == "let"
         // let name = expr
         let name = tv(tokens, pos + 1)
@@ -1248,25 +1293,25 @@ fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
             if tk(tokens, p) == "KW" and tv(tokens, p) == "spawn" and tk(tokens, p + 1) == "KW" and tv(tokens, p + 1) == "fn"
                 let spawn_col = tok_col(tokens, p)
                 let sp = p + 2
-                sp = expect(tokens, sp, "(")
+                sp = expect(tokens, sp, "(", pe)
                 let sp_params = []
-                while tv(tokens, sp) != ")"
+                while tv(tokens, sp) != ")" and tk(tokens, sp) != "EOF"
                     if len(sp_params) > 0
-                        sp = expect(tokens, sp, ",")
+                        sp = expect(tokens, sp, ",", pe)
                     push(sp_params, Param(tv(tokens, sp), "", null_expr()))
                     sp = sp + 1
-                sp = expect(tokens, sp, ")")
+                sp = expect(tokens, sp, ")", pe)
                 let sp2 = skip_nl(tokens, sp)
                 let sp_body = []
                 while tk(tokens, sp2) != "EOF"
                     if tok_col(tokens, sp2) <= spawn_col
                         break
-                    let sp_r = parse_stmt(tokens, sp2)
+                    let sp_r = parse_stmt(tokens, sp2, pe)
                     push(sp_body, sp_r.stmt)
                     sp2 = skip_nl(tokens, sp_r.pos)
                 StmtParseResult(Stmt("spawn", name, null_expr(), sp_body, sp_params, [], [], ln), sp2)
             else
-                let expr_r = parse_expr(tokens, p, 0)
+                let expr_r = parse_expr(tokens, p, 0, pe)
                 StmtParseResult(Stmt("assign", name, expr_r.expr, [], [], [], [], ln), expr_r.pos)
         else
             StmtParseResult(Stmt("assign", name, null_expr(), [], [], [], [], ln), p)
@@ -1275,42 +1320,42 @@ fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
             let sa_name = tv(tokens, pos)
             let spawn_col = tok_col(tokens, pos + 2)
             let sp = pos + 4
-            sp = expect(tokens, sp, "(")
+            sp = expect(tokens, sp, "(", pe)
             let sp_params = []
-            while tv(tokens, sp) != ")"
+            while tv(tokens, sp) != ")" and tk(tokens, sp) != "EOF"
                 if len(sp_params) > 0
-                    sp = expect(tokens, sp, ",")
+                    sp = expect(tokens, sp, ",", pe)
                 push(sp_params, Param(tv(tokens, sp), "", null_expr()))
                 sp = sp + 1
-            sp = expect(tokens, sp, ")")
+            sp = expect(tokens, sp, ")", pe)
             let sp2 = skip_nl(tokens, sp)
             let sp_body = []
             while tk(tokens, sp2) != "EOF"
                 if tok_col(tokens, sp2) <= spawn_col
                     break
-                let sp_r = parse_stmt(tokens, sp2)
+                let sp_r = parse_stmt(tokens, sp2, pe)
                 push(sp_body, sp_r.stmt)
                 sp2 = skip_nl(tokens, sp_r.pos)
             StmtParseResult(Stmt("spawn", sa_name, null_expr(), sp_body, sp_params, [], [], ln), sp2)
         else
-            let expr_r = parse_expr(tokens, pos, 0)
+            let expr_r = parse_expr(tokens, pos, 0, pe)
             let p = expr_r.pos
             if tk(tokens, p) == "ASSIGN"
                 p = p + 1
-                let rhs_r = parse_expr(tokens, p, 0)
+                let rhs_r = parse_expr(tokens, p, 0, pe)
                 StmtParseResult(Stmt("assign", "", rhs_r.expr, [], [], [], [expr_r.expr], ln), rhs_r.pos)
             else if tk(tokens, p) == "OP" and (tv(tokens, p) == "+=" or tv(tokens, p) == "-=" or tv(tokens, p) == "*=" or tv(tokens, p) == "/=")
                 let op = tv(tokens, p)
                 p = p + 1
-                let rhs_r = parse_expr(tokens, p, 0)
+                let rhs_r = parse_expr(tokens, p, 0, pe)
                 StmtParseResult(Stmt("compound_assign", op, rhs_r.expr, [], [], [], [expr_r.expr], ln), rhs_r.pos)
             else
                 StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], [], ln), p)
     else
-        let expr_r = parse_expr(tokens, pos, 0)
+        let expr_r = parse_expr(tokens, pos, 0, pe)
         if tk(tokens, expr_r.pos) == "ASSIGN"
             let dp = expr_r.pos + 1
-            let rhs_r = parse_expr(tokens, dp, 0)
+            let rhs_r = parse_expr(tokens, dp, 0, pe)
             StmtParseResult(Stmt("assign", "", rhs_r.expr, [], [], [], [expr_r.expr], ln), rhs_r.pos)
         else
             StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], [], ln), expr_r.pos)
@@ -1326,19 +1371,22 @@ fn ffi_llvm_type(ann: string) -> string
         return "i32"
     "i64"
 
-fn parse_extern_decl(tokens: list, pos: int) -> StmtParseResult
+fn parse_extern_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     if tk(tokens, p) != "KW" or tv(tokens, p) != "fn"
-        syntax_error(tokens, p, "expected 'fn' after 'extern'")
+        p = syntax_error(tokens, p, "expected 'fn' after 'extern'", pe)
+        return StmtParseResult(error_stmt(ln), p)
     p = p + 1
     let name = tv(tokens, p)
     p = p + 1
-    p = expect(tokens, p, "(")
+    p = expect(tokens, p, "(", pe)
     let params = []
-    while tv(tokens, p) != ")"
+    while tv(tokens, p) != ")" and tk(tokens, p) != "EOF"
         if len(params) > 0
-            p = expect(tokens, p, ",")
+            p = expect(tokens, p, ",", pe)
+            if tk(tokens, p) == "EOF"
+                break
         let param_name = tv(tokens, p)
         p = p + 1
         let type_ann = ""
@@ -1347,7 +1395,7 @@ fn parse_extern_decl(tokens: list, pos: int) -> StmtParseResult
             type_ann = tv(tokens, p)
             p = p + 1
         push(params, Param(param_name, type_ann, null_expr()))
-    p = expect(tokens, p, ")")
+    p = expect(tokens, p, ")", pe)
     let ret_ann = ""
     if tk(tokens, p) == "ARROW"
         p = p + 1
@@ -1362,18 +1410,21 @@ fn parse_extern_decl(tokens: list, pos: int) -> StmtParseResult
     push(ext_ann, Expr("extern", "", 0, [], [], ln))
     StmtParseResult(Stmt("extern_fn", name, ret_expr, [], params, [], ext_ann, ln), p)
 
-fn parse_fn_decl(tokens: list, pos: int) -> StmtParseResult
+fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     let generic_params = []
     if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
         p = p + 1
-        while tv(tokens, p) != ">"
+        while tv(tokens, p) != ">" and tk(tokens, p) != "EOF"
             if len(generic_params) > 0
-                p = expect(tokens, p, ",")
+                p = expect(tokens, p, ",", pe)
+                if tk(tokens, p) == "EOF"
+                    break
             push(generic_params, tv(tokens, p))
             p = p + 1
-        p = p + 1
+        if tk(tokens, p) != "EOF"
+            p = p + 1
     let name = tv(tokens, p)
     p = p + 1
     let is_method = false
@@ -1383,11 +1434,13 @@ fn parse_fn_decl(tokens: list, pos: int) -> StmtParseResult
         let method_name = tv(tokens, p)
         name = name + "__" + method_name
         p = p + 1
-    p = expect(tokens, p, "(")
+    p = expect(tokens, p, "(", pe)
     let params = []
-    while tv(tokens, p) != ")"
+    while tv(tokens, p) != ")" and tk(tokens, p) != "EOF"
         if len(params) > 0
-            p = expect(tokens, p, ",")
+            p = expect(tokens, p, ",", pe)
+            if tk(tokens, p) == "EOF"
+                break
         let param_name = tv(tokens, p)
         p = p + 1
         let type_ann = ""
@@ -1421,11 +1474,11 @@ fn parse_fn_decl(tokens: list, pos: int) -> StmtParseResult
                     p = p + 1
         if tk(tokens, p) == "ASSIGN"
             p = p + 1
-            let def_r = parse_expr(tokens, p, 0)
+            let def_r = parse_expr(tokens, p, 0, pe)
             default_val = def_r.expr
             p = def_r.pos
         push(params, Param(param_name, type_ann, default_val))
-    p = expect(tokens, p, ")")
+    p = expect(tokens, p, ")", pe)
     if is_method
         let has_self = false
         if len(params) > 0
@@ -1485,12 +1538,13 @@ fn parse_fn_decl(tokens: list, pos: int) -> StmtParseResult
         if body_col < 0
             body_col = cur_col
         else if cur_col != body_col
-            syntax_error(tokens, p2, "inconsistent indentation in body of function '" + name + "' (expected column " + str(body_col) + ", got " + str(cur_col) + "); check for mixed tabs and spaces")
-        let sr = parse_stmt(tokens, p2)
+            p2 = syntax_error(tokens, p2, "inconsistent indentation in body of function '" + name + "' (expected column " + str(body_col) + ", got " + str(cur_col) + "); check for mixed tabs and spaces", pe)
+            break
+        let sr = parse_stmt(tokens, p2, pe)
         push(body, sr.stmt)
         p2 = skip_nl(tokens, sr.pos)
     if len(body) == 0
-        syntax_error(tokens, pos, "function '" + name + "' has an empty body; function bodies must be indented past the 'fn' keyword and contain at least one statement")
+        syntax_error(tokens, pos, "function '" + name + "' has an empty body; function bodies must be indented past the 'fn' keyword and contain at least one statement", pe)
     let ret_expr = null_expr()
     if ret_ann != ""
         ret_expr = Expr("rettype", ret_ann, 0, [], [], ln)
@@ -1502,7 +1556,7 @@ fn parse_fn_decl(tokens: list, pos: int) -> StmtParseResult
         push(annotations, Expr("generics", "", 0, gen_children, [], ln))
     StmtParseResult(Stmt("fn", name, ret_expr, body, params, [], annotations, ln), p2)
 
-fn parse_type_decl(tokens: list, pos: int) -> StmtParseResult
+fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     let name = tv(tokens, p)
@@ -1510,12 +1564,15 @@ fn parse_type_decl(tokens: list, pos: int) -> StmtParseResult
     let type_generics = []
     if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
         p = p + 1
-        while tv(tokens, p) != ">"
+        while tv(tokens, p) != ">" and tk(tokens, p) != "EOF"
             if len(type_generics) > 0
-                p = expect(tokens, p, ",")
+                p = expect(tokens, p, ",", pe)
+                if tk(tokens, p) == "EOF"
+                    break
             push(type_generics, tv(tokens, p))
             p = p + 1
-        p = p + 1
+        if tk(tokens, p) != "EOF"
+            p = p + 1
     let p2 = skip_nl(tokens, p)
     let fields = []
     // Parse fields until next top-level construct
@@ -1579,7 +1636,7 @@ fn parse_trait_decl(tokens: list, pos: int) -> StmtParseResult
         p2 = p2 + 1
     StmtParseResult(Stmt("trait", name, null_expr(), [], [], [], [], ln), p2)
 
-fn parse_enum_decl(tokens: list, pos: int) -> StmtParseResult
+fn parse_enum_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     let enum_name = tv(tokens, p)
@@ -1598,9 +1655,11 @@ fn parse_enum_decl(tokens: list, pos: int) -> StmtParseResult
                     let vfields = []
                     if p2 < len(tokens) and tk(tokens, p2) == "DELIM" and tv(tokens, p2) == "("
                         p2 = p2 + 1
-                        while tv(tokens, p2) != ")"
+                        while tv(tokens, p2) != ")" and tk(tokens, p2) != "EOF"
                             if len(vfields) > 0
-                                p2 = expect(tokens, p2, ",")
+                                p2 = expect(tokens, p2, ",", pe)
+                                if tk(tokens, p2) == "EOF"
+                                    break
                             let fname = tv(tokens, p2)
                             p2 = p2 + 1
                             let ftype = ""
@@ -1611,30 +1670,30 @@ fn parse_enum_decl(tokens: list, pos: int) -> StmtParseResult
                             else
                                 ftype = "any"
                             push(vfields, Param(fname, ftype, null_expr()))
-                        p2 = expect(tokens, p2, ")")
+                        p2 = expect(tokens, p2, ")", pe)
                     push(variant_stmts, Stmt("type", vname, null_expr(), [], vfields, [], [], ln))
                     p2 = skip_nl(tokens, p2)
                 else
                     break
     StmtParseResult(Stmt("enum", enum_name, null_expr(), variant_stmts, [], [], [], ln), p2)
 
-fn parse_if_chain(tokens: list, pos: int, base_col: int) -> StmtParseResult
+fn parse_if_chain(tokens: list, pos: int, base_col: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
-    let cond_r = parse_expr(tokens, p, 0)
+    let cond_r = parse_expr(tokens, p, 0, pe)
     let p2 = skip_nl(tokens, cond_r.pos)
     let then_body = []
     while tk(tokens, p2) != "EOF"
         if tok_col(tokens, p2) <= base_col
             break
-        let sr = parse_stmt(tokens, p2)
+        let sr = parse_stmt(tokens, p2, pe)
         push(then_body, sr.stmt)
         p2 = skip_nl(tokens, sr.pos)
     let else_body = []
     if tk(tokens, p2) == "KW" and tv(tokens, p2) == "else" and tok_col(tokens, p2) == base_col
         p2 = p2 + 1
         if tk(tokens, p2) == "KW" and tv(tokens, p2) == "if"
-            let nested_r = parse_if_chain(tokens, p2, base_col)
+            let nested_r = parse_if_chain(tokens, p2, base_col, pe)
             push(else_body, nested_r.stmt)
             p2 = nested_r.pos
         else
@@ -1642,32 +1701,32 @@ fn parse_if_chain(tokens: list, pos: int, base_col: int) -> StmtParseResult
             while tk(tokens, p2) != "EOF"
                 if tok_col(tokens, p2) <= base_col
                     break
-                let sr = parse_stmt(tokens, p2)
+                let sr = parse_stmt(tokens, p2, pe)
                 push(else_body, sr.stmt)
                 p2 = skip_nl(tokens, sr.pos)
     StmtParseResult(Stmt("if", "", cond_r.expr, then_body, [], else_body, [], ln), p2)
 
-fn parse_if_stmt(tokens: list, pos: int) -> StmtParseResult
-    parse_if_chain(tokens, pos, tok_col(tokens, pos))
+fn parse_if_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
+    parse_if_chain(tokens, pos, tok_col(tokens, pos), pe)
 
-fn parse_while_stmt(tokens: list, pos: int) -> StmtParseResult
+fn parse_while_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let kw_col = tok_col(tokens, pos)
     let p = pos + 1
-    let cond_r = parse_expr(tokens, p, 0)
+    let cond_r = parse_expr(tokens, p, 0, pe)
     let p2 = skip_nl(tokens, cond_r.pos)
     let body = []
     while tk(tokens, p2) != "EOF"
         if tok_col(tokens, p2) <= kw_col
             break
-        let sr = parse_stmt(tokens, p2)
+        let sr = parse_stmt(tokens, p2, pe)
         push(body, sr.stmt)
         p2 = skip_nl(tokens, sr.pos)
     if len(body) == 0
-        syntax_error(tokens, pos, "while loop has an empty body; loop body must be indented past the 'while' keyword and contain at least one statement")
+        syntax_error(tokens, pos, "while loop has an empty body; loop body must be indented past the 'while' keyword and contain at least one statement", pe)
     StmtParseResult(Stmt("while", "", cond_r.expr, body, [], [], [], ln), p2)
 
-fn parse_for_stmt(tokens: list, pos: int) -> StmtParseResult
+fn parse_for_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let kw_col = tok_col(tokens, pos)
     let p = pos + 1
@@ -1675,23 +1734,23 @@ fn parse_for_stmt(tokens: list, pos: int) -> StmtParseResult
     p = p + 1
     if tk(tokens, p) == "KW" and tv(tokens, p) == "in"
         p = p + 1
-    let iter_r = parse_expr(tokens, p, 0)
+    let iter_r = parse_expr(tokens, p, 0, pe)
     let p2 = skip_nl(tokens, iter_r.pos)
     let body = []
     while tk(tokens, p2) != "EOF"
         if tok_col(tokens, p2) <= kw_col
             break
-        let sr = parse_stmt(tokens, p2)
+        let sr = parse_stmt(tokens, p2, pe)
         push(body, sr.stmt)
         p2 = skip_nl(tokens, sr.pos)
     if len(body) == 0
-        syntax_error(tokens, pos, "for loop has an empty body; loop body must be indented past the 'for' keyword and contain at least one statement")
+        syntax_error(tokens, pos, "for loop has an empty body; loop body must be indented past the 'for' keyword and contain at least one statement", pe)
     StmtParseResult(Stmt("for", var_name, iter_r.expr, body, [], [], [], ln), p2)
 
-fn parse_match_stmt(tokens: list, pos: int) -> StmtParseResult
+fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
-    let subject_r = parse_expr(tokens, p, 0)
+    let subject_r = parse_expr(tokens, p, 0, pe)
     let p2 = skip_nl(tokens, subject_r.pos)
     let arms = []
     let arm_ref_col = tok_col(tokens, p2)
@@ -1699,15 +1758,16 @@ fn parse_match_stmt(tokens: list, pos: int) -> StmtParseResult
         if tok_col(tokens, p2) < arm_ref_col
             break
         let pat_start = p2
-        let pat_r = parse_pattern(tokens, p2)
+        let pat_r = parse_pattern(tokens, p2, pe)
         let arm_col = tok_col(tokens, p2)
         p2 = pat_r.pos
         if p2 <= pat_start
-            syntax_error(tokens, p2, "invalid match arm pattern; expected a pattern, got '" + tv(tokens, p2) + "'")
+            p2 = syntax_error(tokens, p2, "invalid match arm pattern; expected a pattern, got '" + tv(tokens, p2) + "'", pe)
+            break
         let arm_guard = null_expr()
         if tk(tokens, p2) == "KW" and tv(tokens, p2) == "if"
             p2 = p2 + 1
-            let guard_r = parse_expr(tokens, p2, 2)
+            let guard_r = parse_expr(tokens, p2, 2, pe)
             arm_guard = guard_r.expr
             p2 = guard_r.pos
         if tk(tokens, p2) == "FAT_ARROW"
@@ -1717,12 +1777,12 @@ fn parse_match_stmt(tokens: list, pos: int) -> StmtParseResult
         while tk(tokens, p2) != "EOF"
             if tok_col(tokens, p2) <= arm_col
                 break
-            let sr = parse_stmt(tokens, p2)
+            let sr = parse_stmt(tokens, p2, pe)
             push(arm_body, sr.stmt)
             p2 = skip_nl(tokens, sr.pos)
         push(arms, Stmt("arm", "", pat_r.expr, arm_body, [], [], [arm_guard], ln))
     if len(arms) == 0
-        syntax_error(tokens, pos, "match has no arms; provide at least one pattern arm")
+        syntax_error(tokens, pos, "match has no arms; provide at least one pattern arm", pe)
     StmtParseResult(Stmt("match", "", subject_r.expr, arms, [], [], [], ln), p2)
 
 fn parse_import_stmt(tokens: list, pos: int) -> StmtParseResult
@@ -1737,13 +1797,22 @@ fn parse_import_stmt(tokens: list, pos: int) -> StmtParseResult
         p = p + 1
     StmtParseResult(Stmt("import", module_name, null_expr(), [], [], [], [alias], ln), p)
 
-fn parse_program(tokens: list) -> list
+fn parse_program(tokens: list, pe: list) -> list
     let stmts = []
     let pos = skip_nl(tokens, 0)
     while tk(tokens, pos) != "EOF"
-        let sr = parse_stmt(tokens, pos)
-        push(stmts, sr.stmt)
-        pos = skip_nl(tokens, sr.pos)
+        let prev_pe_len = len(pe)
+        let sr = parse_stmt(tokens, pos, pe)
+        let new_pos = skip_nl(tokens, sr.pos)
+        // If a parse error was recorded and pos didn't advance, force forward
+        if len(pe) > prev_pe_len and new_pos <= pos and tk(tokens, pos) != "EOF"
+            pos = pos + 1
+        else
+            pos = new_pos
+        match sr.stmt
+            Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
+                if stag != "error"
+                    push(stmts, sr.stmt)
     stmts
 
 // ── LLVM IR Code Generator ───────────────────────────────────────────────────
@@ -6874,7 +6943,8 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                         let mod_source = read_file(mod_path)
                         if len(mod_source) > 0
                             let mod_tokens = tokenize(mod_source)
-                            let mod_stmts = parse_program(mod_tokens)
+                            let mod_pe = []
+                            let mod_stmts = parse_program(mod_tokens, mod_pe)
                             let mod_fn_types = {}
                             for ms in mod_stmts
                                 match ms
@@ -8579,7 +8649,8 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
 
 fn compile(source: string) -> string
     let tokens = tokenize(source)
-    let stmts = parse_program(tokens)
+    let _cpe = []
+    let stmts = parse_program(tokens, _cpe)
     let cg = new_codegen()
 
     // Separate functions from top-level statements
@@ -8630,7 +8701,13 @@ fn compile_ir_core(source: string, base_dir: string) -> string
 
 fn compile_ir_core_named(source: string, base_dir: string, filename: string, target: string) -> string
     let tokens = tokenize_file(source, filename)
-    let stmts = parse_program(tokens)
+    let parse_errors = []
+    let stmts = parse_program(tokens, parse_errors)
+    if len(parse_errors) > 0
+        for perr in parse_errors
+            print(perr)
+        print("compilation failed: " + str(len(parse_errors)) + " error(s)")
+        exit(1)
 
     // Split source into lines for error display
     let source_lines = split(source, "\n")
@@ -9373,7 +9450,8 @@ fn resolve_module_file(name: string, base_dir: string) -> string
 
 fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited: dict) -> list
     let tokens = tokenize(mod_source)
-    let stmts = parse_program(tokens)
+    let _mpe = []
+    let stmts = parse_program(tokens, _mpe)
     let mod_fns = []
     let exported = []
     for s in stmts
@@ -9897,7 +9975,8 @@ fn run_self_test()
         Token(k, v, l, c) => assert(k == "INT" and v == "3", "lexer: t5 " + k + ":" + v)
 
     let tokens2 = tokenize("x = 10\ny = x + 5\nprint(y)")
-    let stmts = parse_program(tokens2)
+    let _tpe = []
+    let stmts = parse_program(tokens2, _tpe)
     assert(len(stmts) == 3, "parser: expected 3 stmts, got " + str(len(stmts)))
 
     let source = "x = 42\nprint(x)"
