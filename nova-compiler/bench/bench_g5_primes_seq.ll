@@ -8,33 +8,33 @@ target triple = "x86_64-pc-windows-msvc"
 ; Runtime declarations
 declare i32 @puts(ptr) nounwind
 declare i32 @printf(ptr, ...) nounwind
-declare i32 @strcmp(ptr, ptr) nounwind
+declare i32 @strcmp(ptr, ptr) nounwind readonly
 declare i64 @nova_rt_list_create() nounwind
 declare i64 @nova_rt_deep_copy(i64) nounwind
 declare i64 @nova_rt_list_create_filled(i64, i64) nounwind
 declare i64 @nova_rt_list_append(i64, i64) nounwind
-declare i64 @nova_rt_list_get(i64, i64) nounwind
-declare i64 @nova_rt_list_len(i64) nounwind
+declare i64 @nova_rt_list_get(i64, i64) nounwind readonly
+declare i64 @nova_rt_list_len(i64) nounwind readonly
 declare i64 @nova_rt_dict_create() nounwind
 declare i64 @nova_rt_dict_set(i64, i64, i64) nounwind
-declare i64 @nova_rt_dict_get(i64, i64) nounwind
-declare i64 @nova_rt_dict_contains(i64, i64) nounwind
+declare i64 @nova_rt_dict_get(i64, i64) nounwind readonly
+declare i64 @nova_rt_dict_contains(i64, i64) nounwind readonly
 declare i64 @nova_rt_str_concat(i64, i64) nounwind
 declare i64 @nova_rt_int_to_str(i64) nounwind
-declare i64 @nova_rt_parse_int(i64) nounwind
-declare i64 @nova_rt_len(i64) nounwind
-declare i64 @nova_rt_len_any(i64) nounwind
-declare i64 @nova_rt_ord(i64) nounwind
+declare i64 @nova_rt_parse_int(i64) nounwind readonly
+declare i64 @nova_rt_len(i64) nounwind readonly
+declare i64 @nova_rt_len_any(i64) nounwind readonly
+declare i64 @nova_rt_ord(i64) nounwind readonly
 declare i64 @nova_rt_chr(i64) nounwind
-declare i64 @nova_rt_contains(i64, i64) nounwind
-declare i64 @nova_rt_index_get(i64, i64) nounwind
+declare i64 @nova_rt_contains(i64, i64) nounwind readonly
+declare i64 @nova_rt_index_get(i64, i64) nounwind readonly
 declare i64 @nova_rt_index_set(i64, i64, i64) nounwind
 declare i64 @nova_rt_add(i64, i64) nounwind
 declare i64 @nova_rt_sub(i64, i64) nounwind
 declare i64 @nova_rt_mul(i64, i64) nounwind
 declare i64 @nova_rt_div(i64, i64) nounwind
-declare i64 @nova_rt_eq(i64, i64) nounwind
-declare i64 @nova_rt_neq(i64, i64) nounwind
+declare i64 @nova_rt_eq(i64, i64) nounwind readonly
+declare i64 @nova_rt_neq(i64, i64) nounwind readonly
 declare i64 @nova_rt_any_to_str(i64) nounwind
 declare void @nova_rt_assert(i64, i64) nounwind
 declare i64 @nova_rt_read_file(i64) nounwind
@@ -47,8 +47,8 @@ declare i64 @nova_rt_upper(i64) nounwind
 declare i64 @nova_rt_lower(i64) nounwind
 declare i64 @nova_rt_trim(i64) nounwind
 declare i64 @nova_rt_replace(i64, i64, i64) nounwind
-declare i64 @nova_rt_starts_with(i64, i64) nounwind
-declare i64 @nova_rt_ends_with(i64, i64) nounwind
+declare i64 @nova_rt_starts_with(i64, i64) nounwind readonly
+declare i64 @nova_rt_ends_with(i64, i64) nounwind readonly
 declare i64 @nova_rt_print_any(i64) nounwind
 declare i64 @nova_rt_print_bool(i64) nounwind
 declare i64 @nova_rt_print_float(i64) nounwind
@@ -67,14 +67,15 @@ declare i64 @nova_rt_clock_ns() nounwind
 declare i64 @nova_rt_type_of(i64) nounwind
 declare i64 @nova_rt_range(i64) nounwind
 declare i64 @nova_rt_range_from_to(i64, i64) nounwind
-declare i64 @nova_rt_dict_keys(i64) nounwind
-declare i64 @nova_rt_dict_values(i64) nounwind
-declare i64 @nova_rt_dict_items(i64) nounwind
+declare i64 @nova_rt_dict_keys(i64) nounwind readonly
+declare i64 @nova_rt_dict_values(i64) nounwind readonly
+declare i64 @nova_rt_dict_items(i64) nounwind readonly
 declare i64 @nova_rt_for_iter_init(i64) nounwind
-declare i64 @nova_rt_dict_has(i64, i64) nounwind
+declare i64 @nova_rt_dict_has(i64, i64) nounwind readonly
 declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_system(i64) nounwind
 declare i64 @nova_rt_exec(i64) nounwind
+declare i64 @nova_rt_shell(i64) nounwind
 declare i64 @nova_rt_create_string(ptr) nounwind
 declare void @nova_rt_init_args(i64, i64) nounwind
 declare void @nova_rt_wait_all() nounwind
@@ -93,7 +94,7 @@ declare i64 @nova_rt_parse_float(i64) nounwind
 declare i64 @nova_rt_read_line() nounwind
 declare i64 @nova_rt_append_file(i64, i64) nounwind
 declare i64 @nova_rt_file_exists(i64) nounwind
-declare i64 @nova_rt_find(i64, i64) nounwind
+declare i64 @nova_rt_find(i64, i64) nounwind readonly
 declare i64 @nova_rt_list_concat(i64, i64) nounwind
 declare i64 @nova_rt_list_reverse(i64) nounwind
 declare i64 @nova_rt_list_sort(i64) nounwind
@@ -105,34 +106,34 @@ declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
 declare i64 @nova_rt_mkdir(i64) nounwind
 declare i64 @nova_rt_mkdir_p(i64) nounwind
 declare i64 @nova_rt_path_join(i64, i64) nounwind
-declare i64 @nova_rt_path_exists(i64) nounwind
-declare i64 @nova_rt_path_parent(i64) nounwind
-declare i64 @nova_rt_path_name(i64) nounwind
+declare i64 @nova_rt_path_exists(i64) nounwind readonly
+declare i64 @nova_rt_path_parent(i64) nounwind readonly
+declare i64 @nova_rt_path_name(i64) nounwind readonly
 declare i64 @nova_rt_read_bytes(i64) nounwind
 declare i64 @nova_rt_write_raw(i64) nounwind
-declare i64 @nova_rt_abs(i64) nounwind
-declare i64 @nova_rt_max(i64, i64) nounwind
-declare i64 @nova_rt_min(i64, i64) nounwind
-declare i64 @nova_rt_sqrt(i64) nounwind
-declare i64 @nova_rt_floor(i64) nounwind
-declare i64 @nova_rt_ceil(i64) nounwind
-declare i64 @nova_rt_pow(i64, i64) nounwind
-declare i64 @nova_rt_round(i64) nounwind
-declare i64 @nova_rt_sin(i64) nounwind
-declare i64 @nova_rt_cos(i64) nounwind
-declare i64 @nova_rt_tan(i64) nounwind
-declare i64 @nova_rt_log(i64) nounwind
-declare i64 @nova_rt_log2(i64) nounwind
-declare i64 @nova_rt_log10(i64) nounwind
-declare i64 @nova_rt_exp(i64) nounwind
-declare i64 @nova_rt_fabs(i64) nounwind
-declare i64 @nova_rt_fmax(i64, i64) nounwind
-declare i64 @nova_rt_fmin(i64, i64) nounwind
-declare i64 @nova_rt_fmod(i64, i64) nounwind
-declare i64 @nova_rt_float_to_int(i64) nounwind
-declare i64 @nova_rt_int_to_float(i64) nounwind
-declare i64 @nova_rt_to_int(i64) nounwind
-declare i64 @nova_rt_to_float(i64) nounwind
+declare i64 @nova_rt_abs(i64) nounwind readnone
+declare i64 @nova_rt_max(i64, i64) nounwind readnone
+declare i64 @nova_rt_min(i64, i64) nounwind readnone
+declare i64 @nova_rt_sqrt(i64) nounwind readnone
+declare i64 @nova_rt_floor(i64) nounwind readnone
+declare i64 @nova_rt_ceil(i64) nounwind readnone
+declare i64 @nova_rt_pow(i64, i64) nounwind readnone
+declare i64 @nova_rt_round(i64) nounwind readnone
+declare i64 @nova_rt_sin(i64) nounwind readnone
+declare i64 @nova_rt_cos(i64) nounwind readnone
+declare i64 @nova_rt_tan(i64) nounwind readnone
+declare i64 @nova_rt_log(i64) nounwind readnone
+declare i64 @nova_rt_log2(i64) nounwind readnone
+declare i64 @nova_rt_log10(i64) nounwind readnone
+declare i64 @nova_rt_exp(i64) nounwind readnone
+declare i64 @nova_rt_fabs(i64) nounwind readnone
+declare i64 @nova_rt_fmax(i64, i64) nounwind readnone
+declare i64 @nova_rt_fmin(i64, i64) nounwind readnone
+declare i64 @nova_rt_fmod(i64, i64) nounwind readnone
+declare i64 @nova_rt_float_to_int(i64) nounwind readnone
+declare i64 @nova_rt_int_to_float(i64) nounwind readnone
+declare i64 @nova_rt_to_int(i64) nounwind readnone
+declare i64 @nova_rt_to_float(i64) nounwind readnone
 declare i64 @nova_rt_env(i64) nounwind
 declare i64 @nova_rt_random_int(i64, i64) nounwind
 declare i64 @nova_rt_random_float() nounwind
@@ -156,11 +157,11 @@ declare i64 @nova_rt_bytes_len(i64) nounwind
 declare i64 @nova_rt_bytes_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_bytes_to_str(i64) nounwind
 declare i64 @nova_rt_str_to_bytes(i64) nounwind
-declare i64 @nova_rt_asin(i64) nounwind
-declare i64 @nova_rt_acos(i64) nounwind
-declare i64 @nova_rt_atan(i64) nounwind
-declare i64 @nova_rt_atan2(i64, i64) nounwind
-declare i64 @nova_rt_int_pow(i64, i64) nounwind
+declare i64 @nova_rt_asin(i64) nounwind readnone
+declare i64 @nova_rt_acos(i64) nounwind readnone
+declare i64 @nova_rt_atan(i64) nounwind readnone
+declare i64 @nova_rt_atan2(i64, i64) nounwind readnone
+declare i64 @nova_rt_int_pow(i64, i64) nounwind readnone
 declare i64 @nova_rt_alloc_count() nounwind
 declare i64 @nova_rt_live_count() nounwind
 declare i64 @nova_rt_enumerate(i64) nounwind
@@ -168,18 +169,28 @@ declare i64 @nova_rt_zip(i64, i64) nounwind
 declare i64 @nova_rt_reduce(i64, i64, i64) nounwind
 declare i64 @nova_rt_any_match(i64, i64) nounwind
 declare i64 @nova_rt_all_match(i64, i64) nounwind
-declare i64 @nova_rt_sum(i64) nounwind
-declare i64 @nova_rt_index_of(i64, i64) nounwind
+declare i64 @nova_rt_any_truthy(i64) nounwind readonly
+declare i64 @nova_rt_all_truthy(i64) nounwind readonly
+declare i64 @nova_rt_list_min(i64) nounwind readonly
+declare i64 @nova_rt_list_max(i64) nounwind readonly
+declare i64 @nova_rt_set_create() nounwind
+declare i64 @nova_rt_set_add(i64, i64) nounwind
+declare i64 @nova_rt_set_has(i64, i64) nounwind readonly
+declare i64 @nova_rt_set_remove(i64, i64) nounwind
+declare i64 @nova_rt_set_len(i64) nounwind readonly
+declare i64 @nova_rt_set_to_list(i64) nounwind
+declare i64 @nova_rt_sum(i64) nounwind readonly
+declare i64 @nova_rt_index_of(i64, i64) nounwind readonly
 declare i64 @nova_rt_sort_by(i64, i64) nounwind
 declare i64 @nova_rt_dict_merge(i64, i64) nounwind
-declare i64 @nova_rt_str_count(i64, i64) nounwind
+declare i64 @nova_rt_str_count(i64, i64) nounwind readonly
 declare i64 @nova_rt_lstrip(i64) nounwind
 declare i64 @nova_rt_rstrip(i64) nounwind
 declare i64 @nova_rt_pad_left(i64, i64, i64) nounwind
 declare i64 @nova_rt_pad_right(i64, i64, i64) nounwind
 declare i64 @nova_rt_cwd() nounwind
 declare i64 @nova_rt_list_dir(i64) nounwind
-declare i64 @nova_rt_hash(i64) nounwind
+declare i64 @nova_rt_hash(i64) nounwind readnone
 declare i64 @nova_rt_sha256(i64) nounwind
 declare i64 @nova_rt_sha256_bytes(i64, i64) nounwind
 declare i64 @nova_rt_hmac_sha256(i64, i64) nounwind
@@ -219,10 +230,10 @@ declare i64 @nova_rt_ok(i64) nounwind
 declare i64 @nova_rt_err(i64) nounwind
 declare i64 @nova_rt_some(i64) nounwind
 declare i64 @nova_rt_none() nounwind
-declare i64 @nova_rt_is_ok(i64) nounwind
-declare i64 @nova_rt_is_err(i64) nounwind
-declare i64 @nova_rt_is_some(i64) nounwind
-declare i64 @nova_rt_is_none(i64) nounwind
+declare i64 @nova_rt_is_ok(i64) nounwind readonly
+declare i64 @nova_rt_is_err(i64) nounwind readonly
+declare i64 @nova_rt_is_some(i64) nounwind readonly
+declare i64 @nova_rt_is_none(i64) nounwind readonly
 declare i64 @nova_rt_unwrap(i64) nounwind
 declare i64 @nova_rt_unwrap_err(i64) nounwind
 declare i64 @nova_rt_unwrap_or(i64, i64) nounwind
@@ -259,6 +270,25 @@ declare i64 @nova_rt_iter_find(i64, i64) nounwind
 declare i64 @nova_rt_async(i64) nounwind
 declare i64 @nova_rt_await(i64) nounwind
 declare i64 @nova_rt_await_all(i64) nounwind
+declare i64 @nova_rt_buffer_create() nounwind
+declare i64 @nova_rt_buffer_create_cap(i64) nounwind
+declare void @nova_rt_buffer_append(i64, i64) nounwind
+declare void @nova_rt_buffer_append_char(i64, i64) nounwind
+declare void @nova_rt_buffer_append_int(i64, i64) nounwind
+declare void @nova_rt_buffer_append_float(i64, i64) nounwind
+declare i64 @nova_rt_buffer_to_str(i64) nounwind
+declare i64 @nova_rt_buffer_len(i64) nounwind readonly
+declare void @nova_rt_buffer_clear(i64) nounwind
+declare i64 @nova_rt_buffer_str(i64) nounwind
+declare void @nova_rt_set_arena_mode(i64) nounwind
+declare i64 @nova_rt_is_arena_mode() nounwind
+declare i64 @nova_rt_semver_parse(i64) nounwind
+declare i64 @nova_rt_semver_compare(i64, i64) nounwind readonly
+declare i64 @nova_rt_semver_satisfies(i64, i64) nounwind readonly
+declare i64 @nova_rt_semver_format(i64) nounwind
+declare i64 @nova_rt_lockfile_read(i64) nounwind
+declare i64 @nova_rt_lockfile_write(i64, i64) nounwind
+declare i64 @nova_rt_pkg_resolve(i64, i64) nounwind
 declare i64 @nova_rt_await_any(i64) nounwind
 declare i64 @nova_rt_assert_eq(i64, i64) nounwind
 declare i64 @nova_rt_assert_ne(i64, i64) nounwind
@@ -329,7 +359,7 @@ else7:
 endif8:
   %r14 = add i64 3, 0, !dbg !208
   store i64 %r14, ptr %slot.d, align 8, !dbg !208
-  br label %while_hdr9, !llvm.loop !91, !dbg !209
+  br label %while_hdr9, !dbg !209
 while_hdr9:
   %r15 = load i64, ptr %slot.d, align 8, !dbg !209
   %r16 = load i64, ptr %slot.d, align 8, !dbg !209
@@ -358,7 +388,7 @@ endif14:
   %r27 = add i64 2, 0, !dbg !212
   %r28 = add i64 %r26, %r27, !dbg !212
   store i64 %r28, ptr %slot.d, align 8, !dbg !212
-  br label %while_hdr9, !llvm.loop !91, !dbg !212
+  br label %while_hdr9, !dbg !212
 while_exit11:
   %r29 = add i64 1, 0, !dbg !213
   ret i64 %r29, !dbg !213
@@ -374,7 +404,7 @@ entry:
   store i64 %r0, ptr %slot.count, align 8
   %r1 = add i64 2, 0
   store i64 %r1, ptr %slot.n, align 8
-  br label %while_hdr15, !llvm.loop !91
+  br label %while_hdr15
 while_hdr15:
   %r2 = load i64, ptr %slot.n, align 8
   %r3 = add i64 1000000, 0
@@ -400,7 +430,7 @@ endif20:
   %r11 = add i64 1, 0
   %r12 = add i64 %r10, %r11
   store i64 %r12, ptr %slot.n, align 8
-  br label %while_hdr15, !llvm.loop !91
+  br label %while_hdr15
 while_exit17:
   %r13.p = getelementptr inbounds [25 x i8], ptr @.str.0, i64 0, i64 0
   %r13 = ptrtoint ptr %r13.p to i64
@@ -430,7 +460,7 @@ entry:
 !llvm.module.flags = !{!102, !103}
 
 !100 = distinct !DICompileUnit(language: DW_LANG_C99, file: !101, producer: "NOVA Compiler", isOptimized: false, emissionKind: LineTablesOnly)
-!101 = !DIFile(filename: "primes_tmp.nova", directory: ".")
+!101 = !DIFile(filename: "bench_g5_primes_seq.nova", directory: ".")
 !102 = !{i32 2, !"CodeView", i32 1}
 !103 = !{i32 2, !"Debug Info Version", i32 3}
 !104 = !DISubroutineType(types: !105)
@@ -459,6 +489,3 @@ entry:
 !5 = !{!"list_size", !0}
 !6 = !{!5, !5, i64 0}
 !90 = !{!"branch_weights", i32 2000, i32 1}
-!91 = distinct !{!91, !92, !93}
-!92 = !{!"llvm.loop.unroll.enable"}
-!93 = !{!"llvm.loop.vectorize.enable", i1 true}

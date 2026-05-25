@@ -5207,6 +5207,7 @@ type TiState
     ti_enum_variants: dict
     ti_variant_enum: dict
     ti_filename: string
+    ti_modules: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -5268,7 +5269,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename)
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -6128,7 +6129,31 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                 // type mismatch when this constraint is solved.
                 ti_constrain(st, fn_t, expected_fn, eline)
                 return ret_var
-            if tag == "method_call" or tag == "dyn_call"
+            if tag == "method_call"
+                if len(children) > 0
+                    match children[0]
+                        Expr(rtag, rval, rnum, rch, rf, rln) =>
+                            if rtag == "ident" and contains(st.ti_modules, rval)
+                                let mod_fns = st.ti_modules[rval]
+                                if contains(mod_fns, value)
+                                    let mfn_t = mod_fns[value]
+                                    let arg_types = []
+                                    let mai = 1
+                                    while mai < len(children)
+                                        push(arg_types, ti_infer_expr(st, children[mai]))
+                                        mai = mai + 1
+                                    let ret_var = ti_fresh(st)
+                                    ti_constrain(st, mfn_t, nt_fn(arg_types, ret_var), eline)
+                                    return ret_var
+                                else
+                                    ti_error(st, "module '" + rval + "' has no exported function '" + value + "'", eline)
+                                    return nt_any()
+                let ai = 0
+                while ai < len(children)
+                    ti_infer_expr(st, children[ai])
+                    ai = ai + 1
+                return nt_any()
+            if tag == "dyn_call"
                 let ai = 0
                 while ai < len(children)
                     ti_infer_expr(st, children[ai])
@@ -6849,12 +6874,16 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
         match stmts[si]
             Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
                 if tag == "import"
+                    let mod_alias = name
+                    if len(annotations) > 0 and annotations[0] != ""
+                        mod_alias = annotations[0]
                     let mod_path = resolve_module_file(name, base_dir)
                     if mod_path != ""
                         let mod_source = read_file(mod_path)
                         if len(mod_source) > 0
                             let mod_tokens = tokenize(mod_source)
                             let mod_stmts = parse_program(mod_tokens)
+                            let mod_fn_types = {}
                             for ms in mod_stmts
                                 match ms
                                     Stmt(mtag, mname, mexpr, mbody, mparams, meb, man, msl) =>
@@ -6864,8 +6893,11 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                             while mpp < len(mparams)
                                                 push(mod_param_types, nt_any())
                                                 mpp = mpp + 1
-                                            ti_define(st, mname, ti_mono(nt_fn(mod_param_types, nt_any())))
+                                            let fn_type = nt_fn(mod_param_types, nt_any())
+                                            ti_define(st, mname, ti_mono(fn_type))
                                             st.ti_min_arity[mname] = len(mparams)
+                                            mod_fn_types[mname] = fn_type
+                            st.ti_modules[mod_alias] = mod_fn_types
                 if tag == "fn"
                     if contains(seen_fns, name)
                         ti_error(st, "duplicate function definition: '" + name + "' was already defined on line " + str(seen_fns[name]), sline)
@@ -8437,7 +8469,7 @@ fn ire_emit_terminator(e: IrEmitter, term: IrInst)
                     ire_indent(e, "ret i64 0")
             else if op == "goto"
                 if ire_is_backedge(value) == 1
-                    ire_indent(e, "br label %" + value + ", !llvm.loop !91")
+                    ire_indent(e, "br label %" + value)
                 else
                     ire_indent(e, "br label %" + value)
             else if op == "branch"
@@ -9300,9 +9332,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "!5 = !" + lb + "!" + dq + "list_size" + dq + ", !0" + rb)
     ire_line(e, "!6 = !" + lb + "!5, !5, i64 0" + rb)
     ire_line(e, "!90 = !" + lb + "!" + dq + "branch_weights" + dq + ", i32 2000, i32 1" + rb)
-    ire_line(e, "!91 = distinct !" + lb + "!91, !92, !93" + rb)
-    ire_line(e, "!92 = !" + lb + "!" + dq + "llvm.loop.unroll.enable" + dq + rb)
-    ire_line(e, "!93 = !" + lb + "!" + dq + "llvm.loop.vectorize.enable" + dq + ", i1 true" + rb)
+    // Loop metadata removed: !llvm.loop.unroll.enable caused 693x unrolling,
+    // producing 2.1MB assembly vs 7.8KB without hints. LLVM default heuristics
+    // produce identical is_prime assembly and correct loop optimization.
     ire_line(e, "")
 
     join(e.ire_out, "\n")
@@ -9400,7 +9432,7 @@ fn resolve_and_compile_imports(b: IrBuilder, stmts: list, base_dir: string) -> l
                     if len(annotations) > 0
                         alias = annotations[0]
                     if not contains(visited, mod_name)
-                        visited[mod_name] = 1
+                        visited[mod_name] = alias
                         let mod_path = resolve_module_file(mod_name, base_dir)
                         if mod_path == ""
                             print("error: cannot find module '" + mod_name + "'")
@@ -9409,6 +9441,10 @@ fn resolve_and_compile_imports(b: IrBuilder, stmts: list, base_dir: string) -> l
                         let mod_fns = compile_module_ir(b, mod_source, alias, visited)
                         for mf in mod_fns
                             push(all_ir_fns, mf)
+                    else
+                        let first_alias = visited[mod_name]
+                        if contains(b.ir_modules, first_alias) and alias != first_alias
+                            b.ir_modules[alias] = b.ir_modules[first_alias]
     all_ir_fns
 
 fn nova_replace_ext(path: string, old_ext: string, new_ext: string) -> string
