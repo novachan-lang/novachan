@@ -1217,7 +1217,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     else if kind == "KW" and val == "type"
         parse_type_decl(tokens, pos, pe)
     else if kind == "KW" and val == "trait"
-        parse_trait_decl(tokens, pos)
+        parse_trait_decl(tokens, pos, pe)
     else if kind == "KW" and val == "enum"
         parse_enum_decl(tokens, pos, pe)
     else if kind == "KW" and val == "spawn"
@@ -1573,9 +1573,17 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
             p = p + 1
         if tk(tokens, p) != "EOF"
             p = p + 1
+    let impl_traits = []
+    if tk(tokens, p) == "COLON"
+        p = p + 1
+        push(impl_traits, tv(tokens, p))
+        p = p + 1
+        while tv(tokens, p) == ","
+            p = p + 1
+            push(impl_traits, tv(tokens, p))
+            p = p + 1
     let p2 = skip_nl(tokens, p)
     let fields = []
-    // Parse fields until next top-level construct
     while tk(tokens, p2) != "EOF"
         let cur_tok = tokens[p2]
         match cur_tok
@@ -1583,9 +1591,7 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                 if col <= 1 and k != "IDENT"
                     break
                 if col <= 1 and k == "IDENT"
-                    // Check if it looks like a field (name: type)
                     if p2 + 1 < len(tokens) and tk(tokens, p2 + 1) == "COLON"
-                        // It's a field
                         let fname = tv(tokens, p2)
                         p2 = p2 + 2
                         let ftype = tv(tokens, p2)
@@ -1611,9 +1617,11 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
         for g in type_generics
             push(tg_children, Expr("ident", g, 0, [], [], ln))
         push(type_annotations, Expr("generics", "", 0, tg_children, [], ln))
+    for it in impl_traits
+        push(type_annotations, Expr("impl_trait", it, 0, [], [], ln))
     StmtParseResult(Stmt("type", name, null_expr(), [], fields, [], type_annotations, ln), p2)
 
-fn parse_trait_decl(tokens: list, pos: int) -> StmtParseResult
+fn parse_trait_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     let name = tv(tokens, p)
@@ -1624,17 +1632,49 @@ fn parse_trait_decl(tokens: list, pos: int) -> StmtParseResult
     match trait_tok
         Token(tk2, tv2, tl2, tc2) =>
             trait_col = tc2
+    let methods = []
     while tk(tokens, p2) != "EOF"
         if tk(tokens, p2) == "NEWLINE"
             p2 = p2 + 1
             continue
         let cur_tok = tokens[p2]
+        let cur_col = 0
         match cur_tok
             Token(k, v, line, col) =>
-                if col <= trait_col
-                    break
-        p2 = p2 + 1
-    StmtParseResult(Stmt("trait", name, null_expr(), [], [], [], [], ln), p2)
+                cur_col = col
+        if cur_col <= trait_col
+            break
+        if tk(tokens, p2) == "KW" and tv(tokens, p2) == "fn"
+            let mln = tl(tokens, p2)
+            p2 = p2 + 1
+            let mname = tv(tokens, p2)
+            p2 = p2 + 1
+            let mparams = []
+            if tv(tokens, p2) == "("
+                p2 = p2 + 1
+                while tv(tokens, p2) != ")" and tk(tokens, p2) != "EOF"
+                    if len(mparams) > 0
+                        if tv(tokens, p2) == ","
+                            p2 = p2 + 1
+                    let mpn = tv(tokens, p2)
+                    p2 = p2 + 1
+                    let mpt = ""
+                    if tk(tokens, p2) == "COLON"
+                        p2 = p2 + 1
+                        mpt = tv(tokens, p2)
+                        p2 = p2 + 1
+                    push(mparams, Param(mpn, mpt, null_expr()))
+                if tv(tokens, p2) == ")"
+                    p2 = p2 + 1
+            let mret = ""
+            if tk(tokens, p2) == "ARROW"
+                p2 = p2 + 1
+                mret = tv(tokens, p2)
+                p2 = p2 + 1
+            push(methods, Stmt("fn_sig", mname, Expr("rettype", mret, 0, [], [], mln), [], mparams, [], [], mln))
+        else
+            p2 = p2 + 1
+    StmtParseResult(Stmt("trait", name, null_expr(), methods, [], [], [], ln), p2)
 
 fn parse_enum_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
@@ -3171,6 +3211,8 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_unwrap_err(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_unwrap_or(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_result_tag(i64) nounwind")
+    emit(cg, "declare void @nova_rt_clear_is_result() nounwind")
+    emit(cg, "declare i64 @nova_rt_try_unwrap_value(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_result_map(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_result_map_err(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_result_and_then(i64, i64) nounwind")
@@ -4015,7 +4057,7 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                         di = di + 1
                 let dest = ir_fresh_reg(b)
                 if fn_name == "error"
-                    ir_emit_inst(b, "set_error", dest, ir_type_any(), arg_regs, "", 0)
+                    ir_emit_side(b, "set_error", dest, ir_type_any(), arg_regs, "", 0)
                     return dest
                 else if fn_name == "select"
                     let sel_list = ir_fresh_reg(b)
@@ -4236,46 +4278,44 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
             else if tag == "try"
                 let inner = ir_lower_expr(b, children[0])
                 let dest = ir_fresh_reg(b)
-                ir_emit_inst(b, "is_error", dest, ir_type_int(), [inner], "", 0)
+                ir_emit_side(b, "is_error", dest, ir_type_int(), [inner], "", 0)
                 let err_label = ir_fresh_label(b, "try_err")
                 let ok_label = ir_fresh_label(b, "try_ok")
                 ir_finish_block(b, IrInst("branch", "", ir_type_void(), [dest, ok_label], err_label, 0, "pure", b.ir_cur_line))
                 ir_start_block(b, err_label)
-                ir_emit_inst(b, "raise_error", "", ir_type_void(), [], "", 0)
+                ir_emit_side(b, "raise_error", "", ir_type_void(), [], "", 0)
                 ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure", b.ir_cur_line))
                 ir_start_block(b, ok_label)
                 return inner
             else if tag == "try_unwrap"
+                ir_emit_side(b, "clear_is_result", "", ir_type_void(), [], "", 0)
                 let inner = ir_lower_expr(b, children[0])
-                let tag_reg = ir_fresh_reg(b)
-                ir_emit_side(b, "call", tag_reg, ir_type_int(), [inner], "nova_rt_result_tag", 0)
-                let one_reg = ir_fresh_reg(b)
-                ir_emit_inst(b, "const_int", one_reg, ir_type_int(), [], "1", 1)
-                let cmp_reg = ir_fresh_reg(b)
-                ir_emit_inst(b, "eq", cmp_reg, ir_type_int(), [tag_reg, one_reg], "==", 0)
+                let unwrapped = ir_fresh_reg(b)
+                ir_emit_side(b, "try_unwrap_value", unwrapped, ir_type_any(), [inner], "", 0)
+                let err_check = ir_fresh_reg(b)
+                ir_emit_side(b, "is_error", err_check, ir_type_int(), [unwrapped], "", 0)
                 let err_label = ir_fresh_label(b, "try_err")
                 let ok_label = ir_fresh_label(b, "try_ok")
-                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_reg, ok_label], err_label, 0, "pure", b.ir_cur_line))
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [err_check, ok_label], err_label, 0, "pure", b.ir_cur_line))
                 ir_start_block(b, err_label)
+                ir_emit_side(b, "raise_error", "", ir_type_void(), [], "", 0)
                 ir_finish_block(b, IrInst("return", "", ir_type_void(), [inner], "", 0, "pure", b.ir_cur_line))
                 ir_start_block(b, ok_label)
-                let unwrap_reg = ir_fresh_reg(b)
-                ir_emit_side(b, "call", unwrap_reg, ir_type_any(), [inner], "nova_rt_unwrap", 0)
-                return unwrap_reg
+                return unwrapped
             else if tag == "catch"
                 let tried = ir_lower_expr(b, children[0])
                 let catch_slot = "__catch_" + str(b.ir_lc)
                 b.ir_lc = b.ir_lc + 1
                 ir_emit_inst(b, "slot_store", "", ir_type_void(), [tried], catch_slot, 0)
                 let err_dest = ir_fresh_reg(b)
-                ir_emit_inst(b, "is_error", err_dest, ir_type_int(), [tried], "", 0)
+                ir_emit_side(b, "is_error", err_dest, ir_type_int(), [tried], "", 0)
                 let err_label = ir_fresh_label(b, "catch_err")
                 let ok_label = ir_fresh_label(b, "catch_ok")
                 let merge_label = ir_fresh_label(b, "catch_merge")
                 ir_finish_block(b, IrInst("branch", "", ir_type_void(), [err_dest, ok_label], err_label, 0, "pure", b.ir_cur_line))
                 ir_start_block(b, err_label)
                 let msg_reg = ir_fresh_reg(b)
-                ir_emit_inst(b, "load_error_msg", msg_reg, ir_type_str(), [], "", 0)
+                ir_emit_side(b, "load_error_msg", msg_reg, ir_type_str(), [], "", 0)
                 ir_emit_inst(b, "slot_store", "", ir_type_void(), [msg_reg], value, 0)
                 b.ir_locals[value] = 1
                 let handler_val = ""
@@ -5287,6 +5327,9 @@ type TiState
     ti_variant_enum: dict
     ti_filename: string
     ti_modules: dict
+    ti_traits: dict
+    ti_type_traits: dict
+    ti_type_methods: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -5348,7 +5391,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -6511,6 +6554,13 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 ti_solve(st)
                 let resolved_ctor = ti_zonk(st, ctor_type)
                 ti_define(st, name, ti_generalize(st, resolved_ctor))
+                for ann in annotations
+                    match ann
+                        Expr(at, av, an2, ac, af, al) =>
+                            if at == "impl_trait"
+                                if not contains(st.ti_type_traits, name)
+                                    st.ti_type_traits[name] = {}
+                                st.ti_type_traits[name][av] = sline
                 return nt_unit()
             if tag == "enum"
                 for variant in body
@@ -6647,6 +6697,16 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 for s in body
                     ti_infer_stmt(st, s)
                 ti_pop_scope(st)
+                // Detect infinite loops: while 1, while true → never exits normally
+                let is_infinite = false
+                match expr
+                    Expr(et, ev, en, ec, ef, el) =>
+                        if et == "int" and en != 0
+                            is_infinite = true
+                        if et == "bool" and ev == "true"
+                            is_infinite = true
+                if is_infinite
+                    return nt_nothing()
                 return nt_unit()
             if tag == "for"
                 let iter_t = ti_infer_expr(st, expr)
@@ -6994,6 +7054,31 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                     push(variant_names, vname)
                                     st.ti_variant_enum[vname] = name
                     st.ti_enum_variants[name] = variant_names
+                if tag == "trait"
+                    let trait_methods = []
+                    for tm in body
+                        match tm
+                            Stmt(tmt, tmn, tme, tmb, tmp, tmeb, tma, tml) =>
+                                if tmt == "fn_sig"
+                                    let param_count = len(tmp)
+                                    let has_self = false
+                                    for tp in tmp
+                                        match tp
+                                            Param(tpn, tpt, tpd) =>
+                                                if tpn == "self"
+                                                    has_self = true
+                                    if has_self
+                                        param_count = param_count - 1
+                                    push(trait_methods, tmn)
+                    st.ti_traits[name] = trait_methods
+                if tag == "fn"
+                    let dunder = find(name, "__")
+                    if dunder > 0
+                        let type_name = slice(name, 0, dunder)
+                        let method_name = slice(name, dunder + 2, len(name))
+                        if not contains(st.ti_type_methods, type_name)
+                            st.ti_type_methods[type_name] = []
+                        push(st.ti_type_methods[type_name], method_name)
         si = si + 1
     si = 0
     while si < len(stmts)
@@ -7007,8 +7092,37 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                     ti_error(st, "'continue' outside of a loop is not allowed", sl2)
         ti_infer_stmt(st, stmts[si])
         si = si + 1
+    ti_check_trait_conformance(st)
     ti_solve(st)
     st
+
+fn ti_check_trait_conformance(st: TiState)
+    let type_names = keys(st.ti_type_traits)
+    for tn in type_names
+        let trait_map = st.ti_type_traits[tn]
+        let trait_names = keys(trait_map)
+        for trait_name in trait_names
+            let decl_line = trait_map[trait_name]
+            if not contains(st.ti_traits, trait_name)
+                ti_error(st, "type '" + tn + "' declares conformance to unknown trait '" + trait_name + "'", decl_line)
+            else
+                let required = st.ti_traits[trait_name]
+                let implemented = []
+                if contains(st.ti_type_methods, tn)
+                    implemented = st.ti_type_methods[tn]
+                let missing = []
+                for rm in required
+                    if not list_contains(implemented, rm)
+                        push(missing, rm)
+                if len(missing) > 0
+                    let msg = "type '" + tn + "' does not fully implement trait '" + trait_name + "': missing "
+                    let mi = 0
+                    while mi < len(missing)
+                        if mi > 0
+                            msg = msg + ", "
+                        msg = msg + missing[mi] + "()"
+                        mi = mi + 1
+                    ti_error(st, msg, decl_line)
 
 // ── Tail Call Optimization ───────────────────────────────────────────────────
 
@@ -7654,6 +7768,12 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     rt[dest] = "str"
                 return IrInst(op, dest, ir_type_str(), args, value, num, effect, line)
             else if op == "raise_error"
+                return inst
+            else if op == "clear_is_result"
+                return inst
+            else if op == "try_unwrap_value"
+                if dest != ""
+                    rt[dest] = "any"
                 return inst
             else if op == "copy" and len(args) == 1
                 let src_type = ir_reg_type(rt, args[0])
@@ -8505,6 +8625,13 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 ire_indent(e, dest + " = add i64 " + msg_tmp + ", 0")
             else if op == "raise_error"
                 ire_indent(e, "store i64 1, ptr @__nova_error_flag")
+            else if op == "clear_is_result"
+                ire_indent(e, "call void @nova_rt_clear_is_result()")
+            else if op == "try_unwrap_value"
+                if dest != ""
+                    ire_indent(e, dest + " = call i64 @nova_rt_try_unwrap_value(i64 " + args[0] + ")")
+                else
+                    ire_indent(e, "call i64 @nova_rt_try_unwrap_value(i64 " + args[0] + ")")
             e.ire_dbg_loc = saved_loc
 
 fn ire_is_loop_header(label: string) -> int
@@ -9043,6 +9170,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_unwrap_err(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_unwrap_or(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_result_tag(i64) nounwind")
+    ire_line(e, "declare void @nova_rt_clear_is_result() nounwind")
+    ire_line(e, "declare i64 @nova_rt_try_unwrap_value(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_result_map(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_result_map_err(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_result_and_then(i64, i64) nounwind")

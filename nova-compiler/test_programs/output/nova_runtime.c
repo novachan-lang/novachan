@@ -35,10 +35,14 @@
 #ifdef _WIN32
 extern __declspec(thread) int64_t __nova_error_flag;
 extern __declspec(thread) int64_t __nova_error_msg;
+static __declspec(thread) int64_t __nova_is_result = 0;
 #else
 extern __thread int64_t __nova_error_flag;
 extern __thread int64_t __nova_error_msg;
+static __thread int64_t __nova_is_result = 0;
 #endif
+
+void nova_rt_clear_is_result(void) { __nova_is_result = 0; }
 
 static void nova_set_error(const char* msg) {
     if (__nova_error_msg != 0) {
@@ -5413,18 +5417,22 @@ static int64_t nova_result_pack(int64_t tag, int64_t value) {
 }
 
 int64_t nova_rt_ok(int64_t value) {
+    __nova_is_result = 1;
     return nova_result_pack(0, value);
 }
 
 int64_t nova_rt_err(int64_t value) {
+    __nova_is_result = 1;
     return nova_result_pack(1, value);
 }
 
 int64_t nova_rt_some(int64_t value) {
+    __nova_is_result = 1;
     return nova_result_pack(0, value);
 }
 
 int64_t nova_rt_none(void) {
+    __nova_is_result = 1;
     return nova_result_pack(1, 0);
 }
 
@@ -5484,6 +5492,22 @@ int64_t nova_rt_unwrap_or(int64_t handle, int64_t default_val) {
 int64_t nova_rt_result_tag(int64_t handle) {
     NovaResult* r = (NovaResult*)(uintptr_t)handle;
     return r->tag;
+}
+
+int64_t nova_rt_try_unwrap_value(int64_t handle) {
+    if (__nova_is_result) {
+        __nova_is_result = 0;
+        NovaResult* r = (NovaResult*)(uintptr_t)handle;
+        if (r->tag == 0) {
+            __nova_error_flag = 0;
+            return r->value;
+        } else {
+            __nova_error_flag = 1;
+            __nova_error_msg = r->value;
+            return handle;
+        }
+    }
+    return handle;
 }
 
 int64_t nova_rt_result_map(int64_t handle, int64_t closure) {
