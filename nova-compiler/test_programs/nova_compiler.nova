@@ -5804,6 +5804,7 @@ fn ti_build_stdlib() -> dict
     reg["values"] = NTypeScheme([-1, -2], nt_fn([nt_dict(T, U)], nt_list(U)))
     reg["sort"] = NTypeScheme([-1], nt_fn([nt_list(T)], nt_list(T)))
     reg["contains"] = NTypeScheme([-1, -2], nt_fn([T, U], nt_bool()))
+    reg["del"] = NTypeScheme([-1, -2], nt_fn([nt_dict(T, U), T], nt_unit()))
     reg["map"] = NTypeScheme([-1, -2], nt_fn([nt_list(T), nt_fn([T], U)], nt_list(U)))
     reg["filter"] = NTypeScheme([-1], nt_fn([nt_list(T), nt_fn([T], nt_bool())], nt_list(T)))
     reg["split"] = NTypeScheme([], nt_fn([nt_string(), nt_string()], nt_list(nt_string())))
@@ -10045,6 +10046,183 @@ fn nova_pkg_get(pkg_spec: string)
     print("Added " + pkg_name + "@" + pkg_version + " to nova.toml")
     nova_pkg_download(pkg_name, pkg_version)
 
+// ── LSP Server ──────────────────────────────────────────────────────────────
+
+fn lsp_read_message() -> string
+    let content_length = 0
+    let line = read_line()
+    while line != "" and line != "\r" and line != "\r\n"
+        if starts_with(line, "Content-Length:")
+            let num_str = trim(slice(line, 15, len(line)))
+            num_str = replace(num_str, "\r", "")
+            num_str = replace(num_str, "\n", "")
+            content_length = int(num_str)
+        line = read_line()
+    if content_length <= 0
+        return ""
+    stdin_read_n(content_length)
+
+fn lsp_send(msg: string)
+    let body = msg
+    let header = "Content-Length: " + str(len(body)) + "\r\n\r\n"
+    stdout_write(header + body)
+
+fn lsp_respond(id, result: string)
+    lsp_send("\{\"jsonrpc\":\"2.0\",\"id\":" + str(id) + ",\"result\":" + result + "\}")
+
+fn lsp_notify(method: string, params: string)
+    lsp_send("\{\"jsonrpc\":\"2.0\",\"method\":\"" + method + "\",\"params\":" + params + "\}")
+
+fn lsp_error_response(id, code: int, msg: string)
+    lsp_send("\{\"jsonrpc\":\"2.0\",\"id\":" + str(id) + ",\"error\":\{\"code\":" + str(code) + ",\"message\":\"" + msg + "\"\}\}")
+
+fn lsp_escape_json(s: string) -> string
+    let out = ""
+    let i = 0
+    while i < len(s)
+        let c = s[i]
+        if c == "\\"
+            out = out + "\\\\"
+        else if c == "\""
+            out = out + "\\\""
+        else if c == "\n"
+            out = out + "\\n"
+        else if c == "\r"
+            out = out + "\\r"
+        else if c == "\t"
+            out = out + "\\t"
+        else
+            out = out + c
+        i = i + 1
+    out
+
+fn lsp_collect_diagnostics(source: string, filename: string) -> list
+    let diags = []
+    let tokens = tokenize(source)
+    let parse_errors = []
+    let stmts = parse_program(tokens, parse_errors)
+    for pe in parse_errors
+        let pe_line = 0
+        let colon_idx = find(pe, ":")
+        if colon_idx > 0
+            let after = slice(pe, colon_idx + 1, len(pe))
+            let space_idx = find(after, " ")
+            if space_idx > 0
+                let num = slice(after, 0, space_idx)
+                pe_line = int(num) - 1
+                if pe_line < 0
+                    pe_line = 0
+        push(diags, [pe_line, 0, lsp_escape_json(pe)])
+    let source_lines = split(source, "\n")
+    let ti_state = ti_infer_program_named(stmts, source_lines, filename)
+    for te in ti_state.ti_errors
+        let te_line = 0
+        let arrow_idx = find(te, "--> ")
+        if arrow_idx >= 0
+            let after = slice(te, arrow_idx + 4, len(te))
+            let colon_idx = find(after, ":")
+            if colon_idx > 0
+                let num_end = find(after, "\n")
+                if num_end < 0
+                    num_end = len(after)
+                let num_str = slice(after, colon_idx + 1, num_end)
+                num_str = trim(num_str)
+                te_line = int(num_str) - 1
+                if te_line < 0
+                    te_line = 0
+        let msg_end = find(te, "\n")
+        let msg = te
+        if msg_end > 0
+            msg = slice(te, 0, msg_end)
+        push(diags, [te_line, 0, lsp_escape_json(msg)])
+    diags
+
+fn lsp_publish_diagnostics(uri: string, source: string, filename: string)
+    let diags = lsp_collect_diagnostics(source, filename)
+    let items = ""
+    let di = 0
+    for d in diags
+        let line = d[0]
+        let col = d[1]
+        let msg = d[2]
+        if di > 0
+            items = items + ","
+        items = items + "\{\"range\":\{\"start\":\{\"line\":" + str(line) + ",\"character\":" + str(col) + "\},\"end\":\{\"line\":" + str(line) + ",\"character\":999\}\},\"severity\":1,\"source\":\"nova\",\"message\":\"" + msg + "\"\}"
+        di = di + 1
+    lsp_notify("textDocument/publishDiagnostics", "\{\"uri\":\"" + lsp_escape_json(uri) + "\",\"diagnostics\":[" + items + "]\}")
+
+fn lsp_uri_to_path(uri: string) -> string
+    if starts_with(uri, "file:///")
+        let path = slice(uri, 8, len(uri))
+        path = replace(path, "%20", " ")
+        path = replace(path, "%3A", ":")
+        path = replace(path, "%5C", "\\")
+        return path
+    uri
+
+fn lsp_server_main()
+    write_raw("NOVA LSP server started\n")
+    let docs = {}
+    let running = true
+    while running
+        let body = lsp_read_message()
+        if body == ""
+            continue
+        let msg = json_parse(body)
+        let method = ""
+        let id = 0
+        let has_id = false
+        if contains(msg, "method")
+            method = msg["method"]
+        if contains(msg, "id")
+            id = msg["id"]
+            has_id = true
+        if method == "initialize"
+            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\}\}\}"
+            lsp_respond(id, caps)
+        else if method == "initialized"
+            write_raw("NOVA LSP initialized\n")
+        else if method == "shutdown"
+            lsp_respond(id, "null")
+        else if method == "exit"
+            running = false
+        else if method == "textDocument/didOpen"
+            let params = msg["params"]
+            let td = params["textDocument"]
+            let uri = td["uri"]
+            let text = td["text"]
+            docs[uri] = text
+            let fpath = lsp_uri_to_path(uri)
+            lsp_publish_diagnostics(uri, text, fpath)
+        else if method == "textDocument/didChange"
+            let params = msg["params"]
+            let td = params["textDocument"]
+            let uri = td["uri"]
+            let changes = params["contentChanges"]
+            if len(changes) > 0
+                let text = changes[0]["text"]
+                docs[uri] = text
+                let fpath = lsp_uri_to_path(uri)
+                lsp_publish_diagnostics(uri, text, fpath)
+        else if method == "textDocument/didSave"
+            let params = msg["params"]
+            let td = params["textDocument"]
+            let uri = td["uri"]
+            if contains(params, "text")
+                docs[uri] = params["text"]
+            if contains(docs, uri)
+                let fpath = lsp_uri_to_path(uri)
+                lsp_publish_diagnostics(uri, docs[uri], fpath)
+        else if method == "textDocument/didClose"
+            let params = msg["params"]
+            let td = params["textDocument"]
+            let uri = td["uri"]
+            if contains(docs, uri)
+                docs[uri] = ""
+            lsp_notify("textDocument/publishDiagnostics", "\{\"uri\":\"" + lsp_escape_json(uri) + "\",\"diagnostics\":[]\}")
+        else if has_id
+            lsp_error_response(id, -32601, "Method not found: " + method)
+
 fn compiler_main()
     let arguments = args()
     if len(arguments) < 2
@@ -10069,6 +10247,7 @@ fn compiler_main()
         print("Tools:")
         print("  version               Show version")
         print("  self-test             Run compiler self-test")
+        print("  lsp                   Start LSP server (for IDE integration)")
         print("")
         print("Options:")
         print("  -O0                   Disable optimizations")
@@ -10083,6 +10262,9 @@ fn compiler_main()
         exit(0)
     if cmd == "self-test"
         run_self_test()
+        exit(0)
+    if cmd == "lsp" or cmd == "--lsp"
+        lsp_server_main()
         exit(0)
     if cmd == "init"
         nova_pkg_init()
