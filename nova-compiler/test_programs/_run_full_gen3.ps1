@@ -5,7 +5,7 @@ $compiler = (Resolve-Path ".\gen3_test.exe").Path
 Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
 
 $expect_fail = @("assert_fail_test")
-$expect_compile_fail = @("multi_error_test", "trait_conformance_test", "trait_unknown_test", "forward_type_err_test")
+$expect_compile_fail = @("multi_error_test", "trait_conformance_test", "trait_unknown_test", "forward_type_err_test", "trait_bounds_fail_test")
 $extra_c = @{
     "ffi_test"      = "ffi_helper.c"
     "ffi_full_test" = "ffi_helper.c"

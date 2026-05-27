@@ -1414,6 +1414,7 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
     let p = pos + 1
     let generic_params = []
+    let generic_bounds = {}
     if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
         p = p + 1
         while tv(tokens, p) != ">" and tk(tokens, p) != "EOF"
@@ -1421,8 +1422,13 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                 p = expect(tokens, p, ",", pe)
                 if tk(tokens, p) == "EOF"
                     break
-            push(generic_params, tv(tokens, p))
+            let gp_name = tv(tokens, p)
+            push(generic_params, gp_name)
             p = p + 1
+            if tk(tokens, p) == "COLON"
+                p = p + 1
+                generic_bounds[gp_name] = tv(tokens, p)
+                p = p + 1
         if tk(tokens, p) != "EOF"
             p = p + 1
     let name = tv(tokens, p)
@@ -1554,6 +1560,11 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
         for g in generic_params
             push(gen_children, Expr("ident", g, 0, [], [], ln))
         push(annotations, Expr("generics", "", 0, gen_children, [], ln))
+        if len(generic_bounds) > 0
+            let bound_children = []
+            for bk in keys(generic_bounds)
+                push(bound_children, Expr("bound", bk, 0, [Expr("ident", generic_bounds[bk], 0, [], [], ln)], [], ln))
+            push(annotations, Expr("generic_bounds", "", 0, bound_children, [], ln))
     StmtParseResult(Stmt("fn", name, ret_expr, body, params, [], annotations, ln), p2)
 
 fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
@@ -5331,6 +5342,8 @@ type TiState
     ti_type_traits: dict
     ti_type_methods: dict
     ti_fn_defer: dict
+    ti_fn_bounds: dict
+    ti_bound_checks: list
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -5392,7 +5405,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [])
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -6232,6 +6245,22 @@ fn ti_extract_generics(annotations: list) -> list
                     return names
     []
 
+fn ti_extract_bounds(annotations: list) -> dict
+    for a in annotations
+        match a
+            Expr(at, av, an, ac, af, al) =>
+                if at == "generic_bounds"
+                    let bounds = {}
+                    for c in ac
+                        match c
+                            Expr(ct, cv, cn, cc, cf, cl) =>
+                                if ct == "bound" and len(cc) > 0
+                                    match cc[0]
+                                        Expr(bt, bv, bn, bc, bf, bl) =>
+                                            bounds[cv] = bv
+                    return bounds
+    {}
+
 // ── Expression inference ─────────────────────────────────────────────────────
 
 fn ti_infer_expr(st: TiState, expr: Expr) -> NType
@@ -6280,6 +6309,13 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                     return ret_var
                 let expected_fn = nt_fn(arg_types, ret_var)
                 ti_constrain(st, fn_t, expected_fn, eline)
+                if contains(st.ti_fn_bounds, value)
+                    let fn_bounds = st.ti_fn_bounds[value]
+                    let bci = 0
+                    while bci < len(arg_types)
+                        if contains(fn_bounds, str(bci))
+                            push(st.ti_bound_checks, [arg_types[bci], fn_bounds[str(bci)], eline, value])
+                        bci = bci + 1
                 return ret_var
             if tag == "method_call"
                 if len(children) > 0
@@ -6495,9 +6531,21 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 let saved_fn = st.ti_in_fn
                 st.ti_in_fn = name
                 let gnames = ti_extract_generics(annotations)
+                let gbounds = ti_extract_bounds(annotations)
                 let gmap = {}
                 for gn in gnames
                     gmap[gn] = ti_fresh(st)
+                if len(gbounds) > 0
+                    let fn_bounds = {}
+                    let pbi = 0
+                    for p in params
+                        match p
+                            Param(pname, ptype, pdefault) =>
+                                if ptype != "" and contains(gbounds, ptype)
+                                    fn_bounds[str(pbi)] = gbounds[ptype]
+                        pbi = pbi + 1
+                    if len(fn_bounds) > 0
+                        st.ti_fn_bounds[name] = fn_bounds
                 let param_types = []
                 for p in params
                     match p
@@ -7143,7 +7191,29 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
         let d_resolved = ti_zonk(st, d_fn_type)
         ti_define(st, dn, ti_generalize(st, d_resolved))
         st.ti_fn_types[d_fn_name] = ti_to_ir_kind(ti_apply(st, d_ret_var))
+    ti_check_bounds(st)
     st
+
+fn ti_check_bounds(st: TiState)
+    for bc in st.ti_bound_checks
+        let bc_type = bc[0]
+        let bc_trait = bc[1]
+        let bc_line = bc[2]
+        let bc_fn = bc[3]
+        let resolved = ti_apply(st, bc_type)
+        match resolved
+            NType(rk, rn, rp, ri) =>
+                if rk == "any" or rk == "var"
+                    continue
+                let type_name = rk
+                if rk == "struct"
+                    type_name = rn
+                let has_trait = false
+                if contains(st.ti_type_traits, type_name)
+                    if contains(st.ti_type_traits[type_name], bc_trait)
+                        has_trait = true
+                if not has_trait
+                    ti_error(st, "type " + ti_type_str(resolved) + " does not implement trait '" + bc_trait + "' (required by " + bc_fn + ")", bc_line)
 
 fn ti_check_trait_conformance(st: TiState)
     let type_names = keys(st.ti_type_traits)
