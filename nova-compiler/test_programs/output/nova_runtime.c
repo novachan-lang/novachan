@@ -16,8 +16,12 @@
 #include <windows.h>
 #include <wincrypt.h>
 #include <winhttp.h>
+#define SECURITY_WIN32
+#include <security.h>
+#include <schannel.h>
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "secur32.lib")
 #else
 #include <pthread.h>
 #include <sched.h>
@@ -9130,75 +9134,210 @@ int64_t nova_rt_doc_entry_count(int64_t entries_val) {
    For cross-platform portability we use a stub that records state
    and delegates to the existing TCP functions; real TLS is added per-platform. */
 
+/* Real TLS client via Windows schannel (SSPI). Encrypts/decrypts genuine TLS
+   records against a real peer — replaces the old plaintext stub. */
+#ifdef _WIN32
 typedef struct {
-    int64_t tcp_fd;     /* underlying TCP socket */
-    int     is_server;  /* 1 if server-side */
-    int     handshook;  /* 1 after handshake */
+    NOVA_SOCKET sock;
+    CredHandle  cred;
+    CtxtHandle  ctxt;
+    SecPkgContext_StreamSizes sizes;
+    int   handshook;
+    char  enc[32768];   /* received-but-undecrypted ciphertext */
+    int   enc_len;
+    char  host[256];
 } NovaTlsConn;
 
-static NovaTlsConn g_tls_conns[64];
-static int g_tls_count = 0;
+static int nova_tls_send_all_sock(NOVA_SOCKET s, const char* p, int n) {
+    int sent = 0;
+    while (sent < n) { int k = send(s, p + sent, n - sent, 0); if (k <= 0) return 0; sent += k; }
+    return 1;
+}
 
-/* nova_rt_tls_connect: Open TLS connection to host:port.
-   Returns an opaque TLS handle (>0 on success, 0 on failure). */
+/* Client handshake loop. Returns 1 on success. */
+static int nova_tls_handshake(NovaTlsConn* c) {
+    SECURITY_STATUS ss;
+    DWORD flags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT |
+                  ISC_REQ_CONFIDENTIALITY | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM;
+    DWORD outFlags = 0;
+    SecBuffer  outBuf; SecBufferDesc outDesc;
+
+    /* 1) generate ClientHello */
+    outBuf.pvBuffer = NULL; outBuf.BufferType = SECBUFFER_TOKEN; outBuf.cbBuffer = 0;
+    outDesc.ulVersion = SECBUFFER_VERSION; outDesc.cBuffers = 1; outDesc.pBuffers = &outBuf;
+    ss = InitializeSecurityContextA(&c->cred, NULL, c->host, flags, 0, 0, NULL, 0,
+                                    &c->ctxt, &outDesc, &outFlags, NULL);
+    if (ss != SEC_I_CONTINUE_NEEDED) return 0;
+    if (outBuf.cbBuffer && outBuf.pvBuffer) {
+        if (!nova_tls_send_all_sock(c->sock, (char*)outBuf.pvBuffer, (int)outBuf.cbBuffer)) { FreeContextBuffer(outBuf.pvBuffer); return 0; }
+        FreeContextBuffer(outBuf.pvBuffer);
+    }
+
+    /* 2) handshake exchange loop */
+    c->enc_len = 0;
+    for (;;) {
+        int n = recv(c->sock, c->enc + c->enc_len, (int)(sizeof(c->enc) - c->enc_len), 0);
+        if (n <= 0) return 0;
+        c->enc_len += n;
+
+        SecBuffer inBuf[2];
+        inBuf[0].pvBuffer = c->enc; inBuf[0].cbBuffer = (DWORD)c->enc_len; inBuf[0].BufferType = SECBUFFER_TOKEN;
+        inBuf[1].pvBuffer = NULL;   inBuf[1].cbBuffer = 0;                 inBuf[1].BufferType = SECBUFFER_EMPTY;
+        SecBufferDesc inDesc; inDesc.ulVersion = SECBUFFER_VERSION; inDesc.cBuffers = 2; inDesc.pBuffers = inBuf;
+
+        outBuf.pvBuffer = NULL; outBuf.BufferType = SECBUFFER_TOKEN; outBuf.cbBuffer = 0;
+        outDesc.ulVersion = SECBUFFER_VERSION; outDesc.cBuffers = 1; outDesc.pBuffers = &outBuf;
+
+        ss = InitializeSecurityContextA(&c->cred, &c->ctxt, c->host, flags, 0, 0,
+                                        &inDesc, 0, NULL, &outDesc, &outFlags, NULL);
+
+        if (ss == SEC_E_INCOMPLETE_MESSAGE) continue; /* need more bytes; keep enc */
+
+        if (outBuf.cbBuffer && outBuf.pvBuffer) {
+            nova_tls_send_all_sock(c->sock, (char*)outBuf.pvBuffer, (int)outBuf.cbBuffer);
+            FreeContextBuffer(outBuf.pvBuffer);
+        }
+
+        if (inBuf[1].BufferType == SECBUFFER_EXTRA && inBuf[1].cbBuffer > 0) {
+            memmove(c->enc, c->enc + (c->enc_len - (int)inBuf[1].cbBuffer), inBuf[1].cbBuffer);
+            c->enc_len = (int)inBuf[1].cbBuffer;
+        } else {
+            c->enc_len = 0;
+        }
+
+        if (ss == SEC_E_OK) break;
+        if (ss == SEC_I_CONTINUE_NEEDED) continue;
+        if (FAILED(ss)) return 0;
+    }
+
+    if (QueryContextAttributesA(&c->ctxt, SECPKG_ATTR_STREAM_SIZES, &c->sizes) != SEC_E_OK) return 0;
+    c->handshook = 1;
+    return 1;
+}
+
+/* nova_rt_tls_connect: real TLS handshake to host:port. Returns handle ptr, 0 on failure. */
 int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) {
+    const char* host = (const char*)(uintptr_t)host_val;
+    if (!host) return 0;
     int64_t tcp = nova_rt_tcp_connect(host_val, port_val);
     if (tcp <= 0) return 0;
-    if (g_tls_count >= 64) { nova_rt_tcp_close(tcp); return 0; }
-    int idx = g_tls_count++;
-    g_tls_conns[idx] = (NovaTlsConn){tcp, 0, 1};
-    /* return handle = idx + 10000 to distinguish from TCP handles */
-    return (int64_t)(idx + 10000);
+    NovaTlsConn* c = (NovaTlsConn*)calloc(1, sizeof(NovaTlsConn));
+    if (!c) { nova_rt_tcp_close(tcp); return 0; }
+    c->sock = (NOVA_SOCKET)tcp;
+    strncpy(c->host, host, sizeof(c->host) - 1);
+
+    SCHANNEL_CRED sc; memset(&sc, 0, sizeof(sc));
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_AUTO_CRED_VALIDATION;
+    TimeStamp ts;
+    SECURITY_STATUS ss = AcquireCredentialsHandleA(NULL, (SEC_CHAR*)UNISP_NAME_A, SECPKG_CRED_OUTBOUND,
+                                                   NULL, &sc, NULL, NULL, &c->cred, &ts);
+    if (ss != SEC_E_OK) { nova_rt_tcp_close(tcp); free(c); return 0; }
+
+    if (!nova_tls_handshake(c)) {
+        FreeCredentialsHandle(&c->cred);
+        nova_rt_tcp_close(tcp);
+        free(c);
+        return 0;
+    }
+    return (int64_t)(uintptr_t)c;
 }
 
-/* nova_rt_tls_listen: Create TLS server socket on port.
-   Returns opaque listen handle. cert_path/key_path are file paths to PEM files. */
+/* Server-side TLS requires a certificate; not yet implemented (honest stub). */
 int64_t nova_rt_tls_listen(int64_t port_val, int64_t cert_path_val, int64_t key_path_val) {
-    (void)cert_path_val; (void)key_path_val;
-    int64_t tcp = nova_rt_tcp_listen(port_val);
-    if (tcp <= 0) return 0;
-    if (g_tls_count >= 64) { nova_rt_tcp_close(tcp); return 0; }
-    int idx = g_tls_count++;
-    g_tls_conns[idx] = (NovaTlsConn){tcp, 1, 0};
-    return (int64_t)(idx + 10000);
+    (void)port_val; (void)cert_path_val; (void)key_path_val;
+    return 0; /* TLS server not implemented — needs cert provisioning */
 }
+int64_t nova_rt_tls_accept(int64_t listen_handle) { (void)listen_handle; return 0; }
 
-/* nova_rt_tls_accept: Accept a TLS connection from a listener.
-   Returns new TLS handle for the client. */
-int64_t nova_rt_tls_accept(int64_t listen_handle) {
-    int idx = (int)(listen_handle - 10000);
-    if (idx < 0 || idx >= g_tls_count) return 0;
-    int64_t client_tcp = nova_rt_tcp_accept(g_tls_conns[idx].tcp_fd);
-    if (client_tcp <= 0) return 0;
-    if (g_tls_count >= 64) { nova_rt_tcp_close(client_tcp); return 0; }
-    int cidx = g_tls_count++;
-    g_tls_conns[cidx] = (NovaTlsConn){client_tcp, 0, 1};
-    return (int64_t)(cidx + 10000);
-}
-
-/* nova_rt_tls_send: Send data over TLS connection. */
+/* nova_rt_tls_send: encrypt + send one TLS record. Returns plaintext bytes sent. */
 int64_t nova_rt_tls_send(int64_t handle, int64_t data_val) {
-    int idx = (int)(handle - 10000);
-    if (idx < 0 || idx >= g_tls_count) return 0;
-    return nova_rt_tcp_send(g_tls_conns[idx].tcp_fd, data_val);
+    NovaTlsConn* c = (NovaTlsConn*)(uintptr_t)handle;
+    if (!c || !c->handshook || !data_val) return 0;
+    const char* data = (const char*)(uintptr_t)data_val;
+    size_t len = strlen(data);
+    DWORD total = c->sizes.cbHeader + (DWORD)len + c->sizes.cbTrailer;
+    char* msg = (char*)malloc(total);
+    if (!msg) return 0;
+    memcpy(msg + c->sizes.cbHeader, data, len);
+
+    SecBuffer bufs[4];
+    bufs[0].pvBuffer = msg;                              bufs[0].cbBuffer = c->sizes.cbHeader;  bufs[0].BufferType = SECBUFFER_STREAM_HEADER;
+    bufs[1].pvBuffer = msg + c->sizes.cbHeader;          bufs[1].cbBuffer = (DWORD)len;         bufs[1].BufferType = SECBUFFER_DATA;
+    bufs[2].pvBuffer = msg + c->sizes.cbHeader + len;    bufs[2].cbBuffer = c->sizes.cbTrailer; bufs[2].BufferType = SECBUFFER_STREAM_TRAILER;
+    bufs[3].pvBuffer = NULL; bufs[3].cbBuffer = 0;       bufs[3].BufferType = SECBUFFER_EMPTY;
+    SecBufferDesc desc; desc.ulVersion = SECBUFFER_VERSION; desc.cBuffers = 4; desc.pBuffers = bufs;
+
+    SECURITY_STATUS ss = EncryptMessage(&c->ctxt, 0, &desc, 0);
+    if (ss != SEC_E_OK) { free(msg); return 0; }
+    DWORD sendLen = bufs[0].cbBuffer + bufs[1].cbBuffer + bufs[2].cbBuffer;
+    int ok = nova_tls_send_all_sock(c->sock, msg, (int)sendLen);
+    free(msg);
+    return ok ? (int64_t)len : 0;
 }
 
-/* nova_rt_tls_recv: Receive data from TLS connection. */
+/* nova_rt_tls_recv: receive + decrypt one TLS record, return plaintext string. */
 int64_t nova_rt_tls_recv(int64_t handle, int64_t max_bytes) {
-    int idx = (int)(handle - 10000);
-    if (idx < 0 || idx >= g_tls_count) return 0;
+    NovaTlsConn* c = (NovaTlsConn*)(uintptr_t)handle;
     (void)max_bytes;
-    return nova_rt_tcp_recv(g_tls_conns[idx].tcp_fd);
+    if (!c || !c->handshook) return nova_rt_create_string((void*)"");
+    for (;;) {
+        if (c->enc_len > 0) {
+            SecBuffer bufs[4];
+            bufs[0].pvBuffer = c->enc; bufs[0].cbBuffer = (DWORD)c->enc_len; bufs[0].BufferType = SECBUFFER_DATA;
+            bufs[1].BufferType = SECBUFFER_EMPTY; bufs[1].pvBuffer = NULL; bufs[1].cbBuffer = 0;
+            bufs[2].BufferType = SECBUFFER_EMPTY; bufs[2].pvBuffer = NULL; bufs[2].cbBuffer = 0;
+            bufs[3].BufferType = SECBUFFER_EMPTY; bufs[3].pvBuffer = NULL; bufs[3].cbBuffer = 0;
+            SecBufferDesc desc; desc.ulVersion = SECBUFFER_VERSION; desc.cBuffers = 4; desc.pBuffers = bufs;
+
+            SECURITY_STATUS ss = DecryptMessage(&c->ctxt, &desc, 0, NULL);
+            if (ss == SEC_E_OK) {
+                char* plain = NULL; DWORD plainLen = 0; char* extra = NULL; DWORD extraLen = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (bufs[i].BufferType == SECBUFFER_DATA)  { plain = (char*)bufs[i].pvBuffer; plainLen = bufs[i].cbBuffer; }
+                    if (bufs[i].BufferType == SECBUFFER_EXTRA) { extra = (char*)bufs[i].pvBuffer; extraLen = bufs[i].cbBuffer; }
+                }
+                char* out = (char*)malloc((size_t)plainLen + 1);
+                if (!out) return nova_rt_create_string((void*)"");
+                if (plainLen) memcpy(out, plain, plainLen);
+                out[plainLen] = 0;
+                if (extraLen > 0) { memmove(c->enc, extra, extraLen); c->enc_len = (int)extraLen; }
+                else c->enc_len = 0;
+                int64_t res = nova_rt_create_string((void*)out);
+                free(out);
+                return res;
+            } else if (ss == SEC_I_CONTEXT_EXPIRED) {
+                return nova_rt_create_string((void*)"");
+            } else if (ss != SEC_E_INCOMPLETE_MESSAGE) {
+                return nova_rt_create_string((void*)"");
+            }
+            /* SEC_E_INCOMPLETE_MESSAGE: need more ciphertext */
+        }
+        int n = recv(c->sock, c->enc + c->enc_len, (int)(sizeof(c->enc) - c->enc_len), 0);
+        if (n <= 0) return nova_rt_create_string((void*)"");
+        c->enc_len += n;
+    }
 }
 
-/* nova_rt_tls_close: Close TLS connection. */
+/* nova_rt_tls_close: shut down the TLS context and socket. */
 int64_t nova_rt_tls_close(int64_t handle) {
-    int idx = (int)(handle - 10000);
-    if (idx < 0 || idx >= g_tls_count) return 0;
-    nova_rt_tcp_close(g_tls_conns[idx].tcp_fd);
-    g_tls_conns[idx].tcp_fd = 0;
+    NovaTlsConn* c = (NovaTlsConn*)(uintptr_t)handle;
+    if (!c) return 0;
+    DeleteSecurityContext(&c->ctxt);
+    FreeCredentialsHandle(&c->cred);
+    if (c->sock) NOVA_CLOSE_SOCKET(c->sock);
+    free(c);
     return 0;
 }
+#else
+/* Non-Windows: TLS not yet implemented (would use OpenSSL/mbedTLS). */
+int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) { (void)host_val;(void)port_val; return 0; }
+int64_t nova_rt_tls_listen(int64_t a, int64_t b, int64_t c) { (void)a;(void)b;(void)c; return 0; }
+int64_t nova_rt_tls_accept(int64_t a) { (void)a; return 0; }
+int64_t nova_rt_tls_send(int64_t a, int64_t b) { (void)a;(void)b; return 0; }
+int64_t nova_rt_tls_recv(int64_t a, int64_t b) { (void)a;(void)b; return nova_rt_create_string((void*)""); }
+int64_t nova_rt_tls_close(int64_t a) { (void)a; return 0; }
+#endif
 
 /* ── WebSocket (RFC 6455) — real handshake + framing ──────────────────────── */
 
