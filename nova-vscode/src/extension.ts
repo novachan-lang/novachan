@@ -5,24 +5,27 @@ import { LanguageClient, LanguageClientOptions, ServerOptions, TransportKind } f
 let client: LanguageClient | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
-    const config = vscode.workspace.getConfiguration('nova.lsp');
-    let serverPath = config.get<string>('path', '');
+    const config = vscode.workspace.getConfiguration('nova');
 
+    // Resolve LSP server binary
+    let serverPath = config.get<string>('lsp.path', '');
     if (!serverPath) {
-        const candidates = [
-            path.join(context.extensionPath, 'bin', 'nova-lsp.exe'),
-            path.join(context.extensionPath, 'bin', 'nova-lsp'),
-            'nova-lsp'
-        ];
-        for (const c of candidates) {
-            serverPath = c;
-            break;
-        }
+        const isWin = process.platform === 'win32';
+        const ext = isWin ? '.exe' : '';
+        serverPath = path.join(context.extensionPath, 'bin', `nova-lsp${ext}`);
+    }
+
+    // Resolve compiler binary — passed as arg[1] to the LSP server
+    let compilerPath = config.get<string>('compiler.path', '');
+    if (!compilerPath) {
+        const isWin = process.platform === 'win32';
+        const ext = isWin ? '.exe' : '';
+        compilerPath = path.join(context.extensionPath, 'bin', `nova-compiler${ext}`);
     }
 
     const serverOptions: ServerOptions = {
         command: serverPath,
-        args: [],
+        args: [compilerPath],
         transport: TransportKind.stdio
     };
 

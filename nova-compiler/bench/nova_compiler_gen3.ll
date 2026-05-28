@@ -1,0 +1,2 @@
+﻿Compiled (IR): test_programs\nova_compiler.nova -> test_programs\nova_compiler.ll
+

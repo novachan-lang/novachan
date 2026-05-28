@@ -1,0 +1,565 @@
+// NOVA Language Server (LSP) — minimal server that talks JSON-RPC over
+// stdin/stdout to IDEs like VS Code. On every textDocument/didOpen and
+// didChange, it shells out to the compiler, captures errors, and sends
+// publishDiagnostics back.
+
+// ── Logging to stderr (so it doesn't corrupt the JSON-RPC stream) ───────────
+
+fn log_msg(s: string)
+    write_raw(s + "\n")
+
+// ── JSON helpers (manual, since json_stringify doesn't know our shapes) ─────
+
+fn json_str(s: string) -> string
+    let q = chr(34)
+    let out = q
+    let i = 0
+    while i < len(s)
+        let c = s[i]
+        let co = ord(c)
+        if c == q
+            out = out + "\\" + q
+        else if c == "\\"
+            out = out + "\\\\"
+        else if co == 10
+            out = out + "\\n"
+        else if co == 13
+            out = out + "\\r"
+        else if co == 9
+            out = out + "\\t"
+        else if co < 32
+            out = out + "\\u00" + chr(48 + (co / 16)) + chr(48 + (co - (co / 16) * 16))
+        else
+            out = out + c
+        i = i + 1
+    out + q
+
+fn json_int(n: int) -> string
+    str(n)
+
+// ── Read an LSP message from stdin ──────────────────────────────────────────
+
+fn read_header_line() -> string
+    let line = ""
+    let done = 0
+    let eof = 0
+    while done == 0
+        let c = stdin_read_n(1)
+        if len(c) == 0
+            done = 1
+            eof = 1
+        else if c == "\n"
+            done = 1
+        else if c == "\r"
+            line = line
+        else
+            line = line + c
+    if eof == 1
+        return ""
+    return line
+
+fn read_message() -> string
+    let content_length = 0
+    let done = 0
+    let result = ""
+    while done == 0
+        let hdr = read_header_line()
+        if len(hdr) == 0
+            if content_length == 0
+                done = 1
+            else
+                result = stdin_read_n(content_length)
+                done = 1
+        else
+            let cl_pos = find(lower(hdr), "content-length:")
+            if cl_pos == 0
+                let colon = find(hdr, ":")
+                if colon >= 0
+                    content_length = parse_int(trim(slice(hdr, colon + 1, len(hdr))))
+    return result
+
+// ── Write an LSP message to stdout ──────────────────────────────────────────
+
+fn send_message(body: string)
+    let body_len = len(body)
+    log_msg("[nova-lsp] send_message len=" + str(body_len))
+    let framed = "Content-Length: " + str(body_len) + "\r\n\r\n" + body
+    stdout_write(framed)
+    log_msg("[nova-lsp] send_message done")
+
+// ── JSON-RPC response building ──────────────────────────────────────────────
+
+fn build_response(id: int, result_json: string) -> string
+    "\{\"jsonrpc\":\"2.0\",\"id\":" + str(id) + ",\"result\":" + result_json + "\}"
+
+fn build_notification(method: string, params_json: string) -> string
+    "\{\"jsonrpc\":\"2.0\",\"method\":" + json_str(method) + ",\"params\":" + params_json + "\}"
+
+// ── Naive JSON value extraction (good enough for known LSP shapes) ──────────
+
+fn json_extract_int(json: string, key: string) -> int
+    let needle = json_str(key) + ":"
+    let pos = find(json, needle)
+    if pos < 0
+        return -1
+    let start = pos + len(needle)
+    while start < len(json) and (json[start] == " " or json[start] == "\t")
+        start = start + 1
+    let end = start
+    while end < len(json)
+        let c = json[end]
+        if c == "," or c == "}" or c == "]" or c == " " or c == "\n" or c == "\r"
+            break
+        end = end + 1
+    parse_int(slice(json, start, end))
+
+fn json_extract_string(json: string, key: string) -> string
+    let needle = json_str(key) + ":"
+    let pos = find(json, needle)
+    if pos < 0
+        return ""
+    let q = chr(34)
+    let qpos = -1
+    let i = pos + len(needle)
+    while i < len(json)
+        if json[i] == q
+            qpos = i
+            i = len(json)
+        else
+            i = i + 1
+    if qpos < 0
+        return ""
+    let start = qpos + 1
+    let out = ""
+    let j = start
+    while j < len(json)
+        let c = json[j]
+        if c == "\\" and j + 1 < len(json)
+            let nc = json[j + 1]
+            if nc == "n"
+                out = out + "\n"
+            else if nc == "r"
+                out = out + "\r"
+            else if nc == "t"
+                out = out + "\t"
+            else if nc == q
+                out = out + q
+            else if nc == "\\"
+                out = out + "\\"
+            else
+                out = out + nc
+            j = j + 2
+        else if c == q
+            return out
+        else
+            out = out + c
+            j = j + 1
+    out
+
+// ── Compile a file and parse the compiler's error output for diagnostics ────
+
+type Diagnostic
+    line: int
+    severity: int
+    message: string
+
+fn parse_errors(compiler_output: string) -> list
+    let diagnostics = []
+    let lines = split(compiler_output, "\n")
+    let i = 0
+    let cur_line = -1
+    let cur_msg = ""
+    while i < len(lines)
+        let line = lines[i]
+        let err_pos = find(line, "error[")
+        if err_pos >= 0
+            let colon = find(line, "]:")
+            if colon > err_pos
+                cur_msg = trim(slice(line, colon + 2, len(line)))
+        else if find(line, "--> ") >= 0
+            let arrow = find(line, "--> ")
+            let rest = slice(line, arrow + 4, len(line))
+            let colon = find(rest, ":")
+            if colon > 0
+                let after = slice(rest, colon + 1, len(rest))
+                let next_colon = find(after, ":")
+                let line_str = after
+                if next_colon > 0
+                    line_str = slice(after, 0, next_colon)
+                cur_line = parse_int(line_str)
+                if cur_line > 0 and len(cur_msg) > 0
+                    push(diagnostics, Diagnostic(cur_line - 1, 1, cur_msg))
+                    cur_line = -1
+                    cur_msg = ""
+        i = i + 1
+    diagnostics
+
+fn run_compile_for_uri(uri: string, content: string, compiler: string) -> list
+    let check_path = "__lsp_check__.nova"
+    write_file(check_path, content)
+    let q = chr(34)
+    let output = exec(q + compiler + q + " " + check_path)
+    parse_errors(output)
+
+fn diag_to_json(d: Diagnostic) -> string
+    match d
+        Diagnostic(line_no, sev, msg) =>
+            "\{\"range\":\{\"start\":\{\"line\":" + str(line_no) + ",\"character\":0\},\"end\":\{\"line\":" + str(line_no) + ",\"character\":120\}\},\"severity\":" + str(sev) + ",\"source\":\"nova\",\"message\":" + json_str(msg) + "\}"
+
+fn diags_to_array(ds: list) -> string
+    let out = "["
+    let i = 0
+    for d in ds
+        if i > 0
+            out = out + ","
+        out = out + diag_to_json(d)
+        i = i + 1
+    out + "]"
+
+fn publish_diagnostics(uri: string, ds: list)
+    let diag_array = diags_to_array(ds)
+    let params = "\{\"uri\":" + json_str(uri) + ",\"diagnostics\":" + diag_array + "\}"
+    send_message(build_notification("textDocument/publishDiagnostics", params))
+
+// ── Capabilities ────────────────────────────────────────────────────────────
+
+fn server_capabilities() -> string
+    let caps = "\{"
+    caps = caps + "\"textDocumentSync\":1,"
+    caps = caps + "\"hoverProvider\":true,"
+    caps = caps + "\"definitionProvider\":true,"
+    caps = caps + "\"completionProvider\":\{\"triggerCharacters\":[\".\"]\},"
+    caps = caps + "\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\}"
+    caps = caps + "\}"
+    let info = "\{\"name\":\"nova-lsp\",\"version\":\"0.1.0\"\}"
+    "\{\"capabilities\":" + caps + ",\"serverInfo\":" + info + "\}"
+
+// ── Document tracking + symbol lookup ──────────────────────────────────────
+
+// We keep the latest content of each open URI so hover/completion don't need
+// to re-read the file. didOpen / didChange refresh this map.
+fn document_set(docs: dict, uri: string, text: string)
+    docs[uri] = text
+
+fn document_get(docs: dict, uri: string) -> string
+    if docs.has(uri)
+        return docs[uri]
+    return ""
+
+// Extract a NOVA identifier at line:character from the given source.
+fn word_at_position(text: string, line_no: int, ch: int) -> string
+    let lines = split(text, "\n")
+    if line_no < 0 or line_no >= len(lines)
+        return ""
+    let line = lines[line_no]
+    if ch < 0 or ch > len(line)
+        return ""
+    let start = ch
+    while start > 0
+        let c = line[start - 1]
+        let co = ord(c)
+        let is_id = 0
+        if co >= 65 and co <= 90
+            is_id = 1
+        if co >= 97 and co <= 122
+            is_id = 1
+        if co >= 48 and co <= 57
+            is_id = 1
+        if c == "_"
+            is_id = 1
+        if is_id == 0
+            start = start
+            break
+        start = start - 1
+    let end_idx = ch
+    while end_idx < len(line)
+        let c = line[end_idx]
+        let co = ord(c)
+        let is_id = 0
+        if co >= 65 and co <= 90
+            is_id = 1
+        if co >= 97 and co <= 122
+            is_id = 1
+        if co >= 48 and co <= 57
+            is_id = 1
+        if c == "_"
+            is_id = 1
+        if is_id == 0
+            end_idx = end_idx
+            break
+        end_idx = end_idx + 1
+    if start >= end_idx
+        return ""
+    slice(line, start, end_idx)
+
+// Lookup table: builtin name -> brief signature/description for hover.
+fn builtin_doc(name: string) -> string
+    if name == "print"
+        return "fn print(x: any) -> unit  --  print a value followed by a newline"
+    if name == "len"
+        return "fn len(x: any) -> int  --  length of a string/list/dict"
+    if name == "str"
+        return "fn str(x: any) -> string  --  convert to string"
+    if name == "int"
+        return "fn int(x: any) -> int  --  convert to int"
+    if name == "float"
+        return "fn float(x: any) -> float  --  convert to float"
+    if name == "push"
+        return "fn push(xs: List<T>, v: T) -> unit  --  append to a list"
+    if name == "map"
+        return "fn map(xs: List<T>, f: T -> U) -> List<U>"
+    if name == "filter"
+        return "fn filter(xs: List<T>, p: T -> bool) -> List<T>"
+    if name == "reduce"
+        return "fn reduce(xs: List<T>, f: (U, T) -> U, init: U) -> U"
+    if name == "sum"
+        return "fn sum(xs: List<int>) -> int"
+    if name == "pmap"
+        return "fn pmap(xs: List<T>, f: T -> U) -> List<U>  --  parallel map"
+    if name == "pfor"
+        return "fn pfor(start: int, end: int, f: int -> unit)  --  parallel for-range"
+    if name == "spawn"
+        return "spawn fn() body  --  run body on a worker thread"
+    if name == "channel"
+        return "fn channel() -> Channel<T>"
+    if name == "send"
+        return "fn send(ch: Channel<T>, v: T) -> unit"
+    if name == "recv"
+        return "fn recv(ch: Channel<T>) -> T"
+    if name == "tensor_zeros"
+        return "fn tensor_zeros(shape: List<int>) -> Tensor"
+    if name == "tensor_matmul"
+        return "fn tensor_matmul(a: Tensor, b: Tensor) -> Tensor"
+    if name == "tensor_relu"
+        return "fn tensor_relu(t: Tensor) -> Tensor"
+    if name == "format"
+        return "fn format(template: string, args...) -> string"
+    if name == "http_listen"
+        return "fn http_listen(port: int) -> int"
+    if name == "tcp_accept"
+        return "fn tcp_accept(server: int) -> int"
+    return ""
+
+fn user_symbol_doc(source: string, name: string) -> string
+    let lines = split(source, "\n")
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        if starts_with(line, "fn " + name + "(") or starts_with(line, "fn " + name + " ") or contains(line, "fn " + name + "<")
+            return line
+        if starts_with(line, "let " + name + " ") or starts_with(line, "let " + name + "=")
+            return line
+        if starts_with(line, "type " + name + " ") or starts_with(line, "type " + name + "<")
+            return line
+        i = i + 1
+    return ""
+
+fn build_hover_response(id: int, doc: string) -> string
+    if len(doc) == 0
+        return build_response(id, "null")
+    let contents = "\{\"kind\":\"markdown\",\"value\":" + json_str("```nova\n" + doc + "\n```") + "\}"
+    build_response(id, "\{\"contents\":" + contents + "\}")
+
+// ── Go-to-definition: find line + column where a symbol is declared ─────────
+// Returns dict with keys: found (0/1), line (int), start_col (int), end_col (int)
+fn find_definition_location(source: string, name: string) -> dict
+    let result = {}
+    result["found"] = 0
+    result["line"] = 0
+    result["start_col"] = 0
+    result["end_col"] = 0
+    if len(name) == 0
+        return result
+    let lines = split(source, "\n")
+    let i = 0
+    while i < len(lines)
+        let raw = lines[i]
+        let line = trim(raw)
+        let prefix = ""
+        if starts_with(line, "fn " + name + "(") or starts_with(line, "fn " + name + " ") or starts_with(line, "fn " + name + "<")
+            prefix = "fn "
+        else if starts_with(line, "let " + name + " ") or starts_with(line, "let " + name + "=") or starts_with(line, "let " + name + ":")
+            prefix = "let "
+        else if starts_with(line, "type " + name + " ") or starts_with(line, "type " + name + "<") or starts_with(line, "type " + name + "\n") or line == ("type " + name)
+            prefix = "type "
+        else if starts_with(line, "enum " + name + " ") or starts_with(line, "enum " + name + "<") or line == ("enum " + name)
+            prefix = "enum "
+        else if starts_with(line, "trait " + name + " ") or starts_with(line, "trait " + name + "<") or line == ("trait " + name)
+            prefix = "trait "
+        if len(prefix) > 0
+            // Find the column of `name` in the raw (un-trimmed) line
+            let lead = 0
+            while lead < len(raw) and (raw[lead] == " " or raw[lead] == "\t")
+                lead = lead + 1
+            let start_col = lead + len(prefix)
+            result["found"] = 1
+            result["line"] = i
+            result["start_col"] = start_col
+            result["end_col"] = start_col + len(name)
+            return result
+        i = i + 1
+    return result
+
+fn build_definition_response(id: int, uri: string, loc: dict) -> string
+    if loc["found"] == 0
+        return build_response(id, "null")
+    let line = loc["line"]
+    let sc = loc["start_col"]
+    let ec = loc["end_col"]
+    let range = "\{\"start\":\{\"line\":" + str(line) + ",\"character\":" + str(sc) + "\},\"end\":\{\"line\":" + str(line) + ",\"character\":" + str(ec) + "\}\}"
+    let location = "\{\"uri\":" + json_str(uri) + ",\"range\":" + range + "\}"
+    build_response(id, location)
+
+// Curated list of completions advertised to the client.
+fn completion_items() -> list
+    let names = ["print", "len", "str", "int", "float", "bool", "type_of", "assert", "exit"]
+    push(names, "push")
+    push(names, "map")
+    push(names, "filter")
+    push(names, "reduce")
+    push(names, "sum")
+    push(names, "sort")
+    push(names, "sort_by")
+    push(names, "reverse")
+    push(names, "any_match")
+    push(names, "all_match")
+    push(names, "enumerate")
+    push(names, "zip")
+    push(names, "flatten")
+    push(names, "index_of")
+    push(names, "split")
+    push(names, "join")
+    push(names, "trim")
+    push(names, "upper")
+    push(names, "lower")
+    push(names, "starts_with")
+    push(names, "ends_with")
+    push(names, "find")
+    push(names, "replace")
+    push(names, "format")
+    push(names, "pmap")
+    push(names, "pfilter")
+    push(names, "pfor")
+    push(names, "cpu_count")
+    push(names, "spawn")
+    push(names, "channel")
+    push(names, "send")
+    push(names, "recv")
+    push(names, "tensor_zeros")
+    push(names, "tensor_from_list")
+    push(names, "tensor_add")
+    push(names, "tensor_mul")
+    push(names, "tensor_matmul")
+    push(names, "tensor_relu")
+    push(names, "tensor_sum")
+    push(names, "http_listen")
+    push(names, "tcp_accept")
+    push(names, "fn")
+    push(names, "let")
+    push(names, "if")
+    push(names, "else")
+    push(names, "while")
+    push(names, "for")
+    push(names, "return")
+    push(names, "match")
+    names
+
+fn build_completion_response(id: int) -> string
+    let items_json = "["
+    let items = completion_items()
+    let i = 0
+    for n in items
+        if i > 0
+            items_json = items_json + ","
+        let doc = builtin_doc(n)
+        items_json = items_json + "\{\"label\":" + json_str(n) + ",\"kind\":3,\"detail\":" + json_str(doc) + "\}"
+        i = i + 1
+    items_json = items_json + "]"
+    build_response(id, "\{\"isIncomplete\":false,\"items\":" + items_json + "\}")
+
+// ── Main dispatch loop ──────────────────────────────────────────────────────
+
+fn handle_message(msg: string, docs: dict, compiler: string) -> int
+    let method = json_extract_string(msg, "method")
+    let id = json_extract_int(msg, "id")
+    log_msg("[nova-lsp] method=" + method + " id=" + str(id))
+
+    if method == "initialize"
+        send_message(build_response(id, server_capabilities()))
+        return 0
+    if method == "initialized"
+        return 0
+    if method == "shutdown"
+        send_message(build_response(id, "null"))
+        return 0
+    if method == "exit"
+        return 1
+    if method == "textDocument/didOpen" or method == "textDocument/didChange"
+        let uri = json_extract_string(msg, "uri")
+        let text = json_extract_string(msg, "text")
+        if len(text) > 0
+            document_set(docs, uri, text)
+            let ds = run_compile_for_uri(uri, text, compiler)
+            publish_diagnostics(uri, ds)
+        return 0
+    if method == "textDocument/didClose"
+        let uri = json_extract_string(msg, "uri")
+        document_set(docs, uri, "")
+        return 0
+    if method == "textDocument/hover"
+        let uri = json_extract_string(msg, "uri")
+        let line_no = json_extract_int(msg, "line")
+        let ch = json_extract_int(msg, "character")
+        let source = document_get(docs, uri)
+        if len(source) == 0
+            send_message(build_hover_response(id, ""))
+            return 0
+        let word = word_at_position(source, line_no, ch)
+        log_msg("[nova-lsp] hover word=" + word)
+        let doc = builtin_doc(word)
+        if len(doc) == 0
+            doc = user_symbol_doc(source, word)
+        send_message(build_hover_response(id, doc))
+        return 0
+    if method == "textDocument/definition"
+        let uri = json_extract_string(msg, "uri")
+        let line_no = json_extract_int(msg, "line")
+        let ch = json_extract_int(msg, "character")
+        let source = document_get(docs, uri)
+        if len(source) == 0
+            send_message(build_definition_response(id, uri, find_definition_location("", "")))
+            return 0
+        let word = word_at_position(source, line_no, ch)
+        log_msg("[nova-lsp] definition word=" + word)
+        let loc = find_definition_location(source, word)
+        send_message(build_definition_response(id, uri, loc))
+        return 0
+    if method == "textDocument/completion"
+        send_message(build_completion_response(id))
+        return 0
+    if method == "textDocument/diagnostic"
+        let uri = json_extract_string(msg, "uri")
+        send_message(build_response(id, "\{\"kind\":\"full\",\"items\":[]\}"))
+        return 0
+    return 0
+
+fn main()
+    log_msg("[nova-lsp] server starting...")
+    let compiler = ".\\gen2_move.exe"
+    let a = args()
+    if len(a) > 1
+        compiler = a[1]
+    log_msg("[nova-lsp] compiler: " + compiler)
+    let docs = {}
+    let running = 1
+    while running == 1
+        let msg = read_message()
+        if len(msg) == 0
+            log_msg("[nova-lsp] stdin closed")
+            running = 0
+        else
+            let should_exit = handle_message(msg, docs, compiler)
+            if should_exit == 1
+                log_msg("[nova-lsp] exit requested")
+                running = 0
+    log_msg("[nova-lsp] server stopped")

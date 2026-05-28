@@ -1,0 +1,4231 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// NOVA Self-Hosting Compiler — Phase 7
+// Compiles NOVA source → LLVM IR text → native binary (via clang)
+//
+// Architecture: Source → Lexer → Parser → LLVM Codegen → .ll file
+// All values are i64 (matching the Kotlin compiler's convention).
+// Links against nova_runtime.c for string/list/dict/IO operations.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Data Types ───────────────────────────────────────────────────────────────
+
+type Token
+    kind: string
+    value: string
+    line: int
+    col: int
+
+type Expr
+    tag: string
+    value: string
+    num: int
+    children: list
+    fields: list
+
+type Stmt
+    tag: string
+    name: string
+    expr: Expr
+    body: list
+    params: list
+    else_body: list
+    annotations: list
+
+type Param
+    name: string
+    type_ann: string
+    default_val: Expr
+
+type ParseResult
+    expr: Expr
+    pos: int
+
+type StmtParseResult
+    stmt: Stmt
+    pos: int
+
+// ── IR Types ─────────────────────────────────────────────────────────────────
+
+type IrType
+    kind: string
+    name: string
+    params: list
+    id: int
+
+type IrInst
+    op: string
+    dest: string
+    type: IrType
+    args: list
+    value: string
+    num: int
+    effect: string
+
+type IrBlock
+    label: string
+    insts: list
+    terminator: IrInst
+
+type IrParam
+    name: string
+    type: IrType
+
+type IrFunction
+    name: string
+    params: list
+    ret_type: IrType
+    blocks: list
+    type_params: list
+    is_extern: int
+
+type IrModule
+    functions: list
+    structs: list
+    globals: list
+    string_constants: list
+
+// ── Lexer ────────────────────────────────────────────────────────────────────
+
+fn is_alpha(ch: string) -> bool
+    let c = ord(ch)
+    (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or ch == "_"
+
+fn is_digit(ch: string) -> bool
+    let c = ord(ch)
+    c >= 48 and c <= 57
+
+fn is_alnum(ch: string) -> bool
+    is_alpha(ch) or is_digit(ch)
+
+fn is_ws(ch: string) -> bool
+    ch == " " or ch == "\t" or ch == "\r"
+
+fn is_keyword(word: string) -> bool
+    (word == "fn" or word == "return" or word == "if" or word == "else" or word == "for" or word == "while" or word == "match" or word == "break" or word == "continue" or word == "type" or word == "enum" or word == "spawn" or word == "send" or word == "receive" or word == "channel" or word == "or" or word == "and" or word == "not" or word == "copy" or word == "import" or word == "true" or word == "false" or word == "null" or word == "in" or word == "as" or word == "select" or word == "try" or word == "catch" or word == "trait" or word == "matches" or word == "yield" or word == "let")
+
+fn tokenize(source: string) -> list
+    let tokens = []
+    let pos = 0
+    let line = 1
+    let col = 1
+    let length = len(source)
+
+    while pos < length
+        let ch = source[pos]
+
+        if ch == "\n"
+            push(tokens, Token("NEWLINE", "\\n", line, col))
+            line = line + 1
+            col = 1
+            pos = pos + 1
+        else if is_ws(ch)
+            while pos < length and is_ws(source[pos])
+                pos = pos + 1
+                col = col + 1
+        else if ch == "/" and pos + 1 < length and source[pos + 1] == "/"
+            while pos < length and source[pos] != "\n"
+                pos = pos + 1
+                col = col + 1
+        else if ch == "@"
+            push(tokens, Token("AT", "@", line, col))
+            pos = pos + 1
+            col = col + 1
+        else if is_alpha(ch)
+            let start_col = col
+            let word = ""
+            while pos < length and is_alnum(source[pos])
+                word = word + source[pos]
+                pos = pos + 1
+                col = col + 1
+            if word == "f" and pos < length and source[pos] == "\""
+                // f-string interpolation: f"text {expr} more text"
+                pos = pos + 1
+                col = col + 1
+                let fstr = ""
+                while pos < length and source[pos] != "\""
+                    if source[pos] == "\\" and pos + 1 < length
+                        let esc = source[pos + 1]
+                        if esc == "\{"
+                            fstr = fstr + "\{"
+                            pos = pos + 2
+                            col = col + 2
+                        else if esc == "\}"
+                            fstr = fstr + "\}"
+                            pos = pos + 2
+                            col = col + 2
+                        else if esc == "n"
+                            fstr = fstr + "\n"
+                            pos = pos + 2
+                            col = col + 2
+                        else if esc == "t"
+                            fstr = fstr + "\t"
+                            pos = pos + 2
+                            col = col + 2
+                        else if esc == "r"
+                            fstr = fstr + "\r"
+                            pos = pos + 2
+                            col = col + 2
+                        else if esc == "\\"
+                            fstr = fstr + "\\"
+                            pos = pos + 2
+                            col = col + 2
+                        else if esc == "\""
+                            fstr = fstr + "\""
+                            pos = pos + 2
+                            col = col + 2
+                        else
+                            fstr = fstr + source[pos]
+                            pos = pos + 1
+                            col = col + 1
+                    else if source[pos] == "\{"
+                        push(tokens, Token("INTERP_START", fstr, line, start_col))
+                        fstr = ""
+                        pos = pos + 1
+                        col = col + 1
+                        let depth = 1
+                        let interp_src = ""
+                        while pos < length and depth > 0
+                            if source[pos] == "\{"
+                                depth = depth + 1
+                                interp_src = interp_src + source[pos]
+                            else if source[pos] == "\}"
+                                depth = depth - 1
+                                if depth > 0
+                                    interp_src = interp_src + source[pos]
+                            else if source[pos] == "\\" and pos + 1 < length and source[pos + 1] == "\""
+                                interp_src = interp_src + "\""
+                                pos = pos + 1
+                                col = col + 1
+                            else
+                                interp_src = interp_src + source[pos]
+                            if depth > 0
+                                pos = pos + 1
+                                col = col + 1
+                        pos = pos + 1
+                        col = col + 1
+                        let inner_tokens = tokenize(interp_src)
+                        for itk in inner_tokens
+                            match itk
+                                Token(ik, iv, il, ic) =>
+                                    if ik != "EOF"
+                                        push(tokens, Token(ik, iv, line, ic))
+                        push(tokens, Token("INTERP_MID", "", line, col))
+                    else
+                        fstr = fstr + source[pos]
+                        pos = pos + 1
+                        col = col + 1
+                if pos < length
+                    pos = pos + 1
+                    col = col + 1
+                let did_interp = false
+                if len(tokens) > 0
+                    let last_tok = tokens[len(tokens) - 1]
+                    match last_tok
+                        Token(lk, lv, ll, lc) =>
+                            if lk == "INTERP_MID"
+                                tokens[len(tokens) - 1] = Token("INTERP_END", fstr, line, col)
+                                did_interp = true
+                if not did_interp
+                    push(tokens, Token("STR", fstr, line, start_col))
+            else if is_keyword(word)
+                push(tokens, Token("KW", word, line, start_col))
+            else
+                push(tokens, Token("IDENT", word, line, start_col))
+        else if is_digit(ch)
+            let start_col = col
+            let num = ""
+            let is_float = false
+            while pos < length and (is_digit(source[pos]) or source[pos] == "." or source[pos] == "_" or source[pos] == "e" or source[pos] == "E")
+                if source[pos] == "." or source[pos] == "e" or source[pos] == "E"
+                    is_float = true
+                if source[pos] != "_"
+                    num = num + source[pos]
+                pos = pos + 1
+                col = col + 1
+            if is_float
+                push(tokens, Token("FLOAT", num, line, start_col))
+            else
+                push(tokens, Token("INT", num, line, start_col))
+        else if ch == "\""
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            let fstr = ""
+            while pos < length and source[pos] != "\""
+                if source[pos] == "\\" and pos + 1 < length
+                    let esc = source[pos + 1]
+                    if esc == "\{"
+                        fstr = fstr + "\{"
+                        pos = pos + 2
+                        col = col + 2
+                    else if esc == "\}"
+                        fstr = fstr + "\}"
+                        pos = pos + 2
+                        col = col + 2
+                    else if esc == "n"
+                        fstr = fstr + "\n"
+                        pos = pos + 2
+                        col = col + 2
+                    else if esc == "t"
+                        fstr = fstr + "\t"
+                        pos = pos + 2
+                        col = col + 2
+                    else if esc == "r"
+                        fstr = fstr + "\r"
+                        pos = pos + 2
+                        col = col + 2
+                    else if esc == "\\"
+                        fstr = fstr + "\\"
+                        pos = pos + 2
+                        col = col + 2
+                    else if esc == "\""
+                        fstr = fstr + "\""
+                        pos = pos + 2
+                        col = col + 2
+                    else if esc == "0"
+                        fstr = fstr + "\0"
+                        pos = pos + 2
+                        col = col + 2
+                    else
+                        fstr = fstr + source[pos]
+                        pos = pos + 1
+                        col = col + 1
+                else if source[pos] == "\{"
+                    push(tokens, Token("INTERP_START", fstr, line, start_col))
+                    fstr = ""
+                    pos = pos + 1
+                    col = col + 1
+                    let depth = 1
+                    let interp_src = ""
+                    while pos < length and depth > 0
+                        if source[pos] == "\{"
+                            depth = depth + 1
+                            interp_src = interp_src + source[pos]
+                        else if source[pos] == "\}"
+                            depth = depth - 1
+                            if depth > 0
+                                interp_src = interp_src + source[pos]
+                        else if source[pos] == "\\" and pos + 1 < length and source[pos + 1] == "\""
+                            interp_src = interp_src + "\""
+                            pos = pos + 1
+                            col = col + 1
+                        else
+                            interp_src = interp_src + source[pos]
+                        if depth > 0
+                            pos = pos + 1
+                            col = col + 1
+                    pos = pos + 1
+                    col = col + 1
+                    let inner_tokens = tokenize(interp_src)
+                    for itk in inner_tokens
+                        match itk
+                            Token(ik, iv, il, ic) =>
+                                if ik != "EOF"
+                                    push(tokens, Token(ik, iv, line, ic))
+                    push(tokens, Token("INTERP_MID", "", line, col))
+                else
+                    fstr = fstr + source[pos]
+                    pos = pos + 1
+                    col = col + 1
+            if pos < length
+                pos = pos + 1
+                col = col + 1
+            let did_interp = false
+            if len(tokens) > 0
+                let last_tok = tokens[len(tokens) - 1]
+                match last_tok
+                    Token(lk, lv, ll, lc) =>
+                        if lk == "INTERP_MID"
+                            tokens[len(tokens) - 1] = Token("INTERP_END", fstr, line, col)
+                            did_interp = true
+            if not did_interp
+                push(tokens, Token("STR", fstr, line, start_col))
+        else if ch == "`"
+            let start_col = col
+            pos = pos + 1
+            col = col + 1
+            let raw = ""
+            while pos < length and source[pos] != "`"
+                raw = raw + source[pos]
+                pos = pos + 1
+                col = col + 1
+            if pos < length
+                pos = pos + 1
+                col = col + 1
+            push(tokens, Token("RAW_STR", raw, line, start_col))
+        else if ch == "(" or ch == ")" or ch == "[" or ch == "]" or ch == "\{" or ch == "\}"
+            push(tokens, Token("DELIM", ch, line, col))
+            pos = pos + 1
+            col = col + 1
+        else if ch == ","
+            push(tokens, Token("COMMA", ",", line, col))
+            pos = pos + 1
+            col = col + 1
+        else if ch == ":"
+            push(tokens, Token("COLON", ":", line, col))
+            pos = pos + 1
+            col = col + 1
+        else if ch == "."
+            if pos + 1 < length and source[pos + 1] == "."
+                push(tokens, Token("DOTDOT", "..", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("DOT", ".", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "+"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "+=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "+", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "-"
+            if pos + 1 < length and source[pos + 1] == ">"
+                push(tokens, Token("ARROW", "->", line, col))
+                pos = pos + 2
+                col = col + 2
+            else if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "-=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "-", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "*"
+            if pos + 1 < length and source[pos + 1] == "*"
+                push(tokens, Token("OP", "**", line, col))
+                pos = pos + 2
+                col = col + 2
+            else if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "*=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "*", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "/"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "/=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "/", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "%"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "%=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "%", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "="
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "==", line, col))
+                pos = pos + 2
+                col = col + 2
+            else if pos + 1 < length and source[pos + 1] == ">"
+                push(tokens, Token("FAT_ARROW", "=>", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("ASSIGN", "=", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "!"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "!=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "!", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "<"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", "<=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else if pos + 1 < length and source[pos + 1] == "<"
+                push(tokens, Token("OP", "<<", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "<", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == ">"
+            if pos + 1 < length and source[pos + 1] == "="
+                push(tokens, Token("OP", ">=", line, col))
+                pos = pos + 2
+                col = col + 2
+            else if pos + 1 < length and source[pos + 1] == ">"
+                push(tokens, Token("OP", ">>", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", ">", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "&"
+            push(tokens, Token("OP", "&", line, col))
+            pos = pos + 1
+            col = col + 1
+        else if ch == "|"
+            if pos + 1 < length and source[pos + 1] == ">"
+                push(tokens, Token("PIPE_GT", "|>", line, col))
+                pos = pos + 2
+                col = col + 2
+            else
+                push(tokens, Token("OP", "|", line, col))
+                pos = pos + 1
+                col = col + 1
+        else if ch == "^"
+            push(tokens, Token("OP", "^", line, col))
+            pos = pos + 1
+            col = col + 1
+        else if ch == "~"
+            push(tokens, Token("OP", "~", line, col))
+            pos = pos + 1
+            col = col + 1
+        else if ch == "?"
+            push(tokens, Token("QUESTION", "?", line, col))
+            pos = pos + 1
+            col = col + 1
+        else
+            pos = pos + 1
+            col = col + 1
+
+    push(tokens, Token("EOF", "", line, col))
+    tokens
+
+// ── Parser Utilities ─────────────────────────────────────────────────────────
+
+fn tok_at(tokens: list, pos: int) -> Token
+    tokens[pos]
+
+fn tk(tokens: list, pos: int) -> string
+    match tokens[pos]
+        Token(kind, value, line, col) => kind
+
+fn tv(tokens: list, pos: int) -> string
+    match tokens[pos]
+        Token(kind, value, line, col) => value
+
+fn skip_nl(tokens: list, pos: int) -> int
+    while tk(tokens, pos) == "NEWLINE"
+        pos = pos + 1
+    pos
+
+fn tok_line(tokens: list, pos: int) -> int
+    match tokens[pos]
+        Token(kind, value, line, col) => line
+
+fn tok_col(tokens: list, pos: int) -> int
+    match tokens[pos]
+        Token(kind, value, line, col) => col
+
+fn expect(tokens: list, pos: int, expected_val: string) -> int
+    assert(tv(tokens, pos) == expected_val, "expected '" + expected_val + "' got '" + tv(tokens, pos) + "' at line " + str(tok_line(tokens, pos)))
+    pos + 1
+
+// ── Operator Precedence (Pratt Parser) ───────────────────────────────────────
+
+fn prefix_bp(op: string) -> int
+    if op == "-" or op == "not" or op == "~"
+        27
+    else
+        0
+
+fn infix_bp(op: string) -> list
+    if op == "catch"
+        [2, 3]
+    else if op == "or"
+        [3, 4]
+    else if op == "and"
+        [5, 6]
+    else if op == "|"
+        [7, 8]
+    else if op == "^"
+        [9, 10]
+    else if op == "&"
+        [11, 12]
+    else if op == "==" or op == "!=" or op == "matches"
+        [13, 14]
+    else if op == "<" or op == ">" or op == "<=" or op == ">=" or op == "in"
+        [15, 16]
+    else if op == "<<" or op == ">>"
+        [17, 18]
+    else if op == "+" or op == "-"
+        [19, 20]
+    else if op == "*" or op == "/" or op == "%"
+        [21, 22]
+    else if op == "**"
+        [24, 23]
+    else
+        [0, 0]
+
+fn is_infix_op(tokens: list, pos: int) -> bool
+    let kind = tk(tokens, pos)
+    let val = tv(tokens, pos)
+    if kind == "OP"
+        let bp = infix_bp(val)
+        bp[0] > 0
+    else if kind == "KW" and (val == "and" or val == "or" or val == "in" or val == "matches" or val == "catch")
+        true
+    else
+        false
+
+fn get_infix_op(tokens: list, pos: int) -> string
+    tv(tokens, pos)
+
+// ── Expression Parser ────────────────────────────────────────────────────────
+
+fn null_expr() -> Expr
+    Expr("null", "", 0, [], [])
+
+fn parse_expr(tokens: list, pos: int, min_bp: int) -> ParseResult
+    let left_r = parse_prefix(tokens, pos)
+    let left = left_r.expr
+    let cur = left_r.pos
+
+    while cur < len(tokens) and tk(tokens, cur) != "EOF" and tk(tokens, cur) != "NEWLINE"
+        // Check for postfix operations: function call, index, member access
+        if tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "("
+            let call_r = parse_call_args(tokens, cur, left)
+            left = call_r.expr
+            cur = call_r.pos
+        else if tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "["
+            let idx_r = parse_index(tokens, cur, left)
+            left = idx_r.expr
+            cur = idx_r.pos
+        else if tk(tokens, cur) == "DOT"
+            cur = cur + 1
+            let member_name = tv(tokens, cur)
+            cur = cur + 1
+            // Check for method call: obj.method(args)
+            if cur < len(tokens) and tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "("
+                let method_r = parse_call_args(tokens, cur, Expr("member", member_name, 0, [left], []))
+                left = method_r.expr
+                cur = method_r.pos
+            else
+                left = Expr("member", member_name, 0, [left], [])
+        else if tk(tokens, cur) == "FAT_ARROW" and min_bp <= 1
+            // Lambda: left => body (lowest precedence)
+            cur = cur + 1
+            let body_r = parse_expr(tokens, cur, 0)
+            match left
+                Expr(ltag, lval, lnum, lchildren, lfields) =>
+                    if ltag == "ident"
+                        left = Expr("lambda", "", 0, [body_r.expr], [left])
+                    else if ltag == "tuple"
+                        left = Expr("lambda", "", 0, [body_r.expr], lchildren)
+                    else
+                        left = Expr("lambda", "", 0, [body_r.expr], [left])
+            cur = body_r.pos
+        else if is_infix_op(tokens, cur)
+            let op = get_infix_op(tokens, cur)
+            let bp = infix_bp(op)
+            let lbp = bp[0]
+            let rbp = bp[1]
+            if lbp < min_bp
+                break
+            cur = cur + 1
+            if op == "catch"
+                let err_var = tv(tokens, cur)
+                cur = cur + 1
+                let pre_nl = cur
+                cur = skip_nl(tokens, cur)
+                if pre_nl != cur and tk(tokens, cur) != "EOF"
+                    let body_col = tok_col(tokens, cur)
+                    let body_stmts = []
+                    while tk(tokens, cur) != "EOF" and tok_col(tokens, cur) >= body_col
+                        let sr = parse_stmt(tokens, cur)
+                        push(body_stmts, sr.stmt)
+                        cur = skip_nl(tokens, sr.pos)
+                    if len(body_stmts) > 1
+                        left = Expr("catch", err_var, len(body_stmts), [left], body_stmts)
+                    else if len(body_stmts) == 1
+                        match body_stmts[0]
+                            Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns) =>
+                                left = Expr("catch", err_var, 0, [left, sexpr], [])
+                    else
+                        left = Expr("catch", err_var, 0, [left, null_expr()], [])
+                else
+                    let handler_r = parse_expr(tokens, cur, 0)
+                    left = Expr("catch", err_var, 0, [left, handler_r.expr], [])
+                    cur = handler_r.pos
+            else
+                let right_r = parse_expr(tokens, cur, rbp)
+                left = Expr("binop", op, 0, [left, right_r.expr], [])
+                cur = right_r.pos
+        else
+            break
+
+    ParseResult(left, cur)
+
+fn parse_prefix(tokens: list, pos: int) -> ParseResult
+    let kind = tk(tokens, pos)
+    let val = tv(tokens, pos)
+
+    if kind == "INT"
+        ParseResult(Expr("int", val, int(val), [], []), pos + 1)
+    else if kind == "FLOAT"
+        ParseResult(Expr("float", val, 0, [], []), pos + 1)
+    else if kind == "STR"
+        ParseResult(Expr("str", val, 0, [], []), pos + 1)
+    else if kind == "RAW_STR"
+        ParseResult(Expr("str", val, 0, [], []), pos + 1)
+    else if kind == "KW" and val == "true"
+        ParseResult(Expr("bool", "true", 1, [], []), pos + 1)
+    else if kind == "KW" and val == "false"
+        ParseResult(Expr("bool", "false", 0, [], []), pos + 1)
+    else if kind == "KW" and val == "null"
+        ParseResult(Expr("null", "", 0, [], []), pos + 1)
+    else if kind == "IDENT"
+        ParseResult(Expr("ident", val, 0, [], []), pos + 1)
+    else if kind == "OP" and val == "-"
+        let rbp = prefix_bp("-")
+        let operand_r = parse_expr(tokens, pos + 1, rbp)
+        ParseResult(Expr("unary", "-", 0, [operand_r.expr], []), operand_r.pos)
+    else if kind == "KW" and val == "not"
+        let rbp = prefix_bp("not")
+        let operand_r = parse_expr(tokens, pos + 1, rbp)
+        ParseResult(Expr("unary", "not", 0, [operand_r.expr], []), operand_r.pos)
+    else if kind == "OP" and val == "~"
+        let rbp = prefix_bp("~")
+        let operand_r = parse_expr(tokens, pos + 1, rbp)
+        ParseResult(Expr("unary", "~", 0, [operand_r.expr], []), operand_r.pos)
+    else if kind == "DELIM" and val == "("
+        // Grouped expression or tuple
+        let inner_r = parse_expr(tokens, pos + 1, 0)
+        if tk(tokens, inner_r.pos) == "COMMA"
+            // Tuple literal
+            let elements = [inner_r.expr]
+            let p = inner_r.pos
+            while tv(tokens, p) == ","
+                p = p + 1
+                let elem_r = parse_expr(tokens, p, 0)
+                push(elements, elem_r.expr)
+                p = elem_r.pos
+            p = expect(tokens, p, ")")
+            ParseResult(Expr("tuple", "", 0, elements, []), p)
+        else
+            let p2 = expect(tokens, inner_r.pos, ")")
+            ParseResult(inner_r.expr, p2)
+    else if kind == "DELIM" and val == "["
+        // List literal
+        let elements = []
+        let p = pos + 1
+        while tv(tokens, p) != "]"
+            if len(elements) > 0
+                p = expect(tokens, p, ",")
+            let elem_r = parse_expr(tokens, p, 0)
+            push(elements, elem_r.expr)
+            p = elem_r.pos
+        p = expect(tokens, p, "]")
+        ParseResult(Expr("list", "", 0, elements, []), p)
+    else if kind == "DELIM" and val == "\{"
+        // Dict literal
+        let entries = []
+        let p = pos + 1
+        while tv(tokens, p) != "\}"
+            if len(entries) > 0
+                p = expect(tokens, p, ",")
+                if tv(tokens, p) == "\}"
+                    break
+            let key_r = parse_expr(tokens, p, 0)
+            p = expect(tokens, key_r.pos, ":")
+            let val_r = parse_expr(tokens, p, 0)
+            push(entries, Expr("pair", "", 0, [key_r.expr, val_r.expr], []))
+            p = val_r.pos
+        p = expect(tokens, p, "\}")
+        ParseResult(Expr("dict", "", 0, entries, []), p)
+    else if kind == "INTERP_START"
+        // f-string: INTERP_START(prefix) expr INTERP_MID expr ... INTERP_END(suffix)
+        let parts = []
+        push(parts, Expr("str", val, 0, [], []))
+        let p = pos + 1
+        let interp_expr_r = parse_expr(tokens, p, 0)
+        push(parts, interp_expr_r.expr)
+        p = interp_expr_r.pos
+        while p < len(tokens) and tk(tokens, p) == "INTERP_MID"
+            push(parts, Expr("str", tv(tokens, p), 0, [], []))
+            p = p + 1
+            let next_r = parse_expr(tokens, p, 0)
+            push(parts, next_r.expr)
+            p = next_r.pos
+        if p < len(tokens) and tk(tokens, p) == "INTERP_END"
+            push(parts, Expr("str", tv(tokens, p), 0, [], []))
+            p = p + 1
+        ParseResult(Expr("str_interp", "", 0, parts, []), p)
+    else if kind == "KW" and val == "try"
+        let inner_r = parse_expr(tokens, pos + 1, 5)
+        ParseResult(Expr("try", "", 0, [inner_r.expr], []), inner_r.pos)
+    else if kind == "KW" and val == "if"
+        parse_if_expr(tokens, pos)
+    else if kind == "KW" and val == "match"
+        parse_match_expr(tokens, pos)
+    else if kind == "KW" and val == "for"
+        parse_for_expr(tokens, pos)
+    else
+        assert(false, "unexpected token in expression: " + kind + "(" + val + ") at line " + str(tok_line(tokens, pos)))
+        ParseResult(null_expr(), pos)
+
+fn parse_call_args(tokens: list, pos: int, callee: Expr) -> ParseResult
+    let p = pos + 1
+    let args = []
+    while tv(tokens, p) != ")"
+        if len(args) > 0
+            p = expect(tokens, p, ",")
+        let arg_r = parse_expr(tokens, p, 0)
+        push(args, arg_r.expr)
+        p = arg_r.pos
+    p = expect(tokens, p, ")")
+    // Determine call name from callee
+    match callee
+        Expr(tag, value, num, children, fields) =>
+            if tag == "ident"
+                ParseResult(Expr("call", value, 0, args, []), p)
+            else if tag == "member"
+                // Method call: children[0] is receiver
+                let all_args = [children[0]]
+                for a in args
+                    push(all_args, a)
+                ParseResult(Expr("method_call", value, 0, all_args, []), p)
+            else
+                ParseResult(Expr("dyn_call", "", 0, [callee] + args, []), p)
+
+fn parse_index(tokens: list, pos: int, target: Expr) -> ParseResult
+    let p = pos + 1
+    let idx_r = parse_expr(tokens, p, 0)
+    p = expect(tokens, idx_r.pos, "]")
+    ParseResult(Expr("index", "", 0, [target, idx_r.expr], []), p)
+
+fn parse_if_expr(tokens: list, pos: int) -> ParseResult
+    let p = pos + 1
+    let cond_r = parse_expr(tokens, p, 0)
+    let p2 = skip_nl(tokens, cond_r.pos)
+    let then_r = parse_expr(tokens, p2, 0)
+    let p3 = skip_nl(tokens, then_r.pos)
+    if tk(tokens, p3) == "KW" and tv(tokens, p3) == "else"
+        let p4 = skip_nl(tokens, p3 + 1)
+        let else_r = parse_expr(tokens, p4, 0)
+        ParseResult(Expr("if", "", 0, [cond_r.expr, then_r.expr, else_r.expr], []), else_r.pos)
+    else
+        ParseResult(Expr("if", "", 0, [cond_r.expr, then_r.expr], []), p3)
+
+fn parse_match_expr(tokens: list, pos: int) -> ParseResult
+    let p = pos + 1
+    let subject_r = parse_expr(tokens, p, 0)
+    let p2 = skip_nl(tokens, subject_r.pos)
+    let arms = []
+    while tk(tokens, p2) != "EOF" and tk(tokens, p2) != "NEWLINE"
+        // Parse pattern => body
+        let pat_r = parse_pattern(tokens, p2)
+        p2 = skip_nl(tokens, pat_r.pos)
+        p2 = expect(tokens, p2, "=>")
+        p2 = skip_nl(tokens, p2)
+        let body_r = parse_expr(tokens, p2, 0)
+        push(arms, Expr("arm", "", 0, [pat_r.expr, body_r.expr], []))
+        p2 = skip_nl(tokens, body_r.pos)
+    ParseResult(Expr("match", "", 0, [subject_r.expr] + arms, []), p2)
+
+fn parse_pattern(tokens: list, pos: int) -> ParseResult
+    let kind = tk(tokens, pos)
+    let val = tv(tokens, pos)
+    if kind == "IDENT"
+        if pos + 1 < len(tokens) and tv(tokens, pos + 1) == "("
+            // Constructor pattern: Name(field1, field2, ...)
+            let name = val
+            let p = pos + 2
+            let fields = []
+            while tv(tokens, p) != ")"
+                if len(fields) > 0
+                    p = expect(tokens, p, ",")
+                push(fields, Expr("pat_var", tv(tokens, p), 0, [], []))
+                p = p + 1
+            p = expect(tokens, p, ")")
+            ParseResult(Expr("pat_ctor", name, 0, fields, []), p)
+        else if val == "_"
+            ParseResult(Expr("pat_wild", "_", 0, [], []), pos + 1)
+        else
+            ParseResult(Expr("pat_var", val, 0, [], []), pos + 1)
+    else if kind == "INT"
+        ParseResult(Expr("pat_lit", val, int(val), [], []), pos + 1)
+    else if kind == "STR"
+        ParseResult(Expr("pat_str", val, 0, [], []), pos + 1)
+    else
+        ParseResult(Expr("pat_wild", "_", 0, [], []), pos)
+
+fn parse_for_expr(tokens: list, pos: int) -> ParseResult
+    let p = pos + 1
+    let var_name = tv(tokens, p)
+    p = p + 1
+    p = skip_nl(tokens, p)
+    if tk(tokens, p) == "KW" and tv(tokens, p) == "in"
+        p = p + 1
+    let iter_r = parse_expr(tokens, p, 0)
+    let p2 = skip_nl(tokens, iter_r.pos)
+    let body_r = parse_expr(tokens, p2, 0)
+    ParseResult(Expr("for", var_name, 0, [iter_r.expr, body_r.expr], []), body_r.pos)
+
+// ── Statement Parser ─────────────────────────────────────────────────────────
+
+fn parse_block(tokens: list, pos: int) -> StmtParseResult
+    let stmts = []
+    let p = skip_nl(tokens, pos)
+    while tk(tokens, p) != "EOF" and tk(tokens, p) != "KW"
+        let sr = parse_stmt(tokens, p)
+        push(stmts, sr.stmt)
+        p = skip_nl(tokens, sr.pos)
+        // Heuristic: stop block at dedent (no explicit INDENT/DEDENT in this tokenizer)
+        // For now: parse one statement per block-line
+        break
+    StmtParseResult(Stmt("block", "", null_expr(), stmts, [], [], []), p)
+
+fn parse_stmt(tokens: list, pos: int) -> StmtParseResult
+    let kind = tk(tokens, pos)
+    let val = tv(tokens, pos)
+
+    if kind == "AT"
+        // Annotation: @name followed by statement
+        let ann_name = tv(tokens, pos + 1)
+        let p = skip_nl(tokens, pos + 2)
+        let inner_r = parse_stmt(tokens, p)
+        match inner_r.stmt
+            Stmt(tag, name, expr, body, params, else_body, annotations) =>
+                let new_anns = [ann_name]
+                for a in annotations
+                    push(new_anns, a)
+                StmtParseResult(Stmt(tag, name, expr, body, params, else_body, new_anns), inner_r.pos)
+    else if kind == "KW" and val == "fn"
+        parse_fn_decl(tokens, pos)
+    else if kind == "KW" and val == "type"
+        parse_type_decl(tokens, pos)
+    else if kind == "KW" and val == "if"
+        parse_if_stmt(tokens, pos)
+    else if kind == "KW" and val == "while"
+        parse_while_stmt(tokens, pos)
+    else if kind == "KW" and val == "for"
+        parse_for_stmt(tokens, pos)
+    else if kind == "KW" and val == "return"
+        let p = pos + 1
+        if tk(tokens, p) == "NEWLINE" or tk(tokens, p) == "EOF"
+            StmtParseResult(Stmt("return", "", null_expr(), [], [], [], []), p)
+        else
+            let expr_r = parse_expr(tokens, p, 0)
+            StmtParseResult(Stmt("return", "", expr_r.expr, [], [], [], []), expr_r.pos)
+    else if kind == "KW" and val == "yield"
+        let expr_r = parse_expr(tokens, pos + 1, 0)
+        StmtParseResult(Stmt("yield", "", expr_r.expr, [], [], [], []), expr_r.pos)
+    else if kind == "KW" and val == "break"
+        StmtParseResult(Stmt("break", "", null_expr(), [], [], [], []), pos + 1)
+    else if kind == "KW" and val == "continue"
+        StmtParseResult(Stmt("continue", "", null_expr(), [], [], [], []), pos + 1)
+    else if kind == "KW" and val == "import"
+        parse_import_stmt(tokens, pos)
+    else if kind == "KW" and val == "match"
+        parse_match_stmt(tokens, pos)
+    else if kind == "KW" and val == "let"
+        // let name = expr
+        let name = tv(tokens, pos + 1)
+        let p = pos + 2
+        if tk(tokens, p) == "ASSIGN"
+            p = p + 1
+            let expr_r = parse_expr(tokens, p, 0)
+            StmtParseResult(Stmt("assign", name, expr_r.expr, [], [], [], []), expr_r.pos)
+        else
+            StmtParseResult(Stmt("assign", name, null_expr(), [], [], [], []), p)
+    else if kind == "IDENT"
+        // Assignment or expression statement
+        let expr_r = parse_expr(tokens, pos, 0)
+        let p = expr_r.pos
+        if tk(tokens, p) == "ASSIGN"
+            p = p + 1
+            let rhs_r = parse_expr(tokens, p, 0)
+            StmtParseResult(Stmt("assign", "", rhs_r.expr, [], [], [], [expr_r.expr]), rhs_r.pos)
+        else if tk(tokens, p) == "OP" and (tv(tokens, p) == "+=" or tv(tokens, p) == "-=" or tv(tokens, p) == "*=" or tv(tokens, p) == "/=")
+            let op = tv(tokens, p)
+            p = p + 1
+            let rhs_r = parse_expr(tokens, p, 0)
+            StmtParseResult(Stmt("compound_assign", op, rhs_r.expr, [], [], [], [expr_r.expr]), rhs_r.pos)
+        else
+            StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], []), p)
+    else
+        let expr_r = parse_expr(tokens, pos, 0)
+        StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], []), expr_r.pos)
+
+fn parse_fn_decl(tokens: list, pos: int) -> StmtParseResult
+    let p = pos + 1
+    let name = tv(tokens, p)
+    p = p + 1
+    p = expect(tokens, p, "(")
+    let params = []
+    while tv(tokens, p) != ")"
+        if len(params) > 0
+            p = expect(tokens, p, ",")
+        let param_name = tv(tokens, p)
+        p = p + 1
+        let type_ann = ""
+        let default_val = null_expr()
+        if tk(tokens, p) == "COLON"
+            p = p + 1
+            type_ann = tv(tokens, p)
+            p = p + 1
+        if tk(tokens, p) == "ASSIGN"
+            p = p + 1
+            let def_r = parse_expr(tokens, p, 0)
+            default_val = def_r.expr
+            p = def_r.pos
+        push(params, Param(param_name, type_ann, default_val))
+    p = expect(tokens, p, ")")
+    // Skip return type annotation
+    if tk(tokens, p) == "ARROW"
+        p = p + 1
+        // Skip type name
+        while tk(tokens, p) == "IDENT" or tk(tokens, p) == "DELIM"
+            p = p + 1
+    let p2 = skip_nl(tokens, p)
+    // Parse body as multiple statements until next top-level statement
+    let body = []
+    while tk(tokens, p2) != "EOF"
+        let cur_tok = tokens[p2]
+        match cur_tok
+            Token(k, v, line, col) =>
+                if col <= 1
+                    break
+        let sr = parse_stmt(tokens, p2)
+        push(body, sr.stmt)
+        p2 = skip_nl(tokens, sr.pos)
+    StmtParseResult(Stmt("fn", name, null_expr(), body, params, [], []), p2)
+
+fn parse_type_decl(tokens: list, pos: int) -> StmtParseResult
+    let p = pos + 1
+    let name = tv(tokens, p)
+    p = p + 1
+    let p2 = skip_nl(tokens, p)
+    let fields = []
+    // Parse fields until next top-level construct
+    while tk(tokens, p2) != "EOF"
+        let cur_tok = tokens[p2]
+        match cur_tok
+            Token(k, v, line, col) =>
+                if col <= 1 and k != "IDENT"
+                    break
+                if col <= 1 and k == "IDENT"
+                    // Check if it looks like a field (name: type)
+                    if p2 + 1 < len(tokens) and tk(tokens, p2 + 1) == "COLON"
+                        // It's a field
+                        let fname = tv(tokens, p2)
+                        p2 = p2 + 2
+                        let ftype = tv(tokens, p2)
+                        p2 = p2 + 1
+                        push(fields, Param(fname, ftype, null_expr()))
+                        p2 = skip_nl(tokens, p2)
+                    else
+                        break
+                else if k == "IDENT"
+                    let fname = tv(tokens, p2)
+                    p2 = p2 + 1
+                    if tk(tokens, p2) == "COLON"
+                        p2 = p2 + 1
+                        let ftype = tv(tokens, p2)
+                        p2 = p2 + 1
+                        push(fields, Param(fname, ftype, null_expr()))
+                    p2 = skip_nl(tokens, p2)
+                else
+                    break
+    StmtParseResult(Stmt("type", name, null_expr(), [], fields, [], []), p2)
+
+fn parse_if_chain(tokens: list, pos: int, base_col: int) -> StmtParseResult
+    let p = pos + 1
+    let cond_r = parse_expr(tokens, p, 0)
+    let p2 = skip_nl(tokens, cond_r.pos)
+    let then_body = []
+    while tk(tokens, p2) != "EOF"
+        if tok_col(tokens, p2) <= base_col
+            break
+        let sr = parse_stmt(tokens, p2)
+        push(then_body, sr.stmt)
+        p2 = skip_nl(tokens, sr.pos)
+    let else_body = []
+    if tk(tokens, p2) == "KW" and tv(tokens, p2) == "else" and tok_col(tokens, p2) == base_col
+        p2 = p2 + 1
+        p2 = skip_nl(tokens, p2)
+        if tk(tokens, p2) == "KW" and tv(tokens, p2) == "if"
+            let nested_r = parse_if_chain(tokens, p2, base_col)
+            push(else_body, nested_r.stmt)
+            p2 = nested_r.pos
+        else
+            while tk(tokens, p2) != "EOF"
+                if tok_col(tokens, p2) <= base_col
+                    break
+                let sr = parse_stmt(tokens, p2)
+                push(else_body, sr.stmt)
+                p2 = skip_nl(tokens, sr.pos)
+    StmtParseResult(Stmt("if", "", cond_r.expr, then_body, [], else_body, []), p2)
+
+fn parse_if_stmt(tokens: list, pos: int) -> StmtParseResult
+    parse_if_chain(tokens, pos, tok_col(tokens, pos))
+
+fn parse_while_stmt(tokens: list, pos: int) -> StmtParseResult
+    let kw_col = tok_col(tokens, pos)
+    let p = pos + 1
+    let cond_r = parse_expr(tokens, p, 0)
+    let p2 = skip_nl(tokens, cond_r.pos)
+    let body = []
+    while tk(tokens, p2) != "EOF"
+        if tok_col(tokens, p2) <= kw_col
+            break
+        let sr = parse_stmt(tokens, p2)
+        push(body, sr.stmt)
+        p2 = skip_nl(tokens, sr.pos)
+    StmtParseResult(Stmt("while", "", cond_r.expr, body, [], [], []), p2)
+
+fn parse_for_stmt(tokens: list, pos: int) -> StmtParseResult
+    let kw_col = tok_col(tokens, pos)
+    let p = pos + 1
+    let var_name = tv(tokens, p)
+    p = p + 1
+    if tk(tokens, p) == "KW" and tv(tokens, p) == "in"
+        p = p + 1
+    let iter_r = parse_expr(tokens, p, 0)
+    let p2 = skip_nl(tokens, iter_r.pos)
+    let body = []
+    while tk(tokens, p2) != "EOF"
+        if tok_col(tokens, p2) <= kw_col
+            break
+        let sr = parse_stmt(tokens, p2)
+        push(body, sr.stmt)
+        p2 = skip_nl(tokens, sr.pos)
+    StmtParseResult(Stmt("for", var_name, iter_r.expr, body, [], [], []), p2)
+
+fn parse_match_stmt(tokens: list, pos: int) -> StmtParseResult
+    let kw_col = tok_col(tokens, pos)
+    let p = pos + 1
+    let subject_r = parse_expr(tokens, p, 0)
+    let p2 = skip_nl(tokens, subject_r.pos)
+    let arms = []
+    while tk(tokens, p2) != "EOF"
+        if tok_col(tokens, p2) <= kw_col
+            break
+        let pat_r = parse_pattern(tokens, p2)
+        let arm_col = tok_col(tokens, p2)
+        p2 = pat_r.pos
+        if tk(tokens, p2) == "FAT_ARROW"
+            p2 = p2 + 1
+        p2 = skip_nl(tokens, p2)
+        let arm_body = []
+        while tk(tokens, p2) != "EOF"
+            if tok_col(tokens, p2) <= arm_col
+                break
+            let sr = parse_stmt(tokens, p2)
+            push(arm_body, sr.stmt)
+            p2 = skip_nl(tokens, sr.pos)
+        push(arms, Stmt("arm", "", pat_r.expr, arm_body, [], [], []))
+    StmtParseResult(Stmt("match", "", subject_r.expr, arms, [], [], []), p2)
+
+fn parse_import_stmt(tokens: list, pos: int) -> StmtParseResult
+    let p = pos + 1
+    let module_name = tv(tokens, p)
+    p = p + 1
+    let alias = module_name
+    if tk(tokens, p) == "KW" and tv(tokens, p) == "as"
+        p = p + 1
+        alias = tv(tokens, p)
+        p = p + 1
+    StmtParseResult(Stmt("import", module_name, null_expr(), [], [], [], [alias]), p)
+
+fn parse_program(tokens: list) -> list
+    let stmts = []
+    let pos = skip_nl(tokens, 0)
+    while tk(tokens, pos) != "EOF"
+        let sr = parse_stmt(tokens, pos)
+        push(stmts, sr.stmt)
+        pos = skip_nl(tokens, sr.pos)
+    stmts
+
+// ── LLVM IR Code Generator ───────────────────────────────────────────────────
+
+type CodeGen
+    output: list
+    strings: list
+    str_map: dict
+    reg_count: int
+    label_count: int
+    fn_names: list
+    current_slots: dict
+    current_fn: string
+    struct_defs: dict
+    indent: string
+    loop_hdr: string
+    loop_exit: string
+    field_map: dict
+
+fn new_codegen() -> CodeGen
+    CodeGen([], [], {}, 0, 0, [], {}, "", {}, "  ", "", "", {})
+
+fn fresh_reg(cg: CodeGen) -> string
+    let r = "%r" + str(cg.reg_count)
+    cg.reg_count = cg.reg_count + 1
+    r
+
+fn fresh_tmp(cg: CodeGen) -> string
+    let t = "%t" + str(cg.reg_count)
+    cg.reg_count = cg.reg_count + 1
+    t
+
+fn fresh_label(cg: CodeGen, prefix: string) -> string
+    let l = prefix + str(cg.label_count)
+    cg.label_count = cg.label_count + 1
+    l
+
+fn intern_string(cg: CodeGen, s: string) -> int
+    if contains(cg.str_map, s)
+        return cg.str_map[s]
+    let idx = len(cg.strings)
+    push(cg.strings, s)
+    cg.str_map[s] = idx
+    idx
+
+fn emit(cg: CodeGen, line: string)
+    push(cg.output, line)
+
+fn emit_indent(cg: CodeGen, line: string)
+    push(cg.output, cg.indent + line)
+
+// Get or create a stack slot for a variable
+fn get_slot(cg: CodeGen, name: string) -> string
+    let slots = cg.current_slots
+    if contains(slots, name)
+        return slots[name]
+    let slot = "%slot." + name
+    slots[name] = slot
+    slot
+
+// ── LLVM Codegen: Expressions ────────────────────────────────────────────────
+
+fn codegen_expr(cg: CodeGen, expr: Expr) -> string
+    match expr
+        Expr(tag, value, num, children, fields) =>
+            if tag == "int"
+                str(num)
+            else if tag == "bool"
+                str(num)
+            else if tag == "null"
+                "0"
+            else if tag == "float"
+                let bits = float_bits(value)
+                str(bits)
+            else if tag == "str"
+                let idx = intern_string(cg, value)
+                let r = fresh_reg(cg)
+                let slen = len(value) + 1
+                emit_indent(cg, r + " = getelementptr inbounds [" + str(slen) + " x i8], ptr @.str." + str(idx) + ", i64 0, i64 0")
+                let r2 = fresh_reg(cg)
+                emit_indent(cg, r2 + " = ptrtoint ptr " + r + " to i64")
+                r2
+            else if tag == "str_interp"
+                let acc = ""
+                let si = 0
+                while si < len(children)
+                    let part = children[si]
+                    match part
+                        Expr(ptag, pval, pnum, pch, pf) =>
+                            if ptag == "str"
+                                let sidx = intern_string(cg, pval)
+                                let sr = fresh_reg(cg)
+                                let sl = len(pval) + 1
+                                emit_indent(cg, sr + " = getelementptr inbounds [" + str(sl) + " x i8], ptr @.str." + str(sidx) + ", i64 0, i64 0")
+                                let sr2 = fresh_reg(cg)
+                                emit_indent(cg, sr2 + " = ptrtoint ptr " + sr + " to i64")
+                                if acc == ""
+                                    acc = sr2
+                                else
+                                    let cat = fresh_reg(cg)
+                                    emit_indent(cg, cat + " = call i64 @nova_rt_str_concat(i64 " + acc + ", i64 " + sr2 + ")")
+                                    acc = cat
+                            else
+                                let val_r = codegen_expr(cg, part)
+                                let str_r = fresh_reg(cg)
+                                emit_indent(cg, str_r + " = call i64 @nova_rt_any_to_str(i64 " + val_r + ")")
+                                if acc == ""
+                                    acc = str_r
+                                else
+                                    let cat = fresh_reg(cg)
+                                    emit_indent(cg, cat + " = call i64 @nova_rt_str_concat(i64 " + acc + ", i64 " + str_r + ")")
+                                    acc = cat
+                    si = si + 1
+                if acc == ""
+                    let eidx = intern_string(cg, "")
+                    let er = fresh_reg(cg)
+                    emit_indent(cg, er + " = getelementptr inbounds [1 x i8], ptr @.str." + str(eidx) + ", i64 0, i64 0")
+                    let er2 = fresh_reg(cg)
+                    emit_indent(cg, er2 + " = ptrtoint ptr " + er + " to i64")
+                    er2
+                else
+                    acc
+            else if tag == "ident"
+                let slot = get_slot(cg, value)
+                let r = fresh_reg(cg)
+                emit_indent(cg, r + " = load i64, ptr " + slot + ", align 8")
+                r
+            else if tag == "binop"
+                codegen_binop(cg, value, children[0], children[1])
+            else if tag == "unary"
+                codegen_unary(cg, value, children[0])
+            else if tag == "call"
+                codegen_call(cg, value, children)
+            else if tag == "method_call"
+                codegen_method_call(cg, value, children)
+            else if tag == "index"
+                let target_r = codegen_expr(cg, children[0])
+                let idx_r = codegen_expr(cg, children[1])
+                let r = fresh_reg(cg)
+                emit_indent(cg, r + " = call i64 @nova_rt_index_get(i64 " + target_r + ", i64 " + idx_r + ")")
+                r
+            else if tag == "member"
+                let target_r = codegen_expr(cg, children[0])
+                // Member access: field name is in 'value'
+                // Lookup struct field index from struct_defs
+                let field_idx = get_field_index(cg, value)
+                let r = fresh_reg(cg)
+                let ptr = fresh_tmp(cg)
+                emit_indent(cg, ptr + " = inttoptr i64 " + target_r + " to ptr")
+                let gep = fresh_tmp(cg)
+                emit_indent(cg, gep + " = getelementptr i64, ptr " + ptr + ", i64 " + str(field_idx))
+                emit_indent(cg, r + " = load i64, ptr " + gep + ", align 8")
+                r
+            else if tag == "list"
+                let r = fresh_reg(cg)
+                emit_indent(cg, r + " = call i64 @nova_rt_list_create()")
+                for elem in children
+                    let elem_r = codegen_expr(cg, elem)
+                    let tmp = fresh_tmp(cg)
+                    emit_indent(cg, tmp + " = call i64 @nova_rt_list_append(i64 " + r + ", i64 " + elem_r + ")")
+                r
+            else if tag == "dict"
+                let r = fresh_reg(cg)
+                emit_indent(cg, r + " = call i64 @nova_rt_dict_create()")
+                for entry in children
+                    match entry
+                        Expr(et, ev, en, ec, ef) =>
+                            let key_r = codegen_expr(cg, ec[0])
+                            let val_r = codegen_expr(cg, ec[1])
+                            let tmp = fresh_tmp(cg)
+                            emit_indent(cg, tmp + " = call i64 @nova_rt_dict_set(i64 " + r + ", i64 " + key_r + ", i64 " + val_r + ")")
+                r
+            else if tag == "if"
+                codegen_if_expr(cg, children)
+            else
+                "0"
+
+fn codegen_binop(cg: CodeGen, op: string, left: Expr, right: Expr) -> string
+    let l = codegen_expr(cg, left)
+    let r_val = codegen_expr(cg, right)
+    let result = fresh_reg(cg)
+    if op == "+"
+        emit_indent(cg, result + " = call i64 @nova_rt_add(i64 " + l + ", i64 " + r_val + ")")
+    else if op == "-"
+        emit_indent(cg, result + " = sub i64 " + l + ", " + r_val)
+    else if op == "*"
+        emit_indent(cg, result + " = mul i64 " + l + ", " + r_val)
+    else if op == "/"
+        emit_indent(cg, result + " = sdiv i64 " + l + ", " + r_val)
+    else if op == "%"
+        emit_indent(cg, result + " = srem i64 " + l + ", " + r_val)
+    else if op == "=="
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = call i64 @nova_rt_eq(i64 " + l + ", i64 " + r_val + ")")
+        emit_indent(cg, result + " = and i64 " + cmp + ", 1")
+        // Use result directly (already i64 0 or 1)
+        return cmp
+    else if op == "!="
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = call i64 @nova_rt_neq(i64 " + l + ", i64 " + r_val + ")")
+        return cmp
+    else if op == "<"
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = icmp slt i64 " + l + ", " + r_val)
+        emit_indent(cg, result + " = zext i1 " + cmp + " to i64")
+    else if op == ">"
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = icmp sgt i64 " + l + ", " + r_val)
+        emit_indent(cg, result + " = zext i1 " + cmp + " to i64")
+    else if op == "<="
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = icmp sle i64 " + l + ", " + r_val)
+        emit_indent(cg, result + " = zext i1 " + cmp + " to i64")
+    else if op == ">="
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = icmp sge i64 " + l + ", " + r_val)
+        emit_indent(cg, result + " = zext i1 " + cmp + " to i64")
+    else if op == "and"
+        let lbl_entry = fresh_label(cg, "and_entry")
+        emit_indent(cg, "br label %" + lbl_entry)
+        emit(cg, lbl_entry + ":")
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = icmp ne i64 " + l + ", 0")
+        let lbl_rhs = fresh_label(cg, "and_rhs")
+        let lbl_end = fresh_label(cg, "and_end")
+        emit_indent(cg, "br i1 " + cmp + ", label %" + lbl_rhs + ", label %" + lbl_end)
+        emit(cg, lbl_rhs + ":")
+        let r2 = codegen_expr(cg, right)
+        let lbl_rhs_done = fresh_label(cg, "and_done")
+        emit_indent(cg, "br label %" + lbl_rhs_done)
+        emit(cg, lbl_rhs_done + ":")
+        emit_indent(cg, "br label %" + lbl_end)
+        emit(cg, lbl_end + ":")
+        emit_indent(cg, result + " = phi i64 [0, %" + lbl_entry + "], [" + r2 + ", %" + lbl_rhs_done + "]")
+        return result
+    else if op == "or"
+        let lbl_entry = fresh_label(cg, "or_entry")
+        emit_indent(cg, "br label %" + lbl_entry)
+        emit(cg, lbl_entry + ":")
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = icmp ne i64 " + l + ", 0")
+        let lbl_rhs = fresh_label(cg, "or_rhs")
+        let lbl_end = fresh_label(cg, "or_end")
+        emit_indent(cg, "br i1 " + cmp + ", label %" + lbl_end + ", label %" + lbl_rhs)
+        emit(cg, lbl_rhs + ":")
+        let r2 = codegen_expr(cg, right)
+        let lbl_rhs_done = fresh_label(cg, "or_done")
+        emit_indent(cg, "br label %" + lbl_rhs_done)
+        emit(cg, lbl_rhs_done + ":")
+        emit_indent(cg, "br label %" + lbl_end)
+        emit(cg, lbl_end + ":")
+        emit_indent(cg, result + " = phi i64 [" + l + ", %" + lbl_entry + "], [" + r2 + ", %" + lbl_rhs_done + "]")
+        return result
+    else if op == "<<" or op == ">>" or op == "&" or op == "|" or op == "^"
+        let llvm_op = if op == "<<"
+            "shl"
+        else if op == ">>"
+            "ashr"
+        else if op == "&"
+            "and"
+        else if op == "|"
+            "or"
+        else
+            "xor"
+        emit_indent(cg, result + " = " + llvm_op + " i64 " + l + ", " + r_val)
+    else
+        emit_indent(cg, result + " = add i64 " + l + ", " + r_val)
+    result
+
+fn codegen_unary(cg: CodeGen, op: string, operand: Expr) -> string
+    let val = codegen_expr(cg, operand)
+    let result = fresh_reg(cg)
+    if op == "-"
+        emit_indent(cg, result + " = sub i64 0, " + val)
+    else if op == "not"
+        let cmp = fresh_tmp(cg)
+        emit_indent(cg, cmp + " = icmp eq i64 " + val + ", 0")
+        emit_indent(cg, result + " = zext i1 " + cmp + " to i64")
+    else if op == "~"
+        emit_indent(cg, result + " = xor i64 " + val + ", -1")
+    else
+        return val
+    result
+
+fn codegen_call(cg: CodeGen, name: string, args: list) -> string
+    // Check if this is a struct constructor
+    if contains(cg.struct_defs, name)
+        let num_fields = len(args)
+        let alloc_size = num_fields * 8
+        let ptr = fresh_reg(cg)
+        emit_indent(cg, ptr + " = call ptr @nova_rt_struct_alloc(i64 " + str(alloc_size) + ")")
+        let fi = 0
+        for arg in args
+            let arg_r = codegen_expr(cg, arg)
+            let gep = fresh_tmp(cg)
+            emit_indent(cg, gep + " = getelementptr i64, ptr " + ptr + ", i64 " + str(fi))
+            emit_indent(cg, "store i64 " + arg_r + ", ptr " + gep + ", align 8")
+            fi = fi + 1
+        let result = fresh_reg(cg)
+        emit_indent(cg, result + " = ptrtoint ptr " + ptr + " to i64")
+        return result
+    // Map NOVA stdlib names to runtime functions
+    let rt_name = resolve_runtime_fn(name)
+    let arg_strs = []
+    for arg in args
+        let a = codegen_expr(cg, arg)
+        push(arg_strs, "i64 " + a)
+    let result = fresh_reg(cg)
+    let args_str = join(arg_strs, ", ")
+    emit_indent(cg, result + " = call i64 @" + rt_name + "(" + args_str + ")")
+    result
+
+fn codegen_method_call(cg: CodeGen, method: string, args: list) -> string
+    // args[0] is receiver, rest are method args
+    let rt_name = resolve_method_fn(method)
+    let arg_strs = []
+    for arg in args
+        let a = codegen_expr(cg, arg)
+        push(arg_strs, "i64 " + a)
+    let result = fresh_reg(cg)
+    let args_str = join(arg_strs, ", ")
+    emit_indent(cg, result + " = call i64 @" + rt_name + "(" + args_str + ")")
+    result
+
+fn codegen_if_expr(cg: CodeGen, parts: list) -> string
+    let cond_r = codegen_expr(cg, parts[0])
+    let cmp = fresh_tmp(cg)
+    emit_indent(cg, cmp + " = icmp ne i64 " + cond_r + ", 0")
+    let lbl_then = fresh_label(cg, "if_then")
+    let lbl_else = fresh_label(cg, "if_else")
+    let lbl_merge = fresh_label(cg, "if_merge")
+    emit_indent(cg, "br i1 " + cmp + ", label %" + lbl_then + ", label %" + lbl_else)
+    emit(cg, lbl_then + ":")
+    let then_r = codegen_expr(cg, parts[1])
+    let lbl_then_done = fresh_label(cg, "if_then_done")
+    emit_indent(cg, "br label %" + lbl_then_done)
+    emit(cg, lbl_then_done + ":")
+    emit_indent(cg, "br label %" + lbl_merge)
+    emit(cg, lbl_else + ":")
+    let else_r = if len(parts) > 2
+        codegen_expr(cg, parts[2])
+    else
+        "0"
+    let lbl_else_done = fresh_label(cg, "if_else_done")
+    emit_indent(cg, "br label %" + lbl_else_done)
+    emit(cg, lbl_else_done + ":")
+    emit_indent(cg, "br label %" + lbl_merge)
+    emit(cg, lbl_merge + ":")
+    let result = fresh_reg(cg)
+    emit_indent(cg, result + " = phi i64 [" + then_r + ", %" + lbl_then_done + "], [" + else_r + ", %" + lbl_else_done + "]")
+    result
+
+// ── LLVM Codegen: Statements ─────────────────────────────────────────────────
+
+fn codegen_stmt(cg: CodeGen, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            if tag == "assign"
+                let val_r = codegen_expr(cg, expr)
+                if name != ""
+                    let slot = get_slot(cg, name)
+                    emit_indent(cg, "store i64 " + val_r + ", ptr " + slot + ", align 8")
+                else if len(annotations) > 0
+                    // annotations field used for LHS expression in complex assignment
+                    let lhs = annotations[0]
+                    codegen_assign_target(cg, lhs, val_r)
+            else if tag == "compound_assign"
+                let lhs = annotations[0]
+                let lhs_val = codegen_expr(cg, lhs)
+                let rhs_val = codegen_expr(cg, expr)
+                let result = fresh_reg(cg)
+                if name == "+=" or name == "+"
+                    emit_indent(cg, result + " = call i64 @nova_rt_add(i64 " + lhs_val + ", i64 " + rhs_val + ")")
+                else if name == "-=" or name == "-"
+                    emit_indent(cg, result + " = sub i64 " + lhs_val + ", " + rhs_val)
+                else if name == "*=" or name == "*"
+                    emit_indent(cg, result + " = mul i64 " + lhs_val + ", " + rhs_val)
+                else
+                    emit_indent(cg, result + " = sdiv i64 " + lhs_val + ", " + rhs_val)
+                codegen_assign_target(cg, lhs, result)
+            else if tag == "expr"
+                let _discard = codegen_expr(cg, expr)
+            else if tag == "return"
+                let val_r = codegen_expr(cg, expr)
+                emit_indent(cg, "ret i64 " + val_r)
+            else if tag == "if"
+                codegen_if_stmt(cg, stmt)
+            else if tag == "while"
+                codegen_while_stmt(cg, stmt)
+            else if tag == "for"
+                codegen_for_stmt(cg, stmt)
+            else if tag == "match"
+                codegen_match_stmt(cg, stmt)
+            else if tag == "break"
+                emit_indent(cg, "br label %" + cg.loop_exit)
+            else if tag == "continue"
+                emit_indent(cg, "br label %" + cg.loop_hdr)
+
+fn codegen_assign_target(cg: CodeGen, target: Expr, val_reg: string)
+    match target
+        Expr(tag, value, num, children, fields) =>
+            if tag == "ident"
+                let slot = get_slot(cg, value)
+                emit_indent(cg, "store i64 " + val_reg + ", ptr " + slot + ", align 8")
+            else if tag == "index"
+                let target_r = codegen_expr(cg, children[0])
+                let idx_r = codegen_expr(cg, children[1])
+                let tmp = fresh_tmp(cg)
+                emit_indent(cg, tmp + " = call i64 @nova_rt_index_set(i64 " + target_r + ", i64 " + idx_r + ", i64 " + val_reg + ")")
+            else if tag == "member"
+                let target_r = codegen_expr(cg, children[0])
+                let field_idx = get_field_index(cg, value)
+                let ptr = fresh_tmp(cg)
+                emit_indent(cg, ptr + " = inttoptr i64 " + target_r + " to ptr")
+                let gep = fresh_tmp(cg)
+                emit_indent(cg, gep + " = getelementptr i64, ptr " + ptr + ", i64 " + str(field_idx))
+                emit_indent(cg, "store i64 " + val_reg + ", ptr " + gep + ", align 8")
+
+fn codegen_if_stmt(cg: CodeGen, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            let cond_r = codegen_expr(cg, expr)
+            let cmp = fresh_tmp(cg)
+            emit_indent(cg, cmp + " = icmp ne i64 " + cond_r + ", 0")
+            let lbl_then = fresh_label(cg, "then")
+            let lbl_else = fresh_label(cg, "else")
+            let lbl_merge = fresh_label(cg, "merge")
+            emit_indent(cg, "br i1 " + cmp + ", label %" + lbl_then + ", label %" + lbl_else)
+            emit(cg, lbl_then + ":")
+            for s in body
+                codegen_stmt(cg, s)
+            emit_indent(cg, "br label %" + lbl_merge)
+            emit(cg, lbl_else + ":")
+            for s in else_body
+                codegen_stmt(cg, s)
+            emit_indent(cg, "br label %" + lbl_merge)
+            emit(cg, lbl_merge + ":")
+
+fn codegen_while_stmt(cg: CodeGen, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            let prev_hdr = cg.loop_hdr
+            let prev_exit = cg.loop_exit
+            let lbl_hdr = fresh_label(cg, "while_hdr")
+            let lbl_body = fresh_label(cg, "while_body")
+            let lbl_exit = fresh_label(cg, "while_exit")
+            cg.loop_hdr = lbl_hdr
+            cg.loop_exit = lbl_exit
+            emit_indent(cg, "br label %" + lbl_hdr)
+            emit(cg, lbl_hdr + ":")
+            let cond_r = codegen_expr(cg, expr)
+            let cmp = fresh_tmp(cg)
+            emit_indent(cg, cmp + " = icmp ne i64 " + cond_r + ", 0")
+            emit_indent(cg, "br i1 " + cmp + ", label %" + lbl_body + ", label %" + lbl_exit)
+            emit(cg, lbl_body + ":")
+            for s in body
+                codegen_stmt(cg, s)
+            emit_indent(cg, "br label %" + lbl_hdr)
+            emit(cg, lbl_exit + ":")
+            cg.loop_hdr = prev_hdr
+            cg.loop_exit = prev_exit
+
+fn codegen_for_stmt(cg: CodeGen, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            let prev_hdr = cg.loop_hdr
+            let prev_exit = cg.loop_exit
+            let iter_r = codegen_expr(cg, expr)
+            let len_r = fresh_reg(cg)
+            emit_indent(cg, len_r + " = call i64 @nova_rt_len_any(i64 " + iter_r + ")")
+            let idx_name = "__for_idx_" + str(cg.label_count)
+            let idx_slot = get_slot(cg, idx_name)
+            emit_indent(cg, idx_slot + " = alloca i64, align 8")
+            emit_indent(cg, "store i64 0, ptr " + idx_slot + ", align 8")
+            let lbl_hdr = fresh_label(cg, "for_hdr")
+            let lbl_body = fresh_label(cg, "for_body")
+            let lbl_exit = fresh_label(cg, "for_exit")
+            cg.loop_hdr = lbl_hdr
+            cg.loop_exit = lbl_exit
+            emit_indent(cg, "br label %" + lbl_hdr)
+            emit(cg, lbl_hdr + ":")
+            let idx_r = fresh_reg(cg)
+            emit_indent(cg, idx_r + " = load i64, ptr " + idx_slot + ", align 8")
+            let cmp = fresh_tmp(cg)
+            emit_indent(cg, cmp + " = icmp slt i64 " + idx_r + ", " + len_r)
+            emit_indent(cg, "br i1 " + cmp + ", label %" + lbl_body + ", label %" + lbl_exit)
+            emit(cg, lbl_body + ":")
+            // Load current element
+            let elem_r = fresh_reg(cg)
+            emit_indent(cg, elem_r + " = call i64 @nova_rt_index_get(i64 " + iter_r + ", i64 " + idx_r + ")")
+            let var_slot = get_slot(cg, name)
+            emit_indent(cg, "store i64 " + elem_r + ", ptr " + var_slot + ", align 8")
+            for s in body
+                codegen_stmt(cg, s)
+            // Increment index
+            let new_idx = fresh_reg(cg)
+            let cur_idx = fresh_reg(cg)
+            emit_indent(cg, cur_idx + " = load i64, ptr " + idx_slot + ", align 8")
+            emit_indent(cg, new_idx + " = add i64 " + cur_idx + ", 1")
+            emit_indent(cg, "store i64 " + new_idx + ", ptr " + idx_slot + ", align 8")
+            emit_indent(cg, "br label %" + lbl_hdr)
+            emit(cg, lbl_exit + ":")
+            cg.loop_hdr = prev_hdr
+            cg.loop_exit = prev_exit
+
+fn codegen_match_stmt(cg: CodeGen, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            let subject_r = codegen_expr(cg, expr)
+            // For struct destructuring: load fields into variables
+            for arm in body
+                match arm
+                    Stmt(at, an, pattern, arm_body, ap, ae, aa) =>
+                        match pattern
+                            Expr(pt, pv, pn, pchildren, pf) =>
+                                if pt == "pat_ctor"
+                                    // Destructure: load each field
+                                    let ptr = fresh_tmp(cg)
+                                    emit_indent(cg, ptr + " = inttoptr i64 " + subject_r + " to ptr")
+                                    let fi = 0
+                                    for field_pat in pchildren
+                                        match field_pat
+                                            Expr(fpt, fpv, fpn, fpc, fpf) =>
+                                                if fpv != "_"
+                                                    let gep = fresh_tmp(cg)
+                                                    emit_indent(cg, gep + " = getelementptr i64, ptr " + ptr + ", i64 " + str(fi))
+                                                    let fval = fresh_reg(cg)
+                                                    emit_indent(cg, fval + " = load i64, ptr " + gep + ", align 8")
+                                                    let fslot = get_slot(cg, fpv)
+                                                    emit_indent(cg, "store i64 " + fval + ", ptr " + fslot + ", align 8")
+                                        fi = fi + 1
+                                for s in arm_body
+                                    codegen_stmt(cg, s)
+
+// ── Runtime Function Resolution ──────────────────────────────────────────────
+
+fn resolve_runtime_fn(name: string) -> string
+    if name == "print"
+        "nova_rt_print_any"
+    else if name == "len"
+        "nova_rt_len_any"
+    else if name == "str"
+        "nova_rt_int_to_str"
+    else if name == "int"
+        "nova_rt_parse_int"
+    else if name == "push"
+        "nova_rt_list_append"
+    else if name == "ord"
+        "nova_rt_ord"
+    else if name == "chr"
+        "nova_rt_chr"
+    else if name == "assert"
+        "nova_rt_assert"
+    else if name == "contains"
+        "nova_rt_contains"
+    else if name == "read_file"
+        "nova_rt_read_file"
+    else if name == "write_file"
+        "nova_rt_write_file"
+    else if name == "args"
+        "nova_rt_args"
+    else if name == "exit"
+        "nova_rt_exit"
+    else if name == "split"
+        "nova_rt_split"
+    else if name == "join"
+        "nova_rt_join"
+    else if name == "upper"
+        "nova_rt_upper"
+    else if name == "lower"
+        "nova_rt_lower"
+    else if name == "trim"
+        "nova_rt_trim"
+    else if name == "replace"
+        "nova_rt_replace"
+    else if name == "starts_with"
+        "nova_rt_starts_with"
+    else if name == "ends_with"
+        "nova_rt_ends_with"
+    else if name == "filter"
+        "nova_rt_list_filter"
+    else if name == "map"
+        "nova_rt_list_map"
+    else if name == "float_bits"
+        "nova_rt_float_bits"
+    else if name == "slice"
+        "nova_rt_slice"
+    else if name == "repeat"
+        "nova_rt_repeat"
+    else if name == "chars"
+        "nova_rt_chars"
+    else if name == "time_ms"
+        "nova_rt_time_ms"
+    else if name == "sleep"
+        "nova_rt_sleep_ms"
+    else if name == "clock_ns"
+        "nova_rt_clock_ns"
+    else if name == "type_of"
+        "nova_rt_type_of"
+    else if name == "range"
+        "nova_rt_range"
+    else if name == "sort"
+        "nova_rt_sort"
+    else if name == "keys"
+        "nova_rt_dict_keys"
+    else if name == "values"
+        "nova_rt_dict_values"
+    else if name == "system"
+        "nova_rt_system"
+    else if name == "exec"
+        "nova_rt_exec"
+    else if name == "parse_int"
+        "nova_rt_parse_int"
+    else if name == "parse_float"
+        "nova_rt_parse_float"
+    else if name == "dict_keys"
+        "nova_rt_dict_keys"
+    else if name == "dict_values"
+        "nova_rt_dict_values"
+    else if name == "dict_items"
+        "nova_rt_dict_items"
+    else if name == "any_to_str"
+        "nova_rt_any_to_str"
+    else if name == "read_line"
+        "nova_rt_read_line"
+    else if name == "append_file"
+        "nova_rt_append_file"
+    else if name == "file_exists"
+        "nova_rt_file_exists"
+    else if name == "find"
+        "nova_rt_find"
+    else if name == "list_concat"
+        "nova_rt_list_concat"
+    else if name == "list_reverse"
+        "nova_rt_list_reverse"
+    else if name == "list_sort"
+        "nova_rt_list_sort"
+    else if name == "list_slice"
+        "nova_rt_list_slice"
+    else if name == "http_get"
+        "nova_rt_http_get"
+    else if name == "http_post"
+        "nova_rt_http_post"
+    else if name == "mkdir"
+        "nova_rt_mkdir"
+    else if name == "mkdir_p"
+        "nova_rt_mkdir_p"
+    else if name == "path_join"
+        "nova_rt_path_join"
+    else if name == "path_exists"
+        "nova_rt_path_exists"
+    else if name == "path_parent"
+        "nova_rt_path_parent"
+    else if name == "path_name"
+        "nova_rt_path_name"
+    else if name == "read_bytes"
+        "nova_rt_read_bytes"
+    else if name == "write_raw"
+        "nova_rt_write_raw"
+    else
+        name
+
+fn resolve_method_fn(name: string) -> string
+    "nova_rt_" + name
+
+fn get_field_index(cg: CodeGen, field_name: string) -> int
+    if contains(cg.field_map, field_name)
+        return cg.field_map[field_name]
+    return 0
+
+// ── LLVM Module Emission ─────────────────────────────────────────────────────
+
+fn emit_module_header(cg: CodeGen)
+    emit(cg, "; NOVA Self-Hosted Compiler Output")
+    emit(cg, "target datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"")
+    emit(cg, "")
+    emit(cg, "@__nova_error_flag = thread_local global i64 0")
+    emit(cg, "@__nova_error_msg = thread_local global i64 0")
+    emit(cg, "")
+
+fn emit_runtime_declarations(cg: CodeGen)
+    emit(cg, "; Runtime declarations")
+    emit(cg, "declare i32 @puts(ptr) nounwind")
+    emit(cg, "declare i32 @printf(ptr, ...) nounwind")
+    emit(cg, "declare i64 @nova_rt_list_create() nounwind")
+    emit(cg, "declare i64 @nova_rt_list_append(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_list_get(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_list_len(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dict_create() nounwind")
+    emit(cg, "declare i64 @nova_rt_dict_set(i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dict_get(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dict_contains(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_str_concat(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_int_to_str(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_parse_int(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_len(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_len_any(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_ord(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_chr(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_contains(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_index_get(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_index_set(i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_add(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_eq(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_neq(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_any_to_str(i64) nounwind")
+    emit(cg, "declare void @nova_rt_assert(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_read_file(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_write_file(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_args() nounwind")
+    emit(cg, "declare void @nova_rt_exit(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_split(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_join(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_upper(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_lower(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_trim(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_replace(i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_starts_with(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_ends_with(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_print_any(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_float_bits(i64) nounwind")
+    emit(cg, "declare ptr @nova_rt_struct_alloc(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_slice(i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_repeat(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_chars(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_time_ms() nounwind")
+    emit(cg, "declare i64 @nova_rt_sleep_ms(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_clock_ns() nounwind")
+    emit(cg, "declare i64 @nova_rt_type_of(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_range(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_range_from_to(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_sort(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dict_keys(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dict_values(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_system(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_exec(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_create_string(ptr) nounwind")
+    emit(cg, "declare void @nova_rt_init_args(i64, i64) nounwind")
+    emit(cg, "declare void @nova_rt_cleanup() nounwind")
+    emit(cg, "declare i64 @nova_rt_http_get(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_http_post(i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_mkdir(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_mkdir_p(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_path_join(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_path_exists(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_path_parent(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_path_name(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_read_bytes(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_write_raw(i64) nounwind")
+    emit(cg, "")
+
+fn emit_string_constants(cg: CodeGen)
+    if len(cg.strings) > 0
+        emit(cg, "; String constants")
+        let i = 0
+        for s in cg.strings
+            let escaped = llvm_escape_string(s)
+            let byte_len = len(s) + 1
+            emit(cg, "@.str." + str(i) + " = private unnamed_addr constant [" + str(byte_len) + " x i8] c\"" + escaped + "\\00\"")
+            i = i + 1
+        emit(cg, "")
+
+fn codegen_last_as_return(cg: CodeGen, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            if tag == "expr"
+                let val = codegen_expr(cg, expr)
+                emit_indent(cg, "ret i64 " + val)
+            else if tag == "return"
+                let val_r = codegen_expr(cg, expr)
+                emit_indent(cg, "ret i64 " + val_r)
+            else if tag == "match"
+                let subject_r = codegen_expr(cg, expr)
+                for arm in body
+                    match arm
+                        Stmt(at, an, pattern, arm_body, ap, ae, aa) =>
+                            match pattern
+                                Expr(pt, pv, pn, pchildren, pf) =>
+                                    if pt == "pat_ctor"
+                                        let ptr = fresh_tmp(cg)
+                                        emit_indent(cg, ptr + " = inttoptr i64 " + subject_r + " to ptr")
+                                        let fi = 0
+                                        for field_pat in pchildren
+                                            match field_pat
+                                                Expr(fpt, fpv, fpn, fpc, fpf) =>
+                                                    if fpv != "_"
+                                                        let gep = fresh_tmp(cg)
+                                                        emit_indent(cg, gep + " = getelementptr i64, ptr " + ptr + ", i64 " + str(fi))
+                                                        let fval = fresh_reg(cg)
+                                                        emit_indent(cg, fval + " = load i64, ptr " + gep + ", align 8")
+                                                        let fslot = get_slot(cg, fpv)
+                                                        emit_indent(cg, "store i64 " + fval + ", ptr " + fslot + ", align 8")
+                                            fi = fi + 1
+                                    let arm_len = len(arm_body)
+                                    if arm_len > 0
+                                        let ai = 0
+                                        while ai < arm_len - 1
+                                            codegen_stmt(cg, arm_body[ai])
+                                            ai = ai + 1
+                                        codegen_last_as_return(cg, arm_body[arm_len - 1])
+                                    else
+                                        emit_indent(cg, "ret i64 0")
+            else if tag == "if"
+                let cond_r = codegen_expr(cg, expr)
+                let cmp = fresh_tmp(cg)
+                emit_indent(cg, cmp + " = icmp ne i64 " + cond_r + ", 0")
+                let lbl_then = fresh_label(cg, "ret_then")
+                let lbl_else = fresh_label(cg, "ret_else")
+                emit_indent(cg, "br i1 " + cmp + ", label %" + lbl_then + ", label %" + lbl_else)
+                emit(cg, lbl_then + ":")
+                let then_len = len(body)
+                if then_len > 0
+                    let ti = 0
+                    while ti < then_len - 1
+                        codegen_stmt(cg, body[ti])
+                        ti = ti + 1
+                    codegen_last_as_return(cg, body[then_len - 1])
+                else
+                    emit_indent(cg, "ret i64 0")
+                emit(cg, lbl_else + ":")
+                let else_len = len(else_body)
+                if else_len > 0
+                    let ei = 0
+                    while ei < else_len - 1
+                        codegen_stmt(cg, else_body[ei])
+                        ei = ei + 1
+                    codegen_last_as_return(cg, else_body[else_len - 1])
+                else
+                    emit_indent(cg, "ret i64 0")
+            else
+                codegen_stmt(cg, stmt)
+                emit_indent(cg, "ret i64 0")
+
+fn emit_function(cg: CodeGen, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            cg.current_slots = {}
+            cg.reg_count = 0
+            let param_strs = []
+            let i = 0
+            for p in params
+                match p
+                    Param(pname, ptype, pdefault) =>
+                        push(param_strs, "i64 %p" + str(i))
+                        i = i + 1
+            let params_str = join(param_strs, ", ")
+            emit(cg, "define i64 @" + name + "(" + params_str + ") nounwind \{")
+            emit(cg, "entry:")
+            i = 0
+            for p in params
+                match p
+                    Param(pname, ptype, pdefault) =>
+                        let slot = get_slot(cg, pname)
+                        emit_indent(cg, slot + " = alloca i64, align 8")
+                        emit_indent(cg, "store i64 %p" + str(i) + ", ptr " + slot + ", align 8")
+                        i = i + 1
+            let locals = collect_locals(body)
+            for local_name in locals
+                if not contains(cg.current_slots, local_name)
+                    let slot = get_slot(cg, local_name)
+                    emit_indent(cg, slot + " = alloca i64, align 8")
+                    emit_indent(cg, "store i64 0, ptr " + slot + ", align 8")
+            let body_len = len(body)
+            if body_len > 0
+                let si = 0
+                while si < body_len - 1
+                    codegen_stmt(cg, body[si])
+                    si = si + 1
+                codegen_last_as_return(cg, body[body_len - 1])
+            else
+                emit_indent(cg, "ret i64 0")
+            emit(cg, "}")
+            emit(cg, "")
+
+fn emit_nova_main(cg: CodeGen, stmts: list)
+    cg.current_slots = {}
+    cg.reg_count = 0
+    emit(cg, "define i64 @nova_main() nounwind \{")
+    emit(cg, "entry:")
+    let locals = collect_locals(stmts)
+    for local_name in locals
+        let slot = get_slot(cg, local_name)
+        emit_indent(cg, slot + " = alloca i64, align 8")
+        emit_indent(cg, "store i64 0, ptr " + slot + ", align 8")
+    for s in stmts
+        codegen_stmt(cg, s)
+    if list_contains(cg.fn_names, "nova_user_main")
+        let rn = fresh_reg(cg)
+        emit_indent(cg, rn + " = call i64 @nova_user_main()")
+    emit_indent(cg, "ret i64 0")
+    emit(cg, "}")
+    emit(cg, "")
+
+fn emit_main_entry(cg: CodeGen)
+    emit(cg, "define i32 @main(i32 %argc, ptr %argv) nounwind \{")
+    emit(cg, "entry:")
+    emit_indent(cg, "%argc64 = sext i32 %argc to i64")
+    emit_indent(cg, "%argv64 = ptrtoint ptr %argv to i64")
+    emit_indent(cg, "call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
+    emit_indent(cg, "call i64 @nova_main()")
+    emit_indent(cg, "call void @nova_rt_cleanup()")
+    emit_indent(cg, "ret i32 0")
+    emit(cg, "}")
+
+// ── Utility Functions ────────────────────────────────────────────────────────
+
+fn extract_pattern_names(pattern: Expr) -> list
+    let names = []
+    match pattern
+        Expr(tag, value, num, children, fields) =>
+            if tag == "pat_ctor"
+                for field_pat in children
+                    match field_pat
+                        Expr(ft, fv, fn_val, fc, ff) =>
+                            if fv != "_" and fv != ""
+                                push(names, fv)
+    return names
+
+fn expr_ident_name(e: Expr) -> string
+    match e
+        Expr(tag, value, num, children, fields) =>
+            if tag == "ident"
+                return value
+    return ""
+
+fn collect_locals(stmts: list) -> list
+    let locals = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations) =>
+                if tag == "assign" and name != ""
+                    if not list_contains(locals, name)
+                        push(locals, name)
+                else if tag == "assign" and len(annotations) > 0
+                    let lhs_name = expr_ident_name(annotations[0])
+                    if lhs_name != "" and not list_contains(locals, lhs_name)
+                        push(locals, lhs_name)
+                else if tag == "for"
+                    if not list_contains(locals, name)
+                        push(locals, name)
+                    let sub = collect_locals(body)
+                    for l in sub
+                        if not list_contains(locals, l)
+                            push(locals, l)
+                else if tag == "while" or tag == "if"
+                    let sub = collect_locals(body)
+                    for l in sub
+                        if not list_contains(locals, l)
+                            push(locals, l)
+                    let sub2 = collect_locals(else_body)
+                    for l in sub2
+                        if not list_contains(locals, l)
+                            push(locals, l)
+                else if tag == "match"
+                    for arm in body
+                        match arm
+                            Stmt(at, an, pattern, arm_body, ap, ae, aa) =>
+                                let pat_names = extract_pattern_names(pattern)
+                                for pn in pat_names
+                                    if not list_contains(locals, pn)
+                                        push(locals, pn)
+                                let sub = collect_locals(arm_body)
+                                for l in sub
+                                    if not list_contains(locals, l)
+                                        push(locals, l)
+    locals
+
+fn list_contains(lst: list, item: string) -> bool
+    for x in lst
+        if x == item
+            return true
+    false
+
+// ── Free Variable Analysis (for closures) ──────────────────────────────────
+
+fn collect_free_vars_inner(expr: Expr, bound: list, free: list)
+    match expr
+        Expr(tag, value, num, children, fields) =>
+            if tag == "ident"
+                if not list_contains(bound, value) and not list_contains(free, value)
+                    push(free, value)
+            else if tag == "call"
+                if value != "" and not list_contains(bound, value) and not list_contains(free, value)
+                    push(free, value)
+                for child in children
+                    collect_free_vars_inner(child, bound, free)
+            else if tag == "lambda"
+                let inner_bound = []
+                for b_item in bound
+                    push(inner_bound, b_item)
+                for p in fields
+                    match p
+                        Expr(pt, pv, pn, pc, pf) =>
+                            push(inner_bound, pv)
+                if len(children) > 0
+                    collect_free_vars_inner(children[0], inner_bound, free)
+            else if tag == "for"
+                let inner_bound = []
+                for b_item in bound
+                    push(inner_bound, b_item)
+                push(inner_bound, value)
+                for child in children
+                    collect_free_vars_inner(child, inner_bound, free)
+            else
+                for child in children
+                    collect_free_vars_inner(child, bound, free)
+
+fn filter_captures(free: list, fnames: list, sdefs: dict) -> list
+    let result = []
+    for v in free
+        if not list_contains(fnames, v) and resolve_runtime_fn(v) == v and not contains(sdefs, v)
+            push(result, v)
+    result
+
+// ── Lambda Lifting ──────────────────────────────────────────────────────────
+
+fn ir_lift_lambda(b: IrBuilder, lam_params: list, body: Expr, captures: list) -> string
+    let lname = "__lambda_" + str(b.ir_lamc)
+    let tname = "__tramp_" + str(b.ir_lamc)
+    b.ir_lamc = b.ir_lamc + 1
+
+    // Build param list: captures first, then lambda params
+    let all_params = []
+    for fv in captures
+        push(all_params, Param(fv, "", null_expr()))
+    let lam_pnames = []
+    for p in lam_params
+        match p
+            Expr(pt, pv, pn, pc, pf) =>
+                push(all_params, Param(pv, "", null_expr()))
+                push(lam_pnames, pv)
+
+    // Save builder state
+    let save_insts = b.ir_insts
+    let save_blocks = b.ir_blocks
+    let save_clabel = b.ir_clabel
+    let save_rc = b.ir_rc
+    let save_locals = b.ir_locals
+
+    // Lower as function: body is a single expression → implicit return
+    let body_stmt = Stmt("expr", "", body, [], [], [], [])
+    let fn_stmt = Stmt("fn", lname, null_expr(), [body_stmt], all_params, [], [])
+    let ir_fn = ir_lower_function(b, fn_stmt)
+    push(b.ir_lambdas, ir_fn)
+    push(b.ir_fnames, lname)
+    b.ir_fn_arity[lname] = len(all_params)
+
+    // Record trampoline spec: [tramp_name, target_name, num_captures, num_lambda_params]
+    let spec = [tname, lname, len(captures), len(lam_pnames)]
+    push(b.ir_tramps, spec)
+    push(b.ir_fnames, tname)
+    b.ir_fn_arity[tname] = 1 + len(lam_pnames)
+
+    // Restore builder state
+    b.ir_insts = save_insts
+    b.ir_blocks = save_blocks
+    b.ir_clabel = save_clabel
+    b.ir_rc = save_rc
+    b.ir_locals = save_locals
+
+    tname
+
+fn llvm_escape_string(s: string) -> string
+    let result = ""
+    let i = 0
+    while i < len(s)
+        let ch = s[i]
+        if ch == "\n"
+            result = result + "\\0A"
+        else if ch == "\r"
+            result = result + "\\0D"
+        else if ch == "\t"
+            result = result + "\\09"
+        else if ch == "\0"
+            result = result + "\\00"
+        else if ch == "\\"
+            result = result + "\\\\"
+        else if ch == "\""
+            result = result + "\\22"
+        else
+            result = result + ch
+        i = i + 1
+    result
+
+fn float_bits(s: string) -> int
+    // Convert float string to raw bits (for LLVM double constant)
+    // This is a placeholder — real impl needs double-to-bits conversion
+    0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TYPED IR PIPELINE — AST → IR → LLVM
+// Phase 1: All values typed as "any" (equivalent to existing codegen)
+// Phase 2: Type inference refines IrType.kind → "int", "str", etc.
+//          enabling direct arithmetic, eliminating runtime calls
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn ir_type_int() -> IrType
+    IrType("int", "", [], 0)
+
+fn ir_type_str() -> IrType
+    IrType("str", "", [], 0)
+
+fn ir_type_any() -> IrType
+    IrType("any", "", [], 0)
+
+fn ir_type_void() -> IrType
+    IrType("void", "", [], 0)
+
+fn type_name_hash(name: string) -> int
+    let h = 5381
+    let i = 0
+    while i < len(name)
+        h = h * 33 + ord(name[i])
+        i = i + 1
+    h
+
+// ── IR Builder ───────────────────────────────────────────────────────────────
+
+type IrBuilder
+    ir_insts: list
+    ir_rc: int
+    ir_blocks: list
+    ir_clabel: string
+    ir_slots: dict
+    ir_strlits: list
+    ir_strmap: dict
+    ir_lc: int
+    ir_fnames: list
+    ir_sdefs: dict
+    ir_fmap: dict
+    ir_loop_hdr: string
+    ir_loop_exit: string
+    ir_lambdas: list
+    ir_lamc: int
+    ir_fn_arity: dict
+    ir_locals: dict
+    ir_tramps: list
+    ir_modules: dict
+
+fn new_ir_builder() -> IrBuilder
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {})
+
+fn ir_fresh_reg(b: IrBuilder) -> string
+    let r = "%r" + str(b.ir_rc)
+    b.ir_rc = b.ir_rc + 1
+    r
+
+fn ir_fresh_label(b: IrBuilder, prefix: string) -> string
+    let l = prefix + str(b.ir_lc)
+    b.ir_lc = b.ir_lc + 1
+    l
+
+fn ir_emit_inst(b: IrBuilder, op: string, dest: string, typ: IrType, args: list, value: string, num: int)
+    push(b.ir_insts, IrInst(op, dest, typ, args, value, num, "pure"))
+
+fn ir_emit_side(b: IrBuilder, op: string, dest: string, typ: IrType, args: list, value: string, num: int)
+    push(b.ir_insts, IrInst(op, dest, typ, args, value, num, "side_effect"))
+
+fn ir_finish_block(b: IrBuilder, terminator: IrInst)
+    let block = IrBlock(b.ir_clabel, b.ir_insts, terminator)
+    push(b.ir_blocks, block)
+    b.ir_insts = []
+    b.ir_clabel = ""
+
+fn ir_start_block(b: IrBuilder, label: string)
+    b.ir_clabel = label
+
+// ── AST → IR Lowering ────────────────────────────────────────────────────────
+
+fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
+    match expr
+        Expr(tag, value, num, children, fields) =>
+            if tag == "int"
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "const_int", dest, ir_type_int(), [], str(num), num)
+                return dest
+            else if tag == "str"
+                let dest = ir_fresh_reg(b)
+                if not contains(b.ir_strmap, value)
+                    push(b.ir_strlits, value)
+                    b.ir_strmap[value] = len(b.ir_strlits) - 1
+                ir_emit_inst(b, "const_str", dest, ir_type_str(), [], value, 0)
+                return dest
+            else if tag == "str_interp"
+                let acc = ""
+                let idx = 0
+                while idx < len(children)
+                    let part = children[idx]
+                    match part
+                        Expr(ptag, pval, pnum, pch, pf) =>
+                            if ptag == "str"
+                                let sreg = ir_fresh_reg(b)
+                                if not contains(b.ir_strmap, pval)
+                                    push(b.ir_strlits, pval)
+                                    b.ir_strmap[pval] = len(b.ir_strlits) - 1
+                                ir_emit_inst(b, "const_str", sreg, ir_type_str(), [], pval, 0)
+                                if acc == ""
+                                    acc = sreg
+                                else
+                                    let cat = ir_fresh_reg(b)
+                                    ir_emit_side(b, "call", cat, ir_type_str(), [acc, sreg], "nova_rt_str_concat", 0)
+                                    acc = cat
+                            else
+                                let val_reg = ir_lower_expr(b, part)
+                                let str_reg = ir_fresh_reg(b)
+                                ir_emit_side(b, "call", str_reg, ir_type_str(), [val_reg], "nova_rt_any_to_str", 0)
+                                if acc == ""
+                                    acc = str_reg
+                                else
+                                    let cat = ir_fresh_reg(b)
+                                    ir_emit_side(b, "call", cat, ir_type_str(), [acc, str_reg], "nova_rt_str_concat", 0)
+                                    acc = cat
+                    idx = idx + 1
+                if acc == ""
+                    let dest = ir_fresh_reg(b)
+                    if not contains(b.ir_strmap, "")
+                        push(b.ir_strlits, "")
+                        b.ir_strmap[""] = len(b.ir_strlits) - 1
+                    ir_emit_inst(b, "const_str", dest, ir_type_str(), [], "", 0)
+                    return dest
+                return acc
+            else if tag == "ident"
+                if not contains(b.ir_locals, value) and list_contains(b.ir_fnames, value)
+                    // Function reference: wrap in a closure record (no captures)
+                    let arity = 0
+                    if contains(b.ir_fn_arity, value)
+                        arity = b.ir_fn_arity[value]
+                    let tname = "__fnref_" + value
+                    if not list_contains(b.ir_fnames, tname)
+                        let spec = [tname, value, 0, arity]
+                        push(b.ir_tramps, spec)
+                        push(b.ir_fnames, tname)
+                        b.ir_fn_arity[tname] = 1 + arity
+                    let dest = ir_fresh_reg(b)
+                    ir_emit_inst(b, "make_closure", dest, ir_type_any(), [], tname, 0)
+                    return dest
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "slot_load", dest, ir_type_any(), [], value, 0)
+                return dest
+            else if tag == "bool"
+                let dest = ir_fresh_reg(b)
+                let bv = if value == "true"
+                    1
+                else
+                    0
+                ir_emit_inst(b, "const_int", dest, ir_type_int(), [], str(bv), bv)
+                return dest
+            else if tag == "binop"
+                if value == "and"
+                    let left = ir_lower_expr(b, children[0])
+                    let sc_slot = "__sc_" + str(b.ir_lc)
+                    b.ir_lc = b.ir_lc + 1
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [left], sc_slot, 0)
+                    let rhs_label = ir_fresh_label(b, "and_rhs")
+                    let merge_label = ir_fresh_label(b, "and_merge")
+                    ir_finish_block(b, IrInst("branch", "", ir_type_void(), [left, merge_label], rhs_label, 0, "pure"))
+                    ir_start_block(b, rhs_label)
+                    let right = ir_lower_expr(b, children[1])
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [right], sc_slot, 0)
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], merge_label, 0, "pure"))
+                    ir_start_block(b, merge_label)
+                    let dest = ir_fresh_reg(b)
+                    ir_emit_inst(b, "slot_load", dest, ir_type_any(), [], sc_slot, 0)
+                    return dest
+                else if value == "or"
+                    let left = ir_lower_expr(b, children[0])
+                    let sc_slot = "__sc_" + str(b.ir_lc)
+                    b.ir_lc = b.ir_lc + 1
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [left], sc_slot, 0)
+                    let rhs_label = ir_fresh_label(b, "or_rhs")
+                    let merge_label = ir_fresh_label(b, "or_merge")
+                    ir_finish_block(b, IrInst("branch", "", ir_type_void(), [left, rhs_label], merge_label, 0, "pure"))
+                    ir_start_block(b, rhs_label)
+                    let right = ir_lower_expr(b, children[1])
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [right], sc_slot, 0)
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], merge_label, 0, "pure"))
+                    ir_start_block(b, merge_label)
+                    let dest = ir_fresh_reg(b)
+                    ir_emit_inst(b, "slot_load", dest, ir_type_any(), [], sc_slot, 0)
+                    return dest
+                let left = ir_lower_expr(b, children[0])
+                let right = ir_lower_expr(b, children[1])
+                let dest = ir_fresh_reg(b)
+                if value == "+"
+                    ir_emit_inst(b, "add", dest, ir_type_any(), [left, right], "+", 0)
+                else if value == "-"
+                    ir_emit_inst(b, "sub", dest, ir_type_any(), [left, right], "-", 0)
+                else if value == "*"
+                    ir_emit_inst(b, "mul", dest, ir_type_any(), [left, right], "*", 0)
+                else if value == "/"
+                    ir_emit_inst(b, "div", dest, ir_type_any(), [left, right], "/", 0)
+                else if value == "%"
+                    ir_emit_inst(b, "mod", dest, ir_type_any(), [left, right], "%", 0)
+                else if value == "=="
+                    ir_emit_inst(b, "eq", dest, ir_type_any(), [left, right], "==", 0)
+                else if value == "!="
+                    ir_emit_inst(b, "neq", dest, ir_type_any(), [left, right], "!=", 0)
+                else if value == "<"
+                    ir_emit_inst(b, "lt", dest, ir_type_any(), [left, right], "<", 0)
+                else if value == "<="
+                    ir_emit_inst(b, "le", dest, ir_type_any(), [left, right], "<=", 0)
+                else if value == ">"
+                    ir_emit_inst(b, "gt", dest, ir_type_any(), [left, right], ">", 0)
+                else if value == ">="
+                    ir_emit_inst(b, "ge", dest, ir_type_any(), [left, right], ">=", 0)
+                else if value == "in"
+                    ir_emit_side(b, "call", dest, ir_type_any(), [right, left], "nova_rt_contains", 0)
+                return dest
+            else if tag == "unary"
+                let operand = ir_lower_expr(b, children[0])
+                let dest = ir_fresh_reg(b)
+                if value == "-"
+                    ir_emit_inst(b, "neg", dest, ir_type_any(), [operand], "-", 0)
+                else if value == "not"
+                    ir_emit_inst(b, "not", dest, ir_type_any(), [operand], "not", 0)
+                return dest
+            else if tag == "call"
+                let fn_name = value
+                if fn_name == "main"
+                    fn_name = "nova_user_main"
+                let arg_regs = []
+                for child in children
+                    push(arg_regs, ir_lower_expr(b, child))
+                let dest = ir_fresh_reg(b)
+                if fn_name == "error"
+                    ir_emit_inst(b, "set_error", dest, ir_type_any(), arg_regs, "", 0)
+                    return dest
+                else if contains(b.ir_sdefs, fn_name)
+                    ir_emit_inst(b, "make_struct", dest, ir_type_any(), arg_regs, fn_name, len(arg_regs))
+                else if list_contains(b.ir_fnames, fn_name) or resolve_runtime_fn(fn_name) != fn_name
+                    let rt_name = resolve_runtime_fn(fn_name)
+                    ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, rt_name, 0)
+                else
+                    // Dynamic call: fn_name is a variable holding a closure
+                    let closure_reg = ir_fresh_reg(b)
+                    ir_emit_inst(b, "slot_load", closure_reg, ir_type_any(), [], fn_name, 0)
+                    let call_args = [closure_reg]
+                    for ar in arg_regs
+                        push(call_args, ar)
+                    ir_emit_side(b, "dyn_call", dest, ir_type_any(), call_args, "", len(arg_regs))
+                return dest
+            else if tag == "dyn_call"
+                // Dynamic call: children[0] is callee expression, rest are args
+                let callee_reg = ir_lower_expr(b, children[0])
+                let arg_regs = []
+                let ci = 1
+                while ci < len(children)
+                    push(arg_regs, ir_lower_expr(b, children[ci]))
+                    ci = ci + 1
+                let dest = ir_fresh_reg(b)
+                let call_args = [callee_reg]
+                for ar in arg_regs
+                    push(call_args, ar)
+                ir_emit_side(b, "dyn_call", dest, ir_type_any(), call_args, "", len(arg_regs))
+                return dest
+            else if tag == "lambda"
+                let lam_params = fields
+                let body_expr = children[0]
+                let bound = []
+                for p in lam_params
+                    match p
+                        Expr(pt, pv, pn, pc, pf) =>
+                            push(bound, pv)
+                let free = []
+                collect_free_vars_inner(body_expr, bound, free)
+                let captures = filter_captures(free, b.ir_fnames, b.ir_sdefs)
+                let tramp_name = ir_lift_lambda(b, lam_params, body_expr, captures)
+                let capture_regs = []
+                for cap in captures
+                    let cr = ir_fresh_reg(b)
+                    ir_emit_inst(b, "slot_load", cr, ir_type_any(), [], cap, 0)
+                    push(capture_regs, cr)
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "make_closure", dest, ir_type_any(), capture_regs, tramp_name, len(captures))
+                return dest
+            else if tag == "null"
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "const_int", dest, ir_type_any(), [], "0", 0)
+                return dest
+            else if tag == "float"
+                let bits = float_bits(value)
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "const_int", dest, ir_type_any(), [], str(bits), 0)
+                return dest
+            else if tag == "method" or tag == "method_call"
+                // Check if this is a module-qualified call: module.func(args)
+                // children[0] is the receiver, value is the method name
+                if len(children) > 0
+                    match children[0]
+                        Expr(rtag, rval, rnum, rch, rf) =>
+                            if rtag == "ident" and contains(b.ir_modules, rval)
+                                let mod_fns = b.ir_modules[rval]
+                                if list_contains(mod_fns, value)
+                                    let arg_regs = []
+                                    let ai = 1
+                                    while ai < len(children)
+                                        push(arg_regs, ir_lower_expr(b, children[ai]))
+                                        ai = ai + 1
+                                    let dest = ir_fresh_reg(b)
+                                    ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, value, 0)
+                                    return dest
+                let arg_regs = []
+                for child in children
+                    push(arg_regs, ir_lower_expr(b, child))
+                let dest = ir_fresh_reg(b)
+                let rt_name = resolve_method_fn(value)
+                ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, rt_name, 0)
+                return dest
+            else if tag == "list"
+                let dest = ir_fresh_reg(b)
+                let elem_regs = []
+                for child in children
+                    push(elem_regs, ir_lower_expr(b, child))
+                ir_emit_inst(b, "make_list", dest, ir_type_any(), elem_regs, "", len(children))
+                return dest
+            else if tag == "dict"
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "make_dict", dest, ir_type_any(), [], "", 0)
+                for entry in children
+                    match entry
+                        Expr(et, ev, en, ec, ef) =>
+                            let key_r = ir_lower_expr(b, ec[0])
+                            let val_r = ir_lower_expr(b, ec[1])
+                            ir_emit_side(b, "call", "", ir_type_void(), [dest, key_r, val_r], "nova_rt_dict_set", 0)
+                return dest
+            else if tag == "index"
+                let obj = ir_lower_expr(b, children[0])
+                let idx = ir_lower_expr(b, children[1])
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "index_get", dest, ir_type_any(), [obj, idx], "", 0)
+                return dest
+            else if tag == "field" or tag == "member"
+                let obj = ir_lower_expr(b, children[0])
+                let dest = ir_fresh_reg(b)
+                let fi = get_ir_field_index(b, value)
+                ir_emit_inst(b, "field_get", dest, ir_type_any(), [obj], value, fi)
+                return dest
+            else if tag == "if"
+                let cond = ir_lower_expr(b, children[0])
+                let if_slot = "__ifexpr_" + str(b.ir_lc)
+                b.ir_lc = b.ir_lc + 1
+                let then_label = ir_fresh_label(b, "ife_then")
+                let else_label = ir_fresh_label(b, "ife_else")
+                let merge_label = ir_fresh_label(b, "ife_merge")
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cond, else_label], then_label, 0, "pure"))
+                ir_start_block(b, then_label)
+                let then_val = ir_lower_expr(b, children[1])
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [then_val], if_slot, 0)
+                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], merge_label, 0, "pure"))
+                ir_start_block(b, else_label)
+                if len(children) > 2
+                    let else_val = ir_lower_expr(b, children[2])
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [else_val], if_slot, 0)
+                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], merge_label, 0, "pure"))
+                ir_start_block(b, merge_label)
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "slot_load", dest, ir_type_any(), [], if_slot, 0)
+                return dest
+            else if tag == "try"
+                let inner = ir_lower_expr(b, children[0])
+                let dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "is_error", dest, ir_type_int(), [inner], "", 0)
+                let err_label = ir_fresh_label(b, "try_err")
+                let ok_label = ir_fresh_label(b, "try_ok")
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [dest, ok_label], err_label, 0, "pure"))
+                ir_start_block(b, err_label)
+                ir_emit_inst(b, "raise_error", "", ir_type_void(), [], "", 0)
+                ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+                ir_start_block(b, ok_label)
+                return inner
+            else if tag == "catch"
+                let tried = ir_lower_expr(b, children[0])
+                let catch_slot = "__catch_" + str(b.ir_lc)
+                b.ir_lc = b.ir_lc + 1
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [tried], catch_slot, 0)
+                let err_dest = ir_fresh_reg(b)
+                ir_emit_inst(b, "is_error", err_dest, ir_type_int(), [tried], "", 0)
+                let err_label = ir_fresh_label(b, "catch_err")
+                let ok_label = ir_fresh_label(b, "catch_ok")
+                let merge_label = ir_fresh_label(b, "catch_merge")
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [err_dest, ok_label], err_label, 0, "pure"))
+                ir_start_block(b, err_label)
+                let msg_reg = ir_fresh_reg(b)
+                ir_emit_inst(b, "load_error_msg", msg_reg, ir_type_str(), [], "", 0)
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [msg_reg], value, 0)
+                b.ir_locals[value] = 1
+                let handler_val = ""
+                if num > 0
+                    let ci = 0
+                    while ci < len(fields)
+                        if ci == len(fields) - 1
+                            match fields[ci]
+                                Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns) =>
+                                    handler_val = ir_lower_expr(b, sexpr)
+                        else
+                            ir_lower_stmt(b, fields[ci])
+                        ci = ci + 1
+                else
+                    handler_val = ir_lower_expr(b, children[1])
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [handler_val], catch_slot, 0)
+                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], merge_label, 0, "pure"))
+                ir_start_block(b, ok_label)
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [tried], catch_slot, 0)
+                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], merge_label, 0, "pure"))
+                ir_start_block(b, merge_label)
+                let result = ir_fresh_reg(b)
+                ir_emit_inst(b, "slot_load", result, ir_type_any(), [], catch_slot, 0)
+                return result
+            // Fallback
+            let dest = ir_fresh_reg(b)
+            ir_emit_inst(b, "const_int", dest, ir_type_any(), [], "0", 0)
+            return dest
+
+fn get_ir_field_index(b: IrBuilder, field_name: string) -> int
+    if contains(b.ir_fmap, field_name)
+        return b.ir_fmap[field_name]
+    0
+
+fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            if tag == "expr"
+                ir_lower_expr(b, expr)
+            else if tag == "let"
+                let val = ir_lower_expr(b, expr)
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [val], name, 0)
+                b.ir_locals[name] = 1
+            else if tag == "assign"
+                let val = ir_lower_expr(b, expr)
+                if name != ""
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [val], name, 0)
+                    b.ir_locals[name] = 1
+                else if len(annotations) > 0
+                    ir_lower_assign_target(b, annotations[0], val)
+            else if tag == "return"
+                let val = ir_lower_expr(b, expr)
+                ir_finish_block(b, IrInst("return", "", ir_type_void(), [val], "", 0, "pure"))
+            else if tag == "if"
+                let cond = ir_lower_expr(b, expr)
+                let then_label = ir_fresh_label(b, "then")
+                let else_label = ir_fresh_label(b, "else")
+                let end_label = ir_fresh_label(b, "endif")
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cond, else_label], then_label, 0, "pure"))
+                ir_start_block(b, then_label)
+                for s in body
+                    ir_lower_stmt(b, s)
+                if b.ir_clabel != ""
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], end_label, 0, "pure"))
+                ir_start_block(b, else_label)
+                for s in else_body
+                    ir_lower_stmt(b, s)
+                if b.ir_clabel != ""
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], end_label, 0, "pure"))
+                ir_start_block(b, end_label)
+            else if tag == "while"
+                let hdr_label = ir_fresh_label(b, "while_hdr")
+                let body_label = ir_fresh_label(b, "while_body")
+                let exit_label = ir_fresh_label(b, "while_exit")
+                let save_hdr = b.ir_loop_hdr
+                let save_exit = b.ir_loop_exit
+                b.ir_loop_hdr = hdr_label
+                b.ir_loop_exit = exit_label
+                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], hdr_label, 0, "pure"))
+                ir_start_block(b, hdr_label)
+                let cond = ir_lower_expr(b, expr)
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cond, exit_label], body_label, 0, "pure"))
+                ir_start_block(b, body_label)
+                for s in body
+                    ir_lower_stmt(b, s)
+                if b.ir_clabel != ""
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], hdr_label, 0, "pure"))
+                ir_start_block(b, exit_label)
+                b.ir_loop_hdr = save_hdr
+                b.ir_loop_exit = save_exit
+            else if tag == "for"
+                b.ir_locals[name] = 1
+                let iter_reg = ir_lower_expr(b, expr)
+                let len_reg = ir_fresh_reg(b)
+                ir_emit_side(b, "call", len_reg, ir_type_int(), [iter_reg], "nova_rt_len_any", 0)
+                let idx_slot = "__for_idx_" + str(b.ir_lc)
+                let zero_r = ir_fresh_reg(b)
+                ir_emit_inst(b, "const_int", zero_r, ir_type_int(), [], "0", 0)
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [zero_r], idx_slot, 0)
+                let hdr_label = ir_fresh_label(b, "for_hdr")
+                let body_label = ir_fresh_label(b, "for_body")
+                let exit_label = ir_fresh_label(b, "for_exit")
+                let save_hdr = b.ir_loop_hdr
+                let save_exit = b.ir_loop_exit
+                b.ir_loop_hdr = hdr_label
+                b.ir_loop_exit = exit_label
+                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], hdr_label, 0, "pure"))
+                ir_start_block(b, hdr_label)
+                let idx_r = ir_fresh_reg(b)
+                ir_emit_inst(b, "slot_load", idx_r, ir_type_int(), [], idx_slot, 0)
+                let cmp_r = ir_fresh_reg(b)
+                ir_emit_inst(b, "lt", cmp_r, ir_type_int(), [idx_r, len_reg], "<", 0)
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_r, exit_label], body_label, 0, "pure"))
+                ir_start_block(b, body_label)
+                let elem_r = ir_fresh_reg(b)
+                ir_emit_side(b, "call", elem_r, ir_type_any(), [iter_reg, idx_r], "nova_rt_index_get", 0)
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [elem_r], name, 0)
+                for s in body
+                    ir_lower_stmt(b, s)
+                if b.ir_clabel != ""
+                    let next_idx = ir_fresh_reg(b)
+                    ir_emit_inst(b, "slot_load", next_idx, ir_type_int(), [], idx_slot, 0)
+                    let inc_r = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_int", inc_r, ir_type_int(), [], "1", 1)
+                    let new_idx = ir_fresh_reg(b)
+                    ir_emit_inst(b, "add", new_idx, ir_type_int(), [next_idx, inc_r], "+", 0)
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [new_idx], idx_slot, 0)
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], hdr_label, 0, "pure"))
+                ir_start_block(b, exit_label)
+                b.ir_loop_hdr = save_hdr
+                b.ir_loop_exit = save_exit
+            else if tag == "match"
+                let subject = ir_lower_expr(b, expr)
+                let exit_label = ir_fresh_label(b, "match_exit")
+                let hash_reg = ir_fresh_reg(b)
+                ir_emit_inst(b, "field_get", hash_reg, ir_type_int(), [subject], "__type_hash", 0)
+                let arm_count = len(body)
+                let arm_idx = 0
+                let arm_labels = []
+                let aidx = 0
+                while aidx < arm_count
+                    push(arm_labels, ir_fresh_label(b, "marm_" + str(aidx)))
+                    aidx = aidx + 1
+                let fall_label = ir_fresh_label(b, "match_fall")
+                for arm in body
+                    match arm
+                        Stmt(at, an, pattern, arm_body, ap, ae, aa) =>
+                            match pattern
+                                Expr(pt, pv, pn, pchildren, pf) =>
+                                    if pt == "pat_ctor"
+                                        let expected = type_name_hash(pv)
+                                        let exp_reg = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", exp_reg, ir_type_int(), [], str(expected), expected)
+                                        let cmp_reg = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "eq", cmp_reg, ir_type_int(), [hash_reg, exp_reg], "==", 0)
+                                        let next_label = fall_label
+                                        if arm_idx + 1 < arm_count
+                                            next_label = arm_labels[arm_idx + 1]
+                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_reg, next_label], arm_labels[arm_idx], 0, "pure"))
+                                        ir_start_block(b, arm_labels[arm_idx])
+                                        let fi = 1
+                                        for field_pat in pchildren
+                                            match field_pat
+                                                Expr(fpt, fpv, fpn, fpc, fpf) =>
+                                                    if fpv != "_"
+                                                        let fd = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "field_get", fd, ir_type_any(), [subject], fpv, fi)
+                                                        ir_emit_inst(b, "slot_store", "", ir_type_void(), [fd], fpv, 0)
+                                                        b.ir_locals[fpv] = 1
+                                            fi = fi + 1
+                            for s in arm_body
+                                ir_lower_stmt(b, s)
+                            if b.ir_clabel != ""
+                                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], exit_label, 0, "pure"))
+                    arm_idx = arm_idx + 1
+                ir_start_block(b, fall_label)
+                if b.ir_clabel != ""
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], exit_label, 0, "pure"))
+                ir_start_block(b, exit_label)
+            else if tag == "break"
+                if b.ir_loop_exit != ""
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], b.ir_loop_exit, 0, "pure"))
+            else if tag == "continue"
+                if b.ir_loop_hdr != ""
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], b.ir_loop_hdr, 0, "pure"))
+
+fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            if tag == "expr" and b.ir_clabel != ""
+                let val = ir_lower_expr(b, expr)
+                ir_finish_block(b, IrInst("return", "", ir_type_void(), [val], "", 0, "pure"))
+            else if tag == "return"
+                ir_lower_stmt(b, stmt)
+            else if tag == "match"
+                let subject = ir_lower_expr(b, expr)
+                let arm_count = len(body)
+                let arm_labels = []
+                let aidx = 0
+                while aidx < arm_count
+                    push(arm_labels, ir_fresh_label(b, "rmarm_" + str(aidx)))
+                    aidx = aidx + 1
+                let fall_label = ir_fresh_label(b, "rmatch_fall")
+                let hash_reg = ir_fresh_reg(b)
+                ir_emit_inst(b, "field_get", hash_reg, ir_type_int(), [subject], "__type_hash", 0)
+                let arm_idx = 0
+                for arm in body
+                    match arm
+                        Stmt(at, an, pattern, arm_body, ap, ae, aa) =>
+                            match pattern
+                                Expr(pt, pv, pn, pchildren, pf) =>
+                                    if pt == "pat_ctor"
+                                        let expected = type_name_hash(pv)
+                                        let exp_reg = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", exp_reg, ir_type_int(), [], str(expected), expected)
+                                        let cmp_reg = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "eq", cmp_reg, ir_type_int(), [hash_reg, exp_reg], "==", 0)
+                                        let next_label = fall_label
+                                        if arm_idx + 1 < arm_count
+                                            next_label = arm_labels[arm_idx + 1]
+                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_reg, next_label], arm_labels[arm_idx], 0, "pure"))
+                                        ir_start_block(b, arm_labels[arm_idx])
+                                        let fi = 1
+                                        for field_pat in pchildren
+                                            match field_pat
+                                                Expr(fpt, fpv, fpn, fpc, fpf) =>
+                                                    if fpv != "_"
+                                                        let fd = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "field_get", fd, ir_type_any(), [subject], fpv, fi)
+                                                        ir_emit_inst(b, "slot_store", "", ir_type_void(), [fd], fpv, 0)
+                                                        b.ir_locals[fpv] = 1
+                                            fi = fi + 1
+                            let arm_len = len(arm_body)
+                            if arm_len > 0
+                                let ai = 0
+                                while ai < arm_len - 1
+                                    ir_lower_stmt(b, arm_body[ai])
+                                    ai = ai + 1
+                                ir_lower_last_stmt(b, arm_body[arm_len - 1])
+                            else
+                                if b.ir_clabel != ""
+                                    ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+                    arm_idx = arm_idx + 1
+                ir_start_block(b, fall_label)
+                if b.ir_clabel != ""
+                    ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+            else if tag == "if"
+                let cond = ir_lower_expr(b, expr)
+                let then_label = ir_fresh_label(b, "retthen")
+                let else_label = ir_fresh_label(b, "retelse")
+                ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cond, else_label], then_label, 0, "pure"))
+                ir_start_block(b, then_label)
+                let then_len = len(body)
+                if then_len > 0
+                    let ti = 0
+                    while ti < then_len - 1
+                        ir_lower_stmt(b, body[ti])
+                        ti = ti + 1
+                    ir_lower_last_stmt(b, body[then_len - 1])
+                else
+                    if b.ir_clabel != ""
+                        ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+                ir_start_block(b, else_label)
+                let else_len = len(else_body)
+                if else_len > 0
+                    let ei = 0
+                    while ei < else_len - 1
+                        ir_lower_stmt(b, else_body[ei])
+                        ei = ei + 1
+                    ir_lower_last_stmt(b, else_body[else_len - 1])
+                else
+                    if b.ir_clabel != ""
+                        ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+            else
+                ir_lower_stmt(b, stmt)
+                if b.ir_clabel != ""
+                    ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+
+fn ir_lower_assign_target(b: IrBuilder, target: Expr, val_reg: string)
+    match target
+        Expr(tag, value, num, children, fields) =>
+            if tag == "ident"
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [val_reg], value, 0)
+            else if tag == "index"
+                let target_r = ir_lower_expr(b, children[0])
+                let idx_r = ir_lower_expr(b, children[1])
+                ir_emit_side(b, "call", "", ir_type_void(), [target_r, idx_r, val_reg], "nova_rt_index_set", 0)
+            else if tag == "member"
+                let target_r = ir_lower_expr(b, children[0])
+                let fi = get_ir_field_index(b, value)
+                let ptr_reg = ir_fresh_reg(b)
+                ir_emit_inst(b, "field_set", ptr_reg, ir_type_void(), [target_r, val_reg], value, fi)
+
+fn ir_flush_pending_block(b: IrBuilder)
+    if b.ir_clabel != ""
+        ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+
+fn source_type_to_ir(t: string) -> IrType
+    if t == "int"
+        ir_type_int()
+    else if t == "string" or t == "str"
+        ir_type_str()
+    else if t == "list"
+        IrType("list", "", [], 0)
+    else if t == "dict"
+        IrType("dict", "", [], 0)
+    else if t == "bool"
+        ir_type_int()
+    else
+        ir_type_any()
+
+fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
+    match stmt
+        Stmt(tag, name, expr, body, params, else_body, annotations) =>
+            let ir_params = []
+            b.ir_locals = {}
+            for p in params
+                match p
+                    Param(pname, ptype, pdefault) =>
+                        push(ir_params, IrParam(pname, source_type_to_ir(ptype)))
+                        b.ir_locals[pname] = 1
+            b.ir_insts = []
+            b.ir_blocks = []
+            b.ir_clabel = "entry"
+            b.ir_rc = 0
+            let n_body = len(body)
+            if n_body > 0
+                let i = 0
+                while i < n_body - 1
+                    ir_lower_stmt(b, body[i])
+                    i = i + 1
+                ir_lower_last_stmt(b, body[n_body - 1])
+            ir_flush_pending_block(b)
+            if len(b.ir_blocks) == 0
+                ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+            let emit_name = name
+            if emit_name == "main"
+                emit_name = "nova_user_main"
+            IrFunction(emit_name, ir_params, ir_type_any(), b.ir_blocks, [], 0)
+
+// ── IR Type Inference ────────────────────────────────────────────────────────
+
+fn ir_reg_type(reg_types: dict, reg: string) -> string
+    if contains(reg_types, reg)
+        return reg_types[reg]
+    "any"
+
+fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
+    match inst
+        IrInst(op, dest, typ, args, value, num, effect) =>
+            if op == "const_int"
+                rt[dest] = "int"
+                return IrInst(op, dest, ir_type_int(), args, value, num, effect)
+            else if op == "const_str"
+                rt[dest] = "str"
+                return IrInst(op, dest, ir_type_str(), args, value, num, effect)
+            else if op == "add"
+                let lt = ir_reg_type(rt, args[0])
+                let rty = ir_reg_type(rt, args[1])
+                if lt == "int" and rty == "int"
+                    rt[dest] = "int"
+                    return IrInst(op, dest, ir_type_int(), args, value, num, effect)
+                else if lt == "str" or rty == "str"
+                    rt[dest] = "str"
+                    return IrInst(op, dest, ir_type_str(), args, value, num, effect)
+                rt[dest] = "any"
+                return inst
+            else if op == "sub" or op == "mul" or op == "div" or op == "mod" or op == "neg"
+                rt[dest] = "int"
+                return IrInst(op, dest, ir_type_int(), args, value, num, effect)
+            else if op == "eq" or op == "neq"
+                let lt = ir_reg_type(rt, args[0])
+                let rty = ir_reg_type(rt, args[1])
+                let itype = ir_type_any()
+                if lt == "int" and rty == "int"
+                    itype = ir_type_int()
+                else if lt == "str" or rty == "str"
+                    itype = ir_type_str()
+                rt[dest] = "int"
+                return IrInst(op, dest, itype, args, value, num, effect)
+            else if op == "lt" or op == "le" or op == "gt" or op == "ge"
+                rt[dest] = "int"
+                return IrInst(op, dest, ir_type_int(), args, value, num, effect)
+            else if op == "not" or op == "and" or op == "or"
+                rt[dest] = "int"
+                return IrInst(op, dest, ir_type_int(), args, value, num, effect)
+            else if op == "slot_load"
+                let stype = "any"
+                if contains(st, value)
+                    stype = st[value]
+                rt[dest] = stype
+                return IrInst(op, dest, IrType(stype, "", [], 0), args, value, num, effect)
+            else if op == "slot_store"
+                let val_type = ir_reg_type(rt, args[0])
+                if contains(st, value)
+                    if st[value] != val_type
+                        st[value] = "any"
+                else
+                    st[value] = val_type
+                return inst
+            else if op == "call"
+                if dest != ""
+                    let rtype = "any"
+                    if value == "nova_rt_len" or value == "nova_rt_len_any" or value == "nova_rt_ord" or value == "nova_rt_parse_int" or value == "nova_rt_system" or value == "nova_rt_contains"
+                        rtype = "int"
+                    else if value == "nova_rt_str_concat" or value == "nova_rt_int_to_str" or value == "nova_rt_any_to_str" or value == "nova_rt_chr" or value == "nova_rt_exec"
+                        rtype = "str"
+                    else if value == "nova_rt_list_create" or value == "nova_rt_list_append" or value == "nova_rt_chars" or value == "nova_rt_range" or value == "nova_rt_sort" or value == "nova_rt_dict_keys" or value == "nova_rt_dict_values" or value == "nova_rt_args"
+                        rtype = "list"
+                    else if value == "nova_rt_dict_create"
+                        rtype = "dict"
+                    else if contains(frt, value)
+                        rtype = frt[value]
+                    rt[dest] = rtype
+                return inst
+            else if op == "make_struct"
+                if dest != ""
+                    rt[dest] = "struct"
+                return inst
+            else if op == "make_list"
+                if dest != ""
+                    rt[dest] = "list"
+                return inst
+            else if op == "make_dict"
+                if dest != ""
+                    rt[dest] = "dict"
+                return inst
+            else if op == "index_get"
+                if dest != ""
+                    rt[dest] = "any"
+                return inst
+            else if op == "field_get"
+                if dest != ""
+                    rt[dest] = "any"
+                return inst
+            else if op == "is_error"
+                if dest != ""
+                    rt[dest] = "int"
+                return IrInst(op, dest, ir_type_int(), args, value, num, effect)
+            else if op == "set_error"
+                if dest != ""
+                    rt[dest] = "any"
+                return inst
+            else if op == "load_error_msg"
+                if dest != ""
+                    rt[dest] = "str"
+                return IrInst(op, dest, ir_type_str(), args, value, num, effect)
+            else if op == "raise_error"
+                return inst
+            return inst
+
+fn ir_infer_block(rt: dict, st: dict, frt: dict, block: IrBlock) -> IrBlock
+    match block
+        IrBlock(label, insts, terminator) =>
+            let new_insts = []
+            for inst in insts
+                push(new_insts, ir_infer_one(rt, st, frt, inst))
+            IrBlock(label, new_insts, terminator)
+
+fn ir_infer_types(func: IrFunction, frt: dict) -> IrFunction
+    match func
+        IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
+            if is_extern == 1
+                return func
+            let st = {}
+            for p in params
+                match p
+                    IrParam(pname, ptype) =>
+                        match ptype
+                            IrType(tk, tn, tp, tid) =>
+                                if tk == "int" or tk == "str" or tk == "list" or tk == "dict"
+                                    st[pname] = tk
+                                else
+                                    st[pname] = "any"
+            let pass_n = 0
+            let new_blocks = []
+            let converged = false
+            while not converged and pass_n < 3
+                pass_n = pass_n + 1
+                let old_keys = keys(st)
+                let old_vals = []
+                for k in old_keys
+                    push(old_vals, st[k])
+                let rt = {}
+                new_blocks = []
+                for block in blocks
+                    push(new_blocks, ir_infer_block(rt, st, frt, block))
+                converged = true
+                let i = 0
+                while i < len(old_keys)
+                    if contains(st, old_keys[i])
+                        if st[old_keys[i]] != old_vals[i]
+                            converged = false
+                    i = i + 1
+            IrFunction(name, params, ret_type, new_blocks, type_params, is_extern)
+
+fn ir_analyze_return_type(func: IrFunction, frt: dict) -> string
+    match func
+        IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
+            let rt = {}
+            let st = {}
+            for p in params
+                match p
+                    IrParam(pname, ptype) =>
+                        match ptype
+                            IrType(tk, tn, tp, tid) =>
+                                if tk == "int" or tk == "str" or tk == "list" or tk == "dict"
+                                    st[pname] = tk
+                                else
+                                    st[pname] = "any"
+            let pass_n = 0
+            while pass_n < 3
+                pass_n = pass_n + 1
+                rt = {}
+                for block in blocks
+                    ir_infer_block(rt, st, frt, block)
+            for block in blocks
+                match block
+                    IrBlock(label, insts, terminator) =>
+                        match terminator
+                            IrInst(top, tdest, ttyp, targs, tval, tnum, teff) =>
+                                if top == "return" and len(targs) > 0
+                                    let rv = targs[0]
+                                    if rv != "0" and contains(rt, rv)
+                                        return rt[rv]
+            "any"
+
+// ── IR → LLVM Emission ───────────────────────────────────────────────────────
+
+type IrEmitter
+    ire_out: list
+    ire_strs: list
+    ire_smap: dict
+    ire_sc: int
+
+fn new_ir_emitter() -> IrEmitter
+    IrEmitter([], [], {}, 0)
+
+fn ire_line(e: IrEmitter, line: string)
+    push(e.ire_out, line)
+
+fn ire_indent(e: IrEmitter, line: string)
+    push(e.ire_out, "  " + line)
+
+fn ire_intern_string(e: IrEmitter, s: string) -> string
+    if contains(e.ire_smap, s)
+        return e.ire_smap[s]
+    let escaped = llvm_escape_string(s)
+    let name = "@.str." + str(e.ire_sc)
+    e.ire_sc = e.ire_sc + 1
+    let byte_len = len(s) + 1
+    push(e.ire_strs, name + " = private unnamed_addr constant [" + str(byte_len) + " x i8] c\"" + escaped + "\\00\"")
+    e.ire_smap[s] = name
+    name
+
+fn ire_emit_inst(e: IrEmitter, inst: IrInst)
+    match inst
+        IrInst(op, dest, typ, args, value, num, effect) =>
+            if op == "const_int"
+                ire_indent(e, dest + " = add i64 " + str(num) + ", 0")
+            else if op == "const_str"
+                let str_name = ire_intern_string(e, value)
+                let byte_len = len(value) + 1
+                let ptr_reg = dest + ".p"
+                ire_indent(e, ptr_reg + " = getelementptr inbounds [" + str(byte_len) + " x i8], ptr " + str_name + ", i64 0, i64 0")
+                ire_indent(e, dest + " = ptrtoint ptr " + ptr_reg + " to i64")
+            else if op == "add"
+                match typ
+                    IrType(tk, tn, tp, tid) =>
+                        if tk == "int"
+                            ire_indent(e, dest + " = add i64 " + args[0] + ", " + args[1])
+                        else if tk == "str"
+                            ire_indent(e, dest + " = call i64 @nova_rt_str_concat(i64 " + args[0] + ", i64 " + args[1] + ")")
+                        else
+                            ire_indent(e, dest + " = call i64 @nova_rt_add(i64 " + args[0] + ", i64 " + args[1] + ")")
+            else if op == "sub"
+                // sub is always integer (no string subtraction)
+                ire_indent(e, dest + " = sub i64 " + args[0] + ", " + args[1])
+            else if op == "mul"
+                // mul is always integer
+                ire_indent(e, dest + " = mul i64 " + args[0] + ", " + args[1])
+            else if op == "div"
+                // div is always integer
+                ire_indent(e, dest + " = sdiv i64 " + args[0] + ", " + args[1])
+            else if op == "mod"
+                ire_indent(e, dest + " = srem i64 " + args[0] + ", " + args[1])
+            else if op == "neg"
+                ire_indent(e, dest + " = sub i64 0, " + args[0])
+            else if op == "eq"
+                match typ
+                    IrType(tk, tn, tp, tid) =>
+                        if tk == "int"
+                            let tmp = dest + ".cmp"
+                            ire_indent(e, tmp + " = icmp eq i64 " + args[0] + ", " + args[1])
+                            ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else if tk == "str"
+                            let p0 = dest + ".p0"
+                            let p1 = dest + ".p1"
+                            let cmp = dest + ".sc"
+                            let tmp = dest + ".cmp"
+                            ire_indent(e, p0 + " = inttoptr i64 " + args[0] + " to ptr")
+                            ire_indent(e, p1 + " = inttoptr i64 " + args[1] + " to ptr")
+                            ire_indent(e, cmp + " = call i32 @strcmp(ptr " + p0 + ", ptr " + p1 + ")")
+                            ire_indent(e, tmp + " = icmp eq i32 " + cmp + ", 0")
+                            ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else
+                            ire_indent(e, dest + " = call i64 @nova_rt_eq(i64 " + args[0] + ", i64 " + args[1] + ")")
+            else if op == "neq"
+                match typ
+                    IrType(tk, tn, tp, tid) =>
+                        if tk == "int"
+                            let tmp = dest + ".cmp"
+                            ire_indent(e, tmp + " = icmp ne i64 " + args[0] + ", " + args[1])
+                            ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else if tk == "str"
+                            let p0 = dest + ".p0"
+                            let p1 = dest + ".p1"
+                            let cmp = dest + ".sc"
+                            let tmp = dest + ".cmp"
+                            ire_indent(e, p0 + " = inttoptr i64 " + args[0] + " to ptr")
+                            ire_indent(e, p1 + " = inttoptr i64 " + args[1] + " to ptr")
+                            ire_indent(e, cmp + " = call i32 @strcmp(ptr " + p0 + ", ptr " + p1 + ")")
+                            ire_indent(e, tmp + " = icmp ne i32 " + cmp + ", 0")
+                            ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else
+                            ire_indent(e, dest + " = call i64 @nova_rt_neq(i64 " + args[0] + ", i64 " + args[1] + ")")
+            else if op == "lt"
+                let tmp = dest + ".cmp"
+                ire_indent(e, tmp + " = icmp slt i64 " + args[0] + ", " + args[1])
+                ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+            else if op == "le"
+                let tmp = dest + ".cmp"
+                ire_indent(e, tmp + " = icmp sle i64 " + args[0] + ", " + args[1])
+                ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+            else if op == "gt"
+                let tmp = dest + ".cmp"
+                ire_indent(e, tmp + " = icmp sgt i64 " + args[0] + ", " + args[1])
+                ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+            else if op == "ge"
+                let tmp = dest + ".cmp"
+                ire_indent(e, tmp + " = icmp sge i64 " + args[0] + ", " + args[1])
+                ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+            else if op == "not"
+                let tmp = dest + ".cmp"
+                ire_indent(e, tmp + " = icmp eq i64 " + args[0] + ", 0")
+                ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+            else if op == "and"
+                let tmp = dest + ".cmp"
+                ire_indent(e, tmp + " = icmp ne i64 " + args[0] + ", 0")
+                let tmp2 = dest + ".cmp2"
+                ire_indent(e, tmp2 + " = icmp ne i64 " + args[1] + ", 0")
+                let tmp3 = dest + ".and"
+                ire_indent(e, tmp3 + " = and i1 " + tmp + ", " + tmp2)
+                ire_indent(e, dest + " = zext i1 " + tmp3 + " to i64")
+            else if op == "or"
+                let tmp = dest + ".cmp"
+                ire_indent(e, tmp + " = icmp ne i64 " + args[0] + ", 0")
+                let tmp2 = dest + ".cmp2"
+                ire_indent(e, tmp2 + " = icmp ne i64 " + args[1] + ", 0")
+                let tmp3 = dest + ".or"
+                ire_indent(e, tmp3 + " = or i1 " + tmp + ", " + tmp2)
+                ire_indent(e, dest + " = zext i1 " + tmp3 + " to i64")
+            else if op == "slot_load"
+                ire_indent(e, dest + " = load i64, ptr %slot." + value + ", align 8")
+            else if op == "slot_store"
+                ire_indent(e, "store i64 " + args[0] + ", ptr %slot." + value + ", align 8")
+            else if op == "call"
+                let call_str = "call i64 @" + value + "("
+                let i = 0
+                while i < len(args)
+                    if i > 0
+                        call_str = call_str + ", "
+                    call_str = call_str + "i64 " + args[i]
+                    i = i + 1
+                call_str = call_str + ")"
+                if dest != ""
+                    ire_indent(e, dest + " = " + call_str)
+                else
+                    ire_indent(e, call_str)
+            else if op == "make_struct"
+                let size = (num + 1) * 8
+                ire_indent(e, dest + ".ptr = call ptr @nova_rt_struct_alloc(i64 " + str(size) + ")")
+                let hash_val = type_name_hash(value)
+                let hash_gep = dest + ".thash"
+                ire_indent(e, hash_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 0")
+                ire_indent(e, "store i64 " + str(hash_val) + ", ptr " + hash_gep + ", align 8")
+                let fi = 0
+                while fi < len(args)
+                    let gep = dest + ".f" + str(fi)
+                    ire_indent(e, gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 " + str(fi + 1))
+                    ire_indent(e, "store i64 " + args[fi] + ", ptr " + gep + ", align 8")
+                    fi = fi + 1
+                ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
+            else if op == "make_list"
+                ire_indent(e, dest + " = call i64 @nova_rt_list_create()")
+                let i = 0
+                while i < len(args)
+                    ire_indent(e, "call i64 @nova_rt_list_append(i64 " + dest + ", i64 " + args[i] + ")")
+                    i = i + 1
+            else if op == "make_dict"
+                ire_indent(e, dest + " = call i64 @nova_rt_dict_create()")
+            else if op == "index_get"
+                ire_indent(e, dest + " = call i64 @nova_rt_index_get(i64 " + args[0] + ", i64 " + args[1] + ")")
+            else if op == "field_get"
+                let ptr_name = dest + ".ptr"
+                ire_indent(e, ptr_name + " = inttoptr i64 " + args[0] + " to ptr")
+                let gep = dest + ".gep"
+                ire_indent(e, gep + " = getelementptr i64, ptr " + ptr_name + ", i64 " + str(num))
+                ire_indent(e, dest + " = load i64, ptr " + gep + ", align 8")
+            else if op == "field_set"
+                let ptr_name = dest + ".ptr"
+                ire_indent(e, ptr_name + " = inttoptr i64 " + args[0] + " to ptr")
+                let gep = dest + ".gep"
+                ire_indent(e, gep + " = getelementptr i64, ptr " + ptr_name + ", i64 " + str(num))
+                ire_indent(e, "store i64 " + args[1] + ", ptr " + gep + ", align 8")
+            else if op == "make_closure"
+                // Allocate closure record: [trampoline_ptr, cap0, cap1, ...]
+                let record_size = (1 + num) * 8
+                ire_indent(e, dest + ".ptr = call ptr @nova_rt_struct_alloc(i64 " + str(record_size) + ")")
+                // Store trampoline function pointer at slot 0
+                let tramp_gep = dest + ".tgep"
+                ire_indent(e, tramp_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 0")
+                let tramp_val = dest + ".tfn"
+                ire_indent(e, tramp_val + " = ptrtoint ptr @" + value + " to i64")
+                ire_indent(e, "store i64 " + tramp_val + ", ptr " + tramp_gep + ", align 8")
+                // Store captures at slots 1, 2, ...
+                let ci = 0
+                while ci < len(args)
+                    let cap_gep = dest + ".c" + str(ci)
+                    ire_indent(e, cap_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 " + str(ci + 1))
+                    ire_indent(e, "store i64 " + args[ci] + ", ptr " + cap_gep + ", align 8")
+                    ci = ci + 1
+                ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
+            else if op == "dyn_call"
+                // Dynamic closure call: args[0] = closure record, args[1..] = call arguments
+                // num = number of actual arguments (excluding closure record)
+                let rec_ptr = dest + ".rec"
+                ire_indent(e, rec_ptr + " = inttoptr i64 " + args[0] + " to ptr")
+                let fn_raw = dest + ".fnraw"
+                ire_indent(e, fn_raw + " = load i64, ptr " + rec_ptr + ", align 8")
+                let fn_ptr = dest + ".fnptr"
+                ire_indent(e, fn_ptr + " = inttoptr i64 " + fn_raw + " to ptr")
+                // Build call: fn_ptr(closure_record, arg0, arg1, ...)
+                let call_str = "call i64 " + fn_ptr + "(i64 " + args[0]
+                let ai = 1
+                while ai < len(args)
+                    call_str = call_str + ", i64 " + args[ai]
+                    ai = ai + 1
+                call_str = call_str + ")"
+                if dest != ""
+                    ire_indent(e, dest + " = " + call_str)
+                else
+                    ire_indent(e, call_str)
+            else if op == "set_error"
+                ire_indent(e, "store i64 1, ptr @__nova_error_flag")
+                if len(args) > 0
+                    ire_indent(e, "store i64 " + args[0] + ", ptr @__nova_error_msg")
+                if dest != ""
+                    ire_indent(e, dest + " = add i64 0, 0")
+            else if op == "is_error"
+                let flag_tmp = dest + ".fl"
+                let cmp_tmp = dest + ".cmp"
+                ire_indent(e, flag_tmp + " = load i64, ptr @__nova_error_flag")
+                ire_indent(e, "store i64 0, ptr @__nova_error_flag")
+                ire_indent(e, cmp_tmp + " = icmp ne i64 " + flag_tmp + ", 0")
+                ire_indent(e, dest + " = zext i1 " + cmp_tmp + " to i64")
+            else if op == "load_error_msg"
+                let msg_tmp = dest + ".raw"
+                ire_indent(e, msg_tmp + " = load i64, ptr @__nova_error_msg")
+                ire_indent(e, "store i64 0, ptr @__nova_error_msg")
+                ire_indent(e, dest + " = add i64 " + msg_tmp + ", 0")
+            else if op == "raise_error"
+                ire_indent(e, "store i64 1, ptr @__nova_error_flag")
+
+fn ire_emit_terminator(e: IrEmitter, term: IrInst)
+    match term
+        IrInst(op, dest, typ, args, value, num, effect) =>
+            if op == "return"
+                if len(args) > 0
+                    ire_indent(e, "ret i64 " + args[0])
+                else
+                    ire_indent(e, "ret i64 0")
+            else if op == "goto"
+                ire_indent(e, "br label %" + value)
+            else if op == "branch"
+                let cond_cmp = dest + ".br"
+                if cond_cmp == ".br"
+                    let cond_cmp2 = "%br_" + value
+                    ire_indent(e, cond_cmp2 + " = icmp ne i64 " + args[0] + ", 0")
+                    ire_indent(e, "br i1 " + cond_cmp2 + ", label %" + value + ", label %" + args[1])
+                else
+                    ire_indent(e, cond_cmp + " = icmp ne i64 " + args[0] + ", 0")
+                    ire_indent(e, "br i1 " + cond_cmp + ", label %" + value + ", label %" + args[1])
+
+fn ire_collect_slots(blocks: list, param_names: list) -> list
+    let slots = []
+    for block in blocks
+        match block
+            IrBlock(label, insts, terminator) =>
+                for inst in insts
+                    match inst
+                        IrInst(op, dest, typ, args, value, num, effect) =>
+                            if (op == "slot_store" or op == "slot_load") and value != ""
+                                if not list_contains(slots, value) and not list_contains(param_names, value)
+                                    push(slots, value)
+    slots
+
+fn ire_emit_function(e: IrEmitter, func: IrFunction)
+    match func
+        IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
+            if is_extern == 1
+                let decl = "declare i64 @" + name + "("
+                let i = 0
+                while i < len(params)
+                    if i > 0
+                        decl = decl + ", "
+                    decl = decl + "i64"
+                    i = i + 1
+                decl = decl + ") nounwind"
+                ire_line(e, decl)
+                return 0
+            let header = "define i64 @" + name + "("
+            let i = 0
+            while i < len(params)
+                if i > 0
+                    header = header + ", "
+                header = header + "i64 %p" + str(i)
+                i = i + 1
+            header = header + ") nounwind \{"
+            ire_line(e, header)
+            // Collect param names for alloca exclusion
+            let param_names = []
+            let pi = 0
+            while pi < len(params)
+                match params[pi]
+                    IrParam(pname, ptype) =>
+                        push(param_names, pname)
+                pi = pi + 1
+            // Collect all local slot names (excluding params)
+            let local_slots = ire_collect_slots(blocks, param_names)
+            for block in blocks
+                match block
+                    IrBlock(label, insts, terminator) =>
+                        ire_line(e, label + ":")
+                        if label == "entry"
+                            // Allocate param slots
+                            let pi2 = 0
+                            while pi2 < len(params)
+                                match params[pi2]
+                                    IrParam(pname, ptype) =>
+                                        ire_indent(e, "%slot." + pname + " = alloca i64, align 8")
+                                        ire_indent(e, "store i64 %p" + str(pi2) + ", ptr %slot." + pname + ", align 8")
+                                pi2 = pi2 + 1
+                            // Allocate local variable slots
+                            for slot_name in local_slots
+                                ire_indent(e, "%slot." + slot_name + " = alloca i64, align 8")
+                                ire_indent(e, "store i64 0, ptr %slot." + slot_name + ", align 8")
+                        for inst in insts
+                            ire_emit_inst(e, inst)
+                        ire_emit_terminator(e, terminator)
+            ire_line(e, "}")
+            ire_line(e, "")
+
+// ── Main Compiler Pipeline ───────────────────────────────────────────────────
+
+fn compile(source: string) -> string
+    let tokens = tokenize(source)
+    let stmts = parse_program(tokens)
+    let cg = new_codegen()
+
+    // Separate functions from top-level statements
+    let functions = []
+    let top_stmts = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations) =>
+                if tag == "fn"
+                    push(functions, s)
+                    push(cg.fn_names, name)
+                else if tag == "type"
+                    // Register struct fields and build field→index map
+                    cg.struct_defs[name] = params
+                    let fi = 0
+                    for p in params
+                        match p
+                            Param(pname, ptype, pdefault) =>
+                                cg.field_map[pname] = fi
+                        fi = fi + 1
+                else if tag != "import"
+                    push(top_stmts, s)
+
+    // Pass 1: Generate all string constants (by doing a dry-run or pre-scan)
+    // For now, strings are interned during codegen
+
+    // Emit module
+    emit_module_header(cg)
+    emit_runtime_declarations(cg)
+
+    // Emit user functions
+    for fn_stmt in functions
+        emit_function(cg, fn_stmt)
+
+    // Emit main
+    emit_nova_main(cg, top_stmts)
+    emit_main_entry(cg)
+
+    // Emit string constants (at end, so we know all of them)
+    emit_string_constants(cg)
+
+    join(cg.output, "\n")
+
+// ── IR-Based Compiler Pipeline ───────────────────────────────────────────────
+
+fn compile_ir_core(source: string, base_dir: string) -> string
+    let tokens = tokenize(source)
+    let stmts = parse_program(tokens)
+    let b = new_ir_builder()
+    let e = new_ir_emitter()
+
+    // Resolve and compile imported modules
+    let import_ir_fns = resolve_and_compile_imports(b, stmts, base_dir)
+
+    // Separate functions, types, and top-level statements
+    let functions = []
+    let top_stmts = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations) =>
+                if tag == "fn"
+                    push(functions, s)
+                    let fn_name = name
+                    if fn_name == "main"
+                        fn_name = "nova_user_main"
+                    push(b.ir_fnames, fn_name)
+                    b.ir_fn_arity[fn_name] = len(params)
+                else if tag == "type"
+                    b.ir_sdefs[name] = params
+                    let fi = 1
+                    for p in params
+                        match p
+                            Param(pname, ptype, pdefault) =>
+                                b.ir_fmap[pname] = fi
+                        fi = fi + 1
+                else if tag != "import"
+                    push(top_stmts, s)
+
+    // Emit module header
+    ire_line(e, "; NOVA IR-Pipeline Compiler Output")
+    ire_line(e, "target datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"")
+    ire_line(e, "")
+    ire_line(e, "@__nova_error_flag = thread_local global i64 0")
+    ire_line(e, "@__nova_error_msg = thread_local global i64 0")
+    ire_line(e, "")
+
+    // Emit runtime declarations (same as original)
+    ire_line(e, "; Runtime declarations")
+    ire_line(e, "declare i32 @puts(ptr) nounwind")
+    ire_line(e, "declare i32 @printf(ptr, ...) nounwind")
+    ire_line(e, "declare i32 @strcmp(ptr, ptr) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_create() nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_append(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_get(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_len(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_create() nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_set(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_get(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_contains(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_str_concat(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_int_to_str(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_parse_int(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_len(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_len_any(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_ord(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_chr(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_contains(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_index_get(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_index_set(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_add(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_sub(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_mul(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_div(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_eq(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_neq(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_any_to_str(i64) nounwind")
+    ire_line(e, "declare void @nova_rt_assert(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_read_file(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_write_file(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_args() nounwind")
+    ire_line(e, "declare void @nova_rt_exit(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_split(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_join(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_upper(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_lower(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_trim(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_replace(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_starts_with(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_ends_with(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_print_any(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_float_bits(i64) nounwind")
+    ire_line(e, "declare ptr @nova_rt_struct_alloc(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_slice(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_repeat(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_chars(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_time_ms() nounwind")
+    ire_line(e, "declare i64 @nova_rt_sleep_ms(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_clock_ns() nounwind")
+    ire_line(e, "declare i64 @nova_rt_type_of(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_range(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_range_from_to(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_sort(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_keys(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_values(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_items(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_system(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_exec(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_create_string(ptr) nounwind")
+    ire_line(e, "declare void @nova_rt_init_args(i64, i64) nounwind")
+    ire_line(e, "declare void @nova_rt_cleanup() nounwind")
+    ire_line(e, "declare i64 @nova_rt_parse_float(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_read_line() nounwind")
+    ire_line(e, "declare i64 @nova_rt_append_file(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_file_exists(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_find(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_concat(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_reverse(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_sort(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_slice(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_http_get(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_http_post(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_mkdir(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_mkdir_p(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_path_join(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_path_exists(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_path_parent(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_path_name(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_read_bytes(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_write_raw(i64) nounwind")
+    ire_line(e, "")
+
+    // Pass 1: Lower all functions to IR (start with imported module functions)
+    let ir_fns = []
+    for imp_fn in import_ir_fns
+        push(ir_fns, imp_fn)
+    for fn_stmt in functions
+        let ir_fn = ir_lower_function(b, fn_stmt)
+        push(ir_fns, ir_fn)
+
+    // Include lambdas generated during function lowering
+    for lam_fn in b.ir_lambdas
+        push(ir_fns, lam_fn)
+    let lambdas_before_main = len(b.ir_lambdas)
+
+    // Pass 2: Analyze return types (inter-procedural)
+    let frt = {}
+    let changed = true
+    let pass_count = 0
+    while changed and pass_count < 4
+        changed = false
+        pass_count = pass_count + 1
+        for ir_fn in ir_fns
+            match ir_fn
+                IrFunction(fname, fp, fret, fblocks, ftp, fex) =>
+                    let old_type = "any"
+                    if contains(frt, fname)
+                        old_type = frt[fname]
+                    let new_type = ir_analyze_return_type(ir_fn, frt)
+                    if new_type != old_type
+                        frt[fname] = new_type
+                        changed = true
+
+    // Pass 3: Infer types with inter-procedural info and emit
+    for ir_fn in ir_fns
+        let typed_fn = ir_infer_types(ir_fn, frt)
+        ire_emit_function(e, typed_fn)
+
+    // Lower, infer types, and emit nova_main (top-level statements)
+    b.ir_insts = []
+    b.ir_blocks = []
+    b.ir_clabel = "entry"
+    b.ir_rc = 0
+    b.ir_locals = {}
+    for s in top_stmts
+        ir_lower_stmt(b, s)
+    if list_contains(b.ir_fnames, "nova_user_main")
+        let umr = ir_fresh_reg(b)
+        ir_emit_side(b, "call", umr, ir_type_any(), [], "nova_user_main", 0)
+    ir_flush_pending_block(b)
+    if len(b.ir_blocks) == 0
+        ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure"))
+    let main_fn = IrFunction("nova_main", [], ir_type_any(), b.ir_blocks, [], 0)
+    let typed_main = ir_infer_types(main_fn, frt)
+    ire_emit_function(e, typed_main)
+
+    // Emit any lambdas generated during nova_main lowering
+    let mi = lambdas_before_main
+    while mi < len(b.ir_lambdas)
+        let lam_fn = b.ir_lambdas[mi]
+        let typed_lam = ir_infer_types(lam_fn, frt)
+        ire_emit_function(e, typed_lam)
+        mi = mi + 1
+
+    // Emit trampolines
+    for spec in b.ir_tramps
+        let tname = spec[0]
+        let target = spec[1]
+        let ncap = spec[2]
+        let npar = spec[3]
+        let hdr = "define i64 @" + tname + "(i64 %record"
+        let pi = 0
+        while pi < npar
+            hdr = hdr + ", i64 %p" + str(pi)
+            pi = pi + 1
+        hdr = hdr + ") nounwind \{"
+        ire_line(e, hdr)
+        ire_line(e, "entry:")
+        if ncap > 0
+            ire_indent(e, "%rec_ptr = inttoptr i64 %record to ptr")
+            let ci = 0
+            while ci < ncap
+                let gep_name = "%cap" + str(ci) + "_ptr"
+                ire_indent(e, gep_name + " = getelementptr i64, ptr %rec_ptr, i64 " + str(ci + 1))
+                ire_indent(e, "%cap" + str(ci) + " = load i64, ptr " + gep_name + ", align 8")
+                ci = ci + 1
+        let call_str = "call i64 @" + target + "("
+        let first_arg = 1
+        let ci2 = 0
+        while ci2 < ncap
+            if first_arg == 0
+                call_str = call_str + ", "
+            call_str = call_str + "i64 %cap" + str(ci2)
+            first_arg = 0
+            ci2 = ci2 + 1
+        let pi2 = 0
+        while pi2 < npar
+            if first_arg == 0
+                call_str = call_str + ", "
+            call_str = call_str + "i64 %p" + str(pi2)
+            first_arg = 0
+            pi2 = pi2 + 1
+        call_str = call_str + ")"
+        ire_indent(e, "%result = " + call_str)
+        ire_indent(e, "ret i64 %result")
+        ire_line(e, "}")
+        ire_line(e, "")
+
+    // Emit main entry point
+    ire_line(e, "define i32 @main(i32 %argc, ptr %argv) nounwind \{")
+    ire_line(e, "entry:")
+    ire_indent(e, "%argc64 = sext i32 %argc to i64")
+    ire_indent(e, "%argv64 = ptrtoint ptr %argv to i64")
+    ire_indent(e, "call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
+    ire_indent(e, "call i64 @nova_main()")
+    ire_indent(e, "call void @nova_rt_cleanup()")
+    ire_indent(e, "ret i32 0")
+    ire_line(e, "}")
+    ire_line(e, "")
+
+    // Emit string constants
+    if len(e.ire_strs) > 0
+        ire_line(e, "; String constants")
+        for sc in e.ire_strs
+            ire_line(e, sc)
+        ire_line(e, "")
+
+    join(e.ire_out, "\n")
+
+fn compile_ir(source: string) -> string
+    compile_ir_core(source, "")
+
+// ── Entry Point ──────────────────────────────────────────────────────────────
+
+fn path_dir(path: string) -> string
+    let last_sep = -1
+    let i = 0
+    while i < len(path)
+        if path[i] == "/" or path[i] == "\\"
+            last_sep = i
+        i = i + 1
+    if last_sep < 0
+        return ""
+    slice(path, 0, last_sep + 1)
+
+fn resolve_module_file(name: string, base_dir: string) -> string
+    let sep = "/"
+    if contains(base_dir, "\\")
+        sep = "\\"
+    let candidate = base_dir + name + ".nova"
+    let content = read_file(candidate)
+    if len(content) > 0
+        return candidate
+    candidate = name + ".nova"
+    content = read_file(candidate)
+    if len(content) > 0
+        return candidate
+    candidate = path_join(path_join("nova_packages", name), name + ".nova")
+    content = read_file(candidate)
+    if len(content) > 0
+        return candidate
+    candidate = path_join("nova_packages", name + ".nova")
+    content = read_file(candidate)
+    if len(content) > 0
+        return candidate
+    return ""
+
+fn compile_module_ir(b: IrBuilder, mod_source: string, mod_name: string, visited: dict) -> list
+    let tokens = tokenize(mod_source)
+    let stmts = parse_program(tokens)
+    let mod_fns = []
+    let exported = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations) =>
+                if tag == "fn"
+                    push(mod_fns, s)
+                    push(b.ir_fnames, name)
+                    b.ir_fn_arity[name] = len(params)
+                    if len(name) > 0 and name[0] != "_"
+                        push(exported, name)
+                else if tag == "type"
+                    b.ir_sdefs[name] = params
+                    let fi = 1
+                    for p in params
+                        match p
+                            Param(pname, ptype, pdefault) =>
+                                b.ir_fmap[pname] = fi
+                        fi = fi + 1
+    let ir_fns = []
+    for fn_stmt in mod_fns
+        let ir_fn = ir_lower_function(b, fn_stmt)
+        push(ir_fns, ir_fn)
+    for lam_fn in b.ir_lambdas
+        push(ir_fns, lam_fn)
+    b.ir_lambdas = []
+    b.ir_modules[mod_name] = exported
+    ir_fns
+
+fn resolve_and_compile_imports(b: IrBuilder, stmts: list, base_dir: string) -> list
+    let all_ir_fns = []
+    let visited = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations) =>
+                if tag == "import"
+                    let mod_name = name
+                    let alias = mod_name
+                    if len(annotations) > 0
+                        alias = annotations[0]
+                    if not contains(visited, mod_name)
+                        visited[mod_name] = 1
+                        let mod_path = resolve_module_file(mod_name, base_dir)
+                        if mod_path == ""
+                            print("error: cannot find module '" + mod_name + "'")
+                            exit(1)
+                        let mod_source = read_file(mod_path)
+                        let mod_fns = compile_module_ir(b, mod_source, alias, visited)
+                        for mf in mod_fns
+                            push(all_ir_fns, mf)
+    all_ir_fns
+
+fn nova_replace_ext(path: string, old_ext: string, new_ext: string) -> string
+    if ends_with(path, old_ext)
+        return slice(path, 0, len(path) - len(old_ext)) + new_ext
+    return path + new_ext
+
+fn nova_compile_file(input_path: string, output_path: string, use_ir: int) -> string
+    let source = read_file(input_path)
+    if len(source) == 0
+        print("error: cannot read '" + input_path + "'")
+        exit(1)
+    let base_dir = path_dir(input_path)
+    let llvm_ir = if use_ir == 1
+        compile_ir_core(source, base_dir)
+    else
+        compile(source)
+    write_file(output_path, llvm_ir)
+    return output_path
+
+fn nova_find_runtime() -> string
+    let candidates = ["output/nova_runtime.c", "test_programs/output/nova_runtime.c", "nova_runtime.c"]
+    for c in candidates
+        let content = read_file(c)
+        if contains(content, "nova_rt_system")
+            return c
+    for c in candidates
+        let content = read_file(c)
+        if len(content) > 100
+            return c
+    return "nova_runtime.c"
+
+fn nova_link(ll_path: string, exe_path: string, opt_level: string) -> int
+    let rt = nova_find_runtime()
+    let cmd = "clang " + opt_level + " -w \"" + ll_path + "\" \"" + rt + "\" -o \"" + exe_path + "\" -lws2_32 -lwinhttp 2>&1"
+    let ret = system(cmd)
+    return ret
+
+// ── Package Manager ─────────────────────────────────────────────────────────
+
+fn nova_toml_default(name: string) -> string
+    let content = "[package]\n"
+    content = content + "name = \"" + name + "\"\n"
+    content = content + "version = \"0.1.0\"\n"
+    content = content + "description = \"\"\n"
+    content = content + "author = \"\"\n"
+    content = content + "\n"
+    content = content + "[dependencies]\n"
+    content
+
+fn nova_pkg_init()
+    let existing = read_file("nova.toml")
+    if len(existing) > 0
+        print("nova.toml already exists")
+        return 0
+    let content = nova_toml_default("my-project")
+    write_file("nova.toml", content)
+    print("Created nova.toml")
+
+fn nova_parse_toml_deps(content: string) -> dict
+    let deps = {}
+    let lines = split(content, "\n")
+    let in_deps = 0
+    let idx = 0
+    while idx < len(lines)
+        let trimmed = trim(lines[idx])
+        if trimmed == "[dependencies]"
+            in_deps = 1
+        else if len(trimmed) > 0
+            let first_ch = slice(trimmed, 0, 1)
+            if first_ch == "["
+                in_deps = 0
+            else if in_deps == 1 and first_ch != "#"
+                let eq_pos = find(trimmed, "=")
+                if eq_pos >= 0
+                    let key = trim(slice(trimmed, 0, eq_pos))
+                    let val = trim(slice(trimmed, eq_pos + 1, len(trimmed)))
+                    if len(val) >= 2
+                        let vfirst = slice(val, 0, 1)
+                        if vfirst == "\""
+                            val = slice(val, 1, len(val) - 1)
+                    deps[key] = val
+        idx = idx + 1
+    deps
+
+fn nova_registry_url() -> string
+    "https://raw.githubusercontent.com/nova-lang/packages/main/registry/"
+
+fn nova_pkg_is_valid_source(content: string) -> int
+    if len(content) == 0
+        return 0
+    let t = trim(content)
+    if starts_with(t, "<") or starts_with(t, "<!") or starts_with(t, "404")
+        return 0
+    if starts_with(t, "fn ") or starts_with(t, "//") or starts_with(t, "let ") or starts_with(t, "type ") or starts_with(t, "import ") or starts_with(t, "enum ")
+        return 1
+    if find(t, "fn ") >= 0
+        return 1
+    return 0
+
+fn nova_pkg_download(pkg_name: string, pkg_version: string) -> int
+    let pkg_dir = path_join("nova_packages", pkg_name)
+    let marker = path_join(pkg_dir, pkg_name + ".nova")
+    if path_exists(marker) == 1
+        return 1
+    mkdir_p(path_join("nova_packages", pkg_name))
+    let registry = nova_registry_url()
+    let index_url = registry + pkg_name + "/index.toml"
+    let index_content = http_get(index_url)
+    if len(index_content) > 0 and nova_pkg_is_valid_source(index_content) == 0
+        let lines = split(index_content, "\n")
+        let src_url = ""
+        for line in lines
+            let trimmed = trim(line)
+            if starts_with(trimmed, "source")
+                let eq = find(trimmed, "=")
+                if eq >= 0
+                    src_url = trim(slice(trimmed, eq + 1, len(trimmed)))
+                    if len(src_url) >= 2 and slice(src_url, 0, 1) == "\""
+                        src_url = slice(src_url, 1, len(src_url) - 1)
+        if len(src_url) > 0
+            let content = http_get(src_url)
+            if nova_pkg_is_valid_source(content) == 1
+                write_file(marker, content)
+                print("  Downloaded " + pkg_name)
+                return 1
+            else
+                print("  warning: " + pkg_name + " source URL returned invalid content")
+    let gh_url = "https://raw.githubusercontent.com/nova-lang/pkg-" + pkg_name + "/main/" + pkg_name + ".nova"
+    let content = http_get(gh_url)
+    if nova_pkg_is_valid_source(content) == 1
+        write_file(marker, content)
+        print("  Downloaded " + pkg_name + " (github)")
+        return 1
+    print("  error: could not download " + pkg_name + " — package not found in registry or github")
+    print("  Place " + pkg_name + ".nova in nova_packages/" + pkg_name + "/ manually")
+    return 0
+
+fn nova_pkg_install()
+    let toml = read_file("nova.toml")
+    if len(toml) == 0
+        print("error: no nova.toml found. Run nova init first")
+        exit(1)
+    let deps = nova_parse_toml_deps(toml)
+    let dep_keys = keys(deps)
+    if len(dep_keys) == 0
+        print("No dependencies to install")
+        return 0
+    print("Installing " + str(len(dep_keys)) + " package(s)...")
+    let installed = 0
+    for pkg_name in dep_keys
+        let version = deps[pkg_name]
+        let ok = nova_pkg_download(pkg_name, version)
+        if ok == 1
+            installed = installed + 1
+    print("Installed " + str(installed) + "/" + str(len(dep_keys)) + " packages")
+
+fn nova_pkg_get(pkg_spec: string)
+    let pkg_name = pkg_spec
+    let pkg_version = "*"
+    let at_pos = find(pkg_spec, "@")
+    if at_pos >= 0
+        pkg_name = slice(pkg_spec, 0, at_pos)
+        pkg_version = slice(pkg_spec, at_pos + 1, len(pkg_spec))
+    let toml = read_file("nova.toml")
+    if len(toml) == 0
+        print("error: no nova.toml found. Run nova init first")
+        exit(1)
+    let deps = nova_parse_toml_deps(toml)
+    if contains(deps, pkg_name)
+        print("Package " + pkg_name + " already in dependencies")
+        return 0
+    let dep_line = pkg_name + " = " + chr(34) + pkg_version + chr(34) + "\n"
+    let new_toml = toml + dep_line
+    write_file("nova.toml", new_toml)
+    print("Added " + pkg_name + "@" + pkg_version + " to nova.toml")
+    nova_pkg_download(pkg_name, pkg_version)
+
+fn compiler_main()
+    let arguments = args()
+    if len(arguments) < 2
+        print("NOVA Programming Language v0.1.0")
+        print("Usage: nova <command> [options] <file.nova>")
+        print("Commands:")
+        print("  run <file.nova>       Compile and run")
+        print("  build <file.nova>     Compile to executable")
+        print("  compile <file.nova>   Compile to LLVM IR")
+        print("  version               Show version")
+        print("  self-test             Run compiler self-test")
+        print("  init                  Create nova.toml in current directory")
+        print("  get <package>         Add a dependency")
+        print("  install               Download all dependencies from nova.toml")
+        print("Legacy: nova <file.nova> [output.ll]")
+        exit(0)
+    let cmd = arguments[1]
+    if cmd == "version" or cmd == "--version"
+        print("NOVA v0.1.0 (self-hosted, IR pipeline)")
+        exit(0)
+    if cmd == "self-test"
+        run_self_test()
+        exit(0)
+    if cmd == "init"
+        nova_pkg_init()
+        exit(0)
+    if cmd == "get"
+        if len(arguments) < 3
+            print("Usage: nova get <package>[@version]")
+            exit(1)
+        nova_pkg_get(arguments[2])
+        exit(0)
+    if cmd == "install"
+        nova_pkg_install()
+        exit(0)
+    // Parse: nova run/build/compile [--old] [-O0] [-o out] <file>
+    if cmd == "run" or cmd == "build" or cmd == "compile"
+        let use_ir = 1
+        let opt_level = "-O2"
+        let output_file = ""
+        let input_file = ""
+        let i = 2
+        while i < len(arguments)
+            let a = arguments[i]
+            if a == "--old"
+                use_ir = 0
+            else if a == "-O0"
+                opt_level = "-O0"
+            else if a == "-o"
+                i = i + 1
+                if i < len(arguments)
+                    output_file = arguments[i]
+            else
+                input_file = a
+            i = i + 1
+        if input_file == ""
+            print("error: no input file")
+            exit(1)
+        if cmd == "compile"
+            let ll = if output_file != ""
+                output_file
+            else
+                nova_replace_ext(input_file, ".nova", ".ll")
+            nova_compile_file(input_file, ll, use_ir)
+            print("Compiled: " + input_file + " -> " + ll)
+        else if cmd == "build"
+            let ll = nova_replace_ext(input_file, ".nova", ".ll")
+            let exe = if output_file != ""
+                output_file
+            else
+                nova_replace_ext(input_file, ".nova", ".exe")
+            nova_compile_file(input_file, ll, use_ir)
+            let ret = nova_link(ll, exe, opt_level)
+            if ret == 0
+                print("Built: " + exe)
+            else
+                print("error: linking failed (exit " + str(ret) + ")")
+                exit(1)
+        else if cmd == "run"
+            let ll = nova_replace_ext(input_file, ".nova", ".ll")
+            let exe = nova_replace_ext(input_file, ".nova", ".exe")
+            nova_compile_file(input_file, ll, use_ir)
+            let ret = nova_link(ll, exe, opt_level)
+            if ret != 0
+                print("error: linking failed (exit " + str(ret) + ")")
+                exit(1)
+            let run_ret = system("\".\\" + exe + "\"")
+            exit(run_ret)
+        exit(0)
+    // Legacy mode: nova <file.nova> [output.ll]
+    let use_ir = 1
+    let file_idx = 1
+    if arguments[1] == "--old"
+        use_ir = 0
+        file_idx = 2
+    else if arguments[1] == "--ir"
+        file_idx = 2
+    if file_idx >= len(arguments)
+        print("error: no input file")
+        exit(1)
+    let input_path = arguments[file_idx]
+    let output_path = if file_idx + 1 < len(arguments)
+        arguments[file_idx + 1]
+    else
+        nova_replace_ext(input_path, ".nova", ".ll")
+    nova_compile_file(input_path, output_path, use_ir)
+    if use_ir == 1
+        print("Compiled (IR): " + input_path + " -> " + output_path)
+    else
+        print("Compiled: " + input_path + " -> " + output_path)
+
+// ── Self-Test ────────────────────────────────────────────────────────────────
+
+fn run_self_test()
+    let tokens = tokenize("let x = 42 + 3")
+    let non_nl = []
+    for t in tokens
+        match t
+            Token(kind, value, line, col) =>
+                if kind != "NEWLINE" and kind != "EOF"
+                    push(non_nl, t)
+    assert(len(non_nl) == 6, "lexer: expected 6 tokens, got " + str(len(non_nl)))
+    match non_nl[0]
+        Token(k, v, l, c) => assert(k == "KW" and v == "let", "lexer: t0 " + k + ":" + v)
+    match non_nl[1]
+        Token(k, v, l, c) => assert(k == "IDENT" and v == "x", "lexer: t1 " + k + ":" + v)
+    match non_nl[2]
+        Token(k, v, l, c) => assert(k == "ASSIGN" and v == "=", "lexer: t2 " + k + ":" + v)
+    match non_nl[3]
+        Token(k, v, l, c) => assert(k == "INT" and v == "42", "lexer: t3 " + k + ":" + v)
+    match non_nl[4]
+        Token(k, v, l, c) => assert(k == "OP" and v == "+", "lexer: t4 " + k + ":" + v)
+    match non_nl[5]
+        Token(k, v, l, c) => assert(k == "INT" and v == "3", "lexer: t5 " + k + ":" + v)
+
+    let tokens2 = tokenize("x = 10\ny = x + 5\nprint(y)")
+    let stmts = parse_program(tokens2)
+    assert(len(stmts) == 3, "parser: expected 3 stmts, got " + str(len(stmts)))
+
+    let source = "x = 42\nprint(x)"
+    let result = compile(source)
+    assert(contains(result, "define i64 @nova_main"), "codegen: has nova_main")
+    assert(contains(result, "nova_rt_print_any"), "codegen: has print call")
+
+    // Test function compilation
+    let fn_source = "fn add(a, b)\n    return a + b\nresult = add(3, 4)\nprint(result)"
+    let fn_result = compile(fn_source)
+    assert(contains(fn_result, "define i64 @add"), "codegen: has user function")
+
+    // Test string literal compilation (full pipeline)
+    let str_source = "x = \"hello\"\nprint(x)"
+    let str_result = compile(str_source)
+    assert(contains(str_result, "@.str."), "codegen: has string constant")
+    assert(contains(str_result, "nova_rt_print_any"), "codegen: string print call")
+
+    print("NOVA Self-Hosting Compiler: ALL TESTS PASSED")
+
+compiler_main()
