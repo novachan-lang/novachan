@@ -3,9 +3,9 @@ Set-Location $PSScriptRoot
 Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
 
 # Compile + link
-$cr = Invoke-Timed -FilePath (Resolve-Path ".\gen2_move.exe").Path -Arguments "http_demo.nova" -TimeoutMs 60000
+$cr = Invoke-Timed -FilePath (Resolve-Path ".\gen3_test.exe").Path -Arguments "http_demo.nova" -TimeoutMs 60000
 if ($cr.ExitCode -ne 0) { Write-Host "compile failed"; exit 1 }
-$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o http_demo.exe http_demo.ll nova_runtime.c -lws2_32" -TimeoutMs 60000
+$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o http_demo.exe http_demo.ll nova_runtime.c -lws2_32 -ladvapi32 -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 60000
 if ($lr.ExitCode -ne 0) { Write-Host "link failed"; exit 1 }
 
 # Pick a free port
