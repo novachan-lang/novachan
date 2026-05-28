@@ -9631,12 +9631,79 @@ int64_t nova_rt_wasm_compile(int64_t path_val) {
     return (int64_t)idx;
 }
 
-/* nova_rt_wasm_run: Execute a registered WASM module.
-   Stub: validates handle and returns 0 (success). Real WASM JIT is Phase 12+. */
+/* ── Minimal WASM interpreter ─────────────────────────────────────────────
+   Parses the binary module format, locates the code section, and executes the
+   first function body on an i32 stack. Supports the i32 arithmetic/bitwise core
+   (const/add/sub/mul/and/or/xor) — real bytecode execution, not a stub.
+   Returns the i32 result of the (no-arg) entry function; -1 on parse error. */
+
+static uint64_t wasm_uleb(const unsigned char* b, size_t len, size_t* pos) {
+    uint64_t result = 0; int shift = 0;
+    while (*pos < len) {
+        unsigned char byte = b[*pos]; (*pos)++;
+        result |= (uint64_t)(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) break;
+        shift += 7; if (shift >= 64) break;
+    }
+    return result;
+}
+static int64_t wasm_sleb(const unsigned char* b, size_t len, size_t* pos) {
+    int64_t result = 0; int shift = 0; unsigned char byte = 0;
+    while (*pos < len) {
+        byte = b[*pos]; (*pos)++;
+        result |= (int64_t)(byte & 0x7F) << shift;
+        shift += 7;
+        if ((byte & 0x80) == 0) break;
+    }
+    if (shift < 64 && (byte & 0x40)) result |= -((int64_t)1 << shift);
+    return result;
+}
+
 int64_t nova_rt_wasm_run(int64_t handle) {
     int idx = (int)handle;
     if (idx < 0 || idx >= g_wasm_count || !g_wasm_modules[idx].valid) return -1;
-    return 0;
+    const unsigned char* b = (const unsigned char*)g_wasm_modules[idx].bytes;
+    size_t len = g_wasm_modules[idx].size;
+    if (len < 8 || b[0]!=0x00 || b[1]!=0x61 || b[2]!=0x73 || b[3]!=0x6D) return -1; /* \0asm */
+
+    /* Walk sections to find the code section (id 10). */
+    size_t pos = 8, code_pos = 0, code_end = 0;
+    while (pos < len) {
+        unsigned char sid = b[pos++];
+        uint64_t ssize = wasm_uleb(b, len, &pos);
+        if (pos + ssize > len) return -1;
+        if (sid == 10) { code_pos = pos; code_end = pos + (size_t)ssize; break; }
+        pos += (size_t)ssize;
+    }
+    if (code_pos == 0) return -1;
+
+    size_t cp = code_pos;
+    uint64_t fcount = wasm_uleb(b, len, &cp);
+    if (fcount == 0) return -1;
+    uint64_t body_size = wasm_uleb(b, len, &cp);
+    size_t body_end = cp + (size_t)body_size;
+    if (body_end > code_end) return -1;
+    /* skip local declarations: count of (n, valtype) groups */
+    uint64_t local_groups = wasm_uleb(b, len, &cp);
+    for (uint64_t i = 0; i < local_groups && cp < body_end; i++) {
+        wasm_uleb(b, len, &cp);      /* group count */
+        if (cp < body_end) cp++;     /* value type byte */
+    }
+
+    int64_t stack[256]; int sp = 0;
+    while (cp < body_end) {
+        unsigned char op = b[cp++];
+        if (op == 0x41) { int64_t v = wasm_sleb(b, len, &cp); if (sp < 256) stack[sp++] = (int32_t)v; }
+        else if (op == 0x6A) { if (sp<2) return -1; int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x+y); }
+        else if (op == 0x6B) { if (sp<2) return -1; int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x-y); }
+        else if (op == 0x6C) { if (sp<2) return -1; int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x*y); }
+        else if (op == 0x71) { if (sp<2) return -1; int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=x&y; }
+        else if (op == 0x72) { if (sp<2) return -1; int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=x|y; }
+        else if (op == 0x73) { if (sp<2) return -1; int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=x^y; }
+        else if (op == 0x0B) { break; } /* end */
+        else { return -1; } /* unsupported opcode for this minimal interpreter */
+    }
+    return (sp > 0) ? stack[sp-1] : 0;
 }
 
 /* nova_rt_wasm_free: Release a WASM module and its bytecode buffer. */
