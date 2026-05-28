@@ -286,7 +286,8 @@ typedef enum {
     NOVA_MEM_CHANNEL = 3,
     NOVA_MEM_FAT_STR = 4,
     NOVA_MEM_STRUCT  = 5,
-    NOVA_MEM_ITER    = 6
+    NOVA_MEM_ITER    = 6,
+    NOVA_MEM_BOX     = 7   /* tagged primitive (bool/float) widened to Any */
 } NovaMemTag;
 
 static int64_t      nova_mem_live    = 0;
@@ -392,6 +393,34 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
     /* Mask to the low 3 kind bits: structs pack a slot count above them. */
     if (NOVA_RC_VALID(ptr)) return (NovaMemTag)(NOVA_RC_TAG(ptr) & 0x7);
     return (NovaMemTag)-1;
+}
+
+/* ── Boxed primitives (bool/float) for Any-typed values ───────────────────
+   Only bool/float are boxed; int stays raw, so the compiler's own List<Any>
+   of ints/strings/structs is unaffected (bootstrap-safe). A box is a tagged
+   heap cell: { kind, payload }. json/any_to_str read the kind to render correctly. */
+typedef struct { int64_t kind; int64_t payload; } NovaBox;
+#define NOVA_BOX_BOOL  0
+#define NOVA_BOX_FLOAT 1
+
+int64_t nova_rt_box_bool(int64_t v) {
+    NovaBox* b = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
+    if (!b) return 0;
+    b->kind = NOVA_BOX_BOOL; b->payload = v ? 1 : 0;
+    return (int64_t)(uintptr_t)b;
+}
+int64_t nova_rt_box_float(int64_t bits) {
+    NovaBox* b = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
+    if (!b) return 0;
+    b->kind = NOVA_BOX_FLOAT; b->payload = bits;
+    return (int64_t)(uintptr_t)b;
+}
+/* If handle points to a box, return its raw payload; otherwise pass through. */
+int64_t nova_rt_unbox(int64_t handle) {
+    if (!handle) return handle;
+    void* p = (void*)(uintptr_t)handle;
+    if (nova_mem_find_tag(p) == NOVA_MEM_BOX) return ((NovaBox*)p)->payload;
+    return handle;
 }
 
 void nova_rt_track_raw(void* ptr) {
@@ -2024,6 +2053,18 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
 
     void* ptr = (void*)(uintptr_t)val;
     NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_BOX) {
+        NovaBox* bx = (NovaBox*)ptr;
+        if (bx->kind == NOVA_BOX_BOOL) {
+            if (bx->payload) jbuf_append(b, "true", 4);
+            else jbuf_append(b, "false", 5);
+        } else { /* NOVA_BOX_FLOAT */
+            double dv; memcpy(&dv, &bx->payload, sizeof(dv));
+            char fb[40]; snprintf(fb, sizeof(fb), "%g", dv);
+            jbuf_append(b, fb, (int64_t)strlen(fb));
+        }
+        return;
+    }
     if (tag == NOVA_MEM_DICT) {
         NovaDict* d = (NovaDict*)ptr;
         jbuf_char(b, '{');

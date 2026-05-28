@@ -26,6 +26,15 @@ cannot itself be REAL.
 ### #1 — `Any`-typed primitives lose their type at runtime (value-model soundness gap)
 
 **Found:** 2026-05-28 via json_oracle_test.nova. **Severity:** foundational.
+**Progress 2026-05-29:** Runtime BOX LAYER landed + validated (66/66 green). Added `NOVA_MEM_BOX` tag
+(value 7) + `NovaBox{kind,payload}` + `nova_rt_box_bool`/`box_float`/`unbox`; json_stringify_value now
+renders a boxed bool as true/false and a boxed float via %g. Only bool/float box (int stays raw) so the
+compiler's own List<Any> of ints/structs is bootstrap-safe. NOTHING creates boxes yet → zero behavior
+change (foundation only). **Remaining (the deep part):** compiler-side widening insertion — box a
+float/bool when it enters an Any context (container insert, Any arg, return) + transparent unbox at every
+element read. Wide blast radius (every runtime path reading container elements directly: sum/sort/map/
+to_str…), so it must be done incrementally with bootstrap re-validation per step. bool also needs IR-level
+tracking (currently erased to "int" at nova_compiler.nova:4535). This is the dedicated effort.
 
 NOVA stores integers and pointers in the same 64-bit slot with no tag bit. Heap objects are
 identified by `nova_mem_find_tag(ptr)`; primitives are not tagged. When a primitive is passed to an
