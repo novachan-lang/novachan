@@ -9845,6 +9845,19 @@ int64_t nova_rt_json_encode(int64_t val) {
     return nova_rt_create_string((void*)(uintptr_t)raw);
 }
 
+/* Type-specialized JSON encoders. The compiler routes a json_encode call here when
+   it statically knows the argument is a float/bool, since the runtime can't recover
+   a primitive's type from a bare i64 (FINDING #1). Fixes json_encode(3.14)->"3.14"
+   (was garbage bits) and json_encode(true)->"true". */
+int64_t nova_rt_json_encode_float(int64_t bits) {
+    double d; memcpy(&d, &bits, sizeof(d));
+    char buf[40]; snprintf(buf, sizeof(buf), "%g", d);
+    return nova_rt_create_string((void*)buf);
+}
+int64_t nova_rt_json_encode_bool(int64_t v) {
+    return nova_rt_create_string((void*)(v ? "true" : "false"));
+}
+
 /* nova_rt_json_decode: Parse a JSON string into a NOVA value. */
 int64_t nova_rt_json_decode(int64_t str_val) {
     return nova_rt_json_parse(str_val);

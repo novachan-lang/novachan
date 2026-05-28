@@ -130,7 +130,7 @@ trust the label."
 | Result / Option + `?` | REAL | Track 6 |
 | Arena allocator, weak refs, checked arithmetic | REAL | Track 8 |
 | Tensor (n-D float): zeros, matmul, add, mul, scale, sum, relu | **REAL** | matmul verified real (nova_runtime.c:5218). *This is the true AI primitive.* |
-| JSON parse / stringify | **REAL (ints/strings/containers) ✓ / PARTIAL (bool)** | FIXED 2026-05-28: removed the 0→null / 1→true heuristics that corrupted every integer 0/1 (incl. in number arrays). json_encode(0)→"0", [0,1,2]→"[0,1,2]" now exact; 65/65 regression still green; oracle json_oracle_test.nova PASS. Remaining edge: standalone bool renders 1/0 and mixed-primitive `List<Any>` need the tagged value model (FINDING #1). |
+| JSON parse / stringify | **REAL (ints/strings/containers/top-level float) ✓ / PARTIAL (bool, nested float)** | FIXED 2026-05-28: removed 0→null/1→true heuristics (ints exact, incl. arrays). FIXED 2026-05-29: compiler routes json_encode(float)→nova_rt_json_encode_float (json_encode(3.14)→"3.14"; was garbage bits); json_float_test PASS, 67/67 green, bootstrap fixpoint FB721EB780005623. Remaining: standalone bool→1/0 (bool erased to "int" in IR) and floats NESTED in dicts/lists (need container boxing — FINDING #1 deep part). |
 | Regex (match/find/replace/split) | **REAL ✓** | CONFIRMED 2026-05-28: \d \w \s . ? + * [] ^ $ all match known semantics. regex_test.nova. (Deeper RE2 differential deferred to Phase 7 hardening.) |
 | Crypto: sha256, hmac_sha256, base64, hex, crc32, fnv1a, murmur3, uuid4 | **REAL ✓** | CONFIRMED 2026-05-28: sha256("")=e3b0c44…b855 (NIST), hmac=f7bc83f4… (RFC), base64/hex match. test_crypto_stdlib.nova |
 | datetime | REAL? | Cross-check vs known timestamps |
