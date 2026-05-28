@@ -36,6 +36,16 @@ element read. Wide blast radius (every runtime path reading container elements d
 to_str…), so it must be done incrementally with bootstrap re-validation per step. bool also needs IR-level
 tracking (currently erased to "int" at nova_compiler.nova:4535). This is the dedicated effort.
 
+**Nested-container blocker found 2026-05-29 (perf):** Boxing floats/bools inside dicts/lists requires
+*unboxing on every generic container read* (list_get/iter_next/dict_get/index_get). The only safe box
+check is `nova_mem_find_tag`, which uses `IsBadReadPtr` on Windows — a kernel-ish call. Putting that on
+every element read tanks performance (the compiler traverses List<Any> constantly), breaking the 0.98×-C
+promise. So nested boxing is NOT just wiring — it needs a cheaper value-discrimination scheme
+(NaN-boxing, or a tag checkable without IsBadReadPtr, e.g. a fast heap-range bitmap). That is a genuine
+value-model redesign requiring design + benchmarking. DONE so far (safe, validated): int JSON correct
+(2026-05-28), top-level float JSON correct (2026-05-29), runtime box layer landed (744780f). DEFERRED
+(needs redesign): floats/bools nested in containers; standalone bool (also needs IR bool tracking).
+
 NOVA stores integers and pointers in the same 64-bit slot with no tag bit. Heap objects are
 identified by `nova_mem_find_tag(ptr)`; primitives are not tagged. When a primitive is passed to an
 `Any`-typed parameter, the runtime cannot tell `int 0`, `bool false`, and `null` apart — they are
