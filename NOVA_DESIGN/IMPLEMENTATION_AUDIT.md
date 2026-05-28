@@ -61,7 +61,14 @@ only as dedicated Track-8 work with bootstrap re-validation at each step. Hetero
 
 ---
 
-### #2 — User-defined functions do not shadow built-ins (silent wrong-call)
+### #2 — User-defined functions do not shadow built-ins (silent wrong-call) — RESOLVED ✓ 2026-05-28
+
+**Status: FIXED.** ir_lower_expr (nova_compiler.nova:4655) now uses the user function's own name
+when one exists, only falling back to `resolve_runtime_fn` for non-user names. Validated:
+shadow_test.nova (user `fn ok` returns Box(105), not the builtin Result); 66/66 regression green;
+the sole compiler-internal collision `float_bits` is semantically identical to its builtin
+(both atof/strtod→bits) so behavior is unchanged; bootstrap fixpoint CONFIRMED (gen13==gen14,
+SHA 1BF4A488A9A7726E, deterministic). Canonical compiler gen3_test.exe = gen13 (923,136 bytes).
 
 **Found:** 2026-05-28 while debugging the HTTP demo. **Severity:** soundness (silent miscompile).
 

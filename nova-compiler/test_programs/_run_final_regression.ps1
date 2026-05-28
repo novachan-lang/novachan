@@ -27,7 +27,8 @@ $core_tests = @(
     'default_params_test','tuple_test','method_test',
     'math_quick_test','else_sibling_test',
     'mini_struct_test','mini2_test',
-    'stdlib_test','mixed_arith_test'
+    'stdlib_test','mixed_arith_test',
+    'shadow_test'
 )
 
 # Phase 12-14 new tests
