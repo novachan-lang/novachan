@@ -9898,11 +9898,13 @@ typedef struct {
     int ntypes; int tp[256]; int tr[256];        /* type i: nparams / nresults */
     int nfuncs; int ftype[256];                   /* func i -> type idx */
     size_t fbody[256]; size_t fend[256];          /* func i: body start / end */
+    int mem_pages;                                /* declared linear-memory min pages (0 = none) */
+    unsigned char* mem; size_t mem_size;          /* shared linear memory (across all call frames) */
 } WasmMod;
 typedef struct { int kind; size_t loop_start; size_t end_pos; } WasmCtrl; /* 0 block,1 loop,2 if */
 
 static int wasm_parse(WasmMod* m, const unsigned char* b, size_t len) {
-    m->b = b; m->len = len; m->ntypes = 0; m->nfuncs = 0;
+    m->b = b; m->len = len; m->ntypes = 0; m->nfuncs = 0; m->mem_pages = 0; m->mem = NULL; m->mem_size = 0;
     if (len < 8 || b[0]!=0x00||b[1]!=0x61||b[2]!=0x73||b[3]!=0x6D) return 0;
     size_t pos = 8; int code_funcs = 0;
     while (pos < len) {
@@ -9924,6 +9926,9 @@ static int wasm_parse(WasmMod* m, const unsigned char* b, size_t len) {
         } else if (sid == 3) {                     /* function */
             uint64_t cnt = wasm_uleb(b, len, &q);
             for (uint64_t i = 0; i < cnt && i < 256; i++) { m->ftype[i] = (int)wasm_uleb(b, len, &q); m->nfuncs++; }
+        } else if (sid == 5) {                     /* memory: take the first memory's min pages */
+            uint64_t cnt = wasm_uleb(b, len, &q);
+            if (cnt > 0) { uint64_t flags = wasm_uleb(b, len, &q); uint64_t mn = wasm_uleb(b, len, &q); (void)flags; m->mem_pages = (int)mn; }
         } else if (sid == 10) {                    /* code */
             uint64_t cnt = wasm_uleb(b, len, &q);
             for (uint64_t i = 0; i < cnt && i < 256; i++) {
@@ -9997,6 +10002,17 @@ static int64_t wasm_exec(WasmMod* m, int funcidx, const int64_t* args, int nargs
             if (!sub_ok) { ok = 0; break; }
             if (cnr >= 1 && sp < 1024) stack[sp++] = r;
         }
+        /* linear memory: load/store (memarg = align uleb, offset uleb; ea = base + offset) */
+        else if (op == 0x28) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<1){ok=0;break;} uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+4>m->mem_size){ok=0;break;} int32_t v; memcpy(&v,m->mem+ea,4); stack[sp++]=v; }          /* i32.load */
+        else if (op == 0x2C) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<1){ok=0;break;} uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+1>m->mem_size){ok=0;break;} stack[sp++]=(int32_t)(int8_t)m->mem[ea]; }        /* i32.load8_s */
+        else if (op == 0x2D) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<1){ok=0;break;} uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+1>m->mem_size){ok=0;break;} stack[sp++]=(int32_t)m->mem[ea]; }                /* i32.load8_u */
+        else if (op == 0x2E) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<1){ok=0;break;} uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+2>m->mem_size){ok=0;break;} int16_t v; memcpy(&v,m->mem+ea,2); stack[sp++]=(int32_t)v; }  /* i32.load16_s */
+        else if (op == 0x2F) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<1){ok=0;break;} uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+2>m->mem_size){ok=0;break;} uint16_t v; memcpy(&v,m->mem+ea,2); stack[sp++]=(int32_t)v; } /* i32.load16_u */
+        else if (op == 0x36) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<2){ok=0;break;} int32_t v=(int32_t)stack[--sp]; uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+4>m->mem_size){ok=0;break;} memcpy(m->mem+ea,&v,4); }      /* i32.store */
+        else if (op == 0x3A) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<2){ok=0;break;} int32_t v=(int32_t)stack[--sp]; uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+1>m->mem_size){ok=0;break;} m->mem[ea]=(unsigned char)(v&0xFF); } /* i32.store8 */
+        else if (op == 0x3B) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<2){ok=0;break;} int32_t v=(int32_t)stack[--sp]; uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+2>m->mem_size){ok=0;break;} uint16_t h=(uint16_t)(v&0xFFFF); memcpy(m->mem+ea,&h,2); } /* i32.store16 */
+        else if (op == 0x3F) { if (cp < body_end) cp++; if (sp < 1024) stack[sp++] = (int64_t)(m->mem_size / 65536); }                              /* memory.size (pages) */
+        else if (op == 0x40) { if (cp < body_end) cp++; if (sp > 0) sp--; if (sp < 1024) stack[sp++] = -1; }                                        /* memory.grow: unsupported → -1 */
         else if (op == 0x6A) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x+y); }
         else if (op == 0x6B) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x-y); }
         else if (op == 0x6C) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x*y); }
@@ -10043,8 +10059,15 @@ int64_t nova_rt_wasm_run(int64_t handle) {
     if (idx < 0 || idx >= g_wasm_count || !g_wasm_modules[idx].valid) return -1;
     WasmMod m;
     if (!wasm_parse(&m, (const unsigned char*)g_wasm_modules[idx].bytes, g_wasm_modules[idx].size)) return -1;
+    if (m.mem_pages > 0) {
+        m.mem_size = (size_t)m.mem_pages * 65536;
+        if (m.mem_size > (size_t)256 * 1024 * 1024) return -1;   /* sane cap */
+        m.mem = (unsigned char*)calloc(m.mem_size, 1);
+        if (!m.mem) return -1;
+    }
     int ok = 1;
     int64_t r = wasm_exec(&m, 0, NULL, 0, 0, &ok);   /* entry = function 0, no args */
+    if (m.mem) free(m.mem);
     return ok ? r : -1;
 }
 
