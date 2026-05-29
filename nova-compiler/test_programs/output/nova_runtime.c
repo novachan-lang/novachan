@@ -697,6 +697,9 @@ int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
 int64_t nova_rt_list_append_fbox(int64_t handle, int64_t bits) {
     return nova_rt_list_append(handle, nova_rt_box_float(bits));
 }
+int64_t nova_rt_list_append_bbox(int64_t handle, int64_t v) {
+    return nova_rt_list_append(handle, nova_rt_box_bool(v));
+}
 
 int64_t nova_rt_list_get(int64_t handle, int64_t index) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
@@ -1273,6 +1276,9 @@ int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
    The compiler routes d[k] = floatExpr here when the value is statically float. */
 int64_t nova_rt_dict_set_fbox(int64_t handle, int64_t key, int64_t bits) {
     return nova_rt_dict_set(handle, key, nova_rt_box_float(bits));
+}
+int64_t nova_rt_dict_set_bbox(int64_t handle, int64_t key, int64_t v) {
+    return nova_rt_dict_set(handle, key, nova_rt_box_bool(v));
 }
 
 int64_t nova_rt_dict_has(int64_t handle, int64_t key) {

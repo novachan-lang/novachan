@@ -23,7 +23,19 @@ cannot itself be REAL.
 
 ## CRITICAL FINDINGS (foundation issues that must be fixed before building on top)
 
-### #1 — `Any`-typed primitives lose their type at runtime (value-model soundness gap)
+### #1 — `Any`-typed primitives lose their type at runtime — RESOLVED ✓ 2026-05-29
+
+**Status: RESOLVED for all statically-typed primitives.** int, float, AND bool now serialize correctly
+across scalar / list / dict, with correct read-back (unbox). Solved via: (a) box layer + box-ADDRESS-RANGE
+tracking (cheap collision-safe box check, no per-read IsBadReadPtr — resolved the perf blocker); (b) compiler
+boxes float/bool at typed insertion points (list_append_fbox/bbox, dict_set_fbox/bbox, index_set fbox/bbox
+markers) since the compiler knows the static type; (c) JSON walker + any_to_str render boxes; (d) accessors
+(list_get, inlined index-get, dict_get) transparently unbox. bool literals now carry ir_type_bool (still a
+const_int op → optimizer unaffected). Validated: bool_json_test, nested_float_test, dict_float_test,
+nested_bool_test; 71/71 regression green; 7 bootstrap fixpoints (last DB7DDE366DAA648E). Remaining theoretical
+edge: a genuinely-dynamic Any value (unknown runtime type, not statically a primitive) widened into a
+container won't box — rare; the common typed cases all work. Commits: 744780f, 8f93a8a, 9e4ce74, 7c7b746,
+ef3c397, + nested-bool.
 
 **Found:** 2026-05-28 via json_oracle_test.nova. **Severity:** foundational.
 **Progress 2026-05-29:** Runtime BOX LAYER landed + validated (66/66 green). Added `NOVA_MEM_BOX` tag

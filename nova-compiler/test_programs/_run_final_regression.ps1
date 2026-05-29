@@ -28,7 +28,7 @@ $core_tests = @(
     'math_quick_test','else_sibling_test',
     'mini_struct_test','mini2_test',
     'stdlib_test','mixed_arith_test',
-    'shadow_test','json_float_test','nested_float_test','dict_float_test','bool_json_test'
+    'shadow_test','json_float_test','nested_float_test','dict_float_test','bool_json_test','nested_bool_test'
 )
 
 # Phase 12-14 new tests
