@@ -74,7 +74,7 @@ Both compiler-soundness findings (#1 value model, #2 shadowing) are RESOLVED + b
 | **12** GPU compute | elementwise kernels | **REAL compute, CPU backend ✓** | gpu_compute_test; real-device dispatch (CUDA/Metal/Vulkan) TODO |
 | **13** web framework | request parse, routing, response build, JSON | **REAL ✓** | http_demo end-to-end |
 | **13** AI inference | tensor matmul/add/relu, softmax/sigmoid, file model-load → classify (argmax) | **REAL ✓** | ai_classify_test (logits→class), tensor matmul verified |
-| **13** AI model formats | ONNX/GGUF loaders + conv2d | **STUB/TODO** | custom text format works; standard formats not done |
+| **13** AI model formats | GGUF (llama.cpp/ggml) structure parse in NOVA; ONNX + conv2d TODO | **GGUF parse REAL ✓ (2026-05-30) / ONNX TODO** | gguf_test.nova parses a real GGUF v3 file (magic/version/counts/metadata-KV/tensor-info) via read_bytes — oracle: version 3, kv answer=42, tensor w dims=[3] f32 (_gguf_probe.ps1). REMAINING: read f32 weights into tensors (needs f32→f64), ONNX (protobuf), conv2d. |
 | **13** game/ECS | entity/component CRUD + query | **PARTIAL** | functional linear-scan; no archetype perf, no render/audio/physics |
 | **14** deploy | `deploy_config/validate` | **PARTIAL/THIN** | builds config dict; no real provider integration |
 | **14** mobile/embedded | targets | **TODO** | not started |
