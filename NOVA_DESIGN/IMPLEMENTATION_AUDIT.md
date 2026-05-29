@@ -231,6 +231,20 @@ unbox); this is purely raw readers bypassing the accessor. See DEEP_AUDIT_2026-0
 
 See DEEP_AUDIT_2026-05-29 §4.
 
+### #6 — RC/tag checks dereferenced non-pointers (Linux/macOS segfault) — RESOLVED ✓ 2026-05-29 (P0, found via Docker)
+
+**Status: RESOLVED.** Found when first running NOVA on Linux (Docker): `ai_serve` built + started but **segfaulted
+on the first request**. Root cause: `nova_mem_find_tag` / `nova_rc_is_managed` read a value's RC header
+(`ptr[-1]`) to test if it's a managed object, guarded only by Windows' `IsBadReadPtr`. A raw float-bit value (e.g.
+from `json_decode`, ~4.6e18) or a medium int looks like an address; on Linux there's no `IsBadReadPtr`, so the deref
+faults. Also `nova_heap_base` was stuck at 0 (its update was gated on already being non-zero), so the lower bound
+never applied. **Fix:** `nova_track_heap_bounds` updates `[heap_base, heap_top)` on EVERY RC-headered allocation
+(slab, calloc, and the two fat-string mallocs); both checks now reject any value outside that extent with two cheap
+compares BEFORE dereferencing — safe on every OS (Windows `IsBadReadPtr` kept as a backstop). **Validated:** Windows
+78/78 still green; **`ai_serve` runs on Linux in Docker and returns `{"class":1}`** for `{"features":[1,2]}`
+(_docker_validate.ps1) — a real cross-platform HTTP-inference oracle. This makes NOVA genuinely cross-platform: the
+runtime compiles clean on Linux (sound `#ifdef` guards) and the full HTTP+JSON+tensor stack works there.
+
 ### #5 — Fake `model_load`/`model_infer`/`model_close` removed — RESOLVED ✓ 2026-05-29 (P1)
 
 The legacy model API performed no real computation (`model_infer` was identity; `model_load` kept only the path).
@@ -307,7 +321,8 @@ trust the label."
 | **AI model loading + full pipeline** | — | **REAL ✓ (custom format, 2026-05-28)** | Real loader in NOVA: read_file → parse → tensor_from_list → matmul. Oracle: persisted 2x3 weights, loaded, x@W=[3,4,7] hand-computed. ai_model_test.nova. Full pipeline REAL: file→tensors→matmul→relu/softmax/sigmoid. REMAINING: standard formats (ONNX/GGUF) + conv op. |
 | AI legacy stubs (`model_infer` identity, `arr_*`) | done | STUB + REDUNDANT | Superseded by the real tensor pipeline above; these trivial 1D-int stubs should be removed/ignored. |
 | **Game/ECS** (`ecs_*`) | done | PARTIAL | Functional but flat linear-scan array (nova_runtime.c:9632). No rendering, audio, physics, scene graph. | Real archetype/sparse-set ECS + a render/audio/physics backend. Oracle: spawn 100k entities, query perf vs flecs/entt. |
-| **HTTP client** (`http_get/post`) | done | PARTIAL | WinHTTP on Windows (real); "not implemented" on Linux/macOS (nova_runtime.c:3826). | Cross-platform (libcurl or native). Oracle: GET a real endpoint on all 3 OSes. |
+| **HTTP client** (`http_get/post`) | done | PARTIAL | WinHTTP on Windows (real); "not implemented" on Linux/macOS. | Cross-platform client (libcurl/native). Oracle: GET a real endpoint on all 3 OSes. |
+| **HTTP server + runtime on Linux** | — | **REAL ✓ (validated 2026-05-29 via Docker)** | The NOVA runtime compiles clean on Linux (clang) and `ai_serve` (http_listen/accept_raw/send_raw + json + tensor) serves real inference: POST `{"features":[1,2]}` → `{"class":1}` in a Linux container. Required the cross-platform RC-deref fix (Finding #6). |
 | **Debugger** (DAP) | done | STUB | Logs only, no real breakpoints/stepping (nova_runtime.c:8933). | Real DAP server bridging LLDB/GDB. Oracle: set breakpoint, step, inspect a var. |
 | **Deploy** (`deploy_config/validate`) | done | THIN | Builds a dict (nova_runtime.c:9744). No real provider integration. | Real provider APIs (Fly/Docker). Oracle: actually deploy a hello-world and curl it. |
 

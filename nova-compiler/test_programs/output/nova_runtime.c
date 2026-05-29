@@ -69,6 +69,15 @@ static void nova_set_error(const char* msg) {
 static uintptr_t nova_heap_base;
 static uintptr_t nova_heap_top;
 
+/* Track the [base, top) extent of EVERY RC-managed allocation. This lets the tag/RC
+   checks reject a non-pointer value (a raw int or float-bit pattern) with two cheap
+   compares BEFORE dereferencing it — essential on Linux/macOS where there is no
+   IsBadReadPtr to catch a bad read. Every header-creating allocation must call this. */
+static void nova_track_heap_bounds(uintptr_t base_addr, uintptr_t end_addr) {
+    if (nova_heap_base == 0 || base_addr < nova_heap_base) nova_heap_base = base_addr;
+    if (end_addr > nova_heap_top) nova_heap_top = end_addr;
+}
+
 typedef struct NovaSlabPage {
     struct NovaSlabPage* next;
     char data[1]; /* flexible: SLAB_PAGE_OBJECTS * obj_size bytes follow */
@@ -116,10 +125,7 @@ static void nova_slab_grow(NovaSlabPool* pool) {
     if (!page) return;
     uintptr_t page_addr = (uintptr_t)page;
     uintptr_t page_end = page_addr + header_size + page_data_size;
-    if (nova_heap_base && page_addr < nova_heap_base)
-        nova_heap_base = page_addr;
-    if (page_end > nova_heap_top)
-        nova_heap_top = page_end;
+    nova_track_heap_bounds(page_addr, page_end);
     page->next = pool->pages;
     pool->pages = page;
     char* base = page->data;
@@ -331,14 +337,7 @@ static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
         base = (char*)nova_slab_alloc(&nova_slab_64);
     else {
         base = (char*)calloc(1, total);
-        if (base) {
-            uintptr_t baddr = (uintptr_t)base;
-            if (nova_heap_base && baddr < nova_heap_base)
-                nova_heap_base = baddr;
-            uintptr_t bend = baddr + total;
-            if (bend > nova_heap_top)
-                nova_heap_top = bend;
-        }
+        if (base) nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + total);
     }
     if (!base) return NULL;
     ((int32_t*)base)[0] = 1;
@@ -380,13 +379,15 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
     if (!ptr) return (NovaMemTag)-1;
     uintptr_t addr = (uintptr_t)ptr;
     if (addr < 0x10000ULL) return (NovaMemTag)-1;
-    if (nova_heap_base && addr < nova_heap_base) return (NovaMemTag)-1;
-    if (nova_heap_top && addr > nova_heap_top + 0x10000000000ULL) return (NovaMemTag)-1;
     if (nova_int_str_cache_inited &&
         (char*)ptr >= nova_int_str_cache[0] &&
         (char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
         return (NovaMemTag)-1;
     if (nova_strpool_contains(ptr)) return NOVA_MEM_RAW;
+    /* Range-bound to the tracked managed-heap extent BEFORE any dereference. A value
+       outside [heap_base, heap_top) cannot be a NOVA heap object (it's a raw int or
+       float-bit pattern), so reject it without touching memory — safe on every OS. */
+    if (nova_heap_base && (addr < nova_heap_base || addr >= nova_heap_top)) return (NovaMemTag)-1;
 #ifdef _WIN32
     if (IsBadReadPtr((char*)ptr - NOVA_RC_HDR_SIZE, NOVA_RC_HDR_SIZE)) return (NovaMemTag)-1;
 #endif
@@ -611,6 +612,7 @@ static char* nova_fat_str_create(const char* src, size_t len) {
     ((int64_t*)base)[1] = (int64_t)len;
     ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[0] = 1;
     ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[1] = NOVA_RC_ENCODE(NOVA_MEM_FAT_STR);
+    nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + len + 1);
     nova_mem_total++;
     nova_mem_live++;
     return str;
@@ -638,6 +640,7 @@ static char* nova_fat_str_concat(const char* sa, size_t la,
     ((int64_t*)base)[1] = (int64_t)total;
     ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[0] = 1;
     ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[1] = NOVA_RC_ENCODE(NOVA_MEM_FAT_STR);
+    nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + total + 1);
     nova_mem_total++;
     nova_mem_live++;
     return str;
@@ -3688,12 +3691,16 @@ static void nova_rc_free(void* ptr) {
 
 static inline int nova_rc_is_managed(void* ptr) {
     uintptr_t addr = (uintptr_t)ptr;
-    if (nova_heap_base && addr < nova_heap_base) return 0;
+    if (addr < 0x10000ULL) return 0;
     if (nova_int_str_cache_inited &&
         (char*)ptr >= nova_int_str_cache[0] &&
         (char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
         return 0;
     if (nova_strpool_contains(ptr)) return -1;
+    /* Range-bound to the tracked managed heap BEFORE dereferencing — a value outside
+       [heap_base, heap_top) is a raw int / float-bit pattern, not a heap object. This
+       is what makes RC safe on Linux/macOS (no IsBadReadPtr backstop there). */
+    if (nova_heap_base && (addr < nova_heap_base || addr >= nova_heap_top)) return 0;
 #ifdef _WIN32
     if (IsBadReadPtr((char*)ptr - NOVA_RC_HDR_SIZE, NOVA_RC_HDR_SIZE)) return 0;
 #endif
