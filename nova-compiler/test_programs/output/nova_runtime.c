@@ -10747,3 +10747,214 @@ int64_t nova_rt_semver_compatible(int64_t v1_val, int64_t v2_val) {
     int maj2 = (int)strtol(s2, NULL, 10);
     return maj1 == maj2 ? 1 : 0;
 }
+
+/* ── GPU compute (OpenCL, dynamic-loaded) ──────────────────────────────────
+   Loads OpenCL.dll (Windows) or libOpenCL.so (Linux) at runtime via
+   LoadLibrary/dlopen — no link-time dependency, no header dependency.
+   Init is lazy + once-per-process; the program/kernel/context are cached
+   after first successful build, so repeated kernel calls amortize. */
+
+typedef int32_t  cl_int_t;
+typedef uint32_t cl_uint_t;
+typedef uint64_t cl_ulong_t;
+typedef void*    cl_handle_t;
+typedef intptr_t cl_intptr_t_t;
+
+#define NCL_DEVICE_TYPE_GPU   (1<<2)
+#define NCL_MEM_READ_ONLY     (1<<2)
+#define NCL_MEM_WRITE_ONLY    (1<<1)
+#define NCL_MEM_COPY_HOST_PTR (1<<5)
+#define NCL_TRUE              1
+#define NCL_PROGRAM_BUILD_LOG 0x1183
+
+typedef cl_int_t (*PFN_GetPlatformIDs)(cl_uint_t, cl_handle_t*, cl_uint_t*);
+typedef cl_int_t (*PFN_GetDeviceIDs)(cl_handle_t, cl_ulong_t, cl_uint_t, cl_handle_t*, cl_uint_t*);
+typedef cl_handle_t (*PFN_CreateContext)(const cl_intptr_t_t*, cl_uint_t, const cl_handle_t*, void*, void*, cl_int_t*);
+typedef cl_handle_t (*PFN_CreateCommandQueueWithProperties)(cl_handle_t, cl_handle_t, const cl_intptr_t_t*, cl_int_t*);
+typedef cl_handle_t (*PFN_CreateCommandQueue)(cl_handle_t, cl_handle_t, cl_ulong_t, cl_int_t*);
+typedef cl_handle_t (*PFN_CreateBuffer)(cl_handle_t, cl_ulong_t, size_t, void*, cl_int_t*);
+typedef cl_handle_t (*PFN_CreateProgramWithSource)(cl_handle_t, cl_uint_t, const char**, const size_t*, cl_int_t*);
+typedef cl_int_t (*PFN_BuildProgram)(cl_handle_t, cl_uint_t, const cl_handle_t*, const char*, void*, void*);
+typedef cl_int_t (*PFN_GetProgramBuildInfo)(cl_handle_t, cl_handle_t, cl_uint_t, size_t, void*, size_t*);
+typedef cl_handle_t (*PFN_CreateKernel)(cl_handle_t, const char*, cl_int_t*);
+typedef cl_int_t (*PFN_SetKernelArg)(cl_handle_t, cl_uint_t, size_t, const void*);
+typedef cl_int_t (*PFN_EnqueueNDRangeKernel)(cl_handle_t, cl_handle_t, cl_uint_t, const size_t*, const size_t*, const size_t*, cl_uint_t, const cl_handle_t*, cl_handle_t*);
+typedef cl_int_t (*PFN_EnqueueReadBuffer)(cl_handle_t, cl_handle_t, cl_uint_t, size_t, size_t, void*, cl_uint_t, const cl_handle_t*, cl_handle_t*);
+typedef cl_int_t (*PFN_Finish)(cl_handle_t);
+typedef cl_int_t (*PFN_ReleaseMemObject)(cl_handle_t);
+
+static struct {
+    int      tried_init;
+    int      available;
+    void*    dll;
+    cl_handle_t device;
+    cl_handle_t context;
+    cl_handle_t queue;
+    cl_handle_t program;
+    cl_handle_t kernel_vadd;
+    PFN_GetPlatformIDs                    pGetPlatformIDs;
+    PFN_GetDeviceIDs                      pGetDeviceIDs;
+    PFN_CreateContext                     pCreateContext;
+    PFN_CreateCommandQueueWithProperties  pCreateCommandQueueWithProperties;
+    PFN_CreateCommandQueue                pCreateCommandQueue;
+    PFN_CreateBuffer                      pCreateBuffer;
+    PFN_CreateProgramWithSource           pCreateProgramWithSource;
+    PFN_BuildProgram                      pBuildProgram;
+    PFN_GetProgramBuildInfo               pGetProgramBuildInfo;
+    PFN_CreateKernel                      pCreateKernel;
+    PFN_SetKernelArg                      pSetKernelArg;
+    PFN_EnqueueNDRangeKernel              pEnqueueNDRangeKernel;
+    PFN_EnqueueReadBuffer                 pEnqueueReadBuffer;
+    PFN_Finish                            pFinish;
+    PFN_ReleaseMemObject                  pReleaseMemObject;
+} g_gpu = {0};
+
+#ifdef _WIN32
+static void* gpu_dlopen(const char* name) { return (void*)LoadLibraryA(name); }
+static void* gpu_dlsym(void* h, const char* sym) { return (void*)GetProcAddress((HMODULE)h, sym); }
+#else
+static void* gpu_dlopen(const char* name) { return dlopen(name, RTLD_NOW); }
+static void* gpu_dlsym(void* h, const char* sym) { return dlsym(h, sym); }
+#endif
+
+static const char* g_gpu_vadd_src =
+"__kernel void vadd(__global const float* a, __global const float* b, __global float* c) {\n"
+"  int i = get_global_id(0);\n"
+"  c[i] = a[i] + b[i];\n"
+"}\n";
+
+static void nova_gpu_init(void) {
+    if (g_gpu.tried_init) return;
+    g_gpu.tried_init = 1;
+#ifdef _WIN32
+    g_gpu.dll = gpu_dlopen("OpenCL.dll");
+#else
+    g_gpu.dll = gpu_dlopen("libOpenCL.so.1");
+    if (!g_gpu.dll) g_gpu.dll = gpu_dlopen("libOpenCL.so");
+#endif
+    if (!g_gpu.dll) return;
+
+    g_gpu.pGetPlatformIDs                   = (PFN_GetPlatformIDs)gpu_dlsym(g_gpu.dll, "clGetPlatformIDs");
+    g_gpu.pGetDeviceIDs                     = (PFN_GetDeviceIDs)gpu_dlsym(g_gpu.dll, "clGetDeviceIDs");
+    g_gpu.pCreateContext                    = (PFN_CreateContext)gpu_dlsym(g_gpu.dll, "clCreateContext");
+    g_gpu.pCreateCommandQueueWithProperties = (PFN_CreateCommandQueueWithProperties)gpu_dlsym(g_gpu.dll, "clCreateCommandQueueWithProperties");
+    g_gpu.pCreateCommandQueue               = (PFN_CreateCommandQueue)gpu_dlsym(g_gpu.dll, "clCreateCommandQueue");
+    g_gpu.pCreateBuffer                     = (PFN_CreateBuffer)gpu_dlsym(g_gpu.dll, "clCreateBuffer");
+    g_gpu.pCreateProgramWithSource          = (PFN_CreateProgramWithSource)gpu_dlsym(g_gpu.dll, "clCreateProgramWithSource");
+    g_gpu.pBuildProgram                     = (PFN_BuildProgram)gpu_dlsym(g_gpu.dll, "clBuildProgram");
+    g_gpu.pGetProgramBuildInfo              = (PFN_GetProgramBuildInfo)gpu_dlsym(g_gpu.dll, "clGetProgramBuildInfo");
+    g_gpu.pCreateKernel                     = (PFN_CreateKernel)gpu_dlsym(g_gpu.dll, "clCreateKernel");
+    g_gpu.pSetKernelArg                     = (PFN_SetKernelArg)gpu_dlsym(g_gpu.dll, "clSetKernelArg");
+    g_gpu.pEnqueueNDRangeKernel             = (PFN_EnqueueNDRangeKernel)gpu_dlsym(g_gpu.dll, "clEnqueueNDRangeKernel");
+    g_gpu.pEnqueueReadBuffer                = (PFN_EnqueueReadBuffer)gpu_dlsym(g_gpu.dll, "clEnqueueReadBuffer");
+    g_gpu.pFinish                           = (PFN_Finish)gpu_dlsym(g_gpu.dll, "clFinish");
+    g_gpu.pReleaseMemObject                 = (PFN_ReleaseMemObject)gpu_dlsym(g_gpu.dll, "clReleaseMemObject");
+
+    if (!g_gpu.pGetPlatformIDs || !g_gpu.pGetDeviceIDs || !g_gpu.pCreateContext ||
+        !g_gpu.pCreateBuffer || !g_gpu.pCreateProgramWithSource || !g_gpu.pBuildProgram ||
+        !g_gpu.pCreateKernel || !g_gpu.pSetKernelArg || !g_gpu.pEnqueueNDRangeKernel ||
+        !g_gpu.pEnqueueReadBuffer || !g_gpu.pFinish || !g_gpu.pReleaseMemObject) return;
+    if (!g_gpu.pCreateCommandQueueWithProperties && !g_gpu.pCreateCommandQueue) return;
+
+    cl_uint_t nplat = 0;
+    if (g_gpu.pGetPlatformIDs(0, NULL, &nplat) != 0 || nplat == 0) return;
+    cl_handle_t* plats = (cl_handle_t*)calloc(nplat, sizeof(cl_handle_t));
+    if (!plats) return;
+    g_gpu.pGetPlatformIDs(nplat, plats, NULL);
+    for (cl_uint_t i = 0; i < nplat && !g_gpu.device; ++i) {
+        cl_uint_t ndev = 0;
+        if (g_gpu.pGetDeviceIDs(plats[i], NCL_DEVICE_TYPE_GPU, 0, NULL, &ndev) == 0 && ndev > 0) {
+            cl_handle_t devs[8];
+            cl_uint_t want = ndev > 8 ? 8 : ndev;
+            g_gpu.pGetDeviceIDs(plats[i], NCL_DEVICE_TYPE_GPU, want, devs, NULL);
+            g_gpu.device = devs[0];
+        }
+    }
+    free(plats);
+    if (!g_gpu.device) return;
+
+    cl_int_t err = 0;
+    g_gpu.context = g_gpu.pCreateContext(NULL, 1, &g_gpu.device, NULL, NULL, &err);
+    if (!g_gpu.context) return;
+
+    if (g_gpu.pCreateCommandQueueWithProperties) {
+        g_gpu.queue = g_gpu.pCreateCommandQueueWithProperties(g_gpu.context, g_gpu.device, NULL, &err);
+    }
+    if (!g_gpu.queue && g_gpu.pCreateCommandQueue) {
+        g_gpu.queue = g_gpu.pCreateCommandQueue(g_gpu.context, g_gpu.device, 0, &err);
+    }
+    if (!g_gpu.queue) return;
+
+    size_t src_len = strlen(g_gpu_vadd_src);
+    g_gpu.program = g_gpu.pCreateProgramWithSource(g_gpu.context, 1, &g_gpu_vadd_src, &src_len, &err);
+    if (!g_gpu.program) return;
+    if (g_gpu.pBuildProgram(g_gpu.program, 1, &g_gpu.device, "", NULL, NULL) != 0) return;
+    g_gpu.kernel_vadd = g_gpu.pCreateKernel(g_gpu.program, "vadd", &err);
+    if (!g_gpu.kernel_vadd) return;
+
+    g_gpu.available = 1;
+}
+
+int64_t nova_rt_gpu_available(void) {
+    nova_gpu_init();
+    return g_gpu.available ? 1 : 0;
+}
+
+/* GPU vector-add over two float lists: c[i] = a[i] + b[i]. Returns a new
+   list<float>. On failure (GPU unavailable, length mismatch) sets the runtime
+   error and returns a CPU-computed result so the caller still gets correct
+   numerics — soundness over fastness. */
+int64_t nova_rt_gpu_vadd_floats(int64_t a_handle, int64_t b_handle) {
+    NovaList* la = (NovaList*)(uintptr_t)a_handle;
+    NovaList* lb = (NovaList*)(uintptr_t)b_handle;
+    if (!la || !lb) { nova_set_error("gpu_vadd_floats: null list"); return nova_rt_list_create(); }
+    if (la->size != lb->size) { nova_set_error("gpu_vadd_floats: length mismatch"); return nova_rt_list_create(); }
+
+    int64_t n = la->size;
+    int64_t out = nova_rt_list_create();
+    if (n == 0) return out;
+
+    float* ha = (float*)malloc((size_t)n * sizeof(float));
+    float* hb = (float*)malloc((size_t)n * sizeof(float));
+    float* hc = (float*)calloc((size_t)n, sizeof(float));
+    if (!ha || !hb || !hc) { free(ha); free(hb); free(hc); nova_set_error("gpu_vadd_floats: oom"); return out; }
+    for (int64_t i = 0; i < n; ++i) {
+        ha[i] = (float)nova_elem_to_double(la->data[i]);
+        hb[i] = (float)nova_elem_to_double(lb->data[i]);
+    }
+
+    nova_gpu_init();
+    int used_gpu = 0;
+    if (g_gpu.available) {
+        cl_int_t err = 0;
+        cl_handle_t dA = g_gpu.pCreateBuffer(g_gpu.context, NCL_MEM_READ_ONLY | NCL_MEM_COPY_HOST_PTR, (size_t)n * sizeof(float), ha, &err);
+        cl_handle_t dB = g_gpu.pCreateBuffer(g_gpu.context, NCL_MEM_READ_ONLY | NCL_MEM_COPY_HOST_PTR, (size_t)n * sizeof(float), hb, &err);
+        cl_handle_t dC = g_gpu.pCreateBuffer(g_gpu.context, NCL_MEM_WRITE_ONLY, (size_t)n * sizeof(float), NULL, &err);
+        if (dA && dB && dC) {
+            g_gpu.pSetKernelArg(g_gpu.kernel_vadd, 0, sizeof(cl_handle_t), &dA);
+            g_gpu.pSetKernelArg(g_gpu.kernel_vadd, 1, sizeof(cl_handle_t), &dB);
+            g_gpu.pSetKernelArg(g_gpu.kernel_vadd, 2, sizeof(cl_handle_t), &dC);
+            size_t global = (size_t)n;
+            if (g_gpu.pEnqueueNDRangeKernel(g_gpu.queue, g_gpu.kernel_vadd, 1, NULL, &global, NULL, 0, NULL, NULL) == 0) {
+                g_gpu.pFinish(g_gpu.queue);
+                if (g_gpu.pEnqueueReadBuffer(g_gpu.queue, dC, NCL_TRUE, 0, (size_t)n * sizeof(float), hc, 0, NULL, NULL) == 0) {
+                    used_gpu = 1;
+                }
+            }
+        }
+        if (dA) g_gpu.pReleaseMemObject(dA);
+        if (dB) g_gpu.pReleaseMemObject(dB);
+        if (dC) g_gpu.pReleaseMemObject(dC);
+    }
+    if (!used_gpu) {
+        for (int64_t i = 0; i < n; ++i) hc[i] = ha[i] + hb[i];
+    }
+
+    for (int64_t i = 0; i < n; ++i) {
+        double d = (double)hc[i];
+        int64_t bits; memcpy(&bits, &d, sizeof(double));
+        nova_rt_list_append_fbox(out, bits);
+    }
+    free(ha); free(hb); free(hc);
+    return out;
+}
