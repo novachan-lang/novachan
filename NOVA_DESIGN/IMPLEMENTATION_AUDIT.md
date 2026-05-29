@@ -23,9 +23,35 @@ cannot itself be REAL.
 
 ## DEFINITIVE PHASE-BY-PHASE STATUS — consolidated & re-verified 2026-05-29 (compiler gen25)
 
-Single source of truth. Re-verified on the current build: **71/71 regression green**, plus the network/
+Single source of truth. Re-verified on the current build: **77/77 regression green**, plus the network/
 compute oracles re-run live (HTTP, WebSocket, distributed, TLS-to-example.com, WASM, FFI-to-real-C).
 Both compiler-soundness findings (#1 value model, #2 shadowing) are RESOLVED + bootstrap-fixpoint-validated.
+
+> **REMEDIATION STATUS (2026-05-29, post deep audit):** ALL P0 + P1 items RESOLVED + fixpoint-validated, **78/78
+> regression green**, bootstrap deterministic (SHA 9ED0CB7E…):
+> - P0: `read_bytes` implemented (#4); numeric aggregates `sum/min/max/sort/any/all` box/float-aware (#3).
+> - P1: UDP wired + reachable (#4); `dict_contains` dead decl removed (#4); fake `model_*` removed, `phase13_ai_test`
+>   rewritten to a real tensor oracle (#5).
+> - New guards: read_bytes_test, float_list_ops_test, udp_test (78 tests total).
+> - STILL OPEN: P2 capability gaps only (TLS server, WASM control flow, real-device GPU, interactive debugger,
+>   cross-platform HTTP/TLS, distributed fault-tolerance, archetype ECS + render/audio/physics, ONNX/GGUF, deploy).
+>   Dead-code pruning (~17 fns) deferred (harmless — LLVM drops unused).
+
+> **2026-05-29 DEEP CODE-LEVEL AUDIT** — a line-by-line compiler + compiler↔runtime cross-reference audit was run;
+> see [DEEP_AUDIT_2026-05-29.md](DEEP_AUDIT_2026-05-29.md). It confirmed the compiler, value/boxing model, and type
+> system are sound, and confirmed every STUB/PARTIAL claim below was honest. It also found **new defects not visible
+> at the feature level**, now folded in here:
+> - **UDP is UNREACHABLE** — `nova_rt_udp_*` is defined in the runtime but never wired to the compiler. The old
+>   "TCP/UDP sockets REAL" was wrong for UDP (TCP is fine). Corrected below.
+> - **`read_bytes` hard link error** — mapped + declared + type-registered in the compiler but **undefined** in the
+>   runtime; any program calling `read_bytes()` fails to link (latent: no test uses it). Also mis-typed (int→string).
+> - **`sum/min/max/sort/any/all` silently wrong on FLOAT lists** — the same box-unaware-reader class as the tensor
+>   bug fixed this session; int lists unaffected. Runtime-only fix via `nova_elem_to_double`.
+> - **Tensor float-list fix** — `tensor_from_list`/`set`/`scale` now unbox via `nova_elem_to_double`; push/json/file-
+>   built float tensors are correct (regression guard `tensor_boxed_float_test`).
+> - **AI inference HTTP service** (`ai_serve.nova`) — REAL cross-domain oracle: `{"features":[1,2]}`→`{"class":1}`.
+> - `phase13_ai_test` exercises the legacy 1D-int `arr_*` helpers, NOT the tensor pipeline (name overpromises).
+> - ~17 dead runtime functions (~300 lines) incl. the entire UDP subsystem; two-backend (`--old`) duplication hazard.
 
 | Phase | Capability | Status | Evidence / oracle |
 |---|---|---|---|
@@ -166,6 +192,55 @@ itself define names that currently resolve to builtins — validate 65 tests + b
 
 ---
 
+### #3 — Box-unaware numeric readers: `sum/min/max/sort/any/all` wrong on FLOAT lists — RESOLVED ✓ 2026-05-29
+
+**Status: RESOLVED.** `sort`/`any`/`all` made box+float-aware (runtime-only); `sum`/`list_min`/`list_max` now
+type-directed: pure-int lists use the exact integer path, float/Any lists route to `nova_rt_sum_f`/`_min_f`/`_max_f`
+(read each element via `nova_elem_to_double`, return float bits) with the HM signature generalized to `list<T>→T`.
+`nova_elem_to_double` upgraded from a 1e6 heuristic to the reliable 2^52 int/float-bits discriminator (also hardens
+`tensor_from_list`). Validated: float_list_ops_test (push-built boxed floats, raw-bits literals incl. negatives, int
+exactness, boxed-`false` truthiness), 77/77 regression, bootstrap fixpoint deterministic (SHA 101C9B03…). Remaining
+theoretical edge: a list of ints ≥ 2^52 typed non-`intlist` would be read as float (precision loss) — astronomically
+rare and inherent to the tag-free value model. Original finding below.
+
+**(original) Status: OPEN.** Found 2026-05-29 by the deep-audit reader sweep (same class as the tensor bug fixed this session).
+A list built by push/json/file stores **boxed** floats (box pointers in `data[i]`); a literal float list stores raw
+IEEE bits. Several core numeric runtime functions read `l->data[i]` and interpret it as a number **without unboxing**,
+so they silently return garbage on float lists (int lists are unaffected — ints are never boxed):
+
+- `nova_rt_sum` (nova_runtime.c:4846) — `acc += data[i]` as integer add.
+- `nova_rt_list_min` / `nova_rt_list_max` (4883/4893) — raw int64 compare.
+- `nova_rt_list_sort` + `cmp_int64` (1146) — qsort by raw int64 (boxed→sorts by heap address).
+- `nova_rt_any_truthy` / `nova_rt_all_truthy` (4865) — boxed `false`/`0.0` reads as truthy.
+
+**Fix (runtime-only, no re-bootstrap):** route element reads through `nova_elem_to_double` (added this session);
+for min/max/sort compare on the double but return the original element. Verified-safe pattern (already applied to
+`tensor_from_list`/`set`/`scale`). NOT a boxing defect — the boxing model is sound at write+read (for-loops/`index_get`
+unbox); this is purely raw readers bypassing the accessor. See DEEP_AUDIT_2026-05-29 §6.
+
+### #4 — Compiler↔runtime cross-reference defects — OPEN (P0/P1)
+
+**Status: OPEN.** Found 2026-05-29 by the integrity cross-reference.
+- **`read_bytes` HARD LINK ERROR — RESOLVED ✓ 2026-05-29 (P0):** implemented `nova_rt_read_bytes` (binary-safe file
+  read into a NovaBytes buffer; error-flag + 512MB guard) and corrected the type signature to `string→bytes`(any).
+  Validated: read_bytes_test (ASCII oracle h=104…o=111 + bytes_to_str round-trip), 76/76→77/77 regression, bootstrap
+  fixpoint deterministic. *(original: mapped/declared/typed but undefined → link error on use; also mis-typed int→string.)*
+- **UDP unreachable — RESOLVED ✓ 2026-05-29 (P1):** wired `udp_bind/send/recv` (map + declares both backends + HM
+  sigs); `udp_test` oracle passes. Now reachable + REAL.
+- **`dict_contains` dangling decl — RESOLVED ✓ 2026-05-29 (P1):** removed the unused declaration from both backends.
+
+See DEEP_AUDIT_2026-05-29 §4.
+
+### #5 — Fake `model_load`/`model_infer`/`model_close` removed — RESOLVED ✓ 2026-05-29 (P1)
+
+The legacy model API performed no real computation (`model_infer` was identity; `model_load` kept only the path).
+It was a trap and `phase13_ai_test` circularly validated its identity behavior. **Removed** from the compiler
+(mappings/declares/type-regs) and runtime; `phase13_ai_test` rewritten to a REAL tensor-inference oracle
+(matmul → relu → argmax, hand-computed [1,4,2] → class 1). Real model inference is the tensor pipeline
+(`tensor_from_list`/`tensor_matmul`/`relu`/`softmax`/`argmax`); `arr_*` 1D-int helpers kept (they work; just redundant).
+
+---
+
 ## TIER 1 — Compiler core (the genuinely real foundation)
 
 This is the hard, real work. Verified by 65/65 regression tests + deterministic self-host bootstrap.
@@ -196,10 +271,11 @@ trust the label."
 | Collections: PriorityQueue, Deque, SortedMap, LRU, Counter, RingBuffer | REAL | Track 7; LRU has real eviction + hit/miss |
 | Math (libm wrappers) | REAL | Thin, correct |
 | Channels / spawn / monitor / select / async-await | REAL | Concurrency tests across the suite |
-| TCP / UDP sockets (winsock) | REAL | Real Berkeley-socket calls |
+| TCP sockets (winsock) | REAL | Real Berkeley-socket calls (reachable from NOVA) |
+| UDP sockets (`udp_bind/send/recv`) | **REAL ✓ (wired 2026-05-29)** | Was unreachable (defined but unwired). Now mapped + declared + typed; `udp_test` passes (loopback self-send → recv "ping-udp", 8 bytes). |
 | Result / Option + `?` | REAL | Track 6 |
 | Arena allocator, weak refs, checked arithmetic | REAL | Track 8 |
-| Tensor (n-D float): zeros, matmul, add, mul, scale, sum, relu | **REAL** | matmul verified real (nova_runtime.c:5218). *This is the true AI primitive.* |
+| Tensor (n-D float): zeros, matmul, add, mul, scale, sum, relu | **REAL ✓ (boxed-float fix 2026-05-29)** | matmul verified real (nova_runtime.c ~5334). `tensor_from_list`/`set`/`scale` now unbox list elements via `nova_elem_to_double` — push/json/file-built float tensors are correct (were silently garbage before). Guard: tensor_boxed_float_test. *The true AI primitive.* |
 | JSON parse / stringify | **REAL (ints/strings/containers/top-level float) ✓ / PARTIAL (bool, nested float)** | FIXED 2026-05-28: removed 0→null/1→true heuristics (ints exact, incl. arrays). FIXED 2026-05-29: compiler routes json_encode(float)→nova_rt_json_encode_float (json_encode(3.14)→"3.14"; was garbage bits); json_float_test PASS, 67/67 green, bootstrap fixpoint FB721EB780005623. Remaining: standalone bool→1/0 (bool erased to "int" in IR) and floats NESTED in dicts/lists (need container boxing — FINDING #1 deep part). |
 | Regex (match/find/replace/split) | **REAL ✓** | CONFIRMED 2026-05-28: \d \w \s . ? + * [] ^ $ all match known semantics. regex_test.nova. (Deeper RE2 differential deferred to Phase 7 hardening.) |
 | Crypto: sha256, hmac_sha256, base64, hex, crc32, fnv1a, murmur3, uuid4 | **REAL ✓** | CONFIRMED 2026-05-28: sha256("")=e3b0c44…b855 (NIST), hmac=f7bc83f4… (RFC), base64/hex match. test_crypto_stdlib.nova |

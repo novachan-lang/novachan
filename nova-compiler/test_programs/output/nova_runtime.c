@@ -449,6 +449,19 @@ int64_t nova_rt_unbox(int64_t handle) {
    transparent unboxing done by list_get/dict_get, so runtime functions that read
    numeric data directly from a list/dict backing array stay correct no matter how
    the container was built: a list<float> stores raw bits, a list<Any> stores boxes. */
+/* Is a container element a float? Boxed float → yes. For a raw (non-box) slot we
+   distinguish a normal int VALUE from IEEE-754 float BITS using the 2^52 threshold:
+   |v| < 2^52 is an int value; a larger pattern with a valid normal double exponent
+   is float bits. (Same discriminator as nova_is_likely_float, defined locally so it
+   is usable this early in the file.) Mirrors how list_get/index_get treat elements. */
+static int nova_elem_is_float(int64_t elem) {
+    if (nova_is_box(elem)) return ((NovaBox*)(uintptr_t)elem)->kind == NOVA_BOX_FLOAT;
+    if (elem == 0) return 0;
+    if (elem > -(1LL << 52) && elem < (1LL << 52)) return 0;
+    uint64_t expo = ((uint64_t)elem >> 52) & 0x7FF;
+    return (expo > 0 && expo < 0x7FF);
+}
+
 static double nova_elem_to_double(int64_t elem) {
     if (nova_is_box(elem)) {
         NovaBox* bx = (NovaBox*)(uintptr_t)elem;
@@ -457,8 +470,10 @@ static double nova_elem_to_double(int64_t elem) {
         }
         return (double)bx->payload;   /* boxed bool → 0.0/1.0 */
     }
-    if (elem >= -1000000 && elem <= 1000000) return (double)elem;
-    double d; memcpy(&d, &elem, sizeof(double)); return d;
+    if (nova_elem_is_float(elem)) {
+        double d; memcpy(&d, &elem, sizeof(double)); return d;
+    }
+    return (double)elem;              /* normal int value */
 }
 
 void nova_rt_track_raw(void* ptr) {
@@ -1149,9 +1164,26 @@ static int cmp_int64(const void* a, const void* b) {
     return (va > vb) - (va < vb);
 }
 
+/* Numeric comparator that unboxes / reinterprets float bits so a list of floats
+   (boxed via push/json or raw via literal) sorts by numeric value, not by raw
+   int64/heap-pointer bits. Elements stay in their original form after sorting. */
+static int cmp_elem_double(const void* a, const void* b) {
+    double da = nova_elem_to_double(*(const int64_t*)a);
+    double db = nova_elem_to_double(*(const int64_t*)b);
+    return (da > db) - (da < db);
+}
+
 int64_t nova_rt_list_sort(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
-    qsort(l->data, (size_t)l->size, sizeof(int64_t), cmp_int64);
+    if (!l || l->size < 2) return handle;
+    /* Use exact int64 ordering unless the list actually contains floats — this
+       preserves precise ordering for large ints (>= 2^53) that doubles can't hold. */
+    int has_float = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_elem_is_float(l->data[i])) { has_float = 1; break; }
+    }
+    qsort(l->data, (size_t)l->size, sizeof(int64_t),
+          has_float ? cmp_elem_double : cmp_int64);
     return handle;
 }
 
@@ -4862,11 +4894,18 @@ int64_t nova_rt_index_of(int64_t handle, int64_t item) {
     return -1;
 }
 
+/* Truthiness of a container element: a boxed bool/float carries its numeric value
+   (so a boxed `false`/`0.0` is correctly falsy, not "non-null pointer = true"); a
+   raw float `0.0` (bits 0) is falsy; non-numeric handles (e.g. strings) are truthy. */
+static int nova_elem_truthy(int64_t e) {
+    return nova_elem_to_double(e) != 0.0;
+}
+
 int64_t nova_rt_any_truthy(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l) return 0;
     for (int64_t i = 0; i < l->size; i++) {
-        if (l->data[i] != 0) return 1;
+        if (nova_elem_truthy(l->data[i])) return 1;
     }
     return 0;
 }
@@ -4875,7 +4914,7 @@ int64_t nova_rt_all_truthy(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l) return 1;
     for (int64_t i = 0; i < l->size; i++) {
-        if (l->data[i] == 0) return 0;
+        if (!nova_elem_truthy(l->data[i])) return 0;
     }
     return 1;
 }
@@ -4898,6 +4937,42 @@ int64_t nova_rt_list_max(int64_t handle) {
         if (l->data[i] > max_val) max_val = l->data[i];
     }
     return max_val;
+}
+
+/* Float/box-aware aggregates. The compiler routes sum()/list_min()/list_max() here
+   when the argument is NOT a pure int list (i.e. a float or Any list), and types the
+   result as float. Each element is read via nova_elem_to_double (boxed float → value,
+   raw IEEE bits → value, normal int → value), and the result is returned as float bits.
+   The integer variants above stay exact for pure-int lists (any magnitude). */
+int64_t nova_rt_sum_f(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    double acc = 0.0;
+    if (l) for (int64_t i = 0; i < l->size; i++) acc += nova_elem_to_double(l->data[i]);
+    int64_t bits; memcpy(&bits, &acc, sizeof(bits)); return bits;
+}
+int64_t nova_rt_list_min_f(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    double m = 0.0;
+    if (l && l->size > 0) {
+        m = nova_elem_to_double(l->data[0]);
+        for (int64_t i = 1; i < l->size; i++) {
+            double d = nova_elem_to_double(l->data[i]);
+            if (d < m) m = d;
+        }
+    }
+    int64_t bits; memcpy(&bits, &m, sizeof(bits)); return bits;
+}
+int64_t nova_rt_list_max_f(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    double m = 0.0;
+    if (l && l->size > 0) {
+        m = nova_elem_to_double(l->data[0]);
+        for (int64_t i = 1; i < l->size; i++) {
+            double d = nova_elem_to_double(l->data[i]);
+            if (d > m) m = d;
+        }
+    }
+    int64_t bits; memcpy(&bits, &m, sizeof(bits)); return bits;
 }
 
 // Set implementation — backed by a list with equality checks via nova_rt_eq
@@ -5438,6 +5513,44 @@ int64_t nova_rt_str_to_bytes(int64_t str_ptr) {
     int64_t result = nova_rt_bytes_create((int64_t)len);
     NovaBytes* b = (NovaBytes*)(uintptr_t)result;
     if (b && b->data) memcpy(b->data, s, len);
+    return result;
+}
+
+/* Read a file's raw contents into a NovaBytes buffer (binary-safe — does not stop
+   at embedded NULs, unlike read_file which returns a C string). Returns an empty
+   bytes buffer and sets the error flag on failure. */
+int64_t nova_rt_read_bytes(int64_t path) {
+    const char* p = (const char*)(uintptr_t)path;
+    if (!p) { nova_set_error("read_bytes: null path"); return nova_rt_bytes_create(0); }
+    FILE* f = fopen(p, "rb");
+    if (!f) {
+        char errbuf[512];
+        snprintf(errbuf, sizeof(errbuf), "read_bytes: cannot open file '%s': %s", p, strerror(errno));
+        nova_set_error(errbuf);
+        return nova_rt_bytes_create(0);
+    }
+#ifdef _WIN32
+    _fseeki64(f, 0, SEEK_END);
+    int64_t sz = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_END);
+    int64_t sz = (int64_t)ftello(f);
+    fseeko(f, 0, SEEK_SET);
+#endif
+    if (sz < 0 || sz > (int64_t)512 * 1024 * 1024) {
+        fclose(f);
+        nova_set_error(sz < 0 ? "read_bytes: cannot determine size"
+                              : "read_bytes: file exceeds 512MB limit");
+        return nova_rt_bytes_create(0);
+    }
+    int64_t result = nova_rt_bytes_create(sz);
+    NovaBytes* b = (NovaBytes*)(uintptr_t)result;
+    if (b && b->data && sz > 0) {
+        size_t nr = fread(b->data, 1, (size_t)sz, f);
+        b->size = (int64_t)nr;   /* reflect bytes actually read */
+    }
+    fclose(f);
     return result;
 }
 
@@ -10037,42 +10150,10 @@ int64_t nova_rt_arr_dot(int64_t a_handle, int64_t b_handle) {
     return sum;
 }
 
-/* Model stub: uses NovaArr for inference. */
-typedef struct { char path[1024]; int valid; } NovaModelStub;
-static NovaModelStub g_model_stubs[32];
-static int g_model_stub_count = 0;
-
-/* nova_rt_model_load: Open a model file and register it. Returns handle, -1 if not found. */
-int64_t nova_rt_model_load(int64_t path_val) {
-    if (!path_val || g_model_stub_count >= 32) return -1;
-    const char *path = (const char*)(uintptr_t)path_val;
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    fclose(f);
-    int idx = g_model_stub_count++;
-    strncpy(g_model_stubs[idx].path, path, 1023); g_model_stubs[idx].path[1023] = '\0';
-    g_model_stubs[idx].valid = 1;
-    return (int64_t)idx;
-}
-
-/* nova_rt_model_close: Release a model handle. */
-int64_t nova_rt_model_close(int64_t handle) {
-    int idx = (int)handle;
-    if (idx >= 0 && idx < g_model_stub_count && g_model_stubs[idx].valid) g_model_stubs[idx].valid = 0;
-    return 0;
-}
-
-/* nova_rt_model_infer: Run inference on a NovaArr. Stub: identity (copies input). */
-int64_t nova_rt_model_infer(int64_t model_handle, int64_t input_handle) {
-    int m = (int)model_handle, inp = (int)input_handle;
-    if (m < 0 || m >= g_model_stub_count || !g_model_stubs[m].valid) return -1;
-    if (inp < 0 || inp >= g_arr_count || !g_arrs[inp].valid) return -1;
-    int64_t out = nova_rt_arr_create(g_arrs[inp].size);
-    if (out < 0) return -1;
-    int oi = (int)out;
-    for (int64_t i = 0; i < g_arrs[inp].size; i++) g_arrs[oi].data[i] = g_arrs[inp].data[i];
-    return out;
-}
+/* NOTE: the former fake model_load/model_infer/model_close (identity "inference")
+   were removed 2026-05-29 — they performed no real computation and were a trap.
+   Real model inference is the tensor pipeline: tensor_from_list → tensor_matmul →
+   relu/softmax/argmax (see ai_classify_test / ai_serve.nova). */
 
 /* ======== Phase 13 Game: Entity-Component System ======== */
 
