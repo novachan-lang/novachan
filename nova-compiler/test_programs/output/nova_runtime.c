@@ -10045,6 +10045,70 @@ static int64_t wasm_exec(WasmMod* m, int funcidx, const int64_t* args, int nargs
         else if (op == 0x05) { if (csp > 0) { cp = ctrl[csp-1].end_pos; csp--; } }
         else if (op == 0x0C) { uint64_t L=wasm_uleb(b,len,&cp); if ((int)L < csp) { int t=csp-1-(int)L; if (ctrl[t].kind==1) { cp=ctrl[t].loop_start; csp=t+1; } else { cp=ctrl[t].end_pos; csp=t; } } }
         else if (op == 0x0D) { uint64_t L=wasm_uleb(b,len,&cp); int32_t c=(sp>0)?(int32_t)stack[--sp]:0; if (c && (int)L < csp) { int t=csp-1-(int)L; if (ctrl[t].kind==1) { cp=ctrl[t].loop_start; csp=t+1; } else { cp=ctrl[t].end_pos; csp=t; } } }
+        else if (op == 0x0E) {  /* br_table: count labels + default; index selects */
+            uint64_t n = wasm_uleb(b, len, &cp); uint64_t lab[64];
+            for (uint64_t i = 0; i < n; i++) { uint64_t L = wasm_uleb(b,len,&cp); if (i < 64) lab[i] = L; }
+            uint64_t dflt = wasm_uleb(b, len, &cp);
+            int32_t ix = (sp>0)?(int32_t)stack[--sp]:0;
+            uint64_t L = (ix >= 0 && (uint64_t)ix < n && ix < 64) ? lab[ix] : dflt;
+            if ((int)L < csp) { int t=csp-1-(int)L; if (ctrl[t].kind==1) { cp=ctrl[t].loop_start; csp=t+1; } else { cp=ctrl[t].end_pos; csp=t; } }
+        }
+        /* ── i64 (slot holds the full 64-bit value) ── */
+        else if (op == 0x42) { int64_t v = wasm_sleb(b, len, &cp); if (sp < 1024) stack[sp++] = v; }
+        else if (op == 0x7C) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=x+y; }
+        else if (op == 0x7D) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=x-y; }
+        else if (op == 0x7E) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=x*y; }
+        else if (op == 0x7F) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]= y? x/y:0; }
+        else if (op == 0x80) { if(sp<2){ok=0;break;} uint64_t y=(uint64_t)stack[--sp],x=(uint64_t)stack[--sp]; stack[sp++]= y? (int64_t)(x/y):0; }
+        else if (op == 0x81) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]= y? x%y:0; }
+        else if (op == 0x82) { if(sp<2){ok=0;break;} uint64_t y=(uint64_t)stack[--sp],x=(uint64_t)stack[--sp]; stack[sp++]= y? (int64_t)(x%y):0; }
+        else if (op == 0x83) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=x&y; }
+        else if (op == 0x84) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=x|y; }
+        else if (op == 0x85) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=x^y; }
+        else if (op == 0x86) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(int64_t)((uint64_t)x << (y & 63)); }
+        else if (op == 0x87) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=x >> (y & 63); }
+        else if (op == 0x88) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(int64_t)((uint64_t)x >> (y & 63)); }
+        else if (op == 0x50) { if(sp<1){ok=0;break;} int64_t x=stack[--sp]; stack[sp++]=(x==0); }
+        else if (op == 0x51) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(x==y); }
+        else if (op == 0x52) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(x!=y); }
+        else if (op == 0x53) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(x<y); }
+        else if (op == 0x54) { if(sp<2){ok=0;break;} uint64_t y=(uint64_t)stack[--sp],x=(uint64_t)stack[--sp]; stack[sp++]=(x<y); }
+        else if (op == 0x55) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(x>y); }
+        else if (op == 0x56) { if(sp<2){ok=0;break;} uint64_t y=(uint64_t)stack[--sp],x=(uint64_t)stack[--sp]; stack[sp++]=(x>y); }
+        else if (op == 0x57) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(x<=y); }
+        else if (op == 0x58) { if(sp<2){ok=0;break;} uint64_t y=(uint64_t)stack[--sp],x=(uint64_t)stack[--sp]; stack[sp++]=(x<=y); }
+        else if (op == 0x59) { if(sp<2){ok=0;break;} int64_t y=stack[--sp],x=stack[--sp]; stack[sp++]=(x>=y); }
+        else if (op == 0x5A) { if(sp<2){ok=0;break;} uint64_t y=(uint64_t)stack[--sp],x=(uint64_t)stack[--sp]; stack[sp++]=(x>=y); }
+        /* ── f64 (slot holds the IEEE-754 bit pattern) ── */
+        else if (op == 0x44) { int64_t bits=0; for(int k=0;k<8 && cp<body_end;k++) bits |= ((int64_t)(unsigned char)b[cp++])<<(8*k); if(sp<1024) stack[sp++]=bits; }
+        else if (op == 0xA0) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); double r=x+y; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; }
+        else if (op == 0xA1) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); double r=x-y; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; }
+        else if (op == 0xA2) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); double r=x*y; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; }
+        else if (op == 0xA3) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); double r=(y!=0.0)?x/y:0.0; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; }
+        else if (op == 0x99) { if(sp<1){ok=0;break;} double x; memcpy(&x,&stack[--sp],8); double r=x<0?-x:x; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; }
+        else if (op == 0x9A) { if(sp<1){ok=0;break;} double x; memcpy(&x,&stack[--sp],8); double r=-x; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; }
+        else if (op == 0x9F) { if(sp<1){ok=0;break;} double x; memcpy(&x,&stack[--sp],8); double r=sqrt(x); int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; }
+        else if (op == 0x61) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); stack[sp++]=(x==y); }
+        else if (op == 0x62) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); stack[sp++]=(x!=y); }
+        else if (op == 0x63) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); stack[sp++]=(x<y); }
+        else if (op == 0x64) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); stack[sp++]=(x>y); }
+        else if (op == 0x65) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); stack[sp++]=(x<=y); }
+        else if (op == 0x66) { if(sp<2){ok=0;break;} double y,x; memcpy(&y,&stack[--sp],8); memcpy(&x,&stack[--sp],8); stack[sp++]=(x>=y); }
+        /* ── f32 (bit pattern in low 32 bits) ── */
+        else if (op == 0x43) { uint32_t bits=0; for(int k=0;k<4 && cp<body_end;k++) bits |= ((uint32_t)(unsigned char)b[cp++])<<(8*k); if(sp<1024) stack[sp++]=(int64_t)bits; }
+        else if (op == 0x92) { if(sp<2){ok=0;break;} uint32_t yb=(uint32_t)stack[--sp],xb=(uint32_t)stack[--sp]; float y,x; memcpy(&y,&yb,4); memcpy(&x,&xb,4); float r=x+y; uint32_t rb; memcpy(&rb,&r,4); stack[sp++]=(int64_t)rb; }
+        else if (op == 0x93) { if(sp<2){ok=0;break;} uint32_t yb=(uint32_t)stack[--sp],xb=(uint32_t)stack[--sp]; float y,x; memcpy(&y,&yb,4); memcpy(&x,&xb,4); float r=x-y; uint32_t rb; memcpy(&rb,&r,4); stack[sp++]=(int64_t)rb; }
+        else if (op == 0x94) { if(sp<2){ok=0;break;} uint32_t yb=(uint32_t)stack[--sp],xb=(uint32_t)stack[--sp]; float y,x; memcpy(&y,&yb,4); memcpy(&x,&xb,4); float r=x*y; uint32_t rb; memcpy(&rb,&r,4); stack[sp++]=(int64_t)rb; }
+        else if (op == 0x95) { if(sp<2){ok=0;break;} uint32_t yb=(uint32_t)stack[--sp],xb=(uint32_t)stack[--sp]; float y,x; memcpy(&y,&yb,4); memcpy(&x,&xb,4); float r=(y!=0.0f)?x/y:0.0f; uint32_t rb; memcpy(&rb,&r,4); stack[sp++]=(int64_t)rb; }
+        /* ── conversions ── */
+        else if (op == 0xA7) { if(sp<1){ok=0;break;} int64_t x=stack[--sp]; stack[sp++]=(int32_t)x; }                  /* i32.wrap_i64 */
+        else if (op == 0xAC) { if(sp<1){ok=0;break;} int32_t x=(int32_t)stack[--sp]; stack[sp++]=(int64_t)x; }         /* i64.extend_i32_s */
+        else if (op == 0xAD) { if(sp<1){ok=0;break;} uint32_t x=(uint32_t)stack[--sp]; stack[sp++]=(int64_t)(uint64_t)x; } /* i64.extend_i32_u */
+        else if (op == 0xAA) { if(sp<1){ok=0;break;} double x; memcpy(&x,&stack[--sp],8); stack[sp++]=(int32_t)x; }    /* i32.trunc_f64_s */
+        else if (op == 0xB7) { if(sp<1){ok=0;break;} int32_t x=(int32_t)stack[--sp]; double r=(double)x; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; } /* f64.convert_i32_s */
+        else if (op == 0xB9) { if(sp<1){ok=0;break;} int64_t x=stack[--sp]; double r=(double)x; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; } /* f64.convert_i64_s */
+        else if (op == 0xBB) { if(sp<1){ok=0;break;} uint32_t xb=(uint32_t)stack[--sp]; float f; memcpy(&f,&xb,4); double r=(double)f; int64_t bb; memcpy(&bb,&r,8); stack[sp++]=bb; } /* f64.promote_f32 */
+        else if (op == 0xB6) { if(sp<1){ok=0;break;} double x; memcpy(&x,&stack[--sp],8); float f=(float)x; uint32_t rb; memcpy(&rb,&f,4); stack[sp++]=(int64_t)rb; } /* f32.demote_f64 */
         else if (op == 0x0F) { break; }
         else { ok = 0; break; }
     }

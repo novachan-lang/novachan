@@ -69,7 +69,7 @@ Both compiler-soundness findings (#1 value model, #2 shadowing) are RESOLVED + b
 | **11** TLS server | `tls_listen/accept` | **STUB (honest)** | returns 0 — needs server-cert provisioning |
 | **11** distributed | length-framed message transport over node_* | **REAL transport ✓ / PARTIAL FT** | _node_probe round-trip; heartbeat/reconnect/discovery TODO |
 | **11** hot reload | file-change detection | **PARTIAL** | real mtime polling; no live code swap |
-| **12** WASM | bytecode interpreter: i32 const + locals + full compare/arith + **structured control flow** + **function calls & recursion** + **linear memory** (load/store 8/16/32, memory.size) | **REAL ✓ (control flow + calls + memory, 2026-05-29)** | add→42; loop→55; recursive fac(5)→120; mem store/load→30. i64/f32/f64/br_table/memory.grow TODO |
+| **12** WASM | bytecode interpreter: **i32+i64+f32+f64** (const/arith/compare) + conversions + locals + **structured control flow** + **br_table** + **function calls & recursion** + **linear memory** (load/store 8/16/32, memory.size) | **REAL ✓ (i32/i64/f32/f64 + control + calls + memory, 2026-05-29)** | add→42; loop→55; fac(5)→120; mem→30; i64 10^12; trunc(3.5+1.5)→5. memory.grow/imports TODO |
 | **12** GPU compute | elementwise kernels | **REAL compute, CPU backend ✓** | gpu_compute_test; real-device dispatch (CUDA/Metal/Vulkan) TODO |
 | **13** web framework | request parse, routing, response build, JSON | **REAL ✓** | http_demo end-to-end |
 | **13** AI inference | tensor matmul/add/relu, softmax/sigmoid, file model-load → classify (argmax) | **REAL ✓** | ai_classify_test (logits→class), tensor matmul verified |
