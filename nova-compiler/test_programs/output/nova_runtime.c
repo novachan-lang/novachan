@@ -443,6 +443,24 @@ int64_t nova_rt_unbox(int64_t handle) {
     return handle;
 }
 
+/* Convert a NOVA container element to a double. An element may be a boxed float
+   (payload = IEEE-754 bits), a boxed bool (payload 0/1), a raw small int (the int
+   value itself), or raw IEEE-754 float bits (a large bit pattern). This mirrors the
+   transparent unboxing done by list_get/dict_get, so runtime functions that read
+   numeric data directly from a list/dict backing array stay correct no matter how
+   the container was built: a list<float> stores raw bits, a list<Any> stores boxes. */
+static double nova_elem_to_double(int64_t elem) {
+    if (nova_is_box(elem)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)elem;
+        if (bx->kind == NOVA_BOX_FLOAT) {
+            double d; memcpy(&d, &bx->payload, sizeof(double)); return d;
+        }
+        return (double)bx->payload;   /* boxed bool → 0.0/1.0 */
+    }
+    if (elem >= -1000000 && elem <= 1000000) return (double)elem;
+    double d; memcpy(&d, &elem, sizeof(double)); return d;
+}
+
 void nova_rt_track_raw(void* ptr) {
     (void)ptr;
     nova_mem_total++;
@@ -5196,15 +5214,7 @@ int64_t nova_rt_tensor_from_list(int64_t data_handle, int64_t shape_handle) {
     NovaTensor* t = (NovaTensor*)(uintptr_t)handle;
     if (!t) return 0;
     for (int64_t i = 0; i < t->size; i++) {
-        /* Caller stored each element as either an int (raw bits) or float bits */
-        int64_t raw = data->data[i];
-        double d;
-        memcpy(&d, &raw, sizeof(double));
-        /* If the integer is "small" we treat it as an int value */
-        if (raw >= -1000000 && raw <= 1000000) {
-            d = (double)raw;
-        }
-        t->data[i] = d;
+        t->data[i] = nova_elem_to_double(data->data[i]);
     }
     return handle;
 }
@@ -5256,11 +5266,7 @@ void nova_rt_tensor_set(int64_t t_handle, int64_t indices_handle, int64_t val_bi
     NovaList* indices = (NovaList*)(uintptr_t)indices_handle;
     int64_t flat = nova_tensor_flat_index(t, indices);
     if (flat < 0) return;
-    double d;
-    memcpy(&d, &val_bits, sizeof(d));
-    /* Accept ints stored as raw int64 too */
-    if (val_bits >= -1000000 && val_bits <= 1000000) d = (double)val_bits;
-    t->data[flat] = d;
+    t->data[flat] = nova_elem_to_double(val_bits);
 }
 
 static int nova_tensor_shapes_equal(NovaTensor* a, NovaTensor* b) {
@@ -5298,9 +5304,7 @@ int64_t nova_rt_tensor_mul(int64_t a_h, int64_t b_h) {
 int64_t nova_rt_tensor_scale(int64_t a_h, int64_t scalar_bits) {
     NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
     if (!a) return 0;
-    double s;
-    memcpy(&s, &scalar_bits, sizeof(s));
-    if (scalar_bits >= -1000000 && scalar_bits <= 1000000) s = (double)scalar_bits;
+    double s = nova_elem_to_double(scalar_bits);
     int64_t r = nova_tensor_alloc_like(a);
     NovaTensor* result = (NovaTensor*)(uintptr_t)r;
     for (int64_t i = 0; i < a->size; i++) result->data[i] = a->data[i] * s;
