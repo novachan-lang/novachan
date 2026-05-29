@@ -9890,89 +9890,113 @@ static int64_t wasm_sleb(const unsigned char* b, size_t len, size_t* pos) {
     return result;
 }
 
-int64_t nova_rt_wasm_run(int64_t handle) {
-    int idx = (int)handle;
-    if (idx < 0 || idx >= g_wasm_count || !g_wasm_modules[idx].valid) return -1;
-    const unsigned char* b = (const unsigned char*)g_wasm_modules[idx].bytes;
-    size_t len = g_wasm_modules[idx].size;
-    if (len < 8 || b[0]!=0x00 || b[1]!=0x61 || b[2]!=0x73 || b[3]!=0x6D) return -1; /* \0asm */
+/* Parsed module view: function signatures, func→type map, and per-function body
+   byte-ranges. Assumes no imported functions (funcidx indexes code directly) —
+   true for self-contained hand-crafted/clang-emitted compute modules. */
+typedef struct {
+    const unsigned char* b; size_t len;
+    int ntypes; int tp[256]; int tr[256];        /* type i: nparams / nresults */
+    int nfuncs; int ftype[256];                   /* func i -> type idx */
+    size_t fbody[256]; size_t fend[256];          /* func i: body start / end */
+} WasmMod;
+typedef struct { int kind; size_t loop_start; size_t end_pos; } WasmCtrl; /* 0 block,1 loop,2 if */
 
-    /* Walk sections to find the code section (id 10). */
-    size_t pos = 8, code_pos = 0, code_end = 0;
+static int wasm_parse(WasmMod* m, const unsigned char* b, size_t len) {
+    m->b = b; m->len = len; m->ntypes = 0; m->nfuncs = 0;
+    if (len < 8 || b[0]!=0x00||b[1]!=0x61||b[2]!=0x73||b[3]!=0x6D) return 0;
+    size_t pos = 8; int code_funcs = 0;
     while (pos < len) {
         unsigned char sid = b[pos++];
         uint64_t ssize = wasm_uleb(b, len, &pos);
-        if (pos + ssize > len) return -1;
-        if (sid == 10) { code_pos = pos; code_end = pos + (size_t)ssize; break; }
-        pos += (size_t)ssize;
+        size_t sec_end = pos + (size_t)ssize;
+        if (sec_end > len) return 0;
+        size_t q = pos;
+        if (sid == 1) {                            /* type */
+            uint64_t cnt = wasm_uleb(b, len, &q);
+            for (uint64_t i = 0; i < cnt && i < 256; i++) {
+                if (q < sec_end && b[q] == 0x60) q++;        /* functype marker */
+                uint64_t np = wasm_uleb(b, len, &q);
+                for (uint64_t k = 0; k < np && q < sec_end; k++) q++;
+                uint64_t nr = wasm_uleb(b, len, &q);
+                for (uint64_t k = 0; k < nr && q < sec_end; k++) q++;
+                m->tp[i] = (int)np; m->tr[i] = (int)nr; m->ntypes++;
+            }
+        } else if (sid == 3) {                     /* function */
+            uint64_t cnt = wasm_uleb(b, len, &q);
+            for (uint64_t i = 0; i < cnt && i < 256; i++) { m->ftype[i] = (int)wasm_uleb(b, len, &q); m->nfuncs++; }
+        } else if (sid == 10) {                    /* code */
+            uint64_t cnt = wasm_uleb(b, len, &q);
+            for (uint64_t i = 0; i < cnt && i < 256; i++) {
+                uint64_t bs = wasm_uleb(b, len, &q);
+                m->fbody[i] = q; m->fend[i] = q + (size_t)bs; q += (size_t)bs; code_funcs++;
+            }
+        }
+        pos = sec_end;
     }
-    if (code_pos == 0) return -1;
+    return (m->nfuncs > 0 && code_funcs == m->nfuncs);
+}
 
-    size_t cp = code_pos;
-    uint64_t fcount = wasm_uleb(b, len, &cp);
-    if (fcount == 0) return -1;
-    uint64_t body_size = wasm_uleb(b, len, &cp);
-    size_t body_end = cp + (size_t)body_size;
-    if (body_end > code_end) return -1;
+/* Execute one function with the given args. Per-frame buffers are heap-allocated so
+   deep recursion grows the C stack only by a small fixed frame; depth is capped. */
+static int64_t wasm_exec(WasmMod* m, int funcidx, const int64_t* args, int nargs, int depth, int* okp) {
+    if (depth > 512 || funcidx < 0 || funcidx >= m->nfuncs) { *okp = 0; return 0; }
+    const unsigned char* b = m->b; size_t len = m->len;
+    size_t cp = m->fbody[funcidx], body_end = m->fend[funcidx];
+    int tyi = m->ftype[funcidx];
+    int nparams  = (tyi >= 0 && tyi < m->ntypes) ? m->tp[tyi] : 0;
+    int nresults = (tyi >= 0 && tyi < m->ntypes) ? m->tr[tyi] : 1;
 
-    /* local declarations: sum (count,valtype) groups, allocate + zero. */
-    uint64_t local_groups = wasm_uleb(b, len, &cp);
-    int64_t nlocals = 0;
-    for (uint64_t i = 0; i < local_groups && cp < body_end; i++) {
-        uint64_t gc = wasm_uleb(b, len, &cp);   /* group count */
-        if (cp < body_end) cp++;                /* value type byte */
-        nlocals += (int64_t)gc;
-    }
-    if (nlocals < 0 || nlocals > 4096) return -1;
-    int64_t locals_buf[4096];
-    for (int64_t i = 0; i < nlocals; i++) locals_buf[i] = 0;
+    uint64_t groups = wasm_uleb(b, len, &cp);
+    int64_t ndecl = 0;
+    for (uint64_t i = 0; i < groups && cp < body_end; i++) { uint64_t gc = wasm_uleb(b,len,&cp); if (cp < body_end) cp++; ndecl += (int64_t)gc; }
+    int64_t nlocals = (int64_t)nparams + ndecl;
+    if (nlocals < 0 || nlocals > 65536) { *okp = 0; return 0; }
 
-    size_t code_start = cp;                     /* first opcode of the body */
-    size_t span = body_end - code_start;
-
-    /* ── control-flow pre-scan: for each block/loop/if opcode, record the byte
-       position just AFTER its matching `end` (and `else`, for if). Indexed by the
-       opcode's offset relative to code_start. ── */
+    int64_t* locals = (int64_t*)calloc((size_t)(nlocals ? nlocals : 1), sizeof(int64_t));
+    int64_t* stack  = (int64_t*)malloc(sizeof(int64_t) * 1024);
+    WasmCtrl* ctrl  = (WasmCtrl*)malloc(sizeof(WasmCtrl) * 256);
+    size_t code_start = cp, span = body_end - code_start;
     size_t* end_of  = (size_t*)calloc(span ? span : 1, sizeof(size_t));
     size_t* else_of = (size_t*)calloc(span ? span : 1, sizeof(size_t));
-    if (!end_of || !else_of) { free(end_of); free(else_of); return -1; }
-    {
-        size_t mstack[256]; int msp = 0;
-        size_t sc = code_start;
+    if (!locals || !stack || !ctrl || !end_of || !else_of) { free(locals); free(stack); free(ctrl); free(end_of); free(else_of); *okp = 0; return 0; }
+    for (int i = 0; i < nparams && i < (int)nlocals; i++) locals[i] = (i < nargs) ? args[i] : 0;
+
+    {   /* control-flow pre-scan: match block/loop/if -> else/end positions */
+        size_t mstack[256]; int msp = 0; size_t sc = code_start;
         while (sc < body_end) {
-            size_t op_rel = sc - code_start;
-            unsigned char op = b[sc++];
-            if (op == 0x02 || op == 0x03 || op == 0x04) {       /* block/loop/if */
-                if (msp < 256) mstack[msp++] = op_rel;
-                if (sc < body_end) sc++;                        /* blocktype byte */
-            } else if (op == 0x05) {                            /* else */
-                if (msp > 0) else_of[mstack[msp - 1]] = sc;
-            } else if (op == 0x0B) {                            /* end */
-                if (msp > 0) { msp--; end_of[mstack[msp]] = sc; }
-            } else {
-                wasm_skip_imm(op, b, len, &sc);
-            }
+            size_t op_rel = sc - code_start; unsigned char op = b[sc++];
+            if (op == 0x02 || op == 0x03 || op == 0x04) { if (msp < 256) mstack[msp++] = op_rel; if (sc < body_end) sc++; }
+            else if (op == 0x05) { if (msp > 0) else_of[mstack[msp-1]] = sc; }
+            else if (op == 0x0B) { if (msp > 0) { msp--; end_of[mstack[msp]] = sc; } }
+            else wasm_skip_imm(op, b, len, &sc);
         }
     }
 
-    /* ── execute ── */
-    int64_t stack[1024]; int sp = 0;
-    struct { int kind; size_t loop_start; size_t end_pos; } ctrl[256]; int csp = 0; /* kind: 0 block,1 loop,2 if */
-    int64_t result = 0;
-    int ok = 1;
+    int sp = 0, csp = 0, ok = 1;
     cp = code_start;
     while (cp < body_end) {
         size_t op_rel = cp - code_start;
         unsigned char op = b[cp++];
-        if (op == 0x0B) { if (csp > 0) csp--; else break; }                    /* end (function end breaks) */
+        if (op == 0x0B) { if (csp > 0) csp--; else break; }
         else if (op == 0x41) { int64_t v = wasm_sleb(b, len, &cp); if (sp < 1024) stack[sp++] = (int32_t)v; }
-        else if (op == 0x20) { uint64_t li = wasm_uleb(b,len,&cp); if ((int64_t)li < nlocals && sp < 1024) stack[sp++] = locals_buf[li]; }
-        else if (op == 0x21) { uint64_t li = wasm_uleb(b,len,&cp); if (sp > 0 && (int64_t)li < nlocals) locals_buf[li] = stack[--sp]; }
-        else if (op == 0x22) { uint64_t li = wasm_uleb(b,len,&cp); if (sp > 0 && (int64_t)li < nlocals) locals_buf[li] = stack[sp-1]; } /* tee */
+        else if (op == 0x20) { uint64_t li = wasm_uleb(b,len,&cp); if ((int64_t)li < nlocals && sp < 1024) stack[sp++] = locals[li]; }
+        else if (op == 0x21) { uint64_t li = wasm_uleb(b,len,&cp); if (sp > 0 && (int64_t)li < nlocals) locals[li] = stack[--sp]; }
+        else if (op == 0x22) { uint64_t li = wasm_uleb(b,len,&cp); if (sp > 0 && (int64_t)li < nlocals) locals[li] = stack[sp-1]; }
         else if (op == 0x01) { /* nop */ }
-        else if (op == 0x1A) { if (sp > 0) sp--; }                              /* drop */
-        else if (op == 0x1B) { if (sp >= 3) { int32_t c=(int32_t)stack[--sp]; int64_t v2=stack[--sp]; int64_t v1=stack[--sp]; stack[sp++] = c ? v1 : v2; } } /* select */
-        /* arithmetic / bitwise (binary, pop y then x) */
+        else if (op == 0x1A) { if (sp > 0) sp--; }
+        else if (op == 0x1B) { if (sp >= 3) { int32_t c=(int32_t)stack[--sp]; int64_t v2=stack[--sp]; int64_t v1=stack[--sp]; stack[sp++] = c ? v1 : v2; } }
+        else if (op == 0x10) {  /* call funcidx */
+            uint64_t fi = wasm_uleb(b, len, &cp);
+            int cnp = 0, cnr = 1;
+            if ((int)fi < m->nfuncs) { int ct = m->ftype[fi]; cnp = (ct>=0&&ct<m->ntypes)?m->tp[ct]:0; cnr = (ct>=0&&ct<m->ntypes)?m->tr[ct]:1; }
+            int64_t cargs[64];
+            if (cnp > 64) { ok = 0; break; }
+            for (int k = cnp - 1; k >= 0; k--) cargs[k] = (sp > 0) ? stack[--sp] : 0;
+            int sub_ok = 1;
+            int64_t r = wasm_exec(m, (int)fi, cargs, cnp, depth + 1, &sub_ok);
+            if (!sub_ok) { ok = 0; break; }
+            if (cnr >= 1 && sp < 1024) stack[sp++] = r;
+        }
         else if (op == 0x6A) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x+y); }
         else if (op == 0x6B) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x-y); }
         else if (op == 0x6C) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x*y); }
@@ -9986,7 +10010,6 @@ int64_t nova_rt_wasm_run(int64_t handle) {
         else if (op == 0x74) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)((uint32_t)x << (y & 31)); }
         else if (op == 0x75) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x >> (y & 31)); }
         else if (op == 0x76) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)((uint32_t)x >> (y & 31)); }
-        /* comparisons (result 0/1) */
         else if (op == 0x45) { if(sp<1){ok=0;break;} int32_t x=(int32_t)stack[--sp]; stack[sp++]=(x==0); }
         else if (op == 0x46) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(x==y); }
         else if (op == 0x47) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(x!=y); }
@@ -9998,22 +10021,31 @@ int64_t nova_rt_wasm_run(int64_t handle) {
         else if (op == 0x4D) { if(sp<2){ok=0;break;} uint32_t y=(uint32_t)stack[--sp],x=(uint32_t)stack[--sp]; stack[sp++]=(x<=y); }
         else if (op == 0x4E) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(x>=y); }
         else if (op == 0x4F) { if(sp<2){ok=0;break;} uint32_t y=(uint32_t)stack[--sp],x=(uint32_t)stack[--sp]; stack[sp++]=(x>=y); }
-        /* structured control flow */
-        else if (op == 0x02) { if (cp < body_end) cp++; if (csp < 256) { ctrl[csp].kind=0; ctrl[csp].loop_start=0; ctrl[csp].end_pos=end_of[op_rel]; csp++; } } /* block */
-        else if (op == 0x03) { if (cp < body_end) cp++; size_t ls=cp; if (csp < 256) { ctrl[csp].kind=1; ctrl[csp].loop_start=ls; ctrl[csp].end_pos=end_of[op_rel]; csp++; } } /* loop */
+        else if (op == 0x02) { if (cp < body_end) cp++; if (csp < 256) { ctrl[csp].kind=0; ctrl[csp].loop_start=0; ctrl[csp].end_pos=end_of[op_rel]; csp++; } }
+        else if (op == 0x03) { if (cp < body_end) cp++; size_t ls=cp; if (csp < 256) { ctrl[csp].kind=1; ctrl[csp].loop_start=ls; ctrl[csp].end_pos=end_of[op_rel]; csp++; } }
         else if (op == 0x04) { if (cp < body_end) cp++; int32_t c=(sp>0)?(int32_t)stack[--sp]:0; size_t ep=end_of[op_rel], elp=else_of[op_rel];
                                if (csp < 256) { ctrl[csp].kind=2; ctrl[csp].loop_start=0; ctrl[csp].end_pos=ep; csp++; }
-                               if (!c) { if (elp) { cp = elp; } else { cp = ep; if (csp>0) csp--; } } }            /* if: false → else (frame kept) or end (pop) */
-        else if (op == 0x05) { if (csp > 0) { cp = ctrl[csp-1].end_pos; csp--; } }                                /* else reached after then → jump past end */
-        else if (op == 0x0C) { uint64_t L=wasm_uleb(b,len,&cp); if ((int)L < csp) { int t=csp-1-(int)L; if (ctrl[t].kind==1) { cp=ctrl[t].loop_start; csp=t+1; } else { cp=ctrl[t].end_pos; csp=t; } } } /* br */
-        else if (op == 0x0D) { uint64_t L=wasm_uleb(b,len,&cp); int32_t c=(sp>0)?(int32_t)stack[--sp]:0; if (c && (int)L < csp) { int t=csp-1-(int)L; if (ctrl[t].kind==1) { cp=ctrl[t].loop_start; csp=t+1; } else { cp=ctrl[t].end_pos; csp=t; } } } /* br_if */
-        else if (op == 0x0F) { break; }                                                                           /* return */
-        else { ok = 0; break; }                                                                                   /* unreachable / unsupported */
+                               if (!c) { if (elp) { cp = elp; } else { cp = ep; if (csp>0) csp--; } } }
+        else if (op == 0x05) { if (csp > 0) { cp = ctrl[csp-1].end_pos; csp--; } }
+        else if (op == 0x0C) { uint64_t L=wasm_uleb(b,len,&cp); if ((int)L < csp) { int t=csp-1-(int)L; if (ctrl[t].kind==1) { cp=ctrl[t].loop_start; csp=t+1; } else { cp=ctrl[t].end_pos; csp=t; } } }
+        else if (op == 0x0D) { uint64_t L=wasm_uleb(b,len,&cp); int32_t c=(sp>0)?(int32_t)stack[--sp]:0; if (c && (int)L < csp) { int t=csp-1-(int)L; if (ctrl[t].kind==1) { cp=ctrl[t].loop_start; csp=t+1; } else { cp=ctrl[t].end_pos; csp=t; } } }
+        else if (op == 0x0F) { break; }
+        else { ok = 0; break; }
     }
-    free(end_of); free(else_of);
-    if (!ok) return -1;
-    result = (sp > 0) ? stack[sp-1] : 0;
-    return result;
+    int64_t result = (sp > 0) ? stack[sp-1] : 0;
+    free(locals); free(stack); free(ctrl); free(end_of); free(else_of);
+    *okp = ok;
+    return ok ? result : 0;
+}
+
+int64_t nova_rt_wasm_run(int64_t handle) {
+    int idx = (int)handle;
+    if (idx < 0 || idx >= g_wasm_count || !g_wasm_modules[idx].valid) return -1;
+    WasmMod m;
+    if (!wasm_parse(&m, (const unsigned char*)g_wasm_modules[idx].bytes, g_wasm_modules[idx].size)) return -1;
+    int ok = 1;
+    int64_t r = wasm_exec(&m, 0, NULL, 0, 0, &ok);   /* entry = function 0, no args */
+    return ok ? r : -1;
 }
 
 /* nova_rt_wasm_free: Release a WASM module and its bytecode buffer. */
