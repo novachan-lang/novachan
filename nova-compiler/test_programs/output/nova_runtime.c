@@ -3969,19 +3969,93 @@ int64_t nova_rt_http_post(int64_t url, int64_t body, int64_t content_type) {
 }
 
 #else
-
-int64_t nova_rt_http_get(int64_t url) {
-    (void)url;
-    nova_set_error("HTTP: not implemented on this platform");
-    char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
+/* ── Native HTTP/1.1 client for Linux/macOS (Berkeley sockets) ──────────────────
+   Handles http:// over plain TCP. https:// requires TLS — returned as an explicit
+   error here until the OpenSSL path is wired (next increment). Returns the response
+   BODY as a tracked string (same contract as the Windows WinHTTP path). */
+static int64_t nova_http_empty(void) {
+    char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if (e) e[0] = '\0';
     return (int64_t)(uintptr_t)e;
 }
 
+static int64_t http_request(const char* url, const char* method,
+                            const char* body, int64_t body_len, const char* content_type) {
+    if (!url) { nova_set_error("http: null url"); return nova_http_empty(); }
+    const char* p = url;
+    if (strncmp(p, "https://", 8) == 0) {
+        nova_set_error("http: https:// not yet supported on this platform (http:// works); use the Windows build or await the OpenSSL path");
+        return nova_http_empty();
+    }
+    if (strncmp(p, "http://", 7) == 0) p += 7;
+
+    char host[256]; int hi = 0; int port = 80;
+    while (*p && *p != ':' && *p != '/' && hi < 255) host[hi++] = *p++;
+    host[hi] = '\0';
+    if (*p == ':') { p++; port = atoi(p); while (*p && *p != '/') p++; }
+    if (host[0] == '\0' || port <= 0 || port > 65535) { nova_set_error("http: bad url"); return nova_http_empty(); }
+    const char* path = (*p == '/') ? p : "/";
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) { nova_set_error("http: DNS resolution failed"); return nova_http_empty(); }
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); nova_set_error("http: socket() failed"); return nova_http_empty(); }
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); nova_set_error("http: connect failed"); return nova_http_empty(); }
+    freeaddrinfo(res);
+
+    char header[2560];
+    int hl;
+    if (body && body_len > 0) {
+        hl = snprintf(header, sizeof(header),
+            "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: nova/0.1\r\nAccept: */*\r\nContent-Type: %s\r\nContent-Length: %lld\r\nConnection: close\r\n\r\n",
+            method, path, host, content_type ? content_type : "application/octet-stream", (long long)body_len);
+    } else {
+        hl = snprintf(header, sizeof(header),
+            "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: nova/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            method, path, host);
+    }
+    if (hl < 0 || hl >= (int)sizeof(header)) { close(fd); nova_set_error("http: request header too large"); return nova_http_empty(); }
+    if (send(fd, header, (size_t)hl, 0) < 0) { close(fd); nova_set_error("http: send failed"); return nova_http_empty(); }
+    if (body && body_len > 0) { if (send(fd, body, (size_t)body_len, 0) < 0) { close(fd); nova_set_error("http: send body failed"); return nova_http_empty(); } }
+
+    const size_t MAXR = (size_t)100 * 1024 * 1024;
+    size_t cap = 8192, len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) { close(fd); nova_set_error("http: oom"); return nova_http_empty(); }
+    for (;;) {
+        if (len + 4096 + 1 > cap) {
+            if (cap >= MAXR) { nova_set_error("http: response exceeds 100MB limit"); break; }
+            cap *= 2; char* nb = (char*)realloc(buf, cap);
+            if (!nb) { free(buf); close(fd); nova_set_error("http: oom"); return nova_http_empty(); }
+            buf = nb;
+        }
+        ssize_t n = recv(fd, buf + len, 4096, 0);
+        if (n <= 0) break;
+        len += (size_t)n;
+    }
+    close(fd);
+    buf[len] = '\0';
+    /* Return only the body (after the header terminator). The header region is
+       NUL-free, so strstr locates the separator safely even if the body has NULs. */
+    char* sep = strstr(buf, "\r\n\r\n");
+    const char* bstart = sep ? sep + 4 : buf;
+    size_t blen = sep ? (len - (size_t)(bstart - buf)) : len;
+    char* tracked = (char*)nova_heap_alloc(blen + 1, NOVA_MEM_RAW);
+    if (tracked) { memcpy(tracked, bstart, blen); tracked[blen] = '\0'; }
+    free(buf);
+    return tracked ? (int64_t)(uintptr_t)tracked : nova_http_empty();
+}
+
+int64_t nova_rt_http_get(int64_t url) {
+    return http_request((const char*)(uintptr_t)url, "GET", NULL, 0, NULL);
+}
+
 int64_t nova_rt_http_post(int64_t url, int64_t body, int64_t content_type) {
-    (void)url; (void)body; (void)content_type;
-    nova_set_error("HTTP: not implemented on this platform");
-    char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-    return (int64_t)(uintptr_t)e;
+    const char* b = (const char*)(uintptr_t)body;
+    return http_request((const char*)(uintptr_t)url, "POST", b, b ? (int64_t)strlen(b) : 0,
+                        (const char*)(uintptr_t)content_type);
 }
 
 #endif
