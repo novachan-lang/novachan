@@ -324,7 +324,8 @@ trust the label."
 | **HTTP client** (`http_get/post`) | done | PARTIAL | WinHTTP on Windows (real); "not implemented" on Linux/macOS. | Cross-platform client (libcurl/native). Oracle: GET a real endpoint on all 3 OSes. |
 | **HTTP server + runtime on Linux** | — | **REAL ✓ (validated 2026-05-29 via Docker)** | The NOVA runtime compiles clean on Linux (clang) and `ai_serve` (http_listen/accept_raw/send_raw + json + tensor) serves real inference: POST `{"features":[1,2]}` → `{"class":1}` in a Linux container. Required the cross-platform RC-deref fix (Finding #6). |
 | **Debugger** (DAP) | done | STUB | Logs only, no real breakpoints/stepping (nova_runtime.c:8933). | Real DAP server bridging LLDB/GDB. Oracle: set breakpoint, step, inspect a var. |
-| **Deploy** (`deploy_config/validate`) | done | THIN | Builds a dict (nova_runtime.c:9744). No real provider integration. | Real provider APIs (Fly/Docker). Oracle: actually deploy a hello-world and curl it. |
+| **Deploy** (`deploy_config/validate`) | done | THIN (helper) | Builds a config dict — fine as a helper, but not itself a deploy. | — |
+| **Real cloud deploy** (Docker + Railway) | — | **REAL ✓ (2026-05-30)** | `ai_serve` (full NOVA AI service) cross-compiled to Linux, built via Dockerfile, deployed to Railway, and serving live over HTTPS: `POST https://nova-ai-serve-production.up.railway.app/predict {"features":[1,2]}` → `{"class":1}`. ORACLE PASSED (live public endpoint). Kit: Dockerfile + railway.json + _deploy_prep/_docker_validate/_railway_env.ps1. Required: cross-platform RC fix (#6) + reading `$PORT` from env (Railway doesn't shell-expand `${PORT}` in its start command). |
 
 ---
 
