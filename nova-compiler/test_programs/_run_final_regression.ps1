@@ -31,7 +31,7 @@ $core_tests = @(
     'shadow_test','json_float_test','nested_float_test','dict_float_test','bool_json_test','nested_bool_test',
     'tensor_churn_test','tensor_boxed_float_test','ai_classify_test','json_decode_float_test',
     'read_bytes_test','float_list_ops_test','udp_test','supervisor_test',
-    'audio_synth_test','render_test','gpu_vadd_test'
+    'audio_synth_test','render_test','gpu_vadd_test','unsafe_test'
 )
 
 # Phase 12-14 new tests
