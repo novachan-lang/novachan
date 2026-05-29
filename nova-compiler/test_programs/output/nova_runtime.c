@@ -1263,10 +1263,16 @@ int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
         if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0)
-            return d->vals[ei];
+            return nova_rt_unbox(d->vals[ei]);
         slot = (slot + 1) & (d->idx_cap - 1);
     }
     return 0;
+}
+
+/* Set a float dict value, boxed so it keeps its type through the Any value slot.
+   The compiler routes d[k] = floatExpr here when the value is statically float. */
+int64_t nova_rt_dict_set_fbox(int64_t handle, int64_t key, int64_t bits) {
+    return nova_rt_dict_set(handle, key, nova_rt_box_float(bits));
 }
 
 int64_t nova_rt_dict_has(int64_t handle, int64_t key) {

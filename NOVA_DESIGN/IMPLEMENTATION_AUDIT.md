@@ -46,8 +46,12 @@ falls in the narrow box window. **Nested FLOAT in lists now works end-to-end:** 
 elements (list_append_fbox, type-directed), the JSON walker + any_to_str render boxes, and list_get /
 inlined index-get transparently unbox on read. Validated: nested_float_test (json [1.5,2.5,0.25] exact +
 read-back), 68/68 green, bootstrap fixpoint 3D449FD3151AA004.
-DONE: int JSON, top-level float JSON, box layer, **nested float in lists**. REMAINING: nested float in
-DICT values (same pattern, dict_set + dict_get); standalone bool + nested bool (needs IR bool tracking).
+DONE: int JSON, top-level float JSON, box layer, **nested float in lists AND dicts**. Dict path:
+compiler marks index_set with "fbox" when value is float (ir_infer_one), IRE routes to dict_set_fbox /
+boxes list stores; dict_get unboxes. Validated dict_float_test (json {"x":2.5,"n":7} + read-back), 69/69
+green, fixpoint 65C2C19572975341. **Floats are now comprehensively correct (scalar/list/dict).**
+REMAINING: bool (standalone + nested) — bool is erased to "int" in the IR (nova_compiler.nova:4535), so it
+needs IR-level bool tracking before the same boxing approach can distinguish it. That is the last piece.
 
 NOVA stores integers and pointers in the same 64-bit slot with no tag bit. Heap objects are
 identified by `nova_mem_find_tag(ptr)`; primitives are not tagged. When a primitive is passed to an
