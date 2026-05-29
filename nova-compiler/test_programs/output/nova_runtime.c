@@ -9658,13 +9658,110 @@ int64_t nova_rt_tls_close(int64_t handle) {
     return 0;
 }
 #else
-/* Non-Windows: TLS not yet implemented (would use OpenSSL/mbedTLS). */
-int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) { (void)host_val;(void)port_val; return 0; }
-int64_t nova_rt_tls_listen(int64_t a, int64_t b, int64_t c) { (void)a;(void)b;(void)c; return 0; }
+#ifdef NOVA_HAVE_OPENSSL
+/* Real TLS for Linux/macOS via OpenSSL — BOTH server (tls_listen/accept) and client
+   (tls_connect), plus send/recv/close. Built only with -DNOVA_HAVE_OPENSSL -lssl
+   -lcrypto. Reuses the existing Berkeley-socket tcp_listen/accept/connect helpers and
+   layers TLS on top. A handle with ssl==NULL is a listener (fd + server CTX). */
+typedef struct { int fd; SSL* ssl; SSL_CTX* ctx; int own_ctx; } NovaTls;
+
+static void nova_ssl_init_once(void) {
+    static int done = 0;
+    if (!done) { SSL_library_init(); SSL_load_error_strings(); done = 1; }
+}
+
+int64_t nova_rt_tls_listen(int64_t port_val, int64_t cert_path_val, int64_t key_path_val) {
+    nova_ssl_init_once();
+    const char* cert = (const char*)(uintptr_t)cert_path_val;
+    const char* key  = (const char*)(uintptr_t)key_path_val;
+    int64_t lfd = nova_rt_tcp_listen(port_val);
+    if ((int)lfd < 0) { nova_set_error("tls_listen: tcp_listen failed"); return 0; }
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) { NOVA_CLOSE_SOCKET((NOVA_SOCKET)lfd); nova_set_error("tls_listen: SSL_CTX_new failed"); return 0; }
+    if (cert && SSL_CTX_use_certificate_file(ctx, cert, SSL_FILETYPE_PEM) != 1) { SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)lfd); nova_set_error("tls_listen: load cert failed"); return 0; }
+    if (key && SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1) { SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)lfd); nova_set_error("tls_listen: load key failed"); return 0; }
+    NovaTls* L = (NovaTls*)calloc(1, sizeof(NovaTls));
+    if (!L) { SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)lfd); return 0; }
+    L->fd = (int)lfd; L->ssl = NULL; L->ctx = ctx; L->own_ctx = 1;
+    return (int64_t)(uintptr_t)L;
+}
+
+int64_t nova_rt_tls_accept(int64_t listen_handle) {
+    NovaTls* L = (NovaTls*)(uintptr_t)listen_handle;
+    if (!L || !L->ctx) { nova_set_error("tls_accept: bad listener"); return 0; }
+    int64_t cfd = nova_rt_tcp_accept((int64_t)L->fd);
+    if ((int)cfd < 0) { nova_set_error("tls_accept: accept failed"); return 0; }
+    SSL* ssl = SSL_new(L->ctx);
+    if (!ssl) { NOVA_CLOSE_SOCKET((NOVA_SOCKET)cfd); nova_set_error("tls_accept: SSL_new failed"); return 0; }
+    SSL_set_fd(ssl, (int)cfd);
+    if (SSL_accept(ssl) != 1) { SSL_free(ssl); NOVA_CLOSE_SOCKET((NOVA_SOCKET)cfd); nova_set_error("tls_accept: handshake failed"); return 0; }
+    NovaTls* C = (NovaTls*)calloc(1, sizeof(NovaTls));
+    if (!C) { SSL_free(ssl); NOVA_CLOSE_SOCKET((NOVA_SOCKET)cfd); return 0; }
+    C->fd = (int)cfd; C->ssl = ssl; C->ctx = L->ctx; C->own_ctx = 0;  /* shares listener CTX */
+    return (int64_t)(uintptr_t)C;
+}
+
+int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) {
+    nova_ssl_init_once();
+    int64_t fd = nova_rt_tcp_connect(host_val, port_val);
+    if ((int)fd < 0) { nova_set_error("tls_connect: tcp connect failed"); return 0; }
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect: SSL_CTX_new failed"); return 0; }
+    /* Raw TLS primitive: no peer verification by default (works against self-signed
+       endpoints). http_get does full cert verification for calling real APIs. */
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) { SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); return 0; }
+    SSL_set_fd(ssl, (int)fd);
+    const char* host = (const char*)(uintptr_t)host_val;
+    if (host) SSL_set_tlsext_host_name(ssl, host);
+    if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect: handshake failed"); return 0; }
+    NovaTls* C = (NovaTls*)calloc(1, sizeof(NovaTls));
+    if (!C) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); return 0; }
+    C->fd = (int)fd; C->ssl = ssl; C->ctx = ctx; C->own_ctx = 1;
+    return (int64_t)(uintptr_t)C;
+}
+
+int64_t nova_rt_tls_send(int64_t handle, int64_t data_val) {
+    NovaTls* C = (NovaTls*)(uintptr_t)handle;
+    const char* d = (const char*)(uintptr_t)data_val;
+    if (!C || !C->ssl || !d) return -1;
+    int n = SSL_write(C->ssl, d, (int)strlen(d));
+    return (n > 0) ? (int64_t)n : -1;
+}
+
+int64_t nova_rt_tls_recv(int64_t handle, int64_t max_bytes) {
+    NovaTls* C = (NovaTls*)(uintptr_t)handle;
+    if (!C || !C->ssl) return nova_rt_create_string((void*)"");
+    int cap = (int)max_bytes; if (cap <= 0 || cap > 1048576) cap = 65536;
+    char* buf = (char*)malloc((size_t)cap + 1);
+    if (!buf) return nova_rt_create_string((void*)"");
+    int n = SSL_read(C->ssl, buf, cap);
+    if (n <= 0) { free(buf); return nova_rt_create_string((void*)""); }
+    buf[n] = '\0';
+    char* tracked = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
+    if (tracked) memcpy(tracked, buf, (size_t)n + 1);
+    free(buf);
+    return tracked ? (int64_t)(uintptr_t)tracked : nova_rt_create_string((void*)"");
+}
+
+int64_t nova_rt_tls_close(int64_t handle) {
+    NovaTls* C = (NovaTls*)(uintptr_t)handle;
+    if (!C) return 0;
+    if (C->ssl) { SSL_shutdown(C->ssl); SSL_free(C->ssl); }
+    if (C->own_ctx && C->ctx) SSL_CTX_free(C->ctx);
+    if (C->fd) NOVA_CLOSE_SOCKET((NOVA_SOCKET)C->fd);
+    free(C);
+    return 0;
+}
+#else
+/* Non-Windows without OpenSSL: TLS unavailable (build with -DNOVA_HAVE_OPENSSL). */
+int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) { (void)host_val;(void)port_val; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
+int64_t nova_rt_tls_listen(int64_t a, int64_t b, int64_t c) { (void)a;(void)b;(void)c; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
 int64_t nova_rt_tls_accept(int64_t a) { (void)a; return 0; }
 int64_t nova_rt_tls_send(int64_t a, int64_t b) { (void)a;(void)b; return 0; }
 int64_t nova_rt_tls_recv(int64_t a, int64_t b) { (void)a;(void)b; return nova_rt_create_string((void*)""); }
 int64_t nova_rt_tls_close(int64_t a) { (void)a; return 0; }
+#endif
 #endif
 
 /* ── WebSocket (RFC 6455) — real handshake + framing ──────────────────────── */
