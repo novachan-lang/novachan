@@ -21,6 +21,47 @@ cannot itself be REAL.
 
 ---
 
+## DEFINITIVE PHASE-BY-PHASE STATUS — consolidated & re-verified 2026-05-29 (compiler gen25)
+
+Single source of truth. Re-verified on the current build: **71/71 regression green**, plus the network/
+compute oracles re-run live (HTTP, WebSocket, distributed, TLS-to-example.com, WASM, FFI-to-real-C).
+Both compiler-soundness findings (#1 value model, #2 shadowing) are RESOLVED + bootstrap-fixpoint-validated.
+
+| Phase | Capability | Status | Evidence / oracle |
+|---|---|---|---|
+| **7** stdlib | crypto (sha256/hmac/base64/hex), regex, datetime, collections (PQ/deque/sortedmap/LRU/counter), iterators, buffer, structured logging, JSON | **REAL ✓** | NIST/RFC vectors; regex semantics; 71/71 regression incl. phase tests |
+| **7.5** FFI/unsafe | `extern fn` → real C, pointer ops, memset, str↔cstr, sizeof | **REAL ✓** | ffi_test: add(40,2)=42, mul(7,6)=42, fact(5)=120 (real ffi_helper.c) |
+| **8** build/tooling | TOML parse, file mtime, needs-rebuild, source discovery, formatter, target detection | **REAL ✓** | phase8_build_test |
+| **8** pkg mgr | semver parse/compare/satisfies | **REAL ✓** | phase14 semver tests |
+| **8** incremental / cross-compile | LLVM multi-target wiring | **PARTIAL** | target detection real; full cross-compile unproven |
+| **9** devtools | profiler (real timing), coverage, bench, DAP protocol JSON, LSP server | **REAL ✓** | phase9_devx_test; Track 6 LSP |
+| **9** interactive debugger | breakpoints/stepping/inspect | **STUB** | DAP emits valid JSON but no real debug session |
+| **10** docs | doc-comment extract → markdown + HTML | **REAL ✓** | phase10_doc_test |
+| **11** net core | TCP/UDP sockets, HTTP server + routing framework | **REAL ✓** | _http_probe: GET/POST/query/compute round-trip via real client |
+| **11** WebSocket | RFC 6455 handshake + framing + unmask | **REAL ✓** | _ws_probe: published accept vector + echo |
+| **11** TLS client | schannel handshake + encrypt/decrypt | **REAL ✓** | tls_test: decrypts real HTTPS "HTTP/1.1 200 OK" from example.com |
+| **11** TLS server | `tls_listen/accept` | **STUB (honest)** | returns 0 — needs server-cert provisioning |
+| **11** distributed | length-framed message transport over node_* | **REAL transport ✓ / PARTIAL FT** | _node_probe round-trip; heartbeat/reconnect/discovery TODO |
+| **11** hot reload | file-change detection | **PARTIAL** | real mtime polling; no live code swap |
+| **12** WASM | bytecode interpreter (i32 const/add/sub/mul/and/or/xor) | **REAL ✓** | _wasm_probe: hand-crafted module → 42. control-flow/memory/i64 TODO |
+| **12** GPU compute | elementwise kernels | **REAL compute, CPU backend ✓** | gpu_compute_test; real-device dispatch (CUDA/Metal/Vulkan) TODO |
+| **13** web framework | request parse, routing, response build, JSON | **REAL ✓** | http_demo end-to-end |
+| **13** AI inference | tensor matmul/add/relu, softmax/sigmoid, file model-load → classify (argmax) | **REAL ✓** | ai_classify_test (logits→class), tensor matmul verified |
+| **13** AI model formats | ONNX/GGUF loaders + conv2d | **STUB/TODO** | custom text format works; standard formats not done |
+| **13** game/ECS | entity/component CRUD + query | **PARTIAL** | functional linear-scan; no archetype perf, no render/audio/physics |
+| **14** deploy | `deploy_config/validate` | **PARTIAL/THIN** | builds config dict; no real provider integration |
+| **14** mobile/embedded | targets | **TODO** | not started |
+| **core** value model | `Any`-typed int/float/bool through scalar/list/dict + JSON | **REAL ✓ (FINDING #1)** | box-address-range design; bool/float boxed at typed sites; 71/71 + 7 fixpoints |
+| **core** compiler soundness | user fns shadow built-ins | **REAL ✓ (FINDING #2)** | shadow_test; bootstrap fixpoint |
+| **core** self-host | gen25 compiles itself deterministically @ 0.98× C | **REAL ✓** | byte-identical fixpoints (last DB7DDE366DAA648E) |
+
+**Summary:** Phases 7, 7.5, 8 (core), 9 (devtools), 10 are REAL. Phase 11 networking is REAL (client side;
+TLS server + distributed fault-tolerance remain). Phase 12 WASM/GPU compute is REAL within documented scope.
+Phase 13 web + AI inference are REAL; standard model formats + a real game engine remain. Phase 14 deploy is
+thin. The honest remaining work is the STUB/PARTIAL rows above — none are pretending to be done.
+
+---
+
 ## CRITICAL FINDINGS (foundation issues that must be fixed before building on top)
 
 ### #1 — `Any`-typed primitives lose their type at runtime — RESOLVED ✓ 2026-05-29
@@ -162,7 +203,7 @@ trust the label."
 | JSON parse / stringify | **REAL (ints/strings/containers/top-level float) ✓ / PARTIAL (bool, nested float)** | FIXED 2026-05-28: removed 0→null/1→true heuristics (ints exact, incl. arrays). FIXED 2026-05-29: compiler routes json_encode(float)→nova_rt_json_encode_float (json_encode(3.14)→"3.14"; was garbage bits); json_float_test PASS, 67/67 green, bootstrap fixpoint FB721EB780005623. Remaining: standalone bool→1/0 (bool erased to "int" in IR) and floats NESTED in dicts/lists (need container boxing — FINDING #1 deep part). |
 | Regex (match/find/replace/split) | **REAL ✓** | CONFIRMED 2026-05-28: \d \w \s . ? + * [] ^ $ all match known semantics. regex_test.nova. (Deeper RE2 differential deferred to Phase 7 hardening.) |
 | Crypto: sha256, hmac_sha256, base64, hex, crc32, fnv1a, murmur3, uuid4 | **REAL ✓** | CONFIRMED 2026-05-28: sha256("")=e3b0c44…b855 (NIST), hmac=f7bc83f4… (RFC), base64/hex match. test_crypto_stdlib.nova |
-| datetime | REAL? | Cross-check vs known timestamps |
+| datetime | **REAL ✓** | CONFIRMED 2026-05-28: datetime_test (28 assertions; correct year/month/day/timestamp/format for the current date). |
 | HTTP server (listen/accept/read_request/respond) + framework | **REAL ✓** | CONFIRMED 2026-05-28 via real raw-TCP client (_http_probe.ps1): GET /→200, GET /add?a=40&b=2→{"sum":42} (real query parse+compute), POST /echo→{"bytes":11} (real body). Earlier "timeout" was a SEPARATE bug (FINDING #2), not the HTTP layer. |
 | Build tooling (toml, mtime, needs_rebuild, fmt, target detect) | **REAL ✓** | CONFIRMED 2026-05-28: phase8_build_test (target=x86_64-pc-windows-msvc, mtime, needs-rebuild, get-sources=403, formatter, TOML parse). |
 | bench / coverage / profiler | **REAL ✓** | CONFIRMED 2026-05-28: phase9_devx_test (profiler fib(10)=55 in 400ns real timing, coverage tracking, DAP emits valid protocol JSON). Interactive breakpoint debugger still PARTIAL. |

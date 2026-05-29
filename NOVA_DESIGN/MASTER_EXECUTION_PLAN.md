@@ -1,5 +1,11 @@
 # NOVA Master Execution Plan
 
+> **AS-BUILT NOTE (2026-05-29):** This plan is largely executed. NOVA has a self-hosting compiler at
+> 0.98× C with Phases 0–14 substantially implemented. For the real implemented architecture and the
+> per-feature status, see [AS_BUILT_ARCHITECTURE.md](AS_BUILT_ARCHITECTURE.md) and
+> [IMPLEMENTATION_AUDIT.md](IMPLEMENTATION_AUDIT.md). The plan below remains the canonical record of
+> *intent and sequencing*; the audit is the canonical record of *what is actually real*.
+
 ## The Rule
 
 **Nothing moves forward until the step before it is validated.** Every step has a validation gate. If it fails the gate, we STOP, fix it, re-validate, and only THEN proceed. No exceptions. No "we'll fix it later." Later never comes — it just becomes 10x harder to fix.

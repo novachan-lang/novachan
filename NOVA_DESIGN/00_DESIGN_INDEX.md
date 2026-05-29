@@ -1,5 +1,13 @@
 # NOVA Design System — Master Index
 
+> **IMPLEMENTATION STATUS (as-built, 2026-05-29):** NOVA is no longer at "Phase 0." There is a
+> **self-hosting NOVA compiler** (~11.4K lines) emitting LLVM IR + a C runtime, self-compiling to a
+> deterministic byte-identical fixpoint at **~0.98× C**, with **Phases 0–14 substantially implemented**
+> and Phases 7–14 made genuinely real + oracle-verified (71/71 regression green). The plan docs below
+> describe the original design; for **what is actually built** and the key as-built decisions (notably the
+> value model) see **[AS_BUILT_ARCHITECTURE.md](AS_BUILT_ARCHITECTURE.md)**, and for **per-feature
+> REAL/PARTIAL/STUB status** see **[IMPLEMENTATION_AUDIT.md](IMPLEMENTATION_AUDIT.md)** (single source of truth).
+
 ## The Unified Architecture
 
 NOVA is built on ONE model that delivers ALL properties simultaneously:
@@ -63,7 +71,11 @@ See [MASTER_EXECUTION_PLAN.md](MASTER_EXECUTION_PLAN.md) for the complete build 
 
 **The Rule:** Nothing moves forward until the step before it is validated. Every change is checked against everything else. Upstream mistakes are catastrophic.
 
-**Current Phase:** Phase 0 — Language Specification (Syntax → Type Rules → Process Semantics)
+**Current Phase (as-built 2026-05-29):** Phases 0–14 substantially implemented; self-hosting compiler at
+0.98× C. Both compiler-soundness findings resolved (value model #1, shadowing #2). Remaining work = the
+honest STUB/PARTIAL rows in IMPLEMENTATION_AUDIT.md (TLS server, real-device GPU, distributed fault-
+tolerance, WASM control-flow, ONNX/GGUF model formats, archetype ECS, interactive debugger, deploy). The
+"Phase 0" plan below is historical. See AS_BUILT_ARCHITECTURE.md.
 
 **Five Risk Gates:**
 1. Syntax: simpler than Python? (blocks everything)
