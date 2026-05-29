@@ -403,23 +403,43 @@ typedef struct { int64_t kind; int64_t payload; } NovaBox;
 #define NOVA_BOX_BOOL  0
 #define NOVA_BOX_FLOAT 1
 
+/* Track the address range of allocated boxes. This makes the box check a cheap
+   range comparison: any value outside [g_box_lo, g_box_hi] is definitely not a box
+   (rejected with two compares, no deref). Programs that never box pay nothing
+   (range stays empty), so the compiler's hot container reads are unaffected. */
+static uintptr_t g_box_lo = (uintptr_t)-1;
+static uintptr_t g_box_hi = 0;
+
+static void nova_box_track(uintptr_t a) {
+    if (a < g_box_lo) g_box_lo = a;
+    if (a > g_box_hi) g_box_hi = a;
+}
+
 int64_t nova_rt_box_bool(int64_t v) {
     NovaBox* b = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
     if (!b) return 0;
     b->kind = NOVA_BOX_BOOL; b->payload = v ? 1 : 0;
+    nova_box_track((uintptr_t)b);
     return (int64_t)(uintptr_t)b;
 }
 int64_t nova_rt_box_float(int64_t bits) {
     NovaBox* b = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
     if (!b) return 0;
     b->kind = NOVA_BOX_FLOAT; b->payload = bits;
+    nova_box_track((uintptr_t)b);
     return (int64_t)(uintptr_t)b;
+}
+/* Cheap box test: range-reject first (zero cost if nothing was ever boxed), then
+   confirm the tag only for values that fall in the box-address window. */
+static int nova_is_box(int64_t handle) {
+    uintptr_t a = (uintptr_t)handle;
+    if (a < g_box_lo || a > g_box_hi) return 0;
+    if (a & 7) return 0;
+    return nova_mem_find_tag((void*)a) == NOVA_MEM_BOX;
 }
 /* If handle points to a box, return its raw payload; otherwise pass through. */
 int64_t nova_rt_unbox(int64_t handle) {
-    if (!handle) return handle;
-    void* p = (void*)(uintptr_t)handle;
-    if (nova_mem_find_tag(p) == NOVA_MEM_BOX) return ((NovaBox*)p)->payload;
+    if (nova_is_box(handle)) return ((NovaBox*)(uintptr_t)handle)->payload;
     return handle;
 }
 
@@ -672,6 +692,12 @@ int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
     return 0;
 }
 
+/* Append a float to a list, boxed so it keeps its type through the Any element slot.
+   The compiler routes list.push(floatExpr) here when the element is statically float. */
+int64_t nova_rt_list_append_fbox(int64_t handle, int64_t bits) {
+    return nova_rt_list_append(handle, nova_rt_box_float(bits));
+}
+
 int64_t nova_rt_list_get(int64_t handle, int64_t index) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (index < 0) index += list->size;
@@ -683,7 +709,7 @@ int64_t nova_rt_list_get(int64_t handle, int64_t index) {
         nova_set_error(buf);
         return 0;
     }
-    return list->data[index];
+    return nova_rt_unbox(list->data[index]);
 }
 
 int64_t nova_rt_list_set(int64_t handle, int64_t index, int64_t value) {
@@ -2118,6 +2144,7 @@ int64_t nova_rt_json_stringify(int64_t val) {
 
 /* ── Runtime type dispatch for Any-typed values ──────────────────────────── */
 
+int64_t nova_rt_create_string(void* cstr_ptr); /* forward decl (defined later) */
 int64_t nova_rt_any_to_str(int64_t val) {
     if (val == 0) return nova_rt_int_to_str(0);
     void* ptr = (void*)(uintptr_t)val;
@@ -2129,6 +2156,11 @@ int64_t nova_rt_any_to_str(int64_t val) {
         case NOVA_MEM_DICT:     return nova_rt_json_stringify(val);
         case NOVA_MEM_STRUCT:   return (int64_t)(uintptr_t)"<struct>";
         case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"<iter>";
+        case NOVA_MEM_BOX: {
+            NovaBox* bx = (NovaBox*)ptr;
+            if (bx->kind == NOVA_BOX_BOOL) return nova_rt_create_string((void*)(bx->payload ? "true" : "false"));
+            return nova_rt_float_to_str(bx->payload);
+        }
         default:
             if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
                 unsigned char c = *(unsigned char*)ptr;

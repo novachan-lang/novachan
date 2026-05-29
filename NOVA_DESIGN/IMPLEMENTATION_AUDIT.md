@@ -36,15 +36,18 @@ element read. Wide blast radius (every runtime path reading container elements d
 to_str…), so it must be done incrementally with bootstrap re-validation per step. bool also needs IR-level
 tracking (currently erased to "int" at nova_compiler.nova:4535). This is the dedicated effort.
 
-**Nested-container blocker found 2026-05-29 (perf):** Boxing floats/bools inside dicts/lists requires
-*unboxing on every generic container read* (list_get/iter_next/dict_get/index_get). The only safe box
-check is `nova_mem_find_tag`, which uses `IsBadReadPtr` on Windows — a kernel-ish call. Putting that on
-every element read tanks performance (the compiler traverses List<Any> constantly), breaking the 0.98×-C
-promise. So nested boxing is NOT just wiring — it needs a cheaper value-discrimination scheme
-(NaN-boxing, or a tag checkable without IsBadReadPtr, e.g. a fast heap-range bitmap). That is a genuine
-value-model redesign requiring design + benchmarking. DONE so far (safe, validated): int JSON correct
-(2026-05-28), top-level float JSON correct (2026-05-29), runtime box layer landed (744780f). DEFERRED
-(needs redesign): floats/bools nested in containers; standalone bool (also needs IR bool tracking).
+**Nested-container blocker (perf) — RESOLVED 2026-05-29 via box-address-range tracking.** The earlier
+concern was that detecting a box on every container read needs `nova_mem_find_tag` (IsBadReadPtr, slow).
+SOLUTION: track the min/max address of allocated boxes (g_box_lo/g_box_hi). `nova_is_box` first does a
+cheap range compare — any value outside the box-address window is rejected in one compare, with NO deref.
+Programs that never box pay nothing (range empty → instant reject), so the compiler's hot list-indexing
+is unaffected (bootstrap held ~47s, fixpoint deterministic). find_tag runs only for the rare value that
+falls in the narrow box window. **Nested FLOAT in lists now works end-to-end:** compiler boxes float
+elements (list_append_fbox, type-directed), the JSON walker + any_to_str render boxes, and list_get /
+inlined index-get transparently unbox on read. Validated: nested_float_test (json [1.5,2.5,0.25] exact +
+read-back), 68/68 green, bootstrap fixpoint 3D449FD3151AA004.
+DONE: int JSON, top-level float JSON, box layer, **nested float in lists**. REMAINING: nested float in
+DICT values (same pattern, dict_set + dict_get); standalone bool + nested bool (needs IR bool tracking).
 
 NOVA stores integers and pointers in the same 64-bit slot with no tag bit. Heap objects are
 identified by `nova_mem_find_tag(ptr)`; primitives are not tagged. When a primitive is passed to an
