@@ -33,6 +33,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#ifdef NOVA_HAVE_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
 #endif
 
 /* ── Error flag (TLS, defined in LLVM IR, accessed from C runtime) ─────── */
@@ -3970,25 +3974,36 @@ int64_t nova_rt_http_post(int64_t url, int64_t body, int64_t content_type) {
 
 #else
 /* ── Native HTTP/1.1 client for Linux/macOS (Berkeley sockets) ──────────────────
-   Handles http:// over plain TCP. https:// requires TLS — returned as an explicit
-   error here until the OpenSSL path is wired (next increment). Returns the response
-   BODY as a tracked string (same contract as the Windows WinHTTP path). */
+   http:// over plain TCP. https:// over TLS via OpenSSL when built with
+   -DNOVA_HAVE_OPENSSL -lssl -lcrypto (cert verification on, SNI set); otherwise
+   https:// returns an explicit error. Returns the response BODY as a tracked string
+   (same contract as the Windows WinHTTP path). */
 static int64_t nova_http_empty(void) {
     char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if (e) e[0] = '\0';
     return (int64_t)(uintptr_t)e;
 }
 
+/* Read/write that use TLS when an SSL* is present, else the raw socket fd. */
+#ifdef NOVA_HAVE_OPENSSL
+#define NOVA_TLS_WRITE(sp, b, l) ((sp) ? SSL_write((SSL*)(sp), (b), (int)(l)) : (int)send(fd, (b), (l), 0))
+#define NOVA_TLS_READ(sp, b, l)  ((sp) ? SSL_read((SSL*)(sp), (b), (int)(l)) : (int)recv(fd, (b), (l), 0))
+#else
+#define NOVA_TLS_WRITE(sp, b, l) ((int)send(fd, (b), (l), 0))
+#define NOVA_TLS_READ(sp, b, l)  ((int)recv(fd, (b), (l), 0))
+#endif
+
 static int64_t http_request(const char* url, const char* method,
                             const char* body, int64_t body_len, const char* content_type) {
     if (!url) { nova_set_error("http: null url"); return nova_http_empty(); }
     const char* p = url;
-    if (strncmp(p, "https://", 8) == 0) {
-        nova_set_error("http: https:// not yet supported on this platform (http:// works); use the Windows build or await the OpenSSL path");
-        return nova_http_empty();
-    }
-    if (strncmp(p, "http://", 7) == 0) p += 7;
+    int is_https = 0;
+    if (strncmp(p, "https://", 8) == 0) { is_https = 1; p += 8; }
+    else if (strncmp(p, "http://", 7) == 0) { p += 7; }
+#ifndef NOVA_HAVE_OPENSSL
+    if (is_https) { nova_set_error("http: https requires the OpenSSL build (-DNOVA_HAVE_OPENSSL -lssl -lcrypto)"); return nova_http_empty(); }
+#endif
 
-    char host[256]; int hi = 0; int port = 80;
+    char host[256]; int hi = 0; int port = is_https ? 443 : 80;
     while (*p && *p != ':' && *p != '/' && hi < 255) host[hi++] = *p++;
     host[hi] = '\0';
     if (*p == ':') { p++; port = atoi(p); while (*p && *p != '/') p++; }
@@ -4005,6 +4020,27 @@ static int64_t http_request(const char* url, const char* method,
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); nova_set_error("http: connect failed"); return nova_http_empty(); }
     freeaddrinfo(res);
 
+    void* sslp = NULL;
+    int64_t ret = 0;
+    char* buf = NULL;
+#ifdef NOVA_HAVE_OPENSSL
+    SSL_CTX* ctx = NULL;
+    if (is_https) {
+        static int ssl_inited = 0;
+        if (!ssl_inited) { SSL_library_init(); SSL_load_error_strings(); ssl_inited = 1; }
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) { close(fd); nova_set_error("http: SSL_CTX_new failed"); return nova_http_empty(); }
+        SSL_CTX_set_default_verify_paths(ctx);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        SSL* ssl = SSL_new(ctx);
+        if (!ssl) { SSL_CTX_free(ctx); close(fd); nova_set_error("http: SSL_new failed"); return nova_http_empty(); }
+        SSL_set_fd(ssl, fd);
+        SSL_set_tlsext_host_name(ssl, host);   /* SNI */
+        if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); close(fd); nova_set_error("http: TLS handshake/verification failed"); return nova_http_empty(); }
+        sslp = ssl;
+    }
+#endif
+
     char header[2560];
     int hl;
     if (body && body_len > 0) {
@@ -4016,36 +4052,45 @@ static int64_t http_request(const char* url, const char* method,
             "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: nova/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
             method, path, host);
     }
-    if (hl < 0 || hl >= (int)sizeof(header)) { close(fd); nova_set_error("http: request header too large"); return nova_http_empty(); }
-    if (send(fd, header, (size_t)hl, 0) < 0) { close(fd); nova_set_error("http: send failed"); return nova_http_empty(); }
-    if (body && body_len > 0) { if (send(fd, body, (size_t)body_len, 0) < 0) { close(fd); nova_set_error("http: send body failed"); return nova_http_empty(); } }
+    if (hl < 0 || hl >= (int)sizeof(header)) { nova_set_error("http: request header too large"); ret = nova_http_empty(); goto cleanup; }
+    if (NOVA_TLS_WRITE(sslp, header, hl) < 0) { nova_set_error("http: send failed"); ret = nova_http_empty(); goto cleanup; }
+    if (body && body_len > 0) { if (NOVA_TLS_WRITE(sslp, body, (size_t)body_len) < 0) { nova_set_error("http: send body failed"); ret = nova_http_empty(); goto cleanup; } }
 
-    const size_t MAXR = (size_t)100 * 1024 * 1024;
-    size_t cap = 8192, len = 0;
-    char* buf = (char*)malloc(cap);
-    if (!buf) { close(fd); nova_set_error("http: oom"); return nova_http_empty(); }
-    for (;;) {
-        if (len + 4096 + 1 > cap) {
-            if (cap >= MAXR) { nova_set_error("http: response exceeds 100MB limit"); break; }
-            cap *= 2; char* nb = (char*)realloc(buf, cap);
-            if (!nb) { free(buf); close(fd); nova_set_error("http: oom"); return nova_http_empty(); }
-            buf = nb;
+    {
+        const size_t MAXR = (size_t)100 * 1024 * 1024;
+        size_t cap = 8192, len = 0;
+        buf = (char*)malloc(cap);
+        if (!buf) { nova_set_error("http: oom"); ret = nova_http_empty(); goto cleanup; }
+        for (;;) {
+            if (len + 4096 + 1 > cap) {
+                if (cap >= MAXR) { nova_set_error("http: response exceeds 100MB limit"); break; }
+                cap *= 2; char* nb = (char*)realloc(buf, cap);
+                if (!nb) { nova_set_error("http: oom"); ret = nova_http_empty(); goto cleanup; }
+                buf = nb;
+            }
+            int n = NOVA_TLS_READ(sslp, buf + len, 4096);
+            if (n <= 0) break;
+            len += (size_t)n;
         }
-        ssize_t n = recv(fd, buf + len, 4096, 0);
-        if (n <= 0) break;
-        len += (size_t)n;
+        buf[len] = '\0';
+        /* Return only the body (after the header terminator). The header region is
+           NUL-free, so strstr locates the separator even if the body has NULs. */
+        char* sep = strstr(buf, "\r\n\r\n");
+        const char* bstart = sep ? sep + 4 : buf;
+        size_t blen = sep ? (len - (size_t)(bstart - buf)) : len;
+        char* tracked = (char*)nova_heap_alloc(blen + 1, NOVA_MEM_RAW);
+        if (tracked) { memcpy(tracked, bstart, blen); tracked[blen] = '\0'; ret = (int64_t)(uintptr_t)tracked; }
+        else ret = nova_http_empty();
     }
+
+cleanup:
+#ifdef NOVA_HAVE_OPENSSL
+    if (sslp) { SSL_shutdown((SSL*)sslp); SSL_free((SSL*)sslp); }
+    if (ctx) SSL_CTX_free(ctx);
+#endif
+    if (buf) free(buf);
     close(fd);
-    buf[len] = '\0';
-    /* Return only the body (after the header terminator). The header region is
-       NUL-free, so strstr locates the separator safely even if the body has NULs. */
-    char* sep = strstr(buf, "\r\n\r\n");
-    const char* bstart = sep ? sep + 4 : buf;
-    size_t blen = sep ? (len - (size_t)(bstart - buf)) : len;
-    char* tracked = (char*)nova_heap_alloc(blen + 1, NOVA_MEM_RAW);
-    if (tracked) { memcpy(tracked, bstart, blen); tracked[blen] = '\0'; }
-    free(buf);
-    return tracked ? (int64_t)(uintptr_t)tracked : nova_http_empty();
+    return ret;
 }
 
 int64_t nova_rt_http_get(int64_t url) {
