@@ -3065,6 +3065,15 @@ int64_t nova_rt_env(int64_t name_ptr) {
     return (int64_t)(uintptr_t)copy;
 }
 
+/* ── cstr_to_string(ptr) — convert C string pointer to NOVA string ────────
+   FFI helper: extern fns that return const char* (sqlite3_column_text,
+   strerror, etc.) hand back a raw pointer; this wraps it in a NOVA fat
+   string by copying the bytes into the NOVA heap. */
+int64_t nova_rt_cstr_to_string(int64_t ptr) {
+    if (!ptr) return nova_rt_create_string((void*)"");
+    return nova_rt_create_string((void*)(uintptr_t)ptr);
+}
+
 /* ── set_env(name, value) — write to env. Empty value clears the var. ─ */
 int64_t nova_rt_set_env(int64_t name_ptr, int64_t val_ptr) {
     const char* name = (const char*)(uintptr_t)name_ptr;

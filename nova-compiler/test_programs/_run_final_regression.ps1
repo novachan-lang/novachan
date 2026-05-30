@@ -33,7 +33,7 @@ $core_tests = @(
     'read_bytes_test','float_list_ops_test','udp_test','supervisor_test',
     'audio_synth_test','render_test','gpu_vadd_test','unsafe_test',
     'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_opaque_test','ffi_out_test','ffi_repr_c_test',
-    'prof_test'
+    'prof_test','demo_sqlite_test'
 )
 
 # Phase 12-14 new tests
@@ -86,8 +86,18 @@ foreach ($t in $all_tests) {
         if ($skipLibs -notcontains $libName) { $extraLibs += " -l$libName" }
     }
 
+    # Domain-demo: if the .ll references sqlite3_*, link the amalgamation
+    # so the test doesn't depend on a system-wide libsqlite3 install.
+    $extraSrc = ""
+    if (Select-String -Path $ll -Pattern '@sqlite3_' -Quiet) {
+        $sqliteSrc = "$PSScriptRoot\output\sqlite3.c"
+        if (Test-Path $sqliteSrc) {
+            $extraSrc = " `"$sqliteSrc`" -DSQLITE_THREADSAFE=0"
+        }
+    }
+
     # Link
-    $linkArgs = "-O2 -o `"$exe`" `"$ll`" `"$runtimeSrc`" $NovaLinkFlags$extraLibs -D_CRT_SECURE_NO_WARNINGS -w"
+    $linkArgs = "-O2 -o `"$exe`" `"$ll`" `"$runtimeSrc`"$extraSrc $NovaLinkFlags$extraLibs -D_CRT_SECURE_NO_WARNINGS -w"
     $lr = Invoke-Timed -FilePath $ClangPath -Arguments $linkArgs -TimeoutMs 60000 -WorkingDirectory $PSScriptRoot
     if (!(Test-Path $exe)) {
         Write-Host "FAIL link: $t"
