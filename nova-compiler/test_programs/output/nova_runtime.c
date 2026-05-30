@@ -1333,6 +1333,38 @@ int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
     return 0;
 }
 
+/* Track 8 Week 3 (extended): dict_set variant that skips nova_rc_inc on
+   both key and value. Used when the compiler proves the dict is
+   process-local. */
+int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    const char* k = (const char*)(uintptr_t)key;
+    uint64_t h = nova_dict_hash_key(k);
+    int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
+    while (d->idx[slot] != DICT_IDX_EMPTY) {
+        int64_t ei = d->idx[slot];
+        if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0) {
+            d->vals[ei] = val;
+            return 0;
+        }
+        slot = (slot + 1) & (d->idx_cap - 1);
+    }
+    if (d->size >= d->cap) {
+        d->cap *= 2;
+        d->keys = realloc(d->keys, (size_t)d->cap * sizeof(int64_t));
+        d->vals = realloc(d->vals, (size_t)d->cap * sizeof(int64_t));
+        d->hashes = realloc(d->hashes, (size_t)d->cap * sizeof(uint64_t));
+    }
+    d->keys[d->size] = key;
+    d->vals[d->size] = val;
+    d->hashes[d->size] = h;
+    /* INTENTIONALLY no nova_rc_inc on key OR val — caller proven local. */
+    d->idx[slot] = d->size;
+    d->size++;
+    dict_maybe_grow(d);
+    return 0;
+}
+
 int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     const char* k = (const char*)(uintptr_t)key;
