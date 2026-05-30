@@ -32,7 +32,7 @@ $core_tests = @(
     'tensor_churn_test','tensor_boxed_float_test','ai_classify_test','json_decode_float_test',
     'read_bytes_test','float_list_ops_test','udp_test','supervisor_test',
     'audio_synth_test','render_test','gpu_vadd_test','unsafe_test',
-    'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_opaque_test'
+    'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_opaque_test','ffi_out_test'
 )
 
 # Phase 12-14 new tests

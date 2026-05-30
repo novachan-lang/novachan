@@ -1384,6 +1384,10 @@ fn ffi_llvm_type(ann: string) -> string
         return "void"
     if ann == "i32" or ann == "int32"
         return "i32"
+    // out:T params are always pointer-typed at the C ABI (the C function
+    // writes through the pointer). The wrapper handles slot alloca + load-back.
+    if len(ann) > 4 and ann[0:4] == "out:"
+        return "ptr"
     "i64"
 
 fn parse_extern_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
@@ -1409,6 +1413,16 @@ fn parse_extern_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
             p = p + 1
             type_ann = tv(tokens, p)
             p = p + 1
+            // out<T>: parametric type. Encode as "out:T" — downstream FFI emit
+            // and call-site IR check for this prefix to trigger pointer marshaling.
+            // ('<' and '>' are lexed as OP tokens, not DELIM.)
+            if type_ann == "out" and tk(tokens, p) == "OP" and tv(tokens, p) == "<"
+                p = p + 1
+                let inner_t = tv(tokens, p)
+                p = p + 1
+                if tk(tokens, p) == "OP" and tv(tokens, p) == ">"
+                    p = p + 1
+                type_ann = "out:" + inner_t
         push(params, Param(param_name, type_ann, null_expr()))
     p = expect(tokens, p, ")", pe)
     let ret_ann = ""
@@ -4456,9 +4470,10 @@ type IrBuilder
     ir_ffi_wrapped: dict
     ir_cur_line: int
     ir_opaque_types: dict
+    ir_extern_out_idx: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {})
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -4659,8 +4674,27 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                 if fn_name == "main"
                     fn_name = "nova_user_main"
                 let arg_regs = []
+                // For 'out:T' extern fn params, the argument must be a simple
+                // identifier; we emit slot_addr (ptrtoint of the variable's
+                // alloca) instead of evaluating the expression as a value.
+                let out_set = {}
+                if contains(b.ir_extern_out_idx, fn_name)
+                    for oi in b.ir_extern_out_idx[fn_name]
+                        out_set[str(oi)] = 1
+                let ci = 0
                 for child in children
-                    push(arg_regs, ir_lower_expr(b, child))
+                    if contains(out_set, str(ci))
+                        match child
+                            Expr(ctag, cval, cnum, cch, cfl, cln) =>
+                                let dest = ir_fresh_reg(b)
+                                if ctag == "ident"
+                                    ir_emit_inst(b, "slot_addr", dest, ir_type_int(), [], cval, 0)
+                                else
+                                    ir_emit_inst(b, "slot_addr", dest, ir_type_int(), [], "__bad_out", 0)
+                                push(arg_regs, dest)
+                    else
+                        push(arg_regs, ir_lower_expr(b, child))
+                    ci = ci + 1
                 if contains(b.ir_fn_defaults, fn_name)
                     let def_params = b.ir_fn_defaults[fn_name]
                     let di = len(arg_regs)
@@ -7963,10 +7997,13 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                         match p
                             Param(pname, ptype, pdefault) =>
                                 if ptype != "" and ptype != "any"
-                                    if contains(st.ti_opaque_types, ptype)
+                                    let pt_eff = ptype
+                                    if len(pt_eff) > 4 and pt_eff[0:4] == "out:"
+                                        pt_eff = pt_eff[4:999999]
+                                    if contains(st.ti_opaque_types, pt_eff)
                                         push(ext_param_types, nt_int())
                                     else
-                                        push(ext_param_types, ti_ann_to_type(ptype))
+                                        push(ext_param_types, ti_ann_to_type(pt_eff))
                                 else
                                     push(ext_param_types, nt_any())
                     let ext_ret_t = nt_any()
@@ -8239,6 +8276,12 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                 match block
                     IrBlock(label, insts, terminator) =>
                         let slot_last = {}
+                        // Track slot_addr results so calls that escape a slot
+                        // address can invalidate slot_last for that slot (FFI
+                        // out<T>: C writes through the pointer, NOVA must
+                        // re-load the slot afterwards).
+                        let addr_regs = {}
+                        let slot_invalid = {}
                         let new_insts = []
                         for inst in insts
                             match inst
@@ -8248,9 +8291,19 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                                         push(new_insts, inst)
                                     else if op == "slot_store"
                                         slot_last[value] = args[0]
+                                        slot_invalid[value] = 0
+                                        push(new_insts, inst)
+                                    else if op == "slot_addr"
+                                        addr_regs[dest] = value
+                                        push(new_insts, inst)
+                                    else if op == "call"
+                                        for a in args
+                                            if contains(addr_regs, a)
+                                                slot_invalid[addr_regs[a]] = 1
                                         push(new_insts, inst)
                                     else if op == "slot_load"
-                                        if contains(slot_last, value)
+                                        let invalidated = contains(slot_invalid, value) and slot_invalid[value] == 1
+                                        if contains(slot_last, value) and not invalidated
                                             let fwd = slot_last[value]
                                             push(new_insts, IrInst("copy", dest, typ, [fwd], "", 0, "pure", line))
                                             if contains(const_vals, fwd)
@@ -9395,6 +9448,11 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let slot_key = "slot." + value
                 if contains(e.ire_reg_types, slot_key)
                     e.ire_reg_types[dest] = e.ire_reg_types[slot_key]
+            else if op == "slot_addr"
+                // For 'out<T>' FFI args: take the address of a NOVA variable's
+                // alloca slot, as an i64. The wrapper inttoptr's it to ptr,
+                // C writes through, NOVA reads via subsequent slot_load.
+                ire_indent(e, dest + " = ptrtoint ptr %slot." + value + " to i64")
             else if op == "slot_store"
                 ire_indent(e, "store i64 " + args[0] + ", ptr %slot." + value + ", align 8")
                 if contains(e.ire_reg_types, args[0])
@@ -9916,6 +9974,19 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     push(b.ir_externs, s)
                     push(b.ir_fnames, name)
                     b.ir_fn_arity[name] = len(params)
+                    // Record which params are 'out:T' (encoded by the extern
+                    // parser as type_ann="out:...") so the call site can emit
+                    // slot_addr for them instead of slot_load.
+                    let out_idxs = []
+                    let opi = 0
+                    for ep0 in params
+                        match ep0
+                            Param(epn0, ept0, epd0) =>
+                                if len(ept0) > 4 and ept0[0:4] == "out:"
+                                    push(out_idxs, opi)
+                        opi = opi + 1
+                    if len(out_idxs) > 0
+                        b.ir_extern_out_idx[name] = out_idxs
                     // Decide if we need a marshaling wrapper based on declared
                     // types — including @opaque types, which are "ptr" in C
                     // but "i64" in NOVA's calling convention.

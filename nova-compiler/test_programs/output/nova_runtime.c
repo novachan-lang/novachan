@@ -10958,3 +10958,14 @@ int64_t nova_rt_gpu_vadd_floats(int64_t a_handle, int64_t b_handle) {
     free(ha); free(hb); free(hc);
     return out;
 }
+
+/* ── FFI out<T> test helper ────────────────────────────────────────────────
+   c_test_set42: a NOVA out<int> param lowers to "pass ptr to my variable's
+   slot." This trivial C function writes 42 through that pointer, so the
+   NOVA-side variable becomes 42 after the call. Proves the out-mechanism
+   end-to-end. Returns 0 for "success" so the NOVA caller can assert it. */
+int64_t c_test_set42(int64_t* out) {
+    if (out) *out = 42;
+    return 0;
+}
+
