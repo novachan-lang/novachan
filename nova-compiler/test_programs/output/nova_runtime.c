@@ -3065,6 +3065,30 @@ int64_t nova_rt_env(int64_t name_ptr) {
     return (int64_t)(uintptr_t)copy;
 }
 
+/* ── set_env(name, value) — write to env. Empty value clears the var. ─ */
+int64_t nova_rt_set_env(int64_t name_ptr, int64_t val_ptr) {
+    const char* name = (const char*)(uintptr_t)name_ptr;
+    const char* val  = (const char*)(uintptr_t)val_ptr;
+#ifdef _WIN32
+    /* _putenv wants "NAME=VALUE"; clear via "NAME=" */
+    size_t nl = strlen(name), vl = val ? strlen(val) : 0;
+    char* buf = (char*)malloc(nl + 1 + vl + 1);
+    if (!buf) return -1;
+    memcpy(buf, name, nl);
+    buf[nl] = '=';
+    if (vl) memcpy(buf + nl + 1, val, vl);
+    buf[nl + 1 + vl] = 0;
+    int rc = _putenv(buf);
+    free(buf);
+    return rc == 0 ? 0 : -1;
+#else
+    if (!val || !*val) {
+        return unsetenv(name) == 0 ? 0 : -1;
+    }
+    return setenv(name, val, 1) == 0 ? 0 : -1;
+#endif
+}
+
 /* ── random(min, max) — random integer in [min, max] inclusive ────────────── */
 int64_t nova_rt_random_int(int64_t min, int64_t max) {
     if (max <= min) return min;
@@ -11064,6 +11088,95 @@ int64_t nova_rt_prof_exit(int64_t name_ptr) {
             e->calls++;
         }
     }
+    return 0;
+}
+
+/* ── Coverage (per-line hit counts) ────────────────────────────────────────
+   nova_rt_cov_hit(file_ptr, line) is injected by the compiler at every
+   statement when --cov is passed. Each (file, line) pair gets its own
+   counter; nova_rt_cov_dump() prints a per-file summary at exit:
+       file.nova: hit 23/27 lines (85.2%)
+   followed by the list of unhit lines for easy grep -> test gap.
+   The table is small (max 16384 entries) and indexed by name pointer +
+   line, no hashing. atexit registers the dump on first hit. */
+#define NOVA_COV_MAX 16384
+typedef struct {
+    const char* file;
+    int32_t     line;
+    int32_t     count;
+} NovaCovEntry;
+static NovaCovEntry nova_cov_table[NOVA_COV_MAX];
+static int nova_cov_count = 0;
+static int nova_cov_registered = 0;
+
+static NovaCovEntry* nova_cov_find(const char* file, int32_t line) {
+    for (int i = 0; i < nova_cov_count; ++i) {
+        if (nova_cov_table[i].file == file && nova_cov_table[i].line == line) {
+            return &nova_cov_table[i];
+        }
+    }
+    if (nova_cov_count >= NOVA_COV_MAX) return NULL;
+    NovaCovEntry* e = &nova_cov_table[nova_cov_count++];
+    e->file = file; e->line = line; e->count = 0;
+    return e;
+}
+
+void nova_rt_cov_dump(void) {
+    if (nova_cov_count == 0) return;
+    /* Group by file: emit hit/total/percent + list of unhit lines.
+       In one pass collect distinct files; second pass per file. */
+    const char* files[256]; int files_n = 0;
+    for (int i = 0; i < nova_cov_count; ++i) {
+        const char* f = nova_cov_table[i].file;
+        int seen = 0;
+        for (int j = 0; j < files_n; ++j) if (files[j] == f) { seen = 1; break; }
+        if (!seen && files_n < 256) files[files_n++] = f;
+    }
+    fprintf(stderr, "\n=== NOVA coverage ===\n");
+    for (int fi = 0; fi < files_n; ++fi) {
+        const char* f = files[fi];
+        int total = 0, hit = 0;
+        for (int i = 0; i < nova_cov_count; ++i) {
+            if (nova_cov_table[i].file != f) continue;
+            total++;
+            if (nova_cov_table[i].count > 0) hit++;
+        }
+        double pct = total ? (100.0 * (double)hit / (double)total) : 0.0;
+        fprintf(stderr, "%s: %d/%d lines (%.1f%%)\n", f ? f : "(unknown)", hit, total, pct);
+        /* unhit lines */
+        int first = 1;
+        for (int i = 0; i < nova_cov_count; ++i) {
+            if (nova_cov_table[i].file != f) continue;
+            if (nova_cov_table[i].count == 0) {
+                if (first) { fprintf(stderr, "  uncovered: "); first = 0; }
+                else fprintf(stderr, ", ");
+                fprintf(stderr, "%d", nova_cov_table[i].line);
+            }
+        }
+        if (!first) fprintf(stderr, "\n");
+    }
+}
+
+int64_t nova_rt_cov_hit(int64_t file_ptr, int64_t line) {
+    if (!nova_cov_registered) {
+        atexit(nova_rt_cov_dump);
+        nova_cov_registered = 1;
+    }
+    const char* file = (const char*)(uintptr_t)file_ptr;
+    NovaCovEntry* e = nova_cov_find(file, (int32_t)line);
+    if (e) e->count++;
+    return 0;
+}
+
+int64_t nova_rt_cov_register(int64_t file_ptr, int64_t line) {
+    if (!nova_cov_registered) {
+        atexit(nova_rt_cov_dump);
+        nova_cov_registered = 1;
+    }
+    /* Same as cov_hit but doesn't increment — registers the line as
+       "instrumented" with count 0 so the dump can report hit/total. */
+    const char* file = (const char*)(uintptr_t)file_ptr;
+    nova_cov_find(file, (int32_t)line);
     return 0;
 }
 

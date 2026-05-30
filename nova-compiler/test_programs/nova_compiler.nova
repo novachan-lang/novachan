@@ -2578,6 +2578,10 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_prof_exit"
     else if name == "prof_dump"
         "nova_rt_prof_dump"
+    else if name == "cov_hit"
+        "nova_rt_cov_hit"
+    else if name == "cov_dump"
+        "nova_rt_cov_dump"
     else if name == "write_raw"
         "nova_rt_write_raw"
     else if name == "channel"
@@ -2642,6 +2646,8 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_to_float"
     else if name == "env"
         "nova_rt_env"
+    else if name == "set_env"
+        "nova_rt_set_env"
     else if name == "random_int"
         "nova_rt_random_int"
     else if name == "random_float"
@@ -3527,6 +3533,8 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_prof_enter(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_prof_exit(i64) nounwind")
     emit(cg, "declare void @nova_rt_prof_dump() nounwind")
+    emit(cg, "declare i64 @nova_rt_cov_hit(i64, i64) nounwind")
+    emit(cg, "declare void @nova_rt_cov_dump() nounwind")
     emit(cg, "declare i64 @nova_rt_write_raw(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_abs(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_max(i64, i64) nounwind")
@@ -3550,6 +3558,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_float_to_int(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_int_to_float(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_env(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_set_env(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_random_int(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_random_float() nounwind")
     emit(cg, "declare i64 @nova_rt_json_parse(i64) nounwind")
@@ -6586,8 +6595,11 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["prof_enter"] = NTypeScheme([], nt_fn([nt_string()], nt_int()))
     reg["prof_exit"] = NTypeScheme([], nt_fn([nt_string()], nt_int()))
     reg["prof_dump"] = NTypeScheme([], nt_fn([], nt_unit()))
+    reg["cov_hit"] = NTypeScheme([], nt_fn([nt_string(), nt_int()], nt_int()))
+    reg["cov_dump"] = NTypeScheme([], nt_fn([], nt_unit()))
     reg["write_raw"] = NTypeScheme([], nt_fn([nt_string()], nt_unit()))
     reg["env"] = NTypeScheme([], nt_fn([nt_string()], nt_string()))
+    reg["set_env"] = NTypeScheme([], nt_fn([nt_string(), nt_string()], nt_int()))
     reg["parse_int"] = NTypeScheme([], nt_fn([nt_string()], nt_int()))
     reg["parse_float"] = NTypeScheme([], nt_fn([nt_string()], nt_float()))
     reg["float_bits"] = NTypeScheme([], nt_fn([nt_string()], nt_int()))
@@ -9062,9 +9074,13 @@ type IrEmitter
     ire_loc_entries: list
     ire_fn_sp_id: int
     ire_repr_c_types: dict
+    ire_cov_enabled: int
+    ire_cov_last_line: int
+    ire_cov_file_idx: int
+    ire_cov_lines: dict
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {})
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, 0, 0, -1, {})
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -9114,6 +9130,22 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let line_loc = ire_get_line_loc(e, line)
                 if line_loc != 0
                     e.ire_dbg_loc = line_loc
+            // Coverage instrumentation: when --cov is on, emit a hit call
+            // before any instruction whose source line crosses a new line
+            // boundary. One hit per executed line, regardless of how many
+            // IR insts the statement lowered to.
+            if e.ire_cov_enabled == 1 and line > 0 and line != e.ire_cov_last_line
+                let fn_str_name = ire_intern_string(e, e.ire_filename)
+                let fn_byte_len = len(e.ire_filename) + 1
+                let cov_p_reg = "%cov.p" + str(e.ire_tc)
+                let cov_pi_reg = "%cov.pi" + str(e.ire_tc)
+                let cov_call_reg = "%cov.r" + str(e.ire_tc)
+                e.ire_tc = e.ire_tc + 1
+                ire_indent(e, cov_p_reg + " = getelementptr inbounds [" + str(fn_byte_len) + " x i8], ptr " + fn_str_name + ", i64 0, i64 0")
+                ire_indent(e, cov_pi_reg + " = ptrtoint ptr " + cov_p_reg + " to i64")
+                ire_indent(e, cov_call_reg + " = call i64 @nova_rt_cov_hit(i64 " + cov_pi_reg + ", i64 " + str(line) + ")")
+                e.ire_cov_last_line = line
+                e.ire_cov_lines[str(line)] = 1
             if op == "const_int"
                 ire_indent(e, dest + " = add i64 " + str(num) + ", 0")
             else if op == "const_float"
@@ -9970,6 +10002,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let b = new_ir_builder()
     let resolved_target = resolve_target(target)
     let e = new_ir_emitter(filename, resolved_target)
+    // NOVA_COV=1 environment toggle: when set, the IR emitter injects
+    // nova_rt_cov_hit(file, line) at every new source-line boundary.
+    let cov_env = env("NOVA_COV")
+    if len(cov_env) > 0 and cov_env[0] == "1"
+        e.ire_cov_enabled = 1
 
     // Resolve and compile imported modules
     let import_ir_fns = resolve_and_compile_imports(b, stmts, base_dir)
@@ -10208,6 +10245,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_prof_enter(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_prof_exit(i64) nounwind")
     ire_line(e, "declare void @nova_rt_prof_dump() nounwind")
+    ire_line(e, "declare i64 @nova_rt_cov_hit(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_cov_register(i64, i64) nounwind")
+    ire_line(e, "declare void @nova_rt_cov_dump() nounwind")
     ire_line(e, "declare i64 @nova_rt_write_raw(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_abs(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_max(i64, i64) nounwind readnone")
@@ -10233,6 +10273,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_to_int(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_to_float(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_env(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_set_env(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_random_int(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_random_float() nounwind")
     ire_line(e, "declare i64 @nova_rt_json_parse(i64) nounwind")
@@ -10870,6 +10911,18 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_indent(e, "%argc64 = sext i32 %argc to i64")
     ire_indent(e, "%argv64 = ptrtoint ptr %argv to i64")
     ire_indent(e, "call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
+    // Pre-register all coverage-instrumented lines so the report shows
+    // hit/total properly (lines never executed still appear as uncovered).
+    if e.ire_cov_enabled == 1 and len(keys(e.ire_cov_lines)) > 0
+        let cov_fn_str = ire_intern_string(e, e.ire_filename)
+        let cov_fn_len = len(e.ire_filename) + 1
+        ire_indent(e, "%covr.p = getelementptr inbounds [" + str(cov_fn_len) + " x i8], ptr " + cov_fn_str + ", i64 0, i64 0")
+        ire_indent(e, "%covr.pi = ptrtoint ptr %covr.p to i64")
+        let cri = 0
+        for lk in keys(e.ire_cov_lines)
+            let cr_reg = "%covr.r" + str(cri)
+            ire_indent(e, cr_reg + " = call i64 @nova_rt_cov_register(i64 %covr.pi, i64 " + lk + ")")
+            cri = cri + 1
     ire_indent(e, "call i64 @nova_main()")
     ire_indent(e, "call void @nova_rt_wait_all()")
     ire_indent(e, "call void @nova_rt_cleanup()")
@@ -11675,6 +11728,7 @@ fn compiler_main()
         print("  repl                  Start interactive shell (compiles + runs repl.nova)")
         print("  debug <file.nova>     Build with debug info and launch lldb")
         print("  bench <file.nova>     Build then time N runs (min/mean/max)")
+        print("  cov <file.nova>       Build with coverage and run; per-line report on exit")
         print("")
         print("Single-file commands:")
         print("  compile <file.nova>   Compile to LLVM IR only")
@@ -11739,6 +11793,34 @@ fn compiler_main()
         if errs > 0
             exit(1)
         exit(0)
+    if cmd == "cov" or cmd == "coverage"
+        // Build with coverage and run. We re-invoke ourselves through cmd.exe
+        // with NOVA_COV=1 set in the env so compile_ir_core_named will
+        // toggle ire_cov_enabled. This works even before set_env existed in
+        // the stdlib (avoids bootstrap chicken-and-egg).
+        if len(arguments) < 3
+            print("Usage: nova cov <file.nova>")
+            exit(1)
+        let cov_in = arguments[2]
+        let cov_ll = nova_replace_ext(cov_in, ".nova", ".ll")
+        let cov_exe = nova_replace_ext(cov_in, ".nova", ".exe")
+        let self_exe = arguments[0]
+        let cov_compile = "cmd /c \"set NOVA_COV=1 && \"" + self_exe + "\" compile -o \"" + cov_ll + "\" \"" + cov_in + "\"\""
+        let crc = system(cov_compile)
+        if crc != 0
+            print("error: coverage compile failed (exit " + str(crc) + ")")
+            exit(1)
+        let cret = nova_link(cov_ll, cov_exe, "-O0", "")
+        if cret != 0
+            print("error: coverage link failed")
+            exit(1)
+        let cnorm = replace(cov_exe, "/", "\\")
+        let cprefix = ".\\"
+        if starts_with(cnorm, "\\") or starts_with(cnorm, ".\\")
+            cprefix = ""
+        if len(cnorm) >= 2 and slice(cnorm, 1, 2) == ":"
+            cprefix = ""
+        exit(system(chr(34) + cprefix + cnorm + chr(34)))
     if cmd == "bench"
         // Build once -O2, then run N times and report wall-time stats.
         // Useful for verifying NOVA's perf claims on real workloads without
