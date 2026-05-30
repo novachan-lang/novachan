@@ -65,6 +65,10 @@ These were originally "unsolved" problems. The unified model resolves them in pr
 - The developer experience bar is: simpler than Python, safer than Rust
 - NOVA beats every listed language through unified design, not feature accumulation
 
+## Framework Ecosystem Strategy
+
+- [FRAMEWORK_ECOSYSTEM_STRATEGY.md](FRAMEWORK_ECOSYSTEM_STRATEGY.md) — Complete strategic architecture for 9 frameworks (Forge, Reactor, Cortex, Mesh, Prism, Pulse, Sentinel, Edge, Ops), Nova Vault package registry, cloud platform monetization, competitive positioning, 10-year horizon, and adoption strategy.
+
 ## Master Execution Plan
 
 See [MASTER_EXECUTION_PLAN.md](MASTER_EXECUTION_PLAN.md) for the complete build plan.
