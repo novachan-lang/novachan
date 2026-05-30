@@ -10969,6 +10969,104 @@ int64_t c_test_set42(int64_t* out) {
     return 0;
 }
 
+/* ── Profiler (per-function call count + cumulative time) ─────────────────
+   nova_rt_prof_enter("fn_name") at function entry records a hi-res
+   timestamp; nova_rt_prof_exit("fn_name") accumulates (now - entry) into
+   that function's bucket and increments the call count. On program exit,
+   atexit-registered nova_rt_prof_dump() prints sorted by total time.
+   The compiler injects these calls when --profile is passed. Names live
+   for the duration of the binary (string literals in .rodata), so we can
+   key by pointer + use a tiny linear-probe table without allocation.
+   Up to 1024 distinct functions; that covers any realistic NOVA program. */
+#define NOVA_PROF_MAX 1024
+typedef struct {
+    const char* name;
+    int64_t     calls;
+    int64_t     total_ns;
+    int64_t     enter_ns;
+    int32_t     depth;
+} NovaProfEntry;
+static NovaProfEntry nova_prof_table[NOVA_PROF_MAX];
+static int nova_prof_count = 0;
+static int nova_prof_registered = 0;
+
+static int64_t nova_prof_now_ns(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (int64_t)((double)t.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+#endif
+}
+
+static NovaProfEntry* nova_prof_find(const char* name) {
+    for (int i = 0; i < nova_prof_count; ++i) {
+        if (nova_prof_table[i].name == name) return &nova_prof_table[i];
+    }
+    if (nova_prof_count >= NOVA_PROF_MAX) return NULL;
+    NovaProfEntry* e = &nova_prof_table[nova_prof_count++];
+    e->name = name; e->calls = 0; e->total_ns = 0; e->enter_ns = 0; e->depth = 0;
+    return e;
+}
+
+void nova_rt_prof_dump(void) {
+    int n = nova_prof_count;
+    if (n == 0) return;
+    int idx[NOVA_PROF_MAX];
+    for (int i = 0; i < n; ++i) idx[i] = i;
+    for (int i = 1; i < n; ++i) {
+        int k = idx[i];
+        int64_t kv = nova_prof_table[k].total_ns;
+        int j = i - 1;
+        while (j >= 0 && nova_prof_table[idx[j]].total_ns < kv) {
+            idx[j+1] = idx[j]; --j;
+        }
+        idx[j+1] = k;
+    }
+    fprintf(stderr, "\n=== NOVA profile (sorted by total time) ===\n");
+    fprintf(stderr, "%-40s %12s %14s %14s\n", "function", "calls", "total_ms", "per_call_us");
+    for (int i = 0; i < n; ++i) {
+        NovaProfEntry* e = &nova_prof_table[idx[i]];
+        double total_ms = (double)e->total_ns / 1.0e6;
+        double per_us = e->calls ? ((double)e->total_ns / 1.0e3 / (double)e->calls) : 0.0;
+        fprintf(stderr, "%-40s %12lld %14.3f %14.3f\n",
+                e->name ? e->name : "(null)",
+                (long long)e->calls, total_ms, per_us);
+    }
+}
+
+int64_t nova_rt_prof_enter(int64_t name_ptr) {
+    if (!nova_prof_registered) {
+        atexit(nova_rt_prof_dump);
+        nova_prof_registered = 1;
+    }
+    const char* name = (const char*)(uintptr_t)name_ptr;
+    NovaProfEntry* e = nova_prof_find(name);
+    if (!e) return 0;
+    if (e->depth == 0) e->enter_ns = nova_prof_now_ns();
+    e->depth++;
+    return 0;
+}
+
+int64_t nova_rt_prof_exit(int64_t name_ptr) {
+    const char* name = (const char*)(uintptr_t)name_ptr;
+    NovaProfEntry* e = nova_prof_find(name);
+    if (!e) return 0;
+    if (e->depth > 0) {
+        e->depth--;
+        if (e->depth == 0) {
+            int64_t now = nova_prof_now_ns();
+            e->total_ns += (now - e->enter_ns);
+            e->calls++;
+        }
+    }
+    return 0;
+}
+
 /* ── FFI @repr(C) struct test helper ───────────────────────────────────────
    NOVA struct handles ARE pointers to the heap-allocated data block (the
    8-byte RC+tag header sits at handle[-1]; the data starts at handle[0]).
