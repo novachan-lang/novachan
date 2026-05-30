@@ -35,7 +35,7 @@ $core_tests = @(
     'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_opaque_test','ffi_out_test','ffi_repr_c_test',
     'prof_test','demo_sqlite_test','demo_http_server_test','demo_forge_test','demo_forge_v2_test',
     'demo_forge_todo_test','demo_cortex_serve_test','demo_pulse_test','demo_mesh_test','demo_sentinel_test',
-    'demo_ops_test','demo_reactor_test','demo_prism_test','demo_edge_test'
+    'demo_ops_test','demo_reactor_test','demo_prism_test','demo_edge_test','demo_full_stack_test'
 )
 
 # Phase 12-14 new tests
