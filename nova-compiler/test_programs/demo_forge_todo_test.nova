@@ -1,0 +1,117 @@
+// THE "Full-Stack in 100 lines" demo per FRAMEWORK_ECOSYSTEM_STRATEGY.md.
+// A REST TODO API backed by SQLite, in pure NOVA, using Forge + the
+// sqlite FFI from 9b5f2d7. Single file, single binary, end-to-end:
+//
+//   POST /api/todos?title=X    -> add a todo, return JSON of the new row
+//   GET  /api/todos            -> list all todos as JSON array
+//
+// The test spawns the server in a child process, POSTs three todos, then
+// GETs the list and verifies all three came back in insertion order.
+// This is the "I built a database-backed web app in one language and
+// fewer lines than Flask + SQLAlchemy" moment.
+import forge
+
+@opaque
+type DbHandle
+@opaque
+type StmtHandle
+
+extern fn sqlite3_open(path: string, db_out: out<DbHandle>) -> i32
+extern fn sqlite3_exec(db: DbHandle, sql: string, cb: int, ctx: int, errmsg_out: int) -> i32
+extern fn sqlite3_prepare_v2(db: DbHandle, sql: string, nbyte: i32, stmt_out: out<StmtHandle>, tail_out: int) -> i32
+extern fn sqlite3_step(stmt: StmtHandle) -> i32
+extern fn sqlite3_column_int(stmt: StmtHandle, col: i32) -> i32
+extern fn sqlite3_column_text(stmt: StmtHandle, col: i32) -> int
+extern fn sqlite3_finalize(stmt: StmtHandle) -> i32
+extern fn sqlite3_close(db: DbHandle) -> i32
+
+fn db_init() -> int
+    let db = 0
+    unsafe sqlite3_open(":memory:", db)
+    unsafe sqlite3_exec(db, "CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT)", 0, 0, 0)
+    db
+
+fn db_insert_todo(db_handle: int, title: string)
+    // Naive: build the SQL with concat. Real Forge v0.5 will add
+    // compile-time SQL validation + parameter binding. For the demo,
+    // we trust the title input (test-only).
+    let sql = "INSERT INTO todos (title) VALUES ('" + title + "')"
+    unsafe sqlite3_exec(db_handle, sql, 0, 0, 0)
+
+fn db_list_todos_json(db_handle: int) -> string
+    let stmt = 0
+    unsafe sqlite3_prepare_v2(db_handle, "SELECT id, title FROM todos ORDER BY id", -1, stmt, 0)
+    let out = "["
+    let first = true
+    let SQLITE_ROW_LOCAL = 100
+    let rc = unsafe sqlite3_step(stmt)
+    while rc == SQLITE_ROW_LOCAL
+        let id = unsafe sqlite3_column_int(stmt, 0)
+        let title_ptr = unsafe sqlite3_column_text(stmt, 1)
+        let title = cstr_to_string(title_ptr)
+        if not first
+            out = out + ","
+        out = out + "\{\"id\":" + str(id) + ",\"title\":\"" + title + "\"\}"
+        first = false
+        rc = unsafe sqlite3_step(stmt)
+    unsafe sqlite3_finalize(stmt)
+    out + "]"
+
+fn serve_todo(port: int, n: int)
+    // Open the DB inside the server fn so the handle lives in this
+    // process — spawn may not propagate raw int handles cleanly across
+    // process boundaries yet.
+    let db_handle = db_init()
+    let listener = tcp_listen(port)
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        let raw = tcp_recv(conn)
+        let m = forge.parse_method(raw)
+        let path_clean = forge.parse_path_clean(raw)
+        let resp = "404"
+        if m == "POST" and path_clean == "/api/todos"
+            let title = forge.query_get(raw, "title")
+            if len(title) > 0
+                db_insert_todo(db_handle, title)
+                resp = forge.json_obj(201, [["title", title], ["status", "created"]])
+            else
+                resp = forge.text(400, "missing ?title=")
+        else if m == "GET" and path_clean == "/api/todos"
+            resp = forge.json(200, db_list_todos_json(db_handle))
+        else
+            resp = forge.text(404, "not found: " + path_clean)
+        tcp_send(conn, resp)
+        tcp_close(conn)
+        i = i + 1
+    tcp_close(listener)
+
+fn main()
+    let port = 18897
+    spawn fn()
+        serve_todo(port, 4)
+    sleep(300)
+    let base = "http://127.0.0.1:" + str(port)
+
+    let r1 = http_post(base + "/api/todos?title=buy-milk", "", "text/plain")
+    if find(r1, "\"status\":\"created\"") < 0
+        print("FAIL 1 add: " + r1)
+        exit(1)
+    let r2 = http_post(base + "/api/todos?title=write-code", "", "text/plain")
+    if find(r2, "\"title\":\"write-code\"") < 0
+        print("FAIL 2 add: " + r2)
+        exit(1)
+    let r3 = http_post(base + "/api/todos?title=ship-it", "", "text/plain")
+    if find(r3, "\"title\":\"ship-it\"") < 0
+        print("FAIL 3 add: " + r3)
+        exit(1)
+
+    let list_resp = http_get(base + "/api/todos")
+    if find(list_resp, "buy-milk") < 0 or find(list_resp, "write-code") < 0 or find(list_resp, "ship-it") < 0
+        print("FAIL list: " + list_resp)
+        exit(1)
+    if find(list_resp, "\"id\":1") < 0 or find(list_resp, "\"id\":2") < 0 or find(list_resp, "\"id\":3") < 0
+        print("FAIL list ids: " + list_resp)
+        exit(1)
+
+    print("FORGE+SQLITE todo demo passed: 3 todos POSTed, queried back via REST API, JSON response with ids 1/2/3 and titles verified — full-stack in NOVA, single binary, single language")

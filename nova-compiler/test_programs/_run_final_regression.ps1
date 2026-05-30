@@ -33,7 +33,8 @@ $core_tests = @(
     'read_bytes_test','float_list_ops_test','udp_test','supervisor_test',
     'audio_synth_test','render_test','gpu_vadd_test','unsafe_test',
     'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_opaque_test','ffi_out_test','ffi_repr_c_test',
-    'prof_test','demo_sqlite_test','demo_http_server_test','demo_forge_test'
+    'prof_test','demo_sqlite_test','demo_http_server_test','demo_forge_test','demo_forge_v2_test',
+    'demo_forge_todo_test'
 )
 
 # Phase 12-14 new tests

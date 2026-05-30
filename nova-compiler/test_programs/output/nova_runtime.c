@@ -4736,13 +4736,38 @@ int64_t nova_rt_tcp_send(int64_t sock_val, int64_t data_ptr) {
 
 int64_t nova_rt_tcp_recv(int64_t sock_val) {
     NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
-    char buf[4096];
-    int n = recv(sock, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) return (int64_t)(uintptr_t)"";
-    buf[n] = 0;
-    char* result = (char*)nova_heap_alloc(n + 1, NOVA_MEM_RAW);
-    if (!result) return (int64_t)(uintptr_t)"";
-    memcpy(result, buf, n + 1);
+    /* Drain loop: HTTP requests often come in 2+ packets (headers, then
+       body). After each recv, poll with a short select timeout; append
+       until the socket is idle for 30ms, the connection closes, or the
+       buffer hits its cap. Makes Forge request parsing robust without
+       requiring the framework author to handle partial reads. */
+    size_t cap = 8192;
+    size_t used = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return (int64_t)(uintptr_t)"";
+    for (;;) {
+        if (used + 4096 + 1 > cap) {
+            size_t nc = cap * 2;
+            char* nb = (char*)realloc(buf, nc);
+            if (!nb) break;
+            buf = nb;
+            cap = nc;
+        }
+        int n = recv(sock, buf + used, (int)(cap - used - 1), 0);
+        if (n <= 0) break;
+        used += (size_t)n;
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(sock, &rfds);
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 30000;
+        int r = select((int)sock + 1, &rfds, NULL, NULL, &tv);
+        if (r <= 0) break;
+        if (!FD_ISSET(sock, &rfds)) break;
+    }
+    if (used == 0) { free(buf); return (int64_t)(uintptr_t)""; }
+    buf[used] = 0;
+    char* result = (char*)nova_heap_alloc(used + 1, NOVA_MEM_RAW);
+    if (!result) { free(buf); return (int64_t)(uintptr_t)""; }
+    memcpy(result, buf, used + 1);
+    free(buf);
     return (int64_t)(uintptr_t)result;
 }
 
