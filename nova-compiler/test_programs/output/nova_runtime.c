@@ -750,6 +750,22 @@ int64_t nova_rt_list_free_local(int64_t handle) {
     return 0;
 }
 
+/* Track 8 Week 5: deterministic drop of a proven-local dict. Frees the
+   backing arrays + the dict struct, no RC bookkeeping on keys/values. */
+int64_t nova_rt_dict_free_local(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    if (d->keys)   { free(d->keys);   d->keys = NULL; }
+    if (d->vals)   { free(d->vals);   d->vals = NULL; }
+    if (d->hashes) { free(d->hashes); d->hashes = NULL; }
+    if (d->idx)    { free(d->idx);    d->idx = NULL; }
+    d->size = 0;
+    d->cap = 0;
+    d->idx_cap = 0;
+    nova_rc_dec(handle);
+    return 0;
+}
+
 /* Track 8 Week 3: append to a list known by the compiler to be
    process-local (proven by escape analysis to never cross a channel,
    spawn, or function return). Skips nova_rc_inc on the element. The
