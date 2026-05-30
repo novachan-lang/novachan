@@ -732,6 +732,24 @@ int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
     return 0;
 }
 
+/* Track 8 Week 5 foundation: deterministic drop of a proven-local list.
+   Frees the backing data array + the list struct itself, immediately,
+   without RC bookkeeping on elements (caller guarantees they're either
+   primitives or not strongly held elsewhere). Manually callable from
+   NOVA source as 'list_free_local(handle)'; future W5+ work will auto-
+   insert this at scope end for local lists. */
+int64_t nova_rt_list_free_local(int64_t handle) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (!list) return 0;
+    if (list->data) { free(list->data); list->data = NULL; }
+    list->size = 0;
+    list->cap = 0;
+    /* The list struct itself was nova_heap_alloc'd; mark it freeable
+       via the standard RC dec (drops to zero, runtime frees it). */
+    nova_rc_dec(handle);
+    return 0;
+}
+
 /* Track 8 Week 3: append to a list known by the compiler to be
    process-local (proven by escape analysis to never cross a channel,
    spawn, or function return). Skips nova_rc_inc on the element. The
