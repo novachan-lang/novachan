@@ -32,7 +32,7 @@ $core_tests = @(
     'tensor_churn_test','tensor_boxed_float_test','ai_classify_test','json_decode_float_test',
     'read_bytes_test','float_list_ops_test','udp_test','supervisor_test',
     'audio_synth_test','render_test','gpu_vadd_test','unsafe_test',
-    'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test'
+    'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test'
 )
 
 # Phase 12-14 new tests
@@ -72,8 +72,21 @@ foreach ($t in $all_tests) {
         $fail++; continue
     }
 
+    # Pick up @link("libname") -> '; LINK_LIB: name' comments emitted by the
+    # compiler and propagate them to clang as -l<name> flags. On Windows,
+    # libm is part of MSVCRT (no m.lib), so skip 'm' there to avoid linker
+    # errors — the annotation remains correct documentation + works on Linux.
+    $extraLibs = ""
+    $isWin = $IsWindows -or ($env:OS -eq 'Windows_NT')
+    $skipLibs = @()
+    if ($isWin) { $skipLibs = @('m','pthread','dl','rt') }
+    Get-Content $ll | Where-Object { $_ -match '^; LINK_LIB: (\S+)' } | ForEach-Object {
+        $libName = $matches[1]
+        if ($skipLibs -notcontains $libName) { $extraLibs += " -l$libName" }
+    }
+
     # Link
-    $linkArgs = "-O2 -o `"$exe`" `"$ll`" `"$runtimeSrc`" $NovaLinkFlags -D_CRT_SECURE_NO_WARNINGS -w"
+    $linkArgs = "-O2 -o `"$exe`" `"$ll`" `"$runtimeSrc`" $NovaLinkFlags$extraLibs -D_CRT_SECURE_NO_WARNINGS -w"
     $lr = Invoke-Timed -FilePath $ClangPath -Arguments $linkArgs -TimeoutMs 60000 -WorkingDirectory $PSScriptRoot
     if (!(Test-Path $exe)) {
         Write-Host "FAIL link: $t"
