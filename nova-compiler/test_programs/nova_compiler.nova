@@ -8502,6 +8502,27 @@ fn ir_escape_analysis(func: IrFunction) -> list
             // element is the local-dest set for codegen consumption.
             [n_allocs, n_escape, local_set]
 
+// Track 8 W7 helper: returns 1 if any function in the program calls
+// spawn (directly via "spawn" or "nova_rt_spawn"). Used by the auto-arena
+// pass: if no spawn anywhere, the program is single-process and can run
+// in arena mode (no RC traffic, freed at process exit). Conservative —
+// indirect spawns via FFI are not detected, so this is opt-in via env.
+fn ir_program_has_spawn(all_fns: list) -> int
+    for f in all_fns
+        match f
+            IrFunction(_, _, _, blocks, _, fextern) =>
+                if fextern == 0
+                    for block in blocks
+                        match block
+                            IrBlock(_, insts, _) =>
+                                for inst in insts
+                                    match inst
+                                        IrInst(op, _, _, _, value, _, _, _) =>
+                                            if op == "call"
+                                                if value == "nova_rt_spawn" or value == "spawn"
+                                                    return 1
+    0
+
 fn ir_const_fold(func: IrFunction) -> IrFunction
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
@@ -11245,12 +11266,27 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
         ire_line(e, "}")
         ire_line(e, "")
 
+    // Track 8 W7: auto-arena. When NOVA_AUTO_ARENA=1 is set AND the program
+    // never calls spawn (direct or via runtime), enable arena mode at the very
+    // start of main. This eliminates all RC traffic globally — memory frees on
+    // process exit via OS teardown. Safe for short-lived programs; long-running
+    // single-process programs would leak, so this stays opt-in.
+    let auto_arena_env = env("NOVA_AUTO_ARENA")
+    let want_auto_arena = len(auto_arena_env) > 0 and auto_arena_env[0] == "1"
+    let do_auto_arena = 0
+    if want_auto_arena
+        if ir_program_has_spawn(all_fns) == 0
+            do_auto_arena = 1
+
     // Emit main entry point
     ire_line(e, "define i32 @main(i32 %argc, ptr %argv) nounwind \{")
     ire_line(e, "entry:")
     ire_indent(e, "%argc64 = sext i32 %argc to i64")
     ire_indent(e, "%argv64 = ptrtoint ptr %argv to i64")
     ire_indent(e, "call void @nova_rt_init_args(i64 %argc64, i64 %argv64)")
+    if do_auto_arena == 1
+        ire_line(e, "  ; AUTO-ARENA: no spawn detected, RC overhead globally eliminated")
+        ire_indent(e, "call void @nova_rt_set_arena_mode(i64 1)")
     // Pre-register all coverage-instrumented lines so the report shows
     // hit/total properly (lines never executed still appear as uncovered).
     if e.ire_cov_enabled == 1 and len(keys(e.ire_cov_lines)) > 0
