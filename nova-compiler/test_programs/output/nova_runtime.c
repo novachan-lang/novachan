@@ -3065,6 +3065,27 @@ int64_t nova_rt_env(int64_t name_ptr) {
     return (int64_t)(uintptr_t)copy;
 }
 
+/* ── Track 8 measurement: RC operation counters ────────────────────────────
+   The runtime tracks how many nova_rc_inc and nova_rc_dec calls occur
+   over the lifetime of the program. nova_rt_rc_stats_dump() prints the
+   totals — combined with the compiler's "ESCAPE SUMMARY: X% local" line
+   this is enough to answer "how much would real RC elision save on this
+   program?" without needing the actual elision-emit step done yet.
+   The counters are NOT atomic; they're accurate enough on a single-
+   threaded run and "approximately right" otherwise. Cheap. */
+static int64_t nova_rc_inc_count = 0;
+static int64_t nova_rc_dec_count = 0;
+
+int64_t nova_rt_rc_stats_inc(void) { return ++nova_rc_inc_count; }
+int64_t nova_rt_rc_stats_dec(void) { return ++nova_rc_dec_count; }
+
+void nova_rt_rc_stats_dump(void) {
+    fprintf(stderr, "\n=== NOVA RC stats ===\n");
+    fprintf(stderr, "  rc_inc calls: %lld\n", (long long)nova_rc_inc_count);
+    fprintf(stderr, "  rc_dec calls: %lld\n", (long long)nova_rc_dec_count);
+    fprintf(stderr, "  total RC ops: %lld\n", (long long)(nova_rc_inc_count + nova_rc_dec_count));
+}
+
 /* ── cstr_to_string(ptr) — convert C string pointer to NOVA string ────────
    FFI helper: extern fns that return const char* (sqlite3_column_text,
    strerror, etc.) hand back a raw pointer; this wraps it in a NOVA fat
@@ -3751,6 +3772,7 @@ void nova_rc_inc(int64_t val) {
     int kind = nova_rc_is_managed(ptr);
     if (kind == 0) return;
     if (kind == -1) { nova_strpool_rc_inc(ptr); return; }
+    nova_rc_inc_count++;
     if (nova_is_multithreaded) {
 #ifdef _WIN32
         InterlockedIncrement((volatile LONG*)&NOVA_RC_COUNT(ptr));
@@ -3785,6 +3807,12 @@ static void nova_rc_dec_internal(int64_t val) {
 }
 
 void nova_rc_dec(int64_t val) {
+    if (val && (uint64_t)val >= 0x10000ULL) {
+        void* ptr = (void*)(uintptr_t)val;
+        if (nova_rc_is_managed(ptr) > 0) {
+            nova_rc_dec_count++;
+        }
+    }
     nova_rc_dec_internal(val);
 }
 
