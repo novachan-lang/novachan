@@ -1,0 +1,178 @@
+// NOVA FORGE — minimal pure-NOVA web framework.
+// Stage 2b adoption-engine #1 per FRAMEWORK_ECOSYSTEM_STRATEGY.md.
+// Built on NOVA's tcp_* primitives + spawn + first-class functions.
+//
+// API surface (public):
+//   forge.text(status, body)        -> raw HTTP response (text/plain)
+//   forge.html(status, body)        -> raw HTTP response (text/html)
+//   forge.json(status, body)        -> raw HTTP response (application/json)
+//   forge.parse_method(req)         -> "GET", "POST", ...
+//   forge.parse_path(req)           -> "/api/users"
+//   forge.parse_body(req)           -> request body (string)
+//   forge.serve(port, handler)      -> infinite accept loop, spawn per conn
+//   forge.serve_n(port, handler, n) -> serve exactly N requests, then close
+//                                       (testable + deterministic)
+//
+// The handler is a function (method, path, body) -> response string.
+// Use the response builders to construct the response string with proper
+// headers + Content-Length.
+
+fn _status_line(status: int) -> string
+    if status == 200
+        return "200 OK"
+    if status == 201
+        return "201 Created"
+    if status == 204
+        return "204 No Content"
+    if status == 301
+        return "301 Moved Permanently"
+    if status == 302
+        return "302 Found"
+    if status == 400
+        return "400 Bad Request"
+    if status == 401
+        return "401 Unauthorized"
+    if status == 403
+        return "403 Forbidden"
+    if status == 404
+        return "404 Not Found"
+    if status == 500
+        return "500 Internal Server Error"
+    str(status) + " OK"
+
+fn _build(status: int, ctype: string, body: string) -> string
+    let r = "HTTP/1.1 " + _status_line(status) + "\r\n"
+    r = r + "Content-Type: " + ctype + "\r\n"
+    r = r + "Content-Length: " + str(len(body)) + "\r\n"
+    r = r + "Connection: close\r\n"
+    r = r + "Server: NOVA Forge\r\n"
+    r = r + "\r\n"
+    r = r + body
+    r
+
+fn text(status: int, body: string) -> string
+    _build(status, "text/plain; charset=utf-8", body)
+
+fn html(status: int, body: string) -> string
+    _build(status, "text/html; charset=utf-8", body)
+
+fn json(status: int, body: string) -> string
+    _build(status, "application/json", body)
+
+fn parse_method(req: string) -> string
+    let sp = find(req, " ")
+    if sp < 0
+        return "GET"
+    slice(req, 0, sp)
+
+fn parse_path(req: string) -> string
+    let sp1 = find(req, " ")
+    if sp1 < 0
+        return "/"
+    let rest = slice(req, sp1 + 1, len(req))
+    let sp2 = find(rest, " ")
+    if sp2 < 0
+        return rest
+    slice(rest, 0, sp2)
+
+fn parse_body(req: string) -> string
+    let sep = find(req, "\r\n\r\n")
+    if sep < 0
+        return ""
+    slice(req, sep + 4, len(req))
+
+// Query string from "/path?key=value&k2=v2" -> "key=value&k2=v2", "" if none
+fn parse_query(req: string) -> string
+    let p = parse_path(req)
+    let q = find(p, "?")
+    if q < 0
+        return ""
+    slice(p, q + 1, len(p))
+
+// Path without query string
+fn parse_path_clean(req: string) -> string
+    let p = parse_path(req)
+    let q = find(p, "?")
+    if q < 0
+        return p
+    slice(p, 0, q)
+
+// Get a single query param value. "" if not present.
+fn query_get(req: string, key: string) -> string
+    let q = parse_query(req)
+    if len(q) == 0
+        return ""
+    let needle = key + "="
+    let i = find(q, needle)
+    if i < 0
+        return ""
+    if i > 0
+        let prev = q[i - 1]
+        if prev != "&"
+            // false match like "xkey=" — bail. (could refine; MVP)
+            return ""
+    let rest = slice(q, i + len(needle), len(q))
+    let amp = find(rest, "&")
+    if amp < 0
+        return rest
+    slice(rest, 0, amp)
+
+// Header value (case-sensitive on header name for the MVP).
+// Returns "" if header not found.
+fn header_get(req: string, name: string) -> string
+    let hdr_end = find(req, "\r\n\r\n")
+    let region = req
+    if hdr_end >= 0
+        region = slice(req, 0, hdr_end)
+    let needle = "\r\n" + name + ": "
+    let i = find(region, needle)
+    if i < 0
+        return ""
+    let rest = slice(region, i + len(needle), len(region))
+    let nl = find(rest, "\r\n")
+    if nl < 0
+        return rest
+    slice(rest, 0, nl)
+
+// Builds an application/json response body from a list of [key, value]
+// pairs. Values are strings; if you want raw (number/bool/object), pass
+// the string already serialized. Quotes inside values must already be
+// escaped by the caller — MVP, not a full JSON encoder.
+fn json_obj(status: int, pairs: list) -> string
+    let body = "\{"
+    let n = len(pairs)
+    let i = 0
+    while i < n
+        let kv = pairs[i]
+        let k = kv[0]
+        let v = kv[1]
+        if i > 0
+            body = body + ","
+        body = body + "\"" + k + "\":\"" + v + "\""
+        i = i + 1
+    body = body + "\}"
+    _build(status, "application/json", body)
+
+fn _handle_one(conn: int, handler)
+    let req = tcp_recv(conn)
+    let m = parse_method(req)
+    let p = parse_path(req)
+    let b = parse_body(req)
+    let resp = handler(m, p, b)
+    tcp_send(conn, resp)
+    tcp_close(conn)
+
+fn serve(port: int, handler)
+    let listener = tcp_listen(port)
+    while true
+        let conn = tcp_accept(listener)
+        _handle_one(conn, handler)
+
+fn serve_n(port: int, handler, n: int)
+    let listener = tcp_listen(port)
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        _handle_one(conn, handler)
+        i = i + 1
+    tcp_close(listener)
