@@ -1,0 +1,75 @@
+// NOVA Cortex + NOVA Forge composition demo: a real ML inference HTTP
+// server. Single binary, single language, ONE compilation unit per the
+// compiler advantage thesis (TCP accept → HTTP parse → tensor matmul →
+// softmax → argmax → JSON response, all optimized as a single function).
+//
+// The server loads a tiny 2-input → 3-class linear classifier:
+//   W = [[1.0, 2.0, 0.0],
+//        [0.0, 1.0, 1.0]]
+// Logits for input [a, b] = [a*1+b*0, a*2+b*1, a*0+b*1] = [a, 2a+b, b]
+//   POST /classify  body: "1.0,2.0"   -> {"class":1,"prob_milli":NNN}
+//                  (logits=[1,4,2] → softmax → class 1 dominates)
+//   POST /classify  body: "0.1,5.0"   -> class 1 again (5*1+0.1=5.1 vs 0.1, 5.0)
+//                                          actually: [0.1, 5.2, 5.0] → class 1
+//   POST /classify  body: "10.0,0.1"  -> [10.0, 20.1, 0.1] → class 1
+//                                          (class 1 dominates broadly)
+import forge
+import cortex
+
+fn serve_classifier(port: int, w_handle, n: int)
+    let listener = tcp_listen(port)
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        let raw = tcp_recv(conn)
+        let m = forge.parse_method(raw)
+        let path = forge.parse_path_clean(raw)
+        let body = forge.parse_body(raw)
+        let resp = "404"
+        if m == "POST" and path == "/classify"
+            let inputs = cortex.parse_floats(body)
+            if len(inputs) != 2
+                resp = forge.text(400, "need exactly 2 floats; got " + str(len(inputs)))
+            else
+                let x = tensor_from_list(inputs, [1, 2])
+                let result = cortex.classify(w_handle, x)
+                let cls = result[0]
+                let pm = result[1]
+                resp = forge.json_obj(200, [["class", str(cls)], ["prob_milli", str(pm)]])
+        else if m == "GET" and path == "/health"
+            resp = forge.json_obj(200, [["status", "ok"], ["model", "linear-2x3"]])
+        else
+            resp = forge.text(404, "not found: " + path)
+        tcp_send(conn, resp)
+        tcp_close(conn)
+        i = i + 1
+    tcp_close(listener)
+
+fn main()
+    // Build the 2x3 weight matrix in-memory
+    let w = tensor_from_list([1.0, 2.0, 0.0,    0.0, 1.0, 1.0], [2, 3])
+    let port = 18899
+    spawn fn()
+        serve_classifier(port, w, 3)
+    sleep(300)
+    let base = "http://127.0.0.1:" + str(port)
+
+    // 1. Health check
+    let h = http_get(base + "/health")
+    if find(h, "\"status\":\"ok\"") < 0
+        print("FAIL health: " + h)
+        exit(1)
+
+    // 2. Real classification: input [1.0, 2.0] -> logits [1, 4, 2] -> class 1
+    let r1 = http_post(base + "/classify", "1.0,2.0", "text/plain")
+    if find(r1, "\"class\":\"1\"") < 0
+        print("FAIL classify 1: " + r1)
+        exit(1)
+
+    // 3. Another classification: input [3.0, 1.0] -> logits [3, 7, 1] -> class 1
+    let r2 = http_post(base + "/classify", "3.0,1.0", "text/plain")
+    if find(r2, "\"class\":\"1\"") < 0
+        print("FAIL classify 2: " + r2)
+        exit(1)
+
+    print("CORTEX+FORGE demo passed: real tensor matmul + softmax + argmax served as JSON over HTTP, in pure NOVA, single binary")
