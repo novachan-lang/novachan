@@ -9287,9 +9287,10 @@ type IrEmitter
     ire_cov_lines: dict
     ire_local_lists: dict
     ire_local_slots: dict
+    ire_load_origin: dict
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, 0, 0, -1, {}, {}, {})
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, 0, 0, -1, {}, {}, {}, {})
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -9711,6 +9712,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 // Track 8: propagate local-list status from slot to load result.
                 if contains(e.ire_local_slots, value)
                     e.ire_local_lists[dest] = 1
+                // Track 8 W5b: remember which slot this register came from so
+                // the return-time auto-drop pass can skip freeing the slot
+                // whose value is being returned.
+                e.ire_load_origin[dest] = value
             else if op == "slot_addr"
                 // For 'out<T>' FFI args: take the address of a NOVA variable's
                 // alloca slot, as an i64. The wrapper inttoptr's it to ptr,
@@ -10077,6 +10082,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
     e.ire_reg_types = {}
     e.ire_tc = 0
     e.ire_local_slots = {}
+    e.ire_load_origin = {}
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             if is_extern == 1
@@ -10151,6 +10157,35 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                 ire_indent(e, "store i64 0, ptr %slot." + slot_name + ", align 8")
                         for inst in insts
                             ire_emit_inst(e, inst)
+                        // Track 8 W5b: before any return terminator, auto-
+                        // insert list_free_local / dict_free_local calls for
+                        // each per-fn local slot. SKIP the slot whose value
+                        // is the return value (otherwise we'd free the data
+                        // before the caller can read it).
+                        let want_t8 = env("NOVA_TRACK8")
+                        let do_w5b = len(want_t8) > 0 and want_t8[0] == "1"
+                        if do_w5b
+                            match terminator
+                                IrInst(top, _, _, targs, _, _, _, _) =>
+                                    if top == "return" and len(targs) > 0
+                                        let ret_arg = targs[0]
+                                        let returned_slot = ""
+                                        if contains(e.ire_load_origin, ret_arg)
+                                            returned_slot = e.ire_load_origin[ret_arg]
+                                        for slot_n in keys(e.ire_local_slots)
+                                            if slot_n != returned_slot
+                                                let slot_kind = ""
+                                                if contains(e.ire_reg_types, "slot." + slot_n)
+                                                    slot_kind = e.ire_reg_types["slot." + slot_n]
+                                                let drop_fn = ""
+                                                if slot_kind == "list"
+                                                    drop_fn = "nova_rt_list_free_local"
+                                                else if slot_kind == "dict"
+                                                    drop_fn = "nova_rt_dict_free_local"
+                                                if drop_fn != ""
+                                                    let dl_reg = "%dl." + slot_n
+                                                    ire_indent(e, dl_reg + " = load i64, ptr %slot." + slot_n + ", align 8")
+                                                    ire_indent(e, "call i64 @" + drop_fn + "(i64 " + dl_reg + ")")
                         ire_emit_terminator(e, terminator)
             e.ire_dbg_loc = 0
             ire_line(e, "}")
