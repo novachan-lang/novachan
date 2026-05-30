@@ -1219,7 +1219,7 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
                 let new_anns = []
                 if ann_arg == ""
-                    push(new_anns, ann_name)
+                    push(new_anns, Expr("ann", ann_name, 0, [], [], ln))
                 else
                     push(new_anns, Expr("ann_with_arg", ann_name, 0, [Expr("str", ann_arg, 0, [], [], ln)], [], ln))
                 for a in annotations
@@ -4455,9 +4455,10 @@ type IrBuilder
     ir_fn_returns: dict
     ir_ffi_wrapped: dict
     ir_cur_line: int
+    ir_opaque_types: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0)
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {})
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -5958,6 +5959,7 @@ type TiState
     ti_bound_checks: list
     ti_extern_fns: dict
     ti_unsafe_depth: int
+    ti_opaque_types: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -6019,7 +6021,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0)
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -7476,6 +7478,8 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                 if not contains(st.ti_type_traits, name)
                                     st.ti_type_traits[name] = {}
                                 st.ti_type_traits[name][av] = sline
+                            if at == "ann" and av == "opaque"
+                                st.ti_opaque_types[name] = 1
                 return nt_unit()
             if tag == "enum"
                 for variant in body
@@ -7945,20 +7949,34 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                         push(param_types, ti_fresh(st))
                     let ret_var = ti_fresh(st)
                     ti_define(st, name, ti_mono(nt_fn(param_types, ret_var)))
+                if tag == "type"
+                    // Early-pass @opaque registration so that extern_fn decls
+                    // that follow can see this type name as int-aliased.
+                    for ann in annotations
+                        match ann
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ann" and av == "opaque"
+                                    st.ti_opaque_types[name] = 1
                 if tag == "extern_fn"
                     let ext_param_types = []
                     for p in params
                         match p
                             Param(pname, ptype, pdefault) =>
                                 if ptype != "" and ptype != "any"
-                                    push(ext_param_types, ti_ann_to_type(ptype))
+                                    if contains(st.ti_opaque_types, ptype)
+                                        push(ext_param_types, nt_int())
+                                    else
+                                        push(ext_param_types, ti_ann_to_type(ptype))
                                 else
                                     push(ext_param_types, nt_any())
                     let ext_ret_t = nt_any()
                     match expr
                         Expr(ert, erv, ern, erc, erf, erl) =>
                             if ert == "rettype"
-                                ext_ret_t = ti_ann_to_type(erv)
+                                if contains(st.ti_opaque_types, erv)
+                                    ext_ret_t = nt_int()
+                                else
+                                    ext_ret_t = ti_ann_to_type(erv)
                     ti_define(st, name, ti_mono(nt_fn(ext_param_types, ext_ret_t)))
                     st.ti_extern_fns[name] = 1
                 if tag == "enum"
@@ -9898,22 +9916,37 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     push(b.ir_externs, s)
                     push(b.ir_fnames, name)
                     b.ir_fn_arity[name] = len(params)
-                    // Decide if we need a marshaling wrapper based on declared types
+                    // Decide if we need a marshaling wrapper based on declared
+                    // types — including @opaque types, which are "ptr" in C
+                    // but "i64" in NOVA's calling convention.
                     let ext_ret_ll = "i64"
                     match expr
                         Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
                             if rxt == "rettype"
                                 ext_ret_ll = ffi_llvm_type(rxv)
+                                if contains(b.ir_opaque_types, rxv)
+                                    ext_ret_ll = "ptr"
                     let ext_needs = ext_ret_ll != "i64"
                     if not ext_needs
                         for ep in params
                             match ep
                                 Param(epn, ept, epd) =>
-                                    if ffi_llvm_type(ept) != "i64"
+                                    let ep_ll = ffi_llvm_type(ept)
+                                    if contains(b.ir_opaque_types, ept)
+                                        ep_ll = "ptr"
+                                    if ep_ll != "i64"
                                         ext_needs = true
                     if ext_needs
                         b.ir_ffi_wrapped[name] = 1
                 else if tag == "type"
+                    // @opaque marks a type as an FFI handle (held as int in
+                    // NOVA, passed as ptr to C). Detected via the "ann" Expr
+                    // wrapper around bare annotations. Used for sqlite3*, etc.
+                    for ann in annotations
+                        match ann
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ann" and av == "opaque"
+                                    b.ir_opaque_types[name] = 1
                     b.ir_sdefs[name] = params
                     let fi = 1
                     for p in params
@@ -10500,11 +10533,16 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
                             if rxt == "rettype"
                                 real_ret = ffi_llvm_type(rxv)
+                                if contains(b.ir_opaque_types, rxv)
+                                    real_ret = "ptr"
                     let real_arg_types = []
                     for p in eparams
                         match p
                             Param(pn, pt, pd) =>
-                                push(real_arg_types, ffi_llvm_type(pt))
+                                let pll = ffi_llvm_type(pt)
+                                if contains(b.ir_opaque_types, pt)
+                                    pll = "ptr"
+                                push(real_arg_types, pll)
                     let needs_wrapper = real_ret != "i64"
                     let ai = 0
                     while ai < len(real_arg_types) and not needs_wrapper
