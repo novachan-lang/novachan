@@ -1203,13 +1203,15 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     let val = tv(tokens, pos)
 
     if kind == "AT"
-        // Annotation: @name [( "stringarg" )] followed by statement
+        // Annotation: @name [( "stringarg" | IDENT )] followed by statement.
+        // Both string and bare-ident args are accepted for ergonomic forms
+        // like @repr(C) (no quotes) and @link("m") (string).
         let ann_name = tv(tokens, pos + 1)
         let ann_arg = ""
         let p = pos + 2
         if tk(tokens, p) == "DELIM" and tv(tokens, p) == "("
             p = p + 1
-            if tk(tokens, p) == "STR"
+            if tk(tokens, p) == "STR" or tk(tokens, p) == "IDENT"
                 ann_arg = tv(tokens, p)
                 p = p + 1
             p = expect(tokens, p, ")", pe)
@@ -4471,9 +4473,10 @@ type IrBuilder
     ir_cur_line: int
     ir_opaque_types: dict
     ir_extern_out_idx: dict
+    ir_repr_c_types: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {})
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -5164,7 +5167,10 @@ fn get_ir_field_index(b: IrBuilder, field_name: string) -> int
 fn get_ir_field_index_for(b: IrBuilder, stype: string, field_name: string) -> int
     if stype != "" and contains(b.ir_sdefs, stype)
         let sparams = b.ir_sdefs[stype]
+        // @repr(C) structs: no leading type-hash slot, so fields start at 0.
         let sfi = 1
+        if contains(b.ir_repr_c_types, stype)
+            sfi = 0
         for sp in sparams
             match sp
                 Param(spn, spt, spd) =>
@@ -9043,9 +9049,10 @@ type IrEmitter
     ire_line_locs: dict
     ire_loc_entries: list
     ire_fn_sp_id: int
+    ire_repr_c_types: dict
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0)
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {})
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -9528,16 +9535,27 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     else
                         ire_indent(e, call_str)
             else if op == "make_struct"
-                let size = (num + 1) * 8
+                // @repr(C) structs are flat C-layout: no leading type-hash
+                // slot, fields start at offset 0. Regular NOVA structs have
+                // a hash word at slot 0 used for runtime type checks; fields
+                // begin at slot 1. C code accessing the struct sees fields
+                // at offsets 0,8,16,... so the @repr(C) layout matches.
+                let is_repr_c = contains(e.ire_repr_c_types, value)
+                let extra_slots = 1
+                if is_repr_c
+                    extra_slots = 0
+                let size = (num + extra_slots) * 8
                 ire_indent(e, dest + ".ptr = call ptr @nova_rt_struct_alloc(i64 " + str(size) + ")")
-                let hash_val = type_name_hash(value)
-                let hash_gep = dest + ".thash"
-                ire_indent(e, hash_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 0")
-                ire_indent(e, "store i64 " + str(hash_val) + ", ptr " + hash_gep + ", align 8")
+                if not is_repr_c
+                    let hash_val = type_name_hash(value)
+                    let hash_gep = dest + ".thash"
+                    ire_indent(e, hash_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 0")
+                    ire_indent(e, "store i64 " + str(hash_val) + ", ptr " + hash_gep + ", align 8")
                 let fi = 0
                 while fi < len(args)
                     let gep = dest + ".f" + str(fi)
-                    ire_indent(e, gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 " + str(fi + 1))
+                    let slot_off = fi + extra_slots
+                    ire_indent(e, gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 " + str(slot_off))
                     ire_indent(e, "store i64 " + args[fi] + ", ptr " + gep + ", align 8")
                     fi = fi + 1
                 ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
@@ -9995,7 +10013,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
                             if rxt == "rettype"
                                 ext_ret_ll = ffi_llvm_type(rxv)
-                                if contains(b.ir_opaque_types, rxv)
+                                if contains(b.ir_opaque_types, rxv) or contains(b.ir_repr_c_types, rxv)
                                     ext_ret_ll = "ptr"
                     let ext_needs = ext_ret_ll != "i64"
                     if not ext_needs
@@ -10003,7 +10021,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                             match ep
                                 Param(epn, ept, epd) =>
                                     let ep_ll = ffi_llvm_type(ept)
-                                    if contains(b.ir_opaque_types, ept)
+                                    if contains(b.ir_opaque_types, ept) or contains(b.ir_repr_c_types, ept)
                                         ep_ll = "ptr"
                                     if ep_ll != "i64"
                                         ext_needs = true
@@ -10011,13 +10029,20 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         b.ir_ffi_wrapped[name] = 1
                 else if tag == "type"
                     // @opaque marks a type as an FFI handle (held as int in
-                    // NOVA, passed as ptr to C). Detected via the "ann" Expr
-                    // wrapper around bare annotations. Used for sqlite3*, etc.
+                    // NOVA, passed as ptr to C). @repr(C) marks a NOVA struct
+                    // as C-layout-compatible: its handle (= heap data pointer)
+                    // can be passed to C as a struct pointer, fields stay
+                    // accessible to NOVA. Both lower as "ptr" at the boundary.
                     for ann in annotations
                         match ann
                             Expr(at, av, an2, ac, af, al) =>
                                 if at == "ann" and av == "opaque"
                                     b.ir_opaque_types[name] = 1
+                                if at == "ann_with_arg" and av == "repr" and len(ac) > 0
+                                    match ac[0]
+                                        Expr(stg, sav, sn2, sac2, saf2, sal2) =>
+                                            if stg == "str" and sav == "C"
+                                                b.ir_repr_c_types[name] = 1
                     b.ir_sdefs[name] = params
                     let fi = 1
                     for p in params
@@ -10604,14 +10629,14 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
                             if rxt == "rettype"
                                 real_ret = ffi_llvm_type(rxv)
-                                if contains(b.ir_opaque_types, rxv)
+                                if contains(b.ir_opaque_types, rxv) or contains(b.ir_repr_c_types, rxv)
                                     real_ret = "ptr"
                     let real_arg_types = []
                     for p in eparams
                         match p
                             Param(pn, pt, pd) =>
                                 let pll = ffi_llvm_type(pt)
-                                if contains(b.ir_opaque_types, pt)
+                                if contains(b.ir_opaque_types, pt) or contains(b.ir_repr_c_types, pt)
                                     pll = "ptr"
                                 push(real_arg_types, pll)
                     let needs_wrapper = real_ret != "i64"
@@ -10760,6 +10785,10 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     fpt = ir_collect_param_types(all_fns, frt)
 
     // Pass 3: Infer types with inter-procedural info and emit
+    // Plumb @repr(C) type set from the IR builder into the LLVM emitter so
+    // make_struct can skip the type-hash slot for C-layout structs.
+    for k in keys(b.ir_repr_c_types)
+        e.ire_repr_c_types[k] = 1
     for ir_fn in ir_fns
         let typed_fn = ir_infer_types(ir_fn, frt, fpt)
         ire_emit_function(e, typed_fn)

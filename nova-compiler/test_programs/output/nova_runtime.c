@@ -10969,3 +10969,15 @@ int64_t c_test_set42(int64_t* out) {
     return 0;
 }
 
+/* ── FFI @repr(C) struct test helper ───────────────────────────────────────
+   NOVA struct handles ARE pointers to the heap-allocated data block (the
+   8-byte RC+tag header sits at handle[-1]; the data starts at handle[0]).
+   For a NOVA @repr(C) struct with three int fields, the layout is three
+   contiguous int64_t at offsets 0, 8, 16. We treat the handle as a pointer
+   to that flat memory and write 1, 2, 3 in. After the call, NOVA reads
+   t.a/t.b/t.c via its normal field-access path and sees the new values. */
+int64_t c_test_fill_triple(int64_t* t) {
+    if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
+    return 0;
+}
+
