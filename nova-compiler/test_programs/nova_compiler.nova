@@ -9310,9 +9310,10 @@ type IrEmitter
     ire_local_slots: dict
     ire_load_origin: dict
     ire_slot_escaped: dict
+    ire_dropped: dict
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, 0, 0, -1, {}, {}, {}, {}, {})
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, 0, 0, -1, {}, {}, {}, {}, {}, {})
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -10167,6 +10168,96 @@ fn ire_collect_slots(blocks: list, param_names: list) -> list
                                     push(slots, value)
     slots
 
+// Track 8 W8: classical iterative liveness on the IR's basic-block graph.
+// Returns a dict mapping each block label to the SET of slot names that
+// are live at the END of that block (any successor still needs them).
+//
+// Algorithm (textbook backward dataflow):
+//   use[B]      = slots read in B before being written in B
+//   def[B]      = slots written in B
+//   live_in[B]  = use[B] ∪ (live_out[B] - def[B])
+//   live_out[B] = ∪ live_in[S] for each successor S of B
+//
+// Successors come from the block's terminator:
+//   return     → no successors
+//   goto L     → [L]                 (target in value)
+//   branch L F → [L, F]              (true in value, false in args[1])
+fn ire_liveness(blocks: list, slot_names: list) -> dict
+    let n = len(blocks)
+    let use_set = {}
+    let def_set = {}
+    let succ_map = {}
+    for blk in blocks
+        match blk
+            IrBlock(lbl, insts, term) =>
+                let bu = {}
+                let bd = {}
+                for inst in insts
+                    match inst
+                        IrInst(op, _, _, _, value, _, _, _) =>
+                            if op == "slot_load" and list_contains(slot_names, value)
+                                if not contains(bd, value)
+                                    bu[value] = 1
+                            if op == "slot_store" and list_contains(slot_names, value)
+                                bd[value] = 1
+                use_set[lbl] = bu
+                def_set[lbl] = bd
+                let succs = []
+                match term
+                    IrInst(top, _, _, targs, tvalue, _, _, _) =>
+                        if top == "goto"
+                            if tvalue != ""
+                                push(succs, tvalue)
+                        else if top == "branch"
+                            if tvalue != ""
+                                push(succs, tvalue)
+                            if len(targs) >= 2
+                                push(succs, targs[1])
+                succ_map[lbl] = succs
+    let live_in = {}
+    let live_out = {}
+    for blk in blocks
+        match blk
+            IrBlock(lbl, _, _) =>
+                live_in[lbl] = {}
+                live_out[lbl] = {}
+    let changed = true
+    let iters = 0
+    while changed and iters < 64
+        changed = false
+        iters = iters + 1
+        let i = n - 1
+        while i >= 0
+            match blocks[i]
+                IrBlock(lbl, _, _) =>
+                    let new_out = {}
+                    for s in succ_map[lbl]
+                        if contains(live_in, s)
+                            for k in keys(live_in[s])
+                                new_out[k] = 1
+                    let new_in = {}
+                    for k in keys(use_set[lbl])
+                        new_in[k] = 1
+                    for k in keys(new_out)
+                        if not contains(def_set[lbl], k)
+                            new_in[k] = 1
+                    if len(keys(new_out)) != len(keys(live_out[lbl]))
+                        changed = true
+                    else
+                        for k in keys(new_out)
+                            if not contains(live_out[lbl], k)
+                                changed = true
+                    if len(keys(new_in)) != len(keys(live_in[lbl]))
+                        changed = true
+                    else
+                        for k in keys(new_in)
+                            if not contains(live_in[lbl], k)
+                                changed = true
+                    live_out[lbl] = new_out
+                    live_in[lbl] = new_in
+            i = i - 1
+    live_out
+
 fn ire_emit_function(e: IrEmitter, func: IrFunction)
     // Reset per-function state — including Track 8 W5b local slot set
     // so drops from a previous function don't leak into this one.
@@ -10175,6 +10266,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
     e.ire_local_slots = {}
     e.ire_load_origin = {}
     e.ire_slot_escaped = {}
+    e.ire_dropped = {}
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             if is_extern == 1
@@ -10224,6 +10316,14 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                 pi = pi + 1
             // Collect all local slot names (excluding params)
             let local_slots = ire_collect_slots(blocks, param_names)
+            // Track 8 W8: opt-in mid-fn liveness-based drops. Compute live_out
+            // per block once; later in the block-emit loop we'll insert drops
+            // for slots that are dead by the block's exit.
+            let w8_env = env("NOVA_T8_W8")
+            let do_w8 = len(w8_env) > 0 and w8_env[0] == "1"
+            let live_out_map = {}
+            if do_w8
+                live_out_map = ire_liveness(blocks, local_slots)
             for block in blocks
                 match block
                     IrBlock(label, insts, terminator) =>
@@ -10249,6 +10349,31 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                 ire_indent(e, "store i64 0, ptr %slot." + slot_name + ", align 8")
                         for inst in insts
                             ire_emit_inst(e, inst)
+                        // Track 8 W8: drop slots that are dead at block exit.
+                        // Skip the return block — W5b handles that. Skip any
+                        // slot already in ire_dropped so we don't double-free.
+                        // Also respect ire_slot_escaped: an escaped slot's
+                        // value is still reachable through some container.
+                        if do_w8 and contains(live_out_map, label)
+                            match terminator
+                                IrInst(w8_top, _, _, _, _, _, _, _) =>
+                                    if w8_top != "return"
+                                        let w8_live = live_out_map[label]
+                                        for w8_slot in keys(e.ire_local_slots)
+                                            if not contains(w8_live, w8_slot) and not contains(e.ire_slot_escaped, w8_slot) and not contains(e.ire_dropped, w8_slot)
+                                                let w8_kind = ""
+                                                if contains(e.ire_reg_types, "slot." + w8_slot)
+                                                    w8_kind = e.ire_reg_types["slot." + w8_slot]
+                                                let w8_fn = ""
+                                                if w8_kind == "list"
+                                                    w8_fn = "nova_rt_list_free_local"
+                                                else if w8_kind == "dict"
+                                                    w8_fn = "nova_rt_dict_free_local"
+                                                if w8_fn != ""
+                                                    let w8_reg = ire_fresh_tmp(e, "dl." + w8_slot)
+                                                    ire_indent(e, w8_reg + " = load i64, ptr %slot." + w8_slot + ", align 8")
+                                                    ire_indent(e, "call i64 @" + w8_fn + "(i64 " + w8_reg + ")")
+                                                    e.ire_dropped[w8_slot] = 1
                         // Track 8 W5b: before any return terminator, auto-
                         // insert list_free_local / dict_free_local calls for
                         // each per-fn local slot. SKIP the slot whose value
@@ -10282,7 +10407,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                                 // container holds a live reference. Dropping the
                                                 // slot here would free data the caller can still
                                                 // reach. Skip.
-                                                if not contains(e.ire_slot_escaped, slot_n)
+                                                if not contains(e.ire_slot_escaped, slot_n) and not contains(e.ire_dropped, slot_n)
                                                     let slot_kind = ""
                                                     if contains(e.ire_reg_types, "slot." + slot_n)
                                                         slot_kind = e.ire_reg_types["slot." + slot_n]
@@ -10298,6 +10423,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                                         let dl_reg = ire_fresh_tmp(e, "dl." + slot_n)
                                                         ire_indent(e, dl_reg + " = load i64, ptr %slot." + slot_n + ", align 8")
                                                         ire_indent(e, "call i64 @" + drop_fn + "(i64 " + dl_reg + ")")
+                                                        e.ire_dropped[slot_n] = 1
                         ire_emit_terminator(e, terminator)
             e.ire_dbg_loc = 0
             ire_line(e, "}")
