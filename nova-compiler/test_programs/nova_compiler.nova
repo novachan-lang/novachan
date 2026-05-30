@@ -8299,6 +8299,102 @@ fn ir_die(func: IrFunction) -> IrFunction
 
 // ── Constant Folding + Slot Forwarding ──────────────────────────────────────
 
+// ── Track 8 F102 Week 1: Escape Analysis ────────────────────────────────────
+// Returns [n_allocs, n_escaping_allocs] for one function. An allocation is
+// any make_list / make_dict / make_struct. It "escapes" if its result
+// register flows to a return, a send(channel, value), a spawn capture, or
+// is stored into a container that itself escapes.
+//
+// This is the conservative may-escape pass: when in doubt, mark as escape.
+// Soundness > completeness. A later (stronger) pass can lower the
+// escape count by tracking inter-procedural dataflow.
+fn ir_escape_analysis(func: IrFunction) -> list
+    match func
+        IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
+            if is_extern == 1 or len(blocks) == 0
+                return [0, 0]
+            let escaping = {}
+            // Phase 1: collect direct escape sites and mark their operands.
+            for block in blocks
+                match block
+                    IrBlock(_, insts, terminator) =>
+                        for inst in insts
+                            match inst
+                                IrInst(op, dest, _, args, value, _, _, _) =>
+                                    if op == "call"
+                                        if value == "nova_rt_channel_send" or value == "nova_rt_channel_send_move" or value == "nova_rt_channel_recv" or value == "send"
+                                            if len(args) >= 2
+                                                escaping[args[1]] = 1
+                                        if value == "nova_rt_spawn" or value == "spawn"
+                                            let ai = 0
+                                            while ai < len(args)
+                                                escaping[args[ai]] = 1
+                                                ai = ai + 1
+                                    // NOTE: slot_store is LOCAL by itself — the slot
+                                    // lives on the current function's stack. Whether
+                                    // its content escapes is determined by phase 2 (if
+                                    // any reload of this slot reaches an escape point).
+                                    if op == "field_set" or op == "index_set"
+                                        // Storing into a container: only escapes if the
+                                        // container escapes. Conservative for MVP: assume
+                                        // container does escape, so the value escapes.
+                                        if len(args) >= 3
+                                            escaping[args[2]] = 1
+                        match terminator
+                            IrInst(top, _, _, targs, _, _, _, _) =>
+                                if top == "return" and len(targs) > 0
+                                    escaping[targs[0]] = 1
+            // Phase 2: forward-propagate via copies and slot_load only.
+            // A value escapes if a COPY of it escapes (same handle moves), or
+            // if it's loaded from an escaping slot. Other operations produce a
+            // *new* value that doesn't make the inputs escape.
+            let changed = true
+            while changed
+                changed = false
+                for block in blocks
+                    match block
+                        IrBlock(_, insts, _) =>
+                            for inst in insts
+                                match inst
+                                    IrInst(op, dest, _, args, value, _, _, _) =>
+                                        // dest escapes? maybe its alias-source needs to
+                                        if dest != "" and contains(escaping, dest)
+                                            if op == "copy" or op == "slot_load"
+                                                let src_key = ""
+                                                if op == "slot_load"
+                                                    src_key = "slot." + value
+                                                else if len(args) > 0
+                                                    src_key = args[0]
+                                                if src_key != "" and not contains(escaping, src_key)
+                                                    escaping[src_key] = 1
+                                                    changed = true
+                                        // src escapes? if so the dest of a copy aliases it
+                                        if op == "copy" and len(args) > 0
+                                            if contains(escaping, args[0]) and dest != "" and not contains(escaping, dest)
+                                                escaping[dest] = 1
+                                                changed = true
+                                        if op == "slot_store" and len(args) > 0
+                                            // storing into a slot: if any later slot_load
+                                            // of this slot escapes, the stored value escapes
+                                            let slot_k = "slot." + value
+                                            if contains(escaping, slot_k) and not contains(escaping, args[0])
+                                                escaping[args[0]] = 1
+                                                changed = true
+            // Phase 3: count allocations and how many escape.
+            let n_allocs = 0
+            let n_escape = 0
+            for block in blocks
+                match block
+                    IrBlock(_, insts, _) =>
+                        for inst in insts
+                            match inst
+                                IrInst(op, dest, _, args, _, _, _, _) =>
+                                    if op == "make_list" or op == "make_dict" or op == "make_struct"
+                                        n_allocs = n_allocs + 1
+                                        if dest != "" and contains(escaping, dest)
+                                            n_escape = n_escape + 1
+            [n_allocs, n_escape]
+
 fn ir_const_fold(func: IrFunction) -> IrFunction
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
@@ -10856,12 +10952,31 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // make_struct can skip the type-hash slot for C-layout structs.
     for k in keys(b.ir_repr_c_types)
         e.ire_repr_c_types[k] = 1
+    // Track 8 escape analysis: when NOVA_ESCAPE_STATS=1, run the pass on
+    // every user function and emit a comment in the .ll with the result.
+    // Aggregates printed to stderr at compile-end for the user.
+    let esc_env = env("NOVA_ESCAPE_STATS")
+    let want_escape = len(esc_env) > 0 and esc_env[0] == "1"
+    let total_allocs = 0
+    let total_escape = 0
     for ir_fn in ir_fns
         let typed_fn = ir_infer_types(ir_fn, frt, fpt)
+        if want_escape
+            let ea = ir_escape_analysis(typed_fn)
+            total_allocs = total_allocs + ea[0]
+            total_escape = total_escape + ea[1]
+            match typed_fn
+                IrFunction(fname, _, _, _, _, _) =>
+                    ire_line(e, "; ESCAPE " + fname + ": allocs=" + str(ea[0]) + " escape=" + str(ea[1]) + " local=" + str(ea[0] - ea[1]))
         ire_emit_function(e, typed_fn)
 
     // Emit nova_main
     let typed_main = ir_infer_types(main_fn, frt, fpt)
+    if want_escape
+        let ea_main = ir_escape_analysis(typed_main)
+        total_allocs = total_allocs + ea_main[0]
+        total_escape = total_escape + ea_main[1]
+        ire_line(e, "; ESCAPE nova_main: allocs=" + str(ea_main[0]) + " escape=" + str(ea_main[1]) + " local=" + str(ea_main[0] - ea_main[1]))
     ire_emit_function(e, typed_main)
 
     // Emit any lambdas generated during nova_main lowering
@@ -10869,8 +10984,20 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     while mi2 < len(b.ir_lambdas)
         let lam_fn = b.ir_lambdas[mi2]
         let typed_lam = ir_infer_types(lam_fn, frt, fpt)
+        if want_escape
+            let ea_lam = ir_escape_analysis(typed_lam)
+            total_allocs = total_allocs + ea_lam[0]
+            total_escape = total_escape + ea_lam[1]
+            match typed_lam
+                IrFunction(lname, _, _, _, _, _) =>
+                    ire_line(e, "; ESCAPE " + lname + ": allocs=" + str(ea_lam[0]) + " escape=" + str(ea_lam[1]) + " local=" + str(ea_lam[0] - ea_lam[1]))
         ire_emit_function(e, typed_lam)
         mi2 = mi2 + 1
+    if want_escape
+        let pct_local = 0
+        if total_allocs > 0
+            pct_local = (100 * (total_allocs - total_escape)) / total_allocs
+        ire_line(e, "; ESCAPE SUMMARY: allocs=" + str(total_allocs) + " escape=" + str(total_escape) + " local=" + str(total_allocs - total_escape) + " (" + str(pct_local) + "% local, RC-elidable)")
 
     // Emit trampolines
     for spec in b.ir_tramps
