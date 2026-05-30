@@ -7973,6 +7973,90 @@ fn break_continue_check(body: list, st: TiState)
         break_continue_walk(body[i], 0, st)
         i = i + 1
 
+// ── Track 8 Week 4: use-after-move check ────────────────────────────────────
+// When NOVA_TRACK8=1, sending a variable on a channel transfers
+// ownership: any later use of that variable in the same scope is a
+// compile error. This catches the Rust-style "value moved here" / "used
+// here after move" patterns at compile time. Opt-in so existing programs
+// that send-then-print still compile in legacy mode.
+
+fn move_expr_uses(e: Expr, moved: dict, errors: list)
+    match e
+        Expr(tag, value, num, children, fields, eline) =>
+            // `send(ch, x)` — moves x. Don't traverse into the second arg
+            // (its use IS the move; we add it to moved AFTER processing).
+            if tag == "call" and value == "send" and len(children) >= 2
+                // First arg (channel) is allowed to be a moved var? In
+                // practice channels are values themselves; we conservatively
+                // check it.
+                move_expr_uses(children[0], moved, errors)
+                match children[1]
+                    Expr(at, av, an, ac, af, al) =>
+                        if at == "ident" and contains(moved, av)
+                            push(errors, "error[E1003]: value '" + av + "' used after move on line " + str(al))
+                        else if at != "ident"
+                            move_expr_uses(children[1], moved, errors)
+                moved[move_arg_name(children[1])] = eline
+                return 0
+            if tag == "ident"
+                if contains(moved, value)
+                    push(errors, "error[E1003]: value '" + value + "' used after move on line " + str(eline) + " (moved earlier in this scope by send())")
+                return 0
+            for ch in children
+                move_expr_uses(ch, moved, errors)
+
+fn move_arg_name(e: Expr) -> string
+    match e
+        Expr(tag, value, _, _, _, _) =>
+            if tag == "ident"
+                return value
+    ""
+
+fn move_check_stmts(stmts: list, errors: list)
+    let moved = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
+                if tag == "let" or tag == "assign"
+                    if name != "" and contains(moved, name)
+                        del(moved, name)
+                    if expr != null_expr()
+                        move_expr_uses(expr, moved, errors)
+                else if tag == "expr"
+                    if expr != null_expr()
+                        move_expr_uses(expr, moved, errors)
+                else if tag == "return"
+                    if expr != null_expr()
+                        move_expr_uses(expr, moved, errors)
+                else if tag == "fn"
+                    let fn_errs = []
+                    move_check_stmts(body, fn_errs)
+                    for fe in fn_errs
+                        push(errors, fe)
+                else if tag == "spawn"
+                    // Fresh scope for the spawned process body
+                    let sp_errs = []
+                    move_check_stmts(body, sp_errs)
+                    for se in sp_errs
+                        push(errors, se)
+                else if tag == "if" or tag == "while" or tag == "for"
+                    if expr != null_expr()
+                        move_expr_uses(expr, moved, errors)
+                    let inner_errs = []
+                    move_check_stmts(body, inner_errs)
+                    for ie in inner_errs
+                        push(errors, ie)
+                    if len(else_body) > 0
+                        let else_errs = []
+                        move_check_stmts(else_body, else_errs)
+                        for ee in else_errs
+                            push(errors, ee)
+
+fn move_check_program(stmts: list) -> list
+    let errors = []
+    move_check_stmts(stmts, errors)
+    errors
+
 // ── Main entry point: infer types for a parsed program ───────────────────────
 
 fn ti_infer_program(stmts: list, source_lines: list) -> TiState
@@ -10129,6 +10213,17 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             print(err)
         print("compilation failed: " + str(len(ti_state.ti_errors)) + " error(s)")
         exit(1)
+
+    // Track 8 Week 4: use-after-move check (opt-in via NOVA_TRACK8=1).
+    // send(ch, x) moves x; any subsequent use of x is a compile error.
+    let t8_env_chk = env("NOVA_TRACK8")
+    if len(t8_env_chk) > 0 and t8_env_chk[0] == "1"
+        let move_errs = move_check_program(stmts)
+        if len(move_errs) > 0
+            for me in move_errs
+                print(me)
+            print("compilation failed: " + str(len(move_errs)) + " move-semantics error(s)")
+            exit(1)
 
     let b = new_ir_builder()
     let resolved_target = resolve_target(target)
