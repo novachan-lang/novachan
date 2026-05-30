@@ -9834,6 +9834,19 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             // (args[2]) was incref'd by the escaping dict.
                             if len(args) >= 3 and contains(e.ire_load_origin, args[2])
                                 e.ire_slot_escaped[e.ire_load_origin[args[2]]] = 1
+                    // Track 8 W5b soundness (general case): any other call may
+                    // stash its arguments in the callee's data structures or
+                    // return aliases of them. Be conservative — every slot
+                    // that supplied an argument is considered escaped, except
+                    // when the call is a _no_rc variant on a known-local
+                    // container (handled above).
+                    let _is_norc = call_name == "nova_rt_list_append_no_rc" or call_name == "nova_rt_dict_set_no_rc"
+                    if not _is_norc
+                        let _cai = 0
+                        while _cai < len(args)
+                            if contains(e.ire_load_origin, args[_cai])
+                                e.ire_slot_escaped[e.ire_load_origin[args[_cai]]] = 1
+                            _cai = _cai + 1
                     let call_str = "call i64 @" + call_name + "("
                     let i = 0
                     while i < len(args)
@@ -9869,6 +9882,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     let slot_off = fi + extra_slots
                     ire_indent(e, gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 " + str(slot_off))
                     ire_indent(e, "store i64 " + args[fi] + ", ptr " + gep + ", align 8")
+                    // W5b soundness: the struct now holds a pointer to args[fi].
+                    // The struct may outlive this function. Mark source slot.
+                    if contains(e.ire_load_origin, args[fi])
+                        e.ire_slot_escaped[e.ire_load_origin[args[fi]]] = 1
                     fi = fi + 1
                 ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
             else if op == "make_list"
@@ -9876,6 +9893,8 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let i = 0
                 while i < len(args)
                     ire_indent(e, "call i64 @nova_rt_list_append(i64 " + dest + ", i64 " + args[i] + ")")
+                    if contains(e.ire_load_origin, args[i])
+                        e.ire_slot_escaped[e.ire_load_origin[args[i]]] = 1
                     i = i + 1
                 e.ire_reg_types[dest] = "list"
             else if op == "make_dict"
@@ -10010,6 +10029,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 ire_indent(e, dest + " = add i64 " + args[0] + ", 0")
                 if len(args) == 1 and contains(e.ire_reg_types, args[0])
                     e.ire_reg_types[dest] = e.ire_reg_types[args[0]]
+                // W5b soundness: propagate load_origin so escapes from aliased
+                // values still mark the original slot.
+                if len(args) == 1 and contains(e.ire_load_origin, args[0])
+                    e.ire_load_origin[dest] = e.ire_load_origin[args[0]]
             else if op == "make_closure"
                 // Allocate closure record: [trampoline_ptr, cap0, cap1, ...]
                 let record_size = (1 + num) * 8
@@ -10026,6 +10049,11 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     let cap_gep = dest + ".c" + str(ci)
                     ire_indent(e, cap_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 " + str(ci + 1))
                     ire_indent(e, "store i64 " + args[ci] + ", ptr " + cap_gep + ", align 8")
+                    // W5b soundness: every capture is now referenced by the
+                    // closure, which can outlive this function. Mark source
+                    // slots as escaped so W5b does NOT drop them.
+                    if contains(e.ire_load_origin, args[ci])
+                        e.ire_slot_escaped[e.ire_load_origin[args[ci]]] = 1
                     ci = ci + 1
                 ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
             else if op == "dyn_call"
@@ -10044,6 +10072,13 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     call_str = call_str + ", i64 " + args[ai]
                     ai = ai + 1
                 call_str = call_str + ")"
+                // W5b soundness: dyn_call may stash any of its args. Mark all
+                // slot-origin args (including the closure record itself).
+                let _dai = 0
+                while _dai < len(args)
+                    if contains(e.ire_load_origin, args[_dai])
+                        e.ire_slot_escaped[e.ire_load_origin[args[_dai]]] = 1
+                    _dai = _dai + 1
                 if dest != ""
                     ire_indent(e, dest + " = " + call_str)
                 else
@@ -10219,13 +10254,15 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                         // each per-fn local slot. SKIP the slot whose value
                         // is the return value (otherwise we'd free the data
                         // before the caller can read it).
-                        // W5b auto-drop ON by default — symmetric with W3
-                        // elision so leaks from elided rc_inc are immediately
-                        // freed at function return. Opt out via NOVA_NO_TRACK8
-                        // (whole-feature) or NOVA_T8_NO_DROP (drop-only).
+                        // W5b auto-drop: opt-in via NOVA_T8_DROP=1 only.
+                        // Soundness across all escape patterns isn't proven
+                        // yet (closure-passing in compiler code revealed
+                        // missed cases — see bootstrap notes). Default OFF
+                        // keeps W3 RC elision's perf win without the risk.
+                        let want_drop = env("NOVA_T8_DROP")
                         let no_t8b = env("NOVA_NO_TRACK8")
                         let no_drop = env("NOVA_T8_NO_DROP")
-                        let do_w5b = true
+                        let do_w5b = len(want_drop) > 0 and want_drop[0] == "1"
                         if len(no_t8b) > 0 and no_t8b[0] == "1"
                             do_w5b = false
                         if len(no_drop) > 0 and no_drop[0] == "1"
