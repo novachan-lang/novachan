@@ -11048,6 +11048,20 @@ fn nova_compile_file(input_path: string, output_path: string, use_ir: int, targe
     return output_path
 
 fn nova_find_runtime() -> string
+    // Honor explicit overrides first so users in arbitrary cwds can build:
+    //   NOVA_RUNTIME=/full/path/to/nova_runtime.c     ← exact file
+    //   NOVA_HOME=/install/dir                        ← we append /output/nova_runtime.c
+    let env_rt = env("NOVA_RUNTIME")
+    if len(env_rt) > 0 and len(read_file(env_rt)) > 100
+        return env_rt
+    let nh = env("NOVA_HOME")
+    if len(nh) > 0
+        let cand = path_join(nh, "output/nova_runtime.c")
+        if len(read_file(cand)) > 100
+            return cand
+        let cand2 = path_join(nh, "nova_runtime.c")
+        if len(read_file(cand2)) > 100
+            return cand2
     let candidates = ["output/nova_runtime.c", "test_programs/output/nova_runtime.c", "nova_runtime.c"]
     for c in candidates
         let content = read_file(c)
@@ -11067,8 +11081,25 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
         cmd = cmd + " --target=" + resolved
     cmd = cmd + " \"" + ll_path + "\" \"" + rt + "\" -o \"" + exe_path + "\""
     if target_is_windows(resolved) == 1
-        cmd = cmd + " -lws2_32 -lwinhttp"
-    cmd = cmd + " 2>&1"
+        // Runtime uses Wincrypt (random/UUID), WinSock (TCP/UDP), WinHTTP
+        // (http_request), bcrypt (TLS-adjacent). advapi32 covers Wincrypt.
+        cmd = cmd + " -lws2_32 -lwinhttp -ladvapi32 -lbcrypt"
+    // Also propagate @link("libname") LINK_LIB comments emitted by the IR.
+    let ll_content = read_file(ll_path)
+    let ll_lines = split(ll_content, "\n")
+    let extra_libs = ""
+    let seen = {}
+    for line in ll_lines
+        let t = trim(line)
+        if starts_with(t, "; LINK_LIB:")
+            let libname = trim(slice(t, 11, len(t)))
+            if libname == "m" or libname == "pthread" or libname == "dl" or libname == "rt"
+                if target_is_windows(resolved) == 1
+                    libname = ""
+            if len(libname) > 0 and not contains(seen, libname)
+                seen[libname] = 1
+                extra_libs = extra_libs + " -l" + libname
+    cmd = cmd + extra_libs + " -D_CRT_SECURE_NO_WARNINGS 2>&1"
     let ret = system(cmd)
     return ret
 
@@ -11124,6 +11155,58 @@ fn nova_pkg_entry() -> string
     if path_exists("main.nova") == 1
         return "main.nova"
     return ""
+
+// Minimal NOVA formatter: normalizes whitespace without changing structure.
+//  - tabs -> 4 spaces
+//  - trim trailing whitespace per line
+//  - collapse 3+ blank lines to 2
+//  - file ends with exactly one newline
+fn nova_fmt_trim_trailing_ws(s: string) -> string
+    let n = len(s)
+    while n > 0
+        let c = s[n - 1]
+        if c == " " or c == "\t" or c == "\r"
+            n = n - 1
+        else
+            break
+    if n == len(s)
+        return s
+    if n == 0
+        return ""
+    slice(s, 0, n)
+
+fn nova_fmt_file(path: string)
+    let content = read_file(path)
+    if len(content) == 0
+        print("error: file not found or empty: " + path)
+        exit(1)
+    let lines = split(content, "\n")
+    let result = ""
+    let blank_run = 0
+    let li = 0
+    let last_non_blank_idx = -1
+    let kept = []
+    while li < len(lines)
+        let l = replace(lines[li], "\t", "    ")
+        l = nova_fmt_trim_trailing_ws(l)
+        if len(l) == 0
+            blank_run = blank_run + 1
+            if blank_run <= 2
+                push(kept, l)
+        else
+            blank_run = 0
+            last_non_blank_idx = len(kept)
+            push(kept, l)
+        li = li + 1
+    let ki = 0
+    let upto = last_non_blank_idx + 1
+    if upto < 0
+        upto = 0
+    while ki < upto
+        result = result + kept[ki] + "\n"
+        ki = ki + 1
+    write_file(path, result)
+    print("Formatted: " + path)
 
 fn nova_pkg_clean()
     let removed = 0
@@ -11494,6 +11577,7 @@ fn compiler_main()
         print("  run [file]            Build and run project (or specific file)")
         print("  test                  Run all *_test.nova files in tests/ and ./")
         print("  clean                 Remove .ll, .exe build artifacts")
+        print("  fmt <file.nova>       Format source (whitespace normalization)")
         print("")
         print("Single-file commands:")
         print("  compile <file.nova>   Compile to LLVM IR only")
@@ -11538,6 +11622,12 @@ fn compiler_main()
         exit(0)
     if cmd == "test"
         nova_pkg_test()
+        exit(0)
+    if cmd == "fmt" or cmd == "format"
+        if len(arguments) < 3
+            print("Usage: nova fmt <file.nova>")
+            exit(1)
+        nova_fmt_file(arguments[2])
         exit(0)
     if cmd == "get"
         if len(arguments) < 3
