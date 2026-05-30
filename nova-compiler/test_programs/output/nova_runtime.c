@@ -732,6 +732,24 @@ int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
     return 0;
 }
 
+/* Track 8 Week 3: append to a list known by the compiler to be
+   process-local (proven by escape analysis to never cross a channel,
+   spawn, or function return). Skips nova_rc_inc on the element. The
+   list itself is still heap-allocated; only the per-element RC traffic
+   is elided. When the local list goes out of scope it freelists/
+   garbage-collects without dec'ing elements (because the compiler
+   guarantees no other holder exists). */
+int64_t nova_rt_list_append_no_rc(int64_t handle, int64_t elem) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (list->size >= list->cap) {
+        list->cap *= 2;
+        list->data = realloc(list->data, (size_t)list->cap * sizeof(int64_t));
+    }
+    list->data[list->size++] = elem;
+    /* INTENTIONALLY no nova_rc_inc — caller proven local. */
+    return 0;
+}
+
 /* Append a float to a list, boxed so it keeps its type through the Any element slot.
    The compiler routes list.push(floatExpr) here when the element is statically float. */
 int64_t nova_rt_list_append_fbox(int64_t handle, int64_t bits) {
