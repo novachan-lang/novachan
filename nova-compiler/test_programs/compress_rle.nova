@@ -1,0 +1,290 @@
+// ============================================================================
+// NOVA Standard Library — compress module (pure-NOVA, lossless)
+// ============================================================================
+// Run-length encoding with multi-digit counts, plus a byte<->string packer.
+// No external libraries. Round-trip guaranteed: rle_decode(rle_encode(x)) == x
+// for any ASCII string x whose bytes are in 1..127 (see NUL note below).
+//
+// Public API:
+//   rle_encode(s)        -> string  (e.g. "aaabbc" -> "3a2b1c")
+//   rle_decode(s)        -> string  (inverse of rle_encode)
+//   bytes_pack(ints)     -> string  (list of ints 1..255 -> string via chr)
+//   bytes_unpack(s)      -> list    (string -> list of ints via ord)
+//
+// ── Encoding format ──────────────────────────────────────────────────────────
+// A run is encoded as  <decimal-count><literal>.
+//   * <decimal-count> is a maximal run of ASCII decimal digits '0'..'9'
+//     (always at least one digit; never a leading zero since counts >= 1).
+//   * <literal> is the single byte that repeats.
+//
+// Ambiguity problem & solution:
+//   If the literal byte is itself a digit (or the escape byte), it cannot sit
+//   directly after the count digits — the decoder could not tell where the
+//   count ends. We therefore ESCAPE such literals with a backslash (byte 92):
+//     - literal is a digit '0'..'9'  -> emit  "\\" + digit
+//     - literal is the backslash      -> emit  "\\\\"
+//   On decode, after reading the count digits, if the next byte is the escape
+//   byte we take the following byte as the literal verbatim; otherwise the next
+//   byte IS the literal. This keeps the common case ("3a2b1c") delimiter-free
+//   and identical to the canonical RLE form, while making the format provably
+//   unambiguous for ALL inputs, including pure-digit strings like "112233".
+//
+// ── NUL note ─────────────────────────────────────────────────────────────────
+// NOVA strings are C-string backed: a 0 byte (NUL) terminates the string, so a
+// 0 byte cannot be represented inside a NOVA string value. bytes_pack therefore
+// supports byte values 1..255 (it masks others into a byte; callers must avoid
+// 0). This is a runtime-string limitation, not an algorithm limitation.
+
+// ── constants ────────────────────────────────────────────────────────────────
+
+fn _escape_byte() -> int
+    92
+
+// ── digit helpers ───────────────────────────────────────────────────────────
+// The count is rendered explicitly from digits (not via str(int)) so the
+// encoder is fully self-contained and independent of int-formatting behavior.
+
+fn _digit_char(d: int) -> string
+    chr(48 + d)
+
+fn _int_to_decimal(n: int) -> string
+    if n == 0
+        return "0"
+    let digits = []
+    let v = n
+    while v > 0
+        let d = v % 10
+        push(digits, d)
+        v = v / 10
+    let out = ""
+    let i = len(digits) - 1
+    while i >= 0
+        out = out + _digit_char(digits[i])
+        i = i - 1
+    out
+
+fn _is_digit_byte(b: int) -> bool
+    b >= 48 and b <= 57
+
+fn _needs_escape(b: int) -> bool
+    // A literal must be escaped if it could be confused with count digits
+    // (a digit byte) or with the escape marker itself.
+    if _is_digit_byte(b)
+        return true
+    if b == _escape_byte()
+        return true
+    false
+
+// ── run-length encoding ─────────────────────────────────────────────────────
+
+fn rle_encode(s: string) -> string
+    let n = len(s)
+    if n == 0
+        return ""
+    let out = ""
+    let i = 0
+    while i < n
+        let cb = ord(s[i])
+        let count = 1
+        let j = i + 1
+        while j < n and ord(s[j]) == cb
+            count = count + 1
+            j = j + 1
+        out = out + _int_to_decimal(count)
+        if _needs_escape(cb)
+            out = out + chr(_escape_byte())
+        out = out + s[i]
+        i = j
+    out
+
+fn rle_decode(s: string) -> string
+    let n = len(s)
+    if n == 0
+        return ""
+    let out = ""
+    let i = 0
+    while i < n
+        // 1) parse the count: a maximal run of decimal digits.
+        let count = 0
+        let saw_digit = false
+        while i < n and _is_digit_byte(ord(s[i]))
+            count = count * 10 + (ord(s[i]) - 48)
+            saw_digit = true
+            i = i + 1
+        if saw_digit == false
+            // Malformed (no count). Emit byte as a single literal so decode is
+            // total and never loses data on adversarial input.
+            out = out + s[i]
+            i = i + 1
+        else
+            if i < n
+                // 2) read the literal, honoring the escape marker.
+                let lit = ""
+                if ord(s[i]) == _escape_byte()
+                    i = i + 1
+                    if i < n
+                        lit = s[i]
+                        i = i + 1
+                    else
+                        lit = chr(_escape_byte())
+                else
+                    lit = s[i]
+                    i = i + 1
+                // 3) expand.
+                let k = 0
+                while k < count
+                    out = out + lit
+                    k = k + 1
+            // count with no following literal: malformed; a well-formed
+            // encoder never emits this, so drop it.
+    out
+
+// ── byte packing ────────────────────────────────────────────────────────────
+
+fn bytes_pack(ints: list) -> string
+    // Each int is masked to a byte (0..255). Callers must avoid 0 — see NUL
+    // note — since a 0 byte cannot be stored in a NOVA string.
+    let out = ""
+    let i = 0
+    while i < len(ints)
+        let b = ints[i] & 255
+        out = out + chr(b)
+        i = i + 1
+    out
+
+fn bytes_unpack(s: string) -> list
+    let out = []
+    let i = 0
+    while i < len(s)
+        push(out, ord(s[i]))
+        i = i + 1
+    out
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn _roundtrip(s: string)
+    assert_eq(rle_decode(rle_encode(s)), s)
+
+fn main()
+    // ── _int_to_decimal sanity ──
+    assert_eq(_int_to_decimal(0), "0")
+    assert_eq(_int_to_decimal(1), "1")
+    assert_eq(_int_to_decimal(9), "9")
+    assert_eq(_int_to_decimal(10), "10")
+    assert_eq(_int_to_decimal(11), "11")
+    assert_eq(_int_to_decimal(20), "20")
+    assert_eq(_int_to_decimal(255), "255")
+    assert_eq(_int_to_decimal(1000), "1000")
+
+    // ── canonical encode shapes (delimiter-free for non-digit literals) ──
+    assert_eq(rle_encode("aaabbc"), "3a2b1c")
+    assert_eq(rle_encode("a"), "1a")
+    assert_eq(rle_encode(""), "")
+
+    // ── multi-digit counts ──
+    assert_eq(rle_encode("aaabbbbbbbbbbbcccc"), "3a11b4c")
+    assert_eq(rle_encode("xxxxxxxxxxxxxxxxxxxx"), "20x")
+
+    // ── decode basic ──
+    assert_eq(rle_decode("3a2b1c"), "aaabbc")
+    assert_eq(rle_decode("11b"), "bbbbbbbbbbb")
+    assert_eq(rle_decode("20x"), "xxxxxxxxxxxxxxxxxxxx")
+    assert_eq(rle_decode(""), "")
+
+    // ── digit literals get escaped (byte 92 == backslash) ──
+    // "11" -> run of two '1' -> count 2, literal '1' (escaped) -> "2" + "\" + "1"
+    assert_eq(rle_encode("11"), "2" + chr(92) + "1")
+    assert_eq(rle_decode("2" + chr(92) + "1"), "11")
+    // backslash literal escapes itself
+    assert_eq(rle_encode(chr(92) + chr(92)), "2" + chr(92) + chr(92))
+    assert_eq(rle_decode("2" + chr(92) + chr(92)), chr(92) + chr(92))
+
+    // ── round-trips (the core requirement) ──
+    _roundtrip("aaabbbbbbbbbbbcccc")
+    _roundtrip("abcdef")
+    _roundtrip("")
+    _roundtrip("xxxxxxxxxxxxxxxxxxxx")
+    _roundtrip("a")
+    _roundtrip("hello world")
+    _roundtrip("Mississippi")
+    _roundtrip("112233")
+    _roundtrip("11")
+    _roundtrip("0000000000")
+    _roundtrip("9080706050")
+    _roundtrip("aA1!aA1!")
+    _roundtrip("    ")
+    _roundtrip("the quick brown fox jumps over the lazy dog 1234567890")
+    _roundtrip("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    _roundtrip(chr(92) + chr(92) + chr(92))
+    _roundtrip("a" + chr(92) + "1" + chr(92) + "9b")
+
+    // A longer adversarial mix of runs and singletons including digits.
+    let mixed = "wwwwwwwwwwzzzzzzzzzzzzzzzzzzzzzzzzzzqAAAAAAAAAAAAAAAAAAAAt5555550"
+    // (contains a run of '5' digits — exercises escaped multi-count)
+    _roundtrip(mixed)
+
+    // Every printable ASCII byte 33..126 as a singleton string (round-trip).
+    let probe = ""
+    let pc = 33
+    while pc <= 126
+        probe = probe + chr(pc)
+        pc = pc + 1
+    _roundtrip(probe)
+    // And each printable byte as a run of 13 (forces 2-digit count + maybe escape).
+    let pc2 = 33
+    while pc2 <= 126
+        let run = ""
+        let rk = 0
+        while rk < 13
+            run = run + chr(pc2)
+            rk = rk + 1
+        _roundtrip(run)
+        pc2 = pc2 + 1
+
+    // ── compression actually shrinks repetitive input ──
+    let rep = "xxxxxxxxxxxxxxxxxxxx"
+    assert_eq(len(rle_encode(rep)) < len(rep), true)
+    let rep2 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert_eq(len(rle_encode(rep2)) < len(rep2), true)
+    assert_eq(len(rle_encode("bbbbbbbbbbb")) < len("bbbbbbbbbbb"), true)
+
+    // ── byte pack/unpack round-trips (1..255; 0 excluded per NUL note) ──
+    let bs = [1, 2, 65, 90, 97, 122, 127, 200, 255]
+    let packed = bytes_pack(bs)
+    assert_eq(len(packed), 9)
+    let unpacked = bytes_unpack(packed)
+    assert_eq(len(unpacked), 9)
+    let bi = 0
+    while bi < len(bs)
+        assert_eq(unpacked[bi], bs[bi])
+        bi = bi + 1
+
+    // empty bytes round-trip
+    let empty_packed = bytes_pack([])
+    assert_eq(len(empty_packed), 0)
+    assert_eq(len(bytes_unpack(empty_packed)), 0)
+
+    // single byte
+    assert_eq(bytes_unpack(bytes_pack([72]))[0], 72)
+
+    // masking: 256 -> 0 cannot survive a string, so test 257 -> 1
+    assert_eq(bytes_unpack(bytes_pack([257]))[0], 1)
+    assert_eq(bytes_unpack(bytes_pack([511]))[0], 255)
+
+    // round-trip every storable byte value 1..255 through pack/unpack
+    let all_bytes = []
+    let v = 1
+    while v < 256
+        push(all_bytes, v)
+        v = v + 1
+    let all_packed = bytes_pack(all_bytes)
+    assert_eq(len(all_packed), 255)
+    let all_un = bytes_unpack(all_packed)
+    let vi = 0
+    while vi < 255
+        assert_eq(all_un[vi], vi + 1)
+        vi = vi + 1
+
+    print("compress_rle ok")

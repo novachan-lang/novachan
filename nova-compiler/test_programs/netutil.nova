@@ -1,0 +1,359 @@
+// ============================================================================
+// NOVA Standard Library — netutil module
+// ============================================================================
+// High-level networking helpers layered over the existing runtime socket
+// builtins (tcp_listen/tcp_accept/tcp_connect/tcp_send/tcp_recv/tcp_close,
+// udp_bind/udp_send/udp_recv). The builtins do the raw byte movement; this
+// module provides the PURE protocol/text helpers that surround them —
+// address parsing, HTTP request construction, status-line / query-string
+// parsing, URL joining, and IPv4 <-> integer conversion.
+//
+// Everything here is deterministic and side-effect-free (no live socket
+// required), so it is fully unit-testable. The thin socket convenience
+// wrappers at the bottom simply forward to the runtime builtins.
+//
+// Public API (pure helpers):
+//   parse_host_port("host:port")          -> [host_str, port_int]
+//   build_http_request(method, path, host)-> HTTP/1.1 request string
+//   parse_http_status_line("HTTP/1.1 200 OK") -> [version, code_int, reason]
+//   parse_query_string("a=1&b=2")         -> dict {a:"1", b:"2"}
+//   url_join(base, path)                  -> joined URL string
+//   ip_to_int("1.2.3.4")                  -> int
+//   int_to_ip(int)                        -> "a.b.c.d"
+//
+// Socket convenience wrappers (forward to runtime builtins):
+//   http_get(host, port, path)            -> raw response string
+//   tcp_send_line(fd, line)               -> bytes sent
+
+// ── internal helpers ───────────────────────────────────────────────────────
+
+// Parse a non-negative base-10 integer out of a string. Returns -1 if the
+// string is empty or contains any non-digit character. We roll our own rather
+// than trusting int() on arbitrary substrings so parsing is total and never
+// surprises the caller with garbage on malformed input.
+fn _parse_uint(s: string) -> int
+    let n = len(s)
+    if n == 0
+        return -1
+    let acc = 0
+    let i = 0
+    while i < n
+        let d = ord(s[i])
+        if d < 48 or d > 57
+            return -1
+        acc = acc * 10 + (d - 48)
+        i = i + 1
+    acc
+
+// Trim ASCII spaces, tabs, CR and LF from both ends of a string.
+fn _strip_ws(s: string) -> string
+    let n = len(s)
+    let start = 0
+    while start < n
+        let c = ord(s[start])
+        if c == 32 or c == 9 or c == 13 or c == 10
+            start = start + 1
+        else
+            break
+    let end = n
+    while end > start
+        let c2 = ord(s[end - 1])
+        if c2 == 32 or c2 == 9 or c2 == 13 or c2 == 10
+            end = end - 1
+        else
+            break
+    slice(s, start, end)
+
+// Return the index of the last occurrence of single-char `ch` in `s`, or -1.
+// Needed for host:port where IPv6-style hosts may contain multiple colons;
+// the port is always after the final colon.
+fn _rfind_char(s: string, ch: string) -> int
+    let target = ord(ch)
+    let i = len(s) - 1
+    while i >= 0
+        if ord(s[i]) == target
+            return i
+        i = i - 1
+    -1
+
+// ── address parsing ─────────────────────────────────────────────────────────
+
+// parse_host_port("localhost:8080") -> ["localhost", 8080]
+// Splits on the LAST colon so bracketed/colon-bearing hosts keep their host
+// intact. If there is no colon, or the port is non-numeric, the port slot is
+// -1 (sentinel) so callers can detect malformed input without a crash.
+fn parse_host_port(hp: string) -> list
+    let s = _strip_ws(hp)
+    let idx = _rfind_char(s, ":")
+    if idx < 0
+        return [s, -1]
+    let host = slice(s, 0, idx)
+    let port_str = slice(s, idx + 1, len(s))
+    let port = _parse_uint(port_str)
+    if port < 0 or port > 65535
+        return [host, -1]
+    [host, port]
+
+// ── HTTP request construction ───────────────────────────────────────────────
+
+// build_http_request("GET", "/index.html", "example.com")
+//   -> "GET /index.html HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+// Produces a minimal but well-formed HTTP/1.1 request: request line, mandatory
+// Host header (required by HTTP/1.1), an explicit Connection: close so a plain
+// tcp_recv loop terminates, and the blank line that ends the headers.
+fn build_http_request(method: string, path: string, host: string) -> string
+    let m = method
+    if len(m) == 0
+        m = "GET"
+    let p = path
+    if len(p) == 0
+        p = "/"
+    // Ensure the path is absolute.
+    if ord(p[0]) != 47
+        p = "/" + p
+    let req = m + " " + p + " HTTP/1.1\r\n"
+    req = req + "Host: " + host + "\r\n"
+    req = req + "Connection: close\r\n"
+    req = req + "\r\n"
+    req
+
+// ── HTTP status line parsing ────────────────────────────────────────────────
+
+// parse_http_status_line("HTTP/1.1 200 OK") -> ["HTTP/1.1", 200, "OK"]
+// The reason phrase may contain spaces, so we split only the first two tokens
+// (version, code) and take the remainder verbatim as the reason. A malformed
+// or empty code yields -1, leaving version/reason as parsed.
+fn parse_http_status_line(line: string) -> list
+    let s = _strip_ws(line)
+    let sp1 = find(s, " ")
+    if sp1 < 0
+        return [s, -1, ""]
+    let version = slice(s, 0, sp1)
+    let rest = slice(s, sp1 + 1, len(s))
+    let sp2 = find(rest, " ")
+    let code_str = rest
+    let reason = ""
+    if sp2 >= 0
+        code_str = slice(rest, 0, sp2)
+        reason = slice(rest, sp2 + 1, len(rest))
+    let code = _parse_uint(code_str)
+    [version, code, reason]
+
+// ── query string parsing ────────────────────────────────────────────────────
+
+// parse_query_string("a=1&b=2") -> {"a": "1", "b": "2"}
+// Values are kept as STRINGS (callers know their own expected types; HTTP
+// query values are inherently textual). A bare key with no '=' maps to "".
+// A leading '?' is tolerated and stripped. Empty input yields an empty dict.
+fn parse_query_string(qs: string) -> dict
+    let result = {}
+    let s = qs
+    if len(s) > 0 and ord(s[0]) == 63
+        s = slice(s, 1, len(s))
+    if len(s) == 0
+        return result
+    let pairs = split(s, "&")
+    let i = 0
+    while i < len(pairs)
+        let pair = pairs[i]
+        if len(pair) > 0
+            let eq = find(pair, "=")
+            if eq < 0
+                result[pair] = ""
+            else
+                let k = slice(pair, 0, eq)
+                let v = slice(pair, eq + 1, len(pair))
+                result[k] = v
+        i = i + 1
+    result
+
+// ── URL joining ─────────────────────────────────────────────────────────────
+
+// url_join("http://h.com/api/", "/v1/users") -> "http://h.com/api/v1/users"
+// Joins a base URL and a path with exactly one slash between them, regardless
+// of whether the base has a trailing slash or the path a leading one. An
+// absolute path (one starting with '/') is treated as relative-to-base here
+// for predictable concatenation of path segments (this helper is about
+// segment joining, not RFC 3986 resolution). Empty path returns base as-is.
+fn url_join(base: string, path: string) -> string
+    if len(path) == 0
+        return base
+    if len(base) == 0
+        return path
+    let b = base
+    // Strip a single trailing slash from base.
+    if ord(b[len(b) - 1]) == 47
+        b = slice(b, 0, len(b) - 1)
+    let p = path
+    // Strip a single leading slash from path.
+    if ord(p[0]) == 47
+        p = slice(p, 1, len(p))
+    b + "/" + p
+
+// ── IPv4 <-> integer ────────────────────────────────────────────────────────
+
+// ip_to_int("1.2.3.4") -> 16909060
+// Packs the four octets big-endian into a single integer. Returns -1 if the
+// address does not have exactly four numeric octets each in 0..255.
+fn ip_to_int(ip: string) -> int
+    let parts = split(ip, ".")
+    if len(parts) != 4
+        return -1
+    let acc = 0
+    let i = 0
+    while i < 4
+        let octet = _parse_uint(parts[i])
+        if octet < 0 or octet > 255
+            return -1
+        acc = (acc << 8) | octet
+        i = i + 1
+    acc
+
+// int_to_ip(16909060) -> "1.2.3.4"
+// Inverse of ip_to_int. Masks out each of the four bytes, most significant
+// first, and joins them with dots.
+fn int_to_ip(value: int) -> string
+    let b0 = (value >> 24) & 255
+    let b1 = (value >> 16) & 255
+    let b2 = (value >> 8) & 255
+    let b3 = value & 255
+    str(b0) + "." + str(b1) + "." + str(b2) + "." + str(b3)
+
+// ── socket convenience wrappers (forward to runtime builtins) ────────────────
+// These require a live peer so they are not exercised by the unit tests, but
+// they ship as the intended high-level entry points over the raw builtins.
+
+// Send a single line terminated by CRLF over an open TCP fd.
+fn tcp_send_line(fd, line)
+    tcp_send(fd, line + "\r\n")
+
+// Perform a blocking HTTP/1.1 GET over a fresh TCP connection and return the
+// raw response text. Connects, sends a well-formed request, reads one chunk,
+// closes. (Single-recv; sufficient for small responses / Connection: close.)
+fn http_get(host, port, path)
+    let fd = tcp_connect(host, port)
+    let req = build_http_request("GET", path, host)
+    tcp_send(fd, req)
+    let resp = tcp_recv(fd)
+    tcp_close(fd)
+    resp
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+fn main()
+    // parse_host_port — basic
+    let hp = parse_host_port("localhost:8080")
+    assert_eq(hp[0], "localhost")
+    assert_eq(hp[1], 8080)
+
+    // parse_host_port — IP host
+    let hp2 = parse_host_port("127.0.0.1:443")
+    assert_eq(hp2[0], "127.0.0.1")
+    assert_eq(hp2[1], 443)
+
+    // parse_host_port — whitespace tolerant
+    let hp3 = parse_host_port("  example.com:80  ")
+    assert_eq(hp3[0], "example.com")
+    assert_eq(hp3[1], 80)
+
+    // parse_host_port — no port -> sentinel -1
+    let hp4 = parse_host_port("nohost")
+    assert_eq(hp4[0], "nohost")
+    assert_eq(hp4[1], -1)
+
+    // parse_host_port — non-numeric port -> sentinel -1
+    let hp5 = parse_host_port("host:abc")
+    assert_eq(hp5[0], "host")
+    assert_eq(hp5[1], -1)
+
+    // parse_host_port — out-of-range port -> sentinel -1
+    let hp6 = parse_host_port("host:70000")
+    assert_eq(hp6[1], -1)
+
+    // build_http_request — exact wire bytes
+    let req = build_http_request("GET", "/index.html", "example.com")
+    let expected = "GET /index.html HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    assert_eq(req, expected)
+
+    // build_http_request — defaults + path normalization
+    let req2 = build_http_request("", "api/v1", "h.io")
+    assert_eq(req2, "GET /api/v1 HTTP/1.1\r\nHost: h.io\r\nConnection: close\r\n\r\n")
+
+    // build_http_request — POST keeps method and absolute path
+    let req3 = build_http_request("POST", "/submit", "srv")
+    assert_eq(req3, "POST /submit HTTP/1.1\r\nHost: srv\r\nConnection: close\r\n\r\n")
+
+    // parse_http_status_line — standard 200
+    let st = parse_http_status_line("HTTP/1.1 200 OK")
+    assert_eq(st[0], "HTTP/1.1")
+    assert_eq(st[1], 200)
+    assert_eq(st[2], "OK")
+
+    // parse_http_status_line — multi-word reason
+    let st2 = parse_http_status_line("HTTP/1.0 404 Not Found")
+    assert_eq(st2[0], "HTTP/1.0")
+    assert_eq(st2[1], 404)
+    assert_eq(st2[2], "Not Found")
+
+    // parse_http_status_line — trailing CRLF stripped, no reason
+    let st3 = parse_http_status_line("HTTP/1.1 204\r\n")
+    assert_eq(st3[0], "HTTP/1.1")
+    assert_eq(st3[1], 204)
+    assert_eq(st3[2], "")
+
+    // parse_query_string — basic two pairs
+    let q = parse_query_string("a=1&b=2")
+    assert_eq(q["a"], "1")
+    assert_eq(q["b"], "2")
+    assert_eq(len(keys(q)), 2)
+
+    // parse_query_string — leading '?' and bare key
+    let q2 = parse_query_string("?name=nova&debug&x=10")
+    assert_eq(q2["name"], "nova")
+    assert_eq(q2["debug"], "")
+    assert_eq(q2["x"], "10")
+
+    // parse_query_string — empty -> empty dict
+    let q3 = parse_query_string("")
+    assert_eq(len(keys(q3)), 0)
+
+    // parse_query_string — value containing '=' kept whole
+    let q4 = parse_query_string("token=a=b=c")
+    assert_eq(q4["token"], "a=b=c")
+
+    // url_join — both have slashes
+    assert_eq(url_join("http://h.com/api/", "/v1/users"), "http://h.com/api/v1/users")
+    // url_join — neither has slash
+    assert_eq(url_join("http://h.com/api", "v1/users"), "http://h.com/api/v1/users")
+    // url_join — base trailing only
+    assert_eq(url_join("http://h.com/", "users"), "http://h.com/users")
+    // url_join — path leading only
+    assert_eq(url_join("http://h.com", "/users"), "http://h.com/users")
+    // url_join — empty path returns base
+    assert_eq(url_join("http://h.com/api", ""), "http://h.com/api")
+
+    // ip_to_int / int_to_ip — known value
+    assert_eq(ip_to_int("1.2.3.4"), 16909060)
+    assert_eq(int_to_ip(16909060), "1.2.3.4")
+
+    // ip_to_int — boundary octets
+    assert_eq(ip_to_int("0.0.0.0"), 0)
+    assert_eq(int_to_ip(0), "0.0.0.0")
+    assert_eq(int_to_ip(4294967295), "255.255.255.255")
+
+    // ip_to_int — malformed -> -1
+    assert_eq(ip_to_int("1.2.3"), -1)
+    assert_eq(ip_to_int("1.2.3.256"), -1)
+    assert_eq(ip_to_int("a.b.c.d"), -1)
+
+    // ip round-trip over several addresses
+    let samples = ["8.8.8.8", "192.168.1.1", "10.0.0.255", "172.16.254.1", "127.0.0.1"]
+    let i = 0
+    while i < len(samples)
+        let original = samples[i]
+        let packed = ip_to_int(original)
+        let unpacked = int_to_ip(packed)
+        assert_eq(unpacked, original)
+        i = i + 1
+
+    print("netutil ok")

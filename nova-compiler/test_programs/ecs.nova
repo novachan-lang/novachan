@@ -1,0 +1,223 @@
+// ============================================================================
+// NOVA Standard Library — ecs module (Entity-Component-System registry)
+// ============================================================================
+// A small, dict-backed ECS world for games. No del() in gen3, so destroyed
+// entities are tracked via an "alive" dict; component reads/queries always
+// gate on liveness. Component storage is a single dict keyed by a composed
+// string "comp_name#eid". Component names seen so far are tracked so queries
+// don't have to parse keys.
+//
+// World layout (wrapper list):
+//   world[0] = components dict   key = comp_name + "#" + str(eid) -> value
+//   world[1] = next entity id    monotonically increasing int counter
+//   world[2] = alive dict        key = str(eid) -> true for living entities
+//   world[3] = alive count       int (number of living entities)
+//
+// Public API:
+//   world_new()                         -> world
+//   entity_create(world)                -> int   (fresh, monotonic eid)
+//   entity_destroy(world, eid)          -> bool  (true if it was alive)
+//   entity_alive(world, eid)            -> bool
+//   component_set(world, eid, name, v)  -> bool  (false if eid not alive)
+//   component_get(world, eid, name)             (value or null)
+//   component_has(world, eid, name)     -> bool
+//   entities_with(world, name)          -> list  (eids that have component)
+//   entity_count(world)                 -> int
+
+// ── internal helpers ───────────────────────────────────────────────────────
+
+fn _ecs_key(name: string, eid: int) -> string
+    name + "#" + str(eid)
+
+// ── world ───────────────────────────────────────────────────────────────────
+
+fn world_new() -> list
+    let components = {}
+    let alive = {}
+    [components, 1, alive, 0]
+
+// ── entities ─────────────────────────────────────────────────────────────────
+
+fn entity_create(world) -> int
+    let eid = world[1]
+    world[1] = eid + 1
+    let alive = world[2]
+    alive[str(eid)] = true
+    world[3] = world[3] + 1
+    eid
+
+fn entity_alive(world, eid) -> bool
+    let alive = world[2]
+    let k = str(eid)
+    if contains(alive, k)
+        return alive[k]
+    false
+
+fn entity_destroy(world, eid) -> bool
+    let alive = world[2]
+    let k = str(eid)
+    if contains(alive, k) == false
+        return false
+    if alive[k] == false
+        return false
+    // Mark dead. Component values stay in the dict (no del) but every
+    // reader gates on liveness, so they are logically gone and cannot be
+    // observed. A future eid never collides because ids are monotonic.
+    alive[k] = false
+    world[3] = world[3] - 1
+    true
+
+fn entity_count(world) -> int
+    world[3]
+
+// ── components ───────────────────────────────────────────────────────────────
+
+fn component_set(world, eid, comp_name, value) -> bool
+    if entity_alive(world, eid) == false
+        return false
+    let components = world[0]
+    components[_ecs_key(comp_name, eid)] = value
+    true
+
+fn component_get(world, eid, comp_name)
+    if entity_alive(world, eid) == false
+        return null
+    let components = world[0]
+    let k = _ecs_key(comp_name, eid)
+    if contains(components, k)
+        return components[k]
+    null
+
+fn component_has(world, eid, comp_name) -> bool
+    if entity_alive(world, eid) == false
+        return false
+    let components = world[0]
+    contains(components, _ecs_key(comp_name, eid))
+
+// entities_with iterates living entity ids and reports those carrying the
+// component. Eids are integers in [1, next), so we scan that range and check
+// liveness + component presence. This stays correct after destruction because
+// dead entities fail the liveness gate.
+fn entities_with(world, comp_name) -> list
+    let result = []
+    let next_id = world[1]
+    let eid = 1
+    while eid < next_id
+        if entity_alive(world, eid)
+            if component_has(world, eid, comp_name)
+                push(result, eid)
+        eid = eid + 1
+    result
+
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+fn _list_contains_int(lst, x) -> bool
+    let i = 0
+    while i < len(lst)
+        if lst[i] == x
+            return true
+        i = i + 1
+    false
+
+fn main()
+    let w = world_new()
+    assert_eq(entity_count(w), 0)
+
+    // Create 3 entities — ids must be fresh and monotonically increasing.
+    let e1 = entity_create(w)
+    let e2 = entity_create(w)
+    let e3 = entity_create(w)
+    assert_eq(e1, 1)
+    assert_eq(e2, 2)
+    assert_eq(e3, 3)
+    assert_eq(entity_count(w), 3)
+    assert_eq(entity_alive(w, e1), true)
+    assert_eq(entity_alive(w, e2), true)
+    assert_eq(entity_alive(w, e3), true)
+    assert_eq(entity_alive(w, 99), false)
+
+    // Attach "pos" and "vel" components.
+    // e1: pos + vel ; e2: pos only ; e3: vel only
+    assert_eq(component_set(w, e1, "pos", "0,0"), true)
+    assert_eq(component_set(w, e1, "vel", "1,1"), true)
+    assert_eq(component_set(w, e2, "pos", "5,5"), true)
+    assert_eq(component_set(w, e3, "vel", "2,2"), true)
+
+    // component_get / component_has
+    assert_eq(component_get(w, e1, "pos"), "0,0")
+    assert_eq(component_get(w, e1, "vel"), "1,1")
+    assert_eq(component_get(w, e2, "pos"), "5,5")
+    assert_eq(component_has(w, e1, "pos"), true)
+    assert_eq(component_has(w, e1, "vel"), true)
+    assert_eq(component_has(w, e2, "vel"), false)
+    assert_eq(component_has(w, e3, "pos"), false)
+
+    // Missing component returns null.
+    assert_eq(component_get(w, e2, "vel"), null)
+    assert_eq(component_get(w, e3, "pos"), null)
+    // Unknown entity returns null / false.
+    assert_eq(component_get(w, 99, "pos"), null)
+    assert_eq(component_has(w, 99, "pos"), false)
+
+    // Numeric and structured component values, not just strings.
+    assert_eq(component_set(w, e2, "hp", 100), true)
+    assert_eq(component_get(w, e2, "hp"), 100)
+    assert_eq(component_set(w, e3, "tags", [1, 2, 3]), true)
+    let tags = component_get(w, e3, "tags")
+    assert_eq(len(tags), 3)
+    assert_eq(tags[2], 3)
+
+    // entities_with("pos") -> e1, e2 (order = ascending eid)
+    let with_pos = entities_with(w, "pos")
+    assert_eq(len(with_pos), 2)
+    assert_eq(_list_contains_int(with_pos, e1), true)
+    assert_eq(_list_contains_int(with_pos, e2), true)
+    assert_eq(_list_contains_int(with_pos, e3), false)
+
+    // entities_with("vel") -> e1, e3
+    let with_vel = entities_with(w, "vel")
+    assert_eq(len(with_vel), 2)
+    assert_eq(_list_contains_int(with_vel, e1), true)
+    assert_eq(_list_contains_int(with_vel, e3), true)
+
+    // entities_with for an unknown component -> empty
+    let with_none = entities_with(w, "nope")
+    assert_eq(len(with_none), 0)
+
+    // Destroy e2. Counts drop; e2 disappears from queries and reads.
+    assert_eq(entity_destroy(w, e2), true)
+    assert_eq(entity_count(w), 2)
+    assert_eq(entity_alive(w, e2), false)
+    assert_eq(component_get(w, e2, "pos"), null)
+    assert_eq(component_has(w, e2, "pos"), false)
+
+    let with_pos_after = entities_with(w, "pos")
+    assert_eq(len(with_pos_after), 1)
+    assert_eq(_list_contains_int(with_pos_after, e1), true)
+    assert_eq(_list_contains_int(with_pos_after, e2), false)
+
+    // Destroying again is a no-op (returns false, count unchanged).
+    assert_eq(entity_destroy(w, e2), false)
+    assert_eq(entity_count(w), 2)
+    // Destroying an entity that never existed is also false.
+    assert_eq(entity_destroy(w, 99), false)
+
+    // Setting a component on a dead entity fails.
+    assert_eq(component_set(w, e2, "pos", "9,9"), false)
+    assert_eq(component_get(w, e2, "pos"), null)
+
+    // New entity after destruction gets a fresh, never-reused id (monotonic).
+    let e4 = entity_create(w)
+    assert_eq(e4, 4)
+    assert_eq(entity_count(w), 3)
+    assert_eq(component_set(w, e4, "pos", "7,7"), true)
+    let with_pos_final = entities_with(w, "pos")
+    assert_eq(len(with_pos_final), 2)
+    assert_eq(_list_contains_int(with_pos_final, e1), true)
+    assert_eq(_list_contains_int(with_pos_final, e4), true)
+    assert_eq(_list_contains_int(with_pos_final, e2), false)
+
+    print("ecs ok")

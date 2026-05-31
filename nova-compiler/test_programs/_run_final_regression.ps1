@@ -59,7 +59,19 @@ $new_tests = @(
     'phase14_stabilize_test'
 )
 
-$all_tests = $core_tests + $track7_tests + $new_tests
+# Phase 9 + domain stdlib modules (sorted_map, regex, crc32, math3d, ecs, etc.)
+$domain_tests = @(
+    'sorted_map_test',
+    'regex_full_test',
+    'crc32_test',
+    'math3d',
+    'ecs',
+    'crypto_util',
+    'netutil',
+    'compress_rle'
+)
+
+$all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests
 $pass = 0; $fail = 0; $skip = 0; $failures = @()
 
 Write-Host "=== NOVA Full Regression Suite (gen3_test = gen11_phase13) ==="
