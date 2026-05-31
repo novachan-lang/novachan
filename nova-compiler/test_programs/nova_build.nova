@@ -1,0 +1,347 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// NOVA Build System — `nova build`
+// Reads nova.toml project manifest, resolves dependencies, compiles, links.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn path_basename(path: string) -> string
+    let last_sep = -1
+    let i = 0
+    while i < len(path)
+        if path[i] == "/" or path[i] == "\\"
+            last_sep = i
+        i = i + 1
+    if last_sep >= 0
+        return slice(path, last_sep + 1, len(path))
+    path
+
+fn path_stem(filename: string) -> string
+    let dot = -1
+    let i = len(filename) - 1
+    while i >= 0
+        if filename[i] == "."
+            dot = i
+            break
+        i = i - 1
+    if dot > 0
+        return slice(filename, 0, dot)
+    filename
+
+fn path_join(a: string, b: string) -> string
+    if len(a) == 0
+        return b
+    if a == "."
+        return b
+    if ends_with(a, "/") or ends_with(a, "\\")
+        return a + b
+    a + "/" + b
+
+// ── TOML-subset parser ────────────────────────────────────────────────────────
+
+fn toml_parse(text: string) -> dict
+    let result = {}
+    let current_section = ""
+    let lines = split(text, "\n")
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        if len(line) == 0 or starts_with(line, "#")
+            i = i + 1
+            continue
+        if starts_with(line, "[")
+            let end_bracket = find(line, "]")
+            if end_bracket > 0
+                current_section = slice(line, 1, end_bracket)
+                if not contains(result, current_section)
+                    result[current_section] = {}
+            i = i + 1
+            continue
+        let eq = find(line, "=")
+        if eq > 0
+            let key = trim(slice(line, 0, eq))
+            let val = trim(slice(line, eq + 1, len(line)))
+            if starts_with(val, "\"") and ends_with(val, "\"")
+                val = slice(val, 1, len(val) - 1)
+            if current_section != ""
+                let sec = result[current_section]
+                sec[key] = val
+                result[current_section] = sec
+            else
+                result[key] = val
+        i = i + 1
+    result
+
+// ── Project model ─────────────────────────────────────────────────────────────
+
+fn load_manifest(dir: string) -> dict
+    let path = path_join(dir, "nova.toml")
+    if not file_exists(path)
+        print("error: no nova.toml found in " + dir)
+        exit(1)
+    let text = read_file(path)
+    let manifest = toml_parse(text)
+    if not contains(manifest, "package")
+        print("error: nova.toml missing [package] section")
+        exit(1)
+    manifest
+
+fn get_field(manifest: dict, section: string, key: string, default_val: string) -> string
+    if not contains(manifest, section)
+        return default_val
+    let sec = manifest[section]
+    if contains(sec, key)
+        return sec[key]
+    default_val
+
+// ── File discovery ────────────────────────────────────────────────────────────
+
+fn discover_nova_files(dir: string) -> list
+    let all_files = list_dir(dir)
+    let nova_files = []
+    for f in all_files
+        if ends_with(f, ".nova")
+            push(nova_files, path_join(dir, f))
+    nova_files
+
+// ── Compilation ───────────────────────────────────────────────────────────────
+
+fn compile_nova(compiler_path: string, nova_path: string, work_dir: string) -> int
+    let cmd = "cd /d \"" + work_dir + "\" && \"" + compiler_path + "\" \"" + path_basename(nova_path) + "\""
+    system(cmd)
+
+fn link_binary(ll_path: string, runtime_path: string, output: string, target: string, opt_level: string, extra_flags: string) -> int
+    let cmd = "clang " + opt_level + " -o \"" + output + "\" \"" + ll_path + "\" \"" + runtime_path + "\""
+    if target != ""
+        cmd = cmd + " --target=" + target
+    cmd = cmd + " " + extra_flags + " -D_CRT_SECURE_NO_WARNINGS -w"
+    system(cmd)
+
+// ── Build command ─────────────────────────────────────────────────────────────
+
+fn cmd_build(build_args: list)
+    let dir = "."
+    if len(build_args) > 0
+        dir = build_args[0]
+    let manifest = load_manifest(dir)
+    let name = get_field(manifest, "package", "name", "unnamed")
+    let version = get_field(manifest, "package", "version", "0.1.0")
+    let src_dir_name = get_field(manifest, "package", "src", "src")
+    let entry = get_field(manifest, "package", "entry", "main.nova")
+    let target = get_field(manifest, "build", "target", "")
+    let opt = get_field(manifest, "build", "opt", "2")
+    let link_flags = get_field(manifest, "build", "link_flags", "-lws2_32 -lbcrypt -ladvapi32")
+    print("Building " + name + " v" + version + "...")
+    let src_dir = path_join(dir, src_dir_name)
+    let entry_path = path_join(src_dir, entry)
+    if not file_exists(entry_path)
+        print("error: entry point not found: " + entry_path)
+        exit(1)
+    let out_dir = path_join(dir, "build")
+    if not file_exists(out_dir)
+        system("mkdir \"" + out_dir + "\"")
+    let base = cwd()
+    let compiler = base + "/gen3_test.exe"
+    if not file_exists(compiler)
+        compiler = base + "/" + dir + "/gen3_test.exe"
+    if not file_exists(compiler)
+        compiler = "gen3_test.exe"
+    let compile_result = compile_nova(compiler, entry_path, src_dir)
+    if compile_result != 0
+        print("Compilation failed.")
+        exit(1)
+    let stem = path_stem(entry)
+    let ll_path = path_join(src_dir, stem + ".ll")
+    if not file_exists(ll_path)
+        print("error: compiler did not produce " + ll_path)
+        exit(1)
+    let output = path_join(out_dir, name + ".exe")
+    let runtime = path_join(dir, "output/nova_runtime.c")
+    if not file_exists(runtime)
+        runtime = "output/nova_runtime.c"
+    let link_result = link_binary(ll_path, runtime, output, target, "-O" + opt, link_flags)
+    if link_result != 0
+        print("Linking failed.")
+        exit(1)
+    print("Built: " + output + " (" + name + " v" + version + ")")
+
+// ── Init command ──────────────────────────────────────────────────────────────
+
+fn cmd_init(init_args: list)
+    let name = "my_project"
+    if len(init_args) > 0
+        name = init_args[0]
+    let toml_content = "[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\nentry = \"main.nova\"\n\n[dependencies]\n"
+    write_file("nova.toml", toml_content)
+    system("mkdir src")
+    write_file("src/main.nova", "fn main()\n    print(\"Hello from " + name + "!\")\n")
+    print("Initialized project: " + name)
+    print("  nova.toml")
+    print("  src/main.nova")
+
+// ── Fmt command ───────────────────────────────────────────────────────────────
+
+fn count_leading_spaces(line: string) -> int
+    let spaces = 0
+    let i = 0
+    while i < len(line)
+        if line[i] == " "
+            spaces = spaces + 1
+        else if line[i] == "\t"
+            spaces = spaces + 4
+        else
+            break
+        i = i + 1
+    spaces
+
+fn nova_format(text: string) -> string
+    let lines = split(text, "\n")
+    let result = []
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        let trimmed = trim(line)
+        if len(trimmed) == 0
+            push(result, "")
+        else
+            let indent = count_leading_spaces(line) / 4
+            let normalized = repeat(" ", indent * 4) + trimmed
+            push(result, normalized)
+        i = i + 1
+    join(result, "\n")
+
+fn cmd_fmt(fmt_args: list)
+    let files = fmt_args
+    if len(files) == 0
+        files = discover_nova_files(".")
+    let changed = 0
+    for f in files
+        if not file_exists(f)
+            print("warning: file not found: " + f)
+            continue
+        let text = read_file(f)
+        let formatted = nova_format(text)
+        if formatted != text
+            write_file(f, formatted)
+            print("formatted: " + f)
+            changed = changed + 1
+    if changed == 0
+        print("All files already formatted.")
+    else
+        print(str(changed) + " file(s) formatted.")
+
+// ── Run command ───────────────────────────────────────────────────────────────
+
+fn cmd_run(run_args: list)
+    cmd_build(run_args)
+    let dir = "."
+    if len(run_args) > 0
+        dir = run_args[0]
+    let manifest = load_manifest(dir)
+    let name = get_field(manifest, "package", "name", "unnamed")
+    let exe = path_join(dir, "build/" + name + ".exe")
+    if not file_exists(exe)
+        print("error: binary not found: " + exe)
+        exit(1)
+    print("--- Running " + name + " ---")
+    system("\"" + exe + "\"")
+
+// ── Clean command ─────────────────────────────────────────────────────────────
+
+fn cmd_clean(clean_args: list)
+    let dir = "."
+    if len(clean_args) > 0
+        dir = clean_args[0]
+    let build_dir = path_join(dir, "build")
+    if file_exists(build_dir)
+        system("rmdir /s /q \"" + build_dir + "\"")
+        print("Cleaned build directory.")
+    else
+        print("Nothing to clean.")
+
+// ── Test command ──────────────────────────────────────────────────────────────
+
+fn cmd_test(test_args: list)
+    let dir = "."
+    if len(test_args) > 0
+        dir = test_args[0]
+    let test_dir = path_join(dir, "tests")
+    if not file_exists(test_dir)
+        print("No tests/ directory found.")
+        return 0
+    let files = discover_nova_files(test_dir)
+    let pass_count = 0
+    let fail_count = 0
+    for f in files
+        let bname = path_basename(f)
+        let stem = path_stem(bname)
+        print("Testing " + stem + "...")
+        let cr = compile_nova("gen3_test.exe", f, test_dir)
+        if cr != 0
+            fail_count = fail_count + 1
+            print("  FAIL (compile): " + stem)
+            continue
+        let ll = path_join(test_dir, stem + ".ll")
+        let exe = path_join(dir, "build/" + stem + ".exe")
+        let runtime = path_join(dir, "output/nova_runtime.c")
+        link_binary(ll, runtime, exe, "", "-O0", "-lws2_32 -lbcrypt -ladvapi32")
+        let result = system("\"" + exe + "\"")
+        if result == 0
+            pass_count = pass_count + 1
+            print("  PASS " + stem)
+        else
+            fail_count = fail_count + 1
+            print("  FAIL (run): " + stem)
+    print(str(pass_count) + " passed, " + str(fail_count) + " failed.")
+    if fail_count > 0
+        exit(1)
+    0
+
+// ── Version info ──────────────────────────────────────────────────────────────
+
+fn cmd_version()
+    print("nova-build 0.1.0")
+    print("NOVA Build System")
+
+// ── Main entry point ──────────────────────────────────────────────────────────
+
+fn main()
+    let argv = args()
+    if len(argv) < 2
+        print("nova-build: NOVA project build tool")
+        print("")
+        print("Commands:")
+        print("  init [name]     Create a new NOVA project")
+        print("  build [dir]     Build the project")
+        print("  run [dir]       Build and run")
+        print("  test [dir]      Run tests")
+        print("  fmt [files...]  Format source files")
+        print("  clean [dir]     Remove build artifacts")
+        print("  version         Show version")
+        print("")
+        print("Usage: nova-build <command> [args...]")
+        exit(0)
+    let cmd = argv[1]
+    let rest = []
+    let ri = 2
+    while ri < len(argv)
+        push(rest, argv[ri])
+        ri = ri + 1
+    if cmd == "init"
+        cmd_init(rest)
+    else if cmd == "build"
+        cmd_build(rest)
+    else if cmd == "run"
+        cmd_run(rest)
+    else if cmd == "test"
+        cmd_test(rest)
+    else if cmd == "fmt"
+        cmd_fmt(rest)
+    else if cmd == "clean"
+        cmd_clean(rest)
+    else if cmd == "version"
+        cmd_version()
+    else
+        print("Unknown command: " + cmd)
+        print("Run 'nova-build' without arguments for help.")
+        exit(1)
