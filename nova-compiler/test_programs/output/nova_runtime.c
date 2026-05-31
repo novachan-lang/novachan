@@ -4712,6 +4712,86 @@ int64_t nova_rt_regex_split(int64_t text_ptr, int64_t pattern_ptr) {
     return list;
 }
 
+/* regex_find_all(text, pattern) — returns list of all non-overlapping matches */
+int64_t nova_rt_regex_find_all(int64_t text_ptr, int64_t pattern_ptr) {
+    const char* text = (const char*)(uintptr_t)text_ptr;
+    const char* pattern = (const char*)(uintptr_t)pattern_ptr;
+    int64_t list = nova_rt_list_create();
+    if (!text || !pattern) return list;
+
+    ReProg prog;
+    memset(&prog, 0, sizeof(prog));
+    if (re_compile(pattern, &prog) != 0) {
+        nova_set_error("regex: invalid pattern");
+        re_free(&prog);
+        return list;
+    }
+
+    const char* cur = text;
+    while (*cur) {
+        const char* saves[2] = {NULL, NULL};
+        int found = re_exec(&prog, cur, saves, 2);
+        if (!found || !saves[0] || !saves[1] || saves[0] == saves[1]) break;
+        size_t mlen = saves[1] - saves[0];
+        char* match = (char*)nova_heap_alloc(mlen + 1, NOVA_MEM_RAW);
+        if (match) { memcpy(match, saves[0], mlen); match[mlen] = 0; }
+        else { match = (char*)""; }
+        nova_rt_list_append(list, (int64_t)(uintptr_t)match);
+        cur = saves[1];
+    }
+    re_free(&prog);
+    return list;
+}
+
+/* regex_replace_all(text, pattern, replacement) — replaces ALL matches */
+int64_t nova_rt_regex_replace_all(int64_t text_ptr, int64_t pattern_ptr, int64_t repl_ptr) {
+    const char* text = (const char*)(uintptr_t)text_ptr;
+    const char* pattern = (const char*)(uintptr_t)pattern_ptr;
+    const char* repl = (const char*)(uintptr_t)repl_ptr;
+    if (!text || !pattern || !repl) return text_ptr;
+
+    ReProg prog;
+    memset(&prog, 0, sizeof(prog));
+    if (re_compile(pattern, &prog) != 0) {
+        nova_set_error("regex: invalid pattern");
+        re_free(&prog);
+        return text_ptr;
+    }
+
+    size_t repl_len = strlen(repl);
+    size_t buf_cap = strlen(text) * 2 + 256;
+    char* buf = (char*)malloc(buf_cap);
+    if (!buf) { re_free(&prog); return text_ptr; }
+    size_t buf_len = 0;
+
+    const char* cur = text;
+    while (*cur) {
+        const char* saves[2] = {NULL, NULL};
+        int found = re_exec(&prog, cur, saves, 2);
+        if (!found || !saves[0] || !saves[1] || saves[0] == saves[1]) {
+            size_t rest = strlen(cur);
+            if (buf_len + rest >= buf_cap) { buf_cap = buf_len + rest + 64; buf = (char*)realloc(buf, buf_cap); }
+            memcpy(buf + buf_len, cur, rest);
+            buf_len += rest;
+            break;
+        }
+        size_t prefix = saves[0] - cur;
+        if (buf_len + prefix + repl_len >= buf_cap) { buf_cap = (buf_len + prefix + repl_len) * 2 + 64; buf = (char*)realloc(buf, buf_cap); }
+        memcpy(buf + buf_len, cur, prefix);
+        buf_len += prefix;
+        memcpy(buf + buf_len, repl, repl_len);
+        buf_len += repl_len;
+        cur = saves[1];
+    }
+    re_free(&prog);
+    buf[buf_len] = 0;
+    char* result = (char*)nova_heap_alloc(buf_len + 1, NOVA_MEM_RAW);
+    if (result) { memcpy(result, buf, buf_len + 1); }
+    else { result = (char*)""; }
+    free(buf);
+    return (int64_t)(uintptr_t)result;
+}
+
 /* ── TCP/UDP Sockets (cross-platform) ──────────────────────────────────────── */
 
 #ifdef _WIN32
