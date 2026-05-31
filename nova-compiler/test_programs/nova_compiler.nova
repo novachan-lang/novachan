@@ -4501,6 +4501,32 @@ fn type_name_hash(name: string) -> int
         i = i + 1
     h
 
+// Format an int64 as a decimal string using ONLY integer arithmetic. The generic
+// str() builtin falls back to nova_rt_any_to_str for values the IR optimizer
+// can't statically pin to `int`; that fallback guesses int-vs-float from the bit
+// pattern and wrongly prints large integers — e.g. DJB2 type-name hashes or raw
+// float bit patterns — as doubles, which is invalid as an LLVM i64 literal and
+// breaks the emitted module. Integer constants we emit into LLVM MUST go through
+// this helper, never str(). Digit extraction works directly on a negative value
+// (only the single digit is negated) so INT_MIN is handled without overflow.
+fn fmt_i64_decimal(n: int) -> string
+    if n == 0
+        return "0"
+    let neg = false
+    let v = n
+    if v < 0
+        neg = true
+    let digits = ""
+    while v != 0
+        let d = v % 10
+        if d < 0
+            d = 0 - d
+        digits = chr(48 + d) + digits
+        v = v / 10
+    if neg
+        return "-" + digits
+    digits
+
 // ── IR Builder ───────────────────────────────────────────────────────────────
 
 type IrBuilder
@@ -5533,10 +5559,15 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 ir_emit_inst(b, "slot_store", "", ir_type_void(), [zero_r], idx_slot, 0)
                 let hdr_label = ir_fresh_label(b, "for_hdr")
                 let body_label = ir_fresh_label(b, "for_body")
+                let inc_label = ir_fresh_label(b, "for_inc")
                 let exit_label = ir_fresh_label(b, "for_exit")
                 let save_hdr = b.ir_loop_hdr
                 let save_exit = b.ir_loop_exit
-                b.ir_loop_hdr = hdr_label
+                // `continue` must jump to the increment block (inc_label), NOT the
+                // condition header — otherwise the index is never advanced and the
+                // loop spins forever. (while-loops set ir_loop_hdr to the condition
+                // because they have no separate increment step.)
+                b.ir_loop_hdr = inc_label
                 b.ir_loop_exit = exit_label
                 ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], hdr_label, 0, "pure", b.ir_cur_line))
                 ir_start_block(b, hdr_label)
@@ -5552,14 +5583,19 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 for s in body
                     ir_lower_stmt(b, s)
                 if b.ir_clabel != ""
-                    let next_idx = ir_fresh_reg(b)
-                    ir_emit_inst(b, "slot_load", next_idx, ir_type_int(), [], idx_slot, 0)
-                    let inc_r = ir_fresh_reg(b)
-                    ir_emit_inst(b, "const_int", inc_r, ir_type_int(), [], "1", 1)
-                    let new_idx = ir_fresh_reg(b)
-                    ir_emit_inst(b, "add", new_idx, ir_type_int(), [next_idx, inc_r], "+", 0)
-                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [new_idx], idx_slot, 0)
-                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], hdr_label, 0, "pure", b.ir_cur_line))
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], inc_label, 0, "pure", b.ir_cur_line))
+                // Increment block — also the target of `continue`. Always emitted so
+                // a `continue` inside the body has a valid landing pad even when the
+                // body's fall-through path is closed (e.g. ends in return).
+                ir_start_block(b, inc_label)
+                let next_idx = ir_fresh_reg(b)
+                ir_emit_inst(b, "slot_load", next_idx, ir_type_int(), [], idx_slot, 0)
+                let inc_r = ir_fresh_reg(b)
+                ir_emit_inst(b, "const_int", inc_r, ir_type_int(), [], "1", 1)
+                let new_idx = ir_fresh_reg(b)
+                ir_emit_inst(b, "add", new_idx, ir_type_int(), [next_idx, inc_r], "+", 0)
+                ir_emit_inst(b, "slot_store", "", ir_type_void(), [new_idx], idx_slot, 0)
+                ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], hdr_label, 0, "pure", b.ir_cur_line))
                 ir_start_block(b, exit_label)
                 b.ir_loop_hdr = save_hdr
                 b.ir_loop_exit = save_exit
@@ -9559,9 +9595,9 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 e.ire_cov_last_line = line
                 e.ire_cov_lines[str(line)] = 1
             if op == "const_int"
-                ire_indent(e, dest + " = add i64 " + str(num) + ", 0")
+                ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
             else if op == "const_float"
-                ire_indent(e, dest + " = add i64 " + str(num) + ", 0")
+                ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
             else if op == "const_str"
                 let str_name = ire_intern_string(e, value)
                 let byte_len = len(value) + 1
@@ -10055,7 +10091,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     let hash_val = type_name_hash(value)
                     let hash_gep = dest + ".thash"
                     ire_indent(e, hash_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 0")
-                    ire_indent(e, "store i64 " + str(hash_val) + ", ptr " + hash_gep + ", align 8")
+                    ire_indent(e, "store i64 " + fmt_i64_decimal(hash_val) + ", ptr " + hash_gep + ", align 8")
                 let fi = 0
                 while fi < len(args)
                     let gep = dest + ".f" + str(fi)

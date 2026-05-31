@@ -27,7 +27,7 @@ $core_tests = @(
     'default_params_test','tuple_test','method_test',
     'math_quick_test','else_sibling_test',
     'mini_struct_test','mini2_test',
-    'stdlib_test','mixed_arith_test',
+    'stdlib_test','mixed_arith_test','for_continue_test',
     'shadow_test','json_float_test','nested_float_test','dict_float_test','bool_json_test','nested_bool_test',
     'tensor_churn_test','tensor_boxed_float_test','ai_classify_test','json_decode_float_test',
     'read_bytes_test','float_list_ops_test','udp_test','supervisor_test',

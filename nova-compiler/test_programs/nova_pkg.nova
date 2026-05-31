@@ -1,0 +1,502 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// NOVA Package Manager — `nova get`, `nova publish`, `nova update`
+// Local registry, semver resolution, lockfile management.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Semver ───────────────────────────────────────────────────────────────────
+
+fn semver_parse(s: string) -> dict
+    let result = {"major": 0, "minor": 0, "patch": 0, "pre": "", "valid": 1}
+    let parts = split(s, ".")
+    if len(parts) < 2
+        result["valid"] = 0
+        return result
+    let major_str = parts[0]
+    if starts_with(major_str, "v")
+        major_str = slice(major_str, 1, len(major_str))
+    result["major"] = int(major_str)
+    result["minor"] = int(parts[1])
+    if len(parts) >= 3
+        let patch_str = parts[2]
+        let dash = find(patch_str, "-")
+        if dash >= 0
+            result["patch"] = int(slice(patch_str, 0, dash))
+            result["pre"] = slice(patch_str, dash + 1, len(patch_str))
+        else
+            result["patch"] = int(patch_str)
+    result
+
+fn semver_cmp(a: dict, b: dict) -> int
+    if a["major"] != b["major"]
+        if a["major"] < b["major"]
+            return -1
+        return 1
+    if a["minor"] != b["minor"]
+        if a["minor"] < b["minor"]
+            return -1
+        return 1
+    if a["patch"] != b["patch"]
+        if a["patch"] < b["patch"]
+            return -1
+        return 1
+    let a_pre = a["pre"]
+    let b_pre = b["pre"]
+    if a_pre == "" and b_pre == ""
+        return 0
+    if a_pre != "" and b_pre == ""
+        return -1
+    if a_pre == "" and b_pre != ""
+        return 1
+    if a_pre < b_pre
+        return -1
+    if a_pre > b_pre
+        return 1
+    0
+
+fn semver_to_str(v: dict) -> string
+    let s = str(v["major"]) + "." + str(v["minor"]) + "." + str(v["patch"])
+    if v["pre"] != ""
+        s = s + "-" + v["pre"]
+    s
+
+fn semver_compatible_caret(version: dict, constraint: dict) -> int
+    if version["major"] != constraint["major"]
+        return 0
+    if semver_cmp(version, constraint) < 0
+        return 0
+    1
+
+fn semver_compatible_tilde(version: dict, constraint: dict) -> int
+    if version["major"] != constraint["major"]
+        return 0
+    if version["minor"] != constraint["minor"]
+        return 0
+    if semver_cmp(version, constraint) < 0
+        return 0
+    1
+
+fn semver_satisfies(version: dict, constraint_str: string) -> int
+    if constraint_str == "*"
+        return 1
+    if starts_with(constraint_str, "^")
+        let c = semver_parse(slice(constraint_str, 1, len(constraint_str)))
+        return semver_compatible_caret(version, c)
+    if starts_with(constraint_str, "~")
+        let c = semver_parse(slice(constraint_str, 1, len(constraint_str)))
+        return semver_compatible_tilde(version, c)
+    if starts_with(constraint_str, ">=")
+        let c = semver_parse(slice(constraint_str, 2, len(constraint_str)))
+        return semver_cmp(version, c) >= 0
+    if starts_with(constraint_str, "=")
+        let c = semver_parse(slice(constraint_str, 1, len(constraint_str)))
+        return semver_cmp(version, c) == 0
+    let c = semver_parse(constraint_str)
+    semver_cmp(version, c) == 0
+
+// ── Path helpers ─────────────────────────────────────────────────────────────
+
+fn path_join(a: string, b: string) -> string
+    if len(a) == 0
+        return b
+    if a == "."
+        return b
+    if ends_with(a, "/") or ends_with(a, "\\")
+        return a + b
+    a + "/" + b
+
+fn home_dir() -> string
+    let h = env("USERPROFILE")
+    if len(h) == 0
+        h = env("HOME")
+    h
+
+fn registry_dir() -> string
+    path_join(home_dir(), ".nova/registry")
+
+fn registry_index_dir() -> string
+    path_join(registry_dir(), "index")
+
+fn registry_crates_dir() -> string
+    path_join(registry_dir(), "crates")
+
+// ── TOML-subset parser (reuse from nova_build) ───────────────────────────────
+
+fn toml_parse(text: string) -> dict
+    let result = {}
+    let current_section = ""
+    let lines = split(text, "\n")
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        if len(line) == 0 or starts_with(line, "#")
+            i = i + 1
+            continue
+        if starts_with(line, "[")
+            let end_bracket = find(line, "]")
+            if end_bracket > 0
+                current_section = slice(line, 1, end_bracket)
+                if not contains(result, current_section)
+                    result[current_section] = {}
+            i = i + 1
+            continue
+        let eq = find(line, "=")
+        if eq > 0
+            let key = trim(slice(line, 0, eq))
+            let val = trim(slice(line, eq + 1, len(line)))
+            if starts_with(val, "\"") and ends_with(val, "\"")
+                val = slice(val, 1, len(val) - 1)
+            if current_section != ""
+                let sec = result[current_section]
+                sec[key] = val
+                result[current_section] = sec
+            else
+                result[key] = val
+        i = i + 1
+    result
+
+fn get_field(manifest: dict, section: string, key: string, default_val: string) -> string
+    if not contains(manifest, section)
+        return default_val
+    let sec = manifest[section]
+    if contains(sec, key)
+        return sec[key]
+    default_val
+
+// ── Package metadata ─────────────────────────────────────────────────────────
+
+fn pkg_metadata_path(name: string, version: string) -> string
+    path_join(registry_index_dir(), name + "/" + version + ".json")
+
+fn pkg_tarball_path(name: string, version: string) -> string
+    path_join(registry_crates_dir(), name + "-" + version + ".tar")
+
+fn load_manifest(dir: string) -> dict
+    let path = path_join(dir, "nova.toml")
+    if not file_exists(path)
+        print("error: no nova.toml found in " + dir)
+        exit(1)
+    toml_parse(read_file(path))
+
+// ── Registry operations ──────────────────────────────────────────────────────
+
+fn ensure_registry()
+    mkdir_p(registry_dir())
+    mkdir_p(registry_index_dir())
+    mkdir_p(registry_crates_dir())
+
+fn list_versions(name: string) -> list
+    let idx_dir = path_join(registry_index_dir(), name)
+    let files = list_dir(idx_dir)
+    let versions = []
+    for f in files
+        if ends_with(f, ".json")
+            let ver = slice(f, 0, len(f) - 5)
+            push(versions, ver)
+    versions
+
+fn best_version(name: string, constraint: string) -> string
+    let versions = list_versions(name)
+    let best = ""
+    let best_sv = {}
+    for v in versions
+        let sv = semver_parse(v)
+        if sv["valid"] == 0
+            continue
+        if semver_satisfies(sv, constraint) == 0
+            continue
+        if best == "" or semver_cmp(sv, best_sv) > 0
+            best = v
+            best_sv = sv
+    best
+
+// ── Dependency resolution (greedy nearest-wins) ──────────────────────────────
+
+fn resolve_deps(manifest: dict) -> dict
+    let resolved = {}
+    if not contains(manifest, "dependencies")
+        return resolved
+    let deps = manifest["dependencies"]
+    let dep_names = keys(deps)
+    for name in dep_names
+        let constraint = deps[name]
+        let version = best_version(name, constraint)
+        if version == ""
+            print("error: no version of '" + name + "' satisfies constraint '" + constraint + "'")
+            exit(1)
+        resolved[name] = version
+        let dep_meta_path = pkg_metadata_path(name, version)
+        if file_exists(dep_meta_path)
+            let meta_text = read_file(dep_meta_path)
+            let meta = toml_parse(meta_text)
+            if contains(meta, "dependencies")
+                let transitive = meta["dependencies"]
+                let tnames = keys(transitive)
+                for tn in tnames
+                    if not contains(resolved, tn)
+                        let tv = best_version(tn, transitive[tn])
+                        if tv != ""
+                            resolved[tn] = tv
+    resolved
+
+// ── Lockfile ─────────────────────────────────────────────────────────────────
+
+fn write_lockfile(dir: string, resolved: dict)
+    let content = "# nova.lock - auto-generated, do not edit\n"
+    content = content + "# Generated by nova-pkg\n\n"
+    let names = keys(resolved)
+    for name in names
+        content = content + name + " = \"" + resolved[name] + "\"\n"
+    write_file(path_join(dir, "nova.lock"), content)
+    print("  Written nova.lock")
+
+fn read_lockfile(dir: string) -> dict
+    let path = path_join(dir, "nova.lock")
+    if not file_exists(path)
+        return {}
+    let text = read_file(path)
+    let result = {}
+    let lines = split(text, "\n")
+    for line in lines
+        let trimmed = trim(line)
+        if len(trimmed) == 0 or starts_with(trimmed, "#")
+            continue
+        let eq = find(trimmed, "=")
+        if eq > 0
+            let key = trim(slice(trimmed, 0, eq))
+            let val = trim(slice(trimmed, eq + 1, len(trimmed)))
+            if starts_with(val, "\"") and ends_with(val, "\"")
+                val = slice(val, 1, len(val) - 1)
+            result[key] = val
+    result
+
+// ── Publish command ──────────────────────────────────────────────────────────
+
+fn cmd_publish(args: list)
+    let dir = "."
+    if len(args) > 0
+        dir = args[0]
+    let manifest = load_manifest(dir)
+    let name = get_field(manifest, "package", "name", "")
+    let version = get_field(manifest, "package", "version", "")
+    if name == "" or version == ""
+        print("error: nova.toml must have [package] name and version")
+        exit(1)
+    ensure_registry()
+    let pkg_dir = path_join(registry_index_dir(), name)
+    mkdir_p(pkg_dir)
+    let meta_content = "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\n"
+    if contains(manifest, "dependencies")
+        meta_content = meta_content + "\n[dependencies]\n"
+        let deps = manifest["dependencies"]
+        let dep_names = keys(deps)
+        for dn in dep_names
+            meta_content = meta_content + dn + " = \"" + deps[dn] + "\"\n"
+    write_file(pkg_metadata_path(name, version), meta_content)
+    let src_dir = path_join(dir, get_field(manifest, "package", "src", "src"))
+    let tar_dir = path_join(registry_crates_dir(), name + "-" + version)
+    mkdir_p(tar_dir)
+    let src_files = list_dir(src_dir)
+    for f in src_files
+        if ends_with(f, ".nova")
+            let content = read_file(path_join(src_dir, f))
+            write_file(path_join(tar_dir, f), content)
+    let toml_content = read_file(path_join(dir, "nova.toml"))
+    write_file(path_join(tar_dir, "nova.toml"), toml_content)
+    print("Published " + name + " v" + version + " to local registry")
+
+// ── Install command (nova get) ───────────────────────────────────────────────
+
+fn cmd_get(args: list)
+    if len(args) == 0
+        print("Usage: nova-pkg get <package> [version]")
+        exit(1)
+    let pkg_name = args[0]
+    // Default to "*" (latest available) when no version is requested. A caret
+    // default like "^0.0.0" would reject every real release whose major > 0.
+    let constraint = "*"
+    if len(args) > 1
+        constraint = args[1]
+    else
+        let at = find(pkg_name, "@")
+        if at > 0
+            constraint = "^" + slice(pkg_name, at + 1, len(pkg_name))
+            pkg_name = slice(pkg_name, 0, at)
+    let version = best_version(pkg_name, constraint)
+    if version == ""
+        print("error: package '" + pkg_name + "' not found in registry")
+        print("  Available: " + str(list_versions(pkg_name)))
+        exit(1)
+    let manifest_path = "nova.toml"
+    if not file_exists(manifest_path)
+        print("error: no nova.toml in current directory. Run 'nova-build init' first.")
+        exit(1)
+    let text = read_file(manifest_path)
+    if not contains(text, "[dependencies]")
+        text = text + "\n[dependencies]\n"
+    text = text + pkg_name + " = \"^" + version + "\"\n"
+    write_file(manifest_path, text)
+    let dep_src = path_join(registry_crates_dir(), pkg_name + "-" + version)
+    let local_deps = "deps/" + pkg_name
+    mkdir_p("deps")
+    mkdir_p(local_deps)
+    let dep_files = list_dir(dep_src)
+    for f in dep_files
+        let content = read_file(path_join(dep_src, f))
+        write_file(path_join(local_deps, f), content)
+    print("Installed " + pkg_name + " v" + version)
+    print("  Added to nova.toml [dependencies]")
+    print("  Source in deps/" + pkg_name + "/")
+
+// ── Update command ───────────────────────────────────────────────────────────
+
+fn cmd_update(args: list)
+    let manifest = load_manifest(".")
+    let resolved = resolve_deps(manifest)
+    write_lockfile(".", resolved)
+    let names = keys(resolved)
+    mkdir_p("deps")
+    for name in names
+        let version = resolved[name]
+        let dep_src = path_join(registry_crates_dir(), name + "-" + version)
+        let local_deps = "deps/" + name
+        mkdir_p(local_deps)
+        let upd_files = list_dir(dep_src)
+        for f in upd_files
+            let content = read_file(path_join(dep_src, f))
+            write_file(path_join(local_deps, f), content)
+        print("  " + name + " v" + version)
+    print("Updated " + str(len(names)) + " dependencies.")
+
+// ── Remove command ───────────────────────────────────────────────────────────
+
+fn cmd_remove(args: list)
+    if len(args) == 0
+        print("Usage: nova-pkg remove <package>")
+        exit(1)
+    let pkg_name = args[0]
+    let text = read_file("nova.toml")
+    let lines = split(text, "\n")
+    let result = []
+    for line in lines
+        if not starts_with(trim(line), pkg_name + " =") and not starts_with(trim(line), pkg_name + "=")
+            push(result, line)
+    write_file("nova.toml", join(result, "\n"))
+    print("Removed " + pkg_name + " from nova.toml")
+
+// ── List command ─────────────────────────────────────────────────────────────
+
+fn cmd_list(args: list)
+    let manifest = load_manifest(".")
+    if not contains(manifest, "dependencies")
+        print("No dependencies.")
+        return 0
+    let deps = manifest["dependencies"]
+    let names = keys(deps)
+    if len(names) == 0
+        print("No dependencies.")
+        return 0
+    print("Dependencies:")
+    for name in names
+        let constraint = deps[name]
+        let lock = read_lockfile(".")
+        let locked_ver = ""
+        if contains(lock, name)
+            locked_ver = " (locked: " + lock[name] + ")"
+        print("  " + name + " " + constraint + locked_ver)
+    0
+
+// ── Search command ───────────────────────────────────────────────────────────
+
+fn cmd_search(args: list)
+    if len(args) == 0
+        print("Usage: nova-pkg search <query>")
+        exit(1)
+    let query = args[0]
+    let idx = registry_index_dir()
+    let packages = list_dir(idx)
+    if len(packages) == 0
+        print("Registry empty. No packages published yet.")
+        return 0
+    let found = 0
+    for pkg in packages
+        if contains(pkg, query)
+            let versions = list_versions(pkg)
+            print("  " + pkg + " (" + str(len(versions)) + " versions)")
+            found = found + 1
+    if found == 0
+        print("No packages matching '" + query + "'")
+    else
+        print(str(found) + " package(s) found.")
+    0
+
+// ── Info command ─────────────────────────────────────────────────────────────
+
+fn cmd_info(args: list)
+    if len(args) == 0
+        print("Usage: nova-pkg info <package>")
+        exit(1)
+    let name = args[0]
+    let versions = list_versions(name)
+    if len(versions) == 0
+        print("Package '" + name + "' not found.")
+        exit(1)
+    print("Package: " + name)
+    print("Versions: " + str(len(versions)))
+    for v in versions
+        let meta_path = pkg_metadata_path(name, v)
+        if file_exists(meta_path)
+            let meta = toml_parse(read_file(meta_path))
+            let deps_str = ""
+            if contains(meta, "dependencies")
+                let d = meta["dependencies"]
+                deps_str = " [deps: " + str(len(keys(d))) + "]"
+            print("  " + v + deps_str)
+        else
+            print("  " + v)
+
+// ── Main entry point ─────────────────────────────────────────────────────────
+
+fn main()
+    let argv = args()
+    if len(argv) < 2
+        print("nova-pkg: NOVA package manager")
+        print("")
+        print("Commands:")
+        print("  get <pkg>[@ver]   Install a package")
+        print("  publish [dir]     Publish to local registry")
+        print("  update            Update all deps to latest compatible")
+        print("  remove <pkg>      Remove a dependency")
+        print("  list              List current dependencies")
+        print("  search <query>    Search registry")
+        print("  info <pkg>        Show package details")
+        print("  version           Show version")
+        print("")
+        print("Usage: nova-pkg <command> [args...]")
+        exit(0)
+    let cmd = argv[1]
+    let rest = []
+    let ri = 2
+    while ri < len(argv)
+        push(rest, argv[ri])
+        ri = ri + 1
+    if cmd == "get"
+        cmd_get(rest)
+    else if cmd == "publish"
+        cmd_publish(rest)
+    else if cmd == "update"
+        cmd_update(rest)
+    else if cmd == "remove"
+        cmd_remove(rest)
+    else if cmd == "list"
+        cmd_list(rest)
+    else if cmd == "search"
+        cmd_search(rest)
+    else if cmd == "info"
+        cmd_info(rest)
+    else if cmd == "version"
+        print("nova-pkg 0.1.0")
+        print("NOVA Package Manager")
+    else
+        print("Unknown command: " + cmd)
+        print("Run 'nova-pkg' without arguments for help.")
+        exit(1)
