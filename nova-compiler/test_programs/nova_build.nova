@@ -104,6 +104,39 @@ fn discover_nova_files(dir: string) -> list
             push(nova_files, path_join(dir, f))
     nova_files
 
+// ── Incremental build cache ───────────────────────────────────────────────────
+
+// Combined content hash of every .nova file under src_dir plus the build config
+// that affects output (opt level, target, runtime). Sorted file list so the hash
+// is independent of directory-listing order. Conservative by design: changing ANY
+// source or config invalidates the whole build — never produces a stale binary.
+fn project_source_hash(src_dir: string, runtime_path: string, opt: string, target: string) -> string
+    let files = list_dir(src_dir)
+    let nova_files = []
+    for f in files
+        if ends_with(f, ".nova")
+            push(nova_files, f)
+    nova_files = sort(nova_files)
+    let blob = "opt=" + opt + ";target=" + target + ";\n"
+    for f in nova_files
+        let content = read_file(path_join(src_dir, f))
+        blob = blob + "@@" + f + "@@\n" + content + "\n"
+    if file_exists(runtime_path)
+        blob = blob + "@@runtime@@\n" + read_file(runtime_path)
+    sha256(blob)
+
+fn cache_path(out_dir: string) -> string
+    path_join(out_dir, ".build_hash")
+
+fn read_cached_hash(out_dir: string) -> string
+    let p = cache_path(out_dir)
+    if not file_exists(p)
+        return ""
+    trim(read_file(p))
+
+fn write_cached_hash(out_dir: string, h: string)
+    write_file(cache_path(out_dir), h)
+
 // ── Compilation ───────────────────────────────────────────────────────────────
 
 fn compile_nova(compiler_path: string, nova_path: string, work_dir: string) -> int
@@ -117,21 +150,49 @@ fn link_binary(ll_path: string, runtime_path: string, output: string, target: st
     cmd = cmd + " " + extra_flags + " -D_CRT_SECURE_NO_WARNINGS -w"
     system(cmd)
 
+// ── Cross-compilation targets ─────────────────────────────────────────────────
+
+fn is_known_target(triple: string) -> bool
+    let known = ["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin", "armv7-unknown-linux-gnueabihf", "riscv64gc-unknown-linux-gnu", "wasm32-unknown-unknown"]
+    for k in known
+        if k == triple
+            return true
+    false
+
+fn target_is_windows(triple: string) -> bool
+    if triple == ""
+        return true
+    contains(triple, "windows")
+
 // ── Build command ─────────────────────────────────────────────────────────────
 
 fn cmd_build(build_args: list)
     let dir = "."
-    if len(build_args) > 0
-        dir = build_args[0]
+    let force = false
+    let target_override = ""
+    for a in build_args
+        if a == "--force" or a == "-f"
+            force = true
+        else if starts_with(a, "--target=")
+            target_override = slice(a, 9, len(a))
+        else if not starts_with(a, "-")
+            dir = a
     let manifest = load_manifest(dir)
     let name = get_field(manifest, "package", "name", "unnamed")
     let version = get_field(manifest, "package", "version", "0.1.0")
     let src_dir_name = get_field(manifest, "package", "src", "src")
     let entry = get_field(manifest, "package", "entry", "main.nova")
     let target = get_field(manifest, "build", "target", "")
+    if target_override != ""
+        target = target_override
     let opt = get_field(manifest, "build", "opt", "2")
     let link_flags = get_field(manifest, "build", "link_flags", "-lws2_32 -lbcrypt -ladvapi32")
-    print("Building " + name + " v" + version + "...")
+    if target != "" and not is_known_target(target)
+        print("warning: unrecognized target triple '" + target + "' — passing through to clang as-is")
+    if target == ""
+        print("Building " + name + " v" + version + "...")
+    else
+        print("Building " + name + " v" + version + " for " + target + "...")
     let src_dir = path_join(dir, src_dir_name)
     let entry_path = path_join(src_dir, entry)
     if not file_exists(entry_path)
@@ -140,6 +201,21 @@ fn cmd_build(build_args: list)
     let out_dir = path_join(dir, "build")
     if not file_exists(out_dir)
         system("mkdir \"" + out_dir + "\"")
+    let exe_ext = ""
+    if target_is_windows(target)
+        exe_ext = ".exe"
+    let output = path_join(out_dir, name + exe_ext)
+    let runtime = path_join(dir, "output/nova_runtime.c")
+    if not file_exists(runtime)
+        runtime = "output/nova_runtime.c"
+    // Incremental: skip the whole build when sources+config are unchanged and the
+    // output binary still exists.
+    let cur_hash = project_source_hash(src_dir, runtime, opt, target)
+    if not force
+        if file_exists(output)
+            if read_cached_hash(out_dir) == cur_hash
+                print("Up to date: " + output + " (" + name + " v" + version + ")")
+                return
     let base = cwd()
     let compiler = base + "/gen3_test.exe"
     if not file_exists(compiler)
@@ -155,14 +231,11 @@ fn cmd_build(build_args: list)
     if not file_exists(ll_path)
         print("error: compiler did not produce " + ll_path)
         exit(1)
-    let output = path_join(out_dir, name + ".exe")
-    let runtime = path_join(dir, "output/nova_runtime.c")
-    if not file_exists(runtime)
-        runtime = "output/nova_runtime.c"
     let link_result = link_binary(ll_path, runtime, output, target, "-O" + opt, link_flags)
     if link_result != 0
         print("Linking failed.")
         exit(1)
+    write_cached_hash(out_dir, cur_hash)
     print("Built: " + output + " (" + name + " v" + version + ")")
 
 // ── Init command ──────────────────────────────────────────────────────────────
@@ -235,8 +308,9 @@ fn cmd_fmt(fmt_args: list)
 fn cmd_run(run_args: list)
     cmd_build(run_args)
     let dir = "."
-    if len(run_args) > 0
-        dir = run_args[0]
+    for a in run_args
+        if not starts_with(a, "-")
+            dir = a
     let manifest = load_manifest(dir)
     let name = get_field(manifest, "package", "name", "unnamed")
     let exe = path_join(dir, "build/" + name + ".exe")
