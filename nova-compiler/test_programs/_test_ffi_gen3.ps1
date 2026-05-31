@@ -1,13 +1,11 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
-$compiler = (Resolve-Path "$PSScriptRoot\gen3_test.exe").Path
+$compiler = (Resolve-Path ".\gen3_test.exe").Path
 $runtimeSrc = "$PSScriptRoot\output\nova_runtime.c"
+$helperC = "$PSScriptRoot\ffi_helper.c"
 
 $tests = @(
-    'phase75_opoverload_test'
-    'phase75_default_trait_test'
-    'phase75_dyn_trait_test'
     'ffi_test'
     'ffi_full_test'
     'ffi_strlen_test'
@@ -21,24 +19,24 @@ $tests = @(
 
 $pass = 0; $fail = 0; $skip = 0; $failures = @()
 
-Write-Host "=== PHASE 7.5 TESTS ==="
+Write-Host "=== FFI TESTS (gen3) ==="
 
 foreach ($t in $tests) {
     $nova = "$PSScriptRoot\$t.nova"
     $ll   = "$PSScriptRoot\$t.ll"
     $exe  = "$PSScriptRoot\$t.exe"
     if (!(Test-Path $nova)) { Write-Host "SKIP $t"; $skip++; continue }
-    Write-Host "Compiling $t..."
+    Remove-Item $ll -Force -ErrorAction SilentlyContinue
     $cr = Invoke-Timed -FilePath $compiler -Arguments "$t.nova" -TimeoutMs 30000 -WorkingDirectory $PSScriptRoot
     if ($cr.TimedOut -or $cr.ExitCode -ne 0) {
         Write-Host "FAIL compile: $t (exit=$($cr.ExitCode))"
-        if ($cr.StdOut) { Write-Host $cr.StdOut.Substring(0, [Math]::Min(500, $cr.StdOut.Length)) }
+        if ($cr.StdOut) { Write-Host $cr.StdOut.Substring(0, [Math]::Min(300, $cr.StdOut.Length)) }
         $failures += "$t (COMPILE)"; $fail++; continue
     }
     if (!(Test-Path $ll)) { Write-Host "FAIL $t (no .ll)"; $failures += "$t (NO .ll)"; $fail++; continue }
+    # Link with ffi_helper.c if it exists
     $extraC = ""
-    $helperC = "$PSScriptRoot\ffi_helper.c"
-    if ($t -match "^ffi_" -and (Test-Path $helperC)) { $extraC = "`"$helperC`"" }
+    if (Test-Path $helperC) { $extraC = "`"$helperC`"" }
     $linkArgs = "-O2 -o `"$exe`" `"$ll`" `"$runtimeSrc`" $extraC $NovaLinkFlags -D_CRT_SECURE_NO_WARNINGS -w"
     Invoke-Timed -FilePath $ClangPath -Arguments $linkArgs -TimeoutMs 30000 -WorkingDirectory $PSScriptRoot | Out-Null
     if (!(Test-Path $exe)) { Write-Host "FAIL link: $t"; $failures += "$t (LINK)"; $fail++; Remove-Item $ll -Force -ErrorAction SilentlyContinue; continue }
@@ -50,11 +48,10 @@ foreach ($t in $tests) {
         if ($rr.StdOut) { Write-Host $rr.StdOut.Substring(0, [Math]::Min(300, $rr.StdOut.Length)) }
         $failures += "$t (RUN)"; $fail++
     } else {
-        if ($rr.StdOut) { Write-Host $rr.StdOut.Trim() }
         Write-Host "PASS $t"; $pass++
     }
 }
 
-Write-Host "`n=== PHASE 7.5: $pass PASS, $fail FAIL, $skip SKIP ==="
+Write-Host "`n=== FFI: $pass PASS, $fail FAIL, $skip SKIP ==="
 if ($failures.Count -gt 0) { Write-Host "Failures:"; foreach ($f in $failures) { Write-Host "  $f" } }
 if ($fail -gt 0) { exit 1 }
