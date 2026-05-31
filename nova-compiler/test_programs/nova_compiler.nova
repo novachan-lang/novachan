@@ -12528,6 +12528,105 @@ fn lsp_uri_to_path(uri: string) -> string
         return path
     uri
 
+fn lsp_get_word_at(docs: dict, uri: string, line_num: int, col: int) -> string
+    if not contains(docs, uri)
+        return ""
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    if line_num >= len(lines)
+        return ""
+    let line = lines[line_num]
+    if col >= len(line)
+        return ""
+    let start = col
+    while start > 0
+        let ch = ord(line[start - 1])
+        if ch == 32 or ch == 40 or ch == 41 or ch == 44 or ch == 61 or ch == 46 or ch == 91 or ch == 93
+            break
+        start = start - 1
+    let wend = col
+    while wend < len(line)
+        let ch = ord(line[wend])
+        if ch == 32 or ch == 40 or ch == 41 or ch == 44 or ch == 61 or ch == 46 or ch == 91 or ch == 93
+            break
+        wend = wend + 1
+    if start >= wend
+        return ""
+    slice(line, start, wend)
+
+fn lsp_infer_type_hint(docs: dict, uri: string, word: string) -> string
+    if not contains(docs, uri)
+        return ""
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        if starts_with(line, "fn " + word + "(")
+            return "function"
+        if starts_with(line, "type " + word)
+            return "type"
+        if starts_with(line, "let " + word + " ")
+            let eq_pos = find(line, "=")
+            if eq_pos > 0
+                let rhs = trim(slice(line, eq_pos + 1, len(line)))
+                if len(rhs) > 0
+                    let fc = ord(rhs[0])
+                    if fc == 91
+                        return "list"
+                    if fc == 123
+                        return "dict"
+                    if fc >= 48 and fc <= 57
+                        return "number"
+                if rhs == "true" or rhs == "false"
+                    return "bool"
+                return "variable"
+        i = i + 1
+    ""
+
+fn lsp_find_definition(docs: dict, uri: string, word: string) -> int
+    if word == "" or not contains(docs, uri)
+        return -1
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        if starts_with(line, "fn " + word + "(")
+            return i
+        if starts_with(line, "type " + word)
+            return i
+        if starts_with(line, "let " + word + " ") or starts_with(line, "let " + word + "=")
+            return i
+        i = i + 1
+    -1
+
+fn lsp_get_completions(docs: dict, uri: string) -> string
+    if not contains(docs, uri)
+        return ""
+    let source = docs[uri]
+    let lines = split(source, "\n")
+    let items = []
+    let i = 0
+    while i < len(lines)
+        let line = trim(lines[i])
+        if starts_with(line, "fn ")
+            let paren = find(line, "(")
+            if paren > 3
+                let fname = slice(line, 3, paren)
+                push(items, "\{\"label\":\"" + fname + "\",\"kind\":3\}")
+        else if starts_with(line, "type ")
+            let sp = find(line, " ")
+            if sp >= 0
+                let trest = trim(slice(line, 5, len(line)))
+                let tname = trest
+                let tsp = find(trest, " ")
+                if tsp > 0
+                    tname = slice(trest, 0, tsp)
+                push(items, "\{\"label\":\"" + tname + "\",\"kind\":22\}")
+        i = i + 1
+    join(items, ",")
+
 fn lsp_server_main()
     write_raw("NOVA LSP server started\n")
     let docs = {}
@@ -12546,7 +12645,7 @@ fn lsp_server_main()
             id = msg["id"]
             has_id = true
         if method == "initialize"
-            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\}\}\}"
+            let caps = "\{\"capabilities\":\{\"textDocumentSync\":\{\"openClose\":true,\"change\":1,\"save\":\{\"includeText\":true\}\},\"diagnosticProvider\":\{\"interFileDependencies\":false,\"workspaceDiagnostics\":false\},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":\{\"triggerCharacters\":[]\}\}\}"
             lsp_respond(id, caps)
         else if method == "initialized"
             write_raw("NOVA LSP initialized\n")
@@ -12588,6 +12687,45 @@ fn lsp_server_main()
             if contains(docs, uri)
                 docs[uri] = ""
             lsp_notify("textDocument/publishDiagnostics", "\{\"uri\":\"" + lsp_escape_json(uri) + "\",\"diagnostics\":[]\}")
+        else if method == "textDocument/hover"
+            if has_id
+                let hparams = msg["params"]
+                let htd = hparams["textDocument"]
+                let huri = htd["uri"]
+                let hpos = hparams["position"]
+                let hline = hpos["line"]
+                let hcol = hpos["character"]
+                let hword = lsp_get_word_at(docs, huri, hline, hcol)
+                if hword != ""
+                    let htype = lsp_infer_type_hint(docs, huri, hword)
+                    if htype != ""
+                        lsp_respond(id, "\{\"contents\":\{\"kind\":\"plaintext\",\"value\":\"" + hword + " : " + htype + "\"\}\}")
+                    else
+                        lsp_respond(id, "\{\"contents\":\{\"kind\":\"plaintext\",\"value\":\"" + hword + "\"\}\}")
+                else
+                    lsp_respond(id, "null")
+        else if method == "textDocument/definition"
+            if has_id
+                let dparams = msg["params"]
+                let dtd = dparams["textDocument"]
+                let duri = dtd["uri"]
+                let dpos = dparams["position"]
+                let dline = dpos["line"]
+                let dcol = dpos["character"]
+                let dword = lsp_get_word_at(docs, duri, dline, dcol)
+                let ddef = lsp_find_definition(docs, duri, dword)
+                if ddef >= 0
+                    let dloc = "\{\"uri\":\"" + lsp_escape_json(duri) + "\",\"range\":\{\"start\":\{\"line\":" + str(ddef) + ",\"character\":0\},\"end\":\{\"line\":" + str(ddef) + ",\"character\":0\}\}\}"
+                    lsp_respond(id, dloc)
+                else
+                    lsp_respond(id, "null")
+        else if method == "textDocument/completion"
+            if has_id
+                let cparams = msg["params"]
+                let ctd = cparams["textDocument"]
+                let curi = ctd["uri"]
+                let citems = lsp_get_completions(docs, curi)
+                lsp_respond(id, "\{\"isIncomplete\":false,\"items\":[" + citems + "]\}")
         else if has_id
             lsp_error_response(id, -32601, "Method not found: " + method)
 
