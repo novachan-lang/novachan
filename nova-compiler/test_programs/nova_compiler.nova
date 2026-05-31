@@ -1713,7 +1713,34 @@ fn parse_trait_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                 p2 = p2 + 1
                 mret = tv(tokens, p2)
                 p2 = p2 + 1
-            push(methods, Stmt("fn_sig", mname, Expr("rettype", mret, 0, [], [], mln), [], mparams, [], [], mln))
+            let p3 = skip_nl(tokens, p2)
+            let mbody = []
+            if tk(tokens, p3) != "EOF"
+                let bt = tokens[p3]
+                let btc = 0
+                match bt
+                    Token(btk, btv, btl, btcol) =>
+                        btc = btcol
+                if btc > cur_col
+                    while tk(tokens, p3) != "EOF"
+                        if tk(tokens, p3) == "NEWLINE"
+                            p3 = p3 + 1
+                            continue
+                        let bt2 = tokens[p3]
+                        let btc2 = 0
+                        match bt2
+                            Token(b2k, b2v, b2l, b2c) =>
+                                btc2 = b2c
+                        if btc2 <= cur_col
+                            break
+                        let sr = parse_stmt(tokens, p3, pe)
+                        push(mbody, sr.stmt)
+                        p3 = skip_nl(tokens, sr.pos)
+                    p2 = p3
+            if len(mbody) > 0
+                push(methods, Stmt("fn_default", mname, Expr("rettype", mret, 0, [], [], mln), mbody, mparams, [], [], mln))
+            else
+                push(methods, Stmt("fn_sig", mname, Expr("rettype", mret, 0, [], [], mln), [], mparams, [], [], mln))
         else
             p2 = p2 + 1
     StmtParseResult(Stmt("trait", name, null_expr(), methods, [], [], [], ln), p2)
@@ -4506,9 +4533,10 @@ type IrBuilder
     ir_opaque_types: dict
     ir_extern_out_idx: dict
     ir_repr_c_types: dict
+    ir_method_dispatch: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {})
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -4536,6 +4564,56 @@ fn ir_start_block(b: IrBuilder, label: string)
     b.ir_clabel = label
 
 // ── AST → IR Lowering ────────────────────────────────────────────────────────
+
+fn ir_resolve_op_overload(b: IrBuilder, op: string, left_expr: Expr) -> string
+    let method = ""
+    if op == "+"
+        method = "add"
+    else if op == "-"
+        method = "sub"
+    else if op == "*"
+        method = "mul"
+    else if op == "/"
+        method = "div"
+    else if op == "%"
+        method = "rem"
+    else if op == "=="
+        method = "eq"
+    else if op == "!="
+        method = "neq"
+    else if op == "<"
+        method = "lt"
+    else if op == "<="
+        method = "le"
+    else if op == ">"
+        method = "gt"
+    else if op == ">="
+        method = "ge"
+    if method == ""
+        return ""
+    let recv = ir_expr_struct_type(b, left_expr)
+    if recv == ""
+        return ""
+    let candidate = recv + "__" + method
+    if list_contains(b.ir_fnames, candidate)
+        return candidate
+    ""
+
+fn ir_resolve_unary_overload(b: IrBuilder, op: string, operand_expr: Expr) -> string
+    let recv = ir_expr_struct_type(b, operand_expr)
+    if recv == ""
+        return ""
+    let method = ""
+    if op == "-"
+        method = "neg"
+    else if op == "not"
+        method = "not"
+    if method == ""
+        return ""
+    let candidate = recv + "__" + method
+    if list_contains(b.ir_fnames, candidate)
+        return candidate
+    ""
 
 fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
     match expr
@@ -4652,6 +4730,13 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     let dest = ir_fresh_reg(b)
                     ir_emit_inst(b, "slot_load", dest, ir_type_any(), [], sc_slot, 0)
                     return dest
+                let overloaded = ir_resolve_op_overload(b, value, children[0])
+                if overloaded != ""
+                    let ovl = ir_lower_expr(b, children[0])
+                    let ovr = ir_lower_expr(b, children[1])
+                    let ovd = ir_fresh_reg(b)
+                    ir_emit_side(b, "call", ovd, ir_type_any(), [ovl, ovr], overloaded, 0)
+                    return ovd
                 let left = ir_lower_expr(b, children[0])
                 let right = ir_lower_expr(b, children[1])
                 let dest = ir_fresh_reg(b)
@@ -4695,6 +4780,12 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     ir_emit_inst(b, "shr", dest, ir_type_int(), [left, right], ">>", 0)
                 return dest
             else if tag == "unary"
+                let unary_overload = ir_resolve_unary_overload(b, value, children[0])
+                if unary_overload != ""
+                    let uo = ir_lower_expr(b, children[0])
+                    let ud = ir_fresh_reg(b)
+                    ir_emit_side(b, "call", ud, ir_type_any(), [uo], unary_overload, 0)
+                    return ud
                 let operand = ir_lower_expr(b, children[0])
                 let dest = ir_fresh_reg(b)
                 if value == "-"
@@ -4849,6 +4940,41 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                             resolved_method = typed_m
                 if resolved_method != ""
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, resolved_method, 0)
+                else if contains(b.ir_method_dispatch, value) and len(arg_regs) > 0
+                    let disp_impls = b.ir_method_dispatch[value]
+                    let disp_recv = arg_regs[0]
+                    let disp_hash = ir_fresh_reg(b)
+                    ir_emit_inst(b, "field_get", disp_hash, ir_type_int(), [disp_recv], "__type_hash", 0)
+                    let disp_merge = ir_fresh_label(b, "dyn_merge")
+                    let disp_slot = "__dyn_" + str(b.ir_lc)
+                    b.ir_lc = b.ir_lc + 1
+                    let disp_zero = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_int", disp_zero, ir_type_int(), [], "0", 0)
+                    ir_emit_inst(b, "slot_store", "", ir_type_void(), [disp_zero], disp_slot, 0)
+                    let di = 0
+                    while di < len(disp_impls)
+                        let dimp = disp_impls[di]
+                        let dimp_hash = dimp[0]
+                        let dimp_fn = dimp[1]
+                        let disp_then = ir_fresh_label(b, "dyn_" + str(di))
+                        let disp_next = ir_fresh_label(b, "dyn_try" + str(di + 1))
+                        let disp_hash_c = ir_fresh_reg(b)
+                        ir_emit_inst(b, "const_int", disp_hash_c, ir_type_int(), [], str(dimp_hash), dimp_hash)
+                        let disp_cmp = ir_fresh_reg(b)
+                        ir_emit_inst(b, "eq", disp_cmp, ir_type_int(), [disp_hash, disp_hash_c], "", 0)
+                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [disp_cmp, disp_next], disp_then, 0, "pure", b.ir_cur_line))
+                        ir_start_block(b, disp_then)
+                        let disp_r = ir_fresh_reg(b)
+                        ir_emit_side(b, "call", disp_r, ir_type_any(), arg_regs, dimp_fn, 0)
+                        ir_emit_inst(b, "slot_store", "", ir_type_void(), [disp_r], disp_slot, 0)
+                        ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], disp_merge, 0, "pure", b.ir_cur_line))
+                        ir_start_block(b, disp_next)
+                        di = di + 1
+                    ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], disp_merge, 0, "pure", b.ir_cur_line))
+                    ir_start_block(b, disp_merge)
+                    let disp_load = ir_fresh_reg(b)
+                    ir_emit_inst(b, "slot_load", disp_load, ir_type_any(), [], disp_slot, 0)
+                    return disp_load
                 else if contains(b.ir_methods, value)
                     let user_method = b.ir_methods[value]
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, user_method, 0)
@@ -5226,6 +5352,48 @@ fn ir_expr_struct_type(b: IrBuilder, expr: Expr) -> string
                 let lt = b.ir_locals[ev]
                 if lt != 1 and contains(b.ir_sdefs, lt)
                     return lt
+            if et == "binop" and len(ec) >= 2
+                let bin_lt = ir_expr_struct_type(b, ec[0])
+                if bin_lt != ""
+                    let bin_m = ""
+                    if ev == "+"
+                        bin_m = "add"
+                    else if ev == "-"
+                        bin_m = "sub"
+                    else if ev == "*"
+                        bin_m = "mul"
+                    else if ev == "/"
+                        bin_m = "div"
+                    else if ev == "%"
+                        bin_m = "rem"
+                    if bin_m != ""
+                        let bin_cand = bin_lt + "__" + bin_m
+                        if contains(b.ir_fn_returns, bin_cand)
+                            let bin_rt = b.ir_fn_returns[bin_cand]
+                            if contains(b.ir_sdefs, bin_rt)
+                                return bin_rt
+            if et == "method_call" and len(ec) >= 1
+                let mc_recv = ir_expr_struct_type(b, ec[0])
+                if mc_recv != ""
+                    let mc_cand = mc_recv + "__" + ev
+                    if contains(b.ir_fn_returns, mc_cand)
+                        let mc_rt = b.ir_fn_returns[mc_cand]
+                        if contains(b.ir_sdefs, mc_rt)
+                            return mc_rt
+            if et == "unary" and len(ec) >= 1
+                let un_lt = ir_expr_struct_type(b, ec[0])
+                if un_lt != ""
+                    let un_m = ""
+                    if ev == "-"
+                        un_m = "neg"
+                    else if ev == "not"
+                        un_m = "not"
+                    if un_m != ""
+                        let un_cand = un_lt + "__" + un_m
+                        if contains(b.ir_fn_returns, un_cand)
+                            let un_rt = b.ir_fn_returns[un_cand]
+                            if contains(b.ir_sdefs, un_rt)
+                                return un_rt
     ""
 
 fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
@@ -6032,6 +6200,7 @@ type TiState
     ti_extern_fns: dict
     ti_unsafe_depth: int
     ti_opaque_types: dict
+    ti_trait_defaults: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -6093,7 +6262,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -8159,10 +8328,11 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                     st.ti_enum_variants[name] = variant_names
                 if tag == "trait"
                     let trait_methods = []
+                    let trait_defs = {}
                     for tm in body
                         match tm
                             Stmt(tmt, tmn, tme, tmb, tmp, tmeb, tma, tml) =>
-                                if tmt == "fn_sig"
+                                if tmt == "fn_sig" or tmt == "fn_default"
                                     let param_count = len(tmp)
                                     let has_self = false
                                     for tp in tmp
@@ -8173,7 +8343,11 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                     if has_self
                                         param_count = param_count - 1
                                     push(trait_methods, tmn)
+                                    if tmt == "fn_default"
+                                        trait_defs[tmn] = tm
                     st.ti_traits[name] = trait_methods
+                    if len(trait_defs) > 0
+                        st.ti_trait_defaults[name] = trait_defs
                 if tag == "fn"
                     let dunder = find(name, "__")
                     if dunder > 0
@@ -8245,10 +8419,15 @@ fn ti_check_trait_conformance(st: TiState)
                 let implemented = []
                 if contains(st.ti_type_methods, tn)
                     implemented = st.ti_type_methods[tn]
+                let has_defaults = contains(st.ti_trait_defaults, trait_name)
+                let trait_def_map = {}
+                if has_defaults
+                    trait_def_map = st.ti_trait_defaults[trait_name]
                 let missing = []
                 for rm in required
                     if not list_contains(implemented, rm)
-                        push(missing, rm)
+                        if not contains(trait_def_map, rm)
+                            push(missing, rm)
                 if len(missing) > 0
                     let msg = "type '" + tn + "' does not fully implement trait '" + trait_name + "': missing "
                     let mi = 0
@@ -8908,7 +9087,7 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         if dest != ""
                             rt[dest] = "str"
                         return IrInst("copy", dest, ir_type_str(), args, "", 0, "pure", line)
-                    if arg_type != "int" and arg_type != "any"
+                    if arg_type != "int"
                         if dest != ""
                             rt[dest] = "str"
                         return IrInst(op, dest, typ, args, "nova_rt_any_to_str", num, effect, line)
@@ -10379,15 +10558,15 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                         // each per-fn local slot. SKIP the slot whose value
                         // is the return value (otherwise we'd free the data
                         // before the caller can read it).
-                        // W5b auto-drop: DEFAULT ON (2026-05-31).
-                        // Validated: 121/121 regression tests pass with
-                        // auto-drop enabled. Soundness rules cover returns,
-                        // channel sends, spawn captures, closure captures,
-                        // field stores, container appends, and dyn_call args.
-                        // Disable with NOVA_T8_NO_DROP=1 if needed.
+                        // W5b auto-drop: opt-in via NOVA_T8_DROP=1.
+                        // Bootstrap fixpoint bug found: W5b-compiled compiler
+                        // cannot correctly self-compile (2nd-gen binary fails
+                        // trait/closure/generics tests). Keep opt-in until
+                        // escape analysis handles compiler's own code patterns.
+                        let want_drop = env("NOVA_T8_DROP")
                         let no_t8b = env("NOVA_NO_TRACK8")
                         let no_drop = env("NOVA_T8_NO_DROP")
-                        let do_w5b = true
+                        let do_w5b = len(want_drop) > 0 and want_drop[0] == "1"
                         if len(no_t8b) > 0 and no_t8b[0] == "1"
                             do_w5b = false
                         if len(no_drop) > 0 and no_drop[0] == "1"
@@ -10631,6 +10810,60 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                         vfi = vfi + 1
                 else if tag != "import" and tag != "trait"
                     push(top_stmts, s)
+
+    // Inject default trait methods for implementing types
+    let td_trait_names = keys(ti_state.ti_trait_defaults)
+    for td_tn in td_trait_names
+        let td_defs = ti_state.ti_trait_defaults[td_tn]
+        let td_method_names = keys(td_defs)
+        let td_all_types = keys(ti_state.ti_type_traits)
+        for td_type in td_all_types
+            let td_tt = ti_state.ti_type_traits[td_type]
+            if contains(td_tt, td_tn)
+                let td_impl = []
+                if contains(ti_state.ti_type_methods, td_type)
+                    td_impl = ti_state.ti_type_methods[td_type]
+                for td_mn in td_method_names
+                    if not list_contains(td_impl, td_mn)
+                        let td_def_stmt = td_defs[td_mn]
+                        match td_def_stmt
+                            Stmt(dft, dfn, dfe, dfb, dfp, dfeb, dfa, dfl) =>
+                                let synth_name = td_type + "__" + td_mn
+                                let synth_params = [Param("self", "", null_expr())]
+                                for sp in dfp
+                                    push(synth_params, sp)
+                                let synth_fn = Stmt("fn", synth_name, dfe, dfb, synth_params, [], [], dfl)
+                                push(functions, synth_fn)
+                                push(b.ir_fnames, synth_name)
+                                b.ir_fn_arity[synth_name] = len(synth_params)
+                                b.ir_fn_defaults[synth_name] = synth_params
+                                match dfe
+                                    Expr(rtt2, rtv2, rtn2, rtc2, rtf2, rtl2) =>
+                                        if rtt2 == "rettype" and rtv2 != ""
+                                            b.ir_fn_returns[synth_name] = rtv2
+                                let dd_pos = find(synth_name, "__")
+                                if dd_pos > 0
+                                    let dd_suffix = synth_name[dd_pos + 2:999999999]
+                                    b.ir_methods[dd_suffix] = synth_name
+
+    // Build method dispatch table: method_name → [(type_hash, fn_name), ...]
+    let mdt_collect = {}
+    for fn_s in functions
+        match fn_s
+            Stmt(ft, fn2, fe, fb, fp, feb, fa, fl) =>
+                let mdt_dd = find(fn2, "__")
+                if mdt_dd > 0
+                    let mdt_type = slice(fn2, 0, mdt_dd)
+                    let mdt_method = slice(fn2, mdt_dd + 2, len(fn2))
+                    if contains(b.ir_sdefs, mdt_type)
+                        if not contains(mdt_collect, mdt_method)
+                            mdt_collect[mdt_method] = []
+                        push(mdt_collect[mdt_method], [type_name_hash(mdt_type), fn2, len(fp)])
+    let mdt_keys = keys(mdt_collect)
+    for mk in mdt_keys
+        let mdt_impls = mdt_collect[mk]
+        if len(mdt_impls) > 1
+            b.ir_method_dispatch[mk] = mdt_impls
 
     // Emit module header
     let dq = chr(34)

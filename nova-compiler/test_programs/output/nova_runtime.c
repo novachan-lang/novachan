@@ -955,8 +955,13 @@ int64_t nova_rt_int_to_str(int64_t v) {
 int64_t nova_rt_float_to_str(int64_t bits) {
     double v;
     memcpy(&v, &bits, sizeof(double));
-    char tmp[32];
-    int len = snprintf(tmp, 32, "%g", v);
+    char tmp[64];
+    int len = snprintf(tmp, 64, "%.15g", v);
+    if (!strchr(tmp, '.') && !strchr(tmp, 'e') && !strchr(tmp, 'E')) {
+        tmp[len++] = '.';
+        tmp[len++] = '0';
+        tmp[len] = '\0';
+    }
     char* result = nova_fat_str_create(tmp, (size_t)len);
     if (!result) return 0;
     return (int64_t)(uintptr_t)result;

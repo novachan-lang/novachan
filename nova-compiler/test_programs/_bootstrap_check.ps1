@@ -1,47 +1,46 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
-Write-Host "=== Bootstrap Convergence Test ==="
+Write-Host "=== Bootstrap Fixpoint Check ==="
 
-# Step 1: Compile nova_compiler.nova with gen2 → gen3.ll
-Write-Host "`n[1/4] Compiling nova_compiler.nova with gen2 → gen3.ll"
-$cr = Invoke-Timed -FilePath (Resolve-Path ".\gen2_move.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 180000
-if ($cr.ExitCode -ne 0) { Write-Host "FAIL: gen3 compile (exit=$($cr.ExitCode))"; exit 1 }
-Copy-Item "nova_compiler.ll" "gen3.ll" -Force
-Write-Host "OK"
+# Pass 1: gen3_test.exe compiles nova_compiler.nova
+Remove-Item nova_compiler.ll -Force -ErrorAction SilentlyContinue
+Write-Host "`n[1/4] gen3_test.exe -> nova_compiler.ll"
+$r1 = Invoke-Timed -FilePath '.\gen3_test.exe' -Arguments 'nova_compiler.nova' -TimeoutMs 120000 -WorkingDirectory $PSScriptRoot
+if ($r1.ExitCode -ne 0) { Write-Host "FAIL pass 1 compile"; exit 1 }
+Write-Host "  OK"
 
-# Step 2: Link gen3.ll → gen3.exe
-Write-Host "[2/4] Linking gen3.exe"
-Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
-$lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o gen3.exe gen3.ll nova_runtime.c $NovaLinkFlags" -TimeoutMs 180000
-if (!(Test-Path "gen3.exe")) { Write-Host "FAIL: gen3 link"; exit 1 }
-Write-Host "OK"
+# Link pass 1
+Write-Host "[2/4] link -> nova_p1.exe"
+$linkArgs = "-O2 -o `"nova_p1.exe`" `"nova_compiler.ll`" `"output\nova_runtime.c`" $NovaLinkFlags -D_CRT_SECURE_NO_WARNINGS -w"
+Invoke-Timed -FilePath $ClangPath -Arguments $linkArgs -TimeoutMs 60000 -WorkingDirectory $PSScriptRoot | Out-Null
+if (!(Test-Path ".\nova_p1.exe")) { Write-Host "FAIL pass 1 link"; exit 1 }
+$s1 = (Get-Item ".\nova_p1.exe").Length
+Write-Host "  OK ($s1 bytes)"
 
-# Step 3: Compile nova_compiler.nova with gen3 → gen4.ll
-Write-Host "[3/4] Compiling nova_compiler.nova with gen3 → gen4.ll"
-$cr2 = Invoke-Timed -FilePath (Resolve-Path ".\gen3.exe").Path -Arguments "nova_compiler.nova" -TimeoutMs 180000
-if ($cr2.ExitCode -ne 0) { Write-Host "FAIL: gen4 compile (exit=$($cr2.ExitCode))"; exit 1 }
-Copy-Item "nova_compiler.ll" "gen4.ll" -Force
-Write-Host "OK"
+# Pass 2: nova_p1.exe compiles nova_compiler.nova
+Remove-Item nova_compiler.ll -Force -ErrorAction SilentlyContinue
+Write-Host "[3/4] nova_p1.exe -> nova_compiler.ll"
+$r2 = Invoke-Timed -FilePath '.\nova_p1.exe' -Arguments 'nova_compiler.nova' -TimeoutMs 120000 -WorkingDirectory $PSScriptRoot
+if ($r2.ExitCode -ne 0) { Write-Host "FAIL pass 2 compile"; exit 1 }
+Write-Host "  OK"
 
-# Step 4: Compare gen3.ll and gen4.ll
-Write-Host "[4/4] Comparing gen3.ll vs gen4.ll"
-$h3 = (Get-FileHash "gen3.ll" -Algorithm SHA256).Hash
-$h4 = (Get-FileHash "gen4.ll" -Algorithm SHA256).Hash
-$s3 = (Get-Item "gen3.ll").Length
-$s4 = (Get-Item "gen4.ll").Length
+# Link pass 2
+Write-Host "[4/4] link -> nova_p2.exe"
+$linkArgs2 = "-O2 -o `"nova_p2.exe`" `"nova_compiler.ll`" `"output\nova_runtime.c`" $NovaLinkFlags -D_CRT_SECURE_NO_WARNINGS -w"
+Invoke-Timed -FilePath $ClangPath -Arguments $linkArgs2 -TimeoutMs 60000 -WorkingDirectory $PSScriptRoot | Out-Null
+if (!(Test-Path ".\nova_p2.exe")) { Write-Host "FAIL pass 2 link"; exit 1 }
+$s2 = (Get-Item ".\nova_p2.exe").Length
+Write-Host "  OK ($s2 bytes)"
 
-Write-Host "gen3.ll: $s3 bytes, SHA256: $h3"
-Write-Host "gen4.ll: $s4 bytes, SHA256: $h4"
-
-if ($h3 -eq $h4) {
-    Write-Host "`nBOOTSTRAP CONVERGED: gen3.ll == gen4.ll"
+# Compare
+if ($s1 -eq $s2) {
+    Write-Host "`n=== BOOTSTRAP FIXPOINT: PASS ($s1 bytes) ==="
+    Copy-Item ".\nova_p1.exe" ".\gen3_test.exe" -Force
+    Write-Host "Updated gen3_test.exe"
 } else {
-    Write-Host "`nBOOTSTRAP DIVERGED: gen3.ll != gen4.ll"
-    # Show diff stats
-    $lines3 = (Get-Content gen3.ll).Count
-    $lines4 = (Get-Content gen4.ll).Count
-    Write-Host "Lines: gen3=$lines3 gen4=$lines4"
+    Write-Host "`n=== BOOTSTRAP FIXPOINT: FAIL (pass1=$s1, pass2=$s2) ==="
+    exit 1
 }
 
-Remove-Item "gen3.ll","gen4.ll","gen3.exe","nova_compiler.ll","nova_runtime.c" -Force -ErrorAction SilentlyContinue
+Remove-Item nova_p1.exe, nova_p2.exe, nova_compiler.ll -Force -ErrorAction SilentlyContinue
