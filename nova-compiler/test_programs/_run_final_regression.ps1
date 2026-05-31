@@ -39,6 +39,17 @@ $core_tests = @(
     't8_w5_test','t8_w5b_test','t8_w5b_auto','t8_w6_test','t8_w7_test','t8_soundness_test','t8_channel_test','t8_w8_test'
 )
 
+# Track 7 stdlib breadth tests
+$track7_tests = @(
+    'track7_stdlib_full_test',
+    'track7_encoding_test',
+    'track7_logging_test',
+    'track7_random_test',
+    'track7_datetime_test',
+    'track7_path_test',
+    'track7_collections_lib_test'
+)
+
 # Phase 12-14 new tests
 $new_tests = @(
     'phase12_wasm_gpu_test',
@@ -48,7 +59,7 @@ $new_tests = @(
     'phase14_stabilize_test'
 )
 
-$all_tests = $core_tests + $new_tests
+$all_tests = $core_tests + $track7_tests + $new_tests
 $pass = 0; $fail = 0; $skip = 0; $failures = @()
 
 Write-Host "=== NOVA Full Regression Suite (gen3_test = gen11_phase13) ==="
