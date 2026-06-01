@@ -11398,6 +11398,113 @@ int64_t nova_rt_cov_register(int64_t file_ptr, int64_t line) {
     return 0;
 }
 
+/* ── LCOV coverage export ──────────────────────────────────────────────────
+   Writes a coverage tracefile in LCOV format so genhtml can render an HTML
+   report. Format:
+     TN:                  (test name — empty)
+     SF:<source_file>     (per file section)
+     DA:<line>,<count>    (one per instrumented line)
+     LH:<hit_lines>
+     LF:<total_lines>
+     end_of_record        (ends a file section)
+   Returns 0 on success, -1 on error. */
+int64_t nova_rt_cov_export_lcov(int64_t path_ptr) {
+    const char* path = (const char*)(uintptr_t)path_ptr;
+    if (!path || nova_cov_count == 0) return -1;
+
+    FILE* out = fopen(path, "w");
+    if (!out) return -1;
+
+    /* collect distinct file pointers */
+    const char* files[256]; int files_n = 0;
+    for (int i = 0; i < nova_cov_count; ++i) {
+        const char* f = nova_cov_table[i].file;
+        int seen = 0;
+        for (int j = 0; j < files_n; ++j) if (files[j] == f) { seen = 1; break; }
+        if (!seen && files_n < 256) files[files_n++] = f;
+    }
+
+    /* emit one record block per file, lines sorted ascending */
+    for (int fi = 0; fi < files_n; ++fi) {
+        const char* f = files[fi];
+        fprintf(out, "TN:\nSF:%s\n", f ? f : "(unknown)");
+
+        /* collect entries for this file and sort by line */
+        int idxs[NOVA_COV_MAX]; int n = 0;
+        for (int i = 0; i < nova_cov_count; ++i)
+            if (nova_cov_table[i].file == f && n < NOVA_COV_MAX) idxs[n++] = i;
+        /* insertion sort by line */
+        for (int i = 1; i < n; ++i) {
+            int k = idxs[i], j = i - 1;
+            while (j >= 0 && nova_cov_table[idxs[j]].line > nova_cov_table[k].line)
+                { idxs[j+1] = idxs[j]; --j; }
+            idxs[j+1] = k;
+        }
+
+        int lh = 0, lf = 0;
+        for (int i = 0; i < n; ++i) {
+            NovaCovEntry* e = &nova_cov_table[idxs[i]];
+            fprintf(out, "DA:%d,%d\n", e->line, e->count);
+            lf++;
+            if (e->count > 0) lh++;
+        }
+        fprintf(out, "LH:%d\nLF:%d\nend_of_record\n", lh, lf);
+    }
+    fclose(out);
+    return 0;
+}
+
+/* ── Flamegraph collapsed-stack export ─────────────────────────────────────
+   Writes Brendan Gregg's collapsed stack format (one line per function):
+     function_name <weight>
+   Where weight is total time in microseconds.
+   Covers both the user-facing prof_start/stop regions (g_prof) and the
+   internal auto-instrumented regions (nova_prof_table).
+   Feed to flamegraph.pl to render an SVG. */
+int64_t nova_rt_prof_export_flame(int64_t path_ptr) {
+    const char* path = (const char*)(uintptr_t)path_ptr;
+    int total_entries = g_prof_count + nova_prof_count;
+    if (!path || total_entries == 0) return -1;
+
+    FILE* out = fopen(path, "w");
+    if (!out) return -1;
+
+    /* user prof_start/stop regions */
+    for (int i = 0; i < g_prof_count; ++i) {
+        NovaProf* e = &g_prof[i];
+        if (e->calls == 0) continue;
+        int64_t weight = e->total_ns / 1000;
+        if (weight < 1) weight = 1;
+        fprintf(out, "%s %lld\n", e->name ? e->name : "(unknown)", (long long)weight);
+    }
+    /* auto-instrumented internal regions */
+    for (int i = 0; i < nova_prof_count; ++i) {
+        NovaProfEntry* e = &nova_prof_table[i];
+        if (e->calls == 0) continue;
+        int64_t weight = e->total_ns / 1000;
+        if (weight < 1) weight = 1;
+        fprintf(out, "%s %lld\n", e->name ? e->name : "(unknown)", (long long)weight);
+    }
+    fclose(out);
+    return 0;
+}
+
+/* ── ABI version stamp ─────────────────────────────────────────────────────
+   Every NOVA binary exposes this symbol so tools can verify ABI compatibility
+   without running the binary. The version follows semver: bump when the
+   public runtime ABI (function signatures, struct layouts, calling convention)
+   changes in a breaking way. */
+#define NOVA_ABI_VERSION_MAJOR 1
+#define NOVA_ABI_VERSION_MINOR 0
+#define NOVA_ABI_VERSION_PATCH 0
+const char* __nova_abi_version = "nova-abi-1.0.0";
+int64_t nova_rt_abi_version(void) {
+    /* Returns the ABI version as a packed int: (major<<16)|(minor<<8)|patch */
+    return ((int64_t)NOVA_ABI_VERSION_MAJOR << 16) |
+           ((int64_t)NOVA_ABI_VERSION_MINOR << 8)  |
+           (int64_t)NOVA_ABI_VERSION_PATCH;
+}
+
 /* ── FFI @repr(C) struct test helper ───────────────────────────────────────
    NOVA struct handles ARE pointers to the heap-allocated data block (the
    8-byte RC+tag header sits at handle[-1]; the data starts at handle[0]).

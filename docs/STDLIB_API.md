@@ -549,6 +549,28 @@ NOVA can compile a subset of itself to WebAssembly. The runtime exposes:
 
 See `nova-compiler/test_programs/phase12_wasm_gpu_test.nova` for the working example.
 
+## Coverage and profiling (Phase 9)
+
+| Function | Signature | Description |
+|---|---|---|
+| `cov_export_lcov(path)` | `string -> int` | Write LCOV tracefile for genhtml. Returns 0 on success, -1 if no coverage data (binary not compiled with `--cov`). |
+| `cov_report()` | `() -> list` | Returns `[[file, line, count], ...]`. |
+| `cov_reset()` | `() -> unit` | Reset all hit counters. |
+| `prof_start(name)` | `string -> int` | Start timing a region. Returns a handle. |
+| `prof_stop(handle)` | `int -> int` | Stop timing, returns total nanoseconds. |
+| `prof_report()` | `() -> unit` | Print sorted profiling table to stdout. |
+| `prof_export_flame(path)` | `string -> int` | Write Brendan Gregg collapsed-stack flamegraph file (feed to flamegraph.pl). Returns 0 on success, -1 if no data. Covers both prof_start/stop regions and auto-instrumented internals. |
+| `prof_reset()` | `() -> unit` | Clear all profiling data. |
+| `prof_get_ns(handle)` | `int -> int` | Cumulative nanoseconds for a region handle. |
+
+## ABI stability (Phase 14)
+
+| Function | Signature | Description |
+|---|---|---|
+| `abi_version()` | `() -> int` | Returns packed version `(major<<16)\|(minor<<8)\|patch`. Current: 1.0.0 = 65536. |
+
+Every NOVA binary also exports the C symbol `__nova_abi_version` (string `"nova-abi-1.0.0"`) so tools can inspect the ABI level without running the binary.
+
 ## Domain modules (Phase 11/13)
 
 Shipped as standalone, fully-tested NOVA source modules under

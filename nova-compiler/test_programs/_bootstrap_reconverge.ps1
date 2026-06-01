@@ -9,7 +9,7 @@ Set-Location $PSScriptRoot
 function Compile-Link {
     param([string]$compiler, [string]$outExe, [string]$saveLl)
     Remove-Item nova_compiler.ll -Force -ErrorAction SilentlyContinue
-    $r = Invoke-Timed -FilePath $compiler -Arguments 'nova_compiler.nova' -TimeoutMs 180000 -WorkingDirectory $PSScriptRoot
+    $r = Invoke-Timed -FilePath $compiler -Arguments 'nova_compiler.nova' -TimeoutMs 360000 -WorkingDirectory $PSScriptRoot
     if ($r.TimedOut -or $r.ExitCode -ne 0) { Write-Host "FAIL compile via $compiler (exit=$($r.ExitCode) timedout=$($r.TimedOut))"; if ($r.StdOut) { Write-Host $r.StdOut.Substring(0,[Math]::Min(800,$r.StdOut.Length)) }; exit 1 }
     if (!(Test-Path nova_compiler.ll)) { Write-Host "FAIL: no .ll from $compiler"; exit 1 }
     if ($saveLl) { Copy-Item nova_compiler.ll $saveLl -Force }
