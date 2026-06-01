@@ -4463,6 +4463,68 @@ static int re_compile(const char* pattern, ReProg* prog) {
             if (i < len && pattern[i] == '?') i++; /* non-greedy marker, skip */
             break;
         }
+        case '{': {
+            /* Counted quantifier: {n} exact, {n,m} range, {n,} at-least-n.
+               Operates on the single-instruction atom at pc-1 (same scope as * + ?).
+               Lookahead-validate first; a malformed '{' is treated as a literal. */
+            int j = i + 1, vn = 0, has_n = 0, vcomma = 0, vm = -1, has_m = 0;
+            while (j < len && pattern[j] >= '0' && pattern[j] <= '9') { vn = vn*10 + (pattern[j]-'0'); has_n = 1; j++; }
+            if (j < len && pattern[j] == ',') { vcomma = 1; j++;
+                while (j < len && pattern[j] >= '0' && pattern[j] <= '9') { vm = (has_m ? vm : 0); vm = vm*10 + (pattern[j]-'0'); has_m = 1; j++; }
+            }
+            if (pc == 0 || !has_n || j >= len || pattern[j] != '}') {
+                EMIT(RE_LIT); prog->code[pc-1].c = (unsigned char)'{'; i++; break;
+            }
+            int rn = vn;
+            int rm = vcomma ? (has_m ? vm : -1) : vn;   /* -1 == unbounded ({n,}) */
+            i = j + 1;   /* consume through '}' */
+            if (rn < 0 || rn > 1000 || (rm >= 0 && (rm > 1000 || rm < rn))) return -1;
+            int atom = pc - 1;
+            /* Snapshot the atom; deep-copy its class set so duplicates never alias
+               the same malloc'd buffer (re_free frees cls per-instruction). */
+            ReInst tmpl = prog->code[atom];
+            char* tmpl_cls = NULL;
+            if (tmpl.cls && tmpl.cls_len > 0) {
+                tmpl_cls = (char*)malloc((size_t)tmpl.cls_len + 1);
+                if (!tmpl_cls) return -1;
+                memcpy(tmpl_cls, tmpl.cls, (size_t)tmpl.cls_len + 1);
+            }
+            /* Remove the original atom (free its cls) and rebuild from the template. */
+            if (prog->code[atom].cls) { free(prog->code[atom].cls); prog->code[atom].cls = NULL; }
+            pc = atom;
+            #define EMIT_ATOM() do { \
+                if (pc >= RE_MAX_INST - 3) { if (tmpl_cls) free(tmpl_cls); return -1; } \
+                prog->code[pc] = tmpl; \
+                if (tmpl_cls) { char* _d = (char*)malloc((size_t)tmpl.cls_len + 1); \
+                    if (!_d) { if (tmpl_cls) free(tmpl_cls); return -1; } \
+                    memcpy(_d, tmpl_cls, (size_t)tmpl.cls_len + 1); prog->code[pc].cls = _d; } \
+                else { prog->code[pc].cls = NULL; } \
+                pc++; } while(0)
+            /* rn required copies */
+            for (int k = 0; k < rn; k++) EMIT_ATOM();
+            if (rm < 0) {
+                /* {n,}: append atom*  ->  SPLIT(body, end); body; JMP(split) */
+                if (pc >= RE_MAX_INST - 3) { if (tmpl_cls) free(tmpl_cls); return -1; }
+                int s = pc;
+                prog->code[pc].op = RE_SPLIT; prog->code[pc].cls = NULL; prog->code[pc].cls_len = 0; pc++;
+                EMIT_ATOM();
+                prog->code[pc].op = RE_JMP; prog->code[pc].cls = NULL; prog->code[pc].cls_len = 0; prog->code[pc].x = s; pc++;
+                prog->code[s].x = s + 1; prog->code[s].y = pc;
+            } else {
+                /* {n,m}: (m-n) greedy-optional copies -> each SPLIT(body, skip); body */
+                for (int k = rn; k < rm; k++) {
+                    if (pc >= RE_MAX_INST - 3) { if (tmpl_cls) free(tmpl_cls); return -1; }
+                    int s = pc;
+                    prog->code[pc].op = RE_SPLIT; prog->code[pc].cls = NULL; prog->code[pc].cls_len = 0; pc++;
+                    EMIT_ATOM();
+                    prog->code[s].x = s + 1; prog->code[s].y = pc;
+                }
+            }
+            #undef EMIT_ATOM
+            if (tmpl_cls) free(tmpl_cls);
+            if (i < len && pattern[i] == '?') i++;   /* tolerate non-greedy marker */
+            break;
+        }
         default:
             EMIT(RE_LIT);
             prog->code[pc-1].c = (unsigned char)c;

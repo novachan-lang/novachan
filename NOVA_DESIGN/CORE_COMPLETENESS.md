@@ -31,6 +31,22 @@ until the *core* is complete. This document is the gate.
 
 ---
 
+## Build progress (live)
+
+Execution started 2026-06-02. Rule: **verify each gap against the real code before building** —
+the scorecard's MISSING/0% counts came partly from a conservative ledger and several were stale.
+
+- ✅ **File I/O completeness** (Feature 1, committed `a15b6e2`) — added `remove_file`, `remove_dir`,
+  `rename_path`, `copy_file`, `file_size`, `file_mtime`, `is_dir`, `is_file`, `write_bytes`,
+  `read_lines`, `temp_dir`. Cross-platform, full error handling, 138/138 regression. (Cat. 12 now
+  largely closed; `seek`/`truncate`/mmap still open.)
+- ✅ **Time & date** — found ALREADY COMPLETE on verification (14 `datetime_*` builtins fully
+  registered + runtime + `track7_datetime_test`). The scorecard's "0%" was wrong. No work needed.
+- ⏭ **Next verified-real gaps:** regex `{n}`/`|` (confirmed missing), Unicode-correct strings
+  (`len("café")==5`), typed `Result<T,E>` (type-erased today).
+
+---
+
 ## 1. Types, literals & syntax
 
 | Feature | Seen in | Tier | NOVA status | How NOVA beats it |
