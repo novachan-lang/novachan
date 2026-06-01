@@ -1,0 +1,386 @@
+// ============================================================================
+// NOVA Standard Library — statistics module
+// ============================================================================
+// Pure-NOVA descriptive + inferential statistics over lists of numbers
+// (int OR float, freely mixed). Every numeric value that enters arithmetic is
+// coerced to float with `_f` (x * 1.0) — the ONLY sound int-or-float -> float
+// coercion in the gen3 compiler. float() misconverts already-float values and
+// `x + 0.0` is also unreliable, so neither is used anywhere in this module.
+//
+// All functions are non-mutating: median/percentile sort a COPY built from
+// scratch, leaving the caller's list untouched.
+//
+// Public API:
+//   sum_list(xs), count(xs), mean(xs)
+//   variance(xs)  (population),  stddev(xs)
+//   median(xs), mode(xs)
+//   minv(xs), maxv(xs), range_of(xs)
+//   percentile(xs, p)            (p in 0..100, linear interpolation)
+//   correlation(xs, ys)          (Pearson r; 0.0 on zero variance)
+//   linreg(xs, ys) -> [slope, intercept]   (ordinary least squares)
+
+// ── numeric helper ──────────────────────────────────────────────────────────
+// Coerce int OR float to float soundly. int*1.0 promotes via the float multiply;
+// float*1.0 is the identity. Verified pattern, see math3d.nova.
+
+fn _f(x) -> float
+    x * 1.0
+
+// ── internal: sorted COPY (ascending), never mutates the input ───────────────
+// Insertion sort into a freshly allocated list. Each source element is coerced
+// to float so comparisons and later arithmetic are uniform. O(n^2), which is
+// fine for the small-to-moderate sample sizes typical of a stats call and keeps
+// the implementation obviously correct (stable, no pivot edge cases).
+
+fn _sorted_copy(xs) -> list
+    let out = []
+    let i = 0
+    while i < len(xs)
+        let v = _f(xs[i])
+        // find insertion position in `out`
+        let j = len(out)
+        push(out, v)
+        // shift larger elements right until v is in place
+        while j > 0 and out[j - 1] > v
+            out[j] = out[j - 1]
+            j = j - 1
+        out[j] = v
+        i = i + 1
+    out
+
+// ── basic aggregates ─────────────────────────────────────────────────────────
+
+fn count(xs) -> int
+    len(xs)
+
+fn sum_list(xs) -> float
+    let total = 0.0
+    let i = 0
+    while i < len(xs)
+        total = total + _f(xs[i])
+        i = i + 1
+    total
+
+fn mean(xs) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    sum_list(xs) / _f(n)
+
+// ── dispersion ───────────────────────────────────────────────────────────────
+// Population variance: mean of squared deviations from the mean.
+
+fn variance(xs) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    let m = mean(xs)
+    let acc = 0.0
+    let i = 0
+    while i < n
+        let d = _f(xs[i]) - m
+        acc = acc + d * d
+        i = i + 1
+    acc / _f(n)
+
+fn stddev(xs) -> float
+    sqrt(variance(xs))
+
+// ── order statistics ─────────────────────────────────────────────────────────
+// Median on a sorted COPY. Even length -> mean of the two middle elements.
+
+fn median(xs) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    let s = _sorted_copy(xs)
+    let mid = n / 2
+    if n % 2 == 1
+        return s[mid]
+    (s[mid - 1] + s[mid]) / 2.0
+
+// Mode: most frequent value; ties resolved to the SMALLEST value.
+// Strategy: sort a copy so equal values are adjacent and groups appear in
+// ascending order. Walk the runs; only adopt a new best when its count is
+// STRICTLY greater than the current best. Because groups are visited smallest
+// first, the smallest value among equal-count ties is the one retained.
+
+fn mode(xs) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    let s = _sorted_copy(xs)
+    let best_val = s[0]
+    let best_count = 1
+    let cur_val = s[0]
+    let cur_count = 1
+    let i = 1
+    while i < n
+        if s[i] == cur_val
+            cur_count = cur_count + 1
+        else
+            cur_val = s[i]
+            cur_count = 1
+        if cur_count > best_count
+            best_count = cur_count
+            best_val = cur_val
+        i = i + 1
+    best_val
+
+fn minv(xs) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    let m = _f(xs[0])
+    let i = 1
+    while i < n
+        let v = _f(xs[i])
+        if v < m
+            m = v
+        i = i + 1
+    m
+
+fn maxv(xs) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    let m = _f(xs[0])
+    let i = 1
+    while i < n
+        let v = _f(xs[i])
+        if v > m
+            m = v
+        i = i + 1
+    m
+
+fn range_of(xs) -> float
+    maxv(xs) - minv(xs)
+
+// Percentile with linear interpolation between closest ranks.
+// p is clamped to [0, 100]. Rank position r = (p/100) * (n - 1) over the
+// 0-based sorted copy; interpolate between floor(r) and ceil(r).
+
+fn percentile(xs, p) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    let pf = _f(p)
+    if pf < 0.0
+        pf = 0.0
+    if pf > 100.0
+        pf = 100.0
+    let s = _sorted_copy(xs)
+    if n == 1
+        return s[0]
+    let rank = pf / 100.0 * _f(n - 1)
+    let lo = floor(rank)
+    let hi = ceil(rank)
+    let lo_i = _idx(lo)
+    let hi_i = _idx(hi)
+    if lo_i == hi_i
+        return s[lo_i]
+    let frac = rank - lo
+    s[lo_i] + (s[hi_i] - s[lo_i]) * frac
+
+// floor/ceil return floats; convert to an int index via truncation toward zero.
+// Values here are always >= 0 and < n, so adding 0.5 then integer-dividing by 1
+// is unnecessary — a direct cast through repeated subtraction would be costly.
+// Instead we exploit that int(float) is unavailable but int arithmetic on a
+// known-nonnegative integral float is recoverable by counting. n is small.
+
+fn _idx(fval) -> int
+    let k = 0
+    let acc = 0.0
+    while acc + 1.0 <= fval
+        acc = acc + 1.0
+        k = k + 1
+    k
+
+// ── correlation & regression ─────────────────────────────────────────────────
+// Pearson correlation coefficient. Guards against zero variance in either
+// series (a constant column) by returning 0.0 rather than dividing by zero.
+
+fn correlation(xs, ys) -> float
+    let n = len(xs)
+    if n == 0
+        return 0.0
+    if len(ys) < n
+        return 0.0
+    let mx = mean(xs)
+    let my = mean(ys)
+    let sxy = 0.0
+    let sxx = 0.0
+    let syy = 0.0
+    let i = 0
+    while i < n
+        let dx = _f(xs[i]) - mx
+        let dy = _f(ys[i]) - my
+        sxy = sxy + dx * dy
+        sxx = sxx + dx * dx
+        syy = syy + dy * dy
+        i = i + 1
+    if sxx == 0.0
+        return 0.0
+    if syy == 0.0
+        return 0.0
+    let denom = sqrt(sxx * syy)
+    if denom == 0.0
+        return 0.0
+    sxy / denom
+
+// Ordinary least squares simple linear regression: fit y = slope*x + intercept.
+// slope = cov(x,y) / var(x); intercept = mean(y) - slope*mean(x).
+// On zero x-variance (vertical/degenerate data) slope is 0 and intercept is
+// mean(y) — a defined, non-crashing result.
+
+fn linreg(xs, ys) -> list
+    let n = len(xs)
+    if n == 0
+        return [0.0, 0.0]
+    if len(ys) < n
+        return [0.0, 0.0]
+    let mx = mean(xs)
+    let my = mean(ys)
+    let sxy = 0.0
+    let sxx = 0.0
+    let i = 0
+    while i < n
+        let dx = _f(xs[i]) - mx
+        let dy = _f(ys[i]) - my
+        sxy = sxy + dx * dy
+        sxx = sxx + dx * dx
+        i = i + 1
+    if sxx == 0.0
+        return [0.0, my]
+    let slope = sxy / sxx
+    let intercept = my - slope * mx
+    [slope, intercept]
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+fn main()
+    let tol = 0.0000001
+
+    // ---- count ----
+    assert_eq(count([1, 2, 3, 4]), 4)
+    assert_eq(count([]), 0)
+    assert_eq(count([5]), 1)
+
+    // ---- sum_list ----
+    assert_near(sum_list([1, 2, 3, 4]), 10.0, tol)
+    assert_near(sum_list([1.5, 2.5]), 4.0, tol)
+    assert_near(sum_list([]), 0.0, tol)
+    // mixed int + float
+    assert_near(sum_list([1, 2.5, 3]), 6.5, tol)
+
+    // ---- mean ----
+    assert_near(mean([1, 2, 3, 4]), 2.5, tol)
+    assert_near(mean([2, 4, 6]), 4.0, tol)
+    assert_near(mean([5]), 5.0, tol)
+    assert_near(mean([]), 0.0, tol)
+    assert_near(mean([1.0, 2.0, 3.0, 4.0, 5.0]), 3.0, tol)
+
+    // ---- variance (population) & stddev ----
+    // [2,4,4,4,5,5,7,9]: mean=5, squared devs=9+1+1+1+0+0+4+16=32, /8 = 4 -> std 2
+    assert_near(variance([2, 4, 4, 4, 5, 5, 7, 9]), 4.0, tol)
+    assert_near(stddev([2, 4, 4, 4, 5, 5, 7, 9]), 2.0, tol)
+    // constant data -> zero variance/stddev
+    assert_near(variance([7, 7, 7, 7]), 0.0, tol)
+    assert_near(stddev([7, 7, 7, 7]), 0.0, tol)
+    // simple 2-point: [1,3] mean 2, dev^2 = 1+1=2, /2 = 1
+    assert_near(variance([1, 3]), 1.0, tol)
+    assert_near(stddev([1, 3]), 1.0, tol)
+
+    // ---- median ----
+    assert_near(median([3, 1, 2]), 2.0, tol)            // odd
+    assert_near(median([1, 2, 3, 4]), 2.5, tol)         // even
+    assert_near(median([5]), 5.0, tol)
+    assert_near(median([4, 1, 3, 2]), 2.5, tol)         // unsorted even
+    assert_near(median([9, 7, 1, 3, 5]), 5.0, tol)      // unsorted odd
+    // input must NOT be mutated by median
+    let orig = [3, 1, 2]
+    let med = median(orig)
+    assert_near(med, 2.0, tol)
+    assert_eq(orig[0], 3)
+    assert_eq(orig[1], 1)
+    assert_eq(orig[2], 2)
+
+    // ---- mode ----
+    assert_near(mode([1, 2, 2, 3]), 2.0, tol)
+    assert_near(mode([4, 4, 4, 1, 2]), 4.0, tol)
+    // tie between 1 and 2 (each twice) -> smallest = 1
+    assert_near(mode([2, 2, 1, 1, 3]), 1.0, tol)
+    // all unique -> smallest value (every count is 1)
+    assert_near(mode([5, 3, 9, 1, 7]), 1.0, tol)
+    assert_near(mode([42]), 42.0, tol)
+
+    // ---- min / max / range ----
+    assert_near(minv([3, 1, 4, 1, 5, 9, 2, 6]), 1.0, tol)
+    assert_near(maxv([3, 1, 4, 1, 5, 9, 2, 6]), 9.0, tol)
+    assert_near(range_of([3, 1, 4, 1, 5, 9, 2, 6]), 8.0, tol)
+    assert_near(minv([-5, -2, -9]), -9.0, tol)
+    assert_near(maxv([-5, -2, -9]), -2.0, tol)
+    assert_near(range_of([7, 7, 7]), 0.0, tol)
+
+    // ---- percentile ----
+    assert_near(percentile([1, 2, 3, 4, 5], 50), 3.0, tol)
+    assert_near(percentile([1, 2, 3, 4, 5], 0), 1.0, tol)
+    assert_near(percentile([1, 2, 3, 4, 5], 100), 5.0, tol)
+    // 25th of [1..5]: rank = 0.25*4 = 1.0 -> exactly index 1 -> 2
+    assert_near(percentile([1, 2, 3, 4, 5], 25), 2.0, tol)
+    // 75th of [1..5]: rank = 0.75*4 = 3.0 -> index 3 -> 4
+    assert_near(percentile([1, 2, 3, 4, 5], 75), 4.0, tol)
+    // interpolation: median of even via percentile 50 of [1,2,3,4]
+    // rank = 0.5*3 = 1.5 -> between idx1(2) and idx2(3) -> 2.5
+    assert_near(percentile([1, 2, 3, 4], 50), 2.5, tol)
+    // 10th of [10,20,30,40,50]: rank=0.1*4=0.4 -> 10 + (20-10)*0.4 = 14
+    assert_near(percentile([10, 20, 30, 40, 50], 10), 14.0, tol)
+    // single element
+    assert_near(percentile([42], 99), 42.0, tol)
+    // clamping out-of-range p
+    assert_near(percentile([1, 2, 3, 4, 5], 150), 5.0, tol)
+    assert_near(percentile([1, 2, 3, 4, 5], -10), 1.0, tol)
+    // percentile must not mutate input
+    let porig = [5, 3, 1, 4, 2]
+    let pq = percentile(porig, 50)
+    assert_near(pq, 3.0, tol)
+    assert_eq(porig[0], 5)
+    assert_eq(porig[4], 2)
+
+    // ---- correlation ----
+    // perfectly positively correlated: y = 2x + 1 -> r = 1
+    let cx = [1, 2, 3, 4, 5]
+    let cy = [3, 5, 7, 9, 11]
+    assert_near(correlation(cx, cy), 1.0, tol)
+    // perfectly negatively correlated: y = -x -> r = -1
+    assert_near(correlation([1, 2, 3, 4], [4, 3, 2, 1]), -1.0, tol)
+    // zero variance in y -> guarded to 0.0
+    assert_near(correlation([1, 2, 3], [5, 5, 5]), 0.0, tol)
+    // zero variance in x -> guarded to 0.0
+    assert_near(correlation([2, 2, 2], [1, 2, 3]), 0.0, tol)
+    // self-correlation is 1
+    assert_near(correlation([1, 4, 9, 16], [1, 4, 9, 16]), 1.0, tol)
+
+    // ---- linreg ----
+    // perfect line y = 2x + 1
+    let lr = linreg([1, 2, 3, 4, 5], [3, 5, 7, 9, 11])
+    assert_near(lr[0], 2.0, tol)        // slope
+    assert_near(lr[1], 1.0, tol)        // intercept
+    // line y = -3x + 10
+    let lr2 = linreg([0, 1, 2, 3], [10, 7, 4, 1])
+    assert_near(lr2[0], -3.0, tol)
+    assert_near(lr2[1], 10.0, tol)
+    // horizontal line y = 5 -> slope 0, intercept 5
+    let lr3 = linreg([1, 2, 3, 4], [5, 5, 5, 5])
+    assert_near(lr3[0], 0.0, tol)
+    assert_near(lr3[1], 5.0, tol)
+    // degenerate x (all equal) -> slope 0, intercept mean(y)
+    let lr4 = linreg([2, 2, 2], [1, 2, 6])
+    assert_near(lr4[0], 0.0, tol)
+    assert_near(lr4[1], 3.0, tol)
+    // fractional slope: y = 0.5x + 1 over [0,2,4,6] -> [1,2,3,4]
+    let lr5 = linreg([0, 2, 4, 6], [1, 2, 3, 4])
+    assert_near(lr5[0], 0.5, tol)
+    assert_near(lr5[1], 1.0, tol)
+
+    print("stats ok")

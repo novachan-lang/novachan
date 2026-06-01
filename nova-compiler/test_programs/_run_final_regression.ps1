@@ -68,7 +68,12 @@ $domain_tests = @(
     'ecs',
     'crypto_util',
     'netutil',
-    'compress_rle'
+    'compress_rle',
+    'nn',
+    'physics2d',
+    'stats',
+    'router',
+    'validate'
 )
 
 $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests

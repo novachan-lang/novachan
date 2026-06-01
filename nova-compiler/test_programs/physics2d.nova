@@ -1,0 +1,352 @@
+// ============================================================================
+// NOVA Standard Library — physics2d module
+// ============================================================================
+// A production-grade 2D physics / collision library, pure NOVA.
+//
+// Representation:
+//   vec2  = [x, y]                      (list of 2 floats)
+//   aabb  = [x, y, w, h]                (axis-aligned box: min corner + size)
+//
+// All arithmetic is float-based. Integer literals passed by callers are
+// promoted with _f (x * 1.0) so the library is robust to mixed int/float
+// inputs. We never use the float() builtin (it corrupts already-float
+// values) and never use `x + 0.0`. The ONLY sound int-or-float -> float
+// coercion is `x * 1.0`, captured in _f below.
+//
+// Public API:
+//   vec2:   _f, vec2_add, vec2_sub, vec2_scale, vec2_length, vec2_normalize
+//   aabb:   aabb_new, aabb_intersects, aabb_contains_point
+//   circle: circle_intersects
+//   sim:    integrate
+//   solve:  resolve_aabb_overlap
+
+// ── numeric helper ──────────────────────────────────────────────────────────
+// Universal int-or-float -> float coercion. int*1.0 promotes via the float
+// multiply; float*1.0 is the identity. float() builtin is NOT used because it
+// reinterprets an already-float value's bit pattern as an integer.
+
+fn _f(x) -> float
+    x * 1.0
+
+// ── vec2 ──────────────────────────────────────────────────────────────────────
+
+fn vec2_add(a, b) -> list
+    [a[0] + b[0], a[1] + b[1]]
+
+fn vec2_sub(a, b) -> list
+    [a[0] - b[0], a[1] - b[1]]
+
+fn vec2_scale(a, s) -> list
+    let fs = _f(s)
+    [a[0] * fs, a[1] * fs]
+
+fn vec2_length(a) -> float
+    sqrt(a[0] * a[0] + a[1] * a[1])
+
+fn vec2_normalize(a) -> list
+    let len = vec2_length(a)
+    if len == 0.0
+        return [0.0, 0.0]
+    let inv = 1.0 / len
+    [a[0] * inv, a[1] * inv]
+
+// ── AABB (axis-aligned bounding box) ──────────────────────────────────────────
+// Stored as [x, y, w, h] where (x, y) is the minimum corner and (w, h) the
+// positive size. The box spans [x, x+w] on X and [y, y+h] on Y.
+
+fn aabb_new(x, y, w, h) -> list
+    [_f(x), _f(y), _f(w), _f(h)]
+
+// Overlap test using the separating-axis shortcut for AABBs: two boxes overlap
+// iff they overlap on BOTH axes. Edge-touching (a.maxX == b.minX) is treated as
+// NOT overlapping (strict <), which is the standard convention so that boxes
+// sharing only a boundary are considered separated.
+fn aabb_intersects(a, b) -> bool
+    let amin_x = a[0]
+    let amax_x = a[0] + a[2]
+    let amin_y = a[1]
+    let amax_y = a[1] + a[3]
+    let bmin_x = b[0]
+    let bmax_x = b[0] + b[2]
+    let bmin_y = b[1]
+    let bmax_y = b[1] + b[3]
+    if amax_x <= bmin_x
+        return false
+    if bmax_x <= amin_x
+        return false
+    if amax_y <= bmin_y
+        return false
+    if bmax_y <= amin_y
+        return false
+    true
+
+// Point containment. A point on the min edge is inside; a point on the max edge
+// is outside (half-open [min, max) interval), matching aabb_intersects' strict
+// boundary convention so containment and overlap stay consistent.
+fn aabb_contains_point(box, px, py) -> bool
+    let fpx = _f(px)
+    let fpy = _f(py)
+    let min_x = box[0]
+    let max_x = box[0] + box[2]
+    let min_y = box[1]
+    let max_y = box[1] + box[3]
+    if fpx < min_x
+        return false
+    if fpx >= max_x
+        return false
+    if fpy < min_y
+        return false
+    if fpy >= max_y
+        return false
+    true
+
+// ── Circle collision ──────────────────────────────────────────────────────────
+// Two circles overlap iff the distance between centers is < sum of radii. We
+// compare SQUARED quantities to avoid the sqrt rounding error and the cost of
+// the square root. Touching (distance == r1+r2) counts as overlapping (<=),
+// which is the natural convention for circles where the boundary is shared
+// contact.
+fn circle_intersects(x1, y1, r1, x2, y2, r2) -> bool
+    let dx = _f(x2) - _f(x1)
+    let dy = _f(y2) - _f(y1)
+    let dist_sq = dx * dx + dy * dy
+    let r_sum = _f(r1) + _f(r2)
+    let r_sum_sq = r_sum * r_sum
+    dist_sq <= r_sum_sq
+
+// ── Integration (semi-implicit / symplectic Euler) ────────────────────────────
+// vel' = vel + accel * dt   (velocity updated first)
+// pos' = pos + vel' * dt    (position uses the NEW velocity)
+// Returns [new_pos, new_vel] as a list of two vec2s. Semi-implicit Euler is the
+// standard choice for game physics because it conserves energy far better than
+// explicit (forward) Euler for oscillatory systems.
+fn integrate(pos, vel, accel, dt) -> list
+    let fdt = _f(dt)
+    let new_vx = vel[0] + accel[0] * fdt
+    let new_vy = vel[1] + accel[1] * fdt
+    let new_px = pos[0] + new_vx * fdt
+    let new_py = pos[1] + new_vy * fdt
+    let new_pos = [new_px, new_py]
+    let new_vel = [new_vx, new_vy]
+    [new_pos, new_vel]
+
+// ── AABB overlap resolution (minimum translation vector) ──────────────────────
+// Given two OVERLAPPING boxes a and b, return the minimum translation vector
+// [mtvx, mtvy] that, applied to box a, separates it from b along the axis of
+// least penetration. If the boxes do not overlap, returns [0.0, 0.0].
+//
+// Penetration on each axis is the signed overlap; we pick the axis with the
+// SMALLEST absolute overlap (cheapest separation) and push a out along it.
+// The sign is chosen so a moves away from b: if a's center is left of b's
+// center we push a further left (negative x), and so on.
+fn resolve_aabb_overlap(a, b) -> list
+    if aabb_intersects(a, b) == false
+        return [0.0, 0.0]
+    let amin_x = a[0]
+    let amax_x = a[0] + a[2]
+    let bmin_x = b[0]
+    let bmax_x = b[0] + b[2]
+    let amin_y = a[1]
+    let amax_y = a[1] + a[3]
+    let bmin_y = b[1]
+    let bmax_y = b[1] + b[3]
+    // Overlap extents on each axis (both positive because boxes intersect).
+    // overlap_x = min(amax, bmax) - max(amin, bmin)
+    let right = amax_x
+    if bmax_x < right
+        right = bmax_x
+    let left = amin_x
+    if bmin_x > left
+        left = bmin_x
+    let overlap_x = right - left
+    let top = amax_y
+    if bmax_y < top
+        top = bmax_y
+    let bottom = amin_y
+    if bmin_y > bottom
+        bottom = bmin_y
+    let overlap_y = top - bottom
+    // Center coordinates to decide push direction.
+    let acx = amin_x + a[2] * 0.5
+    let bcx = bmin_x + b[2] * 0.5
+    let acy = amin_y + a[3] * 0.5
+    let bcy = bmin_y + b[3] * 0.5
+    if overlap_x < overlap_y
+        // Separate along X (least penetration).
+        if acx < bcx
+            return [0.0 - overlap_x, 0.0]
+        return [overlap_x, 0.0]
+    // Separate along Y.
+    if acy < bcy
+        return [0.0, 0.0 - overlap_y]
+    [0.0, overlap_y]
+
+// ── tests ──────────────────────────────────────────────────────────────────────
+
+fn main()
+    let tol = 0.0000001
+
+    // ---- _f coercion sanity ----
+    assert_near(_f(7), 7.0, tol)
+    assert_near(_f(11.0), 11.0, tol)
+    assert_near(_f(-2.5), -2.5, tol)
+
+    // ---- vec2 arithmetic ----
+    let va = [3.0, 4.0]
+    let vb = [1.0, 2.0]
+    let vs = vec2_add(va, vb)
+    assert_near(vs[0], 4.0, tol)
+    assert_near(vs[1], 6.0, tol)
+    let vd = vec2_sub(va, vb)
+    assert_near(vd[0], 2.0, tol)
+    assert_near(vd[1], 2.0, tol)
+    let vsc = vec2_scale(va, 2.0)
+    assert_near(vsc[0], 6.0, tol)
+    assert_near(vsc[1], 8.0, tol)
+    // scale with int factor (coercion robustness)
+    let vsci = vec2_scale(va, 3)
+    assert_near(vsci[0], 9.0, tol)
+    assert_near(vsci[1], 12.0, tol)
+    // length: 3-4-5 triangle
+    assert_near(vec2_length([3.0, 4.0]), 5.0, tol)
+    assert_near(vec2_length([0.0, 0.0]), 0.0, tol)
+    // normalize: unit length, correct direction
+    let vn = vec2_normalize([3.0, 4.0])
+    assert_near(vn[0], 0.6, tol)
+    assert_near(vn[1], 0.8, tol)
+    assert_near(vec2_length(vn), 1.0, tol)
+    // zero vector normalizes to zero (no NaN / div-by-zero)
+    let vnz = vec2_normalize([0.0, 0.0])
+    assert_near(vnz[0], 0.0, tol)
+    assert_near(vnz[1], 0.0, tol)
+
+    // ---- aabb construction ----
+    let box = aabb_new(1, 2, 3, 4)
+    assert_near(box[0], 1.0, tol)
+    assert_near(box[1], 2.0, tol)
+    assert_near(box[2], 3.0, tol)
+    assert_near(box[3], 4.0, tol)
+
+    // ---- aabb_intersects: overlapping ----
+    let oa = aabb_new(0, 0, 10, 10)
+    let ob = aabb_new(5, 5, 10, 10)
+    assert_eq(aabb_intersects(oa, ob), true)
+    assert_eq(aabb_intersects(ob, oa), true)
+    // one box fully inside another
+    let inner = aabb_new(2, 2, 1, 1)
+    assert_eq(aabb_intersects(oa, inner), true)
+    assert_eq(aabb_intersects(inner, oa), true)
+
+    // ---- aabb_intersects: separated ----
+    let sa = aabb_new(0, 0, 5, 5)
+    let sb = aabb_new(10, 10, 5, 5)
+    assert_eq(aabb_intersects(sa, sb), false)
+    assert_eq(aabb_intersects(sb, sa), false)
+    // separated only on X
+    let sx = aabb_new(20, 0, 5, 5)
+    assert_eq(aabb_intersects(sa, sx), false)
+    // separated only on Y
+    let sy = aabb_new(0, 20, 5, 5)
+    assert_eq(aabb_intersects(sa, sy), false)
+    // edge-touching boxes are NOT overlapping (strict boundary)
+    let edge = aabb_new(5, 0, 5, 5)
+    assert_eq(aabb_intersects(sa, edge), false)
+
+    // ---- aabb_contains_point ----
+    let cbox = aabb_new(0, 0, 10, 10)
+    assert_eq(aabb_contains_point(cbox, 5, 5), true)
+    assert_eq(aabb_contains_point(cbox, 0, 0), true)
+    // max edge is outside (half-open interval)
+    assert_eq(aabb_contains_point(cbox, 10, 10), false)
+    assert_eq(aabb_contains_point(cbox, 10, 5), false)
+    assert_eq(aabb_contains_point(cbox, 5, 10), false)
+    // clearly outside
+    assert_eq(aabb_contains_point(cbox, 15, 5), false)
+    assert_eq(aabb_contains_point(cbox, -1, 5), false)
+    assert_eq(aabb_contains_point(cbox, 5, -1), false)
+    // float point inside
+    assert_eq(aabb_contains_point(cbox, 9.99, 0.01), true)
+
+    // ---- circle_intersects ----
+    // clearly overlapping (centers 1 apart, radii 1+1)
+    assert_eq(circle_intersects(0, 0, 1, 1, 0, 1), true)
+    // clearly separated (centers 10 apart, radii 1+1)
+    assert_eq(circle_intersects(0, 0, 1, 10, 0, 1), false)
+    // boundary: centers exactly r1+r2 apart -> touching counts as intersecting
+    // centers at (0,0) and (5,0), radii 2 and 3 -> distance 5 == 2+3
+    assert_eq(circle_intersects(0, 0, 2, 5, 0, 3), true)
+    // just beyond boundary: distance 5.001 > 5 -> not intersecting
+    assert_eq(circle_intersects(0.0, 0.0, 2.0, 5.001, 0.0, 3.0), false)
+    // just inside boundary: distance 4.999 < 5 -> intersecting
+    assert_eq(circle_intersects(0.0, 0.0, 2.0, 4.999, 0.0, 3.0), true)
+    // diagonal distance: 3-4-5 -> centers (0,0),(3,4) dist 5, radii 2+3 touching
+    assert_eq(circle_intersects(0, 0, 2, 3, 4, 3), true)
+    // diagonal just out: radii 2+2.9 = 4.9 < 5 -> not intersecting
+    assert_eq(circle_intersects(0.0, 0.0, 2.0, 3.0, 4.0, 2.9), false)
+
+    // ---- integrate: known-number step ----
+    // pos[0,0] vel[1,0] accel[0,-10] dt=0.1
+    //   vel' = [1 + 0*0.1, 0 + (-10)*0.1] = [1, -1]
+    //   pos' = [0 + 1*0.1, 0 + (-1)*0.1]  = [0.1, -0.1]
+    let r0 = integrate([0.0, 0.0], [1.0, 0.0], [0.0, -10.0], 0.1)
+    let np = r0[0]
+    let nv = r0[1]
+    assert_near(np[0], 0.1, tol)
+    assert_near(np[1], -0.1, tol)
+    assert_near(nv[0], 1.0, tol)
+    assert_near(nv[1], -1.0, tol)
+    // a second step continues correctly (semi-implicit chaining)
+    // vel'' = [1, -1 + (-10)*0.1] = [1, -2]
+    // pos'' = [0.1 + 1*0.1, -0.1 + (-2)*0.1] = [0.2, -0.3]
+    let r1 = integrate(np, nv, [0.0, -10.0], 0.1)
+    let np2 = r1[0]
+    let nv2 = r1[1]
+    assert_near(np2[0], 0.2, tol)
+    assert_near(np2[1], -0.3, tol)
+    assert_near(nv2[0], 1.0, tol)
+    assert_near(nv2[1], -2.0, tol)
+    // zero accel, zero dt -> nothing moves
+    let rstat = integrate([5.0, 5.0], [2.0, 3.0], [0.0, 0.0], 0.0)
+    let sp = rstat[0]
+    assert_near(sp[0], 5.0, tol)
+    assert_near(sp[1], 5.0, tol)
+
+    // ---- resolve_aabb_overlap: minimum translation vector ----
+    // a = [0,0,10,10], b = [8,0,10,10]. Overlap on X = 2, full overlap on Y.
+    // Least-penetration axis is X. a's center (5) is left of b's center (13),
+    // so a is pushed left: mtv = [-2, 0].
+    let ra = aabb_new(0, 0, 10, 10)
+    let rb = aabb_new(8, 0, 10, 10)
+    let mtv = resolve_aabb_overlap(ra, rb)
+    assert_near(mtv[0], -2.0, tol)
+    assert_near(mtv[1], 0.0, tol)
+    // Applying the MTV to a separates the boxes (now edge-touching, not overlapping).
+    let ra_moved = aabb_new(ra[0] + mtv[0], ra[1] + mtv[1], ra[2], ra[3])
+    assert_eq(aabb_intersects(ra_moved, rb), false)
+
+    // symmetric case: a is to the RIGHT of b -> pushed right (positive x).
+    let rc = aabb_new(8, 0, 10, 10)
+    let rd = aabb_new(0, 0, 10, 10)
+    let mtv2 = resolve_aabb_overlap(rc, rd)
+    assert_near(mtv2[0], 2.0, tol)
+    assert_near(mtv2[1], 0.0, tol)
+    let rc_moved = aabb_new(rc[0] + mtv2[0], rc[1] + mtv2[1], rc[2], rc[3])
+    assert_eq(aabb_intersects(rc_moved, rd), false)
+
+    // Y-axis least penetration: overlap on Y smaller than on X.
+    // a = [0,0,10,10], b = [0,8,10,10]. Overlap X = 10, overlap Y = 2.
+    // a's center (5) below b's center (13) -> push a down: mtv = [0, -2].
+    let re = aabb_new(0, 0, 10, 10)
+    let rf = aabb_new(0, 8, 10, 10)
+    let mtv3 = resolve_aabb_overlap(re, rf)
+    assert_near(mtv3[0], 0.0, tol)
+    assert_near(mtv3[1], -2.0, tol)
+    let re_moved = aabb_new(re[0] + mtv3[0], re[1] + mtv3[1], re[2], re[3])
+    assert_eq(aabb_intersects(re_moved, rf), false)
+
+    // Non-overlapping input -> zero MTV.
+    let mtv0 = resolve_aabb_overlap(sa, sb)
+    assert_near(mtv0[0], 0.0, tol)
+    assert_near(mtv0[1], 0.0, tol)
+
+    print("physics2d ok")

@@ -549,6 +549,73 @@ NOVA can compile a subset of itself to WebAssembly. The runtime exposes:
 
 See `nova-compiler/test_programs/phase12_wasm_gpu_test.nova` for the working example.
 
+## Domain modules (Phase 11/13)
+
+Shipped as standalone, fully-tested NOVA source modules under
+`nova-compiler/test_programs/`. Each is self-contained and compiles with the
+bundled compiler. Copy the module into your project or import the functions you need.
+
+### `math3d` — 3D linear algebra
+
+Vectors are float lists (`[x,y,z]`); `mat4` is a flat 16-float row-major list.
+
+| Function | Description |
+|---|---|
+| `v3(x,y,z)`, `v3_add/sub`, `v3_scale(v,s)` | vec3 construction & arithmetic |
+| `v3_dot`, `v3_cross`, `v3_length`, `v3_normalize` | products, magnitude, unit (zero-safe) |
+| `v3_lerp(a,b,t)`, `v3_distance(a,b)` | interpolation, distance |
+| `v2`, `v2_add/sub`, `v2_dot`, `v2_length` | vec2 ops |
+| `mat4_identity`, `mat4_mul(a,b)` | 4×4 matrix, general multiply |
+| `mat4_translate(x,y,z)`, `mat4_scale(x,y,z)`, `mat4_transform_v3(m,v)` | transforms |
+| `deg_to_rad`, `rad_to_deg`, `clampf(v,lo,hi)` | helpers |
+
+### `ecs` — Entity-Component-System
+
+| Function | Description |
+|---|---|
+| `world_new()` | create a world |
+| `entity_create(w)` | fresh monotonic entity id (never reused) |
+| `entity_destroy(w,eid)` / `entity_alive(w,eid)` | lifecycle (alive-gated) |
+| `component_set/get/has(w,eid,name,...)` | attach/read components |
+| `entities_with(w,name)` | query eids having a component |
+| `entity_count(w)` | living entity count |
+
+### `crypto_util` — high-level crypto
+
+Wraps the `sha256` / `hmac_sha256` / `crc32` / `base64` / `random_bytes` builtins.
+`crc32` is CRC-32/ISO-HDLC correct (`crc32("123456789")==0xCBF43926`).
+
+| Function | Description |
+|---|---|
+| `hash_hex(s)` | SHA-256 hex |
+| `checksum(s)` | CRC-32 int |
+| `hmac_sign(key,msg)` / `hmac_verify(key,msg,sig)` | HMAC-SHA256 sign/verify |
+| `b64(s)` / `b64_decode_to_str(b)` | base64 round-trip |
+| `token(n)` | random hex token |
+
+### `netutil` — HTTP/URL parsing (no sockets needed)
+
+| Function | Description |
+|---|---|
+| `parse_host_port("h:p")` | `[host, port_int]` |
+| `build_http_request(method,path,host)` | HTTP/1.1 request string |
+| `parse_http_status_line(line)` | `[version, code_int, reason]` |
+| `parse_query_string("a=1&b=2")` | dict of string values |
+| `url_join(base,path)` | single-slash join |
+| `ip_to_int(ip)` / `int_to_ip(n)` | 32-bit round-trip |
+
+### `compress_rle` — run-length compression
+
+| Function | Description |
+|---|---|
+| `rle_encode(s)` / `rle_decode(s)` | unambiguous RLE; `decode(encode(x))==x` for all ASCII |
+| `bytes_pack(ints)` / `bytes_unpack(s)` | int-list ↔ string (bytes 1..255) |
+
+> **Float note for module authors:** NOVA's `float()` builtin must not be used to
+> coerce a value that may already be a float (it reinterprets the bits). Use
+> `x * 1.0` for a correct int-or-float → float coercion. The domain modules
+> follow this via a local `_f(x)` helper.
+
 ---
 
 For non-stdlib helpers shipped as separate modules (Forge HTTP server, Cortex AI, Pulse data pipeline, Mesh distributed, Sentinel security, Ops devops, Reactor games, Prism GUI, Edge embedded), see `FRAMEWORKS.md`.

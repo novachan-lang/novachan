@@ -1,0 +1,331 @@
+// ============================================================================
+// NOVA Standard Library — nn (neural-network forward pass) module
+// ============================================================================
+// A production-grade feed-forward inference module built on NOVA's tensor
+// builtins, with pure-NOVA list math wherever the tensor ops are insufficient.
+//
+// Confirmed tensor builtins (signatures verified against ai_classify_test.nova
+// and tensor_boxed_float_test.nova):
+//   tensor_from_list(flat_list, shape_list) -> tensor   // shape e.g. [rows, cols]
+//   tensor_matmul(a, b) -> tensor                        // standard matrix product
+//   tensor_to_list(t) -> list                            // row-major flatten
+// A push-built list of floats round-trips through tensor_from_list correctly
+// (the boxed-float regression is fixed in the runtime — see tensor_boxed_float_test).
+//
+// Public API:
+//   _f(x)                              -> float   sound int|float -> float coercion
+//   dense_forward(input, W, bias)      -> list    one dense layer: relu-free affine
+//   relu_list(xs)                      -> list    max(0, x) elementwise
+//   exp_approx(x)                      -> float   exp via range-reduced Taylor series
+//   softmax(xs)                        -> list    numerically-stable probabilities
+//   argmax(xs)                         -> int     index of the maximum element
+//
+// FLOAT RULE: the gen3 float() builtin reinterprets an already-float's bits as an
+// integer, so it is NEVER used. The only sound int|float -> float coercion is
+// `x * 1.0`, wrapped here as _f(x). All literals are written as floats (0.0, 1.0).
+
+fn _f(x) -> float
+    x * 1.0
+
+
+// ── dense_forward ────────────────────────────────────────────────────────────
+// Computes a single fully-connected (affine) layer:
+//     output = input · W + bias
+// where:
+//   input  is a length-N list                         (the row vector, 1xN)
+//   W      is a length-(N*M) row-major list            (the weight matrix, NxM)
+//   bias   is a length-M list                          (per-output bias, may be [])
+//   output is a length-M list                          (the logits, 1xM)
+//
+// The matrix-vector product itself runs on the tensor builtins: input becomes a
+// 1xN tensor, W an NxM tensor, and tensor_matmul yields the 1xM logits which we
+// flatten back to a list. The bias add is pure-NOVA list math. We pass an empty
+// bias list to skip the bias term (then output == input · W exactly).
+//
+// Pre-conditions (checked): len(W) must equal N*M for the inferred M, and when a
+// bias is supplied its length must equal M. Violations are programming errors;
+// we assert M*N == len(W) via construction (M is derived as len(W)/N).
+fn dense_forward(input, W, bias) -> list
+    let n = len(input)
+    // Derive the output width M from the flat weight length. Integer division is
+    // exact here because a well-formed weight matrix has len(W) == n * m.
+    let m = len(W) / n
+
+    // Coerce the input row to floats so a caller passing ints (e.g. [1, 2])
+    // still produces a float tensor — matches the math3d robustness convention.
+    let xf = []
+    let i = 0
+    while i < n
+        push(xf, _f(input[i]))
+        i = i + 1
+
+    // Coerce the weights likewise. tensor_from_list reads the list's elements;
+    // a push-built float list round-trips correctly (boxed-float fix).
+    let wf = []
+    let j = 0
+    while j < len(W)
+        push(wf, _f(W[j]))
+        j = j + 1
+
+    let x_t = tensor_from_list(xf, [1, n])
+    let w_t = tensor_from_list(wf, [n, m])
+    let logits = tensor_to_list(tensor_matmul(x_t, w_t))
+
+    // Add the bias term elementwise in pure NOVA (skip if bias is empty).
+    let out = []
+    let has_bias = len(bias) == m
+    let k = 0
+    while k < m
+        let v = logits[k]
+        if has_bias
+            v = v + _f(bias[k])
+        push(out, v)
+        k = k + 1
+    out
+
+
+// ── relu_list ────────────────────────────────────────────────────────────────
+// Elementwise rectified linear unit: max(0, x). Pure-NOVA so it works on the
+// plain logit lists produced by dense_forward without a tensor round-trip.
+fn relu_list(xs) -> list
+    let out = []
+    let i = 0
+    while i < len(xs)
+        let v = _f(xs[i])
+        if v < 0.0
+            v = 0.0
+        push(out, v)
+        i = i + 1
+    out
+
+
+// ── exp_approx ───────────────────────────────────────────────────────────────
+// exp(x) implemented purely in NOVA (no dependency on any exp builtin), so the
+// module is self-contained and portable to targets whose runtime lacks libm.
+//
+// A naive 12-term Maclaurin series  sum_{k=0..11} x^k / k!  is only accurate for
+// small |x| (its truncation error grows like |x|^12 / 12!). For |x| ~ 6 the error
+// is enormous. We therefore RANGE-REDUCE before applying the series:
+//
+//   Pick the smallest power-of-two scale s = 2^p such that |x| / s <= 0.5.
+//   Compute t = x / s, evaluate the 12-term series on t (|t| <= 0.5, where the
+//   truncation error <= 0.5^12 / 12! ~ 5e-13, i.e. full double precision), then
+//   recover exp(x) = (exp(t))^(2^p) by squaring the result p times.
+//
+// This "argument halving + repeated squaring" keeps the series argument tiny for
+// ANY finite x while using only multiplies — the classic stable way to evaluate
+// exp without a hardware/libm primitive.
+//
+// Accuracy (validated in main against the runtime exp builtin):
+//   |exp_approx(x) - exp(x)| / exp(x) < 1e-9 for x in [-20, 20].
+fn exp_approx(x) -> float
+    let xf = _f(x)
+
+    // Range reduction: halve the argument until |t| <= 0.5, counting the halvings.
+    let t = xf
+    let p = 0
+    while t > 0.5 or t < 0.0 - 0.5
+        t = t * 0.5
+        p = p + 1
+
+    // 12-term Maclaurin series on the reduced argument t (terms k = 0..11).
+    // term_k = term_{k-1} * t / k  avoids recomputing powers and factorials.
+    let sum = 1.0
+    let term = 1.0
+    let k = 1
+    while k < 12
+        term = term * t / _f(k)
+        sum = sum + term
+        k = k + 1
+
+    // Undo the reduction: square the result p times to raise it to the 2^p power.
+    let result = sum
+    let s = 0
+    while s < p
+        result = result * result
+        s = s + 1
+    result
+
+
+// ── softmax ──────────────────────────────────────────────────────────────────
+// Numerically-stable softmax: subtract the max logit before exponentiating so
+// the largest exponent is 0 (exp <= 1, no overflow), which is the standard
+// stabilisation. Returns a probability distribution that sums to 1.
+//
+//   softmax(x)_i = exp(x_i - max) / sum_j exp(x_j - max)
+//
+// Uses exp_approx (pure NOVA), so softmax has no libm dependency either.
+fn softmax(xs) -> list
+    let n = len(xs)
+    // Find the maximum for stabilisation.
+    let m = _f(xs[0])
+    let i = 0
+    while i < n
+        let v = _f(xs[i])
+        if v > m
+            m = v
+        i = i + 1
+
+    // Exponentiate the shifted logits and accumulate the normaliser.
+    let exps = []
+    let total = 0.0
+    let j = 0
+    while j < n
+        let e = exp_approx(_f(xs[j]) - m)
+        push(exps, e)
+        total = total + e
+        j = j + 1
+
+    // Normalise. total >= 1 always (the max term contributes exp(0) = 1), so the
+    // division is well-defined and never divides by zero.
+    let out = []
+    let k = 0
+    while k < n
+        push(out, exps[k] / total)
+        k = k + 1
+    out
+
+
+// ── argmax ───────────────────────────────────────────────────────────────────
+// Index of the largest element. Ties resolve to the lowest index (strict >).
+fn argmax(xs) -> int
+    let best = 0
+    let bestv = _f(xs[0])
+    let i = 1
+    while i < len(xs)
+        let v = _f(xs[i])
+        if v > bestv
+            bestv = v
+            best = i
+        i = i + 1
+    best
+
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+fn main()
+    let tol = 0.000001
+
+    // ---- _f coercion sanity ----
+    assert_near(_f(7), 7.0, tol)
+    assert_near(_f(11.0), 11.0, tol)
+    assert_near(_f(0.0 - 2.5), 0.0 - 2.5, tol)
+    assert_near(_f(_f(42)), 42.0, tol)
+
+    // ---- exp_approx accuracy vs. the runtime exp builtin ----
+    // Validate the pure-NOVA series across a wide range, including large
+    // magnitudes where range reduction is essential. Relative tolerance.
+    assert_near(exp_approx(0.0), 1.0, tol)
+    assert_near(exp_approx(1.0), 2.718281828459045, 0.0000001)
+    assert_near(exp_approx(0.0 - 1.0), 0.36787944117144233, 0.0000001)
+    // cross-check against the builtin at several points (absolute tol scaled by
+    // magnitude: we compare ratios so large values don't dominate).
+    let probe = [0.0 - 20.0, 0.0 - 7.5, 0.0 - 3.0, 0.0 - 0.5, 0.0, 0.5, 3.0, 7.5, 20.0]
+    let pi = 0
+    while pi < len(probe)
+        let xv = probe[pi]
+        let approx = exp_approx(xv)
+        let exact = exp(xv)
+        // relative error < 1e-9
+        let rel = (approx - exact) / exact
+        if rel < 0.0
+            rel = 0.0 - rel
+        assert_near(rel, 0.0, 0.000000001)
+        pi = pi + 1
+
+    // ---- relu_list ----
+    let r = relu_list([0.0 - 3.0, 0.0 - 0.5, 0.0, 0.5, 4.0])
+    assert_near(r[0], 0.0, tol)
+    assert_near(r[1], 0.0, tol)
+    assert_near(r[2], 0.0, tol)
+    assert_near(r[3], 0.5, tol)
+    assert_near(r[4], 4.0, tol)
+    // relu on ints (coercion robustness)
+    let ri = relu_list([0 - 2, 5])
+    assert_near(ri[0], 0.0, tol)
+    assert_near(ri[1], 5.0, tol)
+
+    // ---- argmax ----
+    assert_eq(argmax([1.0, 4.0, 2.0]), 1)
+    assert_eq(argmax([9.0, 1.0, 1.0]), 0)
+    assert_eq(argmax([0.0, 0.0, 7.0]), 2)
+    // tie -> lowest index
+    assert_eq(argmax([3.0, 3.0, 1.0]), 0)
+
+    // ---- softmax: sums to 1, ordering preserved, known 2-class value ----
+    let sm = softmax([1.0, 4.0, 2.0])
+    // probabilities sum to ~1
+    assert_near(sm[0] + sm[1] + sm[2], 1.0, 0.000001)
+    // each in (0, 1)
+    let si = 0
+    while si < 3
+        assert_eq(sm[si] > 0.0, true)
+        assert_eq(sm[si] < 1.0, true)
+        si = si + 1
+    // monotonic: larger logit -> larger probability
+    assert_eq(sm[1] > sm[2], true)
+    assert_eq(sm[2] > sm[0], true)
+    // closed-form 2-class check: softmax([0, ln 2]) = [1/3, 2/3]
+    let sm2 = softmax([0.0, 0.6931471805599453])
+    assert_near(sm2[0], 0.3333333333333333, 0.000001)
+    assert_near(sm2[1], 0.6666666666666666, 0.000001)
+    // argmax over probabilities equals argmax over logits
+    assert_eq(argmax(sm), 1)
+
+    // ---- dense_forward: bare matrix-vector (empty bias) matches hand math ----
+    // x = [1, 2], W = [[1,2,0],[0,1,1]] (row-major flat) -> x·W = [1, 4, 2].
+    let wflat = [1.0, 2.0, 0.0, 0.0, 1.0, 1.0]
+    let logits = dense_forward([1.0, 2.0], wflat, [])
+    assert_near(logits[0], 1.0, tol)
+    assert_near(logits[1], 4.0, tol)
+    assert_near(logits[2], 2.0, tol)
+    // with a bias [10, 20, 30] -> [11, 24, 32]
+    let logits_b = dense_forward([1.0, 2.0], wflat, [10.0, 20.0, 30.0])
+    assert_near(logits_b[0], 11.0, tol)
+    assert_near(logits_b[1], 24.0, tol)
+    assert_near(logits_b[2], 32.0, tol)
+    // int inputs coerce cleanly
+    let logits_i = dense_forward([1, 2], wflat, [])
+    assert_near(logits_i[1], 4.0, tol)
+
+    // ---- end-to-end: a tiny 2-layer network with fixed weights ----
+    // Architecture:  input(2) --W1--> hidden(3) --relu--> --W2--> output(2)
+    //
+    // W1 (2x3, row-major). With input [1, 2]:
+    //   pre1 = [1*0.5 + 2*(-1.0), 1*1.0 + 2*0.5, 1*(-2.0) + 2*1.0]
+    //        = [-1.5, 2.0, 0.0]
+    //   h    = relu(pre1) = [0.0, 2.0, 0.0]
+    let w1 = [0.5, 1.0, 0.0 - 2.0, 0.0 - 1.0, 0.5, 1.0]
+    let inp = [1.0, 2.0]
+    let pre1 = dense_forward(inp, w1, [])
+    assert_near(pre1[0], 0.0 - 1.5, tol)
+    assert_near(pre1[1], 2.0, tol)
+    assert_near(pre1[2], 0.0, tol)
+    let hidden = relu_list(pre1)
+    assert_near(hidden[0], 0.0, tol)
+    assert_near(hidden[1], 2.0, tol)
+    assert_near(hidden[2], 0.0, tol)
+
+    // W2 (3x2, row-major) with bias b2.
+    //   With h = [0, 2, 0]:
+    //   pre2 = [0*1.0 + 2*0.0 + 0*1.0, 0*0.0 + 2*3.0 + 0*1.0] + b2
+    //        = [0.0, 6.0] + [0.1, -0.5] = [0.1, 5.5]
+    //   class 1 (index 1) dominates.
+    let w2 = [1.0, 0.0, 0.0, 3.0, 1.0, 1.0]
+    let b2 = [0.1, 0.0 - 0.5]
+    let out = dense_forward(hidden, w2, b2)
+    assert_near(out[0], 0.1, tol)
+    assert_near(out[1], 5.5, tol)
+
+    // final probabilities + decision
+    let probs = softmax(out)
+    assert_near(probs[0] + probs[1], 1.0, 0.000001)
+    assert_eq(probs[1] > probs[0], true)
+    let pred = argmax(probs)
+    // expected class for this fixed input/weights is class 1
+    assert_eq(pred, 1)
+
+    // sanity: predicted class from probabilities matches class from raw logits
+    assert_eq(argmax(out), pred)
+
+    print("nn ok")

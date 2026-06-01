@@ -1,0 +1,362 @@
+// ============================================================================
+// NOVA Standard Library — http_router module
+// ============================================================================
+// A pure-NOVA HTTP router / path-matcher. No sockets, no I/O — just string
+// operations over URL paths. This is the matching core that a real HTTP server
+// sits on top of: given a request method + path, find the registered route and
+// extract its path parameters.
+//
+// Pattern grammar (per segment, split on '/'):
+//   literal   "users"   — must equal the path segment exactly
+//   param     ":id"     — captures the path segment under key "id"
+//   wildcard  "*"        — matches ALL remaining path segments (zero or more),
+//                          captured (joined with '/') under key "*". A wildcard
+//                          must be the final pattern segment.
+//
+// Representations (plain Values — lists and dicts, no structs needed):
+//   route       = [method, pattern]                 (a list of two strings)
+//   route table = [route, route, ...]               (a list of routes)
+//   params      = { "id": "42", "pid": "7", ... }   (a dict, string->string)
+//
+// Why no structs: every piece of state here is naturally a Value (list/dict).
+// Keeping it as plain Values means the router composes with the rest of the
+// stdlib (json, collections) with zero glue, and matches NOVA's "data is just
+// Values" model. A struct would add a type with no behavior — pure ceremony.
+//
+// Public API:
+//   path_segments(path)            -> list of non-empty segments
+//   route_match(pattern, path)     -> params dict if match, else null
+//   method_key(method, pattern)    -> "GET /users/:id" route-table key
+//   query_extract(url)             -> dict of query params from the ?a=1&b=2 part
+//   router_new()                   -> empty route table
+//   router_add(r, method, pattern) -> append a route
+//   router_find(r, method, path)   -> [matched_pattern, params] or null
+//
+// Design notes:
+//   * Empty segments are dropped (split on '/' yields leading/trailing ""s for
+//     "/users/42" -> ["", "users", "42"] and "/static/" -> ["", "static", ""];
+//     path_segments normalises this to ["users","42"] / ["static"]). This makes
+//     trailing slashes and the leading slash irrelevant, which is what every
+//     real router does ("/users/42" and "users/42" route identically).
+//   * Matching is exact on segment count UNLESS the pattern ends in a wildcard.
+//   * router_find scans routes in registration order and returns the first hit,
+//     so more-specific routes should be registered before catch-alls.
+
+// ── path splitting ───────────────────────────────────────────────────────────
+// Split a path on '/' and keep only the non-empty segments. This single
+// normalisation point means callers never see the spurious "" segments that
+// split() produces for leading/trailing slashes.
+
+fn path_segments(path) -> list
+    let raw = split(path, "/")
+    let out = []
+    let i = 0
+    while i < len(raw)
+        let seg = raw[i]
+        if len(seg) > 0
+            push(out, seg)
+        i = i + 1
+    out
+
+// ── core matcher ─────────────────────────────────────────────────────────────
+// route_match(pattern, path):
+//   returns a params dict (possibly empty {}) when the path matches the
+//   pattern, or null when it does not. Never throws.
+//
+// Algorithm: walk pattern segments and path segments in lockstep.
+//   - "*"     : consume the rest of the path, record it under "*", return params
+//   - ":name" : require a path segment to exist; capture it under "name"
+//   - literal : require a path segment that equals it exactly
+// After the walk, the path must be fully consumed (no leftover segments) unless
+// a wildcard ended it.
+
+fn route_match(pattern, path)
+    let pseg = path_segments(pattern)
+    let xseg = path_segments(path)
+    let params = {}
+    let i = 0
+    while i < len(pseg)
+        let p = pseg[i]
+        if p == "*"
+            // Wildcard: swallow everything remaining in the path (>= 0 segs).
+            let rest = []
+            let j = i
+            while j < len(xseg)
+                push(rest, xseg[j])
+                j = j + 1
+            params["*"] = join(rest, "/")
+            return params
+        // Non-wildcard segment needs a corresponding path segment.
+        if i >= len(xseg)
+            return null
+        let x = xseg[i]
+        if len(p) > 0 and p[0] == ":"
+            // Parameter capture. Key is the pattern segment minus the ':'.
+            let key = slice(p, 1, len(p))
+            params[key] = x
+        else
+            if p != x
+                return null
+        i = i + 1
+    // Pattern exhausted with no wildcard: path must be exhausted too, else the
+    // path is longer than the pattern and is not a match.
+    if len(xseg) != len(pseg)
+        return null
+    params
+
+// ── route-table key ──────────────────────────────────────────────────────────
+// Build the canonical "METHOD PATTERN" key used to identify a route. Method is
+// upper-cased-by-convention by the caller; we just join with a single space.
+
+fn method_key(method, pattern) -> str
+    method + " " + pattern
+
+// ── query string extraction ──────────────────────────────────────────────────
+// query_extract(url): pull the part after the first '?' and parse it as
+// &-separated key=value pairs into a dict. A pair with no '=' maps the key to
+// the empty string. A pair with multiple '=' keeps everything after the first
+// '=' as the value. Returns {} when there is no query string.
+
+fn query_extract(url) -> dict
+    let out = {}
+    let q = find(url, "?")
+    if q < 0
+        return out
+    let qs = slice(url, q + 1, len(url))
+    if len(qs) == 0
+        return out
+    let pairs = split(qs, "&")
+    let i = 0
+    while i < len(pairs)
+        let pair = pairs[i]
+        if len(pair) > 0
+            let eq = find(pair, "=")
+            if eq < 0
+                out[pair] = ""
+            else
+                let k = slice(pair, 0, eq)
+                let v = slice(pair, eq + 1, len(pair))
+                if len(k) > 0
+                    out[k] = v
+        i = i + 1
+    out
+
+// ── Router ───────────────────────────────────────────────────────────────────
+// A route table is just a list of [method, pattern] routes. router_find scans
+// in order and returns [matched_pattern, params] for the first route whose
+// method matches AND whose pattern matches the path.
+
+fn router_new() -> list
+    let routes = []
+    routes
+
+fn router_add(r, method, pattern)
+    let route = [method, pattern]
+    push(r, route)
+    0
+
+fn router_find(r, method, path)
+    let i = 0
+    while i < len(r)
+        let route = r[i]
+        let rmethod = route[0]
+        let rpattern = route[1]
+        if rmethod == method
+            let params = route_match(rpattern, path)
+            if params != null
+                return [rpattern, params]
+        i = i + 1
+    null
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+fn main()
+    // ---- path_segments: leading/trailing/empty normalisation ----
+    let s1 = path_segments("/users/42/posts/7")
+    assert_eq(len(s1), 4)
+    assert_eq(s1[0], "users")
+    assert_eq(s1[1], "42")
+    assert_eq(s1[2], "posts")
+    assert_eq(s1[3], "7")
+
+    let s2 = path_segments("/static/")
+    assert_eq(len(s2), 1)
+    assert_eq(s2[0], "static")
+
+    let s3 = path_segments("")
+    assert_eq(len(s3), 0)
+
+    let s4 = path_segments("/")
+    assert_eq(len(s4), 0)
+
+    let s5 = path_segments("users/42")
+    assert_eq(len(s5), 2)
+    assert_eq(s5[0], "users")
+    assert_eq(s5[1], "42")
+
+    // ---- route_match: multi-param capture ----
+    let m1 = route_match("/users/:id/posts/:pid", "/users/42/posts/7")
+    assert_eq(m1 != null, true)
+    assert_eq(contains(m1, "id"), true)
+    assert_eq(contains(m1, "pid"), true)
+    assert_eq(m1["id"], "42")
+    assert_eq(m1["pid"], "7")
+    // exactly the two expected keys, nothing spurious
+    assert_eq(len(keys(m1)), 2)
+
+    // ---- route_match: single param ----
+    let m2 = route_match("/users/:id", "/users/99")
+    assert_eq(m2 != null, true)
+    assert_eq(m2["id"], "99")
+    assert_eq(len(keys(m2)), 1)
+
+    // ---- route_match: literal-only path, empty params ----
+    let m3 = route_match("/users", "/users")
+    assert_eq(m3 != null, true)
+    assert_eq(len(keys(m3)), 0)
+
+    // ---- route_match: non-match, different literal ----
+    let m4 = route_match("/users/:id", "/posts/1")
+    assert_eq(m4, null)
+
+    // ---- route_match: non-match, path too short ----
+    let m5 = route_match("/users/:id/posts/:pid", "/users/42")
+    assert_eq(m5, null)
+
+    // ---- route_match: non-match, path too long (no wildcard) ----
+    let m6 = route_match("/users/:id", "/users/42/extra")
+    assert_eq(m6, null)
+
+    // ---- route_match: non-match, pattern longer than path ----
+    let m7 = route_match("/a/b/c", "/a/b")
+    assert_eq(m7, null)
+
+    // ---- route_match: literal mismatch at trailing segment ----
+    let m8 = route_match("/users/:id/posts", "/users/42/comments")
+    assert_eq(m8, null)
+
+    // ---- route_match: trailing-slash insensitivity ----
+    let m9 = route_match("/users/:id", "/users/42/")
+    assert_eq(m9 != null, true)
+    assert_eq(m9["id"], "42")
+
+    // ---- route_match: wildcard matches the rest ----
+    let w1 = route_match("/static/*", "/static/css/app.css")
+    assert_eq(w1 != null, true)
+    assert_eq(w1["*"], "css/app.css")
+
+    // ---- route_match: wildcard, single trailing segment ----
+    let w2 = route_match("/static/*", "/static/logo.png")
+    assert_eq(w2 != null, true)
+    assert_eq(w2["*"], "logo.png")
+
+    // ---- route_match: wildcard, deep nesting ----
+    let w3 = route_match("/files/*", "/files/a/b/c/d.txt")
+    assert_eq(w3 != null, true)
+    assert_eq(w3["*"], "a/b/c/d.txt")
+
+    // ---- route_match: wildcard matches zero remaining segments ----
+    let w4 = route_match("/static/*", "/static")
+    assert_eq(w4 != null, true)
+    assert_eq(w4["*"], "")
+
+    // ---- route_match: wildcard does NOT match a different prefix ----
+    let w5 = route_match("/static/*", "/assets/css/app.css")
+    assert_eq(w5, null)
+
+    // ---- route_match: param + wildcard combined ----
+    let w6 = route_match("/u/:id/files/*", "/u/7/files/docs/readme.md")
+    assert_eq(w6 != null, true)
+    assert_eq(w6["id"], "7")
+    assert_eq(w6["*"], "docs/readme.md")
+
+    // ---- method_key ----
+    assert_eq(method_key("GET", "/users/:id"), "GET /users/:id")
+    assert_eq(method_key("POST", "/users"), "POST /users")
+
+    // ---- query_extract: basic two params ----
+    let q1 = query_extract("/search?a=1&b=2")
+    assert_eq(q1["a"], "1")
+    assert_eq(q1["b"], "2")
+    assert_eq(len(keys(q1)), 2)
+
+    // ---- query_extract: no query string ----
+    let q2 = query_extract("/search")
+    assert_eq(len(keys(q2)), 0)
+
+    // ---- query_extract: empty query string after '?' ----
+    let q3 = query_extract("/search?")
+    assert_eq(len(keys(q3)), 0)
+
+    // ---- query_extract: key with no value ----
+    let q4 = query_extract("/p?flag&x=9")
+    assert_eq(q4["flag"], "")
+    assert_eq(q4["x"], "9")
+    assert_eq(len(keys(q4)), 2)
+
+    // ---- query_extract: value containing '=' ----
+    let q5 = query_extract("/p?token=a=b=c")
+    assert_eq(q5["token"], "a=b=c")
+
+    // ---- query_extract: trailing '&' and empty pair tolerated ----
+    let q6 = query_extract("/p?a=1&&b=2&")
+    assert_eq(q6["a"], "1")
+    assert_eq(q6["b"], "2")
+    assert_eq(len(keys(q6)), 2)
+
+    // ---- Router: end-to-end ----
+    let r = router_new()
+    router_add(r, "GET", "/users/:id")
+    router_add(r, "POST", "/users")
+    router_add(r, "GET", "/static/*")
+    assert_eq(len(r), 3)
+
+    // GET /users/99 -> matches the :id route, captures id=99
+    let f1 = router_find(r, "GET", "/users/99")
+    assert_eq(f1 != null, true)
+    assert_eq(f1[0], "/users/:id")
+    let p1 = f1[1]
+    assert_eq(p1["id"], "99")
+
+    // POST /users -> matches the literal POST route
+    let f2 = router_find(r, "POST", "/users")
+    assert_eq(f2 != null, true)
+    assert_eq(f2[0], "/users")
+    let p2 = f2[1]
+    assert_eq(len(keys(p2)), 0)
+
+    // method mismatch: POST to a path only registered for GET -> null
+    let f3 = router_find(r, "POST", "/users/99")
+    assert_eq(f3, null)
+
+    // non-matching path -> null
+    let f4 = router_find(r, "GET", "/nope/here")
+    assert_eq(f4, null)
+
+    // wildcard route matches a static asset
+    let f5 = router_find(r, "GET", "/static/css/app.css")
+    assert_eq(f5 != null, true)
+    assert_eq(f5[0], "/static/*")
+    let p5 = f5[1]
+    assert_eq(p5["*"], "css/app.css")
+
+    // method mismatch on the wildcard route -> null
+    let f6 = router_find(r, "POST", "/static/css/app.css")
+    assert_eq(f6, null)
+
+    // registration-order: first matching GET route wins. Register a broad
+    // catch-all AFTER a specific one and confirm the specific one is chosen.
+    let r2 = router_new()
+    router_add(r2, "GET", "/api/health")
+    router_add(r2, "GET", "/api/:name")
+    let f7 = router_find(r2, "GET", "/api/health")
+    assert_eq(f7[0], "/api/health")
+    let p7 = f7[1]
+    assert_eq(len(keys(p7)), 0)
+    // a different name falls through to the param route
+    let f8 = router_find(r2, "GET", "/api/status")
+    assert_eq(f8[0], "/api/:name")
+    let p8 = f8[1]
+    assert_eq(p8["name"], "status")
+
+    print("router ok")

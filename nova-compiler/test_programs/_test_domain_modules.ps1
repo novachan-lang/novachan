@@ -4,7 +4,7 @@ Set-Location $PSScriptRoot
 # Verifies the Phase 11/13 domain stdlib modules. Each is a self-contained
 # .nova file with a main() running asserts + printing "<name> ok".
 
-$modules = @('math3d', 'ecs', 'crypto_util', 'netutil', 'compress_rle')
+$modules = @('math3d', 'ecs', 'crypto_util', 'netutil', 'compress_rle', 'nn', 'physics2d', 'stats', 'router', 'validate')
 
 $pass = 0; $fail = 0; $failures = @()
 Write-Host "=== DOMAIN MODULES TEST ==="
