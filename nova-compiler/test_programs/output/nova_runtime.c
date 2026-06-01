@@ -5163,6 +5163,49 @@ int64_t nova_rt_udp_recv(int64_t sock_val) {
     return (int64_t)(uintptr_t)result;
 }
 
+/* ── DNS / host identity ───────────────────────────────────────────────────── */
+
+/* dns_resolve(host): resolve a hostname to its first IPv4 dotted-quad address,
+   or "" if it cannot be resolved. Deterministic-failure like which(): a bad
+   host yields "", never a crash. IPv4 is forced, so localhost is always
+   127.0.0.1 (never ::1). */
+int64_t nova_rt_dns_resolve(int64_t host_ptr) {
+    const char* host = (const char*)(uintptr_t)host_ptr;
+    if (!host || !*host) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    nova_wsa_init();
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;        /* IPv4 only */
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res || !res->ai_addr) {
+        if (res) freeaddrinfo(res);
+        return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    }
+    /* Copy into a typed sockaddr_in (memcpy, not a cast) to respect strict
+       aliasing; AF_INET guarantees ai_addr is a sockaddr_in. */
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    size_t cplen = (size_t)res->ai_addrlen;
+    if (cplen > sizeof(sin)) cplen = sizeof(sin);
+    memcpy(&sin, res->ai_addr, cplen);
+    char ip[64];
+    ip[0] = '\0';
+    if (!inet_ntop(AF_INET, &sin.sin_addr, ip, sizeof(ip))) ip[0] = '\0';
+    freeaddrinfo(res);
+    return (int64_t)(uintptr_t)nova_fat_str_create(ip, strlen(ip));
+}
+
+/* hostname(): the local machine's network name, or "" on failure. */
+int64_t nova_rt_hostname(void) {
+    nova_wsa_init();   /* gethostname needs winsock initialised on Windows */
+    char buf[256];
+    buf[0] = '\0';
+    if (gethostname(buf, (int)sizeof(buf)) != 0)
+        return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    buf[sizeof(buf) - 1] = '\0';   /* guarantee NUL-termination */
+    return (int64_t)(uintptr_t)nova_fat_str_create(buf, strlen(buf));
+}
+
 /* ── HTTP Server (minimal, single-threaded) ────────────────────────────────── */
 
 int64_t nova_rt_http_listen(int64_t port_val) {

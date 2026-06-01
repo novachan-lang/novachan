@@ -78,7 +78,8 @@ $domain_tests = @(
     'linter_test',
     'file_io_test',
     'unicode_math_test',
-    'os_test'
+    'os_test',
+    'net_test'
 )
 
 $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests
