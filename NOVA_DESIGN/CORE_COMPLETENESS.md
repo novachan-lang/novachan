@@ -36,16 +36,45 @@ until the *core* is complete. This document is the gate.
 Execution started 2026-06-02. Rule: **verify each gap against the real code before building** —
 the scorecard's MISSING/0% counts came partly from a conservative ledger and several were stale.
 
-- ✅ **File I/O completeness** (Feature 1, committed `a15b6e2`) — added `remove_file`, `remove_dir`,
-  `rename_path`, `copy_file`, `file_size`, `file_mtime`, `is_dir`, `is_file`, `write_bytes`,
-  `read_lines`, `temp_dir`. Cross-platform, full error handling, 138/138 regression. (Cat. 12 now
-  largely closed; `seek`/`truncate`/mmap still open.)
-- ✅ **Time & date** — found ALREADY COMPLETE on verification (14 `datetime_*` builtins fully
-  registered + runtime + `track7_datetime_test`). The scorecard's "0%" was wrong. No work needed.
-- ⏭ **Next verified-real gaps:** regex `{n}`/`|` (confirmed missing), Unicode-correct strings
-  (`len("café")==5`), typed `Result<T,E>` (type-erased today).
+**Shipped tonight (each: production-grade, cross-platform, fully wired across all 4 builtin sites,
+bootstrap-reconverged gen5==gen6 byte-identical, full regression green before commit):**
+
+- ✅ **File I/O completeness** (committed `a15b6e2`) — `remove_file`, `remove_dir`, `rename_path`,
+  `copy_file`, `file_size`, `file_mtime`, `is_dir`, `is_file`, `write_bytes`, `read_lines`,
+  `temp_dir`. (Cat. 12; `seek`/`truncate`/mmap still open.)
+- ✅ **Regex `{n}`/`{n,m}`/`{n,}` counted quantifiers** (committed `0d16e68`) — exact/range/at-least-n,
+  deep-copying class sets to avoid double-free. Runtime-only. (Cat. 17.)
+- ✅ **Unicode codepoint views + numerics** — *Batch A* (committed `f07dc1b`, 139/139) — `char_count`,
+  `char_at`, `code_points`, `from_codepoint`, `is_valid_utf8` (UTF-8 codepoint layer, additive — byte
+  `len`/`ord` unchanged); `sinh`/`cosh`/`tanh`/`cbrt`/`hypot`/`gcd`/`lcm`/`pi`/`e`/`fmod`. Also fixed
+  `fmod` (was name-mapped+declared+classified but never type-registered → would fail type-check). (Cats. 9, 11.)
+- ✅ **OS / process** — *Batch B* (committed `f5eae3f`, 140/140) — `chdir`, `getpid`, `which`
+  (cross-platform PATH resolution). Plus a **soundness fix**: pre-existing `set_env` returned
+  `0`=success/`-1`=fail — backwards under NOVA truthiness (0 is falsy, so `if set_env(...)` read
+  inverted). Now `1`=success/`0`=fail, consistent with `chdir`/`mkdir_p`/file ops. (Cat. 12.)
+- ✅ **Networking identity** — *Batch C* (committed `198c943`, 141/141) — `dns_resolve(host)→str`
+  (forces AF_INET, strict-aliasing-safe via memcpy, `""`-on-failure), `hostname()→str`. Closes the
+  DNS row. (Cat. 13.)
+
+**Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
+*self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
+runtime, ran the cited tests through `gen3_test.exe`). Findings rewrote the scorecard in BOTH
+directions — see **"Verified audit"** below. Headline correction: the prior ledger's "Concurrency 10% /
+Async 13% / Time-Date 0%" was **stale** — real thread-pool `spawn` (with process-isolation-by-deep-copy),
+channels, `select`, `async`/`await`, `pmap`/`pfilter`, and `yield` generators all exist and pass tests.
+The *only* true 0% is **Reflection/runtime**.
+
+- ⏭ **Next (deferred to a user-present session — too risky to rush autonomously):** regex `|`
+  alternation (the VM uses absolute pc indices, so `|` needs a recursive-descent rewrite, not
+  fixup-laden insertion); typed `Result<T,E>`/`Option<T>` in the type system (deep type-system
+  change); Unicode-correct `len`/indexing (high blast radius).
 
 ---
+
+> **Authoritative status note (2026-06-02):** the per-row **NOVA status** cells in sections 1–22 below
+> are the original 2026-06-01 snapshot, kept for context. Where the **VERIFIED AUDIT** section (above)
+> lists a discrepancy, *that* evidence-backed status is authoritative and supersedes the cell. The
+> SCORECARD and per-category table reflect the verified numbers. When in doubt, trust the audit section.
 
 ## 1. Types, literals & syntax
 
@@ -350,107 +379,195 @@ the scorecard's MISSING/0% counts came partly from a conservative ledger and sev
 
 # SCORECARD
 
-**Total deduplicated core features: 156**
+**Verified 2026-06-02** by 22-agent evidence-based audit + independent re-verification of every
+load-bearing claim (ran the cited tests through the self-hosted `gen3_test.exe`, read the runtime).
+The earlier headline said "156" but the per-category table actually summed to **189** — that
+inconsistency is now resolved; 189 is the real deduplicated feature count.
+
+**Total deduplicated core features: 189**
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 66 | 42% |
-| 🟡 PARTIAL | 41 | 26% |
-| ❌ MISSING | 49 | 31% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **86.5 / 156** | **55%** |
+| ✅ HAVE | 74 | 39% |
+| 🟡 PARTIAL | 59 | 31% |
+| ❌ MISSING | 56 | 30% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **103.5 / 189** | **55%** |
+
+The weighted total held at 55% because the audit's corrections roughly cancelled — but the
+*composition* changed materially and the *narrative* changed completely (see below). The number
+is now **evidence-backed**, not aspirational.
 
 ## Per-category completion
 
 Completion % = (HAVE + 0.5·PARTIAL) / total in category.
 
-| # | Category | Features | ✅ | 🟡 | ❌ | Completion |
-|---|---|---|---|---|---|---|
-| 1 | Types, literals & syntax | 16 | 8 | 5 | 3 | **66%** |
-| 2 | Functions & closures | 11 | 7 | 1 | 3 | **68%** |
-| 3 | OOP / polymorphism / interfaces | 9 | 4 | 4 | 1 | **67%** |
-| 4 | Generics & metaprogramming | 13 | 3 | 3 | 7 | **35%** |
-| 5 | Memory & resource management | 11 | 3 | 6 | 2 | **55%** |
-| 6 | Concurrency & parallelism | 15 | 0 | 3 | 12 | **10%** |
-| 7 | Error handling | 9 | 3 | 5 | 1 | **61%** |
-| 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** |
-| 9 | Strings & Unicode | 8 | 4 | 1 | 3 | **56%** |
-| 10 | Collections & iterators | 12 | 5 | 5 | 2 | **63%** |
-| 11 | Numerics & math | 9 | 3 | 2 | 4 | **44%** |
-| 12 | File / OS / process | 8 | 3 | 1 | 4 | **44%** |
-| 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** |
-| 14 | HTTP & WebSockets | 5 | 2 | 2 | 1 | **60%** |
-| 15 | Async / event I/O | 4 | 0 | 1 | 3 | **13%** |
-| 16 | Time & date | 4 | 0 | 0 | 4 | **0%** |
-| 17 | Regex & parsing | 5 | 0 | 3 | 2 | **30%** |
-| 18 | Serialization | 6 | 2 | 2 | 2 | **50%** |
-| 19 | Testing | 5 | 2 | 1 | 2 | **50%** |
-| 20 | FFI / native interop | 7 | 3 | 1 | 3 | **50%** |
-| 21 | Reflection / runtime | 5 | 0 | 0 | 5 | **0%** |
-| 22 | Tooling | 12 | 9 | 2 | 1 | **83%** |
+Verified status (✅ HAVE / 🟡 PARTIAL / ❌ MISSING) per the 2026-06-02 audit. Arrows mark the
+categories the audit corrected vs. the stale 2026-06-01 snapshot.
 
-**Reading the scorecard:** NOVA's *sequential single-process* language is largely done — types,
-functions, OOP, modules, collections, error propagation, strings, and tooling all sit in the 55–83%
-band, and tooling is the strongest area (83%). The catastrophic holes are exactly the things that make
-the **Three Primitives** vision real: **Concurrency & parallelism (10%)**, **Async I/O (13%)**, and the
-two domains with literally **0% — Time/Date and Reflection/runtime**. Concurrency is the single
-biggest risk: NOVA has Channels-as-transport primitives and a process-isolated *memory* model, but the
-ledger evidences **no real lightweight-process runtime, no scheduler, no spawn, no supervision, no
-async** — `forge.serve()` is single-threaded. A language whose entire thesis is "Processes + Channels"
-cannot ship its core with a 10% concurrency score.
+| # | Category | Features | ✅ | 🟡 | ❌ | Completion | vs prior |
+|---|---|---|---|---|---|---|---|
+| 1 | Types, literals & syntax | 16 | 8 | 5 | 3 | **66%** | = |
+| 2 | Functions & closures | 11 | 6 | 2 | 3 | **64%** | ↓ named-params not real |
+| 3 | OOP / polymorphism / interfaces | 9 | 4 | 4 | 1 | **67%** | = |
+| 4 | Generics & metaprogramming | 13 | 3 | 2 | 8 | **31%** | ↓ src-loc/cfg not real |
+| 5 | Memory & resource management | 11 | 4 | 6 | 1 | **64%** | ↑ |
+| 6 | Concurrency & parallelism | 15 | 5 | 5 | 5 | **50%** | ⇈ **was 10% (stale)** |
+| 7 | Error handling | 9 | 3 | 5 | 1 | **61%** | = |
+| 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
+| 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
+| 10 | Collections & iterators | 12 | 4 | 6 | 2 | **58%** | ↓ no binary_search/linkedlist |
+| 11 | Numerics & math | 9 | 2 | 4 | 3 | **44%** | π/e found; popcount not real |
+| 12 | File / OS / process | 8 | 4 | 1 | 3 | **56%** | ↑ FS-ops + OS added |
+| 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** | DNS now real |
+| 14 | HTTP & WebSockets | 5 | 2 | 2 | 1 | **60%** | = |
+| 15 | Async / event I/O | 4 | 2 | 1 | 1 | **63%** | ⇈ **was 13% (stale)** |
+| 16 | Time & date | 4 | 1 | 2 | 1 | **50%** | ⇈ **was 0% (stale)** |
+| 17 | Regex & parsing | 5 | 0 | 1 | 4 | **10%** | ↓ parse/tokenizer not real |
+| 18 | Serialization | 6 | 1 | 2 | 3 | **33%** | ↓ derive/codec not real |
+| 19 | Testing | 5 | 2 | 0 | 3 | **40%** | ↓ no process isolation |
+| 20 | FFI / native interop | 7 | 3 | 1 | 3 | **50%** | = |
+| 21 | Reflection / runtime | 5 | 0 | 0 | 5 | **0%** | = (the only true 0%) |
+| 22 | Tooling | 12 | 10 | 2 | 0 | **92%** | ↑ REPL is real |
+
+**Reading the scorecard (corrected by the 2026-06-02 audit):** NOVA's *sequential single-process*
+language is largely done — types, functions, OOP, modules, collections, error propagation, strings,
+and tooling all sit in the 56–92% band, and tooling is the strongest area (92%).
+
+The big correction: **Concurrency is NOT the catastrophic hole the prior ledger claimed.** It audited
+at **50%, not 10%** — and I independently verified it: `nova_rt_spawn` lazily inits a real OS-thread
+pool and runs the spawned process on it with its *own deep-copied environment* (process isolation by
+construction, not by annotation); `nova_rt_channel_create/send/recv`, `nova_rt_select`, `nova_rt_async/
+await/await_all/await_any`, and `nova_rt_pmap/pfilter/pfor` (real `pthread_create`/`CreateThread` +
+join) are all present; and `spawn_test`, `async_test`, `select_test`, `select_multi_test`, `yield_test`,
+`parallel_test` **all pass through the self-hosted compiler**. The old "forge.serve() is single-threaded,
+no spawn that runs" claim was auditing a stale snapshot. Likewise **Async I/O is 63% not 13%** (async
+composition + event-loop/select are real) and **Time/Date is 50% not 0%** (`datetime.nova`: 14 builtins,
+formatting/parsing, calendar helpers, `track7_datetime_test` passes).
+
+What remains genuinely weak, and is honest: **Reflection/runtime (0% — the only true zero)**;
+**Regex & *parsing* (10%)** — the regex *engine* is solid (classes/quantifiers/`{n}`/anchors/groups,
+tested) but `|` alternation, a user-facing tokenizer, `Result`-returning number parsing, and
+parser-combinators are missing; **Generics & metaprogramming (31%)** — no macros/comptime/reflection
+derive; **Serialization (33%)** — JSON is real but Serde-style derive + gzip/deflate are missing;
+**Testing (40%)** — runner + assertions are real but test execution is sequential (no process
+isolation). The concurrency *primitives* are real; what's still missing on top of them is the
+*structured* layer — **supervision trees, structured concurrency, GenServer, bounded channels** — and
+that, plus typed `Result<T,E>`, is the honest remaining core work.
+
+**The thesis holds:** a language built on "Processes + Channels" now actually has working processes and
+channels — verified, not promised.
+
+---
+
+# VERIFIED AUDIT — every discrepancy (2026-06-02)
+
+Method: 22 parallel agents re-checked each category's rows against the **self-hosted** codebase
+(`nova_runtime.c`, `nova_compiler.nova`, the `.nova` tests run through `gen3_test.exe`) — NOT the dead
+Java/Kotlin bootstrap. I then **personally re-verified every load-bearing claim** (read `nova_rt_spawn`/
+the thread pool; ran the cited concurrency tests; grepped to confirm each absence). Every row below has
+concrete evidence.
+
+### ⇧ Stale-PESSIMISTIC — the doc undersold what's real (corrected upward)
+
+| Cat | Feature | was → now | Evidence (verified) |
+|---|---|---|---|
+| 6 | Message passing / selective receive | 🟡→✅ | `nova_rt_channel_create/send/recv` (2514/2557/2618), `nova_rt_select` (2745); `select_test`, `select_multi_test` pass |
+| 6 | Async task + future/await + compose | ❌→✅ | `nova_rt_async/await/await_all/await_any` (7285+); `async_test` passes |
+| 6 | Auto-parallel data pipelines | ❌→✅ | `nova_rt_pmap` (rt 7518 / compiler 2894), dynamic thread-count by CPU/size; `parallel_test`: "pmap correctness: OK" |
+| 6 | Select/poll over many channels | ❌→✅ | `nova_rt_channel_select` (2705) / `nova_rt_select` (2745); `select_test` passes |
+| 6 | Coroutines / generators (yield) | ❌→🟡 | `yield` parsed (1042/1293), codegen 8015; `yield_test` → `[0,1,2,3,4]` |
+| 6 | Supervision trees | ❌→🟡 | `nova_rt_monitor` (3379) registers listeners; `process_link/exit_notify` (9383+) are **stubs** (log-only, no restart) |
+| 6 | Hot code reload | ❌→🟡 | `nova_rt_hot_reload_watch/check/path` (10732+) exist; mtime/migration **not** implemented (infra only) |
+| 12 | Buffered read/write/append (text+binary) | 🟡→✅ | `read/write/append_file` + `read_bytes/write_bytes/read_lines`; `file_io_test` passes |
+| 12 | FS ops delete/rmdir/stat/rename/copy/temp | ❌→✅ | 9 builtins (Batch A); `file_io_test` exercises all; passes |
+| 12 | Subprocess + env + pid | ❌→🟡 | `spawn`/`exec`/`set_env`/`getpid`/`chdir`/`which`; `os_test` passes. Missing: stdio-as-Channels, signals |
+| 15 | Async composition (futures/then) | ❌→✅ | `nova_rt_async/await/await_all`; `async_test` |
+| 15 | Event loop / reactor | ❌→✅ | `nova_rt_select/channel_select`; `select_test`/`select_multi_test` |
+| 16 | Date/time formatting + parsing | ❌→✅ | `datetime.nova` `dt_format_*`; `datetime_parse` registered; `track7_datetime_test` passes |
+| 16 | Durations; Calendar/tz | ❌→🟡 | `dt_diff_ms/add_days/add_seconds`, `dt_to_parts/day_name/is_leap_year` (untyped ints, UTC-only) |
+| 9 | Charset encode/decode | ❌→🟡 | `str_to_bytes/bytes_to_str` exist but return values, not `Result` |
+| 11 | Complex + math constants (π, e) | ❌→🟡 | `nova_rt_pi/e` (3722); no `Complex` type |
+| 5 | (ownership/persistent rows) | →↑ | RC + escape analysis + spawn deep-copy isolation verified |
+| 22 | REPL / interactive eval | ❌→✅ | **`repl.nova`** (self-hosted: stdin loop, session accretion, compiles each entry with the real compiler). *Audit mis-cited `Repl.kt` (dead Kotlin); the real evidence is `repl.nova`.* |
+
+### ⇩ Stale-OPTIMISTIC — the doc oversold; corrected downward (these matter most for honesty)
+
+| Cat | Feature | was → now | Evidence (verified absence) |
+|---|---|---|---|
+| 2 | Default **+ named** parameters | ✅→🟡 | defaults work (`defaults_test`); **named-argument calls** not in parser/codegen/tests (grep: 0) |
+| 4 | Source-location intrinsics `__FILE__`/`__LINE__` | ✅→❌ | no user-facing builtin (grep: 0); only internal compiler tracking |
+| 4 | Conditional compilation (`cfg`/`#if`) | 🟡→❌ | no `cfg`/`#if`/typed compile-time conditions found |
+| 10 | Linked lists (as a type) | ✅→🟡 | no `LinkedList` type; only "compiler may pick layout" prose |
+| 10 | Comparable + **binary search** | ✅→🟡 | sort works; **no `binary_search`/`bsearch`** (grep: 0) |
+| 11 | Bit ops **popcount/clz/ctz/rotate** | ✅→🟡 | only `& \| ^ ~ << >>`; popcount/clz/ctz/rotate **absent** (grep: 0) — *closing in Batch D* |
+| 17 | Number↔text conversion (Result) | 🟡→❌ | `parse_int/parse_float` = `atoll`/`atof`, silent 0 on fail, no `Result` |
+| 17 | Tokenizer / scanner | 🟡→❌ | lexer is **compiler-internal only**; no user-facing builtin |
+| 18 | Compact binary term format | 🟡→❌ | no reusable codec; only ad-hoc length-framing in one demo |
+| 18 | Safe deserialization | ✅→🟡 | true for JSON only; general derive-(de)serialize doesn't exist |
+| 19 | Process-isolated parallel tests | 🟡→❌ | `nova_rt_test_run` calls `fn()` directly — sequential, **zero isolation** |
+
+**Lesson recorded:** the stale-pessimistic rows came from auditing an old snapshot; the stale-optimistic
+rows came from crediting "How NOVA beats it" *aspiration* as if it were *implementation*. Both are now
+evidence-gated. This is why the rule is **verify each claim against the self-hosted code before writing it.**
 
 ---
 
 # TOP PRIORITY GAPS
 
 These are the **table-stakes and signature items** (❌ MISSING or 🟡 PARTIAL) that block NOVA from
-being a complete core language. Ordered by leverage — earlier items gate later work and gate the
-frameworks.
+being a complete core language. **Re-ordered 2026-06-02 after the audit** — the old #1 ("no concurrent
+runtime / no spawn") was *stale*: the lightweight-process runtime, channels, `select`, `async`, and
+parallel map already exist and pass tests. What remains is the *structured* layer on top, plus the
+items below. Ordered by leverage.
 
-1. **Concurrent / async runtime (lightweight Processes + scheduler + spawn).** *(Concurrency,
-   signature, ❌)* The entire vision rests on Processes and Channels, yet there is no real runtime:
-   no green-process scheduler, no `spawn` that runs, no async. `forge.serve()` is single-threaded.
-   This gates almost every other gap (HTTP scale, async I/O, supervision, distributed). **The
-   highest-leverage work in the whole project.**
+1. **Typed `Result<T,E>` / `Option<T>` in the type system.** *(Error handling, signature, 🟡)* **Now
+   the single highest-leverage gap.** Errors are erased to `int` with a runtime `exit(1)` on mismatch;
+   result-returning fns declare `-> int`. Until errors are statically checked, NOVA loses to Rust, C++
+   (`expected`), and even Go on safety, and exhaustive error handling is impossible. (Deep type-system
+   change — do it carefully, user-present.)
 
-2. **Typed `Result<T,E>` / `Option<T>` in the type system.** *(Error handling, signature, 🟡)*
-   Errors are currently erased to `int` with a runtime `exit(1)` on mismatch. Until errors are
-   statically checked, NOVA loses to Rust, C++ (`expected`), and even Go on safety, and exhaustive
-   error handling is impossible.
+2. **Structured concurrency layer on the existing runtime.** *(Concurrency, signature, 🟡/❌)* The
+   *primitives* are real (spawn/channels/select/async/pmap — verified). Missing is the *structure*:
+   **supervision trees / "let it crash"** (today `monitor` registers listeners but `link`/`exit` are
+   log-only stubs — no restart), **structured concurrency** (child-outlives-scope prevention),
+   **GenServer-style** typed servers, and **bounded/back-pressured channels**. This is where NOVA's
+   Erlang-beating thesis is *won* — and it's now a far smaller lift than the old ledger implied.
 
-3. **Unicode-correct strings.** *(Strings, important, 🟡)* Everything is byte-level today —
-   `len("café") == 5`, no codepoint/grapheme awareness, no non-ASCII case folding, byte-only regex.
-   Every modern language (Java/Py/JS/Erl/Elx) is Unicode-correct; this is table-stakes.
+3. **Compile-time metaprogramming + reflection.** *(Generics 31% / Reflection 0%, signature, ❌)* No
+   hygienic macros, no comptime evaluation surface, no compile-time reflection, no `derive`.
+   Reflection/runtime is the only true **0%**. Load-bearing for serialization derive (#6), ORM/DI
+   patterns, and is a Java/Elixir/Zig signature strength NOVA must answer the NOVA way (typed comptime).
 
-4. **File-I/O completeness.** *(File/OS, table-stakes, ❌/🟡)* Missing delete/rmdir, stat
-   (size/mtime/perms), rename/move, copy, temp files, `write_bytes` (binary write), seek/truncate,
-   and per-line file streaming (`read_line` is stdin-only). Real apps cannot ship without these.
+4. **Unicode-correct `len`/indexing.** *(Strings, important, 🟡)* Codepoint **views** now exist
+   (`char_count`/`char_at`/`code_points`/`from_codepoint`/`is_valid_utf8`, Batch A) — but default
+   `len`/indexing/`ord`/`chr`/regex are still **byte-level** (`len("café")==5`), and there's no
+   grapheme/normalization/non-ASCII case-fold. Decide the default-view semantics (high blast radius).
 
-5. **Time & date library (currently 0%).** *(Time, table-stakes, ❌)* No monotonic/wall clock
-   distinction, no durations, no calendar/timezone, no formatting/parsing. Every reference language
-   ships this; NOVA ships none of it.
+5. **HTTP depth + thread-pooled serve.** *(HTTP, important, 🟡/❌)* The thread pool now exists, so
+   `serve()` should dispatch each connection onto it (no longer gated on a missing runtime). Still
+   missing: cookies, sessions, auth, multipart uploads, streaming/chunked responses, middleware chain,
+   request timeouts. Blocks the full-stack first-run identity.
 
-6. **HTTP depth + concurrent serve.** *(HTTP, important, 🟡/❌)* Single-threaded server (gated on #1),
-   plus missing cookies, sessions, auth, multipart uploads, streaming/chunked responses, middleware
-   chain, and request timeouts. Blocks the full-stack first-run identity.
+6. **Serialization derive + compression.** *(Serialization 33%, signature, ❌)* JSON encode/decode is
+   real; missing is Serde-style **derive-(de)serialize for any Value** (gated on #3 reflection/comptime)
+   and **gzip/deflate/zip** codecs. The derive machinery is the same one that marshals Channel wire data.
 
-7. **Regex completeness.** *(Regex, table-stakes, 🟡)* Missing `{n}` counted quantifiers and `|`
-   alternation — both table-stakes regex features the source itself admits are unsupported.
+7. **Regex `|` alternation + parsing surface.** *(Regex/parsing 10%, table-stakes, 🟡/❌)* `{n}` is
+   **done**; `|` alternation remains (needs a recursive-descent regex rewrite — the VM uses absolute pc
+   indices). Plus a user-facing **tokenizer**, **`Result`-returning number parsing** (today `atoll`/`atof`
+   silently return 0), and parser-combinators.
 
-8. **Compile-time metaprogramming + reflection.** *(Generics/Metaprogramming + Reflection, signature,
-   ❌)* No hygienic macros, no compile-time reflection, no derive. Reflection/runtime is at 0%. This is
-   load-bearing for serialization derive, ORM/DI-class patterns, and is a Java/Elixir signature
-   strength NOVA must answer.
+8. **DB driver layer + remote package registry.** *(Modules/persistence, important, 🟡)* SQL is
+   string-concatenated (injection-prone) with no connection/parameter-binding abstraction; the package
+   registry is local-only (no network fetch / transitive resolution). Both block others shipping on NOVA.
 
-9. **OS subprocess + signals + select/poll multiplexing.** *(File/OS + Concurrency, important, ❌)*
-   No subprocess spawning with stdio Channels, no signal-as-message delivery, no multi-source `select`.
-   Needed for real systems/tooling work and gated partly on #1.
+9. **Numeric + collection table-stakes.** *(Numerics/Collections, important, 🟡)* **bit ops
+   popcount/clz/ctz/rotate** (closing in Batch D), **`binary_search`**, bignum + decimal numeric tower.
+   Small individually, but they're features the doc *claimed* and didn't have — honesty debt to clear.
 
-10. **DB driver layer + remote package registry.** *(Modules/packaging + persistence, important, 🟡)*
-    SQL is string-concatenated (injection-prone) with no connection/parameter-binding abstraction;
-    the package registry is local-only with no network fetch or transitive resolution. Both block
-    others from actually building and shipping on NOVA.
+10. **OS subprocess depth + file seek.** *(File/OS, important, 🟡/❌)* `spawn`/`exec`/`set_env`/`getpid`/
+    `chdir`/`which` exist; missing is **subprocess stdio-as-Channels**, **signal-as-message** delivery,
+    and file **seek/truncate/mmap**.
 
-**Honorable mention (signature gaps that define the vision, just below the cut):** supervision trees /
-"let it crash" self-healing (Concurrency, ❌), bignum + decimal numeric tower (Numerics, ❌), and
-derive-able Serde-style serialization (Serialization, ❌). These are where NOVA *wins* once #1 lands —
-prioritize them immediately after the runtime exists.
+**Process-isolated test execution** *(Testing, 🟡→❌)* — `test_run` is sequential with zero isolation
+despite the "tests run in isolated Processes" claim; an easy win once #2's spawn-per-test is wired.
