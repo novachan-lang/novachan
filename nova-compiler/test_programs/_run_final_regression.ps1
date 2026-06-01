@@ -76,7 +76,8 @@ $domain_tests = @(
     'validate',
     'coverage_prof_test',
     'linter_test',
-    'file_io_test'
+    'file_io_test',
+    'unicode_math_test'
 )
 
 $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests

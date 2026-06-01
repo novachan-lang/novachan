@@ -3710,6 +3710,98 @@ int64_t nova_rt_fmod(int64_t x, int64_t y) { return f2i(fmod(i2f(x), i2f(y))); }
 int64_t nova_rt_round(int64_t x) { return f2i(round(i2f(x))); }
 int64_t nova_rt_sqrt(int64_t x)  { return f2i(sqrt(i2f(x))); }
 int64_t nova_rt_pow(int64_t x, int64_t y) { return f2i(pow(i2f(x), i2f(y))); }
+int64_t nova_rt_sinh(int64_t x)  { return f2i(sinh(i2f(x))); }
+int64_t nova_rt_cosh(int64_t x)  { return f2i(cosh(i2f(x))); }
+int64_t nova_rt_tanh(int64_t x)  { return f2i(tanh(i2f(x))); }
+int64_t nova_rt_cbrt(int64_t x)  { return f2i(cbrt(i2f(x))); }
+int64_t nova_rt_hypot(int64_t x, int64_t y) { return f2i(hypot(i2f(x), i2f(y))); }
+int64_t nova_rt_pi(void) { return f2i(3.14159265358979323846); }
+int64_t nova_rt_e(void)  { return f2i(2.71828182845904523536); }
+int64_t nova_rt_gcd(int64_t a, int64_t b) {
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b != 0) { int64_t t = b; b = a % b; a = t; }
+    return a;
+}
+int64_t nova_rt_lcm(int64_t a, int64_t b) {
+    if (a == 0 || b == 0) return 0;
+    int64_t g = nova_rt_gcd(a, b);
+    int64_t r = (a / g) * b;
+    return r < 0 ? -r : r;
+}
+
+/* ── UTF-8 / Unicode (codepoint-aware; complements byte-level len/ord/chr) ──────
+   These ADD codepoint semantics without changing the existing byte-based ops, so
+   no existing program changes behavior. A NOVA string is UTF-8 bytes. */
+static int64_t nova_utf8_decode(const unsigned char* s, size_t len, size_t* i) {
+    if (*i >= len) return -1;
+    unsigned char b0 = s[*i];
+    if (b0 < 0x80) { (*i)++; return (int64_t)b0; }
+    int n; int64_t cp;
+    if      ((b0 & 0xE0) == 0xC0) { n = 1; cp = b0 & 0x1F; }
+    else if ((b0 & 0xF0) == 0xE0) { n = 2; cp = b0 & 0x0F; }
+    else if ((b0 & 0xF8) == 0xF0) { n = 3; cp = b0 & 0x07; }
+    else return -1;                       /* invalid lead byte */
+    if (*i + (size_t)n >= len) return -1; /* truncated sequence */
+    for (int k = 1; k <= n; k++) {
+        unsigned char b = s[*i + (size_t)k];
+        if ((b & 0xC0) != 0x80) return -1;
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    *i += (size_t)(n + 1);
+    return cp;
+}
+static int nova_utf8_encode(int64_t cp, char* out) {
+    if (cp < 0 || cp > 0x10FFFF) return 0;
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) { out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000) { out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+    out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F)); return 4;
+}
+int64_t nova_rt_char_count(int64_t s_val) {
+    const unsigned char* s = (const unsigned char*)(uintptr_t)s_val;
+    if (!s) return 0;
+    size_t len = strlen((const char*)s), i = 0; int64_t count = 0;
+    while (i < len) { size_t j = i; int64_t cp = nova_utf8_decode(s, len, &j); if (cp < 0) i++; else i = j; count++; }
+    return count;
+}
+int64_t nova_rt_char_at(int64_t s_val, int64_t index) {
+    const unsigned char* s = (const unsigned char*)(uintptr_t)s_val;
+    if (!s || index < 0) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    size_t len = strlen((const char*)s), i = 0; int64_t idx = 0;
+    while (i < len) {
+        size_t j = i; int64_t cp = nova_utf8_decode(s, len, &j);
+        size_t adv = (cp < 0) ? 1 : (j - i);
+        if (idx == index) return (int64_t)(uintptr_t)nova_fat_str_create((const char*)s + i, adv);
+        i += adv; idx++;
+    }
+    return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+}
+int64_t nova_rt_code_points(int64_t s_val) {
+    const unsigned char* s = (const unsigned char*)(uintptr_t)s_val;
+    int64_t list = nova_rt_list_create();
+    if (!s) return list;
+    size_t len = strlen((const char*)s), i = 0;
+    while (i < len) {
+        size_t j = i; int64_t cp = nova_utf8_decode(s, len, &j);
+        if (cp < 0) { cp = (int64_t)s[i]; i++; } else i = j;
+        nova_rt_list_append(list, cp);
+    }
+    return list;
+}
+int64_t nova_rt_from_codepoint(int64_t cp) {
+    char out[5]; int n = nova_utf8_encode(cp, out);
+    if (n == 0) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    return (int64_t)(uintptr_t)nova_fat_str_create(out, (size_t)n);
+}
+int64_t nova_rt_is_valid_utf8(int64_t s_val) {
+    const unsigned char* s = (const unsigned char*)(uintptr_t)s_val;
+    if (!s) return 0;
+    size_t len = strlen((const char*)s), i = 0;
+    while (i < len) { size_t j = i; int64_t cp = nova_utf8_decode(s, len, &j); if (cp < 0) return 0; i = j; }
+    return 1;
+}
 int64_t nova_rt_floor(int64_t x) { return (int64_t)floor(i2f(x)); }
 int64_t nova_rt_ceil(int64_t x)  { return (int64_t)ceil(i2f(x)); }
 int64_t nova_rt_abs(int64_t x) {
