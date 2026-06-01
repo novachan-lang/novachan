@@ -5935,6 +5935,227 @@ int64_t nova_rt_read_bytes(int64_t path) {
     return result;
 }
 
+/* ── Filesystem completeness (delete / move / copy / stat / binary / lines / temp)
+   Every entry handles a NULL path, sets the error flag on failure, and is
+   cross-platform (Win32 API on Windows, POSIX on Linux). Mutators return
+   1 = ok / 0 = fail, except the write_* family which returns 0 = ok / -1 = fail
+   to match write_file/append_file. Stat queries return -1 when the path is absent. */
+
+int64_t nova_rt_remove_file(int64_t path_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) { nova_set_error("remove_file: null path"); return 0; }
+#ifdef _WIN32
+    if (!DeleteFileA(p)) { nova_set_error("remove_file: delete failed"); return 0; }
+#else
+    if (unlink(p) != 0) {
+        char e[512]; snprintf(e, sizeof(e), "remove_file '%s': %s", p, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
+}
+
+int64_t nova_rt_remove_dir(int64_t path_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) { nova_set_error("remove_dir: null path"); return 0; }
+#ifdef _WIN32
+    if (!RemoveDirectoryA(p)) { nova_set_error("remove_dir: rmdir failed (directory must be empty)"); return 0; }
+#else
+    if (rmdir(p) != 0) {
+        char e[512]; snprintf(e, sizeof(e), "remove_dir '%s': %s", p, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
+}
+
+int64_t nova_rt_rename_path(int64_t src_val, int64_t dst_val) {
+    const char* s = (const char*)(uintptr_t)src_val;
+    const char* d = (const char*)(uintptr_t)dst_val;
+    if (!s || !d) { nova_set_error("rename_path: null path"); return 0; }
+#ifdef _WIN32
+    if (!MoveFileExA(s, d, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+        nova_set_error("rename_path: move failed"); return 0;
+    }
+#else
+    if (rename(s, d) != 0) {
+        char e[512]; snprintf(e, sizeof(e), "rename_path '%s' -> '%s': %s", s, d, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
+}
+
+int64_t nova_rt_copy_file(int64_t src_val, int64_t dst_val) {
+    const char* s = (const char*)(uintptr_t)src_val;
+    const char* d = (const char*)(uintptr_t)dst_val;
+    if (!s || !d) { nova_set_error("copy_file: null path"); return 0; }
+#ifdef _WIN32
+    if (!CopyFileA(s, d, FALSE)) { nova_set_error("copy_file: copy failed"); return 0; }
+    return 1;
+#else
+    FILE* in = fopen(s, "rb");
+    if (!in) {
+        char e[512]; snprintf(e, sizeof(e), "copy_file: cannot open '%s': %s", s, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+    FILE* out = fopen(d, "wb");
+    if (!out) {
+        fclose(in);
+        char e[512]; snprintf(e, sizeof(e), "copy_file: cannot create '%s': %s", d, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+    char buf[65536];
+    size_t r;
+    int ok = 1;
+    while ((r = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, r, out) != r) { ok = 0; break; }
+    }
+    if (ferror(in)) ok = 0;
+    fclose(in);
+    if (fclose(out) != 0) ok = 0;
+    if (!ok) { nova_set_error("copy_file: I/O error during copy"); return 0; }
+    return 1;
+#endif
+}
+
+int64_t nova_rt_file_size(int64_t path_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) return -1;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fad)) return -1;
+    return ((int64_t)fad.nFileSizeHigh << 32) | (int64_t)fad.nFileSizeLow;
+#else
+    struct stat st;
+    if (stat(p, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+#endif
+}
+
+int64_t nova_rt_file_mtime(int64_t path_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) return -1;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fad)) return -1;
+    /* FILETIME = 100ns ticks since 1601-01-01; convert to Unix epoch seconds. */
+    ULARGE_INTEGER t;
+    t.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
+    t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    return (int64_t)((t.QuadPart - 116444736000000000ULL) / 10000000ULL);
+#else
+    struct stat st;
+    if (stat(p, &st) != 0) return -1;
+    return (int64_t)st.st_mtime;
+#endif
+}
+
+int64_t nova_rt_is_dir(int64_t path_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) return 0;
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(p);
+    return (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+#else
+    struct stat st;
+    if (stat(p, &st) != 0) return 0;
+    return S_ISDIR(st.st_mode) ? 1 : 0;
+#endif
+}
+
+int64_t nova_rt_is_file(int64_t path_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) return 0;
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(p);
+    return (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+#else
+    struct stat st;
+    if (stat(p, &st) != 0) return 0;
+    return S_ISREG(st.st_mode) ? 1 : 0;
+#endif
+}
+
+/* write_bytes(path, bytes): the binary-write complement of read_bytes. */
+int64_t nova_rt_write_bytes(int64_t path_val, int64_t bytes_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    NovaBytes* b = (NovaBytes*)(uintptr_t)bytes_val;
+    if (!p) { nova_set_error("write_bytes: null path"); return -1; }
+    FILE* f = fopen(p, "wb");
+    if (!f) {
+        char e[512]; snprintf(e, sizeof(e), "write_bytes: cannot write '%s': %s", p, strerror(errno));
+        nova_set_error(e); return -1;
+    }
+    int ok = 1;
+    if (b && b->data && b->size > 0) {
+        if (fwrite(b->data, 1, (size_t)b->size, f) != (size_t)b->size) ok = 0;
+    }
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { nova_set_error("write_bytes: I/O error"); return -1; }
+    return 0;
+}
+
+/* read_lines(path): read a whole file and split into a list of lines.
+   Splits on '\n', strips a trailing '\r' (handles CRLF), and does NOT emit a
+   final empty element for a trailing newline. Returns an empty list + sets the
+   error flag on failure. */
+int64_t nova_rt_read_lines(int64_t path_val) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    int64_t list = nova_rt_list_create();
+    if (!p) { nova_set_error("read_lines: null path"); return list; }
+    FILE* f = fopen(p, "rb");
+    if (!f) {
+        char e[512]; snprintf(e, sizeof(e), "read_lines: cannot open '%s': %s", p, strerror(errno));
+        nova_set_error(e); return list;
+    }
+#ifdef _WIN32
+    _fseeki64(f, 0, SEEK_END); int64_t sz = _ftelli64(f); _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_END); int64_t sz = (int64_t)ftello(f); fseeko(f, 0, SEEK_SET);
+#endif
+    if (sz < 0 || sz > (int64_t)512 * 1024 * 1024) {
+        fclose(f); nova_set_error("read_lines: bad size or file exceeds 512MB"); return list;
+    }
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); nova_set_error("read_lines: out of memory"); return list; }
+    size_t nr = fread(buf, 1, (size_t)sz, f);
+    buf[nr] = '\0';
+    fclose(f);
+    size_t start = 0;
+    for (size_t i = 0; i < nr; i++) {
+        if (buf[i] == '\n') {
+            size_t end = i;
+            if (end > start && buf[end - 1] == '\r') end--;   /* strip CR of CRLF */
+            char* line = nova_fat_str_create(buf + start, end - start);
+            if (line) nova_rt_list_append(list, (int64_t)(uintptr_t)line);
+            start = i + 1;
+        }
+    }
+    if (start < nr) {   /* trailing line with no final newline */
+        size_t end = nr;
+        if (end > start && buf[end - 1] == '\r') end--;
+        char* line = nova_fat_str_create(buf + start, end - start);
+        if (line) nova_rt_list_append(list, (int64_t)(uintptr_t)line);
+    }
+    free(buf);
+    return list;
+}
+
+/* temp_dir(): the OS temporary-directory path (with trailing separator on Windows). */
+int64_t nova_rt_temp_dir(void) {
+#ifdef _WIN32
+    char buf[MAX_PATH + 1];
+    DWORD n = GetTempPathA(MAX_PATH, buf);
+    if (n == 0 || n > MAX_PATH) return (int64_t)(uintptr_t)nova_fat_str_create(".", 1);
+    return (int64_t)(uintptr_t)nova_fat_str_create(buf, (size_t)n);
+#else
+    const char* t = getenv("TMPDIR");
+    if (!t || !*t) t = "/tmp";
+    return (int64_t)(uintptr_t)nova_fat_str_create(t, strlen(t));
+#endif
+}
+
 int64_t nova_rt_str_char_at(int64_t str_val, int64_t index) {
     const char* s = (const char*)(uintptr_t)str_val;
     if (!s) return (int64_t)(uintptr_t)"";
