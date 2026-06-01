@@ -3734,6 +3734,33 @@ int64_t nova_rt_lcm(int64_t a, int64_t b) {
     return r < 0 ? -r : r;
 }
 
+/* ── Bit manipulation (single hardware instructions on every target) ───────────
+   All operate on the 64-bit two's-complement representation. clz/ctz of 0 are
+   UB for the __builtin_* intrinsics, so they are guarded to return 64; rotates
+   mask the count to 0..63 and use the (64-r)&63 trick so rot-by-0 is never a
+   shift-by-64 (which is also UB). */
+int64_t nova_rt_popcount(int64_t x) {
+    return (int64_t)__builtin_popcountll((unsigned long long)x);
+}
+int64_t nova_rt_clz(int64_t x) {
+    if (x == 0) return 64;
+    return (int64_t)__builtin_clzll((unsigned long long)x);
+}
+int64_t nova_rt_ctz(int64_t x) {
+    if (x == 0) return 64;
+    return (int64_t)__builtin_ctzll((unsigned long long)x);
+}
+int64_t nova_rt_rotl(int64_t x, int64_t n) {
+    unsigned long long v = (unsigned long long)x;
+    unsigned r = (unsigned)(((unsigned long long)n) & 63ULL);
+    return (int64_t)((v << r) | (v >> ((64 - r) & 63)));
+}
+int64_t nova_rt_rotr(int64_t x, int64_t n) {
+    unsigned long long v = (unsigned long long)x;
+    unsigned r = (unsigned)(((unsigned long long)n) & 63ULL);
+    return (int64_t)((v >> r) | (v << ((64 - r) & 63)));
+}
+
 /* ── UTF-8 / Unicode (codepoint-aware; complements byte-level len/ord/chr) ──────
    These ADD codepoint semantics without changing the existing byte-based ops, so
    no existing program changes behavior. A NOVA string is UTF-8 bytes. */

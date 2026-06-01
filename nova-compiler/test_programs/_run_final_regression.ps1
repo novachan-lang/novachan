@@ -79,10 +79,20 @@ $domain_tests = @(
     'file_io_test',
     'unicode_math_test',
     'os_test',
-    'net_test'
+    'net_test',
+    'bit_ops_test'
 )
 
-$all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests
+# Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
+$concurrency_tests = @(
+    'async_test',
+    'select_test',
+    'select_multi_test',
+    'yield_test',
+    'parallel_test'
+)
+
+$all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurrency_tests
 $pass = 0; $fail = 0; $skip = 0; $failures = @()
 
 Write-Host "=== NOVA Full Regression Suite (gen3_test = gen11_phase13) ==="
