@@ -3184,27 +3184,31 @@ int64_t nova_rt_cstr_to_string(int64_t ptr) {
     return nova_rt_create_string((void*)(uintptr_t)ptr);
 }
 
-/* ── set_env(name, value) — write to env. Empty value clears the var. ─ */
+/* ── set_env(name, value) — write to env. Empty value clears the var.
+   Returns 1 on success, 0 on failure (NOVA truthiness: 0 is falsy, so a
+   0=success convention would make `if set_env(...)` read backwards). ─ */
 int64_t nova_rt_set_env(int64_t name_ptr, int64_t val_ptr) {
     const char* name = (const char*)(uintptr_t)name_ptr;
     const char* val  = (const char*)(uintptr_t)val_ptr;
+    if (!name || !*name) { nova_set_error("set_env: empty name"); return 0; }
 #ifdef _WIN32
     /* _putenv wants "NAME=VALUE"; clear via "NAME=" */
     size_t nl = strlen(name), vl = val ? strlen(val) : 0;
     char* buf = (char*)malloc(nl + 1 + vl + 1);
-    if (!buf) return -1;
+    if (!buf) { nova_set_error("set_env: out of memory"); return 0; }
     memcpy(buf, name, nl);
     buf[nl] = '=';
     if (vl) memcpy(buf + nl + 1, val, vl);
     buf[nl + 1 + vl] = 0;
     int rc = _putenv(buf);
     free(buf);
-    return rc == 0 ? 0 : -1;
+    if (rc != 0) { nova_set_error("set_env: failed"); return 0; }
+    return 1;
 #else
     if (!val || !*val) {
-        return unsetenv(name) == 0 ? 0 : -1;
+        return unsetenv(name) == 0 ? 1 : 0;
     }
-    return setenv(name, val, 1) == 0 ? 0 : -1;
+    return setenv(name, val, 1) == 0 ? 1 : 0;
 #endif
 }
 
@@ -5704,6 +5708,76 @@ int64_t nova_rt_cwd(void) {
     memcpy(result, buf, len);
     result[len] = '\0';
     return (int64_t)(uintptr_t)result;
+}
+
+/* ── OS / process (chdir, pid, which; set_env already exists above) ─────────── */
+
+/* chdir(path): change the process working directory. Returns 1 ok / 0 fail. */
+int64_t nova_rt_chdir(int64_t path_ptr) {
+    const char* p = (const char*)(uintptr_t)path_ptr;
+    if (!p) { nova_set_error("chdir: null path"); return 0; }
+#ifdef _WIN32
+    if (!SetCurrentDirectoryA(p)) { nova_set_error("chdir: failed"); return 0; }
+#else
+    if (chdir(p) != 0) {
+        char e[512]; snprintf(e, sizeof(e), "chdir '%s': %s", p, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
+}
+
+/* getpid(): current process id. */
+int64_t nova_rt_getpid(void) {
+#ifdef _WIN32
+    return (int64_t)GetCurrentProcessId();
+#else
+    return (int64_t)getpid();
+#endif
+}
+
+/* which(name): resolve an executable on PATH; returns the full path or "". */
+int64_t nova_rt_which(int64_t name_ptr) {
+    const char* name = (const char*)(uintptr_t)name_ptr;
+    if (!name || !*name) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    const char* path = getenv("PATH");
+    if (!path) path = "";
+#ifdef _WIN32
+    const char sep = ';'; const char dirsep = '\\';
+    const char* exts[] = { "", ".exe", ".bat", ".cmd" };
+    int nexts = 4;
+#else
+    const char sep = ':'; const char dirsep = '/';
+    const char* exts[] = { "" };
+    int nexts = 1;
+#endif
+    char cand[4096];
+    const char* p = path;
+    while (1) {
+        const char* e = strchr(p, sep);
+        size_t dlen = e ? (size_t)(e - p) : strlen(p);
+        if (dlen > 0 && dlen < 3000) {
+            for (int xi = 0; xi < nexts; xi++) {
+                int n = snprintf(cand, sizeof(cand), "%.*s%c%s%s", (int)dlen, p, dirsep, name, exts[xi]);
+                if (n > 0 && n < (int)sizeof(cand)) {
+#ifdef _WIN32
+                    DWORD a = GetFileAttributesA(cand);
+                    if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY))
+                        return (int64_t)(uintptr_t)nova_fat_str_create(cand, (size_t)n);
+#else
+                    if (access(cand, X_OK) == 0) {
+                        struct stat st;
+                        if (stat(cand, &st) == 0 && S_ISREG(st.st_mode))
+                            return (int64_t)(uintptr_t)nova_fat_str_create(cand, (size_t)n);
+                    }
+#endif
+                }
+            }
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
 }
 
 int64_t nova_rt_list_dir(int64_t path_ptr) {
