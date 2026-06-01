@@ -55,6 +55,10 @@ bootstrap-reconverged gen5==gen6 byte-identical, full regression green before co
 - ✅ **Networking identity** — *Batch C* (committed `198c943`, 141/141) — `dns_resolve(host)→str`
   (forces AF_INET, strict-aliasing-safe via memcpy, `""`-on-failure), `hostname()→str`. Closes the
   DNS row. (Cat. 13.)
+- ✅ **Bit manipulation** — *Batch D* (committed `47af07c`, 147/147) — `popcount`, `clz`, `ctz`
+  (0 guarded to 64, no UB), `rotl`, `rotr` (count masked 0..63, no shift-by-64 UB). Closes the cat-11
+  bit-ops row that the audit caught the doc *claiming* but not having. Also added the 5 verified
+  concurrency tests (`async`/`select`/`select_multi`/`yield`/`parallel`) to the regression. (Cat. 11.)
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -388,14 +392,15 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 74 | 39% |
-| 🟡 PARTIAL | 59 | 31% |
+| ✅ HAVE | 75 | 40% |
+| 🟡 PARTIAL | 58 | 31% |
 | ❌ MISSING | 56 | 30% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **103.5 / 189** | **55%** |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **104 / 189** | **55%** |
 
-The weighted total held at 55% because the audit's corrections roughly cancelled — but the
+The weighted total held at ~55% because the audit's corrections roughly cancelled — but the
 *composition* changed materially and the *narrative* changed completely (see below). The number
-is now **evidence-backed**, not aspirational.
+is now **evidence-backed**, not aspirational. *(Includes Batch D: bit-ops popcount/clz/ctz/rotate
+moved cat-11 from 2→3 HAVE.)*
 
 ## Per-category completion
 
@@ -416,7 +421,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
 | 10 | Collections & iterators | 12 | 4 | 6 | 2 | **58%** | ↓ no binary_search/linkedlist |
-| 11 | Numerics & math | 9 | 2 | 4 | 3 | **44%** | π/e found; popcount not real |
+| 11 | Numerics & math | 9 | 3 | 3 | 3 | **50%** | ↑ π/e found; popcount/clz/ctz/rotate added (Batch D) |
 | 12 | File / OS / process | 8 | 4 | 1 | 3 | **56%** | ↑ FS-ops + OS added |
 | 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** | DNS now real |
 | 14 | HTTP & WebSockets | 5 | 2 | 2 | 1 | **60%** | = |
@@ -499,7 +504,7 @@ concrete evidence.
 | 4 | Conditional compilation (`cfg`/`#if`) | 🟡→❌ | no `cfg`/`#if`/typed compile-time conditions found |
 | 10 | Linked lists (as a type) | ✅→🟡 | no `LinkedList` type; only "compiler may pick layout" prose |
 | 10 | Comparable + **binary search** | ✅→🟡 | sort works; **no `binary_search`/`bsearch`** (grep: 0) |
-| 11 | Bit ops **popcount/clz/ctz/rotate** | ✅→🟡 | only `& \| ^ ~ << >>`; popcount/clz/ctz/rotate **absent** (grep: 0) — *closing in Batch D* |
+| 11 | Bit ops **popcount/clz/ctz/rotate** | ✅→🟡→✅ | was absent; **CLOSED in Batch D** (`47af07c`): `popcount`/`clz`/`ctz`/`rotl`/`rotr` added, `bit_ops_test` passes. Doc claim is now true. |
 | 17 | Number↔text conversion (Result) | 🟡→❌ | `parse_int/parse_float` = `atoll`/`atof`, silent 0 on fail, no `Result` |
 | 17 | Tokenizer / scanner | 🟡→❌ | lexer is **compiler-internal only**; no user-facing builtin |
 | 18 | Compact binary term format | 🟡→❌ | no reusable codec; only ad-hoc length-framing in one demo |
@@ -561,9 +566,10 @@ items below. Ordered by leverage.
    string-concatenated (injection-prone) with no connection/parameter-binding abstraction; the package
    registry is local-only (no network fetch / transitive resolution). Both block others shipping on NOVA.
 
-9. **Numeric + collection table-stakes.** *(Numerics/Collections, important, 🟡)* **bit ops
-   popcount/clz/ctz/rotate** (closing in Batch D), **`binary_search`**, bignum + decimal numeric tower.
-   Small individually, but they're features the doc *claimed* and didn't have — honesty debt to clear.
+9. **Numeric + collection table-stakes.** *(Numerics/Collections, important, 🟡)* bit ops
+   popcount/clz/ctz/rotate — **DONE** (Batch D, `47af07c`). Remaining: **`binary_search`**, bignum +
+   decimal numeric tower. Small individually, but features the doc *claimed* and didn't have — clearing
+   the honesty debt one at a time.
 
 10. **OS subprocess depth + file seek.** *(File/OS, important, 🟡/❌)* `spawn`/`exec`/`set_env`/`getpid`/
     `chdir`/`which` exist; missing is **subprocess stdio-as-Channels**, **signal-as-message** delivery,
