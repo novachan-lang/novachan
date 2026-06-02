@@ -2445,6 +2445,24 @@ int64_t nova_rt_eq(int64_t a, int64_t b) {
         }
         return 1;
     }
+    /* Structural Value Identity: two structs are equal iff same type (slot 0 = type
+       hash) and all fields equal, recursively. NOVA values live in process isolation
+       and are only ever deep-copied across channels, so object identity is unobservable
+       — structural equality is the only coherent notion. The SAME structure walk backs
+       ==, hash, copy, to_json and show, so they cannot drift apart. (No cycle detection:
+       matches nova_rt_eq's existing list/dict behavior; value-semantic data is acyclic.) */
+    if (ta == NOVA_MEM_STRUCT && tb == NOVA_MEM_STRUCT) {
+        int64_t na = NOVA_STRUCT_NSLOTS(pa);
+        int64_t nb = NOVA_STRUCT_NSLOTS(pb);
+        if (na != nb) return 0;
+        const int64_t* sa = (const int64_t*)pa;
+        const int64_t* sb = (const int64_t*)pb;
+        if (na > 0 && sa[0] != sb[0]) return 0;
+        for (int64_t i = 1; i < na; i++) {
+            if (!nova_rt_eq(sa[i], sb[i])) return 0;
+        }
+        return 1;
+    }
     return 0;
 }
 
@@ -5981,6 +5999,37 @@ int64_t nova_rt_hash(int64_t val) {
         uint64_t h = 14695981039346656037ULL;
         while (*s) {
             h ^= (uint64_t)(unsigned char)*s++;
+            h *= 1099511628211ULL;
+        }
+        return (int64_t)h;
+    }
+    /* Structural Value Identity: hash walks the same structure nova_rt_eq compares, so
+       equal values always hash equal (the consistency other languages must hand-maintain
+       between equals()/hashCode()). List = positional; dict = order-independent (its eq
+       ignores entry order); struct = positional, seeded with the slot-0 type hash. */
+    if (tag == NOVA_MEM_LIST) {
+        NovaList* l = (NovaList*)ptr;
+        uint64_t h = 14695981039346656037ULL;
+        for (int64_t i = 0; i < l->size; i++) {
+            h ^= (uint64_t)nova_rt_hash(l->data[i]);
+            h *= 1099511628211ULL;
+        }
+        return (int64_t)h;
+    }
+    if (tag == NOVA_MEM_DICT) {
+        NovaDict* d = (NovaDict*)ptr;
+        uint64_t h = 0;
+        for (int64_t i = 0; i < d->size; i++) {
+            h += (uint64_t)nova_rt_hash(d->keys[i]) * 31u + (uint64_t)nova_rt_hash(d->vals[i]);
+        }
+        return (int64_t)h;
+    }
+    if (tag == NOVA_MEM_STRUCT) {
+        const int64_t* s = (const int64_t*)ptr;
+        int64_t n = NOVA_STRUCT_NSLOTS(ptr);
+        uint64_t h = (n > 0) ? (uint64_t)s[0] : 14695981039346656037ULL;
+        for (int64_t i = 1; i < n; i++) {
+            h ^= (uint64_t)nova_rt_hash(s[i]);
             h *= 1099511628211ULL;
         }
         return (int64_t)h;
