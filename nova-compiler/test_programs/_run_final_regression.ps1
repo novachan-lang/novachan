@@ -100,7 +100,8 @@ $domain_tests = @(
     'bitset',
     'typed_result_test',
     'result_test',
-    'parse_safe_test'
+    'parse_safe_test',
+    'q_propagate_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

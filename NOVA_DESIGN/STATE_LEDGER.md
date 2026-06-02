@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **168-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **169-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the
@@ -42,7 +42,7 @@ below — those are the real work. **Do not spend effort "fixing" the stale non-
 ### Error handling (now statically typed — 2026-06-02)
 - `error`/`catch`/`try`/`?` unified; `?` does real cross-function early-return propagation (verified).
 - `Result`/`Option` runtime value type (`NovaResult{tag,value}`) + ~15 combinators (ok/err/some/none/is_ok/unwrap/unwrap_or/map/and_then/…).
-- ✅ **Typed `Result<T,E>`/`Option<T>` DONE:** `Result := Sum<T,E>`, `Option := Sum<T,unit>`; ok/err/some/none/unwrap/unwrap_or/is_* typed over `nt_sum` (the unifier already handled "sum"; `any` permissive). **`unwrap` is `Sum<T,E>→T` — `unwrap(non-Result)` or wrong-type-use is now a COMPILE ERROR (E1001), not a runtime `exit(1)`.** Verified: typed_result_test + a negative test + migrated result_test. No codegen change (Result still lowers as NovaResult i64). *Refinement left: monadic-`?` E-propagation into the fn return type.*
+- ✅ **Typed `Result<T,E>`/`Option<T>` DONE:** `Result := Sum<T,E>`, `Option := Sum<T,unit>`; ok/err/some/none/unwrap/unwrap_or/is_* typed over `nt_sum` (the unifier already handled "sum"; `any` permissive). **`unwrap` is `Sum<T,E>→T` — `unwrap(non-Result)` or wrong-type-use is now a COMPILE ERROR (E1001), not a runtime `exit(1)`.** Verified: typed_result_test + a negative test + migrated result_test. No codegen change (Result still lowers as NovaResult i64). **Monadic-`?` refinement DONE:** `x?` on `Sum<T,E>` yields `T` (q_propagate_test). *Left: fn-return E-constraint (a `?`-using fn should be required to declare `Result<_,E>`) — smaller nicety.*
 
 ### Stdlib & runtime
 - Strings: split/join/trim/upper/lower/slice/find/replace/pad/center; **`format()`** Python-style mini-language; **f-string interpolation** over arbitrary expressions (critique WRONG on "no format").

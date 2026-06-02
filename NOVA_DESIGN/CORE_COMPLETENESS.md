@@ -122,8 +122,10 @@ tests) + the regex `|` rewrite:**
   Verified: `typed_result_test` (happy paths + Option) passes; a negative test is rejected; `result_test`
   migrated (its functions were wrongly annotated `-> int` while returning Results — erasure had masked it,
   typed Result correctly flags it) and passes. Bootstrap-reconverged (self-host uses no Result, so safe).
-  *Follow-up refinement: `?`/`try` still yields `any` (doesn't yet propagate E to the fn return type) —
-  monadic-`?` typing is a future enhancement; the core static-checking win is in.*
+  *Monadic-`?` refinement DONE: `x?` on a `Sum<T,E>` now yields `T` (the ok value type) instead of `any`
+  (verified: `q_propagate_test` parses + propagates errors through `?`). Only the fn-return E-constraint
+  (requiring a `?`-using fn to declare `Result<_,E>`) is left — a smaller soundness nicety; codegen already
+  early-returns the error correctly.*
 - ✅ **Result-returning safe number parsing** (NEW, cat-17 MISSING→HAVE) — `parse_int_safe(s) ->
   Result<int,string>` and `parse_float_safe(s) -> Result<float,string>` (typed via `nt_sum`, showcasing
   typed Result). `ok(n)` iff the whole string (modulo whitespace) parses, else `err(reason)` — the total,
