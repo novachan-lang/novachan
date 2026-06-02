@@ -85,6 +85,10 @@ tests) + the regex `|` rewrite:**
 - ✅ **Complex numbers** — *Batch K* `complexnum.nova` — `[re,im]` float pairs; `c_add`/`c_sub`/`c_mul`/
   `c_div`/`c_abs`/`c_conj`/`c_scale`. Verified `i²=-1`, `|3+4i|=5`, `1/i=-i`, `(a/b)·b=a`, `z·conj(z)=|z|²`.
   **Closes cat-11 "Complex numbers" (PARTIAL→HAVE — π/e were already there).**
+- ✅ **Exact rational arithmetic** — *Batch L* `rational.nova` — `[num,den]` always in lowest terms
+  (gcd-reduced, den>0); `rat`/`rat_add`/`rat_sub`/`rat_mul`/`rat_div`/`rat_cmp`/`rat_to_str`. Verified
+  `½+⅓=⅚`, `1+½+⅓+¼=25/12` exact. **Closes cat-11 "Decimal/exact/rational" (MISSING→HAVE).** With this,
+  **cat-11 Numerics went 44%→78% tonight** (bit-ops, bignum, complex, rational).
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -418,10 +422,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 81 | 43% |
+| ✅ HAVE | 82 | 43% |
 | 🟡 PARTIAL | 54 | 29% |
-| ❌ MISSING | 54 | 29% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **108 / 189** | **57%** |
+| ❌ MISSING | 53 | 28% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **109 / 189** | **58%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -449,7 +453,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
 | 10 | Collections & iterators | 12 | 5 | 5 | 2 | **63%** | ↑ binary_search added (Batch E) |
-| 11 | Numerics & math | 9 | 5 | 2 | 2 | **67%** | ↑ bit-ops (D), bignum (I/J), **complex (K)** |
+| 11 | Numerics & math | 9 | 6 | 2 | 1 | **78%** | ⇈ **44%→78%**: bit-ops(D), bignum(I/J), complex(K), rational(L) |
 | 12 | File / OS / process | 8 | 4 | 1 | 3 | **56%** | ↑ FS-ops + OS added |
 | 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** | DNS now real |
 | 14 | HTTP & WebSockets | 5 | 3 | 1 | 1 | **70%** | ↑ URI encode/parse added (Batch F) |
