@@ -1915,6 +1915,17 @@ fn parse_import_stmt(tokens: list, pos: int) -> StmtParseResult
 // is dead-strippable: emitted/kept only if `.show()` is actually called. Scalar
 // fields render via str(self.f); fields whose type is itself a @derive(Show) struct
 // render recursively via self.f.show().
+fn _is_valid_struct_name(s: string) -> int
+    // Guards automatic derivation against a parser artifact: a struct FIELD whose name is a
+    // keyword (e.g. `type: IrType`) breaks the field loop, leaving a stray top-level type decl
+    // whose name is the colon token's value ":". Those phantom types must never be derived for
+    // (":__show" would collide). Only derive for names that begin like a real identifier.
+    if len(s) == 0
+        return 0
+    if is_alpha(s[0]) or s[0] == "_"
+        return 1
+    return 0
+
 fn _derive_has(anns: list, dname: string) -> int
     for a in anns
         match a
@@ -2013,16 +2024,47 @@ fn _make_hash_method(tname: string, fields: list, hashset: dict, ln: int) -> Stm
     let ret_stmt = Stmt("return", "", acc, [], [], [], [], ln)
     Stmt("fn", tname + "__hash", null_expr(), [ret_stmt], [Param("self", "", null_expr())], [], [], ln)
 
+// @derive(Serialize): to_json renders the struct as a JSON object. Field VALUES go
+// through json_stringify (handles int/float/string-escaping/list/dict); nested
+// @derive(Serialize) struct fields recurse via self.f.to_json(). Keys are built with
+// chr(34) (literal quote) so no string-escape ambiguity. The DB/HTTP serialize keystone.
+fn _make_to_json_method(tname: string, fields: list, jsonset: dict, ln: int) -> Stmt
+    let acc = Expr("str", "\{", 0, [], [], ln)
+    let i = 0
+    let n = len(fields)
+    while i < n
+        match fields[i]
+            Param(fname, ftype, fdef) =>
+                let key = chr(34) + fname + chr(34) + ":"
+                if i > 0
+                    key = "," + key
+                acc = Expr("binop", "+", 0, [acc, Expr("str", key, 0, [], [], ln)], [], ln)
+                let memb = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
+                let jval = Expr("call", "json_stringify", 0, [memb], [], ln)
+                if contains(jsonset, ftype)
+                    jval = Expr("method_call", "to_json", 0, [memb], [], ln)
+                acc = Expr("binop", "+", 0, [acc, jval], [], ln)
+        i = i + 1
+    acc = Expr("binop", "+", 0, [acc, Expr("str", "\}", 0, [], [], ln)], [], ln)
+    let ret_stmt = Stmt("return", "", acc, [], [], [], [], ln)
+    Stmt("fn", tname + "__to_json", null_expr(), [ret_stmt], [Param("self", "", null_expr())], [], [], ln)
+
 fn expand_derives(stmts: list) -> list
     let showset = {}
     let eqset = {}
     let cloneset = {}
     let hashset = {}
+    let jsonset = {}
     for s in stmts
         match s
             Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns, sln) =>
                 if stag == "type"
-                    if _derive_has(sanns, "Show") == 1
+                    // NOVA way (not Rust/Python): the genius compiler derives a value's textual form
+                    // from its STRUCTURE (innovation D1) — zero annotation. EVERY record struct is
+                    // automatically showable; no @derive(Show) needed. Putting every struct in showset
+                    // also lets nested struct fields render recursively via the same derived path.
+                    // (Skip parser phantoms from keyword-named fields — see _is_valid_struct_name.)
+                    if _is_valid_struct_name(sname) == 1
                         showset[sname] = 1
                     if _derive_has(sanns, "Eq") == 1
                         eqset[sname] = 1
@@ -2030,12 +2072,15 @@ fn expand_derives(stmts: list) -> list
                         cloneset[sname] = 1
                     if _derive_has(sanns, "Hash") == 1
                         hashset[sname] = 1
+                    if _derive_has(sanns, "Serialize") == 1
+                        jsonset[sname] = 1
     let generated = []
     for s in stmts
         match s
             Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns, sln) =>
                 if stag == "type"
-                    if _derive_has(sanns, "Show") == 1
+                    // Automatic: generate <Type>__show for every record struct (zero annotation).
+                    if _is_valid_struct_name(sname) == 1
                         push(generated, _make_show_method(sname, sparams, showset, sln))
                     if _derive_has(sanns, "Eq") == 1
                         push(generated, _make_eq_method(sname, sparams, eqset, sln))
@@ -2043,6 +2088,8 @@ fn expand_derives(stmts: list) -> list
                         push(generated, _make_clone_method(sname, sparams, cloneset, sln))
                     if _derive_has(sanns, "Hash") == 1
                         push(generated, _make_hash_method(sname, sparams, hashset, sln))
+                    if _derive_has(sanns, "Serialize") == 1
+                        push(generated, _make_to_json_method(sname, sparams, jsonset, sln))
     if len(generated) == 0
         return stmts
     let out = []
@@ -5134,6 +5181,22 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                             push(arg_regs, ir_lower_expr(b, dpd))
                         di = di + 1
                 let dest = ir_fresh_reg(b)
+                // NOVA way (zero annotation): str(p)/print(p) on a record struct dispatch to the
+                // compiler-derived <Type>__show, synthesized for every struct in expand_derives.
+                // Resolved here at codegen, where the static struct type is known (HM types are
+                // deferred during inference). Gated on the __show actually existing so a struct
+                // type without one (e.g. an enum value-type) falls through to the generic path.
+                if (fn_name == "str" or fn_name == "print") and len(children) == 1
+                    let show_sty = ir_expr_struct_type(b, children[0])
+                    if show_sty != "" and list_contains(b.ir_fnames, show_sty + "__show")
+                        if fn_name == "str"
+                            ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, show_sty + "__show", 0)
+                            return dest
+                        else
+                            let show_r = ir_fresh_reg(b)
+                            ir_emit_side(b, "call", show_r, ir_type_any(), arg_regs, show_sty + "__show", 0)
+                            ir_emit_side(b, "call", dest, ir_type_any(), [show_r], "nova_rt_print_any", 0)
+                            return dest
                 if fn_name == "error"
                     ir_emit_side(b, "set_error", dest, ir_type_any(), arg_regs, "", 0)
                     return dest
@@ -5652,6 +5715,18 @@ fn ir_expr_struct_type(b: IrBuilder, expr: Expr) -> string
                 let lt = b.ir_locals[ev]
                 if lt != 1 and contains(b.ir_sdefs, lt)
                     return lt
+            if (et == "member" or et == "field") and len(ec) >= 1
+                // Field access self.f: resolve the receiver's struct type, then look up the
+                // declared type of field f. Enables static dispatch on nested struct fields
+                // (e.g. Seg__show rendering its Point fields via a direct Point__show call,
+                // instead of a runtime __type_hash probe that a tagless record struct lacks).
+                let mem_recv = ir_expr_struct_type(b, ec[0])
+                if mem_recv != ""
+                    let mem_key = mem_recv + "." + ev
+                    if contains(b.ir_field_types, mem_key)
+                        let mem_ft = b.ir_field_types[mem_key]
+                        if contains(b.ir_sdefs, mem_ft)
+                            return mem_ft
             if et == "binop" and len(ec) >= 2
                 let bin_lt = ir_expr_struct_type(b, ec[0])
                 if bin_lt != ""

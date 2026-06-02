@@ -104,7 +104,9 @@ $domain_tests = @(
     'q_propagate_test',
     'derive_show_test',
     'derive_eq_test',
-    'derive_clone_hash_test'
+    'derive_clone_hash_test',
+    'derive_serialize_test',
+    'auto_show_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
