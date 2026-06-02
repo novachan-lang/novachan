@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **153-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **154-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the
@@ -14,8 +14,9 @@ OS-thread pool with process-isolation-by-deep-copy; channels/`select`/`async`/`a
 DNS (`dns_resolve`/`hostname`), 10 math builtins, and bit-ops (`popcount`/`clz`/`ctz`/`rotl`/`rotr`).
 Implementation commits: `a15b6e2`, `0d16e68`, `f07dc1b`, `f5eae3f`, `198c943`, `47af07c`,
 then pure-NOVA stdlib + regex `|`: `b6a3e02` (corex), `99ca666` (urlx), `6841eee` (csvx),
-`a449401` (regex `|`), `7838476` (collx), + bignum (this commit). Regression: **153/153**. Verified
-scorecard **80 HAVE / 55 PARTIAL / 54 MISSING of 189 = 57%** (was 55% pre-push).
+`a449401` (regex `|`), `7838476` (collx), `60da2aa` (bignum), `…J` (bignum div/gcd), + complexnum
+(this commit). Regression: **154/154**. Verified scorecard **81 HAVE / 54 PARTIAL / 54 MISSING of
+189 = 57%** (was 55% pre-push; cat-11 Numerics 44%→67%).
 
 **Headline:** The external critique largely audited the *old Java-bootstrap, design-doc-era*
 NOVA. The current **self-hosted** compiler (`gen3_test.exe`, native PE32+, ~0.98× C,
@@ -45,7 +46,7 @@ below — those are the real work. **Do not spend effort "fixing" the stale non-
 - OS/process: `env`, **`set_env`** (truthiness-fixed), **`chdir`**, **`getpid`**, **`which`**, `cwd`, `spawn`/`exec` (added `f5eae3f`, `os_test` passes).
 - Networking identity: **`dns_resolve`** (IPv4, `""`-on-fail), **`hostname`** (added `198c943`, `net_test` passes).
 - Unicode codepoint layer: `char_count`/`char_at`/`code_points`/`from_codepoint`/`is_valid_utf8` (additive — byte `len`/`ord` unchanged). Math: `sinh`/`cosh`/`tanh`/`cbrt`/`hypot`/`gcd`/`lcm`/`pi`/`e`/`fmod` (added `f07dc1b`). Bit ops: `popcount`/`clz`/`ctz`/`rotl`/`rotr` (added `47af07c`, UB-guarded, `bit_ops_test` passes).
-- Pure-NOVA stdlib modules (no bootstrap, self-contained + inline-tested): **corex** (`b6a3e02`: binary_search/lower_bound/upper_bound/isqrt/ilog2/clamp/sign/next_pow2), **urlx** (`99ca666`: url_encode/decode RFC-3986 byte-level, parse_query/build_query, html_escape), **csvx** (`6841eee`: RFC-4180 CSV parse/quote, key=value config), **collx** (`7838476`: take/drop/chunk/zip/unique/windows/flatten1/count_elem/reverse_list/sum_int), **bignum** (complete arbitrary-precision integer lib as decimal strings: bn_add/bn_sub/bn_mul/bn_divmod(long division)/bn_div/bn_mod/bn_gcd/bn_cmp; exact 25!/fib(100)/2^64/gcd-of-primes).
+- Pure-NOVA stdlib modules (no bootstrap, self-contained + inline-tested): **corex** (`b6a3e02`: binary_search/lower_bound/upper_bound/isqrt/ilog2/clamp/sign/next_pow2), **urlx** (`99ca666`: url_encode/decode RFC-3986 byte-level, parse_query/build_query, html_escape), **csvx** (`6841eee`: RFC-4180 CSV parse/quote, key=value config), **collx** (`7838476`: take/drop/chunk/zip/unique/windows/flatten1/count_elem/reverse_list/sum_int), **bignum** (complete arbitrary-precision integer lib as decimal strings: bn_add/bn_sub/bn_mul/bn_divmod(long division)/bn_div/bn_mod/bn_gcd/bn_cmp; exact 25!/fib(100)/2^64/gcd-of-primes), **complexnum** (complex `[re,im]`: c_add/c_sub/c_mul/c_div/c_abs/c_conj; i²=-1, |3+4i|=5).
 - Collections: list/dict/set/deque/priority-queue/sorted-map/LRU/counter/ring-buffer; iterators; JSON encode/decode.
 - Crypto (from-scratch, oracle-verified): SHA-256, HMAC-SHA256, CRC-32 (ISO-HDLC correct), base64, random_bytes.
 - Tensors: matmul/add/mul/scale/relu/softmax/zeros (real C). Domain modules: math3d, ecs, nn, physics2d, stats, router, netutil, compress_rle, crypto_util.

@@ -82,6 +82,9 @@ tests) + the regex `|` rewrite:**
   strings. *Complete* integer library: `bn_add`/`bn_sub`/`bn_mul`/`bn_divmod`(long division)/`bn_div`/
   `bn_mod`/`bn_gcd`/`bn_cmp` via schoolbook string arithmetic (no list mutation). Exact past i64:
   verified `25!`, `fib(100)`, `2^64`, `2^64/1000`, gcd of two primes, `q·b+r==a`. **Closes cat-11 bignum.**
+- ✅ **Complex numbers** — *Batch K* `complexnum.nova` — `[re,im]` float pairs; `c_add`/`c_sub`/`c_mul`/
+  `c_div`/`c_abs`/`c_conj`/`c_scale`. Verified `i²=-1`, `|3+4i|=5`, `1/i=-i`, `(a/b)·b=a`, `z·conj(z)=|z|²`.
+  **Closes cat-11 "Complex numbers" (PARTIAL→HAVE — π/e were already there).**
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -415,10 +418,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 80 | 42% |
-| 🟡 PARTIAL | 55 | 29% |
+| ✅ HAVE | 81 | 43% |
+| 🟡 PARTIAL | 54 | 29% |
 | ❌ MISSING | 54 | 29% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **107.5 / 189** | **57%** |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **108 / 189** | **57%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -446,7 +449,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
 | 10 | Collections & iterators | 12 | 5 | 5 | 2 | **63%** | ↑ binary_search added (Batch E) |
-| 11 | Numerics & math | 9 | 4 | 3 | 2 | **61%** | ↑ bit-ops (D), π/e, **bignum (I)** |
+| 11 | Numerics & math | 9 | 5 | 2 | 2 | **67%** | ↑ bit-ops (D), bignum (I/J), **complex (K)** |
 | 12 | File / OS / process | 8 | 4 | 1 | 3 | **56%** | ↑ FS-ops + OS added |
 | 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** | DNS now real |
 | 14 | HTTP & WebSockets | 5 | 3 | 1 | 1 | **70%** | ↑ URI encode/parse added (Batch F) |
@@ -516,7 +519,7 @@ concrete evidence.
 | 16 | Date/time formatting + parsing | ❌→✅ | `datetime.nova` `dt_format_*`; `datetime_parse` registered; `track7_datetime_test` passes |
 | 16 | Durations; Calendar/tz | ❌→🟡 | `dt_diff_ms/add_days/add_seconds`, `dt_to_parts/day_name/is_leap_year` (untyped ints, UTC-only) |
 | 9 | Charset encode/decode | ❌→🟡 | `str_to_bytes/bytes_to_str` exist but return values, not `Result` |
-| 11 | Complex + math constants (π, e) | ❌→🟡 | `nova_rt_pi/e` (3722); no `Complex` type |
+| 11 | Complex + math constants (π, e) | ❌→🟡→✅ | π/e (`nova_rt_pi/e`); **`Complex` added in Batch K** (`complexnum.nova`: add/sub/mul/div/abs/conj) |
 | 5 | (ownership/persistent rows) | →↑ | RC + escape analysis + spawn deep-copy isolation verified |
 | 22 | REPL / interactive eval | ❌→✅ | **`repl.nova`** (self-hosted: stdin loop, session accretion, compiles each entry with the real compiler). *Audit mis-cited `Repl.kt` (dead Kotlin); the real evidence is `repl.nova`.* |
 
