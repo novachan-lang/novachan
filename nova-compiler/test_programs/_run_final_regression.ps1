@@ -93,7 +93,11 @@ $domain_tests = @(
     'strx',
     'basex',
     'matrixx',
-    'proptest'
+    'proptest',
+    'getin',
+    'prng',
+    'uuid',
+    'bitset'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

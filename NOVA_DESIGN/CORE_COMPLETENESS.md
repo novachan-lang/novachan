@@ -96,6 +96,12 @@ tests) + the regex `|` rewrite:**
   validation — cat-11/17), `matrixx` (zeros/identity/transpose/add/**mul** — linear algebra), `proptest`
   (`forall_range` exhaustive + `forall_int` random + counterexample reporting). **`proptest` closes cat-19
   property-based testing (MISSING→HAVE);** the others strengthen already-HAVE rows.
+- ✅ **Batch N — 4 more modules (2nd parallel workflow, all re-verified by me):** `getin` (total/never-crash
+  deep nested access into dict+list trees via `type_of`+membership/bounds gating — **closes cat-10 deep access
+  read-side, MISSING→PARTIAL**; `put_in` write-side still open), `prng` (functional state-threaded xorshift64 —
+  deterministic/reproducible, distinct from the non-det `random_int`; strengthens cat-11 PRNG), `uuid` (v4
+  generation with version/variant bits + `is_uuid` validation), `bitset` (immutable bitset over int words —
+  set/clear/test/count via popcount/union/intersect).
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -430,9 +436,9 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 | NOVA status | Count | % |
 |---|---|---|
 | ✅ HAVE | 83 | 44% |
-| 🟡 PARTIAL | 54 | 29% |
-| ❌ MISSING | 52 | 28% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **110 / 189** | **58%** |
+| 🟡 PARTIAL | 55 | 29% |
+| ❌ MISSING | 51 | 27% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **110.5 / 189** | **58%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -459,7 +465,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 7 | Error handling | 9 | 3 | 5 | 1 | **61%** | = |
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
-| 10 | Collections & iterators | 12 | 5 | 5 | 2 | **63%** | ↑ binary_search added (Batch E) |
+| 10 | Collections & iterators | 12 | 5 | 6 | 1 | **67%** | ↑ binary_search (E), deep-access read (N) |
 | 11 | Numerics & math | 9 | 6 | 2 | 1 | **78%** | ⇈ **44%→78%**: bit-ops(D), bignum(I/J), complex(K), rational(L) |
 | 12 | File / OS / process | 8 | 4 | 1 | 3 | **56%** | ↑ FS-ops + OS added |
 | 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** | DNS now real |

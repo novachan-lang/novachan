@@ -1,0 +1,227 @@
+// NOVA PRNG — functional, state-threaded, seedable pseudo-random generator.
+//
+// Unlike random_int (non-deterministic), this module is PURELY DETERMINISTIC:
+// the same seed always yields the same sequence, so simulations, property
+// tests, and games are perfectly reproducible. State is threaded explicitly
+// through every call — nothing is mutated in place — so a sequence is a pure
+// function of its starting state.
+//
+// Algorithm: xorshift64 (Marsaglia). Each step produces a new 64-bit state;
+// we mask off the sign bit so every emitted value is a NON-NEGATIVE int.
+//
+// Public API:
+//   prng_seed(n)               -> int            (non-zero starting state)
+//   prng_next(state)           -> [value, state] (value == new non-neg state)
+//   prng_range(state, lo, hi)  -> [value, state] (lo <= value <= hi)
+//   prng_take(state, count)    -> list of ints   (threads state internally)
+//
+// NOT cryptographically secure — use a CSPRNG for security contexts.
+
+// Clears the sign bit of a 64-bit int, mapping it into [0, 2^63 - 1].
+// 9223372036854775807 == 2^63 - 1 == INT64_MAX. ANDing with it is the
+// portable, deterministic way to force a value non-negative without writing
+// an INT64_MIN literal or relying on abs (which is undefined for INT64_MIN).
+fn _prng_nonneg(x: int) -> int
+    x & 9223372036854775807
+
+// One xorshift64 step. Operates on the full 64-bit state (sign bit included)
+// so the generator keeps its full period; only the EMITTED value is masked.
+fn _prng_step(state: int) -> int
+    let s = state
+    s = s ^ (s << 13)
+    s = s ^ (s >> 7)
+    s = s ^ (s << 17)
+    s
+
+// Derive a non-zero starting state from any seed. xorshift64 has a fixed
+// point at 0 (0 maps to 0 forever), so a 0 seed MUST map to a constant
+// non-zero state. We also stir the seed once so adjacent seeds (0,1,2,...)
+// diverge immediately instead of producing near-identical sequences.
+fn prng_seed(n: int) -> int
+    let s = n
+    if s == 0
+        s = 88172645463325252
+    // Stir: SplitMix-style avalanche so small seeds spread across the state.
+    s = s ^ (s << 21)
+    s = s ^ (s >> 35)
+    s = s ^ (s << 4)
+    if s == 0
+        s = 88172645463325252
+    s
+
+// Advance the generator. Returns [value, new_state] where value is the new
+// state forced non-negative. value and new_state encode the same step (value
+// is the masked view, new_state the full 64-bit state to feed back in).
+fn prng_next(state: int)
+    let ns = _prng_step(state)
+    let value = _prng_nonneg(ns)
+    [value, ns]
+
+// Uniform-ish integer in the inclusive range [lo, hi]. If lo > hi we treat
+// the range as the single point lo (defensive; never divide by zero / negative
+// span). Uses modulo of a guaranteed-non-negative value so the result is
+// always in range and deterministic.
+fn prng_range(state: int, lo: int, hi: int)
+    if lo >= hi
+        return [lo, _prng_step(state)]
+    let ns = _prng_step(state)
+    let value = _prng_nonneg(ns)
+    let span = hi - lo + 1
+    let v = lo + (value % span)
+    [v, ns]
+
+// Produce `count` non-negative ints, threading state internally. Returns the
+// list only (the final state is recoverable by re-seeding). count <= 0 yields
+// an empty list.
+fn prng_take(state: int, count: int) -> list
+    let out = []
+    let st = state
+    let i = 0
+    while i < count
+        let step = prng_next(st)
+        let value = step[0]
+        st = step[1]
+        out = out + [value]
+        i = i + 1
+    out
+
+// Same as prng_take but every value is constrained to [lo, hi]. Kept separate
+// so the plain stream stays full-width.
+fn prng_take_range(state: int, count: int, lo: int, hi: int) -> list
+    let out = []
+    let st = state
+    let i = 0
+    while i < count
+        let step = prng_range(st, lo, hi)
+        let value = step[0]
+        st = step[1]
+        out = out + [value]
+        i = i + 1
+    out
+
+// ── tests ─────────────────────────────────────────────────────────────────
+
+fn _all_nonneg(xs: list) -> bool
+    let i = 0
+    while i < len(xs)
+        if xs[i] < 0
+            return false
+        i = i + 1
+    true
+
+fn _lists_equal(a: list, b: list) -> bool
+    if len(a) != len(b)
+        return false
+    let i = 0
+    while i < len(a)
+        if a[i] != b[i]
+            return false
+        i = i + 1
+    true
+
+fn _all_in_range(xs: list, lo: int, hi: int) -> bool
+    let i = 0
+    while i < len(xs)
+        if xs[i] < lo
+            return false
+        if xs[i] > hi
+            return false
+        i = i + 1
+    true
+
+fn main()
+    // ── prng_seed: never returns 0, even for seed 0 ──────────────────────
+    assert_true(prng_seed(0) != 0)
+    assert_true(prng_seed(1) != 0)
+    assert_true(prng_seed(-1) != 0)
+    assert_true(prng_seed(123456789) != 0)
+    // Different seeds give different starting states.
+    assert_true(prng_seed(1) != prng_seed(2))
+    assert_true(prng_seed(0) != prng_seed(1))
+    // Deterministic: same seed -> same state.
+    assert_eq(prng_seed(42), prng_seed(42))
+
+    // ── prng_next: shape, non-negativity, determinism ───────────────────
+    let s0 = prng_seed(42)
+    let n1 = prng_next(s0)
+    assert_eq(len(n1), 2)
+    let v1 = n1[0]
+    let st1 = n1[1]
+    assert_true(v1 >= 0)              // emitted value is non-negative
+    // value is the masked view of the new state.
+    assert_eq(v1, _prng_nonneg(st1))
+    // Calling prng_next again on the SAME input gives the SAME output.
+    let n1b = prng_next(s0)
+    assert_eq(n1b[0], v1)
+    assert_eq(n1b[1], st1)
+    // Advancing from st1 produces a (with overwhelming probability) new value.
+    let n2 = prng_next(st1)
+    assert_true(n2[0] >= 0)
+
+    // ── prng_range: in-range, deterministic, boundary cases ─────────────
+    let r1 = prng_range(s0, 10, 20)
+    assert_eq(len(r1), 2)
+    assert_true(r1[0] >= 10)
+    assert_true(r1[0] <= 20)
+    // Determinism.
+    let r1b = prng_range(s0, 10, 20)
+    assert_eq(r1b[0], r1[0])
+    assert_eq(r1b[1], r1[1])
+    // Single-point range [7,7] -> always 7.
+    let rp = prng_range(s0, 7, 7)
+    assert_eq(rp[0], 7)
+    // Inverted range lo>hi -> collapses to lo (defensive).
+    let rinv = prng_range(s0, 9, 3)
+    assert_eq(rinv[0], 9)
+    // Negative ranges still produce a value inside [lo,hi].
+    let rneg = prng_range(s0, -5, 5)
+    assert_true(rneg[0] >= -5)
+    assert_true(rneg[0] <= 5)
+    // Wide range.
+    let rwide = prng_range(s0, 0, 1000000)
+    assert_true(rwide[0] >= 0)
+    assert_true(rwide[0] <= 1000000)
+
+    // ── prng_take: count, non-negativity ────────────────────────────────
+    let seqA = prng_take(prng_seed(2026), 10)
+    assert_eq(len(seqA), 10)          // returns exactly `count`
+    assert_true(_all_nonneg(seqA))    // all values non-negative
+
+    // count == 0 -> empty list.
+    let seq0 = prng_take(prng_seed(1), 0)
+    assert_eq(len(seq0), 0)
+    // negative count -> empty list (loop never runs).
+    let seqNeg = prng_take(prng_seed(1), -4)
+    assert_eq(len(seqNeg), 0)
+    // count == 1 -> single element.
+    let seq1 = prng_take(prng_seed(1), 1)
+    assert_eq(len(seq1), 1)
+    assert_true(seq1[0] >= 0)
+
+    // ── REPRODUCIBILITY: same seed -> identical sequence ────────────────
+    let seqA2 = prng_take(prng_seed(2026), 10)
+    assert_true(_lists_equal(seqA, seqA2))
+
+    // ── DISTINCTNESS: different seeds -> different sequence ──────────────
+    let seqB = prng_take(prng_seed(2027), 10)
+    assert_true(_lists_equal(seqA, seqA) == true)   // sanity on the helper
+    assert_true(_lists_equal(seqA, seqB) == false)  // overwhelmingly different
+
+    // A second distinct pair, to make the "very likely" claim robust.
+    let seqC = prng_take(prng_seed(100), 16)
+    let seqD = prng_take(prng_seed(200), 16)
+    assert_true(_lists_equal(seqC, seqD) == false)
+
+    // ── prng_take_range: count, range, reproducibility ──────────────────
+    let rangedA = prng_take_range(prng_seed(55), 50, 1, 6)   // dice rolls
+    assert_eq(len(rangedA), 50)
+    assert_true(_all_in_range(rangedA, 1, 6))
+    let rangedA2 = prng_take_range(prng_seed(55), 50, 1, 6)
+    assert_true(_lists_equal(rangedA, rangedA2))             // reproducible
+
+    // Negative-spanning ranged take stays in bounds.
+    let rangedNeg = prng_take_range(prng_seed(7), 30, -10, 10)
+    assert_eq(len(rangedNeg), 30)
+    assert_true(_all_in_range(rangedNeg, -10, 10))
+
+    print("prng_test passed")

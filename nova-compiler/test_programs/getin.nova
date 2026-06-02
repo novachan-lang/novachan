@@ -1,0 +1,249 @@
+// ============================================================================
+// NOVA Standard Library — getin module
+// ============================================================================
+// Deep nested access into JSON-like structures. NOVA represents decoded JSON
+// as a tree of two heterogeneous containers:
+//
+//     dict  — string-keyed map   (a JSON object)
+//     list  — int-indexed array  (a JSON array)
+//
+// with leaf values being int / float / string / bool / null. Real-world data
+// (config files, API responses, parsed documents) is exactly this shape, and
+// reaching `cfg["server"]["ports"][0]` by hand means writing a membership
+// check and a bounds check at EVERY hop — one missing guard is a segfault.
+//
+// get_in() collapses that whole walk into a single, total (never-crashing)
+// function modelled on Clojure's `get-in`: you hand it the root object and a
+// PATH (a list whose elements are string keys for dicts and int indices for
+// lists), and it descends as far as the path stays valid, returning the
+// reached value — or a caller-supplied default the instant the path leaves
+// the structure.
+//
+// The design is "total by construction": at each hop we branch on
+// type_of(cur). A step only descends when the container kind and the step kind
+// agree AND the key/index is actually present/in-range. Any disagreement
+// (asking for a string key in a list, an int index in a dict, a missing key,
+// an out-of-range or negative index, or a leaf reached before the path ends)
+// STOPS the walk and yields the default. This is why get_in NEVER does an
+// unchecked d[k] / xs[i] — every access is gated by a membership/bounds test
+// first, so it cannot dereference past the end of a container.
+//
+// Public API:
+//   get_in(obj, path, dflt)  -> value : safe deep get, returns dflt on any miss
+//   has_in(obj, path)        -> 1/0   : 1 iff the FULL path resolves
+//   get_in_str(obj, path, dflt) -> str: get_in specialised to a string default
+//
+// Why a single get_in instead of one helper per container kind? Because the
+// path itself is heterogeneous — a real path like ["users", 0, "name"] mixes
+// string keys and int indices — so the walk MUST decide per-hop, at runtime,
+// which kind of step it is. type_of(step) on the path element tells us the
+// programmer's INTENT; type_of(cur) on the container tells us what's THERE; a
+// hop succeeds only when those two agree.
+
+// ── one descent step ──────────────────────────────────────────────────────────
+// Try to take ONE hop from `cur` using path element `step`. Returns 1 and the
+// child is reachable iff:
+//   * cur is a dict, step is a string, and (step in cur)        -> descend by key
+//   * cur is a list, step is an int, and 0 <= step < len(cur)   -> descend by idx
+// Anything else (kind mismatch, missing key, out-of-range/negative index,
+// or cur being a leaf) means "no child here".
+//
+// We split the boolean "can we descend?" test (step_ok) from the actual read
+// (step_get) so get_in/has_in share ONE source of truth for what a valid hop
+// is — and so has_in can answer without ever materialising the value. Keeping
+// the predicate and the read in lockstep is what makes get_in total: we only
+// ever call step_get after step_ok returned 1, so its d[step]/cur[step] reads
+// are always in-bounds.
+
+fn step_ok(cur, step) -> int
+    let ck = type_of(cur)
+    let sk = type_of(step)
+    if ck == "dict"
+        // dict hops require a STRING key; a non-string step can't index a dict.
+        if sk == "string"
+            if step in cur
+                return 1
+        return 0
+    if ck == "list"
+        // list hops require an INT index, in [0, len). Negative or >= len stops.
+        if sk == "int"
+            if step >= 0
+                if step < len(cur)
+                    return 1
+        return 0
+    // cur is a leaf (int/float/string/bool/null) — nothing to descend into.
+    return 0
+
+// Read the child for a hop that step_ok() has already approved. Never called
+// otherwise, so both reads below are guaranteed in-range.
+fn step_get(cur, step)
+    if type_of(cur) == "dict"
+        return cur[step]
+    return cur[step]
+
+// ── deep get ────────────────────────────────────────────────────────────────
+// Walk `obj` along `path`. The loop invariant is: `cur` is always a value we
+// have legitimately reached from `obj` by the first `i` path elements. For each
+// remaining element we test step_ok; the first failure returns `dflt`, and an
+// empty path returns `obj` unchanged (zero hops = the root itself).
+fn get_in(obj, path, dflt)
+    let cur = obj
+    let i = 0
+    let n = len(path)
+    while i < n
+        let step = path[i]
+        if step_ok(cur, step) == 0
+            return dflt
+        cur = step_get(cur, step)
+        i = i + 1
+    return cur
+
+// ── existence ─────────────────────────────────────────────────────────────────
+// 1 iff the FULL path resolves to some value (which may itself be falsy/null).
+// This is distinct from get_in == dflt: a key can legitimately hold the same
+// value you'd pass as a default, so presence must be tested structurally — by
+// walking the path and checking every hop succeeds — not by comparing results.
+fn has_in(obj, path) -> int
+    let cur = obj
+    let i = 0
+    let n = len(path)
+    while i < n
+        let step = path[i]
+        if step_ok(cur, step) == 0
+            return 0
+        cur = step_get(cur, step)
+        i = i + 1
+    return 1
+
+// ── string-typed convenience ──────────────────────────────────────────────────
+// get_in specialised for the common "pull a string out of config" case. The
+// default is a string, so the result is always usable as a string by the
+// caller. (NOVA is dynamically-walked here; this overload exists for intent and
+// to keep call sites annotation-clean, not because the engine needs it.)
+fn get_in_str(obj, path, dflt) -> str
+    return get_in(obj, path, dflt)
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+fn main()
+    // ---- hand-built nested structure (the spec's example) ----
+    //   d = { "name": "NOVA",
+    //         "meta": { "x": 42 },
+    //         "arr":  [10, 20, 30] }
+    let d = {}
+    d["name"] = "NOVA"
+    let inner = {}
+    inner["x"] = 42
+    d["meta"] = inner
+    let arr = [10, 20, 30]
+    d["arr"] = arr
+
+    // ---- get_in: the spec's required assertions ----
+    assert_eq(get_in(d, ["name"], ""), "NOVA")          // top-level string key
+    assert_eq(get_in(d, ["meta", "x"], 0), 42)          // nested dict -> key
+    assert_eq(get_in(d, ["arr", 1], 0), 20)             // dict -> list -> index
+    assert_eq(get_in(d, ["missing"], "none"), "none")   // missing top key -> dflt
+    assert_eq(get_in(d, ["meta", "y"], -1), -1)         // missing nested key -> dflt
+    assert_eq(get_in(d, ["arr", 9], -1), -1)            // list index out of range
+    assert_eq(has_in(d, ["meta", "x"]), 1)              // full path resolves
+    assert_eq(has_in(d, ["meta", "z"]), 0)              // missing leaf key
+    // empty path returns obj itself: prove it's the SAME dict by reading a key.
+    let root = get_in(d, [], 0)
+    assert_eq(root["name"], "NOVA")
+    assert_eq(type_of(root), "dict")
+
+    // ---- get_in: list-index boundaries (first / last / one-past / negative) ----
+    assert_eq(get_in(d, ["arr", 0], -1), 10)            // first element
+    assert_eq(get_in(d, ["arr", 2], -1), 30)            // last element
+    assert_eq(get_in(d, ["arr", 3], -1), -1)            // one past the end -> dflt
+    assert_eq(get_in(d, ["arr", -1], -1), -1)           // negative index -> dflt
+    assert_eq(get_in(d, ["arr", 100], -7), -7)          // far out of range -> dflt
+
+    // ---- get_in: kind-mismatch hops must STOP (not crash) ----
+    // string key into a list:
+    assert_eq(get_in(d, ["arr", "x"], -1), -1)
+    // int index into a dict:
+    assert_eq(get_in(d, [0], -1), -1)
+    // int index into the root dict via a deeper path:
+    assert_eq(get_in(d, ["meta", 0], -1), -1)
+    // descend THROUGH a leaf: "name" is a string, so any further step stops.
+    assert_eq(get_in(d, ["name", "more"], -1), -1)
+    assert_eq(get_in(d, ["name", 0], -1), -1)
+    // descend through an int leaf:
+    assert_eq(get_in(d, ["meta", "x", "deeper"], -1), -1)
+
+    // ---- has_in: presence vs. value ----
+    assert_eq(has_in(d, ["name"]), 1)
+    assert_eq(has_in(d, ["arr"]), 1)
+    assert_eq(has_in(d, ["arr", 0]), 1)
+    assert_eq(has_in(d, ["arr", 2]), 1)
+    assert_eq(has_in(d, ["arr", 3]), 0)                 // out of range
+    assert_eq(has_in(d, ["arr", -1]), 0)                // negative
+    assert_eq(has_in(d, ["missing"]), 0)
+    assert_eq(has_in(d, ["meta"]), 1)
+    assert_eq(has_in(d, ["meta", "x"]), 1)
+    assert_eq(has_in(d, ["meta", "y"]), 0)
+    assert_eq(has_in(d, []), 1)                         // empty path always resolves (to obj)
+    // has_in must report presence even when the held value EQUALS a typical
+    // default: arr[0] is 10; were has_in implemented via "get_in == dflt" it
+    // would be fooled. Structural walk gets it right.
+    assert_eq(has_in(d, ["arr", 0]), 1)
+
+    // ---- get_in finds a present value even if it looks like a default ----
+    // arr[0] == 10; passing 10 as the default must NOT hide a real hit/miss.
+    assert_eq(get_in(d, ["arr", 0], 10), 10)            // present, equals dflt by luck
+    assert_eq(get_in(d, ["arr", 5], 10), 10)            // absent, returns dflt
+
+    // ---- get_in returns a CONTAINER when the path lands on one ----
+    let got_arr = get_in(d, ["arr"], 0)
+    assert_eq(type_of(got_arr), "list")
+    assert_eq(len(got_arr), 3)
+    assert_eq(got_arr[1], 20)
+    let got_meta = get_in(d, ["meta"], 0)
+    assert_eq(type_of(got_meta), "dict")
+    assert_eq(got_meta["x"], 42)
+
+    // ---- get_in_str: string-default specialisation ----
+    assert_eq(get_in_str(d, ["name"], ""), "NOVA")
+    assert_eq(get_in_str(d, ["nope"], "default"), "default")
+    assert_eq(get_in_str(d, ["meta", "missing"], "fallback"), "fallback")
+
+    // ---- deeper, mixed-kind structure: list of dicts, dict of lists ----
+    //   root = { "users": [ {"name":"ada"}, {"name":"linus"} ],
+    //            "grid":  [ [1,2], [3,4,5] ] }
+    let u0 = {}
+    u0["name"] = "ada"
+    let u1 = {}
+    u1["name"] = "linus"
+    let users = [u0, u1]
+    let row0 = [1, 2]
+    let row1 = [3, 4, 5]
+    let grid = [row0, row1]
+    let root2 = {}
+    root2["users"] = users
+    root2["grid"] = grid
+
+    assert_eq(get_in(root2, ["users", 0, "name"], "?"), "ada")
+    assert_eq(get_in(root2, ["users", 1, "name"], "?"), "linus")
+    assert_eq(get_in(root2, ["users", 2, "name"], "?"), "?")   // user idx out of range
+    assert_eq(get_in(root2, ["users", 0, "age"], -1), -1)       // missing inner key
+    assert_eq(get_in(root2, ["grid", 0, 0], -1), 1)             // list -> list -> index
+    assert_eq(get_in(root2, ["grid", 1, 2], -1), 5)             // ragged inner row
+    assert_eq(get_in(root2, ["grid", 0, 2], -1), -1)            // ragged: row0 has no idx 2
+    assert_eq(get_in(root2, ["grid", 1, 0], -1), 3)
+    assert_eq(has_in(root2, ["users", 1, "name"]), 1)
+    assert_eq(has_in(root2, ["users", 5, "name"]), 0)
+    assert_eq(has_in(root2, ["grid", 0, 2]), 0)                 // ragged out of range
+    assert_eq(has_in(root2, ["grid", 1, 2]), 1)
+
+    // ---- empty containers behave (no spurious descents) ----
+    let empty_d = {}
+    let empty_l = []
+    assert_eq(get_in(empty_d, ["k"], "x"), "x")
+    assert_eq(get_in(empty_l, [0], "x"), "x")
+    assert_eq(has_in(empty_d, ["k"]), 0)
+    assert_eq(has_in(empty_l, [0]), 0)
+    assert_eq(has_in(empty_d, []), 1)                  // empty path on empty dict still resolves
+    assert_eq(type_of(get_in(empty_d, [], 0)), "dict")
+
+    print("getin_test passed")
