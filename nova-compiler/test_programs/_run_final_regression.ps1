@@ -81,7 +81,8 @@ $domain_tests = @(
     'os_test',
     'net_test',
     'bit_ops_test',
-    'corex'
+    'corex',
+    'urlx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
