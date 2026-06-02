@@ -3809,6 +3809,26 @@ int64_t nova_rt_rotr(int64_t x, int64_t n) {
     return (int64_t)((v >> r) | (v << ((64 - r) & 63)));
 }
 
+/* ── Network byte order (cat-13): host<->network (big-endian) conversion for raw
+   protocol code. On a little-endian host these byte-swap; on big-endian they are
+   identity. Endianness is detected at runtime and __builtin_bswap is used, so no
+   <arpa/inet.h>/<winsock2.h> dependency (portable Linux/Windows). ntoh* == hton*
+   (the conversion is its own inverse). Inputs are taken as unsigned 16/32-bit
+   (upper i64 bits ignored); outputs are zero-extended. */
+static int nova_is_big_endian(void) { uint16_t t = 1; return ((const unsigned char*)&t)[0] == 0; }
+int64_t nova_rt_htons(int64_t v) {
+    uint16_t x = (uint16_t)((uint64_t)v & 0xFFFFu);
+    if (!nova_is_big_endian()) x = __builtin_bswap16(x);
+    return (int64_t)x;
+}
+int64_t nova_rt_ntohs(int64_t v) { return nova_rt_htons(v); }
+int64_t nova_rt_htonl(int64_t v) {
+    uint32_t x = (uint32_t)((uint64_t)v & 0xFFFFFFFFu);
+    if (!nova_is_big_endian()) x = __builtin_bswap32(x);
+    return (int64_t)x;
+}
+int64_t nova_rt_ntohl(int64_t v) { return nova_rt_htonl(v); }
+
 /* ── UTF-8 / Unicode (codepoint-aware; complements byte-level len/ord/chr) ──────
    These ADD codepoint semantics without changing the existing byte-based ops, so
    no existing program changes behavior. A NOVA string is UTF-8 bytes. */
