@@ -124,6 +124,11 @@ tests) + the regex `|` rewrite:**
   typed Result correctly flags it) and passes. Bootstrap-reconverged (self-host uses no Result, so safe).
   *Follow-up refinement: `?`/`try` still yields `any` (doesn't yet propagate E to the fn return type) —
   monadic-`?` typing is a future enhancement; the core static-checking win is in.*
+- ✅ **Result-returning safe number parsing** (NEW, cat-17 MISSING→HAVE) — `parse_int_safe(s) ->
+  Result<int,string>` and `parse_float_safe(s) -> Result<float,string>` (typed via `nt_sum`, showcasing
+  typed Result). `ok(n)` iff the whole string (modulo whitespace) parses, else `err(reason)` — the total,
+  typed replacement for the silent-0 `atoi`/`atof` path. `strtoll`/`strtod` with full-consumption + ERANGE
+  checks. `parse_safe_test` verifies valid/invalid/whitespace/trailing-junk/scientific cases.
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -457,10 +462,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 86 | 46% |
+| ✅ HAVE | 87 | 46% |
 | 🟡 PARTIAL | 52 | 28% |
-| ❌ MISSING | 51 | 27% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **112 / 189** | **59%** |
+| ❌ MISSING | 50 | 26% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **113 / 189** | **60%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -494,7 +499,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 14 | HTTP & WebSockets | 5 | 3 | 1 | 1 | **70%** | ↑ URI encode/parse added (Batch F) |
 | 15 | Async / event I/O | 4 | 2 | 1 | 1 | **63%** | ⇈ **was 13% (stale)** |
 | 16 | Time & date | 4 | 1 | 2 | 1 | **50%** | ⇈ **was 0% (stale)** |
-| 17 | Regex & parsing | 5 | 1 | 0 | 4 | **20%** | ↑ regex engine now full ({n}+`\|` done) |
+| 17 | Regex & parsing | 5 | 2 | 0 | 3 | **40%** | ↑ regex engine full + Result number parsing (new) |
 | 18 | Serialization | 6 | 2 | 1 | 3 | **42%** | ↑ key=value config parsing added (Batch G) |
 | 19 | Testing | 5 | 3 | 0 | 2 | **60%** | ↑ property-based testing added (Batch M `proptest`) |
 | 20 | FFI / native interop | 7 | 3 | 1 | 3 | **50%** | = |
@@ -572,7 +577,7 @@ concrete evidence.
 | 10 | Linked lists (as a type) | ✅→🟡 | no `LinkedList` type; only "compiler may pick layout" prose |
 | 10 | Comparable + **binary search** | ✅→🟡→✅ | was absent; **CLOSED in Batch E** (`b6a3e02`): `binary_search`/`lower_bound`/`upper_bound` in `corex.nova`, tested |
 | 11 | Bit ops **popcount/clz/ctz/rotate** | ✅→🟡→✅ | was absent; **CLOSED in Batch D** (`47af07c`): `popcount`/`clz`/`ctz`/`rotl`/`rotr` added, `bit_ops_test` passes. Doc claim is now true. |
-| 17 | Number↔text conversion (Result) | 🟡→❌ | `parse_int/parse_float` = `atoll`/`atof`, silent 0 on fail, no `Result` |
+| 17 | Number↔text conversion (Result) | 🟡→❌→✅ | was silent-0 `atoll`/`atof`; **`parse_int_safe`/`parse_float_safe` -> Result<T,string> added** (typed, total) |
 | 17 | Tokenizer / scanner | 🟡→❌ | lexer is **compiler-internal only**; no user-facing builtin |
 | 18 | Compact binary term format | 🟡→❌ | no reusable codec; only ad-hoc length-framing in one demo |
 | 18 | Safe deserialization | ✅→🟡 | true for JSON only; general derive-(de)serialize doesn't exist |

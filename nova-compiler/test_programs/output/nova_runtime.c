@@ -6630,6 +6630,42 @@ int64_t nova_rt_none(void) {
     return nova_result_pack(1, 0);
 }
 
+/* parse_int_safe(s) -> Result<int,string>: ok(n) iff the whole string (modulo
+   surrounding whitespace) is a valid base-10 integer; else err(reason). The
+   typed, total replacement for the silent-0 `to_int`/atoi path. */
+int64_t nova_rt_parse_int_safe(int64_t s_ptr) {
+    const char* s = (const char*)(uintptr_t)s_ptr;
+    if (!s) return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("null string", 11));
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    if (*s == '\0') return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("empty string", 12));
+    errno = 0;
+    char* end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end == s) return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("not an integer", 14));
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
+    if (*end != '\0') return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("trailing characters", 19));
+    if (errno == ERANGE) return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("integer out of range", 20));
+    return nova_rt_ok((int64_t)v);
+}
+
+/* parse_float_safe(s) -> Result<float,string>. A NOVA float is its IEEE-754 i64
+   bit pattern, so ok() wraps the reinterpreted bits. */
+int64_t nova_rt_parse_float_safe(int64_t s_ptr) {
+    const char* s = (const char*)(uintptr_t)s_ptr;
+    if (!s) return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("null string", 11));
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    if (*s == '\0') return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("empty string", 12));
+    errno = 0;
+    char* end = NULL;
+    double d = strtod(s, &end);
+    if (end == s) return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("not a number", 12));
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
+    if (*end != '\0') return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("trailing characters", 19));
+    int64_t bits;
+    memcpy(&bits, &d, sizeof(bits));
+    return nova_rt_ok(bits);
+}
+
 int64_t nova_rt_is_ok(int64_t handle) {
     NovaResult* r = (NovaResult*)(uintptr_t)handle;
     return r->tag == 0 ? 1 : 0;

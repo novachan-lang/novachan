@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **167-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **168-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the
@@ -17,9 +17,11 @@ then pure-NOVA stdlib + regex `|`: `b6a3e02` (corex), `99ca666` (urlx), `6841eee
 `a449401` (regex `|`), `7838476` (collx), `60da2aa` (bignum), `…J` (bignum div/gcd), + complexnum
 + complexnum, rational, + Batch M (setops/strx/basex/matrixx/proptest) + Batch N (getin/prng/uuid/
 bitset) + **bounded channels** + **typed Result** (deep tier, runtime/inferrer+bootstrap). Regression:
-**167/167**. Verified scorecard **86 HAVE / 52 PARTIAL / 51 MISSING of 189 = 59%** (was 55% pre-push;
-cat-11 Numerics 44%→78%, cat-19 Testing 40%→60%, cat-7 Error-handling 61%→72%, cat-6 +bounded channels).
-Deep tier now being IMPLEMENTED (bounded channels ✅, typed Result ✅) per TYPED_RESULT_PLAN/DEEP_TIER_ROADMAP.
+**168/168**. Verified scorecard **87 HAVE / 52 PARTIAL / 50 MISSING of 189 = 60%** (was 55% pre-push;
+cat-11 Numerics 44%→78%, cat-19 Testing 40%→60%, cat-7 Error-handling 61%→72%, cat-17 Regex/parsing
+20%→40%, cat-6 +bounded channels). Deep tier IMPLEMENTED: bounded channels ✅, typed Result ✅, plus
+`parse_int_safe`/`parse_float_safe` -> Result<T,string> (new, leverages typed Result). See
+TYPED_RESULT_PLAN/DEEP_TIER_ROADMAP.
 
 **Headline:** The external critique largely audited the *old Java-bootstrap, design-doc-era*
 NOVA. The current **self-hosted** compiler (`gen3_test.exe`, native PE32+, ~0.98× C,
