@@ -110,7 +110,8 @@ $domain_tests = @(
     'dns_test',
     'algx',
     'comprehension_test',
-    'type_alias_test'
+    'type_alias_test',
+    'decode_utf8_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

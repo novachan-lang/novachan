@@ -6786,6 +6786,83 @@ int64_t nova_rt_parse_float_safe(int64_t s_ptr) {
     return nova_rt_ok(bits);
 }
 
+/* RFC 3629 validity beyond raw bit-decoding. nova_utf8_decode only checks byte
+   STRUCTURE (lead/continuation shape), so a secure decoder must additionally
+   reject: codepoints above U+10FFFF, UTF-16 surrogates (U+D800..U+DFFF), and
+   OVERLONG encodings (a codepoint encoded in more bytes than required — the
+   classic filter-bypass vector, e.g. C0 AF as an overlong '/'). seqlen is the
+   number of bytes the decoder consumed for this codepoint. */
+static int nova_utf8_cp_valid(int64_t cp, size_t seqlen) {
+    if (cp > 0x10FFFF) return 0;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return 0;
+    if (seqlen == 2 && cp < 0x80)    return 0;
+    if (seqlen == 3 && cp < 0x800)   return 0;
+    if (seqlen == 4 && cp < 0x10000) return 0;
+    return 1;
+}
+
+/* decode_utf8(bytes) -> Result<str,string>: total, RFC-3629-STRICT UTF-8 decode.
+   ok(s) iff every byte forms valid, non-overlong, non-surrogate, in-range UTF-8;
+   else err("invalid UTF-8 at byte N"). The typed, total, secure replacement for
+   the silent-coercion bytes_to_str path — malformed/hostile input can never
+   masquerade as a valid string. */
+int64_t nova_rt_decode_utf8(int64_t handle) {
+    NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (!b) return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create("null bytes", 10));
+    const unsigned char* s = b->data;
+    size_t len = (size_t)(b->size < 0 ? 0 : b->size);
+    size_t i = 0;
+    while (i < len) {
+        size_t j = i;
+        int64_t cp = nova_utf8_decode(s, len, &j);
+        if (cp < 0 || !nova_utf8_cp_valid(cp, j - i)) {
+            char msg[48];
+            int n = snprintf(msg, sizeof(msg), "invalid UTF-8 at byte %lld", (long long)i);
+            if (n < 0) n = 0;
+            if ((size_t)n >= sizeof(msg)) n = (int)sizeof(msg) - 1;
+            return nova_rt_err((int64_t)(uintptr_t)nova_fat_str_create(msg, (size_t)n));
+        }
+        i = j;
+    }
+    /* len==0 path is safe: nova_fat_str_create never dereferences src when len==0. */
+    return nova_rt_ok((int64_t)(uintptr_t)nova_fat_str_create((const char*)s, len));
+}
+
+/* decode_utf8_lossy(bytes) -> str: lenient total decode. Valid sequences pass
+   through; a structurally-bad byte becomes one U+FFFD (skip 1 byte), and a
+   decodable-but-illegal sequence (overlong/surrogate/out-of-range) becomes one
+   U+FFFD (skip the whole sequence). Never fails — the everyday "just give me
+   text" decoder. */
+int64_t nova_rt_decode_utf8_lossy(int64_t handle) {
+    NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (!b || b->size <= 0) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    const unsigned char* s = b->data;
+    size_t len = (size_t)b->size;
+    if (len > (SIZE_MAX - 1) / 3) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    char* out = (char*)malloc(len * 3 + 1);   /* worst case: every byte -> 3-byte U+FFFD */
+    if (!out) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    size_t oi = 0, i = 0;
+    while (i < len) {
+        size_t j = i;
+        int64_t cp = nova_utf8_decode(s, len, &j);
+        if (cp < 0) {
+            out[oi++] = (char)0xEF; out[oi++] = (char)0xBF; out[oi++] = (char)0xBD;
+            i++;                              /* structurally bad: skip 1 byte */
+        } else if (!nova_utf8_cp_valid(cp, j - i)) {
+            out[oi++] = (char)0xEF; out[oi++] = (char)0xBF; out[oi++] = (char)0xBD;
+            i = j;                            /* decodable but illegal: skip the sequence */
+        } else {
+            size_t seqlen = j - i;
+            memcpy(out + oi, s + i, seqlen);
+            oi += seqlen;
+            i = j;
+        }
+    }
+    int64_t r = (int64_t)(uintptr_t)nova_fat_str_create(out, oi);
+    free(out);
+    return r;
+}
+
 int64_t nova_rt_is_ok(int64_t handle) {
     NovaResult* r = (NovaResult*)(uintptr_t)handle;
     return r->tag == 0 ? 1 : 0;

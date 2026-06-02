@@ -27,6 +27,14 @@ regression-green). Any matching rows below are STALE — skip them:
   fields, enum-variant fields, extern signatures). The DISTINCT/newtype half (`type UserId = distinct int`,
   UserId != int) is still remaining — deferred deliberately because sound newtype codegen needs the
   underlying-repr threaded through IR ops (==, print, arithmetic) which today is type-erased.
+- **Strict charset decode** `decode_utf8(bytes) -> Result<str,str>` (RFC-3629-strict: rejects malformed
+  structure AND overlong encodings, surrogates, codepoints > U+10FFFF — surfaces the offending byte offset
+  as a typed Err) + `decode_utf8_lossy(bytes) -> str` (bad bytes → U+FFFD, never fails). Closes the
+  "secure by default" gap where `bytes_to_str` silently coerced malformed bytes. (Covers the table-stakes
+  "Charset encode/decode returning Result" row.)
+- **`print(struct_local)` dispatch** verified WORKING (audit's "prints `<struct>`" finding is STALE — direct
+  `print(p)` of a let-bound struct now routes through the structural `__show`; covers the "Universal Object
+  protocol" PARTIAL row's only remaining gap).
 Always re-verify a row against the real code before building (the per-item "evidence" below is as-of-audit).
 
 **Total verified-remaining: 96** (minus the shipped items above)
@@ -40,8 +48,8 @@ Always re-verify a row against the real code before building (the per-item "evid
 - **evidence (as of audit):** ti_error(st, "duplicate function definition: '" + name + "' was already defined on line ...") at nova_compiler.nova:8643-8644 fires whenever a function name is seen twice (seen_fns map populated at 8646). The only 'overload' identifiers in the codebase are ir_resolve_op_overload / ir_resolve_unary_overload (4829, 4863) which are TRAIT operator overloading, not name-based function overloading. ti_define stores exactly one type scheme per name (8651), and ti_min_arity[name] holds a single arity (8639) â€” no candidate-set / ranking machinery. No overload-resolution test exists in test_programs/*.nova.
 
 ### Charset encode/decode returning Result on malformed bytes  *(9. Strings & Unicode)*
-- **status:** MISSING | **effort:** medium
-- **gap:** No total charset decode (e.g. decode_utf8/encode_latin1) that returns a Result with the offending byte offset on malformed input; bytes->str silently coerces.
+- **status:** DONE (this push) — `decode_utf8` -> Result (RFC-3629-strict) + `decode_utf8_lossy` -> str shipped.
+- **gap:** ~~No total charset decode~~ CLOSED. `decode_utf8(bytes) -> Result<str,str>` reports "invalid UTF-8 at byte N" (rejecting structural errors, overlong forms, surrogates, and codepoints > U+10FFFF); `decode_utf8_lossy(bytes) -> str` replaces bad bytes with U+FFFD. test_programs/decode_utf8_test.nova. (encode_utf8 intentionally NOT added — a NOVA string is already UTF-8, so `str_to_bytes` is the encoder; a fallible Latin-1 encoder was judged niche/checklist, deferred unless a real need appears.)
 - **NOVA approach:** Add nova_rt_decode_utf8(bytes)->Result<str,err> and nova_rt_encode_utf8/encode_latin1 reusing existing nova_utf8_decode (it already returns -1 on malformed) plus the thread-local __nova_is_result flag (nova_runtime.c:46-53) to construct the Sum-typed Result the TYPED_RESULT machinery already supports; wire the 4 sites with reg[...] = nt_fn([bytes],Result-of-string) so unwrap-misuse is a compile error and malformed bytes surface as a typed Err â€” no silent replacement, no throw.
 - **evidence (as of audit):** Bytes type exists (nova_rt_bytes_create/get/set/len/slice at nova_runtime.c:6270-6310, nova_rt_str_to_bytes:6322, nova_rt_bytes_to_str:6312) but nova_rt_bytes_to_str silently memcpy's bytes into a C string with NO UTF-8/charset validation and NO Result â€” malformed bytes are coerced, not reported. is_valid_utf8 (3877) is only a bool predicate, not a total decoder. Searched 'decode','encode','charset','latin','malformed','replacement_char' in runtime: only base64/hex/json encode (nova_rt_base64_encode/hex_encode/json_encode) and no charset decode returning Result. No utf8_decode/latin1/utf16 Result-returning conversion exists.
 
@@ -76,7 +84,7 @@ Always re-verify a row against the real code before building (the per-item "evid
 - **evidence (as of audit):** Recoverable path is real: nova_set_error sets thread-local __nova_error_flag/__nova_error_msg (nova_runtime.c:55-65), `error`/`try`(raise_error)/`catch` are lowered (nova_compiler.nova:5383-5410, 9632, 10649) and `?` does cross-function early return. Process monitoring infra exists: NovaProcessInfo has exit_status + monitors[], on completion it sends exit_status to every monitor (nova_runtime.c:2999-3003, 3047-3049) and nova_rt_monitor wires a channel (nova_runtime.c:3427-3448). Deep-copy isolation across spawn (nova_rt_deep_copy, 1628).
 
 ### Universal Object protocol (equals/hash/toString/inspect)  *(3. OOP / polymorphism / interfaces)*
-- **status:** PARTIAL | **effort:** small
+- **status:** DONE — re-verified 2026-06-02: `print(p)` of a let-bound struct local now renders structurally (audit's `<struct>` finding was STALE). ==, hash, copy, str/print, json_stringify all automatic.
 - **gap:** `print(struct_var)` directly (an ident bound by `let`) falls through to nova_rt_print_any and prints `<struct>` instead of routing through `<Type>__show`, even though `str(struct_var)` works â€” ir_expr_struct_type (nova_compiler.nova:5637-5640) does not resolve the local's struct type at the print call site in all cases.
 - **NOVA approach:** The print(p) dispatch path already exists (nova_compiler.nova:5109-5113) but is gated on ir_expr_struct_type returning the local's type; harden the ident branch (5637-5640) so a `let`-bound struct local keeps its ir_locals type through to the standalone print statement (the str() path already succeeds, so the fix is making the local-type record survive for direct print), reusing the same __show call emission â€” zero new runtime, zero annotation.
 - **evidence (as of audit):** Structural `==` (nova_rt_eq struct branch at nova_runtime.c:2454-2465 compares type-hash slot 0 + all fields recursively), `hash()` consistent with == (nova_rt_hash at nova_runtime.c:5992 walks the same structure), `copy()` deep clone (nova_rt_deep_copy at nova_runtime.c:1628), `str(struct)` auto-show (_make_show_method + expand_derives at nova_compiler.nova:1934-2014, dispatched at codegen 5103-5108), and `to_json` auto-serialize (_make_to_json_method 1962-1981) are ALL real. auto_eq_test.nova and auto_json_test.nova pass exit=0; auto_show_test.nova assertions pass. BUT running auto_show_test.nova, the standalone `print(p)` statement (line 28) emitted `<struct>` instead of `Point { x: 3, y: 2.5 }`, while `str(p)` rendered correctly in the same function â€” the print(struct) display path failed to dispatch to __show.
