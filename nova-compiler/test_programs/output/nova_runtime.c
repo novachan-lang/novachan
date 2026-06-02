@@ -4466,12 +4466,38 @@ static int re_is_digit(int c) { return c >= '0' && c <= '9'; }
 static int re_is_word(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
 static int re_is_space(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
 
+/* When alternation inserts a SPLIT at index `threshold`, every instruction in
+   [from,to) shifted right by 1 must have its absolute jump targets (RE_SPLIT.x/y,
+   RE_JMP.x) bumped by 1 if they point at or past the insertion point. RE_SAVE's
+   x is a -1/-2 sentinel (never an index), so it is left alone. */
+static void re_bump(ReProg* prog, int from, int to, int threshold) {
+    for (int k = from; k < to; k++) {
+        ReInst* in = &prog->code[k];
+        if (in->op == RE_SPLIT) {
+            if (in->x >= threshold) in->x++;
+            if (in->y >= threshold) in->y++;
+        } else if (in->op == RE_JMP) {
+            if (in->x >= threshold) in->x++;
+        }
+    }
+}
+
 static int re_compile(const char* pattern, ReProg* prog) {
     int pc = 0;
     int len = (int)strlen(pattern);
     int pstack[64];
     int pstack_top = 0;
     int i = 0;
+
+    /* Alternation state, indexed by group depth (pstack_top). alt_start[d] is the
+       start pc of the current alternative in the group at depth d; alt_jmp[d][*]
+       are the indices of the per-alternative JMPs awaiting backpatch to that
+       group's END (the ')' or end-of-pattern). */
+    #define RE_MAX_ALT 64
+    int alt_start[66];
+    int alt_jmp[66][RE_MAX_ALT];
+    int alt_njmp[66];
+    for (int z = 0; z < 66; z++) { alt_start[z] = 0; alt_njmp[z] = 0; }
 
     #define EMIT(OP) do { if (pc >= RE_MAX_INST-2) return -1; prog->code[pc].op = (OP); prog->code[pc].cls = NULL; prog->code[pc].cls_len = 0; pc++; } while(0)
 
@@ -4529,24 +4555,49 @@ static int re_compile(const char* pattern, ReProg* prog) {
             break;
         }
         case '|': {
-            /* Patch: insert SPLIT before left, JMP at end of left */
-            /* Simple approach: treat | as alternation of the last atom */
-            /* For full correctness, handle with groups. Simple impl for now: */
-            /* We'll handle | inside parentheses only. Bare | not supported in v1. */
-            EMIT(RE_LIT);
-            prog->code[pc-1].c = '|';
+            /* Alternation A|B : turn the current alternative A (the code in
+               [as,pc)) into  SPLIT(A, B); A; JMP(END)  by inserting a SPLIT at
+               `as` and appending a JMP. END is backpatched at ')' / end-of-pattern.
+               Inserting shifts A right by one slot, so all absolute targets inside
+               A are bumped (re_bump). Right-nesting falls out: the previous SPLIT's
+               y already points at `as`, which now holds this new SPLIT. */
+            int as = alt_start[pstack_top];
+            if (pc + 2 >= RE_MAX_INST) return -1;
+            if (alt_njmp[pstack_top] >= RE_MAX_ALT) return -1;
+            memmove(&prog->code[as+1], &prog->code[as], (size_t)(pc - as) * sizeof(ReInst));
+            pc++;
+            re_bump(prog, as+1, pc, as);
+            prog->code[as].op = RE_SPLIT;
+            prog->code[as].cls = NULL;        /* the moved copy at as+1 owns any cls */
+            prog->code[as].cls_len = 0;
+            prog->code[as].x = as + 1;        /* left alternative starts right after */
+            int jidx = pc;
+            EMIT(RE_JMP);                     /* JMP END after the left alternative */
+            prog->code[jidx].x = -1;          /* backpatched later */
+            alt_jmp[pstack_top][alt_njmp[pstack_top]++] = jidx;
+            prog->code[as].y = pc;            /* right alternative begins here */
+            alt_start[pstack_top] = pc;
             i++;
             break;
         }
         case '(': {
+            if (pstack_top >= 64) return -1;
             pstack[pstack_top++] = pc;
             EMIT(RE_SAVE);
             prog->code[pc-1].x = -1;
+            /* a fresh alternation scope for this group, starting after the SAVE */
+            alt_start[pstack_top] = pc;
+            alt_njmp[pstack_top] = 0;
             i++;
             break;
         }
         case ')': {
             if (pstack_top <= 0) return -1;
+            /* converge this group's alternatives at END = here (before the close
+               SAVE), so every branch flows through the closing SAVE. */
+            for (int z = 0; z < alt_njmp[pstack_top]; z++)
+                prog->code[ alt_jmp[pstack_top][z] ].x = pc;
+            alt_njmp[pstack_top] = 0;
             pstack_top--;
             EMIT(RE_SAVE);
             prog->code[pc-1].x = -2;
@@ -4655,9 +4706,13 @@ static int re_compile(const char* pattern, ReProg* prog) {
             break;
         }
     }
+    /* top-level alternatives converge at the final MATCH */
+    for (int z = 0; z < alt_njmp[0]; z++)
+        prog->code[ alt_jmp[0][z] ].x = pc;
     EMIT(RE_MATCH);
     prog->len = pc;
     #undef EMIT
+    #undef RE_MAX_ALT
     return 0;
 }
 
