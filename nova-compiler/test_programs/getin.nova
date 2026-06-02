@@ -123,7 +123,73 @@ fn has_in(obj, path) -> int
 fn get_in_str(obj, path, dflt) -> str
     return get_in(obj, path, dflt)
 
+// ── deep put (write side) ─────────────────────────────────────────────────────
+// put_in(obj, path, val): set `val` at `path`, returning the (mutated) root.
+// NOVA containers are reference Values, so the write is in-place — `obj` and the
+// returned root are the same object (the "in-place when uniquely owned" model).
+// Missing intermediate DICT keys are created on the fly (as a dict, or a list
+// when the next step is an int index); we never auto-grow a list (an out-of-range
+// list index is ambiguous, so that hop is a no-op leaving `obj` unchanged). The
+// leaf write is total: a dict key is created-or-overwritten; a list index is
+// overwritten only when in range. Empty path replaces the root (returns `val`).
+// All container writes go through this generic-param helper. NOVA index-set
+// dispatches on the value's RUNTIME tag when the target is a generic param
+// (type `any`) — which is the sound path — so `_set_at` correctly handles both
+// dict (string key) and list (int index) regardless of any stale static type at
+// the call site. (Writing `cur[k]=v` directly on a slot that was reassigned
+// across container kinds can mis-specialize to the wrong runtime fn.)
+fn _set_at(container, key, value)
+    container[key] = value
+
+fn put_in(obj, path, val)
+    let n = len(path)
+    if n == 0
+        return val
+    let cur = obj
+    let i = 0
+    while i < n - 1
+        let step = path[i]
+        if step_ok(cur, step) == 1
+            cur = step_get(cur, step)
+        else
+            // Create a missing intermediate — only possible at a dict via a string key.
+            // Set a fresh {} or [] (via _set_at), then re-read it.
+            if type_of(cur) == "dict"
+                if type_of(step) == "string"
+                    if type_of(path[i + 1]) == "int"
+                        _set_at(cur, step, [])
+                    else
+                        _set_at(cur, step, {})
+                    cur = step_get(cur, step)
+                else
+                    return obj
+            else
+                return obj
+        i = i + 1
+    let leaf = path[n - 1]
+    if type_of(cur) == "dict"
+        if type_of(leaf) == "string"
+            _set_at(cur, leaf, val)
+    if type_of(cur) == "list"
+        if type_of(leaf) == "int"
+            if leaf >= 0
+                if leaf < len(cur)
+                    _set_at(cur, leaf, val)
+    return obj
+
+// update_in(obj, path, f): read the current value at `path` (null if absent),
+// apply the function `f` to it, and write the result back via put_in. Composes
+// the total read with the total write — a missing path applies `f(null)` and
+// creates it. `f` is any callable Value (closure or fn reference).
+fn update_in(obj, path, f)
+    let cur_val = get_in(obj, path, null)
+    let new_val = f(cur_val)
+    return put_in(obj, path, new_val)
+
 // ── tests ────────────────────────────────────────────────────────────────────
+
+fn _bump100(v)
+    return v + 100
 
 fn main()
     // ---- hand-built nested structure (the spec's example) ----
@@ -245,5 +311,48 @@ fn main()
     assert_eq(has_in(empty_l, [0]), 0)
     assert_eq(has_in(empty_d, []), 1)                  // empty path on empty dict still resolves
     assert_eq(type_of(get_in(empty_d, [], 0)), "dict")
+
+    // ---- put_in: overwrite existing leaves (in-place, returns same root) ----
+    put_in(d, ["name"], "RUST-KILLER")
+    assert_eq(get_in(d, ["name"], ""), "RUST-KILLER")     // top-level overwrite
+    put_in(d, ["meta", "x"], 99)
+    assert_eq(get_in(d, ["meta", "x"], 0), 99)            // nested dict overwrite
+    put_in(d, ["arr", 1], 200)
+    assert_eq(get_in(d, ["arr", 1], 0), 200)              // list index overwrite
+    assert_eq(get_in(d, ["arr", 0], 0), 10)               // siblings untouched
+    assert_eq(get_in(d, ["arr", 2], 0), 30)
+
+    // ---- put_in: create new keys (dict create-or-overwrite leaf) ----
+    put_in(d, ["newtop"], 7)
+    assert_eq(get_in(d, ["newtop"], -1), 7)               // new top-level key
+    put_in(d, ["meta", "y"], 5)
+    assert_eq(get_in(d, ["meta", "y"], -1), 5)            // new key in existing dict
+    assert_eq(get_in(d, ["meta", "x"], -1), 99)           // existing nested key kept
+
+    // ---- put_in: auto-create missing intermediate dicts ----
+    put_in(d, ["a", "b", "c"], 123)
+    assert_eq(get_in(d, ["a", "b", "c"], -1), 123)        // three levels conjured
+    assert_eq(type_of(get_in(d, ["a"], 0)), "dict")
+    assert_eq(type_of(get_in(d, ["a", "b"], 0)), "dict")
+
+    // ---- put_in: out-of-range list index is a no-op (never grows/crashes) ----
+    put_in(d, ["arr", 9], 999)
+    assert_eq(has_in(d, ["arr", 9]), 0)                   // unchanged
+    assert_eq(len(get_in(d, ["arr"], [])), 3)
+
+    // ---- put_in: empty path replaces the root ----
+    assert_eq(put_in(d, [], "replaced"), "replaced")
+
+    // ---- update_in: read-modify-write via a fn reference ----
+    let e = {}
+    e["counter"] = 1
+    update_in(e, ["counter"], _bump100)
+    assert_eq(get_in(e, ["counter"], 0), 101)             // 1 -> 101
+    let e2 = {}
+    let inner2 = {}
+    inner2["hits"] = 40
+    e2["stats"] = inner2
+    update_in(e2, ["stats", "hits"], _bump100)
+    assert_eq(get_in(e2, ["stats", "hits"], 0), 140)      // nested read-modify-write
 
     print("getin_test passed")
