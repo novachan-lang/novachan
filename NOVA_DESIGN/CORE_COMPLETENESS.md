@@ -78,6 +78,9 @@ tests) + the regex `|` rewrite:**
   branches. Runtime-only, 35-case test. **cat-17 regex-engine row PARTIAL→HAVE.**
 - ✅ **Collection helpers** — *Batch H* `collx.nova` (`take`/`drop`/`chunk`/`zip`/`unique`/`windows`/
   `flatten1`/`count_elem`/`reverse_list`/`sum_int`). Strengthens cat-10 functional algorithms.
+- ✅ **Arbitrary-precision integers** — *Batch I* `bignum.nova` — non-negative bigints as decimal
+  strings; `bn_add`/`bn_mul`/`bn_cmp` via schoolbook string arithmetic (no list mutation). Exact past
+  i64: verified `25!`, `fib(100)`, `2^64`, `123456789·987654321`. **Closes cat-11 bignum (MISSING→HAVE).**
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -411,10 +414,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 79 | 42% |
+| ✅ HAVE | 80 | 42% |
 | 🟡 PARTIAL | 55 | 29% |
-| ❌ MISSING | 55 | 29% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **106.5 / 189** | **56%** |
+| ❌ MISSING | 54 | 29% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **107.5 / 189** | **57%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -442,7 +445,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
 | 10 | Collections & iterators | 12 | 5 | 5 | 2 | **63%** | ↑ binary_search added (Batch E) |
-| 11 | Numerics & math | 9 | 3 | 3 | 3 | **50%** | ↑ π/e found; popcount/clz/ctz/rotate added (Batch D) |
+| 11 | Numerics & math | 9 | 4 | 3 | 2 | **61%** | ↑ bit-ops (D), π/e, **bignum (I)** |
 | 12 | File / OS / process | 8 | 4 | 1 | 3 | **56%** | ↑ FS-ops + OS added |
 | 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** | DNS now real |
 | 14 | HTTP & WebSockets | 5 | 3 | 1 | 1 | **70%** | ↑ URI encode/parse added (Batch F) |
@@ -589,8 +592,9 @@ items below. Ordered by leverage.
 
 9. **Numeric + collection table-stakes.** *(Numerics/Collections, important, 🟡)* bit ops
    popcount/clz/ctz/rotate — **DONE** (Batch D, `47af07c`); `binary_search`/`lower_bound`/`upper_bound`
-   — **DONE** (Batch E, `b6a3e02`). Remaining: bignum + decimal numeric tower (deep — auto-promote on
-   i64 overflow). Honesty debt on the small table-stakes items is now largely cleared.
+   — **DONE** (Batch E, `b6a3e02`); **bignum** (`bn_add`/`bn_mul`/`bn_cmp`, exact past i64) — **DONE**
+   (Batch I, `bignum.nova`). Remaining: *compiler-integrated* auto-promotion (i64→bignum on overflow,
+   transparent to the user) and a **decimal/rational** tower. Honesty debt on small table-stakes cleared.
 
 10. **OS subprocess depth + file seek.** *(File/OS, important, 🟡/❌)* `spawn`/`exec`/`set_env`/`getpid`/
     `chdir`/`which` exist; missing is **subprocess stdio-as-Channels**, **signal-as-message** delivery,

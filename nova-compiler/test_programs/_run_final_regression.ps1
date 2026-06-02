@@ -85,7 +85,8 @@ $domain_tests = @(
     'urlx',
     'csvx',
     'regex_alt_test',
-    'collx'
+    'collx',
+    'bignum'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
