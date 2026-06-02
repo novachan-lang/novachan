@@ -141,6 +141,10 @@ tests) + the regex `|` rewrite:**
   emitted unconditionally, like any function. True dead-strip (the design's headline) is a **compiler-wide**
   optimization (emit program-internal functions as `internal` linkage so `globaldce`/`-O2` removes uncalled
   ones) — a legitimately separate piece of work, NOT a derive-specific defect. Tracked as Phase-1.1.*
+- ✅ **Reflection Phase 2 — `@derive(Eq)`** — structural equality method (`p.eq(q)`): scalar fields via
+  `==`, nested `@derive(Eq)` struct fields via `.eq()`, empty struct ⇒ `true`. Proves the substrate
+  generalizes (same field-walk, different fold). **Stacked derives work** (`@derive(Show)` + `@derive(Eq)`
+  on one struct → both methods generated). `derive_eq_test` verifies scalar/nested/stacked.
 - ✅ **Result-returning safe number parsing** (NEW, cat-17 MISSING→HAVE) — `parse_int_safe(s) ->
   Result<int,string>` and `parse_float_safe(s) -> Result<float,string>` (typed via `nt_sum`, showcasing
   typed Result). `ok(n)` iff the whole string (modulo whitespace) parses, else `err(reason)` — the total,
