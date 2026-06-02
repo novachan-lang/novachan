@@ -106,7 +106,9 @@ $domain_tests = @(
     'auto_json_test',
     'auto_eq_test',
     'idx_set_soundness_test',
-    'byteorder_test'
+    'byteorder_test',
+    'dns_test',
+    'algx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

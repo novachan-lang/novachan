@@ -5356,6 +5356,57 @@ int64_t nova_rt_hostname(void) {
     return (int64_t)(uintptr_t)nova_fat_str_create(buf, strlen(buf));
 }
 
+/* reverse_dns(ip): PTR lookup of a dotted-quad IPv4 address to its hostname, or ""
+   if it cannot be resolved (deterministic-failure, never a crash). */
+int64_t nova_rt_reverse_dns(int64_t ip_ptr) {
+    const char* ip = (const char*)(uintptr_t)ip_ptr;
+    if (!ip || !*ip) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    nova_wsa_init();
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1)
+        return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    char host[256];
+    host[0] = '\0';
+    if (getnameinfo((struct sockaddr*)&sa, (socklen_t)sizeof(sa), host, (socklen_t)sizeof(host), NULL, 0, 0) != 0)
+        return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    host[sizeof(host) - 1] = '\0';
+    return (int64_t)(uintptr_t)nova_fat_str_create(host, strlen(host));
+}
+
+/* dns_resolve_all(host): ALL IPv4 addresses for a host as a list of dotted-quad
+   strings (empty list on failure). Multi-record companion to dns_resolve, which
+   returns only the first. */
+int64_t nova_rt_dns_resolve_all(int64_t host_ptr) {
+    int64_t list = nova_rt_list_create();
+    const char* host = (const char*)(uintptr_t)host_ptr;
+    if (!host || !*host) return list;
+    nova_wsa_init();
+    struct addrinfo hints, *res = NULL, *p;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;        /* IPv4 only */
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+        if (res) freeaddrinfo(res);
+        return list;
+    }
+    for (p = res; p; p = p->ai_next) {
+        if (!p->ai_addr) continue;
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        size_t cplen = (size_t)p->ai_addrlen;
+        if (cplen > sizeof(sin)) cplen = sizeof(sin);
+        memcpy(&sin, p->ai_addr, cplen);
+        char ip[64];
+        ip[0] = '\0';
+        if (inet_ntop(AF_INET, &sin.sin_addr, ip, sizeof(ip)))
+            nova_rt_list_append(list, (int64_t)(uintptr_t)nova_fat_str_create(ip, strlen(ip)));
+    }
+    freeaddrinfo(res);
+    return list;
+}
+
 /* ── HTTP Server (minimal, single-threaded) ────────────────────────────────── */
 
 int64_t nova_rt_http_listen(int64_t port_val) {
