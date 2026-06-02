@@ -78,9 +78,10 @@ tests) + the regex `|` rewrite:**
   branches. Runtime-only, 35-case test. **cat-17 regex-engine row PARTIAL→HAVE.**
 - ✅ **Collection helpers** — *Batch H* `collx.nova` (`take`/`drop`/`chunk`/`zip`/`unique`/`windows`/
   `flatten1`/`count_elem`/`reverse_list`/`sum_int`). Strengthens cat-10 functional algorithms.
-- ✅ **Arbitrary-precision integers** — *Batch I* `bignum.nova` — non-negative bigints as decimal
-  strings; `bn_add`/`bn_mul`/`bn_cmp` via schoolbook string arithmetic (no list mutation). Exact past
-  i64: verified `25!`, `fib(100)`, `2^64`, `123456789·987654321`. **Closes cat-11 bignum (MISSING→HAVE).**
+- ✅ **Arbitrary-precision integers** — *Batches I+J* `bignum.nova` — non-negative bigints as decimal
+  strings. *Complete* integer library: `bn_add`/`bn_sub`/`bn_mul`/`bn_divmod`(long division)/`bn_div`/
+  `bn_mod`/`bn_gcd`/`bn_cmp` via schoolbook string arithmetic (no list mutation). Exact past i64:
+  verified `25!`, `fib(100)`, `2^64`, `2^64/1000`, gcd of two primes, `q·b+r==a`. **Closes cat-11 bignum.**
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
