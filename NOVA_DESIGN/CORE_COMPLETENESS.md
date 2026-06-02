@@ -112,6 +112,18 @@ tests) + the regex `|` rewrite:**
   blocked senders can't hang. `bounded_chan_test` (cap-2, 6 items, concurrent consumer) passes — no deadlock.
   *Note: supervision-restart already existed (`supervisor_test`, `monitor()` builtin); the remaining
   concurrency gap is OS-crash fault-isolation (deep Track-8 ownership work).*
+- ✅ **Typed `Result<T,E>` / `Option<T>`** — ⭐ **THE #1 GAP, now implemented** (cat-7). Per
+  `TYPED_RESULT_PLAN.md`: `Result := nt_sum(T,E)`, `Option := nt_sum(T,unit)`. Registry schemes for
+  `ok`/`err`/`some`/`none`/`is_ok`/`is_err`/`is_some`/`is_none`/`unwrap`/`unwrap_err`/`unwrap_or`/
+  `result_tag` over the (previously unused) `nt_sum` — the unifier already handles `sum` and `any` is
+  permissive, so it was a contained inferrer change (no codegen change — Result still lowers as the
+  NovaResult i64; codegen is type-erased). **`unwrap` is now `Sum<T,E>→T`: `unwrap(a_dict)` is a COMPILE
+  ERROR** (`error[E1001]: expected ?T | ?T, found Dict<…>`) where it used to be a silent runtime `exit(1)`.
+  Verified: `typed_result_test` (happy paths + Option) passes; a negative test is rejected; `result_test`
+  migrated (its functions were wrongly annotated `-> int` while returning Results — erasure had masked it,
+  typed Result correctly flags it) and passes. Bootstrap-reconverged (self-host uses no Result, so safe).
+  *Follow-up refinement: `?`/`try` still yields `any` (doesn't yet propagate E to the fn return type) —
+  monadic-`?` typing is a future enhancement; the core static-checking win is in.*
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -445,10 +457,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 84 | 44% |
-| 🟡 PARTIAL | 54 | 29% |
+| ✅ HAVE | 86 | 46% |
+| 🟡 PARTIAL | 52 | 28% |
 | ❌ MISSING | 51 | 27% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **111 / 189** | **59%** |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **112 / 189** | **59%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -472,7 +484,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 4 | Generics & metaprogramming | 13 | 3 | 2 | 8 | **31%** | ↓ src-loc/cfg not real |
 | 5 | Memory & resource management | 11 | 4 | 6 | 1 | **64%** | ↑ |
 | 6 | Concurrency & parallelism | 15 | 6 | 4 | 5 | **53%** | ⇈ was 10% (stale); +bounded channels (deep-tier impl) |
-| 7 | Error handling | 9 | 3 | 5 | 1 | **61%** | = |
+| 7 | Error handling | 9 | 5 | 3 | 1 | **72%** | ⇈ **typed Result/Option now statically checked** |
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
 | 10 | Collections & iterators | 12 | 5 | 6 | 1 | **67%** | ↑ binary_search (E), deep-access read (N) |
@@ -580,11 +592,13 @@ runtime / no spawn") was *stale*: the lightweight-process runtime, channels, `se
 parallel map already exist and pass tests. What remains is the *structured* layer on top, plus the
 items below. Ordered by leverage.
 
-1. **Typed `Result<T,E>` / `Option<T>` in the type system.** *(Error handling, signature, 🟡)* **Now
-   the single highest-leverage gap.** Errors are erased to `int` with a runtime `exit(1)` on mismatch;
-   result-returning fns declare `-> int`. Until errors are statically checked, NOVA loses to Rust, C++
-   (`expected`), and even Go on safety, and exhaustive error handling is impossible. (Deep type-system
-   change — do it carefully, user-present.)
+1. ~~Typed `Result<T,E>` / `Option<T>`~~ — ✅ **DONE** (2026-06-02). `Result := Sum<T,E>`,
+   `Option := Sum<T,unit>`; `ok`/`err`/`some`/`none`/`unwrap`/`unwrap_or`/`is_*` are typed over `nt_sum`,
+   so `unwrap` is `Sum<T,E>→T` and `unwrap`-of-a-non-Result / wrong-type-use is a **compile error** instead
+   of a runtime `exit(1)`. The runtime/`?`/combinators were already real; this added the static layer. NOVA
+   now matches Rust/C++(`expected`)/Go on value-based error *checking*. **Remaining refinement:** monadic-`?`
+   type propagation (`x?` yields `T` but doesn't yet thread `E` into the enclosing fn's return type) and
+   exhaustiveness on error match — enhancements, not blockers.
 
 2. **Structured concurrency layer on the existing runtime.** *(Concurrency, signature, 🟡/❌)* The
    *primitives* are real (spawn/channels/select/async/pmap — verified). Missing is the *structure*:

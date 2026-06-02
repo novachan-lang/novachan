@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **165-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **167-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the
@@ -16,10 +16,10 @@ Implementation commits: `a15b6e2`, `0d16e68`, `f07dc1b`, `f5eae3f`, `198c943`, `
 then pure-NOVA stdlib + regex `|`: `b6a3e02` (corex), `99ca666` (urlx), `6841eee` (csvx),
 `a449401` (regex `|`), `7838476` (collx), `60da2aa` (bignum), `…J` (bignum div/gcd), + complexnum
 + complexnum, rational, + Batch M (setops/strx/basex/matrixx/proptest) + Batch N (getin/prng/uuid/
-bitset) + **bounded channels** (deep tier, runtime+bootstrap). Regression: **165/165**. Verified scorecard
-**84 HAVE / 54 PARTIAL / 51 MISSING of 189 = 59%** (was 55% pre-push; cat-11 Numerics 44%→78%, cat-19
-Testing 40%→60%, cat-6 Concurrency +bounded channels). Typed `Result<T,E>` fully designed (NOVA_DESIGN/
-TYPED_RESULT_PLAN.md) + DEEP_TIER_ROADMAP.md — implementing the deep tier now.
+bitset) + **bounded channels** + **typed Result** (deep tier, runtime/inferrer+bootstrap). Regression:
+**167/167**. Verified scorecard **86 HAVE / 52 PARTIAL / 51 MISSING of 189 = 59%** (was 55% pre-push;
+cat-11 Numerics 44%→78%, cat-19 Testing 40%→60%, cat-7 Error-handling 61%→72%, cat-6 +bounded channels).
+Deep tier now being IMPLEMENTED (bounded channels ✅, typed Result ✅) per TYPED_RESULT_PLAN/DEEP_TIER_ROADMAP.
 
 **Headline:** The external critique largely audited the *old Java-bootstrap, design-doc-era*
 NOVA. The current **self-hosted** compiler (`gen3_test.exe`, native PE32+, ~0.98× C,
@@ -37,10 +37,10 @@ below — those are the real work. **Do not spend effort "fixing" the stale non-
 - Pattern matching (exhaustive), closures, default args, modules (`import`/`as`/selective, merged IR — verified live on 4 multi-file tests).
 - **Diagnostics are rustc-class** (critique WRONG): error codes (E0001, E0010-13, E1000-E1012, E1003), `file:line:col`, source snippets, `help:` text, Levenshtein "did you mean?".
 
-### Error handling (functionally real, type-unsafe)
+### Error handling (now statically typed — 2026-06-02)
 - `error`/`catch`/`try`/`?` unified; `?` does real cross-function early-return propagation (verified).
 - `Result`/`Option` runtime value type (`NovaResult{tag,value}`) + ~15 combinators (ok/err/some/none/is_ok/unwrap/unwrap_or/map/and_then/…).
-- ⚠️ **Gap:** type-ERASED — result-returning fns still declare `-> int`; `unwrap` mismatch is runtime `exit(1)`, not a compile error. No statically-typed `Result<T,E>`/`Option<T>`.
+- ✅ **Typed `Result<T,E>`/`Option<T>` DONE:** `Result := Sum<T,E>`, `Option := Sum<T,unit>`; ok/err/some/none/unwrap/unwrap_or/is_* typed over `nt_sum` (the unifier already handled "sum"; `any` permissive). **`unwrap` is `Sum<T,E>→T` — `unwrap(non-Result)` or wrong-type-use is now a COMPILE ERROR (E1001), not a runtime `exit(1)`.** Verified: typed_result_test + a negative test + migrated result_test. No codegen change (Result still lowers as NovaResult i64). *Refinement left: monadic-`?` E-propagation into the fn return type.*
 
 ### Stdlib & runtime
 - Strings: split/join/trim/upper/lower/slice/find/replace/pad/center; **`format()`** Python-style mini-language; **f-string interpolation** over arbitrary expressions (critique WRONG on "no format").
@@ -96,7 +96,7 @@ headline features exist.**
 ## ❌ NOT COMPLETED — verified real gaps (this is the work)
 
 ### TIER 1 — blocks real production apps
-1. **Typed `Result<T,E>` / `Option<T>` in the type system** — make errors statically checked, not erased to `int` with runtime `exit(1)`. **Now the #1 gap** (deep type-system change; do it user-present).
+1. ~~Typed `Result<T,E>` / `Option<T>`~~ — ✅ **DONE 2026-06-02.** Statically checked now (Sum-typed; unwrap is a compile error on misuse, not a runtime exit(1)). Was the #1 gap. *Refinement left: monadic-`?` E-propagation.*
 2. **Structured concurrency layer** — the *primitives* are done (see Concurrency above); missing is the *structure*: **supervision/restart** (today log-only stubs), structured concurrency, GenServer, bounded channels. This is where the Erlang-beating thesis is won — and it's a far smaller lift than the old "no runtime" framing implied.
 3. ~~File I/O completeness~~ — **DONE** (`a15b6e2`): delete/rmdir/stat/rename/copy/temp/`write_bytes`/`read_lines` all shipped. *Only seek/truncate/mmap remain.*
 4. ~~Regex~~ — **DONE.** `{n}`/`{n,m}`/`{n,}` (`0d16e68`) AND `|` alternation (`a449401`) both shipped; the regex engine is now complete (classes/quantifiers/counted/alternation/anchors/groups). *Remaining in the broader cat-17: user-facing tokenizer, Result-returning number parsing, parser-combinators.*

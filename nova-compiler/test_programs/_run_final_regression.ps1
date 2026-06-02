@@ -97,7 +97,9 @@ $domain_tests = @(
     'getin',
     'prng',
     'uuid',
-    'bitset'
+    'bitset',
+    'typed_result_test',
+    'result_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
