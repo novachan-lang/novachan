@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **147-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **152-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the
@@ -12,8 +12,10 @@ OS-thread pool with process-isolation-by-deep-copy; channels/`select`/`async`/`a
 `pfilter`/`yield` all exist and pass tests. Also shipped tonight: File-I/O completeness, regex
 `{n}`, Unicode codepoint views, OS builtins (`chdir`/`getpid`/`which`, `set_env` truthiness fix),
 DNS (`dns_resolve`/`hostname`), 10 math builtins, and bit-ops (`popcount`/`clz`/`ctz`/`rotl`/`rotr`).
-Implementation commits: `a15b6e2`, `0d16e68`, `f07dc1b`, `f5eae3f`, `198c943`, `47af07c`
-(+ `919bfb4` = this doc rewrite). Regression: **147/147**.
+Implementation commits: `a15b6e2`, `0d16e68`, `f07dc1b`, `f5eae3f`, `198c943`, `47af07c`,
+then pure-NOVA stdlib + regex `|`: `b6a3e02` (corex), `99ca666` (urlx), `6841eee` (csvx),
+`a449401` (regex `|`), + collx (this commit). Regression: **152/152**. Verified scorecard
+**79 HAVE / 55 PARTIAL / 55 MISSING of 189 = 56%** (was 55%).
 
 **Headline:** The external critique largely audited the *old Java-bootstrap, design-doc-era*
 NOVA. The current **self-hosted** compiler (`gen3_test.exe`, native PE32+, ~0.98× C,
@@ -38,11 +40,12 @@ below — those are the real work. **Do not spend effort "fixing" the stale non-
 
 ### Stdlib & runtime
 - Strings: split/join/trim/upper/lower/slice/find/replace/pad/center; **`format()`** Python-style mini-language; **f-string interpolation** over arbitrary expressions (critique WRONG on "no format").
-- Regex: real backtracking NFA — char classes/ranges, `* + ?`, **`{n}`/`{n,m}`/`{n,}` counted quantifiers** (added `0d16e68`), anchors, `\d \w \s`, groups (tested). *Gap: `|` alternation.*
+- Regex: real backtracking NFA — char classes/ranges, `* + ?`, **`{n}`/`{n,m}`/`{n,}` counted quantifiers** (`0d16e68`), **`|` alternation** (`a449401`: SPLIT-before-alt + `re_bump` index-fixup; handles `a|b|c`, `(cat|dog)s`, nested `(a|b)|c`, anchored; 35-case test), anchors, `\d \w \s`, groups (tested). **Engine complete.**
 - File I/O: read/write/append, `file_exists`, **`list_dir`**, `read_bytes`/**`write_bytes`**, `read_lines`, `mkdir`/`mkdir_p`, `path_join`, and full FS ops — **`remove_file`/`remove_dir`/`rename_path`/`copy_file`/`file_size`/`file_mtime`/`is_dir`/`is_file`/`temp_dir`** (added `a15b6e2`, `file_io_test` passes). *Gap: seek/truncate/mmap.*
 - OS/process: `env`, **`set_env`** (truthiness-fixed), **`chdir`**, **`getpid`**, **`which`**, `cwd`, `spawn`/`exec` (added `f5eae3f`, `os_test` passes).
 - Networking identity: **`dns_resolve`** (IPv4, `""`-on-fail), **`hostname`** (added `198c943`, `net_test` passes).
 - Unicode codepoint layer: `char_count`/`char_at`/`code_points`/`from_codepoint`/`is_valid_utf8` (additive — byte `len`/`ord` unchanged). Math: `sinh`/`cosh`/`tanh`/`cbrt`/`hypot`/`gcd`/`lcm`/`pi`/`e`/`fmod` (added `f07dc1b`). Bit ops: `popcount`/`clz`/`ctz`/`rotl`/`rotr` (added `47af07c`, UB-guarded, `bit_ops_test` passes).
+- Pure-NOVA stdlib modules (no bootstrap, self-contained + inline-tested): **corex** (`b6a3e02`: binary_search/lower_bound/upper_bound/isqrt/ilog2/clamp/sign/next_pow2), **urlx** (`99ca666`: url_encode/decode RFC-3986 byte-level, parse_query/build_query, html_escape), **csvx** (`6841eee`: RFC-4180 CSV parse/quote, key=value config), **collx** (take/drop/chunk/zip/unique/windows/flatten1/count_elem/reverse_list/sum_int).
 - Collections: list/dict/set/deque/priority-queue/sorted-map/LRU/counter/ring-buffer; iterators; JSON encode/decode.
 - Crypto (from-scratch, oracle-verified): SHA-256, HMAC-SHA256, CRC-32 (ISO-HDLC correct), base64, random_bytes.
 - Tensors: matmul/add/mul/scale/relu/softmax/zeros (real C). Domain modules: math3d, ecs, nn, physics2d, stats, router, netutil, compress_rle, crypto_util.
@@ -90,7 +93,7 @@ headline features exist.**
 1. **Typed `Result<T,E>` / `Option<T>` in the type system** — make errors statically checked, not erased to `int` with runtime `exit(1)`. **Now the #1 gap** (deep type-system change; do it user-present).
 2. **Structured concurrency layer** — the *primitives* are done (see Concurrency above); missing is the *structure*: **supervision/restart** (today log-only stubs), structured concurrency, GenServer, bounded channels. This is where the Erlang-beating thesis is won — and it's a far smaller lift than the old "no runtime" framing implied.
 3. ~~File I/O completeness~~ — **DONE** (`a15b6e2`): delete/rmdir/stat/rename/copy/temp/`write_bytes`/`read_lines` all shipped. *Only seek/truncate/mmap remain.*
-4. **Regex `|` alternation** — `{n}`/`{n,m}`/`{n,}` **DONE** (`0d16e68`); `|` remains (needs a recursive-descent regex rewrite — the VM uses absolute pc indices).
+4. ~~Regex~~ — **DONE.** `{n}`/`{n,m}`/`{n,}` (`0d16e68`) AND `|` alternation (`a449401`) both shipped; the regex engine is now complete (classes/quantifiers/counted/alternation/anchors/groups). *Remaining in the broader cat-17: user-facing tokenizer, Result-returning number parsing, parser-combinators.*
 5. **Unicode-correct `len`/indexing** — codepoint **views** added (`char_count`/`char_at`/`code_points`/…, `f07dc1b`); default `len`/indexing/`ord`/`chr`/regex still byte-level (`len("café")==5`). No grapheme/normalization/non-ASCII case-fold.
 6. **HTTP depth + thread-pooled serve** — the thread pool now exists, so `serve()` should dispatch connections onto it (no longer blocked on a missing runtime). Still missing: cookies, sessions, auth, multipart, streaming/chunked, **middleware chain**, request timeouts.
 7. **DB driver layer** — connection abstraction + parameter binding (SQL is string-concat today, injection-prone); Postgres/MySQL drivers.

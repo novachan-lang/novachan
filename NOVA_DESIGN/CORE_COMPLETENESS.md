@@ -60,6 +60,25 @@ bootstrap-reconverged gen5==gen6 byte-identical, full regression green before co
   bit-ops row that the audit caught the doc *claiming* but not having. Also added the 5 verified
   concurrency tests (`async`/`select`/`select_multi`/`yield`/`parallel`) to the regression. (Cat. 11.)
 
+**Shipped tonight — pure-NOVA stdlib (no bootstrap; self-contained `.nova` modules, exhaustive inline
+tests) + the regex `|` rewrite:**
+
+- ✅ **Ordered search + integer numerics** — *Batch E* `corex.nova` (committed `b6a3e02`, 148/148) —
+  `binary_search`/`lower_bound`/`upper_bound`/`count_sorted`/`contains_sorted`; `sign`/`clamp_int`/
+  `isqrt` (exact integer Newton)/`ilog2`/`next_pow2`. **Closes the cat-10 `binary_search` honesty debt.**
+- ✅ **URL / web encoding** — *Batch F* `urlx.nova` (committed `99ca666`, 149/149) — `url_encode`/
+  `url_decode` (RFC-3986, byte-level so UTF-8 round-trips), `parse_query`/`build_query`, `html_escape`
+  (anti-XSS). **Closes the cat-14 URI row.**
+- ✅ **CSV + config parsing** — *Batch G* `csvx.nova` (committed `6841eee`, 150/150) — `parse_csv_line`/
+  `parse_csv`/`csv_field` (RFC-4180-ish: quotes, embedded commas, doubled-quote escaping, CRLF),
+  `parse_config` (key=value, `#`/`;` comments). **Closes the cat-18 config row.**
+- ✅ **Regex `|` alternation** (committed `a449401`, 151/151) — the `|` case was a **stub** (emitted a
+  literal `|`); now a real `SPLIT(A,B); A; JMP(END)` with bounded index-fixup (`re_bump`) for the
+  absolute-index VM. Handles `a|b|c`, grouped `(cat|dog)s`, nested `(a|b)|c`, anchored, quantified
+  branches. Runtime-only, 35-case test. **cat-17 regex-engine row PARTIAL→HAVE.**
+- ✅ **Collection helpers** — *Batch H* `collx.nova` (`take`/`drop`/`chunk`/`zip`/`unique`/`windows`/
+  `flatten1`/`count_elem`/`reverse_list`/`sum_int`). Strengthens cat-10 functional algorithms.
+
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
 runtime, ran the cited tests through `gen3_test.exe`). Findings rewrote the scorecard in BOTH
@@ -392,15 +411,17 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 75 | 40% |
-| 🟡 PARTIAL | 58 | 31% |
-| ❌ MISSING | 56 | 30% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **104 / 189** | **55%** |
+| ✅ HAVE | 79 | 42% |
+| 🟡 PARTIAL | 55 | 29% |
+| ❌ MISSING | 55 | 29% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **106.5 / 189** | **56%** |
 
-The weighted total held at ~55% because the audit's corrections roughly cancelled — but the
-*composition* changed materially and the *narrative* changed completely (see below). The number
-is now **evidence-backed**, not aspirational. *(Includes Batch D: bit-ops popcount/clz/ctz/rotate
-moved cat-11 from 2→3 HAVE.)*
+The audit's corrections roughly cancelled, but the *composition* changed materially and the
+*narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
+Then tonight's batches moved it from 55%→56% by closing real rows: **Batch D** bit-ops (cat-11 2→3
+HAVE), **Batch E** `binary_search` (cat-10 PARTIAL→HAVE), **Batch F** URI encoding (cat-14 PARTIAL→HAVE),
+**Batch G** config parsing (cat-18 MISSING→HAVE), and the **regex `|`** rewrite (cat-17 PARTIAL→HAVE).
+Every one is backed by a passing test in the 151-test regression.
 
 ## Per-category completion
 
@@ -420,15 +441,15 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 7 | Error handling | 9 | 3 | 5 | 1 | **61%** | = |
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |
-| 10 | Collections & iterators | 12 | 4 | 6 | 2 | **58%** | ↓ no binary_search/linkedlist |
+| 10 | Collections & iterators | 12 | 5 | 5 | 2 | **63%** | ↑ binary_search added (Batch E) |
 | 11 | Numerics & math | 9 | 3 | 3 | 3 | **50%** | ↑ π/e found; popcount/clz/ctz/rotate added (Batch D) |
 | 12 | File / OS / process | 8 | 4 | 1 | 3 | **56%** | ↑ FS-ops + OS added |
 | 13 | Networking & sockets | 6 | 2 | 3 | 1 | **58%** | DNS now real |
-| 14 | HTTP & WebSockets | 5 | 2 | 2 | 1 | **60%** | = |
+| 14 | HTTP & WebSockets | 5 | 3 | 1 | 1 | **70%** | ↑ URI encode/parse added (Batch F) |
 | 15 | Async / event I/O | 4 | 2 | 1 | 1 | **63%** | ⇈ **was 13% (stale)** |
 | 16 | Time & date | 4 | 1 | 2 | 1 | **50%** | ⇈ **was 0% (stale)** |
-| 17 | Regex & parsing | 5 | 0 | 1 | 4 | **10%** | ↓ parse/tokenizer not real |
-| 18 | Serialization | 6 | 1 | 2 | 3 | **33%** | ↓ derive/codec not real |
+| 17 | Regex & parsing | 5 | 1 | 0 | 4 | **20%** | ↑ regex engine now full ({n}+`\|` done) |
+| 18 | Serialization | 6 | 2 | 1 | 3 | **42%** | ↑ key=value config parsing added (Batch G) |
 | 19 | Testing | 5 | 2 | 0 | 3 | **40%** | ↓ no process isolation |
 | 20 | FFI / native interop | 7 | 3 | 1 | 3 | **50%** | = |
 | 21 | Reflection / runtime | 5 | 0 | 0 | 5 | **0%** | = (the only true 0%) |
@@ -503,7 +524,7 @@ concrete evidence.
 | 4 | Source-location intrinsics `__FILE__`/`__LINE__` | ✅→❌ | no user-facing builtin (grep: 0); only internal compiler tracking |
 | 4 | Conditional compilation (`cfg`/`#if`) | 🟡→❌ | no `cfg`/`#if`/typed compile-time conditions found |
 | 10 | Linked lists (as a type) | ✅→🟡 | no `LinkedList` type; only "compiler may pick layout" prose |
-| 10 | Comparable + **binary search** | ✅→🟡 | sort works; **no `binary_search`/`bsearch`** (grep: 0) |
+| 10 | Comparable + **binary search** | ✅→🟡→✅ | was absent; **CLOSED in Batch E** (`b6a3e02`): `binary_search`/`lower_bound`/`upper_bound` in `corex.nova`, tested |
 | 11 | Bit ops **popcount/clz/ctz/rotate** | ✅→🟡→✅ | was absent; **CLOSED in Batch D** (`47af07c`): `popcount`/`clz`/`ctz`/`rotl`/`rotr` added, `bit_ops_test` passes. Doc claim is now true. |
 | 17 | Number↔text conversion (Result) | 🟡→❌ | `parse_int/parse_float` = `atoll`/`atof`, silent 0 on fail, no `Result` |
 | 17 | Tokenizer / scanner | 🟡→❌ | lexer is **compiler-internal only**; no user-facing builtin |
@@ -557,19 +578,19 @@ items below. Ordered by leverage.
    real; missing is Serde-style **derive-(de)serialize for any Value** (gated on #3 reflection/comptime)
    and **gzip/deflate/zip** codecs. The derive machinery is the same one that marshals Channel wire data.
 
-7. **Regex `|` alternation + parsing surface.** *(Regex/parsing 10%, table-stakes, 🟡/❌)* `{n}` is
-   **done**; `|` alternation remains (needs a recursive-descent regex rewrite — the VM uses absolute pc
-   indices). Plus a user-facing **tokenizer**, **`Result`-returning number parsing** (today `atoll`/`atof`
-   silently return 0), and parser-combinators.
+7. **Regex parsing surface.** *(Regex/parsing 20%, table-stakes, 🟡/❌)* The regex **engine is now
+   complete** — `{n}` (`0d16e68`) and `|` alternation (`a449401`) both **done**, so classes/quantifiers/
+   anchors/groups/counted/alternation all work. Remaining in this category: a user-facing **tokenizer**,
+   **`Result`-returning number parsing** (today `atoll`/`atof` silently return 0), and parser-combinators.
 
 8. **DB driver layer + remote package registry.** *(Modules/persistence, important, 🟡)* SQL is
    string-concatenated (injection-prone) with no connection/parameter-binding abstraction; the package
    registry is local-only (no network fetch / transitive resolution). Both block others shipping on NOVA.
 
 9. **Numeric + collection table-stakes.** *(Numerics/Collections, important, 🟡)* bit ops
-   popcount/clz/ctz/rotate — **DONE** (Batch D, `47af07c`). Remaining: **`binary_search`**, bignum +
-   decimal numeric tower. Small individually, but features the doc *claimed* and didn't have — clearing
-   the honesty debt one at a time.
+   popcount/clz/ctz/rotate — **DONE** (Batch D, `47af07c`); `binary_search`/`lower_bound`/`upper_bound`
+   — **DONE** (Batch E, `b6a3e02`). Remaining: bignum + decimal numeric tower (deep — auto-promote on
+   i64 overflow). Honesty debt on the small table-stakes items is now largely cleared.
 
 10. **OS subprocess depth + file seek.** *(File/OS, important, 🟡/❌)* `spawn`/`exec`/`set_env`/`getpid`/
     `chdir`/`which` exist; missing is **subprocess stdio-as-Channels**, **signal-as-message** delivery,
