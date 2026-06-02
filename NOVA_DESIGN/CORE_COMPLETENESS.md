@@ -89,6 +89,13 @@ tests) + the regex `|` rewrite:**
   (gcd-reduced, den>0); `rat`/`rat_add`/`rat_sub`/`rat_mul`/`rat_div`/`rat_cmp`/`rat_to_str`. Verified
   `½+⅓=⅚`, `1+½+⅓+¼=25/12` exact. **Closes cat-11 "Decimal/exact/rational" (MISSING→HAVE).** With this,
   **cat-11 Numerics went 44%→78% tonight** (bit-ops, bignum, complex, rational).
+- ✅ **Batch M — 5 modules authored+self-validated in parallel** (a 5-agent workflow; each iterated against
+  `gen3_test.exe` until green, then I independently re-ran all 5): `setops` (union/intersection/difference/
+  symdiff/subset — cat-10 set algebra), `strx` (ASCII case, capitalize/title, count_substr, replace_all,
+  **levenshtein** edit distance — cat-9), `basex` (`to_base`/`from_base` 2–36, `is_int_str`/`is_digit_str`
+  validation — cat-11/17), `matrixx` (zeros/identity/transpose/add/**mul** — linear algebra), `proptest`
+  (`forall_range` exhaustive + `forall_int` random + counterexample reporting). **`proptest` closes cat-19
+  property-based testing (MISSING→HAVE);** the others strengthen already-HAVE rows.
 
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
@@ -422,10 +429,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 82 | 43% |
+| ✅ HAVE | 83 | 44% |
 | 🟡 PARTIAL | 54 | 29% |
-| ❌ MISSING | 53 | 28% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **109 / 189** | **58%** |
+| ❌ MISSING | 52 | 28% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **110 / 189** | **58%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -461,7 +468,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 16 | Time & date | 4 | 1 | 2 | 1 | **50%** | ⇈ **was 0% (stale)** |
 | 17 | Regex & parsing | 5 | 1 | 0 | 4 | **20%** | ↑ regex engine now full ({n}+`\|` done) |
 | 18 | Serialization | 6 | 2 | 1 | 3 | **42%** | ↑ key=value config parsing added (Batch G) |
-| 19 | Testing | 5 | 2 | 0 | 3 | **40%** | ↓ no process isolation |
+| 19 | Testing | 5 | 3 | 0 | 2 | **60%** | ↑ property-based testing added (Batch M `proptest`) |
 | 20 | FFI / native interop | 7 | 3 | 1 | 3 | **50%** | = |
 | 21 | Reflection / runtime | 5 | 0 | 0 | 5 | **0%** | = (the only true 0%) |
 | 22 | Tooling | 12 | 10 | 2 | 0 | **92%** | ↑ REPL is real |

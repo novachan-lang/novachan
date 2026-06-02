@@ -88,7 +88,12 @@ $domain_tests = @(
     'collx',
     'bignum',
     'complexnum',
-    'rational'
+    'rational',
+    'setops',
+    'strx',
+    'basex',
+    'matrixx',
+    'proptest'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

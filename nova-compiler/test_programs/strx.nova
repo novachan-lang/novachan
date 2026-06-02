@@ -1,0 +1,299 @@
+// ============================================================================
+// NOVA Standard Library — strx module
+// ============================================================================
+// ASCII-focused string utilities. Pure NOVA: operates on bytes via ord/chr,
+// builds results by string concatenation (no in-place byte mutation, which
+// NOVA strings do not support). No new builtins.
+//
+// Closes:
+//   cat-9 Strings: case/transform + edit distance
+//
+// Public API:
+//   str_upper_ascii(s) -> str    (A-Za-z toggled to upper; other bytes as-is)
+//   str_lower_ascii(s) -> str    (A-Za-z toggled to lower; other bytes as-is)
+//   capitalize(s) -> str         (first letter upper, the rest lower)
+//   title_case(s) -> str         (capitalize each space-separated word)
+//   count_substr(s, sub) -> int  (non-overlapping occurrences; sub non-empty)
+//   replace_all(s, from, to)     (non-overlapping, left to right; from non-empty)
+//   levenshtein(a, b) -> int     (edit distance; two rolling rows by rebuild)
+//   str_count_char(s, ch) -> int (occurrences of a single byte ch)
+//
+// Design notes:
+//   - ASCII letter ranges: 'A'..'Z' is 65..90, 'a'..'z' is 97..122. The gap
+//     between the two cases is exactly 32, so toggling case is a +/- 32 on the
+//     byte value, applied ONLY when the byte is already a letter.
+//   - Case functions iterate byte-by-byte and append; every non-letter byte
+//     (digits, punctuation, UTF-8 continuation bytes) is passed through
+//     unchanged, so multibyte sequences are never corrupted.
+
+// Lower-case a single byte b if it is an ASCII uppercase letter; else return b.
+fn _to_lower_byte(b) -> int
+    if b >= 65 and b <= 90        // 'A'..'Z'
+        return b + 32
+    b
+
+// Upper-case a single byte b if it is an ASCII lowercase letter; else return b.
+fn _to_upper_byte(b) -> int
+    if b >= 97 and b <= 122       // 'a'..'z'
+        return b - 32
+    b
+
+// ── case transforms ──────────────────────────────────────────────────────────
+
+// Upper-case every ASCII letter in s; all other bytes are copied verbatim.
+fn str_upper_ascii(s) -> str
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        out = out + chr(_to_upper_byte(ord(s[i])))
+        i = i + 1
+    out
+
+// Lower-case every ASCII letter in s; all other bytes are copied verbatim.
+fn str_lower_ascii(s) -> str
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        out = out + chr(_to_lower_byte(ord(s[i])))
+        i = i + 1
+    out
+
+// First letter upper, the remaining letters lower. Empty string -> "".
+// "heLLO" -> "Hello": lower the whole string, then upper just byte 0.
+fn capitalize(s) -> str
+    if len(s) == 0
+        return ""
+    let lowered = str_lower_ascii(s)
+    let head = chr(_to_upper_byte(ord(lowered[0])))
+    // tail is everything after the first byte (already lowered)
+    let tail = slice(lowered, 1, len(lowered))
+    head + tail
+
+// Capitalize each space-separated word and re-join with single spaces.
+// Uses split on a single space, so runs of spaces collapse the same way the
+// splitter treats them; the canonical inputs have single spaces between words.
+fn title_case(s) -> str
+    let words = split(s, " ")
+    let out = ""
+    let i = 0
+    let n = len(words)
+    while i < n
+        if i > 0
+            out = out + " "
+        out = out + capitalize(words[i])
+        i = i + 1
+    out
+
+// ── substring counting & replacement ─────────────────────────────────────────
+
+// Count NON-OVERLAPPING occurrences of sub in s. sub must be non-empty.
+// After each match, the scan resumes at match_index + len(sub), so overlapping
+// matches are not double-counted: count_substr("aaaa","aa") == 2 (not 3).
+fn count_substr(s, sub) -> int
+    let sublen = len(sub)
+    if sublen == 0
+        return 0                 // defensive: undefined per contract, return 0
+    let count = 0
+    let pos = 0
+    let n = len(s)
+    while pos <= n - sublen
+        let rest = slice(s, pos, n)
+        let idx = find(rest, sub)
+        if idx < 0
+            return count         // no more matches
+        count = count + 1
+        pos = pos + idx + sublen // skip past this match (non-overlapping)
+    count
+
+// Replace every NON-OVERLAPPING occurrence of `from` with `to`, left to right.
+// `from` must be non-empty. Built with find+slice: locate the next match in the
+// remaining tail, copy the gap before it, append `to`, advance past the match.
+fn replace_all(s, from, to)
+    let fromlen = len(from)
+    if fromlen == 0
+        return s                 // defensive: nothing to find, leave unchanged
+    let out = ""
+    let pos = 0
+    let n = len(s)
+    while pos <= n - fromlen
+        let rest = slice(s, pos, n)
+        let idx = find(rest, from)
+        if idx < 0
+            // no further match: append the rest and stop
+            out = out + slice(s, pos, n)
+            return out
+        // copy the unmatched gap [pos, pos+idx), then the replacement
+        out = out + slice(s, pos, pos + idx)
+        out = out + to
+        pos = pos + idx + fromlen
+    // append any trailing bytes after the last possible match position
+    out = out + slice(s, pos, n)
+    out
+
+// ── edit distance ────────────────────────────────────────────────────────────
+
+// Levenshtein edit distance between a and b: the minimum number of single-byte
+// insertions, deletions, or substitutions to turn a into b.
+//
+// Classic DP over the (m+1) x (n+1) cost matrix, kept as TWO rolling rows.
+// Each new row is BUILT FRESH by rebuild (list + [val]) rather than mutated in
+// place — NOVA lists have no verified in-place element assignment, and rebuild
+// is the contract here. `prev` holds row i-1, `curr` is constructed for row i.
+fn levenshtein(a, b) -> int
+    let m = len(a)
+    let n = len(b)
+    // trivial boundaries: one string empty -> length of the other
+    if m == 0
+        return n
+    if n == 0
+        return m
+
+    // prev = row 0: distance from "" to b[0..j] is j (j insertions).
+    let prev = []
+    let j = 0
+    while j <= n
+        prev = prev + [j]
+        j = j + 1
+
+    let i = 1
+    while i <= m
+        // curr starts with column 0: distance from a[0..i] to "" is i deletions.
+        let curr = [i]
+        // byte of a at position i-1 (DP is 1-indexed over the strings)
+        let ca = ord(a[i - 1])
+        let k = 1
+        while k <= n
+            let cb = ord(b[k - 1])
+            // cost of a substitution at this cell: 0 if bytes match, else 1
+            let sub_cost = 1
+            if ca == cb
+                sub_cost = 0
+            // three candidate costs:
+            let del_cost = prev[k] + 1          // delete a[i-1]
+            let ins_cost = curr[k - 1] + 1      // insert b[k-1]
+            let rep_cost = prev[k - 1] + sub_cost  // substitute / match
+            let best = del_cost
+            if ins_cost < best
+                best = ins_cost
+            if rep_cost < best
+                best = rep_cost
+            curr = curr + [best]                // rebuild, never in-place
+            k = k + 1
+        prev = curr                              // roll: this row becomes prev
+        i = i + 1
+    // answer is the last cell of the final row
+    prev[n]
+
+// ── single-char counting ─────────────────────────────────────────────────────
+
+// Count occurrences of the single byte `ch` (a 1-byte string) in s. If ch is
+// not exactly one byte, return 0 (only single-byte counting is defined).
+fn str_count_char(s, ch) -> int
+    if len(ch) != 1
+        return 0
+    let target = ord(ch)
+    let count = 0
+    let i = 0
+    let n = len(s)
+    while i < n
+        if ord(s[i]) == target
+            count = count + 1
+        i = i + 1
+    count
+
+// ============================================================================
+fn main()
+    // ── _to_lower_byte / _to_upper_byte internals ──
+    assert_eq(_to_lower_byte(65), 97)     // 'A' -> 'a'
+    assert_eq(_to_lower_byte(97), 97)     // 'a' unchanged
+    assert_eq(_to_lower_byte(48), 48)     // '0' unchanged
+    assert_eq(_to_upper_byte(97), 65)     // 'a' -> 'A'
+    assert_eq(_to_upper_byte(65), 65)     // 'A' unchanged
+    assert_eq(_to_upper_byte(57), 57)     // '9' unchanged
+
+    // ── str_upper_ascii ──
+    assert_eq(str_upper_ascii("hello"), "HELLO")
+    assert_eq(str_upper_ascii("Hello, World!"), "HELLO, WORLD!")
+    assert_eq(str_upper_ascii("abc123XYZ"), "ABC123XYZ")   // digits pass through
+    assert_eq(str_upper_ascii(""), "")                      // empty
+    assert_eq(str_upper_ascii("ABC"), "ABC")                // already upper
+    assert_eq(str_upper_ascii("a.b.c"), "A.B.C")            // punctuation kept
+
+    // ── str_lower_ascii ──
+    assert_eq(str_lower_ascii("HELLO"), "hello")
+    assert_eq(str_lower_ascii("Hello, World!"), "hello, world!")
+    assert_eq(str_lower_ascii("ABC123xyz"), "abc123xyz")
+    assert_eq(str_lower_ascii(""), "")
+    assert_eq(str_lower_ascii("abc"), "abc")
+    assert_eq(str_lower_ascii("A-B-C"), "a-b-c")
+
+    // ── capitalize ── (spec example)
+    assert_eq(capitalize("heLLO"), "Hello")
+    assert_eq(capitalize("hello"), "Hello")
+    assert_eq(capitalize("HELLO"), "Hello")
+    assert_eq(capitalize("h"), "H")            // single letter
+    assert_eq(capitalize("H"), "H")
+    assert_eq(capitalize(""), "")              // empty
+    assert_eq(capitalize("123abc"), "123abc")  // first byte not a letter -> unchanged
+    assert_eq(capitalize("worLD"), "World")
+
+    // ── title_case ── (spec example)
+    assert_eq(title_case("hello world"), "Hello World")
+    assert_eq(title_case("the quick brown FOX"), "The Quick Brown Fox")
+    assert_eq(title_case("nova"), "Nova")          // single word
+    assert_eq(title_case(""), "")                  // empty -> "" (split("") -> one empty word)
+    assert_eq(title_case("a b c"), "A B C")
+
+    // ── count_substr ── (spec example)
+    assert_eq(count_substr("aaaa", "aa"), 2)       // non-overlapping
+    assert_eq(count_substr("aaa", "aa"), 1)        // only one non-overlapping
+    assert_eq(count_substr("abababab", "ab"), 4)
+    assert_eq(count_substr("hello", "l"), 2)
+    assert_eq(count_substr("hello", "z"), 0)       // absent
+    assert_eq(count_substr("", "a"), 0)            // empty haystack
+    assert_eq(count_substr("a.b.c", "."), 2)
+    assert_eq(count_substr("mississippi", "ss"), 2)
+    assert_eq(count_substr("aaaaaa", "aa"), 3)
+
+    // ── replace_all ── (spec example)
+    assert_eq(replace_all("a.b.c", ".", "-"), "a-b-c")
+    assert_eq(replace_all("hello", "l", "L"), "heLLo")
+    assert_eq(replace_all("aaa", "a", "bb"), "bbbbbb")   // expanding replacement
+    assert_eq(replace_all("abcabc", "abc", "x"), "xx")   // shrinking replacement
+    assert_eq(replace_all("hello", "z", "Z"), "hello")   // no match -> unchanged
+    assert_eq(replace_all("", "a", "b"), "")             // empty source
+    assert_eq(replace_all("aaaa", "aa", "b"), "bb")      // non-overlapping
+    assert_eq(replace_all("a,b,c,d", ",", ";"), "a;b;c;d")
+    assert_eq(replace_all("xxx", "x", ""), "")           // delete via empty `to`
+    assert_eq(replace_all("foofoo", "foo", "bar"), "barbar")
+
+    // ── levenshtein ── (spec examples)
+    assert_eq(levenshtein("kitten", "sitting"), 3)
+    assert_eq(levenshtein("", "abc"), 3)
+    assert_eq(levenshtein("x", "x"), 0)
+    // ── levenshtein boundaries & symmetry ──
+    assert_eq(levenshtein("", ""), 0)
+    assert_eq(levenshtein("abc", ""), 3)
+    assert_eq(levenshtein("abc", "abc"), 0)
+    assert_eq(levenshtein("abc", "abd"), 1)        // one substitution
+    assert_eq(levenshtein("abc", "ac"), 1)         // one deletion
+    assert_eq(levenshtein("ac", "abc"), 1)         // one insertion
+    assert_eq(levenshtein("flaw", "lawn"), 2)
+    assert_eq(levenshtein("sitting", "kitten"), 3) // symmetric to the spec case
+    assert_eq(levenshtein("abc", "xyz"), 3)        // all substituted
+    assert_eq(levenshtein("a", ""), 1)
+    assert_eq(levenshtein("gumbo", "gambol"), 2)
+
+    // ── str_count_char ──
+    assert_eq(str_count_char("hello", "l"), 2)
+    assert_eq(str_count_char("hello", "h"), 1)
+    assert_eq(str_count_char("hello", "z"), 0)
+    assert_eq(str_count_char("", "a"), 0)          // empty string
+    assert_eq(str_count_char("aaaa", "a"), 4)
+    assert_eq(str_count_char("a.b.c", "."), 2)
+    assert_eq(str_count_char("hello", "ll"), 0)    // not a single byte -> 0
+    assert_eq(str_count_char("mississippi", "s"), 4)
+
+    print("strx_test passed")
