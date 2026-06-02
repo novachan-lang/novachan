@@ -8,7 +8,22 @@ Tier order = implementation priority. Batch log of what has LANDED is in memory
 (project_complete_all_remaining.md). Execute one gated batch at a time; do not ask, self-prioritize
 toward what makes NOVA special/powerful (feedback_autonomous_high_impact.md).
 
-**Total verified-remaining: 96**
+## ⚠ ALREADY SHIPPED SINCE THIS AUDIT — DO NOT REDO (confirm via `git log`)
+This audit was a point-in-time snapshot; the following have since LANDED (committed, reconverged,
+regression-green). Any matching rows below are STALE — skip them:
+- **Reflection fully automatic, `@derive` removed**: `print`/`str`/`==`/`hash`/`json_stringify` derive from
+  struct structure with zero annotation; `copy()` = universal clone. (Covers "Universal Object",
+  "derive-able (de)serialization", "structural eq/hash" rows.)
+- **`put_in`/`update_in`** (deep nested-access write side).
+- **Network byte-order** `htons`/`htonl`/`ntohs`/`ntohl`; **`dns_resolve_all`** + **`reverse_dns`**
+  (the DNS/byte-order "important" row is now largely closed).
+- **`algx`** functional algorithms (take_while/drop_while/partition/find_index/count_by/zip_with/flat_map/
+  scan/group_by/intersperse) — strengthens the generic-algorithm-library row.
+- **List comprehensions** `[expr for x in iter if cond]` over lists AND ranges (`range(n)` now typed `list<int>`).
+- **Codegen crash fixed**: index-set `x[i]=v` on a slot reassigned across container kinds.
+Always re-verify a row against the real code before building (the per-item "evidence" below is as-of-audit).
+
+**Total verified-remaining: 96** (minus the shipped items above)
 
 ## table-stakes (8)
 
