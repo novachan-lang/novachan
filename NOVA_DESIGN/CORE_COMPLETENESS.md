@@ -126,6 +126,21 @@ tests) + the regex `|` rewrite:**
   (verified: `q_propagate_test` parses + propagates errors through `?`). Only the fn-return E-constraint
   (requiring a `?`-using fn to declare `Result<_,E>`) is left — a smaller soundness nicety; codegen already
   early-returns the error correctly.*
+- ✅ **Reflection Phase 1 — `@derive(Show)`** (the keystone's first capability; cat-21 Reflection 0%→10%,
+  cat-4 derive-injection): a struct annotated `@derive(Show)` gets a **compiler-synthesized `show` method**
+  (`p.show()` → `"Type { f: v, … }"`). Implemented as a post-parse pass (`expand_derives` in
+  `nova_compiler.nova`) that synthesizes the method as ordinary AST fed through normal lowering — reuses
+  field access + `str()` + method dispatch + concat, **no hand-built IR**. Scalar fields render via
+  `str(self.f)` (sound per static field type — float prints correctly), nested `@derive(Show)` struct
+  fields render recursively via `self.f.show()`. `derive_show_test` verifies int+float (`2.5`/`0.0`/`1.0`),
+  nested `Seg{a:Point,b:Point,name}`, exact output. Bootstrap-reconverged; `expand_derives` is a **no-op when
+  no `@derive` present** (zero impact on the 169 existing tests + the self-host). This is the substrate for
+  Phase 2 (`Eq`/`Hash`/`Clone`) and Phase 3 (`Serialize` — the DB/HTTP keystone). *Honest dead-strip status:
+  NOVA currently emits ALL functions as external `define i64 @…` (verified, codegen line 4271), so no
+  uncalled function — generated or user-written — is stripped today. The generated `__show` is therefore
+  emitted unconditionally, like any function. True dead-strip (the design's headline) is a **compiler-wide**
+  optimization (emit program-internal functions as `internal` linkage so `globaldce`/`-O2` removes uncalled
+  ones) — a legitimately separate piece of work, NOT a derive-specific defect. Tracked as Phase-1.1.*
 - ✅ **Result-returning safe number parsing** (NEW, cat-17 MISSING→HAVE) — `parse_int_safe(s) ->
   Result<int,string>` and `parse_float_safe(s) -> Result<float,string>` (typed via `nt_sum`, showcasing
   typed Result). `ok(n)` iff the whole string (modulo whitespace) parses, else `err(reason)` — the total,
@@ -465,9 +480,9 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 | NOVA status | Count | % |
 |---|---|---|
 | ✅ HAVE | 87 | 46% |
-| 🟡 PARTIAL | 52 | 28% |
-| ❌ MISSING | 50 | 26% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **113 / 189** | **60%** |
+| 🟡 PARTIAL | 54 | 29% |
+| ❌ MISSING | 48 | 25% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **114 / 189** | **60%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -488,7 +503,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 1 | Types, literals & syntax | 16 | 8 | 5 | 3 | **66%** | = |
 | 2 | Functions & closures | 11 | 6 | 2 | 3 | **64%** | ↓ named-params not real |
 | 3 | OOP / polymorphism / interfaces | 9 | 4 | 4 | 1 | **67%** | = |
-| 4 | Generics & metaprogramming | 13 | 3 | 2 | 8 | **31%** | ↓ src-loc/cfg not real |
+| 4 | Generics & metaprogramming | 13 | 3 | 3 | 7 | **35%** | ↑ @derive code-injection (Phase 1); src-loc/cfg not real |
 | 5 | Memory & resource management | 11 | 4 | 6 | 1 | **64%** | ↑ |
 | 6 | Concurrency & parallelism | 15 | 6 | 4 | 5 | **53%** | ⇈ was 10% (stale); +bounded channels (deep-tier impl) |
 | 7 | Error handling | 9 | 5 | 3 | 1 | **72%** | ⇈ **typed Result/Option now statically checked** |
@@ -505,7 +520,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 18 | Serialization | 6 | 2 | 1 | 3 | **42%** | ↑ key=value config parsing added (Batch G) |
 | 19 | Testing | 5 | 3 | 0 | 2 | **60%** | ↑ property-based testing added (Batch M `proptest`) |
 | 20 | FFI / native interop | 7 | 3 | 1 | 3 | **50%** | = |
-| 21 | Reflection / runtime | 5 | 0 | 0 | 5 | **0%** | = (the only true 0%) |
+| 21 | Reflection / runtime | 5 | 0 | 1 | 4 | **10%** | ↑ @derive(Show) — annotation-driven codegen (no longer 0%) |
 | 22 | Tooling | 12 | 10 | 2 | 0 | **92%** | ↑ REPL is real |
 
 **Reading the scorecard (corrected by the 2026-06-02 audit):** NOVA's *sequential single-process*
@@ -523,7 +538,8 @@ no spawn that runs" claim was auditing a stale snapshot. Likewise **Async I/O is
 composition + event-loop/select are real) and **Time/Date is 50% not 0%** (`datetime.nova`: 14 builtins,
 formatting/parsing, calendar helpers, `track7_datetime_test` passes).
 
-What remains genuinely weak, and is honest: **Reflection/runtime (0% — the only true zero)**;
+What remains genuinely weak, and is honest: **Reflection/runtime (10% — `@derive(Show)` is the first
+capability; was 0%)**;
 **Regex & *parsing* (10%)** — the regex *engine* is solid (classes/quantifiers/`{n}`/anchors/groups,
 tested) but `|` alternation, a user-facing tokenizer, `Result`-returning number parsing, and
 parser-combinators are missing; **Generics & metaprogramming (31%)** — no macros/comptime/reflection

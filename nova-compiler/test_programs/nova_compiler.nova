@@ -1906,6 +1906,72 @@ fn parse_import_stmt(tokens: list, pos: int) -> StmtParseResult
         p = p + 1
     StmtParseResult(Stmt("import", module_name, null_expr(), [], [], [], [alias], ln), p)
 
+// ── Reflection Phase 1: @derive(Show) ────────────────────────────────────────
+// A struct annotated `@derive(Show)` gets a compiler-synthesized `show` method that
+// renders it as "TypeName { field: value, ... }". The method is built as ordinary
+// AST and fed through the normal pipeline (type inference + lowering), so it reuses
+// field access, str(), method dispatch, and concat — no bespoke IR. It is a regular
+// method (`p.show()`), dispatched by NOVA's existing receiver-type resolution, and
+// is dead-strippable: emitted/kept only if `.show()` is actually called. Scalar
+// fields render via str(self.f); fields whose type is itself a @derive(Show) struct
+// render recursively via self.f.show().
+fn _derive_has_show(anns: list) -> int
+    for a in anns
+        match a
+            Expr(atag, aname, anum, achildren, afields, aln) =>
+                if atag == "ann_with_arg" and aname == "derive" and len(achildren) > 0
+                    match achildren[0]
+                        Expr(ctag, cval, cnum, cch, cfl, cln) =>
+                            if cval == "Show"
+                                return 1
+    return 0
+
+fn _make_show_method(tname: string, fields: list, derived: dict, ln: int) -> Stmt
+    let acc = Expr("str", tname + " \{", 0, [], [], ln)
+    let i = 0
+    let n = len(fields)
+    while i < n
+        match fields[i]
+            Param(fname, ftype, fdef) =>
+                let sep = ", "
+                if i == 0
+                    sep = " "
+                acc = Expr("binop", "+", 0, [acc, Expr("str", sep + fname + ": ", 0, [], [], ln)], [], ln)
+                let memb = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
+                let rendered = Expr("call", "str", 0, [memb], [], ln)
+                if contains(derived, ftype)
+                    rendered = Expr("method_call", "show", 0, [memb], [], ln)
+                acc = Expr("binop", "+", 0, [acc, rendered], [], ln)
+        i = i + 1
+    let closing = " \}"
+    if n == 0
+        closing = "\}"
+    acc = Expr("binop", "+", 0, [acc, Expr("str", closing, 0, [], [], ln)], [], ln)
+    let ret_stmt = Stmt("return", "", acc, [], [], [], [], ln)
+    Stmt("fn", tname + "__show", null_expr(), [ret_stmt], [Param("self", "", null_expr())], [], [], ln)
+
+fn expand_derives(stmts: list) -> list
+    let derived = {}
+    for s in stmts
+        match s
+            Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns, sln) =>
+                if stag == "type" and _derive_has_show(sanns) == 1
+                    derived[sname] = 1
+    let generated = []
+    for s in stmts
+        match s
+            Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns, sln) =>
+                if stag == "type" and _derive_has_show(sanns) == 1
+                    push(generated, _make_show_method(sname, sparams, derived, sln))
+    if len(generated) == 0
+        return stmts
+    let out = []
+    for s in stmts
+        push(out, s)
+    for g in generated
+        push(out, g)
+    out
+
 fn parse_program(tokens: list, pe: list) -> list
     let stmts = []
     let pos = skip_nl(tokens, 0)
@@ -1922,7 +1988,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    stmts
+    expand_derives(stmts)
 
 // ── LLVM IR Code Generator ───────────────────────────────────────────────────
 
