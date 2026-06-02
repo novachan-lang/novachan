@@ -1641,6 +1641,38 @@ fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let p = pos + 1
     let name = tv(tokens, p)
     p = p + 1
+    // Transparent type alias:  type Name = TargetType
+    // (e.g. `type Json = dict<string, any>`). The target's full parametric
+    // form is captured into a string, mirroring the param/return-type capture
+    // in parse_fn_decl, and resolved to its underlying NType during inference
+    // (ti_ann_to_type_g) — zero runtime cost, the name is purely a synonym.
+    if tk(tokens, p) == "ASSIGN"
+        p = p + 1
+        let target = tv(tokens, p)
+        p = p + 1
+        if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
+            target = target + "<"
+            let adepth = 1
+            p = p + 1
+            while adepth > 0 and tk(tokens, p) != "EOF" and tk(tokens, p) != "NEWLINE"
+                let atkk = tk(tokens, p)
+                let atvv = tv(tokens, p)
+                if atkk == "OP" and atvv == "<"
+                    adepth = adepth + 1
+                    target = target + "<"
+                else if atkk == "OP" and atvv == ">"
+                    adepth = adepth - 1
+                    target = target + ">"
+                else if atkk == "OP" and atvv == ">>"
+                    adepth = adepth - 2
+                    target = target + ">>"
+                else if atkk == "DELIM" and atvv == ","
+                    target = target + ","
+                else if atkk == "IDENT"
+                    target = target + atvv
+                p = p + 1
+        let alias_expr = Expr("aliastype", target, 0, [], [], ln)
+        return StmtParseResult(Stmt("type_alias", name, alias_expr, [], [], [], [], ln), skip_nl(tokens, p))
     let type_generics = []
     if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
         p = p + 1
@@ -6559,6 +6591,7 @@ type TiState
     ti_unsafe_depth: int
     ti_opaque_types: dict
     ti_trait_defaults: dict
+    ti_aliases: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -6620,7 +6653,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -7685,36 +7718,45 @@ fn ti_split_type_args(args: string) -> list
         push(parts, trim(slice(args, start, len(args))))
     parts
 
-fn ti_ann_to_type_g(ann: string, gmap: dict) -> NType
+fn ti_ann_to_type_g(st: TiState, ann: string, gmap: dict) -> NType
     if contains(gmap, ann)
         return gmap[ann]
-    let lt = find(ann, "<")
+    // Resolve transparent type aliases (type Name = Target) before any
+    // structural interpretation, so `Json` becomes `dict<string,any>` etc.
+    // The bounded loop terminates a cyclic alias chain instead of looping
+    // forever; a stuck name falls through to nt_struct and fails to unify.
+    let resolved = ann
+    let aguard = 0
+    while contains(st.ti_aliases, resolved) and aguard < 64
+        resolved = st.ti_aliases[resolved]
+        aguard = aguard + 1
+    let lt = find(resolved, "<")
     if lt < 0
-        return ti_ann_to_type(ann)
-    if not ends_with(ann, ">")
-        return ti_ann_to_type(ann)
-    let base = slice(ann, 0, lt)
-    let args_str = slice(ann, lt + 1, len(ann) - 1)
+        return ti_ann_to_type(resolved)
+    if not ends_with(resolved, ">")
+        return ti_ann_to_type(resolved)
+    let base = slice(resolved, 0, lt)
+    let args_str = slice(resolved, lt + 1, len(resolved) - 1)
     let args = ti_split_type_args(args_str)
     if base == "List" or base == "list"
         if len(args) >= 1
-            return nt_list(ti_ann_to_type_g(args[0], gmap))
+            return nt_list(ti_ann_to_type_g(st, args[0], gmap))
         return nt_list(nt_any())
     if base == "Map" or base == "dict" or base == "Dict"
         if len(args) >= 2
-            return nt_dict(ti_ann_to_type_g(args[0], gmap), ti_ann_to_type_g(args[1], gmap))
+            return nt_dict(ti_ann_to_type_g(st, args[0], gmap), ti_ann_to_type_g(st, args[1], gmap))
         return nt_dict(nt_string(), nt_any())
     if base == "Option"
         if len(args) >= 1
-            return ti_ann_to_type_g(args[0], gmap)
+            return ti_ann_to_type_g(st, args[0], gmap)
         return nt_any()
     if base == "Result"
         if len(args) >= 1
-            return ti_ann_to_type_g(args[0], gmap)
+            return ti_ann_to_type_g(st, args[0], gmap)
         return nt_any()
     if base == "Channel" or base == "channel"
         if len(args) >= 1
-            return nt_channel(ti_ann_to_type_g(args[0], gmap))
+            return nt_channel(ti_ann_to_type_g(st, args[0], gmap))
         return nt_channel(nt_any())
     ti_ann_to_type(base)
 
@@ -8054,13 +8096,13 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                         Param(pname, ptype, pdefault) =>
                             let pt = ti_fresh(st)
                             if ptype != "" and ptype != "any"
-                                pt = ti_ann_to_type_g(ptype, gmap)
+                                pt = ti_ann_to_type_g(st, ptype, gmap)
                             push(param_types, pt)
                 let ret_var = ti_fresh(st)
                 match expr
                     Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
                         if rxt == "rettype" and rxv != "" and rxv != "any"
-                            let ann_t = ti_ann_to_type_g(rxv, gmap)
+                            let ann_t = ti_ann_to_type_g(st, rxv, gmap)
                             match ann_t
                                 NType(ak, an2, ap, ai) =>
                                     if ak != "any"
@@ -8123,6 +8165,9 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 return nt_unit()
             if tag == "extern_fn"
                 return nt_unit()
+            if tag == "type_alias"
+                // Aliases are registered in the pre-scan; nothing to infer here.
+                return nt_unit()
             if tag == "type"
                 let tgnames = ti_extract_generics(annotations)
                 let tgmap = {}
@@ -8132,13 +8177,13 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 for p in params
                     match p
                         Param(pname, ptype, pdefault) =>
-                            field_map[pname] = ti_ann_to_type_g(ptype, tgmap)
+                            field_map[pname] = ti_ann_to_type_g(st, ptype, tgmap)
                 st.ti_structs[name] = field_map
                 let field_types = []
                 for p in params
                     match p
                         Param(pname, ptype, pdefault) =>
-                            push(field_types, ti_ann_to_type_g(ptype, tgmap))
+                            push(field_types, ti_ann_to_type_g(st, ptype, tgmap))
                 let ctor_type = nt_fn(field_types, nt_struct(name))
                 ti_solve(st)
                 let resolved_ctor = ti_zonk(st, ctor_type)
@@ -8162,13 +8207,13 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                 for vp in vparams
                                     match vp
                                         Param(vpname, vptype, vpdefault) =>
-                                            vfield_map[vpname] = ti_ann_to_type(vptype)
+                                            vfield_map[vpname] = ti_ann_to_type_g(st, vptype, {})
                                 st.ti_structs[vname] = vfield_map
                                 let vfield_types = []
                                 for vp in vparams
                                     match vp
                                         Param(vpname, vptype, vpdefault) =>
-                                            push(vfield_types, ti_ann_to_type(vptype))
+                                            push(vfield_types, ti_ann_to_type_g(st, vptype, {}))
                                 let vctor_type = nt_fn(vfield_types, nt_struct(vname))
                                 ti_define(st, vname, ti_mono(vctor_type))
                 return nt_unit()
@@ -8665,6 +8710,17 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
     let st = ti_new_named(source_lines, filename)
     let seen_fns = {}
     let base_dir = path_dir(filename)
+    // Pre-scan transparent type aliases first, so any declaration (extern_fn,
+    // fn signature, struct field) can resolve an alias regardless of where it
+    // appears in source order. Aliases are compile-time-only synonyms.
+    for alias_s in stmts
+        match alias_s
+            Stmt(a_tag, a_name, a_expr, a_body, a_params, a_else, a_anns, a_sln) =>
+                if a_tag == "type_alias"
+                    match a_expr
+                        Expr(ae_t, ae_v, ae_n, ae_c, ae_f, ae_l) =>
+                            if ae_t == "aliastype"
+                                st.ti_aliases[a_name] = ae_v
     let si = 0
     while si < len(stmts)
         match stmts[si]
@@ -8725,7 +8781,7 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                     if contains(st.ti_opaque_types, pt_eff)
                                         push(ext_param_types, nt_int())
                                     else
-                                        push(ext_param_types, ti_ann_to_type(pt_eff))
+                                        push(ext_param_types, ti_ann_to_type_g(st, pt_eff, {}))
                                 else
                                     push(ext_param_types, nt_any())
                     let ext_ret_t = nt_any()
@@ -8735,7 +8791,7 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                 if contains(st.ti_opaque_types, erv)
                                     ext_ret_t = nt_int()
                                 else
-                                    ext_ret_t = ti_ann_to_type(erv)
+                                    ext_ret_t = ti_ann_to_type_g(st, erv, {})
                     ti_define(st, name, ti_mono(nt_fn(ext_param_types, ext_ret_t)))
                     st.ti_extern_fns[name] = 1
                 if tag == "enum"
@@ -11065,7 +11121,7 @@ fn compile(source: string) -> string
                             Param(pname, ptype, pdefault) =>
                                 cg.field_map[pname] = fi
                         fi = fi + 1
-                else if tag != "import" and tag != "trait"
+                else if tag != "import" and tag != "trait" and tag != "type_alias"
                     push(top_stmts, s)
 
     // Pass 1: Generate all string constants (by doing a dry-run or pre-scan)
@@ -11239,7 +11295,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                                 b.ir_fmap[vpname] = vfi
                                                 b.ir_field_types[vname + "." + vpname] = vptype
                                         vfi = vfi + 1
-                else if tag != "import" and tag != "trait"
+                else if tag != "import" and tag != "trait" and tag != "type_alias"
                     push(top_stmts, s)
 
     // Inject default trait methods for implementing types

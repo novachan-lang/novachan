@@ -21,6 +21,12 @@ regression-green). Any matching rows below are STALE — skip them:
   scan/group_by/intersperse) — strengthens the generic-algorithm-library row.
 - **List comprehensions** `[expr for x in iter if cond]` over lists AND ranges (`range(n)` now typed `list<int>`).
 - **Codegen crash fixed**: index-set `x[i]=v` on a slot reassigned across container kinds.
+- **Transparent type aliases** `type Name = TargetType` (e.g. `type Json = dict<string,any>`,
+  `type Grid = list<list<int>>`): zero-cost compile-time synonyms resolved in `ti_ann_to_type_g`
+  (pre-scanned so forward refs work; bounded cyclic-alias guard; works in fn params/returns, struct
+  fields, enum-variant fields, extern signatures). The DISTINCT/newtype half (`type UserId = distinct int`,
+  UserId != int) is still remaining — deferred deliberately because sound newtype codegen needs the
+  underlying-repr threaded through IR ops (==, print, arithmetic) which today is type-erased.
 Always re-verify a row against the real code before building (the per-item "evidence" below is as-of-audit).
 
 **Total verified-remaining: 96** (minus the shipped items above)
@@ -58,8 +64,8 @@ Always re-verify a row against the real code before building (the per-item "evid
 - **evidence (as of audit):** Runtime assertions are fully real: assert/assert_eq/assert_ne/assert_true/assert_false/assert_near/assert_contains/assert_approx/assert_throws all wired across all 4 builtin sites â€” name->fn map (nova_compiler.nova:2599-3357), type registry reg["assert"]=nt_fn([bool,string],unit) etc. (7058,7278-7367), and both LLVM declare emitters (3702/3980-4082 and 11285/11603-11686); runtime nova_rt_assert (nova_runtime.c). Test math assert(1+1==2) baked into the self-test (nova_compiler.nova:12481).
 
 ### Type aliases AND distinct/newtypes (UserId != Int)  *(1. Types, literals & syntax)*
-- **status:** MISSING | **effort:** medium
-- **gap:** No transparent type alias (`type Id = Int`) and no distinct/newtype that makes `UserId` non-interchangeable with `Int`.
+- **status:** PARTIAL | **effort:** medium — **transparent alias DONE (this push)**; distinct/newtype still MISSING.
+- **gap:** ~~No transparent type alias (`type Id = Int`)~~ DONE. Still missing: a distinct/newtype that makes `UserId` non-interchangeable with `Int`. The transparent half shipped (`type Name = Target`, resolved in `ti_ann_to_type_g` with a pre-scan + cyclic guard; test_programs/type_alias_test.nova). The distinct half needs newtype-repr threaded through IR operator lowering (==, print, arithmetic) so a newtype-over-int behaves as int at runtime while staying distinct in inference — non-trivial because codegen is type-erased; do it as a dedicated soundness-verified batch, not a rush.
 - **NOVA approach:** Extend parse_type_decl to recognize `type Name = Expr`: a bare RHS type registers a transparent alias (resolved in ti_ann_to_type_g, line 7632, by substituting the alias name before unification â€” zero runtime cost), while `type Name = distinct Expr` mints a fresh nominal NType whose `unify` only matches itself, so the inferrer's existing occurs/unify machinery catches `UserId`-vs-`Int` mixing automatically with no new runtime representation.
 - **evidence (as of audit):** parse_type_decl (nova_compiler.nova:1607-1670) handles only `type Name [<generics>] [: traits]` followed by indented `field: Type` lines â€” it produces Stmt("type",...) for structs/enum variants (variant path line 1789). There is NO `=` alias form (the post-name code jumps straight to generics/traits/fields, never consuming `=`). Grep `type alias|typealias|newtype|distinct type` found only module-import aliasing (`import X as Y`, line 1908-1913) and unrelated LLVM `distinct !DISubprogram` debug metadata â€” no nominal type alias or distinct/newtype mechanism.
 
