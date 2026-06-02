@@ -102,10 +102,6 @@ $domain_tests = @(
     'result_test',
     'parse_safe_test',
     'q_propagate_test',
-    'derive_show_test',
-    'derive_eq_test',
-    'derive_clone_hash_test',
-    'derive_serialize_test',
     'auto_show_test',
     'auto_json_test',
     'auto_eq_test'

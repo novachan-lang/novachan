@@ -1207,6 +1207,12 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         // Both string and bare-ident args are accepted for ergonomic forms
         // like @repr(C) (no quotes) and @link("m") (string).
         let ann_name = tv(tokens, pos + 1)
+        if ann_name == "derive"
+            // NOVA has no @derive. Show and serialization are automatic for every struct
+            // (str/print and json_stringify just work), equality (==) and hash are universal
+            // structural operations, and clone is copy(). Borrowed annotations are not a NOVA
+            // feature — guide the developer to the automatic way instead of silently ignoring.
+            syntax_error(tokens, pos, "@derive is not a NOVA feature -- show/serialize are automatic (str, print, json_stringify work on any struct), == and hash are universal structural operations, and clone is copy(). Remove the @derive annotation.", pe)
         let ann_arg = ""
         let p = pos + 2
         if tk(tokens, p) == "DELIM" and tv(tokens, p) == "("
@@ -1906,15 +1912,14 @@ fn parse_import_stmt(tokens: list, pos: int) -> StmtParseResult
         p = p + 1
     StmtParseResult(Stmt("import", module_name, null_expr(), [], [], [], [alias], ln), p)
 
-// ── Reflection Phase 1: @derive(Show) ────────────────────────────────────────
-// A struct annotated `@derive(Show)` gets a compiler-synthesized `show` method that
-// renders it as "TypeName { field: value, ... }". The method is built as ordinary
-// AST and fed through the normal pipeline (type inference + lowering), so it reuses
-// field access, str(), method dispatch, and concat — no bespoke IR. It is a regular
-// method (`p.show()`), dispatched by NOVA's existing receiver-type resolution, and
-// is dead-strippable: emitted/kept only if `.show()` is actually called. Scalar
-// fields render via str(self.f); fields whose type is itself a @derive(Show) struct
-// render recursively via self.f.show().
+// ── Automatic structural rendering (Structural Value Identity, D1) ────────────
+// EVERY record struct gets a compiler-synthesized <Type>__show that renders it as
+// "TypeName { field: value, ... }" — zero annotation (NOVA has no @derive). It is built
+// as ordinary AST and fed through the normal pipeline (type inference + lowering), so it
+// reuses field access, str(), and concat — no bespoke IR. str(p)/print(p) dispatch to it
+// at codegen (where the static struct type is known), and it is dead-strippable: kept only
+// if a struct is actually shown. Scalar fields render via str(self.f); struct fields render
+// recursively via self.f.show() (resolved statically to the field type's __show).
 fn _is_valid_struct_name(s: string) -> int
     // Guards automatic derivation against a parser artifact: a struct FIELD whose name is a
     // keyword (e.g. `type: IrType`) breaks the field loop, leaving a stray top-level type decl
@@ -1924,17 +1929,6 @@ fn _is_valid_struct_name(s: string) -> int
         return 0
     if is_alpha(s[0]) or s[0] == "_"
         return 1
-    return 0
-
-fn _derive_has(anns: list, dname: string) -> int
-    for a in anns
-        match a
-            Expr(atag, aname, anum, achildren, afields, aln) =>
-                if atag == "ann_with_arg" and aname == "derive" and len(achildren) > 0
-                    match achildren[0]
-                        Expr(ctag, cval, cnum, cch, cfl, cln) =>
-                            if cval == dname
-                                return 1
     return 0
 
 fn _make_show_method(tname: string, fields: list, derived: dict, ln: int) -> Stmt
@@ -1961,73 +1955,10 @@ fn _make_show_method(tname: string, fields: list, derived: dict, ln: int) -> Stm
     let ret_stmt = Stmt("return", "", acc, [], [], [], [], ln)
     Stmt("fn", tname + "__show", null_expr(), [ret_stmt], [Param("self", "", null_expr())], [], [], ln)
 
-// @derive(Eq): structural equality. self.f == other.f for scalars; nested
-// @derive(Eq) struct fields compared via self.f.eq(other.f). Empty struct -> true.
-fn _make_eq_method(tname: string, fields: list, eqset: dict, ln: int) -> Stmt
-    let acc = Expr("bool", "true", 1, [], [], ln)
-    let first = 1
-    let i = 0
-    let n = len(fields)
-    while i < n
-        match fields[i]
-            Param(fname, ftype, fdef) =>
-                let lhs = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
-                let rhs = Expr("member", fname, 0, [Expr("ident", "other", 0, [], [], ln)], [], ln)
-                let cmp = Expr("binop", "==", 0, [lhs, rhs], [], ln)
-                if contains(eqset, ftype)
-                    cmp = Expr("method_call", "eq", 0, [lhs, rhs], [], ln)
-                if first == 1
-                    acc = cmp
-                    first = 0
-                else
-                    acc = Expr("binop", "and", 0, [acc, cmp], [], ln)
-        i = i + 1
-    let ret_stmt = Stmt("return", "", acc, [], [], [], [], ln)
-    let params = [Param("self", "", null_expr()), Param("other", "", null_expr())]
-    Stmt("fn", tname + "__eq", null_expr(), [ret_stmt], params, [], [], ln)
-
-// @derive(Clone): return a fresh struct with each field copied; nested @derive(Clone)
-// struct fields are deep-cloned via .clone().
-fn _make_clone_method(tname: string, fields: list, cloneset: dict, ln: int) -> Stmt
-    let field_inits = []
-    let i = 0
-    let n = len(fields)
-    while i < n
-        match fields[i]
-            Param(fname, ftype, fdef) =>
-                let memb = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
-                let val = memb
-                if contains(cloneset, ftype)
-                    val = Expr("method_call", "clone", 0, [memb], [], ln)
-                push(field_inits, Expr("field_init", fname, 0, [val], [], ln))
-        i = i + 1
-    let body = Expr("struct_init", tname, 0, field_inits, [], ln)
-    let ret_stmt = Stmt("return", "", body, [], [], [], [], ln)
-    Stmt("fn", tname + "__clone", null_expr(), [ret_stmt], [Param("self", "", null_expr())], [], [], ln)
-
-// @derive(Hash): structural hash, fold h = h*31 + hash(field). Nested @derive(Hash)
-// struct fields contribute self.f.hash(). Deterministic; equal structs hash equal.
-fn _make_hash_method(tname: string, fields: list, hashset: dict, ln: int) -> Stmt
-    let acc = Expr("int", "17", 17, [], [], ln)
-    let i = 0
-    let n = len(fields)
-    while i < n
-        match fields[i]
-            Param(fname, ftype, fdef) =>
-                let memb = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
-                let fh = Expr("call", "hash", 0, [memb], [], ln)
-                if contains(hashset, ftype)
-                    fh = Expr("method_call", "hash", 0, [memb], [], ln)
-                let scaled = Expr("binop", "*", 0, [acc, Expr("int", "31", 31, [], [], ln)], [], ln)
-                acc = Expr("binop", "+", 0, [scaled, fh], [], ln)
-        i = i + 1
-    let ret_stmt = Stmt("return", "", acc, [], [], [], [], ln)
-    Stmt("fn", tname + "__hash", null_expr(), [ret_stmt], [Param("self", "", null_expr())], [], [], ln)
-
-// @derive(Serialize): to_json renders the struct as a JSON object. Field VALUES go
-// through json_stringify (handles int/float/string-escaping/list/dict); nested
-// @derive(Serialize) struct fields recurse via self.f.to_json(). Keys are built with
-// chr(34) (literal quote) so no string-escape ambiguity. The DB/HTTP serialize keystone.
+// Automatic to_json: renders the struct as a JSON object derived from its structure.
+// Field VALUES go through json_stringify (handles int/float/string-escaping/list/dict);
+// nested struct fields recurse via self.f.to_json(). Keys are built with chr(34) (literal
+// quote) so no string-escape ambiguity. The DB/HTTP serialize keystone — zero annotation.
 fn _make_to_json_method(tname: string, fields: list, jsonset: dict, ln: int) -> Stmt
     let acc = Expr("str", "\{", 0, [], [], ln)
     let i = 0
@@ -2050,48 +1981,28 @@ fn _make_to_json_method(tname: string, fields: list, jsonset: dict, ln: int) -> 
     Stmt("fn", tname + "__to_json", null_expr(), [ret_stmt], [Param("self", "", null_expr())], [], [], ln)
 
 fn expand_derives(stmts: list) -> list
+    // NOVA way (not Rust/Python): the genius compiler derives a value's textual form (show) and
+    // its JSON encoding (to_json) from its STRUCTURE (innovation D1) — zero annotation, for EVERY
+    // record struct. Equality (==), hash and clone(copy) are universal structural runtime
+    // operations, so they need no per-type generation at all. Every struct goes in showset/jsonset
+    // so nested struct fields render/serialize recursively via the same derived path. (Skip parser
+    // phantoms from keyword-named fields — see _is_valid_struct_name.)
     let showset = {}
-    let eqset = {}
-    let cloneset = {}
-    let hashset = {}
     let jsonset = {}
     for s in stmts
         match s
             Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns, sln) =>
                 if stag == "type"
-                    // NOVA way (not Rust/Python): the genius compiler derives a value's textual form
-                    // from its STRUCTURE (innovation D1) — zero annotation. EVERY record struct is
-                    // automatically showable; no @derive(Show) needed. Putting every struct in showset
-                    // also lets nested struct fields render recursively via the same derived path.
-                    // (Skip parser phantoms from keyword-named fields — see _is_valid_struct_name.)
                     if _is_valid_struct_name(sname) == 1
                         showset[sname] = 1
-                    if _derive_has(sanns, "Eq") == 1
-                        eqset[sname] = 1
-                    if _derive_has(sanns, "Clone") == 1
-                        cloneset[sname] = 1
-                    if _derive_has(sanns, "Hash") == 1
-                        hashset[sname] = 1
-                    // to_json is automatic too (the DB/HTTP keystone): every struct in jsonset, so
-                    // json_stringify(struct) and nested .to_json() resolve through the derived path.
-                    if _is_valid_struct_name(sname) == 1
                         jsonset[sname] = 1
     let generated = []
     for s in stmts
         match s
             Stmt(stag, sname, sexpr, sbody, sparams, selse, sanns, sln) =>
                 if stag == "type"
-                    // Automatic: generate <Type>__show for every record struct (zero annotation).
                     if _is_valid_struct_name(sname) == 1
                         push(generated, _make_show_method(sname, sparams, showset, sln))
-                    if _derive_has(sanns, "Eq") == 1
-                        push(generated, _make_eq_method(sname, sparams, eqset, sln))
-                    if _derive_has(sanns, "Clone") == 1
-                        push(generated, _make_clone_method(sname, sparams, cloneset, sln))
-                    if _derive_has(sanns, "Hash") == 1
-                        push(generated, _make_hash_method(sname, sparams, hashset, sln))
-                    // Automatic: generate <Type>__to_json for every record struct (zero annotation).
-                    if _is_valid_struct_name(sname) == 1
                         push(generated, _make_to_json_method(sname, sparams, jsonset, sln))
     if len(generated) == 0
         return stmts

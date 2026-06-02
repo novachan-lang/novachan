@@ -2,18 +2,31 @@
 
 **Status:** 2026-06-02. The keystone deep-tier item (gates Serde-derive → DB/HTTP, units, DI patterns).
 
-> ## ✅ STATUS (2026-06-02): AUTOMATIC **Show** LANDED — `@derive` retired for rendering
-> `str(p)`/`print(p)` on ANY record struct now auto-render `Type { f: v, ... }` with **zero annotation**,
-> nested structs included — no `@derive(Show)`, no `.show()`. RECONVERGED gen5==gen6 byte-identical;
-> installed as gen3_test.exe; **174/174 regression PASS** (the four `@derive` tests still pass — the
-> annotation survives as a harmless optional override). Implementation differs from the original plan below
-> in ONE key way: dispatch is resolved at **codegen** (`ir_expr_struct_type`), NOT post-inference — NOVA's
-> Hindley-Milner defers type constraints, so the static struct type isn't known at `ti_infer_expr` time but
-> IS at codegen (same place `.show()` already dispatched). Added a `member`/`field` case to
-> `ir_expr_struct_type` (nested fields), and an `_is_valid_struct_name` guard (a struct field named with a
-> keyword like `type:` spawns a parser-phantom `":"` type that must not be derived). Next: same pattern for
-> `to_json` (via `json_stringify(struct)` dispatch) and — carefully, it changes equality semantics — `==`.
-> See memory [[project-automatic-structural-show]].
+> ## ✅ DONE (2026-06-02): `@derive` REMOVED — all five capabilities are automatic / universal
+> The entire `@derive` annotation is **gone from NOVA** (it raises a helpful compile error pointing to the
+> automatic way). Every capability it used to provide is now zero-annotation:
+> - **Show** — `str(p)`/`print(p)` auto-render `Type { f: v, ... }`, nested included (commit 8915e6f).
+> - **Serialize** — `json_stringify(p)` auto-serializes to JSON, nested included (commit f0bcf2d).
+> - **Eq + Hash** — `a == b` is structural by value and `hash(p)` is structurally consistent with it, via
+>   the universal runtime `nova_rt_eq`/`nova_rt_hash` (commit b2cc7ad). No per-type code at all.
+> - **Clone** — `copy(p)` is already a universal runtime deep-clone. No annotation, no generation.
+>
+> Each landed as its own RECONVERGED (gen5==gen6 byte-identical) + full-regression-green increment, then the
+> `@derive` surface itself was removed (dead generators + `_derive_has` deleted, `expand_derives` reduced to
+> the two automatic generators, four `derive_*_test` files replaced by `auto_show_test`/`auto_json_test`/
+> `auto_eq_test`).
+>
+> **Two implementation facts worth keeping:** (1) dispatch for show/serialize is resolved at **codegen**
+> (`ir_expr_struct_type`), NOT post-inference — NOVA's Hindley-Milner defers type constraints, so the static
+> struct type isn't known at `ti_infer_expr` time but IS at codegen. A `member`/`field` case was added to
+> `ir_expr_struct_type` for nested fields, plus an `_is_valid_struct_name` guard (a struct field named with a
+> keyword like `type:` spawns a parser-phantom `":"` type that must not be derived). (2) `==`/`hash` needed
+> **no** codegen change — `==` already lowers to `nova_rt_eq`; only the runtime gained a `NOVA_MEM_STRUCT`
+> branch. The unique NOVA framing: structural equality is *forced* by the Process primitive (isolation makes
+> object identity unobservable), and `==`/`hash`/`copy`/`to_json`/`show` are one structural walk so they
+> provably can't drift. See memory [[project-automatic-structural-show]].
+>
+> *(The `@derive`-mechanics design below is retained for historical context only; `@derive` no longer exists.)*
 >
 > ## ⚠ COURSE CORRECTION (2026-06-02): AUTOMATIC, not `@derive`
 > The first implementation shipped `@derive(Show/Eq/Clone/Hash/Serialize)` — an opt-in annotation.

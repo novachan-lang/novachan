@@ -126,30 +126,29 @@ tests) + the regex `|` rewrite:**
   (verified: `q_propagate_test` parses + propagates errors through `?`). Only the fn-return E-constraint
   (requiring a `?`-using fn to declare `Result<_,E>`) is left — a smaller soundness nicety; codegen already
   early-returns the error correctly.*
-- ✅ **Reflection Phase 1 — `@derive(Show)`** (the keystone's first capability; cat-21 Reflection 0%→10%,
-  cat-4 derive-injection): a struct annotated `@derive(Show)` gets a **compiler-synthesized `show` method**
-  (`p.show()` → `"Type { f: v, … }"`). Implemented as a post-parse pass (`expand_derives` in
-  `nova_compiler.nova`) that synthesizes the method as ordinary AST fed through normal lowering — reuses
-  field access + `str()` + method dispatch + concat, **no hand-built IR**. Scalar fields render via
-  `str(self.f)` (sound per static field type — float prints correctly), nested `@derive(Show)` struct
-  fields render recursively via `self.f.show()`. `derive_show_test` verifies int+float (`2.5`/`0.0`/`1.0`),
-  nested `Seg{a:Point,b:Point,name}`, exact output. Bootstrap-reconverged; `expand_derives` is a **no-op when
-  no `@derive` present** (zero impact on the 169 existing tests + the self-host). This is the substrate for
-  Phase 2 (`Eq`/`Hash`/`Clone`) and Phase 3 (`Serialize` — the DB/HTTP keystone). *Honest dead-strip status:
-  NOVA currently emits ALL functions as external `define i64 @…` (verified, codegen line 4271), so no
-  uncalled function — generated or user-written — is stripped today. The generated `__show` is therefore
-  emitted unconditionally, like any function. True dead-strip (the design's headline) is a **compiler-wide**
-  optimization (emit program-internal functions as `internal` linkage so `globaldce`/`-O2` removes uncalled
-  ones) — a legitimately separate piece of work, NOT a derive-specific defect. Tracked as Phase-1.1.*
-- ✅ **Reflection Phase 2 — `@derive(Eq)`** — structural equality method (`p.eq(q)`): scalar fields via
-  `==`, nested `@derive(Eq)` struct fields via `.eq()`, empty struct ⇒ `true`. Proves the substrate
-  generalizes (same field-walk, different fold). **Stacked derives work** (`@derive(Show)` + `@derive(Eq)`
-  on one struct → both methods generated). `derive_eq_test` verifies scalar/nested/stacked.
-- ✅ **Reflection Phase 2b — `@derive(Clone)` + `@derive(Hash)`** — `clone` reconstructs a fresh struct
-  (nested `@derive(Clone)` fields deep-cloned via `.clone()`); `hash` is a structural fold `h=h*31+hash(f)`
-  (nested via `.hash()`), deterministic. With Show/Eq/Hash/Clone all derivable, the **Universal Object
-  protocol is complete (cat-3 PARTIAL→HAVE)**. `derive_clone_hash_test` verifies clone-equality (via `.eq()`),
-  deep nesting, and hash reproducibility.
+- ✅ **Reflection — AUTOMATIC Structural Value Identity (no `@derive`, the NOVA way)** (cat-21 Reflection,
+  cat-3 Universal Object, cat-18 serialize). The five "derive" capabilities are now zero-annotation, derived
+  by the genius compiler/runtime from a Value's STRUCTURE (innovation D1). `@derive` was first shipped as an
+  opt-in annotation, then **removed entirely** (it now raises a helpful compile error) because borrowed
+  annotations violate NOVA's zero-annotation law:
+  - **Show** — `str(p)`/`print(p)` auto-render `Type { f: v, … }`, nested included. `expand_derives`
+    synthesizes `<Type>__show` for *every* record struct (AST → normal lowering, no hand IR); `str`/`print`
+    dispatch to it at **codegen** via `ir_expr_struct_type` (HM defers types, so the static struct type is
+    known at codegen, not inference). `auto_show_test`. *(commit 8915e6f)*
+  - **Serialize** — `json_stringify(p)` auto-serializes to a JSON object, nested recursing; same dispatch via
+    `<Type>__to_json`. The DB/HTTP serialize keystone. `auto_json_test`. *(commit f0bcf2d)*
+  - **Eq + Hash** — `a == b` is structural by value and `hash(p)` is structurally consistent with it, via the
+    ONE universal runtime `nova_rt_eq`/`nova_rt_hash` (extended with a `NOVA_MEM_STRUCT` branch; `==` already
+    lowered to `nova_rt_eq`, so **no codegen change**, no per-type generation). Uniquely NOVA: structural eq is
+    *forced* by the Process primitive (isolation ⇒ identity unobservable), and ==/hash/copy/to_json/show are
+    one structural walk so they can't drift. `auto_eq_test`. *(commit b2cc7ad)*
+  - **Clone** — `copy(p)` is already a universal runtime deep-clone (`nova_rt_deep_copy`); no annotation, no
+    generation. `auto_eq_test` covers it.
+
+  Each landed RECONVERGED (gen5==gen6) + full-regression-green; then the `@derive` surface (parsing handler,
+  `_derive_has`, the `_make_eq/clone/hash_method` generators, the four `derive_*_test` files) was removed.
+  *Honest dead-strip status unchanged: NOVA emits all functions as external `define`, so generated `__show`/
+  `__to_json` are emitted unconditionally; true dead-strip is a separate compiler-wide `internal`-linkage pass.*
 - ✅ **Result-returning safe number parsing** (NEW, cat-17 MISSING→HAVE) — `parse_int_safe(s) ->
   Result<int,string>` and `parse_float_safe(s) -> Result<float,string>` (typed via `nt_sum`, showcasing
   typed Result). `ok(n)` iff the whole string (modulo whitespace) parses, else `err(reason)` — the total,
@@ -489,9 +488,9 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 | NOVA status | Count | % |
 |---|---|---|
 | ✅ HAVE | 88 | 47% |
-| 🟡 PARTIAL | 53 | 28% |
-| ❌ MISSING | 48 | 25% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **114.5 / 189** | **61%** |
+| 🟡 PARTIAL | 54 | 29% |
+| ❌ MISSING | 47 | 25% |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **115 / 189** | **61%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -526,7 +525,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 15 | Async / event I/O | 4 | 2 | 1 | 1 | **63%** | ⇈ **was 13% (stale)** |
 | 16 | Time & date | 4 | 1 | 2 | 1 | **50%** | ⇈ **was 0% (stale)** |
 | 17 | Regex & parsing | 5 | 2 | 0 | 3 | **40%** | ↑ regex engine full + Result number parsing (new) |
-| 18 | Serialization | 6 | 2 | 1 | 3 | **42%** | ↑ key=value config parsing added (Batch G) |
+| 18 | Serialization | 6 | 2 | 2 | 2 | **50%** | ↑ config (G) + derive-able Serialize→to_json (reflection P3) |
 | 19 | Testing | 5 | 3 | 0 | 2 | **60%** | ↑ property-based testing added (Batch M `proptest`) |
 | 20 | FFI / native interop | 7 | 3 | 1 | 3 | **50%** | = |
 | 21 | Reflection / runtime | 5 | 0 | 1 | 4 | **10%** | ↑ @derive(Show) — annotation-driven codegen (no longer 0%) |
