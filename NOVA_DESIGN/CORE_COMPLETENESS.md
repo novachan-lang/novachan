@@ -103,6 +103,16 @@ tests) + the regex `|` rewrite:**
   generation with version/variant bits + `is_uuid` validation), `bitset` (immutable bitset over int words —
   set/clear/test/count via popcount/union/intersect).
 
+**Deep tier — now being IMPLEMENTED (not just planned):**
+
+- ✅ **Bounded / back-pressured channels** (cat-6 signature, PARTIAL→HAVE) — added `bound` + a `not_full`
+  condition variable to `NovaChannel`; `channel_bounded(cap)` builtin (wired + bootstrap-reconverged). `send`
+  back-pressures while `cap` items are queued (predicate-loop on `not_full`, mirroring the existing `not_empty`
+  pattern); every dequeue (`recv` + `try_recv`/select) signals `not_full`; `close` broadcasts both condvars so
+  blocked senders can't hang. `bounded_chan_test` (cap-2, 6 items, concurrent consumer) passes — no deadlock.
+  *Note: supervision-restart already existed (`supervisor_test`, `monitor()` builtin); the remaining
+  concurrency gap is OS-crash fault-isolation (deep Track-8 ownership work).*
+
 **Verified audit (2026-06-02):** ran a 22-agent evidence-based audit of every feature against the
 *self-hosted* codebase, then **independently re-verified every load-bearing claim myself** (read the
 runtime, ran the cited tests through `gen3_test.exe`). Findings rewrote the scorecard in BOTH
@@ -435,10 +445,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 83 | 44% |
-| 🟡 PARTIAL | 55 | 29% |
+| ✅ HAVE | 84 | 44% |
+| 🟡 PARTIAL | 54 | 29% |
 | ❌ MISSING | 51 | 27% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **110.5 / 189** | **58%** |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **111 / 189** | **59%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -461,7 +471,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 | 3 | OOP / polymorphism / interfaces | 9 | 4 | 4 | 1 | **67%** | = |
 | 4 | Generics & metaprogramming | 13 | 3 | 2 | 8 | **31%** | ↓ src-loc/cfg not real |
 | 5 | Memory & resource management | 11 | 4 | 6 | 1 | **64%** | ↑ |
-| 6 | Concurrency & parallelism | 15 | 5 | 5 | 5 | **50%** | ⇈ **was 10% (stale)** |
+| 6 | Concurrency & parallelism | 15 | 6 | 4 | 5 | **53%** | ⇈ was 10% (stale); +bounded channels (deep-tier impl) |
 | 7 | Error handling | 9 | 3 | 5 | 1 | **61%** | = |
 | 8 | Modules & packaging | 9 | 4 | 3 | 2 | **61%** | = |
 | 9 | Strings & Unicode | 8 | 4 | 2 | 2 | **63%** | ↑ codepoint views added |

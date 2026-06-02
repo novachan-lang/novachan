@@ -2502,12 +2502,15 @@ typedef struct {
     int64_t  head;
     int64_t  count;
     int64_t  closed;
+    int64_t  bound;   /* 0 = unbounded; >0 = max queued items before send back-pressures */
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;
+    CONDITION_VARIABLE not_full;
 #else
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
+    pthread_cond_t not_full;
 #endif
 } NovaChannel;
 
@@ -2519,14 +2522,27 @@ int64_t nova_rt_channel_create(void) {
     ch->head = 0;
     ch->count = 0;
     ch->closed = 0;
+    ch->bound = 0;
 #ifdef _WIN32
     InitializeCriticalSection(&ch->lock);
     InitializeConditionVariable(&ch->not_empty);
+    InitializeConditionVariable(&ch->not_full);
 #else
     pthread_mutex_init(&ch->lock, NULL);
     pthread_cond_init(&ch->not_empty, NULL);
+    pthread_cond_init(&ch->not_full, NULL);
 #endif
     return (int64_t)(uintptr_t)ch;
+}
+
+/* Bounded channel: send() back-pressures (blocks) while `bound` items are queued,
+   giving native flow control. bound<=0 behaves as an unbounded channel. */
+int64_t nova_rt_channel_bounded(int64_t bound) {
+    int64_t h = nova_rt_channel_create();
+    if (!h) return 0;
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)h;
+    ch->bound = bound > 0 ? bound : 0;
+    return h;
 }
 
 static void channel_enqueue(NovaChannel* ch, int64_t value) {
@@ -2561,6 +2577,8 @@ int64_t nova_rt_channel_send(int64_t handle, int64_t value) {
     int64_t copy = nova_rt_deep_copy(value);
 #ifdef _WIN32
     EnterCriticalSection(&ch->lock);
+    while (ch->bound > 0 && ch->count >= ch->bound && !ch->closed)
+        SleepConditionVariableCS(&ch->not_full, &ch->lock, INFINITE);
     if (ch->closed) {
         LeaveCriticalSection(&ch->lock);
         nova_rc_dec(copy);
@@ -2572,6 +2590,8 @@ int64_t nova_rt_channel_send(int64_t handle, int64_t value) {
     LeaveCriticalSection(&ch->lock);
 #else
     pthread_mutex_lock(&ch->lock);
+    while (ch->bound > 0 && ch->count >= ch->bound && !ch->closed)
+        pthread_cond_wait(&ch->not_full, &ch->lock);
     if (ch->closed) {
         pthread_mutex_unlock(&ch->lock);
         nova_rc_dec(copy);
@@ -2591,6 +2611,8 @@ int64_t nova_rt_channel_send_move(int64_t handle, int64_t value) {
     NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
 #ifdef _WIN32
     EnterCriticalSection(&ch->lock);
+    while (ch->bound > 0 && ch->count >= ch->bound && !ch->closed)
+        SleepConditionVariableCS(&ch->not_full, &ch->lock, INFINITE);
     if (ch->closed) {
         LeaveCriticalSection(&ch->lock);
         return -1;
@@ -2601,6 +2623,8 @@ int64_t nova_rt_channel_send_move(int64_t handle, int64_t value) {
     LeaveCriticalSection(&ch->lock);
 #else
     pthread_mutex_lock(&ch->lock);
+    while (ch->bound > 0 && ch->count >= ch->bound && !ch->closed)
+        pthread_cond_wait(&ch->not_full, &ch->lock);
     if (ch->closed) {
         pthread_mutex_unlock(&ch->lock);
         return -1;
@@ -2627,6 +2651,7 @@ int64_t nova_rt_channel_recv(int64_t handle) {
         SleepConditionVariableCS(&ch->not_empty, &ch->lock, INFINITE);
     }
     int64_t value = channel_dequeue(ch);
+    WakeConditionVariable(&ch->not_full);
     LeaveCriticalSection(&ch->lock);
 #else
     pthread_mutex_lock(&ch->lock);
@@ -2638,6 +2663,7 @@ int64_t nova_rt_channel_recv(int64_t handle) {
         pthread_cond_wait(&ch->not_empty, &ch->lock);
     }
     int64_t value = channel_dequeue(ch);
+    pthread_cond_signal(&ch->not_full);
     pthread_mutex_unlock(&ch->lock);
 #endif
     return value;
@@ -2650,11 +2676,13 @@ int64_t nova_rt_channel_close(int64_t handle) {
     EnterCriticalSection(&ch->lock);
     ch->closed = 1;
     WakeAllConditionVariable(&ch->not_empty);
+    WakeAllConditionVariable(&ch->not_full);
     LeaveCriticalSection(&ch->lock);
 #else
     pthread_mutex_lock(&ch->lock);
     ch->closed = 1;
     pthread_cond_broadcast(&ch->not_empty);
+    pthread_cond_broadcast(&ch->not_full);
     pthread_mutex_unlock(&ch->lock);
 #endif
     return 0;
@@ -2671,8 +2699,10 @@ static int channel_try_recv(NovaChannel* ch, int64_t* out_value) {
     if (ch->count > 0) {
         *out_value = channel_dequeue(ch);
 #ifdef _WIN32
+        WakeConditionVariable(&ch->not_full);
         LeaveCriticalSection(&ch->lock);
 #else
+        pthread_cond_signal(&ch->not_full);
         pthread_mutex_unlock(&ch->lock);
 #endif
         return 1;

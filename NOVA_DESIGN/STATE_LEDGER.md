@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **164-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **165-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the
@@ -16,9 +16,10 @@ Implementation commits: `a15b6e2`, `0d16e68`, `f07dc1b`, `f5eae3f`, `198c943`, `
 then pure-NOVA stdlib + regex `|`: `b6a3e02` (corex), `99ca666` (urlx), `6841eee` (csvx),
 `a449401` (regex `|`), `7838476` (collx), `60da2aa` (bignum), `…J` (bignum div/gcd), + complexnum
 + complexnum, rational, + Batch M (setops/strx/basex/matrixx/proptest) + Batch N (getin/prng/uuid/
-bitset). Regression: **164/164**. Verified scorecard **83 HAVE / 55 PARTIAL / 51 MISSING of 189 = 58%**
-(was 55% pre-push; cat-11 Numerics 44%→78%, cat-19 Testing 40%→60%, cat-10 deep-access read-side).
-Typed `Result<T,E>` fully designed (NOVA_DESIGN/TYPED_RESULT_PLAN.md) — ready for a focused session.
+bitset) + **bounded channels** (deep tier, runtime+bootstrap). Regression: **165/165**. Verified scorecard
+**84 HAVE / 54 PARTIAL / 51 MISSING of 189 = 59%** (was 55% pre-push; cat-11 Numerics 44%→78%, cat-19
+Testing 40%→60%, cat-6 Concurrency +bounded channels). Typed `Result<T,E>` fully designed (NOVA_DESIGN/
+TYPED_RESULT_PLAN.md) + DEEP_TIER_ROADMAP.md — implementing the deep tier now.
 
 **Headline:** The external critique largely audited the *old Java-bootstrap, design-doc-era*
 NOVA. The current **self-hosted** compiler (`gen3_test.exe`, native PE32+, ~0.98× C,
@@ -74,8 +75,10 @@ below — those are the real work. **Do not spend effort "fixing" the stale non-
 - **Channels:** `nova_rt_channel_create/send/recv`, `nova_rt_select`/`channel_select` over multiple channels. `select_test` → 30, `select_multi_test` → 1500.
 - **Async:** `nova_rt_async/await/await_all/await_any` (futures + composition). `async_test` passes.
 - **Data parallelism:** `nova_rt_pmap`/`pfilter`/`pfor` — real worker threads, dynamic thread-count by CPU/size. `parallel_test`: "pmap correctness: OK / pfilter correctness: OK".
+- **Bounded channels (NEW 2026-06-02):** `channel_bounded(cap)` — `send` back-pressures while `cap` items queued (`not_full` condvar, mirrors `not_empty` pattern); `recv`/`try_recv` signal `not_full`; `close` broadcasts both. `bounded_chan_test` (cap-2, 6 items, concurrent consumer) passes, no deadlock. Closes cat-6 bounded/back-pressured channels.
+- **Supervision (already real):** `monitor()` builtin + pool-worker exit-notification work (`monitor_test`/`monitor_multi_test`); restart-on-failure demonstrated in `supervisor_test`. Remaining: OS-crash fault-isolation (deep Track-8).
 - **Generators:** `yield` parsed + codegen'd. `yield_test` → `[0,1,2,3,4]`.
-- ⚠️ **Still missing (the *structured* layer, not the primitives):** supervision trees (`monitor` registers listeners but `link`/`exit` are log-only stubs — no restart), structured concurrency, GenServer, bounded/back-pressured channels, hot-reload (infra only). This is the real remaining concurrency work — far smaller than "build a runtime from scratch."
+- ⚠️ **Still missing (after bounded channels + verified supervision):** GenServer-style typed servers, structured-concurrency scope enforcement, hot-reload (infra only), and **OS-crash fault-isolation** (a child `exit(1)` currently takes the process down — the deep Track-8 ownership work). Bounded channels ✅ and supervision-restart ✅ are now done.
 
 ### Targets (partial but real)
 - WASM compute-only pipeline (real: sum 1..100 → 5050 in Node).
