@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **170-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **172-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the
@@ -17,12 +17,13 @@ then pure-NOVA stdlib + regex `|`: `b6a3e02` (corex), `99ca666` (urlx), `6841eee
 `a449401` (regex `|`), `7838476` (collx), `60da2aa` (bignum), `…J` (bignum div/gcd), + complexnum
 + complexnum, rational, + Batch M (setops/strx/basex/matrixx/proptest) + Batch N (getin/prng/uuid/
 bitset) + **bounded channels** + **typed Result** + safe parsers + monadic-? + **reflection Phase 1
-`@derive(Show)`** (deep tier, runtime/inferrer/codegen + bootstrap). Regression: **170/170**. Verified scorecard **87 HAVE / 54 PARTIAL / 48 MISSING of 189 = 60%** (was 55% pre-push;
+`@derive(Show)`** (deep tier, runtime/inferrer/codegen + bootstrap). Regression: **172/172**. Verified scorecard **88 HAVE / 53 PARTIAL / 48 MISSING of 189 = 61%** (was 55% pre-push;
 cat-11 Numerics 44%→78%, cat-19 Testing 40%→60%, cat-7 Error-handling 61%→72%, cat-17 Regex/parsing
-20%→40%, **cat-21 Reflection 0%→10%**, cat-4 Generics 31%→35%, cat-6 +bounded channels). Deep tier
-IMPLEMENTED: bounded channels ✅, typed Result ✅ (complete w/ monadic-?), safe parsers ✅, **reflection
-Phase 1 `@derive(Show)` ✅** (first reflection capability). Dead-strip is a compiler-wide follow-up (all fns
-emit external `define`). See TYPED_RESULT_PLAN/REFLECTION_DESIGN/DEEP_TIER_ROADMAP.
+20%→40%, **cat-21 Reflection 0%→10%**, cat-4 Generics 31%→35%, **cat-3 OOP 67%→72%** (Universal Object
+protocol via derive), cat-6 +bounded channels). Deep tier IMPLEMENTED: bounded channels ✅, typed Result ✅
+(complete w/ monadic-?), safe parsers ✅, **reflection `@derive(Show/Eq/Clone/Hash)` ✅** (Universal Object
+protocol — 4 derives on one `expand_derives` substrate; Serialize next). Dead-strip is a compiler-wide
+follow-up (all fns emit external `define`). See TYPED_RESULT_PLAN/REFLECTION_DESIGN/DEEP_TIER_ROADMAP.
 
 **Headline:** The external critique largely audited the *old Java-bootstrap, design-doc-era*
 NOVA. The current **self-hosted** compiler (`gen3_test.exe`, native PE32+, ~0.98× C,

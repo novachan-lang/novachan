@@ -145,6 +145,11 @@ tests) + the regex `|` rewrite:**
   `==`, nested `@derive(Eq)` struct fields via `.eq()`, empty struct ⇒ `true`. Proves the substrate
   generalizes (same field-walk, different fold). **Stacked derives work** (`@derive(Show)` + `@derive(Eq)`
   on one struct → both methods generated). `derive_eq_test` verifies scalar/nested/stacked.
+- ✅ **Reflection Phase 2b — `@derive(Clone)` + `@derive(Hash)`** — `clone` reconstructs a fresh struct
+  (nested `@derive(Clone)` fields deep-cloned via `.clone()`); `hash` is a structural fold `h=h*31+hash(f)`
+  (nested via `.hash()`), deterministic. With Show/Eq/Hash/Clone all derivable, the **Universal Object
+  protocol is complete (cat-3 PARTIAL→HAVE)**. `derive_clone_hash_test` verifies clone-equality (via `.eq()`),
+  deep nesting, and hash reproducibility.
 - ✅ **Result-returning safe number parsing** (NEW, cat-17 MISSING→HAVE) — `parse_int_safe(s) ->
   Result<int,string>` and `parse_float_safe(s) -> Result<float,string>` (typed via `nt_sum`, showcasing
   typed Result). `ok(n)` iff the whole string (modulo whitespace) parses, else `err(reason)` — the total,
@@ -483,10 +488,10 @@ inconsistency is now resolved; 189 is the real deduplicated feature count.
 
 | NOVA status | Count | % |
 |---|---|---|
-| ✅ HAVE | 87 | 46% |
-| 🟡 PARTIAL | 54 | 29% |
+| ✅ HAVE | 88 | 47% |
+| 🟡 PARTIAL | 53 | 28% |
 | ❌ MISSING | 48 | 25% |
-| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **114 / 189** | **60%** |
+| **Weighted "done"** (HAVE = 1.0, PARTIAL = 0.5) | **114.5 / 189** | **61%** |
 
 The audit's corrections roughly cancelled, but the *composition* changed materially and the
 *narrative* changed completely (see below); the number is now **evidence-backed**, not aspirational.
@@ -506,7 +511,7 @@ categories the audit corrected vs. the stale 2026-06-01 snapshot.
 |---|---|---|---|---|---|---|---|
 | 1 | Types, literals & syntax | 16 | 8 | 5 | 3 | **66%** | = |
 | 2 | Functions & closures | 11 | 6 | 2 | 3 | **64%** | ↓ named-params not real |
-| 3 | OOP / polymorphism / interfaces | 9 | 4 | 4 | 1 | **67%** | = |
+| 3 | OOP / polymorphism / interfaces | 9 | 5 | 3 | 1 | **72%** | ↑ Universal Object protocol via @derive(Show/Eq/Hash/Clone) |
 | 4 | Generics & metaprogramming | 13 | 3 | 3 | 7 | **35%** | ↑ @derive code-injection (Phase 1); src-loc/cfg not real |
 | 5 | Memory & resource management | 11 | 4 | 6 | 1 | **64%** | ↑ |
 | 6 | Concurrency & parallelism | 15 | 6 | 4 | 5 | **53%** | ⇈ was 10% (stale); +bounded channels (deep-tier impl) |
