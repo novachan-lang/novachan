@@ -151,7 +151,8 @@ $domain_tests = @(
     'mailx',
     'logx',
     'cryptorand',
-    'durx'
+    'durx',
+    'clockx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
