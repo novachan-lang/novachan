@@ -1033,7 +1033,11 @@ int64_t nova_rt_len(int64_t handle) {
 int64_t nova_rt_slice(int64_t s, int64_t start, int64_t end) {
     const char* str = (const char*)(uintptr_t)s;
     int64_t len = (int64_t)strlen(str);
+    /* Negative indices count from the end (Python-style), matching list slicing,
+       so s[-2:] / s[:-1] work instead of returning the whole string / "". */
+    if (start < 0) start += len;
     if (start < 0) start = 0;
+    if (end < 0) end += len;
     if (end > len) end = len;
     if (start >= end) { char* r = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(r) r[0] = '\0'; return (int64_t)(uintptr_t)r; }
     int64_t n = end - start;
@@ -1192,14 +1196,23 @@ int64_t nova_rt_join(int64_t list_handle, int64_t sep) {
     return (int64_t)(uintptr_t)result;
 }
 
+static int64_t nova_utf8_decode(const unsigned char* s, size_t len, size_t* i);  /* fwd (def below) */
+
 int64_t nova_rt_chars(int64_t s) {
-    const char* str = (const char*)(uintptr_t)s;
-    size_t len = strlen(str);
+    /* Split into CODEPOINTS (each a UTF-8 substring), not raw bytes, so chars()
+       agrees with char_at/char_count on multibyte text (was: 1 entry per byte). */
+    const unsigned char* str = (const unsigned char*)(uintptr_t)s;
     int64_t list = nova_rt_list_create();
-    for (size_t i = 0; i < len; i++) {
-        char* ch = (char*)nova_heap_alloc(2, NOVA_MEM_RAW);
-        if (ch) { ch[0] = str[i]; ch[1] = '\0'; }
+    if (!str) return list;
+    size_t len = strlen((const char*)str), i = 0;
+    while (i < len) {
+        size_t j = i;
+        int64_t cp = nova_utf8_decode(str, len, &j);
+        size_t clen = (cp < 0 || j <= i) ? 1 : (j - i);   /* invalid byte -> 1 */
+        char* ch = (char*)nova_heap_alloc(clen + 1, NOVA_MEM_RAW);
+        if (ch) { memcpy(ch, str + i, clen); ch[clen] = '\0'; }
         nova_rt_list_append(list, (int64_t)(uintptr_t)ch);
+        i += clen;
     }
     return list;
 }

@@ -134,7 +134,8 @@ $domain_tests = @(
     'structser_test',
     'resulteq_test',
     'jsonunicode_test',
-    'copyboxsafety_test'
+    'copyboxsafety_test',
+    'strslicechars_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
