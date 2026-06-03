@@ -162,7 +162,8 @@ $domain_tests = @(
     'offheap_test',
     'atomicx_test',
     'futurex',
-    'nurseryx'
+    'nurseryx',
+    'webx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
