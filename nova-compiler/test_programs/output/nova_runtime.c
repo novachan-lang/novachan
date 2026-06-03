@@ -6951,7 +6951,12 @@ typedef struct {
 } NovaResult;
 
 static int64_t nova_result_pack(int64_t tag, int64_t value) {
-    NovaResult* r = (NovaResult*)nova_heap_alloc(sizeof(NovaResult), NOVA_MEM_RAW);
+    /* Allocate as a 2-slot STRUCT (tag@slot0, value@slot1) rather than NOVA_MEM_RAW.
+       Same data layout, so the NovaResult accessors / unwrap / `?` / match are
+       unchanged, but nova_rt_eq/hash/deep_copy now route through the structural
+       branch: ok(1)==ok(2) is false and ok(1)==ok(1) true (was: RAW -> strcmp on
+       the tag byte made all ok(...) compare equal). */
+    NovaResult* r = (NovaResult*)nova_rt_struct_alloc((int64_t)sizeof(NovaResult));
     if (!r) { fprintf(stderr, "nova: OOM allocating Result\n"); exit(1); }
     r->tag = tag;
     r->value = value;
