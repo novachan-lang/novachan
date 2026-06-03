@@ -9869,6 +9869,15 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         return IrInst(op, dest, typ, args, "nova_rt_list_append_fbox", num, effect, line)
                     if ir_reg_type(rt, args[1]) == "bool"
                         return IrInst(op, dest, typ, args, "nova_rt_list_append_bbox", num, effect, line)
+                // Dict-literal entries lower to nova_rt_dict_set calls with raw
+                // values; box float/bool values (NovaBox) so a dict literal renders
+                // like d[k]=v does (index-set already boxes). Without this,
+                // {"k": true} -> {"k":1} and {"k": 1.5} -> giant-int garbage.
+                if value == "nova_rt_dict_set" and len(args) == 3
+                    if ir_reg_type(rt, args[2]) == "float"
+                        return IrInst(op, dest, typ, args, "nova_rt_dict_set_fbox", num, effect, line)
+                    if ir_reg_type(rt, args[2]) == "bool"
+                        return IrInst(op, dest, typ, args, "nova_rt_dict_set_bbox", num, effect, line)
                 if value == "nova_rt_list_create_filled" and len(args) == 2
                     if dest != ""
                         if ir_reg_type(rt, args[1]) == "int"
@@ -9962,16 +9971,29 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     rt[dest] = "struct"
                 return inst
             else if op == "make_list"
+                // Encode each element's box-kind into the inst value ("f"=float,
+                // "b"=bool, "."=raw) so the emitter boxes float/bool literal
+                // elements (NovaBox), matching the push/index-set boxing — else a
+                // bool literal renders 1/0 and a dict/heuristic-free float renders
+                // garbage. All-int stays "intlist" (no boxing → C-array fast path).
+                let ml_all_int = len(args) > 0
+                let ml_kinds = ""
+                for ml_a in args
+                    let mk = ir_reg_type(rt, ml_a)
+                    if mk != "int"
+                        ml_all_int = false
+                    if mk == "float"
+                        ml_kinds = ml_kinds + "f"
+                    else if mk == "bool"
+                        ml_kinds = ml_kinds + "b"
+                    else
+                        ml_kinds = ml_kinds + "."
                 if dest != ""
-                    let ml_all_int = len(args) > 0
-                    for ml_a in args
-                        if ir_reg_type(rt, ml_a) != "int"
-                            ml_all_int = false
                     if ml_all_int
                         rt[dest] = "intlist"
                     else
                         rt[dest] = "list"
-                return inst
+                return IrInst(op, dest, typ, args, ml_kinds, num, effect, line)
             else if op == "make_dict"
                 if dest != ""
                     rt[dest] = "dict"
@@ -10850,7 +10872,21 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 ire_indent(e, dest + " = call i64 @nova_rt_list_create()")
                 let i = 0
                 while i < len(args)
-                    ire_indent(e, "call i64 @nova_rt_list_append(i64 " + dest + ", i64 " + args[i] + ")")
+                    // value carries per-element box-kinds from the specializer:
+                    // "f" -> box float, "b" -> box bool, else append raw.
+                    let ev = args[i]
+                    let kc = "."
+                    if i < len(value)
+                        kc = slice(value, i, i + 1)
+                    if kc == "f"
+                        let fb = dest + ".fb" + str(i)
+                        ire_indent(e, fb + " = call i64 @nova_rt_box_float(i64 " + args[i] + ")")
+                        ev = fb
+                    else if kc == "b"
+                        let bb = dest + ".bb" + str(i)
+                        ire_indent(e, bb + " = call i64 @nova_rt_box_bool(i64 " + args[i] + ")")
+                        ev = bb
+                    ire_indent(e, "call i64 @nova_rt_list_append(i64 " + dest + ", i64 " + ev + ")")
                     if contains(e.ire_load_origin, args[i])
                         e.ire_slot_escaped[e.ire_load_origin[args[i]]] = 1
                     i = i + 1
