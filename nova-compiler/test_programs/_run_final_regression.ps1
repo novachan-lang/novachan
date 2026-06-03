@@ -147,7 +147,8 @@ $domain_tests = @(
     'supx',
     'optional_test',
     'lockx',
-    'cmapx'
+    'cmapx',
+    'mailx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
