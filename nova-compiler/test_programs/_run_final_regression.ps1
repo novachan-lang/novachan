@@ -155,7 +155,8 @@ $domain_tests = @(
     'clockx',
     'textblock_test',
     'multigen_test',
-    'dictcomp_test'
+    'dictcomp_test',
+    'ptestx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
