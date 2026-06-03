@@ -8717,6 +8717,66 @@ int64_t nova_rt_mmap_close(int64_t handle) {
     return 0;
 }
 
+/* ── Off-heap / direct memory regions (safe) ──────────────────────────────────
+   A writable, page-aligned byte region OUTSIDE the RC/GC heap (VirtualAlloc on
+   Windows, anonymous mmap on POSIX) — for large buffers, DMA-style staging, or
+   avoiding heap pressure on hot paths. Zero-initialized. All get/set are bounds-
+   checked at runtime (OOB read -> -1, OOB write -> no-op), so it can never UB. */
+typedef struct {
+    uint8_t* data;
+    int64_t  size;
+} NovaOffheap;
+
+int64_t nova_rt_offheap_create(int64_t size_val) {
+    int64_t sz = size_val < 0 ? 0 : size_val;
+    NovaOffheap* r = (NovaOffheap*)nova_heap_alloc(sizeof(NovaOffheap), NOVA_MEM_RAW);
+    if (!r) { nova_set_error("offheap_create: out of memory"); return 0; }
+    r->data = NULL; r->size = 0;
+    if (sz == 0) return (int64_t)(uintptr_t)r;
+#ifdef _WIN32
+    void* p = VirtualAlloc(NULL, (SIZE_T)sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!p) { nova_set_error("offheap_create: VirtualAlloc failed"); return (int64_t)(uintptr_t)r; }
+#else
+    void* p = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { nova_set_error("offheap_create: mmap failed"); return (int64_t)(uintptr_t)r; }
+#endif
+    r->data = (uint8_t*)p; r->size = sz;   /* OS zero-initializes the region */
+    return (int64_t)(uintptr_t)r;
+}
+
+int64_t nova_rt_offheap_len(int64_t handle) {
+    NovaOffheap* r = (NovaOffheap*)(uintptr_t)handle;
+    if (!r) return 0;
+    return r->size;
+}
+
+int64_t nova_rt_offheap_get(int64_t handle, int64_t i) {
+    NovaOffheap* r = (NovaOffheap*)(uintptr_t)handle;
+    if (!r || !r->data || i < 0 || i >= r->size) return -1;   /* bounds-checked */
+    return (int64_t)r->data[i];
+}
+
+int64_t nova_rt_offheap_set(int64_t handle, int64_t i, int64_t b) {
+    NovaOffheap* r = (NovaOffheap*)(uintptr_t)handle;
+    if (!r || !r->data || i < 0 || i >= r->size) return -1;   /* OOB write -> no-op */
+    r->data[i] = (uint8_t)(b & 0xff);
+    return 0;
+}
+
+int64_t nova_rt_offheap_free(int64_t handle) {
+    NovaOffheap* r = (NovaOffheap*)(uintptr_t)handle;
+    if (!r) return 0;
+    if (r->data && r->size > 0) {
+#ifdef _WIN32
+        VirtualFree(r->data, 0, MEM_RELEASE);
+#else
+        munmap(r->data, (size_t)r->size);
+#endif
+    }
+    r->data = NULL; r->size = 0;
+    return 0;
+}
+
 /* ── Recursive directory walk ────────────────────────────────────────────── */
 
 int64_t nova_rt_dir_walk(int64_t path_val) {
