@@ -5611,6 +5611,10 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                         if m_arm_idx > 0
                                             ir_start_block(b, m_check_labels[m_arm_idx - 1])
                                         let m_expected = type_name_hash(m_pv)
+                                        if m_pn == 1
+                                            m_expected = 1
+                                            if m_pv == "Ok" or m_pv == "Some"
+                                                m_expected = 0
                                         let m_exp_reg = ir_fresh_reg(b)
                                         ir_emit_inst(b, "const_int", m_exp_reg, ir_type_int(), [], str(m_expected), m_expected)
                                         let m_cmp = ir_fresh_reg(b)
@@ -5995,7 +5999,14 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                     if pt == "pat_ctor"
                                         if arm_idx > 0
                                             ir_start_block(b, check_labels[arm_idx - 1])
+                                        // pn==1 marks a Result/Option sum-match (set by the
+                                        // inferrer): compare the NovaResult tag (Ok/Some=0,
+                                        // Err/None=1) instead of a type-name hash.
                                         let expected = type_name_hash(pv)
+                                        if pn == 1
+                                            expected = 1
+                                            if pv == "Ok" or pv == "Some"
+                                                expected = 0
                                         let exp_reg = ir_fresh_reg(b)
                                         ir_emit_inst(b, "const_int", exp_reg, ir_type_int(), [], str(expected), expected)
                                         let cmp_reg = ir_fresh_reg(b)
@@ -6162,6 +6173,10 @@ fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
                                         if arm_idx > 0
                                             ir_start_block(b, rcheck_labels[arm_idx - 1])
                                         let expected = type_name_hash(pv)
+                                        if pn == 1
+                                            expected = 1
+                                            if pv == "Ok" or pv == "Some"
+                                                expected = 0
                                         let exp_reg = ir_fresh_reg(b)
                                         ir_emit_inst(b, "const_int", exp_reg, ir_type_int(), [], str(expected), expected)
                                         let cmp_reg = ir_fresh_reg(b)
@@ -8003,6 +8018,10 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                 let m_subj = nt_any()
                 if len(children) > 0
                     m_subj = ti_infer_expr(st, children[0])
+                    // Resolve the subject's deferred constraints now so a Result/Option
+                    // subject is seen as a concrete Sum when checking Ok/Err/Some/None
+                    // patterns (ti_constrain only defers; ti_solve binds + clears).
+                    ti_solve(st)
                 let ex_pats = []
                 let m_result = nt_any()
                 let m_first = true
@@ -8376,6 +8395,10 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 return nt_unit()
             if tag == "match"
                 let subj = ti_infer_expr(st, expr)
+                // Resolve the subject's deferred constraints now (ti_constrain only
+                // defers) so a Result/Option subject is a concrete Sum when checking
+                // Ok/Err/Some/None patterns in ti_infer_pattern.
+                ti_solve(st)
                 let match_t = nt_unit()
                 let match_first = true
                 let ex_pats = []
@@ -8436,17 +8459,44 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
             else if tag == "pat_str"
                 ti_constrain(st, expected, nt_string(), eline)
             else if tag == "pat_ctor"
-                if contains(st.ti_variant_enum, value)
-                    let pc_w = ti_walk(st, expected)
+                let pc_w = ti_walk(st, expected)
+                // Built-in Result/Option sum-match: the subject is a Sum and the
+                // constructor is Ok/Err/Some/None (NOT shadowed by a same-named user
+                // enum variant). Mark the pattern (num=1) so codegen compares the
+                // NovaResult TAG (0=Ok/Some, 1=Err/None) rather than a type-name hash,
+                // and bind the payload at the Sum's ok/err element type. User enums are
+                // nt_struct (never "sum"), so this can't collide with a user Some/None.
+                let is_sum_match = false
+                match pc_w
+                    NType(pwk, pwn, pwp, pwi) =>
+                        if pwk == "sum" and not contains(st.ti_variant_enum, value)
+                            if value == "Ok" or value == "Err" or value == "Some" or value == "None"
+                                is_sum_match = true
+                if is_sum_match
+                    pat.num = 1
+                    let payload_t = nt_any()
                     match pc_w
-                        NType(pwk, pwn, pwp, pwi) =>
-                            if pwk == "int" or pwk == "float" or pwk == "bool" or pwk == "string" or pwk == "range" or pwk == "list" or pwk == "dict"
-                                ti_error(st, "cannot match enum variant '" + value + "' against subject of type " + ti_type_str(pc_w), eline)
-                for child in children
-                    match child
-                        Expr(ct, cv, cn, cc, cf, cln) =>
-                            if ct == "pat_var"
-                                ti_define(st, cv, ti_mono(ti_fresh(st)))
+                        NType(pwk2, pwn2, pwp2, pwi2) =>
+                            if (value == "Ok" or value == "Some") and len(pwp2) >= 1
+                                payload_t = pwp2[0]
+                            else if (value == "Err" or value == "None") and len(pwp2) >= 2
+                                payload_t = pwp2[1]
+                    for child in children
+                        match child
+                            Expr(ct, cv, cn, cc, cf, cln) =>
+                                if ct == "pat_var"
+                                    ti_define(st, cv, ti_mono(payload_t))
+                else
+                    if contains(st.ti_variant_enum, value)
+                        match pc_w
+                            NType(pwk, pwn, pwp, pwi) =>
+                                if pwk == "int" or pwk == "float" or pwk == "bool" or pwk == "string" or pwk == "range" or pwk == "list" or pwk == "dict"
+                                    ti_error(st, "cannot match enum variant '" + value + "' against subject of type " + ti_type_str(pc_w), eline)
+                    for child in children
+                        match child
+                            Expr(ct, cv, cn, cc, cf, cln) =>
+                                if ct == "pat_var"
+                                    ti_define(st, cv, ti_mono(ti_fresh(st)))
 
 // ── Match exhaustiveness check ───────────────────────────────────────────────
 
