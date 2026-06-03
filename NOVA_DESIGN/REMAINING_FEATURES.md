@@ -35,6 +35,14 @@ regression-green). Any matching rows below are STALE — skip them:
 - **`print(struct_local)` dispatch** verified WORKING (audit's "prints `<struct>`" finding is STALE — direct
   `print(p)` of a let-bound struct now routes through the structural `__show`; covers the "Universal Object
   protocol" PARTIAL row's only remaining gap).
+- **Pattern matching on Result/Option** `match r { Ok(n)=>.. Err(e)=>.. }` / `Some(v)`/`None()` (25e4590) —
+  was a foundational silent-no-match bug; FIXED via ti sum-ctor marking + tag-based codegen. (Covers the
+  error-handling "match on Result" intent + unblocked with/else.)
+- **with/else happy-path chaining** `with a <- e1, b <- e2 <body> else err <h>` (2b9292d) — desugars to
+  nested Ok/Err match. (The "with/else happy-path chaining" signature row is DONE.)
+- **Large ints in int lists print correctly** (a817248) — typed intlist formatter. PARTIAL int/float fix;
+  the broader "Any int/float soundness" (mixed/nested/scalar-any big ints) still needs the full widen-boxing
+  overhaul (project_int_float_valuemodel_fix).
 Always re-verify a row against the real code before building (the per-item "evidence" below is as-of-audit).
 
 **Total verified-remaining: 96** (minus the shipped items above)
