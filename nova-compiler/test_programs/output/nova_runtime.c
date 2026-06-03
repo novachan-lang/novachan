@@ -913,6 +913,44 @@ int64_t nova_rt_list_to_str(int64_t handle) {
     return (int64_t)(uintptr_t)tracked;
 }
 
+/* Typed formatter for a statically-known int list ("intlist"): every element is a
+   raw i64 integer, so format it directly with %lld — NO int-vs-float magnitude
+   heuristic, which misfires on large ints (>= 2^53) whose bit pattern resembles a
+   normal double. The compiler routes print/str of an inferred intlist here. */
+int64_t nova_rt_intlist_to_str(int64_t handle) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (!list) return (int64_t)(uintptr_t)nova_fat_str_create("[]", 2);
+    size_t cap = 64;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return (int64_t)(uintptr_t)nova_fat_str_create("[]", 2);
+    size_t pos = 0;
+    buf[pos++] = '[';
+    for (int64_t i = 0; i < list->size; i++) {
+        if (i > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
+        char tmp[32];
+        int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)list->data[i]);
+        if (n < 0) n = 0;
+        while (pos + (size_t)n + 4 >= cap) {
+            cap *= 2;
+            char* nb = (char*)realloc(buf, cap);
+            if (!nb) { free(buf); return (int64_t)(uintptr_t)nova_fat_str_create("[]", 2); }
+            buf = nb;
+        }
+        memcpy(buf + pos, tmp, (size_t)n);
+        pos += (size_t)n;
+    }
+    buf[pos++] = ']';
+    int64_t r = (int64_t)(uintptr_t)nova_fat_str_create(buf, pos);
+    free(buf);
+    return r;
+}
+
+int64_t nova_rt_print_intlist(int64_t handle) {
+    int64_t s = nova_rt_intlist_to_str(handle);
+    puts((const char*)(uintptr_t)s);
+    return 0;
+}
+
 /* ── Strings ──────────────────────────────────────────────────────────────── */
 
 int64_t nova_rt_str_concat(int64_t a, int64_t b) {
