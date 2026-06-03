@@ -1659,6 +1659,15 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                     else if rtkk == "IDENT"
                         ret_ann = ret_ann + rtvv
                     p = p + 1
+    // Optional clause guard: `fn f(params) when <expr>` (contextual, not a keyword).
+    // Multiple same-name/arity heads with guards are fused post-parse into one fn
+    // whose body is a guard if/else chain (Elixir/Erlang-style clause dispatch).
+    let fn_guard = null_expr()
+    if tk(tokens, p) == "IDENT" and tv(tokens, p) == "when"
+        p = p + 1
+        let guard_r = parse_expr(tokens, p, 0, pe)
+        fn_guard = guard_r.expr
+        p = guard_r.pos
     let fn_col = 1
     let fn_tok = tokens[pos]
     match fn_tok
@@ -1699,7 +1708,11 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
             for bk in keys(generic_bounds)
                 push(bound_children, Expr("bound", bk, 0, [Expr("ident", generic_bounds[bk], 0, [], [], ln)], [], ln))
             push(annotations, Expr("generic_bounds", "", 0, bound_children, [], ln))
-    StmtParseResult(Stmt("fn", name, ret_expr, body, params, [], annotations, ln), p2)
+    // Carry the clause guard (if any) in the fn Stmt's else_body slot (unused for fns).
+    let fn_else = []
+    if fn_guard != null_expr()
+        push(fn_else, Stmt("guard", "", fn_guard, [], [], [], [], ln))
+    StmtParseResult(Stmt("fn", name, ret_expr, body, params, fn_else, annotations, ln), p2)
 
 fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let ln = tl(tokens, pos)
@@ -2205,6 +2218,75 @@ fn _make_to_json_method(tname: string, fields: list, jsonset: dict, ln: int) -> 
     let ret_stmt = Stmt("return", "", acc, [], [], [], [], ln)
     Stmt("fn", tname + "__to_json", null_expr(), [ret_stmt], [Param("self", tname, null_expr())], [], [], ln)
 
+// ── Multi-clause function heads (Erlang/Elixir-style guard dispatch) ──────────
+// Several same-name/same-arity `fn f(...) when <guard>` heads are fused into ONE
+// function whose body is a guard if/else chain (last unguarded head = catch-all;
+// if all heads are guarded, a no-clause-matched assert is the final else). Heads
+// share parameter names (guards/bodies reference the same params). Runs post-parse
+// (before expand_derives + inference) so the rest of the pipeline sees one fn. The
+// compiler's own source has no guards/duplicate names, so this is a no-op for
+// self-compilation (bootstrap-safe).
+fn _fn_guard_of(s: Stmt) -> Expr
+    match s
+        Stmt(gtag, gname, gexpr, gbody, gparams, gelse, ganns, gsline) =>
+            if len(gelse) > 0
+                match gelse[0]
+                    Stmt(gt2, gn2, ge2, gb2, gp2, geb2, ga2, gl2) =>
+                        if gt2 == "guard"
+                            return ge2
+    null_expr()
+
+fn _clause_fail_stmt(name: string, ln: int) -> Stmt
+    let cond = Expr("bool", "false", 0, [], [], ln)
+    let msg = Expr("str", "no matching clause for " + name, 0, [], [], ln)
+    let call = Expr("call", "assert", 0, [cond, msg], [], ln)
+    Stmt("expr", "", call, [], [], [], [], ln)
+
+fn _fuse_heads(heads: list, name: string, params: list, ret_expr: Expr, anns: list, ln: int) -> Stmt
+    let chain = [_clause_fail_stmt(name, ln)]
+    let i = len(heads) - 1
+    while i >= 0
+        let h = heads[i]
+        let g = _fn_guard_of(h)
+        let hbody = []
+        match h
+            Stmt(ht, hn, he, hb, hp, heb, ha, hl) =>
+                hbody = hb
+        if g == null_expr()
+            chain = hbody
+        else
+            chain = [Stmt("if", "", g, hbody, [], chain, [], ln)]
+        i = i - 1
+    Stmt("fn", name, ret_expr, chain, params, [], anns, ln)
+
+fn fuse_multiclause(stmts: list) -> list
+    let group_guarded = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "fn"
+                    if _fn_guard_of(s) != null_expr()
+                        group_guarded[name + "/" + str(len(params))] = 1
+    let out = []
+    let emitted = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "fn" and contains(group_guarded, name + "/" + str(len(params)))
+                    let key = name + "/" + str(len(params))
+                    if not contains(emitted, key)
+                        emitted[key] = 1
+                        let heads = []
+                        for s2 in stmts
+                            match s2
+                                Stmt(t2, n2, e2, b2, p2x, eb2, a2, l2) =>
+                                    if t2 == "fn" and n2 == name and len(p2x) == len(params)
+                                        push(heads, s2)
+                        push(out, _fuse_heads(heads, name, params, expr, anns, sline))
+                else
+                    push(out, s)
+    out
+
 fn expand_derives(stmts: list) -> list
     // NOVA way (not Rust/Python): the genius compiler derives a value's textual form (show) and
     // its JSON encoding (to_json) from its STRUCTURE (innovation D1) — zero annotation, for EVERY
@@ -2254,7 +2336,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    expand_derives(stmts)
+    expand_derives(fuse_multiclause(stmts))
 
 // ── LLVM IR Code Generator ───────────────────────────────────────────────────
 
