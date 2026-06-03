@@ -104,7 +104,7 @@ fn is_ws(ch: string) -> bool
     ch == " " or ch == "\t" or ch == "\r"
 
 fn is_keyword(word: string) -> bool
-    (word == "fn" or word == "return" or word == "if" or word == "else" or word == "for" or word == "while" or word == "match" or word == "break" or word == "continue" or word == "type" or word == "enum" or word == "spawn" or word == "send" or word == "receive" or word == "channel" or word == "or" or word == "and" or word == "not" or word == "import" or word == "true" or word == "false" or word == "null" or word == "in" or word == "as" or word == "select" or word == "try" or word == "catch" or word == "trait" or word == "matches" or word == "yield" or word == "let" or word == "extern" or word == "unsafe")
+    (word == "fn" or word == "return" or word == "if" or word == "else" or word == "for" or word == "while" or word == "match" or word == "break" or word == "continue" or word == "type" or word == "enum" or word == "spawn" or word == "send" or word == "receive" or word == "channel" or word == "or" or word == "and" or word == "not" or word == "import" or word == "true" or word == "false" or word == "null" or word == "in" or word == "as" or word == "select" or word == "try" or word == "catch" or word == "trait" or word == "matches" or word == "yield" or word == "let" or word == "extern" or word == "unsafe" or word == "with")
 
 fn lex_error(code: string, msg: string, line: int, col: int, help: string)
     lex_error_file(code, msg, "", line, col, help)
@@ -1339,6 +1339,8 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         parse_import_stmt(tokens, pos)
     else if kind == "KW" and val == "match"
         parse_match_stmt(tokens, pos, pe)
+    else if kind == "KW" and val == "with"
+        parse_with_stmt(tokens, pos, pe)
     else if kind == "KW" and val == "let"
         // let name = expr
         let name = tv(tokens, pos + 1)
@@ -1963,6 +1965,75 @@ fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     if len(arms) == 0
         syntax_error(tokens, pos, "match has no arms; provide at least one pattern arm", pe)
     StmtParseResult(Stmt("match", "", subject_r.expr, arms, [], [], [], ln), p2)
+
+// Build the nested-match desugaring of a `with` chain. Each bind `pat <- expr`
+// becomes `match expr { Ok(pat) => <rest>, Err(errname) => <else_body> }`; the
+// innermost Ok arm runs the with body. Reuses the (now working) Result/Option
+// match-on-Sum machinery — no new IR/runtime. The else body is shared by every
+// Err arm (only one fires per run).
+fn build_with_match(binds: list, idx: int, body: list, err_name: string, else_body: list, ln: int) -> list
+    if idx >= len(binds)
+        return body
+    let bind = binds[idx]
+    let pat_name = bind[0]
+    let src_expr = bind[1]
+    let inner = build_with_match(binds, idx + 1, body, err_name, else_body, ln)
+    let ok_pat = Expr("pat_ctor", "Ok", 0, [Expr("pat_var", pat_name, 0, [], [], ln)], [], ln)
+    let ok_arm = Stmt("arm", "", ok_pat, inner, [], [], [null_expr()], ln)
+    let err_pat = Expr("pat_ctor", "Err", 0, [Expr("pat_var", err_name, 0, [], [], ln)], [], ln)
+    let err_arm = Stmt("arm", "", err_pat, else_body, [], [], [null_expr()], ln)
+    [Stmt("match", "", src_expr, [ok_arm, err_arm], [], [], [], ln)]
+
+// `with pat <- expr, pat2 <- expr2` <body> `else errname` <else-body>
+// Elixir-style happy-path chaining: run each fallible step; on the first Err,
+// bind it to `errname` and run the else block. Desugars to nested Ok/Err match.
+fn parse_with_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
+    let ln = tl(tokens, pos)
+    let with_col = tok_col(tokens, pos)
+    let p = pos + 1
+    let binds = []
+    while tk(tokens, p) != "EOF" and tk(tokens, p) != "NEWLINE"
+        let pat_name = tv(tokens, p)
+        p = p + 1
+        if tk(tokens, p) == "OP" and tv(tokens, p) == "<"
+            p = p + 1
+        if tk(tokens, p) == "OP" and tv(tokens, p) == "-"
+            p = p + 1
+        let src_r = parse_expr(tokens, p, 0, pe)
+        push(binds, [pat_name, src_r.expr])
+        p = src_r.pos
+        if tk(tokens, p) == "COMMA"
+            p = p + 1
+        else
+            break
+    let p2 = skip_nl(tokens, p)
+    let body = []
+    while tk(tokens, p2) != "EOF"
+        if tok_col(tokens, p2) <= with_col
+            break
+        let sr = parse_stmt(tokens, p2, pe)
+        push(body, sr.stmt)
+        p2 = skip_nl(tokens, sr.pos)
+    let err_name = "_"
+    let else_body = []
+    if tk(tokens, p2) == "KW" and tv(tokens, p2) == "else" and tok_col(tokens, p2) == with_col
+        p2 = p2 + 1
+        if tk(tokens, p2) == "IDENT"
+            err_name = tv(tokens, p2)
+            p2 = p2 + 1
+        p2 = skip_nl(tokens, p2)
+        while tk(tokens, p2) != "EOF"
+            if tok_col(tokens, p2) <= with_col
+                break
+            let sr = parse_stmt(tokens, p2, pe)
+            push(else_body, sr.stmt)
+            p2 = skip_nl(tokens, sr.pos)
+    else
+        syntax_error(tokens, p2, "with-chain requires an 'else' block (aligned with 'with') to handle the error case", pe)
+    if len(binds) == 0
+        syntax_error(tokens, pos, "with-chain needs at least one 'pat <- expr' binding", pe)
+    let desugared = build_with_match(binds, 0, body, err_name, else_body, ln)
+    StmtParseResult(desugared[0], p2)
 
 fn parse_import_stmt(tokens: list, pos: int) -> StmtParseResult
     let ln = tl(tokens, pos)
