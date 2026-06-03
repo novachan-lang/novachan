@@ -2350,7 +2350,7 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
             else jbuf_append(b, "false", 5);
         } else { /* NOVA_BOX_FLOAT */
             double dv; memcpy(&dv, &bx->payload, sizeof(dv));
-            char fb[40]; snprintf(fb, sizeof(fb), "%g", dv);
+            char fb[40]; snprintf(fb, sizeof(fb), "%.15g", dv);
             jbuf_append(b, fb, (int64_t)strlen(fb));
         }
         return;
@@ -11835,7 +11835,9 @@ int64_t nova_rt_json_encode(int64_t val) {
    (was garbage bits) and json_encode(true)->"true". */
 int64_t nova_rt_json_encode_float(int64_t bits) {
     double d; memcpy(&d, &bits, sizeof(d));
-    char buf[40]; snprintf(buf, sizeof(buf), "%g", d);
+    /* %.15g matches str()/float_to_str (was %g = 6 sig figs, silently truncating
+       precision so json round-trip lost data). */
+    char buf[40]; snprintf(buf, sizeof(buf), "%.15g", d);
     return nova_rt_create_string((void*)buf);
 }
 int64_t nova_rt_json_encode_bool(int64_t v) {
