@@ -2118,7 +2118,10 @@ static int64_t json_parse_number(JsonParser* p) {
         double val = strtod(p->src + start, NULL);
         int64_t bits;
         memcpy(&bits, &val, sizeof(bits));
-        return bits;
+        /* Box the decoded float so it round-trips (json_stringify reads the box)
+           and reads back as a float through dict_get/list_get unboxing, instead
+           of leaking raw IEEE bits that render as a giant integer. */
+        return nova_rt_box_float(bits);
     } else {
         int64_t val = 0;
         int neg = 0;
@@ -2392,6 +2395,12 @@ int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {
 }
 
 static inline int nova_is_likely_float(int64_t v) {
+    /* A boxed scalar is authoritative: float box -> yes, bool box -> no.
+       Falls back to the magnitude heuristic only for raw (unboxed) values. */
+    if (nova_is_box(v)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)v;
+        return bx->kind == NOVA_BOX_FLOAT ? 1 : 0;
+    }
     if (v == 0) return 0;
     if (v > -(1LL << 52) && v < (1LL << 52)) return 0;
     uint64_t exp = ((uint64_t)v >> 52) & 0x7FF;
@@ -2399,6 +2408,11 @@ static inline int nova_is_likely_float(int64_t v) {
 }
 
 static inline double nova_to_double(int64_t v) {
+    if (nova_is_box(v)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)v;
+        if (bx->kind == NOVA_BOX_FLOAT) { double d; memcpy(&d, &bx->payload, 8); return d; }
+        return (double)bx->payload;   /* boxed bool */
+    }
     if (nova_is_likely_float(v)) {
         double d; memcpy(&d, &v, 8); return d;
     }

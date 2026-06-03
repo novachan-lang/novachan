@@ -129,7 +129,8 @@ $domain_tests = @(
     'boxeq_test',
     'tablex',
     'floatmath_test',
-    'litbox_test'
+    'litbox_test',
+    'jsonfloat_rt_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
