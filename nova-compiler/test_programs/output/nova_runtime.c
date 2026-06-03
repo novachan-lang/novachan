@@ -28,6 +28,8 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -8632,6 +8634,87 @@ int64_t nova_rt_secure_bytes(int64_t n) {
         b->size = n;
     }
     return result;
+}
+
+/* ── Memory-mapped files (read-only) ──────────────────────────────────────────
+   A file mapped into the address space: zero-copy, OS-paged access to large files
+   without reading the whole thing into the heap. mmap_open returns an opaque handle;
+   mmap_byte does bounds-checked reads; mmap_close releases the mapping + descriptors.
+   Backed by CreateFileMapping/MapViewOfFile on Windows and mmap(2) on POSIX. */
+typedef struct {
+    uint8_t* data;
+    int64_t  size;
+#ifdef _WIN32
+    void* file;   /* HANDLE to the file */
+    void* map;    /* HANDLE to the mapping object */
+#else
+    int   fd;
+#endif
+} NovaMmap;
+
+int64_t nova_rt_mmap_open(int64_t path) {
+    const char* p = (const char*)(uintptr_t)path;
+    NovaMmap* m = (NovaMmap*)nova_heap_alloc(sizeof(NovaMmap), NOVA_MEM_RAW);
+    if (!m) { nova_set_error("mmap_open: out of memory"); return 0; }
+    m->data = NULL; m->size = 0;
+#ifdef _WIN32
+    m->file = NULL; m->map = NULL;
+    if (!p) { nova_set_error("mmap_open: null path"); return (int64_t)(uintptr_t)m; }
+    HANDLE fh = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) { nova_set_error("mmap_open: cannot open file"); return (int64_t)(uintptr_t)m; }
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(fh, &sz)) { CloseHandle(fh); nova_set_error("mmap_open: cannot size file"); return (int64_t)(uintptr_t)m; }
+    m->file = (void*)fh;
+    if (sz.QuadPart == 0) { m->size = 0; return (int64_t)(uintptr_t)m; }  /* empty file: no view */
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mh) { CloseHandle(fh); m->file = NULL; nova_set_error("mmap_open: cannot create mapping"); return (int64_t)(uintptr_t)m; }
+    void* view = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    if (!view) { CloseHandle(mh); CloseHandle(fh); m->file = NULL; nova_set_error("mmap_open: cannot map view"); return (int64_t)(uintptr_t)m; }
+    m->map = (void*)mh; m->data = (uint8_t*)view; m->size = (int64_t)sz.QuadPart;
+#else
+    m->fd = -1;
+    if (!p) { nova_set_error("mmap_open: null path"); return (int64_t)(uintptr_t)m; }
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) { nova_set_error("mmap_open: cannot open file"); return (int64_t)(uintptr_t)m; }
+    struct stat stt;
+    if (fstat(fd, &stt) != 0) { close(fd); nova_set_error("mmap_open: cannot stat file"); return (int64_t)(uintptr_t)m; }
+    m->fd = fd; m->size = (int64_t)stt.st_size;
+    if (m->size == 0) return (int64_t)(uintptr_t)m;  /* empty file: no mapping */
+    void* addr = mmap(NULL, (size_t)m->size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) { close(fd); m->fd = -1; m->size = 0; nova_set_error("mmap_open: mmap failed"); return (int64_t)(uintptr_t)m; }
+    m->data = (uint8_t*)addr;
+#endif
+    return (int64_t)(uintptr_t)m;
+}
+
+int64_t nova_rt_mmap_len(int64_t handle) {
+    NovaMmap* m = (NovaMmap*)(uintptr_t)handle;
+    if (!m) return 0;
+    return m->size;
+}
+
+int64_t nova_rt_mmap_byte(int64_t handle, int64_t i) {
+    NovaMmap* m = (NovaMmap*)(uintptr_t)handle;
+    if (!m || !m->data || i < 0 || i >= m->size) return -1;   /* bounds-checked */
+    return (int64_t)m->data[i];
+}
+
+int64_t nova_rt_mmap_close(int64_t handle) {
+    NovaMmap* m = (NovaMmap*)(uintptr_t)handle;
+    if (!m) return 0;
+#ifdef _WIN32
+    if (m->data) UnmapViewOfFile(m->data);
+    if (m->map)  CloseHandle((HANDLE)m->map);
+    if (m->file) CloseHandle((HANDLE)m->file);
+    m->map = NULL; m->file = NULL;
+#else
+    if (m->data && m->size > 0) munmap(m->data, (size_t)m->size);
+    if (m->fd >= 0) close(m->fd);
+    m->fd = -1;
+#endif
+    m->data = NULL; m->size = 0;
+    return 0;
 }
 
 /* ── Recursive directory walk ────────────────────────────────────────────── */

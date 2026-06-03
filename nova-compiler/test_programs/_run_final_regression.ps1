@@ -157,7 +157,8 @@ $domain_tests = @(
     'multigen_test',
     'dictcomp_test',
     'ptestx',
-    'fnval_test'
+    'fnval_test',
+    'mmap_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
