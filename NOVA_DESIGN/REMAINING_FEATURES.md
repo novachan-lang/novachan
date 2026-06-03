@@ -113,8 +113,8 @@ shipped row — check this header + `git log` first. Tracking is in-place in thi
 ## signature (30)
 
 ### GenServer-style stateful server behaviour  *(6. Concurrency & parallelism)*
-- **status:** MISSING | **effort:** large
-- **gap:** No GenServer behaviour generated from a typed Channel protocol; no compile-time proof that every message variant has a handler.
+- **status:** DONE (2026-06-03, library) | **effort:** large
+- **shipped:** actorx.nova — actor_start(initial, handler) spawns a receive loop threading state through handler fn(state,msg)->[new_state,reply]; actor_call(server,msg) is a synchronous request/reply rendezvous; actor_stop ends the loop (clean program-exit join). Pure-NOVA over the real spawn + channel primitives (the NOVA way: composition, no new runtime). test in actorx.nova. (Future enhancement: a compiler-generated dispatch with Sum-protocol exhaustiveness checking; the runtime behaviour is delivered now.)
 - **NOVA approach:** The NOVA way: declare a Sum-typed request protocol; the compiler generates the receive loop + dispatch and exhaustiveness-checks that every variant has a handler (reuse the existing match-exhaustiveness checker). State is the process-local Value threaded through handlers â€” built entirely on spawn + typed channel + Sum types already shipping, no new runtime.
 - **evidence (as of audit):** Grepped *.nova and nova_compiler.nova for gen_server|genserver â€” no abstraction. A stateful server is only hand-composable from spawn + channel (as supervisor_test.nova does for restart). No compiler-checked message-protocol-to-handler mapping exists.
 
