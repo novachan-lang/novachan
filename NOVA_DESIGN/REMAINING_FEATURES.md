@@ -43,9 +43,22 @@ regression-green). Any matching rows below are STALE — skip them:
 - **Large ints in int lists print correctly** (a817248) — typed intlist formatter. PARTIAL int/float fix;
   the broader "Any int/float soundness" (mixed/nested/scalar-any big ints) still needs the full widen-boxing
   overhaul (project_int_float_valuemodel_fix).
+- **Atoms** `:name` interned-symbol literals (252135c) — lexer-disambiguated, work in ==/print/match/dict/list.
+- **Decimal / fixed-point** money type — decimalx.nova (Decimal {m,s}, add/sub/mul/eq/lt/str), exact base-10.
+- **Buffered file handles** (b87d31e) — file_open/read_line/write/eof/seek/tell/flush/close (streaming I/O; was whole-file only).
+- **`nova emit <file>`** IR dumper (3672653) — prints generated LLVM IR to stdout.
+- **Multi-clause function heads with guards** (818a5a0) — `fn f(..) when <g>` heads fuse into a guard if/else chain.
+- **URI parse/build RFC 3986** (809ce1f) — urlx.uri_parse/uri_build (scheme/userinfo/host/port/path/query/fragment).
+- **Value-model soundness sprint** (792fe46,495ce9a,aa88fa2,cc772f8,4d0447e,dfa281e,4b648f3,3d3d7ac,0afb32f,31ace60)
+  — 12 real correctness bugs fixed, HARDENING already-"done" rows: boxed-scalar ==/hash/contains; Result/Option ==
+  (ok(1)==ok(2) was true); deep-copy-of-boxed UAF; scalar max/min/abs on floats; bool/float in list & dict
+  literals; JSON float round-trip + box-aware arithmetic; struct auto show/to_json bool+float fields + str(bool);
+  json_decode \uXXXX→UTF-8; sum(range) exact int; string negative slice + chars() codepoints; JSON %.15g precision.
+  (These strengthen "Universal Object protocol", "derive-able serialization", error-handling rows — not new rows.)
 Always re-verify a row against the real code before building (the per-item "evidence" below is as-of-audit).
 
-**Total verified-remaining: 96** (minus the shipped items above)
+**Total verified-remaining: ~80** (96 minus the shipped items above; the tier text below may be STALE for a
+shipped row — check this header + `git log` first. Tracking is in-place in this file; no side lists.)
 
 ## table-stakes (8)
 
