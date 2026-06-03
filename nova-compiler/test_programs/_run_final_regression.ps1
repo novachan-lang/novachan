@@ -116,7 +116,8 @@ $domain_tests = @(
     'generics_edge_test',
     'intlist_test',
     'with_else_test',
-    'atom_test'
+    'atom_test',
+    'newtype_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
