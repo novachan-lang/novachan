@@ -2083,10 +2083,54 @@ static int64_t json_parse_string(JsonParser* p) {
                 case 'b':  buf[out++] = '\b'; break;
                 case 'f':  buf[out++] = '\f'; break;
                 case 'u': {
-                    int64_t remain = (start + raw_len) - (i + 1);
-                    int skip = remain >= 4 ? 4 : (int)remain;
-                    buf[out++] = '?';
-                    i += skip;
+                    /* \uXXXX -> decode 4 hex to a codepoint, combine UTF-16 surrogate
+                       pairs, and UTF-8 encode (was: emitted '?' and dropped the data).
+                       A \uXXXX is 6 source bytes -> <=3 UTF-8 bytes; a surrogate pair is
+                       12 -> 4, so the output never exceeds the input: buf stays in bounds. */
+                    int64_t end_i = start + raw_len;
+                    unsigned int cp = 0;
+                    int ok = (i + 4 < end_i);
+                    if (ok) {
+                        for (int k = 1; k <= 4; k++) {
+                            char c = p->src[i + k]; cp <<= 4;
+                            if (c >= '0' && c <= '9') cp |= (unsigned)(c - '0');
+                            else if (c >= 'a' && c <= 'f') cp |= (unsigned)(c - 'a' + 10);
+                            else if (c >= 'A' && c <= 'F') cp |= (unsigned)(c - 'A' + 10);
+                            else { ok = 0; break; }
+                        }
+                    }
+                    if (!ok) { buf[out++] = '?'; break; }
+                    i += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < end_i &&
+                        p->src[i + 1] == '\\' && p->src[i + 2] == 'u') {
+                        unsigned int lo = 0; int ok2 = 1;
+                        for (int k = 3; k <= 6; k++) {
+                            char c = p->src[i + k]; lo <<= 4;
+                            if (c >= '0' && c <= '9') lo |= (unsigned)(c - '0');
+                            else if (c >= 'a' && c <= 'f') lo |= (unsigned)(c - 'a' + 10);
+                            else if (c >= 'A' && c <= 'F') lo |= (unsigned)(c - 'A' + 10);
+                            else { ok2 = 0; break; }
+                        }
+                        if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                            i += 6;
+                        }
+                    }
+                    if (cp < 0x80) {
+                        buf[out++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        buf[out++] = (char)(0xC0 | (cp >> 6));
+                        buf[out++] = (char)(0x80 | (cp & 0x3F));
+                    } else if (cp < 0x10000) {
+                        buf[out++] = (char)(0xE0 | (cp >> 12));
+                        buf[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        buf[out++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        buf[out++] = (char)(0xF0 | (cp >> 18));
+                        buf[out++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                        buf[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        buf[out++] = (char)(0x80 | (cp & 0x3F));
+                    }
                     break;
                 }
                 default:   buf[out++] = p->src[i]; break;
