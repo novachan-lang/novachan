@@ -123,7 +123,8 @@ $domain_tests = @(
     'combinx',
     'datex',
     'file_handle_test',
-    'typed_let_test'
+    'typed_let_test',
+    'graphx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
