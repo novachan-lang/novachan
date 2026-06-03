@@ -1659,8 +1659,12 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
             dst[i] = nova_deep_copy_rec(src[i], m, depth + 1);
         return (int64_t)(uintptr_t)dst;
     }
-    if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR || tag == NOVA_MEM_CHANNEL) {
-        /* strings are immutable; channels are the shared comm primitive */
+    if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR || tag == NOVA_MEM_CHANNEL || tag == NOVA_MEM_BOX) {
+        /* strings + boxed scalars (float/bool) are immutable -> share with a refcount
+           bump; channels are the shared comm primitive. The box bump is REQUIRED: the
+           list/dict copy loops nova_rc_dec(e) after appending, so without this inc a
+           deep-copied / channel-sent / copy()'d boxed element is freed prematurely
+           (use-after-free). */
         nova_rc_inc(v);
         return v;
     }

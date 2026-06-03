@@ -133,7 +133,8 @@ $domain_tests = @(
     'jsonfloat_rt_test',
     'structser_test',
     'resulteq_test',
-    'jsonunicode_test'
+    'jsonunicode_test',
+    'copyboxsafety_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
