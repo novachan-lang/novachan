@@ -6697,6 +6697,168 @@ int64_t nova_rt_temp_dir(void) {
 #endif
 }
 
+/* ── Buffered file handles: streaming open/read/write/seek/close ──────────────
+ * Whole-file read_file/write_file load/store the entire file; these give an open
+ * FILE* handle so a 10GB log streams line-by-line without loading into RAM.
+ * Handles are 1-based indices into a fixed table so a bogus or already-closed
+ * handle is rejected (error flag) instead of dereferencing garbage. The table
+ * (slot allocation/free) is lock-guarded; per-handle FILE* use is single-owner
+ * by contract (a handle is a process-local Value, not Sendable across spawn). */
+#define NOVA_MAX_FILES 1024
+static FILE* nova_file_table[NOVA_MAX_FILES];
+#ifdef _WIN32
+static CRITICAL_SECTION nova_file_mtx;
+#else
+static pthread_mutex_t nova_file_mtx = PTHREAD_MUTEX_INITIALIZER;
+#endif
+static int nova_file_init = 0;
+
+static void nova_file_ensure_init(void) {
+    if (!nova_file_init) {
+#ifdef _WIN32
+        InitializeCriticalSection(&nova_file_mtx);
+#endif
+        nova_file_init = 1;
+    }
+}
+static void nova_file_lock(void) {
+#ifdef _WIN32
+    EnterCriticalSection(&nova_file_mtx);
+#else
+    pthread_mutex_lock(&nova_file_mtx);
+#endif
+}
+static void nova_file_unlock(void) {
+#ifdef _WIN32
+    LeaveCriticalSection(&nova_file_mtx);
+#else
+    pthread_mutex_unlock(&nova_file_mtx);
+#endif
+}
+/* Resolve a 1-based handle to its FILE* (NULL if out of range / closed). */
+static FILE* nova_file_get(int64_t h) {
+    if (h < 1 || h > NOVA_MAX_FILES) return NULL;
+    return nova_file_table[h - 1];
+}
+
+/* file_open(path, mode) -> handle (>=1), or 0 on error. mode is a C fopen mode
+ * string ("r","w","a","rb","wb","ab","r+","w+",...). */
+int64_t nova_rt_file_open(int64_t path_val, int64_t mode_val) {
+    nova_file_ensure_init();
+    const char* p = (const char*)(uintptr_t)path_val;
+    const char* m = (const char*)(uintptr_t)mode_val;
+    if (!p || !m || !*m) { nova_set_error("file_open: null/empty path or mode"); return 0; }
+    /* Whitelist the first mode char so a garbage mode can't trigger surprising
+     * fopen behavior; the optional 'b'/'+' suffixes are passed through. */
+    if (m[0] != 'r' && m[0] != 'w' && m[0] != 'a') {
+        nova_set_error("file_open: mode must start with r, w, or a"); return 0;
+    }
+    FILE* f = fopen(p, m);
+    if (!f) {
+        char e[512]; snprintf(e, sizeof(e), "file_open: cannot open '%s' (mode %s): %s", p, m, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+    nova_file_lock();
+    int slot = -1;
+    for (int i = 0; i < NOVA_MAX_FILES; i++) { if (!nova_file_table[i]) { slot = i; break; } }
+    if (slot >= 0) nova_file_table[slot] = f;
+    nova_file_unlock();
+    if (slot < 0) { fclose(f); nova_set_error("file_open: too many open files (max 1024)"); return 0; }
+    return (int64_t)(slot + 1);
+}
+
+/* file_read_line(h) -> string. Returns the next line WITHOUT its terminator
+ * (\n and \r\n both stripped). At end-of-file returns "" with file_eof(h) set;
+ * a genuine empty line also returns "" but file_eof stays false, so the robust
+ * loop is: read, then break if the result is "" AND file_eof(h). */
+int64_t nova_rt_file_read_line(int64_t h) {
+    FILE* f = nova_file_get(h);
+    if (!f) { nova_set_error("file_read_line: invalid handle"); return (int64_t)(uintptr_t)nova_fat_str_create("", 0); }
+    size_t cap = 256, len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) { nova_set_error("file_read_line: out of memory"); return (int64_t)(uintptr_t)nova_fat_str_create("", 0); }
+    int c;
+    while ((c = getc(f)) != EOF) {
+        if (c == '\n') break;
+        if (len + 1 >= cap) {
+            size_t nc = cap * 2;
+            char* nb = (char*)realloc(buf, nc);
+            if (!nb) { free(buf); nova_set_error("file_read_line: out of memory"); return (int64_t)(uintptr_t)nova_fat_str_create("", 0); }
+            buf = nb; cap = nc;
+        }
+        buf[len++] = (char)c;
+    }
+    if (len > 0 && buf[len - 1] == '\r') len--;   /* strip CR of a CRLF line */
+    char* s = nova_fat_str_create(buf, len);
+    free(buf);
+    return (int64_t)(uintptr_t)(s ? s : nova_fat_str_create("", 0));
+}
+
+/* file_write(h, s) -> bytes written, or -1 on error. */
+int64_t nova_rt_file_write(int64_t h, int64_t s_val) {
+    FILE* f = nova_file_get(h);
+    if (!f) { nova_set_error("file_write: invalid handle"); return -1; }
+    const char* s = (const char*)(uintptr_t)s_val;
+    if (!s) return 0;
+    size_t len = strlen(s);
+    if (len == 0) return 0;
+    size_t nw = fwrite(s, 1, len, f);
+    if (nw != len) { nova_set_error("file_write: short write"); return -1; }
+    return (int64_t)nw;
+}
+
+/* file_eof(h) -> 1 if the end-of-file indicator is set, else 0. */
+int64_t nova_rt_file_eof(int64_t h) {
+    FILE* f = nova_file_get(h);
+    if (!f) { nova_set_error("file_eof: invalid handle"); return 1; }
+    return feof(f) ? 1 : 0;
+}
+
+/* file_seek(h, offset) -> 0 on success, -1 on error. Absolute, from start. */
+int64_t nova_rt_file_seek(int64_t h, int64_t off) {
+    FILE* f = nova_file_get(h);
+    if (!f) { nova_set_error("file_seek: invalid handle"); return -1; }
+    if (off < 0) { nova_set_error("file_seek: negative offset"); return -1; }
+#ifdef _WIN32
+    if (_fseeki64(f, off, SEEK_SET) != 0) { nova_set_error("file_seek: failed"); return -1; }
+#else
+    if (fseeko(f, (off_t)off, SEEK_SET) != 0) { nova_set_error("file_seek: failed"); return -1; }
+#endif
+    return 0;
+}
+
+/* file_tell(h) -> current byte offset, or -1 on error. */
+int64_t nova_rt_file_tell(int64_t h) {
+    FILE* f = nova_file_get(h);
+    if (!f) { nova_set_error("file_tell: invalid handle"); return -1; }
+#ifdef _WIN32
+    int64_t pos = _ftelli64(f);
+#else
+    int64_t pos = (int64_t)ftello(f);
+#endif
+    return pos;
+}
+
+/* file_flush(h) -> 0 on success, -1 on error (durably commit buffered writes). */
+int64_t nova_rt_file_flush(int64_t h) {
+    FILE* f = nova_file_get(h);
+    if (!f) { nova_set_error("file_flush: invalid handle"); return -1; }
+    return fflush(f) == 0 ? 0 : -1;
+}
+
+/* file_close(h) -> 0 on success, -1 on error. Frees the slot; a second close of
+ * the same handle is reported (error flag) rather than double-closing the FILE*. */
+int64_t nova_rt_file_close(int64_t h) {
+    if (h < 1 || h > NOVA_MAX_FILES) { nova_set_error("file_close: invalid handle"); return -1; }
+    nova_file_ensure_init();
+    nova_file_lock();
+    FILE* f = nova_file_table[h - 1];
+    nova_file_table[h - 1] = NULL;
+    nova_file_unlock();
+    if (!f) { nova_set_error("file_close: handle already closed"); return -1; }
+    return fclose(f) == 0 ? 0 : -1;
+}
+
 int64_t nova_rt_str_char_at(int64_t str_val, int64_t index) {
     const char* s = (const char*)(uintptr_t)str_val;
     if (!s) return (int64_t)(uintptr_t)"";
