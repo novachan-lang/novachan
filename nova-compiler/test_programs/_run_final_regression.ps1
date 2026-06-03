@@ -124,7 +124,8 @@ $domain_tests = @(
     'datex',
     'file_handle_test',
     'typed_let_test',
-    'graphx'
+    'graphx',
+    'httpx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
