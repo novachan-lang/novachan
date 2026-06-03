@@ -140,7 +140,8 @@ $domain_tests = @(
     'multiclause_test',
     'variadics_test',
     'scanx',
-    'parsex'
+    'parsex',
+    'intfloat_mixed_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

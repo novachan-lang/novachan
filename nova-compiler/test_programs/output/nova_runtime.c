@@ -460,11 +460,11 @@ int64_t nova_rt_unbox(int64_t handle) {
    is float bits. (Same discriminator as nova_is_likely_float, defined locally so it
    is usable this early in the file.) Mirrors how list_get/index_get treat elements. */
 static int nova_elem_is_float(int64_t elem) {
+    /* Collection floats/bools are boxed (literals, push, index-set, json_decode,
+       lambda/map results). So a BOX float is a float; any raw element is an int —
+       no unsound magnitude heuristic (which misfired on large ints). */
     if (nova_is_box(elem)) return ((NovaBox*)(uintptr_t)elem)->kind == NOVA_BOX_FLOAT;
-    if (elem == 0) return 0;
-    if (elem > -(1LL << 52) && elem < (1LL << 52)) return 0;
-    uint64_t expo = ((uint64_t)elem >> 52) & 0x7FF;
-    return (expo > 0 && expo < 0x7FF);
+    return 0;
 }
 
 static double nova_elem_to_double(int64_t elem) {
@@ -883,6 +883,7 @@ int64_t nova_rt_len_any(int64_t handle) {
 }
 
 int64_t nova_rt_any_to_str(int64_t val); /* forward decl */
+int64_t nova_rt_elem_to_str(int64_t val); /* fwd: heuristic-free collection element render */
 
 int64_t nova_rt_list_to_str(int64_t handle) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
@@ -892,7 +893,7 @@ int64_t nova_rt_list_to_str(int64_t handle) {
     buf[pos++] = '[';
     for (int64_t i = 0; i < list->size; i++) {
         if (i > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
-        int64_t s = nova_rt_any_to_str(list->data[i]);
+        int64_t s = nova_rt_elem_to_str(list->data[i]);
         const char* elem = (const char*)(uintptr_t)s;
         size_t n = strlen(elem);
         NovaMemTag etag = nova_mem_find_tag((void*)(uintptr_t)list->data[i]);
@@ -2437,6 +2438,31 @@ int64_t nova_rt_any_to_str(int64_t val) {
             }
             return nova_rt_int_to_str(val);
     }
+}
+
+/* Heuristic-free renderer for a COLLECTION element (list_to_str uses this). The
+   element is read straight from storage, where floats/bools are boxed, so a raw
+   value is unambiguously an int — no magnitude heuristic (which misfired on large
+   ints in mixed lists). Scalar nova_rt_any_to_str keeps the heuristic for the
+   rarer case of an unboxed float pulled out of a collection and printed directly. */
+int64_t nova_rt_elem_to_str(int64_t val) {
+    if (val == 0) return nova_rt_int_to_str(0);
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_BOX) {
+        NovaBox* bx = (NovaBox*)ptr;
+        if (bx->kind == NOVA_BOX_BOOL) return nova_rt_create_string((void*)(bx->payload ? "true" : "false"));
+        return nova_rt_float_to_str(bx->payload);
+    }
+    if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR) return val;
+    if (tag == NOVA_MEM_LIST) return nova_rt_list_to_str(val);
+    if (tag == NOVA_MEM_DICT) return nova_rt_json_stringify(val);
+    if (tag == NOVA_MEM_STRUCT) return (int64_t)(uintptr_t)"<struct>";
+    if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
+        unsigned char c = *(unsigned char*)ptr;
+        if (c == 0 || (c >= 0x20 && c < 0x7F)) return val;
+    }
+    return nova_rt_int_to_str(val);   /* raw scalar in a collection = int */
 }
 
 int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {
