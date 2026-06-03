@@ -1333,14 +1333,18 @@ int64_t nova_rt_list_slice(int64_t handle, int64_t start, int64_t end) {
     return new_list;
 }
 
+int64_t nova_rt_eq(int64_t a, int64_t b);  /* fwd decl: value equality (def below) */
+
 int64_t nova_rt_contains(int64_t container, int64_t item) {
     if (container == 0) return 0;
     void* ptr = (void*)(uintptr_t)container;
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_LIST) {
         NovaList* l = (NovaList*)ptr;
+        /* value equality (not raw pointer/identity) so membership works for
+           boxed floats/bools, structs, nested lists and computed strings. */
         for (int64_t i = 0; i < l->size; i++) {
-            if (l->data[i] == item) return 1;
+            if (nova_rt_eq(l->data[i], item)) return 1;
         }
         return 0;
     }
@@ -2447,6 +2451,12 @@ int64_t nova_rt_print_float(int64_t bits) {
 }
 
 int64_t nova_rt_eq(int64_t a, int64_t b) {
+    /* Unbox boxed scalars (NovaBox float/bool) so two equal floats compare equal
+       regardless of how each was produced (literal=raw bits vs push/dict-set=boxed).
+       For every non-box value nova_rt_unbox is a tag-checked no-op, so this only
+       fixes boxed scalars and never changes existing int/string/list/struct eq. */
+    a = nova_rt_unbox(a);
+    b = nova_rt_unbox(b);
     if (a == b) return 1;
     void* pa = (void*)(uintptr_t)a;
     void* pb = (void*)(uintptr_t)b;
@@ -6099,6 +6109,10 @@ int64_t nova_rt_list_dir(int64_t path_ptr) {
 }
 
 int64_t nova_rt_hash(int64_t val) {
+    /* Unbox first so a boxed float/bool hashes identically to its raw form —
+       keeps hash consistent with nova_rt_eq (equal values hash equal) for dict
+       keys and set membership. Tag-checked no-op for every non-box value. */
+    val = nova_rt_unbox(val);
     if (val == 0) return 0;
     void* ptr = (void*)(uintptr_t)val;
     NovaMemTag tag = nova_mem_find_tag(ptr);
