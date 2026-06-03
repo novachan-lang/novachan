@@ -1057,27 +1057,48 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
             let first_r = parse_expr(tokens, p, 0, pe)
             p = first_r.pos
             if tk(tokens, p) == "KW" and tv(tokens, p) == "for"
-                p = p + 1
-                let cvar = tv(tokens, p)
-                p = p + 1
-                p = expect(tokens, p, "in", pe)
-                let iter_r = parse_expr(tokens, p, 0, pe)
-                p = iter_r.pos
-                let has_cond = 0
-                let cond_e = null_expr()
-                if tk(tokens, p) == "KW" and tv(tokens, p) == "if"
+                // One or more generator clauses, each: `for VAR in ITER (if COND)*`.
+                // Desugars (parse-time, no new IR) to nested flatten(map(...)) reusing
+                // the map/filter/flatten builtins:
+                //   [e for x in xs]                -> map(xs, fn(x) e)
+                //   [e for x in xs if c]           -> map(filter(xs, fn(x) c), fn(x) e)
+                //   [e for x in xs for y in ys]    -> flatten(map(xs, fn(x) map(ys, fn(y) e)))
+                // A filter binds to the generator it follows.
+                let cvars = []
+                let citers = []
+                let cfilters = []
+                while tk(tokens, p) == "KW" and tv(tokens, p) == "for"
                     p = p + 1
-                    let cond_r = parse_expr(tokens, p, 0, pe)
-                    cond_e = cond_r.expr
-                    p = cond_r.pos
-                    has_cond = 1
+                    let cvar = tv(tokens, p)
+                    p = p + 1
+                    p = expect(tokens, p, "in", pe)
+                    let iter_r = parse_expr(tokens, p, 0, pe)
+                    p = iter_r.pos
+                    let myfilters = []
+                    while tk(tokens, p) == "KW" and tv(tokens, p) == "if"
+                        p = p + 1
+                        let cond_r = parse_expr(tokens, p, 0, pe)
+                        push(myfilters, cond_r.expr)
+                        p = cond_r.pos
+                    push(cvars, cvar)
+                    push(citers, iter_r.expr)
+                    push(cfilters, myfilters)
                 p = expect(tokens, p, "]", pe)
-                let map_lambda = Expr("lambda", "", 0, [first_r.expr], [Expr("ident", cvar, 0, [], [], ln)], ln)
-                let source = iter_r.expr
-                if has_cond == 1
-                    let filt_lambda = Expr("lambda", "", 0, [cond_e], [Expr("ident", cvar, 0, [], [], ln)], ln)
-                    source = Expr("call", "filter", 0, [iter_r.expr, filt_lambda], [], ln)
-                ParseResult(Expr("call", "map", 0, [source, map_lambda], [], ln), p)
+                let nclauses = len(cvars)
+                let result = null_expr()
+                let idx = nclauses - 1
+                while idx >= 0
+                    let cv = cvars[idx]
+                    let src = citers[idx]
+                    for fcond in cfilters[idx]
+                        src = Expr("call", "filter", 0, [src, Expr("lambda", "", 0, [fcond], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                    if idx == nclauses - 1
+                        result = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [first_r.expr], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                    else
+                        let mapped = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [result], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                        result = Expr("call", "flatten", 0, [mapped], [], ln)
+                    idx = idx - 1
+                ParseResult(result, p)
             else
                 let elements = [first_r.expr]
                 while tv(tokens, p) != "]" and tk(tokens, p) != "EOF"

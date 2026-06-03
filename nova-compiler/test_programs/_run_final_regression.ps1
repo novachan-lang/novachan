@@ -153,7 +153,8 @@ $domain_tests = @(
     'cryptorand',
     'durx',
     'clockx',
-    'textblock_test'
+    'textblock_test',
+    'multigen_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
