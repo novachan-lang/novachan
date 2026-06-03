@@ -119,7 +119,8 @@ $domain_tests = @(
     'atom_test',
     'newtype_test',
     'decimalx',
-    'stralgo'
+    'stralgo',
+    'combinx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
