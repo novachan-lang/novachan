@@ -8777,6 +8777,49 @@ int64_t nova_rt_offheap_free(int64_t handle) {
     return 0;
 }
 
+/* ── Atomics (lock-free Atomic<int>) ──────────────────────────────────────────
+   The NOVA memory model: happens-before is a free consequence of channel
+   send/receive (deep-copy + mutex). For the rare lock-free shared counter, an
+   atomic int CELL: a NOVA_MEM_RAW cell (so deep_copy SHARES it across Processes,
+   like a channel) holding an int64 accessed via clang's __atomic_* builtins, which
+   lower to atomicrmw/cmpxchg with seq_cst ordering (no exposed weaker orderings —
+   simplicity). Real hardware atomicity, so concurrent Processes never lose updates. */
+int64_t nova_rt_atomic_new(int64_t v) {
+    int64_t* cell = (int64_t*)nova_heap_alloc(sizeof(int64_t), NOVA_MEM_RAW);
+    if (!cell) { nova_set_error("atomic_new: out of memory"); return 0; }
+    __atomic_store_n(cell, v, __ATOMIC_SEQ_CST);
+    return (int64_t)(uintptr_t)cell;
+}
+
+int64_t nova_rt_atomic_get(int64_t handle) {
+    int64_t* cell = (int64_t*)(uintptr_t)handle;
+    if (!cell) return 0;
+    return __atomic_load_n(cell, __ATOMIC_SEQ_CST);
+}
+
+int64_t nova_rt_atomic_set(int64_t handle, int64_t v) {
+    int64_t* cell = (int64_t*)(uintptr_t)handle;
+    if (!cell) return 0;
+    __atomic_store_n(cell, v, __ATOMIC_SEQ_CST);
+    return 0;
+}
+
+/* atomic fetch-and-add; returns the NEW value (post-increment). */
+int64_t nova_rt_atomic_add(int64_t handle, int64_t delta) {
+    int64_t* cell = (int64_t*)(uintptr_t)handle;
+    if (!cell) return 0;
+    return __atomic_add_fetch(cell, delta, __ATOMIC_SEQ_CST);
+}
+
+/* compare-and-swap: if *cell == expect, set to newv and return 1; else return 0. */
+int64_t nova_rt_atomic_cas(int64_t handle, int64_t expect, int64_t newv) {
+    int64_t* cell = (int64_t*)(uintptr_t)handle;
+    if (!cell) return 0;
+    int64_t exp = expect;
+    return __atomic_compare_exchange_n(cell, &exp, newv, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+}
+
 /* ── Recursive directory walk ────────────────────────────────────────────── */
 
 int64_t nova_rt_dir_walk(int64_t path_val) {

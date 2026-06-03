@@ -159,7 +159,8 @@ $domain_tests = @(
     'ptestx',
     'fnval_test',
     'mmap_test',
-    'offheap_test'
+    'offheap_test',
+    'atomicx_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
