@@ -8599,6 +8599,22 @@ int64_t nova_rt_random_bytes(int64_t n) {
     return (int64_t)(uintptr_t)buf;
 }
 
+/* Secure random bytes as a proper length-carrying bytes buffer (NovaBytes), so
+   embedded NUL bytes are preserved (unlike the string-returning random_bytes, which
+   truncates at the first NUL) and bytes_get/bytes_len work directly. Same CSPRNG
+   (CryptGenRandom / /dev/urandom). This is the clean secure-bytes API; random_bytes
+   stays as-is for its existing string callers. */
+int64_t nova_rt_secure_bytes(int64_t n) {
+    if (n < 0 || n > 1048576) n = 0;
+    int64_t result = nova_rt_bytes_create(n);
+    NovaBytes* b = (NovaBytes*)(uintptr_t)result;
+    if (b && b->data && n > 0) {
+        nova_secure_random_bytes(b->data, (size_t)n);
+        b->size = n;
+    }
+    return result;
+}
+
 /* ── Recursive directory walk ────────────────────────────────────────────── */
 
 int64_t nova_rt_dir_walk(int64_t path_val) {
