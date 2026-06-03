@@ -1612,6 +1612,11 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
                     else if tkk == "IDENT"
                         type_ann = type_ann + tvv
                     p = p + 1
+        // variadic rest param: `name: T...` -> the param is a list<T> that collects
+        // the trailing call arguments (lexer yields DOTDOT then DOT for "...").
+        if tk(tokens, p) == "DOTDOT" and tk(tokens, p + 1) == "DOT"
+            type_ann = type_ann + "..."
+            p = p + 2
         if tk(tokens, p) == "ASSIGN"
             p = p + 1
             let def_r = parse_expr(tokens, p, 0, pe)
@@ -5440,6 +5445,34 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     else
                         push(arg_regs, ir_lower_expr(b, child))
                     ci = ci + 1
+                // variadic call: if the callee's last param is a rest param (`T...`),
+                // pack the trailing args into a single list and pass it as that param.
+                if contains(b.ir_fn_defaults, fn_name)
+                    let vp = b.ir_fn_defaults[fn_name]
+                    let vnp = len(vp)
+                    if vnp > 0
+                        let v_is_var = false
+                        match vp[vnp - 1]
+                            Param(vpn2, vpt2, vpd2) =>
+                                if ends_with(vpt2, "...")
+                                    v_is_var = true
+                        if v_is_var
+                            let v_fix = vnp - 1
+                            if len(arg_regs) >= v_fix
+                                let v_packed = []
+                                let v_i = 0
+                                while v_i < v_fix
+                                    push(v_packed, arg_regs[v_i])
+                                    v_i = v_i + 1
+                                let v_rest = []
+                                let v_r = v_fix
+                                while v_r < len(arg_regs)
+                                    push(v_rest, arg_regs[v_r])
+                                    v_r = v_r + 1
+                                let v_lreg = ir_fresh_reg(b)
+                                ir_emit_inst(b, "make_list", v_lreg, ir_type_list(), v_rest, "", len(v_rest))
+                                push(v_packed, v_lreg)
+                                arg_regs = v_packed
                 if contains(b.ir_fn_defaults, fn_name)
                     let def_params = b.ir_fn_defaults[fn_name]
                     let di = len(arg_regs)
@@ -6883,6 +6916,7 @@ type TiState
     ti_opaque_types: dict
     ti_trait_defaults: dict
     ti_aliases: dict
+    ti_variadic: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -6944,7 +6978,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -8020,6 +8054,9 @@ fn ti_split_type_args(args: string) -> list
     parts
 
 fn ti_ann_to_type_g(st: TiState, ann: string, gmap: dict) -> NType
+    // A variadic rest param `T...` is a list<T> inside the function body.
+    if ends_with(ann, "...")
+        return nt_list(ti_ann_to_type_g(st, slice(ann, 0, len(ann) - 3), gmap))
     if contains(gmap, ann)
         return gmap[ann]
     // Resolve transparent type aliases (type Name = Target) before any
@@ -8119,6 +8156,24 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                 while ai < len(children)
                     push(arg_types, ti_infer_expr(st, children[ai]))
                     ai = ai + 1
+                // variadic call: collapse trailing args into the rest param's list<T>
+                // (each extra arg unified with the element type), so the fn type with
+                // (fixed+1) params unifies against (fixed + 1 list) actuals.
+                if contains(st.ti_variadic, value)
+                    let v_fixed = st.ti_variadic[value]
+                    if len(arg_types) >= v_fixed
+                        let v_restT = ti_fresh(st)
+                        let v_collapsed = []
+                        let vk = 0
+                        while vk < v_fixed
+                            push(v_collapsed, arg_types[vk])
+                            vk = vk + 1
+                        let vr = v_fixed
+                        while vr < len(arg_types)
+                            ti_constrain(st, v_restT, arg_types[vr], eline)
+                            vr = vr + 1
+                        push(v_collapsed, nt_list(v_restT))
+                        arg_types = v_collapsed
                 if contains(st.ti_min_arity, value)
                     let full_ar = 0
                     match fn_t
@@ -8466,6 +8521,14 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                     if mdt == "null"
                                         min_ar = min_ar + 1
                 st.ti_min_arity[name] = min_ar
+                // variadic fn: last param `T...` -> rest is optional, so min = fixed count
+                if len(params) > 0
+                    match params[len(params) - 1]
+                        Param(vpn, vpt, vpd) =>
+                            if ends_with(vpt, "...")
+                                let fixed_ar = len(params) - 1
+                                st.ti_variadic[name] = fixed_ar
+                                st.ti_min_arity[name] = fixed_ar
                 st.ti_in_fn = saved_fn
                 return nt_unit()
             if tag == "extern_fn"
