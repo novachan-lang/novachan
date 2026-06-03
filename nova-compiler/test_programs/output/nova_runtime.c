@@ -1715,6 +1715,25 @@ int64_t nova_rt_dict_values(int64_t handle) {
     return list;
 }
 
+/* Build a dict from a list of [key, value] pairs (each a 2-element list) — backs the
+   dict-comprehension {k: v for ...} desugar. dict_set RC-incs what it stores, so the
+   freshly-built pair list can be released normally afterward. Keys are strings, like
+   all NOVA dict keys. */
+int64_t nova_rt_dict_from_pairs(int64_t pairs_handle) {
+    int64_t d = nova_rt_dict_create();
+    NovaList* pairs = (NovaList*)(uintptr_t)pairs_handle;
+    if (!pairs) return d;
+    for (int64_t i = 0; i < pairs->size; i++) {
+        void* pp = (void*)(uintptr_t)pairs->data[i];
+        if (nova_mem_find_tag(pp) == NOVA_MEM_LIST) {
+            NovaList* pair = (NovaList*)pp;
+            if (pair->size >= 2)
+                nova_rt_dict_set(d, pair->data[0], pair->data[1]);
+        }
+    }
+    return d;
+}
+
 int64_t nova_rt_dict_items(int64_t handle) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     int64_t list = nova_rt_list_create();

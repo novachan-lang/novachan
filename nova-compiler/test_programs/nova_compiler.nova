@@ -1113,23 +1113,70 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
                 p = expect(tokens, p, "]", pe)
                 ParseResult(Expr("list", "", 0, elements, [], ln), p)
     else if kind == "DELIM" and val == "\{"
-        // Dict literal
-        let entries = []
+        // Dict literal OR dict comprehension {k: v for x in xs (if c)* (for ...)*}.
         let p = pos + 1
-        while tv(tokens, p) != "\}" and tk(tokens, p) != "EOF"
-            if len(entries) > 0
-                p = expect(tokens, p, ",", pe)
-                if tv(tokens, p) == "\}" or tk(tokens, p) == "EOF"
-                    break
-            let key_r = parse_expr(tokens, p, 0, pe)
-            p = expect(tokens, key_r.pos, ":", pe)
-            let val_r = parse_expr(tokens, p, 0, pe)
-            push(entries, Expr("pair", "", 0, [key_r.expr, val_r.expr], [], ln))
-            if val_r.pos <= p
-                break
-            p = val_r.pos
-        p = expect(tokens, p, "\}", pe)
-        ParseResult(Expr("dict", "", 0, entries, [], ln), p)
+        if tv(tokens, p) == "\}"
+            ParseResult(Expr("dict", "", 0, [], [], ln), p + 1)
+        else
+            let key0 = parse_expr(tokens, p, 0, pe)
+            p = expect(tokens, key0.pos, ":", pe)
+            let val0 = parse_expr(tokens, p, 0, pe)
+            p = val0.pos
+            if tk(tokens, p) == "KW" and tv(tokens, p) == "for"
+                // Dict comprehension: build [k, v] pairs via the SAME nested
+                // flatten(map(filter ...)) desugar as list comprehensions, then fold
+                // them into a dict with dict_from_pairs.
+                let cvars = []
+                let citers = []
+                let cfilters = []
+                while tk(tokens, p) == "KW" and tv(tokens, p) == "for"
+                    p = p + 1
+                    let cvar = tv(tokens, p)
+                    p = p + 1
+                    p = expect(tokens, p, "in", pe)
+                    let iter_r = parse_expr(tokens, p, 0, pe)
+                    p = iter_r.pos
+                    let myfilters = []
+                    while tk(tokens, p) == "KW" and tv(tokens, p) == "if"
+                        p = p + 1
+                        let cond_r = parse_expr(tokens, p, 0, pe)
+                        push(myfilters, cond_r.expr)
+                        p = cond_r.pos
+                    push(cvars, cvar)
+                    push(citers, iter_r.expr)
+                    push(cfilters, myfilters)
+                p = expect(tokens, p, "\}", pe)
+                let pairexpr = Expr("list", "", 0, [key0.expr, val0.expr], [], ln)
+                let nclauses = len(cvars)
+                let result = null_expr()
+                let idx = nclauses - 1
+                while idx >= 0
+                    let cv = cvars[idx]
+                    let src = citers[idx]
+                    for fcond in cfilters[idx]
+                        src = Expr("call", "filter", 0, [src, Expr("lambda", "", 0, [fcond], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                    if idx == nclauses - 1
+                        result = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [pairexpr], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                    else
+                        let mapped = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [result], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                        result = Expr("call", "flatten", 0, [mapped], [], ln)
+                    idx = idx - 1
+                ParseResult(Expr("call", "dict_from_pairs", 0, [result], [], ln), p)
+            else
+                let entries = [Expr("pair", "", 0, [key0.expr, val0.expr], [], ln)]
+                while tv(tokens, p) != "\}" and tk(tokens, p) != "EOF"
+                    p = expect(tokens, p, ",", pe)
+                    if tv(tokens, p) == "\}" or tk(tokens, p) == "EOF"
+                        break
+                    let key_r = parse_expr(tokens, p, 0, pe)
+                    p = expect(tokens, key_r.pos, ":", pe)
+                    let val_r = parse_expr(tokens, p, 0, pe)
+                    push(entries, Expr("pair", "", 0, [key_r.expr, val_r.expr], [], ln))
+                    if val_r.pos <= p
+                        break
+                    p = val_r.pos
+                p = expect(tokens, p, "\}", pe)
+                ParseResult(Expr("dict", "", 0, entries, [], ln), p)
     else if kind == "INTERP_START"
         let parts = []
         push(parts, Expr("str", val, 0, [], [], ln))
@@ -3424,6 +3471,8 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_list_dir"
     else if name == "hash"
         "nova_rt_hash"
+    else if name == "dict_from_pairs"
+        "nova_rt_dict_from_pairs"
     else if name == "flatten"
         "nova_rt_flatten"
     else if name == "list_create_filled"
@@ -4365,6 +4414,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_secure_bytes(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_dir_walk(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_flatten(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dict_from_pairs(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_create_filled(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_pmap(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_pfilter(i64, i64) nounwind")
@@ -7672,6 +7722,7 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["pad_left"] = NTypeScheme([], nt_fn([nt_string(), nt_int(), nt_int()], nt_string()))
     reg["pad_right"] = NTypeScheme([], nt_fn([nt_string(), nt_int(), nt_int()], nt_string()))
     reg["flatten"] = NTypeScheme([-1], nt_fn([nt_list(nt_list(T))], nt_list(T)))
+    reg["dict_from_pairs"] = NTypeScheme([-1, -2], nt_fn([nt_list(nt_list(nt_any()))], nt_dict(nt_string(), U)))
     reg["hash"] = NTypeScheme([-1], nt_fn([T], nt_int()))
     reg["sha256"] = NTypeScheme([], nt_fn([nt_string()], nt_string()))
     reg["sha256_bytes"] = NTypeScheme([], nt_fn([nt_any(), nt_int()], nt_string()))
@@ -12260,6 +12311,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_secure_bytes(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_dir_walk(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_flatten(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dict_from_pairs(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_pmap(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_pfilter(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_pfor(i64, i64, i64) nounwind")
