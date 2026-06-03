@@ -1,0 +1,111 @@
+// cmapx — concurrent map, the NOVA way (process-owned state, not lock-striping).
+//
+// A ConcurrentHashMap in C/Java/Go needs lock striping or CAS loops because many
+// threads touch one shared dict. NOVA has no shared mutable memory, so that whole
+// class of bug (torn reads, lost updates, lock-ordering deadlock) cannot exist here.
+// A concurrent map is simply a PROCESS that owns a private dict; every reader/writer
+// sends it a message and the process serializes them. Process isolation IS the
+// synchronization — zero locks, zero data races, by construction (Erlang's ETS /
+// Elixir's Agent, expressed through Values + Processes + Channels).
+//
+// op codes: 0=stop 1=put 2=get 3=has 4=size 5=keys ; request = [op, key, val, reply]
+
+fn cmap_new()
+    let req = channel()
+    spawn fn()
+        let m = {}
+        let go = 1
+        while go == 1
+            let env = receive(req)
+            let op = env[0]
+            if op == 0
+                go = 0
+            else if op == 1
+                m[env[1]] = env[2]
+                send(env[3], 1)
+            else if op == 2
+                if contains(m, env[1])
+                    send(env[3], [1, m[env[1]]])
+                else
+                    send(env[3], [0, 0])
+            else if op == 3
+                if contains(m, env[1])
+                    send(env[3], 1)
+                else
+                    send(env[3], 0)
+            else if op == 4
+                send(env[3], len(m))
+            else if op == 5
+                send(env[3], keys(m))
+    return req
+
+fn cmap_put(cm, k, v)
+    let rch = channel()
+    send(cm, [1, k, v, rch])
+    return receive(rch)
+
+fn cmap_get(cm, k)
+    let rch = channel()
+    send(cm, [2, k, 0, rch])
+    return receive(rch)          // [found, value]
+
+fn cmap_has(cm, k)
+    let rch = channel()
+    send(cm, [3, k, 0, rch])
+    return receive(rch)
+
+fn cmap_size(cm)
+    let rch = channel()
+    send(cm, [4, 0, 0, rch])
+    return receive(rch)
+
+fn cmap_keys(cm)
+    let rch = channel()
+    send(cm, [5, 0, 0, rch])
+    return receive(rch)
+
+fn cmap_stop(cm)
+    let dummy = channel()
+    send(cm, [0, 0, 0, dummy])
+    return 0
+
+fn main()
+    let m = cmap_new()
+    cmap_put(m, "a", 10)
+    cmap_put(m, "b", 20)
+    assert_eq(cmap_has(m, "a"), 1)
+    assert_eq(cmap_has(m, "z"), 0)
+    let g = cmap_get(m, "b")
+    assert_eq(g[0], 1)
+    assert_eq(g[1], 20)
+    assert_eq(cmap_size(m), 2)
+    cmap_put(m, "a", 99)
+    let g2 = cmap_get(m, "a")
+    assert_eq(g2[1], 99)
+    let miss = cmap_get(m, "nope")
+    assert_eq(miss[0], 0)
+
+    // concurrent writers: 3 processes each insert a distinct key; the owning
+    // process serializes the writes (no locks). Barrier on a done channel, then
+    // the map holds all of them.
+    let done = channel()
+    cmap_put(m, "w0", 0)
+    spawn fn()
+        cmap_put(m, "x1", 1)
+        send(done, 1)
+    spawn fn()
+        cmap_put(m, "x2", 2)
+        send(done, 1)
+    spawn fn()
+        cmap_put(m, "x3", 3)
+        send(done, 1)
+    let d = 0
+    while d < 3
+        receive(done)
+        d = d + 1
+    // a, b, w0, x1, x2, x3 = 6 keys
+    assert_eq(cmap_size(m), 6)
+    assert_eq(cmap_get(m, "x2")[1], 2)
+
+    cmap_stop(m)
+    print("cmapx passed")

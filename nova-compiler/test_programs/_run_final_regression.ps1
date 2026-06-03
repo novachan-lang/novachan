@@ -146,7 +146,8 @@ $domain_tests = @(
     'actorx',
     'supx',
     'optional_test',
-    'lockx'
+    'lockx',
+    'cmapx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
