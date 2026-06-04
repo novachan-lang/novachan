@@ -374,9 +374,9 @@ switch ($Command) {
     "bench"   { Nova-Bench -Path ($Args | Select-Object -First 1) }
     "version" { Nova-Version }
     "help"    {
-        Write-Host "NOVA $NovaVersion — Universal Future Computing Language"
+        Write-Host "NOVA $NovaVersion -- Universal Future Computing Language"
         Write-Host ""
-        Write-Host "Usage: nova <command> [args]"
+        Write-Host 'Usage: nova [command] [args]'
         Write-Host ""
         Write-Host "Commands:"
         Write-Host "  build [file]    Compile a NOVA program to native binary"
@@ -384,7 +384,7 @@ switch ($Command) {
         Write-Host "  test [path]     Run all *_test.nova files"
         Write-Host "  check [file]    Type-check without building"
         Write-Host "  fmt [file]      Format source code"
-        Write-Host "  new <name>      Create new project"
+        Write-Host '  new [name]      Create new project'
         Write-Host "  clean           Remove build artifacts"
         Write-Host "  bench [path]    Run benchmarks"
         Write-Host "  version         Show version info"
@@ -392,11 +392,11 @@ switch ($Command) {
     default {
         if ($Command) {
             Write-Host "Unknown command: $Command"
-            Write-Host "Run 'nova help' for usage."
+            Write-Host 'Run "nova help" for usage.'
             exit 1
         } else {
             Write-Host "NOVA $NovaVersion"
-            Write-Host "Run 'nova help' for usage."
+            Write-Host 'Run "nova help" for usage.'
         }
     }
 }

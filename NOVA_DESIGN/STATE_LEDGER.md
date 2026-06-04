@@ -2,7 +2,7 @@
 
 **Purpose:** The honest, evidence-verified record of what is COMPLETED vs NOT in NOVA
 today. Built by auditing the self-hosted codebase (`nova_compiler.nova`,
-`output/nova_runtime.c`, the **172-test** regression suite, `docs/`) against an external
+`output/nova_runtime.c`, the **173-test** regression suite, `docs/`) against an external
 critique. Every line below was checked against real files, not memory.
 
 **2026-06-02 update:** a 22-agent evidence audit + independent re-verification corrected the

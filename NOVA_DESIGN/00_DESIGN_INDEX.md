@@ -68,6 +68,8 @@ These were originally "unsolved" problems. The unified model resolves them in pr
 ## Framework Ecosystem Strategy
 
 - [FRAMEWORK_ECOSYSTEM_STRATEGY.md](FRAMEWORK_ECOSYSTEM_STRATEGY.md) — Complete strategic architecture for 9 frameworks (Forge, Reactor, Cortex, Mesh, Prism, Pulse, Sentinel, Edge, Ops), Nova Vault package registry, cloud platform monetization, competitive positioning, 10-year horizon, and adoption strategy.
+- [FORGE_MASTER_PLAN.md](FORGE_MASTER_PLAN.md) — ★ CANONICAL BUILD PLAN for NOVA's web framework. Every feature from Spring Boot/Django/Rails/Phoenix/Go/ASP.NET/FastAPI, why each matters, how Forge beats them, language gaps to fix first, realistic 9–12 month phased sequence, feature scorecard. **This is the framework we build first.**
+- [FORGE_ARCHITECTURE.md](FORGE_ARCHITECTURE.md) — ★ CANONICAL ARCHITECTURE + PROJECT STRUCTURE for Forge. The governing thesis (compile-time derivation from types), 10 design principles, the 3 Crown Jewels (zero-config real-time auto-admin, server-driven UI, lean WASM frontend), the folder structure (both the user's `nova forge new` app AND Forge's own internal modules), the complete 25-subsystem definition (what/from-whom/NOVA-way/priority), the `nova forge` CLI, the request lifecycle, what's missing, and the future roadmap. Built from exhaustive verified inventories of Django 5/6, Spring Boot 3/4, Go ecosystem, Rails 8, Phoenix, Laravel 12, ASP.NET Core 10, FastAPI.
 
 ## Master Execution Plan
 
