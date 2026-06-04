@@ -164,7 +164,8 @@ $domain_tests = @(
     'futurex',
     'nurseryx',
     'webx',
-    'seqx'
+    'seqx',
+    'rchanx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
