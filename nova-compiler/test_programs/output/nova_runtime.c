@@ -113,6 +113,20 @@ int64_t nova_rt_panic(int64_t msg_ptr) {
     return 0;                                 /* unreachable */
 }
 
+/* Capture a spawned Process's exit reason as a stable heap string: the panic message
+   (thread-local __nova_error_msg, set by nova_panic on this worker) for a crash, or
+   "normal" for a clean exit. Erlang-style {DOWN, reason}; read via exit_reason(p). */
+static int64_t nova_make_reason(int crashed) {
+    const char* s = "normal";
+    if (crashed)
+        s = (__nova_error_msg != 0) ? (const char*)(uintptr_t)__nova_error_msg : "crashed";
+    size_t n = strlen(s);
+    char* c = (char*)malloc(n + 1);
+    if (!c) return 0;
+    memcpy(c, s, n + 1);
+    return (int64_t)(uintptr_t)c;
+}
+
 /* ─�� Slab Allocator (fast fixed-size pools for hot-path objects) ──────────── */
 
 #define SLAB_32_OBJ_SIZE  32
@@ -3117,6 +3131,7 @@ typedef struct {
     int64_t  monitor_cap;
     volatile int64_t finished;
     int64_t  exit_status;
+    int64_t  exit_reason;   /* heap string: WHY it exited ("normal" / panic msg); 0 = none */
 #ifdef _WIN32
     CRITICAL_SECTION lock;
 #else
@@ -3220,6 +3235,7 @@ static DWORD WINAPI nova_pool_worker(LPVOID arg) {
 
             EnterCriticalSection(&proc->lock);
             proc->exit_status = nova_proc_crashed ? 1 : 0;
+            proc->exit_reason = nova_make_reason(nova_proc_crashed);
             for (int64_t i = 0; i < proc->monitor_count; i++)
                 nova_rt_channel_send(proc->monitors[i], proc->exit_status);
             proc->finished = 1;
@@ -3274,6 +3290,7 @@ static void* nova_pool_worker(void* arg) {
 
             pthread_mutex_lock(&proc->lock);
             proc->exit_status = nova_proc_crashed ? 1 : 0;
+            proc->exit_reason = nova_make_reason(nova_proc_crashed);
             for (int64_t i = 0; i < proc->monitor_count; i++)
                 nova_rt_channel_send(proc->monitors[i], proc->exit_status);
             proc->finished = 1;
@@ -3602,6 +3619,7 @@ int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
     proc->monitor_cap = 0;
     proc->finished = 0;
     proc->exit_status = 0;
+    proc->exit_reason = 0;
 
 #ifdef _WIN32
     InitializeCriticalSection(&proc->lock);
@@ -3685,6 +3703,18 @@ int64_t nova_rt_monitor(int64_t proc_handle) {
     pthread_mutex_unlock(&proc->lock);
 #endif
     return ch;
+}
+
+/* exit_reason(p): WHY a Process exited — "normal", or the panic message for a contained
+   crash. Pairs with monitor(p) (which reports THAT it exited): a supervisor can log/decide
+   on the reason. Returns "" if the process has not exited yet (or is unknown). */
+int64_t nova_rt_exit_reason(int64_t proc_handle) {
+    NovaProcessInfo* proc = (NovaProcessInfo*)(uintptr_t)proc_handle;
+    if (proc && proc->exit_reason != 0)
+        return proc->exit_reason;
+    char* e = (char*)malloc(1);
+    if (e) e[0] = '\0';
+    return (int64_t)(uintptr_t)e;
 }
 
 void nova_rt_wait_all(void) {
