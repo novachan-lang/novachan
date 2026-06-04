@@ -184,7 +184,8 @@ $domain_tests = @(
     'static_assert_test',
     'vmcast_test',
     'from_json_test',
-    'requires_test'
+    'requires_test',
+    'floatcast_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
