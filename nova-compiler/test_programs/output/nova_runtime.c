@@ -8820,6 +8820,38 @@ int64_t nova_rt_atomic_cas(int64_t handle, int64_t expect, int64_t newv) {
                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
 
+/* ── Platform identity (for conditional code by OS/arch) ───────────────────────
+   os_name()/arch_name() return the compile-time platform as a NOVA string, so
+   `if os_name() == "windows" ...` selects platform behaviour (both branches still
+   type-check — NOVA's win over textual #if). Heap-copied (like env) so == works. */
+static int64_t nova_platform_str(const char* s) {
+    size_t len = strlen(s);
+    char* copy = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!copy) return (int64_t)(uintptr_t)"";
+    memcpy(copy, s, len + 1);
+    return (int64_t)(uintptr_t)copy;
+}
+
+int64_t nova_rt_os_name(void) {
+#ifdef _WIN32
+    return nova_platform_str("windows");
+#elif defined(__APPLE__)
+    return nova_platform_str("macos");
+#else
+    return nova_platform_str("linux");
+#endif
+}
+
+int64_t nova_rt_arch_name(void) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return nova_platform_str("arm64");
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__amd64__)
+    return nova_platform_str("x86_64");
+#else
+    return nova_platform_str("unknown");
+#endif
+}
+
 /* ── Recursive directory walk ────────────────────────────────────────────── */
 
 int64_t nova_rt_dir_walk(int64_t path_val) {
