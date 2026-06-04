@@ -1378,6 +1378,20 @@ int64_t nova_rt_list_map(int64_t handle, int64_t closure) {
     return new_list;
 }
 
+/* map variant that BOXES each float result. The compiler routes map() here when the
+   mapped function is a NAMED fn with a float return (raw-float ABI) -- without boxing,
+   the result list holds raw float bits that render/serialize as ints. (Anonymous lambdas
+   already box their float return, so they keep using plain nova_rt_list_map.) */
+int64_t nova_rt_list_map_fbox(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t new_list = nova_rt_list_create();
+    for (int64_t i = 0; i < l->size; i++)
+        nova_rt_list_append(new_list, nova_rt_box_float(fn(closure, l->data[i])));
+    return new_list;
+}
+
 int64_t nova_rt_list_filter(int64_t handle, int64_t closure) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t* rec = (int64_t*)(uintptr_t)closure;

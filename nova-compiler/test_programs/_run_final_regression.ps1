@@ -186,7 +186,8 @@ $domain_tests = @(
     'from_json_test',
     'requires_test',
     'floatcast_test',
-    'exit_reason_test'
+    'exit_reason_test',
+    'mapfbox_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
