@@ -92,6 +92,10 @@ static void nova_reset_call_depth(void);     /* defined alongside g_stack_depth 
 
 void nova_panic(const char* msg) {
     if (msg && msg[0]) nova_set_error(msg);
+    /* automatic structured crash report (logfmt) — machine-parseable, on every fault
+       whether contained in a spawned Process or fatal on the main thread. */
+    fprintf(stderr, "level=ERROR event=fault detail=\"%s\"\n", msg ? msg : "unknown");
+    fflush(stderr);
     if (nova_fault_active) {
         nova_reset_call_depth();             /* longjmp skips the per-frame depth decrements */
         nova_proc_crashed = 1;
