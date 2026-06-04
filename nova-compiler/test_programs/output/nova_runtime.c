@@ -8911,6 +8911,38 @@ int64_t nova_rt_arch_name(void) {
 #endif
 }
 
+/* ── Exit hooks (at_exit) ─────────────────────────────────────────────────────
+   Register a closure to run at program exit (LIFO order, like C atexit) for cleanup
+   that must happen no matter how the program ends. Reuses the closure-call convention
+   (slot 0 = fn-ptr, invoked as fn(env, arg)); the closure is rc-pinned so it survives
+   until exit. */
+#define NOVA_MAX_ATEXIT 256
+static int64_t nova_atexit_hooks[NOVA_MAX_ATEXIT];
+static int     nova_atexit_count = 0;
+static int     nova_atexit_registered = 0;
+
+static void nova_run_atexit_hooks(void) {
+    for (int i = nova_atexit_count - 1; i >= 0; i--) {
+        int64_t closure = nova_atexit_hooks[i];
+        if (closure) {
+            nova_fn1 fn = (nova_fn1)(uintptr_t)((int64_t*)(uintptr_t)closure)[0];
+            fn(closure, 0);
+        }
+    }
+}
+
+int64_t nova_rt_at_exit(int64_t closure) {
+    if (nova_atexit_count < NOVA_MAX_ATEXIT) {
+        nova_rc_inc(closure);                            /* pin until program exit */
+        nova_atexit_hooks[nova_atexit_count++] = closure;
+    }
+    if (!nova_atexit_registered) {
+        atexit(nova_run_atexit_hooks);
+        nova_atexit_registered = 1;
+    }
+    return 0;
+}
+
 /* ── Recursive directory walk ────────────────────────────────────────────── */
 
 int64_t nova_rt_dir_walk(int64_t path_val) {
