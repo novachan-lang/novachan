@@ -168,7 +168,8 @@ $domain_tests = @(
     'rchanx',
     'osname_test',
     'crash_isolation_test',
-    'spawn_assign_body_test'
+    'spawn_assign_body_test',
+    'unitsx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
