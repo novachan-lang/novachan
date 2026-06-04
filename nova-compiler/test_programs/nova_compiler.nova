@@ -1820,18 +1820,22 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
         let guard_r = parse_expr(tokens, p, 0, pe)
         fn_guard = guard_r.expr
         p = guard_r.pos
-    // Optional design-by-contract preconditions: `requires <expr>` (contextual ident,
-    // repeatable). The genius compiler injects each as an assert at function entry —
-    // design-by-contract with zero ceremony. ('ensures' postconditions need return-value
-    // rewriting and are a tracked follow-up; reject them clearly rather than misparse.)
+    // Optional design-by-contract clauses (contextual idents, any order, repeatable):
+    // `requires <expr>` (precondition) and `ensures <expr>` (postcondition, where `result`
+    // names the return value). requires injects an entry assert here; ensures is carried on
+    // the fn (annotations) and lowered post-parse by inject_ensures (wrapper/impl split) so
+    // the postcondition is checked on EVERY return path with zero ceremony.
     let fn_requires = []
-    while tk(tokens, p) == "IDENT" and tv(tokens, p) == "requires"
+    let fn_ensures = []
+    while tk(tokens, p) == "IDENT" and (tv(tokens, p) == "requires" or tv(tokens, p) == "ensures")
+        let clause_kind = tv(tokens, p)
         p = p + 1
-        let req_r = parse_expr(tokens, p, 0, pe)
-        push(fn_requires, req_r.expr)
-        p = req_r.pos
-    if tk(tokens, p) == "IDENT" and tv(tokens, p) == "ensures"
-        p = syntax_error(tokens, p, "'ensures' (postconditions) are not yet supported; 'requires' (preconditions) are. Postconditions need return-value rewriting (tracked).", pe)
+        let clause_r = parse_expr(tokens, p, 0, pe)
+        if clause_kind == "requires"
+            push(fn_requires, clause_r.expr)
+        else
+            push(fn_ensures, clause_r.expr)
+        p = clause_r.pos
     let fn_col = 1
     let fn_tok = tokens[pos]
     match fn_tok
@@ -1886,6 +1890,9 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     let fn_else = []
     if fn_guard != null_expr()
         push(fn_else, Stmt("guard", "", fn_guard, [], [], [], [], ln))
+    // Carry postcondition exprs on the fn (annotations); inject_ensures lowers them post-parse.
+    if len(fn_ensures) > 0
+        push(annotations, Expr("ensures", "", 0, fn_ensures, [], ln))
     StmtParseResult(Stmt("fn", name, ret_expr, body, params, fn_else, annotations, ln), p2)
 
 fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
@@ -2489,6 +2496,50 @@ fn fuse_multiclause(stmts: list) -> list
                     push(out, s)
     out
 
+// Design-by-contract postconditions (`ensures <expr>`, where `result` names the return
+// value). For each fn carrying an "ensures" annotation, split it into <name>__ens_impl
+// (the original body, untouched) plus a thin WRAPPER under the original name that runs the
+// body, asserts each postcondition on `result`, and returns it. This checks the contract
+// on EVERY return path (early returns, nested returns, implicit last-expr) for free —
+// they all flow through the impl's single return value — with no return-rewriting. Runs
+// post-parse, before expand_derives. The compiler's own source has no `ensures`, so this
+// is a no-op for self-compilation (bootstrap-safe).
+fn inject_ensures(stmts: list) -> list
+    let out = []
+    for s in stmts
+        let handled = false
+        match s
+            Stmt(tag, name, ret_expr, body, params, fn_else, anns, sline) =>
+                if tag == "fn"
+                    let ens_exprs = []
+                    let other_anns = []
+                    for a in anns
+                        match a
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ensures"
+                                    for e in ac
+                                        push(ens_exprs, e)
+                                else
+                                    push(other_anns, a)
+                    if len(ens_exprs) > 0
+                        handled = true
+                        let impl_name = name + "__ens_impl"
+                        push(out, Stmt("fn", impl_name, ret_expr, body, params, fn_else, other_anns, sline))
+                        let arg_idents = []
+                        for pp in params
+                            match pp
+                                Param(ppn, ppt, ppd) =>
+                                    push(arg_idents, Expr("ident", ppn, 0, [], [], sline))
+                        let wbody = [Stmt("assign", "result", Expr("call", impl_name, 0, arg_idents, [], sline), [], [], [], [], sline)]
+                        for en in ens_exprs
+                            let en_msg = Expr("str", "postcondition failed in '" + name + "'", 0, [], [], sline)
+                            push(wbody, Stmt("expr", "", Expr("call", "assert", 0, [en, en_msg], [], sline), [], [], [], [], sline))
+                        push(wbody, Stmt("return", "", Expr("ident", "result", 0, [], [], sline), [], [], [], [], sline))
+                        push(out, Stmt("fn", name, ret_expr, wbody, params, [], other_anns, sline))
+        if not handled
+            push(out, s)
+    out
+
 fn expand_derives(stmts: list) -> list
     // NOVA way (not Rust/Python): the genius compiler derives a value's textual form (show) and
     // its JSON encoding (to_json) from its STRUCTURE (innovation D1) — zero annotation, for EVERY
@@ -2539,7 +2590,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    expand_derives(fuse_multiclause(stmts))
+    expand_derives(inject_ensures(fuse_multiclause(stmts)))
 
 // ── LLVM IR Code Generator ───────────────────────────────────────────────────
 
