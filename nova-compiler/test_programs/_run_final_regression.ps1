@@ -177,7 +177,8 @@ $domain_tests = @(
     'spanx',
     'pvecx',
     'bfieldx',
-    'bindgen'
+    'bindgen',
+    'doctestx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
