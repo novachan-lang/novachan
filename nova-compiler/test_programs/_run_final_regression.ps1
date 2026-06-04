@@ -174,7 +174,8 @@ $domain_tests = @(
     'rex',
     'deflatex',
     'bitsx',
-    'spanx'
+    'spanx',
+    'pvecx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
