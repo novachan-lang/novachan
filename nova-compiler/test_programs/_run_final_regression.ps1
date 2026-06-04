@@ -171,7 +171,8 @@ $domain_tests = @(
     'spawn_assign_body_test',
     'unitsx',
     'supcrash_test',
-    'rex'
+    'rex',
+    'deflatex'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
