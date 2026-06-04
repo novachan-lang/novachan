@@ -74,11 +74,22 @@ fn _parse_class(s, p)
 fn _parse_atom(s, p)
     let c = _peek(s, p)
     if c == "("
-        let inner = _parse_alt(s, p + 1)
-        let pos = inner[1]
-        if _peek(s, pos) == ")"
-            pos = pos + 1
-        return [inner[0], pos]
+        // capturing group `(...)`, or named `(?<name>...)`. Indices are assigned
+        // left-to-right (by opening paren) in _number_groups after the parse.
+        let pos = p + 1
+        let gname = ""
+        if _peek(s, pos) == "?" and _peek(s, pos + 1) == "<"
+            pos = pos + 2
+            while pos < len(s) and _peek(s, pos) != ">"
+                gname = gname + s[pos]
+                pos = pos + 1
+            if _peek(s, pos) == ">"
+                pos = pos + 1
+        let inner = _parse_alt(s, pos)
+        let ipos = inner[1]
+        if _peek(s, ipos) == ")"
+            ipos = ipos + 1
+        return [["group", 0 - 1, gname, inner[0]], ipos]
     if c == "["
         return _parse_class(s, p + 1)
     if c == "."
@@ -95,6 +106,28 @@ fn _emit(prog, instr)
     push(prog, instr)
     return len(prog) - 1
 
+// Assign capture-group indices left-to-right by opening paren (pre-order). gc is a
+// 1-element mutable counter; group 0 is reserved for the whole match, so explicit
+// groups start at 1. Returns the numbered tree.
+fn _number_groups(node, gc)
+    let t = node[0]
+    if t == "group"
+        let idx = gc[0]
+        gc[0] = idx + 1
+        let inner = _number_groups(node[3], gc)
+        return ["group", idx, node[2], inner]
+    if t == "concat"
+        return ["concat", _number_groups(node[1], gc), _number_groups(node[2], gc)]
+    if t == "alt"
+        return ["alt", _number_groups(node[1], gc), _number_groups(node[2], gc)]
+    if t == "star"
+        return ["star", _number_groups(node[1], gc)]
+    if t == "plus"
+        return ["plus", _number_groups(node[1], gc)]
+    if t == "quest"
+        return ["quest", _number_groups(node[1], gc)]
+    return node
+
 fn _compile_node(prog, node)
     let t = node[0]
     if t == "empty"
@@ -107,6 +140,13 @@ fn _compile_node(prog, node)
         return 0
     if t == "class"
         _emit(prog, ["class", node[1], node[2]])
+        return 0
+    if t == "group"
+        // save 2k at start, save 2k+1 at end; the start-save carries the name (if any)
+        // so a named lookup can map name -> group index by scanning the program.
+        _emit(prog, ["save", 2 * node[1], node[2]])
+        _compile_node(prog, node[3])
+        _emit(prog, ["save", 2 * node[1] + 1, ""])
         return 0
     if t == "concat"
         _compile_node(prog, node[1])
@@ -149,7 +189,8 @@ fn _compile_node(prog, node)
 fn rex_compile(pattern)
     let prog = []
     let parsed = _parse_alt(pattern, 0)
-    _compile_node(prog, parsed[0])
+    let numbered = _number_groups(parsed[0], [1])
+    _compile_node(prog, numbered)
     _emit(prog, ["match", 0, 0])
     return prog
 
@@ -165,6 +206,10 @@ fn _add_thread(prog, lst, pc)
     else if instr[0] == "jmp"
         push(lst, pc)
         _add_thread(prog, lst, instr[1])
+    else if instr[0] == "save"
+        // epsilon for the non-capturing matchers (rex_full_match/search): skip through.
+        push(lst, pc)
+        _add_thread(prog, lst, pc + 1)
     else
         push(lst, pc)
     return 0
@@ -204,7 +249,7 @@ fn rex_full_match(prog, input)
     return _has_match(prog, clist)
 
 // rex_search: does the pattern occur ANYWHERE in the input (substring), still
-// linear-time � a fresh start-thread is seeded at every position and we accept as soon
+// linear-time � a fresh start-thread is seeded at every position and we accept as soon
 // as any thread reaches Match.
 fn rex_search(prog, input)
     let clist = []
@@ -244,6 +289,120 @@ fn rex_find(pattern, input)
 
 fn rex_test(pattern, input)
     return rex_full_match(rex_compile(pattern), input)
+
+// ── submatch (capture groups), still linear-time ─────────────────────────────
+// Pike-VM with per-thread save-slots: each thread carries its own capture positions
+// (slot 2k = group k start, 2k+1 = end). Dedup-by-pc keeps the highest-priority
+// (leftmost-greedy) thread, so captures follow standard regex semantics.
+fn _ngroups(prog)
+    let mx = 0
+    for instr in prog
+        if instr[0] == "save"
+            if instr[1] > mx
+                mx = instr[1]
+    return mx / 2
+
+fn _add_thread_cap(prog, pcs, svs, pc, saves, pos)
+    if contains(pcs, pc)
+        return 0
+    let instr = prog[pc]
+    if instr[0] == "split"
+        push(pcs, pc)
+        push(svs, saves)
+        _add_thread_cap(prog, pcs, svs, instr[1], saves, pos)
+        _add_thread_cap(prog, pcs, svs, instr[2], saves, pos)
+    else if instr[0] == "jmp"
+        push(pcs, pc)
+        push(svs, saves)
+        _add_thread_cap(prog, pcs, svs, instr[1], saves, pos)
+    else if instr[0] == "save"
+        push(pcs, pc)
+        push(svs, saves)
+        let ns = copy(saves)
+        ns[instr[1]] = pos
+        _add_thread_cap(prog, pcs, svs, pc + 1, ns, pos)
+    else
+        push(pcs, pc)
+        push(svs, saves)
+    return 0
+
+fn _step_cap(prog, pcs, svs, code, npcs, nsvs, pos)
+    let ti = 0
+    while ti < len(pcs)
+        let pc = pcs[ti]
+        let instr = prog[pc]
+        let matched = 0
+        if instr[0] == "char"
+            if code == instr[1]
+                matched = 1
+        else if instr[0] == "any"
+            matched = 1
+        else if instr[0] == "class"
+            for rng in instr[1]
+                if code >= rng[0] and code <= rng[1]
+                    matched = 1
+            if instr[2] == 1
+                matched = 1 - matched
+        if matched == 1
+            _add_thread_cap(prog, npcs, nsvs, pc + 1, svs[ti], pos)
+        ti = ti + 1
+    return 0
+
+fn _extract_caps(input, saves, ng, whole)
+    let caps = [whole]                  // index 0 = whole match
+    let g = 1
+    while g <= ng
+        let st = saves[2 * g]
+        let en = saves[2 * g + 1]
+        if st >= 0 and en >= 0
+            push(caps, input[st:en])
+        else
+            push(caps, "")
+        g = g + 1
+    return caps
+
+// rex_captures(pattern, input) -> [wholeMatch, group1, group2, ...] on a full match,
+// or [] if the pattern does not match the whole input.
+fn rex_captures(pattern, input)
+    let prog = rex_compile(pattern)
+    let ng = _ngroups(prog)
+    let initsaves = []
+    let k = 0
+    while k < 2 * (ng + 1)
+        push(initsaves, 0 - 1)
+        k = k + 1
+    let pcs = []
+    let svs = []
+    _add_thread_cap(prog, pcs, svs, 0, initsaves, 0)
+    let i = 0
+    let n = len(input)
+    while i < n
+        let npcs = []
+        let nsvs = []
+        _step_cap(prog, pcs, svs, ord(input[i]), npcs, nsvs, i + 1)
+        pcs = npcs
+        svs = nsvs
+        i = i + 1
+    let ti = 0
+    while ti < len(pcs)
+        if prog[pcs[ti]][0] == "match"
+            return _extract_caps(input, svs[ti], ng, input)
+        ti = ti + 1
+    return []
+
+// rex_named(pattern, input, name) -> the substring captured by the named group, or "".
+fn rex_named(pattern, input, name)
+    let prog = rex_compile(pattern)
+    let idx = 0 - 1
+    for instr in prog
+        if instr[0] == "save" and name != "" and instr[2] == name
+            idx = instr[1] / 2
+    if idx < 0
+        return ""
+    let caps = rex_captures(pattern, input)
+    if len(caps) > idx
+        return caps[idx]
+    return ""
 
 fn main()
     // literals
@@ -304,5 +463,37 @@ fn main()
     // full-match still requires the whole string
     assert_eq(rex_test("cat", "the cat sat"), 0)
     assert_eq(rex_test("cat", "cat"), 1)
+
+    // ── capture groups (submatch) ────────────────────────────────────────────
+    // numbered groups: caps[0] = whole match, caps[1..] = groups left-to-right
+    let c1 = rex_captures("([0-9]+)-([0-9]+)", "12-345")
+    assert_eq(len(c1), 3)
+    assert_eq(c1[0], "12-345")
+    assert_eq(c1[1], "12")
+    assert_eq(c1[2], "345")
+    // nested groups number by opening paren
+    let c2 = rex_captures("(a(b)(c))d", "abcd")
+    assert_eq(c2[1], "abc")
+    assert_eq(c2[2], "b")
+    assert_eq(c2[3], "c")
+    // a repeated group captures its LAST iteration (greedy), like every regex engine
+    let c3 = rex_captures("([a-z])+", "abc")
+    assert_eq(c3[1], "c")
+    // alternation inside a group
+    let c4 = rex_captures("(cat|dog)s", "dogs")
+    assert_eq(c4[1], "dog")
+    // an optional group that doesn't participate captures the empty string
+    let c5 = rex_captures("a(b)?c", "ac")
+    assert_eq(len(c5), 2)
+    assert_eq(c5[1], "")
+    let c6 = rex_captures("a(b)?c", "abc")
+    assert_eq(c6[1], "b")
+    // no match -> empty result
+    assert_eq(len(rex_captures("(x)", "y")), 0)
+    // named groups
+    assert_eq(rex_named("(?<y>[0-9]+)-(?<m>[0-9]+)", "2026-06", "y"), "2026")
+    assert_eq(rex_named("(?<y>[0-9]+)-(?<m>[0-9]+)", "2026-06", "m"), "06")
+    assert_eq(rex_named("(?<word>[a-z]+)", "hello", "word"), "hello")
+    assert_eq(rex_named("(?<word>[a-z]+)", "hello", "missing"), "")
 
     print("rex passed")
