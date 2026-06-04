@@ -1,0 +1,209 @@
+// rex — a guaranteed LINEAR-TIME regex engine (Thompson NFA simulation), immune to the
+// catastrophic backtracking that plagues PCRE-style engines on inputs like (a+)+$. A
+// pattern compiles to a small instruction program; matching steps a SET of NFA threads
+// through the input in lockstep, so time is O(input * program) regardless of pattern.
+// Supports: literal chars, . (any), * + ? (greedy), | (alternation), (...) grouping.
+
+// ── parse pattern -> tree ────────────────────────────────────────────────────
+// node = ["char", code] | ["any"] | ["concat", a, b] | ["alt", a, b]
+//      | ["star", a] | ["plus", a] | ["quest", a] | ["empty"]
+
+fn _peek(s, p)
+    if p < len(s)
+        return s[p]
+    return ""
+
+fn _parse_alt(s, p)
+    let lhs = _parse_concat(s, p)
+    let node = lhs[0]
+    let pos = lhs[1]
+    while _peek(s, pos) == "|"
+        let rhs = _parse_concat(s, pos + 1)
+        node = ["alt", node, rhs[0]]
+        pos = rhs[1]
+    return [node, pos]
+
+fn _parse_concat(s, p)
+    let node = ["empty"]
+    let pos = p
+    let first = 1
+    while pos < len(s) and _peek(s, pos) != "|" and _peek(s, pos) != ")"
+        let r = _parse_repeat(s, pos)
+        if first == 1
+            node = r[0]
+            first = 0
+        else
+            node = ["concat", node, r[0]]
+        pos = r[1]
+    return [node, pos]
+
+fn _parse_repeat(s, p)
+    let a = _parse_atom(s, p)
+    let node = a[0]
+    let pos = a[1]
+    let c = _peek(s, pos)
+    if c == "*"
+        return [["star", node], pos + 1]
+    if c == "+"
+        return [["plus", node], pos + 1]
+    if c == "?"
+        return [["quest", node], pos + 1]
+    return [node, pos]
+
+fn _parse_atom(s, p)
+    let c = _peek(s, p)
+    if c == "("
+        let inner = _parse_alt(s, p + 1)
+        let pos = inner[1]
+        if _peek(s, pos) == ")"
+            pos = pos + 1
+        return [inner[0], pos]
+    if c == "."
+        return [["any"], p + 1]
+    if c == chr(92)            // backslash: escape the next char as a literal
+        let nx = _peek(s, p + 1)
+        return [["char", ord(nx)], p + 2]
+    return [["char", ord(c)], p + 1]
+
+// ── compile tree -> instruction program ──────────────────────────────────────
+// instr = [op, a, b]. op: "char"(a=code) "any" "split"(a,b=pcs) "jmp"(a=pc) "match"
+
+fn _emit(prog, instr)
+    push(prog, instr)
+    return len(prog) - 1
+
+fn _compile_node(prog, node)
+    let t = node[0]
+    if t == "empty"
+        return 0
+    if t == "char"
+        _emit(prog, ["char", node[1], 0])
+        return 0
+    if t == "any"
+        _emit(prog, ["any", 0, 0])
+        return 0
+    if t == "concat"
+        _compile_node(prog, node[1])
+        _compile_node(prog, node[2])
+        return 0
+    if t == "alt"
+        let s = _emit(prog, ["split", 0, 0])
+        prog[s] = ["split", len(prog), 0]      // target1 = start of left
+        _compile_node(prog, node[1])
+        let j = _emit(prog, ["jmp", 0, 0])
+        // patch split target2 = start of right (current end)
+        let sp = prog[s]
+        prog[s] = ["split", sp[1], len(prog)]
+        _compile_node(prog, node[2])
+        prog[j] = ["jmp", len(prog), 0]        // jmp over right to end
+        return 0
+    if t == "star"
+        let s = _emit(prog, ["split", 0, 0])
+        prog[s] = ["split", len(prog), 0]      // enter body
+        _compile_node(prog, node[1])
+        _emit(prog, ["jmp", s, 0])             // loop back to split
+        let sp = prog[s]
+        prog[s] = ["split", sp[1], len(prog)]  // exit = current end
+        return 0
+    if t == "plus"
+        let body = len(prog)
+        _compile_node(prog, node[1])
+        let s = _emit(prog, ["split", body, 0])
+        prog[s] = ["split", body, len(prog)]   // loop to body or exit
+        return 0
+    if t == "quest"
+        let s = _emit(prog, ["split", 0, 0])
+        prog[s] = ["split", len(prog), 0]      // body
+        _compile_node(prog, node[1])
+        let sp = prog[s]
+        prog[s] = ["split", sp[1], len(prog)]  // skip = end
+        return 0
+    return 0
+
+fn rex_compile(pattern)
+    let prog = []
+    let parsed = _parse_alt(pattern, 0)
+    _compile_node(prog, parsed[0])
+    _emit(prog, ["match", 0, 0])
+    return prog
+
+// ── simulate (linear-time NFA, thread-set) ───────────────────────────────────
+fn _add_thread(prog, lst, pc)
+    if contains(lst, pc)
+        return 0
+    let instr = prog[pc]
+    if instr[0] == "split"
+        push(lst, pc)                          // mark visited to break eps-cycles
+        _add_thread(prog, lst, instr[1])
+        _add_thread(prog, lst, instr[2])
+    else if instr[0] == "jmp"
+        push(lst, pc)
+        _add_thread(prog, lst, instr[1])
+    else
+        push(lst, pc)
+    return 0
+
+fn _has_match(prog, lst)
+    for pc in lst
+        if prog[pc][0] == "match"
+            return 1
+    return 0
+
+fn rex_full_match(prog, input)
+    let clist = []
+    _add_thread(prog, clist, 0)
+    let i = 0
+    let n = len(input)
+    while i < n
+        let code = ord(input[i])
+        let nlist = []
+        for pc in clist
+            let instr = prog[pc]
+            if instr[0] == "char"
+                if code == instr[1]
+                    _add_thread(prog, nlist, pc + 1)
+            else if instr[0] == "any"
+                _add_thread(prog, nlist, pc + 1)
+        clist = nlist
+        i = i + 1
+    return _has_match(prog, clist)
+
+fn rex_test(pattern, input)
+    return rex_full_match(rex_compile(pattern), input)
+
+fn main()
+    // literals
+    assert_eq(rex_test("abc", "abc"), 1)
+    assert_eq(rex_test("abc", "abd"), 0)
+    assert_eq(rex_test("abc", "ab"), 0)
+    // any
+    assert_eq(rex_test("a.c", "axc"), 1)
+    assert_eq(rex_test("a.c", "ac"), 0)
+    // star
+    assert_eq(rex_test("ab*c", "ac"), 1)
+    assert_eq(rex_test("ab*c", "abbbc"), 1)
+    assert_eq(rex_test("ab*c", "abx"), 0)
+    // plus
+    assert_eq(rex_test("ab+c", "ac"), 0)
+    assert_eq(rex_test("ab+c", "abbc"), 1)
+    // quest
+    assert_eq(rex_test("ab?c", "ac"), 1)
+    assert_eq(rex_test("ab?c", "abc"), 1)
+    assert_eq(rex_test("ab?c", "abbc"), 0)
+    // alternation
+    assert_eq(rex_test("cat|dog", "cat"), 1)
+    assert_eq(rex_test("cat|dog", "dog"), 1)
+    assert_eq(rex_test("cat|dog", "cow"), 0)
+    // grouping + repetition
+    assert_eq(rex_test("(ab)+", "ababab"), 1)
+    assert_eq(rex_test("(ab)+", "aba"), 0)
+    assert_eq(rex_test("a(b|c)*d", "abcbcd"), 1)
+    assert_eq(rex_test("a(b|c)*d", "ad"), 1)
+    assert_eq(rex_test("a(b|c)*d", "abed"), 0)
+    // escaped metachar
+    assert_eq(rex_test("a" + chr(92) + ".c", "a.c"), 1)
+    assert_eq(rex_test("a" + chr(92) + ".c", "axc"), 0)
+    // LINEAR-TIME: the classic catastrophic-backtracking killer completes instantly
+    assert_eq(rex_test("(a+)+b", "aaaaaaaaaaaaaaaaaaaac"), 0)
+
+    print("rex passed")
