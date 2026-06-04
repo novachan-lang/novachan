@@ -166,7 +166,8 @@ $domain_tests = @(
     'webx',
     'seqx',
     'rchanx',
-    'osname_test'
+    'osname_test',
+    'crash_isolation_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

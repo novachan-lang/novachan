@@ -7,6 +7,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <errno.h>
+#include <setjmp.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -64,6 +65,48 @@ static void nova_set_error(const char* msg) {
     memcpy(m, msg, len + 1);
     __nova_error_flag = 1;
     __nova_error_msg = (int64_t)(uintptr_t)m;
+}
+
+/* ── Crash isolation: per-spawned-Process fault boundary ──────────────────────
+   A fatal inside a spawned Process (panic / unwrap-on-Err / overflow / failed
+   assert / stack overflow) longjmps back to the pool worker, which records
+   exit_status=1 and notifies monitors — the whole program SURVIVES ("let it
+   crash"; supervisors can restart). On the main thread there is no supervisor, so
+   a fatal still terminates the program, as it must. The fault state is thread-local
+   so concurrent crashes on different workers never collide; nova_panic only fires
+   from user-reachable contexts (no runtime lock is held), so the longjmp cannot
+   strand an internal mutex. A contained crash abandons that task's heap
+   allocations (shared-heap runtime, no per-process reclaim) — a leak, but vastly
+   better than whole-program death. */
+#ifdef _WIN32
+static __declspec(thread) jmp_buf nova_fault_buf;
+static __declspec(thread) int     nova_fault_active = 0;
+static __declspec(thread) int     nova_proc_crashed = 0;
+#else
+static __thread jmp_buf nova_fault_buf;
+static __thread int     nova_fault_active = 0;
+static __thread int     nova_proc_crashed = 0;
+#endif
+
+static void nova_reset_call_depth(void);     /* defined alongside g_stack_depth below */
+
+void nova_panic(const char* msg) {
+    if (msg && msg[0]) nova_set_error(msg);
+    if (nova_fault_active) {
+        nova_reset_call_depth();             /* longjmp skips the per-frame depth decrements */
+        nova_proc_crashed = 1;
+        longjmp(nova_fault_buf, 1);          /* contained: back to the worker */
+    }
+    exit(1);                                  /* main thread: terminate (caller reported) */
+}
+
+/* user-facing: panic(msg) deliberately crashes the current Process — contained if
+   spawned, fatal in main. */
+int64_t nova_rt_panic(int64_t msg_ptr) {
+    const char* msg = (const char*)(uintptr_t)msg_ptr;
+    fprintf(stderr, "nova: panic: %s\n", msg ? msg : "panic");
+    nova_panic(msg ? msg : "panic");
+    return 0;                                 /* unreachable */
 }
 
 /* ─�� Slab Allocator (fast fixed-size pools for hot-path objects) ──────────── */
@@ -3163,10 +3206,16 @@ static DWORD WINAPI nova_pool_worker(LPVOID arg) {
 
         if (task.proc) {
             NovaProcessInfo* proc = task.proc;
-            proc->fn(proc->ctx);
+            /* fault boundary: a fatal in proc->fn longjmps here, contained */
+            nova_fault_active = 1;
+            nova_proc_crashed = 0;
+            if (setjmp(nova_fault_buf) == 0) {
+                proc->fn(proc->ctx);
+            }
+            nova_fault_active = 0;
 
             EnterCriticalSection(&proc->lock);
-            proc->exit_status = 0;
+            proc->exit_status = nova_proc_crashed ? 1 : 0;
             for (int64_t i = 0; i < proc->monitor_count; i++)
                 nova_rt_channel_send(proc->monitors[i], proc->exit_status);
             proc->finished = 1;
@@ -3211,10 +3260,16 @@ static void* nova_pool_worker(void* arg) {
 
         if (task.proc) {
             NovaProcessInfo* proc = task.proc;
-            proc->fn(proc->ctx);
+            /* fault boundary: a fatal in proc->fn longjmps here, contained */
+            nova_fault_active = 1;
+            nova_proc_crashed = 0;
+            if (setjmp(nova_fault_buf) == 0) {
+                proc->fn(proc->ctx);
+            }
+            nova_fault_active = 0;
 
             pthread_mutex_lock(&proc->lock);
-            proc->exit_status = 0;
+            proc->exit_status = nova_proc_crashed ? 1 : 0;
             for (int64_t i = 0; i < proc->monitor_count; i++)
                 nova_rt_channel_send(proc->monitors[i], proc->exit_status);
             proc->finished = 1;
@@ -4656,7 +4711,7 @@ void nova_rt_assert(int64_t cond, int64_t msg) {
     if (!cond) {
         const char* s = (const char*)(uintptr_t)msg;
         fprintf(stderr, "Assertion failed: %s\n", s ? s : "(no message)");
-        exit(1);
+        nova_panic(s ? s : "assertion failed");
     }
 }
 
@@ -7237,7 +7292,7 @@ int64_t nova_rt_unwrap(int64_t handle) {
         } else {
             fprintf(stderr, "nova: unwrap called on None\n");
         }
-        exit(1);
+        nova_panic("unwrap called on Err/None");
     }
     return r->value;
 }
@@ -7246,7 +7301,7 @@ int64_t nova_rt_unwrap_err(int64_t handle) {
     NovaResult* r = (NovaResult*)(uintptr_t)handle;
     if (r->tag != 1) {
         fprintf(stderr, "nova: unwrap_err called on Ok/Some\n");
-        exit(1);
+        nova_panic("unwrap_err called on Ok/Some");
     }
     return r->value;
 }
@@ -9899,7 +9954,7 @@ void nova_rt_log_error(int64_t msg, int64_t fields) {
 }
 void nova_rt_log_fatal(int64_t msg, int64_t fields) {
     nova_log_emit(NOVA_LOG_FATAL, (const char*)(uintptr_t)msg, fields);
-    exit(1);
+    nova_panic((const char*)(uintptr_t)msg);
 }
 
 /* ── Test Framework Extensions ────────────────────────────────────────────── */
@@ -10165,7 +10220,7 @@ int64_t nova_rt_arena_used(int64_t handle) {
 void nova_rt_overflow_panic(void) {
     fprintf(stderr, "NOVA panic: integer overflow detected\n");
     fflush(stderr);
-    exit(1);
+    nova_panic("integer overflow");
 }
 
 int64_t nova_rt_checked_add(int64_t a, int64_t b) {
@@ -10333,12 +10388,17 @@ void nova_rt_process_exit_notify(int64_t pid, int64_t reason) {
 static volatile int g_stack_depth = 0;
 static int g_stack_max = 100000;
 
+/* Reset recursion-depth counter after a contained crash: the longjmp out of a
+   panicking spawned Process skips the per-frame decrements, so without this the
+   global counter would creep up over many crashes and eventually false-trip. */
+static void nova_reset_call_depth(void) { g_stack_depth = 0; }
+
 void nova_rt_stack_enter(void) {
     if (++g_stack_depth > g_stack_max) {
         fprintf(stderr, "NOVA panic: stack overflow (depth > %d)\n", g_stack_max);
         fflush(stderr);
         g_stack_depth = 0;
-        exit(1);
+        nova_panic("stack overflow");
     }
 }
 
