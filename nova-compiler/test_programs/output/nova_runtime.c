@@ -4147,6 +4147,13 @@ int64_t nova_rt_int_to_float(int64_t x) { return f2i((double)x); }
 
 int64_t nova_rt_to_int(int64_t val) {
     if (val == 0) return 0;
+    /* Unbox an Any-typed boxed float/bool first (symmetric with nova_rt_to_float):
+       int(json_decode("2.5")) truncates to 2, int(boxed bool) is 0/1. Range-guarded. */
+    if (nova_is_box(val)) {
+        NovaBox* nb = (NovaBox*)(uintptr_t)val;
+        if (nb->kind == NOVA_BOX_FLOAT) return (int64_t)i2f(nb->payload);
+        return nb->payload;
+    }
     void* ptr = (void*)(uintptr_t)val;
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR) return nova_rt_parse_int(val);
@@ -4163,6 +4170,15 @@ int64_t nova_rt_to_int(int64_t val) {
 
 int64_t nova_rt_to_float(int64_t val) {
     if (val == 0) return f2i(0.0);
+    /* An Any-typed float/bool arrives BOXED (json_decode, generic containers); unbox
+       it to the actual numeric value. Without this, float(json_decode("2.5")) read the
+       box POINTER as a double and returned garbage. Range-guarded (zero cost if nothing
+       was ever boxed). A float box's payload is already the double's bit pattern. */
+    if (nova_is_box(val)) {
+        NovaBox* nb = (NovaBox*)(uintptr_t)val;
+        if (nb->kind == NOVA_BOX_FLOAT) return nb->payload;
+        return f2i((double)nb->payload);
+    }
     void* ptr = (void*)(uintptr_t)val;
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR) return nova_rt_parse_float(val);

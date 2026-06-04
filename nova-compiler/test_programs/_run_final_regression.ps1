@@ -181,7 +181,8 @@ $domain_tests = @(
     'doctestx',
     'atexit_test',
     'typename_test',
-    'static_assert_test'
+    'static_assert_test',
+    'vmcast_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
