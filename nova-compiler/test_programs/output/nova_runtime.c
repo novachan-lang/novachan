@@ -8911,6 +8911,45 @@ int64_t nova_rt_arch_name(void) {
 #endif
 }
 
+/* ── Runtime type identity (RTTI) ─────────────────────────────────────────────
+   type_name(v) reports the runtime kind of an Any-typed value as a string, for
+   inspecting heterogeneous data (e.g. json_decode results, generic containers)
+   without static type info -- NOVA's safe answer to a downcast. Correct for the
+   value kinds that flow through Any: int / float / bool / string / list / dict /
+   struct / channel. Both lookups (nova_is_box, nova_mem_find_tag) are address-
+   range-guarded, so an arbitrary raw int is classified without ever touching
+   memory. Two representation edges, by design: a raw bytes handle reports
+   "string" (bytes and strings share NOVA_MEM_RAW; bytes-as-Any is rare and you
+   know you hold bytes by construction), and an *unboxed scalar* float reports
+   "int" (the tracked unboxed-float residual) -- floats that reach Any via a
+   collection or json are boxed and report "float" correctly, which is the RTTI
+   use case. */
+int64_t nova_rt_type_name(int64_t v) {
+    if (nova_is_box(v)) {
+        NovaBox* b = (NovaBox*)(uintptr_t)v;
+        return nova_platform_str(b->kind == NOVA_BOX_FLOAT ? "float" : "bool");
+    }
+    switch (nova_mem_find_tag((void*)(uintptr_t)v)) {
+        case NOVA_MEM_LIST:    return nova_platform_str("list");
+        case NOVA_MEM_DICT:    return nova_platform_str("dict");
+        case NOVA_MEM_STRUCT:  return nova_platform_str("struct");
+        case NOVA_MEM_CHANNEL: return nova_platform_str("channel");
+        case NOVA_MEM_RAW:
+        case NOVA_MEM_FAT_STR: return nova_platform_str("string");
+        default:               break;
+    }
+    /* A string LITERAL is a static global (outside the managed heap, not in the
+       strpool), so it carries no mem tag. Detect it exactly as the renderers do
+       (nova_rt_elem_to_str): a readable pointer whose first byte is NUL or
+       printable ASCII is text. This keeps type_name consistent with print() --
+       if a value renders as a string, type_name reports "string". */
+    if ((uint64_t)v > 0x10000 && nova_is_readable_str((void*)(uintptr_t)v)) {
+        unsigned char c = *(unsigned char*)(uintptr_t)v;
+        if (c == 0 || (c >= 0x20 && c < 0x7F)) return nova_platform_str("string");
+    }
+    return nova_platform_str("int");
+}
+
 /* ── Exit hooks (at_exit) ─────────────────────────────────────────────────────
    Register a closure to run at program exit (LIFO order, like C atexit) for cleanup
    that must happen no matter how the program ends. Reuses the closure-call convention

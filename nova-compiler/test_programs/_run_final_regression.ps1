@@ -179,7 +179,8 @@ $domain_tests = @(
     'bfieldx',
     'bindgen',
     'doctestx',
-    'atexit_test'
+    'atexit_test',
+    'typename_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
