@@ -5631,6 +5631,12 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                 return dest
             else if tag == "call"
                 let fn_name = value
+                if fn_name == "static_assert"
+                    // Compile-time only (checked during inference); emit no runtime
+                    // code -> a const 0 value that the optimizer dead-strips.
+                    let sa_dest = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_int", sa_dest, ir_type_int(), [], "0", 0)
+                    return sa_dest
                 if fn_name == "main"
                     fn_name = "nova_user_main"
                 let arg_regs = []
@@ -8364,6 +8370,92 @@ fn ti_extract_bounds(annotations: list) -> dict
 
 // ── Expression inference ─────────────────────────────────────────────────────
 
+// Compile-time constant evaluation for static_assert: folds int/bool literals,
+// arithmetic, comparisons, and/or/not into a single value. ok=0 means the
+// expression is NOT a compile-time constant (e.g. it references a variable), so
+// the build is rejected with a clear message rather than silently accepted. NOVA
+// wraps on overflow, so this mirrors runtime integer semantics. Used only by
+// static_assert -> the check costs zero at runtime (no IR is emitted for it).
+type ConstEval
+    ok: int
+    val: int
+
+fn ti_const_eval(e: Expr) -> ConstEval
+    match e
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et == "int"
+                return ConstEval(1, en)
+            if et == "bool"
+                return ConstEval(1, en)
+            if et == "unary"
+                let ux = ti_const_eval(ec[0])
+                if ux.ok == 0
+                    return ConstEval(0, 0)
+                if ev == "-"
+                    return ConstEval(1, 0 - ux.val)
+                if ev == "not"
+                    if ux.val == 0
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                return ConstEval(0, 0)
+            if et == "binop"
+                let lc = ti_const_eval(ec[0])
+                if lc.ok == 0
+                    return ConstEval(0, 0)
+                let rc = ti_const_eval(ec[1])
+                if rc.ok == 0
+                    return ConstEval(0, 0)
+                let a = lc.val
+                let bb = rc.val
+                if ev == "+"
+                    return ConstEval(1, a + bb)
+                if ev == "-"
+                    return ConstEval(1, a - bb)
+                if ev == "*"
+                    return ConstEval(1, a * bb)
+                if ev == "/"
+                    if bb == 0
+                        return ConstEval(0, 0)
+                    return ConstEval(1, a / bb)
+                if ev == "%"
+                    if bb == 0
+                        return ConstEval(0, 0)
+                    return ConstEval(1, a % bb)
+                if ev == "=="
+                    if a == bb
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                if ev == "!="
+                    if a != bb
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                if ev == "<"
+                    if a < bb
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                if ev == ">"
+                    if a > bb
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                if ev == "<="
+                    if a <= bb
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                if ev == ">="
+                    if a >= bb
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                if ev == "and"
+                    if a != 0 and bb != 0
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                if ev == "or"
+                    if a != 0 or bb != 0
+                        return ConstEval(1, 1)
+                    return ConstEval(1, 0)
+                return ConstEval(0, 0)
+    ConstEval(0, 0)
+
 fn ti_infer_expr(st: TiState, expr: Expr) -> NType
     ti_infer_expr_inner(st, expr)
 
@@ -8383,6 +8475,24 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
             if tag == "ident"
                 return ti_lookup(st, value, eline)
             if tag == "call"
+                if value == "static_assert"
+                    // Compile-time assertion: evaluate the constant argument NOW and
+                    // fail the build if it is false (or not a constant). Emits no code.
+                    if len(children) == 0
+                        ti_error(st, "static_assert requires a constant boolean expression argument", eline)
+                    else
+                        let sa_ce = ti_const_eval(children[0])
+                        if sa_ce.ok == 0
+                            ti_error(st, "static_assert requires a compile-time constant expression (only int/bool literals, arithmetic, comparisons, and/or/not are allowed)", eline)
+                        else if sa_ce.val == 0
+                            let sa_msg = "static assertion failed"
+                            if len(children) >= 2
+                                match children[1]
+                                    Expr(smt, smv, smn, smc, smf, sml) =>
+                                        if smt == "str"
+                                            sa_msg = "static assertion failed: " + smv
+                            ti_error(st, sa_msg, eline)
+                    return nt_int()
                 if contains(st.ti_extern_fns, value) and st.ti_unsafe_depth == 0
                     ti_error(st, "calling extern function '" + value + "' requires an enclosing 'unsafe' expression (C code is outside NOVA's safety envelope; wrap the call: 'unsafe " + value + "(...)')", eline)
                 let fn_t = ti_lookup(st, value, eline)
