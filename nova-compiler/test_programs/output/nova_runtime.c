@@ -2535,6 +2535,186 @@ int64_t nova_rt_json_stringify(int64_t val) {
     return (int64_t)(uintptr_t)tracked;
 }
 
+/* forward decls — these are defined later in the file but used by the term codec */
+int64_t nova_rt_bytes_create(int64_t size_val);
+int64_t nova_rt_bytes_get(int64_t handle, int64_t index);
+void    nova_rt_bytes_set(int64_t handle, int64_t index, int64_t value);
+int64_t nova_rt_bytes_len(int64_t handle);
+int64_t nova_rt_create_string(void* cstr_ptr);
+
+/* ── Compact binary term codec (term_encode / term_decode) ────────────────────
+   A self-describing, tag-coded binary serialization of any Value — the compact
+   binary alternative to json_stringify's text (MessagePack / Erlang
+   term_to_binary class). Same structural walk as json_stringify_value (so the
+   tricky value-model cases — boxed float/bool, the int-vs-string heuristic — are
+   handled identically), but emits [tag][payload] bytes instead of text, and
+   preserves the int/float distinction exactly. Round-trips through the bytes
+   Value; backs a future compact node_send wire format. */
+#define NOVA_TT_INT   1
+#define NOVA_TT_FLOAT 2
+#define NOVA_TT_BOOL  3
+#define NOVA_TT_STR   4
+#define NOVA_TT_LIST  5
+#define NOVA_TT_DICT  6
+
+typedef struct { unsigned char* buf; size_t len; size_t cap; } NovaTermBuf;
+
+static void ntb_reserve(NovaTermBuf* b, size_t extra) {
+    if (b->len + extra <= b->cap) return;
+    size_t nc = b->cap ? b->cap * 2 : 64;
+    while (nc < b->len + extra) nc *= 2;
+    unsigned char* nb = (unsigned char*)realloc(b->buf, nc);
+    if (!nb) return;
+    b->buf = nb; b->cap = nc;
+}
+static void ntb_byte(NovaTermBuf* b, unsigned char c) {
+    ntb_reserve(b, 1); if (b->buf) b->buf[b->len++] = c;
+}
+/* unsigned LEB128 varint — small values take 1 byte (the compactness win). */
+static void ntb_varint(NovaTermBuf* b, uint64_t v) {
+    while (v >= 0x80) { ntb_byte(b, (unsigned char)(v & 0x7F) | 0x80); v >>= 7; }
+    ntb_byte(b, (unsigned char)v);
+}
+/* signed -> zigzag -> varint (so small magnitudes, +/-, are 1 byte). */
+static void ntb_svarint(NovaTermBuf* b, int64_t sv) {
+    uint64_t zz = ((uint64_t)sv << 1) ^ (uint64_t)(sv >> 63);
+    ntb_varint(b, zz);
+}
+static void ntb_f64(NovaTermBuf* b, int64_t bits) {  /* float: fixed 8 raw IEEE bytes */
+    uint64_t v = (uint64_t)bits;
+    ntb_reserve(b, 8);
+    if (!b->buf) return;
+    for (int s = 56; s >= 0; s -= 8) b->buf[b->len++] = (unsigned char)((v >> s) & 0xFF);
+}
+static void ntb_str(NovaTermBuf* b, const char* s) {
+    size_t n = s ? strlen(s) : 0;
+    ntb_byte(b, NOVA_TT_STR);
+    ntb_varint(b, (uint64_t)n);
+    ntb_reserve(b, n);
+    if (b->buf && n) { memcpy(b->buf + b->len, s, n); b->len += n; }
+}
+static void ntb_keystr(NovaTermBuf* b, const char* s) {  /* dict key: varint-len+bytes, no tag */
+    size_t n = s ? strlen(s) : 0;
+    ntb_varint(b, (uint64_t)n);
+    ntb_reserve(b, n);
+    if (b->buf && n) { memcpy(b->buf + b->len, s, n); b->len += n; }
+}
+
+static void term_encode_value(NovaTermBuf* b, int64_t val, int depth) {
+    if (depth > 64) { ntb_byte(b, NOVA_TT_INT); ntb_svarint(b, 0); return; }
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_BOX) {
+        NovaBox* bx = (NovaBox*)ptr;
+        if (bx->kind == NOVA_BOX_BOOL) { ntb_byte(b, NOVA_TT_BOOL); ntb_byte(b, bx->payload ? 1 : 0); }
+        else { ntb_byte(b, NOVA_TT_FLOAT); ntb_f64(b, bx->payload); }  /* payload holds the IEEE bits */
+        return;
+    }
+    if (tag == NOVA_MEM_DICT) {
+        NovaDict* d = (NovaDict*)ptr;
+        ntb_byte(b, NOVA_TT_DICT); ntb_varint(b, (uint64_t)d->size);
+        for (int64_t i = 0; i < d->size; i++) {
+            ntb_keystr(b, (const char*)(uintptr_t)d->keys[i]);
+            term_encode_value(b, d->vals[i], depth + 1);
+        }
+        return;
+    }
+    if (tag == NOVA_MEM_LIST) {
+        NovaList* l = (NovaList*)ptr;
+        ntb_byte(b, NOVA_TT_LIST); ntb_varint(b, (uint64_t)l->size);
+        for (int64_t i = 0; i < l->size; i++) term_encode_value(b, l->data[i], depth + 1);
+        return;
+    }
+    if (tag == NOVA_MEM_RAW) { ntb_str(b, (const char*)ptr); return; }
+    if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
+        unsigned char c = *(unsigned char*)ptr;
+        if (c == 0 || (c >= 0x20 && c < 0x7F)) { ntb_str(b, (const char*)ptr); return; }
+    }
+    ntb_byte(b, NOVA_TT_INT); ntb_svarint(b, val);   /* bare integer */
+}
+
+int64_t nova_rt_term_encode(int64_t val) {
+    NovaTermBuf b; b.buf = NULL; b.len = 0; b.cap = 0;
+    term_encode_value(&b, val, 0);
+    int64_t bytes = nova_rt_bytes_create((int64_t)b.len);
+    for (size_t i = 0; i < b.len; i++) nova_rt_bytes_set(bytes, (int64_t)i, (int64_t)b.buf[i]);
+    free(b.buf);
+    return bytes;
+}
+
+typedef struct { const unsigned char* p; size_t len; size_t pos; } NovaTermRd;
+static unsigned char ntr_byte(NovaTermRd* r) { return r->pos < r->len ? r->p[r->pos++] : 0; }
+static uint64_t ntr_varint(NovaTermRd* r) {
+    uint64_t result = 0; int shift = 0;
+    while (r->pos < r->len && shift < 64) {
+        unsigned char byte = ntr_byte(r);
+        result |= (uint64_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    return result;
+}
+static int64_t ntr_svarint(NovaTermRd* r) {
+    uint64_t zz = ntr_varint(r);
+    return (int64_t)(zz >> 1) ^ -(int64_t)(zz & 1);   /* un-zigzag */
+}
+static int64_t ntr_f64(NovaTermRd* r) {
+    uint64_t v = 0; for (int i = 0; i < 8; i++) v = (v << 8) | ntr_byte(r); return (int64_t)v;
+}
+
+static int64_t term_decode_value(NovaTermRd* r, int depth) {
+    if (depth > 64 || r->pos >= r->len) return 0;
+    unsigned char t = ntr_byte(r);
+    if (t == NOVA_TT_INT)   return ntr_svarint(r);
+    if (t == NOVA_TT_FLOAT) return nova_rt_box_float(ntr_f64(r));
+    if (t == NOVA_TT_BOOL)  return nova_rt_box_bool((int64_t)ntr_byte(r));
+    if (t == NOVA_TT_STR) {
+        uint64_t n = ntr_varint(r);
+        char* s = (char*)malloc((size_t)n + 1);
+        if (!s) return 0;
+        for (uint64_t i = 0; i < n; i++) s[i] = (char)ntr_byte(r);
+        s[n] = 0;
+        int64_t str = nova_rt_create_string(s);   /* copies */
+        free(s);
+        return str;
+    }
+    if (t == NOVA_TT_LIST) {
+        uint64_t n = ntr_varint(r);
+        int64_t lst = nova_rt_list_create();
+        for (uint64_t i = 0; i < n; i++) nova_rt_list_append(lst, term_decode_value(r, depth + 1));
+        return lst;
+    }
+    if (t == NOVA_TT_DICT) {
+        uint64_t n = ntr_varint(r);
+        int64_t d = nova_rt_dict_create();
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t kn = ntr_varint(r);
+            char* k = (char*)malloc((size_t)kn + 1);
+            if (!k) return d;
+            for (uint64_t j = 0; j < kn; j++) k[j] = (char)ntr_byte(r);
+            k[kn] = 0;
+            int64_t kstr = nova_rt_create_string(k);
+            free(k);
+            int64_t v = term_decode_value(r, depth + 1);
+            nova_rt_dict_set(d, kstr, v);
+        }
+        return d;
+    }
+    return 0;
+}
+
+int64_t nova_rt_term_decode(int64_t bytes) {
+    int64_t n = nova_rt_bytes_len(bytes);
+    if (n < 0) n = 0;
+    unsigned char* buf = (unsigned char*)malloc((size_t)(n > 0 ? n : 1));
+    if (!buf) return 0;
+    for (int64_t i = 0; i < n; i++) buf[i] = (unsigned char)nova_rt_bytes_get(bytes, i);
+    NovaTermRd r; r.p = buf; r.len = (size_t)n; r.pos = 0;
+    int64_t v = term_decode_value(&r, 0);
+    free(buf);
+    return v;
+}
+
 /* ── Runtime type dispatch for Any-typed values ──────────────────────────── */
 
 int64_t nova_rt_create_string(void* cstr_ptr); /* forward decl (defined later) */
