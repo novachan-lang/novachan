@@ -42,29 +42,54 @@
 #endif
 #endif
 
-/* ── Error flag (TLS, defined in LLVM IR, accessed from C runtime) ─────── */
+/* ── Task-local state (Stage 0 of the implicit-async flagship) ────────────────
+   The error/Result state that used to be raw thread-locals now lives in a per-task
+   NovaTaskState reached through a settable `nova_current_task` pointer. On the current
+   thread-pool runtime each OS thread has one default state (set lazily by nova_cur), so
+   behavior is identical; once green tasks land, the scheduler will repoint
+   nova_current_task at each task's own state before resuming it, so tasks multiplexed
+   onto one carrier thread never share error state (the TLS-leak the design's adversarial
+   pass flagged as fatal). The compiler now emits calls to the nova_rt_*_error helpers
+   below instead of touching the TLS globals directly. Fault-boundary fields migrate in
+   Stage 0b. */
+typedef struct {
+    int64_t error_flag;
+    int64_t error_msg;
+    int64_t is_result;
+} NovaTaskState;
+
 #ifdef _WIN32
-extern __declspec(thread) int64_t __nova_error_flag;
-extern __declspec(thread) int64_t __nova_error_msg;
-static __declspec(thread) int64_t __nova_is_result = 0;
+static __declspec(thread) NovaTaskState nova_tls_task = {0, 0, 0};
+__declspec(thread) NovaTaskState* nova_current_task = 0;
 #else
-extern __thread int64_t __nova_error_flag;
-extern __thread int64_t __nova_error_msg;
-static __thread int64_t __nova_is_result = 0;
+static __thread NovaTaskState nova_tls_task = {0, 0, 0};
+__thread NovaTaskState* nova_current_task = 0;
 #endif
 
-void nova_rt_clear_is_result(void) { __nova_is_result = 0; }
+static NovaTaskState* nova_cur(void) {
+    if (!nova_current_task) nova_current_task = &nova_tls_task;
+    return nova_current_task;
+}
+
+void nova_rt_clear_is_result(void) { nova_cur()->is_result = 0; }
+
+/* error-flag helpers — the compiler emits calls to these (was direct TLS load/store). */
+void    nova_rt_raise_error(void)           { nova_cur()->error_flag = 1; }
+void    nova_rt_set_error_flag(int64_t msg) { NovaTaskState* t = nova_cur(); t->error_flag = 1; t->error_msg = msg; }
+int64_t nova_rt_take_error_flag(void)       { NovaTaskState* t = nova_cur(); int64_t f = t->error_flag; t->error_flag = 0; return f; }
+int64_t nova_rt_take_error_msg(void)        { NovaTaskState* t = nova_cur(); int64_t m = t->error_msg; t->error_msg = 0; return m; }
 
 static void nova_set_error(const char* msg) {
-    if (__nova_error_msg != 0) {
-        free((void*)(uintptr_t)__nova_error_msg);
+    NovaTaskState* t = nova_cur();
+    if (t->error_msg != 0) {
+        free((void*)(uintptr_t)t->error_msg);
     }
     size_t len = strlen(msg);
     char* m = malloc(len + 1);
-    if (!m) { __nova_error_flag = 1; __nova_error_msg = 0; return; }
+    if (!m) { t->error_flag = 1; t->error_msg = 0; return; }
     memcpy(m, msg, len + 1);
-    __nova_error_flag = 1;
-    __nova_error_msg = (int64_t)(uintptr_t)m;
+    t->error_flag = 1;
+    t->error_msg = (int64_t)(uintptr_t)m;
 }
 
 /* ── Crash isolation: per-spawned-Process fault boundary ──────────────────────
@@ -119,7 +144,7 @@ int64_t nova_rt_panic(int64_t msg_ptr) {
 static int64_t nova_make_reason(int crashed) {
     const char* s = "normal";
     if (crashed)
-        s = (__nova_error_msg != 0) ? (const char*)(uintptr_t)__nova_error_msg : "crashed";
+        { int64_t em = nova_cur()->error_msg; s = (em != 0) ? (const char*)(uintptr_t)em : "crashed"; }
     size_t n = strlen(s);
     char* c = (char*)malloc(n + 1);
     if (!c) return 0;
@@ -7191,22 +7216,22 @@ static int64_t nova_result_pack(int64_t tag, int64_t value) {
 }
 
 int64_t nova_rt_ok(int64_t value) {
-    __nova_is_result = 1;
+    nova_cur()->is_result = 1;
     return nova_result_pack(0, value);
 }
 
 int64_t nova_rt_err(int64_t value) {
-    __nova_is_result = 1;
+    nova_cur()->is_result = 1;
     return nova_result_pack(1, value);
 }
 
 int64_t nova_rt_some(int64_t value) {
-    __nova_is_result = 1;
+    nova_cur()->is_result = 1;
     return nova_result_pack(0, value);
 }
 
 int64_t nova_rt_none(void) {
-    __nova_is_result = 1;
+    nova_cur()->is_result = 1;
     return nova_result_pack(1, 0);
 }
 
@@ -7382,15 +7407,16 @@ int64_t nova_rt_result_tag(int64_t handle) {
 }
 
 int64_t nova_rt_try_unwrap_value(int64_t handle) {
-    if (__nova_is_result) {
-        __nova_is_result = 0;
+    NovaTaskState* t = nova_cur();
+    if (t->is_result) {
+        t->is_result = 0;
         NovaResult* r = (NovaResult*)(uintptr_t)handle;
         if (r->tag == 0) {
-            __nova_error_flag = 0;
+            t->error_flag = 0;
             return r->value;
         } else {
-            __nova_error_flag = 1;
-            __nova_error_msg = r->value;
+            t->error_flag = 1;
+            t->error_msg = r->value;
             return handle;
         }
     }
@@ -10119,10 +10145,11 @@ int64_t nova_rt_assert_approx(int64_t actual_bits, int64_t expected_bits, int64_
 /* assert_throws: call closure, expect it to set error flag */
 int64_t nova_rt_assert_throws(int64_t closure, int64_t expected_msg) {
     (void)expected_msg;
-    int64_t saved_flag = __nova_error_flag;
-    int64_t saved_msg  = __nova_error_msg;
-    __nova_error_flag = 0;
-    __nova_error_msg  = 0;
+    NovaTaskState* t = nova_cur();
+    int64_t saved_flag = t->error_flag;
+    int64_t saved_msg  = t->error_msg;
+    t->error_flag = 0;
+    t->error_msg  = 0;
 
     int64_t* rec = (int64_t*)(uintptr_t)closure;
     if (rec) {
@@ -10130,9 +10157,9 @@ int64_t nova_rt_assert_throws(int64_t closure, int64_t expected_msg) {
         fn(closure, 0);
     }
 
-    int64_t threw = __nova_error_flag;
-    __nova_error_flag = saved_flag;
-    __nova_error_msg  = saved_msg;
+    int64_t threw = t->error_flag;
+    t->error_flag = saved_flag;
+    t->error_msg  = saved_msg;
 
     if (threw) { nova_test_pass++; return 1; }
     nova_test_fail++;
