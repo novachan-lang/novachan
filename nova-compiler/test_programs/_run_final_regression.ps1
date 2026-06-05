@@ -189,7 +189,8 @@ $domain_tests = @(
     'exit_reason_test',
     'mapfbox_test',
     'fiber_test',
-    'coro'
+    'coro',
+    'pipe'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

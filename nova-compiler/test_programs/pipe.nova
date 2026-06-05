@@ -1,0 +1,156 @@
+// pipe.nova — lazy FUSED transformation pipelines (deforestation), the NOVA way.
+//
+// The generic-algorithm-library's remaining gap is fusion: naive
+// `map(filter(xs, p), f)` allocates TWO throwaway intermediate lists and runs
+// the transforms over every element. A fused pipe composes map/filter/take into
+// ONE pass over the source with NO intermediate lists, and `take` SHORT-CIRCUITS
+// — it stops pulling (and stops running the upstream transforms) the instant it
+// has enough. So `pipe(xs).map(f).take(3)` runs f exactly 3 times, not len(xs).
+// This is the streaming/transducer idea (Clojure transducers, Rust iterator
+// adapters) expressed over Values + first-class functions — no new runtime.
+//
+// A pipeline = [src, ops]; an op = [tag, payload]  (tag: "map"|"filter"|"take").
+
+fn pipe(src)
+  [src, []]
+
+// append an op, returning a NEW pipeline (the source list is shared, ops are fresh).
+fn _with_op(pl, op)
+  let r = []
+  for o in pl[1]
+    push(r, o)
+  push(r, op)
+  [pl[0], r]
+
+fn p_map(pl, f)
+  _with_op(pl, ["map", f])
+
+fn p_filter(pl, pred)
+  _with_op(pl, ["filter", pred])
+
+fn p_take(pl, n)
+  _with_op(pl, ["take", n])
+
+// The fused engine: one pass over src, each surviving value folded via
+// emit_fn(acc, value). counts[] holds per-op `take` counters; once a take is
+// satisfied the `stopped` flag halts all further upstream work (no more map/
+// filter calls, no allocation) — single pass, no intermediate lists.
+fn _run(pl, acc, emit_fn)
+  let src = pl[0]
+  let ops = pl[1]
+  let counts = []
+  for o in ops
+    push(counts, 0)
+  let stopped = 0
+  for x in src
+    if stopped == 0
+      let cur = x
+      let keep = 1
+      let after_stop = 0
+      let i = 0
+      while i < len(ops)
+        if keep == 1
+          let op = ops[i]
+          let tag = op[0]
+          if tag == "map"
+            let f = op[1]
+            cur = f(cur)
+          else if tag == "filter"
+            let pred = op[1]
+            if pred(cur)
+              keep = 1
+            else
+              keep = 0
+          else if tag == "take"
+            let n = op[1]
+            counts[i] = counts[i] + 1
+            if counts[i] > n
+              keep = 0
+              stopped = 1
+            else if counts[i] == n
+              after_stop = 1
+        i = i + 1
+      if keep == 1
+        acc = emit_fn(acc, cur)
+        if after_stop == 1
+          stopped = 1
+  acc
+
+// ── Terminal operations (each is single-pass, no intermediate list) ──
+
+fn _collect_emit(acc, v)
+  push(acc, v)
+  acc
+
+fn p_collect(pl)
+  _run(pl, [], fn(a, v) _collect_emit(a, v))
+
+fn p_sum(pl)
+  _run(pl, 0, fn(a, v) a + v)
+
+fn p_count(pl)
+  _run(pl, 0, fn(a, v) a + 1)
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+// helpers
+fn dbl(x)
+  x * 2
+
+fn is_even(x)
+  x % 2 == 0
+
+fn gt5(x)
+  x > 5
+
+// Test 1: fused map+filter, correctness vs the naive two-list version.
+let xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+let fused = p_collect(p_filter(p_map(pipe(xs), fn(x) dbl(x)), fn(x) gt5(x)))
+// map doubles -> [2,4,6,8,10,12,14,16,18,20]; filter >5 -> [6,8,10,12,14,16,18,20]
+let naive = filter(map(xs, fn(x) dbl(x)), fn(x) gt5(x))
+assert(len(fused) == len(naive), "fused length matches naive")
+assert(fused[0] == 6, "first survivor is 6")
+assert(fused[7] == 20, "last survivor is 20")
+assert(len(fused) == 8, "8 survivors")
+print("PASS: fused map+filter matches naive")
+
+// Test 2: take SHORT-CIRCUITS — the deforestation proof. Source has 1000
+// elements; with a side-effect counter we show map runs only 3 times, not 1000.
+let calls = [0]
+fn counting_dbl(box, x)
+  box[0] = box[0] + 1
+  x * 2
+
+let big = range(1000)
+let three = p_collect(p_take(p_map(pipe(big), fn(x) counting_dbl(calls, x)), 3))
+assert(len(three) == 3, "took exactly 3")
+assert(three[0] == 0, "0*2==0")
+assert(three[1] == 2, "1*2==2")
+assert(three[2] == 4, "2*2==4")
+assert(calls[0] == 3, "map ran exactly 3 times over a 1000-element source (short-circuit)")
+print("PASS: take short-circuits — map ran " + str(calls[0]) + "/1000 (deforestation)")
+
+// Test 3: streaming sum — folds without materializing a list.
+let s = p_sum(p_filter(pipe(range(11)), fn(x) is_even(x)))
+// evens in 0..10: 0,2,4,6,8,10 -> sum 30
+assert(s == 30, "streaming sum of evens 0..10 == 30")
+print("PASS: streaming sum (no intermediate list)")
+
+// Test 4: filter-then-map ordering + count.
+let c = p_count(p_map(p_filter(pipe(range(20)), fn(x) is_even(x)), fn(x) dbl(x)))
+// evens 0..19 = 10 of them, each doubled, count = 10
+assert(c == 10, "count of doubled-evens 0..19 == 10")
+print("PASS: filter->map ordering + count")
+
+// Test 5: empty pipeline passes through unchanged.
+let pass = p_collect(pipe([7, 8, 9]))
+assert(len(pass) == 3, "empty pipeline = identity")
+assert(pass[1] == 8, "passthrough preserves values")
+print("PASS: empty pipeline = identity")
+
+// Test 6: take larger than the (filtered) stream just yields all.
+let few = p_collect(p_take(p_filter(pipe(range(10)), fn(x) is_even(x)), 100))
+assert(len(few) == 5, "take(100) over 5 evens yields all 5")
+print("PASS: take beyond stream length")
+
+print("ALL PASS: pipe — fused lazy pipelines with short-circuit (deforestation)")
