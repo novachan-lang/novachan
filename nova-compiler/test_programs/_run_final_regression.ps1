@@ -198,7 +198,8 @@ $domain_tests = @(
     'propx',
     'fiber_nested_test',
     'difx',
-    'sched_test'
+    'sched_test',
+    'greenx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

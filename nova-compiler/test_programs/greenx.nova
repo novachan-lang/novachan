@@ -1,0 +1,102 @@
+// greenx.nova — reusable green-concurrency patterns over the Stage-2a M:N
+// scheduler (sched_spawn / sched_run). Raw sched_spawn/sched_run is the
+// low-level primitive; these make it practical: run a batch of tasks, or map a
+// function over a list CONCURRENTLY as green tasks on one OS thread (no
+// thread-per-task cost). All coordination is via channels — no shared locks.
+
+// Run a list of green-task thunks (each a fn(z)) to completion.
+fn green_all(thunks)
+  for t in thunks
+    sched_spawn(t)
+  sched_run()
+
+// worker: compute f(job) and send [index, result] for ordered collection.
+fn _gm_worker(c, idx, f, job)
+  let r = f(job)
+  send(c, [idx, r])
+
+// collector: receive n [index, result] pairs and place each by index.
+fn _gm_collect(c, out, n)
+  let k = 0
+  while k < n
+    let pair = receive(c)
+    out[pair[0]] = pair[1]
+    k = k + 1
+
+// Concurrently map `f` over `jobs` as green tasks; return results IN ORDER.
+// Each job runs in its own green task (parked/scheduled cooperatively); results
+// are routed back over a channel and reassembled by index.
+fn green_map(jobs, f)
+  let n = len(jobs)
+  let resch = channel()
+  let i = 0
+  while i < n
+    let job = jobs[i]
+    let idx = i
+    sched_spawn(fn(z) _gm_worker(resch, idx, f, job))
+    i = i + 1
+  let results = []
+  let j = 0
+  while j < n
+    push(results, 0)
+    j = j + 1
+  sched_spawn(fn(z) _gm_collect(resch, results, n))
+  sched_run()
+  results
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+// Test 1: concurrent map preserves order.
+fn sq(x)
+  x * x
+
+let r1 = green_map([1, 2, 3, 4, 5], fn(x) sq(x))
+assert(len(r1) == 5, "5 results")
+assert(r1[0] == 1, "1*1")
+assert(r1[1] == 4, "2*2")
+assert(r1[2] == 9, "3*3")
+assert(r1[3] == 16, "4*4")
+assert(r1[4] == 25, "5*5")
+print("PASS: green_map preserves order")
+
+// Test 2: green_map over a larger list, sum the results.
+fn dbl(x)
+  x * 2
+
+let r2 = green_map([10, 20, 30, 40, 50, 60, 70, 80], fn(x) dbl(x))
+let total = 0
+let i2 = 0
+while i2 < len(r2)
+  total = total + r2[i2]
+  i2 = i2 + 1
+assert(total == (10 + 20 + 30 + 40 + 50 + 60 + 70 + 80) * 2, "doubled sum")
+print("PASS: green_map over 8 jobs")
+
+// Test 3: green_all runs a batch of thunks (coordinate via a shared channel).
+let hub = channel()
+let acc = [0]
+
+fn push_one(c)
+  send(c, 1)
+
+fn drain(c, out, n)
+  let i = 0
+  while i < n
+    out[0] = out[0] + receive(c)
+    i = i + 1
+
+let thunks = [fn(z) push_one(hub), fn(z) push_one(hub), fn(z) push_one(hub), fn(z) drain(hub, acc, 3)]
+green_all(thunks)
+assert(acc[0] == 3, "green_all ran 4 thunks; 3 producers + 1 drainer")
+print("PASS: green_all batch")
+
+// Test 4: nested map values flow correctly (heterogeneous transform).
+fn add100(x)
+  x + 100
+
+let r4 = green_map([0, 1, 2], fn(x) add100(x))
+assert(r4[0] == 100, "0+100")
+assert(r4[2] == 102, "2+100")
+print("PASS: green_map transform")
+
+print("ALL PASS: greenx — reusable green-concurrency patterns")
