@@ -3804,6 +3804,36 @@ int64_t nova_rt_sched_run(void) {
     return 0;
 }
 
+/* ── Stage 2a TRANSPARENCY: run the whole program under the green scheduler ────
+   When NOVA_GREEN is set, the program's main runs as a green task and `spawn`
+   creates green tasks — so plain spawn/channel code is M:N (many tasks on one
+   OS thread, blocking-LOOKING channel ops park) with ZERO async keyword. Default
+   (env unset) is byte-for-byte the old behavior. Flag-gated so it is opt-in. */
+static int nova_green_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = getenv("NOVA_GREEN");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* The compiler-emitted main calls this with &nova_main. In green mode we run
+   nova_main as the root green task and drive the scheduler; otherwise we call it
+   directly (identical to the old `call @nova_main()`). */
+void nova_rt_main_dispatch(int64_t main_fn) {
+    if (nova_green_enabled()) {
+        int64_t* rec = (int64_t*)malloc(sizeof(int64_t));
+        if (rec) {
+            rec[0] = main_fn;                 /* a 1-slot closure record: slot 0 = fn ptr */
+            nova_rt_sched_spawn((int64_t)(uintptr_t)rec);
+            nova_rt_sched_run();
+            return;
+        }
+    }
+    ((int64_t(*)(void))(uintptr_t)main_fn)();  /* direct call (default / OOM fallback) */
+}
+
 /* ── Thread Pool + Process / Spawn ───────────────────────────────────────── */
 
 typedef void (*nova_spawn_entry)(void*);
@@ -4292,6 +4322,14 @@ int64_t nova_rt_shell(int64_t cmd_ptr) {
 }
 
 int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
+    /* TRANSPARENCY: in green mode, while running under the scheduler, spawn a
+       green task instead of an OS-pool thread. ctx_ptr is the closure record
+       (slot 0 = fn_ptr), exactly what sched_spawn/fiber_create expect. Green
+       tasks share captures (cooperative single carrier); deep-copy-isolated
+       green spawn is a future refinement. */
+    if (nova_green_enabled() && nova_sched_running) {
+        return nova_rt_sched_spawn(ctx_ptr);
+    }
     nova_is_multithreaded = 1;
     if (!nova_pool) nova_pool_init();
 
