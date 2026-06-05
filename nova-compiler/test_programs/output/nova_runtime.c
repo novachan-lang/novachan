@@ -2998,7 +2998,8 @@ typedef struct {
 static int  nova_sched_in_task(void);          /* 1 if running inside a green task */
 static void nova_sched_park_on(NovaChannel* ch);   /* park current task on ch->green_waiters (recv; caller holds the lock) */
 static void nova_sched_park_send(NovaChannel* ch);  /* park current task on ch->green_send_waiters (send; caller holds the lock) */
-static void nova_sched_yield_now(void);            /* yield to the carrier (call AFTER unlocking) */
+static void nova_sched_yield_now(void);            /* yield to the carrier (caller already parked on a waiter list) */
+static void nova_sched_yield_runnable(void);       /* re-enqueue current task + yield (cooperative yield; not parked) */
 static void nova_sched_wake_one(NovaChannel* ch);  /* move one parked RECV waiter back to the run-queue (caller holds the lock) */
 static void nova_sched_wake_send_one(NovaChannel* ch); /* move one parked SEND waiter back to the run-queue */
 static void nova_sched_wake_all(NovaChannel* ch);  /* wake all parked waiters, both kinds (used on close) */
@@ -3306,7 +3307,9 @@ int64_t nova_rt_channel_select(int64_t channels_ptr, int64_t count) {
             if (tup) { tup[0] = -1; tup[1] = 0; }
             return (int64_t)(uintptr_t)tup;
         }
-        if (++spins < 64) {
+        if (nova_sched_in_task()) {
+            nova_sched_yield_runnable();   /* green task: re-enqueue self + yield to the carrier so producers run (select isn't parked on one channel, so it must stay runnable; an OS spin here would deadlock the single carrier) */
+        } else if (++spins < 64) {
 #ifdef _WIN32
             SwitchToThread();
 #else
@@ -3355,7 +3358,9 @@ int64_t nova_rt_select(int64_t list_handle) {
             nova_rt_list_append(result, 0);
             return result;
         }
-        if (++spins < 64) {
+        if (nova_sched_in_task()) {
+            nova_sched_yield_runnable();   /* green task: re-enqueue self + yield to the carrier so producers run (select isn't parked on one channel, so it must stay runnable; an OS spin here would deadlock the single carrier) */
+        } else if (++spins < 64) {
 #ifdef _WIN32
             SwitchToThread();
 #else
@@ -3741,6 +3746,10 @@ static void nova_sched_park_send(NovaChannel* ch) {
     ch->green_send_waiters = (void*)t;
 }
 static void nova_sched_yield_now(void) { nova_rt_fiber_yield(); }
+static void nova_sched_yield_runnable(void) {
+    if (nova_sched_current) { nova_sched_current->status = 0; nova_rq_push(nova_sched_current); }
+    nova_rt_fiber_yield();
+}
 
 static void nova_sched_wake_one(NovaChannel* ch) {
     NovaSchedTask* t = (NovaSchedTask*)ch->green_waiters;
