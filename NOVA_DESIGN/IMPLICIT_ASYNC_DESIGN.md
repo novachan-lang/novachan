@@ -10,6 +10,18 @@ durable foundation — read it before any implementation stage.
 error state (0a) and fault boundary (0b) now per-task in NovaTaskState via nova_cur(). GO/NO-GO
 passed (byte-identical, 255/255, perf-neutral).
 
+✅ **Stage 2a CORE WORKING (2026-06-05).** The M:N green-task scheduler runs: `sched_spawn(closure)`
+creates a green task (a Stage-1 fiber), `sched_run()` is the single-carrier loop that drives them
+cooperatively, and channel `recv` PARKS a green task (yields to the carrier) instead of blocking the OS
+thread — `send`/`close` unpark it. Single-carrier + cooperative ⇒ no lost-wakeup race (F1's hard case is
+2b-only). Validated by sched_test.nova: producer/consumer with parking, two-channel ping-pong, and
+**1000 green tasks coordinating on ONE OS thread** (the no-thread-per-task win). NovaChannel gained a
+`green_waiters` list; channel_recv/send/close got green branches; the scheduler is ~90 LOC over the
+fiber primitive. Non-green code is unaffected (the green branch is gated on `nova_sched_in_task()`).
+**This is the explicit-API core; the remaining Stage 2 work is: reroute `spawn`→green + wrap `main` as a
+green task (transparency), send-side bounded-channel parking (F3), monitor/wait_all integration, then
+2b work-stealing across N carriers.**
+
 ✅ **Stage 1 COMPLETE (2026-06-05).** Green-task context-switch primitive validated:
 - **Windows:** Fibers API (CreateFiber/SwitchToFiber) — OS manages stacks + register save.
 - **POSIX x86_64:** hand-written asm (push/pop RBX/RBP/R12-15, save/restore RSP, retq) + mmap
