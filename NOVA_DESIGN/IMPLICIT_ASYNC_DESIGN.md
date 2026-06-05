@@ -340,8 +340,12 @@ held, and the CARRIER releases ch->lock only AFTER the context switch completes*
 serialization point; the task is not resumable until it has fully yielded and the lock is dropped by
 the scheduler, not by the parking task). Unpark never directly resumes — it only enqueues.
 
-**F2 (FATAL) — `g_stack_depth` is still a process-global** (nova_runtime.c ~10822, `static volatile
-int`; Stage 0 deferred it). On 2b, N carriers do non-atomic `++/--` on it = data race (UB). Even on 2a,
+**F2 (FATAL) — ✅ RESOLVED 2026-06-05 (commit 9c059e9, "Stage 1.5").** `g_stack_depth` + `g_stack_max`
+moved from process-globals into NovaTaskState (stack_depth + stack_max via nova_cur()); also fixed the
+pre-existing 16-pool-thread race on the global and the yielded-fiber-leaves-max-lowered leak; removed
+nova_fiber_restore_stack. Confirmed stack_enter is NOT auto-emitted per fn-entry (zero hot-path cost).
+Gate green (reconverge byte-identical, 258/258, primes neutral). Original finding below for the record:
+`g_stack_depth` was a process-global (nova_runtime.c ~10822, `static volatile int`; Stage 0 deferred it). On 2b, N carriers do non-atomic `++/--` on it = data race (UB). Even on 2a,
 park/resume across tasks leaves a stale depth (task A parks at depth 50; task B resumes and sees 50),
 causing false stack-overflow panics, and `nova_reset_call_depth()` in nova_panic zeroes it globally.
 **REQUIREMENT: move `g_stack_depth` (and `g_stack_max` is fine global/read-only) INTO NovaTaskState;
