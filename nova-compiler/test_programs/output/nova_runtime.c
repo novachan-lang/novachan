@@ -56,6 +56,9 @@ typedef struct {
     int64_t error_flag;
     int64_t error_msg;
     int64_t is_result;
+    jmp_buf fault_buf;      /* Stage 0b: per-task fault boundary (was __thread nova_fault_buf) */
+    int     fault_active;
+    int     crashed;
 } NovaTaskState;
 
 #ifdef _WIN32
@@ -103,15 +106,12 @@ static void nova_set_error(const char* msg) {
    strand an internal mutex. A contained crash abandons that task's heap
    allocations (shared-heap runtime, no per-process reclaim) — a leak, but vastly
    better than whole-program death. */
-#ifdef _WIN32
-static __declspec(thread) jmp_buf nova_fault_buf;
-static __declspec(thread) int     nova_fault_active = 0;
-static __declspec(thread) int     nova_proc_crashed = 0;
-#else
-static __thread jmp_buf nova_fault_buf;
-static __thread int     nova_fault_active = 0;
-static __thread int     nova_proc_crashed = 0;
-#endif
+/* The fault boundary (jmp_buf + active/crashed flags) now lives in NovaTaskState above,
+   reached via nova_cur() — so once green tasks share a carrier thread, a contained crash
+   longjmps to the CURRENT task's own jmp_buf, never another task's (the design's fatal
+   issue #2). On today's runtime nova_cur() is the per-thread default, so behavior is
+   identical. (g_stack_depth stays a global for now — it's checked per function entry, so
+   it gets made per-task when the scheduler lands, to avoid nova_cur() overhead per call.) */
 
 static void nova_reset_call_depth(void);     /* defined alongside g_stack_depth below */
 
@@ -121,10 +121,11 @@ void nova_panic(const char* msg) {
        whether contained in a spawned Process or fatal on the main thread. */
     fprintf(stderr, "level=ERROR event=fault detail=\"%s\"\n", msg ? msg : "unknown");
     fflush(stderr);
-    if (nova_fault_active) {
+    NovaTaskState* ft = nova_cur();
+    if (ft->fault_active) {
         nova_reset_call_depth();             /* longjmp skips the per-frame depth decrements */
-        nova_proc_crashed = 1;
-        longjmp(nova_fault_buf, 1);          /* contained: back to the worker */
+        ft->crashed = 1;
+        longjmp(ft->fault_buf, 1);           /* contained: back to the worker (this task's jmp_buf) */
     }
     exit(1);                                  /* main thread: terminate (caller reported) */
 }
@@ -3264,17 +3265,18 @@ static DWORD WINAPI nova_pool_worker(LPVOID arg) {
 
         if (task.proc) {
             NovaProcessInfo* proc = task.proc;
-            /* fault boundary: a fatal in proc->fn longjmps here, contained */
-            nova_fault_active = 1;
-            nova_proc_crashed = 0;
-            if (setjmp(nova_fault_buf) == 0) {
+            /* fault boundary: a fatal in proc->fn longjmps here, contained (this task's jmp_buf) */
+            NovaTaskState* ft = nova_cur();
+            ft->fault_active = 1;
+            ft->crashed = 0;
+            if (setjmp(ft->fault_buf) == 0) {
                 proc->fn(proc->ctx);
             }
-            nova_fault_active = 0;
+            ft->fault_active = 0;
 
             EnterCriticalSection(&proc->lock);
-            proc->exit_status = nova_proc_crashed ? 1 : 0;
-            proc->exit_reason = nova_make_reason(nova_proc_crashed);
+            proc->exit_status = ft->crashed ? 1 : 0;
+            proc->exit_reason = nova_make_reason(ft->crashed);
             for (int64_t i = 0; i < proc->monitor_count; i++)
                 nova_rt_channel_send(proc->monitors[i], proc->exit_status);
             proc->finished = 1;
@@ -3319,17 +3321,18 @@ static void* nova_pool_worker(void* arg) {
 
         if (task.proc) {
             NovaProcessInfo* proc = task.proc;
-            /* fault boundary: a fatal in proc->fn longjmps here, contained */
-            nova_fault_active = 1;
-            nova_proc_crashed = 0;
-            if (setjmp(nova_fault_buf) == 0) {
+            /* fault boundary: a fatal in proc->fn longjmps here, contained (this task's jmp_buf) */
+            NovaTaskState* ft = nova_cur();
+            ft->fault_active = 1;
+            ft->crashed = 0;
+            if (setjmp(ft->fault_buf) == 0) {
                 proc->fn(proc->ctx);
             }
-            nova_fault_active = 0;
+            ft->fault_active = 0;
 
             pthread_mutex_lock(&proc->lock);
-            proc->exit_status = nova_proc_crashed ? 1 : 0;
-            proc->exit_reason = nova_make_reason(nova_proc_crashed);
+            proc->exit_status = ft->crashed ? 1 : 0;
+            proc->exit_reason = nova_make_reason(ft->crashed);
             for (int64_t i = 0; i < proc->monitor_count; i++)
                 nova_rt_channel_send(proc->monitors[i], proc->exit_status);
             proc->finished = 1;
