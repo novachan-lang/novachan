@@ -200,7 +200,8 @@ $domain_tests = @(
     'difx',
     'sched_test',
     'greenx',
-    'procx'
+    'procx',
+    'spix'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
