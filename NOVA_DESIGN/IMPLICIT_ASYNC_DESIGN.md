@@ -5,6 +5,14 @@ studies + 3 NOVA-runtime maps + runtime-designer synthesis + devils-advocate str
 Implementation is a multi-session effort (~6–12 months solo, honest estimate). This doc is the
 durable foundation — read it before any implementation stage.
 
+**IMPLEMENTATION PROGRESS:** ✅ **Stage 0 COMPLETE (2026-06-05, commits 3cdf3f4 + 21fd822).**
+Both fatal TLS issues fixed — error state (0a, compiler+runtime, was the GO/NO-GO: PASSED —
+byte-identical, 255/255, perf-neutral on compute) and the fault boundary (0b, runtime-only) now
+live in a per-task `NovaTaskState` reached via `nova_cur()`/`nova_current_task`. The runtime is
+ready for the M:N scheduler to give each green task its own NovaTaskState. `g_stack_depth` is
+deferred to the scheduler stage (it's checked per fn-entry; make it per-task then to avoid
+nova_cur() overhead). NEXT: Stage 1 (context-switch primitive).
+
 ## The goal
 A NOVA Process that does blocking-LOOKING I/O (`tcp_recv`, `channel_recv`, `accept`, …) must
 **yield cooperatively** so one OS thread can drive thousands of Processes — scaling to **100k+
