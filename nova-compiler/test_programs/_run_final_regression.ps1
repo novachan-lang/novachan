@@ -190,7 +190,8 @@ $domain_tests = @(
     'mapfbox_test',
     'fiber_test',
     'coro',
-    'pipe'
+    'pipe',
+    'graphemex'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
