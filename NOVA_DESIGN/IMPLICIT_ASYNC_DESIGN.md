@@ -162,3 +162,238 @@ Conditionally achievable. NOT a "pure runtime migration" — it is compiler+runt
 32KB fixed stacks + cooperative preemption, the 100k-connection target IS reachable and vastly
 better than 16 OS threads. The 4KB-growable / signal-preemption endgame needs 1-2 yrs more compiler
 work. **Start with Stage 0 and treat its GATE 4/5 result as the project's go/no-go.**
+
+---
+
+# Stage 2 — M:N scheduler: detailed design (drafted 2026-06-05, grounded in real code)
+
+Stages 0 + 1 are DONE. This is the concrete, code-grounded plan for Stage 2, written after
+re-reading the actual concurrency runtime (output/nova_runtime.c). It supersedes the one-paragraph
+Stage 2 sketch above where they differ.
+
+## ⚠ THE KEY FINDING: Stage 2 ⊃ channel parking (Stage 5 is NOT separable from Stage 2)
+The original staging puts the scheduler (Stage 2) before channel parking (Stage 5). **That ordering
+is unbuildable.** Evidence from the real runtime:
+- `nova_rt_channel_recv` (nova_runtime.c ~2931) blocks the calling OS thread on a condvar
+  (`pthread_cond_wait`/`SleepConditionVariableCS` on `not_empty`) when the channel is empty.
+- Existing tests that MUST pass unchanged are channel-driven and block: actorx (a GenServer's
+  receive-loop task blocks on recv waiting for requests), supx/supcrash (supervisor blocks on a
+  monitor channel), lockx/cmapx/mailx (a server task blocks on its request channel), bounded_chan,
+  select_test, async/futurex.
+- If `spawn` creates a green task on one of N carrier threads, and that green task calls
+  `channel_recv` on an empty channel, the condvar path **blocks the carrier (an OS thread)**, not
+  the green task. With N carriers and >N green tasks each blocked on a channel (the GenServer/
+  supervisor pattern — there can be thousands), every carrier is stuck on a condvar and the
+  remaining runnable green tasks never run → **deadlock**. The 10k-task gate (10k cheap tasks, many
+  of them parked on channels) cannot pass on a blocking-carrier model.
+
+**Therefore Stage 2's minimal correct unit = scheduler + channel/wait_all/monitor parking.** A green
+task that would block on a channel must *park* (fiber_yield to the carrier's scheduler) so the carrier
+runs another task; the counterpart op (send/close) must *unpark* it. Only **socket I/O** parking
+(the netpoller, Stages 3-4) stays separable — sockets are a different wait source, and DNS/file I/O
+go to the blocking-offload pool. So: **Stage 2 = green scheduler + in-process (channel) parking.**
+
+## Data structures (reusing Stage 0 NovaTaskState + Stage 1 NovaFiber)
+```c
+typedef enum { TASK_RUNNABLE, TASK_RUNNING, TASK_PARKED, TASK_DONE } NovaTaskStatus;
+
+typedef struct NovaTask {
+    NovaFiber        fiber;        // Stage 1: 32KB green stack + saved context + NovaTaskState
+    int64_t          entry_fn;     // the spawned closure (already in fiber.entry_fn)
+    NovaTaskStatus   status;
+    NovaProcessInfo* proc;         // REUSE: monitors[], exit_status, exit_reason, finished
+    struct NovaTask* qnext;        // intrusive link for run-queue AND channel wait-list
+    int64_t          park_chan;    // channel handle it's parked on (0 if not channel-parked)
+    int              park_kind;    // PARK_RECV | PARK_SEND
+} NovaTask;
+
+typedef struct {                   // one per carrier OS thread (N = cpu_count)
+    NovaFiber  sched_ctx;          // the carrier's own context; tasks fiber_yield back to it
+    NovaTask*  current;
+    // 2a: shared global run-queue under a mutex. 2b: per-carrier chase-lev deque + steal.
+} NovaCarrier;
+```
+The channel struct (`NovaChannel`) gains a **green wait-list**: `NovaTask* recv_waiters; NovaTask*
+send_waiters;` (intrusive, protected by the existing `ch->lock`).
+
+## The carrier loop
+```
+for (;;) {
+  task = run_queue_pop();              // 2a: global mutex queue; 2b: local→steal→global
+  if (!task) { if (shutdown && live==0) break; wait_on_work_condvar(); continue; }
+  carrier->current = task;
+  nova_current_task  = &task->fiber.task;   // Stage 0: repoint per-task error/fault state
+  nova_current_fiber = &task->fiber;
+  task->status = TASK_RUNNING;
+  fiber_resume(&task->fiber);           // switch into the green stack (Stage 1)
+  // back here when the task PARKED (fiber_yield) or finished (trampoline set status=DONE)
+  if (task->status == TASK_DONE) finalize_task(task);   // exit_status, notify monitors, free
+  // if PARKED: it already linked itself onto a channel wait-list; just loop to the next task
+}
+```
+`finalize_task` is exactly today's pool-worker epilogue (nova_runtime.c ~3277-3283 / ~3333-3339):
+set `proc->exit_status = crashed?1:0`, `proc->exit_reason`, send to monitors, `finished=1`.
+
+## spawn reroute (API byte-identical)
+`nova_rt_spawn(fn, ctx)`: UNCHANGED deep_copy of ctx (isolation preserved). Instead of enqueueing a
+`NovaPoolTask` on the OS pool, allocate a `NovaTask` (with a 32KB fiber whose entry runs
+`proc->fn(ctx)` inside the per-task setjmp fault boundary — the Stage 1 trampoline already does
+exactly this), register `proc` in the process table (unchanged), push the task on the run-queue, wake
+a carrier. Return `(int64_t)proc` (unchanged handle).
+
+## Channel park/unpark (the coupled new machinery)
+`channel_recv` becomes:
+```
+lock(ch);
+while (ch->count == 0) {
+  if (ch->closed) { unlock; return -1; }
+  if (on_a_carrier()) {                 // nova_current_fiber != carrier sched_ctx
+    cur = carrier->current;
+    cur->park_kind = PARK_RECV; cur->status = TASK_PARKED;
+    list_push(ch->recv_waiters, cur);
+    unlock(ch);
+    fiber_yield();                       // -> carrier loop; carrier runs another task
+    lock(ch);                            // resumed by a sender's unpark; re-check the loop
+  } else {
+    cond_wait(ch->not_empty, ch->lock);  // MAIN thread (not a green task): keep blocking
+  }
+}
+val = dequeue(ch); signal/unpark a send_waiter; unlock(ch); return val;
+```
+`channel_send` after enqueue: if `ch->recv_waiters` non-empty, pop one, set RUNNABLE, push to a
+carrier run-queue + wake a carrier (the unpark). It must ALSO `cond_signal(not_empty)` for a possibly
+main-thread/pool blocked receiver — **channels have dual waiters (green park-list + condvar), and
+every producer must service both.** `channel_close` wakes/unparks all waiters of both kinds.
+
+`select` (today a 1ms busy-poll, nova_runtime.c ~2793): a green task registers on every channel's
+recv_waiters, parks once, and the first matching send unparks it (CAS a `claimed` flag to defeat the
+lost-wakeup/double-fire race). Eliminates the spin floor. (This is the nominal Stage 5 select work,
+pulled in because select must not busy-block a carrier.)
+
+## wait_all (main-thread integration)
+Two viable shapes:
+- **(b) main blocks on an all_done condvar** while N carriers drain the run-queue; carriers signal
+  when the live-task count reaches 0. Closest to today (nova_runtime.c ~4031). If user code parks all
+  tasks on channels that never receive (a user bug), wait_all hangs — same failure as today.
+- (a) main becomes an extra carrier (convert to fiber, run the scheduler loop until empty). More
+  parallelism, more entanglement.
+Pick (b) for Stage 2 — minimal change, main stays a plain blocked thread.
+
+## Fault boundary — UNCHANGED from Stage 1, now per-task
+The fiber trampoline already does `setjmp(task->fiber.task.fault_buf)` ON the green stack, and
+`nova_panic` reads `nova_cur()->fault_buf` (Stage 0b). A panic in a green task longjmps to THAT
+task's buf on THAT task's stack; the trampoline marks `crashed`, returns to the carrier, which
+finalizes exit_status=1 + monitors. This is the entire reason Stages 0+1 came first; Stage 2 inherits
+it for free. ✓
+
+## The 2a / 2b split
+- **2a — ONE carrier, global run-queue, channel parking, fault boundary.** No parallelism, no
+  stealing. Proves the green-task model + park/unpark + fault isolation + dual-waiter channels in
+  isolation. All concurrency tests pass (they run *concurrently but not in parallel* — correctness,
+  not speedup). 10k-task test: 10k fibers on 1 carrier, parked/woken via channels, completes <1s.
+- **2b — N carriers + chase-lev work-stealing deque + global overflow.** Restores real parallelism;
+  pmap/parallel_test regain speedup.
+
+## ⚠ Caveats / risks this design must clear (hand to the adversary)
+1. **CPU-bound starvation.** A green task that never parks (pure compute) hogs its carrier until done.
+   On 2a (1 carrier) a long compute task blocks ALL others until it finishes — if any test spawns a
+   non-terminating-until-signalled compute loop expecting *concurrent* progress with another task,
+   2a deadlocks. **Mitigation:** cooperative preemption at fn-entry (`if (task->preempt) fiber_yield`)
+   from 2a — the design doc already says "from Stage 2 onward." A periodic timer sets `preempt`.
+   MUST audit: does any existing test rely on two compute tasks making progress without yielding?
+   (e.g. atomicx_test: 4 tasks × 1000 atomic increments on a shared counter — if those never park,
+   on 1 carrier they serialize; correctness holds, the final count is still 4000, so 2a is fine; but
+   verify none *spin-wait* on each other.)
+2. **Dual-waiter channel races.** Producer must wake condvar AND unpark green waiters atomically
+   w.r.t. ch->lock; a wakeup that races a park can be lost. Needs a careful happens-before argument.
+3. **pmap/async coexistence.** pmap/pfor/pfilter/async use the OS pool directly (nova_runtime.c
+   ~3592, ~8119). Stage 2 reroutes only `spawn`. A green task and a pool task sharing a channel is the
+   dual-waiter case — already handled. Keep pmap/async on the OS pool for Stage 2 (don't migrate).
+4. **Main thread calling channel_recv directly** (not in a spawn) must keep the condvar path — it is
+   not a green task. `on_a_carrier()` gates this.
+5. **Deep-copy malloc contention** across N carriers (noted above) — defer; 2a has 1 carrier anyway.
+
+## Falsification for Stage 2
+- A channel-blocked GenServer/supervisor test deadlocks under the green scheduler → parking is wrong.
+- atomicx/parallel_test produce wrong results → isolation or memory model broke.
+- 2b shows no speedup over 2a on parallel_test → work-stealing is broken.
+- Any existing concurrency test changes observable behavior → the "byte-identical API" promise failed.
+
+## Honest scope estimate
+Stage 2 is the single largest, riskiest stage (it reroutes the spawn path every concurrency test
+depends on, and pulls in channel parking). ~400-600 LOC C, no compiler change (spawn/channel builtins
+keep their signatures). It deserves a dedicated fresh-context session. Do 2a first, gate hard
+(all concurrency tests + 10k-task), then 2b.
+
+## ⚠⚠ Stage 2 ADVERSARIAL REVIEW (devils-advocate, 2026-06-05) — 2 FATAL + 5 SERIOUS
+A devils-advocate pass against the draft above (grounded in nova_runtime.c) found issues that the
+naive design would have shipped as bugs. **These are now REQUIREMENTS for the Stage 2 implementation.**
+
+**F1 (FATAL) — park/unpark lost-wakeup + double-run race.** The draft's channel_recv does
+`list_push(recv_waiters); unlock(ch); fiber_yield();` — the task is VISIBLE on the wait-list BEFORE it
+has actually yielded. A sender (another carrier in 2b, or the same carrier after a preemption point in
+2a) can pop it, mark RUNNABLE, and a second carrier can `fiber_resume` it WHILE the first carrier is
+still executing its stack between unlock and yield → two carriers run one fiber stack = corruption.
+`pthread_cond_wait` has no such window (atomic unlock+block). **REQUIREMENT: a `park(unlock_fn)`
+primitive à la Go's `gopark` — the task sets park state, switches to the carrier WITH ch->lock still
+held, and the CARRIER releases ch->lock only AFTER the context switch completes** (the switch is the
+serialization point; the task is not resumable until it has fully yielded and the lock is dropped by
+the scheduler, not by the parking task). Unpark never directly resumes — it only enqueues.
+
+**F2 (FATAL) — `g_stack_depth` is still a process-global** (nova_runtime.c ~10822, `static volatile
+int`; Stage 0 deferred it). On 2b, N carriers do non-atomic `++/--` on it = data race (UB). Even on 2a,
+park/resume across tasks leaves a stale depth (task A parks at depth 50; task B resumes and sees 50),
+causing false stack-overflow panics, and `nova_reset_call_depth()` in nova_panic zeroes it globally.
+**REQUIREMENT: move `g_stack_depth` (and `g_stack_max` is fine global/read-only) INTO NovaTaskState;
+`nova_rt_stack_enter/exit` go through `nova_cur()->stack_depth`.** This is the Stage-0-deferred work;
+Stage 2 is where it lands. (Costs a `nova_cur()` per fn-entry — measure vs the compute hot path; if it
+regresses, cache the current task-state pointer in a register/TLS the carrier updates on switch.)
+
+**F3 (SERIOUS) — bounded-channel SEND-side parking unspecified.** The draft only parks recv. A green
+task sending to a FULL bounded channel (ch->bound>0 && count>=bound, nova_runtime.c ~2903/2915) would
+block the carrier on `not_full`. **REQUIREMENT: symmetric send-side park on `send_waiters`**, unparked
+by a receiver's dequeue (which already signals not_full). Mirror the recv park primitive.
+
+**F4 (SERIOUS) — finalize_task sends monitor notifications while holding proc->lock** (today's pool
+worker does this, nova_runtime.c ~3546/3602: holds proc->lock, calls nova_rt_channel_send per monitor;
+send does deep_copy(malloc) then takes ch->lock). Nested `proc->lock → [CRT heap] → ch->lock` with
+unspecified global ordering. **REQUIREMENT: define a strict lock order (proc->lock < ch->lock; never
+the reverse) and/or snapshot the monitor list + exit_status under proc->lock, release it, THEN send.**
+
+**F5 (SERIOUS) — select can't register on N channels with one intrusive `qnext`.** A single link can
+be on ONE list. select needs the task on N channels' recv_waiters at once. **REQUIREMENT: non-intrusive
+waiter NODES (one heap node per (task,channel) registration), plus an atomic `claimed` flag on the
+TASK so the first firing send CAS-claims it and the others no-op; the woken task must then UNLINK its
+stale nodes from the other N-1 channels before running.** (This is the nominal Stage-5 select work; it
+comes WITH Stage 2 because select must not busy-block a carrier.)
+
+**F6 (SERIOUS) — wait_all "live-task count" undefined + cleanup race.** Is a PARKED task "live"? Must
+be YES (else a pipeline A→B→C with all parked would make wait_all return early while work remains) —
+so wait_all returns only when every task is DONE. And today's wait_all FREES every NovaProcessInfo
+(nova_runtime.c ~4052); if a carrier's finalize_task hasn't sent monitor notifications yet, that's a
+use-after-free. **REQUIREMENT: live-count = count of tasks not yet DONE (parked counts as live);
+finalize_task (incl. monitor sends) must COMPLETE before the task is counted DONE and before wait_all
+proceeds to free procs.**
+
+**F7 (SERIOUS) — fiber_resume returns with `nova_current_task = NULL`** (Stage 1 code, nova_runtime.c
+~3284/3396 set it NULL after the switch returns — correct for the user-facing fiber API, wrong for the
+carrier loop). After `fiber_resume` returns to the carrier, any finalize_task work (channel_send →
+deep_copy → error-flag paths) runs with nova_cur() falling through to the thread default.
+**REQUIREMENT: the carrier loop explicitly sets `nova_current_task = &carrier_state` immediately after
+fiber_resume returns, before any scheduler-side work** (the carrier needs its OWN NovaTaskState).
+
+**C8/C9/C10 (CONCERNS):** (8) cooperative preemption at fn-ENTRY does NOT fire in tight loops that call
+only builtins (atomic_add, integer ops) — so a CPU-bound `while k<N: atomic_add(...)` never yields; on
+2a it serializes (correctness holds for atomicx_test → final count still 4000, but no interleaving) —
+acceptable for v1, document it. (9) `on_a_carrier()` must correctly classify main-thread + old-pool
+workers as NOT-on-a-carrier so they keep the condvar path — needs a per-thread "I am a carrier" flag,
+not just a fiber-pointer compare. (10) cross-carrier fiber resume in 2b: Windows Fibers CAN be
+SwitchToFiber'd from any thread that has ConvertThreadToFiber'd (OK); POSIX asm switch is TLS-safe as
+long as the carrier sets nova_current_task before resuming (OK) — confirm both in 2b.
+
+**Net:** the corrected Stage 2 = green scheduler + a Go-style `park(unlock_fn)` primitive + symmetric
+recv/send channel parking + g_stack_depth→NovaTaskState + non-intrusive select waiter-nodes + a
+DONE-gated live-count for wait_all + carrier-owned NovaTaskState. Still ~no compiler change. The park
+primitive (F1) and g_stack_depth migration (F2) are the two must-get-right cores; everything else is
+mechanical once those are sound. Build 2a, gate on every concurrency test UNCHANGED + a 10k-parked-task
+test, then 2b.
