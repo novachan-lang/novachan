@@ -193,7 +193,8 @@ $domain_tests = @(
     'pipe',
     'graphemex',
     'utctime',
-    'term_test'
+    'term_test',
+    'dirwatch'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
