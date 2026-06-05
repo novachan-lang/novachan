@@ -59,7 +59,11 @@ typedef struct {
     jmp_buf fault_buf;      /* Stage 0b: per-task fault boundary (was __thread nova_fault_buf) */
     int     fault_active;
     int     crashed;
+    int64_t stack_depth;    /* Stage 1.5: per-task recursion depth (was global g_stack_depth) */
+    int64_t stack_max;      /* per-task overflow limit; 0 => NOVA_DEFAULT_STACK_MAX */
 } NovaTaskState;
+
+#define NOVA_DEFAULT_STACK_MAX 100000
 
 #ifdef _WIN32
 static __declspec(thread) NovaTaskState nova_tls_task = {0, 0, 0};
@@ -110,8 +114,10 @@ static void nova_set_error(const char* msg) {
    reached via nova_cur() — so once green tasks share a carrier thread, a contained crash
    longjmps to the CURRENT task's own jmp_buf, never another task's (the design's fatal
    issue #2). On today's runtime nova_cur() is the per-thread default, so behavior is
-   identical. (g_stack_depth stays a global for now — it's checked per function entry, so
-   it gets made per-task when the scheduler lands, to avoid nova_cur() overhead per call.) */
+   identical. (Stage 1.5: stack_depth + stack_max are now ALSO per-task in NovaTaskState,
+   completing the TLS migration — fixing the pre-existing race where 16 pool threads shared
+   one global g_stack_depth, and the green-task leak where a yielded fiber left the global
+   max lowered. The nova_cur() per fn-entry is one predictable TLS load + branch.) */
 
 static void nova_reset_call_depth(void);     /* defined alongside g_stack_depth below */
 
@@ -3192,7 +3198,6 @@ static __thread int        nova_carrier_ready = 0;
 #endif
 
 static void nova_fiber_limit_stack(void);
-static void nova_fiber_restore_stack(void);
 
 static void nova_ensure_carrier(void) {
     if (nova_carrier_ready) return;
@@ -3251,8 +3256,6 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
         fn(f->entry_fn, 0);
     }
     f->task.fault_active = 0;
-
-    nova_fiber_restore_stack();
 
     f->status = 3;
     if (f->resumer && f->resumer->handle)
@@ -3341,8 +3344,6 @@ static void nova_posix_fiber_trampoline(void) {
         fn(f->entry_fn, 0);
     }
     f->task.fault_active = 0;
-
-    nova_fiber_restore_stack();
 
     f->status = 3;
     if (f->resumer)
@@ -10817,47 +10818,43 @@ void nova_rt_process_exit_notify(int64_t pid, int64_t reason) {
     }
 }
 
-/* ── Track 8: F027 Stack Overflow Guard ──────────────────────────────────── */
-
-static volatile int g_stack_depth = 0;
-static int g_stack_max = 100000;
+/* ── Track 8: F027 Stack Overflow Guard (Stage 1.5: per-task, not global) ──── */
 
 /* Reset recursion-depth counter after a contained crash: the longjmp out of a
-   panicking spawned Process skips the per-frame decrements, so without this the
-   global counter would creep up over many crashes and eventually false-trip. */
-static void nova_reset_call_depth(void) { g_stack_depth = 0; }
+   panicking task skips the per-frame decrements, so without this the counter
+   would creep up over many crashes and eventually false-trip. Per-task now. */
+static void nova_reset_call_depth(void) { nova_cur()->stack_depth = 0; }
 
 void nova_rt_stack_enter(void) {
-    if (++g_stack_depth > g_stack_max) {
-        fprintf(stderr, "NOVA panic: stack overflow (depth > %d)\n", g_stack_max);
+    NovaTaskState* t = nova_cur();
+    int64_t max = t->stack_max > 0 ? t->stack_max : NOVA_DEFAULT_STACK_MAX;
+    if (++t->stack_depth > max) {
+        fprintf(stderr, "NOVA panic: stack overflow (depth > %lld)\n", (long long)max);
         fflush(stderr);
-        g_stack_depth = 0;
+        t->stack_depth = 0;
         nova_panic("stack overflow");
     }
 }
 
 void nova_rt_stack_exit(void) {
-    if (g_stack_depth > 0) --g_stack_depth;
+    NovaTaskState* t = nova_cur();
+    if (t->stack_depth > 0) --t->stack_depth;
 }
 
 void nova_rt_stack_set_max(int64_t max) {
-    if (max > 0 && max <= 10000000) g_stack_max = (int)max;
+    if (max > 0 && max <= 10000000) nova_cur()->stack_max = max;
 }
 
-static int nova_fiber_saved_stack_max = 0;
-
+/* A fiber gets its own (lower) limit on its own 32KB stack, in its OWN
+   NovaTaskState — so a yield can't leave another task's limit clobbered (the
+   bug the old global g_stack_max had). No save/restore: the fiber's task state
+   is discarded when the fiber finishes; the carrier keeps its own. */
 static void nova_fiber_limit_stack(void) {
-    nova_fiber_saved_stack_max = g_stack_max;
-    int fiber_max = NOVA_FIBER_STACK_SIZE / 256;
+    NovaTaskState* t = nova_cur();
+    int64_t fiber_max = NOVA_FIBER_STACK_SIZE / 256;
     if (fiber_max < 64) fiber_max = 64;
-    g_stack_max = fiber_max;
-    g_stack_depth = 0;
-}
-
-static void nova_fiber_restore_stack(void) {
-    if (nova_fiber_saved_stack_max > 0)
-        g_stack_max = nova_fiber_saved_stack_max;
-    g_stack_depth = 0;
+    t->stack_max = fiber_max;
+    t->stack_depth = 0;
 }
 
 /* ── Track 8: @deprecated warning ────────────────────────────────────────── */
