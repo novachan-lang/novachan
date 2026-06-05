@@ -3464,7 +3464,9 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     me->status = 2;
     SwitchToFiber(f->handle);
     nova_current_fiber = me;
-    nova_current_task = NULL;
+    nova_current_task = &me->task;   /* restore the RESUMER's own task state (Stage 2 F7):
+                                        correct for the carrier loop AND for nested fibers
+                                        (a generator resuming an upstream generator). */
     me->status = 1;
     return (f->status == 3) ? 1 : 0;
 }
@@ -3574,7 +3576,9 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     nova_current_fiber = f;
     nova_asm_switch(&me->saved_sp, &f->saved_sp);
     nova_current_fiber = me;
-    nova_current_task = NULL;
+    nova_current_task = &me->task;   /* restore the RESUMER's own task state (Stage 2 F7):
+                                        correct for the carrier loop AND for nested fibers
+                                        (a generator resuming an upstream generator). */
     me->status = 1;
     return (f->status == 3) ? 1 : 0;
 }

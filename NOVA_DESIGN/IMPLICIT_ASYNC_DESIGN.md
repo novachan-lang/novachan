@@ -379,12 +379,14 @@ use-after-free. **REQUIREMENT: live-count = count of tasks not yet DONE (parked 
 finalize_task (incl. monitor sends) must COMPLETE before the task is counted DONE and before wait_all
 proceeds to free procs.**
 
-**F7 (SERIOUS) — fiber_resume returns with `nova_current_task = NULL`** (Stage 1 code, nova_runtime.c
-~3284/3396 set it NULL after the switch returns — correct for the user-facing fiber API, wrong for the
-carrier loop). After `fiber_resume` returns to the carrier, any finalize_task work (channel_send →
-deep_copy → error-flag paths) runs with nova_cur() falling through to the thread default.
-**REQUIREMENT: the carrier loop explicitly sets `nova_current_task = &carrier_state` immediately after
-fiber_resume returns, before any scheduler-side work** (the carrier needs its OWN NovaTaskState).
+**F7 (SERIOUS) — ✅ RESOLVED 2026-06-05.** fiber_resume now restores the RESUMER's own task state on
+return — `nova_current_task = &me->task` (both the Windows-Fiber and POSIX-asm paths), instead of NULL.
+This fixes it for BOTH the future carrier loop AND nested fibers (a generator resuming an upstream
+generator). Validated by fiber_nested_test.nova: a parent fiber that resumes a child then PANICS is now
+CONTAINED to its own fiber — without the fix the parent resumed with NULL→thread-default state
+(fault_active=0) and the panic terminated the whole program. Original finding for the record: Stage 1
+code set nova_current_task NULL after the switch (fine for a top-level fiber whose resumer is a real
+thread, wrong for nested fibers / the carrier loop).
 
 **C8/C9/C10 (CONCERNS):** (8) cooperative preemption at fn-ENTRY does NOT fire in tight loops that call
 only builtins (atomic_add, integer ops) — so a CPU-bound `while k<N: atomic_add(...)` never yields; on
