@@ -3159,6 +3159,275 @@ int64_t nova_rt_channel_recv_timeout(int64_t handle, int64_t timeout_ms) {
 #endif
 }
 
+/* ── Green-task context-switch primitive (Stage 1 of implicit-async) ─────
+   Each fiber has its own 32KB stack and its own NovaTaskState (from Stage 0).
+   The carrier thread (main or pool worker) is converted to a fiber on first
+   use. Win: Fibers API (CreateFiber/SwitchToFiber). POSIX x86_64: hand-written
+   asm save/restore + mmap stacks with mprotect guard pages. */
+
+#define NOVA_FIBER_STACK_SIZE  32768
+
+typedef struct NovaFiber {
+    NovaTaskState     task;
+    int               status;       /* 0=created 1=running 2=suspended 3=finished */
+    int64_t           entry_fn;     /* NOVA closure */
+    struct NovaFiber* resumer;
+#ifdef _WIN32
+    LPVOID            handle;
+#else
+    uint64_t          saved_sp;
+    uint8_t*          stack_mem;
+    size_t            stack_alloc;
+#endif
+} NovaFiber;
+
+#ifdef _WIN32
+static __declspec(thread) NovaFiber* nova_current_fiber = NULL;
+static __declspec(thread) NovaFiber  nova_carrier_fiber;
+static __declspec(thread) int        nova_carrier_ready = 0;
+#else
+static __thread NovaFiber* nova_current_fiber = NULL;
+static __thread NovaFiber  nova_carrier_fiber;
+static __thread int        nova_carrier_ready = 0;
+#endif
+
+static void nova_fiber_limit_stack(void);
+static void nova_fiber_restore_stack(void);
+
+static void nova_ensure_carrier(void) {
+    if (nova_carrier_ready) return;
+    memset(&nova_carrier_fiber, 0, sizeof(NovaFiber));
+#ifdef _WIN32
+    if (IsThreadAFiber())
+        nova_carrier_fiber.handle = GetCurrentFiber();
+    else {
+        nova_carrier_fiber.handle = ConvertThreadToFiber(NULL);
+        if (!nova_carrier_fiber.handle) return;
+    }
+#endif
+    nova_carrier_fiber.status = 1;
+    nova_carrier_ready = 1;
+    nova_current_fiber = &nova_carrier_fiber;
+}
+
+/* ── Windows Fibers ──────────────────────────────────────────────────── */
+#ifdef _WIN32
+
+int _resetstkoflw(void);
+
+static LONG WINAPI nova_fiber_overflow_handler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+        _resetstkoflw();
+        NovaTaskState* ft = nova_cur();
+        if (ft->fault_active) {
+            ft->crashed = 1;
+            longjmp(ft->fault_buf, 1);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static volatile int nova_fiber_veh_installed = 0;
+
+static void nova_install_fiber_veh(void) {
+    if (nova_fiber_veh_installed) return;
+    AddVectoredExceptionHandler(1, nova_fiber_overflow_handler);
+    nova_fiber_veh_installed = 1;
+}
+
+static void CALLBACK nova_fiber_entry(LPVOID param) {
+    NovaFiber* f = (NovaFiber*)param;
+    nova_current_fiber = f;
+    nova_current_task = &f->task;
+    f->status = 1;
+
+    nova_fiber_limit_stack();
+
+    f->task.fault_active = 1;
+    f->task.crashed = 0;
+    if (setjmp(f->task.fault_buf) == 0) {
+        int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
+        nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+        fn(f->entry_fn, 0);
+    }
+    f->task.fault_active = 0;
+
+    nova_fiber_restore_stack();
+
+    f->status = 3;
+    if (f->resumer && f->resumer->handle)
+        SwitchToFiber(f->resumer->handle);
+    for (;;) SleepEx(INFINITE, FALSE);
+}
+
+int64_t nova_rt_fiber_create(int64_t closure) {
+    nova_install_fiber_veh();
+    NovaFiber* f = (NovaFiber*)calloc(1, sizeof(NovaFiber));
+    if (!f) return 0;
+    f->entry_fn = closure;
+    f->status = 0;
+    f->handle = CreateFiber((SIZE_T)NOVA_FIBER_STACK_SIZE, nova_fiber_entry, f);
+    if (!f->handle) { free(f); return 0; }
+    return (int64_t)(uintptr_t)f;
+}
+
+int64_t nova_rt_fiber_resume(int64_t handle) {
+    NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
+    if (!f || f->status == 3) return 1;
+    nova_ensure_carrier();
+    NovaFiber* me = nova_current_fiber;
+    if (!me) return -1;
+    f->resumer = me;
+    me->status = 2;
+    SwitchToFiber(f->handle);
+    nova_current_fiber = me;
+    nova_current_task = NULL;
+    me->status = 1;
+    return (f->status == 3) ? 1 : 0;
+}
+
+int64_t nova_rt_fiber_yield(void) {
+    NovaFiber* me = nova_current_fiber;
+    if (!me || !me->resumer) return 0;
+    me->status = 2;
+    SwitchToFiber(me->resumer->handle);
+    nova_current_fiber = me;
+    nova_current_task = &me->task;
+    me->status = 1;
+    return 0;
+}
+
+int64_t nova_rt_fiber_is_done(int64_t handle) {
+    NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
+    return (f && f->status == 3) ? 1 : 0;
+}
+
+/* ── POSIX x86_64 asm context switch ──────────────────────────────────── */
+#elif defined(__x86_64__)
+
+__attribute__((naked, noinline))
+void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp) {
+    __asm__ volatile (
+        "pushq %%rbx\n\t"
+        "pushq %%rbp\n\t"
+        "pushq %%r12\n\t"
+        "pushq %%r13\n\t"
+        "pushq %%r14\n\t"
+        "pushq %%r15\n\t"
+        "movq %%rsp, (%%rdi)\n\t"
+        "movq (%%rsi), %%rsp\n\t"
+        "popq %%r15\n\t"
+        "popq %%r14\n\t"
+        "popq %%r13\n\t"
+        "popq %%r12\n\t"
+        "popq %%rbp\n\t"
+        "popq %%rbx\n\t"
+        "retq\n\t"
+    );
+}
+
+static void nova_posix_fiber_trampoline(void) {
+    NovaFiber* f = nova_current_fiber;
+    nova_current_task = &f->task;
+    f->status = 1;
+
+    nova_fiber_limit_stack();
+
+    f->task.fault_active = 1;
+    f->task.crashed = 0;
+    if (setjmp(f->task.fault_buf) == 0) {
+        int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
+        nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+        fn(f->entry_fn, 0);
+    }
+    f->task.fault_active = 0;
+
+    nova_fiber_restore_stack();
+
+    f->status = 3;
+    if (f->resumer)
+        nova_asm_switch(&f->saved_sp, &f->resumer->saved_sp);
+    for (;;) { }
+}
+
+int64_t nova_rt_fiber_create(int64_t closure) {
+    NovaFiber* f = (NovaFiber*)calloc(1, sizeof(NovaFiber));
+    if (!f) return 0;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    size_t total = (size_t)NOVA_FIBER_STACK_SIZE + (size_t)page_size;
+
+    f->stack_mem = (uint8_t*)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (f->stack_mem == MAP_FAILED) { free(f); return 0; }
+    mprotect(f->stack_mem, (size_t)page_size, PROT_NONE);
+
+    f->stack_alloc = total;
+    f->entry_fn = closure;
+    f->status = 0;
+
+    uint64_t* sp = (uint64_t*)(f->stack_mem + total);
+    sp = (uint64_t*)((uintptr_t)sp & ~0xFULL);
+    *(--sp) = 0;
+    *(--sp) = (uint64_t)nova_posix_fiber_trampoline;
+    *(--sp) = 0;  /* r15 */
+    *(--sp) = 0;  /* r14 */
+    *(--sp) = 0;  /* r13 */
+    *(--sp) = 0;  /* r12 */
+    *(--sp) = 0;  /* rbp */
+    *(--sp) = 0;  /* rbx */
+    f->saved_sp = (uint64_t)sp;
+
+    return (int64_t)(uintptr_t)f;
+}
+
+int64_t nova_rt_fiber_resume(int64_t handle) {
+    NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
+    if (!f || f->status == 3) return 1;
+    nova_ensure_carrier();
+    NovaFiber* me = nova_current_fiber;
+    if (!me) return -1;
+    f->resumer = me;
+    me->status = 2;
+    nova_current_fiber = f;
+    nova_asm_switch(&me->saved_sp, &f->saved_sp);
+    nova_current_fiber = me;
+    nova_current_task = NULL;
+    me->status = 1;
+    return (f->status == 3) ? 1 : 0;
+}
+
+int64_t nova_rt_fiber_yield(void) {
+    NovaFiber* me = nova_current_fiber;
+    if (!me || !me->resumer) return 0;
+    me->status = 2;
+    NovaFiber* target = me->resumer;
+    nova_asm_switch(&me->saved_sp, &target->saved_sp);
+    nova_current_fiber = me;
+    nova_current_task = &me->task;
+    me->status = 1;
+    return 0;
+}
+
+int64_t nova_rt_fiber_is_done(int64_t handle) {
+    NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
+    return (f && f->status == 3) ? 1 : 0;
+}
+
+/* ── Unsupported platform stubs ───────────────────────────────────────── */
+#else
+
+int64_t nova_rt_fiber_create(int64_t c) {
+    fprintf(stderr, "nova: fibers not supported on this platform\n"); return 0;
+}
+int64_t nova_rt_fiber_resume(int64_t h) { return 1; }
+int64_t nova_rt_fiber_yield(void)       { return 0; }
+int64_t nova_rt_fiber_is_done(int64_t h) { return 1; }
+
+#endif
+/* ── end fiber primitive ─────────────────────────────────────────────── */
+
 /* ── Thread Pool + Process / Spawn ───────────────────────────────────────── */
 
 typedef void (*nova_spawn_entry)(void*);
@@ -10573,6 +10842,22 @@ void nova_rt_stack_exit(void) {
 
 void nova_rt_stack_set_max(int64_t max) {
     if (max > 0 && max <= 10000000) g_stack_max = (int)max;
+}
+
+static int nova_fiber_saved_stack_max = 0;
+
+static void nova_fiber_limit_stack(void) {
+    nova_fiber_saved_stack_max = g_stack_max;
+    int fiber_max = NOVA_FIBER_STACK_SIZE / 256;
+    if (fiber_max < 64) fiber_max = 64;
+    g_stack_max = fiber_max;
+    g_stack_depth = 0;
+}
+
+static void nova_fiber_restore_stack(void) {
+    if (nova_fiber_saved_stack_max > 0)
+        g_stack_max = nova_fiber_saved_stack_max;
+    g_stack_depth = 0;
 }
 
 /* ── Track 8: @deprecated warning ────────────────────────────────────────── */

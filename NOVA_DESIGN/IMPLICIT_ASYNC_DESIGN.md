@@ -5,13 +5,28 @@ studies + 3 NOVA-runtime maps + runtime-designer synthesis + devils-advocate str
 Implementation is a multi-session effort (~6–12 months solo, honest estimate). This doc is the
 durable foundation — read it before any implementation stage.
 
-**IMPLEMENTATION PROGRESS:** ✅ **Stage 0 COMPLETE (2026-06-05, commits 3cdf3f4 + 21fd822).**
-Both fatal TLS issues fixed — error state (0a, compiler+runtime, was the GO/NO-GO: PASSED —
-byte-identical, 255/255, perf-neutral on compute) and the fault boundary (0b, runtime-only) now
-live in a per-task `NovaTaskState` reached via `nova_cur()`/`nova_current_task`. The runtime is
-ready for the M:N scheduler to give each green task its own NovaTaskState. `g_stack_depth` is
-deferred to the scheduler stage (it's checked per fn-entry; make it per-task then to avoid
-nova_cur() overhead). NEXT: Stage 1 (context-switch primitive).
+**IMPLEMENTATION PROGRESS:**
+✅ **Stage 0 COMPLETE (2026-06-05, commits 3cdf3f4 + 21fd822).** Both fatal TLS issues fixed —
+error state (0a) and fault boundary (0b) now per-task in NovaTaskState via nova_cur(). GO/NO-GO
+passed (byte-identical, 255/255, perf-neutral).
+
+✅ **Stage 1 COMPLETE (2026-06-05).** Green-task context-switch primitive validated:
+- **Windows:** Fibers API (CreateFiber/SwitchToFiber) — OS manages stacks + register save.
+- **POSIX x86_64:** hand-written asm (push/pop RBX/RBP/R12-15, save/restore RSP, retq) + mmap
+  stacks with mprotect guard pages.
+- **35ns per context switch** (measured, 20000 switches; target was <200ns).
+- **1000 round-trips** verified (1001 resumes for 1000 yields + finish).
+- **Fault boundary on green stack** works: panic in a fiber longjmps to the per-fiber setjmp in
+  the trampoline; the fiber is marked finished; the carrier resumes. Validated by panic test.
+- **Interleaved fibers** correct: two fibers yield and resume in alternation (a1, b1, a2, b2).
+- **Per-fiber NovaTaskState** + reduced stack-depth limit in trampoline.
+- VEH installed for hardware stack overflow (EXCEPTION_STACK_OVERFLOW → _resetstkoflw + longjmp).
+  Known v1 limitation: deep recursion that exhausts the 32KB stack before the software check
+  fires can hang the VEH's longjmp on the exhausted stack; practical for v1 since normal code
+  stays well within the ~128-frame software limit.
+- New builtins: fiber_create(closure), fiber_resume(handle), fiber_yield(), fiber_is_done(handle).
+- Test: fiber_test.nova (7 cases: basic, yield, multi-yield, 1000-trips, perf, panic, interleaved).
+NEXT: Stage 2 (M:N scheduler).
 
 ## The goal
 A NOVA Process that does blocking-LOOKING I/O (`tcp_recv`, `channel_recv`, `accept`, …) must
