@@ -2978,7 +2978,8 @@ typedef struct {
     int64_t  count;
     int64_t  closed;
     int64_t  bound;   /* 0 = unbounded; >0 = max queued items before send back-pressures */
-    void*    green_waiters;  /* Stage 2a: head of a list of green tasks parked on recv */
+    void*    green_waiters;       /* Stage 2a: green tasks parked on recv (empty channel) */
+    void*    green_send_waiters;  /* Stage 2a (F3): green tasks parked on send (full bounded channel) */
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;
@@ -2995,10 +2996,12 @@ typedef struct {
    channel op, it PARKS (yields to the single carrier) instead of blocking the
    OS thread — so thousands of green tasks coordinate on one thread. */
 static int  nova_sched_in_task(void);          /* 1 if running inside a green task */
-static void nova_sched_park_on(NovaChannel* ch);   /* enqueue current task on ch->green_waiters (caller holds the lock) */
+static void nova_sched_park_on(NovaChannel* ch);   /* park current task on ch->green_waiters (recv; caller holds the lock) */
+static void nova_sched_park_send(NovaChannel* ch);  /* park current task on ch->green_send_waiters (send; caller holds the lock) */
 static void nova_sched_yield_now(void);            /* yield to the carrier (call AFTER unlocking) */
-static void nova_sched_wake_one(NovaChannel* ch);  /* move one parked waiter back to the run-queue (caller holds the lock) */
-static void nova_sched_wake_all(NovaChannel* ch);  /* wake all parked waiters (used on close) */
+static void nova_sched_wake_one(NovaChannel* ch);  /* move one parked RECV waiter back to the run-queue (caller holds the lock) */
+static void nova_sched_wake_send_one(NovaChannel* ch); /* move one parked SEND waiter back to the run-queue */
+static void nova_sched_wake_all(NovaChannel* ch);  /* wake all parked waiters, both kinds (used on close) */
 
 int64_t nova_rt_channel_create(void) {
     NovaChannel* ch = (NovaChannel*)nova_heap_alloc(sizeof(NovaChannel), NOVA_MEM_CHANNEL);
@@ -3010,6 +3013,7 @@ int64_t nova_rt_channel_create(void) {
     ch->closed = 0;
     ch->bound = 0;
     ch->green_waiters = NULL;
+    ch->green_send_waiters = NULL;
 #ifdef _WIN32
     InitializeCriticalSection(&ch->lock);
     InitializeConditionVariable(&ch->not_empty);
@@ -3062,6 +3066,41 @@ int64_t nova_rt_channel_send(int64_t handle, int64_t value) {
     /* Ownership: the receiver gets an independent deep copy, so sender and
        receiver never share mutable heap state across the process boundary. */
     int64_t copy = nova_rt_deep_copy(value);
+    /* Stage 2a (F3): a green task sending to a FULL bounded channel PARKS
+       (yields to the carrier) instead of blocking the OS thread; a receiver's
+       dequeue unparks it. */
+    if (nova_sched_in_task()) {
+        for (;;) {
+#ifdef _WIN32
+            EnterCriticalSection(&ch->lock);
+            if (ch->closed) { LeaveCriticalSection(&ch->lock); nova_rc_dec(copy); return -1; }
+            if (ch->bound <= 0 || ch->count < ch->bound) {
+                int we = (ch->count == 0);
+                channel_enqueue(ch, copy);
+                if (we) WakeConditionVariable(&ch->not_empty);
+                nova_sched_wake_one(ch);
+                LeaveCriticalSection(&ch->lock);
+                return 0;
+            }
+            nova_sched_park_send(ch);
+            LeaveCriticalSection(&ch->lock);
+#else
+            pthread_mutex_lock(&ch->lock);
+            if (ch->closed) { pthread_mutex_unlock(&ch->lock); nova_rc_dec(copy); return -1; }
+            if (ch->bound <= 0 || ch->count < ch->bound) {
+                int we = (ch->count == 0);
+                channel_enqueue(ch, copy);
+                if (we) pthread_cond_signal(&ch->not_empty);
+                nova_sched_wake_one(ch);
+                pthread_mutex_unlock(&ch->lock);
+                return 0;
+            }
+            nova_sched_park_send(ch);
+            pthread_mutex_unlock(&ch->lock);
+#endif
+            nova_sched_yield_now();   /* resumed when a receiver frees a slot; retry */
+        }
+    }
 #ifdef _WIN32
     EnterCriticalSection(&ch->lock);
     while (ch->bound > 0 && ch->count >= ch->bound && !ch->closed)
@@ -3138,13 +3177,13 @@ int64_t nova_rt_channel_recv(int64_t handle) {
         for (;;) {
 #ifdef _WIN32
             EnterCriticalSection(&ch->lock);
-            if (ch->count > 0) { int64_t v = channel_dequeue(ch); WakeConditionVariable(&ch->not_full); LeaveCriticalSection(&ch->lock); return v; }
+            if (ch->count > 0) { int64_t v = channel_dequeue(ch); WakeConditionVariable(&ch->not_full); nova_sched_wake_send_one(ch); LeaveCriticalSection(&ch->lock); return v; }
             if (ch->closed) { LeaveCriticalSection(&ch->lock); return -1; }
             nova_sched_park_on(ch);
             LeaveCriticalSection(&ch->lock);
 #else
             pthread_mutex_lock(&ch->lock);
-            if (ch->count > 0) { int64_t v = channel_dequeue(ch); pthread_cond_signal(&ch->not_full); pthread_mutex_unlock(&ch->lock); return v; }
+            if (ch->count > 0) { int64_t v = channel_dequeue(ch); pthread_cond_signal(&ch->not_full); nova_sched_wake_send_one(ch); pthread_mutex_unlock(&ch->lock); return v; }
             if (ch->closed) { pthread_mutex_unlock(&ch->lock); return -1; }
             nova_sched_park_on(ch);
             pthread_mutex_unlock(&ch->lock);
@@ -3691,8 +3730,15 @@ static void nova_sched_park_on(NovaChannel* ch) {
     NovaSchedTask* t = nova_sched_current;
     if (!t) return;
     t->status = 2;
-    t->next = (NovaSchedTask*)ch->green_waiters;   /* push front of the channel's waiter list */
+    t->next = (NovaSchedTask*)ch->green_waiters;   /* push front of the channel's recv-waiter list */
     ch->green_waiters = (void*)t;
+}
+static void nova_sched_park_send(NovaChannel* ch) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return;
+    t->status = 2;
+    t->next = (NovaSchedTask*)ch->green_send_waiters;  /* push front of the send-waiter list */
+    ch->green_send_waiters = (void*)t;
 }
 static void nova_sched_yield_now(void) { nova_rt_fiber_yield(); }
 
@@ -3704,8 +3750,17 @@ static void nova_sched_wake_one(NovaChannel* ch) {
     t->status = 0;
     nova_rq_push(t);                               /* back to the run-queue */
 }
+static void nova_sched_wake_send_one(NovaChannel* ch) {
+    NovaSchedTask* t = (NovaSchedTask*)ch->green_send_waiters;
+    if (!t) return;
+    ch->green_send_waiters = (void*)t->next;
+    t->next = NULL;
+    t->status = 0;
+    nova_rq_push(t);
+}
 static void nova_sched_wake_all(NovaChannel* ch) {
     while (ch->green_waiters) nova_sched_wake_one(ch);
+    while (ch->green_send_waiters) nova_sched_wake_send_one(ch);
 }
 
 /* Create a green task from a closure and enqueue it. */
