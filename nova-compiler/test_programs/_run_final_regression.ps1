@@ -208,7 +208,8 @@ $domain_tests = @(
     'globx',
     'fuzzx',
     'bloomx',
-    'unionx'
+    'unionx',
+    'triex'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
