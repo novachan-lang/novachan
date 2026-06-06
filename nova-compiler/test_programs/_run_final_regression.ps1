@@ -253,6 +253,7 @@ $domain_tests = @(
     'setx',
     'progressx',
     'netaddrx',
+    'rulengx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
