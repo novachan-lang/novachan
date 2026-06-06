@@ -232,6 +232,7 @@ $domain_tests = @(
     'matbuilderx',
     'pluralx',
     'fifolifox',
+    'geox',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
