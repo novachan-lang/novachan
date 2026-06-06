@@ -254,6 +254,7 @@ $domain_tests = @(
     'progressx',
     'netaddrx',
     'rulengx',
+    'benchx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
