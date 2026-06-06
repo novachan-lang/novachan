@@ -175,6 +175,7 @@ $domain_tests = @(
     'envx',
     'ratex',
     'dotenvx',
+    'cronx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
