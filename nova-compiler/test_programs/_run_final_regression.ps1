@@ -240,6 +240,7 @@ $domain_tests = @(
     'emailx',
     'opx',
     'bstx',
+    'phonex',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
