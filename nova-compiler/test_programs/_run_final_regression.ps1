@@ -210,6 +210,7 @@ $domain_tests = @(
     'schemax',
     'hexdumpx',
     'crcx',
+    'ringx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
