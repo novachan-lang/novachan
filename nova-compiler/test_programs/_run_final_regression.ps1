@@ -211,7 +211,8 @@ $domain_tests = @(
     'unionx',
     'triex',
     'topox',
-    'dijkx'
+    'dijkx',
+    'conhashx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
