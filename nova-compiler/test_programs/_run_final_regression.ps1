@@ -213,7 +213,8 @@ $domain_tests = @(
     'topox',
     'dijkx',
     'conhashx',
-    'kmpx'
+    'kmpx',
+    'selectx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
