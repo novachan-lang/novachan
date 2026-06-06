@@ -204,7 +204,8 @@ $domain_tests = @(
     'spix',
     'inix',
     'csvw',
-    'green_transparent'
+    'green_transparent',
+    'globx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
