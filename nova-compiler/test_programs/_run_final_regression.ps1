@@ -216,6 +216,7 @@ $domain_tests = @(
     'bitmapx',
     'pubsubx',
     'ipx',
+    'permutx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
