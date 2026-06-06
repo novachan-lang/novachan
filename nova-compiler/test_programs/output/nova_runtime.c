@@ -1942,6 +1942,148 @@ int64_t nova_rt_exec(int64_t cmd_str) {
     return s;
 }
 
+/* ── Interactive subprocess with stdin/stdout pipes ───────────────────── */
+#ifdef _WIN32
+typedef struct {
+    HANDLE hProcess;
+    HANDLE hStdinWrite;
+    HANDLE hStdoutRead;
+} NovaProcHandle;
+
+int64_t nova_rt_proc_open(int64_t cmd_str) {
+    const char* cmd = (const char*)(uintptr_t)cmd_str;
+    if (!cmd) return 0;
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    HANDLE hStdinRead, hStdinWrite, hStdoutRead, hStdoutWrite;
+    if (!CreatePipe(&hStdinRead, &hStdinWrite, &sa, 0)) return 0;
+    if (!CreatePipe(&hStdoutRead, &hStdoutWrite, &sa, 0)) {
+        CloseHandle(hStdinRead); CloseHandle(hStdinWrite); return 0;
+    }
+    SetHandleInformation(hStdinWrite, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hStdinRead; si.hStdOutput = hStdoutWrite; si.hStdError = hStdoutWrite;
+    PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+    char* cmd_buf = _strdup(cmd);
+    BOOL ok = CreateProcessA(NULL, cmd_buf, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    free(cmd_buf);
+    CloseHandle(hStdinRead); CloseHandle(hStdoutWrite);
+    if (!ok) { CloseHandle(hStdinWrite); CloseHandle(hStdoutRead); return 0; }
+    CloseHandle(pi.hThread);
+    NovaProcHandle* ph = (NovaProcHandle*)malloc(sizeof(NovaProcHandle));
+    if (!ph) { CloseHandle(pi.hProcess); CloseHandle(hStdinWrite); CloseHandle(hStdoutRead); return 0; }
+    ph->hProcess = pi.hProcess; ph->hStdinWrite = hStdinWrite; ph->hStdoutRead = hStdoutRead;
+    return (int64_t)(uintptr_t)ph;
+}
+
+int64_t nova_rt_proc_write_stdin(int64_t handle, int64_t data_str) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (!ph) return 0;
+    const char* data = (const char*)(uintptr_t)data_str;
+    if (!data) return 0;
+    DWORD written; WriteFile(ph->hStdinWrite, data, (DWORD)strlen(data), &written, NULL);
+    return (int64_t)written;
+}
+
+int64_t nova_rt_proc_read_stdout(int64_t handle) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (!ph) return (int64_t)(uintptr_t)"";
+    char buf[4096]; DWORD avail = 0;
+    if (!PeekNamedPipe(ph->hStdoutRead, NULL, 0, NULL, &avail, NULL) || avail == 0) {
+        DWORD n; if (!ReadFile(ph->hStdoutRead, buf, 1, &n, NULL) || n == 0)
+            return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+        char* r = (char*)malloc(2); r[0] = buf[0]; r[1] = 0;
+        return (int64_t)(uintptr_t)r;
+    }
+    DWORD to_read = avail < 4095 ? avail : 4095; DWORD n;
+    ReadFile(ph->hStdoutRead, buf, to_read, &n, NULL);
+    buf[n] = 0;
+    return (int64_t)(uintptr_t)nova_fat_str_create(buf, (size_t)n);
+}
+
+int64_t nova_rt_proc_close_stdin(int64_t handle) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (ph && ph->hStdinWrite) { CloseHandle(ph->hStdinWrite); ph->hStdinWrite = NULL; }
+    return 0;
+}
+
+int64_t nova_rt_proc_wait(int64_t handle) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (!ph) return -1;
+    WaitForSingleObject(ph->hProcess, INFINITE);
+    DWORD code; GetExitCodeProcess(ph->hProcess, &code);
+    CloseHandle(ph->hProcess);
+    if (ph->hStdinWrite) CloseHandle(ph->hStdinWrite);
+    CloseHandle(ph->hStdoutRead);
+    free(ph);
+    return (int64_t)code;
+}
+#else
+typedef struct {
+    pid_t pid;
+    int stdin_fd;
+    int stdout_fd;
+} NovaProcHandle;
+
+int64_t nova_rt_proc_open(int64_t cmd_str) {
+    const char* cmd = (const char*)(uintptr_t)cmd_str;
+    if (!cmd) return 0;
+    int stdin_pipe[2], stdout_pipe[2];
+    if (pipe(stdin_pipe) < 0) return 0;
+    if (pipe(stdout_pipe) < 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); return 0; }
+    pid_t pid = fork();
+    if (pid < 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); close(stdout_pipe[0]); close(stdout_pipe[1]); return 0; }
+    if (pid == 0) {
+        close(stdin_pipe[1]); close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], 0); dup2(stdout_pipe[1], 1); dup2(stdout_pipe[1], 2);
+        close(stdin_pipe[0]); close(stdout_pipe[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    close(stdin_pipe[0]); close(stdout_pipe[1]);
+    NovaProcHandle* ph = (NovaProcHandle*)malloc(sizeof(NovaProcHandle));
+    if (!ph) { close(stdin_pipe[1]); close(stdout_pipe[0]); return 0; }
+    ph->pid = pid; ph->stdin_fd = stdin_pipe[1]; ph->stdout_fd = stdout_pipe[0];
+    return (int64_t)(uintptr_t)ph;
+}
+
+int64_t nova_rt_proc_write_stdin(int64_t handle, int64_t data_str) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (!ph) return 0;
+    const char* data = (const char*)(uintptr_t)data_str;
+    if (!data) return 0;
+    ssize_t w = write(ph->stdin_fd, data, strlen(data));
+    return (int64_t)(w > 0 ? w : 0);
+}
+
+int64_t nova_rt_proc_read_stdout(int64_t handle) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (!ph) return (int64_t)(uintptr_t)"";
+    char buf[4096]; ssize_t n = read(ph->stdout_fd, buf, 4095);
+    if (n <= 0) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    buf[n] = 0;
+    return (int64_t)(uintptr_t)nova_fat_str_create(buf, (size_t)n);
+}
+
+int64_t nova_rt_proc_close_stdin(int64_t handle) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (ph && ph->stdin_fd >= 0) { close(ph->stdin_fd); ph->stdin_fd = -1; }
+    return 0;
+}
+
+int64_t nova_rt_proc_wait(int64_t handle) {
+    NovaProcHandle* ph = (NovaProcHandle*)(uintptr_t)handle;
+    if (!ph) return -1;
+    int status; waitpid(ph->pid, &status, 0);
+    if (ph->stdin_fd >= 0) close(ph->stdin_fd);
+    close(ph->stdout_fd);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    free(ph);
+    return (int64_t)code;
+}
+#endif
+
 /* ── Filesystem utilities ────────────────────────────────────────────────── */
 
 int64_t nova_rt_mkdir(int64_t path_val) {
