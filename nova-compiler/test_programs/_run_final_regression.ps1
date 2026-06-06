@@ -201,6 +201,7 @@ $domain_tests = @(
     'assertx',
     'linkx2',
     'mimesx',
+    'httpclx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
