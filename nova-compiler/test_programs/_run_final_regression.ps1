@@ -213,6 +213,7 @@ $domain_tests = @(
     'ringx',
     'mathfx',
     'tsvx',
+    'bitmapx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
