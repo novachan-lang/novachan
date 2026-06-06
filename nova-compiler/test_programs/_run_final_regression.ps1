@@ -178,6 +178,7 @@ $domain_tests = @(
     'cronx',
     'markdownx',
     'jwtx',
+    'migrationx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
