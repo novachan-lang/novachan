@@ -194,6 +194,7 @@ $domain_tests = @(
     'resultx',
     'iterx',
     'configx',
+    'treex',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
