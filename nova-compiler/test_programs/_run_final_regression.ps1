@@ -243,6 +243,7 @@ $domain_tests = @(
     'phonex',
     'colorconvx',
     'httpstatusx',
+    'numfmtx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
