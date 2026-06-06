@@ -227,6 +227,7 @@ $domain_tests = @(
     'datefmtx',
     'memox',
     'routerx',
+    'workerx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
