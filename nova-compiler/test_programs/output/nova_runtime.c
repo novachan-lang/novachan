@@ -3710,6 +3710,13 @@ typedef struct NovaSchedTask {
     int64_t fiber;                 /* handle from nova_rt_fiber_create */
     int     status;                /* 0=runnable 1=running 2=parked 3=done */
     struct NovaSchedTask* next;    /* run-queue OR channel-waiter link (mutually exclusive) */
+    /* Monitoring support (mirrors NovaProcessInfo for green-task monitor/exit_reason) */
+    int64_t* monitors;
+    int64_t  monitor_count;
+    int64_t  monitor_cap;
+    int64_t  exit_status;          /* 0=normal, 1=crashed */
+    int64_t  exit_reason;          /* heap string: "normal" or the panic message */
+    int      finished;             /* 1 after task fully done + monitors notified */
 } NovaSchedTask;
 
 static NovaSchedTask* nova_rq_head = NULL;
@@ -3772,6 +3779,25 @@ static void nova_sched_wake_all(NovaChannel* ch) {
     while (ch->green_send_waiters) nova_sched_wake_send_one(ch);
 }
 
+/* Send a value to a channel from the scheduler loop (not inside a green task).
+   Direct enqueue + green-waiter wake: a parked green task sits on green_waiters,
+   not the condvar, so the normal OS-path send would not wake it. */
+static void nova_sched_notify_channel(int64_t ch_handle, int64_t value) {
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)ch_handle;
+#ifdef _WIN32
+    EnterCriticalSection(&ch->lock);
+#else
+    pthread_mutex_lock(&ch->lock);
+#endif
+    channel_enqueue(ch, value);
+    if (ch->green_waiters) nova_sched_wake_one(ch);
+#ifdef _WIN32
+    LeaveCriticalSection(&ch->lock);
+#else
+    pthread_mutex_unlock(&ch->lock);
+#endif
+}
+
 /* Create a green task from a closure and enqueue it. */
 int64_t nova_rt_sched_spawn(int64_t closure) {
     NovaSchedTask* t = (NovaSchedTask*)calloc(1, sizeof(NovaSchedTask));
@@ -3779,6 +3805,12 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
     t->fiber = nova_rt_fiber_create(closure);
     if (!t->fiber) { free(t); return 0; }
     t->status = 0;
+    t->monitors = NULL;
+    t->monitor_count = 0;
+    t->monitor_cap = 0;
+    t->exit_status = 0;
+    t->exit_reason = 0;
+    t->finished = 0;
     nova_rq_push(t);
     nova_sched_live++;
     return (int64_t)(uintptr_t)t;
@@ -3797,7 +3829,30 @@ int64_t nova_rt_sched_run(void) {
         t->status = 1;
         int64_t done = nova_rt_fiber_resume(t->fiber);
         nova_sched_current = NULL;
-        if (done == 1) { t->status = 3; nova_sched_live--; }
+        if (done == 1) {
+            /* Read crash status from the FIBER's task state (nova_cur() is the
+               carrier at this point, not the finished fiber) */
+            NovaFiber* fib = (NovaFiber*)(uintptr_t)t->fiber;
+            int crashed = fib->task.crashed;
+            t->exit_status = crashed ? 1 : 0;
+            {
+                const char* s = "normal";
+                if (crashed) {
+                    int64_t em = fib->task.error_msg;
+                    s = (em != 0) ? (const char*)(uintptr_t)em : "crashed";
+                }
+                size_t n = strlen(s);
+                char* c = (char*)malloc(n + 1);
+                if (c) memcpy(c, s, n + 1);
+                t->exit_reason = c ? (int64_t)(uintptr_t)c : 0;
+            }
+            /* Notify monitors: direct enqueue + green-waiter wake */
+            for (int64_t i = 0; i < t->monitor_count; i++)
+                nova_sched_notify_channel(t->monitors[i], t->exit_status);
+            t->finished = 1;
+            t->status = 3;
+            nova_sched_live--;
+        }
         /* if it parked, it linked itself onto a channel's green_waiters (not the run-queue) */
     }
     nova_sched_running = 0;
@@ -4399,6 +4454,25 @@ int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
 }
 
 int64_t nova_rt_monitor(int64_t proc_handle) {
+    /* Green mode: the handle is a NovaSchedTask*, not NovaProcessInfo*.
+       Single-carrier cooperative: no lock needed (only one thread).
+       Check nova_green_enabled() (not nova_sched_running) because handles
+       stay NovaSchedTask* even after sched_run returns. */
+    if (nova_green_enabled()) {
+        NovaSchedTask* gt = (NovaSchedTask*)(uintptr_t)proc_handle;
+        int64_t ch = nova_rt_channel_create();
+        if (gt->finished) {
+            nova_rt_channel_send(ch, gt->exit_status);
+            return ch;
+        }
+        if (gt->monitor_count >= gt->monitor_cap) {
+            gt->monitor_cap = gt->monitor_cap == 0 ? 4 : gt->monitor_cap * 2;
+            gt->monitors = (int64_t*)realloc(gt->monitors, (size_t)gt->monitor_cap * sizeof(int64_t));
+        }
+        gt->monitors[gt->monitor_count++] = ch;
+        return ch;
+    }
+
     NovaProcessInfo* proc = (NovaProcessInfo*)(uintptr_t)proc_handle;
     int64_t ch = nova_rt_channel_create();
 
@@ -4436,6 +4510,15 @@ int64_t nova_rt_monitor(int64_t proc_handle) {
    crash. Pairs with monitor(p) (which reports THAT it exited): a supervisor can log/decide
    on the reason. Returns "" if the process has not exited yet (or is unknown). */
 int64_t nova_rt_exit_reason(int64_t proc_handle) {
+    /* Green mode: handle is a NovaSchedTask* (process-lifetime discriminant) */
+    if (nova_green_enabled()) {
+        NovaSchedTask* gt = (NovaSchedTask*)(uintptr_t)proc_handle;
+        if (gt && gt->exit_reason != 0)
+            return gt->exit_reason;
+        char* e = (char*)malloc(1);
+        if (e) e[0] = '\0';
+        return (int64_t)(uintptr_t)e;
+    }
     NovaProcessInfo* proc = (NovaProcessInfo*)(uintptr_t)proc_handle;
     if (proc && proc->exit_reason != 0)
         return proc->exit_reason;

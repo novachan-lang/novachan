@@ -205,6 +205,7 @@ $domain_tests = @(
     'inix',
     'csvw',
     'green_transparent',
+    'green_monitor_test',
     'globx',
     'fuzzx',
     'bloomx',
