@@ -209,6 +209,7 @@ $domain_tests = @(
     'authx',
     'schemax',
     'hexdumpx',
+    'crcx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
