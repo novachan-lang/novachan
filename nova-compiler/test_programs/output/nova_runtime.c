@@ -4324,11 +4324,13 @@ int64_t nova_rt_shell(int64_t cmd_ptr) {
 int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
     /* TRANSPARENCY: in green mode, while running under the scheduler, spawn a
        green task instead of an OS-pool thread. ctx_ptr is the closure record
-       (slot 0 = fn_ptr), exactly what sched_spawn/fiber_create expect. Green
-       tasks share captures (cooperative single carrier); deep-copy-isolated
-       green spawn is a future refinement. */
+       (slot 0 = fn_ptr), exactly what sched_spawn/fiber_create expect. We
+       deep_copy the closure first so the green task gets an ISOLATED copy of its
+       captured environment — same process-isolation guarantee as OS-pool spawn
+       (deep_copy SHARES channels, so the spawner and task still share channels
+       for communication while non-channel state is isolated). */
     if (nova_green_enabled() && nova_sched_running) {
-        return nova_rt_sched_spawn(ctx_ptr);
+        return nova_rt_sched_spawn(nova_rt_deep_copy(ctx_ptr));
     }
     nova_is_multithreaded = 1;
     if (!nova_pool) nova_pool_init();
