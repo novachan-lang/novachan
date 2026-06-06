@@ -255,6 +255,7 @@ $domain_tests = @(
     'netaddrx',
     'rulengx',
     'benchx',
+    'aggx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
