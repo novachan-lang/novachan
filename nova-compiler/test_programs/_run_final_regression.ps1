@@ -167,6 +167,7 @@ $domain_tests = @(
     'seqx',
     'rchanx',
     'osname_test',
+    'must_use_test',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
