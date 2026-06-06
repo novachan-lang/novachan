@@ -183,6 +183,7 @@ $domain_tests = @(
     'poolx',
     'retryx',
     'healthx',
+    'metrx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
