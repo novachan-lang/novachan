@@ -219,7 +219,8 @@ $domain_tests = @(
     'dpx',
     'colorx',
     'tmplx',
-    'fsmx'
+    'fsmx',
+    'backoffx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
