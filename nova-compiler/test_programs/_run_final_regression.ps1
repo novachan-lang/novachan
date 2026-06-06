@@ -214,6 +214,7 @@ $domain_tests = @(
     'mathfx',
     'tsvx',
     'bitmapx',
+    'pubsubx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
