@@ -179,6 +179,7 @@ $domain_tests = @(
     'markdownx',
     'jwtx',
     'migrationx',
+    'circuitx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
