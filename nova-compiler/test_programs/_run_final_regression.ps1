@@ -241,6 +241,7 @@ $domain_tests = @(
     'opx',
     'bstx',
     'phonex',
+    'colorconvx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
