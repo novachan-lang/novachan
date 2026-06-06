@@ -177,6 +177,7 @@ $domain_tests = @(
     'dotenvx',
     'cronx',
     'markdownx',
+    'jwtx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
