@@ -248,6 +248,7 @@ $domain_tests = @(
     'rlimitx',
     'taskqx',
     'jsonqueryx',
+    'chanx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
