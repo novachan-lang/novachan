@@ -218,7 +218,8 @@ $domain_tests = @(
     'fenwickx',
     'dpx',
     'colorx',
-    'tmplx'
+    'tmplx',
+    'fsmx'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
