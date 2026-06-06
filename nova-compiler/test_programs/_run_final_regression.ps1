@@ -231,6 +231,7 @@ $domain_tests = @(
     'tokenx',
     'matbuilderx',
     'pluralx',
+    'fifolifox',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
