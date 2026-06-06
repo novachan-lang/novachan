@@ -251,6 +251,7 @@ $domain_tests = @(
     'chanx',
     'color256x',
     'setx',
+    'progressx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
