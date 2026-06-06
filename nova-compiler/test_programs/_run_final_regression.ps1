@@ -239,6 +239,7 @@ $domain_tests = @(
     'streakx',
     'emailx',
     'opx',
+    'bstx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
