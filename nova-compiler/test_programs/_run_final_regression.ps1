@@ -170,6 +170,7 @@ $domain_tests = @(
     'must_use_test',
     'argparsex',
     'edistx',
+    'semverx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
