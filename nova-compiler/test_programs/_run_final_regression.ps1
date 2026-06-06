@@ -222,6 +222,7 @@ $domain_tests = @(
     'priorityx',
     'kvstorex',
     'sanitx',
+    'stacktracex',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
