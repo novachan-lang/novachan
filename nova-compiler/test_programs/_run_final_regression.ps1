@@ -172,6 +172,7 @@ $domain_tests = @(
     'edistx',
     'semverx',
     'logfmtx',
+    'envx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
