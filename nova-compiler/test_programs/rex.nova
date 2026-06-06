@@ -117,6 +117,16 @@ fn _parse_class(s, p)
 fn _parse_atom(s, p)
     let c = _peek(s, p)
     if c == "("
+        // lookahead: (?=...) positive, (?!...) negative
+        if _peek(s, p + 1) == "?" and (_peek(s, p + 2) == "=" or _peek(s, p + 2) == "!")
+            let la_positive = 1
+            if _peek(s, p + 2) == "!"
+                la_positive = 0
+            let la_inner = _parse_alt(s, p + 3)
+            let la_pos = la_inner[1]
+            if _peek(s, la_pos) == ")"
+                la_pos = la_pos + 1
+            return [["lookahead", la_inner[0], la_positive], la_pos]
         // capturing group `(...)`, or named `(?<name>...)`. Indices are assigned
         // left-to-right (by opening paren) in _number_groups after the parse.
         let pos = p + 1
@@ -242,6 +252,12 @@ fn _compile_node(prog, node)
         let sp = prog[s]
         prog[s] = ["split", sp[1], len(prog)]  // skip = end
         return 0
+    if t == "lookahead"
+        let sub_prog = []
+        _compile_node(sub_prog, node[1])
+        _emit(sub_prog, ["match", 0, 0])
+        _emit(prog, ["lookahead", sub_prog, node[2]])
+        return 0
     return 0
 
 fn rex_compile(pattern)
@@ -251,6 +267,64 @@ fn rex_compile(pattern)
     _compile_node(prog, numbered)
     _emit(prog, ["match", 0, 0])
     return prog
+
+// ── lookahead sub-match: does any PREFIX of input (from pos) match sub_prog? ──
+fn _prefix_match(sub_prog, input, pos)
+    let clist = []
+    _la_add(sub_prog, clist, 0)
+    if _la_has_match(sub_prog, clist)
+        return 1
+    let i = pos
+    while i < len(input)
+        let code = ord(input[i])
+        let nlist = []
+        for pc in clist
+            let instr = sub_prog[pc]
+            if instr[0] == "char"
+                if code == instr[1]
+                    _la_add(sub_prog, nlist, pc + 1)
+            else if instr[0] == "any"
+                _la_add(sub_prog, nlist, pc + 1)
+            else if instr[0] == "class"
+                let matched = 0
+                for rng in instr[1]
+                    if code >= rng[0] and code <= rng[1]
+                        matched = 1
+                if instr[2] == 1
+                    matched = 1 - matched
+                if matched == 1
+                    _la_add(sub_prog, nlist, pc + 1)
+        if _la_has_match(sub_prog, nlist)
+            return 1
+        if len(nlist) == 0
+            return 0
+        clist = nlist
+        i = i + 1
+    return 0
+
+fn _la_add(prog, lst, pc)
+    if contains(lst, pc)
+        return 0
+    let instr = prog[pc]
+    if instr[0] == "split"
+        push(lst, pc)
+        _la_add(prog, lst, instr[1])
+        _la_add(prog, lst, instr[2])
+    else if instr[0] == "jmp"
+        push(lst, pc)
+        _la_add(prog, lst, instr[1])
+    else if instr[0] == "save"
+        push(lst, pc)
+        _la_add(prog, lst, pc + 1)
+    else
+        push(lst, pc)
+    return 0
+
+fn _la_has_match(prog, lst)
+    for pc in lst
+        if prog[pc][0] == "match"
+            return 1
+    return 0
 
 // ── simulate (linear-time NFA, thread-set) ───────────────────────────────────
 fn _add_thread(prog, lst, pc)
@@ -278,9 +352,25 @@ fn _has_match(prog, lst)
             return 1
     return 0
 
+fn _resolve_lookaheads(prog, lst, input, pos)
+    let resolved = []
+    for pc in lst
+        let instr = prog[pc]
+        if instr[0] == "lookahead"
+            let sub_prog = instr[1]
+            let positive = instr[2]
+            let la_ok = _prefix_match(sub_prog, input, pos)
+            if (la_ok == 1 and positive == 1) or (la_ok == 0 and positive == 0)
+                _add_thread(prog, resolved, pc + 1)
+        else
+            if not contains(resolved, pc)
+                push(resolved, pc)
+    resolved
+
 fn rex_full_match(prog, input)
     let clist = []
     _add_thread(prog, clist, 0)
+    clist = _resolve_lookaheads(prog, clist, input, 0)
     let i = 0
     let n = len(input)
     while i < n
@@ -302,6 +392,7 @@ fn rex_full_match(prog, input)
                     matched = 1 - matched
                 if matched == 1
                     _add_thread(prog, nlist, pc + 1)
+        nlist = _resolve_lookaheads(prog, nlist, input, i + 1)
         clist = nlist
         i = i + 1
     return _has_match(prog, clist)
@@ -312,6 +403,7 @@ fn rex_full_match(prog, input)
 fn rex_search(prog, input)
     let clist = []
     _add_thread(prog, clist, 0)
+    clist = _resolve_lookaheads(prog, clist, input, 0)
     if _has_match(prog, clist)
         return 1
     let i = 0
@@ -336,6 +428,7 @@ fn rex_search(prog, input)
                 if matched == 1
                     _add_thread(prog, nlist, pc + 1)
         _add_thread(prog, nlist, 0)            // re-seed: a match may start here
+        nlist = _resolve_lookaheads(prog, nlist, input, i + 1)
         clist = nlist
         i = i + 1
         if _has_match(prog, clist)
@@ -588,5 +681,17 @@ fn main()
     assert_eq(rex_test("(ab)\{2\}", "abab"), 1)
     assert_eq(rex_test("(ab)\{2\}", "ababab"), 0)
     assert_eq(rex_find(bs + "d\{4\}", "year 2026 ok"), 1)
+
+    // ── lookahead (?=...) and (?!...) ──────────────────────────────────────────
+    // positive lookahead: assert what follows without consuming
+    assert_eq(rex_test("foo(?=bar)", "foobar"), 0)  // lookahead doesn't consume "bar", full match needs it
+    assert_eq(rex_find("foo(?=bar)", "foobar"), 1)  // search: "foo" followed by "bar"
+    assert_eq(rex_find("foo(?=bar)", "foobaz"), 0)  // "foo" NOT followed by "bar"
+    // negative lookahead: assert what does NOT follow
+    assert_eq(rex_find("foo(?!bar)", "foobaz"), 1)  // "foo" NOT followed by "bar" -> match
+    assert_eq(rex_find("foo(?!bar)", "foobar"), 0)  // "foo" followed by "bar" -> no match
+    // lookahead with class
+    assert_eq(rex_find(bs + "d+(?=" + bs + "D)", "123abc"), 1)  // digits followed by non-digit
+    assert_eq(rex_find(bs + "d+(?=" + bs + "D)", "123"), 0)     // digits NOT followed by non-digit
 
     print("rex passed")
