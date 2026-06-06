@@ -205,6 +205,7 @@ $domain_tests = @(
     'samplex',
     'queuex',
     'pathx',
+    'embedx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
