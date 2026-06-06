@@ -246,6 +246,7 @@ $domain_tests = @(
     'numfmtx',
     'uuidx',
     'rlimitx',
+    'taskqx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
