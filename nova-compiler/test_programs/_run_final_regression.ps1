@@ -186,6 +186,7 @@ $domain_tests = @(
     'metrx',
     'validx',
     'slugx',
+    'paginx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
