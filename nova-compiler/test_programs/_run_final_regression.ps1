@@ -249,6 +249,7 @@ $domain_tests = @(
     'taskqx',
     'jsonqueryx',
     'chanx',
+    'color256x',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
