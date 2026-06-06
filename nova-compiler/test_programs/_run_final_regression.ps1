@@ -193,6 +193,7 @@ $domain_tests = @(
     'hashx',
     'resultx',
     'iterx',
+    'configx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
