@@ -5054,9 +5054,13 @@ static int nova_debug_was_freed(void* p) {
 }
 #endif
 
+static void nova_rt_weak_invalidate(int64_t obj_handle);  /* forward */
 static void nova_rc_free(void* ptr) {
     NovaMemTag tag = NOVA_RC_TAG(ptr);
     nova_mem_live--;
+    /* Auto-invalidate any weak refs pointing to this object (soundness:
+       prevents dangling weak refs after RC free). */
+    nova_rt_weak_invalidate((int64_t)(uintptr_t)ptr);
 #ifdef NOVA_DEBUG_RC
     {
         int prev = nova_debug_was_freed(ptr);
@@ -11230,7 +11234,19 @@ int64_t nova_rt_weak_create(int64_t obj_handle) {
     wr->obj_handle = obj_handle;
     wr->alive      = obj_handle != 0 ? 1 : 0;
     NovaWeakNode* node = (NovaWeakNode*)malloc(sizeof(NovaWeakNode));
-    if (node) { node->ref = wr; node->next = g_weak_list; g_weak_list = node; }
+    if (node) {
+#ifdef _WIN32
+        EnterCriticalSection(&g_weak_mtx);
+#else
+        pthread_mutex_lock(&g_weak_mtx);
+#endif
+        node->ref = wr; node->next = g_weak_list; g_weak_list = node;
+#ifdef _WIN32
+        LeaveCriticalSection(&g_weak_mtx);
+#else
+        pthread_mutex_unlock(&g_weak_mtx);
+#endif
+    }
     return (int64_t)(uintptr_t)wr;
 }
 
