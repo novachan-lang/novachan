@@ -252,6 +252,7 @@ $domain_tests = @(
     'color256x',
     'setx',
     'progressx',
+    'netaddrx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
