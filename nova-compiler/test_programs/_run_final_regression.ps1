@@ -207,6 +207,7 @@ $domain_tests = @(
     'pathx',
     'embedx',
     'authx',
+    'schemax',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
