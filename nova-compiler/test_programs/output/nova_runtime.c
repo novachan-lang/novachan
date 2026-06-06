@@ -12591,25 +12591,26 @@ int64_t nova_rt_node_connect(int64_t host_val, int64_t port_val) {
 }
 
 /* nova_rt_node_send: Send a NOVA value to a remote node.
-   Wire format: [4-byte big-endian length][JSON payload]. Length framing guarantees
-   message boundaries over TCP (the old newline scheme broke on split/merged recvs). */
+   Wire format: [4-byte big-endian length][term-encoded binary payload].
+   Uses the compact binary term codec (exact int/float preservation, LEB128
+   varints) instead of JSON text — more compact and lossless. */
 int64_t nova_rt_node_send(int64_t node_handle, int64_t value) {
     if (!node_handle) return 0;
-    int64_t serialized = nova_rt_json_stringify(value);
-    if (!serialized) return 0;
-    const char* json = (const char*)(uintptr_t)serialized;
-    uint32_t len = (uint32_t)strlen(json);
+    int64_t encoded = nova_rt_term_encode(value);
+    if (!encoded) return 0;
+    NovaBytes* nb = (NovaBytes*)(uintptr_t)encoded;
+    uint32_t len = (uint32_t)nb->size;
     uint8_t hdr[4];
     hdr[0] = (uint8_t)(len >> 24); hdr[1] = (uint8_t)(len >> 16);
     hdr[2] = (uint8_t)(len >> 8);  hdr[3] = (uint8_t)len;
     NOVA_SOCKET fd = (NOVA_SOCKET)node_handle;
     if (!nova_send_all(fd, (const char*)hdr, 4)) return 0;
-    if (len && !nova_send_all(fd, json, (size_t)len)) return 0;
+    if (len && !nova_send_all(fd, (const char*)nb->data, (size_t)len)) return 0;
     return (int64_t)len;
 }
 
 /* nova_rt_node_recv: Receive one length-framed NOVA value from a remote node.
-   Reads exactly the 4-byte length, then exactly that many payload bytes, then parses. */
+   Reads the 4-byte length, then the binary payload, then term_decode. */
 int64_t nova_rt_node_recv(int64_t node_handle, int64_t max_bytes) {
     (void)max_bytes;
     if (!node_handle) return 0;
@@ -12618,13 +12619,11 @@ int64_t nova_rt_node_recv(int64_t node_handle, int64_t max_bytes) {
     if (!nova_recv_exact(fd, (char*)hdr, 4)) return 0;
     uint32_t len = ((uint32_t)hdr[0]<<24)|((uint32_t)hdr[1]<<16)|((uint32_t)hdr[2]<<8)|(uint32_t)hdr[3];
     if (len > 64u*1024u*1024u) return 0; /* sanity guard */
-    char* buf = (char*)malloc((size_t)len + 1);
-    if (!buf) return 0;
-    if (len && !nova_recv_exact(fd, buf, (size_t)len)) { free(buf); return 0; }
-    buf[len] = 0;
-    int64_t s = nova_rt_create_string((void*)buf);
-    free(buf);
-    return nova_rt_json_parse(s);
+    int64_t bytes = nova_rt_bytes_create((int64_t)len);
+    if (!bytes) return 0;
+    NovaBytes* nb = (NovaBytes*)(uintptr_t)bytes;
+    if (len && !nova_recv_exact(fd, (char*)nb->data, (size_t)len)) return 0;
+    return nova_rt_term_decode(bytes);
 }
 
 /* nova_rt_node_close: Close connection to a remote node. */

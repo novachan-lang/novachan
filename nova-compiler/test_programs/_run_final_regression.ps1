@@ -169,6 +169,7 @@ $domain_tests = @(
     'osname_test',
     'must_use_test',
     'argparsex',
+    'edistx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
