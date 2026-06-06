@@ -203,6 +203,7 @@ $domain_tests = @(
     'mimesx',
     'httpclx',
     'samplex',
+    'queuex',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
