@@ -225,6 +225,7 @@ $domain_tests = @(
     'stacktracex',
     'regtryx',
     'datefmtx',
+    'memox',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
