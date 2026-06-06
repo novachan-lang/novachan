@@ -235,6 +235,7 @@ $domain_tests = @(
     'geox',
     'safemathx',
     'lrucachex',
+    'buildx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
