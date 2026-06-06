@@ -191,6 +191,7 @@ $domain_tests = @(
     'ciphx',
     'intervx',
     'hashx',
+    'resultx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
