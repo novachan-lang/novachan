@@ -181,6 +181,7 @@ $domain_tests = @(
     'migrationx',
     'circuitx',
     'poolx',
+    'retryx',
     'crash_isolation_test',
     'spawn_assign_body_test',
     'unitsx',
