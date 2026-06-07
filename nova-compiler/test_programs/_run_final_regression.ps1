@@ -312,7 +312,13 @@ $domain_tests = @(
     'colorx',
     'tmplx',
     'fsmx',
-    'backoffx'
+    'backoffx',
+    'defer_test',
+    'lazy_gen_test',
+    'const_test',
+    'hot_reload_test',
+    'io_poll_test',
+    'ws_sched_test'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

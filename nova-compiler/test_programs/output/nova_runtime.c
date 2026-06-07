@@ -3582,6 +3582,7 @@ typedef struct NovaFiber {
     int               status;       /* 0=created 1=running 2=suspended 3=finished */
     int64_t           entry_fn;     /* NOVA closure */
     struct NovaFiber* resumer;
+    int64_t           yield_value;  /* lazy generator: most recently yielded value */
 #ifdef _WIN32
     LPVOID            handle;
 #else
@@ -3711,6 +3712,28 @@ int64_t nova_rt_fiber_is_done(int64_t handle) {
     return (f && f->status == 3) ? 1 : 0;
 }
 
+/* ── Lazy generator primitives (Windows) ──────────────────────────────── */
+int64_t nova_rt_gen_yield(int64_t value) {
+    NovaFiber* me = nova_current_fiber;
+    if (me) me->yield_value = value;
+    nova_rt_fiber_yield();
+    return 0;
+}
+int64_t nova_rt_gen_next(int64_t handle) {
+    return nova_rt_fiber_resume(handle);
+}
+int64_t nova_rt_gen_value(int64_t handle) {
+    NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
+    return f ? f->yield_value : 0;
+}
+int64_t nova_rt_gen_collect(int64_t handle) {
+    int64_t list = nova_rt_list_create();
+    while (nova_rt_gen_next(handle) == 0) {
+        nova_rt_list_append(list, nova_rt_gen_value(handle));
+    }
+    return list;
+}
+
 /* ── POSIX x86_64 asm context switch ──────────────────────────────────── */
 #elif defined(__x86_64__)
 
@@ -3824,6 +3847,35 @@ int64_t nova_rt_fiber_is_done(int64_t handle) {
     return (f && f->status == 3) ? 1 : 0;
 }
 
+/* ── Lazy generator primitives ─────────────────────────────────────────
+   Built on fiber_create/resume/yield. A generator is a fiber handle.
+   gen_yield stores the value in the fiber's yield_value slot before
+   suspending; gen_next resumes the fiber; gen_value reads the slot. */
+
+int64_t nova_rt_gen_yield(int64_t value) {
+    NovaFiber* me = nova_current_fiber;
+    if (me) me->yield_value = value;
+    nova_rt_fiber_yield();
+    return 0;
+}
+
+int64_t nova_rt_gen_next(int64_t handle) {
+    return nova_rt_fiber_resume(handle);
+}
+
+int64_t nova_rt_gen_value(int64_t handle) {
+    NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
+    return f ? f->yield_value : 0;
+}
+
+int64_t nova_rt_gen_collect(int64_t handle) {
+    int64_t list = nova_rt_list_create();
+    while (nova_rt_gen_next(handle) == 0) {
+        nova_rt_list_append(list, nova_rt_gen_value(handle));
+    }
+    return list;
+}
+
 /* ── Unsupported platform stubs ───────────────────────────────────────── */
 #else
 
@@ -3833,6 +3885,10 @@ int64_t nova_rt_fiber_create(int64_t c) {
 int64_t nova_rt_fiber_resume(int64_t h) { return 1; }
 int64_t nova_rt_fiber_yield(void)       { return 0; }
 int64_t nova_rt_fiber_is_done(int64_t h) { return 1; }
+int64_t nova_rt_gen_yield(int64_t v)    { return 0; }
+int64_t nova_rt_gen_next(int64_t h)     { return 1; }
+int64_t nova_rt_gen_value(int64_t h)    { return 0; }
+int64_t nova_rt_gen_collect(int64_t h)  { return nova_rt_list_create(); }
 
 #endif
 /* ── end fiber primitive ─────────────────────────────────────────────── */
@@ -4029,6 +4085,222 @@ void nova_rt_main_dispatch(int64_t main_fn) {
         }
     }
     ((int64_t(*)(void))(uintptr_t)main_fn)();  /* direct call (default / OOM fallback) */
+}
+
+/* ── Stage 2b: work-stealing multi-carrier scheduler ──────────────────────────
+   N worker threads (one per CPU core), each with a local FIFO deque.
+   Tasks are spawned to the caller's deque; idle workers steal from random
+   victims. Uses a bounded circular buffer with CAS for steal and local
+   push/pop with a mutex. */
+
+#define NOVA_WS_DEQUE_CAP 4096
+#define NOVA_WS_MAX_WORKERS 64
+
+typedef struct {
+    NovaSchedTask* buf[NOVA_WS_DEQUE_CAP];
+    volatile int64_t top;    /* steal end (other workers pop from here) */
+    volatile int64_t bottom; /* push end (owning worker pushes/pops here) */
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+#else
+    pthread_mutex_t lock;
+#endif
+} NovaWSDeque;
+
+typedef struct {
+    NovaWSDeque deque;
+    int id;
+    volatile int active;
+#ifdef _WIN32
+    HANDLE thread;
+#else
+    pthread_t thread;
+#endif
+} NovaWSWorker;
+
+static NovaWSWorker g_ws_workers[NOVA_WS_MAX_WORKERS];
+static int g_ws_worker_count = 0;
+static volatile int g_ws_shutdown = 0;
+static volatile int64_t g_ws_total_tasks = 0;
+
+static void ws_deque_init(NovaWSDeque* d) {
+    memset(d->buf, 0, sizeof(d->buf));
+    d->top = 0;
+    d->bottom = 0;
+#ifdef _WIN32
+    InitializeCriticalSection(&d->lock);
+#else
+    pthread_mutex_init(&d->lock, NULL);
+#endif
+}
+
+static void ws_deque_push(NovaWSDeque* d, NovaSchedTask* t) {
+#ifdef _WIN32
+    EnterCriticalSection(&d->lock);
+#else
+    pthread_mutex_lock(&d->lock);
+#endif
+    int64_t b = d->bottom;
+    d->buf[b % NOVA_WS_DEQUE_CAP] = t;
+    d->bottom = b + 1;
+#ifdef _WIN32
+    LeaveCriticalSection(&d->lock);
+#else
+    pthread_mutex_unlock(&d->lock);
+#endif
+}
+
+static NovaSchedTask* ws_deque_pop(NovaWSDeque* d) {
+#ifdef _WIN32
+    EnterCriticalSection(&d->lock);
+#else
+    pthread_mutex_lock(&d->lock);
+#endif
+    int64_t b = d->bottom;
+    int64_t t = d->top;
+    NovaSchedTask* result = NULL;
+    if (b > t) {
+        b--;
+        d->bottom = b;
+        result = d->buf[b % NOVA_WS_DEQUE_CAP];
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&d->lock);
+#else
+    pthread_mutex_unlock(&d->lock);
+#endif
+    return result;
+}
+
+static NovaSchedTask* ws_deque_steal(NovaWSDeque* d) {
+#ifdef _WIN32
+    EnterCriticalSection(&d->lock);
+#else
+    pthread_mutex_lock(&d->lock);
+#endif
+    int64_t t = d->top;
+    int64_t b = d->bottom;
+    NovaSchedTask* result = NULL;
+    if (t < b) {
+        result = d->buf[t % NOVA_WS_DEQUE_CAP];
+        d->top = t + 1;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&d->lock);
+#else
+    pthread_mutex_unlock(&d->lock);
+#endif
+    return result;
+}
+
+static unsigned int g_ws_rng_state = 1;
+static int ws_random_victim(int self_id, int count) {
+    g_ws_rng_state = g_ws_rng_state * 1103515245 + 12345;
+    int v = (int)((g_ws_rng_state >> 16) % (unsigned int)count);
+    if (v == self_id) v = (v + 1) % count;
+    return v;
+}
+
+static
+#ifdef _WIN32
+DWORD WINAPI
+#else
+void*
+#endif
+ws_worker_loop(void* arg) {
+    NovaWSWorker* w = (NovaWSWorker*)arg;
+    int spin = 0;
+    while (!g_ws_shutdown) {
+        NovaSchedTask* task = ws_deque_pop(&w->deque);
+        if (!task && g_ws_worker_count > 1) {
+            int victim = ws_random_victim(w->id, g_ws_worker_count);
+            task = ws_deque_steal(&g_ws_workers[victim].deque);
+        }
+        if (task) {
+            spin = 0;
+            task->status = 1;
+            int64_t done = nova_rt_fiber_resume(task->fiber);
+            if (done == 1) {
+                task->status = 3;
+#ifdef _WIN32
+                InterlockedDecrement64(&g_ws_total_tasks);
+#else
+                __sync_fetch_and_sub(&g_ws_total_tasks, 1);
+#endif
+            } else if (task->status != 2) {
+                task->status = 0;
+                ws_deque_push(&w->deque, task);
+            }
+        } else {
+            spin++;
+            if (spin > 100) {
+#ifdef _WIN32
+                Sleep(1);
+#else
+                usleep(1000);
+#endif
+                spin = 0;
+            }
+        }
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+int64_t nova_rt_ws_init(int64_t num_workers) {
+    int n = (int)num_workers;
+    if (n <= 0 || n > NOVA_WS_MAX_WORKERS) n = 4;
+    g_ws_worker_count = n;
+    g_ws_shutdown = 0;
+    g_ws_total_tasks = 0;
+    for (int i = 0; i < n; i++) {
+        g_ws_workers[i].id = i;
+        g_ws_workers[i].active = 1;
+        ws_deque_init(&g_ws_workers[i].deque);
+    }
+    for (int i = 0; i < n; i++) {
+#ifdef _WIN32
+        g_ws_workers[i].thread = CreateThread(NULL, 0, ws_worker_loop, &g_ws_workers[i], 0, NULL);
+#else
+        pthread_create(&g_ws_workers[i].thread, NULL, ws_worker_loop, &g_ws_workers[i]);
+#endif
+    }
+    return (int64_t)n;
+}
+
+int64_t nova_rt_ws_spawn(int64_t closure) {
+    NovaSchedTask* t = (NovaSchedTask*)calloc(1, sizeof(NovaSchedTask));
+    if (!t) return 0;
+    t->fiber = nova_rt_fiber_create(closure);
+    if (!t->fiber) { free(t); return 0; }
+    t->status = 0;
+#ifdef _WIN32
+    InterlockedIncrement64(&g_ws_total_tasks);
+#else
+    __sync_fetch_and_add(&g_ws_total_tasks, 1);
+#endif
+    int target = (int)(g_ws_total_tasks % g_ws_worker_count);
+    ws_deque_push(&g_ws_workers[target].deque, t);
+    return (int64_t)(uintptr_t)t;
+}
+
+int64_t nova_rt_ws_task_count(void) {
+    return g_ws_total_tasks;
+}
+
+int64_t nova_rt_ws_shutdown(void) {
+    g_ws_shutdown = 1;
+    for (int i = 0; i < g_ws_worker_count; i++) {
+#ifdef _WIN32
+        WaitForSingleObject(g_ws_workers[i].thread, 5000);
+#else
+        pthread_join(g_ws_workers[i].thread, NULL);
+#endif
+    }
+    return 0;
 }
 
 /* ── Thread Pool + Process / Spawn ───────────────────────────────────────── */
@@ -12838,6 +13110,280 @@ int64_t nova_rt_hot_reload_path(int64_t watch_id) {
     int idx = (int)watch_id;
     if (idx < 0 || idx >= g_hot_watch_count) return nova_rt_create_string((void*)"");
     return nova_rt_create_string((void*)g_hot_watch_paths[idx]);
+}
+
+/* -- Scalable I/O: Netpoller (IOCP/epoll) --------------------------------- */
+
+#define NOVA_POLL_READ  1
+#define NOVA_POLL_WRITE 2
+#define NOVA_POLL_ERROR 4
+#define NOVA_POLL_HUP   8
+#define NOVA_MAX_POLL_EVENTS 256
+
+#ifdef _WIN32
+/* Windows WSAPoll-based poller (readiness model, like POSIX poll) */
+typedef struct {
+    WSAPOLLFD fds[NOVA_MAX_POLL_EVENTS];
+    int       nfds;
+    int       valid;
+} NovaPollHandle;
+
+#define NOVA_MAX_POLLERS 16
+static NovaPollHandle g_pollers[NOVA_MAX_POLLERS];
+static int g_poller_count = 0;
+
+int64_t nova_rt_io_poll_create(void) {
+    nova_wsa_init();
+    if (g_poller_count >= NOVA_MAX_POLLERS) return -1;
+    int idx = g_poller_count++;
+    g_pollers[idx].nfds = 0;
+    g_pollers[idx].valid = 1;
+    return (int64_t)idx;
+}
+
+int64_t nova_rt_io_poll_add(int64_t poller_id, int64_t fd_val, int64_t events) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+    if (g_pollers[idx].nfds >= NOVA_MAX_POLL_EVENTS) return -1;
+    int n = g_pollers[idx].nfds;
+    g_pollers[idx].fds[n].fd = (SOCKET)fd_val;
+    g_pollers[idx].fds[n].events = 0;
+    if (events & NOVA_POLL_READ)  g_pollers[idx].fds[n].events |= POLLIN;
+    if (events & NOVA_POLL_WRITE) g_pollers[idx].fds[n].events |= POLLOUT;
+    g_pollers[idx].fds[n].revents = 0;
+    g_pollers[idx].nfds++;
+    return 0;
+}
+
+int64_t nova_rt_io_poll_wait(int64_t poller_id, int64_t timeout_ms) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return nova_rt_list_create();
+    int ret = WSAPoll(g_pollers[idx].fds, g_pollers[idx].nfds, (INT)timeout_ms);
+    int64_t result = nova_rt_list_create();
+    if (ret <= 0) return result;
+    for (int i = 0; i < g_pollers[idx].nfds; i++) {
+        if (g_pollers[idx].fds[i].revents == 0) continue;
+        int64_t ev = nova_rt_list_create();
+        nova_rt_list_append(ev, (int64_t)g_pollers[idx].fds[i].fd);
+        int64_t flags = 0;
+        if (g_pollers[idx].fds[i].revents & POLLIN)  flags |= NOVA_POLL_READ;
+        if (g_pollers[idx].fds[i].revents & POLLOUT) flags |= NOVA_POLL_WRITE;
+        if (g_pollers[idx].fds[i].revents & POLLERR) flags |= NOVA_POLL_ERROR;
+        if (g_pollers[idx].fds[i].revents & POLLHUP) flags |= NOVA_POLL_HUP;
+        nova_rt_list_append(ev, flags);
+        nova_rt_list_append(result, ev);
+        g_pollers[idx].fds[i].revents = 0;
+    }
+    return result;
+}
+
+int64_t nova_rt_io_poll_remove(int64_t poller_id, int64_t fd_val) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+    SOCKET target = (SOCKET)fd_val;
+    for (int i = 0; i < g_pollers[idx].nfds; i++) {
+        if (g_pollers[idx].fds[i].fd == target) {
+            g_pollers[idx].fds[i] = g_pollers[idx].fds[g_pollers[idx].nfds - 1];
+            g_pollers[idx].nfds--;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int64_t nova_rt_io_poll_close(int64_t poller_id) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+    g_pollers[idx].nfds = 0;
+    g_pollers[idx].valid = 0;
+    return 0;
+}
+
+int64_t nova_rt_io_set_nonblocking(int64_t fd_val) {
+    NOVA_SOCKET fd = (NOVA_SOCKET)fd_val;
+    u_long mode = 1;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0 ? 0 : -1;
+}
+
+#else
+/* Linux/POSIX epoll-based poller */
+#include <sys/epoll.h>
+
+typedef struct {
+    int epfd;
+    int valid;
+} NovaPollHandle;
+
+#define NOVA_MAX_POLLERS 16
+static NovaPollHandle g_pollers[NOVA_MAX_POLLERS];
+static int g_poller_count = 0;
+
+int64_t nova_rt_io_poll_create(void) {
+    if (g_poller_count >= NOVA_MAX_POLLERS) return -1;
+    int epfd = epoll_create1(0);
+    if (epfd < 0) return -1;
+    int idx = g_poller_count++;
+    g_pollers[idx].epfd = epfd;
+    g_pollers[idx].valid = 1;
+    return (int64_t)idx;
+}
+
+int64_t nova_rt_io_poll_add(int64_t poller_id, int64_t fd_val, int64_t events) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+    struct epoll_event ev;
+    ev.events = 0;
+    if (events & NOVA_POLL_READ)  ev.events |= EPOLLIN;
+    if (events & NOVA_POLL_WRITE) ev.events |= EPOLLOUT;
+    ev.events |= EPOLLET;
+    ev.data.fd = (int)fd_val;
+    return epoll_ctl(g_pollers[idx].epfd, EPOLL_CTL_ADD, (int)fd_val, &ev) == 0 ? 0 : -1;
+}
+
+int64_t nova_rt_io_poll_wait(int64_t poller_id, int64_t timeout_ms) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return nova_rt_list_create();
+    struct epoll_event events[NOVA_MAX_POLL_EVENTS];
+    int n = epoll_wait(g_pollers[idx].epfd, events, NOVA_MAX_POLL_EVENTS, (int)timeout_ms);
+    int64_t result = nova_rt_list_create();
+    for (int i = 0; i < n; i++) {
+        int64_t ev = nova_rt_list_create();
+        nova_rt_list_append(ev, (int64_t)events[i].data.fd);
+        int64_t flags = 0;
+        if (events[i].events & EPOLLIN)  flags |= NOVA_POLL_READ;
+        if (events[i].events & EPOLLOUT) flags |= NOVA_POLL_WRITE;
+        if (events[i].events & EPOLLERR) flags |= NOVA_POLL_ERROR;
+        if (events[i].events & EPOLLHUP) flags |= NOVA_POLL_HUP;
+        nova_rt_list_append(ev, flags);
+        nova_rt_list_append(result, ev);
+    }
+    return result;
+}
+
+int64_t nova_rt_io_poll_remove(int64_t poller_id, int64_t fd_val) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+    return epoll_ctl(g_pollers[idx].epfd, EPOLL_CTL_DEL, (int)fd_val, NULL) == 0 ? 0 : -1;
+}
+
+int64_t nova_rt_io_poll_close(int64_t poller_id) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return -1;
+    close(g_pollers[idx].epfd);
+    g_pollers[idx].valid = 0;
+    return 0;
+}
+
+int64_t nova_rt_io_set_nonblocking(int64_t fd_val) {
+    int fd = (int)fd_val;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 ? 0 : -1;
+}
+
+#endif
+
+/* -- Hot code loading (dlopen/LoadLibrary) -------------------------------- */
+
+typedef struct {
+    void*   handle;
+    char    path[1024];
+    int     valid;
+} NovaHotModule;
+
+#define NOVA_MAX_HOT_MODULES 64
+static NovaHotModule g_hot_modules[NOVA_MAX_HOT_MODULES];
+static int g_hot_module_count = 0;
+
+int64_t nova_rt_hot_load(int64_t path_val) {
+    if (!path_val || g_hot_module_count >= NOVA_MAX_HOT_MODULES) return -1;
+    const char* path = (const char*)(uintptr_t)path_val;
+    void* handle = NULL;
+#ifdef _WIN32
+    handle = (void*)LoadLibraryA(path);
+#else
+    handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (!handle) return -1;
+    int idx = g_hot_module_count++;
+    g_hot_modules[idx].handle = handle;
+    strncpy(g_hot_modules[idx].path, path, 1023);
+    g_hot_modules[idx].path[1023] = 0;
+    g_hot_modules[idx].valid = 1;
+    return (int64_t)idx;
+}
+
+int64_t nova_rt_hot_unload(int64_t mod_id) {
+    int idx = (int)mod_id;
+    if (idx < 0 || idx >= g_hot_module_count || !g_hot_modules[idx].valid) return -1;
+#ifdef _WIN32
+    FreeLibrary((HMODULE)g_hot_modules[idx].handle);
+#else
+    dlclose(g_hot_modules[idx].handle);
+#endif
+    g_hot_modules[idx].handle = NULL;
+    g_hot_modules[idx].valid = 0;
+    return 0;
+}
+
+int64_t nova_rt_hot_reload(int64_t mod_id) {
+    int idx = (int)mod_id;
+    if (idx < 0 || idx >= g_hot_module_count) return -1;
+    if (g_hot_modules[idx].valid && g_hot_modules[idx].handle) {
+#ifdef _WIN32
+        FreeLibrary((HMODULE)g_hot_modules[idx].handle);
+#else
+        dlclose(g_hot_modules[idx].handle);
+#endif
+    }
+    void* handle = NULL;
+#ifdef _WIN32
+    handle = (void*)LoadLibraryA(g_hot_modules[idx].path);
+#else
+    handle = dlopen(g_hot_modules[idx].path, RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (!handle) { g_hot_modules[idx].valid = 0; return -1; }
+    g_hot_modules[idx].handle = handle;
+    g_hot_modules[idx].valid = 1;
+    return 0;
+}
+
+int64_t nova_rt_hot_sym(int64_t mod_id, int64_t name_val) {
+    int idx = (int)mod_id;
+    if (idx < 0 || idx >= g_hot_module_count || !g_hot_modules[idx].valid) return 0;
+    if (!name_val) return 0;
+    const char* name = (const char*)(uintptr_t)name_val;
+    void* sym = NULL;
+#ifdef _WIN32
+    sym = (void*)GetProcAddress((HMODULE)g_hot_modules[idx].handle, name);
+#else
+    sym = dlsym(g_hot_modules[idx].handle, name);
+#endif
+    return (int64_t)(uintptr_t)sym;
+}
+
+int64_t nova_rt_hot_call0(int64_t fn_ptr) {
+    if (!fn_ptr) return 0;
+    typedef int64_t (*fn_t)(void);
+    return ((fn_t)(uintptr_t)fn_ptr)();
+}
+
+int64_t nova_rt_hot_call1(int64_t fn_ptr, int64_t a) {
+    if (!fn_ptr) return 0;
+    typedef int64_t (*fn_t)(int64_t);
+    return ((fn_t)(uintptr_t)fn_ptr)(a);
+}
+
+int64_t nova_rt_hot_call2(int64_t fn_ptr, int64_t a, int64_t b) {
+    if (!fn_ptr) return 0;
+    typedef int64_t (*fn_t)(int64_t, int64_t);
+    return ((fn_t)(uintptr_t)fn_ptr)(a, b);
+}
+
+int64_t nova_rt_hot_call3(int64_t fn_ptr, int64_t a, int64_t b, int64_t c) {
+    if (!fn_ptr) return 0;
+    typedef int64_t (*fn_t)(int64_t, int64_t, int64_t);
+    return ((fn_t)(uintptr_t)fn_ptr)(a, b, c);
 }
 
 /* ======== Phase 12: WASM + GPU ======== */
