@@ -4595,6 +4595,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_print_bool(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_float_bits(i64) nounwind")
     emit(cg, "declare ptr @nova_rt_struct_alloc(i64) nounwind")
+    emit(cg, "declare ptr @nova_rt_aligned_struct_alloc(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_slice(i64, i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_repeat(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_chars(i64) nounwind")
@@ -5738,6 +5739,8 @@ type IrBuilder
     ir_opaque_types: dict
     ir_extern_out_idx: dict
     ir_repr_c_types: dict
+    ir_repr_packed: dict
+    ir_repr_align: dict
     ir_method_dispatch: dict
     ir_defers: list
     ir_gen_fns: dict
@@ -5746,7 +5749,7 @@ type IrBuilder
     ir_fn_name: string
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, [], {}, {}, "", "")
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "")
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -11575,6 +11578,8 @@ type IrEmitter
     ire_loc_entries: list
     ire_fn_sp_id: int
     ire_repr_c_types: dict
+    ire_repr_packed: dict
+    ire_repr_align: dict
     ire_cov_enabled: int
     ire_cov_last_line: int
     ire_cov_file_idx: int
@@ -11587,7 +11592,7 @@ type IrEmitter
     ire_cur_fn_lambda: int
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, 0, 0, -1, {}, {}, {}, {}, {}, {}, 0)
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, {}, {}, {}, {}, {}, 0)
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -12145,17 +12150,21 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     else
                         ire_indent(e, call_str)
             else if op == "make_struct"
-                // @repr(C) structs are flat C-layout: no leading type-hash
-                // slot, fields start at offset 0. Regular NOVA structs have
-                // a hash word at slot 0 used for runtime type checks; fields
-                // begin at slot 1. C code accessing the struct sees fields
-                // at offsets 0,8,16,... so the @repr(C) layout matches.
                 let is_repr_c = contains(e.ire_repr_c_types, value)
+                let is_packed = contains(e.ire_repr_packed, value)
+                let field_align = 8
+                if is_packed
+                    field_align = 1
+                if contains(e.ire_repr_align, value)
+                    field_align = e.ire_repr_align[value]
                 let extra_slots = 1
                 if is_repr_c
                     extra_slots = 0
                 let size = (num + extra_slots) * 8
-                ire_indent(e, dest + ".ptr = call ptr @nova_rt_struct_alloc(i64 " + str(size) + ")")
+                if contains(e.ire_repr_align, value) and e.ire_repr_align[value] > 16
+                    ire_indent(e, dest + ".ptr = call ptr @nova_rt_aligned_struct_alloc(i64 " + str(size) + ", i64 " + str(e.ire_repr_align[value]) + ")")
+                else
+                    ire_indent(e, dest + ".ptr = call ptr @nova_rt_struct_alloc(i64 " + str(size) + ")")
                 if not is_repr_c
                     let hash_val = type_name_hash(value)
                     let hash_gep = dest + ".thash"
@@ -12166,9 +12175,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     let gep = dest + ".f" + str(fi)
                     let slot_off = fi + extra_slots
                     ire_indent(e, gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 " + str(slot_off))
-                    ire_indent(e, "store i64 " + args[fi] + ", ptr " + gep + ", align 8")
-                    // W5b soundness: the struct now holds a pointer to args[fi].
-                    // The struct may outlive this function. Mark source slot.
+                    ire_indent(e, "store i64 " + args[fi] + ", ptr " + gep + ", align " + str(field_align))
                     if contains(e.ire_load_origin, args[fi])
                         e.ire_slot_escaped[e.ire_load_origin[args[fi]]] = 1
                     fi = fi + 1
@@ -12922,6 +12929,14 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                         Expr(stg, sav, sn2, sac2, saf2, sal2) =>
                                             if stg == "str" and sav == "C"
                                                 b.ir_repr_c_types[name] = 1
+                                            if stg == "str" and sav == "packed"
+                                                b.ir_repr_c_types[name] = 1
+                                                b.ir_repr_packed[name] = 1
+                                            if stg == "str" and starts_with(sav, "align(")
+                                                let astr = slice(sav, 6, len(sav) - 1)
+                                                let aval = int(astr)
+                                                if aval > 0
+                                                    b.ir_repr_align[name] = aval
                     b.ir_sdefs[name] = params
                     let fi = 1
                     for p in params
@@ -13099,6 +13114,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_float_bits(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_float_to_str(i64) nounwind")
     ire_line(e, "declare ptr @nova_rt_struct_alloc(i64) nounwind")
+    ire_line(e, "declare ptr @nova_rt_aligned_struct_alloc(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_slice(i64, i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_slice_any(i64, i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_repeat(i64, i64) nounwind")
@@ -13876,6 +13892,10 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // make_struct can skip the type-hash slot for C-layout structs.
     for k in keys(b.ir_repr_c_types)
         e.ire_repr_c_types[k] = 1
+    for k in keys(b.ir_repr_packed)
+        e.ire_repr_packed[k] = 1
+    for k in keys(b.ir_repr_align)
+        e.ire_repr_align[k] = b.ir_repr_align[k]
     // Track 8 escape analysis + W3 RC elision: ON by default (the perf moat).
     // NOVA_NO_TRACK8=1 disables both for bisection / backward-compat. The
     // existing NOVA_TRACK8=1 env still works (now also enables W4 strict

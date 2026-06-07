@@ -456,6 +456,29 @@ void* nova_rt_struct_alloc(int64_t size) {
     return nova_heap_alloc((size_t)size, packed);
 }
 
+void* nova_rt_aligned_struct_alloc(int64_t size, int64_t alignment) {
+    if (alignment <= 16) return nova_rt_struct_alloc(size);
+    int64_t nslots = size / 8;
+    if (nslots < 0) nslots = 0;
+    if (nslots > 0x1FFF) nslots = 0x1FFF;
+    size_t total = (size_t)size + NOVA_RC_HDR_SIZE;
+    size_t aligned_total = (total + (size_t)alignment - 1) & ~((size_t)alignment - 1);
+#ifdef _WIN32
+    char* base = (char*)_aligned_malloc(aligned_total, (size_t)alignment);
+#else
+    char* base = NULL;
+    if (posix_memalign((void**)&base, (size_t)alignment, aligned_total) != 0)
+        base = NULL;
+#endif
+    if (!base) return NULL;
+    ((int32_t*)base)[0] = 1;
+    ((int32_t*)base)[1] = NOVA_RC_ENCODE(((int32_t)nslots << 3) | NOVA_MEM_STRUCT);
+    nova_mem_total++;
+    nova_mem_live++;
+    if (base) nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + aligned_total);
+    return base + NOVA_RC_HDR_SIZE;
+}
+
 /* ── Fat Strings: [hash:8][len:8][rc:4][tag:4][char data...]['\0'] ────────
    Pointer returned to user code points to char data (offset +24 from base).
    This IS a valid const char* for printf, strcmp, memcpy, etc.
