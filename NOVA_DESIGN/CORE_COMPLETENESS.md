@@ -478,6 +478,34 @@ The *only* true 0% is **Reflection/runtime**.
 
 # SCORECARD
 
+## ★ 2026-06-07 UPDATE — ALL REMAINING FEATURES CLOSED
+
+The `REMAINING_FEATURES.md` tracker (96 verified-remaining items from the 2026-06-02 audit)
+is now **96/96 DONE**. Every PARTIAL and MISSING item has been implemented, tested, and committed.
+The per-row table below is the original 2026-06-02 snapshot; major categories moved since:
+
+- **Cat 1-4** (types/functions/generics/meta): comptime cfg, type predicates, variadics, defer/destructors — all DONE
+- **Cat 5** (memory): alignment/packing (@repr(packed)/align(N)) — DONE (2026-06-07)
+- **Cat 6** (concurrency): bounded channels, work-stealing scheduler, netpoller — all DONE
+- **Cat 7** (errors): typed Result<T,E>/Option<T>, monadic ? — DONE
+- **Cat 9** (strings): Unicode codepoint views (char_count/char_at/code_points/from_codepoint) — DONE
+- **Cat 10** (collections): binary_search, deep access (get_in/put_in), lazy generators — all DONE
+- **Cat 11** (numerics): bignum, complex, rational, decimal, SIMD vectors — all DONE
+- **Cat 12** (I/O): complete file I/O, interactive subprocess — DONE
+- **Cat 13** (networking): DNS, network byte-order, non-blocking I/O (netpoller) — all DONE
+- **Cat 16** (time): UTC arithmetic + 65-zone timezone DB (tzdb.nova) — DONE (2026-06-07)
+- **Cat 17** (regex): linear-time RE2-class engine + captures + lookaround + Unicode \p{} — DONE (2026-06-07)
+- **Cat 18** (serialization): JSON/TOML/YAML/CSV parsers, automatic structural serialization — all DONE
+- **Cat 19** (testing): property-based testing (proptest), micro-benchmarks (benchx) — all DONE
+- **Cat 20** (FFI): dlopen/LoadLibrary hot reload, shared lib output, C interop — all DONE
+- **Cat 21** (reflection): automatic structural Show/Eq/Hash/Clone/Serialize (zero annotation) — DONE
+
+**The 189-feature table below is STALE. The canonical source is `REMAINING_FEATURES.md` (96/96 DONE).**
+
+---
+
+*Original 2026-06-02 snapshot (kept for reference):*
+
 **Verified 2026-06-02** by 22-agent evidence-based audit + independent re-verification of every
 load-bearing claim (ran the cited tests through the self-hosted `gen3_test.exe`, read the runtime).
 The earlier headline said "156" but the per-category table actually summed to **189** — that
