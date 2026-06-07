@@ -127,6 +127,16 @@ fn _parse_atom(s, p)
             if _peek(s, la_pos) == ")"
                 la_pos = la_pos + 1
             return [["lookahead", la_inner[0], la_positive], la_pos]
+        // lookbehind: (?<=...) positive, (?<!...) negative
+        if _peek(s, p + 1) == "?" and _peek(s, p + 2) == "<" and (_peek(s, p + 3) == "=" or _peek(s, p + 3) == "!")
+            let lb_positive = 1
+            if _peek(s, p + 3) == "!"
+                lb_positive = 0
+            let lb_inner = _parse_alt(s, p + 4)
+            let lb_pos = lb_inner[1]
+            if _peek(s, lb_pos) == ")"
+                lb_pos = lb_pos + 1
+            return [["lookbehind", lb_inner[0], lb_positive], lb_pos]
         // capturing group `(...)`, or named `(?<name>...)`. Indices are assigned
         // left-to-right (by opening paren) in _number_groups after the parse.
         let pos = p + 1
@@ -258,6 +268,12 @@ fn _compile_node(prog, node)
         _emit(sub_prog, ["match", 0, 0])
         _emit(prog, ["lookahead", sub_prog, node[2]])
         return 0
+    if t == "lookbehind"
+        let sub_prog = []
+        _compile_node(sub_prog, node[1])
+        _emit(sub_prog, ["match", 0, 0])
+        _emit(prog, ["lookbehind", sub_prog, node[2]])
+        return 0
     return 0
 
 fn rex_compile(pattern)
@@ -352,7 +368,47 @@ fn _has_match(prog, lst)
             return 1
     return 0
 
-fn _resolve_lookaheads(prog, lst, input, pos)
+// ── lookbehind sub-match: does the sub_prog match any SUFFIX of input[0..pos)? ──
+// Try matching starting at every position j in [0, pos) and check if the match
+// consumes exactly up to pos. This is O(pos * |sub_prog|), still linear per position.
+fn _suffix_match(sub_prog, input, pos)
+    let j = 0
+    while j <= pos
+        let clist = []
+        _la_add(sub_prog, clist, 0)
+        if j == pos and _la_has_match(sub_prog, clist)
+            return 1
+        let k = j
+        while k < pos
+            let code = ord(input[k])
+            let nlist = []
+            for pc in clist
+                let instr = sub_prog[pc]
+                if instr[0] == "char"
+                    if code == instr[1]
+                        _la_add(sub_prog, nlist, pc + 1)
+                else if instr[0] == "any"
+                    _la_add(sub_prog, nlist, pc + 1)
+                else if instr[0] == "class"
+                    let matched = 0
+                    for rng in instr[1]
+                        if code >= rng[0] and code <= rng[1]
+                            matched = 1
+                    if instr[2] == 1
+                        matched = 1 - matched
+                    if matched == 1
+                        _la_add(sub_prog, nlist, pc + 1)
+            if len(nlist) == 0
+                k = pos
+            else
+                clist = nlist
+                k = k + 1
+                if k == pos and _la_has_match(sub_prog, clist)
+                    return 1
+        j = j + 1
+    return 0
+
+fn _resolve_assertions(prog, lst, input, pos)
     let resolved = []
     for pc in lst
         let instr = prog[pc]
@@ -362,6 +418,12 @@ fn _resolve_lookaheads(prog, lst, input, pos)
             let la_ok = _prefix_match(sub_prog, input, pos)
             if (la_ok == 1 and positive == 1) or (la_ok == 0 and positive == 0)
                 _add_thread(prog, resolved, pc + 1)
+        else if instr[0] == "lookbehind"
+            let sub_prog = instr[1]
+            let positive = instr[2]
+            let lb_ok = _suffix_match(sub_prog, input, pos)
+            if (lb_ok == 1 and positive == 1) or (lb_ok == 0 and positive == 0)
+                _add_thread(prog, resolved, pc + 1)
         else
             if not contains(resolved, pc)
                 push(resolved, pc)
@@ -370,7 +432,7 @@ fn _resolve_lookaheads(prog, lst, input, pos)
 fn rex_full_match(prog, input)
     let clist = []
     _add_thread(prog, clist, 0)
-    clist = _resolve_lookaheads(prog, clist, input, 0)
+    clist = _resolve_assertions(prog, clist, input, 0)
     let i = 0
     let n = len(input)
     while i < n
@@ -392,7 +454,7 @@ fn rex_full_match(prog, input)
                     matched = 1 - matched
                 if matched == 1
                     _add_thread(prog, nlist, pc + 1)
-        nlist = _resolve_lookaheads(prog, nlist, input, i + 1)
+        nlist = _resolve_assertions(prog, nlist, input, i + 1)
         clist = nlist
         i = i + 1
     return _has_match(prog, clist)
@@ -403,7 +465,7 @@ fn rex_full_match(prog, input)
 fn rex_search(prog, input)
     let clist = []
     _add_thread(prog, clist, 0)
-    clist = _resolve_lookaheads(prog, clist, input, 0)
+    clist = _resolve_assertions(prog, clist, input, 0)
     if _has_match(prog, clist)
         return 1
     let i = 0
@@ -428,7 +490,7 @@ fn rex_search(prog, input)
                 if matched == 1
                     _add_thread(prog, nlist, pc + 1)
         _add_thread(prog, nlist, 0)            // re-seed: a match may start here
-        nlist = _resolve_lookaheads(prog, nlist, input, i + 1)
+        nlist = _resolve_assertions(prog, nlist, input, i + 1)
         clist = nlist
         i = i + 1
         if _has_match(prog, clist)
@@ -472,10 +534,42 @@ fn _add_thread_cap(prog, pcs, svs, pc, saves, pos)
         let ns = copy(saves)
         ns[instr[1]] = pos
         _add_thread_cap(prog, pcs, svs, pc + 1, ns, pos)
+    else if instr[0] == "lookahead"
+        push(pcs, pc)
+        push(svs, saves)
+    else if instr[0] == "lookbehind"
+        push(pcs, pc)
+        push(svs, saves)
     else
         push(pcs, pc)
         push(svs, saves)
     return 0
+
+fn _resolve_assertions_cap(prog, pcs, svs, input, pos)
+    let rpcs = []
+    let rsvs = []
+    let ti = 0
+    while ti < len(pcs)
+        let pc = pcs[ti]
+        let instr = prog[pc]
+        if instr[0] == "lookahead"
+            let sub_prog = instr[1]
+            let positive = instr[2]
+            let la_ok = _prefix_match(sub_prog, input, pos)
+            if (la_ok == 1 and positive == 1) or (la_ok == 0 and positive == 0)
+                _add_thread_cap(prog, rpcs, rsvs, pc + 1, svs[ti], pos)
+        else if instr[0] == "lookbehind"
+            let sub_prog = instr[1]
+            let positive = instr[2]
+            let lb_ok = _suffix_match(sub_prog, input, pos)
+            if (lb_ok == 1 and positive == 1) or (lb_ok == 0 and positive == 0)
+                _add_thread_cap(prog, rpcs, rsvs, pc + 1, svs[ti], pos)
+        else
+            if not contains(rpcs, pc)
+                push(rpcs, pc)
+                push(rsvs, svs[ti])
+        ti = ti + 1
+    return [rpcs, rsvs]
 
 fn _step_cap(prog, pcs, svs, code, npcs, nsvs, pos)
     let ti = 0
@@ -525,14 +619,18 @@ fn rex_captures(pattern, input)
     let pcs = []
     let svs = []
     _add_thread_cap(prog, pcs, svs, 0, initsaves, 0)
+    let r0 = _resolve_assertions_cap(prog, pcs, svs, input, 0)
+    pcs = r0[0]
+    svs = r0[1]
     let i = 0
     let n = len(input)
     while i < n
         let npcs = []
         let nsvs = []
         _step_cap(prog, pcs, svs, ord(input[i]), npcs, nsvs, i + 1)
-        pcs = npcs
-        svs = nsvs
+        let ra = _resolve_assertions_cap(prog, npcs, nsvs, input, i + 1)
+        pcs = ra[0]
+        svs = ra[1]
         i = i + 1
     let ti = 0
     while ti < len(pcs)
@@ -693,5 +791,20 @@ fn main()
     // lookahead with class
     assert_eq(rex_find(bs + "d+(?=" + bs + "D)", "123abc"), 1)  // digits followed by non-digit
     assert_eq(rex_find(bs + "d+(?=" + bs + "D)", "123"), 0)     // digits NOT followed by non-digit
+
+    // ── lookbehind (?<=...) and (?<!...) ──────────────────────────────────────
+    // positive lookbehind: assert what precedes without consuming
+    assert_eq(rex_find("(?<=foo)bar", "foobar"), 1)  // "bar" preceded by "foo"
+    assert_eq(rex_find("(?<=foo)bar", "bazbar"), 0)  // "bar" NOT preceded by "foo"
+    assert_eq(rex_find("(?<=a)b", "ab"), 1)
+    assert_eq(rex_find("(?<=a)b", "cb"), 0)
+    // negative lookbehind: assert what does NOT precede
+    assert_eq(rex_find("(?<!foo)bar", "bazbar"), 1)  // "bar" NOT preceded by "foo"
+    assert_eq(rex_find("(?<!foo)bar", "foobar"), 0)  // "bar" preceded by "foo" -> no match
+    assert_eq(rex_find("(?<!a)b", "cb"), 1)
+    assert_eq(rex_find("(?<!a)b", "ab"), 0)
+    // lookbehind with classes
+    assert_eq(rex_find("(?<=" + bs + "d)x", "3x"), 1)   // x preceded by a digit
+    assert_eq(rex_find("(?<=" + bs + "d)x", "ax"), 0)   // x NOT preceded by a digit
 
     print("rex passed")

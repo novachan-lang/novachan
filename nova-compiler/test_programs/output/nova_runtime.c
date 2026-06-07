@@ -3069,6 +3069,30 @@ int64_t nova_rt_neq(int64_t a, int64_t b) {
     return nova_rt_eq(a, b) ? 0 : 1;
 }
 
+/* DJB2 type-name hash for dynamic dispatch on any value (builtins + structs).
+   Struct slot 0 already stores the hash; builtins use precomputed constants. */
+int64_t nova_rt_type_hash(int64_t val) {
+    if (val == 0) return 193495088LL; /* djb2("int") */
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    switch (tag) {
+        case NOVA_MEM_STRUCT: return ((int64_t*)ptr)[0]; /* slot 0 = type hash */
+        case NOVA_MEM_LIST:    return 6385440353LL;       /* djb2("list") */
+        case NOVA_MEM_DICT:    return 6385152329LL;       /* djb2("dict") */
+        case NOVA_MEM_RAW:     return 6954031493116LL;    /* djb2("string") */
+        case NOVA_MEM_FAT_STR: return 6954031493116LL;    /* djb2("string") */
+        case NOVA_MEM_BOX: {
+            NovaBox* b = (NovaBox*)ptr;
+            if (b->kind == NOVA_BOX_FLOAT) return 210712519067LL; /* djb2("float") */
+            return 6385087377LL; /* djb2("bool") */
+        }
+        default:
+            if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr))
+                return 6954031493116LL; /* djb2("string") */
+            return 193495088LL; /* djb2("int") */
+    }
+}
+
 int64_t nova_rt_type_of(int64_t val) {
     if (val == 0) return (int64_t)(uintptr_t)"int";
     void* ptr = (void*)(uintptr_t)val;
