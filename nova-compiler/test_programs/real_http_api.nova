@@ -1,0 +1,185 @@
+/// real_http_api.nova — A real JSON REST API server written in NOVA
+///
+/// Uses raw TCP primitives to build a full HTTP/JSON API.
+/// Demonstrates: TCP server, HTTP parsing, routing, JSON,
+/// in-memory state, string processing, concurrency.
+
+fn _parse_method(raw)
+    let sp = find(raw, " ")
+    if sp < 0
+        return ""
+    slice(raw, 0, sp)
+
+fn _parse_path(raw)
+    let sp1 = find(raw, " ")
+    if sp1 < 0
+        return ""
+    let rest = slice(raw, sp1 + 1, len(raw))
+    let sp2 = find(rest, " ")
+    if sp2 < 0
+        return rest
+    slice(rest, 0, sp2)
+
+fn _parse_body(raw)
+    let sep = find(raw, "\r\n\r\n")
+    if sep < 0
+        return ""
+    slice(raw, sep + 4, len(raw))
+
+fn _json_field(body, field)
+    let key = "\"" + field + "\""
+    let idx = find(body, key)
+    if idx < 0
+        return ""
+    let after = slice(body, idx + len(key), len(body))
+    let ci = find(after, ":")
+    if ci < 0
+        return ""
+    let val = trim(slice(after, ci + 1, len(after)))
+    if len(val) == 0
+        return ""
+    if val[0] == "\""
+        let eq = find(slice(val, 1, len(val)), "\"")
+        if eq < 0
+            return ""
+        return slice(val, 1, 1 + eq)
+    let ei = 0
+    while ei < len(val) and val[ei] != "," and val[ei] != "\}" and val[ei] != " "
+        ei = ei + 1
+    trim(slice(val, 0, ei))
+
+fn _http_ok(client, body)
+    let hdr = "HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)) + "\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+    tcp_send(client, hdr + body)
+    tcp_close(client)
+
+fn _http_created(client, body)
+    let hdr = "HTTP/1.1 201 Created\r\nContent-Length: " + str(len(body)) + "\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+    tcp_send(client, hdr + body)
+    tcp_close(client)
+
+fn _http_err(client, code, msg)
+    let body = "\{\"error\":\"" + msg + "\"\}"
+    let status = if code == 404
+        "404 Not Found"
+    else
+        "400 Bad Request"
+    let hdr = "HTTP/1.1 " + status + "\r\nContent-Length: " + str(len(body)) + "\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+    tcp_send(client, hdr + body)
+    tcp_close(client)
+
+fn _item_json(item)
+    "\{\"id\":" + str(item["id"]) + ",\"name\":\"" + str(item["name"]) + "\",\"value\":" + str(item["value"]) + "\}"
+
+fn _items_json(items)
+    let parts = []
+    for item in items
+        push(parts, _item_json(item))
+    "[" + join(parts, ",") + "]"
+
+fn _handle(client, raw, items, nid)
+    let method = _parse_method(raw)
+    let path = _parse_path(raw)
+    let body = _parse_body(raw)
+
+    if method == "GET" and path == "/health"
+        _http_ok(client, "\{\"status\":\"ok\"\}")
+        return nid
+
+    if method == "GET" and path == "/api/stats"
+        _http_ok(client, "\{\"items\":" + str(len(items)) + "\}")
+        return nid
+
+    if method == "GET" and path == "/api/items"
+        _http_ok(client, _items_json(items))
+        return nid
+
+    if method == "POST" and path == "/api/items"
+        let name = _json_field(body, "name")
+        let vs = _json_field(body, "value")
+        if len(name) == 0
+            _http_err(client, 400, "name required")
+            return nid
+        let v = if len(vs) > 0
+            parse_int(vs)
+        else
+            0
+        let item = {"id": nid, "name": name, "value": v}
+        push(items, item)
+        _http_created(client, _item_json(item))
+        return nid + 1
+
+    if method == "GET" and starts_with(path, "/api/items/")
+        let parts = split(path, "/")
+        if len(parts) >= 4
+            let id = parse_int(parts[3])
+            for item in items
+                if item["id"] == id
+                    _http_ok(client, _item_json(item))
+                    return nid
+        _http_err(client, 404, "not found")
+        return nid
+
+    _http_err(client, 404, "unknown")
+    return nid
+
+fn _server_task(port, ready_ch, result_ch)
+    let srv = tcp_listen(port)
+    assert(srv >= 0, "listen failed")
+    send(ready_ch, 1)
+    let items = []
+    let nid = 1
+    let rc = 0
+    while rc < 6
+        let client = tcp_accept(srv)
+        if client >= 0
+            let raw = tcp_recv(client)
+            if len(raw) > 0
+                rc = rc + 1
+                nid = _handle(client, raw, items, nid)
+            else
+                tcp_close(client)
+    tcp_close(srv)
+    send(result_ch, rc)
+
+fn _test_api()
+    let port = 19100
+    let ready_ch = channel()
+    let result_ch = channel()
+    let p = port
+    let rch = ready_ch
+    let rsch = result_ch
+    spawn(fn(z) _server_task(p, rch, rsch))
+    recv(ready_ch)
+    sleep(50)
+
+    let r1 = http_get("http://127.0.0.1:" + str(port) + "/health")
+    assert(contains(str(r1), "ok"), "health: " + str(r1))
+    print("  health check: PASS")
+
+    let r2 = http_post("http://127.0.0.1:" + str(port) + "/api/items", "\{\"name\":\"widget\",\"value\":42\}", "application/json")
+    assert(contains(str(r2), "widget"), "create: " + str(r2))
+    print("  create item: PASS")
+
+    let r3 = http_post("http://127.0.0.1:" + str(port) + "/api/items", "\{\"name\":\"gadget\",\"value\":99\}", "application/json")
+    assert(contains(str(r3), "gadget"), "create2: " + str(r3))
+    print("  create item 2: PASS")
+
+    let r4 = http_get("http://127.0.0.1:" + str(port) + "/api/items")
+    assert(contains(str(r4), "widget"), "list: " + str(r4))
+    print("  list items: PASS")
+
+    let r5 = http_get("http://127.0.0.1:" + str(port) + "/api/items/1")
+    assert(contains(str(r5), "widget"), "get1: " + str(r5))
+    print("  get by id: PASS")
+
+    let r6 = http_get("http://127.0.0.1:" + str(port) + "/api/stats")
+    assert(contains(str(r6), "\"items\":2"), "stats: " + str(r6))
+    print("  stats: PASS")
+
+    let h = recv(result_ch)
+    assert(h == 6, "handled 6")
+
+fn main()
+    _test_api()
+    print("real_http_api: all passed")

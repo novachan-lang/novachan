@@ -3917,11 +3917,29 @@ typedef struct NovaSchedTask {
     int      finished;             /* 1 after task fully done + monitors notified */
 } NovaSchedTask;
 
+#ifndef NOVA_POLL_READ
+#define NOVA_POLL_READ  1
+#define NOVA_POLL_WRITE 2
+#endif
+
+/* I/O waiter: a green task parked waiting for socket readiness. When the
+   carrier loop finds no runnable tasks it polls all I/O waiters via select()
+   and re-enqueues those whose FDs are ready. This is the netpoller integration
+   that makes tcp_recv/tcp_send/tcp_accept non-blocking under the green
+   scheduler — zero coloring, same API, the runtime does the work. */
+typedef struct NovaIOWaiter {
+    NovaSchedTask*      task;
+    int64_t             fd;
+    int                 events;  /* NOVA_POLL_READ or NOVA_POLL_WRITE */
+    struct NovaIOWaiter* next;
+} NovaIOWaiter;
+
 static NovaSchedTask* nova_rq_head = NULL;
 static NovaSchedTask* nova_rq_tail = NULL;
 static NovaSchedTask* nova_sched_current = NULL;
 static int     nova_sched_running = 0;
 static int64_t nova_sched_live = 0;
+static NovaIOWaiter* nova_io_waiters = NULL;
 
 static void nova_rq_push(NovaSchedTask* t) {
     t->next = NULL;
@@ -3977,6 +3995,66 @@ static void nova_sched_wake_all(NovaChannel* ch) {
     while (ch->green_send_waiters) nova_sched_wake_send_one(ch);
 }
 
+/* Park the current green task on I/O: register its FD + desired events and
+   yield to the carrier. The carrier's poll loop will wake it when ready. */
+static void nova_sched_park_io(int64_t fd, int events) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return;
+    NovaIOWaiter* w = (NovaIOWaiter*)calloc(1, sizeof(NovaIOWaiter));
+    if (!w) return;
+    w->task = t;
+    w->fd = fd;
+    w->events = events;
+    w->next = nova_io_waiters;
+    nova_io_waiters = w;
+    t->status = 2;
+    nova_rt_fiber_yield();
+}
+
+/* Poll all I/O waiters via select() with a timeout; re-enqueue those whose
+   FDs are ready. Returns the count of tasks woken. */
+static int nova_sched_poll_io(int timeout_ms) {
+    if (!nova_io_waiters) return 0;
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    int maxfd = 0;
+    for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
+        if (w->events & NOVA_POLL_READ)  FD_SET(w->fd, &rfds);
+        if (w->events & NOVA_POLL_WRITE) FD_SET(w->fd, &wfds);
+#ifndef _WIN32
+        if ((int)w->fd > maxfd) maxfd = (int)w->fd;
+#endif
+    }
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#ifdef _WIN32
+    int n = select(0, &rfds, &wfds, NULL, &tv);
+#else
+    int n = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
+#endif
+    if (n <= 0) return 0;
+    int woken = 0;
+    NovaIOWaiter** pp = &nova_io_waiters;
+    while (*pp) {
+        NovaIOWaiter* w = *pp;
+        int ready = 0;
+        if ((w->events & NOVA_POLL_READ)  && FD_ISSET(w->fd, &rfds))  ready = 1;
+        if ((w->events & NOVA_POLL_WRITE) && FD_ISSET(w->fd, &wfds)) ready = 1;
+        if (ready) {
+            *pp = w->next;
+            w->task->status = 0;
+            nova_rq_push(w->task);
+            free(w);
+            woken++;
+        } else {
+            pp = &w->next;
+        }
+    }
+    return woken;
+}
+
 /* Send a value to a channel from the scheduler loop (not inside a green task).
    Direct enqueue + green-waiter wake: a parked green task sits on green_waiters,
    not the condvar, so the normal OS-path send would not wake it. */
@@ -4021,7 +4099,11 @@ int64_t nova_rt_sched_run(void) {
     nova_sched_running = 1;
     while (nova_sched_live > 0) {
         NovaSchedTask* t = nova_rq_pop();
-        if (!t) break;                             /* all remaining tasks parked => deadlock; bail */
+        if (!t && nova_io_waiters) {
+            nova_sched_poll_io(10);
+            t = nova_rq_pop();
+        }
+        if (!t) break;
         if (t->status == 3) continue;
         nova_sched_current = t;
         t->status = 1;
@@ -6624,6 +6706,8 @@ static void nova_wsa_init(void) {
 static void nova_wsa_init(void) {}
 #endif
 
+int64_t nova_rt_io_set_nonblocking(int64_t fd_val);
+
 int64_t nova_rt_tcp_connect(int64_t host_ptr, int64_t port_val) {
     nova_wsa_init();
     const char* host = (const char*)(uintptr_t)host_ptr;
@@ -6686,6 +6770,26 @@ int64_t nova_rt_tcp_listen(int64_t port_val) {
 
 int64_t nova_rt_tcp_accept(int64_t server_val) {
     NOVA_SOCKET server = (NOVA_SOCKET)server_val;
+    if (nova_sched_in_task()) {
+        nova_rt_io_set_nonblocking(server_val);
+        for (;;) {
+            struct sockaddr_in ca;
+            int al = sizeof(ca);
+#ifdef _WIN32
+            NOVA_SOCKET c = accept(server, (struct sockaddr*)&ca, &al);
+            if (c != NOVA_INVALID_SOCKET) return (int64_t)c;
+            if (WSAGetLastError() != WSAEWOULDBLOCK) break;
+#else
+            socklen_t sl = (socklen_t)al;
+            NOVA_SOCKET c = accept(server, (struct sockaddr*)&ca, &sl);
+            if (c != NOVA_INVALID_SOCKET) return (int64_t)c;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+#endif
+            nova_sched_park_io(server_val, NOVA_POLL_READ);
+        }
+        nova_set_error("tcp_accept: accept failed (green)");
+        return -1;
+    }
     struct sockaddr_in client_addr;
     int addrlen = sizeof(client_addr);
 #ifdef _WIN32
@@ -6706,6 +6810,21 @@ int64_t nova_rt_tcp_send(int64_t sock_val, int64_t data_ptr) {
     const char* data = (const char*)(uintptr_t)data_ptr;
     if (!data) return 0;
     int len = (int)strlen(data);
+    if (nova_sched_in_task()) {
+        nova_rt_io_set_nonblocking(sock_val);
+        int total = 0;
+        while (total < len) {
+            int n = send(sock, data + total, len - total, 0);
+            if (n >= 0) { total += n; continue; }
+#ifdef _WIN32
+            if (WSAGetLastError() != WSAEWOULDBLOCK) break;
+#else
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+#endif
+            nova_sched_park_io(sock_val, NOVA_POLL_WRITE);
+        }
+        return (int64_t)total;
+    }
     int sent = send(sock, data, len, 0);
     if (sent < 0) {
         nova_set_error("tcp_send: send failed");
@@ -6716,6 +6835,26 @@ int64_t nova_rt_tcp_send(int64_t sock_val, int64_t data_ptr) {
 
 int64_t nova_rt_tcp_recv(int64_t sock_val) {
     NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
+    if (nova_sched_in_task()) {
+        nova_rt_io_set_nonblocking(sock_val);
+        char buf[8192];
+        for (;;) {
+            int n = recv(sock, buf, sizeof(buf) - 1, 0);
+            if (n > 0) {
+                buf[n] = '\0';
+                char* result = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
+                if (result) { memcpy(result, buf, (size_t)n + 1); return (int64_t)(uintptr_t)result; }
+                return (int64_t)(uintptr_t)"";
+            }
+            if (n == 0) return (int64_t)(uintptr_t)"";
+#ifdef _WIN32
+            if (WSAGetLastError() != WSAEWOULDBLOCK) return (int64_t)(uintptr_t)"";
+#else
+            if (errno != EAGAIN && errno != EWOULDBLOCK) return (int64_t)(uintptr_t)"";
+#endif
+            nova_sched_park_io(sock_val, NOVA_POLL_READ);
+        }
+    }
     /* Drain loop: HTTP requests often come in 2+ packets (headers, then
        body). After each recv, poll with a short select timeout; append
        until the socket is idle for 30ms, the connection closes, or the
@@ -12377,6 +12516,180 @@ int64_t nova_rt_dap_send(int64_t msg_val) {
     fflush(stdout);
     return (int64_t)len;
 }
+
+/* ── Interactive Debugger ─────────────────────────────────────────────────
+   Instrumentation-based debugger. Breakpoint table + step-mode state +
+   console REPL when stopped. dbg_hook(file,line,locals) checks breakpoints
+   and step-mode, drops into the console when triggered. */
+
+#define NOVA_DBG_MAX_BP   256
+#define NOVA_DBG_MAX_STACK 128
+
+typedef struct { const char* file; int line; int enabled; } NovaDbgBP;
+typedef struct { const char* fn_name; const char* file; int line; int64_t locals; } NovaDbgFrame;
+
+static NovaDbgBP    g_dbg_bps[NOVA_DBG_MAX_BP];
+static int          g_dbg_bp_count = 0;
+static int          g_dbg_mode = 0;
+static int          g_dbg_step_depth = 0;
+static NovaDbgFrame g_dbg_stack[NOVA_DBG_MAX_STACK];
+static int          g_dbg_depth = 0;
+static int          g_dbg_active = 0;
+
+int64_t nova_rt_dbg_set_bp(int64_t file_val, int64_t line_val) {
+    if (g_dbg_bp_count >= NOVA_DBG_MAX_BP) return -1;
+    const char* f = file_val ? (const char*)(uintptr_t)file_val : "<unknown>";
+    int idx = g_dbg_bp_count++;
+    g_dbg_bps[idx].file = f;
+    g_dbg_bps[idx].line = (int)line_val;
+    g_dbg_bps[idx].enabled = 1;
+    g_dbg_active = 1;
+    return idx;
+}
+
+int64_t nova_rt_dbg_remove_bp(int64_t idx) {
+    if (idx < 0 || idx >= g_dbg_bp_count) return -1;
+    g_dbg_bps[(int)idx].enabled = 0;
+    return 0;
+}
+
+int64_t nova_rt_dbg_list_bps(void) {
+    int64_t result = nova_rt_list_create();
+    for (int i = 0; i < g_dbg_bp_count; i++) {
+        if (!g_dbg_bps[i].enabled) continue;
+        int64_t row = nova_rt_list_create();
+        nova_rt_list_append(row, (int64_t)i);
+        nova_rt_list_append(row, nova_rt_create_string((void*)g_dbg_bps[i].file));
+        nova_rt_list_append(row, (int64_t)g_dbg_bps[i].line);
+        nova_rt_list_append(result, row);
+    }
+    return result;
+}
+
+int64_t nova_rt_dbg_push_frame(int64_t fn_name_val, int64_t file_val, int64_t line_val, int64_t locals) {
+    if (g_dbg_depth < NOVA_DBG_MAX_STACK) {
+        NovaDbgFrame* f = &g_dbg_stack[g_dbg_depth];
+        f->fn_name = fn_name_val ? (const char*)(uintptr_t)fn_name_val : "<anon>";
+        f->file = file_val ? (const char*)(uintptr_t)file_val : "<unknown>";
+        f->line = (int)line_val;
+        f->locals = locals;
+    }
+    g_dbg_depth++;
+    return g_dbg_depth;
+}
+
+int64_t nova_rt_dbg_pop_frame(void) {
+    if (g_dbg_depth > 0) g_dbg_depth--;
+    if (g_dbg_mode == 3 && g_dbg_depth < g_dbg_step_depth) g_dbg_mode = 1;
+    return g_dbg_depth;
+}
+
+int64_t nova_rt_dbg_backtrace(void) {
+    int64_t result = nova_rt_list_create();
+    int top = g_dbg_depth < NOVA_DBG_MAX_STACK ? g_dbg_depth : NOVA_DBG_MAX_STACK;
+    for (int i = top - 1; i >= 0; i--) {
+        int64_t row = nova_rt_list_create();
+        nova_rt_list_append(row, nova_rt_create_string((void*)g_dbg_stack[i].fn_name));
+        nova_rt_list_append(row, nova_rt_create_string((void*)g_dbg_stack[i].file));
+        nova_rt_list_append(row, (int64_t)g_dbg_stack[i].line);
+        nova_rt_list_append(result, row);
+    }
+    return result;
+}
+
+static int nova_dbg_should_stop(const char* file, int line) {
+    if (!g_dbg_active) return 0;
+    if (g_dbg_mode == 1) return 1;
+    if (g_dbg_mode == 2 && g_dbg_depth <= g_dbg_step_depth) return 1;
+    for (int i = 0; i < g_dbg_bp_count; i++) {
+        if (g_dbg_bps[i].enabled && g_dbg_bps[i].line == line) {
+            if (!file || !g_dbg_bps[i].file) return 1;
+            const char* bf = g_dbg_bps[i].file;
+            size_t blen = strlen(bf);
+            size_t flen = strlen(file);
+            if (flen >= blen && strcmp(file + flen - blen, bf) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
+static void nova_dbg_show_locals(int64_t locals) {
+    if (!locals) { fprintf(stderr, "[dbg] no locals captured\n"); return; }
+    int64_t keys = nova_rt_dict_keys(locals);
+    int64_t n = nova_rt_list_len(keys);
+    if (n == 0) { fprintf(stderr, "[dbg] no locals\n"); return; }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = nova_rt_list_get(keys, i);
+        int64_t v = nova_rt_dict_get(locals, k);
+        const char* ks = (const char*)(uintptr_t)k;
+        fprintf(stderr, "  %s = ", ks);
+        int64_t vs = nova_rt_any_to_str(v);
+        fprintf(stderr, "%s\n", vs ? (const char*)(uintptr_t)vs : "?");
+    }
+}
+
+int64_t nova_rt_dbg_hook(int64_t file_val, int64_t line_val, int64_t locals) {
+    const char* file = file_val ? (const char*)(uintptr_t)file_val : "<unknown>";
+    int line = (int)line_val;
+    if (!nova_dbg_should_stop(file, line)) return 0;
+
+    if (g_dbg_depth > 0 && g_dbg_depth <= NOVA_DBG_MAX_STACK) {
+        g_dbg_stack[g_dbg_depth - 1].line = line;
+        g_dbg_stack[g_dbg_depth - 1].locals = locals;
+    }
+
+    fprintf(stderr, "\n[dbg] stopped at %s:%d", file, line);
+    int top = g_dbg_depth < NOVA_DBG_MAX_STACK ? g_dbg_depth : NOVA_DBG_MAX_STACK;
+    if (top > 0) fprintf(stderr, " in %s", g_dbg_stack[top-1].fn_name);
+    fprintf(stderr, "\n");
+    g_dbg_mode = 0;
+
+    char cmd[256];
+    for (;;) {
+        fprintf(stderr, "(nova-dbg) ");
+        fflush(stderr);
+        if (!fgets(cmd, sizeof(cmd), stdin)) break;
+        size_t cl = strlen(cmd);
+        while (cl > 0 && (cmd[cl-1] == '\n' || cmd[cl-1] == '\r')) cmd[--cl] = '\0';
+
+        if (strcmp(cmd, "c") == 0 || strcmp(cmd, "continue") == 0) {
+            break;
+        } else if (strcmp(cmd, "s") == 0 || strcmp(cmd, "step") == 0) {
+            g_dbg_mode = 1; break;
+        } else if (strcmp(cmd, "n") == 0 || strcmp(cmd, "next") == 0) {
+            g_dbg_mode = 2; g_dbg_step_depth = g_dbg_depth; break;
+        } else if (strcmp(cmd, "o") == 0 || strcmp(cmd, "out") == 0) {
+            g_dbg_mode = 3; g_dbg_step_depth = g_dbg_depth; break;
+        } else if (strcmp(cmd, "bt") == 0) {
+            for (int i = top - 1; i >= 0; i--)
+                fprintf(stderr, "  #%d  %s (%s:%d)\n", top-1-i, g_dbg_stack[i].fn_name, g_dbg_stack[i].file, g_dbg_stack[i].line);
+        } else if (strcmp(cmd, "locals") == 0) {
+            nova_dbg_show_locals(locals);
+        } else if (strncmp(cmd, "p ", 2) == 0) {
+            const char* name = cmd + 2;
+            while (*name == ' ') name++;
+            if (locals) {
+                int64_t key = nova_rt_create_string((void*)name);
+                int64_t v = nova_rt_dict_get(locals, key);
+                int64_t vs = nova_rt_any_to_str(v);
+                fprintf(stderr, "  %s = %s\n", name, vs ? (const char*)(uintptr_t)vs : "<not found>");
+            }
+        } else if (strncmp(cmd, "bp ", 3) == 0) {
+            int bpl = atoi(cmd + 3);
+            if (bpl > 0) { nova_rt_dbg_set_bp(file_val, bpl); fprintf(stderr, "  breakpoint at %s:%d\n", file, bpl); }
+        } else if (strcmp(cmd, "q") == 0 || strcmp(cmd, "quit") == 0) {
+            exit(0);
+        } else if (strcmp(cmd, "h") == 0 || strcmp(cmd, "help") == 0) {
+            fprintf(stderr, "[dbg] c=continue s=step n=next o=out bt=backtrace locals p=print bp=break q=quit\n");
+        } else if (cl > 0) {
+            fprintf(stderr, "  unknown: %s (h for help)\n", cmd);
+        }
+    }
+    return 1;
+}
+
+int64_t nova_rt_dbg_enable(void) { g_dbg_active = 1; g_dbg_mode = 1; return 0; }
+int64_t nova_rt_dbg_disable(void) { g_dbg_active = 0; g_dbg_mode = 0; return 0; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Phase 10 — Documentation Generator: doc extraction, HTML/Markdown output

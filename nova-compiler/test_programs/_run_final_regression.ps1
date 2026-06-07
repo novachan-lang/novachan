@@ -318,7 +318,13 @@ $domain_tests = @(
     'const_test',
     'hot_reload_test',
     'io_poll_test',
-    'ws_sched_test'
+    'ws_sched_test',
+    'protocol_builtin_test',
+    'green_netpoll_test',
+    'debugx',
+    'real_cli_grep',
+    'real_http_api',
+    'nova_fmt'
 )
 
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators

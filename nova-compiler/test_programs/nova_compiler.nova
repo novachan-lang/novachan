@@ -422,13 +422,18 @@ fn tokenize_file(source: string, filename: string) -> list
             else
                 let num = ""
                 let is_float = false
-                while pos < length and (is_digit(source[pos]) or (source[pos] == "." and pos + 1 < length and source[pos + 1] != ".") or source[pos] == "_" or source[pos] == "e" or source[pos] == "E")
+                while pos < length and (is_digit(source[pos]) or (source[pos] == "." and pos + 1 < length and is_digit(source[pos + 1])) or source[pos] == "_" or source[pos] == "e" or source[pos] == "E")
                     if source[pos] == "." or source[pos] == "e" or source[pos] == "E"
                         is_float = true
                     if source[pos] != "_"
                         num = num + source[pos]
                     pos = pos + 1
                     col = col + 1
+                if is_float and len(num) > 0 and num[len(num) - 1] == "."
+                    num = slice(num, 0, len(num) - 1)
+                    is_float = false
+                    pos = pos - 1
+                    col = col - 1
                 if is_float
                     push(tokens, Token("FLOAT", num, line, start_col))
                 else
@@ -4245,6 +4250,24 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_dap_breakpoint"
     else if name == "dap_send"
         "nova_rt_dap_send"
+    else if name == "dbg_set_bp"
+        "nova_rt_dbg_set_bp"
+    else if name == "dbg_remove_bp"
+        "nova_rt_dbg_remove_bp"
+    else if name == "dbg_list_bps"
+        "nova_rt_dbg_list_bps"
+    else if name == "dbg_push_frame"
+        "nova_rt_dbg_push_frame"
+    else if name == "dbg_pop_frame"
+        "nova_rt_dbg_pop_frame"
+    else if name == "dbg_backtrace"
+        "nova_rt_dbg_backtrace"
+    else if name == "dbg_hook"
+        "nova_rt_dbg_hook"
+    else if name == "dbg_enable"
+        "nova_rt_dbg_enable"
+    else if name == "dbg_disable"
+        "nova_rt_dbg_disable"
     // Phase 10: Documentation generator
     else if name == "doc_extract"
         "nova_rt_doc_extract"
@@ -4745,6 +4768,15 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_term_decode(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_sched_spawn(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_sched_run() nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_set_bp(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_remove_bp(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_list_bps() nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_push_frame(i64, i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_pop_frame() nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_backtrace() nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_hook(i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_enable() nounwind")
+    emit(cg, "declare i64 @nova_rt_dbg_disable() nounwind")
     emit(cg, "declare i64 @nova_rt_at_exit(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_dir_walk(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_flatten(i64) nounwind")
@@ -6538,20 +6570,35 @@ fn get_ir_field_index_for(b: IrBuilder, stype: string, field_name: string) -> in
             sfi = sfi + 1
     get_ir_field_index(b, field_name)
 
+fn _is_builtin_type_name(n)
+    n == "int" or n == "float" or n == "string" or n == "list" or n == "dict" or n == "bool"
+
 fn ir_expr_struct_type(b: IrBuilder, expr: Expr) -> string
     match expr
         Expr(et, ev, en, ec, ef, eln) =>
+            if et == "int"
+                return "int"
+            if et == "float"
+                return "float"
+            if et == "string"
+                return "string"
+            if et == "list" or et == "list_init"
+                return "list"
+            if et == "dict_init"
+                return "dict"
+            if et == "ident" and (ev == "true" or ev == "false")
+                return "bool"
             if et == "struct_init" and contains(b.ir_sdefs, ev)
                 return ev
             if et == "call" and contains(b.ir_sdefs, ev)
                 return ev
             if et == "call" and contains(b.ir_fn_returns, ev)
                 let rt = b.ir_fn_returns[ev]
-                if contains(b.ir_sdefs, rt)
+                if contains(b.ir_sdefs, rt) or _is_builtin_type_name(rt)
                     return rt
             if et == "ident" and contains(b.ir_locals, ev)
                 let lt = b.ir_locals[ev]
-                if lt != 1 and contains(b.ir_sdefs, lt)
+                if lt != 1 and (contains(b.ir_sdefs, lt) or _is_builtin_type_name(lt))
                     return lt
             if (et == "member" or et == "field") and len(ec) >= 1
                 // Field access self.f: resolve the receiver's struct type, then look up the
@@ -8499,6 +8546,15 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["dap_log"] = NTypeScheme([], nt_fn([nt_string(), nt_string()], nt_unit()))
     reg["dap_breakpoint"] = NTypeScheme([], nt_fn([nt_string(), nt_int()], nt_unit()))
     reg["dap_send"] = NTypeScheme([], nt_fn([nt_string()], nt_int()))
+    reg["dbg_set_bp"] = NTypeScheme([], nt_fn([nt_string(), nt_int()], nt_int()))
+    reg["dbg_remove_bp"] = NTypeScheme([], nt_fn([nt_int()], nt_int()))
+    reg["dbg_list_bps"] = NTypeScheme([], nt_fn([], nt_any()))
+    reg["dbg_push_frame"] = NTypeScheme([], nt_fn([nt_string(), nt_string(), nt_int(), nt_any()], nt_int()))
+    reg["dbg_pop_frame"] = NTypeScheme([], nt_fn([], nt_int()))
+    reg["dbg_backtrace"] = NTypeScheme([], nt_fn([], nt_any()))
+    reg["dbg_hook"] = NTypeScheme([], nt_fn([nt_string(), nt_int(), nt_any()], nt_int()))
+    reg["dbg_enable"] = NTypeScheme([], nt_fn([], nt_int()))
+    reg["dbg_disable"] = NTypeScheme([], nt_fn([], nt_int()))
     // Phase 10: Documentation generator
     reg["doc_extract"] = NTypeScheme([], nt_fn([nt_string()], nt_any()))
     reg["doc_to_markdown"] = NTypeScheme([], nt_fn([nt_any(), nt_string()], nt_string()))
@@ -12668,7 +12724,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                 if mdt_dd > 0
                     let mdt_type = slice(fn2, 0, mdt_dd)
                     let mdt_method = slice(fn2, mdt_dd + 2, len(fn2))
-                    if contains(b.ir_sdefs, mdt_type)
+                    if contains(b.ir_sdefs, mdt_type) or _is_builtin_type_name(mdt_type)
                         if not contains(mdt_collect, mdt_method)
                             mdt_collect[mdt_method] = []
                         push(mdt_collect[mdt_method], [type_name_hash(mdt_type), fn2, len(fp)])
@@ -13011,6 +13067,15 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_term_decode(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_sched_spawn(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_sched_run() nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_set_bp(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_remove_bp(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_list_bps() nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_push_frame(i64, i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_pop_frame() nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_backtrace() nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_hook(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_enable() nounwind")
+    ire_line(e, "declare i64 @nova_rt_dbg_disable() nounwind")
     ire_line(e, "declare i64 @nova_rt_at_exit(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_dir_walk(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_flatten(i64) nounwind")
