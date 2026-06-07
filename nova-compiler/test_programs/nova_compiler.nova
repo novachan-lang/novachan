@@ -2624,6 +2624,49 @@ fn inject_ensures(stmts: list) -> list
             push(out, s)
     out
 
+fn _make_fields_method(tname: string, fields: list, ln: int) -> Stmt
+    let elems = []
+    for f in fields
+        match f
+            Param(fname, ftype, fdef) =>
+                push(elems, Expr("str", fname, 0, [], [], ln))
+    let list_expr = Expr("list", "", 0, elems, [], ln)
+    let ret_stmt = Stmt("return", "", list_expr, [], [], [], [], ln)
+    Stmt("fn", tname + "__fields", null_expr(), [ret_stmt], [Param("self", tname, null_expr())], [], [], ln)
+
+fn _make_type_name_method(tname: string, ln: int) -> Stmt
+    let ret_stmt = Stmt("return", "", Expr("str", tname, 0, [], [], ln), [], [], [], [], ln)
+    Stmt("fn", tname + "__type_name", null_expr(), [ret_stmt], [Param("self", tname, null_expr())], [], [], ln)
+
+fn _make_field_get_method(tname: string, fields: list, ln: int) -> Stmt
+    // Returns the value of field `name` from `self`. Because fields may have
+    // different types (string/int/bool), we push the value into a temp list (which
+    // type-erases to `any`) and return list[0], avoiding HM unification conflicts.
+    let box_var = "_fg_box"
+    let box_init = Stmt("assign", box_var, Expr("list", "", 0, [], [], ln), [], [], [], [], ln)
+    let body = [box_init]
+    let box_id = Expr("ident", box_var, 0, [], [], ln)
+    for f in fields
+        match f
+            Param(fname, ftype, fdef) =>
+                let cond = Expr("binop", "==", 0, [Expr("ident", "name", 0, [], [], ln), Expr("str", fname, 0, [], [], ln)], [], ln)
+                let memb = Expr("member", fname, 0, [Expr("ident", "self", 0, [], [], ln)], [], ln)
+                let do_push = Stmt("expr", "", Expr("call", "push", 0, [box_id, memb], [], ln), [], [], [], [], ln)
+                let do_ret = Stmt("return", "", Expr("index", "", 0, [box_id, Expr("int", "0", 0, [], [], ln)], [], ln), [], [], [], [], ln)
+                push(body, Stmt("if", "", cond, [do_push, do_ret], [], [], [], ln))
+    push(body, Stmt("return", "", Expr("null", "", 0, [], [], ln), [], [], [], [], ln))
+    Stmt("fn", tname + "__field_get", null_expr(), body, [Param("self", tname, null_expr()), Param("name", "string", null_expr())], [], [], ln)
+
+fn _make_field_types_method(tname: string, fields: list, ln: int) -> Stmt
+    let elems = []
+    for f in fields
+        match f
+            Param(fname, ftype, fdef) =>
+                push(elems, Expr("str", ftype, 0, [], [], ln))
+    let list_expr = Expr("list", "", 0, elems, [], ln)
+    let ret_stmt = Stmt("return", "", list_expr, [], [], [], [], ln)
+    Stmt("fn", tname + "__field_types", null_expr(), [ret_stmt], [Param("self", tname, null_expr())], [], [], ln)
+
 fn expand_derives(stmts: list) -> list
     // NOVA way (not Rust/Python): the genius compiler derives a value's textual form (show) and
     // its JSON encoding (to_json) from its STRUCTURE (innovation D1) — zero annotation, for EVERY
@@ -2649,6 +2692,10 @@ fn expand_derives(stmts: list) -> list
                         push(generated, _make_show_method(sname, sparams, showset, sln))
                         push(generated, _make_to_json_method(sname, sparams, jsonset, sln))
                         push(generated, _make_from_json_method(sname, sparams, jsonset, sln))
+                        push(generated, _make_fields_method(sname, sparams, sln))
+                        push(generated, _make_type_name_method(sname, sln))
+                        push(generated, _make_field_types_method(sname, sparams, sln))
+                        push(generated, _make_field_get_method(sname, sparams, sln))
     if len(generated) == 0
         return stmts
     let out = []
@@ -4555,6 +4602,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_sleep_ms(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_clock_ns() nounwind")
     emit(cg, "declare i64 @nova_rt_type_of(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_type_hash(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_range(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_range_from_to(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_sort(i64) nounwind")
@@ -5694,9 +5742,11 @@ type IrBuilder
     ir_defers: list
     ir_gen_fns: dict
     ir_consts: dict
+    ir_filename: string
+    ir_fn_name: string
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, [], {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, [], {}, {}, "", "")
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -5830,6 +5880,18 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     return dest
                 return acc
             else if tag == "ident"
+                if value == "__file__"
+                    let dest = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_str", dest, ir_type_str(), [], b.ir_filename, 0)
+                    return dest
+                if value == "__line__"
+                    let dest = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_int", dest, ir_type_int(), [], str(b.ir_cur_line), b.ir_cur_line)
+                    return dest
+                if value == "__func__"
+                    let dest = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_str", dest, ir_type_str(), [], b.ir_fn_name, 0)
+                    return dest
                 if not contains(b.ir_locals, value) and list_contains(b.ir_fnames, value)
                     // Function reference: wrap in a closure record (no captures)
                     let arity = 0
@@ -6055,6 +6117,26 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     if json_sty != "" and list_contains(b.ir_fnames, json_sty + "__to_json")
                         ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, json_sty + "__to_json", 0)
                         return dest
+                if fn_name == "fields" and len(children) == 1
+                    let fl_sty = ir_expr_struct_type(b, children[0])
+                    if fl_sty != "" and list_contains(b.ir_fnames, fl_sty + "__fields")
+                        ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, fl_sty + "__fields", 0)
+                        return dest
+                if fn_name == "type_name" and len(children) == 1
+                    let tn_sty = ir_expr_struct_type(b, children[0])
+                    if tn_sty != "" and list_contains(b.ir_fnames, tn_sty + "__type_name")
+                        ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, tn_sty + "__type_name", 0)
+                        return dest
+                if fn_name == "field_types" and len(children) == 1
+                    let ft_sty = ir_expr_struct_type(b, children[0])
+                    if ft_sty != "" and list_contains(b.ir_fnames, ft_sty + "__field_types")
+                        ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, ft_sty + "__field_types", 0)
+                        return dest
+                if fn_name == "field_get" and len(children) == 2
+                    let fg_sty = ir_expr_struct_type(b, children[0])
+                    if fg_sty != "" and list_contains(b.ir_fnames, fg_sty + "__field_get")
+                        ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, fg_sty + "__field_get", 0)
+                        return dest
                 if fn_name == "error"
                     ir_emit_side(b, "set_error", dest, ir_type_any(), arg_regs, "", 0)
                     return dest
@@ -6068,9 +6150,9 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     return dest
                 else if contains(b.ir_sdefs, fn_name)
                     ir_emit_inst(b, "make_struct", dest, ir_type_any(), arg_regs, fn_name, len(arg_regs))
-                else if list_contains(b.ir_fnames, fn_name) or resolve_runtime_fn(fn_name) != fn_name
-                    // User-defined functions shadow built-ins of the same name: only
-                    // resolve to a runtime built-in when no user fn with that name exists.
+                else if not contains(b.ir_locals, fn_name) and (list_contains(b.ir_fnames, fn_name) or resolve_runtime_fn(fn_name) != fn_name)
+                    // Local variables shadow builtins. User-defined functions shadow
+                    // built-ins of the same name when no local with that name exists.
                     let rt_name = fn_name
                     if not list_contains(b.ir_fnames, fn_name)
                         rt_name = resolve_runtime_fn(fn_name)
@@ -6173,7 +6255,7 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     let disp_impls = b.ir_method_dispatch[value]
                     let disp_recv = arg_regs[0]
                     let disp_hash = ir_fresh_reg(b)
-                    ir_emit_inst(b, "field_get", disp_hash, ir_type_int(), [disp_recv], "__type_hash", 0)
+                    ir_emit_side(b, "call", disp_hash, ir_type_int(), [disp_recv], "nova_rt_type_hash", 0)
                     let disp_merge = ir_fresh_label(b, "dyn_merge")
                     let disp_slot = "__dyn_" + str(b.ir_lc)
                     b.ir_lc = b.ir_lc + 1
@@ -7457,6 +7539,7 @@ fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
             b.ir_clabel = "entry"
             b.ir_rc = 0
             b.ir_defers = []
+            b.ir_fn_name = name
             ir_mark_move_sends(b, body)
             let is_gen = stmts_has_yield(body) and not starts_with(name, "__nfn_")
             if is_gen
@@ -8031,6 +8114,10 @@ fn ti_build_stdlib() -> dict
     reg["bool"] = NTypeScheme([-1], nt_fn([T], nt_bool()))
     reg["type_of"] = NTypeScheme([-1], nt_fn([T], nt_string()))
     reg["type"] = NTypeScheme([-1], nt_fn([T], nt_string()))
+    reg["fields"] = NTypeScheme([-1], nt_fn([T], nt_list(nt_string())))
+    reg["field_types"] = NTypeScheme([-1], nt_fn([T], nt_list(nt_string())))
+    reg["type_name"] = NTypeScheme([-1], nt_fn([T], nt_string()))
+    reg["field_get"] = NTypeScheme([-1], nt_fn([T, nt_string()], nt_any()))
     reg["len"] = NTypeScheme([-1], nt_fn([T], nt_int()))
     reg["range"] = NTypeScheme([], nt_fn([nt_int()], nt_list(nt_int())))
     reg["push"] = NTypeScheme([-1], nt_fn([nt_list(T), T], nt_unit()))
@@ -8712,6 +8799,10 @@ fn ti_lookup(st: TiState, vname: string, line: int) -> NType
     if contains(stdlib, vname)
         let scheme = stdlib[vname]
         return ti_instantiate(st, scheme)
+    if vname == "__file__" or vname == "__func__"
+        return nt_string()
+    if vname == "__line__"
+        return nt_int()
     let suggestion = ti_suggest_name(st, vname)
     let msg = "unknown identifier '" + vname + "'"
     if suggestion != ""
@@ -8927,6 +9018,30 @@ fn ti_const_eval(e: Expr) -> ConstEval
                         return ConstEval(1, 1)
                     return ConstEval(1, 0)
                 return ConstEval(0, 0)
+            if et == "if_expr"
+                if len(ec) >= 3
+                    let cce = ti_const_eval(ec[0])
+                    if cce.ok == 0
+                        return ConstEval(0, 0)
+                    if cce.val != 0
+                        return ti_const_eval(ec[1])
+                    return ti_const_eval(ec[2])
+                return ConstEval(0, 0)
+            if et == "if"
+                if len(ec) >= 3
+                    let cce = ti_const_eval(ec[0])
+                    if cce.ok == 0
+                        return ConstEval(0, 0)
+                    if cce.val != 0
+                        return ti_const_eval(ec[1])
+                    return ti_const_eval(ec[2])
+                return ConstEval(0, 0)
+            if et == "paren"
+                if len(ec) >= 1
+                    return ti_const_eval(ec[0])
+                return ConstEval(0, 0)
+            if et == "str"
+                return ConstEval(1, len(ev))
     ConstEval(0, 0)
 
 fn ti_infer_expr(st: TiState, expr: Expr) -> NType
@@ -12562,6 +12677,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             exit(1)
 
     let b = new_ir_builder()
+    b.ir_filename = filename
     let resolved_target = resolve_target(target)
     let e = new_ir_emitter(filename, resolved_target)
     // NOVA_COV=1 environment toggle: when set, the IR emitter injects
@@ -12839,6 +12955,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_sleep_ms(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_clock_ns() nounwind")
     ire_line(e, "declare i64 @nova_rt_type_of(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_type_hash(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_range(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_range_from_to(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_dict_keys(i64) nounwind readonly")

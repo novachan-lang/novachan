@@ -1,7 +1,7 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
-$compiler = ".\gen2_move.exe"
+$compiler = ".\nova.exe"
 $pass = 0
 $fail = 0
 $skip = 0
