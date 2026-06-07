@@ -7916,7 +7916,11 @@ int64_t nova_rt_tensor_add(int64_t a_h, int64_t b_h) {
     if (!nova_tensor_shapes_equal(a, b)) return 0;
     int64_t r = nova_tensor_alloc_like(a);
     NovaTensor* result = (NovaTensor*)(uintptr_t)r;
-    for (int64_t i = 0; i < a->size; i++) result->data[i] = a->data[i] + b->data[i];
+    double * restrict rd = result->data;
+    const double * restrict ad = a->data;
+    const double * restrict bd = b->data;
+    const int64_t n = a->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = ad[i] + bd[i];
     return r;
 }
 
@@ -7926,7 +7930,11 @@ int64_t nova_rt_tensor_mul(int64_t a_h, int64_t b_h) {
     if (!nova_tensor_shapes_equal(a, b)) return 0;
     int64_t r = nova_tensor_alloc_like(a);
     NovaTensor* result = (NovaTensor*)(uintptr_t)r;
-    for (int64_t i = 0; i < a->size; i++) result->data[i] = a->data[i] * b->data[i];
+    double * restrict rd = result->data;
+    const double * restrict ad = a->data;
+    const double * restrict bd = b->data;
+    const int64_t n = a->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = ad[i] * bd[i];
     return r;
 }
 
@@ -7936,7 +7944,10 @@ int64_t nova_rt_tensor_scale(int64_t a_h, int64_t scalar_bits) {
     double s = nova_elem_to_double(scalar_bits);
     int64_t r = nova_tensor_alloc_like(a);
     NovaTensor* result = (NovaTensor*)(uintptr_t)r;
-    for (int64_t i = 0; i < a->size; i++) result->data[i] = a->data[i] * s;
+    double * restrict rd = result->data;
+    const double * restrict ad = a->data;
+    const int64_t n = a->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = ad[i] * s;
     return r;
 }
 
