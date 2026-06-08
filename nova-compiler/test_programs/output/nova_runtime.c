@@ -3981,12 +3981,19 @@ typedef struct NovaIOWaiter {
     struct NovaIOWaiter* next;
 } NovaIOWaiter;
 
+typedef struct NovaSleepWaiter {
+    NovaSchedTask*        task;
+    int64_t               wake_time_ms;
+    struct NovaSleepWaiter* next;
+} NovaSleepWaiter;
+
 static NovaSchedTask* nova_rq_head = NULL;
 static NovaSchedTask* nova_rq_tail = NULL;
 static NovaSchedTask* nova_sched_current = NULL;
 static int     nova_sched_running = 0;
 static int64_t nova_sched_live = 0;
 static NovaIOWaiter* nova_io_waiters = NULL;
+static NovaSleepWaiter* nova_sleep_waiters = NULL;
 
 static void nova_rq_push(NovaSchedTask* t) {
     t->next = NULL;
@@ -4054,6 +4061,49 @@ static void nova_sched_park_io(int64_t fd, int events) {
     w->events = events;
     w->next = nova_io_waiters;
     nova_io_waiters = w;
+    t->status = 2;
+    nova_rt_fiber_yield();
+}
+
+static int64_t nova_sched_now_ms(void) {
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#endif
+}
+
+static int nova_sched_wake_sleepers(void) {
+    if (!nova_sleep_waiters) return 0;
+    int64_t now = nova_sched_now_ms();
+    int woken = 0;
+    NovaSleepWaiter** pp = &nova_sleep_waiters;
+    while (*pp) {
+        NovaSleepWaiter* w = *pp;
+        if (now >= w->wake_time_ms) {
+            *pp = w->next;
+            w->task->status = 0;
+            nova_rq_push(w->task);
+            free(w);
+            woken++;
+        } else {
+            pp = &w->next;
+        }
+    }
+    return woken;
+}
+
+static void nova_sched_park_sleep(int64_t ms) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return;
+    NovaSleepWaiter* w = (NovaSleepWaiter*)calloc(1, sizeof(NovaSleepWaiter));
+    if (!w) return;
+    w->task = t;
+    w->wake_time_ms = nova_sched_now_ms() + ms;
+    w->next = nova_sleep_waiters;
+    nova_sleep_waiters = w;
     t->status = 2;
     nova_rt_fiber_yield();
 }
@@ -4145,9 +4195,19 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
 int64_t nova_rt_sched_run(void) {
     nova_sched_running = 1;
     while (nova_sched_live > 0) {
+        nova_sched_wake_sleepers();
         NovaSchedTask* t = nova_rq_pop();
-        if (!t && nova_io_waiters) {
-            nova_sched_poll_io(10);
+        if (!t && (nova_io_waiters || nova_sleep_waiters)) {
+            int poll_ms = nova_sleep_waiters ? 1 : 10;
+            if (nova_io_waiters) nova_sched_poll_io(poll_ms);
+            else { /* only sleep waiters, brief OS sleep to avoid spin */
+#ifdef _WIN32
+                Sleep(1);
+#else
+                usleep(1000);
+#endif
+            }
+            nova_sched_wake_sleepers();
             t = nova_rq_pop();
         }
         if (!t) break;
@@ -4187,22 +4247,22 @@ int64_t nova_rt_sched_run(void) {
 }
 
 /* ── Stage 2a TRANSPARENCY: run the whole program under the green scheduler ────
-   When NOVA_GREEN is set, the program's main runs as a green task and `spawn`
-   creates green tasks — so plain spawn/channel code is M:N (many tasks on one
-   OS thread, blocking-LOOKING channel ops park) with ZERO async keyword. Default
-   (env unset) is byte-for-byte the old behavior. Flag-gated so it is opt-in. */
+   NOVA's implicit async model: EVERY program runs under the M:N green scheduler
+   by default. main() becomes the root green task; spawn() creates green tasks;
+   channel ops and socket I/O park cooperatively — zero async keyword, zero
+   coloring, the runtime does all the work. Set NOVA_GREEN=0 to disable. */
 static int nova_green_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char* v = getenv("NOVA_GREEN");
-        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+        cached = (v && v[0] == '0') ? 0 : 1;
     }
     return cached;
 }
 
-/* The compiler-emitted main calls this with &nova_main. In green mode we run
-   nova_main as the root green task and drive the scheduler; otherwise we call it
-   directly (identical to the old `call @nova_main()`). */
+/* The compiler-emitted main calls this with &nova_main. Default: run nova_main
+   as the root green task on the M:N scheduler (implicit async). Fallback to
+   direct call only when NOVA_GREEN=0 or on OOM. */
 void nova_rt_main_dispatch(int64_t main_fn) {
     if (nova_green_enabled()) {
         int64_t* rec = (int64_t*)malloc(sizeof(int64_t));
@@ -6107,6 +6167,10 @@ int64_t nova_rt_clock_ns(void) {
 }
 
 void nova_rt_sleep_ms(int64_t ms) {
+    if (nova_sched_in_task()) {
+        nova_sched_park_sleep(ms);
+        return;
+    }
 #ifdef _WIN32
     Sleep((DWORD)ms);
 #else

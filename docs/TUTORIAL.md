@@ -461,6 +461,111 @@ fn main()
     print(v)
 ```
 
+### Implicit async (green threads)
+
+NOVA uses an M:N green thread scheduler by default. Every `spawn` creates a lightweight fiber (32KB stack), scheduled across OS threads by a work-stealing scheduler. I/O calls like `sleep_ms`, `tcp_accept`, and `tcp_recv` automatically yield to the scheduler instead of blocking the OS thread — no `async`/`await` keywords needed.
+
+```nova
+fn fetch_data(url, result_ch)
+    let data = http_get(url)             // blocks this fiber, not the OS thread
+    send(result_ch, data)
+
+fn main()
+    let ch = channel()
+    let c = ch
+    spawn(fn(x) fetch_data("http://example.com/a", c))
+    spawn(fn(x) fetch_data("http://example.com/b", c))
+    let r1 = recv(ch)
+    let r2 = recv(ch)
+    print("got both responses")
+```
+
+To disable green threads (use raw OS threads): set `NOVA_GREEN=0`.
+
+### Bounded channels
+
+Channels can be bounded to create back-pressure:
+
+```nova
+fn main()
+    let ch = channel_bounded(2)          // max 2 items buffered
+    send(ch, "a")                        // goes through
+    send(ch, "b")                        // goes through
+    // send(ch, "c") would block until someone recv's
+    print(recv(ch))                      // "a"
+```
+
+### Fan-out / fan-in pattern
+
+```nova
+fn worker(id, task_ch, result_ch)
+    let running = 1
+    while running == 1
+        let task = recv(task_ch)
+        if task == -1
+            running = 0
+        else
+            send(result_ch, task * task)
+
+fn main()
+    let tasks = channel()
+    let results = channel()
+    let tc = tasks
+    let rc = results
+    // spawn 4 workers
+    let i = 0
+    while i < 4
+        let wid = i
+        spawn(fn(x) worker(wid, tc, rc))
+        i = i + 1
+    // send 20 tasks
+    let j = 0
+    while j < 20
+        send(tasks, j)
+        j = j + 1
+    // send stop signals
+    let k = 0
+    while k < 4
+        send(tasks, -1)
+        k = k + 1
+    // collect results
+    let total = 0
+    let r = 0
+    while r < 20
+        total = total + recv(results)
+        r = r + 1
+    print("sum of squares: " + str(total))
+```
+
+### UFCS (Uniform Function Call Syntax)
+
+Any function `f(x, args...)` can be called as `x.f(args...)`:
+
+```nova
+fn double(x)
+    x * 2
+
+fn main()
+    let r = 5.double()                   // same as double(5)
+    print(r)                             // 10
+    let nums = [1, 2, 3]
+    let doubled = nums.map(fn(x) x * 2) // method-style call
+    print(doubled)                       // [2, 4, 6]
+```
+
+### Debugging
+
+Compile with `NOVA_DBG=1` to enable the interactive debugger:
+
+```bash
+$env:NOVA_DBG = "1"
+nova compile myprogram.nova
+clang -o myprogram.exe myprogram.ll output/nova_runtime.o -lws2_32 -ladvapi32
+./myprogram.exe                          # enters debug REPL at first line
+```
+
+The debugger auto-instruments every source line with hooks. At the REPL you can set breakpoints, step through code, and inspect variables.
+
 ## 12. Modules
 
 A `.nova` file IS a module. The file name is the module name.

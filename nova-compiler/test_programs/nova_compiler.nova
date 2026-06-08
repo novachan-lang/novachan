@@ -3292,6 +3292,8 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_assert"
     else if name == "contains"
         "nova_rt_contains"
+    else if name == "del"
+        "nova_rt_dict_del"
     else if name == "read_file"
         "nova_rt_read_file"
     else if name == "write_file"
@@ -6318,6 +6320,8 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                 else if contains(b.ir_methods, value)
                     let user_method = b.ir_methods[value]
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, user_method, 0)
+                else if list_contains(b.ir_fnames, value)
+                    ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, value, 0)
                 else
                     let rt_name = resolve_method_fn(value)
                     ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, rt_name, 0)
@@ -9233,10 +9237,50 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                                 else
                                     ti_error(st, "module '" + rval + "' has no exported function '" + value + "'", eline)
                                     return nt_any()
-                let ai = 0
-                while ai < len(children)
-                    ti_infer_expr(st, children[ai])
-                    ai = ai + 1
+                let _mc_sole = ""
+                let _mc_multi = 0
+                let _mc_tkeys = keys(st.ti_type_methods)
+                for _mc_tk in _mc_tkeys
+                    if list_contains(st.ti_type_methods[_mc_tk], value)
+                        if _mc_sole == ""
+                            _mc_sole = _mc_tk
+                        else
+                            _mc_multi = 1
+                if _mc_sole != "" and _mc_multi == 0
+                    let _mc_rn = _mc_sole + "__" + value
+                    let _mc_ft = ti_lookup(st, _mc_rn, eline)
+                    let _mc_args = []
+                    let _mc_ai = 0
+                    while _mc_ai < len(children)
+                        push(_mc_args, ti_infer_expr(st, children[_mc_ai]))
+                        _mc_ai = _mc_ai + 1
+                    let _mc_ret = ti_fresh(st)
+                    ti_constrain(st, _mc_ft, nt_fn(_mc_args, _mc_ret), eline)
+                    return _mc_ret
+                if _mc_multi == 1
+                    let _mc_ai2 = 0
+                    while _mc_ai2 < len(children)
+                        ti_infer_expr(st, children[_mc_ai2])
+                        _mc_ai2 = _mc_ai2 + 1
+                    return nt_any()
+                let ufcs_arg_types = []
+                let uai = 0
+                while uai < len(children)
+                    push(ufcs_arg_types, ti_infer_expr(st, children[uai]))
+                    uai = uai + 1
+                if contains(st.ti_stdlib, value)
+                    let ufcs_scheme = st.ti_stdlib[value]
+                    match ufcs_scheme
+                        NTypeScheme(qvars, fn_type) =>
+                            let fresh_fn = ti_instantiate(st, ufcs_scheme)
+                            let ufcs_ret = ti_fresh(st)
+                            ti_constrain(st, fresh_fn, nt_fn(ufcs_arg_types, ufcs_ret), eline)
+                            return ufcs_ret
+                else if contains(st.ti_fn_types, value)
+                    let ufcs_fn_t = st.ti_fn_types[value]
+                    let ufcs_ret = ti_fresh(st)
+                    ti_constrain(st, ufcs_fn_t, nt_fn(ufcs_arg_types, ufcs_ret), eline)
+                    return ufcs_ret
                 return nt_any()
             if tag == "dyn_call"
                 let ai = 0
@@ -11584,6 +11628,8 @@ type IrEmitter
     ire_cov_last_line: int
     ire_cov_file_idx: int
     ire_cov_lines: dict
+    ire_dbg_instr_enabled: int
+    ire_dbg_instr_last_line: int
     ire_local_lists: dict
     ire_local_slots: dict
     ire_load_origin: dict
@@ -11592,7 +11638,7 @@ type IrEmitter
     ire_cur_fn_lambda: int
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, {}, {}, {}, {}, {}, 0)
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0)
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -11658,6 +11704,17 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 ire_indent(e, cov_call_reg + " = call i64 @nova_rt_cov_hit(i64 " + cov_pi_reg + ", i64 " + str(line) + ")")
                 e.ire_cov_last_line = line
                 e.ire_cov_lines[str(line)] = 1
+            if e.ire_dbg_instr_enabled == 1 and line > 0 and line != e.ire_dbg_instr_last_line
+                let dbgi_str_name = ire_intern_string(e, e.ire_filename)
+                let dbgi_byte_len = len(e.ire_filename) + 1
+                let dbgi_p_reg = "%dbgi.p" + str(e.ire_tc)
+                let dbgi_pi_reg = "%dbgi.pi" + str(e.ire_tc)
+                let dbgi_call_reg = "%dbgi.r" + str(e.ire_tc)
+                e.ire_tc = e.ire_tc + 1
+                ire_indent(e, dbgi_p_reg + " = getelementptr inbounds [" + str(dbgi_byte_len) + " x i8], ptr " + dbgi_str_name + ", i64 0, i64 0")
+                ire_indent(e, dbgi_pi_reg + " = ptrtoint ptr " + dbgi_p_reg + " to i64")
+                ire_indent(e, dbgi_call_reg + " = call i64 @nova_rt_dbg_hook(i64 " + dbgi_pi_reg + ", i64 " + str(line) + ", i64 0)")
+                e.ire_dbg_instr_last_line = line
             if op == "const_int"
                 ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
             else if op == "const_float"
@@ -12438,9 +12495,11 @@ fn ire_emit_terminator(e: IrEmitter, term: IrInst)
                 if line_loc != 0
                     e.ire_dbg_loc = line_loc
             if op == "return"
+                if e.ire_dbg_instr_enabled == 1
+                    let dpf_reg = "%dbg.pf" + str(e.ire_tc)
+                    e.ire_tc = e.ire_tc + 1
+                    ire_indent(e, dpf_reg + " = call i64 @nova_rt_dbg_pop_frame()")
                 if len(args) > 0
-                    // box a float result from an anonymous lambda (any ABI) so e.g.
-                    // map(xs, fn(e) e / total) yields a list of boxed floats.
                     let rv = args[0]
                     if e.ire_cur_fn_lambda == 1 and contains(e.ire_reg_types, args[0]) and e.ire_reg_types[args[0]] == "float"
                         let rbx = args[0] + ".retfbox"
@@ -12667,6 +12726,26 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                             for slot_name in local_slots
                                 ire_indent(e, "%slot." + slot_name + " = alloca i64, align 8")
                                 ire_indent(e, "store i64 0, ptr %slot." + slot_name + ", align 8")
+                            if e.ire_dbg_instr_enabled == 1
+                                let dbgf_name_str = ire_intern_string(e, name)
+                                let dbgf_name_len = len(name) + 1
+                                let dbgf_file_str = ire_intern_string(e, e.ire_filename)
+                                let dbgf_file_len = len(e.ire_filename) + 1
+                                let dbgf_np = "%dbgf.np" + str(e.ire_tc)
+                                let dbgf_npi = "%dbgf.npi" + str(e.ire_tc)
+                                let dbgf_fp = "%dbgf.fp" + str(e.ire_tc)
+                                let dbgf_fpi = "%dbgf.fpi" + str(e.ire_tc)
+                                let dbgf_call = "%dbgf.r" + str(e.ire_tc)
+                                e.ire_tc = e.ire_tc + 1
+                                ire_indent(e, dbgf_np + " = getelementptr inbounds [" + str(dbgf_name_len) + " x i8], ptr " + dbgf_name_str + ", i64 0, i64 0")
+                                ire_indent(e, dbgf_npi + " = ptrtoint ptr " + dbgf_np + " to i64")
+                                ire_indent(e, dbgf_fp + " = getelementptr inbounds [" + str(dbgf_file_len) + " x i8], ptr " + dbgf_file_str + ", i64 0, i64 0")
+                                ire_indent(e, dbgf_fpi + " = ptrtoint ptr " + dbgf_fp + " to i64")
+                                let dbgf_line = 0
+                                if contains(e.ire_fn_lines, name)
+                                    dbgf_line = e.ire_fn_lines[name]
+                                ire_indent(e, dbgf_call + " = call i64 @nova_rt_dbg_push_frame(i64 " + dbgf_npi + ", i64 " + dbgf_fpi + ", i64 " + str(dbgf_line) + ", i64 0)")
+                                e.ire_dbg_instr_last_line = 0
                         for inst in insts
                             ire_emit_inst(e, inst)
                         // Track 8 W8: drop slots that are dead at block exit.
@@ -12844,6 +12923,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let cov_env = env("NOVA_COV")
     if len(cov_env) > 0 and cov_env[0] == "1"
         e.ire_cov_enabled = 1
+    let dbg_env = env("NOVA_DBG")
+    if len(dbg_env) > 0 and dbg_env[0] == "1"
+        e.ire_dbg_instr_enabled = 1
 
     // Resolve and compile imported modules
     let import_ir_fns = resolve_and_compile_imports(b, stmts, base_dir)
@@ -14041,6 +14123,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             let cr_reg = "%covr.r" + str(cri)
             ire_indent(e, cr_reg + " = call i64 @nova_rt_cov_register(i64 %covr.pi, i64 " + lk + ")")
             cri = cri + 1
+    if e.ire_dbg_instr_enabled == 1
+        ire_indent(e, "%dbgen = call i64 @nova_rt_dbg_enable()")
     ire_indent(e, "call void @nova_rt_main_dispatch(i64 ptrtoint (ptr @nova_main to i64))")
     ire_indent(e, "call void @nova_rt_wait_all()")
     ire_indent(e, "call void @nova_rt_cleanup()")
@@ -15227,24 +15311,31 @@ fn compiler_main()
         print("  iter: " + str(bench_iters))
         exit(0)
     if cmd == "debug"
-        // Build -O0 -g and launch LLDB. NOVA's IR emits !dbg metadata for
-        // every statement, so breakpoints by source line (b file.nova:N)
-        // work and 'step' moves through NOVA source, not LLVM IR.
         if len(arguments) < 3
             print("Usage: nova debug <file.nova>")
             exit(1)
         let dbg_in = arguments[2]
         let dbg_ll = nova_replace_ext(dbg_in, ".nova", ".ll")
         let dbg_exe = nova_replace_ext(dbg_in, ".nova", ".exe")
-        nova_compile_file(dbg_in, dbg_ll, 1, "")
+        let self_exe = arguments[0]
+        let dbg_compile = "cmd /c \"set NOVA_DBG=1 && \"" + self_exe + "\" compile -o \"" + dbg_ll + "\" \"" + dbg_in + "\"\""
+        let drc = system(dbg_compile)
+        if drc != 0
+            print("error: debug compile failed (exit " + str(drc) + ")")
+            exit(1)
         let dret = nova_link(dbg_ll, dbg_exe, "-O0", "")
         if dret != 0
             print("error: debug link failed (exit " + str(dret) + ")")
             exit(1)
-        print("Built " + dbg_exe + " with debug info. Launching lldb...")
-        print("  Tips:  b " + dbg_in + ":N   set breakpoint  |   run   start  |   n step  |   p VAR")
-        let lldb_cmd = "lldb \"" + dbg_exe + "\""
-        exit(system(lldb_cmd))
+        print("NOVA interactive debugger")
+        print("  Commands:  s=step  n=next  o=out  c=continue  bt=backtrace  locals  p VAR  bp LINE  q=quit")
+        let dnorm = replace(dbg_exe, "/", "\\")
+        let dprefix = ".\\"
+        if starts_with(dnorm, "\\") or starts_with(dnorm, ".\\")
+            dprefix = ""
+        if len(dnorm) >= 2 and slice(dnorm, 1, 2) == ":"
+            dprefix = ""
+        exit(system(chr(34) + dprefix + dnorm + chr(34)))
     if cmd == "repl"
         // Bundled interactive shell. Looks for repl.nova via the same
         // discovery convention as the runtime: NOVA_HOME first, then a few

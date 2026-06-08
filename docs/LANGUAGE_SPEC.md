@@ -206,6 +206,21 @@ s.upper()          // pure method
 
 Methods are functions whose first argument is a value of the receiver type. They can be defined as `fn TypeName.method(self, ...)` or imported from the runtime.
 
+### UFCS (Uniform Function Call Syntax)
+
+Any function `f(x, y, ...)` can be called as `x.f(y, ...)`. The compiler rewrites `x.f(args)` to `f(x, args)` when `f` is a known function and `x` has no method named `f`. This enables a chaining style without requiring dedicated method definitions:
+
+```nova
+fn double(x)
+    x * 2
+
+fn main()
+    print(5.double())            // 10 — rewrites to double(5)
+    print([1,2,3].map(fn(x) x + 1))  // [2, 3, 4]
+```
+
+Resolution order: (1) field access, (2) type-specific method, (3) UFCS fallback to global function.
+
 ### If as expression
 
 ```nova
