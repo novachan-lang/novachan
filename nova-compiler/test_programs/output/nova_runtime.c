@@ -1900,6 +1900,16 @@ int64_t nova_rt_for_iter_init(int64_t obj) {
     return obj;
 }
 
+int64_t nova_rt_for_destr_init(int64_t obj) {
+    if (obj == 0) return nova_rt_list_create();
+    void* ptr = (void*)(uintptr_t)obj;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_DICT) {
+        return nova_rt_dict_items(obj);
+    }
+    return nova_rt_for_iter_init(obj);
+}
+
 /* ── Character operations ────────────────────────────────────────────────── */
 
 int64_t nova_rt_ord(int64_t s) {
