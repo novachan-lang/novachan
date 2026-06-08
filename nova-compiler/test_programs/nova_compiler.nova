@@ -2261,6 +2261,10 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
         else
             push(fn_ensures, clause_r.expr)
         p = clause_r.pos
+    let fn_memo = false
+    if tk(tokens, p) == "IDENT" and tv(tokens, p) == "memo"
+        fn_memo = true
+        p = p + 1
     let fn_col = 1
     let fn_tok = tokens[pos]
     match fn_tok
@@ -2318,6 +2322,8 @@ fn parse_fn_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
     // Carry postcondition exprs on the fn (annotations); inject_ensures lowers them post-parse.
     if len(fn_ensures) > 0
         push(annotations, Expr("ensures", "", 0, fn_ensures, [], ln))
+    if fn_memo
+        push(annotations, Expr("memo", "", 0, [], [], ln))
     StmtParseResult(Stmt("fn", name, ret_expr, body, params, fn_else, annotations, ln), p2)
 
 fn parse_type_decl(tokens: list, pos: int, pe: list) -> StmtParseResult
@@ -3131,6 +3137,66 @@ fn fuse_multiclause(stmts: list) -> list
                     push(out, s)
     out
 
+fn inject_memo(stmts: list) -> list
+    let out = []
+    for s in stmts
+        let handled = false
+        match s
+            Stmt(tag, name, ret_expr, body, params, fn_else, anns, sline) =>
+                if tag == "fn"
+                    let is_memo = false
+                    let other_anns = []
+                    for a in anns
+                        match a
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "memo"
+                                    is_memo = true
+                                else
+                                    push(other_anns, a)
+                    if is_memo
+                        handled = true
+                        let impl_name = name + "__memo_impl"
+                        push(out, Stmt("fn", impl_name, ret_expr, body, params, fn_else, other_anns, sline))
+                        let arg_idents = []
+                        for pp in params
+                            match pp
+                                Param(ppn, ppt, ppd) =>
+                                    push(arg_idents, Expr("ident", ppn, 0, [], [], sline))
+                        let cache_init = Expr("call", "memo_cache", 0, [Expr("str", name, 0, [], [], sline)], [], sline)
+                        let cache_bind = Stmt("assign", "__mc", cache_init, [], [], [], [], sline)
+                        let cache_id = Expr("ident", "__mc", 0, [], [], sline)
+                        let memo_key = null_expr()
+                        if len(params) == 1
+                            memo_key = Expr("call", "str", 0, [arg_idents[0]], [], sline)
+                        else
+                            let key_parts = []
+                            let _mk_first = true
+                            for _mk_a in arg_idents
+                                if _mk_first
+                                    push(key_parts, Expr("call", "str", 0, [_mk_a], [], sline))
+                                    _mk_first = false
+                                else
+                                    push(key_parts, Expr("str", ",", 0, [], [], sline))
+                                    push(key_parts, Expr("call", "str", 0, [_mk_a], [], sline))
+                            memo_key = key_parts[0]
+                            let _mk_i = 1
+                            while _mk_i < len(key_parts)
+                                memo_key = Expr("binop", "+", 0, [memo_key, key_parts[_mk_i]], [], sline)
+                                _mk_i = _mk_i + 1
+                        let has_check = Expr("call", "contains", 0, [cache_id, memo_key], [], sline)
+                        let cache_get = Expr("index", "", 0, [cache_id, memo_key], [], sline)
+                        let early_ret = Stmt("return", "", cache_get, [], [], [], [], sline)
+                        let check_stmt = Stmt("if", "", has_check, [early_ret], [], [], [], sline)
+                        let call_impl = Expr("call", impl_name, 0, arg_idents, [], sline)
+                        let bind_result = Stmt("assign", "__memo_r", call_impl, [], [], [], [], sline)
+                        let cache_lhs = Expr("index", "", 0, [cache_id, memo_key], [], sline)
+                        let store_stmt = Stmt("assign", "", Expr("ident", "__memo_r", 0, [], [], sline), [], [], [], [cache_lhs], sline)
+                        let ret_stmt = Stmt("return", "", Expr("ident", "__memo_r", 0, [], [], sline), [], [], [], [], sline)
+                        push(out, Stmt("fn", name, ret_expr, [cache_bind, check_stmt, bind_result, store_stmt, ret_stmt], params, [], other_anns, sline))
+        if not handled
+            push(out, s)
+    out
+
 // Design-by-contract postconditions (`ensures <expr>`, where `result` names the return
 // value). For each fn carrying an "ensures" annotation, split it into <name>__ens_impl
 // (the original body, untouched) plus a thin WRAPPER under the original name that runs the
@@ -3285,7 +3351,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    expand_derives(inject_ensures(fuse_multiclause(_expand_destruct_list(stmts))))
+    expand_derives(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(stmts)))))
 
 // ── LLVM IR Code Generator ───────────────────────────────────────────────────
 
@@ -3878,6 +3944,8 @@ fn codegen_match_stmt(cg: CodeGen, stmt: Stmt)
 fn resolve_runtime_fn(name: string) -> string
     if name == "print"
         "nova_rt_print_any"
+    else if name == "memo_cache"
+        "nova_rt_memo_cache"
     else if name == "copy"
         "nova_rt_deep_copy"
     else if name == "len"
@@ -5231,6 +5299,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_for_iter_init(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_for_destr_init(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_dict_has(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_memo_cache(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_dict_del(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_find(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_parse_float(i64) nounwind")
@@ -9252,6 +9321,7 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["json_stringify"] = NTypeScheme([-1], nt_fn([T], nt_string()))
     reg["append_file"] = NTypeScheme([], nt_fn([nt_string(), nt_string()], nt_unit()))
     reg["file_exists"] = NTypeScheme([], nt_fn([nt_string()], nt_bool()))
+    reg["memo_cache"] = NTypeScheme([], nt_fn([nt_string()], nt_any()))
     reg["http_get"] = NTypeScheme([], nt_fn([nt_string()], nt_string()))
     reg["http_post"] = NTypeScheme([], nt_fn([nt_string(), nt_string(), nt_string()], nt_string()))
     reg["mkdir"] = NTypeScheme([], nt_fn([nt_string()], nt_int()))
@@ -14265,6 +14335,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_for_iter_init(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_for_destr_init(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_dict_has(i64, i64) nounwind readonly")
+    ire_line(e, "declare i64 @nova_rt_memo_cache(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_dict_del(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_system(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_exec(i64) nounwind")

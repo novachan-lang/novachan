@@ -1640,6 +1640,17 @@ int64_t nova_rt_dict_has(int64_t handle, int64_t key) {
     return 0;
 }
 
+static int64_t g_memo_registry = 0;
+int64_t nova_rt_memo_cache(int64_t fn_name) {
+    if (g_memo_registry == 0) g_memo_registry = nova_rt_dict_create();
+    if (nova_rt_dict_has(g_memo_registry, fn_name)) {
+        return nova_rt_dict_get(g_memo_registry, fn_name);
+    }
+    int64_t d = nova_rt_dict_create();
+    nova_rt_dict_set(g_memo_registry, fn_name, d);
+    return d;
+}
+
 int64_t nova_rt_dict_del(int64_t handle, int64_t key) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     const char* k = (const char*)(uintptr_t)key;
