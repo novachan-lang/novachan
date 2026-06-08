@@ -2995,13 +2995,13 @@ int64_t nova_rt_add(int64_t a, int64_t b) {
     if (a_is_str || b_is_str)
         return nova_rt_str_concat_safe(a, b);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
-        return nova_from_double(nova_to_double(a) + nova_to_double(b));
+        return nova_rt_box_float(nova_from_double(nova_to_double(a) + nova_to_double(b)));
     return a + b;
 }
 
 int64_t nova_rt_sub(int64_t a, int64_t b) {
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
-        return nova_from_double(nova_to_double(a) - nova_to_double(b));
+        return nova_rt_box_float(nova_from_double(nova_to_double(a) - nova_to_double(b)));
     return a - b;
 }
 
@@ -3019,13 +3019,13 @@ int64_t nova_rt_mul(int64_t a, int64_t b) {
     if (b_is_str && !a_is_str)
         return nova_rt_repeat(b, a);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
-        return nova_from_double(nova_to_double(a) * nova_to_double(b));
+        return nova_rt_box_float(nova_from_double(nova_to_double(a) * nova_to_double(b)));
     return a * b;
 }
 
 int64_t nova_rt_div(int64_t a, int64_t b) {
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
-        return nova_from_double(nova_to_double(a) / nova_to_double(b));
+        return nova_rt_box_float(nova_from_double(nova_to_double(a) / nova_to_double(b)));
     if (b == 0) return 0;
     return a / b;
 }
