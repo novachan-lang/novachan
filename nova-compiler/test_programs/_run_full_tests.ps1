@@ -1,7 +1,7 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
-$compiler = (Resolve-Path ".\gen2_move.exe").Path
+$compiler = (Resolve-Path ".\gen3_test.exe").Path
 Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
 
 # Tests that SHOULD exit non-zero (testing error paths)
