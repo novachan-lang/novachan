@@ -1,8 +1,11 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
+$env:NOVA_NO_CACHE = "1"
 $compiler = (Resolve-Path "$PSScriptRoot\gen3_test.exe").Path
 $runtimeSrc = "$PSScriptRoot\output\nova_runtime.c"
+$runtimeObj = "$PSScriptRoot\nova_runtime_test.o"
+$sqliteSrc  = "$PSScriptRoot\output\sqlite3.c"
 
 # Core language regression tests
 $core_tests = @(
@@ -338,92 +341,144 @@ $concurrency_tests = @(
 )
 
 $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurrency_tests
-$pass = 0; $fail = 0; $skip = 0; $failures = @()
 
-Write-Host "=== NOVA Full Regression Suite (gen3_test = gen11_phase13) ==="
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+Write-Host "=== NOVA Full Regression Suite ==="
 Write-Host "Compiler: $compiler ($((Get-Item $compiler).Length) bytes)"
 Write-Host "Tests: $($all_tests.Count) total"
+
+# ─── Step 1: Pre-compile runtime ONCE ───
+Write-Host ""
+Write-Host "Pre-compiling nova_runtime.c -> nova_runtime_test.o ..."
+$rtc = Invoke-Timed -FilePath $ClangPath -Arguments "-c -O2 `"$runtimeSrc`" -o `"$runtimeObj`" -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 120000 -WorkingDirectory $PSScriptRoot
+if ($rtc.ExitCode -ne 0 -or !(Test-Path $runtimeObj)) {
+    Write-Host "FATAL: runtime pre-compile failed (exit=$($rtc.ExitCode))"
+    if ($rtc.StdErr) { Write-Host $rtc.StdErr }
+    exit 1
+}
+Write-Host "Runtime pre-compiled in $([math]::Round($sw.Elapsed.TotalSeconds, 1))s"
 Write-Host ""
 
-foreach ($t in $all_tests) {
-    $nova = "$PSScriptRoot\$t.nova"
-    $ll   = "$PSScriptRoot\$t.ll"
-    $exe  = "$PSScriptRoot\$t.exe"
+# ─── Step 2: Parallel test runner ───
+$maxParallel = [Math]::Max(2, [Math]::Min(8, [Environment]::ProcessorCount - 2))
+Write-Host "Running tests ($maxParallel parallel)..."
+Write-Host ""
 
-    if (!(Test-Path $nova)) { $skip++; continue }
+$testScript = {
+    param($testName, $compilerPath, $rtObjPath, $workDir, $clangExe, $lFlags, $sqPath)
 
-    # Compile
-    $cr = Invoke-Timed -FilePath $compiler -Arguments "$t.nova" -TimeoutMs 60000 -WorkingDirectory $PSScriptRoot
-    if ($cr.TimedOut -or $cr.ExitCode -ne 0) {
-        Write-Host "FAIL compile: $t  (exit=$($cr.ExitCode))"
-        $failures += "$t (COMPILE)"
-        $fail++; continue
-    }
-    if (!(Test-Path $ll)) {
-        Write-Host "FAIL compile: $t  (no .ll produced)"
-        $failures += "$t (NO .ll)"
-        $fail++; continue
+    $r = @{ Name = $testName; Status = "PASS"; Detail = "" }
+
+    if (-not (Test-Path "$workDir\$testName.nova")) {
+        $r.Status = "SKIP"; return $r
     }
 
-    # Pick up @link("libname") -> '; LINK_LIB: name' comments emitted by the
-    # compiler and propagate them to clang as -l<name> flags. On Windows,
-    # libm is part of MSVCRT (no m.lib), so skip 'm' there to avoid linker
-    # errors — the annotation remains correct documentation + works on Linux.
-    $extraLibs = ""
-    $isWin = $IsWindows -or ($env:OS -eq 'Windows_NT')
-    $skipLibs = @()
-    if ($isWin) { $skipLibs = @('m','pthread','dl','rt') }
-    Get-Content $ll | Where-Object { $_ -match '^; LINK_LIB: (\S+)' } | ForEach-Object {
-        $libName = $matches[1]
-        if ($skipLibs -notcontains $libName) { $extraLibs += " -l$libName" }
-    }
-
-    # Domain-demo: if the .ll references sqlite3_*, link the amalgamation
-    # so the test doesn't depend on a system-wide libsqlite3 install.
-    $extraSrc = ""
-    if (Select-String -Path $ll -Pattern '@sqlite3_' -Quiet) {
-        $sqliteSrc = "$PSScriptRoot\output\sqlite3.c"
-        if (Test-Path $sqliteSrc) {
-            $extraSrc = " `"$sqliteSrc`" -DSQLITE_THREADSAFE=0"
+    function _RunProc($fp, $ar, $to, $wd) {
+        $pi = New-Object System.Diagnostics.ProcessStartInfo
+        $pi.FileName = $fp; $pi.Arguments = $ar; $pi.WorkingDirectory = $wd
+        $pi.UseShellExecute = $false
+        $pi.RedirectStandardOutput = $true; $pi.RedirectStandardError = $true
+        $pi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($pi)
+        $ot = $p.StandardOutput.ReadToEndAsync()
+        $et = $p.StandardError.ReadToEndAsync()
+        $ok = $p.WaitForExit($to)
+        if (-not $ok) {
+            try { $p.Kill() } catch {}
+            try { $p.WaitForExit(5000) } catch {}
+            return @{ T = $true; X = -1; O = ""; E = "" }
         }
+        return @{ T = $false; X = $p.ExitCode; O = $ot.Result; E = $et.Result }
     }
 
-    # Link
-    $linkArgs = "-O2 -o `"$exe`" `"$ll`" `"$runtimeSrc`"$extraSrc $NovaLinkFlags$extraLibs -D_CRT_SECURE_NO_WARNINGS -w"
-    $lr = Invoke-Timed -FilePath $ClangPath -Arguments $linkArgs -TimeoutMs 60000 -WorkingDirectory $PSScriptRoot
-    if (!(Test-Path $exe)) {
-        Write-Host "FAIL link: $t"
-        $failures += "$t (LINK)"
-        $fail++
+    $ll  = "$workDir\$testName.ll"
+    $exe = "$workDir\$testName.exe"
+
+    $cr = _RunProc $compilerPath "$testName.nova" 60000 $workDir
+    if ($cr.T -or $cr.X -ne 0) {
+        $r.Status = "FAIL"; $r.Detail = "COMPILE exit=$($cr.X)"; return $r
+    }
+    if (-not (Test-Path $ll)) {
+        $r.Status = "FAIL"; $r.Detail = "NO .ll"; return $r
+    }
+
+    $xlib = ""
+    $skipL = @('m','pthread','dl','rt')
+    Get-Content $ll | Where-Object { $_ -match '^; LINK_LIB: (\S+)' } | ForEach-Object {
+        if ($skipL -notcontains $matches[1]) { $xlib += " -l$($matches[1])" }
+    }
+    $xsrc = ""
+    if ((Select-String -Path $ll -Pattern '@sqlite3_' -Quiet) -and (Test-Path $sqPath)) {
+        $xsrc = " `"$sqPath`" -DSQLITE_THREADSAFE=0"
+    }
+
+    $la = "-O2 -o `"$exe`" `"$ll`" `"$rtObjPath`"$xsrc $lFlags$xlib -D_CRT_SECURE_NO_WARNINGS -w"
+    $lr = _RunProc $clangExe $la 60000 $workDir
+    if (-not (Test-Path $exe)) {
+        $r.Status = "FAIL"; $r.Detail = "LINK"
         Remove-Item $ll -Force -ErrorAction SilentlyContinue
-        continue
+        return $r
     }
 
-    # Run
-    $rr = Invoke-Timed -FilePath $exe -Arguments '' -TimeoutMs 15000 -WorkingDirectory $PSScriptRoot
+    $rr = _RunProc $exe "" 15000 $workDir
     Remove-Item $exe,$ll -Force -ErrorAction SilentlyContinue
 
-    if ($rr.TimedOut) {
-        Write-Host "FAIL timeout: $t"
-        $failures += "$t (TIMEOUT)"
-        $fail++
-    } elseif ($rr.ExitCode -ne 0) {
-        Write-Host "FAIL run: $t  (exit=$($rr.ExitCode))"
-        $failures += "$t (RUN exit=$($rr.ExitCode))"
-        $fail++
-    } elseif ($rr.StdErr -match 'FAIL assert') {
-        $preview = $rr.StdErr.Trim().Substring(0, [Math]::Min(120, $rr.StdErr.Trim().Length))
-        Write-Host "FAIL assert: $t  -- $preview"
-        $failures += "$t (ASSERT FAIL)"
-        $fail++
-    } else {
-        Write-Host "PASS $t"
-        $pass++
-    }
+    if ($rr.T) { $r.Status = "FAIL"; $r.Detail = "TIMEOUT" }
+    elseif ($rr.X -ne 0) { $r.Status = "FAIL"; $r.Detail = "RUN exit=$($rr.X)" }
+    elseif ($rr.E -match 'FAIL assert') { $r.Status = "FAIL"; $r.Detail = "ASSERT FAIL" }
+
+    return $r
 }
 
+$pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $maxParallel)
+$pool.Open()
+
+$jobs = New-Object System.Collections.ArrayList
+foreach ($t in $all_tests) {
+    $ps = [PowerShell]::Create()
+    $ps.RunspacePool = $pool
+    [void]$ps.AddScript($testScript)
+    [void]$ps.AddArgument($t)
+    [void]$ps.AddArgument($compiler)
+    [void]$ps.AddArgument($runtimeObj)
+    [void]$ps.AddArgument($PSScriptRoot)
+    [void]$ps.AddArgument($ClangPath)
+    [void]$ps.AddArgument($NovaLinkFlags)
+    [void]$ps.AddArgument($sqliteSrc)
+    $handle = $ps.BeginInvoke()
+    [void]$jobs.Add(@{ PS = $ps; Handle = $handle; Name = $t })
+}
+
+$pass = 0; $fail = 0; $skip = 0; $failures = @()
+foreach ($job in $jobs) {
+    try {
+        $res = $job.PS.EndInvoke($job.Handle)
+        if ($res -and $res.Count -gt 0) { $r = $res[$res.Count - 1] }
+        else { $r = @{ Name = $job.Name; Status = "FAIL"; Detail = "NO RESULT" } }
+    } catch {
+        $r = @{ Name = $job.Name; Status = "FAIL"; Detail = "RUNSPACE ERROR" }
+    }
+
+    switch ($r.Status) {
+        "PASS" { $pass++; Write-Host "PASS $($r.Name)" }
+        "SKIP" { $skip++ }
+        default {
+            $fail++
+            $failures += "$($r.Name) ($($r.Detail))"
+            Write-Host "FAIL $($r.Name)  ($($r.Detail))"
+        }
+    }
+    $job.PS.Dispose()
+}
+
+$pool.Close()
+$pool.Dispose()
+Remove-Item $runtimeObj -Force -ErrorAction SilentlyContinue
+
+$sw.Stop()
 Write-Host ""
 Write-Host "=== RESULTS: $pass PASS, $fail FAIL, $skip SKIP (of $($all_tests.Count) total) ==="
+Write-Host "Wall time: $([math]::Round($sw.Elapsed.TotalSeconds, 1))s"
 if ($failures.Count -gt 0) {
     Write-Host ""
     Write-Host "Failures:"

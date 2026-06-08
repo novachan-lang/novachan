@@ -968,8 +968,13 @@ fn parse_expr(tokens: list, pos: int, min_bp: int, pe: list) -> ParseResult
     let left = left_r.expr
     let cur = left_r.pos
 
-    while cur < len(tokens) and tk(tokens, cur) != "EOF" and tk(tokens, cur) != "NEWLINE"
-        // Check for postfix operations: function call, index, member access
+    while cur < len(tokens) and tk(tokens, cur) != "EOF"
+        if tk(tokens, cur) == "NEWLINE"
+            let _nlp = skip_nl(tokens, cur)
+            if tk(tokens, _nlp) == "DOT" or tk(tokens, _nlp) == "PIPE_GT"
+                cur = _nlp
+            else
+                break
         if tk(tokens, cur) == "DELIM" and tv(tokens, cur) == "("
             let call_r = parse_call_args(tokens, cur, left, pe)
             left = call_r.expr
@@ -1993,7 +1998,10 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
                 StmtParseResult(Stmt("spawn", name, null_expr(), sp_body, sp_params, [], [], ln), sp2)
             else
                 let expr_r = parse_expr(tokens, p, 0, pe)
-                StmtParseResult(Stmt("assign", name, expr_r.expr, [], let_params, [], [], ln), expr_r.pos)
+                if tk(tokens, expr_r.pos) == "KW" and tv(tokens, expr_r.pos) == "fn"
+                    _parse_trail_fn(tokens, expr_r.pos, tok_col(tokens, pos), pe, "trail_fn_let", name, expr_r.expr, ln)
+                else
+                    StmtParseResult(Stmt("assign", name, expr_r.expr, [], let_params, [], [], ln), expr_r.pos)
         else
             StmtParseResult(Stmt("assign", name, null_expr(), [], let_params, [], [], ln), p)
     else if kind == "IDENT"
@@ -2034,6 +2042,8 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
                 p = p + 1
                 let rhs_r = parse_expr(tokens, p, 0, pe)
                 StmtParseResult(Stmt("compound_assign", op, rhs_r.expr, [], [], [], [expr_r.expr], ln), rhs_r.pos)
+            else if tk(tokens, p) == "KW" and tv(tokens, p) == "fn"
+                _parse_trail_fn(tokens, p, tok_col(tokens, pos), pe, "trail_fn_expr", "", expr_r.expr, ln)
             else
                 StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], [], ln), p)
     else
@@ -2042,8 +2052,28 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             let dp = expr_r.pos + 1
             let rhs_r = parse_expr(tokens, dp, 0, pe)
             StmtParseResult(Stmt("assign", "", rhs_r.expr, [], [], [], [expr_r.expr], ln), rhs_r.pos)
+        else if tk(tokens, expr_r.pos) == "KW" and tv(tokens, expr_r.pos) == "fn"
+            _parse_trail_fn(tokens, expr_r.pos, tok_col(tokens, pos), pe, "trail_fn_expr", "", expr_r.expr, ln)
         else
             StmtParseResult(Stmt("expr", "", expr_r.expr, [], [], [], [], ln), expr_r.pos)
+
+fn _parse_trail_fn(tokens: list, fn_pos: int, stmt_col: int, pe: list, ttag: string, tname: string, call_expr: Expr, sline: int) -> StmtParseResult
+    let _tf_p = fn_pos + 1
+    _tf_p = expect(tokens, _tf_p, "(", pe)
+    let _tf_ps = []
+    while tv(tokens, _tf_p) != ")" and tk(tokens, _tf_p) != "EOF"
+        if len(_tf_ps) > 0
+            _tf_p = expect(tokens, _tf_p, ",", pe)
+        push(_tf_ps, Param(tv(tokens, _tf_p), "", null_expr()))
+        _tf_p = _tf_p + 1
+    _tf_p = expect(tokens, _tf_p, ")", pe)
+    let _tf_p2 = skip_nl(tokens, _tf_p)
+    let _tf_bd = []
+    while tk(tokens, _tf_p2) != "EOF" and tok_col(tokens, _tf_p2) > stmt_col
+        let _tf_sr = parse_stmt(tokens, _tf_p2, pe)
+        push(_tf_bd, _tf_sr.stmt)
+        _tf_p2 = skip_nl(tokens, _tf_sr.pos)
+    StmtParseResult(Stmt(ttag, tname, call_expr, _tf_bd, _tf_ps, [], [], sline), _tf_p2)
 
 fn ffi_llvm_type(ann: string) -> string
     if ann == "float"
@@ -3085,6 +3115,36 @@ fn _fuse_heads(heads: list, name: string, params: list, ret_expr: Expr, anns: li
         i = i - 1
     Stmt("fn", name, ret_expr, chain, params, [], anns, ln)
 
+fn _desugar_trail_fns(stmts: list) -> list
+    let _dt_out = []
+    for _dt_s in stmts
+        match _dt_s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "trail_fn_let" or tag == "trail_fn_expr"
+                    let _dt_fn = "__tfn_" + str(sline)
+                    let _dt_nb = _desugar_trail_fns(body)
+                    push(_dt_out, Stmt("fn", _dt_fn, null_expr(), _dt_nb, params, [], [], sline))
+                    match expr
+                        Expr(et, ev, en, ec, ef, el) =>
+                            let _dt_args = []
+                            for _dt_a in ec
+                                push(_dt_args, _dt_a)
+                            push(_dt_args, Expr("ident", _dt_fn, 0, [], [], sline))
+                            let _dt_call = Expr(et, ev, en, _dt_args, ef, el)
+                            if tag == "trail_fn_let"
+                                push(_dt_out, Stmt("assign", name, _dt_call, [], [], [], [], sline))
+                            else
+                                push(_dt_out, Stmt("expr", "", _dt_call, [], [], [], [], sline))
+                else
+                    let _dt_nb2 = body
+                    let _dt_ne2 = else_body
+                    if len(body) > 0
+                        _dt_nb2 = _desugar_trail_fns(body)
+                    if len(else_body) > 0
+                        _dt_ne2 = _desugar_trail_fns(else_body)
+                    push(_dt_out, Stmt(tag, name, expr, _dt_nb2, params, _dt_ne2, anns, sline))
+    _dt_out
+
 fn _expand_destruct_list(stmts: list) -> list
     let out = []
     for s in stmts
@@ -3351,7 +3411,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    expand_derives(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(stmts)))))
+    expand_derives(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts))))))
 
 // ── LLVM IR Code Generator ───────────────────────────────────────────────────
 
