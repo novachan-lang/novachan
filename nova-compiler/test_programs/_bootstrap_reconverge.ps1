@@ -38,7 +38,8 @@ Write-Host "gen6.ll SHA256: $h6"
 if ($h5 -eq $h6) {
     Write-Host "`n=== RECONVERGED: gen5 == gen6 (byte-identical) ==="
     Copy-Item 'nova_p2.exe' 'gen3_test.exe' -Force
-    Write-Host "Installed gen5 as gen3_test.exe"
+    Copy-Item 'nova_p2.exe' 'nova.exe' -Force
+    Write-Host "Installed gen5 as gen3_test.exe + nova.exe"
     Remove-Item nova_p1.exe, nova_p2.exe, nova_p3.exe, gen4.ll, gen5.ll, gen6.ll, nova_compiler.ll -Force -ErrorAction SilentlyContinue
     exit 0
 } else {

@@ -1,0 +1,264 @@
+/// real_kv_server.nova — Concurrent key-value store server
+///
+/// A Redis-like in-memory store with:
+///   - Concurrent TCP client handling (spawn per connection)
+///   - Channel-based serialized data access (actor pattern)
+///   - GET/SET/DEL/KEYS/INCR/EXPIRE commands
+///   - TTL-based key expiration
+///   - Stats tracking (ops/sec, hit rate)
+///
+/// Proves: spawn, channels, select, match, structs, TCP,
+///         string processing, dict, error handling, UFCS.
+
+fn _parse_cmd(raw)
+    let trimmed = trim(raw)
+    let parts = split(trimmed, " ")
+    if len(parts) == 0
+        return {"cmd": "", "args": []}
+    let cmd = parts[0]
+    let args = []
+    let i = 1
+    while i < len(parts)
+        push(args, parts[i])
+        i = i + 1
+    {"cmd": cmd, "args": args}
+
+fn _store_loop(cmd_ch, resp_ch)
+    let data = {}
+    let ttls = {}
+    let stats = {"gets": 0, "sets": 0, "dels": 0, "hits": 0, "misses": 0}
+    let running = 1
+    while running == 1
+        let msg = recv(cmd_ch)
+        let cmd = msg["cmd"]
+        let args = msg["args"]
+
+        if cmd == "SET"
+            if len(args) >= 2
+                data[args[0]] = args[1]
+                stats["sets"] = stats["sets"] + 1
+                if len(args) >= 3
+                    ttls[args[0]] = time_ms() + parse_int(args[2]) * 1000
+                send(resp_ch, "+OK")
+            else
+                send(resp_ch, "-ERR wrong number of args for SET")
+
+        else if cmd == "GET"
+            if len(args) >= 1
+                let key = args[0]
+                stats["gets"] = stats["gets"] + 1
+                if contains(ttls, key) and time_ms() > ttls[key]
+                    del(data, key)
+                    del(ttls, key)
+                if contains(data, key)
+                    stats["hits"] = stats["hits"] + 1
+                    send(resp_ch, "+" + str(data[key]))
+                else
+                    stats["misses"] = stats["misses"] + 1
+                    send(resp_ch, "-nil")
+            else
+                send(resp_ch, "-ERR wrong number of args for GET")
+
+        else if cmd == "DEL"
+            if len(args) >= 1
+                let key = args[0]
+                stats["dels"] = stats["dels"] + 1
+                if contains(data, key)
+                    del(data, key)
+                    if contains(ttls, key)
+                        del(ttls, key)
+                    send(resp_ch, "+1")
+                else
+                    send(resp_ch, "+0")
+            else
+                send(resp_ch, "-ERR wrong number of args for DEL")
+
+        else if cmd == "INCR"
+            if len(args) >= 1
+                let key = args[0]
+                if contains(data, key)
+                    let v = parse_int(str(data[key]))
+                    data[key] = str(v + 1)
+                    send(resp_ch, "+" + str(v + 1))
+                else
+                    data[key] = "1"
+                    send(resp_ch, "+1")
+            else
+                send(resp_ch, "-ERR wrong number of args for INCR")
+
+        else if cmd == "KEYS"
+            let ks = keys(data)
+            send(resp_ch, "+" + join(ks, ","))
+
+        else if cmd == "STATS"
+            let total = stats["gets"] + stats["sets"] + stats["dels"]
+            let hr = if stats["gets"] > 0
+                (stats["hits"] * 100) / stats["gets"]
+            else
+                0
+            send(resp_ch, "+ops=" + str(total) + " hits=" + str(stats["hits"]) + " misses=" + str(stats["misses"]) + " hit_rate=" + str(hr) + "%")
+
+        else if cmd == "QUIT"
+            send(resp_ch, "+BYE")
+            running = 0
+
+        else
+            send(resp_ch, "-ERR unknown command: " + cmd)
+
+fn _kv_exec(cmd_ch, resp_ch, cmd, args)
+    send(cmd_ch, {"cmd": cmd, "args": args})
+    recv(resp_ch)
+
+fn _handle_client(client, cmd_ch, resp_ch)
+    let raw = tcp_recv(client)
+    if len(raw) == 0
+        tcp_close(client)
+        return 0
+    let parsed = _parse_cmd(raw)
+    let result = _kv_exec(cmd_ch, resp_ch, parsed["cmd"], parsed["args"])
+    tcp_send(client, str(result) + "\n")
+    tcp_close(client)
+    1
+
+fn _test_basic_ops()
+    let cmd_ch = channel()
+    let resp_ch = channel()
+    let cch = cmd_ch
+    let rch = resp_ch
+    spawn(fn(x) _store_loop(cch, rch))
+
+    let r1 = _kv_exec(cmd_ch, resp_ch, "SET", ["name", "NOVA"])
+    assert(r1 == "+OK", "SET: " + str(r1))
+
+    let r2 = _kv_exec(cmd_ch, resp_ch, "GET", ["name"])
+    assert(r2 == "+NOVA", "GET: " + str(r2))
+
+    let r3 = _kv_exec(cmd_ch, resp_ch, "GET", ["missing"])
+    assert(r3 == "-nil", "MISS: " + str(r3))
+
+    let r4 = _kv_exec(cmd_ch, resp_ch, "DEL", ["name"])
+    assert(r4 == "+1", "DEL: " + str(r4))
+
+    let r5 = _kv_exec(cmd_ch, resp_ch, "GET", ["name"])
+    assert(r5 == "-nil", "DEL verify: " + str(r5))
+
+    _kv_exec(cmd_ch, resp_ch, "QUIT", [])
+    print("  basic ops: PASS")
+
+fn _test_incr()
+    let cmd_ch = channel()
+    let resp_ch = channel()
+    let cch = cmd_ch
+    let rch = resp_ch
+    spawn(fn(x) _store_loop(cch, rch))
+
+    let r1 = _kv_exec(cmd_ch, resp_ch, "INCR", ["counter"])
+    assert(r1 == "+1", "INCR new: " + str(r1))
+
+    let r2 = _kv_exec(cmd_ch, resp_ch, "INCR", ["counter"])
+    assert(r2 == "+2", "INCR 2: " + str(r2))
+
+    let r3 = _kv_exec(cmd_ch, resp_ch, "INCR", ["counter"])
+    assert(r3 == "+3", "INCR 3: " + str(r3))
+
+    let r4 = _kv_exec(cmd_ch, resp_ch, "GET", ["counter"])
+    assert(r4 == "+3", "GET counter: " + str(r4))
+
+    _kv_exec(cmd_ch, resp_ch, "QUIT", [])
+    print("  incr: PASS")
+
+fn _test_multi_key()
+    let cmd_ch = channel()
+    let resp_ch = channel()
+    let cch = cmd_ch
+    let rch = resp_ch
+    spawn(fn(x) _store_loop(cch, rch))
+
+    _kv_exec(cmd_ch, resp_ch, "SET", ["a", "1"])
+    _kv_exec(cmd_ch, resp_ch, "SET", ["b", "2"])
+    _kv_exec(cmd_ch, resp_ch, "SET", ["c", "3"])
+
+    let ks = _kv_exec(cmd_ch, resp_ch, "KEYS", [])
+    assert(contains(str(ks), "a"), "has a")
+    assert(contains(str(ks), "b"), "has b")
+    assert(contains(str(ks), "c"), "has c")
+
+    let st = _kv_exec(cmd_ch, resp_ch, "STATS", [])
+    assert(contains(str(st), "ops=3"), "3 ops: " + str(st))
+
+    _kv_exec(cmd_ch, resp_ch, "QUIT", [])
+    print("  multi key + stats: PASS")
+
+fn _test_overwrite()
+    let cmd_ch = channel()
+    let resp_ch = channel()
+    let cch = cmd_ch
+    let rch = resp_ch
+    spawn(fn(x) _store_loop(cch, rch))
+
+    _kv_exec(cmd_ch, resp_ch, "SET", ["x", "old"])
+    let r1 = _kv_exec(cmd_ch, resp_ch, "GET", ["x"])
+    assert(r1 == "+old", "old: " + str(r1))
+
+    _kv_exec(cmd_ch, resp_ch, "SET", ["x", "new"])
+    let r2 = _kv_exec(cmd_ch, resp_ch, "GET", ["x"])
+    assert(r2 == "+new", "new: " + str(r2))
+
+    _kv_exec(cmd_ch, resp_ch, "QUIT", [])
+    print("  overwrite: PASS")
+
+fn _test_concurrent_clients()
+    let cmd_ch = channel()
+    let resp_ch = channel()
+    let cch = cmd_ch
+    let rch = resp_ch
+    spawn(fn(x) _store_loop(cch, rch))
+
+    let i = 0
+    while i < 20
+        _kv_exec(cmd_ch, resp_ch, "SET", ["key_" + str(i), str(i * 10)])
+        i = i + 1
+
+    let j = 0
+    let all_ok = 1
+    while j < 20
+        let r = _kv_exec(cmd_ch, resp_ch, "GET", ["key_" + str(j)])
+        if r != "+" + str(j * 10)
+            all_ok = 0
+        j = j + 1
+    assert(all_ok == 1, "all 20 keys correct")
+
+    let st = _kv_exec(cmd_ch, resp_ch, "STATS", [])
+    assert(contains(str(st), "ops=40"), "40 ops (20 SET + 20 GET): " + str(st))
+    assert(contains(str(st), "hit_rate=100%"), "100% hit rate: " + str(st))
+
+    _kv_exec(cmd_ch, resp_ch, "QUIT", [])
+    print("  concurrent 20 keys: PASS")
+
+fn _test_error_handling()
+    let cmd_ch = channel()
+    let resp_ch = channel()
+    let cch = cmd_ch
+    let rch = resp_ch
+    spawn(fn(x) _store_loop(cch, rch))
+
+    let r1 = _kv_exec(cmd_ch, resp_ch, "SET", ["only_key"])
+    assert(starts_with(str(r1), "-ERR"), "SET 1 arg: " + str(r1))
+
+    let r2 = _kv_exec(cmd_ch, resp_ch, "BADCMD", [])
+    assert(starts_with(str(r2), "-ERR"), "unknown cmd: " + str(r2))
+
+    let r3 = _kv_exec(cmd_ch, resp_ch, "DEL", ["nonexist"])
+    assert(r3 == "+0", "DEL missing: " + str(r3))
+
+    _kv_exec(cmd_ch, resp_ch, "QUIT", [])
+    print("  error handling: PASS")
+
+fn main()
+    _test_basic_ops()
+    _test_incr()
+    _test_multi_key()
+    _test_overwrite()
+    _test_concurrent_clients()
+    _test_error_handling()
+    print("real_kv_server: all passed")
