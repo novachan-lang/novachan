@@ -1204,6 +1204,18 @@ int64_t nova_rt_repeat(int64_t s, int64_t count) {
     return (int64_t)(uintptr_t)result;
 }
 
+int64_t nova_rt_list_repeat(int64_t list, int64_t count) {
+    int64_t result = nova_rt_list_create();
+    if (count <= 0) return result;
+    int64_t len = nova_rt_list_len(list);
+    for (int64_t rep = 0; rep < count; rep++) {
+        for (int64_t i = 0; i < len; i++) {
+            nova_rt_list_append(result, nova_rt_list_get(list, i));
+        }
+    }
+    return result;
+}
+
 int64_t nova_rt_trim(int64_t s) {
     const char* str = (const char*)(uintptr_t)s;
     while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
@@ -3018,6 +3030,10 @@ int64_t nova_rt_mul(int64_t a, int64_t b) {
         return nova_rt_repeat(a, b);
     if (b_is_str && !a_is_str)
         return nova_rt_repeat(b, a);
+    if (ta == NOVA_MEM_LIST)
+        return nova_rt_list_repeat(a, b);
+    if (tb == NOVA_MEM_LIST)
+        return nova_rt_list_repeat(b, a);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(nova_to_double(a) * nova_to_double(b)));
     return a * b;
