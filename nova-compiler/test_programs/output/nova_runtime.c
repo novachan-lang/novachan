@@ -9101,6 +9101,97 @@ int64_t nova_rt_format(int64_t template_s, int64_t args_handle) {
     return result ? (int64_t)(uintptr_t)result : 0;
 }
 
+int64_t nova_rt_format_one(int64_t val, int64_t spec_str) {
+    const char* spec = (const char*)(uintptr_t)spec_str;
+    if (!spec || *spec == 0) return nova_rt_any_to_str(val);
+
+    char fill = ' ';
+    char align_ch = '<';
+    int width = 0;
+    int precision = -1;
+    char type_ch = 0;
+
+    const char* sp = spec;
+    if (sp[0] && sp[1] && (sp[1] == '<' || sp[1] == '>' || sp[1] == '^')) {
+        fill = sp[0]; align_ch = sp[1]; sp += 2;
+    } else if (*sp == '<' || *sp == '>' || *sp == '^') {
+        align_ch = *sp; sp++;
+    }
+    if (*sp == '0') { fill = '0'; align_ch = '>'; sp++; }
+    while (*sp >= '0' && *sp <= '9') { width = width * 10 + (*sp - '0'); sp++; }
+    if (*sp == '.') {
+        sp++; precision = 0;
+        while (*sp >= '0' && *sp <= '9') { precision = precision * 10 + (*sp - '0'); sp++; }
+    }
+    if (*sp == 'd' || *sp == 'f' || *sp == 's' || *sp == 'x' || *sp == 'o' || *sp == 'b')
+        type_ch = *sp;
+
+    char vbuf[256];
+    int vlen = 0;
+
+    if (type_ch == 'd') {
+        int64_t ival;
+        if (nova_is_likely_float(val)) {
+            double d; int64_t ubv = nova_rt_unbox(val);
+            memcpy(&d, &ubv, sizeof(d)); ival = (int64_t)d;
+        } else { ival = val; }
+        vlen = snprintf(vbuf, sizeof(vbuf), "%lld", (long long)ival);
+    } else if (type_ch == 'x') {
+        vlen = snprintf(vbuf, sizeof(vbuf), "%llx", (long long)nova_rt_unbox(val));
+    } else if (type_ch == 'o') {
+        vlen = snprintf(vbuf, sizeof(vbuf), "%llo", (long long)nova_rt_unbox(val));
+    } else if (type_ch == 'b') {
+        int64_t v = nova_rt_unbox(val);
+        if (v == 0) { vbuf[0] = '0'; vlen = 1; }
+        else {
+            char tmp[66]; int ti = 0;
+            int64_t uv = v < 0 ? -v : v;
+            while (uv > 0) { tmp[ti++] = '0' + (int)(uv & 1); uv >>= 1; }
+            if (v < 0) { vbuf[0] = '-'; vlen = 1; }
+            for (int j = ti - 1; j >= 0; j--) vbuf[vlen++] = tmp[j];
+        }
+        vbuf[vlen] = 0;
+    } else if (type_ch == 'f') {
+        double d;
+        if (nova_is_likely_float(val)) {
+            int64_t ubv = nova_rt_unbox(val); memcpy(&d, &ubv, sizeof(d));
+        } else { d = (double)val; }
+        if (precision < 0) precision = 6;
+        vlen = snprintf(vbuf, sizeof(vbuf), "%.*f", precision, d);
+    } else if (type_ch == 's') {
+        const char* s = (const char*)(uintptr_t)val;
+        if (s) {
+            vlen = (int)strlen(s);
+            if (precision >= 0 && vlen > precision) vlen = precision;
+            if (vlen > 255) vlen = 255;
+            memcpy(vbuf, s, (size_t)vlen); vbuf[vlen] = 0;
+        }
+    } else {
+        if (precision >= 0) {
+            double d;
+            if (nova_is_likely_float(val)) {
+                int64_t ubv = nova_rt_unbox(val); memcpy(&d, &ubv, sizeof(d));
+            } else { d = (double)val; }
+            vlen = snprintf(vbuf, sizeof(vbuf), "%.*f", precision, d);
+        } else {
+            int64_t s = nova_rt_any_to_str(val);
+            const char* sv = (const char*)(uintptr_t)s;
+            if (sv) {
+                vlen = (int)strlen(sv);
+                if (vlen > 255) vlen = 255;
+                memcpy(vbuf, sv, (size_t)vlen); vbuf[vlen] = 0;
+            }
+        }
+    }
+
+    char out[512];
+    int pos = 0;
+    fmt_pad(out, &pos, (int)sizeof(out), vbuf, vlen, width, fill, align_ch);
+    out[pos] = 0;
+    char* r = nova_fat_str_create(out, (size_t)pos);
+    return r ? (int64_t)(uintptr_t)r : 0;
+}
+
 int64_t nova_rt_center(int64_t s_handle, int64_t width, int64_t fill_char) {
     const char* s = (const char*)(uintptr_t)s_handle;
     if (!s) s = "";
