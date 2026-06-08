@@ -1115,16 +1115,13 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
         if tv(tokens, p) == "]"
             ParseResult(Expr("list", "", 0, [], [], ln), p + 1)
         else
+            let _sp_first = false
+            if tk(tokens, p) == "DOTDOT" and tk(tokens, p + 1) == "DOT"
+                _sp_first = true
+                p = p + 2
             let first_r = parse_expr(tokens, p, 0, pe)
             p = first_r.pos
-            if tk(tokens, p) == "KW" and tv(tokens, p) == "for"
-                // One or more generator clauses, each: `for VAR in ITER (if COND)*`.
-                // Desugars (parse-time, no new IR) to nested flatten(map(...)) reusing
-                // the map/filter/flatten builtins:
-                //   [e for x in xs]                -> map(xs, fn(x) e)
-                //   [e for x in xs if c]           -> map(filter(xs, fn(x) c), fn(x) e)
-                //   [e for x in xs for y in ys]    -> flatten(map(xs, fn(x) map(ys, fn(y) e)))
-                // A filter binds to the generator it follows.
+            if not _sp_first and tk(tokens, p) == "KW" and tv(tokens, p) == "for"
                 let cvars = []
                 let citers = []
                 let cfilters = []
@@ -1162,82 +1159,188 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
                 ParseResult(result, p)
             else
                 let elements = [first_r.expr]
+                let _sp_flags = [_sp_first]
+                let _has_spread = _sp_first
                 while tv(tokens, p) != "]" and tk(tokens, p) != "EOF"
                     p = expect(tokens, p, ",", pe)
                     if tv(tokens, p) == "]" or tk(tokens, p) == "EOF"
                         break
+                    let _sp = false
+                    if tk(tokens, p) == "DOTDOT" and tk(tokens, p + 1) == "DOT"
+                        _sp = true
+                        _has_spread = true
+                        p = p + 2
                     let elem_r = parse_expr(tokens, p, 0, pe)
                     push(elements, elem_r.expr)
+                    push(_sp_flags, _sp)
                     if elem_r.pos <= p
                         break
                     p = elem_r.pos
                 p = expect(tokens, p, "]", pe)
-                ParseResult(Expr("list", "", 0, elements, [], ln), p)
+                if not _has_spread
+                    ParseResult(Expr("list", "", 0, elements, [], ln), p)
+                else
+                    let _sp_parts = []
+                    let _sp_group = []
+                    let _sp_i = 0
+                    while _sp_i < len(elements)
+                        if _sp_flags[_sp_i]
+                            if len(_sp_group) > 0
+                                push(_sp_parts, Expr("list", "", 0, _sp_group, [], ln))
+                                _sp_group = []
+                            push(_sp_parts, elements[_sp_i])
+                        else
+                            push(_sp_group, elements[_sp_i])
+                        _sp_i = _sp_i + 1
+                    if len(_sp_group) > 0
+                        push(_sp_parts, Expr("list", "", 0, _sp_group, [], ln))
+                    let _sp_outer = Expr("list", "", 0, _sp_parts, [], ln)
+                    ParseResult(Expr("call", "flatten", 0, [_sp_outer], [], ln), p)
     else if kind == "DELIM" and val == "\{"
-        // Dict literal OR dict comprehension {k: v for x in xs (if c)* (for ...)*}.
         let p = pos + 1
         if tv(tokens, p) == "\}"
             ParseResult(Expr("dict", "", 0, [], [], ln), p + 1)
         else
-            let key0 = parse_expr(tokens, p, 0, pe)
-            p = expect(tokens, key0.pos, ":", pe)
-            let val0 = parse_expr(tokens, p, 0, pe)
-            p = val0.pos
-            if tk(tokens, p) == "KW" and tv(tokens, p) == "for"
-                // Dict comprehension: build [k, v] pairs via the SAME nested
-                // flatten(map(filter ...)) desugar as list comprehensions, then fold
-                // them into a dict with dict_from_pairs.
-                let cvars = []
-                let citers = []
-                let cfilters = []
-                while tk(tokens, p) == "KW" and tv(tokens, p) == "for"
-                    p = p + 1
-                    let cvar = tv(tokens, p)
-                    p = p + 1
-                    p = expect(tokens, p, "in", pe)
-                    let iter_r = parse_expr(tokens, p, 0, pe)
-                    p = iter_r.pos
-                    let myfilters = []
-                    while tk(tokens, p) == "KW" and tv(tokens, p) == "if"
-                        p = p + 1
-                        let cond_r = parse_expr(tokens, p, 0, pe)
-                        push(myfilters, cond_r.expr)
-                        p = cond_r.pos
-                    push(cvars, cvar)
-                    push(citers, iter_r.expr)
-                    push(cfilters, myfilters)
-                p = expect(tokens, p, "\}", pe)
-                let pairexpr = Expr("list", "", 0, [key0.expr, val0.expr], [], ln)
-                let nclauses = len(cvars)
-                let result = null_expr()
-                let idx = nclauses - 1
-                while idx >= 0
-                    let cv = cvars[idx]
-                    let src = citers[idx]
-                    for fcond in cfilters[idx]
-                        src = Expr("call", "filter", 0, [src, Expr("lambda", "", 0, [fcond], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
-                    if idx == nclauses - 1
-                        result = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [pairexpr], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
-                    else
-                        let mapped = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [result], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
-                        result = Expr("call", "flatten", 0, [mapped], [], ln)
-                    idx = idx - 1
-                ParseResult(Expr("call", "dict_from_pairs", 0, [result], [], ln), p)
-            else
-                let entries = [Expr("pair", "", 0, [key0.expr, val0.expr], [], ln)]
+            let _ds_first = false
+            if tk(tokens, p) == "DOTDOT" and tk(tokens, p + 1) == "DOT"
+                _ds_first = true
+                p = p + 2
+            if _ds_first
+                let _ds_expr0 = parse_expr(tokens, p, 0, pe)
+                p = _ds_expr0.pos
+                let _ds_parts = [_ds_expr0.expr]
+                let _ds_flags = [true]
                 while tv(tokens, p) != "\}" and tk(tokens, p) != "EOF"
                     p = expect(tokens, p, ",", pe)
                     if tv(tokens, p) == "\}" or tk(tokens, p) == "EOF"
                         break
-                    let key_r = parse_expr(tokens, p, 0, pe)
-                    p = expect(tokens, key_r.pos, ":", pe)
-                    let val_r = parse_expr(tokens, p, 0, pe)
-                    push(entries, Expr("pair", "", 0, [key_r.expr, val_r.expr], [], ln))
-                    if val_r.pos <= p
-                        break
-                    p = val_r.pos
+                    if tk(tokens, p) == "DOTDOT" and tk(tokens, p + 1) == "DOT"
+                        p = p + 2
+                        let _ds_sp = parse_expr(tokens, p, 0, pe)
+                        push(_ds_parts, _ds_sp.expr)
+                        push(_ds_flags, true)
+                        p = _ds_sp.pos
+                    else
+                        let _ds_k = parse_expr(tokens, p, 0, pe)
+                        p = expect(tokens, _ds_k.pos, ":", pe)
+                        let _ds_v = parse_expr(tokens, p, 0, pe)
+                        push(_ds_parts, Expr("pair", "", 0, [_ds_k.expr, _ds_v.expr], [], ln))
+                        push(_ds_flags, false)
+                        p = _ds_v.pos
                 p = expect(tokens, p, "\}", pe)
-                ParseResult(Expr("dict", "", 0, entries, [], ln), p)
+                let _ds_segs = []
+                let _ds_grp = []
+                let _ds_j = 0
+                while _ds_j < len(_ds_parts)
+                    if _ds_flags[_ds_j]
+                        if len(_ds_grp) > 0
+                            push(_ds_segs, Expr("dict", "", 0, _ds_grp, [], ln))
+                            _ds_grp = []
+                        push(_ds_segs, _ds_parts[_ds_j])
+                    else
+                        push(_ds_grp, _ds_parts[_ds_j])
+                    _ds_j = _ds_j + 1
+                if len(_ds_grp) > 0
+                    push(_ds_segs, Expr("dict", "", 0, _ds_grp, [], ln))
+                let _ds_result = _ds_segs[0]
+                let _ds_k2 = 1
+                while _ds_k2 < len(_ds_segs)
+                    _ds_result = Expr("call", "dict_merge", 0, [_ds_result, _ds_segs[_ds_k2]], [], ln)
+                    _ds_k2 = _ds_k2 + 1
+                ParseResult(_ds_result, p)
+            else
+                let key0 = parse_expr(tokens, p, 0, pe)
+                p = expect(tokens, key0.pos, ":", pe)
+                let val0 = parse_expr(tokens, p, 0, pe)
+                p = val0.pos
+                if tk(tokens, p) == "KW" and tv(tokens, p) == "for"
+                    let cvars = []
+                    let citers = []
+                    let cfilters = []
+                    while tk(tokens, p) == "KW" and tv(tokens, p) == "for"
+                        p = p + 1
+                        let cvar = tv(tokens, p)
+                        p = p + 1
+                        p = expect(tokens, p, "in", pe)
+                        let iter_r = parse_expr(tokens, p, 0, pe)
+                        p = iter_r.pos
+                        let myfilters = []
+                        while tk(tokens, p) == "KW" and tv(tokens, p) == "if"
+                            p = p + 1
+                            let cond_r = parse_expr(tokens, p, 0, pe)
+                            push(myfilters, cond_r.expr)
+                            p = cond_r.pos
+                        push(cvars, cvar)
+                        push(citers, iter_r.expr)
+                        push(cfilters, myfilters)
+                    p = expect(tokens, p, "\}", pe)
+                    let pairexpr = Expr("list", "", 0, [key0.expr, val0.expr], [], ln)
+                    let nclauses = len(cvars)
+                    let result = null_expr()
+                    let idx = nclauses - 1
+                    while idx >= 0
+                        let cv = cvars[idx]
+                        let src = citers[idx]
+                        for fcond in cfilters[idx]
+                            src = Expr("call", "filter", 0, [src, Expr("lambda", "", 0, [fcond], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                        if idx == nclauses - 1
+                            result = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [pairexpr], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                        else
+                            let mapped = Expr("call", "map", 0, [src, Expr("lambda", "", 0, [result], [Expr("ident", cv, 0, [], [], ln)], ln)], [], ln)
+                            result = Expr("call", "flatten", 0, [mapped], [], ln)
+                        idx = idx - 1
+                    ParseResult(Expr("call", "dict_from_pairs", 0, [result], [], ln), p)
+                else
+                    let entries = [Expr("pair", "", 0, [key0.expr, val0.expr], [], ln)]
+                    let _ds2_has_sp = false
+                    let _ds2_flags = [false]
+                    let _ds2_parts = [Expr("pair", "", 0, [key0.expr, val0.expr], [], ln)]
+                    while tv(tokens, p) != "\}" and tk(tokens, p) != "EOF"
+                        p = expect(tokens, p, ",", pe)
+                        if tv(tokens, p) == "\}" or tk(tokens, p) == "EOF"
+                            break
+                        if tk(tokens, p) == "DOTDOT" and tk(tokens, p + 1) == "DOT"
+                            _ds2_has_sp = true
+                            p = p + 2
+                            let _ds2_sp = parse_expr(tokens, p, 0, pe)
+                            push(_ds2_parts, _ds2_sp.expr)
+                            push(_ds2_flags, true)
+                            push(entries, Expr("pair", "", 0, [null_expr(), null_expr()], [], ln))
+                            p = _ds2_sp.pos
+                        else
+                            let key_r = parse_expr(tokens, p, 0, pe)
+                            p = expect(tokens, key_r.pos, ":", pe)
+                            let val_r = parse_expr(tokens, p, 0, pe)
+                            push(entries, Expr("pair", "", 0, [key_r.expr, val_r.expr], [], ln))
+                            push(_ds2_parts, Expr("pair", "", 0, [key_r.expr, val_r.expr], [], ln))
+                            push(_ds2_flags, false)
+                            if val_r.pos <= p
+                                break
+                            p = val_r.pos
+                    p = expect(tokens, p, "\}", pe)
+                    if not _ds2_has_sp
+                        ParseResult(Expr("dict", "", 0, entries, [], ln), p)
+                    else
+                        let _ds2_segs = []
+                        let _ds2_grp = []
+                        let _ds2_j = 0
+                        while _ds2_j < len(_ds2_parts)
+                            if _ds2_flags[_ds2_j]
+                                if len(_ds2_grp) > 0
+                                    push(_ds2_segs, Expr("dict", "", 0, _ds2_grp, [], ln))
+                                    _ds2_grp = []
+                                push(_ds2_segs, _ds2_parts[_ds2_j])
+                            else
+                                push(_ds2_grp, _ds2_parts[_ds2_j])
+                            _ds2_j = _ds2_j + 1
+                        if len(_ds2_grp) > 0
+                            push(_ds2_segs, Expr("dict", "", 0, _ds2_grp, [], ln))
+                        let _ds2_result = _ds2_segs[0]
+                        let _ds2_k = 1
+                        while _ds2_k < len(_ds2_segs)
+                            _ds2_result = Expr("call", "dict_merge", 0, [_ds2_result, _ds2_segs[_ds2_k]], [], ln)
+                            _ds2_k = _ds2_k + 1
+                        ParseResult(_ds2_result, p)
     else if kind == "INTERP_START"
         let parts = []
         push(parts, Expr("str", val, 0, [], [], ln))
