@@ -4201,6 +4201,9 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
     return (int64_t)(uintptr_t)t;
 }
 
+static int nova_sched_root_exit = 0;
+static NovaSchedTask* nova_sched_root_task = NULL;
+
 /* The carrier loop: run green tasks cooperatively until all are done (or the
    run-queue is empty while tasks remain parked — a user deadlock, which we
    bail out of rather than hang). */
@@ -4245,6 +4248,8 @@ int64_t nova_rt_sched_run(void) {
                 if (c) memcpy(c, s, n + 1);
                 t->exit_reason = c ? (int64_t)(uintptr_t)c : 0;
             }
+            if (t == nova_sched_root_task && crashed)
+                nova_sched_root_exit = 1;
             /* Notify monitors: direct enqueue + green-waiter wake */
             for (int64_t i = 0; i < t->monitor_count; i++)
                 nova_sched_notify_channel(t->monitors[i], t->exit_status);
@@ -4279,13 +4284,16 @@ void nova_rt_main_dispatch(int64_t main_fn) {
     if (nova_green_enabled()) {
         int64_t* rec = (int64_t*)malloc(sizeof(int64_t));
         if (rec) {
-            rec[0] = main_fn;                 /* a 1-slot closure record: slot 0 = fn ptr */
-            nova_rt_sched_spawn((int64_t)(uintptr_t)rec);
+            rec[0] = main_fn;
+            nova_sched_root_exit = 0;
+            int64_t root_h = nova_rt_sched_spawn((int64_t)(uintptr_t)rec);
+            nova_sched_root_task = (NovaSchedTask*)(uintptr_t)root_h;
             nova_rt_sched_run();
+            if (nova_sched_root_exit) exit(nova_sched_root_exit);
             return;
         }
     }
-    ((int64_t(*)(void))(uintptr_t)main_fn)();  /* direct call (default / OOM fallback) */
+    ((int64_t(*)(void))(uintptr_t)main_fn)();
 }
 
 /* ── Stage 2b: work-stealing multi-carrier scheduler ──────────────────────────
@@ -8886,15 +8894,14 @@ int64_t nova_rt_try_unwrap_value(int64_t handle) {
 }
 
 int64_t nova_rt_wrap_error_context(int64_t result_handle, int64_t fn_name, int64_t line_num) {
-    NovaResult* r = (NovaResult*)(uintptr_t)result_handle;
-    if (r->tag != 1) return result_handle;
-    const char* old_msg = (const char*)(uintptr_t)r->value;
+    NovaTaskState* t = nova_cur();
+    const char* old_msg = t->error_msg ? (const char*)(uintptr_t)t->error_msg : NULL;
+    if (!old_msg) return result_handle;
     const char* fname   = (const char*)(uintptr_t)fn_name;
     size_t needed = strlen(fname) + 32 + strlen(old_msg);
     char* m = malloc(needed + 1);
     if (!m) return result_handle;
     snprintf(m, needed + 1, "in %s at line %lld: %s", fname, (long long)line_num, old_msg);
-    NovaTaskState* t = nova_cur();
     t->error_msg = (int64_t)(uintptr_t)m;
     return nova_result_pack(1, (int64_t)(uintptr_t)m);
 }

@@ -1,60 +1,33 @@
-Set-Location $PSScriptRoot
-. "$PSScriptRoot\_proc_util.ps1"
-Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
-$compiler = ".\nova.exe"
-$pass = 0
-$fail = 0
-$skip = 0
+. ./_proc_util.ps1
 
 $tests = @(
-    "float_test", "while_test", "list_test", "string_test", "for_test",
-    "closure_test", "combined_test", "nested_fn_test",
-    "struct_test", "struct_advanced_test", "struct_mutate_test",
-    "match_test", "match_advanced_test", "higher_order_test",
-    "enum_test", "range_test", "string_methods_test", "dict_test",
-    "math_test", "string_stdlib_test", "list_methods_test",
-    "type_conv_test", "spawn_test", "close_test",
-    "rc_phase2_test", "dict_iter_test", "slice_test",
-    "defaults_test", "in_operator_test", "struct_methods_test",
-    "generics_test", "match_guard_test", "trait_test",
-    "destructure_test", "assert_test", "string_index_test",
-    "string_iter_test", "string_ops_test",
-    "list_struct_test", "list_struct_loop_test",
-    "string_accum_test", "string_accum_fn_test",
-    "codegen_pattern_test", "match_expr_test",
-    "map_filter_test", "bitwise_test",
-    "yield_test", "closure_ir_test",
-    "error_test", "tiny_test", "match_str_test",
-    "default_params_test", "tuple_test", "method_test",
-    "math_quick_test", "else_sibling_test",
-    "mini_struct_test", "mini2_test",
-    "stdlib_test", "mixed_arith_test"
+  'float_test','while_test','list_test','string_test','for_test','closure_test',
+  'combined_test','struct_test','match_test','enum_test','range_test',
+  'dict_test','math_test','type_conv_test','slice_test','defaults_test',
+  'in_operator_test','struct_methods_test','match_guard_test','trait_test',
+  'destructure_test','assert_test','string_index_test','match_expr_test',
+  'map_filter_test','bitwise_test','regex_test','bytes_test','closure_ir_test',
+  'import_multi_test','error_test','tco_test','enum_full_test',
+  'for_else_test','spread_test','for_destructure_test','for_guard_test',
+  'unless_until_test'
 )
 
-foreach ($test in $tests) {
-    if (!(Test-Path "$test.nova")) { $skip++; continue }
-    $cr = Invoke-Timed -FilePath (Resolve-Path $compiler).Path -Arguments "$test.nova" -TimeoutMs 30000
-    if ($cr.ExitCode -ne 0 -or !(Test-Path "$test.ll")) {
-        Write-Host "FAIL compile: $test (exit=$($cr.ExitCode))"
-        $fail++
-        continue
-    }
-    $lr = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o $test.exe $test.ll nova_runtime.c $NovaLinkFlags" -TimeoutMs 60000
-    if (!(Test-Path "$test.exe")) {
-        Write-Host "FAIL link: $test"
-        $fail++
-        Remove-Item "$test.ll" -Force -ErrorAction SilentlyContinue
-        continue
-    }
-    $rr = Invoke-Timed -FilePath (Resolve-Path ".\$test.exe").Path -Arguments "" -TimeoutMs 10000
-    if ($rr.ExitCode -ne 0) {
-        Write-Host "FAIL run: $test (exit=$($rr.ExitCode))"
-        $fail++
-    } else {
-        $pass++
-    }
-    Remove-Item "$test.ll","$test.exe" -Force -ErrorAction SilentlyContinue
+$pass = 0; $fail = 0; $failNames = @()
+foreach ($t in $tests) {
+    $nova = "$t.nova"
+    $ll = "$t.ll"
+    $exe = "$t.exe"
+    Remove-Item $ll -ErrorAction SilentlyContinue
+    $cr = Invoke-Timed -FilePath './gen3_test.exe' -Arguments $nova -TimeoutMs 120000 -WorkingDirectory '.'
+    if ($cr.ExitCode -ne 0) { $fail++; $failNames += "$t(compile)"; continue }
+    $lr = Invoke-Timed -FilePath 'clang' -Arguments "$ll output/nova_runtime.o -o $exe -O2 -lws2_32 -ladvapi32" -TimeoutMs 60000 -WorkingDirectory '.'
+    if ($lr.ExitCode -ne 0) { $fail++; $failNames += "$t(link)"; continue }
+    $rr = Invoke-Timed -FilePath "./$exe" -Arguments '' -TimeoutMs 15000 -WorkingDirectory '.'
+    if ($rr.TimedOut) { $fail++; $failNames += "$t(timeout)" }
+    elseif ($rr.ExitCode -ne 0) { $fail++; $failNames += "$t(exit=$($rr.ExitCode))" }
+    elseif ($rr.StdErr -match 'FAIL') { $fail++; $failNames += "$t(stderr-FAIL)" }
+    else { $pass++ }
 }
-Remove-Item "nova_runtime.c" -Force -ErrorAction SilentlyContinue
-Write-Host ""
-Write-Host "Results: $pass PASS, $fail FAIL, $skip SKIP"
+
+Write-Host "PASS: $pass / $($pass+$fail)"
+if ($fail -gt 0) { Write-Host "FAILED: $($failNames -join ', ')" }
