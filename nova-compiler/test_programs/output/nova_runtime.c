@@ -3006,6 +3006,18 @@ int64_t nova_rt_sub(int64_t a, int64_t b) {
 }
 
 int64_t nova_rt_mul(int64_t a, int64_t b) {
+    void* pa = (void*)(uintptr_t)a;
+    void* pb = (void*)(uintptr_t)b;
+    NovaMemTag ta = nova_mem_find_tag(pa);
+    NovaMemTag tb = nova_mem_find_tag(pb);
+    int a_is_str = (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
+                    ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa)));
+    int b_is_str = (tb == NOVA_MEM_RAW || tb == NOVA_MEM_FAT_STR ||
+                    ((uint64_t)b > 0x10000 && tb == (NovaMemTag)-1 && nova_is_readable_str(pb)));
+    if (a_is_str && !b_is_str)
+        return nova_rt_repeat(a, b);
+    if (b_is_str && !a_is_str)
+        return nova_rt_repeat(b, a);
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_from_double(nova_to_double(a) * nova_to_double(b));
     return a * b;

@@ -440,6 +440,25 @@ fn tokenize_file(source: string, filename: string) -> list
                     if not int_fits_i64(num)
                         lex_error_file("E0012", "integer literal '" + num + "' is too large for i64", filename, line, start_col, "i64 max is 9223372036854775807 (19 digits); use a smaller value")
                     push(tokens, Token("INT", num, line, start_col))
+        else if ch == "\"" and pos + 2 < length and source[pos + 1] == "\"" and source[pos + 2] == "\""
+            let start_col = col
+            let start_line = line
+            pos = pos + 3
+            col = col + 3
+            let _tq = ""
+            while pos < length and not (source[pos] == "\"" and pos + 2 < length and source[pos + 1] == "\"" and source[pos + 2] == "\"")
+                if source[pos] == "\n"
+                    line = line + 1
+                    col = 1
+                else
+                    col = col + 1
+                _tq = _tq + source[pos]
+                pos = pos + 1
+            if pos >= length
+                lex_error_file("E0010", "unterminated triple-quoted string", filename, start_line, start_col, "string opened with triple-quote was never closed")
+            pos = pos + 3
+            col = col + 3
+            push(tokens, Token("STR", _dedent_block(_tq), line, start_col))
         else if ch == "\""
             let start_col = col
             let start_line = line
@@ -1351,10 +1370,21 @@ fn parse_match_expr(tokens: list, pos: int, pe: list) -> ParseResult
         if len(arms) > 0 and tok_col(tokens, p2) < arm_col
             break
         let cur_kind = tk(tokens, p2)
-        if cur_kind != "IDENT" and cur_kind != "INT" and cur_kind != "STR"
+        let _neg_start = cur_kind == "OP" and tv(tokens, p2) == "-" and p2 + 1 < len(tokens) and tk(tokens, p2 + 1) == "INT"
+        if cur_kind != "IDENT" and cur_kind != "INT" and cur_kind != "STR" and cur_kind != "ATOM" and not _neg_start
             break
         let pat_r = parse_pattern(tokens, p2, pe)
-        p2 = skip_nl(tokens, pat_r.pos)
+        p2 = pat_r.pos
+        let _or_pats = [pat_r.expr]
+        while tk(tokens, p2) == "OP" and tv(tokens, p2) == "|"
+            p2 = p2 + 1
+            let _or_next = parse_pattern(tokens, p2, pe)
+            push(_or_pats, _or_next.expr)
+            p2 = _or_next.pos
+        let _final_pat = pat_r.expr
+        if len(_or_pats) > 1
+            _final_pat = Expr("pat_or", "", 0, _or_pats, [], ln)
+        p2 = skip_nl(tokens, p2)
         let guard_expr = null_expr()
         if tk(tokens, p2) == "KW" and tv(tokens, p2) == "if"
             p2 = p2 + 1
@@ -1364,7 +1394,7 @@ fn parse_match_expr(tokens: list, pos: int, pe: list) -> ParseResult
         p2 = expect(tokens, p2, "=>", pe)
         p2 = skip_nl(tokens, p2)
         let body_r = parse_expr(tokens, p2, 0, pe)
-        push(arms, Expr("arm", "", 0, [pat_r.expr, body_r.expr, guard_expr], [], ln))
+        push(arms, Expr("arm", "", 0, [_final_pat, body_r.expr, guard_expr], [], ln))
         p2 = skip_nl(tokens, body_r.pos)
     ParseResult(Expr("match", "", 0, [subject_r.expr] + arms, [], ln), p2)
 
@@ -1397,11 +1427,35 @@ fn parse_pattern(tokens: list, pos: int, pe: list) -> ParseResult
         else
             ParseResult(Expr("pat_var", val, 0, [], [], ln), pos + 1)
     else if kind == "INT"
-        ParseResult(Expr("pat_lit", val, int(val), [], [], ln), pos + 1)
+        if pos + 2 < len(tokens) and tk(tokens, pos + 1) == "DOTDOT" and tk(tokens, pos + 2) == "INT"
+            let _rlo = int(val)
+            let _rhi_v = tv(tokens, pos + 2)
+            let _rhi = int(_rhi_v)
+            ParseResult(Expr("pat_range", val, _rlo, [Expr("pat_lit", _rhi_v, _rhi, [], [], ln)], [], ln), pos + 3)
+        else
+            ParseResult(Expr("pat_lit", val, int(val), [], [], ln), pos + 1)
     else if kind == "STR"
         ParseResult(Expr("pat_str", val, 0, [], [], ln), pos + 1)
     else if kind == "ATOM"
         ParseResult(Expr("pat_str", ":" + val, 0, [], [], ln), pos + 1)
+    else if kind == "OP" and val == "-" and pos + 1 < len(tokens) and tk(tokens, pos + 1) == "INT"
+        let _nv = tv(tokens, pos + 1)
+        let _nn = 0 - int(_nv)
+        let _ns = "-" + _nv
+        if pos + 3 < len(tokens) and tk(tokens, pos + 2) == "DOTDOT"
+            if tk(tokens, pos + 3) == "INT"
+                let _nrhi_v = tv(tokens, pos + 3)
+                let _nrhi = int(_nrhi_v)
+                ParseResult(Expr("pat_range", _ns, _nn, [Expr("pat_lit", _nrhi_v, _nrhi, [], [], ln)], [], ln), pos + 4)
+            else if tk(tokens, pos + 3) == "OP" and tv(tokens, pos + 3) == "-" and pos + 4 < len(tokens) and tk(tokens, pos + 4) == "INT"
+                let _nrhi_v2 = tv(tokens, pos + 4)
+                let _nrhi2 = 0 - int(_nrhi_v2)
+                let _nrhi_s = "-" + _nrhi_v2
+                ParseResult(Expr("pat_range", _ns, _nn, [Expr("pat_lit", _nrhi_s, _nrhi2, [], [], ln)], [], ln), pos + 5)
+            else
+                ParseResult(Expr("pat_lit", _ns, _nn, [], [], ln), pos + 2)
+        else
+            ParseResult(Expr("pat_lit", _ns, _nn, [], [], ln), pos + 2)
     else
         ParseResult(Expr("pat_wild", "_", 0, [], [], ln), pos)
 
@@ -2302,6 +2356,14 @@ fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         if p2 <= pat_start
             p2 = syntax_error(tokens, p2, "invalid match arm pattern; expected a pattern, got '" + tv(tokens, p2) + "'", pe)
             break
+        let _smo_pats = [pat_r.expr]
+        while tk(tokens, p2) == "OP" and tv(tokens, p2) == "|"
+            p2 = p2 + 1
+            let _smo_next = parse_pattern(tokens, p2, pe)
+            push(_smo_pats, _smo_next.expr)
+            p2 = _smo_next.pos
+        if len(_smo_pats) > 1
+            pat_r = ParseResult(Expr("pat_or", "", 0, _smo_pats, [], ln), p2)
         let arm_guard = null_expr()
         if tk(tokens, p2) == "KW" and tv(tokens, p2) == "if"
             p2 = p2 + 1
@@ -6619,7 +6681,7 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                             if len(m_ac) >= 1
                                 match m_ac[0]
                                     Expr(m_spt, m_spv, m_spn, m_spc, m_spf, m_spln) =>
-                                        if m_spt == "pat_lit" or m_spt == "pat_str" or m_spt == "pat_var"
+                                        if m_spt == "pat_lit" or m_spt == "pat_str" or m_spt == "pat_var" or m_spt == "pat_range" or m_spt == "pat_or"
                                             m_is_value = 1
                     m_si = m_si + 1
                 let m_hash = ""
@@ -6696,6 +6758,81 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                         if m_arm_idx + 1 < m_arm_count
                                             m_next = m_check_labels[m_arm_idx]
                                         ir_finish_block(b, IrInst("branch", "", ir_type_void(), [m_cmp, m_next], m_arm_labels[m_arm_idx], 0, "pure", b.ir_cur_line))
+                                        ir_start_block(b, m_arm_labels[m_arm_idx])
+                                    else if m_pt == "pat_range"
+                                        if m_arm_idx > 0
+                                            ir_start_block(b, m_check_labels[m_arm_idx - 1])
+                                        let m_rlo = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", m_rlo, ir_type_int(), [], m_pv, m_pn)
+                                        let m_rge = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "ge", m_rge, ir_type_int(), [m_subject, m_rlo], ">=", 0)
+                                        let m_rhi_v = ""
+                                        let m_rhi_n = 0
+                                        if len(m_pchildren) > 0
+                                            match m_pchildren[0]
+                                                Expr(_rht, _rhv, _rhn, _rhc, _rhf, _rhl) =>
+                                                    m_rhi_v = _rhv
+                                                    m_rhi_n = _rhn
+                                        let m_rhi = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", m_rhi, ir_type_int(), [], m_rhi_v, m_rhi_n)
+                                        let m_rle = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "le", m_rle, ir_type_int(), [m_subject, m_rhi], "<=", 0)
+                                        let m_rand = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "and", m_rand, ir_type_int(), [m_rge, m_rle], "and", 0)
+                                        let m_next = m_fall
+                                        if m_arm_idx + 1 < m_arm_count
+                                            m_next = m_check_labels[m_arm_idx]
+                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [m_rand, m_next], m_arm_labels[m_arm_idx], 0, "pure", b.ir_cur_line))
+                                        ir_start_block(b, m_arm_labels[m_arm_idx])
+                                    else if m_pt == "pat_or"
+                                        if m_arm_idx > 0
+                                            ir_start_block(b, m_check_labels[m_arm_idx - 1])
+                                        let _mo_i = 0
+                                        while _mo_i < len(m_pchildren)
+                                            match m_pchildren[_mo_i]
+                                                Expr(_mot, _mov, _mon, _moc, _mof, _mol) =>
+                                                    let _mo_ok = m_arm_labels[m_arm_idx]
+                                                    let _mo_fail = m_fall
+                                                    if _mo_i + 1 < len(m_pchildren)
+                                                        _mo_fail = ir_fresh_label(b, "mor_" + str(m_arm_idx) + "_" + str(_mo_i + 1))
+                                                    else if m_arm_idx + 1 < m_arm_count
+                                                        _mo_fail = m_check_labels[m_arm_idx]
+                                                    if _mot == "pat_lit"
+                                                        let _mo_e = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _mo_e, ir_type_int(), [], _mov, _mon)
+                                                        let _mo_c = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "eq", _mo_c, ir_type_int(), [m_subject, _mo_e], "==", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_mo_c, _mo_fail], _mo_ok, 0, "pure", b.ir_cur_line))
+                                                    else if _mot == "pat_str"
+                                                        let _mo_e = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_str", _mo_e, ir_type_str(), [], _mov, 0)
+                                                        let _mo_c = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "eq", _mo_c, ir_type_str(), [m_subject, _mo_e], "==", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_mo_c, _mo_fail], _mo_ok, 0, "pure", b.ir_cur_line))
+                                                    else if _mot == "pat_range"
+                                                        let _mo_rlo = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _mo_rlo, ir_type_int(), [], _mov, _mon)
+                                                        let _mo_rge = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "ge", _mo_rge, ir_type_int(), [m_subject, _mo_rlo], ">=", 0)
+                                                        let _mo_rhi_v = ""
+                                                        let _mo_rhi_n = 0
+                                                        if len(_moc) > 0
+                                                            match _moc[0]
+                                                                Expr(_mrt, _mrv, _mrn, _mrc, _mrf, _mrl) =>
+                                                                    _mo_rhi_v = _mrv
+                                                                    _mo_rhi_n = _mrn
+                                                        let _mo_rhi = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _mo_rhi, ir_type_int(), [], _mo_rhi_v, _mo_rhi_n)
+                                                        let _mo_rle = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "le", _mo_rle, ir_type_int(), [m_subject, _mo_rhi], "<=", 0)
+                                                        let _mo_ra = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "and", _mo_ra, ir_type_int(), [_mo_rge, _mo_rle], "and", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_mo_ra, _mo_fail], _mo_ok, 0, "pure", b.ir_cur_line))
+                                                    else
+                                                        ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], _mo_ok, 0, "pure", b.ir_cur_line))
+                                                    if _mo_i + 1 < len(m_pchildren)
+                                                        ir_start_block(b, _mo_fail)
+                                            _mo_i = _mo_i + 1
                                         ir_start_block(b, m_arm_labels[m_arm_idx])
                                     else
                                         if m_arm_idx > 0
@@ -7076,7 +7213,7 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                         Stmt(sm_at, sm_an, sm_pat, sm_ab, sm_ap, sm_ae, sm_aa, sm_sl) =>
                             match sm_pat
                                 Expr(sm_pt, sm_pv, sm_pn, sm_pc, sm_pf, sm_pln) =>
-                                    if sm_pt == "pat_lit" or sm_pt == "pat_str" or sm_pt == "pat_var"
+                                    if sm_pt == "pat_lit" or sm_pt == "pat_str" or sm_pt == "pat_var" or sm_pt == "pat_range" or sm_pt == "pat_or"
                                         sm_is_value = 1
                 let hash_reg = ""
                 if sm_is_value == 0
@@ -7153,6 +7290,81 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                         if arm_idx + 1 < arm_count
                                             next_label = check_labels[arm_idx]
                                         ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_reg, next_label], arm_labels[arm_idx], 0, "pure", b.ir_cur_line))
+                                        ir_start_block(b, arm_labels[arm_idx])
+                                    else if pt == "pat_range"
+                                        if arm_idx > 0
+                                            ir_start_block(b, check_labels[arm_idx - 1])
+                                        let pr_lo = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", pr_lo, ir_type_int(), [], pv, pn)
+                                        let pr_ge = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "ge", pr_ge, ir_type_int(), [subject, pr_lo], ">=", 0)
+                                        let pr_hi_v = ""
+                                        let pr_hi_n = 0
+                                        if len(pchildren) > 0
+                                            match pchildren[0]
+                                                Expr(_prt, _prv, _prn, _prc, _prf, _prl) =>
+                                                    pr_hi_v = _prv
+                                                    pr_hi_n = _prn
+                                        let pr_hi = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", pr_hi, ir_type_int(), [], pr_hi_v, pr_hi_n)
+                                        let pr_le = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "le", pr_le, ir_type_int(), [subject, pr_hi], "<=", 0)
+                                        let pr_and = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "and", pr_and, ir_type_int(), [pr_ge, pr_le], "and", 0)
+                                        let next_label = fall_label
+                                        if arm_idx + 1 < arm_count
+                                            next_label = check_labels[arm_idx]
+                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [pr_and, next_label], arm_labels[arm_idx], 0, "pure", b.ir_cur_line))
+                                        ir_start_block(b, arm_labels[arm_idx])
+                                    else if pt == "pat_or"
+                                        if arm_idx > 0
+                                            ir_start_block(b, check_labels[arm_idx - 1])
+                                        let _so_i = 0
+                                        while _so_i < len(pchildren)
+                                            match pchildren[_so_i]
+                                                Expr(_sot, _sov, _son, _soc, _sof, _sol) =>
+                                                    let _so_ok = arm_labels[arm_idx]
+                                                    let _so_fail = fall_label
+                                                    if _so_i + 1 < len(pchildren)
+                                                        _so_fail = ir_fresh_label(b, "sor_" + str(arm_idx) + "_" + str(_so_i + 1))
+                                                    else if arm_idx + 1 < arm_count
+                                                        _so_fail = check_labels[arm_idx]
+                                                    if _sot == "pat_lit"
+                                                        let _so_e = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _so_e, ir_type_int(), [], _sov, _son)
+                                                        let _so_c = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "eq", _so_c, ir_type_int(), [subject, _so_e], "==", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_so_c, _so_fail], _so_ok, 0, "pure", b.ir_cur_line))
+                                                    else if _sot == "pat_str"
+                                                        let _so_e = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_str", _so_e, ir_type_str(), [], _sov, 0)
+                                                        let _so_c = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "eq", _so_c, ir_type_str(), [subject, _so_e], "==", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_so_c, _so_fail], _so_ok, 0, "pure", b.ir_cur_line))
+                                                    else if _sot == "pat_range"
+                                                        let _so_rlo = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _so_rlo, ir_type_int(), [], _sov, _son)
+                                                        let _so_rge = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "ge", _so_rge, ir_type_int(), [subject, _so_rlo], ">=", 0)
+                                                        let _so_rhi_v = ""
+                                                        let _so_rhi_n = 0
+                                                        if len(_soc) > 0
+                                                            match _soc[0]
+                                                                Expr(_srt, _srv, _srn, _src, _srf, _srl) =>
+                                                                    _so_rhi_v = _srv
+                                                                    _so_rhi_n = _srn
+                                                        let _so_rhi = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _so_rhi, ir_type_int(), [], _so_rhi_v, _so_rhi_n)
+                                                        let _so_rle = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "le", _so_rle, ir_type_int(), [subject, _so_rhi], "<=", 0)
+                                                        let _so_ra = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "and", _so_ra, ir_type_int(), [_so_rge, _so_rle], "and", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_so_ra, _so_fail], _so_ok, 0, "pure", b.ir_cur_line))
+                                                    else
+                                                        ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], _so_ok, 0, "pure", b.ir_cur_line))
+                                                    if _so_i + 1 < len(pchildren)
+                                                        ir_start_block(b, _so_fail)
+                                            _so_i = _so_i + 1
                                         ir_start_block(b, arm_labels[arm_idx])
                                     else
                                         if arm_idx > 0
@@ -7253,7 +7465,7 @@ fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
                         Stmt(rm_at, rm_an, rm_pat, rm_ab, rm_ap, rm_ae, rm_aa, rm_sl) =>
                             match rm_pat
                                 Expr(rm_pt, rm_pv, rm_pn, rm_pc, rm_pf, rm_pln) =>
-                                    if rm_pt == "pat_lit" or rm_pt == "pat_str" or rm_pt == "pat_var"
+                                    if rm_pt == "pat_lit" or rm_pt == "pat_str" or rm_pt == "pat_var" or rm_pt == "pat_range" or rm_pt == "pat_or"
                                         rm_is_value = 1
                 let arm_labels = []
                 let aidx = 0
@@ -7326,6 +7538,81 @@ fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
                                         if arm_idx + 1 < arm_count
                                             next_label = rcheck_labels[arm_idx]
                                         ir_finish_block(b, IrInst("branch", "", ir_type_void(), [cmp_reg, next_label], arm_labels[arm_idx], 0, "pure", b.ir_cur_line))
+                                        ir_start_block(b, arm_labels[arm_idx])
+                                    else if pt == "pat_range"
+                                        if arm_idx > 0
+                                            ir_start_block(b, rcheck_labels[arm_idx - 1])
+                                        let rp_lo = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", rp_lo, ir_type_int(), [], pv, pn)
+                                        let rp_ge = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "ge", rp_ge, ir_type_int(), [subject, rp_lo], ">=", 0)
+                                        let rp_hi_v = ""
+                                        let rp_hi_n = 0
+                                        if len(pchildren) > 0
+                                            match pchildren[0]
+                                                Expr(_rpt2, _rpv2, _rpn2, _rpc2, _rpf2, _rpl2) =>
+                                                    rp_hi_v = _rpv2
+                                                    rp_hi_n = _rpn2
+                                        let rp_hi = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "const_int", rp_hi, ir_type_int(), [], rp_hi_v, rp_hi_n)
+                                        let rp_le = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "le", rp_le, ir_type_int(), [subject, rp_hi], "<=", 0)
+                                        let rp_and = ir_fresh_reg(b)
+                                        ir_emit_inst(b, "and", rp_and, ir_type_int(), [rp_ge, rp_le], "and", 0)
+                                        let next_label = fall_label
+                                        if arm_idx + 1 < arm_count
+                                            next_label = rcheck_labels[arm_idx]
+                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [rp_and, next_label], arm_labels[arm_idx], 0, "pure", b.ir_cur_line))
+                                        ir_start_block(b, arm_labels[arm_idx])
+                                    else if pt == "pat_or"
+                                        if arm_idx > 0
+                                            ir_start_block(b, rcheck_labels[arm_idx - 1])
+                                        let _ro_i = 0
+                                        while _ro_i < len(pchildren)
+                                            match pchildren[_ro_i]
+                                                Expr(_rot, _rov, _ron, _roc, _rof, _rol) =>
+                                                    let _ro_ok = arm_labels[arm_idx]
+                                                    let _ro_fail = fall_label
+                                                    if _ro_i + 1 < len(pchildren)
+                                                        _ro_fail = ir_fresh_label(b, "ror_" + str(arm_idx) + "_" + str(_ro_i + 1))
+                                                    else if arm_idx + 1 < arm_count
+                                                        _ro_fail = rcheck_labels[arm_idx]
+                                                    if _rot == "pat_lit"
+                                                        let _ro_e = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _ro_e, ir_type_int(), [], _rov, _ron)
+                                                        let _ro_c = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "eq", _ro_c, ir_type_int(), [subject, _ro_e], "==", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_ro_c, _ro_fail], _ro_ok, 0, "pure", b.ir_cur_line))
+                                                    else if _rot == "pat_str"
+                                                        let _ro_e = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_str", _ro_e, ir_type_str(), [], _rov, 0)
+                                                        let _ro_c = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "eq", _ro_c, ir_type_str(), [subject, _ro_e], "==", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_ro_c, _ro_fail], _ro_ok, 0, "pure", b.ir_cur_line))
+                                                    else if _rot == "pat_range"
+                                                        let _ro_rlo = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _ro_rlo, ir_type_int(), [], _rov, _ron)
+                                                        let _ro_rge = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "ge", _ro_rge, ir_type_int(), [subject, _ro_rlo], ">=", 0)
+                                                        let _ro_rhi_v = ""
+                                                        let _ro_rhi_n = 0
+                                                        if len(_roc) > 0
+                                                            match _roc[0]
+                                                                Expr(_rrt, _rrv, _rrn, _rrc, _rrf, _rrl) =>
+                                                                    _ro_rhi_v = _rrv
+                                                                    _ro_rhi_n = _rrn
+                                                        let _ro_rhi = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "const_int", _ro_rhi, ir_type_int(), [], _ro_rhi_v, _ro_rhi_n)
+                                                        let _ro_rle = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "le", _ro_rle, ir_type_int(), [subject, _ro_rhi], "<=", 0)
+                                                        let _ro_ra = ir_fresh_reg(b)
+                                                        ir_emit_inst(b, "and", _ro_ra, ir_type_int(), [_ro_rge, _ro_rle], "and", 0)
+                                                        ir_finish_block(b, IrInst("branch", "", ir_type_void(), [_ro_ra, _ro_fail], _ro_ok, 0, "pure", b.ir_cur_line))
+                                                    else
+                                                        ir_finish_block(b, IrInst("goto", "", ir_type_void(), [], _ro_ok, 0, "pure", b.ir_cur_line))
+                                                    if _ro_i + 1 < len(pchildren)
+                                                        ir_start_block(b, _ro_fail)
+                                            _ro_i = _ro_i + 1
                                         ir_start_block(b, arm_labels[arm_idx])
                                     else
                                         if arm_idx > 0
@@ -9364,7 +9651,10 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
             if tag == "binop"
                 let left = ti_infer_expr(st, children[0])
                 let right = ti_infer_expr(st, children[1])
-                if value == "+" or value == "-" or value == "*" or value == "/" or value == "%" or value == "**"
+                if value == "+" or value == "-" or value == "/" or value == "%" or value == "**"
+                    ti_constrain(st, left, right, eline)
+                    return left
+                if value == "*"
                     ti_constrain(st, left, right, eline)
                     return left
                 if value == "==" or value == "!=" or value == "<" or value == ">" or value == "<=" or value == ">="
@@ -9966,6 +10256,13 @@ fn ti_infer_pattern(st: TiState, pat: Expr, expected: NType)
                 ti_constrain(st, expected, nt_int(), eline)
             else if tag == "pat_str"
                 ti_constrain(st, expected, nt_string(), eline)
+            else if tag == "pat_range"
+                ti_constrain(st, expected, nt_int(), eline)
+            else if tag == "pat_or"
+                let _ori = 0
+                while _ori < len(children)
+                    ti_infer_pattern(st, children[_ori], expected)
+                    _ori = _ori + 1
             else if tag == "pat_ctor"
                 let pc_w = ti_walk(st, expected)
                 // Built-in Result/Option sum-match: the subject is a Sum and the
@@ -12592,7 +12889,8 @@ fn ire_emit_terminator(e: IrEmitter, term: IrInst)
                 if ire_is_loop_header(value) == 1
                     prof_hint = ", !prof !90"
                 if cond_cmp == ".br"
-                    let cond_cmp2 = "%br_" + value
+                    let cond_cmp2 = "%br_" + value + str(e.ire_tc)
+                    e.ire_tc = e.ire_tc + 1
                     ire_indent(e, cond_cmp2 + " = icmp ne i64 " + args[0] + ", 0")
                     ire_indent(e, "br i1 " + cond_cmp2 + ", label %" + value + ", label %" + args[1] + prof_hint)
                 else

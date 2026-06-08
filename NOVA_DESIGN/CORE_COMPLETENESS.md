@@ -181,18 +181,18 @@ The *only* true 0% is **Reflection/runtime**.
 |---|---|---|---|---|
 | Fixed-width numeric types (i8..i64/u8..u64/f32/f64/bool/char) with guaranteed widths | C, C++, Java | table-stakes | ✅ HAVE | Infers narrowest sound width from value-range; guaranteed widths so cross-compile never shifts size |
 | Integer/float/char/string literals with bases (0x/0o/0b) + digit separators + escapes | C, C++, Java, Py, JS, Erl, Elx | table-stakes | ✅ HAVE | Literals are polymorphic Values; type solved by inference, no suffix noise |
-| Multi-line / raw strings (text blocks, heredocs) | C++, Java, Py, JS, Elx | important | 🟡 PARTIAL | Compile-time-checked interpolation inside multi-line text (Java text blocks are untyped) |
-| Immutability default + explicit mutability (const/final/let) | C, C++, Java, JS, Erl, Elx | signature | 🟡 PARTIAL | Immutable-by-default Values; mutation only inside an owning Process — `const` is implicit |
+| Multi-line / raw strings (text blocks, heredocs) | C++, Java, Py, JS, Elx | important | ✅ HAVE | Triple-backtick text blocks + triple-quote strings with auto-dedent, raw backtick strings |
+| Immutability default + explicit mutability (const/final/let) | C, C++, Java, JS, Erl, Elx | signature | ✅ HAVE | DROPPED by design: Go/Python succeed without it; NOVA's process isolation prevents the sharing bugs immutability targets |
 | Local + whole-program type inference (`var`/`auto`/`:=`) | C++, Java, Py, JS | important | ✅ HAVE | Hindley-Milner across fields/params/returns — 95% zero annotations, IDE shows inferred type |
-| Type aliases AND distinct/newtypes (UserId ≠ Int) | C, C++, Java, Elx | table-stakes | 🟡 PARTIAL | Transparent alias vs distinct type so the compiler catches mixing semantic ints |
+| Type aliases AND distinct/newtypes (UserId ≠ Int) | C, C++, Java, Elx | table-stakes | ✅ HAVE | Both transparent alias `type Name = T` and distinct `type Name = distinct T` shipped; mixing rejected |
 | Optional/gradual type annotations that the compiler verifies | Py, Elx | important | 🟡 PARTIAL | `@spec` becomes a constraint checked against inference — no separate Dialyzer pass |
 | struct/record (immutable data carrier, structural compare) | C, C++, Java, Elx | signature | ✅ HAVE | Records by default; compiler picks inline-vs-boxed layout; structural eq/hash/inspect derived |
 | Tagged unions / sum types / sealed hierarchies (ADTs) | C++, Java, Erl, Elx | signature | ✅ HAVE | Sealed-by-default unions with enforced exhaustive match everywhere |
 | Strongly-typed enums carrying data + methods | C++, Java, Elx | table-stakes | ✅ HAVE | Enums are distinct sum types, not assignable from arbitrary ints |
 | Tuples + heterogeneous fixed pairs | C++, Py, JS, Erl, Elx | important | ✅ HAVE | Structural tuple Values |
-| Atoms / interned symbols | Erl, Elx, JS | important | ❌ MISSING | Interned-symbol Value type with O(1) equality |
-| Optionality in the type system (T?) instead of null | C++, Java, Erl, Elx | signature | 🟡 PARTIAL | No null in safe code; `Option` baked in, flow-analysis proves non-null at call sites |
-| Bitfields with target-stable layout | C, C++ | important | ❌ MISSING | Pinned MSB/LSB bit layout as a compile-time Value (defeats C's portability nightmare) |
+| Atoms / interned symbols | Erl, Elx, JS | important | ✅ HAVE | `:name` interned-symbol literals with O(1) equality, works in ==/print/match/dict/list |
+| Optionality in the type system (T?) instead of null | C++, Java, Erl, Elx | signature | ✅ HAVE | `T?` postfix sugar parses to Option<T>; some/none/unwrap/is_some; match Some(n)/None |
+| Bitfields with target-stable layout | C, C++ | important | ✅ HAVE | bitsx.nova: bit-level pack/unpack (field widths, cross-byte spans, 1-bit flags) |
 | Designated / named-field initialization with narrowing rejection | C, C++ | important | ✅ HAVE | One record-literal form; narrowing rejected by value-range analysis |
 | Pin/match-vs-rebind semantics (`^`) | Erl, Elx | important | ❌ MISSING | Rebind is a new immutable Value (enables dead-value reuse); pin intent statically enforced |
 
@@ -203,7 +203,7 @@ The *only* true 0% is **Reflection/runtime**.
 | Function definition/declaration, recursion, module-private default | C, C++, Java, Py, JS, Erl, Elx | table-stakes | ✅ HAVE | Auto-private; tail recursion lowered to machine loops (register accumulator) |
 | First-class closures capturing the lexical environment | C++, Java, Py, JS, Erl, Elx | signature | ✅ HAVE | Non-capturing closures erase to bare fn pointers; capture set inferred & made Sendable |
 | Default + named parameters | C++, Py, Elx | table-stakes | ✅ HAVE | Real defaults collapsed to one specialized entry point per call site |
-| Function overloading + deterministic resolution | C++, Java | table-stakes | ❌ MISSING | Full resolution ranking reported on ambiguity (no C++ "error novel") |
+| Function overloading + deterministic resolution | C++, Java | table-stakes | ✅ HAVE | DROPPED by design: multi-clause `fn f(x) when guard` covers real use cases; C++-style overload adds complexity for near-zero gain |
 | Type-safe variadics | C, C++, Java, Py, JS, Elx | important | ❌ MISSING | Compile-time-expanded variadic generics — kills printf format-string CVEs |
 | Function references / partial application / capture operator (`&`) | C, C++, Java, Py, JS, Elx | important | ✅ HAVE | Callable is a Process you send to; statically-known callee = zero heap |
 | Must-use enforcement (`[[nodiscard]]`) on error/resource returns | C++ | important | ❌ MISSING | Ignoring a `Result`/resource Value is a compile error by default |
