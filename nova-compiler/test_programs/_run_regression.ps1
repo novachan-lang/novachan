@@ -9,7 +9,7 @@ $tests = @(
   'map_filter_test','bitwise_test','regex_test','bytes_test','closure_ir_test',
   'import_multi_test','error_test','tco_test','enum_full_test',
   'for_else_test','spread_test','for_destructure_test','for_guard_test',
-  'unless_until_test','operator_repeat_test'
+  'unless_until_test','operator_repeat_test','items_test'
 )
 
 $pass = 0; $fail = 0; $failNames = @()
