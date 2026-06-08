@@ -8885,6 +8885,20 @@ int64_t nova_rt_try_unwrap_value(int64_t handle) {
     return handle;
 }
 
+int64_t nova_rt_wrap_error_context(int64_t result_handle, int64_t fn_name, int64_t line_num) {
+    NovaResult* r = (NovaResult*)(uintptr_t)result_handle;
+    if (r->tag != 1) return result_handle;
+    const char* old_msg = (const char*)(uintptr_t)r->value;
+    const char* fname   = (const char*)(uintptr_t)fn_name;
+    size_t needed = strlen(fname) + 32 + strlen(old_msg);
+    char* m = malloc(needed + 1);
+    if (!m) return result_handle;
+    snprintf(m, needed + 1, "in %s at line %lld: %s", fname, (long long)line_num, old_msg);
+    NovaTaskState* t = nova_cur();
+    t->error_msg = (int64_t)(uintptr_t)m;
+    return nova_result_pack(1, (int64_t)(uintptr_t)m);
+}
+
 int64_t nova_rt_result_map(int64_t handle, int64_t closure) {
     NovaResult* r = (NovaResult*)(uintptr_t)handle;
     if (r->tag != 0) return handle;
