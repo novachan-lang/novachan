@@ -5490,7 +5490,13 @@ int64_t nova_rt_fabs(int64_t x)  { return f2i(fabs(i2f(x))); }
 int64_t nova_rt_fmod(int64_t x, int64_t y) { return f2i(fmod(i2f(x), i2f(y))); }
 int64_t nova_rt_round(int64_t x) { return f2i(round(i2f(x))); }
 int64_t nova_rt_sqrt(int64_t x)  { return f2i(sqrt(i2f(x))); }
-int64_t nova_rt_pow(int64_t x, int64_t y) { return f2i(pow(i2f(x), i2f(y))); }
+int64_t nova_rt_pow(int64_t x, int64_t y) {
+    uint64_t ux = (uint64_t)x, uy = (uint64_t)y;
+    int x_is_int = (ux < 0x0010000000000000ULL) || (ux > 0xFFF0000000000000ULL);
+    int y_is_int = (uy < 0x0010000000000000ULL) || (uy > 0xFFF0000000000000ULL);
+    if (x_is_int && y_is_int) return nova_rt_int_pow(x, y);
+    return f2i(pow(i2f(x), i2f(y)));
+}
 int64_t nova_rt_sinh(int64_t x)  { return f2i(sinh(i2f(x))); }
 int64_t nova_rt_cosh(int64_t x)  { return f2i(cosh(i2f(x))); }
 int64_t nova_rt_tanh(int64_t x)  { return f2i(tanh(i2f(x))); }
