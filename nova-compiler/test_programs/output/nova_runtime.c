@@ -5488,7 +5488,7 @@ int64_t nova_rt_log10(int64_t x) { return f2i(log10(i2f(x))); }
 int64_t nova_rt_exp(int64_t x)   { return f2i(exp(i2f(x))); }
 int64_t nova_rt_fabs(int64_t x)  { return f2i(fabs(i2f(x))); }
 int64_t nova_rt_fmod(int64_t x, int64_t y) { return f2i(fmod(i2f(x), i2f(y))); }
-int64_t nova_rt_round(int64_t x) { return f2i(round(i2f(x))); }
+int64_t nova_rt_round(int64_t x) { return (int64_t)round(i2f(x)); }
 int64_t nova_rt_sqrt(int64_t x)  { return f2i(sqrt(i2f(x))); }
 int64_t nova_rt_pow(int64_t x, int64_t y) {
     uint64_t ux = (uint64_t)x, uy = (uint64_t)y;
