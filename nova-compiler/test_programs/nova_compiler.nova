@@ -5437,6 +5437,11 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_list_append_bbox(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_box_bool(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_unbox(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_unbox_elem(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_lt(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_le(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_gt(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_ge(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_get(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_len(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_dict_create() nounwind")
@@ -12589,8 +12594,14 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 if lt == "str" or rty == "str"
                     rt[dest] = "int"
                     return IrInst(op, dest, ir_type_str(), args, value, num, effect, line)
+                if lt == "int" and rty == "int"
+                    rt[dest] = "int"
+                    return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
+                // val/any operand(s): a container element or any value may be a boxed
+                // float — a raw icmp would compare box pointers. Route to the box-aware
+                // nova_rt_lt/le/gt/ge. Statically-int comparisons above stay icmp (fast).
                 rt[dest] = "int"
-                return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
+                return IrInst(op, dest, ir_type_any(), args, value, num, effect, line)
             else if op == "not" or op == "and" or op == "or"
                 rt[dest] = "int"
                 return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
@@ -12712,14 +12723,27 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         if contains(st, lslot)
                             let vt = ir_reg_type(rt, args[1])
                             if vt == "int"
-                                if st[lslot] == "list" or st[lslot] == "intlist"
-                                    st[lslot] = "intlist"
-                                if dest != ""
-                                    rt[dest] = "intlist"
+                                // Heterogeneity is STICKY: once a non-int has been
+                                // appended (float/bool/str/...), the list is permanently
+                                // "list" — a later int push must NOT re-promote it to the
+                                // intlist (raw int C-array) fast path, or the earlier boxed
+                                // float elements would be read with the int type and a box
+                                // pointer would render as a giant int. (Value-model overhaul.)
+                                let lhet = contains(st, "@het@" + lslot) and st["@het@" + lslot] == "1"
+                                if lhet
+                                    st[lslot] = "list"
+                                    if dest != ""
+                                        rt[dest] = "list"
+                                else
+                                    if st[lslot] == "list" or st[lslot] == "intlist"
+                                        st[lslot] = "intlist"
+                                    if dest != ""
+                                        rt[dest] = "intlist"
                                 return inst
                             else
                                 if st[lslot] == "intlist"
                                     st[lslot] = "list"
+                                st["@het@" + lslot] = "1"
                                 rt[args[0]] = "list"
                                 if dest != ""
                                     rt[dest] = "list"
@@ -12952,12 +12976,102 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 return IrInst(op, dest, copy_itype, args, value, num, effect, line)
             return inst
 
-fn ir_infer_block(rt: dict, st: dict, frt: dict, block: IrBlock) -> IrBlock
+fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> IrBlock
     match block
         IrBlock(label, insts, terminator) =>
             let new_insts = []
             for inst in insts
-                push(new_insts, ir_infer_one(rt, st, frt, inst))
+                let ti = ir_infer_one(rt, st, frt, inst)
+                // Value-model widen-boxing: a float-typed argument flowing into an
+                // `any` parameter must be boxed (NovaBox float), else its raw double
+                // bits are read as an int / a wild pointer at the callee. fpt[callee]
+                // carries the call-site-inferred param kind: absent or "any" => any.
+                // Externs and runtime calls are not in fpt, so they are never boxed
+                // (they take raw doubles by ABI). See VALUE_MODEL_OVERHAUL.md.
+                let handled = false
+                match ti
+                    IrInst(op, dest, typ, args, value, num, effect, line) =>
+                        if op == "call" and contains(fpt, value) and len(args) > 0
+                            let pm = fpt[value]
+                            let new_args = []
+                            let ai = 0
+                            for a in args
+                                let do_box = false
+                                if ir_reg_type(rt, a) == "float"
+                                    let akey = str(ai)
+                                    if not contains(pm, akey)
+                                        do_box = true
+                                    else if pm[akey] == "any"
+                                        do_box = true
+                                if do_box
+                                    let bxc = 0
+                                    if contains(rt, "@wbox@")
+                                        bxc = rt["@wbox@"]
+                                    let bxr = "%wbox" + str(bxc)
+                                    rt["@wbox@"] = bxc + 1
+                                    push(new_insts, IrInst("call", bxr, ir_type_any(), [a], "nova_rt_box_float", 0, "pure", line))
+                                    push(new_args, bxr)
+                                else
+                                    push(new_args, a)
+                                ai = ai + 1
+                            push(new_insts, IrInst(op, dest, typ, new_args, value, num, effect, line))
+                            handled = true
+                        else if op == "call" and (value == "nova_rt_channel_send" or value == "nova_rt_channel_send_move") and len(args) >= 2
+                            // Channel payloads are `any`; box a float payload so recv()
+                            // reads it back as a float, not raw bits.
+                            if ir_reg_type(rt, args[1]) == "float"
+                                let bxc = 0
+                                if contains(rt, "@wbox@")
+                                    bxc = rt["@wbox@"]
+                                let bxr = "%wbox" + str(bxc)
+                                rt["@wbox@"] = bxc + 1
+                                push(new_insts, IrInst("call", bxr, ir_type_any(), [args[1]], "nova_rt_box_float", 0, "pure", line))
+                                push(new_insts, IrInst(op, dest, typ, [args[0], bxr], value, num, effect, line))
+                                handled = true
+                        else if (op == "add" or op == "sub" or op == "mul" or op == "div" or op == "mod") and len(args) == 2
+                            // Dynamic arithmetic (result type "any" — one operand is
+                            // val/any) reads each operand via nova_to_double. A RAW float
+                            // operand (statically "float") must be boxed so it is recognized
+                            // as a float — the magnitude heuristic that used to recover raw
+                            // float bits is gone. A typed float*float op stays "float" (real
+                            // fmul, never reaches here). See VALUE_MODEL_OVERHAUL.md.
+                            let arith_dyn = false
+                            match typ
+                                IrType(atk, _, _, _) =>
+                                    if atk == "any"
+                                        arith_dyn = true
+                            if arith_dyn
+                                let a_args = []
+                                for aa in args
+                                    if ir_reg_type(rt, aa) == "float"
+                                        let abc = 0
+                                        if contains(rt, "@wbox@")
+                                            abc = rt["@wbox@"]
+                                        let abr = "%wbox" + str(abc)
+                                        rt["@wbox@"] = abc + 1
+                                        push(new_insts, IrInst("call", abr, ir_type_any(), [aa], "nova_rt_box_float", 0, "pure", line))
+                                        push(a_args, abr)
+                                    else
+                                        push(a_args, aa)
+                                push(new_insts, IrInst(op, dest, typ, a_args, value, num, effect, line))
+                                handled = true
+                        else if op == "slot_store" and len(args) == 1 and contains(st, value) and st[value] == "any"
+                            // Storing a RAW float into an `any`-typed slot (e.g. a loop-
+                            // carried accumulator that widened to "any", or an explicit
+                            // `let x: any = 1.5`) must box it, so a later load reads a float,
+                            // not raw bits. Float-typed slots store raw (fast path); only
+                            // "any" slots box. See VALUE_MODEL_OVERHAUL.md.
+                            if ir_reg_type(rt, args[0]) == "float"
+                                let sbc = 0
+                                if contains(rt, "@wbox@")
+                                    sbc = rt["@wbox@"]
+                                let sbr = "%wbox" + str(sbc)
+                                rt["@wbox@"] = sbc + 1
+                                push(new_insts, IrInst("call", sbr, ir_type_any(), [args[0]], "nova_rt_box_float", 0, "pure", line))
+                                push(new_insts, IrInst(op, dest, typ, [sbr], value, num, effect, line))
+                                handled = true
+                if not handled
+                    push(new_insts, ti)
             IrBlock(label, new_insts, terminator)
 
 fn ir_infer_types(func: IrFunction, frt: dict, fpt: dict) -> IrFunction
@@ -12999,7 +13113,7 @@ fn ir_infer_types(func: IrFunction, frt: dict, fpt: dict) -> IrFunction
                 let rt = {}
                 new_blocks = []
                 for block in blocks
-                    push(new_blocks, ir_infer_block(rt, st, frt, block))
+                    push(new_blocks, ir_infer_block(rt, st, frt, fpt, block))
                 converged = true
                 let i = 0
                 while i < len(old_keys)
@@ -13007,6 +13121,13 @@ fn ir_infer_types(func: IrFunction, frt: dict, fpt: dict) -> IrFunction
                         if st[old_keys[i]] != old_vals[i]
                             converged = false
                     i = i + 1
+                // NEW slots added this pass (e.g. a loop-carried accumulator whose
+                // type only widens to "any" once the back-edge store is seen) mean the
+                // types have NOT settled — run another pass so the loop body is re-typed
+                // with the converged slot type, else codegen emits stale per-pass types
+                // (a float accumulator that is actually boxed -> double-box at runtime).
+                if len(keys(st)) != len(old_keys)
+                    converged = false
             IrFunction(name, new_params, ret_type, new_blocks, type_params, is_extern)
 
 fn ir_analyze_return_type(func: IrFunction, frt: dict, fpt: dict) -> string
@@ -13032,7 +13153,7 @@ fn ir_analyze_return_type(func: IrFunction, frt: dict, fpt: dict) -> string
                 pass_n = pass_n + 1
                 rt = {}
                 for block in blocks
-                    ir_infer_block(rt, st, frt, block)
+                    ir_infer_block(rt, st, frt, {}, block)
             for block in blocks
                 match block
                     IrBlock(label, insts, terminator) =>
@@ -13062,7 +13183,7 @@ fn ir_collect_param_types(all_fns: list, frt: dict) -> dict
                                         else
                                             st[pname] = "any"
                     for block in fblocks
-                        ir_infer_block(rt, st, frt, block)
+                        ir_infer_block(rt, st, frt, {}, block)
                     for block in fblocks
                         match block
                             IrBlock(label, insts, terminator) =>
@@ -13529,6 +13650,8 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, sc + " = call i32 @strcmp(ptr " + p0 + ", ptr " + p1 + ")")
                             ire_indent(e, tmp + " = icmp slt i32 " + sc + ", 0")
                             ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else if tk == "any"
+                            ire_indent(e, dest + " = call i64 @nova_rt_lt(i64 " + args[0] + ", i64 " + args[1] + ")")
                         else
                             let tmp = dest + ".cmp"
                             ire_indent(e, tmp + " = icmp slt i64 " + args[0] + ", " + args[1])
@@ -13560,6 +13683,8 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, sc + " = call i32 @strcmp(ptr " + p0 + ", ptr " + p1 + ")")
                             ire_indent(e, tmp + " = icmp sle i32 " + sc + ", 0")
                             ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else if tk == "any"
+                            ire_indent(e, dest + " = call i64 @nova_rt_le(i64 " + args[0] + ", i64 " + args[1] + ")")
                         else
                             let tmp = dest + ".cmp"
                             ire_indent(e, tmp + " = icmp sle i64 " + args[0] + ", " + args[1])
@@ -13591,6 +13716,8 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, sc + " = call i32 @strcmp(ptr " + p0 + ", ptr " + p1 + ")")
                             ire_indent(e, tmp + " = icmp sgt i32 " + sc + ", 0")
                             ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else if tk == "any"
+                            ire_indent(e, dest + " = call i64 @nova_rt_gt(i64 " + args[0] + ", i64 " + args[1] + ")")
                         else
                             let tmp = dest + ".cmp"
                             ire_indent(e, tmp + " = icmp sgt i64 " + args[0] + ", " + args[1])
@@ -13622,6 +13749,8 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, sc + " = call i32 @strcmp(ptr " + p0 + ", ptr " + p1 + ")")
                             ire_indent(e, tmp + " = icmp sge i32 " + sc + ", 0")
                             ire_indent(e, dest + " = zext i1 " + tmp + " to i64")
+                        else if tk == "any"
+                            ire_indent(e, dest + " = call i64 @nova_rt_ge(i64 " + args[0] + ", i64 " + args[1] + ")")
                         else
                             let tmp = dest + ".cmp"
                             ire_indent(e, tmp + " = icmp sge i64 " + args[0] + ", " + args[1])
@@ -13883,7 +14012,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         ire_indent(e, fi + " = select i1 " + neg + ", i64 " + adj + ", i64 " + args[1])
                         ire_indent(e, ep + " = getelementptr i64, ptr " + dp + ", i64 " + fi)
                     ire_indent(e, dest + ".lv = load i64, ptr " + ep + ", align 8, !tbaa !4")
-                    ire_indent(e, dest + " = call i64 @nova_rt_unbox(i64 " + dest + ".lv)")
+                    ire_indent(e, dest + " = call i64 @nova_rt_unbox_elem(i64 " + dest + ".lv)")
                 else if target_kind == "dict"
                     ire_indent(e, dest + " = call i64 @nova_rt_dict_get(i64 " + args[0] + ", i64 " + args[1] + ")")
                 else
@@ -14730,6 +14859,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_list_append_bbox(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_box_bool(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_unbox(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_unbox_elem(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_lt(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_le(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_gt(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_ge(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_list_get(i64, i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_list_len(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_dict_create() nounwind")

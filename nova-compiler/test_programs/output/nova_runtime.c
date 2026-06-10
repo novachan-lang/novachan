@@ -566,6 +566,22 @@ int64_t nova_rt_unbox(int64_t handle) {
     return handle;
 }
 
+/* Container element read (list_get/dict_get/inline index): a FLOAT box is kept
+   BOXED so the element preserves its float type through the `any` value slot —
+   str()/print()/float()/dynamic-arith are all box-aware, so a boxed float renders
+   and computes correctly, while a raw int stays unambiguously an int (the value-
+   model overhaul deletes the magnitude heuristic that used to recover unboxed
+   float bits). A BOOL box is still unboxed to raw 0/1 so existing truthiness and
+   bool handling are unchanged (no regression). See VALUE_MODEL_OVERHAUL.md. */
+int64_t nova_rt_unbox_elem(int64_t handle) {
+    if (nova_is_box(handle)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)handle;
+        if (bx->kind == NOVA_BOX_FLOAT) return handle;  /* keep float boxed */
+        return bx->payload;                              /* bool -> raw 0/1 */
+    }
+    return handle;
+}
+
 /* Convert a NOVA container element to a double. An element may be a boxed float
    (payload = IEEE-754 bits), a boxed bool (payload 0/1), a raw small int (the int
    value itself), or raw IEEE-754 float bits (a large bit pattern). This mirrors the
@@ -922,7 +938,7 @@ int64_t nova_rt_list_get(int64_t handle, int64_t index) {
         nova_set_error(buf);
         return 0;
     }
-    return nova_rt_unbox(list->data[index]);
+    return nova_rt_unbox_elem(list->data[index]);
 }
 
 int64_t nova_rt_list_set(int64_t handle, int64_t index, int64_t value) {
@@ -1612,7 +1628,7 @@ int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
         if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0)
-            return nova_rt_unbox(d->vals[ei]);
+            return nova_rt_unbox_elem(d->vals[ei]);
         slot = (slot + 1) & (d->idx_cap - 1);
     }
     return 0;
@@ -2955,11 +2971,9 @@ int64_t nova_rt_any_to_str(int64_t val) {
                 unsigned char c = *(unsigned char*)ptr;
                 if (c == 0 || (c >= 0x20 && c < 0x7F)) return val;
             }
-            if (val < -(1LL << 52) || val > (1LL << 52)) {
-                uint64_t exp = ((uint64_t)val >> 52) & 0x7FF;
-                if (exp > 0 && exp < 0x7FF)
-                    return nova_rt_float_to_str(val);
-            }
+            /* Value-model overhaul: a raw (unboxed) scalar in an `any` slot is
+               UNAMBIGUOUSLY an int — floats are always boxed at the widen point.
+               The old magnitude heuristic here misread large integers as floats. */
             return nova_rt_int_to_str(val);
     }
 }
@@ -3006,16 +3020,18 @@ int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {
 }
 
 static inline int nova_is_likely_float(int64_t v) {
-    /* A boxed scalar is authoritative: float box -> yes, bool box -> no.
-       Falls back to the magnitude heuristic only for raw (unboxed) values. */
+    /* Box tag is the SOLE authority: float box -> yes, anything else -> no.
+       The old magnitude heuristic (|v| > 2^52 with a normal IEEE exponent ->
+       "float") was UNSOUND: a large integer (hash, snowflake id, bitset) whose
+       bit pattern has a normal double exponent was misread as a float. With the
+       value-model overhaul (floats ALWAYS boxed at every `any`-widen point), a
+       raw int64 in an `any` context is unambiguously an int, so the heuristic is
+       not only unnecessary but harmful. See NOVA_DESIGN/VALUE_MODEL_OVERHAUL.md. */
     if (nova_is_box(v)) {
         NovaBox* bx = (NovaBox*)(uintptr_t)v;
         return bx->kind == NOVA_BOX_FLOAT ? 1 : 0;
     }
-    if (v == 0) return 0;
-    if (v > -(1LL << 52) && v < (1LL << 52)) return 0;
-    uint64_t exp = ((uint64_t)v >> 52) & 0x7FF;
-    return (exp > 0 && exp < 0x7FF);
+    return 0;
 }
 
 static inline double nova_to_double(int64_t v) {
@@ -3090,6 +3106,38 @@ int64_t nova_rt_print_float(int64_t bits) {
     puts((const char*)(uintptr_t)s);
     return 0;
 }
+
+/* Box-aware ordering comparison for DYNAMIC (any-typed) operands — used by
+   lt/le/gt/ge when an operand is a container element / any value that may be a
+   boxed float, a string, or an int. Returns -1 (a<b), 0 (a==b), 1 (a>b).
+   Statically-typed int/float/str comparisons use icmp/fcmp/strcmp directly and
+   never reach here. See NOVA_DESIGN/VALUE_MODEL_OVERHAUL.md. */
+static int nova_rt_cmp(int64_t a, int64_t b) {
+    int af = nova_is_box(a) && ((NovaBox*)(uintptr_t)a)->kind == NOVA_BOX_FLOAT;
+    int bf = nova_is_box(b) && ((NovaBox*)(uintptr_t)b)->kind == NOVA_BOX_FLOAT;
+    if (af || bf) {
+        double da = nova_to_double(a), db = nova_to_double(b);
+        return (da < db) ? -1 : ((da > db) ? 1 : 0);
+    }
+    void* pa = (void*)(uintptr_t)a;
+    void* pb = (void*)(uintptr_t)b;
+    NovaMemTag ta = nova_mem_find_tag(pa);
+    NovaMemTag tb = nova_mem_find_tag(pb);
+    int a_str = (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
+                 ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa)));
+    int b_str = (tb == NOVA_MEM_RAW || tb == NOVA_MEM_FAT_STR ||
+                 ((uint64_t)b > 0x10000 && tb == (NovaMemTag)-1 && nova_is_readable_str(pb)));
+    if (a_str && b_str) {
+        int c = strcmp((const char*)pa, (const char*)pb);
+        return (c < 0) ? -1 : ((c > 0) ? 1 : 0);
+    }
+    int64_t ua = nova_rt_unbox(a), ub = nova_rt_unbox(b);  /* bool->0/1, int passthrough */
+    return (ua < ub) ? -1 : ((ua > ub) ? 1 : 0);
+}
+int64_t nova_rt_lt(int64_t a, int64_t b) { return nova_rt_cmp(a, b) <  0 ? 1 : 0; }
+int64_t nova_rt_le(int64_t a, int64_t b) { return nova_rt_cmp(a, b) <= 0 ? 1 : 0; }
+int64_t nova_rt_gt(int64_t a, int64_t b) { return nova_rt_cmp(a, b) >  0 ? 1 : 0; }
+int64_t nova_rt_ge(int64_t a, int64_t b) { return nova_rt_cmp(a, b) >= 0 ? 1 : 0; }
 
 int64_t nova_rt_eq(int64_t a, int64_t b) {
     /* Unbox boxed scalars (NovaBox float/bool) so two equal floats compare equal
