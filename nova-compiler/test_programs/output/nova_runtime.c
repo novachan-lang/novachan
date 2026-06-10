@@ -4281,6 +4281,152 @@ static int nova_sched_poll_io(int timeout_ms) {
     return woken;
 }
 
+/* ── Blocking-offload pool (DNS now; file I/O / FFI later) ───────────────────
+   Some operations can't be made pollable — getaddrinfo() has no FD to register on
+   the netpoller. Running one on a carrier would block ALL that carrier's green
+   tasks. So a green task submits the blocking op to a small OS-thread pool, PARKS,
+   and the CARRIER (never the offload thread — that would be the cross-thread
+   fiber-resume race, F1) re-enqueues it once done. Zero coloring: tcp_connect to a
+   hostname / dns_resolve keep their signatures; the runtime does the work. */
+typedef struct NovaOffloadJob {
+    void  (*fn)(void*);             /* the blocking op */
+    void*   arg;                    /* its args + result slot (on the parked green stack) */
+    int     done;                   /* set (release) by the worker; read (acquire) by the carrier */
+    NovaSchedTask* task;            /* the parked green task to re-enqueue on completion */
+    struct NovaOffloadJob* qnext;   /* offload work-queue link (worker side) */
+    struct NovaOffloadJob* wnext;   /* carrier waiter-list link (carrier side) */
+} NovaOffloadJob;
+
+#define NOVA_OFFLOAD_THREADS 4
+static NovaOffloadJob* nova_offload_qhead = NULL;
+static NovaOffloadJob* nova_offload_qtail = NULL;
+static NovaOffloadJob* nova_offload_waiters = NULL;   /* carrier-local: green tasks awaiting completion */
+static int nova_offload_started = 0;
+#ifdef _WIN32
+static CRITICAL_SECTION   nova_offload_lock;
+static CONDITION_VARIABLE nova_offload_cv;
+#else
+static pthread_mutex_t nova_offload_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  nova_offload_cv  = PTHREAD_COND_INITIALIZER;
+#endif
+
+#ifdef _WIN32
+static DWORD WINAPI nova_offload_worker(LPVOID unused) {
+#else
+static void* nova_offload_worker(void* unused) {
+#endif
+    (void)unused;
+    for (;;) {
+#ifdef _WIN32
+        EnterCriticalSection(&nova_offload_lock);
+        while (!nova_offload_qhead) SleepConditionVariableCS(&nova_offload_cv, &nova_offload_lock, INFINITE);
+        NovaOffloadJob* job = nova_offload_qhead;
+        nova_offload_qhead = job->qnext; if (!nova_offload_qhead) nova_offload_qtail = NULL;
+        LeaveCriticalSection(&nova_offload_lock);
+#else
+        pthread_mutex_lock(&nova_offload_lock);
+        while (!nova_offload_qhead) pthread_cond_wait(&nova_offload_cv, &nova_offload_lock);
+        NovaOffloadJob* job = nova_offload_qhead;
+        nova_offload_qhead = job->qnext; if (!nova_offload_qhead) nova_offload_qtail = NULL;
+        pthread_mutex_unlock(&nova_offload_lock);
+#endif
+        job->fn(job->arg);                              /* the blocking op (writes its result slot) */
+        __atomic_store_n(&job->done, 1, __ATOMIC_RELEASE);  /* publish result, then done */
+    }
+#ifndef _WIN32
+    return NULL;
+#endif
+}
+
+static void nova_offload_ensure(void) {
+    if (nova_offload_started) return;
+    nova_offload_started = 1;
+#ifdef _WIN32
+    InitializeCriticalSection(&nova_offload_lock);
+    InitializeConditionVariable(&nova_offload_cv);
+    for (int i = 0; i < NOVA_OFFLOAD_THREADS; i++) {
+        HANDLE h = CreateThread(NULL, 0, nova_offload_worker, NULL, 0, NULL);
+        if (h) CloseHandle(h);
+    }
+#else
+    for (int i = 0; i < NOVA_OFFLOAD_THREADS; i++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, nova_offload_worker, NULL) == 0) pthread_detach(th);
+    }
+#endif
+}
+
+/* Submit a blocking op + PARK the current green task until it completes. The
+   job/arg live on the green task's (preserved) fiber stack; the worker writes the
+   result there while the task is parked, then publishes `done`; the carrier scans
+   and re-enqueues. Outside a green task, runs synchronously (no pool). */
+static void nova_offload_run(NovaOffloadJob* job) {
+    if (!nova_sched_in_task()) { job->fn(job->arg); job->done = 1; return; }
+    nova_offload_ensure();
+    job->task = nova_sched_current;
+    job->done = 0;
+    /* Register on the carrier waiter list (carrier-thread-local — the green task
+       runs ON the carrier, so this is not concurrent with the carrier's scan)
+       BEFORE enqueueing, so the carrier sees it the instant we yield. */
+    job->wnext = nova_offload_waiters;
+    nova_offload_waiters = job;
+#ifdef _WIN32
+    EnterCriticalSection(&nova_offload_lock);
+    job->qnext = NULL;
+    if (nova_offload_qtail) nova_offload_qtail->qnext = job; else nova_offload_qhead = job;
+    nova_offload_qtail = job;
+    WakeConditionVariable(&nova_offload_cv);
+    LeaveCriticalSection(&nova_offload_lock);
+#else
+    pthread_mutex_lock(&nova_offload_lock);
+    job->qnext = NULL;
+    if (nova_offload_qtail) nova_offload_qtail->qnext = job; else nova_offload_qhead = job;
+    nova_offload_qtail = job;
+    pthread_cond_signal(&nova_offload_cv);
+    pthread_mutex_unlock(&nova_offload_lock);
+#endif
+    nova_sched_current->status = 2;   /* PARKED */
+    nova_rt_fiber_yield();             /* -> carrier; resumed after done==1 */
+}
+
+/* Carrier-side scan: re-enqueue green tasks whose offload job has completed.
+   Runs ONLY on the carrier thread, so it never resumes a fiber from another
+   thread. The job memory is on the resumed task's stack — freed by that task. */
+static int nova_sched_check_offload(void) {
+    int woken = 0;
+    NovaOffloadJob** pp = &nova_offload_waiters;
+    while (*pp) {
+        NovaOffloadJob* j = *pp;
+        if (__atomic_load_n(&j->done, __ATOMIC_ACQUIRE)) {
+            *pp = j->wnext;
+            j->task->status = 0;
+            nova_rq_push(j->task);
+            woken++;
+        } else {
+            pp = &j->wnext;
+        }
+    }
+    return woken;
+}
+
+/* Offloaded getaddrinfo: a green task resolving a HOSTNAME parks on the offload
+   pool instead of blocking its carrier on the blocking resolver. (Connecting to an
+   IP literal resolves instantly, no real DNS.) Non-green callers run synchronously. */
+typedef struct { const char* host; const char* port; struct addrinfo hints; struct addrinfo* res; int err; } NovaDnsJob;
+static void nova_dns_job_fn(void* arg) {
+    NovaDnsJob* d = (NovaDnsJob*)arg;
+    d->err = getaddrinfo(d->host, d->port, &d->hints, &d->res);
+}
+static int nova_offload_getaddrinfo(const char* host, const char* port, const struct addrinfo* hints, struct addrinfo** res) {
+    if (!nova_sched_in_task()) return getaddrinfo(host, port, hints, res);
+    NovaDnsJob dj;
+    dj.host = host; dj.port = port; dj.hints = *hints; dj.res = NULL; dj.err = 0;
+    NovaOffloadJob job; job.fn = nova_dns_job_fn; job.arg = &dj;
+    nova_offload_run(&job);
+    *res = dj.res;
+    return dj.err;
+}
+
 /* Send a value to a channel from the scheduler loop (not inside a green task).
    Direct enqueue + green-waiter wake: a parked green task sits on green_waiters,
    not the condvar, so the normal OS-path send would not wake it. */
@@ -4329,10 +4475,12 @@ int64_t nova_rt_sched_run(void) {
     while (nova_sched_live > 0) {
         nova_sched_wake_sleepers();
         NovaSchedTask* t = nova_rq_pop();
-        if (!t && (nova_io_waiters || nova_sleep_waiters)) {
-            int poll_ms = nova_sleep_waiters ? 1 : 10;
+        if (!t && (nova_io_waiters || nova_sleep_waiters || nova_offload_waiters)) {
+            /* short poll when sleepers or offload jobs are pending (they need a
+               timely re-check); 10ms when only blocking on socket readiness. */
+            int poll_ms = (nova_sleep_waiters || nova_offload_waiters) ? 1 : 10;
             if (nova_io_waiters) nova_sched_poll_io(poll_ms);
-            else { /* only sleep waiters, brief OS sleep to avoid spin */
+            else { /* only sleep/offload waiters, brief OS sleep to avoid spin */
 #ifdef _WIN32
                 Sleep(1);
 #else
@@ -4340,6 +4488,7 @@ int64_t nova_rt_sched_run(void) {
 #endif
             }
             nova_sched_wake_sleepers();
+            nova_sched_check_offload();   /* re-enqueue green tasks whose DNS/offload job finished */
             t = nova_rq_pop();
         }
         if (!t) break;
@@ -6190,7 +6339,7 @@ static int64_t http_request(const char* url, const char* method,
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) { nova_set_error("http: DNS resolution failed"); return nova_http_empty(); }
+    if (nova_offload_getaddrinfo(host, portstr, &hints, &res) != 0 || !res) { nova_set_error("http: DNS resolution failed"); return nova_http_empty(); }
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); nova_set_error("http: socket() failed"); return nova_http_empty(); }
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); nova_set_error("http: connect failed"); return nova_http_empty(); }
@@ -6974,7 +7123,7 @@ int64_t nova_rt_tcp_connect(int64_t host_ptr, int64_t port_val) {
     hints.ai_socktype = SOCK_STREAM;
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+    if (nova_offload_getaddrinfo(host, port_str, &hints, &res) != 0) {
         nova_set_error("tcp_connect: cannot resolve host");
         return -1;
     }
@@ -7264,7 +7413,7 @@ int64_t nova_rt_dns_resolve(int64_t host_ptr) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;        /* IPv4 only */
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res || !res->ai_addr) {
+    if (nova_offload_getaddrinfo(host, NULL, &hints, &res) != 0 || !res || !res->ai_addr) {
         if (res) freeaddrinfo(res);
         return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
     }
@@ -7324,7 +7473,7 @@ int64_t nova_rt_dns_resolve_all(int64_t host_ptr) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;        /* IPv4 only */
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+    if (nova_offload_getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
         if (res) freeaddrinfo(res);
         return list;
     }
