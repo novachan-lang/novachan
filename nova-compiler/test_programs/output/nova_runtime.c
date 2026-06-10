@@ -6984,6 +6984,47 @@ int64_t nova_rt_tcp_connect(int64_t host_ptr, int64_t port_val) {
         nova_set_error("tcp_connect: socket creation failed");
         return -1;
     }
+    /* Green task: non-blocking connect that PARKS on the netpoller during the TCP
+       handshake (the network-RTT part) instead of blocking the carrier — so one
+       carrier can drive many concurrent outbound connections. The socket goes
+       non-blocking; connect() returns EINPROGRESS; we park on POLL_WRITE until the
+       socket is writable (handshake done/failed) and confirm via SO_ERROR. (DNS via
+       getaddrinfo above is still blocking — usually cached/fast; DNS->offload-pool
+       is a further post-v1 refinement. See IMPLICIT_ASYNC_DESIGN.md.) */
+    if (nova_sched_in_task()) {
+        nova_rt_io_set_nonblocking((int64_t)sock);
+        int crc = connect(sock, res->ai_addr, (int)res->ai_addrlen);
+        if (crc != 0) {
+            int inprog;
+#ifdef _WIN32
+            int werr = WSAGetLastError();
+            inprog = (werr == WSAEWOULDBLOCK || werr == WSAEINPROGRESS);
+#else
+            inprog = (errno == EINPROGRESS || errno == EWOULDBLOCK);
+#endif
+            if (!inprog) {
+                NOVA_CLOSE_SOCKET(sock); freeaddrinfo(res);
+                nova_set_error("tcp_connect: connection failed");
+                return -1;
+            }
+            nova_sched_park_io((int64_t)sock, NOVA_POLL_WRITE);   /* park until writable */
+            int soerr = 0;
+#ifdef _WIN32
+            int slen = (int)sizeof(soerr);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soerr, &slen);
+#else
+            socklen_t slen = (socklen_t)sizeof(soerr);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, (void*)&soerr, &slen);
+#endif
+            if (soerr != 0) {
+                NOVA_CLOSE_SOCKET(sock); freeaddrinfo(res);
+                nova_set_error("tcp_connect: connection failed");
+                return -1;
+            }
+        }
+        freeaddrinfo(res);
+        return (int64_t)sock;
+    }
     if (connect(sock, res->ai_addr, (int)res->ai_addrlen) != 0) {
         NOVA_CLOSE_SOCKET(sock);
         freeaddrinfo(res);
