@@ -4143,6 +4143,20 @@ static void nova_sched_yield_runnable(void) {
     nova_rt_fiber_yield();
 }
 
+/* Cooperative yield (NOVA `reschedule()`): a green task voluntarily gives up its
+   carrier so other runnable green tasks run, then resumes where it left off.
+   ZERO cost to code that never calls it — NOVA does NOT instrument every loop/call
+   (that would tax the C-level hot path, breaking the "beat C" promise). Outside a
+   green task (main thread / OS-pool worker) it is a harmless no-op. v1 scheduling
+   is cooperative: tasks yield at channel/I/O/park points automatically; a CPU-bound
+   task that hits none of those should call reschedule() periodically (or stay <=
+   carrier count, or use pmap on the OS pool). Involuntary (signal-based) preemption
+   is post-v1 (see IMPLICIT_ASYNC_DESIGN.md). */
+int64_t nova_rt_reschedule(void) {
+    if (nova_sched_in_task()) nova_sched_yield_runnable();
+    return 0;
+}
+
 static void nova_sched_wake_one(NovaChannel* ch) {
     NovaSchedTask* t = (NovaSchedTask*)ch->green_waiters;
     if (!t) return;

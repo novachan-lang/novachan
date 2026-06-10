@@ -6,6 +6,22 @@ Implementation is a multi-session effort (~6–12 months solo, honest estimate).
 durable foundation — read it before any implementation stage.
 
 **IMPLEMENTATION PROGRESS:**
+✅✅ **VERIFIED STATE 2026-06-10 (against real code + full test run, not memory).** Stages 0, 1, 1.5,
+2a, 2b(work-stealing), 3(netpoller), 4(socket I/O parking) are ALL implemented and PASS:
+- 23/23 concurrency tests pass (fiber, sched, ws_sched, spawn×6, bounded_chan, select×2, monitor×3,
+  green_monitor, green_supervisor, supervisor, supcrash, atomicx, parallel, async, t8_channel).
+- green_netpoll_test passes (green echo server + concurrent accepts) — socket I/O parks on the poller.
+- **green_scale_test (committed db6a859): 10,000 green tasks incl. 10,000 simultaneously PARKED, ~382ms**
+  via the TRANSPARENT path (no async keyword, no sched_run; main auto-wrapped). The headline gate met.
+- All of the above STILL pass after the value-model overhaul (commits 8da4b0c/0bf015f).
+**The ONE genuine v1 gap: cooperative/involuntary PREEMPTION for CPU-bound green tasks** (no `preempt`
+flag exists; no user-facing scheduler-yield). This pits two NOVA non-negotiables against each other —
+"zero-ceremony/compiler-is-genius" (→ automatic preemption) vs "beat C" (→ no per-loop/per-call hot-path
+tax). The doc's fn-entry plan (Stage 6 below) is INSUFFICIENT (C8: doesn't fire in builtin-only tight
+loops) AND taxes every call. Real options: loop-back-edge auto-preempt (taxes GATE 4/5 hot loops — must
+measure) vs signal-based async preempt (correctly post-v1). Decision pending. Remaining post-v1
+(unchanged, intentional): growable stacks, async/signal preemption, DNS/file→offload, tcp_connect park.
+
 ✅ **Stage 0 COMPLETE (2026-06-05, commits 3cdf3f4 + 21fd822).** Both fatal TLS issues fixed —
 error state (0a) and fault boundary (0b) now per-task in NovaTaskState via nova_cur(). GO/NO-GO
 passed (byte-identical, 255/255, perf-neutral).
