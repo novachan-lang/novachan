@@ -12619,8 +12619,8 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 rt["@slot@" + args[0]] = value
                 if contains(st, value)
                     if st[value] != val_type
-                        let a_listish = st[value] == "list" or st[value] == "intlist"
-                        let b_listish = val_type == "list" or val_type == "intlist"
+                        let a_listish = st[value] == "list" or st[value] == "intlist" or st[value] == "floatlist"
+                        let b_listish = val_type == "list" or val_type == "intlist" or val_type == "floatlist"
                         if a_listish and b_listish
                             st[value] = "list"
                         else
@@ -12741,6 +12741,12 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                                         rt[dest] = "intlist"
                                 return inst
                             else
+                                if vt == "float" and st[lslot] == "floatlist"
+                                    // float appended to a floatlist -> stays a homogeneous
+                                    // floatlist (boxed storage; reads stay typed-float).
+                                    if dest != ""
+                                        rt[dest] = "floatlist"
+                                    return IrInst(op, dest, typ, args, "nova_rt_list_append_fbox", num, effect, line)
                                 if st[lslot] == "intlist"
                                     st[lslot] = "list"
                                 st["@het@" + lslot] = "1"
@@ -12774,7 +12780,7 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     return inst
                 if (value == "nova_rt_for_iter_init" or value == "nova_rt_for_destr_init") and len(args) == 1
                     let fi_type = ir_reg_type(rt, args[0])
-                    if fi_type == "intlist" or fi_type == "list"
+                    if fi_type == "intlist" or fi_type == "list" or fi_type == "floatlist"
                         if dest != ""
                             rt[dest] = fi_type
                         return IrInst("copy", dest, ir_type_any(), args, "", 0, "pure", line)
@@ -12864,11 +12870,14 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 // bool literal renders 1/0 and a dict/heuristic-free float renders
                 // garbage. All-int stays "intlist" (no boxing → C-array fast path).
                 let ml_all_int = len(args) > 0
+                let ml_all_float = len(args) > 0
                 let ml_kinds = ""
                 for ml_a in args
                     let mk = ir_reg_type(rt, ml_a)
                     if mk != "int"
                         ml_all_int = false
+                    if mk != "float"
+                        ml_all_float = false
                     if mk == "float"
                         ml_kinds = ml_kinds + "f"
                     else if mk == "bool"
@@ -12878,6 +12887,13 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 if dest != ""
                     if ml_all_int
                         rt[dest] = "intlist"
+                    else if ml_all_float
+                        // floatlist: a homogeneous float list. Storage is BOXED floats
+                        // (valid as `any` everywhere — so it is safe to treat exactly like
+                        // "list" anywhere a floatlist case is not handled; a missed case
+                        // degrades to correct-but-slow dynamic dispatch, never corruption).
+                        // index_get specializes to a TYPED float read (fadd/fcmp/float_to_str).
+                        rt[dest] = "floatlist"
                     else
                         rt[dest] = "list"
                 return IrInst(op, dest, typ, args, ml_kinds, num, effect, line)
@@ -12893,6 +12909,13 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     if ir_reg_type(rt, args[0]) == "intlist"
                         rt[dest] = "int"
                         return IrInst(op, dest, ir_type_int(), args, value, ig_nn, effect, line)
+                    if ir_reg_type(rt, args[0]) == "floatlist"
+                        // floatlist element is a boxed float; read it as a TYPED float
+                        // (full unbox -> raw double) so downstream uses fadd/fcmp/float_to_str
+                        // instead of dynamic dispatch. The "fl" marker tells the emitter to
+                        // emit nova_rt_unbox (raw double) rather than nova_rt_unbox_elem.
+                        rt[dest] = "float"
+                        return IrInst(op, dest, ir_type_float(), args, "fl", ig_nn, effect, line)
                     rt[dest] = "val"
                 return IrInst(op, dest, typ, args, value, ig_nn, effect, line)
             else if op == "index_set"
@@ -14012,7 +14035,12 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         ire_indent(e, fi + " = select i1 " + neg + ", i64 " + adj + ", i64 " + args[1])
                         ire_indent(e, ep + " = getelementptr i64, ptr " + dp + ", i64 " + fi)
                     ire_indent(e, dest + ".lv = load i64, ptr " + ep + ", align 8, !tbaa !4")
-                    ire_indent(e, dest + " = call i64 @nova_rt_unbox_elem(i64 " + dest + ".lv)")
+                    if value == "fl"
+                        // floatlist read: full unbox to a raw double, typed float.
+                        ire_indent(e, dest + " = call i64 @nova_rt_unbox(i64 " + dest + ".lv)")
+                        e.ire_reg_types[dest] = "float"
+                    else
+                        ire_indent(e, dest + " = call i64 @nova_rt_unbox_elem(i64 " + dest + ".lv)")
                 else if target_kind == "dict"
                     ire_indent(e, dest + " = call i64 @nova_rt_dict_get(i64 " + args[0] + ", i64 " + args[1] + ")")
                 else

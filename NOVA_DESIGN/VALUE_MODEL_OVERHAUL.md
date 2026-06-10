@@ -104,10 +104,17 @@ exists (`ire_float_load`/`nova_rt_unbox`) on the read side; verify every consume
 sends. Channels already deep-copy; ensure the copy preserves the float box tag.
 
 **Stage 4 — G6 + heuristic deletion + `floatlist` fast path.**
-  (a) Add a `floatlist` IR type, mirror of `intlist`: `make_list` all-float → `floatlist`; propagate
-      through slots; `index_get`→`float`; teach EVERY `== "list"/"intlist"` site (~20) to accept it.
-      This both fixes `float(xs[1])` (elision fires) AND enables a C double-array backing (no
-      per-element box) — a perf win, the mirror of `intlist`'s int-array fast path.
+  (a) ✅ SHIPPED (2026-06-10, commit after 8da4b0c). Added a `floatlist` compile-time type:
+      `make_list` all-float → `floatlist`; propagated through slots/append/iteration; `index_get`
+      → TYPED float read (full unbox → raw double → fadd/fcmp/float_to_str instead of dynamic
+      dispatch). **KEY SAFETY DECISION:** storage stays BOXED (not a raw `double[]`). A raw
+      `double[]` (true mirror of `intlist`) is UNSAFE in NOVA — raw doubles are not valid `any`
+      values (unlike raw ints), so a float list flowing to generic code would corrupt, and a
+      heterogeneous push would need an O(n) runtime re-box. With boxed storage, `floatlist` is a
+      pure read-optimization hint: any unhandled `== "list"/"intlist"` site degrades to correct-
+      but-slow dynamic dispatch, NEVER corruption. Fixes `float(xs[1])` and gives float vectors
+      typed-float arithmetic/iteration. (The raw-`double[]` no-boxing variant would need a runtime
+      NovaList element-kind tag + escape-to-box discipline — a larger follow-up, deferred.)
   (b) With ALL widens boxing (Stages 1–3) and `floatlist` carrying float lists losslessly, a raw
       int64 in any `any` context is unambiguously int. DELETE `nova_is_likely_float` and switch its
       consumers (`nova_to_double`, serialization) to box-tag-only. This is the payoff: the unsound
