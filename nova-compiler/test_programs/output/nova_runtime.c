@@ -10920,6 +10920,29 @@ int64_t nova_rt_arch_name(void) {
 #endif
 }
 
+/* Struct type-name registry for runtime reflection. The compiler emits one
+   nova_rt_register_struct_name(hash, "Name") per struct type at program init;
+   type_name(struct) reads the struct's slot-0 type hash and looks up the concrete
+   name here. Linear scan (struct-type count is small; type_name is not hot). The
+   name pointers are static string constants in the program image. */
+#define NOVA_MAX_STRUCT_TYPES 8192
+static int64_t     g_struct_type_hashes[NOVA_MAX_STRUCT_TYPES];
+static const char* g_struct_type_names[NOVA_MAX_STRUCT_TYPES];
+static int         g_struct_type_count = 0;
+void nova_rt_register_struct_name(int64_t hash, int64_t name_val) {
+    if (g_struct_type_count >= NOVA_MAX_STRUCT_TYPES) return;
+    for (int i = 0; i < g_struct_type_count; i++)
+        if (g_struct_type_hashes[i] == hash) return;   /* idempotent */
+    g_struct_type_hashes[g_struct_type_count] = hash;
+    g_struct_type_names[g_struct_type_count] = (const char*)(uintptr_t)name_val;
+    g_struct_type_count++;
+}
+static const char* nova_struct_name_for_hash(int64_t hash) {
+    for (int i = 0; i < g_struct_type_count; i++)
+        if (g_struct_type_hashes[i] == hash) return g_struct_type_names[i];
+    return NULL;
+}
+
 /* ── Runtime type identity (RTTI) ─────────────────────────────────────────────
    type_name(v) reports the runtime kind of an Any-typed value as a string, for
    inspecting heterogeneous data (e.g. json_decode results, generic containers)
@@ -10941,7 +10964,16 @@ int64_t nova_rt_type_name(int64_t v) {
     switch (nova_mem_find_tag((void*)(uintptr_t)v)) {
         case NOVA_MEM_LIST:    return nova_platform_str("list");
         case NOVA_MEM_DICT:    return nova_platform_str("dict");
-        case NOVA_MEM_STRUCT:  return nova_platform_str("struct");
+        case NOVA_MEM_STRUCT: {
+            /* slot 0 holds the DJB2 type hash for non-repr(C) structs; map it to the
+               concrete registered name. repr(C)/0-slot structs have no hash slot, so
+               fall back to the generic "struct". */
+            if (NOVA_STRUCT_NSLOTS((void*)(uintptr_t)v) >= 1) {
+                const char* nm = nova_struct_name_for_hash(((const int64_t*)(uintptr_t)v)[0]);
+                if (nm) return nova_platform_str(nm);
+            }
+            return nova_platform_str("struct");
+        }
         case NOVA_MEM_CHANNEL: return nova_platform_str("channel");
         case NOVA_MEM_RAW:
         case NOVA_MEM_FAT_STR: return nova_platform_str("string");

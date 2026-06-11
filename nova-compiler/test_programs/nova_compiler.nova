@@ -13462,9 +13462,10 @@ type IrEmitter
     ire_slot_escaped: dict
     ire_dropped: dict
     ire_cur_fn_lambda: int
+    ire_struct_types: dict
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0)
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {})
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -14065,6 +14066,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     let hash_gep = dest + ".thash"
                     ire_indent(e, hash_gep + " = getelementptr i64, ptr " + dest + ".ptr, i64 0")
                     ire_indent(e, "store i64 " + fmt_i64_decimal(hash_val) + ", ptr " + hash_gep + ", align 8")
+                    // Record (name -> slot-0 type hash) so @main can register it for
+                    // runtime reflection: type_name(struct) reads slot 0 and looks up
+                    // the concrete name. Dedup via the dict; zero per-construction cost.
+                    e.ire_struct_types[value] = fmt_i64_decimal(hash_val)
                 let fi = 0
                 while fi < len(args)
                     let gep = dest + ".f" + str(fi)
@@ -15082,6 +15087,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_proc_close_stdin(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_proc_wait(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_shell(i64) nounwind")
+    ire_line(e, "declare void @nova_rt_register_struct_name(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_create_string(ptr) nounwind")
     ire_line(e, "declare void @nova_rt_init_args(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_wait_all() nounwind")
@@ -15977,6 +15983,23 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     if do_auto_arena == 1
         ire_line(e, "  ; AUTO-ARENA: no spawn detected, RC overhead globally eliminated")
         ire_indent(e, "call void @nova_rt_set_arena_mode(i64 1)")
+    // Register struct type names for runtime reflection (type_name -> concrete name).
+    // One registration per struct type (deduped via the dict, accumulated as structs
+    // were lowered) — built once here at init, looked up by slot-0 type hash. Zero
+    // per-construction cost. The registry stays empty for programs with no structs.
+    if len(keys(e.ire_struct_types)) > 0
+        ire_line(e, "  ; RTTI: register struct type names")
+        let sreg_i = 0
+        for st_name in keys(e.ire_struct_types)
+            let st_hash = e.ire_struct_types[st_name]
+            let st_str = ire_intern_string(e, st_name)
+            let st_len = len(st_name) + 1
+            let sp_reg = "%sreg.p" + str(sreg_i)
+            let spi_reg = "%sreg.pi" + str(sreg_i)
+            ire_indent(e, sp_reg + " = getelementptr inbounds [" + str(st_len) + " x i8], ptr " + st_str + ", i64 0, i64 0")
+            ire_indent(e, spi_reg + " = ptrtoint ptr " + sp_reg + " to i64")
+            ire_indent(e, "call void @nova_rt_register_struct_name(i64 " + st_hash + ", i64 " + spi_reg + ")")
+            sreg_i = sreg_i + 1
     // Pre-register all coverage-instrumented lines so the report shows
     // hit/total properly (lines never executed still appear as uncovered).
     if e.ire_cov_enabled == 1 and len(keys(e.ire_cov_lines)) > 0
