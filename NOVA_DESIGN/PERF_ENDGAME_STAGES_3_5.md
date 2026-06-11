@@ -76,6 +76,28 @@ revert on ANY float-soundness failure. **Effort: ~1 day.**
 
 ## STAGE 4 — Struct SROA / stack-alloc non-escaping structs  ·  Day 2-3  ·  beats: C, Rust
 
+> **INVESTIGATION FINDINGS (2026-06-11) — READ BEFORE STARTING. Corruption-risk; here is the real surface.**
+> - RC is ALREADY elided for local structs: `ir_escape_analysis` returns `local_set` (non-escaping
+>   make_struct/list/dict dests, builder ~12107); `local_set` → `e.ire_local_lists` at ~16003/16020/16035.
+>   So "no RC" is DONE. 4a reduces to: emit `alloca` instead of `nova_rt_struct_alloc` (IRE make_struct ~14089)
+>   when `dest ∈ ire_local_lists`, ptrtoint the alloca to the i64 handle; field_get/set already inttoptr it.
+> - **THE NEW RISK = the MemTag.** Heap structs carry a `NovaMemTag` (kind=STRUCT + nslots) packed by
+>   `nova_rt_struct_alloc`→`nova_heap_alloc` (runtime 449-456). `==`/hash/deep_copy/generic dispatch read that
+>   tag to walk fields. A stack `alloca` has NO such tag → those ops read garbage before the alloca → CORRUPTION.
+>   And those ops are NOT escape sites in the EA today (12030-12052 marks only send/spawn/field_set/index_set/
+>   return), so a `local_set` struct CAN reach them. **Fix REQUIRED before 4a ships:** either (a) extend the EA
+>   to mark a struct that flows to `==`/hash/deep_copy/any-typed-call as escaping (keeps it heap — shrinks the
+>   stackable set to pure field-access structs, which covers dot/matmul/physics), or (b) emit a valid static
+>   NovaMemTag header on the alloca (non-freeable RC) so tag-readers work. (a) is simpler + safer; do (a) first.
+> - 4a (alloca + i64 handle via ptrtoint/inttoptr) removes heap malloc + RC but LLVM will NOT register-promote
+>   (address taken). 4b (true SROA → registers) needs the local struct handle to stay an LLVM pointer/aggregate
+>   (no ptrtoint), i.e. break uniform-i64 LOCALLY for proven-local structs — bigger, do after 4a measures.
+> - Interprocedural caveat: marking a struct passed to a regular `call` as local inherits the SAME envelope as
+>   today's RC-elision (a synchronous callee that reads fields is fine; one that persists the handle would be an
+>   escape the per-function EA misses — unchanged from current behavior, but verify with the escape stress test).
+> - MANDATORY new test: `==`/hash/print on a locally-constructed struct + a struct returned/sent/stored-in-list
+>   MUST stay heap. Gate behind `NOVA_SROA=1` for the first bootstrap.
+
 **Goal:** a struct that escape analysis proves NON-escaping is lowered to LLVM SSA values / an `alloca`
 aggregate instead of `nova_rt_struct_alloc` + RC. No heap, no RC, registers → LLVM `mem2reg` promotes
 `Point{x,y}` to two registers. This is COMPETITIVE_DOMINATION_PLAN Tier-1 #4 — the "C-level perf" asterisk-remover.
