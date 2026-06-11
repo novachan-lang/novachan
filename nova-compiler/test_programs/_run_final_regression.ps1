@@ -116,6 +116,7 @@ $domain_tests = @(
     'comprehension_test',
     'type_alias_test',
     'decode_utf8_test',
+    'normx_test',
     'match_result_test',
     'generics_edge_test',
     'intlist_test',
