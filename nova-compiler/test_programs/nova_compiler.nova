@@ -12162,9 +12162,35 @@ fn ir_escaping_set(func: IrFunction, summaries: dict) -> dict
                                             while bi < len(args)
                                                 escaping[args[bi]] = 1
                                                 bi = bi + 1
+                                    // SOUNDNESS (attack guards 2/3): a value captured by a closure,
+                                    // passed to a dyn_call, stored as a field of another struct
+                                    // (nested), or put into a list/dict ESCAPES — its handle can
+                                    // outlive this frame. Conservatively escape ALL args of these
+                                    // ops (scalars are no-ops; struct/heap args are correctly kept
+                                    // off the stack). Without this, a struct reachable via a closure
+                                    // or container would be wrongly stack-allocated -> use-after-free.
+                                    if op == "make_closure" or op == "dyn_call" or op == "make_struct" or op == "make_list" or op == "make_dict"
+                                        let ci = 0
+                                        while ci < len(args)
+                                            escaping[args[ci]] = 1
+                                            ci = ci + 1
+                                    // MemTag guard: structural == / != lower to nova_rt_eq, which
+                                    // reads the heap RC/MemTag header (ptr[-1], NOVA_STRUCT_NSLOTS)
+                                    // to walk fields — a STACK struct has no such header. So any
+                                    // struct operand of these ops must stay on the heap. (Scalar
+                                    // operands are no-ops.) These are binary OPS, not "call"s, so the
+                                    // call rule above doesn't cover them. match/type_name read the
+                                    // stored slot-0 hash (present on stack structs) so are fine.
+                                    if op == "eq" or op == "ne"
+                                        let qi = 0
+                                        while qi < len(args)
+                                            escaping[args[qi]] = 1
+                                            qi = qi + 1
                                     if op == "field_set" or op == "index_set"
-                                        if len(args) >= 3
-                                            escaping[args[2]] = 1
+                                        // the stored VALUE is the last arg (field_set: [obj,val];
+                                        // index_set: [container,index,val]) — it escapes into the target.
+                                        if len(args) >= 2
+                                            escaping[args[len(args) - 1]] = 1
                         match terminator
                             IrInst(top, _, _, targs, _, _, _, _) =>
                                 if top == "return" and len(targs) > 0
@@ -12223,7 +12249,7 @@ fn ir_escape_summaries(all_fns: list) -> dict
                         let pi = 0
                         for p in fparams
                             match p
-                                Param(pn, pt, pd) =>
+                                IrParam(pn, pt) =>
                                     if contains(esc, "%p" + str(pi)) or contains(esc, "slot." + pn)
                                         newpm[str(pi)] = 1
                             pi = pi + 1
@@ -13680,9 +13706,10 @@ type IrEmitter
     ire_dropped: dict
     ire_cur_fn_lambda: int
     ire_struct_types: dict
+    ire_stackable: dict
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {})
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {})
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -14307,7 +14334,13 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 if is_repr_c
                     extra_slots = 0
                 let size = (num + extra_slots) * 8
-                if contains(e.ire_repr_align, value) and e.ire_repr_align[value] > 16
+                if contains(e.ire_stackable, dest)
+                    // Stage 4 SROA: dest.ptr is an entry-block alloca (hoisted above) — no heap
+                    // allocation. The hash + field stores + ptrtoint below are unchanged; the
+                    // struct lives on the stack frame (reclaimed on return, beats the leak-until-
+                    // exit heap). LLVM may further promote it via mem2reg/SROA once 4b lands.
+                    ire_indent(e, "; sroa stack struct " + dest)
+                else if contains(e.ire_repr_align, value) and e.ire_repr_align[value] > 16
                     ire_indent(e, dest + ".ptr = call ptr @nova_rt_aligned_struct_alloc(i64 " + str(size) + ", i64 " + str(e.ire_repr_align[value]) + ")")
                 else
                     ire_indent(e, dest + ".ptr = call ptr @nova_rt_struct_alloc(i64 " + str(size) + ")")
@@ -14880,6 +14913,23 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                             for slot_name in local_slots
                                 ire_indent(e, "%slot." + slot_name + " = alloca i64, align 8")
                                 ire_indent(e, "store i64 0, ptr %slot." + slot_name + ", align 8")
+                            // Stage 4 SROA: hoist stack-struct allocas to the entry block (once),
+                            // reused across loop iterations (sound — a non-escaping struct never
+                            // outlives an iteration, so the buffer can be overwritten each time).
+                            // dest.ptr is defined here; the body's make_struct skips the heap
+                            // nova_rt_struct_alloc for these dests. Stackable structs are non-repr-C
+                            // all-scalar => extra_slots=1 (the leading type-hash slot), so the alloca
+                            // is [nfields+1 x i64] — identical layout to the heap struct (minus the
+                            // RC header, which is never read: the escape set keeps any struct that
+                            // reaches a tag-reading op on the heap). Empty when SROA is off => no-op.
+                            for _sab in blocks
+                                match _sab
+                                    IrBlock(_, _sabi, _) =>
+                                        for _sai in _sabi
+                                            match _sai
+                                                IrInst(_saop, _sadest, _, _, _saval, _sanum, _, _) =>
+                                                    if _saop == "make_struct" and contains(e.ire_stackable, _sadest)
+                                                        ire_indent(e, _sadest + ".ptr = alloca [" + str(_sanum + 1) + " x i64], align 8")
                             if e.ire_dbg_instr_enabled == 1
                                 let dbgf_name_str = ire_intern_string(e, name)
                                 let dbgf_name_len = len(name) + 1
@@ -16166,14 +16216,18 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // alloca codegen is wired (which will be gated behind NOVA_SROA=1).
     let _allscalar = {}
     for _sdt in keys(b.ir_sdefs)
-        let _allsc = 1
-        for _sfp in b.ir_sdefs[_sdt]
-            match _sfp
-                Param(_apn, _apt, _apd) =>
-                    if _apt != "int" and _apt != "float" and _apt != "bool"
-                        _allsc = 0
-        if _allsc == 1
-            _allscalar[_sdt] = 1
+        // Exclude @repr(C)/aligned structs: their FFI layout (no type-hash slot, custom
+        // alignment) must stay heap. Plain all-scalar structs (every field int/float/bool)
+        // are stack-allocatable — no heap fields => zero RC concern, fixed extra_slots=1.
+        if not contains(b.ir_repr_c_types, _sdt) and not contains(b.ir_repr_align, _sdt)
+            let _allsc = 1
+            for _sfp in b.ir_sdefs[_sdt]
+                match _sfp
+                    Param(_apn, _apt, _apd) =>
+                        if _apt != "int" and _apt != "float" and _apt != "bool"
+                            _allsc = 0
+            if _allsc == 1
+                _allscalar[_sdt] = 1
     let _esumm = ir_escape_summaries(all_fns)
 
     // Pass 3: Infer types with inter-procedural info and emit
@@ -16194,6 +16248,10 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let t8_off = len(no_t8) > 0 and no_t8[0] == "1"
     let want_escape = (not t8_off) or (len(esc_env) > 0 and esc_env[0] == "1")
     let want_elision = not t8_off
+    // Stage 4 SROA (Step B): stack-allocate non-escaping all-scalar structs. Gated behind
+    // NOVA_SROA=1 until validated (default = current heap behavior, regression unchanged).
+    let _sroa_env = env("NOVA_SROA")
+    let do_sroa = len(_sroa_env) > 0 and _sroa_env[0] == "1"
     let total_allocs = 0
     let total_escape = 0
     for ir_fn in ir_fns
@@ -16218,6 +16276,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         for _sk in keys(_stk)
                             _sl = _sl + " " + _sk
                         ire_line(e, _sl)
+        e.ire_stackable = {}
+        if do_sroa and want_escape
+            e.ire_stackable = ir_stackable_structs(typed_fn, _esumm, _allscalar)
         ire_emit_function(e, typed_fn)
 
     // Emit nova_main
@@ -16238,6 +16299,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             for _skm in keys(_stkm)
                 _slm = _slm + " " + _skm
             ire_line(e, _slm)
+    e.ire_stackable = {}
+    if do_sroa and want_escape
+        e.ire_stackable = ir_stackable_structs(typed_main, _esumm, _allscalar)
     ire_emit_function(e, typed_main)
 
     // Emit any lambdas generated during nova_main lowering
@@ -16257,6 +16321,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             match typed_lam
                 IrFunction(lname, _, _, _, _, _) =>
                     ire_line(e, "; ESCAPE " + lname + ": allocs=" + str(ea_lam[0]) + " escape=" + str(ea_lam[1]) + " local=" + str(ea_lam[0] - ea_lam[1]))
+        e.ire_stackable = {}
         ire_emit_function(e, typed_lam)
         mi2 = mi2 + 1
     if want_escape
