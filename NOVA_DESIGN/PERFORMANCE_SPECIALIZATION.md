@@ -51,6 +51,24 @@ and GATE 4/5.
 layout) instead of boxed — removes the residual `nova_rt_unbox` per field read seen even in the
 typed IR above. With Stage 1: struct float math = pure `fmul`/`fadd`.
 
+> **Stage 2 ATTEMPT 1 (2026-06-11) — REVERTED. Read before retrying.** Implemented the
+> redundant-INTERMEDIATE-unbox slice: mark const_float + the 6 float-arith results (fmul/fadd/…)
+> as `"float"` in `ire_reg_types`, and make `ire_float_load` emit a plain `bitcast` (skip
+> `nova_rt_unbox`) when `src` is a known-`"float"` register. VERIFIED at the IR level: `dot_typed`/
+> `dot_unann` went 6→4 `nova_rt_unbox` (the two fmul-result unboxes feeding the `fadd` removed);
+> `idot` stayed pure `mul i64`; bootstrap reconverged (CC2FED00). BUT the full regression dropped to
+> **391/393 — `nn` and `stats` FAIL under the PARALLEL regression load yet pass 8/8 in isolation**
+> (real value, e.g. `assert_near expected 0 got 0.6487…` = e^0.5−1). Reverting restored 393/393,
+> confirming Stage 2 as the cause. Codegen is deterministic, so a load-dependent flake is NOT a simple
+> wrong-skip. Prime suspect: `ire_reg_types` is a FLAT, non-control-flow map and the `"float"` mark
+> PROPAGATES through slot_store/slot_load (~13931-13961) — a loop-carried/reused float-accumulator slot
+> can read `"float"` in the map while holding a boxed value on some path → load wrongly skips the unbox.
+> PRECISE RETRY: mark only DIRECT same-expression arith/const results; do NOT let `"float"` flow through
+> slots (don't inherit on slot_load / don't set on slot_store). Keeps the dot-product win (direct
+> fmul→fadd, no slot), drops the slot imprecision. The load-dependence still needs explaining (rule out
+> a green-runtime/heap-layout interaction). The verified gate CAUGHT this — do not ship until nn/stats
+> stay green under the FULL parallel regression repeatedly.
+
 **Stage 3 — Struct SROA.** Non-escaping structs (escape analysis exists — Track 8) lower to LLVM
 `{double,double}` value aggregates, not heap `i64*` → LLVM splits into registers, zero malloc.
 
