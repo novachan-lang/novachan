@@ -2,7 +2,8 @@ Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
 $env:NOVA_NO_CACHE = "1"
-$compiler = (Resolve-Path "$PSScriptRoot\gen3_test.exe").Path
+$compilerName = if ($env:NOVA_REGRESSION_COMPILER) { $env:NOVA_REGRESSION_COMPILER } else { "gen3_test.exe" }
+$compiler = (Resolve-Path "$PSScriptRoot\$compilerName").Path
 $runtimeSrc = "$PSScriptRoot\output\nova_runtime.c"
 $runtimeObj = "$PSScriptRoot\nova_runtime_test.o"
 $sqliteSrc  = "$PSScriptRoot\output\sqlite3.c"

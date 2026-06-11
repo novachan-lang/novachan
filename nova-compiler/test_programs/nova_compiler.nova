@@ -6560,8 +6560,13 @@ fn llvm_escape_string(s: string) -> string
         i = i + 1
     result
 
-fn float_bits(s: string) -> int
-    parse_float(s)
+// `float_bits(s)` resolves to the int-typed builtin nova_rt_float_bits (string ->
+// raw IEEE-754 i64 bits). A prior user-fn wrapper `fn float_bits -> int = parse_float(s)`
+// was inferred FLOAT-typed (its body returns a float), so the literal-emission sites
+// `ir_emit_inst(b, "const_float", ..., bits)` saw a float `bits`, which the value-model
+// then boxed into ir_emit_inst's any-typed num param — leaking a compiler-heap box
+// POINTER as the emitted float-literal constant. Using the int-typed builtin keeps
+// `bits` an int (no float_to_str, no wbox boxing), so const_float emits raw bits.
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TYPED IR PIPELINE — AST → IR → LLVM
@@ -10219,6 +10224,8 @@ fn ti_ann_to_type(ann: string) -> NType
         return nt_list(nt_any())
     if ann == "dict" or ann == "Dict" or ann == "Map"
         return nt_dict(nt_string(), nt_any())
+    if ann == "channel" or ann == "Channel"
+        return nt_channel(nt_any())
     if ann == "" or ann == "any" or ann == "Any"
         return nt_any()
     nt_struct(ann)
@@ -12638,9 +12645,6 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 if lt == "int" and rty == "int"
                     rt[dest] = "int"
                     return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
-                // val/any operand(s): a container element or any value may be a boxed
-                // float — a raw icmp would compare box pointers. Route to the box-aware
-                // nova_rt_lt/le/gt/ge. Statically-int comparisons above stay icmp (fast).
                 rt[dest] = "int"
                 return IrInst(op, dest, ir_type_any(), args, value, num, effect, line)
             else if op == "not" or op == "and" or op == "or"
@@ -13065,10 +13069,15 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                 let ti = ir_infer_one(rt, st, frt, inst)
                 // Value-model widen-boxing: a float-typed argument flowing into an
                 // `any` parameter must be boxed (NovaBox float), else its raw double
-                // bits are read as an int / a wild pointer at the callee. fpt[callee]
-                // carries the call-site-inferred param kind: absent or "any" => any.
-                // Externs and runtime calls are not in fpt, so they are never boxed
-                // (they take raw doubles by ABI). See VALUE_MODEL_OVERHAUL.md.
+                // bits are misread as an int / pointer by nova_to_double et al.
+                // fpt[callee] carries the call-site-inferred param kind: absent or
+                // "any" => box (the callee slot is a generic i64-any). A concrete kind
+                // (e.g. "float") means the callee takes a typed value — math intrinsics
+                // read raw float bits via nova_float_arg(), so boxing is NOT needed and
+                // would allocate a heap NovaBox per call (a GATE 4/5 hot-loop regression,
+                // e.g. sqrt(x) inside a while loop). Dynamic arithmetic, channel send and
+                // any-slot store have their own float-box branches below.
+                // See VALUE_MODEL_OVERHAUL.md.
                 let handled = false
                 match ti
                     IrInst(op, dest, typ, args, value, num, effect, line) =>

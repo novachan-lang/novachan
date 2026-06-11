@@ -545,7 +545,9 @@ int64_t nova_rt_box_bool(int64_t v) {
     nova_box_track((uintptr_t)b);
     return (int64_t)(uintptr_t)b;
 }
+static int nova_is_box(int64_t handle);
 int64_t nova_rt_box_float(int64_t bits) {
+    if (nova_is_box(bits)) return bits;
     NovaBox* b = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
     if (!b) return 0;
     b->kind = NOVA_BOX_FLOAT; b->payload = bits;
@@ -1126,6 +1128,10 @@ int64_t nova_rt_int_to_str(int64_t v) {
 }
 
 int64_t nova_rt_float_to_str(int64_t bits) {
+    if (nova_is_box(bits)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)bits;
+        if (bx->kind == NOVA_BOX_FLOAT) bits = bx->payload;
+    }
     double v;
     memcpy(&v, &bits, sizeof(double));
     char tmp[64];
@@ -3112,11 +3118,21 @@ int64_t nova_rt_print_float(int64_t bits) {
    boxed float, a string, or an int. Returns -1 (a<b), 0 (a==b), 1 (a>b).
    Statically-typed int/float/str comparisons use icmp/fcmp/strcmp directly and
    never reach here. See NOVA_DESIGN/VALUE_MODEL_OVERHAUL.md. */
+static inline double nova_cmp_f(int64_t v) {
+    if (nova_is_box(v)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)v;
+        if (bx->kind == NOVA_BOX_FLOAT) { double d; memcpy(&d, &bx->payload, 8); return d; }
+        return (double)bx->payload;
+    }
+    int64_t m = v < 0 ? -v : v;
+    if (m >= 0 && m < ((int64_t)1 << 53)) return (double)v;
+    double d; memcpy(&d, &v, 8); return d;
+}
 static int nova_rt_cmp(int64_t a, int64_t b) {
     int af = nova_is_box(a) && ((NovaBox*)(uintptr_t)a)->kind == NOVA_BOX_FLOAT;
     int bf = nova_is_box(b) && ((NovaBox*)(uintptr_t)b)->kind == NOVA_BOX_FLOAT;
     if (af || bf) {
-        double da = nova_to_double(a), db = nova_to_double(b);
+        double da = nova_cmp_f(a), db = nova_cmp_f(b);
         return (da < db) ? -1 : ((da > db) ? 1 : 0);
     }
     void* pa = (void*)(uintptr_t)a;
@@ -5704,33 +5720,47 @@ int64_t nova_rt_int_pow(int64_t base, int64_t exp) {
 static inline double i2f(int64_t v) { double d; memcpy(&d, &v, 8); return d; }
 static inline int64_t f2i(double d)  { int64_t v; memcpy(&v, &d, 8); return v; }
 
-int64_t nova_rt_sin(int64_t x)   { return f2i(sin(i2f(x))); }
-int64_t nova_rt_cos(int64_t x)   { return f2i(cos(i2f(x))); }
-int64_t nova_rt_tan(int64_t x)   { return f2i(tan(i2f(x))); }
-int64_t nova_rt_asin(int64_t x)  { return f2i(asin(i2f(x))); }
-int64_t nova_rt_acos(int64_t x)  { return f2i(acos(i2f(x))); }
-int64_t nova_rt_atan(int64_t x)  { return f2i(atan(i2f(x))); }
-int64_t nova_rt_atan2(int64_t y, int64_t x) { return f2i(atan2(i2f(y), i2f(x))); }
-int64_t nova_rt_log(int64_t x)   { return f2i(log(i2f(x))); }
-int64_t nova_rt_log2(int64_t x)  { return f2i(log2(i2f(x))); }
-int64_t nova_rt_log10(int64_t x) { return f2i(log10(i2f(x))); }
-int64_t nova_rt_exp(int64_t x)   { return f2i(exp(i2f(x))); }
-int64_t nova_rt_fabs(int64_t x)  { return f2i(fabs(i2f(x))); }
-int64_t nova_rt_fmod(int64_t x, int64_t y) { return f2i(fmod(i2f(x), i2f(y))); }
-int64_t nova_rt_round(int64_t x) { return (int64_t)round(i2f(x)); }
-int64_t nova_rt_sqrt(int64_t x)  { return f2i(sqrt(i2f(x))); }
-int64_t nova_rt_pow(int64_t x, int64_t y) {
-    uint64_t ux = (uint64_t)x, uy = (uint64_t)y;
-    int x_is_int = (ux < 0x0010000000000000ULL) || (ux > 0xFFF0000000000000ULL);
-    int y_is_int = (uy < 0x0010000000000000ULL) || (uy > 0xFFF0000000000000ULL);
-    if (x_is_int && y_is_int) return nova_rt_int_pow(x, y);
-    return f2i(pow(i2f(x), i2f(y)));
+/* Accept both raw float bits (from typed codegen) and boxed NovaBox floats
+   (from nova_rt_add/mul/etc. returns).  Box check first; fallback = bitcast. */
+static inline double nova_float_arg(int64_t x) {
+    if (nova_is_box(x)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)x;
+        if (bx->kind == NOVA_BOX_FLOAT) { double d; memcpy(&d, &bx->payload, 8); return d; }
+        return (double)bx->payload;
+    }
+    return i2f(x);
 }
-int64_t nova_rt_sinh(int64_t x)  { return f2i(sinh(i2f(x))); }
-int64_t nova_rt_cosh(int64_t x)  { return f2i(cosh(i2f(x))); }
-int64_t nova_rt_tanh(int64_t x)  { return f2i(tanh(i2f(x))); }
-int64_t nova_rt_cbrt(int64_t x)  { return f2i(cbrt(i2f(x))); }
-int64_t nova_rt_hypot(int64_t x, int64_t y) { return f2i(hypot(i2f(x), i2f(y))); }
+
+int64_t nova_rt_sin(int64_t x)   { return f2i(sin(nova_float_arg(x))); }
+int64_t nova_rt_cos(int64_t x)   { return f2i(cos(nova_float_arg(x))); }
+int64_t nova_rt_tan(int64_t x)   { return f2i(tan(nova_float_arg(x))); }
+int64_t nova_rt_asin(int64_t x)  { return f2i(asin(nova_float_arg(x))); }
+int64_t nova_rt_acos(int64_t x)  { return f2i(acos(nova_float_arg(x))); }
+int64_t nova_rt_atan(int64_t x)  { return f2i(atan(nova_float_arg(x))); }
+int64_t nova_rt_atan2(int64_t y, int64_t x) { return f2i(atan2(nova_float_arg(y), nova_float_arg(x))); }
+int64_t nova_rt_log(int64_t x)   { return f2i(log(nova_float_arg(x))); }
+int64_t nova_rt_log2(int64_t x)  { return f2i(log2(nova_float_arg(x))); }
+int64_t nova_rt_log10(int64_t x) { return f2i(log10(nova_float_arg(x))); }
+int64_t nova_rt_exp(int64_t x)   { return f2i(exp(nova_float_arg(x))); }
+int64_t nova_rt_fabs(int64_t x)  { return f2i(fabs(nova_float_arg(x))); }
+int64_t nova_rt_fmod(int64_t x, int64_t y) { return f2i(fmod(nova_float_arg(x), nova_float_arg(y))); }
+int64_t nova_rt_round(int64_t x) { return (int64_t)round(nova_float_arg(x)); }
+int64_t nova_rt_sqrt(int64_t x)  { return f2i(sqrt(nova_float_arg(x))); }
+int64_t nova_rt_pow(int64_t x, int64_t y) {
+    int x_box = nova_is_box(x), y_box = nova_is_box(y);
+    if (!x_box && !y_box) {
+        uint64_t ux = (uint64_t)x, uy = (uint64_t)y;
+        int x_is_int = (ux < 0x0010000000000000ULL) || (ux > 0xFFF0000000000000ULL);
+        int y_is_int = (uy < 0x0010000000000000ULL) || (uy > 0xFFF0000000000000ULL);
+        if (x_is_int && y_is_int) return nova_rt_int_pow(x, y);
+    }
+    return f2i(pow(nova_float_arg(x), nova_float_arg(y)));
+}
+int64_t nova_rt_sinh(int64_t x)  { return f2i(sinh(nova_float_arg(x))); }
+int64_t nova_rt_cosh(int64_t x)  { return f2i(cosh(nova_float_arg(x))); }
+int64_t nova_rt_tanh(int64_t x)  { return f2i(tanh(nova_float_arg(x))); }
+int64_t nova_rt_cbrt(int64_t x)  { return f2i(cbrt(nova_float_arg(x))); }
+int64_t nova_rt_hypot(int64_t x, int64_t y) { return f2i(hypot(nova_float_arg(x), nova_float_arg(y))); }
 int64_t nova_rt_pi(void) { return f2i(3.14159265358979323846); }
 int64_t nova_rt_e(void)  { return f2i(2.71828182845904523536); }
 int64_t nova_rt_gcd(int64_t a, int64_t b) {
@@ -5865,9 +5895,13 @@ int64_t nova_rt_is_valid_utf8(int64_t s_val) {
     while (i < len) { size_t j = i; int64_t cp = nova_utf8_decode(s, len, &j); if (cp < 0) return 0; i = j; }
     return 1;
 }
-int64_t nova_rt_floor(int64_t x) { return (int64_t)floor(i2f(x)); }
-int64_t nova_rt_ceil(int64_t x)  { return (int64_t)ceil(i2f(x)); }
+int64_t nova_rt_floor(int64_t x) { return (int64_t)floor(nova_float_arg(x)); }
+int64_t nova_rt_ceil(int64_t x)  { return (int64_t)ceil(nova_float_arg(x)); }
 int64_t nova_rt_abs(int64_t x) {
+    if (nova_is_box(x)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)x;
+        if (bx->kind == NOVA_BOX_FLOAT) return f2i(fabs(nova_float_arg(x)));
+    }
     uint64_t ux = (uint64_t)x;
     uint64_t exp = (ux >> 52) & 0x7FF;
     if (exp > 0 && exp < 0x7FF) return (int64_t)(ux & 0x7FFFFFFFFFFFFFFFULL);
@@ -5875,9 +5909,9 @@ int64_t nova_rt_abs(int64_t x) {
 }
 int64_t nova_rt_max(int64_t a, int64_t b) { return a > b ? a : b; }
 int64_t nova_rt_min(int64_t a, int64_t b) { return a < b ? a : b; }
-int64_t nova_rt_fmax(int64_t a, int64_t b) { return f2i(fmax(i2f(a), i2f(b))); }
-int64_t nova_rt_fmin(int64_t a, int64_t b) { return f2i(fmin(i2f(a), i2f(b))); }
-int64_t nova_rt_float_to_int(int64_t x) { return (int64_t)i2f(x); }
+int64_t nova_rt_fmax(int64_t a, int64_t b) { return f2i(fmax(nova_float_arg(a), nova_float_arg(b))); }
+int64_t nova_rt_fmin(int64_t a, int64_t b) { return f2i(fmin(nova_float_arg(a), nova_float_arg(b))); }
+int64_t nova_rt_float_to_int(int64_t x) { return (int64_t)nova_float_arg(x); }
 int64_t nova_rt_int_to_float(int64_t x) { return f2i((double)x); }
 
 int64_t nova_rt_to_int(int64_t val) {
@@ -14030,21 +14064,34 @@ int64_t nova_rt_io_poll_add(int64_t poller_id, int64_t fd_val, int64_t events) {
 int64_t nova_rt_io_poll_wait(int64_t poller_id, int64_t timeout_ms) {
     int idx = (int)poller_id;
     if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return nova_rt_list_create();
-    int ret = WSAPoll(g_pollers[idx].fds, g_pollers[idx].nfds, (INT)timeout_ms);
+    /* Use select() instead of WSAPoll — WSAPoll has a known bug on Windows 10
+       where it does not report POLLIN for listening sockets with pending connections. */
+    fd_set rfds, wfds, efds;
+    FD_ZERO(&rfds); FD_ZERO(&wfds); FD_ZERO(&efds);
+    for (int i = 0; i < g_pollers[idx].nfds; i++) {
+        SOCKET s = g_pollers[idx].fds[i].fd;
+        if (g_pollers[idx].fds[i].events & POLLIN)  FD_SET(s, &rfds);
+        if (g_pollers[idx].fds[i].events & POLLOUT) FD_SET(s, &wfds);
+        FD_SET(s, &efds);
+    }
+    struct timeval tv;
+    tv.tv_sec = (long)(timeout_ms / 1000);
+    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+    int ret = select(0, &rfds, &wfds, &efds, &tv);
     int64_t result = nova_rt_list_create();
     if (ret <= 0) return result;
     for (int i = 0; i < g_pollers[idx].nfds; i++) {
-        if (g_pollers[idx].fds[i].revents == 0) continue;
-        int64_t ev = nova_rt_list_create();
-        nova_rt_list_append(ev, (int64_t)g_pollers[idx].fds[i].fd);
+        SOCKET s = g_pollers[idx].fds[i].fd;
         int64_t flags = 0;
-        if (g_pollers[idx].fds[i].revents & POLLIN)  flags |= NOVA_POLL_READ;
-        if (g_pollers[idx].fds[i].revents & POLLOUT) flags |= NOVA_POLL_WRITE;
-        if (g_pollers[idx].fds[i].revents & POLLERR) flags |= NOVA_POLL_ERROR;
-        if (g_pollers[idx].fds[i].revents & POLLHUP) flags |= NOVA_POLL_HUP;
-        nova_rt_list_append(ev, flags);
-        nova_rt_list_append(result, ev);
-        g_pollers[idx].fds[i].revents = 0;
+        if (FD_ISSET(s, &rfds))  flags |= NOVA_POLL_READ;
+        if (FD_ISSET(s, &wfds)) flags |= NOVA_POLL_WRITE;
+        if (FD_ISSET(s, &efds)) flags |= NOVA_POLL_ERROR;
+        if (flags) {
+            int64_t ev = nova_rt_list_create();
+            nova_rt_list_append(ev, (int64_t)s);
+            nova_rt_list_append(ev, flags);
+            nova_rt_list_append(result, ev);
+        }
     }
     return result;
 }
