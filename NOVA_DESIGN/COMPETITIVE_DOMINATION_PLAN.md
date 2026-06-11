@@ -14,6 +14,59 @@
 > **[PERF_ENDGAME_STAGES_3_5.md](PERF_ENDGAME_STAGES_3_5.md)**. Unified under ONE NOVA-original principle,
 > Representation Inference (not copied from Julia/Rust). Still pending here: growable stacks, WASM target.
 
+> ## ★ AUDIT RECONCILIATION 2026-06-11 (parallel 4-agent code audit + adversarial Stage-4 attack)
+>
+> **The TRUE state (verified against the real code, not this plan's stale text):**
+> - **PERF:** ~1.0× C on scalar/float math NOW (Stage 1+2+3 landed: int struct = `mul i64`; float struct math
+>   = 0 `nova_rt_unbox`, pure `load`/`fmul`/`fadd`). The ONE remaining gap to *beat* C = struct SROA (Stage 4)
+>   + monomorphic native-ABI (Stage 5) — both designed, neither built. LTO genuinely unimplemented (every clang
+>   invocation passes `-O2` only). SIMD: zero help emitted (vectorize hints deliberately absent after the
+>   693×-unroll incident). Const-eval is integer-only, intra-block.
+> - **CONCURRENCY:** green scheduler real + strong (10k tasks/382ms transparent) but **M:1** — the work-stealing
+>   multi-carrier (`ws_worker_loop`/`nova_rt_ws_init`, runtime ~4713/4756) EXISTS but is NOT wired into
+>   `nova_rt_main_dispatch` (still calls single-carrier `sched_run`). 32KB fixed fiber stacks (~30k tasks/GB vs
+>   BEAM's ~300 B/proc). Supervisor: only primitives (`monitor`/`exit_reason`) — **no strategy module, and
+>   one_for_all/rest_for_one are BLOCKED: NOVA has no process-kill (let-it-crash only), so a supervisor can't
+>   terminate healthy children.** Distributed: `node_*` TCP transport REAL; `remote_spawn`/`remote_send` are
+>   type-stubs (0 `nova_rt_remote_*` — would fail at link). Hot-swap = DLL plugins, not Erlang in-flight swap.
+> - **REACH:** async/await DONE (transparent green sched). dict comprehensions DONE. fmt+lint DONE. WASM PARTIAL
+>   (IR/datalayout correct; runtime is an i32-only interpreter — no calls/memory/f64). REPL MISSING. set
+>   comprehensions MISSING. reflection PARTIAL (`type_name`/`field_get` real; `field_names` not wired).
+>
+> **Stage-4 SROA adversarial verdict = NEEDS_REDESIGN (the attack found ≥5 CORRUPTION bugs — DO NOT ship the
+> naive alloca).** Required guards BEFORE any 4a, gated `NOVA_SROA=1`: (1) EA must mark generic-`call` args
+> escaping (whitelist pure builtins) — the biggest hole; (2) EA must mark `make_closure` captures escaping;
+> (3) EA transitive `make_struct` arg propagation (nested structs); (4) MemTag safety via **Option A** (EA keeps
+> any struct reaching `==`/hash/deep_copy/type_name/json/any-typed-call on the heap) — simpler+safer than a
+> fake-RC-header; (5) **fix the pre-existing `nova_rc_free` leak FIRST** (runtime ~6821: no `NOVA_MEM_STRUCT`
+> case → struct heap fields leak on death, while W5b already transferred ownership — confirmed real, but a
+> targeted leak/double-free test is mandatory since the short regression won't catch it); (6) field-by-field
+> `nova_rc_dec` at scope end for stack structs holding heap fields; (7) 4a (ptrtoint/inttoptr) only removes
+> malloc+RC, NOT register promotion — 4b (keep the local-struct handle as an LLVM `ptr`, direct GEP, break
+> uniform-i64 *locally*) is what actually hits registers and beats C. Do 4a → measure → 4b.
+>
+> **DE-RISKED EXECUTION ORDER (each behind the verified gate; corruption-risk items need targeted tests):**
+> 1. **LTO** — VALIDATED VIABLE (needs `-flto -fuse-ld=lld`; bare `-flto` errors "requires -fuse-ld=lld").
+>    Roll into the ~25 build scripts + the `nova_runtime.c` compile (cross-TU inlining is the real win). Safe,
+>    additive; bootstrap convergence is on `.ll` so link-LTO doesn't affect it. ~½ day + bench validation.
+> 2. **Fix `nova_rc_free` NOVA_MEM_STRUCT field-dec** — pre-existing leak; MUST precede Stage 4. + leak/double-free test.
+> 3. **Harden `ir_escape_analysis`** (the 3 guards) as its own commit + escape stress test — also makes today's
+>    RC-elision strictly more sound. De-risks Stage 4. (Mind perf: whitelist pure builtins, watch GATE 4/5.)
+> 4. **Stage 4 4a** (alloca + Option-A) behind `NOVA_SROA=1` → measure malloc+RC elimination.
+> 5. **Stage 4 4b** (ptr-typed local handle + GEP) → the real register/beat-C win for dot/matmul/physics.
+> 6. **Reach quick-wins batch:** `field_names` (wire `_make_field_types_method` ~3517), `remote_send/recv/close`
+>    codegen over the real `node_*` transport, set comprehensions. One bootstrap.
+> 7. **Stage 5** monomorphic native-ABI narrow slice (highest reconvergence risk — last in the perf push).
+> 8. **Parked (genuinely multi-week each):** M:N transparent scheduler (wire WS + make all sched state
+>    thread-safe — a soundness minefield), growable/segmented stacks, full WASM runtime, REPL (OrcJIT), true
+>    `spawn_remote` + transparent distributed channels, in-flight hot code swap, COW-on-send, full monomorphization,
+>    real SIMD via typed `double[]` arrays (Perf S4 floatlist-raw). These are weeks-to-months; sequence after
+>    the beat-C + fault-tolerance core is proven.
+>
+> Bottom line: NOVA's concurrency foundation + float perf are genuinely competitive TODAY. The "beat C" claim
+> has an asterisk until SROA+monomorphization land — and the attack has de-risked exactly how to land them
+> without corrupting memory. Detailed perf plan: [PERF_ENDGAME_STAGES_3_5.md](PERF_ENDGAME_STAGES_3_5.md).
+
 > **Philosophy:** We don't copy features. We identify the PROBLEM each language solves, then
 > solve it the NOVA way — often better, because we see the whole picture they couldn't.
 > Every gap below has been verified against the REAL `nova_compiler.nova` (16,502 lines)
