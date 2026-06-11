@@ -14019,15 +14019,23 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 // on a list -> segfault. Clearing forces the sound nova_rt_index_set
                 // dispatcher; genuinely-typed slots (literals/list_create/typed stores)
                 // keep their kind, so the inline fast path (and GATE-5 perf) is preserved.
-                if contains(e.ire_reg_types, args[0]) and e.ire_reg_types[args[0]] != "float"
+                let _ss_cur = ""
+                if contains(e.ire_reg_types, "slot." + value)
+                    _ss_cur = e.ire_reg_types["slot." + value]
+                if _ss_cur == "float" and contains(e.ire_reg_types, args[0]) and e.ire_reg_types[args[0]] == "float"
+                    // PERF Stage 3.5: an ALWAYS-FLOAT slot (pre-marked "float" by the float-slot
+                    // pre-pass — every store proven float-typed) storing a float value stays raw,
+                    // so the matching slot_load skips nova_rt_unbox and LLVM mem2reg promotes the
+                    // slot to a register. Only ever "float" here because the pre-pass set it.
+                    e.ire_reg_types["slot." + value] = "float"
+                else if contains(e.ire_reg_types, args[0]) and e.ire_reg_types[args[0]] != "float"
                     e.ire_reg_types["slot." + value] = e.ire_reg_types[args[0]]
                 else
-                    // Repr Inference soundness: NEVER propagate "float" (raw-double) onto a
-                    // mutable slot. A slot can be reassigned a boxed value on another path or
-                    // loop iteration; the emitter's reg-type map is flat (not control-flow
-                    // sensitive), so a "float" slot would let a later load wrongly skip the
-                    // unbox on a boxed value (this is exactly what broke nn/stats in attempt 1).
-                    // Float-rawness therefore lives ONLY on SSA temporaries. The container-kind
+                    // Soundness: never propagate "float" onto a slot that the pre-pass did NOT
+                    // prove always-float. A general slot can be reassigned a boxed value on
+                    // another path; the reg-type map is flat (not control-flow sensitive), so a
+                    // wrongly-"float" slot would let a later load skip the unbox on a boxed value
+                    // (exactly what broke nn/stats in Stage-2 attempt 1). Container-kind
                     // (list/dict) propagation above is unaffected.
                     e.ire_reg_types["slot." + value] = ""
                 // Track 8: if storing a local list into a slot, that slot
@@ -14617,6 +14625,43 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                 decl = decl + ") nounwind"
                 ire_line(e, decl)
                 return 0
+            // PERF Stage 3.5 (raw float locals): pre-pass to find ALWAYS-FLOAT slots —
+            // local variables where EVERY slot_store value is float-typed in the IR. Such a
+            // slot only ever holds raw double bits, so it can store/load RAW (skip
+            // nova_rt_unbox) and LLVM mem2reg promotes it to a register — closing the ~2x
+            // gap vs C on float-accumulator loops (sum/running-total/physics-integrate).
+            // SOUND because all-stores-float guarantees no boxed value is ever read raw —
+            // the unsound case the Stage-2 slot-guard conservatively blocked for untyped
+            // slots. IR-typ "float" == raw double bits (a BOXED float is typ "any").
+            let _ff_regty = {}
+            for _ff_b in blocks
+                match _ff_b
+                    IrBlock(_ff_lbl, _ff_insts, _ff_term) =>
+                        for _ff_i in _ff_insts
+                            match _ff_i
+                                IrInst(_ffo, _ffd, _fft, _ffa, _ffv, _ffn, _ffe, _ffl) =>
+                                    if _ffd != ""
+                                        match _fft
+                                            IrType(_ffk, _fftn, _fftp, _ffti) =>
+                                                _ff_regty[_ffd] = _ffk
+            let _ff_any = {}
+            let _ff_bad = {}
+            for _fg_b in blocks
+                match _fg_b
+                    IrBlock(_fg_lbl, _fg_insts, _fg_term) =>
+                        for _fg_i in _fg_insts
+                            match _fg_i
+                                IrInst(_fgo, _fgd, _fgt, _fga, _fgv, _fgn, _fge, _fgl) =>
+                                    if _fgo == "slot_store" and len(_fga) >= 1
+                                        _ff_any[_fgv] = 1
+                                        let _fgvk = ""
+                                        if contains(_ff_regty, _fga[0])
+                                            _fgvk = _ff_regty[_fga[0]]
+                                        if _fgvk != "float"
+                                            _ff_bad[_fgv] = 1
+            for _ff_s in keys(_ff_any)
+                if not contains(_ff_bad, _ff_s)
+                    e.ire_reg_types["slot." + _ff_s] = "float"
             let header = "define i64 @" + name + "("
             let i = 0
             while i < len(params)
