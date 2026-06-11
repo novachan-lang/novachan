@@ -14093,9 +14093,7 @@ int64_t nova_rt_io_poll_add(int64_t poller_id, int64_t fd_val, int64_t events) {
     return 0;
 }
 
-int64_t nova_rt_io_poll_wait(int64_t poller_id, int64_t timeout_ms) {
-    int idx = (int)poller_id;
-    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return nova_rt_list_create();
+static int64_t nova_poll_blocking(int idx, int64_t timeout_ms) {
     /* Use select() instead of WSAPoll — WSAPoll has a known bug on Windows 10
        where it does not report POLLIN for listening sockets with pending connections. */
     fd_set rfds, wfds, efds;
@@ -14191,9 +14189,7 @@ int64_t nova_rt_io_poll_add(int64_t poller_id, int64_t fd_val, int64_t events) {
     return epoll_ctl(g_pollers[idx].epfd, EPOLL_CTL_ADD, (int)fd_val, &ev) == 0 ? 0 : -1;
 }
 
-int64_t nova_rt_io_poll_wait(int64_t poller_id, int64_t timeout_ms) {
-    int idx = (int)poller_id;
-    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return nova_rt_list_create();
+static int64_t nova_poll_blocking(int idx, int64_t timeout_ms) {
     struct epoll_event events[NOVA_MAX_POLL_EVENTS];
     int n = epoll_wait(g_pollers[idx].epfd, events, NOVA_MAX_POLL_EVENTS, (int)timeout_ms);
     int64_t result = nova_rt_list_create();
@@ -14233,6 +14229,26 @@ int64_t nova_rt_io_set_nonblocking(int64_t fd_val) {
 }
 
 #endif
+
+/* Cooperative io_poll_wait: when called from inside a green task, the blocking
+   poll (select/epoll_wait) runs on the blocking-offload pool and the task PARKS,
+   so the carrier stays free to run other green tasks — including a spawned
+   tcp_connect that produces the very event we're waiting for (otherwise the
+   blocking poll would deadlock the M:N scheduler). Outside a green task it runs
+   the poll directly. Mirrors the DNS-offload pattern (nova_offload_run). */
+typedef struct { int idx; int64_t timeout_ms; int64_t result; } NovaPollOffloadArg;
+static void nova_poll_offload_fn(void* arg) {
+    NovaPollOffloadArg* a = (NovaPollOffloadArg*)arg;
+    a->result = nova_poll_blocking(a->idx, a->timeout_ms);
+}
+int64_t nova_rt_io_poll_wait(int64_t poller_id, int64_t timeout_ms) {
+    int idx = (int)poller_id;
+    if (idx < 0 || idx >= g_poller_count || !g_pollers[idx].valid) return nova_rt_list_create();
+    NovaPollOffloadArg a; a.idx = idx; a.timeout_ms = timeout_ms; a.result = 0;
+    NovaOffloadJob job; job.fn = nova_poll_offload_fn; job.arg = &a;
+    nova_offload_run(&job);   /* parks+offloads in a green task; runs synchronously otherwise */
+    return a.result;
+}
 
 /* -- Hot code loading (dlopen/LoadLibrary) -------------------------------- */
 
