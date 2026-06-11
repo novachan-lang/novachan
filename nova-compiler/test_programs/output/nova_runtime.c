@@ -4212,7 +4212,16 @@ static void nova_sched_park_io(int64_t fd, int events) {
 
 static int64_t nova_sched_now_ms(void) {
 #ifdef _WIN32
-    return (int64_t)GetTickCount64();
+    /* High-resolution monotonic ms via QPC. GetTickCount64 has ~15.6ms granularity,
+       so a sleep(10) deadline could be satisfied in near-zero REAL time when the park
+       lands just before a tick boundary (the coarse clock "jumps" a full tick) — green
+       sleep then returned early vs the fine-grained time_ms(), breaking duration logic.
+       QPC gives sub-ms accuracy so sleep(ms) parks for at least ms of real time. */
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (c.QuadPart / freq.QuadPart) * 1000
+         + ((c.QuadPart % freq.QuadPart) * 1000) / freq.QuadPart;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -4246,7 +4255,10 @@ static void nova_sched_park_sleep(int64_t ms) {
     NovaSleepWaiter* w = (NovaSleepWaiter*)calloc(1, sizeof(NovaSleepWaiter));
     if (!w) return;
     w->task = t;
-    w->wake_time_ms = nova_sched_now_ms() + ms;
+    /* +1 (for ms>0) guarantees AT LEAST ms of real sleep: nova_sched_now_ms() floors to
+       whole ms, so a bare "+ ms" deadline can be satisfied ~1ms early (the park instant's
+       sub-ms fraction is truncated). sleep(ms) must never return before ms elapses. */
+    w->wake_time_ms = nova_sched_now_ms() + ms + (ms > 0 ? 1 : 0);
     w->next = nova_sleep_waiters;
     nova_sleep_waiters = w;
     t->status = 2;
