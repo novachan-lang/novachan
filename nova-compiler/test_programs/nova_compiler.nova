@@ -13505,8 +13505,19 @@ fn ire_indent(e: IrEmitter, line: string)
         push(e.ire_out, "  " + line)
 
 fn ire_float_load(e: IrEmitter, dst: string, src: string)
-    ire_indent(e, dst + ".ub = call i64 @nova_rt_unbox(i64 " + src + ")")
-    ire_indent(e, dst + " = bitcast i64 " + dst + ".ub to double")
+    // PERF — Representation Inference (the sound rule): skip nova_rt_unbox ONLY when src
+    // is a register the emitter can PROVE holds raw double bits. We mark "float" exclusively
+    // on SSA temporaries that are themselves float-arith results or const_float (single-
+    // assignment → provably raw). The mark is NEVER propagated through a mutable slot
+    // (see slot_store), because a slot can hold a boxed value on another path/iteration —
+    // that unsoundness is what broke nn/stats in attempt 1. For everything not provably raw
+    // we keep the unbox (a no-op on raw values, correct on boxes). LLVM then folds the
+    // double->i64->double round-trips into a clean fmul/fadd chain.
+    if contains(e.ire_reg_types, src) and e.ire_reg_types[src] == "float"
+        ire_indent(e, dst + " = bitcast i64 " + src + " to double")
+    else
+        ire_indent(e, dst + ".ub = call i64 @nova_rt_unbox(i64 " + src + ")")
+        ire_indent(e, dst + " = bitcast i64 " + dst + ".ub to double")
 
 fn ire_intern_string(e: IrEmitter, s: string) -> string
     if contains(e.ire_smap, s)
@@ -13558,6 +13569,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
             else if op == "const_float"
                 ire_indent(e, dest + " = add i64 " + fmt_i64_decimal(num) + ", 0")
+                e.ire_reg_types[dest] = "float"   // Repr Inference: SSA temp, provably raw double bits
             else if op == "const_str"
                 let str_name = ire_intern_string(e, value)
                 let byte_len = len(value) + 1
@@ -13581,6 +13593,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fadd double " + af + ", " + bf)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
+                            e.ire_reg_types[dest] = "float"   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
                             ire_indent(e, dest + " = add i64 " + args[0] + ", " + args[1])
                         else if tk == "str"
@@ -13604,6 +13617,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fsub double " + af + ", " + bf)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
+                            e.ire_reg_types[dest] = "float"   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
                             ire_indent(e, dest + " = sub i64 " + args[0] + ", " + args[1])
                         else
@@ -13625,6 +13639,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fmul double " + af + ", " + bf)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
+                            e.ire_reg_types[dest] = "float"   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
                             ire_indent(e, dest + " = mul i64 " + args[0] + ", " + args[1])
                         else
@@ -13646,6 +13661,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = fdiv double " + af + ", " + bf)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
+                            e.ire_reg_types[dest] = "float"   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
                             ire_indent(e, dest + " = sdiv i64 " + args[0] + ", " + args[1])
                         else
@@ -13667,6 +13683,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                                 ire_float_load(e, bf, args[1])
                             ire_indent(e, rf + " = frem double " + af + ", " + bf)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
+                            e.ire_reg_types[dest] = "float"   // Repr Inference: SSA temp, provably raw double bits
                         else
                             ire_indent(e, dest + " = srem i64 " + args[0] + ", " + args[1])
             else if op == "neg"
@@ -13678,6 +13695,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_float_load(e, af, args[0])
                             ire_indent(e, rf + " = fsub double -0.0, " + af)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
+                            e.ire_reg_types[dest] = "float"   // Repr Inference: SSA temp, provably raw double bits
                         else
                             ire_indent(e, dest + " = sub i64 0, " + args[0])
             else if op == "eq"
@@ -13937,9 +13955,16 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 // on a list -> segfault. Clearing forces the sound nova_rt_index_set
                 // dispatcher; genuinely-typed slots (literals/list_create/typed stores)
                 // keep their kind, so the inline fast path (and GATE-5 perf) is preserved.
-                if contains(e.ire_reg_types, args[0])
+                if contains(e.ire_reg_types, args[0]) and e.ire_reg_types[args[0]] != "float"
                     e.ire_reg_types["slot." + value] = e.ire_reg_types[args[0]]
                 else
+                    // Repr Inference soundness: NEVER propagate "float" (raw-double) onto a
+                    // mutable slot. A slot can be reassigned a boxed value on another path or
+                    // loop iteration; the emitter's reg-type map is flat (not control-flow
+                    // sensitive), so a "float" slot would let a later load wrongly skip the
+                    // unbox on a boxed value (this is exactly what broke nn/stats in attempt 1).
+                    // Float-rawness therefore lives ONLY on SSA temporaries. The container-kind
+                    // (list/dict) propagation above is unaffected.
                     e.ire_reg_types["slot." + value] = ""
                 // Track 8: if storing a local list into a slot, that slot
                 // is now a local-list slot. Loads from it propagate.
