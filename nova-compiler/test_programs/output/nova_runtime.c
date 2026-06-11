@@ -8460,7 +8460,11 @@ int64_t nova_rt_tensor_to_list(int64_t t_handle) {
     for (int64_t i = 0; i < t->size; i++) {
         int64_t bits;
         memcpy(&bits, &t->data[i], sizeof(bits));
-        nova_rt_list_append(list, bits);
+        /* Tensor data is always float — box each element so the list slot is a
+           self-describing float (value-model invariant). A raw-bits append would
+           make logits[k] an int-looking element that dynamic arith (v + bias[k])
+           and read-back misinterpret. See VALUE_MODEL_OVERHAUL.md. */
+        nova_rt_list_append_fbox(list, bits);
     }
     return list;
 }
@@ -9423,8 +9427,7 @@ int64_t nova_rt_format(int64_t template_s, int64_t args_handle) {
                 }
                 vbuf[vlen] = 0;
             } else if (type_ch == 'f') {
-                double d;
-                memcpy(&d, &val, sizeof(d));
+                double d = nova_float_arg(val);
                 if (precision < 0) precision = 6;
                 vlen = snprintf(vbuf, sizeof(vbuf), "%.*f", precision, d);
             } else if (type_ch == 's' || type_ch == 0) {
@@ -10195,10 +10198,9 @@ int64_t nova_rt_assert_false(int64_t val) {
 }
 
 int64_t nova_rt_assert_near(int64_t actual_bits, int64_t expected_bits, int64_t eps_bits) {
-    double a, e, eps;
-    memcpy(&a, &actual_bits, sizeof(double));
-    memcpy(&e, &expected_bits, sizeof(double));
-    memcpy(&eps, &eps_bits, sizeof(double));
+    double a = nova_float_arg(actual_bits);
+    double e = nova_float_arg(expected_bits);
+    double eps = nova_float_arg(eps_bits);
     if (fabs(a - e) <= eps) {
         nova_test_pass++;
         return 1;
@@ -11203,8 +11205,7 @@ void nova_rt_buffer_append_int(int64_t handle, int64_t val) {
 void nova_rt_buffer_append_float(int64_t handle, int64_t val) {
     if (!handle) return;
     NovaBuffer* buf = (NovaBuffer*)(uintptr_t)handle;
-    double d;
-    memcpy(&d, &val, sizeof(double));
+    double d = nova_float_arg(val);
     char tmp[64];
     int n = snprintf(tmp, sizeof(tmp), "%.15g", d);
     if (n <= 0) return;
@@ -12052,10 +12053,9 @@ int64_t nova_rt_assert_contains(int64_t coll, int64_t item) {
 
 /* assert_approx: |a - b| <= eps (floating point comparison with tolerance) */
 int64_t nova_rt_assert_approx(int64_t actual_bits, int64_t expected_bits, int64_t eps_bits) {
-    double a, e, eps;
-    memcpy(&a, &actual_bits,   sizeof(double));
-    memcpy(&e, &expected_bits, sizeof(double));
-    memcpy(&eps, &eps_bits,    sizeof(double));
+    double a = nova_float_arg(actual_bits);
+    double e = nova_float_arg(expected_bits);
+    double eps = nova_float_arg(eps_bits);
     if (fabs(a - e) <= eps) { nova_test_pass++; return 1; }
     nova_test_fail++;
     fprintf(stderr, "  FAIL assert_approx: |%.15g - %.15g| = %.15g > eps=%.15g\n",
@@ -14740,7 +14740,7 @@ int64_t nova_rt_json_encode(int64_t val) {
    a primitive's type from a bare i64 (FINDING #1). Fixes json_encode(3.14)->"3.14"
    (was garbage bits) and json_encode(true)->"true". */
 int64_t nova_rt_json_encode_float(int64_t bits) {
-    double d; memcpy(&d, &bits, sizeof(d));
+    double d = nova_float_arg(bits);
     /* %.15g matches str()/float_to_str (was %g = 6 sig figs, silently truncating
        precision so json round-trip lost data). */
     char buf[40]; snprintf(buf, sizeof(buf), "%.15g", d);
