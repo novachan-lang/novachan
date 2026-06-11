@@ -13014,6 +13014,12 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         is_marker = "bbox"
                 return IrInst(op, dest, typ, args, is_marker, is_nn, effect, line)
             else if op == "field_get"
+                // Stage 3: propagate the inference-RESOLVED field type onto the returned
+                // inst's typ (was kept as the lowering-time typ, which is "any" for an
+                // UNANNOTATED receiver). The IRE field_get mark reads typ to decide whether
+                // to mark the result "float" — without this, unannotated struct field reads
+                // (e.g. dot_unann) keep their unbox while annotated ones (dot_typed) don't.
+                let fg_rtyp = typ
                 if dest != ""
                     if value == "__type_hash"
                         rt[dest] = "int"
@@ -13027,6 +13033,7 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                                     let _fg_ft = frt[_fg_sfk]
                                     if _fg_ft == "float"
                                         rt[dest] = "float"
+                                        fg_rtyp = ir_type_float()
                                         _fg_resolved = true
                                     else if _fg_ft == "int"
                                         rt[dest] = "int"
@@ -13045,7 +13052,7 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                                         rt[dest] = "str"
                                     else
                                         rt[dest] = "any"
-                return inst
+                return IrInst(op, dest, fg_rtyp, args, value, num, effect, line)
             else if op == "is_error"
                 if dest != ""
                     rt[dest] = "int"
@@ -13191,6 +13198,63 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                 rt["@wbox@"] = sbc + 1
                                 push(new_insts, IrInst("call", sbr, ir_type_any(), [args[0]], "nova_rt_box_float", 0, "pure", line))
                                 push(new_insts, IrInst(op, dest, typ, [sbr], value, num, effect, line))
+                                handled = true
+                        else if op == "make_struct"
+                            // PERF Stage 3 narrow (any->raw at a float-field WRITE): a float
+                            // struct field must hold RAW double bits so the read can skip the
+                            // unbox. A "float" arg is already raw (Stage 2). An "any" arg is a
+                            // BOXED float (e.g. from a dict/list/generic read) — unbox it to raw
+                            // bits before storing, so ALL float fields are consistently raw
+                            // (keeps ==/hash/deep_copy, which compare slot bits, consistent).
+                            // Positional float-field map via "@sfkinds@" (args are positional).
+                            let mk_kinds = ""
+                            if contains(frt, "@sfkinds@" + value)
+                                mk_kinds = frt["@sfkinds@" + value]
+                            let mk_need = false
+                            let mk_ck = 0
+                            for mk_ca in args
+                                if mk_ck < len(mk_kinds)
+                                    if mk_kinds[mk_ck] == "f" and ir_reg_type(rt, mk_ca) == "any"
+                                        mk_need = true
+                                mk_ck = mk_ck + 1
+                            if mk_need
+                                let mk_new = []
+                                let mk_i = 0
+                                for mk_a in args
+                                    let mk_do = false
+                                    if mk_i < len(mk_kinds)
+                                        if mk_kinds[mk_i] == "f" and ir_reg_type(rt, mk_a) == "any"
+                                            mk_do = true
+                                    if mk_do
+                                        let nbc = 0
+                                        if contains(rt, "@wbox@")
+                                            nbc = rt["@wbox@"]
+                                        let nbr = "%wbox" + str(nbc)
+                                        rt["@wbox@"] = nbc + 1
+                                        push(new_insts, IrInst("call", nbr, ir_type_float(), [mk_a], "nova_rt_unbox", 0, "pure", line))
+                                        push(mk_new, nbr)
+                                    else
+                                        push(mk_new, mk_a)
+                                    mk_i = mk_i + 1
+                                push(new_insts, IrInst(op, dest, typ, mk_new, value, num, effect, line))
+                                handled = true
+                        else if op == "field_set" and len(args) >= 2
+                            // Stage 3 narrow at obj.x = v when x is a float field: unbox an
+                            // `any` (boxed) v to raw bits, mirroring the make_struct narrow.
+                            let fs_sty = ir_reg_type(rt, args[0])
+                            let fs_ft = ""
+                            if fs_sty != "" and fs_sty != "any" and fs_sty != "val"
+                                let fs_key = "@sf@" + fs_sty + "." + value
+                                if contains(frt, fs_key)
+                                    fs_ft = frt[fs_key]
+                            if fs_ft == "float" and ir_reg_type(rt, args[1]) == "any"
+                                let fbc = 0
+                                if contains(rt, "@wbox@")
+                                    fbc = rt["@wbox@"]
+                                let fbr = "%wbox" + str(fbc)
+                                rt["@wbox@"] = fbc + 1
+                                push(new_insts, IrInst("call", fbr, ir_type_float(), [args[1]], "nova_rt_unbox", 0, "pure", line))
+                                push(new_insts, IrInst(op, dest, typ, [args[0], fbr], value, num, effect, line))
                                 handled = true
                 if not handled
                     push(new_insts, ti)
@@ -14180,6 +14244,13 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 let gep = dest + ".gep"
                 ire_indent(e, gep + " = getelementptr i64, ptr " + ptr_name + ", i64 " + str(num))
                 ire_indent(e, dest + " = load i64, ptr " + gep + ", align 8")
+                // PERF Stage 3: a float field is now guaranteed to hold RAW double bits
+                // (every write narrows any->raw), so mark the read result "float" — the
+                // Stage-2 ire_float_load then emits bitcast-only and skips nova_rt_unbox.
+                match typ
+                    IrType(fg_tk, fg_tn, fg_tp, fg_tid) =>
+                        if fg_tk == "float"
+                            e.ire_reg_types[dest] = "float"
             else if op == "field_set"
                 let ptr_name = dest + ".ptr"
                 ire_indent(e, ptr_name + " = inttoptr i64 " + args[0] + " to ptr")
@@ -15863,6 +15934,22 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let _sft_keys = keys(b.ir_field_types)
     for _sfk in _sft_keys
         frt["@sf@" + _sfk] = b.ir_field_types[_sfk]
+    // PERF Stage 3 (Representation Inference): per-struct POSITIONAL float-field map.
+    // "@sfkinds@<Struct>" -> a string with one char per field in declaration order:
+    // "f" if that field is float, "." otherwise. make_struct args are positional, but
+    // field types in frt are keyed by name; this gives the coercion pass position->kind
+    // so it can narrow an `any` (boxed) arg destined for a float field back to raw bits.
+    let _sd_keys = keys(b.ir_sdefs)
+    for _sdn in _sd_keys
+        let _sfkinds = ""
+        for _sfp in b.ir_sdefs[_sdn]
+            match _sfp
+                Param(_pn, _pt, _pd) =>
+                    if _pt == "float"
+                        _sfkinds = _sfkinds + "f"
+                    else
+                        _sfkinds = _sfkinds + "."
+        frt["@sfkinds@" + _sdn] = _sfkinds
     let fpt = {}
     let changed = true
     let pass_count = 0
