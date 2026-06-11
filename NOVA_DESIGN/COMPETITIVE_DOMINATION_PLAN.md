@@ -3,6 +3,17 @@
 **Created:** 2026-06-09
 **Status:** ACTIVE — the roadmap for NOVA's core to beat C, C++, Java, Python, Go, Rust, JavaScript, Erlang, and Elixir
 
+> **PROGRESS UPDATE 2026-06-11.** Shipped since this was written: M:N work-stealing multi-carrier
+> scheduler (Tier-2 #6 — the #1 priority), netpoller + DNS offload, transparent green `main` (10k green
+> tasks incl. 10k parked in 382ms), accurate green sleep + uwtable error unwinding. On the perf front,
+> the "C-level perf asterisk" (Tier-1 #4 stack-alloc + the i64-ABI float boxing) is now an ACTIVE,
+> code-grounded push: **Perf Stage 1 DONE** (inferred types → native fmul/mul, int struct = C-parity),
+> **Stage 2 DONE & sound** (redundant float-unbox elimination). The remaining perf-domination work —
+> **Stages 3 (raw float fields) → 4 (struct SROA / stack-alloc == this plan's Tier-1 #4) → 5 (native-ABI
+> specialization)** — is now a concrete ~5-day execution plan: see
+> **[PERF_ENDGAME_STAGES_3_5.md](PERF_ENDGAME_STAGES_3_5.md)**. Unified under ONE NOVA-original principle,
+> Representation Inference (not copied from Julia/Rust). Still pending here: growable stacks, WASM target.
+
 > **Philosophy:** We don't copy features. We identify the PROBLEM each language solves, then
 > solve it the NOVA way — often better, because we see the whole picture they couldn't.
 > Every gap below has been verified against the REAL `nova_compiler.nova` (16,502 lines)
