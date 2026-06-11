@@ -6668,9 +6668,10 @@ type IrBuilder
     ir_consts: dict
     ir_filename: string
     ir_fn_name: string
+    ir_fn_param_stypes: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "")
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {})
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -8864,14 +8865,27 @@ fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
         Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
             let ir_params = []
             b.ir_locals = {}
+            // Inferred param struct-types (Stage 1): the HM inferer already knows an
+            // unannotated param's struct type; use it so field access lowers natively
+            // (a.x*b.x -> fmul, not nova_rt_mul). See PERFORMANCE_SPECIALIZATION.md.
+            let _fnkey = name
+            if _fnkey == "main"
+                _fnkey = "nova_user_main"
+            let _inf_pst = []
+            if contains(b.ir_fn_param_stypes, _fnkey)
+                _inf_pst = b.ir_fn_param_stypes[_fnkey]
+            let _pidx = 0
             for p in params
                 match p
                     Param(pname, ptype, pdefault) =>
                         push(ir_params, IrParam(pname, source_type_to_ir(ptype)))
                         if ptype != "" and (contains(b.ir_sdefs, ptype) or _is_builtin_type_name(ptype))
                             b.ir_locals[pname] = ptype
+                        else if _pidx < len(_inf_pst) and contains(b.ir_sdefs, _inf_pst[_pidx])
+                            b.ir_locals[pname] = _inf_pst[_pidx]
                         else
                             b.ir_locals[pname] = 1
+                        _pidx = _pidx + 1
             let dunder = find(name, "__")
             if dunder > 0
                 let self_type = slice(name, 0, dunder)
@@ -8985,6 +8999,7 @@ type TiState
     ti_aliases: dict
     ti_variadic: dict
     ti_must_use: list
+    ti_fn_param_types: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -9052,7 +9067,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [])
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -11371,6 +11386,15 @@ fn ti_to_ir_kind(t: NType) -> string
                 return "struct"
     "any"
 
+// Like ti_to_ir_kind but preserves the struct NAME (e.g. "Point") for a struct —
+// codegen needs the name to look up field types and type field access natively.
+fn ti_to_ir_stype(t: NType) -> string
+    match t
+        NType(kind, name, params, id) =>
+            if kind == "struct" and name != ""
+                return name
+    ti_to_ir_kind(t)
+
 // ── Unused-variable analysis (catches typos like `counte = counter + 1`) ─────
 
 fn unused_reads_expr(e: Expr, reads: dict)
@@ -11734,6 +11758,19 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
         let d_resolved = ti_zonk(st, d_fn_type)
         ti_define(st, dn, ti_generalize(st, d_resolved))
         st.ti_fn_types[d_fn_name] = ti_to_ir_kind(ti_apply(st, d_ret_var))
+        // Stage 1 (beat-C): export FULLY-RESOLVED param types here — after the whole
+        // program is inferred + final ti_solve, an unannotated struct param (e.g. dot's
+        // `a`) is now unified to its concrete struct via call sites. Codegen reads these
+        // to type field access natively (a.x*b.x -> fmul). See PERFORMANCE_SPECIALIZATION.md.
+        let _dpst = []
+        match d_resolved
+            NType(_dk, _dn2, _dps, _did) =>
+                if _dk == "fn" and len(_dps) >= 1
+                    let _dpi = 0
+                    while _dpi < len(_dps) - 1
+                        push(_dpst, ti_to_ir_stype(_dps[_dpi]))
+                        _dpi = _dpi + 1
+        st.ti_fn_param_types[d_fn_name] = _dpst
     ti_check_bounds(st)
     st
 
@@ -12865,7 +12902,7 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 return inst
             else if op == "make_struct"
                 if dest != ""
-                    rt[dest] = "struct"
+                    rt[dest] = value
                 return inst
             else if op == "make_list"
                 // Encode each element's box-kind into the inst value ("f"=float,
@@ -12945,16 +12982,33 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     if value == "__type_hash"
                         rt[dest] = "int"
                     else
-                        match typ
-                            IrType(tk, tn, tp, tid) =>
-                                if tk == "float"
-                                    rt[dest] = "float"
-                                else if tk == "int"
-                                    rt[dest] = "int"
-                                else if tk == "str"
-                                    rt[dest] = "str"
-                                else
-                                    rt[dest] = "any"
+                        let _fg_resolved = false
+                        if len(args) > 0
+                            let _fg_recv = ir_reg_type(rt, args[0])
+                            if _fg_recv != "any" and _fg_recv != "val" and _fg_recv != "struct"
+                                let _fg_sfk = "@sf@" + _fg_recv + "." + value
+                                if contains(frt, _fg_sfk)
+                                    let _fg_ft = frt[_fg_sfk]
+                                    if _fg_ft == "float"
+                                        rt[dest] = "float"
+                                        _fg_resolved = true
+                                    else if _fg_ft == "int"
+                                        rt[dest] = "int"
+                                        _fg_resolved = true
+                                    else if _fg_ft == "string" or _fg_ft == "str"
+                                        rt[dest] = "str"
+                                        _fg_resolved = true
+                        if not _fg_resolved
+                            match typ
+                                IrType(tk, tn, tp, tid) =>
+                                    if tk == "float"
+                                        rt[dest] = "float"
+                                    else if tk == "int"
+                                        rt[dest] = "int"
+                                    else if tk == "str"
+                                        rt[dest] = "str"
+                                    else
+                                        rt[dest] = "any"
                 return inst
             else if op == "is_error"
                 if dest != ""
@@ -14678,6 +14732,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
 
     let b = new_ir_builder()
     b.ir_filename = filename
+    b.ir_fn_param_stypes = ti_state.ti_fn_param_types
     let resolved_target = resolve_target(target)
     let e = new_ir_emitter(filename, resolved_target)
     // NOVA_COV=1 environment toggle: when set, the IR emitter injects
@@ -15725,6 +15780,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     let frt = {}
     for ti_fname in keys(ti_state.ti_fn_types)
         frt[ti_fname] = ti_state.ti_fn_types[ti_fname]
+    let _sft_keys = keys(b.ir_field_types)
+    for _sfk in _sft_keys
+        frt["@sf@" + _sfk] = b.ir_field_types[_sfk]
     let fpt = {}
     let changed = true
     let pass_count = 0
