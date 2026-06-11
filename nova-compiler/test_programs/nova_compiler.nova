@@ -12131,6 +12131,130 @@ fn ir_escape_analysis(func: IrFunction) -> list
             // element is the local-dest set for codegen consumption.
             [n_allocs, n_escape, local_set]
 
+// ── Stage 4 SROA: interprocedural escape analysis ───────────────────────────
+// ir_escaping_set computes the set of value-regs that ESCAPE the function, using
+// an interprocedural summary for user-function calls (an arg escapes only if the
+// callee's corresponding parameter escapes). Unknown/builtin callees conservatively
+// escape ALL their args — this is SOUND and, for free, keeps any struct passed to a
+// tag-reading runtime fn (nova_rt_eq/hash/deep_copy/type_name/print/...) on the heap
+// (the MemTag guard), since those are non-summary calls. This is SEPARATE from
+// ir_escape_analysis's local_set (which drives RC-elision) so it cannot perturb that.
+fn ir_escaping_set(func: IrFunction, summaries: dict) -> dict
+    match func
+        IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
+            let escaping = {}
+            for block in blocks
+                match block
+                    IrBlock(_, insts, terminator) =>
+                        for inst in insts
+                            match inst
+                                IrInst(op, dest, _, args, value, _, _, _) =>
+                                    if op == "call"
+                                        if contains(summaries, value)
+                                            let pm = summaries[value]
+                                            let ai = 0
+                                            while ai < len(args)
+                                                if contains(pm, str(ai))
+                                                    escaping[args[ai]] = 1
+                                                ai = ai + 1
+                                        else
+                                            let bi = 0
+                                            while bi < len(args)
+                                                escaping[args[bi]] = 1
+                                                bi = bi + 1
+                                    if op == "field_set" or op == "index_set"
+                                        if len(args) >= 3
+                                            escaping[args[2]] = 1
+                        match terminator
+                            IrInst(top, _, _, targs, _, _, _, _) =>
+                                if top == "return" and len(targs) > 0
+                                    escaping[targs[0]] = 1
+            let changed = true
+            while changed
+                changed = false
+                for block in blocks
+                    match block
+                        IrBlock(_, insts, _) =>
+                            for inst in insts
+                                match inst
+                                    IrInst(op, dest, _, args, value, _, _, _) =>
+                                        if dest != "" and contains(escaping, dest)
+                                            if op == "copy" or op == "slot_load"
+                                                let src_key = ""
+                                                if op == "slot_load"
+                                                    src_key = "slot." + value
+                                                else if len(args) > 0
+                                                    src_key = args[0]
+                                                if src_key != "" and not contains(escaping, src_key)
+                                                    escaping[src_key] = 1
+                                                    changed = true
+                                        if op == "copy" and len(args) > 0
+                                            if contains(escaping, args[0]) and dest != "" and not contains(escaping, dest)
+                                                escaping[dest] = 1
+                                                changed = true
+                                        if op == "slot_store" and len(args) > 0
+                                            let slot_k = "slot." + value
+                                            if contains(escaping, slot_k) and not contains(escaping, args[0])
+                                                escaping[args[0]] = 1
+                                                changed = true
+            escaping
+
+// ir_escape_summaries: fixpoint over all functions computing, per function, the SET of
+// parameter indices that escape. Monotonic (escapes only grow), so it converges; capped
+// at 8 iterations defensively. summaries[fname] = dict of "<paramIndex>" -> 1.
+fn ir_escape_summaries(all_fns: list) -> dict
+    let summ = {}
+    for fnx in all_fns
+        match fnx
+            IrFunction(fnname, _, _, _, _, fex) =>
+                if fex == 0
+                    summ[fnname] = {}
+    let changed = true
+    let iters = 0
+    while changed and iters < 8
+        changed = false
+        iters = iters + 1
+        for fnx in all_fns
+            match fnx
+                IrFunction(fnname, fparams, _, fblocks, _, fex) =>
+                    if fex == 0 and len(fblocks) > 0
+                        let esc = ir_escaping_set(fnx, summ)
+                        let newpm = {}
+                        let pi = 0
+                        for p in fparams
+                            match p
+                                Param(pn, pt, pd) =>
+                                    if contains(esc, "%p" + str(pi)) or contains(esc, "slot." + pn)
+                                        newpm[str(pi)] = 1
+                            pi = pi + 1
+                        let oldn = 0
+                        if contains(summ, fnname)
+                            oldn = len(keys(summ[fnname]))
+                        if len(keys(newpm)) != oldn
+                            summ[fnname] = newpm
+                            changed = true
+    summ
+
+// ir_stackable_structs: make_struct dests safe to STACK-allocate — non-escaping (per the
+// interprocedural escaping set) AND all-scalar-field type (no heap fields => zero RC concern
+// in any mode). The all-scalar restriction + the escaping set (which keeps any struct reaching
+// a runtime polymorphic/tag-reading path on the heap) make this sound for stack allocation.
+fn ir_stackable_structs(func: IrFunction, summaries: dict, allscalar_types: dict) -> dict
+    let esc = ir_escaping_set(func, summaries)
+    let stackable = {}
+    match func
+        IrFunction(_, _, _, blocks, _, _) =>
+            for block in blocks
+                match block
+                    IrBlock(_, insts, _) =>
+                        for inst in insts
+                            match inst
+                                IrInst(op, dest, _, args, value, _, _, _) =>
+                                    if op == "make_struct" and dest != ""
+                                        if not contains(esc, dest) and contains(allscalar_types, value)
+                                            stackable[dest] = 1
+    stackable
+
 // Track 8 W7 helper: returns 1 if any function in the program calls
 // spawn (directly via "spawn" or "nova_rt_spawn"). Used by the auto-arena
 // pass: if no spawn anywhere, the program is single-process and can run
@@ -16035,6 +16159,23 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         changed = true
     fpt = ir_collect_param_types(all_fns, frt)
 
+    // Stage 4 SROA (Step A — analysis only, no codegen change yet): the set of all-scalar
+    // struct types (every field int/float/bool => no heap fields => zero RC concern in any
+    // mode) + the interprocedural escape summary. Together they drive ir_stackable_structs,
+    // emitted below as ; STACKABLE comments so the analysis can be validated before the
+    // alloca codegen is wired (which will be gated behind NOVA_SROA=1).
+    let _allscalar = {}
+    for _sdt in keys(b.ir_sdefs)
+        let _allsc = 1
+        for _sfp in b.ir_sdefs[_sdt]
+            match _sfp
+                Param(_apn, _apt, _apd) =>
+                    if _apt != "int" and _apt != "float" and _apt != "bool"
+                        _allsc = 0
+        if _allsc == 1
+            _allscalar[_sdt] = 1
+    let _esumm = ir_escape_summaries(all_fns)
+
     // Pass 3: Infer types with inter-procedural info and emit
     // Plumb @repr(C) type set from the IR builder into the LLVM emitter so
     // make_struct can skip the type-hash slot for C-layout structs.
@@ -16071,6 +16212,12 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             match typed_fn
                 IrFunction(fname, _, _, _, _, _) =>
                     ire_line(e, "; ESCAPE " + fname + ": allocs=" + str(ea[0]) + " escape=" + str(ea[1]) + " local=" + str(ea[0] - ea[1]))
+                    let _stk = ir_stackable_structs(typed_fn, _esumm, _allscalar)
+                    if len(keys(_stk)) > 0
+                        let _sl = "; STACKABLE " + fname + ":"
+                        for _sk in keys(_stk)
+                            _sl = _sl + " " + _sk
+                        ire_line(e, _sl)
         ire_emit_function(e, typed_fn)
 
     // Emit nova_main
@@ -16085,6 +16232,12 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             for k in keys(local_set_m)
                 e.ire_local_lists[k] = 1
         ire_line(e, "; ESCAPE nova_main: allocs=" + str(ea_main[0]) + " escape=" + str(ea_main[1]) + " local=" + str(ea_main[0] - ea_main[1]))
+        let _stkm = ir_stackable_structs(typed_main, _esumm, _allscalar)
+        if len(keys(_stkm)) > 0
+            let _slm = "; STACKABLE nova_main:"
+            for _skm in keys(_stkm)
+                _slm = _slm + " " + _skm
+            ire_line(e, _slm)
     ire_emit_function(e, typed_main)
 
     // Emit any lambdas generated during nova_main lowering
