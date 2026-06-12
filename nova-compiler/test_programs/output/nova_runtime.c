@@ -510,12 +510,55 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
        outside [heap_base, heap_top) cannot be a NOVA heap object (it's a raw int or
        float-bit pattern), so reject it without touching memory — safe on every OS. */
     if (nova_heap_base && (addr < nova_heap_base || addr >= nova_heap_top)) return (NovaMemTag)-1;
+    /* Sound fast-reject: every NOVA managed pointer is 8-aligned — an 8-byte RC
+       header sits on a >=16-aligned base (calloc / slab page / _aligned_malloc /
+       fat-string), so the returned pointer is always a multiple of 8. A candidate
+       that is not 8-aligned therefore cannot be a real object; reject it with no
+       dereference. This never rejects a genuine object. */
+    if (addr & 0x7ULL) return (NovaMemTag)-1;
 #ifdef _WIN32
     if (IsBadReadPtr((char*)ptr - NOVA_RC_HDR_SIZE, NOVA_RC_HDR_SIZE)) return (NovaMemTag)-1;
 #endif
-    /* Mask to the low 3 kind bits: structs pack a slot count above them. */
-    if (NOVA_RC_VALID(ptr)) return (NovaMemTag)(NOVA_RC_TAG(ptr) & 0x7);
-    return (NovaMemTag)-1;
+    if (!NOVA_RC_VALID(ptr)) return (NovaMemTag)-1;
+    /* A live object reachable as an operand always carries a positive reference
+       count (every allocator path initializes rc=1). A stray integer that happens
+       to fake the 16-bit magic almost never also presents rc>=1 — a second sound
+       reject (rc is the int32 at ptr-8). */
+    if (((const int32_t*)ptr)[-2] < 1) return (NovaMemTag)-1;
+    {
+        /* Mask to the low 3 kind bits: structs pack a slot count above them. */
+        NovaMemTag kind = (NovaMemTag)(NOVA_RC_TAG(ptr) & 0x7);
+        /* STRUCTURAL VALIDATION — the decisive sound filter against the uniform-i64
+           int/pointer ambiguity. The 16-bit magic alone is too weak under heavy
+           untyped (`any`) integer arithmetic: nova_rt_add/mul probe ~10^6 operands,
+           so a 1/65536 magic collision becomes likely, and misreading an integer as
+           a LIST/DICT (then *_repeat dereferences it) or FAT_STR (repeat reads it)
+           is a CVE-class wild-pointer crash. For exactly those dereference-dangerous
+           kinds, confirm the object's own invariants. The bounds hold for EVERY
+           genuine object (0<=size<=cap, len>=0, below a physically impossible
+           element/byte count), so no real object is ever rejected; a faked one
+           almost never passes. Reads past the guaranteed 8-byte header are bounded
+           to the tracked heap [heap_base, heap_top) so validation cannot fault in
+           practice. STRUCT/CHANNEL/BOX/ITER fall through to safe integer arithmetic
+           and need no field check. Full provable soundness is value tagging
+           (NOVA_DESIGN/VALUE_MODEL_OVERHAUL.md); this eliminates the crash today at
+           zero hot-path cost. Layouts: NovaList{data,size,cap} -> size@+8 cap@+16;
+           NovaDict{keys,vals,hashes,size,cap,...} -> size@+24 cap@+32;
+           fat-string NOVA_FAT_LEN -> int64 at ptr-16. */
+        if (nova_heap_base && (kind == NOVA_MEM_LIST || kind == NOVA_MEM_DICT)) {
+            size_t span = (kind == NOVA_MEM_DICT) ? 40u : 24u;
+            if ((uintptr_t)((const char*)ptr + span) > nova_heap_top) return (NovaMemTag)-1;
+            int64_t sz, cp;
+            if (kind == NOVA_MEM_LIST) { sz = ((const int64_t*)ptr)[1]; cp = ((const int64_t*)ptr)[2]; }
+            else                       { sz = ((const int64_t*)ptr)[3]; cp = ((const int64_t*)ptr)[4]; }
+            if (sz < 0 || cp < sz || (uint64_t)cp > (1ULL << 40)) return (NovaMemTag)-1;
+        } else if (nova_heap_base && kind == NOVA_MEM_FAT_STR) {
+            if ((uintptr_t)((const char*)ptr - 16) < nova_heap_base) return (NovaMemTag)-1;
+            int64_t len = ((const int64_t*)ptr)[-2];
+            if (len < 0 || (uint64_t)len > (1ULL << 40)) return (NovaMemTag)-1;
+        }
+        return kind;
+    }
 }
 
 /* ── Boxed primitives (bool/float) for Any-typed values ───────────────────
@@ -623,6 +666,16 @@ void nova_rt_track_raw(void* ptr) {
     nova_mem_live++;
 }
 
+/* NOTE: distinguishing a header-less raw C-string pointer from a bare integer is
+   FUNDAMENTALLY UNSOLVABLE at runtime in the uniform-i64 value model — readability is
+   not stringness, content probing misfires on integers that address text-like memory,
+   and module-range gating rejects legitimate malloc'd runtime strings. A sound fix
+   requires value identity for ALL strings (header every runtime string) or value
+   tagging (NOVA_DESIGN/VALUE_MODEL_OVERHAUL.md). This heuristic is therefore retained
+   as-is; the find_tag/RC discrimination path IS now hardened (alignment + rc>=1 +
+   structural validation) which closes the LIST/DICT magic-collision deref vector. The
+   residual `+`/`*`-on-large-untyped-int wild read is documented as a known soundness
+   gap pending the value-model work. See _pm_serloop repro + INT_POINTER_SOUNDNESS.md. */
 static int nova_is_readable_str(const void* ptr) {
 #ifdef _WIN32
     return !IsBadReadPtr(ptr, 1);
@@ -7209,21 +7262,26 @@ static void nova_rc_free(void* ptr) {
 }
 
 static inline int nova_rc_is_managed(void* ptr) {
-    uintptr_t addr = (uintptr_t)ptr;
-    if (addr < 0x10000ULL) return 0;
-    if (nova_int_str_cache_inited &&
-        (char*)ptr >= nova_int_str_cache[0] &&
-        (char*)ptr < nova_int_str_cache[0] + sizeof(nova_int_str_cache))
-        return 0;
+    /* SINGLE SOURCE OF TRUTH for the int-vs-pointer discrimination. rc_inc/rc_dec
+       WRITE to ptr-8 (and free at rc==0), so a misclassified integer here is even
+       more dangerous than in nova_mem_find_tag (it corrupts memory / frees a wild
+       pointer). This previously used a weaker check (range + 16-bit magic only),
+       which let a deterministically-computed large integer from untyped (`any`)
+       arithmetic fake an object and get its "refcount" decremented — a hard crash.
+       Routing through the hardened nova_mem_find_tag (8-alignment + rc>=1 +
+       structural validation) closes that hole everywhere at once.
+         find_tag -> -1        : not a managed object  -> 0
+         find_tag -> RAW (0)   : interned strpool str  -> -1
+         find_tag -> kind 1..7 : real managed object   -> 1 */
+    /* strpool-interned strings use a DISTINCT refcount table (nova_strpool_rc),
+       so they must be reported as -1 here. nova_mem_find_tag returns NOVA_MEM_RAW
+       for BOTH strpool strings AND heap-allocated NOVA_MEM_RAW strings (e.g.
+       str_concat results), which use the normal embedded refcount — so RAW alone
+       cannot disambiguate. The strpool membership test is the authority; check it
+       first, then route everything else (heap-RAW included) through the normal
+       embedded-rc path. */
     if (nova_strpool_contains(ptr)) return -1;
-    /* Range-bound to the tracked managed heap BEFORE dereferencing — a value outside
-       [heap_base, heap_top) is a raw int / float-bit pattern, not a heap object. This
-       is what makes RC safe on Linux/macOS (no IsBadReadPtr backstop there). */
-    if (nova_heap_base && (addr < nova_heap_base || addr >= nova_heap_top)) return 0;
-#ifdef _WIN32
-    if (IsBadReadPtr((char*)ptr - NOVA_RC_HDR_SIZE, NOVA_RC_HDR_SIZE)) return 0;
-#endif
-    return NOVA_RC_VALID(ptr) ? 1 : 0;
+    return nova_mem_find_tag(ptr) == (NovaMemTag)-1 ? 0 : 1;
 }
 
 void nova_rc_inc(int64_t val) {
