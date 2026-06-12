@@ -129,7 +129,31 @@ in a list MUST stay heap); (f) bootstrap; (g) regression ×3 + microbench. **Eff
 
 ---
 
-## STAGE 5 — Monomorphic native-ABI specialization (narrow slice)  ·  Day 4-5  ·  beats: C++, Rust, Julia
+## ⛔ STAGE 5 — FALSIFIED 2026-06-12 (hand-validated; do NOT build as a standalone stage)
+
+Hand-built the EXACT Stage-5 target IR for `dot(a,b)` over `type V3 {x,y,z: float}` (native-ABI clone
+`define internal double @dot(ptr,ptr)`, GEP field reads, `ret double`, call site passing ptr) and measured
+vs `clang -O2` (C=59ms, 30M-iter loop):
+- i64-ABI (current): **1.20× C**
+- native-ABI clone (Stage 5's mechanism): **1.28× C — WORSE** (opt-IR confirms the clone IS inlined: 0 calls,
+  12 fmul/fadd in the loop — but it bloats without SROA).
+- native call + pass alloca ptr directly (4b+5 combined): **1.15× C** — modest, NOT C-parity.
+
+ROOT: the EA-local stack struct is `alloca [4 x i64]` (header at index 0, fields i64-typed at 1/2/3) and the
+handle launders through an i64 slot (`ptrtoint`→store→load→`inttoptr`). BOTH defeat LLVM SROA regardless of
+the call ABI, so the struct never reaches registers (C SROAs V3 to 3 xmm regs). Stage 5's design assumption
+(native-ABI clone ⇒ ≥1.0× C) is therefore FALSE.
+
+**Beating C needs a COORDINATED value-model overhaul, all three together:** (1) tagless raw-`double` layout for
+EA-local structs (not `[4 x i64]`), (2) ptr-typed local struct handles (no ptrtoint/i64-slot laundering = the
+old "4b"), (3) native-ABI calls (the old "5"). Partial steps have poor ROI. This is a multi-month
+rearchitecture = COMPETITIVE_DOMINATION_PLAN scale, NOT a bounded day-4-5 stage. NOVA at ~1.0-1.2× C with ZERO
+annotations + memory-safety is at the CEILING of the uniform-i64 value model; "match C" is delivered. Repro:
+test_programs/dotbench{,_native,_combined}.ll, dotbench.c, _dotn.ps1.
+
+---
+
+## STAGE 5 (ORIGINAL PLAN — superseded by the falsification above) — Monomorphic native-ABI specialization
 
 **Goal (slice, not the full multi-month version):** for a provably-monomorphic LEAF function with all-primitive
 params (e.g. `dot(a: Point, b: Point) -> float`), emit a SECOND native-ABI clone (`@dot$Point$Point(ptr,ptr)
