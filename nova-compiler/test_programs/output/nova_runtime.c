@@ -3458,6 +3458,42 @@ int64_t nova_rt_channel_send(int64_t handle, int64_t value) {
    so we skip the deep copy and transfer the value directly. */
 int64_t nova_rt_channel_send_move(int64_t handle, int64_t value) {
     NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    /* Green task: PARK (yield to the carrier) on a full bounded channel instead of
+       blocking the carrier OS thread — mirrors nova_rt_channel_send (INV-6 / RACE-19).
+       Move semantics: enqueue `value` directly (no deep copy). On close, return -1
+       without rc_dec (matching the non-green path below). */
+    if (nova_sched_in_task()) {
+        for (;;) {
+#ifdef _WIN32
+            EnterCriticalSection(&ch->lock);
+            if (ch->closed) { LeaveCriticalSection(&ch->lock); return -1; }
+            if (ch->bound <= 0 || ch->count < ch->bound) {
+                int we = (ch->count == 0);
+                channel_enqueue(ch, value);
+                if (we) WakeConditionVariable(&ch->not_empty);
+                nova_sched_wake_one(ch);
+                LeaveCriticalSection(&ch->lock);
+                return 0;
+            }
+            nova_sched_park_send(ch);
+            LeaveCriticalSection(&ch->lock);
+#else
+            pthread_mutex_lock(&ch->lock);
+            if (ch->closed) { pthread_mutex_unlock(&ch->lock); return -1; }
+            if (ch->bound <= 0 || ch->count < ch->bound) {
+                int we = (ch->count == 0);
+                channel_enqueue(ch, value);
+                if (we) pthread_cond_signal(&ch->not_empty);
+                nova_sched_wake_one(ch);
+                pthread_mutex_unlock(&ch->lock);
+                return 0;
+            }
+            nova_sched_park_send(ch);
+            pthread_mutex_unlock(&ch->lock);
+#endif
+            nova_sched_yield_now();   /* resumed when a receiver frees a slot; retry */
+        }
+    }
 #ifdef _WIN32
     EnterCriticalSection(&ch->lock);
     while (ch->bound > 0 && ch->count >= ch->bound && !ch->closed)
@@ -3865,6 +3901,9 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     if (!me) return -1;
     f->resumer = me;
     me->status = 2;
+    nova_current_task = &f->task;   /* RACE-17: the resuming carrier sets the resumed task's TLS
+                                       BEFORE the switch, so a fiber migrated to a different carrier
+                                       sees its own task (not the resumer's). Restored to me below. */
     SwitchToFiber(f->handle);
     nova_current_fiber = me;
     nova_current_task = &me->task;   /* restore the RESUMER's own task state (Stage 2 F7):
@@ -3999,6 +4038,8 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     f->resumer = me;
     me->status = 2;
     nova_current_fiber = f;
+    nova_current_task = &f->task;   /* RACE-17: set the resumed task's TLS before the switch
+                                       (thread-migration safety under M:N). Restored to me below. */
     nova_asm_switch(&me->saved_sp, &f->saved_sp);
     nova_current_fiber = me;
     nova_current_task = &me->task;   /* restore the RESUMER's own task state (Stage 2 F7):

@@ -278,6 +278,7 @@ $domain_tests = @(
     'typename_test',
     'field_names_test',
     'sroa_stress_test',
+    'mn_stress_test',
     'static_assert_test',
     'vmcast_test',
     'from_json_test',
