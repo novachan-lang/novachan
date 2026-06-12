@@ -162,6 +162,7 @@ $domain_tests = @(
     'multigen_test',
     'dictcomp_test',
     'set_comp_test',
+    'remote_test',
     'ptestx',
     'fnval_test',
     'mmap_test',

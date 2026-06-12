@@ -8536,6 +8536,94 @@ void nova_rt_tcp_close(int64_t sock_val) {
     NOVA_CLOSE_SOCKET(sock);
 }
 
+/* ── Distributed channels (remote_*) ──────────────────────────────────────────
+   NOVA's "channels across ALL boundaries" extended to the network. A remote channel
+   IS a TCP socket; each message is length-prefixed JSON: [4-byte big-endian length]
+   [UTF-8 JSON]. remote_send serializes a value via json_encode; remote_recv reads one
+   framed message and json_decodes it back to a value. Both are GREEN-AWARE — a green
+   task parks on the netpoller instead of blocking its carrier — so distributed channels
+   compose with spawn/select exactly like local channels. Values must be JSON-able
+   (int/float/bool/string/list/dict); process isolation holds (the peer gets an
+   independent value, never shared mutable heap). */
+int64_t nova_rt_json_encode(int64_t val);   /* defined later */
+int64_t nova_rt_json_decode(int64_t str_val);
+
+static int nova_remote_io(int64_t sock_val, char* buf, int len, int writing) {
+    NOVA_SOCKET s = (NOVA_SOCKET)sock_val;
+    int green = nova_sched_in_task();
+    if (green) nova_rt_io_set_nonblocking(sock_val);
+    int total = 0;
+    while (total < len) {
+        int n = writing ? send(s, buf + total, len - total, 0)
+                         : recv(s, buf + total, len - total, 0);
+        if (n > 0) { total += n; continue; }
+        if (n == 0) return -1;                 /* peer closed mid-message */
+#ifdef _WIN32
+        if (WSAGetLastError() != WSAEWOULDBLOCK) return -1;
+#else
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+#endif
+        if (green) {
+            nova_sched_park_io(sock_val, writing ? NOVA_POLL_WRITE : NOVA_POLL_READ);
+        } else {
+            fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
+            if (writing) select((int)s + 1, NULL, &fds, NULL, NULL);
+            else         select((int)s + 1, &fds, NULL, NULL, NULL);
+        }
+    }
+    return 0;
+}
+
+/* Open a remote channel to a listening peer (client side). Returns a channel handle
+   (the socket) or -1 on failure. */
+int64_t nova_rt_remote_connect(int64_t host_ptr, int64_t port_val) {
+    return nova_rt_tcp_connect(host_ptr, port_val);
+}
+
+/* Listen on a port and accept ONE peer, returning the connected channel (server side).
+   Point-to-point; the listening socket is closed once the peer connects. */
+int64_t nova_rt_remote_listen(int64_t port_val) {
+    int64_t srv = nova_rt_tcp_listen(port_val);
+    if (srv < 0) return -1;
+    int64_t cli = nova_rt_tcp_accept(srv);
+    NOVA_CLOSE_SOCKET((NOVA_SOCKET)srv);
+    return cli;
+}
+
+int64_t nova_rt_remote_send(int64_t sock_val, int64_t value) {
+    int64_t json = nova_rt_json_encode(value);
+    const char* str = (const char*)(uintptr_t)json;
+    if (!str) str = "null";
+    int len = (int)strlen(str);
+    unsigned char hdr[4];
+    hdr[0] = (unsigned char)((len >> 24) & 0xff);
+    hdr[1] = (unsigned char)((len >> 16) & 0xff);
+    hdr[2] = (unsigned char)((len >> 8) & 0xff);
+    hdr[3] = (unsigned char)(len & 0xff);
+    if (nova_remote_io(sock_val, (char*)hdr, 4, 1) < 0) return -1;
+    if (len > 0 && nova_remote_io(sock_val, (char*)str, len, 1) < 0) return -1;
+    return 0;
+}
+
+int64_t nova_rt_remote_recv(int64_t sock_val) {
+    unsigned char hdr[4];
+    if (nova_remote_io(sock_val, (char*)hdr, 4, 0) < 0) return 0;   /* 0 = closed/error */
+    long len = ((long)hdr[0] << 24) | ((long)hdr[1] << 16) | ((long)hdr[2] << 8) | (long)hdr[3];
+    if (len < 0 || len > (64L * 1024 * 1024)) return 0;            /* 64MB sanity cap */
+    char* buf = (char*)malloc((size_t)len + 1);
+    if (!buf) return 0;
+    if (len > 0 && nova_remote_io(sock_val, buf, (int)len, 0) < 0) { free(buf); return 0; }
+    buf[len] = '\0';
+    int64_t result = nova_rt_json_decode((int64_t)(uintptr_t)buf);
+    free(buf);
+    return result;
+}
+
+int64_t nova_rt_remote_close(int64_t sock_val) {
+    NOVA_CLOSE_SOCKET((NOVA_SOCKET)sock_val);
+    return 0;
+}
+
 int64_t nova_rt_udp_bind(int64_t port_val) {
     nova_wsa_init();
     int port = (int)port_val;
