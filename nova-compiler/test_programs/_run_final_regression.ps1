@@ -163,6 +163,7 @@ $domain_tests = @(
     'dictcomp_test',
     'set_comp_test',
     'remote_test',
+    'remote_multi_test',
     'ptestx',
     'fnval_test',
     'mmap_test',

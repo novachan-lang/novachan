@@ -8590,6 +8590,17 @@ int64_t nova_rt_remote_listen(int64_t port_val) {
     return cli;
 }
 
+/* Multi-client server: remote_bind opens a listener (kept open); remote_accept blocks
+   for the next peer and returns its channel (green-aware — parks on the netpoller). A
+   server loops `let c = remote_accept(l)` and spawns a handler per peer, so one NOVA
+   node serves many distributed clients concurrently. */
+int64_t nova_rt_remote_bind(int64_t port_val) {
+    return nova_rt_tcp_listen(port_val);
+}
+int64_t nova_rt_remote_accept(int64_t listener_val) {
+    return nova_rt_tcp_accept(listener_val);
+}
+
 int64_t nova_rt_remote_send(int64_t sock_val, int64_t value) {
     int64_t json = nova_rt_json_encode(value);
     const char* str = (const char*)(uintptr_t)json;
