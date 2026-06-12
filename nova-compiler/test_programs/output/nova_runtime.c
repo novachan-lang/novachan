@@ -4747,6 +4747,13 @@ int64_t nova_rt_sched_run(void) {
         nova_sched_current = t;
         t->status = 1;
         t->park_committed = 0;   /* M:N F1: clear before resume; set to 1 below once it parks */
+        /* M:N migration cleanse: this carrier loop runs ON the carrier fiber, so nova_current_fiber
+           MUST be this carrier when we resume. A task that previously ran here, parked, and migrated
+           to another carrier can leave nova_current_fiber pointing at itself (a task fiber); without
+           this reset fiber_resume captures that stale task as `me`, corrupting me->status / resumer
+           and propagating (pollution) -> manifests as a lost-wakeup. Forcing it to the carrier makes
+           `me` correct and breaks the propagation. N=1: g_carrier_count<=1 -> skipped (no migration). */
+        if (g_carrier_count > 1) nova_current_fiber = &nova_carrier_fiber;
         int64_t done = nova_rt_fiber_resume(t->fiber);
         nova_sched_current = NULL;
         if (g_carrier_count > 1) g_carrier_tasks_run[nova_carrier_id & 63]++;
