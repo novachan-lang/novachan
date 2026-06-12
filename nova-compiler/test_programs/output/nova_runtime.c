@@ -666,26 +666,68 @@ void nova_rt_track_raw(void* ptr) {
     nova_mem_live++;
 }
 
-/* NOTE: distinguishing a header-less raw C-string pointer from a bare integer is
-   FUNDAMENTALLY UNSOLVABLE at runtime in the uniform-i64 value model — readability is
-   not stringness, content probing misfires on integers that address text-like memory,
-   and module-range gating rejects legitimate malloc'd runtime strings. A sound fix
-   requires value identity for ALL strings (header every runtime string) or value
-   tagging (NOVA_DESIGN/VALUE_MODEL_OVERHAUL.md). This heuristic is therefore retained
-   as-is; the find_tag/RC discrimination path IS now hardened (alignment + rc>=1 +
-   structural validation) which closes the LIST/DICT magic-collision deref vector. The
-   residual `+`/`*`-on-large-untyped-int wild read is documented as a known soundness
-   gap pending the value-model work. See _pm_serloop repro + INT_POINTER_SOUNDNESS.md. */
-static int nova_is_readable_str(const void* ptr) {
 #ifdef _WIN32
-    return !IsBadReadPtr(ptr, 1);
+/* Address range of the loaded program image. Static string literals emitted by the
+   compiler live here (.rdata/.rodata); integer compute values never do. Captured
+   lazily + idempotently from the PE header (benign data race). */
+static uintptr_t g_module_lo = 0, g_module_hi = 0;
+static void nova_capture_module_range(void) {
+    HMODULE h = GetModuleHandleW(NULL);
+    if (!h) { g_module_hi = (uintptr_t)-1; return; }
+    uintptr_t base = (uintptr_t)h;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)h;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) { g_module_lo = base; g_module_hi = base + 0x4000000; return; }
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((char*)h + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) { g_module_lo = base; g_module_hi = base + 0x4000000; return; }
+    g_module_lo = base;
+    g_module_hi = base + nt->OptionalHeader.SizeOfImage;
+}
+static int nova_addr_in_module(uintptr_t a) {
+    if (g_module_hi == 0) nova_capture_module_range();
+    return a >= g_module_lo && a < g_module_hi;
+}
 #else
-    ssize_t r = 0;
+/* POSIX: page-granular readability + a bounded text scan, used only as the literal
+   discriminator where module-range capture is not implemented. Page-guarded so a
+   stray integer-as-pointer cannot wild-walk. */
+static int nova_byte_readable(const void* p) {
     int fd[2];
     if (pipe(fd) != 0) return 0;
-    r = write(fd[1], ptr, 1);
+    ssize_t r = write(fd[1], p, 1);
     close(fd[0]); close(fd[1]);
     return r == 1;
+}
+static int nova_probe_cstr(const char* p) {
+    const int MAXLEN = 4096;
+    for (int i = 0; i < MAXLEN; i++) {
+        if (i == 0 || (((uintptr_t)(p + i)) & 0xFFFu) == 0) {
+            if (!nova_byte_readable(p + i)) return 0;
+        }
+        unsigned char c = (unsigned char)p[i];
+        if (c == 0) return 1;
+        if (c < 0x09 || (c > 0x0d && c < 0x20)) return 0;
+    }
+    return 0;
+}
+#endif
+
+/* SOUND int-vs-string discrimination. Every runtime-created string now carries an RC
+   header (nova_mem_find_tag -> RAW/FAT_STR); the only header-less string is a static
+   literal, which lives in the program image (Windows: exact PE range; POSIX: a
+   page-guarded text probe). A bare integer carries no header and is not in the image,
+   so it can NEVER be mistaken for a string here — closing the CVE-class wild read
+   where untyped (`any`) `+`/`*` strlen()'d a large integer as a string. See
+   NOVA_DESIGN/INT_POINTER_SOUNDNESS.md. */
+static int nova_is_readable_str(const void* ptr) {
+    uintptr_t a = (uintptr_t)ptr;
+    if (a < 0x10000ULL) return 0;
+    NovaMemTag t = nova_mem_find_tag((void*)a);
+    if (t == NOVA_MEM_RAW || t == NOVA_MEM_FAT_STR) return 1;  /* headered runtime string */
+    if (t != (NovaMemTag)-1) return 0;                         /* list/dict/box/etc. -> not a string */
+#ifdef _WIN32
+    return nova_addr_in_module(a);                             /* header-less -> only a static literal counts */
+#else
+    return nova_probe_cstr((const char*)ptr);
 #endif
 }
 
@@ -783,6 +825,21 @@ static const char* nova_intern(const char* s) {
 static int nova_str_eq(const char* a, const char* b) {
     if (a == b) return 1;
     return strcmp(a, b) == 0;
+}
+
+/* Take ownership of a raw malloc'd C-string `buf`, return a HEADERED NOVA fat string
+   (a copy carrying RC identity), and free the raw buffer. The int/string discrimination
+   recognizes the returned value (find_tag -> FAT_STR); the original raw buffer keeps
+   its own malloc/realloc/free lifecycle untouched. Used at the return boundary of
+   runtime string producers whose internal buffer is realloc'd or error-path-freed and
+   so cannot itself be a headered object. strlen length matches the existing C-string
+   semantics (NUL-terminated). */
+static char* nova_fat_str_create(const char* src, size_t len);
+static int64_t nova_str_take(char* buf) {
+    if (!buf) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    int64_t r = (int64_t)(uintptr_t)nova_fat_str_create(buf, strlen(buf));
+    free(buf);
+    return r;
 }
 
 /* ── Fat String Constructor ──────────────────────────────────────────────
@@ -2142,7 +2199,7 @@ int64_t nova_rt_proc_read_stdout(int64_t handle) {
     if (!PeekNamedPipe(ph->hStdoutRead, NULL, 0, NULL, &avail, NULL) || avail == 0) {
         DWORD n; if (!ReadFile(ph->hStdoutRead, buf, 1, &n, NULL) || n == 0)
             return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
-        char* r = (char*)malloc(2); r[0] = buf[0]; r[1] = 0;
+        char* r = (char*)nova_heap_alloc(2, NOVA_MEM_RAW); r[0] = buf[0]; r[1] = 0;
         return (int64_t)(uintptr_t)r;
     }
     DWORD to_read = avail < 4095 ? avail : 4095; DWORD n;
@@ -5727,7 +5784,7 @@ int64_t nova_rt_shell(int64_t cmd_ptr) {
     buf[len] = '\0';
     /* Trim trailing newline */
     while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
-    return (int64_t)(uintptr_t)buf;
+    return nova_str_take(buf);
 }
 
 int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
@@ -5865,20 +5922,21 @@ int64_t nova_rt_monitor(int64_t proc_handle) {
    on the reason. Returns "" if the process has not exited yet (or is unknown). */
 int64_t nova_rt_exit_reason(int64_t proc_handle) {
     /* Green mode: handle is a NovaSchedTask* (process-lifetime discriminant) */
+    /* Return HEADERED copies: the stored exit_reason buffers are raw malloc'd internal
+       struct fields (leaked by design, never directly a NOVA value). Copying through
+       nova_rt_create_string gives the caller a proper rc-managed fat string with
+       identity, so the int/string discrimination recognizes it (and there is no
+       shared ownership between the struct field and the returned value). */
     if (nova_green_enabled()) {
         NovaSchedTask* gt = (NovaSchedTask*)(uintptr_t)proc_handle;
         if (gt && gt->exit_reason != 0)
-            return gt->exit_reason;
-        char* e = (char*)malloc(1);
-        if (e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+            return nova_rt_create_string((void*)(uintptr_t)gt->exit_reason);
+        return nova_rt_create_string((void*)"");
     }
     NovaProcessInfo* proc = (NovaProcessInfo*)(uintptr_t)proc_handle;
     if (proc && proc->exit_reason != 0)
-        return proc->exit_reason;
-    char* e = (char*)malloc(1);
-    if (e) e[0] = '\0';
-    return (int64_t)(uintptr_t)e;
+        return nova_rt_create_string((void*)(uintptr_t)proc->exit_reason);
+    return nova_rt_create_string((void*)"");
 }
 
 void nova_rt_wait_all(void) {
@@ -11780,7 +11838,7 @@ int64_t nova_rt_sha256(int64_t input) {
     uint8_t hash[32];
     sha256_final(&ctx, hash);
     static const char hex_chars[] = "0123456789abcdef";
-    char* out = (char*)malloc(65);
+    char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
     if (!out) return (int64_t)(uintptr_t)"";
     for (int i = 0; i < 32; i++) {
         out[i*2]   = hex_chars[hash[i] >> 4];
@@ -11800,7 +11858,7 @@ int64_t nova_rt_sha256_bytes(int64_t data, int64_t len_val) {
     uint8_t hash[32];
     sha256_final(&ctx, hash);
     static const char hex_chars[] = "0123456789abcdef";
-    char* out = (char*)malloc(65);
+    char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
     if (!out) return (int64_t)(uintptr_t)"";
     for (int i = 0; i < 32; i++) {
         out[i*2]   = hex_chars[hash[i] >> 4];
@@ -11849,7 +11907,7 @@ int64_t nova_rt_hmac_sha256(int64_t key_val, int64_t msg_val) {
     uint8_t final_hash[32];
     sha256_final(&outer, final_hash);
     static const char hex_chars[] = "0123456789abcdef";
-    char* out = (char*)malloc(65);
+    char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
     if (!out) return (int64_t)(uintptr_t)"";
     for (int i = 0; i < 32; i++) {
         out[i*2]   = hex_chars[final_hash[i] >> 4];
@@ -11865,7 +11923,7 @@ int64_t nova_rt_hex_encode(int64_t input) {
     const char* s = (const char*)(uintptr_t)input;
     if (!s) return (int64_t)(uintptr_t)"";
     size_t len = strlen(s);
-    char* out = (char*)malloc(len * 2 + 1);
+    char* out = (char*)nova_heap_alloc(len * 2 + 1, NOVA_MEM_RAW);
     if (!out) return (int64_t)(uintptr_t)"";
     static const char hex_chars[] = "0123456789abcdef";
     for (size_t i = 0; i < len; i++) {
@@ -11899,7 +11957,7 @@ int64_t nova_rt_hex_decode(int64_t input) {
         out[i] = (char)((hv << 4) | lv);
     }
     out[out_len] = '\0';
-    return (int64_t)(uintptr_t)out;
+    return nova_str_take(out);
 }
 
 /* ── Base64 encode/decode (RFC 4648) ─────────────────────────────────────── */
@@ -11911,7 +11969,7 @@ int64_t nova_rt_base64_encode(int64_t input) {
     if (!s) return (int64_t)(uintptr_t)"";
     size_t len = strlen((const char*)s);
     size_t out_len = 4 * ((len + 2) / 3);
-    char* out = (char*)malloc(out_len + 1);
+    char* out = (char*)nova_heap_alloc(out_len + 1, NOVA_MEM_RAW);
     if (!out) return (int64_t)(uintptr_t)"";
     size_t j = 0;
     for (size_t i = 0; i < len; i += 3) {
@@ -11962,7 +12020,7 @@ int64_t nova_rt_base64_decode(int64_t input) {
         if (j < out_len) out[j++] = (char)(triple & 0xff);
     }
     out[j] = '\0';
-    return (int64_t)(uintptr_t)out;
+    return nova_str_take(out);
 }
 
 /* ── UUID v4 (cryptographic random on Windows, /dev/urandom on Linux) ────── */
@@ -11998,7 +12056,7 @@ int64_t nova_rt_uuid4(void) {
     nova_secure_random_bytes(bytes, 16);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    char* out = (char*)malloc(37);
+    char* out = (char*)nova_heap_alloc(37, NOVA_MEM_RAW);
     if (!out) return (int64_t)(uintptr_t)"";
     static const char hx[] = "0123456789abcdef";
     int pos = 0;
@@ -12013,7 +12071,7 @@ int64_t nova_rt_uuid4(void) {
 
 int64_t nova_rt_random_bytes(int64_t n) {
     if (n <= 0 || n > 1048576) return (int64_t)(uintptr_t)"";
-    char* buf = (char*)malloc((size_t)n + 1);
+    char* buf = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
     if (!buf) return (int64_t)(uintptr_t)"";
     nova_secure_random_bytes((uint8_t*)buf, (size_t)n);
     buf[n] = '\0';
@@ -12406,7 +12464,7 @@ int64_t nova_rt_dir_walk(int64_t path_val) {
             char full[MAX_PATH * 2];
             snprintf(full, sizeof(full), "%s\\%s", cur, fd.cFileName);
             size_t flen = strlen(full);
-            char* dup = (char*)malloc(flen + 1);
+            char* dup = (char*)nova_heap_alloc(flen + 1, NOVA_MEM_RAW);
             if (dup) { memcpy(dup, full, flen + 1); nova_rt_list_append(result, (int64_t)(uintptr_t)dup); }
             if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && stack_top < 255) {
                 strncpy(stack_paths[stack_top], full, MAX_PATH - 1);
@@ -12437,7 +12495,7 @@ int64_t nova_rt_dir_walk(int64_t path_val) {
             char full[8192];
             snprintf(full, sizeof(full), "%s/%s", cur, ent->d_name);
             size_t flen = strlen(full);
-            char* dup = (char*)malloc(flen + 1);
+            char* dup = (char*)nova_heap_alloc(flen + 1, NOVA_MEM_RAW);
             if (dup) { memcpy(dup, full, flen + 1); nova_rt_list_append(result, (int64_t)(uintptr_t)dup); }
             struct stat st;
             if (stat(full, &st) == 0 && S_ISDIR(st.st_mode) && stack_top < 255) {
