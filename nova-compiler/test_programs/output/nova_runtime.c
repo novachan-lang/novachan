@@ -3794,6 +3794,9 @@ int64_t nova_rt_channel_recv_timeout(int64_t handle, int64_t timeout_ms) {
 typedef struct NovaFiber {
     NovaTaskState     task;
     int               status;       /* 0=created 1=running 2=suspended 3=finished */
+    volatile int      active;       /* M:N detector: 1 while a carrier is executing this fiber */
+    int               is_task;      /* 1 = scheduler green task (returns to the CURRENT carrier on
+                                       yield/finish, migration-safe); 0 = generator (returns to resumer) */
     int64_t           entry_fn;     /* NOVA closure */
     struct NovaFiber* resumer;
     int64_t           yield_value;  /* lazy generator: most recently yielded value */
@@ -3805,6 +3808,37 @@ typedef struct NovaFiber {
     size_t            stack_alloc;
 #endif
 } NovaFiber;
+
+static int g_watchdog_on = 0;   /* M:N diagnostics (NOVA_SCHED_WATCHDOG); declared early for fiber_resume */
+
+/* M:N event trace (diagnostics only): a lock-free ring buffer of recent scheduler/fiber
+   events, dumped by the watchdog on a hang. kinds: 1 RES_ENTER(f,me) 2 RES_EXIT(f,me)
+   3 TRAMP_DONE(f,resumer) 4 YIELD_OUT(me,resumer) 5 YIELD_IN(me,-) 6 PUSH(t,-) 7 POP(t,-)
+   8 WAKE(t,ch) 9 PARK(t,ch). */
+typedef struct { int kind; void* a; void* b; unsigned tid; } NovaTraceEv;
+static NovaTraceEv g_trace[1024];
+#ifdef _WIN32
+static volatile LONG64 g_trace_idx = 0;
+static inline long nova_trace_next(void) { return (long)(InterlockedIncrement64(&g_trace_idx) - 1); }
+#else
+static volatile long g_trace_idx = 0;
+static inline long nova_trace_next(void) { return __atomic_fetch_add(&g_trace_idx, 1, __ATOMIC_RELAXED); }
+#endif
+static volatile long g_pol_at = -1;   /* g_trace_idx at the first detected pollution; freezes the ring */
+static inline void nova_trace(int k, void* a, void* b) {
+    if (!g_watchdog_on) return;
+    if (g_pol_at >= 0 && g_trace_idx > g_pol_at + 16) return;   /* freeze shortly after 1st pollution */
+    long i = nova_trace_next();
+    NovaTraceEv* e = &g_trace[i & 1023];
+    e->kind = k; e->a = a; e->b = b;
+#ifdef _WIN32
+    e->tid = (unsigned)GetCurrentThreadId();
+#else
+    e->tid = 0;
+#endif
+}
+static void* g_carrier_fiber_addr[64];   /* &nova_carrier_fiber per carrier id, recorded at startup */
+static volatile long g_pollution_count = 0;   /* times fiber_resume saw nova_current_fiber != own carrier */
 
 #ifdef _WIN32
 static __declspec(thread) NovaFiber* nova_current_fiber = NULL;
@@ -3877,8 +3911,13 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
     f->task.fault_active = 0;
 
     f->status = 3;
-    if (f->resumer && f->resumer->handle)
-        SwitchToFiber(f->resumer->handle);
+    /* M:N: a scheduler task ALWAYS returns to the carrier thread it is currently running on
+       (migration-safe), never a stored resumer (which a migrated task may have left stale). A
+       generator (is_task=0) returns to the task that resumed it (resumer). */
+    NovaFiber* back = f->is_task ? &nova_carrier_fiber : f->resumer;
+    nova_trace(3, f, back);
+    if (back && back->handle)
+        SwitchToFiber(back->handle);
     for (;;) SleepEx(INFINITE, FALSE);
 }
 
@@ -3897,14 +3936,30 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
     if (!f || f->status == 3) return 1;
     nova_ensure_carrier();
-    NovaFiber* me = nova_current_fiber;
+    /* M:N: resuming a SCHEDULER TASK is always done by a carrier from the sched_run loop, so the
+       resumer is THIS thread's own carrier fiber — read it directly (&nova_carrier_fiber) rather
+       than trusting nova_current_fiber, which a migrated task could have left pointing at a task
+       fiber now running on another carrier. This also CLEANSES nova_current_fiber via the restore
+       below, so pollution cannot propagate. A generator (is_task=0) is resumed BY the running task,
+       so its resumer is that task = nova_current_fiber. */
+    NovaFiber* me = f->is_task ? &nova_carrier_fiber : nova_current_fiber;
     if (!me) return -1;
+    if (g_watchdog_on && me != &nova_carrier_fiber) {
+        InterlockedIncrement(&g_pollution_count);
+        if (g_pol_at < 0) g_pol_at = (long)g_trace_idx;   /* freeze the trace ring on first pollution */
+    }
     f->resumer = me;
     me->status = 2;
+    if (g_watchdog_on) {
+        if (InterlockedCompareExchange((volatile LONG*)&f->active, 1, 0) != 0)
+            fprintf(stderr, "[BUG] DOUBLE-RESUME fiber=%p status=%d me=%p\n", (void*)f, f->status, (void*)me);
+        nova_trace(1, f, me);
+    }
     nova_current_task = &f->task;   /* RACE-17: the resuming carrier sets the resumed task's TLS
                                        BEFORE the switch, so a fiber migrated to a different carrier
                                        sees its own task (not the resumer's). Restored to me below. */
     SwitchToFiber(f->handle);
+    if (g_watchdog_on) { f->active = 0; nova_trace(2, f, me); }
     nova_current_fiber = me;
     nova_current_task = &me->task;   /* restore the RESUMER's own task state (Stage 2 F7):
                                         correct for the carrier loop AND for nested fibers
@@ -3915,9 +3970,14 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
 
 int64_t nova_rt_fiber_yield(void) {
     NovaFiber* me = nova_current_fiber;
-    if (!me || !me->resumer) return 0;
+    if (!me) return 0;
+    /* scheduler task -> current carrier (migration-safe); generator -> its resumer */
+    NovaFiber* back = me->is_task ? &nova_carrier_fiber : me->resumer;
+    if (!back || !back->handle) return 0;
     me->status = 2;
-    SwitchToFiber(me->resumer->handle);
+    nova_trace(4, me, back);
+    SwitchToFiber(back->handle);
+    nova_trace(5, me, NULL);
     nova_current_fiber = me;
     nova_current_task = &me->task;
     me->status = 1;
@@ -3992,8 +4052,10 @@ static void nova_posix_fiber_trampoline(void) {
     f->task.fault_active = 0;
 
     f->status = 3;
-    if (f->resumer)
-        nova_asm_switch(&f->saved_sp, &f->resumer->saved_sp);
+    /* M:N: scheduler task returns to the CURRENT carrier (migration-safe); generator -> resumer */
+    NovaFiber* back = f->is_task ? &nova_carrier_fiber : f->resumer;
+    if (back)
+        nova_asm_switch(&f->saved_sp, &back->saved_sp);
     for (;;) { }
 }
 
@@ -4033,7 +4095,9 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
     if (!f || f->status == 3) return 1;
     nova_ensure_carrier();
-    NovaFiber* me = nova_current_fiber;
+    /* M:N: scheduler task -> resumer is THIS thread's carrier (migration-safe, cleanses TLS);
+       generator -> resumer is the running task (nova_current_fiber). See Windows path. */
+    NovaFiber* me = f->is_task ? &nova_carrier_fiber : nova_current_fiber;
     if (!me) return -1;
     f->resumer = me;
     me->status = 2;
@@ -4051,9 +4115,11 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
 
 int64_t nova_rt_fiber_yield(void) {
     NovaFiber* me = nova_current_fiber;
-    if (!me || !me->resumer) return 0;
+    if (!me) return 0;
+    /* scheduler task -> current carrier (migration-safe); generator -> its resumer */
+    NovaFiber* target = me->is_task ? &nova_carrier_fiber : me->resumer;
+    if (!target) return 0;
     me->status = 2;
-    NovaFiber* target = me->resumer;
     nova_asm_switch(&me->saved_sp, &target->saved_sp);
     nova_current_fiber = me;
     nova_current_task = &me->task;
@@ -4134,6 +4200,11 @@ typedef struct NovaSchedTask {
     int64_t  exit_status;          /* 0=normal, 1=crashed */
     int64_t  exit_reason;          /* heap string: "normal" or the panic message */
     int      finished;             /* 1 after task fully done + monitors notified */
+    volatile int park_committed;   /* M:N F1: 0 while a task is mid-yield, 1 once it has fully
+                                      parked. A waking carrier spins until 1 before re-enqueuing,
+                                      so no carrier resumes a fiber that hasn't finished SwitchToFiber. */
+    int      home_carrier;         /* M:N: carrier this task is bound to (-1 = unbound); used in later steps */
+    volatile int in_rq;            /* M:N detector: 1 while linked in the run-queue (guarded by g_sched_lock) */
 } NovaSchedTask;
 
 #ifndef NOVA_POLL_READ
@@ -4161,20 +4232,69 @@ typedef struct NovaSleepWaiter {
 
 static NovaSchedTask* nova_rq_head = NULL;
 static NovaSchedTask* nova_rq_tail = NULL;
-static NovaSchedTask* nova_sched_current = NULL;
+#ifdef _WIN32
+static __declspec(thread) NovaSchedTask* nova_sched_current = NULL;
+static __declspec(thread) int nova_carrier_id = 0;
+#else
+static __thread NovaSchedTask* nova_sched_current = NULL;
+static __thread int nova_carrier_id = 0;
+#endif
 static int     nova_sched_running = 0;
-static int64_t nova_sched_live = 0;
+static volatile int64_t nova_sched_live = 0;
 static NovaIOWaiter* nova_io_waiters = NULL;
 static NovaSleepWaiter* nova_sleep_waiters = NULL;
 
+/* M:N scheduler synchronization. nova_sched_lock/unlock + nova_live_* are NO-OPS when
+   g_carrier_count<=1 (the single-carrier default), so the existing hot path is byte-identical;
+   the global lock + atomic live counter engage only once >1 carrier starts (NOVA_CARRIERS>1).
+   This Step-1 coarse single lock guards the run-queue + all waiter lists + wake paths; later
+   steps replace it with per-carrier deques + lock-free work-stealing. */
+static int g_carrier_count = 1;
+#ifdef _WIN32
+static CRITICAL_SECTION g_sched_lock;
+static int g_sched_lock_inited = 0;
+static inline void nova_sched_lock(void)   { if (g_carrier_count > 1) EnterCriticalSection(&g_sched_lock); }
+static inline void nova_sched_unlock(void) { if (g_carrier_count > 1) LeaveCriticalSection(&g_sched_lock); }
+static inline int64_t nova_live_get(void)  { return (g_carrier_count > 1) ? InterlockedCompareExchange64((volatile LONG64*)&nova_sched_live, 0, 0) : nova_sched_live; }
+static inline void nova_live_inc(void)      { if (g_carrier_count > 1) InterlockedIncrement64((volatile LONG64*)&nova_sched_live); else nova_sched_live++; }
+static inline void nova_live_dec(void)      { if (g_carrier_count > 1) InterlockedDecrement64((volatile LONG64*)&nova_sched_live); else nova_sched_live--; }
+#else
+static pthread_mutex_t g_sched_lock = PTHREAD_MUTEX_INITIALIZER;
+static inline void nova_sched_lock(void)   { if (g_carrier_count > 1) pthread_mutex_lock(&g_sched_lock); }
+static inline void nova_sched_unlock(void) { if (g_carrier_count > 1) pthread_mutex_unlock(&g_sched_lock); }
+static inline int64_t nova_live_get(void)  { return (g_carrier_count > 1) ? __atomic_load_n(&nova_sched_live, __ATOMIC_ACQUIRE) : nova_sched_live; }
+static inline void nova_live_inc(void)      { if (g_carrier_count > 1) __atomic_add_fetch(&nova_sched_live, 1, __ATOMIC_ACQ_REL); else nova_sched_live++; }
+static inline void nova_live_dec(void)      { if (g_carrier_count > 1) __atomic_sub_fetch(&nova_sched_live, 1, __ATOMIC_ACQ_REL); else nova_sched_live--; }
+#endif
+
+/* Diagnostic only (NOVA_CARRIER_STATS=1): per-carrier count of task resumes, so a
+   test can confirm work actually spread across >1 carrier. Zero cost at N=1. */
+static volatile long g_carrier_tasks_run[64];
+
+/* Diagnostic only (NOVA_SCHED_WATCHDOG=1): per-carrier breadcrumb so a watchdog
+   thread can dump where each carrier is stuck on a hang. pc: 0=init 1=pop 2=resume
+   3=spin-wake 4=idle 5=exit. spin = task being spun-on in a wake. Zero cost off. */
+static volatile int   g_carrier_pc[64];
+static volatile void* g_carrier_spin[64];
+static volatile long  g_carrier_loops[64];   /* sched_run loop iterations, to detect progress */
+/* g_watchdog_on declared earlier (above the fiber code) */
+
 static void nova_rq_push(NovaSchedTask* t) {
+    nova_sched_lock();
+    if (g_watchdog_on && t->in_rq)
+        fprintf(stderr, "[BUG] DOUBLE-PUSH task=%p status=%d committed=%d\n", (void*)t, t->status, t->park_committed);
+    t->in_rq = 1;
     t->next = NULL;
     if (nova_rq_tail) nova_rq_tail->next = t; else nova_rq_head = t;
     nova_rq_tail = t;
+    nova_trace(6, t, NULL);
+    nova_sched_unlock();
 }
 static NovaSchedTask* nova_rq_pop(void) {
+    nova_sched_lock();
     NovaSchedTask* t = nova_rq_head;
-    if (t) { nova_rq_head = t->next; if (!nova_rq_head) nova_rq_tail = NULL; t->next = NULL; }
+    if (t) { nova_rq_head = t->next; if (!nova_rq_head) nova_rq_tail = NULL; t->next = NULL; t->in_rq = 0; nova_trace(7, t, NULL); }
+    nova_sched_unlock();
     return t;
 }
 
@@ -4183,6 +4303,7 @@ static int nova_sched_in_task(void) { return nova_sched_running && nova_sched_cu
 static void nova_sched_park_on(NovaChannel* ch) {
     NovaSchedTask* t = nova_sched_current;
     if (!t) return;
+    nova_trace(9, t, ch);
     t->status = 2;
     t->next = (NovaSchedTask*)ch->green_waiters;   /* push front of the channel's recv-waiter list */
     ch->green_waiters = (void*)t;
@@ -4220,6 +4341,18 @@ static void nova_sched_wake_one(NovaChannel* ch) {
     ch->green_waiters = (void*)t->next;
     t->next = NULL;
     t->status = 0;
+    nova_trace(8, t, ch);
+    /* M:N F1: a task parks by linking to green_waiters UNDER ch->lock, releasing ch->lock,
+       THEN yielding. Between release and the yield completing, another carrier could wake +
+       re-enqueue it, and a third could resume the fiber while it is still mid-yield on the
+       original carrier (double-run = corruption). Spin until the parking carrier has set
+       park_committed (after the yield completed). No-op at N=1 (the task always finished
+       yielding before any wake can run on the same single carrier). */
+    if (g_carrier_count > 1) {
+        if (g_watchdog_on) { int cid = nova_carrier_id & 63; g_carrier_pc[cid] = 3; g_carrier_spin[cid] = t; }
+        while (!t->park_committed) { /* spin */ }
+        if (g_watchdog_on) { int cid = nova_carrier_id & 63; g_carrier_pc[cid] = 0; g_carrier_spin[cid] = NULL; }
+    }
     nova_rq_push(t);                               /* back to the run-queue */
 }
 static void nova_sched_wake_send_one(NovaChannel* ch) {
@@ -4228,6 +4361,11 @@ static void nova_sched_wake_send_one(NovaChannel* ch) {
     ch->green_send_waiters = (void*)t->next;
     t->next = NULL;
     t->status = 0;
+    if (g_carrier_count > 1) {
+        if (g_watchdog_on) { int cid = nova_carrier_id & 63; g_carrier_pc[cid] = 3; g_carrier_spin[cid] = t; }
+        while (!t->park_committed) { /* spin: see nova_sched_wake_one */ }
+        if (g_watchdog_on) { int cid = nova_carrier_id & 63; g_carrier_pc[cid] = 0; g_carrier_spin[cid] = NULL; }
+    }
     nova_rq_push(t);
 }
 static void nova_sched_wake_all(NovaChannel* ch) {
@@ -4245,8 +4383,10 @@ static void nova_sched_park_io(int64_t fd, int events) {
     w->task = t;
     w->fd = fd;
     w->events = events;
+    nova_sched_lock();
     w->next = nova_io_waiters;
     nova_io_waiters = w;
+    nova_sched_unlock();
     t->status = 2;
     nova_rt_fiber_yield();
 }
@@ -4271,7 +4411,8 @@ static int64_t nova_sched_now_ms(void) {
 }
 
 static int nova_sched_wake_sleepers(void) {
-    if (!nova_sleep_waiters) return 0;
+    if (!nova_sleep_waiters) return 0;   /* benign racy fast-path; re-checked under the lock */
+    nova_sched_lock();
     int64_t now = nova_sched_now_ms();
     int woken = 0;
     NovaSleepWaiter** pp = &nova_sleep_waiters;
@@ -4280,6 +4421,7 @@ static int nova_sched_wake_sleepers(void) {
         if (now >= w->wake_time_ms) {
             *pp = w->next;
             w->task->status = 0;
+            if (g_carrier_count > 1) while (!w->task->park_committed) { /* F1 spin */ }
             nova_rq_push(w->task);
             free(w);
             woken++;
@@ -4287,6 +4429,7 @@ static int nova_sched_wake_sleepers(void) {
             pp = &w->next;
         }
     }
+    nova_sched_unlock();
     return woken;
 }
 
@@ -4300,8 +4443,10 @@ static void nova_sched_park_sleep(int64_t ms) {
        whole ms, so a bare "+ ms" deadline can be satisfied ~1ms early (the park instant's
        sub-ms fraction is truncated). sleep(ms) must never return before ms elapses. */
     w->wake_time_ms = nova_sched_now_ms() + ms + (ms > 0 ? 1 : 0);
+    nova_sched_lock();
     w->next = nova_sleep_waiters;
     nova_sleep_waiters = w;
+    nova_sched_unlock();
     t->status = 2;
     nova_rt_fiber_yield();
 }
@@ -4314,6 +4459,7 @@ static int nova_sched_poll_io(int timeout_ms) {
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
     int maxfd = 0;
+    nova_sched_lock();
     for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
         if (w->events & NOVA_POLL_READ)  FD_SET(w->fd, &rfds);
         if (w->events & NOVA_POLL_WRITE) FD_SET(w->fd, &wfds);
@@ -4321,6 +4467,7 @@ static int nova_sched_poll_io(int timeout_ms) {
         if ((int)w->fd > maxfd) maxfd = (int)w->fd;
 #endif
     }
+    nova_sched_unlock();
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
@@ -4331,6 +4478,7 @@ static int nova_sched_poll_io(int timeout_ms) {
 #endif
     if (n <= 0) return 0;
     int woken = 0;
+    nova_sched_lock();   /* guard nova_io_waiters mutation (Step 1 coarse; Step 2 -> per-carrier) */
     NovaIOWaiter** pp = &nova_io_waiters;
     while (*pp) {
         NovaIOWaiter* w = *pp;
@@ -4340,6 +4488,7 @@ static int nova_sched_poll_io(int timeout_ms) {
         if (ready) {
             *pp = w->next;
             w->task->status = 0;
+            if (g_carrier_count > 1) while (!w->task->park_committed) { /* F1 spin */ }
             nova_rq_push(w->task);
             free(w);
             woken++;
@@ -4347,6 +4496,7 @@ static int nova_sched_poll_io(int timeout_ms) {
             pp = &w->next;
         }
     }
+    nova_sched_unlock();
     return woken;
 }
 
@@ -4463,18 +4613,21 @@ static void nova_offload_run(NovaOffloadJob* job) {
    thread. The job memory is on the resumed task's stack — freed by that task. */
 static int nova_sched_check_offload(void) {
     int woken = 0;
+    nova_sched_lock();
     NovaOffloadJob** pp = &nova_offload_waiters;
     while (*pp) {
         NovaOffloadJob* j = *pp;
         if (__atomic_load_n(&j->done, __ATOMIC_ACQUIRE)) {
             *pp = j->wnext;
             j->task->status = 0;
+            if (g_carrier_count > 1) while (!j->task->park_committed) { /* F1 spin */ }
             nova_rq_push(j->task);
             woken++;
         } else {
             pp = &j->wnext;
         }
     }
+    nova_sched_unlock();
     return woken;
 }
 
@@ -4521,6 +4674,7 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
     if (!t) return 0;
     t->fiber = nova_rt_fiber_create(closure);
     if (!t->fiber) { free(t); return 0; }
+    ((NovaFiber*)(uintptr_t)t->fiber)->is_task = 1;   /* scheduler task: yield/finish -> current carrier */
     t->status = 0;
     t->monitors = NULL;
     t->monitor_count = 0;
@@ -4528,8 +4682,10 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
     t->exit_status = 0;
     t->exit_reason = 0;
     t->finished = 0;
+    t->park_committed = 0;
+    t->home_carrier = -1;
     nova_rq_push(t);
-    nova_sched_live++;
+    nova_live_inc();
     return (int64_t)(uintptr_t)t;
 }
 
@@ -4541,7 +4697,9 @@ static NovaSchedTask* nova_sched_root_task = NULL;
    bail out of rather than hang). */
 int64_t nova_rt_sched_run(void) {
     nova_sched_running = 1;
-    while (nova_sched_live > 0) {
+    int _wcid = nova_carrier_id & 63;
+    while (nova_live_get() > 0) {
+        if (g_watchdog_on) { g_carrier_loops[_wcid]++; g_carrier_pc[_wcid] = 1; }
         nova_sched_wake_sleepers();
         NovaSchedTask* t = nova_rq_pop();
         if (!t && (nova_io_waiters || nova_sleep_waiters || nova_offload_waiters)) {
@@ -4560,12 +4718,29 @@ int64_t nova_rt_sched_run(void) {
             nova_sched_check_offload();   /* re-enqueue green tasks whose DNS/offload job finished */
             t = nova_rq_pop();
         }
-        if (!t) break;
+        if (!t) {
+            if (g_carrier_count > 1) {
+                /* M:N: another carrier may still produce work (channel sends, spawns).
+                   Exit only when ALL tasks are done; otherwise brief idle then retry. */
+                if (nova_live_get() <= 0) break;
+                if (g_watchdog_on) g_carrier_pc[_wcid] = 4;
+#ifdef _WIN32
+                Sleep(1);
+#else
+                usleep(1000);
+#endif
+                continue;
+            }
+            break;   /* single-carrier: no runnable + no waiters => done */
+        }
         if (t->status == 3) continue;
+        if (g_watchdog_on) { g_carrier_pc[_wcid] = 2; g_carrier_spin[_wcid] = t; }
         nova_sched_current = t;
         t->status = 1;
+        t->park_committed = 0;   /* M:N F1: clear before resume; set to 1 below once it parks */
         int64_t done = nova_rt_fiber_resume(t->fiber);
         nova_sched_current = NULL;
+        if (g_carrier_count > 1) g_carrier_tasks_run[nova_carrier_id & 63]++;
         if (done == 1) {
             /* Read crash status from the FIBER's task state (nova_cur() is the
                carrier at this point, not the finished fiber) */
@@ -4590,11 +4765,15 @@ int64_t nova_rt_sched_run(void) {
                 nova_sched_notify_channel(t->monitors[i], t->exit_status);
             t->finished = 1;
             t->status = 3;
-            nova_sched_live--;
+            nova_live_dec();
+        } else {
+            /* M:N F1: the task yielded/parked — publish park_committed (release) so a carrier
+               spinning in wake_one/wake_send_one/wake_sleepers/poll_io/check_offload may now
+               safely re-enqueue and resume it (it has fully finished SwitchToFiber). */
+            t->park_committed = 1;
         }
-        /* if it parked, it linked itself onto a channel's green_waiters (not the run-queue) */
     }
-    nova_sched_running = 0;
+    if (g_carrier_count <= 1) nova_sched_running = 0;  /* M:N: main_dispatch clears it after join */
     return 0;
 }
 
@@ -4615,15 +4794,162 @@ static int nova_green_enabled(void) {
 /* The compiler-emitted main calls this with &nova_main. Default: run nova_main
    as the root green task on the M:N scheduler (implicit async). Fallback to
    direct call only when NOVA_GREEN=0 or on OOM. */
+/* ── M:N carrier thread ───────────────────────────────────────────────────
+   Each secondary carrier is an OS thread converted to a fiber-carrier. It runs
+   the SAME nova_rt_sched_run() loop as carrier 0 (the main thread); the loop's
+   M:N branch (g_carrier_count>1) keeps it alive until every task finishes. Task
+   fibers are thread-migratable (Win Fibers / POSIX ucontext), so a task spawned
+   on one carrier may be resumed on another. */
+#ifdef _WIN32
+static DWORD WINAPI nova_carrier_thread(LPVOID arg) {
+    nova_carrier_id = (int)(intptr_t)arg;
+    nova_ensure_carrier();          /* ConvertThreadToFiber for this carrier */
+    if (g_watchdog_on) g_carrier_fiber_addr[nova_carrier_id & 63] = nova_current_fiber;
+    nova_rt_sched_run();
+    return 0;
+}
+#else
+static void* nova_carrier_thread(void* arg) {
+    nova_carrier_id = (int)(intptr_t)arg;
+    nova_ensure_carrier();
+    if (g_watchdog_on) g_carrier_fiber_addr[nova_carrier_id & 63] = nova_current_fiber;
+    nova_rt_sched_run();
+    return NULL;
+}
+#endif
+
+/* Watchdog (NOVA_SCHED_WATCHDOG=1): dumps each carrier's breadcrumb every few
+   seconds so a hang's cause (spin-deadlock vs idle/lost-wakeup) is visible. */
+static int g_watchdog_ncar = 0;
+#ifdef _WIN32
+static DWORD WINAPI nova_watchdog_thread(LPVOID arg) {
+#else
+static void* nova_watchdog_thread(void* arg) {
+#endif
+    (void)arg;
+    const char* names[] = {"init","pop","resume","SPIN-WAKE","idle","exit"};
+    for (int tick = 0; ; tick++) {
+#ifdef _WIN32
+        Sleep(4000);
+#else
+        usleep(4000000);
+#endif
+        if (nova_sched_live <= 0) break;
+        fprintf(stderr, "[watchdog t=%ds] live=%lld rq_head=%p pollution=%ld", (tick+1)*4,
+                (long long)nova_sched_live, (void*)nova_rq_head, g_pollution_count);
+        for (int i = 0; i < g_watchdog_ncar; i++) {
+            int pc = g_carrier_pc[i];
+            fprintf(stderr, " | c%d=%s loops=%ld", i,
+                    (pc >= 0 && pc <= 5) ? names[pc] : "?", g_carrier_loops[i]);
+            if ((pc == 3 || pc == 2) && g_carrier_spin[i]) {
+                NovaSchedTask* st = (NovaSchedTask*)g_carrier_spin[i];
+                NovaFiber* fb = (NovaFiber*)(uintptr_t)st->fiber;
+                fprintf(stderr, "(task=%p committed=%d tstatus=%d root=%d", (void*)st,
+                        st->park_committed, st->status, (st == nova_sched_root_task));
+                if (fb) fprintf(stderr, " fiber=%p fstatus=%d factive=%d resumer=%p", (void*)fb, fb->status, fb->active, (void*)fb->resumer);
+                fprintf(stderr, ")");
+            }
+        }
+        fprintf(stderr, "\n");
+        /* carrier fiber addresses, so resumer can be classified (carrier vs task fiber) */
+        fprintf(stderr, "  carrier_fibers:");
+        for (int i = 0; i < g_watchdog_ncar; i++) fprintf(stderr, " c%d=%p", i, g_carrier_fiber_addr[i]);
+        fprintf(stderr, "\n");
+        if (tick == 0) {
+            /* dump trace events around the FIRST pollution (g_pol_at), which is the introduction site */
+            const char* kn[] = {"?","RES_ENTER","RES_EXIT","TRAMP_DONE","YIELD_OUT","YIELD_IN","PUSH","POP","WAKE","PARK"};
+            long center = (g_pol_at >= 0) ? g_pol_at : (long)g_trace_idx;
+            long start = center > 90 ? center - 90 : 0;
+            long end = center + 18;
+            fprintf(stderr, "  --- trace around first pollution @%ld (count=%ld) ---\n", g_pol_at, g_pollution_count);
+            for (long j = start; j < end; j++) {
+                NovaTraceEv* e = &g_trace[j & 1023];
+                int k = (e->kind >= 1 && e->kind <= 9) ? e->kind : 0;
+                fprintf(stderr, "  %s[%ld] t%u %s a=%p b=%p\n", (j == g_pol_at ? ">>" : "  "), j, e->tid, kn[k], e->a, e->b);
+            }
+        }
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
 void nova_rt_main_dispatch(int64_t main_fn) {
     if (nova_green_enabled()) {
         int64_t* rec = (int64_t*)malloc(sizeof(int64_t));
         if (rec) {
             rec[0] = main_fn;
             nova_sched_root_exit = 0;
+            /* M:N carrier count: NOVA_CARRIERS overrides; default 1 = single-carrier
+               (byte-identical to the pre-M:N hot path — M:N is opt-in until validated). */
+            int ncar = 1;
+            const char* cenv = getenv("NOVA_CARRIERS");
+            if (cenv && cenv[0]) {
+                ncar = atoi(cenv);
+                if (ncar < 1) ncar = 1;
+                if (ncar > 64) ncar = 64;   /* hard cap (matches NOVA_WS_MAX_WORKERS, #defined later) */
+            }
+            if (ncar > 1) {
+                /* Engage the locks/atomics/F1-spins BEFORE any task can run. */
+#ifdef _WIN32
+                if (!g_sched_lock_inited) { InitializeCriticalSection(&g_sched_lock); g_sched_lock_inited = 1; }
+#else
+                {
+                    pthread_mutexattr_t a;
+                    pthread_mutexattr_init(&a);
+                    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+                    pthread_mutex_init(&g_sched_lock, &a);
+                    pthread_mutexattr_destroy(&a);
+                }
+#endif
+                nova_is_multithreaded = 1;   /* engages atomic RC across carriers */
+                g_carrier_count = ncar;      /* >1 => every nova_sched_lock/live/F1-spin activates */
+                nova_sched_running = 1;       /* set ONCE; carriers don't reset it (main_dispatch does, post-join) */
+                if (getenv("NOVA_SCHED_WATCHDOG")) {
+                    g_watchdog_on = 1; g_watchdog_ncar = ncar;
+#ifdef _WIN32
+                    CreateThread(NULL, 0, nova_watchdog_thread, NULL, 0, NULL);
+#else
+                    { pthread_t wt; pthread_create(&wt, NULL, nova_watchdog_thread, NULL); pthread_detach(wt); }
+#endif
+                }
+            }
             int64_t root_h = nova_rt_sched_spawn((int64_t)(uintptr_t)rec);
             nova_sched_root_task = (NovaSchedTask*)(uintptr_t)root_h;
-            nova_rt_sched_run();
+            if (ncar > 1) {
+                nova_carrier_id = 0;          /* main thread is carrier 0 */
+                nova_ensure_carrier();
+                if (g_watchdog_on) g_carrier_fiber_addr[0] = nova_current_fiber;
+#ifdef _WIN32
+                HANDLE* th = (HANDLE*)malloc(sizeof(HANDLE) * (size_t)(ncar - 1));
+                for (int i = 1; i < ncar; i++)
+                    th[i-1] = CreateThread(NULL, 0, nova_carrier_thread, (LPVOID)(intptr_t)i, 0, NULL);
+                nova_rt_sched_run();          /* main runs as carrier 0 */
+                for (int i = 0; i < ncar - 1; i++) {
+                    if (th[i]) { WaitForSingleObject(th[i], INFINITE); CloseHandle(th[i]); }
+                }
+                free(th);
+#else
+                pthread_t* th = (pthread_t*)malloc(sizeof(pthread_t) * (size_t)(ncar - 1));
+                for (int i = 1; i < ncar; i++)
+                    pthread_create(&th[i-1], NULL, nova_carrier_thread, (void*)(intptr_t)i);
+                nova_rt_sched_run();
+                for (int i = 0; i < ncar - 1; i++) pthread_join(th[i], NULL);
+                free(th);
+#endif
+                nova_sched_running = 0;       /* all carriers joined => scheduler done */
+                if (getenv("NOVA_CARRIER_STATS")) {
+                    int active = 0;
+                    for (int i = 0; i < ncar; i++) if (g_carrier_tasks_run[i]) active++;
+                    fprintf(stderr, "[carriers] %d/%d active (pollution=%ld):", active, ncar, g_pollution_count);
+                    for (int i = 0; i < ncar; i++) fprintf(stderr, " c%d=%ld", i, g_carrier_tasks_run[i]);
+                    fprintf(stderr, "\n");
+                }
+            } else {
+                nova_rt_sched_run();          /* single-carrier default (unchanged) */
+            }
             if (nova_sched_root_exit) exit(nova_sched_root_exit);
             return;
         }
@@ -4820,6 +5146,7 @@ int64_t nova_rt_ws_spawn(int64_t closure) {
     if (!t) return 0;
     t->fiber = nova_rt_fiber_create(closure);
     if (!t->fiber) { free(t); return 0; }
+    ((NovaFiber*)(uintptr_t)t->fiber)->is_task = 1;   /* scheduler task: yield/finish -> current carrier */
     t->status = 0;
 #ifdef _WIN32
     InterlockedIncrement64(&g_ws_total_tasks);
