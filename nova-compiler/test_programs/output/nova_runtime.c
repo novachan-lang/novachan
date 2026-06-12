@@ -9088,6 +9088,18 @@ int64_t nova_rt_set_to_list(int64_t handle) {
     return result;
 }
 
+/* Build a set from a list (deduping). Backs set literals {a,b,c} and set
+   comprehensions {EXPR for ...}, which desugar to set_from_list(<list>). */
+int64_t nova_rt_set_from_list(int64_t list_handle) {
+    int64_t s = nova_rt_set_create();
+    NovaList* l = (NovaList*)(uintptr_t)list_handle;
+    if (!l) return s;
+    for (int64_t i = 0; i < l->size; i++) {
+        nova_rt_set_add(s, l->data[i]);
+    }
+    return s;
+}
+
 static int64_t nova_sort_by_closure;
 static int nova_sort_by_cmp(const void* a, const void* b) {
     int64_t va = *(const int64_t*)a;

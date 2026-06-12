@@ -161,6 +161,7 @@ $domain_tests = @(
     'textblock_test',
     'multigen_test',
     'dictcomp_test',
+    'set_comp_test',
     'ptestx',
     'fnval_test',
     'mmap_test',

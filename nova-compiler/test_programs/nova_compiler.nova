@@ -1443,7 +1443,93 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
                 ParseResult(_ds_result, p)
             else
                 let key0 = parse_expr(tokens, p, 0, pe)
-                p = expect(tokens, key0.pos, ":", pe)
+                p = key0.pos
+                if tv(tokens, p) != ":"
+                    // Not a dict (no ':' after the first expr): SET literal {a, b, c} or SET
+                    // comprehension {EXPR for V in IT (if C)?}. Both desugar (parse-time, no new
+                    // IR) to set_from_list(<list>), reusing the list-comprehension machinery.
+                    if tk(tokens, p) == "KW" and tv(tokens, p) == "for"
+                        let scvars = []
+                        let sciters = []
+                        let scfilters = []
+                        let scdestr = []
+                        while tk(tokens, p) == "KW" and tv(tokens, p) == "for"
+                            p = p + 1
+                            let _scd_vars = []
+                            let scvar = ""
+                            if tv(tokens, p) == "("
+                                p = p + 1
+                                while tv(tokens, p) != ")" and tk(tokens, p) != "EOF"
+                                    if tk(tokens, p) == "IDENT"
+                                        push(_scd_vars, tv(tokens, p))
+                                        p = p + 1
+                                    if tv(tokens, p) == ","
+                                        p = p + 1
+                                p = p + 1
+                                scvar = "__scomp_tup_" + str(ln)
+                            else
+                                scvar = tv(tokens, p)
+                                p = p + 1
+                            p = expect(tokens, p, "in", pe)
+                            let siter_r = parse_expr(tokens, p, 0, pe)
+                            p = siter_r.pos
+                            let _scd_iter = siter_r.expr
+                            if len(_scd_vars) > 0
+                                _scd_iter = Expr("call", "__destr_iter", 0, [siter_r.expr], [], ln)
+                            let smyfilters = []
+                            while tk(tokens, p) == "KW" and tv(tokens, p) == "if"
+                                p = p + 1
+                                let scond_r = parse_expr(tokens, p, 0, pe)
+                                push(smyfilters, scond_r.expr)
+                                p = scond_r.pos
+                            push(scvars, scvar)
+                            push(sciters, _scd_iter)
+                            push(scfilters, smyfilters)
+                            push(scdestr, _scd_vars)
+                        p = expect(tokens, p, "\}", pe)
+                        let snclauses = len(scvars)
+                        let sresult = null_expr()
+                        let sidx = snclauses - 1
+                        while sidx >= 0
+                            let scv = scvars[sidx]
+                            let ssrc = sciters[sidx]
+                            let _scd_body = key0.expr
+                            if len(scdestr[sidx]) > 0
+                                let _scdi = 0
+                                while _scdi < len(scdestr[sidx])
+                                    let _scd_repl = Expr("index", "", 0, [Expr("ident", scv, 0, [], [], ln), Expr("int", "", _scdi, [], [], ln)], [], ln)
+                                    _scd_body = _comp_subst(_scd_body, scdestr[sidx][_scdi], _scd_repl)
+                                    _scdi = _scdi + 1
+                            for sfcond in scfilters[sidx]
+                                let _sfc = sfcond
+                                if len(scdestr[sidx]) > 0
+                                    let _sfci = 0
+                                    while _sfci < len(scdestr[sidx])
+                                        let _sfc_repl = Expr("index", "", 0, [Expr("ident", scv, 0, [], [], ln), Expr("int", "", _sfci, [], [], ln)], [], ln)
+                                        _sfc = _comp_subst(_sfc, scdestr[sidx][_sfci], _sfc_repl)
+                                        _sfci = _sfci + 1
+                                ssrc = Expr("call", "filter", 0, [ssrc, Expr("lambda", "", 0, [_sfc], [Expr("ident", scv, 0, [], [], ln)], ln)], [], ln)
+                            if sidx == snclauses - 1
+                                sresult = Expr("call", "map", 0, [ssrc, Expr("lambda", "", 0, [_scd_body], [Expr("ident", scv, 0, [], [], ln)], ln)], [], ln)
+                            else
+                                let smapped = Expr("call", "map", 0, [ssrc, Expr("lambda", "", 0, [sresult], [Expr("ident", scv, 0, [], [], ln)], ln)], [], ln)
+                                sresult = Expr("call", "flatten", 0, [smapped], [], ln)
+                            sidx = sidx - 1
+                        return ParseResult(Expr("call", "set_from_list", 0, [sresult], [], ln), p)
+                    else
+                        let _set_elems = [key0.expr]
+                        while tv(tokens, p) != "\}" and tk(tokens, p) != "EOF"
+                            p = expect(tokens, p, ",", pe)
+                            if tv(tokens, p) == "\}" or tk(tokens, p) == "EOF"
+                                break
+                            let _se_r = parse_expr(tokens, p, 0, pe)
+                            push(_set_elems, _se_r.expr)
+                            if _se_r.pos <= p
+                                break
+                            p = _se_r.pos
+                        p = expect(tokens, p, "\}", pe)
+                        return ParseResult(Expr("call", "set_from_list", 0, [Expr("list", "", 0, _set_elems, [], ln)], [], ln), p)
+                p = expect(tokens, p, ":", pe)
                 let val0 = parse_expr(tokens, p, 0, pe)
                 p = val0.pos
                 if tk(tokens, p) == "KW" and tv(tokens, p) == "for"
@@ -4624,6 +4710,8 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_set_len"
     else if name == "set_to_list"
         "nova_rt_set_to_list"
+    else if name == "set_from_list"
+        "nova_rt_set_from_list"
     else if name == "list_min"
         "nova_rt_list_min"
     else if name == "list_max"
@@ -5718,6 +5806,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_set_remove(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_set_len(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_set_to_list(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_set_from_list(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_sum(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_index_of(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_sort_by(i64, i64) nounwind")
@@ -9684,6 +9773,7 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["set_remove"] = NTypeScheme([-1], nt_fn([nt_any(), T], nt_bool()))
     reg["set_len"] = NTypeScheme([], nt_fn([nt_any()], nt_int()))
     reg["set_to_list"] = NTypeScheme([-1], nt_fn([nt_any()], nt_list(T)))
+    reg["set_from_list"] = NTypeScheme([-1], nt_fn([nt_list(T)], nt_any()))
     reg["datetime_now"] = NTypeScheme([], nt_fn([], nt_string()))
     reg["datetime_format"] = NTypeScheme([], nt_fn([nt_int(), nt_string()], nt_string()))
     reg["datetime_year"] = NTypeScheme([], nt_fn([nt_int()], nt_int()))
@@ -15597,6 +15687,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_set_remove(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_set_len(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_set_to_list(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_set_from_list(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_sum(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_index_of(i64, i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_sort_by(i64, i64) nounwind")
