@@ -3795,8 +3795,10 @@ typedef struct NovaFiber {
     NovaTaskState     task;
     int               status;       /* 0=created 1=running 2=suspended 3=finished */
     volatile int      active;       /* M:N detector: 1 while a carrier is executing this fiber */
-    int               is_task;      /* 1 = scheduler green task (returns to the CURRENT carrier on
-                                       yield/finish, migration-safe); 0 = generator (returns to resumer) */
+    int               is_task;      /* 1 = scheduler green task: ALWAYS yields/finishes to the CURRENT
+                                       carrier (&nova_carrier_fiber), which is migration- AND
+                                       pollution-proof (never consults the per-thread resumer/TLS).
+                                       0 = generator: yields/finishes to its resumer (the task). */
     int64_t           entry_fn;     /* NOVA closure */
     struct NovaFiber* resumer;
     int64_t           yield_value;  /* lazy generator: most recently yielded value */
@@ -3810,6 +3812,11 @@ typedef struct NovaFiber {
 } NovaFiber;
 
 static int g_watchdog_on = 0;   /* M:N diagnostics (NOVA_SCHED_WATCHDOG); declared early for fiber_resume */
+/* Number of OS carrier threads (1 = single-carrier default). Declared early so the fiber
+   primitives can gate M:N-only behavior on it: at g_carrier_count<=1 the fiber switch is the
+   original resumer-based path (N=1 == pre-M:N, byte-identical), and only at >1 do scheduler
+   tasks switch to the CURRENT carrier (&nova_carrier_fiber). Set by nova_rt_main_dispatch. */
+static int g_carrier_count = 1;
 
 /* M:N event trace (diagnostics only): a lock-free ring buffer of recent scheduler/fiber
    events, dumped by the watchdog on a hang. kinds: 1 RES_ENTER(f,me) 2 RES_EXIT(f,me)
@@ -3911,10 +3918,9 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
     f->task.fault_active = 0;
 
     f->status = 3;
-    /* M:N: a scheduler task ALWAYS returns to the carrier thread it is currently running on
-       (migration-safe), never a stored resumer (which a migrated task may have left stale). A
-       generator (is_task=0) returns to the task that resumed it (resumer). */
-    NovaFiber* back = f->is_task ? &nova_carrier_fiber : f->resumer;
+    /* return to the CURRENT carrier if a carrier resumed us (migration/corruption-safe), else to
+       the task that resumed us (nested sched_run / generator). */
+    NovaFiber* back = (g_carrier_count > 1 && f->is_task) ? &nova_carrier_fiber : f->resumer;
     nova_trace(3, f, back);
     if (back && back->handle)
         SwitchToFiber(back->handle);
@@ -3936,13 +3942,11 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
     if (!f || f->status == 3) return 1;
     nova_ensure_carrier();
-    /* M:N: resuming a SCHEDULER TASK is always done by a carrier from the sched_run loop, so the
-       resumer is THIS thread's own carrier fiber — read it directly (&nova_carrier_fiber) rather
-       than trusting nova_current_fiber, which a migrated task could have left pointing at a task
-       fiber now running on another carrier. This also CLEANSES nova_current_fiber via the restore
-       below, so pollution cannot propagate. A generator (is_task=0) is resumed BY the running task,
-       so its resumer is that task = nova_current_fiber. */
-    NovaFiber* me = f->is_task ? &nova_carrier_fiber : nova_current_fiber;
+    /* resumer = the fiber currently running on this thread (a carrier in the carrier loop, or a
+       task when nesting a generator / explicit sched_run). The top-level carrier loop cleanses
+       nova_current_fiber to &nova_carrier_fiber before each resume (see nova_rt_sched_run), so a
+       migrated task can never leave a carrier resuming with a stale task fiber as `me`. */
+    NovaFiber* me = nova_current_fiber;
     if (!me) return -1;
     if (g_watchdog_on && me != &nova_carrier_fiber) {
         InterlockedIncrement(&g_pollution_count);
@@ -3971,8 +3975,7 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
 int64_t nova_rt_fiber_yield(void) {
     NovaFiber* me = nova_current_fiber;
     if (!me) return 0;
-    /* scheduler task -> current carrier (migration-safe); generator -> its resumer */
-    NovaFiber* back = me->is_task ? &nova_carrier_fiber : me->resumer;
+    NovaFiber* back = (g_carrier_count > 1 && me->is_task) ? &nova_carrier_fiber : me->resumer;
     if (!back || !back->handle) return 0;
     me->status = 2;
     nova_trace(4, me, back);
@@ -4052,8 +4055,7 @@ static void nova_posix_fiber_trampoline(void) {
     f->task.fault_active = 0;
 
     f->status = 3;
-    /* M:N: scheduler task returns to the CURRENT carrier (migration-safe); generator -> resumer */
-    NovaFiber* back = f->is_task ? &nova_carrier_fiber : f->resumer;
+    NovaFiber* back = (g_carrier_count > 1 && f->is_task) ? &nova_carrier_fiber : f->resumer;
     if (back)
         nova_asm_switch(&f->saved_sp, &back->saved_sp);
     for (;;) { }
@@ -4095,9 +4097,7 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     NovaFiber* f = (NovaFiber*)(uintptr_t)handle;
     if (!f || f->status == 3) return 1;
     nova_ensure_carrier();
-    /* M:N: scheduler task -> resumer is THIS thread's carrier (migration-safe, cleanses TLS);
-       generator -> resumer is the running task (nova_current_fiber). See Windows path. */
-    NovaFiber* me = f->is_task ? &nova_carrier_fiber : nova_current_fiber;
+    NovaFiber* me = nova_current_fiber;
     if (!me) return -1;
     f->resumer = me;
     me->status = 2;
@@ -4116,8 +4116,7 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
 int64_t nova_rt_fiber_yield(void) {
     NovaFiber* me = nova_current_fiber;
     if (!me) return 0;
-    /* scheduler task -> current carrier (migration-safe); generator -> its resumer */
-    NovaFiber* target = me->is_task ? &nova_carrier_fiber : me->resumer;
+    NovaFiber* target = (g_carrier_count > 1 && me->is_task) ? &nova_carrier_fiber : me->resumer;
     if (!target) return 0;
     me->status = 2;
     nova_asm_switch(&me->saved_sp, &target->saved_sp);
@@ -4248,8 +4247,8 @@ static NovaSleepWaiter* nova_sleep_waiters = NULL;
    g_carrier_count<=1 (the single-carrier default), so the existing hot path is byte-identical;
    the global lock + atomic live counter engage only once >1 carrier starts (NOVA_CARRIERS>1).
    This Step-1 coarse single lock guards the run-queue + all waiter lists + wake paths; later
-   steps replace it with per-carrier deques + lock-free work-stealing. */
-static int g_carrier_count = 1;
+   steps replace it with per-carrier deques + lock-free work-stealing. (g_carrier_count is
+   declared earlier, above the fiber primitives.) */
 #ifdef _WIN32
 static CRITICAL_SECTION g_sched_lock;
 static int g_sched_lock_inited = 0;
@@ -4696,6 +4695,16 @@ static NovaSchedTask* nova_sched_root_task = NULL;
    run-queue is empty while tasks remain parked — a user deadlock, which we
    bail out of rather than hang). */
 int64_t nova_rt_sched_run(void) {
+    /* M:N (N>1) ONLY: an EXPLICIT sched_run() from inside a green task (low-level Stage-2a API:
+       sched_spawn... then sched_run()) must NOT drive tasks itself — under M:N the spawned tasks
+       are is_task=1 and return to the CURRENT carrier, which the carrier threads drive. This nested
+       caller just cooperatively yields until they finish (live <= 1 = only this caller remains).
+       At N=1 this is skipped and the ORIGINAL classic nested loop below runs (resumer-based, drives
+       the tasks on this thread + polls the netpoller when idle — byte-identical to pre-M:N). */
+    if (g_carrier_count > 1 && nova_sched_in_task()) {
+        while (nova_live_get() > 1) nova_sched_yield_runnable();
+        return 0;
+    }
     nova_sched_running = 1;
     int _wcid = nova_carrier_id & 63;
     while (nova_live_get() > 0) {

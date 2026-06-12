@@ -9,7 +9,8 @@ $l = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o `"$dir\_p2.exe`" `"$di
 if ($l.ExitCode -ne 0) { Write-Host "LINK-FAIL $($l.StdErr)"; exit 1 }
 Write-Host "built _p2.exe; soaking $runs runs per carrier-count"
 $errf = "$dir\_soak_err.txt"; $outf = "$dir\_soak_out.txt"
-$env:NOVA_CARRIER_STATS = "1"; $env:NOVA_SCHED_WATCHDOG = "1"
+$env:NOVA_CARRIER_STATS = "1"
+if ($env:WD -eq "1") { $env:NOVA_SCHED_WATCHDOG = "1" } else { Remove-Item Env:\NOVA_SCHED_WATCHDOG -ErrorAction SilentlyContinue }
 foreach ($nc in @("2","4","8")) {
     $env:NOVA_CARRIERS = $nc
     $hangs = 0; $bad = 0; $maxpol = 0
