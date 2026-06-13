@@ -8765,6 +8765,24 @@ int64_t nova_rt_remote_close(int64_t sock_val) {
     return 0;
 }
 
+/* remote_spawn(conn, name, args): send a spawn request — the 2-element list
+   [name, args] — to a peer over the channel, then return the channel so the
+   caller awaits the result via remote_recv. The peer's dispatch loop does
+   call_by_name(name, args) and sends the result back. Args are JSON-serialized
+   over the wire (remote_send), i.e. DEEP-COPIED — the remote runs on its own
+   isolated copy (process isolation holds across the network; the channel is the
+   only shared boundary). Returns the channel, or -1 on send failure. */
+int64_t nova_rt_remote_spawn(int64_t conn, int64_t name_val, int64_t args_handle) {
+    int64_t msg = nova_rt_list_create();
+    if (!msg) return -1;
+    nova_rt_list_append(msg, name_val);
+    nova_rt_list_append(msg, args_handle);
+    int64_t rc = nova_rt_remote_send(conn, msg);
+    nova_rc_dec(msg);                 /* transient request list (append took refs; dec balances) */
+    if (rc < 0) return -1;
+    return conn;
+}
+
 int64_t nova_rt_udp_bind(int64_t port_val) {
     nova_wsa_init();
     int port = (int)port_val;
@@ -12345,6 +12363,67 @@ static const char* nova_struct_name_for_hash(int64_t hash) {
     for (int i = 0; i < g_struct_type_count; i++)
         if (g_struct_type_hashes[i] == hash) return g_struct_type_names[i];
     return NULL;
+}
+
+/* ── Function-by-name registry (distributed spawn / dynamic apply) ────────────
+   The compiler emits nova_rt_register_fn("name", @fn, arity) at program init
+   (single-threaded, in @main before nova_rt_main_dispatch — i.e. before any
+   spawn/scheduler), but ONLY when the program actually uses call_by_name /
+   remote_spawn, so non-distributed programs pay nothing and no extra functions
+   get address-taken. After init the table is IMMUTABLE, so reads (call_by_name)
+   are lock-free and race-free. Linear scan: call_by_name is RPC dispatch
+   (network-bound), never a hot loop. Name pointers are valid null-terminated C
+   strings whether the source was a string literal (raw .str pointer) or a fat
+   string (data is null-terminated, header sits before the handle). */
+#define NOVA_MAX_FNS 16384
+static const char* g_fn_names[NOVA_MAX_FNS];
+static void*       g_fn_ptrs[NOVA_MAX_FNS];
+static int         g_fn_arities[NOVA_MAX_FNS];
+static int         g_fn_count = 0;
+void nova_rt_register_fn(int64_t name_val, int64_t fn_ptr, int64_t arity) {
+    if (g_fn_count >= NOVA_MAX_FNS) return;          /* generous cap; silently full */
+    const char* name = (const char*)(uintptr_t)name_val;
+    if (!name) return;
+    g_fn_names[g_fn_count]   = name;
+    g_fn_ptrs[g_fn_count]    = (void*)(uintptr_t)fn_ptr;
+    g_fn_arities[g_fn_count] = (int)arity;
+    g_fn_count++;
+}
+/* Resolve a function by name and apply it to the elements of a NOVA list.
+   Returns the function's result, or 0 with an error set if the name is unknown,
+   the arity does not match len(args), or arity > 8. Each argument is unboxed
+   (nova_rt_unbox: box->payload, raw passes through) so a JSON-decoded list of
+   ints applies correctly to an int-parameter function. The all-i64 calling
+   convention lets us cast the registered pointer to the matching arity. */
+int64_t nova_rt_call_by_name(int64_t name_val, int64_t args_handle) {
+    const char* name = (const char*)(uintptr_t)name_val;
+    if (!name) { nova_set_error("call_by_name: null function name"); return 0; }
+    NovaList* args = (NovaList*)(uintptr_t)args_handle;
+    int n = args ? (int)args->size : 0;
+    if (n > 8) { nova_set_error("call_by_name: more than 8 arguments not supported"); return 0; }
+    int64_t ua[8];
+    for (int k = 0; k < n; k++) ua[k] = nova_rt_unbox(args->data[k]);
+    for (int i = 0; i < g_fn_count; i++) {
+        if (strcmp(g_fn_names[i], name) != 0) continue;
+        if (g_fn_arities[i] != n) {
+            nova_set_error("call_by_name: argument count does not match the function arity");
+            return 0;
+        }
+        void* f = g_fn_ptrs[i];
+        switch (n) {
+            case 0: return ((int64_t(*)(void))f)();
+            case 1: return ((int64_t(*)(int64_t))f)(ua[0]);
+            case 2: return ((int64_t(*)(int64_t,int64_t))f)(ua[0],ua[1]);
+            case 3: return ((int64_t(*)(int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2]);
+            case 4: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3]);
+            case 5: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4]);
+            case 6: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5]);
+            case 7: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6]);
+            case 8: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7]);
+        }
+    }
+    nova_set_error("call_by_name: unknown function name");
+    return 0;
 }
 
 /* ── Runtime type identity (RTTI) ─────────────────────────────────────────────

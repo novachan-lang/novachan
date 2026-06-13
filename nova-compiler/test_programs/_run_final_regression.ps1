@@ -164,6 +164,8 @@ $domain_tests = @(
     'set_comp_test',
     'remote_test',
     'remote_multi_test',
+    'call_by_name_test',
+    'remote_spawn_test',
     'int_ptr_soundness_repro',
     'str_identity_test',
     'struct_rc_test',
