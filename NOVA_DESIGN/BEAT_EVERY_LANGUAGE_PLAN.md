@@ -107,7 +107,17 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
   reconnection-heartbeat; arity > 8; float-arg ABI nuance (args unboxed → raw double bits, fine for
   raw-float params).
 
-**[P5] Const-eval expansion (beat Zig/C comptime). [SCOPED 2026-06-13 — needs new global infra.]**
+**[P5] ✅ DONE (733a707) — const-aggregate baking (beat the Zig/C comptime gap NOVA was losing).**
+- *Shipped:* a top-level `const` list literal of pure literals is now built ONCE in the `@nova_main`
+  prologue and cached (runtime g_const_cache + `nova_rt_const_set`/`nova_rt_const_get` [readonly]),
+  instead of being re-lowered/rebuilt at every use (and per loop iteration). Reused P4's gated-prologue
+  + runtime-cache pattern. Shared immutable handle is sound (M:N RC is atomic, like a channel; permanent
+  cache ref). `ir_const_bakeable` gates on non-empty list-of-literals (no inter-const dependency).
+- *Verified:* const_bake_test (TABLE used 5×+loop → built ONCE in IR) + const_test unchanged; 406/406;
+  reconverged 520326D8. Follow-ups: dict-literal consts, scalar-const-ref elements, typed const_get
+  result (currently generic index_get — correct, slightly slower).
+
+**[P5-orig] (superseded by the above) Const-eval expansion notes. [SCOPED 2026-06-13.]**
 - *Problem (confirmed in IR):* scalar consts (`const TAU = PI*2`) already fold via inline-expr +
   LLVM. But a `const` AGGREGATE is stored as an expr (`b.ir_consts[name]=expr`) and **re-lowered at
   EVERY use** (ir_lower_expr at ~L7027) — so `const TABLE=[1,4,9,16,25]` is REBUILT from scratch on
