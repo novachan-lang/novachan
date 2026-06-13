@@ -1914,15 +1914,18 @@ static void nova_copymap_put(NovaCopyMap* m, int64_t key, int64_t val) {
 }
 
 /* Deep-copy recursion ceiling. nova_deep_copy_rec uses ~80-128 bytes of stack per
-   level at -O2. A green task / generator runs on a fixed 32KB fiber stack, so we cap
-   at NOVA_DEEP_COPY_FIBER_LIMIT (=64 -> ~8KB, with comfortable headroom for the stack
-   already consumed above us plus nova_panic's own call chain). The main thread (only
+   level at -O2. A green task / generator fiber has a PE-default reserve (~16MB usable,
+   measured in iter 17 — NOT the 32KB an earlier comment wrongly assumed when this was
+   set to 64), so 4096 levels (~0.5-1MB) sits far inside it with room for a deep prior
+   call chain; and if a pathological value DID exceed the real stack, the iter-16 SEH
+   __except in nova_fiber_entry contains the overflow as a clean crash anyway (this guard
+   is the nicer-error soft backstop, the SEH is the hard one). The main thread (only
    when NOVA_GREEN=0 runs nova_main directly on the MB-class OS stack) keeps the old
    10000 ceiling. EXCEEDING the limit PANICS (a contained crash on a fiber) rather than
    the old share-on-overflow, which silently aliased substructure between the channel
    sender and receiver — a process-isolation violation / data race. So: either a fully
    independent deep copy, or a clean contained failure; never partial sharing. */
-#define NOVA_DEEP_COPY_FIBER_LIMIT 64
+#define NOVA_DEEP_COPY_FIBER_LIMIT 4096
 
 static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
     if ((uint64_t)v < 0x10000ULL) return v;
