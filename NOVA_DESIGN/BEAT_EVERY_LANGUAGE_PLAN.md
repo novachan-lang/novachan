@@ -17,7 +17,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **C++** | templates, RAII, zero-cost | RAII=`defer`+RC; operators=traits; generics+inference; **no template/UB/45-min-compile complexity** | monomorphic native-ABI specialization (narrow perf) |
 | **Rust** | safety w/o GC | process isolation = same safety (no data races/UAF/null), **zero annotations**, no borrow-checker fight | COW-on-send (cut deep-copy cost) — perf, not safety |
 | **Go** | M:N concurrency, fast compile | M:N work-stealing scheduler; typed channels+select+spawn; **+supervisors/monitors Go lacks**; **small-commit auto-grow fiber stacks (86b8b4d): contained overflow + 2.37× task density** | faster incremental compile |
-| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)**; **fiber overflow = contained crash (fb73d6e) + 52.6k parked tasks/GB (86b8b4d)**; **multi-node cluster membership: G-Set CRDT, seed-join + gossip, 3 nodes converge (3367cfa)**; **cluster failure-detection: gossip-as-heartbeat + last-seen, kill-one-detect-down 4/4, 0 false-positives (c7c6edc)**; **carrier-safe http_get + a real green HTTP server stack (4d8a964/e87170e)** | phi-accrual/suspicion detector (incr 3); stackless coroutines for true millions (~300 B/proc); hot code swap |
+| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)**; **fiber overflow = contained crash (fb73d6e) + 52.6k parked tasks/GB (86b8b4d)**; **multi-node cluster membership: G-Set CRDT, seed-join + gossip, 3 nodes converge (3367cfa)**; **cluster failure-detection: gossip-as-heartbeat + last-seen, kill-one-detect-down 4/4, 0 false-positives (c7c6edc)**; **cluster graceful leave: cluster_leave broadcasts departure → peers mark down immediately, crash-control-verified (f320c9d)**; **carrier-safe http_get + a real green HTTP server stack (4d8a964/e87170e)** | phi-accrual/suspicion detector (incr 4); stackless coroutines for true millions (~300 B/proc); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
 | **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; WASM m1–m5 (f64/string/list/float programs run in wasm32, output byte-identical to native, reusable runtime); **`nova wasm <file>` is now a FIRST-CLASS CLI command (c93fbfa)**; **m6 (08794a5): dicts + structs run in wasm32 byte-identical to native (struct_alloc + full dict ops via FNV-1a matching native + index_get dict-dispatch) — real dict/struct/word-count programs run in the browser** | m7 = the TAGGED C-runtime-to-wasm path (eliminates the untagged JS-runtime int/pointer ambiguity for medium ints through polymorphic ops — the documented m6 boundary); channels→SharedArrayBuffer; DOM bindings |
@@ -129,9 +129,13 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
   taking.
 - *Verified:* call_by_name_test (registry + dynamic apply 0/1/2) + remote_spawn_test (localhost round-
   trip: requester → remote_spawn → server resolves `add` by name → 42). 405/405; reconverged 2B051F29.
-- *Remaining for full Erlang-class distribution (future):* multi-node clustering / discovery /
-  reconnection-heartbeat; arity > 8; float-arg ABI nuance (args unboxed → raw double bits, fine for
-  raw-float params).
+- *Multi-node clustering SHIPPED (pure NOVA over remote_*):* G-Set CRDT membership + seed-join/gossip
+  convergence (3367cfa); failure detection = gossip-as-heartbeat + last-seen + cluster_alive/status,
+  kill-one-detect-down 4/4 with 0 false-positives (c7c6edc); graceful leave = cluster_leave broadcasts
+  departure → peers mark down immediately, crash-control-verified that the verdict is the broadcast not a
+  timeout coincidence (f320c9d).
+- *Remaining for full Erlang-class distribution (future):* phi-accrual/suspicion detector (incr 4);
+  arity > 8; float-arg ABI nuance (args unboxed → raw double bits, fine for raw-float params).
 
 **[P5] ✅ DONE (733a707) — const-aggregate baking (beat the Zig/C comptime gap NOVA was losing).**
 - *Shipped:* a top-level `const` list literal of pure literals is now built ONCE in the `@nova_main`
