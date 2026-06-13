@@ -20,7 +20,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)** | node clustering/discovery (multi-node); growable stacks (millions); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
-| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; **WASM m1+m2+m3 done: NOVA f64-compute, static-string+print, AND a loop-compute + DYNAMIC string run in wasm32 in Node** via a JS-hosted runtime bridge (compiled NOVA logic in wasm, runtime services as host imports — the real browser-deploy architecture) | WASM m4+: self-contained in-wasm RC heap (host-independent) + lists/structs; nova-build wasm glue gen; channels/DOM |
+| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; **WASM m1–m4 done: f64-compute, string+print, loop+dynamic-string, AND a real LIST-using algorithm (prime sieve, 168 primes) run in wasm32 in Node** — JS-managed linear-memory runtime (bump heap + list/string fns over instance.exports.memory; the browser-deploy architecture) | WASM m5+: compile the C memory-runtime to wasm (one source of truth, free/dicts/structs); nova-build wasm glue-gen CLI; channels→SharedArrayBuffer; DOM |
 
 **Bottom line:** the core is already competitive-to-dominant on 6 of 9; the open frontiers are
 **perf endgame (C struct-passing + SIMD), distribution+scale (Erlang), and WASM (JS browser).**
@@ -152,10 +152,18 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
   port the C runtime to linear memory, runtime services are **JS-hosted** (host imports manage strings
   via opaque i64 handles) — the pragmatic browser architecture (NOVA logic in wasm, runtime+DOM in JS
   glue). So NOVA programs that USE THE RUNTIME now run in wasm given host-provided nova_rt_* services.
-- *Milestone 4+ (next):* a **self-contained** in-wasm RC heap in linear memory (for host-INDEPENDENT
-  wasm — no JS runtime) + lists/structs + more nova_rt_*; then `nova build --target wasm` tooling that
-  auto-generates the JS glue; then channels→SharedArrayBuffer+Atomics, threads→Web Workers, DOM.
-  Effort XL — keep decomposing.
+- *Milestone 4 (DONE 9f006cc):* a real **list-using** NOVA program — Sieve of Eratosthenes, n=1000 →
+  168 primes — runs in wasm32 (output == native). Lists need a real heap in linear memory (index
+  get/set are inlined wasm reads/writes), so this added a **JS-managed linear-memory runtime**
+  (_wasm_sieve_run.cjs): a bump allocator over `instance.exports.memory` + the 5 import fns
+  (list_create, list_append_no_rc with array growth, unbox_elem, int_to_str, print_str), matching
+  NOVA's wasm32 NovaList layout (data@0 i32 / size@8 / cap@16, i64 elems). Workflow-designed +
+  adversarially verified (severity minor). n=1000 is past clang's unroll threshold → genuine
+  in-wasm computation + ~7 list growths. All 4 milestones in _wasm_milestone.ps1.
+- *Milestone 5+ (next):* compile NOVA's **C memory-runtime to wasm** (one source of truth → correct
+  layouts, free/dicts/structs, no JS layout-replication) via #ifdef'ing the OS parts + a wasm malloc;
+  then a `nova build --target wasm` CLI that auto-generates the glue; then channels→SharedArrayBuffer+
+  Atomics, threads→Web Workers, DOM. Effort XL — keep decomposing.
 
 **[P7] REPL via OrcJIT (beat Python adoption).**
 - *NOVA way:* `nova repl` JIT-compiles each line via LLVM OrcJIT (NOT a 2nd interpreter); state
