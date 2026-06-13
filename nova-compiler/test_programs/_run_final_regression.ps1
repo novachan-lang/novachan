@@ -406,7 +406,7 @@ Write-Host ""
 $testScript = {
     param($testName, $compilerPath, $rtObjPath, $workDir, $clangExe, $lFlags, $sqPath)
 
-    $r = @{ Name = $testName; Status = "PASS"; Detail = "" }
+    $r = @{ Name = $testName; Status = "PASS"; Detail = ""; Out = "" }
 
     if (-not (Test-Path "$workDir\$testName.nova")) {
         $r.Status = "SKIP"; return $r
@@ -465,6 +465,7 @@ $testScript = {
     if ($rr.T) { $r.Status = "FAIL"; $r.Detail = "TIMEOUT" }
     elseif ($rr.X -ne 0) { $r.Status = "FAIL"; $r.Detail = "RUN exit=$($rr.X)" }
     elseif ($rr.E -match 'FAIL assert') { $r.Status = "FAIL"; $r.Detail = "ASSERT FAIL" }
+    if ($rr.O) { $r.Out = ([string]$rr.O).Trim() }
 
     return $r
 }
@@ -488,7 +489,7 @@ foreach ($t in $parallel_tests) {
     [void]$jobs.Add(@{ PS = $ps; Handle = $handle; Name = $t })
 }
 
-$pass = 0; $fail = 0; $skip = 0; $failures = @()
+$pass = 0; $fail = 0; $skip = 0; $failures = @(); $suspects = @()
 foreach ($job in $jobs) {
     try {
         $res = $job.PS.EndInvoke($job.Handle)
@@ -499,7 +500,7 @@ foreach ($job in $jobs) {
     }
 
     switch ($r.Status) {
-        "PASS" { $pass++; Write-Host "PASS $($r.Name)" }
+        "PASS" { $pass++; Write-Host "PASS $($r.Name)"; if ([string]::IsNullOrWhiteSpace($r.Out)) { $suspects += $r.Name } }
         "SKIP" { $skip++ }
         default {
             $fail++
@@ -530,7 +531,7 @@ foreach ($t in $server_tests) {
         $r = @{ Name = $t; Status = "FAIL"; Detail = "RUNSPACE ERROR" }
     }
     switch ($r.Status) {
-        "PASS" { $pass++; Write-Host "PASS $($r.Name) [serial]" }
+        "PASS" { $pass++; Write-Host "PASS $($r.Name) [serial]"; if ([string]::IsNullOrWhiteSpace($r.Out)) { $suspects += $r.Name } }
         "SKIP" { $skip++ }
         default { $fail++; $failures += "$($r.Name) ($($r.Detail))"; Write-Host "FAIL $($r.Name)  ($($r.Detail)) [serial]" }
     }
@@ -550,5 +551,10 @@ if ($failures.Count -gt 0) {
     Write-Host ""
     Write-Host "Failures:"
     foreach ($f in $failures) { Write-Host "  $f" }
+}
+if ($suspects.Count -gt 0) {
+    Write-Host ""
+    Write-Host "SUSPECT (exit 0 but NO stdout - possible false-pass, audit these):"
+    foreach ($s in $suspects) { Write-Host "  $s" }
 }
 if ($fail -gt 0) { exit 1 }
