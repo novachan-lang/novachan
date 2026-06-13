@@ -77,3 +77,40 @@ its first stage is the same provenance work other deep features need.
 Use `json_stringify(struct_with_a_list<Struct>_field)` (works) rather than a top-level list, or
 build the array string manually, until Path A lands. Do NOT register `to_json` as a stdlib function
 in isolation — that silences symptom B. `auto_reflect_test` already guards the working struct cases.
+
+## Path A — VERIFIED implementation recipe (iter 32, adversarially reviewed; ready for iter 33)
+
+A design+verify workflow (compiler-architect + devils-advocate + synthesis) produced + hardened the
+exact Path-A edits. Grounded facts: the inferer→codegen threading channel ALREADY exists
+(`b.ir_fn_param_stypes = ti_state.ti_fn_param_types`, compile_ir_core_named ~L15468, populated
+post-final-`ti_solve` ~L11978-12001 — the SOUND, use-site-unified pattern). Extend it for lists:
+
+- **Recording (pure-additive, .ll-inert during self-compile → byte-identical reconverge):** add 2
+  IrBuilder dicts `ir_list_elem_stype` (local-name → elem struct) + `ir_fn_ret_list_elem` (fn-name →
+  elem struct), populated at: list-literal/let (`ir_list_elem_struct` query on the RHS), `push(ident,
+  structval)` (track + clear-to-"" on a heterogeneous push), reassignment (del stale + repopulate),
+  and fn-registration (return annotation `list<Struct>`). A CONSERVATIVE query
+  `ir_list_elem_struct(b, expr)` returns a struct name ONLY when provably a homogeneous list of one
+  struct (literal: all children same struct in `ir_sdefs`; ident: the recorded value; call: the
+  fn-ret annotation) — else "". Do NOT touch `ir_expr_struct_type` (many dispatches read it).
+- **★ CVE TRAP (the review's critical catch — MUST do): reset `ir_list_elem_stype = {}` at EVERY
+  function boundary** (right after `b.ir_locals = {}` in ir_lower_function ~L9084 AND the top-level
+  nova_main scope ~L16522). Without it, a recorded `pts→Point` in fn A leaks to a same-named `pts` in
+  fn B that holds a different type → the consumer emits `nova_rt_list_map(<non-list>, Point__to_json)`
+  = a SEGFAULT-class CVE (the never-over-specialize-across-scopes rule).
+- **Consumer (split by safety):** `json_stringify(list<Struct>)` is a CALL-form dispatch (~L7332) —
+  emit `"[" + join(map(lst, fn(e) <Elem>__to_json(e)), ",") + "]"` (the proven field-level pattern).
+  Reconverge-SAFE: the compiler has ZERO call-form `json_stringify(list<Struct>)`, so its .ll is
+  unchanged. `to_json(list)` (symptom B) is HARDER: it needs `to_json` registered in `ti_stdlib`
+  (risks perturbing the compiler's own `to_json` inference) AND covering the `list.to_json()`
+  METHOD-call form (~L7454, NOT the call form) — defer `to_json` to a later step; `json_stringify`
+  alone fixes the dangerous silent symptom A.
+
+**iter-33 plan:** apply the recording + the function-boundary resets + the `json_stringify`
+consumer together; GATE = a new test exercising (a) literal / ident / push-built / fn-returned
+list-of-structs → exact JSON array, (b) THE CVE SCENARIO (two functions with same-named list locals
+of DIFFERENT types + json_stringify both → prove no mis-serialization/segfault), (c) list<scalar>
++ empty list unchanged; + FULL reconverge gen5.ll==gen6.ll (run EARLY, fast-fail) + 413 0-SUSPECT +
+green_scale N=1. REVERT on any divergence/crash/mis-serialization. `to_json(list)` + the method-call
+form are a follow-up. (Exact line-anchored edits are cached in the iter-32 workflow run; re-derive
+current line numbers when implementing — the file shifts.)
