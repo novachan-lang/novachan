@@ -359,6 +359,7 @@ $concurrency_tests = @(
     'sort_string_test',
     'leak_baseline_test',
     'auto_reflect_test',
+    'json_list_test',
     'http_offload_test'
 )
 

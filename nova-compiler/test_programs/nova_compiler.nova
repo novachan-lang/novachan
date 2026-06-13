@@ -6840,9 +6840,11 @@ type IrBuilder
     ir_fn_param_stypes: dict
     ir_const_baked: dict
     ir_const_build_order: list
+    ir_list_elem_stype: dict
+    ir_fn_ret_list_elem: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [])
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [], {}, {})
 
 // P5 const-baking: is `e` a compile-time-constant LITERAL element (int/float/str/
 // bool, or a unary-negated/notted literal)? Pure literals only — NO ident refs —
@@ -7334,6 +7336,19 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     if json_sty != "" and list_contains(b.ir_fnames, json_sty + "__to_json")
                         ir_emit_side(b, "call", dest, ir_type_any(), arg_regs, json_sty + "__to_json", 0)
                         return dest
+                    // Stage-1 list-of-structs (DB/HTTP serialize keystone): when the arg is a list
+                    // whose elements are ALL one struct, serialize as a JSON array via the proven
+                    // field-level pattern -- "[" + join(map(lst, fn(e) <Elem>__to_json(e)), ",") + "]".
+                    // Reconverge-safe: the compiler has no call-form json_stringify on a list-of-structs.
+                    let _jls_elem = ir_list_elem_struct(b, children[0])
+                    if _jls_elem != "" and list_contains(b.ir_fnames, _jls_elem + "__to_json")
+                        let _jls_ln = b.ir_cur_line
+                        let _jls_body = Expr("call", _jls_elem + "__to_json", 0, [Expr("ident", "_jlse", 0, [], [], _jls_ln)], [], _jls_ln)
+                        let _jls_lam = Expr("lambda", "", 0, [_jls_body], [Expr("ident", "_jlse", 0, [], [], _jls_ln)], _jls_ln)
+                        let _jls_map = Expr("call", "map", 0, [children[0], _jls_lam], [], _jls_ln)
+                        let _jls_join = Expr("call", "join", 0, [_jls_map, Expr("str", ",", 0, [], [], _jls_ln)], [], _jls_ln)
+                        let _jls_full = Expr("binop", "+", 0, [Expr("binop", "+", 0, [Expr("str", "[", 0, [], [], _jls_ln), _jls_join], [], _jls_ln), Expr("str", "]", 0, [], [], _jls_ln)], [], _jls_ln)
+                        return ir_lower_expr(b, _jls_full)
                 if fn_name == "fields" and len(children) == 1
                     let fl_sty = ir_expr_struct_type(b, children[0])
                     if fl_sty != "" and list_contains(b.ir_fnames, fl_sty + "__fields")
@@ -8076,12 +8091,55 @@ fn ir_expr_struct_type(b: IrBuilder, expr: Expr) -> string
                                 return un_rt
     ""
 
+// Stage-1 list-element-type query: if `expr` is provably a list whose elements are ALL the same
+// struct type, return that struct name, else "". Conservative (never claims a type it can't prove)
+// -- a list literal needs every child to be the same struct in ir_sdefs; an ident reads the
+// recorded ir_list_elem_stype; a fn-call reads ir_fn_ret_list_elem (from a -> list<Struct> return
+// annotation). Pure query (never mutates b). Used by the json_stringify list-of-structs dispatch.
+fn ir_list_elem_struct(b: IrBuilder, expr: Expr) -> string
+    match expr
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et == "list" or et == "list_init"
+                if len(ec) == 0
+                    return ""
+                let _les_first = ir_expr_struct_type(b, ec[0])
+                if _les_first == "" or not contains(b.ir_sdefs, _les_first)
+                    return ""
+                let _les_i = 1
+                while _les_i < len(ec)
+                    let _les_ci = ir_expr_struct_type(b, ec[_les_i])
+                    if _les_ci != _les_first
+                        return ""
+                    _les_i = _les_i + 1
+                return _les_first
+            if et == "ident" and contains(b.ir_list_elem_stype, ev)
+                let _les_v = b.ir_list_elem_stype[ev]
+                if _les_v != "" and _les_v != "!"   // "" = unknown/empty (upgradeable); "!" = heterogeneous (poisoned)
+                    return _les_v
+            if et == "call" and contains(b.ir_fn_ret_list_elem, ev)
+                return b.ir_fn_ret_list_elem[ev]
+    ""
+
 fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
     match stmt
         Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
             if sline > 0
                 b.ir_cur_line = sline
             if tag == "expr"
+                // Stage-1: track a list-of-struct local's element type through push(ident, struct_val).
+                // Only simple ident targets; clear to "" on a heterogeneous push (conservative).
+                match expr
+                    Expr(_pe_t, _pe_v, _pe_n, _pe_c, _pe_f, _pe_l) =>
+                        if _pe_t == "call" and _pe_v == "push" and len(_pe_c) == 2
+                            match _pe_c[0]
+                                Expr(_pe_lt, _pe_lv, _pe_ln, _pe_lc, _pe_lf, _pe_ll) =>
+                                    if _pe_lt == "ident"
+                                        let _pe_elem = ir_expr_struct_type(b, _pe_c[1])
+                                        if _pe_elem != "" and contains(b.ir_sdefs, _pe_elem)
+                                            if not contains(b.ir_list_elem_stype, _pe_lv) or b.ir_list_elem_stype[_pe_lv] == ""
+                                                b.ir_list_elem_stype[_pe_lv] = _pe_elem   // first real element upgrades unknown/empty
+                                            else if b.ir_list_elem_stype[_pe_lv] != _pe_elem
+                                                b.ir_list_elem_stype[_pe_lv] = "!"        // differing struct -> heterogeneous, poison
                 ir_lower_expr(b, expr)
             else if tag == "let"
                 let val = ir_lower_expr(b, expr)
@@ -8091,6 +8149,13 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                     b.ir_locals[name] = let_stype
                 else
                     b.ir_locals[name] = 1
+                // Stage-1: record a homogeneous list-of-struct local's element type (or "" to FORGET
+                // a stale struct if this let rebinds the name to a non-struct-list / non-list -- a
+                // same-name re-let must never inherit a prior struct type, else mis-specialization).
+                if let_stype == "list"
+                    b.ir_list_elem_stype[name] = ir_list_elem_struct(b, expr)
+                else if contains(b.ir_list_elem_stype, name)
+                    b.ir_list_elem_stype[name] = ""
             else if tag == "assign"
                 // Typed-let dispatch for automatic from_json: `let p: T = from_json(d)`
                 // where T is a struct rewrites the call to the compiler-derived
@@ -8119,6 +8184,13 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                             b.ir_locals[name] = asg_stype
                         else
                             b.ir_locals[name] = 1
+                    // Stage-1: reassignment may change the list element type -> re-derive (set "" to
+                    // forget a stale struct; the query treats "" as not-a-known-struct-list).
+                    let _asg_lt = ir_expr_struct_type(b, eff_expr)
+                    if _asg_lt == "list"
+                        b.ir_list_elem_stype[name] = ir_list_elem_struct(b, eff_expr)
+                    else if contains(b.ir_list_elem_stype, name)
+                        b.ir_list_elem_stype[name] = ""
                 else if len(annotations) > 0
                     let a0 = annotations[0]
                     let a0_is_ident = false
@@ -9082,6 +9154,7 @@ fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
         Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
             let ir_params = []
             b.ir_locals = {}
+            b.ir_list_elem_stype = {}   // CVE-critical: reset per-fn so a list-local elem type never leaks across functions (same-name collision -> mis-specialization)
             // Inferred param struct-types (Stage 1): the HM inferer already knows an
             // unannotated param's struct type; use it so field access lowers natively
             // (a.x*b.x -> fmul, not nova_rt_mul). See PERFORMANCE_SPECIALIZATION.md.
@@ -15502,6 +15575,12 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                 if rt_lt > 0
                                     rt_base = slice(rtv, 0, rt_lt)
                                 b.ir_fn_returns[name] = rt_base
+                                // Stage-1: a -> list<Struct> return annotation records the element
+                                // struct, so json_stringify on the fn's result serializes correctly.
+                                if rt_base == "list" and rt_lt > 0
+                                    let _rtle = slice(rtv, rt_lt + 1, len(rtv) - 1)
+                                    if contains(b.ir_sdefs, _rtle)
+                                        b.ir_fn_ret_list_elem[name] = _rtle
                     let dunder_pos = find(fn_name, "__")
                     if dunder_pos > 0
                         let method_suffix = fn_name[dunder_pos + 2:999999999]
@@ -16520,6 +16599,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     b.ir_clabel = "entry"
     b.ir_rc = 0
     b.ir_locals = {}
+    b.ir_list_elem_stype = {}   // CVE-critical: reset for the top-level scope too
     // P5 const-baking: build each bakeable const aggregate ONCE here, at the very
     // start of nova_main (before top_stmts and the user-main call -> before any
     // use), and cache the handle. The literal expr is lowered with the normal
