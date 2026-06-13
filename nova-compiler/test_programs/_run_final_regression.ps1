@@ -373,6 +373,18 @@ if ($rtc.ExitCode -ne 0 -or !(Test-Path $runtimeObj)) {
     exit 1
 }
 Write-Host "Runtime pre-compiled in $([math]::Round($sw.Elapsed.TotalSeconds, 1))s"
+
+# Pre-compile sqlite3.c -> sqlite3_test.o ONCE. The 9MB amalgamation was being
+# recompiled at -O2 for EVERY sqlite FFI test inside the parallel link step, which
+# under parallel CPU contention exceeded the 60s link timeout -> "undefined
+# sqlite3_*" link failures (demo_sqlite_test / demo_forge_todo_test). Compiling it
+# once here and linking the object makes those tests fast + reliable.
+$sqliteObj = "$PSScriptRoot\output\sqlite3_test.o"
+if (Test-Path $sqliteSrc) {
+    Write-Host "Pre-compiling sqlite3.c -> sqlite3_test.o ..."
+    $sqc = Invoke-Timed -FilePath $ClangPath -Arguments "-c -O2 -DSQLITE_THREADSAFE=0 `"$sqliteSrc`" -o `"$sqliteObj`" -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 240000 -WorkingDirectory $PSScriptRoot
+    if (!(Test-Path $sqliteObj)) { Write-Host "WARN: sqlite pre-compile failed (exit=$($sqc.ExitCode)); sqlite FFI tests may fail to link" }
+}
 Write-Host ""
 
 # ─── Step 2: Parallel test runner ───
@@ -425,7 +437,7 @@ $testScript = {
     }
     $xsrc = ""
     if ((Select-String -Path $ll -Pattern '@sqlite3_' -Quiet) -and (Test-Path $sqPath)) {
-        $xsrc = " `"$sqPath`" -DSQLITE_THREADSAFE=0"
+        $xsrc = " `"$sqPath`""   # $sqPath is the pre-compiled sqlite3_test.o (fast, reliable link)
     }
 
     $la = "-O2 -o `"$exe`" `"$ll`" `"$rtObjPath`"$xsrc $lFlags$xlib -D_CRT_SECURE_NO_WARNINGS -w"
@@ -460,7 +472,7 @@ foreach ($t in $all_tests) {
     [void]$ps.AddArgument($PSScriptRoot)
     [void]$ps.AddArgument($ClangPath)
     [void]$ps.AddArgument($NovaLinkFlags)
-    [void]$ps.AddArgument($sqliteSrc)
+    [void]$ps.AddArgument($sqliteObj)
     $handle = $ps.BeginInvoke()
     [void]$jobs.Add(@{ PS = $ps; Handle = $handle; Name = $t })
 }
@@ -490,6 +502,7 @@ foreach ($job in $jobs) {
 $pool.Close()
 $pool.Dispose()
 Remove-Item $runtimeObj -Force -ErrorAction SilentlyContinue
+Remove-Item $sqliteObj -Force -ErrorAction SilentlyContinue
 
 $sw.Stop()
 Write-Host ""
