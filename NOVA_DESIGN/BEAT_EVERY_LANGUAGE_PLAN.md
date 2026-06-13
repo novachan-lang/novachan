@@ -20,7 +20,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)** | node clustering/discovery (multi-node); growable stacks (millions); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
-| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; **WASM m1–m4 done: f64-compute, string+print, loop+dynamic-string, AND a real LIST-using algorithm (prime sieve, 168 primes) run in wasm32 in Node** — JS-managed linear-memory runtime (bump heap + list/string fns over instance.exports.memory; the browser-deploy architecture) | WASM m5+: compile the C memory-runtime to wasm (one source of truth, free/dicts/structs); nova-build wasm glue-gen CLI; channels→SharedArrayBuffer; DOM |
+| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; **WASM m1–m5 done: f64-compute, string+print, loop+dynamic-string, a real LIST sieve (168 primes), AND real STRING + FLOAT programs run in wasm32 in Node — output BYTE-IDENTICAL to native** via a REUSABLE JS-managed linear-memory runtime (lists/strings/floats/print over instance.exports.memory, bump heap @ __heap_base; the browser-deploy architecture) | WASM m6+: compile the C memory-runtime to wasm (one source of truth → free/dicts/structs/full builtins); nova-build wasm glue-gen CLI; channels→SharedArrayBuffer; DOM |
 
 **Bottom line:** the core is already competitive-to-dominant on 6 of 9; the open frontiers are
 **perf endgame (C struct-passing + SIMD), distribution+scale (Erlang), and WASM (JS browser).**
@@ -171,10 +171,17 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
   NOVA's wasm32 NovaList layout (data@0 i32 / size@8 / cap@16, i64 elems). Workflow-designed +
   adversarially verified (severity minor). n=1000 is past clang's unroll threshold → genuine
   in-wasm computation + ~7 list growths. All 4 milestones in _wasm_milestone.ps1.
-- *Milestone 5+ (next):* compile NOVA's **C memory-runtime to wasm** (one source of truth → correct
-  layouts, free/dicts/structs, no JS layout-replication) via #ifdef'ing the OS parts + a wasm malloc;
-  then a `nova build --target wasm` CLI that auto-generates the glue; then channels→SharedArrayBuffer+
-  Atomics, threads→Web Workers, DOM. Effort XL — keep decomposing.
+- *Milestone 5 (DONE a54a87d):* a REUSABLE JS-managed linear-memory runtime (_wasm_runtime.cjs) so
+  MULTIPLE real programs run in wasm32 — a LIST sieve, a STRING program (reverse + concat-in-loop +
+  len), and a FLOAT program (harmonic series + average) — each cross-checked BYTE-IDENTICAL to native.
+  Bump heap @ __heap_base (--export=__heap_base; fixes m4's hardcoded-offset fragility); covers
+  list/str/float/print builtins; float-to-str = %.15g matching nova_runtime.c. _wasm_load.cjs generic
+  loader; _wasm_milestone.ps1 verifies all 6. Workflow-designed + adversary-verified (severity minor:
+  len/index string-only, bump never frees — demo-grade limits).
+- *Milestone 6+ (next):* compile NOVA's **C memory-runtime to wasm** (one source of truth → correct
+  layouts, free/dicts/structs, FULL builtin coverage, no JS layout-replication) via #ifdef'ing the OS
+  parts + a wasm malloc; then a `nova build --target wasm` CLI that auto-generates the glue; then
+  channels→SharedArrayBuffer+Atomics, threads→Web Workers, DOM. Effort XL — keep decomposing.
 
 **[P7] REPL via OrcJIT (beat Python adoption).**
 - *NOVA way:* `nova repl` JIT-compiles each line via LLVM OrcJIT (NOT a 2nd interpreter); state
