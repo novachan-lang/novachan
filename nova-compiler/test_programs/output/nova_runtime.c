@@ -1552,17 +1552,44 @@ static int cmp_elem_double(const void* a, const void* b) {
     return (da > db) - (da < db);
 }
 
+/* String comparator: each element is an i64 pointer to NUL-terminated char data (the
+   value points at the chars; any fat-string header sits before it — same representation
+   nova_rt_eq compares via strcmp). Used when a list is homogeneously strings so sort()
+   orders LEXICOGRAPHICALLY by content, not by heap-pointer address. */
+static int cmp_elem_str(const void* a, const void* b) {
+    const char* sa = (const char*)(uintptr_t)(*(const int64_t*)a);
+    const char* sb = (const char*)(uintptr_t)(*(const int64_t*)b);
+    if (!sa) return sb ? -1 : 0;
+    if (!sb) return 1;
+    return strcmp(sa, sb);
+}
+
+/* Is this list element a string value? Uses the SAME sound tag/readability test as
+   nova_rt_eq/nova_rt_add (hardened by the int/pointer-soundness work) so a bare int is
+   never misclassified as a string pointer. */
+static int nova_elem_is_str(int64_t v) {
+    if ((uint64_t)v <= 0x10000) return 0;
+    void* p = (void*)(uintptr_t)v;
+    NovaMemTag t = nova_mem_find_tag(p);
+    return (t == NOVA_MEM_RAW || t == NOVA_MEM_FAT_STR ||
+            (t == (NovaMemTag)-1 && nova_is_readable_str(p)));
+}
+
 int64_t nova_rt_list_sort(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size < 2) return handle;
-    /* Use exact int64 ordering unless the list actually contains floats — this
-       preserves precise ordering for large ints (>= 2^53) that doubles can't hold. */
-    int has_float = 0;
+    /* Pick the comparator by element kind: a homogeneous string list sorts lexicographically
+       by CONTENT (was a bug — strings sorted by raw heap-pointer address); a list with any
+       float sorts by numeric value; otherwise exact int64 ordering (preserves precise order
+       for ints >= 2^53 that doubles can't hold). */
+    int has_float = 0, all_str = 1;
     for (int64_t i = 0; i < l->size; i++) {
-        if (nova_elem_is_float(l->data[i])) { has_float = 1; break; }
+        if (nova_elem_is_float(l->data[i])) has_float = 1;
+        if (!nova_elem_is_str(l->data[i])) all_str = 0;
     }
-    qsort(l->data, (size_t)l->size, sizeof(int64_t),
-          has_float ? cmp_elem_double : cmp_int64);
+    int (*cmp)(const void*, const void*) =
+        all_str ? cmp_elem_str : (has_float ? cmp_elem_double : cmp_int64);
+    qsort(l->data, (size_t)l->size, sizeof(int64_t), cmp);
     return handle;
 }
 
