@@ -3914,7 +3914,19 @@ int64_t nova_rt_channel_recv_timeout(int64_t handle, int64_t timeout_ms) {
    use. Win: Fibers API (CreateFiber/SwitchToFiber). POSIX x86_64: hand-written
    asm save/restore + mmap stacks with mprotect guard pages. */
 
-#define NOVA_FIBER_STACK_SIZE  32768
+#define NOVA_FIBER_STACK_SIZE  32768   /* legacy constant: ONLY drives the opt-in stack_enter depth guard
+                                          (stack_max = this/256). NOT the real stack size — see below. */
+#define NOVA_FIBER_COMMIT_SIZE 4096    /* INITIAL committed fiber stack (1 page). The RESERVE is the PE
+                                          default (~per the linker, large) — same as the old CreateFiber
+                                          path used. Windows auto-grows committed pages on demand up to
+                                          the reserve, so a parked green task commits only what it touches
+                                          (~8KB) instead of a full 32KB. MEASURED ~2.5x more parked tasks
+                                          per GB of commit charge (toward Erlang-scale). NO behavioral
+                                          change vs iter 16: the usable stack (PE-default reserve) and the
+                                          overflow boundary are identical to the old CreateFiber(32768)
+                                          (whose 32768 was the COMMIT, not the reserve); overflow still
+                                          faults at the reserve and the iter-16 SEH __except contains it.
+                                          POSIX already commits lazily (demand-zero mmap) => Windows-only. */
 
 typedef struct NovaFiber {
     NovaTaskState     task;
@@ -4059,10 +4071,12 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
         }
     } __except (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW
                 ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-        /* HARDWARE stack overflow on this fiber's fixed 32KB stack (e.g. unbounded user
-           recursion — which is unguarded, since the depth counter is opt-in). The stack
-           has unwound back to this frame (top of the fiber stack), so we have full stack
-           again; _resetstkoflw restores the guard page (verified repeatable). Report a
+        /* HARDWARE stack overflow at this fiber's reserve boundary (e.g. unbounded user
+           recursion — which is unguarded, since the depth counter is opt-in). The stack auto-
+           grew from its 4KB initial commit up to the reserve; the fault fires at the reserve,
+           independent of the initial commit. Unwinding returns to this frame (top of the fiber
+           stack, always committed), so we have stack again; _resetstkoflw restores the guard
+           page at the reserve boundary (verified repeatable). Report a
            contained crash exactly like nova_panic, then fall through to the normal
            fiber-exit path so the carrier survives and runs the remaining tasks. */
         _resetstkoflw();
@@ -4089,7 +4103,15 @@ int64_t nova_rt_fiber_create(int64_t closure) {
     if (!f) return 0;
     f->entry_fn = closure;
     f->status = 0;
-    f->handle = CreateFiber((SIZE_T)NOVA_FIBER_STACK_SIZE, nova_fiber_entry, f);
+    /* Small initial COMMIT (4KB), PE-default RESERVE (the 0 below = same large reserve the
+       old CreateFiber(NOVA_FIBER_STACK_SIZE) used — its arg was the COMMIT, with the reserve
+       defaulting to the PE header; verified CreateFiberEx(4096,0) gives the SAME ~16MB usable
+       stack). The stack auto-grows committed pages on demand, so a fiber commits only what it
+       touches; overflow still raises EXCEPTION_STACK_OVERFLOW at the reserve boundary for the
+       __except to contain. dwFlags=0 (no FIBER_FLAG_FLOAT_SAVE — x64 SwitchToFiber already
+       preserves SSE state). NOTE: passing a small EXPLICIT reserve here would shrink the usable
+       stack and overflow the deeply-recursive self-hosted compiler — keep it 0 (PE default). */
+    f->handle = CreateFiberEx((SIZE_T)NOVA_FIBER_COMMIT_SIZE, 0, 0, nova_fiber_entry, f);
     if (!f->handle) { free(f); return 0; }
     return (int64_t)(uintptr_t)f;
 }
