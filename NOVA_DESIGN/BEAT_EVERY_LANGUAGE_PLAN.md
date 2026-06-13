@@ -20,7 +20,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)** | node clustering/discovery (multi-node); growable stacks (millions); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
-| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises | **WASM target** (real f64/calls/memory runtime) |
+| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; **WASM milestone 1 done (8821467): NOVA f64+function-call runs in wasm32 in Node** (real codegen, not the i32 interpreter) | WASM milestone 2+: linear-memory runtime (strings/lists/print) so non-trivial programs run; DOM/channels |
 
 **Bottom line:** the core is already competitive-to-dominant on 6 of 9; the open frontiers are
 **perf endgame (C struct-passing + SIMD), distribution+scale (Erlang), and WASM (JS browser).**
@@ -139,13 +139,16 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 
 ### Tier 3 — reach (beat JS browser, Python REPL) — biggest, last
 
-**[P6] WASM target — real wasm32 (beat JS / browser).**
-- *Problem:* WASM backend emits correct IR/datalayout but the runtime is an i32-only interpreter
-  (no calls/linear-memory/f64).
-- *NOVA way:* NOVA → LLVM IR → wasm32 (LLVM backend) + a WASM runtime shim (RC heap in linear memory,
-  channels→SharedArrayBuffer+Atomics, file IO→WASI, threads→Web Workers). `nova build --target wasm`.
-- *First milestone:* run a real **f64 + function-call** NOVA program in wasmtime/browser. Effort XL —
-  decompose into milestones; do NOT attempt whole thing at once.
+**[P6] WASM target — real wasm32 (beat JS / browser). [Milestone 1 ✅ DONE 8821467.]**
+- *Milestone 1 (DONE):* a real **f64 + function-call** NOVA program compiles NOVA→LLVM IR→wasm32 and
+  RUNS correctly in Node's WebAssembly (compute(1.5,2.5)=5.25). NOVA already emits correct wasm32 IR
+  (`compile --target wasm`); the win was proving the path end-to-end (clang --target=wasm32 -O2 →
+  wasm-ld --gc-sections → Node + a 1-line nova_rt_unbox shim). Reproducible via _wasm_milestone.ps1.
+  Toolchain on this box: clang wasm32 + wasm-ld + Node v20 (no wasmtime needed).
+- *Milestone 2+ (next):* a linear-memory runtime shim — RC heap in wasm linear memory so strings/lists/
+  structs work, + `print` via a WASI/imported write — so NON-trivial NOVA programs run in wasm. Then
+  `nova build --target wasm` tooling (invoke clang+wasm-ld), then channels→SharedArrayBuffer+Atomics,
+  threads→Web Workers, DOM bindings. Effort XL — keep decomposing milestone-by-milestone.
 
 **[P7] REPL via OrcJIT (beat Python adoption).**
 - *NOVA way:* `nova repl` JIT-compiles each line via LLVM OrcJIT (NOT a 2nd interpreter); state
