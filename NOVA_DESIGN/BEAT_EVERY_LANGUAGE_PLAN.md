@@ -150,14 +150,16 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
   RUNTIME ISSUE below), so it would leak a channel per RPC → OOM; the sound paths are (a) fix channel-free
   first, or (b) a runtime recv-deadline (park-with-deadline, no per-call channel). connect to an
   unreachable/firewalled host still waits the OS SYN timeout; arity > 8; float-arg ABI nuance.
-- *★ KNOWN RUNTIME ISSUE (found iter 28, pre-existing): CHANNELS ARE NEVER RC-FREED.* A loop of
-  `let ch=channel()` leaks exactly one NovaChannel struct per iteration (live_count probe: 1000 channels →
-  delta 1000) — the ownership analysis emits no drop for channel-typed values (almost certainly a
-  deliberate safety default, since channels are shared across spawn by reference and freeing one a task
-  still holds = use-after-free). Every spawn/select/async/distributed program leaks channels. The fix is to
-  free channels SAFELY (verify spawn rc_inc's captured channels first, else UAF — delicate, needs heavy
-  concurrent-stress + adversarial review). Two correct-but-deferred destructor fixes wait on it: rc_dec
-  buffered items (mirror LIST/DICT) + pthread_cond_destroy(&ch->not_full) on POSIX.
+- *★ KNOWN RUNTIME ISSUE (chars. iter 29 — see NOVA_DESIGN/RC_COMPLETENESS.md): NOVA's RC is a PARTIAL
+  count.* It tracks container membership (rc_inc only in list_append/dict_set/deep_copy-share/list_set), NOT
+  total references — slot_store never rc_dec's the old value, so reassigned/loop-local heap values of EVERY
+  type leak ~1 struct/iter (probe: list/dict/chan all 2000/2001 over 2000 iters, identical with
+  NOVA_T8_DROP=1). NOT channel-specific (iter-28's framing corrected). A reassignment-drop is UNSAFE (the
+  for-in BORROWED element via index_get has no rc_inc → dropping the loop-var overwrite = UAF) and not
+  separable from the W5b bootstrap-self-compile gap. The sound fix = total reference counting (Swift/CPython
+  ARC), staged S0-S4 in RC_COMPLETENESS.md (S0 oracle leak_baseline_test DONE). Tolerable for short-lived
+  processes; the real debt is long-running servers. The 2 channel-destructor fixes (rc_dec buffered items +
+  pthread_cond_destroy not_full) land with S3.
 
 **[P5] ✅ DONE (733a707) — const-aggregate baking (beat the Zig/C comptime gap NOVA was losing).**
 - *Shipped:* a top-level `const` list literal of pure literals is now built ONCE in the `@nova_main`
