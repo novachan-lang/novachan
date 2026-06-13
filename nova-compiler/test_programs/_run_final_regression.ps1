@@ -358,6 +358,7 @@ $concurrency_tests = @(
     'deep_copy_depth_test',
     'sort_string_test',
     'leak_baseline_test',
+    'auto_reflect_test',
     'http_offload_test'
 )
 
