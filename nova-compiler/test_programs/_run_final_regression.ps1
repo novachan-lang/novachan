@@ -167,6 +167,7 @@ $domain_tests = @(
     'int_ptr_soundness_repro',
     'str_identity_test',
     'struct_rc_test',
+    'sup_strategies_test',
     'ptestx',
     'fnval_test',
     'mmap_test',
