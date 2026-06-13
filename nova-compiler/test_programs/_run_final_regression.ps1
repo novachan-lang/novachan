@@ -356,7 +356,8 @@ $concurrency_tests = @(
     'bounded_chan_test',
     'overflow_recovery_test',
     'deep_copy_depth_test',
-    'sort_string_test'
+    'sort_string_test',
+    'http_offload_test'
 )
 
 $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurrency_tests

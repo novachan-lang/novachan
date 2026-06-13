@@ -7590,33 +7590,42 @@ static int parse_url(const char* url, wchar_t* host, int host_cap,
     return 1;
 }
 
-static int64_t http_request(const char* url, const char* method,
-                            const char* body, int64_t body_len,
-                            const char* content_type) {
+/* HTTP request inputs + raw result. http_request_raw does ALL blocking WinHTTP I/O and
+   fills *out_body (malloc'd, NULL on error) / *out_len / *out_err / out_errmsg using ONLY
+   malloc + OS APIs — NEVER the NOVA heap and NEVER nova_set_error — so it runs safely on a
+   blocking-offload WORKER thread without racing the carrier's NOVA heap or writing the
+   worker's orphaned error-TLS. The http_request() wrapper offloads it when on a green task
+   (keeping the carrier free for other green tasks, e.g. an in-process green HTTP server —
+   fixes the iter-21 green-client-vs-green-server deadlock) and builds the tracked NOVA
+   string + sets any error ON THE CARRIER after unpark. */
+#define NOVA_HTTP_MAX_RESPONSE (100LL * 1024 * 1024)
+typedef struct {
+    const char* url; const char* method; const char* body;
+    int64_t body_len; const char* content_type;
+    char*  out_body; size_t out_len; int out_err; char out_errmsg[256];
+} NovaHttpReq;
+
+static void http_request_raw(const char* url, const char* method,
+                             const char* body, int64_t body_len, const char* content_type,
+                             char** out_body, size_t* out_len, int* out_err, char* out_errmsg) {
     wchar_t host[512], path[2048];
     int port, use_ssl;
     if (!parse_url(url, host, 512, path, 2048, &port, &use_ssl)) {
-        nova_set_error("HTTP: invalid URL");
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        snprintf(out_errmsg, 256, "HTTP: invalid URL"); *out_err = 1; return;
     }
 
     HINTERNET session = WinHttpOpen(L"NOVA/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
-        nova_set_error("HTTP: failed to open session");
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        snprintf(out_errmsg, 256, "HTTP: failed to open session"); *out_err = 1; return;
     }
     WinHttpSetTimeouts(session, 10000, 10000, 30000, 30000);
 
     HINTERNET connect = WinHttpConnect(session, host, (INTERNET_PORT)port, 0);
     if (!connect) {
-        nova_set_error("HTTP: failed to connect");
-        WinHttpCloseHandle(session);
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        snprintf(out_errmsg, 256, "HTTP: failed to connect"); *out_err = 1;
+        WinHttpCloseHandle(session); return;
     }
 
     wchar_t wmethod[16];
@@ -7626,11 +7635,8 @@ static int64_t http_request(const char* url, const char* method,
     HINTERNET request = WinHttpOpenRequest(connect, wmethod, path,
         NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) {
-        nova_set_error("HTTP: failed to create request");
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        snprintf(out_errmsg, 256, "HTTP: failed to create request"); *out_err = 1;
+        WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return;
     }
 
     if (content_type && content_type[0]) {
@@ -7652,30 +7658,17 @@ static int64_t http_request(const char* url, const char* method,
         body ? (DWORD)body_len : 0, 0);
     if (!ok) {
         DWORD err = GetLastError();
-        char errbuf[256];
-        snprintf(errbuf, sizeof(errbuf), "HTTP: send failed (error %lu)", err);
-        nova_set_error(errbuf);
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        snprintf(out_errmsg, 256, "HTTP: send failed (error %lu)", err); *out_err = 1;
+        WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return;
     }
 
     ok = WinHttpReceiveResponse(request, NULL);
     if (!ok) {
         DWORD err = GetLastError();
-        char errbuf[256];
-        snprintf(errbuf, sizeof(errbuf), "HTTP: receive failed (error %lu)", err);
-        nova_set_error(errbuf);
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-        return (int64_t)(uintptr_t)e;
+        snprintf(out_errmsg, 256, "HTTP: receive failed (error %lu)", err); *out_err = 1;
+        WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return;
     }
 
-    #define NOVA_HTTP_MAX_RESPONSE (100LL * 1024 * 1024)
     HttpBuf buf;
     hbuf_init(&buf);
     DWORD bytes_available = 0;
@@ -7683,11 +7676,9 @@ static int64_t http_request(const char* url, const char* method,
         if (!WinHttpQueryDataAvailable(request, &bytes_available)) break;
         if (bytes_available == 0) break;
         if (buf.len + (int64_t)bytes_available > NOVA_HTTP_MAX_RESPONSE) {
-            nova_set_error("HTTP: response exceeds 100MB limit");
+            snprintf(out_errmsg, 256, "HTTP: response exceeds 100MB limit"); *out_err = 1;
             free(buf.data);
-            WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session);
-            char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(e) e[0] = '\0';
-            return (int64_t)(uintptr_t)e;
+            WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return;
         }
         char* chunk = malloc(bytes_available);
         if (!chunk) break;
@@ -7697,15 +7688,49 @@ static int64_t http_request(const char* url, const char* method,
         }
         free(chunk);
     }
-    hbuf_append(&buf, "\0", 1);
 
     WinHttpCloseHandle(request);
     WinHttpCloseHandle(connect);
     WinHttpCloseHandle(session);
 
-    char* tracked = (char*)nova_heap_alloc((size_t)buf.len, NOVA_MEM_RAW);
-    if (tracked) memcpy(tracked, buf.data, (size_t)buf.len);
-    free(buf.data);
+    *out_body = buf.data;          /* malloc'd; the carrier takes ownership and frees it */
+    *out_len  = (size_t)buf.len;   /* body bytes (wrapper appends the NUL) */
+    *out_err  = 0;
+}
+
+/* Offload-pool entry: pure blocking C work, NO NOVA heap / NO nova_set_error. */
+static void nova_http_job_fn(void* arg) {
+    NovaHttpReq* q = (NovaHttpReq*)arg;
+    http_request_raw(q->url, q->method, q->body, q->body_len, q->content_type,
+                     &q->out_body, &q->out_len, &q->out_err, q->out_errmsg);
+}
+
+static int64_t http_request(const char* url, const char* method,
+                            const char* body, int64_t body_len,
+                            const char* content_type) {
+    NovaHttpReq q;
+    q.url = url; q.method = method; q.body = body; q.body_len = body_len; q.content_type = content_type;
+    q.out_body = NULL; q.out_len = 0; q.out_err = 0; q.out_errmsg[0] = '\0';
+    if (nova_sched_in_task()) {
+        /* Green task: offload the blocking I/O to the pool + PARK; the carrier stays free
+           to run other green tasks (e.g. a spawned HTTP server this request talks to). */
+        NovaOffloadJob job; job.fn = nova_http_job_fn; job.arg = &q;
+        nova_offload_run(&job);
+    } else {
+        http_request_raw(url, method, body, body_len, content_type,
+                         &q.out_body, &q.out_len, &q.out_err, q.out_errmsg);
+    }
+    /* --- back on the carrier (or main thread): all NOVA-heap work happens HERE --- */
+    if (q.out_err || !q.out_body) {
+        if (q.out_errmsg[0]) nova_set_error(q.out_errmsg);
+        if (q.out_body) free(q.out_body);
+        char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if (e) e[0] = '\0';
+        return (int64_t)(uintptr_t)e;
+    }
+    char* tracked = (char*)nova_heap_alloc(q.out_len + 1, NOVA_MEM_RAW);
+    if (tracked) { memcpy(tracked, q.out_body, q.out_len); tracked[q.out_len] = '\0'; }
+    free(q.out_body);
+    if (!tracked) { char* e = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if (e) e[0] = '\0'; return (int64_t)(uintptr_t)e; }
     return (int64_t)(uintptr_t)tracked;
 }
 
