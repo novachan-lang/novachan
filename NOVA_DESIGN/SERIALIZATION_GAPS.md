@@ -2,9 +2,24 @@
 
 **Status:** json_stringify(list-of-structs) FIXED via Path A (iter 33, fc5988c, reconverged
 407B43B3) — recording channel + per-fn resets + the json_stringify consumer shipped, 414/414. The
-silent raw-pointer bug is gone for literal / push-built / fn-returned lists. REMAINING (follow-up):
-to_json(list) [still the loud E1001 — needs ti_stdlib registration that risks the compiler's own
-to_json inference] + the list.to_json() method-call form (~L7454). Original analysis (iter 31): Code-verified via a 3-agent design
+silent raw-pointer bug is gone for literal / push-built / fn-returned lists.
+
+**to_json(list) — RESOLVED AS A DESIGN BOUNDARY (iter 34), NOT a fix to make.** Attempting it
+revealed the ti_stdlib-registration approach is not just insufficient but HARMFUL: `to_json` IS a
+per-struct method (every struct has a derived `<T>__to_json`), so the inference method-resolver
+rewrites `to_json(lst)` to the ELEMENT's method `Point__to_json` and dispatches THAT on the list —
+bypassing any codegen list-consumer. Registering `to_json` in ti_stdlib (T->string) only silences the
+inference E1001; the rewrite still happens, so `to_json([Point..])` then COMPILES and emits SILENT
+GARBAGE (Point__to_json reads the NovaList* as a Point -> `{"x":2,"y":8}`). That converts a LOUD
+compile error into silent wrong output — a NOVA-rule violation — so iter 34 was REVERTED. A real fix
+would require changing the inference method-resolution to refuse resolving a per-struct method on a
+LIST receiver — high blast radius (affects all method resolution, risks the working to_json(struct)),
+not worth it for `to_json` when `json_stringify` already serves. DESIGN STANCE: **`json_stringify` is
+the universal serializer** (struct, list-of-structs, scalar, dict — all work); **`to_json` is the
+single-value/struct method**. `to_json(list)` staying a LOUD compile error is an acceptable boundary,
+not a gap. (The `list.to_json()` method-call form is the same story.)
+
+Original analysis (iter 31): Code-verified via a 3-agent design
 workflow (compiler-architect + devils-advocate + synthesis). The clean fix is infrastructure
 (inferer-to-codegen type threading OR tagged structs) — staged, not rushed. Partial fixes trade a
 loud bug for a silent one and are REJECTED.
