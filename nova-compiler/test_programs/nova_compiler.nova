@@ -5800,6 +5800,8 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_remote_spawn(i64, i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_call_by_name(i64, i64) nounwind")
     emit(cg, "declare void @nova_rt_register_fn(i64, i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_const_set(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_const_get(i64) nounwind readonly")
     emit(cg, "declare i64 @nova_rt_bytes_create(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_bytes_get(i64, i64) nounwind")
     emit(cg, "declare void @nova_rt_bytes_set(i64, i64, i64) nounwind")
@@ -6836,9 +6838,42 @@ type IrBuilder
     ir_filename: string
     ir_fn_name: string
     ir_fn_param_stypes: dict
+    ir_const_baked: dict
+    ir_const_build_order: list
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [])
+
+// P5 const-baking: is `e` a compile-time-constant LITERAL element (int/float/str/
+// bool, or a unary-negated/notted literal)? Pure literals only — NO ident refs —
+// so a bakeable const has no dependency on another const (no init ordering) and
+// lowering it never re-enters the const-ident use-site (no const_get recursion).
+fn ir_const_literal_elem(e: Expr) -> int
+    match e
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et == "int" or et == "float" or et == "str" or et == "bool"
+                return 1
+            if et == "unary" and len(ec) == 1 and (ev == "-" or ev == "not")
+                return ir_const_literal_elem(ec[0])
+            return 0
+    0
+
+// A const is BAKEABLE (built once + cached, not rebuilt per use) if its value is a
+// NON-EMPTY list literal whose every element is a pure literal. Covers the lookup-
+// table case (the Zig/C-comptime win) while staying sound: immutable shared value,
+// no inter-const dependency. Empty lists / non-literal elements keep inline-rebuild.
+fn ir_const_bakeable(expr: Expr) -> int
+    match expr
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et != "list"
+                return 0
+            if len(ec) == 0
+                return 0
+            for child in ec
+                if ir_const_literal_elem(child) == 0
+                    return 0
+            return 1
+    0
 
 fn ir_fresh_reg(b: IrBuilder) -> string
     let r = "%r" + str(b.ir_rc)
@@ -7030,6 +7065,16 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     let dest = ir_fresh_reg(b)
                     ir_emit_inst(b, "make_closure", dest, ir_type_any(), [], tname, 0)
                     return dest
+                // P5 const-baking: a bakeable const aggregate loads its single
+                // cached handle (built once in the nova_main prologue) instead of
+                // re-lowering the literal -> rebuilding the list at every use.
+                if contains(b.ir_const_baked, value)
+                    let _cb_id = b.ir_const_baked[value]
+                    let _cb_idr = ir_fresh_reg(b)
+                    ir_emit_inst(b, "const_int", _cb_idr, ir_type_int(), [], "", _cb_id)
+                    let _cb_get = ir_fresh_reg(b)
+                    ir_emit_inst(b, "call", _cb_get, ir_type_any(), [_cb_idr], "nova_rt_const_get", 0)
+                    return _cb_get
                 if contains(b.ir_consts, value)
                     return ir_lower_expr(b, b.ir_consts[value])
                 let dest = ir_fresh_reg(b)
@@ -15547,6 +15592,12 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                         vfi = vfi + 1
                 else if tag == "const"
                     b.ir_consts[name] = expr
+                    // P5 const-baking: a top-level const whose value is a non-empty
+                    // list literal of pure literals is built ONCE in the nova_main
+                    // prologue and cached; uses load it instead of rebuilding.
+                    if ir_const_bakeable(expr) == 1
+                        b.ir_const_baked[name] = len(b.ir_const_build_order)
+                        push(b.ir_const_build_order, [name, expr])
                 else if tag != "import" and tag != "trait" and tag != "type_alias"
                     push(top_stmts, s)
 
@@ -15881,6 +15932,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_remote_spawn(i64, i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_call_by_name(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_register_fn(i64, i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_const_set(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_const_get(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_bytes_create(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_bytes_get(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_bytes_set(i64, i64, i64) nounwind")
@@ -16467,6 +16520,21 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     b.ir_clabel = "entry"
     b.ir_rc = 0
     b.ir_locals = {}
+    // P5 const-baking: build each bakeable const aggregate ONCE here, at the very
+    // start of nova_main (before top_stmts and the user-main call -> before any
+    // use), and cache the handle. The literal expr is lowered with the normal
+    // make_list path (correct element boxing); nova_rt_const_set stores it with a
+    // permanent reference. Use-sites load it via nova_rt_const_get. Empty when no
+    // const is bakeable -> nova_main is unchanged.
+    for _cb in b.ir_const_build_order
+        let _cb_name = _cb[0]
+        let _cb_expr = _cb[1]
+        let _cb_id = b.ir_const_baked[_cb_name]
+        let _cb_h = ir_lower_expr(b, _cb_expr)
+        let _cb_idr = ir_fresh_reg(b)
+        ir_emit_inst(b, "const_int", _cb_idr, ir_type_int(), [], "", _cb_id)
+        let _cb_sr = ir_fresh_reg(b)
+        ir_emit_side(b, "call", _cb_sr, ir_type_any(), [_cb_idr, _cb_h], "nova_rt_const_set", 0)
     for s in top_stmts
         ir_lower_stmt(b, s)
     if list_contains(b.ir_fnames, "nova_user_main")

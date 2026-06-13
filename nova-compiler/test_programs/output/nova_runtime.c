@@ -12426,6 +12426,28 @@ int64_t nova_rt_call_by_name(int64_t name_val, int64_t args_handle) {
     return 0;
 }
 
+/* ── Const-aggregate cache (compile-time-baked immutable constants) ───────────
+   A top-level `const` list literal is built ONCE in the @main prologue (single-
+   threaded, before nova_rt_main_dispatch) and cached here; every use loads the
+   shared handle via nova_rt_const_get instead of rebuilding it (Zig/C-comptime-
+   class: the table is constructed once, not per reference / per loop iteration).
+   The const is immutable, so the shared handle is safe; under the M:N scheduler
+   RC is atomic (InterlockedIncrement, exactly like a shared channel), so
+   concurrent reads never lose updates, and the permanent cache reference keeps
+   it alive for the program lifetime. The static array is zero-initialized. */
+#define NOVA_MAX_CONSTS 4096
+static int64_t g_const_cache[NOVA_MAX_CONSTS];
+int64_t nova_rt_const_set(int64_t id, int64_t handle) {
+    if (id < 0 || id >= NOVA_MAX_CONSTS) return handle;
+    g_const_cache[id] = handle;
+    nova_rc_inc(handle);          /* permanent program-lifetime reference */
+    return handle;
+}
+int64_t nova_rt_const_get(int64_t id) {
+    if (id < 0 || id >= NOVA_MAX_CONSTS) return 0;
+    return g_const_cache[id];
+}
+
 /* ── Runtime type identity (RTTI) ─────────────────────────────────────────────
    type_name(v) reports the runtime kind of an Any-typed value as a string, for
    inspecting heterogeneous data (e.g. json_decode results, generic containers)
