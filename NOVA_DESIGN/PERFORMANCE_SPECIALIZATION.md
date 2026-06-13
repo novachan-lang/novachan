@@ -47,6 +47,34 @@ Closes dynamic dispatch for ALL monomorphic code with no language change. Tracta
 exist; it is wiring the ti type-environment into the IR builder. Measure `_dot_untyped` → `fmul`
 and GATE 4/5.
 
+> **Stage 1 STATUS (2026-06-13).** ✅ DONE for the DIRECT-CALL case (verified): unannotated
+> scalar params/locals AND struct params lower to native `mul i64`/`fmul`/`fadd` — `addmul(3,4)`,
+> `work(7)`, `fmix(2.0,3.0)`, the dot product, etc. all emit zero `nova_rt_*` calls. The sound
+> mechanism is the IR-level `ir_collect_param_types` (`fpt`): it types a function's params from
+> ALL of its DIRECT call sites with **conflict → `any`**, so a function used at >1 type stays
+> polymorphic. Struct params additionally come from `ti_fn_param_types` (commit b36ae32).
+>
+> **Remaining gap = functions passed to a higher-order function** (`map`/`filter`/`pmap`/`reduce`):
+> the closure is handed to a runtime fn with no direct IR `call`, so `fpt` never types its params →
+> the closure body stays dynamic (`nova_rt_mul`). This is the one place `_dot_untyped`-style code
+> is still slow.
+>
+> **ATTEMPT (2026-06-13) — REVERTED. Read before retrying.** Tried feeding the inferer's
+> *resolved* per-function param types (`ti_fn_param_types`, i.e. `ti_zonk(d_fn_type)`) into `fpt`.
+> This is **UNSOUND**: `d_fn_type` is the function's BODY-resolved type, which for a *generalized*
+> function can be more specific than its actual uses. A polymorphic helper whose body forces `int`
+> but which is **instantiated at `float` elsewhere** got its single shared body specialized to `int`
+> → the float caller read integer bits as a double (`expected 4, got 1.97e-323`). Regression caught
+> it: math3d/complexnum/colorconvx FAIL (398/401). **This is exactly why the struct-only Stage 1
+> (b36ae32) deliberately ignores scalar `ti_fn_param_types` — a struct param can't be a generic
+> numeric, so it has no int/float instantiation ambiguity; a scalar one does.** The HOF
+> element-type hint (record the list element type at each `map(list,fn)` site, conflict→any) is the
+> *right shape* but still has a residual soundness hole for functions reached through OTHER generic
+> paths, and only whole-program **use-set monomorphization (Stage 5)** is fully sound: type the body
+> ONLY when the function is provably used at exactly one type combination across the entire program
+> (direct + HOF + indirect). So sound HOF specialization is a Stage-5 deliverable, not a Stage-1
+> plumbing tweak. The direct-call win stands.
+
 **Stage 2 — Unbox typed struct fields.** A struct with `float` fields stores raw `double`s (typed
 layout) instead of boxed — removes the residual `nova_rt_unbox` per field read seen even in the
 typed IR above. With Stage 1: struct float math = pure `fmul`/`fadd`.
