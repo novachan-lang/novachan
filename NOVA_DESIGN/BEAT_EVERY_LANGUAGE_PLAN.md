@@ -145,9 +145,19 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
   peer. Now watches POLL_WRITE waiters in exceptfds (+ the non-green nova_remote_io fallback). Verified
   by a 3-lens adversarial review (0 blockers) + a kill-a-worker-mid-batch pmap test (the permanent guard).
 - *Remaining for full Erlang-class distribution (future):* phi-accrual/suspicion detector (incr 6);
-  cluster_spawn/pmap recv-timeout (a hung-but-alive peer still blocks the caller; connect to an
-  unreachable/firewalled host waits the OS SYN timeout); arity > 8; float-arg ABI nuance (args unboxed
-  → raw double bits, fine for raw-float params).
+  cluster_spawn/pmap recv-timeout for a hung-but-alive peer — EXPLORED + REVERTED in iter 28: a pure-NOVA
+  timeout needs a per-call channel to race recv vs timer, but channels are never RC-freed (see KNOWN
+  RUNTIME ISSUE below), so it would leak a channel per RPC → OOM; the sound paths are (a) fix channel-free
+  first, or (b) a runtime recv-deadline (park-with-deadline, no per-call channel). connect to an
+  unreachable/firewalled host still waits the OS SYN timeout; arity > 8; float-arg ABI nuance.
+- *★ KNOWN RUNTIME ISSUE (found iter 28, pre-existing): CHANNELS ARE NEVER RC-FREED.* A loop of
+  `let ch=channel()` leaks exactly one NovaChannel struct per iteration (live_count probe: 1000 channels →
+  delta 1000) — the ownership analysis emits no drop for channel-typed values (almost certainly a
+  deliberate safety default, since channels are shared across spawn by reference and freeing one a task
+  still holds = use-after-free). Every spawn/select/async/distributed program leaks channels. The fix is to
+  free channels SAFELY (verify spawn rc_inc's captured channels first, else UAF — delicate, needs heavy
+  concurrent-stress + adversarial review). Two correct-but-deferred destructor fixes wait on it: rc_dec
+  buffered items (mirror LIST/DICT) + pthread_cond_destroy(&ch->not_full) on POSIX.
 
 **[P5] ✅ DONE (733a707) — const-aggregate baking (beat the Zig/C comptime gap NOVA was losing).**
 - *Shipped:* a top-level `const` list literal of pure literals is now built ONCE in the `@nova_main`
