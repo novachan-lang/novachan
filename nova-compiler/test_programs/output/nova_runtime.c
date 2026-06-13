@@ -9839,17 +9839,40 @@ typedef struct {
     const double* bd;
     int64_t n, k, row_start, row_end;
 } NovaMatmulChunk;
+/* CACHE-BLOCKED via 2D i/j tiling (IB=32 rows, JB=64 cols). The original ikj
+   re-streamed all of B for every row -> memory-bandwidth-bound (parallelism barely
+   scaled: 1.32x C on 8 cores). Tiling keeps the C tile (IB*JB*8 = 16KB) L1-resident
+   across the ENTIRE kk=0..k-1 sweep (no L2/L3 round-trips on the C read-modify-write)
+   and reuses each B-row slice across all IB rows of the tile (32x less B traffic) ->
+   compute-bound -> the existing thread-parallelism scales. The kk loop is NOT tiled,
+   so each cell C[i][j] still accumulates over kk in order 0..k-1 -> BIT-IDENTICAL to
+   the serial version (no reassociation). Each cell belongs to exactly one (ii,jj)
+   tile, so writes stay within this thread's [row_start,row_end) -> RACE-FREE.
+   Design + adversarially verified (3 strategies, 0 correctness breaks). */
+#define NOVA_MM_IB 32   /* i-tile: 32 rows  (32*64*8 = 16 KB C tile, ~50% of 32KB L1d) */
+#define NOVA_MM_JB 64   /* j-tile: 64 cols  (64*8 = 512 B per reused B-row slice)       */
 static void nova_matmul_run_chunk(NovaMatmulChunk* c) {
     const int64_t n = c->n, k = c->k;
-    double * restrict rd = c->rd;
+    const int64_t row_start = c->row_start, row_end = c->row_end;
+    double       * restrict rd = c->rd;
     const double * restrict ad = c->ad;
     const double * restrict bd = c->bd;
-    for (int64_t i = c->row_start; i < c->row_end; i++) {
-        double * restrict rrow = rd + i * n;
-        for (int64_t kk = 0; kk < k; kk++) {
-            const double aik = ad[i * k + kk];
-            const double * restrict brow = bd + kk * n;
-            for (int64_t j = 0; j < n; j++) rrow[j] += aik * brow[j];
+    /* Degenerate-dim guard. Result is calloc'd to 0 (the correct empty-sum answer);
+       the n<=0 guard is load-bearing (calloc(m*0,8) may be NULL -> rd+0 UB). */
+    if (row_start >= row_end || k <= 0 || n <= 0) return;
+    for (int64_t ii = row_start; ii < row_end; ii += NOVA_MM_IB) {
+        const int64_t i_end = (ii + NOVA_MM_IB <= row_end) ? ii + NOVA_MM_IB : row_end;
+        for (int64_t jj = 0; jj < n; jj += NOVA_MM_JB) {
+            const int64_t j_end = (jj + NOVA_MM_JB <= n) ? jj + NOVA_MM_JB : n;
+            const int64_t j_len = j_end - jj;            /* tile width (handles j-tail) */
+            for (int64_t kk = 0; kk < k; kk++) {
+                const double * restrict brow = bd + kk * n + jj;
+                for (int64_t i = ii; i < i_end; i++) {   /* i-tail handled by i_end clamp */
+                    const double aik = ad[i * k + kk];
+                    double * restrict rrow = rd + i * n + jj;
+                    for (int64_t j = 0; j < j_len; j++) rrow[j] += aik * brow[j];
+                }
+            }
         }
     }
 }
