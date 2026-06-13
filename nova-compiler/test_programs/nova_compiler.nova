@@ -13224,6 +13224,14 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         _rawfloat = 1
                     else if contains(frt, value)
                         rtype = frt[value]
+                        // PERF P1: a user fn that PROVABLY returns raw double bits (every
+                        // return value is float-arith/const/float-field/floatlist/math —
+                        // see ir_returns_raw_double, recorded as @raw@<fn>) lets the caller
+                        // read the result via bitcast instead of a defensive nova_rt_unbox.
+                        // Gated on @raw@ so a `-> float` fn that returns a BOX (c_re) keeps
+                        // the unbox — bitcasting a box pointer as double is the 2.6e-311 bug.
+                        if rtype == "float" and contains(frt, "@raw@" + value)
+                            _rawfloat = 1
                     if rtype == "any"
                         rtype = "val"
                     rt[dest] = rtype
@@ -13650,6 +13658,101 @@ fn ir_analyze_return_type(func: IrFunction, frt: dict, fpt: dict) -> string
                                     if rv != "0" and contains(rt, rv)
                                         return rt[rv]
             "any"
+
+// PERF P1 (beat-C struct math): is register `rv` PROVEN to hold raw double bits?
+// Mirrors the emitter's ire_proven_float exactly: a value is raw double iff it is float-
+// typed AND produced by a float-arith binop (-> fadd/fmul/...), a const_float, a float
+// field read, a floatlist element read (typed-float index_get), a hardware-math builtin,
+// or a call to another fn that itself provably returns raw double (@raw@). NEVER a
+// slot_load (a slot can carry a box on another path — the hard-won Stage-2 rule) and
+// NEVER a generic/box-returning call. So a caller that bitcasts this value instead of
+// calling nova_rt_unbox is always correct.
+fn ir_reg_is_raw_double(rv: string, rt: dict, defop: dict, defval: dict, frt: dict) -> int
+    if rv == "0"
+        return 0
+    if not contains(rt, rv)
+        return 0
+    if rt[rv] != "float"
+        return 0
+    if not contains(defop, rv)
+        return 0
+    let op = defop[rv]
+    if op == "const_float"
+        return 1
+    if op == "add" or op == "sub" or op == "mul" or op == "div" or op == "mod"
+        return 1
+    if op == "field_get"
+        return 1
+    if op == "index_get"
+        return 1
+    if op == "call"
+        let cv = defval[rv]
+        if cv == "nova_rt_sin" or cv == "nova_rt_cos" or cv == "nova_rt_tan" or cv == "nova_rt_asin" or cv == "nova_rt_acos" or cv == "nova_rt_atan" or cv == "nova_rt_atan2" or cv == "nova_rt_log" or cv == "nova_rt_log2" or cv == "nova_rt_log10" or cv == "nova_rt_exp" or cv == "nova_rt_fabs" or cv == "nova_rt_fmod" or cv == "nova_rt_sqrt" or cv == "nova_rt_pow" or cv == "nova_rt_fmax" or cv == "nova_rt_fmin" or cv == "nova_rt_random_float" or cv == "nova_rt_int_to_float" or cv == "nova_rt_to_float" or cv == "nova_rt_parse_float" or cv == "nova_rt_sinh" or cv == "nova_rt_cosh" or cv == "nova_rt_tanh" or cv == "nova_rt_cbrt" or cv == "nova_rt_hypot" or cv == "nova_rt_pi" or cv == "nova_rt_e"
+            return 1
+        if contains(frt, "@raw@" + cv)
+            return 1
+    return 0
+
+// PERF P1: does this whole function PROVABLY return raw double bits on EVERY return path?
+// A `-> float` annotation is NOT proof (c_re(z)=z[0] over a boxed-float list is typed
+// float but returns a BOX — the annotation lies; bitcasting that box pointer as double
+// gave the 2.6e-311 bug). We re-run the same type inference ir_analyze_return_type uses
+// (so add->float etc. are resolved), then require every return value to pass
+// ir_reg_is_raw_double. Used to gate extending unbox-removal to user-fn call results.
+fn ir_returns_raw_double(func: IrFunction, frt: dict, fpt: dict) -> int
+    match func
+        IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
+            if is_extern == 1
+                return 0
+            let rt = {}
+            let st = {}
+            let pidx = 0
+            for p in params
+                match p
+                    IrParam(pname, ptype) =>
+                        match ptype
+                            IrType(tk, tn, tp, tid) =>
+                                if tk == "int" or tk == "str" or tk == "list" or tk == "dict"
+                                    st[pname] = tk
+                                else if contains(fpt, name) and contains(fpt[name], str(pidx))
+                                    st[pname] = fpt[name][str(pidx)]
+                                else
+                                    st[pname] = "any"
+                pidx = pidx + 1
+            let pass_n = 0
+            while pass_n < 3
+                pass_n = pass_n + 1
+                rt = {}
+                for block in blocks
+                    ir_infer_block(rt, st, frt, {}, block)
+            // Defining op + value for every dest (the op never changes during inference;
+            // the inferred TYPE is read from rt, populated as a side-effect of the passes).
+            let defop = {}
+            let defval = {}
+            for block in blocks
+                match block
+                    IrBlock(blabel, binsts, bterm) =>
+                        for inst in binsts
+                            match inst
+                                IrInst(iop, idest, ityp, iargs, ival, inum, ieff, iline) =>
+                                    if idest != ""
+                                        defop[idest] = iop
+                                        defval[idest] = ival
+            // Every return value must be a proven raw double (and there must be one).
+            let saw_return = 0
+            let all_raw = 1
+            for block2 in blocks
+                match block2
+                    IrBlock(blabel2, binsts2, bterm2) =>
+                        match bterm2
+                            IrInst(top, tdest, ttyp, targs, tval, tnum, teff, tline) =>
+                                if top == "return" and len(targs) > 0
+                                    saw_return = 1
+                                    if ir_reg_is_raw_double(targs[0], rt, defop, defval, frt) == 0
+                                        all_raw = 0
+            if saw_return == 1 and all_raw == 1
+                return 1
+            return 0
 
 fn ir_collect_param_types(all_fns: list, frt: dict) -> dict
     let fpt = {}
@@ -16411,6 +16514,25 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         frt[fname] = new_type
                         changed = true
     fpt = ir_collect_param_types(all_fns, frt)
+
+    // PERF P1 (beat-C struct math): mark every float-returning user fn that PROVABLY
+    // returns raw double bits as "@raw@<fn>" in frt. ir_infer_one then types calls to
+    // such fns float -> the emitter reads the result via bitcast, dropping the per-call
+    // defensive nova_rt_unbox (the dot-product gap vs C). Small monotonic fixpoint so a
+    // fn returning another raw fn's result is also caught (transitive). Only float-typed,
+    // not-yet-marked fns are analysed, so the cost is bounded (most fns are skipped).
+    let raw_changed = true
+    let raw_pass = 0
+    while raw_changed and raw_pass < 4
+        raw_changed = false
+        raw_pass = raw_pass + 1
+        for ir_fn in all_fns
+            match ir_fn
+                IrFunction(rfname, rfp, rfret, rfblocks, rftp, rfex) =>
+                    if contains(frt, rfname) and frt[rfname] == "float" and not contains(frt, "@raw@" + rfname)
+                        if ir_returns_raw_double(ir_fn, frt, fpt) == 1
+                            frt["@raw@" + rfname] = 1
+                            raw_changed = true
 
     // Stage 4 SROA (Step A — analysis only, no codegen change yet): the set of all-scalar
     // struct types (every field int/float/bool => no heap fields => zero RC concern in any

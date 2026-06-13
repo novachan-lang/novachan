@@ -13,7 +13,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 
 | Language | Its prime | NOVA status | Remaining to dominate |
 |---|---|---|---|
-| **C** | raw scalar/float perf | float math **matches/beats C** (hardware intrinsics, sound, 1495bd3); scalar/int = native; non-escaping structs stack-alloc'd (4a on by default) | struct-passed-to-fn ~1.2× (float-return coercion); SIMD on float arrays |
+| **C** | raw scalar/float perf | float math **matches/beats C** (hardware intrinsics, sound, 1495bd3); scalar/int = native; non-escaping structs stack-alloc'd (4a); **struct-math-via-fn-call = 1.009× C (parity, P1 done)** | construction-heavy loops ~3.8× (per-iter struct alloc + i64-handle ABI → Stage-5/floatlist-raw); SIMD on float arrays |
 | **C++** | templates, RAII, zero-cost | RAII=`defer`+RC; operators=traits; generics+inference; **no template/UB/45-min-compile complexity** | monomorphic native-ABI specialization (narrow perf) |
 | **Rust** | safety w/o GC | process isolation = same safety (no data races/UAF/null), **zero annotations**, no borrow-checker fight | COW-on-send (cut deep-copy cost) — perf, not safety |
 | **Go** | M:N concurrency, fast compile | M:N work-stealing scheduler; typed channels+select+spawn; **+supervisors/monitors Go lacks** | faster incremental compile; growable stacks |
@@ -31,15 +31,24 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 
 ### Tier 1 — perf endgame (beat C fully) + scale (beat Erlang)
 
-**[P1] Float-return coercion → extend unbox-removal to user fns (beat-C struct math).**
-- *Problem:* a `-> float` user fn (e.g. `dot`) returns raw double; the caller `s + dot(..)` works,
-  but a `-> float` fn that returns a raw INT (`c_re(z)=z[0]` over an int list) makes the annotation
-  LIE — so we can't blanket-trust `frt==float`. That's why bc6b21f scoped unbox-removal to builtins.
-- *NOVA way:* insert `sitofp` at a `-> float` return whose value is statically int, so the annotation
-  becomes TRUE (the fn genuinely returns raw double). Then float-typed user-fn call results are
-  provably raw double → mark `ire_proven_float` → drop the defensive unbox (extends 1495bd3/bc6b21f).
-- *Where:* `ir_lower` return lowering + `ir_analyze_return_type` (~13609) + frt; emitter call result.
-- *Verify:* `dot`-product benchmark ≤1.0× C; complexnum/math3d still pass; 403; reconverge. Effort M.
+**[P1] ✅ DONE — "returns raw double" summary → extend unbox-removal to user fns (beat-C struct math).**
+- *Problem:* a `-> float` user fn returns EITHER raw double bits (`dot` = a float `add`) OR a BOX
+  (`c_re(z)=z[0]` over a boxed-float list → a generic `index_get`). `frt==float` does not distinguish
+  them; the blanket version bitcast `c_re`'s box pointer as a double → 2.6e-311 (why bc6b21f scoped
+  unbox-removal to builtins only).
+- *NOVA way (sound, no coercion needed):* a `@raw@<fn>` summary in `frt` — set iff EVERY return value
+  is float-typed AND defined by a raw-producer op (float-arith binop / const_float / float field_get /
+  floatlist index_get / hardware-math builtin / call to another `@raw@` fn), never a slot_load or a
+  generic/box-returning call. Mirrors the emitter's `ire_proven_float` exactly. `ir_infer_one` then
+  types a call to a `@raw@` fn `float` → the emitter reads the result via bitcast, dropping the
+  defensive `nova_rt_unbox`. `dot`→`@raw@` (win); `c_re`→not (keeps the defensive path; sound).
+- *Built:* `ir_reg_is_raw_double` + `ir_returns_raw_double` (sibling of `ir_analyze_return_type`),
+  a monotonic `@raw@` fixpoint after the frt fixpoint, and the `_rawfloat` gate in `ir_infer_one`.
+- *Result (measured, -O2):* isolated struct-math-via-fn-call (field-mutate + `dot` per iter) =
+  **NOVA 234ms vs C 232ms = 1.009× C** (was ~1.23×); IR confirms the call result is bitcast not
+  unboxed; complexnum/math3d/nn/stats pass (no hang); **403/403; reconverged gen5.ll==gen6.ll**.
+- *Note:* construction-heavy loops (reconstruct structs each iter) are still ~3.8× C — that is the
+  separate per-iter-alloc + i64-handle ABI gap (floatlist-raw P2 / Stage-5 native-ABI), NOT P1.
 
 **[P2] floatlist-raw + auto-vectorization (beat C on array math / SIMD).**
 - *Problem:* `intlist` is a raw `i64[]` C-array (fast); `floatlist` is BOXED → no SIMD. NOVA emits no
