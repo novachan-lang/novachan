@@ -1,0 +1,126 @@
+// clusterx.nova — NOVA cluster membership (increment 1: seed-join + gossip convergence)
+//
+// A grow-only G-Set CRDT (Shapiro et al. 2011): union-merge is commutative, associative,
+// and idempotent, so every node CONVERGES to the same member set regardless of message
+// order or duplication. Pure NOVA over the real remote_* TCP transport. One actor task
+// owns the member set (no shared mutable state — NOVA's process-isolation model); all
+// other tasks query/update it via a command channel.
+//
+// Increment 1 is GROW-ONLY: members are never removed. So cluster_members() returns every
+// node that has EVER joined, not necessarily those alive. Heartbeat / failure detection /
+// removal is increment 2.
+
+fn cluster_start(port, seeds)
+    let self_addr = "127.0.0.1:" + str(port)
+    let cmd_ch = channel()
+    spawn _manager_loop(cmd_ch, self_addr)   // sole owner of the member set
+    spawn _acceptor_loop(port, cmd_ch)       // inbound peers -> manager
+    for seed in seeds
+        if seed != self_addr
+            spawn _join_seed(seed, self_addr, cmd_ch)
+    spawn _gossip_loop(cmd_ch, self_addr)    // periodic push-pull gossip
+    {"cmd_ch": cmd_ch, "self": self_addr}
+
+fn cluster_members(info)
+    let reply = channel()
+    send(info["cmd_ch"], {"cmd": "get", "reply": reply})
+    receive(reply)
+
+// ── membership manager actor (single owner of the set) ──────────────────────
+
+fn _union(members, incoming)
+    for m in incoming
+        if contains(members, m) == false
+            push(members, m)
+    sort(members)
+
+fn _pick_peer(members, self_addr)
+    let peers = []
+    for m in members
+        if m != self_addr
+            push(peers, m)
+    if len(peers) == 0
+        return ""
+    peers[time_ms() % len(peers)]
+
+fn _manager_loop(cmd_ch, self_addr)
+    let members = [self_addr]
+    while true
+        let cmd = receive(cmd_ch)
+        let c = cmd["cmd"]
+        if c == "merge"
+            members = _union(members, cmd["members"])
+        else if c == "merge_get"
+            members = _union(members, cmd["members"])
+            send(cmd["reply"], members)
+        else if c == "get"
+            send(cmd["reply"], members)
+        else if c == "get_peer"
+            send(cmd["reply"], _pick_peer(members, self_addr))
+
+// ── acceptor: inbound connections route to the manager ──────────────────────
+
+fn _acceptor_loop(port, cmd_ch)
+    let listener = remote_bind(port)
+    while true
+        let conn = remote_accept(listener)
+        spawn _handle_peer(conn, cmd_ch)
+
+fn _handle_peer(conn, cmd_ch)
+    let msg = remote_recv(conn)
+    if msg != 0
+        let reply = channel()
+        if msg["type"] == "join"
+            // add the joiner, then reply with our full (updated) member list — atomic,
+            // no add-then-get race (merge_get does both in one manager command).
+            send(cmd_ch, {"cmd": "merge_get", "members": [msg["from"]], "reply": reply})
+            remote_send(conn, {"type": "ack", "members": receive(reply)})
+        else if msg["type"] == "gossip"
+            send(cmd_ch, {"cmd": "merge_get", "members": msg["members"], "reply": reply})
+            remote_send(conn, {"type": "ack", "members": receive(reply)})
+    remote_close(conn)
+
+// ── outbound: join a seed (with retry — a transient connect failure must NOT leave
+//    the node permanently isolated) ──────────────────────────────────────────
+
+fn _join_seed(seed_addr, self_addr, cmd_ch)
+    let parts = split(seed_addr, ":")
+    let host = parts[0]
+    let port = parse_int(parts[1])
+    let conn = -1
+    let attempt = 0
+    while attempt < 12
+        conn = remote_connect(host, port)
+        if conn != -1
+            break
+        sleep(200)
+        attempt = attempt + 1
+    if conn == -1
+        return 0
+    remote_send(conn, {"type": "join", "from": self_addr})
+    let reply = remote_recv(conn)
+    remote_close(conn)
+    if reply != 0
+        send(cmd_ch, {"cmd": "merge", "members": reply["members"]})
+
+// ── periodic push-pull gossip: send our list to a random peer, merge their reply ──
+
+fn _gossip_loop(cmd_ch, self_addr)
+    sleep(300)
+    while true
+        let pch = channel()
+        send(cmd_ch, {"cmd": "get_peer", "reply": pch})
+        let peer = receive(pch)
+        if peer != ""
+            let lch = channel()
+            send(cmd_ch, {"cmd": "get", "reply": lch})
+            let mine = receive(lch)
+            let parts = split(peer, ":")
+            let conn = remote_connect(parts[0], parse_int(parts[1]))
+            if conn != -1
+                remote_send(conn, {"type": "gossip", "members": mine})
+                let ack = remote_recv(conn)
+                remote_close(conn)
+                if ack != 0
+                    send(cmd_ch, {"cmd": "merge", "members": ack["members"]})
+        sleep(300)
