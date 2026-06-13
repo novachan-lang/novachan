@@ -9827,6 +9827,41 @@ int64_t nova_rt_tensor_scale(int64_t a_h, int64_t scalar_bits) {
     return r;
 }
 
+/* One row-chunk of an ikj matmul: output rows [row_start, row_end). The `restrict`
+   qualifiers let clang vectorize the inner j loop to packed SIMD (mulpd/addpd). When
+   run by multiple threads over DISJOINT row ranges this is RACE-FREE by construction
+   (each thread writes only its own result rows; ad/bd are read-only), so no locks are
+   needed, and the result is numerically identical to the serial version (the kk
+   reduction order is unchanged; threads just split the independent i-loop). */
+typedef struct {
+    double*       rd;
+    const double* ad;
+    const double* bd;
+    int64_t n, k, row_start, row_end;
+} NovaMatmulChunk;
+static void nova_matmul_run_chunk(NovaMatmulChunk* c) {
+    const int64_t n = c->n, k = c->k;
+    double * restrict rd = c->rd;
+    const double * restrict ad = c->ad;
+    const double * restrict bd = c->bd;
+    for (int64_t i = c->row_start; i < c->row_end; i++) {
+        double * restrict rrow = rd + i * n;
+        for (int64_t kk = 0; kk < k; kk++) {
+            const double aik = ad[i * k + kk];
+            const double * restrict brow = bd + kk * n;
+            for (int64_t j = 0; j < n; j++) rrow[j] += aik * brow[j];
+        }
+    }
+}
+#ifdef _WIN32
+static DWORD WINAPI nova_matmul_thread(LPVOID arg) { nova_matmul_run_chunk((NovaMatmulChunk*)arg); return 0; }
+static __declspec(thread) int nova_in_par_matmul = 0;
+#else
+static void* nova_matmul_thread(void* arg) { nova_matmul_run_chunk((NovaMatmulChunk*)arg); return NULL; }
+static __thread int nova_in_par_matmul = 0;
+#endif
+#define NOVA_MATMUL_MAX_THREADS 64
+
 int64_t nova_rt_tensor_matmul(int64_t a_h, int64_t b_h) {
     NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
     NovaTensor* b = (NovaTensor*)(uintptr_t)b_h;
@@ -9844,25 +9879,58 @@ int64_t nova_rt_tensor_matmul(int64_t a_h, int64_t b_h) {
     NovaTensor* result = (NovaTensor*)(uintptr_t)r;
     if (!result) return 0;
 
-    /* Standard ikj matmul. The `restrict` qualifiers tell clang the result/input
-       backings do not alias (result is a fresh allocation; a/b are read-only), so
-       the inner j loop — which writes DISTINCT output cells rrow[j] (no cross-lane
-       reduction; the kk-summation order is unchanged) — auto-vectorizes to packed
-       SIMD (mulpd/addpd). This is numerically IDENTICAL to the scalar version, not
-       a reassociation. For larger sizes, blocked + parallel would be a further win. */
     double * restrict rd = result->data;
     const double * restrict ad = a->data;
     const double * restrict bd = b->data;
-    for (int64_t i = 0; i < m; i++) {
-        double * restrict rrow = rd + i * n;
-        for (int64_t kk = 0; kk < k; kk++) {
-            const double aik = ad[i * k + kk];
-            const double * restrict brow = bd + kk * n;
-            for (int64_t j = 0; j < n; j++) {
-                rrow[j] += aik * brow[j];
-            }
-        }
+
+    /* BEAT C via auto-parallelism (NOVA's thesis: the runtime parallelizes what C runs
+       serially). Split the independent i-loop (rows) across OS threads — the CALLING
+       thread does chunk 0 and worker threads do the rest, then we join (caller
+       participates -> no all-idle-waiting deadlock; workers run leaf computation ->
+       no nested-matmul recursion -> the thread-local guard is purely defensive). Only
+       for large enough work (else thread overhead dominates) and >1 core. Small matmuls
+       (the regression's 2x2/1xN cases) take the serial path -> byte-identical behavior. */
+    int ncores = (int)nova_detect_cpu_count();
+    int64_t work = m * n * k;
+    int nthreads = ncores;
+    if ((int64_t)nthreads > m) nthreads = (int)m;
+    if (nthreads > NOVA_MATMUL_MAX_THREADS) nthreads = NOVA_MATMUL_MAX_THREADS;
+    int do_parallel = (!nova_in_par_matmul) && (nthreads >= 2) && (work >= 1000000);
+
+    if (!do_parallel) {
+        NovaMatmulChunk c; c.rd = rd; c.ad = ad; c.bd = bd; c.n = n; c.k = k; c.row_start = 0; c.row_end = m;
+        nova_matmul_run_chunk(&c);
+        return r;
     }
+
+    nova_in_par_matmul = 1;
+    NovaMatmulChunk chunks[NOVA_MATMUL_MAX_THREADS];
+    int64_t per = (m + nthreads - 1) / nthreads;
+    for (int t = 0; t < nthreads; t++) {
+        int64_t rs = (int64_t)t * per;  if (rs > m) rs = m;
+        int64_t re = rs + per;          if (re > m) re = m;
+        chunks[t].rd = rd; chunks[t].ad = ad; chunks[t].bd = bd;
+        chunks[t].n = n; chunks[t].k = k; chunks[t].row_start = rs; chunks[t].row_end = re;
+    }
+#ifdef _WIN32
+    HANDLE th[NOVA_MATMUL_MAX_THREADS]; for (int t = 0; t < nthreads; t++) th[t] = NULL;
+    for (int t = 1; t < nthreads; t++) {
+        th[t] = CreateThread(NULL, 0, nova_matmul_thread, &chunks[t], 0, NULL);
+        if (!th[t]) nova_matmul_run_chunk(&chunks[t]);   /* fallback: run inline if create fails */
+    }
+    nova_matmul_run_chunk(&chunks[0]);                   /* caller participates */
+    for (int t = 1; t < nthreads; t++) if (th[t]) { WaitForSingleObject(th[t], INFINITE); CloseHandle(th[t]); }
+#else
+    pthread_t th[NOVA_MATMUL_MAX_THREADS]; char ok[NOVA_MATMUL_MAX_THREADS];
+    for (int t = 0; t < nthreads; t++) ok[t] = 0;
+    for (int t = 1; t < nthreads; t++) {
+        if (pthread_create(&th[t], NULL, nova_matmul_thread, &chunks[t]) == 0) ok[t] = 1;
+        else nova_matmul_run_chunk(&chunks[t]);          /* fallback: run inline if create fails */
+    }
+    nova_matmul_run_chunk(&chunks[0]);                   /* caller participates */
+    for (int t = 1; t < nthreads; t++) if (ok[t]) pthread_join(th[t], NULL);
+#endif
+    nova_in_par_matmul = 0;
     return r;
 }
 
