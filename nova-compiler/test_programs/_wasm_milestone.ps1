@@ -48,5 +48,14 @@ if (Build-Wasm "wasm_m3" "nova_user_main") {
     if ($n.ExitCode -ne 0) { $fail = 1 }
 } else { $fail = 1 }
 
-Remove-Item wasm_m1.ll,wasm_m1.o,wasm_m1.wasm,wasm_m2.ll,wasm_m2.o,wasm_m2.wasm,wasm_m3.ll,wasm_m3.o,wasm_m3.wasm -ErrorAction SilentlyContinue
-if ($fail -eq 0) { Write-Host "WASM MILESTONES OK: f64+call, static-string+print, AND loop-compute+dynamic-string run in wasm32" } else { Write-Host "WASM MILESTONE FAILURE"; exit 1 }
+# M4 — a REAL list-using algorithm (Sieve of Eratosthenes, n=1000 -> 168 primes) runs
+# in wasm via a JS-MANAGED LINEAR-MEMORY runtime (bump heap + list_create/append over
+# instance.exports.memory; the list lives in wasm linear memory, indexed by inlined wasm).
+if (Build-Wasm "wasm_sieve" "nova_user_main") {
+    $n = Invoke-Timed -FilePath $NODE -Arguments "_wasm_sieve_run.cjs" -TimeoutMs 30000
+    Write-Host ("  M4: " + ($n.StdOut.Trim().Split([char]10) | Select-Object -Last 1))
+    if ($n.ExitCode -ne 0) { $fail = 1 }
+} else { $fail = 1 }
+
+Remove-Item wasm_m1.ll,wasm_m1.o,wasm_m1.wasm,wasm_m2.ll,wasm_m2.o,wasm_m2.wasm,wasm_m3.ll,wasm_m3.o,wasm_m3.wasm,wasm_sieve.ll,wasm_sieve.o,wasm_sieve.wasm -ErrorAction SilentlyContinue
+if ($fail -eq 0) { Write-Host "WASM MILESTONES OK: f64+call, static-string+print, loop+dynamic-string, AND a real list-using sieve (168 primes) run in wasm32" } else { Write-Host "WASM MILESTONE FAILURE"; exit 1 }
