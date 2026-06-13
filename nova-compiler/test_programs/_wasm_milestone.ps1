@@ -41,5 +41,12 @@ if (Build-Wasm "wasm_m2" "nova_user_main") {
     if ($n.ExitCode -ne 0) { $fail = 1 }
 } else { $fail = 1 }
 
-Remove-Item wasm_m1.ll,wasm_m1.o,wasm_m1.wasm,wasm_m2.ll,wasm_m2.o,wasm_m2.wasm -ErrorAction SilentlyContinue
-if ($fail -eq 0) { Write-Host "WASM MILESTONES OK: NOVA f64+call AND static-string+print run in wasm32" } else { Write-Host "WASM MILESTONE FAILURE"; exit 1 }
+# M3 — a real loop computing in wasm + a DYNAMIC string printed via a JS-hosted runtime
+if (Build-Wasm "wasm_m3" "nova_user_main") {
+    $n = Invoke-Timed -FilePath $NODE -Arguments "_wasm_m3_run.cjs" -TimeoutMs 30000
+    Write-Host ("  M3: " + $n.StdOut.Trim())
+    if ($n.ExitCode -ne 0) { $fail = 1 }
+} else { $fail = 1 }
+
+Remove-Item wasm_m1.ll,wasm_m1.o,wasm_m1.wasm,wasm_m2.ll,wasm_m2.o,wasm_m2.wasm,wasm_m3.ll,wasm_m3.o,wasm_m3.wasm -ErrorAction SilentlyContinue
+if ($fail -eq 0) { Write-Host "WASM MILESTONES OK: f64+call, static-string+print, AND loop-compute+dynamic-string run in wasm32" } else { Write-Host "WASM MILESTONE FAILURE"; exit 1 }
