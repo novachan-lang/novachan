@@ -353,7 +353,8 @@ $concurrency_tests = @(
     'select_multi_test',
     'yield_test',
     'parallel_test',
-    'bounded_chan_test'
+    'bounded_chan_test',
+    'overflow_recovery_test'
 )
 
 $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurrency_tests

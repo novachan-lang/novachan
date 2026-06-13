@@ -120,6 +120,7 @@ static void nova_set_error(const char* msg) {
    max lowered. The nova_cur() per fn-entry is one predictable TLS load + branch.) */
 
 static void nova_reset_call_depth(void);     /* defined alongside g_stack_depth below */
+static int  nova_on_fiber_stack(void);        /* 1 if running on a green-task/generator 32KB fiber (defined with the fiber TLS) */
 
 void nova_panic(const char* msg) {
     if (msg && msg[0]) nova_set_error(msg);
@@ -1912,9 +1913,23 @@ static void nova_copymap_put(NovaCopyMap* m, int64_t key, int64_t val) {
     m->olds[m->n] = key; m->news[m->n] = val; m->n++;
 }
 
+/* Deep-copy recursion ceiling. nova_deep_copy_rec uses ~80-128 bytes of stack per
+   level at -O2. A green task / generator runs on a fixed 32KB fiber stack, so we cap
+   at NOVA_DEEP_COPY_FIBER_LIMIT (=64 -> ~8KB, with comfortable headroom for the stack
+   already consumed above us plus nova_panic's own call chain). The main thread (only
+   when NOVA_GREEN=0 runs nova_main directly on the MB-class OS stack) keeps the old
+   10000 ceiling. EXCEEDING the limit PANICS (a contained crash on a fiber) rather than
+   the old share-on-overflow, which silently aliased substructure between the channel
+   sender and receiver — a process-isolation violation / data race. So: either a fully
+   independent deep copy, or a clean contained failure; never partial sharing. */
+#define NOVA_DEEP_COPY_FIBER_LIMIT 64
+
 static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
     if ((uint64_t)v < 0x10000ULL) return v;
-    if (depth > 10000) { nova_rc_inc(v); return v; }   /* stack guard: share */
+    {   int copy_limit = nova_on_fiber_stack() ? NOVA_DEEP_COPY_FIBER_LIMIT : 10000;
+        if (depth > copy_limit)
+            nova_panic("deep copy: value nested beyond safe stack depth");
+    }
     void* p = (void*)(uintptr_t)v;
     NovaMemTag tag = nova_mem_find_tag(p);
     if (tag == NOVA_MEM_LIST) {
@@ -3967,6 +3982,17 @@ static __thread NovaFiber  nova_carrier_fiber;
 static __thread int        nova_carrier_ready = 0;
 #endif
 
+/* Are we executing on a green-task / generator fiber (fixed 32KB stack) rather than
+   the main thread or a carrier loop (MB-class OS stack)? While a task/generator fiber
+   runs, nova_current_fiber points at its own heap NovaFiber; the carrier (and the main
+   thread, which is converted to the carrier fiber) is &nova_carrier_fiber; before any
+   fiber activity it is NULL. This tests fiber IDENTITY directly, so it is immune to
+   nova_rt_stack_set_max() (which can set an arbitrary stack_max on any thread and would
+   defeat a stack_max-based heuristic). Used by nova_deep_copy_rec to pick its limit. */
+static int nova_on_fiber_stack(void) {
+    return nova_current_fiber != NULL && nova_current_fiber != &nova_carrier_fiber;
+}
+
 static void nova_fiber_limit_stack(void);
 
 static void nova_ensure_carrier(void) {
@@ -3991,23 +4017,25 @@ static void nova_ensure_carrier(void) {
 int _resetstkoflw(void);
 
 static LONG WINAPI nova_fiber_overflow_handler(EXCEPTION_POINTERS* ep) {
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
-        _resetstkoflw();
-        NovaTaskState* ft = nova_cur();
-        if (ft->fault_active) {
-            ft->crashed = 1;
-            longjmp(ft->fault_buf, 1);
-        }
-    }
+    /* NEUTRALIZED (was UB): this VEH previously did _resetstkoflw()+longjmp(fault_buf)
+       on EXCEPTION_STACK_OVERFLOW. Both are illegal from a vectored handler: the VEH
+       runs DURING RtlDispatchException (before frame-based unwinding), so longjmp's
+       RtlUnwindEx corrupts the in-flight dispatch state, and MSDN requires _resetstkoflw
+       to run from an __except BODY, not a filter/VEH. Fiber stack-overflow recovery now
+       lives in the __try/__except in nova_fiber_entry (the documented mechanism, verified
+       to recover repeatably on a 32KB fiber). This VEH is kept installed only as a no-op
+       so the global handler chain is otherwise unchanged. */
+    (void)ep;
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static volatile int nova_fiber_veh_installed = 0;
+static volatile LONG nova_fiber_veh_installed = 0;
 
 static void nova_install_fiber_veh(void) {
-    if (nova_fiber_veh_installed) return;
-    AddVectoredExceptionHandler(1, nova_fiber_overflow_handler);
-    nova_fiber_veh_installed = 1;
+    /* Atomic one-shot install: two carriers creating their first fiber concurrently must
+       not both call AddVectoredExceptionHandler (a formal data race on the old plain int). */
+    if (InterlockedCompareExchange(&nova_fiber_veh_installed, 1, 0) == 0)
+        AddVectoredExceptionHandler(1, nova_fiber_overflow_handler);
 }
 
 static void CALLBACK nova_fiber_entry(LPVOID param) {
@@ -4020,10 +4048,28 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
 
     f->task.fault_active = 1;
     f->task.crashed = 0;
-    if (setjmp(f->task.fault_buf) == 0) {
-        int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
-        nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
-        fn(f->entry_fn, 0);
+    __try {
+        /* Software faults (panic / unwrap-on-Err / failed assert / deep-copy guard)
+           longjmp back to this setjmp — verified to land here WITHOUT entering the
+           __except (x64 longjmp uses RtlUnwindEx, which is not an SEH exception). */
+        if (setjmp(f->task.fault_buf) == 0) {
+            int64_t* rec = (int64_t*)(uintptr_t)f->entry_fn;
+            nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+            fn(f->entry_fn, 0);
+        }
+    } __except (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW
+                ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        /* HARDWARE stack overflow on this fiber's fixed 32KB stack (e.g. unbounded user
+           recursion — which is unguarded, since the depth counter is opt-in). The stack
+           has unwound back to this frame (top of the fiber stack), so we have full stack
+           again; _resetstkoflw restores the guard page (verified repeatable). Report a
+           contained crash exactly like nova_panic, then fall through to the normal
+           fiber-exit path so the carrier survives and runs the remaining tasks. */
+        _resetstkoflw();
+        f->task.crashed = 1;
+        nova_set_error("stack overflow");
+        fprintf(stderr, "level=ERROR event=fault detail=\"stack overflow\"\n");
+        fflush(stderr);
     }
     f->task.fault_active = 0;
 

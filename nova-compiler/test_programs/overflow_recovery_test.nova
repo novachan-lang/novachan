@@ -1,0 +1,61 @@
+// overflow_recovery_test.nova — iter-16 fiber stack-overflow SOUNDNESS.
+// Two green tasks each hit a stack-overflow condition and must die as a CONTAINED
+// crash (not kill the process), while the carrier survives and every well-behaved
+// task completes. The process must exit 0.
+//   Task A: unbounded TREE recursion -> hardware overflow of the 32KB fiber stack
+//           -> Windows SEH __except in nova_fiber_entry contains it (verified to
+//           unwind through NOVA uwtable frames). (two non-tail calls so LLVM cannot
+//           turn it into an accumulator loop.)
+//   Task B: a value nested far beyond the safe copy depth, deep-copied via copy()
+//           -> nova_deep_copy_rec's fiber guard panics (contained) at depth 64.
+
+fn build_nested(depth)
+  let v = [0]
+  let i = 0
+  while i < depth
+    v = [v]
+    i = i + 1
+  v
+
+fn deep_copier(ch)
+  let v = build_nested(200)
+  let w = copy(v)          // deep copy on the 32KB fiber -> guard panics at depth 64
+  send(ch, len(w))         // unreachable; keeps `w` live so the copy can't be elided
+
+fn tree(n)
+  let a = tree(n + 1)      // dives unboundedly deep first -> overflows the fiber stack
+  let b = tree(n - 1)
+  a + b
+
+fn good_worker(ch, id)
+  send(ch, id)
+
+fn main()
+  let results = channel()
+
+  // 5 well-behaved workers
+  let i = 1
+  while i <= 5
+    let _w = spawn good_worker(results, i)
+    i = i + 1
+
+  // Task A: unbounded recursion -> hardware stack overflow -> SEH-contained crash
+  let bad1 = spawn tree(0)
+  let st1 = receive(monitor(bad1))
+  assert(st1 != 0, "recursion-overflow task must be a contained crash, got " + str(st1))
+
+  // Task B: deeply-nested value deep-copied -> deep_copy guard panic -> contained
+  let sink = channel()
+  let bad2 = spawn deep_copier(sink)
+  let st2 = receive(monitor(bad2))
+  assert(st2 != 0, "deep-copy-overflow task must be a contained crash, got " + str(st2))
+
+  // All 5 well-behaved workers must have completed (carrier survived BOTH crashes)
+  let total = 0
+  let got = 0
+  while got < 5
+    total = total + receive(results)
+    got = got + 1
+  assert(total == 15, "all 5 workers must complete (sum 1..5 = 15), got " + str(total))
+
+  print("overflow_recovery_test: 2 contained overflows, 5/5 workers survived, process alive")
