@@ -17,7 +17,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **C++** | templates, RAII, zero-cost | RAII=`defer`+RC; operators=traits; generics+inference; **no template/UB/45-min-compile complexity** | monomorphic native-ABI specialization (narrow perf) |
 | **Rust** | safety w/o GC | process isolation = same safety (no data races/UAF/null), **zero annotations**, no borrow-checker fight | COW-on-send (cut deep-copy cost) — perf, not safety |
 | **Go** | M:N concurrency, fast compile | M:N work-stealing scheduler; typed channels+select+spawn; **+supervisors/monitors Go lacks**; **small-commit auto-grow fiber stacks (86b8b4d): contained overflow + 2.37× task density** | faster incremental compile |
-| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)**; **fiber overflow = contained crash (fb73d6e) + 52.6k parked tasks/GB (86b8b4d)**; **multi-node cluster membership: G-Set CRDT, seed-join + gossip, 3 nodes converge (3367cfa)**; **cluster failure-detection: gossip-as-heartbeat + last-seen, kill-one-detect-down 4/4, 0 false-positives (c7c6edc)**; **cluster graceful leave: cluster_leave broadcasts departure → peers mark down immediately, crash-control-verified (f320c9d)**; **cluster_spawn: distributed task placement — run a fn on a LIVE peer via the fn registry, no-peer/dead-peer return gracefully (bb10f51)**; **carrier-safe http_get + a real green HTTP server stack (4d8a964/e87170e)** | phi-accrual/suspicion detector (incr 5); stackless coroutines for true millions (~300 B/proc); hot code swap |
+| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)**; **fiber overflow = contained crash (fb73d6e) + 52.6k parked tasks/GB (86b8b4d)**; **multi-node cluster membership: G-Set CRDT, seed-join + gossip, 3 nodes converge (3367cfa)**; **cluster failure-detection: gossip-as-heartbeat + last-seen, kill-one-detect-down 4/4, 0 false-positives (c7c6edc)**; **cluster graceful leave: cluster_leave broadcasts departure → peers mark down immediately, crash-control-verified (f320c9d)**; **cluster_spawn: distributed task placement — run a fn on a LIVE peer via the fn registry, no-peer/dead-peer return gracefully (bb10f51)**; **cluster_pmap: distributed scatter-gather — round-robin across live peers, concurrent, ordered, partial-failure-tolerant + FIXED a netpoller select()-missing-exceptfds hang (refused connect parked forever on Windows in ALL distributed code) (7d9ec1c)**; **carrier-safe http_get + a real green HTTP server stack (4d8a964/e87170e)** | phi-accrual/suspicion detector (incr 6); cluster_spawn/pmap recv-timeout (hung-but-alive peer); stackless coroutines for true millions (~300 B/proc); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
 | **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; WASM m1–m5 (f64/string/list/float programs run in wasm32, output byte-identical to native, reusable runtime); **`nova wasm <file>` is now a FIRST-CLASS CLI command (c93fbfa)**; **m6 (08794a5): dicts + structs run in wasm32 byte-identical to native (struct_alloc + full dict ops via FNV-1a matching native + index_get dict-dispatch) — real dict/struct/word-count programs run in the browser** | m7 = the TAGGED C-runtime-to-wasm path (eliminates the untagged JS-runtime int/pointer ambiguity for medium ints through polymorphic ops — the documented m6 boundary); channels→SharedArrayBuffer; DOM bindings |
@@ -136,10 +136,18 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
   timeout coincidence (f320c9d); cluster_spawn = distributed task placement — pick a LIVE member from
   cluster_alive, send {"type":"spawn","fn","args"}, peer resolves via the fn registry (call_by_name) and
   replies; no-live-peer + dead-peer (connect-fail / socket-EOF) return a graceful error, never block
-  (bb10f51). Cluster now does WORK, not just membership.
-- *Remaining for full Erlang-class distribution (future):* phi-accrual/suspicion detector (incr 5);
-  cluster_spawn recv-timeout (a hung-but-alive peer still blocks the caller); arity > 8; float-arg ABI
-  nuance (args unboxed → raw double bits, fine for raw-float params).
+  (bb10f51). cluster_pmap = distributed scatter-gather: round-robin a batch over the live peers, run
+  concurrently (each spawn its own green task), gather IN ORDER, per-task ok/err so a dead peer errors
+  only its slot (7d9ec1c). Cluster now does WORK, not just membership.
+- *Runtime soundness fix (7d9ec1c):* the green netpoller's select() passed NULL exceptfds → a
+  remote_connect to a refused/dead peer parked FOREVER on Windows (failed non-blocking connect is
+  signaled only in exceptfds there) → a silent hang in ALL distributed code against an unreachable
+  peer. Now watches POLL_WRITE waiters in exceptfds (+ the non-green nova_remote_io fallback). Verified
+  by a 3-lens adversarial review (0 blockers) + a kill-a-worker-mid-batch pmap test (the permanent guard).
+- *Remaining for full Erlang-class distribution (future):* phi-accrual/suspicion detector (incr 6);
+  cluster_spawn/pmap recv-timeout (a hung-but-alive peer still blocks the caller; connect to an
+  unreachable/firewalled host waits the OS SYN timeout); arity > 8; float-arg ABI nuance (args unboxed
+  → raw double bits, fine for raw-float params).
 
 **[P5] ✅ DONE (733a707) — const-aggregate baking (beat the Zig/C comptime gap NOVA was losing).**
 - *Shipped:* a top-level `const` list literal of pure literals is now built ONCE in the `@nova_main`
