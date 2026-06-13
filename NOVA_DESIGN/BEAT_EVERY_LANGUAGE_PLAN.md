@@ -16,8 +16,8 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **C** | raw scalar/float perf | float math **matches/beats C** (intrinsics, 1495bd3); scalar/int native; non-escaping structs stack-alloc'd (4a); **struct-math-via-fn-call 1.009× C (P1)**; tensor elementwise SIMD auto-vectorized; **tensor_matmul SIMD + AUTO-PARALLEL + CACHE-BLOCKED (2D i/j tiling) = BEATS C 1.45× @512² / 1.72× @1024² (f4ff85c, 8 cores, zero user effort, bit-identical)** | construction-heavy loops ~3.8× (i64-handle ABI → Stage-5); SIMD on `[float]` **lists** (staged P2); larger matmul scaling (k-panel packing / per-platform tile tuning) |
 | **C++** | templates, RAII, zero-cost | RAII=`defer`+RC; operators=traits; generics+inference; **no template/UB/45-min-compile complexity** | monomorphic native-ABI specialization (narrow perf) |
 | **Rust** | safety w/o GC | process isolation = same safety (no data races/UAF/null), **zero annotations**, no borrow-checker fight | COW-on-send (cut deep-copy cost) — perf, not safety |
-| **Go** | M:N concurrency, fast compile | M:N work-stealing scheduler; typed channels+select+spawn; **+supervisors/monitors Go lacks** | faster incremental compile; growable stacks |
-| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)** | node clustering/discovery (multi-node); growable stacks (millions); hot code swap |
+| **Go** | M:N concurrency, fast compile | M:N work-stealing scheduler; typed channels+select+spawn; **+supervisors/monitors Go lacks**; **small-commit auto-grow fiber stacks (86b8b4d): contained overflow + 2.37× task density** | faster incremental compile |
+| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)**; **fiber overflow = contained crash (fb73d6e) + 52.6k parked tasks/GB (86b8b4d)** | node clustering/discovery (multi-node); stackless coroutines for true millions (~300 B/proc); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
 | **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; WASM m1–m5 (f64/string/list/float programs run in wasm32, output byte-identical to native, reusable runtime); **`nova wasm <file>` is now a FIRST-CLASS CLI command (c93fbfa): compile to a runnable bundle (.wasm + loader + runtime) → `node app.run.cjs`** | WASM m6+: compile the C memory-runtime to wasm (one source of truth → free/dicts/structs/full builtins); channels→SharedArrayBuffer; DOM bindings |
@@ -78,9 +78,9 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 - *Verify (per stage):* reconverge `gen5.ll==gen6.ll` + 403 each stage; final = a float-array sum/map
   loop beats serial C with no unroll bloat. Effort L (multi-iteration). Soundness-sensitive.
 
-**[P3] Growable fiber stacks (beat Erlang/Go on scale). Stage 0 DONE (fb73d6e). Stage 1 = the density win.**
-- *Problem:* fixed 32KB fiber stacks → ~30k tasks/GB (BEAM ~300 B/proc). "Millions of processes" not
-  yet real.
+**[P3] Growable fiber stacks (beat Erlang/Go on scale). Stage 0 DONE (fb73d6e) + Stage 1 DONE (86b8b4d).**
+- *Problem:* fibers committed a full 32KB up front → ~22k parked tasks/GB of commit (BEAM ~300 B/proc).
+  "Millions of processes" capped by commit charge.
 - *Iter-13 workflow finding (num_clean=0, severity major):* the obvious win (Win CreateFiberEx
   small-commit/large-reserve → ~4× more tasks/GB committed) was NOT soundly landable because the overflow
   backstop was BROKEN: the Win VEH did `longjmp` (UB), POSIX had no SIGSEGV handler, and the deep_copy
@@ -99,9 +99,17 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
     on the Windows build and needs the adversary's fixes (cache page size out of the handler; widen the
     guard-fault range for large stack frames; atomic install; macOS SIGBUS). POSIX overflow stays defined
     process-death until then. Iterative (unbounded-depth) `nova_deep_copy_rec` is a separate hardening.
-- *Stage 1 (now soundly landable — the density win):* `CreateFiberEx(small commit, ≥32KB reserve)` on Win
-  for ~4× more tasks/GB committed (≈Go-initial density); the SEH backstop makes the smaller commit safe.
-  BEAM's 300 B/proc needs stackless coroutines — a separate, much larger effort.
+- ✅ **Stage 1 DONE — iter 17 (86b8b4d), the density win:** `CreateFiber(32768)` → `CreateFiberEx(4096
+  commit, 0 reserve, ...)`. KEY: `CreateFiber`'s arg was the COMMIT (reserve defaulted to the PE header,
+  ~16MB) — so the iter-13 adversary was right that an explicit small reserve REGRESSES the cap. Passing
+  reserve=`0` (PE default) keeps the SAME ~16MB usable stack (verified == `CreateFiber(32768)`; an explicit
+  32768 reserve gave only ~765KB and overflowed the self-hosted compiler in bootstrap pass 2 — caught + fixed)
+  while the 4KB commit + Windows auto-grow means a fiber commits only what it touches. The iter-16 SEH backstop
+  makes the small commit safe (overflow still faults at the reserve → `__except` contains it; verified). MEASURED:
+  commit/parked-task **48.5KB → 20.4KB = 2.37×** (22k → **52.6k parked tasks/GB** of commit charge). green_scale
+  10k N=1 wall-time unchanged (+0.3%, noise — auto-grow soft faults are free). POSIX already demand-zero (mmap)
+  → Windows-only change. 408/408, reconverged 24CE520B. BEAM's 300 B/proc needs stackless coroutines — a
+  separate, much larger effort (the remaining gap to true millions).
 - *Verify:* induce a green-task stack overflow → clean recovery (DONE); green tests + green_scale still
   pass (DONE); 408; for Stage 1, a commit-charge measurement (spawn N tasks, read PrivateMemorySize)
   shows the reduction. Effort L, soundness-CRITICAL.
