@@ -20,7 +20,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)** | node clustering/discovery (multi-node); growable stacks (millions); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
-| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; **WASM milestone 1 done (8821467): NOVA f64+function-call runs in wasm32 in Node** (real codegen, not the i32 interpreter) | WASM milestone 2+: linear-memory runtime (strings/lists/print) so non-trivial programs run; DOM/channels |
+| **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises; **WASM m1+m2 done: NOVA f64+call AND static-string+print run in wasm32 in Node** (real codegen + linear memory + I/O, not the i32 interpreter) | WASM m3+: RC heap in linear memory (dynamic strings/lists, str()->print); then channels/DOM |
 
 **Bottom line:** the core is already competitive-to-dominant on 6 of 9; the open frontiers are
 **perf endgame (C struct-passing + SIMD), distribution+scale (Erlang), and WASM (JS browser).**
@@ -139,16 +139,18 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 
 ### Tier 3 — reach (beat JS browser, Python REPL) — biggest, last
 
-**[P6] WASM target — real wasm32 (beat JS / browser). [Milestone 1 ✅ DONE 8821467.]**
-- *Milestone 1 (DONE):* a real **f64 + function-call** NOVA program compiles NOVA→LLVM IR→wasm32 and
-  RUNS correctly in Node's WebAssembly (compute(1.5,2.5)=5.25). NOVA already emits correct wasm32 IR
-  (`compile --target wasm`); the win was proving the path end-to-end (clang --target=wasm32 -O2 →
-  wasm-ld --gc-sections → Node + a 1-line nova_rt_unbox shim). Reproducible via _wasm_milestone.ps1.
-  Toolchain on this box: clang wasm32 + wasm-ld + Node v20 (no wasmtime needed).
-- *Milestone 2+ (next):* a linear-memory runtime shim — RC heap in wasm linear memory so strings/lists/
-  structs work, + `print` via a WASI/imported write — so NON-trivial NOVA programs run in wasm. Then
-  `nova build --target wasm` tooling (invoke clang+wasm-ld), then channels→SharedArrayBuffer+Atomics,
-  threads→Web Workers, DOM bindings. Effort XL — keep decomposing milestone-by-milestone.
+**[P6] WASM target — real wasm32 (beat JS / browser). [Milestones 1+2 ✅ DONE.]**
+- *Milestone 1 (DONE 8821467):* a real **f64 + function-call** NOVA program runs in Node's WebAssembly
+  (compute(1.5,2.5)=5.25). Pure SSA, 1 import (nova_rt_unbox).
+- *Milestone 2 (DONE 4264586):* a NOVA program with a **static string + print** runs in wasm32
+  ("hello from wasm") — adds the linear-memory + I/O path. print(literal) → load the data-section
+  string ptr → nova_rt_print_str(ptr); the Node shim reads the null-terminated bytes from
+  exports.memory and logs them. 1 import. Both verified by _wasm_milestone.ps1.
+- *Milestone 3+ (next):* a minimal RC heap in wasm linear memory (malloc + the string/list element
+  ops) so **dynamic** strings/lists + str(x)→print work — a larger runtime port: #ifdef the OS-only
+  parts (sockets/threads/fibers stay native; stub/omit under wasm) and provide malloc (dlmalloc or a
+  bump allocator) + an imported write. Then `nova build --target wasm` tooling, then channels→
+  SharedArrayBuffer+Atomics, threads→Web Workers, DOM. Effort XL — keep decomposing.
 
 **[P7] REPL via OrcJIT (beat Python adoption).**
 - *NOVA way:* `nova repl` JIT-compiles each line via LLVM OrcJIT (NOT a 2nd interpreter); state
