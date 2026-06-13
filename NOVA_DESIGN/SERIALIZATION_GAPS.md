@@ -1,6 +1,10 @@
 # NOVA Serialization Gap: top-level list-of-structs (and why the obvious fix is unsound)
 
-**Status:** characterized + deferred (iter 31, 2026-06-14). Code-verified via a 3-agent design
+**Status:** json_stringify(list-of-structs) FIXED via Path A (iter 33, fc5988c, reconverged
+407B43B3) — recording channel + per-fn resets + the json_stringify consumer shipped, 414/414. The
+silent raw-pointer bug is gone for literal / push-built / fn-returned lists. REMAINING (follow-up):
+to_json(list) [still the loud E1001 — needs ti_stdlib registration that risks the compiler's own
+to_json inference] + the list.to_json() method-call form (~L7454). Original analysis (iter 31): Code-verified via a 3-agent design
 workflow (compiler-architect + devils-advocate + synthesis). The clean fix is infrastructure
 (inferer-to-codegen type threading OR tagged structs) — staged, not rushed. Partial fixes trade a
 loud bug for a silent one and are REJECTED.
