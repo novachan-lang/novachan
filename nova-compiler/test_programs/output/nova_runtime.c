@@ -4948,7 +4948,17 @@ int64_t nova_rt_sched_run(void) {
 #endif
                 continue;
             }
-            break;   /* single-carrier: no runnable + no waiters => done */
+            /* single-carrier: keep looping while a SLEEP/OFFLOAD waiter is pending AND the
+               ROOT task is still alive — those waiters WILL become ready (a timer fires, an
+               offload completes), so exiting now would quit a program mid-sleep/mid-offload
+               (a periodic loop, or main awaiting a timer/HTTP). The poll branch above already
+               throttled ~1ms, so this is not a busy-spin. Once the root (main) has FINISHED
+               we exit Go-style even if a background daemon still sleeps/offloads (a server
+               test whose main returns while a periodic sleep-daemon lingers still terminates).
+               Pure I/O-blocked idle still breaks here, leaving that termination unchanged. */
+            if ((nova_sleep_waiters || nova_offload_waiters) &&
+                nova_sched_root_task && nova_sched_root_task->status != 3) continue;
+            break;   /* nothing runnable; no live-root timer/offload pending => done */
         }
         if (t->status == 3) continue;
         if (g_watchdog_on) { g_carrier_pc[_wcid] = 2; g_carrier_spin[_wcid] = t; }

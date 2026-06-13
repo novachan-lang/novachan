@@ -362,6 +362,13 @@ $concurrency_tests = @(
 
 $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurrency_tests
 
+# Server-binding tests run their OWN in-process green TCP server + client (real I/O). Running
+# many concurrently starves the green server's scheduling under CPU load -> intermittent
+# failures (they each pass reliably given the box to themselves). So run these SERIALLY,
+# after the parallel batch.
+$server_tests = @('demo_http_server_test','demo_forge_test','demo_forge_v2_test','demo_forge_todo_test','demo_cortex_serve_test','demo_ops_test','demo_full_stack_test','real_http_api','http_offload_test')
+$parallel_tests = @($all_tests | Where-Object { $server_tests -notcontains $_ })
+
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 Write-Host "=== NOVA Full Regression Suite ==="
 Write-Host "Compiler: $compiler ($((Get-Item $compiler).Length) bytes)"
@@ -466,7 +473,7 @@ $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace
 $pool.Open()
 
 $jobs = New-Object System.Collections.ArrayList
-foreach ($t in $all_tests) {
+foreach ($t in $parallel_tests) {
     $ps = [PowerShell]::Create()
     $ps.RunspacePool = $pool
     [void]$ps.AddScript($testScript)
@@ -501,6 +508,33 @@ foreach ($job in $jobs) {
         }
     }
     $job.PS.Dispose()
+}
+
+# ─── Serial phase: server-binding tests, one at a time (CPU to themselves) ───
+foreach ($t in $server_tests) {
+    $ps = [PowerShell]::Create()
+    $ps.RunspacePool = $pool
+    [void]$ps.AddScript($testScript)
+    [void]$ps.AddArgument($t)
+    [void]$ps.AddArgument($compiler)
+    [void]$ps.AddArgument($runtimeObj)
+    [void]$ps.AddArgument($PSScriptRoot)
+    [void]$ps.AddArgument($ClangPath)
+    [void]$ps.AddArgument($NovaLinkFlags)
+    [void]$ps.AddArgument($sqliteObj)
+    try {
+        $res = $ps.Invoke()   # synchronous -> serial
+        if ($res -and $res.Count -gt 0) { $r = $res[$res.Count - 1] }
+        else { $r = @{ Name = $t; Status = "FAIL"; Detail = "NO RESULT" } }
+    } catch {
+        $r = @{ Name = $t; Status = "FAIL"; Detail = "RUNSPACE ERROR" }
+    }
+    switch ($r.Status) {
+        "PASS" { $pass++; Write-Host "PASS $($r.Name) [serial]" }
+        "SKIP" { $skip++ }
+        default { $fail++; $failures += "$($r.Name) ($($r.Detail))"; Write-Host "FAIL $($r.Name)  ($($r.Detail)) [serial]" }
+    }
+    $ps.Dispose()
 }
 
 $pool.Close()
