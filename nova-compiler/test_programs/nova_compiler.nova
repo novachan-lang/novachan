@@ -17137,6 +17137,23 @@ fn nova_find_runtime() -> string
             return c
     return "nova_runtime.c"
 
+// Locate the reusable JS-managed linear-memory runtime (_wasm_runtime.cjs) that
+// provides nova_rt_* imports for wasm32 programs. Mirrors nova_find_runtime().
+fn nova_find_wasm_runtime() -> string
+    let nh = env("NOVA_HOME")
+    if len(nh) > 0
+        let cand = path_join(nh, "output/_wasm_runtime.cjs")
+        if contains(read_file(cand), "createRuntime")
+            return cand
+        let cand2 = path_join(nh, "_wasm_runtime.cjs")
+        if contains(read_file(cand2), "createRuntime")
+            return cand2
+    let candidates = ["output/_wasm_runtime.cjs", "test_programs/_wasm_runtime.cjs", "_wasm_runtime.cjs"]
+    for c in candidates
+        if contains(read_file(c), "createRuntime")
+            return c
+    return ""
+
 fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: string) -> int
     let rt = nova_find_runtime()
     let resolved = resolve_target(target)
@@ -17897,6 +17914,7 @@ fn compiler_main()
         print("Single-file commands:")
         print("  compile <file.nova>   Compile to LLVM IR only")
         print("  emit <file.nova>      Print generated LLVM IR to stdout (inspect codegen)")
+        print("  wasm <file.nova>      Compile to a runnable WebAssembly bundle (.wasm + JS loader)")
         print("")
         print("Package commands:")
         print("  get <package>[@ver]   Add a dependency to nova.toml")
@@ -18113,6 +18131,82 @@ fn compiler_main()
         exit(0)
     if cmd == "install"
         nova_pkg_install()
+        exit(0)
+    if cmd == "wasm"
+        // Compile a NOVA source to a RUNNABLE WebAssembly bundle:
+        //   <base>.wasm        -- WebAssembly binary (NOVA logic)
+        //   <base>.run.cjs     -- Node loader
+        //   _wasm_runtime.cjs  -- reusable JS-managed linear-memory runtime (copied alongside)
+        // Run with: node <base>.run.cjs   (works for programs using the covered builtins:
+        // lists/strings/floats/print; an uncovered builtin fails with a clear named error).
+        let wasm_in = ""
+        let wasm_out = ""
+        let wasm_opt = "-O2"
+        let wi = 2
+        while wi < len(arguments)
+            let wa = arguments[wi]
+            if wa == "-o"
+                wi = wi + 1
+                if wi < len(arguments)
+                    wasm_out = arguments[wi]
+            else if wa == "-O0"
+                wasm_opt = "-O0"
+            else if wa == "-O1"
+                wasm_opt = "-O1"
+            else
+                wasm_in = wa
+            wi = wi + 1
+        if wasm_in == ""
+            print("Usage: nova wasm <file.nova> [-o output_base] [-O0]")
+            print("  Produces <base>.wasm + <base>.run.cjs + _wasm_runtime.cjs")
+            print("  Run with: node <base>.run.cjs")
+            exit(1)
+        if not file_exists(wasm_in)
+            print("error: cannot read '" + wasm_in + "': file not found")
+            exit(1)
+        let wasm_base = wasm_out
+        if wasm_base == ""
+            wasm_base = nova_replace_ext(wasm_in, ".nova", "")
+        // Distinct .wasm.ll intermediate avoids cache collision with a native <base>.ll
+        // (nova_compile_file caches by output_path+mtime, target-agnostic).
+        let wasm_ll = wasm_base + ".wasm.ll"
+        let wasm_path = wasm_base + ".wasm"
+        let wasm_loader = wasm_base + ".run.cjs"
+        let wasm_dir = path_dir(wasm_path)
+        nova_compile_file(wasm_in, wasm_ll, 1, "wasm")
+        // One clang call drives wasm-ld internally (only clang need be on PATH).
+        let q = chr(34)
+        let wlink = "clang --target=wasm32 " + wasm_opt + " -nostdlib"
+        wlink = wlink + " -Wl,--no-entry -Wl,--export=nova_user_main"
+        wlink = wlink + " -Wl,--export=__heap_base -Wl,--allow-undefined -Wl,--gc-sections"
+        wlink = wlink + " " + q + wasm_ll + q + " -o " + q + wasm_path + q + " -w 2>&1"
+        let wret = system(wlink)
+        if wret != 0
+            print("error: wasm link failed (exit " + str(wret) + ")")
+            print("  command: " + wlink)
+            print("  Ensure clang supports --target=wasm32 (LLVM 8+).")
+            exit(1)
+        let wrt_src = nova_find_wasm_runtime()
+        if wrt_src == ""
+            print("error: _wasm_runtime.cjs not found. Set NOVA_HOME or run from the nova-compiler tree.")
+            exit(1)
+        let wrt_dst = "_wasm_runtime.cjs"
+        if len(wasm_dir) > 0
+            wrt_dst = wasm_dir + "_wasm_runtime.cjs"
+        copy_file(wrt_src, wrt_dst)
+        // Emit the <base>.run.cjs loader (resolves the runtime + wasm relative to __dirname).
+        let wasm_stem = nova_replace_ext(path_name(wasm_path), ".wasm", "")
+        let nl = chr(10)
+        // Single brace-free loader line. NOVA treats { } inside string literals as
+        // interpolation, so all the brace-containing logic lives in _wasm_runtime.cjs's
+        // runFile(); the emitted loader just calls it with the wasm path.
+        let ldr = "require(require(" + q + "path" + q + ").join(__dirname, " + q + "_wasm_runtime.cjs" + q + ")).runFile(require(" + q + "path" + q + ").join(__dirname, " + q + wasm_stem + ".wasm" + q + "))" + nl
+        write_file(wasm_loader, ldr)
+        print("WASM bundle built:")
+        print("  " + wasm_path)
+        print("  " + wasm_loader)
+        print("  " + wrt_dst)
+        print("Run with: node " + wasm_loader)
         exit(0)
     // Parse: nova run/build/compile [--old] [-O0] [-o out] [--target T] <file>
     if cmd == "emit"

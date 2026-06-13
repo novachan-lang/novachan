@@ -292,4 +292,24 @@ function createRuntime() {
   return { imports, init, getOutput };
 }
 
-module.exports = { createRuntime };
+// Convenience entry for the `nova wasm` CLI's emitted loader: instantiate a wasm
+// file with a fresh runtime, run nova_user_main, and report a clear error if the
+// program uses a builtin this runtime does not yet provide.
+function runFile(wasmPath) {
+  const fs = require("fs");
+  const rt = createRuntime();
+  return WebAssembly.instantiate(fs.readFileSync(wasmPath), { env: rt.imports })
+    .then(({ instance }) => { rt.init(instance); instance.exports.nova_user_main(); })
+    .catch((e) => {
+      if (e instanceof WebAssembly.LinkError) {
+        const m = e.message.match(/function="([^"]+)"/);
+        if (m) console.error("error: this program uses builtin '" + m[1] + "' which is not yet in _wasm_runtime.cjs.");
+        else console.error("error: wasm link failed:", e.message);
+      } else {
+        console.error("error: wasm runtime error:", e.message || e);
+      }
+      process.exit(1);
+    });
+}
+
+module.exports = { createRuntime, runFile };
