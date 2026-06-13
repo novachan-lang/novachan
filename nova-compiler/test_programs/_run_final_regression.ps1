@@ -167,6 +167,7 @@ $domain_tests = @(
     'call_by_name_test',
     'remote_spawn_test',
     'const_bake_test',
+    'tensor_matmul_test',
     'int_ptr_soundness_repro',
     'str_identity_test',
     'struct_rc_test',

@@ -9844,12 +9844,22 @@ int64_t nova_rt_tensor_matmul(int64_t a_h, int64_t b_h) {
     NovaTensor* result = (NovaTensor*)(uintptr_t)r;
     if (!result) return 0;
 
-    /* Standard ijk matmul. For larger sizes, blocked + parallel would be a win. */
+    /* Standard ikj matmul. The `restrict` qualifiers tell clang the result/input
+       backings do not alias (result is a fresh allocation; a/b are read-only), so
+       the inner j loop — which writes DISTINCT output cells rrow[j] (no cross-lane
+       reduction; the kk-summation order is unchanged) — auto-vectorizes to packed
+       SIMD (mulpd/addpd). This is numerically IDENTICAL to the scalar version, not
+       a reassociation. For larger sizes, blocked + parallel would be a further win. */
+    double * restrict rd = result->data;
+    const double * restrict ad = a->data;
+    const double * restrict bd = b->data;
     for (int64_t i = 0; i < m; i++) {
+        double * restrict rrow = rd + i * n;
         for (int64_t kk = 0; kk < k; kk++) {
-            double aik = a->data[i * k + kk];
+            const double aik = ad[i * k + kk];
+            const double * restrict brow = bd + kk * n;
             for (int64_t j = 0; j < n; j++) {
-                result->data[i * n + j] += aik * b->data[kk * n + j];
+                rrow[j] += aik * brow[j];
             }
         }
     }
