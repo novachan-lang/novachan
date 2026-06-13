@@ -39,6 +39,23 @@ fn cluster_status(info)
     send(info["cmd_ch"], {"cmd": "status", "reply": reply})
     receive(reply)
 
+// Graceful leave: announce departure to every peer so they mark us "down" IMMEDIATELY,
+// instead of waiting out the failure-detection timeout. Best-effort — a peer we can't
+// reach just falls back to timeout detection (peers are alive in a graceful-leave scenario;
+// localhost connect to a dead/absent peer fails fast, so this never blocks on the living).
+fn cluster_leave(info)
+    let reply = channel()
+    send(info["cmd_ch"], {"cmd": "get", "reply": reply})
+    let members = receive(reply)
+    let self_addr = info["self"]
+    for m in members
+        if m != self_addr
+            let parts = split(m, ":")
+            let conn = remote_connect(parts[0], parse_int(parts[1]))
+            if conn != -1
+                remote_send(conn, {"type": "leave", "from": self_addr})
+                remote_close(conn)
+
 // ── membership manager actor (single owner of the set + last-seen) ───────────
 
 fn _union(members, incoming)
@@ -89,6 +106,10 @@ fn _manager_loop(cmd_ch, self_addr)
             // proof-of-life from a peer (any inbound message). Unconditional: a stray
             // touch for a not-yet-merged addr is harmless (alive/status iterate members).
             last_seen[cmd["addr"]] = time_ms()
+        else if c == "mark_left"
+            // a peer announced a graceful leave: force it "down" now (last_seen=0 => the
+            // age (now-0) exceeds any timeout). If it ever rejoins, a fresh touch revives it.
+            last_seen[cmd["addr"]] = 0
         else if c == "alive"
             let now3 = time_ms()
             let alive = []
@@ -130,6 +151,10 @@ fn _handle_peer(conn, cmd_ch)
                 send(cmd_ch, {"cmd": "touch", "addr": msg["from"]})
             send(cmd_ch, {"cmd": "merge_get", "members": msg["members"], "reply": reply})
             remote_send(conn, {"type": "ack", "members": receive(reply)})
+        else if msg["type"] == "leave"
+            // graceful departure: mark the sender down immediately (no ack — it's gone).
+            if msg["from"] != 0
+                send(cmd_ch, {"cmd": "mark_left", "addr": msg["from"]})
     remote_close(conn)
 
 // ── outbound: join a seed (with retry — a transient connect failure must NOT leave
