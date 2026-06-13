@@ -7313,6 +7313,20 @@ static void nova_rc_free(void* ptr) {
         case NOVA_MEM_FAT_STR:
             free((char*)ptr - NOVA_FAT_HDR_SIZE - NOVA_RC_HDR_SIZE);
             break;
+        case NOVA_MEM_STRUCT: {
+            /* A struct/closure owns its fields/captures (W5b transferred ownership;
+               make_struct rc_inc's managed field values, deep_copy deep-copies them).
+               Without dec'ing them here, a struct's heap fields (list/string/nested
+               struct) LEAK on death. Slot 0 is the type hash (non-repr-C struct) or fn
+               ptr (closure) — never a managed field, so dec slots 1..nslots-1 only.
+               (Mirrors deep_copy at ~1958: raw-copy slot 0, manage slots 1..N-1.) */
+            int64_t nslots = NOVA_STRUCT_NSLOTS(ptr);
+            int64_t* slots = (int64_t*)ptr;
+            for (int64_t i = 1; i < nslots; i++)
+                nova_rc_dec_internal(slots[i]);
+            free((char*)ptr - NOVA_RC_HDR_SIZE);
+            break;
+        }
         default:
             free((char*)ptr - NOVA_RC_HDR_SIZE);
             break;
