@@ -78,26 +78,33 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 - *Verify (per stage):* reconverge `gen5.ll==gen6.ll` + 403 each stage; final = a float-array sum/map
   loop beats serial C with no unroll bloat. Effort L (multi-iteration). Soundness-sensitive.
 
-**[P3] Growable fiber stacks (beat Erlang/Go on scale). ⚠️ BLOCKED on overflow-safety (iter-13 workflow). MUST stage.**
+**[P3] Growable fiber stacks (beat Erlang/Go on scale). Stage 0 DONE (fb73d6e). Stage 1 = the density win.**
 - *Problem:* fixed 32KB fiber stacks → ~30k tasks/GB (BEAM ~300 B/proc). "Millions of processes" not
   yet real.
 - *Iter-13 workflow finding (num_clean=0, severity major):* the obvious win (Win CreateFiberEx
-  small-commit/large-reserve → ~4× more tasks/GB committed) is NOT soundly landable yet because the
-  overflow backstop is BROKEN: ⚠️ the Win handler `nova_fiber_overflow_handler` does `longjmp` from a
-  VEH = **undefined behavior** (MSDN); the software call-depth guard (`nova_rt_stack_enter`) is **dead
-  code** (compiler never emits it); POSIX has **no SIGSEGV/sigaltstack handler** (guard fault = crash);
-  and `nova_deep_copy_rec`'s depth guard (10000) is mis-sized for the 32KB fiber stack (1.2MB > 32KB →
-  a deeply-nested value sent on a channel from a green task OVERFLOWS → hits the VEH-UB).
-- *SOUND STAGED PATH (do in this order):* **Stage 0 (overflow safety FIRST):** Win overflow handler
-  VEH+longjmp → `__try/__except`(EXCEPTION_STACK_OVERFLOW) inside `nova_fiber_entry` (+ `_resetstkoflw`);
-  POSIX SIGSEGV + `sigaltstack` handler routing guard-page faults to a clean per-fiber panic; recalibrate
-  the deep_copy guard CONTEXT-AWARE (~200 on a fiber via `nova_sched_in_task()`, 10000 on main → no
-  isolation regression). **Stage 1 (then the win):** `CreateFiberEx(small commit, ≥32KB reserve)` on Win
-  for ~4× more tasks/GB committed (≈Go-initial density). BEAM's 300 B/proc needs stackless coroutines —
-  a separate, much larger effort.
-- *Verify:* induce a green-task stack overflow → clean recovery (no UB/crash, carrier continues); green
-  tests + green_scale still pass; 407; a commit-charge measurement (spawn N tasks, read process
-  PrivateMemorySize) shows the reduction. Effort L, soundness-CRITICAL.
+  small-commit/large-reserve → ~4× more tasks/GB committed) was NOT soundly landable because the overflow
+  backstop was BROKEN: the Win VEH did `longjmp` (UB), POSIX had no SIGSEGV handler, and the deep_copy
+  depth guard was mis-sized (10000 >> the ~150-300 a 32KB stack holds → a deep channel-send OVERFLOWED).
+- ✅ **Stage 0 DONE — iter 16 (fb73d6e), overflow safety SOUND on Windows:** Win VEH neutralized to a
+  no-op `CONTINUE_SEARCH`; real recovery is `__try/__except(EXCEPTION_STACK_OVERFLOW)` around the user-fn
+  call in `nova_fiber_entry` + `_resetstkoflw` (empirically verified to recover from a real 32KB overflow
+  and to unwind through NOVA `uwtable` frames; software longjmp inside `__try` still lands at setjmp). The
+  deep_copy guard is now CONTEXT-AWARE — 64 on a fiber / 10000 on the main OS stack, by FIBER IDENTITY
+  (`nova_current_fiber != carrier`, immune to `nova_rt_stack_set_max()` which the adversary showed breaks
+  a `stack_max` heuristic) — and PANICS (contained) instead of the old share-on-overflow (an isolation
+  hole). VEH install made atomic. Both vectors are now clean contained crashes (carrier survives). Guard:
+  `overflow_recovery_test` (a recursion-overflow task + a deep-copy-overflow task both contained while 5
+  workers complete; exit 0). 408/408, reconverged 24CE520B.
+  - **Still deferred (own iteration):** POSIX `sigaltstack`+SIGSEGV recovery — cannot be runtime-verified
+    on the Windows build and needs the adversary's fixes (cache page size out of the handler; widen the
+    guard-fault range for large stack frames; atomic install; macOS SIGBUS). POSIX overflow stays defined
+    process-death until then. Iterative (unbounded-depth) `nova_deep_copy_rec` is a separate hardening.
+- *Stage 1 (now soundly landable — the density win):* `CreateFiberEx(small commit, ≥32KB reserve)` on Win
+  for ~4× more tasks/GB committed (≈Go-initial density); the SEH backstop makes the smaller commit safe.
+  BEAM's 300 B/proc needs stackless coroutines — a separate, much larger effort.
+- *Verify:* induce a green-task stack overflow → clean recovery (DONE); green tests + green_scale still
+  pass (DONE); 408; for Stage 1, a commit-charge measurement (spawn N tasks, read PrivateMemorySize)
+  shows the reduction. Effort L, soundness-CRITICAL.
 
 ### Tier 2 — distribution (beat Erlang) + comptime (beat Zig/C)
 
