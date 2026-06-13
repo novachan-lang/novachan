@@ -62,13 +62,11 @@ fn cluster_leave(info)
 // {"ok": false, "error": msg} if there is no live peer or it is unreachable. Never blocks on a
 // DEAD peer: a failed connect and a socket-EOF (the peer process died) both short-circuit to an
 // error; only a hung-but-alive peer could block awaiting its reply (recv-timeout is future).
-fn cluster_spawn(info, fn_name, fn_args)
-    let live = cluster_alive(info)
-    let self_addr = info["self"]
-    let target = ""
-    for m in live
-        if m != self_addr
-            target = m
+// Run fn_name(fn_args) on a SPECIFIC target addr. The reusable core of cluster_spawn/pmap:
+// connect → send the spawn request → recv the result. Always RETURNS (never an infinite park):
+// a failed connect and a socket-EOF (peer process died) both short-circuit to an error, so a
+// dead target cannot hang a caller — only a hung-but-alive peer could (recv-timeout is future).
+fn _spawn_to(target, fn_name, fn_args)
     if target == ""
         return {"ok": false, "error": "no live peer"}
     let parts = split(target, ":")
@@ -81,6 +79,62 @@ fn cluster_spawn(info, fn_name, fn_args)
     if reply == 0
         return {"ok": false, "error": "peer closed before replying: " + target}
     {"ok": true, "value": reply["value"], "node": target}
+
+fn cluster_spawn(info, fn_name, fn_args)
+    let live = cluster_alive(info)
+    let self_addr = info["self"]
+    let target = ""
+    for m in live
+        if m != self_addr
+            target = m
+    _spawn_to(target, fn_name, fn_args)
+
+// One pmap task: run on its assigned peer, then send the INDEX-TAGGED result on the shared gather
+// channel. Spawned as its own green task so a slow/dead peer only stalls ITS slot, not the batch
+// (channels are reference-shared across spawn — same as _gossip_once → the manager).
+fn _pmap_worker(result_ch, idx, target, fn_name, task_args)
+    let r = _spawn_to(target, fn_name, task_args)
+    send(result_ch, {"idx": idx, "result": r})
+
+// Distributed scatter-gather (the point of a cluster: run the whole batch across the membership
+// AT ONCE). Distributes args_list round-robin over the LIVE peers, runs every task concurrently,
+// and gathers results IN INPUT ORDER (each worker tags its slot index; the gatherer places by
+// index regardless of completion order). Returns {"ok": true, "values": [<per-task result>...]}
+// where each per-task result is itself {"ok":bool, "value"|"error":..} — so one failed/dead peer
+// produces an error in ITS slot WITHOUT sinking the rest of the batch. No live peer / empty input
+// short-circuit; a dead peer mid-batch cannot hang the gather (every _spawn_to returns).
+fn cluster_pmap(info, fn_name, args_list)
+    let n = len(args_list)
+    if n == 0
+        return {"ok": true, "values": []}
+    let live = cluster_alive(info)
+    let self_addr = info["self"]
+    let peers = []
+    for m in live
+        if m != self_addr
+            push(peers, m)
+    if len(peers) == 0
+        return {"ok": false, "error": "no live peer"}
+    let result_ch = channel()
+    let i = 0
+    let pidx = 0
+    while i < n
+        spawn _pmap_worker(result_ch, i, peers[pidx], fn_name, args_list[i])
+        pidx = pidx + 1
+        if pidx >= len(peers)
+            pidx = 0
+        i = i + 1
+    let slots = []
+    let j = 0
+    while j < n
+        push(slots, 0)                       // placeholders so index-set lands IN ORDER
+        j = j + 1
+    let got = 0
+    while got < n
+        let msg = receive(result_ch)         // exactly n arrive (every worker sends once)
+        slots[msg["idx"]] = msg["result"]
+        got = got + 1
+    {"ok": true, "values": slots}
 
 // ── membership manager actor (single owner of the set + last-seen) ───────────
 

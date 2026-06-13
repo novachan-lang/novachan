@@ -4662,14 +4662,21 @@ static void nova_sched_park_sleep(int64_t ms) {
    FDs are ready. Returns the count of tasks woken. */
 static int nova_sched_poll_io(int timeout_ms) {
     if (!nova_io_waiters) return 0;
-    fd_set rfds, wfds;
+    fd_set rfds, wfds, efds;
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
+    FD_ZERO(&efds);
     int maxfd = 0;
     nova_sched_lock();
     for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
         if (w->events & NOVA_POLL_READ)  FD_SET(w->fd, &rfds);
-        if (w->events & NOVA_POLL_WRITE) FD_SET(w->fd, &wfds);
+        /* A non-blocking connect parks on POLL_WRITE: success shows in writefds, but on Windows
+           a FAILURE (e.g. ECONNREFUSED — peer down) shows ONLY in exceptfds, so watch both — else
+           a connect to a dead/refused peer never wakes and the green task parks forever (a hang in
+           cluster_spawn/pmap/remote_spawn/any distributed code). On POSIX a failed connect already
+           surfaces in writefds (so this is a no-op there); exceptfds on a stream socket signals
+           only TCP OOB, which NOVA never sends — a stray OOB wake just retries send() and re-parks. */
+        if (w->events & NOVA_POLL_WRITE) { FD_SET(w->fd, &wfds); FD_SET(w->fd, &efds); }
 #ifndef _WIN32
         if ((int)w->fd > maxfd) maxfd = (int)w->fd;
 #endif
@@ -4679,9 +4686,9 @@ static int nova_sched_poll_io(int timeout_ms) {
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
 #ifdef _WIN32
-    int n = select(0, &rfds, &wfds, NULL, &tv);
+    int n = select(0, &rfds, &wfds, &efds, &tv);
 #else
-    int n = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
+    int n = select(maxfd + 1, &rfds, &wfds, &efds, &tv);
 #endif
     if (n <= 0) return 0;
     int woken = 0;
@@ -4691,7 +4698,7 @@ static int nova_sched_poll_io(int timeout_ms) {
         NovaIOWaiter* w = *pp;
         int ready = 0;
         if ((w->events & NOVA_POLL_READ)  && FD_ISSET(w->fd, &rfds))  ready = 1;
-        if ((w->events & NOVA_POLL_WRITE) && FD_ISSET(w->fd, &wfds)) ready = 1;
+        if ((w->events & NOVA_POLL_WRITE) && (FD_ISSET(w->fd, &wfds) || FD_ISSET(w->fd, &efds))) ready = 1;
         if (ready) {
             *pp = w->next;
             w->task->status = 0;
@@ -8829,9 +8836,14 @@ static int nova_remote_io(int64_t sock_val, char* buf, int len, int writing) {
         if (green) {
             nova_sched_park_io(sock_val, writing ? NOVA_POLL_WRITE : NOVA_POLL_READ);
         } else {
-            fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
-            if (writing) select((int)s + 1, NULL, &fds, NULL, NULL);
-            else         select((int)s + 1, &fds, NULL, NULL, NULL);
+            /* Non-green blocking fallback: also watch exceptfds so a connection error (Windows
+               signals it there, not in read/write-fds) wakes us instead of parking forever — the
+               retried send()/recv() then surfaces the real errno. Same fix as the green netpoller
+               (nova_sched_poll_io); harmless on POSIX (exceptfds there = OOB, never sent). */
+            fd_set fds, efds; FD_ZERO(&fds); FD_ZERO(&efds);
+            FD_SET(s, &fds); FD_SET(s, &efds);
+            if (writing) select((int)s + 1, NULL, &fds, &efds, NULL);
+            else         select((int)s + 1, &fds, NULL, &efds, NULL);
         }
     }
     return 0;
