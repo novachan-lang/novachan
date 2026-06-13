@@ -17,7 +17,7 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 | **C++** | templates, RAII, zero-cost | RAII=`defer`+RC; operators=traits; generics+inference; **no template/UB/45-min-compile complexity** | monomorphic native-ABI specialization (narrow perf) |
 | **Rust** | safety w/o GC | process isolation = same safety (no data races/UAF/null), **zero annotations**, no borrow-checker fight | COW-on-send (cut deep-copy cost) — perf, not safety |
 | **Go** | M:N concurrency, fast compile | M:N work-stealing scheduler; typed channels+select+spawn; **+supervisors/monitors Go lacks** | faster incremental compile; growable stacks |
-| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real | distribution (`remote_spawn`+clustering); growable stacks (millions); hot code swap |
+| **Erlang/Elixir** | fault tolerance, millions of procs, distribution | supervisor **one_for_one/all/rest_for_one** (cfacc52), monitor, let-it-crash; green sched 10k/382ms; remote_* channels real; **remote_spawn + function-by-name registry done (51d7d76)** | node clustering/discovery (multi-node); growable stacks (millions); hot code swap |
 | **Python** | simplicity, REPL | as readable, **zero annotations, 50-100× faster**; comprehensions; huge stdlib | REPL (OrcJIT) |
 | **Java** | reflection, no-warmup JIT | reflection (field_names/types/type_name) done; **AOT > JIT (no warmup), no NPE (Option)** | — (ecosystem is not a language gap) |
 | **JavaScript** | browser reach, async | green scheduler = async with **no colored functions**; typed channels > promises | **WASM target** (real f64/calls/memory runtime) |
@@ -90,14 +90,22 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 
 ### Tier 2 — distribution (beat Erlang) + comptime (beat Zig/C)
 
-**[P4] `remote_spawn` + node clustering (beat Erlang distribution).**
-- *Problem:* remote_* channels (TCP+JSON, green-aware) are REAL; `remote_spawn` is a type-stub
-  (blocked by no function-by-name lookup).
-- *NOVA way:* a function registry (name→fn ptr) so a closure can be sent + resolved remotely;
-  `remote_spawn(node, fn, args) -> channel` over the existing transport; node discovery + reconnection/
-  heartbeat; process isolation holds across the wire (deep-copied args, channels shared).
-- *Where:* remote_* runtime fns; make_closure/trampoline; spawn lowering; a registered-fn table.
-- *Verify:* a 2-node round-trip spawning a remote task; remote_* tests still pass; 403. Effort L.
+**[P4] ✅ DONE (51d7d76) — `remote_spawn` + function-by-name registry (beat Erlang distribution, core).**
+- *Was:* remote_* channels (TCP+JSON, green-aware) REAL; `remote_spawn` a type-stub (no function-by-name
+  lookup).
+- *NOVA way (shipped):* a function registry (name→fn ptr+arity) built once at @main init, single-
+  threaded before the scheduler → IMMUTABLE after → lock-free reads. `nova_rt_call_by_name(name, args)`
+  resolves + unboxes args + applies via an all-i64 arity switch (0..8); names work as literal (raw .str)
+  or JSON-decoded fat string (strcmp). `remote_spawn(conn, name, args)` sends `[name, args]` over the
+  existing transport (JSON = deep-copy → process isolation across the wire), returns the reply channel;
+  the peer's dispatch loop is plain NOVA (`call_by_name(req[0], req[1])`). Registration is gated on
+  `ire_uses_byname` so non-distributed programs (incl. the compiler) pay nothing / no needless address-
+  taking.
+- *Verified:* call_by_name_test (registry + dynamic apply 0/1/2) + remote_spawn_test (localhost round-
+  trip: requester → remote_spawn → server resolves `add` by name → 42). 405/405; reconverged 2B051F29.
+- *Remaining for full Erlang-class distribution (future):* multi-node clustering / discovery /
+  reconnection-heartbeat; arity > 8; float-arg ABI nuance (args unboxed → raw double bits, fine for
+  raw-float params).
 
 **[P5] Const-eval expansion (beat Zig/C comptime). [SCOPED 2026-06-13 — needs new global infra.]**
 - *Problem (confirmed in IR):* scalar consts (`const TAU = PI*2`) already fold via inline-expr +
