@@ -50,16 +50,33 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 - *Note:* construction-heavy loops (reconstruct structs each iter) are still ~3.8× C — that is the
   separate per-iter-alloc + i64-handle ABI gap (floatlist-raw P2 / Stage-5 native-ABI), NOT P1.
 
-**[P2] floatlist-raw + auto-vectorization (beat C on array math / SIMD).**
+**[P2] floatlist-raw + auto-vectorization (beat C on array math / SIMD). ⚠️ DEFERRED — value-model-overhaul-class, must be STAGED (do NOT rush in one iteration).**
 - *Problem:* `intlist` is a raw `i64[]` C-array (fast); `floatlist` is BOXED → no SIMD. NOVA emits no
   vectorize hints (past 693×-unroll incident).
-- *NOVA way:* a raw `double[]` backing for homogeneous float lists (NovaList element-kind tag), + safe
-  `align`/`!noalias`/`!tbaa` metadata on typed-array loads so LLVM's loop vectorizer fires WITHOUT
-  manual unroll hints. The compiler auto-vectorizes loops the dev never annotated.
-- *Where:* NovaList struct + element-kind tag (runtime); floatlist creation/index_get/append; the
-  for-over-list lowering; array load emission.
-- *Verify:* a float-array sum/map loop vectorizes (asm shows `addpd`/`mulpd`) + beats serial C; no
-  unroll bloat; 403; reconverge. Effort L.
+- *Why deferred (2026-06-13 audit):* the runtime invariant is **"a float in ANY collection is always
+  BOXED"** — `nova_rt_unbox_elem` keeps floats boxed precisely so a list is valid as `any` everywhere
+  (the slow generic path degrades to correct-but-slow, never corruption). A raw `double[]` backing
+  BREAKS that invariant across **147 `->data[i]` element-read sites**, and there is **NO runtime
+  element-kind tag today** (intlist needs none — a raw i64 is also a valid `any` int; a raw double is
+  NOT a valid `any` float). So raw-f64 storage requires a runtime tag that EVERY generic reader
+  consults (box-on-read for f64) — changing a load-bearing value-model invariant. Rushing it risks
+  silent corruption that passes 403 but is a latent CVE. This is the SAME class as the int/float
+  value-model fix that was explicitly staged A/B with the regression as oracle.
+- *NOVA way (sound STAGED design for the dedicated effort):*
+  - *Stage A:* add an element-kind tag to `NovaList` (append `tag@+24` AFTER `data@0/size@+8/cap@+16`
+    so `nova_mem_find_tag`'s structural offset reads are unchanged); default tag = current behavior;
+    NO behavior change. Reconverge + 403 (proves the field is inert).
+  - *Stage B:* floatlist creation sets tag=RAW_F64 + a `double[]` backing; the SINGLE generic-read
+    choke-points (`nova_rt_index_get`, and the value-extraction used by ops) **box-on-read** when the
+    list is RAW_F64 (so all 147 sites stay correct — slow generic path boxes, never corrupts). Movers
+    (slice/reverse/concat/copy) just relocate bits + propagate the tag. Append stores raw double for a
+    float, else PROMOTES the list to boxed. The hard part is the per-site audit: every site that
+    *interprets* (not just moves) an element must respect the tag.
+  - *Stage C:* fast typed path — the emitter's floatlist `index_get` / `for`-over-floatlist reads raw
+    `double` directly (no box) with `align`/`!noalias`/`!tbaa` so LLVM's loop vectorizer auto-fires
+    (NEVER add unroll.enable/vectorize.enable — the 693× incident). asm shows `addpd`/`mulpd`.
+- *Verify (per stage):* reconverge `gen5.ll==gen6.ll` + 403 each stage; final = a float-array sum/map
+  loop beats serial C with no unroll bloat. Effort L (multi-iteration). Soundness-sensitive.
 
 **[P3] Growable/segmented fiber stacks (beat Erlang/Go on process scale).**
 - *Problem:* fixed 32KB fiber stacks → ~30k tasks/GB (BEAM ~300 B/proc). "Millions of processes" not
@@ -82,14 +99,25 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 - *Where:* remote_* runtime fns; make_closure/trampoline; spawn lowering; a registered-fn table.
 - *Verify:* a 2-node round-trip spawning a remote task; remote_* tests still pass; 403. Effort L.
 
-**[P5] Const-eval expansion (beat Zig/C comptime).**
-- *Problem:* const-eval is integer-only, intra-block. LLVM already folds simple const arithmetic, so
-  the NOVA win is compile-time evaluation of things LLVM can't: build a `const` lookup table by
-  running a NOVA fn at compile time.
-- *NOVA way:* a small AST interpreter over `const` blocks (literals/arithmetic/const-fn-calls) →
-  bake the result as a literal/array. NOT C++ constexpr complexity — "if it's all-const, evaluate now."
-- *Where:* `ti_const_eval` (~10641) + a const-block lowering that emits the computed literal.
-- *Verify:* a const lookup table has zero runtime construction cost; 403. Effort M.
+**[P5] Const-eval expansion (beat Zig/C comptime). [SCOPED 2026-06-13 — needs new global infra.]**
+- *Problem (confirmed in IR):* scalar consts (`const TAU = PI*2`) already fold via inline-expr +
+  LLVM. But a `const` AGGREGATE is stored as an expr (`b.ir_consts[name]=expr`) and **re-lowered at
+  EVERY use** (ir_lower_expr at ~L7027) — so `const TABLE=[1,4,9,16,25]` is REBUILT from scratch on
+  every reference (verified: use1 builds it, use2 rebuilds it; in a hot loop it rebuilds per
+  iteration). Where C/Zig/Rust bake the table into `.rodata`, NOVA reconstructs it every time.
+- *NOVA way:* bake a const aggregate ONCE. NOVA has **no cross-function value globals today** (consts
+  use inline-expr precisely because there's no global slot), so this needs NEW infra:
+  (1) a module global `@nova.const.N = internal global i64 0`; (2) build each bakeable const once in
+  the `@nova_main` prologue (single-threaded, before any `spawn` → race-free, no lazy-init race);
+  (3) a `global_load` IR op (type = the const's type, pure) so use-sites load the global instead of
+  re-lowering. Restrict v1 to consts whose elements are non-aggregate const exprs (avoids
+  aggregate-of-aggregate init ordering).
+- *Where:* const-decl collection (~L15534) flags bakeable aggregates; ir_lower_expr const-ident
+  resolution (~L7027) emits `global_load`; new IR op threaded through infer/fold/optimizer/emitter;
+  main-prologue init + global decls in the emitter. Effort M, broad-but-shallow surface.
+- *Verify:* a const table built once (IR shows ONE list_create across all uses) + a hot loop over it
+  doesn't rebuild; 403; reconverge. NOTE: lower-impact than the reach/scale items — Zig-comptime is
+  niche and NOVA already has scalar const folding.
 
 ### Tier 3 — reach (beat JS browser, Python REPL) — biggest, last
 
