@@ -2185,6 +2185,46 @@ int64_t nova_rt_ord(int64_t s) {
     return (int64_t)(unsigned char)p[0];
 }
 
+/* Character-class predicates: classify the FIRST byte of the string (empty -> 0/false).
+   ASCII-range, mirror nova_rt_ord's first-byte read. These are exposed as builtins; a user
+   program (or the compiler) that defines its own fn of the same name shadows the builtin. */
+int64_t nova_rt_is_space(int64_t s) {
+    const char* p = (const char*)(uintptr_t)s;
+    if (!p || !*p) return 0;
+    unsigned char c = (unsigned char)p[0];
+    return (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f') ? 1 : 0;
+}
+int64_t nova_rt_is_upper(int64_t s) {
+    const char* p = (const char*)(uintptr_t)s;
+    if (!p || !*p) return 0;
+    unsigned char c = (unsigned char)p[0];
+    return (c >= 'A' && c <= 'Z') ? 1 : 0;
+}
+int64_t nova_rt_is_lower(int64_t s) {
+    const char* p = (const char*)(uintptr_t)s;
+    if (!p || !*p) return 0;
+    unsigned char c = (unsigned char)p[0];
+    return (c >= 'a' && c <= 'z') ? 1 : 0;
+}
+int64_t nova_rt_is_digit(int64_t s) {
+    const char* p = (const char*)(uintptr_t)s;
+    if (!p || !*p) return 0;
+    unsigned char c = (unsigned char)p[0];
+    return (c >= '0' && c <= '9') ? 1 : 0;
+}
+int64_t nova_rt_is_alpha(int64_t s) {
+    const char* p = (const char*)(uintptr_t)s;
+    if (!p || !*p) return 0;
+    unsigned char c = (unsigned char)p[0];
+    return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) ? 1 : 0;
+}
+int64_t nova_rt_is_alnum(int64_t s) {
+    const char* p = (const char*)(uintptr_t)s;
+    if (!p || !*p) return 0;
+    unsigned char c = (unsigned char)p[0];
+    return ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) ? 1 : 0;
+}
+
 int64_t nova_rt_chr(int64_t n) {
     char* buf = (char*)nova_heap_alloc(2, NOVA_MEM_RAW);
     if (!buf) return 0;
