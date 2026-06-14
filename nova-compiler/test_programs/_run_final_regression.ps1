@@ -171,6 +171,7 @@ $domain_tests = @(
     'tensor_activations_test',
     'tensor_ops_test',
     'mlp_inference_test',
+    'wasm_grow_test',
     'int_ptr_soundness_repro',
     'str_identity_test',
     'struct_rc_test',

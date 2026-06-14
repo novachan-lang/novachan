@@ -16762,8 +16762,10 @@ int64_t nova_rt_wasm_compile(int64_t path_val) {
    arithmetic/bitwise set (add/sub/mul/div/rem/and/or/xor/shl/shr/, signed+unsigned);
    drop/select/nop; and structured control flow (block/loop/if/else/br/br_if/return)
    resolved by a one-pass bracket-matching pre-scan. Real execution of real control
-   flow — a loop/branch program runs correctly. TODO: calls, memory, i64/f32/f64,
-   br_table. Returns the i32 result of function 0; -1 on parse/opcode error. */
+   flow — a loop/branch program runs correctly. Also implemented: calls (0x10),
+   linear memory load/store + memory.size/memory.grow (0x28-0x40), i64/f32/f64 ops,
+   and br_table (0x0E). Remaining gap: imported/host functions. Returns the i32
+   result of function 0; -1 on parse/opcode error. */
 
 static uint64_t wasm_uleb(const unsigned char* b, size_t len, size_t* pos);
 static int64_t  wasm_sleb(const unsigned char* b, size_t len, size_t* pos);
@@ -16934,7 +16936,28 @@ static int64_t wasm_exec(WasmMod* m, int funcidx, const int64_t* args, int nargs
         else if (op == 0x3A) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<2){ok=0;break;} int32_t v=(int32_t)stack[--sp]; uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+1>m->mem_size){ok=0;break;} m->mem[ea]=(unsigned char)(v&0xFF); } /* i32.store8 */
         else if (op == 0x3B) { wasm_uleb(b,len,&cp); uint64_t off=wasm_uleb(b,len,&cp); if(sp<2){ok=0;break;} int32_t v=(int32_t)stack[--sp]; uint32_t a=(uint32_t)stack[--sp]; size_t ea=(size_t)a+off; if(!m->mem||ea+2>m->mem_size){ok=0;break;} uint16_t h=(uint16_t)(v&0xFFFF); memcpy(m->mem+ea,&h,2); } /* i32.store16 */
         else if (op == 0x3F) { if (cp < body_end) cp++; if (sp < 1024) stack[sp++] = (int64_t)(m->mem_size / 65536); }                              /* memory.size (pages) */
-        else if (op == 0x40) { if (cp < body_end) cp++; if (sp > 0) sp--; if (sp < 1024) stack[sp++] = -1; }                                        /* memory.grow: unsupported → -1 */
+        else if (op == 0x40) {                                                                                                                       /* memory.grow(delta_pages) -> prev_pages | -1 */
+            if (cp < body_end) cp++;                                  /* reserved memory-index byte */
+            if (sp < 1) { ok = 0; break; }
+            uint32_t delta = (uint32_t)stack[--sp];                   /* pages to add */
+            uint64_t old_pages = (uint64_t)(m->mem_size / 65536);
+            if (delta == 0) { if (sp < 1024) stack[sp++] = (int64_t)old_pages; }   /* grow-by-0 = current size, no realloc */
+            else {
+                uint64_t new_size = (old_pages + (uint64_t)delta) * 65536ULL;       /* 64-bit math: no overflow for capped sizes */
+                if (new_size > (uint64_t)256 * 1024 * 1024) {                       /* sane cap matches nova_rt_wasm_run init */
+                    if (sp < 1024) stack[sp++] = -1;                                /* spec grow-failure value */
+                } else {
+                    unsigned char* nm = (unsigned char*)realloc(m->mem, (size_t)new_size);
+                    if (!nm) { if (sp < 1024) stack[sp++] = -1; }                   /* OOM: m->mem/mem_size left intact */
+                    else {
+                        size_t old_size = (size_t)(old_pages * 65536ULL);
+                        memset(nm + old_size, 0, (size_t)new_size - old_size);      /* new pages are zero-initialized */
+                        m->mem = nm; m->mem_size = (size_t)new_size;
+                        if (sp < 1024) stack[sp++] = (int64_t)old_pages;            /* spec: return previous size in pages */
+                    }
+                }
+            }
+        }
         else if (op == 0x6A) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x+y); }
         else if (op == 0x6B) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x-y); }
         else if (op == 0x6C) { if(sp<2){ok=0;break;} int32_t y=(int32_t)stack[--sp],x=(int32_t)stack[--sp]; stack[sp++]=(int32_t)(x*y); }
