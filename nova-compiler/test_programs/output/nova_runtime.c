@@ -13281,13 +13281,31 @@ void nova_rt_register_fn(int64_t name_val, int64_t fn_ptr, int64_t arity) {
    (nova_rt_unbox: box->payload, raw passes through) so a JSON-decoded list of
    ints applies correctly to an int-parameter function. The all-i64 calling
    convention lets us cast the registered pointer to the matching arity. */
+/* Chained int64_t-list macros so the arity-cast type lists below cannot miscount: each
+   builds on the previous, so NOVA_IN expands to exactly N comma-separated int64_t. */
+#define NOVA_I1  int64_t
+#define NOVA_I2  NOVA_I1,int64_t
+#define NOVA_I3  NOVA_I2,int64_t
+#define NOVA_I4  NOVA_I3,int64_t
+#define NOVA_I5  NOVA_I4,int64_t
+#define NOVA_I6  NOVA_I5,int64_t
+#define NOVA_I7  NOVA_I6,int64_t
+#define NOVA_I8  NOVA_I7,int64_t
+#define NOVA_I9  NOVA_I8,int64_t
+#define NOVA_I10 NOVA_I9,int64_t
+#define NOVA_I11 NOVA_I10,int64_t
+#define NOVA_I12 NOVA_I11,int64_t
+#define NOVA_I13 NOVA_I12,int64_t
+#define NOVA_I14 NOVA_I13,int64_t
+#define NOVA_I15 NOVA_I14,int64_t
+#define NOVA_I16 NOVA_I15,int64_t
 int64_t nova_rt_call_by_name(int64_t name_val, int64_t args_handle) {
     const char* name = (const char*)(uintptr_t)name_val;
     if (!name) { nova_set_error("call_by_name: null function name"); return 0; }
     NovaList* args = (NovaList*)(uintptr_t)args_handle;
     int n = args ? (int)args->size : 0;
-    if (n > 8) { nova_set_error("call_by_name: more than 8 arguments not supported"); return 0; }
-    int64_t ua[8];
+    if (n > 16) { nova_set_error("call_by_name: more than 16 arguments not supported"); return 0; }
+    int64_t ua[16];
     for (int k = 0; k < n; k++) ua[k] = nova_rt_unbox(args->data[k]);
     for (int i = 0; i < g_fn_count; i++) {
         if (strcmp(g_fn_names[i], name) != 0) continue;
@@ -13297,20 +13315,44 @@ int64_t nova_rt_call_by_name(int64_t name_val, int64_t args_handle) {
         }
         void* f = g_fn_ptrs[i];
         switch (n) {
-            case 0: return ((int64_t(*)(void))f)();
-            case 1: return ((int64_t(*)(int64_t))f)(ua[0]);
-            case 2: return ((int64_t(*)(int64_t,int64_t))f)(ua[0],ua[1]);
-            case 3: return ((int64_t(*)(int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2]);
-            case 4: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3]);
-            case 5: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4]);
-            case 6: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5]);
-            case 7: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6]);
-            case 8: return ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7]);
+            case 0:  return ((int64_t(*)(void))f)();
+            case 1:  return ((int64_t(*)(NOVA_I1 ))f)(ua[0]);
+            case 2:  return ((int64_t(*)(NOVA_I2 ))f)(ua[0],ua[1]);
+            case 3:  return ((int64_t(*)(NOVA_I3 ))f)(ua[0],ua[1],ua[2]);
+            case 4:  return ((int64_t(*)(NOVA_I4 ))f)(ua[0],ua[1],ua[2],ua[3]);
+            case 5:  return ((int64_t(*)(NOVA_I5 ))f)(ua[0],ua[1],ua[2],ua[3],ua[4]);
+            case 6:  return ((int64_t(*)(NOVA_I6 ))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5]);
+            case 7:  return ((int64_t(*)(NOVA_I7 ))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6]);
+            case 8:  return ((int64_t(*)(NOVA_I8 ))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7]);
+            case 9:  return ((int64_t(*)(NOVA_I9 ))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8]);
+            case 10: return ((int64_t(*)(NOVA_I10))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9]);
+            case 11: return ((int64_t(*)(NOVA_I11))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9],ua[10]);
+            case 12: return ((int64_t(*)(NOVA_I12))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9],ua[10],ua[11]);
+            case 13: return ((int64_t(*)(NOVA_I13))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9],ua[10],ua[11],ua[12]);
+            case 14: return ((int64_t(*)(NOVA_I14))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9],ua[10],ua[11],ua[12],ua[13]);
+            case 15: return ((int64_t(*)(NOVA_I15))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9],ua[10],ua[11],ua[12],ua[13],ua[14]);
+            case 16: return ((int64_t(*)(NOVA_I16))f)(ua[0],ua[1],ua[2],ua[3],ua[4],ua[5],ua[6],ua[7],ua[8],ua[9],ua[10],ua[11],ua[12],ua[13],ua[14],ua[15]);
         }
     }
     nova_set_error("call_by_name: unknown function name");
     return 0;
 }
+#undef NOVA_I1
+#undef NOVA_I2
+#undef NOVA_I3
+#undef NOVA_I4
+#undef NOVA_I5
+#undef NOVA_I6
+#undef NOVA_I7
+#undef NOVA_I8
+#undef NOVA_I9
+#undef NOVA_I10
+#undef NOVA_I11
+#undef NOVA_I12
+#undef NOVA_I13
+#undef NOVA_I14
+#undef NOVA_I15
+#undef NOVA_I16
 
 /* ── Const-aggregate cache (compile-time-baked immutable constants) ───────────
    A top-level `const` list literal is built ONCE in the @main prologue (single-
