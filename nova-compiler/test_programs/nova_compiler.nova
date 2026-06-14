@@ -16782,18 +16782,29 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
         // declarations. The build script greps these and adds -l<libname> to
         // clang. Dedupe so the same lib only appears once.
         let seen_libs = {}
+        let seen_src = {}
+        let seen_obj = {}
         for ext_stmt in b.ir_externs
             match ext_stmt
                 Stmt(elt, eln, elexpr, elbody, elparams, eleselse, elann, elsline) =>
                     for ea in elann
                         match ea
                             Expr(eat, eav, ean2, eac, eaf, eal) =>
-                                if eat == "ann_with_arg" and eav == "link" and len(eac) > 0
+                                if eat == "ann_with_arg" and len(eac) > 0
                                     match eac[0]
                                         Expr(satg, sav, san2, sac, saf, sal) =>
-                                            if satg == "str" and not contains(seen_libs, sav)
+                                            // @link("m") -> -lm ; @link_source("foo.c") -> compile+link foo.c
+                                            // on demand ; @link_object("foo.o") -> link a prebuilt object.
+                                            // nova_link consumes these markers. Dedupe each kind.
+                                            if satg == "str" and eav == "link" and not contains(seen_libs, sav)
                                                 seen_libs[sav] = 1
                                                 ire_line(e, "; LINK_LIB: " + sav)
+                                            else if satg == "str" and eav == "link_source" and not contains(seen_src, sav)
+                                                seen_src[sav] = 1
+                                                ire_line(e, "; LINK_SOURCE: " + sav)
+                                            else if satg == "str" and eav == "link_object" and not contains(seen_obj, sav)
+                                                seen_obj[sav] = 1
+                                                ire_line(e, "; LINK_OBJECT: " + sav)
         for ext_stmt in b.ir_externs
             match ext_stmt
                 Stmt(et, en, eexpr, ebody, eparams, eelse, eann, esline) =>
@@ -17619,6 +17630,23 @@ fn nova_find_wasm_runtime() -> string
             return c
     return ""
 
+// Reject paths containing shell-active characters before they are interpolated into a
+// system() command line for @link_source/@link_object. Quoting alone is not safe across
+// cmd.exe AND POSIX sh, so we refuse anything that could break out of the quotes or inject
+// a command at build time. Legitimate C source/object paths use none of these.
+fn _link_path_safe(p: string) -> bool
+    if len(p) == 0
+        return false
+    let bad = ["\"", "'", "`", "$", ";", "|", "&", "<", ">", "(", ")", "*", "?", "^", "%", "!", "\{", "\}", "~", "#", "\n", "\r", "\t"]
+    for c in bad
+        if contains(p, c)
+            return false
+    // '[' and ']' are checked separately: as elements of a list literal they collide
+    // with the literal's own delimiters, but they are equally shell-active (glob).
+    if contains(p, "[") or contains(p, "]")
+        return false
+    return true
+
 fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: string) -> int
     let rt = nova_find_runtime()
     let resolved = resolve_target(target)
@@ -17650,6 +17678,8 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
     // as before (no libssl-dev dependency). POSIX only: Windows uses WinHTTP/bcrypt.
     let needs_ssl = 0
     let needs_sqlite = 0
+    let link_srcs = []
+    let link_objs = []
     for line in ll_lines
         let t = trim(line)
         if starts_with(t, "; LINK_LIB:")
@@ -17660,6 +17690,14 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
             if len(libname) > 0 and not contains(seen, libname)
                 seen[libname] = 1
                 extra_libs = extra_libs + " -l" + libname
+        else if starts_with(t, "; LINK_SOURCE:")
+            let sp = trim(slice(t, 14, len(t)))
+            if len(sp) > 0 and not contains(link_srcs, sp)
+                push(link_srcs, sp)
+        else if starts_with(t, "; LINK_OBJECT:")
+            let op = trim(slice(t, 14, len(t)))
+            if len(op) > 0 and not contains(link_objs, op)
+                push(link_objs, op)
         if contains(line, "call ") and (contains(line, "@nova_rt_tls_") or contains(line, "@nova_rt_http_get"))
             needs_ssl = 1
         if contains(line, "call ") and contains(line, "@sqlite3_")
@@ -17679,6 +17717,36 @@ fn nova_link(ll_path: string, exe_path: string, opt_level: string, target: strin
         if len(read_file(sq_o)) < 100
             system("clang -c -O2 -DSQLITE_THREADSAFE=0 \"" + sq_c + "\" -o \"" + sq_o + "\" -D_CRT_SECURE_NO_WARNINGS -w")
         extra_libs = extra_libs + " \"" + sq_o + "\""
+    // General FFI: @link_source("x.c") compiles each C source on demand into a cached
+    // <src>.o (rebuilt only when the .o is missing or the source is newer -- correct
+    // incremental caching, since a user's foo.c is edited unlike the frozen sqlite
+    // amalgamation). @link_object("x.o") links a prebuilt object directly. Both paths come
+    // from a user string literal interpolated into system(), so each is rejected unless it
+    // is free of shell metacharacters (no build-time command injection) and exists.
+    for sp in link_srcs
+        if not _link_path_safe(sp)
+            print("link error: @link_source path rejected (unsafe characters): " + sp)
+            return 1
+        let src_mt = build_file_mtime(sp)
+        if src_mt < 0
+            print("link error: @link_source file not found: " + sp)
+            return 1
+        let obj = sp + ".o"
+        let obj_mt = build_file_mtime(obj)
+        if obj_mt < 0 or src_mt > obj_mt
+            let rc = system("clang -c -O2 \"" + sp + "\" -o \"" + obj + "\" -D_CRT_SECURE_NO_WARNINGS -w")
+            if rc != 0
+                print("link error: failed to compile @link_source: " + sp)
+                return 1
+        extra_libs = extra_libs + " \"" + obj + "\""
+    for op in link_objs
+        if not _link_path_safe(op)
+            print("link error: @link_object path rejected (unsafe characters): " + op)
+            return 1
+        if build_file_mtime(op) < 0
+            print("link error: @link_object file not found: " + op)
+            return 1
+        extra_libs = extra_libs + " \"" + op + "\""
     cmd = cmd + extra_libs + " -D_CRT_SECURE_NO_WARNINGS 2>&1"
     let ret = system(cmd)
     return ret

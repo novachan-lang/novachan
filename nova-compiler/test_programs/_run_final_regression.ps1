@@ -36,7 +36,7 @@ $core_tests = @(
     'tensor_churn_test','tensor_boxed_float_test','ai_classify_test','json_decode_float_test',
     'read_bytes_test','float_list_ops_test','udp_test','supervisor_test',
     'audio_synth_test','render_test','gpu_vadd_test','unsafe_test',
-    'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_opaque_test','ffi_out_test','ffi_repr_c_test',
+    'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_linksrc_test','ffi_opaque_test','ffi_out_test','ffi_repr_c_test',
     'prof_test','demo_sqlite_test','demo_sqlite_bind_test','sqlitex_test','demo_http_server_test','demo_forge_test','demo_forge_v2_test',
     'demo_forge_todo_test','demo_cortex_serve_test','demo_pulse_test','demo_mesh_test','demo_sentinel_test',
     'demo_ops_test','demo_reactor_test','demo_prism_test','demo_edge_test','demo_full_stack_test','demo_frameworks_v2_test',
@@ -465,6 +465,24 @@ $testScript = {
     $xsrc = ""
     if ((Select-String -Path $ll -Pattern '@sqlite3_' -Quiet) -and (Test-Path $sqPath)) {
         $xsrc = " `"$sqPath`""   # $sqPath is the pre-compiled sqlite3_test.o (fast, reliable link)
+    }
+    # General FFI @link_source/@link_object: the regression links manually (it does not
+    # shell to the compiler's nova_link), so it must honor the same markers nova_link does.
+    # Compile each C source to <src>.o on demand; add prebuilt objects directly. Only the
+    # one test that declares foo.c hits this, so no cross-test race on the object.
+    Get-Content $ll | Where-Object { $_ -match '^; LINK_SOURCE: (.+?)\s*$' } | ForEach-Object {
+        $sp = $matches[1]
+        $obj = "$workDir\$sp.o"
+        if (Test-Path "$workDir\$sp") {
+            if (-not (Test-Path $obj)) {
+                _RunProc $clangExe "-c -O2 `"$workDir\$sp`" -o `"$obj`" -D_CRT_SECURE_NO_WARNINGS -w" 60000 $workDir | Out-Null
+            }
+            $xsrc += " `"$obj`""
+        }
+    }
+    Get-Content $ll | Where-Object { $_ -match '^; LINK_OBJECT: (.+?)\s*$' } | ForEach-Object {
+        $op = $matches[1]
+        if (Test-Path "$workDir\$op") { $xsrc += " `"$workDir\$op`"" }
     }
 
     $la = "-O2 -o `"$exe`" `"$ll`" `"$rtObjPath`"$xsrc $lFlags$xlib -D_CRT_SECURE_NO_WARNINGS -w"
