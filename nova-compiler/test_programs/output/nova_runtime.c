@@ -4019,6 +4019,49 @@ int64_t nova_rt_select_timeout(int64_t list_handle, int64_t timeout_ms) {
     }
 }
 
+/* Non-blocking receive: returns [1, value] if a value was dequeued, else [0, 0]. Never blocks. */
+int64_t nova_rt_try_recv(int64_t handle) {
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    int64_t value = 0;
+    int got = channel_try_recv(ch, &value);
+    int64_t result = nova_rt_list_create();
+    nova_rt_list_append(result, got ? 1 : 0);
+    nova_rt_list_append(result, value);   /* raw dequeued value (mirrors nova_rt_select's [idx,value]); 0 if empty */
+    return result;
+}
+
+/* Non-blocking send: enqueue value if there is room (unbounded, or count < bound) and the channel
+   is open. Returns 1 if sent, 0 if full or closed. Deep-copies the value (process isolation) like
+   nova_rt_channel_send; if not sent, the copy is freed (no leak). */
+int64_t nova_rt_try_send(int64_t handle, int64_t value) {
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    int64_t copy = nova_rt_deep_copy(value);
+    int sent = 0;
+#ifdef _WIN32
+    EnterCriticalSection(&ch->lock);
+    if (!ch->closed && (ch->bound <= 0 || ch->count < ch->bound)) {
+        int was_empty = (ch->count == 0);
+        channel_enqueue(ch, copy);
+        if (was_empty) WakeConditionVariable(&ch->not_empty);
+        nova_sched_wake_one(ch);
+        sent = 1;
+    }
+    LeaveCriticalSection(&ch->lock);
+#else
+    pthread_mutex_lock(&ch->lock);
+    if (!ch->closed && (ch->bound <= 0 || ch->count < ch->bound)) {
+        int was_empty = (ch->count == 0);
+        channel_enqueue(ch, copy);
+        if (was_empty) pthread_cond_signal(&ch->not_empty);
+        nova_sched_wake_one(ch);
+        sent = 1;
+    }
+    pthread_mutex_unlock(&ch->lock);
+#endif
+    if (!sent) nova_rc_dec(copy);
+    return sent;
+}
+
 /* Receive with timeout (milliseconds). Returns value on success,
    -1 on timeout or closed channel. */
 int64_t nova_rt_channel_recv_timeout(int64_t handle, int64_t timeout_ms) {
