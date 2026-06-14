@@ -46,18 +46,18 @@ more HIGH-leverage additive batch, and uniquely it fixes **correctness bugs**, n
 The refuters REFUTED one stale gap (select_try/default — already ships as `select_timeout(ch.., 0)`),
 which is the trap working. Confirmed survivors:
 
-**iter-40 (NEXT) — C-correctness batch, split into two clean ships (soundness-first):**
-1. ★ **Unsigned / logical ops** (HIGH, correctness) — `>>` lowers to `ashr` (arithmetic), so
-   `(1<<63) >> 1` sign-extends to `0xC000…` instead of the logical `0x4000…` → silently WRONG
-   crypto/hash/PRNG. Grep `lshr|udiv|urem|icmp ult` = 0. SHIP as runtime-fn builtins (NOT the audit's
-   `>>>` lexer token — that touches the compiler's own lexer; a builtin is strictly safer + same fix):
-   `ushr/ult/ugt/ule/uge/udiv/urem` (i64 in/out, ucmp→bool; udiv/urem guard ÷0; ushr masks &63 → no UB).
-   Pure additive, reconverge-trivially-safe. ← iter-40.
+**C-correctness batch, split into two clean ships (soundness-first):**
+1. ★ ~~Unsigned / logical ops~~ ✅ DONE (f082232, reconverged A55FDCC5) — `>>` lowered to `ashr`
+   (arithmetic), so `(1<<63) >> 1` sign-extended to `0xC000…` instead of the logical `0x4000…` →
+   silently WRONG crypto/hash/PRNG. Shipped `ushr/ult/ugt/ule/uge/udiv/urem` as runtime-fn builtins
+   (fn + UFCS), NOT the `>>>` lexer token (strictly safer, same fix). All total/no-UB: ushr masks &63,
+   udiv/urem guard ÷0, compares treat i64 as u64. uint_ops_test PROVES the fix (logical vs ashr
+   contrast). 419/419, reconverged byte-identical. The `>>>` infix sugar is deferred ergonomics.
 2. **Typed-width raw memory** (HIGH, correctness) — `nova_rt_ptr_read/write` are hard-coded
    `*(int64_t*)` (8 bytes); grep `offheap_get_f|read_f64` = 0. Can't read a native-width u8/u16/u32/
    f32/f64 field from a C struct / wire buffer without an unsound 8-byte over-read. SHIP
    `ptr_read/write_{u8,i8,u16,i16,u32,i32,u64,f32,f64}` + `offheap_get_f64/set_f64` (tiny C fns,
-   floats bitcast). ← iter-41.
+   floats bitcast). ← iter-41 (NEXT).
 
 **Paper-cut sweep (LOW-MED, follow-up additive pass, each has a workaround):** keyed
 min/max/sorted(key,reverse); timer/ticker channels + set_timeout/interval; ws_connect client;
