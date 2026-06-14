@@ -52,8 +52,27 @@ sites**, never reconstructed for values that arrive already-`any` (json_decode, 
 | **0 — Dark infra** ✅ DONE (92d5c91) | NULL define + 3 singletons + encode NULL arm + RC pin, dead code | **byte-identical 7AF1AF49** (confirmed) | window poisoning, int32 UAF — mitigated (lazy init + range+exact-match RC pin); C harness ODDBALL_OK |
 | **1 — Decode fidelity** ✅ DONE (8520b08) | json_parse_value: null/true/false→singletons; round-trip faithful | **byte-identical 7AF1AF49** (confirmed — compiler never json_decodes during self-compile) | known-partial: container-read still yields 0/1 until Stage 3; json_oracle_test PASS, 422/422 |
 | **2 — Term wire + oracle** ✅ DONE (2a4cce0) | distribution = JSON (already fixed by S1, proven transitively); fixed the SEPARATE binary term codec (NOVA_TT_NULL=7, both directions -- null was mis-encoding as float 0.0); hardened oracle (empty containers, realistic payload, term round-trip) | **byte-identical 7AF1AF49** (confirmed) | done |
-| **3 — General any-read** | bool/null survive a general container read via a DISTINCT seam (NOT a global flip) | **NEW fixpoint** (edits compiler codegen) — the cutover | HIGHEST; needs IR-grep gate + spread_test.nova; separate go/no-go |
-| **4 — Cutover** | make default, lock with permanent fixtures | on the established fixpoint | low if 0-2 only |
+| **3 — General any-read** | ⛔ **DEFERRED (iter-47, evidence-based)** — see below | — | not expressible without redesigning NOVA's null semantics |
+| **4 — Cutover** | ✅ effectively DONE — Stages 0-2 are the shipped deliverable; behavior is already default | byte-identical | none |
+
+### Stage 3 — DEFERRED (grounded by empirical probe, iter-47)
+
+An `anyread_probe.nova` against the live runtime (json_decode `{"a":true,"b":null,"c":0,"d":false}`):
+```
+a==true:1  a==1:1     | b==null:1  b==0:1   | c==0:1  c==null:1
+d==false:1 d==0:1     | null==0:1  false==0:1  true==1:1
+```
+Findings: (1) **bool read-back ALREADY works** — `d["a"]==true` and `d["d"]==false` are true (true/false
+lower to bare i64 1/0, and unbox returns 1/0). (2) **`null` ≡ `0` ≡ `false` is a NOVA LANGUAGE-LEVEL
+identity** — the `null` literal lowers to `const_int 0` (nova_compiler.nova ~7634), so `null==0` is
+literally true. Stage 3's target (`d["meta"]==null` true while `d["count"]==null` false) is therefore
+**not expressible in NOVA today**: it would require changing the `null` literal itself to a distinct
+value, which rewrites null/bool/zero semantics across the entire language (every `==null`, every
+null-sentinel return, the compiler's own `Expr("null")` uses at 177/1000/3600) — a massive, high-
+bootstrap-risk language-semantics change, not a serialization stage. The JSON ROUND-TRIP (the business
+goal) is fully delivered by Stages 0-2; the read-back indistinguishability is a pre-existing language
+property, not a JSON regression. DEFER as a separate language-design question (revisit only if a
+concrete need for a distinct null value arises). **Stages 0-2 = the shipped JSON-native deliverable.**
 
 **GO: Stages 0-2 now** (closes the round-trip blocker — unblocks web-backend identity / WASM-DOM /
 distribution wire — with ZERO compiler change, byte-identical by construction).
