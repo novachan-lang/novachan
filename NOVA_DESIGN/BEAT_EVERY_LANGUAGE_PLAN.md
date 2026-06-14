@@ -382,3 +382,6 @@ genuinely real + verified, BUT the two halves of its own first-download identity
 ★ LESSON: two frontier deliveries (JSON, WASM) were built while the basic `nova run`-a-fresh-project
 floor was broken. The re-audit's "what fails for a REAL first user" check caught it. Fix the floor (C)
 before proving the story (B).
+
+
+**iter-53 UPDATE:** ✅ Option C DONE (79072b4, reconverged 15D5A9D5) -- runtime auto-discovery fixed via nova_rt_self_exe_path() + install-relative probes in nova_find_runtime(); `nova run` works for a fresh user from any cwd with NO env (ONBOARDING_OK vs shipped nova.exe; _onboarding_test.ps1 = permanent guard). Two-phase bootstrap (first builtin the compiler calls on itself). The first-download FLOOR is FIXED. NEXT = B (flagship full-stack demo).
