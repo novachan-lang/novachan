@@ -15,6 +15,12 @@ function readCStr(ptr) {
 export async function runDom(wasmUrl) {
   const nodes = [null];                       // handle = index into this table; 0 = null
   let inst = null;                            // bound after instantiate; event handlers read it
+  let bumpPtr = 0;                             // host-side bump allocator over wasm linear memory
+  function writeCStr(s) {                      // write a JS string INTO wasm memory; return the ptr
+    const bytes = new TextEncoder().encode(s);
+    const p = (bumpPtr + 7) & ~7; bumpPtr = p + bytes.length + 1;
+    memU8.set(bytes, p); memU8[p + bytes.length] = 0; return p;
+  }
   const dom = {
     dom_get_by_id(idPtr) { const el = document.getElementById(readCStr(idPtr)); if (!el) return 0n; nodes.push(el); return BigInt(nodes.length - 1); },
     dom_create(tagPtr)   { nodes.push(document.createElement(readCStr(tagPtr))); return BigInt(nodes.length - 1); },
@@ -24,6 +30,16 @@ export async function runDom(wasmUrl) {
     // Stage 3: a browser event invokes a NOVA fn, identified by its wasm EXPORT NAME (a string).
     dom_on_click(h, namePtr) { const n = nodes[Number(h)], name = readCStr(namePtr);
       if (n) n.addEventListener("click", () => inst.exports[name]()); return 0n; },
+    // Stage B: async fetch from a (NOVA) backend. Reuses the export-name callback (like on_click):
+    // fetch the URL, write the response text INTO wasm memory, call the NOVA export with the ptr.
+    http_get_json(urlPtr, namePtr) {
+      const url = readCStr(urlPtr), name = readCStr(namePtr);
+      fetch(url).then(r => r.text()).then(txt => {
+        memU8 = new Uint8Array(inst.exports.memory.buffer);   // refresh in case memory grew
+        inst.exports[name](BigInt(writeCStr(txt)));
+      }).catch(() => inst.exports[name](BigInt(writeCStr("[]"))));
+      return 0n;
+    },
   };
   // tolerant: any runtime symbol the module imports but we don't model -> a no-op returning 0n.
   const env = new Proxy(dom, { get(t, k) { return k in t ? t[k] : (() => 0n); } });
@@ -31,5 +47,7 @@ export async function runDom(wasmUrl) {
   const { instance } = await WebAssembly.instantiate(await resp.arrayBuffer(), { env });
   inst = instance;
   memU8 = new Uint8Array(instance.exports.memory.buffer);
+  const hb = instance.exports.__heap_base;
+  bumpPtr = Number(hb && hb.value !== undefined ? hb.value : hb) || 65536;
   instance.exports.nova_user_main();
 }
