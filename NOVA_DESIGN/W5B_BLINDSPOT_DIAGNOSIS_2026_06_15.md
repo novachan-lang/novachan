@@ -163,6 +163,30 @@ a fact (this frame owns it) not a heuristic. With ownership, the headline loop-l
 leak is fixed deterministically and W5b's escape-set becomes unnecessary. S2.5 is the larger
 value-model campaign; the minimal fix above unblocks W5b in the meantime without it.
 
+## UPDATE iter-81 (fix landed, commit 39b1789, fixpoint 7B113325)
+
+The minimal fix above was implemented in slot_store (guarded so it never overwrites an existing
+origin -- redirecting a slot-loaded register could free its source slot under a live alias, a
+UAF; only fresh construction registers, which have no origin, get linked). Result: the full
+regression under NOVA_T8_DROP=1 went from 422/9 to 430/1 -- 8 of 9 reproducers fixed
+(sorted_map_test, ecs, router, routerx, stacktracex, real_http_api, physics2d, rex). Normal
+(W5b-off) regression stayed 431/0 (the change is inert when W5b is off). green_scale PASS.
+_w5b_probe_h is now ASAN-clean. W5b remains DEFAULT OFF.
+
+A second rule (mark slots assigned a borrowed container -- ire_borrow_src -- non-droppable) was
+prototyped and REVERTED: it changed nothing measurable (still 430/1), so it was unverified.
+
+REMAINING for a suite-sound W5b (the 9th reproducer, pvecx -- found via the W5b .ll having two
+residual free_local sites): (1) pvec_set free_local(copied) -- the no_rc-append-then-escape
+interaction: nc = [] is deemed local at the append, so push(nc, copied) routes to
+nova_rt_list_append_no_rc which SKIPS the escape-mark (it only marks on the non-local branch),
+but nc subsequently ESCAPES via the returned PVec, so copied is freed while still reachable.
+The fix is to ALSO mark the element's source slot escaped in the no_rc branch (conservative;
+trades the no_rc clean-drop for soundness). (2) PVec__field_get free_local(_fg_box) -- a field
+accessor boxes the field value into a local that W5b drops; needs the boxed-field-read to be
+treated as a borrow. Both are the no_rc / borrow-vs-own ownership class (S2.5 territory) and are
+the gating work for a W5b default-flip campaign.
+
 ## Artifacts (committed as permanent W5b guards)
 
 - Probes: _w5b_probe_a, b, c, e, g (clean cases) and _w5b_probe_h (the minimal reproducer).
