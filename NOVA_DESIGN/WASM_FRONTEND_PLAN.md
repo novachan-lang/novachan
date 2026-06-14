@@ -24,7 +24,16 @@ stage that touches the shared value representation and must be staged behind the
 validated against native output (the int/pointer CVE class).
 
 ## Staged plan
-- **Stage 0 — VERIFY the host-import path** (≈0.5 iter, NO code): compile a `_wasm_dom_demo.nova`
+- ✅ **Stage 0 + 1 DONE (iter-48, zero compiler change)** — `_wasm_dom_demo.nova` declares
+  `extern fn dom_set_text(id: string, txt: string)`; `main()` calls `unsafe dom_set_text("app",
+  "Hello from NOVA")`. Built to wasm32; the `.wasm` import section confirms `{module:"env",
+  name:"dom_set_text", kind:"function"}` (an undefined extern declare IS a wasm host import). The Node
+  oracle (`_wasm_dom_oracle.cjs`, fake-`document` since jsdom absent) drives it end-to-end →
+  `DOM_OK captured=[Hello from NOVA]`. Browser runtime (`_wasm_runtime_browser.mjs`) + HTML harness
+  (`_wasm_dom_index.html`) committed for the real-browser demo. Compiler git-clean → byte-identical;
+  native 422/422; shared `_wasm_runtime.cjs` untouched. THE FULL-STACK-FRONTEND SEED EXISTS.
+- ~~Stage 0 — VERIFY~~ (folded into the above):
+- (historical detail) **Stage 0 — VERIFY the host-import path** (≈0.5 iter, NO code): compile a `_wasm_dom_demo.nova`
   declaring `extern fn dom_set_text(id: ptr, txt: ptr)` to wasm32; inspect the `.wasm` import section
   (wasm-objdump / `WebAssembly.Module.imports` in Node) to confirm it lowers to `import "env"
   "dom_set_text"` with the expected ptr/i32 ABI. De-risks the whole plan; if it works, Stage 1 needs
