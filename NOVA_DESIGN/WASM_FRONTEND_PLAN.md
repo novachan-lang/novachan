@@ -73,11 +73,25 @@ validated against native output (the int/pointer CVE class).
   `_wasm_dom_event_index.html` wire it for a real browser. **NOVA's interactive full-stack frontend
   story is proven: build DOM + handle events, in wasm32, zero hand-written JS glue.** `_wasm_build_one.ps1`
   parameterized with an `extraExports` arg.
-- **Stage 4 — m7 SOUND runtime-to-wasm** (deep, risky, the soundness cutover): compile the REAL tagged
-  `nova_runtime.c` to wasm32 so the wasm target carries NOVA's actual value model (RC/tag identity),
-  eliminating BOTH the double-maintained JS runtime AND the large-int/pointer divergence. Stage behind
-  the wasm target, validate against NATIVE output as the oracle; /stress-test the int/pointer CVE before
-  any code touches shared representation. (`nova_runtime_wasm.c` is a dead stub gesture; m7 is the real thing.)
+- **Stage 4 — m7 SOUND runtime-to-wasm** (deep; BLOCKED-on-toolchain as of iter-51 — deferred):
+  ★ iter-51 PROBE FINDING (good news + the blocker): `clang --target=wasm32 -c output/nova_runtime.c`
+  yields exactly ONE error — `stdio.h not found` — i.e. the ~17k-line real runtime is essentially
+  PORTABLE C with NO code-entanglement errors; m7 is a TOOLCHAIN + STUBBING effort, not a rewrite. BUT
+  it is BLOCKED NOW on: (1) **no wasi-sdk sysroot installed** (both `wasm32` and `wasm32-wasip1` fail to
+  find libc headers) — installing wasi-sdk is a heavy env dependency, not added blindly; (2) OS-dependent
+  subsystems (pthreads / sockets / fs / VirtualAlloc-mmap) would COMPILE under wasi but not WORK in
+  browser-wasm → need `#ifdef NOVA_WASM` stubs (threads→single-thread, sockets/fs→error/noop); (3) the
+  int/pointer CVE must be re-stress-tested for 32-bit wasm pointers (the readable-address heuristic in
+  `find_tag`/`nova_is_readable_str` assumes 64-bit addresses) BEFORE any value-model code. Sequenced AFTER
+  a wasi-sdk is available + a CVE-in-wasm32 stress-test clears. (`nova_runtime_wasm.c` = the current 7KB
+  stub; the JS runtime `_wasm_runtime.cjs` carries the sound-subset value model today.)
+- ✅ **Stage 5 — `nova build --target web` (bundler) DONE (iter-51, reconverge-safe script form)**:
+  `_wasm_build_web.ps1 <prog.nova> [exports]` packages the PROVEN Stages 0-3 frontend into ONE
+  self-contained, servable `web_<prog>/` directory (the `.wasm` + `_wasm_runtime_browser.mjs` +
+  a generated `index.html`). Turns "build a full-stack frontend in NOVA" into one command. Script form
+  (not a native `nova build --target web` subcommand) is deliberate: a CLI change touches
+  nova_compiler.nova → a reconverge EVENT (new SHA), whereas the script keeps the compiler byte-identical;
+  the native subcommand is a documented follow-up once a reconverge is acceptable.
 - **Stage 5 — frontend story**: a DOM/reactive stdlib + `nova build --target web` (emit .wasm + html +
   glue as one artifact). Months; gated on 2-4.
 

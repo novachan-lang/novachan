@@ -15,7 +15,7 @@ rt.imports.dom_create    = (tagPtr) => { nodes.push(mkEl(readCStr(tagPtr))); ret
 rt.imports.dom_set_text  = (h, txtPtr) => { const n=nodes[Number(h)]; if(n) n.text=readCStr(txtPtr); return 0n; };
 rt.imports.dom_append    = (ph, ch) => { const p=nodes[Number(ph)], c=nodes[Number(ch)]; if(p&&c) p.children.push(c); return 0n; };
 rt.imports.dom_on_click  = (h, namePtr) => { const n=nodes[Number(h)], name=readCStr(namePtr); if(n) n.addEventListener("click", () => inst.exports[name]()); return 0n; };
-WebAssembly.instantiate(fs.readFileSync("_wasm_dom_event_demo.wasm"), { env: rt.imports })
+WebAssembly.instantiate(fs.readFileSync(process.argv[2] || "_wasm_dom_event_demo.wasm"), { env: rt.imports })
   .then(({instance})=>{
     inst = instance; rt.init(instance); memU8 = new Uint8Array(instance.exports.memory.buffer);
     instance.exports.nova_user_main();                  // builds the button + registers on_click
