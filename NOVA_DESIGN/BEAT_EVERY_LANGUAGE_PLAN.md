@@ -16,11 +16,9 @@ mid-tier is NOT exhausted. These are additive, low-risk (reconverge-safe — the
 them), shippable in ~1 iteration each via the standard builtin pattern (reg + LLVM declare +
 name→runtime map + runtime fn + test + reconverge):
 
-1. **`select_timeout(channels..., timeout_ms)`** — ★ #1, ranked first by BOTH the Go and Erlang
-   lenses (closes Go `select + time.After` AND Erlang `receive...after` in one change). Mechanism
-   exists: `nova_rt_select` (runtime ~L3841) already spins + green-yields over channels via
-   `channel_try_recv`; add a deadline (start tick + elapsed check, return `[-1,0]` on timeout).
-   `nova_rt_channel_recv_timeout` (~L3892) is the model. Also expose `try_recv`/`try_send`.
+1. ~~`select_timeout(channels..., timeout_ms)`~~ ✅ DONE (b9aed16, reconverged 317C63E8) — variadic
+   `select_timeout(ch.., timeout_ms)` -> `[index, value]` or `[-1, 0]` on timeout; green-task safe;
+   closes Go `select + time.After` AND Erlang `receive...after`. (`try_recv`/`try_send` still TODO.)
 2. **char-class builtins** — `is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_upper`/`is_lower`
    (absent from the registry; locally redefined in ~30 .nova files incl. the compiler — local fns
    shadow the builtin, so reconverge-safe).
