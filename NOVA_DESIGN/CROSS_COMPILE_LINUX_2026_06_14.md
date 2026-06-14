@@ -101,6 +101,31 @@ The sweep surfaced exactly one REAL cross-platform bug, now fixed:
   calls sort_by, so this reconverges byte-identical to 3F75D36A; Windows regression
   426/426 0-SUSPECT (stdlib_test updated to the deterministic stable order).
 
+## Demand-driven OpenSSL / HTTPS on POSIX (iter-68)
+
+The runtime's https + TLS code (http_get over https, and the tls_connect/listen/accept/
+send/recv/close builtins) lives behind #ifdef NOVA_HAVE_OPENSSL, so a default POSIX build
+compiled it OUT and could not link it -- http_get("https://...") errored and a TLS program
+failed to link (the nova_rt_tls_* symbols are OpenSSL-gated). Fixed DEMAND-DRIVEN, so the
+90% of programs that never touch TLS/http keep building with no OpenSSL dependency:
+
+  Both link paths (nova_link in the compiler CLI, and nova_build's WSL cross-link) scan the
+  generated .ll for a CALL to a TLS/https builtin -- a line containing both "call" and
+  "@nova_rt_tls_" or "@nova_rt_http_get". (The unconditional `declare` lines have no "call",
+  so a non-TLS program never triggers it.) When found, and the target is non-Windows, they
+  add -DNOVA_HAVE_OPENSSL (so the runtime's OpenSSL paths compile in) and link -lssl -lcrypto.
+  Link order matters: the -D goes early (position-independent compile flag) but -lssl -lcrypto
+  go AFTER the runtime object, or GNU ld --as-needed discards them (undefined SSL_* refs).
+  Windows is untouched (it uses WinHTTP/bcrypt, already linked).
+
+Verified (WSL Ubuntu, OpenSSL 3.0.13): (1) the runtime compiles clean with
+-DNOVA_HAVE_OPENSSL (no OpenSSL-1.x rot); (2) a tls_connect program cross-built via
+nova_build --target=x86_64-unknown-linux-gnu links libssl.so.3 (ldd-confirmed), runs, and
+the OpenSSL TLS path is live ("TLS_BUILD_OK"); (3) a plain non-TLS program cross-builds with
+NO OpenSSL (must-not-break). Oracle: _test_ssl_xc.ps1 (+ _ssl_probe.sh for the compile probe).
+Bootstrap-safe: the compiler itself never calls a TLS/http builtin, so its own .ll has no such
+call -> reconverges to a new fixpoint without pulling OpenSSL into the compiler's own link.
+
 ## Scope / remaining
 
   - PROVEN: NOVA codegen + runtime are portable to Linux x86_64; real programs run,
