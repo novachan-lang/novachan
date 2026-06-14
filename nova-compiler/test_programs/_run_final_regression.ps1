@@ -355,6 +355,7 @@ $concurrency_tests = @(
     'try_chan_test',
     'char_class_test',
     'uint_ops_test',
+    'ptr_width_test',
     'yield_test',
     'parallel_test',
     'bounded_chan_test',

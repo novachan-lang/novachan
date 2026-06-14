@@ -12726,6 +12726,20 @@ int64_t nova_rt_offheap_set(int64_t handle, int64_t i, int64_t b) {
     return 0;
 }
 
+/* Typed f64 view of an off-heap region. `off` is a BYTE offset (consistent with offheap_get/set's
+   byte index); bounds-checked so [off, off+8) stays inside the region -> never OOB. Float ABI:
+   returns/accepts the double's bits as i64 (f2i / nova_float_arg), like the math builtins. */
+int64_t nova_rt_offheap_get_f64(int64_t handle, int64_t off) {
+    NovaOffheap* r = (NovaOffheap*)(uintptr_t)handle;
+    if (!r || !r->data || off < 0 || off + 8 > r->size) return 0;
+    double d; memcpy(&d, r->data + off, 8); return f2i(d);
+}
+int64_t nova_rt_offheap_set_f64(int64_t handle, int64_t off, int64_t vbits) {
+    NovaOffheap* r = (NovaOffheap*)(uintptr_t)handle;
+    if (!r || !r->data || off < 0 || off + 8 > r->size) return -1;
+    double d = nova_float_arg(vbits); memcpy(r->data + off, &d, 8); return 0;
+}
+
 int64_t nova_rt_offheap_free(int64_t handle) {
     NovaOffheap* r = (NovaOffheap*)(uintptr_t)handle;
     if (!r) return 0;
@@ -14585,6 +14599,31 @@ void nova_rt_ptr_write(int64_t ptr_val, int64_t value) {
     if (!ptr_val) return;
     *(int64_t*)(uintptr_t)ptr_val = value;
 }
+
+/* Typed-width raw reads/writes. The bare ptr_read/write above are i64-only (8 bytes), so reading
+   the last narrow field of a C-struct or wire buffer is an out-of-bounds 8-byte over-read, and a
+   write clobbers adjacent bytes. These access EXACTLY the native width. memcpy (not a cast) is used
+   so unaligned wire-buffer access is well-defined and strict-aliasing-safe (clang lowers it to a
+   single load/store). null-guard -> 0/no-op. Signed reads sign-extend; one write per width covers
+   signed+unsigned (same low bytes). Floats use NOVA's scalar-float ABI (i64 carrying the double's
+   bits, via f2i / nova_float_arg, exactly like nova_rt_sqrt); ptr_read_f32 widens the 4-byte float
+   to NOVA's f64, ptr_write_f32 narrows it. */
+int64_t nova_rt_ptr_read_u8(int64_t p)  { if (!p) return 0; uint8_t  v; memcpy(&v, (void*)(uintptr_t)p, 1); return (int64_t)v; }
+int64_t nova_rt_ptr_read_i8(int64_t p)  { if (!p) return 0; int8_t   v; memcpy(&v, (void*)(uintptr_t)p, 1); return (int64_t)v; }
+int64_t nova_rt_ptr_read_u16(int64_t p) { if (!p) return 0; uint16_t v; memcpy(&v, (void*)(uintptr_t)p, 2); return (int64_t)v; }
+int64_t nova_rt_ptr_read_i16(int64_t p) { if (!p) return 0; int16_t  v; memcpy(&v, (void*)(uintptr_t)p, 2); return (int64_t)v; }
+int64_t nova_rt_ptr_read_u32(int64_t p) { if (!p) return 0; uint32_t v; memcpy(&v, (void*)(uintptr_t)p, 4); return (int64_t)v; }
+int64_t nova_rt_ptr_read_i32(int64_t p) { if (!p) return 0; int32_t  v; memcpy(&v, (void*)(uintptr_t)p, 4); return (int64_t)v; }
+int64_t nova_rt_ptr_read_u64(int64_t p) { if (!p) return 0; uint64_t v; memcpy(&v, (void*)(uintptr_t)p, 8); return (int64_t)v; }
+int64_t nova_rt_ptr_read_f64(int64_t p) { if (!p) return 0; double   d; memcpy(&d, (void*)(uintptr_t)p, 8); return f2i(d); }
+int64_t nova_rt_ptr_read_f32(int64_t p) { if (!p) return 0; float    f; memcpy(&f, (void*)(uintptr_t)p, 4); return f2i((double)f); }
+
+int64_t nova_rt_ptr_write_u8(int64_t p, int64_t v)  { if (!p) return 0; uint8_t  x = (uint8_t)v;  memcpy((void*)(uintptr_t)p, &x, 1); return 0; }
+int64_t nova_rt_ptr_write_u16(int64_t p, int64_t v) { if (!p) return 0; uint16_t x = (uint16_t)v; memcpy((void*)(uintptr_t)p, &x, 2); return 0; }
+int64_t nova_rt_ptr_write_u32(int64_t p, int64_t v) { if (!p) return 0; uint32_t x = (uint32_t)v; memcpy((void*)(uintptr_t)p, &x, 4); return 0; }
+int64_t nova_rt_ptr_write_u64(int64_t p, int64_t v) { if (!p) return 0; uint64_t x = (uint64_t)v; memcpy((void*)(uintptr_t)p, &x, 8); return 0; }
+int64_t nova_rt_ptr_write_f64(int64_t p, int64_t v) { if (!p) return 0; double d = nova_float_arg(v);        memcpy((void*)(uintptr_t)p, &d, 8); return 0; }
+int64_t nova_rt_ptr_write_f32(int64_t p, int64_t v) { if (!p) return 0; float  f = (float)nova_float_arg(v); memcpy((void*)(uintptr_t)p, &f, 4); return 0; }
 
 /* nova_rt_ptr_add: Pointer arithmetic (byte offset) */
 int64_t nova_rt_ptr_add(int64_t ptr_val, int64_t offset) {
