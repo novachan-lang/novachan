@@ -53,11 +53,13 @@ which is the trap working. Confirmed survivors:
    (fn + UFCS), NOT the `>>>` lexer token (strictly safer, same fix). All total/no-UB: ushr masks &63,
    udiv/urem guard ÷0, compares treat i64 as u64. uint_ops_test PROVES the fix (logical vs ashr
    contrast). 419/419, reconverged byte-identical. The `>>>` infix sugar is deferred ergonomics.
-2. **Typed-width raw memory** (HIGH, correctness) — `nova_rt_ptr_read/write` are hard-coded
-   `*(int64_t*)` (8 bytes); grep `offheap_get_f|read_f64` = 0. Can't read a native-width u8/u16/u32/
-   f32/f64 field from a C struct / wire buffer without an unsound 8-byte over-read. SHIP
-   `ptr_read/write_{u8,i8,u16,i16,u32,i32,u64,f32,f64}` + `offheap_get_f64/set_f64` (tiny C fns,
-   floats bitcast). ← iter-41 (NEXT).
+2. ~~Typed-width raw memory~~ ✅ DONE (8b25dd8, reconverged 897AE00F) — `ptr_read/write_{u8,i8,u16,
+   i16,u32,i32,u64,f32,f64}` + `offheap_get_f64/set_f64` (17 builtins, fn + UFCS). memcpy-based
+   (unaligned + strict-aliasing safe), null-guarded, offheap bounds-checked; float ABI = i64-bits via
+   f2i/nova_float_arg matching nova_rt_sqrt. ptr_width_test PROVES native-width access (adjacent-u32
+   boundary, no 8-byte over-read) + sign-extension + unaligned + f64/f32 round-trip. 420/420.
+
+★ BOTH HIGH-leverage C-correctness batches DONE. Remaining additive = LOW-MED paper-cuts only.
 
 **Paper-cut sweep (LOW-MED, follow-up additive pass, each has a workaround):** keyed
 min/max/sorted(key,reverse); timer/ticker channels + set_timeout/interval; ws_connect client;
