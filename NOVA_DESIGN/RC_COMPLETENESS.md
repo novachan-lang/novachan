@@ -91,3 +91,60 @@ elision/optimization. Rust avoids RC entirely via compile-time ownership. NOVA's
 RC with Track-8 ownership-erasure for non-escaping locals (no RC traffic at all there) + total RC for
 genuinely-shared values (Stage 3-4). Until Stage 3 lands, NOVA is **behind** Swift/CPython/Rust on
 this axis (leaks reassigned heap locals) — a tracked correctness debt, not a design dead-end.
+
+---
+
+## ★★ iter-55 VALIDATED DESIGN (2026-06-14, 8-agent design + adversarial workflow)
+
+VERDICT: **GO on S1 (byte-identical provenance foundation) + S2 (re-enable W5b, positive-owned gate);
+HARD STOP before S3.** The actual leak fix (S3 total-RC) is DEFERRED: slot-level provenance is
+necessary-but-INSUFFICIENT -- S3 needs a value-level ownership-transfer model (S2.5) that does not
+exist yet. Build the safe foundation; do NOT promise the leak fix until S2.5.
+
+**Why S3 defers (verified):** `nova_rt_list_append` rc_incs the element (runtime L546) while the source
+still owns it -> the pervasive `let acc=[]; for x in items { push(acc,x) }; return acc` pattern would
+double-count, and dropping would double-free. Also `make_struct` stores fields with a BARE store (no
+rc_inc, codegen L14997) while struct rc_free dec's them (L7790) -- a latent double-free landmine, and
+the L7785 comment FALSELY claims make_struct rc_incs. S3 is unsound until S2.5 adds clone-or-transfer
+at owning-container boundaries.
+
+**Chosen mechanism (defeats the byte-identity + DCE refutations by construction):** carry provenance as
+a NEW FIELD on the slot_store IrInst -- NOT a new op-kind. DCE (L12481) keeps an instruction only if
+`op=="slot_store"` (literal string); a renamed owned_store/borrow_store with dest=="" would be DELETED
+-> self-miscompile. There are 47 slot_store occurrences across ~14 consumer/emit sites + ~10 value-
+binding emit sites (generator-for-in L8540, generic-assign L9109, comprehension L9317/9324, match-binds
+L8025/8131/8145/8687/8793/8935/9041, spawn L8839, closure L8867); a field keeps op=="slot_store"
+everywhere so ALL consumers match with ZERO edits and the field is inert until a deliberate consumer
+reads it. Provenance is register-keyed (`ire_borrow_src` set, propagated at index_get/field_get/
+re-borrow). The drop gate must be **POSITIVE-OWNED** (drop only slots PROVEN owned via a closed
+allowlist of allocating producers), NEVER negative-borrowed -> every classification GAP degrades to a
+LEAK, never a UAF. This is the only form that survives both adversarial lenses.
+
+**S1 first-step (byte-identical; 3 pure-metadata edits, consume NOTHING):**
+1. Add `ire_borrow_src: dict` as the LAST field of IrEmitter (mirror the prior ire_uses_byname add;
+   `, {}` final arg in new_ir_emitter).
+2. Populate at borrow-producing codegen sites ONLY (dict writes, emit no LLVM text): index_get dest
+   (the for-in elem_r path ~L8599), field_get dest, slot_load FROM a register already in ire_borrow_src.
+3. Reset `e.ire_borrow_src = {}` in the per-function reset block (alongside ire_load_origin).
+   Do NOT change the slot_store op name. Do NOT add a drop-gate clause. Do NOT read the field where text
+   is emitted. Byte-identity is guaranteed (metadata dicts are never serialized; op string unchanged ->
+   DCE + 14 consumers still match; drop gate untouched).
+   GATE: reconverge gen5.ll==gen6.ll MUST stay 15D5A9D5 (if it moves, a write leaked into output ->
+   bisect across the 3 populate sites) + 422/422 + leak oracle deltas unchanged.
+
+**Stages:** S1 (provenance foundation, byte-identical, LOW) -> S2 (re-enable W5b list/dict drop-at-
+return with positive-owned + not-borrowed + not-escaped gate; default stays 15D5A9D5 since the gate is
+inside the do_w5b branch (default OFF); the W5b-ON path is a SEPARATE fixpoint to prove via self-compile
++ the trait/closure/generics tests that broke bare-W5b; MEDIUM/bounded -- list_free_local does NOT dec
+elements so no element double-free here, that's S3-only; monotonic: drops a strict subset of bare-W5b)
+-> S2.5 (BUILD the value-ownership foundation: clone-or-transfer at append/dict_set/make_struct of a
+borrowed register + rc_inc at make_struct field-store L14997 + fix the false L7785 comment; HIGH, the
+genuine S3 prerequisite) -> S3 (total RC behind NOVA_T8_FULLRC, the actual leak fix; CRITICAL, deferred
+until S2.5 proves) -> S4 (perf elision / RC erasure; LOW-MED, only if S3 succeeds).
+
+**Residual S3 soundness risk (even after S2.5):** unenumerated borrow sources -- borrows leak in via
+field_get (struct-of-lists, pervasive) and tuple/match destructuring (lowered as op=='call' to
+nova_rt_index_get, NOT op=='index_get'). Positive-owned gating keeps these as leaks, not UAFs.
+
+NEXT: iter-56 = execute S1 (byte-identical). iter-57 = S2 (the partial leak fix: function-local list/dict
+freed at return; prove self-compile). S2.5/S3 = the deep value-ownership campaign, sequenced after.
