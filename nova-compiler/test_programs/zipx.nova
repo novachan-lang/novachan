@@ -1,0 +1,115 @@
+// zipx -- read real ZIP archives (PKWARE/.zip; also .jar/.docx/.xlsx/.apk/.epub which are
+// ZIP containers), pure NOVA. Reuses the deflatex inflate engine + CRC32. All multi-byte
+// fields are little-endian. Pure data transform over byte lists -> zero value-model surface.
+import deflatex
+
+fn _u16(b, p)
+    return b[p] | (b[p + 1] << 8)
+fn _u32(b, p)
+    return b[p] | (b[p + 1] << 8) | (b[p + 2] << 16) | (b[p + 3] << 24)
+
+// Find the End-Of-Central-Directory record (signature 0x06054b50 = bytes 80,75,5,6),
+// scanning backward from the end (the comment field makes its position variable).
+fn _find_eocd(b)
+    let i = len(b) - 22
+    while i >= 0
+        if b[i] == 80 and b[i + 1] == 75 and b[i + 2] == 5 and b[i + 3] == 6
+            return i
+        i = i - 1
+    return -1
+
+// zip_open(bytes) -> [bytes, entries]; each entry = [name, method, comp_size, uncomp_size, crc32, local_offset].
+fn zip_open(b)
+    let eocd = _find_eocd(b)
+    if eocd < 0
+        return [b, []]
+    let count = _u16(b, eocd + 10)
+    let cd_off = _u32(b, eocd + 16)
+    let entries = []
+    let p = cd_off
+    let k = 0
+    while k < count
+        // central directory header (sig 80,75,1,2)
+        let method = _u16(b, p + 10)
+        let crc = _u32(b, p + 16)
+        let csize = _u32(b, p + 20)
+        let usize = _u32(b, p + 24)
+        let nlen = _u16(b, p + 28)
+        let elen = _u16(b, p + 30)
+        let clen = _u16(b, p + 32)
+        let loff = _u32(b, p + 42)
+        let name = ""
+        let ni = 0
+        while ni < nlen
+            name = name + chr(b[p + 46 + ni])
+            ni = ni + 1
+        push(entries, [name, method, csize, usize, crc, loff])
+        p = p + 46 + nlen + elen + clen
+        k = k + 1
+    return [b, entries]
+
+fn zip_count(z)
+    return len(z[1])
+
+fn zip_names(z)
+    let names = []
+    for e in z[1]
+        push(names, e[0])
+    return names
+
+fn _entry(z, name)
+    for e in z[1]
+        if e[0] == name
+            return e
+    return []
+
+// zip_read(z, name) -> the DECOMPRESSED bytes (method 0 = stored copy, method 8 = deflate
+// via deflatex.inflate). Seeks the LOCAL file header to find the data (its name/extra
+// lengths can differ from the central directory's).
+fn zip_read(z, name)
+    let b = z[0]
+    let e = _entry(z, name)
+    if len(e) == 0
+        return []
+    let method = e[1]
+    let csize = e[2]
+    let loff = e[5]
+    let nlen = _u16(b, loff + 26)
+    let elen = _u16(b, loff + 28)
+    let data_start = loff + 30 + nlen + elen
+    let comp = []
+    let i = 0
+    while i < csize
+        push(comp, b[data_start + i])
+        i = i + 1
+    if method == 0
+        return comp
+    return deflatex.inflate(comp)
+
+// zip_read_verified -> the bytes if the CRC32 matches the central-directory value, else [].
+fn zip_read_verified(z, name)
+    let e = _entry(z, name)
+    if len(e) == 0
+        return []
+    let out = zip_read(z, name)
+    if deflatex.gzip_crc32(out) == e[4]
+        return out
+    return []
+
+fn main()
+    // Oracle: a REAL 2-entry .zip produced by .NET ZipArchive (_zip_gen.ps1). Both entries
+    // are method-8 (deflate), so zip_read exercises the inflate engine; CRC32 is verified.
+    let zb = [80,75,3,4,20,0,0,0,8,0,1,185,206,92,76,63,188,164,19,0,0,0,17,0,0,0,9,0,0,0,104,101,108,108,111,46,116,120,116,243,72,205,201,201,215,81,136,242,12,80,40,207,47,202,73,81,4,0,80,75,3,4,20,0,0,0,8,0,1,185,206,92,28,121,248,255,163,0,0,0,227,0,0,0,9,0,0,0,115,116,111,114,121,46,116,120,116,45,142,193,18,130,32,20,69,127,229,182,111,248,135,118,181,41,103,114,90,180,3,65,161,16,20,84,132,175,239,169,173,207,125,231,188,90,43,140,179,105,190,16,193,39,135,214,175,248,204,253,16,225,23,21,48,17,182,188,100,72,223,49,84,156,118,125,134,160,81,50,147,70,107,22,69,168,40,7,107,198,217,7,186,237,34,195,213,39,44,106,53,174,179,249,175,151,188,157,80,148,8,60,238,129,19,158,131,54,110,133,111,33,236,38,30,103,30,166,114,38,42,59,181,101,22,159,24,106,250,96,207,80,148,124,212,45,60,200,195,113,168,109,102,184,63,94,23,4,197,9,188,111,21,120,104,52,221,68,56,82,252,0,80,75,1,2,20,0,20,0,0,0,8,0,1,185,206,92,76,63,188,164,19,0,0,0,17,0,0,0,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,104,101,108,108,111,46,116,120,116,80,75,1,2,20,0,20,0,0,0,8,0,1,185,206,92,28,121,248,255,163,0,0,0,227,0,0,0,9,0,0,0,0,0,0,0,0,0,0,0,0,0,58,0,0,0,115,116,111,114,121,46,116,120,116,80,75,5,6,0,0,0,0,2,0,2,0,110,0,0,0,4,1,0,0,0,0]
+    let z = zip_open(zb)
+    assert_eq(zip_count(z), 2)
+    let names = zip_names(z)
+    assert_eq(names[0], "hello.txt")
+    assert_eq(names[1], "story.txt")
+    assert_eq(deflatex.bytes_to_str(zip_read(z, "hello.txt")), "Hello, ZIP world!")
+    let story = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. How vexingly quick daft zebras jump! Sphinx of black quartz, judge my vow. The five boxing wizards jump quickly. NOVA reads ZIP archives now."
+    assert_eq(deflatex.bytes_to_str(zip_read(z, "story.txt")), story)
+    // CRC32 verification against the central directory
+    let v = zip_read_verified(z, "story.txt")
+    assert_eq(len(v) > 0, true)
+    assert_eq(deflatex.bytes_to_str(v), story)
+    print("zipx passed (read 2-entry .zip: names + deflate decompress + CRC32 verify)")
