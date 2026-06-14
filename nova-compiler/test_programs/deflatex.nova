@@ -175,36 +175,210 @@ fn deflate(bytes)
     _enc_sym(bw, 256)
     return bw_finish(bw)
 
+// ── General RFC1951 inflate (stored + fixed + DYNAMIC Huffman, multi-block) ──────
+
+fn _fixed_lit_lengths()
+    let L = []
+    let i = 0
+    while i < 144
+        push(L, 8)
+        i = i + 1
+    while i < 256
+        push(L, 9)
+        i = i + 1
+    while i < 280
+        push(L, 7)
+        i = i + 1
+    while i < 288
+        push(L, 8)
+        i = i + 1
+    return L
+
+fn _fixed_dist_lengths()
+    let L = []
+    let i = 0
+    while i < 30
+        push(L, 5)
+        i = i + 1
+    return L
+
+// Build a canonical-Huffman decoder from per-symbol code lengths.
+// Returns [counts, syms, maxlen]: counts[len] = number of codes of that length,
+// syms = symbols sorted by (length, symbol), maxlen = longest code length.
+fn huff_build(lengths)
+    let maxlen = 0
+    let i = 0
+    while i < len(lengths)
+        if lengths[i] > maxlen
+            maxlen = lengths[i]
+        i = i + 1
+    let counts = []
+    let c = 0
+    while c <= maxlen
+        push(counts, 0)
+        c = c + 1
+    i = 0
+    while i < len(lengths)
+        if lengths[i] > 0
+            counts[lengths[i]] = counts[lengths[i]] + 1
+        i = i + 1
+    let offsets = []
+    let o = 0
+    while o <= maxlen + 1
+        push(offsets, 0)
+        o = o + 1
+    let ln = 1
+    while ln <= maxlen
+        offsets[ln + 1] = offsets[ln] + counts[ln]
+        ln = ln + 1
+    let nsyms = offsets[maxlen + 1]
+    let syms = []
+    let s = 0
+    while s < nsyms
+        push(syms, 0)
+        s = s + 1
+    let nexti = []
+    let q = 0
+    while q <= maxlen + 1
+        push(nexti, offsets[q])
+        q = q + 1
+    let sym = 0
+    while sym < len(lengths)
+        let l2 = lengths[sym]
+        if l2 > 0
+            syms[nexti[l2]] = sym
+            nexti[l2] = nexti[l2] + 1
+        sym = sym + 1
+    return [counts, syms, maxlen]
+
+// Decode one symbol via the canonical algorithm (puff.c style; Huffman bits MSB-first).
+fn huff_decode(br, desc)
+    let counts = desc[0]
+    let syms = desc[1]
+    let maxlen = desc[2]
+    let code = 0
+    let first = 0
+    let index = 0
+    let ln = 1
+    while ln <= maxlen
+        code = code | br_bit(br)
+        let count = counts[ln]
+        if code - first < count
+            return syms[index + (code - first)]
+        index = index + count
+        first = first + count
+        first = first << 1
+        code = code << 1
+        ln = ln + 1
+    return -1
+
+fn br_align(br)
+    if br[2] > 0
+        br[2] = 0
+        br[1] = br[1] + 1
+    return 0
+
+// Read a dynamic block's code-length tables (RFC1951 3.2.7). Returns [litdesc, distdesc].
+fn _read_dynamic(br)
+    let HLIT = br_bits(br, 5) + 257
+    let HDIST = br_bits(br, 5) + 1
+    let HCLEN = br_bits(br, 4) + 4
+    let order = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+    let cl = []
+    let z = 0
+    while z < 19
+        push(cl, 0)
+        z = z + 1
+    let i = 0
+    while i < HCLEN
+        cl[order[i]] = br_bits(br, 3)
+        i = i + 1
+    let cldesc = huff_build(cl)
+    let total = HLIT + HDIST
+    let lengths = []
+    while len(lengths) < total
+        let s = huff_decode(br, cldesc)
+        if s < 16
+            push(lengths, s)
+        else if s == 16
+            let rep = br_bits(br, 2) + 3
+            let prev = lengths[len(lengths) - 1]
+            let r = 0
+            while r < rep
+                push(lengths, prev)
+                r = r + 1
+        else if s == 17
+            let rep2 = br_bits(br, 3) + 3
+            let r2 = 0
+            while r2 < rep2
+                push(lengths, 0)
+                r2 = r2 + 1
+        else
+            let rep3 = br_bits(br, 7) + 11
+            let r3 = 0
+            while r3 < rep3
+                push(lengths, 0)
+                r3 = r3 + 1
+    let lit = []
+    let dist = []
+    let j = 0
+    while j < total
+        if j < HLIT
+            push(lit, lengths[j])
+        else
+            push(dist, lengths[j])
+        j = j + 1
+    return [huff_build(lit), huff_build(dist)]
+
+fn _fixed_descs()
+    return [huff_build(_fixed_lit_lengths()), huff_build(_fixed_dist_lengths())]
+
 fn inflate(data)
     let LB = _len_base()
     let LE = _len_extra()
     let DB = _dist_base()
     let DE = _dist_extra()
     let br = br_new(data)
-    br_bits(br, 1)
-    br_bits(br, 2)
     let out = []
-    let go = 1
-    while go == 1
-        let sym = _dec_sym(br)
-        if sym == 256
-            go = 0
-        else if sym < 256
-            push(out, sym)
-        else
-            let li = sym - 257
-            let length = LB[li] + br_bits(br, LE[li])
-            let di = 0
-            let i = 0
-            while i < 5
-                di = (di << 1) | br_bit(br)
-                i = i + 1
-            let dist = DB[di] + br_bits(br, DE[di])
-            let start = len(out) - dist
+    let final = 0
+    while final == 0
+        final = br_bit(br)
+        let btype = br_bits(br, 2)
+        if btype == 0
+            // stored block: skip to byte boundary, read LEN (2 LE) + NLEN (2, ignored), copy LEN bytes
+            br_align(br)
+            let blen = br[0][br[1]] | (br[0][br[1] + 1] << 8)
+            br[1] = br[1] + 4
             let k = 0
-            while k < length
-                push(out, out[start + k])
+            while k < blen
+                push(out, br[0][br[1]])
+                br[1] = br[1] + 1
                 k = k + 1
+        else
+            let descs = []
+            if btype == 1
+                descs = _fixed_descs()
+            else
+                descs = _read_dynamic(br)
+            let litdesc = descs[0]
+            let distdesc = descs[1]
+            let go = 1
+            while go == 1
+                let sym = huff_decode(br, litdesc)
+                if sym == 256
+                    go = 0
+                else if sym < 256
+                    push(out, sym)
+                else
+                    let li = sym - 257
+                    let length = LB[li] + br_bits(br, LE[li])
+                    let dsym = huff_decode(br, distdesc)
+                    let dist = DB[dsym] + br_bits(br, DE[dsym])
+                    let start = len(out) - dist
+                    let m = 0
+                    while m < length
+                        push(out, out[start + m])
+                        m = m + 1
     return out
 
 // gzip wrapper (RFC 1952): header + DEFLATE body + CRC32 + ISIZE
@@ -237,8 +411,27 @@ fn gzip_compress(bytes)
         push(out, b)
     return out
 fn gzip_decompress(gz)
+    // RFC1952 header: [0]=31 [1]=139 [2]=CM [3]=FLG [4..7]=MTIME [8]=XFL [9]=OS,
+    // then optional FEXTRA/FNAME/FCOMMENT/FHCRC fields selected by FLG, then the
+    // DEFLATE body, then an 8-byte trailer (CRC32 + ISIZE). Parse FLG so we can read
+    // REAL .gz files (command-line gzip sets FNAME), not just minimal headers.
+    let flg = gz[3]
+    let p = 10
+    if (flg & 4) != 0
+        let xlen = gz[p] | (gz[p + 1] << 8)
+        p = p + 2 + xlen
+    if (flg & 8) != 0
+        while gz[p] != 0
+            p = p + 1
+        p = p + 1
+    if (flg & 16) != 0
+        while gz[p] != 0
+            p = p + 1
+        p = p + 1
+    if (flg & 2) != 0
+        p = p + 2
     let body = []
-    let i = 10
+    let i = p
     let n = len(gz) - 8
     while i < n
         push(body, gz[i])
@@ -273,4 +466,10 @@ fn main()
     assert_eq(isz, len(msg))
     let grep = gzip_compress(str_to_bytes(rep))
     assert_eq(bytes_to_str(gzip_decompress(grep)), rep)
-    print("deflatex passed (deflate " + str(len(rep)) + "->" + str(len(comp)) + " bytes; gzip ok)")
+    // DYNAMIC-Huffman inflate: a REAL .gz produced by .NET GZipStream (BTYPE=2 -- the
+    // encoding real gzip/zlib emit). The pre-iter-69 fixed-only inflate could NOT decode
+    // this; it exercises huff_build / huff_decode / _read_dynamic on a genuine stream.
+    let dyn_expected = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. How vexingly quick daft zebras jump! Sphinx of black quartz, judge my vow. The five boxing wizards jump quickly. Compression of varied English text forces a dynamic Huffman block."
+    let dyn_gz = [31,139,8,0,0,0,0,0,4,0,45,143,75,110,195,48,12,68,175,50,221,23,186,68,81,32,203,0,205,5,100,139,178,213,72,162,173,159,45,157,190,116,210,245,12,223,27,62,86,194,94,221,252,196,148,248,136,176,124,226,183,134,45,131,27,37,20,137,189,30,29,134,23,133,187,150,94,232,152,164,116,184,178,194,186,70,18,13,138,240,110,175,156,228,118,201,10,55,62,208,232,116,113,241,253,31,111,180,45,24,52,37,157,95,130,15,252,108,171,139,39,216,98,242,23,120,175,58,149,241,41,169,89,232,210,52,62,20,30,178,224,165,17,169,240,196,59,116,50,111,198,27,237,187,194,23,135,45,81,206,142,227,5,108,58,57,50,248,22,191,203,43,10,157,69,62,75,51,101,104,152,30,117,112,51,110,213,218,160,163,216,121,126,170,63,104,116,248,197,9,1,0,0]
+    assert_eq(bytes_to_str(gzip_decompress(dyn_gz)), dyn_expected)
+    print("deflatex passed (deflate " + str(len(rep)) + "->" + str(len(comp)) + " bytes; gzip ok; dynamic-Huffman inflate ok)")
