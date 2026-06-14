@@ -45,12 +45,20 @@ validated against native output (the int/pointer CVE class).
   browser OR Node+jsdom asserting `getElementById('app').textContent === 'Hello from NOVA'`. SOUND value
   subset only (strings + structs + small ints) — sidesteps the tag-less JS-runtime large-int/pointer
   ambiguity. Reconverge byte-identical; native 400+ regression + the 6 wasm bundles unchanged.
-- **Stage 2 — host ergonomics, the NOVA-way framing** (needs a /deep-think first): a clean documented
-  way to declare host imports framed as **the JS host is a PEER PROCESS and the wasm import table is a
-  CHANNEL to it** (structurally the same problem NOVA already solves with remote_* channels over TCP —
-  do NOT copy wasm-bindgen/emscripten glue). A small DOM-binding surface (set_text, sanitized set_html,
-  create/append node, get/set attribute) + a value-marshalling ABI (add the wasm→JS handle-return
-  direction).
+- ✅ **Stage 2 DONE (iter-49, zero compiler change)** — the NOVA-WAY framing + a real DOM-binding surface.
+  **CONCEPTUAL CONTRIBUTION (the framing decision):** the JS host is a **PEER PROCESS**; the wasm import
+  table is the **CHANNEL** to it; the `extern fn` declarations a NOVA program writes ARE the channel ops
+  — structurally the same problem NOVA already solves with `remote_*` channels over TCP, NOT
+  wasm-bindgen/emscripten codegen glue. **Marshalling ABI (the sound subset, verified by probe):**
+  strings flow IN as char* linear-memory pointers (`readCStr` of the low-32 of the wasm i64 arg); DOM
+  nodes flow OUT as opaque int **HANDLES** kept in a JS side-table (handle = index, 0 = null), passed
+  back into later extern calls. No heterogeneous-`any` crosses the boundary. **Surface shipped:**
+  `dom_get_by_id(id)->int`, `dom_create(tag)->int`, `dom_set_text(node,txt)`, `dom_set_attr(node,k,v)`,
+  `dom_append(parent,child)`. `_wasm_dom_demo2.nova` BUILDS a tree (`#app` ← `<p class="greeting">Built
+  by NOVA</p>`); the Node oracle (`_wasm_dom2_oracle.cjs`, fake document + handle table) → `DOM_OK2`;
+  `_wasm_runtime_browser.mjs` updated to the canonical 5-binding surface; `_wasm_dom_index.html` demos it.
+  DEFERRED to a later sub-stage: string-RETURN from JS→wasm (needs a wasm-exported allocator to write
+  into linear memory) and sanitized `set_html`.
 - **Stage 3 — events / callbacks (JS→wasm)**: export NOVA closures as wasm table entries the host can
   call (a button click invoking a NOVA fn). Bigger design; still wasm-only.
 - **Stage 4 — m7 SOUND runtime-to-wasm** (deep, risky, the soundness cutover): compile the REAL tagged
