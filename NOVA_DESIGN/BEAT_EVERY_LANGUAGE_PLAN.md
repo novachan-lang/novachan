@@ -61,9 +61,16 @@ which is the trap working. Confirmed survivors:
 
 ★ BOTH HIGH-leverage C-correctness batches DONE. Remaining additive = LOW-MED paper-cuts only.
 
-**Paper-cut sweep (LOW-MED, follow-up additive pass, each has a workaround):** keyed
-min/max/sorted(key,reverse); timer/ticker channels + set_timeout/interval; ws_connect client;
-splitlines/partition/rsplit; struct-field defaults; slice patterns.
+**Paper-cut sweep (LOW-MED, follow-up additive pass, each has a workaround):**
+- ~~splitlines/partition/rpartition/rsplit~~ ✅ DONE (3878d74, reconverged 7AF1AF49) — RC-correct via
+  a shared nova_str_slice helper mirroring split's element alloc; fn + UFCS; 421/421.
+- DEFERRED (low-value, revisit opportunistically): keyed min/max/sorted(key,reverse); timer/ticker
+  channels + set_timeout/interval; ws_connect client; struct-field defaults; slice patterns.
+
+★ STRATEGIC PIVOT (iter-43+): the high-value additive correctness work is DONE and the rest of the
+additive tail is low-value with workarounds. Turning to the DEEP FRONTIER — the real path to "core
+complete / first-user full-stack identity works." Starting with the audit's #1: JSON-native value
+model, DESIGNED + adversarially stress-tested via a workflow BEFORE any compiler surgery.
 
 **THEN additive is GENUINELY exhausted → DEEP FRONTIER (audit-ranked, all HIGH):**
 1. **JSON-native tagged value model** — #1 deep pick. A first-class value mixing null/bool/number/
