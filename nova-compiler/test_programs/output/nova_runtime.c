@@ -10508,6 +10508,83 @@ int64_t nova_rt_tensor_relu(int64_t t_handle) {
     return r;
 }
 
+int64_t nova_rt_tensor_exp(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return 0;
+    int64_t r = nova_tensor_alloc_like(t);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict td = t->data;
+    const int64_t n = t->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = exp(td[i]);
+    return r;
+}
+
+/* Numerically-stable softmax over the LAST dimension (contiguous in row-major
+   layout). For a 1D tensor this is the whole vector; for a 2D tensor it is per-row
+   (the standard logits layout). Subtracting the per-group max before exp prevents
+   overflow on large logits (exp(1000) would be +inf) while leaving the normalized
+   result mathematically identical — production-grade inference activation. */
+int64_t nova_rt_tensor_softmax(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t || t->rank < 1) return 0;
+    int64_t last = t->shape[t->rank - 1];
+    int64_t r = nova_tensor_alloc_like(t);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    if (last <= 0 || t->size == 0) return r;          /* empty -> zeros (already calloc'd) */
+    double * restrict rd = result->data;
+    const double * restrict td = t->data;
+    int64_t groups = t->size / last;
+    for (int64_t g = 0; g < groups; g++) {
+        const int64_t base = g * last;
+        double mx = td[base];
+        for (int64_t i = 1; i < last; i++) if (td[base + i] > mx) mx = td[base + i];
+        double sum = 0.0;
+        for (int64_t i = 0; i < last; i++) { double e = exp(td[base + i] - mx); rd[base + i] = e; sum += e; }
+        if (sum > 0.0) { double inv = 1.0 / sum; for (int64_t i = 0; i < last; i++) rd[base + i] *= inv; }
+    }
+    return r;
+}
+
+/* 2D transpose: [m,n] -> [n,m]. Returns 0 (null handle) for non-2D tensors, matching
+   the matmul convention of returning null on a shape it cannot honor. */
+int64_t nova_rt_tensor_transpose(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t || t->rank != 2) return 0;
+    int64_t m = t->shape[0];
+    int64_t n = t->shape[1];
+    int64_t shape_list = nova_rt_list_create();
+    nova_rt_list_append(shape_list, n);
+    nova_rt_list_append(shape_list, m);
+    int64_t r = nova_rt_tensor_zeros(shape_list);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict td = t->data;
+    for (int64_t i = 0; i < m; i++)
+        for (int64_t j = 0; j < n; j++)
+            rd[j * m + i] = td[i * n + j];
+    return r;
+}
+
+/* Reshape: a NEW independent tensor with the given shape and a COPY of the flat data
+   (same row-major order). Element counts must match or it returns 0. Copying (not
+   aliasing the source buffer) keeps the result free of any shared-ownership concern. */
+int64_t nova_rt_tensor_reshape(int64_t t_handle, int64_t shape_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    NovaList* shape = (NovaList*)(uintptr_t)shape_handle;
+    if (!t || !shape) return 0;
+    int64_t expected = nova_tensor_size_from_shape(shape);
+    if (expected != t->size) return 0;
+    int64_t r = nova_rt_tensor_zeros(shape_handle);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    if (t->size > 0) memcpy(result->data, t->data, (size_t)t->size * sizeof(double));
+    return r;
+}
+
 int64_t nova_rt_tensor_to_list(int64_t t_handle) {
     NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
     if (!t) return nova_rt_list_create();
