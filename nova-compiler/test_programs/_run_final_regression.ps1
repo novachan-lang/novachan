@@ -169,6 +169,7 @@ $domain_tests = @(
     'const_bake_test',
     'tensor_matmul_test',
     'tensor_activations_test',
+    'tensor_ops_test',
     'int_ptr_soundness_repro',
     'str_identity_test',
     'struct_rc_test',

@@ -10585,6 +10585,100 @@ int64_t nova_rt_tensor_reshape(int64_t t_handle, int64_t shape_handle) {
     return r;
 }
 
+/* Numerically-stable logistic sigmoid 1/(1+e^-x). The branch keeps the exp argument
+   non-positive on both sides (exp of a large +x would overflow to +inf): for x>=0 use
+   1/(1+e^-x); for x<0 use e^x/(1+e^x). Both forms are mathematically identical and
+   bounded in (0,1) with no overflow/NaN. */
+int64_t nova_rt_tensor_sigmoid(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return 0;
+    int64_t r = nova_tensor_alloc_like(t);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict td = t->data;
+    const int64_t n = t->size;
+    for (int64_t i = 0; i < n; i++) {
+        double x = td[i];
+        if (x >= 0.0) { double e = exp(-x); rd[i] = 1.0 / (1.0 + e); }
+        else          { double e = exp(x);  rd[i] = e / (1.0 + e); }
+    }
+    return r;
+}
+
+/* Elementwise tanh (libm, saturating in (-1,1) -> no overflow). */
+int64_t nova_rt_tensor_tanh(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return 0;
+    int64_t r = nova_tensor_alloc_like(t);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict td = t->data;
+    const int64_t n = t->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = tanh(td[i]);
+    return r;
+}
+
+/* Elementwise natural log (used in cross-entropy). log(0) -> -inf and log(x<0) -> NaN
+   are IEEE-well-defined; callers normalize to positive inputs (e.g. softmax output). */
+int64_t nova_rt_tensor_log(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t) return 0;
+    int64_t r = nova_tensor_alloc_like(t);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict td = t->data;
+    const int64_t n = t->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = log(td[i]);
+    return r;
+}
+
+/* Classification head: the FLAT index of the maximum element (first on ties). Returns
+   a true int64 (no boxing) -> reg type nt_int. Empty tensor -> -1 (no valid index). */
+int64_t nova_rt_tensor_argmax(int64_t t_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    if (!t || t->size == 0) return -1;
+    const double * restrict td = t->data;
+    int64_t best = 0;
+    double bestv = td[0];
+    for (int64_t i = 1; i < t->size; i++) if (td[i] > bestv) { bestv = td[i]; best = i; }
+    return best;
+}
+
+int64_t nova_rt_tensor_sub(int64_t a_h, int64_t b_h) {
+    NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
+    NovaTensor* b = (NovaTensor*)(uintptr_t)b_h;
+    if (!nova_tensor_shapes_equal(a, b)) return 0;
+    int64_t r = nova_tensor_alloc_like(a);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict ad = a->data;
+    const double * restrict bd = b->data;
+    const int64_t n = a->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = ad[i] - bd[i];
+    return r;
+}
+
+/* Elementwise divide. Division by 0.0 yields IEEE inf/NaN (well-defined), matching the
+   add/mul/sub family's no-hidden-trap contract. */
+int64_t nova_rt_tensor_div(int64_t a_h, int64_t b_h) {
+    NovaTensor* a = (NovaTensor*)(uintptr_t)a_h;
+    NovaTensor* b = (NovaTensor*)(uintptr_t)b_h;
+    if (!nova_tensor_shapes_equal(a, b)) return 0;
+    int64_t r = nova_tensor_alloc_like(a);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict ad = a->data;
+    const double * restrict bd = b->data;
+    const int64_t n = a->size;
+    for (int64_t i = 0; i < n; i++) rd[i] = ad[i] / bd[i];
+    return r;
+}
+
 int64_t nova_rt_tensor_to_list(int64_t t_handle) {
     NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
     if (!t) return nova_rt_list_create();
