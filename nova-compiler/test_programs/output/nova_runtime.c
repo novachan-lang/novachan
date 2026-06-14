@@ -3184,6 +3184,7 @@ int64_t nova_rt_create_string(void* cstr_ptr);
 #define NOVA_TT_STR   4
 #define NOVA_TT_LIST  5
 #define NOVA_TT_DICT  6
+#define NOVA_TT_NULL  7   /* JSON-native value model: first-class null on the binary term wire */
 
 typedef struct { unsigned char* buf; size_t len; size_t cap; } NovaTermBuf;
 
@@ -3234,7 +3235,8 @@ static void term_encode_value(NovaTermBuf* b, int64_t val, int depth) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_BOX) {
         NovaBox* bx = (NovaBox*)ptr;
-        if (bx->kind == NOVA_BOX_BOOL) { ntb_byte(b, NOVA_TT_BOOL); ntb_byte(b, bx->payload ? 1 : 0); }
+        if (bx->kind == NOVA_BOX_NULL) { ntb_byte(b, NOVA_TT_NULL); }   /* else null would mis-encode as float 0.0 */
+        else if (bx->kind == NOVA_BOX_BOOL) { ntb_byte(b, NOVA_TT_BOOL); ntb_byte(b, bx->payload ? 1 : 0); }
         else { ntb_byte(b, NOVA_TT_FLOAT); ntb_f64(b, bx->payload); }  /* payload holds the IEEE bits */
         return;
     }
@@ -3295,6 +3297,7 @@ static int64_t term_decode_value(NovaTermRd* r, int depth) {
     unsigned char t = ntr_byte(r);
     if (t == NOVA_TT_INT)   return ntr_svarint(r);
     if (t == NOVA_TT_FLOAT) return nova_rt_box_float(ntr_f64(r));
+    if (t == NOVA_TT_NULL)  return nova_rt_null();
     if (t == NOVA_TT_BOOL)  return nova_rt_box_bool((int64_t)ntr_byte(r));
     if (t == NOVA_TT_STR) {
         uint64_t n = ntr_varint(r);
