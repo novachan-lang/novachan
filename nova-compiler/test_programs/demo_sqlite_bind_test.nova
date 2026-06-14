@@ -1,0 +1,75 @@
+// SQLite PARAMETERIZED (bound) queries through NOVA's FFI -- the production-grade,
+// SQL-injection-safe way to use SQL. Builds on demo_sqlite_test (which proved the basic
+// FFI round-trip); this proves prepare + bind_int/bind_text + reset reuse, AND that a
+// value containing SQL syntax bound as a PARAMETER is stored as literal data, not executed
+// (the injection-safety property). The regression auto-links sqlite3_test.o for any .ll
+// that references @sqlite3_ (see _run_final_regression.ps1).
+
+@opaque
+type DbHandle
+
+@opaque
+type StmtHandle
+
+extern fn sqlite3_open(path: string, db_out: out<DbHandle>) -> i32
+extern fn sqlite3_close(db: DbHandle) -> i32
+extern fn sqlite3_exec(db: DbHandle, sql: string, cb: int, ctx: int, errmsg_out: int) -> i32
+extern fn sqlite3_prepare_v2(db: DbHandle, sql: string, nbyte: i32, stmt_out: out<StmtHandle>, tail_out: int) -> i32
+extern fn sqlite3_bind_int(stmt: StmtHandle, idx: i32, value: i32) -> i32
+extern fn sqlite3_bind_text(stmt: StmtHandle, idx: i32, text: string, nbyte: i32, destructor: int) -> i32
+extern fn sqlite3_step(stmt: StmtHandle) -> i32
+extern fn sqlite3_reset(stmt: StmtHandle) -> i32
+extern fn sqlite3_column_int(stmt: StmtHandle, col: i32) -> i32
+extern fn sqlite3_column_text(stmt: StmtHandle, col: i32) -> int
+extern fn sqlite3_finalize(stmt: StmtHandle) -> i32
+
+fn main()
+    let SQLITE_ROW = 100
+    let SQLITE_DONE = 101
+    let SQLITE_TRANSIENT = -1   // tells sqlite to COPY the bound text immediately
+
+    let db = 0
+    assert_eq(unsafe sqlite3_open(":memory:", db), 0)
+    assert_eq(unsafe sqlite3_exec(db, "CREATE TABLE users (id INTEGER, name TEXT)", 0, 0, 0), 0)
+
+    // Parameterized INSERT: one prepared statement, reused with bound params per row.
+    let ins = 0
+    assert_eq(unsafe sqlite3_prepare_v2(db, "INSERT INTO users VALUES (?, ?)", -1, ins, 0), 0)
+    let ids = [1, 2, 3]
+    // Row 3's name contains SQL syntax -- bound as a PARAMETER it must be stored literally,
+    // NOT executed (this is exactly what defeats SQL injection).
+    let names = ["alice", "bob", "'; DROP TABLE users; --"]
+    let i = 0
+    while i < 3
+        assert_eq(unsafe sqlite3_bind_int(ins, 1, ids[i]), 0)
+        assert_eq(unsafe sqlite3_bind_text(ins, 2, names[i], -1, SQLITE_TRANSIENT), 0)
+        assert_eq(unsafe sqlite3_step(ins), SQLITE_DONE)
+        assert_eq(unsafe sqlite3_reset(ins), 0)
+        i = i + 1
+    assert_eq(unsafe sqlite3_finalize(ins), 0)
+
+    // Parameterized SELECT: fetch the row whose id is bound at runtime.
+    let sel = 0
+    assert_eq(unsafe sqlite3_prepare_v2(db, "SELECT name FROM users WHERE id = ?", -1, sel, 0), 0)
+    assert_eq(unsafe sqlite3_bind_int(sel, 1, 2), 0)
+    assert_eq(unsafe sqlite3_step(sel), SQLITE_ROW)
+    assert_eq(cstr_to_string(unsafe sqlite3_column_text(sel, 0)), "bob")
+    assert_eq(unsafe sqlite3_finalize(sel), 0)
+
+    // Injection-safety: the table still exists (DROP was NOT executed) and row 3's name was
+    // stored verbatim. Count rows + read the literal injection-attempt string back.
+    let cnt = 0
+    assert_eq(unsafe sqlite3_prepare_v2(db, "SELECT count(*) FROM users", -1, cnt, 0), 0)
+    assert_eq(unsafe sqlite3_step(cnt), SQLITE_ROW)
+    assert_eq(unsafe sqlite3_column_int(cnt, 0), 3)
+    assert_eq(unsafe sqlite3_finalize(cnt), 0)
+
+    let chk = 0
+    assert_eq(unsafe sqlite3_prepare_v2(db, "SELECT name FROM users WHERE id = ?", -1, chk, 0), 0)
+    assert_eq(unsafe sqlite3_bind_int(chk, 1, 3), 0)
+    assert_eq(unsafe sqlite3_step(chk), SQLITE_ROW)
+    assert_eq(cstr_to_string(unsafe sqlite3_column_text(chk, 0)), "'; DROP TABLE users; --")
+    assert_eq(unsafe sqlite3_finalize(chk), 0)
+
+    assert_eq(unsafe sqlite3_close(db), 0)
+    print("sqlite bind demo passed: parameterized insert/select + reset reuse; SQL-injection payload stored as literal data, table intact (3 rows)")
