@@ -10002,6 +10002,32 @@ int64_t nova_rt_cwd(void) {
     return (int64_t)(uintptr_t)result;
 }
 
+/* Absolute path of the running executable -- lets the compiler find its runtime install-relative
+   from any cwd (the first-download experience). Returns an RC-identity NOVA string ("" on failure). */
+int64_t nova_rt_self_exe_path(void) {
+#ifdef _WIN32
+    wchar_t wbuf[1024];
+    DWORD wlen = GetModuleFileNameW(NULL, wbuf, 1024);
+    if (wlen == 0 || wlen >= 1024) return (int64_t)(uintptr_t)"";
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen, NULL, 0, NULL, NULL);
+    if (u8len <= 0) return (int64_t)(uintptr_t)"";
+    char* result = (char*)nova_heap_alloc((size_t)u8len + 1, NOVA_MEM_RAW);
+    if (!result) return (int64_t)(uintptr_t)"";
+    WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen, result, u8len, NULL, NULL);
+    result[u8len] = '\0';
+    return (int64_t)(uintptr_t)result;
+#else
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return (int64_t)(uintptr_t)"";
+    char* result = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
+    if (!result) return (int64_t)(uintptr_t)"";
+    memcpy(result, buf, (size_t)n);
+    result[n] = '\0';
+    return (int64_t)(uintptr_t)result;
+#endif
+}
+
 /* ── OS / process (chdir, pid, which; set_env already exists above) ─────────── */
 
 /* chdir(path): change the process working directory. Returns 1 ok / 0 fail. */
