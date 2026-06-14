@@ -3887,6 +3887,77 @@ int64_t nova_rt_select(int64_t list_handle) {
     }
 }
 
+/* Like nova_rt_select but returns [-1, 0] after timeout_ms if no channel becomes ready
+   (timeout_ms < 0 == wait forever, identical to nova_rt_select). Green-task safe: yields to the
+   carrier between sweeps (never an OS spin that would block the single carrier). Closes the Go
+   `select + time.After` and Erlang `receive...after` gap with one primitive. */
+int64_t nova_rt_select_timeout(int64_t list_handle, int64_t timeout_ms) {
+    NovaList* channels = (NovaList*)(uintptr_t)list_handle;
+    if (!channels || channels->size == 0) {
+        int64_t result = nova_rt_list_create();
+        nova_rt_list_append(result, -1);
+        nova_rt_list_append(result, 0);
+        return result;
+    }
+    int64_t spins = 0;
+    int64_t value;
+#ifdef _WIN32
+    DWORD st_start = GetTickCount();
+#else
+    struct timeval st_tv0; gettimeofday(&st_tv0, NULL);
+    int64_t st_start = (int64_t)st_tv0.tv_sec * 1000LL + st_tv0.tv_usec / 1000LL;
+#endif
+    while (1) {
+        int64_t all_closed_empty = 1;
+        for (int64_t i = 0; i < channels->size; i++) {
+            NovaChannel* ch = (NovaChannel*)(uintptr_t)channels->data[i];
+            if (channel_try_recv(ch, &value)) {
+                int64_t result = nova_rt_list_create();
+                nova_rt_list_append(result, i);
+                nova_rt_list_append(result, value);
+                return result;
+            }
+            if (!channel_is_closed(ch) || ch->count > 0)
+                all_closed_empty = 0;
+        }
+        if (all_closed_empty) {
+            int64_t result = nova_rt_list_create();
+            nova_rt_list_append(result, -1);
+            nova_rt_list_append(result, 0);
+            return result;
+        }
+        if (timeout_ms >= 0) {
+#ifdef _WIN32
+            if (GetTickCount() - st_start >= (DWORD)timeout_ms) {
+#else
+            struct timeval st_tv1; gettimeofday(&st_tv1, NULL);
+            int64_t st_now = (int64_t)st_tv1.tv_sec * 1000LL + st_tv1.tv_usec / 1000LL;
+            if (st_now - st_start >= timeout_ms) {
+#endif
+                int64_t result = nova_rt_list_create();
+                nova_rt_list_append(result, -1);
+                nova_rt_list_append(result, 0);
+                return result;
+            }
+        }
+        if (nova_sched_in_task()) {
+            nova_sched_yield_runnable();
+        } else if (++spins < 64) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        } else {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(500);
+#endif
+        }
+    }
+}
+
 /* Receive with timeout (milliseconds). Returns value on success,
    -1 on timeout or closed channel. */
 int64_t nova_rt_channel_recv_timeout(int64_t handle, int64_t timeout_ms) {
