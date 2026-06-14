@@ -36,6 +36,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/wait.h>     /* waitpid (nova_rt_proc_wait) */
+#include <dlfcn.h>        /* dlopen/dlsym/dlclose + RTLD_* (hot reload, gpu_dlopen) */
 #ifdef NOVA_HAVE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -4579,21 +4581,25 @@ int64_t nova_rt_gen_collect(int64_t handle) {
 
 __attribute__((naked, noinline))
 void nova_asm_switch(uint64_t* from_sp, uint64_t* to_sp) {
+    /* Basic asm in a naked function: single-% register syntax (the %% form is for
+       EXTENDED asm and is rejected by gcc here; clang on Windows never compiles this
+       branch -- the _WIN32 path handles fibers there). Saves the SysV callee-saved
+       set, swaps rsp via the from_sp/to_sp args (rdi/rsi), restores, and returns. */
     __asm__ volatile (
-        "pushq %%rbx\n\t"
-        "pushq %%rbp\n\t"
-        "pushq %%r12\n\t"
-        "pushq %%r13\n\t"
-        "pushq %%r14\n\t"
-        "pushq %%r15\n\t"
-        "movq %%rsp, (%%rdi)\n\t"
-        "movq (%%rsi), %%rsp\n\t"
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "popq %%r13\n\t"
-        "popq %%r12\n\t"
-        "popq %%rbp\n\t"
-        "popq %%rbx\n\t"
+        "pushq %rbx\n\t"
+        "pushq %rbp\n\t"
+        "pushq %r12\n\t"
+        "pushq %r13\n\t"
+        "pushq %r14\n\t"
+        "pushq %r15\n\t"
+        "movq %rsp, (%rdi)\n\t"
+        "movq (%rsi), %rsp\n\t"
+        "popq %r15\n\t"
+        "popq %r14\n\t"
+        "popq %r13\n\t"
+        "popq %r12\n\t"
+        "popq %rbp\n\t"
+        "popq %rbx\n\t"
         "retq\n\t"
     );
 }
