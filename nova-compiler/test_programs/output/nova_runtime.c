@@ -9879,18 +9879,56 @@ static int nova_sort_by_cmp(const void* a, const void* b) {
     return 0;
 }
 
+/* STABLE merge sort by precomputed int64 keys (parallel value/key arrays). Stability
+   matters for cross-platform determinism: qsort is unstable AND glibc vs MSVCRT order
+   tied keys differently, so sort_by(by a non-unique key) gave platform-dependent
+   results -- a violation of NOVA's "same code, same result everywhere". The merge takes
+   the LEFT run on ties (k[j] < k[i] only takes the right), preserving input order for
+   equal keys -> deterministic on every platform. */
+static void nova_stable_msort_kv(int64_t* v, int64_t* k, int64_t* tv, int64_t* tk,
+                                 int64_t lo, int64_t hi) {
+    if (hi - lo <= 1) return;
+    int64_t mid = lo + (hi - lo) / 2;
+    nova_stable_msort_kv(v, k, tv, tk, lo, mid);
+    nova_stable_msort_kv(v, k, tv, tk, mid, hi);
+    int64_t i = lo, j = mid, t = lo;
+    while (i < mid && j < hi) {
+        if (k[j] < k[i]) { tv[t] = v[j]; tk[t] = k[j]; j++; }   /* right strictly smaller */
+        else             { tv[t] = v[i]; tk[t] = k[i]; i++; }   /* tie or left smaller -> left (STABLE) */
+        t++;
+    }
+    while (i < mid) { tv[t] = v[i]; tk[t] = k[i]; i++; t++; }
+    while (j < hi)  { tv[t] = v[j]; tk[t] = k[j]; j++; t++; }
+    for (int64_t x = lo; x < hi; x++) { v[x] = tv[x]; k[x] = tk[x]; }
+}
+
 int64_t nova_rt_sort_by(int64_t handle, int64_t closure) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size <= 1) return handle;
+    int64_t n = l->size;
     int64_t new_list = nova_rt_list_create();
     NovaList* result = (NovaList*)(uintptr_t)new_list;
-    result->cap = l->size;
-    result->data = realloc(result->data, (size_t)l->size * sizeof(int64_t));
-    memcpy(result->data, l->data, (size_t)l->size * sizeof(int64_t));
-    result->size = l->size;
-    for (int64_t i = 0; i < result->size; i++) nova_rc_inc(result->data[i]);
-    nova_sort_by_closure = closure;
-    qsort(result->data, (size_t)result->size, sizeof(int64_t), nova_sort_by_cmp);
+    result->cap = n;
+    result->data = realloc(result->data, (size_t)n * sizeof(int64_t));
+    memcpy(result->data, l->data, (size_t)n * sizeof(int64_t));
+    result->size = n;
+    for (int64_t i = 0; i < n; i++) nova_rc_inc(result->data[i]);
+    /* Precompute the sort key ONCE per element (n closure calls, not O(n log n)), then
+       stable-merge-sort by key for a deterministic, platform-independent result. */
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t* keys = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    int64_t* tmpv = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    int64_t* tmpk = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    if (!keys || !tmpv || !tmpk) {           /* OOM fallback: unstable qsort still sorts */
+        free(keys); free(tmpv); free(tmpk);
+        nova_sort_by_closure = closure;
+        qsort(result->data, (size_t)n, sizeof(int64_t), nova_sort_by_cmp);
+        return new_list;
+    }
+    for (int64_t i = 0; i < n; i++) keys[i] = fn(closure, result->data[i]);
+    nova_stable_msort_kv(result->data, keys, tmpv, tmpk, 0, n);
+    free(keys); free(tmpv); free(tmpk);
     return new_list;
 }
 

@@ -74,6 +74,33 @@ Linux) parking + waking 10k tasks. So the M:N green scheduler RUNS CORRECTLY on 
 x86_64 -- the fiber context-switch asm fix is verified correct at runtime (not merely
 compilable), and NOVA's flagship concurrency is proven on a second platform.
 
+## Broad portability sweep (iter-65) -- 40/40 tests pass on Linux
+
+To prove the port is real across features (not cherry-picked), a representative batch of
+40 regression tests was cross-built and run in WSL Ubuntu via _xc_sweep.ps1 + _xc_sweep.sh
+(gcc builds nova_runtime.o once; each test's linux .o is linked + run with kill-on-timeout
+from the test dir; a test PASSES iff it exits 0, since the regression tests self-assert).
+The batch spanned: floats/strings/unicode, dicts/sets, structs + auto-show, closures/HOFs,
+generics, traits, match/enums/guards, math/bignum, bitwise, ranges, tuples/destructuring,
+Result/error handling, spawn + supervisor (concurrency), generators (yield), JSON + float
+soundness, file-IO (read_bytes), tensors + the MLP classifier, and str/int soundness guards.
+
+Result: 40/40 PASS on Linux x86_64.
+
+The sweep surfaced exactly one REAL cross-platform bug, now fixed:
+
+  sort_by was NONDETERMINISTIC across platforms. It used qsort (unstable) with a
+  comparator returning 0 on equal keys, and glibc vs MSVCRT order tied keys differently --
+  so sort_by(by a non-unique key) gave platform-dependent results (stdlib_test's
+  sort-3-words-by-length, with two len-6 ties, passed on Windows but failed on Linux).
+  A language promising "same code, same result everywhere" must not have this. FIX: made
+  nova_rt_sort_by STABLE -- precompute each element's key once (n closure calls, not
+  O(n log n)), then a stable merge sort that takes the LEFT run on ties (preserving input
+  order for equal keys), with an OOM fallback to qsort. Now deterministic on every
+  platform (matching Python/Rust/modern-JS stable-sort semantics). The compiler never
+  calls sort_by, so this reconverges byte-identical to 3F75D36A; Windows regression
+  426/426 0-SUSPECT (stdlib_test updated to the deterministic stable order).
+
 ## Scope / remaining
 
   - PROVEN: NOVA codegen + runtime are portable to Linux x86_64; real programs run,
