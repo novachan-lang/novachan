@@ -19,11 +19,14 @@ name→runtime map + runtime fn + test + reconverge):
 1. ~~`select_timeout(channels..., timeout_ms)`~~ ✅ DONE (b9aed16, reconverged 317C63E8) — variadic
    `select_timeout(ch.., timeout_ms)` -> `[index, value]` or `[-1, 0]` on timeout; green-task safe;
    closes Go `select + time.After` AND Erlang `receive...after`. (`try_recv`/`try_send` still TODO.)
-2. **char-class builtins** — `is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_upper`/`is_lower`
-   (absent from the registry; locally redefined in ~30 .nova files incl. the compiler — local fns
-   shadow the builtin, so reconverge-safe).
-3. **list mutation** — `pop(list)` / `insert(list, i, v)` / `remove(list, v)` (only `push` exists).
-4. **`get(dict, key, default)`** — safe access with fallback (`nova_rt_dict_has` already exists).
+2. ~~list mutation `pop` / `insert` / `remove`~~ ✅ DONE (0dd080b, reconverged 881C52BD) — fn + UFCS;
+   pop transfers ownership (no double-free), remove rc_dec's, insert rc_inc's; RC-stress-tested.
+3. ~~`get(dict, key, default)`~~ ✅ DONE (0dd080b) — value or default; fn + UFCS.
+4. **char-class builtins** — `is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_upper`/`is_lower`
+   (absent from the registry; locally redefined in ~30 .nova files incl. the compiler — verify the
+   local fn shadows the builtin without a redefinition conflict; reconverge is the check).
+5. **`try_recv(ch)` / `try_send(ch, v)`** — non-blocking channel ops (the internal static
+   `channel_try_recv` exists; expose a thin wrapper returning a got/value or sent-bool sentinel).
 
 EXCLUDED (high-risk): the redundant `nova_rt_unbox` in mixed int/float `+=` hot loops — the prior
 Stage-2 fix was REVERTED for nn/stats parallel-load failures; needs per-block type tracking (deep).
