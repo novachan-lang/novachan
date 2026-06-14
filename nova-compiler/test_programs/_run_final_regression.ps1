@@ -357,6 +357,7 @@ $concurrency_tests = @(
     'uint_ops_test',
     'ptr_width_test',
     'strx_ops_test',
+    'json_oracle_test',
     'yield_test',
     'parallel_test',
     'bounded_chan_test',

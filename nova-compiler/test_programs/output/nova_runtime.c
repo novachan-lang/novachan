@@ -3007,15 +3007,15 @@ static int64_t json_parse_value(JsonParser* p) {
         case '{': result = json_parse_object(p); break;
         case '[': result = json_parse_array(p); break;
         case 't':
-            if (json_remaining(p, 4) && memcmp(p->src + p->pos, "true", 4) == 0) { p->pos += 4; result = 1; }
+            if (json_remaining(p, 4) && memcmp(p->src + p->pos, "true", 4) == 0) { p->pos += 4; result = nova_rt_bool(1); }
             else { nova_set_error("JSON: expected 'true'"); p->pos = p->len; result = 0; }
             break;
         case 'f':
-            if (json_remaining(p, 5) && memcmp(p->src + p->pos, "false", 5) == 0) { p->pos += 5; result = 0; }
+            if (json_remaining(p, 5) && memcmp(p->src + p->pos, "false", 5) == 0) { p->pos += 5; result = nova_rt_bool(0); }
             else { nova_set_error("JSON: expected 'false'"); p->pos = p->len; result = 0; }
             break;
         case 'n':
-            if (json_remaining(p, 4) && memcmp(p->src + p->pos, "null", 4) == 0) { p->pos += 4; result = 0; }
+            if (json_remaining(p, 4) && memcmp(p->src + p->pos, "null", 4) == 0) { p->pos += 4; result = nova_rt_null(); }
             else { nova_set_error("JSON: expected 'null'"); p->pos = p->len; result = 0; }
             break;
         default:
