@@ -59,8 +59,20 @@ validated against native output (the int/pointer CVE class).
   `_wasm_runtime_browser.mjs` updated to the canonical 5-binding surface; `_wasm_dom_index.html` demos it.
   DEFERRED to a later sub-stage: string-RETURN from JS→wasm (needs a wasm-exported allocator to write
   into linear memory) and sanitized `set_html`.
-- **Stage 3 — events / callbacks (JS→wasm)**: export NOVA closures as wasm table entries the host can
-  call (a button click invoking a NOVA fn). Bigger design; still wasm-only.
+- ✅ **Stage 3 DONE (iter-50, zero compiler change)** — INTERACTIVITY: a browser event invokes a NOVA fn.
+  ★ MECHANISM (simpler + more robust than fn-pointers/closures/table-entries, which would hand JS a
+  closure-struct pointer not a callable): the handler is a NOVA top-level fn identified to the host by
+  its wasm **EXPORT NAME** (a string). `fn on_click()` compiles to `define i64 @on_click()` (verified)
+  → exported via `wasm-ld --export=on_click`; `extern fn dom_on_click(node, handler_name: string)`;
+  JS does `node.addEventListener("click", () => inst.exports[name]())`. Reuses the proven string
+  marshalling + the existing fn-export mechanism — NO fn pointers, NO closures, NO indirect table. Probe
+  (`_wasm_cb_probe`): JS calling `instance.exports.on_click()` ran the NOVA fn → CB_OK. Demo
+  (`_wasm_dom_event_demo.nova`): main() builds a `<button>` under #app + registers on_click; each click
+  appends `<p>clicked</p>`. Oracle (`_wasm_dom_event_oracle.cjs`, fake document w/ addEventListener →
+  exported handler): 2 clicks → `#app` = `[button, p, p]` → DOM_OK3. `_wasm_runtime_browser.mjs` +
+  `_wasm_dom_event_index.html` wire it for a real browser. **NOVA's interactive full-stack frontend
+  story is proven: build DOM + handle events, in wasm32, zero hand-written JS glue.** `_wasm_build_one.ps1`
+  parameterized with an `extraExports` arg.
 - **Stage 4 — m7 SOUND runtime-to-wasm** (deep, risky, the soundness cutover): compile the REAL tagged
   `nova_runtime.c` to wasm32 so the wasm target carries NOVA's actual value model (RC/tag identity),
   eliminating BOTH the double-maintained JS runtime AND the large-int/pointer divergence. Stage behind
