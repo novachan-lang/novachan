@@ -2233,6 +2233,18 @@ int64_t nova_rt_chr(int64_t n) {
     return (int64_t)(uintptr_t)buf;
 }
 
+/* Unsigned / logical-shift operations. NOVA's `>>` operator lowers to LLVM `ashr` (arithmetic,
+   sign-extending); these treat the i64 as a raw u64 so high-bit shifts/compares/divides are
+   correct for crypto/hash/PRNG and address arithmetic. All total (no UB): ushr masks the shift
+   count (&63); udiv/urem guard division by zero (return 0). */
+int64_t nova_rt_ushr(int64_t a, int64_t b) { return (int64_t)((uint64_t)a >> (uint64_t)(b & 63)); }
+int64_t nova_rt_udiv(int64_t a, int64_t b) { if (b == 0) return 0; return (int64_t)((uint64_t)a / (uint64_t)b); }
+int64_t nova_rt_urem(int64_t a, int64_t b) { if (b == 0) return 0; return (int64_t)((uint64_t)a % (uint64_t)b); }
+int64_t nova_rt_ult(int64_t a, int64_t b) { return ((uint64_t)a <  (uint64_t)b) ? 1 : 0; }
+int64_t nova_rt_ugt(int64_t a, int64_t b) { return ((uint64_t)a >  (uint64_t)b) ? 1 : 0; }
+int64_t nova_rt_ule(int64_t a, int64_t b) { return ((uint64_t)a <= (uint64_t)b) ? 1 : 0; }
+int64_t nova_rt_uge(int64_t a, int64_t b) { return ((uint64_t)a >= (uint64_t)b) ? 1 : 0; }
+
 /* ── Process control ─────────────────────────────────────────────────────── */
 
 void nova_rt_cleanup(void);  /* forward declaration */
