@@ -344,3 +344,41 @@ in-flight hot code swap (blue-green covers 99%); explicit SIMD intrinsics (auto-
 Only once the core beats everyone (the table above all green): full-stack identity — backend (HTTP/
 router/DB/auth), frontend (via WASM/DOM), AI (tensor/inference), deploy — all in NOVA. The core's
 power (perf + concurrency + safety + reach) is what makes the frameworks trivial. Core first.
+
+---
+
+## ★★ iter-52 GROUNDED RE-AUDIT (2026-06-14) — COURSE CORRECTION: the first-download floor is broken
+
+A 6-agent grounded re-audit (state-grounder + 4 vision lenses + synthesis) after the JSON-native +
+WASM frontier deliveries. **stateTruth:** NOVA's compiler/runtime/concurrency/distributed/perf core is
+genuinely real + verified, BUT the two halves of its own first-download identity are BROKEN:
+1. ⛔ **A fresh user cannot `nova run` a project.** REPRODUCED: `nova new p; cd p; nova run` →
+   `clang: no such file or directory: 'nova_runtime.c'`. Setting `NOVA_HOME` makes the SAME project
+   print "Hello from p!" → skeleton/codegen/runtime/link are all CORRECT; **runtime auto-discovery is
+   the ONLY blocker.** Root cause: `nova_find_runtime()` (nova_compiler.nova ~L17450-17474) is env-var +
+   cwd-relative only; no self-exe-path primitive exists (grep GetModuleFileName/proc/self/exe = 0).
+2. **Long-running backend leaks ~1 heap value/iter** (the known partial-RC debt; total-RC = the real
+   but XL/design-first fix).
+
+**SEQUENCE (by leverage × tractability × reconverge-safety):**
+- **C NOW (iter-53): fix runtime auto-discovery.** Add `nova_rt_self_exe_path()` (~15 lines C:
+  GetModuleFileNameW / readlink("/proc/self/exe"), both paths), plumbed like env()/getcwd(); in
+  nova_find_runtime() probe `<exe_dir>/output/nova_runtime.c` then `<exe_dir>/nova_runtime.c` after the
+  env checks. This EDITS the compiler (nova_find_runtime) → a NEW-fixpoint reconverge (not byte-identical
+  — normal for a compiler change, like iters 36-42), CLI-driver path so OFF the value-model/CVE surface.
+  Oracle (already reproduced): `nova new p; cd p; nova run` works with NO env var from any cwd + `nova test`
+  links. THE first-download experience, fixed.
+- **B NEXT: flagship full-stack demo** (NOVA WASM frontend fetches JSON from a NOVA backend, from_json's
+  it, renders to DOM on click) — needs a WASM **fetch import** (verified absent: _wasm_runtime_browser.mjs
+  has 6 DOM ops, no HTTP-data fetch) + a real **web bundler** as a `nova` subcommand (verified: `nova wasm`
+  at ~L18471 emits .wasm + a Node loader, never the browser .mjs/index.html). Both tractable + low-risk
+  (string-emit + copy + the proven on_click export-name callback). Sits on C (can't host a project) → after C.
+- **A LATER: total RC** (the real long-term capability frontier; fixes the per-iter leak) — XL, HIGH
+  reconverge risk, NOT separable from the deferred W5b escape analysis (RC_COMPLETENESS.md S1-S4) →
+  needs its own design workflow first. The better-tractability capability is AI tensor activations
+  (softmax/exp/transpose/reshape — additive runtime fns on NovaTensor double*, low risk) if a capability
+  campaign is wanted before A.
+
+★ LESSON: two frontier deliveries (JSON, WASM) were built while the basic `nova run`-a-fresh-project
+floor was broken. The re-audit's "what fails for a REAL first user" check caught it. Fix the floor (C)
+before proving the story (B).
