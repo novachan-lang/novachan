@@ -569,6 +569,7 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
 typedef struct { int64_t kind; int64_t payload; } NovaBox;
 #define NOVA_BOX_BOOL  0
 #define NOVA_BOX_FLOAT 1
+#define NOVA_BOX_NULL  2   /* JSON-native value model: first-class null (singleton oddball) */
 
 /* Track the address range of allocated boxes. This makes the box check a cheap
    range comparison: any value outside [g_box_lo, g_box_hi] is definitely not a box
@@ -576,6 +577,14 @@ typedef struct { int64_t kind; int64_t payload; } NovaBox;
    (range stays empty), so the compiler's hot container reads are unaffected. */
 static uintptr_t g_box_lo = (uintptr_t)-1;
 static uintptr_t g_box_hi = 0;
+
+/* JSON-native value model -- pinned singleton oddball cells (null/true/false) so bool/null
+   survive as first-class values distinct from integer 0/1. Inert until nova_rt_oddballs_init()
+   runs (first json_decode in Stage 1 / nova_rt_null/nova_rt_bool); in Stage 0 nothing calls it,
+   so g_null_box/etc stay 0 and the [g_oddball_lo,g_oddball_hi] window stays inverted [-1,0] ->
+   the RC pin below never fires and the box window never widens -> behavior is byte-identical. */
+static int64_t g_null_box = 0, g_true_box = 0, g_false_box = 0;
+static uintptr_t g_oddball_lo = (uintptr_t)-1, g_oddball_hi = 0;
 
 static void nova_box_track(uintptr_t a) {
     if (a < g_box_lo) g_box_lo = a;
@@ -611,6 +620,34 @@ int64_t nova_rt_unbox(int64_t handle) {
     if (nova_is_box(handle)) return ((NovaBox*)(uintptr_t)handle)->payload;
     return handle;
 }
+
+/* Lazily mint the three immortal singleton oddball cells (null / true / false). Reuses
+   nova_rt_box_bool's exact alloc path so each cell carries a NOVA_MEM_BOX RC header and is
+   recognized by nova_is_box -> nova_mem_find_tag. Called on first json_decode (Stage 1) or on
+   nova_rt_null/nova_rt_bool. Idempotent. Lazy => programs that never decode JSON pay nothing
+   (the box window stays empty), which is the window-poisoning mitigation. The three cells are
+   separately allocated (each needs its own header for find_tag), so they may NOT be contiguous:
+   the RC pin below uses the [lo,hi] window only as a fast-reject and confirms with an EXACT
+   address match, so it can never skip RC on an unrelated object that happens to fall in range. */
+static void nova_rt_oddballs_init(void) {
+    if (g_null_box) return;
+    NovaBox* n = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
+    NovaBox* t = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
+    NovaBox* f = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
+    if (!n || !t || !f) return;
+    n->kind = NOVA_BOX_NULL; n->payload = 0;
+    t->kind = NOVA_BOX_BOOL; t->payload = 1;
+    f->kind = NOVA_BOX_BOOL; f->payload = 0;
+    nova_box_track((uintptr_t)n); nova_box_track((uintptr_t)t); nova_box_track((uintptr_t)f);
+    g_null_box = (int64_t)(uintptr_t)n; g_true_box = (int64_t)(uintptr_t)t; g_false_box = (int64_t)(uintptr_t)f;
+    uintptr_t lo = (uintptr_t)n, hi = (uintptr_t)n;
+    if ((uintptr_t)t < lo) lo = (uintptr_t)t; if ((uintptr_t)t > hi) hi = (uintptr_t)t;
+    if ((uintptr_t)f < lo) lo = (uintptr_t)f; if ((uintptr_t)f > hi) hi = (uintptr_t)f;
+    g_oddball_lo = lo; g_oddball_hi = hi;
+}
+/* First-class null / bool values (Stage 0: dead from any NOVA program; reached from json_decode in Stage 1). */
+int64_t nova_rt_null(void) { nova_rt_oddballs_init(); return g_null_box; }
+int64_t nova_rt_bool(int64_t v) { nova_rt_oddballs_init(); return v ? g_true_box : g_false_box; }
 
 /* Container element read (list_get/dict_get/inline index): a FLOAT box is kept
    BOXED so the element preserves its float type through the `any` value slot —
@@ -3063,7 +3100,9 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_BOX) {
         NovaBox* bx = (NovaBox*)ptr;
-        if (bx->kind == NOVA_BOX_BOOL) {
+        if (bx->kind == NOVA_BOX_NULL) {
+            jbuf_append(b, "null", 4);
+        } else if (bx->kind == NOVA_BOX_BOOL) {
             if (bx->payload) jbuf_append(b, "true", 4);
             else jbuf_append(b, "false", 5);
         } else { /* NOVA_BOX_FLOAT */
@@ -7784,6 +7823,11 @@ static inline int nova_rc_is_managed(void* ptr) {
 void nova_rc_inc(int64_t val) {
     if (nova_arena_mode) return;
     if ((uint64_t)val < 0x10000ULL) return;
+    /* Pin the immortal JSON oddball singletons: never rc'd, never freed. Range fast-rejects
+       (inverted [-1,0] until oddballs_init -> inert in Stage 0); exact match guarantees we never
+       skip RC on an unrelated object inside the window (the 3 cells may be non-contiguous). */
+    if ((uintptr_t)val >= g_oddball_lo && (uintptr_t)val <= g_oddball_hi &&
+        (val == g_null_box || val == g_true_box || val == g_false_box)) return;
     void* ptr = (void*)(uintptr_t)val;
     int kind = nova_rc_is_managed(ptr);
     if (kind == 0) return;
@@ -7803,6 +7847,10 @@ void nova_rc_inc(int64_t val) {
 static void nova_rc_dec_internal(int64_t val) {
     if (nova_arena_mode) return;
     if ((uint64_t)val < 0x10000ULL) return;
+    /* Pin the immortal JSON oddball singletons (see nova_rc_inc): never decremented, never freed.
+       This is the int32-rc-overflow-UAF mitigation -- a shared singleton's rc must never move. */
+    if ((uintptr_t)val >= g_oddball_lo && (uintptr_t)val <= g_oddball_hi &&
+        (val == g_null_box || val == g_true_box || val == g_false_box)) return;
     void* ptr = (void*)(uintptr_t)val;
     int kind = nova_rc_is_managed(ptr);
     if (kind == 0) return;
