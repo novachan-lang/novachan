@@ -1071,6 +1071,59 @@ int64_t nova_rt_list_set(int64_t handle, int64_t index, int64_t value) {
     return 0;
 }
 
+int64_t nova_rt_eq(int64_t a, int64_t b);  /* fwd decl: value equality, used by list_remove (def below) */
+
+/* pop the LAST element and RETURN it. Ownership TRANSFERS to the caller (NO rc_dec -- so a heap
+   element the caller now holds is never double-freed; the orphaned ref leaks like any other
+   reassigned heap local under the partial-RC model). Empty list -> error + 0. */
+int64_t nova_rt_list_pop(int64_t handle) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (!list || list->size == 0) {
+        nova_set_error("pop from empty list");
+        return 0;
+    }
+    int64_t value = list->data[--list->size];
+    return nova_rt_unbox_elem(value);
+}
+
+/* insert value at index i, shifting [i..size) one slot right. i<0 -> 0, i>size -> size (append).
+   rc_inc's the inserted value (mirrors list_append). */
+int64_t nova_rt_list_insert(int64_t handle, int64_t index, int64_t value) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (!list) return 0;
+    int64_t i = index;
+    if (i < 0) i = 0;
+    if (i > list->size) i = list->size;
+    if (list->size >= list->cap) {
+        list->cap *= 2;
+        list->data = realloc(list->data, (size_t)list->cap * sizeof(int64_t));
+    }
+    for (int64_t k = list->size; k > i; k--)
+        list->data[k] = list->data[k - 1];
+    list->data[i] = value;
+    nova_rc_inc(value);
+    list->size++;
+    return 0;
+}
+
+/* remove the FIRST element structurally equal to value, shifting the rest left. Returns 1 if an
+   element was removed, 0 if absent. rc_dec's the removed element (mirrors list_set dropping the
+   replaced element) -- safe because every list element was rc_inc'd when stored. */
+int64_t nova_rt_list_remove(int64_t handle, int64_t value) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (!list) return 0;
+    for (int64_t k = 0; k < list->size; k++) {
+        if (nova_rt_eq(nova_rt_unbox_elem(list->data[k]), value)) {
+            nova_rc_dec(list->data[k]);
+            for (int64_t j = k; j < list->size - 1; j++)
+                list->data[j] = list->data[j + 1];
+            list->size--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int64_t nova_rt_list_len(int64_t handle) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
     return list->size;
@@ -1776,6 +1829,14 @@ int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
         slot = (slot + 1) & (d->idx_cap - 1);
     }
     return 0;
+}
+
+/* dict.get(d, key, default): the value for key, or `deflt` if the key is absent (Python/JS dict.get).
+   No RC change -- returns a borrowed view of the stored value or the default, like dict_get. */
+int64_t nova_rt_dict_get_default(int64_t handle, int64_t key, int64_t deflt) {
+    if (nova_rt_dict_has(handle, key))
+        return nova_rt_dict_get(handle, key);
+    return deflt;
 }
 
 /* Set a float dict value, boxed so it keeps its type through the Any value slot.
