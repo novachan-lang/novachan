@@ -18,15 +18,23 @@ name→runtime map + runtime fn + test + reconverge):
 
 1. ~~`select_timeout(channels..., timeout_ms)`~~ ✅ DONE (b9aed16, reconverged 317C63E8) — variadic
    `select_timeout(ch.., timeout_ms)` -> `[index, value]` or `[-1, 0]` on timeout; green-task safe;
-   closes Go `select + time.After` AND Erlang `receive...after`. (`try_recv`/`try_send` still TODO.)
+   closes Go `select + time.After` AND Erlang `receive...after`.
 2. ~~list mutation `pop` / `insert` / `remove`~~ ✅ DONE (0dd080b, reconverged 881C52BD) — fn + UFCS;
    pop transfers ownership (no double-free), remove rc_dec's, insert rc_inc's; RC-stress-tested.
 3. ~~`get(dict, key, default)`~~ ✅ DONE (0dd080b) — value or default; fn + UFCS.
-4. **char-class builtins** — `is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_upper`/`is_lower`
-   (absent from the registry; locally redefined in ~30 .nova files incl. the compiler — verify the
-   local fn shadows the builtin without a redefinition conflict; reconverge is the check).
-5. **`try_recv(ch)` / `try_send(ch, v)`** — non-blocking channel ops (the internal static
-   `channel_try_recv` exists; expose a thin wrapper returning a got/value or sent-bool sentinel).
+4. ~~`try_recv(ch)` / `try_send(ch, v)`~~ ✅ DONE (d776a8b, reconverged 217A15CE) — non-blocking;
+   try_recv -> `[got, value]` (reuses the `channel_try_recv` static); try_send -> 1 if sent, 0 if
+   full/closed (deep-copies; frees on reject). fn + UFCS. 200k struct deep-copy-and-free stress clean.
+   Completes Go's channel ergonomics (select/select_timeout/try_recv/try_send).
+5. **char-class builtins** — `is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_upper`/`is_lower`
+   (LAST queue item; LOW value — trivially user-definable 1-liners). PRE-GREP (iter-38): the compiler
+   locally defines `is_alpha`/`is_digit`/`is_alnum`/`is_ws` (TAKEN — registering these as builtins
+   risks a reg-vs-userfn conflict at L12002's dup check; the local fn must cleanly shadow); but
+   `is_space`/`is_upper`/`is_lower` are FREE (zero-conflict). iter-39 = ship the free three, add the
+   taken three only if reg-vs-userfn shadowing reconverges clean (else name them `char_*` or skip).
+
+QUEUE STATUS: 4/5 DONE. After char-class (#5, the dregs) the verified mid-tier is EXHAUSTED →
+return to the DEEP frontier (a fresh grounded audit OR beat-C HOF / total-RC / WASM / REPL).
 
 EXCLUDED (high-risk): the redundant `nova_rt_unbox` in mixed int/float `+=` hot loops — the prior
 Stage-2 fix was REVERTED for nn/stats parallel-load failures; needs per-block type tracking (deep).
