@@ -1442,6 +1442,89 @@ int64_t nova_rt_split(int64_t s, int64_t delim) {
     return list;
 }
 
+/* Allocate an RC-identity NOVA string copy of [src, src+n) -- identical to nova_rt_split's part
+   allocation (nova_heap_alloc RAW gives the string an RC header; the caller's nova_rt_list_append
+   then rc_inc's it, so the list owns it exactly like split's elements). */
+static int64_t nova_str_slice(const char* src, size_t n) {
+    char* part = (char*)nova_heap_alloc(n + 1, NOVA_MEM_RAW);
+    if (!part) return 0;
+    if (n > 0) memcpy(part, src, n);
+    part[n] = '\0';
+    return (int64_t)(uintptr_t)part;
+}
+
+/* splitlines(s): split on '\n', stripping a trailing '\r' per line (CRLF). No trailing empty
+   element when the string ends in a newline (Python str.splitlines semantics); empty interior
+   lines ARE preserved. Empty string -> empty list. */
+int64_t nova_rt_splitlines(int64_t s) {
+    const char* str = (const char*)(uintptr_t)s;
+    int64_t list = nova_rt_list_create();
+    if (!str) return list;
+    const char* start = str;
+    const char* p = str;
+    while (*p) {
+        if (*p == '\n') {
+            size_t n = (size_t)(p - start);
+            if (n > 0 && start[n - 1] == '\r') n--;
+            nova_rt_list_append(list, nova_str_slice(start, n));
+            start = p + 1;
+        }
+        p++;
+    }
+    if (p > start) {   /* trailing content after the last '\n'; none if the string ended with '\n' */
+        size_t n = (size_t)(p - start);
+        if (n > 0 && start[n - 1] == '\r') n--;
+        nova_rt_list_append(list, nova_str_slice(start, n));
+    }
+    return list;
+}
+
+/* partition(s, sep) -> [before, sep, after] at the FIRST occurrence of sep; sep absent -> [s,"",""]. */
+int64_t nova_rt_partition(int64_t s, int64_t sep) {
+    const char* str = (const char*)(uintptr_t)s;
+    const char* d = (const char*)(uintptr_t)sep;
+    int64_t list = nova_rt_list_create();
+    size_t dlen = strlen(d);
+    const char* found = (dlen > 0) ? strstr(str, d) : NULL;
+    if (!found) {
+        nova_rt_list_append(list, nova_str_slice(str, strlen(str)));
+        nova_rt_list_append(list, nova_str_slice("", 0));
+        nova_rt_list_append(list, nova_str_slice("", 0));
+        return list;
+    }
+    nova_rt_list_append(list, nova_str_slice(str, (size_t)(found - str)));
+    nova_rt_list_append(list, nova_str_slice(d, dlen));
+    nova_rt_list_append(list, nova_str_slice(found + dlen, strlen(found + dlen)));
+    return list;
+}
+
+/* rpartition(s, sep) -> [before, sep, after] at the LAST occurrence; sep absent -> ["","",s]. */
+int64_t nova_rt_rpartition(int64_t s, int64_t sep) {
+    const char* str = (const char*)(uintptr_t)s;
+    const char* d = (const char*)(uintptr_t)sep;
+    int64_t list = nova_rt_list_create();
+    size_t dlen = strlen(d);
+    const char* last = NULL;
+    if (dlen > 0) {
+        const char* p = str;
+        while ((p = strstr(p, d)) != NULL) { last = p; p += dlen; }
+    }
+    if (!last) {
+        nova_rt_list_append(list, nova_str_slice("", 0));
+        nova_rt_list_append(list, nova_str_slice("", 0));
+        nova_rt_list_append(list, nova_str_slice(str, strlen(str)));
+        return list;
+    }
+    nova_rt_list_append(list, nova_str_slice(str, (size_t)(last - str)));
+    nova_rt_list_append(list, nova_str_slice(d, dlen));
+    nova_rt_list_append(list, nova_str_slice(last + dlen, strlen(last + dlen)));
+    return list;
+}
+
+/* rsplit(s, sep): split on sep. With no maxsplit this is identical to split (Python semantics);
+   maxsplit (split-from-the-right limit) is a deferred extension. */
+int64_t nova_rt_rsplit(int64_t s, int64_t delim) { return nova_rt_split(s, delim); }
+
 int64_t nova_rt_replace(int64_t s, int64_t old_s, int64_t new_s) {
     const char* str = (const char*)(uintptr_t)s;
     const char* old_str = (const char*)(uintptr_t)old_s;
