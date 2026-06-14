@@ -26,15 +26,21 @@ name→runtime map + runtime fn + test + reconverge):
    try_recv -> `[got, value]` (reuses the `channel_try_recv` static); try_send -> 1 if sent, 0 if
    full/closed (deep-copies; frees on reject). fn + UFCS. 200k struct deep-copy-and-free stress clean.
    Completes Go's channel ergonomics (select/select_timeout/try_recv/try_send).
-5. **char-class builtins** — `is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_upper`/`is_lower`
-   (LAST queue item; LOW value — trivially user-definable 1-liners). PRE-GREP (iter-38): the compiler
-   locally defines `is_alpha`/`is_digit`/`is_alnum`/`is_ws` (TAKEN — registering these as builtins
-   risks a reg-vs-userfn conflict at L12002's dup check; the local fn must cleanly shadow); but
-   `is_space`/`is_upper`/`is_lower` are FREE (zero-conflict). iter-39 = ship the free three, add the
-   taken three only if reg-vs-userfn shadowing reconverges clean (else name them `char_*` or skip).
+5. ~~char-class builtins~~ ✅ DONE (5ad65d3, reconverged FA9B6979) — all SIX shipped
+   (`is_space`/`is_upper`/`is_lower`/`is_digit`/`is_alpha`/`is_alnum`), fn + UFCS. The shadowing
+   question (the compiler defines its own `is_digit`/`is_alpha`/`is_alnum`/`is_ws`) was settled by
+   READING call-lowering (~L7438-7441): `rt_name` defaults to `fn_name`, only falls to
+   `resolve_runtime_fn` when the name is NOT a user fn → the compiler's local fns win at its own call
+   sites (.ll unchanged), user code with no such fn gets the builtin. Inference can't conflict (dup
+   check uses only `seen_fns`; `ti_define` overwrites). PROVEN by byte-identical reconverge.
 
-QUEUE STATUS: 4/5 DONE. After char-class (#5, the dregs) the verified mid-tier is EXHAUSTED →
-return to the DEEP frontier (a fresh grounded audit OR beat-C HOF / total-RC / WASM / REPL).
+QUEUE STATUS: ★ 5/5 DONE — the verified mid-tier queue (iter-35 audit) is EXHAUSTED.
+NEXT (iter-40): a fresh grounded re-audit (running) re-checks exhaustion + ranks the deep frontier.
+The recurring root gap remains: codegen has only a deferred-types heuristic (`ir_expr_struct_type`),
+not the inferer's real types — gates beat-C Stage-5 native-ABI HOF specialization
+(PERFORMANCE_SPECIALIZATION.md) AND collection serialization AND relates to total-RC. iter-33
+shipped the first safe slice of that threading. Deep frontier: beat-C Stage-5, struct-SROA ABI,
+total-RC (RC_COMPLETENESS.md), WASM target, REPL (OrcJIT), stackless millions.
 
 EXCLUDED (high-risk): the redundant `nova_rt_unbox` in mixed int/float `+=` hot loops — the prior
 Stage-2 fix was REVERTED for nn/stats parallel-load failures; needs per-block type tracking (deep).
