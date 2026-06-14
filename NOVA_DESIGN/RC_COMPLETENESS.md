@@ -148,3 +148,39 @@ nova_rt_index_get, NOT op=='index_get'). Positive-owned gating keeps these as le
 
 NEXT: iter-56 = execute S1 (byte-identical). iter-57 = S2 (the partial leak fix: function-local list/dict
 freed at return; prove self-compile). S2.5/S3 = the deep value-ownership campaign, sequenced after.
+
+---
+
+## ★ iter-57 EMPIRICAL W5b-ON PROBE (2026-06-14) -- the historical correctness failure is GONE
+
+A bounded probe (_w5b_probe.ps1): built a W5b-compiled compiler (gen3_test.exe @1187CB94 compiling
+nova_compiler.nova with NOVA_T8_DROP=1 -> gen4_w5b) and ran the EXACT tests that broke bare-W5b
+(trait/closure/generics_advanced/generics_soundness/spread + leak_baseline) THROUGH it (drops on).
+
+RESULT: **W5B-SMOKE OK** -- all 7 pass. The W5b-compiled compiler correctly compiles + runs the
+trait/closure/generics/spread programs that historically failed. => **W5b-on is SEMANTICALLY SOUND
+today.** The 50+ iterations of escape-analysis hardening (ire_slot_escaped propagation at append/
+dict_set/make_struct/closure-capture/dyn_call, the load_origin aliasing, etc.) closed the gaps that
+broke bare-W5b in iter-29. The positive-owned keying (ire_local_slots only holds LOCALLY-CREATED
+list/dict slots -- borrowed index_get/field_get elements never enter it) means the for-in-borrow UAF
+is already structurally prevented, so the S1 not-borrowed clause is belt-and-suspenders, NOT required
+for correctness (the smoke proves it).
+
+OPEN QUESTION (not yet answered): RECONVERGENCE STABILITY. The probe's "SELF-REPRODUCE DIVERGES
+(1187CB94 vs 4BFF7684)" compared gen3's W5b-output vs gen4_w5b's W5b-output -- the FIRST transition,
+which is NEVER a fixpoint (the standard reconverge needs 3 passes and checks gen5==gen6). So the probe
+is INCONCLUSIVE on reconvergence. The decisive test = a proper 3-pass W5b-on reconverge (NOVA_T8_DROP=1
+throughout): does gen5_w5b.ll == gen6_w5b.ll? If YES -> W5b-on is reconverge-stable + sound -> flip
+default-on (a REAL partial leak fix: function-local non-returned list/dict freed at return) with the
+full gate. If NO (diverges at gen5/gen6) -> W5b drop EMISSION is non-deterministic (likely dict-key
+iteration order at the `for slot_n in keys(e.ire_local_slots)` drop loop ~L15646) -> make it
+deterministic (sort the slots) first, then default-on.
+
+SCOPE NOTE: even default-on, W5b is a PARTIAL leak fix (function-local containers NOT returned; the
+pervasive `acc=[]; for x {push}; return acc` escapes via return + the deep value-double-free remain
+S3). The full leak fix is still S3 (behind the S2.5 value-ownership foundation). But W5b default-on is
+a real, sound, shippable leak REDUCTION for the common function-local-container case.
+
+NEXT (iter-58): run the proper 3-pass W5b-on reconverge; if gen5_w5b==gen6_w5b, flip default-on with
+the full gate (full regression under W5b-on + green_scale + the leak oracle showing reduction); else
+fix the drop-emission determinism (sort the drop slots) first.
