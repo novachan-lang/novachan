@@ -34,13 +34,54 @@ name→runtime map + runtime fn + test + reconverge):
    sites (.ll unchanged), user code with no such fn gets the builtin. Inference can't conflict (dup
    check uses only `seen_fns`; `ti_define` overwrites). PROVEN by byte-identical reconverge.
 
-QUEUE STATUS: ★ 5/5 DONE — the verified mid-tier queue (iter-35 audit) is EXHAUSTED.
-NEXT (iter-40): a fresh grounded re-audit (running) re-checks exhaustion + ranks the deep frontier.
-The recurring root gap remains: codegen has only a deferred-types heuristic (`ir_expr_struct_type`),
-not the inferer's real types — gates beat-C Stage-5 native-ABI HOF specialization
-(PERFORMANCE_SPECIALIZATION.md) AND collection serialization AND relates to total-RC. iter-33
-shipped the first safe slice of that threading. Deep frontier: beat-C Stage-5, struct-SROA ABI,
-total-RC (RC_COMPLETENESS.md), WASM target, REPL (OrcJIT), stackless millions.
+QUEUE STATUS: ★ 5/5 DONE — the iter-35 verified mid-tier queue is EXHAUSTED.
+
+---
+
+## ★★ FRESH GROUNDED RE-AUDIT (iter-39 post, 2026-06-14) — 8 lenses + adversarial refutation
+
+A 15-agent workflow (8 language lenses grep-verifying gaps against the real compiler+runtime →
+synthesis → 6 adversarial refuters). Verdict: the additive well is NOT quite dry — there is ONE
+more HIGH-leverage additive batch, and uniquely it fixes **correctness bugs**, not ergonomics.
+The refuters REFUTED one stale gap (select_try/default — already ships as `select_timeout(ch.., 0)`),
+which is the trap working. Confirmed survivors:
+
+**iter-40 (NEXT) — C-correctness batch, split into two clean ships (soundness-first):**
+1. ★ **Unsigned / logical ops** (HIGH, correctness) — `>>` lowers to `ashr` (arithmetic), so
+   `(1<<63) >> 1` sign-extends to `0xC000…` instead of the logical `0x4000…` → silently WRONG
+   crypto/hash/PRNG. Grep `lshr|udiv|urem|icmp ult` = 0. SHIP as runtime-fn builtins (NOT the audit's
+   `>>>` lexer token — that touches the compiler's own lexer; a builtin is strictly safer + same fix):
+   `ushr/ult/ugt/ule/uge/udiv/urem` (i64 in/out, ucmp→bool; udiv/urem guard ÷0; ushr masks &63 → no UB).
+   Pure additive, reconverge-trivially-safe. ← iter-40.
+2. **Typed-width raw memory** (HIGH, correctness) — `nova_rt_ptr_read/write` are hard-coded
+   `*(int64_t*)` (8 bytes); grep `offheap_get_f|read_f64` = 0. Can't read a native-width u8/u16/u32/
+   f32/f64 field from a C struct / wire buffer without an unsound 8-byte over-read. SHIP
+   `ptr_read/write_{u8,i8,u16,i16,u32,i32,u64,f32,f64}` + `offheap_get_f64/set_f64` (tiny C fns,
+   floats bitcast). ← iter-41.
+
+**Paper-cut sweep (LOW-MED, follow-up additive pass, each has a workaround):** keyed
+min/max/sorted(key,reverse); timer/ticker channels + set_timeout/interval; ws_connect client;
+splitlines/partition/rsplit; struct-field defaults; slice patterns.
+
+**THEN additive is GENUINELY exhausted → DEEP FRONTIER (audit-ranked, all HIGH):**
+1. **JSON-native tagged value model** — #1 deep pick. A first-class value mixing null/bool/number/
+   string/array/object. Unlocks the web-backend identity + WASM/DOM frontend + remote-package reach
+   (one root cause). firstStep: NaN-boxed (or 3-bit-tagged) `Any` behind a flag, routed ONLY through
+   json_decode/encode + literal container-stores, with a json_oracle_test (bool/null/mixed round-trip).
+2. **Sized integer types** (u8/u16/u32/i32/u64 with real width+wrap) — the DEEP version of iter-40's
+   additive ops. firstStep: `nt_int_w(bits)` refining nt_int (default 64 = no change), lower only
+   explicit-width sites. Bit-exact crypto + faithful C-struct layout.
+3. **WASM host/DOM interop** (js_import/extern-js bridge + callback table) — the FRONTEND half.
+4. **Per-process mailbox + selective receive + addressable PIDs** — Erlang's prime (gen_server).
+5. **REPL via OrcJIT** (persisted top-level state + incremental type env) — Python's #1 adoption surface.
+6. context-style transitive cancellation + panic recover/try (MED) — do it NOVA-way (scope-based).
+
+The recurring root gap STILL underlies the deep tier: codegen has only a deferred-types heuristic
+(`ir_expr_struct_type`), not the inferer's real types — gates beat-C Stage-5 native-ABI HOF
+specialization (PERFORMANCE_SPECIALIZATION.md) + collection serialization + total-RC. iter-33 shipped
+the first safe slice. Deep-perf frontier: beat-C Stage-5, struct-SROA ABI, total-RC (RC_COMPLETENESS.md).
+
+---
 
 EXCLUDED (high-risk): the redundant `nova_rt_unbox` in mixed int/float `+=` hot loops — the prior
 Stage-2 fix was REVERTED for nn/stats parallel-load failures; needs per-block type tracking (deep).
