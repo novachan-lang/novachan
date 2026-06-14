@@ -9,6 +9,30 @@ NOVA way (genius compiler, zero annotations, process isolation, typed channels, 
 
 ---
 
+## ★ VERIFIED MID-TIER QUEUE (iter-35 grounded re-audit, 2026-06-14) — ship these next
+
+A 6-language re-audit (each gap grep-verified absent against the real compiler/runtime) found the
+mid-tier is NOT exhausted. These are additive, low-risk (reconverge-safe — the compiler doesn't use
+them), shippable in ~1 iteration each via the standard builtin pattern (reg + LLVM declare +
+name→runtime map + runtime fn + test + reconverge):
+
+1. **`select_timeout(channels..., timeout_ms)`** — ★ #1, ranked first by BOTH the Go and Erlang
+   lenses (closes Go `select + time.After` AND Erlang `receive...after` in one change). Mechanism
+   exists: `nova_rt_select` (runtime ~L3841) already spins + green-yields over channels via
+   `channel_try_recv`; add a deadline (start tick + elapsed check, return `[-1,0]` on timeout).
+   `nova_rt_channel_recv_timeout` (~L3892) is the model. Also expose `try_recv`/`try_send`.
+2. **char-class builtins** — `is_digit`/`is_alpha`/`is_alnum`/`is_space`/`is_upper`/`is_lower`
+   (absent from the registry; locally redefined in ~30 .nova files incl. the compiler — local fns
+   shadow the builtin, so reconverge-safe).
+3. **list mutation** — `pop(list)` / `insert(list, i, v)` / `remove(list, v)` (only `push` exists).
+4. **`get(dict, key, default)`** — safe access with fallback (`nova_rt_dict_has` already exists).
+
+EXCLUDED (high-risk): the redundant `nova_rt_unbox` in mixed int/float `+=` hot loops — the prior
+Stage-2 fix was REVERTED for nn/stats parallel-load failures; needs per-block type tracking (deep).
+DEEP frontier unchanged (beat-C Stage-5 HOF, struct-SROA ABI, total-RC, WASM, REPL, stackless).
+
+---
+
 ## Scorecard — where NOVA stands TODAY (verified against the real compiler/runtime)
 
 | Language | Its prime | NOVA status | Remaining to dominate |
