@@ -170,6 +170,7 @@ $domain_tests = @(
     'tensor_matmul_test',
     'tensor_activations_test',
     'tensor_ops_test',
+    'mlp_inference_test',
     'int_ptr_soundness_repro',
     'str_identity_test',
     'struct_rc_test',

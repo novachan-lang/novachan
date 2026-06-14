@@ -10679,6 +10679,30 @@ int64_t nova_rt_tensor_div(int64_t a_h, int64_t b_h) {
     return r;
 }
 
+/* Add a 1D bias vector to EACH ROW of a 2D tensor (the linear-layer bias broadcast):
+   result[r,c] = t[r,c] + bias[c]. Validates t.rank==2, bias.rank==1, and
+   bias.shape[0]==t.cols; else returns 0 (matmul convention). The targeted 2D+1D-row
+   form covers the NN need; general numpy-style broadcasting is intentionally NOT
+   attempted here (too many subtle edge cases). */
+int64_t nova_rt_tensor_add_bias(int64_t t_handle, int64_t bias_handle) {
+    NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
+    NovaTensor* bias = (NovaTensor*)(uintptr_t)bias_handle;
+    if (!t || !bias || t->rank != 2 || bias->rank != 1) return 0;
+    int64_t rows = t->shape[0];
+    int64_t cols = t->shape[1];
+    if (bias->shape[0] != cols) return 0;
+    int64_t r = nova_tensor_alloc_like(t);
+    NovaTensor* result = (NovaTensor*)(uintptr_t)r;
+    if (!result) return 0;
+    double * restrict rd = result->data;
+    const double * restrict td = t->data;
+    const double * restrict bd = bias->data;
+    for (int64_t i = 0; i < rows; i++)
+        for (int64_t j = 0; j < cols; j++)
+            rd[i * cols + j] = td[i * cols + j] + bd[j];
+    return r;
+}
+
 int64_t nova_rt_tensor_to_list(int64_t t_handle) {
     NovaTensor* t = (NovaTensor*)(uintptr_t)t_handle;
     if (!t) return nova_rt_list_create();
