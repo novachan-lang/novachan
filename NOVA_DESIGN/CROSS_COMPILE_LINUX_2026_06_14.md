@@ -105,9 +105,17 @@ The sweep surfaced exactly one REAL cross-platform bug, now fixed:
 
   - PROVEN: NOVA codegen + runtime are portable to Linux x86_64; real programs run,
     INCLUDING the M:N green scheduler at 10k-task scale (fiber switch + netpoller).
-  - First-class nova_build --target=x86_64-linux: needs the .ll triple rewrite wired
-    into nova_build + a Linux sysroot for a no-WSL Windows cross-link (or a documented
-    WSL-assisted path). De-risked by this iteration.
+  - First-class nova_build --target=x86_64-linux: DONE (iter-66). nova_build now, for a
+    non-Windows target, rewrites the generated .ll (triple + m:w->m:e datalayout) and
+    selects link libs/tooling by target+host: on a native Linux/macOS host it links
+    directly with clang; cross from a Windows host (no native Linux sysroot) it lowers
+    the .ll to a Linux ELF object with Windows clang (-c) then links via a WSL distro's
+    gcc (configurable build.wsl_distro, default Ubuntu) which has the Linux headers.
+    Verified end-to-end: `nova_build build --target=x86_64-unknown-linux-gnu <proj>`
+    produces xc_project/build/<name> as a Linux ELF that runs in WSL (Hello, exit 0),
+    while the default Windows build path is byte-for-byte unchanged. Oracle:
+    _test_xc_build.ps1. A no-WSL Windows cross-link still needs a bundled Linux sysroot
+    (future); native-Linux/CI builds need neither WSL nor a sysroot.
   - aarch64/ARM: still blocked on no ARM execution host (re-audit #1); the POSIX asm
     switch is x86_64-only.
   - Tools: _xc_linux_probe.ps1 (linux compile probe), _xc_build_run.ps1 (cross-build +

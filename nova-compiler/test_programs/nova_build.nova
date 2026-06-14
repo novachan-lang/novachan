@@ -164,6 +164,53 @@ fn target_is_windows(triple: string) -> bool
         return true
     contains(triple, "windows")
 
+// Absolutize a (possibly relative) Windows path against the current dir.
+fn abs_win(p: string) -> string
+    let s = replace(p, "/", "\\")
+    if len(s) >= 2 and slice(s, 1, 2) == ":"
+        return s
+    cwd() + "\\" + s
+
+// Translate a Windows path to its WSL /mnt form (C:\X -> /mnt/c/X).
+fn win_to_wsl_path(p: string) -> string
+    let s = replace(p, "\\", "/")
+    if len(s) >= 3 and slice(s, 1, 2) == ":"
+        let drive = lower(slice(s, 0, 1))
+        return "/mnt/" + drive + slice(s, 2, len(s))
+    s
+
+// gen3 hardcodes the Windows triple in every .ll. For a non-Windows target, rewrite the
+// triple (and the ELF mangling m:w -> m:e for linux) so the IR lowers correctly for that
+// target. The .ll is otherwise calling-convention-agnostic (CC applied per-target at
+// codegen), so this rewrite is all that is needed to make a NOVA .ll portable.
+fn rewrite_ll_for_target(ll_path: string, triple: string)
+    let txt = read_file(ll_path)
+    txt = replace(txt, "x86_64-pc-windows-msvc", triple)
+    if contains(triple, "linux")
+        txt = replace(txt, "target datalayout = \"e-m:w-", "target datalayout = \"e-m:e-")
+    write_file(ll_path, txt)
+
+// Cross-link to Linux from a Windows host (which has no native linux sysroot): Windows
+// clang lowers the already-rewritten .ll to a linux ELF object (IR -> obj needs no
+// sysroot), then a WSL distro's gcc compiles the runtime (it has the linux headers) and
+// links. distro is configurable via build.wsl_distro (default Ubuntu). Graceful: on any
+// failure the object is left + manual linux instructions are printed.
+fn link_linux_wsl(ll_path: string, runtime: string, output: string, triple: string, opt_level: string, distro: string) -> int
+    let obj = output + ".o"
+    let r1 = system("clang --target=" + triple + " " + opt_level + " -c \"" + ll_path + "\" -o \"" + obj + "\" -w")
+    if r1 != 0
+        print("error: failed to lower .ll to a " + triple + " object (exit {r1})")
+        return r1
+    let wobj = win_to_wsl_path(abs_win(obj))
+    let wrt = win_to_wsl_path(abs_win(runtime))
+    let wout = win_to_wsl_path(abs_win(output))
+    let inner = "gcc " + opt_level + " '" + wobj + "' '" + wrt + "' -o '" + wout + "' -lpthread -lm -ldl"
+    let r2 = system("wsl -d " + distro + " -e bash -lc \"" + inner + "\"")
+    if r2 != 0
+        print("note: WSL link via distro '" + distro + "' failed (exit {r2}); object left at " + obj)
+        print("  finish on a Linux host: gcc " + opt_level + " <obj> output/nova_runtime.c -o <out> -lpthread -lm -ldl")
+    r2
+
 // ── Build command ─────────────────────────────────────────────────────────────
 
 fn cmd_build(build_args: list)
@@ -201,7 +248,11 @@ fn cmd_build(build_args: list)
         _do_lto = true
     if _do_lto and target == ""
         lto_flags = " -flto -fuse-ld=lld"
-    let link_flags = get_field(manifest, "build", "link_flags", "-lws2_32 -lbcrypt -ladvapi32")
+    // Default link libs are platform-specific: Windows sockets/crypto vs the linux trio.
+    let default_link = "-lws2_32 -lbcrypt -ladvapi32"
+    if target != "" and not target_is_windows(target)
+        default_link = "-lpthread -lm -ldl"
+    let link_flags = get_field(manifest, "build", "link_flags", default_link)
     let crate_type = get_field(manifest, "build", "type", "")
     if crate_type == "cdylib" or crate_type == "shared"
         shared = true
@@ -266,7 +317,18 @@ fn cmd_build(build_args: list)
     let all_link_flags = link_flags
     if shared_flags != ""
         all_link_flags = shared_flags + " " + link_flags
-    let link_result = link_binary(ll_path, runtime, output, target, "-O" + opt + lto_flags, all_link_flags)
+    // gen3 always emits the Windows triple; for a non-Windows target, rewrite the .ll
+    // (triple + ELF datalayout) so it lowers correctly for that target.
+    if target != "" and not target_is_windows(target)
+        rewrite_ll_for_target(ll_path, target)
+    let link_result = 0
+    if target != "" and not target_is_windows(target) and contains(os_name(), "win")
+        // Cross to Linux from Windows: Windows clang has no linux sysroot, so link via WSL.
+        let distro = get_field(manifest, "build", "wsl_distro", "Ubuntu")
+        link_result = link_linux_wsl(ll_path, runtime, output, target, "-O" + opt, distro)
+    else
+        // Native target (incl. building ON linux/macOS for that platform): clang links directly.
+        link_result = link_binary(ll_path, runtime, output, target, "-O" + opt + lto_flags, all_link_flags)
     if link_result != 0
         print("Linking failed.")
         exit(1)
