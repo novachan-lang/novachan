@@ -184,3 +184,43 @@ a real, sound, shippable leak REDUCTION for the common function-local-container 
 NEXT (iter-58): run the proper 3-pass W5b-on reconverge; if gen5_w5b==gen6_w5b, flip default-on with
 the full gate (full regression under W5b-on + green_scale + the leak oracle showing reduction); else
 fix the drop-emission determinism (sort the drop slots) first.
+
+---
+
+## ★ iter-58 W5b DEFAULT-ON ATTEMPT -> FAILED on a residual escape gap (REVERTED, kept opt-in)
+
+W5b-on PASSED: the 3-pass reconverge (gen5_w5b==gen6_w5b = 4BFF7684, reconverge-STABLE), the 7-test
+smoke (trait/closure/generics/spread/leak), AND a benefit oracle (w5b_drop_test: a function-local
+list+dict used-but-not-returned, 1000 calls -> live_count delta 2000 with W5b-OFF vs **0 with W5b-ON**
+-- W5b genuinely FREES function-local containers). So I flipped do_w5b DEFAULT-ON, reconverged to a
+new default-on fixpoint (16D398EB).
+
+THEN THE FULL GATE CAUGHT IT: the W5b-default-on compiler (16D398EB) **UAF-CRASHES (0xC0000005)
+compiling green_scale_test.nova** (a spawn/channel-heavy concurrency program). VERIFIED root cause:
+the crash is the COMPILER crashing (ll=False, no IR emitted), and NOVA_T8_NO_DROP=1 does NOT prevent
+it (the drops are baked into the W5b-compiled compiler BINARY; the env flag only controls the
+compiler's OUTPUT, not its own code). So W5b's return-drop has a RESIDUAL ESCAPE GAP on the
+SPAWN/CHANNEL codegen path -- the compiler's own spawn/channel-handling code creates a local list/dict
+that escapes via a path ire_slot_escaped MISSES, W5b frees it at return, and the freed container is
+used when compiling green_scale -> UAF. The iter-29 trait/closure gap is GONE, but THIS gap remains.
+The 7-smoke gave FALSE CONFIDENCE; only the FULL regression (green_scale) exposed it.
+
+REVERTED: git checkout the flag-flip -> back to S1/default-off; reconverged -> restored 1187CB94;
+green_scale compiles+runs again. NO unsound code in the tree. S1 (a54c463) stands.
+
+IMPLICATIONS:
+- W5b-on is unsound for SPAWN/CHANNEL-heavy programs (compiler OR user) -> NOT safe even as a blanket
+  opt-in for concurrent code. The partial leak fix (W5b default-on) is BLOCKED until this specific
+  escape gap is closed.
+- THE GAP TO CLOSE (the S2 work the iter-55 design named "close alias gaps"): the escape analysis must
+  mark a list/dict that is passed to spawn / sent on a channel / captured by a spawned closure as
+  ESCAPED (so W5b doesn't drop it). Entry point: lldb the W5b-compiled compiler crashing on
+  green_scale_test -> the freed container -> the missing escape-marking site (likely the spawn/send/
+  closure-capture codegen in nova_compiler.nova). w5b_drop_test.nova is the benefit oracle for when
+  it's fixed; green_scale_test is the soundness oracle.
+- The FULL leak fix remains S3 (total RC behind the S2.5 value-ownership foundation) -- deeper still.
+
+DECISION: the leak fix (via W5b) is a deep campaign blocked by a concrete-but-nontrivial escape gap;
+the full fix (S3) is deeper. Banking S1 + this finding; the leak stays the tracked second-broken-floor.
+Next = a tractable capability win (AI tensor activations), returning to the leak (green_scale-gap
+closure -> W5b default-on, OR S3) as a dedicated future campaign.
