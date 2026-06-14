@@ -49,9 +49,9 @@ sites**, never reconstructed for values that arrive already-`any` (json_decode, 
 
 | Stage | Goal | Reconverge | Risk |
 |---|---|---|---|
-| **0 — Dark infra** | NULL define + 3 singletons + encode-side NULL arm + RC pin, as DEAD code | **byte-identical** (nova_compiler.nova NOT edited) | window poisoning, int32 UAF — both mitigated in-stage |
-| **1 — Decode fidelity** | json_parse_value: null→g_null_box, true/false→singletons; round-trip faithful | **byte-identical** (compiler never json_decodes its own state) | user `d["k"]==true` surprises until Stage 3 — document as known-partial |
-| **2 — Term wire + oracle** | extend fidelity to the term/distribution codec; harden oracle matrix | **byte-identical** (runtime-only) | low/additive; confirm NOVA_TT_NULL tag unused |
+| **0 — Dark infra** ✅ DONE (92d5c91) | NULL define + 3 singletons + encode NULL arm + RC pin, dead code | **byte-identical 7AF1AF49** (confirmed) | window poisoning, int32 UAF — mitigated (lazy init + range+exact-match RC pin); C harness ODDBALL_OK |
+| **1 — Decode fidelity** ✅ DONE (8520b08) | json_parse_value: null/true/false→singletons; round-trip faithful | **byte-identical 7AF1AF49** (confirmed — compiler never json_decodes during self-compile) | known-partial: container-read still yields 0/1 until Stage 3; json_oracle_test PASS, 422/422 |
+| **2 — Term wire + oracle** ← NEXT | extend fidelity to the term/distribution codec; harden oracle matrix | **byte-identical** (runtime-only) | low/additive; confirm NOVA_TT_NULL tag unused |
 | **3 — General any-read** | bool/null survive a general container read via a DISTINCT seam (NOT a global flip) | **NEW fixpoint** (edits compiler codegen) — the cutover | HIGHEST; needs IR-grep gate + spread_test.nova; separate go/no-go |
 | **4 — Cutover** | make default, lock with permanent fixtures | on the established fixpoint | low if 0-2 only |
 
