@@ -1,0 +1,45 @@
+// _arena_green_probe.nova -- iter-94: prove the active arena is PER-TASK, not per-OS-thread.
+//
+// Two GREEN tasks (spawn) each open their OWN arena scope and allocate request-like data,
+// ping-ponging over channels so they INTERLEAVE -- each parks mid-scope (on an empty recv),
+// yielding the carrier to the other task. If the active arena were per-OS-thread, the
+// running task's allocations would land in the PARKED task's arena and be freed under it
+// when that task exits its scope -> cross-task use-after-free / wrong live_count. Per-task =>
+// each task's heap is isolated and freed wholesale at ITS OWN arena_exit; live_count returns
+// flat and nothing is freed out from under the other task.
+
+fn worker(id, inbox, outbox, rounds, done)
+    let prev = arena_enter()
+    let acc = 0
+    let r = 0
+    while r < rounds
+        // allocate inside THIS task's scope (dict + list + string)
+        let d = {}
+        d["id"] = id
+        d["name"] = "task-" + str(id) + "-" + str(r)
+        d["buf"] = [r, r + 1, r + 2, r + 3]
+        acc = acc + len(d["buf"]) + d["id"]
+        // ping-pong: send then recv -> the recv parks while empty, yielding to the other task
+        send(outbox, r)
+        acc = acc + receive(inbox)
+        r = r + 1
+    arena_exit(prev)          // free THIS task's whole heap wholesale
+    send(done, acc)
+
+fn main()
+    let base = live_count()
+    let a2b = channel()
+    let b2a = channel()
+    let done = channel()
+    let rounds = 500
+    // A: inbox=b2a outbox=a2b ; B: inbox=a2b outbox=b2a  (balanced ping-pong, no deadlock)
+    spawn fn() worker(1, b2a, a2b, rounds, done)
+    spawn fn() worker(2, a2b, b2a, rounds, done)
+    let r1 = receive(done)
+    let r2 = receive(done)
+    let delta = live_count() - base
+    print("arena_green: 2 tasks x " + str(rounds) + " interleaved rounds; acc=" + str(r1 + r2) + " live_delta=" + str(delta))
+    if delta > 60
+        print("ARENA GREEN FAIL: cross-task arena leak/contamination (delta=" + str(delta) + ")")
+        exit(1)
+    print("ARENA GREEN PASS: per-task arenas isolated across interleaved green tasks; both freed wholesale; live_delta=" + str(delta))

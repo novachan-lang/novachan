@@ -63,6 +63,12 @@ typedef struct {
     int     crashed;
     int64_t stack_depth;    /* Stage 1.5: per-task recursion depth (was global g_stack_depth) */
     int64_t stack_max;      /* per-task overflow limit; 0 => NOVA_DEFAULT_STACK_MAX */
+    struct NovaArena* active_arena;  /* iter-94: PER-TASK transparent arena. nova_heap_alloc
+                                        bumps into it when set. Per-task (not per-OS-thread) so a
+                                        green task that PARKS mid-scope cannot leak its arena to
+                                        another task on the same carrier -- the fiber switch
+                                        repoints nova_current_task, so this field follows the task
+                                        automatically. Zero-init at fiber creation (calloc). */
 } NovaTaskState;
 
 #define NOVA_DEFAULT_STACK_MAX 100000
@@ -416,11 +422,9 @@ static int          nova_arena_mode  = 0;
    malloc'd separately (iter-91 routes them through the arena too); STRUCTs are
    self-contained and fully arena-safe now. */
 typedef struct NovaArena NovaArena;
-#ifdef _WIN32
-static __declspec(thread) NovaArena* nova_active_arena = NULL;
-#else
-static __thread NovaArena* nova_active_arena = NULL;
-#endif
+/* The active arena is PER-TASK: nova_cur()->active_arena (NovaTaskState field), so it
+   follows green-task fiber switches automatically (a parked task cannot leak its arena
+   to another task on the same carrier). nova_cur() is defined above. */
 static void* nova_arena_bump(NovaArena* a, size_t size);
 /* Arena-aware container backing storage (defined near the list section). */
 static void* nova_back_alloc(size_t bytes);
@@ -460,12 +464,13 @@ static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     size_t total = NOVA_RC_HDR_SIZE + size;
     char* base;
-    if (nova_active_arena) {
+    NovaArena* _heap_arena = nova_cur()->active_arena;
+    if (_heap_arena) {
         /* Transparent arena: bump-allocate, tag arena-owned (rc no-op), and EXCLUDE
            from nova_mem_live (freed wholesale on scope exit -> must not count as a
            leak). Slabs are bypassed: slab objects are individually freed, arena
            objects are not. */
-        base = (char*)nova_arena_bump(nova_active_arena, total);
+        base = (char*)nova_arena_bump(_heap_arena, total);
         if (!base) return NULL;
         ((int32_t*)base)[0] = NOVA_RC_ARENA_BIT;
         ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
@@ -1028,20 +1033,24 @@ typedef struct {
    copy (old block wasted, reclaimed wholesale). Non-arena -> plain malloc/realloc,
    byte-identical to the previous behavior -> INERT for all existing programs. */
 static void* nova_back_alloc(size_t bytes) {
-    return nova_active_arena ? nova_arena_bump(nova_active_arena, bytes) : malloc(bytes);
+    NovaArena* a = nova_cur()->active_arena;
+    return a ? nova_arena_bump(a, bytes) : malloc(bytes);
 }
 static void* nova_back_calloc(size_t bytes) {
     /* nova_arena_bump already zeroes; calloc zeroes the heap path. */
-    return nova_active_arena ? nova_arena_bump(nova_active_arena, bytes) : calloc(1, bytes);
+    NovaArena* a = nova_cur()->active_arena;
+    return a ? nova_arena_bump(a, bytes) : calloc(1, bytes);
 }
 static void* nova_back_grow(void* obj, size_t oldbytes, size_t newbytes, void* oldptr) {
     if (NOVA_RC_COUNT(obj) & NOVA_RC_ARENA_BIT) {
         /* Arena object: its backing must grow within ITS arena. Under the
-           single-scope-per-request model the creation arena IS the active arena.
-           Growing while no scope is active means the object outlived its scope
-           (an escape-rule violation) -> panic rather than silently corrupt. */
-        if (!nova_active_arena) { nova_panic("arena container grown outside its scope"); return oldptr; }
-        void* nd = nova_arena_bump(nova_active_arena, newbytes);
+           single-scope-per-request model the creation arena IS the active arena
+           (per-task -> a parked task resumes with its own arena). Growing while no
+           scope is active means the object outlived its scope (an escape-rule
+           violation) -> panic rather than silently corrupt. */
+        NovaArena* a = nova_cur()->active_arena;
+        if (!a) { nova_panic("arena container grown outside its scope"); return oldptr; }
+        void* nd = nova_arena_bump(a, newbytes);
         if (nd && oldptr && oldbytes) memcpy(nd, oldptr, oldbytes);
         return nd;
     }
@@ -14931,16 +14940,18 @@ int64_t nova_rt_arena_used(int64_t handle) {
    crosses a process/channel boundary (channel_send deep-copies + process
    isolation), so request-scoped use is safe. */
 int64_t nova_rt_arena_scope_enter(void) {
-    NovaArena* prev = nova_active_arena;
+    NovaTaskState* t = nova_cur();
+    NovaArena* prev = t->active_arena;
     NovaArena* a = (NovaArena*)(uintptr_t)nova_rt_arena_create();
     if (!a) return (int64_t)(uintptr_t)prev;   /* OOM: stay on the enclosing scope */
-    nova_active_arena = a;
+    t->active_arena = a;
     return (int64_t)(uintptr_t)prev;
 }
 
 int64_t nova_rt_arena_scope_exit(int64_t prev_handle) {
-    NovaArena* a = nova_active_arena;
-    nova_active_arena = (NovaArena*)(uintptr_t)prev_handle;
+    NovaTaskState* t = nova_cur();
+    NovaArena* a = t->active_arena;
+    t->active_arena = (NovaArena*)(uintptr_t)prev_handle;
     if (a) nova_rt_arena_free((int64_t)(uintptr_t)a);
     return 0;   /* int return so the generic builtin-call path emits `call i64` (no void-emit path) */
 }
