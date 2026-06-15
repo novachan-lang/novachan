@@ -169,7 +169,30 @@ mechanism in isolation, before Forge consumes it.
   (~1B refs) — far below the existing int32 rc overflow limit (2^31), so no new
   practical constraint; documented.
 
+### iter-94 plan — green-task per-task arena (designed, not yet built)
+`nova_active_arena` is a per-OS-thread TLS. Green tasks interleave on one carrier, so
+a task that enters a scope and then PARKS (e.g. `tcp_recv`) would leave its arena
+active while the carrier runs ANOTHER task — whose allocations would wrongly land in
+the first task's arena (cross-task corruption / UAF on wholesale free). `_forge_
+readiness.nova` hits this exactly: it spawns the server as a green task while the
+client runs in `main`. CHOSEN APPROACH (avoids editing the RACE-sensitive fiber
+switch): move the active arena into `NovaTaskState` (`NovaArena* active_arena;`) and
+access it via `nova_cur()->active_arena` everywhere `nova_active_arena` is used
+(~10 sites: heap_alloc, nova_back_alloc/calloc/grow, scope enter/exit). The fiber
+switch ALREADY repoints `nova_current_task` to each task's state (lines ~4629/4776),
+so the field follows task switches for free — no save/restore code, no new race.
+PREREQ to verify: green-task `NovaTaskState` is zero-initialized (active_arena=0) at
+fiber creation. GATE: 432 both modes + green_scale + a NEW 2-green-task probe (each
+task opens its own arena scope, they interleave via channel ping-pong, each must see
+ONLY its own arena — ASAN clean, no cross-contamination) + the C harness. Then
+iter-95 = `serve_n_arena` (opt-in arena-scoped serving: `_handle_one` wrapped
+arena_enter..tcp_send..arena_exit; sound only for non-escaping handlers) + re-measure
+`_forge_readiness` (per-request live_delta ~16000 -> ~0). NOTE: the handler-side
+per-request leak is ALREADY proven flat by `_arena_demo` (delta=0); iter-94/95 extend
+that to the real concurrent socket server.
+
 ### Open work
+- green-task per-task arena (iter-94, designed above) + arena-scoped serving (iter-95).
 - list/dict/string backing-array interception (Gotcha 1) — iter-91.
 - Green-task save/restore of `nova_active_arena` (Gotcha 2) + lifecycle tied to the
   green-process scheduler (enter on dispatch, free on completion).
