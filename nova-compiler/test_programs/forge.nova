@@ -764,3 +764,71 @@ fn serve_req(a, port: int)
             let ap = a
             sched_spawn(fn(z) _handle_req_arena(c, ap))
 
+// ── Crash isolation (Phase 1) ─ recover: handler panic -> 500, the server lives ──────────
+// NOVA's "let it crash": dispatch_safe runs the routed handler in a MONITORED process. On a
+// normal return it channels the Response back (deep-copied across the process boundary). On a
+// PANIC the monitor reports the crash and dispatch_safe returns a clean 500 -- the request
+// fails, the server survives. Erlang-class fault tolerance at native (AOT) speed: Go/Node/
+// Spring cannot contain a handler crash to a single request without ceremony. (Proven by the
+// recover probe: good -> 200 Response intact, panic -> 500, program survived.)
+fn _dispatch_run(a, req, rc)
+    let r: Response = dispatch_req(a, req)
+    send(rc, r)
+
+fn dispatch_safe(a, req: Request) -> Response
+    let rc = channel()
+    let ap = a
+    let rq = req
+    let c = rc
+    let p = spawn _dispatch_run(ap, rq, c)
+    let m = monitor(p)
+    let st = receive(m)
+    if st == 0
+        return receive(rc)
+    resp_text(500, "Internal Server Error")
+
+// Crash-isolated per-connection handling: a handler panic returns a clean 500 to the client
+// (not a dropped connection), and the accept loop keeps serving. Also fixes the serve_req_n
+// hang-on-panic (the done signal is always sent, since dispatch_safe never panics).
+fn _handle_req_safe(conn: int, a)
+    let prev = arena_enter()
+    let raw = recv_request(conn)
+    let req: Request = build_request(raw, conn)
+    let resp: Response = dispatch_safe(a, req)
+    tcp_send(conn, finalize(resp))
+    arena_exit(prev)
+    tcp_close(conn)
+
+fn _handle_req_safe_done(conn: int, a, done)
+    _handle_req_safe(conn, a)
+    send(done, 1)
+
+// Spawn-per-connection + crash-isolated serve. Each connection -> own green task; each handler
+// -> monitored sub-process; a handler panic -> 500 + server lives. serve_safe_req_n waits N.
+fn serve_safe_req_n(a, port: int, n: int)
+    let listener = tcp_listen(port)
+    let done = channel()
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            let dc = done
+            sched_spawn(fn(z) _handle_req_safe_done(c, ap, dc))
+        i = i + 1
+    let j = 0
+    while j < n
+        recv(done)
+        j = j + 1
+    tcp_close(listener)
+
+fn serve_safe_req(a, port: int)
+    let listener = tcp_listen(port)
+    while true
+        let conn = tcp_accept(listener)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            sched_spawn(fn(z) _handle_req_safe(c, ap))
+

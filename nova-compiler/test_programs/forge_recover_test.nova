@@ -1,0 +1,69 @@
+// forge_recover_test -- Phase 1 incr-4: crash isolation (the fault-tolerance moat).
+// Part 1 (pure): dispatch_safe runs a panicking handler -> 500, a good handler -> 200.
+// Part 2 (concurrent socket): serve_safe_req_n -- a crashing client gets a clean 500 while a
+// good client gets 200 AND the server survives the crash. Server-binding -> serial in regression.
+import forge
+
+type Out
+    code: int
+
+fn h_ok(req: Request) -> Response
+    forge.resp_json(200, Out(7))
+
+fn h_crash(req: Request) -> Response
+    panic("boom in handler")
+    forge.resp_text(200, "unreachable")
+
+fn _client(port, path, rch)
+    sleep(20)
+    let sock = tcp_connect("127.0.0.1", port)
+    if sock >= 0
+        tcp_send(sock, "GET " + path + " HTTP/1.1\r\n\r\n")
+        let resp = tcp_recv(sock)
+        tcp_close(sock)
+        send(rch, resp)
+    else
+        send(rch, "NOCONN")
+
+fn main()
+    let q = chr(34)
+    let app = forge.app()
+    forge.get(app, "/ok", h_ok)
+    forge.get(app, "/crash", h_crash)
+
+    // Part 1: pure dispatch_safe
+    let okr: Response = forge.dispatch_safe(app, forge.build_request("GET /ok HTTP/1.1\r\n\r\n", 0))
+    assert(okr.status == 200, "dispatch_safe good -> 200")
+    assert(find(forge.finalize(okr), q + "code" + q + ":7") >= 0, "good Response intact")
+    let cr: Response = forge.dispatch_safe(app, forge.build_request("GET /crash HTTP/1.1\r\n\r\n", 0))
+    assert(cr.status == 500, "dispatch_safe panic -> 500 (contained)")
+    print("PASS: dispatch_safe (panic -> 500, good -> 200)")
+
+    // Part 2: concurrent serve_safe -- crash contained per request, server survives
+    let port = 18996
+    let results = channel()
+    let p = port
+    let ap = app
+    sched_spawn(fn(z) forge.serve_safe_req_n(ap, p, 2))
+    sleep(40)
+    let pp1 = port
+    let rc1 = results
+    sched_spawn(fn(z) _client(pp1, "/crash", rc1))
+    let pp2 = port
+    let rc2 = results
+    sched_spawn(fn(z) _client(pp2, "/ok", rc2))
+    let got500 = 0
+    let got200 = 0
+    let j = 0
+    while j < 2
+        let r = recv(results)
+        let s = str(r)
+        if find(s, "500") >= 0
+            got500 = got500 + 1
+        if find(s, "200 OK") >= 0
+            got200 = got200 + 1
+        j = j + 1
+    assert(got500 == 1, "crashing handler -> client got a clean 500")
+    assert(got200 == 1, "good handler -> 200 (server survived the crash)")
+    print("PASS: serve_safe concurrent (crash -> 500, good -> 200, server lives)")
+    print("forge_recover_test passed")
