@@ -87,6 +87,18 @@ exits arena mode (wholesale free) → asserts `live_count()` returns flat. This 
 mechanism in isolation, before Forge consumes it.
 
 ### Implementation status
+- **iter-92 (DONE, DICT backing + container layer COMPLETE):** all `NovaDict`
+  backing allocations (keys/vals/hashes/idx in create, the 3 grow blocks, and the
+  idx rehash in `dict_maybe_grow`) route through `nova_back_alloc`/`nova_back_grow`;
+  the idx `0xFF` sentinel memset is preserved after the arena alloc. The string/HTTP
+  buffers (`HttpBuf`, `NovaTermBuf`) are stack/malloc + self-freed (never
+  `nova_heap_alloc`'d) so they need NO interception; fat strings are single
+  self-contained allocations (arena-safe like structs). **So LIST + DICT complete
+  the container backing layer** — every `nova_heap_alloc`'d object with a separate
+  growable backing is now arena-aware. Validated: structs + 5000 grown lists +
+  1000 grown dicts, each with a reference cycle, freed wholesale; live_count flat;
+  ASAN clean. REMAINING: NOVA `arena_enter`/`arena_exit` builtins (iter-93, compiler
+  change + reconverge) + green-task save/restore of `nova_active_arena`.
 - **iter-91 (DONE, LIST backing):** all `NovaList` backing allocations now follow the
   list's arena kind via `nova_back_alloc`/`nova_back_calloc`/`nova_back_grow`
   (create, create_filled, append, append_no_rc, insert, concat, slice, sort_by);

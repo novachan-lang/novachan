@@ -14,6 +14,10 @@ extern void*   nova_rt_struct_alloc(int64_t size);
 extern int64_t nova_rt_live_count(void);
 extern int64_t nova_rt_list_create(void);
 extern int64_t nova_rt_list_append(int64_t handle, int64_t elem);
+extern int64_t nova_rt_dict_create(void);
+extern int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val);
+#include <stdlib.h>
+#include <stdio.h>
 
 int main(void) {
     /* Warm the allocator OUTSIDE any scope so lazy init doesn't skew the baseline. */
@@ -66,17 +70,38 @@ int main(void) {
     nova_rt_list_append(cyc, cyc);
     nova_rt_arena_scope_exit(p3);                /* wholesale free: headers AND data arrays */
 
-    int64_t after = nova_rt_live_count();
-    int64_t d3 = after - mid2;
+    int64_t d3 = nova_rt_live_count() - mid2;
+    int64_t mid3 = nova_rt_live_count();
 
-    printf("ARENA probe: base=%lld mid=%lld mid2=%lld after=%lld  d1=%lld d2=%lld d3=%lld\n",
-           (long long)base, (long long)mid, (long long)mid2, (long long)after,
-           (long long)d1, (long long)d2, (long long)d3);
-    if (d1 != 0 || d2 != 0 || d3 != 0) {
-        printf("ARENA FAIL: live_count not flat across arena scopes (d1=%lld d2=%lld d3=%lld)\n",
-               (long long)d1, (long long)d2, (long long)d3);
+    /* ---- Scenario 4: arena DICTS with grow+rehash (realloc->bump+copy) + a cycle ----
+       Keys are heap C strings (persistent, NOT arena, NOT rc-managed) so they outlive
+       the scope; freed by us afterward. 200 distinct keys force several grows+rehashes. */
+    enum { NKEYS = 200 };
+    char* keys[NKEYS];
+    for (int i = 0; i < NKEYS; i++) { keys[i] = (char*)malloc(16); sprintf(keys[i], "k%d", i); }
+    int64_t p4 = nova_rt_arena_scope_enter();
+    for (int r = 0; r < 1000; r++) {
+        int64_t D = nova_rt_dict_create();
+        for (int i = 0; i < NKEYS; i++)
+            nova_rt_dict_set(D, (int64_t)(uintptr_t)keys[i], (int64_t)i);
+    }
+    /* a dict that holds ITSELF as a value -> reference cycle. */
+    int64_t dc = nova_rt_dict_create();
+    nova_rt_dict_set(dc, (int64_t)(uintptr_t)keys[0], dc);
+    nova_rt_arena_scope_exit(p4);              /* wholesale free: dict headers + keys/vals/hashes/idx arrays */
+    int64_t d4 = nova_rt_live_count() - mid3;
+    for (int i = 0; i < NKEYS; i++) free(keys[i]);
+
+    int64_t after = nova_rt_live_count();
+
+    printf("ARENA probe: base=%lld after=%lld  d1=%lld d2=%lld d3=%lld d4=%lld\n",
+           (long long)base, (long long)after,
+           (long long)d1, (long long)d2, (long long)d3, (long long)d4);
+    if (d1 != 0 || d2 != 0 || d3 != 0 || d4 != 0) {
+        printf("ARENA FAIL: live_count not flat across arena scopes (d1=%lld d2=%lld d3=%lld d4=%lld)\n",
+               (long long)d1, (long long)d2, (long long)d3, (long long)d4);
         return 1;
     }
-    printf("ARENA PASS: structs(+2 cycles) AND 5000 grown lists(+1 list-cycle) freed wholesale; live_count flat (run under sanitizer to catch dangling reuse)\n");
+    printf("ARENA PASS: structs(+2 cycles), 5000 grown lists(+cycle), 1000 grown dicts(+cycle) freed wholesale; live_count flat (run under sanitizer to catch dangling reuse)\n");
     return 0;
 }

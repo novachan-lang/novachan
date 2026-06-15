@@ -422,6 +422,10 @@ static __declspec(thread) NovaArena* nova_active_arena = NULL;
 static __thread NovaArena* nova_active_arena = NULL;
 #endif
 static void* nova_arena_bump(NovaArena* a, size_t size);
+/* Arena-aware container backing storage (defined near the list section). */
+static void* nova_back_alloc(size_t bytes);
+static void* nova_back_calloc(size_t bytes);
+static void* nova_back_grow(void* obj, size_t oldbytes, size_t newbytes, void* oldptr);
 
 #ifdef _WIN32
 static CRITICAL_SECTION nova_mem_lock;
@@ -997,9 +1001,11 @@ static void dict_rebuild_index(NovaDict* d) {
 
 static void dict_maybe_grow(NovaDict* d) {
     if (d->size * 3 < d->idx_cap * 2) return;
+    int64_t old_idx_cap = d->idx_cap;
     d->idx_cap *= 2;
-    d->idx = realloc(d->idx, (size_t)d->idx_cap * sizeof(int64_t));
-    dict_rebuild_index(d);
+    d->idx = (int64_t*)nova_back_grow((void*)d, (size_t)old_idx_cap * sizeof(int64_t),
+        (size_t)d->idx_cap * sizeof(int64_t), d->idx);
+    dict_rebuild_index(d);  /* fully rebuilds idx (0xFF + re-insert), so the copied bytes are overwritten */
 }
 
 /* forward decl — used by nova_rt_contains before dict section */
@@ -1943,13 +1949,13 @@ int64_t nova_rt_dict_create(void) {
     NovaDict* d = (NovaDict*)nova_heap_alloc(sizeof(NovaDict), NOVA_MEM_DICT);
     if (!d) return 0;
     d->cap     = 8;
-    d->keys    = malloc(8 * sizeof(int64_t));
-    d->vals    = malloc(8 * sizeof(int64_t));
-    d->hashes  = malloc(8 * sizeof(uint64_t));
+    d->keys    = nova_back_alloc(8 * sizeof(int64_t));
+    d->vals    = nova_back_alloc(8 * sizeof(int64_t));
+    d->hashes  = nova_back_alloc(8 * sizeof(uint64_t));
     d->size    = 0;
     d->idx_cap = 16;
-    d->idx     = malloc(16 * sizeof(int64_t));
-    memset(d->idx, 0xFF, 16 * sizeof(int64_t));
+    d->idx     = nova_back_alloc(16 * sizeof(int64_t));
+    memset(d->idx, 0xFF, 16 * sizeof(int64_t));   /* DICT_IDX_EMPTY sentinel (overrides arena zero) */
     return (int64_t)(uintptr_t)d;
 }
 
@@ -1978,10 +1984,14 @@ int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
         slot = (slot + 1) & (d->idx_cap - 1);
     }
     if (d->size >= d->cap) {
+        int64_t old_cap = d->cap;
         d->cap *= 2;
-        d->keys = realloc(d->keys, (size_t)d->cap * sizeof(int64_t));
-        d->vals = realloc(d->vals, (size_t)d->cap * sizeof(int64_t));
-        d->hashes = realloc(d->hashes, (size_t)d->cap * sizeof(uint64_t));
+        d->keys = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
+            (size_t)d->cap * sizeof(int64_t), d->keys);
+        d->vals = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
+            (size_t)d->cap * sizeof(int64_t), d->vals);
+        d->hashes = (uint64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(uint64_t),
+            (size_t)d->cap * sizeof(uint64_t), d->hashes);
     }
     d->keys[d->size] = key;
     d->vals[d->size] = val;
@@ -2011,10 +2021,14 @@ int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
         slot = (slot + 1) & (d->idx_cap - 1);
     }
     if (d->size >= d->cap) {
+        int64_t old_cap = d->cap;
         d->cap *= 2;
-        d->keys = realloc(d->keys, (size_t)d->cap * sizeof(int64_t));
-        d->vals = realloc(d->vals, (size_t)d->cap * sizeof(int64_t));
-        d->hashes = realloc(d->hashes, (size_t)d->cap * sizeof(uint64_t));
+        d->keys = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
+            (size_t)d->cap * sizeof(int64_t), d->keys);
+        d->vals = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
+            (size_t)d->cap * sizeof(int64_t), d->vals);
+        d->hashes = (uint64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(uint64_t),
+            (size_t)d->cap * sizeof(uint64_t), d->hashes);
     }
     d->keys[d->size] = key;
     d->vals[d->size] = val;
@@ -2168,10 +2182,14 @@ int64_t nova_rt_dict_set_concat2(int64_t handle, int64_t a, int64_t b, int64_t v
     memcpy(combined + la, sb, lb + 1);
 
     if (d->size >= d->cap) {
+        int64_t old_cap = d->cap;
         d->cap *= 2;
-        d->keys = realloc(d->keys, (size_t)d->cap * sizeof(int64_t));
-        d->vals = realloc(d->vals, (size_t)d->cap * sizeof(int64_t));
-        d->hashes = realloc(d->hashes, (size_t)d->cap * sizeof(uint64_t));
+        d->keys = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
+            (size_t)d->cap * sizeof(int64_t), d->keys);
+        d->vals = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
+            (size_t)d->cap * sizeof(int64_t), d->vals);
+        d->hashes = (uint64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(uint64_t),
+            (size_t)d->cap * sizeof(uint64_t), d->hashes);
     }
     d->keys[d->size] = (int64_t)(uintptr_t)combined;
     d->vals[d->size] = val;
