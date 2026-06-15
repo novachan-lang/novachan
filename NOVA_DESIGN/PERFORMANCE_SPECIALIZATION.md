@@ -97,6 +97,28 @@ typed IR above. With Stage 1: struct float math = pure `fmul`/`fadd`.
 > a green-runtime/heap-layout interaction). The verified gate CAUGHT this — do not ship until nn/stats
 > stay green under the FULL parallel regression repeatedly.
 
+> **Stage 2 RE-EVALUATION (2026-06-15, iter-98).** The revert's failure — "nn/stats FAIL under the
+> PARALLEL regression yet pass 8/8 in isolation" — has the EXACT signature of the parallel-regression
+> HARNESS flakiness independently observed twice this session (dirwatch and demo_frameworks_v2 both
+> failed once under the parallel 432-run and passed 5/5 standalone, empty error logs). So the Stage 2
+> revert MAY have blamed a harness flake rather than a real Stage-2 bug. ACTION for a future perf
+> session: RE-VALIDATE Stage 2 (the precise retry: direct-expression float marks only, no slot flow)
+> by running nn/stats in ISOLATION repeatedly + the full regression several times, to separate a real
+> wrong-skip from the harness flake. NOT done now (see iter-98 strategic note below).
+
+> ## iter-98 STRATEGIC ASSESSMENT (2026-06-15)
+> NOVA is already **~C-class** (~1.04× C non-escaping struct math; 1.21–1.32× struct-passed-to-fn) and
+> S1 (direct-call specialization) is done. The remaining perf gap is **diminishing-returns**: Stage 2
+> is marginal (~2 unbox/dot, needs re-implementation + the flake re-validation above); Stages 3–5 are
+> genuine fresh-session compiler campaigns (S5/HOF carries the `ti_fn_param_types` soundness trap). No
+> clean high-value BOUNDED perf win is available for a single careful iteration. Meanwhile the core has
+> reached the user's stated framework-readiness gate (C-class perf + the proven arena flat-memory
+> serving, iters 89–95). **Per the directive's explicit guidance, the higher-value next move is FORGE**
+> — the north-star, now buildable on the arena foundation, and the visible "compete with every
+> language" proof. Perf S2–5 and scope-exit RC remain tracked, sound, default-off refinements to take
+> in dedicated sessions; they do not block Forge and do not move the "compete" needle as much as a real
+> framework does.
+
 **Stage 3 — Struct SROA.** Non-escaping structs (escape analysis exists — Track 8) lower to LLVM
 `{double,double}` value aggregates, not heap `i64*` → LLVM splits into registers, zero malloc.
 
