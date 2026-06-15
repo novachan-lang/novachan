@@ -348,6 +348,15 @@ fn cors_preflight(origin: string) -> string
 fn app()
     let a = {}
     a["routes"] = []
+    a["mws"] = []
+    a
+
+// Register a middleware. Middleware = fn(next_handler) -> new_handler, composed by
+// function-wrapping. Applied OUTSIDE-IN: the first use() is the OUTERMOST wrapper (sees
+// the request first, the response last). `use` is a free identifier in NOVA (import is
+// the module keyword), so this name is safe.
+fn use(a, mw)
+    push(a["mws"], mw)
     a
 
 // Internal route registrar. NOTE: named _fr_route (not `route`) because NOVA module
@@ -399,23 +408,17 @@ fn _fr_path_clean(path: string) -> string
         return path
     slice(path, 0, q)
 
-// Pure dispatch: route-match + run the handler, returning the response string.
-// 404 if no route matches the path at all; 405 if the path matches a route of a
-// DIFFERENT method. Pure (no socket) -> usable for testing via mock requests.
-fn dispatch(a, method: string, path: string, body: string) -> string
-    let clean = _fr_path_clean(path)
+// The route TERMINAL: match a built Request against the routes, bind :params, call the
+// handler. 404 if no route matches the path; 405 if the path matches a different method.
+fn _fr_route_dispatch(a, req)
     let routes = a["routes"]
     let other = 0
     let i = 0
     while i < len(routes)
         let rt = routes[i]
-        let mr = _fr_match(rt[1], clean)
+        let mr = _fr_match(rt[1], req["path"])
         if is_ok(mr)
-            if rt[0] == method or rt[0] == "*"
-                let req = {}
-                req["method"] = method
-                req["path"] = clean
-                req["body"] = body
+            if rt[0] == req["method"] or rt[0] == "*"
                 req["params"] = unwrap(mr)
                 let h = rt[2]
                 return h(req)
@@ -424,7 +427,27 @@ fn dispatch(a, method: string, path: string, body: string) -> string
         i = i + 1
     if other == 1
         return text(405, "method not allowed")
-    not_found("no route: " + method + " " + clean)
+    not_found("no route: " + req["method"] + " " + req["path"])
+
+// Pure dispatch: build the Request, run the middleware chain (outside-in) around the
+// route terminal, return the response string. Pure (no socket) -> testable via mock.
+fn dispatch(a, method: string, path: string, body: string) -> string
+    let req = {}
+    req["method"] = method
+    req["path"] = _fr_path_clean(path)
+    req["body"] = body
+    req["params"] = {}
+    // Fold the middleware around the terminal. Wrapping the LAST-registered mw first
+    // makes it innermost (closest to the route) and the FIRST-registered outermost.
+    // Middleware shape is fn(req, next) -> string (composition-friendly; _fr_wrap turns
+    // each into a fn(req) by binding `next`, avoiding triple-curried lambdas).
+    let h = fn(r) _fr_route_dispatch(a, r)
+    let mws = a["mws"]
+    let i = len(mws) - 1
+    while i >= 0
+        h = _fr_wrap(mws[i], h)
+        i = i - 1
+    h(req)
 
 // Serve exactly N requests with routing, each handled INSIDE an arena scope (flat
 // per-request memory via serve_n_arena). Deterministic -> testable.
@@ -440,4 +463,37 @@ fn serve_app_n(a, port: int, n: int)
 // Infinite routed serve, arena-scoped per request.
 fn serve_app(a, port: int)
     serve_arena(port, fn(m, p, b) dispatch(a, m, p, b))
+
+// ── Middleware ───────────────────────────────────────────────────────────────
+// A middleware is fn(req, next) -> response-string: it may inspect/modify req, call
+// next(req) for the downstream response, and modify that response. Composed by the
+// dispatch fold (outside-in). _fr_wrap binds `next` so a mw becomes a fn(req).
+fn _fr_wrap(mw, next)
+    return fn(req) mw(req, next)
+
+// Insert `name: value` before a built response's blank-line boundary (passthrough if none).
+fn _fr_add_header(resp: string, name: string, value: string) -> string
+    let marker = "\r\n\r\n"
+    let i = find(resp, marker)
+    if i < 0
+        return resp
+    let head = slice(resp, 0, i)
+    let body = slice(resp, i + 4, len(resp))
+    head + "\r\n" + name + ": " + value + marker + body
+
+// CORS middleware: adds Access-Control-* headers to every response.
+fn mw_cors(origin: string)
+    return fn(req, next) with_cors(next(req), origin)
+
+// Header-injecting middleware: adds `name: value` to every response.
+fn mw_header(name: string, value: string)
+    return fn(req, next) _fr_add_header(next(req), name, value)
+
+// Logging middleware: prints method + path, then runs next (side effect; pass-through).
+fn _fr_log_next(req, next)
+    print("[forge] " + req["method"] + " " + req["path"])
+    next(req)
+
+fn mw_logger()
+    return fn(req, next) _fr_log_next(req, next)
 
