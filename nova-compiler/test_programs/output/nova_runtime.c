@@ -404,6 +404,25 @@ static volatile int nova_is_multithreaded = 0;
 static int          nova_arena_mode  = 0;
 /* nova_heap_base declared near slab allocator — tracks lowest heap address for fast RC filter */
 
+/* ── Transparent per-request arena (NOVA_DESIGN/FULL_TOTAL_RC_DESIGN.md §2) ──
+   When a scope is active, nova_heap_alloc bump-allocates into it and tags objects
+   arena-owned (NOVA_RC_ARENA_BIT in the rc field -> rc_inc/dec no-op on them, so
+   they are NEVER individually freed). The whole arena is freed WHOLESALE on scope
+   exit: cycle-immune + zero per-object RC. Default NULL -> completely inert (the
+   heap path is unchanged) for all existing programs. NOTE: this is per-OS-thread
+   for now; a green task that PARKS while a scope is active must save/restore this
+   pointer on the carrier (a follow-up before request use — today only whole,
+   non-yielding scopes are sound). Backing arrays of list/dict/string are still
+   malloc'd separately (iter-91 routes them through the arena too); STRUCTs are
+   self-contained and fully arena-safe now. */
+typedef struct NovaArena NovaArena;
+#ifdef _WIN32
+static __declspec(thread) NovaArena* nova_active_arena = NULL;
+#else
+static __thread NovaArena* nova_active_arena = NULL;
+#endif
+static void* nova_arena_bump(NovaArena* a, size_t size);
+
 #ifdef _WIN32
 static CRITICAL_SECTION nova_mem_lock;
 #else
@@ -424,6 +443,11 @@ static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 #define NOVA_RC_TAG(ptr)    ((NovaMemTag)(((const int32_t*)(ptr))[-1] & 0xFFFF))
 #define NOVA_RC_VALID(ptr)  ((((const int32_t*)(ptr))[-1] & 0xFFFF0000) == (uint32_t)NOVA_RC_MAGIC)
 #define NOVA_RC_COUNT(ptr)  (((int32_t*)(ptr))[-2])
+/* Arena-owned marker stored in the rc field: rc_inc/dec treat the object as
+   immortal (no-op) so it is never individually freed; the arena frees it wholesale.
+   A high bit keeps the value >= 1 so nova_mem_find_tag's rc-sanity check still
+   passes (operations on the object work normally). */
+#define NOVA_RC_ARENA_BIT 0x40000000
 /* Structs/closures pack their slot count into the tag word's free bits:
    low 3 bits = kind (NOVA_MEM_STRUCT=5), bits 3..15 = slot count (0..8191).
    Non-struct objects keep slot bits 0, so their tag stays exactly 0..4. */
@@ -432,6 +456,18 @@ static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     size_t total = NOVA_RC_HDR_SIZE + size;
     char* base;
+    if (nova_active_arena) {
+        /* Transparent arena: bump-allocate, tag arena-owned (rc no-op), and EXCLUDE
+           from nova_mem_live (freed wholesale on scope exit -> must not count as a
+           leak). Slabs are bypassed: slab objects are individually freed, arena
+           objects are not. */
+        base = (char*)nova_arena_bump(nova_active_arena, total);
+        if (!base) return NULL;
+        ((int32_t*)base)[0] = NOVA_RC_ARENA_BIT;
+        ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
+        nova_mem_total++;
+        return base + NOVA_RC_HDR_SIZE;
+    }
     if (!nova_slab_inited) nova_slab_init();
     if (tag == NOVA_MEM_LIST && total <= SLAB_32_OBJ_SIZE)
         base = (char*)nova_slab_alloc(&nova_slab_32);
@@ -7856,6 +7892,7 @@ void nova_rc_inc(int64_t val) {
     int kind = nova_rc_is_managed(ptr);
     if (kind == 0) return;
     if (kind == -1) { nova_strpool_rc_inc(ptr); return; }
+    if (NOVA_RC_COUNT(ptr) & NOVA_RC_ARENA_BIT) return;   /* arena-owned: immortal, freed wholesale */
     nova_rc_inc_count++;
     if (nova_is_multithreaded) {
 #ifdef _WIN32
@@ -7879,6 +7916,7 @@ static void nova_rc_dec_internal(int64_t val) {
     int kind = nova_rc_is_managed(ptr);
     if (kind == 0) return;
     if (kind == -1) { nova_strpool_rc_dec(ptr); return; }
+    if (NOVA_RC_COUNT(ptr) & NOVA_RC_ARENA_BIT) return;   /* arena-owned: immortal, freed wholesale */
     int32_t new_count;
     if (nova_is_multithreaded) {
 #ifdef _WIN32
@@ -14730,17 +14768,36 @@ typedef struct NovaArenaChunk {
     char   data[1];
 } NovaArenaChunk;
 
-typedef struct {
+struct NovaArena {
     NovaArenaChunk* current;
     NovaArenaChunk* all;      /* head of all chunks for free */
     size_t          total;
-} NovaArena;
+};
 
 static NovaArenaChunk* nova_arena_new_chunk(size_t cap) {
     NovaArenaChunk* c = (NovaArenaChunk*)malloc(sizeof(NovaArenaChunk) + cap);
     if (!c) return NULL;
     c->next = NULL; c->used = 0; c->cap = cap;
     return c;
+}
+
+/* Bump-pointer allocation into the transparent arena (used by nova_heap_alloc when
+   a scope is active). Returns a zero-initialized block (matches the calloc/struct
+   path of the normal heap allocator). No realloc/free: arenas are freed wholesale. */
+static void* nova_arena_bump(NovaArena* a, size_t size) {
+    if (!a) return NULL;
+    size_t sz = (size + 7) & ~(size_t)7;   /* 8-byte align */
+    if (!a->current || a->current->used + sz > a->current->cap) {
+        size_t new_cap = sz > 65536 ? sz : 65536;
+        NovaArenaChunk* c = nova_arena_new_chunk(new_cap);
+        if (!c) return NULL;
+        c->next = a->all; a->all = c; a->current = c;
+    }
+    char* ptr = a->current->data + a->current->used;
+    a->current->used += sz;
+    a->total         += sz;
+    memset(ptr, 0, sz);
+    return ptr;
 }
 
 int64_t nova_rt_arena_create(void) {
@@ -14789,6 +14846,30 @@ void nova_rt_arena_free(int64_t handle) {
 int64_t nova_rt_arena_used(int64_t handle) {
     NovaArena* a = (NovaArena*)(uintptr_t)handle;
     return a ? (int64_t)a->total : 0;
+}
+
+/* ── Transparent arena SCOPE (the per-request hot path) ────────────────────────
+   nova_rt_arena_scope_enter(): subsequent nova_heap_alloc allocations bump into a
+   fresh arena (arena-owned, rc no-op). Returns the PREVIOUS active arena as an
+   opaque handle so nested scopes restore correctly.
+   nova_rt_arena_scope_exit(prev): restore the enclosing arena and free THIS scope's
+   arena WHOLESALE -- every object allocated in it dies at once, including reference
+   cycles (RC cannot collect those; the arena makes them irrelevant). SOUND iff no
+   live reference into this arena escaped the scope; NOVA copies every value that
+   crosses a process/channel boundary (channel_send deep-copies + process
+   isolation), so request-scoped use is safe. */
+int64_t nova_rt_arena_scope_enter(void) {
+    NovaArena* prev = nova_active_arena;
+    NovaArena* a = (NovaArena*)(uintptr_t)nova_rt_arena_create();
+    if (!a) return (int64_t)(uintptr_t)prev;   /* OOM: stay on the enclosing scope */
+    nova_active_arena = a;
+    return (int64_t)(uintptr_t)prev;
+}
+
+void nova_rt_arena_scope_exit(int64_t prev_handle) {
+    NovaArena* a = nova_active_arena;
+    nova_active_arena = (NovaArena*)(uintptr_t)prev_handle;
+    if (a) nova_rt_arena_free((int64_t)(uintptr_t)a);
 }
 
 /* ── Track 8: F015 Integer Overflow Panic ─────────────────────────────────── */

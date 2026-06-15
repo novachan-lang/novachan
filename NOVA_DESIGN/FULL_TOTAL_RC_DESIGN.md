@@ -86,10 +86,41 @@ A probe that: enters arena mode → allocates many objects *including a delibera
 exits arena mode (wholesale free) → asserts `live_count()` returns flat. This validates the
 mechanism in isolation, before Forge consumes it.
 
+### Implementation status
+- **iter-90 (DONE, runtime foundation):** transparent arena via a thread-local
+  `nova_active_arena`; `nova_heap_alloc` bump-allocates into it and tags objects
+  with `NOVA_RC_ARENA_BIT` (bit 30 of the rc field) so `rc_inc`/`rc_dec` no-op on
+  them (never individually freed); `nova_rt_arena_scope_enter/exit` push/pop +
+  free wholesale (nesting via a returned prev-handle). Arena objects are excluded
+  from `nova_mem_live` (the leak metric). VALIDATED by `_arena_harness.c`: 100k+
+  structs + TWO reference cycles freed wholesale, `live_count` flat, ASAN clean
+  (no UAF/double-free). Completely INERT when no scope is active (heap path
+  unchanged) → zero risk to the 432 suite.
+- **Gotcha 1 (iter-91):** list/dict/string **backing arrays** are separate
+  `malloc`s (`list->data`, dict keys/vals/hashes/idx, string builders). Under a
+  scope only the *header* enters the arena; the backing array would leak on
+  wholesale free. Fix: an object's allocation kind is FIXED AT CREATION (its
+  `ARENA_BIT`); its backing storage follows its own kind; arena "realloc" =
+  bump a new array + copy (old wasted, reclaimed wholesale — no realloc/free in a
+  bump arena). Finite site list: list create/append/insert, dict create/grow/set,
+  string builders. STRUCTs need no change (self-contained) — hence the iter-90
+  struct-only validation.
+- **Gotcha 2 (before request use):** `nova_active_arena` is per-OS-thread. Green
+  tasks interleave on one carrier, so a task that PARKS mid-scope must save/restore
+  this pointer as part of its context (scheduler integration). Today only whole,
+  non-yielding scopes are sound.
+- **Gotcha 3:** `ARENA_BIT` at bit 30 means a real object's rc must stay < 2^30
+  (~1B refs) — far below the existing int32 rc overflow limit (2^31), so no new
+  practical constraint; documented.
+
 ### Open work
-- Arena lifecycle tied to the green-process scheduler (enter on dispatch, free on completion).
-- Growable arena chunks (a request may allocate unbounded; chunk-list + bulk free).
-- The escape-copy audit: enumerate every boundary and prove it copies.
+- list/dict/string backing-array interception (Gotcha 1) — iter-91.
+- Green-task save/restore of `nova_active_arena` (Gotcha 2) + lifecycle tied to the
+  green-process scheduler (enter on dispatch, free on completion).
+- The escape-copy audit: enumerate every boundary and prove it copies out before
+  free (channel-send ✓, response-serialize ✓, globals = process-isolated ✓).
+- NOVA-level surface: `arena_enter()`/`arena_exit()` builtins (compiler change +
+  reconverge) so NOVA programs (and Forge) can use scopes — iter-91+.
 
 ---
 
