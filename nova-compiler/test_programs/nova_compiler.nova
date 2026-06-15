@@ -14331,9 +14331,10 @@ type IrEmitter
     ire_uses_byname: int
     ire_borrow_src: dict        // total-RC S1: registers holding a BORROWED value (index_get/field_get result). Pure metadata; inert until S2 reads it for the positive-owned drop gate.
     ire_owned: dict             // total-RC S1: registers holding a freshly-OWNED value (make_list/dict/struct/closure result). Pure metadata; inert until S3 reads it for the positive-owned drop gate. A register in neither set is UNCLASSIFIED -> S3 treats it as not-droppable (conservative).
+    ire_fullrc_drop: dict       // total-RC S3 (NOVA_T8_FULLRC): slot names proven always-OWNED + never-escaped -> their overwrite emits rc_dec(old). EMPTY unless the flag is on (then byte-identical codegen).
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {})
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {})
 
 // Mark dest as a raw double. ire_reg_types is also set by slot_load propagation (a FLAT,
 // control-flow-insensitive map -> can be wrongly "float" for a reassigned slot), so that
@@ -14817,6 +14818,16 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 // C writes through, NOVA reads via subsequent slot_load.
                 ire_indent(e, dest + " = ptrtoint ptr %slot." + value + " to i64")
             else if op == "slot_store"
+                // total-RC Stage 3 (NOVA_T8_FULLRC): if the pre-pass proved this slot is
+                // always-OWNED + never-escaped, rc_dec the value it currently holds before the
+                // overwrite -- this is what frees the previous loop iteration's allocation (the
+                // headline leak). nova_rt_rc_drop_reassign skips a self-store and is
+                // pointer-validated, so the only values dropped here are uniquely-owned heap
+                // handles. The set is EMPTY unless NOVA_T8_FULLRC=1 -> no-op + byte-identical off.
+                if contains(e.ire_fullrc_drop, value)
+                    let _frc_old = ire_fresh_tmp(e, "frcold." + value)
+                    ire_indent(e, _frc_old + " = load i64, ptr %slot." + value + ", align 8")
+                    ire_indent(e, "call i64 @nova_rt_rc_drop_reassign(i64 " + _frc_old + ", i64 " + args[0] + ")")
                 ire_indent(e, "store i64 " + args[0] + ", ptr %slot." + value + ", align 8")
                 // Sound slot container-kind tracking: a slot adopts the stored value's
                 // static kind, and is CLEARED (-> runtime dispatch) when that kind is
@@ -15513,6 +15524,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
     e.ire_dropped = {}
     e.ire_borrow_src = {}        // total-RC S1: per-function reset (CVE-class -- borrow provenance must not leak across fn boundaries)
     e.ire_owned = {}             // total-RC S1: per-function reset (owned provenance must not leak across fn boundaries)
+    e.ire_fullrc_drop = {}       // total-RC S3: per-function reset (recomputed by the pre-pass below when NOVA_T8_FULLRC=1)
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             // Anonymous lambdas (__lambda_*) are always called via a closure (any
@@ -15570,6 +15582,63 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
             for _ff_s in keys(_ff_any)
                 if not contains(_ff_bad, _ff_s)
                     e.ire_reg_types["slot." + _ff_s] = "float"
+            // total-RC Stage 3 (NOVA_T8_FULLRC, default OFF): pre-pass over this function's IR to
+            // find slots that can be soundly rc_dec'd on overwrite (the headline loop-rebind leak).
+            // A slot is DROPPABLE iff: (a) every slot_store stores a freshly-OWNED value
+            // (make_list/dict/struct/closure result) -> the slot uniquely owns a heap handle; AND
+            // (b) it NEVER escapes -- its loaded value is used ONLY as args[0] of a safe read op
+            // (list_len / index_get / field_get, which do not retain the container), and is never
+            // an arg to a call/make_*/field_set/index_set-value/dyn_call, never aliased into another
+            // slot (let b=a), never returned. Conservative by construction (any unrecognized use ->
+            // not droppable). When the flag is OFF the set stays EMPTY -> zero drops -> codegen is
+            // byte-identical. This MUST be a whole-function pre-pass: a use later in the function
+            // (e.g. `return x` after the loop) must disqualify an earlier store's drop.
+            let _frc_flag = env("NOVA_T8_FULLRC")
+            if len(_frc_flag) > 0 and _frc_flag[0] == "1"
+                let _frc_owned = {}
+                let _frc_loadof = {}
+                for _fa_b in blocks
+                    match _fa_b
+                        IrBlock(_fa_lbl, _fa_insts, _fa_term) =>
+                            for _fa_i in _fa_insts
+                                match _fa_i
+                                    IrInst(_fao, _fad, _fat, _faa, _fav, _fan, _fae, _fal) =>
+                                        if _fao == "make_list" or _fao == "make_dict" or _fao == "make_struct" or _fao == "make_closure"
+                                            _frc_owned[_fad] = 1
+                                        if _fao == "slot_load"
+                                            _frc_loadof[_fad] = _fav
+                let _frc_stored = {}
+                let _frc_bad = {}
+                for _fc_b in blocks
+                    match _fc_b
+                        IrBlock(_fc_lbl, _fc_insts, _fc_term) =>
+                            for _fc_i in _fc_insts
+                                match _fc_i
+                                    IrInst(_fco, _fcd, _fct, _fca, _fcv, _fcn, _fce, _fcl) =>
+                                        if _fco == "slot_store" and len(_fca) >= 1
+                                            _frc_stored[_fcv] = 1
+                                            if not contains(_frc_owned, _fca[0])
+                                                _frc_bad[_fcv] = 1
+                                            if contains(_frc_loadof, _fca[0])
+                                                _frc_bad[_frc_loadof[_fca[0]]] = 1
+                                        else
+                                            let _fc_safe = _fco == "list_len" or _fco == "index_get" or _fco == "field_get"
+                                            let _fc_ai = 0
+                                            while _fc_ai < len(_fca)
+                                                if contains(_frc_loadof, _fca[_fc_ai])
+                                                    if not (_fc_safe and _fc_ai == 0)
+                                                        _frc_bad[_frc_loadof[_fca[_fc_ai]]] = 1
+                                                _fc_ai = _fc_ai + 1
+                            match _fc_term
+                                IrInst(_ft_o, _ft_d, _ft_t, _ft_a, _ft_v, _ft_n, _ft_e, _ft_l) =>
+                                    let _ft_ai = 0
+                                    while _ft_ai < len(_ft_a)
+                                        if contains(_frc_loadof, _ft_a[_ft_ai])
+                                            _frc_bad[_frc_loadof[_ft_a[_ft_ai]]] = 1
+                                        _ft_ai = _ft_ai + 1
+                for _frc_s in keys(_frc_stored)
+                    if not contains(_frc_bad, _frc_s)
+                        e.ire_fullrc_drop[_frc_s] = 1
             let header = "define i64 @" + name + "("
             let i = 0
             while i < len(params)
@@ -16138,6 +16207,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_copy_file(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_file_size(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_file_mtime(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_rc_drop_reassign(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_is_dir(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_is_file(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_write_bytes(i64, i64) nounwind")

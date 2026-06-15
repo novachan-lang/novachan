@@ -7889,6 +7889,19 @@ void nova_rc_dec(int64_t val) {
     nova_rc_dec_internal(val);
 }
 
+/* total-RC Stage 3 (NOVA_T8_FULLRC): drop the value a slot previously held when it is being
+   overwritten with a DIFFERENT value. The compiler emits a call to this only for slots its
+   pre-pass proved are ALWAYS-OWNED (every store is a fresh allocation) and NEVER-ESCAPED/aliased,
+   so `oldv` is a uniquely-owned heap handle (RC=1) and dropping it is the correct destructor --
+   this is what frees the previous iteration's list/dict in a loop-rebind (the headline leak).
+   oldv != newv guards a self-store. nova_rc_dec is pointer-validated (find_tag range/align/magic/
+   rc/structural), so a non-heap or already-dead oldv is a safe no-op -- a final guard behind the
+   compiler's analysis. Returns 0 for the i64 calling convention. */
+int64_t nova_rt_rc_drop_reassign(int64_t oldv, int64_t newv) {
+    if (oldv != newv) nova_rc_dec(oldv);
+    return 0;
+}
+
 /* ── Memory Cleanup ─────────────────────────────────────────────────────── */
 
 int64_t nova_rt_alloc_count(void) {
