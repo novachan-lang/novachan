@@ -87,6 +87,18 @@ exits arena mode (wholesale free) → asserts `live_count()` returns flat. This 
 mechanism in isolation, before Forge consumes it.
 
 ### Implementation status
+- **iter-93 (DONE, NOVA arena builtins + flat-memory PROVEN):** `arena_enter()` /
+  `arena_exit(prev)` are now NOVA builtins (resolve_runtime_fn -> nova_rt_arena_
+  scope_enter/exit; registry ()->int / (int)->int; declares in both codegen paths;
+  rtype int). `nova_rt_arena_scope_exit` returns int64 so the generic builtin-call
+  path emits `call i64` (the void-emit path is hardcoded-only and unproven).
+  `_arena_demo.nova`: 1000 "requests", each `arena_enter()` -> build 50 dicts +
+  lists + strings + a self-referential dict CYCLE -> `arena_exit()`; live_count
+  delta = **0** (FLAT) on the reconverged compiler; ASAN clean. FIRST fixpoint
+  change in the arena arc (D8A18723), 432/0 both modes, green_scale both. This is
+  the framework-readiness property demonstrated in NOVA source. REMAINING: green-
+  task save/restore of `nova_active_arena` (scopes that yield) + wire a scope around
+  a request handler (iter-94).
 - **iter-92 (DONE, DICT backing + container layer COMPLETE):** all `NovaDict`
   backing allocations (keys/vals/hashes/idx in create, the 3 grow blocks, and the
   idx rehash in `dict_maybe_grow`) route through `nova_back_alloc`/`nova_back_grow`;

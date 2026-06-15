@@ -14938,10 +14938,11 @@ int64_t nova_rt_arena_scope_enter(void) {
     return (int64_t)(uintptr_t)prev;
 }
 
-void nova_rt_arena_scope_exit(int64_t prev_handle) {
+int64_t nova_rt_arena_scope_exit(int64_t prev_handle) {
     NovaArena* a = nova_active_arena;
     nova_active_arena = (NovaArena*)(uintptr_t)prev_handle;
     if (a) nova_rt_arena_free((int64_t)(uintptr_t)a);
+    return 0;   /* int return so the generic builtin-call path emits `call i64` (no void-emit path) */
 }
 
 /* ── Track 8: F015 Integer Overflow Panic ─────────────────────────────────── */

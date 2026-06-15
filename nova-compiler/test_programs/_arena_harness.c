@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 extern int64_t nova_rt_arena_scope_enter(void);
-extern void    nova_rt_arena_scope_exit(int64_t prev);
+extern int64_t nova_rt_arena_scope_exit(int64_t prev);
 extern void*   nova_rt_struct_alloc(int64_t size);
 extern int64_t nova_rt_live_count(void);
 extern int64_t nova_rt_list_create(void);
