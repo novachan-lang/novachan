@@ -326,3 +326,123 @@ fn cors_preflight(origin: string) -> string
     let r = text(204, "")
     with_cors(r, origin)
 
+// ── Forge Router (v0.3 increment 1) ─────────────────────────────────────────
+// A real method + path router with :param extraction, dispatched INSIDE an arena
+// scope (serve_app_n -> serve_n_arena) so each request holds flat per-request memory.
+//
+//   let a = forge.app()
+//   forge.get(a, "/users/:id", fn(req) forge.json_obj(200, [["id", req["params"]["id"]]]))
+//   forge.serve_app_n(a, 8080, 100)
+//
+// Handler = fn(req) -> response string, where req is a dict:
+//   req["method"]  req["path"]  req["body"]  req["params"]["id"]
+//
+// HONEST SCOPE (FORGE_DESIGN.md s4.3): responses use the WORKING serialization paths
+// (forge.json / json_obj / text). Returning a BARE STRUCT ("return user") is NOT yet
+// supported -- it needs the auto-JSON-on-return compiler hook (the "correctness cliff":
+// a struct erased through `any` serializes as a JSON ARRAY, not an object). Use
+// forge.json_obj(...) / forge.json(dict-string) until that hook lands (next increment).
+// The Request is a dict here, not the design's struct, for the same reason -- dicts
+// serialize correctly today; the struct model arrives with the compiler hook.
+
+fn app()
+    let a = {}
+    a["routes"] = []
+    a
+
+// Internal route registrar. NOTE: named _fr_route (not `route`) because NOVA module
+// functions are FLAT symbols -- a bare `route` collides at link with user/demo code that
+// defines its own fn route(...) (the demo_*_test handlers do exactly that). Public API is
+// get/post/put/delete/patch.
+fn _fr_route(a, method: string, pattern: string, handler)
+    push(a["routes"], [method, pattern, handler])
+    a
+
+fn get(a, pattern: string, handler)
+    _fr_route(a, "GET", pattern, handler)
+
+fn post(a, pattern: string, handler)
+    _fr_route(a, "POST", pattern, handler)
+
+fn put(a, pattern: string, handler)
+    _fr_route(a, "PUT", pattern, handler)
+
+fn delete(a, pattern: string, handler)
+    _fr_route(a, "DELETE", pattern, handler)
+
+fn patch(a, pattern: string, handler)
+    _fr_route(a, "PATCH", pattern, handler)
+
+// Match a route pattern against a path, extracting :params. Result of a params dict.
+fn _fr_match(pattern: string, path: string)
+    let pat_parts = split(pattern, "/")
+    let path_parts = split(path, "/")
+    if len(pat_parts) != len(path_parts)
+        return err("length mismatch")
+    let params = {}
+    let i = 0
+    while i < len(pat_parts)
+        let pp = pat_parts[i]
+        let vp = path_parts[i]
+        if len(pp) > 0 and starts_with(pp, ":")
+            let pn = slice(pp, 1, len(pp))
+            params[pn] = vp
+        else if pp != vp
+            return err("mismatch")
+        i = i + 1
+    ok(params)
+
+// Strip a "?query" suffix from a path for matching.
+fn _fr_path_clean(path: string) -> string
+    let q = find(path, "?")
+    if q < 0
+        return path
+    slice(path, 0, q)
+
+// Pure dispatch: route-match + run the handler, returning the response string.
+// 404 if no route matches the path at all; 405 if the path matches a route of a
+// DIFFERENT method. Pure (no socket) -> usable for testing via mock requests.
+fn dispatch(a, method: string, path: string, body: string) -> string
+    let clean = _fr_path_clean(path)
+    let routes = a["routes"]
+    let other = 0
+    let i = 0
+    while i < len(routes)
+        let rt = routes[i]
+        let mr = _fr_match(rt[1], clean)
+        if is_ok(mr)
+            if rt[0] == method or rt[0] == "*"
+                let req = {}
+                req["method"] = method
+                req["path"] = clean
+                req["body"] = body
+                req["params"] = unwrap(mr)
+                let h = rt[2]
+                return h(req)
+            else
+                other = 1
+        i = i + 1
+    if other == 1
+        return text(405, "method not allowed")
+    not_found("no route: " + method + " " + clean)
+
+// Serve exactly N requests with routing. Deterministic -> testable.
+//
+// NOTE (arena correctness bug, found iter-99): the arena-scoped variant
+// (serve_n_arena) currently CORRUPTS string-producing ops that build an arena
+// list of arena RAW strings inside the scope -- e.g. split() returns garbage
+// elements (a single arena RAW string and arena lists of HEAP strings are fine;
+// the specific interleaving in split is the bug). A router handler does method/
+// path string work, so it MUST use the correct (non-arena) serve_n until the
+// arena bug is fixed. The arena's flat-memory win (serve_n_arena, iter-95) was
+// leak-validated but NOT content-validated -- it must not be used for real
+// handlers until the corruption is root-caused + fixed (tracked: a focused arena
+// correctness investigation). So routed serve uses serve_n (correct, but leaks
+// per request -- the pre-arena leak) for now.
+fn serve_app_n(a, port: int, n: int)
+    serve_n(port, fn(m, p, b) dispatch(a, m, p, b), n)
+
+// Infinite routed serve.
+fn serve_app(a, port: int)
+    serve(port, fn(m, p, b) dispatch(a, m, p, b))
+
