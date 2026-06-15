@@ -143,6 +143,8 @@ $domain_tests = @(
     'rtti_show_test',
     'forge_keystone_test',
     'cross_import_extern_test',
+    'forge_typed_core_test',
+    'cross_module_struct_test',
     'resulteq_test',
     'jsonunicode_test',
     'copyboxsafety_test',

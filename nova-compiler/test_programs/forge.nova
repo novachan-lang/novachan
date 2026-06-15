@@ -560,3 +560,128 @@ fn rows_dicts(columns: list, rows: list)
         i = i + 1
     out
 
+// ── Typed core (Phase 1) ─ Request / Response structs ────────────────────────
+// The typed model the dict-based router above will migrate onto: a Handler is
+// fn(Request) -> Response. Added ADDITIVELY -- the dict router + serve keep working while
+// typed dispatch is built incrementally, so the gate stays green throughout. The
+// struct<->JSON keystone (Phase 0a) makes a handler return a domain struct as JSON for
+// free (resp_json below): the "return your type, get JSON" win, end to end.
+
+type Request
+    method: string      // "GET"
+    path: string        // "/users/42" (clean, query stripped)
+    raw_path: string    // "/users/42?tab=x" (original)
+    params: dict        // ":id" -> "42", filled by the router at match time
+    query: dict         // "tab" -> "x", parsed once
+    headers: dict       // LOWERCASED header name -> value (case-insensitive for free)
+    body: string
+    state: dict         // middleware scratch: state["session"], state["user"], ...
+    conn: int           // raw fd (streaming / upgrade)
+
+type Response
+    status: int         // 200
+    headers: dict       // header name -> value (middleware mutates; finalize serializes once)
+    body: string
+    halted: bool        // a guard set the response; downstream skips, no exceptions
+
+// Parse "k=v&k2=v2" (the ?query) into a dict. Empty dict if none.
+fn _query_dict(raw_path: string) -> dict
+    let d = {}
+    let q = find(raw_path, "?")
+    if q < 0
+        return d
+    let qs = slice(raw_path, q + 1, len(raw_path))
+    let pairs = split(qs, "&")
+    let i = 0
+    while i < len(pairs)
+        let kv = pairs[i]
+        let eq = find(kv, "=")
+        if eq >= 0
+            d[slice(kv, 0, eq)] = slice(kv, eq + 1, len(kv))
+        i = i + 1
+    d
+
+// Parse request headers into a dict with LOWERCASED keys (HTTP header names are
+// case-insensitive). Skips the request line; stops at the blank-line boundary.
+fn _headers_dict(raw: string) -> dict
+    let d = {}
+    let hdr_end = find(raw, "\r\n\r\n")
+    let region = raw
+    if hdr_end >= 0
+        region = slice(raw, 0, hdr_end)
+    let first_nl = find(region, "\r\n")
+    if first_nl < 0
+        return d
+    let block = slice(region, first_nl + 2, len(region))
+    let lines = split(block, "\r\n")
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        let colon = find(line, ":")
+        if colon >= 0
+            let name = lower(trim(slice(line, 0, colon)))
+            let val = trim(slice(line, colon + 1, len(line)))
+            d[name] = val
+        i = i + 1
+    d
+
+// Parse a complete raw HTTP request into a typed Request (parse-ONCE: query + headers are
+// dicts, O(1) access). PUBLIC: the typed serve path + tests build requests with this.
+fn build_request(raw: string, conn: int) -> Request
+    let rp = parse_path(raw)
+    let q = _query_dict(rp)
+    let h = _headers_dict(raw)
+    Request(parse_method(raw), parse_path_clean(raw), rp, {}, q, h, parse_body(raw), {}, conn)
+
+// Case-insensitive header lookup ("" if absent). Keys are stored lowercased.
+fn req_header(req: Request, name: string) -> string
+    let k = lower(name)
+    if contains(req.headers, k)
+        return req.headers[k]
+    ""
+
+// Serialize a Response struct to the HTTP wire string ONCE (status line + headers +
+// Content-Length + body). The single point where a Response becomes bytes.
+fn finalize(resp: Response) -> string
+    let r = "HTTP/1.1 " + _status_line(resp.status) + "\r\n"
+    let ks = keys(resp.headers)
+    let i = 0
+    while i < len(ks)
+        let k = ks[i]
+        r = r + k + ": " + resp.headers[k] + "\r\n"
+        i = i + 1
+    r = r + "Content-Length: " + str(len(resp.body)) + "\r\n"
+    r = r + "Connection: close\r\n"
+    r = r + "Server: NOVA Forge\r\n"
+    r = r + "\r\n"
+    r = r + resp.body
+    r
+
+// ── Typed Response builders (return a Response struct, not a wire string) ──────
+fn resp_new(status: int, body: string) -> Response
+    Response(status, {}, body, false)
+
+fn resp_text(status: int, body: string) -> Response
+    let h = {}
+    h["Content-Type"] = "text/plain; charset=utf-8"
+    Response(status, h, body, false)
+
+fn resp_html(status: int, body: string) -> Response
+    let h = {}
+    h["Content-Type"] = "text/html; charset=utf-8"
+    Response(status, h, body, false)
+
+// resp_json: serialize ANY value (struct via the RTTI keystone / list / dict / scalar) into
+// a JSON Response. A handler can `return forge.resp_json(200, user)` and the client gets a
+// JSON object -- zero annotation.
+fn resp_json(status: int, value) -> Response
+    let h = {}
+    h["Content-Type"] = "application/json"
+    Response(status, h, json_stringify(value), false)
+
+// Set/overwrite a header on a Response (returns it for chaining). O(1) dict write -- the
+// typed answer to the dict router's string-surgery _fr_add_header.
+fn resp_set_header(resp: Response, name: string, value: string) -> Response
+    resp.headers[name] = value
+    resp
+
