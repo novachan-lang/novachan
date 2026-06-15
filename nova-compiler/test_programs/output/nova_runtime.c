@@ -3186,6 +3186,13 @@ static void jbuf_append(JsonBuf* b, const char* s, int64_t n) {
 
 static void jbuf_char(JsonBuf* b, char c) { jbuf_append(b, &c, 1); }
 
+/* Struct RTTI accessors (the hash-keyed metadata table is defined later, beside the
+   struct-name registry). Prototyped here -- with no struct type in their signatures --
+   so json_stringify_value / show can render a struct's fields through the `any` boundary
+   without needing the NovaStructMeta definition this early in the file. */
+static int nova_struct_meta_fcount(int64_t hash);
+static const char* nova_struct_meta_fname(int64_t hash, int idx);
+
 static void json_stringify_value(JsonBuf* b, int64_t val, int depth);
 
 static void json_stringify_str(JsonBuf* b, const char* s) {
@@ -3253,6 +3260,28 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
     if (tag == NOVA_MEM_RAW) {
         json_stringify_str(b, (const char*)ptr);
         return;
+    }
+    if (tag == NOVA_MEM_STRUCT) {
+        /* Struct erased to `any`: recover field names from the hash-keyed RTTI table
+           (slot-0 = type hash) and render a JSON object. Statically-typed structs took
+           the compile-time <Type>__to_json path and never reach here. On a metadata miss
+           (repr-C struct, closure, unregistered) fall through to the prior behavior --
+           strictly an improvement, never a regression. */
+        int64_t _shash = ((const int64_t*)ptr)[0];
+        int _sfc = nova_struct_meta_fcount(_shash);
+        if (_sfc > 0) {
+            const int64_t* slots = (const int64_t*)ptr;
+            jbuf_char(b, '{');
+            for (int _si = 0; _si < _sfc; _si++) {
+                if (_si > 0) jbuf_char(b, ',');
+                const char* _fn = nova_struct_meta_fname(_shash, _si);
+                json_stringify_str(b, _fn ? _fn : "");
+                jbuf_char(b, ':');
+                json_stringify_value(b, slots[_si + 1], depth + 1);   /* slot 0 = type hash */
+            }
+            jbuf_char(b, '}');
+            return;
+        }
     }
     if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
         unsigned char c = *(unsigned char*)ptr;
@@ -13443,6 +13472,22 @@ void nova_rt_register_struct_field(int64_t hash, int64_t idx, int64_t fname_val,
             return;
         }
     }
+}
+static const NovaStructMeta* nova_struct_meta_for_hash(int64_t hash) {
+    for (int i = 0; i < g_struct_meta_count; i++)
+        if (g_struct_meta[i].hash == hash) return &g_struct_meta[i];
+    return NULL;
+}
+/* Type-free accessors (prototyped near the top, before NovaStructMeta is defined) so the
+   early serialization/show paths can read struct shape without the struct definition. */
+static int nova_struct_meta_fcount(int64_t hash) {
+    const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
+    return m ? (int)m->fcount : 0;
+}
+static const char* nova_struct_meta_fname(int64_t hash, int idx) {
+    const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
+    if (!m || !m->fnames || idx < 0 || idx >= m->fcount) return NULL;
+    return m->fnames[idx];
 }
 
 /* ── Function-by-name registry (distributed spawn / dynamic apply) ────────────

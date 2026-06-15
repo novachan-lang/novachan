@@ -139,6 +139,7 @@ $domain_tests = @(
     'litbox_test',
     'jsonfloat_rt_test',
     'structser_test',
+    'rtti_json_test',
     'resulteq_test',
     'jsonunicode_test',
     'copyboxsafety_test',
