@@ -65,3 +65,22 @@ if (-not $ClangPath) { $ClangPath = "clang" }
 
 # Standard link flags for NOVA runtime (ws2_32 for networking, advapi32 for crypto)
 $NovaLinkFlags = "-lws2_32 -ladvapi32"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forge home + toolchain stdlib install.
+#
+# The framework's canonical source lives at <repo>/forge/forge.nova (its own home, NOT
+# test_programs scratch). Every compile site that sources this file resolves `import forge`
+# from the INSTALLED toolchain copy at $NOVA_HOME/lib/forge.nova -- exactly as an out-of-tree
+# `nova new` project does -- so the regression itself continuously validates install-time
+# module resolution (the download-and-go path). NOVA_HOME is the nova-compiler dir (this
+# script's parent). forge/forge.nova is synced -> $NOVA_HOME/lib on every run so the installed
+# copy can never drift from the single canonical source.
+# ─────────────────────────────────────────────────────────────────────────────
+$env:NOVA_HOME  = (Resolve-Path "$PSScriptRoot\..").Path
+$ForgeCanonical = Join-Path $env:NOVA_HOME "..\forge\forge.nova"
+$ForgeInstalled = Join-Path $env:NOVA_HOME "lib\forge.nova"
+if (Test-Path $ForgeCanonical) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $ForgeInstalled) | Out-Null
+    Copy-Item -Force $ForgeCanonical $ForgeInstalled
+}
