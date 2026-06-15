@@ -1,0 +1,120 @@
+diff --git a/nova-compiler/test_programs/nova_compiler.nova b/nova-compiler/test_programs/nova_compiler.nova
+index 996ba59..ae48306 100644
+--- a/nova-compiler/test_programs/nova_compiler.nova
++++ b/nova-compiler/test_programs/nova_compiler.nova
+@@ -15046,6 +15046,12 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
+                     call_str = call_str + ")"
+                     if dest != ""
+                         ire_indent(e, dest + " = " + call_str)
++                        // total-RC Stage 4: a fresh-owned-producing runtime call (str_concat /
++                        // split / list_map / dict_keys / ...) returns a uniquely-owned heap value;
++                        // mark the result owned so a slot holding only such values is droppable at
++                        // scope exit (the per-request handler temporaries that otherwise leak).
++                        if _rc_owned_producer(value)
++                            e.ire_owned[dest] = 1
+                         // Beat-C: a float-typed call (the raw-double math builtins) returns raw
+                         // double bits. Mark it so a consuming float op reads it via bitcast, not
+                         // a defensive nova_rt_unbox. Mirrors fmul/const_float result tracking.
+@@ -15513,6 +15519,40 @@ fn ire_liveness(blocks: list, slot_names: list) -> dict
+             i = i - 1
+     live_out
+ 
++// total-RC Stage 4: runtime fns that return a FRESH, uniquely-OWNED heap value (RC=1, not
++// aliasing their input). Their call result is marked ire_owned -> a slot holding only such
++// results is droppable at scope exit if never escaped. Conservative whitelist; nova_rc_dec is
++// pointer-validated (0/non-heap -> no-op) and the ASAN gate is the empirical backstop.
++fn _rc_owned_producer(value: string) -> bool
++    if value == "nova_rt_str_concat" or value == "nova_rt_int_to_str" or value == "nova_rt_float_to_str" or value == "nova_rt_bool_to_str" or value == "nova_rt_any_to_str"
++        return true
++    if value == "nova_rt_slice" or value == "nova_rt_upper" or value == "nova_rt_lower" or value == "nova_rt_trim" or value == "nova_rt_lstrip" or value == "nova_rt_rstrip" or value == "nova_rt_repeat"
++        return true
++    if value == "nova_rt_pad_left" or value == "nova_rt_pad_right" or value == "nova_rt_center" or value == "nova_rt_format" or value == "nova_rt_json_stringify" or value == "nova_rt_chr" or value == "nova_rt_from_codepoint" or value == "nova_rt_hex" or value == "nova_rt_oct" or value == "nova_rt_bin"
++        return true
++    if value == "nova_rt_regex_replace" or value == "nova_rt_regex_replace_all"
++        return true
++    if value == "nova_rt_split" or value == "nova_rt_splitlines" or value == "nova_rt_regex_split" or value == "nova_rt_regex_find_all" or value == "nova_rt_chars" or value == "nova_rt_range" or value == "nova_rt_range_from_to"
++        return true
++    if value == "nova_rt_list_map" or value == "nova_rt_list_filter" or value == "nova_rt_dict_keys" or value == "nova_rt_dict_values" or value == "nova_rt_dict_items"
++        return true
++    false
++
++// total-RC Stage 4: runtime fns that READ their args WITHOUT retaining a reference past return
++// (so a value passed to one does NOT escape -> its slot stays droppable). STRING-pure ops + pure
++// readers only: string args are immutable + copied, so there is no element-sharing hazard. LIST
++// args to element-sharing ops (concat/zip/flatten/slice/reverse/sort/append/...) are intentionally
++// EXCLUDED -- their RC behavior needs a per-fn audit; conservatively those still mark the slot
++// escaped. Used to refine the scope-exit droppable analysis so e.g. `s` in `split(s)` is freeable.
++fn _rc_pure_arg(value: string) -> bool
++    if _rc_owned_producer(value)
++        return true
++    if value == "nova_rt_len" or value == "nova_rt_len_any" or value == "nova_rt_str_len" or value == "nova_rt_dict_len" or value == "nova_rt_find" or value == "nova_rt_index_of" or value == "nova_rt_str_count" or value == "nova_rt_char_count"
++        return true
++    if value == "nova_rt_contains" or value == "nova_rt_starts_with" or value == "nova_rt_ends_with" or value == "nova_rt_regex_match" or value == "nova_rt_parse_int" or value == "nova_rt_parse_float" or value == "nova_rt_ord" or value == "nova_rt_hash" or value == "nova_rt_dict_has"
++        return true
++    false
++
+ fn ire_emit_function(e: IrEmitter, func: IrFunction)
+     // Reset per-function state — including Track 8 W5b local slot set
+     // so drops from a previous function don't leak into this one.
+@@ -15605,6 +15645,21 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
+                                     IrInst(_fao, _fad, _fat, _faa, _fav, _fan, _fae, _fal) =>
+                                         if _fao == "make_list" or _fao == "make_dict" or _fao == "make_struct" or _fao == "make_closure"
+                                             _frc_owned[_fad] = 1
++                                        // total-RC Stage 4: a fresh-owned-producing runtime CALL
++                                        // (str_concat / split / list_map / dict_keys / ...) also
++                                        // yields a uniquely-owned heap value -> eligible to drop.
++                                        if _fao == "call" and _rc_owned_producer(_fav)
++                                            _frc_owned[_fad] = 1
++                                        // total-RC Stage 4: string concat (a + b) is lowered as
++                                        // op=="add" with a str result (emits nova_rt_str_concat), NOT
++                                        // a generic call -- it produces a FRESH owned string. (The
++                                        // value-forwarding copy is a distinct op=="copy", so this
++                                        // does not mismark aliases.)
++                                        if _fao == "add"
++                                            match _fat
++                                                IrType(_atk, _atn, _atp, _atid) =>
++                                                    if _atk == "str"
++                                                        _frc_owned[_fad] = 1
+                                         if _fao == "slot_load"
+                                             _frc_loadof[_fad] = _fav
+                 let _frc_stored = {}
+@@ -15623,10 +15678,14 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
+                                                 _frc_bad[_frc_loadof[_fca[0]]] = 1
+                                         else
+                                             let _fc_safe = _fco == "list_len" or _fco == "index_get" or _fco == "field_get"
++                                            // total-RC Stage 4: a call to a STRING-pure/reader fn
++                                            // reads its args without retaining them, so passing a
++                                            // load-of-S to it does NOT escape S (any arg position).
++                                            let _fc_pure = _fco == "call" and _rc_pure_arg(_fcv)
+                                             let _fc_ai = 0
+                                             while _fc_ai < len(_fca)
+                                                 if contains(_frc_loadof, _fca[_fc_ai])
+-                                                    if not (_fc_safe and _fc_ai == 0)
++                                                    if not _fc_pure and not (_fc_safe and _fc_ai == 0)
+                                                         _frc_bad[_frc_loadof[_fca[_fc_ai]]] = 1
+                                                 _fc_ai = _fc_ai + 1
+                             match _fc_term
+@@ -15831,6 +15890,23 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
+                                                         ire_indent(e, dl_reg + " = load i64, ptr %slot." + slot_n + ", align 8")
+                                                         ire_indent(e, "call i64 @" + drop_fn + "(i64 " + dl_reg + ")")
+                                                         e.ire_dropped[slot_n] = 1
++                        // total-RC Stage 4 (NOVA_T8_FULLRC): scope-exit drop. At a RETURN, free the
++                        // current value of every droppable slot (the pre-pass already excluded
++                        // escaped + returned slots from ire_fullrc_drop, so these are uniquely-owned
++                        // function-locals -- the per-call/per-request handler temporaries that
++                        // otherwise leak at scope exit). EMPTY set when the flag is off -> no-op ->
++                        // byte-identical. rc_drop_reassign(old, 0) drops old unless null;
++                        // ire_dropped avoids colliding with the W5b drop above (a multi-return path
++                        // conservatively leaks rather than risk a double-free -- leak-not-free).
++                        match terminator
++                            IrInst(_se_top, _, _, _, _, _, _, _) =>
++                                if _se_top == "return"
++                                    for _se_slot in keys(e.ire_fullrc_drop)
++                                        if not contains(e.ire_dropped, _se_slot)
++                                            let _se_old = ire_fresh_tmp(e, "se." + _se_slot)
++                                            ire_indent(e, _se_old + " = load i64, ptr %slot." + _se_slot + ", align 8")
++                                            ire_indent(e, "call i64 @nova_rt_rc_drop_reassign(i64 " + _se_old + ", i64 0)")
++                                            e.ire_dropped[_se_slot] = 1
+                         ire_emit_terminator(e, terminator)
+             e.ire_dbg_loc = 0
+             ire_line(e, "}")
