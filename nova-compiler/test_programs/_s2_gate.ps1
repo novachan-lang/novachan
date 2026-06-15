@@ -21,7 +21,7 @@ if ($frc -ne 0) { Write-Host "*** S2 GATE FAIL: fullrc regression ***"; exit 1 }
 
 Write-Host ""
 Write-Host "--- ASAN (rtti + struct/serialization/channel) ---"
-foreach ($t in @('rtti_json_test','struct_test','auto_json_test','structser_test','t8_channel_test','crash_isolation_test')) {
+foreach ($t in @('rtti_json_test','rtti_show_test','struct_test','auto_json_test','structser_test','t8_channel_test','crash_isolation_test')) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\_asan_batch.ps1" -t $t
 }
 

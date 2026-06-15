@@ -3192,6 +3192,7 @@ static void jbuf_char(JsonBuf* b, char c) { jbuf_append(b, &c, 1); }
    without needing the NovaStructMeta definition this early in the file. */
 static int nova_struct_meta_fcount(int64_t hash);
 static const char* nova_struct_meta_fname(int64_t hash, int idx);
+static const char* nova_struct_meta_name(int64_t hash);
 
 static void json_stringify_value(JsonBuf* b, int64_t val, int depth);
 
@@ -3494,6 +3495,7 @@ int64_t nova_rt_term_decode(int64_t bytes) {
 /* ── Runtime type dispatch for Any-typed values ──────────────────────────── */
 
 int64_t nova_rt_create_string(void* cstr_ptr); /* forward decl (defined later) */
+static int64_t nova_struct_to_str(int64_t val); /* RTTI struct show, defined below */
 int64_t nova_rt_any_to_str(int64_t val) {
     if (val == 0) return nova_rt_int_to_str(0);
     void* ptr = (void*)(uintptr_t)val;
@@ -3503,7 +3505,7 @@ int64_t nova_rt_any_to_str(int64_t val) {
         case NOVA_MEM_FAT_STR:  return val;
         case NOVA_MEM_LIST:     return nova_rt_list_to_str(val);
         case NOVA_MEM_DICT:     return nova_rt_json_stringify(val);
-        case NOVA_MEM_STRUCT:   return (int64_t)(uintptr_t)"<struct>";
+        case NOVA_MEM_STRUCT:   return nova_struct_to_str(val);
         case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"<iter>";
         case NOVA_MEM_BOX: {
             NovaBox* bx = (NovaBox*)ptr;
@@ -3539,12 +3541,44 @@ int64_t nova_rt_elem_to_str(int64_t val) {
     if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR) return val;
     if (tag == NOVA_MEM_LIST) return nova_rt_list_to_str(val);
     if (tag == NOVA_MEM_DICT) return nova_rt_json_stringify(val);
-    if (tag == NOVA_MEM_STRUCT) return (int64_t)(uintptr_t)"<struct>";
+    if (tag == NOVA_MEM_STRUCT) return nova_struct_to_str(val);
     if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
         unsigned char c = *(unsigned char*)ptr;
         if (c == 0 || (c >= 0x20 && c < 0x7F)) return val;
     }
     return nova_rt_int_to_str(val);   /* raw scalar in a collection = int */
+}
+
+/* Render a struct erased to `any` as "Name { f1: v1, f2: v2 }" using the hash-keyed
+   RTTI table (slot-0 = type hash). Mirrors the compile-time <Type>__show format so the
+   erased and statically-typed str() agree. Field values recurse through elem_to_str
+   (nested structs render as nested "Name { ... }"). On a metadata miss -> "<struct>". */
+static int64_t nova_struct_to_str(int64_t val) {
+    void* ptr = (void*)(uintptr_t)val;
+    int64_t h = ((const int64_t*)ptr)[0];
+    int fc = nova_struct_meta_fcount(h);
+    const char* nm = nova_struct_meta_name(h);
+    if (fc <= 0 || !nm) return (int64_t)(uintptr_t)"<struct>";
+    const int64_t* slots = (const int64_t*)ptr;
+    JsonBuf b; jbuf_init(&b);
+    jbuf_append(&b, nm, (int64_t)strlen(nm));
+    jbuf_append(&b, " {", 2);
+    for (int i = 0; i < fc; i++) {
+        if (i > 0) jbuf_char(&b, ',');
+        jbuf_char(&b, ' ');
+        const char* fn = nova_struct_meta_fname(h, i);
+        if (fn) jbuf_append(&b, fn, (int64_t)strlen(fn));
+        jbuf_append(&b, ": ", 2);
+        int64_t fs = nova_rt_elem_to_str(slots[i + 1]);   /* slot 0 = type hash */
+        const char* fss = (const char*)(uintptr_t)fs;
+        if (fss) jbuf_append(&b, fss, (int64_t)strlen(fss));
+    }
+    jbuf_append(&b, " }", 2);
+    jbuf_char(&b, '\0');
+    char* result = (char*)nova_heap_alloc((size_t)b.len, NOVA_MEM_RAW);
+    if (result) memcpy(result, b.buf, (size_t)b.len);
+    free(b.buf);
+    return (int64_t)(uintptr_t)result;
 }
 
 int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {
@@ -13488,6 +13522,10 @@ static const char* nova_struct_meta_fname(int64_t hash, int idx) {
     const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
     if (!m || !m->fnames || idx < 0 || idx >= m->fcount) return NULL;
     return m->fnames[idx];
+}
+static const char* nova_struct_meta_name(int64_t hash) {
+    const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
+    return m ? m->name : NULL;
 }
 
 /* ── Function-by-name registry (distributed spawn / dynamic apply) ────────────
