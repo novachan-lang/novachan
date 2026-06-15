@@ -19,8 +19,11 @@ flag exists; no user-facing scheduler-yield). This pits two NOVA non-negotiables
 "zero-ceremony/compiler-is-genius" (→ automatic preemption) vs "beat C" (→ no per-loop/per-call hot-path
 tax). The doc's fn-entry plan (Stage 6 below) is INSUFFICIENT (C8: doesn't fire in builtin-only tight
 loops) AND taxes every call. Real options: loop-back-edge auto-preempt (taxes GATE 4/5 hot loops — must
-measure) vs signal-based async preempt (correctly post-v1). Decision pending. Remaining post-v1
-(unchanged, intentional): growable stacks, async/signal preemption, DNS/file→offload, tcp_connect park.
+measure) vs signal-based async preempt (correctly post-v1). Decision: v1 ships cooperative reschedule()
+(commit 9f93efc, zero hot-path cost); involuntary preemption is post-v1. ✅ tcp_connect now PARKS green
+tasks on the netpoller during the TCP handshake (POLL_WRITE, commit 2cbc7da) — verified by
+green_netpoll_test. Remaining post-v1 (unchanged, intentional): growable stacks, async/signal
+preemption, DNS(getaddrinfo)/file→blocking-offload pool.
 
 ✅ **Stage 0 COMPLETE (2026-06-05, commits 3cdf3f4 + 21fd822).** Both fatal TLS issues fixed —
 error state (0a) and fault boundary (0b) now per-task in NovaTaskState via nova_cur(). GO/NO-GO

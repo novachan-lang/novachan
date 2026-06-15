@@ -1,0 +1,30 @@
+$ErrorActionPreference = "Continue"
+$dir = $PSScriptRoot
+$env:NOVA_NO_CACHE = "1"
+$linkFlags = @("-lws2_32","-ladvapi32","-D_CRT_SECURE_NO_WARNINGS","-w")
+$rtSrc = "$dir\output\nova_runtime.c"
+
+Remove-Item "$dir\_range_test.ll" -Force -ErrorAction SilentlyContinue
+Remove-Item "$dir\_range_test.exe" -Force -ErrorAction SilentlyContinue
+Write-Host "=== Compiling _range_test.nova ==="
+$p = Start-Process -FilePath "$dir\gen4.exe" -ArgumentList "_range_test.nova" `
+    -NoNewWindow -PassThru -WorkingDirectory $dir `
+    -RedirectStandardError "$dir\_qtr_err.txt" -RedirectStandardOutput "$dir\_qtr_out.txt"
+$finished = $p.WaitForExit(60000)
+if (-not $finished) { $p.Kill(); Write-Host "TIMEOUT"; exit 1 }
+Get-Content "$dir\_qtr_out.txt" -Raw
+if (-not (Test-Path "$dir\_range_test.ll")) {
+    Write-Host "ERROR: no .ll"
+    Get-Content "$dir\_qtr_err.txt" | Select-Object -First 10
+    exit 1
+}
+Write-Host "=== Linking ==="
+& clang "$dir\_range_test.ll" $rtSrc -o "$dir\_range_test.exe" -O2 @linkFlags 2>"$dir\_qtr_lerr.txt"
+if ($LASTEXITCODE -ne 0) { Write-Host "LINK FAILED"; Get-Content "$dir\_qtr_lerr.txt" | Select-Object -First 10; exit 1 }
+Write-Host "=== Running ==="
+$r = Start-Process -FilePath "$dir\_range_test.exe" -NoNewWindow -PassThru -WorkingDirectory $dir `
+    -RedirectStandardError "$dir\_qtr_rerr.txt" -RedirectStandardOutput "$dir\_qtr_rout.txt"
+$fin2 = $r.WaitForExit(10000)
+if (-not $fin2) { $r.Kill(); Write-Host "RUN TIMEOUT"; exit 1 }
+Get-Content "$dir\_qtr_rout.txt" -Raw
+Write-Host "=== DONE ==="

@@ -2,8 +2,11 @@
 target datalayout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-pc-windows-msvc"
 
-@__nova_error_flag = thread_local global i64 0
-@__nova_error_msg = thread_local global i64 0
+declare void @nova_rt_raise_error() nounwind
+declare i64 @nova_rt_wrap_error_context(i64, i64, i64) nounwind
+declare void @nova_rt_set_error_flag(i64) nounwind
+declare i64 @nova_rt_take_error_flag() nounwind
+declare i64 @nova_rt_take_error_msg() nounwind
 
 ; Runtime declarations
 declare i32 @puts(ptr) nounwind
@@ -19,6 +22,11 @@ declare i64 @nova_rt_list_append_fbox(i64, i64) nounwind
 declare i64 @nova_rt_list_append_bbox(i64, i64) nounwind
 declare i64 @nova_rt_box_bool(i64) nounwind
 declare i64 @nova_rt_unbox(i64) nounwind
+declare i64 @nova_rt_unbox_elem(i64) nounwind
+declare i64 @nova_rt_lt(i64, i64) nounwind
+declare i64 @nova_rt_le(i64, i64) nounwind
+declare i64 @nova_rt_gt(i64, i64) nounwind
+declare i64 @nova_rt_ge(i64, i64) nounwind
 declare i64 @nova_rt_list_get(i64, i64) nounwind readonly
 declare i64 @nova_rt_list_len(i64) nounwind readonly
 declare i64 @nova_rt_dict_create() nounwind
@@ -29,6 +37,7 @@ declare i64 @nova_rt_box_float(i64) nounwind
 declare i64 @nova_rt_dict_get(i64, i64) nounwind readonly
 declare i64 @nova_rt_str_concat(i64, i64) nounwind
 declare i64 @nova_rt_int_to_str(i64) nounwind
+declare i64 @nova_rt_bool_to_str(i64) nounwind
 declare i64 @nova_rt_parse_int(i64) nounwind readonly
 declare i64 @nova_rt_len(i64) nounwind readonly
 declare i64 @nova_rt_len_any(i64) nounwind readonly
@@ -47,6 +56,25 @@ declare i64 @nova_rt_any_to_str(i64) nounwind
 declare void @nova_rt_assert(i64, i64) nounwind
 declare i64 @nova_rt_read_file(i64) nounwind
 declare i64 @nova_rt_write_file(i64, i64) nounwind
+declare i64 @nova_rt_remove_file(i64) nounwind
+declare i64 @nova_rt_remove_dir(i64) nounwind
+declare i64 @nova_rt_rename_path(i64, i64) nounwind
+declare i64 @nova_rt_copy_file(i64, i64) nounwind
+declare i64 @nova_rt_file_size(i64) nounwind
+declare i64 @nova_rt_file_mtime(i64) nounwind
+declare i64 @nova_rt_is_dir(i64) nounwind
+declare i64 @nova_rt_is_file(i64) nounwind
+declare i64 @nova_rt_write_bytes(i64, i64) nounwind
+declare i64 @nova_rt_read_lines(i64) nounwind
+declare i64 @nova_rt_file_open(i64, i64) nounwind
+declare i64 @nova_rt_file_read_line(i64) nounwind
+declare i64 @nova_rt_file_write(i64, i64) nounwind
+declare i64 @nova_rt_file_eof(i64) nounwind
+declare i64 @nova_rt_file_seek(i64, i64) nounwind
+declare i64 @nova_rt_file_tell(i64) nounwind
+declare i64 @nova_rt_file_flush(i64) nounwind
+declare i64 @nova_rt_file_close(i64) nounwind
+declare i64 @nova_rt_temp_dir() nounwind
 declare i64 @nova_rt_args() nounwind
 declare void @nova_rt_exit(i64) nounwind
 declare i64 @nova_rt_split(i64, i64) nounwind
@@ -57,6 +85,8 @@ declare i64 @nova_rt_trim(i64) nounwind
 declare i64 @nova_rt_replace(i64, i64, i64) nounwind
 declare i64 @nova_rt_starts_with(i64, i64) nounwind readonly
 declare i64 @nova_rt_ends_with(i64, i64) nounwind readonly
+declare i64 @nova_rt_print_intlist(i64) nounwind
+declare i64 @nova_rt_intlist_to_str(i64) nounwind
 declare i64 @nova_rt_print_any(i64) nounwind
 declare i64 @nova_rt_print_bool(i64) nounwind
 declare i64 @nova_rt_print_float(i64) nounwind
@@ -65,30 +95,43 @@ declare i64 @nova_rt_print_str(i64) nounwind
 declare i64 @nova_rt_float_bits(i64) nounwind
 declare i64 @nova_rt_float_to_str(i64) nounwind
 declare ptr @nova_rt_struct_alloc(i64) nounwind
+declare ptr @nova_rt_aligned_struct_alloc(i64, i64) nounwind
 declare i64 @nova_rt_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_slice_any(i64, i64, i64) nounwind
 declare i64 @nova_rt_repeat(i64, i64) nounwind
+declare i64 @nova_rt_list_repeat(i64, i64) nounwind
 declare i64 @nova_rt_chars(i64) nounwind
 declare i64 @nova_rt_time_ms() nounwind
 declare i64 @nova_rt_sleep_ms(i64) nounwind
 declare i64 @nova_rt_clock_ns() nounwind
 declare i64 @nova_rt_type_of(i64) nounwind
+declare i64 @nova_rt_type_hash(i64) nounwind
 declare i64 @nova_rt_range(i64) nounwind
 declare i64 @nova_rt_range_from_to(i64, i64) nounwind
 declare i64 @nova_rt_dict_keys(i64) nounwind readonly
 declare i64 @nova_rt_dict_values(i64) nounwind readonly
 declare i64 @nova_rt_dict_items(i64) nounwind readonly
 declare i64 @nova_rt_for_iter_init(i64) nounwind
+declare i64 @nova_rt_for_destr_init(i64) nounwind
+declare i64 @nova_rt_for_kv_init(i64) nounwind
 declare i64 @nova_rt_dict_has(i64, i64) nounwind readonly
+declare i64 @nova_rt_memo_cache(i64) nounwind
 declare i64 @nova_rt_dict_del(i64, i64) nounwind
 declare i64 @nova_rt_system(i64) nounwind
 declare i64 @nova_rt_exec(i64) nounwind
+declare i64 @nova_rt_proc_open(i64) nounwind
+declare i64 @nova_rt_proc_write_stdin(i64, i64) nounwind
+declare i64 @nova_rt_proc_read_stdout(i64) nounwind
+declare i64 @nova_rt_proc_close_stdin(i64) nounwind
+declare i64 @nova_rt_proc_wait(i64) nounwind
 declare i64 @nova_rt_shell(i64) nounwind
 declare i64 @nova_rt_create_string(ptr) nounwind
 declare void @nova_rt_init_args(i64, i64) nounwind
 declare void @nova_rt_wait_all() nounwind
+declare void @nova_rt_main_dispatch(i64) nounwind
 declare void @nova_rt_cleanup() nounwind
 declare i64 @nova_rt_channel_create() nounwind
+declare i64 @nova_rt_channel_bounded(i64) nounwind
 declare i64 @nova_rt_channel_send(i64, i64) nounwind
 declare i64 @nova_rt_channel_send_move(i64, i64) nounwind
 declare i64 @nova_rt_channel_recv(i64) nounwind
@@ -98,6 +141,7 @@ declare i64 @nova_rt_select(i64) nounwind
 declare i64 @nova_rt_channel_recv_timeout(i64, i64) nounwind
 declare i64 @nova_rt_spawn(i64, i64) nounwind
 declare i64 @nova_rt_monitor(i64) nounwind
+declare i64 @nova_rt_exit_reason(i64) nounwind
 declare i64 @nova_rt_parse_float(i64) nounwind
 declare i64 @nova_rt_read_line() nounwind
 declare i64 @nova_rt_append_file(i64, i64) nounwind
@@ -108,6 +152,7 @@ declare i64 @nova_rt_list_reverse(i64) nounwind
 declare i64 @nova_rt_list_sort(i64) nounwind
 declare i64 @nova_rt_list_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_list_map(i64, i64) nounwind
+declare i64 @nova_rt_list_map_fbox(i64, i64) nounwind
 declare i64 @nova_rt_list_filter(i64, i64) nounwind
 declare i64 @nova_rt_http_get(i64) nounwind
 declare i64 @nova_rt_http_post(i64, i64, i64) nounwind
@@ -131,6 +176,29 @@ declare i64 @nova_rt_abs(i64) nounwind readnone
 declare i64 @nova_rt_max(i64, i64) nounwind readnone
 declare i64 @nova_rt_min(i64, i64) nounwind readnone
 declare i64 @nova_rt_sqrt(i64) nounwind readnone
+declare i64 @nova_rt_sinh(i64) nounwind
+declare i64 @nova_rt_cosh(i64) nounwind
+declare i64 @nova_rt_tanh(i64) nounwind
+declare i64 @nova_rt_cbrt(i64) nounwind
+declare i64 @nova_rt_hypot(i64, i64) nounwind
+declare i64 @nova_rt_gcd(i64, i64) nounwind
+declare i64 @nova_rt_lcm(i64, i64) nounwind
+declare i64 @nova_rt_popcount(i64) nounwind
+declare i64 @nova_rt_clz(i64) nounwind
+declare i64 @nova_rt_ctz(i64) nounwind
+declare i64 @nova_rt_rotl(i64, i64) nounwind
+declare i64 @nova_rt_rotr(i64, i64) nounwind
+declare i64 @nova_rt_htons(i64) nounwind
+declare i64 @nova_rt_ntohs(i64) nounwind
+declare i64 @nova_rt_htonl(i64) nounwind
+declare i64 @nova_rt_ntohl(i64) nounwind
+declare i64 @nova_rt_pi() nounwind
+declare i64 @nova_rt_e() nounwind
+declare i64 @nova_rt_char_count(i64) nounwind
+declare i64 @nova_rt_char_at(i64, i64) nounwind
+declare i64 @nova_rt_code_points(i64) nounwind
+declare i64 @nova_rt_from_codepoint(i64) nounwind
+declare i64 @nova_rt_is_valid_utf8(i64) nounwind
 declare i64 @nova_rt_floor(i64) nounwind readnone
 declare i64 @nova_rt_ceil(i64) nounwind readnone
 declare i64 @nova_rt_pow(i64, i64) nounwind readnone
@@ -183,6 +251,8 @@ declare i64 @nova_rt_bytes_len(i64) nounwind
 declare i64 @nova_rt_bytes_slice(i64, i64, i64) nounwind
 declare i64 @nova_rt_bytes_to_str(i64) nounwind
 declare i64 @nova_rt_str_to_bytes(i64) nounwind
+declare i64 @nova_rt_decode_utf8(i64) nounwind
+declare i64 @nova_rt_decode_utf8_lossy(i64) nounwind
 declare i64 @nova_rt_asin(i64) nounwind readnone
 declare i64 @nova_rt_acos(i64) nounwind readnone
 declare i64 @nova_rt_atan(i64) nounwind readnone
@@ -218,8 +288,15 @@ declare i64 @nova_rt_rstrip(i64) nounwind
 declare i64 @nova_rt_pad_left(i64, i64, i64) nounwind
 declare i64 @nova_rt_pad_right(i64, i64, i64) nounwind
 declare i64 @nova_rt_cwd() nounwind
+declare i64 @nova_rt_chdir(i64) nounwind
+declare i64 @nova_rt_getpid() nounwind
+declare i64 @nova_rt_which(i64) nounwind
+declare i64 @nova_rt_dns_resolve(i64) nounwind
+declare i64 @nova_rt_dns_resolve_all(i64) nounwind
+declare i64 @nova_rt_reverse_dns(i64) nounwind
+declare i64 @nova_rt_hostname() nounwind
 declare i64 @nova_rt_list_dir(i64) nounwind
-declare i64 @nova_rt_hash(i64) nounwind readnone
+declare i64 @nova_rt_hash(i64) nounwind readonly
 declare i64 @nova_rt_sha256(i64) nounwind
 declare i64 @nova_rt_sha256_bytes(i64, i64) nounwind
 declare i64 @nova_rt_hmac_sha256(i64, i64) nounwind
@@ -229,8 +306,51 @@ declare i64 @nova_rt_base64_encode(i64) nounwind
 declare i64 @nova_rt_base64_decode(i64) nounwind
 declare i64 @nova_rt_uuid4() nounwind
 declare i64 @nova_rt_random_bytes(i64) nounwind
+declare i64 @nova_rt_secure_bytes(i64) nounwind
+declare i64 @nova_rt_mmap_open(i64) nounwind
+declare i64 @nova_rt_mmap_len(i64) nounwind
+declare i64 @nova_rt_mmap_byte(i64, i64) nounwind
+declare i64 @nova_rt_mmap_close(i64) nounwind
+declare i64 @nova_rt_offheap_create(i64) nounwind
+declare i64 @nova_rt_offheap_len(i64) nounwind
+declare i64 @nova_rt_offheap_get(i64, i64) nounwind
+declare i64 @nova_rt_offheap_set(i64, i64, i64) nounwind
+declare i64 @nova_rt_offheap_free(i64) nounwind
+declare i64 @nova_rt_atomic_new(i64) nounwind
+declare i64 @nova_rt_atomic_get(i64) nounwind
+declare i64 @nova_rt_atomic_set(i64, i64) nounwind
+declare i64 @nova_rt_atomic_add(i64, i64) nounwind
+declare i64 @nova_rt_atomic_cas(i64, i64, i64) nounwind
+declare i64 @nova_rt_os_name() nounwind
+declare i64 @nova_rt_arch_name() nounwind
+declare i64 @nova_rt_type_name(i64) nounwind
+declare i64 @nova_rt_panic(i64) nounwind
+declare i64 @nova_rt_fiber_create(i64) nounwind
+declare i64 @nova_rt_fiber_resume(i64) nounwind
+declare i64 @nova_rt_fiber_yield() nounwind
+declare i64 @nova_rt_reschedule() nounwind
+declare i64 @nova_rt_fiber_is_done(i64) nounwind
+declare i64 @nova_rt_gen_yield(i64) nounwind
+declare i64 @nova_rt_gen_next(i64) nounwind
+declare i64 @nova_rt_gen_value(i64) nounwind
+declare i64 @nova_rt_gen_collect(i64) nounwind
+declare i64 @nova_rt_term_encode(i64) nounwind
+declare i64 @nova_rt_term_decode(i64) nounwind
+declare i64 @nova_rt_sched_spawn(i64) nounwind
+declare i64 @nova_rt_sched_run() nounwind
+declare i64 @nova_rt_dbg_set_bp(i64, i64) nounwind
+declare i64 @nova_rt_dbg_remove_bp(i64) nounwind
+declare i64 @nova_rt_dbg_list_bps() nounwind
+declare i64 @nova_rt_dbg_push_frame(i64, i64, i64, i64) nounwind
+declare i64 @nova_rt_dbg_pop_frame() nounwind
+declare i64 @nova_rt_dbg_backtrace() nounwind
+declare i64 @nova_rt_dbg_hook(i64, i64, i64) nounwind
+declare i64 @nova_rt_dbg_enable() nounwind
+declare i64 @nova_rt_dbg_disable() nounwind
+declare i64 @nova_rt_at_exit(i64) nounwind
 declare i64 @nova_rt_dir_walk(i64) nounwind
 declare i64 @nova_rt_flatten(i64) nounwind
+declare i64 @nova_rt_dict_from_pairs(i64) nounwind
 declare i64 @nova_rt_pmap(i64, i64) nounwind
 declare i64 @nova_rt_pfilter(i64, i64) nounwind
 declare i64 @nova_rt_pfor(i64, i64, i64) nounwind
@@ -256,6 +376,8 @@ declare i64 @nova_rt_tensor_sum(i64) nounwind
 declare i64 @nova_rt_tensor_relu(i64) nounwind
 declare i64 @nova_rt_tensor_to_list(i64) nounwind
 declare i64 @nova_rt_ok(i64) nounwind
+declare i64 @nova_rt_parse_int_safe(i64) nounwind
+declare i64 @nova_rt_parse_float_safe(i64) nounwind
 declare i64 @nova_rt_err(i64) nounwind
 declare i64 @nova_rt_some(i64) nounwind
 declare i64 @nova_rt_none() nounwind
@@ -274,6 +396,7 @@ declare i64 @nova_rt_result_map_err(i64, i64) nounwind
 declare i64 @nova_rt_result_and_then(i64, i64) nounwind
 declare i64 @nova_rt_result_or_else(i64, i64) nounwind
 declare i64 @nova_rt_format(i64, i64) nounwind
+declare i64 @nova_rt_format_one(i64, i64) nounwind
 declare i64 @nova_rt_center(i64, i64, i64) nounwind
 declare i64 @nova_rt_hex(i64) nounwind
 declare i64 @nova_rt_oct(i64) nounwind
@@ -493,6 +616,24 @@ declare i64 @nova_rt_node_accept(i64) nounwind
 declare i64 @nova_rt_hot_reload_watch(i64) nounwind
 declare i64 @nova_rt_hot_reload_check() nounwind
 declare i64 @nova_rt_hot_reload_path(i64) nounwind
+declare i64 @nova_rt_hot_load(i64) nounwind
+declare i64 @nova_rt_hot_unload(i64) nounwind
+declare i64 @nova_rt_hot_reload(i64) nounwind
+declare i64 @nova_rt_hot_sym(i64, i64) nounwind
+declare i64 @nova_rt_hot_call0(i64) nounwind
+declare i64 @nova_rt_hot_call1(i64, i64) nounwind
+declare i64 @nova_rt_hot_call2(i64, i64, i64) nounwind
+declare i64 @nova_rt_hot_call3(i64, i64, i64, i64) nounwind
+declare i64 @nova_rt_ws_init(i64) nounwind
+declare i64 @nova_rt_ws_spawn(i64) nounwind
+declare i64 @nova_rt_ws_task_count() nounwind
+declare i64 @nova_rt_ws_shutdown() nounwind
+declare i64 @nova_rt_io_poll_create() nounwind
+declare i64 @nova_rt_io_poll_add(i64, i64, i64) nounwind
+declare i64 @nova_rt_io_poll_wait(i64, i64) nounwind
+declare i64 @nova_rt_io_poll_remove(i64, i64) nounwind
+declare i64 @nova_rt_io_poll_close(i64) nounwind
+declare i64 @nova_rt_io_set_nonblocking(i64) nounwind
 declare i64 @nova_rt_wasm_compile(i64) nounwind
 declare i64 @nova_rt_wasm_run(i64) nounwind
 declare i64 @nova_rt_wasm_free(i64) nounwind
@@ -618,8 +759,8 @@ while_hdr0:
   %r3 = load i64, ptr %slot.n, align 8
   %r4.cmp = icmp slt i64 %r2, %r3
   %r4 = zext i1 %r4.cmp to i64
-  %br_while_body1 = icmp ne i64 %r4, 0
-  br i1 %br_while_body1, label %while_body1, label %while_exit2, !prof !90
+  %br_while_body10 = icmp ne i64 %r4, 0
+  br i1 %br_while_body10, label %while_body1, label %while_exit2, !prof !90
 while_body1:
   %r5 = load i64, ptr %slot.result, align 8
   %r6 = load i64, ptr %slot.s, align 8
@@ -678,7 +819,7 @@ entry:
   %argc64 = sext i32 %argc to i64
   %argv64 = ptrtoint ptr %argv to i64
   call void @nova_rt_init_args(i64 %argc64, i64 %argv64)
-  call i64 @nova_main()
+  call void @nova_rt_main_dispatch(i64 ptrtoint (ptr @nova_main to i64))
   call void @nova_rt_wait_all()
   call void @nova_rt_cleanup()
   ret i32 0

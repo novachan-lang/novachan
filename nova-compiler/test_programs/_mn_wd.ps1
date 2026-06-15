@@ -6,9 +6,9 @@ if ($c.ExitCode -ne 0) { Write-Host "COMPILE-FAIL $($c.StdErr)"; exit 1 }
 $l = Invoke-Timed -FilePath $ClangPath -Arguments "-O2 -o `"$dir\_p2.exe`" `"$dir\_p2.ll`" `"$dir\output\nova_runtime.c`" $NovaLinkFlags -D_CRT_SECURE_NO_WARNINGS -w" -TimeoutMs 150000
 if ($l.ExitCode -ne 0) { Write-Host "LINK-FAIL $($l.StdErr)"; exit 1 }
 Write-Host "built _p2.exe"
-$env:NOVA_CARRIERS = "8"; $env:NOVA_SCHED_WATCHDOG = "1"
+$env:NOVA_CARRIERS = "4"; $env:NOVA_SCHED_WATCHDOG = "1"
 $errf = "$dir\_wd_err.txt"; $outf = "$dir\_wd_out.txt"
-for ($i = 1; $i -le 40; $i++) {
+for ($i = 1; $i -le 80; $i++) {
     if (Test-Path $errf) { Remove-Item $errf }
     $p = Start-Process -FilePath "$dir\_p2.exe" -RedirectStandardError $errf -RedirectStandardOutput $outf -PassThru -NoNewWindow
     $exited = $p.WaitForExit(12000)

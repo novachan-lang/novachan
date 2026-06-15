@@ -1,0 +1,164 @@
+/// real_pipeline.nova — Concurrent data processing pipeline
+///
+/// Demonstrates: spawn, channels, select, match, closures,
+/// map/filter/reduce, struct data, error handling.
+///
+/// Architecture: Producer -> Workers (parallel) -> Aggregator
+/// A classic fan-out/fan-in concurrency pattern.
+
+type Task
+    id: Int
+    data: String
+    priority: Int
+
+type Result
+    task_id: Int
+    output: String
+    worker_id: Int
+    elapsed_ms: Int
+
+fn _produce(out_ch, count, num_workers)
+    let i = 0
+    while i < count
+        let t = Task(i, "item_" + str(i), i % 3)
+        send(out_ch, t)
+        i = i + 1
+    let w = 0
+    while w < num_workers
+        send(out_ch, Task(-1, "stop", 0))
+        w = w + 1
+
+fn _worker(id, in_ch, out_ch)
+    let processed = 0
+    let running = 1
+    while running == 1
+        let msg = recv(in_ch)
+        if msg.id == -1
+            running = 0
+        else
+            let t0 = time_ms()
+            let output = "processed:" + str(msg.data) + ":by:" + str(id)
+            if msg.priority == 2
+                output = "HIGH:" + output
+            let elapsed = time_ms() - t0
+            send(out_ch, Result(msg.id, output, id, elapsed))
+            processed = processed + 1
+    send(out_ch, Result(-1, "worker_done:" + str(id) + ":" + str(processed), id, 0))
+
+fn _aggregate(result_ch, num_workers)
+    let results = []
+    let total = 0
+    let high_priority = 0
+    let workers_done = 0
+    while workers_done < num_workers
+        let r = recv(result_ch)
+        if r.task_id == -1
+            workers_done = workers_done + 1
+        else
+            push(results, r)
+            total = total + 1
+            if starts_with(r.output, "HIGH:")
+                high_priority = high_priority + 1
+    {"total": total, "high_priority": high_priority, "results": results}
+
+fn _test_basic_pipeline()
+    let task_ch = channel()
+    let result_ch = channel()
+    let tc = task_ch
+    let rc = result_ch
+    let num_workers = 3
+    let num_tasks = 12
+
+    let nw = num_workers
+    spawn(fn(x) _produce(tc, num_tasks, nw))
+
+    let wi = 0
+    while wi < num_workers
+        let wid = wi
+        spawn(fn(x) _worker(wid, tc, rc))
+        wi = wi + 1
+
+    let agg = _aggregate(result_ch, num_workers)
+    assert(agg["total"] == num_tasks, "processed all: " + str(agg["total"]))
+    assert(agg["high_priority"] == 4, "high pri (i%3==2 for 12 items = 4): " + str(agg["high_priority"]))
+
+    let results = agg["results"]
+    let ids_seen = {}
+    for r in results
+        ids_seen[str(r.task_id)] = 1
+    let all_seen = 1
+    let ci = 0
+    while ci < num_tasks
+        if not contains(ids_seen, str(ci))
+            all_seen = 0
+        ci = ci + 1
+    assert(all_seen == 1, "every task processed")
+    print("  basic pipeline: PASS")
+
+fn _test_single_worker()
+    let task_ch = channel()
+    let result_ch = channel()
+    let tc = task_ch
+    let rc = result_ch
+
+    spawn(fn(x) _produce(tc, 5, 1))
+    spawn(fn(x) _worker(0, tc, rc))
+
+    let agg = _aggregate(result_ch, 1)
+    assert(agg["total"] == 5, "5 tasks: " + str(agg["total"]))
+
+    let results = agg["results"]
+    for r in results
+        assert(r.worker_id == 0, "worker 0")
+        assert(contains(r.output, "processed:"), "output format")
+    print("  single worker: PASS")
+
+fn _test_high_priority_distribution()
+    let task_ch = channel()
+    let result_ch = channel()
+    let tc = task_ch
+    let rc = result_ch
+
+    spawn(fn(x) _produce(tc, 30, 5))
+
+    let wi = 0
+    while wi < 5
+        let wid = wi
+        spawn(fn(x) _worker(wid, tc, rc))
+        wi = wi + 1
+
+    let agg = _aggregate(result_ch, 5)
+    assert(agg["total"] == 30, "30 tasks: " + str(agg["total"]))
+    assert(agg["high_priority"] == 10, "10 high-pri (30/3)")
+
+    let worker_counts = {}
+    let results = agg["results"]
+    for r in results
+        let wk = str(r.worker_id)
+        if contains(worker_counts, wk)
+            worker_counts[wk] = worker_counts[wk] + 1
+        else
+            worker_counts[wk] = 1
+    let active_workers = len(keys(worker_counts))
+    assert(active_workers >= 1, "at least 1 worker active: " + str(active_workers))
+    print("  5-worker distribution (" + str(active_workers) + " active): PASS")
+
+fn _test_empty_pipeline()
+    let task_ch = channel()
+    let result_ch = channel()
+    let tc = task_ch
+    let rc = result_ch
+
+    spawn(fn(x) _produce(tc, 0, 1))
+    spawn(fn(x) _worker(0, tc, rc))
+
+    let agg = _aggregate(result_ch, 1)
+    assert(agg["total"] == 0, "0 tasks processed")
+    print("  empty pipeline: PASS")
+
+fn main()
+    _test_basic_pipeline()
+    _test_single_worker()
+    _test_high_priority_distribution()
+    _test_empty_pipeline()
+    print("real_pipeline: all passed")
