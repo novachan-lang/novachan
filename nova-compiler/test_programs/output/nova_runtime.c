@@ -14859,6 +14859,15 @@ static NovaArenaChunk* nova_arena_new_chunk(size_t cap) {
     NovaArenaChunk* c = (NovaArenaChunk*)malloc(sizeof(NovaArenaChunk) + cap);
     if (!c) return NULL;
     c->next = NULL; c->used = 0; c->cap = cap;
+    /* CRITICAL (arena correctness, iter-99): track the chunk's bump region in the heap
+       bounds so nova_mem_find_tag RANGE-ACCEPTS arena objects and classifies them by
+       magic/tag. Without this, arena objects fall outside [heap_base, heap_top] ->
+       find_tag range-REJECTS them -> any-typed runtime dispatch misreads an arena string/
+       list/dict as a non-managed int (split() returned garbage elements). The ARENA_BIT in
+       the rc field still makes rc_inc/dec no-op on these objects (so they are never freed
+       individually; the arena frees them wholesale) -- that is a SEPARATE check from the
+       range/magic classification. */
+    nova_track_heap_bounds((uintptr_t)c->data, (uintptr_t)c->data + cap);
     return c;
 }
 

@@ -1,8 +1,36 @@
-# Arena correctness bug: split() corrupts inside an arena scope (found iter-99)
+# Arena correctness bug: split() corrupts inside an arena scope (found AND FIXED iter-99/100)
 
-**Status:** OPEN — tracked, needs a focused runtime-level investigation. NOT fixed.
-**Severity:** HIGH (silent wrong output, not a crash). NARROW + specific (see below).
-**Date:** 2026-06-15 (iter-99, while building the Forge router on the arena).
+**Status:** ✅ FIXED 2026-06-15 (iter-100, same session). Root-caused via runtime printf.
+**Severity:** WAS HIGH (silent wrong output). NARROW + specific.
+**Date:** found iter-99 (building the Forge router), fixed iter-100.
+
+## ✅ ROOT CAUSE + FIX (the decisive finding)
+Runtime instrumentation showed the parts were CORRECT at `split` return
+(`data[1]=...2CC0 [users]`) but read back as GARBAGE in the caller (`p[1]=[,]` =
+0x2C = a BYTE OF THE POINTER `...782CC0`). So an `any`-typed list element was being
+read as an INTEGER/pointer, not a string. WHY: `nova_arena_bump` / `nova_arena_new_chunk`
+never called `nova_track_heap_bounds`, so arena objects fell OUTSIDE `[heap_base,
+heap_top]`. `nova_mem_find_tag` range-REJECTS out-of-range addresses -> for an `any`-typed
+value, runtime type dispatch saw the arena RAW string as "not a managed object" -> treated
+it as a bare int -> read the pointer's bytes as content. (`slice` worked because its result
+is STATICALLY typed `string` -> no `find_tag` dispatch; the bug only bit `any`-typed arena
+objects, e.g. a list element from split.)
+
+**FIX (one line, nova_arena_new_chunk):** `nova_track_heap_bounds(c->data, c->data + cap)`
+when a chunk is created -> find_tag RANGE-ACCEPTS arena objects and classifies them by
+magic/tag. The `NOVA_RC_ARENA_BIT` in the rc field still makes `rc_inc`/`rc_dec` no-op
+(a SEPARATE check), so arena objects are still never individually freed -- the arena frees
+them wholesale. VERIFIED: arena `split("/users/42","/")` -> `["", "users", "42"]` correct;
+forge router on `serve_n_arena` (which splits paths) PASSES + ASAN clean; arena demo flat
+(delta=0). `serve_app_n` re-pointed to `serve_n_arena` (flat + now correct).
+
+## LESSON
+The arena is now correctness-validated, not just leak-validated: a CONTENT-asserting test
+(the forge router over a real socket through serve_n_arena) is the guard. The original
+iter-95 leak-only "proof" is now backed by content correctness.
+
+---
+## (Original investigation, kept for the record)
 
 ## Symptom
 Inside an arena scope (`arena_enter()` .. `arena_exit()`), `split()` returns the right
