@@ -187,6 +187,33 @@ accessor boxes the field value into a local that W5b drops; needs the boxed-fiel
 treated as a borrow. Both are the no_rc / borrow-vs-own ownership class (S2.5 territory) and are
 the gating work for a W5b default-flip campaign.
 
+## UPDATE iter-82 (W5b is now SUITE-SOUND, commit 59d5086, fixpoint 59AB0B6B)
+
+The 9th reproducer (pvecx) is fixed. It was the no_rc-append-then-escape interaction: a local
+list nc has push(nc, copied) routed to nova_rt_list_append_no_rc, which elides the element incref
+AND had skipped the escape-mark (only the non-local append branch marked); but nc then escapes via
+the returned PVec, so copied was freed while reachable, zeroing a chunk shared across vector
+versions. Fix: the list_append_no_rc branch now also marks the appended element's source slot
+escaped (incref stays elided; only the W5b drop is suppressed). Scoped minimally and verified the
+probe-adjacent way -- the dict_set / index_set sibling no_rc paths were probed under W5b+ASAN and
+are already sound (their dest is not in ire_local_lists), and PVec__field_get's free_local is a
+sound local temp box, not a corruption site.
+
+Result: the full regression under NOVA_T8_DROP=1 is 431/0 -- W5b is SUITE-SOUND (every test correct
+under return-drops, with a self-reconverged compiler). Normal regression 431/0. green_scale PASS.
+New guard _w5b_probe_i.nova.
+
+Net of iters 80-82: the W5b return-drop, unsound since iter-58, is now sound across the whole
+suite via two conservative escape-marking additions (value-forwarded construction registers in
+slot_store; no_rc-appended elements of locals that escape) -- each in the safe direction (only ever
+ADDS marks; more leaks, never fewer frees). W5b STILL DEFAULT OFF. Suite-soundness only makes a
+default-flip a legitimate, separately-gated campaign; it does NOT auto-flip. A flip campaign must:
+(1) build a W5b compiler and reconverge it (gen5_w5b.ll == gen6_w5b.ll); (2) run the full
+regression compiled BY that W5b compiler (not just with W5b output-drops); (3) green_scale under
+W5b; (4) an ASAN sweep of representative programs; and weigh the leak-reduction benefit against
+the no_rc clean-drop regressions this fix trades away. The deeper permanent fix remains S2.5
+clone-or-transfer ownership, which removes the escape heuristic entirely.
+
 ## Artifacts (committed as permanent W5b guards)
 
 - Probes: _w5b_probe_a, b, c, e, g (clean cases) and _w5b_probe_h (the minimal reproducer).
