@@ -13398,6 +13398,53 @@ static const char* nova_struct_name_for_hash(int64_t hash) {
     return NULL;
 }
 
+/* Hash-keyed struct field metadata (RTTI). Recovers a struct's field names/types
+   through the `any` boundary for json/show/from_json. Keyed on the SAME slot-0 DJB2
+   type hash as the name registry above — deep_copy/channel-send copy slot-0, so a
+   struct's identity survives every boundary for free (no allocation or tag-word change).
+   Field name/type pointers are static program-image strings; the per-struct arrays are
+   calloc'd once at init (bounded by struct-type count, never freed). Consumers
+   (json_stringify/show/from_json) land in S2-S4; S1 only writes the table. */
+typedef struct {
+    int64_t       hash;
+    const char*   name;
+    const char**  fnames;
+    const char**  ftypes;
+    int32_t       fcount;
+} NovaStructMeta;
+static NovaStructMeta g_struct_meta[NOVA_MAX_STRUCT_TYPES];
+static int            g_struct_meta_count = 0;
+void nova_rt_register_struct_meta(int64_t hash, int64_t name_val, int64_t fcount) {
+    if (g_struct_meta_count >= NOVA_MAX_STRUCT_TYPES) return;
+    for (int i = 0; i < g_struct_meta_count; i++)
+        if (g_struct_meta[i].hash == hash) return;   /* idempotent */
+    int n = (int)fcount; if (n < 0) n = 0;
+    const char** fn = NULL; const char** ft = NULL;
+    if (n > 0) {
+        fn = (const char**)calloc((size_t)n, sizeof(char*));
+        ft = (const char**)calloc((size_t)n, sizeof(char*));
+        if (!fn || !ft) { free((void*)fn); free((void*)ft); fn = NULL; ft = NULL; n = 0; }
+    }
+    int idx = g_struct_meta_count++;
+    g_struct_meta[idx].hash   = hash;
+    g_struct_meta[idx].name   = (const char*)(uintptr_t)name_val;
+    g_struct_meta[idx].fnames = fn;
+    g_struct_meta[idx].ftypes = ft;
+    g_struct_meta[idx].fcount = (int32_t)n;
+}
+void nova_rt_register_struct_field(int64_t hash, int64_t idx, int64_t fname_val, int64_t ftype_val) {
+    for (int i = 0; i < g_struct_meta_count; i++) {
+        if (g_struct_meta[i].hash == hash) {
+            int j = (int)idx;
+            if (g_struct_meta[i].fnames && g_struct_meta[i].ftypes && j >= 0 && j < g_struct_meta[i].fcount) {
+                g_struct_meta[i].fnames[j] = (const char*)(uintptr_t)fname_val;
+                g_struct_meta[i].ftypes[j] = (const char*)(uintptr_t)ftype_val;
+            }
+            return;
+        }
+    }
+}
+
 /* ── Function-by-name registry (distributed spawn / dynamic apply) ────────────
    The compiler emits nova_rt_register_fn("name", @fn, arity) at program init
    (single-threaded, in @main before nova_rt_main_dispatch — i.e. before any
