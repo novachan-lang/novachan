@@ -3192,6 +3192,7 @@ static void jbuf_char(JsonBuf* b, char c) { jbuf_append(b, &c, 1); }
    without needing the NovaStructMeta definition this early in the file. */
 static int nova_struct_meta_fcount(int64_t hash);
 static const char* nova_struct_meta_fname(int64_t hash, int idx);
+static const char* nova_struct_meta_ftype(int64_t hash, int idx);
 static const char* nova_struct_meta_name(int64_t hash);
 
 static void json_stringify_value(JsonBuf* b, int64_t val, int depth);
@@ -3278,7 +3279,22 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
                 const char* _fn = nova_struct_meta_fname(_shash, _si);
                 json_stringify_str(b, _fn ? _fn : "");
                 jbuf_char(b, ':');
-                json_stringify_value(b, slots[_si + 1], depth + 1);   /* slot 0 = type hash */
+                int64_t _fv = slots[_si + 1];   /* slot 0 = type hash */
+                const char* _ft = nova_struct_meta_ftype(_shash, _si);
+                /* Struct fields are stored RAW per their declared type, so bool/float must
+                   be rendered type-aware (a raw bool is 0/1, a raw float is double bits) --
+                   matching the compile-time <T>__to_json. int/string/struct/list/dict and
+                   boxed values recurse through json_stringify_value as before. */
+                if (_ft && strcmp(_ft, "bool") == 0) {
+                    if (_fv) jbuf_append(b, "true", 4); else jbuf_append(b, "false", 5);
+                } else if (_ft && strcmp(_ft, "float") == 0 &&
+                           nova_mem_find_tag((void*)(uintptr_t)_fv) != NOVA_MEM_BOX) {
+                    double _dv; memcpy(&_dv, &_fv, sizeof(_dv));
+                    char _fb[40]; snprintf(_fb, sizeof(_fb), "%.15g", _dv);
+                    jbuf_append(b, _fb, (int64_t)strlen(_fb));
+                } else {
+                    json_stringify_value(b, _fv, depth + 1);
+                }
             }
             jbuf_char(b, '}');
             return;
@@ -3569,9 +3585,23 @@ static int64_t nova_struct_to_str(int64_t val) {
         const char* fn = nova_struct_meta_fname(h, i);
         if (fn) jbuf_append(&b, fn, (int64_t)strlen(fn));
         jbuf_append(&b, ": ", 2);
-        int64_t fs = nova_rt_elem_to_str(slots[i + 1]);   /* slot 0 = type hash */
-        const char* fss = (const char*)(uintptr_t)fs;
-        if (fss) jbuf_append(&b, fss, (int64_t)strlen(fss));
+        int64_t fv = slots[i + 1];   /* slot 0 = type hash */
+        const char* ft = nova_struct_meta_ftype(h, i);
+        /* Raw bool/float fields rendered type-aware (matches the compile-time __show);
+           everything else (int/string/struct/list/boxed) goes through elem_to_str. */
+        if (ft && strcmp(ft, "bool") == 0) {
+            if (fv) jbuf_append(&b, "true", 4); else jbuf_append(&b, "false", 5);
+        } else {
+            int64_t fs;
+            if (ft && strcmp(ft, "float") == 0 &&
+                nova_mem_find_tag((void*)(uintptr_t)fv) != NOVA_MEM_BOX) {
+                fs = nova_rt_float_to_str(fv);
+            } else {
+                fs = nova_rt_elem_to_str(fv);
+            }
+            const char* fss = (const char*)(uintptr_t)fs;
+            if (fss) jbuf_append(&b, fss, (int64_t)strlen(fss));
+        }
     }
     jbuf_append(&b, " }", 2);
     jbuf_char(&b, '\0');
@@ -13522,6 +13552,11 @@ static const char* nova_struct_meta_fname(int64_t hash, int idx) {
     const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
     if (!m || !m->fnames || idx < 0 || idx >= m->fcount) return NULL;
     return m->fnames[idx];
+}
+static const char* nova_struct_meta_ftype(int64_t hash, int idx) {
+    const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
+    if (!m || !m->ftypes || idx < 0 || idx >= m->fcount) return NULL;
+    return m->ftypes[idx];
 }
 static const char* nova_struct_meta_name(int64_t hash) {
     const NovaStructMeta* m = nova_struct_meta_for_hash(hash);
