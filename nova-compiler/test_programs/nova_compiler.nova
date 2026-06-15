@@ -14330,9 +14330,10 @@ type IrEmitter
     ire_proven_float: dict
     ire_uses_byname: int
     ire_borrow_src: dict        // total-RC S1: registers holding a BORROWED value (index_get/field_get result). Pure metadata; inert until S2 reads it for the positive-owned drop gate.
+    ire_owned: dict             // total-RC S1: registers holding a freshly-OWNED value (make_list/dict/struct/closure result). Pure metadata; inert until S3 reads it for the positive-owned drop gate. A register in neither set is UNCLASSIFIED -> S3 treats it as not-droppable (conservative).
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {})
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {})
 
 // Mark dest as a raw double. ire_reg_types is also set by slot_load propagation (a FLAT,
 // control-flow-insensitive map -> can be wrongly "float" for a reassigned slot), so that
@@ -15073,6 +15074,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         e.ire_slot_escaped[e.ire_load_origin[args[fi]]] = 1
                     fi = fi + 1
                 ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
+                e.ire_owned[dest] = 1        // total-RC S1: a freshly-built struct is OWNED. Inert metadata.
             else if op == "make_list"
                 ire_indent(e, dest + " = call i64 @nova_rt_list_create()")
                 let i = 0
@@ -15096,9 +15098,11 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         e.ire_slot_escaped[e.ire_load_origin[args[i]]] = 1
                     i = i + 1
                 e.ire_reg_types[dest] = "list"
+                e.ire_owned[dest] = 1        // total-RC S1: a freshly-built list is OWNED. Inert metadata.
             else if op == "make_dict"
                 ire_indent(e, dest + " = call i64 @nova_rt_dict_create()")
                 e.ire_reg_types[dest] = "dict"
+                e.ire_owned[dest] = 1        // total-RC S1: a freshly-built dict is OWNED. Inert metadata.
             else if op == "index_get"
                 e.ire_borrow_src[dest] = 1        // total-RC S1: an element read is BORROWED (still owned by the container). Inert metadata.
                 let target_kind = ""
@@ -15269,6 +15273,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         e.ire_slot_escaped[e.ire_load_origin[args[ci]]] = 1
                     ci = ci + 1
                 ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
+                e.ire_owned[dest] = 1        // total-RC S1: a freshly-built closure record is OWNED. Inert metadata.
             else if op == "dyn_call"
                 // Dynamic closure call: args[0] = closure record, args[1..] = call arguments
                 // num = number of actual arguments (excluding closure record)
@@ -15496,6 +15501,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
     e.ire_slot_escaped = {}
     e.ire_dropped = {}
     e.ire_borrow_src = {}        // total-RC S1: per-function reset (CVE-class -- borrow provenance must not leak across fn boundaries)
+    e.ire_owned = {}             // total-RC S1: per-function reset (owned provenance must not leak across fn boundaries)
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             // Anonymous lambdas (__lambda_*) are always called via a closure (any
@@ -15696,10 +15702,15 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                         // is the return value (otherwise we'd free the data
                         // before the caller can read it).
                         // W5b auto-drop: opt-in via NOVA_T8_DROP=1.
-                        // Bootstrap fixpoint bug found: W5b-compiled compiler
-                        // cannot correctly self-compile (2nd-gen binary fails
-                        // trait/closure/generics tests). Keep opt-in until
-                        // escape analysis handles compiler's own code patterns.
+                        // As of iters 80-82 W5b is SUITE-SOUND: the value-forwarding
+                        // and no_rc-append escape blind spots are closed, a
+                        // W5b-compiled compiler self-compiles BYTE-IDENTICALLY, and
+                        // the full regression is 431/0 under NOVA_T8_DROP=1. It stays
+                        // DEFAULT OFF because it does NOT address the per-iteration
+                        // headline leak (slot_store never rc_dec's the overwritten
+                        // value; W5b drops are return-only) -- that needs the staged
+                        // total-RC work (RC_COMPLETENESS.md). See also the inert
+                        // ire_owned/ire_borrow_src provenance (Stage 1 foundation).
                         let want_drop = env("NOVA_T8_DROP")
                         let no_t8b = env("NOVA_NO_TRACK8")
                         let no_drop = env("NOVA_T8_NO_DROP")
