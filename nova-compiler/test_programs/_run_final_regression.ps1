@@ -118,6 +118,7 @@ $domain_tests = @(
     'decode_utf8_test',
     'normx_test',
     'casefoldx_test',
+    'collatex_test',
     'match_result_test',
     'generics_edge_test',
     'intlist_test',
