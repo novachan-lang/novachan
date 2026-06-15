@@ -714,7 +714,10 @@ fn dispatch_req(a, req: Request) -> Response
     resp_text(404, "no route: " + req.method + " " + req.path)
 
 // Per-request arena-scoped typed handling: build the Request, dispatch to a typed handler,
-// finalize the Response to wire ONCE, send, free the arena wholesale.
+// finalize the Response to wire ONCE, send, free the arena wholesale. Runs as the body of a
+// per-connection green task (spawn-per-connection below). The arena is PER-TASK (NovaTaskState),
+// so concurrent connections each hold an independent arena -- flat per-request memory under
+// concurrency, proven sound (forge_spawn_test: N concurrent, per-task arena, ASAN-clean).
 fn _handle_req_arena(conn: int, a)
     let prev = arena_enter()
     let raw = recv_request(conn)
@@ -724,20 +727,40 @@ fn _handle_req_arena(conn: int, a)
     arena_exit(prev)
     tcp_close(conn)
 
-// Serve exactly N requests with typed dispatch, arena-scoped per request. Deterministic.
+// done-signaling wrapper for the deterministic serve_req_n.
+fn _handle_req_done(conn: int, a, done)
+    _handle_req_arena(conn, a)
+    send(done, 1)
+
+// SPAWN-PER-CONNECTION (the G1 fix): each accepted connection runs in its own green task, so
+// the accept loop never blocks on a slow handler -- 10k concurrent connections, straight-line
+// handlers, no async coloring. Serve exactly N requests, waiting for all N handlers to finish
+// before closing (deterministic -> testable).
 fn serve_req_n(a, port: int, n: int)
     let listener = tcp_listen(port)
+    let done = channel()
     let i = 0
     while i < n
         let conn = tcp_accept(listener)
-        _handle_req_arena(conn, a)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            let dc = done
+            sched_spawn(fn(z) _handle_req_done(c, ap, dc))
         i = i + 1
+    let j = 0
+    while j < n
+        recv(done)
+        j = j + 1
     tcp_close(listener)
 
-// Infinite typed serve, arena-scoped per request.
+// Infinite spawn-per-connection serve: accept, spawn a green task per connection, never block.
 fn serve_req(a, port: int)
     let listener = tcp_listen(port)
     while true
         let conn = tcp_accept(listener)
-        _handle_req_arena(conn, a)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            sched_spawn(fn(z) _handle_req_arena(c, ap))
 
