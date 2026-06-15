@@ -1,0 +1,41 @@
+// _forge_arena_readiness.nova -- the flat-memory CONCURRENT SERVER proof.
+//
+// Same shape as _forge_readiness.nova (a spawned forge server + a client GET loop over a
+// REAL socket round-trip), but BOTH sides run inside per-request arena scopes:
+//   - server: forge.serve_n_arena (each request handled inside arena_enter..arena_exit)
+//   - client: each http_get wrapped in its own arena scope
+// live_count() is process-global, so the delta covers BOTH the server handler temporaries
+// AND the client http_get temporaries. With arena scoping on both sides, every request's
+// heap is freed wholesale -> per-request memory is FLAT. The arena is PER-TASK, so the
+// server (a green task that parks on tcp_recv) and the client (main) never cross-pollute.
+import forge
+
+fn handle(m, p, b)
+    let items = []
+    push(items, ["method", m])
+    push(items, ["path", p])
+    push(items, ["ok", "true"])
+    forge.json_obj(200, items)
+
+fn main()
+    let port = 18934
+    let n = 400
+    spawn fn()
+        forge.serve_n_arena(port, fn(m, p, b) handle(m, p, b), n)
+    sleep(300)
+    let base = "http://127.0.0.1:" + str(port)
+    http_get(base + "/warmup")          // one-time setup allocations (not measured)
+    let before = live_count()
+    let i = 1
+    while i < n
+        let prev = arena_enter()        // per-request client scope
+        http_get(base + "/req")         // request + response live in this scope
+        arena_exit(prev)                // freed wholesale
+        i = i + 1
+    let after = live_count()
+    let delta = after - before
+    print("forge_arena_readiness requests=" + str(n - 1) + " live_delta=" + str(delta))
+    if delta > 200
+        print("FORGE ARENA FAIL: per-request memory NOT flat (delta=" + str(delta) + ")")
+        exit(1)
+    print("FORGE ARENA PASS: real socket round-trip, server+client arena-scoped, per-request memory FLAT (delta=" + str(delta) + ")")

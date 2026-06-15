@@ -248,6 +248,45 @@ fn serve_n(port: int, handler, n: int)
         i = i + 1
     tcp_close(listener)
 
+// Arena-scoped per-request handling. Everything a request allocates (the raw request,
+// the parsed parts, and everything the handler builds) lives in a per-request arena
+// that is freed WHOLESALE after the response is written -- flat memory, zero per-object
+// RC, cycle-immune. arena_exit comes AFTER tcp_send because tcp_send copies the response
+// bytes into the socket, so `resp` is not needed past the send. The arena is per-task
+// (NovaTaskState), so this is safe even when the server runs as a green task that parks
+// on tcp_recv while other tasks run.
+//
+// CONTRACT: sound ONLY for handlers that do not RETAIN request-derived values in
+// longer-lived storage (e.g. a module-global cache or another process's state without
+// copying). A handler that stashes a built value in a global would leave a dangling
+// pointer after arena_exit. Stateless / pure-response handlers (the common case) are
+// safe; stateful handlers should use serve_n (RC) or copy escaping values out first.
+fn _handle_one_arena(conn: int, handler)
+    let prev = arena_enter()
+    let req = recv_request(conn)
+    let m = parse_method(req)
+    let p = parse_path(req)
+    let b = parse_body(req)
+    let resp = handler(m, p, b)
+    tcp_send(conn, resp)
+    arena_exit(prev)
+    tcp_close(conn)
+
+fn serve_n_arena(port: int, handler, n: int)
+    let listener = tcp_listen(port)
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        _handle_one_arena(conn, handler)
+        i = i + 1
+    tcp_close(listener)
+
+fn serve_arena(port: int, handler)
+    let listener = tcp_listen(port)
+    while true
+        let conn = tcp_accept(listener)
+        _handle_one_arena(conn, handler)
+
 // ── v0.2 additions ───────────────────────────────────────────────────────
 
 // CORS wrapper. Inserts Access-Control-* headers before the blank-line
