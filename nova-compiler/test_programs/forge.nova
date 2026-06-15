@@ -357,6 +357,7 @@ fn app()
     let a = {}
     a["routes"] = []
     a["mws"] = []
+    a["statics"] = []
     a
 
 // Register a middleware. Middleware = fn(next_handler) -> new_handler, composed by
@@ -375,6 +376,7 @@ fn group(a, prefix: string)
     let g = {}
     g["routes"] = a["routes"]
     g["mws"] = a["mws"]
+    g["statics"] = a["statics"]
     g["prefix"] = prefix
     g
 
@@ -720,6 +722,80 @@ fn _coerce(v) -> Response
 // Handlers take `req: Request` as a TYPED PARAMETER -> field access resolves per-struct
 // (sound; see the cross-module field-resolution fix). Return a Response via resp_json/
 // resp_text/resp_html -- e.g. `return forge.resp_json(200, user)` for "return your type, get JSON".
+// ── Static file serving (Phase 1) ─ traversal-safe BY CONSTRUCTION ────────────
+// static(a, url_prefix, root_dir) mounts a directory: a GET/HEAD whose path begins with
+// url_prefix is served from root_dir. Security is by construction, not configuration --
+// _safe_subpath whitelists path segments so no "..", no absolute / backslash / drive path,
+// and no dotfile (.env / .git / ...) can ever be reached; the served file cannot escape
+// root_dir. Most frameworks serve dotfiles by default and rely on the developer to lock the
+// path down; Forge cannot be misconfigured into a directory-traversal or secret-leak CVE.
+fn static(a, url_prefix: string, root_dir: string)
+    push(a["statics"], [url_prefix, root_dir])
+    a
+
+// A single path segment is UNSAFE if it is "..", a dotfile (leading "."), or contains a
+// backslash or colon (Windows separator / drive-letter / NTFS alternate-data-stream). "."
+// and empty segments are skipped by the caller before this check.
+fn _unsafe_segment(seg: string) -> bool
+    if seg == ".."
+        return true
+    if starts_with(seg, ".")
+        return true
+    if find(seg, "\\") >= 0
+        return true
+    if find(seg, ":") >= 0
+        return true
+    false
+
+// Sanitize a URL subpath into a safe relative filesystem path. err on ANY traversal attempt.
+// The segment whitelist makes escape impossible: every surviving segment is an ordinary name,
+// so root_dir + "/" + result stays inside root_dir.
+fn _safe_subpath(rel: string)
+    let r = rel
+    if starts_with(r, "/")
+        r = slice(r, 1, len(r))
+    let parts = split(r, "/")
+    let clean = ""
+    let i = 0
+    while i < len(parts)
+        let seg = parts[i]
+        if seg == "" or seg == "."
+            i = i + 1
+        else if _unsafe_segment(seg)
+            return err("unsafe path segment")
+        else
+            if clean == ""
+                clean = seg
+            else
+                clean = clean + "/" + seg
+            i = i + 1
+    ok(clean)
+
+// Try to serve req.path from a registered static mount: ok(Response) if a mount's prefix
+// matched AND the sanitized file exists; err otherwise (caller falls through to 404). An
+// empty subpath (the mount root) serves index.html. Text-correct; binary assets (read_file
+// stops at an embedded NUL) await the bytes/streaming Response.
+fn _try_static(a, req: Request)
+    let mounts = a["statics"]
+    let i = 0
+    while i < len(mounts)
+        let m = mounts[i]
+        let prefix = m[0]
+        let root = m[1]
+        if starts_with(req.path, prefix)
+            let safe = _safe_subpath(slice(req.path, len(prefix), len(req.path)))
+            if is_ok(safe)
+                let cleanrel = unwrap(safe)
+                if cleanrel == ""
+                    cleanrel = "index.html"
+                let fpath = root + "/" + cleanrel
+                if file_exists(fpath)
+                    let h = {}
+                    h["Content-Type"] = _ext_ctype(cleanrel)
+                    return ok(Response(200, h, read_file(fpath), false))
+        i = i + 1
+    err("no static match")
+
 // The route-match TERMINAL of the typed chain: find the matching route, bind path params,
 // run the handler through _coerce. 404/405 exactly as before. This is the innermost layer --
 // the middleware fold wraps around it.
@@ -738,6 +814,11 @@ fn _dispatch_terminal(a, req: Request) -> Response
             else
                 other = 1
         i = i + 1
+    // No route matched the (path, method). Try static mounts (GET/HEAD only) before 404.
+    if req.method == "GET" or req.method == "HEAD"
+        let sr = _try_static(a, req)
+        if is_ok(sr)
+            return unwrap(sr)
     if other == 1
         return resp_text(405, "method not allowed")
     resp_text(404, "no route: " + req.method + " " + req.path)

@@ -1,0 +1,72 @@
+// forge_static_test -- Phase 1 incr-7: traversal-safe static file serving.
+// Mounts _static_fixture at /assets and verifies: real files served with the right content-
+// type; mount root -> index.html; and EVERY traversal vector blocked (.. , dotfile, backslash,
+// drive-letter) -> 404, never leaking a file outside the mount. Static is tried only after
+// routes miss, so explicit routes still win.
+import forge
+
+fn h_api(req: Request) -> string
+    "api-wins"
+
+fn main()
+    // Create the dotfile at runtime so it GENUINELY exists when the block is tested (a
+    // committed .env is gitignored, which would make the block a false positive on a fresh
+    // clone). The mount dir already exists (committed index.html / style.css).
+    write_file("_static_fixture/.env", "SECRET=this_must_never_be_served_by_static\n")
+    let a = forge.app()
+    forge.static(a, "/assets", "_static_fixture")
+    // an explicit route under a DIFFERENT prefix to prove routes take precedence over static
+    forge.get(a, "/api/ping", h_api)
+
+    // real file -> 200 with correct content-type + body
+    let css: Response = forge.dispatch_req(a, forge.build_request("GET /assets/style.css HTTP/1.1\r\n\r\n", 0))
+    assert(css.status == 200, "css 200")
+    assert(css.headers["Content-Type"] == "text/css; charset=utf-8", "css content-type")
+    assert(find(css.body, "color") >= 0, "css body served")
+    print("PASS: static file served with content-type")
+
+    // mount root -> index.html
+    let idx: Response = forge.dispatch_req(a, forge.build_request("GET /assets/ HTTP/1.1\r\n\r\n", 0))
+    assert(idx.status == 200, "index 200")
+    assert(idx.headers["Content-Type"] == "text/html; charset=utf-8", "index content-type")
+    assert(find(idx.body, "NOVA Forge static") >= 0, "index.html body")
+    print("PASS: mount root -> index.html")
+
+    // nested explicit file also works
+    let idx2: Response = forge.dispatch_req(a, forge.build_request("GET /assets/index.html HTTP/1.1\r\n\r\n", 0))
+    assert(idx2.status == 200, "index.html explicit 200")
+    print("PASS: explicit index.html")
+
+    // SECURITY: ".." traversal blocked -> 404, never serves forge.nova
+    let trav: Response = forge.dispatch_req(a, forge.build_request("GET /assets/../forge.nova HTTP/1.1\r\n\r\n", 0))
+    assert(trav.status == 404, ".. traversal blocked (404)")
+    assert(find(trav.body, "import forge") < 0, "traversal did not leak source")
+    print("PASS: .. traversal blocked")
+
+    // SECURITY: dotfile (.env) never served even though the file exists in the mount
+    let env: Response = forge.dispatch_req(a, forge.build_request("GET /assets/.env HTTP/1.1\r\n\r\n", 0))
+    assert(env.status == 404, "dotfile blocked (404)")
+    assert(find(env.body, "SECRET") < 0, "dotfile secret not leaked")
+    print("PASS: dotfile (.env) blocked")
+
+    // SECURITY: backslash traversal blocked
+    let bs: Response = forge.dispatch_req(a, forge.build_request("GET /assets/..\\forge.nova HTTP/1.1\r\n\r\n", 0))
+    assert(bs.status == 404, "backslash traversal blocked")
+    print("PASS: backslash traversal blocked")
+
+    // SECURITY: drive-letter blocked
+    let drv: Response = forge.dispatch_req(a, forge.build_request("GET /assets/C:/Windows/win.ini HTTP/1.1\r\n\r\n", 0))
+    assert(drv.status == 404, "drive-letter blocked")
+    print("PASS: drive-letter blocked")
+
+    // missing file -> 404
+    let miss: Response = forge.dispatch_req(a, forge.build_request("GET /assets/nope.txt HTTP/1.1\r\n\r\n", 0))
+    assert(miss.status == 404, "missing file 404")
+    print("PASS: missing file -> 404")
+
+    // explicit route still wins (not shadowed by static)
+    let api: Response = forge.dispatch_req(a, forge.build_request("GET /api/ping HTTP/1.1\r\n\r\n", 0))
+    assert(api.status == 200, "route 200")
+    assert(api.body == "api-wins", "explicit route precedence")
+    print("PASS: explicit route precedence over static")
+    print("forge_static_test passed")
