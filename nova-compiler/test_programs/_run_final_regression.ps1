@@ -147,6 +147,7 @@ $domain_tests = @(
     'cross_module_struct_test',
     'forge_typed_dispatch_test',
     'forge_coerce_test',
+    'forge_typed_mw_test',
     'forge_spawn_test',
     'forge_recover_test',
     'forge_group_test',

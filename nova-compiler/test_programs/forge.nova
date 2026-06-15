@@ -720,7 +720,10 @@ fn _coerce(v) -> Response
 // Handlers take `req: Request` as a TYPED PARAMETER -> field access resolves per-struct
 // (sound; see the cross-module field-resolution fix). Return a Response via resp_json/
 // resp_text/resp_html -- e.g. `return forge.resp_json(200, user)` for "return your type, get JSON".
-fn dispatch_req(a, req: Request) -> Response
+// The route-match TERMINAL of the typed chain: find the matching route, bind path params,
+// run the handler through _coerce. 404/405 exactly as before. This is the innermost layer --
+// the middleware fold wraps around it.
+fn _dispatch_terminal(a, req: Request) -> Response
     let routes = a["routes"]
     let other = 0
     let i = 0
@@ -738,6 +741,53 @@ fn dispatch_req(a, req: Request) -> Response
     if other == 1
         return resp_text(405, "method not allowed")
     resp_text(404, "no route: " + req.method + " " + req.path)
+
+// Typed middleware wrapper: bind `next` so a fn(req: Request, next) -> Response middleware
+// becomes a plain fn(Request) -> Response. _coerce lets a middleware short-circuit by
+// returning a bare string/struct (e.g. a 401 body) just like a handler.
+fn _t_wrap(mw, next)
+    return fn(req) _coerce(mw(req, next))
+
+// Typed dispatch: fold the app's middleware OUTSIDE-IN around the route terminal, then run.
+// First-registered middleware is outermost (sees the request first, the response last). The
+// fold closures are created and consumed INSIDE this function -- which runs in the SPAWNED
+// child on the concurrent/crash-isolated serve paths -- so no fold closure ever crosses a
+// process boundary. Only the plain middleware fn values (stored in the app's "mws" list) are
+// deep-copied across spawn, exactly as route handlers already are; capturing-closure
+// middleware (e.g. mw_set_header(name,value)) survives that copy intact (verified).
+fn dispatch_req(a, req: Request) -> Response
+    let h = fn(r) _dispatch_terminal(a, r)
+    let mws = a["mws"]
+    let i = len(mws) - 1
+    while i >= 0
+        h = _t_wrap(mws[i], h)
+        i = i - 1
+    h(req)
+
+// ── Typed middleware (Phase 1) ─ fn(req: Request, next) -> Response ────────────
+// Typed middleware operates on the Request / Response STRUCTS (the typed handler model),
+// distinct from the dict-request middleware above. Register with use(a, mw); dispatch_req
+// folds them outside-in around the route terminal. A middleware calls next(req) to obtain
+// the downstream Response, may modify it, or may short-circuit by returning its own value
+// (string / struct / Response -- coerced). A middleware may be a plain top-level fn(req,
+// next) or a builder-returned capturing closure; both fold identically and both survive the
+// spawn boundary on the concurrent / crash-isolated serve paths.
+
+// Inject a response header on every response (capturing closure over name/value).
+fn mw_set_header(name: string, value: string)
+    return fn(req, next) resp_set_header(next(req), name, value)
+
+// CORS: add Access-Control-Allow-Origin to every typed response.
+fn mw_cors_origin(origin: string)
+    return fn(req, next) resp_set_header(next(req), "Access-Control-Allow-Origin", origin)
+
+// Logging: print method + path, then pass through (typed Request).
+fn _t_log_next(req: Request, next)
+    print("[forge] " + req.method + " " + req.path)
+    next(req)
+
+fn mw_log()
+    return fn(req, next) _t_log_next(req, next)
 
 // Per-request arena-scoped typed handling: build the Request, dispatch to a typed handler,
 // finalize the Response to wire ONCE, send, free the arena wholesale. Runs as the body of a
