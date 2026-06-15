@@ -148,6 +148,7 @@ $domain_tests = @(
     'forge_typed_dispatch_test',
     'forge_spawn_test',
     'forge_recover_test',
+    'forge_group_test',
     'resulteq_test',
     'jsonunicode_test',
     'copyboxsafety_test',
