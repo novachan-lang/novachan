@@ -7773,7 +7773,22 @@ static void nova_rc_free(void* ptr) {
         }
         case NOVA_MEM_CHANNEL: {
             NovaChannel* ch = (NovaChannel*)ptr;
-            if (ch->buf) free(ch->buf);
+            /* Release un-received buffered items. channel_send deep-copies every
+               value (nova_rt_deep_copy -> fresh RC=1, owned SOLELY by the buffer);
+               recv/dequeue TRANSFER ownership to the receiver (no dec, head advances,
+               count--). So any items STILL queued at free time are buffer-owned and
+               must be dec'd, or every un-received heap value leaks (the "chan ~2000"
+               leak_baseline residual once channels become droppable). Live items
+               occupy the ring [head, head+count); cap is always a power of two, so
+               (head+i) & (cap-1) is the correct index. Received items already left the
+               ring (not in [head,head+count)) -> never visited -> no double-free.
+               Immediates (ints) -> rc_dec_internal is a validated no-op. */
+            if (ch->buf) {
+                int64_t mask = ch->cap - 1;
+                for (int64_t i = 0; i < ch->count; i++)
+                    nova_rc_dec_internal(ch->buf[(ch->head + i) & mask]);
+                free(ch->buf);
+            }
 #ifdef _WIN32
             DeleteCriticalSection(&ch->lock);
 #else
