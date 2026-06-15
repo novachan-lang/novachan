@@ -1,0 +1,346 @@
+// nova_new -- scaffold a new NOVA project. The download-and-go entry point: pick a project
+// TYPE and get a working, compilable app that `import forge` (resolved from the bundled
+// toolchain stdlib -- no package install) and serves immediately.
+//
+//   nova_new --api         <name>   REST API (typed routes, JSON via coercion, middleware, /health)
+//   nova_new --microservice <name>  minimal crash-isolated service (/health, /ready, /echo)
+//   nova_new --frontend    <name>   static SPA served traversal-safe from public/
+//   nova_new --fullstack   <name>   API (/api/*) + static frontend in ONE binary
+//   nova_new --lib         <name>   reusable NOVA library module + test
+//
+// Each server scaffold supports a `--check` mode: it dispatches one request through the full
+// pipeline WITHOUT opening a socket and prints the status -- a zero-dependency healthcheck for
+// CI / containers, and how this tool self-verifies generated projects.
+
+fn die(msg: string)
+    print(msg)
+    exit(1)
+
+// Replace every occurrence of `from` with `to` (raw text blocks do no interpolation).
+fn _sub(s: string, from: string, to: string) -> string
+    let parts = split(s, from)
+    let out = ""
+    let i = 0
+    while i < len(parts)
+        if i > 0
+            out = out + to
+        out = out + parts[i]
+        i = i + 1
+    out
+
+// Write project file <dir>/<rel>, creating parent directories first (write_file does not).
+fn write_proj(dir: string, rel: string, content: string)
+    let full = dir + "/" + rel
+    let last = -1
+    let i = 0
+    while i < len(full)
+        if full[i] == "/"
+            last = i
+        i = i + 1
+    if last >= 0
+        mkdir_p(slice(full, 0, last))
+    write_file(full, content)
+    print("  + " + rel)
+
+fn tmpl_nova_toml(name: string, kind: string) -> string
+    let t = ```
+    name = "__APP__"
+    version = "0.1.0"
+    entry = "main.nova"
+    kind = "__KIND__"
+
+    [dependencies]
+    # forge is bundled in the NOVA toolchain -- no install, no lockfile, no runtime.
+    # `nova build` compiles it into one static native binary.
+    ```
+    _sub(_sub(t, "__APP__", name), "__KIND__", kind)
+
+fn tmpl_readme(name: string, kind: string, run_hint: string) -> string
+    let t = ```
+    # __APP__
+
+    A NOVA project (__KIND__) built with Forge. One language, one binary, zero runtime deps.
+
+    ## Run
+
+    __RUN__
+
+    ## Build a single static binary
+
+        nova build            # produces ./__APP__(.exe) -- ship it anywhere, no deps
+
+    Forge is bundled in the NOVA toolchain, so `import forge` resolves with no package install.
+    ```
+    _sub(_sub(_sub(t, "__APP__", name), "__KIND__", kind), "__RUN__", run_hint)
+
+fn tmpl_api_main() -> string
+    ```
+    // A NOVA REST API built with Forge. Handlers return a domain value -- a struct, a list, or
+    // a Response -- and Forge produces the right JSON automatically ("return your type").
+    import forge
+
+    type Todo
+        id: int
+        title: string
+        done: bool
+
+    type Health
+        status: string
+        service: string
+
+    // In a real app this is your database; an in-memory seed keeps the scaffold runnable.
+    fn seed() -> list
+        [Todo(1, "Learn NOVA", true), Todo(2, "Build with Forge", false)]
+
+    fn health(req: Request) -> Health
+        Health("ok", "api")
+
+    // Returns a list of structs -> a JSON array, no serializer call.
+    fn list_todos(req: Request) -> list
+        seed()
+
+    // Path param + per-item lookup; returns a struct (200) or an error Response (404).
+    fn get_todo(req: Request) -> Response
+        let id = req.params["id"]
+        for t in seed()
+            if str(t.id) == id
+                return forge.resp_json(200, t)
+        forge.resp_json(404, Health("not found", "api"))
+
+    fn build_app()
+        let a = forge.app()
+        forge.use(a, forge.mw_log())
+        forge.use(a, forge.mw_cors_origin("*"))
+        forge.get(a, "/health", health)
+        forge.get(a, "/todos", list_todos)
+        forge.get(a, "/todos/:id", get_todo)
+        a
+
+    fn main()
+        let a = build_app()
+        let av = args()
+        if len(av) > 1 and av[1] == "--check"
+            let r: Response = forge.dispatch_req(a, forge.build_request("GET /health HTTP/1.1\r\n\r\n", 0))
+            print("selfcheck status=" + str(r.status))
+            return
+        print("api listening on http://localhost:8080")
+        forge.serve_req(a, 8080)
+    ```
+
+fn tmpl_micro_main() -> string
+    ```
+    // A minimal NOVA microservice. Each request is handled in a MONITORED process: a handler
+    // panic becomes a 500 and the server lives on (Erlang-style "let it crash", at AOT speed).
+    import forge
+
+    type Status
+        status: string
+
+    type Echo
+        echo: string
+
+    fn health(req: Request) -> Status
+        Status("ok")
+
+    fn ready(req: Request) -> Status
+        Status("ready")
+
+    fn echo(req: Request) -> Echo
+        Echo(req.body)
+
+    fn build_app()
+        let a = forge.app()
+        forge.use(a, forge.mw_log())
+        forge.get(a, "/health", health)
+        forge.get(a, "/ready", ready)
+        forge.post(a, "/echo", echo)
+        a
+
+    fn main()
+        let a = build_app()
+        let av = args()
+        if len(av) > 1 and av[1] == "--check"
+            let r: Response = forge.dispatch_req(a, forge.build_request("GET /health HTTP/1.1\r\n\r\n", 0))
+            print("selfcheck status=" + str(r.status))
+            return
+        print("microservice listening on http://localhost:8081 (crash-isolated)")
+        forge.serve_safe_req(a, 8081)
+    ```
+
+fn tmpl_frontend_main() -> string
+    ```
+    // A NOVA static frontend. Assets in public/ are served traversal-safe by construction
+    // (no .., no dotfiles, no path can escape the mount). One binary serves your SPA.
+    import forge
+
+    fn build_app()
+        let a = forge.app()
+        forge.static(a, "/", "public")
+        a
+
+    fn main()
+        let a = build_app()
+        let av = args()
+        if len(av) > 1 and av[1] == "--check"
+            let r: Response = forge.dispatch_req(a, forge.build_request("GET / HTTP/1.1\r\n\r\n", 0))
+            print("selfcheck status=" + str(r.status))
+            return
+        print("frontend on http://localhost:8080")
+        forge.serve_req(a, 8080)
+    ```
+
+fn tmpl_fullstack_main() -> string
+    ```
+    // A NOVA full-stack app: a JSON API under /api AND a static frontend, in ONE binary, one
+    // `nova run`. The NOVA identity use case -- backend + frontend, one language, no glue.
+    import forge
+
+    type Todo
+        id: int
+        title: string
+        done: bool
+
+    type Health
+        status: string
+
+    fn seed() -> list
+        [Todo(1, "Learn NOVA", true), Todo(2, "Ship with Forge", false)]
+
+    fn api_todos(req: Request) -> list
+        seed()
+
+    fn api_health(req: Request) -> Health
+        Health("ok")
+
+    fn build_app()
+        let a = forge.app()
+        forge.use(a, forge.mw_log())
+        let api = forge.group(a, "/api")
+        forge.get(api, "/todos", api_todos)
+        forge.get(api, "/health", api_health)
+        // Frontend: explicit /api routes win; everything else is served from public/.
+        forge.static(a, "/", "public")
+        a
+
+    fn main()
+        let a = build_app()
+        let av = args()
+        if len(av) > 1 and av[1] == "--check"
+            let r: Response = forge.dispatch_req(a, forge.build_request("GET /api/todos HTTP/1.1\r\n\r\n", 0))
+            print("selfcheck status=" + str(r.status))
+            return
+        print("fullstack on http://localhost:8080 (API at /api, frontend at /)")
+        forge.serve_req(a, 8080)
+    ```
+
+fn tmpl_index_html(name: string) -> string
+    let t = ```
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>__APP__</title>
+        <link rel="stylesheet" href="/style.css" />
+      </head>
+      <body>
+        <main>
+          <h1>__APP__</h1>
+          <p>Served by NOVA Forge -- one binary, zero runtime dependencies.</p>
+          <pre id="out">loading...</pre>
+        </main>
+        <script src="/app.js"></script>
+      </body>
+    </html>
+    ```
+    _sub(t, "__APP__", name)
+
+fn tmpl_app_js() -> string
+    ```
+    // Optional: talk to the /api routes (present in the fullstack scaffold).
+    fetch("/api/todos")
+      .then(function (r) { return r.json(); })
+      .then(function (todos) {
+        document.getElementById("out").textContent = JSON.stringify(todos, null, 2);
+      })
+      .catch(function () {
+        document.getElementById("out").textContent = "static frontend ready";
+      });
+    ```
+
+fn tmpl_style_css() -> string
+    ```
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; margin: 0; display: grid; place-items: center; min-height: 100vh; }
+    main { max-width: 40rem; padding: 2rem; }
+    h1 { margin: 0 0 .5rem; }
+    pre { background: rgba(127,127,127,.15); padding: 1rem; border-radius: .5rem; overflow:auto; }
+    ```
+
+fn tmpl_lib_module() -> string
+    ```
+    // A reusable NOVA library. `import <name>` from any project (vendored, or installed to
+    // $NOVA_HOME/lib). Pure, fully type-inferred -- no annotations required at the call site.
+    fn add(a: int, b: int) -> int
+        a + b
+
+    fn scale(xs: list, k: int) -> list
+        let out = []
+        for x in xs
+            push(out, x * k)
+        out
+    ```
+
+fn tmpl_lib_test(name: string) -> string
+    let t = ```
+    import __APP__
+
+    fn main()
+        assert(__APP__.add(2, 3) == 5, "add")
+        let s = __APP__.scale([1, 2, 3], 10)
+        assert(s[1] == 20, "scale")
+        print("__APP__ tests passed")
+    ```
+    _sub(t, "__APP__", name)
+
+fn scaffold(kind: string, name: string)
+    if file_exists(name + "/nova.toml")
+        die("refusing to overwrite: " + name + "/nova.toml already exists")
+    mkdir_p(name)
+    print("Creating " + name + "/ (" + kind + ")")
+    if kind == "--api"
+        write_proj(name, "main.nova", tmpl_api_main())
+        write_proj(name, "nova.toml", tmpl_nova_toml(name, "api"))
+        write_proj(name, "README.md", tmpl_readme(name, "api", "    nova run        # serve on :8080  (dev: NOVA_HOME set, compile main.nova, run)"))
+    else if kind == "--microservice"
+        write_proj(name, "main.nova", tmpl_micro_main())
+        write_proj(name, "nova.toml", tmpl_nova_toml(name, "microservice"))
+        write_proj(name, "README.md", tmpl_readme(name, "microservice", "    nova run        # serve on :8081 (crash-isolated)"))
+    else if kind == "--frontend"
+        write_proj(name, "main.nova", tmpl_frontend_main())
+        write_proj(name, "nova.toml", tmpl_nova_toml(name, "frontend"))
+        write_proj(name, "public/index.html", tmpl_index_html(name))
+        write_proj(name, "public/app.js", tmpl_app_js())
+        write_proj(name, "public/style.css", tmpl_style_css())
+        write_proj(name, "README.md", tmpl_readme(name, "frontend", "    nova run        # serve public/ on :8080"))
+    else if kind == "--fullstack"
+        write_proj(name, "main.nova", tmpl_fullstack_main())
+        write_proj(name, "nova.toml", tmpl_nova_toml(name, "fullstack"))
+        write_proj(name, "public/index.html", tmpl_index_html(name))
+        write_proj(name, "public/app.js", tmpl_app_js())
+        write_proj(name, "public/style.css", tmpl_style_css())
+        write_proj(name, "README.md", tmpl_readme(name, "fullstack", "    nova run        # API at /api, frontend at / on :8080"))
+    else if kind == "--lib"
+        write_proj(name, name + ".nova", tmpl_lib_module())
+        write_proj(name, name + "_test.nova", tmpl_lib_test(name))
+        write_proj(name, "nova.toml", tmpl_nova_toml(name, "lib"))
+        write_proj(name, "README.md", tmpl_readme(name, "lib", "    nova test       # compile + run " + name + "_test.nova"))
+    else
+        die("unknown project type: " + kind)
+    print("Done. Next: cd " + name)
+
+fn main()
+    let av = args()
+    if len(av) < 3
+        die("usage: nova_new <--api|--microservice|--frontend|--fullstack|--lib> <name>")
+    scaffold(av[1], av[2])
