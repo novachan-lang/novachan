@@ -87,6 +87,18 @@ exits arena mode (wholesale free) → asserts `live_count()` returns flat. This 
 mechanism in isolation, before Forge consumes it.
 
 ### Implementation status
+- **iter-91 (DONE, LIST backing):** all `NovaList` backing allocations now follow the
+  list's arena kind via `nova_back_alloc`/`nova_back_calloc`/`nova_back_grow`
+  (create, create_filled, append, append_no_rc, insert, concat, slice, sort_by);
+  arena "realloc" = bump+copy (validated, ASAN clean). `list_free_local`/
+  `dict_free_local` early-return on arena objects (the arena owns the backing).
+  Validated: 5000 lists with heavy grow + a list-cycle freed wholesale, live_count
+  flat, ASAN clean. INERT for non-arena lists (byte-identical realloc path).
+  REMAINING (iter-92): DICT create/grow/rehash + idx (~10 sites, same pattern) and
+  the string builder; then the NOVA `arena_enter`/`arena_exit` builtins. **All
+  container backing sites MUST be intercepted BEFORE the builtins expose arena
+  scopes to NOVA code** (until then arena objects are only created by the C harness,
+  so partial coverage is unreachable-safe).
 - **iter-90 (DONE, runtime foundation):** transparent arena via a thread-local
   `nova_active_arena`; `nova_heap_alloc` bump-allocates into it and tags objects
   with `NOVA_RC_ARENA_BIT` (bit 30 of the rc field) so `rc_inc`/`rc_dec` no-op on
@@ -102,9 +114,29 @@ mechanism in isolation, before Forge consumes it.
   wholesale free. Fix: an object's allocation kind is FIXED AT CREATION (its
   `ARENA_BIT`); its backing storage follows its own kind; arena "realloc" =
   bump a new array + copy (old wasted, reclaimed wholesale — no realloc/free in a
-  bump arena). Finite site list: list create/append/insert, dict create/grow/set,
-  string builders. STRUCTs need no change (self-contained) — hence the iter-90
+  bump arena). STRUCTs need no change (self-contained) — hence the iter-90
   struct-only validation.
+  - **Precise interception sites (audited):** ~24 backing allocations.
+    LIST: `nova_rt_list_create` (1019), `_create_filled` (1031/1033),
+    `_append`/insert grows (1050/1102/1174), map/concat result grows
+    (1705/1856/9978). DICT: create (1895-1900), grows/rehash (1001 idx,
+    1931-1933, 1964-1966, 2121-2123). STRING builder: create (7998), grow (8005).
+  - **Soundness DECISION — how a grow finds its arena:** REJECTED storing an
+    owner-arena pointer in `NovaList`/`NovaDict` (108 access/constructor sites →
+    too many to guarantee the new field is initialized → garbage-pointer/UAF
+    risk). CHOSEN: a grow checks the OBJECT's `ARENA_BIT`; if set, it bumps the
+    new backing into the **currently active arena** (`nova_active_arena`). This is
+    SOUND under the per-request model (an object is created and mutated within ONE
+    scope → its creation arena IS the active arena at grow time). The only unsound
+    case — mutating an outer-scope object inside a nested inner scope — is the
+    escape-rule violation the model already forbids (use a value only within its
+    scope; copy to outlive it). Guard: a grow on an arena object while
+    `nova_active_arena == NULL` (object used after its scope) is detectably wrong;
+    panic with a clear message rather than silently corrupt. Full nested-scope
+    soundness (owner pointer) is revisited only if a real need appears.
+  - **realloc → bump+copy:** at each grow site, old size is known from the object's
+    pre-grow `cap`/`size`; allocate the new backing via `nova_arena_bump`, `memcpy`
+    the live bytes, leave the old block in the arena (reclaimed wholesale).
 - **Gotcha 2 (before request use):** `nova_active_arena` is per-OS-thread. Green
   tasks interleave on one carrier, so a task that PARKS mid-scope must save/restore
   this pointer as part of its context (scheduler integration). Today only whole,

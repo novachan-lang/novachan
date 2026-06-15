@@ -12,6 +12,8 @@ extern int64_t nova_rt_arena_scope_enter(void);
 extern void    nova_rt_arena_scope_exit(int64_t prev);
 extern void*   nova_rt_struct_alloc(int64_t size);
 extern int64_t nova_rt_live_count(void);
+extern int64_t nova_rt_list_create(void);
+extern int64_t nova_rt_list_append(int64_t handle, int64_t elem);
 
 int main(void) {
     /* Warm the allocator OUTSIDE any scope so lazy init doesn't skew the baseline. */
@@ -50,17 +52,31 @@ int main(void) {
     ((int64_t*)outer)[1] = (int64_t)(uintptr_t)outer2;
     nova_rt_arena_scope_exit(p_outer);              /* free outer */
 
-    int64_t after = nova_rt_live_count();
-    int64_t d2 = after - mid;
+    int64_t d2 = nova_rt_live_count() - mid;
+    int64_t mid2 = nova_rt_live_count();
 
-    printf("ARENA probe: base=%lld mid=%lld after=%lld  d1=%lld d2=%lld\n",
-           (long long)base, (long long)mid, (long long)after,
-           (long long)d1, (long long)d2);
-    if (d1 != 0 || d2 != 0) {
-        printf("ARENA FAIL: live_count not flat across arena scopes (d1=%lld d2=%lld)\n",
-               (long long)d1, (long long)d2);
+    /* ---- Scenario 3: arena LISTS with heavy grow (realloc->bump+copy) + a cycle ---- */
+    int64_t p3 = nova_rt_arena_scope_enter();
+    for (int i = 0; i < 5000; i++) {
+        int64_t L = nova_rt_list_create();
+        for (int j = 0; j < 64; j++) nova_rt_list_append(L, (int64_t)j);  /* forces many grows */
+    }
+    /* A LIST that contains itself -> reference cycle through the backing array. */
+    int64_t cyc = nova_rt_list_create();
+    nova_rt_list_append(cyc, cyc);
+    nova_rt_arena_scope_exit(p3);                /* wholesale free: headers AND data arrays */
+
+    int64_t after = nova_rt_live_count();
+    int64_t d3 = after - mid2;
+
+    printf("ARENA probe: base=%lld mid=%lld mid2=%lld after=%lld  d1=%lld d2=%lld d3=%lld\n",
+           (long long)base, (long long)mid, (long long)mid2, (long long)after,
+           (long long)d1, (long long)d2, (long long)d3);
+    if (d1 != 0 || d2 != 0 || d3 != 0) {
+        printf("ARENA FAIL: live_count not flat across arena scopes (d1=%lld d2=%lld d3=%lld)\n",
+               (long long)d1, (long long)d2, (long long)d3);
         return 1;
     }
-    printf("ARENA PASS: 100002 + nested structs incl 2 cycles freed wholesale; live_count flat (run under sanitizer to catch dangling reuse)\n");
+    printf("ARENA PASS: structs(+2 cycles) AND 5000 grown lists(+1 list-cycle) freed wholesale; live_count flat (run under sanitizer to catch dangling reuse)\n");
     return 0;
 }

@@ -1013,10 +1013,39 @@ typedef struct {
     int64_t  cap;
 } NovaList;
 
+/* ── Arena-aware backing storage for containers (iter-91) ──────────────────────
+   A container's backing array (list->data, dict keys/vals/...) follows the
+   container's OWN allocation kind. nova_back_alloc/calloc key off the CURRENTLY
+   active arena (the header was just allocated there at create time). nova_back_grow
+   keys off the OBJECT's ARENA_BIT (the object may have been created in an earlier
+   call): arena objects can't realloc, so bump a fresh block into the active arena +
+   copy (old block wasted, reclaimed wholesale). Non-arena -> plain malloc/realloc,
+   byte-identical to the previous behavior -> INERT for all existing programs. */
+static void* nova_back_alloc(size_t bytes) {
+    return nova_active_arena ? nova_arena_bump(nova_active_arena, bytes) : malloc(bytes);
+}
+static void* nova_back_calloc(size_t bytes) {
+    /* nova_arena_bump already zeroes; calloc zeroes the heap path. */
+    return nova_active_arena ? nova_arena_bump(nova_active_arena, bytes) : calloc(1, bytes);
+}
+static void* nova_back_grow(void* obj, size_t oldbytes, size_t newbytes, void* oldptr) {
+    if (NOVA_RC_COUNT(obj) & NOVA_RC_ARENA_BIT) {
+        /* Arena object: its backing must grow within ITS arena. Under the
+           single-scope-per-request model the creation arena IS the active arena.
+           Growing while no scope is active means the object outlived its scope
+           (an escape-rule violation) -> panic rather than silently corrupt. */
+        if (!nova_active_arena) { nova_panic("arena container grown outside its scope"); return oldptr; }
+        void* nd = nova_arena_bump(nova_active_arena, newbytes);
+        if (nd && oldptr && oldbytes) memcpy(nd, oldptr, oldbytes);
+        return nd;
+    }
+    return realloc(oldptr, newbytes);
+}
+
 int64_t nova_rt_list_create(void) {
     NovaList* list = (NovaList*)nova_heap_alloc(sizeof(NovaList), NOVA_MEM_LIST);
     if (!list) return 0;
-    list->data = malloc(8 * sizeof(int64_t));
+    list->data = nova_back_alloc(8 * sizeof(int64_t));
     list->size = 0;
     list->cap  = 8;
     return (int64_t)(uintptr_t)list;
@@ -1028,9 +1057,9 @@ int64_t nova_rt_list_create_filled(int64_t count, int64_t value) {
     if (!list) return 0;
     int64_t cap = count < 8 ? 8 : count;
     if (value == 0) {
-        list->data = calloc((size_t)cap, sizeof(int64_t));
+        list->data = nova_back_calloc((size_t)cap * sizeof(int64_t));
     } else {
-        list->data = malloc((size_t)cap * sizeof(int64_t));
+        list->data = nova_back_alloc((size_t)cap * sizeof(int64_t));
         if (list->data) {
             for (int64_t i = 0; i < count; i++) {
                 list->data[i] = value;
@@ -1046,8 +1075,11 @@ int64_t nova_rt_list_create_filled(int64_t count, int64_t value) {
 int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (list->size >= list->cap) {
+        int64_t old_cap = list->cap;
         list->cap *= 2;
-        list->data = realloc(list->data, (size_t)list->cap * sizeof(int64_t));
+        list->data = (int64_t*)nova_back_grow((void*)list,
+            (size_t)old_cap * sizeof(int64_t),
+            (size_t)list->cap * sizeof(int64_t), list->data);
     }
     list->data[list->size++] = elem;
     nova_rc_inc(elem);
@@ -1063,6 +1095,10 @@ int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
 int64_t nova_rt_list_free_local(int64_t handle) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list) return 0;
+    /* Arena-owned list: the arena owns both the header AND the backing array;
+       they are freed wholesale on scope exit. free()'ing the bump-allocated data
+       here would corrupt the arena -> no-op. */
+    if (NOVA_RC_COUNT((void*)list) & NOVA_RC_ARENA_BIT) return 0;
     if (list->data) { free(list->data); list->data = NULL; }
     list->size = 0;
     list->cap = 0;
@@ -1077,6 +1113,9 @@ int64_t nova_rt_list_free_local(int64_t handle) {
 int64_t nova_rt_dict_free_local(int64_t handle) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     if (!d) return 0;
+    /* Arena-owned dict: backing arrays are bump-allocated in the arena and freed
+       wholesale on scope exit; free()'ing them here would corrupt the arena. */
+    if (NOVA_RC_COUNT((void*)d) & NOVA_RC_ARENA_BIT) return 0;
     if (d->keys)   { free(d->keys);   d->keys = NULL; }
     if (d->vals)   { free(d->vals);   d->vals = NULL; }
     if (d->hashes) { free(d->hashes); d->hashes = NULL; }
@@ -1098,8 +1137,11 @@ int64_t nova_rt_dict_free_local(int64_t handle) {
 int64_t nova_rt_list_append_no_rc(int64_t handle, int64_t elem) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (list->size >= list->cap) {
+        int64_t old_cap = list->cap;
         list->cap *= 2;
-        list->data = realloc(list->data, (size_t)list->cap * sizeof(int64_t));
+        list->data = (int64_t*)nova_back_grow((void*)list,
+            (size_t)old_cap * sizeof(int64_t),
+            (size_t)list->cap * sizeof(int64_t), list->data);
     }
     list->data[list->size++] = elem;
     /* INTENTIONALLY no nova_rc_inc — caller proven local. */
@@ -1170,8 +1212,11 @@ int64_t nova_rt_list_insert(int64_t handle, int64_t index, int64_t value) {
     if (i < 0) i = 0;
     if (i > list->size) i = list->size;
     if (list->size >= list->cap) {
+        int64_t old_cap = list->cap;
         list->cap *= 2;
-        list->data = realloc(list->data, (size_t)list->cap * sizeof(int64_t));
+        list->data = (int64_t*)nova_back_grow((void*)list,
+            (size_t)old_cap * sizeof(int64_t),
+            (size_t)list->cap * sizeof(int64_t), list->data);
     }
     for (int64_t k = list->size; k > i; k--)
         list->data[k] = list->data[k - 1];
@@ -1701,8 +1746,11 @@ int64_t nova_rt_list_concat(int64_t a, int64_t b) {
     NovaList* result = (NovaList*)(uintptr_t)new_list;
     int64_t total = la->size + lb->size;
     if (total > result->cap) {
+        int64_t old_cap = result->cap;
         result->cap = total;
-        result->data = realloc(result->data, (size_t)total * sizeof(int64_t));
+        result->data = (int64_t*)nova_back_grow((void*)result,
+            (size_t)old_cap * sizeof(int64_t),
+            (size_t)total * sizeof(int64_t), result->data);
     }
     for (int64_t i = 0; i < la->size; i++) {
         result->data[result->size++] = la->data[i];
@@ -1852,8 +1900,11 @@ int64_t nova_rt_list_slice(int64_t handle, int64_t start, int64_t end) {
     NovaList* result = (NovaList*)(uintptr_t)new_list;
     int64_t n = end - start;
     if (n > result->cap) {
+        int64_t old_cap = result->cap;
         result->cap = n;
-        result->data = realloc(result->data, (size_t)n * sizeof(int64_t));
+        result->data = (int64_t*)nova_back_grow((void*)result,
+            (size_t)old_cap * sizeof(int64_t),
+            (size_t)n * sizeof(int64_t), result->data);
     }
     for (int64_t i = start; i < end; i++) {
         result->data[result->size++] = l->data[i];
@@ -9974,8 +10025,11 @@ int64_t nova_rt_sort_by(int64_t handle, int64_t closure) {
     int64_t n = l->size;
     int64_t new_list = nova_rt_list_create();
     NovaList* result = (NovaList*)(uintptr_t)new_list;
+    int64_t old_cap = result->cap;
     result->cap = n;
-    result->data = realloc(result->data, (size_t)n * sizeof(int64_t));
+    result->data = (int64_t*)nova_back_grow((void*)result,
+        (size_t)old_cap * sizeof(int64_t),
+        (size_t)n * sizeof(int64_t), result->data);
     memcpy(result->data, l->data, (size_t)n * sizeof(int64_t));
     result->size = n;
     for (int64_t i = 0; i < n; i++) nova_rc_inc(result->data[i]);
