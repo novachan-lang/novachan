@@ -165,6 +165,7 @@ $domain_tests = @(
     'forge_secheaders_test',
     'forge_routing2_test',
     'forge_ops_test',
+    'forge_reqid_test',
     'forge_spawn_test',
     'forge_recover_test',
     'forge_group_test',
