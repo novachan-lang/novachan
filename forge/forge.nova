@@ -67,6 +67,32 @@ fn json(status: int, body: string) -> string
 fn json_of(status: int, value) -> string
     json(status, json_stringify(value))
 
+// Truncate a string at the first CR or LF. Used to keep a parsed request-line URI from carrying
+// an embedded CR/LF into req.path / req.query (an attacker-controlled "GET /a\r\nX: b HTTP/1.1"
+// would otherwise land a CRLF in the path that a handler could reflect into a response header).
+fn _cut_at_crlf(s: string) -> string
+    let i = 0
+    while i < len(s)
+        if s[i] == "\r" or s[i] == "\n"
+            return slice(s, 0, i)
+        i = i + 1
+    s
+
+// Strip CR / LF / NUL from a header name or value -- the single defense against response splitting
+// / header injection. Applied at the serialization boundary (finalize, redirect) so EVERY header,
+// including any built from request data (req.query reflected via resp_set_header), is safe by
+// construction. We strip rather than reject so a serve loop never dies on hostile input, and a
+// stripped value can never break framing.
+fn _safe_header(value: string) -> string
+    let out = ""
+    let i = 0
+    while i < len(value)
+        let c = value[i]
+        if c != "\r" and c != "\n" and c != chr(0)
+            out = out + c
+        i = i + 1
+    out
+
 fn parse_method(req: string) -> string
     let sp = find(req, " ")
     if sp < 0
@@ -80,8 +106,8 @@ fn parse_path(req: string) -> string
     let rest = slice(req, sp1 + 1, len(req))
     let sp2 = find(rest, " ")
     if sp2 < 0
-        return rest
-    slice(rest, 0, sp2)
+        return _cut_at_crlf(rest)
+    _cut_at_crlf(slice(rest, 0, sp2))
 
 fn parse_body(req: string) -> string
     let sep = find(req, "\r\n\r\n")
@@ -149,7 +175,7 @@ fn header_get(req: string, name: string) -> string
 // Redirect response (301/302/303/307/308). Includes the Location header.
 fn redirect(status: int, url: string) -> string
     let r = "HTTP/1.1 " + _status_line(status) + "\r\n"
-    r = r + "Location: " + url + "\r\n"
+    r = r + "Location: " + _safe_header(url) + "\r\n"
     r = r + "Content-Length: 0\r\n"
     r = r + "Connection: close\r\n"
     r = r + "Server: NOVA Forge\r\n"
@@ -664,7 +690,13 @@ fn finalize(resp: Response) -> string
     let i = 0
     while i < len(ks)
         let k = ks[i]
-        r = r + k + ": " + resp.headers[k] + "\r\n"
+        let kl = lower(k)
+        // Skip the framework-reserved headers -- they are emitted once below from the single
+        // source of truth, so a handler that set Content-Length/Connection/Server cannot produce
+        // a DUPLICATE (a duplicate Content-Length is a request-smuggling / response-framing vector).
+        // Sanitize every name + value so reflected request data can't split the response.
+        if kl != "content-length" and kl != "connection" and kl != "server"
+            r = r + _safe_header(k) + ": " + _safe_header(resp.headers[k]) + "\r\n"
         i = i + 1
     r = r + "Content-Length: " + str(len(resp.body)) + "\r\n"
     r = r + "Connection: close\r\n"

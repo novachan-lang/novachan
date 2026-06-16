@@ -1,0 +1,49 @@
+// forge_header_security_test -- SEC-1: response splitting / header injection + duplicate-header
+// framing are closed at the serialization boundary. These were empirically confirmed exploitable
+// in the adversarial review (redirect(302, "/x\r\nSet-Cookie: pwned=1") emitted the injected
+// cookie; finalize emitted two Content-Length lines). All assertions are on the WIRE output.
+import forge
+
+fn count_occurrences(hay: string, needle: string) -> int
+    let n = 0
+    let i = find(hay, needle)
+    let base = 0
+    while i >= 0
+        n = n + 1
+        base = base + i + len(needle)
+        let rest = slice(hay, base, len(hay))
+        i = find(rest, needle)
+    n
+
+fn main()
+    // 1. redirect() must NOT let a CRLF in the URL inject a NEW header line. The CRLF is stripped,
+    //    so "Set-Cookie" can only survive glued into the Location value -- never as its own line.
+    let r = forge.redirect(302, "/next\r\nSet-Cookie: pwned=1")
+    assert(find(r, "\r\nSet-Cookie") < 0, "no injected Set-Cookie header LINE")
+    assert(find(r, "Location: /nextSet-Cookie: pwned=1\r\n") >= 0, "url flattened into one Location line")
+    print("PASS: redirect CRLF injection blocked")
+
+    // 2. A reflected request value carrying CRLF, set as a response header, must not split a line.
+    let resp: Response = forge.resp_text(200, "ok")
+    let evil: Response = forge.resp_set_header(resp, "X-Echo", "abc\r\nInjected: yes")
+    let wire = forge.finalize(evil)
+    assert(find(wire, "\r\nInjected: yes") < 0, "reflected CRLF cannot start a header line")
+    assert(find(wire, "X-Echo: abcInjected: yes\r\n") >= 0, "value preserved minus CRLF, one line")
+    print("PASS: reflected header CRLF stripped")
+
+    // 3. finalize must emit exactly ONE Content-Length even if a handler set its own (duplicate
+    //    Content-Length is a request-smuggling vector).
+    let r2: Response = forge.resp_set_header(forge.resp_text(200, "hello"), "Content-Length", "999")
+    let wire2 = forge.finalize(r2)
+    assert(count_occurrences(wire2, "Content-Length:") == 1, "exactly one Content-Length header")
+    assert(find(wire2, "Content-Length: 5") >= 0, "Content-Length is the real body length (5)")
+    assert(count_occurrences(wire2, "Connection:") == 1, "exactly one Connection header")
+    assert(count_occurrences(wire2, "Server:") == 1, "exactly one Server header")
+    print("PASS: reserved headers deduplicated (no smuggling)")
+
+    // 4. A CRLF in the request-line URI must not survive into req.path (parse_path truncates).
+    let req: Request = forge.build_request("GET /a\r\nInjected: x HTTP/1.1\r\nHost: h\r\n\r\n", 0)
+    assert(find(req.path, "\r") < 0, "req.path has no CR")
+    assert(find(req.path, "\n") < 0, "req.path has no LF")
+    print("PASS: request-line CRLF truncated from req.path")
+    print("forge_header_security_test passed")
