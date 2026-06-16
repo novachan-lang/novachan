@@ -36,9 +36,32 @@ fn _status_line(status: int) -> string
         return "403 Forbidden"
     if status == 404
         return "404 Not Found"
+    if status == 303
+        return "303 See Other"
+    if status == 307
+        return "307 Temporary Redirect"
+    if status == 308
+        return "308 Permanent Redirect"
+    if status == 405
+        return "405 Method Not Allowed"
+    if status == 409
+        return "409 Conflict"
+    if status == 413
+        return "413 Payload Too Large"
+    if status == 415
+        return "415 Unsupported Media Type"
+    if status == 422
+        return "422 Unprocessable Entity"
+    if status == 429
+        return "429 Too Many Requests"
     if status == 500
         return "500 Internal Server Error"
-    str(status) + " OK"
+    if status == 502
+        return "502 Bad Gateway"
+    if status == 503
+        return "503 Service Unavailable"
+    // Unknown code: emit the number with no reason phrase (RFC-legal) rather than a misleading "OK".
+    str(status)
 
 fn _build(status: int, ctype: string, body: string) -> string
     let r = "HTTP/1.1 " + _status_line(status) + "\r\n"
@@ -209,21 +232,18 @@ fn serve_file(path: string) -> string
         return text(404, "file not found: " + path)
     _build(200, _ext_ctype(path), content)
 
-// Build a JSON object response from list of [k, v] string pairs.
+// Build a JSON object response from a list of [k, v] string pairs. Serializes through the runtime
+// json_stringify (the same escaping as the struct-RTTI keystone) so a key/value containing a quote,
+// backslash, or control char produces VALID JSON -- the hand-rolled `"k":"v"` concatenation it
+// replaced did not escape and emitted broken JSON.
 fn json_obj(status: int, pairs: list) -> string
-    let body = "\{"
-    let n = len(pairs)
+    let d = {}
     let i = 0
-    while i < n
+    while i < len(pairs)
         let kv = pairs[i]
-        let k = kv[0]
-        let v = kv[1]
-        if i > 0
-            body = body + ","
-        body = body + "\"" + k + "\":\"" + v + "\""
+        d[kv[0]] = kv[1]
         i = i + 1
-    body = body + "\}"
-    _build(status, "application/json", body)
+    _build(status, "application/json", json_stringify(d))
 
 // Maximum request header region (64 KiB) and body (8 MiB). Defaults that BOUND arena growth so a
 // lying / oversized / never-terminated request cannot exhaust memory. Functions (not globals) =
@@ -498,6 +518,10 @@ fn _fr_match(pattern: string, path: string)
         let pp = pat_parts[i]
         let vp = path_parts[i]
         if len(pp) > 0 and starts_with(pp, ":")
+            // A :param must bind a NON-EMPTY segment: "/users/:id" must NOT match "/users/" with
+            // id="" (which would hand a handler an empty id, e.g. db.get("")). Empty -> no match -> 404.
+            if len(vp) == 0
+                return err("empty param segment")
             let pn = slice(pp, 1, len(pp))
             params[pn] = vp
         else if pp != vp
@@ -808,13 +832,15 @@ fn _coerce(v) -> Response
 // Handlers take `req: Request` as a TYPED PARAMETER -> field access resolves per-struct
 // (sound; see the cross-module field-resolution fix). Return a Response via resp_json/
 // resp_text/resp_html -- e.g. `return forge.resp_json(200, user)` for "return your type, get JSON".
-// ── Static file serving (Phase 1) ─ traversal-safe BY CONSTRUCTION ────────────
+// ── Static file serving (Phase 1) ─ traversal-safe by path-segment whitelist ──
 // static(a, url_prefix, root_dir) mounts a directory: a GET/HEAD whose path begins with
-// url_prefix is served from root_dir. Security is by construction, not configuration --
-// _safe_subpath whitelists path segments so no "..", no absolute / backslash / drive path,
-// and no dotfile (.env / .git / ...) can ever be reached; the served file cannot escape
-// root_dir. Most frameworks serve dotfiles by default and rely on the developer to lock the
-// path down; Forge cannot be misconfigured into a directory-traversal or secret-leak CVE.
+// url_prefix (at a segment boundary) is served from root_dir. _safe_subpath whitelists path
+// segments so no "..", no absolute / backslash / drive path, and no dotfile (.env / .git / ...)
+// can be reached TEXTUALLY -- the served path string cannot escape root_dir, and unlike most
+// frameworks Forge never serves dotfiles. CAVEAT (not yet closed): the whitelist is textual and
+// does NOT resolve symlinks, so a symlink placed inside root_dir that points outside it would be
+// followed; realpath-containment is a tracked follow-up. Do not mount a directory containing
+// untrusted symlinks until then.
 fn static(a, url_prefix: string, root_dir: string)
     push(a["statics"], [url_prefix, root_dir])
     a
@@ -834,8 +860,9 @@ fn _unsafe_segment(seg: string) -> bool
     false
 
 // Sanitize a URL subpath into a safe relative filesystem path. err on ANY traversal attempt.
-// The segment whitelist makes escape impossible: every surviving segment is an ordinary name,
-// so root_dir + "/" + result stays inside root_dir.
+// The segment whitelist makes TEXTUAL escape impossible: every surviving segment is an ordinary
+// name, so root_dir + "/" + result stays inside root_dir as a string (symlink resolution is a
+// separate, tracked containment check -- see static()).
 fn _safe_subpath(rel: string)
     let r = rel
     if starts_with(r, "/")
@@ -857,10 +884,22 @@ fn _safe_subpath(rel: string)
             i = i + 1
     ok(clean)
 
-// Try to serve req.path from a registered static mount: ok(Response) if a mount's prefix
-// matched AND the sanitized file exists; err otherwise (caller falls through to 404). An
-// empty subpath (the mount root) serves index.html. Text-correct; binary assets (read_file
-// stops at an embedded NUL) await the bytes/streaming Response.
+// A static mount matches the request path only at a SEGMENT boundary: exactly the prefix, under
+// it as "<prefix>/...", or the root mount "/". So mount "/app" does NOT shadow "/application".
+// Returns ok(subpath-after-prefix) on a match, err otherwise.
+fn _static_match(path: string, prefix: string)
+    if prefix == "/"
+        return ok(slice(path, 1, len(path)))
+    if path == prefix
+        return ok("")
+    if starts_with(path, prefix + "/")
+        return ok(slice(path, len(prefix), len(path)))
+    err("no prefix match")
+
+// Try to serve req.path from a registered static mount: ok(Response) if a mount matched at a
+// segment boundary AND the sanitized file exists; err otherwise (caller falls through to 404). An
+// empty subpath (the mount root) serves index.html. Text-correct; binary assets (read_file stops
+// at an embedded NUL) await the bytes/streaming Response.
 fn _try_static(a, req: Request)
     let mounts = a["statics"]
     let i = 0
@@ -868,8 +907,9 @@ fn _try_static(a, req: Request)
         let m = mounts[i]
         let prefix = m[0]
         let root = m[1]
-        if starts_with(req.path, prefix)
-            let safe = _safe_subpath(slice(req.path, len(prefix), len(req.path)))
+        let mp = _static_match(req.path, prefix)
+        if is_ok(mp)
+            let safe = _safe_subpath(unwrap(mp))
             if is_ok(safe)
                 let cleanrel = unwrap(safe)
                 if cleanrel == ""
