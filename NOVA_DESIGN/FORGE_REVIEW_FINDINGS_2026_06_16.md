@@ -107,3 +107,19 @@ fix, not a hurried patch):
 
 Diagnosis depth still owed: confirm whether the crash is in from_json's parse/fill or at the
 later field read (decides exactly where the default-fill goes). Probe was deleted (scratch).
+
+### Precise diagnosis (autonomous tick 2) — fix location confirmed
+
+The crash is in the COMPILER-GENERATED `<T>__from_json`, emitted by `_make_from_json_method`
+(nova_compiler.nova ~L3311-3331). It builds `T(d["f1"], d["f2"], ...)` reading each field by name
+positionally from the json-decoded dict. A field ABSENT from the dict yields a non-default value
+(wrong type / sentinel) placed into a typed slot, which then derefs at the field read (e.g. a
+non-string in `name` -> crash on `b.name`). So the fix is in the CODEGEN (Tier-3 -> reconverge),
+NOT a runtime-only patch: in `_make_from_json_method`, wrap each field's `elem` (the `d[fname]`
+read) in a presence guard -- `if contains(d, fname): <as today> else: <type-default>` -- with
+type-default = 0 (int/float), "" (string), false (bool), [] (list), and a recursively-defaulted
+struct (or skip-with-default) for struct fields. This guarantees from_json never produces an
+unsafe struct. Add the missing-field + malformed cases to from_json_test as the guard. Sequence
+this with rank-5 (it's the same generator the Result-returning safe variant will extend). Left for
+the gated phase: a reconverge to the bootstrap compiler warrants full attention, not an autonomous
+timer tick.
