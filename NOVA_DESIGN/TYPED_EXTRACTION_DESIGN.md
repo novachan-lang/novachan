@@ -68,3 +68,46 @@ AND {"price":5.0}).
 so the UNSAFE from_json no longer wild-derefs on `from_json("42")` etc. (contains on a bare int was a
 remote-crash hole via the scaffold's `from_json(req.body)`). from_json_safe's json_decode_checked is
 the typed/validating counterpart (Err instead of silent-default).
+
+## from_json_safe DONE (pure-NOVA, deviated from STEP 0's json_decode_checked runtime plan)
+Implemented WITHOUT a runtime edit (lower risk): `_make_from_json_safe_method` emits a NOVA fn
+`<T>__from_json_safe(s)` = `let d=json_decode(s); if type_name(d)!="dict": return err(...);
+ok(<T>__from_json(d))`. json_decode returns a dict ONLY for objects (probed: int->int, arr->list,
+str->string, empty/garbage->int), so `type_name(d)!="dict"` is a real validity gate (only brace-started
+malformed `{bad`->empty dict->ok(defaults) slips; documented v1 gap). Typed-let rewrite at ~L8460
+(`let r: Result<T> = from_json_safe(s)` -> `<T>__from_json_safe(s)`, slot forced SUM-typed via
+fj_force_any=1). Required TWO inferer fixes: (1) registered `from_json_safe` builtin returning
+nt_sum(T,string); (2) ti_ann_to_type_g `Result<T>` was COLLAPSING to inner T (latent bug, zero real
+annotations relied on it) -> now nt_sum(T,string), aligned with the `T?` Option sugar. GATE: generation
+is SKIPPED when the unit user-shadows `ok`/`err` (shadow_test defines `fn ok` -> the generated body's
+`ok(...)`/`err(...)` would bind the wrong fn; caught by the full regression). Guards: from_json_safe_test
++ from_json_safe_forge_test (422-on-bad-body end-to-end).
+
+## query_as / form_as -- REVISED after adversary workflow wa0y0jben (verdict was unsafe-redesign)
+The 8-agent design (sqlx/Pydantic/Ecto + Opus synthesis + Opus adversary) overturned the STEP-1/4 plan:
+- DECISION (kept): NAME-KEYED only, never positional (positional is THE silent-corruption footgun -- a
+  mid-table migration shifts every field). Both query_as<T> & form_as<T> consume a {col:string} dict and
+  bind by `d[field_name]`. DECISION (kept): bad value -> Err with field name; missing key -> type-correct
+  default (absence != malformed); strict-on-missing is opt-in (query_as_strict).
+- ADVERSARY FATAL (empirically PROVEN on this machine): binding a float via
+  `match parse_float_safe(raw) { Ok(v) => local = v }` LOSES the float static type -> `bal="3.14159"`
+  reads back as `4614256650576692846` (raw IEEE bits printed as int). The "Ok(v) carries float type
+  end-to-end" claim is FALSE. to_json MASKS it (struct-meta render) so a happy-path test ships green.
+  FIX: re-establish float typing at the bind site with `float(<ok payload>)` (mirror the WORKING
+  from_json path). MUST-HAVE regression: str(field)==input AND field*2 correct AND to_json correct.
+- PIVOT (risk-killer): make query_as/form_as ENTIRELY PURE-NOVA -- NO runtime edit, NO parse_bool_safe
+  (the adversary found 5+ runtime copies, not 2; the two-copy plan was factually wrong). Field binding:
+  int->parse_int_safe (exists), float->float(parse_float_safe ok) (exists + the fix), bool->INLINE NOVA
+  string compare (true/1/t/yes/on vs false/0/f/no/off -> else Err), string->passthrough,
+  struct-><F>__from_json_safe (exists). Gated on no ok/err shadow, like from_json_safe.
+- ADVERSARY HIGH (NULL): SQLITE_NULL -> cstr_to_string(NULL)="" -> PRESENT key "" -> parse_int_safe("")
+  -> Err -> the whole row fails. NULL is indistinguishable from "" at the dict layer. FIX: empty-string
+  -> type-correct default for NON-STRING fields in BOTH from_row & from_form (consistent, total; nullable
+  columns are THE common shape). Loses loud-"" detection; correct tradeoff.
+- ADVERSARY MEDIUM (harden): row_dict/pool_query_dicts zip `while i<len(cols) and i<len(row)` silently
+  omits keys on a short row -> name-keying drift one layer up. FIX: error (or do not silently omit) on
+  len(row)!=len(cols).
+- TRACKED pre-existing (NOT introduced here, affect from_json too): cstr_to_string strlen-truncates at
+  embedded NUL; parse_float_safe strtod is LC_NUMERIC-locale-dependent. Note as known-limitations.
+- Code-location drift: the design's line numbers were stale; re-verify against real source (row_dict is
+  forge.nova ~L685-693; forge.nova/forge_db.nova exist in forge/, nova-compiler/lib/, _nh_home/lib/).

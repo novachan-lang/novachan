@@ -15,7 +15,7 @@ Write-Host "gen4 built OK"
 
 $gen4 = Join-Path $PSScriptRoot "gen4_test.exe"
 $fail = 0
-foreach ($t in @("from_json_safety_test","from_json_test","auto_json_test","rtti_json_test")) {
+foreach ($t in @("from_json_safe_test","from_json_safety_test","from_json_test","auto_json_test","rtti_json_test")) {
     Remove-Item "$t.ll","$t.exe" -Force -ErrorAction SilentlyContinue
     $cc = Invoke-Timed -FilePath $gen4 -Arguments "$t.nova" -TimeoutMs 120000 -WorkingDirectory $PSScriptRoot
     if (!(Test-Path "$t.ll")) { Write-Host "$t COMPILE FAIL"; if($cc.StdOut){Write-Host $cc.StdOut}; $fail=1; continue }

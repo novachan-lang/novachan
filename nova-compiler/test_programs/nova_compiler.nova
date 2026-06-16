@@ -3377,6 +3377,25 @@ fn _make_from_json_method(tname: string, fields: list, structset: dict, ln: int)
     push(body, Stmt("return", "", ctor, [], [], [], [], ln))
     Stmt("fn", tname + "__from_json", null_expr(), body, [Param("d", "dict", null_expr())], [], [], ln)
 
+// <T>__from_json_safe(s) -- the VALIDATING counterpart of the unsafe from_json. It parses, then
+// REQUIRES a JSON object (dict); non-object / empty / garbage input -> Err(message) instead of a
+// silently-defaulted struct. Returns Result<T, string>: ok(<T>__from_json(d)) on a dict, else err.
+// Pure NOVA (no runtime edit): json_decode returns a dict ONLY for objects (non-objects decode to
+// int/list/string, empty/garbage -> int), so `type_name(d) != "dict"` is a real validity gate.
+// (Brace-started malformed like `{bad` decodes to an empty dict -> ok(defaults); documented v1 gap.)
+// Consumed by the typed-let rewrite (`let r: Result<T> = from_json_safe(s)`); the slot stays
+// SUM-typed so `match r { Ok(t) => .. Err(e) => .. }` tag-dispatches.
+fn _make_from_json_safe_method(tname: string, ln: int) -> Stmt
+    let body = []
+    let dec = Expr("call", "json_decode", 0, [Expr("ident", "s", 0, [], [], ln)], [], ln)
+    push(body, Stmt("assign", "d", dec, [], [], [], [], ln))
+    let cond = Expr("binop", "!=", 0, [Expr("call", "type_name", 0, [Expr("ident", "d", 0, [], [], ln)], [], ln), Expr("str", "dict", 0, [], [], ln)], [], ln)
+    let errret = Stmt("return", "", Expr("call", "err", 0, [Expr("str", "expected a JSON object for " + tname, 0, [], [], ln)], [], ln), [], [], [], [], ln)
+    push(body, Stmt("if", "", cond, [errret], [], [], [], ln))
+    let okval = Expr("call", "ok", 0, [Expr("call", tname + "__from_json", 0, [Expr("ident", "d", 0, [], [], ln)], [], ln)], [], ln)
+    push(body, Stmt("return", "", okval, [], [], [], [], ln))
+    Stmt("fn", tname + "__from_json_safe", null_expr(), body, [Param("s", "string", null_expr())], [], [], ln)
+
 // ── Multi-clause function heads (Erlang/Elixir-style guard dispatch) ──────────
 // Several same-name/same-arity `fn f(...) when <guard>` heads are fused into ONE
 // function whose body is a guard if/else chain (last unguarded head = catch-all;
@@ -3701,6 +3720,14 @@ fn expand_derives(stmts: list) -> list
                             push(generated, _make_to_json_method(sname, sparams, jsonset, sln))
                         if contains(user_fns, sname + "__from_json") == 0
                             push(generated, _make_from_json_method(sname, sparams, jsonset, sln))
+                        // __from_json_safe is built from the `ok`/`err` Result constructors. If THIS
+                        // unit shadows either with a user fn (a legal feature -- see shadow_test), the
+                        // generated body would bind the wrong fn and fail to type-check. Skip it then:
+                        // a unit that redefines the Result constructor cannot sensibly use a
+                        // Result-returning extractor, and every normal unit (no shadow) still gets it
+                        // unconditionally, so cross-module from_json_safe keeps working.
+                        if contains(user_fns, sname + "__from_json_safe") == 0 and contains(user_fns, "ok") == 0 and contains(user_fns, "err") == 0
+                            push(generated, _make_from_json_safe_method(sname, sln))
                         if contains(user_fns, sname + "__fields") == 0
                             push(generated, _make_fields_method(sname, sparams, sln))
                         if contains(user_fns, sname + "__type_name") == 0
@@ -8433,10 +8460,24 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let eff_expr = expr
                 let fj_type = ""
                 let ann_type = ""
+                let fj_force_any = 0
                 if len(params) > 0
                     match params[0]
                         Param(fj_pn, fj_pt, fj_pd) =>
-                            if contains(b.ir_sdefs, fj_pt)
+                            if len(fj_pt) > 8 and fj_pt[0:7] == "Result<" and fj_pt[len(fj_pt)-1:len(fj_pt)] == ">"
+                                // Typed-let over Result<T>: `let r: Result<User> = from_json_safe(s)`
+                                // rewrites to <User>__from_json_safe(s) (compiler-derived, validating).
+                                // The slot MUST stay SUM-typed (Result), so force_any -> never record
+                                // the inner struct in ir_locals; otherwise `match r { Ok(t)/Err(e) }`
+                                // would mis-dispatch (ti collapses Result<T> -> T and mistypes r).
+                                let fj_inner = fj_pt[7:len(fj_pt)-1]
+                                if contains(b.ir_sdefs, fj_inner)
+                                    match expr
+                                        Expr(fs_et, fs_ev, fs_en, fs_ec, fs_ef, fs_el) =>
+                                            if fs_et == "call" and fs_ev == "from_json_safe"
+                                                eff_expr = Expr("call", fj_inner + "__from_json_safe", fs_en, fs_ec, fs_ef, fs_el)
+                                                fj_force_any = 1
+                            else if contains(b.ir_sdefs, fj_pt)
                                 // The typed-let's DECLARED struct type (`let x: T = ...`). Record it
                                 // regardless of the RHS: it is the authoritative static type of `x`,
                                 // and it lets field access resolve `x.field` PER-STRUCT (via ir_sdefs)
@@ -8454,7 +8495,11 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let val = ir_lower_expr(b, eff_expr)
                 if name != ""
                     ir_emit_inst(b, "slot_store", "", ir_type_void(), [val], name, 0)
-                    if fj_type != ""
+                    if fj_force_any == 1
+                        // Result<T> let-binding: keep the slot polymorphic so the sum tag survives
+                        // for the downstream match (never type it as the inner struct).
+                        b.ir_locals[name] = 1
+                    else if fj_type != ""
                         b.ir_locals[name] = fj_type
                     else
                         let asg_stype = ir_expr_struct_type(b, eff_expr)
@@ -10201,6 +10246,10 @@ fn ti_build_stdlib_ext(reg: dict)
     // from_json(d): generic decoder; the result type comes from the let annotation
     // (`let p: T = from_json(d)`), and codegen dispatches to the derived <T>__from_json.
     reg["from_json"] = NTypeScheme([-1], nt_fn([nt_any()], T))
+    // from_json_safe(s): the VALIDATING decoder. Returns Result<T, string> (ok struct | err message);
+    // the ok type T comes from the `let r: Result<T> = ...` annotation, and codegen dispatches to the
+    // derived <T>__from_json_safe. Registered as a sum so the inferer types `r` correctly for match.
+    reg["from_json_safe"] = NTypeScheme([-1], nt_fn([nt_string()], nt_sum(T, nt_string())))
     reg["node_listen"] = NTypeScheme([], nt_fn([nt_int()], nt_any()))
     reg["node_connect"] = NTypeScheme([], nt_fn([nt_string()], nt_any()))
     reg["remote_connect"] = NTypeScheme([], nt_fn([nt_string(), nt_int()], nt_any()))
@@ -10920,8 +10969,14 @@ fn ti_ann_to_type_g(st: TiState, ann: string, gmap: dict) -> NType
             return ti_ann_to_type_g(st, args[0], gmap)
         return nt_any()
     if base == "Result"
+        // Result<T> := nt_sum(T, string); Result<T,E> := nt_sum(T,E). A SUM, not the inner type --
+        // mirrors the `T?` Option sugar (-> nt_sum(T,unit)) and lets `let r: Result<T> = ...` plus
+        // `match r { Ok/Err }` type-check (e.g. from_json_safe). (Collapsing to the inner type was a
+        // latent bug: no real annotation used it, and it broke any Result<T>-annotated sum binding.)
+        if len(args) >= 2
+            return nt_sum(ti_ann_to_type_g(st, args[0], gmap), ti_ann_to_type_g(st, args[1], gmap))
         if len(args) >= 1
-            return ti_ann_to_type_g(st, args[0], gmap)
+            return nt_sum(ti_ann_to_type_g(st, args[0], gmap), nt_string())
         return nt_any()
     if base == "Channel" or base == "channel"
         if len(args) >= 1

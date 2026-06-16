@@ -109,6 +109,8 @@ $domain_tests = @(
     'auto_show_test',
     'auto_json_test',
     'from_json_safety_test',
+    'from_json_safe_test',
+    'from_json_safe_forge_test',
     'auto_eq_test',
     'idx_set_soundness_test',
     'byteorder_test',
