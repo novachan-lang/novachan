@@ -1,0 +1,69 @@
+// forge_recv_security_test -- SEC-2: request-read hardening, observed over a REAL socket.
+// (1) a POST whose body arrives in a SEPARATE TCP segment behind a LOWERCASE `content-length`
+//     header is fully received -- the old case-sensitive parser returned cl=0 and silently
+//     DROPPED the body (cl reaches the handler as got:5, not got:0).
+// (2) a POST advertising an absurd Content-Length does NOT hang the server: the read is bounded
+//     (> MAX_BODY) so the server responds promptly instead of blocking for gigabytes.
+// Server-binding -> runs serially in the regression.
+import forge
+
+type Echo
+    got: int
+
+fn h_echo(req: Request) -> Echo
+    Echo(len(req.body))
+
+fn _client_split(port, rch)
+    sleep(30)
+    let sock = tcp_connect("127.0.0.1", port)
+    if sock >= 0
+        // headers (lowercase content-length) first, then the body as a separate segment
+        tcp_send(sock, "POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: 5\r\n\r\n")
+        sleep(25)
+        tcp_send(sock, "hello")
+        let resp = tcp_recv(sock)
+        tcp_close(sock)
+        send(rch, "SPLIT:" + str(resp))
+    else
+        send(rch, "SPLIT:FAIL")
+
+fn _client_huge(port, rch)
+    sleep(30)
+    let sock = tcp_connect("127.0.0.1", port)
+    if sock >= 0
+        tcp_send(sock, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999\r\n\r\nx")
+        let resp = tcp_recv(sock)
+        tcp_close(sock)
+        send(rch, "HUGE:" + str(resp))
+    else
+        send(rch, "HUGE:FAIL")
+
+fn main()
+    let q = chr(34)
+    let app = forge.app()
+    forge.post(app, "/echo", h_echo)
+    let port = 18994
+    let results = channel()
+    let p = port
+    let ap = app
+    sched_spawn(fn(z) forge.serve_req_n(ap, p, 2))
+    sleep(60)
+    let rc1 = results
+    let pp1 = port
+    sched_spawn(fn(z) _client_split(pp1, rc1))
+    let rc2 = results
+    let pp2 = port
+    sched_spawn(fn(z) _client_huge(pp2, rc2))
+    let split_ok = 0
+    let huge_ok = 0
+    let j = 0
+    while j < 2
+        let r = str(recv(results))
+        if find(r, "SPLIT:") >= 0 and find(r, q + "got" + q + ":5") >= 0
+            split_ok = 1
+        if find(r, "HUGE:") >= 0 and find(r, "200 OK") >= 0
+            huge_ok = 1
+        j = j + 1
+    assert(split_ok == 1, "lowercase content-length body received across segments (got:5)")
+    assert(huge_ok == 1, "oversized Content-Length did not hang the server (bounded read)")
+    print("forge_recv_security_test passed (lowercase-CL body + oversized-CL bound)")

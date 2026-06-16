@@ -225,15 +225,61 @@ fn json_obj(status: int, pairs: list) -> string
     body = body + "\}"
     _build(status, "application/json", body)
 
+// Maximum request header region (64 KiB) and body (8 MiB). Defaults that BOUND arena growth so a
+// lying / oversized / never-terminated request cannot exhaust memory. Functions (not globals) =
+// one source of truth; a larger upload path arrives with a length-delimited bytes Response.
+fn _max_header() -> int
+    65536
+
+fn _max_body() -> int
+    8388608
+
+fn _is_digits(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    while i < len(s)
+        if find("0123456789", s[i]) < 0
+            return false
+        i = i + 1
+    true
+
+// Content-Length from the HEADER REGION only, case-insensitive, anchored to a header-line boundary
+// (so "X-Foo-Content-Length:" cannot match). Returns: -1 absent; -2 malformed/ambiguous -- non-
+// numeric, MORE THAN ONE Content-Length, or ANY Transfer-Encoding (Forge does not implement
+// chunked, so it REFUSES rather than mis-frame, closing a request-smuggling vector); else the length.
 fn _content_length(raw)
-    let idx = find(raw, "Content-Length:")
-    if idx < 0
-        return 0
-    let after = slice(raw, idx + 15, len(raw))
-    let nl = find(after, "\r\n")
-    if nl < 0
-        return 0
-    parse_int(trim(slice(after, 0, nl)))
+    let sep = find(raw, "\r\n\r\n")
+    let head = raw
+    if sep >= 0
+        head = slice(raw, 0, sep)
+    let lines = split(head, "\r\n")
+    let cl = -1
+    let seen = 0
+    let te = 0
+    let i = 1
+    while i < len(lines)
+        let line = lines[i]
+        let c = find(line, ":")
+        if c >= 0
+            let nm = lower(trim(slice(line, 0, c)))
+            let vl = trim(slice(line, c + 1, len(line)))
+            if nm == "content-length"
+                seen = seen + 1
+                if _is_digits(vl)
+                    cl = parse_int(vl)
+                else
+                    cl = -2
+            else if nm == "transfer-encoding"
+                te = 1
+        i = i + 1
+    if te == 1
+        return -2
+    if seen > 1
+        return -2
+    if seen == 0
+        return -1
+    cl
 
 // Read a COMPLETE HTTP request: a single tcp_recv may return only the first TCP segment
 // (headers, or a partial body), so reading once silently drops POST bodies that arrive in
@@ -245,13 +291,21 @@ fn recv_request(conn)
         return req
     let sep = find(req, "\r\n\r\n")
     while sep < 0
+        // Bound the header region: a client that never sends the blank line (Slowloris) or an
+        // oversized header block cannot grow memory without limit.
+        if len(req) > _max_header()
+            return req
         let more = tcp_recv(conn)
         if len(more) == 0
             return req
         req = req + more
         sep = find(req, "\r\n\r\n")
     let cl = _content_length(req)
-    while cl > 0 and (len(req) - (sep + 4)) < cl
+    // Refuse to read a body for an absent (-1), malformed/chunked/ambiguous (-2), or oversized
+    // (> MAX_BODY) Content-Length: return what arrived rather than mis-frame or grow unbounded.
+    if cl < 0 or cl > _max_body()
+        return req
+    while (len(req) - (sep + 4)) < cl
         let more = tcp_recv(conn)
         if len(more) == 0
             return req
