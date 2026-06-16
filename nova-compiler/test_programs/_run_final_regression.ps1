@@ -146,6 +146,7 @@ $domain_tests = @(
     'cross_import_extern_test',
     'forge_typed_core_test',
     'cross_module_struct_test',
+    'tka_xmod_test',
     'forge_typed_dispatch_test',
     'forge_coerce_test',
     'forge_typed_mw_test',
