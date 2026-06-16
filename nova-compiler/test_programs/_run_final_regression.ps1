@@ -155,6 +155,7 @@ $domain_tests = @(
     'forge_keepalive_test',
     'forge_cookie_test',
     'forge_session_test',
+    'forge_redirect_query_test',
     'forge_spawn_test',
     'forge_recover_test',
     'forge_group_test',
