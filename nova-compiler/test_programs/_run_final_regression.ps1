@@ -108,6 +108,7 @@ $domain_tests = @(
     'q_propagate_test',
     'auto_show_test',
     'auto_json_test',
+    'from_json_safety_test',
     'auto_eq_test',
     'idx_set_soundness_test',
     'byteorder_test',

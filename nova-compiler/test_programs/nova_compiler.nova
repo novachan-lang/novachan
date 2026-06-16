@@ -3308,30 +3308,63 @@ fn _list_struct_elem(ftype: string, structset: dict) -> string
 // a STRUCT-typed field recurses via its own <FieldType>__from_json, and a list<Struct>
 // field maps each element through <Elem>__from_json. Dispatched at a typed let
 // (`let p: T = from_json(d)`) by the genius compiler.
+// A crash-safe DEFAULT for a field ABSENT from the decoded JSON dict. Without this, from_json read
+// d[fname] for a missing key and stored the (wrong-type) result into a typed slot -> a later read
+// of a string/list/struct field deref'd garbage and SEGFAULTED (a remote DoS when from_json runs on
+// an untrusted request body). The default is type-correct AND erased to match the present-case
+// type so the local var unifies with no HM conflict: a struct field recurses on {} (-> a fully
+// defaulted struct, typed <T>); a list<Struct> field defaults to [] (typed list, matching map());
+// everything else gets a type-correct literal BOX-ERASED to `any` via [lit][0] (NOVA list elements
+// are `any`) to match d[f], which is also `any`.
+fn _fj_default(ftype: string, structset: dict, ln: int) -> Expr
+    if contains(structset, ftype)
+        return Expr("call", ftype + "__from_json", 0, [Expr("dict", "", 0, [], [], ln)], [], ln)
+    if _list_struct_elem(ftype, structset) != ""
+        return Expr("list", "", 0, [], [], ln)
+    let lit = Expr("null", "", 0, [], [], ln)
+    if ftype == "string" or ftype == "String"
+        lit = Expr("str", "", 0, [], [], ln)
+    else if ftype == "float" or ftype == "Float"
+        lit = Expr("float", "0.0", 0, [], [], ln)
+    else if ftype == "int" or ftype == "Int" or ftype == "bool" or ftype == "Bool"
+        lit = Expr("int", "0", 0, [], [], ln)
+    else if len(ftype) >= 4 and ftype[0:4] == "list"
+        lit = Expr("list", "", 0, [], [], ln)
+    else if ftype == "dict"
+        lit = Expr("dict", "", 0, [], [], ln)
+    Expr("index", "", 0, [Expr("list", "", 0, [lit], [], ln), Expr("int", "0", 0, [], [], ln)], [], ln)
+
 fn _make_from_json_method(tname: string, fields: list, structset: dict, ln: int) -> Stmt
+    let body = []
     let ctor_args = []
     let i = 0
     let n = len(fields)
     while i < n
         match fields[i]
             Param(fname, ftype, fdef) =>
+                let local = "_fj_" + fname
                 let key = Expr("str", fname, 0, [], [], ln)
                 let elem = Expr("index", "", 0, [Expr("ident", "d", 0, [], [], ln), key], [], ln)
-                let arg = elem
+                let real = elem
                 if contains(structset, ftype)
-                    arg = Expr("call", ftype + "__from_json", 0, [elem], [], ln)
+                    real = Expr("call", ftype + "__from_json", 0, [elem], [], ln)
                 else
                     let les = _list_struct_elem(ftype, structset)
                     if les != ""
                         // list<Struct>: map(d[f], fn(e) <Elem>__from_json(e))
                         let lam_body = Expr("call", les + "__from_json", 0, [Expr("ident", "e", 0, [], [], ln)], [], ln)
                         let lam = Expr("lambda", "", 0, [lam_body], [Expr("ident", "e", 0, [], [], ln)], ln)
-                        arg = Expr("call", "map", 0, [elem, lam], [], ln)
-                push(ctor_args, arg)
+                        real = Expr("call", "map", 0, [elem, lam], [], ln)
+                // _fj_<f> = <default> ; if contains(d, "<f>"): _fj_<f> = <real>   (missing -> safe default)
+                push(body, Stmt("assign", local, _fj_default(ftype, structset, ln), [], [], [], [], ln))
+                let has = Expr("call", "contains", 0, [Expr("ident", "d", 0, [], [], ln), key], [], ln)
+                let setreal = Stmt("assign", local, real, [], [], [], [], ln)
+                push(body, Stmt("if", "", has, [setreal], [], [], [], ln))
+                push(ctor_args, Expr("ident", local, 0, [], [], ln))
         i = i + 1
     let ctor = Expr("call", tname, 0, ctor_args, [], ln)
-    let ret_stmt = Stmt("return", "", ctor, [], [], [], [], ln)
-    Stmt("fn", tname + "__from_json", null_expr(), [ret_stmt], [Param("d", "dict", null_expr())], [], [], ln)
+    push(body, Stmt("return", "", ctor, [], [], [], [], ln))
+    Stmt("fn", tname + "__from_json", null_expr(), body, [Param("d", "dict", null_expr())], [], [], ln)
 
 // ── Multi-clause function heads (Erlang/Elixir-style guard dispatch) ──────────
 // Several same-name/same-arity `fn f(...) when <guard>` heads are fused into ONE
