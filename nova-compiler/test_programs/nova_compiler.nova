@@ -3396,6 +3396,94 @@ fn _make_from_json_safe_method(tname: string, ln: int) -> Stmt
     push(body, Stmt("return", "", okval, [], [], [], [], ln))
     Stmt("fn", tname + "__from_json_safe", null_expr(), body, [Param("s", "string", null_expr())], [], [], ln)
 
+// A list literal of the given string values -- the bool accept-set for <T>__from_dict, tested with a
+// single `contains([..], raw)` membership call (one builtin, no multi-block `or` short-circuit chain).
+fn _fd_str_list(values: list, ln: int) -> Expr
+    let elems = []
+    for v in values
+        push(elems, Expr("str", v, 0, [], [], ln))
+    Expr("list", "", 0, elems, [], ln)
+
+// Coercion statements for ONE field of <T>__from_dict (run inside `if contains(d, "<f>")`). String->typed
+// with VALIDATION: a non-coercible value -> `return err("field '<f>': <reason>")` (never a silent default
+// past empty). Empty string -> keep the type-correct default (a NULL column reads as "" via cstr_to_string,
+// and a blank form field is "absent"); only a genuinely-malformed non-empty value errors. FLOAT binds the
+// VALUE via float(raw) (the proven path; the parse_float_safe Ok payload would lose float typing) and only
+// uses parse_float_safe for the Err gate. Uses match Ok/Err (no is_ok/unwrap) so the shadow surface stays ok/err.
+fn _fd_coerce_field(local: string, fname: string, ftype: string, structset: dict, ln: int) -> list
+    let stmts = []
+    let rawname = "_fdraw_" + fname
+    let rawget = Expr("index", "", 0, [Expr("ident", "d", 0, [], [], ln), Expr("str", fname, 0, [], [], ln)], [], ln)
+    push(stmts, Stmt("assign", rawname, rawget, [], [], [], [], ln))
+    let errprefix = "field '" + fname + "': "
+    if ftype == "string" or ftype == "String"
+        push(stmts, Stmt("assign", local, Expr("ident", rawname, 0, [], [], ln), [], [], [], [], ln))
+        return stmts
+    let inner = []
+    if ftype == "int" or ftype == "Int"
+        let vn = "_fdv_" + fname
+        let en = "_fde_" + fname
+        let okp = Expr("pat_ctor", "Ok", 0, [Expr("pat_var", vn, 0, [], [], ln)], [], ln)
+        let oka = Stmt("arm", "", okp, [Stmt("assign", local, Expr("ident", vn, 0, [], [], ln), [], [], [], [], ln)], [], [], [null_expr()], ln)
+        let erp = Expr("pat_ctor", "Err", 0, [Expr("pat_var", en, 0, [], [], ln)], [], ln)
+        let emsg = Expr("binop", "+", 0, [Expr("str", errprefix, 0, [], [], ln), Expr("ident", en, 0, [], [], ln)], [], ln)
+        let era = Stmt("arm", "", erp, [Stmt("return", "", Expr("call", "err", 0, [emsg], [], ln), [], [], [], [], ln)], [], [], [null_expr()], ln)
+        push(inner, Stmt("match", "", Expr("call", "parse_int_safe", 0, [Expr("ident", rawname, 0, [], [], ln)], [], ln), [oka, era], [], [], [], ln))
+    else if ftype == "float" or ftype == "Float"
+        let vn = "_fdv_" + fname
+        let en = "_fde_" + fname
+        let okp = Expr("pat_ctor", "Ok", 0, [Expr("pat_var", vn, 0, [], [], ln)], [], ln)
+        let oka = Stmt("arm", "", okp, [Stmt("assign", local, Expr("call", "float", 0, [Expr("ident", rawname, 0, [], [], ln)], [], ln), [], [], [], [], ln)], [], [], [null_expr()], ln)
+        let erp = Expr("pat_ctor", "Err", 0, [Expr("pat_var", en, 0, [], [], ln)], [], ln)
+        let emsg = Expr("binop", "+", 0, [Expr("str", errprefix, 0, [], [], ln), Expr("ident", en, 0, [], [], ln)], [], ln)
+        let era = Stmt("arm", "", erp, [Stmt("return", "", Expr("call", "err", 0, [emsg], [], ln), [], [], [], [], ln)], [], [], [null_expr()], ln)
+        push(inner, Stmt("match", "", Expr("call", "parse_float_safe", 0, [Expr("ident", rawname, 0, [], [], ln)], [], ln), [oka, era], [], [], [], ln))
+    else if ftype == "bool" or ftype == "Bool"
+        // contains([accept-set], raw) -- single membership call (avoids a multi-block `or` short-circuit
+        // chain whose interaction with the nested if/else mis-sequenced the branches).
+        let istrue = Expr("call", "contains", 0, [_fd_str_list(["true", "1", "t", "yes", "on", "True", "TRUE"], ln), Expr("ident", rawname, 0, [], [], ln)], [], ln)
+        let isfalse = Expr("call", "contains", 0, [_fd_str_list(["false", "0", "f", "no", "off", "False", "FALSE"], ln), Expr("ident", rawname, 0, [], [], ln)], [], ln)
+        let setfalse = Stmt("assign", local, Expr("int", "0", 0, [], [], ln), [], [], [], [], ln)
+        let errb = Stmt("return", "", Expr("call", "err", 0, [Expr("str", errprefix + "not a boolean", 0, [], [], ln)], [], ln), [], [], [], [], ln)
+        let elseif = Stmt("if", "", isfalse, [setfalse], [], [errb], [], ln)
+        // int literal value lives in the `en` (numeric) field, NOT the string -- `Expr("int","1",1,...)`.
+        let settrue = Stmt("assign", local, Expr("int", "1", 1, [], [], ln), [], [], [], [], ln)
+        push(inner, Stmt("if", "", istrue, [settrue], [], [elseif], [], ln))
+    else
+        // struct/list/dict field from a FLAT dict: no flat coercion -> keep the type-correct default.
+        return stmts
+    // non-string: empty string -> keep the default (NULL column / blank form field), else coerce-or-err.
+    let nonempty = Expr("binop", "!=", 0, [Expr("ident", rawname, 0, [], [], ln), Expr("str", "", 0, [], [], ln)], [], ln)
+    push(stmts, Stmt("if", "", nonempty, inner, [], [], [], ln))
+    stmts
+
+// <T>__from_dict(d): NAME-KEYED typed extraction from a {string:string} dict (a DB row via
+// pool_query_dicts, or a form body). Returns Result<T, string>: ok(T) when every present field coerces,
+// else err("field '<f>': <reason>"). The shared core of query_as<T> and form_as<T>. Name-keyed (not
+// positional) by design -- column/form order is irrelevant, so a migration cannot silently shift fields.
+// Missing key OR empty value -> the field's type-correct default (absence != malformed; NULL-safe).
+fn _make_from_dict_method(tname: string, fields: list, structset: dict, ln: int) -> Stmt
+    let body = []
+    let nd_cond = Expr("binop", "!=", 0, [Expr("call", "type_name", 0, [Expr("ident", "d", 0, [], [], ln)], [], ln), Expr("str", "dict", 0, [], [], ln)], [], ln)
+    push(body, Stmt("if", "", nd_cond, [Stmt("assign", "d", Expr("dict", "", 0, [], [], ln), [], [], [], [], ln)], [], [], [], ln))
+    let ctor_args = []
+    let i = 0
+    let n = len(fields)
+    while i < n
+        match fields[i]
+            Param(fname, ftype, fdef) =>
+                let local = "_fd_" + fname
+                push(body, Stmt("assign", local, _fj_default(ftype, structset, ln), [], [], [], [], ln))
+                let key = Expr("str", fname, 0, [], [], ln)
+                let has = Expr("call", "contains", 0, [Expr("ident", "d", 0, [], [], ln), key], [], ln)
+                let coerce = _fd_coerce_field(local, fname, ftype, structset, ln)
+                push(body, Stmt("if", "", has, coerce, [], [], [], ln))
+                push(ctor_args, Expr("ident", local, 0, [], [], ln))
+        i = i + 1
+    let ctor = Expr("call", tname, 0, ctor_args, [], ln)
+    push(body, Stmt("return", "", Expr("call", "ok", 0, [ctor], [], ln), [], [], [], [], ln))
+    Stmt("fn", tname + "__from_dict", null_expr(), body, [Param("d", "dict", null_expr())], [], [], ln)
+
 // ── Multi-clause function heads (Erlang/Elixir-style guard dispatch) ──────────
 // Several same-name/same-arity `fn f(...) when <guard>` heads are fused into ONE
 // function whose body is a guard if/else chain (last unguarded head = catch-all;
@@ -3728,6 +3816,9 @@ fn expand_derives(stmts: list) -> list
                         // unconditionally, so cross-module from_json_safe keeps working.
                         if contains(user_fns, sname + "__from_json_safe") == 0 and contains(user_fns, "ok") == 0 and contains(user_fns, "err") == 0
                             push(generated, _make_from_json_safe_method(sname, sln))
+                        // <T>__from_dict (query_as/form_as core) -- same ok/err shadow gate.
+                        if contains(user_fns, sname + "__from_dict") == 0 and contains(user_fns, "ok") == 0 and contains(user_fns, "err") == 0
+                            push(generated, _make_from_dict_method(sname, sparams, jsonset, sln))
                         if contains(user_fns, sname + "__fields") == 0
                             push(generated, _make_fields_method(sname, sparams, sln))
                         if contains(user_fns, sname + "__type_name") == 0
@@ -8503,6 +8594,11 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                             if fs_et == "call" and fs_ev == "from_json_safe"
                                                 eff_expr = Expr("call", fj_inner + "__from_json_safe", fs_en, fs_ec, fs_ef, fs_el)
                                                 fj_force_any = 1
+                                            else if fs_et == "call" and fs_ev == "form_as"
+                                                // `let r: Result<T> = form_as(d)` -> <T>__from_dict(d)
+                                                // (d = a {string:string} form/row dict). Validating, name-keyed.
+                                                eff_expr = Expr("call", fj_inner + "__from_dict", fs_en, fs_ec, fs_ef, fs_el)
+                                                fj_force_any = 1
                             else if contains(b.ir_sdefs, fj_pt)
                                 // The typed-let's DECLARED struct type (`let x: T = ...`). Record it
                                 // regardless of the RHS: it is the authoritative static type of `x`,
@@ -10286,6 +10382,9 @@ fn ti_build_stdlib_ext(reg: dict)
     // the ok type T comes from the `let r: Result<T> = ...` annotation, and codegen dispatches to the
     // derived <T>__from_json_safe. Registered as a sum so the inferer types `r` correctly for match.
     reg["from_json_safe"] = NTypeScheme([-1], nt_fn([nt_string()], nt_sum(T, nt_string())))
+    // form_as(d): name-keyed typed extraction from a {string:string} dict (form body / DB row) ->
+    // Result<T, string>; T from the `let r: Result<T> = ...` annotation; codegen -> <T>__from_dict.
+    reg["form_as"] = NTypeScheme([-1], nt_fn([nt_any()], nt_sum(T, nt_string())))
     reg["node_listen"] = NTypeScheme([], nt_fn([nt_int()], nt_any()))
     reg["node_connect"] = NTypeScheme([], nt_fn([nt_string()], nt_any()))
     reg["remote_connect"] = NTypeScheme([], nt_fn([nt_string(), nt_int()], nt_any()))

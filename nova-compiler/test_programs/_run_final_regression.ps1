@@ -112,6 +112,7 @@ $domain_tests = @(
     'from_json_safe_test',
     'from_json_safe_forge_test',
     'match_result_struct_test',
+    'form_as_test',
     'auto_eq_test',
     'idx_set_soundness_test',
     'byteorder_test',
