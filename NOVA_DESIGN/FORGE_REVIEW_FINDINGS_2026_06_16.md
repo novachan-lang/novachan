@@ -123,3 +123,21 @@ unsafe struct. Add the missing-field + malformed cases to from_json_test as the 
 this with rank-5 (it's the same generator the Result-returning safe variant will extend). Left for
 the gated phase: a reconverge to the bootstrap compiler warrants full attention, not an autonomous
 timer tick.
+
+### read-timeout design (diagnosed 2026-06-16) — netpoller park-with-deadline
+
+The scheduler has NovaIOWaiter (task+fd+events) and NovaSleepWaiter (task+wake_time_ms) as SEPARATE
+lists (nova_runtime.c ~L4992-5017). A socket read-timeout = a combined waiter: park on fd WITH a
+deadline. Plan (focused session -- concurrency-critical, gate with green_scale + ASAN + both-mode
+regression):
+  1. Add `int64_t deadline_ms` (0 = none) to NovaIOWaiter.
+  2. In the carrier poll loop (the select()-based netpoller drain): re-enqueue a waiter when its fd
+     is ready OR now_ms >= deadline_ms; tag the task so the resumed tcp_recv knows it was a TIMEOUT
+     vs data-ready. Bound the select() timeout by the nearest waiter deadline (already done for sleep
+     waiters -- mirror that).
+  3. tcp_recv (green path): on timeout-wake, return a sentinel (e.g. "" + a thread-local timed-out
+     flag, or a distinct negative) so recv_request can stop and the connection 408s/closes.
+  4. New builtin tcp_set_read_timeout(sock, ms) (or a global default) -> reconverge (compiler reg +
+     declare + runtime). forge recv_request arms it per connection; on timeout return partial -> 408.
+RISK: netpoller is concurrency-critical (M:N lost-wakeup history). Do it FRESH with green_scale +
+ASAN gating; a subtle missed-wakeup race may pass one green_scale run -- run it a few times.
