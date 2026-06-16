@@ -141,3 +141,22 @@ regression):
      declare + runtime). forge recv_request arms it per connection; on timeout return partial -> 408.
 RISK: netpoller is concurrency-critical (M:N lost-wakeup history). Do it FRESH with green_scale +
 ASAN gating; a subtle missed-wakeup race may pass one green_scale run -- run it a few times.
+
+### TRACK-A scoping (diagnosed 2026-06-16) — unannotated cross-module call return type
+
+`ir_fn_returns` (fn name -> return type) is written for the MAIN module's fns (~L16014) and read in
+ir_expr_struct_type (~L8278: `if et=="call" and contains(ir_fn_returns, ev)`). The footgun: an
+unannotated `let x = mod.fn()` where mod.fn (imported, flat symbol) returns a struct -> x's IR type
+isn't set, so x.field falls back to the GLOBAL ir_fmap (name->slot, last-registered wins) -> wrong
+slot on shared field names. Fix (focused, gate-protected — compiler-deterministic, gen4-verify
+catches errors):
+  1. In compile_module_ir's imported-fn registration (~L17570-17620), also populate
+     ir_fn_returns[fn_name] = return-type for imported fns (so cross-module call returns are known).
+  2. In the let/assign IR-lowering, for an UNANNOTATED `let x = <call>`, set ir_locals[x] =
+     ir_fn_returns[callname] when that's a struct (the incr-1 c15c192 fix did this for the ANNOTATED
+     `let x: T` case; extend to the inferred case).
+  3. Repro test FIRST: two modules each defining a struct that SHARE a field name; an unannotated
+     `let x = modA.make()` then x.sharedField must read modA's slot, not the last-registered global.
+Alternative (safer, less complete): compile-ERROR on ambiguous unqualified field access on an
+untyped cross-module value, pushing the user to annotate. ANNOTATED + typed-param paths already work
+(the idiomatic forms), so this is a footgun-hardening, not an active bug in committed code.
