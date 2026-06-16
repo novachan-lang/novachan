@@ -81,3 +81,29 @@ distributed channels). The gaps are REACH, HARDENING, and the INBOUND type story
 8. **Graceful shutdown + built-in /health, /ready** via shutdown-channel + inflight-drain.
 
 Full result: tasks/w6vnsvm0t.output.
+
+## AUTONOMOUS FOLLOW-UP FINDING (2026-06-16) — from_json is UNSAFE on incomplete input (HIGH)
+
+A scoping probe (`let x: T = from_json(s)` on missing-field / malformed input) found that from_json
+SEGFAULTS (0xC0000005) when the JSON omits a struct field: well-formed `{"id":7,"name":"ada"}`
+worked, but `{"id":7}` (missing `name`) crashed the process. The field is left unpopulated ->
+accessing it dereferences garbage.
+
+IMPACT (raises rank-5 from ergonomics to SOUNDNESS): the shipped `--api` scaffold's create_todo
+does `let t: Todo = from_json(req.body)` and serves via serve_req (NOT crash-isolated), so a client
+POSTing incomplete JSON to a scaffolded API SEGFAULTS the server -- a remote DoS in generated code.
+
+This confirms rank-5 ("safe typed extraction") cannot be a Tier-0 forge wrapper -- the crash is in
+the from_json builtin itself. Proper fix options (next phase, do carefully -- a C-level soundness
+fix, not a hurried patch):
+  1. Harden nova_rt_from_json to DEFAULT-FILL missing fields (0 / "" / false) instead of leaving
+     them unpopulated -> never produces an unsafe struct (runtime-only, Tier-2: recompile + both-
+     mode regression + ASAN, likely no reconverge since the codegen contract is unchanged). This is
+     the minimal soundness fix and should come FIRST, independent of the ergonomic body_as<T> work.
+  2. A Result-returning safe variant (from_json_safe -> Ok/Err) wired into _coerce as Err->422, so
+     a bad body is a clean 422 not a 500/crash (the full rank-5).
+  3. Interim mitigation: the scaffold could serve via serve_safe_req so a body crash -> 500 + server
+     lives (a scaffold/template change -> reconverge); secondary to fixing the builtin.
+
+Diagnosis depth still owed: confirm whether the crash is in from_json's parse/fill or at the
+later field read (decides exactly where the default-fill goes). Probe was deleted (scratch).
