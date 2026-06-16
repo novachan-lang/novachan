@@ -1,0 +1,63 @@
+// forge_db -- optional SQLite data layer for Forge.
+//
+// Import this SEPARATELY from forge (only when your app needs a database), so DB-less apps never
+// link sqlite. Connection POOLING is a NOVA channel: recv = acquire (parks if all connections are
+// busy -> natural backpressure), send = release. The handle is an int (opaque sqlite ptr); the
+// channel copies the int while the underlying connection is shared -- no atomic-RC needed, and the
+// int/pointer soundness fix means the channel treats the handle as a scalar (never deref'd). All
+// queries are PARAMETERIZED (db_query binds positionally) -> injection-safe by construction.
+import sqlitex
+
+// Open a pool of N connections to `path`. Use a FILE path so the pooled connections share data
+// (":memory:" gives each connection its OWN private database).
+fn pool_open(path: string, n: int)
+    let ch = channel()
+    let i = 0
+    while i < n
+        send(ch, db_open(path))
+        i = i + 1
+    ch
+
+// Acquire a connection (parks until one is free); release it back to the pool when done.
+fn pool_acquire(pool)
+    recv(pool)
+
+fn pool_release(pool, db)
+    send(pool, db)
+
+// Parameterized query on a pooled connection (acquire -> query -> release). Returns a list of rows
+// (each row a list of column-value strings). INSERT/UPDATE/DELETE return []. Injection-safe: pass
+// values in `params`, never string-concatenate them into `sql`.
+fn pool_query(pool, sql: string, params)
+    let db = recv(pool)
+    let rows = db_query(db, sql, params)
+    send(pool, db)
+    rows
+
+// Execute DDL / a non-parameterized statement on a pooled connection. Returns rc (0 = ok).
+fn pool_exec(pool, sql: string)
+    let db = recv(pool)
+    let rc = db_exec(db, sql)
+    send(pool, db)
+    rc
+
+// Run a list of [sql, params] statements in a single transaction on ONE pooled connection: BEGIN,
+// run all, COMMIT. Atomic against other connections. (Rollback-on-handler-panic via crash
+// isolation is a later refinement; this is the explicit-statement-list form.)
+fn tx(pool, statements)
+    let db = recv(pool)
+    db_exec(db, "BEGIN")
+    let i = 0
+    while i < len(statements)
+        let s = statements[i]
+        db_query(db, s[0], s[1])
+        i = i + 1
+    db_exec(db, "COMMIT")
+    send(pool, db)
+
+// Close all N connections in the pool.
+fn pool_close(pool, n: int)
+    let i = 0
+    while i < n
+        db_close(recv(pool))
+        i = i + 1

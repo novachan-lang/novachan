@@ -78,9 +78,13 @@ $NovaLinkFlags = "-lws2_32 -ladvapi32"
 # copy can never drift from the single canonical source.
 # ─────────────────────────────────────────────────────────────────────────────
 $env:NOVA_HOME  = (Resolve-Path "$PSScriptRoot\..").Path
-$ForgeCanonical = Join-Path $env:NOVA_HOME "..\forge\forge.nova"
-$ForgeInstalled = Join-Path $env:NOVA_HOME "lib\forge.nova"
-if (Test-Path $ForgeCanonical) {
-    New-Item -ItemType Directory -Force -Path (Split-Path $ForgeInstalled) | Out-Null
-    Copy-Item -Force $ForgeCanonical $ForgeInstalled
+$ForgeSrcDir = Join-Path $env:NOVA_HOME "..\forge"
+$LibDir      = Join-Path $env:NOVA_HOME "lib"
+if (Test-Path $ForgeSrcDir) {
+    New-Item -ItemType Directory -Force -Path $LibDir | Out-Null
+    # Install EVERY framework module (forge.nova, forge_db.nova, ...) so an app resolves any of
+    # them from $NOVA_HOME/lib -- exactly as an out-of-tree `nova new` project would.
+    Get-ChildItem -Path $ForgeSrcDir -Filter *.nova | ForEach-Object {
+        Copy-Item -Force $_.FullName (Join-Path $LibDir $_.Name)
+    }
 }
