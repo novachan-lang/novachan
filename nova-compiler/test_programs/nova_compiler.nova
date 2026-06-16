@@ -7114,9 +7114,25 @@ type IrBuilder
     ir_const_build_order: list
     ir_list_elem_stype: dict
     ir_fn_ret_list_elem: dict
+    ir_result_elem_stype: dict
 
 fn new_ir_builder() -> IrBuilder
-    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [], {}, {})
+    IrBuilder([], 0, [], "entry", {}, [], {}, 0, [], {}, {}, "", "", [], 0, {}, {}, [], {}, {}, {}, {}, [], {}, {}, 0, {}, {}, {}, {}, {}, {}, [], {}, {}, "", "", {}, {}, [], {}, {}, {})
+
+// When `match r { Ok(s) => s.field }` runs and `r` was bound `let r: Result<Struct> = ...`, the Ok
+// payload IS that struct -- but the binding defaulted to `any`, so a FLOAT field read via str()/arith
+// silently corrupted (the value's static struct type was lost, like the inner Ok payload). This recovers
+// the payload's struct type from ir_result_elem_stype (recorded at the typed Result<Struct> let) so the
+// bound var is typed correctly. Only Ok/Some carry the value payload; returns "" otherwise (-> stays any,
+// byte-identical to the old behavior for every non-Result-struct match).
+fn ir_match_ok_payload_stype(b: IrBuilder, subject_expr: Expr, ctor: string) -> string
+    if ctor != "Ok" and ctor != "Some"
+        return ""
+    match subject_expr
+        Expr(et, ev, en, ec, ef, el) =>
+            if et == "ident" and contains(b.ir_result_elem_stype, ev)
+                return b.ir_result_elem_stype[ev]
+    ""
 
 // P5 const-baking: is `e` a compile-time-constant LITERAL element (int/float/str/
 // bool, or a unary-negated/notted literal)? Pure literals only — NO ident refs —
@@ -8133,7 +8149,11 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                                                         let m_fd = ir_fresh_reg(b)
                                                         ir_emit_inst(b, "field_get", m_fd, ir_type_any(), [m_subject], m_fpv, m_fi)
                                                         ir_emit_inst(b, "slot_store", "", ir_type_void(), [m_fd], m_fpv, 0)
-                                                        b.ir_locals[m_fpv] = 1
+                                                        let m_pstype = ir_match_ok_payload_stype(b, children[0], m_pv)
+                                                        if m_pstype != ""
+                                                            b.ir_locals[m_fpv] = m_pstype
+                                                        else
+                                                            b.ir_locals[m_fpv] = 1
                                             m_fi = m_fi + 1
                                     else if m_pt == "pat_lit"
                                         if m_arm_idx > 0
@@ -8461,6 +8481,7 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let fj_type = ""
                 let ann_type = ""
                 let fj_force_any = 0
+                let fj_result_inner = ""
                 if len(params) > 0
                     match params[0]
                         Param(fj_pn, fj_pt, fj_pd) =>
@@ -8472,6 +8493,11 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                 // would mis-dispatch (ti collapses Result<T> -> T and mistypes r).
                                 let fj_inner = fj_pt[7:len(fj_pt)-1]
                                 if contains(b.ir_sdefs, fj_inner)
+                                    // Record the Result PAYLOAD struct so `match r { Ok(s) => s.floatField }`
+                                    // recovers s's struct type (else match-Ok drops it and a float field
+                                    // reads back as raw bits). Recorded for ANY Result<Struct> let, not just
+                                    // from_json_safe -- purely additive (only ir_match_ok_payload_stype reads it).
+                                    fj_result_inner = fj_inner
                                     match expr
                                         Expr(fs_et, fs_ev, fs_en, fs_ec, fs_ef, fs_el) =>
                                             if fs_et == "call" and fs_ev == "from_json_safe"
@@ -8495,6 +8521,8 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let val = ir_lower_expr(b, eff_expr)
                 if name != ""
                     ir_emit_inst(b, "slot_store", "", ir_type_void(), [val], name, 0)
+                    if fj_result_inner != ""
+                        b.ir_result_elem_stype[name] = fj_result_inner
                     if fj_force_any == 1
                         // Result<T> let-binding: keep the slot polymorphic so the sum tag survives
                         // for the downstream match (never type it as the inner struct).
@@ -8834,7 +8862,11 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                                         let fd = ir_fresh_reg(b)
                                                         ir_emit_inst(b, "field_get", fd, ir_type_any(), [subject], fpv, fi)
                                                         ir_emit_inst(b, "slot_store", "", ir_type_void(), [fd], fpv, 0)
-                                                        b.ir_locals[fpv] = 1
+                                                        let s_pstype = ir_match_ok_payload_stype(b, expr, pv)
+                                                        if s_pstype != ""
+                                                            b.ir_locals[fpv] = s_pstype
+                                                        else
+                                                            b.ir_locals[fpv] = 1
                                             fi = fi + 1
                                     else if pt == "pat_lit"
                                         if arm_idx > 0
@@ -9082,7 +9114,11 @@ fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
                                                         let fd = ir_fresh_reg(b)
                                                         ir_emit_inst(b, "field_get", fd, ir_type_any(), [subject], fpv, fi)
                                                         ir_emit_inst(b, "slot_store", "", ir_type_void(), [fd], fpv, 0)
-                                                        b.ir_locals[fpv] = 1
+                                                        let r_pstype = ir_match_ok_payload_stype(b, expr, pv)
+                                                        if r_pstype != ""
+                                                            b.ir_locals[fpv] = r_pstype
+                                                        else
+                                                            b.ir_locals[fpv] = 1
                                             fi = fi + 1
                                     else if pt == "pat_lit"
                                         if arm_idx > 0
