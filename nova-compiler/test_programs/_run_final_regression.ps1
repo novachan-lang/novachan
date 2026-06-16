@@ -152,6 +152,7 @@ $domain_tests = @(
     'forge_header_security_test',
     'forge_recv_security_test',
     'forge_routing_correctness_test',
+    'forge_keepalive_test',
     'forge_spawn_test',
     'forge_recover_test',
     'forge_group_test',
@@ -400,7 +401,7 @@ $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurr
 # many concurrently starves the green server's scheduling under CPU load -> intermittent
 # failures (they each pass reliably given the box to themselves). So run these SERIALLY,
 # after the parallel batch.
-$server_tests = @('demo_http_server_test','demo_forge_test','demo_forge_v2_test','demo_forge_todo_test','demo_cortex_serve_test','demo_ops_test','demo_full_stack_test','real_http_api','http_offload_test','forge_spawn_test','forge_recover_test','forge_recv_security_test')
+$server_tests = @('demo_http_server_test','demo_forge_test','demo_forge_v2_test','demo_forge_todo_test','demo_cortex_serve_test','demo_ops_test','demo_full_stack_test','real_http_api','http_offload_test','forge_spawn_test','forge_recover_test','forge_recv_security_test','forge_keepalive_test')
 $parallel_tests = @($all_tests | Where-Object { $server_tests -notcontains $_ })
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()

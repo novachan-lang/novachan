@@ -1,0 +1,58 @@
+// forge_keepalive_test -- HTTP/1.1 keep-alive over a real socket: TWO requests on ONE connection
+// (the connection is reused, not reopened), the response advertises Connection: keep-alive, and a
+// HEAD request returns the GET's Content-Length with NO body. Server-binding -> serial.
+import forge
+
+type Msg
+    n: int
+
+fn h(req: Request) -> Msg
+    Msg(len(req.path))
+
+fn _client(port, rch)
+    sleep(40)
+    let sock = tcp_connect("127.0.0.1", port)
+    if sock >= 0
+        tcp_send(sock, "GET /aa HTTP/1.1\r\nHost: x\r\n\r\n")
+        let r1 = tcp_recv(sock)
+        // request 2 on the SAME socket -- only sent after reading r1 (non-pipelined keep-alive)
+        tcp_send(sock, "GET /bbbb HTTP/1.1\r\nHost: x\r\n\r\n")
+        let r2 = tcp_recv(sock)
+        // request 3: HEAD -> headers only, no body
+        tcp_send(sock, "HEAD /aa HTTP/1.1\r\nHost: x\r\n\r\n")
+        let r3 = tcp_recv(sock)
+        tcp_close(sock)
+        send(rch, str(r1) + "|1|" + str(r2) + "|2|" + str(r3))
+    else
+        send(rch, "FAIL")
+
+fn main()
+    let q = chr(34)
+    let app = forge.app()
+    forge.get(app, "/aa", h)
+    forge.get(app, "/bbbb", h)
+    let port = 18996
+    let results = channel()
+    let p = port
+    let ap = app
+    // ONE connection (n=1) serving MULTIPLE requests proves reuse, not re-accept.
+    sched_spawn(fn(z) forge.serve_req_n(ap, p, 1))
+    sleep(70)
+    let rc = results
+    let pp = port
+    sched_spawn(fn(z) _client(pp, rc))
+    let r = str(recv(results))
+    let s1 = find(r, "|1|")
+    let s2 = find(r, "|2|")
+    let r1 = slice(r, 0, s1)
+    let r2 = slice(r, s1 + 3, s2)
+    let r3 = slice(r, s2 + 3, len(r))
+
+    assert(find(r1, "Connection: keep-alive") >= 0, "response advertises keep-alive")
+    assert(find(r1, q + "n" + q + ":3") >= 0, "req1 /aa handled (n:3)")
+    assert(find(r2, q + "n" + q + ":5") >= 0, "req2 /bbbb on the SAME connection (n:5)")
+    // HEAD: Content-Length present (the GET body would be {"n":3} -> 7 bytes) but NO body emitted.
+    assert(find(r3, "200 OK") >= 0, "HEAD -> 200")
+    assert(find(r3, "Content-Length: 7") >= 0, "HEAD carries the GET Content-Length")
+    assert(find(r3, q + "n" + q) < 0, "HEAD has NO body")
+    print("forge_keepalive_test passed (2 requests/1 connection + HEAD no-body)")
