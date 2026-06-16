@@ -703,6 +703,8 @@ type Response
     headers: dict       // header name -> value (middleware mutates; finalize serializes once)
     body: string
     halted: bool        // a guard set the response; downstream skips, no exceptions
+    cookies: list       // Set-Cookie values; each emitted as its OWN header line by _finalize2
+                        // (Set-Cookie is the one header that legitimately repeats per response)
 
 // Parse "k=v&k2=v2" (the ?query) into a dict. Empty dict if none.
 fn _query_dict(raw_path: string) -> dict
@@ -784,6 +786,11 @@ fn _finalize2(resp: Response, method: string, keep_alive: bool) -> string
     else
         r = r + "Connection: close\r\n"
     r = r + "Server: NOVA Forge\r\n"
+    // Each cookie gets its OWN Set-Cookie line (sanitized so a value cannot inject a header).
+    let ci = 0
+    while ci < len(resp.cookies)
+        r = r + "Set-Cookie: " + _safe_header(resp.cookies[ci]) + "\r\n"
+        ci = ci + 1
     r = r + "\r\n"
     if method != "HEAD"
         r = r + resp.body
@@ -796,17 +803,17 @@ fn finalize(resp: Response) -> string
 
 // ── Typed Response builders (return a Response struct, not a wire string) ──────
 fn resp_new(status: int, body: string) -> Response
-    Response(status, {}, body, false)
+    Response(status, {}, body, false, [])
 
 fn resp_text(status: int, body: string) -> Response
     let h = {}
     h["Content-Type"] = "text/plain; charset=utf-8"
-    Response(status, h, body, false)
+    Response(status, h, body, false, [])
 
 fn resp_html(status: int, body: string) -> Response
     let h = {}
     h["Content-Type"] = "text/html; charset=utf-8"
-    Response(status, h, body, false)
+    Response(status, h, body, false, [])
 
 // resp_json: serialize ANY value (struct via the RTTI keystone / list / dict / scalar) into
 // a JSON Response. A handler can `return forge.resp_json(200, user)` and the client gets a
@@ -814,12 +821,38 @@ fn resp_html(status: int, body: string) -> Response
 fn resp_json(status: int, value) -> Response
     let h = {}
     h["Content-Type"] = "application/json"
-    Response(status, h, json_stringify(value), false)
+    Response(status, h, json_stringify(value), false, [])
 
 // Set/overwrite a header on a Response (returns it for chaining). O(1) dict write -- the
 // typed answer to the dict router's string-surgery _fr_add_header.
 fn resp_set_header(resp: Response, name: string, value: string) -> Response
     resp.headers[name] = value
+    resp
+
+// ── Cookies ───────────────────────────────────────────────────────────────────
+// Read a cookie from the request's Cookie header ("" if absent). Splits "a=1; b=2" on ';' and
+// matches the name exactly (whitespace-trimmed).
+fn cookie_get(req: Request, name: string) -> string
+    let raw = req_header(req, "cookie")
+    if len(raw) == 0
+        return ""
+    let parts = split(raw, ";")
+    let i = 0
+    while i < len(parts)
+        let p = trim(parts[i])
+        let eq = find(p, "=")
+        if eq > 0
+            if slice(p, 0, eq) == name
+                return slice(p, eq + 1, len(p))
+        i = i + 1
+    ""
+
+// Set a cookie with secure-by-default attributes: HttpOnly (no JS access -> XSS-resistant),
+// SameSite=Lax (CSRF-resistant), Path=/. Multiple cookies per response are supported -- each is
+// emitted as its own Set-Cookie line by _finalize2. Returns the Response for chaining. (Add
+// `; Secure` under TLS once HTTPS serving lands.)
+fn resp_set_cookie(resp: Response, name: string, value: string) -> Response
+    push(resp.cookies, name + "=" + value + "; Path=/; HttpOnly; SameSite=Lax")
     resp
 
 // Coerce a handler's return value into a Response: a Response passes through; a string -> 200
@@ -929,7 +962,7 @@ fn _try_static(a, req: Request)
                 if file_exists(fpath)
                     let h = {}
                     h["Content-Type"] = _ext_ctype(cleanrel)
-                    return ok(Response(200, h, read_file(fpath), false))
+                    return ok(Response(200, h, read_file(fpath), false, []))
         i = i + 1
     err("no static match")
 

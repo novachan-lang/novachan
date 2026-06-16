@@ -153,6 +153,7 @@ $domain_tests = @(
     'forge_recv_security_test',
     'forge_routing_correctness_test',
     'forge_keepalive_test',
+    'forge_cookie_test',
     'forge_spawn_test',
     'forge_recover_test',
     'forge_group_test',
