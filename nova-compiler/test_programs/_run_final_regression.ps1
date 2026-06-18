@@ -113,6 +113,7 @@ $domain_tests = @(
     'from_json_safe_forge_test',
     'match_result_struct_test',
     'nested_struct_float_test',
+    'collection_struct_float_test',
     'form_as_test',
     'auto_eq_test',
     'idx_set_soundness_test',
