@@ -346,6 +346,233 @@ fn recv_request(conn)
         req = req + more
     req
 
+// ── Binary-safe request reading (file uploads / multipart) ───────────────────────────────────────────
+// Scan a bytes buffer for the 4-byte header terminator \r\n\r\n from `start`; returns the offset of the
+// first \r, or -1. `start` lets the caller skip already-scanned bytes (with a small overlap for a split).
+fn _find_header_end(buf, start: int) -> int
+    let n = bytes_len(buf)
+    let i = start
+    if i < 0
+        i = 0
+    while i + 3 < n
+        if bytes_get(buf, i) == 13 and bytes_get(buf, i + 1) == 10 and bytes_get(buf, i + 2) == 13 and bytes_get(buf, i + 3) == 10
+            return i
+        i = i + 1
+    -1
+
+// Append every byte of `chunk` to `buf` (amortized-doubling bytes_append); returns the grown buffer.
+// O(len(chunk)) amortized -- avoids the O(n^2)-under-arena cost of repeated bytes_concat for accumulation.
+fn _append_chunk(buf, chunk)
+    let m = bytes_len(chunk)
+    let j = 0
+    while j < m
+        buf = bytes_append(buf, bytes_get(chunk, j))
+        j = j + 1
+    buf
+
+// Binary-safe request read (parallel to recv_request; the string path is untouched). Reads headers + body
+// as a NovaBytes via tcp_recv_bytes so a multipart/binary body with embedded NULs is NOT truncated. Bounds
+// headers (_max_header) and body (_max_body) exactly like recv_request. Returns the full raw message bytes.
+fn recv_request_bin(conn)
+    let buf = _append_chunk(bytes(0), tcp_recv_bytes(conn))
+    if bytes_len(buf) == 0
+        return buf
+    let sep = _find_header_end(buf, 0)
+    while sep < 0
+        if bytes_len(buf) > _max_header()
+            return buf
+        let more = tcp_recv_bytes(conn)
+        if bytes_len(more) == 0
+            return buf
+        let scanned = bytes_len(buf) - 3
+        if scanned < 0
+            scanned = 0
+        buf = _append_chunk(buf, more)
+        sep = _find_header_end(buf, scanned)
+    let cl = _content_length(bytes_to_str(bytes_slice(buf, 0, sep)))
+    if cl < 0 or cl > _max_body()
+        return buf
+    while (bytes_len(buf) - (sep + 4)) < cl
+        let more = tcp_recv_bytes(conn)
+        if bytes_len(more) == 0
+            return buf
+        buf = _append_chunk(buf, more)
+    buf
+
+// Build a Request from the raw message BYTES. Text content-types route through the existing string
+// build_request (byte-identical for NUL-free bodies -> the string-body test suite is unaffected).
+// multipart/form-data and application/octet-stream build from the header region (body stays "") and the
+// binary body is attached as req.raw_body (a NovaBytes). Binary bodies never flow through the string field.
+fn _build_req_from_bytes(raw, conn: int) -> Request
+    let sep = _find_header_end(raw, 0)
+    if sep < 0
+        return build_request(bytes_to_str(raw), conn)
+    let hdrstr = bytes_to_str(bytes_slice(raw, 0, sep))
+    let ctl = lower(hdrstr)
+    let is_bin = find(ctl, "multipart/form-data") >= 0 or find(ctl, "application/octet-stream") >= 0
+    if is_bin == false
+        return build_request(bytes_to_str(raw), conn)
+    let cl = _content_length(hdrstr)
+    let req = build_request(bytes_to_str(bytes_slice(raw, 0, sep + 4)), conn)
+    if cl >= 0 and cl <= _max_body()
+        let bend = sep + 4 + cl
+        if bend > bytes_len(raw)
+            bend = bytes_len(raw)
+        req.raw_body = bytes_slice(raw, sep + 4, bend)
+    req
+
+// ── Multipart/form-data parsing (RFC 7578) ────────────────────────────────────────────────────────────
+// One decoded part of a multipart body. `data` is a NovaBytes holding the EXACT part payload (the leading
+// part headers stripped, the trailing CRLF-before-delimiter excluded). For file parts `filename` is set;
+// for plain form fields it is "". `content_type` defaults to "" (text) when the part omits its own.
+type Part
+    name: string
+    filename: string
+    content_type: string
+    data: any
+
+// Convert an (ASCII) string into a list of its byte codes -- so a hot scan compares ints, not freshly
+// allocated 1-char strings. HTTP delimiters/boundaries are ASCII, so ord(char_at) is exact here.
+fn _str_codes(s: string) -> list
+    let codes = []
+    let i = 0
+    let n = len(s)
+    while i < n
+        push(codes, ord(char_at(s, i)))
+        i = i + 1
+    codes
+
+// find `needle` (an ASCII string) inside `hay` (a string) starting at `start`; -1 if absent. NOVA's `find`
+// has no start offset, so slice-then-find and re-add the offset.
+fn _find_from(hay: string, needle: string, start: int) -> int
+    let s = start
+    if s < 0
+        s = 0
+    if s > len(hay)
+        return -1
+    let rel = find(slice(hay, s, len(hay)), needle)
+    if rel < 0
+        return -1
+    s + rel
+
+// Find `needle` (an ASCII string) inside the bytes `hay` starting at `start`; returns the byte offset of
+// the match or -1. Naive O(n*m) -- fine for HTTP delimiters (boundary ~40B) over an 8MB cap.
+fn _bytes_find(hay, needle: string, start: int) -> int
+    let nc = _str_codes(needle)
+    let m = len(nc)
+    let n = bytes_len(hay)
+    if m == 0
+        return start
+    let i = start
+    if i < 0
+        i = 0
+    while i + m <= n
+        let j = 0
+        let ok = true
+        while j < m and ok
+            if bytes_get(hay, i + j) != nc[j]
+                ok = false
+            j = j + 1
+        if ok
+            return i
+        i = i + 1
+    -1
+
+// Pull the boundary token out of the RAW (case-preserved) Content-Type header. Boundaries are
+// case-SENSITIVE, so this must NOT use the lowercased content_type(req). Returns "" if absent.
+fn _extract_boundary(ct_raw: string) -> string
+    let key = "boundary="
+    let at = find(ct_raw, key)
+    if at < 0
+        return ""
+    let rest = slice(ct_raw, at + len(key), len(ct_raw))
+    // boundary runs to the next ';' or end; a quoted boundary ("...") has the quotes stripped.
+    let semi = find(rest, ";")
+    if semi >= 0
+        rest = slice(rest, 0, semi)
+    rest = trim(rest)
+    if len(rest) >= 2 and ord(char_at(rest, 0)) == 34
+        rest = slice(rest, 1, len(rest) - 1)
+    rest
+
+// Read a quoted attribute (name="value") out of a part's header string. Returns "" if absent.
+fn _mp_attr(hdr: string, key: string) -> string
+    let needle = key + "=\""
+    let at = find(hdr, needle)
+    if at < 0
+        return ""
+    let s = at + len(needle)
+    let e = _find_from(hdr, "\"", s)
+    if e < 0
+        return ""
+    slice(hdr, s, e)
+
+// Parse a multipart/form-data body (a NovaBytes) into a list of Part. The body is split on the delimiter
+// "\r\n--{boundary}" (the leading CRLF belongs to the delimiter, NOT the payload -- the #1 multipart bug).
+// The first delimiter has no leading CRLF, so we seed the scan with "--{boundary}". The closing delimiter
+// is "--{boundary}--". Each part = headers \r\n\r\n payload; payload excludes the trailing CRLF.
+fn parse_multipart(body, boundary: string) -> list
+    let parts = []
+    if bytes_len(body) == 0 or len(boundary) == 0
+        return parts
+    let dash = "--" + boundary
+    // locate the first boundary (may be at offset 0, no leading CRLF)
+    let pos = _bytes_find(body, dash, 0)
+    if pos < 0
+        return parts
+    pos = pos + len(dash)
+    let mid = "\r\n" + dash
+    let guard = 0
+    while guard < 100000
+        guard = guard + 1
+        // after a boundary token comes either "--" (final) or "\r\n" (another part)
+        if pos + 2 <= bytes_len(body) and bytes_get(body, pos) == 45 and bytes_get(body, pos + 1) == 45
+            return parts
+        // skip the CRLF after the boundary token
+        let hstart = pos
+        if hstart + 2 <= bytes_len(body) and bytes_get(body, hstart) == 13 and bytes_get(body, hstart + 1) == 10
+            hstart = hstart + 2
+        // part headers end at \r\n\r\n
+        let hend = _bytes_find(body, "\r\n\r\n", hstart)
+        if hend < 0
+            return parts
+        let hdr = bytes_to_str(bytes_slice(body, hstart, hend))
+        let body_start = hend + 4
+        // payload runs up to the NEXT delimiter "\r\n--{boundary}" (the leading CRLF is excluded)
+        let delim = _bytes_find(body, mid, body_start)
+        if delim < 0
+            return parts
+        let p = Part(_mp_attr(hdr, "name"), _mp_attr(hdr, "filename"), _part_ct(hdr), bytes_slice(body, body_start, delim))
+        push(parts, p)
+        pos = delim + len(mid)
+    parts
+
+// Content-Type of a single part ("" if it declares none).
+fn _part_ct(hdr: string) -> string
+    let low = lower(hdr)
+    let at = find(low, "content-type:")
+    if at < 0
+        return ""
+    let s = at + len("content-type:")
+    let nl = _find_from(hdr, "\r\n", s)
+    let e = nl
+    if e < 0
+        e = len(hdr)
+    trim(slice(hdr, s, e))
+
+// PUBLIC: decode the uploaded parts of a multipart/form-data request. Returns [] for non-multipart
+// requests or when the body was not captured (text serve path). Each Part has name / filename /
+// content_type / data (a NovaBytes). Available on the typed serve path (serve_req_n / serve_safe_req_n).
+fn uploads(req: Request) -> list
+    if find(content_type(req), "multipart/form-data") < 0
+        return []
+    if type_name(req.raw_body) != "bytes"
+        return []
+    let boundary = _extract_boundary(req_header(req, "content-type"))
+    if len(boundary) == 0
+        return []
+    parse_multipart(req.raw_body, boundary)
+
 fn _handle_one(conn: int, handler)
     let req = recv_request(conn)
     let m = parse_method(req)
@@ -729,6 +956,7 @@ type Request
     body: string
     state: dict         // middleware scratch: state["session"], state["user"], ...
     conn: int           // raw fd (streaming / upgrade)
+    raw_body: any       // binary request body as a NovaBytes (multipart/octet-stream); 0 for text requests
 
 type Response
     status: int         // 200
@@ -815,7 +1043,7 @@ fn build_request(raw: string, conn: int) -> Request
     let rp = parse_path(raw)
     let q = _query_dict(rp)
     let h = _headers_dict(raw)
-    Request(parse_method(raw), parse_path_clean(raw), rp, {}, q, h, parse_body(raw), {}, conn)
+    Request(parse_method(raw), parse_path_clean(raw), rp, {}, q, h, parse_body(raw), {}, conn, 0)
 
 // Case-insensitive header lookup ("" if absent). Keys are stored lowercased.
 fn req_header(req: Request, name: string) -> string
@@ -2252,12 +2480,12 @@ fn _serve_conn(conn: int, a, safe: int)
     let alive = true
     while alive
         let prev = arena_enter()
-        let raw = recv_request(conn)
-        if len(raw) == 0
+        let raw = recv_request_bin(conn)
+        if bytes_len(raw) == 0
             arena_exit(prev)
             alive = false
         else
-            let req: Request = build_request(raw, conn)
+            let req: Request = _build_req_from_bytes(raw, conn)
             let ka = _want_keep_alive(req, count)
             let resp: Response = _dispatch_pick(a, req, safe)
             tcp_send(conn, _finalize2(resp, req.method, ka))

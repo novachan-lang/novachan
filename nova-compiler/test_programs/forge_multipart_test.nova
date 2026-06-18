@@ -1,0 +1,104 @@
+// forge_multipart_test -- Forge decodes a multipart/form-data upload, binary parts (embedded NULs) intact.
+// Two layers: (1) parse_multipart directly on a hand-built body -> asserts the EXACT byte count of a binary
+// part (5 for A\0B\0C, NEVER 7 -- the trailing CRLF that precedes the delimiter must be excluded), the
+// #1 multipart bug. (2) a real multipart POST over a socket through serve_req_n: recv_request_bin reads the
+// NUL-containing body without truncation, _build_req_from_bytes attaches it as req.raw_body, and the handler
+// decodes it via forge.uploads(req). The text path (the 492-test suite) is unchanged -- this is additive.
+import forge
+
+// append an ASCII string to a bytes buffer (amortized bytes_append); returns the grown buffer
+fn _ap(buf, s: string)
+    let i = 0
+    let n = len(s)
+    while i < n
+        buf = bytes_append(buf, ord(char_at(s, i)))
+        i = i + 1
+    buf
+
+// Build a multipart/form-data body (boundary "BND") with a text field and a binary file part containing
+// two embedded NULs (A\0B\0C). The body is exactly what follows the request's \r\n\r\n.
+fn _build_body()
+    let b = bytes(0)
+    b = _ap(b, "--BND\r\n")
+    b = _ap(b, "Content-Disposition: form-data; name=\"field1\"\r\n")
+    b = _ap(b, "\r\n")
+    b = _ap(b, "hello\r\n")
+    b = _ap(b, "--BND\r\n")
+    b = _ap(b, "Content-Disposition: form-data; name=\"file1\"; filename=\"f.bin\"\r\n")
+    b = _ap(b, "Content-Type: application/octet-stream\r\n")
+    b = _ap(b, "\r\n")
+    b = bytes_append(b, 65)   // A
+    b = bytes_append(b, 0)    // NUL
+    b = bytes_append(b, 66)   // B
+    b = bytes_append(b, 0)    // NUL
+    b = bytes_append(b, 67)   // C
+    b = _ap(b, "\r\n")
+    b = _ap(b, "--BND--\r\n")
+    b
+
+fn _up_handler(req)
+    let ps = forge.uploads(req)
+    let nfo = "parts=" + str(len(ps))
+    let i = 0
+    while i < len(ps)
+        let p = ps[i]
+        nfo = nfo + " [" + p.name + ":" + str(bytes_len(p.data))
+        if p.filename != ""
+            nfo = nfo + ":file=" + p.filename
+        nfo = nfo + "]"
+        i = i + 1
+    forge.resp_text(200, nfo)
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.post(a, "/upload", fn(req) _up_handler(req))
+    forge.serve_req_n(a, port, 1)
+
+fn main()
+    // ── Layer 1: parse_multipart directly (deterministic, no socket) ───────────────────────────────────
+    let body = _build_body()
+    let ps = forge.parse_multipart(body, "BND")
+    assert(len(ps) == 2, "two parts parsed")
+    let p0 = ps[0]
+    assert(p0.name == "field1", "part0 name field1")
+    assert(p0.filename == "", "part0 has no filename")
+    assert(bytes_len(p0.data) == 5, "part0 'hello' is 5 bytes (trailing CRLF excluded)")
+    assert(bytes_to_str(p0.data) == "hello", "part0 data content == hello")
+    let p1 = ps[1]
+    assert(p1.name == "file1", "part1 name file1")
+    assert(p1.filename == "f.bin", "part1 filename f.bin")
+    assert(p1.content_type == "application/octet-stream", "part1 declares octet-stream")
+    // THE multipart bug guard: A\0B\0C is exactly 5 bytes; a naive impl that keeps the leading CRLF of the
+    // next delimiter would report 7. The leading CRLF belongs to the delimiter, not the payload.
+    assert(bytes_len(p1.data) == 5, "part1 binary data is EXACTLY 5 bytes (NOT 7 -- CRLF excluded)")
+    assert(bytes_get(p1.data, 0) == 65 and bytes_get(p1.data, 1) == 0 and bytes_get(p1.data, 2) == 66 and bytes_get(p1.data, 3) == 0 and bytes_get(p1.data, 4) == 67, "part1 binary content (incl 2 NULs) intact")
+    print("PASS: parse_multipart -- 2 parts, binary NUL part byte-exact (5 bytes, not 7)")
+
+    // ── Layer 2: real multipart POST over a socket through serve_req_n ─────────────────────────────────
+    let port = 19347
+    spawn fn()
+        _server(port)
+    sleep(300)
+    let sock = tcp_connect("127.0.0.1", port)
+    let blen = bytes_len(body)
+    let hdr = "POST /upload HTTP/1.0\r\nContent-Type: multipart/form-data; boundary=BND\r\nContent-Length: " + str(blen) + "\r\n\r\n"
+    // build the FULL request as one bytes buffer (the body has NULs -> must ride the binary wire)
+    let reqb = _ap(bytes(0), hdr)
+    let i2 = 0
+    while i2 < blen
+        reqb = bytes_append(reqb, bytes_get(body, i2))
+        i2 = i2 + 1
+    tcp_send_bytes(sock, reqb)
+    // read the (small, text) response; HTTP/1.0 -> server closes -> a follow-up recv returns "" (no block)
+    let resp = tcp_recv(sock)
+    while find(resp, "parts=2") < 0
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            break
+        resp = resp + more
+    tcp_close(sock)
+    assert(find(resp, "parts=2") >= 0, "server decoded 2 uploaded parts")
+    assert(find(resp, "[field1:5]") >= 0, "text field reached the server as 5 bytes")
+    assert(find(resp, "[file1:5:file=f.bin]") >= 0, "binary file part (5 bytes, NULs intact) + filename decoded server-side")
+    print("PASS: multipart upload round-trip through serve_req_n -- parts decoded server-side")
+    print("forge_multipart_test passed")
