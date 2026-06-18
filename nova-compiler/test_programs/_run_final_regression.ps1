@@ -167,6 +167,7 @@ $domain_tests = @(
     'forge_csrf_test',
     'forge_jwt_test',
     'forge_validate_test',
+    'forge_validate_typed_test',
     'forge_redirect_query_test',
     'forge_pctdecode_test',
     'forge_form_test',
