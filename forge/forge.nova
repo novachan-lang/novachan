@@ -755,7 +755,11 @@ fn ws_encode_frame(fin: int, opcode: int, payload, mask: list) -> any
 // client mask (unmasks in place), the 64-bit MSB-must-be-zero rule (CRIT-5), and the 16MB cap. Returns a
 // WsFrame; status 0 means the caller must read more bytes and retry.
 fn ws_try_decode(buf, start: int) -> WsFrame
-    let avail = bytes_len(buf) - start
+    ws_try_decode_n(buf, start, bytes_len(buf) - start)
+
+// Length-aware decode: `avail` is the count of valid bytes from `start` (decoupled from bytes_len(buf) so
+// it works on the fixed over-allocated connection scratch). The payload is sliced (copied) out of buf.
+fn ws_try_decode_n(buf, start: int, avail: int) -> WsFrame
     if avail < 2
         return WsFrame(0, 0, 0, 0, 0)
     let b0 = bytes_get(buf, start)
@@ -814,15 +818,22 @@ fn ws_try_decode(buf, start: int) -> WsFrame
     WsFrame(1, fin, opcode, total, payload)
 
 // --- WebSocket connection: a live, parked green task speaking the framed protocol over the raw fd ---
-// A WS connection. open: 1 while live (reference-semantic struct -> a handler's `while ws_open(c)` sees
-// the flip to 0). buf: connection-lived (Regime B, active_arena==NULL) accumulation of unparsed bytes
-// across reads (handles partial/pipelined frames). closed: 1 once we've sent a Close frame (idempotency).
+// A WS connection. open: 1 while live (reference-semantic struct -> mutating open=0 is visible to _ws_run).
+// buf: a FIXED-capacity connection-lived scratch (allocated ONCE in Regime B), mutated in place via
+// bytes_set (NEVER reallocated) so it survives the per-message arena_exit -- it holds unparsed bytes
+// across reads (partial/pipelined frames). blen: count of valid bytes in buf. closed: 1 once we've sent a
+// Close frame (idempotency). Per-message allocations live in a per-message arena and are freed wholesale;
+// the fixed buf is the only connection-lived heap -> FLAT memory across millions of messages.
 type Ws
     fd: int
     open: int
     path: string
     buf: any
+    blen: int
     closed: int
+
+fn _ws_bufcap() -> int
+    262144
 
 // Is this request a WebSocket upgrade? (RFC 6455 §4.2.1: Upgrade: websocket, Connection contains upgrade,
 // a valid Sec-WebSocket-Key, Version 13.)
@@ -835,7 +846,8 @@ fn ws_is_upgrade(req: Request) -> bool
         return false
     ws_key_ok(req_header(req, "sec-websocket-key"))
 
-// Register a WebSocket route. handler: fn(ws: Ws) -> unit. Stored in a SEPARATE a["ws_routes"] table so
+// Register a WebSocket route. handler: fn(ws: Ws, msg) -> unit, called once per inbound message (the msg
+// bytes are arena-scoped to the call). Stored in a SEPARATE a["ws_routes"] table so
 // the HTTP dispatch path stays byte-identical. The pattern + handler are registered at app-config time
 // (active_arena == NULL) so they are connection-lived (non-arena) -- safe to hold across a request arena.
 fn ws(a, pattern: string, handler)
@@ -873,23 +885,46 @@ fn ws_handshake(conn: int, req: Request) -> int
     tcp_send(conn, resp)
     1
 
-// Read ONE complete frame off the connection, accumulating from the (green-aware, netpoller-parking)
-// tcp_recv_bytes until ws_try_decode succeeds. Leftover bytes stay in ws.buf for the next frame. Returns
-// the WsFrame (status 1), or a status<0 sentinel: -1 = EOF/closed, -1002/-1009 = protocol error.
-fn _ws_next_frame(ws: Ws) -> WsFrame
+// Fill ws.buf until it holds >= one complete frame, then return that frame DECODED (status 1; the payload
+// is sliced -- arena-allocated when called inside the per-message arena). status<0 = EOF (-1) or protocol
+// error (-1002 bad frame / -1009 frame exceeds the fixed buffer). Reads via the green-aware (netpoller-
+// parking) tcp_recv_bytes and copies into the FIXED buffer via bytes_set (NO reallocation, so ws.buf stays
+// connection-lived across the per-message arena boundary). Does NOT consume -- caller calls _ws_consume.
+fn _ws_fill_frame(ws: Ws) -> WsFrame
     let guard = 0
     while guard < 2000000000
         guard = guard + 1
-        let fr = ws_try_decode(ws.buf, 0)
+        let fr = ws_try_decode_n(ws.buf, 0, ws.blen)
         if fr.status != 0
-            if fr.status == 1
-                ws.buf = bytes_slice(ws.buf, fr.consumed, bytes_len(ws.buf))
             return fr
         let chunk = tcp_recv_bytes(ws.fd)
-        if bytes_len(chunk) == 0
+        let cn = bytes_len(chunk)
+        if cn == 0
             return WsFrame(0 - 1, 0, 0, 0, bytes(0))
-        ws.buf = bytes_concat(ws.buf, chunk)
+        if ws.blen + cn > _ws_bufcap()
+            return WsFrame(0 - 1009, 0, 0, 0, bytes(0))
+        let k = 0
+        while k < cn
+            bytes_set(ws.buf, ws.blen + k, bytes_get(chunk, k))
+            k = k + 1
+        ws.blen = ws.blen + cn
     WsFrame(0 - 1, 0, 0, 0, bytes(0))
+
+// Drop the first `n` bytes of ws.buf, compacting the leftover to the front IN PLACE (bytes_set, no alloc).
+fn _ws_consume(ws: Ws, n: int)
+    let rem = ws.blen - n
+    let k = 0
+    while k < rem
+        bytes_set(ws.buf, k, bytes_get(ws.buf, n + k))
+        k = k + 1
+    ws.blen = rem
+
+// Read ONE complete frame and consume it from the buffer. status 1 = frame in opcode/fin/payload; <0 sentinel.
+fn _ws_next_frame(ws: Ws) -> WsFrame
+    let fr = _ws_fill_frame(ws)
+    if fr.status == 1
+        _ws_consume(ws, fr.consumed)
+    fr
 
 // Send a server frame (FIN, unmasked per RFC) over the green-aware tcp_send_bytes.
 fn _ws_send_frame(ws: Ws, opcode: int, payload) -> int
@@ -954,14 +989,8 @@ fn _ws_read_message(ws: Ws) -> any
     assembled
 
 // ── Public WS handler verbs (distinct names from the C ws_* builtins to avoid resolution collisions) ──
-// Receive the next text message ("" when the connection has closed -- always re-check ws_open after).
-fn ws_next(ws: Ws) -> string
-    bytes_to_str(_ws_read_message(ws))
-
-// Receive the next message as raw bytes (NUL-safe; for binary endpoints).
-fn ws_next_bin(ws: Ws) -> any
-    _ws_read_message(ws)
-
+// Messages are PUSHED to the handler fn(ws, msg_bytes) per inbound message (Phoenix-style), so there is no
+// pull verb -- the per-message arena needs the message lifetime bounded by the callback.
 // Send a text message.
 fn ws_emit(ws: Ws, msg: string) -> int
     _ws_send_frame(ws, 1, str_to_bytes(msg))
@@ -997,12 +1026,21 @@ fn _ws_finish(ws: Ws)
     tcp_close(ws.fd)
 
 // Own the connection for its lifetime. PRECONDITION: active_arena == NULL (the caller arena_exit'd before
-// this) -- the long frame loop never bump-allocates into a never-freed request arena. route[0]=pattern
-// (non-arena, sets ws.path), route[1]=handler. Single owner of the fd close.
+// this). EACH inbound message is processed inside its OWN per-message arena: the message bytes, decoded
+// frame payloads, the reassembly buffer, and the handler's response frame are ALL arena-allocated and
+// freed wholesale at arena_exit -> FLAT memory across millions of messages (the only connection-lived heap
+// is the fixed ws.buf scratch). route[0]=pattern (sets ws.path), route[1]=handler fn(ws, msg_bytes).
+// Single owner of the fd close. The msg is valid ONLY during the handler call (arena-scoped); to retain
+// it, send it on a channel (deep-copied) or emit it immediately.
 fn _ws_run(conn: int, route)
-    let ws = Ws(conn, 1, route[0], bytes(0), 0)
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0)
     let handler = route[1]
-    handler(ws)
+    while ws.open == 1
+        let prev = arena_enter()
+        let msg = _ws_read_message(ws)
+        if ws.open == 1
+            handler(ws, msg)
+        arena_exit(prev)
     _ws_finish(ws)
 
 fn _handle_one(conn: int, handler)

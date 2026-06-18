@@ -1,0 +1,101 @@
+// _ws_soak_test -- scale + memory soak for the pure-NOVA WebSocket frame loop. Drives many echo
+// round-trips through serve_req_n and (1) asserts EVERY echo is byte-correct (the frame loop is sound
+// over thousands of iterations -- no desync, no corruption, no crash), and (2) prints the live-object
+// delta. Default RC leaks ~1 obj/iteration for ANY loop (see leak_baseline_test) -> the WS loop inherits
+// that; under NOVA_T8_FULLRC the per-iteration drops make it flat. The hard gate here is SOUNDNESS +
+// BOUNDED (not runaway/O(n^2)) growth; run under ASAN separately to prove no UAF/double-free.
+import forge
+
+fn _b(s: string)
+    let n = len(s)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+// The handler samples process-wide live_count (which EXCLUDES arena-bumped objects) between msg 100 and
+// 2900: the WS server frame loop (ws_try_decode / ws_encode_frame / per-message arena) is FLAT, so this
+// delta is ~0 regardless of message count. (The client below is also kept arena-flat so it doesn't
+// contaminate the global count.) stats = a connection-lived cell captured by the single-expression lambda;
+// the assert runs IN the server task -> a per-message server leak makes it fail (exit(1) -> test fails).
+fn _measure_echo(c, m, stats)
+    forge.ws_emit_bin(c, m)
+    stats[0] = stats[0] + 1
+    if stats[0] == 100
+        stats[1] = live_count()
+    if stats[0] == 2900
+        let d = live_count() - stats[1]
+        print("WS server live-object delta over 2800 messages = " + str(d) + " (per-message arena -> flat)")
+        assert(d < 1000, "SERVER FLAT per-message memory -- delta=" + str(d) + " independent of the 2800 messages")
+        print("PASS: SERVER flat memory across thousands of messages (per-message arena frees wholesale)")
+
+fn _server(port: int)
+    let stats = [0, 0]
+    let a = forge.app()
+    forge.ws(a, "/echo", fn(c, m) _measure_echo(c, m, stats))
+    forge.serve_req_n(a, port, 1)
+
+fn _read_101(sock)
+    let resp = tcp_recv(sock)
+    while find(resp, "\r\n\r\n") < 0
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            return resp
+        resp = resp + more
+    resp
+
+fn _read_frame(sock)
+    let buf = bytes(0)
+    let guard = 0
+    while guard < 1000
+        guard = guard + 1
+        let fr = forge.ws_try_decode(buf, 0)
+        if fr.status == 1
+            return fr.payload
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return bytes(0)
+        buf = bytes_concat(buf, chunk)
+    bytes(0)
+
+fn main()
+    let port = 19362
+    spawn fn()
+        _server(port)
+    sleep(300)
+    let sock = tcp_connect("127.0.0.1", port)
+    let req = "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    tcp_send(sock, req)
+    let r101 = _read_101(sock)
+    assert(find(r101, "101") >= 0, "handshake ok")
+
+    let total = 3000
+    let mask = [42, 99, 7, 200]
+    // precompute the masked frame ONCE so the client loop allocates nothing per iter that bypasses the
+    // arena (the str_to_bytes-via-char_at helper `_b` is the one arena-bypassing op -- a runtime builtin
+    // quirk, NOT a forge/WS path -- so we keep it OUT of the measured loop). The payload is fixed.
+    let payload = _b("hello soak")
+    let frame = forge.ws_encode_frame(1, 1, payload, mask)
+    let ok = 0
+    let i = 0
+    while i < total
+        // each client round-trip in its own arena: _read_frame's bytes_concat/ws_try_decode/bytes_to_str
+        // are all arena-aware -> the client stays flat too, so the server's global live_count is clean.
+        let prev = arena_enter()
+        tcp_send_bytes(sock, frame)
+        let got = bytes_to_str(_read_frame(sock))
+        if got == "hello soak"
+            ok = ok + 1
+        arena_exit(prev)
+        i = i + 1
+
+    // SOUNDNESS over scale: every one of `total` echoes is byte-correct (no desync/corruption/crash over
+    // thousands of frame-loop iterations). The SERVER's FLAT-memory gate is asserted inside the handler.
+    assert(ok == total, "ALL " + str(total) + " echoes byte-correct over the frame loop (got " + str(ok) + ")")
+    print("PASS: " + str(total) + " WS echo round-trips, all byte-correct (server frame loop sound at scale)")
+
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 8, bytes(0), mask))
+    tcp_close(sock)
+    print("_ws_soak_test passed")
