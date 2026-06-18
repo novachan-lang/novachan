@@ -11259,7 +11259,14 @@ int64_t nova_rt_bytes_create(int64_t size_val) {
     int64_t cap = sz < 16 ? 16 : sz;
     NovaBytes* b = (NovaBytes*)nova_heap_alloc(sizeof(NovaBytes), NOVA_MEM_BYTES);
     if (!b) return 0;
-    b->data = (uint8_t*)calloc((size_t)cap, 1);
+    /* Arena-aware: when a per-request arena is active, the data buffer is bump-allocated
+       into the SAME arena as the struct (nova_heap_alloc also arena-bumps the struct), so
+       both are reclaimed wholesale at arena scope-exit -- no per-request leak (the Forge
+       flat-memory path). With no arena, nova_back_calloc falls back to calloc (heap), and
+       rc_free's free(b->data) frees it. The struct and data domains always match because
+       both check the same active arena at this call -> rc_free (only invoked for heap
+       structs) never frees arena data, and arena structs never reach rc_free (rc no-op). */
+    b->data = (uint8_t*)nova_back_calloc((size_t)cap);
     b->size = sz;
     b->cap = cap;
     if (!b->data) { b->size = 0; b->cap = 0; }
