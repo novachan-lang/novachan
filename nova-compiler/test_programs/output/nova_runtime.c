@@ -1505,7 +1505,16 @@ int64_t nova_rt_len(int64_t handle) {
 
 // nova_rt_contains: generic version below nova_rt_list_slice (handles list, dict, string)
 
+/* A string-op operand that is actually a NovaBytes handle (e.g. a binary Response body retrieved as a
+   string) would otherwise be strlen/strstr'd as a C string -> a wild heap read. Reject it with a clear
+   error instead. find_tag is a cheap constant prefix relative to the O(n) string op it guards; it returns
+   -1 for string literals (off-heap) and RAW for real strings, so it only fires on a genuine bytes value. */
+static void nova_rt_str_guard_bytes(int64_t s) {
+    if (nova_mem_find_tag((void*)(uintptr_t)s) == NOVA_MEM_BYTES)
+        nova_panic("string operation is not defined for a bytes value (got binary data where text was expected)");
+}
 int64_t nova_rt_slice(int64_t s, int64_t start, int64_t end) {
+    nova_rt_str_guard_bytes(s);
     const char* str = (const char*)(uintptr_t)s;
     int64_t len = (int64_t)strlen(str);
     /* Negative indices count from the end (Python-style), matching list slicing,
@@ -1723,12 +1732,14 @@ int64_t nova_rt_replace(int64_t s, int64_t old_s, int64_t new_s) {
 }
 
 int64_t nova_rt_starts_with(int64_t s, int64_t prefix) {
+    nova_rt_str_guard_bytes(s);
     const char* str = (const char*)(uintptr_t)s;
     const char* pre = (const char*)(uintptr_t)prefix;
     return strncmp(str, pre, strlen(pre)) == 0 ? 1 : 0;
 }
 
 int64_t nova_rt_ends_with(int64_t s, int64_t suffix) {
+    nova_rt_str_guard_bytes(s);
     const char* str = (const char*)(uintptr_t)s;
     const char* suf = (const char*)(uintptr_t)suffix;
     size_t str_len = strlen(str), suf_len = strlen(suf);
@@ -1737,6 +1748,7 @@ int64_t nova_rt_ends_with(int64_t s, int64_t suffix) {
 }
 
 int64_t nova_rt_find(int64_t s, int64_t sub) {
+    nova_rt_str_guard_bytes(s);
     const char* str = (const char*)(uintptr_t)s;
     const char* needle = (const char*)(uintptr_t)sub;
     const char* found = strstr(str, needle);
@@ -2435,6 +2447,15 @@ int64_t nova_rt_for_iter_init(int64_t obj) {
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_keys(obj);
     }
+    if (tag == NOVA_MEM_BYTES) {
+        /* Materialize the byte values as an int64 list (0..255) so iteration is safe. Else the iterator
+           treats the NovaBytes as a NovaList and reads data[i] as int64 (8 bytes/elem) -> heap overread. */
+        NovaBytes* b = (NovaBytes*)ptr;
+        int64_t result = nova_rt_list_create();
+        for (int64_t i = 0; i < b->size; i++)
+            nova_rt_list_append(result, (int64_t)b->data[i]);
+        return result;
+    }
     return obj;
 }
 
@@ -2454,6 +2475,18 @@ int64_t nova_rt_for_kv_init(int64_t obj) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_items(obj);
+    }
+    if (tag == NOVA_MEM_BYTES) {
+        /* (index, byteValue) pairs -- read data[i] as a 0..255 int, NOT as int64 (which would overread). */
+        NovaBytes* b = (NovaBytes*)ptr;
+        int64_t bresult = nova_rt_list_create();
+        for (int64_t i = 0; i < b->size; i++) {
+            int64_t pair = nova_rt_list_create();
+            nova_rt_list_append(pair, i);
+            nova_rt_list_append(pair, (int64_t)b->data[i]);
+            nova_rt_list_append(bresult, pair);
+        }
+        return bresult;
     }
     NovaList* l = (NovaList*)ptr;
     int64_t result = nova_rt_list_create();
@@ -3810,7 +3843,7 @@ int64_t nova_rt_add(int64_t a, int64_t b) {
     NovaMemTag ta = nova_mem_find_tag(pa);
     NovaMemTag tb = nova_mem_find_tag(pb);
     if (ta == NOVA_MEM_BYTES || tb == NOVA_MEM_BYTES)
-        nova_panic("'+' is not defined for bytes (use bytes_concat)");
+        nova_panic("'+' is not defined for bytes");
     int a_is_str = (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
                     ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa)));
     int b_is_str = (tb == NOVA_MEM_RAW || tb == NOVA_MEM_FAT_STR ||
@@ -3891,6 +3924,8 @@ static int nova_rt_cmp(int64_t a, int64_t b) {
     void* pb = (void*)(uintptr_t)b;
     NovaMemTag ta = nova_mem_find_tag(pa);
     NovaMemTag tb = nova_mem_find_tag(pb);
+    if (ta == NOVA_MEM_BYTES || tb == NOVA_MEM_BYTES)
+        nova_panic("comparison is not defined for bytes");  /* else < / sort would order by heap address */
     int a_str = (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
                  ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa)));
     int b_str = (tb == NOVA_MEM_RAW || tb == NOVA_MEM_FAT_STR ||
@@ -3994,6 +4029,7 @@ int64_t nova_rt_type_hash(int64_t val) {
         case NOVA_MEM_DICT:    return 6385152329LL;       /* djb2("dict") */
         case NOVA_MEM_RAW:     return 6954031493116LL;    /* djb2("string") */
         case NOVA_MEM_FAT_STR: return 6954031493116LL;    /* djb2("string") */
+        case NOVA_MEM_BYTES:   return 210708248140LL;     /* djb2("bytes") -- consistent with type_name/type_of */
         case NOVA_MEM_BOX: {
             NovaBox* b = (NovaBox*)ptr;
             if (b->kind == NOVA_BOX_FLOAT) return 210712519067LL; /* djb2("float") */
@@ -4018,6 +4054,7 @@ int64_t nova_rt_type_of(int64_t val) {
         case NOVA_MEM_FAT_STR:  return (int64_t)(uintptr_t)"string";
         case NOVA_MEM_STRUCT:   return (int64_t)(uintptr_t)"struct";
         case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"iter";
+        case NOVA_MEM_BYTES:    return (int64_t)(uintptr_t)"bytes";  /* consistent with nova_rt_type_name */
         default:
             if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr))
                 return (int64_t)(uintptr_t)"string";
@@ -11768,6 +11805,9 @@ int64_t nova_rt_index_get(int64_t obj, int64_t index) {
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_get(obj, index);
     }
+    if (tag == NOVA_MEM_BYTES) {
+        return nova_rt_bytes_get(obj, index);  /* size-bounded; else str_char_at would strlen the struct (wild read) */
+    }
     return nova_rt_str_char_at(obj, index);
 }
 
@@ -11776,6 +11816,9 @@ int64_t nova_rt_slice_any(int64_t obj, int64_t start, int64_t end) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_LIST) {
         return nova_rt_list_slice(obj, start, end);
+    }
+    if (tag == NOVA_MEM_BYTES) {
+        return nova_rt_bytes_slice(obj, start, end);  /* size-bounded; else nova_rt_slice would strlen the struct */
     }
     return nova_rt_slice(obj, start, end);
 }
@@ -11797,6 +11840,10 @@ int64_t nova_rt_index_set(int64_t obj, int64_t index, int64_t value) {
     }
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_set(obj, index, value);
+    }
+    if (tag == NOVA_MEM_BYTES) {
+        nova_rt_bytes_set(obj, index, value);  /* else silent no-op = data loss on any-typed bytes */
+        return 0;
     }
     return 0;
 }
