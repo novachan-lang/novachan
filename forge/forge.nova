@@ -1024,6 +1024,166 @@ fn session_get(req: Request, secret: string) -> string
         return ""
     unsign_value(secret, c)
 
+// ── CSRF protection (signed double-submit) ──────────────────────────────────────
+// Designed + adversarially reviewed (workflow wf_eed6a7a3): a SIGNED, SESSION-BOUND, double-submit
+// token over the existing hmac_sha256 + _ct_eq primitives. Stateless (no server store -- works across
+// serve_app_n carriers). Strictly stronger than naive double-submit (Spring's default): the cookie
+// carries "sid|nonce.HMAC(secret,sid|nonce)", so a cookie-injection attacker (sibling subdomain / CRLF)
+// can overwrite the cookie but CANNOT produce a valid HMAC without the server secret -> forgery requires
+// breaking HMAC-SHA256, not setting a cookie. The nonce is from the OS CSPRNG (secure_bytes ->
+// CryptGenRandom//dev/urandom), NOT the time-seeded random_int (which would make the nonce predictable
+// and the whole scheme worthless -- the #1 finding from the adversary pass). NOT BREACH-sensitive: the
+// transmitted value is an HMAC (a PRF output), not a recoverable stable secret, so no XOR masking layer
+// is needed (unlike Django/Rails/Spring). SECURITY CONTRACT: GET/HEAD/OPTIONS/TRACE are NOT checked --
+// a safe-method handler MUST NOT mutate state (GET /logout is a bug; make it POST). If you use cookie
+// sessions you MUST add mw_csrf. If a method-override middleware is ever added it MUST run AFTER this one.
+
+// 16 CSPRNG bytes -> 32-char NUL-free hex. secure_bytes is CryptGenRandom//dev/urandom (NOT time-seeded).
+// hex by hand via bytes_get (hex_encode would strlen-truncate raw bytes at the first NUL).
+fn _csrf_rand_hex() -> string
+    let b = secure_bytes(16)
+    let n = bytes_len(b)
+    let digits = "0123456789abcdef"
+    let out = ""
+    let i = 0
+    while i < n
+        let byte = bytes_get(b, i)
+        out = out + digits[byte / 16] + digits[byte % 16]
+        i = i + 1
+    out
+
+// Split "sid|nonce" on the LAST "|" (the nonce is 32-hex, "|"-free; the session value may itself contain
+// "|"). Returns [sid, nonce]; ["",""] if no "|".
+fn _csrf_split_payload(payload: string) -> list
+    let bar = -1
+    let i = 0
+    while i < len(payload)
+        if payload[i] == "|"
+            bar = i
+        i = i + 1
+    if bar < 0
+        return ["", ""]
+    [slice(payload, 0, bar), slice(payload, bar + 1, len(payload))]
+
+// Safe (CSRF-exempt) methods: the four RFC 9110 read-only methods. Allowlist of exemptions, so any
+// other / non-standard / lowercased method is CHECKED (fail-closed). req.method is the on-the-wire
+// method (no _method override honored), so a POST cannot masquerade as a safe GET.
+fn _csrf_is_safe(method: string) -> bool
+    method == "GET" or method == "HEAD" or method == "OPTIONS" or method == "TRACE"
+
+// Count how many `csrf=` cookies the request carries. 2+ => cookie shadowing (an injected duplicate from
+// a sibling subdomain trying to steer which cookie is trusted) -> treat as tampering. (Adversary finding.)
+fn _csrf_cookie_count(req: Request) -> int
+    let raw = req_header(req, "cookie")
+    if len(raw) == 0
+        return 0
+    let parts = split(raw, ";")
+    let c = 0
+    let i = 0
+    while i < len(parts)
+        let p = trim(parts[i])
+        let eq = find(p, "=")
+        if eq > 0 and slice(p, 0, eq) == "csrf"
+            c = c + 1
+        i = i + 1
+    c
+
+// The CSRF cookie line: SameSite=Strict (no legitimate cross-site use -> also blunts login-CSRF, the
+// cookie is not sent on a cross-site POST) and deliberately NOT HttpOnly (the SPA header pattern needs JS
+// to read the nonce and echo it as X-CSRF-Token; the session cookie stays HttpOnly -- two cookies, opposite
+// needs). The signed value confers no standalone authority (only useful with the HttpOnly session cookie),
+// so a JS-readable CSRF cookie does not widen the XSS blast radius. (Add "; Secure" when TLS serving lands.)
+fn _csrf_set_cookie(resp: Response, signed: string) -> Response
+    push(resp.cookies, "csrf=" + signed + "; Path=/; SameSite=Strict")
+    resp
+
+// Mint a fresh signed, session-bound token; stash the bare nonce in req.state["csrf"] so csrf_token(req)
+// returns the matching nonce in the SAME render (the cookie set here carries that nonce).
+fn _csrf_issue(req: Request, secret: string) -> string
+    let session_id = session_get(req, secret)
+    let nonce = _csrf_rand_hex()
+    req.state["csrf"] = nonce
+    sign_value(secret, session_id + "|" + nonce)
+
+fn _t_csrf(req: Request, next, secret: string, app_origin: string) -> Response
+    if _csrf_is_safe(req.method)
+        // SAFE: never checked; lazily ISSUE the cookie when absent/tampered/session-changed, else reuse.
+        let cur_sid = session_get(req, secret)
+        let existing = unsign_value(secret, cookie_get(req, "csrf"))
+        let need_issue = false
+        if existing == ""
+            need_issue = true
+        else
+            let parts = _csrf_split_payload(existing)
+            if not _ct_eq(parts[0], cur_sid)
+                need_issue = true
+            else
+                req.state["csrf"] = parts[1]
+        if need_issue
+            let signed = _csrf_issue(req, secret)
+            return _csrf_set_cookie(next(req), signed)
+        return next(req)
+    // UNSAFE: full verification, fail-closed. Any failure -> 403 WITHOUT calling next.
+    // (a) Origin defense-in-depth: a present-and-mismatched Origin is rejected; a MISSING Origin is
+    //     allowed (same-origin form posts may omit it). app_origin="" disables the check.
+    if len(app_origin) > 0
+        let origin = req_header(req, "origin")
+        if len(origin) > 0 and origin != app_origin
+            return resp_error(403, "CSRF token invalid")
+    // (b) cookie-shadowing: a duplicate csrf cookie is tampering.
+    if _csrf_cookie_count(req) > 1
+        return resp_error(403, "CSRF token invalid")
+    // (c) cookie present + signature valid -> recover payload (the line that defeats cookie injection:
+    //     an injector cannot produce a valid MAC).
+    let payload = unsign_value(secret, cookie_get(req, "csrf"))
+    if payload == ""
+        return resp_error(403, "CSRF token invalid")
+    let parts = _csrf_split_payload(payload)
+    let bound_sid = parts[0]
+    let cookie_nonce = parts[1]
+    // (d) submitted token: header first, _csrf form field fallback (forms cannot set custom headers).
+    let submitted = req_header(req, "x-csrf-token")
+    if len(submitted) == 0
+        submitted = req_form(req, "_csrf")
+    if len(submitted) == 0
+        return resp_error(403, "CSRF token invalid")
+    // (e) constant-time: submitted == cookie-trusted nonce.
+    if not _ct_eq(submitted, cookie_nonce)
+        return resp_error(403, "CSRF token invalid")
+    // (f) session-binding, LENGTH-BLINDED (HMAC both sides to fixed width so _ct_eq's length early-return
+    //     cannot leak the session-id length). Rejects an authed attacker replaying their OWN token at a
+    //     different user's session. Anonymous flows ("") match and rely on the CSPRNG nonce secrecy.
+    if not _ct_eq(hmac_sha256(secret, bound_sid), hmac_sha256(secret, session_get(req, secret)))
+        return resp_error(403, "CSRF token invalid")
+    next(req)
+
+// CSRF middleware. Add it FIRST (outermost, sees the real wire method):
+//   forge.use(app, forge.mw_csrf(secret, "https://yourapp.com"))   // app_origin "" disables Origin check
+fn mw_csrf(secret: string, app_origin: string)
+    return fn(req, next) _t_csrf(req, next, secret, app_origin)
+
+// The nonce to embed in a form / meta tag for THIS request (set by mw_csrf on the safe-method pass).
+//   <input type=hidden name=_csrf value="{forge.csrf_token(req)}">   (HTML form)
+//   <meta name=csrf-token content="{forge.csrf_token(req)}">         (SPA reads -> X-CSRF-Token header)
+// "" if mw_csrf did not run (renders tokenless; the POST then 403s, surfacing the misconfig).
+fn csrf_token(req: Request) -> string
+    if contains(req.state, "csrf")
+        return req.state["csrf"]
+    ""
+
+// Ready-made hidden input for server-rendered forms.
+fn csrf_field(req: Request) -> string
+    let q = chr(34)
+    "<input type=" + q + "hidden" + q + " name=" + q + "_csrf" + q + " value=" + q + csrf_token(req) + q + ">"
+
+// Rotate the CSRF token after an auth state change (login/logout), binding it to the NEW session so any
+// pre-login token is invalidated (login-CSRF defense-in-depth). Call in the auth handler AFTER session_set:
+//   let r = forge.session_set(forge.resp_redirect(303, "/dashboard"), secret, user_id)
+//   return forge.csrf_rotate(r, secret, user_id)
+fn csrf_rotate(resp: Response, secret: string, new_session_id: string) -> Response
+    let nonce = _csrf_rand_hex()
+    _csrf_set_cookie(resp, sign_value(secret, new_session_id + "|" + nonce))
+
 // Coerce a handler's return value into a Response: a Response passes through; a string -> 200
 // text/plain; anything else (struct / list / dict / scalar) -> 200 JSON via the RTTI keystone.
 // Lets a handler return a BARE domain value -- `return user`, `return notes`, `return "hi"` --

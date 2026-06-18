@@ -163,6 +163,7 @@ $domain_tests = @(
     'forge_keepalive_test',
     'forge_cookie_test',
     'forge_session_test',
+    'forge_csrf_test',
     'forge_redirect_query_test',
     'forge_pctdecode_test',
     'forge_form_test',

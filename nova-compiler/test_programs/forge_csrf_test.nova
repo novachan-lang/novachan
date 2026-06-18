@@ -1,0 +1,72 @@
+// forge_csrf_test -- mw_csrf (signed double-submit) end-to-end. Designed + adversarially reviewed
+// (workflow wf_eed6a7a3). Safe methods are never checked + lazily issue the token; unsafe methods
+// require a valid signed cookie AND a matching submitted nonce (header or _csrf field), else 403.
+import forge
+
+fn show_form(req: Request) -> string
+    forge.csrf_token(req)
+
+fn do_submit(req: Request) -> string
+    "ok"
+
+// Extract the signed cookie value from a Set-Cookie line "csrf=<signed>; Path=/; SameSite=Strict".
+fn cookie_value(line: string) -> string
+    let eq = find(line, "=")
+    let semi = find(line, ";")
+    if semi < 0
+        return slice(line, eq + 1, len(line))
+    slice(line, eq + 1, semi)
+
+fn post_req(signed: string, token: string, send_cookie: bool, send_token: bool) -> Request
+    let r = "POST /submit HTTP/1.1\r\n"
+    if send_cookie
+        r = r + "Cookie: csrf=" + signed + "\r\n"
+    if send_token
+        r = r + "X-CSRF-Token: " + token + "\r\n"
+    r = r + "Content-Length: 0\r\n\r\n"
+    forge.build_request(r, 0)
+
+fn main()
+    let secret = "test-secret-key"
+    let a = forge.app()
+    forge.use(a, forge.mw_csrf(secret, ""))
+    forge.get(a, "/form", fn(req) show_form(req))
+    forge.post(a, "/submit", fn(req) do_submit(req))
+
+    // 1) GET issues the token: a csrf cookie is set + csrf_token(req) returns the matching nonce.
+    let gr = forge.dispatch_test(a, forge.mock_request("GET", "/form", ""))
+    assert(forge.status_of(gr) == 200, "GET /form -> 200")
+    assert(len(gr.cookies) >= 1, "GET issued a csrf cookie")
+    let signed = cookie_value(gr.cookies[0])
+    let nonce = forge.body_of(gr)
+    assert(len(nonce) == 32, "csrf_token is the 32-hex nonce (got len " + str(len(nonce)) + ")")
+    assert(find(signed, nonce) >= 0, "signed cookie carries the nonce")
+    print("PASS: GET issues token (nonce=" + nonce + ")")
+
+    // 2) valid POST: signed cookie + matching X-CSRF-Token -> 200
+    let ok = forge.dispatch_test(a, post_req(signed, nonce, true, true))
+    assert(forge.status_of(ok) == 200, "valid CSRF POST -> 200 (got " + str(forge.status_of(ok)) + ")")
+    print("PASS: valid token -> 200")
+
+    // 3) missing everything -> 403
+    let r3 = forge.dispatch_test(a, post_req("", "", false, false))
+    assert(forge.status_of(r3) == 403, "no cookie/token -> 403")
+    // 4) cookie present, token missing -> 403
+    let r4 = forge.dispatch_test(a, post_req(signed, "", true, false))
+    assert(forge.status_of(r4) == 403, "cookie but no token -> 403")
+    // 5) cookie present, WRONG token -> 403
+    let r5 = forge.dispatch_test(a, post_req(signed, "deadbeefdeadbeefdeadbeefdeadbeef", true, true))
+    assert(forge.status_of(r5) == 403, "wrong token -> 403")
+    // 6) tampered cookie (valid nonce as token, but cookie signature broken) -> 403
+    let r6 = forge.dispatch_test(a, post_req("|" + nonce + ".0000000000000000000000000000000000000000000000000000000000000000", nonce, true, true))
+    assert(forge.status_of(r6) == 403, "tampered cookie signature -> 403")
+    print("PASS: missing / wrong / tampered -> 403")
+
+    // 7) token in the _csrf FORM field (no header) -> 200 (forms cannot set custom headers)
+    let body = "_csrf=" + nonce
+    let fr = "POST /submit HTTP/1.1\r\nCookie: csrf=" + signed + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + str(len(body)) + "\r\n\r\n" + body
+    let r7 = forge.dispatch_test(a, forge.build_request(fr, 0))
+    assert(forge.status_of(r7) == 200, "token via _csrf form field -> 200 (got " + str(forge.status_of(r7)) + ")")
+    print("PASS: _csrf form field -> 200")
+
+    print("forge_csrf_test passed")
