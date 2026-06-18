@@ -9572,6 +9572,74 @@ int64_t nova_rt_tcp_recv(int64_t sock_val) {
     return (int64_t)(uintptr_t)result;
 }
 
+/* Binary-safe send: sends exactly b->size bytes (NOT strlen) so a body with embedded NULs
+   transmits intact. Green-task-aware (mirrors nova_rt_tcp_send's nonblocking + POLL_WRITE
+   park); the blocking path loops to send the whole buffer. Returns bytes sent. */
+int64_t nova_rt_tcp_send_bytes(int64_t sock_val, int64_t bytes_handle) {
+    NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
+    NovaBytes* b = (NovaBytes*)(uintptr_t)bytes_handle;
+    if (!b || !b->data || b->size <= 0) return 0;
+    int len = (int)b->size;
+    const char* data = (const char*)b->data;
+    if (nova_sched_in_task()) {
+        nova_rt_io_set_nonblocking(sock_val);
+        int total = 0;
+        while (total < len) {
+            int n = send(sock, data + total, len - total, 0);
+            if (n >= 0) { total += n; continue; }
+#ifdef _WIN32
+            if (WSAGetLastError() != WSAEWOULDBLOCK) break;
+#else
+            if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+#endif
+            nova_sched_park_io(sock_val, NOVA_POLL_WRITE);
+        }
+        return (int64_t)total;
+    }
+    int total = 0;
+    while (total < len) {
+        int n = send(sock, data + total, len - total, 0);
+        if (n < 0) { nova_set_error("tcp_send_bytes: send failed"); return -1; }
+        if (n == 0) break;
+        total += n;
+    }
+    return (int64_t)total;
+}
+
+/* Binary-safe recv: one recv of up to 8192 bytes into a NovaBytes of the exact length
+   received (preserves embedded NULs, unlike nova_rt_tcp_recv which returns a C string).
+   Green-task-aware (POLL_READ park). Returns an empty bytes on close/error; the caller
+   loops for more. */
+int64_t nova_rt_tcp_recv_bytes(int64_t sock_val) {
+    NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
+    char buf[8192];
+    if (nova_sched_in_task()) {
+        nova_rt_io_set_nonblocking(sock_val);
+        for (;;) {
+            int n = recv(sock, buf, sizeof(buf), 0);
+            if (n > 0) {
+                int64_t r = nova_rt_bytes_create(n);
+                NovaBytes* b = (NovaBytes*)(uintptr_t)r;
+                if (b && b->data) memcpy(b->data, buf, (size_t)n);
+                return r;
+            }
+            if (n == 0) return nova_rt_bytes_create(0);
+#ifdef _WIN32
+            if (WSAGetLastError() != WSAEWOULDBLOCK) return nova_rt_bytes_create(0);
+#else
+            if (errno != EAGAIN && errno != EWOULDBLOCK) return nova_rt_bytes_create(0);
+#endif
+            nova_sched_park_io(sock_val, NOVA_POLL_READ);
+        }
+    }
+    int n = recv(sock, buf, sizeof(buf), 0);
+    if (n <= 0) return nova_rt_bytes_create(0);
+    int64_t r = nova_rt_bytes_create(n);
+    NovaBytes* b = (NovaBytes*)(uintptr_t)r;
+    if (b && b->data) memcpy(b->data, buf, (size_t)n);
+    return r;
+}
+
 void nova_rt_tcp_close(int64_t sock_val) {
     NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
     NOVA_CLOSE_SOCKET(sock);
