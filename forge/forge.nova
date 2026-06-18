@@ -1184,6 +1184,141 @@ fn csrf_rotate(resp: Response, secret: string, new_session_id: string) -> Respon
     let nonce = _csrf_rand_hex()
     _csrf_set_cookie(resp, sign_value(secret, new_session_id + "|" + nonce))
 
+// ── JWT (HS256) + Bearer auth ───────────────────────────────────────────────────
+// REAL HS256 (replaces the naive jwtx, which used sha256(input+secret) [not HMAC], `==` [not
+// constant-time], and never checked exp/alg). forge.jwt_encode/jwt_verify use the genuine hmac_sha256
+// primitive + the constant-time _ct_eq, a STRICT alg=="HS256" allowlist (defeats alg=none / alg-confusion),
+// and exp enforcement. INTEROP CAVEAT: the signature is base64url(HEX hmac), not base64url(RAW mac bytes)
+// as standard JWT libs use -- so a Forge-issued token verifies in Forge (the common case: an app issues +
+// verifies its own tokens) but is NOT byte-compatible with external HS256 verifiers. A raw-byte variant is
+// the interop follow-up. The payload is still standard base64url JSON (a JS frontend can read the claims).
+
+// base64url (RFC 7515, no padding) over the base64 builtins. Private to forge.
+fn _jwt_b64url_enc(data: string) -> string
+    let b = base64_encode(data)
+    let out = ""
+    let i = 0
+    while i < len(b)
+        let ch = b[i]
+        if ch == "+"
+            out = out + "-"
+        else if ch == "/"
+            out = out + "_"
+        else if ch != "="
+            out = out + ch
+        i = i + 1
+    out
+
+fn _jwt_b64url_dec(data: string) -> string
+    let out = ""
+    let i = 0
+    while i < len(data)
+        let ch = data[i]
+        if ch == "-"
+            out = out + "+"
+        else if ch == "_"
+            out = out + "/"
+        else
+            out = out + ch
+        i = i + 1
+    let rem = len(out) % 4
+    if rem == 2
+        out = out + "=="
+    else if rem == 3
+        out = out + "="
+    base64_decode(out)
+
+// Current epoch SECONDS -- for setting jwt "exp" (e.g. now_secs() + 3600 for a 1-hour token).
+fn now_secs() -> int
+    time_ms() / 1000
+
+// jwt_encode(claims, secret) -> a signed HS256 token. Set "exp" (now_secs()+N) in claims for expiry.
+// alg is pinned at the source (never derived from input). Signature segment = the bare 64-char hex HMAC
+// (self-consistent: verify recomputes the identical value). See the INTEROP CAVEAT above.
+fn jwt_encode(claims: dict, secret: string) -> string
+    let q = chr(34)
+    let header = "\{" + q + "alg" + q + ":" + q + "HS256" + q + "," + q + "typ" + q + ":" + q + "JWT" + q + "\}"
+    let signing_input = _jwt_b64url_enc(header) + "." + _jwt_b64url_enc(json_stringify(claims))
+    signing_input + "." + hmac_sha256(secret, signing_input)
+
+// jwt_verify(token, secret) -> Result<dict>. Hardened per the adversary review: STRICT exact alg=="HS256"
+// (reject none/RS256/substrings), reject a `kid` header (single-secret HS256 never uses it -> no kid
+// injection), CONSTANT-TIME signature compare, and exp/nbf claim validation with type + plausibility
+// checks. Rejects a token with NO exp by default (a non-expiring bearer credential is an account-takeover
+// risk -- use _jwt_verify_opts to allow it). Fail-closed + total (returns err, never crashes).
+fn jwt_verify(token: string, secret: string) -> Result<dict>
+    return _jwt_verify_opts(token, secret, true, 60)
+
+fn _jwt_verify_opts(token: string, secret: string, require_exp: bool, leeway: int) -> Result<dict>
+    let parts = split(token, ".")
+    if len(parts) != 3
+        return err("malformed token")
+    if len(parts[2]) == 0
+        return err("missing signature")
+    // (1) STRICT alg pin -- the security control. EXACT equality, BEFORE any crypto. Reject kid.
+    let header = json_decode(_jwt_b64url_dec(parts[0]))
+    if type_name(header) != "dict" or not contains(header, "alg")
+        return err("bad header")
+    if header["alg"] != "HS256"
+        return err("unsupported alg")
+    if contains(header, "kid")
+        return err("unsupported header")
+    // (2) CONSTANT-TIME signature check over the ORIGINAL encoded segments (never re-encode).
+    let signing_input = parts[0] + "." + parts[1]
+    if not _ct_eq(hmac_sha256(secret, signing_input), parts[2])
+        return err("invalid signature")
+    // (3) claims -- only AFTER the signature is proven.
+    let claims = json_decode(_jwt_b64url_dec(parts[1]))
+    if type_name(claims) != "dict"
+        return err("bad payload")
+    let now = time_ms() / 1000
+    // (4) exp: typed int, plausible (year-2000 floor blocks exp=0/negative "never expires"), unexpired.
+    if contains(claims, "exp")
+        if type_name(claims["exp"]) != "int"
+            return err("invalid exp")
+        if claims["exp"] <= 946684800
+            return err("invalid exp")
+        if now > claims["exp"] + leeway
+            return err("token expired")
+    else
+        if require_exp
+            return err("missing exp")
+    // (5) nbf (optional): not-before window.
+    if contains(claims, "nbf")
+        if type_name(claims["nbf"]) != "int"
+            return err("invalid nbf")
+        if now + leeway < claims["nbf"]
+            return err("token not yet valid")
+    ok(claims)
+
+// Extract the token from "Authorization: Bearer <token>". "" if absent / not a Bearer scheme.
+fn bearer_token(req: Request) -> string
+    let h = req_header(req, "authorization")
+    if len(h) < 7
+        return ""
+    if slice(h, 0, 7) != "Bearer "
+        return ""
+    trim(slice(h, 7, len(h)))
+
+// Bearer guard middleware. Verifies BEFORE next; opaque 401 on ANY failure (no signature-vs-expiry oracle);
+// on success sets req.state["user"] = the verified claims dict for the handler. Structured with
+// is_err/unwrap + a trailing next(req) (NOT `match { Ok => return next(req) }`): a `return next(req)`
+// inside a match arm whose subject is a complex fn like jwt_verify hit a codegen bug that zeroed the
+// downstream response body -- see [[project-forge-phase3-security]]. Bearer-auth APIs are not cookie-CSRF-
+// vulnerable, so this composes with (does not need) mw_csrf.
+fn _t_require_auth(req: Request, next, secret: string) -> Response
+    let tok = bearer_token(req)
+    if len(tok) == 0
+        return resp_error(401, "unauthorized")
+    let r = jwt_verify(tok, secret)
+    if is_err(r)
+        return resp_error(401, "unauthorized")
+    req.state["user"] = unwrap(r)
+    next(req)
+
+fn mw_require_auth(secret: string)
+    return fn(req, next) _t_require_auth(req, next, secret)
+
 // Coerce a handler's return value into a Response: a Response passes through; a string -> 200
 // text/plain; anything else (struct / list / dict / scalar) -> 200 JSON via the RTTI keystone.
 // Lets a handler return a BARE domain value -- `return user`, `return notes`, `return "hi"` --
