@@ -1,0 +1,47 @@
+// forge_binary_serve_test -- Forge serves a BINARY response body with embedded NULs intact over real HTTP.
+// A handler returns forge.resp_bytes(...); _finalize2 emits header-only (bytes_len Content-Length) and
+// _serve_conn sends the body via tcp_send_bytes (length-exact, NUL-safe), gated on type_name(body)=="bytes"
+// so string responses stay byte-identical. The body read inside the per-request arena is arena-safe (S2.5).
+// The wire is two sends (header, then body); on localhost they almost always coalesce into the client's
+// first recv (the body is then the tail). We only recv again on a rare split -- never a blind 2nd recv
+// (which would block, since after a coalesced response there is no more data to read).
+import forge
+
+fn _bin_handler(req)
+    let payload = bytes(5)
+    bytes_set(payload, 0, 65)   // A
+    bytes_set(payload, 1, 0)    // NUL
+    bytes_set(payload, 2, 66)   // B
+    bytes_set(payload, 3, 0)    // NUL
+    bytes_set(payload, 4, 67)   // C
+    forge.resp_bytes(200, payload, "application/octet-stream")
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.get(a, "/blob", fn(req) _bin_handler(req))
+    forge.serve_req_n(a, port, 1)
+
+fn _is_payload5(b)
+    bytes_len(b) == 5 and bytes_get(b, 0) == 65 and bytes_get(b, 1) == 0 and bytes_get(b, 2) == 66 and bytes_get(b, 3) == 0 and bytes_get(b, 4) == 67
+
+fn main()
+    let port = 19310
+    spawn fn()
+        _server(port)
+    sleep(300)
+    let sock = tcp_connect("127.0.0.1", port)
+    tcp_send(sock, "GET /blob HTTP/1.0\r\n\r\n")
+    let r1 = tcp_recv_bytes(sock)
+    let n1 = bytes_len(r1)
+    // coalesced (common): header+body in r1 -> body is the last 5 bytes
+    let ok = n1 >= 5 and bytes_get(r1, n1 - 5) == 65 and bytes_get(r1, n1 - 4) == 0 and bytes_get(r1, n1 - 3) == 66 and bytes_get(r1, n1 - 2) == 0 and bytes_get(r1, n1 - 1) == 67
+    if not ok
+        // rare split: r1 was header-only, the body is the next recv (has data -> won't block)
+        let r2 = tcp_recv_bytes(sock)
+        ok = _is_payload5(r2)
+    tcp_close(sock)
+    assert(ok, "binary body with embedded NULs received intact over real HTTP")
+    // header carries the byte-exact Content-Length (5); the header is NUL-free so bytes_to_str captures it
+    assert(find(bytes_to_str(r1), "Content-Length: 5") >= 0, "header Content-Length is the true byte count (5)")
+    print("PASS: Forge served a 5-byte binary body (incl 2 NULs) intact over real HTTP")
+    print("forge_binary_serve_test passed")

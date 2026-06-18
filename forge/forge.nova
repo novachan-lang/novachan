@@ -843,6 +843,10 @@ fn req_form(req: Request, key: string) -> string
 // sanitized so reflected request data cannot split the response. For HEAD, the Content-Length the
 // GET would have is emitted but NO body follows (RFC 9110).
 fn _finalize2(resp: Response, method: string, keep_alive: bool) -> string
+    // A binary (bytes) body rides in the string body field; it must NOT be string-concatenated here
+    // (would NUL-truncate). For binary, we emit the HEADER ONLY with a bytes_len Content-Length, and
+    // _serve_conn sends the body separately via tcp_send_bytes. type_name discriminates at runtime.
+    let is_bin = type_name(resp.body) == "bytes"
     let r = "HTTP/1.1 " + _status_line(resp.status) + "\r\n"
     let ks = keys(resp.headers)
     let i = 0
@@ -852,7 +856,10 @@ fn _finalize2(resp: Response, method: string, keep_alive: bool) -> string
         if kl != "content-length" and kl != "connection" and kl != "server"
             r = r + _safe_header(k) + ": " + _safe_header(resp.headers[k]) + "\r\n"
         i = i + 1
-    r = r + "Content-Length: " + str(len(resp.body)) + "\r\n"
+    if is_bin
+        r = r + "Content-Length: " + str(bytes_len(resp.body)) + "\r\n"
+    else
+        r = r + "Content-Length: " + str(len(resp.body)) + "\r\n"
     if keep_alive
         r = r + "Connection: keep-alive\r\n"
     else
@@ -864,7 +871,7 @@ fn _finalize2(resp: Response, method: string, keep_alive: bool) -> string
         r = r + "Set-Cookie: " + _safe_header(resp.cookies[ci]) + "\r\n"
         ci = ci + 1
     r = r + "\r\n"
-    if method != "HEAD"
+    if method != "HEAD" and not is_bin
         r = r + resp.body
     r
 
@@ -886,6 +893,16 @@ fn resp_html(status: int, body: string) -> Response
     let h = {}
     h["Content-Type"] = "text/html; charset=utf-8"
     Response(status, h, body, false, [])
+
+// Binary response: `raw` is a NovaBytes handle (from bytes()/read_bytes/gzip/etc.). It rides in the
+// string-typed body field (NOVA's uniform i64); _finalize2 + _serve_conn discriminate by
+// type_name(body)=="bytes" and send the bytes length-exact via tcp_send_bytes (no NUL truncation).
+// Lets a handler `return forge.resp_bytes(200, png, "image/png")`. NOTE: a binary body must NOT be passed
+// through string-inspecting middleware (find/len on it are bytes-aware now, but string ops are not).
+fn resp_bytes(status: int, raw, ctype: string) -> Response
+    let h = {}
+    h["Content-Type"] = ctype
+    Response(status, h, raw, false, [])
 
 // Structured JSON error: resp_error(404, "not found") -> {"error":"not found"} with that status.
 // Consistent machine-readable API errors (vs a bare text body).
@@ -2216,6 +2233,10 @@ fn _serve_conn(conn: int, a, safe: int)
             let ka = _want_keep_alive(req, count)
             let resp: Response = _dispatch_pick(a, req, safe)
             tcp_send(conn, _finalize2(resp, req.method, ka))
+            // Binary body: _finalize2 returned header-only; send the bytes length-exact (NUL-safe) BEFORE
+            // arena_exit reclaims an arena-allocated buffer (e.g. read_bytes inside this request arena).
+            if type_name(resp.body) == "bytes" and req.method != "HEAD"
+                tcp_send_bytes(conn, resp.body)
             count = count + 1
             arena_exit(prev)
             if not ka
