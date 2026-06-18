@@ -1,0 +1,116 @@
+// _ws_codec_test -- pure-NOVA WebSocket (RFC 6455) handshake + frame codec, in isolation (no socket).
+// Validates the hardest correctness piece (framing) before Forge integration: handshake accept (canonical
+// RFC vectors), encode/decode round-trips (server-unmasked + client-masked), binary payloads with NULs,
+// fragmentation (FIN bit), partial-buffer (need-more), control frames, and the 64-bit MSB DoS guard.
+import forge
+
+// build a NovaBytes from an ASCII string
+fn _b(s: string)
+    let n = len(s)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+fn main()
+    // ── handshake accept: the two canonical RFC 6455 examples (GUID ...85B11) ──────────────────────────
+    assert(forge.ws_compute_accept("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "RFC accept vec1")
+    assert(forge.ws_compute_accept("x3JJHMbDL1EzLkh9GBhXDw==") == "HSmrc0sMlYUkAGmm5OPpG2HaGWk=", "RFC accept vec2")
+    assert(forge.ws_key_ok("dGhlIHNhbXBsZSBub25jZQ==") == true, "valid 24-char key accepted")
+    assert(forge.ws_key_ok("dGhlIHNhbXBsZSBub25jZQ==dGhlIHNhbXBsZQ==") == false, "overlong key rejected")
+    print("PASS: WS handshake accept (canonical vectors) + key validation")
+
+    // ── server frame (unmasked) round-trip ─────────────────────────────────────────────────────────────
+    let txt = _b("hello")
+    let sf = forge.ws_encode_frame(1, 1, txt, [])
+    // wire: 0x81, 0x05, h,e,l,l,o  -> no mask bit
+    assert(bytes_get(sf, 0) == 129, "server frame byte0 = FIN|text(0x81)")
+    assert(bytes_get(sf, 1) == 5, "server frame len=5, no mask bit")
+    assert(bytes_len(sf) == 7, "server frame total 7 bytes")
+    let df = forge.ws_try_decode(sf, 0)
+    assert(df.status == 1 and df.fin == 1 and df.opcode == 1, "decode server frame: complete, FIN, text")
+    assert(df.consumed == 7, "consumed full frame")
+    assert(bytes_to_str(df.payload) == "hello", "server payload round-trips")
+    print("PASS: server (unmasked) frame encode->decode")
+
+    // ── client frame (masked) round-trip; verify payload is actually masked on the wire ────────────────
+    let cmsg = _b("hi there")
+    let mask = [18, 52, 86, 120]
+    let cf = forge.ws_encode_frame(1, 1, cmsg, mask)
+    assert((bytes_get(cf, 1) & 128) != 0, "client frame has the MASK bit set")
+    assert((bytes_get(cf, 1) & 127) == 8, "client frame payload len 8")
+    // first payload byte on the wire is masked: 'h'(104) ^ 18 != 104
+    assert(bytes_get(cf, 6) != 104, "masked wire byte is NOT the plaintext")
+    let dc = forge.ws_try_decode(cf, 0)
+    assert(dc.status == 1, "decode client frame complete")
+    assert(bytes_to_str(dc.payload) == "hi there", "client payload unmasks correctly")
+    print("PASS: client (masked) frame encode->decode + masking verified")
+
+    // ── binary payload with embedded NULs ──────────────────────────────────────────────────────────────
+    let bin = bytes(0)
+    bin = bytes_append(bin, 65)
+    bin = bytes_append(bin, 0)
+    bin = bytes_append(bin, 66)
+    bin = bytes_append(bin, 0)
+    bin = bytes_append(bin, 67)
+    let bf = forge.ws_encode_frame(1, 2, bin, [222, 173, 190, 239])
+    let dbf = forge.ws_try_decode(bf, 0)
+    assert(dbf.status == 1 and dbf.opcode == 2, "binary frame decoded")
+    assert(bytes_len(dbf.payload) == 5, "binary payload 5 bytes (NULs preserved)")
+    assert(bytes_get(dbf.payload, 0) == 65 and bytes_get(dbf.payload, 1) == 0 and bytes_get(dbf.payload, 2) == 66 and bytes_get(dbf.payload, 3) == 0 and bytes_get(dbf.payload, 4) == 67, "binary content intact incl 2 NULs")
+    print("PASS: binary frame with embedded NULs")
+
+    // ── fragmentation: FIN=0 first fragment ─────────────────────────────────────────────────────────────
+    let frag = forge.ws_encode_frame(0, 1, _b("par"), [])
+    let dfrag = forge.ws_try_decode(frag, 0)
+    assert(dfrag.status == 1 and dfrag.fin == 0, "fragment frame reports FIN=0")
+    print("PASS: fragmentation FIN bit honored")
+
+    // ── partial buffer: a truncated frame must report need-more (status 0) ─────────────────────────────
+    let partial = bytes_slice(sf, 0, 4)
+    let dp = forge.ws_try_decode(partial, 0)
+    assert(dp.status == 0, "truncated frame -> need more bytes")
+    print("PASS: partial buffer -> need-more")
+
+    // ── close frame (opcode 8) ──────────────────────────────────────────────────────────────────────────
+    let clo = forge.ws_encode_frame(1, 8, bytes(0), [])
+    let dclo = forge.ws_try_decode(clo, 0)
+    assert(dclo.status == 1 and dclo.opcode == 8, "close frame opcode 8")
+    print("PASS: close frame")
+
+    // ── 16-bit extended length (200-byte payload) ───────────────────────────────────────────────────────
+    let big = bytes(0)
+    let z = 0
+    while z < 200
+        big = bytes_append(big, 88)
+        z = z + 1
+    let bigf = forge.ws_encode_frame(1, 1, big, [])
+    assert(bytes_get(bigf, 1) == 126, "len byte signals 16-bit extended length")
+    let dbig = forge.ws_try_decode(bigf, 0)
+    assert(dbig.status == 1 and bytes_len(dbig.payload) == 200, "200-byte payload via 16-bit length")
+    print("PASS: 16-bit extended length")
+
+    // ── 64-bit MSB DoS guard: a 127-frame whose 64-bit length has bit 63 set must be a protocol error ───
+    let evil = bytes(0)
+    evil = bytes_append(evil, 130)   // FIN|binary
+    evil = bytes_append(evil, 127)   // 64-bit length follows
+    evil = bytes_append(evil, 255)   // high byte -> bit 63 set
+    let q = 0
+    while q < 7
+        evil = bytes_append(evil, 0)
+        q = q + 1
+    let devil = forge.ws_try_decode(evil, 0)
+    assert(devil.status == (0 - 1002), "64-bit MSB-set length -> protocol error (close 1002), no alloc")
+    print("PASS: 64-bit MSB guard")
+
+    // ── two frames pipelined in one buffer: decode consumes exactly the first ──────────────────────────
+    let two = bytes_concat(sf, cf)
+    let d1 = forge.ws_try_decode(two, 0)
+    assert(d1.status == 1 and bytes_to_str(d1.payload) == "hello", "first of two pipelined frames")
+    let d2 = forge.ws_try_decode(two, d1.consumed)
+    assert(d2.status == 1 and bytes_to_str(d2.payload) == "hi there", "second frame at offset consumed")
+    print("PASS: pipelined frames decode independently")
+
+    print("_ws_codec_test passed")

@@ -1,0 +1,99 @@
+// forge_ws_echo_test -- a real WebSocket (RFC 6455) round-trip through Forge's serve_req_n. NOVA's
+// "channels across ALL boundaries" reaches the live socket wire: forge.ws() registers a handler, the
+// serve loop detects the Upgrade, does the 101 handshake (pure-NOVA SHA-1/base64), exits the request
+// arena, and hands the parked green task to the frame loop. Browsers aren't available in the harness, so
+// the client is pure NOVA -- and like any conformant client it MASKS its frames; the server echoes
+// unmasked. Exercises handshake + accept key + masked->unmasked round-trip (x2) + the Close handshake.
+import forge
+
+fn _b(s: string)
+    let n = len(s)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+fn _echo(c)
+    while forge.ws_open(c)
+        let m = forge.ws_next(c)
+        if forge.ws_open(c)
+            forge.ws_emit(c, m)
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.ws(a, "/echo", fn(c) _echo(c))
+    forge.serve_req_n(a, port, 1)
+
+// read the HTTP 101 response (text, NUL-free) up to the header terminator
+fn _read_101(sock)
+    let resp = tcp_recv(sock)
+    while find(resp, "\r\n\r\n") < 0
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            return resp
+        resp = resp + more
+    resp
+
+// accumulate bytes until one full WS frame decodes; return its payload bytes
+fn _client_read_frame(sock)
+    let buf = bytes(0)
+    let guard = 0
+    while guard < 1000
+        guard = guard + 1
+        let fr = forge.ws_try_decode(buf, 0)
+        if fr.status == 1
+            return fr.payload
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return bytes(0)
+        buf = bytes_concat(buf, chunk)
+    bytes(0)
+
+fn main()
+    let port = 19355
+    spawn fn()
+        _server(port)
+    sleep(300)
+    let sock = tcp_connect("127.0.0.1", port)
+
+    // ── handshake ──────────────────────────────────────────────────────────────────────────────────
+    let key = "dGhlIHNhbXBsZSBub25jZQ=="
+    let req = "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    tcp_send(sock, req)
+    let resp = _read_101(sock)
+    assert(find(resp, "101 Switching Protocols") >= 0, "server sent 101 Switching Protocols")
+    assert(find(resp, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") >= 0, "101 carries the correct RFC 6455 accept key")
+    print("PASS: WS handshake (101 + accept key) over a real socket")
+
+    // ── masked text frame -> unmasked echo (x2, exercising the frame loop) ───────────────────────────
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 1, _b("hello nova ws"), [17, 34, 51, 68]))
+    let e1 = _client_read_frame(sock)
+    assert(bytes_to_str(e1) == "hello nova ws", "echo 1 round-trips (masked client -> unmasked server)")
+    print("PASS: text echo 1")
+
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 1, _b("second message!"), [200, 100, 50, 25]))
+    let e2 = _client_read_frame(sock)
+    assert(bytes_to_str(e2) == "second message!", "echo 2 round-trips")
+    print("PASS: text echo 2")
+
+    // ── a message with non-ASCII bytes survives masking + framing intact ─────────────────────────────
+    let blob = bytes(0)
+    blob = bytes_append(blob, 200)
+    blob = bytes_append(blob, 1)
+    blob = bytes_append(blob, 255)
+    blob = bytes_append(blob, 128)
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 1, blob, [9, 8, 7, 6]))
+    let e3 = _client_read_frame(sock)
+    assert(bytes_len(e3) == 4 and bytes_get(e3, 0) == 200 and bytes_get(e3, 2) == 255 and bytes_get(e3, 3) == 128, "high-byte payload survives mask+frame round-trip")
+    print("PASS: high-byte payload echo")
+
+    // ── close handshake: client sends Close, server should respond + tear down ───────────────────────
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 8, bytes(0), [1, 2, 3, 4]))
+    // server replies with a Close frame carrying status 1000 (two-phase close), then tears down
+    let cf = _client_read_frame(sock)
+    assert(bytes_len(cf) == 2 and bytes_get(cf, 0) == 3 and bytes_get(cf, 1) == 232, "server replied Close with status 1000")
+    tcp_close(sock)
+    print("PASS: close handshake completed (server Close 1000)")
+    print("forge_ws_echo_test passed")

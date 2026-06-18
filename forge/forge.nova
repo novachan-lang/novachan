@@ -573,6 +573,438 @@ fn uploads(req: Request) -> list
         return []
     parse_multipart(req.raw_body, boundary)
 
+// ══ WebSocket (RFC 6455) — pure-NOVA ════════════════════════════════════════════════════════════════════
+// The whole protocol is pure NOVA over the already-green-aware byte primitives (tcp_recv_bytes /
+// tcp_send_bytes park on the netpoller), so a WS connection is a parked green task — no carrier blocking,
+// no new C runtime, no reconverge. NOVA's "channels across ALL boundaries" reaches the live browser wire.
+//
+// --- SHA-1 (RFC 3174) + base64 for the handshake accept (used ONLY for the WS handshake, never security) ---
+fn _ws_m32(x: int) -> int
+    x & 4294967295
+
+fn _ws_rotl32(x: int, n: int) -> int
+    ((x << n) | (x >> (32 - n))) & 4294967295
+
+// SHA-1 over a byte list (0..255) -> 20-byte digest as a byte list. KAT-verified vs openssl/certutil.
+fn ws_sha1_bytes(msg: list) -> list
+    let ml = len(msg)
+    let m = []
+    let i = 0
+    while i < ml
+        push(m, msg[i] & 255)
+        i = i + 1
+    push(m, 128)
+    while (len(m) % 64) != 56
+        push(m, 0)
+    let bitlen = ml * 8
+    let j = 7
+    while j >= 0
+        push(m, (bitlen >> (j * 8)) & 255)
+        j = j - 1
+    let h0 = 1732584193
+    let h1 = 4023233417
+    let h2 = 2562383102
+    let h3 = 271733878
+    let h4 = 3285377520
+    let nchunks = len(m) / 64
+    let c = 0
+    while c < nchunks
+        let base = c * 64
+        let w = []
+        let t = 0
+        while t < 16
+            let o = base + t * 4
+            let word = (m[o] << 24) | (m[o + 1] << 16) | (m[o + 2] << 8) | m[o + 3]
+            push(w, word & 4294967295)
+            t = t + 1
+        while t < 80
+            let x = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]
+            push(w, _ws_rotl32(x, 1))
+            t = t + 1
+        let a = h0
+        let b = h1
+        let cc = h2
+        let d = h3
+        let e = h4
+        let r = 0
+        while r < 80
+            let f = 0
+            let k = 0
+            if r < 20
+                f = (b & cc) | ((b ^ 4294967295) & d)
+                k = 1518500249
+            else
+                if r < 40
+                    f = b ^ cc ^ d
+                    k = 1859775393
+                else
+                    if r < 60
+                        f = (b & cc) | (b & d) | (cc & d)
+                        k = 2400959708
+                    else
+                        f = b ^ cc ^ d
+                        k = 3395469782
+            let temp = (_ws_rotl32(a, 5) + (f & 4294967295) + e + k + w[r]) & 4294967295
+            e = d
+            d = cc
+            cc = _ws_rotl32(b, 30)
+            b = a
+            a = temp
+            r = r + 1
+        h0 = (h0 + a) & 4294967295
+        h1 = (h1 + b) & 4294967295
+        h2 = (h2 + cc) & 4294967295
+        h3 = (h3 + d) & 4294967295
+        h4 = (h4 + e) & 4294967295
+        c = c + 1
+    let out = []
+    let hs = [h0, h1, h2, h3, h4]
+    let q = 0
+    while q < 5
+        let hv = hs[q]
+        push(out, (hv >> 24) & 255)
+        push(out, (hv >> 16) & 255)
+        push(out, (hv >> 8) & 255)
+        push(out, hv & 255)
+        q = q + 1
+    out
+
+fn _ws_b64char(v: int) -> string
+    char_at("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", v)
+
+// base64 of a byte list (NUL/high-byte safe).
+fn ws_b64_bytes(data: list) -> string
+    let n = len(data)
+    let out = ""
+    let i = 0
+    while i + 3 <= n
+        let trip = ((data[i] & 255) << 16) | ((data[i + 1] & 255) << 8) | (data[i + 2] & 255)
+        out = out + _ws_b64char((trip >> 18) & 63) + _ws_b64char((trip >> 12) & 63) + _ws_b64char((trip >> 6) & 63) + _ws_b64char(trip & 63)
+        i = i + 3
+    let rem = n - i
+    if rem == 1
+        let trip = (data[i] & 255) << 16
+        out = out + _ws_b64char((trip >> 18) & 63) + _ws_b64char((trip >> 12) & 63) + "=="
+    if rem == 2
+        let trip = ((data[i] & 255) << 16) | ((data[i + 1] & 255) << 8)
+        out = out + _ws_b64char((trip >> 18) & 63) + _ws_b64char((trip >> 12) & 63) + _ws_b64char((trip >> 6) & 63) + "="
+    out
+
+// Sec-WebSocket-Accept = base64(sha1(key + RFC6455-GUID)). The GUID ends ...85B11 (NOT 85B16 -- a one-char
+// error makes every browser reject the handshake). KAT-verified against the two canonical RFC 6455 examples.
+fn ws_compute_accept(key: string) -> string
+    ws_b64_bytes(ws_sha1_bytes(_str_codes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")))
+
+// Reject a malformed/overlong Sec-WebSocket-Key (a valid one is base64 of 16 bytes = 24 chars).
+fn ws_key_ok(key: string) -> bool
+    len(key) >= 16 and len(key) <= 24
+
+// --- Frame codec (RFC 6455 §5.2) ---
+// A decoded frame. status: 0 = need more bytes; 1 = a complete frame is in opcode/fin/payload, `consumed`
+// bytes used; negative = a protocol error whose magnitude is the WS close code (1002 protocol, 1009 too big).
+type WsFrame
+    status: int
+    fin: int
+    opcode: int
+    consumed: int
+    payload: any
+
+fn _ws_max_frame() -> int
+    16777216
+
+// Build a frame. fin: 1=final. opcode: 1 text, 2 binary, 8 close, 9 ping, 10 pong. mask: [] = server
+// (unmasked, per RFC); a 4-byte list = client (masked). Returns the wire bytes (NUL-safe).
+fn ws_encode_frame(fin: int, opcode: int, payload, mask: list) -> any
+    let n = bytes_len(payload)
+    let f = bytes(0)
+    let b0 = opcode & 15
+    if fin != 0
+        b0 = b0 | 128
+    f = bytes_append(f, b0)
+    let maskbit = 0
+    if len(mask) == 4
+        maskbit = 128
+    if n < 126
+        f = bytes_append(f, maskbit | n)
+    else
+        if n < 65536
+            f = bytes_append(f, maskbit | 126)
+            f = bytes_append(f, (n >> 8) & 255)
+            f = bytes_append(f, n & 255)
+        else
+            f = bytes_append(f, maskbit | 127)
+            let j = 7
+            while j >= 0
+                f = bytes_append(f, (n >> (j * 8)) & 255)
+                j = j - 1
+    if len(mask) == 4
+        f = bytes_append(f, mask[0] & 255)
+        f = bytes_append(f, mask[1] & 255)
+        f = bytes_append(f, mask[2] & 255)
+        f = bytes_append(f, mask[3] & 255)
+    let i = 0
+    while i < n
+        let bb = bytes_get(payload, i)
+        if len(mask) == 4
+            bb = bb ^ mask[i & 3]
+        f = bytes_append(f, bb)
+        i = i + 1
+    f
+
+// Try to decode ONE frame from `buf` starting at `start`. Pure parse: handles 7/16/64-bit length, the
+// client mask (unmasks in place), the 64-bit MSB-must-be-zero rule (CRIT-5), and the 16MB cap. Returns a
+// WsFrame; status 0 means the caller must read more bytes and retry.
+fn ws_try_decode(buf, start: int) -> WsFrame
+    let avail = bytes_len(buf) - start
+    if avail < 2
+        return WsFrame(0, 0, 0, 0, 0)
+    let b0 = bytes_get(buf, start)
+    let b1 = bytes_get(buf, start + 1)
+    let fin = 0
+    if (b0 & 128) != 0
+        fin = 1
+    let opcode = b0 & 15
+    let masked = (b1 & 128) != 0
+    let len7 = b1 & 127
+    let hdr = 2
+    let plen = len7
+    if len7 == 126
+        if avail < 4
+            return WsFrame(0, 0, 0, 0, 0)
+        plen = (bytes_get(buf, start + 2) << 8) | bytes_get(buf, start + 3)
+        hdr = 4
+    else
+        if len7 == 127
+            if avail < 10
+                return WsFrame(0, 0, 0, 0, 0)
+            plen = 0
+            let kk = 0
+            while kk < 8
+                plen = (plen << 8) | bytes_get(buf, start + 2 + kk)
+                kk = kk + 1
+            hdr = 10
+    if plen < 0
+        return WsFrame(0 - 1002, 0, 0, 0, 0)
+    if plen > _ws_max_frame()
+        return WsFrame(0 - 1009, 0, 0, 0, 0)
+    let maskoff = hdr
+    if masked
+        hdr = hdr + 4
+    let total = hdr + plen
+    if avail < total
+        return WsFrame(0, 0, 0, 0, 0)
+    let payload = bytes_slice(buf, start + hdr, start + hdr + plen)
+    if masked
+        let m0 = bytes_get(buf, start + maskoff)
+        let m1 = bytes_get(buf, start + maskoff + 1)
+        let m2 = bytes_get(buf, start + maskoff + 2)
+        let m3 = bytes_get(buf, start + maskoff + 3)
+        let i = 0
+        while i < plen
+            let rr = i & 3
+            let mk = m0
+            if rr == 1
+                mk = m1
+            if rr == 2
+                mk = m2
+            if rr == 3
+                mk = m3
+            bytes_set(payload, i, bytes_get(payload, i) ^ mk)
+            i = i + 1
+    WsFrame(1, fin, opcode, total, payload)
+
+// --- WebSocket connection: a live, parked green task speaking the framed protocol over the raw fd ---
+// A WS connection. open: 1 while live (reference-semantic struct -> a handler's `while ws_open(c)` sees
+// the flip to 0). buf: connection-lived (Regime B, active_arena==NULL) accumulation of unparsed bytes
+// across reads (handles partial/pipelined frames). closed: 1 once we've sent a Close frame (idempotency).
+type Ws
+    fd: int
+    open: int
+    path: string
+    buf: any
+    closed: int
+
+// Is this request a WebSocket upgrade? (RFC 6455 §4.2.1: Upgrade: websocket, Connection contains upgrade,
+// a valid Sec-WebSocket-Key, Version 13.)
+fn ws_is_upgrade(req: Request) -> bool
+    if lower(req_header(req, "upgrade")) != "websocket"
+        return false
+    if find(lower(req_header(req, "connection")), "upgrade") < 0
+        return false
+    if req_header(req, "sec-websocket-version") != "13"
+        return false
+    ws_key_ok(req_header(req, "sec-websocket-key"))
+
+// Register a WebSocket route. handler: fn(ws: Ws) -> unit. Stored in a SEPARATE a["ws_routes"] table so
+// the HTTP dispatch path stays byte-identical. The pattern + handler are registered at app-config time
+// (active_arena == NULL) so they are connection-lived (non-arena) -- safe to hold across a request arena.
+fn ws(a, pattern: string, handler)
+    let routes = []
+    if contains(a, "ws_routes")
+        routes = a["ws_routes"]
+    push(routes, [pattern, handler])
+    a["ws_routes"] = routes
+
+// Find the [pattern, handler] for a ws-upgrade request, or [] if none. The returned route is non-arena.
+fn _ws_lookup(a, req: Request) -> list
+    if not ws_is_upgrade(req)
+        return []
+    if not contains(a, "ws_routes")
+        return []
+    let routes = a["ws_routes"]
+    let i = 0
+    while i < len(routes)
+        let rt = routes[i]
+        if is_ok(_fr_match(rt[0], req.path))
+            return rt
+        i = i + 1
+    []
+
+// Send the 101 handshake (reads NOTHING from the socket -- the request was already parsed). Returns 1 on
+// success, 0 (after a 400) on a bad key. Runs inside the request arena; the 101 bytes are consumed by
+// tcp_send before arena_exit.
+fn ws_handshake(conn: int, req: Request) -> int
+    let key = req_header(req, "sec-websocket-key")
+    if ws_key_ok(key) == false
+        tcp_send(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+        return 0
+    let accept = ws_compute_accept(key)
+    let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
+    tcp_send(conn, resp)
+    1
+
+// Read ONE complete frame off the connection, accumulating from the (green-aware, netpoller-parking)
+// tcp_recv_bytes until ws_try_decode succeeds. Leftover bytes stay in ws.buf for the next frame. Returns
+// the WsFrame (status 1), or a status<0 sentinel: -1 = EOF/closed, -1002/-1009 = protocol error.
+fn _ws_next_frame(ws: Ws) -> WsFrame
+    let guard = 0
+    while guard < 2000000000
+        guard = guard + 1
+        let fr = ws_try_decode(ws.buf, 0)
+        if fr.status != 0
+            if fr.status == 1
+                ws.buf = bytes_slice(ws.buf, fr.consumed, bytes_len(ws.buf))
+            return fr
+        let chunk = tcp_recv_bytes(ws.fd)
+        if bytes_len(chunk) == 0
+            return WsFrame(0 - 1, 0, 0, 0, bytes(0))
+        ws.buf = bytes_concat(ws.buf, chunk)
+    WsFrame(0 - 1, 0, 0, 0, bytes(0))
+
+// Send a server frame (FIN, unmasked per RFC) over the green-aware tcp_send_bytes.
+fn _ws_send_frame(ws: Ws, opcode: int, payload) -> int
+    tcp_send_bytes(ws.fd, ws_encode_frame(1, opcode, payload, []))
+
+// Send a Close frame with a 2-byte status code (idempotent: only the first call sends).
+fn _ws_send_close(ws: Ws, code: int) -> int
+    if ws.closed == 1
+        return 0
+    ws.closed = 1
+    let p = bytes(0)
+    p = bytes_append(p, (code >> 8) & 255)
+    p = bytes_append(p, code & 255)
+    _ws_send_frame(ws, 8, p)
+
+// Read the next complete application message (reassembling fragments, answering pings, bounding control
+// frames -- CRIT-2 a bounded WHILE loop, never recursion). Returns the message bytes; sets ws.open=0 and
+// returns whatever is assembled on close/EOF/error. On a protocol error or oversize, replies Close.
+fn _ws_read_message(ws: Ws) -> any
+    if ws.open == 0
+        return bytes(0)
+    let assembled = bytes(0)
+    let ctrl = 0
+    let maxm = _ws_max_frame()
+    let guard = 0
+    while guard < 2000000000
+        guard = guard + 1
+        let fr = _ws_next_frame(ws)
+        if fr.status != 1
+            ws.open = 0
+            if fr.status < 0 and fr.status != (0 - 1)
+                _ws_send_close(ws, 0 - fr.status)
+            return assembled
+        let op = fr.opcode
+        if op == 8
+            ws.open = 0
+            _ws_send_close(ws, 1000)
+            return assembled
+        if op == 9
+            _ws_send_frame(ws, 10, fr.payload)
+            ctrl = ctrl + 1
+            if ctrl > 32
+                ws.open = 0
+                _ws_send_close(ws, 1008)
+                return assembled
+        else
+            if op == 10
+                ctrl = ctrl + 1
+                if ctrl > 32
+                    ws.open = 0
+                    _ws_send_close(ws, 1008)
+                    return assembled
+            else
+                ctrl = 0
+                if bytes_len(assembled) + bytes_len(fr.payload) > maxm
+                    ws.open = 0
+                    _ws_send_close(ws, 1009)
+                    return assembled
+                assembled = bytes_concat(assembled, fr.payload)
+                if fr.fin == 1
+                    return assembled
+    assembled
+
+// ── Public WS handler verbs (distinct names from the C ws_* builtins to avoid resolution collisions) ──
+// Receive the next text message ("" when the connection has closed -- always re-check ws_open after).
+fn ws_next(ws: Ws) -> string
+    bytes_to_str(_ws_read_message(ws))
+
+// Receive the next message as raw bytes (NUL-safe; for binary endpoints).
+fn ws_next_bin(ws: Ws) -> any
+    _ws_read_message(ws)
+
+// Send a text message.
+fn ws_emit(ws: Ws, msg: string) -> int
+    _ws_send_frame(ws, 1, str_to_bytes(msg))
+
+// Send a binary message (NUL-safe).
+fn ws_emit_bin(ws: Ws, data) -> int
+    _ws_send_frame(ws, 2, data)
+
+// Is the connection still open?
+fn ws_open(ws: Ws) -> bool
+    ws.open == 1
+
+// Initiate a clean close (send Close 1000); the drain + fd close happen in _ws_finish.
+fn ws_done(ws: Ws)
+    _ws_send_close(ws, 1000)
+    ws.open = 0
+
+// Two-phase close (CRIT-4): send Close, drain a bounded number of frames awaiting the peer's Close (so the
+// peer's buffered data isn't RST-dropped), then close the fd EXACTLY once (CONCERN-3: _ws_run is the sole
+// owner of tcp_close -- _serve_conn returns without falling through to its tcp_close).
+fn _ws_finish(ws: Ws)
+    _ws_send_close(ws, 1000)
+    let tries = 0
+    while tries < 8
+        let fr = _ws_next_frame(ws)
+        if fr.status != 1
+            tries = 8
+        else
+            if fr.opcode == 8
+                tries = 8
+            else
+                tries = tries + 1
+    tcp_close(ws.fd)
+
+// Own the connection for its lifetime. PRECONDITION: active_arena == NULL (the caller arena_exit'd before
+// this) -- the long frame loop never bump-allocates into a never-freed request arena. route[0]=pattern
+// (non-arena, sets ws.path), route[1]=handler. Single owner of the fd close.
+fn _ws_run(conn: int, route)
+    let ws = Ws(conn, 1, route[0], bytes(0), 0)
+    let handler = route[1]
+    handler(ws)
+    _ws_finish(ws)
+
 fn _handle_one(conn: int, handler)
     let req = recv_request(conn)
     let m = parse_method(req)
@@ -2486,17 +2918,29 @@ fn _serve_conn(conn: int, a, safe: int)
             alive = false
         else
             let req: Request = _build_req_from_bytes(raw, conn)
-            let ka = _want_keep_alive(req, count)
-            let resp: Response = _dispatch_pick(a, req, safe)
-            tcp_send(conn, _finalize2(resp, req.method, ka))
-            // Binary body: _finalize2 returned header-only; send the bytes length-exact (NUL-safe) BEFORE
-            // arena_exit reclaims an arena-allocated buffer (e.g. read_bytes inside this request arena).
-            if type_name(resp.body) == "bytes" and req.method != "HEAD"
-                tcp_send_bytes(conn, resp.body)
-            count = count + 1
-            arena_exit(prev)
-            if not ka
+            // WebSocket upgrade: if a ws route matches, do the 101 handshake, exit the REQUEST arena
+            // (Regime A -> B: the long frame loop runs with active_arena==NULL), hand the socket to the
+            // frame loop, and RETURN -- _ws_run is the SOLE owner of tcp_close (never fall through).
+            let route = _ws_lookup(a, req)
+            if len(route) == 2
+                if ws_handshake(conn, req) == 1
+                    arena_exit(prev)
+                    _ws_run(conn, route)
+                    return
+                arena_exit(prev)
                 alive = false
+            else
+                let ka = _want_keep_alive(req, count)
+                let resp: Response = _dispatch_pick(a, req, safe)
+                tcp_send(conn, _finalize2(resp, req.method, ka))
+                // Binary body: _finalize2 returned header-only; send the bytes length-exact (NUL-safe) BEFORE
+                // arena_exit reclaims an arena-allocated buffer (e.g. read_bytes inside this request arena).
+                if type_name(resp.body) == "bytes" and req.method != "HEAD"
+                    tcp_send_bytes(conn, resp.body)
+                count = count + 1
+                arena_exit(prev)
+                if not ka
+                    alive = false
     tcp_close(conn)
 
 fn _handle_req_arena(conn: int, a)
