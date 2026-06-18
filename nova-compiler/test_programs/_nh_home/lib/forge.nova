@@ -1,0 +1,991 @@
+// NOVA FORGE — minimal pure-NOVA web framework.
+// Stage 2b adoption-engine #1 per FRAMEWORK_ECOSYSTEM_STRATEGY.md.
+// Built on NOVA's tcp_* primitives + spawn + first-class functions.
+//
+// API surface (public):
+//   forge.text(status, body)        -> raw HTTP response (text/plain)
+//   forge.html(status, body)        -> raw HTTP response (text/html)
+//   forge.json(status, body)        -> raw HTTP response (application/json)
+//   forge.parse_method(req)         -> "GET", "POST", ...
+//   forge.parse_path(req)           -> "/api/users"
+//   forge.parse_body(req)           -> request body (string)
+//   forge.serve(port, handler)      -> infinite accept loop, spawn per conn
+//   forge.serve_n(port, handler, n) -> serve exactly N requests, then close
+//                                       (testable + deterministic)
+//
+// The handler is a function (method, path, body) -> response string.
+// Use the response builders to construct the response string with proper
+// headers + Content-Length.
+
+fn _status_line(status: int) -> string
+    if status == 200
+        return "200 OK"
+    if status == 201
+        return "201 Created"
+    if status == 204
+        return "204 No Content"
+    if status == 301
+        return "301 Moved Permanently"
+    if status == 302
+        return "302 Found"
+    if status == 400
+        return "400 Bad Request"
+    if status == 401
+        return "401 Unauthorized"
+    if status == 403
+        return "403 Forbidden"
+    if status == 404
+        return "404 Not Found"
+    if status == 500
+        return "500 Internal Server Error"
+    str(status) + " OK"
+
+fn _build(status: int, ctype: string, body: string) -> string
+    let r = "HTTP/1.1 " + _status_line(status) + "\r\n"
+    r = r + "Content-Type: " + ctype + "\r\n"
+    r = r + "Content-Length: " + str(len(body)) + "\r\n"
+    r = r + "Connection: close\r\n"
+    r = r + "Server: NOVA Forge\r\n"
+    r = r + "\r\n"
+    r = r + body
+    r
+
+fn text(status: int, body: string) -> string
+    _build(status, "text/plain; charset=utf-8", body)
+
+fn html(status: int, body: string) -> string
+    _build(status, "text/html; charset=utf-8", body)
+
+fn json(status: int, body: string) -> string
+    _build(status, "application/json", body)
+
+// json_of: serialize ANY value (struct/list/dict/scalar) into a JSON response. A struct
+// passed here renders as a JSON OBJECT via the hash-keyed RTTI keystone -- even when its
+// static type is erased to `any` through this param -- so a handler can
+// `return forge.json_of(200, user)` and the client gets {"id":7,...}, zero annotation.
+// The "return your domain type, get JSON" win (Phase 0a keystone).
+fn json_of(status: int, value) -> string
+    json(status, json_stringify(value))
+
+fn parse_method(req: string) -> string
+    let sp = find(req, " ")
+    if sp < 0
+        return "GET"
+    slice(req, 0, sp)
+
+fn parse_path(req: string) -> string
+    let sp1 = find(req, " ")
+    if sp1 < 0
+        return "/"
+    let rest = slice(req, sp1 + 1, len(req))
+    let sp2 = find(rest, " ")
+    if sp2 < 0
+        return rest
+    slice(rest, 0, sp2)
+
+fn parse_body(req: string) -> string
+    let sep = find(req, "\r\n\r\n")
+    if sep < 0
+        return ""
+    slice(req, sep + 4, len(req))
+
+// Query string from "/path?key=value&k2=v2" -> "key=value&k2=v2", "" if none
+fn parse_query(req: string) -> string
+    let p = parse_path(req)
+    let q = find(p, "?")
+    if q < 0
+        return ""
+    slice(p, q + 1, len(p))
+
+// Path without query string
+fn parse_path_clean(req: string) -> string
+    let p = parse_path(req)
+    let q = find(p, "?")
+    if q < 0
+        return p
+    slice(p, 0, q)
+
+// Get a single query param value. "" if not present.
+fn query_get(req: string, key: string) -> string
+    let q = parse_query(req)
+    if len(q) == 0
+        return ""
+    let needle = key + "="
+    let i = find(q, needle)
+    if i < 0
+        return ""
+    if i > 0
+        let prev = q[i - 1]
+        if prev != "&"
+            // false match like "xkey=" — bail. (could refine; MVP)
+            return ""
+    let rest = slice(q, i + len(needle), len(q))
+    let amp = find(rest, "&")
+    if amp < 0
+        return rest
+    slice(rest, 0, amp)
+
+// Header value (case-sensitive on header name for the MVP).
+// Returns "" if header not found.
+fn header_get(req: string, name: string) -> string
+    let hdr_end = find(req, "\r\n\r\n")
+    let region = req
+    if hdr_end >= 0
+        region = slice(req, 0, hdr_end)
+    let needle = "\r\n" + name + ": "
+    let i = find(region, needle)
+    if i < 0
+        return ""
+    let rest = slice(region, i + len(needle), len(region))
+    let nl = find(rest, "\r\n")
+    if nl < 0
+        return rest
+    slice(rest, 0, nl)
+
+// Builds an application/json response body from a list of [key, value]
+// pairs. Values are strings; if you want raw (number/bool/object), pass
+// the string already serialized. Quotes inside values must already be
+// escaped by the caller — MVP, not a full JSON encoder.
+// Redirect response (301/302/303/307/308). Includes the Location header.
+fn redirect(status: int, url: string) -> string
+    let r = "HTTP/1.1 " + _status_line(status) + "\r\n"
+    r = r + "Location: " + url + "\r\n"
+    r = r + "Content-Length: 0\r\n"
+    r = r + "Connection: close\r\n"
+    r = r + "Server: NOVA Forge\r\n"
+    r = r + "\r\n"
+    r
+
+fn _ext_ctype(path: string) -> string
+    if ends_with(path, ".html") or ends_with(path, ".htm")
+        return "text/html; charset=utf-8"
+    if ends_with(path, ".css")
+        return "text/css; charset=utf-8"
+    if ends_with(path, ".js")
+        return "application/javascript; charset=utf-8"
+    if ends_with(path, ".json")
+        return "application/json"
+    if ends_with(path, ".png")
+        return "image/png"
+    if ends_with(path, ".jpg") or ends_with(path, ".jpeg")
+        return "image/jpeg"
+    if ends_with(path, ".svg")
+        return "image/svg+xml"
+    if ends_with(path, ".wasm")
+        return "application/wasm"
+    "application/octet-stream"
+
+// Serve a file from disk by reading it and producing a 200 response.
+// Returns a 404 response if the file is missing or empty.
+fn serve_file(path: string) -> string
+    let content = read_file(path)
+    if len(content) == 0
+        return text(404, "file not found: " + path)
+    _build(200, _ext_ctype(path), content)
+
+// Build a JSON object response from list of [k, v] string pairs.
+fn json_obj(status: int, pairs: list) -> string
+    let body = "\{"
+    let n = len(pairs)
+    let i = 0
+    while i < n
+        let kv = pairs[i]
+        let k = kv[0]
+        let v = kv[1]
+        if i > 0
+            body = body + ","
+        body = body + "\"" + k + "\":\"" + v + "\""
+        i = i + 1
+    body = body + "\}"
+    _build(status, "application/json", body)
+
+fn _content_length(raw)
+    let idx = find(raw, "Content-Length:")
+    if idx < 0
+        return 0
+    let after = slice(raw, idx + 15, len(raw))
+    let nl = find(after, "\r\n")
+    if nl < 0
+        return 0
+    parse_int(trim(slice(after, 0, nl)))
+
+// Read a COMPLETE HTTP request: a single tcp_recv may return only the first TCP segment
+// (headers, or a partial body), so reading once silently drops POST bodies that arrive in
+// a later segment. Read full headers, then the body per Content-Length. PUBLIC so servers
+// built directly on tcp_* (not just forge.serve) can read requests correctly too.
+fn recv_request(conn)
+    let req = tcp_recv(conn)
+    if len(req) == 0
+        return req
+    let sep = find(req, "\r\n\r\n")
+    while sep < 0
+        let more = tcp_recv(conn)
+        if len(more) == 0
+            return req
+        req = req + more
+        sep = find(req, "\r\n\r\n")
+    let cl = _content_length(req)
+    while cl > 0 and (len(req) - (sep + 4)) < cl
+        let more = tcp_recv(conn)
+        if len(more) == 0
+            return req
+        req = req + more
+    req
+
+fn _handle_one(conn: int, handler)
+    let req = recv_request(conn)
+    let m = parse_method(req)
+    let p = parse_path(req)
+    let b = parse_body(req)
+    let resp = handler(m, p, b)
+    tcp_send(conn, resp)
+    tcp_close(conn)
+
+fn serve(port: int, handler)
+    let listener = tcp_listen(port)
+    while true
+        let conn = tcp_accept(listener)
+        _handle_one(conn, handler)
+
+fn serve_n(port: int, handler, n: int)
+    let listener = tcp_listen(port)
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        _handle_one(conn, handler)
+        i = i + 1
+    tcp_close(listener)
+
+// Arena-scoped per-request handling. Everything a request allocates (the raw request,
+// the parsed parts, and everything the handler builds) lives in a per-request arena
+// that is freed WHOLESALE after the response is written -- flat memory, zero per-object
+// RC, cycle-immune. arena_exit comes AFTER tcp_send because tcp_send copies the response
+// bytes into the socket, so `resp` is not needed past the send. The arena is per-task
+// (NovaTaskState), so this is safe even when the server runs as a green task that parks
+// on tcp_recv while other tasks run.
+//
+// CONTRACT: sound ONLY for handlers that do not RETAIN request-derived values in
+// longer-lived storage (e.g. a module-global cache or another process's state without
+// copying). A handler that stashes a built value in a global would leave a dangling
+// pointer after arena_exit. Stateless / pure-response handlers (the common case) are
+// safe; stateful handlers should use serve_n (RC) or copy escaping values out first.
+fn _handle_one_arena(conn: int, handler)
+    let prev = arena_enter()
+    let req = recv_request(conn)
+    let m = parse_method(req)
+    let p = parse_path(req)
+    let b = parse_body(req)
+    let resp = handler(m, p, b)
+    tcp_send(conn, resp)
+    arena_exit(prev)
+    tcp_close(conn)
+
+fn serve_n_arena(port: int, handler, n: int)
+    let listener = tcp_listen(port)
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        _handle_one_arena(conn, handler)
+        i = i + 1
+    tcp_close(listener)
+
+fn serve_arena(port: int, handler)
+    let listener = tcp_listen(port)
+    while true
+        let conn = tcp_accept(listener)
+        _handle_one_arena(conn, handler)
+
+// ── v0.2 additions ───────────────────────────────────────────────────────
+
+// CORS wrapper. Inserts Access-Control-* headers before the blank-line
+// boundary in a response built by text/html/json. Returns the new
+// response string. Safe to chain.
+fn with_cors(resp: string, origin: string) -> string
+    let marker = "\r\n\r\n"
+    let i = find(resp, marker)
+    if i < 0
+        return resp
+    let head = slice(resp, 0, i)
+    let body = slice(resp, i + 4, len(resp))
+    let extra = "\r\nAccess-Control-Allow-Origin: " + origin + "\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type"
+    head + extra + marker + body
+
+// Status helpers - common cases without remembering codes.
+fn ok_text(body: string) -> string
+    text(200, body)
+
+fn ok_json(body: string) -> string
+    json(200, body)
+
+fn ok_html(body: string) -> string
+    html(200, body)
+
+fn bad_request(msg: string) -> string
+    text(400, msg)
+
+fn not_found(msg: string) -> string
+    text(404, msg)
+
+fn internal_error(msg: string) -> string
+    text(500, msg)
+
+// CORS preflight responder. Use for OPTIONS requests.
+fn cors_preflight(origin: string) -> string
+    let r = text(204, "")
+    with_cors(r, origin)
+
+// ── Forge Router (v0.3 increment 1) ─────────────────────────────────────────
+// A real method + path router with :param extraction, dispatched INSIDE an arena
+// scope (serve_app_n -> serve_n_arena) so each request holds flat per-request memory.
+//
+//   let a = forge.app()
+//   forge.get(a, "/users/:id", fn(req) forge.json_obj(200, [["id", req["params"]["id"]]]))
+//   forge.serve_app_n(a, 8080, 100)
+//
+// Handler = fn(req) -> response string, where req is a dict:
+//   req["method"]  req["path"]  req["body"]  req["params"]["id"]
+//
+// HONEST SCOPE (FORGE_DESIGN.md s4.3): responses use the WORKING serialization paths
+// (forge.json / json_obj / text). Returning a BARE STRUCT ("return user") is NOT yet
+// supported -- it needs the auto-JSON-on-return compiler hook (the "correctness cliff":
+// a struct erased through `any` serializes as a JSON ARRAY, not an object). Use
+// forge.json_obj(...) / forge.json(dict-string) until that hook lands (next increment).
+// The Request is a dict here, not the design's struct, for the same reason -- dicts
+// serialize correctly today; the struct model arrives with the compiler hook.
+
+fn app()
+    let a = {}
+    a["routes"] = []
+    a["mws"] = []
+    a["statics"] = []
+    a
+
+// Register a middleware. Middleware = fn(next_handler) -> new_handler, composed by
+// function-wrapping. Applied OUTSIDE-IN: the first use() is the OUTERMOST wrapper (sees
+// the request first, the response last). `use` is a free identifier in NOVA (import is
+// the module keyword), so this name is safe.
+fn use(a, mw)
+    push(a["mws"], mw)
+    a
+
+// Route group: a lightweight handle that shares the app's routes + mws but PREFIXES every
+// path registered through it. `let api = forge.group(app, "/api/v1"); forge.get(api, "/users", h)`
+// registers GET /api/v1/users. Works for BOTH the typed (dispatch_req) and dict (dispatch)
+// paths since both register via _fr_route. API versioning / sub-route mounting with zero ceremony.
+fn group(a, prefix: string)
+    let g = {}
+    g["routes"] = a["routes"]
+    g["mws"] = a["mws"]
+    g["statics"] = a["statics"]
+    g["prefix"] = prefix
+    g
+
+// Internal route registrar. NOTE: named _fr_route (not `route`) because NOVA module
+// functions are FLAT symbols -- a bare `route` collides at link with user/demo code that
+// defines its own fn route(...) (the demo_*_test handlers do exactly that). Public API is
+// get/post/put/delete/patch. Prepends a group's prefix when registered through forge.group.
+fn _fr_route(a, method: string, pattern: string, handler)
+    let full = pattern
+    if contains(a, "prefix")
+        full = a["prefix"] + pattern
+    push(a["routes"], [method, full, handler])
+    a
+
+fn get(a, pattern: string, handler)
+    _fr_route(a, "GET", pattern, handler)
+
+fn post(a, pattern: string, handler)
+    _fr_route(a, "POST", pattern, handler)
+
+fn put(a, pattern: string, handler)
+    _fr_route(a, "PUT", pattern, handler)
+
+fn delete(a, pattern: string, handler)
+    _fr_route(a, "DELETE", pattern, handler)
+
+fn patch(a, pattern: string, handler)
+    _fr_route(a, "PATCH", pattern, handler)
+
+// Match a route pattern against a path, extracting :params. Result of a params dict.
+fn _fr_match(pattern: string, path: string)
+    let pat_parts = split(pattern, "/")
+    let path_parts = split(path, "/")
+    if len(pat_parts) != len(path_parts)
+        return err("length mismatch")
+    let params = {}
+    let i = 0
+    while i < len(pat_parts)
+        let pp = pat_parts[i]
+        let vp = path_parts[i]
+        if len(pp) > 0 and starts_with(pp, ":")
+            let pn = slice(pp, 1, len(pp))
+            params[pn] = vp
+        else if pp != vp
+            return err("mismatch")
+        i = i + 1
+    ok(params)
+
+// Strip a "?query" suffix from a path for matching.
+fn _fr_path_clean(path: string) -> string
+    let q = find(path, "?")
+    if q < 0
+        return path
+    slice(path, 0, q)
+
+// The route TERMINAL: match a built Request against the routes, bind :params, call the
+// handler. 404 if no route matches the path; 405 if the path matches a different method.
+fn _fr_route_dispatch(a, req)
+    let routes = a["routes"]
+    let other = 0
+    let i = 0
+    while i < len(routes)
+        let rt = routes[i]
+        let mr = _fr_match(rt[1], req["path"])
+        if is_ok(mr)
+            if rt[0] == req["method"] or rt[0] == "*"
+                req["params"] = unwrap(mr)
+                let h = rt[2]
+                return h(req)
+            else
+                other = 1
+        i = i + 1
+    if other == 1
+        return text(405, "method not allowed")
+    not_found("no route: " + req["method"] + " " + req["path"])
+
+// Pure dispatch: build the Request, run the middleware chain (outside-in) around the
+// route terminal, return the response string. Pure (no socket) -> testable via mock.
+fn dispatch(a, method: string, path: string, body: string) -> string
+    let req = {}
+    req["method"] = method
+    req["path"] = _fr_path_clean(path)
+    req["body"] = body
+    req["params"] = {}
+    // Fold the middleware around the terminal. Wrapping the LAST-registered mw first
+    // makes it innermost (closest to the route) and the FIRST-registered outermost.
+    // Middleware shape is fn(req, next) -> string (composition-friendly; _fr_wrap turns
+    // each into a fn(req) by binding `next`, avoiding triple-curried lambdas).
+    let h = fn(r) _fr_route_dispatch(a, r)
+    let mws = a["mws"]
+    let i = len(mws) - 1
+    while i >= 0
+        h = _fr_wrap(mws[i], h)
+        i = i - 1
+    h(req)
+
+// Serve exactly N requests with routing, each handled INSIDE an arena scope (flat
+// per-request memory via serve_n_arena). Deterministic -> testable.
+//
+// (The iter-99 arena split-corruption bug -- arena objects fell outside the tracked
+// heap range so find_tag misclassified any-typed arena strings -- was ROOT-CAUSED and
+// FIXED: nova_arena_new_chunk now tracks chunk bounds. split/parse inside the scope are
+// correct again, so routed serving runs arena-scoped for flat per-request memory. See
+// NOVA_DESIGN/ARENA_SPLIT_BUG.md.)
+fn serve_app_n(a, port: int, n: int)
+    serve_n_arena(port, fn(m, p, b) dispatch(a, m, p, b), n)
+
+// Infinite routed serve, arena-scoped per request.
+fn serve_app(a, port: int)
+    serve_arena(port, fn(m, p, b) dispatch(a, m, p, b))
+
+// ── Middleware ───────────────────────────────────────────────────────────────
+// A middleware is fn(req, next) -> response-string: it may inspect/modify req, call
+// next(req) for the downstream response, and modify that response. Composed by the
+// dispatch fold (outside-in). _fr_wrap binds `next` so a mw becomes a fn(req).
+fn _fr_wrap(mw, next)
+    return fn(req) mw(req, next)
+
+// Insert `name: value` before a built response's blank-line boundary (passthrough if none).
+fn _fr_add_header(resp: string, name: string, value: string) -> string
+    let marker = "\r\n\r\n"
+    let i = find(resp, marker)
+    if i < 0
+        return resp
+    let head = slice(resp, 0, i)
+    let body = slice(resp, i + 4, len(resp))
+    head + "\r\n" + name + ": " + value + marker + body
+
+// CORS middleware: adds Access-Control-* headers to every response.
+fn mw_cors(origin: string)
+    return fn(req, next) with_cors(next(req), origin)
+
+// Header-injecting middleware: adds `name: value` to every response.
+fn mw_header(name: string, value: string)
+    return fn(req, next) _fr_add_header(next(req), name, value)
+
+// Logging middleware: prints method + path, then runs next (side effect; pass-through).
+fn _fr_log_next(req, next)
+    print("[forge] " + req["method"] + " " + req["path"])
+    next(req)
+
+fn mw_logger()
+    return fn(req, next) _fr_log_next(req, next)
+
+// ── Request data ─────────────────────────────────────────────────────────────
+// Parse the request body as JSON -> dict/list (untyped, via json_decode).
+// TYPED deserialization WORKS today via the from_json typed-let keystone (Phase 0a):
+//   let u: User = from_json(req["body"])   -- the compiler dispatches to User__from_json
+//   (flat / nested / list<struct>; proven by from_json_test). Use this for typed bodies.
+// The ONLY remaining gap is the ergonomic WRAPPER `let u: User = forge.body_as(req)`: a
+// library fn returning T needs let-site -> callee specialization (tracked as query_as<T>,
+// Phase 0c). NOTE: a BARE `from_json(s)` with no `: Type` target still has no dispatch
+// target and must not be used. body_json gives untyped dict access.
+fn body_json(req)
+    return json_decode(req["body"])
+
+// Parse an application/x-www-form-urlencoded string ("a=1&b=2") -> dict of string->string.
+// (MVP: no percent-decoding yet; tracked.)
+fn form_decode(s: string)
+    let d = {}
+    if len(s) == 0
+        return d
+    let pairs = split(s, "&")
+    let i = 0
+    while i < len(pairs)
+        let kv = pairs[i]
+        let eq = find(kv, "=")
+        if eq >= 0
+            d[slice(kv, 0, eq)] = slice(kv, eq + 1, len(kv))
+        i = i + 1
+    d
+
+// Parse the request body as a form -> dict.
+fn body_form(req)
+    return form_decode(req["body"])
+
+// ── DB row helpers ───────────────────────────────────────────────────────────
+// Map a DB row (list of column values) to a dict keyed by column names. Bridges
+// sqlitex db_query rows -> named dicts. NOTE: forge cannot `import sqlitex` and call its
+// externs directly (cross-import extern resolution is a tracked compiler gap), so a
+// program fetches rows via sqlitex SAME-FILE and passes (columns, rows) to these helpers.
+// The TYPED row->struct form (query_as<struct>) needs the struct<-row compiler dispatch
+// (the same keystone as typed JSON), deferred.
+fn row_dict(columns: list, row: list)
+    let d = {}
+    let i = 0
+    while i < len(columns) and i < len(row)
+        d[columns[i]] = row[i]
+        i = i + 1
+    d
+
+fn rows_dicts(columns: list, rows: list)
+    let out = []
+    let i = 0
+    while i < len(rows)
+        push(out, row_dict(columns, rows[i]))
+        i = i + 1
+    out
+
+// ── Typed core (Phase 1) ─ Request / Response structs ────────────────────────
+// The typed model the dict-based router above will migrate onto: a Handler is
+// fn(Request) -> Response. Added ADDITIVELY -- the dict router + serve keep working while
+// typed dispatch is built incrementally, so the gate stays green throughout. The
+// struct<->JSON keystone (Phase 0a) makes a handler return a domain struct as JSON for
+// free (resp_json below): the "return your type, get JSON" win, end to end.
+
+type Request
+    method: string      // "GET"
+    path: string        // "/users/42" (clean, query stripped)
+    raw_path: string    // "/users/42?tab=x" (original)
+    params: dict        // ":id" -> "42", filled by the router at match time
+    query: dict         // "tab" -> "x", parsed once
+    headers: dict       // LOWERCASED header name -> value (case-insensitive for free)
+    body: string
+    state: dict         // middleware scratch: state["session"], state["user"], ...
+    conn: int           // raw fd (streaming / upgrade)
+
+type Response
+    status: int         // 200
+    headers: dict       // header name -> value (middleware mutates; finalize serializes once)
+    body: string
+    halted: bool        // a guard set the response; downstream skips, no exceptions
+
+// Parse "k=v&k2=v2" (the ?query) into a dict. Empty dict if none.
+fn _query_dict(raw_path: string) -> dict
+    let d = {}
+    let q = find(raw_path, "?")
+    if q < 0
+        return d
+    let qs = slice(raw_path, q + 1, len(raw_path))
+    let pairs = split(qs, "&")
+    let i = 0
+    while i < len(pairs)
+        let kv = pairs[i]
+        let eq = find(kv, "=")
+        if eq >= 0
+            d[slice(kv, 0, eq)] = slice(kv, eq + 1, len(kv))
+        i = i + 1
+    d
+
+// Parse request headers into a dict with LOWERCASED keys (HTTP header names are
+// case-insensitive). Skips the request line; stops at the blank-line boundary.
+fn _headers_dict(raw: string) -> dict
+    let d = {}
+    let hdr_end = find(raw, "\r\n\r\n")
+    let region = raw
+    if hdr_end >= 0
+        region = slice(raw, 0, hdr_end)
+    let first_nl = find(region, "\r\n")
+    if first_nl < 0
+        return d
+    let block = slice(region, first_nl + 2, len(region))
+    let lines = split(block, "\r\n")
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        let colon = find(line, ":")
+        if colon >= 0
+            let name = lower(trim(slice(line, 0, colon)))
+            let val = trim(slice(line, colon + 1, len(line)))
+            d[name] = val
+        i = i + 1
+    d
+
+// Parse a complete raw HTTP request into a typed Request (parse-ONCE: query + headers are
+// dicts, O(1) access). PUBLIC: the typed serve path + tests build requests with this.
+fn build_request(raw: string, conn: int) -> Request
+    let rp = parse_path(raw)
+    let q = _query_dict(rp)
+    let h = _headers_dict(raw)
+    Request(parse_method(raw), parse_path_clean(raw), rp, {}, q, h, parse_body(raw), {}, conn)
+
+// Case-insensitive header lookup ("" if absent). Keys are stored lowercased.
+fn req_header(req: Request, name: string) -> string
+    let k = lower(name)
+    if contains(req.headers, k)
+        return req.headers[k]
+    ""
+
+// Serialize a Response struct to the HTTP wire string ONCE (status line + headers +
+// Content-Length + body). The single point where a Response becomes bytes.
+fn finalize(resp: Response) -> string
+    let r = "HTTP/1.1 " + _status_line(resp.status) + "\r\n"
+    let ks = keys(resp.headers)
+    let i = 0
+    while i < len(ks)
+        let k = ks[i]
+        r = r + k + ": " + resp.headers[k] + "\r\n"
+        i = i + 1
+    r = r + "Content-Length: " + str(len(resp.body)) + "\r\n"
+    r = r + "Connection: close\r\n"
+    r = r + "Server: NOVA Forge\r\n"
+    r = r + "\r\n"
+    r = r + resp.body
+    r
+
+// ── Typed Response builders (return a Response struct, not a wire string) ──────
+fn resp_new(status: int, body: string) -> Response
+    Response(status, {}, body, false)
+
+fn resp_text(status: int, body: string) -> Response
+    let h = {}
+    h["Content-Type"] = "text/plain; charset=utf-8"
+    Response(status, h, body, false)
+
+fn resp_html(status: int, body: string) -> Response
+    let h = {}
+    h["Content-Type"] = "text/html; charset=utf-8"
+    Response(status, h, body, false)
+
+// resp_json: serialize ANY value (struct via the RTTI keystone / list / dict / scalar) into
+// a JSON Response. A handler can `return forge.resp_json(200, user)` and the client gets a
+// JSON object -- zero annotation.
+fn resp_json(status: int, value) -> Response
+    let h = {}
+    h["Content-Type"] = "application/json"
+    Response(status, h, json_stringify(value), false)
+
+// Set/overwrite a header on a Response (returns it for chaining). O(1) dict write -- the
+// typed answer to the dict router's string-surgery _fr_add_header.
+fn resp_set_header(resp: Response, name: string, value: string) -> Response
+    resp.headers[name] = value
+    resp
+
+// Coerce a handler's return value into a Response: a Response passes through; a string -> 200
+// text/plain; anything else (struct / list / dict / scalar) -> 200 JSON via the RTTI keystone.
+// Lets a handler return a BARE domain value -- `return user`, `return notes`, `return "hi"` --
+// and Forge produces the right Response. "Return your type, get JSON", zero ceremony.
+fn _coerce(v) -> Response
+    let tn = type_name(v)
+    if tn == "Response"
+        return v
+    if tn == "string"
+        return resp_text(200, v)
+    resp_json(200, v)
+
+// ── Typed dispatch (Phase 1) ─ fn(Request) -> Response handlers ───────────────
+// The TYPED handler model on the same app()/get()/routes: a handler is fn(Request) -> Response
+// and receives the parsed Request (params filled at match), returning a Response struct.
+// dispatch_req is pure (no socket) -> testable. serve_req_n serves it arena-scoped. The dict
+// dispatch above stays for backward compat; a given app uses ONE style (typed handlers here).
+//
+// Handlers take `req: Request` as a TYPED PARAMETER -> field access resolves per-struct
+// (sound; see the cross-module field-resolution fix). Return a Response via resp_json/
+// resp_text/resp_html -- e.g. `return forge.resp_json(200, user)` for "return your type, get JSON".
+// ── Static file serving (Phase 1) ─ traversal-safe BY CONSTRUCTION ────────────
+// static(a, url_prefix, root_dir) mounts a directory: a GET/HEAD whose path begins with
+// url_prefix is served from root_dir. Security is by construction, not configuration --
+// _safe_subpath whitelists path segments so no "..", no absolute / backslash / drive path,
+// and no dotfile (.env / .git / ...) can ever be reached; the served file cannot escape
+// root_dir. Most frameworks serve dotfiles by default and rely on the developer to lock the
+// path down; Forge cannot be misconfigured into a directory-traversal or secret-leak CVE.
+fn static(a, url_prefix: string, root_dir: string)
+    push(a["statics"], [url_prefix, root_dir])
+    a
+
+// A single path segment is UNSAFE if it is "..", a dotfile (leading "."), or contains a
+// backslash or colon (Windows separator / drive-letter / NTFS alternate-data-stream). "."
+// and empty segments are skipped by the caller before this check.
+fn _unsafe_segment(seg: string) -> bool
+    if seg == ".."
+        return true
+    if starts_with(seg, ".")
+        return true
+    if find(seg, "\\") >= 0
+        return true
+    if find(seg, ":") >= 0
+        return true
+    false
+
+// Sanitize a URL subpath into a safe relative filesystem path. err on ANY traversal attempt.
+// The segment whitelist makes escape impossible: every surviving segment is an ordinary name,
+// so root_dir + "/" + result stays inside root_dir.
+fn _safe_subpath(rel: string)
+    let r = rel
+    if starts_with(r, "/")
+        r = slice(r, 1, len(r))
+    let parts = split(r, "/")
+    let clean = ""
+    let i = 0
+    while i < len(parts)
+        let seg = parts[i]
+        if seg == "" or seg == "."
+            i = i + 1
+        else if _unsafe_segment(seg)
+            return err("unsafe path segment")
+        else
+            if clean == ""
+                clean = seg
+            else
+                clean = clean + "/" + seg
+            i = i + 1
+    ok(clean)
+
+// Try to serve req.path from a registered static mount: ok(Response) if a mount's prefix
+// matched AND the sanitized file exists; err otherwise (caller falls through to 404). An
+// empty subpath (the mount root) serves index.html. Text-correct; binary assets (read_file
+// stops at an embedded NUL) await the bytes/streaming Response.
+fn _try_static(a, req: Request)
+    let mounts = a["statics"]
+    let i = 0
+    while i < len(mounts)
+        let m = mounts[i]
+        let prefix = m[0]
+        let root = m[1]
+        if starts_with(req.path, prefix)
+            let safe = _safe_subpath(slice(req.path, len(prefix), len(req.path)))
+            if is_ok(safe)
+                let cleanrel = unwrap(safe)
+                if cleanrel == ""
+                    cleanrel = "index.html"
+                let fpath = root + "/" + cleanrel
+                if file_exists(fpath)
+                    let h = {}
+                    h["Content-Type"] = _ext_ctype(cleanrel)
+                    return ok(Response(200, h, read_file(fpath), false))
+        i = i + 1
+    err("no static match")
+
+// The route-match TERMINAL of the typed chain: find the matching route, bind path params,
+// run the handler through _coerce. 404/405 exactly as before. This is the innermost layer --
+// the middleware fold wraps around it.
+fn _dispatch_terminal(a, req: Request) -> Response
+    let routes = a["routes"]
+    let other = 0
+    let i = 0
+    while i < len(routes)
+        let rt = routes[i]
+        let mr = _fr_match(rt[1], req.path)
+        if is_ok(mr)
+            if rt[0] == req.method or rt[0] == "*"
+                req.params = unwrap(mr)
+                let h = rt[2]
+                return _coerce(h(req))
+            else
+                other = 1
+        i = i + 1
+    // No route matched the (path, method). Try static mounts (GET/HEAD only) before 404.
+    if req.method == "GET" or req.method == "HEAD"
+        let sr = _try_static(a, req)
+        if is_ok(sr)
+            return unwrap(sr)
+    if other == 1
+        return resp_text(405, "method not allowed")
+    resp_text(404, "no route: " + req.method + " " + req.path)
+
+// Typed middleware wrapper: bind `next` so a fn(req: Request, next) -> Response middleware
+// becomes a plain fn(Request) -> Response. _coerce lets a middleware short-circuit by
+// returning a bare string/struct (e.g. a 401 body) just like a handler.
+fn _t_wrap(mw, next)
+    return fn(req) _coerce(mw(req, next))
+
+// Typed dispatch: fold the app's middleware OUTSIDE-IN around the route terminal, then run.
+// First-registered middleware is outermost (sees the request first, the response last). The
+// fold closures are created and consumed INSIDE this function -- which runs in the SPAWNED
+// child on the concurrent/crash-isolated serve paths -- so no fold closure ever crosses a
+// process boundary. Only the plain middleware fn values (stored in the app's "mws" list) are
+// deep-copied across spawn, exactly as route handlers already are; capturing-closure
+// middleware (e.g. mw_set_header(name,value)) survives that copy intact (verified).
+fn dispatch_req(a, req: Request) -> Response
+    let h = fn(r) _dispatch_terminal(a, r)
+    let mws = a["mws"]
+    let i = len(mws) - 1
+    while i >= 0
+        h = _t_wrap(mws[i], h)
+        i = i - 1
+    h(req)
+
+// ── Typed middleware (Phase 1) ─ fn(req: Request, next) -> Response ────────────
+// Typed middleware operates on the Request / Response STRUCTS (the typed handler model),
+// distinct from the dict-request middleware above. Register with use(a, mw); dispatch_req
+// folds them outside-in around the route terminal. A middleware calls next(req) to obtain
+// the downstream Response, may modify it, or may short-circuit by returning its own value
+// (string / struct / Response -- coerced). A middleware may be a plain top-level fn(req,
+// next) or a builder-returned capturing closure; both fold identically and both survive the
+// spawn boundary on the concurrent / crash-isolated serve paths.
+
+// Inject a response header on every response (capturing closure over name/value).
+fn mw_set_header(name: string, value: string)
+    return fn(req, next) resp_set_header(next(req), name, value)
+
+// CORS: add Access-Control-Allow-Origin to every typed response.
+fn mw_cors_origin(origin: string)
+    return fn(req, next) resp_set_header(next(req), "Access-Control-Allow-Origin", origin)
+
+// Logging: print method + path, then pass through (typed Request).
+fn _t_log_next(req: Request, next)
+    print("[forge] " + req.method + " " + req.path)
+    next(req)
+
+fn mw_log()
+    return fn(req, next) _t_log_next(req, next)
+
+// Per-request arena-scoped typed handling: build the Request, dispatch to a typed handler,
+// finalize the Response to wire ONCE, send, free the arena wholesale. Runs as the body of a
+// per-connection green task (spawn-per-connection below). The arena is PER-TASK (NovaTaskState),
+// so concurrent connections each hold an independent arena -- flat per-request memory under
+// concurrency, proven sound (forge_spawn_test: N concurrent, per-task arena, ASAN-clean).
+fn _handle_req_arena(conn: int, a)
+    let prev = arena_enter()
+    let raw = recv_request(conn)
+    let req: Request = build_request(raw, conn)
+    let resp: Response = dispatch_req(a, req)
+    tcp_send(conn, finalize(resp))
+    arena_exit(prev)
+    tcp_close(conn)
+
+// done-signaling wrapper for the deterministic serve_req_n.
+fn _handle_req_done(conn: int, a, done)
+    _handle_req_arena(conn, a)
+    send(done, 1)
+
+// SPAWN-PER-CONNECTION (the G1 fix): each accepted connection runs in its own green task, so
+// the accept loop never blocks on a slow handler -- 10k concurrent connections, straight-line
+// handlers, no async coloring. Serve exactly N requests, waiting for all N handlers to finish
+// before closing (deterministic -> testable).
+fn serve_req_n(a, port: int, n: int)
+    let listener = tcp_listen(port)
+    let done = channel()
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            let dc = done
+            sched_spawn(fn(z) _handle_req_done(c, ap, dc))
+        i = i + 1
+    let j = 0
+    while j < n
+        recv(done)
+        j = j + 1
+    tcp_close(listener)
+
+// Infinite spawn-per-connection serve: accept, spawn a green task per connection, never block.
+fn serve_req(a, port: int)
+    let listener = tcp_listen(port)
+    while true
+        let conn = tcp_accept(listener)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            sched_spawn(fn(z) _handle_req_arena(c, ap))
+
+// ── Crash isolation (Phase 1) ─ recover: handler panic -> 500, the server lives ──────────
+// NOVA's "let it crash": dispatch_safe runs the routed handler in a MONITORED process. On a
+// normal return it channels the Response back (deep-copied across the process boundary). On a
+// PANIC the monitor reports the crash and dispatch_safe returns a clean 500 -- the request
+// fails, the server survives. Erlang-class fault tolerance at native (AOT) speed: Go/Node/
+// Spring cannot contain a handler crash to a single request without ceremony. (Proven by the
+// recover probe: good -> 200 Response intact, panic -> 500, program survived.)
+fn _dispatch_run(a, req, rc)
+    let r: Response = dispatch_req(a, req)
+    send(rc, r)
+
+fn dispatch_safe(a, req: Request) -> Response
+    let rc = channel()
+    let ap = a
+    let rq = req
+    let c = rc
+    let p = spawn _dispatch_run(ap, rq, c)
+    let m = monitor(p)
+    let st = receive(m)
+    if st == 0
+        return receive(rc)
+    resp_text(500, "Internal Server Error")
+
+// Crash-isolated per-connection handling: a handler panic returns a clean 500 to the client
+// (not a dropped connection), and the accept loop keeps serving. Also fixes the serve_req_n
+// hang-on-panic (the done signal is always sent, since dispatch_safe never panics).
+fn _handle_req_safe(conn: int, a)
+    let prev = arena_enter()
+    let raw = recv_request(conn)
+    let req: Request = build_request(raw, conn)
+    let resp: Response = dispatch_safe(a, req)
+    tcp_send(conn, finalize(resp))
+    arena_exit(prev)
+    tcp_close(conn)
+
+fn _handle_req_safe_done(conn: int, a, done)
+    _handle_req_safe(conn, a)
+    send(done, 1)
+
+// Spawn-per-connection + crash-isolated serve. Each connection -> own green task; each handler
+// -> monitored sub-process; a handler panic -> 500 + server lives. serve_safe_req_n waits N.
+fn serve_safe_req_n(a, port: int, n: int)
+    let listener = tcp_listen(port)
+    let done = channel()
+    let i = 0
+    while i < n
+        let conn = tcp_accept(listener)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            let dc = done
+            sched_spawn(fn(z) _handle_req_safe_done(c, ap, dc))
+        i = i + 1
+    let j = 0
+    while j < n
+        recv(done)
+        j = j + 1
+    tcp_close(listener)
+
+fn serve_safe_req(a, port: int)
+    let listener = tcp_listen(port)
+    while true
+        let conn = tcp_accept(listener)
+        if conn >= 0
+            let c = conn
+            let ap = a
+            sched_spawn(fn(z) _handle_req_safe(c, ap))
+
