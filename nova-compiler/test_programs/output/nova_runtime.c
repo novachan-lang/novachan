@@ -11341,6 +11341,43 @@ int64_t nova_rt_bytes_slice(int64_t handle, int64_t start, int64_t end) {
     return result;
 }
 
+/* Concatenate two byte buffers into a fresh NovaBytes (a+b, binary-safe). Overflow-guarded. */
+int64_t nova_rt_bytes_concat(int64_t ah, int64_t bh) {
+    NovaBytes* a = (NovaBytes*)(uintptr_t)ah;
+    NovaBytes* b = (NovaBytes*)(uintptr_t)bh;
+    int64_t asz = (a && a->data) ? a->size : 0;
+    int64_t bsz = (b && b->data) ? b->size : 0;
+    if (asz < 0) asz = 0;
+    if (bsz < 0) bsz = 0;
+    if (asz > ((int64_t)1 << 40) || bsz > ((int64_t)1 << 40)) return nova_rt_bytes_create(0);
+    int64_t total = asz + bsz;
+    int64_t result = nova_rt_bytes_create(total);
+    NovaBytes* rb = (NovaBytes*)(uintptr_t)result;
+    if (rb && rb->data) {
+        if (asz > 0) memcpy(rb->data, a->data, (size_t)asz);
+        if (bsz > 0) memcpy(rb->data + asz, b->data, (size_t)bsz);
+    }
+    return result;
+}
+
+/* Append one byte (0..255), growing the buffer (arena-aware, amortized doubling) when full. Returns the
+   same handle (the struct is stable; only b->data may be reallocated). Lets a buffer be built incrementally
+   -- the foundation for streaming/compression output and request-body accumulation. */
+int64_t nova_rt_bytes_append(int64_t handle, int64_t byte_val) {
+    NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (!b) return handle;
+    if (b->size >= b->cap) {
+        int64_t newcap = b->cap < 16 ? 16 : b->cap * 2;
+        uint8_t* nd = (uint8_t*)nova_back_grow((void*)b, (size_t)b->cap, (size_t)newcap, (void*)b->data);
+        if (!nd) return handle;   /* OOM: drop the append, buffer unchanged */
+        b->data = nd;
+        b->cap = newcap;
+    }
+    b->data[b->size] = (uint8_t)(byte_val & 0xFF);
+    b->size = b->size + 1;
+    return handle;
+}
+
 int64_t nova_rt_bytes_to_str(int64_t handle) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
     if (!b || b->size == 0) return (int64_t)(uintptr_t)"";
