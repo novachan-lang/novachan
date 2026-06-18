@@ -1,0 +1,91 @@
+// forge_validate_test -- forge.validate: rule validation over a request dict that COLLECTS ALL field
+// errors (Moat 7). Cross-module-safe (validates the raw input by name; pair with form_as/from_json_safe
+// for typing). Optional-absent fields skip format rules; required catches empties; numeric min/max parse.
+import forge
+
+type User
+    name: string
+    age: int
+    score: float
+    email: string
+    role: string
+
+fn rules()
+    let r = {}
+    r["name"] = [forge.required(), forge.min_len(1), forge.max_len(80)]
+    r["age"] = [forge.required(), forge.min(13), forge.max(120)]
+    r["score"] = [forge.min(0), forge.max(10)]
+    r["email"] = [forge.required(), forge.email()]
+    r["role"] = [forge.one_of(["admin", "user", "guest"])]
+    r
+
+fn create_user(req: Request) -> Response
+    let body = json_decode(req.body)
+    let r = forge.validate(body, rules())
+    if is_err(r)
+        return forge.errors_response(unwrap_err(r))
+    let parsed: Result<User> = from_json_safe(req.body)
+    if is_err(parsed)
+        return forge.resp_error(422, unwrap_err(parsed))
+    forge.resp_json(201, unwrap(parsed))
+
+fn main()
+    // all-valid -> ok
+    let good = {}
+    good["name"] = "ada"
+    good["age"] = "30"
+    good["score"] = "9.5"
+    good["email"] = "a@b.com"
+    good["role"] = "admin"
+    assert(is_ok(forge.validate(good, rules())), "valid dict -> ok")
+    print("PASS: valid -> ok")
+
+    // many violations -> COLLECT ALL (name empty+short, age too small, score too big, bad email, bad role)
+    let bad = {}
+    bad["name"] = ""
+    bad["age"] = "5"
+    bad["score"] = "99"
+    bad["email"] = "nope"
+    bad["role"] = "x"
+    let rb = forge.validate(bad, rules())
+    assert(is_err(rb), "invalid dict -> err")
+    let errs = unwrap_err(rb)
+    assert(len(errs) >= 5, "collect-all: >=5 errors (got " + str(len(errs)) + ")")
+    let body = forge.body_of(forge.errors_response(errs))
+    assert(find(body, "name") >= 0, "name error present")
+    assert(find(body, "too_small") >= 0, "age too_small present")
+    assert(find(body, "too_big") >= 0, "score too_big present")
+    assert(find(body, "email") >= 0, "email error present")
+    assert(find(body, "one_of") >= 0, "role one_of present")
+    print("PASS: collect-all (" + str(len(errs)) + " errors) -> 422 JSON")
+
+    // numeric min/max parse the string value: age "20" passes, "5" fails min(13)
+    let m1 = {}
+    m1["age"] = "20"
+    assert(is_ok(forge.validate(m1, {"age": [forge.min(13), forge.max(120)]})), "age 20 in [13,120] -> ok")
+    let m2 = {}
+    m2["age"] = "abc"
+    assert(is_err(forge.validate(m2, {"age": [forge.min(13)]})), "non-numeric age vs min -> err")
+    print("PASS: numeric range + numeric guard")
+
+    // optional-absent field skips format rules (no required) -> ok; required-absent -> err
+    let opt = {}
+    opt["name"] = "ok"
+    assert(is_ok(forge.validate(opt, {"bio": [forge.min_len(5)]})), "absent optional skips format rule")
+    assert(is_err(forge.validate(opt, {"email": [forge.required()]})), "absent required -> err")
+    print("PASS: optional-skip + required-absent")
+
+    // end-to-end handler: bad JSON body -> 422 errors; good -> 201
+    let q = chr(34)
+    let a = forge.app()
+    forge.post(a, "/users", fn(req) create_user(req))
+    let badbody = "\{" + q + "name" + q + ":" + q + q + "," + q + "age" + q + ":5," + q + "score" + q + ":1," + q + "email" + q + ":" + q + "nope" + q + "," + q + "role" + q + ":" + q + "x" + q + "\}"
+    let rr = forge.dispatch_test(a, forge.mock_request("POST", "/users", badbody))
+    assert(forge.status_of(rr) == 422, "bad body -> 422 (got " + str(forge.status_of(rr)) + ")")
+    assert(find(forge.body_of(rr), "errors") >= 0, "422 carries errors array")
+    let goodbody = "\{" + q + "name" + q + ":" + q + "bob" + q + "," + q + "age" + q + ":40," + q + "score" + q + ":5," + q + "email" + q + ":" + q + "b@c.io" + q + "," + q + "role" + q + ":" + q + "user" + q + "\}"
+    let rg = forge.dispatch_test(a, forge.mock_request("POST", "/users", goodbody))
+    assert(forge.status_of(rg) == 201, "good body -> 201 (got " + str(forge.status_of(rg)) + ")")
+    print("PASS: end-to-end (bad->422, good->201)")
+
+    print("forge_validate_test passed")

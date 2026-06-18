@@ -1319,6 +1319,174 @@ fn _t_require_auth(req: Request, next, secret: string) -> Response
 fn mw_require_auth(secret: string)
     return fn(req, next) _t_require_auth(req, next, secret)
 
+// ── Input validation (Moat 7) ───────────────────────────────────────────────────
+// forge.validate(dict, rules) -> Result<dict, list<FieldError>>: rule validation that COLLECTS ALL field
+// errors (form UX -- one round-trip). Designed + adversarially reviewed (workflow wf_819de960). NOVA has
+// no type annotations to hang constraints on (Pydantic) and no schema-builder (Zod): rules are plain
+// VALUES -- a dict of field -> list of [kind,arg,code] rule triples built by tiny constructor fns, a
+// first-class reusable value. Validates the RAW request dict by name (cross-module-safe; no struct RTTI),
+// then pair with form_as/from_json_safe to produce the typed struct. Canonical handler:
+//   let body = json_decode(req.body)              // or forge.req_form_all(req) for a form
+//   let r = forge.validate(body, {"name":[forge.required(),forge.min_len(1)], "age":[forge.min(13)]})
+//   if is_err(r): return forge.errors_response(unwrap_err(r))   // ALL rule errors -> 422 JSON
+//   let user: User = from_json_safe(req.body)     // ... then coerce to the typed struct
+// (Use is_err/unwrap + a trailing call in guards -- never `match {Ok=>return next}` after a complex fn:
+//  the codegen bug -- see [[project-forge-phase3-security]]. A type-aware validate over the post-coercion
+//  struct is a tracked follow-up, gated on wiring field_names/field_get through `any` cross-module.)
+
+type FieldError
+    field: string         // the field that failed, e.g. "email"
+    code: string          // STABLE machine code (i18n / client key), e.g. "too_short"
+    rule: string          // the rule kind checked, e.g. "min_len"
+    param: string         // the violated constraint, e.g. "3" -- NEVER the failing input (no reflection/PII)
+    message: string       // default English; dev convenience, not the source of truth
+
+// Rule constructors -- no new syntax, just functions returning a [kind, arg, code] triple. Reusable values.
+fn required()      ["required", "", "required"]
+fn min_len(n: int) ["min_len", str(n), "too_short"]
+fn max_len(n: int) ["max_len", str(n), "too_long"]
+fn min(n: int)     ["min", str(n), "too_small"]
+fn max(n: int)     ["max", str(n), "too_big"]
+fn pattern(re: string) ["pattern", re, "pattern"]      // re MUST be a developer literal (ReDoS: never request data)
+fn email()         ["email", "", "email"]
+fn one_of(vals: list)
+    let s = ""
+    let i = 0
+    while i < len(vals)
+        if i > 0
+            s = s + "|"
+        s = s + vals[i]
+        i = i + 1
+    ["one_of", s, "one_of"]
+
+fn _re_cap() -> int
+    4096
+
+// Structural, NON-regex (linear) email check -- no ReDoS surface.
+fn _is_email(s: string) -> bool
+    let at = find(s, "@")
+    if at <= 0 or at >= len(s) - 1
+        return false
+    let domain = slice(s, at + 1, len(s))
+    if find(domain, ".") < 0
+        return false
+    if find(s, " ") >= 0
+        return false
+    true
+
+fn _one_of_has(param: string, val: string) -> bool
+    for o in split(param, "|")
+        if o == val
+            return true
+    false
+
+fn _fail(field: string, rule: list, msg: string) -> FieldError
+    FieldError(field, rule[2], rule[0], rule[1], msg)
+
+// Is s a (possibly signed) numeric literal (int OR float)? Guards the numeric range rules on raw string
+// input so a non-numeric value fails with "must be a number" rather than a silent parse-to-0.
+fn _is_num(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    if s[0] == "-"
+        if len(s) == 1
+            return false
+        i = 1
+    let dots = 0
+    let digits = 0
+    while i < len(s)
+        let c = s[i]
+        if c == "."
+            dots = dots + 1
+        else if find("0123456789", c) >= 0
+            digits = digits + 1
+        else
+            return false
+        i = i + 1
+    dots <= 1 and digits >= 1
+
+// Apply ONE rule to a field's STRING value -> a list of 0 (pass) or 1 (fail) FieldError. A list (not an
+// in-band sentinel) so a genuine failure can never be read as success (adversary finding). An ABSENT/empty
+// value passes every rule EXCEPT `required` (optional fields skip format/range checks -- the Pydantic/Zod
+// optional semantics); `required` is the only rule that fails on empty.
+fn _apply_rule(fname: string, fval: string, rule: list) -> list
+    let kind = rule[0]
+    let arg = rule[1]
+    if kind == "required"
+        if len(trim(fval)) == 0
+            return [_fail(fname, rule, fname + " is required")]
+        return []
+    // optional + absent/empty -> skip every non-required rule.
+    if len(fval) == 0
+        return []
+    if kind == "min_len"
+        if len(fval) < parse_int(arg)
+            return [_fail(fname, rule, fname + " must be at least " + arg + " characters")]
+        return []
+    if kind == "max_len"
+        if len(fval) > parse_int(arg)
+            return [_fail(fname, rule, fname + " must be at most " + arg + " characters")]
+        return []
+    if kind == "min"
+        if not _is_num(fval)
+            return [_fail(fname, rule, fname + " must be a number")]
+        if float(fval) < float(arg)
+            return [_fail(fname, rule, fname + " must be >= " + arg)]
+        return []
+    if kind == "max"
+        if not _is_num(fval)
+            return [_fail(fname, rule, fname + " must be a number")]
+        if float(fval) > float(arg)
+            return [_fail(fname, rule, fname + " must be <= " + arg)]
+        return []
+    if kind == "one_of"
+        if not _one_of_has(arg, fval)
+            return [_fail(fname, rule, fname + " must be one of: " + arg)]
+        return []
+    if kind == "email"
+        if not _is_email(fval)
+            return [_fail(fname, rule, fname + " must be a valid email")]
+        return []
+    if kind == "pattern"
+        if len(fval) > _re_cap()
+            return [_fail(fname, rule, fname + " is too long to validate")]
+        if not regex_match(fval, arg)
+            return [_fail(fname, rule, fname + " has an invalid format")]
+        return []
+    // unknown rule kind -> fail CLOSED (a typo'd rule must never silently pass).
+    [_fail(fname, rule, fname + " failed an unknown rule '" + kind + "'")]
+
+// validate a request DICT (`d` = req_form_all(req) for forms, or json_decode(req.body) for JSON) against
+// `rules` ({field -> [rule, ...]}). Collects ALL failures (form UX, one round-trip), returning
+// Result<dict, list<FieldError>>. Runs on the RAW input by NAME -- cross-module-safe (no struct RTTI) and
+// fail-fast on bad input; pair with form_as/from_json_safe to then produce the typed struct.
+// (A future type-aware `validate_typed` over the struct post-coercion is gated on RTTI-through-`any`,
+// a tracked compiler follow-up -- see [[project-forge-phase3-security]].)
+fn validate(d, rules)
+    let errs = []
+    for fname in keys(rules)
+        let fval = ""
+        if contains(d, fname)
+            fval = str(d[fname])
+        let rs = rules[fname]
+        let j = 0
+        while j < len(rs)
+            for e in _apply_rule(fname, fval, rs[j])
+                push(errs, e)
+            j = j + 1
+    if len(errs) > 0
+        return err(errs)
+    ok(d)
+
+// Map collected errors to a 422 JSON Response: {"errors":[{field,code,rule,param,message}, ...]}. Each
+// FieldError auto-JSONs via the RTTI keystone; json_stringify escapes (JSON-injection-safe). Never echoes
+// the failing input value (no reflected XSS/PII).
+fn errors_response(errs) -> Response
+    let body = {}
+    body["errors"] = errs
+    resp_json(422, body)
+
 // Coerce a handler's return value into a Response: a Response passes through; a string -> 200
 // text/plain; anything else (struct / list / dict / scalar) -> 200 JSON via the RTTI keystone.
 // Lets a handler return a BARE domain value -- `return user`, `return notes`, `return "hi"` --
