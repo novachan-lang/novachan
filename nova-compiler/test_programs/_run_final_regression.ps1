@@ -169,6 +169,7 @@ $domain_tests = @(
     'forge_jwt_test',
     'forge_validate_test',
     'forge_validate_typed_test',
+    'forge_gzip_test',
     'forge_openapi_test',
     'forge_resp_model_test',
     'forge_model_route_test',
