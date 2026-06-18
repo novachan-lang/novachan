@@ -1517,6 +1517,256 @@ fn errors_response(errs) -> Response
     body["errors"] = errs
     resp_json(422, body)
 
+// ── OpenAPI 3.0 generation (Moat: live API docs from declared types) ─────────────────────────────────
+// HONEST SCOPE (designed + adversary-reviewed, workflow wbu20zrcn). Routes opt INTO docs by passing
+// zero-value SAMPLE instances of their request/response struct types to *_doc registrars. openapi(a,info)
+// walks the route table and builds an OpenAPI 3.0 spec by introspecting the samples via the cross-module
+// RTTI keystone (field_names/field_types/field_get through `any` -> the runtime struct-meta registry).
+// CAVEATS (stated plainly): the sample type is DEVELOPER-ASSERTED, not compiler-bound to the handler's
+// from_json<T>/resp_json (within-type no-drift only; true no-drift needs a compiler hook = future Path-C).
+// A nested struct field is documented only if the sample carries a populated nested instance; list-of-
+// struct elements and unknown types render as {"type":"object"}. The ONE genuine no-drift NOVA delivers
+// here: when a route also supplies its validate `rules`, the documented constraints (minLength/maximum/
+// pattern/enum) are folded from the SAME rules dict that validate() enforces -> docs and validation cannot
+// disagree on constraints. A DJB2 type-name-hash collision (rare) yields a wrong schema (pre-existing RTTI
+// limit). Dispatch reads route indices [0..2] only, so doc routes dispatch identically to plain routes.
+
+// doc-variant registrars: store [method, full, handler, req_sample, resp_sample, rules]. req/resp samples
+// are live struct instances (null when absent); rules is the validate rules dict (empty {} when absent).
+fn _fr_route_doc(a, method: string, pattern: string, handler, req_s, resp_s, rules)
+    let full = pattern
+    if contains(a, "prefix")
+        full = a["prefix"] + pattern
+    push(a["routes"], [method, full, handler, req_s, resp_s, rules])
+    a
+
+fn post_doc(a, pattern: string, handler, req_s, resp_s, rules)
+    _fr_route_doc(a, "POST", pattern, handler, req_s, resp_s, rules)
+fn put_doc(a, pattern: string, handler, req_s, resp_s, rules)
+    _fr_route_doc(a, "PUT", pattern, handler, req_s, resp_s, rules)
+fn patch_doc(a, pattern: string, handler, req_s, resp_s, rules)
+    _fr_route_doc(a, "PATCH", pattern, handler, req_s, resp_s, rules)
+fn get_doc(a, pattern: string, handler, resp_s)
+    let empty = {}
+    _fr_route_doc(a, "GET", pattern, handler, null, resp_s, empty)
+fn delete_doc(a, pattern: string, handler, resp_s)
+    let empty = {}
+    _fr_route_doc(a, "DELETE", pattern, handler, null, resp_s, empty)
+
+// Map one declared field type-name -> a JSON Schema fragment. Lowercasing folds the boxed `Float` cliff to
+// "number" (correct for schema purposes). list/dict/unknown -> object; a struct name -> a $ref into comps,
+// reserved-before-recurse (cycle guard) and populated only if fval is a live nested struct sample.
+fn _oapi_schema_of_type(tname: string, fval, comps)
+    let t = lower(tname)
+    let s = {}
+    if t == "int" or t == "i64" or t == "i32" or t == "long"
+        s["type"] = "integer"
+        return s
+    if t == "float" or t == "f64" or t == "f32" or t == "double"
+        s["type"] = "number"
+        return s
+    if t == "string" or t == "str"
+        s["type"] = "string"
+        return s
+    if t == "bool" or t == "boolean"
+        s["type"] = "boolean"
+        return s
+    if len(t) >= 4 and slice(t, 0, 4) == "list"
+        s["type"] = "array"
+        let it = {}
+        s["items"] = it
+        return s
+    if len(t) >= 4 and slice(t, 0, 4) == "dict"
+        s["type"] = "object"
+        return s
+    // treat as a struct reference
+    if contains(comps, tname) == false
+        let placeholder = {}
+        placeholder["type"] = "object"
+        comps[tname] = placeholder
+        if len(field_names(fval)) > 0
+            comps[tname] = _oapi_schema_of_value(fval, comps)
+    let r = {}
+    r["$ref"] = "#/components/schemas/" + tname
+    return r
+
+// Build an object schema from a live struct sample: every field -> a property, all fields required.
+fn _oapi_schema_of_value(v, comps)
+    let names = field_names(v)
+    let types = field_types(v)
+    let props = {}
+    let req = []
+    let i = 0
+    while i < len(names)
+        let nm = names[i]
+        props[nm] = _oapi_schema_of_type(types[i], field_get(v, nm), comps)
+        push(req, nm)
+        i = i + 1
+    let s = {}
+    s["type"] = "object"
+    s["properties"] = props
+    s["required"] = req
+    return s
+
+// Fold validate rules (the SAME dict validate() enforces) into the object schema's property constraints.
+fn _oapi_fold_rules(obj_schema, rules)
+    let props = obj_schema["properties"]
+    for fld in keys(rules)
+        if contains(props, fld)
+            let ps = props[fld]
+            for r in rules[fld]
+                let k = r[0]
+                let arg = r[1]
+                if k == "min_len"
+                    ps["minLength"] = parse_int(arg)
+                else if k == "max_len"
+                    ps["maxLength"] = parse_int(arg)
+                else if k == "min"
+                    ps["minimum"] = parse_int(arg)
+                else if k == "max"
+                    ps["maximum"] = parse_int(arg)
+                else if k == "pattern"
+                    ps["pattern"] = arg
+                else if k == "email"
+                    ps["format"] = "email"
+                else if k == "one_of"
+                    ps["enum"] = split(arg, "|")
+            props[fld] = ps
+    obj_schema["properties"] = props
+    return obj_schema
+
+// "/users/:id" -> "/users/{id}" (OpenAPI path-template syntax).
+fn _oapi_path(pat: string) -> string
+    let parts = split(pat, "/")
+    let out = ""
+    let i = 0
+    while i < len(parts)
+        let seg = parts[i]
+        if i > 0
+            out = out + "/"
+        if len(seg) > 0 and slice(seg, 0, 1) == ":"
+            out = out + chr(123) + slice(seg, 1, len(seg)) + chr(125)
+        else
+            out = out + seg
+        i = i + 1
+    return out
+
+// Each ":name" segment -> a required string path parameter object.
+fn _oapi_path_params(pat: string)
+    let ps = []
+    let parts = split(pat, "/")
+    let i = 0
+    while i < len(parts)
+        let seg = parts[i]
+        if len(seg) > 0 and slice(seg, 0, 1) == ":"
+            let p = {}
+            p["name"] = slice(seg, 1, len(seg))
+            p["in"] = "path"
+            p["required"] = true
+            let sc = {}
+            sc["type"] = "string"
+            p["schema"] = sc
+            push(ps, p)
+        i = i + 1
+    return ps
+
+// Register a top-level request/response struct sample as a NAMED component (keyed by its real struct name
+// via type_name) and return a $ref to it -- so request/response/nested models all share one components
+// section (FastAPI-style). Reserve-before-recurse cycle guard. Folds validate rules into the component.
+// LIMIT (documented): a type reused across routes with DIFFERENT rules keeps the first route's constraints.
+fn _oapi_register_value(v, comps, rules)
+    let nm = type_name(v)
+    if contains(comps, nm) == false
+        let placeholder = {}
+        placeholder["type"] = "object"
+        comps[nm] = placeholder
+        let sc = _oapi_schema_of_value(v, comps)
+        if len(keys(rules)) > 0
+            sc = _oapi_fold_rules(sc, rules)
+        comps[nm] = sc
+    let r = {}
+    r["$ref"] = "#/components/schemas/" + nm
+    return r
+
+// Build the full OpenAPI 3.0 spec dict from the app's documented routes (those registered via *_doc).
+fn openapi(a, info)
+    let comps = {}
+    let paths = {}
+    for rt in a["routes"]
+        if len(rt) >= 6
+            let method = lower(rt[0])
+            let path = _oapi_path(rt[1])
+            let op = {}
+            // requestBody from the request sample, as a named component (+ folded validate constraints)
+            if len(field_names(rt[3])) > 0
+                let aj = {}
+                aj["schema"] = _oapi_register_value(rt[3], comps, rt[5])
+                let ct = {}
+                ct["application/json"] = aj
+                let rb = {}
+                rb["required"] = true
+                rb["content"] = ct
+                op["requestBody"] = rb
+            // 200 response from the response sample, as a named component
+            let r200 = {}
+            r200["description"] = "OK"
+            if len(field_names(rt[4])) > 0
+                let norules = {}
+                let raj = {}
+                raj["schema"] = _oapi_register_value(rt[4], comps, norules)
+                let rc = {}
+                rc["application/json"] = raj
+                r200["content"] = rc
+            let resp = {}
+            resp["200"] = r200
+            op["responses"] = resp
+            // path parameters
+            let pp = _oapi_path_params(rt[1])
+            if len(pp) > 0
+                op["parameters"] = pp
+            // attach as paths[path][method]
+            let pmap = {}
+            if contains(paths, path)
+                pmap = paths[path]
+            pmap[method] = op
+            paths[path] = pmap
+    let spec = {}
+    spec["openapi"] = "3.0.3"
+    spec["info"] = info
+    spec["paths"] = paths
+    let cs = {}
+    cs["schemas"] = comps
+    spec["components"] = cs
+    return spec
+
+// Swagger UI page (loaded from CDN) pointed at the spec URL. Braces via chr() to dodge interpolation.
+fn _swagger_html(spec_url: string) -> string
+    let q = chr(34)
+    let lb = chr(123)
+    let rb = chr(125)
+    let head = "<!doctype html><html><head><meta charset=" + q + "utf-8" + q + "><title>API Docs</title><link rel=" + q + "stylesheet" + q + " href=" + q + "https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui.css" + q + "></head>"
+    let body = "<body><div id=" + q + "swagger-ui" + q + "></div><script src=" + q + "https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui-bundle.js" + q + "></script>"
+    let js = "<script>window.onload=function()" + lb + "SwaggerUIBundle(" + lb + "url:" + q + spec_url + q + ",dom_id:" + q + "#swagger-ui" + q + rb + ")" + rb + "</script></body></html>"
+    return head + body + js
+
+// Closures capture the prebuilt spec/html (long-lived; built at startup, read-only inside request arenas).
+fn _oapi_serve_spec(spec)
+    return fn(req) resp_json(200, spec)
+fn _oapi_serve_docs(page: string)
+    return fn(req) resp_html(200, page)
+
+// Build the spec ONCE from the routes registered so far, then serve GET /openapi.json + GET /docs.
+// Call AFTER all *_doc routes are registered (it snapshots the route table at call time).
+fn enable_docs(a, title: string, version: string)
+    let info = {}
+    info["title"] = title
+    info["version"] = version
+    let spec = openapi(a, info)
+    get(a, "/openapi.json", _oapi_serve_spec(spec))
+    let page = _swagger_html("/openapi.json")
+    get(a, "/docs", _oapi_serve_docs(page))
+    a
+
 // Coerce a handler's return value into a Response: a Response passes through; a string -> 200
 // text/plain; anything else (struct / list / dict / scalar) -> 200 JSON via the RTTI keystone.
 // Lets a handler return a BARE domain value -- `return user`, `return notes`, `return "hi"` --

@@ -1,0 +1,92 @@
+// forge_openapi_test -- forge.enable_docs generates a live OpenAPI 3.0 spec from sample-declared route
+// types via the cross-module RTTI keystone (forge introspecting APP structs through `any`), serves it at
+// GET /openapi.json and the Swagger UI at GET /docs. HONEST v1 (workflow wbu20zrcn): sample types are
+// developer-asserted; a nested struct is documented when its sample is populated; list/unknown -> object;
+// validate rules fold into schema constraints (the one genuine no-drift -- docs constraints come from the
+// SAME rules dict validate() enforces). This test does a real dispatch round-trip (arena-safe spec).
+import forge
+
+type Address
+    city: string
+    zip: string
+
+type CreateUser
+    name: string
+    age: int
+    active: bool
+    score: float
+    address: Address
+    tags: list
+
+type UserOut
+    id: int
+    name: string
+
+fn user_rules()
+    let r = {}
+    r["name"] = [forge.required(), forge.min_len(1), forge.max_len(80)]
+    r["age"] = [forge.min(13), forge.max(120)]
+    r
+
+fn main()
+    let a = forge.app()
+    // sample carries a POPULATED nested Address so the recursion can document it
+    let req_sample = CreateUser("", 0, false, 0.0, Address("", ""), [])
+    let resp_sample = UserOut(0, "")
+    forge.post_doc(a, "/users", fn(req) forge.resp_json(201, resp_sample), req_sample, resp_sample, user_rules())
+    forge.get_doc(a, "/users/:id", fn(req) forge.resp_json(200, resp_sample), resp_sample)
+    forge.enable_docs(a, "Test API", "1.2.3")
+
+    // GET /openapi.json -> 200 + a real spec (dispatched through the request path -> arena round-trip)
+    let sr = forge.dispatch_test(a, forge.mock_request("GET", "/openapi.json", ""))
+    assert(forge.status_of(sr) == 200, "GET /openapi.json -> 200")
+    let spec = forge.body_of(sr)
+    assert(find(spec, "3.0.3") >= 0, "openapi version")
+    assert(find(spec, "Test API") >= 0, "info.title")
+    assert(find(spec, "1.2.3") >= 0, "info.version")
+    print("PASS: /openapi.json served (" + str(len(spec)) + " bytes)")
+
+    // request-body schema: primitive + list field types mapped correctly
+    assert(find(spec, "requestBody") >= 0, "POST has requestBody")
+    assert(find(spec, "integer") >= 0, "age -> integer")
+    assert(find(spec, "number") >= 0, "score -> number")
+    assert(find(spec, "boolean") >= 0, "active -> boolean")
+    assert(find(spec, "array") >= 0, "tags -> array")
+    print("PASS: primitive + list field types mapped")
+
+    // nested struct -> components + $ref (sample populated with Address())
+    assert(find(spec, "$ref") >= 0, "nested struct -> $ref")
+    assert(find(spec, "components") >= 0, "components present")
+    assert(find(spec, "Address") >= 0, "Address component")
+    assert(find(spec, "city") >= 0, "nested field city")
+    print("PASS: nested struct -> components/$ref (recursive)")
+
+    // validate rules folded into schema constraints (the genuine no-drift: same dict validate() enforces)
+    assert(find(spec, "minLength") >= 0, "min_len -> minLength")
+    assert(find(spec, "maxLength") >= 0, "max_len -> maxLength")
+    assert(find(spec, "minimum") >= 0, "min -> minimum")
+    assert(find(spec, "maximum") >= 0, "max -> maximum")
+    print("PASS: validate rules folded into schema constraints")
+
+    // path params: ":id" -> "{id}" template + a path parameter object.
+    // NOTE: build the needle with chr() -- a literal "{id}" would be string-interpolated by NOVA.
+    let tmpl = "/users/" + chr(123) + "id" + chr(125)
+    assert(find(spec, tmpl) >= 0, "path-template colon-id converted to brace-id")
+    assert(find(spec, "parameters") >= 0, "path parameters present")
+    print("PASS: path param :id documented (templated)")
+
+    // 200 response from the response sample
+    assert(find(spec, "200") >= 0, "200 response")
+    assert(find(spec, "UserOut") >= 0, "UserOut response component")
+    print("PASS: 200 response schema from sample")
+
+    // GET /docs -> Swagger UI page pointed at the spec
+    let dr = forge.dispatch_test(a, forge.mock_request("GET", "/docs", ""))
+    assert(forge.status_of(dr) == 200, "GET /docs -> 200")
+    let page = forge.body_of(dr)
+    assert(find(page, "swagger-ui") >= 0, "Swagger UI div")
+    assert(find(page, "SwaggerUIBundle") >= 0, "Swagger UI bundle")
+    assert(find(page, "/openapi.json") >= 0, "docs points at spec url")
+    print("PASS: /docs serves Swagger UI")
+
+    print("forge_openapi_test passed")
