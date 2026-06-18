@@ -1,0 +1,45 @@
+// forge_binary_file_test -- Forge serves a BINARY static file (with embedded NULs) intact over HTTP via
+// static(). _try_static now reads it with read_bytes (not read_file, which truncates at the first NUL) and
+// hashes it with sha256_of_bytes for a strong ETag; the bytes body flows through the type_name(body)==
+// "bytes" discrimination in _finalize2/_serve_conn (S3) -> tcp_send_bytes (length-exact). The PNG-like
+// payload's embedded NULs would truncate a read_file/string path to 2 bytes (Content-Length 2); the binary
+// path serves all 6.
+import forge
+
+fn _is6(b)
+    bytes_len(b) == 6 and bytes_get(b, 0) == 137 and bytes_get(b, 1) == 80 and bytes_get(b, 2) == 0 and bytes_get(b, 3) == 78 and bytes_get(b, 4) == 0 and bytes_get(b, 5) == 71
+
+fn main()
+    // write a 6-byte binary asset with two embedded NULs (PNG-ish magic: 0x89 'P' NUL 'N' NUL 'G')
+    let payload = bytes(6)
+    bytes_set(payload, 0, 137)
+    bytes_set(payload, 1, 80)
+    bytes_set(payload, 2, 0)
+    bytes_set(payload, 3, 78)
+    bytes_set(payload, 4, 0)
+    bytes_set(payload, 5, 71)
+    write_bytes("_bf_asset.bin", payload)
+
+    let port = 19410
+    spawn fn()
+        let a = forge.app()
+        forge.static(a, "/static", ".")
+        forge.serve_req_n(a, port, 1)
+    sleep(300)
+    let sock = tcp_connect("127.0.0.1", port)
+    tcp_send(sock, "GET /static/_bf_asset.bin HTTP/1.0\r\n\r\n")
+    let r1 = tcp_recv_bytes(sock)
+    let n1 = bytes_len(r1)
+    // coalesced: body is the last 6 bytes of r1
+    let ok = n1 >= 6 and bytes_get(r1, n1 - 6) == 137 and bytes_get(r1, n1 - 5) == 80 and bytes_get(r1, n1 - 4) == 0 and bytes_get(r1, n1 - 3) == 78 and bytes_get(r1, n1 - 2) == 0 and bytes_get(r1, n1 - 1) == 71
+    if not ok
+        let r2 = tcp_recv_bytes(sock)   // rare split: body in the next recv
+        ok = _is6(r2)
+    tcp_close(sock)
+
+    assert(ok, "binary static file served intact including embedded NULs")
+    // Content-Length is the TRUE 6-byte count, not 2 (a string read would stop at the first NUL at index 2)
+    assert(find(bytes_to_str(r1), "Content-Length: 6") >= 0, "Content-Length is the full 6 bytes")
+    assert(find(bytes_to_str(r1), "ETag") >= 0, "strong content ETag present (sha256_of_bytes)")
+    print("PASS: Forge static() served a 6-byte binary file (PNG-like, 2 NULs) intact over real HTTP")
+    print("forge_binary_file_test passed")

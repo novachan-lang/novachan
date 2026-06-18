@@ -13290,6 +13290,27 @@ int64_t nova_rt_sha256(int64_t input) {
     return (int64_t)(uintptr_t)out;
 }
 
+/* SHA-256 of a NovaBytes handle's actual content (b->data[0..size]) -> 64-char hex. The existing
+   nova_rt_sha256_bytes takes a raw pointer+len which a NOVA handle cannot supply; this 1-arg form lets
+   NOVA hash a bytes value (e.g. a strong ETag for binary static files). Binary-safe (uses size, not strlen). */
+int64_t nova_rt_sha256_of_bytes(int64_t handle) {
+    NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    Sha256Ctx ctx;
+    sha256_init(&ctx);
+    if (b && b->data && b->size > 0) sha256_update(&ctx, b->data, (size_t)b->size);
+    uint8_t hash[32];
+    sha256_final(&ctx, hash);
+    static const char hex_chars[] = "0123456789abcdef";
+    char* out = (char*)nova_heap_alloc(65, NOVA_MEM_RAW);
+    if (!out) return (int64_t)(uintptr_t)"";
+    for (int i = 0; i < 32; i++) {
+        out[i*2]   = hex_chars[hash[i] >> 4];
+        out[i*2+1] = hex_chars[hash[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return (int64_t)(uintptr_t)out;
+}
+
 int64_t nova_rt_sha256_bytes(int64_t data, int64_t len_val) {
     const uint8_t* ptr = (const uint8_t*)(uintptr_t)data;
     size_t len = (size_t)len_val;

@@ -224,6 +224,20 @@ fn _ext_ctype(path: string) -> string
         return "application/wasm"
     "application/octet-stream"
 
+// Is this content-type textual? Text assets serve as a STRING (string body -- inspectable by middleware
+// and tests); everything else serves as BYTES (read_bytes, NUL-safe binary wire path). Covers text/*,
+// JSON, JavaScript, and XML/SVG; image/png, application/wasm, octet-stream, etc. fall through to binary.
+fn _ct_is_text(ct: string) -> bool
+    if starts_with(ct, "text/")
+        return true
+    if find(ct, "json") >= 0
+        return true
+    if find(ct, "javascript") >= 0
+        return true
+    if find(ct, "xml") >= 0
+        return true
+    false
+
 // Serve a file from disk by reading it and producing a 200 response.
 // Returns a 404 response if the file is missing or empty.
 fn serve_file(path: string) -> string
@@ -1989,17 +2003,27 @@ fn _try_static(a, req: Request)
                     cleanrel = "index.html"
                 let fpath = root + "/" + cleanrel
                 if file_exists(fpath)
-                    let content = read_file(fpath)
-                    // Content-hash ETag for conditional GET: a browser that already has this exact
-                    // file echoes it in If-None-Match and we answer 304 (no body) instead of resending.
-                    let etag = chr(34) + sha256(content) + chr(34)
+                    let ct = _ext_ctype(cleanrel)
                     let h = {}
-                    h["Content-Type"] = _ext_ctype(cleanrel)
-                    h["ETag"] = etag
+                    h["Content-Type"] = ct
                     h["Cache-Control"] = "no-cache"
-                    if req_header(req, "if-none-match") == etag
+                    // TEXT assets serve as a string (existing path: string body, inspectable). BINARY assets
+                    // (image/pdf/wasm/...) serve via read_bytes -- read_file truncates at the first NUL -- and
+                    // the bytes body flows through the type_name(body)=="bytes" wire path (S3, tcp_send_bytes).
+                    // ETag is a strong content hash either way (a browser echoes it in If-None-Match -> 304).
+                    if _ct_is_text(ct)
+                        let tcontent = read_file(fpath)
+                        let tetag = chr(34) + sha256(tcontent) + chr(34)
+                        h["ETag"] = tetag
+                        if req_header(req, "if-none-match") == tetag
+                            return ok(Response(304, h, "", false, []))
+                        return ok(Response(200, h, tcontent, false, []))
+                    let bcontent = read_bytes(fpath)
+                    let betag = chr(34) + sha256_of_bytes(bcontent) + chr(34)
+                    h["ETag"] = betag
+                    if req_header(req, "if-none-match") == betag
                         return ok(Response(304, h, "", false, []))
-                    return ok(Response(200, h, content, false, []))
+                    return ok(Response(200, h, bcontent, false, []))
         i = i + 1
     err("no static match")
 
