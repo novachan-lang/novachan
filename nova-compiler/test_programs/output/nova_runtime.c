@@ -401,7 +401,14 @@ typedef enum {
     NOVA_MEM_FAT_STR = 4,
     NOVA_MEM_STRUCT  = 5,
     NOVA_MEM_ITER    = 6,
-    NOVA_MEM_BOX     = 7   /* tagged primitive (bool/float) widened to Any */
+    NOVA_MEM_BOX     = 7,  /* tagged primitive (bool/float) widened to Any */
+    /* Binary byte buffer (NovaBytes{data,size,cap}). Value 8 is a FULL 16-bit tag, NOT a
+       3-bit kind: 8&0x7==0 (RAW), so find_tag intercepts it with a PRE-MASK check before
+       the &0x7 mask. No struct tag can equal 8 (structs are (nslots<<3)|5), and no other
+       kind sets bits above the low 3 except struct -> 8 is collision-free. This gives bytes
+       a distinct identity WITHOUT widening the kind field (the struct slot-count encoding
+       stays untouched). See nova_mem_find_tag's load-bearing pre-mask interception. */
+    NOVA_MEM_BYTES   = 8
 } NovaMemTag;
 
 static int64_t      nova_mem_live    = 0;
@@ -574,6 +581,22 @@ static NovaMemTag nova_mem_find_tag(void* ptr) {
        reject (rc is the int32 at ptr-8). */
     if (((const int32_t*)ptr)[-2] < 1) return (NovaMemTag)-1;
     {
+        /* LOAD-BEARING: bytes carry the full 16-bit tag 8 (NOVA_MEM_BYTES). 8&0x7==0==RAW,
+           so it MUST be intercepted BEFORE the &0x7 mask below, or a NovaBytes{data,size,cap}
+           struct would be misread as a C string (wild read / heap-pointer disclosure). No
+           struct tag equals 8 ((nslots<<3)|5 never == 8), so this is unambiguous. Structural
+           validation is LIST-identical (size@+8, cap@+16): rejects an integer that fakes the
+           magic, same defense as LIST/DICT. A reorder of this below the mask reintroduces the
+           CVE-class wild read. */
+        if (NOVA_RC_TAG(ptr) == NOVA_MEM_BYTES) {
+            if (nova_heap_base) {
+                if ((uintptr_t)((const char*)ptr + 24) > nova_heap_top) return (NovaMemTag)-1;
+                int64_t bsz = ((const int64_t*)ptr)[1];
+                int64_t bcp = ((const int64_t*)ptr)[2];
+                if (bsz < 0 || bcp < bsz || (uint64_t)bcp > (1ULL << 40)) return (NovaMemTag)-1;
+            }
+            return NOVA_MEM_BYTES;
+        }
         /* Mask to the low 3 kind bits: structs pack a slot count above them. */
         NovaMemTag kind = (NovaMemTag)(NOVA_RC_TAG(ptr) & 0x7);
         /* STRUCTURAL VALIDATION — the decisive sound filter against the uniform-i64
@@ -1024,6 +1047,17 @@ typedef struct {
     int64_t  cap;
 } NovaList;
 
+/* Binary byte buffer. Defined HERE (not at the bytes-functions section far below) because
+   find_tag/rc_free/deep_copy/len_any/eq/hash/json/term/any_to_str dispatch on NOVA_MEM_BYTES
+   and access these fields. Same {data,size,cap} layout as NovaList -> shares find_tag's
+   structural validation predicate. */
+typedef struct {
+    uint8_t* data;
+    int64_t  size;
+    int64_t  cap;
+} NovaBytes;
+int64_t nova_rt_bytes_create(int64_t size_val);  /* fwd: deep_copy(BYTES) calls it above its definition */
+
 /* ── Arena-aware backing storage for containers (iter-91) ──────────────────────
    A container's backing array (list->data, dict keys/vals/...) follows the
    container's OWN allocation kind. nova_back_alloc/calloc key off the CURRENTLY
@@ -1313,6 +1347,7 @@ int64_t nova_rt_len_any(int64_t handle) {
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_LIST) return ((NovaList*)ptr)->size;
     if (tag == NOVA_MEM_DICT) return ((NovaDict*)ptr)->size;
+    if (tag == NOVA_MEM_BYTES) return ((NovaBytes*)ptr)->size;  /* true binary length, not strlen on the struct */
     if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN((const char*)ptr);
     return (int64_t)strlen((const char*)ptr);
 }
@@ -1946,6 +1981,11 @@ int64_t nova_rt_contains(int64_t container, int64_t item) {
     if (tag == NOVA_MEM_DICT) {
         return nova_rt_dict_has((int64_t)(uintptr_t)ptr, item);
     }
+    /* Bytes containment is not supported in Stage 0; never strstr the {data,size,cap}
+       struct (wild read). A bytes container, or a bytes item against a string container
+       (needle would be the struct), returns 0 safely. */
+    if (tag == NOVA_MEM_BYTES) return 0;
+    if (nova_mem_find_tag((void*)(uintptr_t)item) == NOVA_MEM_BYTES) return 0;
     // String containment: strstr
     const char* haystack = (const char*)ptr;
     const char* needle = (const char*)(uintptr_t)item;
@@ -2301,6 +2341,19 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
         for (int64_t i = 1; i < nslots; i++)
             dst[i] = nova_deep_copy_rec(src[i], m, depth + 1);
         return (int64_t)(uintptr_t)dst;
+    }
+    if (tag == NOVA_MEM_BYTES) {
+        /* Bytes are MUTABLE, so deep-copy (NOT rc_inc-share like immutable strings):
+           process isolation requires the spawned/channel-sent process own an independent
+           buffer, else bytes_set on one side races/corrupts the other. Fresh struct +
+           memcpy'd data. ATOMIC with the tag flip: if this case is absent, tag 8 falls to
+           the bare `return v` below with NO rc_inc -> sender frees while receiver holds = UAF. */
+        NovaBytes* src = (NovaBytes*)(uintptr_t)v;
+        int64_t dst = nova_rt_bytes_create(src->size);
+        NovaBytes* db = (NovaBytes*)(uintptr_t)dst;
+        if (db && db->data && src->data && src->size > 0)
+            memcpy(db->data, src->data, (size_t)src->size);
+        return dst;
     }
     if (tag == NOVA_MEM_RAW || tag == NOVA_MEM_FAT_STR || tag == NOVA_MEM_CHANNEL || tag == NOVA_MEM_BOX) {
         /* strings + boxed scalars (float/bool) are immutable -> share with a refcount
@@ -3259,6 +3312,15 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
         jbuf_char(b, ']');
         return;
     }
+    if (tag == NOVA_MEM_BYTES) {
+        /* Bytes have no canonical JSON form; emit a diagnostic string showing the length
+           (never strlen the struct). A base64 policy is a later stage. */
+        NovaBytes* bb = (NovaBytes*)ptr;
+        char tmp[48];
+        int n = snprintf(tmp, sizeof(tmp), "\"<bytes:%lld>\"", (long long)bb->size);
+        jbuf_append(b, tmp, (int64_t)n);
+        return;
+    }
     if (tag == NOVA_MEM_RAW) {
         json_stringify_str(b, (const char*)ptr);
         return;
@@ -3418,6 +3480,18 @@ static void term_encode_value(NovaTermBuf* b, int64_t val, int depth) {
         return;
     }
     if (tag == NOVA_MEM_RAW) { ntb_str(b, (const char*)ptr); return; }
+    if (tag == NOVA_MEM_BYTES) {
+        /* Stage 0: encode bytes as a LENGTH-PREFIXED STR term (binary-safe on the wire,
+           content preserved) -- never NOVA_TT_INT (which would corrupt bytes -> the pointer
+           value). The far end reconstructs a string with the same bytes; a dedicated bytes
+           term type with proper round-trip is a later stage. */
+        NovaBytes* bb = (NovaBytes*)ptr;
+        ntb_byte(b, NOVA_TT_STR);
+        ntb_varint(b, (uint64_t)bb->size);
+        ntb_reserve(b, (size_t)bb->size);
+        if (b->buf && bb->size > 0 && bb->data) { memcpy(b->buf + b->len, bb->data, (size_t)bb->size); b->len += (size_t)bb->size; }
+        return;
+    }
     if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
         unsigned char c = *(unsigned char*)ptr;
         if (c == 0 || (c >= 0x20 && c < 0x7F)) { ntb_str(b, (const char*)ptr); return; }
@@ -3523,6 +3597,11 @@ int64_t nova_rt_any_to_str(int64_t val) {
         case NOVA_MEM_DICT:     return nova_rt_json_stringify(val);
         case NOVA_MEM_STRUCT:   return nova_struct_to_str(val);
         case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"<iter>";
+        case NOVA_MEM_BYTES: {
+            NovaBytes* bb = (NovaBytes*)ptr;
+            char tmp[48]; snprintf(tmp, sizeof(tmp), "<bytes:%lld>", (long long)bb->size);
+            return nova_rt_create_string((void*)tmp);
+        }
         case NOVA_MEM_BOX: {
             NovaBox* bx = (NovaBox*)ptr;
             if (bx->kind == NOVA_BOX_BOOL) return nova_rt_create_string((void*)(bx->payload ? "true" : "false"));
@@ -3558,6 +3637,11 @@ int64_t nova_rt_elem_to_str(int64_t val) {
     if (tag == NOVA_MEM_LIST) return nova_rt_list_to_str(val);
     if (tag == NOVA_MEM_DICT) return nova_rt_json_stringify(val);
     if (tag == NOVA_MEM_STRUCT) return nova_struct_to_str(val);
+    if (tag == NOVA_MEM_BYTES) {
+        NovaBytes* bb = (NovaBytes*)ptr;
+        char tmp[48]; snprintf(tmp, sizeof(tmp), "<bytes:%lld>", (long long)bb->size);
+        return nova_rt_create_string((void*)tmp);
+    }
     if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
         unsigned char c = *(unsigned char*)ptr;
         if (c == 0 || (c >= 0x20 && c < 0x7F)) return val;
@@ -3725,6 +3809,8 @@ int64_t nova_rt_add(int64_t a, int64_t b) {
     void* pb = (void*)(uintptr_t)b;
     NovaMemTag ta = nova_mem_find_tag(pa);
     NovaMemTag tb = nova_mem_find_tag(pb);
+    if (ta == NOVA_MEM_BYTES || tb == NOVA_MEM_BYTES)
+        nova_panic("'+' is not defined for bytes (use bytes_concat)");
     int a_is_str = (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
                     ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa)));
     int b_is_str = (tb == NOVA_MEM_RAW || tb == NOVA_MEM_FAT_STR ||
@@ -3747,6 +3833,8 @@ int64_t nova_rt_mul(int64_t a, int64_t b) {
     void* pb = (void*)(uintptr_t)b;
     NovaMemTag ta = nova_mem_find_tag(pa);
     NovaMemTag tb = nova_mem_find_tag(pb);
+    if (ta == NOVA_MEM_BYTES || tb == NOVA_MEM_BYTES)
+        nova_panic("'*' is not defined for bytes");
     int a_is_str = (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
                     ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa)));
     int b_is_str = (tb == NOVA_MEM_RAW || tb == NOVA_MEM_FAT_STR ||
@@ -3835,6 +3923,13 @@ int64_t nova_rt_eq(int64_t a, int64_t b) {
         ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa))) {
         if ((uint64_t)b < 0x10000) return 0;
         return (strcmp((const char*)pa, (const char*)pb) == 0) ? 1 : 0;
+    }
+    if (ta == NOVA_MEM_BYTES && tb == NOVA_MEM_BYTES) {
+        NovaBytes* ba = (NovaBytes*)(uintptr_t)a;
+        NovaBytes* bb = (NovaBytes*)(uintptr_t)b;
+        if (ba->size != bb->size) return 0;
+        if (ba->size == 0) return 1;   /* two empty buffers are equal; avoid memcmp(NULL,...,0) */
+        return (memcmp(ba->data, bb->data, (size_t)ba->size) == 0) ? 1 : 0;
     }
     if (ta == NOVA_MEM_LIST && tb == NOVA_MEM_LIST) {
         NovaList* la = (NovaList*)(uintptr_t)a;
@@ -8070,6 +8165,16 @@ static void nova_rc_free(void* ptr) {
         case NOVA_MEM_FAT_STR:
             free((char*)ptr - NOVA_FAT_HDR_SIZE - NOVA_RC_HDR_SIZE);
             break;
+        case NOVA_MEM_BYTES: {
+            /* Free the separately-calloc'd data buffer FIRST (while the struct is valid),
+               then the struct+header. Closes the prior leak (the default arm freed only the
+               header). Arena-bytes never reach here (rc_dec no-ops arena objects), and Stage-0
+               bytes data is always plain calloc, so an unconditional free(b->data) is correct. */
+            NovaBytes* bb = (NovaBytes*)ptr;
+            if (bb->data) free(bb->data);
+            free((char*)ptr - NOVA_RC_HDR_SIZE);
+            break;
+        }
         case NOVA_MEM_STRUCT: {
             /* A struct/closure owns its fields/captures (W5b transferred ownership;
                make_struct rc_inc's managed field values, deep_copy deep-copies them).
@@ -10498,6 +10603,14 @@ int64_t nova_rt_hash(int64_t val) {
         }
         return (int64_t)h;
     }
+    if (tag == NOVA_MEM_BYTES) {
+        /* Content hash (FNV-1a over the bytes) so equal-content bytes hash equal --
+           consistent with nova_rt_eq's memcmp, required for bytes-as-dict-key correctness. */
+        NovaBytes* bb = (NovaBytes*)ptr;
+        uint64_t h = 14695981039346656037ULL;
+        for (int64_t i = 0; i < bb->size; i++) { h ^= (uint64_t)bb->data[i]; h *= 1099511628211ULL; }
+        return (int64_t)h;
+    }
     /* Structural Value Identity: hash walks the same structure nova_rt_eq compares, so
        equal values always hash equal (the consistency other languages must hand-maintain
        between equals()/hashCode()). List = positional; dict = order-independent (its eq
@@ -11065,22 +11178,23 @@ int64_t nova_rt_tensor_to_list(int64_t t_handle) {
     return list;
 }
 
-/* ── Byte Arrays ───────────────────────────────────────────────────────────── */
-
-typedef struct {
-    uint8_t* data;
-    int64_t size;
-    int64_t cap;
-} NovaBytes;
+/* ── Byte Arrays ───────────────────────────────────────────────────────────────
+   (NovaBytes struct is defined up near NovaList so the value-model dispatch functions
+   above can access its fields.) */
 
 int64_t nova_rt_bytes_create(int64_t size_val) {
     int64_t sz = size_val < 0 ? 0 : size_val;
-    NovaBytes* b = (NovaBytes*)nova_heap_alloc(sizeof(NovaBytes), NOVA_MEM_RAW);
+    /* cap reflects the ACTUAL allocation (>=16 for small buffers). The prior code set
+       cap=16 while calloc'ing only `sz` bytes -> any writer trusting cap overran the heap,
+       and calloc(0,1) could return NULL with cap=16 -> a future append writes into NULL.
+       Now: allocate `cap` bytes, cap==allocation; on OOM, size=cap=0 (never NULL+positive cap). */
+    int64_t cap = sz < 16 ? 16 : sz;
+    NovaBytes* b = (NovaBytes*)nova_heap_alloc(sizeof(NovaBytes), NOVA_MEM_BYTES);
     if (!b) return 0;
-    b->data = (uint8_t*)calloc((size_t)sz, 1);
+    b->data = (uint8_t*)calloc((size_t)cap, 1);
     b->size = sz;
-    b->cap = sz < 16 ? 16 : sz;
-    if (!b->data && sz > 0) { b->data = (uint8_t*)calloc(16, 1); b->size = 0; b->cap = 16; }
+    b->cap = cap;
+    if (!b->data) { b->size = 0; b->cap = 0; }
     return (int64_t)(uintptr_t)b;
 }
 
@@ -13782,6 +13896,7 @@ int64_t nova_rt_type_name(int64_t v) {
             return nova_platform_str("struct");
         }
         case NOVA_MEM_CHANNEL: return nova_platform_str("channel");
+        case NOVA_MEM_BYTES:   return nova_platform_str("bytes");
         case NOVA_MEM_RAW:
         case NOVA_MEM_FAT_STR: return nova_platform_str("string");
         default:               break;
