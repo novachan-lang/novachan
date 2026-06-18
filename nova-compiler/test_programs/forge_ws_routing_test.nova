@@ -1,0 +1,92 @@
+// forge_ws_routing_test -- hardens the WS<->HTTP coexistence + multi-route behavior that the echo/soak
+// tests don't cover: (1) two WS routes on one app each upgrade + echo independently; (2) a WS-upgrade
+// request to a path with NO ws route falls through to normal HTTP dispatch -> 404 (the ws branch must not
+// swallow it); (3) a plain HTTP route on the SAME app still serves normally (the ws_routes table must not
+// perturb HTTP dispatch). Three sequential connections through one serve_req_n(a, port, 3).
+import forge
+
+fn _b(s: string)
+    let n = len(s)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.ws(a, "/echo", fn(c, m) forge.ws_emit_bin(c, m))
+    forge.ws(a, "/chat", fn(c, m) forge.ws_emit(c, "chat:" + bytes_to_str(m)))
+    forge.get(a, "/health", fn(req) forge.resp_text(200, "ok"))
+    forge.serve_req_n(a, port, 4)
+
+fn _read_101(sock)
+    let resp = tcp_recv(sock)
+    while find(resp, "\r\n\r\n") < 0
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            return resp
+        resp = resp + more
+    resp
+
+fn _read_frame(sock)
+    let buf = bytes(0)
+    let guard = 0
+    while guard < 1000
+        guard = guard + 1
+        let fr = forge.ws_try_decode(buf, 0)
+        if fr.status == 1
+            return fr.payload
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return bytes(0)
+        buf = bytes_concat(buf, chunk)
+    bytes(0)
+
+// open a WS connection to `path`, send one masked text message, return the echoed payload string
+fn _ws_roundtrip(port: int, path: string, msg: string) -> string
+    let sock = tcp_connect("127.0.0.1", port)
+    let req = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    tcp_send(sock, req)
+    let r101 = _read_101(sock)
+    if find(r101, "101 Switching Protocols") < 0
+        tcp_close(sock)
+        return "NO-101"
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 1, _b(msg), [9, 7, 5, 3]))
+    let got = bytes_to_str(_read_frame(sock))
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 8, bytes(0), [1, 2, 3, 4]))
+    tcp_close(sock)
+    got
+
+fn main()
+    let port = 19371
+    spawn fn()
+        _server(port)
+    sleep(300)
+
+    // (1) two distinct WS routes on one app, each its own handler
+    let e1 = _ws_roundtrip(port, "/echo", "hi echo")
+    assert(e1 == "hi echo", "/echo route echoes verbatim (got '" + e1 + "')")
+    let e2 = _ws_roundtrip(port, "/chat", "hello")
+    assert(e2 == "chat:hello", "/chat route applies its OWN handler (got '" + e2 + "')")
+    print("PASS: two WS routes dispatch to distinct handlers")
+
+    // (2) a WS upgrade to a path with no ws route -> NOT swallowed -> falls through to HTTP -> 404
+    let s3 = tcp_connect("127.0.0.1", port)
+    tcp_send(s3, "GET /nope HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    let r3 = _read_101(s3)
+    tcp_close(s3)
+    assert(find(r3, "404") >= 0, "WS upgrade to an unregistered path falls through to HTTP 404, not a 101")
+    assert(find(r3, "101 Switching Protocols") < 0, "unregistered-path upgrade must NOT send a 101")
+    print("PASS: WS upgrade to an unknown path -> HTTP 404 fallthrough (ws branch does not swallow it)")
+
+    // (3) a plain HTTP route on the SAME app (which also has ws routes) still serves normally
+    let s4 = tcp_connect("127.0.0.1", port)
+    tcp_send(s4, "GET /health HTTP/1.0\r\n\r\n")
+    let r4 = _read_101(s4)
+    tcp_close(s4)
+    assert(find(r4, "200") >= 0 and find(r4, "ok") >= 0, "plain HTTP route serves 200 alongside ws routes (ws_routes table does not perturb HTTP dispatch)")
+    print("PASS: HTTP route coexists with WS routes on one app")
+
+    print("forge_ws_routing_test passed")
