@@ -1,0 +1,70 @@
+// forge_resp_model_test -- forge.resp_model projects a domain struct through a declared OUTPUT type:
+// only the model's fields are read, so sensitive fields (password_hash) are dropped BY CONSTRUCTION
+// (whitelist, the inverse of DRF exclude). Drift (a model field absent from the source) is fail-closed.
+// HONEST v1 (adversary-vetted, workflow w859mzeuh): FLAT fields only -- a nested struct field serializes
+// WHOLE (nested secret still leaks; documented + asserted below); lists/bytes/computed fields out of scope;
+// the drift guard is RUNTIME fail-closed (500 first time the route returns a mismatch), not build-time.
+import forge
+
+type Prof
+    bio: string
+    ssn: string
+
+type Acct
+    id: int
+    name: string
+    email: string
+    balance: float
+    secret: string
+    profile: Prof
+
+type AcctOut
+    id: int
+    name: string
+    email: string
+    balance: float
+    profile: Prof
+
+type BadOut
+    id: int
+    emial: string
+
+fn main()
+    let p = Prof("hello", "999-SECRET-SSN")
+    let acct = Acct(7, "ada", "ada@x.io", 100.0, "HASH_SECRET", p)
+
+    // 1. FLAT secret dropped by construction; declared fields kept.
+    let r = forge.resp_model(200, acct, AcctOut(0, "", "", 0.0, Prof("", "")))
+    assert(forge.status_of(r) == 200, "resp_model -> 200")
+    let proj = forge.body_of(r)
+    assert(find(proj, "HASH_SECRET") < 0, "flat secret dropped by construction")
+    assert(find(proj, "ada@x.io") >= 0, "declared field email present")
+    assert(find(proj, "ada") >= 0, "declared field name present")
+    print("PASS: flat secret dropped, declared fields kept")
+
+    // 2. ZERO-REGRESSION baseline: plain resp_json serializes the FULL struct (secret present).
+    let whole = forge.body_of(forge.resp_json(200, acct))
+    assert(find(whole, "HASH_SECRET") >= 0, "plain resp_json leaks full struct (baseline unchanged)")
+    print("PASS: plain path unchanged (full struct); resp_model strictly narrower")
+
+    // 3. FLOAT: struct-path (resp_json) and dict-path (resp_model) render the integral float identically.
+    //    Both use %.15g -> 100.0 prints as "100" with NO ".0" -> the projection dict path cannot diverge.
+    assert(find(whole, "100") >= 0, "struct-path renders balance 100.0 as 100")
+    assert(find(proj, "100") >= 0, "dict-path renders balance 100.0 as 100")
+    assert(find(proj, "100.0") < 0, "dict-path adds no .0 -- matches struct-path")
+    print("PASS: float renders identically via struct-path and dict-path")
+
+    // 4. DRIFT fail-closed: a model field absent from the source -> generic 500, never echoes the struct.
+    let bad = forge.resp_model(200, acct, BadOut(0, ""))
+    assert(forge.status_of(bad) == 500, "drift -> fail-closed 500")
+    let berr = forge.body_of(bad)
+    assert(find(berr, "HASH_SECRET") < 0, "error path does not echo raw struct")
+    assert(find(berr, "ada@x.io") < 0, "error path does not echo source data")
+    print("PASS: drift -> fail-closed 500 (no raw struct echoed)")
+
+    // 5. KNOWN v1 GAP (documented): a NESTED struct model field serializes WHOLE -> nested secret LEAKS.
+    //    Asserted PRESENT so the gap is explicit until deep projection lands (not silently sold as covered).
+    assert(find(proj, "999-SECRET-SSN") >= 0, "DOCUMENTED v1 GAP: nested field not re-projected (ssn present)")
+    print("PASS: nested-not-projected gap documented (ssn present, as expected in v1)")
+
+    print("forge_resp_model_test passed")

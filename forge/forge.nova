@@ -895,6 +895,59 @@ type ErrorBody
 fn resp_error(status: int, msg: string) -> Response
     resp_json(status, ErrorBody(msg))
 
+// ── Typed response projection (drop sensitive fields BY CONSTRUCTION) ─────────────────────────────────
+// resp_model(status, value, model_sample) serializes `value` through a developer-declared OUTPUT type:
+// only the fields named by the model are read, everything else (password_hash, internal_id, is_admin) is
+// NEVER read -> cannot reach the wire. This is a WHITELIST (the inverse of DRF exclude=[...]): you say what
+// MAY be exposed, not what to hide, so a newly-added secret field defaults to hidden. The model is an
+// ordinary NOVA struct; pass a zero-value sample (as the OpenAPI doc routes already do) to carry its type.
+//
+// HONEST SCOPE (v1, designed + adversary-reviewed -- see [[project-forge-openapi-design]] sibling notes):
+//  - FLAT fields only. A model field that is itself a STRUCT serializes WHOLE (its own fields are NOT
+//    re-projected) -> a NESTED secret still leaks. Deep projection is a tracked follow-up.
+//  - SINGLE value only. A list<struct> return is NOT projected here; call resp_model per item, or a plain
+//    `return value` still serializes the full struct (UNPROJECTED). resp_model protects ONLY what you hand
+//    it -- there is no automatic interception, so do not assume bulk/list endpoints are covered.
+//  - A `bytes` field would mis-serialize (json_stringify has no bytes case) -- models must be scalar/string.
+//  - COMPUTED output fields (a field on the model but not on the source) are rejected as drift (see below);
+//    v1 projection is strictly a SUBSET of the source struct's real fields.
+//  - The drift guard is RUNTIME and fail-closed (a 500 the first time that route returns a mismatched
+//    struct), NOT a build-time/startup check. A true compile-time guarantee needs the Path-C compiler hook.
+
+// Copy ONLY the model's declared fields out of the domain value into a fresh dict (the whitelist). Returns
+// a dict because NOVA has no generic runtime struct constructor; json_stringify renders a dict as a JSON
+// object identically to a struct, so the wire bytes match a hand-written DTO minus the dropped fields.
+fn _project(value, model_sample)
+    let out = {}
+    let names = field_names(model_sample)
+    let i = 0
+    while i < len(names)
+        let nm = names[i]
+        out[nm] = field_get(value, nm)
+        i = i + 1
+    out
+
+// Drift defense (opposite of the leak defense): every model field MUST exist on the source struct. A model
+// field the source lacks (typo / renamed / computed) is a hard error -- caught, never silently nulled.
+// The message names only the developer's own MODEL field (not the source type) so logging it leaks nothing.
+fn _model_check(value, model_sample)
+    let src = field_names(value)
+    let want = field_names(model_sample)
+    let i = 0
+    while i < len(want)
+        let nm = want[i]
+        if not contains(src, nm)
+            return err("response model field not present on returned value: " + nm)
+        i = i + 1
+    ok(value)
+
+// Public: project `value` through the model type and emit JSON. Fail-closed on drift (generic 500, never
+// echoes the raw struct). Mirrors resp_json with the model interposed; zero overhead for routes not using it.
+fn resp_model(status: int, value, model_sample) -> Response
+    if is_err(_model_check(value, model_sample))
+        return resp_error(500, "response model mismatch")
+    resp_json(status, _project(value, model_sample))
+
 // Register a custom 404 handler: on_not_found(app, fn(req) -> Response|value). Used when no route
 // matches (after static). Lets an app return a branded 404 page or a JSON error.
 fn on_not_found(a, handler)

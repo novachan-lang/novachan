@@ -169,6 +169,7 @@ $domain_tests = @(
     'forge_validate_test',
     'forge_validate_typed_test',
     'forge_openapi_test',
+    'forge_resp_model_test',
     'forge_redirect_query_test',
     'forge_pctdecode_test',
     'forge_form_test',
