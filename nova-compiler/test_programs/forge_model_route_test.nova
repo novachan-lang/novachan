@@ -1,0 +1,82 @@
+// forge_model_route_test -- doc<->body no-drift binding (increment 2). A *_doc route that declared a
+// response model (resp_s in slot[4]) auto-projects a BARE-STRUCT handler return through that SAME sample
+// at the dispatch site -- so the wire body and the OpenAPI 200 schema come from ONE declaration (no drift,
+// no closure, no compiler hook). A Response/string return passes through unprojected (handler opt-out); a
+// PLAIN route is byte-identical to before (zero-overhead). Validated through dispatch_test AND a real
+// serve_req_n socket round-trip (the per-connection sched_spawn deep-copies the app+rt[4]; projection runs
+// inside the per-request arena -- the project's #1 corruption surface, so proven empirically not asserted).
+import forge
+
+type Prof
+    bio: string
+    ssn: string
+
+type Acct
+    id: int
+    name: string
+    email: string
+    balance: float
+    secret: string
+    profile: Prof
+
+type AcctOut
+    id: int
+    name: string
+    email: string
+
+fn _acct(req)
+    Acct(7, "ada", "ada@x.io", 100.0, "HASH_SECRET", Prof("hi", "NESTED_SSN"))
+
+fn _model_server(port: int)
+    let a = forge.app()
+    forge.get_doc(a, "/me", fn(req) _acct(req), AcctOut(0, "", ""))
+    forge.serve_req_n(a, port, 1)
+
+fn main()
+    // 1. doc route + BARE struct return -> dispatch auto-projects through the declared model.
+    let a = forge.app()
+    forge.get_doc(a, "/me", fn(req) _acct(req), AcctOut(0, "", ""))
+    let r = forge.dispatch_test(a, forge.mock_request("GET", "/me", ""))
+    assert(forge.status_of(r) == 200, "doc route -> 200")
+    let b1 = forge.body_of(r)
+    assert(find(b1, "HASH_SECRET") < 0, "dispatch-site projection drops the flat secret")
+    assert(find(b1, "NESTED_SSN") < 0, "non-model fields (incl nested struct) fully dropped")
+    assert(find(b1, "ada@x.io") >= 0, "declared field present")
+    print("PASS: doc route bare-struct return auto-projected at dispatch site")
+
+    // NO-DRIFT: the OpenAPI 200 schema for /me is generated from the SAME AcctOut sample (slot[4]) that
+    // drives the wire body -> docs and body cannot disagree. The dropped field appears in NEITHER.
+    let info = {}
+    info["title"] = "T"
+    info["version"] = "1"
+    let spec = forge.body_of(forge.resp_json(200, forge.openapi(a, info)))
+    assert(find(spec, "AcctOut") >= 0, "200 schema documents AcctOut")
+    assert(find(spec, "email") >= 0, "doc lists the declared field email")
+    assert(find(spec, "secret") < 0, "doc omits the dropped field -- docs match the projected body")
+    print("PASS: docs and body bound to ONE sample (no-drift: secret in neither)")
+
+    // 2. doc route + RESPONSE return -> passthrough (handler took control; explicit opt-out).
+    let a2 = forge.app()
+    forge.get_doc(a2, "/raw", fn(req) forge.resp_json(200, _acct(req)), AcctOut(0, "", ""))
+    let r2 = forge.dispatch_test(a2, forge.mock_request("GET", "/raw", ""))
+    assert(find(forge.body_of(r2), "HASH_SECRET") >= 0, "explicit Response is NOT projected (opt-out)")
+    print("PASS: explicit Response return passes through unprojected (opt-out)")
+
+    // 3. PLAIN route (3-tuple) + bare struct -> _coerce unchanged (zero-regression).
+    let a3 = forge.app()
+    forge.get(a3, "/plain", fn(req) _acct(req))
+    let r3 = forge.dispatch_test(a3, forge.mock_request("GET", "/plain", ""))
+    assert(find(forge.body_of(r3), "HASH_SECRET") >= 0, "plain route serializes full struct (no regression)")
+    print("PASS: plain route unchanged (full struct, zero-regression)")
+
+    // 4. REAL serve_req_n round-trip: projection survives the per-connection spawn deep-copy + arena.
+    let port = 18931
+    spawn fn()
+        _model_server(port)
+    sleep(300)
+    let got = http_get("http://127.0.0.1:" + str(port) + "/me")
+    assert(find(got, "ada@x.io") >= 0, "round-trip: declared field present over socket")
+    assert(find(got, "HASH_SECRET") < 0, "round-trip: secret dropped through spawn deep-copy + arena")
+    print("PASS: serve_req_n round-trip projects (secret dropped over a real socket, arena-safe)")
+
+    print("forge_model_route_test passed")
