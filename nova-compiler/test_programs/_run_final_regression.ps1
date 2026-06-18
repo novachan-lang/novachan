@@ -147,6 +147,7 @@ $domain_tests = @(
     'jsonfloat_rt_test',
     'structser_test',
     'rtti_json_test',
+    'rtti_any_test',
     'rtti_show_test',
     'forge_keystone_test',
     'cross_import_extern_test',

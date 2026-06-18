@@ -3611,6 +3611,68 @@ static int64_t nova_struct_to_str(int64_t val) {
     return (int64_t)(uintptr_t)result;
 }
 
+/* ── Reflection through Any: field_names / field_types / field_get on a struct value erased to Any
+   (forge cross-module introspection of an app-defined struct). Statically-typed callers take the
+   compile-time <T>__field_* path and never reach here. SOUNDNESS: tag-guard (reject non-struct / wild
+   pointers) before any slot read; CLAMP the walk to the physical slot count (NOVA_STRUCT_NSLOTS-1) so a
+   DJB2 type-name-hash collision can never over-read (matches deep_copy/== discipline); a metadata miss
+   (repr-C / closure / unregistered) yields empty list / null without dereferencing; raw float/bool field
+   slots are boxed so the Any result round-trips (mirrors nova_struct_to_str / json_stringify_value). */
+static int nova_rt_is_struct_value(int64_t val) {
+    if ((uint64_t)val <= 0x10000ULL) return 0;
+    return nova_mem_find_tag((void*)(uintptr_t)val) == NOVA_MEM_STRUCT;
+}
+static int nova_rt_field_count(int64_t val, int64_t h) {
+    int phys = (int)(NOVA_STRUCT_NSLOTS((void*)(uintptr_t)val) - 1);
+    if (phys < 0) phys = 0;
+    int fc = nova_struct_meta_fcount(h);
+    if (fc > phys) fc = phys;   /* hash-collision / layout skew -> under-read, never out-of-bounds */
+    return fc;
+}
+int64_t nova_rt_field_names(int64_t val) {
+    int64_t lst = nova_rt_list_create();
+    if (!nova_rt_is_struct_value(val)) return lst;
+    int64_t h = ((const int64_t*)(uintptr_t)val)[0];
+    int fc = nova_rt_field_count(val, h);
+    for (int i = 0; i < fc; i++) {
+        const char* fn = nova_struct_meta_fname(h, i);
+        nova_rt_list_append(lst, nova_rt_create_string((void*)(fn ? fn : "")));
+    }
+    return lst;
+}
+int64_t nova_rt_field_types(int64_t val) {
+    int64_t lst = nova_rt_list_create();
+    if (!nova_rt_is_struct_value(val)) return lst;
+    int64_t h = ((const int64_t*)(uintptr_t)val)[0];
+    int fc = nova_rt_field_count(val, h);
+    for (int i = 0; i < fc; i++) {
+        const char* ft = nova_struct_meta_ftype(h, i);
+        nova_rt_list_append(lst, nova_rt_create_string((void*)(ft ? ft : "")));
+    }
+    return lst;
+}
+int64_t nova_rt_field_get(int64_t val, int64_t name) {
+    if (!nova_rt_is_struct_value(val)) return 0;          /* null */
+    if ((uint64_t)name <= 0x10000ULL) return 0;
+    const char* want = (const char*)(uintptr_t)name;      /* NOVA string: NUL-terminated */
+    int64_t h = ((const int64_t*)(uintptr_t)val)[0];
+    int fc = nova_rt_field_count(val, h);
+    const int64_t* slots = (const int64_t*)(uintptr_t)val;
+    for (int i = 0; i < fc; i++) {
+        const char* fn = nova_struct_meta_fname(h, i);
+        if (fn && strcmp(want, fn) == 0) {
+            int64_t fv = slots[i + 1];                    /* slot 0 = type hash */
+            const char* ft = nova_struct_meta_ftype(h, i);
+            if (ft && strcmp(ft, "float") == 0 && nova_mem_find_tag((void*)(uintptr_t)fv) != NOVA_MEM_BOX)
+                return nova_rt_box_float(fv);
+            if (ft && strcmp(ft, "bool") == 0 && nova_mem_find_tag((void*)(uintptr_t)fv) != NOVA_MEM_BOX)
+                return nova_rt_box_bool(fv);
+            return fv;                                    /* int/string/struct/list/dict/boxed pass through */
+        }
+    }
+    return 0;                                             /* unknown field -> null */
+}
+
 int64_t nova_rt_str_concat_safe(int64_t a, int64_t b) {
     if (a == 0 && b == 0) {
         char* r = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(r) r[0] = '\0';
