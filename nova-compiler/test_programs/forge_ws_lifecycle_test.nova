@@ -1,0 +1,103 @@
+// forge_ws_lifecycle_test -- WS room presence hooks (forge.ws_room_ex). on_join fires when a client joins
+// (its broadcast reaches the joiner too), on_msg per message, on_leave when it disconnects (reaching the
+// rest of the room). Two clients verify: A sees its own JOIN, its MSG echo, B's JOIN, and B's LEAVE.
+// NOTE: the on_join frame is sent immediately after the 101 and can COALESCE with it in one TCP read, so
+// the client buffers post-handshake bytes (a real WS client does the same) -- conn = [sock, buffer].
+import forge
+
+fn _b(s: string)
+    let n = len(s)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+fn _join(ws, hub)
+    forge.room_say(hub, "JOIN")
+
+fn _msg(ws, msg, hub)
+    forge.room_say(hub, "MSG:" + bytes_to_str(msg))
+
+fn _leave(ws, hub)
+    forge.room_say(hub, "LEAVE")
+
+fn _server(port: int)
+    let a = forge.app()
+    let h = forge.hub()
+    forge.ws_room_ex(a, "/room", h, fn(ws, hub) _join(ws, hub), fn(ws, msg, hub) _msg(ws, msg, hub), fn(ws, hub) _leave(ws, hub))
+    forge.serve_req_n(a, port, 2)
+
+// scan a bytes buffer for \r\n\r\n; return the offset of the first \r, or -1
+fn _crlf2(buf) -> int
+    let i = 0
+    let n = bytes_len(buf)
+    while i + 3 < n
+        if bytes_get(buf, i) == 13 and bytes_get(buf, i + 1) == 10 and bytes_get(buf, i + 2) == 13 and bytes_get(buf, i + 3) == 10
+            return i
+        i = i + 1
+    0 - 1
+
+// open a WS connection; return [sock, leftover_bytes] where leftover is any frame bytes that arrived
+// coalesced with the 101 handshake response (so the first on_join frame is not lost).
+fn _conn_open(port: int)
+    let sock = tcp_connect("127.0.0.1", port)
+    tcp_send(sock, "GET /room HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    let buf = bytes(0)
+    let sep = 0 - 1
+    while sep < 0
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return [sock, bytes(0)]
+        buf = bytes_concat(buf, chunk)
+        sep = _crlf2(buf)
+    [sock, bytes_slice(buf, sep + 4, bytes_len(buf))]
+
+// read one WS frame from a buffered connection [sock, buf]; consumes the frame from the buffer, reads more
+// as needed. Returns the payload text ("" on close/EOF).
+fn _read_frame(conn)
+    let sock = conn[0]
+    let guard = 0
+    while guard < 1000
+        guard = guard + 1
+        let fr = forge.ws_try_decode(conn[1], 0)
+        if fr.status == 1
+            conn[1] = bytes_slice(conn[1], fr.consumed, bytes_len(conn[1]))
+            return bytes_to_str(fr.payload)
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return ""
+        conn[1] = bytes_concat(conn[1], chunk)
+    ""
+
+fn main()
+    let port = 19414
+    spawn fn()
+        _server(port)
+    sleep(300)
+
+    // A joins -> A receives its own JOIN
+    let ca = _conn_open(port)
+    assert(_read_frame(ca) == "JOIN", "A receives its own JOIN (on_join fired)")
+    // A sends a message -> A receives the echo
+    tcp_send_bytes(ca[0], forge.ws_encode_frame(1, 1, _b("hi"), [1, 2, 3, 4]))
+    assert(_read_frame(ca) == "MSG:hi", "on_msg broadcast A's message")
+    print("PASS: on_join + on_msg")
+
+    // B joins -> both A and B receive a JOIN
+    sleep(100)
+    let cb = _conn_open(port)
+    assert(_read_frame(cb) == "JOIN", "B receives its own JOIN")
+    assert(_read_frame(ca) == "JOIN", "A is notified of B joining")
+    print("PASS: join broadcast reaches the existing room member")
+
+    // B leaves -> A receives a LEAVE
+    tcp_send_bytes(cb[0], forge.ws_encode_frame(1, 8, bytes(0), [1, 2, 3, 4]))
+    tcp_close(cb[0])
+    assert(_read_frame(ca) == "LEAVE", "A is notified of B leaving (on_leave fired)")
+    print("PASS: on_leave broadcast reaches the remaining room member")
+
+    tcp_send_bytes(ca[0], forge.ws_encode_frame(1, 8, bytes(0), [1, 2, 3, 4]))
+    tcp_close(ca[0])
+    print("forge_ws_lifecycle_test passed")

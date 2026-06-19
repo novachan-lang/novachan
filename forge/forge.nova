@@ -884,6 +884,17 @@ fn ws_room(a, pattern: string, hub, handler)
     push(routes, [pattern, handler, hub])
     a["ws_routes"] = routes
 
+// A room route WITH lifecycle hooks for presence: on_join(ws, hub) fires when a client joins (e.g.
+// room_say(hub, "* a user joined *")), on_msg(ws, msg, hub) per message, on_leave(ws, hub) when it
+// disconnects. The join broadcast reaches the joiner too; the leave broadcast reaches the rest of the room.
+// Route = [pattern, on_msg, hub, on_join, on_leave] (length 5 selects the hook path in _ws_run_room).
+fn ws_room_ex(a, pattern: string, hub, on_join, on_msg, on_leave)
+    let routes = []
+    if contains(a, "ws_routes")
+        routes = a["ws_routes"]
+    push(routes, [pattern, on_msg, hub, on_join, on_leave])
+    a["ws_routes"] = routes
+
 // Find the route ([pattern,handler] or [pattern,handler,hub]) for a ws-upgrade request, or [] if none.
 fn _ws_lookup(a, req: Request) -> list
     if not ws_is_upgrade(req)
@@ -1083,8 +1094,8 @@ fn _ws_finish(ws: Ws)
 // Single owner of the fd close. The msg is valid ONLY during the handler call (arena-scoped); to retain
 // it, send it on a channel (deep-copied) or emit it immediately.
 fn _ws_run(conn: int, route, ka: int)
-    // route of length 3 = a broadcast/room route [pattern, handler, hub] -> the dual-task room runner.
-    if len(route) == 3
+    // route of length 3 ([pattern,handler,hub]) OR 5 ([pattern,on_msg,hub,on_join,on_leave]) = a room route.
+    if len(route) >= 3
         _ws_run_room(conn, route, ka)
         return
     let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0, ka, 0)
@@ -1125,15 +1136,28 @@ fn _ws_run_room(conn: int, route, ka: int)
     let outbound = channel_bounded(256)
     let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0)
     let handler = route[1]
+    let has_hooks = len(route) >= 5
     hub_sub(hub, conn, outbound)
     spawn fn()
         _ws_writer(conn, outbound)
+    // lifecycle: on_join fires AFTER subscribe + writer spawn (so its broadcast reaches this client too)
+    if has_hooks
+        let pj = arena_enter()
+        let on_join = route[3]
+        on_join(ws, hub)
+        arena_exit(pj)
     while ws.open == 1
         let prev = arena_enter()
         let msg = _ws_read_message(ws)
         if ws.open == 1
             handler(ws, msg, hub)
         arena_exit(prev)
+    // lifecycle: on_leave fires while still subscribed (its broadcast reaches the rest of the room)
+    if has_hooks
+        let pl = arena_enter()
+        let on_leave = route[4]
+        on_leave(ws, hub)
+        arena_exit(pl)
     // disconnect: stop receiving broadcasts, then tell the writer to flush + close the socket (single owner)
     hub_unsub(hub, conn)
     send(outbound, [0 - 1, 0])
