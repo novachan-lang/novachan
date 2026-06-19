@@ -4181,8 +4181,18 @@ static int64_t channel_dequeue(NovaChannel* ch) {
 int64_t nova_rt_channel_send(int64_t handle, int64_t value) {
     NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
     /* Ownership: the receiver gets an independent deep copy, so sender and
-       receiver never share mutable heap state across the process boundary. */
+       receiver never share mutable heap state across the process boundary.
+       The copy is an ownership TRANSFER that outlives the sender's scope, so it
+       MUST land in the RC heap, NOT the sender's active per-message/request arena
+       (which is freed at arena_exit -> the enqueued copy would dangle, a UAF read
+       by the receiver). Clear active_arena around the deep copy so it is rc=1 heap
+       memory the receiver owns and rc_dec frees. (No-op when no arena is active;
+       deep-copy of a non-heap scalar like an int allocates nothing either way.) */
+    NovaTaskState* _cs_t = nova_cur();
+    NovaArena* _cs_saved = _cs_t->active_arena;
+    _cs_t->active_arena = NULL;
     int64_t copy = nova_rt_deep_copy(value);
+    _cs_t->active_arena = _cs_saved;
     /* Stage 2a (F3): a green task sending to a FULL bounded channel PARKS
        (yields to the carrier) instead of blocking the OS thread; a receiver's
        dequeue unparks it. */

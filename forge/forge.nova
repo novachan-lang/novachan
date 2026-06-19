@@ -831,6 +831,7 @@ type Ws
     buf: any
     blen: int
     closed: int
+    outbound: any
 
 fn _ws_bufcap() -> int
     262144
@@ -857,7 +858,18 @@ fn ws(a, pattern: string, handler)
     push(routes, [pattern, handler])
     a["ws_routes"] = routes
 
-// Find the [pattern, handler] for a ws-upgrade request, or [] if none. The returned route is non-arena.
+// Register a BROADCAST/room WebSocket route bound to a `hub` (forge.hub()). handler: fn(ws, msg, hub),
+// called per inbound message -- typically calls room_say(hub, ...) to fan a message out to EVERY connection
+// on that hub. The framework runs the dual-task model (reader + single writer) and auto-subscribes /
+// unsubscribes the connection. A 3-element route [pattern, handler, hub] selects _ws_run_room.
+fn ws_room(a, pattern: string, hub, handler)
+    let routes = []
+    if contains(a, "ws_routes")
+        routes = a["ws_routes"]
+    push(routes, [pattern, handler, hub])
+    a["ws_routes"] = routes
+
+// Find the route ([pattern,handler] or [pattern,handler,hub]) for a ws-upgrade request, or [] if none.
 fn _ws_lookup(a, req: Request) -> list
     if not ws_is_upgrade(req)
         return []
@@ -926,8 +938,15 @@ fn _ws_next_frame(ws: Ws) -> WsFrame
         _ws_consume(ws, fr.consumed)
     fr
 
-// Send a server frame (FIN, unmasked per RFC) over the green-aware tcp_send_bytes.
+// Send a server frame (FIN, unmasked per RFC). In room/broadcast mode (ws.outbound set) ALL writes are
+// routed to the single writer task via the outbound channel -- the SOLE socket writer -- so concurrent
+// broadcasts and the reader's own pong/close frames can never interleave on the wire (the single-writer
+// rule). channel send deep-copies, so routing an arena-scoped payload to the writer is sound. In basic
+// mode (outbound==0) the reader writes the socket directly.
 fn _ws_send_frame(ws: Ws, opcode: int, payload) -> int
+    if ws.outbound != 0
+        send(ws.outbound, [opcode, payload])
+        return 0
     tcp_send_bytes(ws.fd, ws_encode_frame(1, opcode, payload, []))
 
 // Send a Close frame with a 2-byte status code (idempotent: only the first call sends).
@@ -1033,7 +1052,11 @@ fn _ws_finish(ws: Ws)
 // Single owner of the fd close. The msg is valid ONLY during the handler call (arena-scoped); to retain
 // it, send it on a channel (deep-copied) or emit it immediately.
 fn _ws_run(conn: int, route)
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0)
+    // route of length 3 = a broadcast/room route [pattern, handler, hub] -> the dual-task room runner.
+    if len(route) == 3
+        _ws_run_room(conn, route)
+        return
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0)
     let handler = route[1]
     while ws.open == 1
         let prev = arena_enter()
@@ -1042,6 +1065,52 @@ fn _ws_run(conn: int, route)
             handler(ws, msg)
         arena_exit(prev)
     _ws_finish(ws)
+
+// ── WebSocket broadcast / rooms (dual-task fan-out) ─────────────────────────────────────────────────
+// The single writer task for a connection: the SOLE socket writer. It drains the outbound channel (fed by
+// the hub's broadcasts AND the reader's routed pong/close frames) and writes each as a WS frame. An item is
+// [opcode, payload] (opcode 1 text / 2 binary / 8 close / 10 pong), or [-1, 0] = stop -> close the fd once.
+fn _ws_writer(fd: int, outbound)
+    let running = true
+    while running
+        let item = recv(outbound)
+        if item[0] == (0 - 1)
+            running = false
+        else
+            let prev = arena_enter()
+            tcp_send_bytes(fd, ws_encode_frame(1, item[0], item[1], []))
+            arena_exit(prev)
+    tcp_close(fd)
+
+// Room runner: a per-connection READER (this task) + a spawned WRITER, joined by the hub. The reader reads
+// frames and calls handler(ws, msg, hub) (which typically broadcasts via hub_pub); every outbound frame is
+// routed through ws.outbound to the single writer (no interleaving). On disconnect: unsubscribe from the
+// hub and stop the writer (which owns the fd close). route = [pattern, handler, hub].
+fn _ws_run_room(conn: int, route)
+    let hub = route[2]
+    let outbound = channel()
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound)
+    let handler = route[1]
+    hub_sub(hub, conn, outbound)
+    spawn fn()
+        _ws_writer(conn, outbound)
+    while ws.open == 1
+        let prev = arena_enter()
+        let msg = _ws_read_message(ws)
+        if ws.open == 1
+            handler(ws, msg, hub)
+        arena_exit(prev)
+    // disconnect: stop receiving broadcasts, then tell the writer to flush + close the socket (single owner)
+    hub_unsub(hub, conn)
+    send(outbound, [0 - 1, 0])
+
+// Broadcast a TEXT message to every subscriber of `hub` (each connection's writer sends it as a text frame).
+fn room_say(hub, text: string)
+    hub_pub(hub, [1, str_to_bytes(text)])
+
+// Broadcast BINARY bytes to every subscriber of `hub`.
+fn room_say_bin(hub, data)
+    hub_pub(hub, [2, data])
 
 // ── Pub/sub hub ─────────────────────────────────────────────────────────────────────────────────────
 // A general fan-out hub: a daemon green task owns a registry of subscriber channels (NOT shared memory --
@@ -3023,7 +3092,7 @@ fn _serve_conn(conn: int, a, safe: int)
             // (Regime A -> B: the long frame loop runs with active_arena==NULL), hand the socket to the
             // frame loop, and RETURN -- _ws_run is the SOLE owner of tcp_close (never fall through).
             let route = _ws_lookup(a, req)
-            if len(route) == 2
+            if len(route) >= 2
                 if ws_handshake(conn, req) == 1
                     arena_exit(prev)
                     _ws_run(conn, route)

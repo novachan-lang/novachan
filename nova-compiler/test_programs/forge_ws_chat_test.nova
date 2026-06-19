@@ -1,0 +1,82 @@
+// forge_ws_chat_test -- real-time WebSocket BROADCAST (the Phoenix-style chat). One app, a forge.hub(),
+// and ws_room("/chat", hub, handler). Two clients connect; when one sends a message the handler broadcasts
+// it via the hub, and BOTH clients receive it -- each connection's dual-task (reader + single writer) fans
+// the hub message out to the live socket. This is NOVA's "channels across ALL boundaries" end to end:
+// a NOVA channel (the hub) drives messages to multiple live browser-style sockets.
+import forge
+
+fn _b(s: string)
+    let n = len(s)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+fn _chat(ws, msg, hub)
+    forge.room_say(hub, "msg:" + bytes_to_str(msg))
+
+fn _server(port: int)
+    let a = forge.app()
+    let h = forge.hub()
+    forge.ws_room(a, "/chat", h, fn(ws, msg, hub) _chat(ws, msg, hub))
+    forge.serve_req_n(a, port, 2)
+
+fn _ws_connect(port: int, path: string)
+    let sock = tcp_connect("127.0.0.1", port)
+    tcp_send(sock, "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    let resp = tcp_recv(sock)
+    while find(resp, "\r\n\r\n") < 0
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            return sock
+        resp = resp + more
+    sock
+
+fn _read_frame(sock)
+    let buf = bytes(0)
+    let guard = 0
+    while guard < 1000
+        guard = guard + 1
+        let fr = forge.ws_try_decode(buf, 0)
+        if fr.status == 1
+            return fr.payload
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return bytes(0)
+        buf = bytes_concat(buf, chunk)
+    bytes(0)
+
+fn main()
+    let port = 19377
+    spawn fn()
+        _server(port)
+    sleep(300)
+
+    let c1 = _ws_connect(port, "/chat")
+    let c2 = _ws_connect(port, "/chat")
+    sleep(150)   // let BOTH connections subscribe to the hub before anyone publishes
+
+    // client 1 sends a chat message; the handler broadcasts it to the whole room
+    tcp_send_bytes(c1, forge.ws_encode_frame(1, 1, _b("hello room"), [11, 22, 33, 44]))
+    let r1 = _read_frame(c1)
+    let r2 = _read_frame(c2)
+    assert(bytes_to_str(r1) == "msg:hello room", "client 1 (sender) received the broadcast (got '" + bytes_to_str(r1) + "')")
+    assert(bytes_to_str(r2) == "msg:hello room", "client 2 received the broadcast (got '" + bytes_to_str(r2) + "')")
+    print("PASS: a message from one client broadcast to BOTH clients in the room")
+
+    // a second message, this time from client 2 -> both receive it too
+    tcp_send_bytes(c2, forge.ws_encode_frame(1, 1, _b("hi back"), [5, 6, 7, 8]))
+    let s1 = _read_frame(c1)
+    let s2 = _read_frame(c2)
+    assert(bytes_to_str(s1) == "msg:hi back", "client 1 received client 2's message")
+    assert(bytes_to_str(s2) == "msg:hi back", "client 2 (sender) received its own broadcast")
+    print("PASS: bidirectional broadcast (either client's message reaches the whole room)")
+
+    // close both connections (each writer task owns its socket close)
+    tcp_send_bytes(c1, forge.ws_encode_frame(1, 8, bytes(0), [1, 2, 3, 4]))
+    tcp_close(c1)
+    tcp_send_bytes(c2, forge.ws_encode_frame(1, 8, bytes(0), [1, 2, 3, 4]))
+    tcp_close(c2)
+    print("forge_ws_chat_test passed")
