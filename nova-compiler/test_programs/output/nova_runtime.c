@@ -10,6 +10,11 @@
 #include <setjmp.h>
 
 #ifdef _WIN32
+/* Raise the Winsock select() fd cap from the default 64 BEFORE winsock2.h is included (the Windows
+   fd_set is a struct { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; }, not a bitmap, so this just works).
+   Lifts the concurrent-socket cap (e.g. long-lived WebSocket/SSE connections) from 64 to 4096. The netpoller
+   poll loop runs on the carrier's OS-thread stack (not a 32KB fiber), so the larger fd_set is safe. */
+#define FD_SETSIZE 4096
 #include <io.h>
 #include <fcntl.h>
 #include <winsock2.h>
