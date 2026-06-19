@@ -1115,6 +1115,59 @@ fn room_say(hub, text: string)
 fn room_say_bin(hub, data)
     hub_pub(hub, [2, data])
 
+// ── Server-Sent Events (SSE) ────────────────────────────────────────────────────────────────────────
+// HTTP server->client streaming (live dashboards / notifications), powered by the SAME pub/sub hub. A GET
+// to an sse route becomes a long-lived text/event-stream: the connection subscribes to the hub and writes
+// every published STRING as "data: <msg>\n\n". Simpler than WebSockets (no handshake/framing, one-way), no
+// new protocol. NOTE: give SSE its own hub (it publishes plain strings; ws_room publishes [opcode,bytes]).
+// Register an SSE endpoint bound to `hub`. publish with sse_send(hub, text).
+fn sse(a, pattern: string, hub)
+    let routes = []
+    if contains(a, "sse_routes")
+        routes = a["sse_routes"]
+    push(routes, [pattern, hub])
+    a["sse_routes"] = routes
+
+// Find the [pattern, hub] for a GET matching an sse route, or [] if none. Returned route is non-arena.
+fn _sse_lookup(a, req: Request) -> list
+    if req.method != "GET"
+        return []
+    if not contains(a, "sse_routes")
+        return []
+    let routes = a["sse_routes"]
+    let i = 0
+    while i < len(routes)
+        let rt = routes[i]
+        if is_ok(_fr_match(rt[0], req.path))
+            return rt
+        i = i + 1
+    []
+
+// Run an SSE stream: send the event-stream headers, subscribe to the hub, then stream each published string
+// as an SSE event. The sole socket writer (server->client only). PRECONDITION: active_arena == NULL (caller
+// arena_exit'd). On a failed send (client gone) it unsubscribes and closes the fd (single owner). A client
+// disconnect is detected on the NEXT publish (recv blocks on the hub) -- keepalive/idle-timeout is a tracked
+// follow-up (needs the timed netpoller park). Per-message arena keeps the format+send buffers flat.
+fn _sse_run(conn: int, route)
+    let hub = route[1]
+    tcp_send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+    let outbound = channel_bounded(256)
+    hub_sub(hub, conn, outbound)
+    let alive = true
+    while alive
+        let prev = arena_enter()
+        let msg = recv(outbound)
+        let n = tcp_send(conn, "data: " + msg + chr(10) + chr(10))
+        arena_exit(prev)
+        if n <= 0
+            alive = false
+    hub_unsub(hub, conn)
+    tcp_close(conn)
+
+// Publish a plain-text SSE event to all subscribers of `hub`.
+fn sse_send(hub, msg: string)
+    hub_pub(hub, msg)
+
 // ── Pub/sub hub ─────────────────────────────────────────────────────────────────────────────────────
 // A general fan-out hub: a daemon green task owns a registry of subscriber channels (NOT shared memory --
 // green tasks are deep-copy isolated; the registry lives inside the hub task and is mutated only there).
@@ -3106,6 +3159,14 @@ fn _serve_conn(conn: int, a, safe: int)
                 arena_exit(prev)
                 alive = false
             else
+                // Server-Sent Events: a GET matching an sse route hijacks the connection into a long-lived
+                // text/event-stream (like ws, exit the request arena BEFORE the stream loop and RETURN --
+                // _sse_run is the sole owner of tcp_close).
+                let sroute = _sse_lookup(a, req)
+                if len(sroute) == 2
+                    arena_exit(prev)
+                    _sse_run(conn, sroute)
+                    return
                 let ka = _want_keep_alive(req, count)
                 let resp: Response = _dispatch_pick(a, req, safe)
                 tcp_send(conn, _finalize2(resp, req.method, ka))
