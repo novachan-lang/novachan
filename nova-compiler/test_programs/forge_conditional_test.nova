@@ -1,0 +1,67 @@
+// forge_conditional_test -- conditional GET / HTTP caching for DYNAMIC responses via forge.mw_etag().
+// First GET returns 200 + an ETag; a repeat GET carrying that ETag in If-None-Match gets 304 Not Modified
+// with NO body (the client keeps its cached copy). Exercised over a real socket through the full dispatch
+// + middleware pipeline. etag_for is also unit-checked for determinism.
+import forge
+
+fn _hello(req: Request) -> Response
+    forge.resp_text(200, "stable-body-content")
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.use(a, forge.mw_etag())
+    forge.get(a, "/data", fn(req) _hello(req))
+    forge.serve_req_n(a, port, 2)
+
+fn _get(port: int, path: string, inm: string) -> string
+    let s = tcp_connect("127.0.0.1", port)
+    let req = "GET " + path + " HTTP/1.0\r\nConnection: close\r\n"
+    if inm != ""
+        req = req + "If-None-Match: " + inm + "\r\n"
+    req = req + "\r\n"
+    tcp_send(s, req)
+    let r = tcp_recv(s)
+    let go = true
+    while go
+        let more = tcp_recv(s)
+        if len(more) == 0
+            go = false
+        else
+            r = r + more
+    tcp_close(s)
+    r
+
+// extract the ETag header value (incl. its quotes) from a raw response, "" if absent
+fn _etag_of(resp: string) -> string
+    let i = find(resp, "ETag: ")
+    if i < 0
+        return ""
+    let rest = slice(resp, i + 6, len(resp))
+    let eol = find(rest, "\r\n")
+    slice(rest, 0, eol)
+
+fn main()
+    // etag_for is a deterministic strong validator
+    assert(forge.etag_for("hello") == forge.etag_for("hello"), "etag_for is deterministic")
+    assert(forge.etag_for("hello") != forge.etag_for("world"), "different bodies -> different ETags")
+
+    let port = 19423
+    spawn fn()
+        _server(port)
+    sleep(300)
+
+    // first request: 200 + ETag + the body
+    let r1 = _get(port, "/data", "")
+    assert(find(r1, "200") >= 0, "first GET -> 200")
+    assert(find(r1, "ETag: ") >= 0, "first GET carries an ETag")
+    assert(find(r1, "stable-body-content") >= 0, "first GET sends the body")
+    let tag = _etag_of(r1)
+    assert(len(tag) > 2, "extracted a quoted ETag value")
+    print("PASS: first GET -> 200 + ETag " + tag)
+
+    // revalidate with If-None-Match: same ETag -> 304, no body
+    let r2 = _get(port, "/data", tag)
+    assert(find(r2, "304") >= 0, "revalidation with matching If-None-Match -> 304 Not Modified")
+    assert(find(r2, "stable-body-content") < 0, "304 sends NO body (client keeps its cached copy)")
+    print("PASS: matching If-None-Match -> 304, body suppressed")
+    print("forge_conditional_test passed")
