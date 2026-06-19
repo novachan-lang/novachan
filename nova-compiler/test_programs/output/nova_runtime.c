@@ -2372,7 +2372,23 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
            bump; channels are the shared comm primitive. The box bump is REQUIRED: the
            list/dict copy loops nova_rc_dec(e) after appending, so without this inc a
            deep-copied / channel-sent / copy()'d boxed element is freed prematurely
-           (use-after-free). */
+           (use-after-free).
+           EXCEPTION -- arena-owned objects: an ARENA object's rc_inc is a no-op (it is freed
+           WHOLESALE at arena_exit), so sharing one across a deep-copy ownership boundary
+           (channel send / spawn) would leave the receiver pointing into freed arena memory =
+           heap-use-after-free. deep_copy's contract is an INDEPENDENT copy, so for an arena
+           string/box we MATERIALIZE a real copy: nova_fat_str_create always heap-allocates;
+           the box copy uses nova_heap_alloc (RC heap, since the escaping callers clear
+           active_arena). Channels are never arena-owned and stay shared. */
+        if (tag != NOVA_MEM_CHANNEL && (NOVA_RC_COUNT(p) & NOVA_RC_ARENA_BIT)) {
+            if (tag == NOVA_MEM_FAT_STR)
+                return (int64_t)(uintptr_t)nova_fat_str_create((const char*)p, (size_t)NOVA_FAT_LEN(p));
+            if (tag == NOVA_MEM_RAW)
+                return (int64_t)(uintptr_t)nova_fat_str_create((const char*)p, strlen((const char*)p));
+            NovaBox* sb = (NovaBox*)p;
+            NovaBox* nb = (NovaBox*)nova_heap_alloc(sizeof(NovaBox), NOVA_MEM_BOX);
+            if (nb) { nb->kind = sb->kind; nb->payload = sb->payload; nova_box_track((uintptr_t)nb); return (int64_t)(uintptr_t)nb; }
+        }
         nova_rc_inc(v);
         return v;
     }
@@ -6679,8 +6695,18 @@ int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
        captured environment — same process-isolation guarantee as OS-pool spawn
        (deep_copy SHARES channels, so the spawner and task still share channels
        for communication while non-channel state is isolated). */
+    /* The captured environment is an ownership TRANSFER to a NEW task, so (like channel send) its deep
+       copy MUST land in the RC heap, NOT the spawner's active per-message/request arena -- that arena is
+       freed at arena_exit while the spawned task still holds the copy (a heap-use-after-free). Clear
+       active_arena around the deep copy, then restore. Inert when no arena is active (a user `spawn` inside
+       a Forge request/WS handler runs in an arena -> this prevents a latent UAF). */
+    NovaTaskState* _sp_t = nova_cur();
+    NovaArena* _sp_saved = _sp_t->active_arena;
+    _sp_t->active_arena = NULL;
+    int64_t _sp_ctx = nova_rt_deep_copy(ctx_ptr);
+    _sp_t->active_arena = _sp_saved;
     if (nova_green_enabled() && nova_sched_running) {
-        return nova_rt_sched_spawn(nova_rt_deep_copy(ctx_ptr));
+        return nova_rt_sched_spawn(_sp_ctx);
     }
     nova_is_multithreaded = 1;
     if (!nova_pool) nova_pool_init();
@@ -6690,7 +6716,7 @@ int64_t nova_rt_spawn(int64_t fn_ptr, int64_t ctx_ptr) {
     proc->fn = (nova_spawn_entry)(uintptr_t)fn_ptr;
     /* Ownership: the spawned process gets its own deep copy of the captured
        environment, so it never shares mutable heap state with the spawner. */
-    proc->ctx = (void*)(uintptr_t)nova_rt_deep_copy(ctx_ptr);
+    proc->ctx = (void*)(uintptr_t)_sp_ctx;
     proc->monitors = NULL;
     proc->monitor_count = 0;
     proc->monitor_cap = 0;
