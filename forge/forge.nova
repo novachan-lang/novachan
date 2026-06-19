@@ -1260,6 +1260,79 @@ fn _sse_run(conn: int, route)
 fn sse_send(hub, msg: string)
     hub_pub(hub, msg)
 
+// ── Chunked / streaming HTTP responses (Transfer-Encoding: chunked, RFC 7230) ─────────────────────────
+// Stream a response whose total length isn't known up front (a generated report, a large or incremental
+// body) without buffering it all in memory. A GET to a stream route hijacks the connection (like ws/sse),
+// sends chunked headers, runs the producer -- which calls forge.send_chunk(conn, data) any number of times
+// -- then writes the terminating 0-chunk and closes. Pure-NOVA chunk framing (no runtime add).
+fn _hexdigit(d: int) -> string
+    char_at("0123456789abcdef", d)
+
+// bare lowercase hex of a non-negative int (the chunk-size line; no "0x" prefix per the spec)
+fn _to_hex(n: int) -> string
+    if n == 0
+        return "0"
+    let s = ""
+    let v = n
+    while v > 0
+        s = _hexdigit(v & 15) + s
+        v = v >> 4
+    s
+
+// Register a chunked-streaming route. ctype = Content-Type. producer: fn(conn) -> unit, which calls
+// forge.send_chunk(conn, data) to emit each chunk. Route = [pattern, producer, ctype].
+fn stream(a, pattern: string, ctype: string, producer)
+    let routes = []
+    if contains(a, "stream_routes")
+        routes = a["stream_routes"]
+    push(routes, [pattern, producer, ctype])
+    a["stream_routes"] = routes
+
+// Find the [pattern, producer, ctype] for a GET matching a stream route, or [] if none.
+fn _stream_lookup(a, req: Request) -> list
+    if req.method != "GET"
+        return []
+    if not contains(a, "stream_routes")
+        return []
+    let routes = a["stream_routes"]
+    let i = 0
+    while i < len(routes)
+        let rt = routes[i]
+        if is_ok(_fr_match(rt[0], req.path))
+            return rt
+        i = i + 1
+    []
+
+// Emit one chunk: "<hexlen>\r\n<data>\r\n" (RFC 7230). Empty data is skipped (a 0-length chunk would end
+// the response prematurely). Returns the tcp_send result (<= 0 means the client is gone).
+fn send_chunk(conn: int, data: string) -> int
+    if len(data) == 0
+        return 1
+    tcp_send(conn, _to_hex(len(data)) + "\r\n" + data + "\r\n")
+
+// Emit one BINARY chunk. The chunk length is byte-exact (bytes_len), so this streams arbitrary binary --
+// generated files, images, NUL bytes included (which a string cannot hold). The whole frame is built as one
+// bytes buffer and sent atomically. Empty data skipped. Returns the tcp_send_bytes result.
+fn send_chunk_bin(conn: int, data) -> int
+    let n = bytes_len(data)
+    if n == 0
+        return 1
+    let frame = str_to_bytes(_to_hex(n) + "\r\n")
+    frame = bytes_concat(frame, data)
+    frame = bytes_concat(frame, str_to_bytes("\r\n"))
+    tcp_send_bytes(conn, frame)
+
+// Run a chunked stream: send the chunked headers, run the producer (it emits chunks via send_chunk), then
+// the terminating 0-chunk, then close. PRECONDITION: active_arena == NULL (caller arena_exit'd). Sole owner
+// of tcp_close.
+fn _stream_run(conn: int, route)
+    let producer = route[1]
+    let ctype = route[2]
+    tcp_send(conn, "HTTP/1.1 200 OK\r\nContent-Type: " + ctype + "\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+    producer(conn)
+    tcp_send(conn, "0\r\n\r\n")
+    tcp_close(conn)
+
 // ── Pub/sub hub ─────────────────────────────────────────────────────────────────────────────────────
 // A general fan-out hub: a daemon green task owns a registry of subscriber channels (NOT shared memory --
 // green tasks are deep-copy isolated; the registry lives inside the hub task and is mutated only there).
@@ -3270,6 +3343,13 @@ fn _serve_conn(conn: int, a, safe: int)
                 if len(sroute) >= 2
                     arena_exit(prev)
                     _sse_run(conn, sroute)
+                    return
+                // chunked streaming: a GET matching a stream route hijacks the connection into a chunked
+                // response (exit the request arena BEFORE the producer runs, RETURN -- _stream_run owns close)
+                let xroute = _stream_lookup(a, req)
+                if len(xroute) >= 2
+                    arena_exit(prev)
+                    _stream_run(conn, xroute)
                     return
                 let ka = _want_keep_alive(req, count)
                 let resp: Response = _dispatch_pick(a, req, safe)
