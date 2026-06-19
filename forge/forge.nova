@@ -1043,6 +1043,69 @@ fn _ws_run(conn: int, route)
         arena_exit(prev)
     _ws_finish(ws)
 
+// ── Pub/sub hub ─────────────────────────────────────────────────────────────────────────────────────
+// A general fan-out hub: a daemon green task owns a registry of subscriber channels (NOT shared memory --
+// green tasks are deep-copy isolated; the registry lives inside the hub task and is mutated only there).
+// Subscribers register/unregister and publish by SENDING commands to the hub's command channel (which IS
+// shared across tasks, like any channel). A command is [op, id, payload]: ["sub", id, outbound_channel]
+// (channel-of-channels), ["pub", from_id, msg] (msg fanned out to every subscriber's outbound channel),
+// ["unsub", id, 0]. This is the spine of WS broadcast and is reusable for SSE / internal eventing.
+fn _hub_loop(cmd)
+    let ids = []
+    let subs = []
+    let alive = true
+    while alive
+        let c = recv(cmd)
+        let op = c[0]
+        if op == "pub"
+            let i = 0
+            while i < len(subs)
+                send(subs[i], c[2])
+                i = i + 1
+        else
+            if op == "sub"
+                push(ids, c[1])
+                push(subs, c[2])
+            else
+                if op == "unsub"
+                    let nids = []
+                    let nsubs = []
+                    let j = 0
+                    while j < len(ids)
+                        if ids[j] != c[1]
+                            push(nids, ids[j])
+                            push(nsubs, subs[j])
+                        j = j + 1
+                    ids = nids
+                    subs = nsubs
+                else
+                    if op == "stop"
+                        alive = false
+
+// Create a hub. Returns its command channel (pass to hub_sub/hub_pub/hub_unsub).
+fn hub()
+    let cmd = channel()
+    spawn fn()
+        _hub_loop(cmd)
+    cmd
+
+// Subscribe `outbound` (a channel the subscriber recv's on) under `id`. The hub will send every published
+// message to `outbound`.
+fn hub_sub(h, id: int, outbound)
+    send(h, ["sub", id, outbound])
+
+// Publish `msg` to every current subscriber.
+fn hub_pub(h, msg)
+    send(h, ["pub", 0, msg])
+
+// Unsubscribe `id` (its channel is dropped from the registry).
+fn hub_unsub(h, id: int)
+    send(h, ["unsub", id, 0])
+
+// Stop the hub daemon task (for clean shutdown / tests).
+fn hub_stop(h)
+    send(h, ["stop", 0, 0])
+
 fn _handle_one(conn: int, handler)
     let req = recv_request(conn)
     let m = parse_method(req)
