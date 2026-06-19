@@ -1,0 +1,61 @@
+// forge_ws_keepalive_test -- WebSocket keepalive (opt-in via forge.ws_keepalive). With a 600ms interval, an
+// idle connection is pinged (opcode 9); a client that never answers is reaped after 3 unanswered pings (the
+// server's read returns EOF, the handler ends, the socket closes). Built on the netpoller timed park
+// (tcp_wait_readable) -- the reader PARKS with a deadline, so this costs no CPU while idle. Verifies a ping
+// is sent on idle AND the unresponsive client is closed.
+import forge
+
+// read one WS frame; return [status, opcode]. status 1 = a frame (opcode in [1]); status<0 = closed/EOF.
+fn _read_frame(sock)
+    let buf = bytes(0)
+    let guard = 0
+    while guard < 2000
+        guard = guard + 1
+        let fr = forge.ws_try_decode(buf, 0)
+        if fr.status != 0
+            return [fr.status, fr.opcode]
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return [0 - 1, 0]
+        buf = bytes_concat(buf, chunk)
+    [0 - 1, 0]
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.ws_keepalive(a, 600)
+    forge.ws(a, "/echo", fn(c, m) forge.ws_emit_bin(c, m))
+    forge.serve_req_n(a, port, 1)
+
+fn main()
+    let port = 19396
+    spawn fn()
+        _server(port)
+    sleep(300)
+    let sock = tcp_connect("127.0.0.1", port)
+    tcp_send(sock, "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    let resp = tcp_recv(sock)
+    while find(resp, "\r\n\r\n") < 0
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            resp = resp
+        resp = resp + more
+    assert(find(resp, "101") >= 0, "WS handshake ok")
+
+    // stay idle: the server pings every 600ms; after 3 unanswered it reaps us. Read frames until close.
+    let pings = 0
+    let closed = 0
+    let i = 0
+    while i < 8
+        let fr = _read_frame(sock)
+        if fr[0] < 0
+            closed = 1
+            i = 8
+        else
+            if fr[1] == 9
+                pings = pings + 1
+        i = i + 1
+    tcp_close(sock)
+    assert(pings >= 1, "the server sent a keepalive ping (opcode 9) to the idle client (got " + str(pings) + ")")
+    assert(closed == 1, "the server reaped the unresponsive client after repeated unanswered pings")
+    print("PASS: WS keepalive -- idle client pinged " + str(pings) + "x then reaped on no response")
+    print("forge_ws_keepalive_test passed")

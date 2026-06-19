@@ -832,9 +832,24 @@ type Ws
     blen: int
     closed: int
     outbound: any
+    ka: int          // keepalive interval in ms (0 = disabled); idle reads wake to send a ping
+    pings: int       // consecutive unanswered keepalive pings; >2 -> the peer is dead, reap it
 
 fn _ws_bufcap() -> int
     262144
+
+// Per-app WebSocket keepalive interval (ms), read from the app dict (forge.ws_keepalive sets it). 0 = off
+// (the default -> the frame read loop is byte-identical to no-keepalive). A server enables dead-client
+// detection / proxy-warming with forge.ws_keepalive(app, 30000).
+fn _ws_app_ka(a) -> int
+    if contains(a, "ws_ka_ms")
+        return a["ws_ka_ms"]
+    0
+
+// Enable WebSocket keepalive for this app: every connection that goes `ms` idle gets a ping; a peer that
+// fails to answer 3 pings is reaped (the read returns EOF, the handler ends, the socket closes).
+fn ws_keepalive(a, ms: int)
+    a["ws_ka_ms"] = ms
 
 // Is this request a WebSocket upgrade? (RFC 6455 §4.2.1: Upgrade: websocket, Connection contains upgrade,
 // a valid Sec-WebSocket-Key, Version 13.)
@@ -909,17 +924,33 @@ fn _ws_fill_frame(ws: Ws) -> WsFrame
         let fr = ws_try_decode_n(ws.buf, 0, ws.blen)
         if fr.status != 0
             return fr
-        let chunk = tcp_recv_bytes(ws.fd)
-        let cn = bytes_len(chunk)
-        if cn == 0
-            return WsFrame(0 - 1, 0, 0, 0, bytes(0))
-        if ws.blen + cn > _ws_bufcap()
-            return WsFrame(0 - 1009, 0, 0, 0, bytes(0))
-        let k = 0
-        while k < cn
-            bytes_set(ws.buf, ws.blen + k, bytes_get(chunk, k))
-            k = k + 1
-        ws.blen = ws.blen + cn
+        let do_recv = true
+        // KEEPALIVE (opt-in, ws.ka>0): wait for data up to ws.ka ms (parks the green task on the netpoller
+        // -- yields the carrier, no busy-poll). On idle, send a ping; a peer that ignores 3 pings is dead ->
+        // EOF. When ws.ka==0 this whole block is skipped -> identical to a plain blocking read.
+        if ws.ka > 0
+            let wr = tcp_wait_readable(ws.fd, ws.ka)
+            if wr < 0
+                return WsFrame(0 - 1, 0, 0, 0, bytes(0))
+            if wr == 0
+                ws.pings = ws.pings + 1
+                if ws.pings > 2
+                    return WsFrame(0 - 1, 0, 0, 0, bytes(0))
+                _ws_send_frame(ws, 9, bytes(0))
+                do_recv = false
+        if do_recv
+            let chunk = tcp_recv_bytes(ws.fd)
+            let cn = bytes_len(chunk)
+            if cn == 0
+                return WsFrame(0 - 1, 0, 0, 0, bytes(0))
+            if ws.blen + cn > _ws_bufcap()
+                return WsFrame(0 - 1009, 0, 0, 0, bytes(0))
+            let k = 0
+            while k < cn
+                bytes_set(ws.buf, ws.blen + k, bytes_get(chunk, k))
+                k = k + 1
+            ws.blen = ws.blen + cn
+            ws.pings = 0   // got data (incl. a pong) -> the peer is alive; reset the keepalive counter
     WsFrame(0 - 1, 0, 0, 0, bytes(0))
 
 // Drop the first `n` bytes of ws.buf, compacting the leftover to the front IN PLACE (bytes_set, no alloc).
@@ -1051,12 +1082,12 @@ fn _ws_finish(ws: Ws)
 // is the fixed ws.buf scratch). route[0]=pattern (sets ws.path), route[1]=handler fn(ws, msg_bytes).
 // Single owner of the fd close. The msg is valid ONLY during the handler call (arena-scoped); to retain
 // it, send it on a channel (deep-copied) or emit it immediately.
-fn _ws_run(conn: int, route)
+fn _ws_run(conn: int, route, ka: int)
     // route of length 3 = a broadcast/room route [pattern, handler, hub] -> the dual-task room runner.
     if len(route) == 3
-        _ws_run_room(conn, route)
+        _ws_run_room(conn, route, ka)
         return
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0)
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, 0, ka, 0)
     let handler = route[1]
     while ws.open == 1
         let prev = arena_enter()
@@ -1086,13 +1117,13 @@ fn _ws_writer(fd: int, outbound)
 // frames and calls handler(ws, msg, hub) (which typically broadcasts via hub_pub); every outbound frame is
 // routed through ws.outbound to the single writer (no interleaving). On disconnect: unsubscribe from the
 // hub and stop the writer (which owns the fd close). route = [pattern, handler, hub].
-fn _ws_run_room(conn: int, route)
+fn _ws_run_room(conn: int, route, ka: int)
     let hub = route[2]
     // bounded outbound: caps how many broadcasts can queue for THIS connection's writer. If the client
     // stops reading, its writer stalls, the queue fills, and the hub's try_send drops further broadcasts
     // to it -- so one slow client can't grow memory unbounded or stall the room.
     let outbound = channel_bounded(256)
-    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound)
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0)
     let handler = route[1]
     hub_sub(hub, conn, outbound)
     spawn fn()
@@ -3152,9 +3183,10 @@ fn _serve_conn(conn: int, a, safe: int)
             // frame loop, and RETURN -- _ws_run is the SOLE owner of tcp_close (never fall through).
             let route = _ws_lookup(a, req)
             if len(route) >= 2
+                let kams = _ws_app_ka(a)
                 if ws_handshake(conn, req) == 1
                     arena_exit(prev)
-                    _ws_run(conn, route)
+                    _ws_run(conn, route, kams)
                     return
                 arena_exit(prev)
                 alive = false
