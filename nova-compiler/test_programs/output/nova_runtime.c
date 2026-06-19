@@ -11953,6 +11953,26 @@ int64_t nova_rt_file_close(int64_t h) {
     return fclose(f) == 0 ? 0 : -1;
 }
 
+/* file_read_bytes(h, n) -> NovaBytes of up to n raw bytes read from the handle's
+ * CURRENT position (call file_seek first to position). At/near EOF the returned
+ * NovaBytes is short (its size reflects bytes actually read). The handle MUST be
+ * opened in binary mode ("rb") for byte-exact reads (no CRLF translation). This is
+ * the raw-read companion to file_read_line, and the primitive that lets a server
+ * stream an arbitrary byte RANGE of a huge file without loading the whole thing. */
+int64_t nova_rt_file_read_bytes(int64_t h, int64_t n) {
+    FILE* f = nova_file_get(h);
+    if (!f) { nova_set_error("file_read_bytes: invalid handle"); return nova_rt_bytes_create(0); }
+    if (n < 0) { nova_set_error("file_read_bytes: negative count"); return nova_rt_bytes_create(0); }
+    if (n > (int64_t)512 * 1024 * 1024) { nova_set_error("file_read_bytes: count exceeds 512MB limit"); return nova_rt_bytes_create(0); }
+    int64_t result = nova_rt_bytes_create(n);
+    NovaBytes* b = (NovaBytes*)(uintptr_t)result;
+    if (b && b->data && n > 0) {
+        size_t nr = fread(b->data, 1, (size_t)n, f);
+        b->size = (int64_t)nr;   /* short read at EOF -> reflect actual count */
+    }
+    return result;
+}
+
 int64_t nova_rt_str_char_at(int64_t str_val, int64_t index) {
     const char* s = (const char*)(uintptr_t)str_val;
     if (!s) return (int64_t)(uintptr_t)"";

@@ -3048,6 +3048,83 @@ fn _static_match(path: string, prefix: string)
         return ok(slice(path, len(prefix), len(path)))
     err("no prefix match")
 
+// Parse a single "Range: bytes=START-END" header against a known total size. Returns [start, end]
+// (inclusive, 0-based, clamped) when satisfiable; [-2, -2] present-but-unsatisfiable (caller -> 416);
+// [-1, -1] absent/unsupported (non-bytes, multi-range, or malformed -> caller serves the full 200).
+// Forms: "2-5" (explicit), "2-" (from 2 to end), "-5" (the last 5 bytes / suffix).
+fn _parse_range(rv: string, total: int) -> list
+    if not starts_with(rv, "bytes=")
+        return [-1, -1]
+    let spec = trim(slice(rv, 6, len(rv)))
+    if find(spec, ",") >= 0
+        return [-1, -1]
+    let dash = find(spec, "-")
+    if dash < 0
+        return [-1, -1]
+    let lhs = trim(slice(spec, 0, dash))
+    let rhs = trim(slice(spec, dash + 1, len(spec)))
+    if total <= 0
+        return [-2, -2]
+    let start = 0
+    let end = total - 1
+    if lhs == ""
+        if not _is_digits(rhs)
+            return [-1, -1]
+        let n = parse_int(rhs)
+        if n <= 0
+            return [-2, -2]
+        if n > total
+            n = total
+        start = total - n
+        end = total - 1
+    else
+        if not _is_digits(lhs)
+            return [-1, -1]
+        start = parse_int(lhs)
+        if rhs == ""
+            end = total - 1
+        else
+            if not _is_digits(rhs)
+                return [-1, -1]
+            end = parse_int(rhs)
+        if end > total - 1
+            end = total - 1
+        if start > end or start >= total
+            return [-2, -2]
+    [start, end]
+
+// Serve a 206 Partial Content (or 416) for a binary static file given a Range header value. Uses
+// seek + file_read_bytes so only the requested slice is read -- a 1MB range of a 4GB video never
+// loads the whole file. Returns ok(Response 206/416) on a range, err("no range") to fall through to
+// the full 200 path. Weak size+mtime validator (the full path keeps its strong content-hash ETag).
+fn _range_response(fpath: string, ct: string, rh: string)
+    let total = file_size(fpath)
+    let rng = _parse_range(rh, total)
+    let rstart = rng[0]
+    let rend = rng[1]
+    if rstart == -2
+        let h416 = {}
+        h416["Content-Type"] = ct
+        h416["Content-Range"] = "bytes */" + str(total)
+        h416["Accept-Ranges"] = "bytes"
+        return ok(Response(416, h416, "", false, []))
+    if rstart < 0
+        return err("no range")
+    let rlen = rend - rstart + 1
+    let fh = file_open(fpath, "rb")
+    if fh == 0
+        return err("open failed")
+    file_seek(fh, rstart)
+    let part = file_read_bytes(fh, rlen)
+    file_close(fh)
+    let hr = {}
+    hr["Content-Type"] = ct
+    hr["Accept-Ranges"] = "bytes"
+    hr["Content-Range"] = "bytes " + str(rstart) + "-" + str(rend) + "/" + str(total)
+    hr["Cache-Control"] = "no-cache"
+    hr["ETag"] = "W/" + chr(34) + str(total) + "-" + str(file_mtime(fpath)) + chr(34)
+    ok(Response(206, hr, part, false, []))
+
 // Try to serve req.path from a registered static mount: ok(Response) if a mount matched at a
 // segment boundary AND the sanitized file exists; err otherwise (caller falls through to 404). An
 // empty subpath (the mount root) serves index.html. Text-correct; binary assets (read_file stops
@@ -3083,6 +3160,15 @@ fn _try_static(a, req: Request)
                         if req_header(req, "if-none-match") == tetag
                             return ok(Response(304, h, "", false, []))
                         return ok(Response(200, h, tcontent, false, []))
+                    // Range request (browser video/audio seeking, resumable downloads): serve a 206
+                    // Partial Content via seek + partial read, never loading the whole file. A valid
+                    // range short-circuits here; absent/unsupported ranges fall through to the full 200.
+                    h["Accept-Ranges"] = "bytes"
+                    let rh = req_header(req, "range")
+                    if rh != ""
+                        let rr = _range_response(fpath, ct, rh)
+                        if is_ok(rr)
+                            return rr
                     let bcontent = read_bytes(fpath)
                     let betag = chr(34) + sha256_of_bytes(bcontent) + chr(34)
                     h["ETag"] = betag

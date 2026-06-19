@@ -1,0 +1,71 @@
+// forge_range_test -- HTTP Range requests (206 Partial Content) on static binary files. Exercises the
+// browser video/audio seeking + resumable-download path: explicit range, suffix range, open-ended range,
+// an unsatisfiable range (416), and a full request (200 advertising Accept-Ranges). The partial body is
+// read via seek + file_read_bytes (the new runtime primitive) -- only the requested slice, never the whole
+// file. Content "0123456789ABCDEFGHIJ" (20 bytes): index 2-5 = "2345", last 3 = "HIJ", 10- = "ABCDEFGHIJ".
+import forge
+
+fn _get(port: int, path: string, rangehdr: string) -> string
+    let s = tcp_connect("127.0.0.1", port)
+    let req = "GET " + path + " HTTP/1.0\r\nConnection: close\r\n"
+    if rangehdr != ""
+        req = req + "Range: " + rangehdr + "\r\n"
+    req = req + "\r\n"
+    tcp_send(s, req)
+    let r = tcp_recv(s)
+    let go = true
+    while go
+        let more = tcp_recv(s)
+        if len(more) == 0
+            go = false
+        else
+            r = r + more
+    tcp_close(s)
+    r
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.static(a, "/r", ".")
+    forge.serve_req_n(a, port, 5)
+
+fn main()
+    let port = 19421
+    write_file("_range_data.bin", "0123456789ABCDEFGHIJ")
+    spawn fn()
+        _server(port)
+    sleep(300)
+
+    // explicit range bytes=2-5 -> "2345"
+    let r1 = _get(port, "/r/_range_data.bin", "bytes=2-5")
+    assert(find(r1, "206") >= 0, "explicit range -> 206 Partial Content")
+    assert(find(r1, "Content-Range: bytes 2-5/20") >= 0, "Content-Range header correct (2-5/20)")
+    assert(find(r1, "Accept-Ranges: bytes") >= 0, "Accept-Ranges advertised on 206")
+    assert(find(r1, "\r\n\r\n2345") >= 0, "partial body is exactly bytes 2..5 = '2345'")
+    print("PASS: explicit range 2-5 -> 206 '2345'")
+
+    // suffix range bytes=-3 -> last 3 bytes "HIJ" (index 17-19)
+    let r2 = _get(port, "/r/_range_data.bin", "bytes=-3")
+    assert(find(r2, "206") >= 0, "suffix range -> 206")
+    assert(find(r2, "Content-Range: bytes 17-19/20") >= 0, "suffix Content-Range correct (17-19/20)")
+    assert(find(r2, "\r\n\r\nHIJ") >= 0, "suffix body is the last 3 bytes = 'HIJ'")
+    print("PASS: suffix range -3 -> 206 'HIJ'")
+
+    // open-ended range bytes=10- -> "ABCDEFGHIJ"
+    let r3 = _get(port, "/r/_range_data.bin", "bytes=10-")
+    assert(find(r3, "Content-Range: bytes 10-19/20") >= 0, "open-ended Content-Range correct")
+    assert(find(r3, "\r\n\r\nABCDEFGHIJ") >= 0, "open-ended body is bytes 10..end")
+    print("PASS: open-ended range 10- -> 206 'ABCDEFGHIJ'")
+
+    // unsatisfiable range -> 416 with Content-Range: bytes */20
+    let r4 = _get(port, "/r/_range_data.bin", "bytes=100-200")
+    assert(find(r4, "416") >= 0, "unsatisfiable range -> 416 Range Not Satisfiable")
+    assert(find(r4, "Content-Range: bytes */20") >= 0, "416 reports the total size (*/20)")
+    print("PASS: unsatisfiable range -> 416 '*/20'")
+
+    // full request (no Range) -> 200 advertising Accept-Ranges, full body
+    let r5 = _get(port, "/r/_range_data.bin", "")
+    assert(find(r5, "200") >= 0, "no range -> 200 OK")
+    assert(find(r5, "Accept-Ranges: bytes") >= 0, "200 advertises Accept-Ranges so clients try ranges")
+    assert(find(r5, "\r\n\r\n0123456789ABCDEFGHIJ") >= 0, "full body served when no range")
+    print("PASS: no range -> 200 full body + Accept-Ranges")
+    print("forge_range_test passed")
