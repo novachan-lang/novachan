@@ -1153,13 +1153,37 @@ fn room_say_bin(hub, data)
 // new protocol. NOTE: give SSE its own hub (it publishes plain strings; ws_room publishes [opcode,bytes]).
 // Register an SSE endpoint bound to `hub`. publish with sse_send(hub, text).
 fn sse(a, pattern: string, hub)
+    sse_every(a, pattern, hub, 15000)
+
+// Register an SSE endpoint with an explicit keepalive interval (ms, 0 = none). On `ka_ms` of idle the stream
+// emits an SSE comment line: it keeps proxies from dropping the connection AND reaps a silently-dead client
+// (the comment send fails -> the stream exits + unsubscribes). Route = [pattern, hub, ka_ms].
+fn sse_every(a, pattern: string, hub, ka_ms: int)
     let routes = []
     if contains(a, "sse_routes")
         routes = a["sse_routes"]
-    push(routes, [pattern, hub])
+    push(routes, [pattern, hub, ka_ms])
     a["sse_routes"] = routes
 
-// Find the [pattern, hub] for a GET matching an sse route, or [] if none. Returned route is non-arena.
+// A sentinel value the per-connection keepalive ticker sends on the outbound channel -- distinguished from
+// real published events (which are plain text). The leading NUL makes a collision with real data impossible.
+fn _sse_ka_marker() -> string
+    chr(0) + "__forge_sse_keepalive__"
+
+// Per-connection keepalive ticker: every `ka` ms, nudge the stream's outbound channel so the (otherwise
+// idle) stream loop wakes to emit a comment (and thereby notices a dead peer). sleep() PARKS the green task
+// (yields the carrier -- no busy-poll, no netpoller starvation). Stops when the stream loop signals `stopch`.
+fn _sse_ticker(outbound, stopch, ka: int)
+    let alive = true
+    while alive
+        sleep(ka)
+        let s = try_recv(stopch)
+        if s[0] == 1
+            alive = false
+        else
+            try_send(outbound, _sse_ka_marker())
+
+// Find the route [pattern, hub, ka_ms] for a GET matching an sse route, or [] if none. Returned is non-arena.
 fn _sse_lookup(a, req: Request) -> list
     if req.method != "GET"
         return []
@@ -1181,18 +1205,31 @@ fn _sse_lookup(a, req: Request) -> list
 // follow-up (needs the timed netpoller park). Per-message arena keeps the format+send buffers flat.
 fn _sse_run(conn: int, route)
     let hub = route[1]
+    let ka = route[2]
     tcp_send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
     let outbound = channel_bounded(256)
+    let stopch = channel()
     hub_sub(hub, conn, outbound)
+    // keepalive ticker (opt-in, ka>0): wakes the idle stream every ka ms so it emits a comment and notices
+    // a dead peer. The marker is sent on the SAME outbound channel and filtered out below.
+    if ka > 0
+        spawn fn()
+            _sse_ticker(outbound, stopch, ka)
     let alive = true
     while alive
         let prev = arena_enter()
         let msg = recv(outbound)
-        let n = tcp_send(conn, "data: " + msg + chr(10) + chr(10))
+        let n = 1
+        if msg == _sse_ka_marker()
+            n = tcp_send(conn, ":ka" + chr(10) + chr(10))
+        else
+            n = tcp_send(conn, "data: " + msg + chr(10) + chr(10))
         arena_exit(prev)
         if n <= 0
             alive = false
     hub_unsub(hub, conn)
+    if ka > 0
+        send(stopch, 1)
     tcp_close(conn)
 
 // Publish a plain-text SSE event to all subscribers of `hub`.
@@ -3195,7 +3232,7 @@ fn _serve_conn(conn: int, a, safe: int)
                 // text/event-stream (like ws, exit the request arena BEFORE the stream loop and RETURN --
                 // _sse_run is the sole owner of tcp_close).
                 let sroute = _sse_lookup(a, req)
-                if len(sroute) == 2
+                if len(sroute) >= 2
                     arena_exit(prev)
                     _sse_run(conn, sroute)
                     return
