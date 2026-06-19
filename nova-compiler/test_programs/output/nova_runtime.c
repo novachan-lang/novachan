@@ -5218,6 +5218,7 @@ typedef struct NovaIOWaiter {
     NovaSchedTask*      task;
     int64_t             fd;
     int                 events;  /* NOVA_POLL_READ or NOVA_POLL_WRITE */
+    int64_t             deadline_ms;  /* 0 = wait forever; >0 = wake (timeout) at this monotonic ms */
     struct NovaIOWaiter* next;
 } NovaIOWaiter;
 
@@ -5407,6 +5408,28 @@ static int64_t nova_sched_now_ms(void) {
 #endif
 }
 
+/* Like nova_sched_park_io but the task ALSO wakes after `timeout_ms` even if the fd never becomes ready
+   (the poll loop scans deadlines and re-enqueues expired waiters). The task PARKS (yields the carrier) --
+   it is removed from the run queue, so unlike a busy-poll this does NOT starve the netpoller or other tasks.
+   timeout_ms <= 0 == wait forever (deadline 0). Used for WebSocket keepalive / idle-timeout reads. */
+static void nova_sched_park_io_timeout(int64_t fd, int events, int64_t timeout_ms) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return;
+    NovaIOWaiter* w = (NovaIOWaiter*)calloc(1, sizeof(NovaIOWaiter));
+    if (!w) return;
+    w->task = t;
+    w->fd = fd;
+    w->events = events;
+    /* +1 so a sub-ms remainder still parks for at least the requested time (now_ms floors to whole ms). */
+    w->deadline_ms = (timeout_ms > 0) ? (nova_sched_now_ms() + timeout_ms + 1) : 0;
+    nova_sched_lock();
+    w->next = nova_io_waiters;
+    nova_io_waiters = w;
+    nova_sched_unlock();
+    t->status = 2;
+    nova_rt_fiber_yield();
+}
+
 static int nova_sched_wake_sleepers(void) {
     if (!nova_sleep_waiters) return 0;   /* benign racy fast-path; re-checked under the lock */
     nova_sched_lock();
@@ -5458,6 +5481,18 @@ static int nova_sched_poll_io(int timeout_ms) {
     FD_ZERO(&efds);
     int maxfd = 0;
     nova_sched_lock();
+    /* Shorten the select() wait to the nearest waiter deadline so a timed park wakes on time (Phase 3
+       timed-park; no-op when no waiter has a deadline). */
+    {
+        int64_t now_d = nova_sched_now_ms();
+        for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
+            if (w->deadline_ms > 0) {
+                int64_t rem = w->deadline_ms - now_d;
+                if (rem < 0) rem = 0;
+                if (rem < (int64_t)timeout_ms) timeout_ms = (int)rem;
+            }
+        }
+    }
     for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
         if (w->events & NOVA_POLL_READ)  FD_SET(w->fd, &rfds);
         /* A non-blocking connect parks on POLL_WRITE: success shows in writefds, but on Windows
@@ -5480,15 +5515,23 @@ static int nova_sched_poll_io(int timeout_ms) {
 #else
     int n = select(maxfd + 1, &rfds, &wfds, &efds, &tv);
 #endif
-    if (n <= 0) return 0;
+    /* n<=0 means select timed out (or errored) -- the fd_sets are NOT meaningful, but a timed waiter's
+       deadline may have expired, so we still scan. (Pre-Phase-3 this early-returned; with no deadlines the
+       scan below finds nothing ready -> woken=0, identical behavior.) */
+    int sel_ready = (n > 0);
+    int64_t now_w = nova_sched_now_ms();
     int woken = 0;
     nova_sched_lock();   /* guard nova_io_waiters mutation (Step 1 coarse; Step 2 -> per-carrier) */
     NovaIOWaiter** pp = &nova_io_waiters;
     while (*pp) {
         NovaIOWaiter* w = *pp;
         int ready = 0;
-        if ((w->events & NOVA_POLL_READ)  && FD_ISSET(w->fd, &rfds))  ready = 1;
-        if ((w->events & NOVA_POLL_WRITE) && (FD_ISSET(w->fd, &wfds) || FD_ISSET(w->fd, &efds))) ready = 1;
+        if (sel_ready) {
+            if ((w->events & NOVA_POLL_READ)  && FD_ISSET(w->fd, &rfds))  ready = 1;
+            if ((w->events & NOVA_POLL_WRITE) && (FD_ISSET(w->fd, &wfds) || FD_ISSET(w->fd, &efds))) ready = 1;
+        }
+        /* timed park: wake (as a timeout) if the deadline has passed, regardless of fd readiness */
+        if (!ready && w->deadline_ms > 0 && now_w >= w->deadline_ms) ready = 1;
         if (ready) {
             *pp = w->next;
             w->task->status = 0;
@@ -5502,6 +5545,20 @@ static int nova_sched_poll_io(int timeout_ms) {
     }
     nova_sched_unlock();
     return woken;
+}
+
+/* Any pending I/O waiter with a deadline (a timed park)? Such a waiter WILL wake when its timeout fires,
+   so the carrier loop must keep running for it -- like a sleep waiter -- instead of treating "only I/O
+   waiters left" as idle/done and exiting (which would abandon a parked WebSocket keepalive read). Infinite
+   I/O waiters (deadline 0) are unaffected: pure I/O-blocked idle still exits as before. */
+static int nova_sched_has_timed_io(void) {
+    int has = 0;
+    nova_sched_lock();
+    for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
+        if (w->deadline_ms > 0) { has = 1; break; }
+    }
+    nova_sched_unlock();
+    return has;
 }
 
 /* ── Blocking-offload pool (DNS now; file I/O / FFI later) ───────────────────
@@ -5753,9 +5810,9 @@ int64_t nova_rt_sched_run(void) {
                we exit Go-style even if a background daemon still sleeps/offloads (a server
                test whose main returns while a periodic sleep-daemon lingers still terminates).
                Pure I/O-blocked idle still breaks here, leaving that termination unchanged. */
-            if ((nova_sleep_waiters || nova_offload_waiters) &&
+            if ((nova_sleep_waiters || nova_offload_waiters || nova_sched_has_timed_io()) &&
                 nova_sched_root_task && nova_sched_root_task->status != 3) continue;
-            break;   /* nothing runnable; no live-root timer/offload pending => done */
+            break;   /* nothing runnable; no live-root timer/offload/timed-io pending => done */
         }
         if (t->status == 3) continue;
         if (g_watchdog_on) { g_carrier_pc[_wcid] = 2; g_carrier_spin[_wcid] = t; }
@@ -9716,6 +9773,42 @@ int64_t nova_rt_tcp_recv_bytes(int64_t sock_val) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)r;
     if (b && b->data) memcpy(b->data, buf, (size_t)n);
     return r;
+}
+
+/* tcp_wait_readable(fd, timeout_ms): wait until the socket is readable OR the timeout elapses. Returns 1 if
+   readable (a recv won't block -- data available OR EOF), 0 on timeout (still open, no data), -1 on error/
+   invalid fd. Green-aware: PARKS on the netpoller with a deadline (yields the carrier, NO busy-poll -> does
+   not starve other tasks or the poller). The basis for WebSocket keepalive / idle-timeout: wake when a
+   connection goes quiet to send a ping, without a dedicated thread or a spinning select. */
+int64_t nova_rt_tcp_wait_readable(int64_t fd_val, int64_t timeout_ms) {
+    NOVA_SOCKET sock = (NOVA_SOCKET)fd_val;
+    if ((int64_t)fd_val <= 0) return -1;
+    if (nova_sched_in_task()) {
+        nova_sched_park_io_timeout(fd_val, NOVA_POLL_READ, timeout_ms);
+        /* On wake (readable OR deadline), decide which WITHOUT a fd_set: this runs on a 32KB green-task
+           FIBER stack, and FD_SETSIZE=4096 makes fd_set ~32KB -> a stack-allocated one overflows the fiber.
+           MSG_PEEK is allocation-free and doesn't consume the data (the caller's recv still reads it). */
+        nova_rt_io_set_nonblocking(fd_val);
+        char peekb;
+        int pk = recv(sock, &peekb, 1, MSG_PEEK);
+        if (pk >= 0) return 1;   /* data (>0) or EOF (0): a recv will not block */
+#ifdef _WIN32
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return 0;
+#else
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+#endif
+        return -1;
+    }
+    /* non-green path runs on the OS-thread stack (~1MB), so a 32KB fd_set here is fine */
+    fd_set r; FD_ZERO(&r); FD_SET(sock, &r);
+    struct timeval tv; tv.tv_sec = (long)(timeout_ms / 1000); tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+#ifdef _WIN32
+    int k = select(0, &r, NULL, NULL, &tv);
+#else
+    int k = select((int)sock + 1, &r, NULL, NULL, &tv);
+#endif
+    if (k < 0) return -1;
+    return (k > 0) ? 1 : 0;
 }
 
 void nova_rt_tcp_close(int64_t sock_val) {
