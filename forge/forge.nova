@@ -1833,6 +1833,27 @@ fn _pct_decode(s: string, plus_space: bool) -> string
             i = i + 1
     out
 
+// Percent-ENCODE a string for safe transport in a URL or cookie value: every byte outside the RFC 3986
+// unreserved set (A-Z a-z 0-9 - _ . ~) becomes %XX (uppercase hex). The encode counterpart to _pct_decode;
+// _pct_decode(_pct_encode(s), false) == s.
+fn _hexup2(n: int) -> string
+    let d = "0123456789ABCDEF"
+    char_at(d, (n >> 4) & 15) + char_at(d, n & 15)
+
+fn _pct_encode(s: string) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        let o = ord(c)
+        if (o >= 65 and o <= 90) or (o >= 97 and o <= 122) or (o >= 48 and o <= 57) or o == 45 or o == 95 or o == 46 or o == 126
+            out = out + c
+        else
+            out = out + "%" + _hexup2(o)
+        i = i + 1
+    out
+
 // Parse "k=v&k2=v2" (the ?query) into a dict, percent-decoding keys and values. Empty dict if none.
 fn _query_dict(raw_path: string) -> dict
     let d = {}
@@ -2222,6 +2243,49 @@ fn cookie_get(req: Request, name: string) -> string
 fn resp_set_cookie(resp: Response, name: string, value: string) -> Response
     push(resp.cookies, name + "=" + value + "; Path=/; HttpOnly; SameSite=Lax")
     resp
+
+// ── Flash messages (one-time notifications across a redirect) ─────────────────────────────────────────
+// The POST-redirect-GET pattern: after handling a form, stash a message and redirect (303); the next page
+// shows it exactly ONCE. Backed by a short HttpOnly cookie holding the percent-encoded message. flash() sets
+// it on the redirect response; get_flash() reads it on the next request; it is consumed by clear_flash() or,
+// automatically, by mw_flash().
+//   return forge.flash(forge.resp_redirect(303, "/home"), "Saved!")     // in the POST handler
+//   let msg = forge.get_flash(req)                                       // in the GET handler
+fn flash(resp: Response, msg: string) -> Response
+    resp_set_cookie(resp, "flash", _pct_encode(msg))
+
+// Read the flash message ("" if none), decoding the percent-encoded cookie value.
+fn get_flash(req: Request) -> string
+    let v = cookie_get(req, "flash")
+    if v == ""
+        return ""
+    _pct_decode(v, false)
+
+// Expire the flash cookie so the message is shown only once.
+fn clear_flash(resp: Response) -> Response
+    push(resp.cookies, "flash=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+    resp
+
+// True if `resp` already sets a NEW (non-empty) flash cookie, so mw_flash won't clobber a freshly-set one.
+fn _sets_flash(resp: Response) -> bool
+    let i = 0
+    while i < len(resp.cookies)
+        let c = resp.cookies[i]
+        if starts_with(c, "flash=") and not starts_with(c, "flash=;")
+            return true
+        i = i + 1
+    false
+
+// Middleware: auto-consume the flash. If the request carried a flash AND the handler did not set a fresh
+// one, expire it on the way out -- so any flash is displayed exactly once.  forge.use(app, forge.mw_flash())
+fn _mw_flash_run(req, next) -> Response
+    let resp = next(req)
+    if cookie_get(req, "flash") != "" and not _sets_flash(resp)
+        return clear_flash(resp)
+    resp
+
+fn mw_flash()
+    return fn(req, next) _mw_flash_run(req, next)
 
 // ── Signed sessions ───────────────────────────────────────────────────────────
 // Stateless, tamper-evident sessions: a value the app chooses (a user id, a small JSON blob) is
