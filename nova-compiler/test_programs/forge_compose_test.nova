@@ -1,0 +1,114 @@
+// forge_compose_test -- integration test proving the new Forge features COMPOSE into one real app:
+// HTML views (forge_html) + content negotiation (one /hello route -> HTML or JSON) + auto-escaping (XSS) +
+// flash messages (POST-redirect-GET) + Cache-Control/Vary + the etag/flash middleware, all on one app.
+// Self-terminating (serve_req_n) so it gates like any other test.
+import forge
+import forge_html
+
+fn _home(req: Request) -> Response
+    let msg = forge.get_flash(req)
+    let banner = ""
+    if msg != ""
+        banner = forge_html.div({"class": "flash"}, forge_html.esc(msg))
+    let body = banner + forge_html.h1({}, "NOVA Forge Demo") + forge_html.form({"method": "post", "action": "/feedback"}, forge_html.button({}, "Send"))
+    forge.resp_html(200, forge_html.page("Home", "", body))
+
+fn _hello(req: Request) -> Response
+    let name = forge.req_query(req, "name")
+    if name == ""
+        name = "world"
+    if forge.wants_json(req)
+        let d = {}
+        d["greeting"] = "Hello, " + name
+        return forge.cache(forge.vary(forge.resp_json(200, d), "Accept"), 30)
+    let body = forge_html.h1({}, "Hello, " + forge_html.esc(name))
+    forge.vary(forge.resp_html(200, forge_html.page("Greeting", "", body)), "Accept")
+
+fn _feedback(req: Request) -> Response
+    forge.flash(forge.resp_redirect(303, "/"), "Thanks for your feedback!")
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.use(a, forge.mw_flash())
+    forge.use(a, forge.mw_etag())
+    forge.get(a, "/", fn(req) _home(req))
+    forge.get(a, "/hello", fn(req) _hello(req))
+    forge.post(a, "/feedback", fn(req) _feedback(req))
+    forge.serve_req_n(a, port, 6)
+
+fn _req(port: int, method: string, path: string, headers: string, body: string) -> string
+    let s = tcp_connect("127.0.0.1", port)
+    let r = method + " " + path + " HTTP/1.0\r\nConnection: close\r\n" + headers + "Content-Length: " + str(len(body)) + "\r\n\r\n" + body
+    tcp_send(s, r)
+    let resp = tcp_recv(s)
+    let go = true
+    while go
+        let more = tcp_recv(s)
+        if len(more) == 0
+            go = false
+        else
+            resp = resp + more
+    tcp_close(s)
+    resp
+
+// extract a Set-Cookie value (up to ';') from a response, "" if absent
+fn _cookie_val(resp: string, name: string) -> string
+    let key = "Set-Cookie: " + name + "="
+    let i = find(resp, key)
+    if i < 0
+        return ""
+    let rest = slice(resp, i + len(key), len(resp))
+    let semi = find(rest, ";")
+    if semi < 0
+        return slice(rest, 0, find(rest, "\r\n"))
+    slice(rest, 0, semi)
+
+fn main()
+    let port = 19426
+    spawn fn()
+        _server(port)
+    sleep(300)
+
+    // 1) home page renders via forge_html
+    let r1 = _req(port, "GET", "/", "", "")
+    assert(find(r1, "200") >= 0 and find(r1, "NOVA Forge Demo") >= 0, "home page renders")
+    assert(find(r1, "action=") >= 0 and find(r1, "/feedback") >= 0, "home has the feedback form")
+    print("PASS: home page (forge_html)")
+
+    // 2) content negotiation -> HTML branch, with escaping of the name
+    let r2 = _req(port, "GET", "/hello?name=%3Cb%3Ehi%3C/b%3E", "Accept: text/html\r\n", "")
+    assert(find(r2, "Hello, ") >= 0, "HTML greeting served to a browser")
+    assert(find(r2, "<b>hi</b>") < 0, "the injected <b> is NOT raw (escaped)")
+    assert(find(r2, "&lt;b&gt;hi") >= 0, "the name is HTML-escaped (XSS-safe)")
+    assert(find(r2, "Vary: Accept") >= 0, "negotiated HTML carries Vary: Accept")
+    print("PASS: negotiation -> escaped HTML")
+
+    // 3) same route, JSON branch, cacheable + Vary
+    let r3 = _req(port, "GET", "/hello?name=Sam", "Accept: application/json\r\n", "")
+    assert(find(r3, "greeting") >= 0 and find(r3, "Hello, Sam") >= 0, "JSON greeting served to an API client")
+    assert(find(r3, "Vary: Accept") >= 0, "negotiated JSON carries Vary: Accept")
+    assert(find(r3, "Cache-Control: public, max-age=30") >= 0, "JSON marked cacheable")
+    print("PASS: negotiation -> cacheable JSON")
+
+    // 4) conditional GET: the JSON response has an ETag; re-request with it -> 304
+    let ei = find(r3, "ETag: ")
+    assert(ei >= 0, "mw_etag added an ETag to the JSON response")
+    let etagrest = slice(r3, ei + 6, len(r3))
+    let etagval = slice(etagrest, 0, find(etagrest, "\r\n"))
+    let r4 = _req(port, "GET", "/hello?name=Sam", "Accept: application/json\r\nIf-None-Match: " + etagval + "\r\n", "")
+    assert(find(r4, "304") >= 0, "matching If-None-Match -> 304 Not Modified")
+    print("PASS: conditional GET -> 304")
+
+    // 5) POST feedback -> 303 redirect + flash cookie
+    let r5 = _req(port, "POST", "/feedback", "", "")
+    assert(find(r5, "303") >= 0, "feedback POST -> 303 redirect")
+    let fcookie = _cookie_val(r5, "flash")
+    assert(len(fcookie) > 0, "flash cookie set on the redirect")
+    print("PASS: POST-redirect with flash")
+
+    // 6) follow the redirect carrying the flash -> the message renders, then mw_flash consumes it
+    let r6 = _req(port, "GET", "/", "Cookie: flash=" + fcookie + "\r\n", "")
+    assert(find(r6, "Thanks for your feedback!") >= 0, "flash message rendered on the next page")
+    assert(find(r6, "Max-Age=0") >= 0, "mw_flash consumed the flash (show-once)")
+    print("PASS: flash shown once across the redirect")
+    print("forge_compose_test passed")
