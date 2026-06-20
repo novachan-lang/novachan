@@ -1918,37 +1918,60 @@ fn req_query(req: Request, key: string) -> string
     ""
 
 // ── Content negotiation (one route, any client) ───────────────────────────────────────────────────────
-// Does the request's Accept header allow `ctype`? True on an exact substring match, the "type/*" subtype
-// wildcard (e.g. "text/*" allows "text/html"), or the "*/*" catch-all. Absent Accept means "accept
-// anything" (RFC 7231), so it returns true. Case-insensitive.
+// The ordinal position (entry index) of the first Accept media-range whose type EQUALS `mt` (ignoring its
+// ;q= and other params), or -1. TOKEN-EXACT -- so "application/json" does NOT match "application/json-seq"
+// or "application/json-patch+json", and the index lets callers compare relative preference order.
+fn _accept_pos(a: string, mt: string) -> int
+    let parts = split(a, ",")
+    let i = 0
+    while i < len(parts)
+        let entry = trim(parts[i])
+        let semi = find(entry, ";")
+        if semi >= 0
+            entry = trim(slice(entry, 0, semi))
+        if entry == mt
+            return i
+        i = i + 1
+    0 - 1
+
+// Does the request's Accept header allow `ctype`? Token-exact match, the "type/*" subtype wildcard
+// (e.g. "text/*" allows "text/html"), or the "*/*" catch-all. Absent Accept = "accept anything" (RFC 7231).
 fn accepts(req: Request, ctype: string) -> bool
     let a = lower(req_header(req, "accept"))
     if a == ""
         return true
     let ct = lower(ctype)
-    if find(a, ct) >= 0
-        return true
-    if find(a, "*/*") >= 0
-        return true
+    let typewild = ""
     let slash = find(ct, "/")
     if slash > 0
-        let typewild = slice(ct, 0, slash) + "/*"
-        if find(a, typewild) >= 0
+        typewild = slice(ct, 0, slash) + "/*"
+    let parts = split(a, ",")
+    let i = 0
+    while i < len(parts)
+        let entry = trim(parts[i])
+        let semi = find(entry, ";")
+        if semi >= 0
+            entry = trim(slice(entry, 0, semi))
+        if entry == ct or entry == "*/*"
             return true
+        if typewild != "" and entry == typewild
+            return true
+        i = i + 1
     false
 
 // Does the client prefer JSON over HTML? True when the Accept header names application/json AND either
 // does not name text/html, or names json BEFORE html (a coarse but reliable q-order proxy). This is the
 // API-client-vs-browser test: a browser sends "text/html,...,*/*" (-> false); fetch/curl with
 // "application/json" (-> true). An X-Requested-With: XMLHttpRequest also forces JSON (the XHR convention).
+// Token-exact (via _accept_pos) so "application/json-seq" etc. don't false-trigger.
 fn wants_json(req: Request) -> bool
     if lower(req_header(req, "x-requested-with")) == "xmlhttprequest"
         return true
     let a = lower(req_header(req, "accept"))
-    let j = find(a, "application/json")
+    let j = _accept_pos(a, "application/json")
     if j < 0
         return false
-    let h = find(a, "text/html")
+    let h = _accept_pos(a, "text/html")
     if h < 0
         return true
     j < h
@@ -1980,9 +2003,18 @@ fn conditional(req: Request, resp: Response) -> Response
     let tag = etag_for(resp.body)
     resp.headers["ETag"] = tag
     if req_header(req, "if-none-match") == tag
+        // RFC 7232 4.1: a 304 SHOULD carry the same validator + freshness headers a 200 would -- crucially
+        // Cache-Control and Vary, or a shared cache revalidating a negotiated entry loses the Accept keying.
+        // Carry those (and Set-Cookie) forward; drop the body + body-specific headers.
         let h = {}
         h["ETag"] = tag
-        return Response(304, h, "", false, [])
+        if contains(resp.headers, "Cache-Control")
+            h["Cache-Control"] = resp.headers["Cache-Control"]
+        if contains(resp.headers, "Vary")
+            h["Vary"] = resp.headers["Vary"]
+        if contains(resp.headers, "Expires")
+            h["Expires"] = resp.headers["Expires"]
+        return Response(304, h, "", false, resp.cookies)
     resp
 
 // Middleware: apply conditional() to every response -- drop-in HTTP caching for dynamic GET routes.
@@ -2012,7 +2044,19 @@ fn no_store(resp: Response) -> Response
 fn vary(resp: Response, hdr: string) -> Response
     if contains(resp.headers, "Vary")
         let cur = resp.headers["Vary"]
-        if find(cur, hdr) < 0
+        if trim(cur) == "*"
+            return resp
+        // TOKEN-exact membership (NOT a raw substring -- else adding "Accept" when "Accept-Encoding" is
+        // already present would be wrongly skipped, and the negotiated representation would not be keyed).
+        let want = lower(hdr)
+        let toks = split(cur, ",")
+        let i = 0
+        let present = false
+        while i < len(toks)
+            if lower(trim(toks[i])) == want
+                present = true
+            i = i + 1
+        if not present
             resp.headers["Vary"] = cur + ", " + hdr
     else
         resp.headers["Vary"] = hdr
@@ -3276,16 +3320,28 @@ fn _range_response(fpath: string, ct: string, rh: string)
     if rstart < 0
         return err("no range")
     let rlen = rend - rstart + 1
+    // file_read_bytes hard-rejects n > 512MB (returns empty). Cap the read so a huge requested range
+    // (e.g. "bytes=0-" on a 4GB file) yields a VALID 206 SUB-range rather than an empty body whose
+    // Content-Range lies. Serving fewer bytes than requested is legal HTTP; a client just asks for more.
+    let cap = 536870912
+    if rlen > cap
+        rlen = cap
     let fh = file_open(fpath, "rb")
     if fh == 0
         return err("open failed")
     file_seek(fh, rstart)
     let part = file_read_bytes(fh, rlen)
     file_close(fh)
+    // Re-derive the END from the bytes ACTUALLY read, so Content-Range + Content-Length always agree even
+    // after a cap or a short read (file truncated between stat and read). 0 bytes -> representation gone.
+    let got = bytes_len(part)
+    if got <= 0
+        return err("empty read")
+    let aend = rstart + got - 1
     let hr = {}
     hr["Content-Type"] = ct
     hr["Accept-Ranges"] = "bytes"
-    hr["Content-Range"] = "bytes " + str(rstart) + "-" + str(rend) + "/" + str(total)
+    hr["Content-Range"] = "bytes " + str(rstart) + "-" + str(aend) + "/" + str(total)
     hr["Cache-Control"] = "no-cache"
     hr["ETag"] = "W/" + chr(34) + str(total) + "-" + str(file_mtime(fpath)) + chr(34)
     ok(Response(206, hr, part, false, []))

@@ -1,0 +1,91 @@
+// forge_hardening_test -- regression guards for the adversarial-review fixes:
+//  - content negotiation is TOKEN-exact (application/json-seq no longer false-matches application/json)
+//  - forge_html.link/img neutralize javascript: (and other non-safe) URL schemes
+//  - forge_html attribute NAMES are validated (a malicious key cannot inject markup)
+//  - vary() is token-exact (adding "Accept" after "Accept-Encoding" is NOT dropped)
+//  - conditional() 304 carries Cache-Control + Vary forward (RFC 7232)
+import forge
+import forge_html
+
+fn _req(accept: string)
+    forge.build_request("GET /x HTTP/1.1\r\nAccept: " + accept + "\r\n\r\n", 0)
+
+fn _d()
+    let d = {}
+    d["ok"] = "yes"
+    d
+
+fn _h(req: Request) -> Response
+    let r = forge.resp_json(200, _d())
+    r = forge.vary(r, "Accept-Encoding")
+    r = forge.vary(r, "Accept")
+    forge.cache(r, 60)
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.use(a, forge.mw_etag())
+    forge.get(a, "/x", fn(req) _h(req))
+    forge.serve_req_n(a, port, 2)
+
+fn _get(port: int, path: string, inm: string) -> string
+    let s = tcp_connect("127.0.0.1", port)
+    let req = "GET " + path + " HTTP/1.0\r\nConnection: close\r\n"
+    if inm != ""
+        req = req + "If-None-Match: " + inm + "\r\n"
+    req = req + "\r\n"
+    tcp_send(s, req)
+    let r = tcp_recv(s)
+    let go = true
+    while go
+        let more = tcp_recv(s)
+        if len(more) == 0
+            go = false
+        else
+            r = r + more
+    tcp_close(s)
+    r
+
+fn main()
+    let q = chr(34)
+
+    // --- content negotiation: token-exact ---
+    assert(forge.wants_json(_req("application/json")), "exact json -> wants_json")
+    assert(not forge.wants_json(_req("application/json-seq")), "application/json-seq must NOT match application/json")
+    assert(forge.accepts(_req("text/*"), "text/html"), "text/* accepts text/html")
+    assert(not forge.accepts(_req("application/json-patch+json"), "application/json"), "json-patch must NOT match json")
+    print("PASS: token-exact negotiation")
+
+    // --- forge_html URL scheme allowlist ---
+    let lj = forge_html.link("javascript:alert(1)", "x")
+    assert(find(lj, "javascript:") < 0, "javascript: scheme neutralized")
+    assert(find(lj, "href=" + q + "#" + q) >= 0, "neutralized href becomes #")
+    assert(find(forge_html.link("/home", "x"), "href=" + q + "/home" + q) >= 0, "relative href allowed")
+    assert(find(forge_html.link("https://ex.com/a", "x"), "https://ex.com/a") >= 0, "https href allowed")
+    assert(find(forge_html.img("javascript:evil", "a"), "javascript:") < 0, "img src scheme neutralized")
+    print("PASS: URL scheme allowlist")
+
+    // --- forge_html attribute-name validation ---
+    let bad = forge_html.el("div", {"onx=1 y": "z"}, "i")
+    assert(find(bad, "onx") < 0 and bad == "<div>i</div>", "malicious attribute name skipped")
+    assert(find(forge_html.el("div", {"data-x": "v"}, "i"), "data-x=") >= 0, "valid attribute name kept")
+    print("PASS: attribute-name validation")
+
+    // --- vary() token-exact + conditional 304 carry-forward (over a socket) ---
+    let port = 19428
+    spawn fn()
+        _server(port)
+    sleep(300)
+    let r1 = _get(port, "/x", "")
+    assert(find(r1, "Vary: Accept-Encoding, Accept") >= 0, "vary kept BOTH tokens (Accept not dropped)")
+    assert(find(r1, "Cache-Control: public, max-age=60") >= 0, "cache directive present on 200")
+    let ei = find(r1, "ETag: ")
+    let erest = slice(r1, ei + 6, len(r1))
+    let etag = slice(erest, 0, find(erest, "\r\n"))
+    print("PASS: vary token-exact on 200")
+
+    let r2 = _get(port, "/x", etag)
+    assert(find(r2, "304") >= 0, "matching If-None-Match -> 304")
+    assert(find(r2, "Vary: Accept-Encoding, Accept") >= 0, "304 carries Vary forward (RFC 7232)")
+    assert(find(r2, "Cache-Control: public, max-age=60") >= 0, "304 carries Cache-Control forward")
+    print("PASS: conditional 304 carries cache headers")
+    print("forge_hardening_test passed")
