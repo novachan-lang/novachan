@@ -175,7 +175,14 @@ static int64_t nova_make_reason(int crashed) {
 
 /* ─�� Slab Allocator (fast fixed-size pools for hot-path objects) ──────────── */
 
-#define SLAB_32_OBJ_SIZE  32
+/* Must be >= NOVA_RC_HDR_SIZE + sizeof(NovaList). NovaList is {data,size,cap,elem_kind} = 32B
+   (+8B RC header = 40B total) since the S4.0 typed-array elem_kind field. The slab alloc
+   (nova_heap_alloc: NOVA_MEM_LIST -> slab_32 iff total<=SLAB_32_OBJ_SIZE) and the slab free
+   (nova_rc_free -> nova_fast_free, size-routed) MUST agree on the pool: at 32 a 40B list fell to
+   calloc on alloc but slab_64 on free (size-class mismatch -> a 40B region handed out as a 64B
+   dict slot -> heap-buffer-overflow, ASAN-caught). 48 keeps the 40B list in slab_32 on BOTH paths
+   while the 64B dict stays in slab_64 (64 > 48). */
+#define SLAB_32_OBJ_SIZE  48
 #define SLAB_64_OBJ_SIZE  64
 #define SLAB_PAGE_OBJECTS 128
 
