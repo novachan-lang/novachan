@@ -1111,6 +1111,26 @@ static void* nova_back_grow(void* obj, size_t oldbytes, size_t newbytes, void* o
     return realloc(oldptr, newbytes);
 }
 
+/* S4.2: DEOPT a raw-double (kind=2) list back to the universal boxed (kind=0) representation by
+   re-boxing each inline double. Called at the entry of the long tail of list ops (sort/json/hash/
+   contains/concat/slice/map/filter/insert/pop/remove/set_*) so those run the proven kind=0 path
+   unchanged instead of each needing bespoke kind=2 logic. Sound (values unchanged, just re-boxed);
+   the list permanently leaves the fast representation, acceptable for these rare/non-hot ops. A
+   kind=2 list is compiler-proven single-reference (never shared across tasks), so this in-place
+   mutation has no concurrency hazard. */
+static void nova_list_deopt(int64_t handle) {
+    if (!handle) return;
+    /* CRITICAL: only act on a genuine NovaList. Several call sites (e.g. nova_rt_contains) pass a
+       dict/string/any handle -> casting that to NovaList and reading/writing the +24 elem_kind slot
+       would corrupt it. find_tag confirms the object kind before we touch any list field. */
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (l->elem_kind != 2) return;
+    for (int64_t i = 0; i < l->size; i++)
+        l->data[i] = nova_rt_box_float(l->data[i]);   /* raw double bits -> NOVA_BOX_FLOAT */
+    l->elem_kind = 0;
+}
+
 int64_t nova_rt_list_create(void) {
     NovaList* list = (NovaList*)nova_heap_alloc(sizeof(NovaList), NOVA_MEM_LIST);
     if (!list) return 0;
@@ -1145,6 +1165,10 @@ int64_t nova_rt_list_create_filled(int64_t count, int64_t value) {
 
 int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
+    /* S4.2: a GENERIC append (non-float, or unknown via escape) to a raw-double list must DEOPT it
+       first -- storing a non-double into a kind=2 list would make the kind-aware reader misread the
+       inline bits. This is the escape-appends-a-conflicting-kind safety net. */
+    if (list->elem_kind == 2) nova_list_deopt(handle);
     if (list->size >= list->cap) {
         int64_t old_cap = list->cap;
         list->cap *= 2;
@@ -1224,6 +1248,51 @@ int64_t nova_rt_list_append_no_rc(int64_t handle, int64_t elem) {
 int64_t nova_rt_list_append_fbox(int64_t handle, int64_t bits) {
     return nova_rt_list_append(handle, nova_rt_box_float(bits));
 }
+
+/* S4.2: append a float as a RAW IEEE-754 double stored INLINE in data[] (no heap box).
+   This is the unboxed contiguous fast path: reads become a native load of a double instead
+   of a box-pointer chase (the ~120x->~2.3x C win on float arrays). The compiler routes a
+   PROVEN single-reference floatlist's push here (a tainted/escaped floatlist keeps the boxed
+   append_fbox path so its Any-egress reads stay sound). elem_kind=2 marks the raw-double mode
+   so every list reader (index_get/to_str/sum/eq/deep_copy/...) handles it; a conflicting
+   non-float append DEOPTS back to kind 0 by re-boxing the existing raw doubles. No rc_inc:
+   a raw double owns no heap. */
+int64_t nova_rt_list_append_fraw(int64_t handle, int64_t bits) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    /* Keep each list UNIFORMLY one mode: only go raw (kind=2) if empty or already raw. A list that
+       already holds boxed/other elements (e.g. a make_list literal) must stay boxed, else the
+       kind-aware reader would read those boxed pointers as raw doubles. */
+    if (list->size > 0 && list->elem_kind != 2)
+        return nova_rt_list_append(handle, nova_rt_box_float(bits));
+    if (list->size >= list->cap) {
+        int64_t old_cap = list->cap;
+        list->cap *= 2;
+        list->data = (int64_t*)nova_back_grow((void*)list,
+            (size_t)old_cap * sizeof(int64_t),
+            (size_t)list->cap * sizeof(int64_t), list->data);
+    }
+    list->data[list->size++] = bits;   /* raw double bits inline; no box, no rc_inc */
+    list->elem_kind = 2;
+    return 0;
+}
+
+/* S4.2: typed float READ. Returns raw IEEE-754 double bits regardless of storage mode -> no
+   compile-time consistency requirement and no box-chase for kind=2. kind=2: the inline bits ARE
+   the double; else: unbox the boxed float. The compiler emits this for a NON-TAINTED floatlist
+   read and types the result float (downstream uses fadd/fcmp/float_to_str). */
+int64_t nova_rt_list_get_f(int64_t handle, int64_t index) {
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (index < 0) index += list->size;
+    if (index < 0 || index >= list->size) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "list index %lld out of range for list of size %lld",
+                 (long long)(index < 0 ? index - list->size : index), (long long)list->size);
+        nova_set_error(buf);
+        return 0;
+    }
+    if (list->elem_kind == 2) return list->data[index];   /* raw double bits, no deref */
+    return nova_rt_unbox(list->data[index]);              /* boxed float -> raw double bits */
+}
 int64_t nova_rt_list_append_bbox(int64_t handle, int64_t v) {
     return nova_rt_list_append(handle, nova_rt_box_bool(v));
 }
@@ -1239,10 +1308,16 @@ int64_t nova_rt_list_get(int64_t handle, int64_t index) {
         nova_set_error(buf);
         return 0;
     }
+    /* S4.2 kind=2 box-on-egress: a raw-double list element returned through the generic/Any path
+       must become a proper NOVA_BOX_FLOAT so no downstream find_tag ever sees raw double bits.
+       The compiler's TYPED float read (xs[j] in float context) uses a separate raw-load path. */
+    if (list->elem_kind == 2)
+        return nova_rt_box_float(list->data[index]);
     return nova_rt_unbox_elem(list->data[index]);
 }
 
 int64_t nova_rt_list_set(int64_t handle, int64_t index, int64_t value) {
+    nova_list_deopt(handle);  /* S4.2: index-set runs the boxed path (v1; raw in-place is a follow-on) */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (index < 0) index += list->size;
     if (index < 0 || index >= list->size) {
@@ -1260,11 +1335,13 @@ int64_t nova_rt_list_set(int64_t handle, int64_t index, int64_t value) {
 }
 
 int64_t nova_rt_eq(int64_t a, int64_t b);  /* fwd decl: value equality, used by list_remove (def below) */
+int64_t nova_rt_float_to_str(int64_t bits); /* fwd decl: S4.2 kind=2 list_to_str formats raw doubles */
 
 /* pop the LAST element and RETURN it. Ownership TRANSFERS to the caller (NO rc_dec -- so a heap
    element the caller now holds is never double-freed; the orphaned ref leaks like any other
    reassigned heap local under the partial-RC model). Empty list -> error + 0. */
 int64_t nova_rt_list_pop(int64_t handle) {
+    nova_list_deopt(handle);  /* S4.2: rare op -> run the boxed path */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list || list->size == 0) {
         nova_set_error("pop from empty list");
@@ -1277,6 +1354,7 @@ int64_t nova_rt_list_pop(int64_t handle) {
 /* insert value at index i, shifting [i..size) one slot right. i<0 -> 0, i>size -> size (append).
    rc_inc's the inserted value (mirrors list_append). */
 int64_t nova_rt_list_insert(int64_t handle, int64_t index, int64_t value) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list) return 0;
     int64_t i = index;
@@ -1301,6 +1379,7 @@ int64_t nova_rt_list_insert(int64_t handle, int64_t index, int64_t value) {
    element was removed, 0 if absent. rc_dec's the removed element (mirrors list_set dropping the
    replaced element) -- safe because every list element was rc_inc'd when stored. */
 int64_t nova_rt_list_remove(int64_t handle, int64_t value) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list) return 0;
     for (int64_t k = 0; k < list->size; k++) {
@@ -1385,6 +1464,15 @@ int64_t nova_rt_list_to_str(int64_t handle) {
     buf[pos++] = '[';
     for (int64_t i = 0; i < list->size; i++) {
         if (i > 0) { buf[pos++] = ','; buf[pos++] = ' '; }
+        if (list->elem_kind == 2) {
+            /* S4.2: raw-double element -> format as float directly; never find_tag raw bits. */
+            const char* fe = (const char*)(uintptr_t)nova_rt_float_to_str(list->data[i]);
+            size_t fn = strlen(fe);
+            while (pos + fn + 6 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+            memcpy(buf + pos, fe, fn);
+            pos += fn;
+            continue;
+        }
         int64_t s = nova_rt_elem_to_str(list->data[i]);
         const char* elem = (const char*)(uintptr_t)s;
         size_t n = strlen(elem);
@@ -1592,6 +1680,7 @@ int64_t nova_rt_repeat(int64_t s, int64_t count) {
 }
 
 int64_t nova_rt_list_repeat(int64_t list, int64_t count) {
+    nova_list_deopt(list);  /* S4.2 */
     int64_t result = nova_rt_list_create();
     if (count <= 0) return result;
     int64_t len = nova_rt_list_len(list);
@@ -1824,6 +1913,7 @@ int64_t nova_rt_chars(int64_t s) {
 /* ── List stdlib ──────────────────────────────────────────────────────────── */
 
 int64_t nova_rt_list_concat(int64_t a, int64_t b) {
+    nova_list_deopt(a); nova_list_deopt(b);  /* S4.2 */
     NovaList* la = (NovaList*)(uintptr_t)a;
     NovaList* lb = (NovaList*)(uintptr_t)b;
     int64_t new_list = nova_rt_list_create();
@@ -1875,6 +1965,7 @@ int64_t nova_rt_range_from_to(int64_t from, int64_t to) {
 }
 
 int64_t nova_rt_list_reverse(int64_t handle) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t new_list = nova_rt_list_create();
     for (int64_t i = l->size - 1; i >= 0; i--)
@@ -1921,6 +2012,7 @@ static int nova_elem_is_str(int64_t v) {
 }
 
 int64_t nova_rt_list_sort(int64_t handle) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size < 2) return handle;
     /* Pick the comparator by element kind: a homogeneous string list sorts lexicographically
@@ -1941,6 +2033,7 @@ int64_t nova_rt_list_sort(int64_t handle) {
 typedef int64_t (*nova_fn1)(int64_t env, int64_t arg);
 
 int64_t nova_rt_list_map(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t* rec = (int64_t*)(uintptr_t)closure;
     nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
@@ -1965,6 +2058,7 @@ int64_t nova_rt_list_map_fbox(int64_t handle, int64_t closure) {
 }
 
 int64_t nova_rt_list_filter(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t* rec = (int64_t*)(uintptr_t)closure;
     nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
@@ -1976,6 +2070,7 @@ int64_t nova_rt_list_filter(int64_t handle, int64_t closure) {
 }
 
 int64_t nova_rt_list_slice(int64_t handle, int64_t start, int64_t end) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (start < 0) start += l->size;
     if (end < 0) end += l->size;
@@ -2002,6 +2097,7 @@ int64_t nova_rt_list_slice(int64_t handle, int64_t start, int64_t end) {
 int64_t nova_rt_eq(int64_t a, int64_t b);  /* fwd decl: value equality (def below) */
 
 int64_t nova_rt_contains(int64_t container, int64_t item) {
+    nova_list_deopt(container);  /* S4.2 */
     if (container == 0) return 0;
     void* ptr = (void*)(uintptr_t)container;
     NovaMemTag tag = nova_mem_find_tag(ptr);
@@ -2342,6 +2438,13 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
         int64_t dst = nova_rt_list_create();
         if (!dst) { nova_rc_inc(v); return v; }
         nova_copymap_put(m, v, dst);
+        if (src->elem_kind == 2) {
+            /* S4.2: raw-double list -> copy the inline doubles directly. NEVER deep_copy_rec a raw
+               double: its bit pattern can fake a heap pointer -> find_tag -> wild recursion. */
+            for (int64_t i = 0; i < src->size; i++)
+                nova_rt_list_append_fraw(dst, src->data[i]);
+            return dst;
+        }
         for (int64_t i = 0; i < src->size; i++) {
             int64_t e = nova_deep_copy_rec(src->data[i], m, depth + 1);
             nova_rt_list_append(dst, e);
@@ -2501,6 +2604,7 @@ int64_t nova_rt_for_iter_init(int64_t obj) {
             nova_rt_list_append(result, (int64_t)b->data[i]);
         return result;
     }
+    if (tag == NOVA_MEM_LIST) nova_list_deopt(obj);  /* S4.2: for-in runs the boxed path in v1 */
     return obj;
 }
 
@@ -3381,6 +3485,7 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth) {
         return;
     }
     if (tag == NOVA_MEM_LIST) {
+        nova_list_deopt(val);  /* S4.2: rebox raw doubles -> reuse the boxed-float json rendering */
         NovaList* l = (NovaList*)ptr;
         jbuf_char(b, '[');
         for (int64_t i = 0; i < l->size; i++) {
@@ -4015,8 +4120,16 @@ int64_t nova_rt_eq(int64_t a, int64_t b) {
         NovaList* la = (NovaList*)(uintptr_t)a;
         NovaList* lb = (NovaList*)(uintptr_t)b;
         if (la->size != lb->size) return 0;
+        int ka2 = (la->elem_kind == 2), kb2 = (lb->elem_kind == 2);
         for (int64_t i = 0; i < la->size; i++) {
-            if (!nova_rt_eq(la->data[i], lb->data[i])) return 0;
+            if (ka2 || kb2) {
+                /* S4.2: a raw-double element compares NUMERICALLY; never find_tag raw bits.
+                   kind=2 -> reinterpret the inline bits as double; else extract via elem_to_double. */
+                double da, db2;
+                if (ka2) memcpy(&da, &la->data[i], sizeof(double)); else da = nova_elem_to_double(la->data[i]);
+                if (kb2) memcpy(&db2, &lb->data[i], sizeof(double)); else db2 = nova_elem_to_double(lb->data[i]);
+                if (da != db2) return 0;
+            } else if (!nova_rt_eq(la->data[i], lb->data[i])) return 0;
         }
         return 1;
     }
@@ -10427,6 +10540,7 @@ int64_t nova_rt_sum(int64_t handle) {
 }
 
 int64_t nova_rt_index_of(int64_t handle, int64_t item) {
+    nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l) return -1;
     for (int64_t i = 0; i < l->size; i++) {
@@ -10485,19 +10599,25 @@ int64_t nova_rt_list_max(int64_t handle) {
    result as float. Each element is read via nova_elem_to_double (boxed float → value,
    raw IEEE bits → value, normal int → value), and the result is returned as float bits.
    The integer variants above stay exact for pure-int lists (any magnitude). */
+/* S4.2: extract element i as a double. kind=2 -> the inline bits ARE the double (reinterpret,
+   never find_tag); else the standard boxed/int -> double extraction. */
+static double nova_list_dbl(NovaList* l, int64_t i) {
+    if (l->elem_kind == 2) { double d; memcpy(&d, &l->data[i], sizeof(double)); return d; }
+    return nova_elem_to_double(l->data[i]);
+}
 int64_t nova_rt_sum_f(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     double acc = 0.0;
-    if (l) for (int64_t i = 0; i < l->size; i++) acc += nova_elem_to_double(l->data[i]);
+    if (l) for (int64_t i = 0; i < l->size; i++) acc += nova_list_dbl(l, i);
     int64_t bits; memcpy(&bits, &acc, sizeof(bits)); return bits;
 }
 int64_t nova_rt_list_min_f(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     double m = 0.0;
     if (l && l->size > 0) {
-        m = nova_elem_to_double(l->data[0]);
+        m = nova_list_dbl(l, 0);
         for (int64_t i = 1; i < l->size; i++) {
-            double d = nova_elem_to_double(l->data[i]);
+            double d = nova_list_dbl(l, i);
             if (d < m) m = d;
         }
     }
@@ -10507,9 +10627,9 @@ int64_t nova_rt_list_max_f(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     double m = 0.0;
     if (l && l->size > 0) {
-        m = nova_elem_to_double(l->data[0]);
+        m = nova_list_dbl(l, 0);
         for (int64_t i = 1; i < l->size; i++) {
-            double d = nova_elem_to_double(l->data[i]);
+            double d = nova_list_dbl(l, i);
             if (d > m) m = d;
         }
     }
@@ -10928,6 +11048,7 @@ int64_t nova_rt_hash(int64_t val) {
        between equals()/hashCode()). List = positional; dict = order-independent (its eq
        ignores entry order); struct = positional, seeded with the slot-0 type hash. */
     if (tag == NOVA_MEM_LIST) {
+        nova_list_deopt(val);  /* S4.2: rebox raw doubles -> reuse the boxed hash path */
         NovaList* l = (NovaList*)ptr;
         uint64_t h = 14695981039346656037ULL;
         for (int64_t i = 0; i < l->size; i++) {
@@ -11022,7 +11143,7 @@ int64_t nova_rt_tensor_from_list(int64_t data_handle, int64_t shape_handle) {
     NovaTensor* t = (NovaTensor*)(uintptr_t)handle;
     if (!t) return 0;
     for (int64_t i = 0; i < t->size; i++) {
-        t->data[i] = nova_elem_to_double(data->data[i]);
+        t->data[i] = nova_list_dbl(data, i);   /* S4.2: kind=2-aware (raw-double inline or boxed) */
     }
     return handle;
 }
@@ -14197,6 +14318,7 @@ void nova_rt_register_fn(int64_t name_val, int64_t fn_ptr, int64_t arity) {
 int64_t nova_rt_call_by_name(int64_t name_val, int64_t args_handle) {
     const char* name = (const char*)(uintptr_t)name_val;
     if (!name) { nova_set_error("call_by_name: null function name"); return 0; }
+    nova_list_deopt(args_handle);  /* S4.2: reflection reads args raw via nova_rt_unbox -> a kind=2 raw-double list would collide with a box pointer; deopt to boxed first (no-op for kind=0/1) */
     NovaList* args = (NovaList*)(uintptr_t)args_handle;
     int n = args ? (int)args->size : 0;
     if (n > 16) { nova_set_error("call_by_name: more than 16 arguments not supported"); return 0; }
@@ -18680,8 +18802,8 @@ int64_t nova_rt_gpu_vadd_floats(int64_t a_handle, int64_t b_handle) {
     float* hc = (float*)calloc((size_t)n, sizeof(float));
     if (!ha || !hb || !hc) { free(ha); free(hb); free(hc); nova_set_error("gpu_vadd_floats: oom"); return out; }
     for (int64_t i = 0; i < n; ++i) {
-        ha[i] = (float)nova_elem_to_double(la->data[i]);
-        hb[i] = (float)nova_elem_to_double(lb->data[i]);
+        ha[i] = (float)nova_list_dbl(la, i);   /* S4.2: kind=2-aware (raw-double inline or boxed) */
+        hb[i] = (float)nova_list_dbl(lb, i);
     }
 
     nova_gpu_init();

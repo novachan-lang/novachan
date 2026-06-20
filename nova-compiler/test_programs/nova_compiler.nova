@@ -5949,6 +5949,8 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_list_append_no_rc(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_dict_set_no_rc(i64, i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_append_fbox(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_list_append_fraw(i64, i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_list_get_f(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_list_append_bbox(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_box_bool(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_unbox(i64) nounwind")
@@ -13915,8 +13917,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                                 return inst
                             else
                                 if vt == "float" and st[lslot] == "floatlist"
-                                    // float appended to a floatlist -> stays a homogeneous
-                                    // floatlist (boxed storage; reads stay typed-float).
+                                    // float appended to an ALREADY-floatlist (from a make_list literal) ->
+                                    // stays a homogeneous floatlist, BOXED storage (append_fbox, kind=0).
+                                    // NOTE: an empty/"list" + float push does NOT promote to floatlist
+                                    // here. The S4.2 push->floatlist (kind=2 raw-double) PROMOTION was
+                                    // REVERTED 2026-06-20 (see project-s4-typed-arrays): typing push-built
+                                    // float lists as floatlist makes their reads raw doubles, which the
+                                    // value model fails to box at several sinks (call-arg "val" param,
+                                    // cross-block comparison, index_set) -> a cascade of corruptions
+                                    // (stats median unsorted, geox haversine raw bits). The 68x float-array
+                                    // win needs a robust foundation (first-class typed-array type), not an
+                                    // inferred list mode. kind=2 runtime machinery stays (dormant, sound).
                                     if dest != ""
                                         rt[dest] = "floatlist"
                                     return IrInst(op, dest, typ, args, "nova_rt_list_append_fbox", num, effect, line)
@@ -14108,13 +14119,14 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     if not ig_tainted and ir_reg_type(rt, args[0]) == "intlist"
                         rt[dest] = "int"
                         return IrInst(op, dest, ir_type_int(), args, value, ig_nn, effect, line)
-                    if ir_reg_type(rt, args[0]) == "floatlist"
-                        // floatlist element is a boxed float; read it as a TYPED float
-                        // (full unbox -> raw double) so downstream uses fadd/fcmp/float_to_str
-                        // instead of dynamic dispatch. The "fl" marker tells the emitter to
-                        // emit nova_rt_unbox (raw double) rather than nova_rt_unbox_elem.
+                    if not ig_tainted and ir_reg_type(rt, args[0]) == "floatlist"
+                        // S4.2: kind-aware typed float read via nova_rt_list_get_f -> returns the raw
+                        // IEEE-754 double whether the list is kind=2 (raw inline, NO box-chase -> the
+                        // ~120x->fast win) or kind=0 (boxed -> unbox). Result typed float so downstream
+                        // uses fadd/fcmp/float_to_str. A TAINTED floatlist falls through to the sound
+                        // generic path (nova_rt_index_get -> box-on-egress).
                         rt[dest] = "float"
-                        return IrInst(op, dest, ir_type_float(), args, "fl", ig_nn, effect, line)
+                        return IrInst("call", dest, ir_type_float(), [args[0], args[1]], "nova_rt_list_get_f", num, effect, line)
                     rt[dest] = "val"
                 return IrInst(op, dest, typ, args, value, ig_nn, effect, line)
             else if op == "index_set"
@@ -14255,7 +14267,15 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                     let akey = str(ai)
                                     if not contains(pm, akey)
                                         do_box = true
-                                    else if pm[akey] == "any"
+                                    else if pm[akey] == "any" or pm[akey] == "val"
+                                        // A float arg into a GENERIC param must be boxed. "any" and
+                                        // "val" are both generic value slots (the latter is the label
+                                        // for a generic index_get/call result; fpt records it as a
+                                        // param type when a call site passes e.g. p[0] from an untyped
+                                        // param). Boxing only special-cased "any", so a float read
+                                        // (e.g. floatlist[i] via get_f, raw double bits) passed into a
+                                        // "val" param flowed in UNBOXED and was rendered as an integer
+                                        // (geox/stats: haversine(p1[0],..) got raw bits). Treat val==any.
                                         do_box = true
                                 if do_box
                                     let bxc = 0
@@ -14309,12 +14329,14 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                         push(a_args, aa)
                                 push(new_insts, IrInst(op, dest, typ, a_args, value, num, effect, line))
                                 handled = true
-                        else if op == "slot_store" and len(args) == 1 and contains(st, value) and st[value] == "any"
-                            // Storing a RAW float into an `any`-typed slot (e.g. a loop-
+                        else if op == "slot_store" and len(args) == 1 and contains(st, value) and (st[value] == "any" or st[value] == "val")
+                            // Storing a RAW float into a GENERIC slot (e.g. a loop-
                             // carried accumulator that widened to "any", or an explicit
                             // `let x: any = 1.5`) must box it, so a later load reads a float,
                             // not raw bits. Float-typed slots store raw (fast path); only
-                            // "any" slots box. See VALUE_MODEL_OVERHAUL.md.
+                            // generic slots box. "val" is the generic-value label (sibling of
+                            // "any"); both must box -- see the call-arg boxing above.
+                            // See VALUE_MODEL_OVERHAUL.md.
                             if ir_reg_type(rt, args[0]) == "float"
                                 let sbc = 0
                                 if contains(rt, "@wbox@")
@@ -15386,24 +15408,15 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     if contains(e.ire_reg_types, args[0])
                         tgt_kind = e.ire_reg_types[args[0]]
                     if tgt_kind == "list"
-                        let lp = dest + ".lp"
-                        let dp = dest + ".dp"
-                        let ep = dest + ".ep"
-                        let szp = dest + ".szp"
-                        let sz = dest + ".sz"
-                        let neg = dest + ".neg"
-                        let adj = dest + ".adj"
-                        let fi = dest + ".fi"
-                        ire_indent(e, lp + " = inttoptr i64 " + args[0] + " to ptr")
-                        ire_indent(e, dp + " = load ptr, ptr " + lp + ", align 8, !tbaa !2")
-                        ire_indent(e, szp + " = getelementptr i64, ptr " + lp + ", i64 1")
-                        ire_indent(e, sz + " = load i64, ptr " + szp + ", align 8, !tbaa !6")
-                        ire_indent(e, neg + " = icmp slt i64 " + args[1] + ", 0")
-                        ire_indent(e, adj + " = add i64 " + args[1] + ", " + sz)
-                        ire_indent(e, fi + " = select i1 " + neg + ", i64 " + adj + ", i64 " + args[1])
-                        ire_indent(e, ep + " = getelementptr i64, ptr " + dp + ", i64 " + fi)
-                        ire_indent(e, dest + ".lv = load i64, ptr " + ep + ", align 8, !tbaa !4")
-                        ire_indent(e, dest + " = call i64 @nova_rt_unbox(i64 " + dest + ".lv)")
+                        // S4.2 SOUNDNESS: this inline (originally load data[i] + nova_rt_unbox, used
+                        // for tuple/destructure element reads) misreads a kind=2 raw-double list --
+                        // the raw IEEE bits handed to nova_rt_unbox can collide with a box-pointer
+                        // pattern (find_tag false positive -> wild deref). nova_rt_list_get_f is the
+                        // EXACT kind-aware equivalent: kind=0 -> nova_rt_unbox(data[i]) (identical to
+                        // the old inline), kind=2 -> the raw bits directly (no unbox, no find_tag), and
+                        // it bounds/negative-index checks (which the inline lacked). Result is a raw
+                        // double either way -- the existing consumer semantics are preserved.
+                        ire_indent(e, dest + " = call i64 @nova_rt_list_get_f(i64 " + args[0] + ", i64 " + args[1] + ")")
                         call_inlined = true
                 if (value == "nova_rt_list_create" or value == "nova_rt_list_create_filled") and dest != ""
                     e.ire_reg_types[dest] = "list"
@@ -15560,32 +15573,24 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 if contains(e.ire_reg_types, args[0])
                     target_kind = e.ire_reg_types[args[0]]
                 if target_kind == "list"
-                    let lp = dest + ".lp"
-                    let dp = dest + ".dp"
-                    let ep = dest + ".ep"
-                    ire_indent(e, lp + " = inttoptr i64 " + args[0] + " to ptr")
-                    ire_indent(e, dp + " = load ptr, ptr " + lp + ", align 8, !tbaa !2")
-                    if num == 1
-                        ire_indent(e, ep + " = getelementptr i64, ptr " + dp + ", i64 " + args[1])
-                    else
-                        let szp = dest + ".szp"
-                        let sz = dest + ".sz"
-                        let neg = dest + ".neg"
-                        let adj = dest + ".adj"
-                        let fi = dest + ".fi"
-                        ire_indent(e, szp + " = getelementptr i64, ptr " + lp + ", i64 1")
-                        ire_indent(e, sz + " = load i64, ptr " + szp + ", align 8, !tbaa !6")
-                        ire_indent(e, neg + " = icmp slt i64 " + args[1] + ", 0")
-                        ire_indent(e, adj + " = add i64 " + args[1] + ", " + sz)
-                        ire_indent(e, fi + " = select i1 " + neg + ", i64 " + adj + ", i64 " + args[1])
-                        ire_indent(e, ep + " = getelementptr i64, ptr " + dp + ", i64 " + fi)
-                    ire_indent(e, dest + ".lv = load i64, ptr " + ep + ", align 8, !tbaa !4")
+                    // S4.2 SOUNDNESS: the generic "list"-typed read MUST be kind-aware. An inline
+                    // load of data[i] + unbox_elem misreads a kind=2 (raw-double) list -- the raw
+                    // IEEE bits are handed to unbox_elem, which treats them as an int/box pointer
+                    // (e.g. q[0]+q[1] on a push-built float list became an integer add of the bit
+                    // patterns). A kind=2 list can reach this path when the read fails to specialize
+                    // to nova_rt_list_get_f (store-to-load forwarding can rewrite slot_load->copy and
+                    // drop the floatlist slot type). Route through nova_rt_list_get instead: it is
+                    // BEHAVIOR-IDENTICAL to the old inline path for kind=0/1 (returns
+                    // nova_rt_unbox_elem(data[i]), with negative-index + bounds handling the inline
+                    // path lacked), and box-on-egress for kind=2 (returns a proper NOVA_BOX_FLOAT so
+                    // no downstream find_tag/arith ever sees raw double bits). The typed-fast float
+                    // read still uses nova_rt_list_get_f (raw double, no box) -- the perf win is kept
+                    // where the read specializes; correctness is now independent of specialization.
                     if value == "fl"
-                        // floatlist read: full unbox to a raw double, typed float.
-                        ire_indent(e, dest + " = call i64 @nova_rt_unbox(i64 " + dest + ".lv)")
+                        ire_indent(e, dest + " = call i64 @nova_rt_list_get_f(i64 " + args[0] + ", i64 " + args[1] + ")")
                         ire_mark_float(e, dest)
                     else
-                        ire_indent(e, dest + " = call i64 @nova_rt_unbox_elem(i64 " + dest + ".lv)")
+                        ire_indent(e, dest + " = call i64 @nova_rt_list_get(i64 " + args[0] + ", i64 " + args[1] + ")")
                 else if target_kind == "dict"
                     ire_indent(e, dest + " = call i64 @nova_rt_dict_get(i64 " + args[0] + ", i64 " + args[1] + ")")
                 else
@@ -16576,6 +16581,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_list_append_no_rc(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_dict_set_no_rc(i64, i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_list_append_fbox(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_append_fraw(i64, i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_get_f(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_list_append_bbox(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_list_pop(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_list_insert(i64, i64, i64) nounwind")
