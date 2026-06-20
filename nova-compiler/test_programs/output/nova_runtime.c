@@ -4285,6 +4285,23 @@ int64_t nova_rt_channel_send(int64_t handle, int64_t value) {
    so we skip the deep copy and transfer the value directly. */
 int64_t nova_rt_channel_send_move(int64_t handle, int64_t value) {
     NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    /* ARENA-ESCAPE SAFETY (the move-send sibling of the nova_rt_channel_send fix). Move proves the sender
+       won't reuse `value`, so we normally enqueue it raw. BUT if `value` is ARENA-resident (built in the
+       active per-request/message arena), a raw enqueue hands the receiver a pointer that arena_exit frees
+       WHOLESALE -> cross-task use-after-free (and rc_dec later on a non-rc arena pointer). In that case fall
+       back to the COPYING send: nova_rt_channel_send materializes an independent RC-heap copy (active_arena
+       cleared) and owns the close-path rc_dec. The arena source is reclaimed wholesale and move semantics
+       means the caller never drops it -> no leak, no double-free, no UAF. RC-heap / scalar / literal values
+       are NOT arena-resident and keep the zero-copy move. The arena test mirrors nova_deep_copy_rec exactly:
+       a managed object (find_tag != -1) whose rc field carries NOVA_RC_ARENA_BIT. */
+    if ((uint64_t)value >= 0x10000ULL) {
+        NovaTaskState* _ms_t = nova_cur();
+        if (_ms_t && _ms_t->active_arena) {
+            void* _ms_p = (void*)(uintptr_t)value;
+            if (nova_mem_find_tag(_ms_p) != (NovaMemTag)-1 && (NOVA_RC_COUNT(_ms_p) & NOVA_RC_ARENA_BIT))
+                return nova_rt_channel_send(handle, value);
+        }
+    }
     /* Green task: PARK (yield to the carrier) on a full bounded channel instead of
        blocking the carrier OS thread — mirrors nova_rt_channel_send (INV-6 / RACE-19).
        Move semantics: enqueue `value` directly (no deep copy). On close, return -1
@@ -4646,7 +4663,15 @@ int64_t nova_rt_try_recv(int64_t handle) {
    nova_rt_channel_send; if not sent, the copy is freed (no leak). */
 int64_t nova_rt_try_send(int64_t handle, int64_t value) {
     NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    /* ARENA-ESCAPE SAFETY (sibling of the nova_rt_channel_send fix): the deep copy is an ownership transfer
+       across the task boundary, so it MUST land on the RC heap, not the sender's active per-request/message
+       arena (freed wholesale at arena_exit -> the enqueued copy dangles = cross-task UAF). Clear active_arena
+       around the copy so it is rc=1 heap memory the receiver owns. Inert when no arena is active. */
+    NovaTaskState* _ts_t = nova_cur();
+    NovaArena* _ts_saved = _ts_t->active_arena;
+    _ts_t->active_arena = NULL;
     int64_t copy = nova_rt_deep_copy(value);
+    _ts_t->active_arena = _ts_saved;
     int sent = 0;
 #ifdef _WIN32
     EnterCriticalSection(&ch->lock);
