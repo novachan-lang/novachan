@@ -6593,6 +6593,7 @@ static void nova_pool_shutdown(void) {
 static int    nova_argc = 0;
 static char** nova_argv = NULL;
 
+static void nova_file_ensure_init(void);   /* defined in the file-handle section; called here once */
 void nova_rt_init(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -6600,6 +6601,10 @@ void nova_rt_init(void) {
     InitializeCriticalSection(&nova_mem_lock);
     InitializeCriticalSection(&nova_proc_registry_lock);
 #endif
+    /* Phase 0c: initialize the file-handle table mutex ONCE here, single-threaded at startup, before any
+       worker/carrier thread runs. nova_file_ensure_init then becomes a no-op on every later call, closing
+       the TOCTOU where two threads could both pass `if (!nova_file_init)` and double-init the CS. */
+    nova_file_ensure_init();
     nova_slab_init();
     void* probe = malloc(64);
     if (probe) {
