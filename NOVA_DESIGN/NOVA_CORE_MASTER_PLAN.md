@@ -122,3 +122,22 @@ REVISED M1-CRITICAL PATH (all tractable, much nearer than the mountain framing):
 
 NEXT BUILD ITEM: Stage 3 struct SROA (design pass -> build -> gate). The perf endgame (S4/S5) becomes a
 parallel continuous-improvement track after M1.
+
+## M1 STATUS (2026-06-20) -- foundations VERIFIED, formal battery gate pending
+After Phase 0/1/2/3a, the M1-critical foundations are all in place AND empirically verified:
+ - Phase 0 soundness floor: DONE (UAF/arena/type-checker/file-init; type-checker rejects bad programs).
+ - Phase 1: functional zero-syntax generics VERIFIED (pick(a,b) at int/float/string) + C-class direct perf
+   VERIFIED (native fmul/fadd). S3 struct-SROA + S4/S5 endgame = continuous-after-M1.
+ - Phase 2: capability derivation VERIFIED (str/==/copy/json_stringify on a zero-annotation struct;
+   compiler REJECTS @derive because it's all automatic from Value structure).
+ - Phase 3a: 18-module stdlib installed (lib/) + import-validated + out-of-tree usable.
+ - Concurrency (processes/channels/actors/supervisors) + Forge web framework: pre-existing, gated.
+535/535 both RC modes, 19 commits this session.
+
+The original "multi-month mountain" was the perf ENDGAME (S4/S5) -- correctly continuous-after-M1, not a
+blocker. Most foundations were already built; the loop verified, hardened, and finished them.
+
+NEXT (formal M1 gate): build/measure the ~3-program battery (web slice [Forge], concurrent server
+[green_scale], systems/numeric kernel) against the 6 non-negotiables -- esp. C-perf <=1.1x clang -- to
+FORMALLY confirm M1, then BRANCH: frameworks (Forge/Mesh/Ops/Sentinel/Pulse) || continuous compiler loop
+(S3 SROA, S4/S5, Phase 4 targets GPU/WASM/embedded).
