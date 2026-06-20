@@ -2368,6 +2368,11 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
         NovaBytes* src = (NovaBytes*)(uintptr_t)v;
         int64_t dst = nova_rt_bytes_create(src->size);
         NovaBytes* db = (NovaBytes*)(uintptr_t)dst;
+        /* OOM must not silently hand the receiver a null/degraded bytes (downstream null-deref / silent
+           data loss). Crash-isolated panic instead -- the longjmp is now contained by the fault boundaries,
+           which free the active arena (nova_task_arena_cleanup). */
+        if (!db || (src->size > 0 && !db->data))
+            nova_panic("deep copy: out of memory copying bytes");
         if (db && db->data && src->data && src->size > 0)
             memcpy(db->data, src->data, (size_t)src->size);
         return dst;
@@ -4891,6 +4896,19 @@ static void nova_install_fiber_veh(void) {
         AddVectoredExceptionHandler(1, nova_fiber_overflow_handler);
 }
 
+/* Free any still-active per-task arena and reset the pointer. Called at task completion / after a caught
+   fault: a panic longjmps OVER the handler's arena_scope_exit, which would otherwise (1) LEAK the request
+   arena and (2) leave a DANGLING active_arena that the next task on this carrier/pool thread inherits ->
+   cross-task corruption (reachable in normal "let it crash" operation, not just pathological nesting).
+   NULL on the clean path -> no-op. Frees the innermost arena; a rare nested-arena panic leaks the outer
+   scopes (acceptable on an exceptional path) but never corrupts -- active_arena=NULL is the safe baseline. */
+void nova_rt_arena_free(int64_t);   /* defined later in the arena section */
+static void nova_task_arena_cleanup(void) {
+    NovaTaskState* t = nova_cur();
+    NovaArena* a = t->active_arena;
+    if (a) { t->active_arena = NULL; nova_rt_arena_free((int64_t)(uintptr_t)a); }
+}
+
 static void CALLBACK nova_fiber_entry(LPVOID param) {
     NovaFiber* f = (NovaFiber*)param;
     nova_current_fiber = f;
@@ -4927,6 +4945,7 @@ static void CALLBACK nova_fiber_entry(LPVOID param) {
         fflush(stderr);
     }
     f->task.fault_active = 0;
+    nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
     f->status = 3;
     /* return to the CURRENT carrier if a carrier resumed us (migration/corruption-safe), else to
@@ -5076,6 +5095,7 @@ static void nova_posix_fiber_trampoline(void) {
         fn(f->entry_fn, 0);
     }
     f->task.fault_active = 0;
+    nova_task_arena_cleanup();   /* panic longjmp'd over arena_scope_exit -> free + reset (no leak/corruption) */
 
     f->status = 3;
     NovaFiber* back = (g_carrier_count > 1 && f->is_task) ? &nova_carrier_fiber : f->resumer;
@@ -6425,6 +6445,8 @@ static DWORD WINAPI nova_pool_worker(LPVOID arg) {
         pool->tasks_completed++;
         WakeAllConditionVariable(&pool->all_done);
         LeaveCriticalSection(&pool->lock);
+        nova_task_arena_cleanup();   /* between tasks on the shared pool thread: a faulted/leaked arena must
+                                        not carry into the next task (cross-task corruption) */
     }
     return 0;
 }
@@ -6481,6 +6503,8 @@ static void* nova_pool_worker(void* arg) {
         pool->tasks_completed++;
         pthread_cond_broadcast(&pool->all_done);
         pthread_mutex_unlock(&pool->lock);
+        nova_task_arena_cleanup();   /* between tasks on the shared pool thread: a faulted/leaked arena must
+                                        not carry into the next task (cross-task corruption) */
     }
     return NULL;
 }
