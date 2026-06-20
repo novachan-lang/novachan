@@ -1417,6 +1417,9 @@ int64_t nova_rt_list_iter_has_next(int64_t handle, int64_t index) {
 
 int64_t nova_rt_list_iter_get(int64_t handle, int64_t index) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
+    /* S4 Stage-0: kind=2 (raw double) -> box on egress so a generic for-in variable never
+       receives raw IEEE-754 bits (for-in normally deopts first; this is defense-in-depth). */
+    if (list->elem_kind == 2) return nova_rt_box_float(list->data[index]);
     return list->data[index];
 }
 
@@ -1501,6 +1504,10 @@ int64_t nova_rt_list_to_str(int64_t handle) {
 int64_t nova_rt_intlist_to_str(int64_t handle) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list) return (int64_t)(uintptr_t)nova_fat_str_create("[]", 2);
+    /* S4 Stage-0: this formats data[i] as a raw int64 ("%lld"). A kind=2 (raw double) list would
+       print bit patterns as ints; the compiler only routes intlists (kind=1) here, but delegate
+       defensively to the kind-aware list_to_str if a kind=2 list ever arrives. */
+    if (list->elem_kind == 2) return nova_rt_list_to_str(handle);
     size_t cap = 64;
     char* buf = (char*)malloc(cap);
     if (!buf) return (int64_t)(uintptr_t)nova_fat_str_create("[]", 2);
@@ -1867,6 +1874,7 @@ int64_t nova_rt_find(int64_t s, int64_t sub) {
 }
 
 int64_t nova_rt_join(int64_t list_handle, int64_t sep) {
+    nova_list_deopt(list_handle);  /* S4 Stage-0: join reads data[i] as a string pointer; deopt so a kind=2 list never feeds raw double bits to strlen (wild read) */
     NovaList* l = (NovaList*)(uintptr_t)list_handle;
     const char* s = (const char*)(uintptr_t)sep;
     size_t sep_len = strlen(s);
@@ -2048,6 +2056,7 @@ int64_t nova_rt_list_map(int64_t handle, int64_t closure) {
    the result list holds raw float bits that render/serialize as ints. (Anonymous lambdas
    already box their float return, so they keep using plain nova_rt_list_map.) */
 int64_t nova_rt_list_map_fbox(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);  /* S4 Stage-0: closure must not receive raw double bits from a kind=2 list */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t* rec = (int64_t*)(uintptr_t)closure;
     nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
@@ -2620,6 +2629,7 @@ int64_t nova_rt_for_destr_init(int64_t obj) {
 
 int64_t nova_rt_for_kv_init(int64_t obj) {
     if (obj == 0) return nova_rt_list_create();
+    nova_list_deopt(obj);  /* S4 Stage-0: for k,v over a list yields data[i] as the value; deopt so kind=2 raw doubles box first (no-op for dict/bytes/kind0/1 via find_tag guard) */
     void* ptr = (void*)(uintptr_t)obj;
     NovaMemTag tag = nova_mem_find_tag(ptr);
     if (tag == NOVA_MEM_DICT) {
@@ -3658,6 +3668,7 @@ static void term_encode_value(NovaTermBuf* b, int64_t val, int depth) {
     }
     if (tag == NOVA_MEM_LIST) {
         NovaList* l = (NovaList*)ptr;
+        nova_list_deopt((int64_t)(uintptr_t)ptr);  /* S4 Stage-0: encode recurses on each element as a value; deopt so kind=2 raw doubles box first */
         ntb_byte(b, NOVA_TT_LIST); ntb_varint(b, (uint64_t)l->size);
         for (int64_t i = 0; i < l->size; i++) term_encode_value(b, l->data[i], depth + 1);
         return;
@@ -7203,6 +7214,7 @@ static int nova_pmap_thread_count(int64_t n) {
 }
 
 int64_t nova_rt_pmap(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);  /* S4 Stage-0: deopt ONCE before spawning workers -> parallel closures never read raw kind=2 doubles (race-free: done pre-spawn) */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size == 0) return nova_rt_list_create();
     int64_t n = l->size;
@@ -7258,6 +7270,7 @@ int64_t nova_rt_pmap(int64_t handle, int64_t closure) {
 }
 
 int64_t nova_rt_pfilter(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);  /* S4 Stage-0: deopt ONCE before spawning workers -> parallel closures never read raw kind=2 doubles (race-free: done pre-spawn) */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size == 0) return nova_rt_list_create();
     int64_t n = l->size;
@@ -8435,8 +8448,15 @@ static void nova_rc_free(void* ptr) {
     switch (tag) {
         case NOVA_MEM_LIST: {
             NovaList* l = (NovaList*)ptr;
-            for (int64_t i = 0; i < l->size; i++)
-                nova_rc_dec_internal(l->data[i]);
+            /* S4 Stage-0: kind=2 (raw inline doubles) elements are scalars, NEVER heap refs.
+               Running rc_dec on raw IEEE-754 bits would feed a double's bit pattern to find_tag
+               as if it were a pointer -- and double patterns collide with the heap-pointer range
+               more readily than int patterns do, so unlike intlist (kind=1, find_tag-safe) we must
+               NOT dec kind=2 elements. Skip the dec loop for kind=2; kind=0/1 keep the proven path. */
+            if (l->elem_kind != 2) {
+                for (int64_t i = 0; i < l->size; i++)
+                    nova_rc_dec_internal(l->data[i]);
+            }
             if (l->data) free(l->data);
             nova_fast_free((char*)ptr - NOVA_RC_HDR_SIZE,
                            NOVA_RC_HDR_SIZE + sizeof(NovaList));
@@ -10496,6 +10516,7 @@ int64_t nova_rt_zip(int64_t handle_a, int64_t handle_b) {
 }
 
 int64_t nova_rt_reduce(int64_t handle, int64_t closure, int64_t init) {
+    nova_list_deopt(handle);  /* S4 Stage-0: closure must not receive raw double bits from a kind=2 list */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t* rec = (int64_t*)(uintptr_t)closure;
     nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
@@ -10508,6 +10529,7 @@ int64_t nova_rt_reduce(int64_t handle, int64_t closure, int64_t init) {
 }
 
 int64_t nova_rt_any_match(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);  /* S4 Stage-0: closure must not receive raw double bits from a kind=2 list */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t* rec = (int64_t*)(uintptr_t)closure;
     nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
@@ -10519,6 +10541,7 @@ int64_t nova_rt_any_match(int64_t handle, int64_t closure) {
 }
 
 int64_t nova_rt_all_match(int64_t handle, int64_t closure) {
+    nova_list_deopt(handle);  /* S4 Stage-0: closure must not receive raw double bits from a kind=2 list */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t* rec = (int64_t*)(uintptr_t)closure;
     nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
@@ -10529,9 +10552,16 @@ int64_t nova_rt_all_match(int64_t handle, int64_t closure) {
     return 1;
 }
 
+/* S4 Stage-0 forward decls: int-aggregates delegate a (mis-routed) kind=2 list to the float
+   variant. The compiler routes float/Any lists to the _f variants (so these never see kind=2
+   in practice); this keeps the runtime TOTAL over elem_kind as defense-in-depth. */
+int64_t nova_rt_sum_f(int64_t handle);
+int64_t nova_rt_list_min_f(int64_t handle);
+int64_t nova_rt_list_max_f(int64_t handle);
 int64_t nova_rt_sum(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size == 0) return 0;
+    if (l->elem_kind == 2) return nova_rt_sum_f(handle);  /* raw doubles -> float sum */
     int64_t acc = 0;
     for (int64_t i = 0; i < l->size; i++) {
         acc += l->data[i];
@@ -10577,6 +10607,7 @@ int64_t nova_rt_all_truthy(int64_t handle) {
 int64_t nova_rt_list_min(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size == 0) return 0;
+    if (l->elem_kind == 2) return nova_rt_list_min_f(handle);  /* S4 Stage-0: raw doubles -> float min */
     int64_t min_val = l->data[0];
     for (int64_t i = 1; i < l->size; i++) {
         if (l->data[i] < min_val) min_val = l->data[i];
@@ -10587,6 +10618,7 @@ int64_t nova_rt_list_min(int64_t handle) {
 int64_t nova_rt_list_max(int64_t handle) {
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size == 0) return 0;
+    if (l->elem_kind == 2) return nova_rt_list_max_f(handle);  /* S4 Stage-0: raw doubles -> float max */
     int64_t max_val = l->data[0];
     for (int64_t i = 1; i < l->size; i++) {
         if (l->data[i] > max_val) max_val = l->data[i];
