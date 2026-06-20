@@ -1,0 +1,205 @@
+# S4 — Typed Contiguous Arrays (the #1 perf item, the NOVA way)
+
+**Status: DESIGN (2026-06-20).** Measured gap: float array sum `xs[j]` = ~120x C. Foundation
+(NovaTensor raw `double*`) exists. This doc = the architectural design; infra-specific line refs
+filled in from the list-infra exploration.
+
+## The problem (measured + IR-confirmed) — and the KEY asymmetry
+| Array kind | NOVA vs C @ -O2 | storage | xs[j] lowering | cause |
+|---|---|---|---|---|
+| **int** (`intlist`) | **2.3x** (118ms vs 51ms) | RAW int64 inline | **native load (0 runtime calls!)** | only bounds-check + no-SIMD residual |
+| **float** (`floatlist`) | **120x** (10.9s vs 91ms) | **HEAP-BOXED** (`append_fbox` -> NovaBox per elem) | unbox path | scattered heap derefs + box alloc |
+
+★★ DECISIVE FINDING (2026-06-20): the fast path ALREADY EXISTS and is PROVEN SOUND for ints. `intlist`
+does raw inline storage + native-load lowering today -> 2.3x C. The 120x float gap is a pure ASYMMETRY:
+ints are stored raw (an int is its own value, find_tag-safe), but **floats are BOXED solely because a raw
+double bit-pattern read as `any` confuses find_tag** (the historic int/float CVE class -- a double's high
+bits look like a pointer/large-int). So S4 is NOT a new representation -- it is: **mirror the proven
+intlist mechanism for doubles + add a per-list `element_kind` so the `any`-boundary boxes floatlist
+elements correctly.** The native-load lowering, the @het@ poison, the floatlist detection, and the "fl"
+marker are all already in the compiler (see Existing Infra below). Much lower risk than first framed.
+
+## Existing infra to REUSE (from list-infra exploration, file:line)
+- Runtime `NovaList {int64_t* data; int64_t size; int64_t cap;}` (nova_runtime.c:1049) -- NO element-kind
+  field yet (the one field to add). `NovaBox {kind; payload}` (644) boxes floats/bools.
+- Runtime `NovaTensor {double* data; ...}` (10968) -- the proven raw-double contiguous representation.
+- Compiler IR type registry `ir_reg_type` with values `"intlist"`/`"floatlist"`/`"list"`/`@het@` poison
+  (13567, 13987-14015, 13817-13862). make_list detects all-int->intlist, all-float->floatlist; append
+  promotes/poisons; **@het@ is sticky -> a heterogeneous append demotes to "list" and never re-promotes.**
+- index_get specialization (14020-14036): intlist->native int load; floatlist-> "fl" marker -> raw double.
+- `fpt` whole-program param typing (ir_collect_param_types, 14488-14530); `ir_list_elem_stype` (struct
+  element tracking pattern, 8553-8596) -- the template for tracking a list local's element kind.
+- index_get lowered at ir_lower_expr (8035), make_list at (7983), push->nova_rt_list_append at (7593+).
+
+## The float-any soundness problem (THE crux, what the boxing currently buys)
+Floats are boxed so that `find_tag`/`any`-dispatch can tell a list element is a float (not int/pointer).
+Removing the box requires the runtime to know, PER LIST, that elements are doubles -> `element_kind=2`.
+Then: the TYPED read (compiler proved float) returns raw double bits (fast, no box); an ANY read goes
+through a runtime op that sees element_kind=2 and BOXES on demand (sound). This is the same box-float->any
+discipline already shipped for scalar float-any (the int/float soundness fixes). element_kind makes it
+work for list elements.
+
+## The NOVA-way constraint (the hard part)
+ZERO annotations. The developer writes `let xs = []`, `push(xs, 1.5)`, `xs[j]` -- no `float64[]` type,
+no `Vec<f64>`. The **compiler must INFER** that `xs` is a homogeneous float array and back it with
+contiguous unboxed storage + native loads. Harder than Julia/Rust (where the user declares the array
+type). This is the genius-compiler bar: the common numeric case must "just be fast," no ceremony.
+
+## Decision: HYBRID (runtime typed storage + compile-time native lowering)
+Three approaches considered:
+- **A. Pure static** (compiler proves type, emits native load): needs contiguous unboxed storage anyway,
+  and needs the runtime to still support boxed for the unprovable case. So the runtime change is required
+  regardless.
+- **B. Pure runtime typed-list** (NovaList gains elem_kind, index_get fast-paths homogeneous): removes the
+  box-deref (120x -> ~10x) but KEEPS the per-element runtime CALL -> still opaque, no vectorization.
+  Insufficient for match-C, let alone beat-C.
+- **C. HYBRID (CHOSEN)**: runtime gains an unboxed contiguous mode (B's storage) AND when the compiler
+  PROVES the element type it lowers `xs[j]` to a native inlined `gep+load` (A's lowering), bypassing the
+  call. Unprovable -> runtime call (handles both modes, correct, current speed). Best of both, sound.
+
+## Soundness invariant (the keystone -- a single hole = type-confusion/UAF)
+A list is EITHER **fully-compiler-managed-unboxed** (proven homogeneous for its WHOLE lifetime; native
+loads valid; runtime NEVER deopts it) OR **fully-runtime-boxed** (current). **No mid-life transition** for
+a specialized list. The compiler emits the native unboxed path ONLY when it has proven no heterogeneous
+write can ever happen to that list -> the runtime's `elem_kind` is set once at creation and never changes
+-> the native load can never read a pointer as a double. Unprovable -> boxed forever (correct, current
+speed). This is the same discipline as the total-RC/W5b work: **only ever ADD specialization where provably
+safe; a false negative is slow-but-correct, a false positive is unsound -> bias hard to conservative.**
+
+## Inference rule (when is `xs` provably homogeneous-scalar?)
+Specialize a list variable to unboxed-double (kind=2) / unboxed-int (kind=1) iff ALL hold:
+1. Every WRITE site (list-literal element, `push`, `xs[i]=v`) writes the SAME scalar kind (all float, or
+   all int). A float-literal/float-typed value -> kind 2; int-literal/int-typed -> kind 1.
+2. NO write of a non-scalar (string/list/struct/bytes/any) anywhere in the list's lifetime.
+3. The list does not ESCAPE to a context that could append a different kind or read it as a mutable `any`:
+   - returned/stored where its static type is lost to `any` with a possible heterogeneous append -> deopt.
+   - passed to a function not proven kind-preserving -> deopt (conservative). (fpt's whole-program call-site
+     typing -- `ir_collect_param_types` -- is the analogous existing mechanism; reuse its discipline.)
+4. Reads-as-`any` that only OBSERVE (print, to_json, ==, len, send) are FINE -- the runtime path boxes on
+   demand. Only writes/mutations-to-different-kind disqualify.
+Default when anything is ambiguous: **boxed** (current behavior, correct). Conservative by construction.
+
+## Representation
+Reuse the NovaList struct + add `elem_kind` (0=boxed/heterogeneous [current], 1=int64-inline,
+2=double-inline). When kind!=0, `data` is a contiguous `int64_t[]`/`double[]` (values inline, NOT boxed
+pointers). **find_tag/RTTI UNCHANGED**: a typed list still tags as a LIST; `any`-dispatch goes through the
+runtime which is mode-aware (less invasive + safer than a new first-class tag; cf. the NovaBytes tag work,
+which was needed there because bytes had no list identity -- here we reuse list identity).
+
+## Every runtime list op becomes mode-aware (the bulk of S4.0)
+index_get/index_set, append/push, len, to_str, eq (nova_rt_eq deep compare), deep_copy (kind!=0 ->
+single memcpy of the raw buffer -- FASTER), free, sort, contains, slice, channel-send (homogeneous
+double[] is trivially Sendable -> memcpy, faster). Default kind=0 -> byte-identical to today.
+
+## Value-model interaction (verified safe)
+- **arena/RC**: the raw buffer lives in arena (per-request) or RC heap (long-lived), same as today's
+  NovaList backing -- no new lifetime rules.
+- **deep_copy / channels**: kind!=0 copies/sends via one memcpy (faster than element-wise boxed copy);
+  Sendable trivially (no inner pointers).
+- **any-access**: runtime ops box-on-demand for any-consumers; correctness preserved.
+
+## ★★★ FINAL ARCHITECTURE (post-adversary 2026-06-20 — SUPERSEDES "Decision: HYBRID", "Soundness invariant", and the per-variable "param-mutation taint" idea below)
+The 12-attack adversarial review found the fatal flaw: **NOVA lists are REFERENCE types** (`let ys = xs`
+aliases the same `NovaList*`), the compiler has **no alias analysis**, and my "compiler proves homogeneity ->
+native load BYPASSES the runtime" plan lets aliasing/struct-fields/dict-values/escape mutate the shared
+buffer heterogeneously while a native load reads it as raw doubles -> type confusion. A compile-time proof
+(even with escape/param-mutation taint) CANNOT be made airtight without full alias analysis. So invert it:
+
+**RUNTIME is the single source of truth; the compiler's native load is a GUARDED, hoistable HINT.**
+1. **Runtime invariant (authoritative):** NovaList.`elem_kind` in {0=boxed, 1=int64-raw, 2=double-raw}.
+   Empty `[]` starts kind=0; the FIRST append sets the kind (int->1, float->2, other->0). Any append/set
+   of a CONFLICTING kind **DEOPTS** the list: kind 1->0 is cheap (raw ints are valid boxed elements; just
+   box the new non-int, set kind 0); kind 2->0 RE-BOXES all existing doubles (O(n), rare) then sets kind 0.
+   Because EVERY write goes through the runtime append/set, **every alias observes the deopt** -> the
+   invariant "kind==2 => all data[] are raw doubles" holds under arbitrary aliasing. SOUND by construction.
+2. **All list reads are mode-aware:** index_get/len/eq/sort/to_str/deep_copy/concat/repeat/map/filter/... 
+   branch on elem_kind. An `any`-returning read of a kind-2 element **boxes the double on the way out**
+   (closes the find_tag/int-pointer CVE class). deep_copy/channel-send of kind!=0 = memcpy (never find_tag
+   on raw bits). NEVER rc_inc/rc_dec a raw scalar element (kinds 1/2). [adversary attacks 3,5,6,8,11]
+3. **Compiler emits a GUARDED native fast-path** (replaces the current UNGUARDED intlist native load that
+   the escape probe proved unsound): `xs[j]` -> `k = load xs.elem_kind; if k==<K> { bounds-check; native
+   gep+load on xs.data } else { call nova_rt_index_get(xs,j) }`. In a loop that does NOT mutate xs, LLVM
+   LICM hoists the `k` load + the `xs.data` base out of the loop and auto-vectorizes the native arm ->
+   read-only numeric loops hit ~intlist speed. In a mutating loop, the append is an opaque call that may
+   write xs.data/size, so LLVM conservatively re-reads them each iteration -> realloc-safe. [attacks 1,2,4]
+   The guard means the compiler's inference is now only a PERF HINT: a wrong guess = slow (runtime path),
+   never unsound. Aliasing/polymorphic-helper/struct-field/dict cases all fall to the runtime path safely.
+
+WHY THIS BEATS the compile-time-proof approach: soundness no longer depends on alias analysis NOVA lacks;
+the runtime enforces it; the guard is the firewall the native load was missing. The residual cost (one
+well-predicted branch on scattered access; hoisted to ~free in hot read loops; rare O(n) float deopt) is
+the price of soundness and is acceptable. This ALSO fixes the pre-existing intlist escape bug below.
+
+## REVISED STAGING (authoritative)
+- **S4.0 (runtime, soundness floor):** add `elem_kind`; first-append sets kind; conflicting append DEOPTS
+  (kind1->0 cheap, kind2->0 reboxes); make EVERY list op mode-aware incl. any-read box-on-egress + no
+  rc on raw scalars. Default path (kind 0) byte-identical. GATE: full regression both modes + ASAN +
+  an adversarial suite (alias, struct-field, dict, deep_copy, sort-negatives, empty-then-hetero-push).
+- **S4.1 (compiler, fixes the pre-existing bug):** replace the unguarded intlist native load with the
+  GUARDED form; verify _escprobe now prints 1,2,3.5,4 AND `sum(intArray)` stays native+hoisted. RECONVERGE.
+- **S4.2 (runtime+compiler):** float kind=2 raw storage path (append_fraw, no box) wired at the existing
+  floatlist detection + guarded native double load. GATE: float array-sum 120x -> ~2.3x C. RECONVERGE.
+- **S4.3:** coverage (index-set, slice, nested, 2D->NovaTensor) + the full adversarial regression.
+- **S4.4 (BEAT-C):** SIMD — close the 2.3x (bounds-check elision where provable + reduction vectorization;
+  FP-reduction needs a fast-math `sum` contract; int reductions auto-vec cleanly).
+
+## ★★ PRE-EXISTING SOUNDNESS HOLE FOUND (2026-06-20) — fixed by S4.0+S4.1 above (kept for the record)
+EMPIRICAL (current shipped compiler, _escprobe): an `intlist` (raw int64 storage + native load, ALREADY
+shipped) that ESCAPES to a function which appends a non-int is CORRUPTED. Repro:
+```
+fn addfloat(lst)   push(lst, 3.5)
+fn main()
+    let xs = []   push(xs,1)  push(xs,2)   addfloat(xs)   push(xs,4)
+    # read back -> prints 1, 2, 2659068203608, 4   (element 3 = a BOX POINTER read as raw int)
+```
+ROOT CAUSE: main marks xs `intlist` and never demotes on escape; fpt types addfloat's param `intlist`;
+addfloat boxes the float (append_fbox) INTO the raw int64 array; main reads xs[2] as a native raw int ->
+reads the box pointer as an integer. This is the int/pointer CVE class (project-int-pointer-soundness).
+Today it is a wrong-answer; it becomes a CRASH if that value flows to any-dispatch/find_tag, and S4's
+raw-DOUBLE storage would make it FLOAT corruption (string escape-appended into a raw double[]).
+
+THE SOUND FIX (S4.0, also fixes the pre-existing bug): a typed list (intlist/floatlist) must be DEMOTED to
+generic boxed in the CALLER if it is passed to a function that could make it heterogeneous. NOT "any escape"
+(that kills the common read-only `sum(xs)`/`dot(xs)` pattern). The condition = whole-program param-MUTATION
+taint: a list param that is appended-to with a CONFLICTING kind (transitively) taints the caller's list ->
+demote to boxed. Read-only params (sum/mean/dot/map-source -- the vast majority of array-consuming fns)
+stay fast. fpt already walks all functions per call site; extend it with a per-param "append-taint" fixpoint
+over the call graph. Conservative bias: if unsure whether a callee mutates the param's kind -> demote (slow
+but correct). VERIFY: _escprobe prints 1,2,3.5,4 after the fix; the common `sum(intArray)` stays native.
+
+## Staging (REFRAMED: intlist already does raw-storage+native-load @ 2.3x C; bring floatlist to parity)
+- **S4.0 (SOUNDNESS FLOOR, do FIRST):** close the escape hole above (param-mutation taint -> demote). GATE:
+  _escprobe correct + regression both modes + ASAN. This is a pre-existing-bug fix; it must land before any
+  raw-float storage. Adversary review in flight may add sibling vectors to cover together.
+- **S4.0** runtime: add `element_kind` (0=boxed[current], 1=int64-raw, 2=double-raw) to NovaList; make every
+  list op mode-aware; for kind=2, data[] holds RAW double bits; an ANY/find_tag read of a kind=2 element
+  BOXES on demand (the soundness keystone). Default 0 -> byte-identical. ASAN + full regression both modes.
+- **S4.1** runtime: float fast paths -- `list_append_fraw` (store raw bits, no box) + kind-2 index returning
+  raw double; deep_copy/channel-send of kind-2 = single memcpy; eq/to_str/sort kind-2-aware.
+- **S4.2** compiler: at the EXISTING floatlist creation/append, emit the kind=2 raw path instead of
+  append_fbox; the @het@/escape guard must be sound for the STORAGE switch (not just the read marker) --
+  the soundness-critical step under adversary review.
+- **S4.3** compiler: lower floatlist `xs[j]` to a native raw-double load (mirror the intlist native load
+  that already emits 0 runtime calls). GATE: float array-sum 120x -> ~2.3x C (intlist parity); regression
+  both modes + ASAN; RECONVERGE.
+- **S4.4** coverage: index-set, slice, nested lists; 2D+ reuse NovaTensor.
+- **S4.5 (BEAT-C)** SIMD: close the residual 2.3x (BOTH int & float) = bounds-check + no auto-vec. C
+  auto-vectorizes the reduction; NOVA's bounds-checked load loop does not. FP-reduction reassoc caveat:
+  strict IEEE sum won't auto-vec without fast-math -> beat-C needs a reduction decision (vector reduction
+  intrinsic, or a NOVA fast-math `sum` contract). Int reductions auto-vec cleanly (assoc). S4.0-4.4 =
+  floatlist reaches intlist parity (2.3x); S4.5 = both -> ~1x (match) and beat-C on SIMD.
+
+## Falsification (what would prove this WRONG)
+- If the inference can't be made conservative without rejecting the common `let xs=[]; push; xs[j]` loop
+  (i.e., the common case escapes in a way we must deopt) -> the win evaporates. MUST verify the canonical
+  numeric loop is provable.
+- If making every runtime list op mode-aware regresses the boxed path measurably -> tax on existing code.
+- If find_tag-reuse lets an any-typed heterogeneous read mis-read an unboxed buffer -> UAF. The whole-
+  lifetime proof must close this; ASAN + an adversarial any-read-of-typed-list test is the guard.
+
+## Competitive check
+- C: contiguous double[] -- S4.0-4.4 matches (native load), S4.5 (SIMD) beats only with reduction reassoc.
+- Rust Vec<f64>: same machine code after S4.3, but NOVA needs ZERO annotation (Rust declares the type) -> NOVA wins on ergonomics at equal speed.
+- Julia: typed arrays but user-declared / dynamic-dispatch fallback warmup; NOVA infers + AOT, no warmup.
+- NumPy/Python: NOVA's loop is native; NumPy needs vectorized C calls to be fast (loses on scalar loops).
+- Go: []float64 native but no auto-SIMD reduction either; NOVA ties at S4.4, can beat at S4.5.
