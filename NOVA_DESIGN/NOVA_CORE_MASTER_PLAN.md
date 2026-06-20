@@ -171,3 +171,33 @@ continuous track.
 => M1 IS REACHED. BRANCH NOW: framework loop (Forge/Mesh/Ops/Sentinel/Pulse can start immediately) ||
 continuous compiler loop (S3 struct SROA -> S4 SIMD arrays -> S5 monomorphization; Phase 4 targets
 GPU/WASM/embedded as each unlocks Reactor/Cortex/Prism/Edge).
+
+## POST-M1 PERF MAP (2026-06-20, all MEASURED at the correct -O2 path, not -O0 quick-run)
+| Pattern | NOVA vs C @ -O2 | Status |
+|---|---|---|
+| Scalar numeric loop (recurrence) | ~1.00x | DONE (S1 native fmul/fadd + clang mem2reg/LICM/unroll) |
+| Struct-passed-to-fn (dot product) | ~1.00x | DONE -- struct-S1 (b36ae32) + clang SROA/inline. **S3 is ALREADY closed**; the old 1.2-1.3x was pre-b36ae32. No new compiler work needed. |
+| **MATCH-C (scalar + struct)** | **<=1.00x** | **DONE.** |
+| Float ARRAY sum `xs[j]` over 10M | **~120x SLOWER** | **S4 -- THE #1 GAP.** |
+
+★★ THE #1 COMPILER ITEM = S4 TYPED CONTIGUOUS ARRAYS. ROOT CAUSE (measured + IR-confirmed): a general
+`xs[j]` on a NovaList is a non-inlinable `nova_rt_index_get` CALL per element returning a HEAP-BOXED float
+pointer (list_append_fbox) -> summing 10M elems x 10 passes = 100M runtime calls + 100M scattered heap
+derefs (cache-miss storm). C reads one contiguous double[]. Gap = ~120x.
+
+FOUNDATION ALREADY EXISTS: NovaTensor (nova_runtime.c ~11061+) is a raw contiguous `double* data` with
+`restrict` SIMD-friendly ops (tensor_add/mul/scale). The fast representation is PROVEN in-tree -- S4's job is
+to make the COMMON CASE (a homogeneous float/int list, array-accessed in a loop) use a NovaTensor-class
+unboxed contiguous backing + lower `xs[j]` to a native indexed load (gep+load, inlinable, vectorizable),
+NOT a runtime call. Compiler must INFER homogeneity (all appends same scalar kind, no heterogeneous/any use)
+and stay SOUND (a later non-scalar append must fall back). This is Tier-1 requirement #4 (data-oriented
+layout) and the GATE for the numeric frameworks (Cortex AI / Reactor game / Pulse data).
+
+HONEST M1 REFINEMENT: M1 "match-C" holds for SCALAR + STRUCT compute (done). It does NOT yet hold for
+ARRAY/collection-heavy compute (120x). The M1-IMMEDIATE frameworks (Forge web / Mesh distributed / Ops /
+Sentinel) are I/O & control-bound -> unaffected -> can branch now. The NUMERIC frameworks are array-bound ->
+GATED on S4. So S4 is Tier-1.5: not needed for the web/distributed branch, REQUIRED for the numeric branch.
+
+NEXT BUILD ITEM (active): S4 typed contiguous arrays. Design pass first (representation + inference rule +
+sound fallback + lowering + interaction with arena/RC/deep_copy/channels), then build incrementally, gate
+(reconverge + regression both modes + ASAN). Exploration of the existing list infra launched to ground it.
