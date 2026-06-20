@@ -53,7 +53,9 @@ $track7_tests = @(
     'track7_random_test',
     'track7_datetime_test',
     'track7_path_test',
-    'track7_collections_lib_test'
+    'track7_collections_lib_test',
+    '_s4_adv_test',
+    '_s4_adv_chan_test'
 )
 
 # Phase 12-14 new tests

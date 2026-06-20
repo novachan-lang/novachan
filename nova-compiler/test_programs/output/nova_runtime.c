@@ -1050,6 +1050,14 @@ typedef struct {
     int64_t* data;
     int64_t  size;
     int64_t  cap;
+    /* S4 typed-array (iter, 2026-06-20): element kind for the unboxed contiguous fast path.
+       0 = boxed/heterogeneous (the universal Any path — exactly current behavior). 1 = int64-raw.
+       2 = double-raw. APPENDED as the 4th field on purpose: NovaList & NovaBytes (below) share the
+       {data,size,cap} prefix that find_tag's structural predicate validates; growing only the tail
+       leaves that prefix intact, and elem_kind is read ONLY after the RC tag == NOVA_MEM_LIST is
+       confirmed (NovaBytes has no 4th field). The runtime is the single source of truth: a
+       conflicting append DEOPTS to 0, so every alias observes it (see S4_TYPED_ARRAYS_DESIGN.md). */
+    int64_t  elem_kind;
 } NovaList;
 
 /* Binary byte buffer. Defined HERE (not at the bytes-functions section far below) because
@@ -1102,6 +1110,7 @@ int64_t nova_rt_list_create(void) {
     list->data = nova_back_alloc(8 * sizeof(int64_t));
     list->size = 0;
     list->cap  = 8;
+    list->elem_kind = 0;
     return (int64_t)(uintptr_t)list;
 }
 
@@ -1123,6 +1132,7 @@ int64_t nova_rt_list_create_filled(int64_t count, int64_t value) {
     }
     list->size = count;
     list->cap  = cap;
+    list->elem_kind = 0;
     return (int64_t)(uintptr_t)list;
 }
 
@@ -1838,6 +1848,7 @@ int64_t nova_rt_range(int64_t n) {
     if (n > 0 && !list->data) return 0;
     list->size = n;
     list->cap  = n;
+    list->elem_kind = 0;
     for (int64_t i = 0; i < n; i++) list->data[i] = i;
     return (int64_t)(uintptr_t)list;
 }
@@ -1851,6 +1862,7 @@ int64_t nova_rt_range_from_to(int64_t from, int64_t to) {
     if (n > 0 && !list->data) return 0;
     list->size = n;
     list->cap  = n;
+    list->elem_kind = 0;
     for (int64_t i = 0; i < n; i++) list->data[i] = from + i;
     return (int64_t)(uintptr_t)list;
 }
