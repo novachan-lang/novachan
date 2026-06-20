@@ -411,6 +411,14 @@ fn _build_req_from_bytes(raw, conn: int) -> Request
     let ctl = lower(hdrstr)
     let is_bin = find(ctl, "multipart/form-data") >= 0 or find(ctl, "application/octet-stream") >= 0
     if is_bin == false
+        // Truncate the text body to Content-Length (symmetric with the binary path below) so bytes that
+        // arrived past the body -- an over-read or a pipelined next request -- are not folded into req.body.
+        let tcl = _content_length(hdrstr)
+        if tcl >= 0 and tcl <= _max_body()
+            let tend = sep + 4 + tcl
+            if tend > bytes_len(raw)
+                tend = bytes_len(raw)
+            return build_request(bytes_to_str(bytes_slice(raw, 0, tend)), conn)
         return build_request(bytes_to_str(raw), conn)
     let cl = _content_length(hdrstr)
     let req = build_request(bytes_to_str(bytes_slice(raw, 0, sep + 4)), conn)
@@ -491,8 +499,13 @@ fn _extract_boundary(ct_raw: string) -> string
     if semi >= 0
         rest = slice(rest, 0, semi)
     rest = trim(rest)
+    // Strip surrounding quotes -- but only drop the TRAILING quote if one is actually there, else an
+    // opening-quote-without-close ("abc) would lose its last real byte.
     if len(rest) >= 2 and ord(char_at(rest, 0)) == 34
-        rest = slice(rest, 1, len(rest) - 1)
+        if ord(char_at(rest, len(rest) - 1)) == 34
+            rest = slice(rest, 1, len(rest) - 1)
+        else
+            rest = slice(rest, 1, len(rest))
     rest
 
 // Read a quoted attribute (name="value") out of a part's header string. Returns "" if absent.
@@ -506,6 +519,16 @@ fn _mp_attr(hdr: string, key: string) -> string
     if e < 0
         return ""
     slice(hdr, s, e)
+
+// True if any byte in body[a, e) is NUL. A part header carrying an embedded NUL would be truncated by
+// bytes_to_str (a C string), letting an attacker hide the real name/filename/content-type after the NUL.
+fn _bytes_range_has_nul(body, a: int, e: int) -> bool
+    let i = a
+    while i < e
+        if bytes_get(body, i) == 0
+            return true
+        i = i + 1
+    false
 
 // Parse a multipart/form-data body (a NovaBytes) into a list of Part. The body is split on the delimiter
 // "\r\n--{boundary}" (the leading CRLF belongs to the delimiter, NOT the payload -- the #1 multipart bug).
@@ -535,6 +558,9 @@ fn parse_multipart(body, boundary: string) -> list
         // part headers end at \r\n\r\n
         let hend = _bytes_find(body, "\r\n\r\n", hstart)
         if hend < 0
+            return parts
+        // A NUL in the part header truncates bytes_to_str -> name/filename/content-type confusion; reject.
+        if _bytes_range_has_nul(body, hstart, hend)
             return parts
         let hdr = bytes_to_str(bytes_slice(body, hstart, hend))
         let body_start = hend + 4
@@ -770,6 +796,19 @@ fn ws_try_decode_n(buf, start: int, avail: int) -> WsFrame
     let opcode = b0 & 15
     let masked = (b1 & 128) != 0
     let len7 = b1 & 127
+    // RFC 6455 5.2/5.5 validation (rejects only illegal frames -> safe for both the server decode of masked
+    // client frames AND a client decode of unmasked server frames, which are always well-formed):
+    //   - RSV bits must be 0 (no extension negotiated)
+    //   - opcode must be a defined one (0 cont, 1 text, 2 binary, 8 close, 9 ping, 10 pong)
+    //   - control frames (opcode>=8) must be <=125 bytes and never fragmented (FIN=1)
+    // -1002 = protocol error; _ws_read_message maps a negative status to a Close(abs(status)).
+    if (b0 & 112) != 0
+        return WsFrame(0 - 1002, 0, 0, 0, 0)
+    if opcode != 0 and opcode != 1 and opcode != 2 and opcode != 8 and opcode != 9 and opcode != 10
+        return WsFrame(0 - 1002, 0, 0, 0, 0)
+    if opcode >= 8
+        if len7 > 125 or fin == 0
+            return WsFrame(0 - 1002, 0, 0, 0, 0)
     let hdr = 2
     let plen = len7
     if len7 == 126
@@ -2369,11 +2408,12 @@ fn mw_flash()
 fn _ct_eq(a: string, b: string) -> bool
     if len(a) != len(b)
         return false
+    // Branchless OR-accumulate of per-byte XOR: no data-dependent branch in the loop, so timing does not
+    // leak WHERE two equal-length secrets first differ. diff stays 0 iff every byte matches.
     let diff = 0
     let i = 0
     while i < len(a)
-        if a[i] != b[i]
-            diff = diff + 1
+        diff = diff | (ord(a[i]) ^ ord(b[i]))
         i = i + 1
     diff == 0
 
