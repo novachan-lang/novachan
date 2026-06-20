@@ -88,3 +88,13 @@ if (Test-Path $ForgeSrcDir) {
         Copy-Item -Force $_.FullName (Join-Path $LibDir $_.Name)
     }
 }
+# Install the curated pure-NOVA STDLIB modules into $NOVA_HOME/lib so an out-of-tree project resolves
+# `import corex` (etc.) from the toolchain -- exactly like an installed standard library. Canonical source
+# lives in test_programs/ for now (validated in-tree by the *_lib_test.nova suite); a dedicated stdlib/
+# source dir is a future cleanup. Each is a pure library (its self-test main is ignored on import).
+$StdlibModules = @('corex','strx','urlx','csvx','bignum','complexnum','rational','basex','setops','matrixx','collx','getin','prng','uuid','bitset','graphemex','pvecx','coro')
+New-Item -ItemType Directory -Force -Path $LibDir | Out-Null
+foreach ($m in $StdlibModules) {
+    $src = Join-Path $PSScriptRoot "$m.nova"
+    if (Test-Path $src) { Copy-Item -Force $src (Join-Path $LibDir "$m.nova") }
+}
