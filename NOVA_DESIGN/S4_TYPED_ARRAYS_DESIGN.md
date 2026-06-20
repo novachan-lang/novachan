@@ -130,6 +130,57 @@ the runtime enforces it; the guard is the firewall the native load was missing. 
 well-predicted branch on scattered access; hoisted to ~free in hot read loops; rare O(n) float deopt) is
 the price of soundness and is acceptable. This ALSO fixes the pre-existing intlist escape bug below.
 
+## ★ IMPLEMENTATION CONSTRAINT (runtime.c:1049-1063) — elem_kind must be APPENDED, not inserted
+NovaList `{int64_t* data; int64_t size; int64_t cap;}` (1049) and NovaBytes `{uint8_t* data; size; cap;}`
+(1059) share the SAME layout ON PURPOSE: find_tag's structural validation predicate (the int/pointer
+soundness hardening) keys off data/size/cap. So: add `int64_t elem_kind;` as the **4th field AFTER cap**
+(grows sizeof(NovaList) -> all `nova_heap_alloc(sizeof(NovaList))` sites auto-size; just init elem_kind=0
+at each). Read elem_kind ONLY after the RC-header tag == NOVA_MEM_LIST is confirmed (NovaBytes has no 4th
+field -> never read elem_kind on a bytes object). The first-3-field structural predicate is UNAFFECTED.
+Creation sites to init: nova_rt_list_create (1099), list_create_filled (1108), and any other
+`nova_heap_alloc(sizeof(NovaList)` — grep all before editing. deep_copy uses list_create -> covered.
+
+## ★★★ S4.1 RESOLVED DESIGN (2026-06-20, from the recon + the downstream-typing crux)
+Recon (workflow wnvmf2az8) mapped ~20 write sites + ~22 read/egress sites + confirmed find_tag safety:
+- find_tag reads the RC tag, NOT elem_kind; NovaBytes is intercepted before the &0x7 LIST mask; the
+  {data,size,cap} prefix is byte-identical -> reading elem_kind after a confirmed NOVA_MEM_LIST is SOUND.
+  **S4.0 foundation independently confirmed safe.**
+- The real kind=2 hazard = ~10 sites feed a RAW element word into find_tag (eq:4012, hash:10927,
+  contains:2006, index_of:10426, list_to_str:1384, elem_to_str:3701, json_stringify:3381, deep_copy:2339,
+  set_*). For kind=1 (raw INT) these are ALREADY SOUND (find_tag correctly rejects a bare int). The CVE
+  hazard is specific to kind=2 (raw DOUBLE bits can fake a heap address). => **kind=1 (S4.1) is far safer
+  than kind=2 (S4.2).**
+- ~20 write sites each need kind-awareness (set-on-first / deopt-on-conflict / skip rc on raw kinds);
+  many are easy-to-miss (list_set, insert, remove, pop, concat, reverse, sort, map/map_fbox, filter,
+  slice, set_add/has/remove). deep_copy/channel for kind 1/2 = memcpy the block (no find_tag).
+
+★ THE CRUX (downstream-typing tension): a GUARDED read `if elem_kind==K native else runtime` cannot
+preserve NATIVE INT ARITHMETIC downstream, because the compiler types xs[j] STATICALLY. If a list can
+deopt (kind!=1 at runtime), the element is genuinely not an int, so downstream MUST be the any-path; but
+native int arithmetic requires a static `int` type. => the native-int fast path REQUIRES a static proof
+the list can never deopt. The runtime guard alone can't give that (aliasing). Two regimes, irreducibly:
+  (A) PROVABLY-NON-DEOPTABLE intlist -> unguarded native int read, typed int, native arithmetic. FAST.
+  (B) POSSIBLY-DEOPTABLE intlist -> read typed `any`; `if elem_kind==1 raw-int(as any) else index_get`;
+      any-arithmetic. CORRECT, slower. (deopt+guard handles aliasing/escape uniformly.)
+
+★ SOUNDNESS NOTE on (A): a compile-time-only proof of "non-deoptable" CANNOT be complete — local
+aliasing (`let ys=xs; push(ys, nonint)`) mutates the shared object invisibly to xs's per-slot analysis
+(adversary attack 1). So regime (A) is sound ONLY for a list proven SINGLE-REFERENCE: a local used
+exclusively as push(xs,_)/xs[i]/xs[i]=_/len(xs), NEVER aliased (RHS of assign), passed to a fn, stored
+in a container/struct, or returned. That syntactic linear check is decidable and conservative. Everything
+else -> regime (B) (correct via runtime deopt+guard). Read-only escape (sum(xs)) lands in (B) for S4.1
+(perf regression vs today's UNSOUND-fast) and is recovered in S4.2 via whole-program param-MUTATION taint
+(a fn that never appends a conflicting kind to a param is deopt-safe -> caller keeps regime A/fast).
+
+★ RUNTIME DEOPT (authoritative, needed for regime B + to make the pre-existing bug correct under ALL
+aliasing): elem_kind starts 0; set 1 on first proven-int append; a conflicting append (float/bool/str/
+ptr) DEOPTS to 0 (kind1->0 is FREE: raw ints are valid kind-0 elements, no rebox). To avoid find_tag in
+the hot int-build loop, the compiler emits a DISTINCT append for statically-known ints
+(nova_rt_list_append_iknown -> sets/keeps kind 1, no classify); plain nova_rt_list_append (any/unknown)
++ append_fbox/bbox conservatively DEOPT a kind-1 list to 0 (fbox/bbox are known-non-int; plain-any uses
+a cheap find_tag-reject-bare-int test, false-positive=safe-slow). kind=2 (raw double) deferred to S4.2
+(the ~10 find_tag-egress sites + rebox + RC-skip land together there).
+
 ## REVISED STAGING (authoritative)
 - **S4.0 (runtime, soundness floor):** add `elem_kind`; first-append sets kind; conflicting append DEOPTS
   (kind1->0 cheap, kind2->0 reboxes); make EVERY list op mode-aware incl. any-read box-on-egress + no
