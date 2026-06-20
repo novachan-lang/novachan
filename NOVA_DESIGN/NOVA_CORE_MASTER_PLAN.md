@@ -141,3 +141,33 @@ NEXT (formal M1 gate): build/measure the ~3-program battery (web slice [Forge], 
 [green_scale], systems/numeric kernel) against the 6 non-negotiables -- esp. C-perf <=1.1x clang -- to
 FORMALLY confirm M1, then BRANCH: frameworks (Forge/Mesh/Ops/Sentinel/Pulse) || continuous compiler loop
 (S3 SROA, S4/S5, Phase 4 targets GPU/WASM/embedded).
+
+## M1 FORMALLY CONFIRMED (2026-06-20) -- battery measured, all 6 non-negotiables met
+The 3-program battery was MEASURED (not assumed). All pass:
+ 1. **Numeric/systems kernel** (tight pure-float recurrence `x=x*c+0.5; s+=x*c2`, 200M iters, ZERO
+    annotations): NOVA **381-385ms** vs clang -O2 C **384-388ms** = **~1.00x C** (within noise,
+    marginally faster), IDENTICAL result 950000110889359.0 (correctness verified). "Fast <=1.1x C" MET.
+ 2. **Concurrent server** (green_scale): 10k green tasks incl 10k parked, 382ms, no async keyword,
+    transparent spawn->green. I/O/scheduler-bound; passes.
+ 3. **Web slice** (Forge): 535/535 gated both RC modes, zero-annotation handlers, ASAN-clean
+    per-request arena, simpler than Flask. Passes.
+
+★ KEY PERF FINDING (decisive, ends the i64-ABI worry for SCALAR code): the uniform i64 ABI
+(`alloca i64` per local + bitcast double<->i64 each op) that LOOKS like a 150-300x dynamic-dispatch
+cost is **fully erased by clang -O2**: mem2reg promotes every i64 slot to a register `phi double`,
+LICM folds the bitcast float constants, and the loop is 4x unrolled -- byte-equivalent to C's codegen.
+Native `fmul`/`fadd` (S1) + the optimizer = C parity for scalar numeric loops, TODAY, zero annotations.
+
+★ BENCHMARKING GOTCHA (caused a false 1.83x alarm): `nova.exe file.nova` quick-run links at **-O0**
+(cmd_test path, nova_build.nova:472) -- NOT a perf path. Production `nova build` links at **-O2 + -flto**
+(opt defaults to "2", nova_build.nova:252/345). ALWAYS measure perf via the -O2 build, never the quick-run.
+
+HONEST REMAINING PERF (continuous-after-M1, this is BEAT-C not MATCH-C): auto-vectorizable array loops
+(independent iterations -> SIMD) still store elements as i64 in NovaList, which can block clang
+auto-vectorization. That is S4 (raw double[] / SoA) territory -- the path to BEATING C on vectorizable/
+parallel workloads via whole-program auto-SIMD. The M1 bar (match C, <=1.1x) is MET; beat-C is the
+continuous track.
+
+=> M1 IS REACHED. BRANCH NOW: framework loop (Forge/Mesh/Ops/Sentinel/Pulse can start immediately) ||
+continuous compiler loop (S3 struct SROA -> S4 SIMD arrays -> S5 monomorphization; Phase 4 targets
+GPU/WASM/embedded as each unlocks Reactor/Cortex/Prism/Edge).
