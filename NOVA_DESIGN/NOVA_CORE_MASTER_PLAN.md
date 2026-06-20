@@ -100,3 +100,25 @@ soundness-first ordering + ASAN on lifecycle changes + periodic review. **Nothin
 11 commits, tree clean, **516/516 both RC modes**, P0 critical channel-move/try_send arena UAF
 closed (4957ae7). Next on confirm: **Phase 0 (soundness floor)** under the new flow — first item
 building while its gate runs in the background.
+
+## Phase 1 RE-SCOPE (2026-06-20, after Phase 0 complete + empirical grounding)
+Verified empirically (probe): (1) FUNCTIONAL zero-syntax generics already work -- one plain `pick(a,b)`
+used at int/float/string, all correct (HM inferer generalizes). (2) S1 native-float perf works -- a hot
+`s + 1.5*2.0` loop emits native `fmul double`/`fadd double`, not nova_rt_mul. So NOVA already has:
+soundness (Phase 0) + functional generics + C-class perf for direct/scalar/non-escaping-struct code
+(~1.04x C per perf-verified memory).
+
+Therefore the "multi-month mountain" is ONLY the perf endgame (S4 SIMD arrays + S5 full monomorphization),
+and it is CONTINUOUS-AFTER-M1, NOT an M1 blocker -- the M1-immediate frameworks (Forge/Mesh/Ops/Sentinel/
+Pulse) are not generic-perf-bound, and the GPU/embedded frameworks that need S4/S5+targets branch later.
+
+REVISED M1-CRITICAL PATH (all tractable, much nearer than the mountain framing):
+ - Phase 1: **Stage 3 struct SROA** (closes the ~1.2-1.3x-C struct-passed-to-fn gap; doc calls it tractable
+   plumbing; escape analysis exists at nova_compiler.nova:12873 Track-8 F102). [S2 marginal+flaky -> skip;
+   S4/S5 -> continuous-after-M1]. (+ lazy generators 1e is Pulse-specific, can branch with Pulse.)
+ - Phase 2: capability derivation (Show/Eq/Hash/Sendable from structure -- extend automatic-Show) + dispatch
+   on Value shape + derived serialization (partly shipped: resp_json/RTTI keystone).
+ - Phase 3: install the ~26 orphaned stdlib modules into lib/ + generic algorithm library = **M1**.
+
+NEXT BUILD ITEM: Stage 3 struct SROA (design pass -> build -> gate). The perf endgame (S4/S5) becomes a
+parallel continuous-improvement track after M1.
