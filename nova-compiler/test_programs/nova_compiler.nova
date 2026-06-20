@@ -13579,9 +13579,76 @@ fn ir_reg_nn(rt: dict, reg: string) -> int
         return rt[k]
     0
 
+// ── S4.1 single-reference taint ───────────────────────────────────────────────
+// A list slot keeps its intlist/floatlist FAST read typing only while it is the SOLE
+// reference to its object. The moment the object also becomes reachable through another
+// name -- aliased to a second slot, passed to a user function, stored in a container,
+// captured by a closure, or returned -- a heterogeneous mutation through that other
+// reference (e.g. a callee appending a float into an int list: the pre-existing escape
+// bug) can put a boxed pointer into a slot the compiler still believes is raw int/double,
+// and the native read would reinterpret it. A compile-time proof of "stays homogeneous"
+// is NOT possible without alias analysis NOVA lacks, so we INVERT it: such a slot is
+// TAINTED and its reads fall back to the sound generic path (regime B). The runtime stays
+// the source of truth for the kept-fast (regime A, single-reference) lists. Conservative
+// by construction: only in-place ops on the slot itself are exempt; ANY escape taints
+// (a false taint = slower-but-correct; never unsound).
+fn ir_is_list_slotreg(rt: dict, st: dict, reg: string) -> string
+    let sk = "@slot@" + reg
+    if contains(rt, sk)
+        let slot = rt[sk]
+        if contains(st, slot)
+            let t = st[slot]
+            if t == "intlist" or t == "floatlist" or t == "list"
+                return slot
+    return ""
+
+fn ir_taint_list_slot(st: dict, slot: string)
+    if slot != ""
+        st["@taint@" + slot] = "1"
+
+// A list value's loaded register is used SAFELY (no lasting alias, no heterogeneous mutation
+// reachable through another name) ONLY as the subject (args[0]) of an in-place list operation:
+// index read/write, len, append, sort, print, to_str, for-iteration -- ALL of which are the
+// index_get/index_set ops or calls to nova_rt_* builtins with the list at args[0] (none retain a
+// lasting reference; NOVA deep-copies across channel/spawn boundaries). EVERY other position --
+// a user-function argument, args[1+] of a builtin (stored INTO another container), a copy /
+// slot_store into another name, a return, a struct/dict/closure capture -- makes the object
+// co-reachable and is UNSAFE -> taint. Default-taint by construction (immune to op-shape changes
+// from ir_optimize): a false taint is slower-but-correct; never unsound.
+fn ir_safe_list_use(op: string, value: string, pos: int) -> bool
+    if pos != 0
+        return false
+    if op == "index_get" or op == "index_set"
+        return true
+    if op == "call" and starts_with(value, "nova_rt_")
+        // sort / sort_by RETURN THE SAME handle (in-place) -> `let ys = sort(xs)` makes ys alias xs
+        // while xs keeps its untainted fast typing; mutating ys then reading xs raw would corrupt.
+        // Treat them as NOT safe so xs is tainted when passed (the returned alias can escape). Every
+        // other list-returning builtin (reverse/map/filter/slice/concat/repeat) builds a NEW list.
+        if value == "nova_rt_list_sort" or value == "nova_rt_sort_by"
+            return false
+        return true
+    return false
+
+fn ir_scan_list_taint(rt: dict, st: dict, op: string, args: list, value: string)
+    let i = 0
+    for a in args
+        let slot = ir_is_list_slotreg(rt, st, a)
+        if slot != ""
+            if not ir_safe_list_use(op, value, i)
+                ir_taint_list_slot(st, slot)
+        i = i + 1
+    // Aliasing store `let ys = xs`: the stored register names a list slot AND the dest slot
+    // differs -> the dest now aliases the same object; taint IT too so its own reads fall back.
+    if op == "slot_store" and len(args) >= 1
+        let ss_src = ir_is_list_slotreg(rt, st, args[0])
+        if ss_src != "" and ss_src != value
+            ir_taint_list_slot(st, value)
+
 fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
     match inst
         IrInst(op, dest, typ, args, value, num, effect, line) =>
+            ir_scan_list_taint(rt, st, op, args, value)
             if op == "const_int"
                 if typ.kind == "bool"
                     rt[dest] = "bool"
@@ -13707,6 +13774,14 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 let stype = "any"
                 if contains(st, value)
                     stype = st[value]
+                // S4.1: do NOT demote the slot's list TYPE on taint. Demoting intlist->list cascaded
+                // into the int-vs-float aggregate selection (list_min/max/sum use the int variant ONLY
+                // for "intlist"; "list" -> float variant -> 1 becomes 1.0) and floatlist->list mixed a
+                // boxed read into raw-float math (e-156 garbage). Both broke real tests (math3d/track7).
+                // Soundness for a tainted (escaped/aliased) list is enforced at the index_get READ
+                // instead (see the index_get gate), which returns a generic boxed value without
+                // changing the list's type. Broader consumers (print/min/max of an escaped list that
+                // actually went heterogeneous) are closed in S4.2 (runtime deopt).
                 rt[dest] = stype
                 rt["@slot@" + dest] = value
                 if contains(st, "@nn@" + value) and st["@nn@" + value] == 1
@@ -14021,8 +14096,16 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 let ig_nn = 0
                 if len(args) > 1 and ir_reg_nn(rt, args[1]) == 1
                     ig_nn = 1
+                // S4.1 gate (insurance): if the list register names a TAINTED slot, never take the
+                // raw intlist/floatlist read -- fall through to the sound generic path. Independent
+                // of how args[0] got its type (slot_load/copy already demote, this covers any path).
+                let ig_tainted = false
+                if contains(rt, "@slot@" + args[0])
+                    let ig_slot = rt["@slot@" + args[0]]
+                    if contains(st, "@taint@" + ig_slot) and st["@taint@" + ig_slot] == "1"
+                        ig_tainted = true
                 if dest != ""
-                    if ir_reg_type(rt, args[0]) == "intlist"
+                    if not ig_tainted and ir_reg_type(rt, args[0]) == "intlist"
                         rt[dest] = "int"
                         return IrInst(op, dest, ir_type_int(), args, value, ig_nn, effect, line)
                     if ir_reg_type(rt, args[0]) == "floatlist"
@@ -14123,6 +14206,9 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         let stype = st[slot_nm]
                         if stype != "any"
                             src_type = stype
+                        // S4.1: NO type demotion on taint here either (see slot_load). The copy still
+                        // propagates @slot@ (below), so a copy-dest fed to index_get is caught by the
+                        // index_get taint gate via that slot identity, with no int-vs-float cascade.
                 if dest != ""
                     rt[dest] = src_type
                     if ir_reg_nn(rt, args[0]) == 1

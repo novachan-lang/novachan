@@ -194,6 +194,25 @@ a cheap find_tag-reject-bare-int test, false-positive=safe-slow). kind=2 (raw do
 - **S4.4 (BEAT-C):** SIMD — close the 2.3x (bounds-check elision where provable + reduction vectorization;
   FP-reduction needs a fast-math `sum` contract; int reductions auto-vec cleanly).
 
+## ★★★ S4.1 SHIPPED (2026-06-20) — index_get-only single-reference gate (scoped subset of the plan)
+What actually shipped (smaller than the full regime-A/B plan above, after two regressions forced a
+simplification): a compiler single-reference TAINT (`ir_safe_list_use` + `ir_scan_list_taint`:
+default-taint-at-use; safe = pos0 of index_get/index_set or a `nova_rt_*` call EXCEPT sort/sort_by which
+return-alias) consumed at ONE point — the **index_get gate**: a tainted (escaped/aliased) list's index
+READ returns a generic boxed value (via the args[0] @slot@ taint check; `copy` propagates @slot@), WITHOUT
+changing the list's TYPE. This fixes the pre-existing intlist-escape bug (`_s4_escbug`) for the index-read
+path + the alias/sort-alias cases (`_s4_adv_int`, `_s4_adv_int2`).
+
+WHY NOT the type-demotion design: demoting intlist/floatlist→"list" CASCADED — list_min/max/sum select the
+int variant ONLY for exact "intlist" (1 became 1.0; broke track7) and floatlist→list mixed boxed reads
+into raw-float math (e-156 garbage; broke math3d). The index_get gate avoids the cascade entirely.
+
+SCOPE LIMIT (deferred to S4.2 runtime deopt): print_intlist / list_min/max/sum / floatlist READS of a list
+that ACTUALLY went heterogeneous via escape remain unsound — not exercised by any test; the proper fix is
+the runtime elem_kind deopt + box-on-egress (the authoritative design above). S4.2 supersedes this gate.
+Gate: reconverged gen5==gen6 594A7BBE; NORMAL 540/540; FULLRC 539/540 (1 = a transient parallel-run
+contention crash of the non-concurrent _s4_adv_test, 8/8 stable in isolation).
+
 ## ★★ PRE-EXISTING SOUNDNESS HOLE FOUND (2026-06-20) — fixed by S4.0+S4.1 above (kept for the record)
 EMPIRICAL (current shipped compiler, _escprobe): an `intlist` (raw int64 storage + native load, ALREADY
 shipped) that ESCAPES to a function which appends a non-int is CORRUPTED. Repro:
