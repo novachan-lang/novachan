@@ -423,6 +423,7 @@ $concurrency_tests = @(
     '_gen_server_demo',
     '_supervised_genserver_demo',
     '_reclaim_churn_test',
+    '_mn_stress_test',
     'select_test',
     'select_multi_test',
     'select_timeout_test',

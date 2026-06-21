@@ -5148,16 +5148,23 @@ int64_t nova_rt_fiber_resume(int64_t handle) {
     }
     f->resumer = me;
     me->status = 2;
-    if (g_watchdog_on) {
-        if (InterlockedCompareExchange((volatile LONG*)&f->active, 1, 0) != 0)
-            fprintf(stderr, "[BUG] DOUBLE-RESUME fiber=%p status=%d me=%p\n", (void*)f, f->status, (void*)me);
-        nova_trace(1, f, me);
+    /* M:N hard guard (always-on at N>1, not just watchdog): if f->active is already 1, a SECOND carrier
+       is resuming a fiber this/another carrier is already executing -> imminent stack corruption. Fail
+       FAST (abort) instead of silently corrupting. Set here / reset after SwitchToFiber returns (below) are
+       paired under the same gate, so sequential resumes are fine and only a true concurrent double-resume
+       trips it. No cost at N=1 (the default). This makes a clean N>1 stress run real evidence, not luck. */
+    if (g_watchdog_on || g_carrier_count > 1) {
+        if (InterlockedCompareExchange((volatile LONG*)&f->active, 1, 0) != 0) {
+            fprintf(stderr, "[FATAL] M:N double-resume: fiber=%p status=%d me=%p -- aborting before stack corruption\n", (void*)f, f->status, (void*)me);
+            abort();
+        }
+        if (g_watchdog_on) nova_trace(1, f, me);
     }
     nova_current_task = &f->task;   /* RACE-17: the resuming carrier sets the resumed task's TLS
                                        BEFORE the switch, so a fiber migrated to a different carrier
                                        sees its own task (not the resumer's). Restored to me below. */
     SwitchToFiber(f->handle);
-    if (g_watchdog_on) { f->active = 0; nova_trace(2, f, me); }
+    if (g_watchdog_on || g_carrier_count > 1) { f->active = 0; if (g_watchdog_on) nova_trace(2, f, me); }
     nova_current_fiber = me;
     nova_current_task = &me->task;   /* restore the RESUMER's own task state (Stage 2 F7):
                                         correct for the carrier loop AND for nested fibers
@@ -5401,6 +5408,13 @@ typedef struct NovaSchedTask {
     volatile int park_committed;   /* M:N F1: 0 while a task is mid-yield, 1 once it has fully
                                       parked. A waking carrier spins until 1 before re-enqueuing,
                                       so no carrier resumes a fiber that hasn't finished SwitchToFiber. */
+    volatile int yield_runnable;   /* M:N: a self-YIELDING task (reschedule/select/timed-recv) sets this
+                                      INSTEAD of self-pushing to the run-queue; the CARRIER re-enqueues it
+                                      (push THEN park_committed=1) AFTER the fiber has fully switched back.
+                                      This is the yield-path analog of the wake-path park-commit discipline:
+                                      without it a 2nd carrier could pop+resume the task while this carrier is
+                                      still inside SwitchToFiber (double-resume = stack corruption). N=1: a no-op
+                                      in effect (the lone carrier re-pushes it next iteration). */
     int      home_carrier;         /* M:N: carrier this task is bound to (-1 = unbound); used in later steps */
     volatile int in_rq;            /* M:N detector: 1 while linked in the run-queue (guarded by g_sched_lock) */
     int64_t  mailbox;              /* Erlang frontier Stage-0: this task's inbound mailbox (a NovaChannel handle,
@@ -5533,7 +5547,15 @@ static void nova_sched_park_send(NovaChannel* ch) {
 }
 static void nova_sched_yield_now(void) { nova_rt_fiber_yield(); }
 static void nova_sched_yield_runnable(void) {
-    if (nova_sched_current) { nova_sched_current->status = 0; nova_rq_push(nova_sched_current); }
+    if (nova_sched_current) {
+        nova_sched_current->status = 0;
+        /* M:N: do NOT self-push to the run-queue here. A self-push exposes the task to a 2nd carrier
+           popping + resuming it while THIS carrier is still inside SwitchToFiber (double-resume =
+           stack corruption -- the latent N>1 UAF). Flag it instead; the carrier re-enqueues after the
+           fiber has fully switched back (park-then-commit, the same discipline the wake paths use).
+           N=1: functionally identical (the lone carrier re-pushes it on the next loop iteration). */
+        nova_sched_current->yield_runnable = 1;
+    }
     nova_rt_fiber_yield();
 }
 
@@ -5863,11 +5885,15 @@ static void nova_offload_run(NovaOffloadJob* job) {
     nova_offload_ensure();
     job->task = nova_sched_current;
     job->done = 0;
-    /* Register on the carrier waiter list (carrier-thread-local — the green task
-       runs ON the carrier, so this is not concurrent with the carrier's scan)
-       BEFORE enqueueing, so the carrier sees it the instant we yield. */
+    /* Register on the waiter list BEFORE enqueueing, so the carrier sees it the instant we yield.
+       Under the SAME lock the scan (nova_sched_check_offload) uses: at N>1 another carrier may scan
+       this list (or another task may insert) concurrently, so the lock-free push raced the scan and
+       lost updates. nova_sched_lock is a no-op at N=1 (g_carrier_count<=1) -> zero cost on the default
+       path. Released BEFORE the offload-queue lock below -> no lock nesting / no ordering deadlock. */
+    nova_sched_lock();
     job->wnext = nova_offload_waiters;
     nova_offload_waiters = job;
+    nova_sched_unlock();
 #ifdef _WIN32
     EnterCriticalSection(&nova_offload_lock);
     job->qnext = NULL;
@@ -6340,9 +6366,14 @@ int64_t nova_rt_sched_run(void) {
                the fiber's stack now -> bounded memory under spawn/finish churn. N<=1 only (race-free). */
             if (g_carrier_count <= 1) nova_sched_reclaim_fiber(t);
         } else {
-            /* M:N F1: the task yielded/parked — publish park_committed (release) so a carrier
-               spinning in wake_one/wake_send_one/wake_sleepers/poll_io/check_offload may now
-               safely re-enqueue and resume it (it has fully finished SwitchToFiber). */
+            /* M:N F1: the task yielded or parked. A self-YIELDING task (reschedule/select/timed-recv)
+               set yield_runnable instead of self-pushing; re-enqueue it HERE, now that it has fully
+               switched back -- push THEN set park_committed (the wake-path invariant: any future path
+               that spins on this task's park_committed must find it already in the run-queue). A PARKED
+               task (status=2, on a waiter list) has yield_runnable=0, so its wake path pushes it later.
+               park_committed (release) is published so a carrier spinning in the wake/poll_io/offload
+               paths may now safely re-enqueue + resume it. */
+            if (t->yield_runnable) { t->yield_runnable = 0; nova_rq_push(t); }
             t->park_committed = 1;
         }
     }
