@@ -5948,6 +5948,29 @@ static void nova_sched_notify_channel(int64_t ch_handle, int64_t value) {
 }
 
 /* Create a green task from a closure and enqueue it. */
+/* ── Tombstone-split reclamation ───────────────────────────────────────────────
+   A finished scheduler task's FIBER (its committed+reserved stack + the NovaFiber struct) is the
+   dominant per-task memory cost (~8-20KB of touched stack). Currently nothing is ever freed, so a
+   long-running server that spawns a task per request grows unbounded. This reclaims the fiber on the
+   CARRIER, AFTER the fiber has switched back (done==1) -> it is NOT the running fiber, so
+   DeleteFiber/munmap of it is safe. The tiny NovaSchedTask `t` is KEPT as the stable, UAF-safe PID
+   (monitor()/exit_reason()/late pid_send stay valid), and the mailbox is kept (drain-closed; a late
+   send is a graceful no-op). t->fiber=0 first so any guarded post-finish read (e.g. the N>1 watchdog,
+   which checks `if (fb)`) sees NULL, never a freed pointer. CALLED ONLY at N<=1 (single-carrier) where
+   the finish path is single-threaded and race-free; N>1 reclamation is a follow-on (pairs with the
+   M:N park-commit fixes). Idempotent: the !t->fiber guard makes a double call a no-op. */
+static void nova_sched_reclaim_fiber(NovaSchedTask* t) {
+    if (!t || !t->fiber) return;
+    NovaFiber* fib = (NovaFiber*)(uintptr_t)t->fiber;
+    t->fiber = 0;
+#ifdef _WIN32
+    if (fib->handle) DeleteFiber(fib->handle);
+#else
+    if (fib->stack_mem) munmap(fib->stack_mem, fib->stack_alloc);
+#endif
+    free(fib);
+}
+
 int64_t nova_rt_sched_spawn(int64_t closure) {
     NovaSchedTask* t = (NovaSchedTask*)calloc(1, sizeof(NovaSchedTask));
     if (!t) return 0;
@@ -6312,6 +6335,10 @@ int64_t nova_rt_sched_run(void) {
             t->finished = 1;
             t->status = 3;
             nova_live_dec();
+            /* Tombstone split: the fiber has switched back (we are on the carrier, nova_sched_current=NULL),
+               crash status + error_msg are already copied into t, monitors notified, mailbox drained. Reclaim
+               the fiber's stack now -> bounded memory under spawn/finish churn. N<=1 only (race-free). */
+            if (g_carrier_count <= 1) nova_sched_reclaim_fiber(t);
         } else {
             /* M:N F1: the task yielded/parked — publish park_committed (release) so a carrier
                spinning in wake_one/wake_send_one/wake_sleepers/poll_io/check_offload may now
