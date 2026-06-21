@@ -5991,6 +5991,26 @@ int64_t nova_rt_receive(void) {
     if (!t || !t->mailbox) return 0;   /* not in a green task / no mailbox: Stage-0 no-op (OS-pool = Stage 2) */
     return nova_rt_channel_recv(t->mailbox);   /* parks (green-aware) until a message arrives */
 }
+int64_t nova_rt_try_recv(int64_t handle);   /* fwd: defined later with the channel ops */
+int64_t nova_rt_mailbox_len(int64_t pid) {
+    /* Erlang message_queue_len: # of pending messages in a mailbox (its channel). For backpressure /
+       observability. pid = a mailbox channel handle (from self_pid()/mailbox_of()). */
+    if (!pid) return 0;
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)pid;
+    int64_t n;
+#ifdef _WIN32
+    EnterCriticalSection(&ch->lock); n = ch->count; LeaveCriticalSection(&ch->lock);
+#else
+    pthread_mutex_lock(&ch->lock); n = ch->count; pthread_mutex_unlock(&ch->lock);
+#endif
+    return n;
+}
+int64_t nova_rt_try_receive(void) {
+    /* Non-blocking receive from own mailbox -> [got, msg] (mirrors nova_rt_try_recv; [0,0] if empty). */
+    NovaSchedTask* t = nova_sched_current;
+    if (!t || !t->mailbox) { int64_t r = nova_rt_list_create(); nova_rt_list_append(r, 0); nova_rt_list_append(r, 0); return r; }
+    return nova_rt_try_recv(t->mailbox);
+}
 /* Drain (rc_dec) all buffered messages from a finished task's mailbox and mark it CLOSED, WITHOUT
    freeing the channel struct: the task struct persists (never freed), so a late pid_send must still
    land on a valid, closed channel (send -> rc_dec + -1). rc_dec runs OUTSIDE the lock. */
