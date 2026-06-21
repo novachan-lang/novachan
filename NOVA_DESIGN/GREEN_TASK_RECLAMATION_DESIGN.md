@@ -103,6 +103,30 @@ but **ASAN at N=4 caught a heap-use-after-free** (nova_task_arena_cleanup, nova_
   (the default, the high-value case) is shipped + sound (179126e). This is the right scope: do NOT ship a UAF for
   an opt-in mode.
 
+## ★★ N>1 RECLAMATION — DEEPER ANALYSIS (2026-06-22): DEFER (rigorous 5-agent verdict)
+A read-only multi-agent analysis + adversary nailed the root cause AND why a quick fix is the WRONG move:
+- ROOT CAUSE of the UAF: the f->active double-resume guard is BYPASSED by the early-return `if (f->status==3)
+  return 1` (nova_runtime.c L5137) -- it returns done==1 WITHOUT the CAS. And the fiber sets f->status=3 (L5106)
+  BEFORE its final SwitchToFiber-back (L5112), so during that window a 2nd carrier sees done==1 and reclaims while
+  the fiber is still running its own completion (arena_cleanup). PLUS a 2nd UAF surface: the finish path reads
+  fib->task.crashed/error_msg (L6341/6346) from a possibly-freed fib.
+- THE DISEASE (not the symptom): for a 2nd carrier to get the task at all, the task must be DOUBLE-ENQUEUED. The
+  analysis could NOT pin the double-enqueue statically (run-queue is single-locked + park_committed discipline on
+  every wake path + a double-push detector) -> it is likely the documented N>1 lost-wakeup at high oversubscription
+  ([[project-mn-scheduler-step1]]). ★ KEY INSIGHT: fixing ONLY the UAF (a body_exited flag) MASKS the double-enqueue
+  -> the task is still processed twice -> double nova_live_dec (live-count goes negative -> premature termination),
+  double monitor-notify, double mailbox handling -- SILENT corruption instead of a loud ASAN catch. STRICTLY WORSE.
+- A SOUND fix is a scheduler-protocol change, not a one-liner: (a) carrier-side status publish, (b) atomic
+  single-owner reclaim (InterlockedExchange64, not a racy CAS comparand), (c) move fib->task crash-capture INTO the
+  fiber, (d) the same on the unguarded POSIX ucontext path, (e) watchdog TOCTOU, (f) an EXPLICIT memory barrier
+  (bare `volatile` gives NO inter-thread ordering -- latent weak-memory bug on NOVA's future ARM/RISC-V targets).
+- VERDICT = DEFER. Re-enable N>1 reclamation as part of the M:N production-promotion: per-carrier work-stealing
+  deques (replaces the global g_sched_lock convoy) give a NATURAL single-owner-per-task invariant -> reclamation
+  becomes trivially safe and the body_exited dance is unnecessary. Hunt the double-enqueue root cause FIRST; add a
+  per-task once-finished assert to the validation. Cost of deferral is bounded: ~368B + stack per finished task at
+  N>1 ONLY, freed at process exit. N=1 (the only production mode -- Forge, all tests/benchmarks) reclaims correctly
+  + race-free already (179126e). DO NOT fix piecemeal.
+
 ## Honest payoff
 v1 turns "unbounded growth per spawned task, forever" into "~400B tombstone per finished task + reclaimed stacks" —
 unblocking long-running servers (Forge/WebSocket) from ~100k toward ~10M+ tasks OVER TIME. Full reclamation (mailbox +
