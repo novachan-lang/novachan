@@ -13356,8 +13356,15 @@ int64_t nova_rt_iter_find(int64_t iter, int64_t closure) {
  * ──────────────────────────────────────────────────────────────────────── */
 
 static NovaFuture* nova_future_create(void) {
-    NovaFuture* f = (NovaFuture*)calloc(1, sizeof(NovaFuture));
+    /* nova_heap_alloc (NOT calloc) so the future carries a find_tag-safe RC header: a future is a
+       first-class value (e.g. stored in a list -> nova_rt_list_append rc_inc's it -> find_tag(future)
+       read the header at ptr-8 = OOB when calloc'd; ASAN-confirmed pre-existing heap-buffer-overflow).
+       PIN with one extra rc_inc: futures must be NEVER freed -- the async WORKER THREAD writes f->result
+       after completion, so freeing one (RC->0) while its worker runs would be a UAF. The permanent base
+       ref keeps RC>=1 forever (matching the prior calloc leak-by-design) while making the handle sound. */
+    NovaFuture* f = (NovaFuture*)nova_heap_alloc(sizeof(NovaFuture), NOVA_MEM_RAW);
     if (!f) { fprintf(stderr, "nova: OOM allocating future\n"); exit(1); }
+    nova_rc_inc((int64_t)(uintptr_t)f);
     f->result = 0;
     f->completed = 0;
 #ifdef _WIN32
