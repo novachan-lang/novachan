@@ -5412,9 +5412,14 @@ typedef struct NovaSchedTask {
     int64_t  save_queue;           /* NovaList handle (RC-heap, lazily created); 0 until first use */
     int64_t  recv_cursor;          /* scan index into save_queue during the current receive */
     int64_t  recv_initial;         /* len(save_queue) snapshot at recv_begin (only [0,recv_initial) is re-scanned) */
-    int      recv_src;             /* source of the current candidate: 0 none / 1 save_queue / 2 mailbox */
+    int      recv_src;             /* source of the current candidate: 0 none / 1 save_queue / 2 mailbox / 3 TIMED OUT */
     int64_t  recv_last;            /* the current candidate (stashed by recv_next), so the wildcard `_ => __recv_defer()`
                                       arm can defer it without a binding. Per-task + sequential (one receive at a time). */
+    /* Stage-2 `receive ... after N`: an absolute monotonic-ms deadline for the current timed receive.
+       recv_has_deadline=0 -> untimed (recv_next blocks/parks forever, as Stage-1). recv_next_timed polls
+       the mailbox + cooperatively yields until a message arrives OR now >= recv_deadline_ms (then src=3). */
+    int      recv_has_deadline;    /* 1 if the current receive has an `after` clause */
+    int64_t  recv_deadline_ms;     /* absolute nova_sched_now_ms() deadline; only meaningful when recv_has_deadline */
 } NovaSchedTask;
 
 #ifndef NOVA_POLL_READ
@@ -6055,6 +6060,7 @@ int64_t nova_rt_recv_begin(void) {
     t->recv_cursor = 0;
     t->recv_initial = nova_rt_list_len(t->save_queue);
     t->recv_src = 0;
+    t->recv_has_deadline = 0;   /* untimed: recv_next blocks forever (Stage-1) */
     return 0;
 }
 int64_t nova_rt_recv_next(void) {
@@ -6107,6 +6113,76 @@ int64_t nova_rt_recv_defer(void) {
     t->recv_last = 0;
     t->recv_src = 0;
     return 0;
+}
+/* ── Stage-2 `receive ... after N` (timeout) ───────────────────────────────────
+   Desugars to: __recv_begin_timed(N); while true { let m = __recv_next_timed();
+   if __recv_timed_out() { <after-body>; break } match m { <arm>: commit;body;break ; _ => defer } }.
+   recv_next_timed mirrors nova_rt_select_timeout: scan the save-queue first (instant), then POLL the
+   mailbox with channel_try_recv + cooperative yield until a message arrives OR the absolute deadline
+   passes (then src=3). Poll-yield (not a true park) is the established NOVA channel-or-timeout pattern
+   (select_timeout) -- sound on green tasks (yields the carrier, never starves siblings) at N=1. */
+int64_t nova_rt_recv_begin_timed(int64_t timeout_ms) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return 0;
+    nova_recv_ensure_sq(t);
+    t->recv_cursor = 0;
+    t->recv_initial = nova_rt_list_len(t->save_queue);
+    t->recv_src = 0;
+    t->recv_has_deadline = 1;
+    /* negative timeout == wait forever (degenerates to the untimed path); else absolute deadline.
+       `after 0` -> deadline = now -> drains currently-available messages then times out immediately. */
+    t->recv_deadline_ms = (timeout_ms >= 0) ? (nova_sched_now_ms() + timeout_ms) : -1;
+    return 0;
+}
+int64_t nova_rt_recv_next_timed(void) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return 0;
+    /* Saved candidates first (instant, never times out) -- mirror recv_next src=1. */
+    if (t->recv_cursor < t->recv_initial) {
+        t->recv_src = 1;
+        int64_t m = nova_rt_list_get(t->save_queue, t->recv_cursor);
+        nova_rc_inc(m);
+        t->recv_last = m;
+        return m;
+    }
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)t->mailbox;
+    int64_t spins = 0;
+    while (1) {
+        int64_t v = 0;
+        if (ch && channel_try_recv(ch, &v)) {
+            t->recv_src = 2;
+            t->recv_last = v;
+            return v;
+        }
+        /* deadline reached (recv_deadline_ms < 0 means wait forever -> never times out here). */
+        if (t->recv_deadline_ms >= 0 && nova_sched_now_ms() >= t->recv_deadline_ms) {
+            t->recv_src = 3;
+            t->recv_last = 0;
+            return 0;
+        }
+        if (nova_sched_in_task()) {
+            nova_sched_yield_runnable();   /* green: re-enqueue self + yield so senders run (same as select_timeout) */
+        } else if (++spins < 64) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        } else {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(500);
+#endif
+        }
+    }
+}
+/* 1 iff the last __recv_next_timed timed out (src=3). The desugar branches on this BEFORE matching,
+   so the timeout sentinel never has to live in the message value-space (no sentinel collision). */
+int64_t nova_rt_recv_timed_out(void) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return 0;
+    return (t->recv_src == 3) ? 1 : 0;
 }
 /* Drain (rc_dec) all buffered messages from a finished task's mailbox and mark it CLOSED, WITHOUT
    freeing the channel struct: the task struct persists (never freed), so a late pid_send must still

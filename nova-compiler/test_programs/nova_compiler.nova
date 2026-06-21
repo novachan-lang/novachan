@@ -3173,9 +3173,47 @@ fn parse_receive_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         push(arms, Stmt("arm", "", _pat, _wrapped_body, [], [], [arm_guard], ln))
     if len(arms) == 0
         syntax_error(tokens, pos, "receive has no arms; provide at least one pattern arm", pe)
+    // Stage-2: an optional trailing `after <ms>` clause (dedented from the arms, like Erlang's
+    // `after Timeout -> Body`). `after 0` = drain-then-timeout (non-blocking poll). The timeout body
+    // is indented past the `after` keyword.
+    let has_after = false
+    let timeout_expr = null_expr()
+    let after_body = []
+    if tk(tokens, p2) == "IDENT" and tv(tokens, p2) == "after"
+        has_after = true
+        let after_col = tok_col(tokens, p2)
+        p2 = p2 + 1
+        let te = parse_expr(tokens, p2, 0, pe)
+        timeout_expr = te.expr
+        p2 = te.pos
+        if tk(tokens, p2) == "FAT_ARROW"
+            p2 = p2 + 1
+        p2 = skip_nl(tokens, p2)
+        while tk(tokens, p2) != "EOF"
+            if tok_col(tokens, p2) <= after_col
+                break
+            let asr = parse_stmt(tokens, p2, pe)
+            push(after_body, asr.stmt)
+            p2 = skip_nl(tokens, asr.pos)
     // append the catch-all defer arm: _ => __recv_defer()
     let _defer = Stmt("expr", "", Expr("call", "__recv_defer", 0, [], [], ln), [], [], [], [], ln)
     push(arms, Stmt("arm", "", Expr("pat_wild", "_", 0, [], [], ln), [_defer], [], [], [null_expr()], ln))
+    if has_after
+        // Timed desugar: bind the candidate, branch on timeout BEFORE matching (so the timeout
+        // sentinel never lives in the message value-space), else match as usual.
+        //   __recv_begin_timed(<ms>)
+        //   while true:
+        //       let __recv_m = __recv_next_timed()
+        //       if __recv_timed_out(): <after_body>; break
+        //       match __recv_m: <arms>
+        let _letm = Stmt("assign", "__recv_m", Expr("call", "__recv_next_timed", 0, [], [], ln), [], [], [], [], ln)
+        let _tbrk = Stmt("break", "", null_expr(), [], [], [], [], ln)
+        let _to_body = after_body + [_tbrk]
+        let _ifto = Stmt("if", "", Expr("call", "__recv_timed_out", 0, [], [], ln), _to_body, [], [], [], ln)
+        let _matcht = Stmt("match", "", Expr("ident", "__recv_m", 0, [], [], ln), arms, [], [], [], ln)
+        let _loopt = Stmt("while", "", Expr("bool", "true", 1, [], [], ln), [_letm, _ifto, _matcht], [], [], [], ln)
+        let _begint = Stmt("expr", "", Expr("call", "__recv_begin_timed", 0, [timeout_expr], [], ln), [], [], [], [], ln)
+        return StmtParseResult(Stmt("block", "", null_expr(), [_begint, _loopt], [], [], [], ln), p2)
     let _match = Stmt("match", "", Expr("call", "__recv_next", 0, [], [], ln), arms, [], [], [], ln)
     let _loop = Stmt("while", "", Expr("bool", "true", 1, [], [], ln), [_match], [], [], [], ln)
     let _begin = Stmt("expr", "", Expr("call", "__recv_begin", 0, [], [], ln), [], [], [], [], ln)
@@ -4805,6 +4843,12 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_recv_commit"
     else if name == "__recv_defer"
         "nova_rt_recv_defer"
+    else if name == "__recv_begin_timed"
+        "nova_rt_recv_begin_timed"
+    else if name == "__recv_next_timed"
+        "nova_rt_recv_next_timed"
+    else if name == "__recv_timed_out"
+        "nova_rt_recv_timed_out"
     else if name == "abs"
         "nova_rt_abs"
     else if name == "max"
@@ -6082,6 +6126,9 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_recv_next() nounwind")
     emit(cg, "declare i64 @nova_rt_recv_commit() nounwind")
     emit(cg, "declare i64 @nova_rt_recv_defer() nounwind")
+    emit(cg, "declare i64 @nova_rt_recv_begin_timed(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_recv_next_timed() nounwind")
+    emit(cg, "declare i64 @nova_rt_recv_timed_out() nounwind")
     emit(cg, "declare i64 @nova_rt_list_remove_at(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_write_file(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_remove_file(i64) nounwind")
@@ -10635,6 +10682,9 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["__recv_next"] = NTypeScheme([], nt_fn([], nt_any()))
     reg["__recv_commit"] = NTypeScheme([], nt_fn([], nt_int()))
     reg["__recv_defer"] = NTypeScheme([], nt_fn([], nt_int()))
+    reg["__recv_begin_timed"] = NTypeScheme([], nt_fn([nt_int()], nt_int()))
+    reg["__recv_next_timed"] = NTypeScheme([], nt_fn([], nt_any()))
+    reg["__recv_timed_out"] = NTypeScheme([], nt_fn([], nt_bool()))
     reg["select"] = NTypeScheme([], nt_fn([nt_list(nt_any())], nt_any()))
     reg["select_timeout"] = NTypeScheme([], nt_fn([nt_list(nt_any())], nt_any()))   // variadic: select_timeout(ch.., timeout_ms); typed via the early-return at value=="select_timeout"
     reg["reduce"] = NTypeScheme([-1, -2], nt_fn([nt_list(T), nt_fn([U, T], U), U], U))
@@ -16876,6 +16926,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_recv_next() nounwind")
     ire_line(e, "declare i64 @nova_rt_recv_commit() nounwind")
     ire_line(e, "declare i64 @nova_rt_recv_defer() nounwind")
+    ire_line(e, "declare i64 @nova_rt_recv_begin_timed(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_recv_next_timed() nounwind")
+    ire_line(e, "declare i64 @nova_rt_recv_timed_out() nounwind")
     ire_line(e, "declare i64 @nova_rt_list_remove_at(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_spawn(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_monitor(i64) nounwind")

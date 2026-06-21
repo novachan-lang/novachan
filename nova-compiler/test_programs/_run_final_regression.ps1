@@ -419,6 +419,7 @@ $concurrency_tests = @(
     '_recv_heap_probe',
     '_recv_uaf_probe',
     '_recv_nested_test',
+    '_recv_timeout_test',
     'select_test',
     'select_multi_test',
     'select_timeout_test',
