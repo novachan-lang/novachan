@@ -5509,10 +5509,24 @@ static volatile void* g_carrier_spin[64];
 static volatile long  g_carrier_loops[64];   /* sched_run loop iterations, to detect progress */
 /* g_watchdog_on declared earlier (above the fiber code) */
 
+/* M:N per-carrier-deque migration -- STAGE 0 (NOVA_DESIGN/MN_PER_CARRIER_DEQUE_DESIGN.md).
+   LOCK ORDER (the law every later stage obeys): ch->lock is OUTER, g_sched_lock (recursive) is INNER,
+   per-carrier deque locks are LEAF (never acquired while holding a deque lock). The recursion in
+   g_sched_lock is LOAD-BEARING: wake_sleepers/poll_io/check_offload hold it then call nova_rq_push which
+   re-acquires -- do NOT split it. */
 static void nova_rq_push(NovaSchedTask* t) {
     nova_sched_lock();
-    if (g_watchdog_on && t->in_rq)
-        fprintf(stderr, "[BUG] DOUBLE-PUSH task=%p status=%d committed=%d\n", (void*)t, t->status, t->park_committed);
+    /* SINGLE-OWNER-PER-TASK invariant: a task is in the run-queue/injector AT MOST ONCE. in_rq enforces it.
+       Promoted from a watchdog-only log to a HARD guard at N>1: a double-push == a double-enqueue, which at
+       N>1 means two carriers run the same task -> double live_dec (live-count goes negative -> premature
+       termination) / double monitor-notify / double mailbox drain / a reclaim UAF. abort() makes that a LOUD
+       deterministic crash instead of silent corruption. Zero cost at N=1 (the gate; production mode is N=1).
+       A clean run of the suite + the N>1 stress with this guard PROVES no latent double-enqueue exists. */
+    if (t->in_rq && (g_watchdog_on || g_carrier_count > 1)) {
+        fprintf(stderr, "[FATAL] M:N double-enqueue: task=%p status=%d committed=%d -- aborting before double-process\n",
+                (void*)t, t->status, t->park_committed);
+        abort();
+    }
     t->in_rq = 1;
     t->next = NULL;
     if (nova_rq_tail) nova_rq_tail->next = t; else nova_rq_head = t;
