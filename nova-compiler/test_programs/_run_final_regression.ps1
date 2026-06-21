@@ -415,6 +415,10 @@ $domain_tests = @(
 $concurrency_tests = @(
     'async_test',
     '_mailbox_test',
+    '_recv_select_test',
+    '_recv_heap_probe',
+    '_recv_uaf_probe',
+    '_recv_nested_test',
     'select_test',
     'select_multi_test',
     'select_timeout_test',

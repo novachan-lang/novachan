@@ -1394,6 +1394,19 @@ int64_t nova_rt_list_remove(int64_t handle, int64_t value) {
     return 0;
 }
 
+int64_t nova_rt_list_remove_at(int64_t handle, int64_t index) {
+    /* Remove the element at a given index, rc_dec'ing it (the list releases its ref) and shifting the
+       tail down. Used by selective-receive commit to drop a matched saved message. */
+    nova_list_deopt(handle);
+    NovaList* list = (NovaList*)(uintptr_t)handle;
+    if (!list || index < 0 || index >= list->size) return 0;
+    nova_rc_dec(list->data[index]);
+    for (int64_t j = index; j < list->size - 1; j++)
+        list->data[j] = list->data[j + 1];
+    list->size--;
+    return 1;
+}
+
 int64_t nova_rt_list_len(int64_t handle) {
     NovaList* list = (NovaList*)(uintptr_t)handle;
     return list->size;
@@ -5393,6 +5406,15 @@ typedef struct NovaSchedTask {
     int64_t  mailbox;              /* Erlang frontier Stage-0: this task's inbound mailbox (a NovaChannel handle,
                                       created at spawn). PID = the task ptr (never freed -> UAF-safe); pid_send routes
                                       here; receive() reads it; drained+closed at finish (post-finish sends no-op). */
+    /* Stage-1 selective receive: a persistent per-task save-queue (a NovaList of messages no `receive`
+       arm matched yet, kept in arrival order for future receives -- Erlang's save-queue) + transient
+       per-receive cursor. recv_src: 1=current candidate is save_queue[recv_cursor], 2=mailbox. */
+    int64_t  save_queue;           /* NovaList handle (RC-heap, lazily created); 0 until first use */
+    int64_t  recv_cursor;          /* scan index into save_queue during the current receive */
+    int64_t  recv_initial;         /* len(save_queue) snapshot at recv_begin (only [0,recv_initial) is re-scanned) */
+    int      recv_src;             /* source of the current candidate: 0 none / 1 save_queue / 2 mailbox */
+    int64_t  recv_last;            /* the current candidate (stashed by recv_next), so the wildcard `_ => __recv_defer()`
+                                      arm can defer it without a binding. Per-task + sequential (one receive at a time). */
 } NovaSchedTask;
 
 #ifndef NOVA_POLL_READ
@@ -6011,6 +6033,81 @@ int64_t nova_rt_try_receive(void) {
     if (!t || !t->mailbox) { int64_t r = nova_rt_list_create(); nova_rt_list_append(r, 0); nova_rt_list_append(r, 0); return r; }
     return nova_rt_try_recv(t->mailbox);
 }
+/* ── Stage-1 selective receive ─────────────────────────────────────────────────
+   `receive <arms>` desugars to: __recv_begin(); loop { let m = __recv_next();
+   match m { <arm>: __recv_commit(); body; break ;  _ => __recv_defer(m) } }.
+   The save-queue holds messages no arm matched, in arrival order, for future receives (Erlang). */
+static int64_t nova_recv_ensure_sq(NovaSchedTask* t) {
+    if (!t->save_queue) {
+        /* RC heap, not the active arena (must outlive a per-request arena; mirrors the mailbox) */
+        NovaTaskState* _sq = nova_cur();
+        NovaArena* _saved = _sq->active_arena;
+        _sq->active_arena = NULL;
+        t->save_queue = nova_rt_list_create();
+        _sq->active_arena = _saved;
+    }
+    return t->save_queue;
+}
+int64_t nova_rt_recv_begin(void) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return 0;
+    nova_recv_ensure_sq(t);
+    t->recv_cursor = 0;
+    t->recv_initial = nova_rt_list_len(t->save_queue);
+    t->recv_src = 0;
+    return 0;
+}
+int64_t nova_rt_recv_next(void) {
+    /* Returns the next candidate as an OWNED ref: saved -> peek + rc_inc; mailbox -> channel_recv
+       (already owned). The desugar binds it; commit/defer reconcile the save-queue's ref. */
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return 0;
+    if (t->recv_cursor < t->recv_initial) {
+        t->recv_src = 1;
+        int64_t m = nova_rt_list_get(t->save_queue, t->recv_cursor);  /* box-on-egress, borrowed */
+        nova_rc_inc(m);                                               /* caller owns an independent ref */
+        t->recv_last = m;
+        return m;
+    }
+    t->recv_src = 2;
+    int64_t mm = nova_rt_channel_recv(t->mailbox);   /* blocking pull; owned (deep-copied in) */
+    t->recv_last = mm;
+    return mm;
+}
+int64_t nova_rt_recv_commit(void) {
+    /* The candidate matched. Saved -> remove it from the save-queue (rc_dec's the list's ref; the
+       caller still owns the rc_inc'd ref from recv_next, so the arm body is safe). Mailbox -> nothing
+       (already dequeued). */
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return 0;
+    if (t->recv_src == 1) {
+        nova_rt_list_remove_at(t->save_queue, t->recv_cursor);
+        t->recv_initial--;
+    }
+    t->recv_src = 0;
+    return 0;
+}
+int64_t nova_rt_recv_defer(void) {
+    /* No arm matched the stashed candidate (recv_last). Saved -> advance the cursor (it stays in the
+       save-queue). Mailbox -> append it to the save-queue (deferred for future receives, beyond
+       recv_initial so not re-scanned this receive). */
+    NovaSchedTask* t = nova_sched_current;
+    if (!t) return 0;
+    if (t->recv_src == 1) {
+        /* Stays in the save-queue at its slot; release the subject ref recv_next rc_inc'd
+           (the save-queue keeps its own ref). Balanced -> no leak across re-scans. */
+        t->recv_cursor++;
+        nova_rc_dec(t->recv_last);
+    } else if (t->recv_src == 2) {
+        /* list_append rc_inc's; release the channel_recv'd subject ref so ownership transfers
+           cleanly to the save-queue (net RC unchanged -> no leak). */
+        nova_rt_list_append(t->save_queue, t->recv_last);
+        nova_rc_dec(t->recv_last);
+    }
+    t->recv_last = 0;
+    t->recv_src = 0;
+    return 0;
+}
 /* Drain (rc_dec) all buffered messages from a finished task's mailbox and mark it CLOSED, WITHOUT
    freeing the channel struct: the task struct persists (never freed), so a late pid_send must still
    land on a valid, closed channel (send -> rc_dec + -1). rc_dec runs OUTSIDE the lock. */
@@ -6135,6 +6232,7 @@ int64_t nova_rt_sched_run(void) {
             for (int64_t i = 0; i < t->monitor_count; i++)
                 nova_sched_notify_channel(t->monitors[i], t->exit_status);
             nova_mailbox_drain_close(t->mailbox);   /* Erlang frontier Stage-0: free unread msgs + close (post-finish sends no-op) */
+            if (t->save_queue) { nova_rc_dec(t->save_queue); t->save_queue = 0; }   /* Stage-1: free deferred msgs */
             t->finished = 1;
             t->status = 3;
             nova_live_dec();
@@ -6465,6 +6563,7 @@ ws_worker_loop(void* arg) {
             if (done == 1) {
                 task->status = 3;
                 nova_mailbox_drain_close(task->mailbox);   /* Erlang frontier Stage-0: free unread msgs + close */
+                if (task->save_queue) { nova_rc_dec(task->save_queue); task->save_queue = 0; }   /* Stage-1: free deferred msgs */
 #ifdef _WIN32
                 InterlockedDecrement64(&g_ws_total_tasks);
 #else

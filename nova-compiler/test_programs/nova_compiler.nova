@@ -2132,6 +2132,8 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
         parse_import_stmt(tokens, pos)
     else if kind == "KW" and val == "match"
         parse_match_stmt(tokens, pos, pe)
+    else if kind == "KW" and val == "receive" and not (tk(tokens, pos + 1) == "DELIM" and tv(tokens, pos + 1) == "(")
+        parse_receive_stmt(tokens, pos, pe)
     else if kind == "KW" and val == "with"
         parse_with_stmt(tokens, pos, pe)
     else if kind == "KW" and val == "const"
@@ -3113,6 +3115,71 @@ fn parse_match_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
     if len(arms) == 0
         syntax_error(tokens, pos, "match has no arms; provide at least one pattern arm", pe)
     StmtParseResult(Stmt("match", "", subject_r.expr, arms, [], [], [], ln), p2)
+
+// Erlang frontier Stage-1: selective receive. `receive <pat => body ...>` (column-aligned arms like
+// match, no subject) DESUGARS to a poll loop that reuses the proven match codegen + a per-task
+// save-queue (Erlang semantics: a message no arm matches is deferred, in order, for future receives):
+//   __recv_begin()
+//   while true:
+//       match __recv_next():        # save-queue first (in order), then a blocking mailbox pull
+//           <arm.pat> [if g] => __recv_commit(); <arm.body...>; break
+//           _              => __recv_defer()      # stash the candidate into the save-queue
+fn parse_receive_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
+    let ln = tl(tokens, pos)
+    let p2 = skip_nl(tokens, pos + 1)
+    let arms = []
+    let arm_ref_col = tok_col(tokens, p2)
+    while tk(tokens, p2) != "EOF"
+        if tok_col(tokens, p2) < arm_ref_col
+            break
+        let cur_kind = tk(tokens, p2)
+        let _neg = cur_kind == "OP" and tv(tokens, p2) == "-" and tk(tokens, p2 + 1) == "INT"
+        if cur_kind != "IDENT" and cur_kind != "INT" and cur_kind != "STR" and cur_kind != "ATOM" and not _neg
+            break
+        let pat_start = p2
+        let pat_r = parse_pattern(tokens, p2, pe)
+        let arm_col = tok_col(tokens, p2)
+        p2 = pat_r.pos
+        if p2 <= pat_start
+            break
+        let _pats = [pat_r.expr]
+        while tk(tokens, p2) == "OP" and tv(tokens, p2) == "|"
+            p2 = p2 + 1
+            let _nx = parse_pattern(tokens, p2, pe)
+            push(_pats, _nx.expr)
+            p2 = _nx.pos
+        let _pat = pat_r.expr
+        if len(_pats) > 1
+            _pat = Expr("pat_or", "", 0, _pats, [], ln)
+        let arm_guard = null_expr()
+        if tk(tokens, p2) == "KW" and tv(tokens, p2) == "if"
+            p2 = p2 + 1
+            let gr = parse_expr(tokens, p2, 2, pe)
+            arm_guard = gr.expr
+            p2 = gr.pos
+        if tk(tokens, p2) == "FAT_ARROW"
+            p2 = p2 + 1
+        p2 = skip_nl(tokens, p2)
+        let arm_body = []
+        while tk(tokens, p2) != "EOF"
+            if tok_col(tokens, p2) <= arm_col
+                break
+            let sr = parse_stmt(tokens, p2, pe)
+            push(arm_body, sr.stmt)
+            p2 = skip_nl(tokens, sr.pos)
+        let _commit = Stmt("expr", "", Expr("call", "__recv_commit", 0, [], [], ln), [], [], [], [], ln)
+        let _brk = Stmt("break", "", null_expr(), [], [], [], [], ln)
+        let _wrapped_body = [_commit] + arm_body + [_brk]
+        push(arms, Stmt("arm", "", _pat, _wrapped_body, [], [], [arm_guard], ln))
+    if len(arms) == 0
+        syntax_error(tokens, pos, "receive has no arms; provide at least one pattern arm", pe)
+    // append the catch-all defer arm: _ => __recv_defer()
+    let _defer = Stmt("expr", "", Expr("call", "__recv_defer", 0, [], [], ln), [], [], [], [], ln)
+    push(arms, Stmt("arm", "", Expr("pat_wild", "_", 0, [], [], ln), [_defer], [], [], [null_expr()], ln))
+    let _match = Stmt("match", "", Expr("call", "__recv_next", 0, [], [], ln), arms, [], [], [], ln)
+    let _loop = Stmt("while", "", Expr("bool", "true", 1, [], [], ln), [_match], [], [], [], ln)
+    let _begin = Stmt("expr", "", Expr("call", "__recv_begin", 0, [], [], ln), [], [], [], [], ln)
+    StmtParseResult(Stmt("block", "", null_expr(), [_begin, _loop], [], [], [], ln), p2)
 
 // Build the nested-match desugaring of a `with` chain. Each bind `pat <- expr`
 // becomes `match expr { Ok(pat) => <rest>, Err(errname) => <else_body> }`; the
@@ -4730,6 +4797,14 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_mailbox_len"
     else if name == "try_recv_msg"
         "nova_rt_try_receive"
+    else if name == "__recv_begin"
+        "nova_rt_recv_begin"
+    else if name == "__recv_next"
+        "nova_rt_recv_next"
+    else if name == "__recv_commit"
+        "nova_rt_recv_commit"
+    else if name == "__recv_defer"
+        "nova_rt_recv_defer"
     else if name == "abs"
         "nova_rt_abs"
     else if name == "max"
@@ -6003,6 +6078,11 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_receive() nounwind")
     emit(cg, "declare i64 @nova_rt_mailbox_len(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_try_receive() nounwind")
+    emit(cg, "declare i64 @nova_rt_recv_begin() nounwind")
+    emit(cg, "declare i64 @nova_rt_recv_next() nounwind")
+    emit(cg, "declare i64 @nova_rt_recv_commit() nounwind")
+    emit(cg, "declare i64 @nova_rt_recv_defer() nounwind")
+    emit(cg, "declare i64 @nova_rt_list_remove_at(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_write_file(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_remove_file(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_remove_dir(i64) nounwind")
@@ -9217,6 +9297,13 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 ir_emit_inst(b, "make_closure", dest, ir_type_any(), capture_regs, tramp_name, len(captures))
                 ir_emit_inst(b, "slot_store", "", ir_type_void(), [dest], name, 0)
                 b.ir_locals[name] = 1
+            else if tag == "block"
+                // A compound statement: lower each child in order, sharing the enclosing scope
+                // (no new basic block). Used by desugarings that must return ONE Stmt holding a
+                // sequence (e.g. selective `receive`). Inference already scopes "block" (ti_infer_stmt);
+                // codegen previously dropped it, so the desugared body emitted nothing.
+                for _blk_s in body
+                    ir_lower_stmt(b, _blk_s)
 
 fn ir_lower_last_stmt(b: IrBuilder, stmt: Stmt)
     match stmt
@@ -10543,6 +10630,11 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["mailbox_of"] = NTypeScheme([], nt_fn([nt_any()], nt_any()))
     reg["mailbox_len"] = NTypeScheme([], nt_fn([nt_any()], nt_int()))
     reg["try_recv_msg"] = NTypeScheme([], nt_fn([], nt_list(nt_any())))
+    // Stage-1 selective-receive internal helpers (emitted by the `receive` desugar, not user-facing)
+    reg["__recv_begin"] = NTypeScheme([], nt_fn([], nt_int()))
+    reg["__recv_next"] = NTypeScheme([], nt_fn([], nt_any()))
+    reg["__recv_commit"] = NTypeScheme([], nt_fn([], nt_int()))
+    reg["__recv_defer"] = NTypeScheme([], nt_fn([], nt_int()))
     reg["select"] = NTypeScheme([], nt_fn([nt_list(nt_any())], nt_any()))
     reg["select_timeout"] = NTypeScheme([], nt_fn([nt_list(nt_any())], nt_any()))   // variadic: select_timeout(ch.., timeout_ms); typed via the early-return at value=="select_timeout"
     reg["reduce"] = NTypeScheme([-1, -2], nt_fn([nt_list(T), nt_fn([U, T], U), U], U))
@@ -16780,6 +16872,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_receive() nounwind")
     ire_line(e, "declare i64 @nova_rt_mailbox_len(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_try_receive() nounwind")
+    ire_line(e, "declare i64 @nova_rt_recv_begin() nounwind")
+    ire_line(e, "declare i64 @nova_rt_recv_next() nounwind")
+    ire_line(e, "declare i64 @nova_rt_recv_commit() nounwind")
+    ire_line(e, "declare i64 @nova_rt_recv_defer() nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_remove_at(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_spawn(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_monitor(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_exit_reason(i64) nounwind")
