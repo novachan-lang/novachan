@@ -79,6 +79,30 @@ The mailbox late-send hazard is AVOIDED by keeping the (drain-closed) mailbox �
 - POSIX uncontained stack-overflow (no SIGSEGV/sigaltstack handler — verified) is a SEPARATE correctness item for
   non-Windows; do not fix it under this change.
 
+## ★ N>1 RECLAMATION — ATTEMPTED + REVERTED (2026-06-21): a real reclaim-vs-completion race
+After the M:N park-commit race fix (485ed40) made N>1 corruption-free, I tried enabling reclamation at N>1
+(removed the g_carrier_count<=1 gate + added a watchdog-TOCTOU guard). It PASSED N=1 + N=4-normal + N=4-green_scale,
+but **ASAN at N=4 caught a heap-use-after-free** (nova_task_arena_cleanup, nova_runtime.c:5064) and I REVERTED.
+- The race (from the ASAN backtrace): carrier T4 freed fiber F via nova_sched_reclaim_fiber (finish path,
+  done==1) WHILE carrier T2 was still executing F's OWN completion code -- nova_fiber_entry -> nova_task_arena_cleanup
+  -> read F->task.active_arena. So a fiber's teardown (arena cleanup at L5104, which runs BEFORE f->status=3 at
+  L5106, on the fiber's own stack) is NOT atomic w.r.t. another carrier observing done==1 and reclaiming F.
+- WHY the park-commit fix + the f->active double-resume guard did NOT catch it: this is NOT a resume race (no
+  SwitchToFiber onto F by two carriers). It is a TEARDOWN race -- F's bottom frame (nova_fiber_entry) is still
+  running its completion sequence (cleanup; status=3; SwitchToFiber-back) when a reclaim observes F finished.
+  The NovaTaskState is EMBEDDED in the NovaFiber, so free(fib) frees the task state the completion code is reading.
+- THE FIX a future careful session must do (NOT a quick gate removal): reclaim a fiber ONLY after it has FULLY
+  exited its completion path and switched back -- i.e. the reclaim must be sequenced strictly AFTER the fiber's
+  final SwitchToFiber-to-carrier has returned control to the reclaiming carrier, with a happens-before that no
+  OTHER carrier can free it in between. Options: (a) move arena_cleanup + status=3 BEFORE the body so the
+  bottom frame touches nothing after status=3; (b) a per-fiber "exited" flag set as the LAST act before the
+  switch-back, with reclaim gated on it; (c) only the carrier whose fiber_resume(F) returned done==1 may reclaim F
+  (verify no second carrier ever holds F at that point). Must be ASAN-validated at N=4 + NOVA_SCHED_WATCHDOG=1.
+- STATUS: N>1 reclamation is DEFERRED. N>1 keeps the old never-free behavior (a memory leak under churn at N>1,
+  but N>1 also has the lock-convoy liveness limit, so it is not production-ready regardless). N=1 reclamation
+  (the default, the high-value case) is shipped + sound (179126e). This is the right scope: do NOT ship a UAF for
+  an opt-in mode.
+
 ## Honest payoff
 v1 turns "unbounded growth per spawned task, forever" into "~400B tombstone per finished task + reclaimed stacks" —
 unblocking long-running servers (Forge/WebSocket) from ~100k toward ~10M+ tasks OVER TIME. Full reclamation (mailbox +
