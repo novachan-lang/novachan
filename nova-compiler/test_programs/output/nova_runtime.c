@@ -5390,6 +5390,9 @@ typedef struct NovaSchedTask {
                                       so no carrier resumes a fiber that hasn't finished SwitchToFiber. */
     int      home_carrier;         /* M:N: carrier this task is bound to (-1 = unbound); used in later steps */
     volatile int in_rq;            /* M:N detector: 1 while linked in the run-queue (guarded by g_sched_lock) */
+    int64_t  mailbox;              /* Erlang frontier Stage-0: this task's inbound mailbox (a NovaChannel handle,
+                                      created at spawn). PID = the task ptr (never freed -> UAF-safe); pid_send routes
+                                      here; receive() reads it; drained+closed at finish (post-finish sends no-op). */
 } NovaSchedTask;
 
 #ifndef NOVA_POLL_READ
@@ -5933,9 +5936,81 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
     t->finished = 0;
     t->park_committed = 0;
     t->home_carrier = -1;
+    /* Erlang frontier Stage-0: per-task inbound mailbox. It must OUTLIVE any per-request arena
+       active at spawn (the task drains it at finish, possibly AFTER arena_scope_exit). channel_create
+       -> nova_heap_alloc routes to the active arena, so clear active_arena around it -> RC heap.
+       (Arena-escape UAF, ASAN-confirmed; mirrors the channel_send fix 83c9149.) */
+    {
+        NovaTaskState* _mb_t = nova_cur();
+        NovaArena* _mb_saved = _mb_t->active_arena;
+        _mb_t->active_arena = NULL;
+        t->mailbox = nova_rt_channel_create();
+        _mb_t->active_arena = _mb_saved;
+    }
     nova_rq_push(t);
     nova_live_inc();
     return (int64_t)(uintptr_t)t;
+}
+
+/* ── Erlang frontier Stage-0: process mailboxes (self / send / receive) ──────────
+   PID = the task ptr (a NovaSchedTask never freed once spawned -> a stable, UAF-safe
+   identity, same handle monitor() uses). A mailbox is the task's own NovaChannel, so
+   it reuses the proven channel lock + green-scheduler park/unpark + deep-copy-on-send
+   isolation. Selective receive + `!`/`receive{}` syntax + typed-PID are later stages;
+   Stage-0 ships self()/send(pid,msg)/receive() as builtins. See ERLANG_FRONTIER_DESIGN.md. */
+int64_t nova_rt_self(void) {
+    /* Messaging PID = the task's MAILBOX channel handle. CRITICAL soundness: it must be a value that
+       is safe to embed in a deep-copied message. A channel is a tagged nova_heap_alloc'd object, so
+       find_tag is safe on it AND deep_copy SHARES it (same identity, rc_inc) -- exactly what a PID
+       needs. (The raw task ptr is calloc'd with no RC header -> find_tag reads OOB when the pid is
+       deep-copied inside a message; ASAN-confirmed. That is why the PID is the mailbox, not the task.)
+       rc_inc so the caller owns an independent ref; the task's t->mailbox base ref keeps it alive. */
+    NovaSchedTask* t = nova_sched_current;
+    if (!t || !t->mailbox) return 0;   /* 0 outside a green task (OS-pool = Stage 2) */
+    nova_rc_inc(t->mailbox);
+    return t->mailbox;
+}
+int64_t nova_rt_mailbox_of(int64_t task) {
+    /* Bridge a spawn handle (the task ptr -- a DIRECT arg, never deep-copied, so the cast is safe)
+       to its mailbox PID, so a parent can message a spawned child. */
+    if (!task) return 0;
+    NovaSchedTask* t = (NovaSchedTask*)(uintptr_t)task;
+    if (!t->mailbox) return 0;
+    nova_rc_inc(t->mailbox);
+    return t->mailbox;
+}
+int64_t nova_rt_pid_send(int64_t pid, int64_t msg) {
+    /* pid = a mailbox channel handle (from self_pid()/mailbox_of()/a received pid). Just a channel send:
+       deep-copies the payload into the RC heap (ownership transfer); a finished task's mailbox is CLOSED
+       -> channel_send rc_dec's the copy and returns -1 (graceful no-op, no leak, no UAF). */
+    if (!pid) return -1;
+    return nova_rt_channel_send(pid, msg);
+}
+int64_t nova_rt_receive(void) {
+    NovaSchedTask* t = nova_sched_current;
+    if (!t || !t->mailbox) return 0;   /* not in a green task / no mailbox: Stage-0 no-op (OS-pool = Stage 2) */
+    return nova_rt_channel_recv(t->mailbox);   /* parks (green-aware) until a message arrives */
+}
+/* Drain (rc_dec) all buffered messages from a finished task's mailbox and mark it CLOSED, WITHOUT
+   freeing the channel struct: the task struct persists (never freed), so a late pid_send must still
+   land on a valid, closed channel (send -> rc_dec + -1). rc_dec runs OUTSIDE the lock. */
+static void nova_mailbox_drain_close(int64_t handle) {
+    if (!handle) return;
+    NovaChannel* ch = (NovaChannel*)(uintptr_t)handle;
+    for (;;) {
+        int64_t v = 0; int got = 0;
+#ifdef _WIN32
+        EnterCriticalSection(&ch->lock);
+        if (ch->count > 0) { v = channel_dequeue(ch); got = 1; } else { ch->closed = 1; }
+        LeaveCriticalSection(&ch->lock);
+#else
+        pthread_mutex_lock(&ch->lock);
+        if (ch->count > 0) { v = channel_dequeue(ch); got = 1; } else { ch->closed = 1; }
+        pthread_mutex_unlock(&ch->lock);
+#endif
+        if (!got) break;
+        nova_rc_dec(v);
+    }
 }
 
 static int nova_sched_root_exit = 0;
@@ -6039,6 +6114,7 @@ int64_t nova_rt_sched_run(void) {
             /* Notify monitors: direct enqueue + green-waiter wake */
             for (int64_t i = 0; i < t->monitor_count; i++)
                 nova_sched_notify_channel(t->monitors[i], t->exit_status);
+            nova_mailbox_drain_close(t->mailbox);   /* Erlang frontier Stage-0: free unread msgs + close (post-finish sends no-op) */
             t->finished = 1;
             t->status = 3;
             nova_live_dec();
@@ -6368,6 +6444,7 @@ ws_worker_loop(void* arg) {
             int64_t done = nova_rt_fiber_resume(task->fiber);
             if (done == 1) {
                 task->status = 3;
+                nova_mailbox_drain_close(task->mailbox);   /* Erlang frontier Stage-0: free unread msgs + close */
 #ifdef _WIN32
                 InterlockedDecrement64(&g_ws_total_tasks);
 #else
@@ -6424,6 +6501,13 @@ int64_t nova_rt_ws_spawn(int64_t closure) {
     if (!t->fiber) { free(t); return 0; }
     ((NovaFiber*)(uintptr_t)t->fiber)->is_task = 1;   /* scheduler task: yield/finish -> current carrier */
     t->status = 0;
+    {   /* mailbox in the RC heap, not the active arena (arena-escape UAF; see sched_spawn) */
+        NovaTaskState* _mb_t = nova_cur();
+        NovaArena* _mb_saved = _mb_t->active_arena;
+        _mb_t->active_arena = NULL;
+        t->mailbox = nova_rt_channel_create();
+        _mb_t->active_arena = _mb_saved;
+    }
 #ifdef _WIN32
     InterlockedIncrement64(&g_ws_total_tasks);
 #else

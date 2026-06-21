@@ -58,7 +58,8 @@ $track7_tests = @(
     '_s4_adv_chan_test',
     '_s4_adv_int_test',
     '_s4_escbug_test',
-    '_s4_adv_int2_test'
+    '_s4_adv_int2_test',
+    '_s4_floatarr_test'
 )
 
 # Phase 12-14 new tests
@@ -413,6 +414,7 @@ $domain_tests = @(
 # Concurrency tests — real thread-pool spawn, channels, select, async, parallel map, generators
 $concurrency_tests = @(
     'async_test',
+    '_mailbox_test',
     'select_test',
     'select_multi_test',
     'select_timeout_test',

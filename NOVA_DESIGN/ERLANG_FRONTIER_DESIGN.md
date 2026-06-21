@@ -1,0 +1,36 @@
+# NOVA Erlang/Elixir Frontier — Design Verdict & Staged Plan
+
+**Status:** DESIGNED + adversarially vetted (2026-06-21, 7-agent workflow: 3 runtime-designers × 3 pieces + 3 devil's-advocates + synthesis, all claims grounded against the real `nova_runtime.c`/`nova_compiler.nova`). This is the implementation work-list. Goal: make NOVA genuinely Erlang/Elixir-class at fault tolerance + selective receive + (eventually) massive process counts — the NOVA way (CSP-channel foundation, not a BEAM copy).
+
+## The core architectural decision
+
+A **mailbox = a process-owned inbound NovaChannel**. A **PID = a typed handle** to that task (inferer tracks `Pid`, so `pid ! msg` lowers *statically* to `pid_send` — NEVER a `find_tag` runtime guess, which is the int/pointer CVE class). **Selective receive = match-with-save** over a **two-queue mailbox** (incoming ring + BEAM-style save-queue) — NEVER mid-ring removal (which breaks `channel_enqueue`'s contiguous-ring invariant `(head+count)&(cap-1)`). This reuses the proven channel lock + green-scheduler park/unpark and preserves deep-copy-on-send isolation.
+
+## Frontier order (impact ÷ risk)
+
+1. **A — mailbox + selective receive** ← LEAD (zero upstream deps; reuses shipped channel/monitor/`mailx.nova` infra)
+2. **C — fair scheduling** (after the `yield_runnable` park-commit fix + a loop-nesting analysis pass)
+3. **growable stacks** (replaces stackless B for the scale problem)
+4. **C — hot code swap** (research tier; `unsafe`-only until two-generation retention + compiler-verified state migration)
+
+## Piece A — staged plan (each stage gated: reconverge gen5.ll==gen6.ll + 541 both-modes + ASAN + stress)
+
+- **★ STAGE-0 PID REPRESENTATION — RESOLVED + SHIPPED (2026-06-21):** the implementation found the real crux is NOT a dead-PID UAF (tasks are NEVER freed — `nova_rt_sched_spawn` calloc's a `NovaSchedTask` and there is no `free` on the finish path; `exit_reason` reads it post-finish), it is **find_tag-safety of a PID embedded in a deep-copied message**. A raw task ptr (calloc'd, no RC header) embedded in a message → `deep_copy`→`find_tag` reads the header at `ptr-8` = OOB (ASAN-confirmed `heap-buffer-overflow in nova_mem_find_tag`). **SOUND ANSWER (shipped): the messaging PID = the task's MAILBOX CHANNEL HANDLE.** A channel is a tagged `nova_heap_alloc`'d object → `find_tag`-safe, and `deep_copy` SHARES channels (same identity, rc_inc — confirmed nova_runtime.c:2511 "channels are the shared comm primitive") — exactly what a PID needs. NO RC'd-PCB, NO `NOVA_MEM_TASK` tag, NO scheduler-allocation change. `self_pid()` / `mailbox_of(task)` return the (rc_inc'd) mailbox handle; `send_msg(mb,msg)` = `channel_send`; `recv_msg()` = `channel_recv(own mailbox)`. `spawn` still returns the task handle (monitor unchanged); `mailbox_of` bridges task-handle → mailbox (the task ptr is a DIRECT arg, never deep-copied, so the cast is safe). Mailbox created at both spawn paths (sched_spawn + ws_spawn); drained+closed (not freed — the channel persists with the leaked-by-design task) at both finish paths → post-finish sends hit channel_send's closed→rc_dec→-1 (graceful no-op, no leak, no UAF).
+- **Stage 0 — mailbox + typed PID + bare blocking receive** (smallest sound primitive, proves the model end-to-end):
+  - Runtime: add `int64_t mailbox;` to `NovaSchedTask` (~5377) + `NovaProcessInfo` (~6461); `t->mailbox = nova_rt_channel_create()` at spawn; `nova_rt_self()` (green: `nova_sched_current`; OS-pool: TLS) → PID; `nova_rt_pid_send(pid,v)` → `nova_rt_channel_send(task->mailbox, v)`; `nova_rt_receive()` → receive from current task's mailbox (parks via existing channel park/unpark). Task-finish (~6042): `nova_rt_channel_close(mailbox)` + drain-and-`rc_dec` (mirror the b94331e channel-destructor leak fix).
+  - Compiler: parse + lower `self()`→`nova_rt_self`, `pid ! msg` (and/or `send(pid,msg)`)→`nova_rt_pid_send`, bare `receive()`→`nova_rt_receive`; inferer types `spawn` result as `Pid`.
+  - Soundness: mailbox IS a NovaChannel (same lock/park/unpark, proven); typed PID → static `pid_send` (no find_tag); no mailbox leak (close+drain on finish). The compiler uses no mailboxes → its `.ll` should be byte-identical (reconverge sanity).
+  - Stress: 2-task ping-pong + 1k-task fan-in to one mailbox.
+- **Stage 1 — selective receive (the marquee):** `receive { pat => body ... }` lowers to a compiler-generated match loop: peek incoming, on no-match move to save-queue, on match dequeue + re-prepend save-queue; park on `mailbox.incoming` + retry on wake. Stress: save-queue correctness + 1k-non-matching-then-1-matching wake-thrash (measure the O(n²) ceiling honestly). PAIR WITH the `yield_runnable` park-commit fix (see risks). Run the counter gen_server with 10k callers under NOVA_CARRIERS=4.
+- **Stage 2 — `receive ... after N` timeout + OS-pool receive path** (a non-green/OS-thread caller receiving).
+- **Stage 3 — `mailbox_len(pid)` introspection (Erlang `message_queue_len`), bounded-mailbox opt-in (flood protection), monitor integration.**
+
+## CRITICAL adversary findings (respect during implementation)
+
+1. **Existing M:N double-resume race (real UAF vector, latent at N>1 today):** `nova_sched_yield_runnable` (5505) pushes the task to the run-queue BEFORE the fiber finishes switching, with NO `park_committed` guard on the run-queue pop+resume path (5963→6017) — that guard exists only on the channel-wake paths (5537/5550). A 2nd carrier can `fiber_resume` the task while the 1st is still mid-`SwitchToFiber` → stack corruption. `nova_rt_reschedule()` (5519) has the SAME bug. Default N=1 is safe. **Mailbox Stage 0/1 receive parks via the channel path (safe), so it does NOT trigger this — but fair-scheduling (Piece C) MUST fix it first:** route auto-yield through a park-then-commit discipline (don't run-queue-push until `park_committed`, re-enqueue after `fiber_resume` returns). This also fixes the latent `reschedule()` bug.
+2. **Selective-receive guards must be PURE** (no channel ops / side effects): `receive { x if validate(x) => }` where `validate` blocks/recvs would deadlock silently. Restrict (or document) guards to pure predicates (`len`, field compares, arithmetic).
+3. **Stackless (Piece B) is NO-GO:** carrier-stack `send` to a full bounded channel → `fiber_yield` on a non-fiber = UB (confirmed 4368→5163). Also `select`-as-busy-spin (4659/4710) breaks the "millions idle" premise. Use growable stacks instead (4KB→mmap-reserve→fault-grow, ~4.5KB/proc, 1M on 16GB, preserves no-coloring).
+4. **Hot-swap NO-GO as designed:** `FreeLibrary` mid-execution = code-page UAF; `g_hot_modules` unlocked; ~30-line footgun protocol. `unsafe`-only until two-generation retention + verified migration.
+
+## Honest verdict (post-build)
+After Stage 0–3 + fair-scheduling + growable stacks: NOVA is genuinely **Erlang/Elixir-class on the gen_server/supervisor MODEL and selective receive**, with `pid ! msg` / `receive {}` / `self()` simpler than Erlang and far simpler than Elixir's behaviour boilerplate, PLUS an O(1) per-tag escape hatch (`mailx`) Erlang lacks. The honest gaps that remain: true *millions* of processes (growable stacks get ~1M; BEAM's preemptive fairness + 30 years of production hardening are a longer road), and hot-swap parity (research tier).
