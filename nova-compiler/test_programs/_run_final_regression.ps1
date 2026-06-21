@@ -421,6 +421,7 @@ $concurrency_tests = @(
     '_recv_nested_test',
     '_recv_timeout_test',
     '_gen_server_demo',
+    '_supervised_genserver_demo',
     'select_test',
     'select_multi_test',
     'select_timeout_test',
