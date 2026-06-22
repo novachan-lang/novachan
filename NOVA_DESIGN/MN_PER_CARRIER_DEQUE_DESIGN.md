@@ -82,9 +82,19 @@ drain (use time-based).
   false-empty. After: N=4 ASAN+watchdog 728ms clean, N=1 312ms unchanged. LESSON for Stage C: the owner pop/steal
   hot path MUST stay lock-free in the common case (a per-op lock is a perf cliff, ASAN-amplified). GATE: reconverge +
   551/551 both modes (N=1 inert) + N>1 green_scale ASAN+watchdog clean.
-- **STAGE B (~30 LOC):** spawn (L6026) + yield_runnable (L6376) push to the current carrier's deque at N>1; overflow
-  spills to the injector (ADD the cap check ws_deque L6618 lacks); park_committed=1 BEFORE the push (correction #2).
-  GATE: child tasks start on the spawning carrier; reschedule-storm ASAN + zero L5157 aborts; N=1 reconverge.
+- **STAGE B — ATTEMPTED + REVERTED (2026-06-22): a lost-task hang at N=4 (blocker found).** Implemented spawn +
+  yield_runnable push to the current carrier's deque (+ overflow spill to the injector + cap check + park_committed=1
+  BEFORE the push + an in_rq guard on the deque push). Results: N=1 PASS; ASAN-clean; the Stage-0 in_rq guard NEVER
+  fired (-> NO double-enqueue). BUT green_scale at N=4 (non-ASAN AND ASAN) HANGS: the watchdog shows "GREEN SCALE
+  PASS" PRINTS (the test logic COMPLETES) yet the process never exits -- live=2, all 4 carriers idle, injector empty
+  -> 2 tasks stay LIVE but unreachable (a parked task with a LOST WAKEUP), so the carrier loop's while(live>0) never
+  terminates. Stage A exits cleanly (728ms), so the deque-routing TIMING CHANGE exposed the documented N>1 channel
+  lost-wakeup at high oversubscription ([[project-mn-scheduler-step1]]) -- masked at Stage A by the global-queue
+  timing. ★ Stage B CANNOT land until that LOST-WAKEUP is hunted + fixed FIRST, and the fix is NOT in the deque code
+  -- it's in the channel park/wake path (a park-vs-send race, or a wake hitting the wrong queue). REVERTED to the
+  sound Stage-A state. NEXT SESSION for Stage B: (1) instrument the watchdog to identify the 2 stuck tasks + what
+  they're parked on; (2) fix the park/wake race; (3) THEN re-do the deque push. GATE (when re-done): N=1 reconverge +
+  551 both modes; N>1 green_scale + reschedule storm ASAN+watchdog must EXIT cleanly (live->0), zero double-enqueue.
 - **STAGE C (~45 LOC):** work-stealing in the nova_rq_pop fallthrough (steal-one, per-carrier RNG, time-based drain).
   GATE: green_scale N=2/4/8 ASAN+wd, reschedule-storm completes (no lock-convoy!), no hang/abort; MEASURE throughput
   vs the global queue (the payoff).
