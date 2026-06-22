@@ -221,3 +221,44 @@ fully serialize migration**, not tweak the wake handshake.
 - LESSON #3: do NOT attempt another speculative scheduler fix without first PROVING the mechanism (instrument or
   lldb). Three disproven theories now: lock-holding, commit-flag-staleness(boolean), commit-flag-staleness(epoch).
   The proven-by-evidence cause is migration (leaked `active` + frozen carrier-commit + cross-thread resumer).
+
+## ★★★ 2026-06-22 — FIXED. No-migration task PINNING works. N>1 multi-carrier scheduler is LIVE.
+The migration diagnosis was correct, and the fix predicted by it WORKS. Implemented "Stage P1" (de-risked):
+- **Per-carrier run-queue = an MPSC intrusive linked list** (head/tail/count + LEAF lock), links through
+  `t->next` (free while a task is runnable; sleep/io/offload parks use a separate waiter struct's next).
+  UNBOUNDED -> no overflow -> no spill-to-global -> no accidental migration (the ring's fatal flaw, caught
+  by the adversarial review: a spilled home>=0 task in the global queue would run on a non-home carrier).
+  Replaced the Stage-A ring (slots/bottom/top) in place; the unlocked owner empty-check now reads `count`.
+- **Claim on first global pop**: `nova_rq_pop`, under g_sched_lock, sets `home_carrier = nova_carrier_id`
+  for a freshly-spawned (home<0) task. Thereafter home is immutable. Spawn still -> global (home=-1).
+- **All 6 wake / re-enqueue sites route to the HOME carrier's queue** via a new `nova_sched_enqueue_task`
+  (wake_one, wake_send_one, wake_sleepers, poll_io, check_offload, the yield_runnable re-enqueue). The
+  spawn push (global, claimable) is the ONLY remaining nova_rq_push, by design.
+- **F1 park_committed spins KEPT** (P1 de-risk): under pinning they are guaranteed instant no-ops (the home
+  carrier set park_committed before it could pop the task), but keeping them made this diff orthogonal to
+  spin-removal. P2 (next) removes them as dead code.
+- All gated g_carrier_count>1; at N=1 home stays -1 forever -> every path falls through to nova_rq_push/pop
+  -> byte-identical production path.
+
+### Validation (the make-or-break gate) — ALL GREEN
+- green_scale 10k: **N=1 294ms PASS; N=4 x(20+50)=70/70 CLEAN; N=8 x50 50/50 CLEAN** (was ~6/10 HANG with
+  the boolean AND the epoch). 120/120 clean, zero SPIN-WAKE, zero double-enqueue abort, correct sums.
+- **ASAN N=4 x6: 6/6 clean** (PASS + zero AddressSanitizer/abort/UAF).
+- reschedule-storm (_mns, exercises the yield_runnable reroute): N=1/4/8 x10 each, MN_STRESS_OK n=500, no abort.
+- **Bootstrap reconverged: gen5.ll == gen6.ll = FDCE3132...** (compiler logic unchanged; new runtime installed).
+- **Full regression 551/551 PASS in BOTH modes** (NORMAL + NOVA_T8_FULLRC) -> N=1 production path proven intact.
+
+### Why this worked when 3 flag-fixes failed
+The flag fixes (deferred-wake, boolean, epoch) all tried to fix the WAKE side. The bug was the RESUME side:
+a migrated fiber wedged its carrier (SwitchToFiber never returned), so no flag scheme could ever advance the
+commit. Pinning makes a fiber only ever run on ONE OS thread -> the wedge precondition is gone. The waker
+just hands the task to its home carrier's queue; the home carrier (the sole resumer, currently blocked inside
+its own resume until the task fully yields) picks it up next loop -> no double-resume, no spin needed, no wedge.
+
+### Remaining (separately gated, NON-blocking — N>1 is now usable opt-in)
+- P2: delete the now-dead F1 spins (pure cleanup; re-gate + re-validate).
+- N>1 fiber RECLAMATION still gated OFF (the carrier-finish reclaim at L~6505 stays `g_carrier_count<=1`):
+  under pinning the resume is single-threaded so it's likely now safe, but the watchdog `st->fiber` read is a
+  separate TOCTOU; fix that first. Memory grows with task count at N>1 until then (bounded per run).
+- No work-stealing -> load imbalance possible (acknowledged; a later, separately-gated optimization).
+- Socket/netpoller at N>1 not re-validated here (green_scale is channel/sleep/offload). Forge runs N=1.

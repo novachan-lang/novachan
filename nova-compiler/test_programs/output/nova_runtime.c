@@ -5509,18 +5509,25 @@ static volatile void* g_carrier_spin[64];
 static volatile long  g_carrier_loops[64];   /* sched_run loop iterations, to detect progress */
 /* g_watchdog_on declared earlier (above the fiber code) */
 
-/* ── M:N per-carrier work-stealing deque (NOVA_DESIGN/MN_PER_CARRIER_DEQUE_DESIGN.md) ──────────────────
-   STAGE A: pure infrastructure. The owner (a carrier) pushes/pops the BOTTOM of its own deque; thieves
-   (Stage C) steal from the TOP under the same per-deque lock. Carriers are few (<=64), so a mutex-per-deque
-   is fine (a lock-free Chase-Lev is an optional later refinement). The per-deque lock is a LEAF lock: never
-   acquired while holding g_sched_lock or a channel lock (the lock-order law in nova_rq_push). In Stage A
-   NOTHING pushes to a deque (only nova_rq_pop consults it, finding it empty), so behavior is unchanged at
-   every N -- this only lays the structure + the pop seam. NOVA_DEQUE_CAP is a power of 2 (ring masking). */
-#define NOVA_DEQUE_CAP 4096
+/* ── M:N per-carrier run-queue (NOVA_DESIGN/MN_PER_CARRIER_DEQUE_DESIGN.md) ──────────────────
+   NO-MIGRATION PINNING (2026-06-22): each green task is pinned to a HOME carrier on first run; thereafter
+   ONLY that carrier resumes it, so a fiber only ever executes on ONE OS thread over its life. This eliminates
+   the PROVEN root cause of the N>1 deadlock -- a migration-induced carrier WEDGE (a resume's SwitchToFiber
+   never returns -> leaked f->active -> the carrier-produced park commit never runs -> a waker spins forever).
+   Three flag-based fixes (deferred-wake, boolean, epoch) all failed because none touched migration.
+   This queue is an MPSC intrusive linked list: MANY carriers PUSH (any waker re-enqueueing a task homed here),
+   only the OWNER carrier POPS. It is UNBOUNDED -- it links through t->next, which is FREE while a task is
+   runnable (a task is parked-on-a-waiter-list XOR runnable-in-a-queue, never both; sleep/io/offload parks use
+   a SEPARATE waiter struct's next, not t->next). Unbounded = no overflow = no spill-to-global = no accidental
+   migration (the ring's fatal flaw: a spilled home>=0 task in the global queue would run on a non-home carrier).
+   The per-carrier lock is a LEAF lock (never held while taking g_sched_lock or a channel lock). At N=1 this is
+   never touched -- the global-injector path stays byte-identical. */
 typedef struct {
-    NovaSchedTask* slots[NOVA_DEQUE_CAP];
-    int64_t bottom;     /* owner end: next free slot; count = bottom - top */
-    int64_t top;        /* thief end: oldest item */
+    NovaSchedTask* head;        /* pop end: the owner carrier dequeues here (FIFO) */
+    NovaSchedTask* tail;        /* push end: any carrier enqueues a task homed here */
+    volatile int64_t count;     /* the owner's UNLOCKED empty-check reads this. x86-TSO: an aligned 64-bit
+                                   volatile read is atomic; a stale-LOW value only yields a false-EMPTY -> a
+                                   1ms idle retry, never a lost task -> always safe (non-TSO: make it atomic). */
 #ifdef _WIN32
     CRITICAL_SECTION lock;
 #else
@@ -5533,8 +5540,9 @@ static NovaCarrierDeque g_carriers[64];
 static void nova_deque_init_all(int ncar) {
     for (int i = 0; i < ncar && i < 64; i++) {
         if (!g_carriers[i].inited) {
-            g_carriers[i].bottom = 0;
-            g_carriers[i].top = 0;
+            g_carriers[i].head = NULL;
+            g_carriers[i].tail = NULL;
+            g_carriers[i].count = 0;
 #ifdef _WIN32
             InitializeCriticalSection(&g_carriers[i].lock);
 #else
@@ -5545,26 +5553,27 @@ static void nova_deque_init_all(int ncar) {
     }
 }
 
-/* Owner pop from the bottom of THIS carrier's deque. NULL if empty (Stage A: always empty). Clears in_rq
-   (the task is leaving the queue), mirroring nova_rq_pop -- the single-owner-per-task invariant. */
+/* Owner pop from the HEAD of THIS carrier's queue (FIFO). NULL if empty. Clears in_rq + t->next (the task is
+   leaving the queue), mirroring nova_rq_pop -- the single-owner-per-task invariant. The UNLOCKED empty-check
+   keeps the common idle/work pop lock-free (a per-pop lock here was CATASTROPHIC under ASAN -- Stage A): only
+   the owner pops (decrements count), so a stale `count` it reads is at worst LOW (a missed remote push) ->
+   false-EMPTY -> a 1ms idle retry next loop, never a false-NON-empty (the locked re-check below covers that). */
 static NovaSchedTask* nova_deque_pop_local(void) {
     NovaCarrierDeque* d = &g_carriers[nova_carrier_id & 63];
-    /* Unlocked owner fast path: the OWNER is the only writer of bottom, so it reads bottom accurately; top
-       is written only by thieves (steal). bottom<=top => empty, and a stale (smaller) top only makes that
-       MORE true -> a NULL verdict here is always correct (never a false-empty that loses a task). This keeps
-       the common case lock-free (critical: every carrier idle/work pop hits this; a per-pop lock here is
-       catastrophic under ASAN and wasteful in production). Stage A: always empty -> always this path. */
-    if (!d->inited || d->bottom <= d->top) return NULL;
+    if (!d->inited || d->count <= 0) return NULL;
     NovaSchedTask* t = NULL;
 #ifdef _WIN32
     EnterCriticalSection(&d->lock);
 #else
     pthread_mutex_lock(&d->lock);
 #endif
-    if (d->bottom > d->top) {
-        d->bottom--;
-        t = d->slots[d->bottom & (NOVA_DEQUE_CAP - 1)];
-        if (t) t->in_rq = 0;
+    t = d->head;
+    if (t) {
+        d->head = t->next;
+        if (!d->head) d->tail = NULL;
+        t->next = NULL;
+        t->in_rq = 0;
+        d->count--;
     }
 #ifdef _WIN32
     LeaveCriticalSection(&d->lock);
@@ -5609,9 +5618,52 @@ static NovaSchedTask* nova_rq_pop(void) {
     }
     nova_sched_lock();
     NovaSchedTask* t = nova_rq_head;
-    if (t) { nova_rq_head = t->next; if (!nova_rq_head) nova_rq_tail = NULL; t->next = NULL; t->in_rq = 0; nova_trace(7, t, NULL); }
+    if (t) {
+        nova_rq_head = t->next; if (!nova_rq_head) nova_rq_tail = NULL; t->next = NULL; t->in_rq = 0; nova_trace(7, t, NULL);
+        /* PINNING claim: a freshly-spawned (home<0) task is CLAIMED by the first carrier to pop it from the
+           global injector -> thereafter every wake routes it back to THIS carrier's queue (no migration). The
+           claim is race-free: the global pop is under g_sched_lock, so exactly one carrier extracts a given
+           task; home_carrier is then immutable for the task's life. Gated N>1; at N=1 home stays -1 forever. */
+        if (g_carrier_count > 1 && t->home_carrier < 0) t->home_carrier = nova_carrier_id;
+    }
     nova_sched_unlock();
     return t;
+}
+
+/* PINNING MPSC push: enqueue a woken task to a SPECIFIC carrier's queue. Any carrier may call this (a waker
+   re-enqueueing a task homed on another carrier); only the owner pops. Caller may hold ch->lock (OUTER) or
+   g_sched_lock -- the per-carrier lock is LEAF, so this is lock-order-legal. in_rq double-enqueue guard
+   mirrors nova_rq_push (a double-enqueue at N>1 = two carriers run one task = corruption -> abort loudly). */
+static void nova_carrier_enqueue(int home_id, NovaSchedTask* t) {
+    NovaCarrierDeque* d = &g_carriers[home_id & 63];
+    if (t->in_rq && (g_watchdog_on || g_carrier_count > 1)) {
+        fprintf(stderr, "[FATAL] M:N double-enqueue (carrier %d): task=%p status=%d -- aborting before double-process\n",
+                home_id, (void*)t, t->status);
+        abort();
+    }
+#ifdef _WIN32
+    EnterCriticalSection(&d->lock);
+#else
+    pthread_mutex_lock(&d->lock);
+#endif
+    t->in_rq = 1;
+    t->next = NULL;
+    if (d->tail) d->tail->next = t; else d->head = t;
+    d->tail = t;
+    d->count++;
+#ifdef _WIN32
+    LeaveCriticalSection(&d->lock);
+#else
+    pthread_mutex_unlock(&d->lock);
+#endif
+}
+
+/* PINNING-aware re-enqueue: a task that has run before has a home carrier >= 0 -> route it back to THAT
+   carrier's queue (no migration -> no carrier wedge). Unclaimed (home<0) or N=1 -> the global injector (the
+   original byte-identical path). This REPLACES the bare nova_rq_push in every WAKE / yield_runnable site. */
+static void nova_sched_enqueue_task(NovaSchedTask* t) {
+    if (g_carrier_count > 1 && t->home_carrier >= 0) nova_carrier_enqueue(t->home_carrier, t);
+    else nova_rq_push(t);
 }
 
 static int nova_sched_in_task(void) { return nova_sched_running && nova_sched_current != NULL; }
@@ -5677,7 +5729,7 @@ static void nova_sched_wake_one(NovaChannel* ch) {
         while (!t->park_committed) { /* spin */ }
         if (g_watchdog_on) { int cid = nova_carrier_id & 63; g_carrier_pc[cid] = 0; g_carrier_spin[cid] = NULL; }
     }
-    nova_rq_push(t);                               /* back to the run-queue */
+    nova_sched_enqueue_task(t);                     /* PINNING: back to the task's HOME carrier's queue */
 }
 static void nova_sched_wake_send_one(NovaChannel* ch) {
     NovaSchedTask* t = (NovaSchedTask*)ch->green_send_waiters;
@@ -5690,7 +5742,7 @@ static void nova_sched_wake_send_one(NovaChannel* ch) {
         while (!t->park_committed) { /* spin: see nova_sched_wake_one */ }
         if (g_watchdog_on) { int cid = nova_carrier_id & 63; g_carrier_pc[cid] = 0; g_carrier_spin[cid] = NULL; }
     }
-    nova_rq_push(t);
+    nova_sched_enqueue_task(t);                     /* PINNING: back to the task's HOME carrier's queue */
 }
 static void nova_sched_wake_all(NovaChannel* ch) {
     while (ch->green_waiters) nova_sched_wake_one(ch);
@@ -5768,7 +5820,7 @@ static int nova_sched_wake_sleepers(void) {
             *pp = w->next;
             w->task->status = 0;
             if (g_carrier_count > 1) while (!w->task->park_committed) { /* F1 spin */ }
-            nova_rq_push(w->task);
+            nova_sched_enqueue_task(w->task);   /* PINNING: route to the task's HOME carrier */
             free(w);
             woken++;
         } else {
@@ -5862,7 +5914,7 @@ static int nova_sched_poll_io(int timeout_ms) {
             *pp = w->next;
             w->task->status = 0;
             if (g_carrier_count > 1) while (!w->task->park_committed) { /* F1 spin */ }
-            nova_rq_push(w->task);
+            nova_sched_enqueue_task(w->task);   /* PINNING: route to the task's HOME carrier */
             free(w);
             woken++;
         } else {
@@ -6012,7 +6064,7 @@ static int nova_sched_check_offload(void) {
             *pp = j->wnext;
             j->task->status = 0;
             if (g_carrier_count > 1) while (!j->task->park_committed) { /* F1 spin */ }
-            nova_rq_push(j->task);
+            nova_sched_enqueue_task(j->task);   /* PINNING: route to the task's HOME carrier */
             woken++;
         } else {
             pp = &j->wnext;
@@ -6459,7 +6511,7 @@ int64_t nova_rt_sched_run(void) {
                task (status=2, on a waiter list) has yield_runnable=0, so its wake path pushes it later.
                park_committed (release) is published so a carrier spinning in the wake/poll_io/offload
                paths may now safely re-enqueue + resume it. */
-            if (t->yield_runnable) { t->yield_runnable = 0; nova_rq_push(t); }
+            if (t->yield_runnable) { t->yield_runnable = 0; nova_sched_enqueue_task(t); }  /* PINNING: home queue (== this carrier) */
             t->park_committed = 1;
         }
     }
