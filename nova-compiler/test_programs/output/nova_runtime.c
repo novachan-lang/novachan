@@ -5509,6 +5509,71 @@ static volatile void* g_carrier_spin[64];
 static volatile long  g_carrier_loops[64];   /* sched_run loop iterations, to detect progress */
 /* g_watchdog_on declared earlier (above the fiber code) */
 
+/* ── M:N per-carrier work-stealing deque (NOVA_DESIGN/MN_PER_CARRIER_DEQUE_DESIGN.md) ──────────────────
+   STAGE A: pure infrastructure. The owner (a carrier) pushes/pops the BOTTOM of its own deque; thieves
+   (Stage C) steal from the TOP under the same per-deque lock. Carriers are few (<=64), so a mutex-per-deque
+   is fine (a lock-free Chase-Lev is an optional later refinement). The per-deque lock is a LEAF lock: never
+   acquired while holding g_sched_lock or a channel lock (the lock-order law in nova_rq_push). In Stage A
+   NOTHING pushes to a deque (only nova_rq_pop consults it, finding it empty), so behavior is unchanged at
+   every N -- this only lays the structure + the pop seam. NOVA_DEQUE_CAP is a power of 2 (ring masking). */
+#define NOVA_DEQUE_CAP 4096
+typedef struct {
+    NovaSchedTask* slots[NOVA_DEQUE_CAP];
+    int64_t bottom;     /* owner end: next free slot; count = bottom - top */
+    int64_t top;        /* thief end: oldest item */
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+#else
+    pthread_mutex_t lock;
+#endif
+    int inited;
+} NovaCarrierDeque;
+static NovaCarrierDeque g_carriers[64];
+
+static void nova_deque_init_all(int ncar) {
+    for (int i = 0; i < ncar && i < 64; i++) {
+        if (!g_carriers[i].inited) {
+            g_carriers[i].bottom = 0;
+            g_carriers[i].top = 0;
+#ifdef _WIN32
+            InitializeCriticalSection(&g_carriers[i].lock);
+#else
+            pthread_mutex_init(&g_carriers[i].lock, NULL);
+#endif
+            g_carriers[i].inited = 1;
+        }
+    }
+}
+
+/* Owner pop from the bottom of THIS carrier's deque. NULL if empty (Stage A: always empty). Clears in_rq
+   (the task is leaving the queue), mirroring nova_rq_pop -- the single-owner-per-task invariant. */
+static NovaSchedTask* nova_deque_pop_local(void) {
+    NovaCarrierDeque* d = &g_carriers[nova_carrier_id & 63];
+    /* Unlocked owner fast path: the OWNER is the only writer of bottom, so it reads bottom accurately; top
+       is written only by thieves (steal). bottom<=top => empty, and a stale (smaller) top only makes that
+       MORE true -> a NULL verdict here is always correct (never a false-empty that loses a task). This keeps
+       the common case lock-free (critical: every carrier idle/work pop hits this; a per-pop lock here is
+       catastrophic under ASAN and wasteful in production). Stage A: always empty -> always this path. */
+    if (!d->inited || d->bottom <= d->top) return NULL;
+    NovaSchedTask* t = NULL;
+#ifdef _WIN32
+    EnterCriticalSection(&d->lock);
+#else
+    pthread_mutex_lock(&d->lock);
+#endif
+    if (d->bottom > d->top) {
+        d->bottom--;
+        t = d->slots[d->bottom & (NOVA_DEQUE_CAP - 1)];
+        if (t) t->in_rq = 0;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&d->lock);
+#else
+    pthread_mutex_unlock(&d->lock);
+#endif
+    return t;
+}
+
 /* M:N per-carrier-deque migration -- STAGE 0 (NOVA_DESIGN/MN_PER_CARRIER_DEQUE_DESIGN.md).
    LOCK ORDER (the law every later stage obeys): ch->lock is OUTER, g_sched_lock (recursive) is INNER,
    per-carrier deque locks are LEAF (never acquired while holding a deque lock). The recursion in
@@ -5535,6 +5600,13 @@ static void nova_rq_push(NovaSchedTask* t) {
     nova_sched_unlock();
 }
 static NovaSchedTask* nova_rq_pop(void) {
+    /* M:N Stage A: at N>1, a carrier drains its OWN deque first (locality, no global lock). Empty until
+       Stage B pushes to it, so today this always falls through to the global injector below -> behavior
+       unchanged. At N=1 the deque path is skipped entirely (the existing linked-list pop, byte-identical). */
+    if (g_carrier_count > 1) {
+        NovaSchedTask* lt = nova_deque_pop_local();
+        if (lt) return lt;
+    }
     nova_sched_lock();
     NovaSchedTask* t = nova_rq_head;
     if (t) { nova_rq_head = t->next; if (!nova_rq_head) nova_rq_tail = NULL; t->next = NULL; t->in_rq = 0; nova_trace(7, t, NULL); }
@@ -6524,6 +6596,7 @@ void nova_rt_main_dispatch(int64_t main_fn) {
 #endif
                 nova_is_multithreaded = 1;   /* engages atomic RC across carriers */
                 g_carrier_count = ncar;      /* >1 => every nova_sched_lock/live/F1-spin activates */
+                nova_deque_init_all(ncar);   /* M:N Stage A: per-carrier deque locks (before carriers spawn) */
                 nova_sched_running = 1;       /* set ONCE; carriers don't reset it (main_dispatch does, post-join) */
                 if (getenv("NOVA_SCHED_WATCHDOG")) {
                     g_watchdog_on = 1; g_watchdog_ncar = ncar;

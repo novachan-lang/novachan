@@ -71,9 +71,17 @@ drain (use time-based).
   double-enqueues). This REFINES the reclaim-defer worry: the N>1 reclaim UAF was NOT a simple double-enqueue in these
   paths (the reclaim analysis was medium-confidence on that). The guard is now permanent enforcement that will LOUDLY
   catch any double-enqueue introduced by the stealing stages (B+). Gate: N=1 reconverge + 551/551 both modes (inert).
-- **STAGE A (~60 LOC):** Add NovaCarrierDeque g_carriers[64] (struct + per-deque mutex, init when ncar>1). Wire ONLY
-  nova_rq_pop: at N>1 try local deque, then fall through to the injector (global list). Nothing pushes to deques yet
-  -> N=1 AND N>1 behavior unchanged (pure infrastructure). GATE: reconverge + 551/551; N>1 green_scale N=2/4 ASAN+wd.
+- **STAGE A — ✅ DONE (2026-06-22):** Added NovaCarrierDeque g_carriers[64] (bounded ring cap 4096 + per-deque
+  CRITICAL_SECTION, nova_deque_init_all in main_dispatch when ncar>1) + nova_deque_pop_local (owner pop from bottom,
+  clears in_rq) + wired nova_rq_pop to consult the local deque first at N>1 (empty -> falls through to the global
+  injector). Nothing pushes yet -> N=1 AND N>1 behavior unchanged (pure infra). ★ GOTCHA: the first cut locked the
+  deque mutex on EVERY pop (even when empty). Non-ASAN was fine (304ms N=4), but under ASAN the per-pop
+  EnterCriticalSection in the carrier pop loop was CATASTROPHIC (green_scale N=4 ASAN 1.2s -> TIMEOUT 70-150s). FIX =
+  the standard owner fast-path: an UNLOCKED emptiness check (bottom<=top -> NULL, no lock) before locking. Race-safe:
+  the owner is the sole writer of bottom (accurate); a stale (smaller) top only makes "empty" MORE true -> never a
+  false-empty. After: N=4 ASAN+watchdog 728ms clean, N=1 312ms unchanged. LESSON for Stage C: the owner pop/steal
+  hot path MUST stay lock-free in the common case (a per-op lock is a perf cliff, ASAN-amplified). GATE: reconverge +
+  551/551 both modes (N=1 inert) + N>1 green_scale ASAN+watchdog clean.
 - **STAGE B (~30 LOC):** spawn (L6026) + yield_runnable (L6376) push to the current carrier's deque at N>1; overflow
   spills to the injector (ADD the cap check ws_deque L6618 lacks); park_committed=1 BEFORE the push (correction #2).
   GATE: child tasks start on the spawning carrier; reschedule-storm ASAN + zero L5157 aborts; N=1 reconverge.
