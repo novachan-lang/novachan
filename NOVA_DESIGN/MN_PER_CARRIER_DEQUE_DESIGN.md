@@ -134,6 +134,32 @@ c0/c3=resume committed=0, pollution=ONLY 8 (so the swallowed-finish theory is NO
   reschedule storm at N=4/8 under watchdog must EXIT cleanly with live->0 over >=50 repeated runs, c2 never stuck in
   SPIN-WAKE). THEN the per-carrier-deque Stages B/C/D become unblocked.
 
+## ★★ CORRECTION (2026-06-22): the deferred-wake fix FAILED -> the lock-holding theory is DISPROVEN
+Implemented the deferred-wake fix (wake_one/wake_send_one chain to a thread-local pending list; nova_rq_pop flushes
+= spin park_committed + push, OUTSIDE ch->lock). Validated N=4 + watchdog x10: **7/10 STILL HANG**. So moving the spin
+out of ch->lock did NOT fix it -> the deadlock is NOT (just) the lock-holding. REVERTED (sound Stage-A state, 93e061c).
+- ★ DECISIVE NEW EVIDENCE (watchdog on the deferred-wake hang): ALL 4 carriers fixate on the ROOT task (main):
+  c0=resume it, c1+c2+c3 all SPIN-WAKE for it. main = tstatus=2 (parked) + fstatus=1 (fiber RUNNING) + factive=1 (a
+  carrier IS executing main's fiber) + committed=0 (park NOT committed). rq_head non-NULL, pollution=16 (low).
+- ★ REAL ROOT CAUSE (now high-confidence): a MULTIPLE-WAKE / park_committed-REUSE-ACROSS-CYCLES race -- i.e. Analyst
+  1's hypothesis that the synthesis under-weighted. park_committed is a SINGLE flag REUSED every park cycle. Scenario:
+  main is in a tight recv loop (results channel). Cycle 1: main parks, its carrier sets park_committed=1. A waker
+  pops main + (eventually) pushes. main is resumed (park_committed cleared to 0), runs, RE-parks (cycle 2,
+  committed=0 mid-yield). A second waker reads the STALE park_committed=1 (left from cycle 1, not yet re-cleared, OR
+  observed across the clear/set window) and pushes main PREMATURELY -> a carrier resumes main while it is mid-yield
+  (factive=1, fstatus=1) AND still tstatus=2 -> main is simultaneously "being woken" by c1/c2/c3 and "being resumed"
+  by c0 -> the f->active CAS does NOT abort (it is one fiber, resumed sequentially, not two concurrent SwitchToFiber)
+  -> main never cleanly completes a park -> committed stays 0 -> the wakers spin forever. The single reused flag
+  cannot distinguish "committed THIS park" from "committed a PRIOR park."
+- ★ LIKELY FIX (next, dedicated): replace the boolean park_committed with a per-park EPOCH (monotonic counter). A
+  waker, when it pops a waiter, records the park epoch E it is waking; it only re-enqueues once the task has
+  committed park epoch >= E (the carrier bumps the epoch when it commits THAT specific park). A stale commit from a
+  prior cycle (epoch < E) is then NOT mistaken for the current park. This de-races the wake/re-park cycle without a
+  lock. Must preserve the f->active double-resume guard + N=1 zero-cost. Validate with N=4/8 + watchdog x50 clean.
+- LESSON #2: the FIRST fix attempt (deferred wake, from the instrument-first SPIN-WAKE evidence) was ALSO wrong --
+  but it generated the decisive multiple-wake evidence. Two disproven theories (lock-holding, pollution) before the
+  real one (park_committed epoch). N>1 is genuinely hard; N=1 (production) is unaffected throughout.
+
 ## Open questions to resolve during implementation
 - PRE-EXISTING (today, N>1) non-atomic status race: park_io/sleep/offload poller writes w->task->status=0 (L5777)
   while the parking task's fiber may still execute. Independent of deque topology. ASAN/TSan it; may need atomic status.
