@@ -105,6 +105,35 @@ drain (use time-based).
 - STAGE F (defer): per-carrier netpoller (only if poll_io becomes the next ceiling).
 Estimated 6 core commits; budget 8-10 (1-2 debug iterations on Stage C stealing + Stage D TOCTOU verify).
 
+## ★★ ROOT CAUSE FOUND (2026-06-22): N>1 deadlock = wake-spin-under-ch->lock (NOT the pollution hypothesis)
+The lost-wakeup investigation (workflow wf_ee22cb09) proposed a MEDIUM-confidence "swallowed-finish via pollution"
+root cause (fix: volatile nova_current_fiber + a done_flag) and DISMISSED Analyst-2's spin-under-lock deadlock. The
+synthesis itself mandated INSTRUMENT-FIRST before fixing. That step OVERTURNED the verdict: running the CURRENT
+committed code (485ed40/Stage A, NO deque routing) at NOVA_CARRIERS=4 + NOVA_SCHED_WATCHDOG=1 DEADLOCKS intermittently
+-- watchdog: live=7447 STUCK (t=8s..24s, not decreasing), **c2=SPIN-WAKE** (stuck in wake_one's park_committed spin),
+c0/c3=resume committed=0, pollution=ONLY 8 (so the swallowed-finish theory is NOT the driver). 
+- ★ THE REAL BUG: nova_sched_wake_one / wake_send_one (and wake_sleepers/poll_io/check_offload) SPIN
+  `while(!t->park_committed)` (L5677/5690...) WHILE HOLDING ch->lock (wake_one is called under ch->lock by
+  channel_send/close/notify). DEADLOCK: carrier C2 holds chX->lock + spins for task T's park_committed; T is RUNNING
+  on another carrier (committed=0) and needs chX->lock to reach its park point (where park_committed would be set) ->
+  T blocks on chX->lock held by C2 -> circular wait -> permanent hang. It is INTERMITTENT (timing) and PRE-EXISTING
+  in the committed code (the Stage-A/485ed40 gate passed by luck; the per-carrier-deque timing made it more likely,
+  which is how Stage B surfaced it). N=1 is unaffected (the spin is gated g_carrier_count>1).
+- ★ THE FIX (deferred wake -- do NOT spin under ch->lock): wake_one should POP the waiter under ch->lock, the CALLER
+  releases ch->lock, THEN a post-unlock step spins on park_committed + nova_rq_push. I.e. split wake_one into
+  pop-under-lock + commit-after-unlock, and update every caller (channel_send 4390/4403/4425/4438, channel_close,
+  notify_channel 6054, the recv-side wake_send_one). Higher blast radius (~6 call sites) but it is the SOUND fix and
+  it does NOT touch the double-resume guard (the spin still happens, just after releasing ch->lock, so a task can
+  reach its park point). Alternative (setting park_committed at park_on time) is UNSOUND -- it would let a waker
+  re-enqueue a task still executing between park_on and yield -> the f->active double-resume guard would abort.
+- ★ LESSON: a static "cannot deadlock" proof was WRONG; the watchdog's live SPIN-WAKE breadcrumb is the truth. Always
+  instrument-confirm a scheduler root cause before fixing (the synthesis was right to demand it). The volatile
+  nova_current_fiber + done_flag fix is a SEPARATE, real-but-secondary hardening (pollution=8 shows a small residual
+  pollution window) -- do it AFTER the deadlock fix, not instead of it.
+- NEXT (focused session): implement the deferred-wake fix; gate (N=1 551 both modes + reconverge; N>1 green_scale +
+  reschedule storm at N=4/8 under watchdog must EXIT cleanly with live->0 over >=50 repeated runs, c2 never stuck in
+  SPIN-WAKE). THEN the per-carrier-deque Stages B/C/D become unblocked.
+
 ## Open questions to resolve during implementation
 - PRE-EXISTING (today, N>1) non-atomic status race: park_io/sleep/offload poller writes w->task->status=0 (L5777)
   while the parking task's fiber may still execute. Independent of deque topology. ASAN/TSan it; may need atomic status.
