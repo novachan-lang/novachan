@@ -21,6 +21,7 @@ $core_tests = @(
     'defaults_test','in_operator_test','struct_methods_test',
     'generics_test','match_guard_test','trait_test',
     'destructure_test','assert_test','string_index_test',
+    'oob_write_test',
     'string_iter_test','string_ops_test',
     'list_struct_test','list_struct_loop_test',
     'string_accum_test','string_accum_fn_test',
