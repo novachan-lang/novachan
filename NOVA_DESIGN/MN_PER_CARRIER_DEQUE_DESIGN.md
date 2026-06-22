@@ -171,3 +171,53 @@ out of ch->lock did NOT fix it -> the deadlock is NOT (just) the lock-holding. R
 ## Honest scope
 This is a multi-session, fully-gated effort. N=1 (production) is untouched throughout. It properly fixes the N>1
 lock-convoy liveness AND (Stage D) the deferred N>1 reclamation, via the single-owner invariant. Start: Stage 0 + A.
+
+## ★★ 2026-06-22 — THE EPOCH FIX ALSO FAILED. Root cause is NOT the commit flag — it is a MIGRATION race.
+The per-park EPOCH was implemented (dual scheme: channel path used `parks`/`parks_committed`; sleep/io/offload
+kept the boolean untouched), built clean, N=1 perfect. **N=4 + watchdog: still ~6/10 HANG** — identical failure
+rate to the boolean. This DECISIVELY rules out the entire "commit-flag staleness" class (boolean AND epoch fail
+the same way). All three flag/wake fixes (deferred-wake, then epoch) were attacking a SYMPTOM.
+
+### The decisive watchdog evidence (N=4, captured 2026-06-22, frozen at first pollution)
+Hang fingerprint (identical at t=4s and t=8s — a true deadlock, zero progress):
+- **c0 = SPIN-WAKE on the ROOT task**: `parks=30 parks_committed=1 tstatus=0(runnable) factive=1 resumer=c2`.
+  The root PARKED 30 times but only ONE park ever committed. A legitimate waker (c0) is spinning forever for a
+  commit (`parks_committed >= ~30`) that never arrives.
+- c1, c3 = `resume` (inside `fiber_resume`, `factive=1`) on tasks with `status=1` (running, not yielding).
+- c2 = `init` (idle at loop top) — YET it is the root's `resumer`.
+- pollution count = 17 (NOT 8 as a prior session saw — and it IS causal here, contra that session's dismissal).
+
+### Why this is a migration race, not a flag race
+`factive=1` means a `fiber_resume`'s `SwitchToFiber(root)` is *still outstanding* — the matching `f->active=0`
+(runtime L~5167, right after SwitchToFiber returns) NEVER RAN. So the carrier that resumed the root never got
+control back. Therefore the carrier-loop COMMIT (`parks_committed = parks`, the else-branch after `fiber_resume`
+returns) also never ran — which is EXACTLY why `parks_committed` froze at 1 while `parks` climbed to 30. The
+commit flag was never the problem; the **commit code is unreachable because a resume's SwitchToFiber doesn't
+return.** And `resumer=c2` while `c2=init` proves the resumer bookkeeping is stale/cross-thread.
+- The trace shows it directly: `[127017] t31592 RES_ENTER a=7830 b=c0carrier` (carrier c0/thread t31592 resumes
+  task 7830) ... `[127024] t18344 RES_ENTER a=94B0 b=7830` — a DIFFERENT OS thread (t18344) resumes another task
+  with **a TASK FIBER (7830) as the resumer `me`**. `me` should ALWAYS be a carrier fiber (the loop cleanses
+  `nova_current_fiber=&nova_carrier_fiber` before every resume). A task fiber appearing cross-thread as `me` ⇒ a
+  migrated fiber's per-thread fiber bookkeeping (`nova_current_fiber`, `resumer`, `active`) got confused when the
+  task ran on more than one carrier thread across its life.
+
+### Conclusion — every unresolved thread is a MIGRATION race
+The yield-to-`&nova_carrier_fiber` machinery (L5179/5109) + the resume cleanse (L6439) were added to MAKE
+migration safe, but there is a residual hole: a green task that runs on carrier A, parks, is woken, and is
+resumed by carrier B can leak `f->active`, freeze its carrier-produced commit, and orphan itself — deadlocking
+its waker. Three flag-based fixes failed because they never touched migration. **The fix must eliminate or
+fully serialize migration**, not tweak the wake handshake.
+
+### DECISION (extreme-care directive): revert + pivot to NO-MIGRATION (task pinning)
+- Reverted the epoch entirely → runtime back to the sound committed baseline (`git checkout`, 0 epoch refs,
+  N=1 green_scale 10k = 307ms PASS). Soundness #1: do not ship speculative scheduler code.
+- N=1 (the production default) is UNAFFECTED and rock-solid throughout. N>1 stays opt-in/experimental.
+- The real fix = **pin each green task to a home carrier (no migration)**: a woken task is re-enqueued ONLY to
+  the carrier that last ran it; each carrier drains its own queue; the global queue is for INITIAL spawn
+  distribution only; NO work-stealing initially (add later once the pinned base is provably race-free). This
+  removes the cross-thread fiber-state race BY CONSTRUCTION (a fiber only ever runs on one thread). `home_carrier`
+  already exists (init -1, claimed on first run). This subsumes Stage B–D. Cost = load imbalance, acceptable for
+  correctness-first; stealing is a later, separately-gated optimization.
+- LESSON #3: do NOT attempt another speculative scheduler fix without first PROVING the mechanism (instrument or
+  lldb). Three disproven theories now: lock-holding, commit-flag-staleness(boolean), commit-flag-staleness(epoch).
+  The proven-by-evidence cause is migration (leaked `active` + frozen carrier-commit + cross-thread resumer).
