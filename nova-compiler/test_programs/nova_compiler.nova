@@ -9980,6 +9980,8 @@ type TiState
     ti_variadic: dict
     ti_must_use: list
     ti_fn_param_types: dict
+    ti_trait_method_arity: dict
+    ti_type_method_arity: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -10047,7 +10049,7 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -12828,6 +12830,7 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                 if tag == "trait"
                     let trait_methods = []
                     let trait_defs = {}
+                    let trait_arity = {}
                     for tm in body
                         match tm
                             Stmt(tmt, tmn, tme, tmb, tmp, tmeb, tma, tml) =>
@@ -12842,9 +12845,11 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                     if has_self
                                         param_count = param_count - 1
                                     push(trait_methods, tmn)
+                                    trait_arity[tmn] = param_count          // #8 S8.1: record required arity (self-excluded)
                                     if tmt == "fn_default"
                                         trait_defs[tmn] = tm
                     st.ti_traits[name] = trait_methods
+                    st.ti_trait_method_arity[name] = trait_arity
                     if len(trait_defs) > 0
                         st.ti_trait_defaults[name] = trait_defs
                 if tag == "fn"
@@ -12855,6 +12860,19 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                         if not contains(st.ti_type_methods, type_name)
                             st.ti_type_methods[type_name] = []
                         push(st.ti_type_methods[type_name], method_name)
+                        // #8 S8.1: record this method's arity (self-excluded, SAME convention as the trait
+                        // side) so conformance can verify the impl's arity matches the trait's required arity.
+                        let _m_arity = len(params)
+                        for _mp in params
+                            match _mp
+                                Param(_mpn, _mpt, _mpd) =>
+                                    if _mpn == "self"
+                                        _m_arity = _m_arity - 1
+                        let _tma = {}
+                        if contains(st.ti_type_method_arity, type_name)
+                            _tma = st.ti_type_method_arity[type_name]
+                        _tma[method_name] = _m_arity
+                        st.ti_type_method_arity[type_name] = _tma
         si = si + 1
     si = 0
     while si < len(stmts)
@@ -12936,10 +12954,24 @@ fn ti_check_trait_conformance(st: TiState)
                 if has_defaults
                     trait_def_map = st.ti_trait_defaults[trait_name]
                 let missing = []
+                let arity_errs = []
+                // #8 S8.1: pull the recorded per-method arities (self-excluded) for trait + impl
+                let _tr_ar = {}
+                if contains(st.ti_trait_method_arity, trait_name)
+                    _tr_ar = st.ti_trait_method_arity[trait_name]
+                let _ty_ar = {}
+                if contains(st.ti_type_method_arity, tn)
+                    _ty_ar = st.ti_type_method_arity[tn]
                 for rm in required
                     if not list_contains(implemented, rm)
                         if not contains(trait_def_map, rm)
                             push(missing, rm)
+                    else
+                        // the type HAS this method -> its arity must match the trait's required arity
+                        // (closes the name-only conformance hole: a wrong-arity impl was silently accepted)
+                        if contains(_tr_ar, rm) and contains(_ty_ar, rm)
+                            if _tr_ar[rm] != _ty_ar[rm]
+                                push(arity_errs, rm + "() wants " + str(_tr_ar[rm]) + " arg(s), impl has " + str(_ty_ar[rm]))
                 if len(missing) > 0
                     let msg = "type '" + tn + "' does not fully implement trait '" + trait_name + "': missing "
                     let mi = 0
@@ -12949,6 +12981,15 @@ fn ti_check_trait_conformance(st: TiState)
                         msg = msg + missing[mi] + "()"
                         mi = mi + 1
                     ti_error(st, msg, decl_line)
+                if len(arity_errs) > 0
+                    let amsg = "type '" + tn + "' implements trait '" + trait_name + "' with wrong method arity: "
+                    let ai2 = 0
+                    while ai2 < len(arity_errs)
+                        if ai2 > 0
+                            amsg = amsg + ", "
+                        amsg = amsg + arity_errs[ai2]
+                        ai2 = ai2 + 1
+                    ti_error(st, amsg, decl_line)
 
 // ── Tail Call Optimization ───────────────────────────────────────────────────
 
