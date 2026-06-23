@@ -1,0 +1,300 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// dframe — a columnar DataFrame for NOVA (numeric/AI spine, full-parity item)
+//
+// A DataFrame is a labeled table held COLUMN-oriented:
+//     { "cols": [name...],            // explicit, ordered column names
+//       "n":    rowcount,
+//       "data": { name: [values...] } }
+// Column order is always taken from "cols" (never from dict key order), so every
+// operation is deterministic. Values may be int/float/string; columns are assumed
+// homogeneous (the natural table shape).
+//
+// v1 is correctness-first and pure NOVA: sort is a stable insertion sort (O(n^2)),
+// join is hash-indexed (O(n+m) build, O(n) probe). The perf endgame — vectorized
+// columnar kernels over raw double[] (Stage-4) — is tracked separately; it changes
+// the representation, not this API.
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _dfl_has(xs: list, s: string) -> int
+    for x in xs
+        if x == s
+            return 1
+    0
+
+fn _pad(s: string, w: int) -> string
+    let out = s
+    while len(out) < w
+        out = out + " "
+    out
+
+// ── Construction ───────────────────────────────────────────────────────────────
+
+// columns aligned to colnames (each entry is a full column list)
+fn df_from_columns(colnames: list, columns: list) -> dict
+    let data = {}
+    let n = 0
+    if len(columns) > 0
+        n = len(columns[0])
+    let i = 0
+    while i < len(colnames)
+        data[colnames[i]] = columns[i]
+        i = i + 1
+    {"cols": colnames, "n": n, "data": data}
+
+// rows is a list of value-lists, each aligned to colnames (the natural table form)
+fn df_new(colnames: list, rows: list) -> dict
+    let columns = []
+    let c = 0
+    while c < len(colnames)
+        let col = []
+        for row in rows
+            push(col, row[c])
+        push(columns, col)
+        c = c + 1
+    df_from_columns(colnames, columns)
+
+// ── Accessors ────────────────────────────────────────────────────────────────
+
+fn df_cols(df: dict) -> list
+    df["cols"]
+
+fn df_nrows(df: dict) -> int
+    df["n"]
+
+fn df_ncols(df: dict) -> int
+    len(df["cols"])
+
+fn df_col(df: dict, name: string) -> list
+    let data = df["data"]
+    data[name]
+
+fn df_row(df: dict, i: int) -> dict
+    let r = {}
+    for c in df_cols(df)
+        r[c] = df_col(df, c)[i]
+    r
+
+// ── Transforms (each returns a NEW DataFrame) ──────────────────────────────────
+
+// project a subset/reordering of columns
+fn df_select(df: dict, names: list) -> dict
+    let columns = []
+    for c in names
+        push(columns, df_col(df, c))
+    df_from_columns(names, columns)
+
+// keep rows where pred(row_dict) is non-zero
+fn df_filter(df: dict, pred) -> dict
+    let n = df_nrows(df)
+    let keep = []
+    let i = 0
+    while i < n
+        if pred(df_row(df, i)) != 0
+            push(keep, i)
+        i = i + 1
+    let columns = []
+    for c in df_cols(df)
+        let src = df_col(df, c)
+        let col = []
+        for idx in keep
+            push(col, src[idx])
+        push(columns, col)
+    df_from_columns(df_cols(df), columns)
+
+// add a column (or replace it if `name` already exists)
+fn df_with_col(df: dict, name: string, values: list) -> dict
+    let cols = []
+    let columns = []
+    let replaced = 0
+    for c in df_cols(df)
+        push(cols, c)
+        if c == name
+            push(columns, values)
+            replaced = 1
+        else
+            push(columns, df_col(df, c))
+    if replaced == 0
+        push(cols, name)
+        push(columns, values)
+    df_from_columns(cols, columns)
+
+fn df_head(df: dict, k: int) -> dict
+    let lim = k
+    let columns = []
+    for c in df_cols(df)
+        let src = df_col(df, c)
+        if lim > len(src)
+            lim = len(src)
+        let col = []
+        let i = 0
+        while i < lim
+            push(col, src[i])
+            i = i + 1
+        push(columns, col)
+    df_from_columns(df_cols(df), columns)
+
+// stable insertion sort of rows by one column (ascending != 0 -> ascending)
+fn df_sort(df: dict, keycol: string, ascending: int) -> dict
+    let n = df_nrows(df)
+    let keyvals = df_col(df, keycol)
+    let order = []
+    let i = 0
+    while i < n
+        push(order, i)
+        i = i + 1
+    let a = 1
+    while a < n
+        let cur = order[a]
+        let curkey = keyvals[cur]
+        let b = a - 1
+        let placed = 0
+        while b >= 0 and placed == 0
+            let bkey = keyvals[order[b]]
+            let move = 0
+            if ascending != 0
+                if bkey > curkey
+                    move = 1
+            else
+                if bkey < curkey
+                    move = 1
+            if move == 1
+                order[b + 1] = order[b]
+                b = b - 1
+            else
+                placed = 1
+        order[b + 1] = cur
+        a = a + 1
+    let columns = []
+    for c in df_cols(df)
+        let src = df_col(df, c)
+        let col = []
+        for idx in order
+            push(col, src[idx])
+        push(columns, col)
+    df_from_columns(df_cols(df), columns)
+
+// group rows by keycol, aggregate valcol with op in {sum,count,min,max,mean}.
+// Result columns: [keycol, "<op>_<valcol>"]; groups in first-seen order.
+fn df_groupby_agg(df: dict, keycol: string, valcol: string, op: string) -> dict
+    let kdata = df_col(df, keycol)
+    let vdata = df_col(df, valcol)
+    let n = df_nrows(df)
+    let groups = {}
+    let order = []
+    let i = 0
+    while i < n
+        let k = kdata[i]
+        let ks = str(k)
+        let v = vdata[i]
+        if not contains(groups, ks)
+            groups[ks] = {"key": k, "sum": 0, "count": 0, "min": v, "max": v}
+            push(order, ks)
+        let g = groups[ks]
+        g["sum"] = g["sum"] + v
+        g["count"] = g["count"] + 1
+        if v < g["min"]
+            g["min"] = v
+        if v > g["max"]
+            g["max"] = v
+        groups[ks] = g
+        i = i + 1
+    let outkeys = []
+    let outvals = []
+    for ks in order
+        let g = groups[ks]
+        push(outkeys, g["key"])
+        if op == "sum"
+            push(outvals, g["sum"])
+        else if op == "count"
+            push(outvals, g["count"])
+        else if op == "min"
+            push(outvals, g["min"])
+        else if op == "max"
+            push(outvals, g["max"])
+        else if op == "mean"
+            push(outvals, (g["sum"] + 0.0) / (g["count"] + 0.0))
+        else
+            push(outvals, 0)
+    df_from_columns([keycol, op + "_" + valcol], [outkeys, outvals])
+
+// inner join on a shared key column. Right-side columns that clash with a left
+// column name are emitted as "right_<name>".
+fn df_join(left: dict, right: dict, keycol: string) -> dict
+    let rkeys = df_col(right, keycol)
+    let rn = df_nrows(right)
+    let ridx = {}
+    let j = 0
+    while j < rn
+        let ks = str(rkeys[j])
+        if not contains(ridx, ks)
+            ridx[ks] = []
+        let lst = ridx[ks]
+        push(lst, j)
+        ridx[ks] = lst
+        j = j + 1
+    let lcols = df_cols(left)
+    let rcols_extra = []
+    for c in df_cols(right)
+        if c != keycol
+            push(rcols_extra, c)
+    let outcols = []
+    for c in lcols
+        push(outcols, c)
+    for c in rcols_extra
+        if _dfl_has(lcols, c)
+            push(outcols, "right_" + c)
+        else
+            push(outcols, c)
+    let outdata = {}
+    for c in outcols
+        outdata[c] = []
+    let lkeys = df_col(left, keycol)
+    let ln = df_nrows(left)
+    let i = 0
+    while i < ln
+        let ks = str(lkeys[i])
+        if contains(ridx, ks)
+            for rj in ridx[ks]
+                for c in lcols
+                    let col = outdata[c]
+                    push(col, df_col(left, c)[i])
+                    outdata[c] = col
+                for c in rcols_extra
+                    let outname = c
+                    if _dfl_has(lcols, c)
+                        outname = "right_" + c
+                    let col2 = outdata[outname]
+                    push(col2, df_col(right, c)[rj])
+                    outdata[outname] = col2
+        i = i + 1
+    let columns = []
+    for c in outcols
+        push(columns, outdata[c])
+    df_from_columns(outcols, columns)
+
+// ── Rendering ──────────────────────────────────────────────────────────────────
+
+fn df_to_str(df: dict) -> string
+    let cols = df_cols(df)
+    let n = df_nrows(df)
+    let widths = {}
+    for c in cols
+        widths[c] = len(c)
+    let i = 0
+    while i < n
+        for c in cols
+            let s = str(df_col(df, c)[i])
+            if len(s) > widths[c]
+                widths[c] = len(s)
+        i = i + 1
+    let out = ""
+    for c in cols
+        out = out + _pad(c, widths[c]) + "  "
+    out = out + "\n"
+    let r = 0
+    while r < n
+        for c in cols
+            out = out + _pad(str(df_col(df, c)[r]), widths[c]) + "  "
+        out = out + "\n"
+        r = r + 1
+    out
