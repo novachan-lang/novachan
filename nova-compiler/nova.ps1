@@ -24,10 +24,16 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CompilerExe  = Join-Path $ScriptDir "test_programs\gen3_test.exe"
 $CompilerJar  = Join-Path $ScriptDir "build\libs\nova-compiler-0.1.0-all.jar"
 $RuntimeSrc   = Join-Path $ScriptDir "test_programs\output\nova_runtime.c"
+$SqliteSrc    = Join-Path $ScriptDir "test_programs\output\sqlite3.c"
+$CacheDir     = Join-Path $ScriptDir ".nova_cache"
 $ClangPath    = "clang"
 $DefaultFlags = "-O2 -D_CRT_SECURE_NO_WARNINGS -w"
 $LinkLibs     = "-lws2_32 -ladvapi32"
 $NovaVersion  = "0.3.0-dev"
+# Item #1 — fast inner dev loop: link against a CACHED runtime/sqlite object (compiled once, keyed by
+# source SHA) at -O0 by default; --release uses -O2. Was recompiling the 20k-line runtime.c every build
+# (~5.8s); cached -O0 link is ~0.3s. -O0 only affects DEV build speed, never correctness.
+$script:LinkOpt = "-O0"
 
 # Detect platform
 $IsWin = $IsWindows -or ($env:OS -eq 'Windows_NT')
@@ -78,8 +84,41 @@ function Invoke-NovaCompile {
     }
 }
 
+# Item #1: ensure a cached object for a big C source, compiled ONCE per (source-SHA, opt-level).
+# Returns the cached .o path. Rebuilds only when the source content changes (SHA sidecar) — so the
+# 20k-line runtime / 9MB sqlite is not recompiled on every `nova run`.
+function Ensure-CachedObj {
+    param([string]$Src, [string]$Name, [string]$Opt, [string]$ExtraDef = "")
+    if (-not (Test-Path $Src)) { return "" }
+    if (-not (Test-Path $CacheDir)) { New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null }
+    $tag = if ($Opt -like "*-O2*") { "rel" } else { "dev" }
+    $obj = Join-Path $CacheDir "$Name`_$tag.o"
+    $shaFile = Join-Path $CacheDir "$Name`_$tag.sha"
+    # Fast path: if the cached object is newer than the source, the source is unchanged since we built it ->
+    # reuse without hashing the (large) source. A modified OR git-checked-out-older source has mtime >= obj,
+    # which falls through to the SHA check below (so correctness never depends on mtime alone).
+    if (Test-Path $obj) {
+        if ((Get-Item $obj).LastWriteTimeUtc -gt (Get-Item $Src).LastWriteTimeUtc) { return $obj }
+    }
+    $curHash = (Get-FileHash $Src -Algorithm SHA256).Hash
+    $cached = if (Test-Path $shaFile) { (Get-Content $shaFile -Raw).Trim() } else { "" }
+    if (-not (Test-Path $obj) -or $cached -ne $curHash) {
+        Write-Host "Caching $Name ($tag, one-time)..."
+        $a = "$Opt -c $ExtraDef `"$Src`" -o `"$obj`" -D_CRT_SECURE_NO_WARNINGS -w"
+        $p = Start-Process -FilePath $ClangPath -ArgumentList $a -NoNewWindow -Wait -PassThru -RedirectStandardError "$env:TEMP\nova_obj_err.txt"
+        if ($p.ExitCode -ne 0 -or -not (Test-Path $obj)) {
+            $e = Get-Content "$env:TEMP\nova_obj_err.txt" -Raw -ErrorAction SilentlyContinue
+            Write-Error "Cached object build failed for $Name`: $e"; exit 1
+        }
+        Set-Content -Path $shaFile -Value $curHash -NoNewline
+    }
+    return $obj
+}
+
 function Invoke-ClangLink {
     param([string]$LlFile, [string]$OutputExe, [string]$WorkDir, [string]$ExtraLibs = "")
+
+    $opt = $script:LinkOpt
 
     # Extract LINK_LIB comments from .ll file
     $libFlags = ""
@@ -90,14 +129,17 @@ function Invoke-ClangLink {
         if ($skipLibs -notcontains $lib) { $libFlags += " -l$lib" }
     }
 
-    # Check for sqlite3
-    $extraSrc = ""
-    $sqliteSrc = Join-Path $ScriptDir "test_programs\output\sqlite3.c"
-    if ((Select-String -Path (Join-Path $WorkDir $LlFile) -Pattern '@sqlite3_' -Quiet) -and (Test-Path $sqliteSrc)) {
-        $extraSrc = " `"$sqliteSrc`" -DSQLITE_THREADSAFE=0"
+    # Cached runtime object (compiled once, not every build)
+    $rtObj = Ensure-CachedObj -Src $RuntimeSrc -Name "nova_runtime" -Opt $opt
+
+    # Cached sqlite object, only when the program uses it
+    $extraObj = ""
+    if (Select-String -Path (Join-Path $WorkDir $LlFile) -Pattern '@sqlite3_' -Quiet) {
+        $sqObj = Ensure-CachedObj -Src $SqliteSrc -Name "sqlite3" -Opt $opt -ExtraDef "-DSQLITE_THREADSAFE=0"
+        if ($sqObj) { $extraObj = " `"$sqObj`"" }
     }
 
-    $linkArgs = "$DefaultFlags -o `"$OutputExe`" `"$LlFile`" `"$RuntimeSrc`"$extraSrc $LinkLibs$libFlags$ExtraLibs"
+    $linkArgs = "$opt -o `"$OutputExe`" `"$LlFile`" `"$rtObj`"$extraObj $LinkLibs$libFlags$ExtraLibs -D_CRT_SECURE_NO_WARNINGS -w"
     $p = Start-Process -FilePath $ClangPath -ArgumentList $linkArgs -WorkingDirectory $WorkDir -NoNewWindow -Wait -PassThru -RedirectStandardError "$env:TEMP\nova_link_err.txt"
     return $p.ExitCode
 }
@@ -363,11 +405,16 @@ function Nova-Version {
 
 # ─── Dispatch ─────────────────────────────────────────────────────────
 
+# Item #1: --release (or -r) → -O2 peak build; default → -O0 cached dev link (fast inner loop).
+$isRelease = ($Args -contains '--release') -or ($Args -contains '-r')
+$script:LinkOpt = if ($isRelease) { '-O2' } else { '-O0' }
+$srcArg = ($Args | Where-Object { $_ -notlike '-*' } | Select-Object -First 1)
+
 switch ($Command) {
-    "build"   { Nova-Build -Source ($Args | Select-Object -First 1) }
-    "run"     { Nova-Run -Source ($Args | Select-Object -First 1) }
-    "test"    { Nova-Test -Path ($Args | Select-Object -First 1) }
-    "check"   { Nova-Check -Source ($Args | Select-Object -First 1) }
+    "build"   { Nova-Build -Source $srcArg }
+    "run"     { Nova-Run -Source $srcArg }
+    "test"    { Nova-Test -Path $srcArg }
+    "check"   { Nova-Check -Source $srcArg }
     "fmt"     { Nova-Fmt -Source ($Args | Select-Object -First 1) }
     "new"     { Nova-New -Name ($Args | Select-Object -First 1) }
     "clean"   { Nova-Clean }

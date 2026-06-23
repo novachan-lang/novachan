@@ -10,7 +10,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 0 — sharpen the gate first (compounding speedup; do before grinding the rest)
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 1 | Cached runtime `.o` + `-O0` dev link (builds 5.8s→0.3s) | 🔴 | S | build scripts | TODO | — |
+| 1 | Cached runtime `.o` + `-O0` dev link (builds 5.8s→0.3s) | 🔴 | S | build scripts | **DONE** (nova.ps1: SHA+mtime-keyed `.nova_cache`, dev -O0 / `--release` -O2; measured 12s→2.5s, 4.7×; true 0.3s = the interpreter #30) | opus |
 | 2 | Parallel test runner + ThreadSanitizer on the C runtime (suite ~55m→~10m) | 🔴 | M | test harness, runtime | TODO | — |
 | 3 | CI (none exists) + perf-regression gate (nova_rt_* call-count=0 on hot paths) | 🔴 | M | CI, bench | TODO | — |
 
