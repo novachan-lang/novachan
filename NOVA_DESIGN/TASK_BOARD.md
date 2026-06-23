@@ -38,7 +38,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 4 — full-parity: performance
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 13 | Float-array C-parity (raw double[], Stage 4) — kills ~120× C gap | 🟡 | L | compiler+runtime | TODO | — |
+| 13 | Float-array C-parity (raw double[], Stage 4) — kills ~120× C gap | 🟡 | L | compiler+runtime | PARTIAL (scoped, evidence-based): runtime raw-`double[]` mode EXISTS (NovaList.elem_kind==2 + append_fbox + nova_list_deopt-on-taint + box-on-Any-egress) and the compiler already routes float-list `xs[i]` to `nova_rt_list_get_f` which takes the raw fast path (`return list->data[index]`, no box-deref) — so it is NO LONGER the 120× boxed gap. REMAINING = replace the per-element CALL to nova_rt_list_get_f with an INLINED guarded native `load double` (getelementptr + `load double`, guarded by elem_kind==2, guard hoisted out of the loop) to reach C-parity + enable auto-vectorization. This is a self-reconverging codegen change (compiler recompiles itself) → full gate (reconverge + 571×2 modes + ASAN + perf) required; soundness-sensitive (same area that broke math3d/complexnum when rushed). Do as a focused effort. | — |
 | 14 | HOF/closure monomorphization (Stage 5) — XL, HIGH RISK (PhD-grade) | 🟡 | XL | compiler | TODO | — |
 | 15 | Struct SROA + typed-field unbox + native NOVA→NOVA ABI (Stage 2/3) | 🟡 | XL | compiler | TODO | — |
 
