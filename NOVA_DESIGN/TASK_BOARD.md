@@ -11,7 +11,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
 | 1 | Cached runtime `.o` + `-O0` dev link (builds 5.8s→0.3s) | 🔴 | S | build scripts | **DONE** (nova.ps1: SHA+mtime-keyed `.nova_cache`, dev -O0 / `--release` -O2; measured 12s→2.5s, 4.7×; true 0.3s = the interpreter #30) | opus |
-| 2 | Parallel test runner + ThreadSanitizer on the C runtime (suite ~55m→~10m) | 🔴 | M | test harness, runtime | TODO | — |
+| 2 | Parallel test runner + ThreadSanitizer on the C runtime | 🔴 | M | test harness, runtime | **PARTIAL**: parallel runner ALREADY EXISTS (regression RunspacePool, min(8,cores-2); ~17min/mode — the "55min sequential" was a miscount). TSan is UNSUPPORTED on clang `x86_64-pc-windows-msvc` → must run on the WSL/Linux track (where the runtime already cross-compiles). TSan-on-Linux teed up; not a Windows item. | opus |
 | 3 | CI (none exists) + perf-regression gate (nova_rt_* call-count=0 on hot paths) | 🔴 | M | CI, bench | TODO | — |
 
 ## PHASE 1 — cheap minimum-bar floor (safety + ops; S/M each, low risk)
