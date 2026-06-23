@@ -70,6 +70,18 @@ $toml = Get-Content "test_consumer/nova.toml" -Raw
 if (!($toml -match "mathlib")) { Write-Host "FAIL: nova.toml not updated"; exit 1 }
 Write-Host "  OK"
 
+# Step 7: Resolver correctness in an ISOLATED registry (NOVA_REGISTRY override) so the
+# full transitive closure / constraint intersection / conflict / cycle cases are exercised
+# without touching the shared per-user registry.
+Write-Host "[7/7] Testing dependency resolver (transitive closure, intersection, conflict, cycle)..."
+$savedReg = $env:NOVA_REGISTRY
+$env:NOVA_REGISTRY = Join-Path $env:TEMP ("nova_reg_" + [System.Guid]::NewGuid().ToString("N"))
+$rr = Invoke-Timed -FilePath "$PSScriptRoot\nova_pkg.exe" -Arguments 'selftest' -TimeoutMs 15000 -WorkingDirectory $PSScriptRoot
+Remove-Item $env:NOVA_REGISTRY -Recurse -Force -ErrorAction SilentlyContinue
+if ($savedReg) { $env:NOVA_REGISTRY = $savedReg } else { Remove-Item Env:NOVA_REGISTRY -ErrorAction SilentlyContinue }
+if (!($rr.StdOut -match "pkg-resolver: all passed")) { Write-Host "FAIL: resolver selftest: $($rr.StdOut)"; exit 1 }
+Write-Host "  OK"
+
 # Cleanup
 Remove-Item "test_pkg_project" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "test_consumer" -Recurse -Force -ErrorAction SilentlyContinue

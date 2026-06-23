@@ -111,6 +111,11 @@ fn home_dir() -> string
     h
 
 fn registry_dir() -> string
+    // NOVA_REGISTRY lets a project (or test, or CI) point at an isolated registry
+    // instead of the shared per-user one. Empty/unset -> the default ~/.nova/registry.
+    let override = env("NOVA_REGISTRY")
+    if len(override) > 0
+        return override
     path_join(home_dir(), ".nova/registry")
 
 fn registry_index_dir() -> string
@@ -194,7 +199,16 @@ fn list_versions(name: string) -> list
             push(versions, ver)
     versions
 
-fn best_version(name: string, constraint: string) -> string
+fn _list_has_str(xs: list, s: string) -> int
+    for x in xs
+        if x == s
+            return 1
+    0
+
+// Highest published version of `name` that satisfies EVERY constraint in `cons`
+// (constraint intersection). "" if none qualifies. Single-constraint callers go
+// through best_version, which is just the 1-element case.
+fn best_version_multi(name: string, cons: list) -> string
     let versions = list_versions(name)
     let best = ""
     let best_sv = {}
@@ -202,41 +216,94 @@ fn best_version(name: string, constraint: string) -> string
         let sv = semver_parse(v)
         if sv["valid"] == 0
             continue
-        if semver_satisfies(sv, constraint) == 0
+        let ok = 1
+        for c in cons
+            if semver_satisfies(sv, c) == 0
+                ok = 0
+        if ok == 0
             continue
         if best == "" or semver_cmp(sv, best_sv) > 0
             best = v
             best_sv = sv
     best
 
-// ── Dependency resolution (greedy nearest-wins) ──────────────────────────────
+fn best_version(name: string, constraint: string) -> string
+    best_version_multi(name, [constraint])
+
+// ── Dependency resolution (full transitive closure + constraint intersection) ──
+//
+// The previous resolver was a greedy 2-level "nearest wins": it walked direct deps
+// and their direct deps ONLY (a dep three levels down was silently dropped), kept
+// the FIRST version chosen for a transitive package (a later, tighter constraint was
+// ignored — the resolved version might not satisfy every consumer), and could not
+// report a genuine conflict (two incompatible exact pins quietly mis-resolved).
+//
+// resolve_graph is a fixpoint worklist over the WHOLE dependency graph:
+//   - every requirement (name, constraint) discovered anywhere is recorded,
+//   - each package is pinned to the HIGHEST version satisfying ALL its constraints
+//     (intersection); when a newly discovered constraint lowers that choice, the
+//     package is re-expanded so its (possibly different) deps are re-walked,
+//   - constraints only ever accumulate and the chosen version only ever decreases
+//     over a finite version set, so the fixpoint terminates; cycles (a->b->a) are
+//     absorbed because a repeated (name,constraint) re-pins to the same version and
+//     stops expanding,
+//   - if no version satisfies the accumulated constraints, it's a real conflict.
+//
+// Returns {"ok":1,"resolved":{name->version}} or
+//         {"ok":0,"pkg":name,"error":msg}. The CLI wrapper resolve_deps turns a
+// conflict into a clear error+exit; tests call resolve_graph directly and assert.
+fn resolve_graph(manifest: dict) -> dict
+    let constraints = {}    // name -> list of every constraint string seen for it
+    let resolved = {}       // name -> currently-chosen version
+    let q_names = []        // FIFO of pending requirements (index-pointer queue)
+    let q_cons = []
+    if contains(manifest, "dependencies")
+        let deps = manifest["dependencies"]
+        for name in keys(deps)
+            push(q_names, name)
+            push(q_cons, deps[name])
+    let head = 0
+    let guard = 0
+    while head < len(q_names)
+        guard = guard + 1
+        if guard > 1000000
+            return {"ok": 0, "pkg": "", "error": "dependency resolution did not converge"}
+        let name = q_names[head]
+        let constraint = q_cons[head]
+        head = head + 1
+        let clist = []
+        if contains(constraints, name)
+            clist = constraints[name]
+        if not _list_has_str(clist, constraint)
+            push(clist, constraint)
+        constraints[name] = clist
+        let chosen = best_version_multi(name, clist)
+        if chosen == ""
+            return {"ok": 0, "pkg": name, "error": "no version of '" + name + "' satisfies all constraints: " + join(clist, ", ")}
+        let prev = ""
+        if contains(resolved, name)
+            prev = resolved[name]
+        if chosen == prev
+            continue
+        resolved[name] = chosen
+        let meta_path = pkg_metadata_path(name, chosen)
+        if file_exists(meta_path)
+            let meta = toml_parse(read_file(meta_path))
+            if contains(meta, "dependencies")
+                let tdeps = meta["dependencies"]
+                for tn in keys(tdeps)
+                    push(q_names, tn)
+                    push(q_cons, tdeps[tn])
+    {"ok": 1, "resolved": resolved}
 
 fn resolve_deps(manifest: dict) -> dict
-    let resolved = {}
-    if not contains(manifest, "dependencies")
-        return resolved
-    let deps = manifest["dependencies"]
-    let dep_names = keys(deps)
-    for name in dep_names
-        let constraint = deps[name]
-        let version = best_version(name, constraint)
-        if version == ""
-            print("error: no version of '" + name + "' satisfies constraint '" + constraint + "'")
-            exit(1)
-        resolved[name] = version
-        let dep_meta_path = pkg_metadata_path(name, version)
-        if file_exists(dep_meta_path)
-            let meta_text = read_file(dep_meta_path)
-            let meta = toml_parse(meta_text)
-            if contains(meta, "dependencies")
-                let transitive = meta["dependencies"]
-                let tnames = keys(transitive)
-                for tn in tnames
-                    if not contains(resolved, tn)
-                        let tv = best_version(tn, transitive[tn])
-                        if tv != ""
-                            resolved[tn] = tv
-    resolved
+    let r = resolve_graph(manifest)
+    if r["ok"] == 0
+        print("error: cannot resolve dependencies: " + r["error"])
+        if r["pkg"] != ""
+            print("  Available versions of '" + r["pkg"] + "': " + str(list_versions(r["pkg"])))
+        exit(1)
+    r["resolved"]
 
 // ── Lockfile ─────────────────────────────────────────────────────────────────
 
@@ -454,6 +521,70 @@ fn cmd_info(args: list)
         else
             print("  " + v)
 
+// ── Selftest (resolver correctness, isolated registry) ──────────────────────────
+
+fn _publish_fixture(name: string, version: string, deps: dict)
+    ensure_registry()
+    mkdir_p(path_join(registry_index_dir(), name))
+    let meta = "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\n"
+    if len(keys(deps)) > 0
+        meta = meta + "\n[dependencies]\n"
+        for dn in keys(deps)
+            meta = meta + dn + " = \"" + deps[dn] + "\"\n"
+    write_file(pkg_metadata_path(name, version), meta)
+
+// Run with NOVA_REGISTRY pointed at a throwaway dir (the harness does this) so the
+// shared registry is never touched. Exercises the four properties the old greedy
+// resolver got wrong: deep transitivity, constraint intersection, conflict, cycles.
+fn cmd_selftest(args: list)
+    // c: a package with several versions across two majors
+    _publish_fixture("c", "1.0.0", {})
+    _publish_fixture("c", "1.1.0", {})
+    _publish_fixture("c", "1.2.0", {})
+    _publish_fixture("c", "2.0.0", {})
+    // a needs c ^1.0, b needs c ^1.1 -> intersection must be 1.x AND >=1.1 -> 1.2.0
+    _publish_fixture("a", "1.0.0", {"c": "^1.0.0"})
+    _publish_fixture("b", "1.0.0", {"c": "^1.1.0"})
+    // deep chain d -> e -> f (3 levels; the old 2-level resolver dropped f)
+    _publish_fixture("f", "3.0.0", {})
+    _publish_fixture("e", "2.0.0", {"f": "^3.0.0"})
+    _publish_fixture("d", "1.0.0", {"e": "^2.0.0"})
+
+    // 1) Diamond + constraint intersection
+    let r1 = resolve_graph({"dependencies": {"a": "^1.0.0", "b": "^1.0.0"}})
+    assert(r1["ok"] == 1, "diamond resolves")
+    let res1 = r1["resolved"]
+    assert(res1["a"] == "1.0.0", "a pinned")
+    assert(res1["b"] == "1.0.0", "b pinned")
+    assert(res1["c"] == "1.2.0", "c intersected: highest 1.x satisfying ^1.0 AND ^1.1")
+    assert(len(keys(res1)) == 3, "diamond deduped to a,b,c")
+
+    // 2) Deep transitive closure (3 levels)
+    let r2 = resolve_graph({"dependencies": {"d": "^1.0.0"}})
+    assert(r2["ok"] == 1, "deep chain resolves")
+    let res2 = r2["resolved"]
+    assert(res2["d"] == "1.0.0", "depth-1 d")
+    assert(res2["e"] == "2.0.0", "depth-2 e")
+    assert(res2["f"] == "3.0.0", "depth-3 f (old resolver missed this)")
+
+    // 3) Genuine conflict (incompatible exact pins on c)
+    _publish_fixture("g", "1.0.0", {"c": "=1.0.0"})
+    _publish_fixture("h", "1.0.0", {"c": "=2.0.0"})
+    let r3 = resolve_graph({"dependencies": {"g": "^1.0.0", "h": "^1.0.0"}})
+    assert(r3["ok"] == 0, "conflict detected (old resolver silently mis-picked)")
+    assert(r3["pkg"] == "c", "conflict reported on c")
+
+    // 4) Cycle safety (x <-> y) must terminate, not hang
+    _publish_fixture("x", "1.0.0", {"y": "^1.0.0"})
+    _publish_fixture("y", "1.0.0", {"x": "^1.0.0"})
+    let r4 = resolve_graph({"dependencies": {"x": "^1.0.0"}})
+    assert(r4["ok"] == 1, "cycle resolves without hang")
+    let res4 = r4["resolved"]
+    assert(res4["x"] == "1.0.0", "cycle x")
+    assert(res4["y"] == "1.0.0", "cycle y")
+
+    print("pkg-resolver: all passed")
+
 // ── Main entry point ─────────────────────────────────────────────────────────
 
 fn main()
@@ -469,6 +600,7 @@ fn main()
         print("  list              List current dependencies")
         print("  search <query>    Search registry")
         print("  info <pkg>        Show package details")
+        print("  selftest          Run resolver correctness tests")
         print("  version           Show version")
         print("")
         print("Usage: nova-pkg <command> [args...]")
@@ -493,6 +625,8 @@ fn main()
         cmd_search(rest)
     else if cmd == "info"
         cmd_info(rest)
+    else if cmd == "selftest"
+        cmd_selftest(rest)
     else if cmd == "version"
         print("nova-pkg 0.1.0")
         print("NOVA Package Manager")
