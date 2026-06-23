@@ -17,7 +17,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 1 — cheap minimum-bar floor (safety + ops; S/M each, low risk)
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 4 | Gate the `unsafe` surface (reject ptr_write/alloc_raw/free_raw/extern in safe code) | 🔴 | S | compiler | TODO | — |
+| 4 | Gate the `unsafe` surface (reject raw-ptr builtins in safe code) | 🔴 | S→**M** | compiler | **DESIGNED**: gate = extend the extern-unsafe check at nova_compiler.nova L11562 (`ti_unsafe_depth==0`) to the raw set (all `ptr_*`, `memcpy_unsafe`, `memset_unsafe`, `alloc_raw`, `free_raw`). Blast radius only 2 files (phase75_ffi_test, ptr_width_test[in-regression]). FINDING: expr-level `unsafe` is too painful (raw calls inside `if` conditions) → must ADD an `unsafe` BLOCK first (parser change, S→M). NEXT cycle. | opus |
 | 5 | Symbolic stack traces on panic/assert (file+line+fn; DWARF exists) | 🔴 | M | runtime | TODO | — |
 | 6 | Signal handling (SIGTERM/SIGINT/ctrl-C) + lifecycle hooks | 🔴 | M | runtime | TODO | — |
 | 7 | Structured logging (levels, sinks, JSON, request context) | 🔴 | M | stdlib | TODO | — |
