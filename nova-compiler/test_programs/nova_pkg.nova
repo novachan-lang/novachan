@@ -175,6 +175,34 @@ fn pkg_metadata_path(name: string, version: string) -> string
 fn pkg_tarball_path(name: string, version: string) -> string
     path_join(registry_crates_dir(), name + "-" + version + ".tar")
 
+// ── ABI contract (#38) ─────────────────────────────────────────────────────────
+//
+// A precompiled package is only safe to load under a runtime whose struct/RTTI
+// layout matches the one it was built against. This is the SONAME pattern: the
+// runtime exposes a single integer ABI version; a package records the ABI it was
+// published against; install/update refuses (or warns on) a mismatch instead of
+// silently loading a layout-incompatible artifact. BUMP pkg_abi_version() whenever a
+// nova_runtime struct/RTTI-slot layout changes in a way that breaks precompiled code.
+fn pkg_abi_version() -> int
+    1
+
+// the abi recorded in a published package's metadata (0 = legacy/unknown)
+fn pkg_meta_abi(name: string, version: string) -> int
+    let p = pkg_metadata_path(name, version)
+    if not file_exists(p)
+        return 0
+    let meta = toml_parse(read_file(p))
+    int(get_field(meta, "package", "abi", "0"))
+
+// 1 = safe to load: same ABI, or legacy (0) which we allow-with-warning elsewhere.
+fn pkg_abi_compatible(name: string, version: string) -> int
+    let a = pkg_meta_abi(name, version)
+    if a == 0
+        return 1
+    if a == pkg_abi_version()
+        return 1
+    0
+
 fn load_manifest(dir: string) -> dict
     let path = path_join(dir, "nova.toml")
     if not file_exists(path)
@@ -394,7 +422,7 @@ fn cmd_publish(args: list)
     ensure_registry()
     let pkg_dir = path_join(registry_index_dir(), name)
     mkdir_p(pkg_dir)
-    let meta_content = "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\n"
+    let meta_content = "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\nabi = \"" + str(pkg_abi_version()) + "\"\n"
     if contains(manifest, "dependencies")
         meta_content = meta_content + "\n[dependencies]\n"
         let deps = manifest["dependencies"]
@@ -467,14 +495,20 @@ fn cmd_update(args: list)
     // republished or tampered package) before we overwrite the lock.
     let prior = read_lockfile_integrity(".")
     let mismatches = 0
+    let abi_bad = 0
     for pn in keys(resolved)
         if contains(prior, pn)
             let cur = pkg_content_hash(pn, resolved[pn])
             if cur != "" and prior[pn] != "" and prior[pn] != cur
                 print("  WARNING: integrity mismatch for " + pn + " v" + resolved[pn] + " (registry content changed since lock)")
                 mismatches = mismatches + 1
+        if pkg_abi_compatible(pn, resolved[pn]) == 0
+            print("  WARNING: ABI mismatch for " + pn + " v" + resolved[pn] + " (built for ABI " + str(pkg_meta_abi(pn, resolved[pn])) + ", runtime is ABI " + str(pkg_abi_version()) + ") -- recompile required")
+            abi_bad = abi_bad + 1
     if mismatches > 0
         print("  " + str(mismatches) + " package(s) failed integrity check.")
+    if abi_bad > 0
+        print("  " + str(abi_bad) + " package(s) ABI-incompatible with this runtime.")
     write_lockfile(".", resolved)
     let names = keys(resolved)
     mkdir_p("deps")
@@ -582,7 +616,7 @@ fn cmd_info(args: list)
 fn _publish_fixture(name: string, version: string, deps: dict)
     ensure_registry()
     mkdir_p(path_join(registry_index_dir(), name))
-    let meta = "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\n"
+    let meta = "[package]\nname = \"" + name + "\"\nversion = \"" + version + "\"\nabi = \"" + str(pkg_abi_version()) + "\"\n"
     if len(keys(deps)) > 0
         meta = meta + "\n[dependencies]\n"
         for dn in keys(deps)
@@ -659,6 +693,21 @@ fn cmd_selftest(args: list)
     _publish_fixture("c", "1.2.0", {})
     write_file(path_join(path_join(registry_crates_dir(), "c-1.2.0"), "lib.nova"), "// tampered\nfn evil() -> int\n    1\n")
     assert(pkg_content_hash("c", "1.2.0") != h1, "tampered crate hashes differently (reproducibility breach detected)")
+
+    // 7) ABI contract (#38): fixtures publish at the current ABI -> compatible; a
+    // package tagged with a different ABI is flagged incompatible (not silently loaded).
+    assert(pkg_meta_abi("a", "1.0.0") == pkg_abi_version(), "fixture recorded current ABI")
+    assert(pkg_abi_compatible("a", "1.0.0") == 1, "current-ABI package is compatible")
+    // simulate a package built for a future/incompatible runtime ABI
+    mkdir_p(path_join(registry_index_dir(), "oldpkg"))
+    write_file(pkg_metadata_path("oldpkg", "1.0.0"), "[package]\nname = \"oldpkg\"\nversion = \"1.0.0\"\nabi = \"999\"\n")
+    assert(pkg_meta_abi("oldpkg", "1.0.0") == 999, "reads recorded abi 999")
+    assert(pkg_abi_compatible("oldpkg", "1.0.0") == 0, "ABI 999 incompatible with runtime ABI 1")
+    // a legacy package with no abi field (0) is allowed (compat, warn elsewhere)
+    mkdir_p(path_join(registry_index_dir(), "legacy"))
+    write_file(pkg_metadata_path("legacy", "1.0.0"), "[package]\nname = \"legacy\"\nversion = \"1.0.0\"\n")
+    assert(pkg_meta_abi("legacy", "1.0.0") == 0, "no abi field -> 0 (legacy)")
+    assert(pkg_abi_compatible("legacy", "1.0.0") == 1, "legacy abi allowed")
 
     print("pkg-resolver: all passed")
 
