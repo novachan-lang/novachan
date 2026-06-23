@@ -1,0 +1,77 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_limits — production-hardening primitives for NOVA web services (#40)
+//
+// DoS-resistance building blocks, as pure functions/state so they're testable and
+// reusable from Forge middleware: request-size caps, a token-bucket rate limiter, and
+// a concurrent-connection guard. (Wiring these into forge.serve's accept/parse path —
+// plus graceful drain via shutdown_requested() — is the framework-side follow-up;
+// this is the enforcement LOGIC, verified in isolation.)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Request size caps (reject before allocating) ───────────────────────────────
+
+// 1 if a body of `content_length` bytes is within max_bytes (and non-negative).
+fn limit_body_ok(content_length: int, max_bytes: int) -> int
+    if content_length < 0
+        return 0
+    if content_length > max_bytes
+        return 0
+    1
+
+fn limit_line_ok(line: string, max_len: int) -> int
+    if len(line) > max_len
+        return 0
+    1
+
+fn limit_headers_ok(count: int, max_headers: int) -> int
+    if count > max_headers
+        return 0
+    1
+
+// ── Token-bucket rate limiter ──────────────────────────────────────────────────
+// capacity tokens, refilled at refill_per_ms tokens/ms. Each allowed request costs
+// tokens; when the bucket is empty the request is denied. Caller supplies a monotonic
+// now_ms (so it's deterministic + testable). State is a dict, mutated in place.
+
+fn rate_new(capacity: float, refill_per_ms: float) -> dict
+    {"cap": capacity, "tokens": capacity, "refill": refill_per_ms, "last": 0}
+
+fn _rate_min(a: float, b: float) -> float
+    if a < b
+        return a
+    b
+
+// returns 1 if allowed (and deducts cost), 0 if rate-limited
+fn rate_allow(b: dict, now_ms: int, cost: float) -> int
+    let elapsed = now_ms - b["last"]
+    if elapsed < 0
+        elapsed = 0
+    let refilled = b["tokens"] + (elapsed + 0.0) * b["refill"]
+    let tokens = _rate_min(b["cap"], refilled)
+    b["last"] = now_ms
+    if tokens >= cost
+        b["tokens"] = tokens - cost
+        return 1
+    b["tokens"] = tokens
+    0
+
+// ── Concurrent-connection guard ─────────────────────────────────────────────────
+
+fn conn_new(max_conns: int) -> dict
+    {"max": max_conns, "cur": 0}
+
+// returns 1 if a slot was acquired, 0 if at capacity (caller should reject/503)
+fn conn_acquire(g: dict) -> int
+    if g["cur"] >= g["max"]
+        return 0
+    g["cur"] = g["cur"] + 1
+    1
+
+fn conn_release(g: dict)
+    let c = g["cur"] - 1
+    if c < 0
+        c = 0
+    g["cur"] = c
+
+fn conn_count(g: dict) -> int
+    g["cur"]
