@@ -87,6 +87,22 @@ assertion (find_tag(ptr) ∈ {LIST,DICT,STRUCT}) + the `< 0x10000` null/immediat
    cycle-leaking; do NOT claim "flat memory" for cyclic data. A cycle collector / arena-scoping
    is the only remedy — out of scope for #9.
 
+## EMPIRICAL FINDING (2026-06-24) — existing W5b+FULLRC are insufficient
+
+Verified by leak probe + IR inspection: a loop calling `make_garbage()` (which builds a
+throwaway list `x` + dict `d`, returns only an int) LEAKS to ~2GB even with BOTH
+`NOVA_T8_DROP=1` (W5b scope-exit drop) AND `NOVA_T8_FULLRC=1` (reassignment drop) on.
+Result is CORRECT (total=15000000) but memory is NOT reclaimed. The IR shows
+`make_garbage` emits NO free for `x` or `d` at its `ret` — even though `x` is read only
+by `len()` (an already-"safe" op). So the W5b/W8 escape analysis (`ire_slot_escaped`) is
+OVER-CONSERVATIVE: it marks these locals escaped and skips the drop. The real #9 work is
+therefore making the escape classification PRECISELY reclaim locals that are provably
+non-escaping (read only by ops that don't retain the container: len/keys/index_get/
+field_get/contains/str/...), WITHOUT ever freeing a value the caller can still reach.
+That is the soundness-critical core: one wrongly-whitelisted op = a UAF. Confirms the
+design pass: #9 is intricate compiler work in the riskiest subsystem, gated + flag-OFF
++ ASAN-on-574-tests, done with fresh full focus — NOT a flag flip and NOT a depth-rush.
+
 ## Bottom line
 Code **Stages 0 → 1 → 2** now (fresh-owned, path-sensitive, uniform-primitive subset — sound
 under INV-OWN, no dec-without-inc, default-OFF). FREEZE Stages 3-4. This is the achievable,
