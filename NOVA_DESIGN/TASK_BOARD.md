@@ -31,7 +31,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 3 — ecosystem minimum-bar
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 10 | Real package manager (transitive resolver + lockfile + signed/repro + network registry) | 🔴 | L | tooling | TODO | — |
+| 10 | Real package manager (transitive resolver + lockfile + signed/repro + network registry) | 🟡 | L | tooling | LOCAL HALF DONE: full transitive-closure resolver w/ constraint intersection+conflict+cycle (f79667c) + content-integrity lockfile (sha256, reproducible/tamper-evident, fb2272f) + NOVA_REGISTRY override + selftest, all 7 pkg-tool steps pass. REMAINING: network registry client + signed builds (needs hostable registry infra). | f79667c, fb2272f |
 | 11 | Sound crypto (AES-GCM/ChaCha20, Ed25519/RSA, Argon2/PBKDF2); fix broken jwtx | 🔴 | L | stdlib+runtime | **IN PROGRESS** — (a) **jwtx MAC FIXED**: was `sha256(signing_input+secret)` (length-extension forgeable); now real `hmac_sha256(msg,secret)` in both create+verify. Compiles + self-test passes; pure-NOVA isolated (no reconverge). Remaining (b): AES-GCM/ChaCha20, Ed25519/RSA, Argon2/PBKDF2 — wire to OpenSSL (NOVA_HAVE_OPENSSL), never hand-roll. | opus |
 | 12 | N>1 multi-core as a tested default (fix fiber-stack leak + N>1 CI matrix, flip on) | 🔴 | L | runtime | **IN PROGRESS** — (a) **N>1 CI GATE DONE**: `_n_carriers_ci.ps1` runs the concurrency flagships (green_scale 10k, mn_stress) at NOVA_CARRIERS=4 AND 8 with kill-on-timeout, asserting correct output — closes the audit's "N>1 has ZERO regression coverage" gap; wired into nova_ci.ps1. Verified PASS. Remaining (b): fix the N>1 fiber-stack leak (runtime, was UAF-risky — careful) + (c) flip default once green (risky: N>1 still has busy-spin/no-preemption gaps). | opus |
 
@@ -85,8 +85,8 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
 | 35 | Compile-time eval (const-fn/comptime) + binary/bitstring pattern matching | 🟡 | L | compiler | TODO | — |
-| 36 | Reflection upgrade (invoke-by-name + dynamic construction) + Forge ORM | 🟡 | L | compiler+stdlib | TODO | — |
-| 37 | Numeric/AI spine (ndarray + DataFrame + linalg → autograd/optimizers + ONNX/GGUF + GPU/SPIR-V) | 🟡 | XL | runtime+stdlib | TODO | — |
+| 36 | Reflection upgrade (invoke-by-name + dynamic construction) + Forge ORM | 🟡 | L | compiler+stdlib | ORM FOUNDATION DONE: `qb.nova` parameterized SQL query builder (SELECT/INSERT/UPDATE/DELETE, where/order/limit/join, injection-safe by construction, feeds sqlitex db_query) + qb_lib_test, both modes (83a384e). REMAINING: invoke-by-name/dynamic construction (compiler) + typed schema↔table + migrations. | opus |
+| 37 | Numeric/AI spine (ndarray + DataFrame + linalg → autograd/optimizers + ONNX/GGUF + GPU/SPIR-V) | 🟡 | XL | runtime+stdlib | CORE DONE (pure-NOVA, both modes): DataFrame `dframe.nova` (2f2de79), `linalg.nova` solve/det/inverse/lstsq (f18929a), reverse-mode `autograd.nova` (2e541cd), + TRAIN PROOF: linear regression learned via autograd+GD→w=2,b=1,loss=1.6e-29 (c4158bc). REMAINING: ndarray, optimizers lib, ONNX/GGUF parsers (XL), GPU/SPIR-V (hw-blocked). | opus |
 
 ## PHASE 11 — full-parity: stability & correctness contracts
 | # | Item | Tier | Size | Touches | Status | Owner |
