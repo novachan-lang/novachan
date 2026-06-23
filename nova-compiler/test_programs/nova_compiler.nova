@@ -13901,6 +13901,10 @@ fn ir_scan_list_taint(rt: dict, st: dict, op: string, args: list, value: string)
         let ss_src = ir_is_list_slotreg(rt, st, args[0])
         if ss_src != "" and ss_src != value
             ir_taint_list_slot(st, value)
+        // S2: a non-empty int-literal source marks its slot @hadint@ (has int elements),
+        // so a subsequent float push cannot promote it to floatlist.
+        if contains(rt, "@regihad@" + args[0])
+            st["@hadint@" + value] = "1"
 
 fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
     match inst
@@ -14153,6 +14157,15 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         if contains(st, lslot)
                             let vt = ir_reg_type(rt, args[1])
                             if vt == "int"
+                                // S2: this list now holds an int element -> never eligible for
+                                // floatlist promotion (its ints would be read as raw doubles).
+                                st["@hadint@" + lslot] = "1"
+                                // S2: an int pushed onto a (promoted) floatlist makes it
+                                // heterogeneous -> demote to "list" (generic boxed reads), so the
+                                // existing boxed floats and this int are both read correctly.
+                                if st[lslot] == "floatlist"
+                                    st["@het@" + lslot] = "1"
+                                    st[lslot] = "list"
                                 // Heterogeneity is STICKY: once a non-int has been
                                 // appended (float/bool/str/...), the list is permanently
                                 // "list" — a later int push must NOT re-promote it to the
@@ -14183,6 +14196,25 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                                     // (stats median unsorted, geox haversine raw bits). The 68x float-array
                                     // win needs a robust foundation (first-class typed-array type), not an
                                     // inferred list mode. kind=2 runtime machinery stays (dormant, sound).
+                                    if dest != ""
+                                        rt[dest] = "floatlist"
+                                    return IrInst(op, dest, typ, args, "nova_rt_list_append_fbox", num, effect, line)
+                                // S2 (re-enabled SOUNDLY 2026-06-23): a float pushed onto a list that
+                                // has NEVER held a non-float (no @hadint@) and is not heterogeneous ->
+                                // PROMOTE to floatlist. This is what makes push-built float arrays fast:
+                                // reads then take the typed-float path (list_get_f -> unbox -> native
+                                // fadd) instead of dynamic boxing nova_rt_add (which leaked ~16B/op).
+                                // Storage stays BOXED (append_fbox, kind=0) -- identical to a float
+                                // LITERAL list, which is already sound. The 06-20 revert failed on
+                                // raw-bits EGRESS to any-sinks; that is now covered (float_egress_raw_test),
+                                // and int-mixing is excluded by @hadint@ (float_int_mix_test). An empty []
+                                // carries no @hadint@ (Edit 1) so it is promotable; a non-empty int list is
+                                // marked (Edit 1+2) so it is not.
+                                let s2_hadint = contains(st, "@hadint@" + lslot) and st["@hadint@" + lslot] == "1"
+                                let s2_het = contains(st, "@het@" + lslot) and st["@het@" + lslot] == "1"
+                                if vt == "float" and not s2_hadint and not s2_het
+                                    st[lslot] = "floatlist"
+                                    rt[args[0]] = "floatlist"
                                     if dest != ""
                                         rt[dest] = "floatlist"
                                     return IrInst(op, dest, typ, args, "nova_rt_list_append_fbox", num, effect, line)
@@ -14344,6 +14376,12 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 if dest != ""
                     if ml_all_int
                         rt[dest] = "intlist"
+                        // S2: a NON-EMPTY int literal has real int elements -> mark the
+                        // register so its slot is flagged @hadint@ on store, which blocks a
+                        // later float push from mis-promoting it to floatlist (reading the
+                        // ints as raw doubles). An EMPTY [] carries no mark (promotable).
+                        if len(args) > 0
+                            rt["@regihad@" + dest] = "1"
                     else if ml_all_float
                         // floatlist: a homogeneous float list. Storage is BOXED floats
                         // (valid as `any` everywhere — so it is safe to treat exactly like
