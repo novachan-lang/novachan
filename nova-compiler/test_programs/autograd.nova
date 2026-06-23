@@ -1,0 +1,122 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// autograd — reverse-mode automatic differentiation for NOVA (numeric/AI spine)
+//
+// The engine under every ML framework: build an expression DAG of scalar ops, then
+// one backward pass applies the chain rule to get every input's gradient at once.
+//
+// A "tape" is { "nodes": [ node... ] }; each op APPENDS a node and returns its
+// integer id, so a node's dependencies always have a SMALLER id than itself. That
+// makes creation order a valid topological order — backward just walks nodes in
+// REVERSE and pushes each node's grad onto its parents (accumulating, so shared
+// subexpressions compose correctly). No explicit topo sort, no stored closures.
+//
+//   t  = ad_tape()
+//   x  = ad_leaf(t, 3.0); y = ad_leaf(t, 2.0)
+//   f  = ad_add(t, ad_mul(t,x,y), ad_mul(t,x,x))   // f = x*y + x*x
+//   ad_backward(t, f)
+//   ad_grad(t, x)   // 8.0  (= y + 2x)
+//
+// Scalar floats; v1 covers add/sub/mul/div/neg/relu/exp/log. Tensor/vectorized AD
+// (over linalg + a double[] backing) is the Stage-4 extension; the tape API stays.
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn ad_tape() -> dict
+    {"nodes": []}
+
+fn _ad_push(t: dict, val: float, op: string, a: int, b: int) -> int
+    let nodes = t["nodes"]
+    let id = len(nodes)
+    push(nodes, {"val": val, "grad": 0.0, "op": op, "a": a, "b": b})
+    t["nodes"] = nodes
+    id
+
+fn ad_value(t: dict, id: int) -> float
+    let nodes = t["nodes"]
+    nodes[id]["val"]
+
+fn ad_grad(t: dict, id: int) -> float
+    let nodes = t["nodes"]
+    nodes[id]["grad"]
+
+// ── Op constructors (each returns the new node's id) ───────────────────────────
+
+fn ad_leaf(t: dict, v: float) -> int
+    _ad_push(t, v, "leaf", -1, -1)
+
+fn ad_add(t: dict, a: int, b: int) -> int
+    _ad_push(t, ad_value(t, a) + ad_value(t, b), "add", a, b)
+
+fn ad_sub(t: dict, a: int, b: int) -> int
+    _ad_push(t, ad_value(t, a) - ad_value(t, b), "sub", a, b)
+
+fn ad_mul(t: dict, a: int, b: int) -> int
+    _ad_push(t, ad_value(t, a) * ad_value(t, b), "mul", a, b)
+
+fn ad_div(t: dict, a: int, b: int) -> int
+    _ad_push(t, ad_value(t, a) / ad_value(t, b), "div", a, b)
+
+fn ad_neg(t: dict, a: int) -> int
+    _ad_push(t, 0.0 - ad_value(t, a), "neg", a, -1)
+
+fn ad_relu(t: dict, a: int) -> int
+    let v = ad_value(t, a)
+    let r = v
+    if r < 0.0
+        r = 0.0
+    _ad_push(t, r, "relu", a, -1)
+
+fn ad_exp(t: dict, a: int) -> int
+    _ad_push(t, exp(ad_value(t, a)), "exp", a, -1)
+
+fn ad_log(t: dict, a: int) -> int
+    _ad_push(t, log(ad_value(t, a)), "log", a, -1)
+
+// ── Backward pass ──────────────────────────────────────────────────────────────
+
+fn _ad_accum(nodes: list, idx: int, delta: float) -> list
+    let nd = nodes[idx]
+    nd["grad"] = nd["grad"] + delta
+    nodes[idx] = nd
+    nodes
+
+// Seed d(root)/d(root)=1 and propagate to every node. After this, ad_grad(t, leaf)
+// holds d(root)/d(leaf). (Grads are NOT auto-zeroed across calls; use a fresh tape.)
+fn ad_backward(t: dict, root: int)
+    let nodes = t["nodes"]
+    let rn = nodes[root]
+    rn["grad"] = 1.0
+    nodes[root] = rn
+    let i = len(nodes) - 1
+    while i >= 0
+        let node = nodes[i]
+        let g = node["grad"]
+        let op = node["op"]
+        let a = node["a"]
+        let b = node["b"]
+        if op == "add"
+            nodes = _ad_accum(nodes, a, g)
+            nodes = _ad_accum(nodes, b, g)
+        else if op == "sub"
+            nodes = _ad_accum(nodes, a, g)
+            nodes = _ad_accum(nodes, b, 0.0 - g)
+        else if op == "mul"
+            let va = nodes[a]["val"]
+            let vb = nodes[b]["val"]
+            nodes = _ad_accum(nodes, a, vb * g)
+            nodes = _ad_accum(nodes, b, va * g)
+        else if op == "div"
+            let na = nodes[a]["val"]
+            let nb = nodes[b]["val"]
+            nodes = _ad_accum(nodes, a, g / nb)
+            nodes = _ad_accum(nodes, b, 0.0 - na * g / (nb * nb))
+        else if op == "neg"
+            nodes = _ad_accum(nodes, a, 0.0 - g)
+        else if op == "relu"
+            if nodes[a]["val"] > 0.0
+                nodes = _ad_accum(nodes, a, g)
+        else if op == "exp"
+            nodes = _ad_accum(nodes, a, node["val"] * g)
+        else if op == "log"
+            nodes = _ad_accum(nodes, a, g / nodes[a]["val"])
+        i = i - 1
+    t["nodes"] = nodes
