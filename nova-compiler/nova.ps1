@@ -406,8 +406,10 @@ function Nova-Version {
 # ─── Dispatch ─────────────────────────────────────────────────────────
 
 # Item #1: --release (or -r) → -O2 peak build; default → -O0 cached dev link (fast inner loop).
+# Item #5: dev builds add -g so a fatal panic's stack trace resolves to func + file:line (clang DWARF
+# read by llvm-symbolizer). --release stays -O2 (no -g; symbolize offline if needed).
 $isRelease = ($Args -contains '--release') -or ($Args -contains '-r')
-$script:LinkOpt = if ($isRelease) { '-O2' } else { '-O0' }
+$script:LinkOpt = if ($isRelease) { '-O2' } else { '-O0 -g' }
 $srcArg = ($Args | Where-Object { $_ -notlike '-*' } | Select-Object -First 1)
 
 switch ($Command) {

@@ -43,6 +43,7 @@
 #include <netdb.h>
 #include <sys/wait.h>     /* waitpid (nova_rt_proc_wait) */
 #include <dlfcn.h>        /* dlopen/dlsym/dlclose + RTLD_* (hot reload, gpu_dlopen) */
+#include <execinfo.h>     /* #5: backtrace()/backtrace_symbols_fd for fatal-panic stack traces */
 #ifdef NOVA_HAVE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -66,6 +67,9 @@ typedef struct {
     jmp_buf fault_buf;      /* Stage 0b: per-task fault boundary (was __thread nova_fault_buf) */
     int     fault_active;
     int     crashed;
+    int     is_root;        /* #5: 1 for the ROOT task (main). A panic here TERMINATES the program even
+                               though it is fault_active (contained-longjmp), so nova_panic prints a stack
+                               trace for it (and for non-task fatal panics) but NOT for supervised spawned crashes. */
     int64_t stack_depth;    /* Stage 1.5: per-task recursion depth (was global g_stack_depth) */
     int64_t stack_max;      /* per-task overflow limit; 0 => NOVA_DEFAULT_STACK_MAX */
     struct NovaArena* active_arena;  /* iter-94: PER-TASK transparent arena. nova_heap_alloc
@@ -135,6 +139,50 @@ static void nova_set_error(const char* msg) {
 static void nova_reset_call_depth(void);     /* defined alongside g_stack_depth below */
 static int  nova_on_fiber_stack(void);        /* 1 if running on a green-task/generator 32KB fiber (defined with the fiber TLS) */
 
+/* #5: print a symbolic stack trace for a FATAL (main-thread) panic — the program is about to die, so the
+   call chain is what the developer needs. NOT printed for CONTAINED ("let it crash") spawned-process faults
+   (normal supervised operation; a trace per contained crash would be noise + cost). Windows: CaptureStackBackTrace
+   (kernel32, already linked) -> ASLR-relative RVAs -> shell to llvm-symbolizer (reads clang's DWARF) for
+   func + file:line, falling back to raw RVAs if it's absent. POSIX: backtrace()/backtrace_symbols_fd.
+   Build with -g (the default `nova run/build` dev link does) for file:line resolution. */
+static void nova_print_backtrace(void) {
+#ifdef _WIN32
+    void* frames[48];
+    USHORT n = CaptureStackBackTrace(1, 48, frames, NULL);   /* skip this frame */
+    if (n == 0) return;
+    HMODULE base = GetModuleHandleA(NULL);
+    char exe[MAX_PATH];
+    if (GetModuleFileNameA(NULL, exe, MAX_PATH) == 0) return;
+    char cmd[4096];
+    int off = snprintf(cmd, sizeof(cmd), "llvm-symbolizer --relative-address -e \"%s\"", exe);
+    for (USHORT i = 0; i < n && off > 0 && off < (int)sizeof(cmd) - 32; i++) {
+        uintptr_t rva = (uintptr_t)frames[i] - (uintptr_t)base;
+        off += snprintf(cmd + off, sizeof(cmd) - off, " 0x%llx", (unsigned long long)rva);
+    }
+    fprintf(stderr, "stack trace (most recent call first):\n");
+    fflush(stderr);
+    FILE* pp = (off > 0) ? _popen(cmd, "r") : NULL;
+    if (pp) {
+        char line[1024];
+        int any = 0;
+        while (fgets(line, sizeof(line), pp)) { fprintf(stderr, "  %s", line); any = 1; }
+        _pclose(pp);
+        if (any) { fflush(stderr); return; }
+    }
+    /* fallback: raw RVAs (symbolize offline with: llvm-symbolizer --relative-address -e <exe> <rva...>) */
+    for (USHORT i = 0; i < n; i++)
+        fprintf(stderr, "  #%u  <exe>+0x%llx\n", i, (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)base));
+    fflush(stderr);
+#else
+    void* frames[48];
+    int n = backtrace(frames, 48);
+    if (n <= 0) return;
+    fprintf(stderr, "stack trace (most recent call first):\n");
+    fflush(stderr);
+    backtrace_symbols_fd(frames, n, 2);   /* fd 2 = stderr; needs -g (/ -rdynamic) for names */
+#endif
+}
+
 void nova_panic(const char* msg) {
     if (msg && msg[0]) nova_set_error(msg);
     /* automatic structured crash report (logfmt) — machine-parseable, on every fault
@@ -143,10 +191,14 @@ void nova_panic(const char* msg) {
     fflush(stderr);
     NovaTaskState* ft = nova_cur();
     if (ft->fault_active) {
+        if (ft->is_root) nova_print_backtrace();  /* #5: root (main) crash terminates the program -> trace it
+                                                     here, while the crashing stack is still live (pre-longjmp).
+                                                     Supervised spawned crashes are NOT traced (contained). */
         nova_reset_call_depth();             /* longjmp skips the per-frame depth decrements */
         ft->crashed = 1;
         longjmp(ft->fault_buf, 1);           /* contained: back to the worker (this task's jmp_buf) */
     }
+    nova_print_backtrace();                   /* #5: non-task FATAL crash -> symbolic stack trace */
     exit(1);                                  /* main thread: terminate (caller reported) */
 }
 
@@ -6661,6 +6713,10 @@ void nova_rt_main_dispatch(int64_t main_fn) {
             }
             int64_t root_h = nova_rt_sched_spawn((int64_t)(uintptr_t)rec);
             nova_sched_root_task = (NovaSchedTask*)(uintptr_t)root_h;
+            /* #5: mark the root task so a fatal panic in main prints a stack trace (it crashes via the
+               contained-longjmp path because main runs as a green task, but it TERMINATES the program). */
+            if (nova_sched_root_task && nova_sched_root_task->fiber)
+                ((NovaFiber*)(uintptr_t)nova_sched_root_task->fiber)->task.is_root = 1;
             if (ncar > 1) {
                 nova_carrier_id = 0;          /* main thread is carrier 0 */
                 nova_ensure_carrier();
