@@ -85,6 +85,28 @@ promotion is fundamentally unsound and #13 needs a **declared** typed-array type
 (`[float]` surface syntax) so the type is never inferred-and-lost — a larger language
 change. Decide this at the end of the S1 audit, not before.
 
+## S2 DONE; S3 Stage-A (raw kind=2 storage) ATTEMPTED + REVERTED 2026-06-23
+
+- **S2 (committed 372679f):** push-built all-float lists promote to `floatlist` with
+  BOXED storage (`append_fbox`, kind=0); reads via `list_get_f` -> unbox -> native
+  `fadd`. Closed the catastrophic 120×+leak gap (-> ~8× C, no leak), local AND
+  parameter positions (param via sound `fpt` call-site typing). Fully gated, ASAN clean.
+- **S3 Stage A (raw kind=2 storage) — REVERTED:** changed the two floatlist append
+  sites to `append_fraw` (raw inline `double[]`). The dedicated escape oracle
+  (`float_array_escape_test`) PASSED, but the **`stats` corruptor FAILED** at the gen4
+  canary stage with the 06-20 signature (`expected 5 ... got 9.36e-312` = raw bits
+  read as a value). So raw kind=2 storage is STILL unsound: some float-array read path
+  in `stats` (likely `_sorted_copy`/`percentile`/`median`) reads elements generically
+  WITHOUT first deopting kind=2 -> boxed. The escape oracle did not cover that path.
+  Reverted before any commit/reconverge; committed NOVA unaffected.
+- **Conclusion:** S3 (raw storage + inlined load, true C-parity) is BLOCKED on
+  completing the deopt-on-escape machinery (every generic float-array reader must
+  either handle kind=2 or force a deopt first). That is a dedicated runtime+compiler
+  effort, NOT a quick win. **Do NOT re-enable `append_fraw` until the `stats`/sort/
+  percentile read paths are proven to deopt** (extend `float_array_escape_test` with
+  sort/median/percentile/copy first, make it fail, then fix the readers, THEN retry).
+  S2's boxed-storage native arithmetic remains the safe, shipped state.
+
 ## Relationship to #9
 
 Independent: S1/S2 *remove* float-array boxing (fewer allocations), which *reduces*
