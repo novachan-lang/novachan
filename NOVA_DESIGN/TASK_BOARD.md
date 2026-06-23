@@ -17,7 +17,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 1 — cheap minimum-bar floor (safety + ops; S/M each, low risk)
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 4 | Gate the `unsafe` surface (reject raw-ptr builtins in safe code) | 🔴 | S→**M** | compiler | **DESIGNED**: gate = extend the extern-unsafe check at nova_compiler.nova L11562 (`ti_unsafe_depth==0`) to the raw set (all `ptr_*`, `memcpy_unsafe`, `memset_unsafe`, `alloc_raw`, `free_raw`). Blast radius only 2 files (phase75_ffi_test, ptr_width_test[in-regression]). FINDING: expr-level `unsafe` is too painful (raw calls inside `if` conditions) → must ADD an `unsafe` BLOCK first (parser change, S→M). NEXT cycle. | opus |
+| 4 | Gate the `unsafe` surface (reject raw-ptr builtins in safe code) | 🔴 | S→M | compiler | **DONE**: added an `unsafe` BLOCK (parser+inference+codegen) + extended the extern-unsafe gate at L11562 to all raw builtins (`ptr_*`, `memcpy/memset_unsafe`, `alloc_raw`, `free_raw`) via `_is_unsafe_builtin`; wrapped the 2 affected test files. Verified: unwrapped→E1000 reject, `unsafe` block→ok, both tests pass. Reconverged 21A37662; **552/552 both modes**; ASAN: phase75 clean, ptr_width surfaced a PRE-EXISTING `find_tag`-on-raw-memory over-read (codegen-identical to pre-#4 → NOT a regression; now confined to `unsafe` code) → tracked as a separate soundness item. | opus |
 | 5 | Symbolic stack traces on panic/assert (file+line+fn; DWARF exists) | 🔴 | M | runtime | TODO | — |
 | 6 | Signal handling (SIGTERM/SIGINT/ctrl-C) + lifecycle hooks | 🔴 | M | runtime | TODO | — |
 | 7 | Structured logging (levels, sinks, JSON, request context) | 🔴 | M | stdlib | TODO | — |

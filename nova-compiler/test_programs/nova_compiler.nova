@@ -2097,6 +2097,20 @@ fn parse_stmt(tokens: list, pos: int, pe: list) -> StmtParseResult
             push(_lp_body, _lp_sr.stmt)
             _lp_p = skip_nl(tokens, _lp_sr.pos)
         StmtParseResult(Stmt("while", "", Expr("bool", "true", 1, [], [], ln), _lp_body, [], [], [], ln), _lp_p)
+    else if kind == "KW" and val == "unsafe" and tk(tokens, pos + 1) == "NEWLINE"
+        // #4: `unsafe` BLOCK (a NEWLINE right after `unsafe` => indented region). The same-line
+        // `unsafe <expr>` form has its operand on this line (no NEWLINE here), so it is unaffected and
+        // falls through to the expression-statement path. Body gathered by column (model: `loop`);
+        // inference raises ti_unsafe_depth across it so raw-memory builtins are permitted; codegen
+        // lowers it transparently (same as a plain "block").
+        let _us_p = skip_nl(tokens, pos + 1)
+        let _us_body = []
+        let _us_col = tok_col(tokens, pos)
+        while tk(tokens, _us_p) != "EOF" and tok_col(tokens, _us_p) > _us_col
+            let _us_sr = parse_stmt(tokens, _us_p, pe)
+            push(_us_body, _us_sr.stmt)
+            _us_p = skip_nl(tokens, _us_sr.pos)
+        StmtParseResult(Stmt("unsafe_block", "", null_expr(), _us_body, [], [], [], ln), _us_p)
     else if kind == "KW" and val == "until"
         let _ut_p = pos + 1
         let _ut_cond = parse_expr(tokens, _ut_p, 0, pe)
@@ -9344,11 +9358,11 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 ir_emit_inst(b, "make_closure", dest, ir_type_any(), capture_regs, tramp_name, len(captures))
                 ir_emit_inst(b, "slot_store", "", ir_type_void(), [dest], name, 0)
                 b.ir_locals[name] = 1
-            else if tag == "block"
+            else if tag == "block" or tag == "unsafe_block"
                 // A compound statement: lower each child in order, sharing the enclosing scope
                 // (no new basic block). Used by desugarings that must return ONE Stmt holding a
-                // sequence (e.g. selective `receive`). Inference already scopes "block" (ti_infer_stmt);
-                // codegen previously dropped it, so the desugared body emitted nothing.
+                // sequence (e.g. selective `receive`), and by the #4 `unsafe` block (transparent at
+                // codegen -- safety is enforced at inference, not lowering). Inference already scopes it.
                 for _blk_s in body
                     ir_lower_stmt(b, _blk_s)
 
@@ -11494,6 +11508,13 @@ fn ti_const_eval(e: Expr) -> ConstEval
 fn ti_infer_expr(st: TiState, expr: Expr) -> NType
     ti_infer_expr_inner(st, expr)
 
+// #4: raw-memory primitives that can read/write ARBITRARY memory (heap-corruption footguns). Like extern
+// calls, these require an enclosing `unsafe` block/expression, so "no UB in safe code" becomes a checkable
+// property. Kept in sync with the registrations near reg["ptr_read"]... / reg["alloc_raw"].
+fn _is_unsafe_builtin(name)
+    let _ub = ["ptr_read", "ptr_write", "ptr_read_u8", "ptr_read_i8", "ptr_read_u16", "ptr_read_i16", "ptr_read_u32", "ptr_read_i32", "ptr_read_u64", "ptr_read_f32", "ptr_read_f64", "ptr_write_u8", "ptr_write_u16", "ptr_write_u32", "ptr_write_u64", "ptr_write_f32", "ptr_write_f64", "ptr_add", "ptr_diff", "memcpy_unsafe", "memset_unsafe", "alloc_raw", "free_raw"]
+    return contains(_ub, name)
+
 fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
     match expr
         Expr(tag, value, num, children, fields, eline) =>
@@ -11559,8 +11580,11 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                             ti_infer_expr(st, children[_md_ai])
                             _md_ai = _md_ai + 1
                         return nt_any()
-                if contains(st.ti_extern_fns, value) and st.ti_unsafe_depth == 0
-                    ti_error(st, "calling extern function '" + value + "' requires an enclosing 'unsafe' expression (C code is outside NOVA's safety envelope; wrap the call: 'unsafe " + value + "(...)')", eline)
+                if st.ti_unsafe_depth == 0
+                    if contains(st.ti_extern_fns, value)
+                        ti_error(st, "calling extern function '" + value + "' requires an enclosing 'unsafe' expression (C code is outside NOVA's safety envelope; wrap the call: 'unsafe " + value + "(...)')", eline)
+                    else if _is_unsafe_builtin(value)
+                        ti_error(st, "calling raw-memory primitive '" + value + "' requires an enclosing 'unsafe' block/expression (it can read or write arbitrary memory -- outside NOVA's safety envelope; wrap it as 'unsafe " + value + "(...)' or put it inside an `unsafe` block)", eline)
                 let fn_t = ti_lookup(st, value, eline)
                 let arg_types = []
                 let ai = 0
@@ -12171,6 +12195,16 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 return nt_unit()
             if tag == "defer"
                 ti_infer_expr(st, expr)
+                return nt_unit()
+            if tag == "unsafe_block"
+                // #4: raise the unsafe depth across the whole block so raw-memory builtins (and extern
+                // calls) are permitted inside, then restore it. Scoped like any block body.
+                st.ti_unsafe_depth = st.ti_unsafe_depth + 1
+                ti_push_scope(st)
+                for s in body
+                    ti_infer_stmt(st, s)
+                ti_pop_scope(st)
+                st.ti_unsafe_depth = st.ti_unsafe_depth - 1
                 return nt_unit()
             if tag == "const"
                 let ct = ti_infer_expr(st, expr)
