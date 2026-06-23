@@ -25,6 +25,10 @@ Write-Host "`n[CI 2/3] Perf-regression gate..."
 & .\_perf_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2 (perf regression) ==="; exit 1 }
 
+Write-Host "`n[CI 2b/3] N>1 multi-core gate (concurrency flagships at NOVA_CARRIERS=4/8)..."
+& .\_n_carriers_ci.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b (N>1 concurrency regression) ==="; exit 1 }
+
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."
 Remove-Item Env:NOVA_T8_FULLRC -ErrorAction SilentlyContinue
 & .\_run_final_regression.ps1

@@ -33,7 +33,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 |---|------|------|------|---------|--------|-------|
 | 10 | Real package manager (transitive resolver + lockfile + signed/repro + network registry) | 🔴 | L | tooling | TODO | — |
 | 11 | Sound crypto (AES-GCM/ChaCha20, Ed25519/RSA, Argon2/PBKDF2); fix broken jwtx | 🔴 | L | stdlib+runtime | **IN PROGRESS** — (a) **jwtx MAC FIXED**: was `sha256(signing_input+secret)` (length-extension forgeable); now real `hmac_sha256(msg,secret)` in both create+verify. Compiles + self-test passes; pure-NOVA isolated (no reconverge). Remaining (b): AES-GCM/ChaCha20, Ed25519/RSA, Argon2/PBKDF2 — wire to OpenSSL (NOVA_HAVE_OPENSSL), never hand-roll. | opus |
-| 12 | N>1 multi-core as a tested default (fix fiber-stack leak + N>1 CI matrix, flip on) | 🔴 | L | runtime | TODO | — |
+| 12 | N>1 multi-core as a tested default (fix fiber-stack leak + N>1 CI matrix, flip on) | 🔴 | L | runtime | **IN PROGRESS** — (a) **N>1 CI GATE DONE**: `_n_carriers_ci.ps1` runs the concurrency flagships (green_scale 10k, mn_stress) at NOVA_CARRIERS=4 AND 8 with kill-on-timeout, asserting correct output — closes the audit's "N>1 has ZERO regression coverage" gap; wired into nova_ci.ps1. Verified PASS. Remaining (b): fix the N>1 fiber-stack leak (runtime, was UAF-risky — careful) + (c) flip default once green (risky: N>1 still has busy-spin/no-preemption gaps). | opus |
 
 ## PHASE 4 — full-parity: performance
 | # | Item | Tier | Size | Touches | Status | Owner |
