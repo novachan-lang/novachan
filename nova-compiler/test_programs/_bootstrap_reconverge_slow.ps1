@@ -44,6 +44,8 @@ if ($h5 -eq $h6) {
     Copy-Item nova_p2.exe gen3_test.exe -Force
     Copy-Item nova_p2.exe nova.exe -Force
     Write-Host "Installed gen5 as gen3_test.exe + nova.exe"
+    exit 0   # explicit: the success path must not inherit a stale non-zero $LASTEXITCODE
+             # (an earlier clang link warning left it non-zero -> the CI gate false-failed)
 } else {
     Write-Host ""
     Write-Host "*** DIVERGED: gen5 != gen6 ***"
