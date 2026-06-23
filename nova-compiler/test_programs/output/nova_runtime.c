@@ -7269,9 +7269,35 @@ static int    nova_argc = 0;
 static char** nova_argv = NULL;
 
 static void nova_file_ensure_init(void);   /* defined in the file-handle section; called here once */
+/* #6: graceful shutdown on SIGINT (Ctrl-C) / SIGTERM (containers/k8s). The handler sets a flag the program
+   can poll via shutdown_requested() to drain cleanly; a SECOND signal force-exits, so the process always
+   stays killable even if nothing drains (no "flag set but unkillable" trap). signal() handles SIGINT/SIGTERM
+   on both Windows (CRT) and POSIX. The handler uses write() only (async-signal-safe; fprintf is not). */
+#include <signal.h>
+static volatile sig_atomic_t nova_shutdown_flag = 0;
+static void nova_signal_handler(int sig) {
+    (void)sig;
+    if (nova_shutdown_flag) { _exit(130); }   /* 2nd signal -> forceful exit (stays killable) */
+    nova_shutdown_flag = 1;                    /* 1st signal -> request graceful drain */
+    static const char m[] = "\nlevel=WARN event=shutdown detail=\"signal received; draining (signal again to force quit)\"\n";
+#ifdef _WIN32
+    _write(2, m, (unsigned int)(sizeof(m) - 1));
+#else
+    { ssize_t _w = write(2, m, sizeof(m) - 1); (void)_w; }
+#endif
+}
+static void nova_install_signal_handlers(void) {
+    signal(SIGINT, nova_signal_handler);
+    signal(SIGTERM, nova_signal_handler);
+}
+/* user-facing builtin: 1 once a shutdown signal has arrived. Poll it in server/accept/event loops to break
+   out and drain (close connections, finish in-flight work) instead of being hard-killed. */
+int64_t nova_rt_shutdown_requested(void) { return nova_shutdown_flag ? 1 : 0; }
+
 void nova_rt_init(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    nova_install_signal_handlers();   /* #6: SIGINT/SIGTERM -> graceful-then-forceful shutdown */
 #ifdef _WIN32
     InitializeCriticalSection(&nova_mem_lock);
     InitializeCriticalSection(&nova_proc_registry_lock);
