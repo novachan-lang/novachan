@@ -532,9 +532,35 @@ static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
    Non-struct objects keep slot bits 0, so their tag stays exactly 0..4. */
 #define NOVA_STRUCT_NSLOTS(ptr) ((int64_t)((((const uint32_t*)(ptr))[-1] & 0xFFFFu) >> 3))
 
+/* #27 no_std/freestanding: when NOVA_FREESTANDING is defined the core value allocator
+   bump-allocates from a fixed STATIC buffer instead of libc malloc — the foundation of a
+   bare-metal/embedded profile (no OS heap). Objects are tagged ARENA so rc_dec is a no-op
+   (a bump allocator cannot free individual objects -> no libc free either). Memory grows
+   until reset; size the buffer to the program's working set via -DNOVA_FS_HEAP_SIZE. The
+   DEFAULT build (flag absent) is byte-identical — the block below is preprocessed away.
+   (Full no_std additionally needs the I/O/channel mallocs + printf/socket/thread sites
+   #ifdef'd to freestanding equivalents (UART, etc.) + a bare-metal _start — tracked.) */
+#ifndef NOVA_FS_HEAP_SIZE
+#define NOVA_FS_HEAP_SIZE (8 * 1024 * 1024)
+#endif
+
 static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     size_t total = NOVA_RC_HDR_SIZE + size;
     char* base;
+#ifdef NOVA_FREESTANDING
+    {
+        static unsigned char nova_fs_heap[NOVA_FS_HEAP_SIZE];
+        static size_t nova_fs_off = 0;
+        size_t fa = (total + 15u) & ~((size_t)15u);   /* 16-byte align */
+        if (nova_fs_off + fa > sizeof(nova_fs_heap)) return NULL;   /* freestanding OOM */
+        base = (char*)&nova_fs_heap[nova_fs_off];
+        nova_fs_off += fa;
+        ((int32_t*)base)[0] = NOVA_RC_ARENA_BIT;   /* no individual free (bump) */
+        ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
+        nova_mem_total++;
+        return base + NOVA_RC_HDR_SIZE;
+    }
+#endif
     NovaArena* _heap_arena = nova_cur()->active_arena;
     if (_heap_arena) {
         /* Transparent arena: bump-allocate, tag arena-owned (rc no-op), and EXCLUDE
