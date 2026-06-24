@@ -5922,6 +5922,19 @@ static int nova_sched_poll_io(int timeout_ms) {
                 if (rem < (int64_t)timeout_ms) timeout_ms = (int)rem;
             }
         }
+        /* #19 fairness: ALSO size select() to the soonest SLEEP-waiter deadline, so a sleeper
+           coexisting with a socket waiter no longer forces the carrier into a 1ms busy-cap
+           (the idle branch caps to 10ms now). min-only: a far sleeper never EXTENDS select
+           beyond the caller's cap (the cap stays the ceiling). This only SIZES the blocking
+           wait — the actual wake is still done solely by nova_sched_wake_sleepers() on the
+           carrier (gated on now>=wake_time_ms, idempotent), so no fiber is resumed off-thread
+           and the sleep(ms)>=ms duration guarantee is preserved. Same lock already held;
+           wake_time_ms is a scalar, nothing retained past the lock. */
+        for (NovaSleepWaiter* s = nova_sleep_waiters; s; s = s->next) {
+            int64_t rem = s->wake_time_ms - now_d;
+            if (rem < 0) rem = 0;
+            if (rem < (int64_t)timeout_ms) timeout_ms = (int)rem;
+        }
     }
     for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
         if (w->events & NOVA_POLL_READ)  FD_SET(w->fd, &rfds);
@@ -6469,9 +6482,13 @@ int64_t nova_rt_sched_run(void) {
         nova_sched_wake_sleepers();
         NovaSchedTask* t = nova_rq_pop();
         if (!t && (nova_io_waiters || nova_sleep_waiters || nova_offload_waiters)) {
-            /* short poll when sleepers or offload jobs are pending (they need a
-               timely re-check); 10ms when only blocking on socket readiness. */
-            int poll_ms = (nova_sleep_waiters || nova_offload_waiters) ? 1 : 10;
+            /* #19: poll_io now folds SLEEP deadlines into select() (min-only, cap=ceiling),
+               so a sleeper coexisting with a socket waiter no longer needs the 1ms busy-cap.
+               Unify to 10ms: ~99% of the CPU win without the cross-carrier wake-latency
+               regression a larger cap would add. OFFLOAD still caps at 1ms — an offload job
+               has no fd and no select-foldable deadline; its completion is an atomic `done`
+               flag reaped by check_offload, so select() must keep re-checking it promptly. */
+            int poll_ms = nova_offload_waiters ? 1 : 10;
             if (nova_io_waiters) nova_sched_poll_io(poll_ms);
             else { /* only sleep/offload waiters, brief OS sleep to avoid spin */
 #ifdef _WIN32

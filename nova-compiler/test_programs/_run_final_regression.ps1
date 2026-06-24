@@ -73,7 +73,8 @@ $new_tests = @(
     '_s5_hof_mono',
     '_s5_byval_test',
     '_s5_escape_canary',
-    '_kwfield_test'
+    '_kwfield_test',
+    '_fair_sleep_io'
 )
 
 # Phase 9 + domain stdlib modules (sorted_map, regex, crc32, math3d, ecs, etc.)
