@@ -1,0 +1,71 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// otp — Erlang/OTP-style behaviours for NOVA (#18): GenServer + Supervisor
+//
+// Built on NOVA's proven primitives — spawn (green process), channel()/send/recv
+// (typed rendezvous), and closures that capture channels. Process isolation +
+// channel deep-copy give the Erlang safety shape for free (no shared mutable state).
+//
+//   GenServer: a stateful process with a serialized message loop.
+//     srv = gen_start(initial_state, handler)   // handler: fn(state, req) -> {state, reply}
+//     gen_cast(srv, req)      // async, no reply
+//     v = gen_call(srv, req)  // sync, returns handler's reply
+//     gen_stop(srv)
+//
+//   Supervisor: run a worker; if it signals failure, restart up to max_restarts.
+//     r = supervise(workFn, max_restarts)  // workFn: fn(report_ch, attempt); send(report_ch, payload>0 ok | 0 fail)
+//     r = {"ok", "payload", "restarts"}
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── GenServer ────────────────────────────────────────────────────────────────
+// Returns the server's request channel (its "pid"). The handler is called once per
+// message, in arrival order, in the server process — so state mutations are race-free.
+fn gen_start(initial_state, handler)
+    let req_ch = channel()
+    spawn fn()
+        let state = initial_state
+        let running = 1
+        while running == 1
+            let msg = recv(req_ch)
+            let kind = msg["kind"]
+            if kind == "stop"
+                running = 0
+            else
+                let out = handler(state, msg["req"])
+                state = out["state"]
+                if kind == "call"
+                    send(msg["reply"], out["reply"])
+    req_ch
+
+// synchronous call: send a per-call reply channel, block until the server replies.
+fn gen_call(srv, req)
+    let reply = channel()
+    send(srv, {"kind": "call", "req": req, "reply": reply})
+    recv(reply)
+
+// asynchronous cast: fire-and-forget (no reply).
+fn gen_cast(srv, req)
+    send(srv, {"kind": "cast", "req": req, "reply": 0})
+
+fn gen_stop(srv)
+    send(srv, {"kind": "stop", "req": 0, "reply": 0})
+
+// ── Supervisor ─────────────────────────────────────────────────────────────────
+// Spawn workFn(report_ch, attempt); it does its work and sends a result on report_ch
+// (a value > 0 = success payload, 0 = failure). On failure the supervisor restarts,
+// up to max_restarts. Returns {ok, payload, restarts}. (Restart-on-signaled-failure,
+// the supervision pillar; rendezvous-deterministic.)
+fn supervise(workFn, max_restarts)
+    let ch = channel()
+    let attempt = 0
+    let done = 0
+    let payload = 0
+    while done == 0 and attempt <= max_restarts
+        spawn fn()
+            workFn(ch, attempt)
+        let r = recv(ch)
+        if r == 0
+            attempt = attempt + 1
+        else
+            payload = r
+            done = 1
+    {"ok": done, "payload": payload, "restarts": attempt}
