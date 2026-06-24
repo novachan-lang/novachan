@@ -72,7 +72,8 @@ $new_tests = @(
     'phase14_stabilize_test',
     '_s5_hof_mono',
     '_s5_byval_test',
-    '_s5_escape_canary'
+    '_s5_escape_canary',
+    '_kwfield_test'
 )
 
 # Phase 9 + domain stdlib modules (sorted_map, regex, crc32, math3d, ecs, etc.)
@@ -578,7 +579,7 @@ $testScript = {
         return $r
     }
 
-    $rr = _RunProc $exe "" 15000 $workDir
+    $rr = _RunProc $exe "" 30000 $workDir   # 30s (was 15s): heavy numeric tests (linalg/dframe/ndarray) get CPU-starved under ~16x parallel + IDE background load and spuriously timed out at 15s though they finish in <120ms standalone
     Remove-Item $exe,$ll -Force -ErrorAction SilentlyContinue
 
     if ($rr.T) { $r.Status = "FAIL"; $r.Detail = "TIMEOUT" }
