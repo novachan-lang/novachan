@@ -14890,7 +14890,7 @@ fn ir_returns_raw_double(func: IrFunction, frt: dict, fpt: dict) -> int
                 return 1
             return 0
 
-fn ir_collect_param_types(all_fns: list, frt: dict) -> dict
+fn ir_collect_param_types(all_fns: list, frt: dict, tramp_map: dict) -> dict
     let fpt = {}
     for ir_fn in all_fns
         match ir_fn
@@ -14898,6 +14898,10 @@ fn ir_collect_param_types(all_fns: list, frt: dict) -> dict
                 if fex == 0
                     let rt = {}
                     let st = {}
+                    // #14 (S5 HOF mono): closure_reg -> trampoline name, so a map/filter
+                    // call site can route the list's element type to the lambda body. Empty
+                    // tramp_map (flag NOVA_S5_HOF off) => no HOF harvest => byte-identical.
+                    let mc_def = {}
                     for p in fp
                         match p
                             IrParam(pname, ptype) =>
@@ -14915,6 +14919,8 @@ fn ir_collect_param_types(all_fns: list, frt: dict) -> dict
                                 for inst in insts
                                     match inst
                                         IrInst(iop, idest, ityp, iargs, ival, inum, ieff, iline) =>
+                                            if iop == "make_closure"
+                                                mc_def[idest] = ival
                                             if iop == "call"
                                                 let callee = ival
                                                 if not contains(fpt, callee)
@@ -14932,6 +14938,40 @@ fn ir_collect_param_types(all_fns: list, frt: dict) -> dict
                                                         else
                                                             fpt[callee][akey] = atype
                                                     ai = ai + 1
+                                                // #14 (S5 HOF mono, gated): an INLINE lambda passed to
+                                                // map/filter over a statically int/float-typed list gets its
+                                                // single user param specialized to that element kind. Sound
+                                                // because (a) nova_list_deopt boxes every float element so the
+                                                // body's box-tolerant nova_rt_unbox reads it correctly, (b) the
+                                                // element kind comes from the call-site list type, NOT a
+                                                // generalized body resolution (so it cannot reproduce the
+                                                // ti_fn_param_types/math3d mis-specialization), (c) if the same
+                                                // lambda is used at two element kinds the conflict->any merge
+                                                // below collapses it to dynamic.
+                                                let _is_hof = callee == "nova_rt_list_map" or callee == "nova_rt_list_map_fbox" or callee == "nova_rt_list_filter"
+                                                if _is_hof and len(iargs) >= 2 and contains(mc_def, iargs[1])
+                                                    let _tname = mc_def[iargs[1]]
+                                                    if contains(tramp_map, _tname)
+                                                        let _spec = tramp_map[_tname]
+                                                        let _lname = _spec[0]
+                                                        let _ncap = _spec[1]
+                                                        let _lt = "any"
+                                                        if contains(rt, iargs[0])
+                                                            _lt = rt[iargs[0]]
+                                                        let _ek = ""
+                                                        if _lt == "intlist"
+                                                            _ek = "int"
+                                                        else if _lt == "floatlist"
+                                                            _ek = "float"
+                                                        if _ek != ""
+                                                            if not contains(fpt, _lname)
+                                                                fpt[_lname] = {}
+                                                            let _lk = str(_ncap)
+                                                            if contains(fpt[_lname], _lk)
+                                                                if fpt[_lname][_lk] != _ek
+                                                                    fpt[_lname][_lk] = "any"
+                                                            else
+                                                                fpt[_lname][_lk] = _ek
     fpt
 
 // ── IR → LLVM Emission ───────────────────────────────────────────────────────
@@ -17857,12 +17897,20 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                         _sfkinds = _sfkinds + "."
         frt["@sfkinds@" + _sdn] = _sfkinds
     let fpt = {}
+    // #14 (S5 HOF mono, gated NOVA_S5_HOF): map trampoline name -> [lambda_body, ncap]
+    // so ir_collect_param_types can specialize an inline map/filter lambda's param to the
+    // list's element kind. Flag OFF => empty map => no HOF harvest => byte-identical codegen.
+    let _s5_tramp_map = {}
+    let _s5_hof_flag = env("NOVA_S5_HOF")
+    if len(_s5_hof_flag) > 0 and _s5_hof_flag[0] == "1"
+        for _s5_sp in b.ir_tramps
+            _s5_tramp_map[_s5_sp[0]] = [_s5_sp[1], _s5_sp[2]]
     let changed = true
     let pass_count = 0
     while changed and pass_count < 6
         changed = false
         pass_count = pass_count + 1
-        fpt = ir_collect_param_types(all_fns, frt)
+        fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map)
         for ir_fn in all_fns
             match ir_fn
                 IrFunction(fname, fp, fret, fblocks, ftp, fex) =>
@@ -17873,7 +17921,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     if new_type != old_type and new_type != "any"
                         frt[fname] = new_type
                         changed = true
-    fpt = ir_collect_param_types(all_fns, frt)
+    fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map)
 
     // PERF P1 (beat-C struct math): mark every float-returning user fn that PROVABLY
     // returns raw double bits as "@raw@<fn>" in frt. ir_infer_one then types calls to

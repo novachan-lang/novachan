@@ -69,7 +69,8 @@ $new_tests = @(
     'phase13_web_test',
     'phase13_ai_test',
     'phase13_game_test',
-    'phase14_stabilize_test'
+    'phase14_stabilize_test',
+    '_s5_hof_mono'
 )
 
 # Phase 9 + domain stdlib modules (sorted_map, regex, crc32, math3d, ecs, etc.)
