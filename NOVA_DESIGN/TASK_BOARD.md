@@ -63,28 +63,28 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 | 23 | ARM/aarch64 fiber switch (silently no-ops today) + macOS runtime + multi-platform CI | 🔴 BLOCKED (needs ARM/macOS hardware) | L | runtime | ENV-BLOCKED here (win32 x64 only): the fiber context-switch is `#ifdef _WIN32`(Fibers) / `#elif __x86_64__`(hand asm) / `#else`→`"fibers not supported"`+return 0. ARM needs AArch64 asm for nova_asm_switch (mirror the x86_64 stp/ldp of x19-x28+x29/x30+sp swap) — but context-switch asm is UNTESTABLE without ARM hardware, and shipping unvalidated would risk silent stack corruption (worse than the honest no-op). RECIPE documented; needs an ARM/macOS box to implement+validate. | — |
 | 24 | Dead-runtime stripping / runtime tiers + static-musl release (tiny binaries) | 🔴 BLOCKED (needs musl/Linux toolchain) | L | runtime+build | ENV-BLOCKED here (no musl/Linux): static-musl is the core deliverable and needs a Linux+musl toolchain to build+verify. Dead-runtime stripping (`-ffunction-sections -Wl,--gc-sections` / LTO) is partially testable on Windows but the headline (tiny static-musl binaries) is Linux-only. | — |
 | 25 | C ABI both directions (@export, struct-by-value FFI, callback thunks) | 🟡 | L | compiler+runtime | TODO | — |
-| 26 | Real WASM codegen backend + wasi-sdk (today a no-op stub) | 🟡 | XL | compiler+runtime | TODO | — |
+| 26 | Real WASM codegen backend + wasi-sdk (today a no-op stub) | 🟢 (real backend works — board's "stub" was STALE) | XL | compiler+runtime | VERIFIED REAL (board badly stale): `nova wasm <file>` emits a real `.wasm` + JS loader bundle (`_w.run.cjs`, `_wasm_runtime.cjs`) + DOM/fullstack HTML; clang `--target=wasm32 -nostdlib` link path (compiler L20332). VERIFIED IT RUNS: `node _w.run.cjs` on `add(20,22)`+string-concat printed "wasm says: 42". Gated: wasm_grow_test in the regression. REMAINING (real but partial): broader stdlib/syscall coverage under wasm (wasi-sdk), not core codegen. | opus |
 | 27 | no_std/freestanding profile (bare-metal / 64KB-RAM embedded) | 🟡 | XL | runtime | TODO | — |
 
 ## PHASE 8 — full-parity: ownership tier
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 28 | Owned/move tier + move-checker on-by-default + must-use Result + Drop/RAII | 🟡 | XL | compiler | TODO | — |
+| 28 | Owned/move tier + move-checker on-by-default + must-use Result + Drop/RAII | 🟡 (move-check + must_use foundations exist) | XL | compiler | PARTIAL (board understated): a move-checker exists (`move_expr_uses` → E1003 "value used after move", for send()-moves) + `ti_must_use` (must-use enforcement). REMAINING (XL): a full owned/move TIER (move semantics beyond send), move-check on-by-default for all moves, Drop/RAII destructors. | — |
 
 ## PHASE 9 — full-parity: tooling & DX
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
 | 29 | One-command signed installer (msi/brew/apt/curl) bundling runtime+clang | 🟡 | M | packaging | TODO | — |
-| 30 | Real interpreter / REPL + notebooks (instant feedback) | 🟡 | L | new backend | TODO | — |
-| 31 | Sampling CPU profiler + flamegraph + heap profiler | 🟡 | L | runtime+tooling | TODO | — |
-| 32 | Semantic LSP (wire real HM types into completion/hover) | 🟡 | M | compiler+lsp | TODO | — |
-| 33 | Working `nova debug` (DWARF + channel/process-aware pretty-printers) | 🟡 | M | tooling | TODO | — |
-| 34 | AST-reprinting `nova fmt` (whitespace-only today) | 🟡 | M | compiler | TODO | — |
+| 30 | Real interpreter / REPL + notebooks (instant feedback) | 🟡 (REPL works; notebooks remain) | L | new backend | PARTIAL: `nova repl` works (interactive shell, compiles+runs repl.nova). REMAINING: a real interpreter (vs compile-each-line) + notebook integration. | — |
+| 31 | Sampling CPU profiler + flamegraph + heap profiler | 🟡 (region profiler works) | L | runtime+tooling | PARTIAL: `nova_rt_prof_start`/`stop` named-region profiler + `nova cov` (coverage) + `nova bench` ship + gated (prof_test). REMAINING: statistical SAMPLING profiler + flamegraph + heap profiler. | — |
+| 32 | Semantic LSP (wire real HM types into completion/hover) | 🟡 (check/diagnostics work) | M | compiler+lsp | PARTIAL: `__lsp_check__` + `nova check` (parse+type-check, fast diagnostics) ship. REMAINING: wire the HM-inferred types into semantic hover/completion responses. | — |
+| 33 | Working `nova debug` (DWARF + channel/process-aware pretty-printers) | 🟡 (DWARF + lldb work) | M | tooling | PARTIAL: `nova debug` builds with DWARF (`!DICompileUnit` DW_LANG_C99, LineTablesOnly) + launches lldb; line-level debugging works. REMAINING: channel/process-aware pretty-printers (inspect green tasks/channels). | — |
+| 34 | AST-reprinting `nova fmt` (whitespace-only today) | 🟡 (whitespace fmt works) | M | compiler | PARTIAL: `nova fmt` works (whitespace normalization). REMAINING: full AST-reprinting (canonical layout) with comment preservation. | — |
 
 ## PHASE 10 — full-parity: stdlib & advanced
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 35 | Compile-time eval (const-fn/comptime) + binary/bitstring pattern matching | 🟡 | L | compiler | TODO | — |
+| 35 | Compile-time eval (const-fn/comptime) + binary/bitstring pattern matching | 🟡 (const-baking works) | L | compiler | PARTIAL: compile-time const-baking exists + gated (`ir_const_bakeable`, const_bake_test + const_test pass) — immutable const values are baked at compile time. REMAINING: general const-FN evaluation (a compile-time interpreter) + binary/bitstring pattern matching. | — |
 | 36 | Reflection upgrade (invoke-by-name + dynamic construction) + Forge ORM | 🟡 | L | compiler+stdlib | ORM FOUNDATION DONE: `qb.nova` parameterized SQL query builder (SELECT/INSERT/UPDATE/DELETE, where/order/limit/join, injection-safe by construction, feeds sqlitex db_query) + qb_lib_test, both modes (83a384e). REMAINING: invoke-by-name/dynamic construction (compiler) + typed schema↔table + migrations. | opus |
 | 37 | Numeric/AI spine (ndarray + DataFrame + linalg → autograd/optimizers + ONNX/GGUF + GPU/SPIR-V) | 🟡 | XL | runtime+stdlib | CORE DONE (pure-NOVA, both modes): DataFrame `dframe.nova` (2f2de79), `linalg.nova` solve/det/inverse/lstsq (f18929a), reverse-mode `autograd.nova` (2e541cd), + TRAIN PROOF: linear regression learned via autograd+GD→w=2,b=1,loss=1.6e-29 (c4158bc). REMAINING: ndarray, optimizers lib, ONNX/GGUF parsers (XL), GPU/SPIR-V (hw-blocked). | opus |
 
