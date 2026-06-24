@@ -9960,6 +9960,8 @@ type TiState
     ti_in_fn: string
     ti_stdlib: dict
     ti_unify_count: int
+    ti_budget_reported: bool    // #16: per-drain flag — fail-closed budget error emitted at most once per ti_solve drain
+    ti_strict: bool             // #16: NOVA_TI_STRICT opt-in — per-drain budget reset + fail-closed exhaustion. OFF = historical fail-open (byte-identical).
     ti_source_lines: list
     ti_min_arity: dict
     ti_enum_variants: dict
@@ -10049,7 +10051,9 @@ fn ti_new(source_lines: list) -> TiState
 
 fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {})
+    let _ti_strict_env = env("NOVA_TI_STRICT")
+    let _ti_strict = len(_ti_strict_env) > 0 and _ti_strict_env[0] == "1"
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -10330,8 +10334,26 @@ fn ti_zonk(st: TiState, t: NType) -> NType
 
 fn ti_unify_d(st: TiState, a: NType, b: NType, line: int, depth: int)
     st.ti_unify_count = st.ti_unify_count + 1
-    if depth > 50 or st.ti_unify_count > 5000
-        return
+    // #16 STRICT (NOVA_TI_STRICT, opt-in): the unification budget is RESET per ti_solve
+    // drain (so later declarations get full checking instead of being starved by a global
+    // budget that silently skips their mismatch checks) and exhaustion is FAIL-CLOSED
+    // (error, not silent-accept). The depth bound stays silent (deep type = incompleteness,
+    // not a mismatch). DEFAULT (off) preserves the historical global fail-open behavior
+    // EXACTLY -> byte-identical. NOTE: strict mode currently surfaces a latent inferer
+    // inconsistency (IrInst constructor arity mis-inferred 2 vs 8) in the compiler's OWN
+    // source — masked until now by the budget hole. Tracked; must be fixed before strict
+    // can be the default.
+    if st.ti_strict
+        if depth > 50
+            return
+        if st.ti_unify_count > 1000000
+            if not st.ti_budget_reported
+                st.ti_budget_reported = true
+                ti_error(st, "type inference budget exhausted: this declaration is too large or too deeply constrained to fully type-check", line)
+            return
+    else
+        if depth > 50 or st.ti_unify_count > 5000
+            return
     let wa = ti_walk(st, a)
     let wb = ti_walk(st, b)
     match wa
@@ -10413,6 +10435,14 @@ fn ti_unify_arms(st: TiState, a: NType, b: NType, line: int)
         ti_constrain(st, a, b, line)
 
 fn ti_solve(st: TiState)
+    // #16 STRICT: per-drain budget reset. ti_solve is the unit at which constraints are
+    // batch-resolved (it clears ti_constraints below), so the budget must be fresh here —
+    // otherwise it accumulates across the whole compile and starves later declarations,
+    // silently skipping their mismatch checks (the fail-open soundness hole). Gated so
+    // DEFAULT is byte-identical to the historical (no-reset) behavior.
+    if st.ti_strict
+        st.ti_unify_count = 0
+        st.ti_budget_reported = false
     let total = len(st.ti_constraints)
     let i = 0
     while i < total
