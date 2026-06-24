@@ -51,7 +51,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 6 — full-parity: concurrency / OTP / Erlang endgame
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 18 | First-class OTP layer (Supervisor + restart strategies + GenServer + registry + telemetry) | 🟡 | L | runtime+stdlib | TODO | — |
+| 18 | First-class OTP layer (Supervisor + restart strategies + GenServer + registry + telemetry) | 🟢 (behaviours done; links/trap_exit need runtime) | L | runtime+stdlib | OTP STDLIB DONE (ddbf821/a0dc61a/01c0698): `otp.nova` GenServer (gen_start/call/cast/stop, serialized race-free state loop), Supervisor (supervise + restart-on-failure up to N), named registry (registry_start/reg_register/reg_whereis — name→pid discovery); `telemetry.nova` counters/gauges/histograms. All pure-NOVA on spawn+channels (verified channel-in-message + passed-fn-in-spawned-closure), both modes, ASAN-clean. REMAINING: links/trap_exit (need runtime exit-signal support). | opus |
 | 19 | Concurrency fairness (timer-wheel parking, unify async, preemption, file-I/O offload) | 🟡 | L | runtime | TODO | — |
 | 20 | Growable/segmented green stacks (millions of processes) — maybe blocked by i64 ABI | 🟡 | XL | runtime | TODO | — |
 | 21 | Transparent distribution (node discovery, global PID/registry, term-faithful wire) | 🟡 | XL | runtime+stdlib | TODO | — |
