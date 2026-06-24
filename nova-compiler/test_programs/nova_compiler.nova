@@ -15120,9 +15120,12 @@ type IrEmitter
     ire_borrow_src: dict        // total-RC S1: registers holding a BORROWED value (index_get/field_get result). Pure metadata; inert until S2 reads it for the positive-owned drop gate.
     ire_owned: dict             // total-RC S1: registers holding a freshly-OWNED value (make_list/dict/struct/closure result). Pure metadata; inert until S3 reads it for the positive-owned drop gate. A register in neither set is UNCLASSIFIED -> S3 treats it as not-droppable (conservative).
     ire_fullrc_drop: dict       // total-RC S3 (NOVA_T8_FULLRC): slot names proven always-OWNED + never-escaped -> their overwrite emits rc_dec(old). EMPTY unless the flag is on (then byte-identical codegen).
+    ire_s5_byval: dict          // #15 S5 ABI: fname -> list of [param_idx, struct_name] pairs for by-value eligible params. EMPTY when NOVA_S5_ABI off.
+    ire_s5_sdefs: dict          // #15 S5 ABI: reference to ir_sdefs for field kind lookups during emission.
+    ire_s5_struct_ptr: dict     // #15 S5 ABI: per-function: dest_reg -> ptr_name for stackable make_struct dests (so call-site scalarization can GEP from it).
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {})
+    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {})
 
 // Mark dest as a raw double. ire_reg_types is also set by slot_load propagation (a FLAT,
 // control-flow-insensitive map -> can be wrongly "float" for a reassigned slot), so that
@@ -15811,12 +15814,57 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             if contains(e.ire_load_origin, args[_cai])
                                 e.ire_slot_escaped[e.ire_load_origin[args[_cai]]] = 1
                             _cai = _cai + 1
+                    // #15 S5 ABI: check if callee has by-value params
+                    let _s5c_byval_list = []
+                    if contains(e.ire_s5_byval, value)
+                        _s5c_byval_list = e.ire_s5_byval[value]
+                    // Build a quick lookup: param_idx -> struct_name
+                    let _s5c_pmap = {}
+                    let _s5c_bi = 0
+                    while _s5c_bi < len(_s5c_byval_list)
+                        let _s5c_entry = _s5c_byval_list[_s5c_bi]
+                        _s5c_pmap[str(_s5c_entry[0])] = _s5c_entry[1]
+                        _s5c_bi = _s5c_bi + 1
                     let call_str = "call i64 @" + call_name + "("
                     let i = 0
+                    let _s5c_first = 1
                     while i < len(args)
-                        if i > 0
-                            call_str = call_str + ", "
-                        call_str = call_str + "i64 " + args[i]
+                        if contains(_s5c_pmap, str(i))
+                            // Scalarize: GEP+load each field from the struct ptr
+                            let _s5c_sn = _s5c_pmap[str(i)]
+                            let _s5c_fields = e.ire_s5_sdefs[_s5c_sn]
+                            // Get the ptr: either from ire_s5_struct_ptr (make_struct dest)
+                            // or via inttoptr from the i64 value (slot-loaded struct pointer)
+                            let _s5c_ptr = ""
+                            if contains(e.ire_s5_struct_ptr, args[i])
+                                _s5c_ptr = e.ire_s5_struct_ptr[args[i]]
+                            else
+                                _s5c_ptr = ire_fresh_tmp(e, "_s5c.itp")
+                                ire_indent(e, _s5c_ptr + " = inttoptr i64 " + args[i] + " to ptr")
+                            let _s5c_fi = 0
+                            for _s5c_fp in _s5c_fields
+                                match _s5c_fp
+                                    Param(_s5c_fpn, _s5c_fpt, _s5c_fpd) =>
+                                        if _s5c_first == 0
+                                            call_str = call_str + ", "
+                                        _s5c_first = 0
+                                        let _s5c_slot = _s5c_fi + 1
+                                        let _s5c_gep = ire_fresh_tmp(e, "_s5c.gep")
+                                        let _s5c_ld = ire_fresh_tmp(e, "_s5c.ld")
+                                        ire_indent(e, _s5c_gep + " = getelementptr i64, ptr " + _s5c_ptr + ", i64 " + str(_s5c_slot))
+                                        ire_indent(e, _s5c_ld + " = load i64, ptr " + _s5c_gep + ", align 8")
+                                        if _s5c_fpt == "float"
+                                            let _s5c_bc = ire_fresh_tmp(e, "_s5c.bc")
+                                            ire_indent(e, _s5c_bc + " = bitcast i64 " + _s5c_ld + " to double")
+                                            call_str = call_str + "double " + _s5c_bc
+                                        else
+                                            call_str = call_str + "i64 " + _s5c_ld
+                                _s5c_fi = _s5c_fi + 1
+                        else
+                            if _s5c_first == 0
+                                call_str = call_str + ", "
+                            _s5c_first = 0
+                            call_str = call_str + "i64 " + args[i]
                         i = i + 1
                     call_str = call_str + ")"
                     if dest != ""
@@ -15871,6 +15919,10 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         e.ire_slot_escaped[e.ire_load_origin[args[fi]]] = 1
                     fi = fi + 1
                 ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
+                // #15 S5 ABI: record .ptr name so call-site scalarization can GEP from it.
+                // Record for ALL make_struct dests (both stackable and heap) so any caller
+                // that passes this struct to a by-value callee can GEP-load the fields.
+                e.ire_s5_struct_ptr[dest] = dest + ".ptr"
                 e.ire_owned[dest] = 1        // total-RC S1: a freshly-built struct is OWNED. Inert metadata.
             else if op == "make_list"
                 ire_indent(e, dest + " = call i64 @nova_rt_list_create()")
@@ -16279,6 +16331,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
     e.ire_borrow_src = {}        // total-RC S1: per-function reset (CVE-class -- borrow provenance must not leak across fn boundaries)
     e.ire_owned = {}             // total-RC S1: per-function reset (owned provenance must not leak across fn boundaries)
     e.ire_fullrc_drop = {}       // total-RC S3: per-function reset (recomputed by the pre-pass below when NOVA_T8_FULLRC=1)
+    e.ire_s5_struct_ptr = {}     // #15 S5 ABI: per-function reset (populated by make_struct emission for stackable dests)
     match func
         IrFunction(name, params, ret_type, blocks, type_params, is_extern) =>
             // Anonymous lambdas (__lambda_*) are always called via a closure (any
@@ -16393,12 +16446,41 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                 for _frc_s in keys(_frc_stored)
                     if not contains(_frc_bad, _frc_s)
                         e.ire_fullrc_drop[_frc_s] = 1
+            // #15 S5 ABI: build a lookup for this function's by-value param info
+            // _s5_pmap[pi] = struct_name iff param pi is by-value eligible
+            let _s5_pmap = {}
+            if contains(e.ire_s5_byval, name)
+                let _s5_entries = e.ire_s5_byval[name]
+                let _s5_ei = 0
+                while _s5_ei < len(_s5_entries)
+                    let _s5_entry = _s5_entries[_s5_ei]
+                    _s5_pmap[str(_s5_entry[0])] = _s5_entry[1]
+                    _s5_ei = _s5_ei + 1
             let header = "define i64 @" + name + "("
             let i = 0
+            let _s5_first_param = 1
             while i < len(params)
-                if i > 0
-                    header = header + ", "
-                header = header + "i64 %p" + str(i)
+                if contains(_s5_pmap, str(i))
+                    // By-value param: emit k typed params per field
+                    let _s5_sn = _s5_pmap[str(i)]
+                    let _s5_fields = e.ire_s5_sdefs[_s5_sn]
+                    let _s5_fi = 0
+                    for _s5_fp in _s5_fields
+                        match _s5_fp
+                            Param(_s5_fpn, _s5_fpt, _s5_fpd) =>
+                                if _s5_first_param == 0
+                                    header = header + ", "
+                                _s5_first_param = 0
+                                if _s5_fpt == "float"
+                                    header = header + "double %p" + str(i) + ".f" + str(_s5_fi)
+                                else
+                                    header = header + "i64 %p" + str(i) + ".f" + str(_s5_fi)
+                        _s5_fi = _s5_fi + 1
+                else
+                    if _s5_first_param == 0
+                        header = header + ", "
+                    _s5_first_param = 0
+                    header = header + "i64 %p" + str(i)
                 i = i + 1
             // uwtable: emit Windows SEH unwind info (.pdata/.xdata) for every NOVA
             // function. Without it, longjmp/RtlUnwindEx (how nova_panic contains a
@@ -16453,8 +16535,44 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                             while pi2 < len(params)
                                 match params[pi2]
                                     IrParam(pname, ptype) =>
-                                        ire_indent(e, "%slot." + pname + " = alloca i64, align 8")
-                                        ire_indent(e, "store i64 %p" + str(pi2) + ", ptr %slot." + pname + ", align 8")
+                                        if contains(_s5_pmap, str(pi2))
+                                            // #15 S5 ABI: reconstruct struct from scalarized field params
+                                            let _s5r_sn = _s5_pmap[str(pi2)]
+                                            let _s5r_fields = e.ire_s5_sdefs[_s5r_sn]
+                                            let _s5r_nf = len(_s5r_fields)
+                                            let _s5r_alloca = "%s5r." + pname + ".ptr"
+                                            ire_indent(e, _s5r_alloca + " = alloca [" + str(_s5r_nf + 1) + " x i64], align 8")
+                                            // Store type-hash into slot 0 (dead, DCE'd — kept for layout invariance)
+                                            let _s5r_hash = type_name_hash(_s5r_sn)
+                                            let _s5r_gep0 = "%s5r." + pname + ".h" + str(e.ire_tc)
+                                            e.ire_tc = e.ire_tc + 1
+                                            ire_indent(e, _s5r_gep0 + " = getelementptr i64, ptr " + _s5r_alloca + ", i64 0")
+                                            ire_indent(e, "store i64 " + fmt_i64_decimal(_s5r_hash) + ", ptr " + _s5r_gep0 + ", align 8")
+                                            // Store each field param into slots 1..k
+                                            let _s5r_fi = 0
+                                            for _s5r_fp in _s5r_fields
+                                                match _s5r_fp
+                                                    Param(_s5r_fpn, _s5r_fpt, _s5r_fpd) =>
+                                                        let _s5r_slot = _s5r_fi + 1
+                                                        let _s5r_gep = "%s5r." + pname + ".g" + str(_s5r_fi)
+                                                        ire_indent(e, _s5r_gep + " = getelementptr i64, ptr " + _s5r_alloca + ", i64 " + str(_s5r_slot))
+                                                        if _s5r_fpt == "float"
+                                                            // bitcast double -> i64
+                                                            let _s5r_bc = "%s5r." + pname + ".bc" + str(_s5r_fi)
+                                                            ire_indent(e, _s5r_bc + " = bitcast double %p" + str(pi2) + ".f" + str(_s5r_fi) + " to i64")
+                                                            ire_indent(e, "store i64 " + _s5r_bc + ", ptr " + _s5r_gep + ", align 8")
+                                                        else
+                                                            ire_indent(e, "store i64 %p" + str(pi2) + ".f" + str(_s5r_fi) + ", ptr " + _s5r_gep + ", align 8")
+                                                _s5r_fi = _s5r_fi + 1
+                                            // Set %slot.pname = ptrtoint of the alloca (the body uses this)
+                                            ire_indent(e, "%slot." + pname + " = alloca i64, align 8")
+                                            let _s5r_pti = "%s5r." + pname + ".pti" + str(e.ire_tc)
+                                            e.ire_tc = e.ire_tc + 1
+                                            ire_indent(e, _s5r_pti + " = ptrtoint ptr " + _s5r_alloca + " to i64")
+                                            ire_indent(e, "store i64 " + _s5r_pti + ", ptr %slot." + pname + ", align 8")
+                                        else
+                                            ire_indent(e, "%slot." + pname + " = alloca i64, align 8")
+                                            ire_indent(e, "store i64 %p" + str(pi2) + ", ptr %slot." + pname + ", align 8")
                                         match ptype
                                             IrType(pk, _, _, _) =>
                                                 if pk == "list" or pk == "intlist"
@@ -17963,6 +18081,102 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                 _allscalar[_sdt] = 1
     let _esumm = ir_escape_summaries(all_fns)
 
+    // ── #15 S5 ABI: compute by-value-eligible callee set (NOVA_S5_ABI=1) ──────
+    // A param i of f is by-value-eligible iff:
+    //   (1) fpt (the sound use-set from ir_collect_param_types) gives a concrete
+    //       struct name S for that param (not "any" = conflict, not a scalar type)
+    //   (2) S is in _allscalar (all fields int/float/bool)
+    //   (3) param i does NOT escape inside f (per _esumm)
+    // Then a global address-taken guard removes any f that is referenced anywhere
+    // other than as the direct callee of an op=="call" instruction.
+    let _s5_abi_env = env("NOVA_S5_ABI")
+    let do_s5abi = len(_s5_abi_env) > 0 and _s5_abi_env[0] == "1"
+    let _s5_byval = {}
+    if do_s5abi
+        // Edit 1: eligibility from the SOUND use-set (fpt), NOT ir_fn_param_stypes
+        for _s5_fn in all_fns
+            match _s5_fn
+                IrFunction(_s5_fname, _s5_fparams, _, _, _, _s5_fex) =>
+                    if _s5_fex == 0
+                        let _s5_idxs = []
+                        let _s5_pi = 0
+                        for _s5_p in _s5_fparams
+                            match _s5_p
+                                IrParam(_s5_pn, _s5_pt) =>
+                                    let _s5_pst = ""
+                                    if contains(fpt, _s5_fname) and contains(fpt[_s5_fname], str(_s5_pi))
+                                        _s5_pst = fpt[_s5_fname][str(_s5_pi)]
+                                    // Require: concrete struct name in _allscalar, not "any"/scalar
+                                    let _s5_esc = contains(_esumm, _s5_fname) and contains(_esumm[_s5_fname], str(_s5_pi))
+                                    if _s5_pst != "" and _s5_pst != "any" and _s5_pst != "int" and _s5_pst != "float" and _s5_pst != "str" and _s5_pst != "list" and _s5_pst != "dict" and _s5_pst != "bool" and _s5_pst != "intlist" and _s5_pst != "floatlist" and contains(_allscalar, _s5_pst) and not _s5_esc
+                                        push(_s5_idxs, [_s5_pi, _s5_pst])
+                            _s5_pi = _s5_pi + 1
+                        if len(_s5_idxs) > 0
+                            _s5_byval[_s5_fname] = _s5_idxs
+
+        // Edit 2: global address-taken guard — remove any f that appears as
+        // anything other than the callee value of a direct op=="call".
+        // Build the set of fnames that are address-taken (referenced indirectly).
+        let _s5_taken = {}
+        for _s5g_fn in all_fns
+            match _s5g_fn
+                IrFunction(_, _, _, _s5g_blocks, _, _) =>
+                    for _s5g_blk in _s5g_blocks
+                        match _s5g_blk
+                            IrBlock(_, _s5g_insts, _s5g_term) =>
+                                for _s5g_inst in _s5g_insts
+                                    match _s5g_inst
+                                        IrInst(_s5g_op, _, _, _s5g_args, _s5g_val, _, _, _) =>
+                                            if _s5g_op == "call"
+                                                // In a direct call, value is the callee name.
+                                                // Args are the arguments — if any arg is an fname
+                                                // in _s5_byval, it is address-taken (passed as value).
+                                                let _s5g_ai = 0
+                                                while _s5g_ai < len(_s5g_args)
+                                                    if contains(_s5_byval, _s5g_args[_s5g_ai])
+                                                        _s5_taken[_s5g_args[_s5g_ai]] = 1
+                                                    _s5g_ai = _s5g_ai + 1
+                                            else if _s5g_op == "make_closure" or _s5g_op == "call_by_name" or _s5g_op == "dyn_call"
+                                                // value field references a function name (closure target,
+                                                // call_by_name target, etc.)
+                                                if contains(_s5_byval, _s5g_val)
+                                                    _s5_taken[_s5g_val] = 1
+                                                // Also check all args
+                                                let _s5g_bi = 0
+                                                while _s5g_bi < len(_s5g_args)
+                                                    if contains(_s5_byval, _s5g_args[_s5g_bi])
+                                                        _s5_taken[_s5g_args[_s5g_bi]] = 1
+                                                    _s5g_bi = _s5g_bi + 1
+                                            else
+                                                // Any other op: if value or any arg is an fname, it's taken
+                                                if contains(_s5_byval, _s5g_val)
+                                                    _s5_taken[_s5g_val] = 1
+                                                let _s5g_ci = 0
+                                                while _s5g_ci < len(_s5g_args)
+                                                    if contains(_s5_byval, _s5g_args[_s5g_ci])
+                                                        _s5_taken[_s5g_args[_s5g_ci]] = 1
+                                                    _s5g_ci = _s5g_ci + 1
+                                match _s5g_term
+                                    IrInst(_s5g_top, _, _, _s5g_targs, _s5g_tval, _, _, _) =>
+                                        // Terminators (return, branch, etc.)
+                                        if contains(_s5_byval, _s5g_tval)
+                                            _s5_taken[_s5g_tval] = 1
+                                        let _s5g_di = 0
+                                        while _s5g_di < len(_s5g_targs)
+                                            if contains(_s5_byval, _s5g_targs[_s5g_di])
+                                                _s5_taken[_s5g_targs[_s5g_di]] = 1
+                                            _s5g_di = _s5g_di + 1
+        // Remove address-taken fns from _s5_byval
+        for _s5_tk in keys(_s5_taken)
+            if contains(_s5_byval, _s5_tk)
+                _s5_byval[_s5_tk] = []
+        // Clean up empty entries
+        let _s5_final = {}
+        for _s5_fk in keys(_s5_byval)
+            if len(_s5_byval[_s5_fk]) > 0
+                _s5_final[_s5_fk] = _s5_byval[_s5_fk]
+        _s5_byval = _s5_final
+
     // Pass 3: Infer types with inter-procedural info and emit
     // Plumb @repr(C) type set from the IR builder into the LLVM emitter so
     // make_struct can skip the type-hash slot for C-layout structs.
@@ -17972,6 +18186,9 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
         e.ire_repr_packed[k] = 1
     for k in keys(b.ir_repr_align)
         e.ire_repr_align[k] = b.ir_repr_align[k]
+    // #15 S5 ABI: plumb the by-value-eligible set and struct defs into the emitter
+    e.ire_s5_byval = _s5_byval
+    e.ire_s5_sdefs = b.ir_sdefs
     // Track 8 escape analysis + W3 RC elision: ON by default (the perf moat).
     // NOVA_NO_TRACK8=1 disables both for bisection / backward-compat. The
     // existing NOVA_TRACK8=1 env still works (now also enables W4 strict
