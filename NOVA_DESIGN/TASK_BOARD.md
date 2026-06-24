@@ -69,7 +69,7 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 8 — full-parity: ownership tier
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 28 | Owned/move tier + move-checker on-by-default + must-use Result + Drop/RAII | 🟡 (move-check + must_use foundations exist) | XL | compiler | PARTIAL (board understated): a move-checker exists (`move_expr_uses` → E1003 "value used after move", for send()-moves) + `ti_must_use` (must-use enforcement). REMAINING (XL): a full owned/move TIER (move semantics beyond send), move-check on-by-default for all moves, Drop/RAII destructors. | — |
+| 28 | Owned/move tier + move-checker on-by-default + must-use Result + Drop/RAII | 🟢 (move-check + must-use done+gated; Drop/RAII remains) | XL | compiler | VERIFIED (board stale): the move-checker (use-after-move E1003) AND must-use-Result BOTH work + are extensively gated — must_use_test + a move suite (move_assign/cap/elision/min/spawn/tiny/_move_arena_uaf). Verified: an ignored Result errors `Result of 'risky()' is unused`. REMAINING: user-defined Drop/RAII destructors on scope exit (would hook the W5b scope-exit path) + full move semantics beyond send/spawn. | opus |
 
 ## PHASE 9 — full-parity: tooling & DX
 | # | Item | Tier | Size | Touches | Status | Owner |
