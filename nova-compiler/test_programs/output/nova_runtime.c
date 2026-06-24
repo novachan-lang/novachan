@@ -4982,6 +4982,22 @@ int64_t nova_rt_channel_recv_timeout(int64_t handle, int64_t timeout_ms) {
                                           faults at the reserve and the iter-16 SEH __except contains it.
                                           POSIX already commits lazily (demand-zero mmap) => Windows-only. */
 
+/* #20 POSIX fiber stack hardening (the POSIX path only — Windows uses CreateFiberEx with a
+   ~16MB auto-growing reserve + SEH overflow containment). The old POSIX stack was 32KB with a
+   single 4KB guard page, which (a) overflowed deep code that Windows handles fine (the
+   self-hosted compiler's recursive descent / a deeply nested AST walk) and (b) let a stack
+   frame larger than one page LEAP the single guard into an adjacent fiber's memory = silent
+   cross-fiber corruption. Fix: a generous 1MB usable stack (demand-zero mmap => only TOUCHED
+   pages cost RSS, so a parked shallow fiber still costs ~8KB physical despite the 1MB virtual
+   — no memory regression) fronted by a 64KB PROT_NONE guard (no single frame can skip it ->
+   overflow always faults cleanly instead of corrupting). NOTE (tracked, needs Linux to
+   validate): full "carrier survives overflow" parity still needs a SIGSEGV/sigaltstack handler
+   that converts the guard-page fault into the contained-crash longjmp the software-fault path
+   uses; this hardening converts silent-corruption -> clean fault, the SIGSEGV->contained step
+   is the documented follow-on. */
+#define NOVA_POSIX_STACK_SIZE  (1024 * 1024)
+#define NOVA_POSIX_GUARD_SIZE  (64 * 1024)
+
 typedef struct NovaFiber {
     NovaTaskState     task;
     int               status;       /* 0=created 1=running 2=suspended 3=finished */
@@ -5323,14 +5339,16 @@ int64_t nova_rt_fiber_create(int64_t closure) {
     NovaFiber* f = (NovaFiber*)calloc(1, sizeof(NovaFiber));
     if (!f) return 0;
 
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) page_size = 4096;
-    size_t total = (size_t)NOVA_FIBER_STACK_SIZE + (size_t)page_size;
+    /* #20: 1MB usable stack + 64KB PROT_NONE guard (was 32KB + one 4KB page). Demand-zero
+       mmap => RSS is only touched pages, so the larger virtual size costs no physical memory
+       for a shallow fiber. The 64KB guard guarantees no frame can leap past it into a
+       neighbor's memory (the silent-corruption hazard). */
+    size_t total = (size_t)NOVA_POSIX_STACK_SIZE + (size_t)NOVA_POSIX_GUARD_SIZE;
 
     f->stack_mem = (uint8_t*)mmap(NULL, total, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (f->stack_mem == MAP_FAILED) { free(f); return 0; }
-    mprotect(f->stack_mem, (size_t)page_size, PROT_NONE);
+    mprotect(f->stack_mem, (size_t)NOVA_POSIX_GUARD_SIZE, PROT_NONE);
 
     f->stack_alloc = total;
     f->entry_fn = closure;
