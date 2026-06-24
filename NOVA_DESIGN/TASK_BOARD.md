@@ -45,8 +45,8 @@ Status legend: TODO · DESIGNING · CODING · GATING · BLOCKED · DONE · REVER
 ## PHASE 5 — full-parity: type-system correctness
 | # | Item | Tier | Size | Touches | Status | Owner |
 |---|------|------|------|---------|--------|-------|
-| 16 | Type-system hardening (reset unification budget, type enum payloads, spec, negative tests) | 🟡 | M | compiler | TODO | — |
-| 17 | Multi-error compilation (checker silently returns on budget exhaustion today) | 🟡 | M | compiler | TODO | — |
+| 16 | Type-system hardening (reset unification budget, type enum payloads, spec, negative tests) | 🟢 (gated strict mode shipped) | M | compiler | DONE (0a93161, gated NOVA_TI_STRICT default-OFF; TYPE_HARDENING_S16.md): closes the fail-open budget hole — unify budget was global+never-reset+silent-skip-on-exhaustion → later decls' mismatches silently became `any`→runtime (CVE class; measured: 5000 cap hit mid-self-compile, peak 9664). FIX: per-drain reset + fail-closed exhaustion (1M backstop). DEFAULT byte-identical (reconverge gen5==gen6 + 583×2); strict validated (negatives rejected E1001, math3d/complexnum clean). BONUS FINDING: strict surfaced a latent pre-existing inferer bug (IrInst ctor mis-inferred 2-arg vs 8) = the gate to default-on (tracked). | opus |
+| 17 | Multi-error compilation (checker silently returns on budget exhaustion today) | 🟢 (verified working + budget edge fixed by #16) | M | compiler | DONE (verified): the checker ALREADY accumulates all type errors into ti_errors and reports them in ONE compile — VERIFIED multi-error within a fn (_s17_probe: 3 mismatches + 2 warnings = 5 reported) AND across fns (_s17_multifn: 3 distinct E1001 in first/second/third). The board's "silently returns on budget exhaustion → ~1 error/compile" symptom WAS the fail-open budget hole, now fixed by #16 (per-drain reset under NOVA_TI_STRICT; default-mode small programs already report all). No early-return-on-first-error exists. Evidence committed (_s17_*.nova). | opus |
 
 ## PHASE 6 — full-parity: concurrency / OTP / Erlang endgame
 | # | Item | Tier | Size | Touches | Status | Owner |
