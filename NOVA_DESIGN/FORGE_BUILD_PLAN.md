@@ -1,0 +1,425 @@
+# FORGE — Build Plan
+
+> The single, decisive order of operations for building **all** of Forge. This is not a feasibility study — every layer in `FORGE_STATUS.md` is committed work, sequenced. Read `FORGE_STATUS.md` for the vision, the competitor matrix, the substrate insight, and the ground-truth inventory; read **this** for what to pick up, in what order, and how each task proves it shipped. Every task here maps to a specific edit site, a specific test, and a checkable acceptance bar. Nothing below is a maybe.
+
+---
+
+## Commitment
+
+We build the whole thing. Everything in this plan is sequencing and prerequisites — nothing more. Forge's deepest features are not inventions; they are **promotions** of NOVA runtime primitives that already ship and pass tests (`hub()`, `monitor`, `spawn`, crash isolation, bounded channels, `remote_*` channels, the struct→JSON RTTI keystone). The infrastructure that is net-new code — HTTP/2 framing, the `service`/`impl` interface surface, the WASM codegen backend — is fully scoped into ordered, independently-shippable tasks below, each with a named prerequisite. We execute layer by layer, gate by gate, until the whole vision stands.
+
+**Definition of done:** a beginner ships a full-stack, real-time, fault-tolerant, multi-protocol app in one language — and Forge beats Spring Boot, Django, and Phoenix at their own strengths (Spring's resilience+observability batteries, Django's ORM+admin, Phoenix's OTP+LiveView+real-time), with zero `.proto`, zero `settings.py`, zero reactive fork, zero sidecar, and one struct definition shared across the wire.
+
+---
+
+## How we ship every task
+
+**The gate (mandatory, every task, no exceptions):**
+
+```
+edit  →  precheck (nova_compiler.nova self-parse)
+      →  gen4 smoke (compile + run THIS task's *_test.nova)
+      →  bootstrap reconverge (gen5.ll == gen6.ll, BYTE-IDENTICAL .ll — never compare exe SHAs)
+      →  full regression (all forge_*_test.nova + core suite)
+      →  commit
+```
+
+- **Kill-on-timeout is MANDATORY** on every spawned binary. Use `Invoke-Timed` / `_proc_util.ps1`. A runaway serve loop crashed Windows before — every new test gets a bounded `serve_*_n` / explicit-stop loop guard *before* it is built.
+- **Reconverge compares `.ll` files, not exe SHAs.** clang `-O2` link is non-deterministic on Windows (same `.ll` → different exe SHA). gen5.ll == gen6.ll byte-identical is the only convergence proof.
+- **Pure-stdlib tasks** (new `forge/*.nova` functions, zero compiler change) still run the full gate — reconverge is a formality but it is run. **Compiler-touching tasks** (anything editing `nova_compiler.nova` / `nova_runtime.c`) change emitted IR, so they are sequenced last within their sprint and gated on a strict gen5.ll == gen6.ll diff before any further task builds on them.
+- **String hygiene:** in NOVA strings `{x}` interpolates. A literal brace in emitted HTTP/JSON/HTML/log templates is written `chr(123)`/`chr(125)` or by concatenation, or escaped `\{`/`\}` where the lexer supports it (see `jwt_encode` for the pattern). Never emit a bare `{`.
+- **Argument-node hygiene (codegen tasks):** never share an `Expr` AST node between an original and a rewritten call. Build fresh nodes. Sharing causes the "Stmt else is field 6 / int-literal value is `en` not the string" corruption class.
+
+**Task format legend.** Every detailed task is a row: **id** (stable handle, cite it in commits) · **WHAT** (the increment) · **WHERE** (exact file + insertion site / line anchor) · **API** (the real NOVA signature being added) · **TEST** (the `*_test.nova` that guards it) · **ACCEPTANCE** (the checkable bar — never a judgment call) · **DEPENDS-ON** (prerequisite task ids). Line anchors are tagged ground-truth from the cited revision; treat a drifted line number as "the site is real, re-locate it," never as a stale claim.
+
+---
+
+## The sprint map
+
+Order of battle: near-term, no-new-runtime value first (the front door and the cheap moats), then the infra arc that unlocks microservices, distribution, and the full-stack endgame.
+
+| Sprint | Theme | After it ships, the developer can… |
+|---|---|---|
+| **S0** | **L1 HTTP hardening** | Run a credible production server: read/idle timeouts, connection cap, graceful drain, correct `:param` decoding. No Slowloris, no accept storm, no dropped in-flight on deploy. |
+| **S1** | **L2 typed-DB front door (the keystone)** | Write the 22-line hero: `body_as<T>`, `query_as<T>`, `db.all<T>`/`find<T>`/`insert<T>`/`delete<T>`, `with tx { }`, async pool acquire, Postgres. The marquee ergonomic layer — typed, injection-safe, driver-agnostic. |
+| **S2** | **L4 OTP (the cheap moat)** | Declare supervisor trees, typed GenServers, agents, crash-safe tasks, registry, application root, and zero-infra background jobs (queue + retry + DLQ + cron + pool + nursery). |
+| **S3** | **L8 observability** | Get RED metrics + `/metrics`, `/healthz`÷`/readyz`, structured JSON logs, and W3C trace propagation through the channel hop — automatically, zero-annotation. |
+| **S4** | **L3 auth** | Stand up an explicit auth pipeline, RBAC, password hashing, OAuth2 resource-server, and an N>1-correct rate-limit owner-actor. |
+| **S5** | **L5 real-time (join-auth, presence, LiveView)** | Ship Phoenix-shaped channels with per-topic join authorization + socket assigns, live presence, and the LiveView crown jewel (per-conn process + render-differ + `on_info`). |
+| **S6** | **#8 interfaces (the infra unlock)** | Dispatch is sound (silent-0, any-bound, hash-collision closed); `service`/`impl`/`chan T` parse and type-check. Gates gRPC and distributed `service`. |
+| **S7** | **HTTP/2** | TLS+ALPN, HPACK, frame codec, flow control, multiplexed streams on the netpoller. Upgrades REST; gates gRPC. |
+| **S8** | **gRPC + GraphQL** | Service-from-types over h2 (4 call shapes, typed client), and schema-from-types GraphQL (resolvers, subscriptions, DataLoader-on-arena, depth limit) — zero `.proto`, zero `protoc`. |
+| **S9** | **Postgres-scale data + migrations** | (folded into S1 + extended here) Composable typed query DSL, migrations (derive-from-struct + rename hint), file/blob storage. |
+| **S10** | **Message queues + resilience + outbox** | One publish/consume API (NATS→Kafka→Rabbit), ack/retry/DLQ/prefetch, composable channel decorators (timeout/retry/CB/bulkhead), and the atomic outbox relay. |
+| **S11** | **Distribution L9** | Real `remote_spawn`, cluster mesh + RPC, global registry, distributed monitor+failover, cluster PubSub+Presence, rolling-restart + mTLS. |
+| **S12** | **Auto-admin from types** | Register a struct → full CRUD UI: list/search/filter/sort, FK picker, bulk actions, object-perms, inline editing + audit log. Django's moat. |
+| **S13** | **WASM frontend (the endgame)** | Compile NOVA to real WASM, run the value model in the browser, render HTML-as-fn to live DOM, and ship backend+frontend+realtime from one codebase with one shared struct definition. |
+
+The dependency spine: **S0/S1/S2/S3/S4 are independent and parallelizable** (no new runtime). **S5** needs S2's GenServer `on_info`. **S6 (interfaces) and S7 (HTTP/2) are the two independent XL prerequisites that both gate S8 (gRPC).** **S10's outbox** needs S1's `tx` + S2's supervisor. **S11** is correctly last among the server arc. **S12** needs S1's typed-DB + S4's auth. **S13's D8.1 (WASM codegen)** is the single unblocking step for the entire frontend story.
+
+---
+
+## Sprint S0 — Layer 1: HTTP hardening (no new runtime, this is the front door)
+
+**Design preamble.** The per-connection loop is `_serve_conn(conn, a, safe)` (`forge/forge.nova:3662`); every hardening task edits it or the accept loops that call it (`serve_req`/`serve_req_n`/`serve_safe_req`/`serve_safe_req_n`, `:3726–3815`). The read primitive is `recv_request_bin(conn)` (`:376`); it already enforces `_max_header()` 64 KiB (`:265`) and `_max_body()` 8 MiB (`:268`). What is missing is a **wall-clock deadline** (T1.1) and an **accept cap** (T1.3). Route params bind in `_fr_match` (`:1627`, `:param` at `:1658`, catch-all at `:1646`) and the dict path `_fr_route_dispatch` (`:1682`); neither percent-decodes — that is B2.
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T1.1** | Per-connection **read/idle timeout** (Slowloris) | `forge/forge.nova` — new `recv_request_bin_to` beside `recv_request_bin` (`:376`); wrap each `tcp_recv_bytes` in a `select_timeout` deadline | `fn _max_header_ms() -> int` (=10000); `fn _max_body_ms() -> int` (=30000); `fn recv_request_bin_to(conn, hdr_ms: int, body_ms: int)` — returns sentinel (empty bytes + `_timed_out` flag) on expiry; byte caps + `_find_header_end`/`_content_length` logic UNCHANGED | `forge_timeout_test.nova` (new) | a client that sends `"GET / HTTP/1.1\r\n"` then stalls past `hdr_ms` has its connection closed within hdr_ms+slack (loop returns, no hang under `Invoke-Timed` 5s cap); a well-behaved request still returns 200 | — |
+| **T1.2** | Wire the deadline into the **keep-alive loop** | `forge/forge.nova` — `_serve_conn` (`:3662`); replace `recv_request_bin(conn)` at `:3667` with `recv_request_bin_to(...)`; on sentinel set `alive=false` + `arena_exit(prev)` (mirror the `bytes_len(raw)==0` branch `:3668`) | (reuses T1.1) | extend `forge_timeout_test.nova` | an idle kept-alive connection past `hdr_ms` between requests is closed; the normal two-request keep-alive path still serves both (regression) | T1.1 |
+| **T1.3** | Accept-side **connection cap** (semaphore channel) | `forge/forge.nova` — helper near the accept loops (`:3726–3815`); modify `serve_req`/`serve_safe_req` loops (`:3745`/`:3807`) | `fn _max_conns() -> int` (=10000); `fn _conn_sem(n: int)` → channel pre-filled with `n` permits (mirror `forge_db.pool_open`); `recv(sem)` **before** `sched_spawn`, handler returns the permit after `_serve_conn` | `forge_connlimit_test.nova` (new) | with cap=2, a 3rd concurrent connection parks on `recv(sem)` until one of the first two finishes; no unbounded spawn under an accept storm | — |
+| **T1.4** | **Route `:param` percent-decode** (closes B2) | `forge/forge.nova` — `_fr_match` (`:1627`); `:param` bind `:1658`, catch-all bind `:1646` | `params[pn] = _pct_decode(vp, false)` and `params[cn] = _pct_decode(rest, false)` — `plus_space=false` (path segments don't treat `+` as space) | `forge_param_decode_test.nova` (new) | `/u/:id` against `/u/a%20b` binds `id=="a b"`; `/files/*p` against `/files/x%2Fy` binds the decoded `/`; existing `forge_routing_correctness_test`/`forge_group_test` still byte-identical | — |
+| **T1.5** | **Graceful drain** (stop-accept + await in-flight) | `forge/forge.nova` — `serve_req`/`serve_safe_req` loops (`:3745`/`:3807`); reuse `shutdown_requested()` (shipped) + the T1.3 semaphore as the in-flight counter | `fn _drain(listener, sem, n: int)` — on `shutdown_requested()`: stop accepting, drain the semaphore back to full (blocks until every in-flight handler released), then `tcp_close(listener)`; loops become `while shutdown_requested()==false` | `forge_drain_test.nova` (new) | after a simulated SIGTERM, the server accepts no new connection but an in-flight request runs to completion and sends its full response before the listener closes; post-drain connect refused | T1.3 |
+
+**L1 notes.** `recv_request_bin_to` is `recv_request_bin` *plus* a deadline, not a rewrite. T1.3 and T1.5 share **one** semaphore (one source of truth for "in-flight") — build T1.3 first; T1.5 reuses its permit-return as the drain countdown. Do not add a second counter.
+
+**Sprint S0 exit gate.** All five tests green + full regression byte-identical on the decode path. **New capability:** a credible production HTTP server — Slowloris-proof, accept-storm-proof, deploy-drain-safe, RFC-correct on path params. This is the floor every other sprint serves traffic through.
+
+---
+
+## Sprint S1 — Layer 2: typed data ergonomics (the marquee frontier, the hero's keystone)
+
+**Phase 0c (T2.1) is the keystone — build it first.** `<T>` does NOT flow from the call site; it flows from the **let-binding's declared type**: `let r: Result<User> = from_json_safe(s)` is rewritten to `<User>__from_json_safe(s)` in the IR-lower assign ladder at `nova_compiler.nova:8800–8838`, using the annotation captured into `params[0]` (parser `:2202`). Phase 0c **extends this exact ladder** to new wrapper call-names; it adds **no parser syntax**. Every typed wrapper (`body_as`, `query_as`, `db.all`, …) becomes "real" only once its call-name is in that ladder.
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T2.1** | **Phase 0c — let-site → callee type-arg specialization** | `nova-compiler/test_programs/nova_compiler.nova` — IR-lower assign ladder `:8800–8838` (the existing `from_json_safe`/`from_json`/`form_as` rewrites) | Extend the ladder (full algorithm below) so a let with declared `T`/`Result<T>`/`list<T>` and RHS `body_as`/`query_as`/`db_find`/`db_all` rewrites to `<T>__from_json_safe`/`<T>__from_dict`/`map(...,T__from_dict)`; **default to the SAFE Result path (B5)** | `forge_typed_wrapper_test.nova` (new, compiler-level) | `let u: Result<User> = body_as(s)` emits IR **identical** to `let u: Result<User> = from_json_safe(s)` (diff the two — identical); gen5.ll==gen6.ll | — |
+| **T2.2** | **`body_as<T>` wrapper** (safe Result default) | `forge/forge.nova` — near `body_json` (`:1772`) | `fn body_as(req: Request) -> any` — returns `req.body`/`req.raw_body`; typing happens at the let-site via T2.1 | `forge_body_as_test.nova` (new) | a valid JSON body parses into `User`; malformed JSON returns 422 (not a crash); **never** routes through raw `from_json` (B5) | T2.1 |
+| **T2.3** | **`query_as<T>`** (name-keyed, safe) | `forge/forge.nova` — near `req_query` (`:1954`) | `fn query_as(req: Request) -> dict` — returns `req.query`; `let f: Result<Filter> = query_as(req)` → `<Filter>__from_dict(req.query)` (`__from_dict` already generated `:3583`) | `forge_query_as_test.nova` (new) | `?min=10&active=true` against `struct Filter{min:int,active:bool}` binds `min==10`,`active==true`; missing required field → `err` (fail-closed, 422) | T2.1 |
+| **T2.4** | **`db.all<T>` / `db.find<T>`** typed-row mapping | `forge/forge_db.nova` — beside `pool_query_dicts` (`:40`) | `fn db_all(pool, table: string) -> list`; `fn db_find(pool, table: string, id) -> dict`; let-site `list<Todo>`/`Result<Todo>` rewrite to `map(rows, Todo__from_dict)` / `Todo__from_dict(row)` via T2.1 | `forge_typed_db_test.nova` (new) | a `Todo` table round-trips: `db.all` returns `list<Todo>` with correctly typed fields (int `id`, bool `done` from text columns via `__from_dict`); `db.find` of a missing id → `err` | T2.1 |
+| **T2.5** | **`db.insert<T>` / `db.delete<T>`** via field-meta | `forge/forge_db.nova` — beside `pool_insert` (`:57`) | `fn db_insert(pool, table: string, row) -> int` — uses `field_names`/`field_types` (RTTI `:3890`/`:3877`) to build `INSERT INTO t (cols) VALUES (?,?...)` with positional params; `fn db_delete(pool, table: string, id) -> int` → parameterized `DELETE ... WHERE id=?` | extend `forge_typed_db_test.nova` | `db.insert(pool,"todos",Todo{...})` writes a row whose columns equal the struct fields (no value string-concat → injection-safe), returns `last_insert_rowid`; `db.delete` removes by id, returns affected count | — |
+| **T2.6** | **Async pool acquire-park** | `forge/forge_db.nova` — `pool_acquire` (`:22`, already `recv(pool)` which parks) + bounded timeout | `fn pool_acquire_to(pool, ms: int) -> Result` — `select_timeout`-bound `recv`; timeout → `err("pool acquire timeout")`; `fn pool_open_sized(path, n, max_wait_ms)` | `forge_pool_park_test.nova` (new) | with a 1-conn pool + 2 green tasks, the 2nd parks (doesn't spin a carrier) until the 1st releases; an acquire past `ms` returns `err` not a hang (under `Invoke-Timed`) | — |
+| **T2.7** | **Lexical `with tx { }`** sugar | parser `nova_compiler.nova` (`with`/`else` desugar) + `forge/forge_db.nova` `tx` (`:74`) | parse `with tx = db.begin() { stmts }` → acquire, `BEGIN`, run, `COMMIT` on normal exit / `ROLLBACK` on panic, `send(pool,db)` always; `fn tx_begin(pool)` / `tx_commit` / `tx_rollback` backing | `forge_with_tx_test.nova` (new) | two inserts in `with tx { }` commit atomically; a panic mid-block rolls back (row count unchanged) and the connection returns to the pool (no leak) — no proxy/self-invocation trap | T2.1 |
+| **T2.8** | **PostgreSQL driver + pool** via `@link` | new `forge/forge_pg.nova` (mirrors `forge_db.nova`); `output/nova_runtime.c` only if a thin libpq shim is needed | `fn pg_open(conninfo: string) -> int` (`@link PQconnectdb`); `fn pg_query(db, sql, params) -> list` (`PQexecParams`, parameterized); `fn pg_pool_open(conninfo, n)` returning the **same channel-of-handles shape** as `pool_open` | `forge_pg_test.nova` (new, env-gated; skips if no local PG) | the **same** `db.all<Todo>`/`db.insert`/`with tx` code (T2.4/5/7) runs against Postgres with only `pool_open`→`pg_pool_open` swapped — proving the typed layer is driver-agnostic | T2.4, T2.5, T2.7 |
+
+### Phase 0c (T2.1) — exact compiler change, junior-implementable
+
+**File:** `nova-compiler/test_programs/nova_compiler.nova`. **Function:** the IR-lower `"assign"` branch, lines **8789–8857**. **Do not touch the parser.**
+
+**What exists now (the pattern you extend):** inside `match params[0] { Param(fj_pn, fj_pt, fj_pd) => ... }`:
+- `fj_pt` is `Result<T>`, `T ∈ ir_sdefs` → `match expr { Expr(fs_et, fs_ev, ...) }` tests `fs_ev`:
+  - `"from_json_safe"` → `eff_expr = Expr("call", fj_inner + "__from_json_safe", ...)` (`:8816`)
+  - `"form_as"` → `eff_expr = Expr("call", fj_inner + "__from_dict", ...)` (`:8819`)
+- `fj_pt` bare struct `T ∈ ir_sdefs` → `"from_json"` → `Expr("call", fj_pt + "__from_json", [json_decode(arg)], ...)` (`:8834`).
+
+**The change — three additive cases, no removals:**
+
+1. **`body_as` (Result<T> arm, beside `:8816`):**
+   ```
+   else if fs_et == "call" and fs_ev == "body_as"
+       eff_expr = Expr("call", fj_inner + "__from_json_safe", fs_en, fs_ec, fs_ef, fs_el)
+       fj_force_any = 1
+   ```
+   Pass `fs_ec` (the call's args, `[req]`/`[req.body]`) straight through, exactly as the `from_json_safe` line does. `fj_force_any=1` keeps the slot `Result`-typed so the downstream `match r { Ok/Err }` dispatches (preserve the `:8804` comment).
+
+2. **`query_as` (Result<T> arm, beside `:8819`):**
+   ```
+   else if fs_et == "call" and fs_ev == "query_as"
+       eff_expr = Expr("call", fj_inner + "__from_dict", fs_en, fs_ec, fs_ef, fs_el)
+       fj_force_any = 1
+   ```
+   `__from_dict` is already generated for every struct (`_make_from_dict`-family, `:3942`) — the name-keyed `{string:string}`→struct path, exactly what `req.query` is.
+
+3. **`db.find` / `db.all` (two declared forms):**
+   - **`Result<T>` (`db.find`):** `else if fs_et == "call" and fs_ev == "db_find"` → `<T>__from_dict` on the row dict (same shape as `query_as`).
+   - **`list<T>` (`db.all`):** a *new declared-type shape*. The `Result<` test is at `:8801`; add a sibling `else if` on `fj_pt` detecting `fj_pt[0:5] == "list<"` with inner `T ∈ ir_sdefs`; when `fs_ev == "db_all"`, rewrite to a `map`:
+     ```
+     // eff_expr = map(db_all_rows(...), fn(r) T__from_dict(r))
+     let lam = Expr("lambda", "", 0,
+                    [Expr("call", inner + "__from_dict", 0, [Expr("ident","r",0,[],[],ln)], [], ln)],
+                    [Param("r","dict",null_expr())], ln)
+     eff_expr = Expr("call", "map", 0, [original_db_all_call, lam], [], ln)
+     ```
+     Copy the lambda Expr construction the codebase already uses for `list<Struct>` mapping in `_make_from_json_method` (`:3488–3489`) — the proven pattern. Then record the element struct type so JSON egress recurses: set `b.ir_list_elem_stype[name] = inner` after the `slot_store` (mirror `:8786`).
+
+**Argument-node hygiene (load-bearing):** never share an `Expr` node between original and rewrite. Build a *fresh* `Expr("ident","r",...)` for the lambda param — do not reuse a node from `fs_ec`. Sharing causes the "Stmt else is field 6 / int-literal value is `en`" corruption.
+
+**Why this is sound and minimal.** Every rewrite is purely additive — new `else if` arms in a chain whose `else` is "leave `eff_expr = expr` unchanged." A program not using these wrappers at a typed let is **byte-identical** (gen5.ll==gen6.ll proves it). The wrappers are ordinary NOVA fns returning `any`/`dict`/`list`; used without a typed let they still work untyped, with no crash path and no raw-`from_json` exposure (B5 closed by construction — `body_as`'s only rewrite target is `__from_json_safe`, never `__from_json`).
+
+**Falsification:** if `forge_typed_wrapper_test.nova`'s emitted IR for `let r: Result<User> = body_as(s)` is **not identical** to the `from_json_safe` form, the rewrite is mis-wired. If reconverge gen5.ll != gen6.ll, an `Expr` node was shared or a stale list-elem-type was left set. Both checkable.
+
+**Sequencing within S1:** T2.1 → (T2.2, T2.3 parallel) → T2.4 → T2.5 → T2.6 → T2.7 → T2.8.
+
+**Sprint S1 exit gate.** `forge_typed_wrapper_test` proves byte-identical IR; the hero's routes (`db.all<Todo>`, `db.insert(req.body_as<Todo>())`, `db.find<Todo>`, `db.delete<Todo>`) run against both SQLite and Postgres. **New capability: the 22-line hero compiles and runs for real** — typed in, typed rows, typed out, injection-safe, driver-agnostic, with `with tx { }` atomicity.
+
+---
+
+## Sprint S2 — Layer 4: OTP / fault tolerance (the cheap moat)
+
+**Substrate (all shipped + tested):** `spawn`/`channel()`/`send`/`recv`; `monitor(p)` → channel firing 0(normal)/1(abnormal); `exit_reason(p)`; contained `panic` (per-process `exit_status=1`); `channel_bounded(n)`; `atomic_new/add/get`; `type_of(v)` (the RTTI tag for typed dispatch buildable today); `time_ms()`. Prototypes to promote: `supx.nova`, `otp.nova`, `actorx.nova`, `nurseryx.nova`, `futurex.nova`, `poolx.nova`, `queuex.nova`, `cronx.nova`. **All Layer-4 lands in one new module `forge/forge_otp.nova`** (installed to `lib/`, mirrored to `test_programs/` for tests), re-exported from `forge.nova` near `fn hub()` (`:1422`) / `fn app()` (`:1573`) so callers write `forge.supervisor(...)`. **Honest precondition:** supervised restart only recovers if state is **externalized** (DB/Agent) — the Application root holds the Registry so restarted children re-acquire dependencies.
+
+### S2a — Supervisor
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T4.1** | Supervisor object + child-spec accumulation | `forge_otp.nova`, `// ── Supervisor ──` (promotes `supx.nova`); re-export stubs near `forge.nova:1422` | `sup_new(strategy, max_restarts, in_seconds) -> Sup`; `child_add(sup, name, start_fn, restart, shutdown_ms) -> int` (restart ∈ permanent/transient/temporary) | `forge_sup_spec_test.nova` | 3 children → `sup_child_count==3`; each spec's `name`/`restart` round-trips | — |
+| **T4.2** | `one_for_one`: spawn+`monitor` each, respawn failed child by policy | same section, `sup_run_one_for_one` (promotes `supcrash_test` loop) | `sup_start(sup) -> int`; internal `_sup_spawn_child(sup, idx)` | `forge_sup_one_for_one_test.nova` | a child panicking on attempts 0,1 (atomic-gated) then succeeding is respawned exactly twice; `transient` exiting normal is NOT respawned; `temporary` never | T4.1 |
+| **T4.3** | `one_for_all` + `rest_for_one` | same section, `sup_apply_strategy` (promotes `sup_strategies_test`) | extend `sup_start`; internal `_sup_restart_set(sup, failed_idx, strategy)` | `forge_sup_strategies_test.nova` | one_for_all re-runs ALL; rest_for_one re-runs failed + all started after (runs-per-child `[1,2,2]` for a flaky middle child) | T4.2 |
+| **T4.4** | Restart-intensity window + escalation | same section, `sup_check_intensity` (ring of `time_ms()` timestamps) | internal `_sup_record_restart(sup) -> int` | `forge_sup_escalate_test.nova` | an always-panic child under `max_restarts:2,in_seconds:5` makes the supervisor task exit abnormal; a parent supervisor observes exit_status==1 | T4.2 |
+| **T4.5** | Named strategy + restart idents (not strings) | `nova_compiler.nova`, type-reg near `channel_bounded`/`monitor` registration | `one_for_one`/`one_for_all`/`rest_for_one` + `permanent`/`transient`/`temporary` as int-valued consts mapped to the string contract | `forge_sup_idents_test.nova` | `forge.supervisor(strategy: one_for_one, ...)` runs identically to the string form; precheck + gen4 + gen5.ll==gen6.ll clean | T4.3 |
+| **T4.6** | Keyword-arg surface for child specs | `nova_compiler.nova`, call-site arg-binding (validate the `name:` kw path) | `forge.child(sup, "import", fn() -> run_import(), restart: transient, shutdown_ms: 5000)` | `forge_sup_kwargs_test.nova` | the §7 supervisor sketch compiles verbatim; omitted kw fall to defaults (`restart`→permanent, `shutdown_ms`→5000); reconverge clean | T4.5 |
+
+`shutdown_ms` is recorded but **advisory** (NOVA has no preemptive kill — "let it crash"); it bounds a *cooperative* drain only — document as best-effort, never claim force-terminate.
+
+### S2b — GenServer (typed-message dispatch)
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T4.7** | GenServer core loop (state-threading receive behind a request channel) | `forge_otp.nova`, `// ── GenServer ──` (promotes `otp.nova:gen_start`/`actorx.nova`) | `server(initial_state) -> Srv` | `forge_server_basic_test.nova` | a counter server handles in-order `call`s race-free | T4.1 |
+| **T4.8** | Type-dispatched handlers via RTTI (`type_of(msg)`, not string keys) | same section, `_gen_dispatch(srv, msg)` | `on_call(srv, MsgType, fn(s,m)->reply)`; `on_cast(srv, MsgType, fn(s,m)->unit)` | `forge_server_typed_test.nova` | `AddItem`/`Clear` dispatch to distinct handlers; an unregistered struct type returns a typed `err`, never silent-0 (closes the #8 hazard) | T4.7 |
+| **T4.9** | `set_state` + reply protocol | same section | `set_state(new_state)`; `call(srv, msg) -> reply`; `cast(srv, msg) -> unit` | `forge_server_state_test.nova` | `call(cart, AddItem{...})` returns the reply and the next `call` sees mutated state; `cast` returns immediately, state still advances | T4.8 |
+| **T4.10** | `on_info` (out-of-band: monitor DOWN, PubSub, timer) | same section; gen loop `else`-branch routes non-{call,cast,stop} to info | `on_info(srv, fn(s, msg)->unit)`; envelope kind `"info"` | `forge_server_oninfo_test.nova` | a monitored child's DOWN signal forwarded into the server hits `on_info` and mutates state — the load-bearing hook for LiveView/Presence | T4.9 |
+| **T4.11** | `on_terminate` cleanup (on stop + abnormal exit) | same section; `gen_stop` calls terminate; a wrapper task monitors the server and invokes terminate with the exit reason on crash | `on_terminate(srv, fn(s, reason)->unit)`; `stop(srv) -> unit` | `forge_server_terminate_test.nova` | clean `stop` runs terminate reason "normal"; a panicking handler runs terminate with the `exit_reason` panic reason | T4.10, T4.4 |
+
+**Frozen envelope:** `{kind:"call"|"cast"|"info"|"stop", tag:<type-name>, msg:<struct>, reply:<chan|0>}` — `tag` carried so the dispatcher needn't re-derive `type_of` on the hot path. `reply` vs `set_state` split is intentional (no ad-hoc `{state,reply}` dict). Once #8 (S6) lands, `forge.server` upgrades to typed `impl`-style methods with no runtime tag — keep the envelope stable so it is source-compatible.
+
+### S2c — Agent / Task / async→await
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T4.12** | `forge.agent` — single-value state cell | `forge_otp.nova`, `// ── Agent ──` (on T4.7) | `agent(init) -> Ag`; `agent_get(ag)`; `agent_update(ag, fn(v)->v)`; `agent_get_and(ag, fn(v)->[v,r]) -> r` | `forge_agent_test.nova` | `agent_update(a, fn(x) x+1)` then `agent_get` returns the increment; 3 concurrent updaters serialize (no lost update) | T4.9 |
+| **T4.13** | `forge.task`/`forge.async`→`await` crash-safe sugar | `forge_otp.nova`, `// ── Task/Future ──` (promotes `futurex.nova`) | `async(fn()->T) -> Future<T>`; `await(f) -> Result<T>` (child panic → `err(reason)` via `monitor`); `await_all(fs)`; `task_then`/`task_map` | `forge_task_test.nova` | `(10+1)*2==22` chain; `async(fn() panic("x"))` awaited returns `err` containing "x" instead of crashing the awaiter — the crash-safe upgrade over raw `futurex` | T4.11 |
+
+### S2d — Registry + Application root
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T4.14** | `forge.registry` — name→pid map, serialized | `forge_otp.nova`, `// ── Registry ──` (promotes `otp.nova:registry_start`) | `registry() -> Reg`; `reg_put(reg, name, pid)`; `reg_get(reg, name) -> pid_or_0`; `reg_drop(reg, name)` | `forge_registry_test.nova` | register two named servers, look both up; absent name → 0; a server that exits is auto-dropped via `on_info` DOWN (uses T4.10) | T4.10 |
+| **T4.15** | `forge.application` root (top-level supervisor + registry) | `forge_otp.nova`, `// ── Application ──`; ties T4.4 + T4.14 | `application(name) -> App`; `app_supervisor(app)`; `app_registry(app)`; `app_start(app)`; `app_stop(app)` | `forge_application_test.nova` | `app_start` brings up root supervisor + registry; all declared children running + discoverable by name; `app_stop` runs every `on_terminate` in reverse start order | T4.4, T4.11, T4.14 |
+
+### S2e — Local background jobs
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T4.16** | `forge.jobs` — bounded-channel queue + worker drain | `forge_otp.nova`, `// ── Jobs ──` (queue from `queuex.nova`, transport `channel_bounded`) | `jobs(capacity) -> Jobs`; `enqueue(jq, kind, payload) -> int` (0 if full); `jobs_run(jq, num_workers, handler) -> int` | `forge_jobs_basic_test.nova` | N jobs drained by workers, each processed exactly once; enqueue past `capacity` returns 0 (back-pressure) | T4.1 |
+| **T4.17** | Retries with backoff + DLQ | same section; per-job attempt counter + `time_ms()` backoff; worker wraps handler in `monitor` | `enqueue_ex(jq, kind, payload, max_attempts) -> int`; `jobs_dlq(jq) -> list`; `_job_retry_delay(attempt)` (exp) | `forge_jobs_retry_test.nova` | a job failing twice then succeeding runs 3×; failing `max_attempts` → DLQ with last error; a panicking handler is retried (not lost) | T4.16, T4.13 |
+| **T4.18** | `forge.cron` — schedule a job on a cron expr | same Jobs section (parse/match from `cronx.nova`); a spawned ticker | `cron(jq, expr, kind, payload) -> int`; `_cron_tick(jq)`; `cron_due(parsed, now_fields) -> bool` | `forge_cron_test.nova` | `"*/15 * * * *"` parses to 4 minute-slots; a 1-minute simulated clock fires on matching minutes and enqueues | T4.16 |
+| **T4.19** | `forge.pool` — fixed worker/connection pool | `forge_otp.nova`, `// ── Pool ──` (promotes `poolx.nova`) | `pool(create_fn, size) -> Pool`; `pool_acquire`/`pool_release`; `pool_with(p, fn(item)->r) -> r` | `forge_pool_test.nova` | acquire/release correct; `pool_with` auto-releases; acquiring beyond size blocks until release | T4.1 |
+| **T4.20** | `forge.nursery` — structured concurrency scope | `forge_otp.nova`, `// ── Nursery ──` (promotes `nurseryx.nova`, crash-safe via `monitor`) | `nursery() -> Nur`; `nursery_go(nur, fn()->r)`; `nursery_join(nur) -> list` | `forge_nursery_test.nova` | 3 children complete before `nursery_join` (sum==60); if any panics, `nursery_join` still returns (its slot = `err(reason)`), no orphan | T4.13 |
+
+The cron ticker loop **must** be bounded by an explicit `running` flag with a stop path (kill-on-timeout discipline); tests use a simulated clock, never a wall-clock sleep loop.
+
+**Sprint S2 exit gate.** All `forge_sup_*`/`forge_server_*`/`forge_agent`/`forge_task`/`forge_registry`/`forge_application`/`forge_jobs_*`/`forge_cron`/`forge_pool`/`forge_nursery` tests green, plus the existing `green_supervisor_test`/`supcrash_test`/`green_monitor_test`/`crash_isolation_test`/`actorx`/`otp_lib_test`/`workerx`/`nurseryx`/`futurex`/`poolx`/`queuex`/`cronx`/`sup_strategies_test`. Only T4.5/T4.6 touch the compiler — sequence them last in S2a, behind a clean gen5.ll == gen6.ll diff. **New capability:** declarative OTP — supervisor trees, typed GenServers (with the `on_info` hook LiveView depends on), agents, crash-safe tasks, an application lifecycle, and zero-infra background jobs.
+
+---
+
+## Sprint S3 — Layer 8: observability (automatic, zero-annotation)
+
+**Insertion points (verified `forge/forge.nova`):** `mw_request_id`/`_t_request_id` (`:3570`/`:3563`), `mw_access_log`/`_t_access_log` (`:3629`/`:3624`), `health_route` (`:3610`, `Health` struct `:3604`), `_dispatch_terminal`/`_fr_route_dispatch` (`:1682`), `req.state` dict, `json_obj`/`json_stringify` (`:260`), `time_ms()`. Daemons model on `_hub_loop` request/reply (`:1443`) for single-owner N>1-safety.
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T8.1** | RED metrics registry (counter/histogram by method+route + in-flight gauge), single-owner daemon | `forge.nova`, `// ── Metrics ──` after `mw_access_log` (`:3630`); `_metrics_loop(cmd)` + `metrics_registry()` | `metrics_registry()`; `metric_observe(reg, method, route, status, latency_ms)`; `metric_inflight(reg, delta)` | `forge_metrics_test.nova` (new) | after 3 observed requests: count==3, a latency histogram with 3 bucketed samples, in-flight back to 0 | — |
+| **T8.2** | `mw_metrics(reg)` middleware (in-flight + count+latency+status) | beside `mw_access_log` (`:3629`); route label from `req.state["route"]` | `mw_metrics(reg)` returning `fn(req, next)` | `forge_metrics_test.nova` | a 3-request mock dispatch leaves count==3 for the route + latency ≥ 0; a 500 route is counted with status 500 | T8.1 |
+| **T8.3** | Set `req.state["route"]` to the matched **pattern** | `_dispatch_terminal` + `_fr_route_dispatch` (`:1682`): write `req.state["route"]=rt[1]` before the handler | (internal) | `forge_metrics_test.nova` | `/users/1` and `/users/2` on `/users/:id` aggregate under ONE label, count==2 | T8.2 |
+| **T8.4** | `/metrics` Prometheus text exposition | Metrics section; `get(a,"/metrics",...)` → `resp_text(200, body)` ctype `text/plain; version=0.0.4` | `metrics_route(a, reg)` | `forge_metrics_test.nova` | `GET /metrics` → 200 body containing `http_requests_total{` + `http_request_duration` lines, valid sample value | T8.3 |
+| **T8.5** | `/healthz` liveness (no dependency checks) | augment `health_route` (`:3610`), reuse `Health` (`:3604`) | `healthz_route(a)` → `GET /healthz` → 200 `{"status":"ok"}` | `forge_health_test.nova` (new) | `GET /healthz` → 200 unconditionally; documented as liveness | — |
+| **T8.6** | `/readyz` readiness (registered checks; any `Err`→503) | Health section beside T8.5; `a["ready_checks"]` | `ready_check(a, name, check)`; `readyz_route(a)` | `forge_health_test.nova` | a check returning `err("db")` → 503 naming the failed check; all `ok()` → 200 — proving `/readyz` ≠ `/healthz` | T8.5 |
+| **T8.7** | Structured JSON logging | `// ── Structured logging ──` near `mw_access_log`; honor `logx` env-level | `log_json(level, msg, fields)` — one JSON object per line via `json_stringify` | `forge_logjson_test.nova` (new) | output is exactly one valid JSON line with `level`/`msg`/`ts` + caller fields; a quoted value escapes correctly (parses back via `json_decode`) | — |
+| **T8.8** | W3C `traceparent` extract/inject | extend `_t_request_id` (`:3563`) → add `_t_trace`/`mw_trace`; `req.state["trace_id"]` = 16-byte hex | `mw_trace()`; `trace_id(req) -> string`; `_parse_traceparent(h) -> dict` | `forge_trace_test.nova` (new) | inbound `traceparent: 00-<32hex>-<16hex>-01` parsed; same `trace_id` in `req.state` + echoed response header; absent header mints a valid 32-hex id | — |
+| **T8.9** | Bind `trace_id` into structured logs | `_t_access_log` (`:3624`) emits via `log_json` incl. `trace_id`; `log_json` accepts a current-trace binding | (rewires `_t_access_log`) | `forge_trace_test.nova` | an access-log line under `mw_trace`+`mw_access_log` is JSON carrying the same `trace_id` the response echoed | T8.7, T8.8 |
+| **T8.10** | Propagate trace across the **channel hop** | `Traced{trace_id, payload}` envelope + `trace_send`/`trace_recv`; relies on channel deep-copy (commit 0e8cdce) | `trace_send(ch, req, payload)`; `trace_recv(ch) -> {trace_id, payload}` | `forge_trace_hop_test.nova` (new) | a spawned worker receiving a `trace_send`'d payload reads the SAME `trace_id` as the originating request | T8.8 |
+
+**Ordering rule (encode in doc comments):** `mw_trace` (T8.8) must run before `mw_metrics`/`mw_access_log` so `req.state["trace_id"]` and `["route"]` are populated when they read them.
+
+**Sprint S3 exit gate.** All metrics/health/logjson/trace tests green; the registries are single-owner (N>1-safe by construction). **New capability:** RED metrics + `/metrics`, distinct liveness/readiness, JSON logs, and trace context that survives the channel hop — automatic, the thing Spring loses across async.
+
+---
+
+## Sprint S4 — Layer 3: auth (beat Spring Security)
+
+**Insertion points:** after the JWT block (`jwt_verify` `:2673`), `session_get` (`:2445`), `_ct_eq` (`:2408`), `_csrf_rand_hex`/`secure_bytes` (`:2467`), `req_header` (`:1946`), `mw_rate_limit`/`_t_rate_limit` (`:3598`/`:3578`), `group(app, prefix)` (`:1592`), `req.state` dict.
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T3.1** | `mw_auth` pipeline (explicit, debuggable) | `// ── Auth pipeline ──` after L2700+; `_t_auth(req, next, resolver)` + `mw_auth(resolver)` | `mw_auth(resolver)` where `resolver: fn(req) -> Result<User>`; sets `req.state["user"]` on `Ok`, absent on `Err` | `forge_auth_test.nova` (new) | a valid session/JWT populates `req.state["user"]`; an invalid token leaves it absent + chain continues (the route guard, not the resolver, decides 401) | — |
+| **T3.2** | Users/groups/permissions model (structs) | Auth section | `type User{id, username, password_hash, roles:list}`, `type Group{name, perms:list}`; `user_has_role(u, role) -> bool`; `user_has_perm(u, groups, perm) -> bool` | `forge_rbac_test.nova` (new) | `user_has_role` true for assigned, false else; `user_has_perm` resolves transitively through the user's groups | — |
+| **T3.3** | Persisted users/groups via `forge_db` | `forge/forge_db.nova`; rows↔`User`/`Group` (typed `query_as<T>` once S1 lands; `row_dict` until then) | `user_create(pool, username, password_hash, roles) -> Result<int>`; `user_by_username(pool, username) -> Result<User>` | `forge_rbac_test.nova` | create then look up round-trips (id, username, roles) through SQLite; missing user → `err` not crash (fail-closed) | T3.2 |
+| **T3.4** | Route-level `requires(role)` guard | Auth section; `_t_requires(req, next, role)` + `mw_requires(role)`; depends on `mw_auth` running first | `requires(role)` (returns the guard mw); usable per-group via `group(app, prefix)` | `forge_auth_test.nova` | no role → 403, handler never runs; with role → through; missing `req.state["user"]` → 401 (fail-closed, surfaces misconfig) | T3.1, T3.2 |
+| **T3.5** | Password hashing (PBKDF2-HMAC-SHA256) | Auth section; on bundled `hmac_sha256` + `secure_bytes`; constant-time via `_ct_eq`; encoded `pbkdf2$iters$salt$hash` | `password_hash(pw) -> string`; `password_verify(pw, encoded) -> bool` | `forge_password_test.nova` (new) | `password_verify(pw, password_hash(pw))` true; wrong pw false; two hashes of the same pw differ (unique salt); verify uses `_ct_eq` (no early exit) | — |
+| **T3.6** | Upgrade-on-login rehash hook | beside T3.5 | `password_needs_rehash(encoded) -> bool` | `forge_password_test.nova` | a hash below the current iteration target → true; a current-default hash → false | T3.5 |
+| **T3.7** | OAuth2 resource-server `validate` | Auth section; reads `Authorization: Bearer` (`req_header`), delegates to `jwt_verify`; usable as `mw_auth` resolver | `oauth2_validate(req, secret, audience) -> Result<dict>`; `require_scope(claims, scope) -> bool` | `forge_oauth2_test.nova` (new) | Bearer JWT with matching `aud` + scope → `Ok(claims)`; wrong aud / missing scope / tampered token → `Err` (rides hardened `jwt_verify`) | T3.1 |
+| **T3.8** | **Local rate-limit owner-actor** (closes B8) | beside `mw_rate_limit` (`:3598`); `_ratelimit_loop(cmd)` owns `{key→[count, window_start]}`, modeled on `_hub_loop`/`hub_count` (`:1443`) | `rate_limiter()` (spawns owner); `mw_rate_limit_actor(reg, lim, window_ms)` sends `["hit", key, now]`, gets allow/deny | `forge_ratelimit_actor_test.nova` (new) | under limit → 200, over → 429; from 4 concurrent tasks hammering one key the deny count is exactly `total - lim` (single-owner correct); existing `forge_ratelimit_test` still passes | — |
+
+**Ordering rule (doc comments):** `mw_auth` (T3.1) must run before `requires` (T3.4).
+
+**Sprint S4 exit gate.** All auth/rbac/password/oauth2/ratelimit-actor tests green; the limiter is N>1-correct. **New capability:** an explicit, debuggable auth pipeline (no 12-filter "why 403?" maze), RBAC, sound password hashing, OAuth2 resource-server, and a rate limiter that holds under multiple carriers.
+
+---
+
+## Sprint S5 — Layer 5: real-time (join-auth, presence, LiveView)
+
+**Insertion points (verified):** `ws`/`ws_room`/`ws_room_ex` (`:908`/`919`/`930`), `_ws_lookup` (`:938`), `_ws_run`/`_ws_run_room` (`:1135`/`1170`, hooks `on_join` `:1183` / `on_leave` `:1195`), `_serve_conn` WS-upgrade (`:3676`), `hub`/`_hub_loop`/`hub_sub`/`hub_pub`/`hub_unsub`/`hub_count` (`:1382–1450`), `room_say` (`:1205`), `Ws` struct (`:866`), `get` (`:1611`). **Depends on S2's GenServer `on_info` (T4.10)** for presence membership events and LiveView server-push.
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **T5.1** | Topic registry + `forge.pubsub()` (one bus fans many topics) | `// ── Topic PubSub ──` after `room_say_bin` (`:1210`) | `type Bus{cmd, topics}`; `pubsub() -> Bus` (spawns a `_hub_loop`-style daemon keyed by topic) | `forge_pubsub_test.nova` (new) | a subscriber on `"room:a"` does NOT receive a publish to `"room:b"` (topic isolation) | — |
+| **T5.2** | `broadcast`/`subscribe`/`unsubscribe` (topic-scoped) | same section; daemon loop switches on `c[0]` op AND `c[1]` topic | `broadcast(bus, topic, msg)`; `subscribe(bus, topic, outbound)`; `unsubscribe(bus, topic, id)` | `forge_pubsub_test.nova` | publish to `"room:lobby"` reaches exactly its 2 subscribers; a 3rd on another topic gets 0; `try_send` slow-consumer drop preserved | T5.1 |
+| **T5.3** | Socket `assigns` (per-conn scratch on `Ws`) | extend `Ws` (`:866`) with `assigns: any`; init `{}` at both `Ws(...)` (`:1140`/`:1176`) | `ws_assign(ws, key, value)`; `ws_get(ws, key)` | `forge_ws_assigns_test.nova` (new) | a value written in `on_join` is readable in `on_msg` for the same conn; two conns have independent assigns | — |
+| **T5.4** | Per-topic **join authorization** route | new fn beside `ws_room_ex` (`:930`); 6-element ws route `[pattern, on_msg, hub, on_join, on_leave, authorize]` | `channel(a, pattern, hub, authorize, on_join, on_msg, on_leave)`, `authorize: fn(req, topic) -> Result` | `forge_channel_auth_test.nova` (new) | an `authorize` returning `err(403)` never reaches `on_join`/`on_msg`, socket closed WS 4403; `ok()` lets messages flow | T5.3 |
+| **T5.5** | Enforce authorize at handshake (pre-101) | `_serve_conn` WS-upgrade (`:3676–3684`): after `_ws_lookup`, if route len==6 call `authorize(req, topic)` BEFORE `ws_handshake` | internal `_ws_authorize(route, req) -> Result` | `forge_channel_auth_test.nova` | a failing-authorize upgrade gets HTTP 403, no 101; a passing one gets 101 + runs `_ws_run_room` — over a real `serve_safe_req_n` socket round-trip, bounded N | T5.4 |
+| **T5.6** | Default-safe: no-authorize topic outside allowlist = reject | in `_ws_authorize` (T5.5): no authorize AND pattern not in `a["ws_public_prefixes"]` → `err(403)`; add `ws_public(a, prefix)` | `ws_public(a, prefix)` | `forge_channel_auth_test.nova` | `ws_room` on `"room:*"` with no authorize + no `ws_public` is rejected at upgrade; after `ws_public(app, "room:")` it is accepted | T5.5 |
+| **T5.7** | Presence GenServer (`{topic→{key→meta}}`, request/reply) | `// ── Presence ──`; `_presence_loop(cmd)` + `presence()` (modeled on `_hub_loop` + `hub_count`) | `presence()`; `track(p, topic, key, meta)`; `untrack(p, topic, key)`; `list_presence(p, topic) -> list` | `forge_presence_test.nova` (new) | 3 `track` then 1 `untrack` on `"room:lobby"` → exactly the 2 remaining `{key, meta}`; concurrent track from 2 tasks race-free (single owner) | T5.1 |
+| **T5.8** | Wire presence into the `channel` lifecycle | `_ws_run_room` (`:1170`): call presence track/untrack in the `on_join` (`:1183`) / `on_leave` (`:1195`) arenas when the route carries a presence handle | (extends route tuple; internal) | `forge_presence_test.nova` | a client appears in `list_presence` while connected, disappears after disconnect — over a `serve_safe_req_n` WS round-trip, bounded N | T5.4, T5.7, T5.3 |
+| **T5.9** | LiveView per-conn scaffold | `// ── LiveView ──`; reuse `_ws_run`-style per-conn loop (`:1135`) + HTTP route (`get`, `:1611`) | `live(a, pattern, mount, on_event, render)` — `mount: fn(req)->State`, `on_event: fn(State, ev)->State`, `render: fn(State)->string` | `forge_liveview_test.nova` (new) | GET → full HTML containing `render(mount(req))`; a WS `inc` event drives `on_event` and the new state's render is produced (no diff yet) | T5.3, T5.4 |
+| **T5.10** | LiveView **render-differ** | LiveView section; `_live_diff(prev_html, new_html) -> list` of `[marker, newvalue]`; called in the WS event loop | `_live_diff(prev, new) -> list` (internal) | `forge_liveview_diff_test.nova` (new) | for a counter render, an `inc` sends ONLY the changed numeric segment (diff list length==1, marker identifies the span), not the whole body | T5.9 |
+| **T5.11** | LiveView `on_info` (PubSub → re-render) | LiveView WS loop; optional `on_info: fn(State, msg)->State` + a `subscribe`d outbound `select`ed alongside the frame read — the per-conn analog of the GenServer `on_info` hook (T4.10) | `live(a, pattern, mount, on_event, render, on_info)` | `forge_liveview_info_test.nova` (new) | a `broadcast` to the live route's topic drives `on_info`, producing a new render diffed (T5.10) + pushed to the client — over a bounded `serve_safe_req_n` round-trip | T5.10, T5.2, T4.10 |
+
+**Sprint S5 exit gate.** All pubsub/ws-assigns/channel-auth/presence/liveview tests green over real bounded socket round-trips; the 62 existing `forge_*_test` stay green. **New capability:** Phoenix-shaped real-time — join-authorized channels with socket assigns, live presence, and LiveView (per-conn process + render-differ + server-push) — same language, same runtime, no Redis/ASGI fork.
+
+---
+
+## Sprint S6 — Interfaces #8 (the infra unlock: gates gRPC + distributed `service`)
+
+**Ground truth:** dispatch table at `nova_compiler.nova:17009–17026` (`mdt_collect` → `b.ir_method_dispatch`, entries `[type_name_hash(type), fn_name, arity]`, stored only when `len(impls) > 1`). Dynamic dispatch emission `:8082–8153` (`nova_rt_type_hash` → linear hash-compare → `disp_slot`, default seeded `0` `:8097–8099`, no-fallback panic "#8 S8.0" `:8129–8139`). Hash `type_name_hash` (DJB2) `:7318–7324`. Static resolution `ir_expr_struct_type` `:8622`. Trait parse `parse_trait_decl` `:2791`, `impl` parse `:2697–2790`, conformance `ti_check_trait_conformance` `:12972–13019`. `chan` = `nt_channel` (`:11334`/`11411`); no `chan T` return-type parse path yet. **Fix the three confirmed holes against red tests first, then add the `service`/`impl`/`chan T` surface.**
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D1.1** | Reproduce silent-0/free-fn-misroute hole | new `iface_dispatch_hole_test.nova` | (test only) `trait Speak{fn say(self)->string}`, one impl `Dog__say`, plus a *free* fn `say(x)`→"FREE"; call `say` on an `any`-typed `Dog` | `iface_dispatch_hole_test.nova` | red test committed: call must return the `Dog` impl, NOT "FREE", NOT 0 — currently FAILS (documents the hole) | — |
+| **D1.2** | Reproduce any-bound-skip hole | new `iface_anybound_test.nova` | generic `fn greet(s)` (param unannotated → `ir_expr_struct_type` "" `:8082`) calling `s.say()`, two impl types in one program | `iface_anybound_test.nova` | each call dispatches to the correct per-type impl — FAILS today (`mdt_collect` skips single-impl `:17025`; any receiver gets no static resolution) | D1.1 |
+| **D1.3** | Reproduce hash-collision hole | new `iface_hash_collision_test.nova` | two struct names whose DJB2 collide (computed offline), each with the same-named method | `iface_hash_collision_test.nova` | the second type's impl runs (not the first registered) — FAILS today (`:8093` compares only the i64 hash, first arm wins) | D1.1 |
+| **D1.4** | Fix dispatch-table gen: register ALL methods + carry exact type id | `nova_compiler.nova:17009–17026` (`mdt_collect`) | (internal) populate `ir_method_dispatch[mk]` even when `len(impls)==1` (drop `>1` at `:17025`); store the type **name string** with the hash → `[type_name_hash(t), fn2, len(fp), t]` | `iface_anybound_test.nova` passes | any-typed single-impl method calls resolve; `forge_typed_dispatch_test`/`forge_keystone_test` still pass | D1.2 |
+| **D1.5** | Collision-proof: secondary type-name equality guard | `nova_compiler.nova:8100–8118` + new runtime helper | runtime `i64 nova_rt_type_name_eq(i64 value, i64 type_name_str)` in `output/nova_runtime.c`; emit as AND-guard after the hash `eq` at `:8110` (arm fires only when hash matches AND RTTI type name equals the recorded name) | `iface_hash_collision_test.nova` passes | colliding names dispatch correctly; DJB2 stays the fast pre-filter, equality is authority | D1.3, D1.4 |
+| **D1.6** | Fix fallback ordering: trap before free-fn misroute | `nova_compiler.nova:8119–8139` + the `else if` chain `:8145–8152` | (internal) when a name IS a known trait/impl method, the no-arm-matched path takes the S8.0 panic (`:8129–8139`), NOT the free-fn fallback (`:8124–8127`) | `iface_dispatch_hole_test.nova` passes | a method call on an any value hits a real impl or panics loudly — never silently calls an unrelated free fn | D1.1, D1.4 |
+| **D1.7** | Verify the fixes hold under the full gate | (harness only) | none | D1.1–D1.3 green; full regression all pass; gen5.ll==gen6.ll | bootstrap reconverges, zero regressions, three guard tests permanent; commit dispatch-hardening as one unit | D1.4, D1.5, D1.6 |
+| **D1.8** | Parse `service Name { fn ... }` | `nova_compiler.nova` near `parse_trait_decl` (`:2791`) — `parse_service_decl`; register `"service"` kw in the stmt dispatcher (`:2024`) | `service Orders { fn get(req: GetOrder) -> Order ... }` — lowers to the trait node shape + a `service` marker | `service_parse_test.nova` (new) | a `service` with 4 method sigs type-checks; each method's required arity recorded (reuse `ti_trait_method_arity` `:12882`); conformance treats `impl Orders` like trait conformance | D1.7 |
+| **D1.9** | Parse `chan T` as a function return type | `nova_compiler.nova` type-annotation parse (`:2636`) + resolver feeding `nt_channel` (`:11411`) | `fn watch(req: GetOrder) -> chan Order` resolves to `nt_channel(Order)` | `chan_return_test.nova` (new) | inference gives `nt_channel(struct Order)`; `for x in result` iterates it; existing `chan()` expr form unchanged | D1.8 |
+| **D1.10** | `impl Name` against a `service` + conformance | reuse `impl` parse (`:2697`) + `ti_check_trait_conformance` (`:12972–13019`) | `impl Orders { fn get(...)->Order {...} fn watch(...)->chan Order {...} }` | `service_impl_test.nova` (new) | a complete impl passes; a missing method errors "does not fully implement"; a wrong-arity method errors via the `:13019` arity path (incl. `chan T` shapes) | D1.9 |
+
+**Sprint S6 exit gate.** Three permanent dispatch-hole guards green; `service`/`impl`/`chan T` parse, infer, and check conformance; full regression byte-identical. **New capability:** sound dynamic dispatch (the foundation `forge.server` typed dispatch and gRPC both stand on) and the `service` interface surface — one source of truth for REST + gRPC + OpenAPI + typed client.
+
+---
+
+## Sprint S7 — HTTP/2 (gates gRPC; upgrades REST)
+
+TLS+ALPN is the floor (HTTPS/OpenSSL is 🟡) — solid before any framing.
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D2.1** | ALPN-capable TLS listener | `output/nova_runtime.c` (TLS/OpenSSL FFI) + `serve_tls` in `forge.nova` near `serve_req_n` | `forge.serve_tls(app, port, certPath, keyPath)` advertising ALPN `["h2","http/1.1"]`; runtime `nova_rt_tls_alpn_selected(conn) -> string` | `forge_tls_alpn_test.nova` (new) | handshake completes; selected protocol readable ("http/1.1" until h2 lands); falls back cleanly | — |
+| **D2.2** | HPACK encoder/decoder (static + dynamic table) | new `forge/forge_h2.nova`; pure-NOVA over `bytes` | `h2_hpack_decode(bytes) -> list<Header>`; `h2_hpack_encode(list<Header>) -> bytes` | `forge_hpack_test.nova` (new) | round-trips RFC 7541 C.2/C.3/C.4 fixtures byte-exact incl. dynamic-table eviction | D2.1 |
+| **D2.3** | HTTP/2 frame codec | `forge_h2.nova` | `h2_read_frame(conn) -> Frame`; `h2_write_frame(conn, Frame)` — DATA/HEADERS/SETTINGS/WINDOW_UPDATE/RST_STREAM/PING/GOAWAY | `forge_h2_frame_test.nova` (new) | all frame types round-trip field-for-field; preface `PRI * HTTP/2.0` recognized | D2.2 |
+| **D2.4** | Connection + stream flow-control windows | `forge_h2.nova` (per-conn + per-stream state) | `h2_consume_window(stream, n)`; `h2_update_window(stream, n)`; default initial window 65535 | `forge_h2_flow_test.nova` (new) | DATA exceeding the window parks the sender until WINDOW_UPDATE; underflow → GOAWAY FLOW_CONTROL_ERROR | D2.3 |
+| **D2.5** | Multiplexed streams on the netpoller | `forge_h2.nova` serve loop + `forge.serve_h2(app, port, cert, key)`; one green task per stream | `forge.serve_h2(app, 8443, cert, key)` — routes h2 through the existing router/`_finalize2` | `forge_h2_serve_test.nova` (new) | two concurrent streams on one conn, interleaved DATA, both responses correct + independent (HOL-free); max-concurrent-streams cap enforced | D2.4, D2.1 |
+
+**Sprint S7 exit gate.** HPACK fixtures byte-exact, all frames round-trip, flow control honored both directions, two multiplexed streams independent over one TLS conn. **New capability:** HTTP/2 over TLS+ALPN through the existing handler path — REST upgraded, gRPC unblocked.
+
+---
+
+## Sprint S8 — gRPC + GraphQL (zero `.proto`, zero `protoc`)
+
+### gRPC (after S6 #8 + S7 HTTP/2)
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D3.1** | protobuf codec from field-meta with explicit `@tag(n)` | new `forge/forge_proto.nova`; `@tag` field-annotation parse in `nova_compiler.nova` + RTTI walk | `pb_encode<T>(value) -> bytes`; `pb_decode<T>(bytes) -> Result<T>` — varint/zigzag/len-delimited; field numbers from `@tag(n)`, never order | `forge_proto_test.nova` (new) | round-trips a `@tag` struct byte-matching a known-good protobuf fixture; a reused/changed tag fails the build | D1.10, D2.5 |
+| **D3.2** | Map the 4 call shapes to channel directionality | `forge/forge_grpc.nova` | (internal) unary→one-shot; server-stream (`->chan T`)→DATA per `send`; client-stream (`items: chan T`)→inbound DATA per recv; bidi→duplex | `forge_grpc_shapes_test.nova` (new) | each shape produces correct gRPC framing incl. trailers/`grpc-status` | D3.1 |
+| **D3.3** | Service-from-types server + `serve_grpc` | `forge_grpc.nova` + `app.mount(Orders)` / `a.serve_grpc(port)` | `app.mount(ServiceImpl); app.serve_grpc(50051)` — routes `/Package.Service/Method` to the impl via the now-sound dispatch | `forge_grpc_server_test.nova` (new) | a real `service Orders` impl is reachable as gRPC with zero `.proto`; unary `get` returns the struct over the wire; 4 MiB msg cap + max-stream cap enforced | D3.2 |
+| **D3.4** | Typed client stubs | `forge_grpc.nova`; `Orders.connect("grpc://host:port")` codegen from the `service` type | `let c = Orders.connect("grpc://..."); c.get(GetOrder{id:42})`; `for t in c.watch(...)` iterates a server-stream channel | `forge_grpc_client_test.nova` (new) | client calls the D3.3 server in-process: unary + server-stream results correct; transport swap (`local`/`tcp://`) leaves call sites unchanged | D3.3 |
+
+### GraphQL
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D4.1** | Schema-from-types | new `forge/forge_gql.nova`; RTTI field-meta → SDL | `gql_schema([Order, User, ...]) -> Schema` | `forge_gql_schema_test.nova` (new) | generated SDL contains `type Order { id: Int! total: Float! }` | D1.10, keystone RTTI ✅ |
+| **D4.2** | Query parser + resolver dispatch | `forge_gql.nova` + `forge.gql(app, "/graphql", schema, resolvers)` | `gql_resolve(field, fn(parent, args, ctx) -> any)` | `forge_gql_query_test.nova` (new) | `{ order(id:1){ total } }` → `{"data":{"order":{"total":...}}}` | D4.1 |
+| **D4.3** | Subscriptions over WebSocket | `forge_gql.nova` on `ws_room`/`hub` (✅) | `gql_subscribe(field, fn(args) -> chan T)`; graphql-ws over the existing WS server | `forge_gql_sub_test.nova` (new) | subscribe, publish via hub, client frame received | D4.2 |
+| **D4.4** | DataLoader on the per-request arena | `forge_gql.nova`; batch map keyed in arena memory (freed at `arena_exit`) | `gql_loader(fn(keys: list) -> list)` — per-request, auto-batched | `forge_gql_dataloader_test.nova` (new) | a nested would-be-N+1 query issues ONE batched backend call; `live_delta→0` after request (arena freed) | D4.2 |
+| **D4.5** | Depth + complexity limit (secure-by-default) | `forge_gql.nova` pre-execution validator | `gql(app, path, schema, resolvers, max_depth: 10, max_complexity: 1000)` | `forge_gql_limit_test.nova` (new) | a deeply nested query is rejected with a 4xx/error before resolution (Absinthe parity) | D4.2 |
+
+**Sprint S8 exit gate.** A typed `service` is reachable as gRPC (server + client, all 4 shapes) and the same types drive a GraphQL endpoint (queries, subscriptions, arena-DataLoader, depth limit). **New capability:** microservices and graph APIs from the struct definitions themselves — the "one `service` block = REST + gRPC + OpenAPI + typed client" beat made real.
+
+---
+
+## Sprint S9 — Postgres-scale data: query DSL, migrations, storage
+
+(Builds on S1's typed-DB and S2.8 Postgres pool. Sequenced after the OTP/observability/auth value lands so the data layer matures against real apps.)
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D9.1** | Composable, type-checked query DSL | `forge/forge_db.nova` over sqlitex ✅; field-existence checking rides the struct field-meta the inferer already resolves at `ir_expr_struct_type` (`nova_compiler.nova:8622`) — a `where(o.<field>)` referencing a missing field fails inference exactly like any bad field access | `where(o.total > 100)` type-checked against struct fields; `select`/`order_by`/`limit` builders compiling to parameterized SQL | `forge_query_dsl_test.nova` (new) | a `where` referencing a non-field is a compile error (inference rejects the unknown field access); the built query is parameterized (injection-safe) and returns typed rows | T2.4 |
+| **D9.2** | Migrations: derive-from-struct + `@renamed_from` hint | `forge/forge_migrate.nova` + `@renamed_from` field-annotation parse | `migrate(pool, [Todo, User])` — zero-annotation add/drop/type-change; renames require `@renamed_from("old")` | `forge_migrate_test.nova` (new) | add/drop/type-change derived from the struct diff; a `@renamed_from` field renames the column (no data loss); a bare rename without the hint is drop+add (documented) | T2.5 |
+| **D9.3** | File / blob storage abstraction | `forge/forge_storage.nova` | `storage.put(key, bytes)`/`storage.get(key)`/`storage.url(key)` — local backend first, S3/GCS behind the same interface | `forge_storage_test.nova` (new) | an upload persists via the local backend and reads back byte-identical; backend swap is config-only | T2.5 |
+
+**Sprint S9 exit gate.** DSL type-checks against struct fields; migrations are deterministic + non-interactive with the rename hint; uploads persist. **New capability:** Django-ORM-class data ergonomics on Postgres — typed queries, safe migrations, blob storage.
+
+---
+
+## Sprint S10 — Message queues + resilience + outbox
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D5.1** | One publish/consume API surface | new `forge/forge_mq.nova`; transport behind a config URL | `let q = forge.queue("nats://host:4222"); q.publish(subject, value); q.consume(subject, group, fn(msg: T) -> Result)` | `forge_mq_api_test.nova` (new) | against an in-memory loopback backend, publish→consume round-trips a typed struct (no broker in the gate) | keystone RTTI ✅, bounded chans ✅ |
+| **D5.2** | NATS backend | `forge_mq.nova` NATS codec over the outbound TCP client / netpoller | `nats://` URL drives connect/sub/pub | `forge_mq_nats_test.nova` (env-gated) | real NATS pub/sub; same API as D5.1 | D5.1, outbound client |
+| **D5.3** | Kafka + Rabbit backends | `forge_mq.nova` `kafka://`/`amqp://` codecs behind the same interface | unchanged call sites; URL scheme selects transport | `forge_mq_kafka_test.nova`/`forge_mq_rabbit_test.nova` (env-gated) | backend swap is config-only; call sites identical | D5.2 |
+| **D5.4** | ack/retry/DLQ/prefetch | `forge_mq.nova` consumer wrapper | `.group(g).retry(n).backoff(exp_jitter).dead_letter(subj).prefetch(k)` | `forge_mq_dlq_test.nova` (new) | a handler returning `err()` retries n× then lands on the DLQ; prefetch caps in-flight at k | D5.1 |
+| **D5.5** | Outbox relay as a supervised job | `forge_mq.nova` relay + `forge.supervisor` child (S2) + DB `tx` (S1) | `with tx { tx.insert(o); tx.publish(subj, evt) }`; a supervised relay drains the outbox table | `forge_outbox_test.nova` (new) | crash before commit publishes nothing; commit → relay publishes exactly once; relay restarts under supervision | D5.1, T2.7, T4.4 |
+| **D7r.1** | Outbound HTTP client + connection pool | `forge/forge_client.nova` over netpoller | pooled outbound HTTP; shared substrate with WS/SSE outbound | `forge_outclient_test.nova` (new) | a pooled outbound request round-trips; the pool bounds concurrent connections | netpoller ✅ |
+| **D7r.2** | Composable channel decorators | `forge/forge_resilience.nova` wrapping a channel | `.timeout/.retry/.circuit_breaker/.bulkhead` — one impl, every transport | `forge_resilience_test.nova` (new) | the same CB wraps an HTTP call and a gRPC call; an open breaker fast-fails; a bulkhead caps concurrent in-flight per dependency | D7r.1 |
+
+**Sprint S10 exit gate.** Typed publish/consume against a loopback backend + NATS; retry/DLQ/prefetch enforced; the outbox publishes exactly once across a crash; channel decorators apply uniformly. **New capability:** broker-agnostic messaging with the reliability patterns (DLQ, outbox) teams botch most, plus the resilience zoo as channel decorators — one impl across every protocol.
+
+---
+
+## Sprint S11 — Distribution L9 (correctly last in the server arc)
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D6.1** | Real remote process (replace the local-proxy stub) | `output/nova_runtime.c` `nova_rt_remote_spawn` + `clusterx.nova` | `remote_spawn(node, fnName, args) -> RemoteHandle` that truly spawns on the target node over `remote_*` | `dist_remote_spawn_test.nova` (new) | a fn spawned on a second in-process node runs there (distinct node id); a reply channel returns the result | remote_* ✅, call_by_name ✅ |
+| **D6.2** | Cluster RPC + mesh membership | `clusterx.nova` gossip over `remote_*` | `cluster_join(seed)`; `cluster_members() -> list<Node>`; `cluster_rpc(node, fn, args)` | `dist_membership_test.nova` (new) | 3 nodes form a mesh; killing one updates membership on survivors; RPC reaches any member | D6.1 |
+| **D6.3** | Global registry | `clusterx.nova` distributed name→handle | `global_register(name, handle)`; `global_whereis(name) -> RemoteHandle` | `dist_registry_test.nova` (new) | register on node A, resolve + call from node B | D6.2 |
+| **D6.4** | Distributed monitor + failover | `clusterx.nova` extend `monitor` across nodes | `monitor(remoteHandle) -> chan DownSignal`; supervisor reacts to remote DOWN | `dist_failover_test.nova` (new) | supervise a remote process; kill its node → DOWN delivered + a restart fires elsewhere (closes "can't supervise a remote process") | D6.3 |
+| **D6.5** | Cluster PubSub + Presence | `pubsubx.nova`/`forge.nova` subscribe each node's hub to peers | `forge.broadcast` reaches cluster subscribers; `forge.list_presence` aggregates across nodes (OR-Set CRDT) | `dist_pubsub_test.nova` (new) | publish on A reaches subscriber on B; presence merges across nodes | D6.2, T4.10 |
+| **D6.6** | Rolling-restart deploy + drain + mTLS | `forge.nova` drain (`shutdown_requested()` ✅ + S0 T1.5) + supervised rolling restart (D6.4) + TLS client-cert (D2.1) | `forge.rolling_restart(sup)`; `serve_tls(..., client_ca: ca, verify: mutual)` | `dist_rolling_test.nova`/`dist_mtls_test.nova` (new) | drain completes in-flight, no dropped connections during restart; a connection without a valid client cert is rejected | D6.4, D2.1, T1.5 |
+
+**Sprint S11 exit gate.** A remote process truly executes on a peer; membership converges; cluster-wide names resolve; remote supervision + failover work; cluster PubSub/Presence merge; zero-downtime restart + mTLS hold. **New capability:** a pure-NOVA cluster — the mesh is the library, not a sidecar.
+
+---
+
+## Sprint S12 — Auto-admin from types (Django's moat)
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D7.1** | Register struct → CRUD UI | new `forge/forge_admin.nova` on `forge_html` ✅ + typed `forge_db` (S1) + RTTI | `forge.admin(app, [User, Order])` mounts `/admin` with list+create+edit+delete per struct, fields from field-meta | `forge_admin_crud_test.nova` (new) | `/admin/user` lists rows; POST creates one (round-trips through db) — zero hand-written HTML | T2.4, T2.5, HTML-as-fn ✅ |
+| **D7.2** | List/search/filter/sort | `forge_admin.nova` list view + query DSL (S9) | `admin_config(User, list_display: [...], search: [...], filters: [...])` | `forge_admin_list_test.nova` (new) | search narrows rows; sort header reorders; a filter chip applies a WHERE (Django-list parity) | D7.1, D9.1 |
+| **D7.3** | FK picker + bulk actions | `forge_admin.nova` relation rendering + action registry | FK fields render a select of related rows; `admin_action(name, fn(ids) -> Result)` | `forge_admin_fk_test.nova` (new) | an edit form shows an FK dropdown; a bulk action runs over selected ids | D7.2 |
+| **D7.4** | Object-level permissions | `forge_admin.nova` + `mw_auth` (S4) | `admin_perms(User, fn(actor, obj, action) -> bool)` | `forge_admin_perms_test.nova` (new) | a user without permission → 403 on edit; with permission → 200 | D7.1, T3.1 |
+| **D7.5** | Inline editing + audit log | `forge_admin.nova` nested-form rendering + a `LogEntry` table per mutation | `admin_inline(Order, Item)`; auto audit row per create/update/delete | `forge_admin_audit_test.nova` (new) | an inline child edits with its parent; every mutation appends an audit row (Django `InlineModelAdmin` + `LogEntry` parity) | D7.3, D7.4 |
+
+**Sprint S12 exit gate.** A struct → working CRUD with list/search/filter/sort, FK picker, bulk actions, object-perms, inline editing + audit history. **New capability:** Django admin's stickiness, generated from types, zero hand-written HTML.
+
+---
+
+## Sprint S13 — WASM frontend (the endgame)
+
+The WASM target is a stub today. Complete codegen first, then the runtime, then DOM, then full-stack — each proven before the next.
+
+| id | WHAT | WHERE | API | TEST | ACCEPTANCE | DEPENDS-ON |
+|---|---|---|---|---|---|---|
+| **D8.1** | Complete WASM codegen backend | `nova_compiler.nova` codegen target path (the WASM emitter is a no-op stub) | `nova_build --target wasm32 app.nova` emits a valid `.wasm` module | `wasm_codegen_test.nova` (new) | a pure-arithmetic fn compiled to wasm runs under wasmtime/node (env-gated) and returns the right number | — |
+| **D8.2** | WASM runtime (memory, strings, lists, dicts) | new `output/nova_runtime_wasm.c` (wasm-targeted subset) — heap/arena/RTTI in wasm linear memory | the core value model (list/dict/struct/string/bytes) in the wasm build | `wasm_runtime_test.nova` (new) | a fn using lists+dicts+structs compiles to wasm with correct results incl. struct→JSON keystone in-wasm | D8.1 |
+| **D8.3** | HTML-as-fn → DOM bindings | new `forge/forge_dom.nova` + wasm↔JS host imports | `mount(rootId, fn(state) -> Html)` — `forge_html` builders render to real DOM nodes | `wasm_dom_test.nova` (new) | a counter component renders to a DOM node (headless browser, env-gated); text content asserted | D8.2 |
+| **D8.4** | Full-stack: shared structs + event loop + fetch | `forge_dom.nova` client event loop + `fetch`-backed `Channel<T>` to a Forge backend | `on_click`/`on_input` handlers; `forge.fetch<T>(url)` returns a typed value using the SAME struct as the server | `wasm_fullstack_test.nova` (new) | a client form POSTs a struct to a Forge route and renders the typed response; the same `struct` compiles to both server (native) and client (wasm) | D8.3; S8 client optional for typed transport |
+
+**Sprint S13 exit gate.** NOVA scalar+value-model code runs as real WASM; HTML-as-fn produces live DOM; a form POSTs a struct and renders a typed response with one shared struct definition across the wire. **New capability:** backend + frontend + realtime in one NOVA codebase — the developer never leaves.
+
+---
+
+## Milestones
+
+| Milestone | What it proves | Completed by |
+|---|---|---|
+| **M1 — "the 22-line hero runs for real"** | A beginner's full CRUD app compiles and serves: typed in/out, typed rows, injection-safe, on a Slowloris-proof, drain-safe server. | **S0 + S1** (T1.1–T1.5, T2.1–T2.8) |
+| **M2 — "OTP + real-time + observability = production single-node"** | Supervisor trees, typed GenServers, background jobs, RED metrics + health + traces, an explicit auth pipeline, join-authorized channels, presence, and LiveView — a complete, observable, fault-tolerant single node. | **S2 + S3 + S4 + S5** (T4.x, T8.x, T3.x, T5.x) |
+| **M3 — "gRPC + queues + resilience = microservices"** | Sound interface dispatch, HTTP/2, service-from-types gRPC (server + typed client, 4 shapes), GraphQL, Postgres-scale data + migrations, broker-agnostic messaging with outbox + DLQ, and channel-decorator resilience. | **S6 + S7 + S8 + S9 + S10** (D1.x, D2.x, D3.x, D4.x, D9.x, D5.x, D7r.x) |
+| **M4 — "distribution + admin + WASM = the whole vision"** | A pure-NOVA cluster (real `remote_spawn`, mesh, global registry, distributed supervision, cluster PubSub/Presence, rolling restart + mTLS), Django-class auto-admin, and a WASM frontend sharing struct definitions with the backend. The definition of done. | **S11 + S12 + S13** (D6.x, D7.x, D8.x) |
+
+---
+
+## Start here
+
+**The first move is T2.1 — Phase 0c, the let-site → callee type-arg specialization in `nova_compiler.nova:8800–8838`. Start there. Everything else in S1 follows it.**
+
+T2.1 is the single keystone of the entire typed-data layer. Every marquee wrapper (`body_as<T>`, `query_as<T>`, `db.all<T>`, `db.find<T>`) is inert stdlib until its call-name is in the IR-lower assign ladder. The change is purely additive — three new `else if` arms whose absence leaves the compiler byte-identical — and its correctness is mechanically checkable, not a judgment call: the emitted IR for `let r: Result<User> = body_as(s)` must diff identical to the existing `from_json_safe` rewrite, and reconverge must hold gen5.ll == gen6.ll. Landing it first collapses S1's remaining seven tasks into thin wrappers and makes the 22-line hero — Forge's identity — real. No other edit in the plan unlocks as much. The exact algorithm is in *Phase 0c (T2.1) — exact compiler change, junior-implementable*; that section is the literal work order.
+
+**Second track, in parallel for a second engineer: T1.1 (per-connection read timeout).** It touches no compiler code (pure `forge.nova` stdlib over the shipped `select_timeout`), carries zero reconverge risk, and closes the most credibility-damaging gap (Slowloris) on the server every other sprint serves traffic through. T2.1 and T1.1 share no files and no dependencies — two engineers run them at once, both on the critical path to M1.
