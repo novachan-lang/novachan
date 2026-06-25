@@ -3607,6 +3607,22 @@ fn _make_from_dict_method(tname: string, fields: list, structset: dict, ln: int)
     push(body, Stmt("return", "", Expr("call", "ok", 0, [ctor], [], ln), [], [], [], [], ln))
     Stmt("fn", tname + "__from_dict", null_expr(), body, [Param("d", "dict", null_expr())], [], [], ln)
 
+// Forge T2.4: <T>__from_dict_list(rows) -> list<T>. A TYPED loop (no HOF) that maps the
+// Result-returning <T>__from_dict over each row dict and collects the Ok payloads, skipping
+// malformed rows. This produces REAL <T> handles (unlike map(rows, __from_dict), which yields
+// list<Result<T>> and reads back as garbage). The db.all<T> let-site rewrite calls this directly
+// (like db_find's __from_dict). All nodes are fresh (no shared Expr).
+fn _make_from_dict_list_method(tname: string, ln: int) -> Stmt
+    let body = []
+    push(body, Stmt("assign", "out", Expr("list", "", 0, [], [], ln), [], [], [], [], ln))
+    let lb = []
+    push(lb, Stmt("assign", "one", Expr("call", tname + "__from_dict", 0, [Expr("ident", "r", 0, [], [], ln)], [], ln), [], [], [], [], ln))
+    let push_ok = Stmt("expr", "", Expr("call", "push", 0, [Expr("ident", "out", 0, [], [], ln), Expr("call", "unwrap", 0, [Expr("ident", "one", 0, [], [], ln)], [], ln)], [], ln), [], [], [], [], ln)
+    push(lb, Stmt("if", "", Expr("call", "is_ok", 0, [Expr("ident", "one", 0, [], [], ln)], [], ln), [push_ok], [], [], [], ln))
+    push(body, Stmt("for", "r", Expr("ident", "rows", 0, [], [], ln), lb, [], [], [], ln))
+    push(body, Stmt("return", "", Expr("ident", "out", 0, [], [], ln), [], [], [], [], ln))
+    Stmt("fn", tname + "__from_dict_list", null_expr(), body, [Param("rows", "list", null_expr())], [], [], ln)
+
 // ── Multi-clause function heads (Erlang/Elixir-style guard dispatch) ──────────
 // Several same-name/same-arity `fn f(...) when <guard>` heads are fused into ONE
 // function whose body is a guard if/else chain (last unguarded head = catch-all;
@@ -3942,6 +3958,9 @@ fn expand_derives(stmts: list) -> list
                         // <T>__from_dict (query_as/form_as core) -- same ok/err shadow gate.
                         if contains(user_fns, sname + "__from_dict") == 0 and contains(user_fns, "ok") == 0 and contains(user_fns, "err") == 0
                             push(generated, _make_from_dict_method(sname, sparams, jsonset, sln))
+                        // <T>__from_dict_list (db.all<T> core) -- needs __from_dict + is_ok/unwrap unshadowed.
+                        if contains(user_fns, sname + "__from_dict_list") == 0 and contains(user_fns, "ok") == 0 and contains(user_fns, "err") == 0 and contains(user_fns, "is_ok") == 0 and contains(user_fns, "unwrap") == 0
+                            push(generated, _make_from_dict_list_method(sname, sln))
                         if contains(user_fns, sname + "__fields") == 0
                             push(generated, _make_fields_method(sname, sparams, sln))
                         if contains(user_fns, sname + "__type_name") == 0
@@ -8795,6 +8814,7 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 let ann_type = ""
                 let fj_force_any = 0
                 let fj_result_inner = ""
+                let fj_list_elem = ""
                 if len(params) > 0
                     match params[0]
                         Param(fj_pn, fj_pt, fj_pd) =>
@@ -8852,18 +8872,28 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                             let fj_decoded = Expr("call", "json_decode", 0, fj_ec, [], fj_el)
                                             eff_expr = Expr("call", fj_pt + "__from_json", fj_en, [fj_decoded], fj_ef, fj_el)
                                             fj_type = fj_pt
-                            // `db.all<T>` (list<T>) is DEFERRED. A map(db_all(...), fn(r) <T>__from_dict(r)) rewrite
-                            // injected HERE runs mechanically (nova_rt_list_map calls the lambda) but the lambda is
-                            // built AFTER type inference, so its <T> return is never inferred and the result list's
-                            // elements come back untyped -> the for-loop reads garbage. (Proven: the SAME map+converting
-                            // -lambda works when written in source, where ti sees it.) The clean fix is a generated
-                            // typed `<T>__from_dict_list` helper — a typed loop, no HOF — rewritten as a DIRECT call
-                            // `<T>__from_dict_list(db_all(...))` (like db_find's direct __from_dict). Focused follow-up.
+                            else if len(fj_pt) > 6 and fj_pt[0:5] == "list<" and fj_pt[len(fj_pt)-1:len(fj_pt)] == ">"
+                                // Forge T2.4: `let xs: list<T> = db_all(pool, table)` -> <T>__from_dict_list(db_all(...)),
+                                // a generated typed loop yielding REAL <T> handles. DIRECT call (like db_find) -> no
+                                // post-ti HOF/lambda typing gap (the map+lambda approach yielded list<Result<T>> garbage).
+                                let fj_le = fj_pt[5:len(fj_pt)-1]
+                                if contains(b.ir_sdefs, fj_le)
+                                    match expr
+                                        Expr(la_et, la_ev, la_en, la_ec, la_ef, la_el) =>
+                                            if la_et == "call" and la_ev == "db_all"
+                                                eff_expr = Expr("call", fj_le + "__from_dict_list", 0, [expr], [], la_el)
+                                                fj_list_elem = fj_le
                 let val = ir_lower_expr(b, eff_expr)
                 if name != ""
                     ir_emit_inst(b, "slot_store", "", ir_type_void(), [val], name, 0)
                     if fj_result_inner != ""
                         b.ir_result_elem_stype[name] = fj_result_inner
+                    if fj_list_elem != ""
+                        // db_all rewrote to <T>__from_dict_list(...) (a call): mark the slot a list of
+                        // the element struct so `for x in xs` types x as <T> (mirrors the list-literal
+                        // path at :8785). The elements are REAL <T> handles, so this types correctly.
+                        b.ir_locals[name] = "list"
+                        b.ir_list_elem_stype[name] = fj_list_elem
                     if fj_force_any == 1
                         // Result<T> let-binding: keep the slot polymorphic so the sum tag survives
                         // for the downstream match (never type it as the inner struct).

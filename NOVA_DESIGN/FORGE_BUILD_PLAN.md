@@ -12,6 +12,21 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 
 ---
 
+## Build progress (live ledger)
+
+> Updated as tasks ship. Each entry: task → commit → gate. (FORGE_STATUS.md §3 is the capability view; this is the task-by-task ledger.)
+
+**Sprint S1 — typed data front door — IN PROGRESS:**
+- **T2.1 — let-site typed-wrapper rewrites — ✅ DONE (commit `47f66da`).** `let r: Result<T> = body_as(s)` → `<T>__from_json_safe(s)` (the SAFE path, B5); `query_as(dict)` → `<T>__from_dict`; `db_find(pool,table,id)` → `<T>__from_dict(`*result row*`)`. Purely additive (reconverge gen5.ll==gen6.ll byte-identical) + 585×2. Verified end-to-end (`ada:36` / `min=10` / `bob`). Guard: `forge_typed_wrapper_test.nova`.
+- **T2.9 — crash-safe `from_json` — ✅ VERIFIED ALREADY DONE (no code change).** B5a ("raw `from_json` SEGFAULTs on partial input") was a STALE finding: `_make_from_dict_method`/`_make_from_json_method` already coerce non-dict input to `{}` and default every missing field. Tested: a partial body missing the nested-struct, float, and list fields returns a defaulted struct, exit 0, **no segfault**. → B5a should be struck from §4.
+- **T2.4 — `db.all<T>` typed-list — ✅ DONE (gating, commit pending green).** Generated `<T>__from_dict_list(rows)` — a TYPED loop that maps `<T>__from_dict` over each row and collects the Ok payloads (`is_ok`/`unwrap`, skipping malformed rows) → **real `<T>` handles** — plus a direct-call rewrite `<T>__from_dict_list(db_all(...))`. The earlier `map(db_all, fn(r) __from_dict(r))` garbled for two reasons (now understood): `__from_dict` returns `Result<T>` so the map produced `list<Result<T>>`, AND a lambda injected at IR-lower has no post-ti type. The generated typed loop avoids both. All four typed arms green.
+
+**Next in S1 (sequenced):** T2.5 `db_insert` (skip the `id` PK so SQLite auto-assigns) + `db_delete` (needs a `db_affected`/`sqlite3_changes` extern) — Sonnet-drafted, integrating; T2.7 `with tx`; T2.6 async pool-park; then **build + RUN the 22-line hero**. T2.8 Postgres is env-gated (needs a local PG).
+
+**Scope note found while building (NOW-vs-GOAL):** the hero's `req.body_as<Todo>()` / `db.all<Todo>()` *method + call-site-`<T>`* syntax is distinct from T2.1's *typed-let* form (`let x: Result<T> = body_as(...)`). The typed-let form is shipped; the call-site `<T>` + UFCS form is a follow-up. Until then the hero is written with typed lets.
+
+---
+
 ## How we ship every task
 
 **The gate (mandatory, every task, no exceptions):**
