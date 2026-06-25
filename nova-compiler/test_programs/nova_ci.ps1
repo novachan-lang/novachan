@@ -33,6 +33,10 @@ Write-Host "`n[CI 2d/3] #27 no_std freestanding-allocator gate (static buffer, n
 & .\_s27_freestanding_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2d (freestanding allocator) ==="; exit 1 }
 
+Write-Host "`n[CI 2e/3] #30 interpreter gate (nova eval tree-walks expressions, no compile)..."
+& .\_s30_eval_check.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2e (nova eval interpreter) ==="; exit 1 }
+
 Write-Host "`n[CI 2b/3] N>1 multi-core gate (concurrency flagships at NOVA_CARRIERS=4/8)..."
 & .\_n_carriers_ci.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b (N>1 concurrency regression) ==="; exit 1 }
