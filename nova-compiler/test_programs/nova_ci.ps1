@@ -45,6 +45,10 @@ Write-Host "`n[CI 2g/3] #32 semantic-LSP gate (hover returns the real function s
 & .\_s32_hover_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2g (LSP hover signature) ==="; exit 1 }
 
+Write-Host "`n[CI 2h/3] #35 const-fn-eval gate (compile-time fold of const fn calls; fold==runtime)..."
+& .\_s35_constfn_check.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2h (const-fn-eval) ==="; exit 1 }
+
 Write-Host "`n[CI 2b/3] N>1 multi-core gate (concurrency flagships at NOVA_CARRIERS=4/8)..."
 & .\_n_carriers_ci.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b (N>1 concurrency regression) ==="; exit 1 }

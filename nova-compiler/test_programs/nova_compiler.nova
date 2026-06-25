@@ -16961,13 +16961,17 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                                 b.ir_field_types[vname + "." + vpname] = vptype
                                         vfi = vfi + 1
                 else if tag == "const"
-                    b.ir_consts[name] = expr
+                    // #35 const-fn-eval: fold a pure call-rooted initializer (e.g.
+                    // `const X = fib(10)`) to a literal at compile time. Sound + fails
+                    // closed to runtime; returns expr unchanged when not foldable.
+                    let _cfe = ce_try_fold_const(expr, stmts)
+                    b.ir_consts[name] = _cfe
                     // P5 const-baking: a top-level const whose value is a non-empty
                     // list literal of pure literals is built ONCE in the nova_main
                     // prologue and cached; uses load it instead of rebuilding.
-                    if ir_const_bakeable(expr) == 1
+                    if ir_const_bakeable(_cfe) == 1
                         b.ir_const_baked[name] = len(b.ir_const_build_order)
-                        push(b.ir_const_build_order, [name, expr])
+                        push(b.ir_const_build_order, [name, _cfe])
                 else if tag != "import" and tag != "trait" and tag != "type_alias"
                     push(top_stmts, s)
 
@@ -20128,6 +20132,268 @@ fn eval_expr(env: dict, e: Expr) -> any
                 return 0
             print("eval error: cannot interpret this expression — use `nova run`")
             return 0
+
+// ── #35 compile-time const evaluation (const-fn-eval) ──────────────────────
+// A kind-tracking tree interpreter for folding `const X = <pure call>` to a literal
+// at compile time. SOUNDNESS by construction: values are computed with NOVA's OWN
+// operators (identical runtime semantics incl. i64 wraparound), and the KIND is tracked
+// through evaluation (not introspected — is_int/etc. are compile-time-only and bools are
+// raw i64 at the `any` level, indistinguishable from ints). v1 folds INT results only.
+// Fails CLOSED on anything uncertain (unknown ident/call/stmt, complex assign, arity
+// mismatch, div-by-zero, side-effecting builtins, budget exhaustion) → runtime fallback.
+type CeVal
+    kind: string
+    v: any
+
+fn ce_fail(ctl: dict) -> CeVal
+    ctl["failed"] = true
+    CeVal("fail", 0)
+
+fn ce_budget_ok(ctl: dict) -> bool
+    if ctl["failed"]
+        return false
+    let b = ctl["budget"]
+    if b <= 0
+        ctl["failed"] = true
+        return false
+    ctl["budget"] = b - 1
+    true
+
+fn ce_eval_expr(ctl: dict, env: dict, fns: dict, e: Expr) -> CeVal
+    if not ce_budget_ok(ctl)
+        return CeVal("fail", 0)
+    match e
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et == "int"
+                return CeVal("int", en)
+            if et == "float"
+                return CeVal("float", parse_float(ev))
+            if et == "str" or et == "string"
+                return CeVal("str", ev)
+            if et == "bool"
+                if ev == "true"
+                    return CeVal("bool", true)
+                return CeVal("bool", false)
+            if et == "ident"
+                if ev == "true"
+                    return CeVal("bool", true)
+                if ev == "false"
+                    return CeVal("bool", false)
+                if contains(env, ev)
+                    return env[ev]
+                return ce_fail(ctl)
+            if et == "unary"
+                let u = ce_eval_expr(ctl, env, fns, ec[0])
+                if ctl["failed"]
+                    return u
+                if ev == "-"
+                    if u.kind == "int"
+                        return CeVal("int", 0 - u.v)
+                    if u.kind == "float"
+                        return CeVal("float", 0.0 - u.v)
+                    return ce_fail(ctl)
+                if ev == "not"
+                    return CeVal("bool", not u.v)
+                return ce_fail(ctl)
+            if et == "binop"
+                if ev == "and"
+                    let la = ce_eval_expr(ctl, env, fns, ec[0])
+                    if ctl["failed"]
+                        return la
+                    if not la.v
+                        return CeVal("bool", false)
+                    let ra = ce_eval_expr(ctl, env, fns, ec[1])
+                    if ctl["failed"]
+                        return ra
+                    if ra.v
+                        return CeVal("bool", true)
+                    return CeVal("bool", false)
+                if ev == "or"
+                    let lo = ce_eval_expr(ctl, env, fns, ec[0])
+                    if ctl["failed"]
+                        return lo
+                    if lo.v
+                        return CeVal("bool", true)
+                    let ro = ce_eval_expr(ctl, env, fns, ec[1])
+                    if ctl["failed"]
+                        return ro
+                    if ro.v
+                        return CeVal("bool", true)
+                    return CeVal("bool", false)
+                let l = ce_eval_expr(ctl, env, fns, ec[0])
+                if ctl["failed"]
+                    return l
+                let r = ce_eval_expr(ctl, env, fns, ec[1])
+                if ctl["failed"]
+                    return r
+                if ev == "<"
+                    return CeVal("bool", l.v < r.v)
+                if ev == ">"
+                    return CeVal("bool", l.v > r.v)
+                if ev == "<="
+                    return CeVal("bool", l.v <= r.v)
+                if ev == ">="
+                    return CeVal("bool", l.v >= r.v)
+                if ev == "=="
+                    return CeVal("bool", l.v == r.v)
+                if ev == "!="
+                    return CeVal("bool", l.v != r.v)
+                let rk = "int"
+                if l.kind == "float" or r.kind == "float"
+                    rk = "float"
+                if l.kind == "str" or r.kind == "str"
+                    rk = "str"
+                if ev == "+"
+                    return CeVal(rk, l.v + r.v)
+                if ev == "-"
+                    return CeVal(rk, l.v - r.v)
+                if ev == "*"
+                    return CeVal(rk, l.v * r.v)
+                if ev == "/"
+                    if rk == "int" and r.v == 0
+                        return ce_fail(ctl)
+                    return CeVal(rk, l.v / r.v)
+                if ev == "%"
+                    if r.v == 0
+                        return ce_fail(ctl)
+                    return CeVal(rk, l.v % r.v)
+                return ce_fail(ctl)
+            if et == "call"
+                return ce_eval_call(ctl, env, fns, ev, ec)
+            return ce_fail(ctl)
+
+fn ce_eval_call(ctl: dict, env: dict, fns: dict, fname: string, argexprs: list) -> CeVal
+    if fname == "abs" and len(argexprs) == 1
+        let a = ce_eval_expr(ctl, env, fns, argexprs[0])
+        if ctl["failed"]
+            return a
+        if a.kind == "int"
+            if a.v < 0
+                return CeVal("int", 0 - a.v)
+            return CeVal("int", a.v)
+        return ce_fail(ctl)
+    if contains(fns, fname)
+        let fstmt = fns[fname]
+        match fstmt
+            Stmt(st, sn, se, sb, sp, sel, san, sl) =>
+                if len(sp) != len(argexprs)
+                    return ce_fail(ctl)
+                let callenv = {}
+                let ai = 0
+                for p in sp
+                    match p
+                        Param(pn, pt, pd) =>
+                            let av = ce_eval_expr(ctl, env, fns, argexprs[ai])
+                            if ctl["failed"]
+                                return av
+                            callenv[pn] = av
+                    ai = ai + 1
+                ctl["ret"] = false
+                ce_eval_block(ctl, callenv, fns, sb)
+                if ctl["failed"]
+                    return CeVal("fail", 0)
+                if not ctl["ret"]
+                    return ce_fail(ctl)
+                let rv = ctl["retval"]
+                ctl["ret"] = false
+                return rv
+    ce_fail(ctl)
+
+fn ce_eval_block(ctl: dict, env: dict, fns: dict, stmts: list)
+    for s in stmts
+        if ctl["failed"] or ctl["ret"]
+            return
+        if not ce_budget_ok(ctl)
+            return
+        match s
+            Stmt(st, sn, se, sb, sp, sel, san, sl) =>
+                if st == "assign"
+                    let av = ce_eval_expr(ctl, env, fns, se)
+                    if ctl["failed"]
+                        return
+                    if sn != ""
+                        // `let x = v` declaration form
+                        env[sn] = av
+                    else
+                        // reassignment `x = v`: target Expr lives in the ann field.
+                        // Only simple-ident targets that are ALREADY a known local
+                        // (param/prior let) — globals/index/member targets fail closed.
+                        if len(san) != 1
+                            ctl["failed"] = true
+                            return
+                        let tname = ""
+                        match san[0]
+                            Expr(tt, tv, tn2, tc2, tf2, tl2) =>
+                                if tt == "ident"
+                                    tname = tv
+                        if tname == "" or not contains(env, tname)
+                            ctl["failed"] = true
+                            return
+                        env[tname] = av
+                else if st == "return"
+                    let rv = ce_eval_expr(ctl, env, fns, se)
+                    if ctl["failed"]
+                        return
+                    ctl["retval"] = rv
+                    ctl["ret"] = true
+                    return
+                else if st == "if"
+                    let c = ce_eval_expr(ctl, env, fns, se)
+                    if ctl["failed"]
+                        return
+                    if c.v
+                        ce_eval_block(ctl, env, fns, sb)
+                    else
+                        ce_eval_block(ctl, env, fns, sel)
+                else if st == "while"
+                    while true
+                        if ctl["failed"] or ctl["ret"]
+                            break
+                        if not ce_budget_ok(ctl)
+                            break
+                        let wc = ce_eval_expr(ctl, env, fns, se)
+                        if ctl["failed"]
+                            break
+                        if not wc.v
+                            break
+                        ce_eval_block(ctl, env, fns, sb)
+                else if st == "expr"
+                    ce_eval_expr(ctl, env, fns, se)
+                    if ctl["failed"]
+                        return
+                else
+                    ctl["failed"] = true
+                    return
+
+// Try to fold a top-level const initializer. Only attempts call-rooted initializers
+// (literal/list/scalar-arith consts already have existing paths / LLVM folds them).
+// Returns a literal Expr on success, else the original expr unchanged.
+fn ce_try_fold_const(expr: Expr, stmts: list) -> Expr
+    let is_call = false
+    match expr
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et == "call"
+                is_call = true
+    if not is_call
+        return expr
+    let fns = {}
+    for s in stmts
+        match s
+            Stmt(st, sn, se, sb, sp, sel, san, sl) =>
+                if st == "fn"
+                    fns[sn] = s
+    let ctl = {}
+    ctl["budget"] = 2000000
+    ctl["failed"] = false
+    ctl["ret"] = false
+    ctl["retval"] = CeVal("int", 0)
+    let env = {}
+    let cv = ce_eval_expr(ctl, env, fns, expr)
+    if ctl["failed"]
+        return expr
+    if cv.kind == "int"
+        return Expr("int", str(cv.v), cv.v, [], [], 0)
+    return expr
 
 fn compiler_main()
     let arguments = args()
