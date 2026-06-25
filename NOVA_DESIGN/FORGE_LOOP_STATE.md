@@ -103,16 +103,33 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   a lingering daemon (nova_runtime.c ~6651-6653), but the **N>1 idle path did NOT** — it waited for
   `live<=0` forever -> hang (and a task-LEAK per closed streaming conn on a real N>1 server). **FIX (made,
   gating via nova_ci bp5cbwzpp): bring N>1 to parity** — in the N>1 idle branch (~6638), break when
-  `nova_sched_root_task->status==3`. N>1-branch-ONLY => N=1 byte-identical. **Focused-validated: all 6
-  streaming tests PASS at N=4 (<1.2s each), ws_echo control unaffected.** Pending: nova_ci green (N=1
-  588 both modes + reconverge) + a full N=4 regression re-run to confirm 593 PASS broadly, then COMMIT.
+  `nova_sched_root_task->status==3`. N>1-branch-ONLY => N=1 byte-identical. **DONE + COMMITTED (5456066):**
+  nova_ci ALL GREEN (gen5.ll==gen6.ll B4CAC97E, perf native, 593/594 both modes N=1) + **full N=4
+  regression = 593 PASS / 0 FAIL** (the 5 streaming tests fixed; the ENTIRE suite now passes at BOTH
+  N=1 AND N=4 => multi-core CORRECTNESS broadly validated, the Stage-5 correctness bar met).
   NOTE for re-running forge tests standalone: `_install_forge.ps1` first (installs current forge.nova ->
   nova-compiler/lib), then NOVA_HOME=<repo>/nova-compiler; the _nh_home copy is stale.
-  **THEN REMAINING:** (2) **0E memo** DORMANT (@memo only in compiler+showcase, not Forge/prod — close
-  the codegen lock only if @memo reaches N>1 prod code). (3) **Stage 2/3b PERF** (channel de-convoy +
-  netpoller single-poller — throughput vs Spring/BEAM; Stage 2 is the risky wake-refactor; the netpoller
-  single-poller is the genuine 3b, distinct from this shutdown fix). (4) **Stage 5 flip** N>1 default
-  (high blast-radius; opt-in-prod-ready + soak first). 0D counters = TSAN-follow-on (diagnostic, benign). N=1 invariant = TWO oracles (reconverge for the
+  **THROUGHPUT SOAK DONE (2026-06-26, NOVA_DESIGN/FORGE_N1_SOAK_PLAN.md + harness forge_load_server/
+  client.nova + _forge_load_soak.ps1):** measured N=1/2/4/8 on a handler spectrum, separate-process
+  client, nonce-echo correctness. **bad=0 across ~30k requests (multi-core CORRECTNESS holds under
+  load).** /cpu (compute) scales **3.84× at N=8** (1.53/2.47/3.84 @ 2/4/8) — the beat-on-compute number.
+  But /ping + /user (I/O- + string-bound) get **NO benefit (0.84–0.93×, even regress)**. ROOT CAUSE
+  (measured): the SINGLE accept-loop task pinned to one carrier + netpoller thundering herd (all carriers
+  select() the same nova_io_waiters) + atomic-RC/lock overhead serialize the CONNECTION path. **#1
+  FINDING: the accept/poller serialization is THE bottleneck for typical (I/O-bound) web throughput** —
+  fixing it (per-carrier accept + single-poller) is what makes multi-core Forge BROADLY win, not just
+  compute apps. Decisively confirms flip = **Option B′** (Forge tooling sets NOVA_CARRIERS; NEVER the
+  global default 6841 — it would regress the 95% non-compute case). Benchmark harness committed = the
+  oracle to measure the accept/poller fix against.
+  Soak findings (tracked, not yet built): **N1-server-exit** — a standalone NOVA server exits ~10ms at
+  N=1 because tcp_accept is an UNTIMED io_waiter and the N=1 idle-exit (6661, has_timed_io only counts
+  deadline>0) treats it as pure-io-idle and breaks (worked around in the bench with a keepalive sleep
+  daemon; PROPER FIX = let untimed io_waiters keep the N=1 scheduler alive, gated). **C2** nova_mem_live
+  non-atomic (per-carrier TLS fix; gates only the leak probe). **C1** arena-mode = VERIFIED SAFE.
+  **THEN REMAINING, reprioritized by the data:** (1) **per-carrier accept + single-poller** (the
+  headline throughput work — makes I/O-bound handlers scale; re-run the bench to measure). (2) C2 + the
+  leak/stability soak. (3) hub/SSE race smoke (S7). (4) flip = B′ once I/O scales. (5) N1-server-exit
+  proper fix. 0E memo DORMANT. 0D counters = TSAN-follow-on. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.

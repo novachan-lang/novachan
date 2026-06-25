@@ -1,0 +1,65 @@
+// forge_load_server -- N>1 throughput soak SERVER (design wvemtcezz, NOVA_DESIGN/FORGE_N1_SOAK_PLAN.md).
+// A handler spectrum from I/O-bound (/ping) to CPU-bound (/cpu) so multi-core scaling is reported
+// HONESTLY: the /ping floor measures accept+netpoller serialization; /cpu is the "beat Spring/BEAM on
+// compute" ceiling. Every handler echoes a fixed-width DELIMITED nonce ("N=00012345;") so the client's
+// correctness check can never false-pass on a substring (adversary C3). Carrier count = NOVA_CARRIERS
+// of the *server process* (set by the soak driver). ROUNDS via env so /cpu can be calibrated to ~1ms
+// without recompiling. The FNV-1a loop is native i64 mul/xor (no nsw) -> real compute, not DCE-able.
+import forge
+
+fn env_or(name: string, def: string) -> string
+    let v = env(name)
+    if len(v) == 0
+        def
+    else
+        v
+
+// "N=" + 8-digit zero-padded + ";"  -> never a substring of another nonce's token.
+fn ntok(n: int) -> string
+    let s = str(n)
+    while len(s) < 8
+        s = "0" + s
+    "N=" + s + ";"
+
+// The typed serve path (_serve_conn) passes a Request STRUCT and expects a Response: read params via
+// req.params["nonce"] (struct field -> dict), return via resp_text/resp_json (NOT forge.text, which
+// returns a FULL response string -> double-wrapped). Register the fns directly (forge.get(a,pat,h)).
+
+// (a) TRIVIAL -- the I/O + accept + parse floor.
+fn h_ping(req: Request) -> Response
+    forge.resp_text(200, "pong;" + ntok(parse_int(req.params["nonce"])))
+
+// (b) MODERATE -- a few concats of per-request work (moderate, between /ping and /cpu).
+fn h_json(req: Request) -> Response
+    let n = parse_int(req.params["nonce"])
+    let body = "tok=" + ntok(n) + " name=u active=true id=" + str(n) + " ts=" + str(n * 2)
+    forge.resp_text(200, body)
+
+// (c) CPU-BOUND -- FNV-1a over ROUNDS, seeded by the nonce (defeats CSE) and echoed (forces observation).
+fn h_cpu(req: Request) -> Response
+    let n = parse_int(req.params["nonce"])
+    let rounds = parse_int(env_or("ROUNDS", "300000"))
+    let h = 1469598103934665603
+    let i = 0
+    while i < rounds
+        h = h ^ (n + i)
+        h = h * 1099511628211
+        i = i + 1
+    forge.resp_text(200, "cpu;" + ntok(n) + str(h) + ";")
+
+fn main()
+    let a = forge.app()
+    forge.get(a, "/ping/:nonce", h_ping)
+    forge.get(a, "/user/:nonce", h_json)
+    forge.get(a, "/cpu/:nonce",  h_cpu)
+    let port = parse_int(env_or("PORT", "8080"))
+    // KEEPALIVE DAEMON: at N=1 the scheduler's idle-exit treats an UNTIMED io waiter (the accept) as
+    // "pure I/O-blocked idle" and breaks (nova_runtime.c ~6661 -- nova_sched_has_timed_io only counts
+    // deadline>0). A perpetual sleep waiter is a TIMED waiter, so the idle-exit keeps polling and the
+    // server stays up at N=1 too. Parked the entire run -> zero perturbation of the throughput numbers.
+    // (The proper fix = let untimed io waiters keep the N=1 scheduler alive; tracked separately.)
+    spawn fn()
+        while true
+            sleep(3600000)
+    print("forge_load_server listening port=" + str(port))
+    forge.serve_req(a, port)

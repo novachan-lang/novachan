@@ -1,0 +1,92 @@
+// forge_load_client -- N>1 throughput soak CLIENT (design wvemtcezz). Standalone (NO forge import, so it
+// never pulls the framework into the client). Spawns K green tasks, each doing M sequential request/
+// response round-trips on a fresh connection (Connection: close -> response completeness is unambiguous:
+// recv returns "" on peer close). Task i owns the nonce range [i*M, (i+1)*M) (disjoint -> unique). Every
+// response MUST contain the exact delimited token for THE nonce it sent (adversary C3 -> no substring
+// false-pass) else it counts as `bad`. Run this at NOVA_CARRIERS=8 vs the server's N so the client is
+// never the bottleneck (verify with the saturation check in the soak driver). Prints one ASCII RESULT line.
+
+fn env_or(name: string, def: string) -> string
+    let v = env(name)
+    if len(v) == 0
+        def
+    else
+        v
+
+fn ntok(n: int) -> string
+    let s = str(n)
+    while len(s) < 8
+        s = "0" + s
+    "N=" + s + ";"
+
+fn client_task(host: string, port: int, route: string, m: int, base_nonce: int, result_ch)
+    let ok = 0
+    let bad = 0
+    let r = 0
+    while r < m
+        let nonce = base_nonce + r
+        let sock = tcp_connect(host, port)
+        if sock < 0
+            bad = bad + 1
+        else
+            let req = "GET " + route + str(nonce) + " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            tcp_send(sock, req)
+            // read-to-close: tcp_recv yields <=4095B per call; loop until peer closes (recv -> "").
+            let resp = ""
+            let reading = 1
+            while reading == 1
+                let chunk = tcp_recv(sock)
+                if len(chunk) == 0
+                    reading = 0
+                else
+                    resp = resp + chunk
+            tcp_close(sock)
+            if contains(resp, ntok(nonce))
+                ok = ok + 1
+            else
+                bad = bad + 1
+        r = r + 1
+    send(result_ch, [ok, bad])
+
+fn run_phase(host: string, port: int, route: string, kk: int, m: int, base_off: int) -> list
+    let result_ch = channel()
+    let i = 0
+    while i < kk
+        let base = base_off + i * m
+        spawn fn()
+            client_task(host, port, route, m, base, result_ch)
+        i = i + 1
+    let ok = 0
+    let bad = 0
+    let g = 0
+    while g < kk
+        let res = receive(result_ch)
+        ok = ok + res[0]
+        bad = bad + res[1]
+        g = g + 1
+    [ok, bad]
+
+fn main()
+    let host = env_or("HOST", "127.0.0.1")
+    let port = parse_int(env_or("PORT", "8080"))
+    let route = env_or("ROUTE", "/cpu/")
+    let kk = parse_int(env_or("K", "64"))
+    let mm = parse_int(env_or("M", "200"))
+    let warm = parse_int(env_or("WARM", "10"))
+    sleep(250)   // let the server bind + listen
+
+    // WARMUP (untimed): excludes lazy slab/intern init + TCP slow-start. Disjoint nonce range (>= 9000000).
+    if warm > 0
+        run_phase(host, port, route, kk, warm, 9000000)
+
+    // MEASURED
+    let total = kk * mm
+    let t0 = clock_ns()
+    let res = run_phase(host, port, route, kk, mm, 0)
+    let elapsed_ms = (clock_ns() - t0) / 1000000
+    let ok = res[0]
+    let bad = res[1]
+    let rps = 0
+    if elapsed_ms > 0
+        rps = (ok * 1000) / elapsed_ms
+    print("RESULT route=" + route + " K=" + str(kk) + " M=" + str(mm) + " total=" + str(total) + " ok=" + str(ok) + " bad=" + str(bad) + " elapsed_ms=" + str(elapsed_ms) + " rps=" + str(rps))
