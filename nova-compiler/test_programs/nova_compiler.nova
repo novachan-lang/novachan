@@ -19523,6 +19523,646 @@ fn nova_lint_file(path: string) -> int
     print(path + ": " + str(warnings) + " warning(s)")
     return 0
 
+// ── #34 AST-reprint formatter ──────────────────────────────────────────────
+// Parses to AST and reprints canonical NOVA source FROM the AST, with an absolute
+// safety guarantee via a dual gate + fallback to the whitespace normalizer:
+//   Gate A (faithfulness): parse(orig) == parse(reprint)  (structural AST equality)
+//   Gate B (comments):     comment multiset preserved
+//   Any unhandled node / trailing comment / parse error -> fall back (no regression).
+
+// Raw parse: parse_program WITHOUT the desugaring pipeline (trail_fns/destruct/
+// multiclause/ensures/memo/derives) so the AST round-trips at the source level.
+fn fmt_parse_raw(tokens: list, pe: list) -> list
+    let stmts = []
+    let pos = skip_nl(tokens, 0)
+    while tk(tokens, pos) != "EOF"
+        let prev_pe_len = len(pe)
+        let sr = parse_stmt(tokens, pos, pe)
+        let new_pos = skip_nl(tokens, sr.pos)
+        if len(pe) > prev_pe_len and new_pos <= pos and tk(tokens, pos) != "EOF"
+            pos = pos + 1
+        else
+            pos = new_pos
+        match sr.stmt
+            Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
+                if stag != "error"
+                    push(stmts, sr.stmt)
+    stmts
+
+// Re-escape a decoded string for emission as a "double-quoted" literal. Falls back
+// (sets unsupported) on braces — the lexer treats { } as interpolation — and NULs.
+fn fmt_escape_str(s: string, ctx: dict) -> string
+    let out = ""
+    let i = 0
+    while i < len(s)
+        let c = s[i]
+        let o = ord(c)
+        if c == "\\"
+            out = out + "\\\\"
+        else if c == "\""
+            out = out + "\\\""
+        else if c == "\n"
+            out = out + "\\n"
+        else if c == "\t"
+            out = out + "\\t"
+        else if c == "\r"
+            out = out + "\\r"
+        else if o == 123 or o == 125 or o == 0
+            ctx["unsupported"] = 1
+            return ""
+        else
+            out = out + c
+        i = i + 1
+    out
+
+fn fmt_rp_prec(op: string) -> int
+    if op == "or"
+        return 1
+    if op == "and"
+        return 2
+    if op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=" or op == "in" or op == "is" or op == "matches"
+        return 3
+    if op == "|"
+        return 4
+    if op == "^"
+        return 5
+    if op == "&"
+        return 6
+    if op == "<<" or op == ">>"
+        return 7
+    if op == "+" or op == "-"
+        return 8
+    if op == "*" or op == "/" or op == "%"
+        return 9
+    if op == "**"
+        return 10
+    return 0
+
+fn fmt_rp_indent(level: int) -> string
+    let s = ""
+    let i = 0
+    while i < level
+        s = s + "    "
+        i = i + 1
+    s
+
+fn fmt_rp_expr(e: Expr, ctx: dict) -> string
+    if ctx["unsupported"] == 1
+        return ""
+    match e
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et == "int"
+                return str(en)
+            if et == "float"
+                return ev
+            if et == "str"
+                let esc = fmt_escape_str(ev, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                return chr(34) + esc + chr(34)
+            if et == "bool"
+                return ev
+            if et == "null"
+                return "null"
+            if et == "ident"
+                return ev
+            if et == "binop"
+                if len(ec) < 2
+                    ctx["unsupported"] = 1
+                    return ""
+                let left = ec[0]
+                let right = ec[1]
+                let ls = ""
+                let rs = ""
+                let my_prec = fmt_rp_prec(ev)
+                match left
+                    Expr(lt, lv, ln2, lc, lf, ll) =>
+                        if lt == "binop" and fmt_rp_prec(lv) < my_prec
+                            ls = "(" + fmt_rp_expr(left, ctx) + ")"
+                        else
+                            ls = fmt_rp_expr(left, ctx)
+                match right
+                    Expr(rt, rv, rn2, rc, rf, rl) =>
+                        if rt == "binop"
+                            let rp = fmt_rp_prec(rv)
+                            if ev == "**"
+                                if rp < my_prec
+                                    rs = "(" + fmt_rp_expr(right, ctx) + ")"
+                                else
+                                    rs = fmt_rp_expr(right, ctx)
+                            else
+                                if rp <= my_prec
+                                    rs = "(" + fmt_rp_expr(right, ctx) + ")"
+                                else
+                                    rs = fmt_rp_expr(right, ctx)
+                        else
+                            rs = fmt_rp_expr(right, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                return ls + " " + ev + " " + rs
+            if et == "unary"
+                if len(ec) < 1
+                    ctx["unsupported"] = 1
+                    return ""
+                let operand = fmt_rp_expr(ec[0], ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                if ev == "not"
+                    return "not " + operand
+                return ev + operand
+            if et == "call"
+                let args = ""
+                let ai = 0
+                while ai < len(ec)
+                    if ai > 0
+                        args = args + ", "
+                    args = args + fmt_rp_expr(ec[ai], ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    ai = ai + 1
+                return ev + "(" + args + ")"
+            if et == "method_call"
+                if len(ec) < 1
+                    ctx["unsupported"] = 1
+                    return ""
+                let recv = fmt_rp_expr(ec[0], ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                let margs = ""
+                let mi = 1
+                while mi < len(ec)
+                    if mi > 1
+                        margs = margs + ", "
+                    margs = margs + fmt_rp_expr(ec[mi], ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    mi = mi + 1
+                return recv + "." + ev + "(" + margs + ")"
+            if et == "member"
+                if len(ec) < 1
+                    ctx["unsupported"] = 1
+                    return ""
+                let obj = fmt_rp_expr(ec[0], ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                return obj + "." + ev
+            if et == "index"
+                if len(ec) < 2
+                    ctx["unsupported"] = 1
+                    return ""
+                let tgt = fmt_rp_expr(ec[0], ctx)
+                let idx = fmt_rp_expr(ec[1], ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                return tgt + "[" + idx + "]"
+            if et == "list"
+                let elems = ""
+                let li = 0
+                while li < len(ec)
+                    if li > 0
+                        elems = elems + ", "
+                    elems = elems + fmt_rp_expr(ec[li], ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    li = li + 1
+                return "[" + elems + "]"
+            if et == "dict"
+                let lb = chr(123)
+                let rb = chr(125)
+                let entries = ""
+                let di = 0
+                while di < len(ec)
+                    if di > 0
+                        entries = entries + ", "
+                    match ec[di]
+                        Expr(pt, pv, pn, pc, pf, pl) =>
+                            if pt == "pair" and len(pc) >= 2
+                                let pk = fmt_rp_expr(pc[0], ctx)
+                                let pval = fmt_rp_expr(pc[1], ctx)
+                                if ctx["unsupported"] == 1
+                                    return ""
+                                entries = entries + pk + ": " + pval
+                            else
+                                ctx["unsupported"] = 1
+                                return ""
+                    di = di + 1
+                return lb + entries + rb
+            ctx["unsupported"] = 1
+            return ""
+
+fn fmt_rp_param(p: Param, ctx: dict) -> string
+    match p
+        Param(pn, pt, pd) =>
+            match pd
+                Expr(dt, dv, dn, dc, df, dl) =>
+                    if dt != "null"
+                        ctx["unsupported"] = 1
+                        return ""
+            if pt != ""
+                return pn + ": " + pt
+            return pn
+
+fn fmt_rp_stmt(s: Stmt, indent: int, ctx: dict) -> string
+    if ctx["unsupported"] == 1
+        return ""
+    let pad = fmt_rp_indent(indent)
+    match s
+        Stmt(st, sn, se, sb, sp, sel, san, sl) =>
+            if st == "fn"
+                if len(san) > 0 or len(sel) > 0
+                    ctx["unsupported"] = 1
+                    return ""
+                let header = pad + "fn " + sn + "("
+                let pi = 0
+                while pi < len(sp)
+                    if pi > 0
+                        header = header + ", "
+                    header = header + fmt_rp_param(sp[pi], ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    pi = pi + 1
+                header = header + ")"
+                match se
+                    Expr(ret_tag, ret_val, ret_num, ret_c, ret_f, ret_ln) =>
+                        if ret_tag == "rettype"
+                            header = header + " -> " + ret_val
+                let result = header + "\n"
+                let bi = 0
+                while bi < len(sb)
+                    result = result + fmt_rp_stmt_c(sb[bi], indent + 1, ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    bi = bi + 1
+                return result
+            if st == "type"
+                if len(san) > 0
+                    ctx["unsupported"] = 1
+                    return ""
+                let result = pad + "type " + sn + "\n"
+                let fi = 0
+                while fi < len(sp)
+                    match sp[fi]
+                        Param(fn2, ft, fd) =>
+                            if ft != ""
+                                result = result + fmt_rp_indent(indent + 1) + fn2 + ": " + ft + "\n"
+                            else
+                                result = result + fmt_rp_indent(indent + 1) + fn2 + "\n"
+                    fi = fi + 1
+                return result
+            if st == "const"
+                let val = fmt_rp_expr(se, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                return pad + "const " + sn + " = " + val + "\n"
+            if st == "assign"
+                if sn != ""
+                    let type_ann = ""
+                    if len(sp) > 0
+                        match sp[0]
+                            Param(pn, pt, pd) =>
+                                if pt != ""
+                                    type_ann = pt
+                    let has_init = true
+                    match se
+                        Expr(set2, sev, sen, sec, sef, seln) =>
+                            if set2 == "null" and seln == 0
+                                has_init = false
+                    if has_init
+                        let val = fmt_rp_expr(se, ctx)
+                        if ctx["unsupported"] == 1
+                            return ""
+                        if type_ann != ""
+                            return pad + "let " + sn + ": " + type_ann + " = " + val + "\n"
+                        return pad + "let " + sn + " = " + val + "\n"
+                    else
+                        if type_ann != ""
+                            return pad + "let " + sn + ": " + type_ann + "\n"
+                        return pad + "let " + sn + "\n"
+                else
+                    if len(san) < 1
+                        ctx["unsupported"] = 1
+                        return ""
+                    let target = fmt_rp_expr(san[0], ctx)
+                    let val = fmt_rp_expr(se, ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    return pad + target + " = " + val + "\n"
+            if st == "return"
+                match se
+                    Expr(ret, rv, rn, rc, rf, rln) =>
+                        if ret == "null" and rln == 0
+                            return pad + "return\n"
+                let val = fmt_rp_expr(se, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                return pad + "return " + val + "\n"
+            if st == "if"
+                let cond = fmt_rp_expr(se, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                let result = pad + "if " + cond + "\n"
+                let bi = 0
+                while bi < len(sb)
+                    result = result + fmt_rp_stmt_c(sb[bi], indent + 1, ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    bi = bi + 1
+                if len(sel) == 1
+                    match sel[0]
+                        Stmt(elt, eln2, ele, elb, elp, elel, elan, ell) =>
+                            if elt == "if"
+                                let nested = fmt_rp_stmt(sel[0], indent, ctx)
+                                if ctx["unsupported"] == 1
+                                    return ""
+                                result = result + pad + "else " + slice(nested, len(pad), len(nested))
+                                return result
+                            else
+                                result = result + pad + "else\n" + fmt_rp_stmt_c(sel[0], indent + 1, ctx)
+                                if ctx["unsupported"] == 1
+                                    return ""
+                                return result
+                else if len(sel) > 1
+                    result = result + pad + "else\n"
+                    let ei = 0
+                    while ei < len(sel)
+                        result = result + fmt_rp_stmt_c(sel[ei], indent + 1, ctx)
+                        if ctx["unsupported"] == 1
+                            return ""
+                        ei = ei + 1
+                return result
+            if st == "while"
+                let cond = fmt_rp_expr(se, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                let result = pad + "while " + cond + "\n"
+                let bi = 0
+                while bi < len(sb)
+                    result = result + fmt_rp_stmt_c(sb[bi], indent + 1, ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    bi = bi + 1
+                return result
+            if st == "for"
+                let iter = fmt_rp_expr(se, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                let result = pad + "for " + sn + " in " + iter + "\n"
+                let bi = 0
+                while bi < len(sb)
+                    result = result + fmt_rp_stmt_c(sb[bi], indent + 1, ctx)
+                    if ctx["unsupported"] == 1
+                        return ""
+                    bi = bi + 1
+                if len(sel) > 0
+                    result = result + pad + "else\n"
+                    let ei = 0
+                    while ei < len(sel)
+                        result = result + fmt_rp_stmt_c(sel[ei], indent + 1, ctx)
+                        if ctx["unsupported"] == 1
+                            return ""
+                        ei = ei + 1
+                return result
+            if st == "expr"
+                let val = fmt_rp_expr(se, ctx)
+                if ctx["unsupported"] == 1
+                    return ""
+                return pad + val + "\n"
+            if st == "break"
+                return pad + "break\n"
+            if st == "continue"
+                return pad + "continue\n"
+            if st == "import"
+                if len(san) > 0
+                    let alias = str(san[0])
+                    if alias != "" and alias != sn
+                        return pad + "import " + sn + " as " + alias + "\n"
+                return pad + "import " + sn + "\n"
+            ctx["unsupported"] = 1
+            return ""
+
+// Collect comment-only lines: line_number -> text. Sets unsupported on a trailing
+// code-line comment or a block comment (we only safely preserve own-line comments).
+fn fmt_collect_comments(source: string, ctx: dict) -> dict
+    let comments = {}
+    let lines = split(source, "\n")
+    let li = 0
+    while li < len(lines)
+        let line = lines[li]
+        let trimmed = trim(line)
+        let line_num = li + 1
+        if len(trimmed) >= 2 and slice(trimmed, 0, 2) == "//"
+            comments[str(line_num)] = trimmed
+        else if len(trimmed) > 0
+            let ci = 0
+            let in_str = false
+            while ci < len(trimmed)
+                let ch = trimmed[ci]
+                if ch == "\"" and (ci == 0 or trimmed[ci - 1] != "\\")
+                    in_str = not in_str
+                else if not in_str and ch == "/" and ci + 1 < len(trimmed) and trimmed[ci + 1] == "/"
+                    ctx["unsupported"] = 1
+                    ci = len(trimmed)
+                ci = ci + 1
+            if find(trimmed, "/*") >= 0
+                ctx["unsupported"] = 1
+        li = li + 1
+    comments
+
+fn fmt_comment_texts(comments: dict) -> list
+    let texts = []
+    let ks = keys(comments)
+    for k in ks
+        push(texts, comments[k])
+    sort(texts)
+
+fn fmt_ast_equal_expr(a: Expr, b: Expr) -> bool
+    match a
+        Expr(at, av, an, ac, af, al) =>
+            match b
+                Expr(bt, bv, bn, bc, bf, bl) =>
+                    if at != bt
+                        return false
+                    if av != bv
+                        return false
+                    if an != bn
+                        return false
+                    if len(ac) != len(bc)
+                        return false
+                    let ci = 0
+                    while ci < len(ac)
+                        if not fmt_ast_equal_expr(ac[ci], bc[ci])
+                            return false
+                        ci = ci + 1
+                    if len(af) != len(bf)
+                        return false
+                    let fi = 0
+                    while fi < len(af)
+                        if not fmt_ast_equal_expr(af[fi], bf[fi])
+                            return false
+                        fi = fi + 1
+                    return true
+
+fn fmt_ast_equal_params(a: list, b: list) -> bool
+    if len(a) != len(b)
+        return false
+    let i = 0
+    while i < len(a)
+        match a[i]
+            Param(an, at, ad) =>
+                match b[i]
+                    Param(bn, bt, bd) =>
+                        if an != bn
+                            return false
+                        if at != bt
+                            return false
+                        if not fmt_ast_equal_expr(ad, bd)
+                            return false
+        i = i + 1
+    true
+
+fn fmt_ast_equal_stmt(a: Stmt, b: Stmt) -> bool
+    match a
+        Stmt(at, an, ae, ab, ap, ael, aan, asl) =>
+            match b
+                Stmt(bt, bn, be, bb, bp, bel, ban, bsl) =>
+                    if at != bt
+                        return false
+                    if an != bn
+                        return false
+                    if not fmt_ast_equal_expr(ae, be)
+                        return false
+                    if not fmt_ast_equal_list(ab, bb)
+                        return false
+                    if not fmt_ast_equal_params(ap, bp)
+                        return false
+                    if not fmt_ast_equal_list(ael, bel)
+                        return false
+                    if len(aan) != len(ban)
+                        return false
+                    if at == "import"
+                        let ai = 0
+                        while ai < len(aan)
+                            if str(aan[ai]) != str(ban[ai])
+                                return false
+                            ai = ai + 1
+                    else
+                        let ai = 0
+                        while ai < len(aan)
+                            if not fmt_ast_equal_expr(aan[ai], ban[ai])
+                                return false
+                            ai = ai + 1
+                    return true
+
+fn fmt_ast_equal_list(a: list, b: list) -> bool
+    if len(a) != len(b)
+        return false
+    let i = 0
+    while i < len(a)
+        if not fmt_ast_equal_stmt(a[i], b[i])
+            return false
+        i = i + 1
+    true
+
+// Comment-aware stmt wrapper: emits own-line comments anchored BEFORE this stmt's
+// source line (re-indented to the stmt's level) via a shared cursor in ctx, then the
+// stmt — so comments interleave at EVERY nesting level, not just the top level.
+fn fmt_rp_stmt_c(s: Stmt, indent: int, ctx: dict) -> string
+    if ctx["unsupported"] == 1
+        return ""
+    let pad = fmt_rp_indent(indent)
+    let sline = 0
+    match s
+        Stmt(st, sn, se, sb, sp, sel, san, sl) =>
+            sline = sl
+    let pre = ""
+    let clines = ctx["clines"]
+    while ctx["ccur"] < len(clines) and clines[ctx["ccur"]] < sline
+        let cl = clines[ctx["ccur"]]
+        pre = pre + pad + ctx["comments"][str(cl)] + "\n"
+        ctx["ccur"] = ctx["ccur"] + 1
+    pre + fmt_rp_stmt(s, indent, ctx)
+
+// Reprint stmts, interleaving own-line comments anchored by source line number.
+fn fmt_reprint(stmts: list, comments: dict, ctx: dict) -> string
+    let comment_lines = []
+    let ks = keys(comments)
+    for k in ks
+        push(comment_lines, int(k))
+    comment_lines = sort(comment_lines)
+    ctx["comments"] = comments
+    ctx["clines"] = comment_lines
+    ctx["ccur"] = 0
+    let result = ""
+    let si = 0
+    while si < len(stmts)
+        if ctx["unsupported"] == 1
+            return ""
+        result = result + fmt_rp_stmt_c(stmts[si], 0, ctx)
+        if ctx["unsupported"] == 1
+            return ""
+        match stmts[si]
+            Stmt(st2, sn2, se2, sb2, sp2, sel2, san2, sl2) =>
+                if st2 == "fn" or st2 == "type"
+                    result = result + "\n"
+        si = si + 1
+    while ctx["ccur"] < len(ctx["clines"])
+        result = result + ctx["comments"][str(ctx["clines"][ctx["ccur"]])] + "\n"
+        ctx["ccur"] = ctx["ccur"] + 1
+    result
+
+fn nova_fmt_file_ast(path: string)
+    let content = read_file(path)
+    if len(content) == 0
+        print("error: file not found or empty: " + path)
+        exit(1)
+    let tokens1 = tokenize(content)
+    let pe1 = []
+    let stmts1 = fmt_parse_raw(tokens1, pe1)
+    if len(pe1) > 0
+        nova_fmt_file(path)
+        return 0
+    let ctx = {}
+    ctx["unsupported"] = 0
+    let comments1 = fmt_collect_comments(content, ctx)
+    if ctx["unsupported"] == 1
+        nova_fmt_file(path)
+        return 0
+    let src2 = fmt_reprint(stmts1, comments1, ctx)
+    if ctx["unsupported"] == 1
+        nova_fmt_file(path)
+        return 0
+    if len(src2) == 0 and len(stmts1) > 0
+        nova_fmt_file(path)
+        return 0
+    let tokens2 = tokenize(src2)
+    let pe2 = []
+    let stmts2 = fmt_parse_raw(tokens2, pe2)
+    if len(pe2) > 0
+        nova_fmt_file(path)
+        return 0
+    if not fmt_ast_equal_list(stmts1, stmts2)
+        nova_fmt_file(path)
+        return 0
+    let ctx2 = {}
+    ctx2["unsupported"] = 0
+    let comments2 = fmt_collect_comments(src2, ctx2)
+    if ctx2["unsupported"] == 1
+        nova_fmt_file(path)
+        return 0
+    let texts1 = fmt_comment_texts(comments1)
+    let texts2 = fmt_comment_texts(comments2)
+    if len(texts1) != len(texts2)
+        nova_fmt_file(path)
+        return 0
+    let ti = 0
+    while ti < len(texts1)
+        if texts1[ti] != texts2[ti]
+            nova_fmt_file(path)
+            return 0
+        ti = ti + 1
+    write_file(path, src2)
+    print("Formatted (AST): " + path)
+
 fn nova_fmt_file(path: string)
     let content = read_file(path)
     if len(content) == 0
@@ -20496,7 +21136,7 @@ fn compiler_main()
         if len(arguments) < 3
             print("Usage: nova fmt <file.nova>")
             exit(1)
-        nova_fmt_file(arguments[2])
+        nova_fmt_file_ast(arguments[2])
         exit(0)
     if cmd == "lint"
         if len(arguments) < 3

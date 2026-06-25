@@ -49,6 +49,10 @@ Write-Host "`n[CI 2h/3] #35 const-fn-eval gate (compile-time fold of const fn ca
 & .\_s35_constfn_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2h (const-fn-eval) ==="; exit 1 }
 
+Write-Host "`n[CI 2i/3] #34 AST-reprint formatter gate (canonical+faithful+idempotent+comments; safe fallback)..."
+& .\_s34_fmt_check.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2i (AST-reprint formatter) ==="; exit 1 }
+
 Write-Host "`n[CI 2b/3] N>1 multi-core gate (concurrency flagships at NOVA_CARRIERS=4/8)..."
 & .\_n_carriers_ci.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b (N>1 concurrency regression) ==="; exit 1 }
