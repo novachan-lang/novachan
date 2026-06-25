@@ -241,13 +241,38 @@ static int64_t nova_make_reason(int crashed) {
 static uintptr_t nova_heap_base;
 static uintptr_t nova_heap_top;
 
+/* Forward decl: g_carrier_count is defined+initialized (=1) near the scheduler (~L5066). Declared here
+   (tentative definition, C11 6.9.2 — the initialized def below is authoritative) so the allocation-path
+   heap-bounds tracker can gate its N>1 atomic update on the carrier count. */
+static int g_carrier_count;
+
 /* Track the [base, top) extent of EVERY RC-managed allocation. This lets the tag/RC
    checks reject a non-pointer value (a raw int or float-bit pattern) with two cheap
    compares BEFORE dereferencing it — essential on Linux/macOS where there is no
    IsBadReadPtr to catch a bad read. Every header-creating allocation must call this. */
 static void nova_track_heap_bounds(uintptr_t base_addr, uintptr_t end_addr) {
-    if (nova_heap_base == 0 || base_addr < nova_heap_base) nova_heap_base = base_addr;
-    if (end_addr > nova_heap_top) nova_heap_top = end_addr;
+    if (g_carrier_count > 1) {
+        /* N>1 (Stage 0A): monotonic ATOMIC update — base only shrinks, top only grows. Fixes the
+           read-check-write CLOBBER where two carriers race this tracker and one's wider extent is
+           lost, permanently NARROWING the global [base,top); find_tag then misclassifies a genuine
+           heap object as a raw int (and the reverse) = CVE-class value-model corruption. Relaxed is
+           sufficient: find_tag needs only a non-torn aligned 8-byte bound (atomic on x86 & AArch64),
+           not a happens-before with the allocator; the monotonic CAS makes any stale read WIDE (a safe
+           extra RC-header check), never narrow — and a carrier's own pointers are always covered by
+           that carrier's own program-order update before the pointer is used. */
+        uintptr_t cur = __atomic_load_n(&nova_heap_base, __ATOMIC_RELAXED);
+        while ((cur == 0 || base_addr < cur) &&
+               !__atomic_compare_exchange_n(&nova_heap_base, &cur, base_addr, 1,
+                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+        cur = __atomic_load_n(&nova_heap_top, __ATOMIC_RELAXED);
+        while (end_addr > cur &&
+               !__atomic_compare_exchange_n(&nova_heap_top, &cur, end_addr, 1,
+                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+    } else {
+        /* N=1 (default): byte-identical to the original non-atomic path. */
+        if (nova_heap_base == 0 || base_addr < nova_heap_base) nova_heap_base = base_addr;
+        if (end_addr > nova_heap_top) nova_heap_top = end_addr;
+    }
 }
 
 typedef struct NovaSlabPage {
@@ -7382,6 +7407,9 @@ void nova_rt_init(void) {
        the TOCTOU where two threads could both pass `if (!nova_file_init)` and double-init the CS. */
     nova_file_ensure_init();
     nova_slab_init();
+    /* Seed the heap-bounds extent (find_tag's coarse filter). SINGLE-THREADED init, BEFORE any carrier
+       thread spawns (g_carrier_count is still 1 here) — so these are plain writes by design; the only
+       CONCURRENT writer is nova_track_heap_bounds, which uses a monotonic CAS at N>1 (Stage 0A). */
     void* probe = malloc(64);
     if (probe) {
         nova_heap_base = (uintptr_t)probe;

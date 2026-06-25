@@ -64,8 +64,11 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   ALL folded in; goNoGo=revise = build the revised stages). It IS the complete multithreading-for-Forge
   design: **Stages 0-5, ending at Stage 5 = flip N>1 default → Forge on all cores** (that IS the
   parallelism; work-stealing folded to optional-later, NOT needed for v1 — the global-injector-claim
-  model already balances new connections across idle cores). **AWAITING OWNER GO** to build **Stage 0A**
-  (nova_track_heap_bounds monotonic CAS, gated). N=1 invariant = TWO oracles (reconverge for the
+  model already balances new connections across idle cores). **LOOP RUNNING (owner GO given, full autonomy to the Forge end).** Stage 0A (heap-bounds
+  monotonic CAS, gated) IMPLEMENTED in output/nova_runtime.c — N>1 stress PASS (25/25 normal + 8/8 ASAN
+  at NOVA_CARRIERS=4); guard _n1_heapbounds_test added to the regression; N=1 gate (nova_ci) was
+  running. 0B-0E DESIGNED (0B intern-table lock before lazy-init / 0C box-track CAS / 0D counters
+  relaxed-atomic / 0E memo lock — all gated g_carrier_count>1) — implement as one batch after 0A commits. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.
