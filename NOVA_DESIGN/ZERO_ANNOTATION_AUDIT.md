@@ -108,3 +108,41 @@ field access* — is the novel thing, and it lands hardest on the compiler itsel
   gated; (2) hygienic `quote`/`$splice`; (3) field-access-over-destructuring. This competes with Forge
   for priority — it is arguably more core (it's the "simpler than Python" proof). User decides the mix.
 - **Track B (Forge):** continues; all NEW Forge code is written to the standard from here.
+
+---
+
+## SYNTHESIS — design workflow w60vm6it3 (2026-06-25, 11 agents, code-grounded)
+
+A 4-phase workflow (audit → design → adversarial review → synthesize) settled the path against the REAL compiler code (every claim cites `nova_compiler.nova` file:line).
+
+### The adversarial review KILLED both naive inference designs (we dodged a CVE)
+- **use-set-monomorphization**: *needs-work* — premise false (`ti_fn_param_types` is ALREADY `d_fn_type`-sourced + struct-filtered at 12985-13000 / 9921); lambda-hero path structurally broken by the capture-prefix index shift (7204-7212) + the TI/IR phase boundary.
+- **structural-bidirectional (unique-field narrowing)**: **UNSOUND / CVE-class** — pinning a param to struct S from a field access emits a NATIVE struct slot-read; if any caller passes a non-struct (`any`/`dict`), that's type-confusion strictly worse than B12. Rejected.
+
+### Honest reframe on the Forge hero
+NOVA lambdas take NO annotation today. The load-bearing `req: Request` sits on the named helper (`list_todos(req: Request, pool)`). So making `fn(req) -> ...` work buys **correctness (closes B12) + native dispatch (perf)** — NOT developer-annotation reduction. The hero is already lambda-annotation-free; be transparent about that.
+
+### class-I (strip now — verified byte-identical .ll)
+- ALL `: string` params (~209): `+`/`==`/index/`len` dispatch on the operand / `_any` runtime fn, not the annotation.
+- `-> string`/`-> bool` returns NOT feeding typed dispatch (~110). EXCLUDE any `-> Struct` return that feeds `let x=f(); x.field`.
+- Direct-call `: int`/`: dict`/`: list`/struct params whose callers all pass typed literals/locals (fpt/struct-S1 recovers them). NOT the forwarded helper→helper params.
+
+### class-G (real gaps — compiler tasks; NEVER re-annotate around them)
+1. **Lambda param typing** (TI lambda case = `nt_any`, 11934). Solve in the IR layer (captures known), by NAME not positional index.
+2. **Cross-fn forwarding of SCALAR params** (tree-walkers `ce_*`/`eval_expr`/`fmt_rp_*`). Sound fix = whole-program use-SET monomorphization (per-instantiation, conflict→`any`). The int/float landmine lives here — naive body-flow FORBIDDEN.
+3. **B12 global field-slot collision** — a SYMPTOM of (1)/(2), not independent. Do NOT "fix" with a field→struct reverse map (shared field names body/path/headers = ambiguous/unsound).
+4. **Unannotated struct returns** don't flow to caller dispatch (`ir_fn_returns` only from source `-> Type`). Thread the HM-resolved struct name (`ti_to_ir_stype`, preserves names) in.
+5. **Metaprogramming boilerplate** — 474 `Expr(` + 248 `Stmt(` construction sites. Not inference; the quasi-quote feature.
+
+### Staged, gated plan (safest first)
+- **S0** — strip verified class-I `: string`/`-> string`/`-> bool` (per cluster: .ll-diff byte-identical → reconverge → 588 both modes). Very low risk. **THE SAFE FIRST STEP.**
+- **S1** — IR-layer lambda-param struct pinning (the hero): pin by NAME when the body forwards into an already-pinned struct param AND no caller can supply a non-struct; flag `NOVA_LAMBDA_INFER` (default OFF). Gated + `_lambda_param_any_arg` CVE canary + float canaries.
+- **S2** — thread HM-resolved struct RETURN names into `ir_fn_returns` (unannotated struct returns flow to caller dispatch). Nominal-only, low-medium.
+- **S3** — compiler-internal hygienic `quote(...)`/`$splice` (the "looks new" novelty). Sidesteps the int/float landmine (touches neither `ti_*` nor `fpt`). Must-fixes: name-fragment splice concatenates at REIFY time into `Expr.value`; BEHAVIORAL-equivalence oracle (NOT .ll-identity, due to the `__quote_ln` hoist); parse-phase gensym determinism (protects reconvergence).
+- **S4** — sound whole-program use-set monomorphization for SCALAR forwarding (the compiler's perf prize: tree-walkers go native). **HIGH RISK — the documented unsoundness zone.** Defer until S0–S3 + the int-AND-float generic-HOF canary harness are in place. Naive type-flow FORBIDDEN.
+
+### Open questions for the owner
+1. The hero (S1) is correctness+perf, not annotation reduction — prioritize it, or chase literal-zero-annotations-everywhere (needs the high-risk S4)?
+2. Visible annotation-count reduction first (S0–S3), or accept S4 risk for compiler self-compile speed?
+3. `quote(...)` user-facing macro now, or compiler-internal only until the language matures?
+4. S2 may fire `E1007 no-field` errors earlier (correct rejections) — acceptable, or strictly additive?
