@@ -1,3 +1,7 @@
+> ⚠️ **SUPERSEDED — 2026-06-25. Archived for history; do not plan from this file.** The canonical Forge docs are **[FORGE_STATUS.md](FORGE_STATUS.md)** (what/why) and **[FORGE_BUILD_PLAN.md](FORGE_BUILD_PLAN.md)** (how/when). Everything actionable here has been reconciled into those two against the real `forge.nova` source + all tests.
+
+---
+
 # FORGE MASTER PLAN -- Beat Spring Boot, Django, and Every Framework That Exists
 
 **Date:** 2026-06-15 (supersedes the 2026-06-04 draft)

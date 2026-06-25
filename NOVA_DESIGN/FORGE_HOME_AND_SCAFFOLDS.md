@@ -1,3 +1,7 @@
+> ⚠️ **SUPERSEDED — 2026-06-25. Archived for history; do not plan from this file.** The canonical Forge docs are **[FORGE_STATUS.md](FORGE_STATUS.md)** (what/why) and **[FORGE_BUILD_PLAN.md](FORGE_BUILD_PLAN.md)** (how/when). The `nova new` scaffold work tracked here is now build-plan tasks in S0 (note: `nova new` is currently wired to a dead `nova_pkg_new` stub — see FORGE_STATUS §4 B9).
+
+---
+
 # Forge Home + `nova new` Scaffolds — Architecture & Execution
 
 Status: ACTIVE (arc started incr-8). This is the "download-and-go" DX the user prioritised:

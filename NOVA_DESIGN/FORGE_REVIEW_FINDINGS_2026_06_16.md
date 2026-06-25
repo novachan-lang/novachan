@@ -1,3 +1,7 @@
+> ⚠️ **SUPERSEDED — 2026-06-25. Archived for history; do not plan from this file.** The canonical Forge docs are **[FORGE_STATUS.md](FORGE_STATUS.md)** (what/why) and **[FORGE_BUILD_PLAN.md](FORGE_BUILD_PLAN.md)** (how/when). The findings here were re-read in full on 2026-06-25 and folded into FORGE_STATUS §4 (incl. the `from_json` SEGFAULT and `nova new` dead-stub bugs).
+
+---
+
 # Forge Competitive + Adversarial Review — 2026-06-16 (workflow w6vnsvm0t, 12 agents)
 
 7 competitor lenses (Spring/Django/Rails/Phoenix/Express/FastAPI/Axum) + 3 adversary passes

@@ -1,3 +1,7 @@
+> ⚠️ **SUPERSEDED — 2026-06-25. Archived for history; do not plan from this file.** The canonical Forge docs are **[FORGE_STATUS.md](FORGE_STATUS.md)** (what/why) and **[FORGE_BUILD_PLAN.md](FORGE_BUILD_PLAN.md)** (how/when). Everything actionable here has been reconciled into those two against the real `forge.nova` source + all tests.
+
+---
+
 # FORGE ARCHITECTURE — Complete Design & Project Structure
 
 **Date:** 2026-06-04
