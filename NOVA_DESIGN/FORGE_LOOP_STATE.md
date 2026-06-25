@@ -126,10 +126,22 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   deadline>0) treats it as pure-io-idle and breaks (worked around in the bench with a keepalive sleep
   daemon; PROPER FIX = let untimed io_waiters keep the N=1 scheduler alive, gated). **C2** nova_mem_live
   non-atomic (per-carrier TLS fix; gates only the leak probe). **C1** arena-mode = VERIFIED SAFE.
-  **THEN REMAINING, reprioritized by the data:** (1) **per-carrier accept + single-poller** (the
-  headline throughput work — makes I/O-bound handlers scale; re-run the bench to measure). (2) C2 + the
-  leak/stability soak. (3) hub/SSE race smoke (S7). (4) flip = B′ once I/O scales. (5) N1-server-exit
-  proper fix. 0E memo DORMANT. 0D counters = TSAN-follow-on. N=1 invariant = TWO oracles (reconverge for the
+  **ACCEPT/POLLER SCALING DESIGNED (FORGE_ACCEPT_POLLER_PLAN.md, design wc8trswnr adversary-vetted):**
+  single-poller THREAD (kills the herd) + wake-one + parallel-accept, STAGED S-a→S-b→S-c, each gated.
+  **VERDICT: build-ready but DELIBERATE focused work, NOT an overnight rush** — S-a alone is a new poller
+  thread + break-fd + per-carrier events + idle-wait restructure on the MOST concurrency-critical code
+  (~8 subtle adversary hazards) and its payoff is only BREAK-EVEN (~1.0×; the real gain is S-c). A subtle
+  lost-wakeup could pass a green_scale gate and fail in the field → soundness #1 says implement with full
+  attention, gate each stage against the committed soak harness. DEFERRED-by-design: the F1-spin-under-
+  lock restructure (open ONLY if S-a's soak shows it's the ceiling).
+  **THEN REMAINING:** (1) **implement accept/poller S-a→S-b→S-c** (deliberate session; THE I/O-throughput
+  lever). (2) C2 mem_live TLS + leak/stability soak. (3) flip = B′ once I/O scales. (4) N1-server-exit
+  proper fix (untimed io_waiters keep N=1 alive — small, gated; removes the bench keepalive daemon). (5)
+  **Forge Phase B moats** (OTP declarative API / observability / auth — the mission's BREADTH; lower-risk
+  Forge-level code). 0E memo DORMANT. 0D counters = TSAN-follow-on.
+  **★ NEXT SESSION:** either (a) implement accept/poller S-a with full focus, or (b) Forge Phase B
+  features — both advance "beat the frameworks"; the multi-core FOUNDATION (correctness + compute-
+  throughput) is DONE + measured + banked. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.
