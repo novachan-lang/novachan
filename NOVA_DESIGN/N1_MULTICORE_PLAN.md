@@ -19,6 +19,13 @@ Both required. Plus N>1 stress (below). All new N>1 code gated `g_carrier_count>
   once, no re-park double-run).
 - **(C) fiber_reclaim_mn** (50k task churn, RSS plateaus ≤~2× N=1, NOVA_SCHED_WATCHDOG=1 to stress the
   fiber-read-vs-free UAF) + **green_netpoll_mn** (8 concurrent socket round-trips < 5s).
+- **Sanitizers:** ASAN clean every stage (UAF/OOB). For the concurrency-heavy stages (2 channel, 3
+  netpoller, 4 fiber-reclaim), ALSO run **TSAN (ThreadSanitizer) on the Linux path** — the gold-standard
+  *data-race* detector that catches lost-wakeup / memory-ordering bugs ASAN cannot. (Windows is primary
+  for dev; the race stages get a dedicated Linux TSAN pass.)
+- **Test-FIRST:** for each race fix, write the failing-interleaving test that FAILS on the pre-fix code
+  first, then the fix makes it pass (same discipline as the inference canaries). Kill-on-timeout is
+  MANDATORY on every N>1 test (a hung concurrency test must be force-killed — WaitForExit does NOT kill).
 
 ## Staged plan (safest-first; each stage gated by the two oracles + the relevant stress harness)
 
