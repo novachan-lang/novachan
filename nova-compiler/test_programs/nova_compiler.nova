@@ -15157,9 +15157,16 @@ type IrEmitter
     ire_s5_byval: dict          // #15 S5 ABI: fname -> list of [param_idx, struct_name] pairs for by-value eligible params. EMPTY when NOVA_S5_ABI off.
     ire_s5_sdefs: dict          // #15 S5 ABI: reference to ir_sdefs for field kind lookups during emission.
     ire_s5_struct_ptr: dict     // #15 S5 ABI: per-function: dest_reg -> ptr_name for stackable make_struct dests (so call-site scalarization can GEP from it).
+    ire_dwarf_vars: int         // #33: when 1 (NOVA_DWARF_VARS / `nova debug`), emit DWARF DILocalVariable + llvm.dbg.declare so lldb can inspect NOVA locals. Default 0 -> byte-identical line-tables-only DWARF.
+    ire_dbg_vars: list          // #33: collected [varid, name, sp_id, line] DILocalVariable entries, emitted in the metadata section. EMPTY unless ire_dwarf_vars.
+    ire_cur_fn_line: int        // #33: source line of the function currently being emitted (for DILocalVariable line attrs).
 
 fn new_ir_emitter(filename: string, target: string) -> IrEmitter
-    IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {})
+    let e = IrEmitter([], [], {}, 0, {}, 0, filename, {}, 200, [], 0, target, {}, [], 0, {}, {}, {}, 0, 0, -1, {}, 0, 0, {}, {}, {}, {}, {}, 0, {}, {}, {}, 0, {}, {}, {}, {}, {}, {}, 0, [], 0)
+    // #33: enable DWARF variable emission when requested (NOVA_DWARF_VARS or `nova debug`).
+    if env("NOVA_DWARF_VARS") != ""
+        e.ire_dwarf_vars = 1
+    e
 
 // Mark dest as a raw double. ire_reg_types is also set by slot_load propagation (a FLAT,
 // control-flow-insensitive map -> can be wrongly "float" for a reassigned slot), so that
@@ -15171,6 +15178,19 @@ fn new_ir_emitter(filename: string, target: string) -> IrEmitter
 fn ire_mark_float(e: IrEmitter, d: string)
     e.ire_reg_types[d] = "float"
     e.ire_proven_float[d] = 1
+
+// #33: emit a DWARF DILocalVariable + llvm.dbg.declare for a `%slot.<vname>` alloca, so
+// lldb can inspect the NOVA local by name. No-op unless NOVA_DWARF_VARS is on and the
+// current function carries debug info. The variable is typed `nova_value` (a 64-bit value);
+// the nova_lldb.py summary renders it structurally via the runtime formatter.
+fn ire_emit_dbg_local(e: IrEmitter, vname: string)
+    if e.ire_dwarf_vars != 1 or e.ire_fn_sp_id == 0
+        return 0
+    let vid = e.ire_dbg_counter
+    e.ire_dbg_counter = e.ire_dbg_counter + 1
+    push(e.ire_dbg_vars, [vid, vname, e.ire_fn_sp_id, e.ire_cur_fn_line])
+    ire_indent(e, "call void @llvm.dbg.declare(metadata ptr %slot." + vname + ", metadata !" + str(vid) + ", metadata !DIExpression()), !dbg !" + str(e.ire_dbg_loc))
+    0
 
 // Mint or recycle a DILocation id for a given source line within the current
 // function's scope. Returns 0 if no scope is active (debug info off for this
@@ -16535,8 +16555,10 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                 // function is discarded.
                 e.ire_line_locs = {}
                 e.ire_fn_sp_id = sp_id
+                e.ire_cur_fn_line = e.ire_fn_lines[name]   // #33: for DILocalVariable line attrs
             else
                 e.ire_fn_sp_id = 0
+                e.ire_cur_fn_line = 0
             header = header + " \{"
             ire_line(e, header)
             if has_dbg
@@ -16604,9 +16626,11 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                             e.ire_tc = e.ire_tc + 1
                                             ire_indent(e, _s5r_pti + " = ptrtoint ptr " + _s5r_alloca + " to i64")
                                             ire_indent(e, "store i64 " + _s5r_pti + ", ptr %slot." + pname + ", align 8")
+                                            ire_emit_dbg_local(e, pname)
                                         else
                                             ire_indent(e, "%slot." + pname + " = alloca i64, align 8")
                                             ire_indent(e, "store i64 %p" + str(pi2) + ", ptr %slot." + pname + ", align 8")
+                                            ire_emit_dbg_local(e, pname)
                                         match ptype
                                             IrType(pk, _, _, _) =>
                                                 if pk == "list" or pk == "intlist"
@@ -16618,6 +16642,7 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                             for slot_name in local_slots
                                 ire_indent(e, "%slot." + slot_name + " = alloca i64, align 8")
                                 ire_indent(e, "store i64 0, ptr %slot." + slot_name + ", align 8")
+                                ire_emit_dbg_local(e, slot_name)
                             // Stage 4 SROA: hoist stack-struct allocas to the entry block (once),
                             // reused across loop iterations (sound — a non-escaping struct never
                             // outlives an iteration, so the buffer can be overwritten each time).
@@ -17652,6 +17677,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     // Track 7: Logging
     ire_line(e, "declare void @nova_rt_log_trace(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_log_debug(i64, i64) nounwind")
+    if e.ire_dwarf_vars == 1
+        ire_line(e, "declare void @llvm.dbg.declare(metadata, metadata, metadata) nounwind readnone")
     ire_line(e, "declare void @nova_rt_log_info(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_log_warn(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_log_error(i64, i64) nounwind")
@@ -18507,11 +18534,16 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
         ire_line(e, "!llvm.dbg.cu = !" + lb + "!100" + rb)
         ire_line(e, "!llvm.module.flags = !" + lb + "!102, !103" + rb)
         ire_line(e, "")
-        ire_line(e, "!100 = distinct !DICompileUnit(language: DW_LANG_C99, file: !101, producer: " + dq + "NOVA Compiler" + dq + ", isOptimized: false, emissionKind: LineTablesOnly)")
+        let _ek = "LineTablesOnly"
+        if e.ire_dwarf_vars == 1
+            _ek = "FullDebug"
+        ire_line(e, "!100 = distinct !DICompileUnit(language: DW_LANG_C99, file: !101, producer: " + dq + "NOVA Compiler" + dq + ", isOptimized: false, emissionKind: " + _ek + ")")
         ire_line(e, "!101 = !DIFile(filename: " + dq + e.ire_filename + dq + ", directory: " + dq + "." + dq + ")")
-        if target_is_windows(e.ire_target) == 1
+        if target_is_windows(e.ire_target) == 1 and e.ire_dwarf_vars == 0
             ire_line(e, "!102 = !" + lb + "i32 2, !" + dq + "CodeView" + dq + ", i32 1" + rb)
         else
+            // #33: variable-debug mode emits DWARF even on Windows so lldb (which `nova debug`
+            // launches) can read locals; flag-off Windows keeps CodeView -> byte-identical.
             ire_line(e, "!102 = !" + lb + "i32 7, !" + dq + "Dwarf Version" + dq + ", i32 4" + rb)
         ire_line(e, "!103 = !" + lb + "i32 2, !" + dq + "Debug Info Version" + dq + ", i32 3" + rb)
         ire_line(e, "!104 = !DISubroutineType(types: !105)")
@@ -18531,6 +18563,15 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             let pl_sp = loc_entry[1]
             let pl_line = loc_entry[2]
             ire_line(e, "!" + str(pl_id) + " = !DILocation(line: " + str(pl_line) + ", column: 0, scope: !" + str(pl_sp) + ")")
+        // #33: variable debug info (DILocalVariable + a nova_value base type) when enabled.
+        if e.ire_dwarf_vars == 1
+            // A typedef (not a bare DIBasicType) so lldb preserves the name "nova_value"
+            // for type-summary matching — a DW_ATE_signed/64 base type is displayed as
+            // "long long" and the custom name is lost.
+            ire_line(e, "!106 = !DIDerivedType(tag: DW_TAG_typedef, name: " + dq + "nova_value" + dq + ", baseType: !107)")
+            ire_line(e, "!107 = !DIBasicType(name: " + dq + "i64" + dq + ", size: 64, encoding: DW_ATE_signed)")
+            for dv in e.ire_dbg_vars
+                ire_line(e, "!" + str(dv[0]) + " = !DILocalVariable(name: " + dq + dv[1] + dq + ", scope: !" + str(dv[2]) + ", file: !101, line: " + str(dv[3]) + ", type: !106)")
         ire_line(e, "")
 
     // Emit TBAA and loop metadata
