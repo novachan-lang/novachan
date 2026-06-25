@@ -73,12 +73,21 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   code races on — needs @memo codegen locking, not just a registry lock; @memo is N=1-correct today).
   **REORDER (soundness order, not feature order):** Stage 1 (B11 app-freeze + B8 limiter) is DEFENSIVE
   (handlers only READ the app dict in correct use; limiter not on the hot path) — do it BEFORE the
-  Stage-5 flip. Tackle the ACTIVE N>1 bugs first: **NEXT = Stage 2 (channel deferred-wake)** — the
-  hardest + highest-value (Forge uses channels heavily; the lost-wakeup hang breaks N>1), with the
-  adversary must-fixes (re-park generation stamp; copy offload j->task BEFORE enqueue). Then Stage 3
-  (netpoller: status-overwrite-inside-lock + single-poller), Stage 4 (epoch fiber-reclaim), then
-  Stage 1 (defensive), then Stage 5 (flip N>1 default). B11 audit finding: app IS a dict, mutated at
-  SETUP (route reg a["ws_routes"]=...) — freeze at serve-start; confirm no serve-time write first. N=1 invariant = TWO oracles (reconverge for the
+  Stage-5 flip. Tackle the ACTIVE N>1 bugs first: **PROGRESS (verified by reading the runtime): N>1 CORRECTNESS is essentially COMPLETE.**
+  Stage 0 ✅ value-model; CHANNELS ✅ correct (park+wake under ch->lock, NO lost-wakeup — so the planned
+  Stage 2 deferred-wake is PERF, not correctness); STAGE 3a ✅ status-overwrite HANG fixed (status=2
+  moved INSIDE the publish lock in park_io/park_io_timeout/park_sleep/offload_run — was after the unlock
+  so a poll/check_offload could set status=0 then get clobbered -> enqueued-but-parked HANG); NETPOLLER
+  ✅ correct (poll mutates nova_io_waiters under g_sched_lock + F1 park_committed spin -> no double-wake;
+  Stage 3b single-poller is PERF). Stage 3a IMPLEMENTED (5 reorder edits, byte-identical N=1); N>1
+  sleep-park stress 30/30 + 8/8 ASAN at N=4; guard _n1_park_test added; N=1 gate running.
+  **REMAINING = resource/perf/defensive (NOT crash/hang/corruption):**
+  - **Stage 4** = fiber-reclaim LEAK (guard at nova_runtime.c ~6700 `if (g_carrier_count<=1) reclaim` ->
+    fibers never freed at N>1 -> long-running N>1 Forge OOMs; NEEDED before the flip; HARDEST remaining =
+    RCU epoch reclaim with the EXITED-CARRIER (epoch=INT64_MAX on exit) + ARM RELEASE/ACQUIRE must-fixes).
+  - **Stage 2** (channel de-convoy) + **Stage 3b** (netpoller single-poller) = PERF (throughput).
+  - **Stage 1** = DEFENSIVE (B11 app-freeze: app IS a dict mutated at SETUP only -> freeze at serve-start,
+    confirm no serve-time write; B8 limiter owner-actor). **Stage 5** = flip N>1 default. Close 0D/0E first. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.

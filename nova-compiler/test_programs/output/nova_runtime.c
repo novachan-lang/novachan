@@ -5930,10 +5930,14 @@ static void nova_sched_park_io(int64_t fd, int events) {
     w->fd = fd;
     w->events = events;
     nova_sched_lock();
+    t->status = 2;   /* Stage 3a: PARKED — set INSIDE the publish lock, BEFORE the waiter is visible in
+                        nova_io_waiters, so a poll-scan on another carrier never sees the waiter with a
+                        stale status and then has its status=0 clobbered by a post-unlock status=2 (the
+                        clobber left the task enqueued-but-status=2 -> mis-parked -> permanent HANG).
+                        N=1: g_sched_lock is a no-op; this is a straight-line reorder, byte-identical. */
     w->next = nova_io_waiters;
     nova_io_waiters = w;
     nova_sched_unlock();
-    t->status = 2;
     nova_rt_fiber_yield();
 }
 
@@ -5971,10 +5975,10 @@ static void nova_sched_park_io_timeout(int64_t fd, int events, int64_t timeout_m
     /* +1 so a sub-ms remainder still parks for at least the requested time (now_ms floors to whole ms). */
     w->deadline_ms = (timeout_ms > 0) ? (nova_sched_now_ms() + timeout_ms + 1) : 0;
     nova_sched_lock();
+    t->status = 2;   /* Stage 3a: PARKED inside the publish lock (see nova_sched_park_io). */
     w->next = nova_io_waiters;
     nova_io_waiters = w;
     nova_sched_unlock();
-    t->status = 2;
     nova_rt_fiber_yield();
 }
 
@@ -6012,10 +6016,10 @@ static void nova_sched_park_sleep(int64_t ms) {
        sub-ms fraction is truncated). sleep(ms) must never return before ms elapses. */
     w->wake_time_ms = nova_sched_now_ms() + ms + (ms > 0 ? 1 : 0);
     nova_sched_lock();
+    t->status = 2;   /* Stage 3a: PARKED inside the publish lock (see nova_sched_park_io). */
     w->next = nova_sleep_waiters;
     nova_sleep_waiters = w;
     nova_sched_unlock();
-    t->status = 2;
     nova_rt_fiber_yield();
 }
 
@@ -6212,6 +6216,11 @@ static void nova_offload_run(NovaOffloadJob* job) {
        lost updates. nova_sched_lock is a no-op at N=1 (g_carrier_count<=1) -> zero cost on the default
        path. Released BEFORE the offload-queue lock below -> no lock nesting / no ordering deadlock. */
     nova_sched_lock();
+    nova_sched_current->status = 2;   /* Stage 3a: PARKED inside the publish lock, BEFORE the job is
+                                         visible in nova_offload_waiters (and before it's handed to the
+                                         offload worker below), so a check_offload scan on another carrier
+                                         can't set status=0 and then have it clobbered by the old
+                                         post-unlock status=2 (-> enqueued-but-parked -> permanent HANG). */
     job->wnext = nova_offload_waiters;
     nova_offload_waiters = job;
     nova_sched_unlock();
@@ -6230,8 +6239,7 @@ static void nova_offload_run(NovaOffloadJob* job) {
     pthread_cond_signal(&nova_offload_cv);
     pthread_mutex_unlock(&nova_offload_lock);
 #endif
-    nova_sched_current->status = 2;   /* PARKED */
-    nova_rt_fiber_yield();             /* -> carrier; resumed after done==1 */
+    nova_rt_fiber_yield();             /* -> carrier; resumed after done==1 (status=2 set above, inside the publish lock — Stage 3a) */
 }
 
 /* Carrier-side scan: re-enqueue green tasks whose offload job has completed.
