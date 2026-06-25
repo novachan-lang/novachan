@@ -59,16 +59,16 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   ZERO_ANNOTATION_AUDIT.md, SOUND_INFERENCE_PLAN.md.
 - **Deferred (opportunistic, non-blocking):** inference S2 lambda-pinning (drops the hero's one
   `req: Request`); quasi-quote v1; flag-ON enablement of NOVA_STRUCT_RET.
-- **CURRENT TASK:** Phase A foundation — **N>1 multi-core design, in TWO parts** (design only; NOT
-  building — awaiting owner go):
-  - **Part 1 — Correctness** (workflow wzr6brjer): map + close the N>1 races (channel lost-wakeup,
-    netpoller M:N coordination, fiber-reclaim, B8/B11), happens-before-proven, adversarial race-hunt.
-    The race-free base.
-  - **Part 2 — Throughput** (runs on Part 1's settled model): make Forge actually FAST across cores —
-    requests/tasks **load-balance across carriers** (work-stealing if home-carrier assignment goes
-    uneven) so all cores stay busy under load. **FORGE only — no game-engine frame barriers, no Reactor.**
-  - Then SYNTHESIZE Part 1 + Part 2 → one complete N>1-multithreading-for-Forge design → present to
-    owner → WAIT for explicit go before any build.
+- **CURRENT TASK:** Phase A foundation — **N>1 multi-core design COMPLETE** (NOVA_DESIGN/
+  N1_MULTICORE_PLAN.md; design wzr6brjer, adversary-vetted — the race-hunt caught 7 FATAL/MAJOR holes,
+  ALL folded in; goNoGo=revise = build the revised stages). It IS the complete multithreading-for-Forge
+  design: **Stages 0-5, ending at Stage 5 = flip N>1 default → Forge on all cores** (that IS the
+  parallelism; work-stealing folded to optional-later, NOT needed for v1 — the global-injector-claim
+  model already balances new connections across idle cores). **AWAITING OWNER GO** to build **Stage 0A**
+  (nova_track_heap_bounds monotonic CAS, gated). N=1 invariant = TWO oracles (reconverge for the
+  compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
+  fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
+  not patched forward.
 
 ## Resume checklist
 1. Read this doc + FORGE_STATUS.md §11 F7/B8/B11 (the N>1 races) + the N>1 design output when it lands.
