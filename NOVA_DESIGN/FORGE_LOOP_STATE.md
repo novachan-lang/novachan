@@ -11,6 +11,14 @@ Django, Erlang/Elixir, Phoenix** — each at its own strength. Forge wins by *pr
 Erlang-shaped runtime primitives into clean APIs (see FORGE_STATUS §1, §6). Core NOVA (the language)
 beats C/Rust/Go/Python at the language level; Forge beats the web frameworks on top of it.
 
+**★ THIS IS ONE CONTINUOUS LOOP — NOT SEPARATE TASKS.** The Forge plan is COMPLETE (FORGE_STATUS +
+FORGE_BUILD_PLAN); this is EXECUTION, not more planning. Core-NOVA work (N>1 multi-core, inference),
+Forge features, and later Reactor (the game engine, REACTOR_MASTER_PLAN.md) are ALL threads of the SAME
+loop toward the SAME vision — deeply connected (N>1 powers Forge AND Reactor; inference cleans ALL NOVA
+code; one runtime under everything). The "phases" below are the FLOW/ORDER within the one loop, never
+walls between projects. DESIGN only the genuinely-hard, soundness-critical core pieces (lightly, in the
+loop); BUILD everything else against the existing plan. No re-planning, no stop-start — flow.
+
 ## How we work (the loop protocol)
 - **Model strategy:** Opus 4.8 = every architectural decision + every NOVA compiler/runtime change + new
   language feature + hard/complex task. Sonnet 4.6 = ongoing/mechanical implementation, ALWAYS under an
@@ -52,9 +60,17 @@ beats C/Rust/Go/Python at the language level; Forge beats the web frameworks on 
   ZERO_ANNOTATION_AUDIT.md, SOUND_INFERENCE_PLAN.md.
 - **Deferred (opportunistic, non-blocking):** inference S2 lambda-pinning (drops the hero's one
   `req: Request`); quasi-quote v1; flag-ON enablement of NOVA_STRUCT_RET.
-- **CURRENT TASK:** Phase A foundation — **N>1 multi-core design** (workflow: understand the M:N
-  scheduler races → design the sound productionization → adversarial review → staged gated build plan).
-  NOT yet building runtime code; design first (soundness-critical concurrency work).
+- **CURRENT TASK:** Phase A foundation — **N>1 multi-core design, in TWO parts** (design only; NOT
+  building — awaiting owner go):
+  - **Part 1 — Correctness** (workflow wzr6brjer): map + close the N>1 races (channel lost-wakeup,
+    netpoller M:N coordination, fiber-reclaim, B8/B11), happens-before-proven, adversarial race-hunt.
+    The race-free base.
+  - **Part 2 — Parallelism** (runs on Part 1's settled model): the actual multi-core SPEEDUP —
+    **work-stealing** (idle cores steal queued jobs → all cores busy; vs the I/O-side pinning), a
+    **deterministic tick barrier** (game frames + parallel pmap), and a clean **parallel job/task-graph
+    API**. Serves Forge throughput AND Reactor frames.
+  - Then SYNTHESIZE Part 1 + Part 2 → one complete "multithreaded NOVA" design → present to owner →
+    WAIT for explicit go before any build.
 
 ## Resume checklist
 1. Read this doc + FORGE_STATUS.md §11 F7/B8/B11 (the N>1 races) + the N>1 design output when it lands.
