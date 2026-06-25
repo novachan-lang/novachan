@@ -1,5 +1,6 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
+Stop-StrayCompilers   # clean slate: an orphaned build racing nova_compiler.ll would stall it at 0 bytes
 # Slow-environment variant of _bootstrap_reconverge.ps1: identical logic, but compile
 # timeouts bumped 450000 -> 900000 (15 min) and link 120000 -> 240000 (4 min) so the
 # ~9-min nova_compiler.nova compile (memory-pressure-starved on this host) does not hit

@@ -59,6 +59,29 @@ function Invoke-Timed {
     }
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Kill ORPHANED build/compiler processes before starting a build.
+#
+# WHY THIS EXISTS:
+#   The NOVA compiler derives its output filename from its input
+#   (nova_compiler.nova -> nova_compiler.ll). If two compiler processes build the
+#   same source concurrently they CLOBBER that file — it stalls at 0 bytes and
+#   every downstream link/test then fails mysteriously (2026-06-25 incident: a
+#   build backgrounded with a bare `&` inside a tool call was orphaned when the
+#   launching shell returned, then raced the next clean build).
+#
+#   A build is NEVER legitimately concurrent with another (the gen chain runs one
+#   step at a time), so any build binary still RUNNING when a new build starts is
+#   an orphan. Kill it first -> a clean, single-writer build every time.
+# ─────────────────────────────────────────────────────────────────────────────
+function Stop-StrayCompilers {
+    foreach ($name in @('gen3_test','gen4','gen4_test','gen5','gen6','gen2_move','nova_p1','nova_p2','nova_p3')) {
+        Get-Process -Name $name -ErrorAction SilentlyContinue |
+            Where-Object { $_.Id -ne $PID } |
+            ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }
+    }
+}
+
 # Resolve clang once; callers pass $ClangPath to Invoke-Timed.
 $ClangPath = (Get-Command clang -ErrorAction SilentlyContinue).Source
 if (-not $ClangPath) { $ClangPath = "clang" }

@@ -13,6 +13,11 @@ param([switch]$SkipReconverge, [switch]$Quick)
 Set-Location $PSScriptRoot
 $ErrorActionPreference = "Continue"
 
+# Clean slate: kill any orphaned build process from a prior/aborted run before the gate
+# starts — an orphan racing the bootstrap's nova_compiler.ll build would stall it at 0 bytes.
+. "$PSScriptRoot\_proc_util.ps1"
+Stop-StrayCompilers
+
 if (-not $SkipReconverge) {
     Write-Host "`n[CI 1/3] Bootstrap reconverge (gen5.ll == gen6.ll)..."
     & .\_bootstrap_reconverge_slow.ps1
