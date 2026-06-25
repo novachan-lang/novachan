@@ -22,6 +22,9 @@ beats C/Rust/Go/Python at the language level; Forge beats the web frameworks on 
 - **The gate (mandatory):** compiler/runtime change → `nova_ci.ps1` (reconverge gen5.ll==gen6.ll, NEVER
   exe SHA; perf gate; 588 regression in NORMAL + NOVA_T8_FULLRC). Stdlib/Forge-only → regression
   (-SkipReconverge ok). Kill-on-timeout MANDATORY. New code is zero-annotation + minimal (the 95/5 law).
+- **PERMISSION GATE (owner rule):** design/analysis (workflows, code reads) runs freely — but NEVER
+  start a BUILD (any NOVA runtime/compiler change OR Forge code) without the owner's explicit "go."
+  **Propose → approve → build.** Nothing irreversible without the owner's word.
 
 ## The sequencing plan (beat Spring/Django/Erlang/Elixir)
 - **Phase A — FOUNDATION (core-NOVA divert): N>1 multi-core production-grade.** NOVA is concurrent
@@ -29,7 +32,11 @@ beats C/Rust/Go/Python at the language level; Forge beats the web frameworks on 
   RACES (channel lost-wakeup, netpoller M:N coordination, fiber-reclaim memory, B8 limiter-owner, B11
   app-object race — FORGE_STATUS §11 F7). **A single-core server can't out-throughput Spring (thread-
   per-request multicore) or BEAM (scheduler-per-core). Closing N>1 is THE foundation for the beat
-  claim.** Must stay N=1-byte-identical + gated.
+  claim.** Must stay N=1-byte-identical + gated. **SHARED FOUNDATION for BOTH frameworks: Forge
+  (I/O-bound concurrency throughput) AND Reactor — the game engine, 2nd framework
+  (REACTOR_MASTER_PLAN.md), whose PAPG model needs CPU-bound parallel frame jobs + a deterministic tick
+  barrier. The production scheduler must serve BOTH: pinning/parking for I/O AND work-stealing + barrier
+  for parallel compute. Correctness (races) first; the parallel-compute/work-stealing layer on top.
 - **Phase B — the cheap moats:** L4 OTP declarative API (forge.supervisor + child specs; GenServer
   call/cast/**on_info**/timeout/terminate) = beat Erlang's ergonomics on its own substrate; L8
   observability (/metrics, /healthz, JSON logs + trace-id) + L3 auth pipeline = beat Spring; L5 channel
