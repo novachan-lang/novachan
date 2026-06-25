@@ -6694,10 +6694,17 @@ int64_t nova_rt_sched_run(void) {
             t->finished = 1;
             t->status = 3;
             nova_live_dec();
-            /* Tombstone split: the fiber has switched back (we are on the carrier, nova_sched_current=NULL),
-               crash status + error_msg are already copied into t, monitors notified, mailbox drained. Reclaim
-               the fiber's stack now -> bounded memory under spawn/finish churn. N<=1 only (race-free). */
-            if (g_carrier_count <= 1) nova_sched_reclaim_fiber(t);
+            /* Stage 4: reclaim the finished fiber at ALL carrier counts -> bounded memory under
+               spawn/finish churn (closes the N>1 fiber LEAK: a task-per-connection server at N>1 grew
+               memory without bound). The old `N<=1 only` guard was STALE PRE-PINNING conservatism (when a
+               task could migrate and finish on a non-home carrier). Post-pinning (commit 71a651d) a
+               CLAIMED task runs ONLY on its home carrier (home set on the sole global-injector claim at
+               nova_rq_pop, under g_sched_lock; every wake re-enqueues to home -> no migration), so a
+               FINISHED fiber is touched ONLY by its home carrier HERE: no other carrier resumes it
+               (pinning + status=3 terminal), and the watchdog dereferences st->fiber ONLY for
+               g_carrier_spin tasks (parked-being-woken, never finishing). reclaim_fiber zeros t->fiber
+               before freeing. So immediate free is race-free at N>1. N=1 unchanged (already reclaimed). */
+            nova_sched_reclaim_fiber(t);
         } else {
             /* M:N F1: the task yielded or parked. A self-YIELDING task (reschedule/select/timed-recv)
                set yield_runnable instead of self-pushing; re-enqueue it HERE, now that it has fully

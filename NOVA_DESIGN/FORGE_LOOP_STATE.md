@@ -81,13 +81,24 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   ✅ correct (poll mutates nova_io_waiters under g_sched_lock + F1 park_committed spin -> no double-wake;
   Stage 3b single-poller is PERF). Stage 3a IMPLEMENTED (5 reorder edits, byte-identical N=1); N>1
   sleep-park stress 30/30 + 8/8 ASAN at N=4; guard _n1_park_test added; N=1 gate running.
-  **REMAINING = resource/perf/defensive (NOT crash/hang/corruption):**
-  - **Stage 4** = fiber-reclaim LEAK (guard at nova_runtime.c ~6700 `if (g_carrier_count<=1) reclaim` ->
-    fibers never freed at N>1 -> long-running N>1 Forge OOMs; NEEDED before the flip; HARDEST remaining =
-    RCU epoch reclaim with the EXITED-CARRIER (epoch=INT64_MAX on exit) + ARM RELEASE/ACQUIRE must-fixes).
-  - **Stage 2** (channel de-convoy) + **Stage 3b** (netpoller single-poller) = PERF (throughput).
-  - **Stage 1** = DEFENSIVE (B11 app-freeze: app IS a dict mutated at SETUP only -> freeze at serve-start,
-    confirm no serve-time write; B8 limiter owner-actor). **Stage 5** = flip N>1 default. Close 0D/0E first. N=1 invariant = TWO oracles (reconverge for the
+  **STAGE 4 ✅ DONE (gating): fiber-reclaim leak fixed as a ONE-LINE guard removal, NOT an RCU mechanism.**
+  Careful reading showed the RCU/epoch design was solving a non-problem: pinning (commit 71a651d) means a
+  CLAIMED task only ever runs on its home carrier (no migration), and the watchdog derefs st->fiber ONLY
+  for g_carrier_spin tasks (parked-being-woken, never finishing) — so a FINISHED fiber is touched only by
+  its home carrier; immediate free is race-free. Changed `if (g_carrier_count<=1) reclaim` -> always
+  reclaim (N=1 unchanged — it already reclaimed). ASAN 6/6 + 10/10 churn at N=4. (The old `N<=1 only`
+  guard was stale PRE-pinning conservatism.)
+  **STAGE 1 (defensive) LARGELY DISSOLVES (verified by audit):** every `a[...] =` write in forge.nova is
+  in a SETUP/registration fn; the serve/dispatch path only READS `a` and handlers get `req` not `a` -> the
+  app dict is ALREADY read-only post-setup -> concurrent reads at N>1 are safe -> **B11 freeze unnecessary**
+  (would add hot-path cost to defend an already-safe invariant). B8 limiter is NOT wired into serve -> not
+  raced -> its owner-actor is a future-when-wired concern.
+  **REAL REMAINING:** (1) **validate Forge ITSELF at N>1** (run forge_* tests at NOVA_CARRIERS=4 -> proves
+  multi-core Forge works + surfaces any real-path issue) — LOW risk, HIGH value, DO NEXT. (2) **0E memo**
+  (@memo per-fn cache races at N>1 — close before flip IF @memo is used; needs @memo codegen lock).
+  (3) **Stage 2/3b PERF** (channel de-convoy + single-poller — for throughput vs Spring/BEAM; Stage 2 is
+  the risky wake-refactor). (4) **Stage 5 flip** N>1 default (high blast-radius; opt-in-prod-ready +
+  soak first). 0D counters = TSAN-follow-on (diagnostic, benign). N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.
