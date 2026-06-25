@@ -98,6 +98,11 @@ Legend: ✅ shipped & tested · 🟡 partial / substrate-exists · ⬜ not built
 - Typed `Response{status,headers,body,halted,cookies}` + `resp_new/text/html/json/bytes/error`, `resp_set_header`, `resp_set_cookie`, `resp_redirect`; `file(path)` content-type-by-ext; single serialization boundary `_finalize2` (framework headers once, HEAD-aware, binary-aware).
 - **Return coercion (`_coerce`):** a handler may return a `Response`, `string`, `bytes`, or **any struct/list/dict/scalar → 200 JSON**. *`forge_coerce_test`.*
 - Multipart uploads `uploads(req) -> list<Part>` (parses into memory; **no persistence backend yet** — see §5 L6 file/blob storage). *`forge_multipart_test`.*
+- **Chunked streaming:** `stream` / `send_chunk` / `send_chunk_bin` (Transfer-Encoding: chunked, RFC 7230). *`forge_chunked_test`.*
+- **Testing surface (socketless):** `mock_request` / `dispatch_test` / `status_of` / `body_of`, plus the dispatch families `dispatch_req`/`dispatch_safe`/`dispatch`. *`forge_testsurface_test`.*
+
+### Legacy raw-parser surface (v0.1/v0.2)
+- The pre-router raw parser used by the `demo_forge_*` programs: `parse_method`/`parse_path`/`parse_path_clean`/`parse_body`/`query_get`/`header_get`/`recv_request`. Still present and exercised by the demos. **Caveat:** `query_get`/`header_get` carry the `xkey=` false-match bug + case-sensitivity bugs tracked in §4 (B15/B16). Prefer the typed `Request` accessors (`req_query`/`req_header`) for new code.
 
 ### ⭐ Struct → JSON keystone — **WORKS** (the old doc's "Bug #1: broken" is FALSE)
 A **two-layer dispatch**, not the bare C runtime:
@@ -117,6 +122,8 @@ The bare C `nova_rt_json_stringify` (runtime L1750 **(VERIFY)**) only handles di
 ### Real-time
 - **WebSocket (RFC 6455, pure NOVA):** `ws`, `ws_room`, `ws_room_ex` (on_join/on_msg/on_leave — a presence primitive), `ws_keepalive`; verbs `ws_emit`/`ws_emit_bin`/`ws_open`/`ws_done`; SHA-1/base64 handshake, frame codec, validation, 16 MB cap, single-writer broadcast, per-message arena. **Note:** there is **no per-topic join-authorization hook yet** — `ws_room` is an open subscribe; per-topic `authorize` gating is a Layer-5 gap (§5 L5, §11 A1). *`forge_ws_*`, `forge_hub_test`, presence test.*
 - **SSE** `sse`/`sse_every`/`sse_send`; **chunked** `stream`/`send_chunk`; **Hub** `hub()`/`hub_sub`/`hub_pub`/`hub_unsub`/`hub_count`/`room_say`. *`forge_sse_test`, `forge_chunked_test`.*
+- **WS frame codec (public):** `ws_try_decode` / `ws_encode_frame` — result carries `.status`/`.payload`/`.opcode`/`.consumed`; negative-status convention (`-1002` for oversize / fragmented-control / reserved-opcode / RSV1). *`forge_security_fixes_test`.*
+- **Local Presence (working today):** `ws_room_ex` on_join/on_msg/on_leave + `hub_count` live in a *serving* room, no deadlock. *`forge_ws_presence_test`, `forge_ws_lifecycle_test`.*
 - Static **Range/206** partial content. *`forge_range_test`.*
 
 ### Security
@@ -124,12 +131,15 @@ The bare C `nova_rt_json_stringify` (runtime L1750 **(VERIFY)**) only handles di
 - **JWT HS256** `jwt_encode`/`jwt_verify`→Result, strict `alg` allowlist, exp/nbf, constant-time. *`forge_jwt_test`.* **Caveat (B6):** signature is base64url(**HEX** mac) — verifies inside Forge but **not** byte-compatible with external HS256 verifiers (raw-byte variant tracked).
 - **Signed stateless sessions** `session_set`/`session_get` (HMAC-SHA256). *`forge_session_test`.* Cookies/flash (POST-redirect-GET). *`forge_cookie_test`, `forge_flash_test`.*
 - **Header-injection defense** `_safe_header` strips CR/LF/NUL at serialization; `_cut_at_crlf` on parsed URIs. *`forge_header_security_test`.* **Request smuggling** `_content_length` refuses dup Content-Length / any Transfer-Encoding. *`forge_recv_security_test`.*
-- Security headers, CORS, rate-limit, request-id, access-log. *`forge_secheaders_test`, `forge_cors_test`, `forge_ratelimit_test`, `forge_reqid_test`, `forge_accesslog_test`.*
+- Security headers, CORS, rate-limit, request-id, access-log. *`forge_secheaders_test`, `forge_cors_test`, `forge_ratelimit_test`, `forge_reqid_test`, `forge_accesslog_test`.* CORS exists under both names: `mw_cors` and `mw_cors_origin` (aliases).
+- **`mw_require_auth(secret)`** → verifies the bearer/session token and sets `req.state["user"]`. *`forge_jwt_test`.*
+- **`forge_limits` DoS-primitive module:** `rate_new`/`rate_allow` (token-bucket refill+burst), `conn_acquire` (conn-guard floors at 0), `limit_body_ok` (size caps). *`forge_limits_lib_test`.* **NOTE: the logic is verified in isolation but NOT yet wired into serve's accept/parse path** — the wiring is a tracked S0 task.
 - Bounds: `_max_header`=64 KiB, `_max_body`=8 MiB, `_max_keepalive`=100; `mw_limit_body`.
 
 ### Data, projection, docs, static, compression
 - **DB pool** (`forge_db`, separate import): `pool_open`/`acquire`/`release`/`query`/`query_dicts`/`insert`/`exec`/`tx`/`close`; all parameterized → injection-safe. Pool semantics today: **SQLite, fixed-size connection set, blocking acquire/release** (no Postgres, no async acquire-park yet — both tracked in §5 L2). *`forge_db_test`.*
-- **`resp_model`/`resp_model_list`** whitelist projection (drops secrets by construction, fail-closed). *`forge_resp_model_test`, `forge_model_route_test`.*
+- **DB bridge helpers** `row_dict` / `rows_dicts` — map `(cols, rows)` → named dicts (the composition bridge to typed-by-`form_as`). *`_forge_data_test`.*
+- **`resp_model`/`resp_model_list`** whitelist projection. *`forge_resp_model_test`, `forge_model_route_test`.* **REAL contract (don't overclaim):** the projection is **FLAT-fields-only**. A *nested* struct field serializes **whole** and will **leak its secret** unless a subset nested model is declared for it. Lists, `bytes`, and computed fields are **out of scope**. The drift guard is a **RUNTIME fail-closed (500)**, not a build-time check (B10).
 - **Validation** + `validate_typed` (RTTI walk, fail-closed). *`forge_validate_test`, `forge_validate_typed_test`.*
 - **OpenAPI 3.0** `*_doc` + `openapi`/`enable_docs` → `/openapi.json` + Swagger `/docs`. *`forge_openapi_test`.* Caveat: sample type is developer-asserted, not compiler-bound (no-drift = Path-C follow-up).
 - **Static** traversal-safe (`_safe_subpath` segment whitelist), text+ETag/304, binary+Range. **Caveat (B7):** textual segment whitelist only — no `realpath`/symlink containment. *`forge_static_test`, `forge_file_test`, `forge_binary_serve_test`.*
@@ -153,11 +163,21 @@ The bare C `nova_rt_json_stringify` (runtime L1750 **(VERIFY)**) only handles di
 | B2 | **Path `:param` not percent-decoded** | Medium | `_fr_match` does **not** `_pct_decode` route params — though query (`_query_dict`), form (`form_decode`), and static path (`_safe_subpath`) all do. A `:id` containing `%2F`/`%20` arrives raw. Narrow but real correctness gap. |
 | B3 | **Per-request memory escape contract** | Medium | `_serve_conn` brackets each request in `arena_enter`/`arena_exit` (flat memory ✅). The **invariant** for any value that *escapes* the request into a long-lived hub/cache: it is **deep-copied to the RC heap at channel send** (`nova_rt_deep_copy` materializes arena strings/boxes; spawn clears `active_arena`) — the exact arena-escape UAF class **closed in commit 0e8cdce**. So escape is *sound*, not hand-waved. **The open part:** long-lived shared state still leans on **atomic cells**, not first-class scope-exit RC (the dual-path long-lived RC half is DEFERRED). Memory growth for genuinely long-lived caches is bounded by that deferral, not by a safety hole. |
 | B4 | **No accept backpressure / connection cap** | Medium | Each connection = a green task. Validated at 10k green tasks, but there is **no global connection cap** — an accept storm spawns unboundedly. Needs an accept-side semaphore (a `lockx` channel of N permits). |
-| B5 | **`from_json` safe-path routing** | Low-Med | `from_json_safe<T>` (compiler-generated `<T>__from_json_safe` → Result) is the **safe** path and works. Raw `from_json` is the keystone path. The wrapper `body_as<T>` (Layer 2) **must default to the safe path**; ensure handlers never route untrusted bodies through raw `from_json`. |
+| B5 | **`from_json` safe-path routing** | **High** | `from_json_safe<T>` (compiler-generated `<T>__from_json_safe` → Result) is the **safe** path and works. Raw `from_json` is the keystone path. The wrapper `body_as<T>` (Layer 2) **must default to the safe path**; ensure handlers never route untrusted bodies through raw `from_json`. *(The underlying crash is split out as B5a.)* |
+| B5a | **raw `from_json` SEGFAULTs (0xC0000005) on incomplete input** | **High** | A missing field on raw `from_json` faults → **remote-DoS**. The `nova new --api` scaffold's `create_todo` uses raw `from_json` over a **non-crash-isolated** `serve_req`. **FIX IS IN CODEGEN:** `_make_from_json_method` must presence-guard each field with a type-default. `body_as<T>`'s safe-path routing does **NOT** fix the underlying crash that other code paths hit. |
 | B6 | **JWT external interop** | Low | HEX-mac signature → not byte-compatible with external HS256 libs. Documented; raw-byte variant is a follow-up. |
-| B7 | **Static symlink containment** | Low | Textual segment whitelist only; a symlink *inside* root pointing out is followed. No `realpath` containment. |
+| B7 | **Static symlink containment** | **Medium** | Textual segment whitelist only; a symlink *inside* root pointing out is followed. No `realpath` containment. **This falsifies the "cannot be misconfigured into a CVE" over-claim.** Fix = `realpath`-canonicalize + prefix-check. |
 | B8 | **Rate-limit / SSE-disconnect under N>1 carriers** | Low | Single-carrier-correct today (frameworks run N=1). N>1 needs an owner-actor for the limiter; SSE idle-timeout tracked. |
-| B9 | **`NOVA_HOME` / install UX** | Low | `import forge` resolves from `$NOVA_HOME/lib/forge.nova`; `_install_forge.ps1` copies `forge/forge.nova`→`lib/`; harness auto-syncs. But a fresh user must know to set `NOVA_HOME` and install — no `forge new` / no packaged distribution yet. |
+| B9 | **`nova new` routes to a STUB — Forge templates unreachable** | Low | `nova new` routes to `nova_pkg_new`, a `print("Hello")` **STUB**; the 5 Forge templates in `nova_new.nova` are **UNREACHABLE**, so CLAUDE.md's "download NOVA → build full-stack app" promise can't be met. Fix = one-line route change + lib bundling. |
+| B9a | **bundled `$NOVA_HOME/lib` ships ONLY `forge.nova`** | Low | `url_decode`/`hmac_sha256`/`sqlitex`/`forge_db`/`forge_html`/`forge_compress` are **unreachable from a scaffolded app** — gates sessions/data/percent-decode/compression. Fix = bundle the full lib set with the distribution. |
+| B10 | **`resp_model` nested-secret leak (flat-only projection)** | Medium | Whitelist projection is FLAT-only; a nested struct field serializes whole and leaks its secret unless a subset nested model is declared. Drift guard is runtime fail-closed (500), not build-time. (See §3 `resp_model` contract.) |
+| B11 | **app object `a` shared BY REFERENCE into green tasks** | Medium | N=1 safe, but a handler mutating `a` under `NOVA_CARRIERS>1` is a **data race** — `sched_spawn` does **not** deep-copy `a`. Enforce **immutable-after-setup** for the app object. |
+| B12 | **TRACK-A: unannotated cross-module struct-return loses IR type** | Low-Med | An unannotated cross-module call returning a struct doesn't set the `let`'s IR type → `x.field` falls back to the global `ir_fmap` (last-registered wins) → **wrong slot on shared field names**. `ir_fn_returns` is only populated for the main module. |
+| B13 | **content-negotiation is POSITION-based** | Low | `accepts`/`wants_*` is position-based, not true q-value parsing. A client's `q=` weights are ignored. |
+| B14 | **`count(*)` returns a STRING not int** | Low | `count(*)` comes back as a string from `forge_db`, not an int — caller must coerce. |
+| B15 | **legacy `query_get` `xkey=` false-match** | Low | The v0.1/v0.2 raw `query_get`/`header_get` match a key as a substring (`xkey=` matches `key=`) — only the legacy `demo_forge_*` path; typed `req_query`/`req_header` are correct. |
+| B16 | **legacy `header_get` case-sensitivity** | Low | Legacy `header_get` is case-sensitive (HTTP headers are case-insensitive); only the legacy raw-parser path. Typed `req_header` is case-insensitive. |
+| B9 (install) | **`NOVA_HOME` / install UX** | Low | `import forge` resolves from `$NOVA_HOME/lib/forge.nova`; `_install_forge.ps1` copies `forge/forge.nova`→`lib/`; harness auto-syncs. But a fresh user must know to set `NOVA_HOME` and install — no `forge new` / no packaged distribution yet. |
 | — | **`json_obj` escaping** | ✅ FIXED | Now routes through `json_stringify` (proper escaping). Listed only to mark it closed. |
 
 **Verified-fixed (do NOT re-report):** struct→JSON object ✅ · spawn-per-conn ✅ · per-request arena ✅ · `_safe_header` CRLF ✅ · `from_json_safe` ✅ · `json_obj` escaping ✅ · percent-decode in query/form/static ✅ (route-param decode is the residual B2).
@@ -323,7 +343,7 @@ This is the single most important framing in the document. NOVA's runtime is **s
 | Router / Controllers / Contexts | ✅ shipped | `app`/`get`/`post`; contexts = NOVA modules |
 | Phoenix Channels (topic WS) | 🟡 shipped local, **no join-auth** | `ws_room`/`hub`/`room_say`; per-topic `authorize` ⬜ (§5 L5) |
 | PubSub (local) | ✅ shipped | `hub()` / `pubsubx.nova` |
-| Presence (local) | 🟡 substrate yes | `ws_room_ex` on_join/leave + `hub_count`; needs GenServer `on_info` |
+| Presence (local) | ✅ **local shipped** | `ws_room_ex` on_join/leave + `hub_count` (*`forge_ws_presence_test`*); **cluster/reactive** presence needs GenServer `on_info` |
 | LiveView | 🟡 render-differ + GenServer-`on_info` are new | per-conn task + WS + HTML-as-fn + structural `==` |
 | Telemetry | 🟡 easy | a `hub()` topic of structured events |
 | Changesets | 🟡 most of it | `validate_typed` + `from_json_safe<T>` |
@@ -506,6 +526,9 @@ Every API sketch above leans on language/runtime surface that **does not exist y
 | Named strategy idents (`exp_jitter`, `one_for_one`, `permanent`) | §7 #1, #7, #9 | ⬜ NEW — enum-like idents | supervisor, backoff |
 | `with tx = db.begin() { }` lexical block | §7 #8 | 🟡 `tx()` exists; **block form is new sugar** | outbox, transactions |
 | Call-site type args `<T>` (`db.all<Todo>()`, `body_as<T>`, `service<Orders>`) | hero, §7 #10 | 🟡 `from_json_safe<T>` works; **let-site→callee inference (Phase 0c) needed** | the entire L2 ergonomic layer |
+
+> **Typed-wrapper rewrite boundary (load-bearing).** `query_as<T>` / `db.all<T>` / `body_as<T>` work **only** at a *syntactically-adjacent typed `let`-binding* (the IR-lower assign ladder). A library function that receives rows generically (e.g. `list<list<any>>`) is **OUT OF SCOPE** for the rewrite. This reconciles the adversary's "needs a new compiler subsystem" with the plan's "three additive else-if arms": **the arms cover the typed-`let` form, not arbitrary generic call sites.** The SQLite typed path **today** is **composition-emulated** (`pool_query_dicts` + `form_as`), **NOT** a dedicated compiler rewrite — a dedicated rewrite is the **GOAL**, not the NOW.
+
 | `@tag(n)` field tags (protobuf wire stability) | §11 F2 | ⬜ NEW field annotation (bounded, opt-in) | protobuf codec correctness |
 | `@renamed_from("old")` migration hint | §5 L2 | ⬜ NEW field annotation (bounded, opt-in, ambiguous-case-only) | deterministic migrations |
 
@@ -632,6 +655,10 @@ Every new way data enters the system ships with a **default safe limit**, so the
 - **F4 — the completion number is weighted, and the weights are shown** (§10), relabeled away from an unbacked "~40%."
 - **F5 — "let it crash" assumes externalized state.** A supervisor restart only recovers if the restarted process rebuilds state from DB/Agent/cache; an in-memory-only GenServer loses data on restart. Stated as a precondition of the whole OTP story (§5 L4, §6).
 - **F6 — migrations disambiguate renames with an explicit hint.** A struct diff cannot tell rename from drop+add without intent; `@renamed_from("old")` is the bounded, opt-in mechanism (everything else stays zero-annotation). Without it a bare rename would data-loss. (§5 L2, §8.)
+- **F7 — Benchmark honesty (no premature multi-core claim).** Make **no multi-core throughput claim vs Spring/Go** until the **N>1 carrier races are closed** — specifically the channel lost-wakeup and the netpoller M:N coordination. Single-carrier (N=1) numbers are fair to publish; N>1 throughput is off-limits as a marketing claim until those races are fixed and gated. (Ties to B8, B11.)
+
+### Adoption track (parallel to the technical sprints)
+The technical roadmap (§5/§10) is **not** the whole job. A separate **adoption track** runs in parallel and outside the technical sprints: **tutorial, migration guide (from Spring/Django/Phoenix), beginner-grade error messages, and a set of real example apps.** These are sequenced independently of the layer work — a framework that is technically complete but undiscoverable still fails NOVA's "download → build a full-stack app" promise.
 
 ### Citation verification note (G3)
 Several runtime/compiler line references (`:2604`, `:7594`, `:7650`, `:4382`, `:4796`, `:1750`, `~L7902`, `~L7936`, `~L3371`) are carried from prior revisions and tagged **(VERIFY)** above — they have **not** been re-confirmed against the current `nova_runtime.c` (19,757 lines) or the moved compiler this revision. The *behaviors* are backed by passing tests; the *exact line numbers* may have drifted. Re-checking them is a tracked doc-maintenance task; until done, trust the test name, not the line number.
