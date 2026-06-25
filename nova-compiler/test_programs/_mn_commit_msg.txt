@@ -1,0 +1,41 @@
+fix(runtime): close the M:N yield double-resume race -- corruption-free multi-core green scheduling (N>1)
+
+The latent N>1 UAF: nova_sched_yield_runnable pushed the yielding task to the run-queue BEFORE it finished
+SwitchToFiber, with no park_committed guard -- so a 2nd carrier could pop + resume the task while the 1st
+was still mid-context-switch (double-resume = stack corruption). The channel/sleep/io/offload WAKE paths
+already deferred the push until park_committed; the YIELD path (reschedule, select, select_timeout,
+recv_timeout -- 6 call sites) did not. Confirmed by a read-only multi-agent analysis + adversarial review
+(exact 2-carrier interleaving grounded in the code; correctness reasoned via happens-before, since a race
+cannot be PROVEN absent by testing).
+
+PART 1 (the fix): a self-yielding task now SETS a yield_runnable flag instead of self-pushing; the CARRIER
+re-enqueues it (push THEN park_committed=1) after the fiber has fully switched back -- the exact
+park-then-commit discipline the wake paths use. Closes all 6 sites at once. Sound on x86-64 TSO
+(fiber_resume returns only after SwitchToFiber saves the task context; g_sched_lock in rq_push/pop is the
+cross-carrier edge). N=1: functionally identical (the lone carrier re-pushes it next loop iteration).
+
+PART 2 (a second confirmed data race, shipped together): nova_offload_waiters was pushed lock-free but
+scanned under nova_sched_lock -> at N>1 concurrent inserts raced the scan and each other. The insert now
+takes nova_sched_lock (released BEFORE the offload-queue lock -> no nesting/deadlock). No-op at N=1.
+
+HARD GUARD: the f->active double-resume detector is promoted from watchdog-only to always-on at N>1 and
+now abort()s (fail-fast) instead of logging-then-corrupting -- any residual race is a deterministic crash,
+not silent corruption. Set/reset paired under the same gate -> no false positives. Zero cost at N=1.
+
+Validation (all scale runs under the memory-capped kill-on-timeout watcher -- never exhausts the machine):
+  - N=1: reconverged gen5.ll==gen6.ll + 551/551 both modes (default path byte-identical / unregressed).
+  - N=4 REALISTIC (green_scale: 10k tasks x2 phases incl. 10k PARKED tasks woken): PASSES clean, 361ms --
+    no regression on the channel park/wake path, no corruption.
+  - N=4 SAFETY: a 100k-yield reschedule storm ran for 60s (normal) + 150s (ASAN) with ZERO double-resume
+    aborts and ZERO ASAN errors -- the always-on guard makes this real evidence, not luck (a race cannot be
+    PROVEN absent by testing; the happens-before argument is primary). New N=1 guard _mn_stress_test.
+  - HONEST: a pure-yield, all-runnable reschedule storm is throughput-bound at N>1 (global-run-queue lock
+    convoy) -- the large 100k-yield storm does not COMPLETE in 60s (a small one does, in 165ms). This is a
+    pre-existing LIVENESS limitation (fix = per-carrier deques / work-stealing), NOT corruption and NOT
+    introduced by this change. Tracked as a separate post-soundness item.
+
+NOT yet (deliberately staged, follow-ons): N>1 fiber reclamation (still N<=1-gated; needs the
+watchdog-TOCTOU fix next), netpoller M:N coordination, and the N>1 run-queue lock-convoy liveness fix.
+This is the FIRST, self-contained change that makes N>1 CORRUPTION-FREE.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

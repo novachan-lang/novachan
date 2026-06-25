@@ -1,0 +1,26 @@
+feat(runtime): M:N Stage A -- per-carrier work-stealing deque infrastructure (pop seam, no behavior change)
+
+Second step of the per-carrier-deque scheduler redesign (NOVA_DESIGN/MN_PER_CARRIER_DEQUE_DESIGN.md). Pure
+infrastructure: lays the deque + the owner-pop seam, with NOTHING pushing to a deque yet, so behavior is
+unchanged at every N. Stages B/C will start using it.
+
+- NovaCarrierDeque g_carriers[64]: a bounded ring (cap 4096, power-of-2 masked) + a per-deque CRITICAL_SECTION,
+  initialized by nova_deque_init_all in main_dispatch when ncar>1 (before carriers spawn).
+- nova_deque_pop_local: owner pop from the bottom of THIS carrier's deque (clears in_rq -- the single-owner
+  invariant). Always empty in Stage A.
+- nova_rq_pop: at g_carrier_count>1, drain the local deque first, else fall through to the global list (now the
+  "injector"). At N=1 the deque path is skipped entirely -> the existing linked-list pop, byte-identical.
+
+★ The owner pop uses an UNLOCKED fast path (bottom<=top -> NULL, no lock) before locking. Race-safe: the owner is
+the sole writer of bottom (read accurately); a stale smaller top only makes the empty-verdict MORE true, never a
+false-empty that loses a task. This is REQUIRED, not an optimization: the first cut locked on every pop, which was
+fine non-ASAN (N=4 304ms) but CATASTROPHIC under ASAN (the carrier pop loop's per-pop EnterCriticalSection drove
+green_scale N=4 from 1.2s to a 70-150s timeout). With the fast path: N=4 ASAN+watchdog 728ms clean.
+
+Gate: N=1 reconverged gen5.ll==gen6.ll + 551/551 both modes (deque path inert at N=1); N>1 green_scale N=4 +
+watchdog + ASAN PASS, zero double-enqueue aborts (the Stage-0 in_rq guard active), ASAN-clean.
+
+Next: Stage B (spawn + yield_runnable push to the local deque + overflow spill to the injector; park_committed=1
+BEFORE the push). Lock order obeyed: deque locks are LEAF.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

@@ -1,0 +1,39 @@
+feat(async): Erlang receive ... after N -- selective-receive timeout (gen_server idle primitive)
+
+Completes selective receive with a timeout clause:
+
+    receive
+        Pattern => body
+    after Ms
+        timeout-body
+
+After Ms milliseconds with no MATCHING message, the timeout body runs. `after 0` = drain
+the currently-buffered mailbox once then time out immediately (non-blocking poll). Saved
+messages are still scanned first (instant, never time out); the deadline bounds only the
+wait for a new matching message.
+
+Parser (parse_receive_stmt): an optional trailing `after <expr>` clause (dedented from the
+arms, Erlang style; body indented past `after`). Timed receives desugar to:
+    __recv_begin_timed(<ms>)
+    while true:
+        let __recv_m = __recv_next_timed()
+        if __recv_timed_out(): <after-body>; break      # branch on timeout BEFORE matching,
+        match __recv_m { <arm>: __recv_commit();body;break ; _ => __recv_defer() }
+The timeout is detected by a runtime predicate, NOT a sentinel value -- so the timeout
+"signal" never has to live in the message value-space (no sentinel/message collision).
+Untimed `receive` (no `after`) is unchanged (Stage-1 blocking path).
+
+Runtime (output/nova_runtime.c): NovaSchedTask gains recv_has_deadline + recv_deadline_ms
+(absolute monotonic ms). nova_rt_recv_begin_timed(ms) snapshots the deadline (ms<0 = wait
+forever; ms==0 = deadline now). nova_rt_recv_next_timed scans the save-queue (instant) then
+POLLS the mailbox with channel_try_recv + cooperative nova_sched_yield_runnable until a
+message arrives OR now>=deadline (recv_src=3). nova_rt_recv_timed_out() returns recv_src==3.
+Poll-yield (not a true park) is the established NOVA channel-or-timeout pattern -- identical
+to the shipped nova_rt_select_timeout -- and is sound on green tasks (yields the carrier,
+never starves siblings) at N=1. Ownership/leak accounting is unchanged from Stage-1.
+
+Test _recv_timeout_test (registered): (A) a matching message present -> handled, 10s timeout
+does NOT fire; (B) no match -> 50ms timeout fires; (C) `after 0` empty mailbox -> immediate
+timeout. Deterministic (no timing races).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

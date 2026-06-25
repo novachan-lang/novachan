@@ -539,6 +539,20 @@ static CRITICAL_SECTION nova_mem_lock;
 static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+/* Stage 0B (N>1): generic critical-section macro + the string-intern-table lock. The macro keeps the
+   multi-return intern path readable. The lock is engaged ONLY when g_carrier_count>1 (after carriers
+   spawn, i.e. after nova_rt_init has InitializeCriticalSection'd it on Windows), so the gated path is
+   never reached with an uninitialized CS. POSIX uses a static initializer. */
+#ifdef _WIN32
+#define NOVA_CS_LOCK(x)   EnterCriticalSection(&(x))
+#define NOVA_CS_UNLOCK(x) LeaveCriticalSection(&(x))
+static CRITICAL_SECTION g_intern_lock;
+#else
+#define NOVA_CS_LOCK(x)   pthread_mutex_lock(&(x))
+#define NOVA_CS_UNLOCK(x) pthread_mutex_unlock(&(x))
+static pthread_mutex_t g_intern_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 /* ── Embedded RC Header ────────────────────────────────────────────────────
    Every heap allocation prepends: [rc:int32 | tag_magic:int32]
    User pointer points past the header. RC ops are O(1) header dereferences.
@@ -786,8 +800,19 @@ static int64_t g_null_box = 0, g_true_box = 0, g_false_box = 0;
 static uintptr_t g_oddball_lo = (uintptr_t)-1, g_oddball_hi = 0;
 
 static void nova_box_track(uintptr_t a) {
-    if (a < g_box_lo) g_box_lo = a;
-    if (a > g_box_hi) g_box_hi = a;
+    if (g_carrier_count > 1) {
+        /* Stage 0C (N>1): monotonic ATOMIC update — same race/fix as nova_track_heap_bounds. g_box_lo
+           only shrinks, g_box_hi only grows; relaxed CAS; a stale read is WIDE (safe), never narrow. */
+        uintptr_t cur = __atomic_load_n(&g_box_lo, __ATOMIC_RELAXED);
+        while (a < cur && !__atomic_compare_exchange_n(&g_box_lo, &cur, a, 1,
+                                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+        cur = __atomic_load_n(&g_box_hi, __ATOMIC_RELAXED);
+        while (a > cur && !__atomic_compare_exchange_n(&g_box_hi, &cur, a, 1,
+                                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+    } else {
+        if (a < g_box_lo) g_box_lo = a;
+        if (a > g_box_hi) g_box_hi = a;
+    }
 }
 
 int64_t nova_rt_box_bool(int64_t v) {
@@ -1016,6 +1041,12 @@ static void nova_intern_grow(void) {
 
 static const char* nova_intern_h(const char* s, uint64_t* out_hash) {
     if (!s) { *out_hash = 0; return NULL; }
+    /* Stage 0B (N>1): serialize the WHOLE intern op — lazy-init, hash, probe, insert, and grow (which
+       frees the old table). Lock is taken BEFORE the NULL-check so two carriers cannot both lazy-init
+       (double calloc -> leaked table + split inserts). Gated: at N=1 no lock is taken (byte-identical
+       to the original); g_intern_lock is initialized before any carrier spawns. Unlock on EVERY path. */
+    int _il = (g_carrier_count > 1);
+    if (_il) NOVA_CS_LOCK(g_intern_lock);
     if (!nova_intern_table) {
         nova_intern_cap = NOVA_INTERN_INIT_CAP;
         nova_intern_table = (const char**)calloc((size_t)nova_intern_cap, sizeof(const char*));
@@ -1038,9 +1069,12 @@ static const char* nova_intern_h(const char* s, uint64_t* out_hash) {
     *out_hash = h;
     uint64_t idx = h & (uint64_t)(nova_intern_cap - 1);
     while (nova_intern_table[idx]) {
-        if (nova_intern_table[idx] == s) return s;
-        if (nova_intern_hashes[idx] == h && strcmp(nova_intern_table[idx], s) == 0)
-            return nova_intern_table[idx];
+        if (nova_intern_table[idx] == s) { if (_il) NOVA_CS_UNLOCK(g_intern_lock); return s; }
+        if (nova_intern_hashes[idx] == h && strcmp(nova_intern_table[idx], s) == 0) {
+            const char* _hit = nova_intern_table[idx];
+            if (_il) NOVA_CS_UNLOCK(g_intern_lock);
+            return _hit;
+        }
         idx = (idx + 1) & (uint64_t)(nova_intern_cap - 1);
     }
     if (nova_intern_used * 2 >= nova_intern_cap) {
@@ -1051,6 +1085,7 @@ static const char* nova_intern_h(const char* s, uint64_t* out_hash) {
     nova_intern_table[idx] = s;
     nova_intern_hashes[idx] = h;
     nova_intern_used++;
+    if (_il) NOVA_CS_UNLOCK(g_intern_lock);
     return s;
 }
 
@@ -7401,6 +7436,7 @@ void nova_rt_init(void) {
 #ifdef _WIN32
     InitializeCriticalSection(&nova_mem_lock);
     InitializeCriticalSection(&nova_proc_registry_lock);
+    InitializeCriticalSection(&g_intern_lock);  /* Stage 0B: single-threaded init, before any carrier spawns */
 #endif
     /* Phase 0c: initialize the file-handle table mutex ONCE here, single-threaded at startup, before any
        worker/carrier thread runs. nova_file_ensure_init then becomes a no-op on every later call, closing

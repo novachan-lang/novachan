@@ -313,76 +313,295 @@ declare i64 @nova_rt_datetime_diff(i64, i64) nounwind
 declare i64 @nova_rt_datetime_add_days(i64, i64) nounwind
 declare i64 @nova_rt_datetime_add_hours(i64, i64) nounwind
 
-define i64 @dot(i64 %p0, i64 %p1) nounwind !dbg !200 {
+define i64 @take_any(i64 %p0) nounwind !dbg !200 {
 entry:
-  %slot.a = alloca i64, align 8, !dbg !201
-  store i64 %p0, ptr %slot.a, align 8, !dbg !201
-  %slot.b = alloca i64, align 8, !dbg !201
-  store i64 %p1, ptr %slot.b, align 8, !dbg !201
-  %r0 = load i64, ptr %slot.a, align 8, !dbg !202
-  %r1.ptr = inttoptr i64 %r0 to ptr, !dbg !202
-  %r1.gep = getelementptr i64, ptr %r1.ptr, i64 1, !dbg !202
-  %r1 = load i64, ptr %r1.gep, align 8, !dbg !202
-  %r2 = load i64, ptr %slot.b, align 8, !dbg !202
-  %r3.ptr = inttoptr i64 %r2 to ptr, !dbg !202
-  %r3.gep = getelementptr i64, ptr %r3.ptr, i64 1, !dbg !202
-  %r3 = load i64, ptr %r3.gep, align 8, !dbg !202
-  %r4.af = bitcast i64 %r1 to double, !dbg !202
-  %r4.bf = bitcast i64 %r3 to double, !dbg !202
-  %r4.rf = fmul double %r4.af, %r4.bf, !dbg !202
-  %r4 = bitcast double %r4.rf to i64, !dbg !202
-  %r5 = load i64, ptr %slot.a, align 8, !dbg !202
-  %r6.ptr = inttoptr i64 %r5 to ptr, !dbg !202
-  %r6.gep = getelementptr i64, ptr %r6.ptr, i64 2, !dbg !202
-  %r6 = load i64, ptr %r6.gep, align 8, !dbg !202
-  %r7 = load i64, ptr %slot.b, align 8, !dbg !202
-  %r8.ptr = inttoptr i64 %r7 to ptr, !dbg !202
-  %r8.gep = getelementptr i64, ptr %r8.ptr, i64 2, !dbg !202
-  %r8 = load i64, ptr %r8.gep, align 8, !dbg !202
-  %r9.af = bitcast i64 %r6 to double, !dbg !202
-  %r9.bf = bitcast i64 %r8 to double, !dbg !202
-  %r9.rf = fmul double %r9.af, %r9.bf, !dbg !202
-  %r9 = bitcast double %r9.rf to i64, !dbg !202
-  %r10.af = bitcast i64 %r4 to double, !dbg !202
-  %r10.bf = bitcast i64 %r9 to double, !dbg !202
-  %r10.rf = fadd double %r10.af, %r10.bf, !dbg !202
-  %r10 = bitcast double %r10.rf to i64, !dbg !202
-  ret i64 %r10, !dbg !202
+  %slot.v = alloca i64, align 8, !dbg !201
+  store i64 %p0, ptr %slot.v, align 8, !dbg !201
+  %r0 = load i64, ptr %slot.v, align 8, !dbg !202
+  ret i64 %r0, !dbg !202
+}
+
+define i64 @sumlist(i64 %p0) nounwind !dbg !203 {
+entry:
+  %slot.xs = alloca i64, align 8, !dbg !204
+  store i64 %p0, ptr %slot.xs, align 8, !dbg !204
+  %slot.s = alloca i64, align 8, !dbg !204
+  store i64 0, ptr %slot.s, align 8, !dbg !204
+  %slot.i = alloca i64, align 8, !dbg !204
+  store i64 0, ptr %slot.i, align 8, !dbg !204
+  %r0 = add i64 0, 0, !dbg !205
+  store i64 %r0, ptr %slot.s, align 8, !dbg !205
+  %r1 = add i64 0, 0, !dbg !206
+  store i64 %r1, ptr %slot.i, align 8, !dbg !206
+  br label %while_hdr0, !dbg !207
+while_hdr0:
+  %r2 = load i64, ptr %slot.i, align 8, !dbg !207
+  %r3 = load i64, ptr %slot.xs, align 8, !dbg !207
+  %r4.lp = inttoptr i64 %r3 to ptr, !dbg !207
+  %r4.szp = getelementptr i64, ptr %r4.lp, i64 1, !dbg !207
+  %r4 = load i64, ptr %r4.szp, align 8, !tbaa !6, !dbg !207
+  %r5.cmp = icmp slt i64 %r2, %r4, !dbg !207
+  %r5 = zext i1 %r5.cmp to i64, !dbg !207
+  %br_while_body1 = icmp ne i64 %r5, 0, !dbg !207
+  br i1 %br_while_body1, label %while_body1, label %while_exit2, !prof !90, !dbg !207
+while_body1:
+  %r6 = load i64, ptr %slot.s, align 8, !dbg !208
+  %r7 = load i64, ptr %slot.xs, align 8, !dbg !208
+  %r8 = load i64, ptr %slot.i, align 8, !dbg !208
+  %r9.lp = inttoptr i64 %r7 to ptr, !dbg !208
+  %r9.dp = load ptr, ptr %r9.lp, align 8, !tbaa !2, !dbg !208
+  %r9.ep = getelementptr i64, ptr %r9.dp, i64 %r8, !dbg !208
+  %r9 = load i64, ptr %r9.ep, align 8, !tbaa !4, !dbg !208
+  %r10 = call i64 @nova_rt_add(i64 %r6, i64 %r9), !dbg !208
+  store i64 %r10, ptr %slot.s, align 8, !dbg !208
+  %r11 = load i64, ptr %slot.i, align 8, !dbg !209
+  %r12 = add i64 1, 0, !dbg !209
+  %r13 = add i64 %r11, %r12, !dbg !209
+  store i64 %r13, ptr %slot.i, align 8, !dbg !209
+  br label %while_hdr0, !dbg !209
+while_exit2:
+  %r14 = load i64, ptr %slot.s, align 8, !dbg !210
+  ret i64 %r14, !dbg !210
+}
+
+define i64 @nova_user_main() nounwind !dbg !211 {
+entry:
+  %slot.fl = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.fl, align 8, !dbg !212
+  %slot.s = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.s, align 8, !dbg !212
+  %slot.fl2 = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.fl2, align 8, !dbg !212
+  %slot.fl3 = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.fl3, align 8, !dbg !212
+  %slot.a = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.a, align 8, !dbg !212
+  %slot.g = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.g, align 8, !dbg !212
+  %slot.h = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.h, align 8, !dbg !212
+  %slot.d = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.d, align 8, !dbg !212
+  %slot.back = alloca i64, align 8, !dbg !212
+  store i64 0, ptr %slot.back, align 8, !dbg !212
+  %r0 = call i64 @nova_rt_list_create(), !dbg !213
+  store i64 %r0, ptr %slot.fl, align 8, !dbg !213
+  %r1 = add i64 %r0, 0, !dbg !214
+  %r2 = add i64 4609434218613702656, 0, !dbg !214
+  %r3 = call i64 @nova_rt_list_append(i64 %r1, i64 %r2), !dbg !214
+  %r4 = add i64 %r0, 0, !dbg !215
+  %r5 = add i64 4612811918334230528, 0, !dbg !215
+  %r6 = call i64 @nova_rt_list_append(i64 %r4, i64 %r5), !dbg !215
+  %r7 = add i64 %r0, 0, !dbg !216
+  %r8 = add i64 4616189618054758400, 0, !dbg !216
+  %r9 = call i64 @nova_rt_list_append(i64 %r7, i64 %r8), !dbg !216
+  %r10 = add i64 %r0, 0, !dbg !217
+  %r11 = add i64 0, 0, !dbg !217
+  %r12.lp = inttoptr i64 %r10 to ptr, !dbg !217
+  %r12.dp = load ptr, ptr %r12.lp, align 8, !tbaa !2, !dbg !217
+  %r12.ep = getelementptr i64, ptr %r12.dp, i64 %r11, !dbg !217
+  %r12 = load i64, ptr %r12.ep, align 8, !tbaa !4, !dbg !217
+  %r13 = add i64 4609434218613702656, 0, !dbg !217
+  %r14 = call i64 @nova_rt_eq(i64 %r12, i64 %r13), !dbg !217
+  %r15.p = getelementptr inbounds [14 x i8], ptr @.str.0, i64 0, i64 0, !dbg !217
+  %r15 = ptrtoint ptr %r15.p to i64, !dbg !217
+  %r16 = call i64 @nova_rt_assert(i64 %r14, i64 %r15), !dbg !217
+  %r17 = add i64 %r0, 0, !dbg !218
+  %r18 = add i64 2, 0, !dbg !218
+  %r19.lp = inttoptr i64 %r17 to ptr, !dbg !218
+  %r19.dp = load ptr, ptr %r19.lp, align 8, !tbaa !2, !dbg !218
+  %r19.ep = getelementptr i64, ptr %r19.dp, i64 %r18, !dbg !218
+  %r19 = load i64, ptr %r19.ep, align 8, !tbaa !4, !dbg !218
+  %r20 = add i64 4616189618054758400, 0, !dbg !218
+  %r21 = call i64 @nova_rt_eq(i64 %r19, i64 %r20), !dbg !218
+  %r22.p = getelementptr inbounds [14 x i8], ptr @.str.1, i64 0, i64 0, !dbg !218
+  %r22 = ptrtoint ptr %r22.p to i64, !dbg !218
+  %r23 = call i64 @nova_rt_assert(i64 %r21, i64 %r22), !dbg !218
+  %r24 = add i64 %r0, 0, !dbg !219
+  %r25.lp = inttoptr i64 %r24 to ptr, !dbg !219
+  %r25.szp = getelementptr i64, ptr %r25.lp, i64 1, !dbg !219
+  %r25 = load i64, ptr %r25.szp, align 8, !tbaa !6, !dbg !219
+  %r26 = add i64 3, 0, !dbg !219
+  %r27.cmp = icmp eq i64 %r25, %r26, !dbg !219
+  %r27 = zext i1 %r27.cmp to i64, !dbg !219
+  %r28.p = getelementptr inbounds [4 x i8], ptr @.str.2, i64 0, i64 0, !dbg !219
+  %r28 = ptrtoint ptr %r28.p to i64, !dbg !219
+  %r29 = call i64 @nova_rt_assert(i64 %r27, i64 %r28), !dbg !219
+  %r30 = add i64 %r0, 0, !dbg !220
+  %r31 = call i64 @sumlist(i64 %r30), !dbg !220
+  %r32 = add i64 4620693217682128896, 0, !dbg !220
+  %r33.af = bitcast i64 %r31 to double, !dbg !220
+  %r33.bf = bitcast i64 %r32 to double, !dbg !220
+  %r33.cmp = fcmp oeq double %r33.af, %r33.bf, !dbg !220
+  %r33 = zext i1 %r33.cmp to i64, !dbg !220
+  %r34.p = getelementptr inbounds [17 x i8], ptr @.str.3, i64 0, i64 0, !dbg !220
+  %r34 = ptrtoint ptr %r34.p to i64, !dbg !220
+  %r35 = call i64 @nova_rt_assert(i64 %r33, i64 %r34), !dbg !220
+  %r36 = add i64 %r0, 0, !dbg !221
+  %r37 = call i64 @nova_rt_any_to_str(i64 %r36), !dbg !221
+  store i64 %r37, ptr %slot.s, align 8, !dbg !221
+  %r38 = add i64 %r37, 0, !dbg !222
+  %r39.p = getelementptr inbounds [4 x i8], ptr @.str.4, i64 0, i64 0, !dbg !222
+  %r39 = ptrtoint ptr %r39.p to i64, !dbg !222
+  %r40 = call i64 @nova_rt_contains(i64 %r38, i64 %r39), !dbg !222
+  %r41.p = getelementptr inbounds [17 x i8], ptr @.str.5, i64 0, i64 0, !dbg !222
+  %r41 = ptrtoint ptr %r41.p to i64, !dbg !222
+  %r42 = call i64 @nova_rt_assert(i64 %r40, i64 %r41), !dbg !222
+  %r43 = add i64 %r37, 0, !dbg !223
+  %r44.p = getelementptr inbounds [2 x i8], ptr @.str.6, i64 0, i64 0, !dbg !223
+  %r44 = ptrtoint ptr %r44.p to i64, !dbg !223
+  %r45 = call i64 @nova_rt_contains(i64 %r43, i64 %r44), !dbg !223
+  %r46.p = getelementptr inbounds [15 x i8], ptr @.str.7, i64 0, i64 0, !dbg !223
+  %r46 = ptrtoint ptr %r46.p to i64, !dbg !223
+  %r47 = call i64 @nova_rt_assert(i64 %r45, i64 %r46), !dbg !223
+  %r48 = call i64 @nova_rt_list_create(), !dbg !224
+  store i64 %r48, ptr %slot.fl2, align 8, !dbg !224
+  %r49 = add i64 %r48, 0, !dbg !225
+  %r50 = add i64 4609434218613702656, 0, !dbg !225
+  %r51 = call i64 @nova_rt_list_append(i64 %r49, i64 %r50), !dbg !225
+  %r52 = add i64 %r48, 0, !dbg !226
+  %r53 = add i64 4612811918334230528, 0, !dbg !226
+  %r54 = call i64 @nova_rt_list_append(i64 %r52, i64 %r53), !dbg !226
+  %r55 = add i64 %r48, 0, !dbg !227
+  %r56 = add i64 4616189618054758400, 0, !dbg !227
+  %r57 = call i64 @nova_rt_list_append(i64 %r55, i64 %r56), !dbg !227
+  %r58 = add i64 %r0, 0, !dbg !228
+  %r59 = add i64 %r48, 0, !dbg !228
+  %r60 = call i64 @nova_rt_eq(i64 %r58, i64 %r59), !dbg !228
+  %r61.p = getelementptr inbounds [28 x i8], ptr @.str.8, i64 0, i64 0, !dbg !228
+  %r61 = ptrtoint ptr %r61.p to i64, !dbg !228
+  %r62 = call i64 @nova_rt_assert(i64 %r60, i64 %r61), !dbg !228
+  %r63 = call i64 @nova_rt_list_create(), !dbg !229
+  store i64 %r63, ptr %slot.fl3, align 8, !dbg !229
+  %r64 = add i64 %r63, 0, !dbg !230
+  %r65 = add i64 4609434218613702656, 0, !dbg !230
+  %r66 = call i64 @nova_rt_list_append(i64 %r64, i64 %r65), !dbg !230
+  %r67 = add i64 %r63, 0, !dbg !231
+  %r68 = add i64 4621762822593629389, 0, !dbg !231
+  %r69 = call i64 @nova_rt_list_append(i64 %r67, i64 %r68), !dbg !231
+  %r70 = add i64 %r0, 0, !dbg !232
+  %r71 = add i64 %r63, 0, !dbg !232
+  %r72 = call i64 @nova_rt_eq(i64 %r70, i64 %r71), !dbg !232
+  %r73.cmp = icmp eq i64 %r72, 0, !dbg !232
+  %r73 = zext i1 %r73.cmp to i64, !dbg !232
+  %r74.p = getelementptr inbounds [9 x i8], ptr @.str.9, i64 0, i64 0, !dbg !232
+  %r74 = ptrtoint ptr %r74.p to i64, !dbg !232
+  %r75 = call i64 @nova_rt_assert(i64 %r73, i64 %r74), !dbg !232
+  %r76 = add i64 %r0, 0, !dbg !233
+  %r77 = call i64 @take_any(i64 %r76), !dbg !233
+  store i64 %r77, ptr %slot.a, align 8, !dbg !233
+  %r78 = add i64 %r77, 0, !dbg !234
+  %r79 = add i64 1, 0, !dbg !234
+  %r80 = call i64 @nova_rt_index_get(i64 %r78, i64 %r79), !dbg !234
+  %r81 = add i64 4612811918334230528, 0, !dbg !234
+  %r82 = call i64 @nova_rt_eq(i64 %r80, i64 %r81), !dbg !234
+  %r83.p = getelementptr inbounds [25 x i8], ptr @.str.10, i64 0, i64 0, !dbg !234
+  %r83 = ptrtoint ptr %r83.p to i64, !dbg !234
+  %r84 = call i64 @nova_rt_assert(i64 %r82, i64 %r83), !dbg !234
+  %r85 = add i64 %r0, 0, !dbg !235
+  store i64 %r85, ptr %slot.g, align 8, !dbg !235
+  %r86 = add i64 %r85, 0, !dbg !236
+  %r87 = add i64 0, 0, !dbg !236
+  %r88.lp = inttoptr i64 %r86 to ptr, !dbg !236
+  %r88.dp = load ptr, ptr %r88.lp, align 8, !tbaa !2, !dbg !236
+  %r88.ep = getelementptr i64, ptr %r88.dp, i64 %r87, !dbg !236
+  %r88 = load i64, ptr %r88.ep, align 8, !tbaa !4, !dbg !236
+  %r89 = add i64 4609434218613702656, 0, !dbg !236
+  %r90 = call i64 @nova_rt_eq(i64 %r88, i64 %r89), !dbg !236
+  %r91.p = getelementptr inbounds [13 x i8], ptr @.str.11, i64 0, i64 0, !dbg !236
+  %r91 = ptrtoint ptr %r91.p to i64, !dbg !236
+  %r92 = call i64 @nova_rt_assert(i64 %r90, i64 %r91), !dbg !236
+  %r93 = add i64 %r85, 0, !dbg !237
+  %r94 = add i64 4617878467915022336, 0, !dbg !237
+  %r95 = call i64 @nova_rt_list_append(i64 %r93, i64 %r94), !dbg !237
+  %r96 = add i64 %r0, 0, !dbg !238
+  %r97 = add i64 3, 0, !dbg !238
+  %r98.lp = inttoptr i64 %r96 to ptr, !dbg !238
+  %r98.dp = load ptr, ptr %r98.lp, align 8, !tbaa !2, !dbg !238
+  %r98.ep = getelementptr i64, ptr %r98.dp, i64 %r97, !dbg !238
+  %r98 = load i64, ptr %r98.ep, align 8, !tbaa !4, !dbg !238
+  %r99 = add i64 4617878467915022336, 0, !dbg !238
+  %r100 = call i64 @nova_rt_eq(i64 %r98, i64 %r99), !dbg !238
+  %r101.p = getelementptr inbounds [32 x i8], ptr @.str.12, i64 0, i64 0, !dbg !238
+  %r101 = ptrtoint ptr %r101.p to i64, !dbg !238
+  %r102 = call i64 @nova_rt_assert(i64 %r100, i64 %r101), !dbg !238
+  %r103 = add i64 %r0, 0, !dbg !239
+  %r104.ptr = call ptr @nova_rt_struct_alloc(i64 16), !dbg !239
+  %r104.thash = getelementptr i64, ptr %r104.ptr, i64 0, !dbg !239
+  store i64 6952342520259, ptr %r104.thash, align 8, !dbg !239
+  %r104.f0 = getelementptr i64, ptr %r104.ptr, i64 1, !dbg !239
+  store i64 %r103, ptr %r104.f0, align 8, !dbg !239
+  %r104 = ptrtoint ptr %r104.ptr to i64, !dbg !239
+  store i64 %r104, ptr %slot.h, align 8, !dbg !239
+  %r105 = add i64 %r104, 0, !dbg !240
+  %r106.ptr = inttoptr i64 %r105 to ptr, !dbg !240
+  %r106.gep = getelementptr i64, ptr %r106.ptr, i64 1, !dbg !240
+  %r106 = load i64, ptr %r106.gep, align 8, !dbg !240
+  %r107 = add i64 2, 0, !dbg !240
+  %r108 = call i64 @nova_rt_index_get(i64 %r106, i64 %r107), !dbg !240
+  %r109 = add i64 4616189618054758400, 0, !dbg !240
+  %r110 = call i64 @nova_rt_eq(i64 %r108, i64 %r109), !dbg !240
+  %r111.p = getelementptr inbounds [23 x i8], ptr @.str.13, i64 0, i64 0, !dbg !240
+  %r111 = ptrtoint ptr %r111.p to i64, !dbg !240
+  %r112 = call i64 @nova_rt_assert(i64 %r110, i64 %r111), !dbg !240
+  %r113 = call i64 @nova_rt_dict_create(), !dbg !241
+  store i64 %r113, ptr %slot.d, align 8, !dbg !241
+  %r114 = add i64 %r0, 0, !dbg !242
+  %r115 = add i64 %r113, 0, !dbg !242
+  %r116.p = getelementptr inbounds [3 x i8], ptr @.str.14, i64 0, i64 0, !dbg !242
+  %r116 = ptrtoint ptr %r116.p to i64, !dbg !242
+  %_is.dv0 = call i64 @nova_rt_dict_set(i64 %r115, i64 %r116, i64 %r114), !dbg !242
+  %r117 = add i64 %r113, 0, !dbg !243
+  %r118.p = getelementptr inbounds [3 x i8], ptr @.str.14, i64 0, i64 0, !dbg !243
+  %r118 = ptrtoint ptr %r118.p to i64, !dbg !243
+  %r119 = call i64 @nova_rt_dict_get(i64 %r117, i64 %r118), !dbg !243
+  store i64 %r119, ptr %slot.back, align 8, !dbg !243
+  %r120 = add i64 %r119, 0, !dbg !244
+  %r121 = add i64 0, 0, !dbg !244
+  %r122 = call i64 @nova_rt_index_get(i64 %r120, i64 %r121), !dbg !244
+  %r123 = add i64 4609434218613702656, 0, !dbg !244
+  %r124 = call i64 @nova_rt_eq(i64 %r122, i64 %r123), !dbg !244
+  %r125.p = getelementptr inbounds [22 x i8], ptr @.str.15, i64 0, i64 0, !dbg !244
+  %r125 = ptrtoint ptr %r125.p to i64, !dbg !244
+  %r126 = call i64 @nova_rt_assert(i64 %r124, i64 %r125), !dbg !244
+  %r127 = add i64 4620130267728707584, 0, !dbg !245
+  %r128 = add i64 %r0, 0, !dbg !245
+  %r129 = add i64 0, 0, !dbg !245
+  %_is.lp1 = inttoptr i64 %r128 to ptr, !dbg !245
+  %_is.dp2 = load ptr, ptr %_is.lp1, align 8, !tbaa !2, !dbg !245
+  %_is.ep3 = getelementptr i64, ptr %_is.dp2, i64 %r129, !dbg !245
+  store i64 %r127, ptr %_is.ep3, align 8, !tbaa !4, !dbg !245
+  %r130 = add i64 %r0, 0, !dbg !246
+  %r131 = add i64 0, 0, !dbg !246
+  %r132.lp = inttoptr i64 %r130 to ptr, !dbg !246
+  %r132.dp = load ptr, ptr %r132.lp, align 8, !tbaa !2, !dbg !246
+  %r132.ep = getelementptr i64, ptr %r132.dp, i64 %r131, !dbg !246
+  %r132 = load i64, ptr %r132.ep, align 8, !tbaa !4, !dbg !246
+  %r133 = add i64 4620130267728707584, 0, !dbg !246
+  %r134 = call i64 @nova_rt_eq(i64 %r132, i64 %r133), !dbg !246
+  %r135.p = getelementptr inbounds [20 x i8], ptr @.str.16, i64 0, i64 0, !dbg !246
+  %r135 = ptrtoint ptr %r135.p to i64, !dbg !246
+  %r136 = call i64 @nova_rt_assert(i64 %r134, i64 %r135), !dbg !246
+  %r137 = add i64 %r0, 0, !dbg !247
+  %r138 = add i64 1, 0, !dbg !247
+  %r139.lp = inttoptr i64 %r137 to ptr, !dbg !247
+  %r139.dp = load ptr, ptr %r139.lp, align 8, !tbaa !2, !dbg !247
+  %r139.ep = getelementptr i64, ptr %r139.dp, i64 %r138, !dbg !247
+  %r139 = load i64, ptr %r139.ep, align 8, !tbaa !4, !dbg !247
+  %r140 = add i64 4612811918334230528, 0, !dbg !247
+  %r141 = call i64 @nova_rt_eq(i64 %r139, i64 %r140), !dbg !247
+  %r142.p = getelementptr inbounds [32 x i8], ptr @.str.17, i64 0, i64 0, !dbg !247
+  %r142 = ptrtoint ptr %r142.p to i64, !dbg !247
+  %r143 = call i64 @nova_rt_assert(i64 %r141, i64 %r142), !dbg !247
+  %r144.p = getelementptr inbounds [36 x i8], ptr @.str.18, i64 0, i64 0, !dbg !248
+  %r144 = ptrtoint ptr %r144.p to i64, !dbg !248
+  %r145 = call i64 @nova_rt_print_str(i64 %r144), !dbg !248
+  ret i64 %r145, !dbg !248
 }
 
 define i64 @nova_main() nounwind {
 entry:
-  %slot.p = alloca i64, align 8
-  store i64 0, ptr %slot.p, align 8
-  %slot.q = alloca i64, align 8
-  store i64 0, ptr %slot.q, align 8
-  %r0 = add i64 4609434218613702656, 0
-  %r1 = add i64 4612811918334230528, 0
-  %r2.ptr = call ptr @nova_rt_struct_alloc(i64 24)
-  %r2.thash = getelementptr i64, ptr %r2.ptr, i64 0
-  store i64 210686530511, ptr %r2.thash, align 8
-  %r2.f0 = getelementptr i64, ptr %r2.ptr, i64 1
-  store i64 %r0, ptr %r2.f0, align 8
-  %r2.f1 = getelementptr i64, ptr %r2.ptr, i64 2
-  store i64 %r1, ptr %r2.f1, align 8
-  %r2 = ptrtoint ptr %r2.ptr to i64
-  store i64 %r2, ptr %slot.p, align 8
-  %r3 = add i64 4613937818241073152, 0
-  %r4 = add i64 4616189618054758400, 0
-  %r5.ptr = call ptr @nova_rt_struct_alloc(i64 24)
-  %r5.thash = getelementptr i64, ptr %r5.ptr, i64 0
-  store i64 210686530511, ptr %r5.thash, align 8
-  %r5.f0 = getelementptr i64, ptr %r5.ptr, i64 1
-  store i64 %r3, ptr %r5.f0, align 8
-  %r5.f1 = getelementptr i64, ptr %r5.ptr, i64 2
-  store i64 %r4, ptr %r5.f1, align 8
-  %r5 = ptrtoint ptr %r5.ptr to i64
-  store i64 %r5, ptr %slot.q, align 8
-  %r6 = load i64, ptr %slot.p, align 8
-  %r7 = load i64, ptr %slot.q, align 8
-  %r8 = call i64 @dot(i64 %r6, i64 %r7)
-  %r9 = call i64 @nova_rt_float_to_str(i64 %r8)
-  %r10 = call i64 @nova_rt_print_str(i64 %r9)
+  %r0 = call i64 @nova_user_main()
   ret i64 0
 }
 
@@ -397,6 +616,27 @@ entry:
   ret i32 0
 }
 
+; String constants
+@.str.0 = private unnamed_addr constant [14 x i8] c"direct read 0\00"
+@.str.1 = private unnamed_addr constant [14 x i8] c"direct read 2\00"
+@.str.2 = private unnamed_addr constant [4 x i8] c"len\00"
+@.str.3 = private unnamed_addr constant [17 x i8] c"sum via fn param\00"
+@.str.4 = private unnamed_addr constant [4 x i8] c"1.5\00"
+@.str.5 = private unnamed_addr constant [17 x i8] c"str contains 1.5\00"
+@.str.6 = private unnamed_addr constant [2 x i8] c"4\00"
+@.str.7 = private unnamed_addr constant [15 x i8] c"str contains 4\00"
+@.str.8 = private unnamed_addr constant [28 x i8] c"deep eq of two float arrays\00"
+@.str.9 = private unnamed_addr constant [9 x i8] c"deep neq\00"
+@.str.10 = private unnamed_addr constant [25 x i8] c"read via any-typed alias\00"
+@.str.11 = private unnamed_addr constant [13 x i8] c"alias read 0\00"
+@.str.12 = private unnamed_addr constant [32 x i8] c"alias mutation visible (shared)\00"
+@.str.13 = private unnamed_addr constant [23 x i8] c"struct field list read\00"
+@.str.14 = private unnamed_addr constant [3 x i8] c"xs\00"
+@.str.15 = private unnamed_addr constant [22 x i8] c"dict-stored list read\00"
+@.str.16 = private unnamed_addr constant [20 x i8] c"index_set then read\00"
+@.str.17 = private unnamed_addr constant [32 x i8] c"neighbor intact after index_set\00"
+@.str.18 = private unnamed_addr constant [36 x i8] c"float_array_escape_test: all passed\00"
+
 ; Debug metadata
 !llvm.dbg.cu = !{!100}
 !llvm.module.flags = !{!102, !103}
@@ -407,9 +647,55 @@ entry:
 !103 = !{i32 2, !"Debug Info Version", i32 3}
 !104 = !DISubroutineType(types: !105)
 !105 = !{null}
-!200 = distinct !DISubprogram(name: "dot", scope: !101, file: !101, line: 5, type: !104, scopeLine: 5, spFlags: DISPFlagDefinition, unit: !100)
-!201 = !DILocation(line: 5, column: 0, scope: !200)
-!202 = !DILocation(line: 6, column: 0, scope: !200)
+!200 = distinct !DISubprogram(name: "take_any", scope: !101, file: !101, line: 10, type: !104, scopeLine: 10, spFlags: DISPFlagDefinition, unit: !100)
+!201 = !DILocation(line: 10, column: 0, scope: !200)
+!203 = distinct !DISubprogram(name: "sumlist", scope: !101, file: !101, line: 13, type: !104, scopeLine: 13, spFlags: DISPFlagDefinition, unit: !100)
+!204 = !DILocation(line: 13, column: 0, scope: !203)
+!211 = distinct !DISubprogram(name: "nova_user_main", scope: !101, file: !101, line: 21, type: !104, scopeLine: 21, spFlags: DISPFlagDefinition, unit: !100)
+!212 = !DILocation(line: 21, column: 0, scope: !211)
+!202 = !DILocation(line: 11, column: 0, scope: !200)
+!205 = !DILocation(line: 14, column: 0, scope: !203)
+!206 = !DILocation(line: 15, column: 0, scope: !203)
+!207 = !DILocation(line: 16, column: 0, scope: !203)
+!208 = !DILocation(line: 17, column: 0, scope: !203)
+!209 = !DILocation(line: 18, column: 0, scope: !203)
+!210 = !DILocation(line: 19, column: 0, scope: !203)
+!213 = !DILocation(line: 22, column: 0, scope: !211)
+!214 = !DILocation(line: 23, column: 0, scope: !211)
+!215 = !DILocation(line: 24, column: 0, scope: !211)
+!216 = !DILocation(line: 25, column: 0, scope: !211)
+!217 = !DILocation(line: 28, column: 0, scope: !211)
+!218 = !DILocation(line: 29, column: 0, scope: !211)
+!219 = !DILocation(line: 30, column: 0, scope: !211)
+!220 = !DILocation(line: 31, column: 0, scope: !211)
+!221 = !DILocation(line: 34, column: 0, scope: !211)
+!222 = !DILocation(line: 35, column: 0, scope: !211)
+!223 = !DILocation(line: 36, column: 0, scope: !211)
+!224 = !DILocation(line: 39, column: 0, scope: !211)
+!225 = !DILocation(line: 40, column: 0, scope: !211)
+!226 = !DILocation(line: 41, column: 0, scope: !211)
+!227 = !DILocation(line: 42, column: 0, scope: !211)
+!228 = !DILocation(line: 43, column: 0, scope: !211)
+!229 = !DILocation(line: 44, column: 0, scope: !211)
+!230 = !DILocation(line: 45, column: 0, scope: !211)
+!231 = !DILocation(line: 46, column: 0, scope: !211)
+!232 = !DILocation(line: 47, column: 0, scope: !211)
+!233 = !DILocation(line: 50, column: 0, scope: !211)
+!234 = !DILocation(line: 51, column: 0, scope: !211)
+!235 = !DILocation(line: 54, column: 0, scope: !211)
+!236 = !DILocation(line: 55, column: 0, scope: !211)
+!237 = !DILocation(line: 56, column: 0, scope: !211)
+!238 = !DILocation(line: 57, column: 0, scope: !211)
+!239 = !DILocation(line: 60, column: 0, scope: !211)
+!240 = !DILocation(line: 61, column: 0, scope: !211)
+!241 = !DILocation(line: 64, column: 0, scope: !211)
+!242 = !DILocation(line: 65, column: 0, scope: !211)
+!243 = !DILocation(line: 66, column: 0, scope: !211)
+!244 = !DILocation(line: 67, column: 0, scope: !211)
+!245 = !DILocation(line: 70, column: 0, scope: !211)
+!246 = !DILocation(line: 71, column: 0, scope: !211)
+!247 = !DILocation(line: 72, column: 0, scope: !211)
+!248 = !DILocation(line: 74, column: 0, scope: !211)
 
 ; TBAA metadata
 !0 = !{!"NOVA TBAA"}

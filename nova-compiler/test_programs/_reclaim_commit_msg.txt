@@ -1,0 +1,37 @@
+perf(runtime): green-task reclamation (tombstone split) -- bounded memory under spawn/finish churn
+
+The #1 long-running-server blocker: green tasks were NEVER freed, so a server spawning a task per
+request grew unbounded (~8-20KB/task, forever). Now, at the single-carrier finish path, the finished
+task's FIBER (its committed stack + the NovaFiber) is reclaimed (DeleteFiber on Windows / munmap on
+POSIX + free), while the tiny NovaSchedTask (~144B) is KEPT as the stable, UAF-safe PID -- so
+monitor() / exit_reason() / late pid_send all stay valid. This is BEAM's cheap-process-table /
+expensive-stack model. The mailbox is kept (drain-closed; a late send stays a graceful no-op),
+which avoids the late-send UAF.
+
+Safe by construction (all hazards verified against the code):
+  - The fiber has switched back to the carrier (done==1, nova_sched_current=NULL) -> it is NOT the
+    running fiber, so DeleteFiber/munmap of it is legal (NEVER from within the fiber).
+  - Crash status + error_msg are copied into the kept task (L6293-6303) BEFORE the free.
+  - t->fiber=0 is published before free, so the only post-finish ->fiber read (the N>1-only watchdog,
+    already `if (fb)`-guarded) sees NULL, never a freed pointer.
+  - PID == the NovaSchedTask ptr (returned by sched_spawn), which is KEPT -> monitor/exit_reason intact.
+  - Generators (is_task=0) never reach this carrier finish path; only run-queue scheduler tasks do.
+  - Gated g_carrier_count<=1: applied ONLY on the single-carrier path where the finish is
+    single-threaded and race-free. N>1 keeps the old never-free behavior (no new risk); N>1
+    reclamation is a follow-on that pairs with the M:N park-commit fixes.
+
+The "growable stacks" premise was a misdiagnosis (read-only multi-agent analysis + adversary review):
+stacks are already lazy-commit (Windows CreateFiberEx commit=4KB/reserve=PE-default; POSIX demand-zero
+mmap), overflow is contained; the real gap was over-time reclamation, not stack size. A safe,
+memory-capped measurement (10k/20k/35k tasks -> 321/735/1408 MB, linear) confirmed alive-at-once scale
+and made the never-freed leak visible (~half the peak was finished tasks). Full reframing, measurement,
+hazards, and the safe-test protocol: NOVA_DESIGN/GREEN_TASK_RECLAMATION_DESIGN.md.
+
+Proof (under _safe_scale_run.ps1: a memory-capped, kill-on-timeout runner that can never exhaust the
+machine): 100k spawn+finish churn now peaks 55MB (was ~1GB -- ~20x less) and is ASAN-clean over 100k
+reclamations. New permanent guard _reclaim_churn_test (30k churn). _safe_scale_run.ps1 is a reusable
+safe scale-test tool.
+
+Reconverged gen5.ll==gen6.ll; regression 550/550 both modes (NORMAL + FULLRC); ASAN-clean.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

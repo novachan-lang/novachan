@@ -1,0 +1,27 @@
+perf(runtime): enable green-task reclamation at N>1 -- bounded memory on multi-core green scheduling
+
+Follow-on to the N=1 tombstone split (179126e) and the M:N park-commit race fix (485ed40): now that
+multi-core green scheduling is corruption-free, the finished-task fiber reclamation is enabled at ALL
+carrier counts (was gated g_carrier_count<=1). A long-running server under NOVA_CARRIERS>1 no longer
+leaks ~8-20KB per finished task.
+
+Two changes:
+  - WATCHDOG TOCTOU fix: the diagnostic watchdog (NOVA_SCHED_WATCHDOG, off by default) copied st->fiber
+    then dereferenced fb->status/active/resumer, which at N>1 raced reclaim's free(fib). It now derefs the
+    fiber ONLY when st->status != 3. This is race-free, not best-effort: a task in g_carrier_spin is being
+    resumed/spun by THIS carrier, so no other carrier finishes it and its status cannot flip to 3 during
+    the read; a status==3 task may have had its fiber reclaimed, so its fiber is not touched.
+  - Removed the g_carrier_count<=1 gate on nova_sched_reclaim_fiber. Safe at all N: the finishing carrier
+    is the SOLE toucher of a just-finished (status==3, off-run-queue) task's fiber -- no other carrier
+    resumes it, and the only cross-carrier reader (the watchdog) now skips it.
+
+Validation (under the memory-capped kill-on-timeout watcher): N=1 reconverged gen5.ll==gen6.ll + 551/551
+both modes (unregressed); green_scale (10k tasks x2 phases incl. 10k parked finishing CONCURRENTLY across
+carriers) PASSES at NOVA_CARRIERS=4 NORMAL and at N=4 + NOVA_SCHED_WATCHDOG=1 + ASAN (exercises concurrent
+N>1 reclamation + the TOCTOU fix) with ZERO ASAN errors / ZERO double-resume aborts.
+
+With this, follow-on #1 is complete: N>1 is corruption-free AND memory-bounded. Remaining (separate):
+the N>1 run-queue lock-convoy liveness (per-carrier deques), full tombstone-free (epoch/generation PID),
+and the POSIX uncontained-overflow handler.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

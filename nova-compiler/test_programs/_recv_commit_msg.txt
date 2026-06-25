@@ -1,0 +1,45 @@
+feat(async): Erlang selective receive -- receive { pat => body } with a BEAM-style save-queue
+
+The gen_server marquee. Column-aligned `receive` arms (like match, not braces) let a
+green process match its mailbox by PATTERN and defer non-matching messages in arrival
+order, then pull them in a later receive -- genuine Erlang selective-receive semantics,
+reusing the proven match codegen + green park/unpark + deep-copy-on-send isolation.
+
+Parser (nova_compiler.nova):
+  parse_receive_stmt desugars `receive <arms>` to one compound statement:
+    block[ __recv_begin();
+           while true { match __recv_next() { <user arm>: __recv_commit(); body; break
+                                              _ => __recv_defer() } } ]
+  Dispatched from parse_stmt when `receive` is NOT followed by `(` (so `receive(ch)`
+  stays a channel recv). Guards and OR-patterns are supported per arm.
+
+Codegen FIX (the root cause that hid the feature): ir_lower_stmt had NO `block` case --
+only ti_infer_stmt (inference) handled the "block" tag, so a compound-statement
+desugaring compiled to NOTHING (the worker body emitted just param-store + ret, zero
+recv calls, no error). Added a `block` case that lowers each child in order. parse_block
+(the other "block" producer) is dead code, which is why the gap was never hit before.
+
+Runtime (output/nova_runtime.c): per-NovaSchedTask save_queue (lazily-created RC-heap
+NovaList, arena-cleared like the mailbox) + recv_cursor/recv_initial/recv_src/recv_last.
+  - recv_next: peek save_queue[0..initial) (src=1, rc_inc for an independent owned ref)
+    then channel_recv(mailbox) (src=2, already owned).
+  - recv_commit: src=1 list_remove_at (decs only the LIST's ref -- the matched message
+    survives for the arm body via recv_next's inc, so NO use-after-free); src=2 no-op.
+  - recv_defer: src=1 cursor++ + rc_dec(recv_last); src=2 list_append + rc_dec(recv_last)
+    -- both balanced, so a repeatedly-deferred saved message does not leak across scans.
+  - task-finish: rc_dec(save_queue); the list destructor decs remaining deferred messages
+    -> no leak even if a task dies with un-matched messages queued.
+
+Soundness (all pass NORMAL + ASAN-clean):
+  _recv_select_test  -- int selective receive, Erlang ordering (match 1 before earlier-2)
+  _recv_heap_probe   -- 3 deep-copied strings deferred to / restored from the save-queue
+  _recv_uaf_probe    -- binds x and READS len(x) of the matched-from-save message
+                        (exercises use-after-free; clean under ASAN)
+  _recv_nested_test  -- nested receive: sound because every matched arm runs commit BEFORE
+                        the body and breaks after it, so the outer loop never re-reads the
+                        clobbered per-task recv_* state.
+
+Reconverged gen5.ll == gen6.ll (73C06674...); the new branches are inert on the compiler's
+own source, so the bootstrap fixpoint is unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
