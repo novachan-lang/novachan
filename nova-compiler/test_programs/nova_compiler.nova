@@ -8769,6 +8769,115 @@ fn ir_list_elem_struct(b: IrBuilder, expr: Expr) -> string
                 return b.ir_fn_ret_list_elem[ev]
     ""
 
+// S1 nominal struct-return: does EVERY terminal/exit path of `body` return a direct constructor
+// of struct `sname`? Maximally conservative (fail-closed): returns false on any construct not
+// explicitly proven. Prevents the null-return CVE by rejecting fns where any path returns null
+// or a non-struct value, so ir_fn_returns is never set for such fns.
+fn _s1_expr_is_struct_ctor(e: Expr, sname: string) -> bool
+    match e
+        Expr(et, ev, en, ec, ef, eln) =>
+            if et == "struct_init" and ev == sname
+                return true
+            if et == "call" and ev == sname
+                return true
+    return false
+
+fn _s1_stmts_all_return_struct(stmts: list, sname: string) -> bool
+    // Walk the statement list. Every explicit `return` must return a struct ctor of sname.
+    // The trailing statement (if it is an expr) is an implicit return and must also be a ctor.
+    // If there is no trailing expr and no return on every path, the fn falls through to null -> false.
+    let n = len(stmts)
+    if n == 0
+        return false
+    let i = 0
+    while i < n
+        let s = stmts[i]
+        match s
+            Stmt(st, sn, se, sb, sp, sel, sa, sl) =>
+                if st == "return"
+                    if not _s1_expr_is_struct_ctor(se, sname)
+                        return false
+                    // This return is good; but other paths may still exist after it (dead code),
+                    // or earlier stmts may have if/match with returns. Continue scanning.
+                if st == "if"
+                    // An if at the tail of the block that has BOTH branches all-returning-struct
+                    // covers the tail. But a mid-block if with returns only on some paths is
+                    // complex; be conservative. Only handle: if/else where BOTH branches
+                    // all-return-struct (recursively), which covers the remaining paths.
+                    // An if WITHOUT else that doesn't return on some path => fallthrough => check tail.
+                    // We don't need to mandate anything about mid-block if's that don't return,
+                    // since they just fall through to the next statement.
+                    // But if this if has a return in only ONE branch, the other falls through.
+                    // We just continue scanning; the return-checking handles explicit returns.
+                    0
+                if st == "match"
+                    // Same logic: match arms with returns are checked individually when we
+                    // encounter `return` stmts inside them. We continue scanning.
+                    0
+        i = i + 1
+    // After scanning all stmts, check the trailing statement. It is the implicit return
+    // if there's no explicit `return` covering this path.
+    let last = stmts[n - 1]
+    match last
+        Stmt(lt, ln2, le, lb, lp, lel, la, ll) =>
+            if lt == "expr"
+                return _s1_expr_is_struct_ctor(le, sname)
+            if lt == "return"
+                // Already checked above — if we reach here the return was good
+                return _s1_expr_is_struct_ctor(le, sname)
+            if lt == "if"
+                // Tail if/else: both branches must all-return-struct
+                if len(lel) == 0
+                    return false
+                if not _s1_stmts_all_return_struct(lb, sname)
+                    return false
+                return _s1_stmts_all_return_struct(lel, sname)
+            if lt == "match"
+                // All arms must all-return-struct
+                if len(lb) == 0
+                    return false
+                for _s1_arm in lb
+                    match _s1_arm
+                        Stmt(_s1at, _s1an, _s1ap, _s1ab, _s1app, _s1ae, _s1aa, _s1al) =>
+                            if not _s1_stmts_all_return_struct(_s1ab, sname)
+                                return false
+                return true
+    return false
+
+fn _fn_all_paths_return_struct(body: list, sname: string, sdefs: dict) -> bool
+    if not contains(sdefs, sname)
+        return false
+    // First pass: check every explicit `return` in the entire body (recursively).
+    // Any return of a non-sname value -> reject immediately.
+    if not _s1_body_returns_ok(body, sname)
+        return false
+    // Second pass: check that the trailing path covers (implicit return).
+    return _s1_stmts_all_return_struct(body, sname)
+
+fn _s1_body_returns_ok(stmts: list, sname: string) -> bool
+    // Recursively check that every `return` stmt in the body returns a ctor of sname.
+    for s in stmts
+        match s
+            Stmt(st, sn, se, sb, sp, sel, sa, sl) =>
+                if st == "return"
+                    if not _s1_expr_is_struct_ctor(se, sname)
+                        return false
+                if st == "if"
+                    if not _s1_body_returns_ok(sb, sname)
+                        return false
+                    if not _s1_body_returns_ok(sel, sname)
+                        return false
+                if st == "match"
+                    for _s1_arm in sb
+                        match _s1_arm
+                            Stmt(_s1at, _s1an, _s1ap, _s1ab, _s1app, _s1ae, _s1aa, _s1al) =>
+                                if not _s1_body_returns_ok(_s1ab, sname)
+                                    return false
+                if st == "while" or st == "for"
+                    if not _s1_body_returns_ok(sb, sname)
+                        return false
+    return true
+
 fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
     match stmt
         Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
@@ -10041,6 +10150,7 @@ type TiState
     ti_fn_param_types: dict
     ti_trait_method_arity: dict
     ti_type_method_arity: dict
+    ti_fn_ret_stypes: dict
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -10110,7 +10220,7 @@ fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
     let _ti_strict_env = env("NOVA_TI_STRICT")
     let _ti_strict = len(_ti_strict_env) > 0 and _ti_strict_env[0] == "1"
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -12985,6 +13095,13 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
         let d_resolved = ti_zonk(st, d_fn_type)
         ti_define(st, dn, ti_generalize(st, d_resolved))
         st.ti_fn_types[d_fn_name] = ti_to_ir_kind(ti_apply(st, d_ret_var))
+        // S1 nominal struct-return: record the HM-resolved return struct name (ungated;
+        // nothing reads ti_fn_ret_stypes unless NOVA_STRUCT_RET=1 at consumption).
+        let _s1_ret_nt = ti_apply(st, d_ret_var)
+        match _s1_ret_nt
+            NType(_s1k, _s1n, _s1ps, _s1id) =>
+                if _s1k == "struct" and _s1n != ""
+                    st.ti_fn_ret_stypes[d_fn_name] = _s1n
         // Stage 1 (beat-C): export FULLY-RESOLVED param types here — after the whole
         // program is inferred + final ti_solve, an unannotated struct param (e.g. dot's
         // `a`) is now unified to its concrete struct via call sites. Codegen reads these
@@ -16950,6 +17067,17 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                                     let _rtle = slice(rtv, rt_lt + 1, len(rtv) - 1)
                                     if contains(b.ir_sdefs, _rtle)
                                         b.ir_fn_ret_list_elem[name] = _rtle
+                    // S1 nominal struct-return (NOVA_STRUCT_RET): pin an UNANNOTATED fn's struct
+                    // return iff EVERY path provably returns a constructor of that one struct
+                    // (fail-closed vs null-return CVE). Source annotations always win.
+                    let _s1_env = env("NOVA_STRUCT_RET")
+                    if len(_s1_env) > 0 and _s1_env[0] == "1"
+                        if not contains(b.ir_fn_returns, name)
+                            if contains(ti_state.ti_fn_ret_stypes, name)
+                                let _s1_s = ti_state.ti_fn_ret_stypes[name]
+                                if contains(b.ir_sdefs, _s1_s)
+                                    if _fn_all_paths_return_struct(body, _s1_s, b.ir_sdefs)
+                                        b.ir_fn_returns[name] = _s1_s
                     let dunder_pos = find(fn_name, "__")
                     if dunder_pos > 0
                         let method_suffix = fn_name[dunder_pos + 2:999999999]
