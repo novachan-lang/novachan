@@ -93,12 +93,26 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   app dict is ALREADY read-only post-setup -> concurrent reads at N>1 are safe -> **B11 freeze unnecessary**
   (would add hot-path cost to defend an already-safe invariant). B8 limiter is NOT wired into serve -> not
   raced -> its owner-actor is a future-when-wired concern.
-  **REAL REMAINING:** (1) **validate Forge ITSELF at N>1** (run forge_* tests at NOVA_CARRIERS=4 -> proves
-  multi-core Forge works + surfaces any real-path issue) — LOW risk, HIGH value, DO NEXT. (2) **0E memo**
-  (@memo per-fn cache races at N>1 — close before flip IF @memo is used; needs @memo codegen lock).
-  (3) **Stage 2/3b PERF** (channel de-convoy + single-poller — for throughput vs Spring/BEAM; Stage 2 is
-  the risky wake-refactor). (4) **Stage 5 flip** N>1 default (high blast-radius; opt-in-prod-ready +
-  soak first). 0D counters = TSAN-follow-on (diagnostic, benign). N=1 invariant = TWO oracles (reconverge for the
+  **VALIDATED FORGE AT N>1 (commit e4a03b9..): the full 594-suite at NOVA_CARRIERS=4 = 588 PASS / 5 FAIL.**
+  The 5 fails were ALL socket-server streaming tests (forge_sse / ws_chat / ws_presence / ws_lifecycle /
+  model_route) and ALL **TIMEOUTs, not functional fails** — the watchdog showed every assertion PASSED
+  ("SSE stream opened... event streamed... keepalive...") then the program HUNG with live=1, all carriers
+  idle. **Root cause (real N>1 bug): a leftover background task** — the SSE/WS keepalive ticker
+  (`_sse_ticker`: sleep+try_send) and/or the stream parked on its hub channel after the client closed —
+  kept `live=1`. The **N=1 idle path already exits Go-style once the ROOT (main) task finishes** even with
+  a lingering daemon (nova_runtime.c ~6651-6653), but the **N>1 idle path did NOT** — it waited for
+  `live<=0` forever -> hang (and a task-LEAK per closed streaming conn on a real N>1 server). **FIX (made,
+  gating via nova_ci bp5cbwzpp): bring N>1 to parity** — in the N>1 idle branch (~6638), break when
+  `nova_sched_root_task->status==3`. N>1-branch-ONLY => N=1 byte-identical. **Focused-validated: all 6
+  streaming tests PASS at N=4 (<1.2s each), ws_echo control unaffected.** Pending: nova_ci green (N=1
+  588 both modes + reconverge) + a full N=4 regression re-run to confirm 593 PASS broadly, then COMMIT.
+  NOTE for re-running forge tests standalone: `_install_forge.ps1` first (installs current forge.nova ->
+  nova-compiler/lib), then NOVA_HOME=<repo>/nova-compiler; the _nh_home copy is stale.
+  **THEN REMAINING:** (2) **0E memo** DORMANT (@memo only in compiler+showcase, not Forge/prod — close
+  the codegen lock only if @memo reaches N>1 prod code). (3) **Stage 2/3b PERF** (channel de-convoy +
+  netpoller single-poller — throughput vs Spring/BEAM; Stage 2 is the risky wake-refactor; the netpoller
+  single-poller is the genuine 3b, distinct from this shutdown fix). (4) **Stage 5 flip** N>1 default
+  (high blast-radius; opt-in-prod-ready + soak first). 0D counters = TSAN-follow-on (diagnostic, benign). N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.

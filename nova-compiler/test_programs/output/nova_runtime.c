@@ -6630,8 +6630,18 @@ int64_t nova_rt_sched_run(void) {
         if (!t) {
             if (g_carrier_count > 1) {
                 /* M:N: another carrier may still produce work (channel sends, spawns).
-                   Exit only when ALL tasks are done; otherwise brief idle then retry. */
+                   Exit when ALL tasks are done; otherwise brief idle then retry. */
                 if (nova_live_get() <= 0) break;
+                /* Stage 3b: Go-style root-exit at N>1 — PARITY with the single-carrier path below
+                   (6651-6653). Once the ROOT (main) task has FINISHED, terminate even if a background
+                   daemon still lingers (an SSE/WS keepalive ticker parked on sleep, or a stream parked
+                   on its hub channel after the client closed). Without this, N>1 waits for live<=0
+                   forever — a leftover streaming-connection task that never finishes hangs the program
+                   (the 5 socket-server regression TIMEOUTs at N=4). A task STILL RUNNING on another
+                   carrier is unaffected (its carrier is busy, not in this idle branch); only an idle
+                   carrier with a finished root breaks, then main_dispatch joins all carriers and exits.
+                   This is exactly NOVA's existing N=1 semantics, now matched at N>1. */
+                if (nova_sched_root_task && nova_sched_root_task->status == 3) break;
                 if (g_watchdog_on) g_carrier_pc[_wcid] = 4;
 #ifdef _WIN32
                 Sleep(1);
