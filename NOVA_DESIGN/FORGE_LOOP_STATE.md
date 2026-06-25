@@ -139,9 +139,24 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   proper fix (untimed io_waiters keep N=1 alive — small, gated; removes the bench keepalive daemon). (5)
   **Forge Phase B moats** (OTP declarative API / observability / auth — the mission's BREADTH; lower-risk
   Forge-level code). 0E memo DORMANT. 0D counters = TSAN-follow-on.
-  **★ NEXT SESSION:** either (a) implement accept/poller S-a with full focus, or (b) Forge Phase B
-  features — both advance "beat the frameworks"; the multi-core FOUNDATION (correctness + compute-
-  throughput) is DONE + measured + banked. N=1 invariant = TWO oracles (reconverge for the
+  **★★ STABILITY SOAK FOUND A PRODUCTION-BLOCKER LEAK (2026-06-26, _forge_stability_soak.ps1):** a
+  long-lived server under sustained load LEAKS ~0.5KB/request, MONOTONIC, **N-INDEPENDENT** (N=1 +301%,
+  N=4 +273% RSS over 192k requests; bad=0, no hang, throughput steady). CONFIRMED SOURCE: the
+  **NovaSchedTask struct leaks on every task finish** — nova_sched_reclaim_fiber (called at the finish
+  path nova_runtime.c:6717) frees the FIBER STACK but never `free(t)`; the struct is freed ONLY on the
+  spawn-FAILURE path (6333/7109). So every spawned task (every Forge request handler via serve_req's
+  fire-and-forget sched_spawn) leaks its PID struct. PRE-EXISTING; the old "flat-memory" proof MISSED it
+  (it measured per-request ARENA delta, not RSS over many requests). A server OOMs in hours → **NOT
+  production-ready until fixed.** FIX (careful — the struct is kept because a PID may be monitored later;
+  naive free = UAF/stale-PID): generational task pool (slot+generation PID, the standard Erlang/ECS
+  pattern) OR monitor-aware refcount (free on finish iff no monitor + no held ref) OR a detached-spawn
+  flag (serve_req's spawns are fire-and-forget → free on finish). DELIBERATE work (UAF risk).
+  **★ NEXT SESSION — prioritized DELIBERATE work (multi-core FOUNDATION correctness+compute-throughput
+  is DONE+measured+banked; these 3 are the remaining "production-ready + beat-frameworks" levers):**
+  **(1) TASK-STRUCT LEAK — #1, production blocker** (design the safe reclaim, gate hard: ASAN + a
+  bounded-server serve_req_n soak that must plateau). (2) accept/poller S-a→S-c (I/O throughput lever,
+  FORGE_ACCEPT_POLLER_PLAN.md). (3) Forge Phase B breadth (OTP/observability/auth). Each = design (Opus,
+  adversary-vetted) → gated impl → re-run the soak/stability harness as the oracle. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.
