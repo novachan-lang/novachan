@@ -64,11 +64,21 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   ALL folded in; goNoGo=revise = build the revised stages). It IS the complete multithreading-for-Forge
   design: **Stages 0-5, ending at Stage 5 = flip N>1 default → Forge on all cores** (that IS the
   parallelism; work-stealing folded to optional-later, NOT needed for v1 — the global-injector-claim
-  model already balances new connections across idle cores). **LOOP RUNNING (owner GO given, full autonomy to the Forge end).** Stage 0A (heap-bounds
-  monotonic CAS, gated) IMPLEMENTED in output/nova_runtime.c — N>1 stress PASS (25/25 normal + 8/8 ASAN
-  at NOVA_CARRIERS=4); guard _n1_heapbounds_test added to the regression; N=1 gate (nova_ci) was
-  running. 0B-0E DESIGNED (0B intern-table lock before lazy-init / 0C box-track CAS / 0D counters
-  relaxed-atomic / 0E memo lock — all gated g_carrier_count>1) — implement as one batch after 0A commits. N=1 invariant = TWO oracles (reconverge for the
+  model already balances new connections across idle cores). **LOOP RUNNING (owner GO, full autonomy to the Forge end).**
+  **STAGE 0 COMPLETE (value-model N>1-safety, all gated + ALL-GREEN):** 0A heap-bounds CAS (commit
+  b7b4063), 0B intern-table lock + 0C box-bounds CAS (commit bd33455). Each: reconverge gen5.ll==gen6.ll
+  + 590-591/N PASS both RC modes + N>1 stress (_n1_heapbounds_test, _n1_box_test) 25/25 + ASAN at N=4.
+  DEFERRED (tracked, CLOSE BEFORE STAGE 5 FLIP): 0D mem counters (diagnostic, racy-but-benign at N>1,
+  TSAN-follow-on); 0E @memo cache (nova_rt_memo_cache returns a per-fn cache dict the GENERATED @memo
+  code races on — needs @memo codegen locking, not just a registry lock; @memo is N=1-correct today).
+  **REORDER (soundness order, not feature order):** Stage 1 (B11 app-freeze + B8 limiter) is DEFENSIVE
+  (handlers only READ the app dict in correct use; limiter not on the hot path) — do it BEFORE the
+  Stage-5 flip. Tackle the ACTIVE N>1 bugs first: **NEXT = Stage 2 (channel deferred-wake)** — the
+  hardest + highest-value (Forge uses channels heavily; the lost-wakeup hang breaks N>1), with the
+  adversary must-fixes (re-park generation stamp; copy offload j->task BEFORE enqueue). Then Stage 3
+  (netpoller: status-overwrite-inside-lock + single-poller), Stage 4 (epoch fiber-reclaim), then
+  Stage 1 (defensive), then Stage 5 (flip N>1 default). B11 audit finding: app IS a dict, mutated at
+  SETUP (route reg a["ws_routes"]=...) — freeze at serve-start; confirm no serve-time write first. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.
