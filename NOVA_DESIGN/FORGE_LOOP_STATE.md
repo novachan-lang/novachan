@@ -12,10 +12,10 @@ Erlang-shaped runtime primitives into clean APIs (see FORGE_STATUS §1, §6). Co
 beats C/Rust/Go/Python at the language level; Forge beats the web frameworks on top of it.
 
 **★ THIS IS ONE CONTINUOUS LOOP — NOT SEPARATE TASKS.** The Forge plan is COMPLETE (FORGE_STATUS +
-FORGE_BUILD_PLAN); this is EXECUTION, not more planning. Core-NOVA work (N>1 multi-core, inference),
-Forge features, and later Reactor (the game engine, REACTOR_MASTER_PLAN.md) are ALL threads of the SAME
-loop toward the SAME vision — deeply connected (N>1 powers Forge AND Reactor; inference cleans ALL NOVA
-code; one runtime under everything). The "phases" below are the FLOW/ORDER within the one loop, never
+FORGE_BUILD_PLAN); this is EXECUTION, not more planning. Core-NOVA work (N>1 multi-core, inference)
+and Forge features are ALL threads of the SAME loop toward the SAME vision — deeply connected (N>1
+powers Forge's multi-core throughput; inference cleans ALL NOVA code; one runtime under everything).
+**Scope = multithreading + Forge. NOT the Reactor/game-engine plan.** The "phases" below are the FLOW/ORDER within the one loop, never
 walls between projects. DESIGN only the genuinely-hard, soundness-critical core pieces (lightly, in the
 loop); BUILD everything else against the existing plan. No re-planning, no stop-start — flow.
 
@@ -40,11 +40,10 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   RACES (channel lost-wakeup, netpoller M:N coordination, fiber-reclaim memory, B8 limiter-owner, B11
   app-object race — FORGE_STATUS §11 F7). **A single-core server can't out-throughput Spring (thread-
   per-request multicore) or BEAM (scheduler-per-core). Closing N>1 is THE foundation for the beat
-  claim.** Must stay N=1-byte-identical + gated. **SHARED FOUNDATION for BOTH frameworks: Forge
-  (I/O-bound concurrency throughput) AND Reactor — the game engine, 2nd framework
-  (REACTOR_MASTER_PLAN.md), whose PAPG model needs CPU-bound parallel frame jobs + a deterministic tick
-  barrier. The production scheduler must serve BOTH: pinning/parking for I/O AND work-stealing + barrier
-  for parallel compute. Correctness (races) first; the parallel-compute/work-stealing layer on top.
+  claim.** Must stay N=1-byte-identical + gated. **FOR FORGE — multithreading + Forge ONLY (NOT the
+  Reactor/game-engine plan).** Make N>1 race-free so Forge handles requests across every core and
+  out-throughputs Spring (thread-per-request) / BEAM (scheduler-per-core). Correctness (races) first;
+  then ensure requests load-balance across cores so no core sits idle under load.
 - **Phase B — the cheap moats:** L4 OTP declarative API (forge.supervisor + child specs; GenServer
   call/cast/**on_info**/timeout/terminate) = beat Erlang's ergonomics on its own substrate; L8
   observability (/metrics, /healthz, JSON logs + trace-id) + L3 auth pipeline = beat Spring; L5 channel
@@ -65,12 +64,11 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   - **Part 1 — Correctness** (workflow wzr6brjer): map + close the N>1 races (channel lost-wakeup,
     netpoller M:N coordination, fiber-reclaim, B8/B11), happens-before-proven, adversarial race-hunt.
     The race-free base.
-  - **Part 2 — Parallelism** (runs on Part 1's settled model): the actual multi-core SPEEDUP —
-    **work-stealing** (idle cores steal queued jobs → all cores busy; vs the I/O-side pinning), a
-    **deterministic tick barrier** (game frames + parallel pmap), and a clean **parallel job/task-graph
-    API**. Serves Forge throughput AND Reactor frames.
-  - Then SYNTHESIZE Part 1 + Part 2 → one complete "multithreaded NOVA" design → present to owner →
-    WAIT for explicit go before any build.
+  - **Part 2 — Throughput** (runs on Part 1's settled model): make Forge actually FAST across cores —
+    requests/tasks **load-balance across carriers** (work-stealing if home-carrier assignment goes
+    uneven) so all cores stay busy under load. **FORGE only — no game-engine frame barriers, no Reactor.**
+  - Then SYNTHESIZE Part 1 + Part 2 → one complete N>1-multithreading-for-Forge design → present to
+    owner → WAIT for explicit go before any build.
 
 ## Resume checklist
 1. Read this doc + FORGE_STATUS.md §11 F7/B8/B11 (the N>1 races) + the N>1 design output when it lands.
