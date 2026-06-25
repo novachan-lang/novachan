@@ -477,6 +477,12 @@ typedef enum {
 
 static int64_t      nova_mem_live    = 0;
 static int64_t      nova_mem_total   = 0;
+/* #31 heap profiler: per-tag allocation accounting (count + bytes), tallied at every
+   nova_heap_alloc. Cheap (two array writes; negligible vs the allocation itself). A
+   breakdown is printed at exit when NOVA_HEAP_PROFILE is set (off by default -> no output;
+   the tallies themselves are always kept, so a future heap_report() builtin can read them). */
+static int64_t      nova_heap_prof_count[16] = {0};
+static int64_t      nova_heap_prof_bytes[16] = {0};
 static volatile int nova_is_multithreaded = 0;
 static int          nova_arena_mode  = 0;
 /* nova_heap_base declared near slab allocator — tracks lowest heap address for fast RC filter */
@@ -547,6 +553,14 @@ static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     size_t total = NOVA_RC_HDR_SIZE + size;
     char* base;
+    /* #31 heap profiler tally. Struct tags encode the slot count in the high bits (low 3 bits
+       = kind = NOVA_MEM_STRUCT=5), so normalize all structs to index 5; other kinds (raw/list/
+       dict/bytes) are the raw enum value. */
+    {
+        int _hp_idx = ((tag & 7) == 5) ? 5 : ((int)tag & 15);
+        nova_heap_prof_count[_hp_idx]++;
+        nova_heap_prof_bytes[_hp_idx] += (int64_t)total;
+    }
 #ifdef NOVA_FREESTANDING
     {
         static unsigned char nova_fs_heap[NOVA_FS_HEAP_SIZE];
@@ -9264,6 +9278,26 @@ int64_t nova_rt_live_count(void) {
 }
 
 void nova_rt_cleanup(void) {
+#ifndef NOVA_FREESTANDING
+    /* #31 heap profiler: print the per-tag allocation breakdown at exit when requested. */
+    if (getenv("NOVA_HEAP_PROFILE")) {
+        const char* _hp_names[16] = {0};
+        _hp_names[NOVA_MEM_RAW]="raw"; _hp_names[NOVA_MEM_LIST]="list";
+        _hp_names[NOVA_MEM_DICT]="dict"; _hp_names[NOVA_MEM_STRUCT]="struct";
+        _hp_names[NOVA_MEM_BYTES]="bytes";
+        int64_t _hp_tc = 0, _hp_tb = 0;
+        fprintf(stderr, "=== NOVA heap profile (allocations by tag) ===\n");
+        for (int _hp_i = 0; _hp_i < 16; _hp_i++) {
+            if (nova_heap_prof_count[_hp_i] == 0) continue;
+            const char* _nm = _hp_names[_hp_i] ? _hp_names[_hp_i] : "other";
+            fprintf(stderr, "  %-8s (tag %d)  count=%lld  bytes=%lld\n",
+                    _nm, _hp_i, (long long)nova_heap_prof_count[_hp_i], (long long)nova_heap_prof_bytes[_hp_i]);
+            _hp_tc += nova_heap_prof_count[_hp_i]; _hp_tb += nova_heap_prof_bytes[_hp_i];
+        }
+        fprintf(stderr, "  TOTAL     count=%lld  bytes=%lld  (still-live objects=%lld)\n",
+                (long long)_hp_tc, (long long)_hp_tb, (long long)nova_mem_live);
+    }
+#endif
     /* With embedded RC, all objects free themselves when RC hits 0.
        Cleanup frees infrastructure only — slab pages, intern table. */
     if (nova_intern_table) { free(nova_intern_table); nova_intern_table = NULL; }
