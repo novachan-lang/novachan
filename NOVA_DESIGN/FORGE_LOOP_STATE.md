@@ -59,6 +59,32 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   ZERO_ANNOTATION_AUDIT.md, SOUND_INFERENCE_PLAN.md.
 - **Deferred (opportunistic, non-blocking):** inference S2 lambda-pinning (drops the hero's one
   `req: Request`); quasi-quote v1; flag-ON enablement of NOVA_STRUCT_RET.
+- **CURRENT TASK (★ LATEST 2026-06-26 — read this first):** N>1 multi-core foundation SHIPPED through the
+  accept/poller (all committed + gated). This session: monitor lock + task-struct reclaim (~20× leak cut) +
+  Batch A safety (C2 nova_mem_live atomic / 0D rc-counts / 0E @memo lock, 9541db7) + N1-exit (listener
+  keep-alive + tcp_close purge — closed a graceful-shutdown HANG the adversarial review caught, d4453b4) +
+  accept/poller **S-a** single poller / kills the herd (9ae2c57) + **S-b/S-c** wake-one FIFO + parallel accept
+  (14c1c7c). Reconverged **579F03A8**, 598/0 both RC modes, green_scale N=4×70+N=8×50 + ASAN all clean.
+  **NOVA is multi-core for COMPUTE (/cpu 6.1×@8) and io-CORRECT.** ★★ **DEEP I/O FINDING** (keep-alive
+  server-saturating soak, _ka_run.ps1 + _ka_load_client.nova, f814b65): **I/O throughput REGRESSES at N>1**
+  (keep-alive /ping N=1=29,941 rps, N=4=0.82×, N=8=0.76×, bad=0) — the GLOBAL `g_sched_lock` serializes every
+  io park/wake/spawn; at 30k+ rps the cross-thread coordination beats the parallelism for cheap requests. This
+  is THE blocker for Forge out-throughputing Spring/Phoenix on web traffic (io-bound). ★★ **THE FIX (owner-
+  chosen) = PER-CARRIER I/O** (Go per-P netpoller): `NOVA_DESIGN/PER_CARRIER_IO_DESIGN.md` (5841b5b) — fully
+  DESIGNED + ADVERSARIALLY REVIEWED (wf w31dn6cg7 → SOUND + staging right) + the RC-1 precondition VALIDATED
+  (pin-at-park is a near-no-op; owner-only invariant CONFIRMED — no unbound io-parks at N>1; green_scale 15 +
+  green_netpoll 5 + forge_spawn 3 clean, then reverted/folded into the PC-1 cut). **★ NEXT (a DEDICATED focused
+  session, BEFORE Forge): implement PC-1** — the atomic shard: `g_carrier_io[]` per-carrier io lists + per-
+  carrier poll + RC-1 pin-at-park + RC-2 shutdown re-derive (each carrier drains its own list; no single-poller
+  join) + RC-3a hybrid listener (listener stays central wake-one; shard only per-connection recv/send/connect)
+  + timed-io shard. Gate each: reconverge + green_scale + ASAN + keep-alive soak (the WIN gate: N>1 > N=1) +
+  DNS-offload-N>1 stress + shutdown-drain. Then **PC-2** (pin handler via sched_spawn_on(self) in forge
+  `_acceptor` — the builtins sched_spawn_on/sched_carrier_count already shipped in 14c1c7c) → **PC-3**
+  (per-carrier listener / Linux SO_REUSEPORT). It partially RESTRUCTURES S-a's connection-io poller+cv → the
+  most dangerous code → not to be rushed at the tail of a long session. **Then** flag-enablement (forge servers
+  default N>1 ONLY once io scales; N=1-for-io until then) → **STOP for Forge permission.** The owner's "8
+  foundation tasks" are DONE except this io-scaling refactor (the real Forge-throughput win — banked + ready).
+  --- earlier state (pre-2026-06-26) below ---
 - **CURRENT TASK:** Phase A foundation — **N>1 multi-core design COMPLETE** (NOVA_DESIGN/
   N1_MULTICORE_PLAN.md; design wzr6brjer, adversary-vetted — the race-hunt caught 7 FATAL/MAJOR holes,
   ALL folded in; goNoGo=revise = build the revised stages). It IS the complete multithreading-for-Forge
