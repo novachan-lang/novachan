@@ -547,10 +547,16 @@ static pthread_mutex_t nova_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 #define NOVA_CS_LOCK(x)   EnterCriticalSection(&(x))
 #define NOVA_CS_UNLOCK(x) LeaveCriticalSection(&(x))
 static CRITICAL_SECTION g_intern_lock;
+/* CRITICAL-1 fix: serializes green-task monitor-list ops (monitor() add vs finish() notify) at N>1.
+   The green monitor() path was lock-free ("single-carrier cooperative") but N>1 ships -> a monitor()
+   realloc raced a concurrent finish() read of t->monitors = heap corruption/UAF. Taken ONLY when
+   g_carrier_count>1 (N=1 cooperative path is byte-identical, no lock). Init'd in nova_rt_init pre-carrier. */
+static CRITICAL_SECTION g_green_monitor_lock;
 #else
 #define NOVA_CS_LOCK(x)   pthread_mutex_lock(&(x))
 #define NOVA_CS_UNLOCK(x) pthread_mutex_unlock(&(x))
 static pthread_mutex_t g_intern_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_green_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 /* ── Embedded RC Header ────────────────────────────────────────────────────
@@ -6696,12 +6702,23 @@ int64_t nova_rt_sched_run(void) {
             }
             if (t == nova_sched_root_task && crashed)
                 nova_sched_root_exit = 1;
-            /* Notify monitors: direct enqueue + green-waiter wake */
-            for (int64_t i = 0; i < t->monitor_count; i++)
-                nova_sched_notify_channel(t->monitors[i], t->exit_status);
+            /* CRITICAL-1/3 fix: SET finished + SNAPSHOT the monitor list UNDER g_green_monitor_lock, then
+               notify OUTSIDE the lock. Under the lock a concurrent monitor() (N>1) either already added its
+               channel (it is in the snapshot -> notified) or, arriving after, sees finished==1 and
+               self-notifies -- never lost, and its realloc can never race our read of t->monitors. Notify
+               is enqueue+wake (non-blocking) but done outside the lock to avoid a
+               g_green_monitor_lock -> g_sched_lock nesting. N=1 cooperative -> no lock; the reorder
+               (finished set here vs below) is unobservable single-threaded. */
+            int _gml = (g_carrier_count > 1);
+            if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
+            t->finished = 1;
+            int64_t _mcount = t->monitor_count;
+            int64_t* _mons = t->monitors;
+            if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
+            for (int64_t i = 0; i < _mcount; i++)
+                nova_sched_notify_channel(_mons[i], t->exit_status);
             nova_mailbox_drain_close(t->mailbox);   /* Erlang frontier Stage-0: free unread msgs + close (post-finish sends no-op) */
             if (t->save_queue) { nova_rc_dec(t->save_queue); t->save_queue = 0; }   /* Stage-1: free deferred msgs */
-            t->finished = 1;
             t->status = 3;
             nova_live_dec();
             /* Stage 4: reclaim the finished fiber at ALL carrier counts -> bounded memory under
@@ -7462,6 +7479,7 @@ void nova_rt_init(void) {
     InitializeCriticalSection(&nova_mem_lock);
     InitializeCriticalSection(&nova_proc_registry_lock);
     InitializeCriticalSection(&g_intern_lock);  /* Stage 0B: single-threaded init, before any carrier spawns */
+    InitializeCriticalSection(&g_green_monitor_lock);  /* CRITICAL-1: green monitor-list lock (gated N>1) */
 #endif
     /* Phase 0c: initialize the file-handle table mutex ONCE here, single-threaded at startup, before any
        worker/carrier thread runs. nova_file_ensure_init then becomes a no-op on every later call, closing
@@ -7763,8 +7781,17 @@ int64_t nova_rt_monitor(int64_t proc_handle) {
     if (nova_green_enabled()) {
         NovaSchedTask* gt = (NovaSchedTask*)(uintptr_t)proc_handle;
         int64_t ch = nova_rt_channel_create();
+        /* CRITICAL-1/3 fix: {check-finished, add-to-list} must be ATOMIC with finish()'s {set-finished,
+           snapshot-notify} so (a) a concurrent finish() can't realloc-vs-read the list (heap corruption)
+           and (b) a monitor added just as the task finishes is never LOST (it either lands in finish's
+           snapshot, or sees finished and self-notifies). N=1 = cooperative single-thread -> no lock. The
+           channel_send for an already-finished task happens OUTSIDE the lock (mirrors the process path). */
+        int _gml = (g_carrier_count > 1);
+        if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
         if (gt->finished) {
-            nova_rt_channel_send(ch, gt->exit_status);
+            int64_t st = gt->exit_status;
+            if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
+            nova_rt_channel_send(ch, st);
             return ch;
         }
         if (gt->monitor_count >= gt->monitor_cap) {
@@ -7772,6 +7799,7 @@ int64_t nova_rt_monitor(int64_t proc_handle) {
             gt->monitors = (int64_t*)realloc(gt->monitors, (size_t)gt->monitor_cap * sizeof(int64_t));
         }
         gt->monitors[gt->monitor_count++] = ch;
+        if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
         return ch;
     }
 
