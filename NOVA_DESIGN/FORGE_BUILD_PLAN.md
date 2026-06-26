@@ -31,9 +31,19 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 **Scope note found while building (NOW-vs-GOAL):** the hero's `req.body_as<Todo>()` / `db.all<Todo>()` *method + call-site-`<T>`* syntax is distinct from T2.1's *typed-let* form (`let x: Result<T> = body_as(...)`). The typed-let form is shipped; the call-site `<T>` + UFCS form is a follow-up. Until then the hero is written with typed lets.
 
 **Sprint S0 — L1 HTTP hardening (the production floor) — IN PROGRESS** (interleaved: started once S1's marquee shipped; every task here is `forge.nova`, low-risk, no compiler change; compiler-touching S0/S1 tasks like T1.8/T2.7 are deferred to focused units):
-- **T1.4 — route `:param`/catch-all percent-decode (closes B2) — ✅ DONE (this commit).** `_fr_match` now `_pct_decode(seg, false)` for both the `:param` bind and the catch-all tail (`plus_space=false`: path `+` is literal; literal `/` joiners are untouched, only `%XX` decodes). `/u/:id` vs `/u/a%20b` → `id="a b"`; `/files/*p` vs `/files/x%2Fy` → `p="x/y"`; plain segments byte-identical. Guard: `forge_param_decode_test.nova`. Routing regression green (`forge_routing_correctness`/`forge_routing2`/`forge_group`).
+- **T1.4 — route `:param`/catch-all percent-decode (closes B2) — ✅ DONE (`78ac7cf`).** `_fr_match` now `_pct_decode(seg, false)` for both binds. `/u/a%20b`→`id="a b"`, `/files/x%2Fy`→`p="x/y"`, plain byte-identical. Guard: `forge_param_decode_test`; routing regression green.
+- **T1.3 — accept-side connection cap (semaphore) — ✅ DONE (`a25ddba`).** `_conn_sem(_max_conns()=10000)`; the acceptor recv()s a permit before spawning, the handler releases on close (no unbounded spawn under an accept storm). Wired into `serve_req` (per-carrier acceptors share one sem) + `serve_safe_req`. Guard: `forge_connlimit_test` + serve_req/_acceptor compile+serve verified.
 
-**Next in S0 (sequenced):** T1.3 connection cap (semaphore — build FIRST, shared by T1.5/T1.6) → T1.1/T1.2 read/idle timeout (`recv_request_bin_to` via `select_timeout`, wired into the keep-alive loop) → T1.5 graceful drain → T1.6 wire shipped `forge_limits` into the live `_serve_conn` → T1.7 static symlink containment. T1.8 (`nova new` re-route) touches the compiler dispatch (focused unit).
+**Next in S0:** T1.1/T1.2 read/idle timeout — needs a RUNTIME timed-recv (`tcp_recv_bytes_to` via the existing `nova_sched_park_io_timeout`; compiler+runtime → reconverge gate) → T1.5 graceful drain → T1.6 wire `forge_limits` → T1.7 static symlink.
+
+**Sprint S2 — L4 OTP (the cheap moat) — CORE SHIPPED** (new module `forge/forge_otp.nova`; pure-stdlib, socketless-tested; promotions of NOVA's `spawn`/`monitor`/contained-panic substrate):
+- **T4.1/T4.2 Supervisor — ✅ (`f9e98ef`):** sup_new/child_add + one_for_one monitor-restart (permanent/transient/temporary + max_restarts).
+- **T4.7-T4.9 GenServer — ✅ (`86c2d60`):** server(state, handler) + call/cast/stop; ONE handler `match`es on the message (the ONLY runtime type-dispatch — `type_of(struct)`="struct"); actor loop ⇒ race-free state.
+- **T4.12 Agent — ✅ (`20dca35`):** serialized state cell (get/update/get_and).
+- **T4.13 Task + T4.20 Nursery — ✅ (`ea05c74`):** crash-safe async/await (panic→err) + structured-concurrency nursery (join-all, crash-safe slots).
+- **T4.14 Registry — ✅ (`dc77526`):** serialized name→pid (+ found the deep-copied-dict new-key runtime bug; loop-local-map workaround).
+
+**Next in S2:** T4.15 Application root (supervisor+registry) → **T4.10 on_info** (out-of-band — the LiveView/Presence prerequisite) → T4.11 on_terminate → T4.16-T4.19 jobs/cron/pool → T4.3 strategies → T4.4 intensity → T4.5/T4.6 idents/kwargs (compiler). **NOVA constraints found while building OTP → [[nova-otp-spawn-constraints]]:** (1) spawn a closure only from main, else `spawn named_fn(args)`; (2) `type_of(struct)`="struct" → dispatch via `match`; (3) deep-copied-dict new-key insert is broken → dynamic-key dicts must be born in the loop. (1)+(3) want a runtime fix (batch with T1.1 timed-recv + T2.7).
 
 ---
 

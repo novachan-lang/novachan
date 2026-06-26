@@ -53,6 +53,17 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   L10 auto-admin + WASM frontend.
 
 ## WHERE WE ARE (update every task)
+- **★ LATEST 2026-06-26 (c) — S2 OTP CORE SHIPPED (continuous autonomous build):** new module
+  `forge/forge_otp.nova` — Supervisor one_for_one (`f9e98ef`), GenServer match-dispatch actor
+  (`86c2d60`), Agent (`20dca35`), Task/async + Nursery (`ea05c74`), Registry (`dc77526`) — ALL
+  pure-stdlib, socketless-tested, PASS. Plus S0 conn-cap semaphore (`a25ddba`). 3 NOVA runtime
+  constraints found → memory [[nova-otp-spawn-constraints]]: (1) from a spawned proc use
+  `spawn named_fn(args)` not closures; (2) `type_of(struct)`="struct" → dispatch via `match`;
+  (3) new key on a spawn-deep-copied dict breaks contains/index → dynamic-key dicts born in the loop.
+  **NEXT in S2:** T4.15 application root → T4.10 on_info (LiveView/Presence prereq) → jobs/cron/pool →
+  strategies/intensity. **Batch as ONE runtime/compiler session:** T1.1 timed-recv (`tcp_recv_bytes_to`
+  via `nova_sched_park_io_timeout`) + the dict-rehash-on-deep-copy fix + T2.7 `with tx`. **PC-1
+  io-scaling still its own dedicated session.** Full task-by-task state = `FORGE_BUILD_PLAN.md` ledger.
 - **★ LATEST 2026-06-26 (b) — FORGE FEATURE LOOP kicked off (owner: "go ahead, don't stop"):** shipped
   **T2.6** (`pool_acquire_to(ms) -> Result<int>` — `select_timeout` park+deadline; saturated pool errs, never
   hangs; `4d0c562`) + **T1.4** (route `:param`/catch-all percent-decode, closes B2; `78ac7cf`) — both gated
