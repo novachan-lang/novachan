@@ -53,6 +53,22 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   L10 auto-admin + WASM frontend.
 
 ## WHERE WE ARE (update every task)
+- **★ LATEST 2026-06-26 (b) — FORGE FEATURE LOOP kicked off (owner: "go ahead, don't stop"):** shipped
+  **T2.6** (`pool_acquire_to(ms) -> Result<int>` — `select_timeout` park+deadline; saturated pool errs, never
+  hangs; `4d0c562`) + **T1.4** (route `:param`/catch-all percent-decode, closes B2; `78ac7cf`) — both gated
+  (pure-stdlib → compiler/runtime untouched → reconverge trivial; targeted regression green). VERIFIED
+  already-done (ledger was stale): T2.5 db_insert/delete + the M1 hero + T2.10 `resp_model` nested fail-closed
+  (all re-ran PASS this session). **S1 is essentially COMPLETE** — only **T2.7** (`with tx` = a NEW-SYNTAX
+  compiler feature + panic-rollback + ~50min reconverge gate; NON-blocking, `tx(pool,[[sql,params]])` already
+  works) and **T2.8** (Postgres, env-gated, ⟸ T2.7) remain. Opened **Sprint S0** (production hardening floor).
+  ⚠ COMPILER FOOTGUN found: bare `-> Result` (no `<T>`) + unannotated `let` + `match` = silent both-arm
+  fall-through (no error, exit 0); fix = `Result<int>` + annotated `let` (a "match hits no arm → error"
+  hardening item). **NEXT — all FOCUSED units in fresh context (the low-risk socketless seam is now
+  exhausted):** (a) **S0 live-server hardening** (T1.3 conn-cap → T1.1/T1.2 read/idle timeout → T1.5 drain →
+  T1.6 wire forge_limits) — SAFETY-CRITICAL: bounded serve loops + kill-on-timeout, the class that crashed
+  Windows twice; (b) **T2.7 `with tx`** (compiler feature); (c) **PC-1 per-carrier-io** (io-scaling foundation,
+  still its own dedicated session). New: `_fdb_one.ps1` (parameterized forge_db smoke), `forge_pool_park_test`,
+  `forge_param_decode_test`.
 - **Done & committed:** Forge M1 hero runs (typed CRUD over the router, `forge_hero_test`, 3dda37b).
   Typed-DB stdlib (db.all/find/insert/delete, 85c8bda). Inference S0+S1 (nominal struct-return,
   flag NOVA_STRUCT_RET default-OFF, gate ALL GREEN, 0f0b86c). Designs saved: quasi-quote (deferred),
