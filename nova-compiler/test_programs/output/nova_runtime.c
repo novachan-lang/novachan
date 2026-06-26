@@ -5742,12 +5742,21 @@ typedef struct {
                                    1ms idle retry, never a lost task -> always safe (non-TSO: make it atomic). */
 #ifdef _WIN32
     CRITICAL_SECTION lock;
+    CONDITION_VARIABLE cv;   /* S-a: the owner carrier parks here when idle; wakers signal it (bound to lock) */
 #else
     pthread_mutex_t lock;
+    pthread_cond_t  cv;
 #endif
     int inited;
 } NovaCarrierDeque;
 static NovaCarrierDeque g_carriers[64];
+/* S-a single-poller (FORGE_ACCEPT_POLLER_PLAN.md): ONE dedicated poller thread owns select(); idle carriers
+   park on their per-carrier cv instead of each polling the global nova_io_waiters (which was a thundering herd
+   fighting g_sched_lock). Gated single_poller_mode = g_carrier_count>1. N=1 takes NONE of this (byte-identical:
+   no poller thread, no cv use, the existing carrier-polls idle branch). */
+static volatile int g_poller_stop = 0;       /* poller loop exits when set (shutdown) */
+static volatile int g_sched_shutdown = 0;    /* carriers stop blocking in idle_wait + break when set */
+static int g_single_poller_mode = 0;         /* set in nova_rt_main_dispatch when ncar>1 */
 
 static void nova_deque_init_all(int ncar) {
     for (int i = 0; i < ncar && i < 64; i++) {
@@ -5757,8 +5766,10 @@ static void nova_deque_init_all(int ncar) {
             g_carriers[i].count = 0;
 #ifdef _WIN32
             InitializeCriticalSection(&g_carriers[i].lock);
+            InitializeConditionVariable(&g_carriers[i].cv);
 #else
             pthread_mutex_init(&g_carriers[i].lock, NULL);
+            pthread_cond_init(&g_carriers[i].cv, NULL);
 #endif
             g_carriers[i].inited = 1;
         }
@@ -5863,9 +5874,61 @@ static void nova_carrier_enqueue(int home_id, NovaSchedTask* t) {
     if (d->tail) d->tail->next = t; else d->head = t;
     d->tail = t;
     d->count++;
+    /* S-a: wake the owner carrier if it's parked in nova_carrier_idle_wait. Signalled UNDER the deque lock,
+       so it is serialized with idle_wait's count re-check (which is also under this lock) -> no lost wakeup:
+       if our count++ landed before idle_wait's check, it sees count>0 and won't block; if it blocked first,
+       this signal wakes it. Gated single_poller_mode (the cv is inited + used only when ncar>1). */
+    if (g_single_poller_mode) {
+#ifdef _WIN32
+        WakeConditionVariable(&d->cv);
+#else
+        pthread_cond_signal(&d->cv);
+#endif
+    }
 #ifdef _WIN32
     LeaveCriticalSection(&d->lock);
 #else
+    pthread_mutex_unlock(&d->lock);
+#endif
+}
+
+/* S-a: wake a carrier parked in nova_carrier_idle_wait. Acquires the deque lock so the signal is serialized
+   with idle_wait's under-lock predicate check (no lost wakeup). Used at shutdown to break idle carriers. */
+static void nova_carrier_signal(int cid) {
+    NovaCarrierDeque* d = &g_carriers[cid & 63];
+    if (!d->inited) return;
+#ifdef _WIN32
+    EnterCriticalSection(&d->lock);
+    WakeConditionVariable(&d->cv);
+    LeaveCriticalSection(&d->lock);
+#else
+    pthread_mutex_lock(&d->lock);
+    pthread_cond_signal(&d->cv);
+    pthread_mutex_unlock(&d->lock);
+#endif
+}
+
+/* S-a: an idle carrier parks here (gated single_poller_mode) instead of polling io itself. Under the deque
+   lock: if work already arrived (count>0) or shutdown began, return at once; else block on the cv with a
+   BOUNDED timeout. The under-lock count re-check + the enqueue's under-lock cv signal are the lost-wakeup-free
+   mechanism; the timeout is only a backstop for any event the cv path can't observe (a missed external kick).
+   The carrier loop re-checks nova_rq_pop after this returns, so a spurious/timeout wake is harmless. */
+static void nova_carrier_idle_wait(int cid, int ms) {
+    NovaCarrierDeque* d = &g_carriers[cid & 63];
+#ifdef _WIN32
+    EnterCriticalSection(&d->lock);
+    if (d->count == 0 && !g_sched_shutdown) SleepConditionVariableCS(&d->cv, &d->lock, (DWORD)ms);
+    LeaveCriticalSection(&d->lock);
+#else
+    pthread_mutex_lock(&d->lock);
+    if (d->count == 0 && !g_sched_shutdown) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += ms / 1000;
+        ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&d->cv, &d->lock, &ts);
+    }
     pthread_mutex_unlock(&d->lock);
 #endif
 }
@@ -6768,7 +6831,10 @@ int64_t nova_rt_sched_run(void) {
         if (g_watchdog_on) { g_carrier_loops[_wcid]++; g_carrier_pc[_wcid] = 1; }
         nova_sched_wake_sleepers();
         NovaSchedTask* t = nova_rq_pop();
-        if (!t && (nova_io_waiters || nova_sleep_waiters || nova_offload_waiters)) {
+        if (!t && !g_single_poller_mode && (nova_io_waiters || nova_sleep_waiters || nova_offload_waiters)) {
+            /* S-a: in single_poller_mode this whole carrier-side poll is SKIPPED — the dedicated poller
+               thread owns select()/wake_sleepers/check_offload for every carrier and signals each carrier's
+               cv; the carrier just parks in nova_carrier_idle_wait below. (Non-poller / fallback path:) */
             /* #19: poll_io now folds SLEEP deadlines into select() (min-only, cap=ceiling),
                so a sleeper coexisting with a socket waiter no longer needs the 1ms busy-cap.
                Unify to 10ms: ~99% of the CPU win without the cross-carrier wake-latency
@@ -6804,11 +6870,15 @@ int64_t nova_rt_sched_run(void) {
                    This is exactly NOVA's existing N=1 semantics, now matched at N>1. */
                 if (nova_sched_root_task && nova_sched_root_task->status == 3) break;
                 if (g_watchdog_on) g_carrier_pc[_wcid] = 4;
+                if (g_single_poller_mode) {
+                    nova_carrier_idle_wait(nova_carrier_id, 10);   /* S-a: park on the per-carrier cv (the poller drives io/sleep/offload) */
+                } else {
 #ifdef _WIN32
-                Sleep(1);
+                    Sleep(1);
 #else
-                usleep(1000);
+                    usleep(1000);
 #endif
+                }
                 continue;
             }
             /* single-carrier: keep looping while a SLEEP/OFFLOAD waiter is pending AND the
@@ -6966,6 +7036,42 @@ static void* nova_carrier_thread(void* arg) {
 }
 #endif
 
+/* S-a: the dedicated single-poller thread. In single_poller_mode it is the SOLE owner of select()
+   (nova_sched_poll_io) and of waking sleep/offload waiters -> kills the thundering herd (carriers no longer
+   each poll the global nova_io_waiters, fighting g_sched_lock). It enqueues woken tasks to their HOME carrier
+   and signals that carrier's cv (in nova_carrier_enqueue). A 1ms poll cap keeps new-waiter + shutdown latency
+   low; with no io waiters it sleeps 1ms (sleep/offload waiters are reaped each loop). Exits on g_poller_stop.
+   NOT a carrier (no fiber / no nova_carrier_id role; it only mutates shared lists under g_sched_lock). */
+#ifdef _WIN32
+static DWORD WINAPI nova_poller_thread(LPVOID arg) {
+#else
+static void* nova_poller_thread(void* arg) {
+#endif
+    (void)arg;
+    while (!g_poller_stop) {
+        if (nova_io_waiters) nova_sched_poll_io(1);   /* select the io fds, block up to 1ms (folds nearer deadlines) */
+        else {
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(1000);
+#endif
+        }
+        nova_sched_wake_sleepers();
+        nova_sched_check_offload();
+    }
+    /* R6 final drain: reap anything that became ready as we stopped (carriers are still alive at this point —
+       the poller is joined BEFORE the carriers), so a wake we owned is delivered rather than silently dropped. */
+    if (nova_io_waiters) nova_sched_poll_io(0);
+    nova_sched_wake_sleepers();
+    nova_sched_check_offload();
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
 /* Watchdog (NOVA_SCHED_WATCHDOG=1): dumps each carrier's breadcrumb every few
    seconds so a hang's cause (spin-deadlock vs idle/lost-wakeup) is visible. */
 static int g_watchdog_ncar = 0;
@@ -7054,7 +7160,8 @@ void nova_rt_main_dispatch(int64_t main_fn) {
 #endif
                 nova_is_multithreaded = 1;   /* engages atomic RC across carriers */
                 g_carrier_count = ncar;      /* >1 => every nova_sched_lock/live/F1-spin activates */
-                nova_deque_init_all(ncar);   /* M:N Stage A: per-carrier deque locks (before carriers spawn) */
+                nova_deque_init_all(ncar);   /* M:N Stage A: per-carrier deque locks + cvs (before carriers spawn) */
+                g_single_poller_mode = 1;     /* S-a: one poller thread owns select(); idle carriers park on their cv */
                 nova_sched_running = 1;       /* set ONCE; carriers don't reset it (main_dispatch does, post-join) */
                 if (getenv("NOVA_SCHED_WATCHDOG")) {
                     g_watchdog_on = 1; g_watchdog_ncar = ncar;
@@ -7079,7 +7186,14 @@ void nova_rt_main_dispatch(int64_t main_fn) {
                 HANDLE* th = (HANDLE*)malloc(sizeof(HANDLE) * (size_t)(ncar - 1));
                 for (int i = 1; i < ncar; i++)
                     th[i-1] = CreateThread(NULL, 0, nova_carrier_thread, (LPVOID)(intptr_t)i, 0, NULL);
-                nova_rt_sched_run();          /* main runs as carrier 0 */
+                HANDLE poller = CreateThread(NULL, 0, nova_poller_thread, NULL, 0, NULL);   /* S-a: the single poller */
+                nova_rt_sched_run();          /* main runs as carrier 0 (breaks on root-exit) */
+                /* S-a shutdown: stop + JOIN the poller FIRST (it stops enqueuing/signalling), then set the
+                   shutdown flag + wake every idle carrier so it sees the finished root and breaks, then join. */
+                g_poller_stop = 1;
+                if (poller) { WaitForSingleObject(poller, INFINITE); CloseHandle(poller); }
+                g_sched_shutdown = 1;
+                for (int i = 0; i < ncar; i++) nova_carrier_signal(i);
                 for (int i = 0; i < ncar - 1; i++) {
                     if (th[i]) { WaitForSingleObject(th[i], INFINITE); CloseHandle(th[i]); }
                 }
@@ -7088,7 +7202,12 @@ void nova_rt_main_dispatch(int64_t main_fn) {
                 pthread_t* th = (pthread_t*)malloc(sizeof(pthread_t) * (size_t)(ncar - 1));
                 for (int i = 1; i < ncar; i++)
                     pthread_create(&th[i-1], NULL, nova_carrier_thread, (void*)(intptr_t)i);
+                pthread_t poller; int poller_ok = (pthread_create(&poller, NULL, nova_poller_thread, NULL) == 0);   /* S-a */
                 nova_rt_sched_run();
+                g_poller_stop = 1;
+                if (poller_ok) pthread_join(poller, NULL);
+                g_sched_shutdown = 1;
+                for (int i = 0; i < ncar; i++) nova_carrier_signal(i);
                 for (int i = 0; i < ncar - 1; i++) pthread_join(th[i], NULL);
                 free(th);
 #endif
