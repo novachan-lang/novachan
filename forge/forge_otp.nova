@@ -80,3 +80,73 @@ fn sup_start(sup) -> int
         spawn _supervise_one(sup, i)
         i = i + 1
     n
+
+// ── GenServer (typed-message dispatch over a request channel) ─────────────────────────────────────
+// A stateful server process. Messages are dispatched to handlers by their RUNTIME TYPE (type_of(msg),
+// NOT string keys), and state is threaded FUNCTIONALLY: a call handler returns [new_state, reply], a
+// cast handler returns new_state -- no shared-mutable cell (matches NOVA's value semantics; cleaner
+// than an implicit set_state, which would need an ambient server context). A `call` blocks for the
+// reply; a `cast` is fire-and-forget but still ordered. The loop is a SPAWNED process, so messages
+// serialize through its request channel -> race-free state by construction (the actor model).
+
+// A server is created with its initial state + ONE handler. The handler MATCHES on the message to
+// dispatch by type -- this is Erlang's handle_call shape, and it is the ONLY way to type-dispatch in
+// NOVA: type_of(struct) returns the generic "struct" (not the type name) and __type_hash isn't
+// readable from user code, but `match msg { TypeA(..) => .. TypeB(..) => .. }` dispatches correctly
+// on an any-typed value (verified). handler: fn(state, msg) -> [new_state, reply].
+fn server(initial_state, handler) -> any
+    let srv = {}
+    srv["req"] = channel()
+    srv["handler"] = handler
+    srv["state"] = initial_state
+    srv
+
+// The server loop: receive an envelope, run the handler (it matches on the message), thread state.
+// A call sends the handler's reply back; a cast ignores it (still advances state, in arrival order).
+// Frozen envelope: {kind:"call"|"cast"|"stop", msg:<value>, reply:<chan|0>}.
+fn _gen_loop(srv)
+    let running = 1
+    while running == 1
+        let env = receive(srv["req"])
+        let kind = env["kind"]
+        if kind == "stop"
+            running = 0
+        else
+            let h = srv["handler"]
+            let r = h(srv["state"], env["msg"])
+            srv["state"] = r[0]
+            if kind == "call"
+                send(env["reply"], r[1])
+
+// Start the server's loop. Spawned DIRECTLY (the monitor/spawn rule -- a closure spawn would not work).
+fn gen_start(srv) -> any
+    spawn _gen_loop(srv)
+    srv
+
+// Synchronous request: send {call, msg} and BLOCK for the handler's reply (the actor serializes it).
+fn call(srv, msg) -> any
+    let rc = channel()
+    let env = {}
+    env["kind"] = "call"
+    env["msg"] = msg
+    env["reply"] = rc
+    send(srv["req"], env)
+    receive(rc)
+
+// Asynchronous request: send {cast, msg}, return immediately. State still advances in arrival order.
+fn cast(srv, msg) -> any
+    let env = {}
+    env["kind"] = "cast"
+    env["msg"] = msg
+    env["reply"] = 0
+    send(srv["req"], env)
+    0
+
+// Stop the server loop (after any already-queued messages).
+fn gen_stop(srv) -> any
+    let env = {}
+    env["kind"] = "stop"
+    env["msg"] = 0
+    env["reply"] = 0
+    send(srv["req"], env)
+    0
