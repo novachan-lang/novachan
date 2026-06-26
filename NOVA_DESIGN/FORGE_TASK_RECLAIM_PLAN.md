@@ -7,6 +7,32 @@
 > adversary-vetted, but DELIBERATE work — the adversary's verdict is "NOT safe to implement incrementally
 > at N>1"; sound only at N=1.**
 
+## ★ STATUS UPDATE (2026-06-26) — prerequisite DONE + the two hardest risks RESOLVED
+- **(1) MONITOR LOCK = DONE + committed (ed3b668).** g_green_monitor_lock (gated g_carrier_count>1)
+  closes CRITICAL-1 (the monitor()-vs-finish realloc-vs-read race) + CRITICAL-3 (lost-DOWN). Verified:
+  gate green (594/595 both modes), _n1_monitor_race_test PASS at N=4 + ASAN, green_scale N=4 10/10. So
+  the N>1-reclaim prerequisite is in place — and CRITICAL-2 (the deref-then-use TOCTOU) is now closable
+  the SAME way: do the finish-side generation-bump + freelist-push UNDER g_green_monitor_lock, and the
+  deref(pid) in monitor/exit_reason UNDER it too → monitor's {deref+use} is serialized with finish's
+  {bump+recycle} → no TOCTOU. So the reclaim can be N>1-COMPLETE, not N=1-only.
+- **(2) find_tag CONCERN-2 (CVE-class) = RESOLVED by ODD-encoding.** find_tag (nova_runtime.c:722)
+  rejects any non-8-aligned value (`if (addr & 0x7) return -1`) BEFORE any structural test. So encode
+  the PID with **bit0=1 (always ODD)** → a packed (slot,gen) handle can NEVER be misclassified as a
+  heap object (the alignment check rejects it regardless of whether its magnitude lands in
+  [heap_base,heap_top)). No find_tag change needed. Layout: bit0=1, bits[1..24]=slot, bits[25..62]=gen,
+  bit63=0. NOVA code treats the PID as an opaque int64 (only the runtime decodes it).
+- **(3) DEREF-SITE SCOPE = CONFIRMED BOUNDED: only 4 sites** cast a spawn handle to NovaSchedTask*
+  (`grep '(NovaSchedTask*)(uintptr_t)'`): mailbox_of (6388, COMPILER-EMITTED), root-task-assign (6892,
+  must decode + NEVER recycle the root slot), monitor (7782), exit_reason (7850). All 4 → nova_task_deref.
+- **REMAINING to implement (straight execution, next focused session):** struct +generation/+slot_index;
+  a grow-only slot-table (slot→stable struct ptr) + freelist (guarded by g_green_monitor_lock at N>1);
+  spawn = pop/grow a slot, gen++, free the slot's PRIOR monitors+exit_reason (free-at-reuse), return
+  the odd encode; the 4 deref sites → nova_task_deref (gen-mismatch → graceful NULL/NOPROC); finish =
+  under g_green_monitor_lock, gen++ + freelist-push (gated NOVA_SCHED_RECLAIM_TASK, default-OFF first);
+  also rc_dec each monitor channel on free (MINOR-1). GATE: reconverge + 595 + green_scale N=4 + ASAN +
+  the stability soak (_forge_stability_soak.ps1) RSS must now PLATEAU + a stale-PID test (monitor a
+  recycled PID → graceful NOPROC, not UAF/wrong-task).
+
 ## ★ The reframe (what the adversary changed) — and a NEW pre-existing bug
 - **CRITICAL-1 (pre-existing N>1 bug, INDEPENDENT of the leak): `nova_rt_monitor()` green path (7760-7774)
   holds NO lock.** Its comment says "single-carrier cooperative: no lock needed" — but N>1 ships

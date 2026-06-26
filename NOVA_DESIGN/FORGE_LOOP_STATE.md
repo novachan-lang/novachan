@@ -163,14 +163,20 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   carrier races the monitored task's finish loop (realloc vs read of t->monitors) on another = heap
   corruption/UAF; LATENT (regression doesn't reliably hit it), real for serve_safe_req at N>1. So N>1
   reclaim is BLOCKED on a per-task monitor lock the runtime needs ANYWAY for CRITICAL-1.
-  **★ NEXT SESSION — prioritized DELIBERATE work (FOUNDATION correctness+compute-throughput DONE+banked;
-  every remaining item is careful runtime work, designed + adversary-vetted, NOT overnight-rushable):**
-  **(1) per-task MONITOR LOCK** (fixes the pre-existing N>1 CRITICAL-1 race AND unblocks N>1 reclaim —
-  real N>1 soundness fix, do FIRST). **(2) N=1-gated task-struct reclaim** (fixes the production leak for
-  the default/server case; FORGE_TASK_RECLAIM_PLAN.md; wide-reaching PID-encoding change → find ALL
-  deref sites incl. compiler-emitted mailbox_of + verify find_tag; flag-default-OFF). (3) accept/poller
-  S-a→S-c (I/O throughput lever, FORGE_ACCEPT_POLLER_PLAN.md). (4) Forge Phase B breadth (OTP/
-  observability/auth). Each = gated impl → re-run the soak/stability harness (committed) as the oracle. N=1 invariant = TWO oracles (reconverge for the
+  **★ DELIBERATE work — prioritized (FOUNDATION correctness+compute-throughput DONE+banked):**
+  **(1) per-task MONITOR LOCK — ✅ DONE + committed (ed3b668).** g_green_monitor_lock (gated >1) closes
+  CRITICAL-1 (monitor-vs-finish realloc-vs-read race) + CRITICAL-3 (lost-DOWN). Gate green (594/595 both
+  modes), _n1_monitor_race_test PASS at N=4 + ASAN, green_scale N=4 10/10. N=1 byte-identical.
+  **(2) TASK-STRUCT RECLAIM (the production leak) — DE-RISKED + READY (next focused step):** the monitor
+  lock now lets it be N>1-COMPLETE (do the finish gen-bump+freelist-push UNDER g_green_monitor_lock →
+  closes CRITICAL-2 TOCTOU too). The two hardest risks are RESOLVED: **find_tag CONCERN-2 = ODD-encode
+  the PID (bit0=1) → find_tag's alignment check [722] rejects it, never misclassified, NO find_tag
+  change**; **deref scope = only 4 sites** (mailbox_of 6388 / root-assign 6892 / monitor 7782 /
+  exit_reason 7850). Remaining = straight execution (slot-table+freelist, encode/decode, 4 sites,
+  finish-reclaim gated flag-default-OFF, free monitors+exit_reason). GATE incl. the stability soak RSS
+  must PLATEAU + a stale-PID test. Full plan: FORGE_TASK_RECLAIM_PLAN.md (status block at top).
+  **(3) accept/poller S-a→S-c** (I/O throughput, FORGE_ACCEPT_POLLER_PLAN.md). **(4) Forge Phase B**
+  breadth (OTP/observability/auth). Each = gated impl → re-run the soak/stability harness as the oracle. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.
