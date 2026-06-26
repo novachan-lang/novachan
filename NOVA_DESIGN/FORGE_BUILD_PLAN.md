@@ -28,6 +28,11 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 
 **Scope note found while building (NOW-vs-GOAL):** the hero's `req.body_as<Todo>()` / `db.all<Todo>()` *method + call-site-`<T>`* syntax is distinct from T2.1's *typed-let* form (`let x: Result<T> = body_as(...)`). The typed-let form is shipped; the call-site `<T>` + UFCS form is a follow-up. Until then the hero is written with typed lets.
 
+**Sprint S0 — L1 HTTP hardening (the production floor) — IN PROGRESS** (interleaved: started once S1's marquee shipped; every task here is `forge.nova`, low-risk, no compiler change; compiler-touching S0/S1 tasks like T1.8/T2.7 are deferred to focused units):
+- **T1.4 — route `:param`/catch-all percent-decode (closes B2) — ✅ DONE (this commit).** `_fr_match` now `_pct_decode(seg, false)` for both the `:param` bind and the catch-all tail (`plus_space=false`: path `+` is literal; literal `/` joiners are untouched, only `%XX` decodes). `/u/:id` vs `/u/a%20b` → `id="a b"`; `/files/*p` vs `/files/x%2Fy` → `p="x/y"`; plain segments byte-identical. Guard: `forge_param_decode_test.nova`. Routing regression green (`forge_routing_correctness`/`forge_routing2`/`forge_group`).
+
+**Next in S0 (sequenced):** T1.3 connection cap (semaphore — build FIRST, shared by T1.5/T1.6) → T1.1/T1.2 read/idle timeout (`recv_request_bin_to` via `select_timeout`, wired into the keep-alive loop) → T1.5 graceful drain → T1.6 wire shipped `forge_limits` into the live `_serve_conn` → T1.7 static symlink containment. T1.8 (`nova new` re-route) touches the compiler dispatch (focused unit).
+
 ---
 
 ## How we ship every task
