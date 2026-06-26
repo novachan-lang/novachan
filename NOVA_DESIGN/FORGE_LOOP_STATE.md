@@ -53,6 +53,16 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   L10 auto-admin + WASM frontend.
 
 ## WHERE WE ARE (update every task)
+- **★ LATEST 2026-06-27 (d) — /loop AUTONOMOUS BUILD (continuous, self-paced):** shipped this loop run,
+  each pure-stdlib + socketless-tested + gated + committed — S3 `obs_routes` (`0a7f8bf`), S0 rate-limiter
+  ACTOR (`c6125d6`, N>1-safe), S2 GenServer `on_terminate` (`ad2dd78`), S3 traceparent parse (`2c32ed2`),
+  S4 RBAC `require_role`/`require_any_role` (`04a148a`). **S2 OTP core + S3 observability core = DONE;
+  S4 auth = OPENED (RBAC).** NEXT (loop picks the most tractable): authn middleware (populate
+  `req["roles"]` from session/JWT) · S2 intensity T4.4 · S2 strategies T4.3 · trace-mint. DEFERRED
+  (fresher context / a batched runtime+compiler session): T1.5 graceful drain (serve_req restructure +
+  live test) · mw_rate_limit wiring (needs req client-IP) · T1.7 symlink-realpath (no realpath builtin)
+  · T1.1 timed-recv + dict-rehash-on-deep-copy fix + T2.7 with-tx + mw_metrics route-label. PC-1
+  io-scaling = its own dedicated session. **Authoritative latest = `git log --oneline -20`.**
 - **★ LATEST 2026-06-26 (c) — S2 OTP CORE SHIPPED (continuous autonomous build):** new module
   `forge/forge_otp.nova` — Supervisor one_for_one (`f9e98ef`), GenServer match-dispatch actor
   (`86c2d60`), Agent (`20dca35`), Task/async + Nursery (`ea05c74`), Registry (`dc77526`) — ALL
