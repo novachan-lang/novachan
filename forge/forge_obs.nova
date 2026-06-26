@@ -1,0 +1,101 @@
+// forge_obs -- observability for Forge: RED metrics, health probes, structured logs. The metrics
+// registry is a single-owner ACTOR (a spawned loop draining a request channel) -> race-free counters
+// with NO locks, N>1-safe by construction. This is the thing Spring loses across async boundaries.
+
+// ── RED metrics registry (single-owner actor) ─────────────────────────────────────────────────────
+// Counts + total latency keyed by "METHOD route" (the route PATTERN, so /users/1 and /users/2 fold
+// under /users/:id), status-code counts, and an in-flight gauge. Maps are BORN IN THE LOOP (adding a
+// new key to a spawn-deep-copied dict is broken -- see nova-otp-spawn-constraints). The snapshot is a
+// LIST of fixed-key entries (safe to deep-copy back over the channel), never the raw dynamic-key dicts.
+
+fn _metrics_loop(reg)
+    let counts = {}
+    let totlat = {}
+    let inflight = 0
+    let running = 1
+    while running == 1
+        let env = receive(reg["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "observe"
+            let key = env["method"] + " " + env["route"]
+            let c = 0
+            if contains(counts, key)
+                c = counts[key]
+            counts[key] = c + 1
+            let l = 0
+            if contains(totlat, key)
+                l = totlat[key]
+            totlat[key] = l + env["latency"]
+        else if op == "inflight"
+            inflight = inflight + env["delta"]
+        else if op == "snapshot"
+            let out = []
+            let ks = keys(counts)
+            let i = 0
+            while i < len(ks)
+                let k = ks[i]
+                let e = {}
+                e["key"] = k
+                e["count"] = counts[k]
+                e["totlat"] = totlat[k]
+                push(out, e)
+                i = i + 1
+            let snap = {}
+            snap["entries"] = out
+            snap["inflight"] = inflight
+            send(env["reply"], snap)
+
+fn metrics_registry() -> any
+    let reg = {}
+    reg["req"] = channel()
+    spawn _metrics_loop(reg)
+    reg
+
+// Record one request: method + route PATTERN + status + latency (ms).
+fn metric_observe(reg, method: string, route: string, status: int, latency: int) -> int
+    let env = {}
+    env["op"] = "observe"
+    env["method"] = method
+    env["route"] = route
+    env["status"] = status
+    env["latency"] = latency
+    env["reply"] = 0
+    send(reg["req"], env)
+    0
+
+// Adjust the in-flight gauge (+1 on request start, -1 on finish).
+fn metric_inflight(reg, delta: int) -> int
+    let env = {}
+    env["op"] = "inflight"
+    env["delta"] = delta
+    env["reply"] = 0
+    send(reg["req"], env)
+    0
+
+// Read a snapshot: {entries: [{key, count, totlat}], inflight}.
+fn metrics_snapshot(reg) -> any
+    let rc = channel()
+    let env = {}
+    env["op"] = "snapshot"
+    env["reply"] = rc
+    send(reg["req"], env)
+    receive(rc)
+
+// Prometheus text exposition (/metrics body) from a snapshot. Braces/quotes are built via chr() --
+// a literal `{` in a NOVA string interpolates, so it must never appear in a template string.
+fn metrics_prometheus(reg) -> string
+    let lb = chr(123)
+    let rb = chr(125)
+    let q = chr(34)
+    let snap = metrics_snapshot(reg)
+    let entries = snap["entries"]
+    let body = "# HELP http_requests_total Total HTTP requests\n# TYPE http_requests_total counter\n"
+    let i = 0
+    while i < len(entries)
+        let e = entries[i]
+        body = body + "http_requests_total" + lb + "endpoint=" + q + e["key"] + q + rb + " " + str(e["count"]) + "\n"
+        i = i + 1
+    body = body + "# TYPE http_inflight_requests gauge\nhttp_inflight_requests " + str(snap["inflight"]) + "\n"
+    body
