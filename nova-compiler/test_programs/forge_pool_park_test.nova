@@ -1,0 +1,44 @@
+// Forge T2.6: a pooled acquire PARKS (cooperatively yields the carrier — no spin) until a connection
+// frees, and a timed acquire ERRS rather than hanging when the pool stays saturated. Socketless (no
+// serve loop) -> kill-on-timeout safe; self-bounds via the acquire deadlines. Exits 1 on mismatch.
+import forge_db
+
+fn holder(pool, id: int, hold_ms: int, rc)
+    let r: Result<int> = pool_acquire_to(pool, 5000)   // generous deadline: must SUCCEED by parking until the conn frees
+    match r
+        Ok(db) =>
+            sleep(hold_ms)
+            pool_release(pool, db)
+            send(rc, id)                  // positive id = acquired (parked successfully if it had to wait)
+        Err(e) =>
+            send(rc, 0 - id)              // negative = failed/timed-out acquire (must NOT happen in TEST 1)
+
+fn main()
+    let pool = pool_open(":memory:", 1)   // exactly ONE connection -> forces contention
+
+    // TEST 1 — the 2nd task must PARK until the 1st releases, then acquire. Both succeed.
+    let rc = channel()
+    spawn fn()
+        holder(pool, 1, 200, rc)
+    sleep(60)                             // let task 1 win the single connection first
+    spawn fn()
+        holder(pool, 2, 0, rc)            // only conn is held -> must park until task 1 releases (~140ms)
+    let a = receive(rc)
+    let b = receive(rc)
+    if a < 1 or b < 1 or (a + b) != 3
+        print("FAIL park: both should acquire (ids 1+2); got a=" + str(a) + " b=" + str(b))
+        exit(1)
+
+    // TEST 2 — saturate the pool, then a timed acquire must ERR (not hang).
+    let held = pool_acquire(pool)         // take the only connection (untimed)
+    let r2: Result<int> = pool_acquire_to(pool, 300)   // 300ms deadline -> must time out (no one will release it)
+    match r2
+        Ok(db2) =>
+            pool_release(pool, db2)
+            print("FAIL timeout: acquired a connection that should have been unavailable")
+            exit(1)
+        Err(e2) =>
+            print("ok timeout -> " + e2)
+    pool_release(pool, held)
+    pool_close(pool, 1)
+    print("PASS forge_pool_park (2nd acquire parks until release; saturated timed acquire errs not hangs)")
