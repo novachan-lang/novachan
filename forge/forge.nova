@@ -3744,33 +3744,60 @@ fn serve_req_n(a, port: int, n: int)
         j = j + 1
     tcp_close(listener)
 
-// S-c (FORGE_ACCEPT_POLLER_PLAN.md): one acceptor loop. Each accepts ONE connection, spawns its handler
-// (UNPINNED via sched_spawn -> work-steals across carriers), and re-parks -- so a backlog fans out across
-// acceptors (the poller's wake-one wakes the oldest acceptor FIFO). tcp_accept returns <0 when the listener
-// is closed (graceful shutdown) -> the acceptor exits cleanly (the N1-exit tcp_close purge+wake delivers -1).
-fn _acceptor(listener: int, a)
+// T1.3: accept-side connection cap. A semaphore channel pre-filled with N permits bounds the number of
+// concurrent in-flight connections -- so an accept storm can never spawn unbounded handlers (which would
+// exhaust memory/FDs). The acceptor recv()s a permit before spawning (parks at the cap -> natural
+// backpressure: excess connections wait in the OS backlog) and the handler send()s it back when the
+// connection closes. Same channel-as-semaphore shape as the DB pool. Default cap = _max_conns().
+fn _max_conns() -> int
+    10000
+
+fn _conn_sem(n: int)
+    let ch = channel()
+    let i = 0
+    while i < n
+        send(ch, 1)
+        i = i + 1
+    ch
+
+// Per-connection handler that RELEASES its cap permit when the connection finally closes (keep-alive
+// included, since _serve_conn loops until the connection ends). Always runs -> no permit leak.
+fn _handle_req_capped(conn: int, a, sem)
+    _serve_conn(conn, a, 0)
+    send(sem, 1)
+
+// S-c (FORGE_ACCEPT_POLLER_PLAN.md): one acceptor loop. Each accepts ONE connection, ACQUIRES a cap permit,
+// spawns its handler (UNPINNED via sched_spawn -> work-steals across carriers), and re-parks -- so a backlog
+// fans out across acceptors (the poller's wake-one wakes the oldest acceptor FIFO). tcp_accept returns <0
+// when the listener is closed (graceful shutdown) -> the acceptor exits cleanly (N1-exit delivers -1); the
+// <0 check is BEFORE recv(sem) so shutdown never leaks a permit.
+fn _acceptor(listener: int, a, sem)
     while true
         let conn = tcp_accept(listener)
         if conn < 0
             return
+        recv(sem)
         let c = conn
         let ap = a
-        sched_spawn(fn(z) _handle_req_arena(c, ap))
+        let s = sem
+        sched_spawn(fn(z) _handle_req_capped(c, ap, s))
 
 // Infinite spawn-per-connection serve. At N>1 fans out one PINNED acceptor per carrier (sched_spawn_on) so
 // accept + dispatch parallelize across cores; the server task then parks forever (the acceptors serve). At
 // N=1 it runs a single acceptor inline (the original single-loop behavior, byte-identical).
 fn serve_req(a, port: int)
     let listener = tcp_listen(port)
+    let sem = _conn_sem(_max_conns())
     let nc = sched_carrier_count()
     if nc <= 1
-        _acceptor(listener, a)
+        _acceptor(listener, a, sem)
     else
         let i = 0
         while i < nc
             let li = listener
             let ai = a
-            sched_spawn_on(i, fn(z) _acceptor(li, ai))
+            let se = sem
+            sched_spawn_on(i, fn(z) _acceptor(li, ai, se))
             i = i + 1
         let block = channel()
         recv(block)
@@ -3828,12 +3855,21 @@ fn serve_safe_req_n(a, port: int, n: int)
         j = j + 1
     tcp_close(listener)
 
+// Capped + crash-isolated per-connection handler (releases its permit on close).
+fn _handle_req_safe_capped(conn: int, a, sem)
+    _serve_conn(conn, a, 1)
+    send(sem, 1)
+
 fn serve_safe_req(a, port: int)
     let listener = tcp_listen(port)
+    let sem = _conn_sem(_max_conns())
     while true
         let conn = tcp_accept(listener)
-        if conn >= 0
-            let c = conn
-            let ap = a
-            sched_spawn(fn(z) _handle_req_safe(c, ap))
+        if conn < 0
+            return
+        recv(sem)
+        let c = conn
+        let ap = a
+        let s = sem
+        sched_spawn(fn(z) _handle_req_safe_capped(c, ap, s))
 
