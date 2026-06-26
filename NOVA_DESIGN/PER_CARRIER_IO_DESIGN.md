@@ -94,3 +94,50 @@ runtime: `nova_io_waiters` (global, → shard); `nova_sched_park_io_ex`; `nova_s
 `nova_poller_thread` (single poller, → per-carrier); the carrier idle branch in `nova_rt_sched_run`;
 `g_carriers[64]` (add the io-list head); `nova_carrier_enqueue` (the wake target). forge: `_acceptor`
 (sched_spawn → sched_spawn_on(self)).
+
+## ADVERSARIAL REVIEW RESULTS (2026-06-26, wf w31dn6cg7 — 4 lenses + synthesis) — VERDICT: SOUND, staging RIGHT, DEDICATED SESSION REQUIRED
+The design's CORE is validated: **pinning→owner-only is SOUND** (a pinned task parks/runs/wakes on the same
+carrier, so its io list has a single accessor), and **leaving sleep/offload GLOBAL does NOT re-introduce the
+ceiling** (low rate). The staging order PC-1 → PC-2 → PC-3 is correct. But four items are **PC-1 PREREQUISITES**
+(must be in the first cut, not deferred), and the implementation is a **dedicated, focused, gated session of its
+own — "not something to fold into another task"** (it has real UAF + deadlock vectors that are N>1-ONLY and
+INVISIBLE to the default regression + the N=1 baseline — the same shape as the migration-wedge that ate a session,
+fixed only by pinning, 71a651d).
+
+### RC-1 — BIGGEST RISK (silent UAF / lost wakeup, N>1-only). MUST fix in PC-1.
+An UNBOUND task (home_carrier=-1) that parks io before its carrier is fixed — the **DNS-offload `tcp_connect`
+path** is the concrete vector — can have its io waiter on carrier A's list while the task is later re-enqueued to
+carrier B → B touches A's list → UAF / lost wakeup. The no-lock claim assumes home is fixed BEFORE any io park.
+**Fix: pin-at-spawn for any io-capable task (set home_carrier at spawn, not just on first global-pop), AND a hard
+assert in `nova_sched_park_io_ex`: `if (g_carrier_count>1) assert(t->home_carrier>=0)` so any violation fails LOUD
+at N>1 instead of corrupting silently.** (My pre-review reasoning was that the global-pop claims home before a
+task runs+parks; the review's offload-connect counterexample makes the assert mandatory regardless — defense that
+turns a silent corruption into a deterministic crash.)
+
+### RC-2 — shutdown deadlock vector. MUST fix in PC-1.
+PC-1 removes/repurposes the single poller, but the current shutdown sets `g_poller_stop` + JOINS the poller
+(~7233/7247). With no single poller that hangs. Re-derive: set `g_sched_shutdown` → wake all carriers → each
+carrier DRAINS ITS OWN per-carrier io list on exit → join carriers. No poller join. Add a per-carrier
+shutdown-drain test.
+
+### RC-3a — hybrid listener (PC-1, deliberate). Full per-carrier listener → PC-3.
+Windows has no SO_REUSEPORT, so keep the LISTENER centrally polled (the existing global wake-one path) and shard
+ONLY the per-connection io (recv/send/connect/**timed-read**). This captures essentially all the keep-alive win
+(hot path is recv/send) and is honest about the platform. Document it as a *deliberate centralized special case*.
+PC-3 promotes to a true per-carrier listener via SO_REUSEPORT on the Linux track.
+
+### Two binding staging amendments
+1. **PC-1 MUST shard timed-io too** (`nova_sched_park_io_timeout`, deadline>0 — keepalive/timeout reads), else
+   PC-2's soak measures a ceiling PC-1 was supposed to remove.
+2. **PC-1 MUST ship RC-3a (hybrid listener)** so accept is bounded BEFORE PC-2 measures throughput.
+PC-2 = "prove it scales / no herd" (the win gate); PC-3 = per-carrier listener (Linux) + accept de-contention.
+
+### Dedicated-session checklist (run with kill-on-timeout on EVERY binary):
+the 4 RC fixes designed up front; owner-only + lock-order invariants written as ASSERTS; a per-carrier
+shutdown-drain test; a DNS-offload-at-N>1 stress test; the keepalive-timeout-not-global check; `gen5.ll==gen6.ll`
++ the 29,941-rps N=1 baseline re-measured BEFORE PC-2; green_scale N=4×70/N=8×50 + ASAN each stage.
+
+### Load-bearing sites (confirmed present; `g_carrier_io` confirmed ABSENT = design unbuilt):
+`nova_io_waiters` decl (~5689), `park_io_ex` (~6042), `park_io_timeout` (~6090), `poll_io` deadline scan +
+`excl_woken[16]` (~6152-6275), `sched_run` idle poll branch (~6873-6884), `poller_thread` (~7080-7104), shutdown
+poller-join (~7233/7247), `tcp_close` waiter purge (~11149-11179).
