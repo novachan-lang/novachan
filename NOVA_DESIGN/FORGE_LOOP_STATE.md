@@ -124,8 +124,15 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   Soak findings (tracked, not yet built): **N1-server-exit** — a standalone NOVA server exits ~10ms at
   N=1 because tcp_accept is an UNTIMED io_waiter and the N=1 idle-exit (6661, has_timed_io only counts
   deadline>0) treats it as pure-io-idle and breaks (worked around in the bench with a keepalive sleep
-  daemon; PROPER FIX = let untimed io_waiters keep the N=1 scheduler alive, gated). **C2** nova_mem_live
-  non-atomic (per-carrier TLS fix; gates only the leak probe). **C1** arena-mode = VERIFIED SAFE.
+  daemon). **ATTEMPTED the broad fix (6661: has_timed_io→nova_io_waiters, let ANY io_waiter keep N=1
+  alive) — gate FAILED: linalg_lib_test TIMEOUT. REVERTED (discipline: revert-not-patch).** linalg is
+  PURE COMPUTE (no io/spawn/file) so the broad keep-alive should not touch it → cause is a STALE/leaked
+  io_waiter that pure-io-break used to mask, OR a parallel-load flake (linalg is compute-heavy, regression
+  runs concurrently). PROPER FIX = TARGETED: keep N=1 alive only for a LISTENER-accept io_waiter (not all
+  io), AND/OR first find why a no-io program has a lingering nova_io_waiters entry. Deliberate retry must
+  re-run + bisect (linalg standalone WITH the fix → hang=real, pass=flake). The bench keepalive daemon
+  stays as the workaround. **C2** nova_mem_live non-atomic (per-carrier TLS; gates only the leak probe).
+  **C1** arena-mode = VERIFIED SAFE.
   **ACCEPT/POLLER SCALING DESIGNED (FORGE_ACCEPT_POLLER_PLAN.md, design wc8trswnr adversary-vetted):**
   single-poller THREAD (kills the herd) + wake-one + parallel-accept, STAGED S-a→S-b→S-c, each gated.
   **VERDICT: build-ready but DELIBERATE focused work, NOT an overnight rush** — S-a alone is a new poller
