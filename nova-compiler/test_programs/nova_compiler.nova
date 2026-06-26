@@ -3801,14 +3801,26 @@ fn inject_memo(stmts: list) -> list
                                 _mk_i = _mk_i + 1
                         let has_check = Expr("call", "contains", 0, [cache_id, memo_key], [], sline)
                         let cache_get = Expr("index", "", 0, [cache_id, memo_key], [], sline)
-                        let early_ret = Stmt("return", "", cache_get, [], [], [], [], sline)
-                        let check_stmt = Stmt("if", "", has_check, [early_ret], [], [], [], sline)
+                        // 0E: bracket the cache LOOKUP and the INSERT with memo_lock/unlock (the gated,
+                        // reused monitor lock) so two carriers running the same @memo'd fn cannot race the
+                        // cache dict (heap corruption on a concurrent insert/rehash). The lock is RELEASED
+                        // across the compute -> recursive @memo is deadlock-free, and the only TOCTOU (a
+                        // benign double-compute of a pure fn) just re-stores the same value. Each lock call
+                        // is a FRESH node (never share Expr nodes in a generator).
+                        let hit_bind = Stmt("assign", "__memo_v", cache_get, [], [], [], [], sline)
+                        let hit_unlock = Stmt("expr", "", Expr("call", "memo_unlock", 0, [], [], sline), [], [], [], [], sline)
+                        let hit_ret = Stmt("return", "", Expr("ident", "__memo_v", 0, [], [], sline), [], [], [], [], sline)
+                        let check_stmt = Stmt("if", "", has_check, [hit_bind, hit_unlock, hit_ret], [], [], [], sline)
+                        let lock_a = Stmt("expr", "", Expr("call", "memo_lock", 0, [], [], sline), [], [], [], [], sline)
+                        let unlock_a = Stmt("expr", "", Expr("call", "memo_unlock", 0, [], [], sline), [], [], [], [], sline)
                         let call_impl = Expr("call", impl_name, 0, arg_idents, [], sline)
                         let bind_result = Stmt("assign", "__memo_r", call_impl, [], [], [], [], sline)
+                        let lock_b = Stmt("expr", "", Expr("call", "memo_lock", 0, [], [], sline), [], [], [], [], sline)
                         let cache_lhs = Expr("index", "", 0, [cache_id, memo_key], [], sline)
                         let store_stmt = Stmt("assign", "", Expr("ident", "__memo_r", 0, [], [], sline), [], [], [], [cache_lhs], sline)
+                        let unlock_b = Stmt("expr", "", Expr("call", "memo_unlock", 0, [], [], sline), [], [], [], [], sline)
                         let ret_stmt = Stmt("return", "", Expr("ident", "__memo_r", 0, [], [], sline), [], [], [], [], sline)
-                        push(out, Stmt("fn", name, ret_expr, [cache_bind, check_stmt, bind_result, store_stmt, ret_stmt], params, [], other_anns, sline))
+                        push(out, Stmt("fn", name, ret_expr, [cache_bind, lock_a, check_stmt, unlock_a, bind_result, lock_b, store_stmt, unlock_b, ret_stmt], params, [], other_anns, sline))
         if not handled
             push(out, s)
     out
@@ -4600,6 +4612,10 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_print_any"
     else if name == "memo_cache"
         "nova_rt_memo_cache"
+    else if name == "memo_lock"
+        "nova_rt_memo_lock"
+    else if name == "memo_unlock"
+        "nova_rt_memo_unlock"
     else if name == "copy"
         "nova_rt_deep_copy"
     else if name == "len"
@@ -6234,6 +6250,8 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_for_kv_init(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_dict_has(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_memo_cache(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_memo_lock() nounwind")
+    emit(cg, "declare i64 @nova_rt_memo_unlock() nounwind")
     emit(cg, "declare i64 @nova_rt_dict_del(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_find(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_parse_float(i64) nounwind")
@@ -10798,6 +10816,8 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["append_file"] = NTypeScheme([], nt_fn([nt_string(), nt_string()], nt_unit()))
     reg["file_exists"] = NTypeScheme([], nt_fn([nt_string()], nt_bool()))
     reg["memo_cache"] = NTypeScheme([], nt_fn([nt_string()], nt_any()))
+    reg["memo_lock"] = NTypeScheme([], nt_fn([], nt_int()))
+    reg["memo_unlock"] = NTypeScheme([], nt_fn([], nt_int()))
     reg["http_get"] = NTypeScheme([], nt_fn([nt_string()], nt_string()))
     reg["http_post"] = NTypeScheme([], nt_fn([nt_string(), nt_string(), nt_string()], nt_string()))
     reg["mkdir"] = NTypeScheme([], nt_fn([nt_string()], nt_int()))
@@ -17397,6 +17417,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_for_kv_init(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_dict_has(i64, i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_memo_cache(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_memo_lock() nounwind")
+    ire_line(e, "declare i64 @nova_rt_memo_unlock() nounwind")
     ire_line(e, "declare i64 @nova_rt_dict_del(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_system(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_exec(i64) nounwind")

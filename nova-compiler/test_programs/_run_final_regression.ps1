@@ -16,7 +16,7 @@ $core_tests = @(
     'match_test','match_advanced_test','higher_order_test',
     'enum_test','range_test','string_methods_test','dict_test',
     'math_test','string_stdlib_test','list_methods_test',
-    'type_conv_test','spawn_test','close_test','_n1_heapbounds_test','_n1_box_test','_n1_park_test','_n1_reclaim_test','_n1_monitor_race_test','_n1_stale_pid_test','_n1_cap_closure_test',
+    'type_conv_test','spawn_test','close_test','_n1_heapbounds_test','_n1_box_test','_n1_park_test','_n1_reclaim_test','_n1_monitor_race_test','_n1_stale_pid_test','_n1_cap_closure_test','_memo_smoke',
     'rc_phase2_test','dict_iter_test','slice_test',
     'defaults_test','in_operator_test','struct_methods_test',
     'generics_test','match_guard_test','trait_test',

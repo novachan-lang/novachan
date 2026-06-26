@@ -501,6 +501,15 @@ typedef enum {
 } NovaMemTag;
 
 static int64_t      nova_mem_live    = 0;
+/* C2: nova_mem_live is on the alloc/free hot path; the plain ++/-- was a real (benign-count) TSAN data
+   race at N>1. Gate to an atomic add when g_carrier_count>1 (N=1 stays a plain ++ -> byte-identical).
+   Only RC-heap allocs touch it (arena objects bypass RC) -> a few per request, low contention. The
+   READ (live_count) is an aligned int64 load -> atomic enough for a RELAXED counter. */
+#ifdef _WIN32
+#define NOVA_MEM_LIVE_ADD(d) do { if (g_carrier_count > 1) InterlockedExchangeAdd64((volatile LONG64*)&nova_mem_live, (LONG64)(d)); else nova_mem_live += (d); } while (0)
+#else
+#define NOVA_MEM_LIVE_ADD(d) do { if (g_carrier_count > 1) __atomic_add_fetch(&nova_mem_live, (int64_t)(d), __ATOMIC_RELAXED); else nova_mem_live += (d); } while (0)
+#endif
 static int64_t      nova_mem_total   = 0;
 /* #31 heap profiler: per-tag allocation accounting (count + bytes), tallied at every
    nova_heap_alloc. Cheap (two array writes; negligible vs the allocation itself). A
@@ -646,7 +655,7 @@ static void* nova_heap_alloc(size_t size, NovaMemTag tag) {
     ((int32_t*)base)[0] = 1;
     ((int32_t*)base)[1] = NOVA_RC_ENCODE(tag);
     nova_mem_total++;
-    nova_mem_live++;
+    NOVA_MEM_LIVE_ADD(1);
     return base + NOVA_RC_HDR_SIZE;
 }
 
@@ -678,7 +687,7 @@ void* nova_rt_aligned_struct_alloc(int64_t size, int64_t alignment) {
     ((int32_t*)base)[0] = 1;
     ((int32_t*)base)[1] = NOVA_RC_ENCODE(((int32_t)nslots << 3) | NOVA_MEM_STRUCT);
     nova_mem_total++;
-    nova_mem_live++;
+    NOVA_MEM_LIVE_ADD(1);
     if (base) nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + aligned_total);
     return base + NOVA_RC_HDR_SIZE;
 }
@@ -931,7 +940,7 @@ static double nova_elem_to_double(int64_t elem) {
 void nova_rt_track_raw(void* ptr) {
     (void)ptr;
     nova_mem_total++;
-    nova_mem_live++;
+    NOVA_MEM_LIVE_ADD(1);
 }
 
 #ifdef _WIN32
@@ -1142,7 +1151,7 @@ static char* nova_fat_str_create(const char* src, size_t len) {
     ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[1] = NOVA_RC_ENCODE(NOVA_MEM_FAT_STR);
     nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + len + 1);
     nova_mem_total++;
-    nova_mem_live++;
+    NOVA_MEM_LIVE_ADD(1);
     return str;
 }
 
@@ -1170,7 +1179,7 @@ static char* nova_fat_str_concat(const char* sa, size_t la,
     ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[1] = NOVA_RC_ENCODE(NOVA_MEM_FAT_STR);
     nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + total + 1);
     nova_mem_total++;
-    nova_mem_live++;
+    NOVA_MEM_LIVE_ADD(1);
     return str;
 }
 
@@ -2454,6 +2463,22 @@ int64_t nova_rt_memo_cache(int64_t fn_name) {
     int64_t d = nova_rt_dict_create();
     nova_rt_dict_set(g_memo_registry, fn_name, d);
     return d;
+}
+
+/* 0E: @memo cache N>1 safety. The generated @memo wrapper does contains()/index/store on the per-fn
+   cache dict; at N>1 two carriers running the same @memo'd fn would race that dict (heap corruption on
+   a concurrent insert/rehash). The wrapper now brackets the LOOKUP and the INSERT in these calls,
+   RELEASING the lock for the compute -- so a recursive @memo cannot self-deadlock, and a benign
+   double-compute of a pure memoized fn (the only TOCTOU window) just overwrites with the same value.
+   We reuse g_green_monitor_lock (no new lock object); @memo is rare so sharing it with monitor/slot ops
+   costs nothing. Gated on g_carrier_count>1 -> at N=1 these are no-ops (byte-identical behavior). */
+int64_t nova_rt_memo_lock(void) {
+    if (g_carrier_count > 1) NOVA_CS_LOCK(g_green_monitor_lock);
+    return 0;
+}
+int64_t nova_rt_memo_unlock(void) {
+    if (g_carrier_count > 1) NOVA_CS_UNLOCK(g_green_monitor_lock);
+    return 0;
 }
 
 int64_t nova_rt_dict_del(int64_t handle, int64_t key) {
@@ -9322,7 +9347,7 @@ static int nova_debug_was_freed(void* p) {
 static void nova_rt_weak_invalidate(int64_t obj_handle);  /* forward */
 static void nova_rc_free(void* ptr) {
     NovaMemTag tag = NOVA_RC_TAG(ptr);
-    nova_mem_live--;
+    NOVA_MEM_LIVE_ADD(-1);
     /* Auto-invalidate any weak refs pointing to this object (soundness:
        prevents dangling weak refs after RC free). */
     nova_rt_weak_invalidate((int64_t)(uintptr_t)ptr);
@@ -9463,7 +9488,7 @@ void nova_rc_inc(int64_t val) {
     if (kind == 0) return;
     if (kind == -1) { nova_strpool_rc_inc(ptr); return; }
     if (NOVA_RC_COUNT(ptr) & NOVA_RC_ARENA_BIT) return;   /* arena-owned: immortal, freed wholesale */
-    nova_rc_inc_count++;
+    if (g_carrier_count <= 1) nova_rc_inc_count++;   /* 0D: debug-only stat -> skip at N>1 (was a racy, unread count) */
     if (nova_is_multithreaded) {
 #ifdef _WIN32
         InterlockedIncrement((volatile LONG*)&NOVA_RC_COUNT(ptr));
@@ -9506,7 +9531,7 @@ void nova_rc_dec(int64_t val) {
     if (val && (uint64_t)val >= 0x10000ULL) {
         void* ptr = (void*)(uintptr_t)val;
         if (nova_rc_is_managed(ptr) > 0) {
-            nova_rc_dec_count++;
+            if (g_carrier_count <= 1) nova_rc_dec_count++;   /* 0D: debug-only stat -> skip at N>1 */
         }
     }
     nova_rc_dec_internal(val);
