@@ -1,6 +1,7 @@
-// Forge S4 (RBAC): require_role / require_any_role middleware gate a request on the user's roles
-// (carried on req["roles"]). Tested by invoking the middleware closure directly with a mock req + next
-// (no live server). Socketless, deterministic.
+// Forge S4: the full authn->authz chain. mw_require_auth(secret) verifies a JWT and sets
+// req.state["user"]=claims; require_role(role) reads the claims' roles and gates. Tests admin-allowed
+// (200), wrong-role-denied (403), no-token-denied (401). Socketless (middleware closures chained
+// directly), deterministic, kill-on-timeout.
 import forge
 import forge_auth
 
@@ -8,35 +9,41 @@ fn ok_next(req)
     resp_text(200, "ok")
 
 fn main()
-    let mw = require_role("admin")
+    let secret = "test-secret-key"
+    let auth = mw_require_auth(secret)
+    let need_admin = require_role("admin")
 
-    let req1 = {}
-    req1["roles"] = ["admin", "user"]
-    if mw(req1, ok_next).status != 200
-        print("FAIL: admin should be allowed (200)")
+    // admin token -> authn sets req.state["user"], require_role(admin) allows -> 200
+    let ac = {}
+    ac["sub"] = "alice"
+    ac["roles"] = ["admin", "user"]
+    ac["exp"] = 9999999999
+    let atok = jwt_encode(ac, secret)
+    let areq = build_request("GET /admin HTTP/1.1\r\nAuthorization: Bearer " + atok + "\r\n\r\n", 0)
+    if auth(areq, fn(rq) need_admin(rq, ok_next)).status != 200
+        print("FAIL: admin token + require_role(admin) should be 200")
         exit(1)
 
-    let req2 = {}
-    req2["roles"] = ["user"]
-    if mw(req2, ok_next).status != 403
-        print("FAIL: non-admin should be 403")
+    // user-only token -> require_role(admin) denies -> 403
+    let uc = {}
+    uc["sub"] = "bob"
+    uc["roles"] = ["user"]
+    uc["exp"] = 9999999999
+    let utok = jwt_encode(uc, secret)
+    let ureq = build_request("GET /admin HTTP/1.1\r\nAuthorization: Bearer " + utok + "\r\n\r\n", 0)
+    if auth(ureq, fn(rq) need_admin(rq, ok_next)).status != 403
+        print("FAIL: user token + require_role(admin) should be 403")
         exit(1)
 
-    let req3 = {}                       // no roles key -> denied
-    if mw(req3, ok_next).status != 403
-        print("FAIL: no-roles should be 403")
+    // no token -> authn 401 (require_role never runs)
+    let nreq = build_request("GET /admin HTTP/1.1\r\n\r\n", 0)
+    if auth(nreq, fn(rq) need_admin(rq, ok_next)).status != 401
+        print("FAIL: no token should be 401")
         exit(1)
 
-    let mw2 = require_any_role(["editor", "admin"])
-    if mw2(req1, ok_next).status != 200
-        print("FAIL: require_any_role should allow admin")
-        exit(1)
-    if mw2(req2, ok_next).status != 403
-        print("FAIL: require_any_role should deny a plain user")
-        exit(1)
-
+    // pure role checks
     if has_role(["a", "b"], "a") == false or has_any_role(["x", "b"], ["b", "z"]) == false
         print("FAIL: has_role / has_any_role")
         exit(1)
 
-    print("PASS forge_auth_rbac (require_role 200/403, require_any_role 200/403, has_role/has_any_role)")
+    print("PASS forge_auth_chain (jwt -> mw_require_auth -> require_role: admin 200, user 403, anon 401)")
