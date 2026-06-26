@@ -6837,6 +6837,15 @@ int64_t nova_rt_sched_run(void) {
                (pinning + status=3 terminal), and the watchdog dereferences st->fiber ONLY for
                g_carrier_spin tasks (parked-being-woken, never finishing). reclaim_fiber zeros t->fiber
                before freeing. So immediate free is race-free at N>1. N=1 unchanged (already reclaimed). */
+            /* CLOSURE leak fix (gated with the task reclaim): release the task's closure record (its
+               captured environment, fib->entry_fn). The spawn arg ESCAPES to the task -- the spawner
+               transfers it (no spawner-side rc_dec, else entry_fn would dangle when the fiber runs; the
+               observed leak-not-UAF proves the task is the sole owner), so it is never freed otherwise.
+               Must run BEFORE reclaim_fiber frees the fiber struct. rc_dec no-ops on a 0 or non-RC
+               (bare-fn-ptr) entry_fn (find_tag rejects it). Closes the residual ~76 B/req closure leak. */
+            if (g_reclaim_task && t->fiber) {
+                nova_rc_dec(((NovaFiber*)(uintptr_t)t->fiber)->entry_fn);
+            }
             nova_sched_reclaim_fiber(t);
             /* TASK-STRUCT RECLAIM (gated NOVA_SCHED_RECLAIM_TASK): return this slot to the freelist for
                reuse, bounding the per-task NovaSchedTask leak. AFTER the monitor notify (so _mons stayed
