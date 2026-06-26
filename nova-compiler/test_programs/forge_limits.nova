@@ -75,3 +75,49 @@ fn conn_release(g: dict)
 
 fn conn_count(g: dict) -> int
     g["cur"]
+
+// ── Rate-limiter ACTOR (N>1-safe: single-owner, per-key token buckets) ────────────────────────────
+// The pure rate_allow above mutates ONE bucket dict -- unsafe to share across the spawn-per-connection
+// boundary (both an N>1 data race AND the deep-copied-dict new-key bug). This wraps it in a serializing
+// ACTOR: per-key buckets are BORN IN THE LOOP and only the actor touches them, so it is race-free and
+// dict-bug-free by construction. rate_check(lim, key, now_ms) -> 1 allow / 0 limited. This is the
+// N>1-correct rate limiter the live serve loop / a mw_rate_limit middleware can safely call.
+fn _ratelimiter_loop(lim)
+    let buckets = {}
+    let cap = lim["cap"]
+    let refill = lim["refill"]
+    let running = 1
+    while running == 1
+        let env = receive(lim["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "check"
+            let key = env["key"]
+            if contains(buckets, key) == false
+                buckets[key] = rate_new(cap, refill)
+            send(env["reply"], rate_allow(buckets[key], env["now_ms"], 1.0))
+
+fn rate_limiter(capacity: float, refill_per_ms: float) -> any
+    let lim = {}
+    lim["req"] = channel()
+    lim["cap"] = capacity
+    lim["refill"] = refill_per_ms
+    spawn _ratelimiter_loop(lim)
+    lim
+
+fn rate_check(lim, key: string, now_ms: int) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "check"
+    env["key"] = key
+    env["now_ms"] = now_ms
+    env["reply"] = rc
+    send(lim["req"], env)
+    receive(rc)
+
+fn rate_limiter_stop(lim)
+    let env = {}
+    env["op"] = "stop"
+    env["reply"] = 0
+    send(lim["req"], env)
