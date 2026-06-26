@@ -1,0 +1,36 @@
+// Pinpoint the per-request residual leak in the DEFAULT forge serve path (dispatch_req direct, safe=0,
+// per-request arena). Serves N requests via serve_req_n, measuring live_count() before/after. A flat
+// path keeps per_req ~0; an RC-heap object escaping the per-request arena shows per_req>0. The in-process
+// driver wraps each request in its OWN arena so the DRIVER's allocations don't pollute the server-side
+// live count. Run with NOVA_HEAP_PROFILE=1 + NOVA_SCHED_RECLAIM_TASK=1 (the forge production mode).
+import forge
+
+fn home(req: Request) -> Response
+    forge.resp_text(200, "ok")
+
+fn driver(port: int, n: int, done)
+    let i = 0
+    while i < n
+        let prev = arena_enter()
+        let s = tcp_connect("127.0.0.1", port)
+        if s >= 0
+            tcp_send(s, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            tcp_recv(s)
+            tcp_close(s)
+        arena_exit(prev)
+        i = i + 1
+    send(done, 1)
+
+fn main()
+    let a = forge.app()
+    forge.get(a, "/", fn(req) home(req))
+    let port = 18893
+    let n = 2000
+    let done = channel()
+    spawn driver(port, n, done)
+    let before = live_count()
+    forge.serve_req_n(a, port, n)
+    recv(done)
+    let after = live_count()
+    let d = after - before
+    print("LEAK_PROBE n=" + str(n) + " before=" + str(before) + " after=" + str(after) + " delta=" + str(d) + " per_req_x1000=" + str((d * 1000) / n))

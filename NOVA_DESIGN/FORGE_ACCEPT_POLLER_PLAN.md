@@ -79,3 +79,48 @@
 runtime nova_runtime.c: nova_sched_poll_io 6028–6113; carrier idle 6610–6628; nova_sched_park_io
 5924–5942; nova_sched_enqueue_task 5834–5837; NovaIOWaiter ~5644; NovaCarrierDeque ~5695;
 nova_rt_main_dispatch/ncar>1 ~6880; nova_rt_tcp_accept 10536–10554. Forge: serve_req forge.nova:3744–3752.
+(NOTE: these line numbers predate the N1-exit edits; grep by function name. park_committed is SET at the
+carrier loop's parked branch — nova_runtime.c ~6921 — and the F1 spins are at ~5941/5954/6041/6148/6319.)
+
+## S-a ADVERSARIAL REVIEW RESULTS (2026-06-26, wf wkppsoghl — 5 lenses, 2 CRASHED) — VERDICT: FRESH SESSION
+A pre-implementation adversarial review of the S-a design (full code read) returned **GO-WITH-CHANGES but
+DO-IT-IN-A-FRESH-FOCUSED-SESSION**, with strong, concrete reasons (not caution-as-default). The review is
+INCOMPLETE: the `lost-wakeup` and `ownership-move` lenses CRASHED mid-run (API errors) — **re-run them first
+next session.** Full output: tasks/wkppsoghl.output.
+
+### The one finding I DISPROVED (do not act on it)
+- **"F1 spin under g_sched_lock deadlocks when the poller is a separate thread"** — FALSE ALARM. A PARKED task
+  (yield_runnable=0) sets `park_committed=1` LOCK-FREE at nova_runtime.c ~6921 (the `if (yield_runnable)` enqueue
+  is SKIPPED for parked tasks). The poller only ever spins on parked io/sleep/offload waiters → their commit is
+  lock-free → the spin completes no matter who holds g_sched_lock. NO deadlock. (The F1-spin-under-lock is still
+  the plan's deferred #5 SERIALIZATION ceiling — measure it in the soak; restructure ONLY if /ping < 1.0×.)
+
+### The REAL, fixable blockers (R1–R9) — implement IN THIS ORDER, gate after the lock work:
+- **R3 (spec):** the poller is a SEPARATE OS thread (like the watchdog at main_dispatch ~7062); the MAIN thread
+  still runs carrier 0's `nova_rt_sched_run`. State this explicitly before coding.
+- **R4/R5 (CV correctness — the real lost-wakeup):** `nova_carrier_idle_wait` MUST do `LOCK d; while(d->count==0
+  && !shutdown) SleepConditionVariableCS(cv,&d->lock,ms); UNLOCK` — the re-check + atomic-unlock-on-sleep is the
+  mechanism; the 10ms cap is only a backstop. The signal in `nova_carrier_enqueue` MUST be raised while/just-after
+  holding the deque lock (a signal raised between the carrier's count-check and its wait is LOST).
+- **N=1 init/gating:** gate `idle_wait`/cv on `g_carrier_count>1 && single_poller_mode`; the cv field is
+  BSS-zero at N=1 (nova_deque_init_all only runs under ncar>1) — confirm zero-init CONDITION_VARIABLE/pthread_cond_t
+  is NEVER touched at N=1. Verify N=1 reconverge gen5.ll==gen6.ll (struct-layout change to NovaCarrierDeque).
+- **R6 (shutdown — orphaned tasks + stranded sleeper):** set `g_poller_stop` (or a `g_no_new_waits`) BEFORE
+  carriers check root-exit, else the poller enqueues to an already-exited carrier (task never runs). Poller does a
+  FINAL DRAIN (wake_sleepers/check_offload) after its loop, else a parked `sleep(100)` with an early root-exit
+  never wakes (violates sleep(ms)>=ms). Do NOT signal CVs after carriers return — use a `g_sched_shutdown` flag
+  carriers test in the idle branch (signalling a dead-thread CV is UB).
+- **R7 (break-fd):** UNCONDITIONALLY add g_break_rd to rfds + check FD_ISSET; TCP_NODELAY on the Win32 loopback
+  write end; micro-test "kicked poller wakes <1ms".
+- **R8/R9 (fallback):** break-fd init fail → single_poller_mode=0 → carriers poll as today (no NEW hang); no
+  half-initialized state.
+
+### Why a fresh session (the review's words, endorsed): it edits the single most dangerous runtime region
+(g_sched_lock/F1/park-commit — multiple prior failed attempts, stabilized only by 71a651d); the oracles are LONG
+and must be REPEATED (a probabilistic deadlock/lost-wakeup needs many clean green_scale N=4×70/N=8×50 + ASAN runs,
+not one lucky pass); N=1 byte-identity is a hard reconverge gate; and the failure mode is a FROZEN 24/7 server —
+the worst outcome for the Forge mission. Tail-of-session time pressure directly conflicts with "run it many times."
+
+### Oracles (ALL must pass, REPEATEDLY, with NOVA_SCHED_WATCHDOG on):
+green_scale N=4×70 + N=8×50; ASAN on green_scale N=4; forge_load_soak /ping ≥ 1.0×; green_netpoll;
+N=1 reconverge gen5.ll==gen6.ll + full regression both modes; micro-tests (kick<1ms, sleep-honored-across-root-exit).

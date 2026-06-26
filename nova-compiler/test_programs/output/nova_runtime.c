@@ -5659,6 +5659,10 @@ typedef struct NovaIOWaiter {
     int64_t             fd;
     int                 events;  /* NOVA_POLL_READ or NOVA_POLL_WRITE */
     int64_t             deadline_ms;  /* 0 = wait forever; >0 = wake (timeout) at this monotonic ms */
+    int                 is_listener;  /* N1-exit: 1 iff this is a tcp_accept park on a listening socket.
+                                         calloc zero-inits it for every OTHER park (timed parks, recv, connect).
+                                         A LIVE listener waiter keeps an idle N=1 carrier alive (a server idle
+                                         between connections) without the keepalive sleep-daemon workaround. */
     struct NovaIOWaiter* next;
 } NovaIOWaiter;
 
@@ -5959,7 +5963,7 @@ static void nova_sched_wake_all(NovaChannel* ch) {
 
 /* Park the current green task on I/O: register its FD + desired events and
    yield to the carrier. The carrier's poll loop will wake it when ready. */
-static void nova_sched_park_io(int64_t fd, int events) {
+static void nova_sched_park_io_ex(int64_t fd, int events, int is_listener) {
     NovaSchedTask* t = nova_sched_current;
     if (!t) return;
     NovaIOWaiter* w = (NovaIOWaiter*)calloc(1, sizeof(NovaIOWaiter));
@@ -5967,6 +5971,7 @@ static void nova_sched_park_io(int64_t fd, int events) {
     w->task = t;
     w->fd = fd;
     w->events = events;
+    w->is_listener = is_listener;   /* N1-exit: only tcp_accept passes 1 */
     nova_sched_lock();
     t->status = 2;   /* Stage 3a: PARKED — set INSIDE the publish lock, BEFORE the waiter is visible in
                         nova_io_waiters, so a poll-scan on another carrier never sees the waiter with a
@@ -5978,6 +5983,8 @@ static void nova_sched_park_io(int64_t fd, int events) {
     nova_sched_unlock();
     nova_rt_fiber_yield();
 }
+/* N1-exit: thin wrapper -> a normal (non-listener) park. All callers except tcp_accept use this. */
+static void nova_sched_park_io(int64_t fd, int events) { nova_sched_park_io_ex(fd, events, 0); }
 
 static int64_t nova_sched_now_ms(void) {
 #ifdef _WIN32
@@ -6159,6 +6166,23 @@ static int nova_sched_has_timed_io(void) {
     nova_sched_lock();
     for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
         if (w->deadline_ms > 0) { has = 1; break; }
+    }
+    nova_sched_unlock();
+    return has;
+}
+
+/* N1-exit: is any LIVE listener waiter parked? A green task blocked in tcp_accept (an UNTIMED read waiter
+   on a listening socket) means a server is idle BETWEEN connections -- the carrier must keep running for it,
+   exactly like a sleep / timed-io waiter, instead of treating "only untimed io waiters left" as done and
+   exiting after a ~10ms poll (which dropped a server with no keepalive sleep-daemon). The status!=3 guard
+   means a finished task's stale waiter never pins the carrier (should not occur -- tcp_close now cleans up
+   waiters on a closed fd -- but defense-in-depth). Consulted ONLY on the N=1 idle path; the N>1 idle branch
+   terminates via the root-exit (status==3) check, so this is N=1-only and N>1 stays byte-identical. */
+static int nova_sched_has_listener(void) {
+    int has = 0;
+    nova_sched_lock();
+    for (NovaIOWaiter* w = nova_io_waiters; w; w = w->next) {
+        if (w->is_listener && w->task && w->task->status != 3) { has = 1; break; }
     }
     nova_sched_unlock();
     return has;
@@ -6795,9 +6819,9 @@ int64_t nova_rt_sched_run(void) {
                we exit Go-style even if a background daemon still sleeps/offloads (a server
                test whose main returns while a periodic sleep-daemon lingers still terminates).
                Pure I/O-blocked idle still breaks here, leaving that termination unchanged. */
-            if ((nova_sleep_waiters || nova_offload_waiters || nova_sched_has_timed_io()) &&
+            if ((nova_sleep_waiters || nova_offload_waiters || nova_sched_has_timed_io() || nova_sched_has_listener()) &&
                 nova_sched_root_task && nova_sched_root_task->status != 3) continue;
-            break;   /* nothing runnable; no live-root timer/offload/timed-io pending => done */
+            break;   /* nothing runnable; no live-root timer/offload/timed-io/listener pending => done */
         }
         if (t->status == 3) continue;
         if (g_watchdog_on) { g_carrier_pc[_wcid] = 2; g_carrier_spin[_wcid] = t; }
@@ -10744,7 +10768,7 @@ int64_t nova_rt_tcp_accept(int64_t server_val) {
             if (c != NOVA_INVALID_SOCKET) return (int64_t)c;
             if (errno != EAGAIN && errno != EWOULDBLOCK) break;
 #endif
-            nova_sched_park_io(server_val, NOVA_POLL_READ);
+            nova_sched_park_io_ex(server_val, NOVA_POLL_READ, 1);   /* N1-exit: a listener park (keeps an idle N=1 server alive) */
         }
         nova_set_error("tcp_accept: accept failed (green)");
         return -1;
@@ -10955,6 +10979,33 @@ int64_t nova_rt_tcp_wait_readable(int64_t fd_val, int64_t timeout_ms) {
 
 void nova_rt_tcp_close(int64_t sock_val) {
     NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
+    /* N1-exit / graceful shutdown (adversary Finding #1): WAKE any green task PARKED on this fd BEFORE we
+       close it. A parked accept/recv whose fd is then closed would otherwise never wake -- select() reports
+       a closed fd as EBADF (POSIX) and the poller wakes nobody, so with the listener keep-alive the carrier
+       would spin on the dead fd forever -> HANG. Under the sched lock, unlink every waiter on this fd and
+       wake its task (status=0; F1 park_committed spin at N>1 -- IDENTICAL to the poller's wake protocol;
+       the task resumes in park_io, retries accept/recv, gets the closed-fd error, returns -1 cleanly), then
+       free the waiter. The list has no entry for this fd in the common close-after-accept-loop case
+       (serve_req_n), so this is a no-op there -> behavior unchanged for every existing test. N=1: the lock
+       is a no-op and the F1 spin is skipped -> a plain list sweep. The wake enqueues to the task's HOME
+       carrier (pinning), so the close can run from any task/thread. */
+    nova_sched_lock();
+    NovaIOWaiter** pp = &nova_io_waiters;
+    while (*pp) {
+        NovaIOWaiter* w = *pp;
+        if (w->fd == sock_val) {
+            *pp = w->next;
+            if (w->task) {
+                w->task->status = 0;
+                if (g_carrier_count > 1) while (!w->task->park_committed) { /* F1: don't wake a task mid-park */ }
+                nova_sched_enqueue_task(w->task);   /* PINNING: route to the task's HOME carrier */
+            }
+            free(w);
+        } else {
+            pp = &w->next;
+        }
+    }
+    nova_sched_unlock();
     NOVA_CLOSE_SOCKET(sock);
 }
 
