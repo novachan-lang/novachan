@@ -147,16 +147,23 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   spawn-FAILURE path (6333/7109). So every spawned task (every Forge request handler via serve_req's
   fire-and-forget sched_spawn) leaks its PID struct. PRE-EXISTING; the old "flat-memory" proof MISSED it
   (it measured per-request ARENA delta, not RSS over many requests). A server OOMs in hours → **NOT
-  production-ready until fixed.** FIX (careful — the struct is kept because a PID may be monitored later;
-  naive free = UAF/stale-PID): generational task pool (slot+generation PID, the standard Erlang/ECS
-  pattern) OR monitor-aware refcount (free on finish iff no monitor + no held ref) OR a detached-spawn
-  flag (serve_req's spawns are fire-and-forget → free on finish). DELIBERATE work (UAF risk).
-  **★ NEXT SESSION — prioritized DELIBERATE work (multi-core FOUNDATION correctness+compute-throughput
-  is DONE+measured+banked; these 3 are the remaining "production-ready + beat-frameworks" levers):**
-  **(1) TASK-STRUCT LEAK — #1, production blocker** (design the safe reclaim, gate hard: ASAN + a
-  bounded-server serve_req_n soak that must plateau). (2) accept/poller S-a→S-c (I/O throughput lever,
-  FORGE_ACCEPT_POLLER_PLAN.md). (3) Forge Phase B breadth (OTP/observability/auth). Each = design (Opus,
-  adversary-vetted) → gated impl → re-run the soak/stability harness as the oracle. N=1 invariant = TWO oracles (reconverge for the
+  production-ready until fixed.** FIX DESIGNED + adversary-vetted (FORGE_TASK_RECLAIM_PLAN.md): there are
+  actually THREE leaks (struct + monitors array + exit_reason). Mechanism = generational slot-map PID
+  (bit63=0 so it never aliases a heap ptr; recycle ONLY the task-struct, NOT the RC'd messaging PID),
+  grow-only freelist. **VERDICT (adversary): "NOT safe to implement incrementally at N>1" — sound ONLY at
+  N=1** (cooperative single-threaded → no TOCTOU/lost-DOWN). **★ NEW PRE-EXISTING BUG SURFACED —
+  CRITICAL-1: nova_rt_monitor() green path (7760) holds NO lock** while N>1 ships → monitor(p) on one
+  carrier races the monitored task's finish loop (realloc vs read of t->monitors) on another = heap
+  corruption/UAF; LATENT (regression doesn't reliably hit it), real for serve_safe_req at N>1. So N>1
+  reclaim is BLOCKED on a per-task monitor lock the runtime needs ANYWAY for CRITICAL-1.
+  **★ NEXT SESSION — prioritized DELIBERATE work (FOUNDATION correctness+compute-throughput DONE+banked;
+  every remaining item is careful runtime work, designed + adversary-vetted, NOT overnight-rushable):**
+  **(1) per-task MONITOR LOCK** (fixes the pre-existing N>1 CRITICAL-1 race AND unblocks N>1 reclaim —
+  real N>1 soundness fix, do FIRST). **(2) N=1-gated task-struct reclaim** (fixes the production leak for
+  the default/server case; FORGE_TASK_RECLAIM_PLAN.md; wide-reaching PID-encoding change → find ALL
+  deref sites incl. compiler-emitted mailbox_of + verify find_tag; flag-default-OFF). (3) accept/poller
+  S-a→S-c (I/O throughput lever, FORGE_ACCEPT_POLLER_PLAN.md). (4) Forge Phase B breadth (OTP/
+  observability/auth). Each = gated impl → re-run the soak/stability harness (committed) as the oracle. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
   fiber-reclaim/netpoll). Build order 0→1→2→3→4→5, each gated; a stage failing any oracle is REVERTED,
   not patched forward.
