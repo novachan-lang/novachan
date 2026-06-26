@@ -44,31 +44,48 @@ fn _run_child(start_fn)
 // spawn -> monitor -> on exit, decide by (exit kind, policy). A CRASH restarts permanent+transient;
 // a NORMAL exit restarts only permanent (transient/temporary retire); temporary never restarts.
 // Exceeding max_restarts retires the child (a simple intensity cap; T4.4 adds the time window).
+// Windowed restart intensity (T4.4): true when MORE THAN max_restarts of the given restart timestamps
+// fall within window_ms of now -> a crash LOOP. Occasional crashes spread over time stay under the
+// limit (each ages out of the window), so they restart indefinitely -- the correct OTP behaviour, and
+// why this replaces a naive cumulative counter. Pure + public -> directly testable with a fake clock.
+fn restart_intensity_exceeded(stamps, now_ms: int, max_restarts: int, window_ms: int) -> bool
+    let count = 0
+    let i = 0
+    while i < len(stamps)
+        if (now_ms - stamps[i]) <= window_ms
+            count = count + 1
+        i = i + 1
+    count > max_restarts
+
 fn _supervise_one(sup, idx)
     let spec = sup["specs"][idx]
     let start_fn = spec[1]
     let restart = spec[2]
     let max_r = sup["max_restarts"]
-    let restarts = 0
+    let window_ms = sup["in_seconds"] * 1000
+    let stamps = []
     let running = 1
     while running == 1
         let p = spawn _run_child(start_fn)
         let m = monitor(p)
         let st = receive(m)
+        let did_restart = 0
         if st == 0
-            // normal exit
+            // normal exit: only a permanent child restarts
             if restart != "permanent"
                 running = 0
             else
-                restarts = restarts + 1
+                did_restart = 1
         else
-            // crash / panic (contained)
+            // crash / panic (contained): permanent + transient restart; temporary never
             if restart == "temporary"
                 running = 0
             else
-                restarts = restarts + 1
-        if running == 1 and restarts > max_r
-            running = 0
+                did_restart = 1
+        if did_restart == 1
+            push(stamps, time_ms())
+            if restart_intensity_exceeded(stamps, time_ms(), max_r, window_ms)
+                running = 0
 
 // Start the supervisor: spawn an independent one_for_one supervision loop per child. Returns the
 // child count. The supervisor itself never blocks the caller; the loops run until each child retires.
