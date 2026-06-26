@@ -5610,6 +5610,13 @@ typedef struct NovaSchedTask {
        the mailbox + cooperatively yields until a message arrives OR now >= recv_deadline_ms (then src=3). */
     int      recv_has_deadline;    /* 1 if the current receive has an `after` clause */
     int64_t  recv_deadline_ms;     /* absolute nova_sched_now_ms() deadline; only meaningful when recv_has_deadline */
+    /* Generational slot-map reclaim (the task-struct leak fix): the spawn HANDLE is an ODD-encoded
+       (slot,gen) PID, NOT this raw ptr. `generation` is bumped on slot REUSE so a stale handle derefs to
+       NULL (graceful NOPROC), never a wrong task; `slot_index` is this task's index in g_task_slots.
+       See nova_task_encode / nova_task_deref / nova_task_alloc_slot. (The MESSAGING pid -- self()/
+       mailbox -- is a separate RC'd channel, unaffected.) */
+    int64_t  generation;
+    int64_t  slot_index;
 } NovaSchedTask;
 
 #ifndef NOVA_POLL_READ
@@ -6332,11 +6339,106 @@ static void nova_sched_reclaim_fiber(NovaSchedTask* t) {
     free(fib);
 }
 
+/* ── Generational slot-map: bound the per-task NovaSchedTask leak (every finished spawn used to leak
+   its ~0.5KB struct). The spawn HANDLE is an ODD-encoded (slot,gen) int64 (bit0=1 so find_tag's
+   alignment reject [~line 722] NEVER misclassifies it as a heap object -> no find_tag change, closes the
+   CVE-class CONCERN). g_task_slots maps slot->stable struct ptr (grow-only, realloc under
+   g_green_monitor_lock); finish freelist-pushes the slot (gated NOVA_SCHED_RECLAIM_TASK); the next spawn
+   reuses it, bumping the generation so a stale handle derefs to NULL. ALL slot-map ops + the deref+use
+   in monitor/exit_reason/mailbox_of run under g_green_monitor_lock at N>1 (serializes reuse vs deref ->
+   no TOCTOU; the monitor lock already serializes monitor-add vs finish). N=1 = cooperative single-thread
+   -> the lock is skipped, byte-identical. The MESSAGING pid (self()/mailbox) is a separate RC'd channel,
+   unaffected. ── */
+#define NOVA_TASK_SLOT_BITS 20                                       /* up to ~1M concurrent tasks */
+#define NOVA_TASK_SLOT_MASK ((int64_t)((1LL << NOVA_TASK_SLOT_BITS) - 1))
+static NovaSchedTask** g_task_slots = NULL;   /* slot -> stable struct ptr (the struct never moves) */
+static int64_t g_task_slot_count = 0;         /* slots ever allocated */
+static int64_t g_task_slot_cap = 0;
+static int64_t* g_task_freelist = NULL;       /* stack of free slot indices (reuse) */
+static int64_t g_task_free_top = 0;
+static int64_t g_task_free_cap = 0;
+static int g_reclaim_task = 0;                /* NOVA_SCHED_RECLAIM_TASK: 1 => recycle finished slots */
+
+static inline int64_t nova_task_encode(int64_t slot, int64_t gen) {
+    return (gen << (NOVA_TASK_SLOT_BITS + 1)) | (slot << 1) | 1;     /* bit0=1 (odd) | slot | gen, bit63=0 */
+}
+/* Decode + validate. CALLER MUST hold g_green_monitor_lock at N>1 (serialize vs slot reuse). Returns
+   NULL for a stale/invalid handle (graceful), never a recycled wrong task. */
+static NovaSchedTask* nova_task_deref(int64_t handle) {
+    if (!(handle & 1)) return NULL;                                 /* a real encoded PID is always odd */
+    int64_t slot = (handle >> 1) & NOVA_TASK_SLOT_MASK;
+    int64_t gen  = (int64_t)((uint64_t)handle >> (NOVA_TASK_SLOT_BITS + 1));
+    if (slot < 0 || slot >= g_task_slot_count) return NULL;
+    NovaSchedTask* t = g_task_slots[slot];
+    if (!t || t->generation != gen) return NULL;
+    return t;
+}
+/* Acquire a slot + its struct (reuse-if-enabled, else grow). CALLER HOLDS g_green_monitor_lock at N>1.
+   Returns the slot index + sets *out_t, or -1 on OOM. */
+static int64_t nova_task_alloc_slot(NovaSchedTask** out_t) {
+    NovaSchedTask* t; int64_t slot;
+    if (g_reclaim_task && g_task_free_top > 0) {
+        slot = g_task_freelist[--g_task_free_top];
+        t = g_task_slots[slot];
+        if (t->monitors)    free(t->monitors);                      /* int64 buffer; monitor channels are caller-governed */
+        if (t->exit_reason) free((void*)(uintptr_t)t->exit_reason); /* exit_reason(p) returns a COPY -> safe to free */
+        if (t->mailbox)     nova_rc_dec(t->mailbox);                /* release the task's base ref on the mailbox channel
+                                                                       (drain_close at finish closes it but does NOT dec the
+                                                                       channel; a messaging-PID holder's own rc_inc'd ref
+                                                                       keeps it alive past reuse). save_queue/fiber were
+                                                                       already released+zeroed at finish. */
+        int64_t gen = t->generation + 1;
+        memset(t, 0, sizeof(*t));
+        t->generation = gen;
+        t->slot_index = slot;
+    } else {
+        t = (NovaSchedTask*)calloc(1, sizeof(NovaSchedTask));
+        if (!t) { *out_t = NULL; return -1; }
+        if (g_task_slot_count >= g_task_slot_cap) {
+            int64_t newcap = g_task_slot_cap ? g_task_slot_cap * 2 : 256;
+            NovaSchedTask** ns = (NovaSchedTask**)realloc(g_task_slots, (size_t)newcap * sizeof(NovaSchedTask*));
+            if (!ns) { free(t); *out_t = NULL; return -1; }
+            g_task_slots = ns; g_task_slot_cap = newcap;
+        }
+        slot = g_task_slot_count++;
+        g_task_slots[slot] = t;
+        t->generation = 1;
+        t->slot_index = slot;
+    }
+    *out_t = t;
+    return slot;
+}
+/* Return a finished task's slot to the freelist for reuse. CALLER HOLDS g_green_monitor_lock at N>1 AND
+   has already verified t is not the root task. Gated by g_reclaim_task. The struct + its monitors/
+   exit_reason stay intact until the next reuse (free-at-reuse), so monitor() of a just-finished slot
+   still reads the real exit_status. */
+static void nova_task_free_slot(NovaSchedTask* t) {
+    if (!g_reclaim_task || !t) return;
+    if (g_task_free_top >= g_task_free_cap) {
+        int64_t newcap = g_task_free_cap ? g_task_free_cap * 2 : 256;
+        int64_t* nf = (int64_t*)realloc(g_task_freelist, (size_t)newcap * sizeof(int64_t));
+        if (!nf) return;                                            /* OOM -> just don't recycle (leak, never crash) */
+        g_task_freelist = nf; g_task_free_cap = newcap;
+    }
+    g_task_freelist[g_task_free_top++] = t->slot_index;
+}
+
 int64_t nova_rt_sched_spawn(int64_t closure) {
-    NovaSchedTask* t = (NovaSchedTask*)calloc(1, sizeof(NovaSchedTask));
-    if (!t) return 0;
+    NovaSchedTask* t = NULL;
+    int _gml = (g_carrier_count > 1);
+    if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
+    int64_t slot = nova_task_alloc_slot(&t);
+    if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
+    if (slot < 0 || !t) return 0;
+    int64_t gen = t->generation;
     t->fiber = nova_rt_fiber_create(closure);
-    if (!t->fiber) { free(t); return 0; }
+    if (!t->fiber) {
+        /* fiber-create failed: return the slot to the freelist (the struct stays in g_task_slots). */
+        if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
+        int _save = g_reclaim_task; g_reclaim_task = 1; nova_task_free_slot(t); g_reclaim_task = _save;
+        if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
+        return 0;
+    }
     ((NovaFiber*)(uintptr_t)t->fiber)->is_task = 1;   /* scheduler task: yield/finish -> current carrier */
     t->status = 0;
     t->monitors = NULL;
@@ -6360,7 +6462,7 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
     }
     nova_rq_push(t);
     nova_live_inc();
-    return (int64_t)(uintptr_t)t;
+    return nova_task_encode(slot, gen);   /* ODD-encoded (slot,gen) handle, NOT the raw ptr */
 }
 
 /* ── Erlang frontier Stage-0: process mailboxes (self / send / receive) ──────────
@@ -6382,13 +6484,17 @@ int64_t nova_rt_self(void) {
     return t->mailbox;
 }
 int64_t nova_rt_mailbox_of(int64_t task) {
-    /* Bridge a spawn handle (the task ptr -- a DIRECT arg, never deep-copied, so the cast is safe)
-       to its mailbox PID, so a parent can message a spawned child. */
+    /* Bridge a spawn handle (the ODD-encoded (slot,gen) PID) to its mailbox channel, so a parent can
+       message a spawned child. Deref + rc_inc UNDER g_green_monitor_lock (N>1) so the slot can't be
+       reused mid-deref; a stale/finished handle -> 0 (graceful). */
     if (!task) return 0;
-    NovaSchedTask* t = (NovaSchedTask*)(uintptr_t)task;
-    if (!t->mailbox) return 0;
-    nova_rc_inc(t->mailbox);
-    return t->mailbox;
+    int _gml = (g_carrier_count > 1);
+    if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
+    NovaSchedTask* t = nova_task_deref(task);
+    int64_t mb = (t && t->mailbox) ? t->mailbox : 0;
+    if (mb) nova_rc_inc(mb);
+    if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
+    return mb;
 }
 int64_t nova_rt_pid_send(int64_t pid, int64_t msg) {
     /* pid = a mailbox channel handle (from self_pid()/mailbox_of()/a received pid). Just a channel send:
@@ -6732,6 +6838,19 @@ int64_t nova_rt_sched_run(void) {
                g_carrier_spin tasks (parked-being-woken, never finishing). reclaim_fiber zeros t->fiber
                before freeing. So immediate free is race-free at N>1. N=1 unchanged (already reclaimed). */
             nova_sched_reclaim_fiber(t);
+            /* TASK-STRUCT RECLAIM (gated NOVA_SCHED_RECLAIM_TASK): return this slot to the freelist for
+               reuse, bounding the per-task NovaSchedTask leak. AFTER the monitor notify (so _mons stayed
+               valid) + reclaim_fiber, and NEVER the root task (its ptr is the scheduler-termination
+               signal). Under g_green_monitor_lock at N>1 so a concurrent monitor()/spawn serializes. The
+               struct + its monitors/exit_reason stay intact until the NEXT spawn reuses the slot
+               (free-at-reuse), so monitor() of a just-finished slot still reads the real exit_status; on
+               reuse the generation bumps so a stale handle derefs to NULL. */
+            if (t != nova_sched_root_task) {
+                int _gmlf = (g_carrier_count > 1);
+                if (_gmlf) NOVA_CS_LOCK(g_green_monitor_lock);
+                nova_task_free_slot(t);
+                if (_gmlf) NOVA_CS_UNLOCK(g_green_monitor_lock);
+            }
         } else {
             /* M:N F1: the task yielded or parked. A self-YIELDING task (reschedule/select/timed-recv)
                set yield_runnable instead of self-pushing; re-enqueue it HERE, now that it has fully
@@ -6889,7 +7008,7 @@ void nova_rt_main_dispatch(int64_t main_fn) {
                 }
             }
             int64_t root_h = nova_rt_sched_spawn((int64_t)(uintptr_t)rec);
-            nova_sched_root_task = (NovaSchedTask*)(uintptr_t)root_h;
+            nova_sched_root_task = nova_task_deref(root_h);   /* decode the encoded handle (startup, single-threaded) */
             /* #5: mark the root task so a fatal panic in main prints a stack trace (it crashes via the
                contained-longjmp path because main runs as a green task, but it TERMINATES the program). */
             if (nova_sched_root_task && nova_sched_root_task->fiber)
@@ -7481,6 +7600,10 @@ void nova_rt_init(void) {
     InitializeCriticalSection(&g_intern_lock);  /* Stage 0B: single-threaded init, before any carrier spawns */
     InitializeCriticalSection(&g_green_monitor_lock);  /* CRITICAL-1: green monitor-list lock (gated N>1) */
 #endif
+    /* Task-struct reclaim gate (default OFF): NOVA_SCHED_RECLAIM_TASK=1 recycles finished task slots
+       (bounds the per-task leak). OFF => slots grow-only (encoding still active + validated, but no
+       reuse => leaks as before). Read once, single-threaded, before any carrier spawns. */
+    { const char* _rt = getenv("NOVA_SCHED_RECLAIM_TASK"); g_reclaim_task = (_rt && _rt[0] == '1'); }
     /* Phase 0c: initialize the file-handle table mutex ONCE here, single-threaded at startup, before any
        worker/carrier thread runs. nova_file_ensure_init then becomes a no-op on every later call, closing
        the TOCTOU where two threads could both pass `if (!nova_file_init)` and double-init the CS. */
@@ -7779,17 +7902,19 @@ int64_t nova_rt_monitor(int64_t proc_handle) {
        Check nova_green_enabled() (not nova_sched_running) because handles
        stay NovaSchedTask* even after sched_run returns. */
     if (nova_green_enabled()) {
-        NovaSchedTask* gt = (NovaSchedTask*)(uintptr_t)proc_handle;
         int64_t ch = nova_rt_channel_create();
-        /* CRITICAL-1/3 fix: {check-finished, add-to-list} must be ATOMIC with finish()'s {set-finished,
-           snapshot-notify} so (a) a concurrent finish() can't realloc-vs-read the list (heap corruption)
-           and (b) a monitor added just as the task finishes is never LOST (it either lands in finish's
-           snapshot, or sees finished and self-notifies). N=1 = cooperative single-thread -> no lock. The
-           channel_send for an already-finished task happens OUTSIDE the lock (mirrors the process path). */
+        /* CRITICAL-1/2/3 fix: {DEREF, check-finished, add-to-list} must be ATOMIC with finish()'s
+           {set-finished, snapshot-notify, freelist-push} so (a) a concurrent finish() can't realloc-vs-read
+           the list (heap corruption), (b) a monitor added just as the task finishes is never LOST (it lands
+           in finish's snapshot, or sees finished and self-notifies), and (c) the slot can't be reused
+           between deref and use (TOCTOU -> wrong task). The DEREF is therefore INSIDE the lock. N=1 =
+           cooperative single-thread -> no lock. channel_send happens OUTSIDE the lock (mirrors the process
+           path). A STALE handle (slot recycled) -> graceful NOPROC (status 1), never a wrong task. */
         int _gml = (g_carrier_count > 1);
         if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
-        if (gt->finished) {
-            int64_t st = gt->exit_status;
+        NovaSchedTask* gt = nova_task_deref(proc_handle);
+        if (!gt || gt->finished) {
+            int64_t st = gt ? gt->exit_status : 1;   /* stale -> NOPROC(1); finished -> real exit_status */
             if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
             nova_rt_channel_send(ch, st);
             return ch;
@@ -7847,10 +7972,17 @@ int64_t nova_rt_exit_reason(int64_t proc_handle) {
        identity, so the int/string discrimination recognizes it (and there is no
        shared ownership between the struct field and the returned value). */
     if (nova_green_enabled()) {
-        NovaSchedTask* gt = (NovaSchedTask*)(uintptr_t)proc_handle;
-        if (gt && gt->exit_reason != 0)
-            return nova_rt_create_string((void*)(uintptr_t)gt->exit_reason);
-        return nova_rt_create_string((void*)"");
+        /* Deref + COPY under g_green_monitor_lock (N>1): the exit_reason buffer can't be freed by a
+           concurrent slot reuse mid-copy. The returned string is an independent rc-managed copy. A stale
+           handle -> "" (graceful). */
+        int _gml = (g_carrier_count > 1);
+        if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
+        NovaSchedTask* gt = nova_task_deref(proc_handle);
+        int64_t r = (gt && gt->exit_reason != 0)
+            ? nova_rt_create_string((void*)(uintptr_t)gt->exit_reason)
+            : nova_rt_create_string((void*)"");
+        if (_gml) NOVA_CS_UNLOCK(g_green_monitor_lock);
+        return r;
     }
     NovaProcessInfo* proc = (NovaProcessInfo*)(uintptr_t)proc_handle;
     if (proc && proc->exit_reason != 0)
