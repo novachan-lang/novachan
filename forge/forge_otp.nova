@@ -1,0 +1,82 @@
+// forge_otp -- OTP-style fault tolerance for Forge: supervisor trees, GenServers, agents, and
+// background jobs, PROMOTED from NOVA's shipped runtime primitives (spawn, monitor, contained panic,
+// channels). "Let it crash" with Erlang-class recovery -- at native (AOT) speed, no BEAM.
+//
+// Substrate (all shipped + tested by green_supervisor_test / supcrash_test / green_monitor_test):
+//   spawn <call>          -> a process handle
+//   monitor(p)            -> a channel that fires 0 (child exited normally) or 1 (child crashed/panic)
+//   a panic is CONTAINED to its process (exit_status=1); it never takes down the supervisor
+//   channel()/send/recv   -> the supervision rendezvous
+
+// ── Supervisor ──────────────────────────────────────────────────────────────────────────────────
+// Restart policies (per child): "permanent" (always restart), "transient" (restart only on a CRASH,
+// not a normal exit), "temporary" (never restart). Strategy "one_for_one" restarts ONLY the failed
+// child (one_for_all / rest_for_one land in T4.3). A Sup is an opaque dict handle (like the app object).
+
+fn sup_new(strategy: string, max_restarts: int, in_seconds: int) -> any
+    let s = {}
+    s["strategy"] = strategy
+    s["max_restarts"] = max_restarts
+    s["in_seconds"] = in_seconds
+    s["specs"] = []
+    s
+
+// Add a child spec: name, a NO-ARG start_fn (the child's entry point), restart policy, and a
+// shutdown budget (ms, advisory -- NOVA has no preemptive kill, so it bounds a cooperative drain
+// only). Returns the new child count.
+fn child_add(sup, name: string, start_fn, restart: string, shutdown_ms: int) -> int
+    let specs = sup["specs"]
+    push(specs, [name, start_fn, restart, shutdown_ms])
+    sup["specs"] = specs
+    len(specs)
+
+fn sup_child_count(sup) -> int
+    len(sup["specs"])
+
+// Runs a child's start_fn. MUST be a top-level named fn spawned DIRECTLY (`spawn _run_child(f)`):
+// from a SPAWNED process (the supervision loop is itself spawned), `spawn fn() f()` (a closure form)
+// does NOT deliver the child's monitor signal, but `spawn named_fn(args)` does (the same reason
+// dispatch_safe uses `spawn _dispatch_run(args)`). Spawning a closure works only from the main task.
+fn _run_child(start_fn)
+    start_fn()
+
+// one_for_one supervision of ONE child (each child gets its own independent supervision loop):
+// spawn -> monitor -> on exit, decide by (exit kind, policy). A CRASH restarts permanent+transient;
+// a NORMAL exit restarts only permanent (transient/temporary retire); temporary never restarts.
+// Exceeding max_restarts retires the child (a simple intensity cap; T4.4 adds the time window).
+fn _supervise_one(sup, idx)
+    let spec = sup["specs"][idx]
+    let start_fn = spec[1]
+    let restart = spec[2]
+    let max_r = sup["max_restarts"]
+    let restarts = 0
+    let running = 1
+    while running == 1
+        let p = spawn _run_child(start_fn)
+        let m = monitor(p)
+        let st = receive(m)
+        if st == 0
+            // normal exit
+            if restart != "permanent"
+                running = 0
+            else
+                restarts = restarts + 1
+        else
+            // crash / panic (contained)
+            if restart == "temporary"
+                running = 0
+            else
+                restarts = restarts + 1
+        if running == 1 and restarts > max_r
+            running = 0
+
+// Start the supervisor: spawn an independent one_for_one supervision loop per child. Returns the
+// child count. The supervisor itself never blocks the caller; the loops run until each child retires.
+fn sup_start(sup) -> int
+    let specs = sup["specs"]
+    let n = len(specs)
+    let i = 0
+    while i < n
+        spawn _supervise_one(sup, i)
+        i = i + 1
+    n
