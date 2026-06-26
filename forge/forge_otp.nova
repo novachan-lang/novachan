@@ -332,3 +332,73 @@ fn reg_drop(reg, name: string) -> any
     env["reply"] = 0
     send(reg["req"], env)
     0
+
+// ── Application (the OTP app root: a supervisor + a registry) ─────────────────────────────────────
+// The top of an app: one supervisor (its children) + one registry (name->pid lookup). Declare children
+// with app_child, then app_start brings up the registry and the supervised children. The single handle
+// you boot + query -- like an Elixir Application / OTP application callback.
+
+fn application(name: string) -> any
+    let app = {}
+    app["name"] = name
+    app["sup"] = sup_new("one_for_one", 5, 10)
+    app["reg"] = 0
+    app
+
+fn app_supervisor(app) -> any
+    app["sup"]
+
+fn app_registry(app) -> any
+    app["reg"]
+
+// Declare a supervised child of the application (delegates to the supervisor's child_add).
+fn app_child(app, name: string, start_fn, restart: string, shutdown_ms: int) -> int
+    child_add(app["sup"], name, start_fn, restart, shutdown_ms)
+
+// Boot the app: bring up the registry, then start the supervised children. Returns the app.
+fn app_start(app) -> any
+    app["reg"] = registry()
+    sup_start(app["sup"])
+    app
+
+// ── Jobs (background queue + worker pool) ─────────────────────────────────────────────────────────
+// A bounded job queue + N workers draining it concurrently. enqueue puts a {kind,payload} job (blocks
+// if the queue is full -> natural back-pressure); jobs_run spawns `num_workers` workers, each calling
+// handler(kind, payload) per job. Zero-infra background processing (no Redis/Celery) -- on the runtime.
+
+fn jobs(capacity: int) -> any
+    let jq = {}
+    jq["ch"] = channel_bounded(capacity)
+    jq
+
+fn enqueue(jq, kind: string, payload) -> int
+    let job = {}
+    job["kind"] = kind
+    job["payload"] = payload
+    send(jq["ch"], job)
+    1
+
+fn _job_worker(jq, handler)
+    let running = 1
+    while running == 1
+        let job = receive(jq["ch"])
+        if job["kind"] == "__stop__"
+            running = 0
+        else
+            handler(job["kind"], job["payload"])
+
+// Spawn `num_workers` workers draining the queue. Each runs handler(kind, payload) per job.
+fn jobs_run(jq, num_workers: int, handler) -> int
+    let i = 0
+    while i < num_workers
+        spawn _job_worker(jq, handler)
+        i = i + 1
+    num_workers
+
+// Tell `num_workers` workers to stop (enqueue that many stop sentinels) -- for clean shutdown/tests.
+fn jobs_stop(jq, num_workers: int) -> int
+    let i = 0
+    while i < num_workers
+        enqueue(jq, "__stop__", 0)
+        i = i + 1
+    num_workers
