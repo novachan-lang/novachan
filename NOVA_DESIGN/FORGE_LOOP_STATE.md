@@ -167,14 +167,20 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
   **(1) per-task MONITOR LOCK — ✅ DONE + committed (ed3b668).** g_green_monitor_lock (gated >1) closes
   CRITICAL-1 (monitor-vs-finish realloc-vs-read race) + CRITICAL-3 (lost-DOWN). Gate green (594/595 both
   modes), _n1_monitor_race_test PASS at N=4 + ASAN, green_scale N=4 10/10. N=1 byte-identical.
-  **(2) TASK-STRUCT RECLAIM (the production leak) — DE-RISKED + READY (next focused step):** the monitor
-  lock now lets it be N>1-COMPLETE (do the finish gen-bump+freelist-push UNDER g_green_monitor_lock →
-  closes CRITICAL-2 TOCTOU too). The two hardest risks are RESOLVED: **find_tag CONCERN-2 = ODD-encode
-  the PID (bit0=1) → find_tag's alignment check [722] rejects it, never misclassified, NO find_tag
-  change**; **deref scope = only 4 sites** (mailbox_of 6388 / root-assign 6892 / monitor 7782 /
-  exit_reason 7850). Remaining = straight execution (slot-table+freelist, encode/decode, 4 sites,
-  finish-reclaim gated flag-default-OFF, free monitors+exit_reason). GATE incl. the stability soak RSS
-  must PLATEAU + a stale-PID test. Full plan: FORGE_TASK_RECLAIM_PLAN.md (status block at top).
+  **(2) TASK-STRUCT RECLAIM (the production leak) — ✅ DONE + committed (abef642 struct + b54e761
+  closure).** Generational slot-map: spawn HANDLE = ODD-encoded (slot,gen) (bit0=1 → find_tag's
+  alignment reject [722] never misclassifies it; NO find_tag change). 4 deref sites + reclaim under
+  g_green_monitor_lock (closes CRITICAL-2 TOCTOU). Finish gen-bump+freelist-push gated
+  NOVA_SCHED_RECLAIM_TASK (default-OFF). On reuse: free monitors+exit_reason + rc_dec mailbox; closure
+  (entry_fn) rc_dec'd at finish. Root never recycled. VERIFIED: reconverge gen5.ll==gen6.ll, 596/597
+  both modes; _n1_monitor_race + _n1_stale_pid + _n1_cap_closure PASS at N=4 + ASAN (no UAF/wrong-task/
+  double-free). **SPAWN-PATH LEAK FIXED: struct + closure + mailbox-on-(interleaved-)reuse → ~20x leak
+  reduction (OOM hours→weeks).**
+  **(2b) RESIDUAL (tracked, smaller, SEPARATE): ~25 B/req in the forge REQUEST-handling path** (NOT the
+  spawn path — that's flat under interleaved reuse). A per-request alloc/arena-escape in serve/dispatch/
+  response. Pinpoint via LSan (Linux) or a bounded serve_req_n + live_count() at N=1 (NOT the
+  all-then-wait _leak_count pattern, which mis-measured — slots never reused). The reclaim flag stays
+  default-OFF until this is closed + the soak fully PLATEAUS, then flip default-ON.
   **(3) accept/poller S-a→S-c** (I/O throughput, FORGE_ACCEPT_POLLER_PLAN.md). **(4) Forge Phase B**
   breadth (OTP/observability/auth). Each = gated impl → re-run the soak/stability harness as the oracle. N=1 invariant = TWO oracles (reconverge for the
   compiler + 588 at N=1 both modes for the runtime) + N>1 stress (green_scale + channel-soak +
