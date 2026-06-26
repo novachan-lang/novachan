@@ -5663,6 +5663,9 @@ typedef struct NovaIOWaiter {
                                          calloc zero-inits it for every OTHER park (timed parks, recv, connect).
                                          A LIVE listener waiter keeps an idle N=1 carrier alive (a server idle
                                          between connections) without the keepalive sleep-daemon workaround. */
+    int                 exclusive;    /* S-b: 1 iff a tcp_accept park at N>1. The poller wakes only ONE
+                                         exclusive waiter per ready fd per round (wake-one), so N acceptors on
+                                         one shared listener don't thundering-herd. calloc zero-inits otherwise. */
     struct NovaIOWaiter* next;
 } NovaIOWaiter;
 
@@ -6026,7 +6029,7 @@ static void nova_sched_wake_all(NovaChannel* ch) {
 
 /* Park the current green task on I/O: register its FD + desired events and
    yield to the carrier. The carrier's poll loop will wake it when ready. */
-static void nova_sched_park_io_ex(int64_t fd, int events, int is_listener) {
+static void nova_sched_park_io_ex(int64_t fd, int events, int is_listener, int exclusive) {
     NovaSchedTask* t = nova_sched_current;
     if (!t) return;
     NovaIOWaiter* w = (NovaIOWaiter*)calloc(1, sizeof(NovaIOWaiter));
@@ -6035,19 +6038,31 @@ static void nova_sched_park_io_ex(int64_t fd, int events, int is_listener) {
     w->fd = fd;
     w->events = events;
     w->is_listener = is_listener;   /* N1-exit: only tcp_accept passes 1 */
+    w->exclusive = exclusive;       /* S-b: only tcp_accept at N>1 passes 1 (wake-one) */
     nova_sched_lock();
     t->status = 2;   /* Stage 3a: PARKED — set INSIDE the publish lock, BEFORE the waiter is visible in
                         nova_io_waiters, so a poll-scan on another carrier never sees the waiter with a
                         stale status and then has its status=0 clobbered by a post-unlock status=2 (the
                         clobber left the task enqueued-but-status=2 -> mis-parked -> permanent HANG).
                         N=1: g_sched_lock is a no-op; this is a straight-line reorder, byte-identical. */
-    w->next = nova_io_waiters;
-    nova_io_waiters = w;
+    if (exclusive) {
+        /* S-b: TAIL-insert exclusive (acceptor) waiters so the poller's HEAD-first drain wakes the OLDEST
+           acceptor first (FIFO) -> no single acceptor monopolizes the listener (the review's blocking #1,
+           which a head-insert would cause: the just-reparked acceptor would always be at the head and always
+           win). The list is short under load (the N acceptors + transient recv parks), so the tail walk is
+           cheap. Non-exclusive waiters keep the O(1) head-insert. */
+        w->next = NULL;
+        if (!nova_io_waiters) nova_io_waiters = w;
+        else { NovaIOWaiter* p = nova_io_waiters; while (p->next) p = p->next; p->next = w; }
+    } else {
+        w->next = nova_io_waiters;
+        nova_io_waiters = w;
+    }
     nova_sched_unlock();
     nova_rt_fiber_yield();
 }
-/* N1-exit: thin wrapper -> a normal (non-listener) park. All callers except tcp_accept use this. */
-static void nova_sched_park_io(int64_t fd, int events) { nova_sched_park_io_ex(fd, events, 0); }
+/* N1-exit/S-b: thin wrapper -> a normal (non-listener, non-exclusive) park. All callers except tcp_accept. */
+static void nova_sched_park_io(int64_t fd, int events) { nova_sched_park_io_ex(fd, events, 0, 0); }
 
 static int64_t nova_sched_now_ms(void) {
 #ifdef _WIN32
@@ -6195,6 +6210,7 @@ static int nova_sched_poll_io(int timeout_ms) {
     int64_t now_w = nova_sched_now_ms();
     int woken = 0;
     nova_sched_lock();   /* guard nova_io_waiters mutation (Step 1 coarse; Step 2 -> per-carrier) */
+    int64_t excl_woken[16]; int n_excl = 0;   /* S-b: fds that already woke an exclusive waiter THIS round */
     NovaIOWaiter** pp = &nova_io_waiters;
     while (*pp) {
         NovaIOWaiter* w = *pp;
@@ -6203,8 +6219,20 @@ static int nova_sched_poll_io(int timeout_ms) {
             if ((w->events & NOVA_POLL_READ)  && FD_ISSET(w->fd, &rfds))  ready = 1;
             if ((w->events & NOVA_POLL_WRITE) && (FD_ISSET(w->fd, &wfds) || FD_ISSET(w->fd, &efds))) ready = 1;
         }
+        int timed_out = (w->deadline_ms > 0 && now_w >= w->deadline_ms);
         /* timed park: wake (as a timeout) if the deadline has passed, regardless of fd readiness */
-        if (!ready && w->deadline_ms > 0 && now_w >= w->deadline_ms) ready = 1;
+        if (!ready && timed_out) ready = 1;
+        /* S-b WAKE-ONE: an exclusive (acceptor) waiter that became fd-ready is woken only if no OTHER exclusive
+           waiter on the SAME fd already woke this round -> exactly one acceptor wakes per readable listener;
+           level-triggered select re-reports a deeper backlog, fanning it across acceptors over rounds. Because
+           exclusive waiters are TAIL-inserted (park_io_ex), the head-first scan wakes the OLDEST first (FIFO,
+           no monopoly). A deadline-expired exclusive waiter is NEVER suppressed (it must wake to time out). */
+        if (ready && w->exclusive && !timed_out) {
+            int already = 0;
+            for (int k = 0; k < n_excl; k++) if (excl_woken[k] == w->fd) { already = 1; break; }
+            if (already) ready = 0;                      /* another acceptor on this fd already woke -> stay parked */
+            else if (n_excl < 16) excl_woken[n_excl++] = w->fd;
+        }
         if (ready) {
             *pp = w->next;
             w->task->status = 0;
@@ -6535,7 +6563,7 @@ static void nova_task_free_slot(NovaSchedTask* t) {
     g_task_freelist[g_task_free_top++] = t->slot_index;
 }
 
-int64_t nova_rt_sched_spawn(int64_t closure) {
+static int64_t nova_rt_sched_spawn_at(int64_t closure, int home) {
     NovaSchedTask* t = NULL;
     int _gml = (g_carrier_count > 1);
     if (_gml) NOVA_CS_LOCK(g_green_monitor_lock);
@@ -6560,7 +6588,7 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
     t->exit_reason = 0;
     t->finished = 0;
     t->park_committed = 0;
-    t->home_carrier = -1;
+    t->home_carrier = home;   /* S-c: spawn_on pins to a carrier (home>=0); plain spawn = -1 (unbound) */
     /* Erlang frontier Stage-0: per-task inbound mailbox. It must OUTLIVE any per-request arena
        active at spawn (the task drains it at finish, possibly AFTER arena_scope_exit). channel_create
        -> nova_heap_alloc routes to the active arena, so clear active_arena around it -> RC heap.
@@ -6572,10 +6600,21 @@ int64_t nova_rt_sched_spawn(int64_t closure) {
         t->mailbox = nova_rt_channel_create();
         _mb_t->active_arena = _mb_saved;
     }
-    nova_rq_push(t);
+    if (home >= 0 && g_carrier_count > 1) nova_carrier_enqueue(home, t);   /* S-c: pinned -> that carrier's deque (+ cv signal) */
+    else nova_rq_push(t);
     nova_live_inc();
     return nova_task_encode(slot, gen);   /* ODD-encoded (slot,gen) handle, NOT the raw ptr */
 }
+/* S-c: plain spawn (unbound -> global injector, claimed by the first carrier to pop it) + the pinned variant
+   sched_spawn_on(cid, closure) (pre-set home -> runs on carrier cid; the N parallel acceptors use this) +
+   sched_carrier_count() (so forge fans out exactly one acceptor per carrier). */
+int64_t nova_rt_sched_spawn(int64_t closure) { return nova_rt_sched_spawn_at(closure, -1); }
+int64_t nova_rt_sched_spawn_on(int64_t cid, int64_t closure) {
+    int h = (int)cid;
+    if (h < 0 || h >= g_carrier_count) h = -1;   /* out of range -> unbound (graceful; still runs) */
+    return nova_rt_sched_spawn_at(closure, h);
+}
+int64_t nova_rt_sched_carrier_count(void) { return (int64_t)g_carrier_count; }
 
 /* ── Erlang frontier Stage-0: process mailboxes (self / send / receive) ──────────
    PID = the task ptr (a NovaSchedTask never freed once spawned -> a stable, UAF-safe
@@ -10769,6 +10808,15 @@ static void nova_wsa_init(void) {}
 
 int64_t nova_rt_io_set_nonblocking(int64_t fd_val);
 
+/* Latency: disable Nagle on accepted + connected sockets. Request-response traffic (forge, RPC, the soak)
+   sends small packets; Nagle + the peer's delayed-ACK can stall a small response ~40ms, which caps a
+   keep-alive /ping benchmark at ~1/40ms regardless of server parallelism. TCP_NODELAY is the standard
+   low-latency server default (nginx/redis set it). Best-effort: a setsockopt failure is harmless. */
+static void nova_set_nodelay(NOVA_SOCKET s) {
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+}
+
 int64_t nova_rt_tcp_connect(int64_t host_ptr, int64_t port_val) {
     nova_wsa_init();
     const char* host = (const char*)(uintptr_t)host_ptr;
@@ -10791,6 +10839,7 @@ int64_t nova_rt_tcp_connect(int64_t host_ptr, int64_t port_val) {
         nova_set_error("tcp_connect: socket creation failed");
         return -1;
     }
+    nova_set_nodelay(sock);   /* low-latency: request-response client sends are small (see nova_set_nodelay) */
     /* Green task: non-blocking connect that PARKS on the netpoller during the TCP
        handshake (the network-RTT part) instead of blocking the carrier — so one
        carrier can drive many concurrent outbound connections. The socket goes
@@ -10879,15 +10928,15 @@ int64_t nova_rt_tcp_accept(int64_t server_val) {
             int al = sizeof(ca);
 #ifdef _WIN32
             NOVA_SOCKET c = accept(server, (struct sockaddr*)&ca, &al);
-            if (c != NOVA_INVALID_SOCKET) return (int64_t)c;
+            if (c != NOVA_INVALID_SOCKET) { nova_set_nodelay(c); return (int64_t)c; }
             if (WSAGetLastError() != WSAEWOULDBLOCK) break;
 #else
             socklen_t sl = (socklen_t)al;
             NOVA_SOCKET c = accept(server, (struct sockaddr*)&ca, &sl);
-            if (c != NOVA_INVALID_SOCKET) return (int64_t)c;
+            if (c != NOVA_INVALID_SOCKET) { nova_set_nodelay(c); return (int64_t)c; }
             if (errno != EAGAIN && errno != EWOULDBLOCK) break;
 #endif
-            nova_sched_park_io_ex(server_val, NOVA_POLL_READ, 1);   /* N1-exit: a listener park (keeps an idle N=1 server alive) */
+            nova_sched_park_io_ex(server_val, NOVA_POLL_READ, 1, g_single_poller_mode ? 1 : 0);   /* N1-exit listener park; S-b: exclusive (wake-one) at N>1 */
         }
         nova_set_error("tcp_accept: accept failed (green)");
         return -1;
@@ -10904,6 +10953,7 @@ int64_t nova_rt_tcp_accept(int64_t server_val) {
         nova_set_error("tcp_accept: accept failed");
         return -1;
     }
+    nova_set_nodelay(client);
     return (int64_t)client;
 }
 

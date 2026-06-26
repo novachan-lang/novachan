@@ -3741,15 +3741,36 @@ fn serve_req_n(a, port: int, n: int)
         j = j + 1
     tcp_close(listener)
 
-// Infinite spawn-per-connection serve: accept, spawn a green task per connection, never block.
-fn serve_req(a, port: int)
-    let listener = tcp_listen(port)
+// S-c (FORGE_ACCEPT_POLLER_PLAN.md): one acceptor loop. Each accepts ONE connection, spawns its handler
+// (UNPINNED via sched_spawn -> work-steals across carriers), and re-parks -- so a backlog fans out across
+// acceptors (the poller's wake-one wakes the oldest acceptor FIFO). tcp_accept returns <0 when the listener
+// is closed (graceful shutdown) -> the acceptor exits cleanly (the N1-exit tcp_close purge+wake delivers -1).
+fn _acceptor(listener: int, a)
     while true
         let conn = tcp_accept(listener)
-        if conn >= 0
-            let c = conn
-            let ap = a
-            sched_spawn(fn(z) _handle_req_arena(c, ap))
+        if conn < 0
+            return
+        let c = conn
+        let ap = a
+        sched_spawn(fn(z) _handle_req_arena(c, ap))
+
+// Infinite spawn-per-connection serve. At N>1 fans out one PINNED acceptor per carrier (sched_spawn_on) so
+// accept + dispatch parallelize across cores; the server task then parks forever (the acceptors serve). At
+// N=1 it runs a single acceptor inline (the original single-loop behavior, byte-identical).
+fn serve_req(a, port: int)
+    let listener = tcp_listen(port)
+    let nc = sched_carrier_count()
+    if nc <= 1
+        _acceptor(listener, a)
+    else
+        let i = 0
+        while i < nc
+            let li = listener
+            let ai = a
+            sched_spawn_on(i, fn(z) _acceptor(li, ai))
+            i = i + 1
+        let block = channel()
+        recv(block)
 
 // ── Crash isolation (Phase 1) ─ recover: handler panic -> 500, the server lives ──────────
 // NOVA's "let it crash": dispatch_safe runs the routed handler in a MONITORED process. On a
