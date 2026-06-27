@@ -881,3 +881,5 @@ Framework now quite complete (routing/sessions/CSRF/JWT/views/static/SSE/WS/Open
 niche; remaining HIGH-VALUE strictly needs supervision (N>1 scheduler, WASM value-model carve, live PG/TLS
 interop). Default next iterations: rotate regression-confirm + only add a utility if genuinely useful. Don't
 invent risky work.
+
+## (an) 2026-06-28 — regression-confirm (rotation 1/4): forge_lang, forge_cookie_ex, forge_urlencode, forge_req_query_all, forge_p256 = 5/5 GREEN. Safe surface exhausted; periodic health checks.
