@@ -408,3 +408,27 @@ MVP); wall-clock vs monotonic liveness + gossip-at-scale false-positives (MEDIUM
 FOLLOW-ON: audit OTHER any-ops (contains, index_of, ...) for the same wild-read fall-through pattern.
 GOTCHA: is_dict() returns 0 for json-decoded dicts — do NOT use it to guard network messages (it silently
 dropped all cluster messages -> 0/3 convergence; reverted). The index_get soundness fix is the right guard.
+
+---
+## (k) 2026-06-27 — ANY-OP WILD-READ SOUNDNESS SWEEP COMPLETE (CVE-class, runtime-only, no reconverge)
+Extended the collection-op fixes (j) to the ENTIRE any-op surface. Root cause everywhere: a runtime op cast
+an any-typed argument to char*/NovaList*/NovaDict* and strlen/strstr/deref'd it, so applying the op to a
+non-container any-value (json_decode of a scalar, a malformed network field, or a maybe-missing dict field
+read as null) dereferenced a bare scalar => ACCESS_VIOLATION (exit -1073741819, repeatedly PROVEN by probes).
+Now ALL gated via a new nova_str_safe(handle) helper (returns the string if nova_is_readable_str, else "")
+or a find_tag==LIST/DICT check -> safe ""/null/0/-1 instead of a wild read.
+Covered (commits 35db1ea, 63a0a6d, 91fa91c [collection]; 657f9a1 [all string ops]; 8ca2f19 [dict keys +
+ord/chars/char_count/lstrip/rstrip]):
+- collection: index_get, slice_any, len_any, len, for-in, contains, index_of
+- string: str_concat, str_len, slice, upper, lower, repeat, trim, split, splitlines, partition, replace,
+  starts_with, ends_with, find, str_count, str_char_at, join (+ list-handle guard + per-element guard)
+- dict: get/set/has/remove key hashing (5 sites)
+- extras: ord, chars, char_count, lstrip, rstrip
+Guard test = nova-compiler/test_programs/index_soundness_test.nova (real containers/strings intact + every
+op safe on non-containers). Regressions green throughout: forge_router, forge_https_app, cluster_test.
+=> A NOVA program can no longer be crashed by indexing/measuring/iterating/searching/string-op'ing an
+any-typed value that isn't the expected type. This is the #1-principle (soundness) win of the session and is
+CORE (any JSON/network input), surfaced by the distribution adversarial review. Detail in
+[[project-int-pointer-soundness]]. GRACEFUL "" chosen (not panic) for consistency + Forge robustness.
+Still-remaining distribution findings (MVP-grade) unchanged from (j): leave-durability tombstone, panic-in-
+remote-fn socket leak, result serialization lossy float/bool, _acceptor_loop busy-spin, security/DoS, scale.
