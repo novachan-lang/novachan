@@ -54,7 +54,10 @@ fn _tlss_take(lst, n: int) -> list
 fn _tlss_slice(lst, a: int, b: int) -> list
     let o = []
     let i = a
-    while i < b
+    let m = len(lst)
+    // Clamp to the source length: a crafted/oversized length field in an attacker-controlled ClientHello
+    // must truncate, never index out of range. (Both operands are comparisons -> safe regardless of && order.)
+    while i < b and i < m
         push(o, lst[i])
         i = i + 1
     o
@@ -128,36 +131,53 @@ fn _tlss_wire(ct: int, body) -> list
     w
 
 // Parse a ClientHello handshake message -> [client_x25519_pubkey, session_id_bytes].
+// Parse a ClientHello -> [client_x25519_pubkey, session_id]. Every direct index is bounds-guarded against
+// `n` and every length field is clamped (via _tlss_slice / bounded loops), so a truncated or maliciously-
+// sized ClientHello yields an empty/short key (-> handshake aborts in the caller) instead of an OOB panic.
 fn _tlss_parse_ch(ch) -> list
+    let n = len(ch)
     let p = 4                       // skip handshake header
     p = p + 2                       // legacy_version
     p = p + 32                      // random
+    if p >= n
+        return [[], []]
     let sidlen = ch[p]
     let session_id = _tlss_slice(ch, p + 1, p + 1 + sidlen)
     p = p + 1 + sidlen
+    if p + 1 >= n
+        return [[], session_id]
     let cslen = (ch[p] << 8) | ch[p + 1]
     p = p + 2 + cslen               // cipher_suites
+    if p >= n
+        return [[], session_id]
     let complen = ch[p]
     p = p + 1 + complen             // compression methods
+    if p + 1 >= n
+        return [[], session_id]
     let extlen = (ch[p] << 8) | ch[p + 1]
     p = p + 2
     let extend = p + extlen
+    if extend > n
+        extend = n
     let key = []
-    while p < extend
+    while p + 4 <= extend
         let etype = (ch[p] << 8) | ch[p + 1]
         let elen = (ch[p + 2] << 8) | ch[p + 3]
         let edata = p + 4
         if etype == 51
             // KeyShareClientHello: client_shares opaque<uint16> of (group(2) + key_exchange opaque<uint16>)
-            let listlen = (ch[edata] << 8) | ch[edata + 1]
-            let q = edata + 2
-            let qend = q + listlen
-            while q < qend
-                let group = (ch[q] << 8) | ch[q + 1]
-                let kelen = (ch[q + 2] << 8) | ch[q + 3]
-                if group == 29
-                    key = _tlss_slice(ch, q + 4, q + 4 + kelen)
-                q = q + 4 + kelen
+            if edata + 2 <= n
+                let listlen = (ch[edata] << 8) | ch[edata + 1]
+                let q = edata + 2
+                let qend = q + listlen
+                if qend > n
+                    qend = n
+                while q + 4 <= qend
+                    let group = (ch[q] << 8) | ch[q + 1]
+                    let kelen = (ch[q + 2] << 8) | ch[q + 3]
+                    if group == 29
+                        key = _tlss_slice(ch, q + 4, q + 4 + kelen)
+                    q = q + 4 + kelen
         p = edata + elen
     let r = []
     push(r, key)
@@ -245,6 +265,9 @@ fn tls13_server_handshake(sock, cert_sk, srv_priv) -> list
     let chp = _tlss_parse_ch(ch)
     let client_pub = chp[0]
     let session_id = chp[1]
+    // Reject a malformed ClientHello (no/short X25519 key_share) BEFORE x25519 -> clean abort, not an OOB.
+    if len(client_pub) != 32
+        return [0]
 
     let srv_pub = x25519(srv_priv, _tlss_base9())
     let sh = _tlss_make_sh(srv_pub, session_id)
