@@ -830,3 +830,15 @@ improvements. Framework mature; remaining audits low-severity. NEXT iteration: c
 CONFIRMATION pass (the overnight changes are now many -- query_get/header_get/SSE/JSON/parse_body/Range/
 redirect/query_all -- confirm they coexist) OR one more utility (req_query_all typed counterpart, header_all)
 OR OpenAPI escaping audit. Foreground; AVOID risky N>1/WASM-carve unsupervised.
+
+---
+## (ai) 2026-06-28 — BROAD REGRESSION GREEN 13/13: all 8 overnight changes coexist
+Confirmed the full overnight changeset is mutually consistent. ALL PASS:
+forge_query, forge_query_all, forge_header, forge_reqparse, forge_sse_format, forge_redirect_safe,
+json_ctrl_escape (runtime), forge_typed_core, forge_crypto_gcm, forge_p256, forge_pg_scram, forge_range,
+forge_chain (CVE-2002-0862 forgery + expiry + 3-cert CA). => The 8 forge improvements (query_get/header_get/
+SSE/JSON-ctrl-escape/parse_body-regression/Range-overflow fixes + open-redirect-guard + query_all) + the
+crypto/X.509 trust hardening all coexist; nothing regressed. Overnight forge HTTP/encoder hardening +
+utilities arc is VALIDATED end-to-end and stable. Findings now fully low-severity / exhausted; remaining
+high-value work needs supervision (N>1 scheduler, WASM value-model carve, live PG/TLS interop). NEXT: a
+small utility (req_query_all/header_all) or another light audit, else idle-tick regression confirmations.
