@@ -3671,13 +3671,30 @@ static void json_stringify_value(JsonBuf* b, int64_t val, int depth);
 static void json_stringify_str(JsonBuf* b, const char* s) {
     jbuf_char(b, '"');
     while (*s) {
-        switch (*s) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
             case '"':  jbuf_append(b, "\\\"", 2); break;
             case '\\': jbuf_append(b, "\\\\", 2); break;
             case '\n': jbuf_append(b, "\\n", 2); break;
             case '\t': jbuf_append(b, "\\t", 2); break;
             case '\r': jbuf_append(b, "\\r", 2); break;
-            default:   jbuf_char(b, *s); break;
+            case '\b': jbuf_append(b, "\\b", 2); break;
+            case '\f': jbuf_append(b, "\\f", 2); break;
+            default:
+                if (c < 0x20) {
+                    /* RFC 8259: every control char U+0000..U+001F MUST be escaped. Those without a short
+                       form above are emitted as \u00XX -- otherwise a raw control byte (e.g. user data with
+                       a 0x01/0x0B/0x1F) yields JSON that a strict parser (JSON.parse) REJECTS. */
+                    static const char hexd[] = "0123456789abcdef";
+                    char esc[6];
+                    esc[0] = '\\'; esc[1] = 'u'; esc[2] = '0'; esc[3] = '0';
+                    esc[4] = hexd[(c >> 4) & 0xF];
+                    esc[5] = hexd[c & 0xF];
+                    jbuf_append(b, esc, 6);
+                } else {
+                    jbuf_char(b, (char)c);
+                }
+                break;
         }
         s++;
     }
