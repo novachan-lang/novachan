@@ -518,12 +518,22 @@ fn forge_serve_tls(port: int, handler) -> int
     tcp_close(srv)
     r
 
-// Serve ONE connection in its own task: handshake + serve + close, then signal completion on done_ch. The
-// per-connection unit forge_serve_tls_n spawns so connections are handled CONCURRENTLY -- a slow/stalled
-// handshake on one connection no longer blocks the others. The handler closure is deep-copied into the task
-// (process isolation); done_ch is a channel (reference-shared across spawn, so the signal reaches the loop).
-fn _tlss_serve_spawned(conn: int, handler, cert_sk, srv_priv, done_ch)
+// The inner per-connection worker: just runs the serve. Spawned + monitored by _tlss_serve_spawned so a
+// handler PANIC (route handlers are arbitrary user code -- unwrap-on-Err, overflow, explicit panic) is
+// CONTAINED here instead of longjmp'ing over the parent's cleanup.
+fn _tlss_run(conn: int, handler, cert_sk, srv_priv)
     _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
+
+// Serve ONE connection in its own task, CRASH-ISOLATED. The serve runs in a monitored sub-process; whether
+// it returns cleanly OR PANICS, the monitor fires and THIS frame (no user code -> never panics) ALWAYS runs
+// tcp_close(conn) + send(done_ch,1). Without this, a handler panic would longjmp over both -> the conn fd
+// leaks AND the accept loop's drain (receive n done signals) blocks forever (the listener never closes).
+// Mirrors the HTTP path's dispatch_safe/_handle_req_safe_done. Connections are handled CONCURRENTLY so a
+// slow handshake on one connection cannot block the others.
+fn _tlss_serve_spawned(conn: int, handler, cert_sk, srv_priv, done_ch)
+    let p = spawn _tlss_run(conn, handler, cert_sk, srv_priv)
+    let m = monitor(p)
+    receive(m)
     tcp_close(conn)
     send(done_ch, 1)
 
