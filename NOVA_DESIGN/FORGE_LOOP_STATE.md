@@ -645,3 +645,24 @@ chain_verify trust path was KAT-gated but never adversarially reviewed. Outcomes
 NOTE: chain_verify is currently called ONLY from forge_chain_test (TLS files import but don't yet invoke it),
 so the signature change (added `now`) + the CA gate have no live caller to break. forge_x509/forge_p256/
 forge_rsa tests all still PASS.
+
+---
+## (x) 2026-06-28 — X.509 TRUST STORY COMPLETE: hostname/SAN binding + ECDSA on-curve (b815489, 0cd00df)
+The two tracked X.509 items are now DONE, so the full TLS trust decision is implemented + gated:
+- ECDSA on-curve validation (0cd00df): ecdsa_p256_verify rejects a public key not on P-256 (qx,qy<p +
+  y^2==x^3-3x+b) before sig math -- invalid-curve defense. gate: off-curve + qx==p rejected, KAT still pass.
+- Hostname/SAN binding (b815489): x509_matches_host(der, host_bytes) parses SubjectAltName (OID 55 1d 11,
+  dNSName tag 0x82) -> exact (case-insensitive) + leftmost-label wildcard (*.example.com matches ONE label,
+  not two, not the bare suffix; suffix-injection rejected); CN-only (no SAN) does NOT match (RFC 6125). Pure
+  byte-list API -> forge_x509 stays crypto-dependency-free. gate forge_x509_san_test.
+=> The X.509 trust decision = chain_verify (signatures + CA basicConstraints + DN chaining + current-time
+   validity + pinned anchor) + x509_matches_host (host identity). All gated. The TLS client just needs to
+   wire chain_verify+matches_host into live server-auth (the verify primitives are all ready).
+CRYPTO SECURITY ARC SUMMARY (this session, 2026-06-27..28): X.509 review found a CRITICAL real forgery
+(CVE-2002-0862) + 3 HIGH, ALL FIXED (fad61d3/756fe72/9704b11/0cd00df) + hostname/SAN added (b815489); AEAD
+review (w5mszujag) 0-confirmed (GHASH/Poly1305/ciphers sound) + GCM wrong-length-tag fix (b30698b); RSA
+PKCS1 verify audited SOUND. The crypto surface is thoroughly reviewed + hardened.
+NOTE: forge_chain_test is CORRECT but SLOW (~150s -- pure-NOVA Ed25519 x 9 certs); the _fdb_one default
+run-timeout kills it (exit=-1) -> use a longer timeout (timeout 150) when gating it. NOT a regression.
+NEXT: forge_pg SCRAM review (last unreviewed auth path) OR a FORGE FEATURE for breadth (signed sessions/
+cookies, static-file serving, templating) -- the security arc is thorough; time to advance the framework.
