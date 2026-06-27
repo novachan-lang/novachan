@@ -842,3 +842,11 @@ crypto/X.509 trust hardening all coexist; nothing regressed. Overnight forge HTT
 utilities arc is VALIDATED end-to-end and stable. Findings now fully low-severity / exhausted; remaining
 high-value work needs supervision (N>1 scheduler, WASM value-model carve, live PG/TLS interop). NEXT: a
 small utility (req_query_all/header_all) or another light audit, else idle-tick regression confirmations.
+
+---
+## (aj) 2026-06-28 — NEW: req_query_all (typed-Request counterpart of query_all) (cbe20d5)
+req.query is a single-value dict, so the typed path lost repeated query values; req_query_all(req,key)
+re-parses req.raw_path -> all values in order, exact-match, []-if-absent. gate forge_req_query_all_test
+(via build_request). Additive. OVERNIGHT TALLY: 9 forge improvements (6 fixes + open-redirect guard +
+query_all + req_query_all). Framework more complete; safe findings exhausted. Remaining high-value =
+supervised (N>1, WASM carve, live PG/TLS). Continuing incremental safe utilities/regression at measured pace.
