@@ -590,3 +590,17 @@ NEXT options: float compute end-to-end in wasm (common, tractable) / more string
 or the dedicated carve; or pivot. GOTCHA: the compiler emits typed/no-RC op VARIANTS (list_append_no_rc,
 list_append_fbox/fraw, list_get_f, ...) -- a wasm runtime must provide each one a program uses (else dummy
 import -> wrong/zero result); grep the .ll for nova_rt_* the program actually calls.
+
+---
+## (u) 2026-06-27 — WASM frontend: FLOAT compute (native f64) runs in wasm (commit 763ae3d)
+NOVA float fns run in real wasm: the specializer lowers a*b+c (float call site) to native fmul/fadd double;
+params/results are raw f64 bits (i64), unboxed via nova_rt_unbox (passthrough in the minimal runtime, added
+to _wrt_min.c); node crosses the f64<->bits boundary via DataView. gate _wasm_float_one.sh: fma=7.0,
+fsum=11.0. So the WASM frontend now runs the COMPUTE/DATA CORE of NOVA: int+float compute, strings (lit+
+build), lists, dicts, combined programs, loops+growable data. 7 gates total (_wasm_one/_wasm_str/_wasm_list/
+_wasm_dict/_wasm_combo/_wasm_loop/_wasm_float). This is a strong "run anywhere" proof for compute/data.
+REMAINING for ANY program: boxed floats in any-typed containers, nested containers, the int/float/string
+discrimination in nova_rt_add, full RC/GC -> the VALUE-MODEL CARVE (a dedicated runtime surgery, scoped in
+WASM_RUNTIME_PORT.md: gate nova_runtime.c's includes + hundreds of I/O/concurrency fns behind
+NOVA_FREESTANDING, keep the native build green, adapt find_tag). NEXT: commit to the carve as a focused
+effort, OR a realistic data-processing capstone demo, OR pivot to another vision area (forge / N>1 / review).
