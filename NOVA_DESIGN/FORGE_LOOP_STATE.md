@@ -767,3 +767,21 @@ OVERNIGHT OUTPUT/PARSER AUDIT TALLY: 3 real bugs fixed (query_get eb53343, heade
 many sound. NEXT: chunked streaming framing (send_chunk/_to_hex), json_stringify escaping (control chars /
 quotes -> JSON injection), OpenAPI gen escaping, the forge_html attribute edge cases. Foreground; AVOID risky
 N>1/WASM-carve unsupervised.
+
+---
+## (ad) 2026-06-28 — JSON control-char escaping fixed (runtime) + parse_body regression self-caught & fixed
+Two fixes this iteration; the 2nd was a self-correction caught by REGRESSION-RUNNING (the value of it):
+- json_stringify control-char escaping (4dab467, RUNTIME nova_runtime.c): escaped only "/\ /\n/\t/\r, emitted
+  other control chars (0x01-0x08,0x0B,0x0C,0x0E-0x1F) RAW -> INVALID JSON per RFC 8259 -> strict JSON.parse
+  REJECTS the whole response (interop/availability bug; NOT injection -- structural "/\ were escaped). FIX:
+  add \b/\f short forms + \u00XX for the rest. _fdb_one recompiles nova_runtime.o each run so it's gate-tested.
+  Gate json_ctrl_escape_test. (NOTE: a literal '{' in a NOVA expected-string INTERPOLATES -- check by content.)
+- ★ parse_body REGRESSION (17e7775, fix to my own f6ff7f9): f6ff7f9 returned "" for EVERY cl<0, dropping the
+  body of a no-Content-Length request -> broke forge_typed_core_test (caught only by running it as
+  regression, NOT in the original 13-test set). FIX: -2 (ambiguous TE/dup-CL/overflow) or >max_body -> ""
+  (refuse); -1 (absent CL) -> trailing bytes ARE the body (lenient, one-shot serve paths, restores pre-f6ff7f9
+  behavior); >=0 -> clamp (over-read fix kept). LESSON: run BROADER regression after a parser change, not just
+  the new gate. forge_reqparse_test gained a positive no-CL-body assertion.
+VERIFIED GREEN after both: forge_typed_core, forge_reqparse, auto_json, bool_json, from_json_safe_forge,
+forge_multipart, forge_recv_security. OVERNIGHT TALLY: 5 real fixes (query_get, header_get, SSE, JSON-escape,
+parse_body-regression). NEXT: chunked streaming (send_chunk/_to_hex), OpenAPI escaping, _parse_range. Foreground.
