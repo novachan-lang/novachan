@@ -80,6 +80,40 @@ i64 nova_rt_list_get(i64 h, i64 i) {
 }
 i64 nova_rt_list_free_local(i64 h) { (void)h; return 0; }   /* bump heap -> no-op */
 
-/* Minimal dynamic add: raw-int addition (the demo's list elements are ints). The real nova_rt_add
+/* Minimal dynamic add: raw-int addition (the demo's list/dict values are ints). The real nova_rt_add
    discriminates int/float/string via find_tag. */
 i64 nova_rt_add(i64 a, i64 b) { return a + b; }
+
+/* String-key equality (handles literal or heap keys via len_any, same as the string runtime). */
+static int nv_streq(i64 a, i64 b) {
+    i64 la = nova_rt_len_any(a), lb = nova_rt_len_any(b);
+    if (la != lb) return 0;
+    const char* sa = (const char*)(usz)a;
+    const char* sb = (const char*)(usz)b;
+    for (i64 i = 0; i < la; i++) if (sa[i] != sb[i]) return 0;
+    return 1;
+}
+/* NovaDict (minimal): {i64 pairs; i64 count; i64 cap}; pairs -> [key0,val0,key1,val1,...]. Linear scan.
+   Opaque to the compiler (it only CALLS create/set/get), so the layout is ours. A real port uses the hashed
+   NovaDict + find_tag (so len_any/keys/values work on a dict value too). */
+i64 nova_rt_dict_create(void) {
+    i64* s = (i64*)nv_alloc(24);
+    i64* p = (i64*)nv_alloc(8 * 2 * 64);
+    if (!s || !p) return 0;
+    s[0] = (i64)(usz)p; s[1] = 0; s[2] = 64;
+    return (i64)(usz)s;
+}
+i64 nova_rt_dict_set(i64 h, i64 key, i64 val) {
+    if (!h) return h;
+    i64* s = (i64*)(usz)h; i64* p = (i64*)(usz)s[0]; i64 n = s[1];
+    for (i64 i = 0; i < n; i++) if (nv_streq(p[2*i], key)) { p[2*i+1] = val; return h; }
+    if (n < s[2]) { p[2*n] = key; p[2*n+1] = val; s[1] = n + 1; }
+    return h;
+}
+i64 nova_rt_dict_get(i64 h, i64 key) {
+    if (!h) return 0;
+    i64* s = (i64*)(usz)h; i64* p = (i64*)(usz)s[0]; i64 n = s[1];
+    for (i64 i = 0; i < n; i++) if (nv_streq(p[2*i], key)) return p[2*i+1];
+    return 0;
+}
+i64 nova_rt_dict_free_local(i64 h) { (void)h; return 0; }
