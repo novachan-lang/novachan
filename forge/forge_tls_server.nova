@@ -61,6 +61,12 @@ fn _tlss_slice(lst, a: int, b: int) -> list
 
 fn _tlss_fill(sock, buf, need: int) -> list
     while len(buf) < need
+        // Slowloris guard: bound each blocking read with an idle deadline. tcp_wait_readable parks on the
+        // netpoller with a timeout (no busy-poll); ready!=1 means timed out (0) or error (-1) -> stop and
+        // let the caller drop the connection rather than wait forever for a trickling/stalled client.
+        let ready = tcp_wait_readable(sock, 15000)
+        if ready != 1
+            return buf
         let chunk = _tlss_b2l(tcp_recv_bytes(sock))
         if len(chunk) == 0
             return buf
@@ -341,8 +347,11 @@ fn tls13_server_accept_once(port: int) -> list
         return [0]
     let conn = tcp_accept(srv)
     if conn < 0
+        tcp_close(srv)
         return [0]
-    tls13_server_handshake(conn, cert_sk, srv_priv)
+    let hr = tls13_server_handshake(conn, cert_sk, srv_priv)
+    tcp_close(srv)
+    hr
 
 // Accept one connection, complete the handshake, read the client's first application record, and send
 // `response` (raw bytes) back encrypted. Returns 1 on success. Used by forge HTTPS serving.
@@ -354,6 +363,7 @@ fn tls13_serve_once(port: int, response) -> int
         return 0
     let conn = tcp_accept(srv)
     if conn < 0
+        tcp_close(srv)
         return 0
     let h = tls13_server_handshake(conn, cert_sk, srv_priv)
     if h[0] != 1
@@ -388,6 +398,54 @@ fn tls13_serve_once(port: int, response) -> int
 // via the ephemeral srv_priv), read the (decrypted) request, run `handler(request_string)`, seal + send the
 // response. Returns 1 if a request was served, 0 on handshake/record failure. The per-connection core
 // shared by forge_serve_tls (single) and forge_serve_tls_n (loop).
+// Content-Length from a request's headers (case-insensitive), or 0 if absent. Digit value via find() on
+// "0123456789" (NOVA has no ord()). Explicit bounds (no reliance on && short-circuit) so a header that ends
+// mid-number can never index out of range.
+fn _tlss_content_length(req) -> int
+    let lo = lower(req)
+    let idx = find(lo, "content-length:")
+    if idx < 0
+        return 0
+    let p = idx + 15
+    let n = len(req)
+    let go = 1
+    while go == 1
+        if p >= n
+            go = 0
+        else if req[p] == " "
+            p = p + 1
+        else
+            go = 0
+    let v = 0
+    let seen = 0
+    let go2 = 1
+    while go2 == 1
+        if p >= n
+            go2 = 0
+        else
+            let d = find("0123456789", req[p])
+            if d >= 0
+                v = v * 10 + d
+                seen = 1
+                p = p + 1
+            else
+                go2 = 0
+    if seen == 0
+        return 0
+    v
+
+// Is `acc` a COMPLETE HTTP/1.1 request? Complete = headers terminated by \r\n\r\n AND (when a body is
+// declared) the body has reached Content-Length. Mirrors recv_request's framing so a request split across
+// MULTIPLE TLS records is fully reassembled before dispatch (the old code dispatched only the first record).
+fn _tlss_req_complete(acc) -> bool
+    let sep = find(acc, "\r\n\r\n")
+    if sep < 0
+        return false
+    let cl = _tlss_content_length(acc)
+    if cl <= 0
+        return true
+    (len(acc) - (sep + 4)) >= cl
+
 fn _tlss_serve_conn(conn: int, handler, cert_sk, srv_priv) -> int
     let h = tls13_server_handshake(conn, cert_sk, srv_priv)
     if h[0] != 1
@@ -398,8 +456,9 @@ fn _tlss_serve_conn(conn: int, handler, cert_sk, srv_priv) -> int
     let s_ap_iv = h[4]
     let buf = h[6]
     let cseq = 0
+    let acc = ""
     let guard = 0
-    while guard < 16
+    while guard < 64
         guard = guard + 1
         let rec = _tlss_read_record(conn, buf)
         buf = rec[2]
@@ -411,10 +470,14 @@ fn _tlss_serve_conn(conn: int, handler, cert_sk, srv_priv) -> int
             if opened[0] != true
                 return 0
             if opened[2] == 23
-                let req = bytes_to_str(_tlss_l2b(opened[1]))
-                let resp = handler(req)
-                tcp_send_bytes(conn, _tlss_l2b(tls13_record_seal(s_ap_key, s_ap_iv, 0, str_to_blist(resp), 23, 0)))
-                return 1
+                // Reassemble the HTTP request across records; each app record has its own AEAD seq (cseq).
+                acc = acc + bytes_to_str(_tlss_l2b(opened[1]))
+                if len(acc) > 1048576
+                    return 0
+                if _tlss_req_complete(acc)
+                    let resp = handler(acc)
+                    tcp_send_bytes(conn, _tlss_l2b(tls13_record_seal(s_ap_key, s_ap_iv, 0, str_to_blist(resp), 23, 0)))
+                    return 1
     0
 
 fn forge_serve_tls(port: int, handler) -> int
@@ -425,8 +488,10 @@ fn forge_serve_tls(port: int, handler) -> int
         return 0
     let conn = tcp_accept(srv)
     if conn < 0
+        tcp_close(srv)
         return 0
     let r = _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
+    tcp_close(conn)
     tcp_close(srv)
     r
 
@@ -441,10 +506,12 @@ fn forge_serve_tls_n(port: int, handler, n: int) -> int
     let i = 0
     while i < n
         let conn = tcp_accept(srv)
-        if conn >= 0
-            let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
-            _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
-            tcp_close(conn)
+        if conn < 0
+            tcp_close(srv)
+            return 1
+        let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
+        _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
+        tcp_close(conn)
         i = i + 1
     tcp_close(srv)
     1

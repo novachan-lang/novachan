@@ -11117,19 +11117,26 @@ int64_t nova_rt_os_random(int64_t n) {
     if (n <= 0) return nova_rt_bytes_create(0);
     int64_t r = nova_rt_bytes_create(n);
     NovaBytes* b = (NovaBytes*)(uintptr_t)r;
-    if (!b || !b->data) return r;
+    if (!b || !b->data) nova_panic("os_random: buffer allocation failed");
+    /* FAIL-CLOSED: nova_rt_bytes_create zero-fills the buffer (nova_back_calloc). A CSPRNG that cannot
+       produce entropy must NEVER return that zero buffer as "random" -- it would silently hand out a fixed,
+       attacker-known key (e.g. an all-zero X25519 scalar clamps to the constant 2^254), a total break of
+       confidentiality + forward secrecy. So EVERY failure path aborts (nova_panic) instead of returning. */
 #ifdef _WIN32
     HCRYPTPROV hp;
-    if (CryptAcquireContextA(&hp, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-        if (!CryptGenRandom(hp, (DWORD)n, (BYTE*)b->data)) nova_set_error("os_random: CryptGenRandom failed");
+    if (!CryptAcquireContextA(&hp, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+        nova_panic("os_random: CryptAcquireContext failed - refusing to return non-random key material");
+    if (!CryptGenRandom(hp, (DWORD)n, (BYTE*)b->data)) {
         CryptReleaseContext(hp, 0);
-    } else {
-        nova_set_error("os_random: CryptAcquireContext failed");
+        nova_panic("os_random: CryptGenRandom failed - refusing to return non-random key material");
     }
+    CryptReleaseContext(hp, 0);
 #else
     FILE* f = fopen("/dev/urandom", "rb");
-    if (f) { size_t got = fread(b->data, 1, (size_t)n, f); (void)got; fclose(f); }
-    else { nova_set_error("os_random: /dev/urandom open failed"); }
+    if (!f) nova_panic("os_random: /dev/urandom open failed - refusing to return non-random key material");
+    size_t got = fread(b->data, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) nova_panic("os_random: short read from /dev/urandom - refusing to return partial key material");
 #endif
     return r;
 }
