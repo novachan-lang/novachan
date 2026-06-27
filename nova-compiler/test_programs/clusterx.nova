@@ -164,6 +164,8 @@ fn _pick_peer(members, self_addr)
 fn _manager_loop(cmd_ch, self_addr)
     let members = [self_addr]
     let last_seen = {}              // addr -> time_ms() of last contact (failure detection)
+    let left = {}                   // addr -> 1 if the node gracefully LEFT (tombstone): a stray gossip from
+                                    // the departed node must NOT revive it; only an explicit rejoin clears it.
     let timeout = 4000              // ms; member silent longer than this => "down". Generous vs the
                                     // ~300ms gossip interval (~13 missed rounds) so steady-state churn
                                     // never false-positives a live node. (For larger clusters T should
@@ -191,13 +193,19 @@ fn _manager_loop(cmd_ch, self_addr)
         else if c == "get_peer"
             send(cmd["reply"], _pick_peer(members, self_addr))
         else if c == "touch"
-            // proof-of-life from a peer (any inbound message). Unconditional: a stray
-            // touch for a not-yet-merged addr is harmless (alive/status iterate members).
-            last_seen[cmd["addr"]] = time_ms()
+            // proof-of-life from a peer (any inbound message). TOMBSTONE GUARD: a stray gossip from a node
+            // that gracefully LEFT must NOT revive it (left[addr]==1 => skip); only an explicit rejoin does.
+            if left[cmd["addr"]] != 1
+                last_seen[cmd["addr"]] = time_ms()
         else if c == "mark_left"
-            // a peer announced a graceful leave: force it "down" now (last_seen=0 => the
-            // age (now-0) exceeds any timeout). If it ever rejoins, a fresh touch revives it.
+            // a peer announced a graceful leave: TOMBSTONE it + force "down" now (last_seen=0 => the age
+            // (now-0) exceeds any timeout). The tombstone makes the leave DURABLE against later gossip touches.
+            left[cmd["addr"]] = 1
             last_seen[cmd["addr"]] = 0
+        else if c == "rejoin"
+            // an explicit join from a (possibly previously-departed) node: clear any tombstone + mark alive.
+            left[cmd["addr"]] = 0
+            last_seen[cmd["addr"]] = time_ms()
         else if c == "alive"
             let now3 = time_ms()
             let alive = []
@@ -219,8 +227,12 @@ fn _manager_loop(cmd_ch, self_addr)
 
 fn _acceptor_loop(port, cmd_ch)
     let listener = remote_bind(port)
+    if listener < 0
+        return 0                              // bind failed (port in use) -> don't spin accept() on -1
     while true
         let conn = remote_accept(listener)
+        if conn < 0
+            return 0                          // listener error -> stop instead of busy-spinning at 100% CPU
         spawn _handle_peer(conn, cmd_ch)
 
 fn _handle_peer(conn, cmd_ch)
@@ -228,9 +240,10 @@ fn _handle_peer(conn, cmd_ch)
     if msg != 0
         let reply = channel()
         if msg["type"] == "join"
-            // add the joiner, then reply with our full (updated) member list — atomic,
-            // no add-then-get race (merge_get does both in one manager command).
-            send(cmd_ch, {"cmd": "touch", "addr": msg["from"]})
+            // add the joiner, then reply with our full (updated) member list — atomic, no add-then-get race
+            // (merge_get does both in one command). "rejoin" clears any tombstone so a node that LEFT and
+            // comes back is revived (a plain gossip from it would stay tombstoned).
+            send(cmd_ch, {"cmd": "rejoin", "addr": msg["from"]})
             send(cmd_ch, {"cmd": "merge_get", "members": [msg["from"]], "reply": reply})
             remote_send(conn, {"type": "ack", "members": receive(reply)})
         else if msg["type"] == "gossip"
