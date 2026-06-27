@@ -454,3 +454,19 @@ precision), unauthenticated spawn + unbounded member/gossip growth (security), w
 liveness + gossip-at-scale false-positives.
 NEXT: per-connection SPAWNING for concurrent HTTPS (forge_serve_tls_n single-threaded); browser-WASM
 frontend; N>1 scheduler.
+
+---
+## (m) 2026-06-27 — CONCURRENT HTTPS: forge_serve_tls_n spawns per connection (commit d52a194)
+forge_serve_tls_n was single-threaded — one slow/stalled TLS handshake blocked every other client. Now each
+accepted connection is handled in its own spawned task (_tlss_serve_spawned: handshake+serve+close+signal a
+shared done channel); the accept loop waits for all n handlers (the done channel) before closing the
+listener. Verified closure-in-spawn deep-copies + calls correctly (a probe: a closure capturing cap=100,
+spawned, returned 107). cert_sk/srv_priv deep-copied per task (isolated); done_ch reference-shared.
+PROVEN: _forge_https_concurrent_one.sh — a STALLED connection (connects, sends nothing) does NOT block a
+FAST curl (would time out under the old loop). Regression: forge_https_app (2 sequential curls) green.
+NOVA-MODEL NOTES (cooperative green tasks at N=1 -> interleaved, not parallel, so NO data races):
+- A handler that PANICS before its done-send would block the drain (server doesn't return) — same class as
+  the dist panic-socket-leak; needs spawn-supervision for a clean count. MVP-deferred.
+- spawn DEEP-COPIES the handler closure, so closure-CAPTURED state is per-connection isolated — correct for
+  stateless routing; a stateful app must keep shared state behind a channel/actor (the NOVA way). Tracked.
+Running a focused adversarial review on the concurrency (races/drain-hang/fd) next.
