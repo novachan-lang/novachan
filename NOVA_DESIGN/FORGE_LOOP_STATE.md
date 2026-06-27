@@ -622,3 +622,26 @@ WASM_RUNTIME_PORT.md). The session has been WASM-heavy for many turns.
   forge_crypto, the X.509/cert-chain, or forge_pg SCRAM auth) -- the soundness/review discipline paid off
   twice (CSPRNG fail-open, concurrency drain-hang).
 - OR commit to the WASM value-model carve as a focused effort.
+
+---
+## (w) 2026-06-28 — Adversarial review of X.509 cert-chain trust path -> 1 CRITICAL + 3 HIGH found, 3 fixed
+Workflow wge308ikt (4 dims, find->refute, 34 agents, 30 findings, 7 confirmed -> 4 distinct issues). The
+chain_verify trust path was KAT-gated but never adversarially reviewed. Outcomes:
+- ★ CRITICAL (fad61d3): NO basicConstraints cA check -> CVE-2002-0862 / Marlinspike forgery: any end-entity
+  leaf under the pinned root could sign a forged cert for ANY name -> TRUSTED (full TLS impersonation). FIX:
+  x509_is_ca(der) parses the [3] extensions for basicConstraints cA=TRUE; chain_verify requires it on every
+  IN-CHAIN issuer (i+1<n); the pinned anchor is exempt (trusted by byte-equality -> self-signed pinning still
+  works). Regression: forgery [forged,non-CA-leaf,root] REJECTED + 3-cert CA chain ACCEPTED.
+- HIGH (756fe72): expiry never checked vs current time (only notBefore<=notAfter ordering). FIX: chain_verify
+  takes `now` (UTCTime bytes), requires notBefore<=now<=notAfter; empty now fails closed. Regression:
+  truly-expired + not-yet-valid REJECTED.
+- HIGH (9704b11): ECDSA verify didn't range-check r,s. FIX: reject r,s outside [1,n-1] (byte-level, FIPS
+  186-4), closes n_inv(0) + malleability. Regression: r=0/s=0/r=n REJECTED. Guards cert + TLS ECDSA paths.
+- TRACKED defense-in-depth (NOT fixed, low practical risk / out-of-current-scope):
+  (1) ECDSA public-key on-curve validation (qx,qy<p, y^2==x^3-3x+b) -- verify-only fails closed on bad Q;
+      needs P-256 field internals (risky). (2) hostname/SAN binding -- chain_verify is chain-only; hostname
+      match is a separate step + chain_verify isn't wired into live TLS server-auth yet. Add x509_matches_host
+      (SAN OID 55 1d 11) when TLS server-auth goes live.
+NOTE: chain_verify is currently called ONLY from forge_chain_test (TLS files import but don't yet invoke it),
+so the signature change (added `now`) + the CA gate have no live caller to break. forge_x509/forge_p256/
+forge_rsa tests all still PASS.
