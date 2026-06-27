@@ -604,3 +604,21 @@ discrimination in nova_rt_add, full RC/GC -> the VALUE-MODEL CARVE (a dedicated 
 WASM_RUNTIME_PORT.md: gate nova_runtime.c's includes + hundreds of I/O/concurrency fns behind
 NOVA_FREESTANDING, keep the native build green, adapt find_tag). NEXT: commit to the carve as a focused
 effort, OR a realistic data-processing capstone demo, OR pivot to another vision area (forge / N>1 / review).
+
+---
+## (v) 2026-06-27 — WASM CAPSTONE: recursion + loop kernels in wasm; minimal-runtime arc SATURATED (44bd8e7)
+fib(20)=6765 (recursion) + sumsq(10)=385 (loop) compile to PURE NATIVE wasm (1093 bytes, no runtime) + run
+in node V8. gate _wasm_kernel_one.sh. The minimal-runtime WASM arc is now COMPREHENSIVE (8 gates: int+float
+compute, recursion, loops, string lit+build, list, dict, combined, growable). NOVA's compute/data core runs
+in a browser-class WebAssembly engine -- a strong, honest "run anywhere" milestone. Further minimal-runtime
+increments = diminishing returns; the only big WASM step left is the VALUE-MODEL CARVE (dedicated surgery,
+WASM_RUNTIME_PORT.md). The session has been WASM-heavy for many turns.
+=> NEXT: PIVOT for breadth toward another vision area (highest value, NOT more minimal-runtime wasm):
+- Forge framework completeness: sessions/cookies, static-file serving, HTML templating/views (the "build a
+  full-stack app" first-experience). Many forge primitives shipped; these round it out.
+- N>1 parallel scheduler (the standing "concurrent N=1 but NOT parallel" gap; races open -- risky but the
+  real multi-core story).
+- Another adversarial-review Workflow on a not-yet-reviewed security path (e.g. the crypto library
+  forge_crypto, the X.509/cert-chain, or forge_pg SCRAM auth) -- the soundness/review discipline paid off
+  twice (CSPRNG fail-open, concurrency drain-hang).
+- OR commit to the WASM value-model carve as a focused effort.
