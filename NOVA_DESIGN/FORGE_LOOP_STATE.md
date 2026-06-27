@@ -820,3 +820,13 @@ fallback -> redirect_local(303, query_get(req,"next"), "/") is open-redirect-pro
 test (public fns). Additive (no path changed). ★ NOVA GOTCHA: `unsafe` is a RESERVED KEYWORD -> can't be a
 variable name (cost a compile error). OVERNIGHT TALLY: 6 fixes + 1 new security utility. NEXT: more missing
 utilities (query_all for repeated keys, etc.) OR OpenAPI/encoder edges OR a broad-regression confirmation pass.
+
+---
+## (ah) 2026-06-28 — NEW: query_all (all values for a repeated query key) (7fac6df)
+query_get returns only the FIRST value; a multi-select/checkbox form submits ?tag=a&tag=b&tag=c. query_all(
+req,key) -> list of ALL values in order (exact key match, absent -> []). Public + additive. gate
+forge_query_all_test. OVERNIGHT TALLY: 6 fixes + 2 new utilities (open-redirect guard, query_all) = 8 forge
+improvements. Framework mature; remaining audits low-severity. NEXT iteration: consider a BROAD-REGRESSION
+CONFIRMATION pass (the overnight changes are now many -- query_get/header_get/SSE/JSON/parse_body/Range/
+redirect/query_all -- confirm they coexist) OR one more utility (req_query_all typed counterpart, header_all)
+OR OpenAPI escaping audit. Foreground; AVOID risky N>1/WASM-carve unsupervised.
