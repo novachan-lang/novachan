@@ -869,3 +869,15 @@ spec via resp_json -> hardened json_stringify -> route/field names escaped (no /
 OVERNIGHT TALLY: 11 forge improvements (6 fixes + 5 utilities: open-redirect guard, query_all, req_query_all,
 url_encode/url_decode, resp_set_cookie_ex). Framework steadily more complete. Safe surface near-exhausted;
 remaining high-value = supervised (N>1/WASM/live-PG). Measured pace.
+
+---
+## (am) 2026-06-28 — NEW: negotiate_lang (Accept-Language i18n negotiation) (c9ede9b)
+Framework had Accept media-type negotiation but no Accept-Language; negotiate_lang(req,supported) picks the
+best offered language (primary-subtag match en-US->en, entry-order preference, * / no-match / absent ->
+supported[0]). gate forge_lang_test. OVERNIGHT TALLY: 12 forge improvements (6 fixes + 6 utilities:
+open-redirect guard, query_all, req_query_all, url_encode/url_decode, resp_set_cookie_ex, negotiate_lang).
+Framework now quite complete (routing/sessions/CSRF/JWT/views/static/SSE/WS/OpenAPI/content-negotiation/i18n
++ the hardened parsers). ★ Safe-autonomous surface ESSENTIALLY EXHAUSTED -- remaining utilities increasingly
+niche; remaining HIGH-VALUE strictly needs supervision (N>1 scheduler, WASM value-model carve, live PG/TLS
+interop). Default next iterations: rotate regression-confirm + only add a utility if genuinely useful. Don't
+invent risky work.
