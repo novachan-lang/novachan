@@ -17,6 +17,11 @@
 // Use the response builders to construct the response string with proper
 // headers + Content-Length.
 
+// forge_live (pure, no imports) supplies the LiveView wire helpers (live_conn/live_diff/patch_json/
+// live_mount_json) used by the WebSocket live runner below. The dependency is acyclic -- forge_live
+// imports nothing -- so forge may layer on it the way it would a dependency-free stdlib module.
+import forge_live
+
 fn _status_line(status: int) -> string
     if status == 200
         return "200 OK"
@@ -1133,6 +1138,10 @@ fn _ws_finish(ws: Ws)
 // Single owner of the fd close. The msg is valid ONLY during the handler call (arena-scoped); to retain
 // it, send it on a channel (deep-copied) or emit it immediately.
 fn _ws_run(conn: int, route, ka: int)
+    // route of length 6 [pattern,view_fn,update_fn,init_fn,statics,"live"] = a LiveView route.
+    if len(route) == 6
+        _ws_run_live(conn, route, ka)
+        return
     // route of length 3 ([pattern,handler,hub]) OR 5 ([pattern,on_msg,hub,on_join,on_leave]) = a room route.
     if len(route) >= 3
         _ws_run_room(conn, route, ka)
@@ -1146,6 +1155,58 @@ fn _ws_run(conn: int, route, ka: int)
             handler(ws, msg)
         arena_exit(prev)
     _ws_finish(ws)
+
+// ── LiveView WebSocket runner (per-connection live view over the socket) ──────────────────────────────
+// Register a LiveView route: on connect the server PUSHES a mount frame (statics once + initial
+// dynamics); thereafter each inbound client event (a text frame, a string) drives update_fn -> view_fn
+// -> a minimal patch frame. view_fn(state) -> dynamics list; update_fn(state, ev) -> the next (FRESH)
+// state; init_fn() -> the initial state; statics = the constant markup parts (len == len(dynamics)+1).
+// The route is length 6 so _ws_run dispatches it to _ws_run_live (distinct from basic(2)/room(3)/ex(5)).
+fn live_ws(a, pattern: string, view_fn, update_fn, init_fn, statics)
+    let routes = []
+    if contains(a, "ws_routes")
+        routes = a["ws_routes"]
+    push(routes, [pattern, view_fn, update_fn, init_fn, statics, "live"])
+    a["ws_routes"] = routes
+
+// Bridge the driver's STRING wire frames to the single socket writer (as text frames). The driver +
+// this pump are the only producers for `outbound` besides the close sentinel. Stops on "__pump_stop__"
+// (sent once after the reader loop ends); a real wire frame is JSON and never equals that sentinel.
+fn _live_frame_pump(frames, outbound)
+    let running = 1
+    while running == 1
+        let f = receive(frames)
+        if f == "__pump_stop__"
+            running = 0
+        else
+            send(outbound, [1, str_to_bytes(f)])
+
+// Own a LiveView connection for its lifetime. The connection's STATE lives inside the spawned live_conn
+// process (NOT this reader's per-message arena, which is freed each arena_exit). A single writer task
+// owns the socket + the fd close (single-writer rule); live_conn emits string frames; _live_frame_pump
+// bridges them to the writer. This reader forwards each client message (an event string) to live_conn.
+fn _ws_run_live(conn: int, route, ka: int)
+    let outbound = channel_bounded(256)
+    let ws = Ws(conn, 1, route[0], bytes(_ws_bufcap()), 0, 0, outbound, ka, 0)
+    let view_fn = route[1]
+    let update_fn = route[2]
+    let init_fn = route[3]
+    let statics = route[4]
+    spawn _ws_writer(conn, outbound)
+    let events = channel()
+    let frames = channel()
+    let init_state = init_fn()
+    spawn live_conn(statics, view_fn, update_fn, init_state, events, frames)
+    spawn _live_frame_pump(frames, outbound)
+    while ws.open == 1
+        let prev = arena_enter()
+        let msg = _ws_read_message(ws)
+        if ws.open == 1
+            send(events, bytes_to_str(msg))
+        arena_exit(prev)
+    send(events, "__stop__")
+    send(frames, "__pump_stop__")
+    send(outbound, [0 - 1, 0])
 
 // ── WebSocket broadcast / rooms (dual-task fan-out) ─────────────────────────────────────────────────
 // The single writer task for a connection: the SOLE socket writer. It drains the outbound channel (fed by

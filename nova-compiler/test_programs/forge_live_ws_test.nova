@@ -1,0 +1,104 @@
+// forge_live_ws_test -- a real WebSocket round-trip for LiveView over Forge's serve_req_n. A live_ws
+// counter route: on connect the server PUSHES a mount frame (statics + d:["0"]); after the client sends
+// an "inc" event frame, the server pushes a patch frame (v:"1"). Exercises the full glue: handshake ->
+// _ws_run_live -> live_conn (state in its own process) -> frame pump -> single writer -> socket.
+//
+// NOTE the server pushes the mount IMMEDIATELY after the 101, so a bulk handshake read can also pull in
+// the first frame's bytes -- the client must KEEP that leftover and decode the frame from it (a naive
+// read-101-then-read-frame loses the mount). kill-on-timeout via _fdb_one.ps1.
+import forge
+
+fn _b(s: string)
+    let n = len(s)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+fn counter_view(state)
+    [str(state["count"])]
+
+fn counter_update(state, ev)
+    let ns = {}
+    if ev == "inc"
+        ns["count"] = state["count"] + 1
+    else
+        ns["count"] = state["count"]
+    ns
+
+fn counter_init()
+    let s = {}
+    s["count"] = 0
+    s
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.live_ws(a, "/live", counter_view, counter_update, counter_init, ["<p>n=", "</p>"])
+    forge.serve_req_n(a, port, 1)
+
+// Read bytes until the HTTP header terminator is present; return the WHOLE buffer (header + any frame
+// bytes the server already pushed right behind the 101).
+fn _read_until_hdr(sock)
+    let buf = bytes(0)
+    let guard = 0
+    while guard < 2000
+        guard = guard + 1
+        if find(bytes_to_str(buf), "\r\n\r\n") >= 0
+            return buf
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return buf
+        buf = bytes_concat(buf, chunk)
+    buf
+
+// Decode one WS frame, seeded with any leftover bytes from the handshake read (so a frame that arrived
+// glued to the 101 is not lost), reading more from the socket only if the seed is short.
+fn _read_frame_seeded(sock, seed)
+    let buf = seed
+    let guard = 0
+    while guard < 2000
+        guard = guard + 1
+        let fr = forge.ws_try_decode(buf, 0)
+        if fr.status == 1
+            return fr.payload
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return bytes(0)
+        buf = bytes_concat(buf, chunk)
+    bytes(0)
+
+fn main()
+    let q = chr(34)
+    let port = 19377
+    spawn fn()
+        _server(port)
+    sleep(300)
+    let sock = tcp_connect("127.0.0.1", port)
+
+    let key = "dGhlIHNhbXBsZSBub25jZQ=="
+    let req = "GET /live HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    tcp_send(sock, req)
+
+    let raw = _read_until_hdr(sock)
+    let hdrend = find(bytes_to_str(raw), "\r\n\r\n") + 4
+    let resp = bytes_to_str(bytes_slice(raw, 0, hdrend))
+    assert(find(resp, "101 Switching Protocols") >= 0, "server sent 101 Switching Protocols")
+    let leftover = bytes_slice(raw, hdrend, bytes_len(raw))
+
+    // the server PUSHES the mount frame on connect (statics once + initial dynamics), possibly glued to the 101
+    let mount = bytes_to_str(_read_frame_seeded(sock, leftover))
+    assert(find(mount, q + "s" + q + ":[") >= 0, "mount frame carries statics")
+    assert(find(mount, q + "d" + q + ":[" + q + "0" + q) >= 0, "mount frame carries d:[0]")
+    print("PASS: live mount frame pushed on connect")
+
+    // client sends an "inc" event -> server pushes a patch frame (slot 0 -> 1)
+    tcp_send_bytes(sock, forge.ws_encode_frame(1, 1, _b("inc"), [17, 34, 51, 68]))
+    let pframe = bytes_to_str(_read_frame_seeded(sock, bytes(0)))
+    assert(find(pframe, q + "c" + q + ":[") >= 0, "patch frame is a changed-set")
+    assert(find(pframe, q + "v" + q + ":" + q + "1" + q) >= 0, "patch carries the new value 1")
+    print("PASS: live patch frame after an event")
+
+    tcp_close(sock)
+    print("PASS forge_live_ws (mount on connect + patch on event over a real WebSocket)")
