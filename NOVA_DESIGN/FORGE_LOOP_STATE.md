@@ -555,3 +555,19 @@ dicts, growable/typed/nested containers, real RC/GC need find_tag tag-disambigua
 from nova_runtime.c's NOVA_FREESTANDING path (the real next milestone; plan in WASM_RUNTIME_PORT.md). DICTS
 via the minimal runtime are a quick similar increment (dict_create/set/get, linear scan, string-key strcmp)
 if the carve is too big for one step. Always -fno-builtin; no reconverge.
+
+---
+## (s) 2026-06-27 — WASM frontend: DICTS work -> all 4 core value types run in wasm (commit ef06359)
+A NOVA dict (build+lookup) runs in wasm: _wrt_min.c gained a minimal dict {i64 pairs,count,cap} (linear
+(key,val) pairs, string-key compare via len_any). gate _wasm_dict_one.sh: dval(d[a]=7,d[b]=9)=16. So the
+minimal-runtime WASM arc is COMPLETE -- the frontend now runs NOVA's FOUR CORE VALUE TYPES + scalar compute
+end-to-end in node V8: compute (ceac8a6), string lit+build (73e5a71/2e1ebd3), list (ca40abb), dict
+(ef06359). 5 gates: _wasm_one.sh, _wasm_str_one.sh, _wasm_list_one.sh, _wasm_dict_one.sh. All green; the
+shared _wrt_min.c is additive (str/list/dict don't interfere). This PROVES NOVA's value model compiles
+cleanly to WebAssembly.
+=> NEXT (the REAL milestone): the VALUE-MODEL CARVE from nova_runtime.c's NOVA_FREESTANDING path so ANY NOVA
+program (not just the demo subset -- growable/typed/nested containers, find_tag tag-disambiguation, real
+RC/GC, int/float/string discrimination in nova_rt_add, len_any/keys/values on any value) runs in wasm. Plan
+in WASM_RUNTIME_PORT.md: carve the value-model subset into a wasm .c (-ffreestanding -fno-builtin, tiny
+memcpy/strlen), gate sockets/threads/fibers/file-IO behind NOVA_FREESTANDING, import crypto.getRandomValues
+for os_random, adapt find_tag's literal branch. Substantial -> assess + make incremental progress.
