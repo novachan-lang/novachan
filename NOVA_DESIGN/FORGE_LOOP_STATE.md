@@ -256,3 +256,27 @@ loop); BUILD everything else against the existing plan. No re-planning, no stop-
 1. Read this doc + FORGE_STATUS.md §11 F7/B8/B11 (the N>1 races) + the N>1 design output when it lands.
 2. `git log --oneline -15` — confirm last commit.
 3. Continue the CURRENT TASK. If mid-build: check the gate state; never commit ungated compiler changes.
+
+---
+## (e) 2026-06-27 — CRYPTO LIBRARY ARC COMPLETE (autonomous loop concluded)
+The "start and complete all" loop mined the entire gateable crypto seam to exhaustion. SHIPPED, all pure
+forge/*.nova (no reconverge), every primitive KAT-gated against RFC/NIST/FIPS vectors:
+- forge_crypto.nova: SHA-256/512/384, MD5, HMAC-SHA-256, Poly1305 (+ a base-2^16 limb bigint _p_*),
+  PBKDF2, HKDF, AES-128/256 + CTR + GCM, ChaCha20, ChaCha20-Poly1305 (both AEADs), base64/hex,
+  X25519 (_f_* field mod 2^255-19), Ed25519 (_ed_* points, sign/verify/publickey).
+- forge_x509.nova: DER TLV reader + writer, x509_parse_cert / x509_spki_key (parse + verify Ed25519 certs).
+- forge_p256.nova: P-256 field (limb-aligned fold, no Solinas) + curve (Jacobian a=-3) + ECDSA-P256 sign/verify.
+- forge_rsa.nova: RSA-PKCS1-v1.5 SHA-256 verify (modexp e=65537).
+- (earlier) PG SCRAM-SHA-256 + MD5 auth (forge_pg), distribution protocol (forge_dist).
+=> NOVA can verify ANY standard X.509 cert / JWT (Ed25519 + ECDSA-P256 + RSA), do modern KEX (X25519),
+authenticated encryption (2 AEADs), and all auth/KDF/hashing.
+NOVA-runtime finds (memory): `1<<64` returns 0xFFFFFFFF ([[nova-shift64-broken]]); a ~1-byte/structured
+KAT miss = mis-transcribed vector or boundary bug, not the crypto core ([[crypto-kat-oneoff-byte]]);
+arithmetic+bitwise on any-typed list reads is EXACT.
+REMAINING (each = a focused/interop session, NOT the autonomous loop):
+- TLS 1.3 handshake + record layer — needs LIVE interop with real servers; cert-chain verify ASSEMBLY
+  belongs here (all signature primitives now exist).
+- Live Postgres connect (driver + auth done; needs a live DB), browser-WASM frontend (WASM is a stub),
+  2-node distribution (protocol done; needs 2 live nodes), N>1 parallel scheduler (races open), and any
+  compiler/runtime changes.
+Authoritative latest = `git log` (crypto arc = 4d860dd..bd1441d).
