@@ -859,3 +859,13 @@ encoder; exposed url_encode(s)=_pct_encode(s) + url_decode(s)=_pct_decode(s,fals
 (round-trips space/specials/+/tab/high-bit/control). OVERNIGHT TALLY: 10 forge improvements (6 fixes + 4
 utilities: open-redirect guard, query_all, req_query_all, url_encode/url_decode). Framework steadily more
 complete. Safe surface near-exhausted; remaining high-value = supervised. Measured pace.
+
+---
+## (al) 2026-06-28 — NEW: resp_set_cookie_ex (Max-Age + Secure); OpenAPI gen audited SOUND (e690d3b)
+resp_set_cookie hard-coded Path=/; HttpOnly; SameSite=Lax with no lifetime/transport control. New
+resp_set_cookie_ex(resp,name,value,max_age,secure): max_age>0 -> persistent Max-Age, <=0 -> session; secure=1
+-> "; Secure" (HTTPS-only auth cookies). gate forge_cookie_ex_test. SOUND audit: OpenAPI gen serializes the
+spec via resp_json -> hardened json_stringify -> route/field names escaped (no /openapi.json injection).
+OVERNIGHT TALLY: 11 forge improvements (6 fixes + 5 utilities: open-redirect guard, query_all, req_query_all,
+url_encode/url_decode, resp_set_cookie_ex). Framework steadily more complete. Safe surface near-exhausted;
+remaining high-value = supervised (N>1/WASM/live-PG). Measured pace.
