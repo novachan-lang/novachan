@@ -810,3 +810,13 @@ parser, chunked, _range_response, sessions/CSRF/static). Crypto/X.509 arc stays 
 crypto_library.md. Memory persists in the harness store (outside repo git). NEXT: remaining low-sev encoder
 edges (OpenAPI structural escaping, _mp_attr/_part_ct), OR a small additive utility. Foreground; AVOID risky
 N>1/WASM-carve unsupervised.
+
+---
+## (ag) 2026-06-28 — NEW: open-redirect guard is_local_redirect + redirect_local (0185d7e)
+Added the missing safe "?next=..." return-to primitive (open-redirect = phishing). is_local_redirect(url)=1
+iff a single-"/" same-origin path (rejects //host protocol-relative, /\host backslash-bypass, http://, scheme
+js:, host-relative, empty, CR/LF/NUL). redirect_local(status,url,fallback) redirects only if safe else
+fallback -> redirect_local(303, query_get(req,"next"), "/") is open-redirect-proof. gate forge_redirect_safe_
+test (public fns). Additive (no path changed). ★ NOVA GOTCHA: `unsafe` is a RESERVED KEYWORD -> can't be a
+variable name (cost a compile error). OVERNIGHT TALLY: 6 fixes + 1 new security utility. NEXT: more missing
+utilities (query_all for repeated keys, etc.) OR OpenAPI/encoder edges OR a broad-regression confirmation pass.
