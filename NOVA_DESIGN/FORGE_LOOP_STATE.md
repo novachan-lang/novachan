@@ -307,3 +307,29 @@ send client Finished, exchange application records) and interop-test against rea
 / a public host). Plus the other live/dangerous items: live Postgres connect, browser-WASM frontend,
 2-node distribution, N>1 parallel scheduler, compiler/runtime changes.
 Authoritative latest = `git log`.
+
+---
+## (g) 2026-06-27 — LIVE HTTPS: TLS 1.3 CLIENT + SERVER, interop-proven (owner reopened the wall)
+The owner pushed back (rightly) that "live TLS interop = focused session" was over-conservative. It was:
+binary sockets (tcp_connect/listen/accept/send_bytes/recv_bytes) + OpenSSL 1.1.1l + curl are all present,
+so the live handshake is buildable AND gateable autonomously. Built + interop-proven:
+- forge_tls_client.nova: live TLS 1.3 CLIENT. tls13_client_l1 (927e2c4) + tls13_client_request (f73974c).
+  Full handshake + server auth (verifies the server CertificateVerify + Finished) + encrypted HTTP both
+  ways, gated vs `openssl s_server -tls1_3` (harness _tls_client_one.ps1).
+- forge_tls_server.nova: live TLS 1.3 SERVER. tls13_server_handshake/serve_once (fbe399c S1, ed96011 S2) +
+  forge_serve_tls(port, handler) (cd22a22 H). Builds+signs the flight (Ed25519 cert + CertificateVerify),
+  verifies the client Finished, serves encrypted app data. Gated vs `openssl s_client` AND `curl -k
+  --tls-max 1.3` (harness _tls_server_one.sh / _forge_https_one.sh) -> curl fetches a routed response.
+=> NOVA is a full HTTPS stack: makes AND serves HTTPS, each interop-proven against independent
+implementations (OpenSSL + curl). LESSON: "needs interop" is NOT a wall when an independent peer (OpenSSL,
+curl) is available locally to test against.
+GOTCHAS this arc: tcp_send/tcp_recv are strlen/NUL text-only -> use tcp_send_bytes/tcp_recv_bytes (binary);
+tcp_connect parks on the netpoller (a no-server test hangs/exits-0); openssl s_client's stdin is finicky
+for app data -> use curl; MSYS_NO_PATHCONV=1 for openssl -subj.
+SECURITY GAP (the #1 remaining item): all ephemeral/server/cert keys are FIXED constants (deterministic for
+testing). NOVA's random_int uses C rand() (a non-crypto PRNG) and there is NO OS-entropy builtin -> a
+CSPRNG (CryptGenRandom/getrandom) must be added (a runtime builtin + compiler registration + reconverge)
+and wired into the TLS keys before ANY of this is production-secure. NEXT.
+Other remaining: live PG connect, browser-WASM frontend, 2-node distribution, N>1 parallel scheduler,
+the thin forge-app HTTPS wrapper (handler calls forge dispatch).
+Authoritative latest = `git log`.
