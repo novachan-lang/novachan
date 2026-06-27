@@ -488,3 +488,23 @@ Running a focused adversarial review on the concurrency (races/drain-hang/fd) ne
 _forge_https_concurrent_one.sh, _forge_https_app_one.sh.
 NOTE: the review's verify agents partially hit a session usage limit (resets ~22:10 IST) -- the HIGH was
 fully verified; avoid launching heavy workflows until the limit resets.
+
+---
+## (o) 2026-06-27 — soundness sweep EXTENDED to list mutators + set ops (commits 605fc99, 22c5cc0)
+list_append(push)/pop/sort/reverse/insert/remove and set_add/has/remove/len/to_list cast handle->NovaList*
+with no type check (the set ops only null-checked) -> push(non-list)/sort(non-list)/set_add(non-list)
+wild-read (proven exit -1073741819). These are DIRECT builtins, NOT reached via the find_tag-checked
+index_get path. All gated with find_tag==LIST (non-list -> safe no-op). set_union/intersection/difference do
+not exist in the runtime.
+=> THE ANY-OP WILD-READ SOUNDNESS CLASS IS NOW COMPREHENSIVELY CLOSED across the ENTIRE runtime surface:
+- collection: index_get, slice_any, len_any, len, for-in, contains, index_of
+- string (17): concat, len, slice, upper, lower, repeat, trim, split, splitlines, partition, replace,
+  starts_with, ends_with, find, str_count, str_char_at, join (+ list-guard + per-element)
+- dict: get/has/set key + HANDLE, keys, values, get_default
+- list mutators: append(push), pop, sort, reverse, insert, remove
+- set: add, has, remove, len, to_list
+- extras: ord, chars, char_count, lstrip, rstrip
+Guard = nova-compiler/test_programs/index_soundness_test.nova; NO reconverge throughout; regressions
+(forge_router/forge_https_app/cluster_test) green at every step. Detail in [[project-int-pointer-soundness]].
+NEXT (big remaining items): browser-WASM frontend (WASM is a no-op stub -- NOVA's "build anything" needs a
+real frontend codegen); N>1 parallel scheduler (races open). Workflow session limit resets ~22:10 IST.
