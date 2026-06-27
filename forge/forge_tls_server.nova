@@ -518,14 +518,26 @@ fn forge_serve_tls(port: int, handler) -> int
     tcp_close(srv)
     r
 
-// Serve n HTTPS requests (n connections) in a loop. The Ed25519 cert key (the server's IDENTITY) is STABLE
-// for the server's lifetime; the ephemeral X25519 key is FRESH per connection (forward secrecy -- a leaked
-// session key never compromises another session). One request per connection. Returns 1.
+// Serve ONE connection in its own task: handshake + serve + close, then signal completion on done_ch. The
+// per-connection unit forge_serve_tls_n spawns so connections are handled CONCURRENTLY -- a slow/stalled
+// handshake on one connection no longer blocks the others. The handler closure is deep-copied into the task
+// (process isolation); done_ch is a channel (reference-shared across spawn, so the signal reaches the loop).
+fn _tlss_serve_spawned(conn: int, handler, cert_sk, srv_priv, done_ch)
+    _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
+    tcp_close(conn)
+    send(done_ch, 1)
+
+// Serve n HTTPS requests (n connections) CONCURRENTLY. The Ed25519 cert key (the server's IDENTITY) is
+// STABLE for the server's lifetime; the ephemeral X25519 key is FRESH per connection (forward secrecy).
+// Each accepted connection is spawned into its own task, so one slow handshake cannot block other clients
+// (defense in depth beyond the per-read timeout). The accept loop then waits for all n handlers (the done
+// channel) before closing the listener. Returns 1.
 fn forge_serve_tls_n(port: int, handler, n: int) -> int
     let cert_sk = _tlss_b2l(unsafe nova_rt_os_random(32))
     let srv = tcp_listen(port)
     if srv < 0
         return 0
+    let done_ch = channel()
     let i = 0
     while i < n
         let conn = tcp_accept(srv)
@@ -533,8 +545,11 @@ fn forge_serve_tls_n(port: int, handler, n: int) -> int
             tcp_close(srv)
             return 1
         let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
-        _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
-        tcp_close(conn)
+        spawn _tlss_serve_spawned(conn, handler, cert_sk, srv_priv, done_ch)
         i = i + 1
+    let got = 0
+    while got < n
+        receive(done_ch)
+        got = got + 1
     tcp_close(srv)
     1
