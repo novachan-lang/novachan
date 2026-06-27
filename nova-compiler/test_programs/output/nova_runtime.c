@@ -11110,6 +11110,30 @@ int64_t nova_rt_tcp_recv_bytes(int64_t sock_val) {
     return r;
 }
 
+/* os_random(n): n cryptographically-secure random bytes from the OS CSPRNG, as a NovaBytes.
+   Windows: CryptGenRandom (advapi32, already linked); POSIX: /dev/urandom. The basis for secure TLS
+   ephemeral/session keys -- NOVA's random_int() uses C rand() and is NOT crypto-secure. */
+int64_t nova_rt_os_random(int64_t n) {
+    if (n <= 0) return nova_rt_bytes_create(0);
+    int64_t r = nova_rt_bytes_create(n);
+    NovaBytes* b = (NovaBytes*)(uintptr_t)r;
+    if (!b || !b->data) return r;
+#ifdef _WIN32
+    HCRYPTPROV hp;
+    if (CryptAcquireContextA(&hp, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        if (!CryptGenRandom(hp, (DWORD)n, (BYTE*)b->data)) nova_set_error("os_random: CryptGenRandom failed");
+        CryptReleaseContext(hp, 0);
+    } else {
+        nova_set_error("os_random: CryptAcquireContext failed");
+    }
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) { size_t got = fread(b->data, 1, (size_t)n, f); (void)got; fclose(f); }
+    else { nova_set_error("os_random: /dev/urandom open failed"); }
+#endif
+    return r;
+}
+
 /* tcp_wait_readable(fd, timeout_ms): wait until the socket is readable OR the timeout elapses. Returns 1 if
    readable (a recv won't block -- data available OR EOF), 0 on timeout (still open, no data), -1 on error/
    invalid fd. Green-aware: PARKS on the netpoller with a deadline (yields the carrier, NO busy-poll -> does
