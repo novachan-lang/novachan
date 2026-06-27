@@ -1633,7 +1633,11 @@ int64_t nova_rt_len_any(int64_t handle) {
     if (tag == NOVA_MEM_DICT) return ((NovaDict*)ptr)->size;
     if (tag == NOVA_MEM_BYTES) return ((NovaBytes*)ptr)->size;  /* true binary length, not strlen on the struct */
     if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN((const char*)ptr);
-    return (int64_t)strlen((const char*)ptr);
+    /* SOUNDNESS: only a genuine string may be strlen'd. A non-measurable scalar (int/float/bool -- e.g.
+       len(json_decode("5")), or for-in over a non-list which lowers to len + index_get) would otherwise be
+       strlen'd as a char* -> wild read / segfault. Return 0 for a non-container. */
+    if (nova_is_readable_str(ptr)) return (int64_t)strlen((const char*)ptr);
+    return 0;
 }
 
 int64_t nova_rt_any_to_str(int64_t val); /* forward decl */
@@ -1797,7 +1801,9 @@ int64_t nova_rt_len(int64_t handle) {
     const char* s = (const char*)(uintptr_t)handle;
     NovaMemTag tag = nova_mem_find_tag((void*)s);
     if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN(s);
-    return (int64_t)strlen(s);
+    /* SOUNDNESS: gate the strlen so a non-string value cannot be deref'd as a char* (wild read). */
+    if (nova_is_readable_str((void*)s)) return (int64_t)strlen(s);
+    return 0;
 }
 
 // nova_rt_contains: generic version below nova_rt_list_slice (handles list, dict, string)
