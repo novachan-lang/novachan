@@ -1533,6 +1533,7 @@ int64_t nova_rt_list_pop(int64_t handle) {
 /* insert value at index i, shifting [i..size) one slot right. i<0 -> 0, i>size -> size (append).
    rc_inc's the inserted value (mirrors list_append). */
 int64_t nova_rt_list_insert(int64_t handle, int64_t index, int64_t value) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;  /* SOUNDNESS: insert into a non-list -> no-op */
     nova_list_deopt(handle);  /* S4.2 */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list) return 0;
@@ -1558,6 +1559,7 @@ int64_t nova_rt_list_insert(int64_t handle, int64_t index, int64_t value) {
    element was removed, 0 if absent. rc_dec's the removed element (mirrors list_set dropping the
    replaced element) -- safe because every list element was rc_inc'd when stored. */
 int64_t nova_rt_list_remove(int64_t handle, int64_t value) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;  /* SOUNDNESS: remove from a non-list -> no-op */
     nova_list_deopt(handle);  /* S4.2 */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list) return 0;
