@@ -1,0 +1,108 @@
+// forge_chain — X.509 certificate-chain verification. Verifies each cert's signature with its issuer's
+// public key (dispatched on the cert's signatureAlgorithm OID), enforces name chaining + date
+// well-formedness, and requires the top cert to byte-equal a pinned trust anchor.
+import forge_x509
+import forge_crypto
+import forge_p256
+import forge_rsa
+
+fn _chain_bytes_eq(a, b) -> int
+    if len(a) != len(b)
+        return 0
+    let i = 0
+    while i < len(a)
+        if a[i] != b[i]
+            return 0
+        i = i + 1
+    1
+
+// lexicographic byte compare a <= b (UTCTime "YYMMDDHHMMSSZ" sorts chronologically)
+fn _chain_time_le(a, b) -> int
+    let n = len(a)
+    if len(b) < n
+        n = len(b)
+    let i = 0
+    while i < n
+        if a[i] < b[i]
+            return 1
+        if a[i] > b[i]
+            return 0
+        i = i + 1
+    if len(a) <= len(b)
+        return 1
+    0
+
+fn _chain_der_int32(b, vstart: int, vend: int) -> list
+    let s = vstart
+    while s < vend and b[s] == 0
+        s = s + 1
+    let out = []
+    let pad = 32 - (vend - s)
+    let i = 0
+    while i < pad
+        push(out, 0)
+        i = i + 1
+    let j = s
+    while j < vend
+        push(out, b[j])
+        j = j + 1
+    out
+
+fn _chain_parse_ecdsa_sig(sig) -> list
+    let seq = der_tlv(sig, 0)
+    let rtlv = der_tlv(sig, seq[2])
+    let stlv = der_tlv(sig, rtlv[3])
+    let out = []
+    push(out, _chain_der_int32(sig, rtlv[2], rtlv[3]))
+    push(out, _chain_der_int32(sig, stlv[2], stlv[3]))
+    out
+
+fn _chain_rsa_n(spki_key) -> list
+    let seq = der_tlv(spki_key, 0)
+    let ntlv = der_tlv(spki_key, seq[2])
+    let start = ntlv[2]
+    if spki_key[start] == 0
+        start = start + 1
+    der_slice(spki_key, start, ntlv[3])
+
+// Verify one certificate's signature over its tbsCertificate using the issuer's SPKI key bytes,
+// dispatched on the cert's signatureAlgorithm OID. Returns 1/0.
+fn x509_verify_one(cert_der, issuer_key) -> int
+    let parsed = x509_parse_cert(cert_der)
+    let tbs = parsed[0]
+    let sig = parsed[1]
+    let oid = x509_sig_alg_oid(cert_der)
+    if _chain_bytes_eq(oid, hex_to_blist("2b6570")) == 1
+        return ed25519_verify(issuer_key, tbs, sig)
+    if _chain_bytes_eq(oid, hex_to_blist("2a8648ce3d040302")) == 1
+        let qx = der_slice(issuer_key, 1, 33)
+        let qy = der_slice(issuer_key, 33, 65)
+        let rs = _chain_parse_ecdsa_sig(sig)
+        return ecdsa_p256_verify(qx, qy, sha256_bytes(tbs), rs[0], rs[1])
+    if _chain_bytes_eq(oid, hex_to_blist("2a864886f70d01010b")) == 1
+        return rsa_pkcs1_sha256_verify(_chain_rsa_n(issuer_key), sha256_bytes(tbs), sig)
+    0
+
+// Verify a certificate chain [leaf, intermediate..., root] against a pinned trust anchor (root DER).
+// Each cert must: be signed by the next cert up (or the anchor, for the top); have issuer DN ==
+// the issuer's subject DN; have notBefore <= notAfter. The top cert must byte-equal the anchor.
+fn chain_verify(certs, trust_anchor) -> int
+    let n = len(certs)
+    let i = 0
+    while i < n
+        let cert = certs[i]
+        let parsed = x509_parse_cert(cert)
+        if _chain_time_le(parsed[5], parsed[6]) != 1
+            return 0
+        let issuer_cert = trust_anchor
+        if i + 1 < n
+            issuer_cert = certs[i + 1]
+        if _chain_bytes_eq(x509_issuer_raw(cert), x509_subject_raw(issuer_cert)) != 1
+            return 0
+        let issuer_key = x509_parse_cert(issuer_cert)[2]
+        if x509_verify_one(cert, issuer_key) != 1
+            return 0
+        i = i + 1
+    if _chain_bytes_eq(certs[n - 1], trust_anchor) != 1
+        return 0
+    1
