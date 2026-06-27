@@ -571,3 +571,22 @@ RC/GC, int/float/string discrimination in nova_rt_add, len_any/keys/values on an
 in WASM_RUNTIME_PORT.md: carve the value-model subset into a wasm .c (-ffreestanding -fno-builtin, tiny
 memcpy/strlen), gate sockets/threads/fibers/file-IO behind NOVA_FREESTANDING, import crypto.getRandomValues
 for os_random, adapt find_tag's literal branch. Substantial -> assess + make incremental progress.
+
+---
+## (t) 2026-06-27 — WASM frontend: combined demo + growable containers + loops (commits a0b0c65, a7626b0)
+- Combined capstone (a0b0c65): ONE NOVA fn combo() using list+dict+string-build+compute -> one wasm module
+  -> node = 165. A real multi-type NOVA program in wasm.
+- Growable + loops (a7626b0): _wrt_min.c list_append now GROWS (doubles, bump-copy) instead of fixed-cap;
+  added nova_rt_list_append_no_rc (the compiler emits this no-RC variant INSIDE loops -- it was missing ->
+  dummy import -> empty list -> 0). A NOVA while-loop pushing 100 ints (list grows 8->128) + summing = 4950
+  in wasm. gate _wasm_loop_one.sh. So the wasm frontend now runs LOOPS + larger-than-initial-cap data.
+WASM gates now: _wasm_one/_wasm_str_one/_wasm_list_one/_wasm_dict_one/_wasm_combo_one/_wasm_loop_one (6).
+CARVE ASSESSMENT (the real "any program" milestone): confirmed the shape -- gating nova_runtime.c's includes
+behind NOVA_FREESTANDING is easy, but it cascades into gating HUNDREDS of I/O/concurrency fns (sockets/
+threads/fibers/file-IO/winsock) across the 17000-line file while keeping the NATIVE build green (a botched
+edit breaks every test). => a large, careful, DEDICATED surgery, not a 2-min loop step. Plan stands in
+WASM_RUNTIME_PORT.md. Meanwhile the minimal runtime keeps gaining real reach incrementally (loops, growth).
+NEXT options: float compute end-to-end in wasm (common, tractable) / more string ops / nested containers;
+or the dedicated carve; or pivot. GOTCHA: the compiler emits typed/no-RC op VARIANTS (list_append_no_rc,
+list_append_fbox/fraw, list_get_f, ...) -- a wasm runtime must provide each one a program uses (else dummy
+import -> wrong/zero result); grep the .ll for nova_rt_* the program actually calls.
