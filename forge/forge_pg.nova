@@ -1,0 +1,101 @@
+// forge_pg -- a pure-NOVA PostgreSQL driver. v1 = the wire-protocol ENCODING/PARSING (PG frontend/backend
+// protocol v3 = length-prefixed big-endian binary messages). This slice builds the client messages and
+// parses the key server replies; it is fully unit-testable WITHOUT a live PG server. The live connection
+// (TCP + the auth handshake incl. SCRAM-SHA-256 + the typed-query/pool integration parallel to forge_db)
+// is specified in NOVA_DESIGN/POSTGRES_DRIVER_DESIGN.md and built in a focused session (the test harness
+// has no PG server to gate against).
+
+// Big-endian int32 / int16 (PG is big-endian on the wire). Lengths are non-negative; the NULL marker (-1)
+// is emitted as four 0xFF bytes by the wire and read back as 0xFFFFFFFF, handled on parse.
+fn pg_be32(n: int) -> any
+    let b = bytes(0)
+    b = bytes_append(b, (n / 16777216) % 256)
+    b = bytes_append(b, (n / 65536) % 256)
+    b = bytes_append(b, (n / 256) % 256)
+    b = bytes_append(b, n % 256)
+    b
+
+fn pg_be16(n: int) -> any
+    let b = bytes(0)
+    b = bytes_append(b, (n / 256) % 256)
+    b = bytes_append(b, n % 256)
+    b
+
+fn pg_rd_be32(b, off: int) -> int
+    (bytes_get(b, off) * 16777216) + (bytes_get(b, off + 1) * 65536) + (bytes_get(b, off + 2) * 256) + bytes_get(b, off + 3)
+
+fn pg_rd_be16(b, off: int) -> int
+    (bytes_get(b, off) * 256) + bytes_get(b, off + 1)
+
+// A C string (NUL-terminated) as bytes.
+fn _cstr(s: string) -> any
+    bytes_append(str_to_bytes(s), 0)
+
+// Read a C string from `b` at `p` -> [string, next_offset_after_NUL].
+fn _rd_cstr(b, p: int) -> any
+    let s = ""
+    let i = p
+    while bytes_get(b, i) != 0
+        s = s + chr(bytes_get(b, i))
+        i = i + 1
+    let r = []
+    push(r, s)
+    push(r, i + 1)
+    r
+
+// StartupMessage: int32 length (incl. itself) + int32 protocol (196608 = v3.0) + "user\0<u>\0database\0<d>\0"
+// + a final \0 (empty key terminates the parameter list).
+fn pg_startup_message(user: string, db: string) -> any
+    let body = pg_be32(196608)
+    body = bytes_concat(body, _cstr("user"))
+    body = bytes_concat(body, _cstr(user))
+    body = bytes_concat(body, _cstr("database"))
+    body = bytes_concat(body, _cstr(db))
+    body = bytes_append(body, 0)
+    bytes_concat(pg_be32(bytes_len(body) + 4), body)
+
+// Simple-query message: 'Q' + int32 length (excludes the tag, includes itself) + sql + \0.
+fn pg_query_message(sql: string) -> any
+    let payload = _cstr(sql)
+    let msg = bytes(0)
+    msg = bytes_append(msg, 81)
+    msg = bytes_concat(msg, pg_be32(bytes_len(payload) + 4))
+    bytes_concat(msg, payload)
+
+// Parse a RowDescription ('T') message at `off` -> the list of column names. Layout: tag(1) + len(4) +
+// int16 field-count, then per field a C-string name + 18 metadata bytes (table oid 4, col 2, type oid 4,
+// type size 2, type mod 4, format 2).
+fn pg_parse_row_description(b, off: int) -> any
+    let count = pg_rd_be16(b, off + 5)
+    let names = []
+    let p = off + 7
+    let i = 0
+    while i < count
+        let r = _rd_cstr(b, p)
+        push(names, r[0])
+        p = r[1] + 18
+        i = i + 1
+    names
+
+// Parse a DataRow ('D') message at `off` -> the list of column value strings ("" for SQL NULL). Layout:
+// tag(1) + len(4) + int16 column-count, then per column an int32 value-length (-1 = NULL) + that many bytes.
+fn pg_parse_data_row(b, off: int) -> any
+    let count = pg_rd_be16(b, off + 5)
+    let vals = []
+    let p = off + 7
+    let i = 0
+    while i < count
+        let vlen = pg_rd_be32(b, p)
+        p = p + 4
+        if vlen > 2147483647
+            push(vals, "")
+        else
+            let s = ""
+            let j = 0
+            while j < vlen
+                s = s + chr(bytes_get(b, p + j))
+                j = j + 1
+            push(vals, s)
+            p = p + vlen
+        i = i + 1
+    vals

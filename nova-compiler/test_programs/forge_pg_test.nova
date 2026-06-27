@@ -1,0 +1,81 @@
+// Forge S9: PostgreSQL wire-protocol encode/parse (the unit-testable slice; no live PG server needed).
+// Builds a StartupMessage + a simple Query and decodes them back; parses a hand-built DataRow (incl a
+// SQL NULL column) and a RowDescription. Socketless, deterministic.
+import forge_pg
+
+// Search raw bytes for a needle (bytes_to_str truncates at the first NUL, and PG messages are full of NULs)
+fn _bytes_contains(hay, needle: string) -> bool
+    let nb = str_to_bytes(needle)
+    let hl = bytes_len(hay)
+    let nl = bytes_len(nb)
+    let i = 0
+    while i + nl <= hl
+        let m = true
+        let j = 0
+        while j < nl
+            if bytes_get(hay, i + j) != bytes_get(nb, j)
+                m = false
+            j = j + 1
+        if m
+            return true
+        i = i + 1
+    false
+
+fn main()
+    // StartupMessage: length prefix == total, protocol == 196608, carries user + database
+    let su = pg_startup_message("alice", "mydb")
+    if pg_rd_be32(su, 0) != bytes_len(su)
+        print("FAIL: startup length prefix should equal total length")
+        exit(1)
+    if pg_rd_be32(su, 4) != 196608
+        print("FAIL: startup protocol version should be 196608")
+        exit(1)
+    if _bytes_contains(su, "alice") == false or _bytes_contains(su, "mydb") == false
+        print("FAIL: startup must carry user + database")
+        exit(1)
+
+    // Query: 'Q' tag, length == 4 + len(sql) + 1, carries the sql
+    let q = pg_query_message("SELECT 1")
+    if bytes_get(q, 0) != 81
+        print("FAIL: query tag should be 'Q' (81)")
+        exit(1)
+    if pg_rd_be32(q, 1) != 13
+        print("FAIL: query length should be 4 + 8 + 1 = 13, got " + str(pg_rd_be32(q, 1)))
+        exit(1)
+    if _bytes_contains(q, "SELECT 1") == false
+        print("FAIL: query must carry the sql")
+        exit(1)
+
+    // DataRow with two columns: "hi" and a SQL NULL (length -1 = four 0xFF)
+    let dr = bytes(0)
+    dr = bytes_append(dr, 68)
+    dr = bytes_concat(dr, pg_be32(0))
+    dr = bytes_concat(dr, pg_be16(2))
+    dr = bytes_concat(dr, pg_be32(2))
+    dr = bytes_concat(dr, str_to_bytes("hi"))
+    dr = bytes_append(dr, 255)
+    dr = bytes_append(dr, 255)
+    dr = bytes_append(dr, 255)
+    dr = bytes_append(dr, 255)
+    let vals = pg_parse_data_row(dr, 0)
+    if len(vals) != 2 or vals[0] != "hi" or vals[1] != ""
+        print("FAIL: DataRow parse (expected [hi, NULL->\"\"])")
+        exit(1)
+
+    // RowDescription with one column "id"
+    let rd = bytes(0)
+    rd = bytes_append(rd, 84)
+    rd = bytes_concat(rd, pg_be32(0))
+    rd = bytes_concat(rd, pg_be16(1))
+    rd = bytes_concat(rd, str_to_bytes("id"))
+    rd = bytes_append(rd, 0)
+    let k = 0
+    while k < 18
+        rd = bytes_append(rd, 0)
+        k = k + 1
+    let cols = pg_parse_row_description(rd, 0)
+    if len(cols) != 1 or cols[0] != "id"
+        print("FAIL: RowDescription parse (expected [id])")
+        exit(1)
+
+    print("PASS forge_pg (startup/query encode + DataRow/RowDescription parse incl SQL NULL)")
