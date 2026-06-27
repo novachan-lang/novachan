@@ -95,6 +95,11 @@ i64 nova_rt_list_free_local(i64 h) { (void)h; return 0; }   /* bump heap -> no-o
    discriminates int/float/string via find_tag. */
 i64 nova_rt_add(i64 a, i64 b) { return a + b; }
 
+/* Float unbox: native float fns unbox params via nova_rt_unbox. In the minimal runtime floats are passed as
+   RAW f64 bits (no heap box), so unbox is a passthrough. (Boxed floats in any-typed containers need the box
+   value model = the carve.) */
+i64 nova_rt_unbox(i64 h) { return h; }
+
 /* String-key equality (handles literal or heap keys via len_any, same as the string runtime). */
 static int nv_streq(i64 a, i64 b) {
     i64 la = nova_rt_len_any(a), lb = nova_rt_len_any(b);
