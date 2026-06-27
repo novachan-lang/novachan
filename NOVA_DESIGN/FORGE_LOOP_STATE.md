@@ -883,3 +883,5 @@ interop). Default next iterations: rotate regression-confirm + only add a utilit
 invent risky work.
 
 ## (an) 2026-06-28 — regression-confirm (rotation 1/4): forge_lang, forge_cookie_ex, forge_urlencode, forge_req_query_all, forge_p256 = 5/5 GREEN. Safe surface exhausted; periodic health checks.
+
+## (ao) 2026-06-28 — regression-confirm (rotation 2/4): forge_query, forge_header, forge_reqparse, forge_redirect_safe, forge_crypto_gcm = 5/5 GREEN. Safe surface exhausted; moved loop to ~30min idle health-check cadence (zero-marginal 2min churn -> wasteful; user input still interrupts immediately).
