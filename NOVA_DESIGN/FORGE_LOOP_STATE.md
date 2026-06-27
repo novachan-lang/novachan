@@ -333,3 +333,27 @@ and wired into the TLS keys before ANY of this is production-secure. NEXT.
 Other remaining: live PG connect, browser-WASM frontend, 2-node distribution, N>1 parallel scheduler,
 the thin forge-app HTTPS wrapper (handler calls forge dispatch).
 Authoritative latest = `git log`.
+
+---
+## (h) 2026-06-27 — CSPRNG: TLS keys now from OS entropy → NOVA HTTPS is KEY-SECURE
+The #1 security gap (fixed hardcoded TLS keys) is CLOSED. NOVA's only randomness was C rand() (a non-crypto
+PRNG); there was no OS entropy.
+- nova_rt_os_random(n) added to test_programs/output/nova_runtime.c (58cf288): n bytes from the OS CSPRNG
+  (Windows CryptGenRandom via the already-linked advapi32 + already-#included wincrypt.h; POSIX /dev/urandom),
+  returned as a NovaBytes (the bytes_create + b->data pattern, like tcp_recv_bytes).
+- Exposed to NOVA via the @link EXTERN FFI — `extern fn nova_rt_os_random(n: int) -> bytes` — NOT a compiler
+  builtin. This was the LOWER-RISK path the loop prompt itself sanctioned as the fallback: NO compiler-
+  bootstrap reconverge (the runtime is recompiled each build and nova_runtime.o is always linked). The
+  reconverge (the heaviest, Windows-crash-history category) was avoided entirely. Purely additive.
+- Wired into ALL TLS keys (27ed23d): client ephemeral X25519 + client random; server ephemeral X25519 +
+  server random + (per-handshake) Ed25519 cert key. The ephemeral X25519 keys are now fresh+unpredictable
+  per handshake → the session secret is no longer computable from source. X25519 commutes regardless of
+  clamping (same scalar used consistently each side; forge's x25519 clamps internally, proven by the old
+  unclamped fixed key having interoperated) → random keys stay interop-correct.
+- GATES (all PASS with random keys): forge_osrandom_test (32 bytes, non-deterministic, non-zero); client vs
+  openssl s_server; server vs curl/openssl s_client; Forge HTTPS serving vs curl (200 OK + body).
+NOTE: the cert key is regenerated per handshake (self-signed, unverified demo cert) — a PRODUCTION server
+would load a STABLE identity key; the ephemeral X25519 key (the security-critical one) MUST be fresh, which
+this guarantees. LESSON: the @link extern FFI is the way to add a runtime capability WITHOUT a reconverge.
+Remaining: thin forge-app HTTPS wrapper (handler→forge dispatch); live PG connect; browser-WASM frontend;
+2-node distribution; N>1 parallel scheduler.
