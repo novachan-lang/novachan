@@ -799,3 +799,14 @@ send_chunk_bin for binary/NUL. _range_response (rstart<0 guard, rlen cap, aend r
 OVERNIGHT TALLY: 6 real fixes (query_get, header_get, SSE-injection, JSON-ctrl-escape, parse_body-regression,
 Range-overflow). Findings now lower-severity (codebase mature). NEXT: OpenAPI gen escaping, _extract_boundary
 /_mp_attr/content_type edges, forge_html attribute-name edges; OR consolidate the session into memory. Foreground.
+
+---
+## (af) 2026-06-28 — Session consolidated into durable MEMORY (forge-http-hardening)
+Wrote memory/project_forge_http_hardening.md (+ MEMORY.md index line): the 8 forge HTTP fixes (query_get,
+header_get, SSE-injection, JSON-ctrl-escape, CL-overflow, parse_method/parse_body+regression, Range-overflow)
++ the AUDITED-SOUND list (so a future session doesn't re-mine: _content_length TE/dup-CL refusal, _safe_header
+CRLF/NUL, _pct_decode, cookie_get, parse_multipart, req_header, redirect, JWT, JSON-depth-128, WS frame
+parser, chunked, _range_response, sessions/CSRF/static). Crypto/X.509 arc stays in memory/project_forge_
+crypto_library.md. Memory persists in the harness store (outside repo git). NEXT: remaining low-sev encoder
+edges (OpenAPI structural escaping, _mp_attr/_part_ct), OR a small additive utility. Foreground; AVOID risky
+N>1/WASM-carve unsupervised.
