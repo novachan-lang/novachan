@@ -752,3 +752,18 @@ value, the components + their wiring are already covered). dispatch_test/build_r
 mock_request are the no-socket integration-test harness for future combined demos.
 NEXT: remaining quick parser audits (parse_query/parse_path/_extract_boundary), then continue. Foreground;
 AVOID risky N>1/WASM-carve unsupervised.
+
+---
+## (ac) 2026-06-28 — SSE event-injection FIXED (637f5fc); redirect/parse_path/parse_query audited SOUND
+3rd overnight bug fixed: _sse_run framed events as "data: " + msg + "\n\n" with NO newline handling -> a
+newline in attacker-echoed data injected SSE fields (event:/id:/retry:) or split events. FIX: new public
+sse_format(msg) prefixes EACH line with "data: " (CR/LF/CRLF folded), one blank line terminates. Single-line
+output byte-identical (socket forge_sse_test still PASSES); forge_sse_format_test gates the injection cases.
+SOUND this iteration (verified vs attacker input): redirect (Location via _safe_header -> CRLF stripped;
+open-redirect is correctly app responsibility), resp_redirect (Location sanitized at finalization),
+parse_path/parse_path_clean (return "/" or CRLF-cut token; empty/no-leading-slash -> 404 not injection),
+parse_query (slice after '?').
+OVERNIGHT OUTPUT/PARSER AUDIT TALLY: 3 real bugs fixed (query_get eb53343, header_get d9c87b1, SSE 637f5fc),
+many sound. NEXT: chunked streaming framing (send_chunk/_to_hex), json_stringify escaping (control chars /
+quotes -> JSON injection), OpenAPI gen escaping, the forge_html attribute edge cases. Foreground; AVOID risky
+N>1/WASM-carve unsupervised.
