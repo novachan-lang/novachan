@@ -378,7 +378,36 @@ fn _append_chunk(buf, chunk)
 // Binary-safe request read (parallel to recv_request; the string path is untouched). Reads headers + body
 // as a NovaBytes via tcp_recv_bytes so a multipart/binary body with embedded NULs is NOT truncated. Bounds
 // headers (_max_header) and body (_max_body) exactly like recv_request. Returns the full raw message bytes.
-fn recv_request_bin(conn)
+// Per-request read DEADLINE (ms) -> Slowloris defense: a connection that does not deliver a COMPLETE
+// request within the budget is dropped (returns empty -> _serve_conn closes). Default 30s (security by
+// default); forge.read_timeout(app, ms) overrides; 0 disables (then the read is byte-identical to the
+// original untimed blocking read). The WS frame loop uses its OWN keepalive (ws_keepalive), so this only
+// bounds the initial HTTP request read + any keep-alive idle gap, never an upgraded WebSocket.
+fn _read_timeout_ms(a) -> int
+    if contains(a, "read_timeout_ms")
+        return a["read_timeout_ms"]
+    30000
+
+fn read_timeout(a, ms: int)
+    a["read_timeout_ms"] = ms
+    a
+
+// Wait for `conn` to become readable before `deadline` (ms epoch). Returns >0 readable, 0 timed out
+// (deadline reached or no data in the remaining window), <0 on error. Parks the green task on the
+// netpoller (yields the carrier, no busy-poll). Clock = clock_ns()/1e6.
+fn _wait_or_timeout(conn, deadline) -> int
+    let now = clock_ns() / 1000000
+    let remaining = deadline - now
+    if remaining <= 0
+        return 0
+    tcp_wait_readable(conn, remaining)
+
+fn recv_request_bin(conn, timeout_ms)
+    let use_to = timeout_ms > 0
+    let deadline = (clock_ns() / 1000000) + timeout_ms
+    if use_to
+        if _wait_or_timeout(conn, deadline) <= 0
+            return bytes(0)
     let buf = _append_chunk(bytes(0), tcp_recv_bytes(conn))
     if bytes_len(buf) == 0
         return buf
@@ -386,6 +415,9 @@ fn recv_request_bin(conn)
     while sep < 0
         if bytes_len(buf) > _max_header()
             return buf
+        if use_to
+            if _wait_or_timeout(conn, deadline) <= 0
+                return bytes(0)
         let more = tcp_recv_bytes(conn)
         if bytes_len(more) == 0
             return buf
@@ -398,6 +430,9 @@ fn recv_request_bin(conn)
     if cl < 0 or cl > _max_body()
         return buf
     while (bytes_len(buf) - (sep + 4)) < cl
+        if use_to
+            if _wait_or_timeout(conn, deadline) <= 0
+                return bytes(0)
         let more = tcp_recv_bytes(conn)
         if bytes_len(more) == 0
             return buf
@@ -3729,7 +3764,7 @@ fn _serve_conn(conn: int, a, safe: int)
     let alive = true
     while alive
         let prev = arena_enter()
-        let raw = recv_request_bin(conn)
+        let raw = recv_request_bin(conn, _read_timeout_ms(a))
         if bytes_len(raw) == 0
             arena_exit(prev)
             alive = false

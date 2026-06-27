@@ -1,0 +1,54 @@
+// Forge T1.1: HTTP read-timeout (Slowloris defense). With a per-request read deadline, a normal request
+// is still served, but a connection that sends a PARTIAL request and never finishes is dropped (the
+// server closes it -> the client sees EOF) instead of holding the connection forever. Built on the
+// existing netpoller timed park (tcp_wait_readable) -- no runtime change. Real sockets, kill-on-timeout.
+import forge
+
+fn _read_until(sock, needle)
+    let resp = tcp_recv(sock)
+    let guard = 0
+    while find(resp, needle) < 0 and guard < 50
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            return resp
+        resp = resp + more
+        guard = guard + 1
+    resp
+
+fn _server(port: int)
+    let a = forge.app()
+    forge.get(a, "/", fn(req) "ok")
+    forge.read_timeout(a, 800)
+    // N=2 is a TEST artifact, not a feature requirement: this client + server share one process, and the
+    // client blocks waiting for the server's timed close -- on N=1 that one carrier is starved. A real
+    // server with external clients drops slow connections fine on N=1.
+    forge.serve_req_n(a, port, 2)
+
+fn main()
+    let port = 19388
+    spawn fn()
+        _server(port)
+    sleep(300)
+
+    // (1) a normal, complete request is served fine even with the read-timeout enabled
+    let s1 = tcp_connect("127.0.0.1", port)
+    tcp_send(s1, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    let r1 = _read_until(s1, "200")
+    if find(r1, "200") < 0
+        print("FAIL: a normal request must still be served (200) with the read-timeout on")
+        exit(1)
+    tcp_close(s1)
+    print("PASS: normal request served with read-timeout enabled")
+
+    // (2) Slowloris: connect, send a PARTIAL request (no header terminator), never finish. The server
+    // must drop it after the deadline -> the client's blocking recv returns EOF (empty), not a hang.
+    let s2 = tcp_connect("127.0.0.1", port)
+    tcp_send(s2, "GET / HTTP/1.1\r\n")
+    // green-parking recv (yields the carrier) so the in-process server can run its timeout + close us
+    let r2 = tcp_recv_bytes(s2)
+    if bytes_len(r2) != 0
+        print("FAIL: a partial/slow request must be dropped (EOF); got " + str(bytes_len(r2)) + " bytes")
+        exit(1)
+    tcp_close(s2)
+
+    print("PASS forge_read_timeout (normal served; partial/slow request dropped by the deadline)")
