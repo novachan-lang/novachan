@@ -2766,16 +2766,18 @@ int64_t nova_rt_dict_len(int64_t handle) {
 }
 
 int64_t nova_rt_dict_keys(int64_t handle) {
-    NovaDict* d = (NovaDict*)(uintptr_t)handle;
     int64_t list = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return list;  /* SOUNDNESS: non-dict -> empty, no wild deref */
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
     for (int64_t i = 0; i < d->size; i++)
         nova_rt_list_append(list, d->keys[i]);
     return list;
 }
 
 int64_t nova_rt_dict_values(int64_t handle) {
-    NovaDict* d = (NovaDict*)(uintptr_t)handle;
     int64_t list = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return list;  /* SOUNDNESS: non-dict -> empty, no wild deref */
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
     for (int64_t i = 0; i < d->size; i++)
         nova_rt_list_append(list, d->vals[i]);
     return list;
