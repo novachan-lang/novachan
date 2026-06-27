@@ -280,3 +280,30 @@ REMAINING (each = a focused/interop session, NOT the autonomous loop):
   2-node distribution (protocol done; needs 2 live nodes), N>1 parallel scheduler (races open), and any
   compiler/runtime changes.
 Authoritative latest = `git log` (crypto arc = 4d860dd..bd1441d).
+
+---
+## (f) 2026-06-27 — TLS 1.3 OFFLINE SURFACE COMPLETE (autonomous arc concluded)
+After the crypto library (e), the "start the next" loop built the entire offline-gateable TLS 1.3 stack,
+all pure forge/*.nova (no reconverge), every layer gated against RFC 8448 §3 "Simple 1-RTT Handshake"
+(vectors recomputed from the downloaded RFC via workflows — never transcribed) or self-constructed KATs:
+- forge_tls.nova: T1 key schedule (HKDF-Expand-Label/Derive-Secret, early/handshake/master secrets,
+  traffic keys+IVs, finished_key, record nonce) [60c7c3f]; T2 record layer (tls13_record_seal/open,
+  AES-128-GCM, opens the real RFC server flight) [98e19ef]; T3 handshake messages (parse ServerHello,
+  frame walk, build ClientHello) [1c9c759]; T4 transcript + end-to-end server Finished verify [c9cf2fd];
+  T5 CertificateVerify (tls13_verify_cert_signature dispatch: rsa_pss/ecdsa_p256/ed25519/rsa_pkcs1) —
+  verifies the REAL RFC 8448 server rsa_pss_rsae_sha256 CertificateVerify [7a3fe8c], + ECDSA/Ed25519
+  self-construct [ca8d8dc].
+- forge_rsa.nova: RSA-PSS verify (MGF1 + EMSA-PSS) [d6edb33].
+- forge_x509.nova: x509_sig_alg_oid / x509_issuer_raw / x509_subject_raw added.
+- forge_chain.nova: x509_verify_one + chain_verify (PKI chain to a pinned anchor, name chaining, dates)
+  [d5f0924].
+=> NOVA can do the COMPLETE TLS 1.3 client handshake CRYPTO + server authentication purely offline:
+derive all keys from an ECDHE secret, AEAD-protect/unprotect records, parse/build handshake messages,
+run the transcript, verify the server Finished, verify the CertificateVerify under any common scheme,
+and validate the certificate chain. Commits 60c7c3f..d5f0924.
+REMAINING = ONLY the LIVE-SOCKET integration (a focused/interop session): drive the handshake state
+machine over a real TCP connection (send ClientHello, recv+parse the server flights, run the keys/verify,
+send client Finished, exchange application records) and interop-test against real servers (openssl s_server
+/ a public host). Plus the other live/dangerous items: live Postgres connect, browser-WASM frontend,
+2-node distribution, N>1 parallel scheduler, compiler/runtime changes.
+Authoritative latest = `git log`.
