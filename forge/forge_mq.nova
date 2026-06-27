@@ -1,0 +1,63 @@
+// forge_mq -- an in-process message broker: NAMED queues with work-sharing (each message is delivered to
+// exactly ONE consumer, vs forge.hub() which broadcasts to ALL). This is the "background jobs / task
+// queue" substrate -- the thing apps reach for RabbitMQ/Sidekiq to do. The broker is a single-owner ACTOR
+// (a spawned loop draining a request channel) -> race-free queue registry, no locks. Queues are bounded
+// channels (natural backpressure + buffering so a publish doesn't block before a consumer exists).
+//
+// v1 = named FIFO queues + work-sharing. Follow-ons (design, not yet built): explicit ack/nack + redelivery
+// on consumer crash, a dead-letter queue, topic->queue routing, and disk persistence for durability.
+
+fn _mq_loop(req)
+    let queues = {}
+    let running = 1
+    while running == 1
+        let env = receive(req)
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else
+            // "queue": ensure the named queue exists, reply with its (shared) channel handle
+            let nm = env["q"]
+            if contains(queues, nm) == false
+                queues[nm] = channel_bounded(1024)
+            send(env["reply"], queues[nm])
+
+// Create a broker (spawns its actor). Use mq_publish / mq_consumer against the returned handle.
+fn mq_broker() -> any
+    let b = {}
+    b["req"] = channel()
+    spawn _mq_loop(b["req"])
+    b
+
+// Look up (or create) a queue's channel via the broker. Internal -- callers use publish/consumer.
+fn _mq_queue(b, name)
+    let rc = channel()
+    let env = {}
+    env["op"] = "queue"
+    env["q"] = name
+    env["reply"] = rc
+    send(b["req"], env)
+    receive(rc)
+
+// Publish a message onto a named queue (creates the queue on first use).
+fn mq_publish(b, name, msg) -> int
+    send(_mq_queue(b, name), msg)
+    0
+
+// Get a consumer handle for a named queue. Multiple consumers on the same queue SHARE the work: each
+// message goes to exactly one of them (channel semantics). Pull messages with mq_pull (blocks/parks until
+// one is available).
+fn mq_consumer(b, name) -> any
+    _mq_queue(b, name)
+
+fn mq_pull(consumer) -> any
+    receive(consumer)
+
+// Stop the broker's actor (queues are abandoned; in-flight messages are dropped).
+fn mq_stop(b) -> int
+    let env = {}
+    env["op"] = "stop"
+    env["q"] = ""
+    env["reply"] = b["req"]
+    send(b["req"], env)
+    0
