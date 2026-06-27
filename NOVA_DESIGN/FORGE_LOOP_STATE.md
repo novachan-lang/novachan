@@ -470,3 +470,21 @@ NOVA-MODEL NOTES (cooperative green tasks at N=1 -> interleaved, not parallel, s
 - spawn DEEP-COPIES the handler closure, so closure-CAPTURED state is per-connection isolated — correct for
   stateless routing; a stateful app must keep shared state behind a channel/actor (the NOVA way). Tracked.
 Running a focused adversarial review on the concurrency (races/drain-hang/fd) next.
+
+---
+## (n) 2026-06-27 — concurrent-HTTPS adversarial review triaged (3 confirmed, 0 critical)
+- HIGH (0503c39): a route handler PANIC longjmp'd OUT of the spawned _tlss_serve_spawned body, skipping
+  tcp_close(conn) AND send(done_ch,1) -> the conn fd leaked AND the accept loop's drain blocked FOREVER ->
+  the server hung. FIXED: _tlss_serve_spawned runs the serve in a MONITORED sub-process (spawn _tlss_run +
+  monitor(p) + receive(m)); whether the child returns or panics, the parent frame (no user code -> never
+  panics) ALWAYS closes the conn + sends done. Mirrors the HTTP dispatch_safe/_handle_req_safe_done pattern.
+  PROVEN forge_https_panic_test (a /crash route that panic()s does NOT hang the server; /ok still served +
+  the server drains + returns).
+- MEDIUM (6f3e0bb): accept failure returned without draining the already-spawned handlers -> orphans. FIXED:
+  break out of the accept loop + drain `spawned` (the actual count), not n.
+- LOW (MVP-deferred): no per-connection concurrency cap (the HTTP path has _conn_sem). forge_serve_tls_n is
+  serve-N (bounded by n); a serve-forever variant would need a semaphore. Tracked.
+=> Concurrent HTTPS is now crash-isolated, leak-free, and drain-safe. Gates: _forge_https_panic_one.sh,
+_forge_https_concurrent_one.sh, _forge_https_app_one.sh.
+NOTE: the review's verify agents partially hit a session usage limit (resets ~22:10 IST) -- the HIGH was
+fully verified; avoid launching heavy workflows until the limit resets.
