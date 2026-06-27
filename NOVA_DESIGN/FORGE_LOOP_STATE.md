@@ -785,3 +785,17 @@ Two fixes this iteration; the 2nd was a self-correction caught by REGRESSION-RUN
 VERIFIED GREEN after both: forge_typed_core, forge_reqparse, auto_json, bool_json, from_json_safe_forge,
 forge_multipart, forge_recv_security. OVERNIGHT TALLY: 5 real fixes (query_get, header_get, SSE, JSON-escape,
 parse_body-regression). NEXT: chunked streaming (send_chunk/_to_hex), OpenAPI escaping, _parse_range. Foreground.
+
+---
+## (ae) 2026-06-28 — Range parse_int overflow digit-cap (3c7b1ef); chunked streaming SOUND
+6th overnight fix: _parse_range validated start/end digits but not LENGTH -> a 16+ digit Range value could
+overflow parse_int. Path was already SECURITY-sound (rstart<0 guard -> no OOB; 512MB read cap; Content-Range
+re-derived from bytes read) -- only a cosmetic gap (wrapped-positive start served a wrong in-file sub-range
+vs 416). FIX (mirrors CL digit-cap): start >15 digits -> 416; end >15 -> clamp last byte; suffix >15 -> whole
+file. gate forge_range_test (added overflow start->416 + overflow end->0-19/20; bumped serve_req_n 5->7).
+SOUND this iteration: chunked streaming (send_chunk/_to_hex) -- length-prefixed (hex size = byte len), so
+embedded \r\n / fake chunk markers in data CANNOT inject (unlike delimiter-based SSE); 0-chunk terminates;
+send_chunk_bin for binary/NUL. _range_response (rstart<0 guard, rlen cap, aend re-derive) security-sound.
+OVERNIGHT TALLY: 6 real fixes (query_get, header_get, SSE-injection, JSON-ctrl-escape, parse_body-regression,
+Range-overflow). Findings now lower-severity (codebase mature). NEXT: OpenAPI gen escaping, _extract_boundary
+/_mp_attr/content_type edges, forge_html attribute-name edges; OR consolidate the session into memory. Foreground.
