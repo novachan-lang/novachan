@@ -63,3 +63,51 @@ fn live_apply(old_dyn, patch) -> any
 // Number of slots in a patch (the wire-size proxy -- 0 means "nothing to send").
 fn patch_size(patch) -> int
     len(patch["changed"])
+
+// ── Per-connection live process (the LiveView server) ─────────────────────────────────────────────
+// A live view is a single-owner ACTOR: a spawned loop that holds the connection's state and the last
+// rendered dynamics. On each inbound event it computes the next state (update_fn), re-renders the
+// dynamics (view_fn), diffs against the previous render, and pushes ONLY the patch on its out-channel
+// (which the WebSocket writer drains to the client). State lives in exactly one process -> no locks, no
+// races, N>1-safe by construction -- the same shape as a GenServer.
+//
+// CONTRACTS:
+//   view_fn(state)        -> dynamics list (the slots; statics are constant and live with the caller)
+//   update_fn(state, ev)  -> the NEXT state. It MUST return a FRESH value (e.g. build a new dict); the
+//                            handed-in state was deep-copied across the spawn boundary, so mutating it
+//                            in place + re-adding keys hits the deep-copied-dict hazard. Returning fresh
+//                            state (born inside this loop) sidesteps it entirely.
+// The initial full render (statics + view_fn(initial_state)) is the caller's job, sent once at connect;
+// this process streams only the deltas. A no-op event (state renders identically) sends NOTHING.
+fn _live_loop(view_fn, update_fn, initial_state, in_ch, out_ch)
+    let state = initial_state
+    let prev_dyn = view_fn(state)
+    let running = 1
+    while running == 1
+        let ev = receive(in_ch)
+        let new_state = update_fn(state, ev)
+        let new_dyn = view_fn(new_state)
+        let patch = live_diff(prev_dyn, new_dyn)
+        if patch_size(patch) > 0
+            send(out_ch, patch)
+        prev_dyn = new_dyn
+        state = new_state
+
+// Spawn a live view actor. Returns a handle {in, out}: send events on `in`, drain patches from `out`.
+// view_fn/update_fn are passed straight to the spawned loop (the same way a GenServer hands its handler
+// to its loop); the channels are shared across the spawn boundary, so the handle wires both directions.
+fn live_view(view_fn, update_fn, initial_state) -> any
+    let lv = {}
+    lv["in"] = channel()
+    lv["out"] = channel()
+    spawn _live_loop(view_fn, update_fn, initial_state, lv["in"], lv["out"])
+    lv
+
+// Send an event into the live view (drives one state transition).
+fn live_send(lv, ev) -> int
+    send(lv["in"], ev)
+    0
+
+// Receive the next patch the live view emits (the WS writer / a test calls this).
+fn live_recv(lv) -> any
+    receive(lv["out"])
