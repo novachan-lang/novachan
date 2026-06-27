@@ -543,3 +543,15 @@ NEXT WASM step: LISTS/DICTS in wasm -- extend _wrt_min.c with heap list_create/l
 (a NOVA fn building [1,2,3] + summing/len), then the full value-model carve from nova_runtime.c's
 NOVA_FREESTANDING path (find_tag/RC, the real layout) per WASM_RUNTIME_PORT.md. Then AI/compute kernels =
 the real browser story. Tools: clang wasm32 + wasm-ld + node v20 (no wasi offline; always -fno-builtin).
+
+---
+## (r) 2026-06-27 — WASM frontend: LISTS work too (4th increment, commit ca40abb)
+A NOVA fn that BUILDS + INDEXES a list runs in wasm: _wrt_min.c grew a heap list NovaList={i64 data,size,cap}
+(i64 fields so the compiler's INLINE size read at handle+8 matches) + list_create/append/get + a minimal
+nova_rt_add (raw int). gate _wasm_list_one.sh: llen([10,20,30])=3, lsum=60. So the WASM frontend now runs
+FOUR classes in node V8: scalar compute, string literal, string build (concat), list build+index. String
+gate still green (additive). HONEST: fixed-cap int lists + inline-len; len_any/index_get ON a list value,
+dicts, growable/typed/nested containers, real RC/GC need find_tag tag-disambiguation = the VALUE-MODEL CARVE
+from nova_runtime.c's NOVA_FREESTANDING path (the real next milestone; plan in WASM_RUNTIME_PORT.md). DICTS
+via the minimal runtime are a quick similar increment (dict_create/set/get, linear scan, string-key strcmp)
+if the carve is too big for one step. Always -fno-builtin; no reconverge.
