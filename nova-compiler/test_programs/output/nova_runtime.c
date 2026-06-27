@@ -1008,6 +1008,16 @@ static int nova_is_readable_str(const void* ptr) {
 #endif
 }
 
+/* SOUNDNESS: coerce a string-op argument to a safe, readable C string. A non-string value (a bare scalar
+   int/float/bool, or a bytes handle) would otherwise be strlen/strstr'd as a char* -> wild read / segfault.
+   Returns "" for any non-string, so every string op stays sound and yields an empty-string result instead
+   of crashing (e.g. upper(req["missing"]) where the missing field read as null -> "" rather than a fault).
+   A genuine string (headered RAW/FAT or a static literal) passes through unchanged. */
+static const char* nova_str_safe(int64_t handle) {
+    if (nova_is_readable_str((void*)(uintptr_t)handle)) return (const char*)(uintptr_t)handle;
+    return "";
+}
+
 /* nova_rt_init is defined later (after all lock declarations) */
 
 /* int_to_str cache declared above (before nova_mem_find_tag) */
@@ -1726,8 +1736,8 @@ int64_t nova_rt_print_intlist(int64_t handle) {
 /* ── Strings ──────────────────────────────────────────────────────────────── */
 
 int64_t nova_rt_str_concat(int64_t a, int64_t b) {
-    const char* sa = (const char*)(uintptr_t)a;
-    const char* sb = (const char*)(uintptr_t)b;
+    const char* sa = nova_str_safe(a);
+    const char* sb = nova_str_safe(b);
     size_t la = strlen(sa), lb = strlen(sb);
     size_t total = la + lb;
     char* result = (char*)nova_heap_alloc(total + 1, NOVA_MEM_RAW);
@@ -1791,7 +1801,7 @@ int64_t nova_rt_bool_to_str(int64_t v) {
 }
 
 int64_t nova_rt_str_len(int64_t handle) {
-    const char* s = (const char*)(uintptr_t)handle;
+    const char* s = nova_str_safe(handle);
     NovaMemTag tag = nova_mem_find_tag((void*)s);
     if (tag == NOVA_MEM_FAT_STR) return NOVA_FAT_LEN(s);
     return (int64_t)strlen(s);
@@ -1817,8 +1827,7 @@ static void nova_rt_str_guard_bytes(int64_t s) {
         nova_panic("string operation is not defined for a bytes value (got binary data where text was expected)");
 }
 int64_t nova_rt_slice(int64_t s, int64_t start, int64_t end) {
-    nova_rt_str_guard_bytes(s);
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     int64_t len = (int64_t)strlen(str);
     /* Negative indices count from the end (Python-style), matching list slicing,
        so s[-2:] / s[:-1] work instead of returning the whole string / "". */
@@ -1836,7 +1845,7 @@ int64_t nova_rt_slice(int64_t s, int64_t start, int64_t end) {
 }
 
 int64_t nova_rt_upper(int64_t s) {
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     size_t len = strlen(str);
     char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
     if (!result) return 0;
@@ -1846,7 +1855,7 @@ int64_t nova_rt_upper(int64_t s) {
 }
 
 int64_t nova_rt_lower(int64_t s) {
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     size_t len = strlen(str);
     char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
     if (!result) return 0;
@@ -1861,7 +1870,7 @@ int64_t nova_rt_repeat(int64_t s, int64_t count) {
         if (r) r[0] = '\0';
         return (int64_t)(uintptr_t)r;
     }
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     size_t len = strlen(str);
     size_t total = len * (size_t)count;
     char* result = (char*)nova_heap_alloc(total + 1, NOVA_MEM_RAW);
@@ -1886,7 +1895,7 @@ int64_t nova_rt_list_repeat(int64_t list, int64_t count) {
 }
 
 int64_t nova_rt_trim(int64_t s) {
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
     size_t len = strlen(str);
     while (len > 0 && (str[len-1] == ' ' || str[len-1] == '\t' || str[len-1] == '\n' || str[len-1] == '\r')) len--;
@@ -1898,8 +1907,8 @@ int64_t nova_rt_trim(int64_t s) {
 }
 
 int64_t nova_rt_split(int64_t s, int64_t delim) {
-    const char* str = (const char*)(uintptr_t)s;
-    const char* d = (const char*)(uintptr_t)delim;
+    const char* str = nova_str_safe(s);
+    const char* d = nova_str_safe(delim);
     size_t dlen = strlen(d);
     if (dlen == 0) {
         nova_set_error("split: empty delimiter");
@@ -1940,7 +1949,7 @@ static int64_t nova_str_slice(const char* src, size_t n) {
    element when the string ends in a newline (Python str.splitlines semantics); empty interior
    lines ARE preserved. Empty string -> empty list. */
 int64_t nova_rt_splitlines(int64_t s) {
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     int64_t list = nova_rt_list_create();
     if (!str) return list;
     const char* start = str;
@@ -1964,8 +1973,8 @@ int64_t nova_rt_splitlines(int64_t s) {
 
 /* partition(s, sep) -> [before, sep, after] at the FIRST occurrence of sep; sep absent -> [s,"",""]. */
 int64_t nova_rt_partition(int64_t s, int64_t sep) {
-    const char* str = (const char*)(uintptr_t)s;
-    const char* d = (const char*)(uintptr_t)sep;
+    const char* str = nova_str_safe(s);
+    const char* d = nova_str_safe(sep);
     int64_t list = nova_rt_list_create();
     size_t dlen = strlen(d);
     const char* found = (dlen > 0) ? strstr(str, d) : NULL;
@@ -2009,9 +2018,9 @@ int64_t nova_rt_rpartition(int64_t s, int64_t sep) {
 int64_t nova_rt_rsplit(int64_t s, int64_t delim) { return nova_rt_split(s, delim); }
 
 int64_t nova_rt_replace(int64_t s, int64_t old_s, int64_t new_s) {
-    const char* str = (const char*)(uintptr_t)s;
-    const char* old_str = (const char*)(uintptr_t)old_s;
-    const char* new_str = (const char*)(uintptr_t)new_s;
+    const char* str = nova_str_safe(s);
+    const char* old_str = nova_str_safe(old_s);
+    const char* new_str = nova_str_safe(new_s);
     size_t old_len = strlen(old_str);
     size_t new_len = strlen(new_str);
     if (old_len == 0) return s;
@@ -2036,45 +2045,46 @@ int64_t nova_rt_replace(int64_t s, int64_t old_s, int64_t new_s) {
 }
 
 int64_t nova_rt_starts_with(int64_t s, int64_t prefix) {
-    nova_rt_str_guard_bytes(s);
-    const char* str = (const char*)(uintptr_t)s;
-    const char* pre = (const char*)(uintptr_t)prefix;
+    const char* str = nova_str_safe(s);
+    const char* pre = nova_str_safe(prefix);
     return strncmp(str, pre, strlen(pre)) == 0 ? 1 : 0;
 }
 
 int64_t nova_rt_ends_with(int64_t s, int64_t suffix) {
-    nova_rt_str_guard_bytes(s);
-    const char* str = (const char*)(uintptr_t)s;
-    const char* suf = (const char*)(uintptr_t)suffix;
+    const char* str = nova_str_safe(s);
+    const char* suf = nova_str_safe(suffix);
     size_t str_len = strlen(str), suf_len = strlen(suf);
     if (suf_len > str_len) return 0;
     return strcmp(str + str_len - suf_len, suf) == 0 ? 1 : 0;
 }
 
 int64_t nova_rt_find(int64_t s, int64_t sub) {
-    nova_rt_str_guard_bytes(s);
-    const char* str = (const char*)(uintptr_t)s;
-    const char* needle = (const char*)(uintptr_t)sub;
+    const char* str = nova_str_safe(s);
+    const char* needle = nova_str_safe(sub);
     const char* found = strstr(str, needle);
     return found ? (int64_t)(found - str) : -1;
 }
 
 int64_t nova_rt_join(int64_t list_handle, int64_t sep) {
+    /* SOUNDNESS: a non-list handle would be deref'd as NovaList* (l->size / l->data wild read). */
+    if (nova_mem_find_tag((void*)(uintptr_t)list_handle) != NOVA_MEM_LIST) {
+        char* r = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if (r) r[0] = '\0'; return (int64_t)(uintptr_t)r;
+    }
     nova_list_deopt(list_handle);  /* S4 Stage-0: join reads data[i] as a string pointer; deopt so a kind=2 list never feeds raw double bits to strlen (wild read) */
     NovaList* l = (NovaList*)(uintptr_t)list_handle;
-    const char* s = (const char*)(uintptr_t)sep;
+    const char* s = nova_str_safe(sep);
     size_t sep_len = strlen(s);
     if (l->size == 0) { char* r = (char*)nova_heap_alloc(1, NOVA_MEM_RAW); if(r) r[0] = '\0'; return (int64_t)(uintptr_t)r; }
     size_t total = 0;
     for (int64_t i = 0; i < l->size; i++) {
-        total += strlen((const char*)(uintptr_t)l->data[i]);
+        total += strlen(nova_str_safe(l->data[i]));
         if (i < l->size - 1) total += sep_len;
     }
     char* result = (char*)nova_heap_alloc(total + 1, NOVA_MEM_RAW);
     if (!result) return 0;
     char* dst = result;
     for (int64_t i = 0; i < l->size; i++) {
-        const char* elem = (const char*)(uintptr_t)l->data[i];
+        const char* elem = nova_str_safe(l->data[i]);
         size_t elen = strlen(elem);
         memcpy(dst, elem, elen); dst += elen;
         if (i < l->size - 1) { memcpy(dst, s, sep_len); dst += sep_len; }
@@ -12016,8 +12026,8 @@ int64_t nova_rt_dict_merge(int64_t handle_a, int64_t handle_b) {
 }
 
 int64_t nova_rt_str_count(int64_t s, int64_t sub) {
-    const char* str = (const char*)(uintptr_t)s;
-    const char* pat = (const char*)(uintptr_t)sub;
+    const char* str = nova_str_safe(s);
+    const char* pat = nova_str_safe(sub);
     if (!str || !pat) return 0;
     size_t plen = strlen(pat);
     if (plen == 0) return 0;
@@ -13397,7 +13407,7 @@ int64_t nova_rt_file_read_bytes(int64_t h, int64_t n) {
 }
 
 int64_t nova_rt_str_char_at(int64_t str_val, int64_t index) {
-    const char* s = (const char*)(uintptr_t)str_val;
+    const char* s = nova_str_safe(str_val);
     if (!s) return (int64_t)(uintptr_t)"";
     int64_t len = (int64_t)strlen(s);
     int64_t idx = index;
