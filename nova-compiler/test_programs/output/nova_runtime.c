@@ -1341,6 +1341,7 @@ int64_t nova_rt_list_create_filled(int64_t count, int64_t value) {
 }
 
 int64_t nova_rt_list_append(int64_t handle, int64_t elem) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;  /* SOUNDNESS: push to a non-list -> no-op, no wild deref */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     /* S4.2: a GENERIC append (non-float, or unknown via escape) to a raw-double list must DEOPT it
        first -- storing a non-double into a kind=2 list would make the kind-aware reader misread the
@@ -1518,6 +1519,7 @@ int64_t nova_rt_float_to_str(int64_t bits); /* fwd decl: S4.2 kind=2 list_to_str
    element the caller now holds is never double-freed; the orphaned ref leaks like any other
    reassigned heap local under the partial-RC model). Empty list -> error + 0. */
 int64_t nova_rt_list_pop(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;  /* SOUNDNESS: pop a non-list -> 0 */
     nova_list_deopt(handle);  /* S4.2: rare op -> run the boxed path */
     NovaList* list = (NovaList*)(uintptr_t)handle;
     if (!list || list->size == 0) {
@@ -2169,6 +2171,7 @@ int64_t nova_rt_range_from_to(int64_t from, int64_t to) {
 }
 
 int64_t nova_rt_list_reverse(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;  /* SOUNDNESS: reverse a non-list -> no-op */
     nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     int64_t new_list = nova_rt_list_create();
@@ -2216,6 +2219,7 @@ static int nova_elem_is_str(int64_t v) {
 }
 
 int64_t nova_rt_list_sort(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;  /* SOUNDNESS: sort a non-list -> no-op */
     nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l || l->size < 2) return handle;
@@ -11886,8 +11890,8 @@ int64_t nova_rt_set_create(void) {
 }
 
 int64_t nova_rt_set_add(int64_t handle, int64_t item) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;  /* SOUNDNESS: non-list/non-set handle -> no wild deref */
     NovaList* l = (NovaList*)(uintptr_t)handle;
-    if (!l) return 0;
     for (int64_t i = 0; i < l->size; i++) {
         if (nova_rt_eq(l->data[i], item)) return 0;
     }
@@ -11896,8 +11900,8 @@ int64_t nova_rt_set_add(int64_t handle, int64_t item) {
 }
 
 int64_t nova_rt_set_has(int64_t handle, int64_t item) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;  /* SOUNDNESS: non-list/non-set handle */
     NovaList* l = (NovaList*)(uintptr_t)handle;
-    if (!l) return 0;
     for (int64_t i = 0; i < l->size; i++) {
         if (nova_rt_eq(l->data[i], item)) return 1;
     }
@@ -11905,8 +11909,8 @@ int64_t nova_rt_set_has(int64_t handle, int64_t item) {
 }
 
 int64_t nova_rt_set_remove(int64_t handle, int64_t item) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;  /* SOUNDNESS: non-list/non-set handle */
     NovaList* l = (NovaList*)(uintptr_t)handle;
-    if (!l) return 0;
     for (int64_t i = 0; i < l->size; i++) {
         if (nova_rt_eq(l->data[i], item)) {
             nova_rc_dec(l->data[i]);
@@ -11919,12 +11923,13 @@ int64_t nova_rt_set_remove(int64_t handle, int64_t item) {
 }
 
 int64_t nova_rt_set_len(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;  /* SOUNDNESS: non-list/non-set handle */
     NovaList* l = (NovaList*)(uintptr_t)handle;
-    if (!l) return 0;
     return l->size;
 }
 
 int64_t nova_rt_set_to_list(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();  /* SOUNDNESS */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l) return nova_rt_list_create();
     int64_t result = nova_rt_list_create();
