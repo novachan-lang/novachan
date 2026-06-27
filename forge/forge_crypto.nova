@@ -500,3 +500,172 @@ fn aes_ctr(key, iv, data) -> list
         _aes_incr(counter)
         i = i + 16
     out
+
+// ── AES-GCM (NIST SP 800-38D) -- authenticated encryption ───────────────────────────────────────────
+// Right-shift one 16-byte value (128-bit, bit0 = MSB of byte0) by 1, in place; return the bit shifted out.
+fn _gf_rshift1(v) -> int
+    let lsb = v[15] & 1
+    let carry = 0
+    let b = 0
+    while b < 16
+        let cout = v[b] & 1
+        v[b] = ((v[b] >> 1) | (carry << 7)) & 255
+        carry = cout
+        b = b + 1
+    lsb
+
+// GF(2^128) multiply (GHASH convention): Z = X * Y, R = 0xe1||0^120.
+fn _ghash_mul(x, y) -> list
+    let z = []
+    let v = []
+    let i = 0
+    while i < 16
+        push(z, 0)
+        push(v, y[i])
+        i = i + 1
+    let bit = 0
+    while bit < 128
+        let xb = (x[bit / 8] >> (7 - (bit % 8))) & 1
+        if xb == 1
+            let q = 0
+            while q < 16
+                z[q] = z[q] ^ v[q]
+                q = q + 1
+        let lsb = _gf_rshift1(v)
+        if lsb == 1
+            v[0] = v[0] ^ 0xe1
+        bit = bit + 1
+    z
+
+// Absorb `data` (16-byte blocks, zero-padded) into the running GHASH y under subkey h.
+fn _ghash_absorb(y, h, data) -> list
+    let i = 0
+    while i < len(data)
+        let q = 0
+        while q < 16
+            let bv = 0
+            if (i + q) < len(data)
+                bv = data[i + q]
+            y[q] = y[q] ^ bv
+            q = q + 1
+        y = _ghash_mul(y, h)
+        i = i + 16
+    y
+
+fn _ghash(h, aad, ct) -> list
+    let y = []
+    let i = 0
+    while i < 16
+        push(y, 0)
+        i = i + 1
+    y = _ghash_absorb(y, h, aad)
+    y = _ghash_absorb(y, h, ct)
+    let aad_bits = len(aad) * 8
+    let ct_bits = len(ct) * 8
+    let lenblk = []
+    let k = 7
+    while k >= 0
+        push(lenblk, (aad_bits >> (k * 8)) & 255)
+        k = k - 1
+    let k2 = 7
+    while k2 >= 0
+        push(lenblk, (ct_bits >> (k2 * 8)) & 255)
+        k2 = k2 - 1
+    let q = 0
+    while q < 16
+        y[q] = y[q] ^ lenblk[q]
+        q = q + 1
+    _ghash_mul(y, h)
+
+// GCM counter: increment ONLY the low 32 bits (bytes 12..15) -- distinct from _aes_incr (full 128-bit).
+fn _inc32(ctr)
+    let i = 15
+    let carry = 1
+    while i >= 12 and carry == 1
+        let v = ctr[i] + carry
+        ctr[i] = v & 255
+        if v > 255
+            carry = 1
+        else
+            carry = 0
+        i = i - 1
+
+fn _gcm_ctr(key, j0, data) -> list
+    let ctr = []
+    let i = 0
+    while i < 16
+        push(ctr, j0[i])
+        i = i + 1
+    _inc32(ctr)
+    let out = []
+    let p = 0
+    while p < len(data)
+        let ks = aes_encrypt_block(ctr, key)
+        let j = 0
+        while j < 16 and (p + j) < len(data)
+            push(out, data[p + j] ^ ks[j])
+            j = j + 1
+        _inc32(ctr)
+        p = p + 16
+    out
+
+fn _gcm_j0(iv12) -> list
+    let j0 = []
+    let k = 0
+    while k < 12
+        push(j0, iv12[k])
+        k = k + 1
+    push(j0, 0)
+    push(j0, 0)
+    push(j0, 0)
+    push(j0, 1)
+    j0
+
+fn _gcm_tag(key, h, j0, aad, ct) -> list
+    let s = _ghash(h, aad, ct)
+    let ej0 = aes_encrypt_block(j0, key)
+    let tag = []
+    let t = 0
+    while t < 16
+        push(tag, s[t] ^ ej0[t])
+        t = t + 1
+    tag
+
+// Encrypt with a 12-byte IV -> [ciphertext, tag(16)].
+fn aes_gcm_encrypt(key, iv12, plaintext, aad) -> any
+    let zero16 = []
+    let i = 0
+    while i < 16
+        push(zero16, 0)
+        i = i + 1
+    let h = aes_encrypt_block(zero16, key)
+    let j0 = _gcm_j0(iv12)
+    let ciphertext = _gcm_ctr(key, j0, plaintext)
+    let out = []
+    push(out, ciphertext)
+    push(out, _gcm_tag(key, h, j0, aad, ciphertext))
+    out
+
+// Decrypt + verify -> [ok(bool), plaintext]. Constant-time-ish tag compare (no early exit).
+fn aes_gcm_decrypt(key, iv12, ciphertext, aad, tag) -> any
+    let zero16 = []
+    let i = 0
+    while i < 16
+        push(zero16, 0)
+        i = i + 1
+    let h = aes_encrypt_block(zero16, key)
+    let j0 = _gcm_j0(iv12)
+    let want = _gcm_tag(key, h, j0, aad, ciphertext)
+    let diff = 0
+    let t = 0
+    while t < 16
+        diff = diff | (want[t] ^ tag[t])
+        t = t + 1
+    let res = []
+    if diff != 0
+        push(res, false)
+        push(res, [])
+        return res
+    push(res, true)
+    push(res, _gcm_ctr(key, j0, ciphertext))
+    res
