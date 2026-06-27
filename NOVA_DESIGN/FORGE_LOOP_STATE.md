@@ -357,3 +357,26 @@ would load a STABLE identity key; the ephemeral X25519 key (the security-critica
 this guarantees. LESSON: the @link extern FFI is the way to add a runtime capability WITHOUT a reconverge.
 Remaining: thin forge-app HTTPS wrapper (handler→forge dispatch); live PG connect; browser-WASM frontend;
 2-node distribution; N>1 parallel scheduler.
+
+---
+## (i) 2026-06-27 — Routed Forge app over HTTPS + adversarial-review hardening (13 findings fixed)
+forge_https.nova: forge_serve_tls_app/_n = the HTTPS analogue of serve_app (same parse_method/path/body +
+dispatch, inside TLS 1.3). Refactored the per-conn core into _tlss_serve_conn; forge_serve_tls_n loops with
+a STABLE cert identity + FRESH ephemeral X25519 per connection (forward secrecy; also closed the stable-cert
+item). Fixed a _hexval flat-symbol clash (forge <-> forge_crypto). Commit caade8a.
+Then ran an adversarial-review workflow (4 dimensions x find->refute, 25 agents): 21 findings, 13 confirmed,
+0 critical. ALL 13 fixed + gated:
+- [HIGH] CSPRNG FAIL-CLOSED: nova_rt_os_random returned a calloc ZERO buffer (+error flag) on entropy
+  failure and no caller checked -> a silent TOTAL break (zero X25519 scalar clamps to the constant 2^254).
+  Now nova_panic on every failure path; one chokepoint fixes all 8 key sites. (2b8d0b4)
+- [HIGH] Slowloris: _tlss_fill bounds every read with a 15s idle deadline via tcp_wait_readable. (2b8d0b4)
+- [MEDIUM] HTTP request REASSEMBLY across TLS records: _tlss_serve_conn accumulates until \r\n\r\n +
+  Content-Length (cap 1MiB/64 records). PROVEN: 40000-byte POST across ~3 records. (2b8d0b4)
+- [MEDIUM/LOW] fd hygiene + loop count: conn + listener always closed; serve_tls_n counts SERVED. (2b8d0b4)
+- [LOW] ClientHello bounds: _tlss_slice clamps, _tlss_parse_ch fully bounds-guarded, handshake rejects a
+  non-32-byte client key before x25519. PROVEN: server survives a malformed CH + still serves. (62fffb7)
+New gates: _forge_https_app_one.sh, _forge_https_post_one.sh (reassembly), _forge_https_malformed_one.sh.
+=> NOVA serves real routed Forge apps over HTTPS, key-secure + adversarially hardened.
+KEY LESSON: the adversarial-review workflow (independent finders per dimension -> refute each finding against
+the real code) caught a genuine HIGH (CSPRNG fail-open) I wrote and was blind to. Worth running on security
+code. Remaining: live PG connect; browser-WASM frontend; 2-node distribution; N>1 parallel scheduler.
