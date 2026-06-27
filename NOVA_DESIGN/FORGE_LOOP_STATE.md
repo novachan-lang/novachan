@@ -850,3 +850,12 @@ re-parses req.raw_path -> all values in order, exact-match, []-if-absent. gate f
 (via build_request). Additive. OVERNIGHT TALLY: 9 forge improvements (6 fixes + open-redirect guard +
 query_all + req_query_all). Framework more complete; safe findings exhausted. Remaining high-value =
 supervised (N>1, WASM carve, live PG/TLS). Continuing incremental safe utilities/regression at measured pace.
+
+---
+## (ak) 2026-06-28 — _pct_encode round-trip audited SOUND -> exposed public url_encode/url_decode (8931364)
+Audit: _pct_encode encodes all non-unreserved bytes as uppercase %XX; _pct_decode reverses byte-safely
+(_fr_hexval lowercases -> accepts uppercase). Round-trip SOUND. Both were private -> apps had no URL-build
+encoder; exposed url_encode(s)=_pct_encode(s) + url_decode(s)=_pct_decode(s,false). gate forge_urlencode_test
+(round-trips space/specials/+/tab/high-bit/control). OVERNIGHT TALLY: 10 forge improvements (6 fixes + 4
+utilities: open-redirect guard, query_all, req_query_all, url_encode/url_decode). Framework steadily more
+complete. Safe surface near-exhausted; remaining high-value = supervised. Measured pace.
