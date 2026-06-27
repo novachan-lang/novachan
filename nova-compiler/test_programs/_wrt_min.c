@@ -61,17 +61,28 @@ i64 nova_rt_str_concat(i64 a, i64 b) {
    growable NovaList + find_tag tag-disambiguation (so len_any/index_get work on lists too). */
 i64 nova_rt_list_create(void) {
     i64* s = (i64*)nv_alloc(24);
-    i64* buf = (i64*)nv_alloc(8 * 64);
+    i64* buf = (i64*)nv_alloc(8 * 8);
     if (!s || !buf) return 0;
-    s[0] = (i64)(usz)buf; s[1] = 0; s[2] = 64;
+    s[0] = (i64)(usz)buf; s[1] = 0; s[2] = 8;
     return (i64)(usz)s;
 }
 i64 nova_rt_list_append(i64 h, i64 e) {
     if (!h) return h;
     i64* s = (i64*)(usz)h;
-    if (s[1] < s[2]) { ((i64*)(usz)s[0])[s[1]] = e; s[1]++; }
+    if (s[1] >= s[2]) {                  /* GROW: double the buffer (bump-copy; old buffer leaks in the bump heap) */
+        i64 ncap = s[2] * 2;
+        i64* nb = (i64*)nv_alloc(8 * (usz)ncap);
+        if (!nb) return h;
+        i64* ob = (i64*)(usz)s[0];
+        for (i64 i = 0; i < s[1]; i++) nb[i] = ob[i];
+        s[0] = (i64)(usz)nb; s[2] = ncap;
+    }
+    ((i64*)(usz)s[0])[s[1]] = e; s[1]++;
     return h;
 }
+/* The compiler emits the no-RC append variant inside loops (no refcount bump). With no RC in the minimal
+   runtime it is just append. (Without this it would be an undefined import -> dummy no-op -> empty list.) */
+i64 nova_rt_list_append_no_rc(i64 h, i64 e) { return nova_rt_list_append(h, e); }
 i64 nova_rt_list_get(i64 h, i64 i) {
     if (!h) return 0;
     i64* s = (i64*)(usz)h;
