@@ -1,6 +1,7 @@
-// Forge X.509 chain verification: build a 2-cert Ed25519 chain (self-signed root -> leaf signed by root)
-// with der_enc + ed25519_sign, then verify it and reject a bad signature, an expired leaf, and a leaf
-// signed by the wrong key. Socketless.
+// Forge X.509 chain verification: build Ed25519 chains (self-signed root -> leaf signed by root) with
+// der_enc + ed25519_sign, then verify them and reject a bad signature, an expired leaf, a leaf signed by
+// the wrong key, AND -- critically -- a CVE-2002-0862 forgery where a non-CA leaf signs a sub-certificate.
+// Socketless.
 import forge_chain
 import forge_crypto
 import forge_x509
@@ -12,7 +13,17 @@ fn _dn(name_str) -> list
     let st = der_enc(49, atv)
     der_enc(48, st)
 
-fn _make_cert(subject_name, issuer_name, subject_pub, signer_sk, nb_str, na_str) -> list
+// basicConstraints cA=TRUE extension, wrapped as the [3] EXPLICIT extensions block. Empty when is_ca=0
+// (cert has no basicConstraints -> cA defaults FALSE -> not a valid issuer).
+fn _exts(is_ca) -> list
+    if is_ca != 1
+        return []
+    let bc_id = der_enc(6, hex_to_blist("551d13"))
+    let bc_val = der_enc(4, der_enc(48, der_enc(1, hex_to_blist("ff"))))
+    let bc_ext = der_enc(48, x_cat(bc_id, bc_val))
+    der_enc(163, der_enc(48, bc_ext))
+
+fn _make_cert(subject_name, issuer_name, subject_pub, signer_sk, nb_str, na_str, is_ca) -> list
     let oid = hex_to_blist("2b6570")
     let alg = der_enc(48, der_enc(6, oid))
     let spki = der_enc(48, x_cat(alg, der_enc(3, x_cat(hex_to_blist("00"), subject_pub))))
@@ -27,6 +38,7 @@ fn _make_cert(subject_name, issuer_name, subject_pub, signer_sk, nb_str, na_str)
     tbsval = x_cat(tbsval, validity)
     tbsval = x_cat(tbsval, subject)
     tbsval = x_cat(tbsval, spki)
+    tbsval = x_cat(tbsval, _exts(is_ca))
     let tbs = der_enc(48, tbsval)
     let sig = ed25519_sign(signer_sk, tbs)
     let sigval = der_enc(3, x_cat(hex_to_blist("00"), sig))
@@ -36,11 +48,15 @@ fn main()
     let root_sk = hex_to_blist("0000000000000000000000000000000000000000000000000000000000000001")
     let leaf_sk = hex_to_blist("0000000000000000000000000000000000000000000000000000000000000002")
     let other_sk = hex_to_blist("0000000000000000000000000000000000000000000000000000000000000003")
+    let inter_sk = hex_to_blist("0000000000000000000000000000000000000000000000000000000000000004")
     let root_pub = ed25519_publickey(root_sk)
     let leaf_pub = ed25519_publickey(leaf_sk)
+    let other_pub = ed25519_publickey(other_sk)
+    let inter_pub = ed25519_publickey(inter_sk)
 
-    let root = _make_cert("Root CA", "Root CA", root_pub, root_sk, "250101000000Z", "350101000000Z")
-    let leaf = _make_cert("leaf", "Root CA", leaf_pub, root_sk, "250101000000Z", "350101000000Z")
+    // root is a CA (cA=TRUE); leaf is an end-entity (cA=FALSE)
+    let root = _make_cert("Root CA", "Root CA", root_pub, root_sk, "250101000000Z", "350101000000Z", 1)
+    let leaf = _make_cert("leaf", "Root CA", leaf_pub, root_sk, "250101000000Z", "350101000000Z", 0)
 
     let chain = []
     push(chain, leaf)
@@ -64,7 +80,7 @@ fn main()
         exit(1)
 
     // expired leaf (notBefore > notAfter)
-    let exleaf = _make_cert("leaf", "Root CA", leaf_pub, root_sk, "350101000000Z", "250101000000Z")
+    let exleaf = _make_cert("leaf", "Root CA", leaf_pub, root_sk, "350101000000Z", "250101000000Z", 0)
     let exchain = []
     push(exchain, exleaf)
     push(exchain, root)
@@ -73,7 +89,7 @@ fn main()
         exit(1)
 
     // wrong issuer: leaf signed by other_sk, not the root
-    let wleaf = _make_cert("leaf", "Root CA", leaf_pub, other_sk, "250101000000Z", "350101000000Z")
+    let wleaf = _make_cert("leaf", "Root CA", leaf_pub, other_sk, "250101000000Z", "350101000000Z", 0)
     let wchain = []
     push(wchain, wleaf)
     push(wchain, root)
@@ -81,4 +97,28 @@ fn main()
         print("FAIL: wrong-issuer leaf accepted")
         exit(1)
 
-    print("PASS forge_chain (2-cert Ed25519 chain verify + bad-sig/expiry/wrong-issuer rejection)")
+    // CVE-2002-0862 FORGERY: an ordinary end-entity leaf (cA=FALSE) under the trusted root signs a forged
+    // sub-certificate for victim.com. The chain links + signatures all verify; ONLY the basicConstraints
+    // cA check rejects it (the attacker leaf is not a CA). Must be rejected.
+    let attacker = _make_cert("Attacker", "Root CA", leaf_pub, root_sk, "250101000000Z", "350101000000Z", 0)
+    let forged = _make_cert("victim.com", "Attacker", other_pub, leaf_sk, "250101000000Z", "350101000000Z", 0)
+    let fchain = []
+    push(fchain, forged)
+    push(fchain, attacker)
+    push(fchain, root)
+    if chain_verify(fchain, root) != 0
+        print("FAIL: CVE-2002-0862 forgery accepted (non-CA leaf signed a sub-cert)")
+        exit(1)
+
+    // positive control: a legitimate 3-cert chain through a real intermediate CA (cA=TRUE) must still pass.
+    let inter = _make_cert("Intermediate CA", "Root CA", inter_pub, root_sk, "250101000000Z", "350101000000Z", 1)
+    let leaf3 = _make_cert("leaf", "Intermediate CA", leaf_pub, inter_sk, "250101000000Z", "350101000000Z", 0)
+    let chain3 = []
+    push(chain3, leaf3)
+    push(chain3, inter)
+    push(chain3, root)
+    if chain_verify(chain3, root) != 1
+        print("FAIL: valid 3-cert CA chain rejected")
+        exit(1)
+
+    print("PASS forge_chain (Ed25519 chain verify + bad-sig/expiry/wrong-issuer + CVE-2002-0862 forgery rejection + 3-cert CA chain)")
