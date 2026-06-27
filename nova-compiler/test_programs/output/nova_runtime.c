@@ -13412,7 +13412,15 @@ int64_t nova_rt_index_get(int64_t obj, int64_t index) {
     if (tag == NOVA_MEM_BYTES) {
         return nova_rt_bytes_get(obj, index);  /* size-bounded; else str_char_at would strlen the struct (wild read) */
     }
-    return nova_rt_str_char_at(obj, index);
+    /* SOUNDNESS: only a genuine string may reach str_char_at. A non-container value (bare int/float/bool --
+       e.g. json_decode("5") then m["k"], or a malformed network message indexed as msg["type"]) would
+       otherwise be dereferenced as a char* -> wild read / segfault. Return 0 (null) for a non-indexable
+       value, consistent with dict_get's missing-key result. nova_is_readable_str is the hardened gate
+       (bare ints < 0x10000 and non-string-tagged addresses both fail it). */
+    if (nova_is_readable_str(ptr)) {
+        return nova_rt_str_char_at(obj, index);
+    }
+    return 0;
 }
 
 int64_t nova_rt_slice_any(int64_t obj, int64_t start, int64_t end) {
@@ -13424,7 +13432,12 @@ int64_t nova_rt_slice_any(int64_t obj, int64_t start, int64_t end) {
     if (tag == NOVA_MEM_BYTES) {
         return nova_rt_bytes_slice(obj, start, end);  /* size-bounded; else nova_rt_slice would strlen the struct */
     }
-    return nova_rt_slice(obj, start, end);
+    /* SOUNDNESS: only a genuine string may reach nova_rt_slice; a non-sliceable value (bare int/float/bool)
+       would otherwise be dereferenced as a char* -> wild read. Return 0 (null) for a non-sliceable value. */
+    if (nova_is_readable_str(ptr)) {
+        return nova_rt_slice(obj, start, end);
+    }
+    return 0;
 }
 
 int64_t nova_rt_float_bits(int64_t str_val) {
