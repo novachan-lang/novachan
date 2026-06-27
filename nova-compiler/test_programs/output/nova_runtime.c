@@ -2358,6 +2358,7 @@ static inline uint64_t nova_dict_hash_key(const char* s) {
 }
 
 int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;  /* SOUNDNESS: non-dict handle -> no-op, no wild deref */
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
@@ -2430,6 +2431,7 @@ int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
 }
 
 int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;  /* SOUNDNESS: non-dict handle -> 0, no wild deref */
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
@@ -2461,6 +2463,7 @@ int64_t nova_rt_dict_set_bbox(int64_t handle, int64_t key, int64_t v) {
 }
 
 int64_t nova_rt_dict_has(int64_t handle, int64_t key) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;  /* SOUNDNESS: non-dict handle -> not found, no wild deref */
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
     const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
