@@ -2313,6 +2313,9 @@ int64_t nova_rt_contains(int64_t container, int64_t item) {
        (needle would be the struct), returns 0 safely. */
     if (tag == NOVA_MEM_BYTES) return 0;
     if (nova_mem_find_tag((void*)(uintptr_t)item) == NOVA_MEM_BYTES) return 0;
+    /* SOUNDNESS: string containment requires BOTH operands to be genuine strings; a non-string container or
+       needle (bare int/float/bool) would be strstr'd as a char* -> wild read. */
+    if (!nova_is_readable_str(ptr) || !nova_is_readable_str((void*)(uintptr_t)item)) return 0;
     // String containment: strstr
     const char* haystack = (const char*)ptr;
     const char* needle = (const char*)(uintptr_t)item;
@@ -11763,6 +11766,7 @@ int64_t nova_rt_sum(int64_t handle) {
 }
 
 int64_t nova_rt_index_of(int64_t handle, int64_t item) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return -1;  /* SOUNDNESS: non-list -> not found, no wild deref */
     nova_list_deopt(handle);  /* S4.2 */
     NovaList* l = (NovaList*)(uintptr_t)handle;
     if (!l) return -1;
