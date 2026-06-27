@@ -55,3 +55,31 @@ i64 nova_rt_str_concat(i64 a, i64 b) {
     d[tot] = '\0';
     return (i64)(usz)d;
 }
+
+/* NovaList = { i64 data; i64 size; i64 cap }; the compiler reads list size INLINE at handle+8 (so the
+   fields are i64-wide). Fixed cap (no grow) is enough for demo lists; the real port uses nova_runtime.c's
+   growable NovaList + find_tag tag-disambiguation (so len_any/index_get work on lists too). */
+i64 nova_rt_list_create(void) {
+    i64* s = (i64*)nv_alloc(24);
+    i64* buf = (i64*)nv_alloc(8 * 64);
+    if (!s || !buf) return 0;
+    s[0] = (i64)(usz)buf; s[1] = 0; s[2] = 64;
+    return (i64)(usz)s;
+}
+i64 nova_rt_list_append(i64 h, i64 e) {
+    if (!h) return h;
+    i64* s = (i64*)(usz)h;
+    if (s[1] < s[2]) { ((i64*)(usz)s[0])[s[1]] = e; s[1]++; }
+    return h;
+}
+i64 nova_rt_list_get(i64 h, i64 i) {
+    if (!h) return 0;
+    i64* s = (i64*)(usz)h;
+    if (i < 0 || i >= s[1]) return 0;
+    return ((i64*)(usz)s[0])[i];
+}
+i64 nova_rt_list_free_local(i64 h) { (void)h; return 0; }   /* bump heap -> no-op */
+
+/* Minimal dynamic add: raw-int addition (the demo's list elements are ints). The real nova_rt_add
+   discriminates int/float/string via find_tag. */
+i64 nova_rt_add(i64 a, i64 b) { return a + b; }
