@@ -776,3 +776,247 @@ fn chacha20(key, nonce, counter: int, data) -> list
         ctr = (ctr + 1) & 4294967295
         i = i + 64
     out
+
+// ── Poly1305 MAC (RFC 8439) -- a tiny base-2^16 limb bigint with mod (2^130 - 5) ─────────────────────
+// Numbers are little-endian lists of 16-bit limbs. Helpers prefixed _p_.
+fn _p_norm(x) -> list
+    let out = []
+    let carry = 0
+    let i = 0
+    while i < len(x)
+        let v = x[i] + carry
+        push(out, v & 65535)
+        carry = v >> 16
+        i = i + 1
+    while carry > 0
+        push(out, carry & 65535)
+        carry = carry >> 16
+    out
+
+fn _p_add(a, b) -> list
+    let n = len(a)
+    if len(b) > n
+        n = len(b)
+    let out = []
+    let carry = 0
+    let i = 0
+    while i < n
+        let av = 0
+        if i < len(a)
+            av = a[i]
+        let bv = 0
+        if i < len(b)
+            bv = b[i]
+        let v = av + bv + carry
+        push(out, v & 65535)
+        carry = v >> 16
+        i = i + 1
+    while carry > 0
+        push(out, carry & 65535)
+        carry = carry >> 16
+    out
+
+fn _p_mul(a, b) -> list
+    let out = []
+    let z = 0
+    while z < len(a) + len(b) + 2
+        push(out, 0)
+        z = z + 1
+    let ia = 0
+    while ia < len(a)
+        let carry = 0
+        let ib = 0
+        while ib < len(b)
+            let v = out[ia + ib] + a[ia] * b[ib] + carry
+            out[ia + ib] = v & 65535
+            carry = v >> 16
+            ib = ib + 1
+        let k = ia + len(b)
+        while carry > 0
+            let v2 = out[k] + carry
+            out[k] = v2 & 65535
+            carry = v2 >> 16
+            k = k + 1
+        ia = ia + 1
+    out
+
+fn _p_mul_small(a, d: int) -> list
+    let out = []
+    let carry = 0
+    let i = 0
+    while i < len(a)
+        let v = a[i] * d + carry
+        push(out, v & 65535)
+        carry = v >> 16
+        i = i + 1
+    while carry > 0
+        push(out, carry & 65535)
+        carry = carry >> 16
+    out
+
+fn _p_cmp(a, b) -> int
+    let n = len(a)
+    if len(b) > n
+        n = len(b)
+    let i = n - 1
+    while i >= 0
+        let av = 0
+        if i < len(a)
+            av = a[i]
+        let bv = 0
+        if i < len(b)
+            bv = b[i]
+        if av > bv
+            return 1
+        if av < bv
+            return 0 - 1
+        i = i - 1
+    0
+
+fn _p_sub(a, b) -> list
+    let out = []
+    let borrow = 0
+    let i = 0
+    while i < len(a)
+        let av = a[i]
+        let bv = 0
+        if i < len(b)
+            bv = b[i]
+        let v = av - bv - borrow
+        if v < 0
+            v = v + 65536
+            borrow = 1
+        else
+            borrow = 0
+        push(out, v & 65535)
+        i = i + 1
+    out
+
+fn _p_is_nonzero(x) -> int
+    let i = 0
+    while i < len(x)
+        if x[i] != 0
+            return 1
+        i = i + 1
+    0
+
+// x >> 130  =  drop 8 limbs (128 bits) then shift right 2 bits
+fn _p_shr130(x) -> list
+    let t = []
+    let i = 8
+    while i < len(x)
+        push(t, x[i])
+        i = i + 1
+    if len(t) == 0
+        push(t, 0)
+    let out = []
+    let j = 0
+    while j < len(t)
+        let nxt = 0
+        if j + 1 < len(t)
+            nxt = t[j + 1]
+        push(out, ((t[j] >> 2) | ((nxt & 3) << 14)) & 65535)
+        j = j + 1
+    out
+
+// x mod 2^130  =  limbs 0..7 plus the low 2 bits of limb 8
+fn _p_low130(x) -> list
+    let out = []
+    let i = 0
+    while i < 8
+        let v = 0
+        if i < len(x)
+            v = x[i]
+        push(out, v)
+        i = i + 1
+    let l8 = 0
+    if 8 < len(x)
+        l8 = x[8] & 3
+    push(out, l8)
+    out
+
+// p = 2^130 - 5 = [0xfffb, 0xffff x7, 3]
+fn _p_const_p() -> list
+    let p = []
+    push(p, 65531)
+    let i = 0
+    while i < 7
+        push(p, 65535)
+        i = i + 1
+    push(p, 3)
+    p
+
+fn _p_mod(x) -> list
+    let v = _p_norm(x)
+    let high = _p_shr130(v)
+    while _p_is_nonzero(high) == 1
+        let low = _p_low130(v)
+        v = _p_norm(_p_add(low, _p_mul_small(high, 5)))
+        high = _p_shr130(v)
+    if _p_cmp(v, _p_const_p()) >= 0
+        v = _p_sub(v, _p_const_p())
+    v
+
+fn _p_from_bytes(b, n: int) -> list
+    let out = []
+    let i = 0
+    while i < n
+        let lo = b[i]
+        let hi = 0
+        if i + 1 < n
+            hi = b[i + 1]
+        push(out, (lo | (hi << 8)) & 65535)
+        i = i + 2
+    if len(out) == 0
+        push(out, 0)
+    out
+
+fn _p_to_bytes16(x) -> list
+    let out = []
+    let i = 0
+    while i < 16
+        let limb = 0
+        let li = i / 2
+        if li < len(x)
+            limb = x[li]
+        if (i & 1) == 0
+            push(out, limb & 255)
+        else
+            push(out, (limb >> 8) & 255)
+        i = i + 1
+    out
+
+// poly1305_mac(key32, msg) -> 16-byte tag
+fn poly1305_mac(key, msg) -> list
+    let rbytes = []
+    let i = 0
+    while i < 16
+        push(rbytes, key[i])
+        i = i + 1
+    rbytes[3] = rbytes[3] & 15
+    rbytes[7] = rbytes[7] & 15
+    rbytes[11] = rbytes[11] & 15
+    rbytes[15] = rbytes[15] & 15
+    rbytes[4] = rbytes[4] & 252
+    rbytes[8] = rbytes[8] & 252
+    rbytes[12] = rbytes[12] & 252
+    let r = _p_from_bytes(rbytes, 16)
+    let acc = [0]
+    let off = 0
+    while off < len(msg)
+        let blk = []
+        let n = 0
+        while n < 16 and (off + n) < len(msg)
+            push(blk, msg[off + n])
+            n = n + 1
+        push(blk, 1)
+        let num = _p_from_bytes(blk, len(blk))
+        acc = _p_mod(_p_mul(_p_add(acc, num), r))
+        off = off + 16
+    let sbytes = []
+    let j = 16
+    while j < 32
+        push(sbytes, key[j])
+        j = j + 1
+    let s = _p_from_bytes(sbytes, 16)
+    _p_to_bytes16(_p_add(acc, s))
