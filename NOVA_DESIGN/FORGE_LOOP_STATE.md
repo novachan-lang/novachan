@@ -508,3 +508,22 @@ Guard = nova-compiler/test_programs/index_soundness_test.nova; NO reconverge thr
 (forge_router/forge_https_app/cluster_test) green at every step. Detail in [[project-int-pointer-soundness]].
 NEXT (big remaining items): browser-WASM frontend (WASM is a no-op stub -- NOVA's "build anything" needs a
 real frontend codegen); N>1 parallel scheduler (races open). Workflow session limit resets ~22:10 IST.
+
+---
+## (p) 2026-06-27 — WASM FRONTEND: NOVA -> real WebAssembly (compute subset), runs in node V8 (commit ceac8a6)
+The "WASM frontend" was absent (only a runtime wasm-module LOADER existed). But NOVA emits LLVM IR, and for
+the NATIVE-COMPUTE subset (fns the type-specializer lowers to native i64/f64 ops, no nova_rt_* calls) that IR
+compiles straight to wasm32 via `clang --target=wasm32` (verified: clang here HAS the wasm target + wasm-ld)
+and runs in node's WASM engine (V8 = browser engine). PROVEN _wasm_one.sh: wasm_demo.nova
+(nova_add/nova_mul/nova_poly=x*x+x+1) -> wasm_demo.wasm (\0asm magic) -> node computes 5/20/43 correctly.
+KEY INSIGHT: the wasm-compatible subset = fns that SPECIALIZE to native ops. A fn with no call site (or no
+type annotation) stays dynamic (nova_rt_mul) -> dummy import in wasm -> wrong result; a call site / annotation
+makes it native -> wasm-correct. Pipeline: gen3 .nova->.ll ; clang --target=wasm32 -nostdlib -Wl,--no-entry
+-Wl,--export-all -Wl,--allow-undefined .ll -> .wasm ; node instantiates (dummy imports for the unused
+nova_rt_* refs) + calls the exported fn (i64<->BigInt).
+HONEST SCOPE: pure scalar compute works end-to-end NOW. Strings/lists/dicts/IO need a WASM PORT of
+nova_runtime.c's core (nova_heap_alloc + the value-model ops ARE wasm-compatible C; the BLOCKERS are
+sockets/threads/Win32/file-IO/fibers). That port = the next real WASM milestone: build a wasm-targeted
+nova_runtime (bump allocator or wasi-libc malloc; stub the non-wasm parts) so a NOVA fn using a string/list
+compiles + runs in wasm. Tools present: clang wasm32, wasm-ld, node v20. (Corrects the audit's "WASM is a
+no-op stub" -- the frontend now produces REAL wasm for compute.)
