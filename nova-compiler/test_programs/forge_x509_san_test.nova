@@ -1,0 +1,78 @@
+// Forge X.509 hostname verification (RFC 6125): build certs carrying a SubjectAltName and check
+// x509_matches_host for exact names, leftmost-label wildcards, non-matches, and the modern rule that a
+// cert with NO SAN does not match by subject CN. Socketless, deterministic.
+import forge_x509
+import forge_crypto
+
+fn _dn(name_str) -> list
+    let cn = der_enc(6, hex_to_blist("550403"))
+    let val = der_enc(19, str_to_blist(name_str))
+    let atv = der_enc(48, x_cat(cn, val))
+    let st = der_enc(49, atv)
+    der_enc(48, st)
+
+// one dNSName GeneralName: [2] IMPLICIT IA5String (tag 0x82 = 130)
+fn _dns(name_str) -> list
+    der_enc(130, str_to_blist(name_str))
+
+// build a minimal Certificate whose tbs carries `exts` (the [3] EXPLICIT extensions bytes, or [] for none).
+// Only the structure matters here -- x509_matches_host parses, it does not verify the signature.
+fn _cert(exts) -> list
+    let alg = der_enc(48, der_enc(6, hex_to_blist("2b6570")))
+    let pub = []
+    let i = 0
+    while i < 32
+        push(pub, 0)
+        i = i + 1
+    let spki = der_enc(48, x_cat(alg, der_enc(3, x_cat(hex_to_blist("00"), pub))))
+    let version = der_enc(160, der_enc(2, hex_to_blist("02")))
+    let serial = der_enc(2, hex_to_blist("01"))
+    let issuer = _dn("Test CA")
+    let validity = der_enc(48, x_cat(der_enc(23, str_to_blist("250101000000Z")), der_enc(23, str_to_blist("350101000000Z"))))
+    let subject = _dn("host.example.com")
+    let tbsval = x_cat(version, serial)
+    tbsval = x_cat(tbsval, alg)
+    tbsval = x_cat(tbsval, issuer)
+    tbsval = x_cat(tbsval, validity)
+    tbsval = x_cat(tbsval, subject)
+    tbsval = x_cat(tbsval, spki)
+    tbsval = x_cat(tbsval, exts)
+    let tbs = der_enc(48, tbsval)
+    let sig = der_enc(3, hex_to_blist("00"))
+    der_enc(48, x_cat(x_cat(tbs, alg), sig))
+
+// the [3] EXPLICIT extensions block holding one subjectAltName (OID 55 1d 11) with the given GeneralNames
+fn _san_exts(gnames) -> list
+    let san_oid = der_enc(6, hex_to_blist("551d11"))
+    let san_ext = der_enc(48, x_cat(san_oid, der_enc(4, der_enc(48, gnames))))
+    der_enc(163, der_enc(48, san_ext))
+
+fn _expect(cert, host_str, want) -> int
+    if x509_matches_host(cert, str_to_blist(host_str)) != want
+        print("FAIL: host " + host_str + " expected " + str(want))
+        exit(1)
+    1
+
+fn main()
+    // cert with SAN: example.com + *.example.com
+    let names = x_cat(_dns("example.com"), _dns("*.example.com"))
+    let cert = _cert(_san_exts(names))
+
+    _expect(cert, "example.com", 1)           // exact
+    _expect(cert, "EXAMPLE.COM", 1)           // case-insensitive
+    _expect(cert, "a.example.com", 1)         // wildcard, one label
+    _expect(cert, "a.b.example.com", 0)       // wildcard must not span two labels
+    _expect(cert, "example.com.evil.com", 0)  // suffix-injection
+    _expect(cert, "notexample.com", 0)        // not a label boundary
+    _expect(cert, "example.org", 0)           // different domain
+
+    // wildcard alone must not match the bare suffix, but must match a single label
+    let wcert = _cert(_san_exts(_dns("*.example.com")))
+    _expect(wcert, "example.com", 0)
+    _expect(wcert, "host.example.com", 1)
+
+    // CN-only cert (no SAN at all) must NOT match by subject CN (modern RFC 6125 rule)
+    let cn_only = _cert([])
+    _expect(cn_only, "host.example.com", 0)
+
+    print("PASS forge_x509_san (SAN exact + case-insensitive + leftmost-label wildcard + non-match + CN-only rejected)")
