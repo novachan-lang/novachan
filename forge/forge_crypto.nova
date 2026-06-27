@@ -1497,3 +1497,295 @@ fn x25519(scalar, u_bytes) -> list
         z2 = z3
         z3 = tmp2
     _f_encode(_f_mul(x2, _f_invert(z2)))
+
+// ── Ed25519 (RFC 8032) -- reuses _f_* field arithmetic + sha512_bytes ────────────────────────────────
+// generic field exponentiation a^e mod p, e = limb list scanned MSB-first over nbits bits.
+fn _f_pow(a, e, nbits: int) -> list
+    let result = _f_small(1)
+    let i = nbits - 1
+    while i >= 0
+        result = _f_reduce(_p_mul(result, result))
+        let bit = (e[i / 16] >> (i & 15)) & 1
+        if bit == 1
+            result = _f_reduce(_p_mul(result, a))
+        i = i - 1
+    result
+
+fn _f_is_zero(a) -> int
+    let v = _f_freeze(a)
+    if _p_is_nonzero(v) == 1
+        return 0
+    1
+
+// (p-1)/4 = 2^253 - 5  (exponent for sqrt(-1) = 2^((p-1)/4))
+fn _ed_pm1_4() -> list
+    let e = []
+    push(e, 65531)
+    let i = 0
+    while i < 14
+        push(e, 65535)
+        i = i + 1
+    push(e, 8191)
+    e
+
+// (p-5)/8 = 2^252 - 3  (exponent for the curve25519 sqrt)
+fn _ed_pm5_8() -> list
+    let e = []
+    push(e, 65533)
+    let i = 0
+    while i < 14
+        push(e, 65535)
+        i = i + 1
+    push(e, 4095)
+    e
+
+// group order L = 2^252 + 27742317777372353535851937790883648493
+fn _ed_const_L() -> list
+    let l = []
+    push(l, 54253)
+    push(l, 23797)
+    push(l, 25370)
+    push(l, 22546)
+    push(l, 40150)
+    push(l, 41719)
+    push(l, 63966)
+    push(l, 5342)
+    push(l, 0)
+    push(l, 0)
+    push(l, 0)
+    push(l, 0)
+    push(l, 0)
+    push(l, 0)
+    push(l, 0)
+    push(l, 4096)
+    l
+
+fn _shl1(a) -> list
+    let out = []
+    let carry = 0
+    let i = 0
+    while i < len(a)
+        let v = (a[i] << 1) | carry
+        push(out, v & 65535)
+        carry = (v >> 16) & 1
+        i = i + 1
+    if carry == 1
+        push(out, 1)
+    out
+
+// reduce a limb list mod L by binary long division (result < L, 16 limbs)
+fn _ed_mod_L(x) -> list
+    let lcon = _ed_const_L()
+    let xn = _p_norm(x)
+    let nbits = len(xn) * 16
+    let rem = []
+    push(rem, 0)
+    let i = nbits - 1
+    while i >= 0
+        rem = _shl1(rem)
+        let bit = (xn[i / 16] >> (i & 15)) & 1
+        if bit == 1
+            rem[0] = rem[0] | 1
+        if _p_cmp(rem, lcon) >= 0
+            rem = _p_sub(rem, lcon)
+        i = i - 1
+    while len(rem) < 16
+        push(rem, 0)
+    rem
+
+fn _ed_identity() -> list
+    let p = []
+    push(p, _f_small(0))
+    push(p, _f_small(1))
+    push(p, _f_small(1))
+    push(p, _f_small(0))
+    p
+
+// twisted-Edwards add (a=-1, add-2008-hwcd-3); complete, so also used for doubling. d2 = 2*d.
+fn _ed_add(p1, p2, d2) -> list
+    let aa = _f_mul(_f_sub(p1[1], p1[0]), _f_sub(p2[1], p2[0]))
+    let bb = _f_mul(_f_add(p1[1], p1[0]), _f_add(p2[1], p2[0]))
+    let cc = _f_mul(_f_mul(p1[3], d2), p2[3])
+    let dd = _f_mul(_f_mul(p1[2], _f_small(2)), p2[2])
+    let e = _f_sub(bb, aa)
+    let f = _f_sub(dd, cc)
+    let g = _f_add(dd, cc)
+    let h = _f_add(bb, aa)
+    let r = []
+    push(r, _f_mul(e, f))
+    push(r, _f_mul(g, h))
+    push(r, _f_mul(f, g))
+    push(r, _f_mul(e, h))
+    r
+
+fn _ed_scalarmult(sbytes, point, d2) -> list
+    let q = _ed_identity()
+    let i = 255
+    while i >= 0
+        q = _ed_add(q, q, d2)
+        let bit = (sbytes[i / 8] >> (i & 7)) & 1
+        if bit == 1
+            q = _ed_add(q, point, d2)
+        i = i - 1
+    q
+
+// recover x from y given the sign bit (RFC 8032 decompression)
+fn _ed_recover_x(y, sign: int, d, sqrtm1) -> list
+    let y2 = _f_sqr(y)
+    let u = _f_sub(y2, _f_small(1))
+    let v = _f_add(_f_mul(d, y2), _f_small(1))
+    let v2 = _f_sqr(v)
+    let v3 = _f_mul(v2, v)
+    let v6 = _f_sqr(v3)
+    let v7 = _f_mul(v6, v)
+    let uv7 = _f_mul(u, v7)
+    let pw = _f_pow(uv7, _ed_pm5_8(), 252)
+    let x = _f_mul(_f_mul(u, v3), pw)
+    let vx2 = _f_mul(v, _f_sqr(x))
+    if _f_is_zero(_f_sub(vx2, u)) == 0
+        if _f_is_zero(_f_add(vx2, u)) == 1
+            x = _f_mul(x, sqrtm1)
+        else
+            x = _f_small(0)
+    let xf = _f_freeze(x)
+    if (xf[0] & 1) != sign
+        xf = _f_freeze(_f_sub(_f_small(0), xf))
+    xf
+
+fn _ed_encode(point) -> list
+    let zinv = _f_invert(point[2])
+    let x = _f_mul(point[0], zinv)
+    let y = _f_mul(point[1], zinv)
+    let out = _f_encode(y)
+    let xf = _f_freeze(x)
+    out[31] = out[31] | ((xf[0] & 1) << 7)
+    out
+
+fn _ed_decode(b, d, sqrtm1) -> list
+    let sign = (b[31] >> 7) & 1
+    let yb = []
+    let i = 0
+    while i < 32
+        push(yb, b[i])
+        i = i + 1
+    yb[31] = yb[31] & 127
+    let y = _f_decode(yb)
+    let x = _ed_recover_x(y, sign, d, sqrtm1)
+    let p = []
+    push(p, x)
+    push(p, y)
+    push(p, _f_small(1))
+    push(p, _f_mul(x, y))
+    p
+
+// returns [d, d2, sqrtm1, basepoint]
+fn _ed_setup() -> list
+    let sqrtm1 = _f_pow(_f_small(2), _ed_pm1_4(), 253)
+    let d = _f_mul(_f_sub(_f_small(0), _f_small(121665)), _f_invert(_f_small(121666)))
+    let d2 = _f_add(d, d)
+    let by = _f_mul(_f_small(4), _f_invert(_f_small(5)))
+    let bx = _ed_recover_x(by, 0, d, sqrtm1)
+    let b = []
+    push(b, bx)
+    push(b, by)
+    push(b, _f_small(1))
+    push(b, _f_mul(bx, by))
+    let s = []
+    push(s, d)
+    push(s, d2)
+    push(s, sqrtm1)
+    push(s, b)
+    s
+
+fn _concat(a, b) -> list
+    let o = []
+    let i = 0
+    while i < len(a)
+        push(o, a[i])
+        i = i + 1
+    let j = 0
+    while j < len(b)
+        push(o, b[j])
+        j = j + 1
+    o
+
+fn _bytes_to_limbs(b, n: int) -> list
+    let f = []
+    let j = 0
+    while j < n
+        push(f, b[j] | (b[j + 1] << 8))
+        j = j + 2
+    f
+
+fn _limbs_to_bytes32(v) -> list
+    let out = []
+    let i = 0
+    while i < 16
+        let limb = 0
+        if i < len(v)
+            limb = v[i]
+        push(out, limb & 255)
+        push(out, (limb >> 8) & 255)
+        i = i + 1
+    out
+
+fn _ed_clamp_scalar(h) -> list
+    let ab = []
+    let i = 0
+    while i < 32
+        push(ab, h[i])
+        i = i + 1
+    ab[0] = ab[0] & 248
+    ab[31] = ab[31] & 127
+    ab[31] = ab[31] | 64
+    ab
+
+fn ed25519_publickey(sk) -> list
+    let setup = _ed_setup()
+    let ab = _ed_clamp_scalar(sha512_bytes(sk))
+    _ed_encode(_ed_scalarmult(ab, setup[3], setup[1]))
+
+fn ed25519_sign(sk, msg) -> list
+    let setup = _ed_setup()
+    let d2 = setup[1]
+    let bp = setup[3]
+    let h = sha512_bytes(sk)
+    let ab = _ed_clamp_scalar(h)
+    let a = _bytes_to_limbs(ab, 32)
+    let prefix = []
+    let j = 32
+    while j < 64
+        push(prefix, h[j])
+        j = j + 1
+    let aenc = _ed_encode(_ed_scalarmult(ab, bp, d2))
+    let r = _ed_mod_L(_bytes_to_limbs(sha512_bytes(_concat(prefix, msg)), 64))
+    let renc = _ed_encode(_ed_scalarmult(_limbs_to_bytes32(r), bp, d2))
+    let k = _ed_mod_L(_bytes_to_limbs(sha512_bytes(_concat(_concat(renc, aenc), msg)), 64))
+    let s = _ed_mod_L(_p_add(_p_mul(k, a), r))
+    _concat(renc, _limbs_to_bytes32(s))
+
+fn ed25519_verify(pubkey, msg, sig) -> int
+    let setup = _ed_setup()
+    let d = setup[0]
+    let d2 = setup[1]
+    let sqrtm1 = setup[2]
+    let bp = setup[3]
+    let renc = []
+    let i = 0
+    while i < 32
+        push(renc, sig[i])
+        i = i + 1
+    let sb = []
+    let j = 32
+    while j < 64
+        push(sb, sig[j])
+        j = j + 1
+    let k = _ed_mod_L(_bytes_to_limbs(sha512_bytes(_concat(_concat(renc, pubkey), msg)), 64))
+    let lhs = _ed_scalarmult(sb, bp, d2)
+    let apt = _ed_decode(pubkey, d, sqrtm1)
+    let ka = _ed_scalarmult(_limbs_to_bytes32(k), apt, d2)
+    let rpt = _ed_decode(renc, d, sqrtm1)
+    let rhs = _ed_add(rpt, ka, d2)
+    if hex_of(_ed_encode(lhs)) == hex_of(_ed_encode(rhs))
+        return 1
+    0
