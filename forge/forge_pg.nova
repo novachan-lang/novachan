@@ -7,6 +7,8 @@
 
 // Big-endian int32 / int16 (PG is big-endian on the wire). Lengths are non-negative; the NULL marker (-1)
 // is emitted as four 0xFF bytes by the wire and read back as 0xFFFFFFFF, handled on parse.
+import forge_crypto
+
 fn pg_be32(n: int) -> any
     let b = bytes(0)
     b = bytes_append(b, (n / 16777216) % 256)
@@ -99,3 +101,64 @@ fn pg_parse_data_row(b, off: int) -> any
             p = p + vlen
         i = i + 1
     vals
+
+// ── SCRAM-SHA-256 client (RFC 5802 / RFC 7677), pure-NOVA via forge_crypto ─────────────────────────
+// The auth handshake Postgres uses by default. All pure computation (no socket): given the user, the
+// password, the client nonce, and the server-first message, produce the client-final message (with the
+// ClientProof) and the expected ServerSignature (to verify the server-final). gs2 header "n,," -> "biws".
+
+fn pg_scram_client_first(user: string, cnonce: string) -> string
+    "n,,n=" + user + ",r=" + cnonce
+
+// Parse "r=<rnonce>,s=<b64salt>,i=<iter>" -> [rnonce, salt_b64, iter].
+fn _pg_scram_parse_sf(sf: string) -> any
+    let parts = split(sf, ",")
+    let rnonce = ""
+    let salt_b64 = ""
+    let iter = 0
+    let i = 0
+    while i < len(parts)
+        let p = parts[i]
+        if len(p) >= 2
+            let tag = slice(p, 0, 2)
+            let val = slice(p, 2, len(p))
+            if tag == "r="
+                rnonce = val
+            else if tag == "s="
+                salt_b64 = val
+            else if tag == "i="
+                iter = parse_int(val)
+        i = i + 1
+    let out = []
+    push(out, rnonce)
+    push(out, salt_b64)
+    push(out, iter)
+    out
+
+// Finish the exchange: returns [client_final_message, expected_server_signature_b64]. The caller sends
+// out[0] and checks the server-final "v=" against out[1].
+fn pg_scram_finish(user: string, password: string, cnonce: string, server_first: string) -> any
+    let sf = _pg_scram_parse_sf(server_first)
+    let rnonce = sf[0]
+    let salt = b64_decode_blist(sf[1])
+    let iter = sf[2]
+    let client_first_bare = "n=" + user + ",r=" + cnonce
+    let client_final_noproof = "c=biws,r=" + rnonce
+    let auth_message = client_first_bare + "," + server_first + "," + client_final_noproof
+    let am = str_to_blist(auth_message)
+    let salted = pbkdf2_sha256(str_to_blist(password), salt, iter, 32)
+    let client_key = hmac_sha256_bytes(salted, str_to_blist("Client Key"))
+    let stored_key = sha256_bytes(client_key)
+    let client_sig = hmac_sha256_bytes(stored_key, am)
+    let proof = []
+    let j = 0
+    while j < len(client_key)
+        push(proof, client_key[j] ^ client_sig[j])
+        j = j + 1
+    let client_final = client_final_noproof + ",p=" + b64_encode_blist(proof)
+    let server_key = hmac_sha256_bytes(salted, str_to_blist("Server Key"))
+    let server_sig = hmac_sha256_bytes(server_key, am)
+    let out = []
+    push(out, client_final)
+    push(out, b64_encode_blist(server_sig))
+    out
