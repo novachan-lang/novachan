@@ -380,3 +380,31 @@ New gates: _forge_https_app_one.sh, _forge_https_post_one.sh (reassembly), _forg
 KEY LESSON: the adversarial-review workflow (independent finders per dimension -> refute each finding against
 the real code) caught a genuine HIGH (CSPRNG fail-open) I wrote and was blind to. Worth running on security
 code. Remaining: live PG connect; browser-WASM frontend; 2-node distribution; N>1 parallel scheduler.
+
+---
+## (j) 2026-06-27 — 2-node distribution: confirmed working + adversarial review + CORE soundness fixes
+Distribution was already advanced + PROVEN (clusterx.nova: G-Set CRDT membership, gossip, liveness,
+cluster_spawn, cluster_pmap with per-task fault isolation, graceful leave; full suite passes across OS
+processes — 3-node convergence, pmap, leave, 2-node cluster_spawn add=42 on a live peer). Postgres not
+installed, so distribution was the pick. Ran an adversarial review (4 dims, 36 agents): 32 findings, 16
+confirmed, 0 critical. FIXED:
+- recv-timeout (54f0772): _spawn_to did remote_recv with NO timeout -> a hung-but-alive peer blocked
+  cluster_spawn/pmap FOREVER (code admitted "recv-timeout is future"). Fixed in pure NOVA: a remote conn is
+  a raw TCP fd, so tcp_wait_readable(conn, 10000) before remote_recv. Proven dist_recv_timeout_test (silent
+  peer -> 2s timeout, no hang). Also fixes the cluster_pmap gather-hang (every _spawn_to now returns).
+- ★★ CORE SOUNDNESS (35db1ea index/slice, 63a0a6d len/for-in): nova_rt_index_get / slice_any / len_any /
+  len fell through to str_char_at / strlen / nova_rt_slice for ANY non-list/dict/bytes value, so indexing /
+  measuring / iterating a non-container any-value (json_decode of a scalar; msg["type"] on a malformed
+  network message) dereferenced the scalar AS a char* => WILD READ => ACCESS_VIOLATION (exit -1073741819).
+  Found via "malformed cluster message crashes the node" but the bug is CORE — any JSON/network value
+  indexed/measured without a type guard. Gated all four entry points with nova_is_readable_str -> safe
+  null/0. Proven index_soundness_test. Affects ALL NOVA code; no reconverge (runtime-only).
+REMAINING distribution findings (MVP-grade, tracked with the review's fixes): leave-durability tombstone
+(HIGH; gossip can resurrect a left node — but the test cluster never calls cluster_leave); a panicking
+remote fn leaves _handle_peer's reply+close unreached -> socket leak + no error reply (HIGH; recv-timeout
+now bounds the driver); result serialization lossy for float/bool/large-int (HIGH); _acceptor_loop busy-
+spins on bind/accept failure (resource); unauthenticated spawn + unbounded member/gossip growth (security,
+MVP); wall-clock vs monotonic liveness + gossip-at-scale false-positives (MEDIUM).
+FOLLOW-ON: audit OTHER any-ops (contains, index_of, ...) for the same wild-read fall-through pattern.
+GOTCHA: is_dict() returns 0 for json-decoded dicts — do NOT use it to guard network messages (it silently
+dropped all cluster messages -> 0/3 convergence; reverted). The index_get soundness fix is the right guard.
