@@ -718,3 +718,20 @@ FOREGROUND AUDITS this turn -- all SOUND (stub-vs-real verified against the code
        parser) -- contained, fix-if-real; (2) a FULL-STACK INTEGRATION DEMO exercising routing+sessions+
        CSRF+JWT+views+static over a socket round-trip (validates the framework end-to-end = the CLAUDE.md
        "first experience"; additive+safe); (3) broad regression of the touched tests. Each: gate -> commit.
+
+---
+## (aa) 2026-06-28 — Overnight parser audits: 2 real forge.nova bugs fixed; rest sound
+Continuing safe foreground audits of attacker-facing parsers (user asleep). Found + FIXED 2 real bugs (both
+public fns, unit-gated), audited the rest SOUND:
+- query_get (eb53343): substring false-match let one param shadow another (notadmin=1 hides admin=1); now
+  splits on '&' + exact key match. gate forge_query_test.
+- header_get (d9c87b1): case-SENSITIVE header-name match missed a differently-cased header (HTTP names are
+  case-insensitive) -> a header-gate bypass; now lowercases the search, preserves value case, stays anchored.
+  gate forge_header_test. (The typed req_header was ALREADY case-insensitive, so JWT/cookie paths were safe.)
+SOUND (verified vs attacker input): _pct_decode (incomplete/invalid % -> literal; valid -> decoded),
+cookie_get (anchored '=' split, first-wins, malformed skipped), parse_multipart (CRLF-in-delimiter handled,
+NUL-in-header rejected, 100000-part guard vs infinite loop, unterminated part -> stop, empty boundary -> []),
+req_header (lower(name) + lowercase-keyed dict).
+NEXT: parse_query/parse_path edge cases (quick), then the FULL-STACK INTEGRATION DEMO (routing+sessions+CSRF+
+JWT+views+static over a socket round-trip = the 'first experience'), then a broad regression of touched tests.
+All foreground (session limit); AVOID risky N>1/WASM-carve unsupervised.
