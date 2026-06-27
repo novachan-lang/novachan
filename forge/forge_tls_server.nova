@@ -384,15 +384,11 @@ fn tls13_serve_once(port: int, response) -> int
 // HTTPS serving: accept one connection, complete the TLS 1.3 handshake, read the decrypted HTTP request,
 // pass it (as a string) to `handler`, and send the handler's response string back encrypted. Mirrors
 // forge.serve(port, handler) but over TLS. Returns 1 on success.
-fn forge_serve_tls(port: int, handler) -> int
-    let cert_sk = _tlss_b2l(unsafe nova_rt_os_random(32))
-    let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
-    let srv = tcp_listen(port)
-    if srv < 0
-        return 0
-    let conn = tcp_accept(srv)
-    if conn < 0
-        return 0
+// Serve ONE already-accepted connection: complete the TLS 1.3 handshake (cert signed with cert_sk, ECDHE
+// via the ephemeral srv_priv), read the (decrypted) request, run `handler(request_string)`, seal + send the
+// response. Returns 1 if a request was served, 0 on handshake/record failure. The per-connection core
+// shared by forge_serve_tls (single) and forge_serve_tls_n (loop).
+fn _tlss_serve_conn(conn: int, handler, cert_sk, srv_priv) -> int
     let h = tls13_server_handshake(conn, cert_sk, srv_priv)
     if h[0] != 1
         return 0
@@ -420,3 +416,35 @@ fn forge_serve_tls(port: int, handler) -> int
                 tcp_send_bytes(conn, _tlss_l2b(tls13_record_seal(s_ap_key, s_ap_iv, 0, str_to_blist(resp), 23, 0)))
                 return 1
     0
+
+fn forge_serve_tls(port: int, handler) -> int
+    let cert_sk = _tlss_b2l(unsafe nova_rt_os_random(32))
+    let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
+    let srv = tcp_listen(port)
+    if srv < 0
+        return 0
+    let conn = tcp_accept(srv)
+    if conn < 0
+        return 0
+    let r = _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
+    tcp_close(srv)
+    r
+
+// Serve n HTTPS requests (n connections) in a loop. The Ed25519 cert key (the server's IDENTITY) is STABLE
+// for the server's lifetime; the ephemeral X25519 key is FRESH per connection (forward secrecy -- a leaked
+// session key never compromises another session). One request per connection. Returns 1.
+fn forge_serve_tls_n(port: int, handler, n: int) -> int
+    let cert_sk = _tlss_b2l(unsafe nova_rt_os_random(32))
+    let srv = tcp_listen(port)
+    if srv < 0
+        return 0
+    let i = 0
+    while i < n
+        let conn = tcp_accept(srv)
+        if conn >= 0
+            let srv_priv = _tlss_b2l(unsafe nova_rt_os_random(32))
+            _tlss_serve_conn(conn, handler, cert_sk, srv_priv)
+            tcp_close(conn)
+        i = i + 1
+    tcp_close(srv)
+    1
