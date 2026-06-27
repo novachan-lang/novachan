@@ -735,3 +735,20 @@ req_header (lower(name) + lowercase-keyed dict).
 NEXT: parse_query/parse_path edge cases (quick), then the FULL-STACK INTEGRATION DEMO (routing+sessions+CSRF+
 JWT+views+static over a socket round-trip = the 'first experience'), then a broad regression of touched tests.
 All foreground (session limit); AVOID risky N>1/WASM-carve unsupervised.
+
+---
+## (ab) 2026-06-28 — BROAD REGRESSION GREEN: 13/13 touched tests pass (session work mutually consistent)
+Ran all tests touched this session to confirm the many changes don't conflict. ALL PASS:
+forge_x509, forge_x509_san, forge_p256, forge_crypto_gcm, forge_pg_scram, forge_reqparse, forge_query,
+forge_header, forge_jwt, forge_session, forge_html, forge_chain (CVE-2002-0862 forgery+expiry+3-cert CA),
+forge_recv_security (framing). => The full session arc is validated end-to-end: X.509 trust (CRITICAL forgery
+fix + CA/expiry/on-curve/hostname-SAN), AEAD/GCM, RSA, ECDSA, SCRAM, HTTP framing+parsing, query_get,
+header_get -- nothing regressed.
+NOTE on the integration demo: the JWT-protected-route integration is ALREADY validated by forge_jwt_test via
+the framework's dispatch_test harness (mw_require_auth -> 200 with valid Bearer / 401 without / 401 bad);
+sessions (forge_session_test), views (forge_html_test) each integration-tested. A new combined socket demo
+would mostly duplicate these with handler-return/status uncertainty unsupervised -> deferred (low marginal
+value, the components + their wiring are already covered). dispatch_test/build_request/status_of/body_of/
+mock_request are the no-socket integration-test harness for future combined demos.
+NEXT: remaining quick parser audits (parse_query/parse_path/_extract_boundary), then continue. Foreground;
+AVOID risky N>1/WASM-carve unsupervised.
