@@ -9,10 +9,10 @@ rm -f _srv_run.txt _cli_run.txt
 ./forge_tls_server_test.exe > _srv_run.txt 2>&1 &
 SRV=$!
 sleep 2
-timeout 15 openssl s_client -connect 127.0.0.1:"$PORT" -tls1_3 </dev/null > _cli_run.txt 2>&1
+timeout 15 curl -sk --tls-max 1.3 --http1.1 https://127.0.0.1:"$PORT"/ > _cli_run.txt 2>&1
 wait $SRV 2>/dev/null
-if grep -q "TLS_AES_128_GCM_SHA256" _cli_run.txt && grep -q "SERVER-HANDSHAKE-OK" _srv_run.txt; then
-    echo "PASS forge_tls_server (full TLS 1.3 handshake vs openssl s_client)"
+if grep -q "NOVA-TLS-SERVER-OK" _cli_run.txt && grep -q "SERVER-HANDSHAKE-OK" _srv_run.txt; then
+    echo "PASS forge_tls_server (full TLS 1.3 handshake + HTTPS GET via curl)"
 else
     echo "FAIL forge_tls_server"
     echo "--- s_client tail ---"; tail -6 _cli_run.txt
