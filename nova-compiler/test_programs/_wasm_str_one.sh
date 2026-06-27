@@ -1,8 +1,8 @@
 #!/bin/bash
-# NOVA string-LITERAL ops -> real wasm via a MINIMAL runtime (_wrt_min.c provides nova_rt_len_any = strlen).
-# Proves a NOVA fn USING a string runs in wasm (beyond pure scalar). Heap string BUILDING (create_string/
-# concat) + lists/dicts need the value-model port (tracked: NOVA_DESIGN/WASM_RUNTIME_PORT.md). NOTE:
-# -fno-builtin so clang doesn't rewrite the runtime's strlen loop into an (undefined) libc strlen import.
+# NOVA string ops -> real wasm via a MINIMAL self-consistent runtime (_wrt_min.c: bump heap + len_any +
+# create_string + str_concat). Proves a NOVA fn that USES and BUILDS a string runs in wasm (beyond pure
+# scalar). Lists/dicts/structs need the full value-model port (tracked: NOVA_DESIGN/WASM_RUNTIME_PORT.md).
+# NOTE: -fno-builtin so clang doesn't rewrite the runtime's strlen loop into an (undefined) libc strlen import.
 cd "$(dirname "$0")" || exit 1
 ./gen3_test.exe wasm_str_demo.nova >/dev/null 2>&1
 [ -f wasm_str_demo.ll ] || { echo "FAIL forge_wasm_str: NOVA->LLVM failed"; exit 1; }
@@ -13,7 +13,7 @@ const fs=require("fs");
 const m=new WebAssembly.Module(fs.readFileSync("wasm_str_demo.wasm"));
 const imp={}; for(const i of WebAssembly.Module.imports(m)){(imp[i.module]=imp[i.module]||{})[i.name]=()=>0n;}
 const x=new WebAssembly.Instance(m,imp).exports;
-const h=x.hello_len(), c=x.combined();
-console.log("hello_len="+h+" combined="+c);
-process.exit((h===5n && c===14n)?0:1);
-' && echo "PASS forge_wasm_str (NOVA string-literal len -> real wasm -> node: hello_len=5, combined=14)" || echo "FAIL forge_wasm_str"
+const h=x.hello_len(), c=x.combined(), t=x.cat_len();
+console.log("hello_len="+h+" combined="+c+" cat_len="+t);
+process.exit((h===5n && c===14n && t===5n)?0:1);
+' && echo "PASS forge_wasm_str (NOVA string literal + BUILD (concat) -> real wasm -> node: hello=5, combined=14, cat=5)" || echo "FAIL forge_wasm_str"
