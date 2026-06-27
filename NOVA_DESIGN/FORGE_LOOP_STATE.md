@@ -432,3 +432,25 @@ CORE (any JSON/network input), surfaced by the distribution adversarial review. 
 [[project-int-pointer-soundness]]. GRACEFUL "" chosen (not panic) for consistency + Forge robustness.
 Still-remaining distribution findings (MVP-grade) unchanged from (j): leave-durability tombstone, panic-in-
 remote-fn socket leak, result serialization lossy float/bool, _acceptor_loop busy-spin, security/DoS, scale.
+
+---
+## (l) 2026-06-27 — distribution hardening (acceptor + durable leave) + keys/values soundness
+Closed the tractable remaining distribution-review findings (commit 9959576):
+- _acceptor_loop busy-spin: returned on remote_bind/remote_accept failure (was a 100% CPU spin spawning
+  _handle_peer(-1,...) on a -1 listener/conn).
+- DURABLE graceful leave: a tombstone (`left` set in _manager_loop). mark_left tombstones; the touch handler
+  SKIPS reviving a tombstoned addr (stray gossip from the departed node can't resurrect it); a new `rejoin`
+  command (sent by _handle_peer on an explicit "join") clears it so a node that left and returns IS revived.
+  (left[addr] on a missing key reads 0 safely via the dict-key soundness fix.) Proven dist_leave_durable_test;
+  cluster_test/cluster_leave/cluster_spawn green.
+Also extended the soundness sweep (commit d19ae80): keys()/values() on a non-dict were a NovaDict* wild read
+-> now find_tag==DICT gated -> empty list. (keys/values are direct builtins, not via the handle-checked
+index_get path.) index_soundness_test covers them.
+DISTRIBUTION STATUS: clusterx is now solid — membership/gossip/liveness/cluster_spawn/cluster_pmap/graceful-
+leave, recv-timeout, durable leave, acceptor guard, all proven across OS processes. MVP-deferred (lower
+value/higher effort, tracked): panic-in-remote-fn socket leak (recv-timeout bounds the driver; needs panic-
+recovery in _handle_peer for a clean error reply), result serialization lossy for float/large-int (JSON
+precision), unauthenticated spawn + unbounded member/gossip growth (security), wall-clock vs monotonic
+liveness + gossip-at-scale false-positives.
+NEXT: per-connection SPAWNING for concurrent HTTPS (forge_serve_tls_n single-threaded); browser-WASM
+frontend; N>1 scheduler.
