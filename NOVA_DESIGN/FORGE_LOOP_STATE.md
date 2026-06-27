@@ -527,3 +527,19 @@ sockets/threads/Win32/file-IO/fibers). That port = the next real WASM milestone:
 nova_runtime (bump allocator or wasi-libc malloc; stub the non-wasm parts) so a NOVA fn using a string/list
 compiles + runs in wasm. Tools present: clang wasm32, wasm-ld, node v20. (Corrects the audit's "WASM is a
 no-op stub" -- the frontend now produces REAL wasm for compute.)
+
+---
+## (q) 2026-06-27 — WASM frontend: 3 real increments (compute + string literal + string BUILD) + port plan
+NOVA -> real WebAssembly now runs THREE classes in node V8 (the browser engine), no reconverge:
+- compute (ceac8a6): native-specialized scalar fns -> wasm directly from the .ll (add=5/mul=20/poly=43). gate _wasm_one.sh.
+- string literal (73e5a71): len() of a literal via a minimal runtime (literal = bare data-segment char*). gate _wasm_str_one.sh.
+- string BUILD (2e1ebd3): str_concat -> a heap string. _wrt_min.c grew a self-consistent heap value model
+  (bump heap; heap string = [i64 len][bytes], handle at the bytes, len at handle-8; len_any detects heap vs
+  literal by the heap range). cat(len "ab"+"cde")=5.
+GOTCHAS (in WASM_RUNTIME_PORT.md): clang -O2 rewrites manual strlen -> libc strlen IMPORT (i32 vs i64 dummy
+-> node BigInt error) => ALWAYS -fno-builtin. No wasi-libc offline => can't compile the 948KB runtime as-is;
+use a minimal/carved wasm unit. i64<->BigInt at the JS boundary; dummy imports for the unused nova_rt_*.
+NEXT WASM step: LISTS/DICTS in wasm -- extend _wrt_min.c with heap list_create/list_append/list_get/len_any
+(a NOVA fn building [1,2,3] + summing/len), then the full value-model carve from nova_runtime.c's
+NOVA_FREESTANDING path (find_tag/RC, the real layout) per WASM_RUNTIME_PORT.md. Then AI/compute kernels =
+the real browser story. Tools: clang wasm32 + wasm-ld + node v20 (no wasi offline; always -fno-builtin).
