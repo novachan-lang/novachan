@@ -2098,7 +2098,7 @@ static int64_t nova_utf8_decode(const unsigned char* s, size_t len, size_t* i); 
 int64_t nova_rt_chars(int64_t s) {
     /* Split into CODEPOINTS (each a UTF-8 substring), not raw bytes, so chars()
        agrees with char_at/char_count on multibyte text (was: 1 entry per byte). */
-    const unsigned char* str = (const unsigned char*)(uintptr_t)s;
+    const unsigned char* str = (const unsigned char*)nova_str_safe(s);
     int64_t list = nova_rt_list_create();
     if (!str) return list;
     size_t len = strlen((const char*)str), i = 0;
@@ -2359,7 +2359,7 @@ static inline uint64_t nova_dict_hash_key(const char* s) {
 
 int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = (const char*)(uintptr_t)key;
+    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
@@ -2398,7 +2398,7 @@ int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
    process-local. */
 int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = (const char*)(uintptr_t)key;
+    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
@@ -2431,7 +2431,7 @@ int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
 
 int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = (const char*)(uintptr_t)key;
+    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
@@ -2462,7 +2462,7 @@ int64_t nova_rt_dict_set_bbox(int64_t handle, int64_t key, int64_t v) {
 
 int64_t nova_rt_dict_has(int64_t handle, int64_t key) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = (const char*)(uintptr_t)key;
+    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
@@ -2502,7 +2502,7 @@ int64_t nova_rt_memo_unlock(void) {
 
 int64_t nova_rt_dict_del(int64_t handle, int64_t key) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = (const char*)(uintptr_t)key;
+    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
     uint64_t h = nova_dict_hash_key(k);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     int64_t found = -1;
@@ -2876,7 +2876,7 @@ int64_t nova_rt_for_kv_init(int64_t obj) {
 /* ── Character operations ────────────────────────────────────────────────── */
 
 int64_t nova_rt_ord(int64_t s) {
-    const char* p = (const char*)(uintptr_t)s;
+    const char* p = nova_str_safe(s);
     if (!p || !*p) return 0;
     return (int64_t)(unsigned char)p[0];
 }
@@ -8648,7 +8648,7 @@ static int nova_utf8_encode(int64_t cp, char* out) {
     out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F)); return 4;
 }
 int64_t nova_rt_char_count(int64_t s_val) {
-    const unsigned char* s = (const unsigned char*)(uintptr_t)s_val;
+    const unsigned char* s = (const unsigned char*)nova_str_safe(s_val);
     if (!s) return 0;
     size_t len = strlen((const char*)s), i = 0; int64_t count = 0;
     while (i < len) { size_t j = i; int64_t cp = nova_utf8_decode(s, len, &j); if (cp < 0) i++; else i = j; count++; }
@@ -12041,7 +12041,7 @@ int64_t nova_rt_str_count(int64_t s, int64_t sub) {
 }
 
 int64_t nova_rt_lstrip(int64_t s) {
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     if (!str) return (int64_t)(uintptr_t)"";
     while (*str && isspace((unsigned char)*str)) str++;
     size_t len = strlen(str);
@@ -12052,7 +12052,7 @@ int64_t nova_rt_lstrip(int64_t s) {
 }
 
 int64_t nova_rt_rstrip(int64_t s) {
-    const char* str = (const char*)(uintptr_t)s;
+    const char* str = nova_str_safe(s);
     if (!str) return (int64_t)(uintptr_t)"";
     size_t len = strlen(str);
     while (len > 0 && isspace((unsigned char)str[len - 1])) len--;
