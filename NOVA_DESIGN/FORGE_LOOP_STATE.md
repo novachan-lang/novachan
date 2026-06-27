@@ -666,3 +666,29 @@ NOTE: forge_chain_test is CORRECT but SLOW (~150s -- pure-NOVA Ed25519 x 9 certs
 run-timeout kills it (exit=-1) -> use a longer timeout (timeout 150) when gating it. NOT a regression.
 NEXT: forge_pg SCRAM review (last unreviewed auth path) OR a FORGE FEATURE for breadth (signed sessions/
 cookies, static-file serving, templating) -- the security arc is thorough; time to advance the framework.
+
+---
+## (y) 2026-06-28 — Forge framework is MATURE (A/B/C already built) + SCRAM nonce-binding hardened (2c3462d)
+Pivoted to "build a forge feature" and found the framework far more complete than assumed -- VERIFIED each
+suggested feature is already REAL + sound (HONEST stub-vs-real):
+- Signed sessions/cookies: sign_value/unsign_value/session_set/session_get in forge.nova, MAC compared with
+  _ct_eq (constant-time, length-checked); forge_session_test PASSES (forgery + tamper rejected). Plus a full
+  adversarially-reviewed CSRF (signed double-submit) + CSPRNG nonce.
+- Static-file serving: static()/_safe_subpath/_static_match -- PATH-TRAVERSAL-SAFE (percent-decodes FIRST so
+  %2e%2e is caught, then segment-whitelists rejecting .., dotfiles, backslash, colon). Symlink containment is
+  noted as a tracked follow-up. Content-Type by extension, Range support.
+- HTML/templating: forge_html.nova is a full XSS-safe VIEW LAYER (esc + el/div/img/link/ul/page/raw, attrs
+  auto-escaped); forge_html_test gates attribute-injection prevention. (Reverted a duplicate html_escape I
+  started in forge.nova -- one obvious way.)
+=> So the forge WEB framework is mature (routing, middleware, sessions, CSRF, JWT, OpenAPI, WS, SSE, static,
+   views, the typed-extraction arc). The "add a feature" angle is largely exhausted.
+SCRAM (last unreviewed auth path): forge_pg SCRAM-SHA-256 is correct KAT-gated crypto building blocks but
+pg_scram_finish lacked the RFC 5802 server-nonce binding -> FIXED 2c3462d (require server nonce to begin with
++ extend the client nonce; reject i<1; return [] on failure) + gated. HONEST: the live PG SASL wire loop
+(send client-final, verify server-final v= against the returned ServerSignature for mutual auth) is NOT wired
+-- tracked with live-Postgres; the building block is ready for it.
+=> GENUINELY-REMAINING BIG ITEMS now: (1) forge HTTP REQUEST-HANDLING adversarial review (attacker-controlled
+   HTTP: request smuggling, header injection, Content-Length/chunked overflow, the router/parser) -- a high-
+   value review surface not yet done; (2) N>1 parallel scheduler (real multi-core; risky); (3) WASM value-
+   model carve; (4) live PG wire integration. The web/crypto surface is reviewed+hardened; next is the HTTP
+   attack surface or the hard infrastructure.
