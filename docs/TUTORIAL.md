@@ -116,13 +116,13 @@ If you are building from source, the extension binary (`nova-vscode/bin/nova-com
 
 ## 2. Hello, world
 
-Create a file called `hello.nova`:
+Create a file called `hello.nova` and put this in it:
 
 ```nova
 print("Hello, world!")
 ```
 
-Run it:
+Now run it from your terminal:
 
 ```
 nova run hello.nova
@@ -134,20 +134,29 @@ Output:
 Hello, world!
 ```
 
-That is the entire program. No `main()` required, no `import` statement, no boilerplate. Top-level statements execute in order, exactly like a script.
+That's the entire program. One line. No `main()` function, no `import` statement, no class wrapper, no semicolons. If you're coming from Java or C#, you're used to writing 5-10 lines of boilerplate before you can print anything. In NOVA, top-level statements execute in order, exactly like a Python script.
 
-### What happens when you run this
+### What actually happens when you run this
 
-`nova run` performs four steps in one command:
+When you type `nova run hello.nova`, four things happen behind the scenes in a fraction of a second:
 
-1. **Parse** — the source is parsed into an AST. Indentation defines block structure; there are no braces.
-2. **Infer** — the type inferrer runs Hindley-Milner inference over the entire program. The type of `"Hello, world!"` is inferred as `string` without any annotation.
-3. **Compile to LLVM IR** — the typed AST is lowered to LLVM IR. The string literal becomes a global constant; `print` becomes a call to `nova_rt_print` in the C runtime.
-4. **Link and run** — clang compiles the IR to a native binary, links the NOVA runtime, and executes it.
+1. **Parse** — NOVA reads your source file and builds a tree of the code's structure. There are no braces `{}` for blocks — NOVA uses indentation, like Python. If you indent a line under an `if` or `fn`, it's inside that block.
 
-The first run takes a fraction of a second. If you `nova build hello.nova` instead, it produces a standalone executable you can distribute.
+2. **Type inference** — The compiler runs a Hindley-Milner type inference pass over the entire program. It sees `"Hello, world!"` and knows that's a `string` without you saying so. You almost never need to write type annotations — the compiler figures them out from how you use things.
 
-### With a function
+3. **Compile to machine code** — The typed program is lowered to LLVM IR (the same intermediate format that C and Rust use), then compiled to native machine code for your CPU. This is why NOVA runs at C speed — it uses the exact same compiler backend.
+
+4. **Link and run** — The machine code is linked with the NOVA runtime (a small C library that provides `print`, channels, memory management, etc.) and executed immediately.
+
+If you want a standalone binary instead of running immediately:
+
+```
+nova build hello.nova
+```
+
+This produces `hello.exe` (Windows) or `hello` (Linux) — a native executable you can copy to any machine with the same OS and run directly. No runtime needed. No Docker. No interpreter.
+
+### Your first function
 
 ```nova
 fn greet(name)
@@ -164,82 +173,156 @@ Hello, NOVA!
 Hello, world!
 ```
 
-The `{name}` inside the string is string interpolation. Any expression is valid inside `{}`. No `f` prefix is needed — all double-quoted strings support interpolation.
+Let's break down what's new here:
 
-> **DO:** Use `{expr}` directly inside strings for interpolation: `"count = {n + 1}"`
-> **DON'T:** Prefix strings with `f` like Python — NOVA strings are always interpolation-capable, and `f"..."` is not valid syntax.
+**`fn greet(name)`** — This defines a function called `greet` that takes one parameter called `name`. Notice there is **no type annotation** on `name`. You didn't write `name: string` — the compiler sees you call `greet("NOVA")` with a string argument, and infers that `name` must be a string. This works automatically for 95% of code.
+
+**`"Hello, {name}!"`** — The `{name}` inside the string is **string interpolation**. NOVA evaluates the expression inside `{}` and inserts its value into the string. You can put any expression inside the braces:
+
+```nova
+x = 10
+print("x is {x}")              // x is 10
+print("double is {x * 2}")     // double is 20
+print("sum is {x + 3}")        // sum is 13
+```
+
+**This is different from Python.** In Python, you must write `f"Hello, {name}!"` with an `f` prefix for interpolation. Forget the `f` and you get the literal text `Hello, {name}!` with no substitution. In NOVA, every double-quoted string supports `{expr}` interpolation by default. There is no `f` prefix and writing `f"..."` is a syntax error.
+
+> **DO:** Use `{expr}` directly inside strings: `"count = {n + 1}"`, `"name is {user.name}"`
+> **DON'T:** Write `f"..."` like Python — NOVA strings always interpolate, and `f"..."` is not valid syntax.
 
 ### Escaping braces
 
-To put a literal `{` or `}` in a string without interpolation:
+What if you want a literal `{` in your string without interpolation? Use `\{`:
 
 ```nova
-print("a dict looks like \{key: value\}")
-// Output: a dict looks like {key: value}
+print("JSON looks like \{\"key\": \"value\"\}")
+// Output: JSON looks like {"key": "value"}
 ```
 
-Use `\{` and `\}` to escape. All other common escapes work too: `\n`, `\t`, `\r`, `\\`, `\"`.
+The escape sequences NOVA supports: `\n` (newline), `\t` (tab), `\r` (carriage return), `\\` (literal backslash), `\"` (literal quote), `\{` (literal open brace), `\}` (literal close brace), `\0` (null byte).
+
+### main() — when you need it
+
+For simple scripts, top-level statements work fine. But for real programs, define a `fn main()`:
+
+```nova
+fn helper()
+    print("I'm a helper")
+
+fn main()
+    helper()
+    print("Program finished")
+```
+
+When `main()` exists, NOVA calls it as the entry point instead of running top-level statements. Use `main()` for any program with multiple functions or that you intend to compile into a binary.
 
 ---
 
 ## 3. Values and types
 
-NOVA has six built-in types: `int`, `float`, `string`, `bool`, `list`, and `dict`. The type inferrer deduces types from usage — you almost never write a type annotation.
+NOVA has six built-in types. You almost never need to write a type annotation — the compiler infers the type from how you use the value. This section explains each type, what you can do with it, and what happens when you get it wrong.
 
 ### Integers
 
 ```nova
 x = 42
 y = -7
-big = 1_000_000        // underscores in literals for readability
-hex = 0xFF             // hex literal
+big = 1_000_000        // underscores for readability — ignored by compiler
+hex = 0xFF             // hex literal = 255
 print(x + y)           // 35
 print(big * 2)         // 2000000
 ```
 
-Integers are 64-bit signed, two's-complement. They wrap on overflow (no undefined behavior, unlike C). Division truncates toward zero. Modulo follows the sign of the dividend.
+Integers are 64-bit signed (range: roughly -9.2 quintillion to +9.2 quintillion). That's the same as Java's `long` or C's `int64_t`.
+
+**Overflow behavior:** Unlike C (where signed overflow is undefined behavior — the compiler can do literally anything), NOVA integers **wrap** on overflow. This is defined, predictable two's-complement behavior. You will never get a security vulnerability from integer overflow in NOVA — the number just wraps around.
 
 ```nova
-print(7 / 2)           // 3 (truncated)
-print(-7 / 2)          // -3 (truncated toward zero)
+// Division and modulo
+print(7 / 2)           // 3 — integer division truncates toward zero
+print(-7 / 2)          // -3 — truncates toward zero (not toward negative infinity)
 print(7 % 3)           // 1
-print(-7 % 3)          // -1 (sign of dividend)
+print(-7 % 3)          // -1 — modulo follows the sign of the dividend
 ```
+
+**Why this matters:** If you're doing `index % array_length` with a potentially negative index, the result can be negative. Python's `%` always returns a non-negative result; NOVA's matches C and Java behavior.
 
 ### Floats
 
 ```nova
 pi = 3.14159
 e = 2.71828
-tiny = 1e-10
+tiny = 1e-10           // scientific notation
 huge = 6.022e23
-print(pi * 2.0)
+print(pi * 2.0)        // 6.28318
 ```
 
-Floats are 64-bit IEEE 754 doubles. Arithmetic follows IEEE semantics including `+Inf`, `-Inf`, and `NaN`. Mixed `int`/`float` arithmetic promotes both sides to `float` automatically.
+Floats are 64-bit IEEE 754 doubles — the same as Java's `double`, Python's `float`, and JavaScript's `number`. They follow standard IEEE semantics: `1.0 / 0.0` produces `Inf`, `0.0 / 0.0` produces `NaN`.
+
+**Automatic promotion:** When you mix `int` and `float` in an expression, NOVA promotes the integer to float:
 
 ```nova
-result = 7 + 0.5       // int + float -> float: 7.5
-print(result)
+result = 7 + 0.5       // int 7 becomes float 7.0, then adds 0.5 → 7.5
+print(result)           // 7.5
+print(type_of(result))  // float
 ```
+
+**Don't compare floats with ==.** Floating-point arithmetic produces rounding errors:
+
+```nova
+print(0.1 + 0.2 == 0.3)   // false — this is true in ALL languages, not a NOVA bug
+print(0.1 + 0.2)           // 0.30000000000000004
+```
+
+If you need to compare floats, check if the difference is small: `abs(a - b) < 0.0001`.
 
 ### Strings
 
 ```nova
 name = "NOVA"
-greeting = "Hello, {name}!"
-multiword = "The year is " + str(2026)
-print(greeting)         // Hello, NOVA!
-print(len(name))        // 4
+greeting = "Hello, {name}!"     // interpolation — name is substituted
+combined = "Year: " + str(2026) // concatenation with + (str() converts int to string)
+print(greeting)                 // Hello, NOVA!
+print(len(name))                // 4
 ```
 
-Strings are immutable UTF-8 byte sequences. The `+` operator concatenates strings. The `str()` built-in converts any value to its string representation. `len()` returns the byte length (for pure ASCII this equals the character count).
+Strings are immutable UTF-8 byte sequences. Once created, a string cannot be changed — operations like `upper()` return a new string:
 
 ```nova
 s = "hello world"
-upper_s = upper(s)      // "HELLO WORLD"
-words = split(s, " ")   // ["hello", "world"]
-print(words[0])         // hello
+upper_s = upper(s)       // "HELLO WORLD" — new string; s is unchanged
+words = split(s, " ")    // ["hello", "world"] — returns a list of strings
+print(words[0])          // hello
+print(s)                 // hello world — s was never modified
+```
+
+**Important string operations:**
+
+```nova
+s = "Hello, NOVA!"
+print(len(s))                      // 12 — byte length
+print(starts_with(s, "Hello"))     // true
+print(ends_with(s, "!"))           // true
+print(contains(s, "NOVA"))         // true
+print(replace(s, "NOVA", "World")) // Hello, World!
+print(trim("  spaces  "))         // spaces
+print(slice(s, 0, 5))             // Hello — substring from index 0 to 5
+```
+
+**String building in loops:** Don't concatenate with `+` in a loop — each `+` copies the entire string, giving O(n²) performance for n iterations. For building large strings, collect pieces in a list and `join()` at the end:
+
+```nova
+// BAD: O(n²) — copies the whole string each iteration
+result = ""
+for i in range(0, 1000)
+    result = result + str(i) + ","
+
+// GOOD: O(n) — join builds the string once at the end
+parts = []
+for i in range(0, 1000)
+    push(parts, str(i))
+result = join(parts, ",")
 ```
 
 ### Booleans
@@ -252,6 +335,8 @@ print(alive or done)       // true
 print(not alive)           // false
 ```
 
+NOVA uses English words `and`, `or`, `not` instead of `&&`, `||`, `!`. This is a deliberate design choice — the code reads like a sentence: "if alive and not done."
+
 Comparison operators return `bool`:
 
 ```nova
@@ -259,51 +344,109 @@ x = 10
 print(x > 5)    // true
 print(x == 10)  // true
 print(x != 3)   // true
+print(x >= 10)  // true
+print(x <= 9)   // false
 ```
 
 ### Lists
+
+Lists are ordered, zero-indexed collections that can hold any type of value:
 
 ```nova
 nums = [1, 2, 3, 4, 5]
 names = ["alice", "bob", "carol"]
 mixed = [1, "two", 3.0, true]   // lists can hold any type
 
-print(nums[0])      // 1
-print(nums[-1])     // 5 (negative index from end)
+// Accessing elements
+print(nums[0])      // 1 — first element
+print(nums[2])      // 3 — third element
+print(nums[-1])     // 5 — last element (negative counts from end)
+print(nums[-2])     // 4 — second-to-last
 print(len(nums))    // 5
 
-nums.push(6)
-print(nums[-1])     // 6
-
-last = nums.pop()   // removes and returns last element
+// Modifying
+push(nums, 6)       // adds 6 to the end → [1, 2, 3, 4, 5, 6]
+last = pop(nums)    // removes and returns last → 6, list is back to [1,2,3,4,5]
 ```
 
-Lists are zero-indexed dynamic arrays. Negative indices count from the end: `-1` is the last element, `-2` is second-to-last.
+**What happens if you access an out-of-bounds index?** NOVA checks bounds at runtime and reports an error with the index and list length. This is safer than C (which silently reads garbage memory) but means you should always check `len()` if you're not sure:
+
+```nova
+nums = [1, 2, 3]
+// print(nums[5])    // Runtime error: index 5 out of bounds (length 3)
+// print(nums[-4])   // Runtime error: index -4 out of bounds (length 3)
+
+// Safe pattern: check first
+if len(nums) > 5
+    print(nums[5])
+```
+
+**Useful list operations:**
+
+```nova
+nums = [3, 1, 4, 1, 5, 9, 2, 6]
+sorted_nums = sort(nums)           // [1, 1, 2, 3, 4, 5, 6, 9]
+print(contains(nums, 4))           // true
+print(len(nums))                   // 8
+reversed_nums = reverse(nums)      // [6, 2, 9, 5, 1, 4, 1, 3]
+
+// Higher-order operations
+evens = filter(nums, x => x % 2 == 0)    // [4, 2, 6]
+doubled = map(nums, x => x * 2)          // [6, 2, 8, 2, 10, 18, 4, 12]
+total = reduce(nums, 0, fn(acc, x) acc + x)  // 31
+```
 
 ### Dicts
+
+Dicts (dictionaries) are hash maps — they store key-value pairs:
 
 ```nova
 person = {"name": "Alice", "age": 30, "active": true}
 print(person["name"])     // Alice
 print(person["age"])      // 30
 
+// Add a new key
 person["email"] = "alice@example.com"
+
+// Check if a key exists (always do this before accessing)
 print(contains(person, "email"))  // true
 print(contains(person, "phone"))  // false
+
+// Get all keys
+for k in keys(person)
+    print("{k}: {person[k]}")
 ```
 
-Dicts are hash maps. New keys can be set at any time with assignment. The `contains()` built-in tests for key presence.
-
-### Type inference: the rule
-
-The compiler infers types from the right-hand side of assignments, from function return expressions, and from how values are used. You should write zero type annotations in normal application code.
+**Accessing a missing key returns a default value** (0 for int, "" for string, etc.) rather than crashing. But you should still use `contains()` to check — relying on defaults is fragile code:
 
 ```nova
-x = 42           // x: int   (inferred from literal)
-y = 3.14         // y: float (inferred from literal)
-name = "NOVA"    // name: string (inferred from literal)
-items = [1,2,3]  // items: list (inferred from literal)
+person = {"name": "Alice"}
+print(person["age"])       // 0 — key missing, returns default
+print(contains(person, "age"))  // false — age was never set
 ```
+
+### Type inference: how the compiler knows what type everything is
+
+You might have noticed that none of the code above has type annotations. You wrote `x = 42`, not `x: int = 42`. The compiler figures out the types automatically:
+
+```nova
+x = 42           // compiler sees 42 → infers x: int
+y = 3.14         // compiler sees 3.14 → infers y: float
+name = "NOVA"    // compiler sees "..." → infers name: string
+items = [1,2,3]  // compiler sees [...] → infers items: list
+ok = true        // compiler sees true → infers ok: bool
+```
+
+This isn't just for literals. The compiler tracks types through function calls, field accesses, and operations:
+
+```nova
+fn double(n)
+    n * 2          // compiler sees * 2, infers n is numeric
+
+print(double(5))   // compiler sees double(5): int argument → n is int → returns int
+```
+
+**The 95% rule:** For loops, local variables, helper functions, closures, and most function parameters, you write zero annotations and the compiler gets it right. The 5% where you DO write annotations are covered in the [Structs](#6-structs) and [Performance guide](#18-performance-guide) sections.
 
 ### When to write a type annotation
 
@@ -622,7 +765,7 @@ Named functions (defined with `fn`) are the right choice for top-level logic, me
 
 ## 6. Structs
 
-Structs are named collections of typed fields. They are NOVA's primary way to define domain types.
+Structs are how you define your own data types in NOVA. A struct groups related fields together under a name. If you're coming from Python, think of it like a `dataclass` with zero boilerplate. From Java, think of a `record`.
 
 ### Declaring a struct
 
@@ -637,12 +780,34 @@ type Person
     active: bool
 ```
 
-The `type` keyword introduces a struct. Field names go on separate indented lines, each with a type annotation. Field types must be lowercase: `int`, `float`, `string`, `bool`, `list`, `dict`.
+The `type` keyword introduces a struct. Each field goes on its own indented line with a name and a type. That's it — no constructors to write, no `__init__`, no getters/setters.
 
-**This is the most important rule about structs:** field type names must be lowercase. If you use `Float` with a capital F, the compiler treats the field as dynamically typed and every arithmetic operation on it goes through a slow dynamic dispatch path — roughly 150 times slower than native float arithmetic.
+### THE most important rule in NOVA: lowercase field types
+
+This is the single most common performance mistake new NOVA users make, so read this carefully.
+
+Field types MUST be **lowercase**: `float`, `int`, `string`, `bool`. If you accidentally write a capital letter — `Float`, `Int`, `String` — the compiler treats that field as **dynamically typed**. Every arithmetic operation on a dynamic field goes through a slow dispatch path that checks the type at runtime. The result:
+
+```nova
+// CORRECT — compiles to native CPU fmul instructions. Same speed as C.
+type FastPoint
+    x: float       // lowercase f = native 64-bit double
+    y: float
+
+// WRONG — compiles to dynamic dispatch. 150x SLOWER for math.
+type SlowPoint
+    x: Float       // capital F = dynamic type. DO NOT DO THIS.
+    y: Float
+```
+
+How much slower? On a benchmark that does `a.x * b.x + a.y * b.y` in a loop:
+- `float` (lowercase): **~1.0x C speed** — the compiler emits raw `fmul` + `fadd` instructions
+- `Float` (capital): **~150x slower** — every `*` and `+` goes through `nova_rt_mul` which checks the type tag, boxes/unboxes, and dispatches
+
+This is not a theoretical concern. It's the difference between a physics simulation running at 60fps and running at 0.4fps. **Always use lowercase types in struct fields.**
 
 > **DO:** Always write `x: float`, `count: int`, `label: string` in struct field declarations.
-> **DON'T:** Write `x: Float` or `count: Int` — capital type names in struct fields disable native code generation for those fields and make your program 100-150x slower for math-heavy operations. This is the single most common performance mistake in NOVA.
+> **DON'T:** Write `x: Float` or `count: Int` — capital type names cause dynamic dispatch that is 100-150x slower for math-heavy operations.
 
 ### Constructing a struct
 
@@ -1340,41 +1505,96 @@ print(build_report(["alpha", "beta", "gamma"]))
 
 ## 11. Processes and channels
 
-NOVA's concurrency model is built on three primitives: values, processes (spawned tasks), and channels (typed queues between tasks). This is the same model as Erlang/OTP, but without the ceremony.
+This is where NOVA becomes fundamentally different from most languages. In Python, you use threads with locks (and hope you don't forget a lock). In JavaScript, you use `async/await` (and every async function forces its callers to be async too). In Go, you use goroutines and channels (closer to NOVA, but with shared memory). In Rust, the borrow checker prevents data races (but forces you to fight with lifetimes).
 
-### spawn
+NOVA's approach: **processes never share memory**. Period. When you send data from one task to another, it's deep-copied. This makes data races impossible — not by discipline ("remember to use a lock"), not by a type system rule ("annotate with Send + Sync"), but by construction. There is no API for sharing memory between tasks.
 
-`spawn` starts a new green task (lightweight coroutine, not a system thread):
+### spawn — creating a task
+
+`spawn` creates a new green task. A green task is like Go's goroutine: it's extremely lightweight (~2KB stack), scheduled cooperatively by the NOVA runtime across a thread pool, and costs almost nothing to create.
 
 ```nova
 spawn fn()
     print("I run in a separate green task")
 
 print("I run in the main task")
-// Both print; order is not guaranteed
+// Both lines print. Order between tasks is NOT guaranteed.
 ```
 
-A green task is extremely cheap — spawning 10,000 tasks takes about 100ms total. The NOVA runtime manages a thread pool of OS threads and schedules green tasks across them cooperatively.
+You can spawn thousands of tasks trivially:
 
-### channel
+```nova
+fn main()
+    for i in range(0, 10000)
+        spawn fn()
+            // Each task does its own work independently
+            let result = i * i
+    print("Spawned 10,000 tasks")
+    // Total time: ~100ms on typical hardware
+```
 
-A channel is a typed queue between tasks. One task sends values; another receives them:
+**No `async` keyword. No colored functions.** In JavaScript, if a function uses `await`, it must be declared `async`, and every function that calls it must also be `async`. This "function coloring" spreads through your entire codebase. In NOVA, `spawn` and `recv` are regular expressions. Any function can use them without changing its signature or its callers.
+
+### channel — talking between tasks
+
+A channel is a queue. One task puts values in with `send()`. Another task takes values out with `recv()`. If the queue is empty, `recv()` blocks the current task (NOT the OS thread — just this green task) until something arrives:
 
 ```nova
 ch = channel()
 
 spawn fn()
+    // This task sends a value into the channel
     send(ch, 42)
 
-result = receive(ch)
+// The main task waits here until the spawned task sends
+result = recv(ch)
 print(result)    // 42
 ```
 
-`send(ch, value)` puts a value into the channel. `receive(ch)` blocks the current task (not the OS thread) until a value arrives. The main task parks and yields to the scheduler until the spawned task sends.
+Think of a channel like a pipe between two people. Person A drops a message into the pipe. Person B picks it up on the other end. They don't need to be in the same room. They don't need to agree on a time. They just use the pipe.
 
-### Ownership transfer on send
+### Ownership transfer — why data races are impossible
 
-When you send a value over a channel, it is **deep-copied** into the channel's buffer. The sending task retains its own copy. This ensures the two tasks can never share mutable state:
+This is the key design insight. When you `send(ch, data)`, NOVA **deep-copies** the data into the channel. Both the sender and receiver have their own independent copies. They can modify their copies without affecting each other:
+
+```nova
+items = [1, 2, 3]
+ch = channel()
+
+spawn fn()
+    received = recv(ch)
+    push(received, 99)     // modifies the RECEIVED copy
+    print(received)        // [1, 2, 3, 99]
+
+send(ch, items)            // sends a deep copy
+push(items, 4)             // modifies the ORIGINAL — safe!
+print(items)               // [1, 2, 3, 4]
+```
+
+**Why deep-copy instead of shared memory?** Because shared memory is the root cause of almost every concurrency bug:
+
+- **Data races**: Two threads modify the same list simultaneously → corrupted data
+- **Deadlocks**: Two threads each wait for a lock the other holds → program freezes
+- **Use-after-free**: One thread frees memory while another is reading it → crash or security vulnerability
+
+NOVA eliminates all of these. Two tasks cannot touch the same memory. If you need to communicate, you copy the data through a channel. This is slightly more memory usage than shared memory, but it's correct by default — you don't need to think about thread safety.
+
+### How data races actually happen (in other languages) and why they can't in NOVA
+
+In Python:
+
+```python
+# DANGEROUS: shared mutable state
+counter = [0]
+
+def increment():
+    for _ in range(1000000):
+        counter[0] += 1    # Not atomic! Two threads can read-modify-write simultaneously
+
+# With two threads, counter might be 1,500,000 instead of 2,000,000
+```
+
+In NOVA, this pattern is structurally impossible. Each task gets its own copy of any data it receives, and there's no way to reference the "same" list from two tasks.
 
 ```nova
 items = [1, 2, 3]
@@ -1623,28 +1843,39 @@ The standard library lives in `$NOVA_HOME/lib/`. The modules available include:
 
 ## 13. Forge: building a REST API
 
-Forge is NOVA's built-in web framework. It is built entirely in NOVA on top of NOVA's TCP and green task primitives. It follows the Erlang/OTP architecture: per-request green tasks, flat arena memory, no GC pauses.
+Forge is NOVA's built-in web framework. When you write `import forge`, you get a full HTTP server — routing, JSON serialization, query parsing, WebSocket support, SQLite integration, JWT authentication, and CSRF protection — all in one import. No package manager, no dependency tree, no virtual environment.
+
+**What makes Forge different from Flask/Express/Gin:**
+
+- **It's compiled.** `nova build server.nova` produces a single ~1.6MB executable. Copy it to a server and run it. No Python runtime, no Node.js, no JVM.
+- **It's fast.** Forge serves requests at C speed. Each request runs in its own green task with arena-scoped memory, so there are no GC pauses.
+- **Structs are JSON.** Return a struct from a handler and Forge automatically serializes it to JSON. Receive JSON in a POST body and Forge automatically deserializes it into a typed struct with validation. No `json.dumps()`, no `JSON.parse()`, no DTO mapping layer.
 
 ### The minimal server
+
+Let's build a working HTTP server in 8 lines:
 
 ```nova
 import forge
 
 fn main()
-    app = forge.app()
+    let app = forge.app()
+
+    // When someone visits http://localhost:8080/, respond with plain text
     forge.get(app, "/", fn(req)
-        forge.text(200, "Hello from NOVA!")
-    )
+        forge.text(200, "Hello from NOVA!"))
+
+    // Start listening on port 8080. This blocks forever.
     forge.serve(app, 8080)
 ```
 
-Run it:
+Save this as `server.nova` and run it:
 
 ```
 nova run server.nova
 ```
 
-Then in another terminal:
+In another terminal, test it:
 
 ```
 curl http://localhost:8080/
@@ -1652,54 +1883,75 @@ curl http://localhost:8080/
 
 Output: `Hello from NOVA!`
 
-### Routes
+**What happened:** `forge.app()` creates an application. `forge.get(app, "/", handler)` registers a handler for GET requests to `/`. `forge.serve(app, 8080)` starts a TCP listener, spawns a green task for each incoming connection, parses the HTTP request, matches it against registered routes, calls your handler, and sends the response. All of that is inside `forge.serve` — you just write the handler.
 
-Forge routes are registered with `forge.get`, `forge.post`, `forge.put`, `forge.delete`, `forge.patch`:
+### Routes — mapping URLs to handlers
+
+Forge supports all standard HTTP methods. Each route is a URL pattern and a handler function:
 
 ```nova
-forge.get(app, "/path", handler_fn)
-forge.post(app, "/path", handler_fn)
-forge.put(app, "/path/:id", handler_fn)
-forge.delete(app, "/path/:id", handler_fn)
+forge.get(app, "/users", list_users)         // GET  /users
+forge.post(app, "/users", create_user)       // POST /users
+forge.put(app, "/users/:id", update_user)    // PUT  /users/42
+forge.delete(app, "/users/:id", delete_user) // DELETE /users/42
+forge.patch(app, "/users/:id", patch_user)   // PATCH  /users/42
 ```
 
-Each handler is a function that receives a `Request` and returns either a string (the raw HTTP response, built with `forge.text`/`forge.json`/`forge.html`) or a struct (automatically serialized to JSON).
+Each handler receives a request object and returns a response. The simplest response is `forge.text(status_code, body)`.
 
-### Path parameters
+**What if someone requests a route you didn't register?** Forge returns HTTP 404 automatically. If they use the wrong HTTP method (e.g., POST to a GET-only route), Forge returns HTTP 405. You don't write these — they're built in.
 
-`:name` in a route pattern captures a dynamic segment:
+### Path parameters — capturing parts of the URL
+
+Put `:name` in a route pattern to capture a dynamic URL segment:
 
 ```nova
 forge.get(app, "/users/:id", fn(req)
-    id = forge.param(req, "id")
+    // If someone visits /users/42, id will be "42"
+    let id = forge.param(req, "id")
     forge.text(200, "User ID: {id}")
 )
+
+forge.get(app, "/posts/:year/:slug", fn(req)
+    let year = forge.param(req, "year")
+    let slug = forge.param(req, "slug")
+    forge.text(200, "Post: {year}/{slug}")
+)
+// GET /posts/2026/hello-world → "Post: 2026/hello-world"
 ```
 
-`forge.param(req, "name")` retrieves the captured segment as a string.
+`forge.param(req, "name")` returns the captured segment as a string. If you need it as an integer, use `parse_int(forge.param(req, "id"))`.
 
-### Query parameters
+### Query parameters — reading ?key=value from the URL
 
 ```nova
 forge.get(app, "/search", fn(req)
-    q = forge.query_get(req, "q")
-    limit_str = forge.query_get(req, "limit")
-    limit = if len(limit_str) > 0 then int(limit_str) else 10
+    let q = forge.query_get(req, "q")              // the search term
+    let limit_str = forge.query_get(req, "limit")   // might be empty
+    let limit = if len(limit_str) > 0 then parse_int(limit_str) else 10
+
     forge.text(200, "Searching for '{q}' with limit {limit}")
 )
-// GET /search?q=nova&limit=5 -> Searching for 'nova' with limit 5
+// GET /search?q=nova&limit=5 → "Searching for 'nova' with limit 5"
+// GET /search?q=nova          → "Searching for 'nova' with limit 10" (default)
 ```
 
-### Request body
+`forge.query_get(req, "key")` returns the value as a string, or `""` if the parameter is missing. Always check `len()` before parsing — an empty string passed to `parse_int` will return an error.
+
+### Request body — reading what the client sent
+
+For POST/PUT/PATCH requests, the client sends data in the body:
 
 ```nova
 forge.post(app, "/echo", fn(req)
-    body = forge.body(req)
+    let body = forge.body(req)
     forge.text(200, "You sent: {body}")
 )
+// curl -X POST -d "hello" http://localhost:8080/echo
+// → "You sent: hello"
 ```
 
-`forge.body(req)` returns the raw request body as a string.
+`forge.body(req)` returns the raw request body as a string. For JSON bodies, you'll usually want `body_as` instead (next section).
 
 ### Returning JSON
 
