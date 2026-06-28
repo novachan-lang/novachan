@@ -307,3 +307,18 @@ joined list with the value-model (split) and RE-RENDERS the <ul> (dom_clear + do
 Adding milk/eggs/bread -> the <ul> has those 3 <li>. Shows string-IN + value-model list + DOM render together --
 a richer app than the counter. Gate _wasm_todo_one.sh. No nova_runtime.c change (dom_clear is a host import).
 NEXT: persistent NOVA module globals in wasm codegen (replace the runtime state-cell); more demos / LiveView-share.
+
+---
+## ★ FINDING (2026-06-28): NOVA has NO mutable module-level global state (NATIVE, not wasm-specific)
+_modglobal_test.nova: a top-level `let counter = 0` + `fn bump(): counter = counter + 1`, called 3x from main,
+then `print(counter)` -> prints **0** NATIVELY (not just in wasm). So `counter = expr` inside a fn does NOT
+mutate the module global -- it binds a function-LOCAL shadow (the RHS reads the global fine, but the write is
+local). This is why the wasm counter (S5e) needed a runtime state-cell: NOVA simply has no mutable module state.
+IMPLICATION (a real design decision, NOT a silent compiler change): NOVA's state model for a frontend (or any
+long-lived mutable state) is currently: (a) a runtime/host cell (the S5e nova_state_get/set workaround), or (b)
+a state-holding PROCESS/actor (the Erlang-shaped way -- spawn a proc that owns the state, send it messages),
+which fits NOVA's process-isolation philosophy ("values owned by processes, not shared"; mutable globals are
+shared-mutable-state = a concurrency hazard the model deliberately avoids). A third option = adding real mutable
+module globals to codegen, but that is reconverge-risky AND arguably against the process-isolation design.
+RECOMMENDATION: treat "NOVA frontend/app state model" as a design decision (process-actor vs cell vs mutable
+global) before any compiler change. The frontend demos work today via the cell. [[project-wasm-value-model]]
