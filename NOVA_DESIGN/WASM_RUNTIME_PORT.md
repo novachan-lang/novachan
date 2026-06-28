@@ -272,3 +272,14 @@ defs in nova_runtime_wasm.c -> the NOVA `extern` declares RESOLVE to them at was
 the logic; the runtime owns the cell. (A real fix = persistent NOVA globals in wasm codegen -- future compiler work.)
 ★ GOTCHA: every NOVA `extern fn` returns i64 by ABI -> a matching C def MUST return int64_t (a `void` def trips a
 wasm-ld signature mismatch -> runtime trap "unreachable"). NEXT: real-browser HTML harness + _wasm_runtime_browser.mjs.
+
+---
+## S5f DONE (2026-06-28): real-browser counter ARTIFACT (html + browser runtime)
+_wasm_counter.html = a self-contained page (div#count + <button>+1) whose inline module script
+instantiateStreaming's _counter.wasm, supplies the DOM host-imports via a Proxy env (dom_get_by_id ->
+document.getElementById + a node<->handle table; dom_set_text -> node.textContent=readCStr; every other import
+-> ()=>0n), calls init() on load, and wires the button click to x.bump(). RUN: serve the dir over http://
+(instantiateStreaming needs application/wasm) and open it. The browser-runtime WIRING is CI-gated by
+_wasm_counter_browser_one.sh (a node sim with a fake document -> count 0->1->2->3), since jsdom is absent. So a
+human can open a real page and click a real button to drive the NOVA-compiled stateful counter. NEXT: Forge-serve
+_wasm_counter.html + _counter.wasm (one language front+back).
