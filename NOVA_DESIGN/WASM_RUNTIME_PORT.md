@@ -248,3 +248,14 @@ under #app. Node oracle (handle side-table + fake document, linked with nova_run
 tree. So a NOVA *render* (computed, not a literal) drives the DOM via the extern-fn -> wasm-import CHANNEL.
 Gate _wasm_domrender_one.sh. No nova_runtime.c change (native untouched). The browser frontend OUT-direction
 (NOVA computes + renders to DOM) is proven end-to-end. NEXT: JS->wasm string IN (exported allocator) + event callbacks.
+
+---
+## S5d DONE (2026-06-28): JS->wasm string IN (round-trip) -- both frontend directions proven
+Added an exported `wasm_alloc(n)->ptr` to nova_runtime_wasm.c (after the #include: returns a RAW-tagged
+nova_heap_alloc buffer that find_tag/len_any read as a string). _wasm_strin.nova: JS writes "hello" into wasm
+memory at wasm_alloc's ptr (+NUL), then echo_len(s)=5 and echo_upper(s) sends upper(s)="HELLO" back via host_emit
+-> round-trip JS->NOVA(value-model)->JS confirmed. This is the event/form-INPUT direction (the frontend doc's
+other deferred item). Gate _wasm_strin_one.sh. nova_runtime.c UNCHANGED (wasm_alloc lives in the shim) -> native
+untouched. => BOTH browser directions proven: OUT (NOVA computes+renders to DOM, S5c) + IN (JS string -> NOVA, S5d).
+NEXT: event callbacks (JS calls an exported wasm fn on a DOM event), then assemble a tiny end-to-end counter/todo
+demo, then wire to the real _wasm_runtime_browser.mjs + an HTML harness.

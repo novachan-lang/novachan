@@ -400,3 +400,11 @@ struct NovaTaskState; /* fwd (real type defined later in the include) */
 static void nova_task_arena_cleanup(void) { }
 
 #include "nova_runtime.c"
+
+/* JS->wasm string IN (frontend event/form-input direction). JS calls wasm_alloc(n) to get a writable buffer
+   ptr in wasm linear memory, writes the UTF-8 bytes + a NUL terminator, then calls a NOVA fn taking a `string`
+   (the ptr as the handle). The buffer is RAW-tagged so nova_mem_find_tag/nova_is_readable_str recognize it as
+   a string (len_any -> strlen). Defined AFTER the #include so nova_heap_alloc + NOVA_MEM_RAW are in scope.
+   wasm-only: native never compiles this file. */
+__attribute__((export_name("wasm_alloc")))
+void* wasm_alloc(int n) { return nova_heap_alloc((size_t)(n < 0 ? 0 : n) + 1, NOVA_MEM_RAW); }
