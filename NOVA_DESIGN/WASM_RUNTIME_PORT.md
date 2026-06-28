@@ -295,3 +295,15 @@ at its first NUL (the wasm's very first byte is NUL -> a 404). Fixed forge.file:
 sent via tcp_send_bytes). Text path unchanged -> forge_static_test still GREEN. This unblocks serving ALL binary
 static assets (wasm/png/fonts/...), not just the demo. (forge/*.nova change -> not a runtime/native change.)
 NEXT: optionally apply the same read_bytes path to serve_file + the static() mount dispatch; persistent NOVA globals.
+
+---
+## S6 DONE (2026-06-28): todo-list demo + binary-static-serving confirmed complete
+(1) BINARY STATIC SERVING confirmed COMPLETE: forge.file fixed in S5g; the static() mount dispatch (_try_static,
+forge.nova ~L3691) was ALREADY binary-safe (reads non-text via read_bytes + the type_name(body)=="bytes" wire
+path + Range/206 support + ETag); serve_file stays intentionally text-only (it returns a string, not a Response).
+So Forge serves any binary static asset (wasm/png/fonts/video). No code change needed beyond S5g.
+(2) TODO-LIST demo (_wasm_todo.nova): JS writes item strings into wasm memory (wasm_alloc), NOVA splits the
+joined list with the value-model (split) and RE-RENDERS the <ul> (dom_clear + dom_create/dom_set_text/dom_append).
+Adding milk/eggs/bread -> the <ul> has those 3 <li>. Shows string-IN + value-model list + DOM render together --
+a richer app than the counter. Gate _wasm_todo_one.sh. No nova_runtime.c change (dom_clear is a host import).
+NEXT: persistent NOVA module globals in wasm codegen (replace the runtime state-cell); more demos / LiveView-share.
