@@ -58,3 +58,59 @@ gateway to lists/dicts. Then structs, then the AI-tensor/compute kernels that ar
 ## Tools present
 clang wasm32 backend ✓, wasm-ld ✓, node v20 (V8 WASM, i64<->BigInt) ✓. wasi-libc ✗ (offline). Always
 `-fno-builtin`. i64 args/returns are BigInt at the JS boundary.
+
+---
+## EXECUTION CHECKLIST (verified 2026-06-28 against nova_runtime.c @ 20462 lines)
+
+### Approach decision: IN-PLACE `#ifndef NOVA_FREESTANDING` gating (not a separate line-range unit)
+The doc above floated "a new nova_runtime_wasm.c that #includes ONLY the value-model section." VERIFIED that
+won't work cleanly: the value-model fns are SCATTERED (L253-938 tags/boxing, L1135-2835 str/list/dict/arena,
+L9591-9781 RC, L17031-17139 arena) and interleaved with I/O. And the I/O fns can't merely be dead-stripped --
+they FAIL TO COMPILE under wasm (no stdio/socket/pthread headers). So they must be gated regardless. Therefore:
+- Gate the SYSTEM includes + every I/O/OS/socket/thread/scheduler section IN PLACE behind `#ifndef NOVA_FREESTANDING`.
+- `output/nova_runtime_wasm.c` = `#define NOVA_FREESTANDING` + tiny libc stubs + `#include "nova_runtime.c"`.
+- Compile that ONE unit: `clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c`.
+- NATIVE stays byte-identical: every gate is `#ifndef NOVA_FREESTANDING` (native, flag absent, includes all as
+  before). VERIFY each step by recompiling nova_runtime.o native + byte-diffing the .o (or rerunning a forge
+  test). This is the hard invariant.
+
+### Verified facts
+- 20462 lines. System includes L1-10 (stdio,stdlib,string,time,stdint,stddef,math,ctype,errno,setjmp); keep
+  stdint/stddef/setjmp bare (no OS). Win32 block L12-27, POSIX block L31-51 (pthread/socket/dlfcn/execinfo/openssl).
+- Existing scaffolding (minimal): L618-631 `nova_heap_alloc` freestanding bump branch (returns early, tags ARENA
+  -> rc_dec no-op, static 8MB buffer, -DNOVA_FS_HEAP_SIZE override) + L9807 cleanup-profiler gate. That's ALL.
+
+### Gate list (wrap each in `#ifndef NOVA_FREESTANDING`; line #s approximate -- CONFIRM at edit time)
+1. Includes L1-10 (keep stdint/stddef/setjmp bare), Win32 L12-27, POSIX L31-51.
+2. find_tag (L713-791): drop the Windows `IsBadReadPtr` (~L733) + POSIX page-probe (`nova_probe_cstr` ~L977-988,
+   `nova_is_readable_str` POSIX path) -> wasm uses range+alignment+magic only (linear memory, no guard pages).
+3. nova_rt_aligned_struct_alloc (L672-693): add NOVA_FREESTANDING path -> plain nova_rt_struct_alloc (ignore align).
+4. RC: nova_rc_inc/dec (L9721-9781) -> non-atomic N=1 path under freestanding; rc_free channel-cleanup case
+   (~L9638-9663, DeleteCriticalSection/pthread_mutex_destroy) gate out (channels excluded).
+5. EXCLUDE entirely (gate): exit/system/exec L2958-3007; process L3024-3098; stdin/out/err L3262-3300; file ops
+   L3305-3375 + L13316-13438; print family L4299-4305,L4477-4500 + nova_rt_list_print L1620-1629; channels
+   L4508-4675; scheduler/fiber/netpoller/offload (~L5000-8260, incl nova_rt_spawn L8089-8243); HTTP/TCP/DNS/TLS;
+   os_random (CryptGenRandom/urandom); hot-reload (dlfcn); backtrace (execinfo).
+6. KEEP (must compile under wasm): tags/boxing/oddballs L253-938, str create/concat L1135-1194, list L1233-1731
+   (minus print), dict L1199-2835, arena L17031-17139, RC L9591-9781, find_tag (adapted), len_any/iter dispatch.
+
+### Tiny libc stubs (in nova_runtime_wasm.c, before the #include)
+memcpy/memmove/memset/strlen/strcmp/strncmp (portable loops) + snprintf (minimal int/float/%s formatter for
+int_to_str/float_to_str/list_to_str). `#define malloc -> nova_heap_alloc(sz,NOVA_MEM_RAW)`, `free -> no-op`,
+`calloc -> alloc+memset`. NOTE: clang lowers struct copies to memcpy -> memcpy MUST exist. Compile `-fno-builtin`
+(else -O2 loop-idiom re-emits a strlen import -> BigInt crash in V8). os_random -> host import (crypto.getRandomValues).
+
+### Incremental execution order (each step: build wasm unit further + RECOMPILE NATIVE .o + verify byte-identical/forge-green + commit)
+S1. Gate includes (L1-10/12-27/31-51) + add stubs file scaffold. Verify native byte-identical. (no wasm milestone yet)
+S2. Gate the big I/O/scheduler/socket sections (#5 list). Native byte-identical. Try wasm compile -> collect the
+    NEXT undefined-symbol/header errors (iterate the gate list until the value-model TU compiles to a wasm .o).
+S3. Adapt find_tag (#2) + aligned_struct (#3) + RC non-atomic + rc_free channel gate (#4). wasm .o links.
+S4. MILESTONE: a NOVA fn that BUILDS a string ("a"+"b"+"c") + measures it runs in node wasm (str_concat + FAT_STR
+    find_tag + freestanding heap). Then lists, then dicts, then structs. Gate via a _wasm_vm_*.sh runner.
+
+### Risks
+- A gate that wraps native-needed code -> native breaks (CAUGHT by the per-step native .o diff / forge test).
+- snprintf float formatting fidelity in wasm (float_to_str) -- may need a careful dtoa; defer (strings/lists/ints
+  first, floats later).
+- find_tag without guard pages: a genuinely-wild ptr in `any` dispatch can't be probed -> wasm relies on
+  range+magic only. Acceptable (wasm linear memory is bounds-checked by the engine; OOB traps deterministically).
