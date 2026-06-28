@@ -906,3 +906,24 @@ N=1 stays byte-identical (all N>1 changes gated on g_carrier_count>1). Commits 1
 9514726, bf865da, a8a39b6. Memory project-mn-scheduler-step1 updated.
 => N>1 multi-core is essentially COMPLETE for validation/hardening. Remaining: optional soak (longer/rarer),
    then the other big pieces (WASM value-model carve; live PG/TLS interop) -- owner steer.
+
+---
+## (as) 2026-06-28 — ★★ WASM FRONTEND ARC COMPLETE + soundness; at an OWNER-STEER point for the deep gaps
+Following the N>1 milestone (ar), this run built + gated the WHOLE WASM frontend story (commits d5912ae..4a99ef4):
+- VALUE-MODEL in wasm: strings/lists/dicts/structs + control-flow run (S1-S5). The carve = output/nova_runtime_wasm.c
+  (`#define NOVA_FREESTANDING` + a freestanding libc shim + `#include nova_runtime.c` + wasm_alloc/nova_state_get/set
+  + __multi3). nova_runtime.c touched in only 5 NATIVE-token-identical `#ifndef NOVA_FREESTANDING` spots.
+- FRONTEND: bidirectional DOM/string boundary (render-out S5b/S5c, string-in S5d), stateful counter (event+state+
+  render via a runtime CELL, S5e), todo list (S6), real-browser HTML artifact (S5f), and Forge serving the wasm
+  frontend full-stack (S5g + a forge.file binary-serve fix).
+- CORRECTNESS: fixed __multi3 (i128 mul was undefined -> optimized big-int computed WRONG); soundness sweep
+  (float/math/div/OOB sound vs native, trap-on-unknown-import harness); heap-OOM verified graceful.
+- ~10 new gates: _wasm_vm/_render/_domrender/_strin/_counter/_counter_browser/_todo/_bench/_sound/_heap _one.sh +
+  _forge_wasm_demo_one.sh. Docs: WASM_FRONTEND_GUIDE.md (dev guide), WASM_RUNTIME_PORT.md (carve+findings).
+- FINDINGS: NOVA has no mutable module globals (native); spawn/actors don't run in wasm (no scheduler) -> the cell
+  is the wasm state model. The audit's "NO frontend / WASM no-op stub" blocker is SUBSTANTIALLY CLOSED (audit
+  updated ee8df65). Memory project-wasm-value-model captures it all.
+★ STEER POINT: the remaining deep gaps are RECONVERGE-RISKY (touch the native self-hosting compiler) -> NEED OWNER
+SIGN-OFF. Ranked recommendation in NEXT_DEEP_GAPS_2026_06_28.md: (1) default-memory RC [highest leverage, owner-
+supervise], (2) float-array perf S4/S5, (3) wasm cooperative scheduler [safe-ish, completes frontend], (4) ARM/
+macOS [needs hardware], (5) GPU/AI. Safe wasm work is exhausted (verified sound). LIVE RESUME = this file.
