@@ -361,13 +361,14 @@ fn build_hover_response(id: int, doc: string) -> string
     build_response(id, "\{\"contents\":" + contents + "\}")
 
 // ── Go-to-definition: find line + column where a symbol is declared ─────────
-// Returns dict with keys: found (0/1), line (int), start_col (int), end_col (int)
+// Returns dict with keys: found (0/1), line (int), start_col (int), end_col (int), found_uri (string)
 fn find_definition_location(source: string, name: string) -> dict
     let result = {}
     result["found"] = 0
     result["line"] = 0
     result["start_col"] = 0
     result["end_col"] = 0
+    result["found_uri"] = ""
     if len(name) == 0
         return result
     let lines = split(source, "\n")
@@ -376,6 +377,7 @@ fn find_definition_location(source: string, name: string) -> dict
         let raw = lines[i]
         let line = trim(raw)
         let prefix = ""
+        // Standard top-level declarations
         if starts_with(line, "fn " + name + "(") or starts_with(line, "fn " + name + " ") or starts_with(line, "fn " + name + "<")
             prefix = "fn "
         else if starts_with(line, "let " + name + " ") or starts_with(line, "let " + name + "=") or starts_with(line, "let " + name + ":")
@@ -397,8 +399,76 @@ fn find_definition_location(source: string, name: string) -> dict
             result["start_col"] = start_col
             result["end_col"] = start_col + len(name)
             return result
+        // Method with receiver type: fn SomeType.name( or fn SomeType.name<
+        if starts_with(line, "fn ") and (contains(line, "." + name + "(") or contains(line, "." + name + "<"))
+            let dot_pos = find(raw, "." + name)
+            if dot_pos >= 0
+                result["found"] = 1
+                result["line"] = i
+                result["start_col"] = dot_pos + 1
+                result["end_col"] = dot_pos + 1 + len(name)
+                return result
+        // Struct field: indented `    field_name: type`  (no leading `let`)
+        if (starts_with(raw, "    ") or starts_with(raw, "\t")) and starts_with(line, name + ":") and not starts_with(line, "let ")
+            let field_pos = find(raw, name + ":")
+            if field_pos >= 0
+                result["found"] = 1
+                result["line"] = i
+                result["start_col"] = field_pos
+                result["end_col"] = field_pos + len(name)
+                return result
         i = i + 1
     return result
+
+// ── Cross-module definition search ──────────────────────────────────────────
+
+fn uri_to_dir(uri: string) -> string
+    let path = uri
+    if starts_with(path, "file:///")
+        path = slice(path, 8, len(path))
+    else if starts_with(path, "file://")
+        path = slice(path, 7, len(path))
+    let last = -1
+    let k = 0
+    while k < len(path)
+        let c = path[k]
+        if c == "/" or c == "\\"
+            last = k
+        k = k + 1
+    if last < 0
+        return ""
+    slice(path, 0, last + 1)
+
+fn find_in_imports(source: string, name: string, current_uri: string) -> dict
+    let empty = {}
+    empty["found"] = 0
+    empty["line"] = 0
+    empty["start_col"] = 0
+    empty["end_col"] = 0
+    empty["found_uri"] = ""
+    let src_dir = uri_to_dir(current_uri)
+    let lines = split(source, "\n")
+    for raw_line in lines
+        let trimmed = trim(raw_line)
+        if not starts_with(trimmed, "import ")
+            continue
+        let rest = trim(slice(trimmed, 7, len(trimmed)))
+        let module_name = rest
+        let space_pos = find(rest, " ")
+        if space_pos >= 0
+            module_name = slice(rest, 0, space_pos)
+        if len(module_name) == 0
+            continue
+        let file_path = src_dir + module_name + ".nova"
+        let content = ""
+        if file_exists(file_path)
+            content = read_file(file_path)
+        if len(content) > 0
+            let loc = find_definition_location(content, name)
+            if loc["found"] == 1
+                loc["found_uri"] = "file:///" + file_path
+                return loc
+    empty
 
 fn build_definition_response(id: int, uri: string, loc: dict) -> string
     if loc["found"] == 0
@@ -532,7 +602,12 @@ fn handle_message(msg: string, docs: dict, compiler: string) -> int
         let word = word_at_position(source, line_no, ch)
         log_msg("[nova-lsp] definition word=" + word)
         let loc = find_definition_location(source, word)
-        send_message(build_definition_response(id, uri, loc))
+        let result_uri = uri
+        if loc["found"] == 0
+            loc = find_in_imports(source, word, uri)
+        if loc["found"] == 1 and len(loc["found_uri"]) > 0
+            result_uri = loc["found_uri"]
+        send_message(build_definition_response(id, result_uri, loc))
         return 0
     if method == "textDocument/completion"
         send_message(build_completion_response(id))

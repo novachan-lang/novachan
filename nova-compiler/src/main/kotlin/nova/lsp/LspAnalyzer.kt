@@ -192,6 +192,16 @@ class LspAnalyzer {
 
         val word = getWordAt(text, line, col) ?: return null
 
+        // 1. Dot-context detection: check if the char immediately before the identifier is '.'
+        val isDotContext = isDotPreceding(text, line, col)
+
+        // 2. Member definition search when dot-context is detected
+        if (isDotContext) {
+            val memberResult = findMemberDefinition(uri, program, word)
+            if (memberResult != null) return memberResult
+        }
+
+        // 3. Top-level search in current file (includes TraitDecl)
         for (stmt in program.stmts) {
             when (stmt) {
                 is FnDecl -> if (stmt.name == word)
@@ -199,6 +209,8 @@ class LspAnalyzer {
                 is TypeDecl -> if (stmt.name == word)
                     return LocationInfo(uri, stmt.span.start.line - 1, stmt.span.start.col - 1)
                 is EnumDecl -> if (stmt.name == word)
+                    return LocationInfo(uri, stmt.span.start.line - 1, stmt.span.start.col - 1)
+                is TraitDecl -> if (stmt.name == word)
                     return LocationInfo(uri, stmt.span.start.line - 1, stmt.span.start.col - 1)
                 is AssignStmt -> if (stmt.target is Ident && (stmt.target as Ident).name == word)
                     return LocationInfo(uri, stmt.span.start.line - 1, stmt.span.start.col - 1)
@@ -210,10 +222,55 @@ class LspAnalyzer {
                 for (p in stmt.params) {
                     if (p.name == word) return LocationInfo(uri, stmt.span.start.line - 1, stmt.span.start.col - 1)
                 }
-                val localDef = findLocalDef(stmt.body, word)
+                // 3a. Recursive local variable search inside function bodies
+                val localDef = findLocalDefRecursive(stmt.body.stmts, word)
                 if (localDef != null) return LocationInfo(uri, localDef.start.line - 1, localDef.start.col - 1)
             }
         }
+
+        // 4. Cross-module import search
+        val docFile = try { File(URI(uri)) } catch (_: Exception) { null }
+        val docDir = docFile?.parentFile
+
+        for (stmt in program.stmts) {
+            if (stmt !is ImportStmt) continue
+            val moduleName = stmt.module.substringAfterLast(".")
+
+            // Try to locate the module file: (a) same dir as doc, (b) $NOVA_HOME/lib/<name>.nova
+            val candidates = mutableListOf<File>()
+            if (docDir != null) {
+                candidates.add(File(docDir, "$moduleName.nova"))
+            }
+            val novaHome = System.getenv("NOVA_HOME")
+            if (novaHome != null) {
+                candidates.add(File(novaHome, "lib/$moduleName.nova"))
+            }
+
+            for (moduleFile in candidates) {
+                if (!moduleFile.exists()) continue
+                val moduleText = try { moduleFile.readText() } catch (_: Exception) { continue }
+                val moduleUri = moduleFile.toURI().toString()
+                val moduleResult = analyze(moduleUri, moduleText)
+                val moduleProgram = moduleResult.program ?: continue
+
+                for (mStmt in moduleProgram.stmts) {
+                    when (mStmt) {
+                        is FnDecl -> if (mStmt.name == word)
+                            return LocationInfo(moduleUri, mStmt.span.start.line - 1, mStmt.span.start.col - 1)
+                        is TypeDecl -> if (mStmt.name == word)
+                            return LocationInfo(moduleUri, mStmt.span.start.line - 1, mStmt.span.start.col - 1)
+                        is EnumDecl -> if (mStmt.name == word)
+                            return LocationInfo(moduleUri, mStmt.span.start.line - 1, mStmt.span.start.col - 1)
+                        is TraitDecl -> if (mStmt.name == word)
+                            return LocationInfo(moduleUri, mStmt.span.start.line - 1, mStmt.span.start.col - 1)
+                        else -> {}
+                    }
+                }
+                // Found a candidate module file that parsed; stop looking at other candidates
+                break
+            }
+        }
+
         return null
     }
 
@@ -258,6 +315,10 @@ class LspAnalyzer {
         return items
     }
 
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
     private fun findNodeTypeAt(result: AnalysisResult, line: Int, col: Int): NovaType? {
         for ((expr, type) in result.nodeTypes) {
             val s = expr.span
@@ -266,10 +327,113 @@ class LspAnalyzer {
         return null
     }
 
-    private fun findLocalDef(body: Block, name: String): SourceSpan? {
-        for (stmt in body.stmts) {
-            if (stmt is AssignStmt && stmt.target is Ident && (stmt.target as Ident).name == name) {
-                return stmt.span
+    /**
+     * Returns true if the character immediately before the identifier starting
+     * at (line, col) is a dot, indicating a member-access expression like `foo.bar`.
+     */
+    private fun isDotPreceding(text: String, line: Int, col: Int): Boolean {
+        val lines = text.lines()
+        if (line < 0 || line >= lines.size) return false
+        val ln = lines[line]
+        // Walk back to the start of the current identifier
+        var identStart = col
+        while (identStart > 0 && isIdentChar(ln[identStart - 1])) identStart--
+        // The character directly before the identifier
+        if (identStart <= 0) return false
+        return ln[identStart - 1] == '.'
+    }
+
+    /**
+     * Search program-level declarations for a member named [memberName]:
+     *   - TypeDecl fields
+     *   - FnDecl with a receiver type (method-style)
+     *   - TraitDecl method signatures
+     */
+    private fun findMemberDefinition(uri: String, program: Program, memberName: String): LocationInfo? {
+        for (stmt in program.stmts) {
+            when (stmt) {
+                is TypeDecl -> {
+                    for (field in stmt.fields) {
+                        if (field.name == memberName) {
+                            return LocationInfo(
+                                uri,
+                                field.span.start.line - 1,
+                                field.span.start.col - 1
+                            )
+                        }
+                    }
+                }
+                is FnDecl -> {
+                    if (stmt.receiverType != null && stmt.name == memberName) {
+                        return LocationInfo(
+                            uri,
+                            stmt.span.start.line - 1,
+                            stmt.span.start.col - 1
+                        )
+                    }
+                }
+                is TraitDecl -> {
+                    for (method in stmt.methods) {
+                        if (method.name == memberName) {
+                            return LocationInfo(
+                                uri,
+                                method.span.start.line - 1,
+                                method.span.start.col - 1
+                            )
+                        }
+                    }
+                }
+                else -> {}
+            }
+        }
+        return null
+    }
+
+    /**
+     * Recursively search a list of statements for the definition of [name].
+     * Handles:
+     *   - AssignStmt  (target is Ident)
+     *   - ForStmt     (variable is IdentPat, then recurses into body.stmts)
+     *   - WhileStmt   (recurses into body.stmts)
+     *   - ExprStmt    containing IfBlockExpr (recurses into thenBlock and elseClause as ElseBlock)
+     *   - SpawnBlockStmt (recurses into body.stmts)
+     */
+    private fun findLocalDefRecursive(stmts: List<Stmt>, name: String): SourceSpan? {
+        for (stmt in stmts) {
+            when (stmt) {
+                is AssignStmt -> {
+                    if (stmt.target is Ident && (stmt.target as Ident).name == name) {
+                        return stmt.span
+                    }
+                }
+                is ForStmt -> {
+                    if (stmt.variable is IdentPat && (stmt.variable as IdentPat).name == name) {
+                        return stmt.span
+                    }
+                    val found = findLocalDefRecursive(stmt.body.stmts, name)
+                    if (found != null) return found
+                }
+                is WhileStmt -> {
+                    val found = findLocalDefRecursive(stmt.body.stmts, name)
+                    if (found != null) return found
+                }
+                is ExprStmt -> {
+                    val expr = stmt.expr
+                    if (expr is IfBlockExpr) {
+                        val thenFound = findLocalDefRecursive(expr.thenBlock.stmts, name)
+                        if (thenFound != null) return thenFound
+                        val elseClause = expr.elseClause
+                        if (elseClause is ElseBlock) {
+                            val elseFound = findLocalDefRecursive(elseClause.block.stmts, name)
+                            if (elseFound != null) return elseFound
+                        }
+                    }
+                }
+                is SpawnBlockStmt -> {
+                    val found = findLocalDefRecursive(stmt.body.stmts, name)
+                    if (found != null) return found
+                }
+                else -> {}
             }
         }
         return null
