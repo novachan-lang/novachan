@@ -215,3 +215,13 @@ bounds-checked so even a misclassified ptr traps, never wild-reads; heap objects
 Native token-identical (inert for _WIN32) + forge_query_test GREEN. Total nova_runtime.c carve edits now 5
 (4 include-gates + this literal branch), ALL #ifndef/#elif NOVA_FREESTANDING, ALL native token-identical.
 NEXT: structs in wasm (auto-JSON / Show), bigger programs, then wire to the browser frontend (WASM_FRONTEND_*).
+
+---
+## S5 DONE (2026-06-28): STRUCTS + control-flow run in wasm (no runtime fix needed)
+Extended _wasm_strbuild.nova + the gate: all SIX correct in node wasm -- strbuild=3, listlen=4, dictlen=3,
+structfield=42 (Point(7,35).x+.y), loopsum=55 (while-loop sum of i*i), listindex=15 (list literal + while +
+xs[i] index). Structs "just worked" via the freestanding struct alloc (nova_rt_struct_alloc / posix_memalign
+shim -> bump) + header-based find_tag (same as list/dict). No nova_runtime.c change this step (native untouched).
+=> the FULL value-model (string/list/dict/struct) + control flow + index access execute in WebAssembly.
+NEXT: a JS<->NOVA boundary for the browser frontend (return a built STRING to JS as the 'render' -- needs
+reading the i64 string-handle's bytes out of wasm linear memory in the harness), per WASM_FRONTEND_*.
