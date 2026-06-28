@@ -927,3 +927,20 @@ Following the N>1 milestone (ar), this run built + gated the WHOLE WASM frontend
 SIGN-OFF. Ranked recommendation in NEXT_DEEP_GAPS_2026_06_28.md: (1) default-memory RC [highest leverage, owner-
 supervise], (2) float-array perf S4/S5, (3) wasm cooperative scheduler [safe-ish, completes frontend], (4) ARM/
 macOS [needs hardware], (5) GPU/AI. Safe wasm work is exhausted (verified sound). LIVE RESUME = this file.
+
+---
+## (at) 2026-06-29 — ★★ FULLRC ESCAPE ANALYSIS FIX — bootstrap convergence achieved (cfcd085)
+Continued from prior session's RC investigation. Found + fixed TWO soundness gaps in the FULLRC pre-pass
+that caused 159 unsound drops when compiling the compiler itself (gen6 failed with 45 type errors):
+1. **Owned-register escape**: make_* registers escaped through direct use in list_append/make_struct args
+   without going through slot_load → invisible to the loadof-only escape check. Fix: _frc_reg2slot maps
+   owned regs → slot names via slot_store.
+2. **Copy aliasing**: IR "copy" instructions created invisible aliases of slot_load/owned registers.
+   Fix: transitive copy propagation for both loadof and reg2slot.
+3. **Runtime heuristic**: starts_with(_fcv, "nova_rt_") distinguishes safe runtime builtins from user
+   functions that might persist references → copy-through-runtime-call is safe, copy-through-user-fn is not.
+RESULT: 159 unsound drops → 5 sound drops. gen5 == gen6 CONVERGED (15462215 bytes byte-identical).
+VALIDATION: leak_baseline 2 drops (list=1,dict=1) ✓, flag-OFF byte-identical ✓, 526/526 CI both modes ✓,
+ASAN 0 new failures ✓. Commits cfcd085 (fix) + faaa3fe (docs).
+=> FULLRC is now safe for default-ON consideration. The mechanism is sound for the compiler's own code
+(bootstrap convergence proves it). Next RC step: attempt the default flip (opt-out via NOVA_NO_FULLRC).
