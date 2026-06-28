@@ -39,8 +39,10 @@ gap and the design is ready. If a lower-risk slice is preferred first: **(3) the
 the frontend story) or **(4) ARM/macOS** (if hardware is available). Avoid starting (1)/(2) without sign-off —
 they reconverge the self-hosting compiler.
 
-## Noted edge-case (low priority, not blocking)
-WASM heap OOM: the freestanding bump heap (`NOVA_FS_HEAP_SIZE`, 8MB default) returns NULL on exhaustion. In wasm,
-address 0 is a VALID linear-memory address (unlike a native segfault), so a NULL deref on OOM could corrupt rather
-than trap. Mitigations: size the heap via `-DNOVA_FS_HEAP_SIZE`, and (future) add a NULL-check in the value-model
-allocators' callers under NOVA_FREESTANDING. Frontends rarely OOM, so this is a documented caveat, not a blocker.
+## Noted edge-case — ★ RESOLVED (verified graceful, gated)
+WASM heap OOM: the freestanding bump heap (`NOVA_FS_HEAP_SIZE`, 8MB default) returns NULL on exhaustion. The
+concern was that address 0 is a VALID wasm linear-memory address (unlike a native segfault), so a NULL deref on
+OOM could corrupt rather than trap. VERIFIED NOT AN ISSUE (gate `_wasm_heap_one.sh`): a string doubled 25x (32MB)
+exhausts the heap, but the value-model's NULL-handle guards (`nova_str_safe`/`find_tag` reject `addr < 0x10000`)
+turn the NULL handle into "" (len 0) BEFORE any deref -> `bigalloc()` returns 0 GRACEFULLY, no corruption/crash/
+hang. Size the heap via `-DNOVA_FS_HEAP_SIZE` for larger working sets. Not a blocker, not a soundness hole.
