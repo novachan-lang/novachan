@@ -65,8 +65,8 @@ INCLUDING leak_baseline (2 drops for x and d).
 
 </details>
 
-## Current state (accurate as of 2026-06-29, updated after cfcd085)
-- **NOVA_T8_FULLRC = WORKING, SOUND, CI-VALIDATED, BOOTSTRAP-CONVERGENT.** Default OFF (opt-in via env var).
+## Current state (accurate as of 2026-06-29, updated after c4da4aa)
+- **★★★ FULLRC = DEFAULT-ON (c4da4aa).** Opt-out via `NOVA_NO_FULLRC=1`. All programs get reassignment drops.
 - **Escape analysis fix (cfcd085):** Three soundness improvements to the FULLRC pre-pass:
   1. **reg2slot tracking**: owned (make_*) registers mapped to their slots via slot_store, so escapes
      through the original register (not just slot_load) are caught
@@ -78,7 +78,7 @@ INCLUDING leak_baseline (2 drops for x and d).
 - **W5b return-drop = DEFAULT-ON** (do_w5b=true at ~16925).
 - **Per-request ARENA = DONE + proven** (server hot path, 99% of Forge).
 - **NOVA_T8_SCOPE (general escaping/borrowed) = NOT IMPLEMENTED** (design-complete only).
-- **Next step:** FULLRC can now be considered for default-ON. Bootstrap converges (5 sound drops),
-  CI passes in both modes (526/526), ASAN clean, flag-OFF byte-identical. Only channels remain
-  (separate extension). The default flip requires one more gen iteration (gen3→gen4→gen5→gen6 with
-  the new default) to validate the transition.
+- **Default flip DONE (c4da4aa):** gen5==gen6==gen7 CONVERGED (15462309 bytes, 5 drops). 526/526
+  regression pass. Opt-out (`NOVA_NO_FULLRC=1`) produces 0 drops (byte-identical to old behavior).
+- **Remaining:** channels (need channel destructor for buffered items), scope-exit RC (design-complete,
+  not implemented). Neither blocks Forge or typical programs.
