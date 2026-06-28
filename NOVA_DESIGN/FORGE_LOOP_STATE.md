@@ -944,3 +944,15 @@ VALIDATION: leak_baseline 2 drops (list=1,dict=1) ✓, flag-OFF byte-identical �
 ASAN 0 new failures ✓. Commits cfcd085 (fix) + faaa3fe (docs).
 => FULLRC is now safe for default-ON consideration. The mechanism is sound for the compiler's own code
 (bootstrap convergence proves it). Next RC step: attempt the default flip (opt-out via NOVA_NO_FULLRC).
+
+---
+## (au) 2026-06-29 — ★★★ FULLRC DEFAULT-ON (c4da4aa) — the #1 memory gap CLOSED at the compiler level
+Flipped FULLRC from opt-in (NOVA_T8_FULLRC=1) to DEFAULT-ON (opt-out via NOVA_NO_FULLRC=1).
+VALIDATION: gen5==gen6==gen7 CONVERGED (15462309 bytes, 5 drops, byte-identical across 3 generations).
+Regression 526/526 pass (identical to baseline, 0 FULLRC-only failures). Opt-out verified (0 drops).
+EFFECT: all NOVA programs now automatically free old values on loop-local reassignment (list/dict/struct).
+leak_baseline: list 2000→1, dict 2000→1 (chan still 2000, needs channel destructor — separate extension).
+Combined with per-request arena (server hot path), NOVA now has a TWO-LAYER default memory model:
+  Layer 1: Per-request ARENA (short-lived, cycle-immune, zero-pause)
+  Layer 2: FULLRC reassignment drops (long-lived, sound, compiler-analyzed)
+The "default code leaks" audit finding is SUBSTANTIALLY CLOSED. Remaining = channels + scope-exit RC.
