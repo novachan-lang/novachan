@@ -887,3 +887,5 @@ invent risky work.
 ## (ao) 2026-06-28 — regression-confirm (rotation 2/4): forge_query, forge_header, forge_reqparse, forge_redirect_safe, forge_crypto_gcm = 5/5 GREEN. Safe surface exhausted; moved loop to ~30min idle health-check cadence (zero-marginal 2min churn -> wasteful; user input still interrupts immediately).
 
 ## (ap) 2026-06-28 — regression-confirm (rotation 3/4): forge_sse_format, json_ctrl_escape, forge_typed_core, forge_pg_scram = 4/4 GREEN. Pure-maintenance; ~30min cadence.
+
+## (aq) 2026-06-28 — regression-confirm (rotation 4/4): forge_range, forge_chain = 2/2 GREEN. FULL ROTATION CYCLE COMPLETE -- all touched tests confirmed green across rotations 1-4. Codebase stable; pure-maintenance ~30min cadence; awaiting user for supervised high-value work (N>1/WASM-carve/live-PG-TLS).
