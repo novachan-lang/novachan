@@ -14,7 +14,8 @@ $lflags = "-lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w"
 # test -> the substring that proves a CORRECT, COMPLETE run (not just a clean exit)
 $tests = @(
     @{ name = "green_scale_test"; ok = "GREEN SCALE PASS" },
-    @{ name = "_mn_stress_test";  ok = "MN_STRESS_OK" }
+    @{ name = "_mn_stress_test";  ok = "MN_STRESS_OK" },
+    @{ name = "_mn_churn";        ok = "MN CHURN OK" }   # sequential slot-reuse + reclaim-bounds-the-pool proof (default reclaim ON at N>1)
 )
 
 $fail = 0

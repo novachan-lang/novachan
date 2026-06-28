@@ -6546,6 +6546,12 @@ static int64_t g_task_free_top = 0;
 static int64_t g_task_free_cap = 0;
 static int g_reclaim_task = 0;                /* NOVA_SCHED_RECLAIM_TASK: 1 => recycle finished slots */
 
+/* Diagnostic: distinct task slots EVER allocated (grow-only -- a freelist-reused slot is not recounted).
+   With reclaim ON, slots are recycled so this stays ~ the max concurrent task count; with reclaim OFF it
+   equals the total number of spawns. Exposed (non-static) so a test can read it via extern to prove that
+   the N>1 reclaim bounds the task-slot pool. */
+int64_t nova_rt_sched_slot_count(void) { return g_task_slot_count; }
+
 static inline int64_t nova_task_encode(int64_t slot, int64_t gen) {
     return (gen << (NOVA_TASK_SLOT_BITS + 1)) | (slot << 1) | 1;     /* bit0=1 (odd) | slot | gen, bit63=0 */
 }
