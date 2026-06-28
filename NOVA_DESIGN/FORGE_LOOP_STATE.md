@@ -889,3 +889,20 @@ invent risky work.
 ## (ap) 2026-06-28 — regression-confirm (rotation 3/4): forge_sse_format, json_ctrl_escape, forge_typed_core, forge_pg_scram = 4/4 GREEN. Pure-maintenance; ~30min cadence.
 
 ## (aq) 2026-06-28 — regression-confirm (rotation 4/4): forge_range, forge_chain = 2/2 GREEN. FULL ROTATION CYCLE COMPLETE -- all touched tests confirmed green across rotations 1-4. Codebase stable; pure-maintenance ~30min cadence; awaiting user for supervised high-value work (N>1/WASM-carve/live-PG-TLS).
+
+---
+## (ar) 2026-06-28 — ★★ N>1 MULTI-CORE VALIDATED + GATED END-TO-END (user-supervised session)
+Drove the #1 capability gap (real multi-core / N>1) to a validated, gated state. NOVA/Forge genuinely runs
+multi-core. All GREEN at NOVA_CARRIERS=4 AND 8:
+- SCHEDULER CORE: green_scale (10k) + _mn_stress + _mn_churn (sequential slot-reuse) -> _n_carriers_ci.ps1.
+- TASK-SLOT MEMORY: reclaim DEFAULT-ON at N>1 (3fbe7e3, owner-approved); PROVEN bounded -- _mn_churn shows
+  20001 distinct slots reclaim-OFF vs 3 ON (~6700x); self-checking gate. nova_rt_sched_slot_count() diag.
+- HTTP SERVING: forge_recv_security (body framing) + forge_mn_load (12 concurrent clients, unique bodies,
+  NO cross-talk -> serving scales w/ correct per-conn routing) x reclaim 0/1 -> _forge_mn_ci.ps1 (bf865da).
+- WS/SSE: SSE hub (publish->subscriber+keepalive) + WS handshake + WS room BROADCAST (single-writer) ->
+  _ws_mn_ci.ps1 (a8a39b6). The last "WS/sockets at N>1 unre-validated" gap CLOSED.
+THREE permanent N>1 gates: _n_carriers_ci.ps1 (scheduler), _forge_mn_ci.ps1 (HTTP), _ws_mn_ci.ps1 (WS/SSE).
+N=1 stays byte-identical (all N>1 changes gated on g_carrier_count>1). Commits 1231c25, 5d9c8ae, 3fbe7e3,
+9514726, bf865da, a8a39b6. Memory project-mn-scheduler-step1 updated.
+=> N>1 multi-core is essentially COMPLETE for validation/hardening. Remaining: optional soak (longer/rarer),
+   then the other big pieces (WASM value-model carve; live PG/TLS interop) -- owner steer.
