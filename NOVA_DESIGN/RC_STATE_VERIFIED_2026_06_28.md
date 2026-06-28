@@ -67,3 +67,24 @@ each loop-iteration `let` is treated as a distinct binding that the slot_store s
 before (flag-OFF byte-identical; flag-ON ASAN-on-ALL + 432/0 + reconverge gen5==gen6 + green_scale + leak delta
 drop). The general escaping/borrowed case stays all-or-nothing, but the HEADLINE loop-rebind leak is a focused,
 bounded extension of an already-working sound mechanism.
+
+## ★★ DIFFERENTIAL NARROWING (same session) — it's a WHOLE-FUNCTION bug on COMPLEX functions
+Drop-call counts under NOVA_T8_FULLRC=1 (grep `call i64 @nova_rt_rc_drop_reassign`):
+- straight-line `x=[..]; x=[..]`           -> 2   (works)
+- reassign INSIDE a loop (x declared above) -> 2   (works)
+- single loop-local `let x=[i]`             -> 1   (works)
+- loop-local `let x=[i,i+1,i+2]` (3-elem)   -> 1   (works)
+- 3-elem + live_count delta                 -> 1   (works)
+- list + dict (2 heap loops)                -> 2   (works)
+- list x + a channel loop                   -> 1   (works)
+- **leak_baseline (list+dict+chan + 3 deltas) -> 0** (BROKEN)
+Every simpler pattern drops; only the full multi-loop+delta function emits ZERO. So the bug is NOT in the
+straight-line/loop-local logic (all sound) — it is a WHOLE-FUNCTION pre-pass issue that, on a sufficiently complex
+function (3 heap loops + the b0/b1/b2 + *_delta slots + send/receive), wrongly flags ALL candidate slots as bad
+(cross-contamination), so leak_baseline gets nothing. NEXT (decisive): instrument the pre-pass (NOVA_T8_DEBUG,
+flag-gated) to dump _frc_owned/_frc_bad/_frc_stored/ire_fullrc_drop for leak_baseline and see WHICH unrelated use
+poisons x/d (candidates: a delta/live_count load, the channel send/receive args, or a slot-key collision across
+the 12+ slots). The fix is then a targeted pre-pass correction — still a bounded extension of a sound mechanism,
+NOT the all-or-nothing scope-exit problem. Validation unchanged (flag-OFF byte-identical + flag-ON ASAN-all + 432/0
++ reconverge). The fact that the machinery works for ~all real single-purpose loops means this is HIGH-VALUE + LOW-
+SCOPE relative to its headline impact.
