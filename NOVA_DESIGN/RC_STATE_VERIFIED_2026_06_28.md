@@ -50,3 +50,20 @@ The #1 gap is real and the current FULLRC "fix" is non-functional (verified). It
 fix needs compiler-internal debugging then careful validation in the riskiest subsystem, and the general case is
 all-or-nothing. The ARENA already covers the case that matters most (server). Recommend tackling the pre-pass bug
 (step 1-2) as a focused, ASAN-gated session — precise entry point above. Supersedes the stale "2000->1" claim.
+
+## ★ REFINEMENT (same session) — FULLRC WORKS for straight-line reassignment; the gap is LOOP-LOCALS
+Minimal probe `let x=[1,2,3]; len(x); x=[4,5,6]; len(x)` under NOVA_T8_FULLRC=1 emits **2 nova_rt_rc_drop_reassign
+CALLS** -> the reassignment-drop mechanism is FUNCTIONAL, not broken. leak_baseline's `while: let x=[...]` emits
+**0** CALLS. So the headline leak is NOT a broken mechanism -- it is a MISSING CASE: a loop-body `let x` (stored
+into the same slot.x each iteration per the .ll) is not marked droppable by the pre-pass, while straight-line
+reassignment IS. The loop structure (back-edge / per-iteration `let` re-declaration) is the differentiator.
+
+This REPLACES the "all-or-nothing" framing for THE HEADLINE LEAK: the straight-line drop machinery already works
++ is sound (432/0), so the tractable next step is to make the pre-pass ALSO mark loop-body reassigned slots
+droppable (a loop-local `let` whose every store is owned + never-escaped is the same safety class as straight-line
+reassignment -- the value rebound each iteration is uniquely owned and the previous one is dead). PRECISE TARGET:
+the pre-pass at nova_compiler.nova:16644-16700 (likely the loop back-edge makes the slot appear loaded/escaped, or
+each loop-iteration `let` is treated as a distinct binding that the slot_store scan doesn't unify). VALIDATE as
+before (flag-OFF byte-identical; flag-ON ASAN-on-ALL + 432/0 + reconverge gen5==gen6 + green_scale + leak delta
+drop). The general escaping/borrowed case stays all-or-nothing, but the HEADLINE loop-rebind leak is a focused,
+bounded extension of an already-working sound mechanism.
