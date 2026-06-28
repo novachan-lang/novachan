@@ -283,3 +283,15 @@ document.getElementById + a node<->handle table; dom_set_text -> node.textConten
 _wasm_counter_browser_one.sh (a node sim with a fake document -> count 0->1->2->3), since jsdom is absent. So a
 human can open a real page and click a real button to drive the NOVA-compiled stateful counter. NEXT: Forge-serve
 _wasm_counter.html + _counter.wasm (one language front+back).
+
+---
+## ★ S5g DONE (2026-06-28): FULL-STACK -- Forge serves the NOVA wasm frontend (ONE language front+back)
+_forge_wasm_demo.nova: a Forge (NOVA backend) app routes GET / -> forge.file("_wasm_counter.html") and GET
+/counter.wasm -> forge.file("_counter.wasm"); a client confirms the HTML (text) AND the wasm WITH content-type
+application/wasm are served. So NOVA serves a NOVA-compiled wasm frontend end-to-end. Gate _forge_wasm_demo_one.sh.
+★ FORGE FIX (forge/forge.nova): serve_file AND file() used read_file (a C string) -> truncated any binary asset
+at its first NUL (the wasm's very first byte is NUL -> a 404). Fixed forge.file: for a NON-text content-type
+(_ct_is_text false) read via read_bytes + return resp_bytes (the existing NUL-safe NovaBytes Response path,
+sent via tcp_send_bytes). Text path unchanged -> forge_static_test still GREEN. This unblocks serving ALL binary
+static assets (wasm/png/fonts/...), not just the demo. (forge/*.nova change -> not a runtime/native change.)
+NEXT: optionally apply the same read_bytes path to serve_file + the static() mount dispatch; persistent NOVA globals.
