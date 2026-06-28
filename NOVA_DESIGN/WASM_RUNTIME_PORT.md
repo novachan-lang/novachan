@@ -225,3 +225,17 @@ shim -> bump) + header-based find_tag (same as list/dict). No nova_runtime.c cha
 => the FULL value-model (string/list/dict/struct) + control flow + index access execute in WebAssembly.
 NEXT: a JS<->NOVA boundary for the browser frontend (return a built STRING to JS as the 'render' -- needs
 reading the i64 string-handle's bytes out of wasm linear memory in the harness), per WASM_FRONTEND_*.
+
+---
+## S5b DONE (2026-06-28): VALUE-MODEL-BACKED RENDER PATH (NOVA builds a string -> JS host)
+_wasm_render.nova: `extern fn host_emit(s: string)` + a fn that BUILDS "Hello from "+"NOVA"+"!" in the wasm
+value-model and calls `unsafe host_emit(msg)`. Linked with nova_runtime_wasm.o; the JS host reads the built
+bytes out of wasm linear memory (memory IS exported; readCStr of the i32 ptr arg) -> captured "Hello from
+NOVA!" EXACTLY. This is the browser RENDER path: compute text/markup in NOVA, hand it to the DOM host via the
+extern-fn -> wasm-import CHANNEL (Frontend doc's framing: JS host = peer process, import table = channel).
+Combines value-model-in-wasm (S4/S5) with the pre-existing extern-fn host-import surface (WASM_FRONTEND Stage
+0-2). The frontend doc's deferred "string from wasm value-model -> JS" is now PROVEN. ABI note: extern fn
+returns i64 by the NOVA ABI (JS impl must return a BigInt e.g. 0n even for void); string ARG arrives as an i32
+linear-memory ptr. Gate: _wasm_render_one.sh. No nova_runtime.c change (native untouched).
+NEXT: wire to the real DOM surface (dom_set_text on a NOVA-built string via _wasm_runtime_browser.mjs), then
+JS->wasm string IN (needs the exported allocator), then event callbacks.
