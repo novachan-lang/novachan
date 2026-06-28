@@ -1,12 +1,15 @@
 /* WASM value-model translation unit (NOVA #27 carve, S1 scaffold).
    Compiles the NOVA runtime's HEAP VALUE-MODEL (strings/lists/dicts/structs + RC + find_tag + arena) to
-   wasm32 by #define NOVA_FREESTANDING -- which gates out the system headers and (incrementally, S2+) the
-   I/O/socket/thread/scheduler sections inside nova_runtime.c -- plus tiny freestanding libc primitives below
-   (there is no wasi-sysroot offline). The NATIVE build NEVER compiles this file: nova_runtime.c is compiled
-   directly with NOVA_FREESTANDING absent, so it is unaffected.
+   wasm32. Two flags are used:
+   - NOVA_FREESTANDING    = use the static-buffer allocator (no malloc).
+   - NOVA_NO_SYSHEADERS   = gate all system headers (sockets/threads/etc. don't exist in wasm without a sysroot).
+     This file provides its own libc shim below. The native _s27 freestanding gate sets only NOVA_FREESTANDING
+     and keeps the host CRT headers — so the flag split lets both targets compile without conflict.
+   The NATIVE build NEVER compiles this file: nova_runtime.c is compiled directly without these flags.
    Build: clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c nova_runtime_wasm.c -o _wasm_vm.o
    (-fno-builtin is MANDATORY: -O2 loop-idiom otherwise re-emits a libc strlen/memcpy import that traps in V8.) */
 #define NOVA_FREESTANDING 1
+#define NOVA_NO_SYSHEADERS 1
 
 #include <stdint.h>
 #include <stddef.h>

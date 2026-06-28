@@ -1,8 +1,9 @@
-/* #27 wasm/freestanding: system headers don't exist for `clang --target=wasm32 -nostdlib` (no sysroot when
-   offline). Gate them behind NOVA_FREESTANDING; the wasm value-model unit (output/nova_runtime_wasm.c)
-   supplies tiny libc stubs instead. stdint/stddef/setjmp are pure-type / no-OS headers -> kept BARE. NATIVE
-   (flag absent) includes all ten in the SAME order -> byte-identical .o (the directives emit no code). */
-#ifndef NOVA_FREESTANDING
+/* #27 wasm/freestanding: split into TWO flags:
+   - NOVA_FREESTANDING  = use the static-buffer value allocator (set by both _s27 native gate AND wasm).
+   - NOVA_NO_SYSHEADERS = gate system headers (set ONLY by nova_runtime_wasm.c, which provides its own
+     libc shim instead). The native _s27 gate sets NOVA_FREESTANDING but NOT NOVA_NO_SYSHEADERS, so the
+     host CRT headers stay available. stdint/stddef are pure-type headers -> always included. */
+#ifndef NOVA_NO_SYSHEADERS
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,14 +11,14 @@
 #endif
 #include <stdint.h>
 #include <stddef.h>
-#ifndef NOVA_FREESTANDING
+#ifndef NOVA_NO_SYSHEADERS
 #include <math.h>
 #include <ctype.h>
 #include <errno.h>
-#include <setjmp.h>   /* hosted header (not a freestanding one like stdint/stddef) -> gate for wasm */
+#include <setjmp.h>
 #endif
 
-#ifndef NOVA_FREESTANDING   /* platform I/O headers (sockets/threads/files/crypto) -- gated out for wasm */
+#ifndef NOVA_NO_SYSHEADERS   /* platform I/O headers (sockets/threads/files/crypto) -- gated out for wasm */
 #ifdef _WIN32
 /* Raise the Winsock select() fd cap from the default 64 BEFORE winsock2.h is included (the Windows
    fd_set is a struct { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; }, not a bitmap, so this just works).
@@ -58,7 +59,7 @@
 #include <openssl/err.h>
 #endif
 #endif
-#endif  /* NOVA_FREESTANDING: platform I/O headers gated out for wasm */
+#endif  /* NOVA_NO_SYSHEADERS: platform I/O headers gated out for wasm */
 
 /* ── Task-local state (Stage 0 of the implicit-async flagship) ────────────────
    The error/Result state that used to be raw thread-locals now lives in a per-task
@@ -111,7 +112,32 @@ void nova_rt_clear_is_result(void) { nova_cur()->is_result = 0; }
 void    nova_rt_raise_error(void)           { nova_cur()->error_flag = 1; }
 void    nova_rt_set_error_flag(int64_t msg) { NovaTaskState* t = nova_cur(); t->error_flag = 1; t->error_msg = msg; }
 int64_t nova_rt_take_error_flag(void)       { NovaTaskState* t = nova_cur(); int64_t f = t->error_flag; t->error_flag = 0; return f; }
-int64_t nova_rt_take_error_msg(void)        { NovaTaskState* t = nova_cur(); int64_t m = t->error_msg; t->error_msg = 0; return m; }
+
+/* nova_rt_take_error_msg: t->error_msg is always a raw malloc pointer (no RC header/tag) set by
+   nova_set_error or nova_rt_wrap_error_context. Returning it as-is would give user code (catch e -> str(e))
+   an untagged pointer that find_tag misclassifies as a list -> heap-buffer-overflow (CVE-class).
+   Fix: wrap in a fat string before returning. nova_fat_str_create is forward-declared below; it is
+   defined later in the file. */
+static char* nova_fat_str_create(const char* src, size_t len);  /* forward-declaration */
+/* Forward declaration needed for nova_is_readable_str (defined later in this file). */
+static int nova_is_readable_str(const void* ptr);
+int64_t nova_rt_take_error_msg(void) {
+    NovaTaskState* t = nova_cur();
+    int64_t m = t->error_msg;
+    t->error_msg = 0;
+    if (!m) return 0;
+    /* t->error_msg is either:
+       (a) a raw malloc C-string set by nova_set_error or nova_rt_wrap_error_context
+       (b) a fat string set by nova_rt_try_unwrap_value (from the result value itself)
+       Either way, wrap in a fat string for safe user-code access. We do NOT free (a)
+       here since nova_set_error may still hold the same pointer; (b) is RC-managed. */
+    if (nova_is_readable_str((const void*)(uintptr_t)m)) {
+        return m;  /* already a tagged fat/literal string — use as-is */
+    }
+    /* raw malloc string: wrap in a fat string copy (the raw buffer leaks, but that is
+       acceptable — the alternative is crashing on literal/fat pointers that aren't malloc). */
+    return (int64_t)(uintptr_t)nova_fat_str_create((const char*)(uintptr_t)m, strlen((const char*)(uintptr_t)m));
+}
 
 static void nova_set_error(const char* msg) {
     NovaTaskState* t = nova_cur();
@@ -7866,7 +7892,7 @@ static void nova_file_ensure_init(void);   /* defined in the file-handle section
    can poll via shutdown_requested() to drain cleanly; a SECOND signal force-exits, so the process always
    stays killable even if nothing drains (no "flag set but unkillable" trap). signal() handles SIGINT/SIGTERM
    on both Windows (CRT) and POSIX. The handler uses write() only (async-signal-safe; fprintf is not). */
-#ifndef NOVA_FREESTANDING   /* signals don't exist in wasm; sig_atomic_t/signal shimmed in nova_runtime_wasm.c */
+#ifndef NOVA_NO_SYSHEADERS   /* signals don't exist in wasm; sig_atomic_t/signal shimmed in nova_runtime_wasm.c */
 #include <signal.h>
 #endif
 static volatile sig_atomic_t nova_shutdown_flag = 0;
@@ -9827,7 +9853,7 @@ int64_t nova_rt_live_count(void) {
 }
 
 void nova_rt_cleanup(void) {
-#ifndef NOVA_FREESTANDING
+#ifndef NOVA_NO_SYSHEADERS
     /* #31 heap profiler: print the per-tag allocation breakdown at exit when requested. */
     if (getenv("NOVA_HEAP_PROFILE")) {
         const char* _hp_names[16] = {0};
@@ -13789,7 +13815,9 @@ int64_t nova_rt_wrap_error_context(int64_t result_handle, int64_t fn_name, int64
     if (!m) return result_handle;
     snprintf(m, needed + 1, "in %s at line %lld: %s", fname, (long long)line_num, old_msg);
     t->error_msg = (int64_t)(uintptr_t)m;
-    return nova_result_pack(1, (int64_t)(uintptr_t)m);
+    /* Pack a TAGGED fat string as the result value (not the raw malloc pointer m).
+       find_tag on m would misclassify it as a list -> heap-buffer-overflow in any string op on catch e. */
+    return nova_result_pack(1, (int64_t)(uintptr_t)nova_fat_str_create(m, strlen(m)));
 }
 
 int64_t nova_rt_result_map(int64_t handle, int64_t closure) {
@@ -17602,7 +17630,7 @@ int64_t nova_rt_build_get_sources(int64_t dir_val) {
 
 /* ── Build system: incremental rebuild tracking ─────────────────────────── */
 
-#ifndef NOVA_FREESTANDING   /* struct stat / S_IS* shimmed in nova_runtime_wasm.c */
+#ifndef NOVA_NO_SYSHEADERS   /* struct stat / S_IS* shimmed in nova_runtime_wasm.c */
 #ifdef _WIN32
 #include <sys/stat.h>
 #else
@@ -19014,7 +19042,7 @@ int64_t nova_rt_io_set_nonblocking(int64_t fd_val) {
 
 #else
 /* Linux/POSIX epoll-based poller */
-#ifndef NOVA_FREESTANDING   /* epoll API shimmed in nova_runtime_wasm.c (netpoller is dead in wasm) */
+#ifndef NOVA_NO_SYSHEADERS   /* epoll API shimmed in nova_runtime_wasm.c (netpoller is dead in wasm) */
 #include <sys/epoll.h>
 #endif
 
