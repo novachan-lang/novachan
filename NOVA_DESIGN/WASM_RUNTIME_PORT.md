@@ -322,3 +322,19 @@ shared-mutable-state = a concurrency hazard the model deliberately avoids). A th
 module globals to codegen, but that is reconverge-risky AND arguably against the process-isolation design.
 RECOMMENDATION: treat "NOVA frontend/app state model" as a design decision (process-actor vs cell vs mutable
 global) before any compiler change. The frontend demos work today via the cell. [[project-wasm-value-model]]
+
+---
+## ★ FINDING (2026-06-28): spawn/green-tasks do NOT execute in the wasm value-model path -> state = the runtime cell
+_wasm_spawn.nova: a spawned worker writes 42 to the shared runtime cell (nova_state_set); run() spawns it,
+monitor+receive, then reads the cell -> returns **0, NOT 42**. So the spawned green task NEVER RAN ITS BODY in
+wasm. (An earlier monitor+receive->99 LITERAL was a FALSE POSITIVE: receive returned without the worker
+executing; the shared-cell probe is definitive -- verify-before-claiming earned its keep here.) ROOT CAUSE:
+wasm has no OS threads (pthread stubbed no-op -> no scheduler carriers) AND no fiber/stack-switching (ucontext
+absent), so the M:N green scheduler cannot run tasks; spawn enqueues a task that is never executed.
+=> RESOLVES the frontend STATE-MODEL design question FOR WASM: the actor/process model is NOT available in the
+current wasm value-model path; the RUNTIME CELL (the S5e nova_state_get/set pattern) IS the state mechanism in
+wasm, and it's sufficient for event-driven frontends (each DOM event = a synchronous NOVA call that reads +
+updates the cell + re-renders). NATIVELY actors work (real scheduler) -- so "state via a process" holds on the
+backend; the browser needs the cell until a wasm cooperative scheduler exists (future: Asyncify-style
+stack-switching, or a manual continuation / state-machine green scheduler on the single wasm stack). This is the
+honest closure of the state-model design question: CELL for wasm now, ACTORS need a wasm-scheduler effort later.
