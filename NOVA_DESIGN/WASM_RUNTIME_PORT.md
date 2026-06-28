@@ -175,3 +175,22 @@ shimming the ~60 POSIX symbols; (B) GATE the socket/netpoller/file/dirent/schedu
 `#ifndef NOVA_FREESTANDING` (removes the half-maintained POSIX branches entirely -> fewer shims, and resolves
 nova_task_arena_cleanup since its POSIX call site goes away). LEAN B for the I/O-heavy sections (cleaner, and the
 value-model never needs them); keep the shim for the value-model libc + math. The shim libc/math is reusable either way.
+
+---
+## ★ S2b DONE (2026-06-28): the WASM value-model TU COMPILES (0 errors)
+output/nova_runtime_wasm.c now compiles clean to a wasm32 object: `clang --target=wasm32 -ffreestanding
+-nostdlib -fno-builtin -O2 -c` -> 0 errors. The ENTIRE NOVA runtime value-model is wasm-compilable. llvm-nm
+confirms the needed symbols present: nova_heap_alloc (+ its freestanding bump buffer nova_fs_heap),
+nova_mem_find_tag, nova_rt_create_string, nova_rt_str_concat, nova_rt_len_any, list/dict/arena.
+Total nova_runtime.c carve edits = 4 include-gates, ALL `#ifndef NOVA_FREESTANDING`, ALL native token-identical
+(clang -E) + forge_query_test GREEN: setjmp.h (S1), signal.h (S2a), sys/stat.h x2 (S2b), sys/epoll.h (S2b).
+Everything else lives in the SHIM (nova_runtime_wasm.c): value-model libc (REAL: bump malloc/calloc/realloc/
+free, snprintf/vsnprintf, strstr/strcpy/strncpy/strrchr, atoi/atoll/atol/atof/strtod/strtol/strtoll, qsort,
+rand/srand LCG, isnan/isinf/isfinite, isspace) + dead-but-declared I/O (stdio, sockets, dirent, epoll, pthreads,
+signals, process, dlopen, mmap, fcntl, time) + the POSIX types/macros/structs (FILE, jmp_buf, pthread_*, fd_set,
+struct sockaddr/addrinfo/stat/tm/timespec/dirent/epoll_event, AF_*/SOCK_*/SO_*/S_IS*/O_*/EPOLL*/RTLD_*/...) +
+a freestanding no-op nova_task_arena_cleanup (its real def is _WIN32-only).
+NEXT: S3 = runtime-adapt find_tag for wasm (the Windows IsBadReadPtr branch is _WIN32-gated already; confirm the
+no-guard-page path is taken; RC is already single-threaded under the shim's no-op pthreads). S4 = compile a
+string-building NOVA .ll to wasm, wasm-ld link (--no-entry --export-all --allow-undefined --gc-sections) with
+nova_runtime_wasm.o, run in node -> the heap-value-model-in-wasm MILESTONE. The 28MB pre-strip .o shrinks at link.

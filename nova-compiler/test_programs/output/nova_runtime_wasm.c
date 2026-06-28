@@ -74,7 +74,7 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };
 struct sockaddr_in { unsigned short sin_family; unsigned short sin_port; struct in_addr sin_addr; char sin_zero[8]; };
 struct addrinfo { int ai_flags, ai_family, ai_socktype, ai_protocol; unsigned int ai_addrlen;
                   struct sockaddr* ai_addr; char* ai_canonname; struct addrinfo* ai_next; };
-struct stat { unsigned long st_dev, st_ino; unsigned int st_mode; unsigned long st_size; long st_mtime; };
+struct stat { unsigned long st_dev, st_ino; unsigned int st_mode; unsigned long st_size; long st_mtime; struct timespec st_mtim; };
 struct dirent { unsigned long d_ino; char d_name[256]; };
 
 /* --- macros --- */
@@ -263,5 +263,140 @@ double sqrt(double),cbrt(double),floor(double),ceil(double),round(double),trunc(
 double pow(double,double),atan2(double,double),fmod(double,double),hypot(double,double),copysign(double,double);
 double fmax(double,double),fmin(double,double),remainder(double,double),nextafter(double,double),fdim(double,double);
 double ldexp(double,int),frexp(double,int*),modf(double,double*),fma(double,double,double);
+
+/* ===== S2b: POSIX I/O surface (wasm takes the POSIX #else branches; all DEAD in a value-model program) ===== */
+typedef long          time_t;
+typedef long          off_t;
+typedef unsigned int  socklen_t;
+typedef unsigned int  useconds_t;
+typedef struct _NOVA_DIR DIR;
+struct tm { int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst; long tm_gmtoff; const char* tm_zone; };
+/* errno + file + socket + mmap constants */
+#define EOF (-1)
+#define EAGAIN 11
+#define EWOULDBLOCK 11
+#define EINPROGRESS 115
+#define EINTR 4
+#define ECONNRESET 104
+#define ERANGE 34
+#define O_RDONLY 0
+#define O_WRONLY 1
+#define O_RDWR 2
+#define F_OK 0
+#define X_OK 1
+#define R_OK 4
+#define W_OK 2
+#define S_IFMT 0170000
+#define S_IFREG 0100000
+#define S_IFDIR 0040000
+#define S_ISREG(m) (((m)&S_IFMT)==S_IFREG)
+#define S_ISDIR(m) (((m)&S_IFMT)==S_IFDIR)
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define MAP_PRIVATE 2
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED ((void*)-1)
+#define AF_INET 2
+#define AF_UNSPEC 0
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
+#define SOL_SOCKET 1
+#define SO_ERROR 4
+#define SO_REUSEADDR 2
+#define IPPROTO_TCP 6
+#define TCP_NODELAY 1
+#define INADDR_ANY 0
+#define MSG_PEEK 2
+/* epoll (Linux netpoller, dead in wasm) */
+struct epoll_event { unsigned int events; union { void* ptr; int fd; unsigned int u32; unsigned long long u64; } data; };
+#define EPOLLIN 1
+#define EPOLLOUT 4
+#define EPOLLERR 8
+#define EPOLLHUP 16
+#define EPOLLRDHUP 0x2000
+#define EPOLLET 0x80000000u
+#define EPOLLONESHOT 0x40000000
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+/* misc libc (REAL) */
+long      atol(const char* s) { return (long)atoll(s); }
+long long strtoll(const char* s, char** end, int base) { (void)base; long long r=0; int sg=1; while(*s==' ')s++; if(*s=='-'){sg=-1;s++;} else if(*s=='+')s++; while(*s>='0'&&*s<='9') r=r*10+(*s++-'0'); if(end)*end=(char*)s; return r*sg; }
+int       isspace(int c) { return c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\v'||c=='\f'; }
+char*     strncpy(char* d, const char* s, size_t n) { size_t i=0; for (; i<n && s[i]; i++) d[i]=s[i]; for (; i<n; i++) d[i]=0; return d; }
+int       sscanf(const char* s, const char* f, ...) { (void)s;(void)f; return 0; }   /* dead in value-model */
+/* socket/dir/file/time stubs (return failure; never reached in a value-model program) */
+int    socket(int a,int b,int c){(void)a;(void)b;(void)c;return -1;}
+int    bind(int s,const struct sockaddr* a,socklen_t l){(void)s;(void)a;(void)l;return -1;}
+int    listen(int s,int b){(void)s;(void)b;return -1;}
+int    accept(int s,struct sockaddr* a,socklen_t* l){(void)s;(void)a;(void)l;return -1;}
+int    connect(int s,const struct sockaddr* a,socklen_t l){(void)s;(void)a;(void)l;return -1;}
+ssize_t send(int s,const void* b,size_t n,int f){(void)s;(void)b;(void)n;(void)f;return -1;}
+ssize_t recv(int s,void* b,size_t n,int f){(void)s;(void)b;(void)n;(void)f;return -1;}
+ssize_t sendto(int s,const void* b,size_t n,int f,const struct sockaddr* a,socklen_t l){(void)s;(void)b;(void)n;(void)f;(void)a;(void)l;return -1;}
+ssize_t recvfrom(int s,void* b,size_t n,int f,struct sockaddr* a,socklen_t* l){(void)s;(void)b;(void)n;(void)f;(void)a;(void)l;return -1;}
+int    setsockopt(int s,int lv,int o,const void* v,socklen_t l){(void)s;(void)lv;(void)o;(void)v;(void)l;return -1;}
+int    getsockopt(int s,int lv,int o,void* v,socklen_t* l){(void)s;(void)lv;(void)o;(void)v;(void)l;return -1;}
+int    shutdown(int s,int how){(void)s;(void)how;return -1;}
+unsigned short htons(unsigned short x){return (unsigned short)((x<<8)|(x>>8));}
+unsigned short ntohs(unsigned short x){return (unsigned short)((x<<8)|(x>>8));}
+unsigned int   htonl(unsigned int x){return ((x<<24)&0xff000000u)|((x<<8)&0xff0000u)|((x>>8)&0xff00u)|((x>>24)&0xffu);}
+unsigned int   ntohl(unsigned int x){return htonl(x);}
+int    inet_pton(int af,const char* s,void* d){(void)af;(void)s;(void)d;return 0;}
+const char* inet_ntop(int af,const void* s,char* d,socklen_t l){(void)af;(void)s; if(d&&l)d[0]=0; return d;}
+int    getnameinfo(const struct sockaddr* a,socklen_t l,char* h,socklen_t hl,char* sv,socklen_t svl,int fl){(void)a;(void)l;(void)h;(void)hl;(void)sv;(void)svl;(void)fl;return -1;}
+int    gethostname(char* n,size_t l){if(n&&l)n[0]=0;return -1;}
+int    epoll_create(int n){(void)n;return -1;}
+int    epoll_create1(int f){(void)f;return -1;}
+int    epoll_ctl(int e,int o,int fd,struct epoll_event* ev){(void)e;(void)o;(void)fd;(void)ev;return -1;}
+int    epoll_wait(int e,struct epoll_event* ev,int m,int t){(void)e;(void)ev;(void)m;(void)t;return -1;}
+DIR*   opendir(const char* p){(void)p;return (DIR*)0;}
+struct dirent* readdir(DIR* d){(void)d;return (struct dirent*)0;}
+int    closedir(DIR* d){(void)d;return 0;}
+int    open(const char* p,int fl,...){(void)p;(void)fl;return -1;}
+int    access(const char* p,int m){(void)p;(void)m;return -1;}
+int    chdir(const char* p){(void)p;return -1;}
+char*  getcwd(char* b,size_t s){if(b&&s)b[0]=0;return b;}
+ssize_t readlink(const char* p,char* b,size_t s){(void)p;(void)b;(void)s;return -1;}
+int    rename(const char* a,const char* b){(void)a;(void)b;return -1;}
+int    rmdir(const char* p){(void)p;return -1;}
+int    unlink(const char* p){(void)p;return -1;}
+int    fstat(int fd,struct stat* st){(void)fd;(void)st;return -1;}
+int    getpid(void){return 1;}
+int    feof(FILE* f){(void)f;return 1;}
+int    ferror(FILE* f){(void)f;return 0;}
+int    getc(FILE* f){(void)f;return -1;}
+struct tm* localtime(const time_t* t){(void)t; static struct tm _tm; return &_tm;}
+struct tm* gmtime(const time_t* t){(void)t; static struct tm _tm; return &_tm;}
+time_t mktime(struct tm* t){(void)t;return 0;}
+size_t strftime(char* s,size_t m,const char* f,const struct tm* t){(void)f;(void)t; if(s&&m)s[0]=0; return 0;}
+
+/* fcntl / dlopen / stdio-seek / strtol-strrchr */
+#define O_NONBLOCK 0x800
+#define F_GETFL 3
+#define F_SETFL 4
+#define RTLD_LAZY 1
+#define RTLD_NOW 2
+#define RTLD_LOCAL 0
+#define RTLD_GLOBAL 0x100
+int    fcntl(int fd,int cmd,...){(void)fd;(void)cmd;return 0;}
+int    fseek(FILE* f,long o,int w){(void)f;(void)o;(void)w;return -1;}
+long   ftell(FILE* f){(void)f;return -1;}
+void*  dlopen(const char* p,int f){(void)p;(void)f;return (void*)0;}
+void*  dlsym(void* h,const char* s){(void)h;(void)s;return (void*)0;}
+int    dlclose(void* h){(void)h;return 0;}
+char*  dlerror(void){return (char*)0;}
+long   strtol(const char* s,char** end,int base){
+    long r=0; int sg=1; while(*s==' ')s++; if(*s=='-'){sg=-1;s++;} else if(*s=='+')s++;
+    if(base==16 && s[0]=='0' && (s[1]=='x'||s[1]=='X')) s+=2;
+    for(;;s++){ int d; if(*s>='0'&&*s<='9')d=*s-'0'; else if(*s>='a'&&*s<='f')d=*s-'a'+10; else if(*s>='A'&&*s<='F')d=*s-'A'+10; else break; if(base&&d>=base)break; r=r*(base?base:10)+d; }
+    if(end)*end=(char*)s; return r*sg;
+}
+char*  strrchr(const char* s,int c){const char* last=(const char*)0; for(;*s;s++) if(*s==(char)c) last=s; return (char*)(c?last:s);}
+
+/* nova_task_arena_cleanup is defined only inside `#ifdef _WIN32` in nova_runtime.c -> absent on the POSIX path
+   wasm takes. No task pool exists in wasm, so a no-op is the correct freestanding behavior. */
+struct NovaTaskState; /* fwd (real type defined later in the include) */
+static void nova_task_arena_cleanup(void) { }
 
 #include "nova_runtime.c"

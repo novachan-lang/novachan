@@ -17591,10 +17591,12 @@ int64_t nova_rt_build_get_sources(int64_t dir_val) {
 
 /* ── Build system: incremental rebuild tracking ─────────────────────────── */
 
+#ifndef NOVA_FREESTANDING   /* struct stat / S_IS* shimmed in nova_runtime_wasm.c */
 #ifdef _WIN32
 #include <sys/stat.h>
 #else
 #include <sys/stat.h>
+#endif
 #endif
 
 static int64_t file_mtime_ms(const char* path) {
@@ -19001,7 +19003,9 @@ int64_t nova_rt_io_set_nonblocking(int64_t fd_val) {
 
 #else
 /* Linux/POSIX epoll-based poller */
+#ifndef NOVA_FREESTANDING   /* epoll API shimmed in nova_runtime_wasm.c (netpoller is dead in wasm) */
 #include <sys/epoll.h>
+#endif
 
 typedef struct {
     int epfd;
