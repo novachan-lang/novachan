@@ -80,5 +80,7 @@ INCLUDING leak_baseline (2 drops for x and d).
 - **NOVA_T8_SCOPE (general escaping/borrowed) = NOT IMPLEMENTED** (design-complete only).
 - **Default flip DONE (c4da4aa):** gen5==gen6==gen7 CONVERGED (15462309 bytes, 5 drops). 526/526
   regression pass. Opt-out (`NOVA_NO_FULLRC=1`) produces 0 drops (byte-identical to old behavior).
-- **Remaining:** channels (need channel destructor for buffered items), scope-exit RC (design-complete,
-  not implemented). Neither blocks Forge or typical programs.
+- **Channel drops DONE (ddf2160):** leak_baseline now list=1, dict=1, chan=1. ALL loop-local leaks closed.
+  The channel destructor already existed; FULLRC just needed to recognize channel_create as "owned."
+- **Remaining:** scope-exit RC (dropping at scope exit, not just on reassignment) + cycle collector.
+  These are deferred to a focused session. Neither blocks Forge or typical programs.
