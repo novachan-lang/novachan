@@ -61,3 +61,42 @@ the unbuilt frontier.
 - **OOB-write in safe array assignment** (xs[i]=v): two inline index_set codegen paths skipped the upper-bound
   check → wild store / heap corruption in plain safe code. Routed through the bounds-checked nova_rt_index_set.
   Reconverged + 551/551 both modes + ASAN + new oob_write_test guard. Commit 8b5ea22.
+
+---
+## UPDATE 2026-06-28 (session: N>1 multi-core + WASM frontend) — two named blockers substantially closed
+The 2026-06-22 baseline above is UNCHANGED as history. This records MEASURED, GATED progress since.
+
+### Concurrency dimension: N>1 is now VALIDATED + GATED end-to-end (was "opt-in, leaks fiber stacks, ZERO regression coverage")
+- N>1 validated + gated at NOVA_CARRIERS=4 AND 8 across scheduler core, HTTP serving, and WS/SSE: gates
+  `_n_carriers_ci.ps1` (green_scale 10k + _mn_stress + _mn_churn), `_forge_mn_ci.ps1` (forge_recv_security +
+  a 12-client no-cross-talk load × reclaim 0/1), `_ws_mn_ci.ps1` (SSE hub + WS handshake + WS broadcast).
+- Task-slot reclaim DEFAULT-ON at N>1 (3fbe7e3) + PROVEN to bound memory (20001->3 distinct slots on a 20k
+  sequential churn, _mn_churn 9514726) -> the "leaks fiber stacks" gap is CLOSED (reclaim frees finished
+  slots + fibers, home-carrier-only, monitor-lock serialized). N=1 stays byte-identical (gated g_carrier_count>1).
+  Commits 1231c25/5d9c8ae/3fbe7e3/9514726/bf865da/a8a39b6/020334c. (Still open: select/after busy-poll; no preemption.)
+
+### Targets + Frameworks + Vision: the WASM FRONTEND now RUNS (was "no-op stub" / "NO NOVA frontend" — blocker #1)
+- The NOVA value-model RUNS in wasm: strings/lists/dicts/structs + control-flow execute in node WebAssembly via
+  a freestanding carve (output/nova_runtime_wasm.c = `#define NOVA_FREESTANDING` + a libc shim + `#include
+  nova_runtime.c`; nova_runtime.c touched in only 5 NATIVE-token-identical `#ifndef NOVA_FREESTANDING` spots).
+  Gate `_wasm_vm_one.sh` (str=3/list=4/dict=3/struct=42/loop=55/index=15). Commits 486f958/d0983b2.
+- Bidirectional browser boundary: NOVA computes + renders a real DOM tree (_wasm_domrender: ul>3 li), AND JS
+  passes strings INTO NOVA via an exported allocator (_wasm_strin round-trip). Stateful interactive counter
+  (event+state+render, 0->1->2->3) + a todo list (string-in + value-model split + DOM render). Real-browser
+  artifact _wasm_counter.html (+ a node-sim gate). Commits c92abec/34c4f54/86f7910/0b1ccc2/9569ef2/8a32503.
+- FULL-STACK: a Forge (NOVA) backend SERVES the NOVA wasm frontend end-to-end (_forge_wasm_demo, f8b9310) --
+  which required + got a forge.file binary-serve fix (read_bytes + resp_bytes). The two halves are now ONE served app.
+- HONEST CAVEATS: browser run is gated via a node oracle + a real openable HTML artifact (no headless-browser CI
+  here); NOVA has NO mutable module-level global state (native finding cf211a6) so frontend state uses a runtime
+  cell -- the NOVA-idiomatic state model (process/actor vs cell vs mutable globals) is an OPEN DESIGN DECISION;
+  it's value-model + DOM + events, not yet a LiveView-share or full SPA framework. Eight `_wasm_*_one.sh` gates.
+
+### Still open (unchanged / partial)
+Default-on memory reclamation (scope-exit RC + cycle collector); general C-level perf (float arrays ~120×C,
+HOF/closure dynamic); ARM/macOS runtime; real GPU/SPIR-V backend; AI training; type-system soundness hardening;
+real package manager + installable distribution. (Crypto: the audit's "crypto near-absent" is now STALE -- a
+later arc built forge_crypto/x509/p256/rsa + offline TLS 1.3; see memory project_forge_crypto_library. Not this session.)
+
+=> NET: ~2 of the 5 vision blockers (frontend; N>1-as-regression-gated-default) substantially advanced this
+session. The "~halfway" verdict moves up, but the deep frontier (default memory safety, general perf,
+multi-target ARM/macOS, GPU, AI) remains the unbuilt work.
