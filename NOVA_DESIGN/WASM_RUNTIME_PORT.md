@@ -259,3 +259,16 @@ other deferred item). Gate _wasm_strin_one.sh. nova_runtime.c UNCHANGED (wasm_al
 untouched. => BOTH browser directions proven: OUT (NOVA computes+renders to DOM, S5c) + IN (JS string -> NOVA, S5d).
 NEXT: event callbacks (JS calls an exported wasm fn on a DOM event), then assemble a tiny end-to-end counter/todo
 demo, then wire to the real _wasm_runtime_browser.mjs + an HTML harness.
+
+---
+## S5e DONE (2026-06-28): EVENT + STATE + RENDER -- a stateful NOVA counter runs in wasm
+_wasm_counter.nova: JS invokes bump() on a "click"; NOVA reads a persistent state cell (extern nova_state_get),
+increments it, and re-renders "count: N" via dom_set_text -> count 0->1->2->3 across calls. Event + state-logic +
+render all in NOVA. Gate _wasm_counter_one.sh. nova_runtime.c UNCHANGED (the cell is in the shim; native safe).
+★ FINDING: NOVA module-level mutable globals do NOT persist across separate exported wasm calls (a top-level
+`let count = 0` reassigned in a fn doesn't retain -- each call sees it reset; the soundness guards then make
+state ops 0-no-ops). So durable state needs a cell: here the runtime provides `nova_state_get/set` (non-static
+defs in nova_runtime_wasm.c -> the NOVA `extern` declares RESOLVE to them at wasm-ld, NOT host imports). NOVA owns
+the logic; the runtime owns the cell. (A real fix = persistent NOVA globals in wasm codegen -- future compiler work.)
+★ GOTCHA: every NOVA `extern fn` returns i64 by ABI -> a matching C def MUST return int64_t (a `void` def trips a
+wasm-ld signature mismatch -> runtime trap "unreachable"). NEXT: real-browser HTML harness + _wasm_runtime_browser.mjs.

@@ -408,3 +408,14 @@ static void nova_task_arena_cleanup(void) { }
    wasm-only: native never compiles this file. */
 __attribute__((export_name("wasm_alloc")))
 void* wasm_alloc(int n) { return nova_heap_alloc((size_t)(n < 0 ? 0 : n) + 1, NOVA_MEM_RAW); }
+
+/* Persistent state cell. NOVA module-level mutable globals do NOT yet persist across separate exported wasm
+   calls (each call doesn't retain the top-level `let`), so a stateful event handler needs durable storage.
+   A NOVA program reaches this via `extern fn nova_state_get()/nova_state_set(v)` -- non-static defs here, so
+   the extern `declare`s RESOLVE to them at wasm-ld (NOT host imports). NOVA owns the logic; the runtime owns
+   the cell. wasm-only (native never compiles this file). */
+static int64_t g_nova_state = 0;
+/* NOVA's ABI makes every `extern fn` return i64, so these MUST return i64 to match the declare (a void return
+   trips a wasm-ld signature mismatch -> runtime trap). */
+int64_t nova_state_get(void) { return g_nova_state; }
+int64_t nova_state_set(int64_t v) { g_nova_state = v; return 0; }
