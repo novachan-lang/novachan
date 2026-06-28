@@ -973,6 +973,15 @@ static int nova_addr_in_module(uintptr_t a) {
     if (g_module_hi == 0) nova_capture_module_range();
     return a >= g_module_lo && a < g_module_hi;
 }
+#elif defined(NOVA_FREESTANDING)
+/* wasm/freestanding: string literals live in the data segment, BELOW the linker-defined __heap_base. Heap
+   objects carry RC headers (found by nova_mem_find_tag before we reach here), and wasm linear memory is
+   bounds-checked, so a header-less pointer below __heap_base is a static literal -- and even a misclassified
+   pointer cannot wild-read (an OOB access traps deterministically). No pipe/page probe (both stubbed in wasm). */
+extern char __heap_base;
+static int nova_addr_in_module(uintptr_t a) {
+    return a >= 0x10000ULL && a < (uintptr_t)&__heap_base;
+}
 #else
 /* POSIX: page-granular readability + a bounded text scan, used only as the literal
    discriminator where module-range capture is not implemented. Page-guarded so a
@@ -1013,6 +1022,8 @@ static int nova_is_readable_str(const void* ptr) {
     if (t != (NovaMemTag)-1) return 0;                         /* list/dict/box/etc. -> not a string */
 #ifdef _WIN32
     return nova_addr_in_module(a);                             /* header-less -> only a static literal counts */
+#elif defined(NOVA_FREESTANDING)
+    return nova_addr_in_module(a);                             /* wasm: data-segment literal (below __heap_base) */
 #else
     return nova_probe_cstr((const char*)ptr);
 #endif

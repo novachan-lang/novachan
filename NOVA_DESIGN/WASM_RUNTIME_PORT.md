@@ -194,3 +194,24 @@ NEXT: S3 = runtime-adapt find_tag for wasm (the Windows IsBadReadPtr branch is _
 no-guard-page path is taken; RC is already single-threaded under the shim's no-op pthreads). S4 = compile a
 string-building NOVA .ll to wasm, wasm-ld link (--no-entry --export-all --allow-undefined --gc-sections) with
 nova_runtime_wasm.o, run in node -> the heap-value-model-in-wasm MILESTONE. The 28MB pre-strip .o shrinks at link.
+
+---
+## ★★★ S4 MILESTONE DONE (2026-06-28): the NOVA HEAP VALUE-MODEL RUNS IN WASM
+_wasm_strbuild.nova builds heap values that EXECUTE correctly in node WebAssembly via the FULL runtime:
+strbuild() (string concat "a"+"b"+"c")=3, listlen() ([10,20,30,40])=4, dictlen() ({3 keys})=3. ALL CORRECT.
+Beyond the prior scalar + string-LITERAL subsets -- this is real heap allocation, string CONCAT, list + dict
+build+measure, via nova_heap_alloc's freestanding bump heap + find_tag + create_string/str_concat/list/dict.
+Flow: gen3 .nova->.ll; `clang --target=wasm32 -O2 -fno-builtin -nostdlib -c .ll -> prog.o`; `wasm-ld --no-entry
+--export-all --allow-undefined --gc-sections prog.o output/nova_runtime_wasm.o -> _strbuild.wasm` (456KB --
+gc-sections strips the 28MB runtime to just what the 3 fns reach); node instantiates (imports stubbed ()=>0n) +
+calls the exported fns (i64 -> BigInt). Gate: _wasm_vm_one.sh (asserts 3/4/3). NOTE: bash /tmp != node C:\tmp on
+Windows -> use LOCAL paths for the .wasm.
+★ S3 fix folded in (string literals returned len 0): under wasm (non-_WIN32) nova_is_readable_str took the POSIX
+nova_probe_cstr path, which probes readability via pipe()/write() -- both STUBBED in wasm -> always fail -> the
+literal is rejected -> nova_str_safe returns "" -> concat length 0. Lists/dicts were fine (headered, found by
+find_tag). FIX: a `#elif defined(NOVA_FREESTANDING)` branch where nova_addr_in_module detects data-segment
+literals as `a >= 0x10000 && a < (uintptr_t)&__heap_base` (the linker symbol; wasm linear memory is
+bounds-checked so even a misclassified ptr traps, never wild-reads; heap objects are header-detected first).
+Native token-identical (inert for _WIN32) + forge_query_test GREEN. Total nova_runtime.c carve edits now 5
+(4 include-gates + this literal branch), ALL #ifndef/#elif NOVA_FREESTANDING, ALL native token-identical.
+NEXT: structs in wasm (auto-JSON / Show), bigger programs, then wire to the browser frontend (WASM_FRONTEND_*).
