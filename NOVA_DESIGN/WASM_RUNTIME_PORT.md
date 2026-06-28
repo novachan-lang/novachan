@@ -239,3 +239,12 @@ returns i64 by the NOVA ABI (JS impl must return a BigInt e.g. 0n even for void)
 linear-memory ptr. Gate: _wasm_render_one.sh. No nova_runtime.c change (native untouched).
 NEXT: wire to the real DOM surface (dom_set_text on a NOVA-built string via _wasm_runtime_browser.mjs), then
 JS->wasm string IN (needs the exported allocator), then event callbacks.
+
+---
+## S5c DONE (2026-06-28): NOVA-COMPUTED render drives a real DOM TREE
+_wasm_domrender.nova declares the dom_* host-import surface (dom_get_by_id/dom_create/dom_set_text/dom_append)
+and uses the VALUE-MODEL (while-loop + str(i) + concat) to COMPUTE text, building <ul><li>item 1..3</li></ul>
+under #app. Node oracle (handle side-table + fake document, linked with nova_runtime_wasm.o) confirms the exact
+tree. So a NOVA *render* (computed, not a literal) drives the DOM via the extern-fn -> wasm-import CHANNEL.
+Gate _wasm_domrender_one.sh. No nova_runtime.c change (native untouched). The browser frontend OUT-direction
+(NOVA computes + renders to DOM) is proven end-to-end. NEXT: JS->wasm string IN (exported allocator) + event callbacks.
