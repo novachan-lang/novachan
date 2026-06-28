@@ -956,3 +956,17 @@ Combined with per-request arena (server hot path), NOVA now has a TWO-LAYER defa
   Layer 1: Per-request ARENA (short-lived, cycle-immune, zero-pause)
   Layer 2: FULLRC reassignment drops (long-lived, sound, compiler-analyzed)
 The "default code leaks" audit finding is SUBSTANTIALLY CLOSED. Remaining = channels + scope-exit RC.
+
+---
+## (av) 2026-06-29 — ★★★ CHANNEL DROPS: leak_baseline list=1 dict=1 chan=1 (ddf2160)
+Extended FULLRC to recognize channel_create/channel_bounded results as owned allocations.
+The channel destructor in nova_rc_free (freeing buffered items + ring buffer + mutex) already existed;
+FULLRC just wasn't triggering it because the pre-pass didn't know channels were "owned."
+RESULT: leak_baseline chan 2000→1. ALL THREE heap-local loop leaks CLOSED.
+GOTCHA: initial attempt crashed (strcmp on NULL) because IrInst field 6 (_fan = integer "num") was used
+instead of field 5 (_fav = string "function name"). Field numbering: IrInst(op,dest,type,args,value,num,extra,label).
+Bootstrap converged (gen5==gen6, 15465375 bytes, 5 drops). 529/529 regression pass.
+ASAN clean on all channel tests. leak_baseline guard tightened from >2200 to >10.
+=> The DEFAULT-MEMORY story for loop-local allocations is COMPLETE: list, dict, struct, closure, AND channel
+all get automatic reassignment drops. Remaining memory gap = scope-exit RC (dropping at scope exit when a
+variable goes out of scope without reassignment) + cycle collector. These are deferred to a focused session.
