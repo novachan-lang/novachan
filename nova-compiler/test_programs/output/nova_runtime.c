@@ -7246,6 +7246,13 @@ void nova_rt_main_dispatch(int64_t main_fn) {
 #endif
                 nova_is_multithreaded = 1;   /* engages atomic RC across carriers */
                 g_carrier_count = ncar;      /* >1 => every nova_sched_lock/live/F1-spin activates */
+                /* Default the task-slot reclaim ON at N>1 (validated safe: slot reuse/deref is serialized
+                   under g_green_monitor_lock, and a finished fiber is freed only by its home carrier via
+                   pinning + terminal status). This bounds the per-task NovaSchedTask leak on long-running
+                   multi-core servers. Set HERE (not in nova_rt_init, which runs before the carrier count is
+                   known). An EXPLICIT NOVA_SCHED_RECLAIM_TASK (0 or 1, parsed in nova_rt_init) still wins;
+                   N=1 is byte-identical (this block runs only when ncar>1). */
+                if (getenv("NOVA_SCHED_RECLAIM_TASK") == NULL) g_reclaim_task = 1;
                 nova_deque_init_all(ncar);   /* M:N Stage A: per-carrier deque locks + cvs (before carriers spawn) */
                 g_single_poller_mode = 1;     /* S-a: one poller thread owns select(); idle carriers park on their cv */
                 nova_sched_running = 1;       /* set ONCE; carriers don't reset it (main_dispatch does, post-join) */
@@ -7863,9 +7870,10 @@ void nova_rt_init(void) {
     InitializeCriticalSection(&g_intern_lock);  /* Stage 0B: single-threaded init, before any carrier spawns */
     InitializeCriticalSection(&g_green_monitor_lock);  /* CRITICAL-1: green monitor-list lock (gated N>1) */
 #endif
-    /* Task-struct reclaim gate (default OFF): NOVA_SCHED_RECLAIM_TASK=1 recycles finished task slots
-       (bounds the per-task leak). OFF => slots grow-only (encoding still active + validated, but no
-       reuse => leaks as before). Read once, single-threaded, before any carrier spawns. */
+    /* Task-struct reclaim gate. NOVA_SCHED_RECLAIM_TASK=1 recycles finished task slots (bounds the per-task
+       leak); 0 forces it off. This sets the EXPLICIT value + the N=1 default (OFF -> byte-identical N=1).
+       At N>1 the default is flipped ON in the carrier-setup block (validated safe; runs after the carrier
+       count is known). Read once, single-threaded, before any carrier spawns. */
     { const char* _rt = getenv("NOVA_SCHED_RECLAIM_TASK"); g_reclaim_task = (_rt && _rt[0] == '1'); }
     /* Phase 0c: initialize the file-handle table mutex ONCE here, single-threaded at startup, before any
        worker/carrier thread runs. nova_file_ensure_init then becomes a no-op on every later call, closing
