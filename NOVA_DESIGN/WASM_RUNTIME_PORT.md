@@ -338,3 +338,19 @@ updates the cell + re-renders). NATIVELY actors work (real scheduler) -- so "sta
 backend; the browser needs the cell until a wasm cooperative scheduler exists (future: Asyncify-style
 stack-switching, or a manual continuation / state-machine green scheduler on the single wasm stack). This is the
 honest closure of the state-model design question: CELL for wasm now, ACTORS need a wasm-scheduler effort later.
+
+---
+## ★ FINDING + FIX (2026-06-28): wasm runtime needs compiler-rt i128 builtins (__multi3) for correct optimized arithmetic
+A microbench (sum i*i, i=0..30M) computed the WRONG result in wasm (returned n-1) while native was correct.
+ROOT CAUSE: -O2 closed-forms the sum loop into the polynomial (n-1)n(2n-1)/6, whose intermediate products
+overflow i64 -> i128 -> LLVM emits **__multi3** (128-bit multiply). __multi3 is in libgcc/compiler-rt on native
+but ABSENT in the freestanding wasm build -> it became an undefined IMPORT -> stubbed to ()=>0n -> wrong product
+-> wrong sum. (Small-loop demos were correct: they never trigger i128.) FIX (nova_runtime_wasm.c, wasm-only ->
+native untouched): a correct __multi3 via 32-bit limbs (no op recurses into a builtin). bench now == native
+(-2011557970256188608); gate `_wasm_bench_one.sh`. Existing gates (value-model, counter) still GREEN.
+NOTE: the OTHER remaining wasm imports are MATH transcendentals (sin/cos/sqrt/pow/...) -- those are correctly
+HOST-PROVIDED (map `env.sqrt = Math.sqrt` etc. in the import object); a host that stubs them to 0 makes a
+math-using program wrong, so a real frontend host MUST supply the math imports. Possible-but-unseen compiler-rt
+gaps to add IF a program's wasm imports show them undefined: __divti3/__udivti3/__umodti3 (i128 VARIABLE divide
+-- rare; constant division strength-reduces to __multi3, already covered) + i128 shifts (usually inlined). This
+is a soundness-relevant class: any LLVM-emitted compiler-rt builtin left undefined silently computes wrong.

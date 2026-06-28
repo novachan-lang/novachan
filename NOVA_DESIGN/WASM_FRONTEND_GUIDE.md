@@ -112,6 +112,10 @@ real-browser artifact is `_wasm_counter.html` (serve the dir over http:// and cl
 - No mutable module globals; no in-wasm `spawn` → use the runtime cell for state.
 - `read_file`/`tcp_recv` are C-string (NUL-truncate) → `read_bytes`/`tcp_recv_bytes`/`forge.file` for binary.
 - forge short fn names (`html/get/json/text/page`) shadow locals — don't reuse them as variable names.
+- **Math imports:** if your NOVA code uses `sqrt/sin/pow/...`, the wasm imports them — the host MUST supply them
+  (`env.sqrt = Math.sqrt`, etc.); a harness that stubs every import to `()=>0n` makes math-using code compute
+  wrong. (The runtime provides the i128 builtin `__multi3` itself — needed for `-O2`-optimized big-integer
+  arithmetic; an undefined LLVM compiler-rt builtin would silently compute wrong, so watch the import list.)
 
 ---
 ## 7. Examples + gates (all under nova-compiler/test_programs/)

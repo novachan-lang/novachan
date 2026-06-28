@@ -399,6 +399,27 @@ char*  strrchr(const char* s,int c){const char* last=(const char*)0; for(;*s;s++
 struct NovaTaskState; /* fwd (real type defined later in the include) */
 static void nova_task_arena_cleanup(void) { }
 
+/* compiler-rt i128 builtins. LLVM emits these for widened/closed-formed i64 arithmetic (e.g. a loop summing
+   i*i that -O2 turns into the polynomial formula with i128 intermediates). They live in libgcc/compiler-rt on
+   native but are ABSENT in the freestanding wasm build -> if left undefined they import + get stubbed -> WRONG
+   results. __multi3 = 128-bit signed multiply, implemented via 32-bit limbs so no op recurses into a builtin. */
+static unsigned __int128 _nova_mul64(unsigned long long a, unsigned long long b) {
+    unsigned long long al = (unsigned)a, ah = a >> 32, bl = (unsigned)b, bh = b >> 32;
+    unsigned long long ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+    unsigned long long cross = (ll >> 32) + (lh & 0xffffffffULL) + (hl & 0xffffffffULL);
+    unsigned long long lo = (ll & 0xffffffffULL) | (cross << 32);
+    unsigned long long hi = hh + (lh >> 32) + (hl >> 32) + (cross >> 32);
+    return ((unsigned __int128)hi << 64) | lo;
+}
+__int128 __multi3(__int128 a, __int128 b) {
+    unsigned __int128 ua = (unsigned __int128)a, ub = (unsigned __int128)b;
+    unsigned long long alo = (unsigned long long)ua, ahi = (unsigned long long)(ua >> 64);
+    unsigned long long blo = (unsigned long long)ub, bhi = (unsigned long long)(ub >> 64);
+    unsigned __int128 lo = _nova_mul64(alo, blo);
+    unsigned long long himid = ahi * blo + alo * bhi;     /* low 64 of the cross terms = the product's high 64 */
+    return (__int128)(lo + ((unsigned __int128)himid << 64));
+}
+
 #include "nova_runtime.c"
 
 /* JS->wasm string IN (frontend event/form-input direction). JS calls wasm_alloc(n) to get a writable buffer
