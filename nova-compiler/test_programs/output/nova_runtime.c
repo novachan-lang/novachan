@@ -1,14 +1,23 @@
+/* #27 wasm/freestanding: system headers don't exist for `clang --target=wasm32 -nostdlib` (no sysroot when
+   offline). Gate them behind NOVA_FREESTANDING; the wasm value-model unit (output/nova_runtime_wasm.c)
+   supplies tiny libc stubs instead. stdint/stddef/setjmp are pure-type / no-OS headers -> kept BARE. NATIVE
+   (flag absent) includes all ten in the SAME order -> byte-identical .o (the directives emit no code). */
+#ifndef NOVA_FREESTANDING
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#endif
 #include <stdint.h>
 #include <stddef.h>
+#ifndef NOVA_FREESTANDING
 #include <math.h>
 #include <ctype.h>
 #include <errno.h>
-#include <setjmp.h>
+#include <setjmp.h>   /* hosted header (not a freestanding one like stdint/stddef) -> gate for wasm */
+#endif
 
+#ifndef NOVA_FREESTANDING   /* platform I/O headers (sockets/threads/files/crypto) -- gated out for wasm */
 #ifdef _WIN32
 /* Raise the Winsock select() fd cap from the default 64 BEFORE winsock2.h is included (the Windows
    fd_set is a struct { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; }, not a bitmap, so this just works).
@@ -49,6 +58,7 @@
 #include <openssl/err.h>
 #endif
 #endif
+#endif  /* NOVA_FREESTANDING: platform I/O headers gated out for wasm */
 
 /* ── Task-local state (Stage 0 of the implicit-async flagship) ────────────────
    The error/Result state that used to be raw thread-locals now lives in a per-task

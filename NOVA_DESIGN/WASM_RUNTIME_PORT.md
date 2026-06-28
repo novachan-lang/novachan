@@ -114,3 +114,41 @@ S4. MILESTONE: a NOVA fn that BUILDS a string ("a"+"b"+"c") + measures it runs i
   first, floats later).
 - find_tag without guard pages: a genuinely-wild ptr in `any` dispatch can't be probed -> wasm relies on
   range+magic only. Acceptable (wasm linear memory is bounds-checked by the engine; OOB traps deterministically).
+
+---
+## S1 DONE + S2 error cascade (2026-06-28, commit pending)
+S1 landed: (a) `output/nova_runtime_wasm.c` scaffold = `#define NOVA_FREESTANDING` + freestanding mem/str prims
+(memcpy/memmove/memset/memcmp/strlen/strcmp/strncmp/strchr) + `#include "nova_runtime.c"`; (b) system includes
+gated in nova_runtime.c (L1-10 + Win32 + POSIX blocks behind `#ifndef NOVA_FREESTANDING`); setjmp.h ALSO gated
+(it is a HOSTED header, not a freestanding one like stdint/stddef — those two resolve under wasm32, setjmp does not).
+
+### ★ INVARIANT CORRECTION: native "byte-identical .o" is UNACHIEVABLE -> use token-identical preprocessed
+The COFF `.o` embeds a TimeDateStamp: the UNEDITED committed nova_runtime.c compiled twice gives two different
+sha256. So `.o` hash equality was never the right check. CORRECT native-safety proof (used for every carve step):
+`clang -E nova_runtime.c | grep -vE '^# ' | grep -v '^\s*$'` (preprocessed, line-markers + blank lines stripped)
+must be byte-identical between the committed and edited file, AND a forge test must pass. S1 PASSED both: the
+native preprocessed token stream is identical (only blank lines added by the directives) + forge_query_test GREEN.
+
+### S2 driver: wasm compile cascade (513 errs) -> distinct symbols, two buckets
+STUB-ABLE libc (value-model uses; ADD freestanding impls to nova_runtime_wasm.c): malloc/calloc/realloc/free
+(-> nova_heap_alloc; free=no-op; realloc=alloc+copy), snprintf (minimal int/float/%s/%c formatter), strstr,
+strcpy, atoi/atoll/atof/strtod (minimal parsers), qsort (minimal), getenv (-> NULL: no env in wasm), abort
+(-> __builtin_trap()). NOTE several (atoi/atof/strtod/qsort) appear in gated I/O regions -> after gating, recompile
+and stub only what REMAINS undeclared (genuinely value-model).
+GATE-OUT (wrap in `#ifndef NOVA_FREESTANDING`; symbol : first line):
+- Panic/fault/backtrace: backtrace 188, fprintf 190, fflush 191, backtrace_symbols_fd 192, longjmp 209, exit 212,
+  setjmp 7735, jmp_buf type. (fault boundary + fatal-panic stack traces)
+- Threads/sched: pthread_mutex_init 315 ... pthread_cond_* 4562-4837, sched_yield 4917, usleep 4923,
+  pthread_create 6409, pthread_join 7317, pthread_mutexattr_* 7257-7260, pthread_*_destroy 7837-7838,
+  types pthread_mutex_t/cond_t/t/mutexattr_t, PTHREAD_*_INITIALIZER, sysconf 7778/_SC_NPROCESSORS_ONLN.
+- Time: gettimeofday 4997, clock_gettime 5986, CLOCK_MONOTONIC/REALTIME.
+- File/std IO: printf 1632, puts 1746, fopen 3315/fread 3276/fwrite 3299/fclose 3333/fseeko 3328/ftello 3329/
+  fgets 3004, write 983/close 984/pipe 982/dup2 3120, FILE/stdin/stdout/stderr, SEEK_SET/END, strerror 3318.
+- Process: system 2978, popen 2988, pclose 2999, execl 3122, _exit 3123, waitpid 3159, WIFEXITED/WEXITSTATUS 3162,
+  mkdir 3177, stat 3239, EEXIST, pid_t, ssize_t.
+- Socket/netpoller: FD_ZERO 6211/FD_SET 6242/FD_ISSET 6276/fd_set, select 6261, getaddrinfo 6484, munmap 6534.
+- aligned alloc: posix_memalign 693 (-> NOVA_FREESTANDING path: plain nova_rt_struct_alloc, ignore alignment).
+First breaks at L119/122 (free/malloc): an early helper -> stubs cover these. nova_task_arena_cleanup 7763 is a
+fwd-decl-after-use artifact -> resolves once its section compiles.
+### S2 plan: gate the above sections behind `#ifndef NOVA_FREESTANDING` (iterate compile->gate until only STUB-ABLE
+symbols remain), add the stub-able libc to the scaffold, re-confirm native token-identical each step. Then S3.
