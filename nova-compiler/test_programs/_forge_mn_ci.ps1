@@ -20,18 +20,24 @@ foreach ($t in $tests) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File ".\_fdb_one.ps1" $($t.name) *> $null
     $exe = "$($t.name).exe"
     if (-not (Test-Path $exe)) { Write-Host "  FAIL $($t.name): did not build"; $fail++; continue }
+    # cover both N>1 carrier counts AND both task-slot-reclaim states (reclaim=1 exercises the slot
+    # reuse-vs-deref path under the monitor lock -- the part that must stay race-free at N>1).
     foreach ($ncar in 4, 8) {
-        $env:NOVA_CARRIERS = "$ncar"
-        & "$PSScriptRoot\_safe_scale_run.ps1" -Exe ".\$exe" -TimeoutSec $TimeoutSec *> $null
-        $out = Get-Content "$exe.scaleout.txt" -Raw -ErrorAction SilentlyContinue
-        if ($out -match [regex]::Escape($t.ok)) {
-            Write-Host "  OK $($t.name) @ NOVA_CARRIERS=$ncar"
-        } else {
-            Write-Host "  FAIL $($t.name) @ N=$ncar (hang / abort / wrong output)"
-            $fail++
+        foreach ($rc in 0, 1) {
+            $env:NOVA_CARRIERS = "$ncar"
+            $env:NOVA_SCHED_RECLAIM_TASK = "$rc"
+            & "$PSScriptRoot\_safe_scale_run.ps1" -Exe ".\$exe" -TimeoutSec $TimeoutSec *> $null
+            $out = Get-Content "$exe.scaleout.txt" -Raw -ErrorAction SilentlyContinue
+            if ($out -match [regex]::Escape($t.ok)) {
+                Write-Host "  OK $($t.name) @ NOVA_CARRIERS=$ncar reclaim=$rc"
+            } else {
+                Write-Host "  FAIL $($t.name) @ N=$ncar reclaim=$rc (hang / abort / wrong output)"
+                $fail++
+            }
         }
     }
     Remove-Item Env:NOVA_CARRIERS -ErrorAction SilentlyContinue
+    Remove-Item Env:NOVA_SCHED_RECLAIM_TASK -ErrorAction SilentlyContinue
 }
 
 if ($fail -gt 0) { Write-Host "=== FORGE N>1 GATE FAILED: $fail problem(s) ==="; exit 1 }
