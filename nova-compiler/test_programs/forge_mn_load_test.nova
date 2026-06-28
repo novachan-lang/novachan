@@ -1,0 +1,60 @@
+// N>1 Forge concurrency/scale + no-cross-talk test: a Forge server (serve_req_n) handles 12 CONCURRENT
+// clients, each POSTing a UNIQUE-length body; the server echoes the body length (auto-JSON {"got":N}). Each
+// client checks it got back ITS OWN length -- so a response routed to the wrong connection under parallel
+// multi-core serving (an N>1 socket/arena race) is caught. Run at NOVA_CARRIERS=4/8 the 12 clients + server
+// accept loop + handlers are green tasks spread across carriers in parallel.
+import forge
+
+type Echo
+    got: int
+
+fn h_echo(req: Request) -> Echo
+    Echo(len(req.body))
+
+fn _client(port: int, id: int, rch)
+    sleep(40)
+    let blen = (id + 1) * 3
+    let body = ""
+    let k = 0
+    while k < blen
+        body = body + "x"
+        k = k + 1
+    let sock = tcp_connect("127.0.0.1", port)
+    if sock >= 0
+        tcp_send(sock, "POST /echo HTTP/1.0\r\nContent-Length: " + str(blen) + "\r\n\r\n" + body)
+        let resp = tcp_recv(sock)
+        tcp_close(sock)
+        if find(resp, "\"got\":" + str(blen)) >= 0
+            send(rch, 1)
+        else
+            send(rch, 0)
+    else
+        send(rch, 0)
+
+fn main()
+    let app = forge.app()
+    forge.post(app, "/echo", h_echo)
+    let port = 19507
+    let nclients = 12
+    let results = channel()
+    let ap = app
+    let pp = port
+    let nc = nclients
+    sched_spawn(fn(z) forge.serve_req_n(ap, pp, nc))
+    sleep(80)
+    let i = 0
+    while i < nclients
+        let p2 = port
+        let id2 = i
+        let rc = results
+        sched_spawn(fn(z) _client(p2, id2, rc))
+        i = i + 1
+    let ok = 0
+    let j = 0
+    while j < nclients
+        ok = ok + recv(results)
+        j = j + 1
+    if ok == nclients
+        print("FORGE N>1 LOAD OK: 12 concurrent clients, all responses correct (no cross-talk)")
+    else
+        print("FORGE N>1 LOAD FAIL: " + str(ok) + "/12")

@@ -9,7 +9,8 @@ param([int]$TimeoutSec = 40)
 Set-Location $PSScriptRoot
 
 $tests = @(
-    @{ name = "forge_recv_security_test"; ok = "forge_recv_security_test passed" }
+    @{ name = "forge_recv_security_test"; ok = "forge_recv_security_test passed" },
+    @{ name = "forge_mn_load_test";       ok = "FORGE N>1 LOAD OK" }   # 12 concurrent clients, no cross-talk (serving scales)
 )
 
 $fail = 0
