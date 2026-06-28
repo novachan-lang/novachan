@@ -152,3 +152,26 @@ First breaks at L119/122 (free/malloc): an early helper -> stubs cover these. no
 fwd-decl-after-use artifact -> resolves once its section compiles.
 ### S2 plan: gate the above sections behind `#ifndef NOVA_FREESTANDING` (iterate compile->gate until only STUB-ABLE
 symbols remain), add the stub-able libc to the scaffold, re-confirm native token-identical each step. Then S3.
+
+---
+## S2 progress (2026-06-28): SHIM approach -> 513 -> 213 errors; key POSIX-branch finding
+PIVOTED from "gate every I/O section in nova_runtime.c" to a SHIM in nova_runtime_wasm.c (keeps native almost
+entirely untouched -- only 2 nova_runtime.c include-gates: setjmp.h already in S1, + signal.h this step; both
+`#ifndef NOVA_FREESTANDING`, native token-identical VERIFIED + forge_query_test GREEN). The shim supplies:
+- VALUE-MODEL libc (REAL impls): bump malloc/calloc/realloc/free, snprintf/vsnprintf (own formatter), strstr/
+  strcpy/strncpy, atoi/atoll/atof/strtod, qsort, rand/srand (LCG), isnan/isinf/isfinite. memcpy/memset/strlen
+  /strcmp/strncmp/strchr from S1.
+- DEAD-in-wasm decls/stubs: stdio (printf/fopen/fread/...), pthreads, signals, process (fork/exec/waitpid),
+  setjmp/longjmp, backtrace, getenv->NULL, time->0, math transcendentals (declarations). + the types/macros the
+  gated headers gave (FILE, jmp_buf, pthread_*, fd_set, struct sockaddr/addrinfo/stat/dirent/timeval, FD_*/
+  SIG*/SEEK_*/CLOCK_*/_SC_*/RAND_MAX...).
+★ FINDING: with the platform headers gated, wasm (non-_WIN32) takes the POSIX `#else` branches everywhere. Those
+branches reference the FULL POSIX API (sockets AF_INET/socket/bind/recv/send/htons/inet_pton, dirent opendir/
+readdir, sys/stat S_ISREG, mmap, time_t/localtime/strftime, EAGAIN/EWOULDBLOCK) AND a WIN32-only static
+(nova_task_arena_cleanup, defined only inside `#ifdef _WIN32` @L5285+ -> absent on the POSIX path -> this is the
+"partial Linux" gap surfacing). Remaining 213 errors are almost entirely this POSIX I/O surface.
+DECISION for next step: these are all NON-value-model (sockets/files/dirs/time/scheduler). Two options: (A) keep
+shimming the ~60 POSIX symbols; (B) GATE the socket/netpoller/file/dirent/scheduler SECTIONS behind
+`#ifndef NOVA_FREESTANDING` (removes the half-maintained POSIX branches entirely -> fewer shims, and resolves
+nova_task_arena_cleanup since its POSIX call site goes away). LEAN B for the I/O-heavy sections (cleaner, and the
+value-model never needs them); keep the shim for the value-model libc + math. The shim libc/math is reusable either way.

@@ -7855,7 +7855,9 @@ static void nova_file_ensure_init(void);   /* defined in the file-handle section
    can poll via shutdown_requested() to drain cleanly; a SECOND signal force-exits, so the process always
    stays killable even if nothing drains (no "flag set but unkillable" trap). signal() handles SIGINT/SIGTERM
    on both Windows (CRT) and POSIX. The handler uses write() only (async-signal-safe; fprintf is not). */
+#ifndef NOVA_FREESTANDING   /* signals don't exist in wasm; sig_atomic_t/signal shimmed in nova_runtime_wasm.c */
 #include <signal.h>
+#endif
 static volatile sig_atomic_t nova_shutdown_flag = 0;
 static void nova_signal_handler(int sig) {
     (void)sig;
