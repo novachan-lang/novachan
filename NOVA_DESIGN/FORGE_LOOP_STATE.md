@@ -1084,3 +1084,33 @@ connection turnover). The conn-soak gates against WORSENING so the eventual full
 => Partial fix shipped (correct structure, ~6/conn). Bulk precisely localized to the handshake's escaping
    raw-string allocs; deferred to a focused debugging session. Per owner direction, RE-CENTER the loop on
    FORGE FEATURE COMPLETION rather than continuing to chase this moderate leak.
+
+---
+## (ba) 2026-06-30 — WS LEAK FULLY FIXED: fat strings are now ARENA-AWARE (root cause, general win)
+Owner: "complete the WS leak + hardening first, confirm it works, THEN Forge effectively with good model use."
+Done. Root cause NAILED (not the handshake code per se -- a GENERAL runtime gap): `nova_fat_str_create`
+used `malloc` directly, so STRINGS bypassed the per-task arena entirely (unlike lists/dicts/structs via
+nova_heap_alloc). A transient string created and discarded WITHOUT a store -- e.g. `char_at()` consumed by
+`ord()` (no reassignment, so FULLRC never drops it; not in the arena, so arena_exit never frees it) --
+leaked forever. The WS handshake's ws_compute_accept (pure-NOVA SHA-1 + base64) does ~88 char_at calls ->
+~86/conn. PROOF: a 64-char_at-in-arena micro-test leaked exactly 64/iter; bad-key churn (skips sha1) was
+flat; handshake-only churn leaked the same ~86/conn as full echo.
+FIX (nova_runtime.c): nova_fat_str_create now bumps into the active arena when one is set (tagged
+NOVA_RC_ARENA_BIT, excluded from nova_mem_live, freed wholesale at arena_exit), mirroring nova_heap_alloc.
+This ACTIVATES already-existing-but-dead infrastructure: nova_deep_copy_rec already MATERIALIZES an
+independent malloc copy of an arena string on the ownership-transfer boundaries (channel send / spawn,
+which also clear active_arena) -- so escapes are safe. find_tag still classifies it FAT_STR (arena chunks
+are bounds-tracked). Also kept the (az) connection-scoped arena in _ws_run (reclaims Ws/buf/_ws_finish).
+RESULT: char_at micro-test 64/iter -> 0; WS conn-churn ~94/conn -> ~1/conn (N=1, the baseline FULLRC loop
+residue) and ~0/conn (N>1) -- FLAT, identical to HTTP churn. The conn-soak assert is now TIGHT (delta<4000).
+VALIDATION (the make-or-break for a change touching EVERY string): full nova_ci ALL GREEN -- gen5==gen6
+RECONVERGED byte-identical (compiler self-compiles consistently; it runs with no arena so its strings still
+malloc -> unchanged), perf-native, freestanding gate, 598/0 in BOTH NORMAL and FULLRC modes (all Forge +
+spawn + channel tests pass -> escape materialization is sound), ASAN clean on the conn-churn path.
+GENERAL WIN beyond WS: ANY arena-scoped code that builds transient strings (parsers, formatters, the whole
+Forge request path) now stays flat instead of leaking unstored string temporaries. This was a real hole in
+the "transparent arena" memory model -- strings were the one value kind that wasn't arena-aware.
+NOTE: nova_fat_str_concat (the OTHER fat constructor, used by `+`) still mallocs -- it is the reassignment
+path that FULLRC already keeps flat, so not a leak source; could be made arena-aware later for symmetry.
+=> WS leak + hardening COMPLETE and confirmed. Next per owner: FORGE feature completion, effectively, with
+   Opus for design/NOVA-changes + Sonnet for mechanical work.

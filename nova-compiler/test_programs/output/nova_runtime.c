@@ -1192,8 +1192,26 @@ static int64_t nova_str_take(char* buf) {
    and data so RC macros work at the same offsets as regular objects. */
 
 static char* nova_fat_str_create(const char* src, size_t len) {
-    char* base = (char*)malloc(NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + len + 1);
-    if (!base) return NULL;
+    size_t fs_total = NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + len + 1;
+    char* base;
+    /* Transparent arena: when a per-task arena is active, bump the fat string into it (tagged
+       NOVA_RC_ARENA_BIT -> rc_inc/dec no-op, freed WHOLESALE at arena_exit, excluded from
+       nova_mem_live). This makes STRINGS arena-aware exactly like lists/dicts/structs (nova_heap_alloc),
+       so a transient string created and discarded WITHOUT being stored -- e.g. char_at()'s result
+       consumed by ord(), which triggers no reassignment for FULLRC to drop -- is reclaimed at scope
+       exit instead of leaking. Escapes are already handled: nova_deep_copy_rec MATERIALIZES an
+       independent malloc copy of an arena string on the ownership-transfer boundaries (channel send /
+       spawn), which also clear active_arena, so the materialized copy is RC-heap. The arena chunk is
+       bounds-tracked by nova_arena_new_chunk, so find_tag still classifies it as FAT_STR. */
+    NovaArena* _fsa = nova_cur()->active_arena;
+    int fs_arena = (_fsa != NULL);
+    if (fs_arena) {
+        base = (char*)nova_arena_bump(_fsa, fs_total);
+        if (!base) return NULL;
+    } else {
+        base = (char*)malloc(fs_total);
+        if (!base) return NULL;
+    }
     char* str = base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE;
     uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < len; i++) {
@@ -1204,11 +1222,13 @@ static char* nova_fat_str_create(const char* src, size_t len) {
     str[len] = '\0';
     ((uint64_t*)base)[0] = h;
     ((int64_t*)base)[1] = (int64_t)len;
-    ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[0] = 1;
+    ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[0] = fs_arena ? NOVA_RC_ARENA_BIT : 1;
     ((int32_t*)(base + NOVA_FAT_HDR_SIZE))[1] = NOVA_RC_ENCODE(NOVA_MEM_FAT_STR);
-    nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + NOVA_FAT_HDR_SIZE + NOVA_RC_HDR_SIZE + len + 1);
     nova_mem_total++;
-    NOVA_MEM_LIVE_ADD(1);
+    if (!fs_arena) {
+        nova_track_heap_bounds((uintptr_t)base, (uintptr_t)base + fs_total);
+        NOVA_MEM_LIVE_ADD(1);
+    }
     return str;
 }
 
