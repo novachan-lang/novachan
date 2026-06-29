@@ -1010,3 +1010,23 @@ Three commits this session, then a regression hunt that uncovered a SEPARATE pre
    capability gap (and a silent-data-loss CVE-class bug) closed. Lesson logged: the wild-read sweep traded a
    crash for a silent correctness regression; soundness fixes must preserve the legitimate feature, not just
    stop the crash.
+
+---
+## (ax) 2026-06-29 — N>1 WebSocket / SSE breadth VALIDATED + gate expanded (no NOVA change)
+Validated the LONG-LIVED, PUSH-oriented socket paths at multi-core, which the audit/memory had flagged as
+"WS/sockets at N>1 unre-validated." ALL 8 self-contained WS/SSE tests pass at NOVA_CARRIERS=4 AND 8 with
+task-slot reclaim BOTH 0 and 1 (32 runs, kill-on-timeout, 32/32 OK):
+  forge_ws_echo (RFC-6455 handshake + masked echo + close), forge_ws_chat (hub BROADCAST fan-out, ran 3×),
+  forge_sse (server->client streaming via the hub), forge_ws_routing, forge_ws_presence, forge_ws_lifecycle,
+  forge_ws_keepalive (ping/pong), _ws_soak (sustained frames). Exercises the per-connection dual-task
+  (reader + SINGLE writer Ws.outbound), the pub/sub hub fan-out, and the netpoller read+write waiter paths
+  across parallel carriers — the parts most prone to an N>1 lost-wakeup / writer race / cross-talk.
+GATE: EXPANDED the existing `_ws_mn_ci.ps1` from 3 tests (sse/echo/chat, N-only) to all 8 WS/SSE tests ×
+N=4/8 × reclaim 0/1. (Did NOT create a duplicate — found `_ws_mn_ci.ps1` already existed; extended it.)
+It's an on-demand gate, consistent with its HTTP sibling `_forge_mn_ci.ps1` (neither is wired into the main
+nova_ci.ps1, which runs only the pure-scheduler `_n_carriers_ci.ps1` at stage 2b; the N=1 WS/SSE coverage is
+in the main regression's serial batch). N=1 behavior untouched (script-only change, no runtime/compiler edit).
+=> Forge's real-time layer (WebSocket rooms + SSE) is now multi-core-validated AND gated. Combined with the
+   already-gated multi-core HTTP serving (_forge_mn_ci, bf865da), Forge's full serving surface — request/
+   response AND streaming/broadcast — is proven N>1-safe. The memory's "WS/sockets at N>1 unre-validated"
+   caveat is RESOLVED.
