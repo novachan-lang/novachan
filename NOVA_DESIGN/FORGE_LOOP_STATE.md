@@ -970,3 +970,43 @@ ASAN clean on all channel tests. leak_baseline guard tightened from >2200 to >10
 => The DEFAULT-MEMORY story for loop-local allocations is COMPLETE: list, dict, struct, closure, AND channel
 all get automatic reassignment drops. Remaining memory gap = scope-exit RC (dropping at scope exit when a
 variable goes out of scope without reassignment) + cycle collector. These are deferred to a focused session.
+
+---
+## (aw) 2026-06-29 — FULLRC UAF soundness, runtime fixes, + struct-as-dict-key regression FIXED
+Three commits this session, then a regression hunt that uncovered a SEPARATE pre-existing bug.
+
+**c16baad — FULLRC UAF soundness (two root causes the default-ON flip exposed):**
+  A) Borrowed-element UAF: index_get/field_get return an INTERIOR pointer with NO rc_inc (borrow valid only
+     while container lives). The pre-pass proved the container non-escaping → dropped it on reassignment while
+     the borrow was live. FIX: propagate the container's slot association into the borrowed result's loadof
+     tracking, so an escaping borrow marks the container bad (no drop).
+  B) Spawn-family move-retain UAF: nova_rt_fiber_create RETAINS the closure at arg[0] by MOVE (no rc_inc). A
+     reassignment drop frees the closure the spawned task still owns. FIX: `_fc_retains` flag marks
+     sched_spawn/fiber_create arg[0] as escaping. Verified via DEBUG_RC oracle (0 double-frees on 4 repros).
+
+**71ef8a5 — runtime (two unrelated fixes):**
+  - Freestanding gate was broken since wasm S1 (d5912ae) gated headers behind NOVA_FREESTANDING but the
+    native _s27 gate also sets it and needs the host CRT. FIX: split into NOVA_FREESTANDING (static allocator)
+    + NOVA_NO_SYSHEADERS (gate headers, wasm-only). Both gates green again.
+  - error_msg CVE-class: nova_rt_wrap_error_context packed a raw malloc ptr as the result value → find_tag
+    misclassified it as a list → list_append OOB. FIX: pack a tagged fat string; take_error_msg wraps raw
+    messages too.
+
+**★ struct-as-dict-key regression (the real find — NOT caused by my commits, but caught by my CI run):**
+  auto_reflect_test failed at `d[b]` (struct key lookup returning 0). Bisected to 8ca2f19 (the runtime
+  wild-read soundness sweep, 2026-06-27): it replaced `k = (char*)key` with `k = nova_str_safe(key)` in the
+  dict key path. nova_str_safe coerces EVERY non-string key (struct/int) to "" → all collide on the ""
+  hash, yet the stored RAW key pointer never strcmp-matches "" → every non-string-key lookup silently
+  returns 0 (data loss). The sweep fixed a real wild-read (a bare-int key strcmp'd as char*) but regressed
+  the legitimate struct-key feature. Pre-8ca2f19 struct keys "worked" only by accidental raw-byte strcmp.
+  FIX (this session, in nova_runtime.c): dict key hash+compare now route NON-string keys through the
+  canonical structural nova_rt_hash / nova_rt_eq (same functions backing ==, set membership, hash), while
+  STRING keys keep the original fast FNV/strcmp path (hot path: HTTP headers, JSON; exact byte back-compat).
+  A symmetric readable-string guard in nova_dict_keymatch makes it sound even for an adversarial/`any`-typed
+  MIXED-key dict (a string is never strcmp'd against a struct's bytes). Sets were already correct (they use
+  nova_rt_eq). New permanent guard: struct_dict_key_test.nova. ASAN clean.
+  VALIDATION: full CI ALL GREEN — gen5==gen6 reconverged, perf-native, freestanding gate, 598/0 both modes.
+=> NOVA dicts now support structural keys (any record struct as a key) correctly AND soundly — a real
+   capability gap (and a silent-data-loss CVE-class bug) closed. Lesson logged: the wild-read sweep traded a
+   crash for a silent correctness regression; soundness fixes must preserve the legitimate feature, not just
+   stop the crash.

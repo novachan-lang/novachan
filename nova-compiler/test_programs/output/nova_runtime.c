@@ -2410,15 +2410,46 @@ static inline uint64_t nova_dict_hash_key(const char* s) {
     return h;
 }
 
+int64_t nova_rt_hash(int64_t val);   /* fwd decl: canonical structural hash (def below) */
+
+/* Dict key hash + comparison, SOUND for all key types AND correct for structural keys.
+   STRING keys keep the original fast FNV/strcmp path (the hot path -- HTTP headers, JSON
+   parsing -- and exact byte-for-byte back-compat). NON-string keys (struct/int/bytes/list)
+   route through the canonical structural nova_rt_hash / nova_rt_eq so structurally-equal
+   values map to the same entry. This fixes struct-as-dict-key and int-key dicts that the
+   8ca2f19 soundness sweep silently broke: its nova_str_safe() coerced every non-string key
+   to "" -> all collided on the "" hash, yet the stored RAW key pointer never strcmp-matched
+   "" -> every non-string lookup failed (returned 0). Soundness is preserved: a non-string
+   key is never strcmp'd as a char* (the original wild read the sweep was closing).
+   The caller computes `key_is_str` ONCE (it drives both the hash and the match), so the hot
+   string path costs at most one extra find_tag (on the stored key) per hash-bucket hit. */
+static inline uint64_t nova_dict_keyhash(int64_t key, int key_is_str) {
+    if (key_is_str) return nova_dict_hash_key((const char*)(uintptr_t)key);
+    return (uint64_t)nova_rt_hash(key);
+}
+static inline int nova_dict_keymatch(int64_t stored, int64_t probe, int probe_is_str) {
+    int stored_is_str = nova_is_readable_str((const void*)(uintptr_t)stored);
+    if (probe_is_str != stored_is_str) return 0;  /* string vs non-string: never equal, never cross-compared */
+    if (probe_is_str) {
+        /* both readable strings -> compare by bytes (the fast hot path) */
+        return strcmp((const char*)(uintptr_t)stored, (const char*)(uintptr_t)probe) == 0;
+    }
+    /* both non-string -> canonical structural eq. The symmetric string guard above
+       guarantees nova_rt_eq is never handed a string vs a struct (which would strcmp the
+       struct's bytes and could over-read a struct with no early NUL) -- so this is sound
+       even for an adversarial/`any`-typed mixed-key dict, not just well-typed code. */
+    return nova_rt_eq(stored, probe) ? 1 : 0;
+}
+
 int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;  /* SOUNDNESS: non-dict handle -> no-op, no wild deref */
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
-    uint64_t h = nova_dict_hash_key(k);
+    int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);  /* SOUND: drives both hash + match; a non-string key is never strcmp'd */
+    uint64_t h = nova_dict_keyhash(key, key_is_str);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
-        if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0) {
+        if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str)) {
             nova_rc_dec(d->vals[ei]);
             d->vals[ei] = val;
             nova_rc_inc(val);
@@ -2452,12 +2483,12 @@ int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
    process-local. */
 int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
-    uint64_t h = nova_dict_hash_key(k);
+    int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);  /* SOUND: drives both hash + match; a non-string key is never strcmp'd */
+    uint64_t h = nova_dict_keyhash(key, key_is_str);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
-        if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0) {
+        if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str)) {
             d->vals[ei] = val;
             return 0;
         }
@@ -2486,12 +2517,12 @@ int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
 int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;  /* SOUNDNESS: non-dict handle -> 0, no wild deref */
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
-    uint64_t h = nova_dict_hash_key(k);
+    int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);  /* SOUND: drives both hash + match; a non-string key is never strcmp'd */
+    uint64_t h = nova_dict_keyhash(key, key_is_str);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
-        if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0)
+        if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str))
             return nova_rt_unbox_elem(d->vals[ei]);
         slot = (slot + 1) & (d->idx_cap - 1);
     }
@@ -2518,12 +2549,12 @@ int64_t nova_rt_dict_set_bbox(int64_t handle, int64_t key, int64_t v) {
 int64_t nova_rt_dict_has(int64_t handle, int64_t key) {
     if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return 0;  /* SOUNDNESS: non-dict handle -> not found, no wild deref */
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
-    uint64_t h = nova_dict_hash_key(k);
+    int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);  /* SOUND: drives both hash + match; a non-string key is never strcmp'd */
+    uint64_t h = nova_dict_keyhash(key, key_is_str);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
-        if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0) return 1;
+        if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str)) return 1;
         slot = (slot + 1) & (d->idx_cap - 1);
     }
     return 0;
@@ -2558,13 +2589,13 @@ int64_t nova_rt_memo_unlock(void) {
 
 int64_t nova_rt_dict_del(int64_t handle, int64_t key) {
     NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    const char* k = nova_str_safe(key);  /* SOUNDNESS: a non-string dict key would be hashed/strcmp'd as a char* -> wild read */
-    uint64_t h = nova_dict_hash_key(k);
+    int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);  /* SOUND: drives both hash + match; a non-string key is never strcmp'd */
+    uint64_t h = nova_dict_keyhash(key, key_is_str);
     int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
     int64_t found = -1;
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
-        if (d->hashes[ei] == h && strcmp((const char*)(uintptr_t)d->keys[ei], k) == 0) {
+        if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str)) {
             found = ei;
             break;
         }
