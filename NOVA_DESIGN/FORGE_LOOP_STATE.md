@@ -1030,3 +1030,32 @@ in the main regression's serial batch). N=1 behavior untouched (script-only chan
    already-gated multi-core HTTP serving (_forge_mn_ci, bf865da), Forge's full serving surface — request/
    response AND streaming/broadcast — is proven N>1-safe. The memory's "WS/sockets at N>1 unre-validated"
    caveat is RESOLVED.
+
+---
+## (ay) 2026-06-29 — WS CONNECTION-CHURN soak: SOUNDNESS gated + a real per-connection leak FOUND (tracked)
+Higher-count N>1 soak (the loop's preferred next unit). Wrote `_ws_conn_soak_test.nova`: 400 fresh WS
+connections, each connect -> 101 handshake -> masked echo -> Close handshake -> teardown, with a per-cycle
+client arena so the global live_count delta reflects SERVER residue. Added to `_ws_mn_ci.ps1` (now 9 tests).
+SOUNDNESS RESULT (the hard gate): all 400 churned connections byte-correct at N=1/4/8, no hang/crash —
+connection setup+teardown is sound under churn at multi-core. This is NEW coverage (the other WS tests are
+fixed at 1–2 connections; nothing exercised connection TURNOVER).
+
+★ FINDING (tracked, NOT yet fixed): a real WebSocket-specific per-connection memory leak of **~92 live
+objects/connection**. It is connection-FIXED (per-MESSAGE is flat — _ws_soak passes; ~92/conn is identical
+at N=1/4/8, so it is NOT fiber-slot reclaim). HTTP-connection churn is FLAT (delta −1 at N>1: `_serve_conn`'s
+HTTP path is fully arena-scoped + the per-conn task reclaims) — so the leak is specific to the WS frame-loop
+path. ROOT CAUSE: `_ws_run` runs with active_arena==NULL (by design — the long frame loop must not hold the
+request arena), so its connection-lived allocations leak: the `Ws` struct + `ws.buf`, and especially
+`_ws_finish` (close-frame encode + draining up to 8 incoming frames) which allocates with NO arena. scope-
+exit RC is unimplemented, so nothing reclaims them when the connection closes.
+PROPOSED FIX (needs owner go — careful, soundness-critical forge change): a CONNECTION-SCOPED arena around
+the whole `_ws_run` body (per-message arenas nest inside; ws.buf lives in the connection arena and survives
+the inner exits; the connection arena frees everything — ws, buf, _ws_finish residue — wholesale at close).
+RISK to design around: the room/live paths' per-connection `outbound` channel is referenced by the hub for
+broadcast, so it MUST escape the connection arena (or the hub holds a freed pointer -> UAF). Likely shape:
+connection arena for the PLAIN path; for room/live, allocate `outbound` + hub-registered state OUTSIDE the
+arena (RC-heap) and free on unsubscribe, arena only the frame-loop scratch. Severity: MODERATE — per-message
+(high-volume) is flat; this bites only high connection TURNOVER. The churn soak gates against WORSENING
+(delta < total*175) so a regression or the eventual fix's improvement is both visible.
+=> Soundness of WS connection churn at N>1 is now GATED. The per-connection leak is localized + proposed;
+   the fix is the next WS unit pending owner approval.

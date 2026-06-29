@@ -19,7 +19,8 @@ $tests = @(
     @{ name = "forge_ws_presence_test";   ok = "forge_ws_presence_test passed" },   # join/leave presence tracked across the room
     @{ name = "forge_ws_lifecycle_test";  ok = "forge_ws_lifecycle_test passed" },  # open/close lifecycle callbacks fire in order
     @{ name = "forge_ws_keepalive_test";  ok = "forge_ws_keepalive_test passed" },  # ping/pong keepalive frames
-    @{ name = "_ws_soak_test";            ok = "_ws_soak_test passed" }             # sustained frames -> flat per-message memory
+    @{ name = "_ws_soak_test";            ok = "_ws_soak_test passed" },            # sustained frames over ONE conn -> flat per-message memory
+    @{ name = "_ws_conn_soak_test";       ok = "_ws_conn_soak_test passed" }        # CONNECTION churn (400 connect/echo/close) -> all byte-correct, memory not worsening
 )
 
 $fail = 0
