@@ -1059,3 +1059,28 @@ arena (RC-heap) and free on unsubscribe, arena only the frame-loop scratch. Seve
 (delta < total*175) so a regression or the eventual fix's improvement is both visible.
 => Soundness of WS connection churn at N>1 is now GATED. The per-connection leak is localized + proposed;
    the fix is the next WS unit pending owner approval.
+
+---
+## (az) 2026-06-29 — WS leak: partial fix (connection arena) + CORRECTED localization of the bulk
+Owner approved fixing the leak. Applied + validated a connection-scoped arena around `_ws_run`'s PLAIN path
+(forge/forge.nova; room/live left alone — their `outbound` channel is hub-referenced and must escape). It is
+SOUND: nested-arena support verified (outer survives inner exits, leaked=0), ASAN-clean on the echo path,
+and the plain-path tests stay green (echo correct, `_ws_soak` per-message FLAT preserved, keepalive OK).
+BUT it only reclaimed ~6/conn (the `Ws`+`ws.buf`+`_ws_finish` residue, as estimated) — so my entry-(ay)
+root-cause for the BULK was WRONG.
+★ CORRECTED localization (decisive tests): the ~86/conn bulk is in the **valid-key handshake path**, NOT
+`_ws_run`'s body. Evidence: (1) a BAD-key churn (ws_key_ok fails -> 400 -> no ws_compute_accept, no _ws_run)
+is FLAT (delta -1); (2) a HANDSHAKE-ONLY churn (valid key, NO data echo) leaks the SAME ~86/conn as the full
+echo churn -> the data/message path contributes ~0 (consistent with _ws_soak flat); (3) it's LINEAR (800
+conns = 2x the 400-conn delta); (4) heap profiler: raw strings dominate (77k of 99k allocs). So the bulk is
+`ws_compute_accept` (pure-NOVA SHA-1 + base64 of the key) and/or the 101-response build — which run INSIDE
+the request arena (arena_enter@3965 .. arena_exit@3979) yet still leak, meaning those allocations ESCAPE the
+request arena. RULED OUT: a minimal arena test doing the SAME work (push a list to 80 + concat a string 28x
+inside an arena) is FLAT — so generic arena list/string growth is fine; something specific to the handshake
+escapes. NEXT DIAGNOSTIC (dedicated session, not loop-thrash): extend the heap profiler to print per-tag
+STILL-LIVE (it currently prints only cumulative-by-tag), or add live_count probes inside ws_compute_accept
+to find the exact escaping alloc. SEVERITY MODERATE (per-message high-volume path flat; bites only high
+connection turnover). The conn-soak gates against WORSENING so the eventual full fix's improvement is visible.
+=> Partial fix shipped (correct structure, ~6/conn). Bulk precisely localized to the handshake's escaping
+   raw-string allocs; deferred to a focused debugging session. Per owner direction, RE-CENTER the loop on
+   FORGE FEATURE COMPLETION rather than continuing to chase this moderate leak.
