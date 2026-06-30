@@ -1219,3 +1219,24 @@ past the load limit). NULL params not yet supported (tracked).
 => PG injection-safety CLOSED + proven live. Remaining prod gaps (priority): TLS verify-full (MITM) > pool
    codegen-bug pin > typed decoding > timeouts. The owner cares deeply about production-grade — apply the bar
    to EVERY unit, track gaps honestly.
+
+---
+## (bf) 2026-06-30 — TLS VERIFY-FULL (MITM gap CLOSED) — proven accept-valid + reject-bad live
+Second production security gap closed. nova_rt_tls_upgrade now takes a `verify` flag (3 platforms):
+  - Windows SChannel (the dev box): handshake stays MANUAL so it always completes, THEN verify=1 runs
+    nova_tls_verify_cert = QueryContextAttributes(REMOTE_CERT) + CertGetCertificateChain (server-auth EKU) +
+    CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, SSL_EXTRA_CERT_CHAIN_POLICY_PARA{AUTHTYPE_SERVER,
+    pwszServerName=host}) -> chain trust + HOSTNAME in one call; dwError!=0 -> reject (close+return 0).
+    Added #pragma comment(lib,"crypt32.lib").
+  - OpenSSL: verify=1 -> SSL_CTX_set_default_verify_paths + SSL_VERIFY_PEER + SSL_set1_host(host) +
+    SSL_set_tlsext_host_name(SNI) + check SSL_get_verify_result==X509_V_OK.
+  - stub: 3-arg signature.
+forge_pg: extern is 3-arg; pg_connect_tls(host,port,user,db,password, sslmode) maps "verify-full"/"verify-ca"
+-> verify=1, else 0 (require). forge_pg_tls_test passes PGSSLMODE env (default "require").
+PROVEN LIVE (forge_tls_upgrade_test, 3 checks): (1) verify=0 encrypted GET->HTTP/1.1 200; (2) verify-full
+ACCEPTS example.com (valid chain+hostname); (3) verify-full REJECTS self-signed.badssl.com (MITM-safe).
+Runtime change -> full nova_ci [pending; commit when green]. Uses the OS trust store (not the NOVA-native
+forge_x509 chain yet — acceptable for prod; a pure-NOVA validation path is a future option).
+=> BOTH PG security gaps (injection + MITM) now CLOSED + proven live. Driver is materially closer to
+   production-grade. Remaining gaps (non-security): pool codegen-bug pin (IR diff), typed/type-OID decoding,
+   statement timeouts, NULL params. Full encrypted PG round-trip awaits a ssl=on server.

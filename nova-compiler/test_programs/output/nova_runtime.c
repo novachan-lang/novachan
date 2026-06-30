@@ -38,6 +38,7 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "secur32.lib")
+#pragma comment(lib, "crypt32.lib")   /* Cert chain validation (tls verify-full): CertGetCertificateChain / CertVerifyCertificateChainPolicy */
 #else
 #include <pthread.h>
 #include <sched.h>
@@ -18699,15 +18700,50 @@ int64_t nova_rt_tls_recv_bytes(int64_t handle) {
     }
 }
 
+/* verify-full: after a MANUAL-validation handshake, validate the peer cert CHAIN (trusted root, not
+   expired/revoked, server-auth EKU) AND the HOSTNAME, using CertVerifyCertificateChainPolicy with
+   CERT_CHAIN_POLICY_SSL -- the same policy HTTPS uses. Returns 1 iff trusted AND host matches, else 0.
+   This is sslmode=verify-full (vs verify=0 = encrypt-only / sslmode=require). */
+static int nova_tls_verify_cert(NovaTlsConn* c, const char* host) {
+    PCCERT_CONTEXT cert = NULL;
+    if (QueryContextAttributesA(&c->ctxt, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &cert) != SEC_E_OK || !cert) return 0;
+    int ok = 0;
+    wchar_t whost[256]; whost[0] = 0;
+    if (host && host[0]) MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 256);
+    CERT_CHAIN_PARA chainPara; memset(&chainPara, 0, sizeof(chainPara)); chainPara.cbSize = sizeof(chainPara);
+    LPSTR usage[1]; usage[0] = (LPSTR)szOID_PKIX_KP_SERVER_AUTH;
+    chainPara.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+    chainPara.RequestedUsage.Usage.cUsageIdentifier = 1;
+    chainPara.RequestedUsage.Usage.rgpszUsageIdentifier = usage;
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    if (CertGetCertificateChain(NULL, cert, NULL, cert->hCertStore, &chainPara, 0, NULL, &chain) && chain) {
+        SSL_EXTRA_CERT_CHAIN_POLICY_PARA sslPara; memset(&sslPara, 0, sizeof(sslPara));
+        sslPara.cbSize = sizeof(sslPara);
+        sslPara.dwAuthType = AUTHTYPE_SERVER;
+        sslPara.pwszServerName = whost[0] ? whost : NULL;
+        CERT_CHAIN_POLICY_PARA policyPara; memset(&policyPara, 0, sizeof(policyPara));
+        policyPara.cbSize = sizeof(policyPara);
+        policyPara.pvExtraPolicyPara = &sslPara;
+        CERT_CHAIN_POLICY_STATUS policyStatus; memset(&policyStatus, 0, sizeof(policyStatus));
+        policyStatus.cbSize = sizeof(policyStatus);
+        if (CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain, &policyPara, &policyStatus))
+            ok = (policyStatus.dwError == 0) ? 1 : 0;
+        CertFreeCertificateChain(chain);
+    }
+    CertFreeCertificateContext(cert);
+    return ok;
+}
+
 /* nova_rt_tls_upgrade: wrap an ALREADY-CONNECTED socket fd in a TLS client session (the SSLRequest/STARTTLS
    pattern -- the caller did any plaintext pre-negotiation, e.g. PG's SSLRequest, and read the 'S' go-ahead).
-   The fd is forced BLOCKING (the SChannel handshake + record I/O are blocking, like tls_connect). Cert
-   validation is OFF (SCH_CRED_MANUAL_CRED_VALIDATION) -- encrypt without verifying the peer cert, i.e. PG
-   sslmode=require (what a self-signed dev server needs); sslmode=verify-full is a later option. Returns a
-   TLS handle (usable with tls_send_bytes/tls_recv_bytes/tls_close) or 0 on failure. */
-int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val) {
+   The fd is forced BLOCKING (the SChannel handshake + record I/O are blocking, like tls_connect).
+   `verify`: 0 = encrypt-only, NO cert check (PG sslmode=require -- a self-signed dev server needs this);
+   1 = VERIFY-FULL (validate the cert chain to a trusted root AND check the hostname -- rejects untrusted/
+   expired/wrong-host certs, MITM-safe). Returns a TLS handle or 0 on failure (incl. verification failure). */
+int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val, int64_t verify_val) {
     NOVA_SOCKET s = (NOVA_SOCKET)sock_val;
     const char* host = host_val ? (const char*)(uintptr_t)host_val : "";
+    int verify = (int)verify_val;
     u_long blk = 0; ioctlsocket(s, FIONBIO, &blk);   /* force blocking for the handshake + records */
     NovaTlsConn* c = (NovaTlsConn*)calloc(1, sizeof(NovaTlsConn));
     if (!c) return 0;
@@ -18715,12 +18751,21 @@ int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val) {
     strncpy(c->host, host, sizeof(c->host) - 1);
     SCHANNEL_CRED sc; memset(&sc, 0, sizeof(sc));
     sc.dwVersion = SCHANNEL_CRED_VERSION;
+    /* Always MANUAL at the SSPI layer so the handshake completes; then verify EXPLICITLY when asked, so
+       a verification failure is a clean rejection (return 0) rather than an opaque handshake error. */
     sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;
     TimeStamp ts;
     SECURITY_STATUS ss = AcquireCredentialsHandleA(NULL, (SEC_CHAR*)UNISP_NAME_A, SECPKG_CRED_OUTBOUND,
                                                    NULL, &sc, NULL, NULL, &c->cred, &ts);
     if (ss != SEC_E_OK) { free(c); return 0; }
     if (!nova_tls_handshake(c)) { FreeCredentialsHandle(&c->cred); free(c); return 0; }
+    if (verify && !nova_tls_verify_cert(c, host)) {
+        nova_set_error("tls_upgrade: certificate verification failed (verify-full)");
+        DeleteSecurityContext(&c->ctxt);
+        FreeCredentialsHandle(&c->cred);
+        free(c);
+        return 0;
+    }
     return (int64_t)(uintptr_t)c;
 }
 #else
@@ -18846,16 +18891,30 @@ int64_t nova_rt_tls_recv_bytes(int64_t handle) {
     ob->size = n;
     return out;
 }
-int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val) {
-    (void)host_val;
+int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val, int64_t verify_val) {
+    const char* host = host_val ? (const char*)(uintptr_t)host_val : "";
+    int verify = (int)verify_val;
     int fd = (int)sock_val;
     int fl = fcntl(fd, F_GETFL, 0); if (fl != -1) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);  /* blocking handshake */
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return 0;
+    if (verify) {
+        /* verify-full: load the system trust store, require a valid chain, AND check the hostname. */
+        SSL_CTX_set_default_verify_paths(ctx);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    }
     SSL* ssl = SSL_new(ctx);
     if (!ssl) { SSL_CTX_free(ctx); return 0; }
-    SSL_set_fd(ssl, fd);                 /* wrap the EXISTING connected fd (no cert verify -> sslmode=require) */
+    if (verify && host && host[0]) {
+        SSL_set1_host(ssl, host);                    /* hostname match (OpenSSL 1.1+) */
+        SSL_set_tlsext_host_name(ssl, host);         /* SNI */
+    }
+    SSL_set_fd(ssl, fd);                 /* wrap the EXISTING connected fd */
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); return 0; }
+    if (verify && SSL_get_verify_result(ssl) != X509_V_OK) {
+        nova_set_error("tls_upgrade: certificate verification failed (verify-full)");
+        SSL_free(ssl); SSL_CTX_free(ctx); return 0;
+    }
     NovaTls* C = (NovaTls*)calloc(1, sizeof(NovaTls));
     if (!C) { SSL_free(ssl); SSL_CTX_free(ctx); return 0; }
     C->fd = fd; C->ssl = ssl; C->ctx = ctx; C->own_ctx = 1;
@@ -18871,7 +18930,7 @@ int64_t nova_rt_tls_recv(int64_t a, int64_t b) { (void)a;(void)b; return nova_rt
 int64_t nova_rt_tls_close(int64_t a) { (void)a; return 0; }
 int64_t nova_rt_tls_send_bytes(int64_t a, int64_t b) { (void)a;(void)b; return 0; }
 int64_t nova_rt_tls_recv_bytes(int64_t a) { (void)a; return nova_rt_bytes_create(0); }
-int64_t nova_rt_tls_upgrade(int64_t a, int64_t b) { (void)a;(void)b; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
+int64_t nova_rt_tls_upgrade(int64_t a, int64_t b, int64_t v) { (void)a;(void)b;(void)v; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
 #endif
 #endif
 
