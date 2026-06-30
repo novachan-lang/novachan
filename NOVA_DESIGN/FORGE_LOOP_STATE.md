@@ -1323,3 +1323,15 @@ Gates: full nova_ci (reconverge gen5==gen6 + 601/0 both modes) for the compiler 
 lib-only adds. forge_orm_test runs the full suite live on both DBs. Memory [[project-forge-orm]].
 NEXT (ORM depth): migrations (schema-from-struct DDL — needs runtime field TYPES; investigate field_type),
 MySQL driver behind the same seam, NULL params, JOIN builder, paginate helper.
+
+---
+## (bk) 2026-06-30 — ORM migrations: schema-from-struct (JPA ddl-auto, zero annotations) [c2892f5]
+orm_create_table(db, table, sampleStruct) reflects field_names + field_types (runtime RTTI;
+field_types -> "int"/"string"/"float"/"bool") and emits CREATE TABLE IF NOT EXISTS with portable per-driver
+column types (int->INTEGER, string->TEXT, float->REAL|DOUBLE PRECISION, bool->INTEGER; `id`->PRIMARY KEY).
+The struct IS the schema. orm_drop_table too. No compiler change. Proven live both DBs. forge-lib gate
+(601/0 both modes). => forge_orm is now FEATURE-COMPLETE for v1: typed queries, CRUD, aggregates, fluent
+query builder, SQL-free repository (get/where), relations (has-many/belongs-to), migrations -- all
+zero-annotation, all live on SQLite + PostgreSQL. Beats JPA on simplicity; matches its core power without
+annotations/EntityManager/proxies. NEXT (needs owner input/resources): MySQL driver (needs a MySQL server to
+prove live), NULL params, JOIN builder, paginate. Memory [[project-forge-orm]].
