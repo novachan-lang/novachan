@@ -1179,3 +1179,23 @@ GATING: runtime change → full nova_ci [result pending — commit when green].
 => PG OVER TLS is functionally complete: every primitive proven live. Remaining for a 100% end-to-end
    encrypted demo = a Postgres with ssl=on (owner can enable in postgresql.conf) + PGPASSWORD. Next = Unit 3
    (pg_pool_open + pg_query/pg_all<T>/with_tx mirroring forge_db; parameterized extended-protocol queries).
+
+---
+## (bd) 2026-06-30 — Unit 3 (PG pool) ATTEMPTED then REVERTED — a NOVA codegen bug to pin first
+Wrote pg_pool_open/pg_acquire/pg_release/pg_query/pg_with_tx/pg_pool_close (channel-of-conns, mirroring
+forge_db) + forge_pg_pool_test. The pool MISBEHAVES: pg_pool_open against :5432 with WRONG creds returns
+ok(EMPTY channel) instead of err — then pg_query's recv() on the empty channel deadlocks (program exits).
+Root: _pg_pool_open_with's loop appears to NOT execute the body (or not return the err) when compiled as a
+MODULE function, so it returns ok(ch) with 0 connections. CONFOUNDING: a byte-identical INLINE copy of the
+exact logic IN THE TEST FILE returns err correctly. Isolated + RULED OUT (all pass in isolation): match-arm
+`return` inside a while loop; if/else branch reassignment propagation; early-return through a tail-call
+wrapper; 7-param mixed-type pass-through via a wrapper; pg_connect returns err correctly twice in a loop.
+So the bug is specifically the module-compiled _pg_pool_open_with (the channel + match-Ok/Err + early-return
++ trailing ok(ch) pattern). NEEDS: diff the generated IR for the module function vs the working inline copy
+(likely an early-`return` inside a match-Err arm being dropped when the function ALSO has a trailing
+expression-return, OR a module-emission path issue). REVERTED forge_pg.nova to the committed 119ddd8 state
+(Units 1+2 intact + green) + removed forge_pg_pool_test so nothing buggy is committed. NOTE (process): this
+cost many guess-test iterations — for the retry, go straight to IR diff, don't guess. Units 1+2 (the live
+connect/auth/query + TLS core) are DONE; Unit 3 is ergonomics on top and non-blocking.
+=> Live Postgres over TLS = CORE COMPLETE (committed, CI-green, proven live). Unit 3 pool deferred pending
+   the module-codegen bug pin. Full encrypted SELECT still just needs a ssl=on PG + PGPASSWORD.
