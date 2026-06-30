@@ -25,7 +25,7 @@ $core_tests = @(
     'string_iter_test','string_ops_test',
     'list_struct_test','list_struct_loop_test',
     'string_accum_test','string_accum_fn_test',
-    'codegen_pattern_test','match_expr_test',
+    'codegen_pattern_test','match_expr_test','match_any_module_test',
     'map_filter_test','bitwise_test',
     'yield_test','closure_ir_test',
     'error_test','tiny_test','match_str_test',
