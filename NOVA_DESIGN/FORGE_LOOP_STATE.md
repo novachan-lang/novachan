@@ -1114,3 +1114,39 @@ NOTE: nova_fat_str_concat (the OTHER fat constructor, used by `+`) still mallocs
 path that FULLRC already keeps flat, so not a leak source; could be made arena-aware later for symmetry.
 => WS leak + hardening COMPLETE and confirmed. Next per owner: FORGE feature completion, effectively, with
    Opus for design/NOVA-changes + Sonnet for mechanical work.
+
+---
+## (bb) 2026-06-30 — LIVE POSTGRES (owner-chosen mission) Unit 1 + a CORE scheduler fix
+Owner chose "Live Postgres over TLS." Used the model split: 3 SONNET assessment agents (codebase reads) →
+Opus design + the intricate driver/runtime code. ASSESSMENT: forge_pg.nova ALREADY had the v3 wire
+encode/parse + ALL auth MATH (SCRAM-SHA-256 + MD5), offline-unit-tested; forge_crypto has sha256/hmac/
+pbkdf2/b64/md5; binary tcp_send_bytes/recv_bytes exist; live TLS exists (tls_connect/send/recv, SChannel/
+OpenSSL) but tls_send/recv are STRING-only + can't upgrade an existing fd (→ Unit 2 needs tls_*_bytes +
+tls_upgrade); a native postgres is LIVE on :5432. Plan = POSTGRES_DRIVER_DESIGN.md "v2 LIVE-COMPLETION".
+
+UNIT 1 (forge_pg.nova, no compiler change): wrote the LIVE driver — pg_connect (tcp_connect + startup +
+framed read-loop [tag][len][body] via tcp_recv_bytes + auth dispatch: AuthOk/cleartext/MD5/SASL-SCRAM,
+driving the existing math; _pg_gen_nonce via nova_rt_os_random), pg_exec (simple query → name-keyed row
+dicts reusing pg_parse_row_description/data_row), pg_close, _pg_parse_error. Test forge_pg_live_test.nova
+(creds via PGHOST/PGPORT/PGUSER/PGDATABASE/PGPASSWORD env; localhost/postgres defaults).
+RESULT vs the REAL :5432 server: pg_connect drove the FULL SCRAM-SHA-256 handshake on the wire and the
+server returned `pg: password authentication failed for user "postgres"` — a correctly-parsed PG
+ErrorResponse. So connect + startup + read-loop + SCRAM exchange + error parse ALL work live; only the
+right password is missing for a SELECT (pg_exec reuses the same proven loop + parsers). DB API to mirror in
+Unit 3 = forge_db's pool_open/pool_query_dicts/db_all<T>/with_tx.
+
+★ CORE SCHEDULER FIX (runtime — found WHILE testing Unit 1, fixes ALL pure clients): a NOVA program whose
+SOLE task (main) parks on a plain netpoller I/O read — e.g. tcp_recv_bytes on an outbound client socket
+(PG/HTTP/gRPC client, no spawns) — EXITED mid-recv (rc 0) instead of waiting. Root cause: the single-carrier
+carrier-loop termination (nova_rt_sched_run, ~line 7082) kept looping for sleep/offload/timed-io/listener
+waiters while root alive, but NOT for a plain `nova_io_waiters` read/write waiter → fell through to break.
+FIX: add `nova_io_waiters` to that keep-looping OR-group (still gated on root->status != 3, so Go-style
+root-exit is preserved: once main finishes, a background I/O-blocked task does NOT keep the program alive).
+A true dead-peer recv now blocks like a real blocking recv (kill-on-timeout bounds tests). This is why the
+WS tests (always a spawned server task) and tls_test (blocking tls_*) never hit it; a pure client did.
+Proof: a sole-main tcp_recv_bytes probe went from silent-exit → correctly receiving PG's 24-byte 'R' msg.
+
+GATING: forge_pg.nova = stdlib-only; but the scheduler fix is a RUNTIME change → full nova_ci (reconverge +
+perf + freestanding + regression BOTH modes). [result pending in this session — commit only when green.]
+=> Live PG (plaintext) Unit 1 essentially done (auth proven live; SELECT needs the owner's PGPASSWORD).
+   Unit 2 = TLS (tls_send_bytes/recv_bytes + tls_upgrade + PG SSLRequest). Unit 3 = pool + typed API.

@@ -7078,10 +7078,18 @@ int64_t nova_rt_sched_run(void) {
                throttled ~1ms, so this is not a busy-spin. Once the root (main) has FINISHED
                we exit Go-style even if a background daemon still sleeps/offloads (a server
                test whose main returns while a periodic sleep-daemon lingers still terminates).
-               Pure I/O-blocked idle still breaks here, leaving that termination unchanged. */
-            if ((nova_sleep_waiters || nova_offload_waiters || nova_sched_has_timed_io() || nova_sched_has_listener()) &&
+               nova_io_waiters covers a task PARKED on a plain (untimed, non-listener) netpoller
+               read/write -- e.g. a pure CLIENT whose main does tcp_recv_bytes on an outbound
+               socket (a PG/HTTP/gRPC client) with NO other task alive. Without it the lone parked
+               root fell through to break and the program EXITED mid-recv instead of waiting on the
+               netpoller (the poll branch above re-arms select each loop and re-enqueues the task
+               when the fd is ready). Gated on root!=3 so the Go-style root-exit is unchanged: once
+               main FINISHES, a background task still blocked on I/O does NOT keep us alive. A true
+               dead-peer recv now blocks (matching real blocking-recv semantics) rather than
+               silently quitting; kill-on-timeout bounds a hung test. */
+            if ((nova_sleep_waiters || nova_offload_waiters || nova_io_waiters || nova_sched_has_timed_io() || nova_sched_has_listener()) &&
                 nova_sched_root_task && nova_sched_root_task->status != 3) continue;
-            break;   /* nothing runnable; no live-root timer/offload/timed-io/listener pending => done */
+            break;   /* nothing runnable; no live-root timer/offload/io/timed-io/listener pending => done */
         }
         if (t->status == 3) continue;
         if (g_watchdog_on) { g_carrier_pc[_wcid] = 2; g_carrier_spin[_wcid] = t; }
