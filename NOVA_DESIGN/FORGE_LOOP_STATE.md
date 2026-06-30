@@ -1279,3 +1279,27 @@ full nova_ci: reconverged gen5==gen6 byte-identical, 599/0 NORMAL + FULLRC. Guar
 => PG driver: connect/SCRAM/MD5, simple+parameterized(injection-safe) queries, TLS+verify-full(MITM-safe),
 pool+transactions -- ALL live-proven. Compiler is more correct (match-on-any fixed everywhere). NEXT = the
 ORM seam (typed pg_all<T> + type-OID decode), then timeouts/NULL params/ssl=on round-trip.
+
+---
+## (bi) 2026-06-30 — UNIVERSAL ORM v1 + struct CRUD, proven live on SQLite AND PostgreSQL [5d4e916, fe8d987]
+Owner asked for a powerful ORM compatible with EVERY db, simple queries, inbuilt functions, high perf.
+Built forge_orm.nova the NOVA way: NOT one typed API per DB, but ONE agnostic layer over a thin per-driver
+seam (connect + parameterized stmt + name-keyed string rows). The typed mapping + helpers are written ONCE.
+  - orm_open(sqlite://… | postgres://user:pw@host:port/db); orm_close.
+  - Typed (zero-annotation): `let xs: list<User> = orm_all(db, sql, params)` and `let u: Result<User> =
+    orm_one(db, sql, params)` — reuse the compiler-generated <T>__from_dict_list / <T>__from_dict; coercion
+    is driven by the STRUCT's field types (int/float/bool/string), so NO per-DB type-code decoding exists.
+  - orm_exec; inbuilt orm_count / orm_exists / orm_agg; struct-driven CRUD orm_insert/orm_update/orm_delete
+    (RTTI field_names/field_get, no SQL to write).
+  - Portable `?` placeholders auto-translate to $N for PG (skipping quoted literals); always bound
+    (injection-safe); every path pooled + parameterized (prepared) = high perf.
+COMPILER change: added orm_one/orm_all to the typed-let rewrite (mirrors db_find/db_all) — two IR sites; the
+inferer needed no change (orm_all `-> list`, orm_one `-> any` unify with list<T>/Result<T>; orm_one returns
+rows[0] to stay `any`, not a bare-dict `Dict`). Relies on the just-fixed match-on-any (orm_open result).
+PROVEN LIVE: the SAME run_suite ran against SQLite AND PG16 (PGPASSWORD=root) — typed list + params + typed
+one + count/exists/agg + struct CRUD. Gates: full nova_ci (reconverge gen5==gen6 + 601/0 both modes) for the
+compiler arms; regression -SkipReconverge for the CRUD lib add. Guard orm_typed_rewrite_test (no deps).
+KNOWN GAP: bool struct field -> PG int column (str(true)="true", type_of(bool)=="int" so undetectable to
+normalize) — CRUD test uses a bool-free struct; bool READ/coerce IS proven. Memory [[project-forge-orm]].
+NEXT (ORM depth): bool->1/0 bind normalization; fluent query builder (from<T>(db).where().order_by().all());
+relations/joins; migrations; MySQL driver behind the same seam. Then PG remainder (timeouts/NULL/ssl=on).
