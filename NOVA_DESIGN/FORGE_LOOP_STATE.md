@@ -1240,3 +1240,24 @@ forge_x509 chain yet — acceptable for prod; a pure-NOVA validation path is a f
 => BOTH PG security gaps (injection + MITM) now CLOSED + proven live. Driver is materially closer to
    production-grade. Remaining gaps (non-security): pool codegen-bug pin (IR diff), typed/type-OID decoding,
    statement timeouts, NULL params. Full encrypted PG round-trip awaits a ssl=on server.
+
+---
+## (bg) 2026-06-30 — PG connection POOL + transactions DONE + a real COMPILER bug root-caused
+Owner gave PG16 creds (postgres/root) and pushed production-grade. Completed the pool layer:
+pg_pool_open/pg_acquire/pg_release/pg_query/pg_query_params_pool/pg_with_tx/pg_pool_close (channel of
+authenticated conns, mirroring forge_db). PROVEN LIVE (forge_pg_pool_test, PGPASSWORD=root): 3-conn pool +
+pooled query + pooled PARAMETERIZED (injection-safe) query + BEGIN/COMMIT transaction all OK; WRONG creds
+correctly return a structured err.
+★ ROOT-CAUSED the earlier "pool returns ok(empty channel)" bug — it's a REAL NOVA COMPILER BUG, not my code:
+`match val { Ok(x)=>; Err(e)=> }` on an `any`-typed value (pg_connect is `-> any`) mis-resolves the
+constructor INSIDE A MODULE function — the Ok arm compiles to `icmp eq tag, 5862623` (a spurious
+constructor-hash) instead of `icmp eq tag, 0` (the real Result tag), so NEITHER arm fires. Proven by IR diff
+(works inline in a test file with tags 0/1; broken as a forge_pg module fn with 5862623). Ruled out every
+component inline (match-return-in-loop, if/else reassign, wrapper early-return, 7-param, err("") seed,
+direct let). WORKAROUND (shipped, production-grade): use is_ok(r)/unwrap(r) (runtime Result-tag accessors,
+unaffected) instead of match; on err return r directly. Full detail + the real-fix pointer in memory
+[[reference-match-any-module-codegen-bug]]. forge-lib-only change -> regression gate -SkipReconverge.
+=> PG driver now has: connect/SCRAM/MD5 auth, simple + parameterized (injection-safe) queries, TLS +
+verify-full (MITM-safe), AND a connection pool + transactions — all proven live against real PG16. The L2
+Data layer moved up materially. Remaining: the COMPILER match-on-any bug (real, fix next for bug-free),
+typed type-OID decoding, statement timeouts, NULL params, ssl=on encrypted round-trip.

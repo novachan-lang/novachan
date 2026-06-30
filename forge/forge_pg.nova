@@ -495,3 +495,67 @@ fn pg_query_params(conn, sql: string, params: list) -> any
     if had_err == 1
         return err("pg: " + errmsg)
     ok(rows)
+
+// ── connection POOL + transactions (parallel to forge_db pool_*/with_tx) ─────────────────────────────
+// A pool is a channel of authenticated connections; acquire = recv (parks until one frees), release = send.
+// Opens n plaintext connections; on ANY failure cleanly closes those already opened and returns the err.
+fn pg_pool_open(host: string, port: int, user: string, db: string, password: string, n: int) -> any
+    let ch = channel()
+    let opened = 0
+    let i = 0
+    while i < n
+        let r = pg_connect(host, port, user, db, password)
+        // is_ok/unwrap (runtime Result-tag checks) -- NOT `match Ok/Err`. A match on the any-typed
+        // pg_connect() result mis-resolves the constructor inside this module (tracked compiler bug); the
+        // runtime tag ops are unaffected. On failure, return r (already an Err Result) after closing opened.
+        if is_ok(r)
+            send(ch, unwrap(r))
+            opened = opened + 1
+        else
+            let j = 0
+            while j < opened
+                pg_close(recv(ch))
+                j = j + 1
+            return r
+        i = i + 1
+    ok(ch)
+
+fn pg_acquire(pool)
+    recv(pool)
+
+fn pg_release(pool, conn)
+    send(pool, conn)
+
+// Acquire -> query -> release. Returns ok(list of name-keyed row dicts) or err.
+fn pg_query(pool, sql: string) -> any
+    let conn = recv(pool)
+    let r = pg_exec(conn, sql)
+    send(pool, conn)
+    r
+
+// Parameterized (injection-safe) pooled query: acquire -> pg_query_params -> release.
+fn pg_query_params_pool(pool, sql: string, params: list) -> any
+    let conn = recv(pool)
+    let r = pg_query_params(conn, sql, params)
+    send(pool, conn)
+    r
+
+// Run body_fn(conn) in a transaction on ONE pooled connection: BEGIN, then COMMIT if body returns ok(..)
+// or ROLLBACK if it returns err(..). The connection is released either way. Returns the body's Result.
+fn pg_with_tx(pool, body_fn) -> any
+    let conn = recv(pool)
+    pg_exec(conn, "BEGIN")
+    let r = body_fn(conn)
+    if is_ok(r)
+        pg_exec(conn, "COMMIT")
+    else
+        pg_exec(conn, "ROLLBACK")
+    send(pool, conn)
+    r
+
+// Close all n pooled connections (drain + Terminate + close each).
+fn pg_pool_close(pool, n: int)
+    let i = 0
+    while i < n
+        pg_close(recv(pool))
+        i = i + 1
