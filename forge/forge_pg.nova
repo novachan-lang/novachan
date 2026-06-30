@@ -185,12 +185,16 @@ fn pg_md5_auth(user: string, password: string, salt) -> string
         i = i + 1
     "md5" + hex_of(md5_bytes(outer_in))
 
-// ── v2: LIVE driver (real socket over tcp_*; NO TLS yet -- plaintext; see POSTGRES_DRIVER_DESIGN.md) ──
-// The runtime OS CSPRNG (CryptGenRandom / urandom). Used for the SCRAM client nonce.
+// ── v2: LIVE driver (real socket; PLAINTEXT over tcp_* OR TLS via SChannel/OpenSSL) ──────────────────
+// A connection is [kind, handle]: kind 0 = plaintext (handle = tcp sock fd), 1 = TLS (handle = tls handle).
+// ALL wire I/O goes through _pg_send / _pg_recv_chunk, so the startup+auth+query logic is transport-agnostic.
 extern fn nova_rt_os_random(n: int) -> bytes
+extern fn nova_rt_tls_upgrade(sock: int, host: string) -> int
+extern fn nova_rt_tls_send_bytes(handle: int, b: bytes) -> int
+extern fn nova_rt_tls_recv_bytes(handle: int) -> bytes
+// (tls_close is already a compiler builtin -- used directly below, NOT re-declared as extern.)
 
-// A SCRAM client nonce: 18 CSPRNG bytes, base64'd. base64's alphabet (A-Za-z0-9+/=) excludes ',' (the SCRAM
-// field separator), so it is a valid nonce as-is.
+// A SCRAM client nonce: 18 CSPRNG bytes, base64'd (its alphabet excludes ',' so it is a valid nonce as-is).
 fn _pg_gen_nonce() -> string
     let rb = unsafe nova_rt_os_random(18)
     let bl = []
@@ -200,21 +204,37 @@ fn _pg_gen_nonce() -> string
         i = i + 1
     b64_encode_blist(bl)
 
-// Build a tagged frontend message: tag(1) + int32 length(payload+4, includes the length field, excludes the
-// tag) + payload. (StartupMessage is the one exception -- it has no tag -- and has its own builder above.)
+// Tagged frontend message: tag(1) + int32 len(payload+4) + payload.
 fn _pg_msg(tag: int, payload) -> any
     let m = bytes(0)
     m = bytes_append(m, tag)
     m = bytes_concat(m, pg_be32(bytes_len(payload) + 4))
     bytes_concat(m, payload)
 
-// Read exactly ONE backend message off the socket, accumulating across recvs. `buf` is the carry-over from a
-// prior read (the wire may deliver several messages per recv, or split one across recvs). Returns
-// [tag(int), full_message_bytes (tag+len+body, so the pg_parse_* parsers take off=0), leftover_bytes].
-// tag = -1 signals EOF / closed connection. Frame = [tag(1)][len(4) incl. itself][body(len-4)].
-fn _pg_recv_msg(sock: int, buf) -> any
+// Transport-agnostic send (conn = [kind, handle]).
+fn _pg_send(conn, data)
+    if conn[0] == 1
+        unsafe nova_rt_tls_send_bytes(conn[1], data)
+    else
+        tcp_send_bytes(conn[1], data)
+
+// Transport-agnostic recv of the next chunk; empty bytes on EOF.
+fn _pg_recv_chunk(conn) -> any
+    if conn[0] == 1
+        return unsafe nova_rt_tls_recv_bytes(conn[1])
+    tcp_recv_bytes(conn[1])
+
+fn _pg_close_transport(conn)
+    if conn[0] == 1
+        tls_close(conn[1])
+    else
+        tcp_close(conn[1])
+
+// Read exactly ONE backend message off the transport (accumulating across chunks). Returns
+// [tag(int), full_message_bytes (tag+len+body -> pg_parse_* take off=0), leftover_bytes]. tag -1 = EOF.
+fn _pg_recv_msg(conn, buf) -> any
     while bytes_len(buf) < 5
-        let chunk = tcp_recv_bytes(sock)
+        let chunk = _pg_recv_chunk(conn)
         if bytes_len(chunk) == 0
             let e = []
             push(e, 0 - 1)
@@ -223,10 +243,9 @@ fn _pg_recv_msg(sock: int, buf) -> any
             return e
         buf = bytes_concat(buf, chunk)
     let tag = bytes_get(buf, 0)
-    let msglen = pg_rd_be32(buf, 1)
-    let total = 1 + msglen
+    let total = 1 + pg_rd_be32(buf, 1)
     while bytes_len(buf) < total
-        let chunk = tcp_recv_bytes(sock)
+        let chunk = _pg_recv_chunk(conn)
         if bytes_len(chunk) == 0
             let e = []
             push(e, 0 - 1)
@@ -234,16 +253,13 @@ fn _pg_recv_msg(sock: int, buf) -> any
             push(e, buf)
             return e
         buf = bytes_concat(buf, chunk)
-    let msg = bytes_slice(buf, 0, total)
-    let leftover = bytes_slice(buf, total, bytes_len(buf))
     let r = []
     push(r, tag)
-    push(r, msg)
-    push(r, leftover)
+    push(r, bytes_slice(buf, 0, total))
+    push(r, bytes_slice(buf, total, bytes_len(buf)))
     r
 
-// Parse an ErrorResponse ('E') / NoticeResponse ('N') message -> the primary human message (field 'M').
-// Layout after tag+len: a series of [field-type(1)][value cstr], terminated by a 0 byte.
+// Parse an ErrorResponse ('E') / NoticeResponse ('N') -> the primary human message (field 'M').
 fn _pg_parse_error(msg) -> string
     let p = 5
     let out = "unknown error"
@@ -255,75 +271,104 @@ fn _pg_parse_error(msg) -> string
             out = r[0]
     out
 
-// Connect + authenticate against a live PG server. Returns ok(sock) ready for queries, or err(msg). Drives
-// the v3 startup + the full auth handshake (AuthenticationOk / cleartext / MD5 / SASL SCRAM-SHA-256) reusing
-// the pure-NOVA auth math above. The SASL exchange spans three 'R' messages (10 SASL, 11 Continue, 12 Final)
-// -- cnonce + the expected server signature are carried in locals across the read loop.
-fn pg_connect(host: string, port: int, user: string, db: string, password: string) -> any
-    let sock = tcp_connect(host, port)
-    if sock < 0
-        return err("pg: cannot connect to " + host + ":" + str(port))
-    tcp_send_bytes(sock, pg_startup_message(user, db))
+// Shared startup + auth handshake over an established transport. Returns ok(conn) ready for queries, or err.
+fn _pg_handshake(conn, user: string, db: string, password: string) -> any
+    _pg_send(conn, pg_startup_message(user, db))
     let buf = bytes(0)
     let cnonce = ""
     let expected_sig = ""
     let done = 0
     while done == 0
-        let m = _pg_recv_msg(sock, buf)
+        let m = _pg_recv_msg(conn, buf)
         let tag = m[0]
         let msg = m[1]
         buf = m[2]
         if tag == 0 - 1
-            tcp_close(sock)
+            _pg_close_transport(conn)
             return err("pg: connection closed during startup/auth")
         else if tag == 82
             let code = pg_rd_be32(msg, 5)
             if code == 0
                 done = 0
             else if code == 3
-                tcp_send_bytes(sock, _pg_msg(112, _cstr(password)))
+                _pg_send(conn, _pg_msg(112, _cstr(password)))
             else if code == 5
                 let salt = []
                 let si = 0
                 while si < 4
                     push(salt, bytes_get(msg, 9 + si))
                     si = si + 1
-                tcp_send_bytes(sock, _pg_msg(112, _cstr(pg_md5_auth(user, password, salt))))
+                _pg_send(conn, _pg_msg(112, _cstr(pg_md5_auth(user, password, salt))))
             else if code == 10
                 cnonce = _pg_gen_nonce()
                 let cfb = str_to_bytes(pg_scram_client_first(user, cnonce))
                 let payload = _cstr("SCRAM-SHA-256")
                 payload = bytes_concat(payload, pg_be32(bytes_len(cfb)))
                 payload = bytes_concat(payload, cfb)
-                tcp_send_bytes(sock, _pg_msg(112, payload))
+                _pg_send(conn, _pg_msg(112, payload))
             else if code == 11
                 let sf = bytes_to_str(bytes_slice(msg, 9, bytes_len(msg)))
                 let fin = pg_scram_finish(user, password, cnonce, sf)
                 if len(fin) == 0
-                    tcp_close(sock)
+                    _pg_close_transport(conn)
                     return err("pg: SCRAM server-first rejected (nonce/iteration check)")
                 expected_sig = fin[1]
-                tcp_send_bytes(sock, _pg_msg(112, str_to_bytes(fin[0])))
+                _pg_send(conn, _pg_msg(112, str_to_bytes(fin[0])))
             else if code == 12
                 let svf = bytes_to_str(bytes_slice(msg, 9, bytes_len(msg)))
                 if svf != "v=" + expected_sig
-                    tcp_close(sock)
+                    _pg_close_transport(conn)
                     return err("pg: SCRAM server signature mismatch (possible MITM)")
             else
-                tcp_close(sock)
+                _pg_close_transport(conn)
                 return err("pg: unsupported auth code " + str(code))
         else if tag == 69
             let e = _pg_parse_error(msg)
-            tcp_close(sock)
+            _pg_close_transport(conn)
             return err("pg: " + e)
         else if tag == 90
             done = 1
-    ok(sock)
+    ok(conn)
 
-// Run a simple-protocol query on a connected socket. Returns ok(list of name-keyed row dicts) -- string
-// values, "" for SQL NULL -- or err(msg) on an ErrorResponse. Reads until ReadyForQuery ('Z').
-fn pg_exec(sock: int, sql: string) -> any
-    tcp_send_bytes(sock, pg_query_message(sql))
+// Plaintext connect -> ok([0, sock]) ready for queries, or err.
+fn pg_connect(host: string, port: int, user: string, db: string, password: string) -> any
+    let sock = tcp_connect(host, port)
+    if sock < 0
+        return err("pg: cannot connect to " + host + ":" + str(port))
+    let conn = []
+    push(conn, 0)
+    push(conn, sock)
+    _pg_handshake(conn, user, db, password)
+
+// TLS connect: PG SSLRequest ([int32 8][int32 80877103]); on 'S' upgrade the socket to TLS and run the SAME
+// startup+auth over the encrypted transport (sslmode=require: encrypt, no cert verify -- works with a
+// self-signed dev server). On 'N' the server declined TLS -> fail closed.
+fn pg_connect_tls(host: string, port: int, user: string, db: string, password: string) -> any
+    let sock = tcp_connect(host, port)
+    if sock < 0
+        return err("pg: cannot connect to " + host + ":" + str(port))
+    let req = pg_be32(8)
+    req = bytes_concat(req, pg_be32(80877103))
+    tcp_send_bytes(sock, req)
+    let reply = tcp_recv_bytes(sock)
+    if bytes_len(reply) < 1
+        tcp_close(sock)
+        return err("pg: no reply to SSLRequest")
+    if bytes_get(reply, 0) != 83
+        tcp_close(sock)
+        return err("pg: server declined TLS (SSLRequest reply was not 'S')")
+    let tls = unsafe nova_rt_tls_upgrade(sock, host)
+    if tls == 0
+        tcp_close(sock)
+        return err("pg: TLS handshake failed")
+    let conn = []
+    push(conn, 1)
+    push(conn, tls)
+    _pg_handshake(conn, user, db, password)
+
+// Run a simple-protocol query -> ok(list of name-keyed row dicts; "" for SQL NULL) or err.
+fn pg_exec(conn, sql: string) -> any
+    _pg_send(conn, pg_query_message(sql))
     let buf = bytes(0)
     let names = []
     let rows = []
@@ -331,7 +376,7 @@ fn pg_exec(sock: int, sql: string) -> any
     let errmsg = ""
     let had_err = 0
     while done == 0
-        let m = _pg_recv_msg(sock, buf)
+        let m = _pg_recv_msg(conn, buf)
         let tag = m[0]
         let msg = m[1]
         buf = m[2]
@@ -357,7 +402,7 @@ fn pg_exec(sock: int, sql: string) -> any
         return err("pg: " + errmsg)
     ok(rows)
 
-// Close a connection cleanly: send Terminate ('X') then close the socket.
-fn pg_close(sock: int)
-    tcp_send_bytes(sock, _pg_msg(88, bytes(0)))
-    tcp_close(sock)
+// Close cleanly: Terminate ('X') then close the transport.
+fn pg_close(conn)
+    _pg_send(conn, _pg_msg(88, bytes(0)))
+    _pg_close_transport(conn)

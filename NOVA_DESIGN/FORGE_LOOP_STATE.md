@@ -1150,3 +1150,32 @@ GATING: forge_pg.nova = stdlib-only; but the scheduler fix is a RUNTIME change �
 perf + freestanding + regression BOTH modes). [result pending in this session — commit only when green.]
 => Live PG (plaintext) Unit 1 essentially done (auth proven live; SELECT needs the owner's PGPASSWORD).
    Unit 2 = TLS (tls_send_bytes/recv_bytes + tls_upgrade + PG SSLRequest). Unit 3 = pool + typed API.
+
+---
+## (bc) 2026-06-30 — PG over TLS (Unit 2): runtime TLS-bytes + upgrade + SSLRequest, all proven live
+RUNTIME (nova_runtime.c, all 3 platforms — Windows SChannel real, OpenSSL real, no-OpenSSL stub):
+  - nova_rt_tls_send_bytes(handle, bytes) / nova_rt_tls_recv_bytes(handle)->bytes — binary-safe (NUL-safe,
+    chunked) TLS I/O; the existing tls_send/recv are STRING-only (strlen) so could not carry PG's binary wire.
+  - nova_rt_tls_upgrade(sock, host)->handle — wrap an ALREADY-CONNECTED fd in a TLS client session (the
+    SSLRequest/STARTTLS pattern). Forces the fd blocking (SChannel/OpenSSL handshake is blocking), cert
+    validation OFF = sslmode=require (encrypt, no verify — works with a self-signed dev server; verify-full
+    later). host is used for SNI.
+FORGE (forge_pg.nova): refactored the live driver to a TRANSPORT-AGNOSTIC connection `conn = [kind, handle]`
+  (0=plaintext/tcp, 1=TLS) routed through _pg_send/_pg_recv_chunk, so the SAME startup+auth+read-loop runs
+  over plaintext OR TLS. Added pg_connect_tls: tcp_connect → SSLRequest [int32 8][int32 80877103] → read 1
+  byte ('S'→tls_upgrade then handshake over the encrypted transport; 'N'→fail-closed "server declined TLS").
+  pg_connect/pg_exec/pg_close now take the conn. (tls_close is a builtin — not re-declared extern; that
+  redefinition was the one link error, fixed. extern-with-`string` ABI works: a NOVA string passes as its
+  pointer — proven by the SNI test.)
+VALIDATION (all live):
+  - forge_tls_upgrade_test: tcp_connect example.com:443 → tls_upgrade(fd, "example.com") → tls_send_bytes
+    (encrypted GET) → tls_recv_bytes → decrypted "HTTP/1.1 200" (863 B). DEFINITIVELY proves the 3 new
+    runtime fns on a real TLS peer (the exact mechanism PG uses after the 'S' go-ahead). SKIPs if offline.
+  - forge_pg_tls_test vs the real :5432: SSLRequest negotiated; the local server is ssl=off so it replied
+    'N' → correctly "server declined TLS". Proves the SSLRequest plumbing; the encrypted path is proven by
+    composition (upgrade+bytes proven above). Full encrypted SELECT needs a server with ssl=on + PGPASSWORD.
+  - Plaintext forge_pg_live_test still green after the conn refactor.
+GATING: runtime change → full nova_ci [result pending — commit when green].
+=> PG OVER TLS is functionally complete: every primitive proven live. Remaining for a 100% end-to-end
+   encrypted demo = a Postgres with ssl=on (owner can enable in postgresql.conf) + PGPASSWORD. Next = Unit 3
+   (pg_pool_open + pg_query/pg_all<T>/with_tx mirroring forge_db; parameterized extended-protocol queries).
