@@ -1392,3 +1392,22 @@ REMAINING of the owner's list:
   (sqlitex extern); MySQL prepared null-bitmap bit. Touches forge_pg + sqlitex + forge_mysql + forge_orm.
 - typedList[i].field cross-struct field-slot compiler bug [[reference-typedlist-field-slot-collision]] --
   needs compiler instrumentation to pin ir_list_elem_stype population; subtle, focused arc.
+
+---
+## (bo) 2026-07-01 — caching_sha2 (MySQL 8.x) fast-path + ORM NULL params [2b80dc6]
+Stood up a Docker MySQL **8.4.10** (caching_sha2_password default) on :3307 to unblock testing.
+- caching_sha2 FAST-PATH: mysql_connect parses auth_plugin_name -> caching_sha2 = SHA256(pw) XOR
+  SHA256(SHA256(SHA256(pw)) ++ scramble); handles AuthMoreData 0x03 (fast success) / 0x04 (cold-cache full
+  auth -> clear err). PROVEN LIVE on 8.4 (full driver + entire universal ORM suite) after priming root@'%'
+  via the official client. => forge_orm runs identically on SQLite + PostgreSQL + MySQL 5.7(native) +
+  MySQL 8.4(caching_sha2). GAP: 0x04 cold-cache full auth (MySQL-SSL via nova_rt_tls_upgrade, or RSA-OAEP).
+- NULL params (forge_orm, ONE file): orm_null() sentinel; _orm_apply_nulls rewrites each `?` bound to
+  orm_null() into literal SQL NULL (keyword, injection-safe) + drops it pre-dispatch -> uniform across all
+  drivers, no per-driver bind change. Guard _orm_null_test.
+Gated -SkipReconverge 603/0 both modes. Memory [[project-forge-mysql]] [[project-forge-orm]].
+INFRA: Docker container `nova-mysql8` (mysql:8.4, :3307, root/root, db nova_test) left RUNNING for the
+caching_sha2 0x04 / future MySQL-8 work; `docker rm -f nova-mysql8` to remove.
+REMAINING of the owner's list: the typedList[i].field cross-struct field-slot COMPILER bug
+[[reference-typedlist-field-slot-collision]] -- a real soundness bug, tracked with a repro, but it needs
+compiler INSTRUMENTATION to pin where ir_list_elem_stype drops out (order/context-dependent; reading alone
+didn't pin it). A focused compiler arc + reconverge -- do it with fresh context, not at a session tail.
