@@ -1303,3 +1303,23 @@ KNOWN GAP: bool struct field -> PG int column (str(true)="true", type_of(bool)==
 normalize) — CRUD test uses a bool-free struct; bool READ/coerce IS proven. Memory [[project-forge-orm]].
 NEXT (ORM depth): bool->1/0 bind normalization; fluent query builder (from<T>(db).where().order_by().all());
 relations/joins; migrations; MySQL driver behind the same seam. Then PG remainder (timeouts/NULL/ssl=on).
+
+---
+## (bj) 2026-06-30 — ORM DEPTH: query builder + repository + relations [9220933, cc9885f]
+Continued forge_orm into a genuinely powerful ORM, all zero-annotation, all proven live on SQLite AND PG16:
+  - FLUENT QUERY BUILDER (NOVA's JPA-Criteria, no annotations): q_from(t).select().where(cond,ps).order_by()
+    .limit().offset() -> OrmQuery (struct + chained methods; params copied per step to avoid aliasing).
+    Run typed: `let xs: list<User> = orm_all(db, q.sql(), q.params)`, or untyped `q.run(db)`. `where` works as
+    a method name despite being a contextual keyword (verified). No compiler change (typing via orm_all).
+  - SQL-FREE TYPED REPOSITORY + RELATIONS: orm_get(db,table,id) (find-by-id) + orm_where(db,table,cond,params)
+    (find-by-condition), both typed via the rewrite. Relations need NO annotations/API: has-many = orm_where
+    on the child FK; belongs-to = orm_get the parent. COMPILER: added orm_get/orm_where to the typed-let
+    rewrite (now SIX row sources: db_all/db_find/orm_all/orm_one/orm_where/orm_get).
+  - Also CLOSED the "bool-write" false alarm: field_get(bool field) returns raw 0/1 (str=="1", not "true";
+    only a bool LITERAL gives "true"), so bool fields bind cleanly even to a PG int column. Proven.
+vs JPA: already SIMPLER (zero annotations, no EntityManager/session/persistence.xml, transparent SQL); now
+covers the core power (typed entities, CRUD, query builder, find/where, relations) WITHOUT JPA's complexity.
+Gates: full nova_ci (reconverge gen5==gen6 + 601/0 both modes) for the compiler arms; -SkipReconverge for
+lib-only adds. forge_orm_test runs the full suite live on both DBs. Memory [[project-forge-orm]].
+NEXT (ORM depth): migrations (schema-from-struct DDL — needs runtime field TYPES; investigate field_type),
+MySQL driver behind the same seam, NULL params, JOIN builder, paginate helper.
