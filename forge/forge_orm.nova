@@ -1,0 +1,190 @@
+// forge_orm -- ONE universal, DB-agnostic ORM over every NOVA driver (SQLite via forge_db, PostgreSQL via
+// forge_pg; more drivers slot in behind the same seam). The design is deliberately NOT one typed API per
+// database. Instead there is a single agnostic layer and a thin per-driver seam:
+//
+//   * PER-DRIVER (the only thing a new database adds): connect, run a parameterized statement, and return
+//     rows as name-keyed STRING dicts. That is it.
+//   * AGNOSTIC, written ONCE (works for every driver): the typed struct mapping, query helpers, counting,
+//     transactions. orm_all<T>/orm_one<T> reuse the compiler-generated <T>__from_dict_list / <T>__from_dict
+//     (NAME-keyed, zero-annotation). Coercion is driven by the STRUCT's field types (int/float/bool/string),
+//     NOT by per-database type codes -- so no per-DB decoding logic is ever needed.
+//
+// Simple to write:   let users: list<User> = orm_all(db, "SELECT * FROM users WHERE age > ?", [18])
+//                     let u: Result<User>   = orm_one(db, "SELECT * FROM users WHERE id = ?", [id])
+//                     orm_exec(db, "INSERT INTO users (name, age) VALUES (?, ?)", [name, age])
+// Portable placeholders: write `?` everywhere; orm rewrites to `$1,$2,...` for PostgreSQL automatically.
+// Injection-safe: values are always bound as parameters, never concatenated into SQL.
+// High performance: every driver path is pooled + parameterized (prepared) -- no per-call connect, no
+// string-built values.
+import forge_db
+import forge_pg
+
+// ---- internal helpers -------------------------------------------------------------------------------
+
+// First index of `sub` in `s`, or -1. (Self-contained; no dependency on a stdlib index_of.)
+fn _orm_find(s: string, sub: string) -> int
+    let sl = len(s)
+    let bl = len(sub)
+    if bl == 0
+        return 0
+    let i = 0
+    while i + bl <= sl
+        if s[i:i + bl] == sub
+            return i
+        i = i + 1
+    -1
+
+// Translate portable `?` placeholders to PostgreSQL `$1,$2,...`. Skips `?` inside single-quoted string
+// literals (a `?` in 'a?b' is data, not a placeholder; '' escaped-quotes stay balanced through the toggle).
+fn _orm_pg_sql(sql: string) -> string
+    let out = ""
+    let n = 0
+    let i = 0
+    let inq = 0
+    while i < len(sql)
+        let ch = sql[i:i + 1]
+        if ch == "'"
+            if inq == 0
+                inq = 1
+            else
+                inq = 0
+            out = out + ch
+        else if ch == "?" and inq == 0
+            n = n + 1
+            out = out + "$" + str(n)
+        else
+            out = out + ch
+        i = i + 1
+    out
+
+// PostgreSQL binds parameters in text format -> stringify every value uniformly.
+fn _orm_pg_params(params) -> list
+    let out = []
+    let i = 0
+    while i < len(params)
+        push(out, str(params[i]))
+        i = i + 1
+    out
+
+// ---- connection -------------------------------------------------------------------------------------
+
+// Open a database from a URL. Returns ok(db) where db = ["orm", kind, pool].
+//   sqlite://<path>                               (e.g. sqlite://app.db)
+//   postgres://user:password@host:port/dbname     (postgresql:// also accepted; ?query is ignored)
+fn orm_open(url: string) -> any
+    if starts_with(url, "sqlite://")
+        let path = url[9:len(url)]
+        let pool = forge_db.pool_open(path, 4)
+        return ok(["orm", "sqlite", pool])
+    if starts_with(url, "postgresql://") or starts_with(url, "postgres://")
+        let rest = url[11:len(url)]
+        if starts_with(url, "postgresql://")
+            rest = url[13:len(url)]
+        let at = _orm_find(rest, "@")
+        if at < 0
+            return err("orm: postgres url must be postgres://user:password@host:port/dbname")
+        let creds = rest[0:at]
+        let loc = rest[at + 1:len(rest)]
+        let user = creds
+        let password = ""
+        let ci = _orm_find(creds, ":")
+        if ci >= 0
+            user = creds[0:ci]
+            password = creds[ci + 1:len(creds)]
+        let hostport = loc
+        let dbname = "postgres"
+        let slash = _orm_find(loc, "/")
+        if slash >= 0
+            hostport = loc[0:slash]
+            dbname = loc[slash + 1:len(loc)]
+        let q = _orm_find(dbname, "?")
+        if q >= 0
+            dbname = dbname[0:q]
+        let host = hostport
+        let port = 5432
+        let pi = _orm_find(hostport, ":")
+        if pi >= 0
+            host = hostport[0:pi]
+            port = parse_int(hostport[pi + 1:len(hostport)])
+        let r = forge_pg.pg_pool_open(host, port, user, dbname, password, 4)
+        if is_ok(r)
+            return ok(["orm", "postgres", unwrap(r)])
+        return r
+    err("orm: unsupported url scheme (use sqlite:// or postgres://)")
+
+fn orm_close(db)
+    let kind = db[1]
+    let h = db[2]
+    if kind == "sqlite"
+        forge_db.pool_close(h, 4)
+    if kind == "postgres"
+        forge_pg.pg_pool_close(h, 4)
+
+// ---- queries (agnostic) -----------------------------------------------------------------------------
+
+// SELECT -> list of name-keyed string row dicts. The name `orm_all` is recognized by the typed-let
+// rewrite, so `let xs: list<T> = orm_all(db, sql, params)` yields a list<T> of real structs.
+fn orm_all(db, sql: string, params) -> list
+    let kind = db[1]
+    let h = db[2]
+    if kind == "sqlite"
+        let c = recv(h)
+        let rows = db_query_named(c, sql, params)
+        send(h, c)
+        return rows
+    if kind == "postgres"
+        let r = forge_pg.pg_query_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))
+        if is_ok(r)
+            return unwrap(r)
+        return []
+    []
+
+// SELECT one -> a single name-keyed dict ({} if no row). `let r: Result<T> = orm_one(...)` -> Result<T>.
+fn orm_one(db, sql: string, params) -> any
+    let rows = orm_all(db, sql, params)
+    if len(rows) > 0
+        return rows[0]
+    {}
+
+// INSERT / UPDATE / DELETE / DDL. Returns ok(affected_rows) or err(message).
+fn orm_exec(db, sql: string, params) -> any
+    let kind = db[1]
+    let h = db[2]
+    if kind == "sqlite"
+        let c = recv(h)
+        db_query(c, sql, params)
+        let n = db_affected(c)
+        send(h, c)
+        return ok(n)
+    if kind == "postgres"
+        let r = forge_pg.pg_query_params_pool(h, _orm_pg_sql(sql), _orm_pg_params(params))
+        if is_ok(r)
+            return ok(0)
+        return r
+    err("orm: unknown db kind")
+
+// ---- inbuilt query functions ------------------------------------------------------------------------
+
+// COUNT rows, optional WHERE (pass "" for none). orm_count(db, "users", "age > ?", [18]).
+fn orm_count(db, table: string, where: string, params) -> int
+    let sql = "SELECT count(*) AS n FROM " + table
+    if len(where) > 0
+        sql = sql + " WHERE " + where
+    let rows = orm_all(db, sql, params)
+    if len(rows) > 0
+        return parse_int(rows[0]["n"])
+    0
+
+// EXISTS: does any row match the WHERE?
+fn orm_exists(db, table: string, where: string, params) -> bool
+    orm_count(db, table, where, params) > 0
+
+// MIN/MAX/SUM/AVG aggregate over a column (returns the text value, "" if no rows). The caller coerces.
+fn orm_agg(db, fn_name: string, col: string, table: string, where: string, params) -> string
+    let sql = "SELECT " + fn_name + "(" + col + ") AS a FROM " + table
+    if len(where) > 0
+        sql = sql + " WHERE " + where
+    let rows = orm_all(db, sql, params)
+    if len(rows) > 0
+        return str(rows[0]["a"])
+    ""
