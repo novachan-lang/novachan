@@ -1372,3 +1372,23 @@ NEXT (clearly scoped, focused arcs): (1) forge_orm mysql:// integration with SOU
 statements (COM_STMT_PREPARE/EXECUTE, binary protocol) -- text COM_QUERY inlining is injection-risky/numeric-
 unsafe, so do prepared statements. (2) caching_sha2_password for MySQL 8.0 (SHA256 fast-path + TLS/RSA full
 auth). (3) NULL params (PG length -1 + SQLite bind_null). (4) the typedList[i].field compiler fix.
+
+---
+## (bn) 2026-07-01 — ONE ORM, EVERY DB: MySQL prepared statements + forge_orm integration [3788069]
+forge_mysql.mysql_query_params: COM_STMT_PREPARE + COM_STMT_EXECUTE + binary result parsing (null bitmap +2
+row offset; ints->decimal string, string/decimal/blob->lenenc; float/double/date advanced-not-decoded v1 gap).
+Params bound as MYSQL_TYPE_VAR_STRING -> server coerces -> INJECTION-SAFE + numeric-correct (no escaping).
+forge_orm: orm_open mysql://user:pw@host:port/db; orm_all/orm_exec dispatch mysql -> mysql_query (no-param DDL)
+/ mysql_query_params (parameterized, prepared). MySQL `?` is native -> no $N translation.
+=> THE FULL universal-ORM suite (typed queries, CRUD, count/exists/agg, query builder, repository, relations,
+migrations, JOINs, pagination) runs IDENTICALLY on SQLite + PostgreSQL + MySQL. forge_orm_test prints all
+three "[x] universal ORM OK ...". Proven live (MySQL 5.7.36, root/root). Gated -SkipReconverge 602/0 both
+modes. Memory [[project-forge-mysql]] [[project-forge-orm]].
+REMAINING of the owner's list:
+- caching_sha2_password (MySQL 8.0 default): BLOCKED on this machine -- the live server is 5.7 (native_password),
+  which can't host a caching_sha2 account, so the auth flow (SHA256 fast-path + 0x03/0x04 + TLS/RSA full auth)
+  can't be tested live here. Needs a MySQL 8.0 server. The SHA256 math (forge_crypto.sha256) is ready.
+- NULL params: cross-driver -- a sentinel orm_null(); PG _pg_bind_msg length -1; SQLite sqlite3_bind_null
+  (sqlitex extern); MySQL prepared null-bitmap bit. Touches forge_pg + sqlitex + forge_mysql + forge_orm.
+- typedList[i].field cross-struct field-slot compiler bug [[reference-typedlist-field-slot-collision]] --
+  needs compiler instrumentation to pin ir_list_elem_stype population; subtle, focused arc.
