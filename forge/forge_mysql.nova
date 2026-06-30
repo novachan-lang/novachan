@@ -59,6 +59,26 @@ fn _my_lenenc_str(b, off: int) -> any
     let start = li[1]
     [bytes_to_str(bytes_slice(b, start, start + n)), start + n]
 
+// length-encoded INTEGER writer (for COM_STMT_EXECUTE param values/lengths).
+fn _my_wr_lenenc(n: int) -> any
+    let b = bytes(0)
+    if n < 251
+        return bytes_append(b, n)
+    if n < 65536
+        b = bytes_append(b, 252)
+        b = bytes_append(b, n & 255)
+        b = bytes_append(b, (n >> 8) & 255)
+        return b
+    b = bytes_append(b, 253)
+    b = bytes_append(b, n & 255)
+    b = bytes_append(b, (n >> 8) & 255)
+    b = bytes_append(b, (n >> 16) & 255)
+    b
+
+// length-encoded STRING writer (lenenc length + raw bytes).
+fn _my_wr_lenstr(sb) -> any
+    bytes_concat(_my_wr_lenenc(bytes_len(sb)), sb)
+
 // ---- packet IO --------------------------------------------------------------------------------------
 fn _my_recv_at_least(sock: int, buf, need: int) -> any
     while bytes_len(buf) < need
@@ -257,6 +277,153 @@ fn mysql_query(conn, sql: string) -> any
                         let sv = _my_lenenc_str(row, o)
                         d[colnames[k]] = sv[0]
                         o = sv[1]
+                    k = k + 1
+                push(rows, d)
+    ok(rows)
+
+// ---- prepared statements (binary protocol) ----------------------------------------------------------
+// Decode ONE binary-protocol value at `off` for column type `t` -> [string, next_off]. Integers ->
+// decimal string; string/decimal/blob/json -> lenenc string; float/double + date/time are advanced
+// correctly but not yet decoded (return "" -- v1 gap). _my_u is unsigned (fine for ids/counts).
+fn _my_bin_val(b, off: int, t: int) -> any
+    if t == 1
+        return [str(_my_u(b, off, 1)), off + 1]
+    if t == 2 or t == 13
+        return [str(_my_u(b, off, 2)), off + 2]
+    if t == 3 or t == 9
+        return [str(_my_u(b, off, 4)), off + 4]
+    if t == 8
+        return [str(_my_u(b, off, 8)), off + 8]
+    if t == 4
+        return ["", off + 4]
+    if t == 5
+        return ["", off + 8]
+    let sres = _my_lenenc_str(b, off)
+    [sres[0], sres[1]]
+
+// Read num_def column-definition packets -> [names, types, leftover_buf], then consume the trailing EOF.
+fn _my_read_coldefs(sock: int, buf, n: int) -> any
+    let names = []
+    let types = []
+    let ci = 0
+    while ci < n
+        let cp = _my_read_packet(sock, buf)
+        buf = cp[2]
+        let cdef = cp[1]
+        let o = 0
+        let st = _my_lenenc_str(cdef, o)
+        o = st[1]
+        st = _my_lenenc_str(cdef, o)
+        o = st[1]
+        st = _my_lenenc_str(cdef, o)
+        o = st[1]
+        st = _my_lenenc_str(cdef, o)
+        o = st[1]
+        st = _my_lenenc_str(cdef, o)
+        let cname = st[0]
+        o = st[1]
+        st = _my_lenenc_str(cdef, o)
+        o = st[1]
+        push(names, cname)
+        push(types, bytes_get(cdef, o + 1 + 2 + 4))
+        ci = ci + 1
+    if n > 0
+        let e = _my_read_packet(sock, buf)
+        buf = e[2]
+    [names, types, buf]
+
+// Parameterized query via a PREPARED STATEMENT (COM_STMT_PREPARE + COM_STMT_EXECUTE, binary protocol).
+// Every param is bound as MYSQL_TYPE_VAR_STRING and the server coerces it to the column type -> NO string
+// inlining/escaping, injection-safe, and numeric-correct. Returns ok(name-keyed string row dicts) /
+// ok([]) for a no-result-set statement / err.
+fn mysql_query_params(conn, sql: string, params) -> any
+    let sock = conn[1]
+    let pq = bytes(0)
+    pq = bytes_append(pq, 22)
+    pq = bytes_concat(pq, str_to_bytes(sql))
+    _my_write_packet(sock, 0, pq)
+    let buf = bytes(0)
+    let pr = _my_read_packet(sock, buf)
+    if pr[0] == 0 - 1
+        return err("mysql: connection closed during prepare")
+    buf = pr[2]
+    let pp = pr[1]
+    if bytes_get(pp, 0) == 255
+        return err("mysql: " + str(_my_u(pp, 1, 2)) + " " + bytes_to_str(bytes_slice(pp, 9, bytes_len(pp))))
+    let stmt_id = _my_u(pp, 1, 4)
+    let num_cols = _my_u(pp, 5, 2)
+    let num_params = _my_u(pp, 7, 2)
+    let pd = _my_read_coldefs(sock, buf, num_params)
+    buf = pd[2]
+    let cd = _my_read_coldefs(sock, buf, num_cols)
+    buf = cd[2]
+    let ex = bytes(0)
+    ex = bytes_append(ex, 23)
+    ex = bytes_concat(ex, _my_p4(stmt_id))
+    ex = bytes_append(ex, 0)
+    ex = bytes_concat(ex, _my_p4(1))
+    let np = len(params)
+    if np > 0
+        let nbm = (np + 7) / 8
+        let bi = 0
+        while bi < nbm
+            ex = bytes_append(ex, 0)
+            bi = bi + 1
+        ex = bytes_append(ex, 1)
+        let ti = 0
+        while ti < np
+            ex = bytes_append(ex, 253)
+            ex = bytes_append(ex, 0)
+            ti = ti + 1
+        let vi = 0
+        while vi < np
+            ex = bytes_concat(ex, _my_wr_lenstr(str_to_bytes(str(params[vi]))))
+            vi = vi + 1
+    _my_write_packet(sock, 0, ex)
+    let xr = _my_read_packet(sock, buf)
+    if xr[0] == 0 - 1
+        return err("mysql: connection closed during execute")
+    buf = xr[2]
+    let xp = xr[1]
+    let xf = bytes_get(xp, 0)
+    if xf == 255
+        return err("mysql: " + str(_my_u(xp, 1, 2)) + " " + bytes_to_str(bytes_slice(xp, 9, bytes_len(xp))))
+    if xf == 0
+        return ok([])
+    let rcc = _my_lenenc_int(xp, 0)
+    let rncols = rcc[0]
+    let rc = _my_read_coldefs(sock, buf, rncols)
+    let rnames = rc[0]
+    let rtypes = rc[1]
+    buf = rc[2]
+    let rows = []
+    let done = 0
+    while done == 0
+        let rp = _my_read_packet(sock, buf)
+        if rp[0] == 0 - 1
+            done = 1
+        else
+            buf = rp[2]
+            let row = rp[1]
+            let rfb = bytes_get(row, 0)
+            if rfb == 254 and bytes_len(row) < 9
+                done = 1
+            else if rfb == 255
+                done = 1
+            else
+                let nbmlen = (rncols + 7 + 2) / 8
+                let o = 1 + nbmlen
+                let d = {}
+                let k = 0
+                while k < rncols
+                    let bytei = 1 + ((k + 2) / 8)
+                    let biti = (k + 2) % 8
+                    if ((bytes_get(row, bytei) >> biti) & 1) == 1
+                        d[rnames[k]] = ""
+                    else
+                        let dec = _my_bin_val(row, o, rtypes[k])
+                        d[rnames[k]] = dec[0]
+                        o = dec[1]
                     k = k + 1
                 push(rows, d)
     ok(rows)
