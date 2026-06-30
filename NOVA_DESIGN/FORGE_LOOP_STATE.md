@@ -1355,3 +1355,20 @@ HandshakeV10, mysql_native_password = SHA1(pw) XOR SHA1(scramble++SHA1(SHA1(pw))
 default [needs TLS/RSA for full auth], COM_QUERY + lenenc result parsing; port 3306). MySQL needs the live
 server creds + version to build with iterative testing (a wire protocol must not be written blind). Owner has
 a MySQL server -> awaiting host/port/user/password/db + version. Memory [[project-forge-orm]].
+
+---
+## (bm) 2026-07-01 — PURE-NOVA MySQL DRIVER, proven live vs MySQL 5.7 [da83c4d]
+Owner provided a live MySQL (localhost:3306, root/root). Built forge/forge_mysql.nova over raw TCP (no
+libmysqlclient): LE packet framing, HandshakeV10 parse, mysql_native_password SHA-1 auth, COM_QUERY, lenenc
+result parsing -> name-keyed string row dicts. Enabler: added sha1_bytes (+_sha1_rotl) to forge_crypto
+(promoted from the WS handshake's ws_sha1_bytes). PROVEN LIVE: SHA-1 KAT + CONNECT OK (native_password on the
+wire vs real MySQL 5.7.36) + a real SELECT returned the inserted rows. NOVA now speaks PostgreSQL AND MySQL
+natively. _mysql_test (KAT always; live only with MYSQLPASSWORD) in the manifest; gated 602/0 both modes.
+Also deleted a stale UNTRACKED test_programs/forge_crypto.nova shadow (it shadowed the synced lib copy and
+cost a cycle). Memory [[project-forge-mysql]].
+This turn also delivered ORM JOINs + pagination [d331948] and tracked the typedList[i].field cross-struct
+field-slot compiler bug [[reference-typedlist-field-slot-collision]].
+NEXT (clearly scoped, focused arcs): (1) forge_orm mysql:// integration with SOUND params = MySQL prepared
+statements (COM_STMT_PREPARE/EXECUTE, binary protocol) -- text COM_QUERY inlining is injection-risky/numeric-
+unsafe, so do prepared statements. (2) caching_sha2_password for MySQL 8.0 (SHA256 fast-path + TLS/RSA full
+auth). (3) NULL params (PG length -1 + SQLite bind_null). (4) the typedList[i].field compiler fix.
