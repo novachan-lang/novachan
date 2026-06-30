@@ -1261,3 +1261,21 @@ unaffected) instead of match; on err return r directly. Full detail + the real-f
 verify-full (MITM-safe), AND a connection pool + transactions — all proven live against real PG16. The L2
 Data layer moved up materially. Remaining: the COMPILER match-on-any bug (real, fix next for bug-free),
 typed type-OID decoding, statement timeouts, NULL params, ssl=on encrypted round-trip.
+
+---
+## (bh) 2026-06-30 — COMPILER BUG FIXED: match Ok/Err on an any-typed value (3 codegen sites) [84c70d5]
+The pool's earlier "ok(empty channel)" symptom was a REAL compiler bug, now FIXED (not just worked around).
+`match val { Ok(x)=>; Err(e)=> }` where val is any-typed (a `-> any` return -- the common module case)
+matched NEITHER arm: codegen used type_name_hash(ctor) (Ok->5862623) and only used the Result tag (0/1)
+when the inferrer set pn==1; an any-typed subject leaves pn!=1, so Ok/Err took the struct-hash path and the
+match fell through. Worked inline (subject inferred Result) but broke in an imported module -> silent
+wrong-result. FIX: Ok/Err are ALWAYS the built-in Result ctors, so force Ok->0/Err->1 regardless of pn.
+★ The fix had to go in ALL THREE match-codegen sites (expression-match ~L8478 + two statement-match
+~L9366/~L9633) -- the probe-adjacent lesson: after patching only the first, the repro STILL emitted 5862623
+from a sibling path. Verified by building a fixed gen4 and confirming 0 bad-hash + the repro passes, then
+full nova_ci: reconverged gen5==gen6 byte-identical, 599/0 NORMAL + FULLRC. Guard = match_any_module_test
+(+ module _match_any_mod), registered in the regression manifest. Detail in memory
+[[reference-match-any-module-codegen-bug]]. This unblocks the typed pg_all<T> ORM seam (let-site<T>).
+=> PG driver: connect/SCRAM/MD5, simple+parameterized(injection-safe) queries, TLS+verify-full(MITM-safe),
+pool+transactions -- ALL live-proven. Compiler is more correct (match-on-any fixed everywhere). NEXT = the
+ORM seam (typed pg_all<T> + type-OID decode), then timeouts/NULL params/ssl=on round-trip.
