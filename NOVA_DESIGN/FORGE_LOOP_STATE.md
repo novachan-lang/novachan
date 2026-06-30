@@ -1335,3 +1335,23 @@ query builder, SQL-free repository (get/where), relations (has-many/belongs-to),
 zero-annotation, all live on SQLite + PostgreSQL. Beats JPA on simplicity; matches its core power without
 annotations/EntityManager/proxies. NEXT (needs owner input/resources): MySQL driver (needs a MySQL server to
 prove live), NULL params, JOIN builder, paginate. Memory [[project-forge-orm]].
+
+---
+## (bl) 2026-06-30 — ORM JOINs + pagination; MySQL driver researched (needs creds) [commit after bk]
+Query builder v2: added a joins clause + .inner_join(t,on)/.left_join(t,on) and .paginate(page,per) (1-based)
+atop .limit/.offset. Method-name gotchas (UFCS desugars x.m(a) -> m(x,a), so a method can't shadow a
+builtin): .select -> .columns (channel-select builtin), .join -> .inner_join (join(list,sep) builtin);
+.where is fine (contextual kw). Proven live both DBs: posts-JOIN-users -> typed DTO, + 2-page pagination.
+★ FOUND + TRACKED a pre-existing COMPILER soundness bug: typedList[i].field reads the WRONG slot when
+`field` collides with another struct at a different index (e.g. Post.title@2 vs PostAuthor.title@0). Per-struct
+resolution of the index-receiver (ir_list_elem_stype / ir_expr_struct_type index case) is unreliable in the
+imported multi-struct case -> recv_stype="" -> global ambiguous slot. Repro + root-cause direction in memory
+[[reference-typedlist-field-slot-collision]]. Workaround: DTO field names that don't collide. NOT introduced
+by the ORM; fix is a focused compiler session. Gated -SkipReconverge 601/0 both modes.
+REMAINING of the owner's "do everything": NULL params (NOVA `null` ≡ i64 0; neither PG _pg_bind_msg nor the
+SQLite path can encode SQL NULL today -> needs driver-level encoding: PG length -1, SQLite sqlite3_bind_null;
+literal `IS NULL`/`VALUES(NULL)` in SQL works now) and the MySQL DRIVER (full protocol researched: LE framing,
+HandshakeV10, mysql_native_password = SHA1(pw) XOR SHA1(scramble++SHA1(SHA1(pw))) [do FIRST], caching_sha2 8.0
+default [needs TLS/RSA for full auth], COM_QUERY + lenenc result parsing; port 3306). MySQL needs the live
+server creds + version to build with iterative testing (a wire protocol must not be written blind). Owner has
+a MySQL server -> awaiting host/port/user/password/db + version. Memory [[project-forge-orm]].
