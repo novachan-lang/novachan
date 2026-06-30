@@ -131,6 +131,30 @@ fn _my_native_pw(password: string, scramble) -> any
         i = i + 1
     out
 
+// caching_sha2_password fast-path token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) ++ scramble(20) ), 32 bytes.
+fn _my_caching_sha2_pw(password: string, scramble) -> any
+    if len(password) == 0
+        return bytes(0)
+    let pw = str_to_blist(password)
+    let h1 = sha256_bytes(pw)
+    let h2 = sha256_bytes(h1)
+    let cat = []
+    let i = 0
+    while i < len(h2)
+        push(cat, h2[i])
+        i = i + 1
+    i = 0
+    while i < len(scramble)
+        push(cat, scramble[i])
+        i = i + 1
+    let h3 = sha256_bytes(cat)
+    let out = bytes(0)
+    i = 0
+    while i < 32
+        out = bytes_append(out, (h1[i] ^ h3[i]) & 255)
+        i = i + 1
+    out
+
 // ---- connect ----------------------------------------------------------------------------------------
 // mysql_connect -> ok(["my", sock]) authenticated + ready for queries, or err. Supports
 // mysql_native_password (MySQL 5.7 default; 8.0 accounts created WITH mysql_native_password).
@@ -167,7 +191,15 @@ fn mysql_connect(host: string, port: int, user: string, db: string, password: st
     while si < 12
         push(scramble, bytes_get(payload, scr2off + si))
         si = si + 1
-    let token = _my_native_pw(password, scramble)
+    let plugin_res = _my_cstr(payload, scr2off + part2)
+    let srv_plugin = plugin_res[0]
+    let token = bytes(0)
+    let resp_plugin = "mysql_native_password"
+    if srv_plugin == "caching_sha2_password"
+        token = _my_caching_sha2_pw(password, scramble)
+        resp_plugin = "caching_sha2_password"
+    else
+        token = _my_native_pw(password, scramble)
     // HandshakeResponse41
     let flags = 512 | 32768 | 524288 | 1
     if len(db) > 0
@@ -186,7 +218,7 @@ fn mysql_connect(host: string, port: int, user: string, db: string, password: st
     if len(db) > 0
         resp = bytes_concat(resp, str_to_bytes(db))
         resp = bytes_append(resp, 0)
-    resp = bytes_concat(resp, str_to_bytes("mysql_native_password"))
+    resp = bytes_concat(resp, str_to_bytes(resp_plugin))
     resp = bytes_append(resp, 0)
     _my_write_packet(sock, 1, resp)
     let r2 = _my_read_packet(sock, pkt[2])
@@ -200,9 +232,23 @@ fn mysql_connect(host: string, port: int, user: string, db: string, password: st
         let msg = bytes_to_str(bytes_slice(rp, 9, bytes_len(rp)))
         tcp_close(sock)
         return err("mysql: " + str(errcode) + " " + msg)
+    if first == 1
+        let status = bytes_get(rp, 1)
+        if status == 3
+            let r3 = _my_read_packet(sock, r2[2])
+            if r3[0] == 0 - 1
+                tcp_close(sock)
+                return err("mysql: connection closed after caching_sha2 fast-auth")
+            if bytes_get(r3[1], 0) == 255
+                let ec = _my_u(r3[1], 1, 2)
+                tcp_close(sock)
+                return err("mysql: " + str(ec) + " " + bytes_to_str(bytes_slice(r3[1], 9, bytes_len(r3[1]))))
+            return ok(["my", sock])
+        tcp_close(sock)
+        return err("mysql: caching_sha2 full authentication required (cold cache) -- needs TLS or RSA, not yet supported; prime the cache or use mysql_native_password")
     if first == 254
         tcp_close(sock)
-        return err("mysql: server requested auth-switch (account is not mysql_native_password)")
+        return err("mysql: server requested an auth-switch (unsupported plugin)")
     ok(["my", sock])
 
 fn mysql_close(conn)
