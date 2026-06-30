@@ -1199,3 +1199,23 @@ cost many guess-test iterations — for the retry, go straight to IR diff, don't
 connect/auth/query + TLS core) are DONE; Unit 3 is ergonomics on top and non-blocking.
 => Live Postgres over TLS = CORE COMPLETE (committed, CI-green, proven live). Unit 3 pool deferred pending
    the module-codegen bug pin. Full encrypted SELECT still just needs a ssl=on PG + PGPASSWORD.
+
+---
+## (be) 2026-06-30 — owner gave creds (PG16 postgres/root) → REAL round-trip + PARAMETERIZED queries (injection-safe)
+Owner provided the local creds (PG16 @ :5432, user=postgres pw=root, ssl=off) AND pushed on production-grade
+("works live != production-complete"; "if not in memory it's wasted"). Two responses:
+1) FULL LIVE ROUND-TRIP PROVEN: `PGUSER=postgres PGPASSWORD=root ./forge_pg_live_test.exe` →
+   "LIVE PG CONNECT OK (full auth handshake completed)" + "row: one=1 greet=hello" + "ROUND-TRIP OK". The
+   pure-NOVA driver does the COMPLETE cycle (SCRAM-SHA-256 auth → SELECT → row parse) against real PG16.
+2) ★ PARAMETERIZED QUERIES (the #1 production gap = SQL injection) — forge_pg.nova: pg_query_params(conn,
+   sql, params) via the EXTENDED protocol (Parse 'P' / Bind 'B' / Describe 'D'-portal / Execute 'E' /
+   Sync 'S'). Values bound SEPARATELY (text format), NEVER concatenated into SQL. PROVEN LIVE injection-safe
+   (forge_pg_params_test): bound `x'; DROP TABLE forge_pg_no_such; --` as $2 → returned VERBATIM as data
+   (n=34, m=42, s=<payload>), not executed. Statement reuse across calls works. forge-lib-only (no runtime
+   change) → regression gate -SkipReconverge.
+MEMORY: added [[feedback-production-grade-bar]] (the owner's standing contract) + [[project-forge-postgres]]
+(honest live-state + gap list) + COMPACTED the oversized MEMORY.md index 37.9KB→12.4KB (was dropping entries
+past the load limit). NULL params not yet supported (tracked).
+=> PG injection-safety CLOSED + proven live. Remaining prod gaps (priority): TLS verify-full (MITM) > pool
+   codegen-bug pin > typed decoding > timeouts. The owner cares deeply about production-grade — apply the bar
+   to EVERY unit, track gaps honestly.

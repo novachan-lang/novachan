@@ -406,3 +406,88 @@ fn pg_exec(conn, sql: string) -> any
 fn pg_close(conn)
     _pg_send(conn, _pg_msg(88, bytes(0)))
     _pg_close_transport(conn)
+
+// ── PARAMETERIZED queries (extended protocol) — INJECTION-SAFE ──────────────────────────────────────
+// The SQL uses $1,$2,... placeholders; the values are sent as SEPARATE Bind parameters and are NEVER
+// concatenated into the SQL string, so a value like "x'; DROP TABLE t; --" is bound as a literal, never
+// parsed as SQL. This is the production-grade, injection-safe path (vs pg_exec's simple-query string).
+// All params are sent in TEXT format; the server coerces per the column/placeholder type.
+
+// Parse ('P'): unnamed statement + query + int16(0 param-type OIDs -> server infers).
+fn _pg_parse_msg(sql: string) -> any
+    let payload = _cstr("")
+    payload = bytes_concat(payload, _cstr(sql))
+    payload = bytes_concat(payload, pg_be16(0))
+    _pg_msg(80, payload)
+
+// Bind ('B'): unnamed portal + unnamed statement + int16(0 param fmt codes = all text) + int16(nparams)
+// + per param [int32 len + bytes] + int16(0 result fmt codes = all text).
+fn _pg_bind_msg(params: list) -> any
+    let payload = _cstr("")
+    payload = bytes_concat(payload, _cstr(""))
+    payload = bytes_concat(payload, pg_be16(0))
+    payload = bytes_concat(payload, pg_be16(len(params)))
+    let i = 0
+    while i < len(params)
+        let pb = str_to_bytes(params[i])
+        payload = bytes_concat(payload, pg_be32(bytes_len(pb)))
+        payload = bytes_concat(payload, pb)
+        i = i + 1
+    payload = bytes_concat(payload, pg_be16(0))
+    _pg_msg(66, payload)
+
+// Describe ('D') the unnamed PORTAL ('P') -> the server returns RowDescription so we get column names.
+fn _pg_describe_portal_msg() -> any
+    let payload = bytes(0)
+    payload = bytes_append(payload, 80)
+    payload = bytes_concat(payload, _cstr(""))
+    _pg_msg(68, payload)
+
+// Execute ('E') the unnamed portal, int32 max_rows = 0 (all).
+fn _pg_execute_msg() -> any
+    let payload = _cstr("")
+    payload = bytes_concat(payload, pg_be32(0))
+    _pg_msg(69, payload)
+
+// Run a parameterized query. `params` = a list of string values bound to $1,$2,... (text format; NULL
+// params are not yet supported -- a tracked limitation). Returns ok(list of name-keyed row dicts) or err.
+// Sends Parse/Bind/Describe/Execute/Sync as one batch, then reads to ReadyForQuery (Sync's error recovery
+// guarantees a 'Z' even on error).
+fn pg_query_params(conn, sql: string, params: list) -> any
+    _pg_send(conn, _pg_parse_msg(sql))
+    _pg_send(conn, _pg_bind_msg(params))
+    _pg_send(conn, _pg_describe_portal_msg())
+    _pg_send(conn, _pg_execute_msg())
+    _pg_send(conn, _pg_msg(83, bytes(0)))
+    let buf = bytes(0)
+    let names = []
+    let rows = []
+    let done = 0
+    let errmsg = ""
+    let had_err = 0
+    while done == 0
+        let m = _pg_recv_msg(conn, buf)
+        let tag = m[0]
+        let msg = m[1]
+        buf = m[2]
+        if tag == 0 - 1
+            done = 1
+        else if tag == 84
+            names = pg_parse_row_description(msg, 0)
+        else if tag == 68
+            let vals = pg_parse_data_row(msg, 0)
+            let row = {}
+            let i = 0
+            while i < len(names)
+                if i < len(vals)
+                    row[names[i]] = vals[i]
+                i = i + 1
+            push(rows, row)
+        else if tag == 69
+            errmsg = _pg_parse_error(msg)
+            had_err = 1
+        else if tag == 90
+            done = 1
+    if had_err == 1
+        return err("pg: " + errmsg)
+    ok(rows)
