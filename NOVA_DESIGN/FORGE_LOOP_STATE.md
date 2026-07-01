@@ -1411,3 +1411,20 @@ REMAINING of the owner's list: the typedList[i].field cross-struct field-slot CO
 [[reference-typedlist-field-slot-collision]] -- a real soundness bug, tracked with a repro, but it needs
 compiler INSTRUMENTATION to pin where ir_list_elem_stype drops out (order/context-dependent; reading alone
 didn't pin it). A focused compiler arc + reconverge -- do it with fresh context, not at a session tail.
+
+---
+## (bp) 2026-07-01 — COMPILER FIX: typedList[i].field cross-struct field-slot bug [252dc76]
+A real SOUNDNESS bug (silent wrong-slot/garbage read), fixed. `let xs: list<T> = db_all/orm_all/orm_where(...)`
+set ir_list_elem_stype[xs]=T, but a re-derivation block right after (tag=="assign") ran unconditionally and
+recomputed the element type from the REWRITTEN `<T>__from_dict_list(...)` eff_expr (whose return-list-elem
+isn't registered) -> ir_list_elem_struct returned "" -> CLOBBERED T to "". Then `xs[i].field` resolved its
+struct via ir_list_elem_stype[xs]="" -> recv_stype="" -> get_ir_field_index_for(b,"",field) = the GLOBAL
+(collision-ambiguous) slot. Universal for typed-let lists, only MANIFESTED when a struct's field slot != the
+global slot for a name shared with another struct. FIX = guard the re-derivation with `if fj_list_elem == ""`.
+Found via compiler instrumentation (set->clobber->read trace). Guard typedlist_field_slot_test; forge_orm_test
+JOIN DTO restored to natural colliding names (title/name) -> proves the fix end-to-end. Gated full nova_ci:
+reconverged gen5==gen6 byte-identical, 604/0 both modes. Memory [[reference-typedlist-field-slot-collision]]
+marked FIXED. => The owner's requested pre-Forge bug is CLOSED. Next: continue across Forge (the mission in
+[[project-forge-loop]]) toward beating Spring/Django/Phoenix. Remaining DB-layer nice-to-haves: caching_sha2
+0x04 cold-cache full auth (MySQL-SSL via nova_rt_tls_upgrade or RSA-OAEP); MySQL FLOAT/DOUBLE/DATE binary
+decode + a pool. Infra: Docker `nova-mysql8` (:3307) still running for that.
