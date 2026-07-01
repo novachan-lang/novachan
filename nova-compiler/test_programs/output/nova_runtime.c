@@ -15178,6 +15178,67 @@ int64_t nova_rt_hmac_sha256(int64_t key_val, int64_t msg_val) {
     return (int64_t)(uintptr_t)out;
 }
 
+/* ── PBKDF2-HMAC-SHA256 (RFC 8018) — native fast path ─────────────────────────
+   Pure-NOVA PBKDF2 at production iteration counts (100k) is ~25s/hash — unusable on a login path.
+   This native impl (on the existing C sha256) does 100k iters in ~30ms. DETERMINISTIC: byte-identical
+   to the pure-NOVA pbkdf2_sha256, so a hash written by one verifies with the other. No malloc (stack
+   salt buffer, so the freestanding/no-libc build stays clean). */
+static void _pbk_hmac_sha256(const uint8_t* key, size_t keylen, const uint8_t* msg, size_t msglen, uint8_t out32[32]) {
+    uint8_t k[64];
+    if (keylen > 64) {
+        Sha256Ctx kc; sha256_init(&kc); sha256_update(&kc, key, keylen);
+        uint8_t kh[32]; sha256_final(&kc, kh);
+        memcpy(k, kh, 32); memset(k + 32, 0, 32);
+    } else {
+        if (keylen) memcpy(k, key, keylen);
+        memset(k + keylen, 0, 64 - keylen);
+    }
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    Sha256Ctx ci; sha256_init(&ci); sha256_update(&ci, ipad, 64); if (msglen) sha256_update(&ci, msg, msglen);
+    uint8_t inner[32]; sha256_final(&ci, inner);
+    Sha256Ctx co; sha256_init(&co); sha256_update(&co, opad, 64); sha256_update(&co, inner, 32);
+    sha256_final(&co, out32);
+}
+
+int64_t nova_rt_pbkdf2_sha256(int64_t pw_val, int64_t salt_val, int64_t iters, int64_t dklen) {
+    NovaBytes* pwb = (NovaBytes*)(uintptr_t)pw_val;
+    NovaBytes* sab = (NovaBytes*)(uintptr_t)salt_val;
+    const uint8_t* pw = (pwb && pwb->data) ? pwb->data : (const uint8_t*)"";
+    size_t pwlen = (pwb && pwb->size > 0) ? (size_t)pwb->size : 0;
+    const uint8_t* salt = (sab && sab->data) ? sab->data : (const uint8_t*)"";
+    size_t saltlen = (sab && sab->size > 0) ? (size_t)sab->size : 0;
+    if (iters < 1) iters = 1;
+    if (dklen < 1) dklen = 1;
+    if (dklen > (1 << 20)) dklen = (1 << 20);
+    int64_t result = nova_rt_bytes_create(dklen);
+    NovaBytes* rb = (NovaBytes*)(uintptr_t)result;
+    if (!rb || !rb->data) nova_panic("pbkdf2: result allocation failed");
+    uint8_t* out = rb->data;
+    uint8_t saltblk[288];
+    if (saltlen > 284) nova_panic("pbkdf2: salt too long");
+    if (saltlen) memcpy(saltblk, salt, saltlen);
+    uint32_t blocks = (uint32_t)((dklen + 31) / 32);
+    int64_t done = 0;
+    for (uint32_t bi = 1; bi <= blocks; bi++) {
+        saltblk[saltlen + 0] = (uint8_t)(bi >> 24);
+        saltblk[saltlen + 1] = (uint8_t)(bi >> 16);
+        saltblk[saltlen + 2] = (uint8_t)(bi >> 8);
+        saltblk[saltlen + 3] = (uint8_t)(bi);
+        uint8_t u[32], t[32];
+        _pbk_hmac_sha256(pw, pwlen, saltblk, saltlen + 4, u);
+        memcpy(t, u, 32);
+        for (int64_t j = 1; j < iters; j++) {
+            _pbk_hmac_sha256(pw, pwlen, u, 32, u);
+            for (int b = 0; b < 32; b++) t[b] ^= u[b];
+        }
+        int64_t take = (dklen - done < 32) ? (dklen - done) : 32;
+        memcpy(out + done, t, (size_t)take);
+        done += take;
+    }
+    return result;
+}
+
 /* ── Hex encode/decode ────────────────────────────────────────────────────── */
 
 int64_t nova_rt_hex_encode(int64_t input) {

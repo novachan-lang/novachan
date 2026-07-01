@@ -193,6 +193,7 @@ $domain_tests = @(
     'forge_csrf_test',
     'forge_jwt_test',
     'forge_auth_sweep_test',
+    '_pbkdf2_native_test',
     'forge_otp_sweep_test',
     'forge_validate_test',
     'forge_validate_typed_test',
