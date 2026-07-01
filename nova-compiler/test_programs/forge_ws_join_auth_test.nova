@@ -1,0 +1,84 @@
+// forge_ws_join_auth_test -- T5.4/5/6 pre-101 WebSocket join authorization.
+// Socket-free: exercises the MECHANISM (forge.ws_guard / ws_default_deny / ws_authz_ok) and the BATTERY
+// authorizers (forge_auth.ws_require_bearer / ws_require_session) directly. The serve-loop wiring that
+// turns a false result into a pre-101 HTTP 401 is covered by the full -SkipReconverge server tests.
+import forge
+import forge_auth
+
+fn mk(raw: string) -> Request
+    forge.build_request(raw, 0)
+
+fn main()
+    let secret = "join-auth-secret"
+
+    // A valid token: aud="api", scope="read write", far-future exp.
+    let claims = {}
+    claims["sub"] = "user42"
+    claims["aud"] = "api"
+    claims["scope"] = "read write"
+    claims["exp"] = 9999999999
+    let tok = forge.jwt_encode(claims, secret)
+
+    // An EXPIRED token (exp = 2001; > the year-2000 plausibility floor, so it is parsed then rejected as expired).
+    let old_claims = {}
+    old_claims["sub"] = "user42"
+    old_claims["aud"] = "api"
+    old_claims["scope"] = "read write"
+    old_claims["exp"] = 1000000000
+    let expired = forge.jwt_encode(old_claims, secret)
+
+    // ── MECHANISM: default-allow vs default-deny for an UNGUARDED pattern ──────────────────────────
+    let a = forge.app()
+    let any_req = mk("GET /ws HTTP/1.1\r\n\r\n")
+    assert(forge.ws_authz_ok(a, any_req, "/ws"), "unguarded + no default-deny -> allow (backward compat)")
+    forge.ws_default_deny(a)
+    assert(not forge.ws_authz_ok(a, any_req, "/ws"), "ws_default_deny -> unguarded pattern REJECTED")
+    print("PASS: mechanism default-allow / secure-by-default flip")
+
+    // ── BEARER authorizer via ws_guard + ws_authz_ok (full path) ──────────────────────────────────
+    let b = forge.app()
+    forge.ws_guard(b, "/ws/chat", forge_auth.ws_require_bearer(secret, "api", "read"))
+
+    let hdr = "GET /ws/chat HTTP/1.1\r\nAuthorization: Bearer " + tok + "\r\n\r\n"
+    assert(forge.ws_authz_ok(b, mk(hdr), "/ws/chat"), "valid bearer + aud + scope -> allow")
+    print("PASS: bearer valid -> allow")
+
+    // access_token query fallback (browsers cannot set WS headers)
+    let qreq = mk("GET /ws/chat?access_token=" + tok + " HTTP/1.1\r\n\r\n")
+    assert(forge.ws_authz_ok(b, qreq, "/ws/chat"), "access_token query param -> allow")
+    print("PASS: bearer via ?access_token -> allow")
+
+    // missing token -> reject
+    assert(not forge.ws_authz_ok(b, mk("GET /ws/chat HTTP/1.1\r\n\r\n"), "/ws/chat"), "no token -> reject")
+    // tampered signature -> reject
+    let bad = mk("GET /ws/chat HTTP/1.1\r\nAuthorization: Bearer not.a.valid.jwt\r\n\r\n")
+    assert(not forge.ws_authz_ok(b, bad, "/ws/chat"), "bad token -> reject")
+    // expired -> reject
+    let ex = mk("GET /ws/chat HTTP/1.1\r\nAuthorization: Bearer " + expired + "\r\n\r\n")
+    assert(not forge.ws_authz_ok(b, ex, "/ws/chat"), "expired token -> reject")
+    print("PASS: bearer missing/tampered/expired -> reject")
+
+    // wrong audience -> reject
+    let c = forge.app()
+    forge.ws_guard(c, "/ws/chat", forge_auth.ws_require_bearer(secret, "other-api", "read"))
+    assert(not forge.ws_authz_ok(c, mk(hdr), "/ws/chat"), "wrong audience -> reject")
+    // missing required scope -> reject
+    let d = forge.app()
+    forge.ws_guard(d, "/ws/chat", forge_auth.ws_require_bearer(secret, "api", "delete"))
+    assert(not forge.ws_authz_ok(d, mk(hdr), "/ws/chat"), "missing scope 'delete' -> reject")
+    print("PASS: bearer wrong-aud / missing-scope -> reject")
+
+    // ── SESSION-cookie authorizer ─────────────────────────────────────────────────────────────────
+    let e = forge.app()
+    forge.ws_guard(e, "/ws/live", forge_auth.ws_require_session(secret))
+    let signed = forge.sign_value(secret, "user42")
+    let sreq = mk("GET /ws/live HTTP/1.1\r\nCookie: session=" + signed + "\r\n\r\n")
+    assert(forge.ws_authz_ok(e, sreq, "/ws/live"), "valid signed session cookie -> allow")
+    // forged cookie (value edited, signature no longer matches) -> reject
+    let forged = mk("GET /ws/live HTTP/1.1\r\nCookie: session=attacker.deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n\r\n")
+    assert(not forge.ws_authz_ok(e, forged, "/ws/live"), "forged session cookie -> reject")
+    // no cookie -> reject
+    assert(not forge.ws_authz_ok(e, mk("GET /ws/live HTTP/1.1\r\n\r\n"), "/ws/live"), "no session cookie -> reject")
+    print("PASS: session valid -> allow; forged/absent -> reject")
+
+    print("forge_ws_join_auth_test passed")

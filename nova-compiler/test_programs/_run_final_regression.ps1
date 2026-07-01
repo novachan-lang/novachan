@@ -194,6 +194,7 @@ $domain_tests = @(
     'forge_csrf_test',
     'forge_jwt_test',
     'forge_oauth2_test',
+    'forge_ws_join_auth_test',
     'forge_auth_sweep_test',
     '_pbkdf2_native_test',
     'forge_otp_sweep_test',

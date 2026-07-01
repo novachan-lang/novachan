@@ -1062,6 +1062,40 @@ fn _ws_lookup(a, req: Request) -> list
         i = i + 1
     []
 
+// ââ WebSocket join authorization (PRE-101) âââââââââââââââââââââââ
+// Authorize a ws upgrade BEFORE the 101 handshake, so an UNAUTHORIZED client never obtains an open
+// socket (rejecting pre-upgrade is a clean HTTP 401; revoking an established WS is expensive and racey
+// with the reader/writer tasks). This is the MECHANISM only -- crypto-free, so forge.nova stays out of a
+// forge_crypto module diamond. The battery authorizers (ws_require_bearer / ws_require_session) live in
+// forge_auth and reuse the existing jwt/session/oauth2 helpers. authorizer: fn(req: Request) -> bool.
+//
+// Stored in a["ws_authz"] (a dict pattern->authorizer) PARALLEL to ws_routes, so the load-bearing
+// route-length dispatch ([p,h]=2 plain, [p,h,hub]=3 room, len-5 hooks) is completely untouched.
+fn ws_guard(a, pattern: string, authorizer)
+    let m = {}
+    if contains(a, "ws_authz")
+        m = a["ws_authz"]
+    m[pattern] = authorizer
+    a["ws_authz"] = m
+
+// Secure-by-default (Phoenix-style): after this, any ws upgrade whose pattern has NO registered authorizer
+// is REJECTED. Off by default so existing routes keep working; one call opts the whole app in.
+fn ws_default_deny(a)
+    a["ws_deny_default"] = 1
+
+// True iff the upgrade to `pattern` is allowed: run its authorizer if registered; else reject when
+// default-deny is on; else allow (preserves current behavior for unguarded routes). Public so an app can
+// pre-check and so the mechanism is unit-testable without a live socket.
+fn ws_authz_ok(a, req: Request, pattern: string) -> bool
+    if contains(a, "ws_authz")
+        let m = a["ws_authz"]
+        if contains(m, pattern)
+            let authz = m[pattern]
+            return authz(req)
+    if contains(a, "ws_deny_default")
+        return false
+    true
+
 // Send the 101 handshake (reads NOTHING from the socket -- the request was already parsed). Returns 1 on
 // success, 0 (after a 400) on a bad key. Runs inside the request arena; the 101 bytes are consumed by
 // tcp_send before arena_exit.
@@ -4218,13 +4252,20 @@ fn _serve_conn(conn: int, a, safe: int)
             // frame loop, and RETURN -- _ws_run is the SOLE owner of tcp_close (never fall through).
             let route = _ws_lookup(a, req)
             if len(route) >= 2
-                let kams = _ws_app_ka(a)
-                if ws_handshake(conn, req) == 1
+                if not ws_authz_ok(a, req, route[0])
+                    // Pre-101 rejection: an unauthorized client never gets an open socket. The 401 bytes
+                    // are sent BEFORE arena_exit (same arena discipline as ws_handshake's 400 path).
+                    tcp_send(conn, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     arena_exit(prev)
-                    _ws_run(conn, route, kams)
-                    return
-                arena_exit(prev)
-                alive = false
+                    alive = false
+                else
+                    let kams = _ws_app_ka(a)
+                    if ws_handshake(conn, req) == 1
+                        arena_exit(prev)
+                        _ws_run(conn, route, kams)
+                        return
+                    arena_exit(prev)
+                    alive = false
             else
                 // Server-Sent Events: a GET matching an sse route hijacks the connection into a long-lived
                 // text/event-stream (like ws, exit the request arena BEFORE the stream loop and RETURN --
