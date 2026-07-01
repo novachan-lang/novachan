@@ -1,0 +1,283 @@
+// forge_otp_sweep_test: T4.3 (one_for_all + rest_for_one + one_for_one backward-compat),
+// T4.11 (on_terminate clean-stop hook), T4.15 (application root start/stop/whereis).
+// Socketless (spawn/monitor/atomic/channel) -> kill-on-timeout safe (15s).
+import forge_otp
+
+// ── child workers used by multiple tests ─────────────────────────────────────────────────────────
+// A "gated" child: increments its per-child run counter, sends 1 to ready_ch, then blocks on
+// go_ch. Two go channels (go1/go2) for the two runs; which one to wait on depends on the run number.
+// After unblocking: if is_crasher==1 AND this is run 1, panic; otherwise exit normally.
+fn _gated_run1(run_ctr, ready_ch, go1)
+    atomic_add(run_ctr, 1)
+    send(ready_ch, 1)
+    receive(go1)
+
+// A "two-run" child: uses run_ctr to decide which go channel to use and whether to crash.
+// run 1: sends ready, waits on go1_ch, then crashes (is_crasher path) or exits normally.
+// run 2+: sends ready, waits on go2_ch, exits normally.
+fn _tworun_stable(run_ctr, ready_ch, go1_ch, go2_ch)
+    let run = atomic_add(run_ctr, 1)
+    send(ready_ch, 1)
+    if run == 1
+        receive(go1_ch)
+    else
+        receive(go2_ch)
+
+fn _tworun_crasher(run_ctr, ready_ch, go1_ch, go2_ch)
+    let run = atomic_add(run_ctr, 1)
+    send(ready_ch, 1)
+    if run == 1
+        let _ = receive(go1_ch)
+        panic("forced crash run 1")
+    else
+        receive(go2_ch)
+
+// Wait for n ready signals from ready_ch (all children have started current run).
+fn _wait_n(ready_ch, n: int)
+    let i = 0
+    while i < n
+        receive(ready_ch)
+        i = i + 1
+
+// Terminate hook helper (top-level fn for the on_terminate callback).
+fn _do_term_sweep(done_ch, reason)
+    send(done_ch, reason)
+
+fn _noop_handler(state, msg)
+    [state, 0]
+
+// ── T4.3a: one_for_all ───────────────────────────────────────────────────────────────────────────
+// 3 children (c0=stable, c1=crasher-on-run1, c2=stable). Strategy: one_for_all.
+// When c1 crashes, supervisor restarts ALL. c0 and c2 are still alive (waiting on their go1 channel)
+// when c1 crashes, so they ARE alive and get force-replaced. After restart, all 3 run again.
+// Assert: c0, c1, c2 each run exactly 2x. c1 runs 2x (initial crash + restart). c0/c2 run 2x.
+fn test_one_for_all()
+    let ready_ch = channel()
+    let r0 = atomic_new(0)
+    let r1 = atomic_new(0)
+    let r2 = atomic_new(0)
+    // Round 1 go channels (blocked until test signals)
+    let go0r1 = channel()
+    let go1r1 = channel()
+    let go2r1 = channel()
+    // Round 2 go channels
+    let go0r2 = channel()
+    let go1r2 = channel()
+    let go2r2 = channel()
+
+    // Single-line closures wrapping named fns (required pattern: closures from main can be multi-step)
+    let c0 = fn() _tworun_stable(r0, ready_ch, go0r1, go0r2)
+    let c1 = fn() _tworun_crasher(r1, ready_ch, go1r1, go1r2)
+    let c2 = fn() _tworun_stable(r2, ready_ch, go2r1, go2r2)
+
+    let sup = sup_new("one_for_all", 5, 10)
+    child_add(sup, "c0", c0, "transient", 5000)
+    child_add(sup, "c1", c1, "transient", 5000)
+    child_add(sup, "c2", c2, "transient", 5000)
+    sup_start(sup)
+
+    // Round 1: wait for all 3 children to be ready (they've incremented counters + sent ready)
+    _wait_n(ready_ch, 3)
+    // c0 and c2 are alive (waiting on go0r1/go2r1). c1 is alive (waiting on go1r1).
+    // Trigger c1 crash: c1 receives go1r1 and panics.
+    // c0 and c2 are still alive -> one_for_all will force-replace them.
+    send(go1r1, 1)
+
+    // After c1 crashes and one_for_all fires: new c0, c1, c2 are spawned (round 2).
+    // Round 2: wait for all 3 NEW instances to send ready
+    _wait_n(ready_ch, 3)
+
+    // Now drain the OLD c0 and c2 processes (still blocking on go0r1/go2r1).
+    // Their DOWNs will arrive as stale (wrong generation) and be discarded by the supervisor.
+    send(go0r1, 1)
+    send(go2r1, 1)
+
+    // Release round 2 children to exit normally
+    send(go0r2, 1)
+    send(go1r2, 1)
+    send(go2r2, 1)
+
+    sleep(100)
+
+    let v0 = atomic_get(r0)
+    let v1 = atomic_get(r1)
+    let v2 = atomic_get(r2)
+    if v0 != 2
+        print("FAIL one_for_all: c0 should run 2x got " + str(v0))
+        exit(1)
+    if v1 != 2
+        print("FAIL one_for_all: c1 should run 2x got " + str(v1))
+        exit(1)
+    if v2 != 2
+        print("FAIL one_for_all: c2 should run 2x got " + str(v2))
+        exit(1)
+    print("PASS one_for_all (c0=" + str(v0) + " c1=" + str(v1) + " c2=" + str(v2) + " all=2x)")
+
+// ── T4.3b: rest_for_one ──────────────────────────────────────────────────────────────────────────
+// 3 children [a(idx0), b(idx1), c(idx2)]. Strategy: rest_for_one.
+// Crash b -> b and c (higher index) restart; a (lower index) does NOT restart.
+// Assert: a runs 1x; b and c run 2x.
+fn test_rest_for_one()
+    let ready_ch = channel()
+    let ra = atomic_new(0)
+    let rb = atomic_new(0)
+    let rc = atomic_new(0)
+
+    // a has only one run (never restarted); needs just one go channel
+    let goa = channel()
+    // b and c have two runs
+    let gobr1 = channel()
+    let gobr2 = channel()
+    let gocr1 = channel()
+    let gocr2 = channel()
+
+    // a: stable, only one run
+    let ca = fn() _gated_run1(ra, ready_ch, goa)
+    let cb = fn() _tworun_crasher(rb, ready_ch, gobr1, gobr2)
+    let cc = fn() _tworun_stable(rc, ready_ch, gocr1, gocr2)
+
+    let sup = sup_new("rest_for_one", 5, 10)
+    child_add(sup, "a", ca, "transient", 5000)
+    child_add(sup, "b", cb, "transient", 5000)
+    child_add(sup, "c", cc, "transient", 5000)
+    sup_start(sup)
+
+    // Round 1: wait for all 3 ready
+    _wait_n(ready_ch, 3)
+    // a (idx0), b (idx1), c (idx2) are all alive.
+    // Crash b: b is waiting on gobr1, receives it and panics.
+    // c (idx2 > idx1) is still alive -> rest_for_one force-replaces c too.
+    // a (idx0 < idx1) is NOT affected by rest_for_one.
+    send(gobr1, 1)
+
+    // After b crashes: b and c are restarted (2 new processes start).
+    // Wait for the 2 new processes (new b, new c) to send ready.
+    _wait_n(ready_ch, 2)
+
+    // Drain old c (still blocking on gocr1 - force-replaced, old process still alive)
+    send(gocr1, 1)
+
+    // Release a to exit (it was never restarted, exits normally now)
+    send(goa, 1)
+
+    // Release round 2 b and c
+    send(gobr2, 1)
+    send(gocr2, 1)
+
+    sleep(100)
+
+    let vra = atomic_get(ra)
+    let vrb = atomic_get(rb)
+    let vrc = atomic_get(rc)
+    if vra != 1
+        print("FAIL rest_for_one: a should run 1x got " + str(vra))
+        exit(1)
+    if vrb != 2
+        print("FAIL rest_for_one: b should run 2x got " + str(vrb))
+        exit(1)
+    if vrc != 2
+        print("FAIL rest_for_one: c should run 2x got " + str(vrc))
+        exit(1)
+    print("PASS rest_for_one (a=" + str(vra) + "x b=" + str(vrb) + "x c=" + str(vrc) + "x)")
+
+// ── T4.3c: one_for_one backward compatibility ────────────────────────────────────────────────────
+// 3 children (a=stable, b=crasher, c=stable). Strategy: one_for_one.
+// Crash b -> ONLY b restarts; a and c each run exactly 1x.
+fn test_one_for_one_compat()
+    let ready_ch = channel()
+    let ra = atomic_new(0)
+    let rb = atomic_new(0)
+    let rc = atomic_new(0)
+
+    let goa  = channel()
+    let gobr1 = channel()
+    let gobr2 = channel()
+    let goc  = channel()
+
+    let ca = fn() _gated_run1(ra, ready_ch, goa)
+    let cb = fn() _tworun_crasher(rb, ready_ch, gobr1, gobr2)
+    let cc = fn() _gated_run1(rc, ready_ch, goc)
+
+    let sup = sup_new("one_for_one", 5, 10)
+    child_add(sup, "a", ca, "transient", 5000)
+    child_add(sup, "b", cb, "transient", 5000)
+    child_add(sup, "c", cc, "transient", 5000)
+    sup_start(sup)
+
+    _wait_n(ready_ch, 3)
+    // Crash b (a and c are alive but NOT affected by one_for_one)
+    send(gobr1, 1)
+    // Only b restarts; wait for new b to send ready
+    _wait_n(ready_ch, 1)
+
+    // Release a and c (they were never restarted)
+    send(goa, 1)
+    send(goc, 1)
+    // Release round 2 b
+    send(gobr2, 1)
+
+    sleep(100)
+
+    let vra = atomic_get(ra)
+    let vrb = atomic_get(rb)
+    let vrc = atomic_get(rc)
+    if vra != 1
+        print("FAIL one_for_one compat: a should run 1x got " + str(vra))
+        exit(1)
+    if vrb != 2
+        print("FAIL one_for_one compat: b should run 2x got " + str(vrb))
+        exit(1)
+    if vrc != 1
+        print("FAIL one_for_one compat: c should run 1x got " + str(vrc))
+        exit(1)
+    print("PASS one_for_one compat (a=" + str(vra) + "x b=" + str(vrb) + "x c=" + str(vrc) + "x)")
+
+// ── T4.11: on_terminate clean-stop hook ──────────────────────────────────────────────────────────
+// Register on_terminate before gen_start; gen_stop triggers callback with reason "normal".
+fn test_on_terminate()
+    let done_ch = channel()
+    let srv = server(0, _noop_handler)
+    let tfn = fn(s, r) _do_term_sweep(done_ch, r)
+    on_terminate(srv, tfn)
+    gen_start(srv)
+    gen_stop(srv)
+    let reason = receive(done_ch)
+    if reason != "normal"
+        print("FAIL on_terminate: expected 'normal' got '" + reason + "'")
+        exit(1)
+    print("PASS on_terminate (callback ran with reason='normal' on gen_stop)")
+
+// ── T4.15: application root ──────────────────────────────────────────────────────────────────────
+fn _app_bump(counter)
+    atomic_add(counter, 1)
+
+fn test_application()
+    let counter = atomic_new(0)
+    let app = application("sweep_app")
+    let w = fn() _app_bump(counter)
+    app_child(app, "w1", w, "transient", 5000)
+    app_child(app, "w2", w, "transient", 5000)
+    if sup_child_count(app_supervisor(app)) != 2
+        print("FAIL application: child count should be 2")
+        exit(1)
+    app_start(app)
+    sleep(150)
+    let cv = atomic_get(counter)
+    if cv != 2
+        print("FAIL application: both children should have run (counter=" + str(cv) + ")")
+        exit(1)
+    let reg = app_registry(app)
+    reg_put(reg, "svc", 99)
+    let found = reg_get(reg, "svc")
+    if found != 99
+        print("FAIL application: whereis 'svc' expected 99 got " + str(found))
+        exit(1)
+    print("PASS application (2 supervised children ran; registry start/whereis working)")
+
+fn main()
+    test_one_for_all()
+    test_rest_for_one()
+    test_one_for_one_compat()
+    test_on_terminate()
+    test_application()
+    print("forge_otp_sweep_test passed")

@@ -92,11 +92,158 @@ fn _supervise_one(sup, idx)
 fn sup_start(sup) -> int
     let specs = sup["specs"]
     let n = len(specs)
+    let strategy = sup["strategy"]
+    if strategy == "one_for_all" or strategy == "rest_for_one"
+        spawn _supervise_multi(sup)
+        return n
     let i = 0
     while i < n
         spawn _supervise_one(sup, i)
         i = i + 1
     n
+
+// ── one_for_all / rest_for_one supervision (T4.3) ────────────────────────────────────────────────
+// A centralized supervisor loop manages ALL children together via a shared DOWN channel. Each child
+// has a watcher task that monitors it and forwards exit notifications to the supervisor. When a child
+// exits, the supervisor applies the strategy:
+//   one_for_all:  (re)start ALL children in the set
+//   rest_for_one: (re)start the crashed child + every child started AFTER it (in spec order)
+// Backward-compatible: one_for_one still uses _supervise_one (independent per-child loops).
+//
+// TERMINATION LIMITATION (NOVA has no preemptive kill): "restart" here means SPAWN A FRESH INSTANCE.
+// A healthy sibling being force-replaced is NOT stopped -- its old process keeps running until it exits
+// on its own (its stale DOWN is discarded via the generation check). So use one_for_all / rest_for_one
+// only with children that SELF-TERMINATE or are stop-signal-aware; long-running non-terminating children
+// leave the old instance lingering. True terminate-then-restart needs a runtime linked-exit primitive
+// (TRACKED). one_for_one is unaffected (each child restarted only when it exits by itself).
+//
+// WATCHER TASK: watches one child process and sends [idx, exit_status, gen] to the central down_ch.
+// `gen` is the generation counter for this particular launch — stale DOWNs from replaced siblings
+// (one_for_all / rest_for_one forcibly replaces still-running children) are identified by a
+// mismatched generation and silently dropped by the central loop. Must be a top-level named fn
+// (spawned from a spawned loop -> must be `spawn named_fn`, not closure).
+fn _child_watcher(p, idx, gen, down_ch)
+    let m = monitor(p)
+    let st = receive(m)
+    send(down_ch, [idx, st, gen])
+
+// _child_should_restart(restart_policy, exit_status): true when this child's policy demands restart
+// given exit_status (0=normal, 1=crash). Mirrors the one_for_one logic.
+fn _child_should_restart(restart_policy: string, exit_status: int) -> bool
+    if exit_status == 0
+        restart_policy == "permanent"
+    else
+        restart_policy != "temporary"
+
+// The centralized multi-strategy supervisor loop. Tracks per-child generation counters, restart
+// stamps, and alive status. When all children have permanently retired the loop exits.
+// Strategy "one_for_all" or "rest_for_one" is read from sup["strategy"].
+//
+// STALE DOWN HANDLING: when one_for_all/rest_for_one forces-replaces a still-running sibling, the
+// old process eventually exits and its watcher fires a DOWN. That DOWN carries the OLD generation
+// number; the central loop discards it (generation mismatch) and does NOT decrement active a
+// second time. This is the generation-counter pattern used by Go's context cancellation and Erlang's
+// process reference tracking -- a lightweight logical clock that makes stale signals harmless.
+fn _supervise_multi(sup)
+    let specs = sup["specs"]
+    let n = len(specs)
+    let max_r = sup["max_restarts"]
+    let window_ms = sup["in_seconds"] * 1000
+    let strategy = sup["strategy"]
+    let down_ch = channel()
+    // stamps: per-child restart timestamp history (for windowed intensity)
+    let stamps = []
+    // gens: per-child generation counter (incremented each restart)
+    let gens = []
+    // alive: per-child boolean (1=active slot, 0=permanently retired)
+    let alive = []
+    let i = 0
+    while i < n
+        push(stamps, [])
+        push(gens, 0)
+        push(alive, 1)
+        i = i + 1
+    // Start all children; each child gets gen=0 watcher
+    let k = 0
+    while k < n
+        let start_fn = specs[k][1]
+        let p = spawn _run_child(start_fn)
+        spawn _child_watcher(p, k, 0, down_ch)
+        k = k + 1
+    // Central supervision loop
+    let active = n
+    while active > 0
+        let evt = receive(down_ch)
+        let cidx = evt[0]
+        let exit_status = evt[1]
+        let evt_gen = evt[2]
+        // Stale DOWN: this child slot was replaced (generation advanced) — discard silently.
+        // live_evt: 1 = current generation (process normally), 0 = stale (skip all restart logic).
+        let live_evt = 0
+        if evt_gen == gens[cidx]
+            live_evt = 1
+        if live_evt == 1
+            // This child slot is now vacant
+            alive[cidx] = 0
+            active = active - 1
+            let crashed_pol = specs[cidx][2]
+            // Does the crashed child itself want to restart given the exit_status?
+            // (Erlang OTP: the cascade -- affecting siblings -- only fires when the crashed
+            // child would itself restart. A transient child exiting normally just retires
+            // without touching siblings, even under one_for_all / rest_for_one.)
+            let crashed_wants_restart = _child_should_restart(crashed_pol, exit_status)
+            // Collect which child slots to restart
+            let restart_indices = []
+            if strategy == "one_for_all"
+                if crashed_wants_restart == true
+                    // Restart the crashed child + ALL alive siblings (force-replace them)
+                    let oi = 0
+                    while oi < n
+                        let pol = specs[oi][2]
+                        if oi == cidx
+                            push(restart_indices, oi)
+                        else
+                            // Force-replace running sibling if policy allows
+                            if alive[oi] == 1 and pol != "temporary"
+                                push(restart_indices, oi)
+                                // Pre-emptively retire so stale DOWNs are discarded (gen check)
+                                alive[oi] = 0
+                                active = active - 1
+                        oi = oi + 1
+            else
+                if crashed_wants_restart == true
+                    // rest_for_one: restart crashed child + all children STARTED AFTER it
+                    let ri = 0
+                    while ri < n
+                        let pol = specs[ri][2]
+                        if ri == cidx
+                            push(restart_indices, ri)
+                        else if ri > cidx
+                            if alive[ri] == 1 and pol != "temporary"
+                                push(restart_indices, ri)
+                                alive[ri] = 0
+                                active = active - 1
+                        ri = ri + 1
+            // Windowed intensity check for the crashed child
+            let intensity_ok = 1
+            let cstamps = stamps[cidx]
+            push(cstamps, time_ms())
+            stamps[cidx] = cstamps
+            if restart_intensity_exceeded(stamps[cidx], time_ms(), max_r, window_ms)
+                intensity_ok = 0
+            // (Re)start each child in restart_indices
+            if intensity_ok == 1
+                let rk = 0
+                while rk < len(restart_indices)
+                    let ridx = restart_indices[rk]
+                    let new_gen = gens[ridx] + 1
+                    gens[ridx] = new_gen
+                    let sfn = specs[ridx][1]
+                    let np = spawn _run_child(sfn)
+                    spawn _child_watcher(np, ridx, new_gen, down_ch)
+                    alive[ridx] = 1
+                    active = active + 1
+                    rk = rk + 1
 
 // ── GenServer (typed-message dispatch over a request channel) ─────────────────────────────────────
 // A stateful server process. Messages are dispatched to handlers by their RUNTIME TYPE (type_of(msg),
