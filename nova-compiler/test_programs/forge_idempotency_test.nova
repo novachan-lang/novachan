@@ -1,0 +1,48 @@
+// forge_idempotency_test -- D7r.3 HTTP reliability: If-Match OCC (412) + Idempotency-Key dedup.
+// Socket-free (dispatch_test). if_match_check enforces optimistic concurrency. For idempotency, the handler
+// returns a RANDOM body per execution: a retry with the same key must replay the IDENTICAL cached body
+// (proving the handler did NOT re-run -> no double side-effect); a different key must produce a fresh body.
+import forge
+
+// Each execution yields a fresh random body, so "same body" == "was replayed, not re-run".
+fn _pay(req: Request) -> Response
+    forge.resp_text(201, "charge-" + str(random_int(1, 2000000000)))
+
+fn main()
+    // ── If-Match OCC (412) ──────────────────────────────────────────────────────────────────────────
+    let etag = "v1"
+    assert(forge.if_match_check(forge.build_request("PUT /d HTTP/1.1\r\nIf-Match: v1\r\n\r\n", 0), etag) == 0, "If-Match matches current -> proceed")
+    assert(forge.if_match_check(forge.build_request("PUT /d HTTP/1.1\r\nIf-Match: v0\r\n\r\n", 0), etag) == 412, "If-Match stale -> 412 (lost-update blocked)")
+    assert(forge.if_match_check(forge.build_request("PUT /d HTTP/1.1\r\nIf-Match: *\r\n\r\n", 0), etag) == 0, "If-Match: * (any existing) -> proceed")
+    assert(forge.if_match_check(forge.build_request("PUT /d HTTP/1.1\r\nIf-None-Match: *\r\n\r\n", 0), "v1") == 412, "If-None-Match: * but resource exists -> 412")
+    assert(forge.if_match_check(forge.build_request("PUT /d HTTP/1.1\r\nIf-None-Match: *\r\n\r\n", 0), "") == 0, "If-None-Match: * and absent -> create ok")
+    assert(forge.if_match_check(forge.build_request("PUT /d HTTP/1.1\r\n\r\n", 0), etag) == 0, "no precondition -> proceed")
+    print("PASS: if_match_check OCC (match/stale/create/absent/none)")
+
+    // ── Idempotency-Key dedup ───────────────────────────────────────────────────────────────────────
+    let store = forge.idempotency_store()
+    let app = forge.app()
+    forge.use(app, forge.mw_idempotent(store))
+    forge.post(app, "/pay", _pay)
+
+    let r1 = forge.dispatch_test(app, forge.build_request("POST /pay HTTP/1.1\r\nIdempotency-Key: abc\r\nContent-Length: 3\r\n\r\namt", 0))
+    assert(forge.status_of(r1) == 201, "first keyed request -> 201")
+    let b1 = forge.body_of(r1)
+    print("PASS: first keyed request runs the handler")
+
+    let r2 = forge.dispatch_test(app, forge.build_request("POST /pay HTTP/1.1\r\nIdempotency-Key: abc\r\nContent-Length: 3\r\n\r\namt", 0))
+    assert(forge.status_of(r2) == 201, "retry -> 201")
+    assert(forge.body_of(r2) == b1, "retry REPLAYS the identical cached body (handler NOT re-run) [" + forge.body_of(r2) + " vs " + b1 + "]")
+    print("PASS: retry with same key replays cached response (no double side-effect)")
+
+    let r3 = forge.dispatch_test(app, forge.build_request("POST /pay HTTP/1.1\r\nIdempotency-Key: def\r\nContent-Length: 3\r\n\r\namt", 0))
+    assert(forge.status_of(r3) == 201, "new key -> 201")
+    assert(forge.body_of(r3) != b1, "a DIFFERENT key runs the handler again (fresh body)")
+    print("PASS: a distinct key is a distinct operation")
+
+    let r4 = forge.dispatch_test(app, forge.build_request("POST /pay HTTP/1.1\r\nContent-Length: 3\r\n\r\namt", 0))
+    assert(forge.status_of(r4) == 201 and forge.body_of(r4) != b1, "no Idempotency-Key -> handler runs (pass-through, fresh body)")
+    print("PASS: requests without an Idempotency-Key pass through")
+
+    forge.idempotency_store_stop(store)
+    print("forge_idempotency_test passed")

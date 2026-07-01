@@ -2645,6 +2645,95 @@ fn negotiate_lang(req: Request, supported: list) -> string
 fn etag_for(body: string) -> string
     chr(34) + sha256(body) + chr(34)
 
+// ── HTTP reliability: If-Match OCC (412) + Idempotency-Key dedup (D7r.3) ──────────────────────────────
+// if_match_check(req, current_etag) -> 0 to proceed, or 412 for a failed precondition (RFC 7232). The
+// HTTP-native lost-update fix: an edit carries If-Match: <etag-it-read>; if the resource changed since
+// (current_etag differs) you get 412 instead of silently clobbering. If-None-Match: * asserts "create only
+// if absent" (current_etag == "" means the resource does not exist yet). No precondition -> proceed.
+// current_etag is the resource's STRONG etag NOW (etag_for(...)); "" means does-not-exist.
+fn if_match_check(req: Request, current_etag: string) -> int
+    let ifm = req_header(req, "if-match")
+    if len(ifm) > 0
+        if ifm != "*" and ifm != current_etag
+            return 412
+    if req_header(req, "if-none-match") == "*"
+        if len(current_etag) > 0
+            return 412
+    0
+
+// Idempotency-Key store: a single-owner ACTOR mapping the client's Idempotency-Key -> the cached response
+// [status, body, content-type]. N>1-safe (only the actor touches the cache; keys are born in the loop,
+// avoiding the deep-copied-dict new-key hazard). Pair with mw_idempotent.
+fn _idem_loop(st)
+    let cache = {}
+    let running = 1
+    while running == 1
+        let env = receive(st["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "get"
+            if contains(cache, env["key"])
+                send(env["reply"], cache[env["key"]])
+            else
+                send(env["reply"], [])
+        else if op == "put"
+            cache[env["key"]] = env["val"]
+
+fn idempotency_store() -> any
+    let st = {}
+    st["req"] = channel()
+    spawn _idem_loop(st)
+    st
+
+fn _idem_get(store, key: string) -> list
+    let rc = channel()
+    let env = {}
+    env["op"] = "get"
+    env["key"] = key
+    env["reply"] = rc
+    send(store["req"], env)
+    receive(rc)
+
+fn _idem_put(store, key: string, val: list)
+    let env = {}
+    env["op"] = "put"
+    env["key"] = key
+    env["val"] = val
+    env["reply"] = 0
+    send(store["req"], env)
+
+fn idempotency_store_stop(store)
+    let env = {}
+    env["op"] = "stop"
+    env["reply"] = 0
+    send(store["req"], env)
+
+// mw_idempotent(store): dedup mutating requests by the Idempotency-Key header. The FIRST request with a
+// given key runs the handler and caches [status, body, content-type]; a RETRY with the same key REPLAYS the
+// cached response WITHOUT re-running the handler -- so a client retrying a POST (dropped response / timeout)
+// never doubles the side-effect. Requests without the header pass through unchanged. The replay carries an
+// Idempotent-Replay: true header so the caller can tell a replay from a fresh result.
+fn _t_idempotent(req: Request, next, store) -> Response
+    let k = req_header(req, "idempotency-key")
+    if len(k) == 0
+        return next(req)
+    let cached = _idem_get(store, k)
+    if len(cached) == 3
+        let h = {}
+        h["Content-Type"] = cached[2]
+        h["Idempotent-Replay"] = "true"
+        return Response(cached[0], h, cached[1], false, [])
+    let resp = next(req)
+    let ct = ""
+    if contains(resp.headers, "Content-Type")
+        ct = resp.headers["Content-Type"]
+    _idem_put(store, k, [resp.status, resp.body, ct])
+    resp
+
+fn mw_idempotent(store)
+    return fn(req, next) _t_idempotent(req, next, store)
+
 // Conditional GET for a dynamic response: hash the body into a strong ETag, attach the ETag header, and if
 // the client's If-None-Match already matches, return 304 Not Modified (empty body) -- the client keeps its
 // cached copy and you save re-sending the payload. Pass-through for non-GET/HEAD, non-200, or binary bodies
