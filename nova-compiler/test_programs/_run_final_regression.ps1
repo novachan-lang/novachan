@@ -192,6 +192,7 @@ $domain_tests = @(
     'forge_session_test',
     'forge_csrf_test',
     'forge_jwt_test',
+    'forge_auth_sweep_test',
     'forge_validate_test',
     'forge_validate_typed_test',
     'forge_gzip_test',

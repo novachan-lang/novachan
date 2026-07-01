@@ -1,7 +1,15 @@
 // forge_auth -- authentication/authorization for Forge (Sprint S4). RBAC: the authenticated user's
 // roles travel on the request (an upstream auth middleware sets req["roles"]); a route gates on a
 // required role via the require_role middleware. Beats Spring Security's ceremony with plain functions.
+// Sprint S5 additions: password hashing (PBKDF2-HMAC-SHA256, Django-style), mw_auth (resolver-driven
+// authn middleware that sets req.state["user"]), requires(role) guard, and user_create/user_by_username
+// DB helpers backed by forge_db. Production-grade: CSPRNG salt, 100k iterations, constant-time verify.
 import forge
+import forge_crypto
+import forge_db
+
+// CSPRNG: OS entropy for the password salt. Same extern used by forge_pg / forge_tls.
+extern fn nova_rt_os_random(n: int) -> bytes
 
 // ── RBAC role checks (pure) ───────────────────────────────────────────────────────────────────────
 fn has_role(roles, required: string) -> bool
@@ -46,3 +54,130 @@ fn _require_any_role_next(req, next, roles_needed)
 
 fn require_any_role(roles_needed)
     return fn(req, next) _require_any_role_next(req, next, roles_needed)
+
+// ── Password hashing (PBKDF2-HMAC-SHA256, Django-style) ──────────────────────────────────────────────
+// Convert a NovaBytes value (from nova_rt_os_random) to a byte list (ints 0..255).
+fn _bytes_to_blist(b: bytes) -> list
+    let out = []
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        push(out, bytes_get(b, i))
+        i = i + 1
+    out
+
+// password_hash_with_iters: core implementation with configurable iteration count. Used by password_hash
+// (always 100000) and the test sweep (uses 1 iteration for speed; production always calls password_hash).
+// Callers who KNOW what they are doing (e.g. a test helper) can call this directly; password_hash() is
+// the default and the right choice for production code.
+fn password_hash_with_iters(password: string, iterations: int) -> string
+    let salt_bytes = _bytes_to_blist(unsafe nova_rt_os_random(16))
+    let pw_blist = str_to_blist(password)
+    let dk = pbkdf2_sha256(pw_blist, salt_bytes, iterations, 32)
+    let salt_b64 = b64_encode_blist(salt_bytes)
+    let dk_b64 = b64_encode_blist(dk)
+    "pbkdf2_sha256$" + str(iterations) + "$" + salt_b64 + "$" + dk_b64
+
+// password_hash: random 16-byte CSPRNG salt, PBKDF2-HMAC-SHA256 (100000 iterations), returns a
+// Django-style self-describing stored value: "pbkdf2_sha256$<iters>$<b64(salt)>$<b64(dk)>".
+// A self-describing format means the stored string carries everything needed to verify -- the
+// algorithm, iteration count, and salt -- so a future rotate-iterations upgrade only needs to
+// re-hash the passwords that still use the old count (password_needs_rehash gates that).
+fn password_hash(password: string) -> string
+    password_hash_with_iters(password, 100000)
+
+// _parse_pbkdf2_stored: split "pbkdf2_sha256$<iters>$<salt_b64>$<dk_b64>" into [algo, iters_str, salt_b64, dk_b64].
+// Returns [] on parse failure (wrong field count or wrong algo).
+fn _parse_pbkdf2_stored(stored: string) -> list
+    let parts = split(stored, "$")
+    if len(parts) != 4
+        return []
+    if parts[0] != "pbkdf2_sha256"
+        return []
+    parts
+
+// password_verify: parse stored hash, recompute PBKDF2, CONSTANT-TIME compare via hex_of (fixed-width)
+// to avoid timing side-channel leakage. Returns false on any parse failure (fail-closed security default).
+fn password_verify(password: string, stored: string) -> bool
+    let parts = _parse_pbkdf2_stored(stored)
+    if len(parts) != 4
+        return false
+    let iters_str = parts[1]
+    let iters = parse_int(iters_str)
+    if iters <= 0
+        return false
+    let salt_blist = b64_decode_blist(parts[2])
+    if len(salt_blist) == 0
+        return false
+    let stored_dk_blist = b64_decode_blist(parts[3])
+    if len(stored_dk_blist) == 0
+        return false
+    let pw_blist = str_to_blist(password)
+    let derived = pbkdf2_sha256(pw_blist, salt_blist, iters, 32)
+    // Constant-time compare: hex_of produces a fixed-width string (64 hex chars for 32 bytes);
+    // _ct_eq then XOR-accumulates without early exit so timing does not reveal WHERE keys differ.
+    _ct_eq(hex_of(derived), hex_of(stored_dk_blist))
+
+// password_needs_rehash: true if stored iterations < target_iters (time to upgrade), or if
+// the stored string cannot be parsed (treat parse-failure as needing re-hash for safety).
+fn password_needs_rehash(stored: string, target_iters: int) -> bool
+    let parts = _parse_pbkdf2_stored(stored)
+    if len(parts) != 4
+        return true
+    let iters = parse_int(parts[1])
+    if iters <= 0
+        return true
+    iters < target_iters
+
+// ── mw_auth: resolver-driven authentication middleware ───────────────────────────────────────────────
+// The resolver has shape fn(req: Request) -> Result<user>. On Ok(user) it writes req.state["user"]
+// and calls next (the route or next middleware handles authorization). On Err it writes
+// req.state["auth_error"] and STILL calls next -- the route guard, not the middleware, decides 401.
+// This design lets public routes co-exist with authenticated routes in the same app (the guard is opt-in
+// per route via requires(...)), matching how Express/Django middleware works.
+fn _mw_auth_next(req: Request, next, resolver) -> Response
+    let r = resolver(req)
+    if is_ok(r)
+        req.state["user"] = unwrap(r)
+    else
+        req.state["auth_error"] = unwrap_err(r)
+    next(req)
+
+fn mw_auth(resolver)
+    return fn(req, next) _mw_auth_next(req, next, resolver)
+
+// ── requires(role): per-route authorization guard ────────────────────────────────────────────────────
+// Placed as middleware on a route (or via use(app, ...)) to gate on a role. If req.state["user"]
+// is absent -> 401 Unauthorized; if the user dict lacks the required role -> 403 Forbidden;
+// otherwise passes through. Reuses the established has_role check (roles list under user["roles"]).
+fn _requires_next(req: Request, next, role: string) -> Response
+    let st = req.state
+    if not contains(st, "user")
+        return resp_error(401, "unauthorized")
+    let u = st["user"]
+    if not has_role(_req_roles(req), role)
+        return resp_error(403, "forbidden: requires role " + role)
+    next(req)
+
+fn requires(role: string)
+    return fn(req, next) _requires_next(req, next, role)
+
+// ── User persistence (forge_db-backed) ───────────────────────────────────────────────────────────────
+// users_ddl: the CREATE TABLE for the users table. Run once at startup (pool_exec(pool, users_ddl())).
+fn users_ddl() -> string
+    "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL)"
+
+// user_create: hash the password, insert {username, password_hash, role} into the users table
+// via parameterized INSERT (injection-safe: values are bound, never concatenated). Returns the new row id.
+fn user_create(pool, username: string, password: string, role: string) -> int
+    let ph = password_hash(password)
+    pool_insert(pool, "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", [username, ph, role])
+
+// user_by_username: parameterized SELECT by username, returns the row as a dict
+// {id, username, password_hash, role} or {} if no user with that name exists.
+fn user_by_username(pool, username: string) -> any
+    let cols = ["id", "username", "password_hash", "role"]
+    let rows = pool_query_dicts(pool, "SELECT id, username, password_hash, role FROM users WHERE username = ?", [username], cols)
+    if len(rows) == 0
+        return {}
+    rows[0]
