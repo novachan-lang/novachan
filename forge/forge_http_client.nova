@@ -1,0 +1,215 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_http_client — outbound HTTP(S) client (D7r.1). Forge ships a server; a universal-comms
+// framework must also CALL OUT (service-to-service, webhooks, OAuth token endpoints, OTLP/SMTP,
+// upstream feeds). This composes the shipped substrate — tcp_connect + the netpoller + the TLS
+// externs (nova_rt_tls_*, verify-full) — into a real request/response client. It is the P3 unlock:
+// resilience decorators (.timeout/.retry/.circuit_breaker), WS/SSE consume, idempotency, and the
+// OTLP/SMTP exporters all layer ON this.
+//
+// v1 scope: all methods, custom headers, request body, https with certificate verification, chunked
+// response de-framing, read-to-EOF via `Connection: close`. Body is returned as a string (text/JSON —
+// the 95% client case). Follow-ups: keep-alive + connection pool, an app-level read deadline on the TLS
+// path (plaintext honours `timeout_ms`), and a bytes body for binary downloads.
+// ══════════════════════════════════════════════════════════════════════════════
+
+extern fn nova_rt_tls_upgrade(sock: int, host: string, verify: int) -> int
+extern fn nova_rt_tls_send_bytes(handle: int, b: bytes) -> int
+extern fn nova_rt_tls_recv_bytes(handle: int) -> bytes
+
+type HttpResponse
+    status: int
+    headers: dict
+    body: string
+
+// Parse "scheme://host[:port][/path]" -> [scheme, host, port, path]. Defaults: scheme http, port 80
+// (443 for https), path "/". Query strings ride along inside `path` (the first '/' starts the path).
+fn parse_url(url: string) -> list
+    let scheme = "http"
+    let rest = url
+    if starts_with(url, "https://")
+        scheme = "https"
+        rest = slice(url, 8, len(url))
+    else if starts_with(url, "http://")
+        rest = slice(url, 7, len(url))
+    let slash = find(rest, "/")
+    let hostport = rest
+    let path = "/"
+    if slash >= 0
+        hostport = slice(rest, 0, slash)
+        path = slice(rest, slash, len(rest))
+    let host = hostport
+    let port = 80
+    if scheme == "https"
+        port = 443
+    let colon = find(hostport, ":")
+    if colon >= 0
+        host = slice(hostport, 0, colon)
+        let pr = parse_int_safe(slice(hostport, colon + 1, len(hostport)))
+        if is_ok(pr)
+            port = unwrap(pr)
+    [scheme, host, port, path]
+
+// Hex chunk-size -> int (lowercased; stops at the first non-hex char, e.g. a ';' chunk-extension).
+fn _hexint(s: string) -> int
+    let v = 0
+    let i = 0
+    let digits = "0123456789abcdef"
+    let t = lower(s)
+    while i < len(t)
+        let d = find(digits, slice(t, i, i + 1))
+        if d < 0
+            i = len(t)
+        else
+            v = v * 16 + d
+            i = i + 1
+    v
+
+// Decode a chunked (RFC 7230 §4.1) response body: repeated "<hexsize>[;ext]\r\n<data>\r\n" until a
+// zero-size chunk. Returns the concatenated data. Malformed framing stops decoding (returns what it has).
+fn _dechunk(s: string) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let j = i
+        while j + 1 < n and slice(s, j, j + 2) != "\r\n"
+            j = j + 1
+        let size = _hexint(slice(s, i, j))
+        if size <= 0
+            return out
+        let start = j + 2
+        if start + size > n
+            return out
+        out = out + slice(s, start, start + size)
+        i = start + size + 2
+    out
+
+// Parse a raw HTTP response into HttpResponse{status, headers(lowercased name->value), body}.
+fn parse_response(raw: string) -> HttpResponse
+    let he = find(raw, "\r\n\r\n")
+    if he < 0
+        return HttpResponse(0, {}, raw)
+    let header_part = slice(raw, 0, he)
+    let body_part = slice(raw, he + 4, len(raw))
+    let lines = split(header_part, "\r\n")
+    let status = 0
+    if len(lines) > 0
+        let sl = lines[0]
+        // "HTTP/1.1 200 OK" -> the token after the first space
+        let sp = find(sl, " ")
+        if sp >= 0
+            let rest = slice(sl, sp + 1, len(sl))
+            let sp2 = find(rest, " ")
+            let code = rest
+            if sp2 >= 0
+                code = slice(rest, 0, sp2)
+            let cr = parse_int_safe(code)
+            if is_ok(cr)
+                status = unwrap(cr)
+    let hdrs = {}
+    let li = 1
+    while li < len(lines)
+        let line = lines[li]
+        let c = find(line, ":")
+        if c > 0
+            let name = lower(trim(slice(line, 0, c)))
+            let value = trim(slice(line, c + 1, len(line)))
+            hdrs[name] = value
+        li = li + 1
+    let body = body_part
+    if contains(hdrs, "transfer-encoding") and find(lower(hdrs["transfer-encoding"]), "chunked") >= 0
+        body = _dechunk(body_part)
+    HttpResponse(status, hdrs, body)
+
+// The default Host-header value: bare host for a default port, host:port otherwise (RFC 7230 §5.4).
+fn _host_header(scheme: string, host: string, port: int) -> string
+    if scheme == "https" and port == 443
+        return host
+    if scheme == "http" and port == 80
+        return host
+    host + ":" + str(port)
+
+// http_request(method, url, headers, body) -> Result<HttpResponse>. `headers` is a dict of extra request
+// headers (Host + Content-Length + Connection are set automatically). For https the socket is upgraded with
+// certificate verification (verify=1). Returns err on connect/TLS/handshake failure.
+fn http_request(method: string, url: string, headers: dict, body: string) -> Result<HttpResponse>
+    let u = parse_url(url)
+    let scheme = u[0]
+    let host = u[1]
+    let port = u[2]
+    let path = u[3]
+    let sock = tcp_connect(host, port)
+    if sock <= 0
+        return err("connect failed: " + host + ":" + str(port))
+    let is_tls = scheme == "https"
+    let tls = 0
+    if is_tls
+        tls = unsafe nova_rt_tls_upgrade(sock, host, 1)
+        if tls <= 0
+            tcp_close(sock)
+            return err("tls handshake failed: " + host)
+
+    let req = method + " " + path + " HTTP/1.1\r\nHost: " + _host_header(scheme, host, port) + "\r\n"
+    let hk = keys(headers)
+    let ki = 0
+    while ki < len(hk)
+        let k = hk[ki]
+        req = req + k + ": " + headers[k] + "\r\n"
+        ki = ki + 1
+    if len(body) > 0
+        req = req + "Content-Length: " + str(len(body)) + "\r\n"
+    req = req + "Connection: close\r\n\r\n" + body
+
+    if is_tls
+        unsafe nova_rt_tls_send_bytes(tls, str_to_bytes(req))
+    else
+        tcp_send(sock, req)
+
+    // Read to EOF: `Connection: close` makes the server close after the full response, so read-until-empty
+    // yields exactly the message (no Content-Length/keep-alive framing needed at v1).
+    let raw = ""
+    let alive = true
+    while alive
+        if is_tls
+            let b = unsafe nova_rt_tls_recv_bytes(tls)
+            if bytes_len(b) == 0
+                alive = false
+            else
+                raw = raw + bytes_to_str(b)
+        else
+            let c = tcp_recv(sock)
+            if len(c) == 0
+                alive = false
+            else
+                raw = raw + c
+    tcp_close(sock)
+    ok(parse_response(raw))
+
+// ── Convenience wrappers ────────────────────────────────────────────────────────────────────────────
+fn http_get(url: string) -> Result<HttpResponse>
+    http_request("GET", url, {}, "")
+
+fn http_get_h(url: string, headers: dict) -> Result<HttpResponse>
+    http_request("GET", url, headers, "")
+
+fn http_post(url: string, body: string) -> Result<HttpResponse>
+    http_request("POST", url, {}, body)
+
+// POST a JSON body (sets Content-Type: application/json).
+fn http_post_json(url: string, body: string) -> Result<HttpResponse>
+    let h = {}
+    h["Content-Type"] = "application/json"
+    http_request("POST", url, h, body)
+
+fn http_put(url: string, body: string) -> Result<HttpResponse>
+    http_request("PUT", url, {}, body)
+
+fn http_delete(url: string) -> Result<HttpResponse>
+    http_request("DELETE", url, {}, "")
+
+// Read a response header (lowercased lookup); "" if absent.
+fn resp_header(r: HttpResponse, name: string) -> string
+    let k = lower(name)
+    if contains(r.headers, k)
+        return r.headers[k]
+    ""

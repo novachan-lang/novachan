@@ -30,9 +30,16 @@ The tables in §2–§6 were last reconciled *before* the 2026-06/07 Forge sprin
 **Static hardening (Sprint S0 / Layer 1):**
 - **Symlink/realpath containment (B7) → FIXED** (`f79e47b`): new runtime `nova_rt_path_within` (POSIX `realpath` / Windows `GetFinalPathNameByHandle`, fail-closed) + `path_within` re-check in the static serve path — a symlink escaping the mount is 404'd (proven live with a junction). The §3/§4-B7 caveat is closed.
 
-**OTP (Sprint S2 / Layer 4):** `one_for_all` + `rest_for_one` strategies + `on_terminate` shipped (`forge_otp`).
+**OTP (Sprint S2 / Layer 4):** `one_for_all` + `rest_for_one` strategies + `on_terminate` shipped (`forge_otp`); a GenServer `server(initial_state, handler)` primitive exists (`forge_otp`).
 
-**Still open (accurate):** LiveView (render-differ + GenServer `on_info`), observability (S3), interfaces #8 (S6), HTTP/2 (S7), gRPC/GraphQL (S8), messaging/resilience (S10), distribution (S11), auto-admin (S12), WASM (S13); and within S0/S1: read/idle timeout (B1), accept-loop conn-cap *wiring* (T1.6), route-param decode (B2), `with tx {}`, full query-DSL/migrations polish, `nova new` scaffold (B9).
+**ALSO already built — verified present 2026-07-01 (the old §3/§4/§5 tables miss these; each has source + a test file, full per-item re-gate is the §11 G3 doc task):**
+- **S0/L1 production floor is largely DONE, not open:** read/idle timeout **B1 CLOSED** (`recv_request_bin` enforces a netpoller-parked wall-clock deadline, default 30s, via `_wait_or_timeout` — a slow client is dropped); route-param percent-decode **B2 CLOSED** (`_fr_match` `_pct_decode`s `:param` + `*catch`; `forge_pctdecode_test`); accept-storm cap **B4 CLOSED** (`_conn_sem`/`_acceptor`/`_handle_req_capped` channel-semaphore parks excess accepts — backpressure, not 503-drop; default 10k); explicit **413** (`mw_limit_body` + `_max_body`); graceful drain (listener-close → acceptor exits).
+- **Observability (S3/L8) present** (`forge_obs`): Prometheus `/metrics` (`metrics_registry`/`metrics_prometheus`), `/healthz` + `/readyz` (`obs_routes`/`readyz_route`), `log_json`.
+- **LiveView (S5/L5) present** (`live_ws`/`live_conn`/`_live_frame_pump`; `forge_live_conn_test`, `forge_live_client_test`) — the S5 crown-jewel substrate is further along than the doc's ⬜.
+- **Background jobs (S2/L4)** (`forge_jobs_test`); **lexical-ish transactions** via `with_tx(pool, body_fn)` (`forge_db`) + `pg_with_tx` (`forge_pg`) — the *function* form (the `with tx {}` compiler sugar is the only remainder).
+- **Outbound HTTP(S) client (D7r.1) NEW this session** (`forge_http_client`): methods/headers/body, https verify-full, chunked de-framing, loopback GET+POST proven (`forge_http_client_test`). Unlocks the P3 resilience chain.
+
+**Still genuinely open (accurate):** the `with tx {}` compiler sugar, full query-DSL/migrations polish, `nova new` scaffold (B9); LiveView render-differ completeness + GenServer `on_info`; the P3 resilience decorators (timeout/retry/circuit-breaker) + WS/SSE **consume** client + idempotency + OTLP/SMTP (now unblocked by the outbound client); and the XL frontier — interfaces #8 (S6), HTTP/2 (S7), gRPC/GraphQL (S8), message queues (S10), distribution/`remote_spawn` (S11), auto-admin (S12), WASM frontend (S13).
 
 ---
 

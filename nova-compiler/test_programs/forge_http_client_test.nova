@@ -1,0 +1,81 @@
+// forge_http_client_test -- outbound HTTP client (D7r.1). Two layers:
+// (1) DETERMINISTIC parse coverage (no socket): parse_url, parse_response (status/headers/body + chunked
+//     de-framing), resp_header. This is where the logic bugs live.
+// (2) LOOPBACK round-trip: a real GET/POST over TCP against Forge's OWN server (serve_req_n handles a
+//     bounded number of connections then returns) -- proves connect+send+read-to-EOF+parse end to end.
+// The https/TLS code path uses the same nova_rt_tls_* externs proven live by forge_pg.
+import forge
+import forge_http_client
+
+// Typed handlers: a field access (req.body) needs a KNOWN param type so `.body` resolves to Request's
+// slot (an untyped closure param falls back to the global field map -> wrong slot; see B12).
+fn _ping(req: Request) -> string
+    "pong-from-forge"
+
+fn _echo(req: Request) -> string
+    req.body
+
+fn _client(port: int, rch)
+    sleep(60)
+    let a = forge_http_client.http_get("http://127.0.0.1:" + str(port) + "/ping")
+    send(rch, a)
+    let b = forge_http_client.http_post("http://127.0.0.1:" + str(port) + "/echo", "hello-body")
+    send(rch, b)
+
+fn main()
+    // ── (1) deterministic parse coverage ────────────────────────────────────────────────────────────
+    let u = forge_http_client.parse_url("http://example.com/a/b?x=1")
+    assert(u[0] == "http" and u[1] == "example.com" and u[2] == 80 and u[3] == "/a/b?x=1", "parse http default port + path+query")
+    let us = forge_http_client.parse_url("https://api.host.io:8443/v1/things")
+    assert(us[0] == "https" and us[1] == "api.host.io" and us[2] == 8443 and us[3] == "/v1/things", "parse https explicit port")
+    let ub = forge_http_client.parse_url("https://only.host")
+    assert(ub[0] == "https" and ub[1] == "only.host" and ub[2] == 443 and ub[3] == "/", "parse https default port + empty path")
+    print("PASS: parse_url (scheme/host/port/path)")
+
+    let r200 = forge_http_client.parse_response("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-A: 1\r\n\r\nhi there")
+    assert(r200.status == 200, "status 200")
+    assert(r200.body == "hi there", "body extracted [" + r200.body + "]")
+    assert(forge_http_client.resp_header(r200, "content-type") == "text/plain", "header (lowercased lookup)")
+    assert(forge_http_client.resp_header(r200, "X-A") == "1", "header case-insensitive")
+    assert(forge_http_client.resp_header(r200, "missing") == "", "absent header -> empty")
+    print("PASS: parse_response status/headers/body")
+
+    // chunked de-framing: "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n" -> "hello world"
+    let rc = forge_http_client.parse_response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+    assert(rc.status == 200, "chunked status 200")
+    assert(rc.body == "hello world", "chunked de-framed [" + rc.body + "]")
+    print("PASS: parse_response chunked de-framing")
+
+    let r404 = forge_http_client.parse_response("HTTP/1.1 404 Not Found\r\n\r\nnope")
+    assert(r404.status == 404 and r404.body == "nope", "404 status + body")
+    print("PASS: parse_response 404")
+
+    // ── (2) loopback round-trip against a real Forge server ─────────────────────────────────────────
+    let app = forge.app()
+    forge.get(app, "/ping", _ping)
+    forge.post(app, "/echo", _echo)
+    let port = 18771
+    let rc2 = channel()
+    let ap = app
+    let p = port
+    sched_spawn(fn(z) forge.serve_req_n(ap, p, 2))
+    sleep(90)
+    let pp = port
+    let rcc = rc2
+    sched_spawn(fn(z) _client(pp, rcc))
+
+    let g = recv(rc2)
+    assert(is_ok(g), "GET /ping returned a response")
+    let gr = unwrap(g)
+    assert(gr.status == 200, "GET status 200 (got " + str(gr.status) + ")")
+    assert(gr.body == "pong-from-forge", "GET body [" + gr.body + "]")
+    print("PASS: loopback GET round-trip")
+
+    let po = recv(rc2)
+    assert(is_ok(po), "POST /echo returned a response")
+    let pr = unwrap(po)
+    assert(pr.status == 200, "POST status 200 (got " + str(pr.status) + ")")
+    assert(pr.body == "hello-body", "POST echoed body [" + pr.body + "]")
+    print("PASS: loopback POST round-trip (body echoed)")
+
+    print("forge_http_client_test passed")
