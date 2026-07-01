@@ -313,3 +313,78 @@ fn sse_next(s) -> Result<string>
 
 fn sse_close(s)
     tcp_close(s["sock"])
+
+// ── OTLP span exporter (OTLP/HTTP) — rides the outbound client (D7r.3/obs) ─────────────────────────────
+// Export tracing spans to an OpenTelemetry collector over OTLP/HTTP (POST <endpoint>/v1/traces). Each span
+// is a dict {trace_id (hex), span_id (hex), name, start_ns, end_ns}. Built as the OTLP protobuf-JSON mapping
+// (resourceSpans -> scopeSpans -> spans) via json_stringify (correct escaping); nanos are strings (int64
+// precision). This is the egress behind "automatic OTel" -- the trace propagation now has somewhere to go.
+fn otlp_spans_json(spans: list) -> string
+    let out = []
+    let i = 0
+    while i < len(spans)
+        let sp = spans[i]
+        let o = {}
+        o["traceId"] = sp["trace_id"]
+        o["spanId"] = sp["span_id"]
+        o["name"] = sp["name"]
+        o["kind"] = 2
+        o["startTimeUnixNano"] = str(sp["start_ns"])
+        o["endTimeUnixNano"] = str(sp["end_ns"])
+        push(out, o)
+        i = i + 1
+    let scope = {}
+    scope["spans"] = out
+    let rs = {}
+    rs["scopeSpans"] = [scope]
+    let root = {}
+    root["resourceSpans"] = [rs]
+    json_stringify(root)
+
+// POST the spans to an OTLP/HTTP collector. endpoint is the base (e.g. "http://localhost:4318"); the
+// standard traces path /v1/traces is appended. Returns the collector's HTTP response.
+fn otlp_export(endpoint: string, spans: list) -> Result<HttpResponse>
+    http_post_json(endpoint + "/v1/traces", otlp_spans_json(spans))
+
+// ── SMTP send_mail — outbound mail over TCP (D7r.3/obs) ────────────────────────────────────────────────
+// Build the RFC 5322 message (headers + body) that goes in the SMTP DATA phase.
+fn smtp_message(from_addr: string, to_addr: string, subject: string, body: string) -> string
+    "From: " + from_addr + "\r\nTo: " + to_addr + "\r\nSubject: " + subject + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + body
+
+fn _smtp_expect(sock: int, code: string) -> bool
+    starts_with(tcp_recv(sock), code)
+
+// send_mail(host, port, from, to, subject, body) -> Result<string>: a plaintext SMTP conversation
+// (220 greeting -> EHLO -> MAIL FROM -> RCPT TO -> DATA -> message + CRLF.CRLF -> QUIT). Aborts with err on
+// any unexpected reply code. v1 is plaintext (no STARTTLS/AUTH -- a follow-up over the same TLS externs the
+// client uses; and dot-stuffing of leading-dot body lines is a tracked follow-up).
+fn send_mail(host: string, port: int, from_addr: string, to_addr: string, subject: string, body: string) -> Result<string>
+    let sock = tcp_connect(host, port)
+    if sock <= 0
+        return err("smtp connect failed: " + host + ":" + str(port))
+    if not _smtp_expect(sock, "220")
+        tcp_close(sock)
+        return err("smtp: no 220 greeting")
+    tcp_send(sock, "EHLO forge\r\n")
+    if not _smtp_expect(sock, "250")
+        tcp_close(sock)
+        return err("smtp: EHLO rejected")
+    tcp_send(sock, "MAIL FROM:<" + from_addr + ">\r\n")
+    if not _smtp_expect(sock, "250")
+        tcp_close(sock)
+        return err("smtp: MAIL FROM rejected")
+    tcp_send(sock, "RCPT TO:<" + to_addr + ">\r\n")
+    if not _smtp_expect(sock, "250")
+        tcp_close(sock)
+        return err("smtp: RCPT TO rejected")
+    tcp_send(sock, "DATA\r\n")
+    if not _smtp_expect(sock, "354")
+        tcp_close(sock)
+        return err("smtp: DATA rejected")
+    tcp_send(sock, smtp_message(from_addr, to_addr, subject, body) + "\r\n.\r\n")
+    if not _smtp_expect(sock, "250")
+        tcp_close(sock)
+        return err("smtp: message rejected")
+    tcp_send(sock, "QUIT\r\n")
+    tcp_close(sock)
+    ok("sent")
