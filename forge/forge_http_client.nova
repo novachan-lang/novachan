@@ -129,10 +129,14 @@ fn _host_header(scheme: string, host: string, port: int) -> string
         return host
     host + ":" + str(port)
 
-// http_request(method, url, headers, body) -> Result<HttpResponse>. `headers` is a dict of extra request
-// headers (Host + Content-Length + Connection are set automatically). For https the socket is upgraded with
-// certificate verification (verify=1). Returns err on connect/TLS/handshake failure.
-fn http_request(method: string, url: string, headers: dict, body: string) -> Result<HttpResponse>
+// http_request_to(method, url, headers, body, timeout_ms) -> Result<HttpResponse>. `headers` is a dict of
+// extra request headers (Host + Content-Length + Connection are set automatically). For https the socket is
+// upgraded with certificate verification (verify=1). `timeout_ms` is an app-level read DEADLINE on the
+// plaintext path: a server that stalls mid-response is dropped with err("read timeout") instead of hanging
+// the caller (netpoller-parked wait, no busy-poll). timeout_ms <= 0 disables it. (TLS path: relies on the
+// OS/connect timeout at v1; compose a resilience .timeout decorator for a hard bound until the TLS read
+// deadline lands.) Returns err on connect/TLS/handshake failure or timeout.
+fn http_request_to(method: string, url: string, headers: dict, body: string, timeout_ms: int) -> Result<HttpResponse>
     let u = parse_url(url)
     let scheme = u[0]
     let host = u[1]
@@ -169,6 +173,8 @@ fn http_request(method: string, url: string, headers: dict, body: string) -> Res
     // yields exactly the message (no Content-Length/keep-alive framing needed at v1).
     let raw = ""
     let alive = true
+    let use_to = timeout_ms > 0 and scheme == "http"
+    let deadline = (clock_ns() / 1000000) + timeout_ms
     while alive
         if is_tls
             let b = unsafe nova_rt_tls_recv_bytes(tls)
@@ -177,6 +183,14 @@ fn http_request(method: string, url: string, headers: dict, body: string) -> Res
             else
                 raw = raw + bytes_to_str(b)
         else
+            if use_to
+                let remaining = deadline - (clock_ns() / 1000000)
+                if remaining <= 0
+                    tcp_close(sock)
+                    return err("read timeout")
+                if tcp_wait_readable(sock, remaining) <= 0
+                    tcp_close(sock)
+                    return err("read timeout")
             let c = tcp_recv(sock)
             if len(c) == 0
                 alive = false
@@ -184,6 +198,10 @@ fn http_request(method: string, url: string, headers: dict, body: string) -> Res
                 raw = raw + c
     tcp_close(sock)
     ok(parse_response(raw))
+
+// http_request with the default 30s read deadline (plaintext). Use http_request_to for a custom bound.
+fn http_request(method: string, url: string, headers: dict, body: string) -> Result<HttpResponse>
+    http_request_to(method, url, headers, body, 30000)
 
 // ── Convenience wrappers ────────────────────────────────────────────────────────────────────────────
 fn http_get(url: string) -> Result<HttpResponse>

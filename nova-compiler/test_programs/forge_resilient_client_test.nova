@@ -1,0 +1,67 @@
+// forge_resilient_client_test -- the P3 thesis made real: the resilience "zoo" (retry, circuit breaker,
+// timeout) are DECORATORS over an outbound call, not a transport. retryx/circuitx wrap a fn(attempt)->Result;
+// forge_http_client.http_request returns Result<HttpResponse> -- so they compose directly. Also exercises the
+// client's app-level read timeout (http_request_to) against a deliberately-slow loopback server.
+import forge
+import forge_http_client
+import retryx
+import circuitx
+
+// A call that always fails: connect to a closed port (immediate connection-refused -> err).
+fn _dead_call(attempt) -> Result<HttpResponse>
+    forge_http_client.http_get("http://127.0.0.1:1/x")
+
+fn _slow(req: Request) -> string
+    sleep(400)
+    "slow-done"
+
+fn _client(port: int, rch)
+    sleep(60)
+    // read deadline 60ms << server's 400ms handler sleep -> read timeout
+    let t = forge_http_client.http_request_to("GET", "http://127.0.0.1:" + str(port) + "/slow", {}, "", 60)
+    send(rch, t)
+    // generous deadline -> the slow response completes
+    let ok2 = forge_http_client.http_request_to("GET", "http://127.0.0.1:" + str(port) + "/slow", {}, "", 3000)
+    send(rch, ok2)
+
+fn main()
+    // ── retry decorator over the outbound call: all attempts fail -> gives up with err ──────────────
+    let r = retryx.retry_exp_backoff(_dead_call, 3, 1, 5)
+    assert(is_err(r), "retry over a dead endpoint -> exhausts attempts and returns err")
+    print("PASS: retry_exp_backoff composes over http_get (fails-closed after N attempts)")
+
+    // ── circuit breaker over the outbound call: opens after the failure threshold ────────────────────
+    let cb = circuitx.circuit_new(2, 10000)
+    let c1 = circuitx.circuit_call(cb, _dead_call)
+    assert(is_err(c1), "circuit call 1 -> err (closed, action failed)")
+    let c2 = circuitx.circuit_call(cb, _dead_call)
+    assert(is_err(c2), "circuit call 2 -> err (threshold reached)")
+    assert(circuitx.circuit_state(cb) == "open", "circuit is OPEN after 2 failures")
+    let c3 = circuitx.circuit_call(cb, _dead_call)
+    assert(is_err(c3), "circuit call 3 -> err fast (open, short-circuited)")
+    print("PASS: circuit_call composes over http_get (opens after threshold, short-circuits)")
+
+    // ── client read timeout against a slow loopback server ──────────────────────────────────────────
+    let app = forge.app()
+    forge.get(app, "/slow", _slow)
+    let port = 18773
+    let rc = channel()
+    let ap = app
+    let p = port
+    sched_spawn(fn(z) forge.serve_req_n(ap, p, 2))
+    sleep(90)
+    let pp = port
+    let rcc = rc
+    sched_spawn(fn(z) _client(pp, rcc))
+
+    let t = recv(rc)
+    assert(is_err(t), "read timeout (60ms) on a 400ms-slow response -> err")
+    print("PASS: http_request_to read timeout fires on a stalled server")
+
+    let ok2 = recv(rc)
+    assert(is_ok(ok2), "generous timeout -> slow response completes")
+    let resp = unwrap(ok2)
+    assert(resp.status == 200 and resp.body == "slow-done", "slow body delivered under a generous deadline [" + resp.body + "]")
+    print("PASS: http_request_to succeeds when the deadline is generous")
+
+    print("forge_resilient_client_test passed")
