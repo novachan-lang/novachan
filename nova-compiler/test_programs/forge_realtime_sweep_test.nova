@@ -1,0 +1,147 @@
+// forge_realtime_sweep_test -- deterministic sweep of the three new real-time primitives:
+//   T5.1/T5.2  pubsub topic bus    (topic-isolated fan-out)
+//   T5.3       socket assigns      (ws_assign / ws_get on the Ws struct)
+//   T5.7/T5.8  presence w/ meta    (presence_track / presence_untrack / presence_list)
+//
+// No live sockets are opened -- all channel/actor operations are driven in-process.
+// Negative cases (isolation, unsub, absent-key, empty-topic) use try_recv or query-state to avoid
+// any blocking receive that would have no message to consume.
+import forge
+
+// ─── T5.1/T5.2: pubsub topic isolation ──────────────────────────────────────────────────────────
+fn test_pubsub()
+    let ps = forge.pubsub()
+
+    let ch_a = channel()
+    let ch_b = channel()
+
+    forge.pubsub_sub(ps, "room:a", ch_a)
+    forge.pubsub_sub(ps, "room:b", ch_b)
+    sleep(50)
+
+    assert(forge.pubsub_count(ps, "room:a") == 1, "pubsub_count room:a == 1 after subscribe")
+    assert(forge.pubsub_count(ps, "room:b") == 1, "pubsub_count room:b == 1 after subscribe")
+    print("PASS: pubsub_count correct after subscribe")
+
+    // Publish to room:a -> ch_a receives it, ch_b does NOT
+    forge.pubsub_pub(ps, "room:a", "msg-A1")
+    sleep(50)
+    let got_a = try_recv(ch_a)
+    let got_b = try_recv(ch_b)
+    assert(got_a[0] == 1, "ch_a received the room:a publish")
+    assert(got_a[1] == "msg-A1", "ch_a got correct payload")
+    assert(got_b[0] == 0, "ch_b did NOT receive a room:a publish (topic isolation)")
+    print("PASS: pubsub room:a publish reached only ch_a, not ch_b (topic isolation)")
+
+    // Publish to room:b -> ch_b receives it, ch_a does NOT
+    forge.pubsub_pub(ps, "room:b", "msg-B1")
+    sleep(50)
+    let got_b2 = try_recv(ch_b)
+    let got_a2 = try_recv(ch_a)
+    assert(got_b2[0] == 1, "ch_b received the room:b publish")
+    assert(got_b2[1] == "msg-B1", "ch_b got correct payload")
+    assert(got_a2[0] == 0, "ch_a did NOT receive a room:b publish (topic isolation)")
+    print("PASS: pubsub room:b publish reached only ch_b, not ch_a (topic isolation)")
+
+    // Unsubscribe ch_a from room:a; subsequent publish must NOT deliver to ch_a
+    forge.pubsub_unsub(ps, "room:a", ch_a)
+    sleep(50)
+    assert(forge.pubsub_count(ps, "room:a") == 0, "pubsub_count room:a == 0 after unsub")
+    forge.pubsub_pub(ps, "room:a", "msg-A2")
+    sleep(50)
+    let got_a3 = try_recv(ch_a)
+    assert(got_a3[0] == 0, "ch_a receives nothing after unsub from room:a")
+    print("PASS: pubsub unsub drops subscriber; no delivery after unsub")
+
+    // pubsub_topics lists known topics
+    let ts = forge.pubsub_topics(ps)
+    assert(len(ts) >= 2, "pubsub_topics returns at least 2 topics")
+    print("PASS: pubsub_topics returns topic names")
+
+    forge.pubsub_stop(ps)
+    print("PASS: pubsub section complete")
+
+// ─── T5.3: socket assigns (ws_assign / ws_get) ───────────────────────────────────────────────────
+// Use forge.ws_mock() to get a Ws with an empty assigns dict; no real socket needed.
+// NOTE: local variable named 'mws' (not 'ws') to avoid shadowing the imported forge.ws route helper.
+fn test_ws_assigns()
+    let mws = forge.ws_mock()
+
+    // Key absent before any assign -> returns ""
+    assert(forge.ws_get(mws, "user") == "", "ws_get absent key returns empty string before any assign")
+
+    // Assign then retrieve
+    forge.ws_assign(mws, "user", "ada")
+    assert(forge.ws_get(mws, "user") == "ada", "ws_get returns value set by ws_assign")
+
+    // A different key is still absent
+    assert(forge.ws_get(mws, "missing") == "", "ws_get on a different absent key returns empty string")
+
+    // Overwrite an existing key
+    forge.ws_assign(mws, "user", "babbage")
+    assert(forge.ws_get(mws, "user") == "babbage", "ws_assign overwrites an existing key")
+
+    // Multiple independent keys
+    forge.ws_assign(mws, "role", "admin")
+    assert(forge.ws_get(mws, "user") == "babbage", "ws_get user unchanged after setting role")
+    assert(forge.ws_get(mws, "role") == "admin", "ws_get role correct")
+
+    print("PASS: ws_assign / ws_get section complete")
+
+// ─── T5.7/T5.8: presence with metadata ──────────────────────────────────────────────────────────
+fn test_presence()
+    let pr = forge.presence()
+
+    // Track two users in room:1 with metadata dicts
+    let m1 = {}
+    m1["name"] = "alice"
+    forge.presence_track(pr, "room:1", "u1", m1)
+    let m2 = {}
+    m2["name"] = "bob"
+    forge.presence_track(pr, "room:1", "u2", m2)
+    // Track a user in a different topic (must not contaminate room:1)
+    let m3 = {}
+    m3["name"] = "carol"
+    forge.presence_track(pr, "room:2", "u3", m3)
+
+    let r1 = forge.presence_list(pr, "room:1")
+    assert(len(keys(r1)) == 2, "presence_list room:1 has 2 entries after tracking u1+u2")
+    assert(contains(r1, "u1"), "u1 is present in room:1")
+    assert(contains(r1, "u2"), "u2 is present in room:1")
+    print("PASS: presence_track + presence_list correct (2 entries)")
+
+    // room:2 is independent
+    let r2 = forge.presence_list(pr, "room:2")
+    assert(len(keys(r2)) == 1, "presence_list room:2 has 1 entry (topic isolation)")
+    assert(contains(r2, "u3"), "u3 is present in room:2")
+    print("PASS: presence topic isolation (room:2 unaffected by room:1 track)")
+
+    // Re-track u1 with new meta (idempotent key update)
+    let m1b = {}
+    m1b["name"] = "alice-updated"
+    forge.presence_track(pr, "room:1", "u1", m1b)
+    let r1b = forge.presence_list(pr, "room:1")
+    assert(len(keys(r1b)) == 2, "re-track same key does not add a duplicate (idempotent)")
+    print("PASS: presence re-track updates meta, does not duplicate")
+
+    // Untrack u1 from room:1
+    forge.presence_untrack(pr, "room:1", "u1")
+    let r1c = forge.presence_list(pr, "room:1")
+    assert(len(keys(r1c)) == 1, "presence_list room:1 has 1 entry after untracking u1")
+    assert(contains(r1c, "u2"), "u2 still present after u1 untracked")
+    assert(contains(r1c, "u1") == false, "u1 no longer present after untrack")
+    print("PASS: presence_untrack removes entry correctly")
+
+    // Empty topic returns empty dict
+    let r_empty = forge.presence_list(pr, "nonexistent:topic")
+    assert(len(keys(r_empty)) == 0, "presence_list on empty topic returns empty dict")
+    print("PASS: presence_list on unknown topic returns empty dict")
+
+    forge.presence_stop(pr)
+    print("PASS: presence section complete")
+
+fn main()
+    test_pubsub()
+    test_ws_assigns()
+    test_presence()
+    print("forge_realtime_sweep_test passed")
