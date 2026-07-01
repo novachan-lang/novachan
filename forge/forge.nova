@@ -3109,13 +3109,11 @@ fn csrf_rotate(resp: Response, secret: string, new_session_id: string) -> Respon
     _csrf_set_cookie(resp, sign_value(secret, new_session_id + "|" + nonce))
 
 // ── JWT (HS256) + Bearer auth ───────────────────────────────────────────────────
-// REAL HS256 (replaces the naive jwtx, which used sha256(input+secret) [not HMAC], `==` [not
-// constant-time], and never checked exp/alg). forge.jwt_encode/jwt_verify use the genuine hmac_sha256
-// primitive + the constant-time _ct_eq, a STRICT alg=="HS256" allowlist (defeats alg=none / alg-confusion),
-// and exp enforcement. INTEROP CAVEAT: the signature is base64url(HEX hmac), not base64url(RAW mac bytes)
-// as standard JWT libs use -- so a Forge-issued token verifies in Forge (the common case: an app issues +
-// verifies its own tokens) but is NOT byte-compatible with external HS256 verifiers. A raw-byte variant is
-// the interop follow-up. The payload is still standard base64url JSON (a JS frontend can read the claims).
+// STANDARD HS256: signature = base64url(RAW HMAC-SHA256 bytes), from hex-decoding the hmac_sha256 builtin
+// over byte lists. This is fully interoperable with jwt.io / jsonwebtoken / PyJWT. Previously the
+// signature was the bare 64-char hex string (B6 bug); that is now fixed. The signing input is
+// unchanged: base64url(header) + "." + base64url(payload). Security properties retained: alg
+// pinned HS256 only, kid rejected, constant-time compare, exp/nbf enforced.
 
 // base64url (RFC 7515, no padding) over the base64 builtins. Private to forge.
 fn _jwt_b64url_enc(data: string) -> string
@@ -3152,18 +3150,47 @@ fn _jwt_b64url_dec(data: string) -> string
         out = out + "="
     base64_decode(out)
 
+// base64url of a raw byte list (RFC 7515 §2): standard base64 of the bytes, then
+// `+`->`-`, `/`->`_`, strip `=` padding. Used for the HMAC signature segment.
+// Hex string (from the hex-returning hmac_sha256 builtin) -> raw byte list, so JWT can base64url the
+// RAW HMAC bytes (standard HS256) WITHOUT importing forge_crypto (which would pull forge into a diamond
+// import via forge_compress -> module resolution break). Uses forge's own hmac_sha256 + ws_b64_bytes.
+fn _jwt_hex_to_blist(hex: string) -> list
+    let out = []
+    let i = 0
+    while i + 1 < len(hex)
+        push(out, _fr_hexval(hex[i:i + 1]) * 16 + _fr_hexval(hex[i + 1:i + 2]))
+        i = i + 2
+    out
+
+fn _jwt_b64url_enc_bytes(blist: list) -> string
+    let b = ws_b64_bytes(blist)
+    let out = ""
+    let i = 0
+    while i < len(b)
+        let ch = b[i]
+        if ch == "+"
+            out = out + "-"
+        else if ch == "/"
+            out = out + "_"
+        else if ch != "="
+            out = out + ch
+        i = i + 1
+    out
+
 // Current epoch SECONDS -- for setting jwt "exp" (e.g. now_secs() + 3600 for a 1-hour token).
 fn now_secs() -> int
     time_ms() / 1000
 
 // jwt_encode(claims, secret) -> a signed HS256 token. Set "exp" (now_secs()+N) in claims for expiry.
-// alg is pinned at the source (never derived from input). Signature segment = the bare 64-char hex HMAC
-// (self-consistent: verify recomputes the identical value). See the INTEROP CAVEAT above.
+// alg is pinned at the source (never derived from input). Signature = base64url(RAW HMAC-SHA256 bytes)
+// -- interoperable with all standard JWT libraries (jwt.io, jsonwebtoken, PyJWT, etc.).
 fn jwt_encode(claims: dict, secret: string) -> string
     let q = chr(34)
     let header = "\{" + q + "alg" + q + ":" + q + "HS256" + q + "," + q + "typ" + q + ":" + q + "JWT" + q + "\}"
     let signing_input = _jwt_b64url_enc(header) + "." + _jwt_b64url_enc(json_stringify(claims))
-    signing_input + "." + hmac_sha256(secret, signing_input)
+    let mac = _jwt_hex_to_blist(hmac_sha256(secret, signing_input))
+    signing_input + "." + _jwt_b64url_enc_bytes(mac)
 
 // jwt_verify(token, secret) -> Result<dict>. Hardened per the adversary review: STRICT exact alg=="HS256"
 // (reject none/RS256/substrings), reject a `kid` header (single-secret HS256 never uses it -> no kid
@@ -3188,8 +3215,11 @@ fn _jwt_verify_opts(token: string, secret: string, require_exp: bool, leeway: in
     if contains(header, "kid")
         return err("unsupported header")
     // (2) CONSTANT-TIME signature check over the ORIGINAL encoded segments (never re-encode).
+    // Recompute base64url(RAW HMAC bytes) and constant-time compare against the token's 3rd segment.
     let signing_input = parts[0] + "." + parts[1]
-    if not _ct_eq(hmac_sha256(secret, signing_input), parts[2])
+    let expected_mac = _jwt_hex_to_blist(hmac_sha256(secret, signing_input))
+    let expected_sig = _jwt_b64url_enc_bytes(expected_mac)
+    if not _ct_eq(expected_sig, parts[2])
         return err("invalid signature")
     // (3) claims -- only AFTER the signature is proven.
     let claims = json_decode(_jwt_b64url_dec(parts[1]))

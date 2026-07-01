@@ -162,6 +162,75 @@ fn _requires_next(req: Request, next, role: string) -> Response
 fn requires(role: string)
     return fn(req, next) _requires_next(req, next, role)
 
+// ── mw_oauth2: Bearer resource-server validation (T3.7) ─────────────────────────────────────────────
+// mw_oauth2(secret, audience, required_scope) middleware: validates an Authorization: Bearer JWT,
+// then checks aud and scope claims before passing through. Fail-closed on every error path.
+// On success: req.state["user"] = the verified claims dict; downstream handlers read it from there.
+// aud: token's "aud" claim must equal `audience` (string) or contain it (when aud is a list).
+// scope: token's "scope" claim must contain `required_scope` as a space-delimited word, OR the
+//        claim may be a list that contains `required_scope`. Empty/missing required_scope is accepted
+//        (caller passes "" to skip scope enforcement while still requiring a valid bearer token).
+// Structured as a top-level helper + single-line closure (avoids the `return next()` inside match
+// codegen bug documented in [[project-forge-phase3-security]]).
+
+// _oauth2_aud_ok: true if the token's aud claim matches the expected audience. aud may be a string
+// or a list of strings (both are valid per RFC 7519 §4.1.3).
+fn _oauth2_aud_ok(claims, audience: string) -> bool
+    if not contains(claims, "aud")
+        return false
+    let aud = claims["aud"]
+    if type_name(aud) == "string"
+        return aud == audience
+    if type_name(aud) == "list"
+        let i = 0
+        while i < len(aud)
+            if aud[i] == audience
+                return true
+            i = i + 1
+    false
+
+// _oauth2_scope_ok: true if `required_scope` is present in the token's scope claim (space-delimited
+// string or list), or if `required_scope` is "" (no scope enforcement requested).
+fn _oauth2_scope_ok(claims, required_scope: string) -> bool
+    if len(required_scope) == 0
+        return true
+    if not contains(claims, "scope")
+        return false
+    let sc = claims["scope"]
+    if type_name(sc) == "list"
+        let i = 0
+        while i < len(sc)
+            if sc[i] == required_scope
+                return true
+            i = i + 1
+        return false
+    if type_name(sc) == "string"
+        let parts = split(sc, " ")
+        let i = 0
+        while i < len(parts)
+            if parts[i] == required_scope
+                return true
+            i = i + 1
+    false
+
+fn _t_oauth2(req: Request, next, secret: string, audience: string, required_scope: string) -> Response
+    let tok = bearer_token(req)
+    if len(tok) == 0
+        return resp_error(401, "unauthorized")
+    let r = jwt_verify(tok, secret)
+    if is_err(r)
+        return resp_error(401, "unauthorized")
+    let claims = unwrap(r)
+    if not _oauth2_aud_ok(claims, audience)
+        return resp_error(403, "forbidden: audience mismatch")
+    if not _oauth2_scope_ok(claims, required_scope)
+        return resp_error(403, "forbidden: missing required scope")
+    req.state["user"] = claims
+    next(req)
+
+fn mw_oauth2(secret: string, audience: string, required_scope: string)
+    return fn(req, next) _t_oauth2(req, next, secret, audience, required_scope)
+
 // ── User persistence (forge_db-backed) ───────────────────────────────────────────────────────────────
 // users_ddl: the CREATE TABLE for the users table. Run once at startup (pool_exec(pool, users_ddl())).
 fn users_ddl() -> string
