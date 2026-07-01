@@ -231,3 +231,85 @@ fn resp_header(r: HttpResponse, name: string) -> string
     if contains(r.headers, k)
         return r.headers[k]
     ""
+
+// ── SSE (Server-Sent Events) CONSUME client (D7r.4) ──────────────────────────────────────────────────
+// Consume an upstream text/event-stream (LLM token streams, event feeds, a Forge sse() endpoint). The
+// stream state is a dict {"sock","buf"} (reference-semantic, so sse_next mutates the caller's buffer in
+// place). v1: plaintext http:// (https/TLS SSE is a follow-up, same as the client body). Only the `data:`
+// field is surfaced; `event:`/`id:`/`retry:`/comment lines are parsed-and-skipped.
+
+// Earliest event boundary in `buf`: [index, len] for "\r\n\r\n" (4) or "\n\n" (2); [-1,0] if none yet.
+fn _sse_boundary(buf: string) -> list
+    let a = find(buf, "\r\n\r\n")
+    let b = find(buf, "\n\n")
+    if a >= 0 and (b < 0 or a <= b)
+        return [a, 4]
+    if b >= 0
+        return [b, 2]
+    [-1, 0]
+
+// Concatenate the `data:` field value(s) of one event block (multiple data lines joined by "\n", per the
+// SSE spec). One optional space after the colon is stripped. Non-data fields + ":" comments are ignored.
+fn _sse_extract_data(block: string) -> string
+    let lines = split(block, "\n")
+    let data = ""
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        if len(line) > 0 and slice(line, len(line) - 1, len(line)) == "\r"
+            line = slice(line, 0, len(line) - 1)
+        if starts_with(line, "data:")
+            let v = slice(line, 5, len(line))
+            if len(v) > 0 and slice(v, 0, 1) == " "
+                v = slice(v, 1, len(v))
+            if len(data) == 0
+                data = v
+            else
+                data = data + "\n" + v
+        i = i + 1
+    data
+
+// sse_connect(url) -> Result<any>: open the stream. GET Accept: text/event-stream; verify 200; returns the
+// stream state dict {"sock","buf"} (buf holds any bytes read past the response headers). Loop sse_next on it.
+fn sse_connect(url: string) -> Result<any>
+    let u = parse_url(url)
+    let host = u[1]
+    let port = u[2]
+    let path = u[3]
+    let sock = tcp_connect(host, port)
+    if sock <= 0
+        return err("sse connect failed: " + host + ":" + str(port))
+    tcp_send(sock, "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n")
+    let hdr = ""
+    let he = find(hdr, "\r\n\r\n")
+    while he < 0
+        let c = tcp_recv(sock)
+        if len(c) == 0
+            tcp_close(sock)
+            return err("sse: stream closed before headers")
+        hdr = hdr + c
+        he = find(hdr, "\r\n\r\n")
+    let r = parse_response(slice(hdr, 0, he) + "\r\n\r\n")
+    if r.status != 200
+        tcp_close(sock)
+        return err("sse: unexpected status " + str(r.status))
+    let s = {}
+    s["sock"] = sock
+    s["buf"] = slice(hdr, he + 4, len(hdr))
+    ok(s)
+
+// sse_next(s) -> Result<string>: block until the next event, return its `data:` payload. err on stream end.
+fn sse_next(s) -> Result<string>
+    let bd = _sse_boundary(s["buf"])
+    while bd[0] < 0
+        let c = tcp_recv(s["sock"])
+        if len(c) == 0
+            return err("sse: stream closed")
+        s["buf"] = s["buf"] + c
+        bd = _sse_boundary(s["buf"])
+    let block = slice(s["buf"], 0, bd[0])
+    s["buf"] = slice(s["buf"], bd[0] + bd[1], len(s["buf"]))
+    ok(_sse_extract_data(block))
+
+fn sse_close(s)
+    tcp_close(s["sock"])
