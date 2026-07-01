@@ -8,10 +8,18 @@ auto-admin) do NOT fully land in 8 days; HTTP/2 is the stretch flagship.
 - **Model split:** Opus = architecture + every compiler/runtime/protocol change + spec-writing + REVIEW + the
   gate/commit decision. Sonnet subagents = mechanical lib-only feature implementation UNDER an Opus spec +
   targeted test scaffolding + running the targeted test. Opus reviews the Sonnet diff before gating.
-- **Tiered testing (stop running 600 tests per change):**
-  - Dev loop per feature: build+run ONLY the affected forge test via `_fdb_one` (~seconds).
-  - Gate per BATCH (3–5 related lib features), not per feature: one `nova_ci -SkipReconverge` (both RC modes).
-  - Full `nova_ci` (reconverge + both modes) ONLY for compiler/runtime changes + milestone gates.
+- **Tiered testing — SECTION-LEVEL gating (owner-confirmed 2026-07-01, to unblock forge speed):**
+  - Dev loop per feature: build+run ONLY the affected forge test via `_fdb_one` (~30s). THIS is the safety
+    floor — every feature's own test must pass before moving on, so no feature ships untested.
+  - Regression is run PER SECTION (e.g. all of auth, all of real-time), NOT per feature: one `_forge_ci`
+    (fast forge subset, ~14 min) at section end. Forge features are mostly additive/isolated -> cross-feature
+    regression is rare and the section-end run catches it.
+  - ★ GUARDRAIL (the one exception): a change to a SHARED forge foundation -- the `Ws`/`Request`/`Response`
+    structs, the serve loop, the router, or the middleware type -- has an all-of-forge blast radius, so gate
+    it IMMEDIATELY on its own (`nova_ci -SkipReconverge`, incl the serial WS server tests), do NOT defer to
+    section end. These are ~1 in 10 features.
+  - Full `nova_ci` (reconverge + 607 × both modes) ONLY for compiler (nova_compiler.nova) / runtime
+    (nova_runtime.c) changes. Correctness preserved (we still test everything); we just test less OFTEN.
 - **High-level NOVA syntax IS allowed in Forge** (map/filter/comprehensions/method-chains) — Forge is
   framework code, not the hot compiler path. Drop to loops only in a genuinely hot per-request inner loop.
 - Each feature: spec → implement → targeted test → Opus review → batch-gate → commit → update this file.
