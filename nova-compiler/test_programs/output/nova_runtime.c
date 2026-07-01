@@ -3437,6 +3437,62 @@ int64_t nova_rt_read_file(int64_t path) {
     return (int64_t)(uintptr_t)buf;
 }
 
+#ifdef _WIN32
+/* Resolve `in` to its final on-disk path (symlinks/junctions/reparse points followed) into `out`.
+   Returns 1 on success, 0 on any failure. Read-only handle (dwDesiredAccess 0 = metadata only), share
+   everything so we never contend with the live server; BACKUP_SEMANTICS also opens a directory handle. */
+static int _nova_win_final_path(const char* in, char* out, size_t outsz) {
+    HANDLE h = CreateFileA(in, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD n = GetFinalPathNameByHandleA(h, out, (DWORD)outsz, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(h);
+    if (n == 0 || n >= (DWORD)outsz) return 0;  /* 0 = fail; >= outsz = did not fit -> fail-closed */
+    /* Strip the \\?\ long-path prefix GetFinalPathNameByHandle prepends (overlap-safe). */
+    if (n >= 4 && out[0] == '\\' && out[1] == '\\' && out[2] == '?' && out[3] == '\\')
+        memmove(out, out + 4, (size_t)n - 4 + 1);  /* +1 copies the NUL too */
+    return 1;
+}
+#endif
+
+/* nova_rt_path_within(root, path) -> 1 iff the OS-canonical (symlinks/junctions RESOLVED) `path` is inside
+   the canonical `root` -- equal to it, or under it at a separator boundary -- else 0, and 0 on ANY error
+   (fail-CLOSED). This is forge.static()'s symlink-containment check: the textual segment whitelist keeps
+   the request STRING inside root_dir, but a symlink whose name is an ordinary segment resolves ELSEWHERE
+   (root_dir/link -> /etc/passwd). Comparing the canonical paths catches that. Both paths pass through the
+   same canonicalizer, so on Windows their case is consistent (on-disk case) -> a case-sensitive compare is
+   correct on both platforms; separator is per-OS. */
+int64_t nova_rt_path_within(int64_t root_v, int64_t path_v) {
+    const char* root = (const char*)(uintptr_t)root_v;
+    const char* path = (const char*)(uintptr_t)path_v;
+    if (!root || !path) return 0;
+#ifdef _WIN32
+    char rbuf[4096], pbuf[4096];
+    if (!_nova_win_final_path(root, rbuf, sizeof(rbuf))) return 0;
+    if (!_nova_win_final_path(path, pbuf, sizeof(pbuf))) return 0;
+    const char* rr = rbuf; const char* pp = pbuf;
+    char sep = '\\';
+#else
+    char* rr_a = realpath(root, NULL);          /* POSIX-2008: mallocs exact size, no PATH_MAX assumption */
+    if (!rr_a) return 0;
+    char* pp_a = realpath(path, NULL);
+    if (!pp_a) { free(rr_a); return 0; }
+    const char* rr = rr_a; const char* pp = pp_a;
+    char sep = '/';
+#endif
+    size_t rl = strlen(rr);
+    int within = 0;
+    if (rl > 0) {
+        if (strcmp(rr, pp) == 0) within = 1;                                   /* path == root */
+        else if (strncmp(pp, rr, rl) == 0 && (rr[rl-1] == sep || pp[rl] == sep))
+            within = 1;                                                        /* under root at a sep boundary */
+    }
+#ifndef _WIN32
+    free(rr_a); free(pp_a);
+#endif
+    return within;
+}
+
 int64_t nova_rt_write_file(int64_t path, int64_t content) {
     const char* p = (const char*)(uintptr_t)path;
     const char* c = (const char*)(uintptr_t)content;

@@ -185,6 +185,7 @@ $domain_tests = @(
     'forge_coerce_test',
     'forge_typed_mw_test',
     'forge_static_test',
+    'forge_static_symlink_test',
     'forge_header_security_test',
     'forge_recv_security_test',
     'forge_routing_correctness_test',
