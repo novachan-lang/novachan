@@ -1062,6 +1062,111 @@ fn _ws_lookup(a, req: Request) -> list
         i = i + 1
     []
 
+// ── WebSocket CONSUME client (D7r.4b) ────────────────────────────────────────────────────────────────
+// The OUTBOUND side of WebSockets: dial a ws:// server, do the client handshake, and read/send frames via
+// the SAME codec the server uses (ws_encode_frame with a 4-byte mask = client-masked per RFC 6455 5.3;
+// ws_try_decode for server frames; ws_compute_accept to verify the 101). Stream state is a dict
+// {"sock","buf"} (reference-semantic; ws_client_recv accumulates + advances the byte buffer in place). v1:
+// plaintext ws:// (wss/TLS is a follow-up), text frames; ping surfaces as ""; close/EOF -> err.
+
+// 16 CSPRNG bytes -> the base64 Sec-WebSocket-Key (RFC 6455 4.1).
+fn _ws_client_key() -> string
+    let kb = secure_bytes(16)
+    let klist = []
+    let i = 0
+    while i < 16
+        push(klist, bytes_get(kb, i))
+        i = i + 1
+    ws_b64_bytes(klist)
+
+// A fresh 4-byte masking key as a list (ws_encode_frame masks client frames with it).
+fn _ws_client_mask() -> list
+    let mb = secure_bytes(4)
+    [bytes_get(mb, 0), bytes_get(mb, 1), bytes_get(mb, 2), bytes_get(mb, 3)]
+
+// ws_connect(url) -> Result<any>: dial ws://host[:port]/path, send the Upgrade handshake, verify the
+// 101 + Sec-WebSocket-Accept. Returns the stream state {"sock","buf"} (buf = binary bytes read past the
+// handshake). Accepts ws:// or http:// (both plaintext here).
+fn ws_connect(url: string) -> Result<any>
+    let rest = url
+    if starts_with(url, "ws://")
+        rest = slice(url, 5, len(url))
+    else if starts_with(url, "http://")
+        rest = slice(url, 7, len(url))
+    let slash = find(rest, "/")
+    let hostport = rest
+    let path = "/"
+    if slash >= 0
+        hostport = slice(rest, 0, slash)
+        path = slice(rest, slash, len(rest))
+    let host = hostport
+    let port = 80
+    let colon = find(hostport, ":")
+    if colon >= 0
+        host = slice(hostport, 0, colon)
+        let pr = parse_int_safe(slice(hostport, colon + 1, len(hostport)))
+        if is_ok(pr)
+            port = unwrap(pr)
+    let sock = tcp_connect(host, port)
+    if sock <= 0
+        return err("ws connect failed: " + host + ":" + str(port))
+    let key = _ws_client_key()
+    tcp_send(sock, "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    // Read the 101 handshake response as text up to the terminator (headers are ASCII/NUL-free -- the
+    // tcp_recv string path, same as forge_ws_echo_test's client). The frame buffer starts EMPTY: a WS
+    // server sends frames only after the client does, so no server frame is concatenated with the 101.
+    let resp = tcp_recv(sock)
+    let guard = 0
+    while find(resp, "\r\n\r\n") < 0 and guard < 4096
+        let more = tcp_recv(sock)
+        if len(more) == 0
+            tcp_close(sock)
+            return err("ws: connection closed before handshake")
+        resp = resp + more
+        guard = guard + 1
+    if find(resp, "\r\n\r\n") < 0
+        tcp_close(sock)
+        return err("ws: handshake headers incomplete")
+    if find(resp, " 101 ") < 0
+        tcp_close(sock)
+        return err("ws: server did not switch protocols (expected 101)")
+    if find(lower(resp), lower("sec-websocket-accept: " + ws_compute_accept(key))) < 0
+        tcp_close(sock)
+        return err("ws: invalid Sec-WebSocket-Accept")
+    let s = {}
+    s["sock"] = sock
+    s["buf"] = bytes(0)
+    ok(s)
+
+// ws_client_send(c, msg): send a MASKED text frame (client->server frames MUST be masked).
+fn ws_client_send(c, msg: string) -> int
+    tcp_send_bytes(c["sock"], ws_encode_frame(1, 1, str_to_bytes(msg), _ws_client_mask()))
+
+// ws_client_recv(c) -> Result<string>: read + decode ONE server frame (text). Fills until a complete
+// frame is present. Close (opcode 8) or EOF -> err; ping (9) -> "" (v1). Advances the buffer.
+fn ws_client_recv(c) -> Result<string>
+    let fr = ws_try_decode(c["buf"], 0)
+    while fr.status == 0
+        let more = tcp_recv_bytes(c["sock"])
+        if bytes_len(more) == 0
+            return err("ws: connection closed")
+        c["buf"] = _append_chunk(c["buf"], more)
+        fr = ws_try_decode(c["buf"], 0)
+    if fr.status < 0
+        return err("ws: protocol error " + str(fr.status))
+    c["buf"] = bytes_slice(c["buf"], fr.consumed, bytes_len(c["buf"]))
+    if fr.opcode == 8
+        return err("ws: closed by server")
+    if fr.opcode == 9
+        return ok("")
+    ok(bytes_to_str(fr.payload))
+
+// ws_client_close(c): send a masked Close frame, then close the socket.
+fn ws_client_close(c)
+    tcp_send_bytes(c["sock"], ws_encode_frame(1, 8, bytes(0), _ws_client_mask()))
+    tcp_close(c["sock"])
+
+
 // ââ WebSocket join authorization (PRE-101) âââââââââââââââââââââââ
 // Authorize a ws upgrade BEFORE the 101 handshake, so an UNAUTHORIZED client never obtains an open
 // socket (rejecting pre-upgrade is a clean HTTP 401; revoking an established WS is expensive and racey
