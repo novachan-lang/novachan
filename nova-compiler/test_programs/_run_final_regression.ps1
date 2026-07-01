@@ -1,3 +1,4 @@
+param([switch]$ForgeOnly, [switch]$NoServer)
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
@@ -476,6 +477,29 @@ $all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurr
 $server_tests = @('demo_http_server_test','demo_forge_test','demo_forge_v2_test','demo_forge_todo_test','demo_cortex_serve_test','demo_ops_test','demo_full_stack_test','real_http_api','http_offload_test','forge_spawn_test','forge_recover_test','forge_recv_security_test','forge_keepalive_test','forge_model_route_test','bytes_socket_test','forge_binary_serve_test','forge_binary_file_test','forge_multipart_test','forge_ws_echo_test','_ws_soak_test','forge_ws_routing_test','forge_ws_chat_test','forge_sse_test','_timed_park_test','forge_ws_keepalive_test','forge_ws_presence_test','forge_ws_lifecycle_test','forge_chunked_test','forge_range_test','forge_conditional_test','forge_flash_test','forge_cache_test','forge_compose_test','forge_hardening_test','cluster_test')
 $parallel_tests = @($all_tests | Where-Object { $server_tests -notcontains $_ })
 
+# -ForgeOnly: run only tests whose SOURCE imports a forge module. A forge-LIB change (compiler + runtime
+# unchanged) can ONLY affect forge-importing tests -- the 600 core/language/domain tests don't import forge,
+# so running them adds zero safety. This is the fast per-batch gate for lib work (full 607 stays for
+# compiler/runtime changes). Robust + zero-maintenance: derived from the actual `import forge*` lines.
+if ($ForgeOnly) {
+    $isForge = {
+        param($n)
+        $f = "$PSScriptRoot\$n.nova"
+        (Test-Path $f) -and ((Get-Content $f -Raw) -match '(?m)^\s*import\s+forge')
+    }
+    $parallel_tests = @($parallel_tests | Where-Object { & $isForge $_ })
+    $server_tests   = @($server_tests   | Where-Object { & $isForge $_ })
+    Write-Host "[ForgeOnly] $($parallel_tests.Count) parallel + $($server_tests.Count) server forge-importing tests"
+}
+# -NoServer: skip the SERIAL real-TCP server-integration tests (each ~40s of real I/O; they dominate wall
+# time). Fast dev gate for lib batches -- the server tests run at the milestone full gate. Non-server unit
+# tests still cover the lib's logic.
+if ($NoServer) {
+    Write-Host "[NoServer] skipping $($server_tests.Count) serial server-integration tests (run them via full nova_ci)"
+    $server_tests = @()
+    $all_tests = @($all_tests | Where-Object { $parallel_tests -contains $_ })
+}
+
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 Write-Host "=== NOVA Full Regression Suite ==="
 Write-Host "Compiler: $compiler ($((Get-Item $compiler).Length) bytes)"
@@ -683,4 +707,5 @@ if ($suspects.Count -gt 0) {
     foreach ($s in $suspects) { Write-Host "  $s" }
 }
 if ($fail -gt 0) { exit 1 }
+exit 0
 
