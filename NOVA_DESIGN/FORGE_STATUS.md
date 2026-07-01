@@ -8,6 +8,34 @@
 
 ---
 
+## 0. RECENT PROGRESS — reconciliation 2026-07-01 (read this first; the sections below predate it)
+
+The tables in §2–§6 were last reconciled *before* the 2026-06/07 Forge sprint. The following items they still show as ⬜ / 🟡 / open-bug are **shipped, tested, and committed** since — treat §0 as the override where it conflicts with a later section. (Each is gated `nova_ci`/`_forge_ci` both RC modes.)
+
+**Data layer — the big one the old tables miss entirely:**
+- **Universal ORM (`forge_orm`)** — DB-agnostic typed layer proven LIVE on **SQLite + PostgreSQL 16 + MySQL** with the *same* code: typed `orm_all<T>`/`orm_one<T>`, struct CRUD, count/exists/agg, fluent query builder (`.where/.inner_join/.left_join/.order_by/.paginate`), SQL-free repository, relations, schema-from-struct migrations. Advances "Data / ORM 🟡" (§2) and much of §5 **Layer 2** well past the doc.
+- **Pure-NOVA PostgreSQL driver (`forge_pg`)** — over TCP+TLS, no libpq: SCRAM-SHA-256, parameterized (injection-safe), TLS verify-full, pool + transactions. Live vs local PG16. (§5 L2 "PostgreSQL driver + pool" was ⬜.)
+- **Pure-NOVA MySQL driver (`forge_mysql`)** — raw TCP, no libmysqlclient: handshake + `mysql_native_password` + `caching_sha2` fast-path + COM_QUERY. Live vs MySQL 5.7/8.4.
+
+**Auth (Sprint S4 / Layer 3) — now ~complete:**
+- **JWT external interop (B6) → FIXED** (`53f7f84`): signature is now standard base64url(**raw** HMAC-SHA256 bytes) — KAT matches jwt.io / jsonwebtoken / PyJWT. The "Forge-internal hex mac" caveat in §2/§3/§4-B6 is closed.
+- **OAuth2 resource-server → SHIPPED**: `mw_oauth2(secret, audience, scope)` bearer validation (RFC 7519 aud/scope). (§2 "OAuth/OIDC ⬜" → 🟡 resource-server.)
+- **`mw_auth` pipeline, route `requires(role)`, persisted users, PBKDF2 password hashing** (native `nova_rt_pbkdf2_sha256`, ~30ms) — all shipped (Day-1 auth sweep).
+- **Rate limiter, N>1-correct** — `forge_limits` promoted to a shipped **leaf lib** with the single-owner `rate_limiter` **actor** + new `conn_guard` **actor** (accept-storm backpressure primitive, B4). The §3/§4-B8 "single-carrier only" caveat is closed at the primitive level (serve-loop *wiring* = T1.6, next).
+
+**Real-time (Sprint S5 / Layer 5):**
+- **Channel join-authorization → SHIPPED** (`ea301b1`): **pre-101** WS handshake authz (`ws_guard` + `ws_default_deny` secure-by-default + `ws_require_bearer`/`ws_require_session`) — an unauthorized client never gets an open socket. Closes the §2 "WS/SSE channel auth ⬜", §5 L5 "Channel join authorization", and §6 "no join-auth" gaps.
+- **PubSub + presence + socket assigns** (`pubsub`/`pubsub_sub`/`pub`/`unsub`, `ws_assign`/`ws_get`, `presence`) — shipped (Day-1 real-time sweep).
+
+**Static hardening (Sprint S0 / Layer 1):**
+- **Symlink/realpath containment (B7) → FIXED** (`f79e47b`): new runtime `nova_rt_path_within` (POSIX `realpath` / Windows `GetFinalPathNameByHandle`, fail-closed) + `path_within` re-check in the static serve path — a symlink escaping the mount is 404'd (proven live with a junction). The §3/§4-B7 caveat is closed.
+
+**OTP (Sprint S2 / Layer 4):** `one_for_all` + `rest_for_one` strategies + `on_terminate` shipped (`forge_otp`).
+
+**Still open (accurate):** LiveView (render-differ + GenServer `on_info`), observability (S3), interfaces #8 (S6), HTTP/2 (S7), gRPC/GraphQL (S8), messaging/resilience (S10), distribution (S11), auto-admin (S12), WASM (S13); and within S0/S1: read/idle timeout (B1), accept-loop conn-cap *wiring* (T1.6), route-param decode (B2), `with tx {}`, full query-DSL/migrations polish, `nova new` scaffold (B9).
+
+---
+
 ## 1. Vision
 
 **Forge is the framework where one developer, in one language, builds the whole system — REST API, real-time UI, background jobs, microservices, and the cluster they run on — and the framework gets fault tolerance, distribution, and universal communication *for free* because NOVA's runtime is already Erlang-shaped underneath it.**
@@ -165,8 +193,8 @@ The bare C `nova_rt_json_stringify` (runtime L1750 **(VERIFY)**) only handles di
 | B4 | **No accept backpressure / connection cap** | Medium | Each connection = a green task. Validated at 10k green tasks, but there is **no global connection cap** — an accept storm spawns unboundedly. Needs an accept-side semaphore (a `lockx` channel of N permits). |
 | B5 | **`from_json` safe-path routing** | **High** | `from_json_safe<T>` (compiler-generated `<T>__from_json_safe` → Result) is the **safe** path and works. Raw `from_json` is the keystone path. The wrapper `body_as<T>` (Layer 2) **must default to the safe path**; ensure handlers never route untrusted bodies through raw `from_json`. *(The underlying crash is split out as B5a.)* |
 | B5a | raw `from_json` on incomplete input | ✅ **VERIFIED-FIXED (2026, do NOT re-report)** | The "SEGFAULT on a missing field" was a STALE finding. `_make_from_dict_method`/`_make_from_json_method` already (a) coerce a non-dict `d` to `{}` up front and (b) default every missing field. **Tested:** a partial body missing the nested-struct, float, and list fields returns a defaulted struct (`name=""`, `score=0.0`), exit 0, **no segfault**. The build-plan's T2.9 is therefore already satisfied. |
-| B6 | **JWT external interop** | Low | HEX-mac signature → not byte-compatible with external HS256 libs. Documented; raw-byte variant is a follow-up. |
-| B7 | **Static symlink containment** | **Medium** | Textual segment whitelist only; a symlink *inside* root pointing out is followed. No `realpath` containment. **This falsifies the "cannot be misconfigured into a CVE" over-claim.** Fix = `realpath`-canonicalize + prefix-check. |
+| B6 | **JWT external interop** | ✅ **FIXED (`53f7f84`, do NOT re-report)** | Signature is now standard base64url(**raw** HMAC-SHA256 bytes) — KAT byte-matches jwt.io / jsonwebtoken / PyJWT. Achieved diamond-import-safe (forge-native hex-decode of `hmac_sha256` + `ws_b64_bytes`, no `forge_crypto` import). alg pinned pre-crypto, kid rejected, constant-time compare, exp/nbf retained. |
+| B7 | **Static symlink containment** | ✅ **FIXED (`f79e47b`, do NOT re-report)** | New runtime `nova_rt_path_within` (POSIX `realpath` / Windows `GetFinalPathNameByHandle`, fail-closed) + `path_within` re-check in the static serve path; a symlink/junction escaping the mount is 404'd (proven live). The over-claim is no longer falsified. |
 | B8 | **Rate-limit / SSE-disconnect under N>1 carriers** | Low | Single-carrier-correct today (frameworks run N=1). N>1 needs an owner-actor for the limiter; SSE idle-timeout tracked. |
 | B9 | **`nova new` routes to a STUB — Forge templates unreachable** | Low | `nova new` routes to `nova_pkg_new`, a `print("Hello")` **STUB**; the 5 Forge templates in `nova_new.nova` are **UNREACHABLE**, so CLAUDE.md's "download NOVA → build full-stack app" promise can't be met. Fix = one-line route change + lib bundling. |
 | B9a | **bundled `$NOVA_HOME/lib` ships ONLY `forge.nova`** | Low | `url_decode`/`hmac_sha256`/`sqlitex`/`forge_db`/`forge_html`/`forge_compress` are **unreachable from a scaffolded app** — gates sessions/data/percent-decode/compression. Fix = bundle the full lib set with the distribution. |
