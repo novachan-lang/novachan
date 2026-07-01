@@ -12,6 +12,16 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 
 ---
 
+## Linked docs (this file is the HUB — keep it focused; heavy per-feature detail lives in linked sub-docs, never dumped here)
+
+> Rule: a new feature/plan that needs its own `.md` is fine and encouraged (keeps THIS file undistracting) — but it MUST be linked here so nothing is orphaned. Add the link when you create the doc.
+
+- [FORGE_STATUS.md](FORGE_STATUS.md) — vision, competitor matrix, substrate insight, capability inventory (the "what/why"; see its §0 for the current reconciliation).
+- [FORGE_8DAY_SPRINT.md](FORGE_8DAY_SPRINT.md) — the deadline-driven re-ordering of the sprints below + the model-split working method (Opus architecture/compiler/runtime/review/gate; Sonnet mechanical lib impl). Subordinate to this plan; kept for the working-method reference.
+- _(add future per-feature spec docs here as they're created)_
+
+---
+
 ## Build progress (live ledger)
 
 > Updated as tasks ship. Each entry: task → commit → gate. (FORGE_STATUS.md §3 is the capability view; this is the task-by-task ledger.)
