@@ -1,0 +1,87 @@
+// forge_totp -- RFC 6238 TOTP + RFC 4226 HOTP two-factor authentication (Google Authenticator / Authy /
+// 1Password compatible). The shared secret is base32 (what the QR code carries); the OTP is HMAC-SHA-1 over an
+// 8-byte big-endian counter, dynamically truncated to N digits. TOTP is HOTP with counter = unix_time/period.
+// This is the 2FA backbone FORGE_FEATURE_AUDIT flagged missing. Composes forge_crypto (hmac_sha1_bytes) +
+// forge_base32 (secret decode). Defaults period=30s, digits=6 (the authenticator-app convention).
+import forge_crypto
+import forge_base32
+
+// PRIVATE: base32 secret string -> raw key byte list.
+fn _totp_key(secret: string) -> list
+    let raw = base32_decode(secret)
+    let key = []
+    let i = 0
+    while i < len(raw)
+        push(key, ord(char_at(raw, i)))
+        i = i + 1
+    key
+
+// PRIVATE: an 8-byte big-endian representation of the counter (the HOTP message).
+fn _totp_counter_bytes(counter: int) -> list
+    let out = []
+    push(out, (counter >> 56) & 255)
+    push(out, (counter >> 48) & 255)
+    push(out, (counter >> 40) & 255)
+    push(out, (counter >> 32) & 255)
+    push(out, (counter >> 24) & 255)
+    push(out, (counter >> 16) & 255)
+    push(out, (counter >> 8) & 255)
+    push(out, counter & 255)
+    out
+
+fn _totp_pow10(d: int) -> int
+    let v = 1
+    let i = 0
+    while i < d
+        v = v * 10
+        i = i + 1
+    v
+
+fn _totp_zpad(s: string, width: int) -> string
+    let out = s
+    while len(out) < width
+        out = "0" + out
+    out
+
+// HOTP (RFC 4226): the OTP for a specific counter. Dynamic truncation per the spec -- the low nibble of the
+// last MAC byte selects a 4-byte window, its high bit masked, mod 10^digits, zero-padded.
+fn hotp(secret: string, counter: int, digits: int) -> string
+    let hs = hmac_sha1_bytes(_totp_key(secret), _totp_counter_bytes(counter))
+    let offset = hs[19] & 15
+    let bin = ((hs[offset] & 127) * 16777216) + (hs[offset + 1] * 65536) + (hs[offset + 2] * 256) + hs[offset + 3]
+    _totp_zpad(str(bin % _totp_pow10(digits)), digits)
+
+// TOTP (RFC 6238) for an explicit unix-seconds time (testable against the RFC vectors).
+fn totp(secret: string, unix_seconds: int, period: int, digits: int) -> string
+    hotp(secret, unix_seconds / period, digits)
+
+// TOTP for the current wall-clock time with the standard 30s/6-digit parameters.
+fn totp_now(secret: string) -> string
+    totp(secret, time_ms() / 1000, 30, 6)
+
+// Verify a submitted code, tolerating +/- `skew` periods of clock drift (skew=1 accepts the previous/next
+// window -- the usual production setting). Constant-work over the skew window.
+fn totp_verify(secret: string, code: string, unix_seconds: int, period: int, digits: int, skew: int) -> bool
+    let base = unix_seconds / period
+    let d = 0 - skew
+    let matched = false
+    while d <= skew
+        if hotp(secret, base + d, digits) == code
+            matched = true
+        d = d + 1
+    matched
+
+// Generate a fresh random base32 secret (default caller passes 20 bytes = 160 bits, the RFC-recommended
+// SHA-1 key size). Give this to the user's authenticator app (as text or inside the otpauth URI / QR).
+fn totp_secret(nbytes: int) -> string
+    let b = secure_bytes(nbytes)
+    let s = ""
+    let i = 0
+    while i < nbytes
+        s = s + chr(bytes_get(b, i))
+        i = i + 1
+    base32_encode(s)
+
+// The otpauth:// provisioning URI a QR code encodes for the authenticator app.
+fn totp_uri(secret: string, issuer: string, account: string) -> string
+    "otpauth://totp/" + issuer + ":" + account + "?secret=" + secret + "&issuer=" + issuer + "&period=30&digits=6"
