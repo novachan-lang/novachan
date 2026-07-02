@@ -1,0 +1,221 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_ratelimit — Per-key TOKEN-BUCKET rate limiter as a single-owner ACTOR.
+//
+// WHAT IS A TOKEN BUCKET?
+// A token bucket models a steady rate with burst tolerance.  Imagine a bucket
+// that holds up to `capacity` tokens.  Tokens refill at `refill_per_sec`
+// tokens/second.  Every allowed request consumes 1 token.  When the bucket
+// is empty, the request is denied (caller must send HTTP 429 Too Many Requests).
+//
+//   capacity       = burst allowance: how many back-to-back requests are allowed
+//                    at full speed before throttling kicks in.
+//   refill_per_sec = steady-state rate: requests per second sustained long-term.
+//
+// Example: capacity=5, refill_per_sec=10
+//   t=0ms   : 5 tokens available — 5 immediate allows consume them all.
+//   t=0ms   : 6th request → 0 tokens → DENIED (429).
+//   t=100ms : elapsed=100ms, added = 10*100/1000 = 1 token → 1 allow.
+//   t=200ms : elapsed=100ms, added = 1 more → 1 allow.  And so on.
+//
+// MONOTONIC CLOCK (clock_ns):
+// We use clock_ns() (monotonic nanoseconds) converted to milliseconds, NOT a
+// wall-clock API.  Wall clocks can jump backward (NTP, DST, leap seconds) which
+// would make `elapsed` negative and grant a spurious unlimited refill.  A
+// monotonic clock only goes forward, so elapsed is always non-negative.
+//
+// WHY AN ACTOR (not a shared dict + mutex)?
+// At NOVA_CARRIERS>1 (N worker threads), a plain shared dict is a data race:
+// two requests can simultaneously read tokens=1, both pass the >= 1 check, and
+// both decrement — leaving tokens=-1 (double-spend).  Conventional solutions
+// (Java Resilience4j, Guava RateLimiter) need a ReentrantLock or AtomicLong CAS
+// loop; under contention those degrade and still require careful GC-safe memory.
+//
+// NOVA's answer: the bucket state LIVES INSIDE one green task (_rl_loop).  All
+// callers send an envelope on a shared channel and park their own green task on
+// a private reply channel.  The actor serializes every operation through a
+// single-owner message loop — race-free by construction, zero mutexes, zero GC,
+// zero OS threads.  Works identically at NOVA_CARRIERS=1 and NOVA_CARRIERS=128.
+//
+// REFILL PRECISION NOTE:
+// Integer math truncates sub-millisecond refills.  When added==0 (elapsed too
+// small), we keep the OLD `last` timestamp so that elapsed accumulates across
+// calls and the fractional token is not silently discarded.  This prevents
+// systematic under-refill at high rates or fine-grained polling.
+//
+// API SUMMARY:
+//   ratelimit_new(capacity, refill_per_sec) -> handle
+//   ratelimit_allow(rl, key) -> 1 (allowed) or 0 (denied → send HTTP 429)
+//   ratelimit_tokens(rl, key) -> int   (current token count, metrics only)
+//   ratelimit_reset(rl, key)           (refill key's bucket to full)
+//   ratelimit_stop(rl)                 (terminate actor, call on shutdown only)
+//
+// Verified by reasoning — capacity=5 rate=10/sec:
+//   5 immediate ratelimit_allow calls → returns 1 each (tokens 5→4→3→2→1→0).
+//   6th call at t≈0ms → returns 0 (denied).
+//   Call at t=100ms: added = 10*100/1000 = 1 token → tokens=1 → returns 1.
+//   Call at t=101ms: added = 10*1/1000 = 0 (truncated), old last kept, elapsed
+//     accumulates until next refill threshold (~200ms for next token).
+//
+// LEAF MODULE — imports NOTHING. Only NOVA builtins: channel/spawn/send/receive/
+// contains/clock_ns/len/str.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// _rl_refill(tokens, last, now, cap, rate) -> list [newtokens, newlast]
+// Compute the token bucket state after a refill pass.  Returns a 2-element list:
+//   [0] = new token count (capped at cap)
+//   [1] = new last-refill timestamp (updated only when tokens were actually added)
+// Keeping `last` unchanged when added==0 lets sub-refill-period elapsed time
+// accumulate rather than resetting the clock on every no-op poll.
+fn _rl_refill(tokens: int, last: int, now: int, cap: int, rate: int) -> list
+    let elapsed = now - last
+    let added = (elapsed * rate) / 1000
+    let newlast = last
+    let newtokens = tokens + added
+    if added > 0
+        newlast = now
+    if newtokens > cap
+        newtokens = cap
+    let result = []
+    push(result, newtokens)
+    push(result, newlast)
+    result
+
+// _rl_loop(rl) — actor; owns ALL bucket state.
+// rl["req"]  : channel — inbound envelope channel.
+// rl["cap"]  : int     — token capacity (burst size), read once.
+// rl["rate"] : int     — refill tokens per second, read once.
+//
+// Bucket per key stored as a 2-element list in `buckets` dict:
+//   buckets[key][0] = current token count  (int)
+//   buckets[key][1] = last-refill timestamp (monotonic ms)
+//
+// Envelope protocol:
+//   op="allow"  key=str reply=chan -> send(reply, 1) allowed / 0 denied
+//   op="tokens" key=str reply=chan -> send(reply, current tokens after refill)
+//   op="reset"  key=str reply=0   -> refill key's bucket to full (fire-and-forget)
+//   op="stop"   reply=0           -> exit loop (fire-and-forget)
+fn _rl_loop(rl)
+    let cap = rl["cap"]
+    let rate = rl["rate"]
+    let buckets = {}
+    let running = 1
+    while running == 1
+        let env = receive(rl["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "allow"
+            let key = env["key"]
+            let now = clock_ns() / 1000000
+            if contains(buckets, key) == false
+                let init = []
+                push(init, cap)
+                push(init, now)
+                buckets[key] = init
+            let bucket = buckets[key]
+            let cur_tok = bucket[0]
+            let cur_last = bucket[1]
+            let filled = _rl_refill(cur_tok, cur_last, now, cap, rate)
+            let tok_after = filled[0]
+            let last_after = filled[1]
+            if tok_after >= 1
+                tok_after = tok_after - 1
+                let updated = []
+                push(updated, tok_after)
+                push(updated, last_after)
+                buckets[key] = updated
+                send(env["reply"], 1)
+            else
+                let keep = []
+                push(keep, tok_after)
+                push(keep, last_after)
+                buckets[key] = keep
+                send(env["reply"], 0)
+        else if op == "tokens"
+            let key = env["key"]
+            let now = clock_ns() / 1000000
+            if contains(buckets, key) == false
+                send(env["reply"], cap)
+            else
+                let bucket = buckets[key]
+                let cur_tok = bucket[0]
+                let cur_last = bucket[1]
+                let filled = _rl_refill(cur_tok, cur_last, now, cap, rate)
+                let tok_after = filled[0]
+                let last_after = filled[1]
+                let snap = []
+                push(snap, tok_after)
+                push(snap, last_after)
+                buckets[key] = snap
+                send(env["reply"], tok_after)
+        else if op == "reset"
+            let key = env["key"]
+            let now = clock_ns() / 1000000
+            let full = []
+            push(full, cap)
+            push(full, now)
+            buckets[key] = full
+
+// ratelimit_new(capacity, refill_per_sec) -> any
+// Create a token-bucket rate limiter actor.
+//   capacity       — maximum burst: requests allowed instantly when bucket is full.
+//   refill_per_sec — steady-state rate: tokens added per second (integer).
+// Returns a handle dict passed to all other functions.
+// The actor spawns immediately and runs until ratelimit_stop is called.
+fn ratelimit_new(capacity: int, refill_per_sec: int) -> any
+    let rl = {}
+    rl["req"] = channel()
+    rl["cap"] = capacity
+    rl["rate"] = refill_per_sec
+    spawn _rl_loop(rl)
+    rl
+
+// ratelimit_allow(rl, key) -> int
+// Attempt to consume one token for `key`.
+// Returns 1 if allowed (token consumed — proceed with the request).
+// Returns 0 if denied — caller MUST send HTTP 429 Too Many Requests.
+// This is the authoritative gate; ratelimit_tokens is metrics-only (TOCTOU unsafe).
+fn ratelimit_allow(rl, key: string) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "allow"
+    env["key"] = key
+    env["reply"] = rc
+    send(rl["req"], env)
+    receive(rc)
+
+// ratelimit_tokens(rl, key) -> int
+// Return the current token count for `key` (after computing a refill).
+// Returns capacity for an unseen key (bucket would be full).
+// METRICS / HEALTH ONLY — do NOT use as a gate (TOCTOU: count may change between
+// this read and a subsequent allow call).  ratelimit_allow is the sole gate.
+fn ratelimit_tokens(rl, key: string) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "tokens"
+    env["key"] = key
+    env["reply"] = rc
+    send(rl["req"], env)
+    receive(rc)
+
+// ratelimit_reset(rl, key)
+// Refill `key`'s bucket to full capacity (now_ms timestamp reset to now).
+// Fire-and-forget — no reply is awaited.
+// Use for: admin unlock of a temporarily banned key; test teardown; post-auth reset.
+// Note: no dict-delete builtin in NOVA — reset overwrites to [cap, now] (equivalent).
+fn ratelimit_reset(rl, key: string)
+    let env = {}
+    env["op"] = "reset"
+    env["key"] = key
+    env["reply"] = 0
+    send(rl["req"], env)
+
+// ratelimit_stop(rl)
+// Terminate the actor loop.  Fire-and-forget.
+// After this call the handle is invalid; any subsequent call will block forever.
+// Call ONLY during controlled shutdown (e.g., server teardown).
+fn ratelimit_stop(rl)
+    let env = {}
+    env["op"] = "stop"
+    env["reply"] = 0
+    send(rl["req"], env)
