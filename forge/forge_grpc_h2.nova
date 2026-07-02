@@ -1,0 +1,166 @@
+// forge_grpc_h2 -- gRPC-over-HTTP/2 (h2c cleartext) serving: wires the forge_grpc unary dispatcher onto
+// the HTTP/2 frame layer so a gRPC client gets real dispatch over cleartext h2 (no ALPN/TLS needed). A
+// unary gRPC call is: a HEADERS frame (:path = "/pkg.Svc/Method", content-type application/grpc) + a DATA
+// frame carrying the length-prefixed request message; the reply is HEADERS(:status 200) + DATA(framed
+// response) + a TRAILERS HEADERS frame carrying grpc-status/grpc-message with END_STREAM (gRPC puts the
+// status in trailers, not the :status line).
+//
+// The deterministic core is grpc_h2_handle(smap, frames, stream_id) -> reply frames -- pure bytes-in /
+// bytes-out, so it is fully unit-testable WITHOUT a socket. serve_grpc_h2c wraps it with the same TCP +
+// preface + SETTINGS loop shape as forge_h2_server.serve_h2c.
+//
+// Imports the leaf codecs (forge_h2 / forge_hpack / forge_grpc) -- all pure, single-level (no diamond).
+import forge_h2
+import forge_hpack
+import forge_grpc
+import forge_h2_server
+
+// Extract the :path pseudo-header (the gRPC method "/pkg.Svc/Method") from a decoded header list.
+fn grpc_h2_path(headers: list) -> string
+    let i = 0
+    while i < len(headers)
+        if headers[i][0] == ":path"
+            return headers[i][1]
+        i = i + 1
+    ""
+
+// Build the h2 frame sequence for a unary gRPC reply on `stream_id`:
+//   HEADERS(:status 200, content-type application/grpc+proto, END_HEADERS)
+//   DATA(framed_body)                         -- NOT end-stream (trailers follow)
+//   HEADERS(grpc-status, grpc-message, END_HEADERS + END_STREAM)   -- the trailers
+fn grpc_h2_reply_frames(stream_id: int, framed_body: list, status: int, message: string) -> list
+    let hdrs = []
+    push(hdrs, [":status", "200"])
+    push(hdrs, ["content-type", "application/grpc+proto"])
+    let out = forge_h2.h2_frame(forge_h2.h2_HEADERS(), forge_h2.h2_END_HEADERS(), stream_id, forge_hpack.hpack_encode_header_block(hdrs))
+    let dframe = forge_h2.h2_frame(forge_h2.h2_DATA(), 0, stream_id, framed_body)
+    let i = 0
+    while i < len(dframe)
+        push(out, dframe[i])
+        i = i + 1
+    let tr = []
+    push(tr, ["grpc-status", str(status)])
+    push(tr, ["grpc-message", message])
+    let tflags = forge_h2.h2_END_HEADERS() + forge_h2.h2_END_STREAM()
+    let tframe = forge_h2.h2_frame(forge_h2.h2_HEADERS(), tflags, stream_id, forge_hpack.hpack_encode_header_block(tr))
+    let j = 0
+    while j < len(tframe)
+        push(out, tframe[j])
+        j = j + 1
+    out
+
+// THE DETERMINISTIC CORE: given the raw h2 request frames (HEADERS + DATA) of a unary call, extract the
+// method path + the framed request message, dispatch via the service map, and return the reply frames.
+// Pure (bytes -> bytes). `stream_id` is echoed onto the reply (the serve loop passes the request's id).
+fn grpc_h2_handle(smap: dict, frames: list, stream_id: int) -> list
+    let path = ""
+    let reqbody = []
+    let pos = 0
+    let n = len(frames)
+    while pos < n
+        let fp = forge_h2.h2_frame_parse(frames, pos)
+        if len(fp) == 0
+            pos = n
+        else
+            if fp[0] == forge_h2.h2_HEADERS()
+                let dec = forge_hpack.hpack_decode_header_block(forge_h2.h2_payload(frames, fp), [])
+                path = grpc_h2_path(dec[0])
+            else if fp[0] == forge_h2.h2_DATA()
+                let db = forge_h2.h2_payload(frames, fp)
+                let k = 0
+                while k < len(db)
+                    push(reqbody, db[k])
+                    k = k + 1
+            pos = fp[5]
+    let res = forge_grpc.grpc_dispatch(smap, path, reqbody)
+    grpc_h2_reply_frames(stream_id, res["framed"], res["status"], res["message"])
+
+// Client/test helper: decode a gRPC reply frame sequence back to [grpc_status, framed_data_bytes] so a
+// test can verify grpc_h2_handle output without re-importing the codecs. framed_data_bytes is the DATA
+// payload (still gRPC-framed); grpc_status is the int from the trailers.
+fn grpc_h2_decode_reply(frames: list) -> list
+    let gstatus = 0 - 1
+    let data = []
+    let pos = 0
+    let n = len(frames)
+    while pos < n
+        let fp = forge_h2.h2_frame_parse(frames, pos)
+        if len(fp) == 0
+            pos = n
+        else
+            if fp[0] == forge_h2.h2_DATA()
+                let db = forge_h2.h2_payload(frames, fp)
+                let k = 0
+                while k < len(db)
+                    push(data, db[k])
+                    k = k + 1
+            else if fp[0] == forge_h2.h2_HEADERS()
+                let dec = forge_hpack.hpack_decode_header_block(forge_h2.h2_payload(frames, fp), [])
+                let hs = dec[0]
+                let i = 0
+                while i < len(hs)
+                    if hs[i][0] == "grpc-status"
+                        gstatus = parse_int(hs[i][1])
+                    i = i + 1
+            pos = fp[5]
+    [gstatus, data]
+
+// ── socket serve loop (mirrors forge_h2_server.serve_h2c; wraps grpc_h2_handle) ────────────────────────
+// serve_grpc_h2c(smap, port, n): accept up to n cleartext h2 connections; on each, read the preface,
+// reply SETTINGS, accumulate frames until a DATA frame carries END_STREAM (unary request complete), then
+// dispatch via grpc_h2_handle and write the reply frames. NOTE: the pure core (grpc_h2_handle) is
+// unit-tested; this socket wrapper mirrors the proven serve_h2c shape -- real grpc-client interop is the
+// remaining attended verification (needs an external gRPC client).
+fn serve_grpc_h2c(smap: dict, port: int, n: int)
+    let listener = tcp_listen(port)
+    let ci = 0
+    while ci < n
+        let conn = tcp_accept(listener)
+        if conn >= 0
+            _grpc_h2c_conn(smap, conn)
+        ci = ci + 1
+    tcp_close(listener)
+
+fn _grpc_h2c_conn(smap: dict, conn: int)
+    let buf = bytes(0)
+    while bytes_len(buf) < 24
+        let more = tcp_recv_bytes(conn)
+        if bytes_len(more) == 0
+            tcp_close(conn)
+            return
+        buf = bytes_concat(buf, more)
+    tcp_send_bytes(conn, forge_h2_server.list_to_bytes(forge_h2.h2_settings([])))
+    let blist = forge_h2_server.bytes_to_list(bytes_slice(buf, 24, bytes_len(buf)))
+    let sid = 1
+    let done = false
+    while done == false
+        let fp = forge_h2.h2_frame_parse(blist, 0)
+        if len(fp) == 0
+            let more = tcp_recv_bytes(conn)
+            if bytes_len(more) == 0
+                done = true
+            else
+                let ml = forge_h2_server.bytes_to_list(more)
+                let k = 0
+                while k < len(ml)
+                    push(blist, ml[k])
+                    k = k + 1
+        else
+            if fp[0] == forge_h2.h2_HEADERS()
+                sid = fp[2]
+            let is_end = (fp[1] & forge_h2.h2_END_STREAM()) != 0
+            if fp[0] == forge_h2.h2_DATA()
+                if is_end
+                    tcp_send_bytes(conn, forge_h2_server.list_to_bytes(grpc_h2_handle(smap, blist, sid)))
+                    done = true
+            if done == false
+                blist = _grpc_slice(blist, fp[5])
+    tcp_close(conn)
+
+fn _grpc_slice(lst: list, from_idx: int) -> list
+    let out = []
+    let i = from_idx
+    while i < len(lst)
+        push(out, lst[i])
+        i = i + 1
+    out

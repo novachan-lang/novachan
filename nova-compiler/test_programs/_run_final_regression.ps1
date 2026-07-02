@@ -233,7 +233,7 @@ $domain_tests = @(
     'forge_bulkhead_test','forge_flags_test','forge_discovery_test','forge_saga_test','forge_storage_test',
     'forge_cache_actor_test','forge_query_test','forge_helpers_test','forge_helpers2_test','forge_page_test',
     'forge_mq_dlq_test','forge_ratelimit_actor_test','forge_admin_model_test','forge_orm_hero_test',
-    'forge_live_oninfo_test','forge_hpack_huffman_test','forge_hpack_c41_test',
+    'forge_live_oninfo_test','forge_hpack_huffman_test','forge_hpack_c41_test','forge_grpc_h2_test',
     'forge_accesslog_test',
     'forge_spawn_test',
     'forge_recover_test',
