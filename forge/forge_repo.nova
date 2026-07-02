@@ -1,0 +1,68 @@
+// forge_repo -- S16: repository-pattern data depth (Spring Data / Django ORM ergonomics) as PURE query
+// builders. Each returns [sql, params] the caller runs via orm_all/orm_exec (typed rows via the typed-let).
+// Covers the data-depth gaps FORGE_FEATURE_AUDIT §D flagged: DERIVED QUERIES, ENTITY AUDITING, SOFT DELETES,
+// OPTIMISTIC LOCKING. All values are BOUND (?), never concatenated -> injection-safe by construction.
+//
+// LEAF MODULE -- imports NOTHING. Built-ins: keys, push, len, join.
+
+// ── derived queries (Spring Data findByXAndY / Django filter(**kwargs)) ────────────────────────────────
+// Build a parameterized "WHERE f1 = ? AND f2 = ?" from a {field: value} dict (equality conjunction).
+//   repo_where_eq({"name":"ada","active":"1"}) -> [" WHERE name = ? AND active = ?", ["ada","1"]]
+fn repo_where_eq(conds: dict) -> list
+    let parts = []
+    let params = []
+    for k in keys(conds)
+        push(parts, k + " = ?")
+        push(params, conds[k])
+    if len(parts) == 0
+        return ["", []]
+    [" WHERE " + join(parts, " AND "), params]
+
+// A full SELECT for a derived query. repo_find_sql("users", {"name":"ada"}) -> [sql, params].
+// Use with a typed let: let xs: list<User> = orm_all(db, sql, params).
+fn repo_find_sql(table: string, conds: dict) -> list
+    let w = repo_where_eq(conds)
+    ["SELECT * FROM " + table + w[0], w[1]]
+
+// ── entity auditing (@CreatedDate/@LastModifiedDate) ──────────────────────────────────────────────────
+// Stamp created_at (only when new) + updated_at onto a fields dict before insert/update. `ts` is the
+// caller's timestamp (e.g. str(time_ms()) or an ISO string). Mutates + returns the dict.
+fn repo_audit_stamp(fields: dict, is_new: bool, ts: string) -> dict
+    if is_new
+        fields["created_at"] = ts
+    fields["updated_at"] = ts
+    fields
+
+// ── soft deletes (@SQLDelete / Django paranoia / Ecto soft-delete) ────────────────────────────────────
+// Mark a row deleted (set deleted_at) instead of removing it.
+//   repo_soft_delete_sql("users", 5, "1699999999") -> ["UPDATE users SET deleted_at = ? WHERE id = ?", ["1699999999", 5]]
+fn repo_soft_delete_sql(table: string, id, ts: string) -> list
+    ["UPDATE " + table + " SET deleted_at = ? WHERE id = ?", [ts, id]]
+
+// The "only live rows" filter (soft-delete-aware) -- append to an existing WHERE.
+fn repo_active_clause() -> string
+    " AND deleted_at IS NULL"
+
+// A live-rows SELECT (WHERE deleted_at IS NULL + the derived conds).
+fn repo_find_active_sql(table: string, conds: dict) -> list
+    let w = repo_where_eq(conds)
+    let sql = "SELECT * FROM " + table
+    if len(w[1]) == 0
+        return [sql + " WHERE deleted_at IS NULL", []]
+    [sql + w[0] + " AND deleted_at IS NULL", w[1]]
+
+// ── optimistic locking (@Version) ─────────────────────────────────────────────────────────────────────
+// An UPDATE that applies ONLY if the row's version matches `expected_version` (else affected=0 -> a lost-
+// update conflict the caller reports as 409/412). Bumps version on success.
+//   repo_versioned_update_sql("users", {"name":"x"}, 5, 3)
+//     -> ["UPDATE users SET name = ?, version = version + 1 WHERE id = ? AND version = ?", ["x", 5, 3]]
+fn repo_versioned_update_sql(table: string, fields: dict, id, expected_version: int) -> list
+    let sets = []
+    let params = []
+    for k in keys(fields)
+        push(sets, k + " = ?")
+        push(params, fields[k])
+    push(sets, "version = version + 1")
+    push(params, id)
+    push(params, expected_version)
+    ["UPDATE " + table + " SET " + join(sets, ", ") + " WHERE id = ? AND version = ?", params]
