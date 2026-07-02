@@ -1,0 +1,135 @@
+// forge_graphql_ws — graphql-ws subprotocol MESSAGE CODEC (transport-agnostic).
+//
+// What graphql-ws is:
+//   The modern GraphQL-over-WebSocket subprotocol (iana name: "graphql-transport-ws").
+//   It replaces the older "subscriptions-transport-ws" (Apollo) with a cleaner, more
+//   spec-aligned design. Every exchange is a UTF-8 JSON frame carrying a "type" field and
+//   an optional "id" (string, per-subscription) and "payload" (message-specific dict/list).
+//
+// Message types and directions:
+//   client -> server:
+//     connection_init  — handshake opener (optional params in payload).
+//     subscribe        — start a subscription; id + payload={query, variables}.
+//     complete         — cancel a subscription (client-side close); id only.
+//   server -> client:
+//     connection_ack   — handshake accepted (no id/payload required).
+//     next             — one result event; id + payload={data: <resolver result>}.
+//     error            — subscription error; id + payload=[{message:"..."},...].
+//     complete         — subscription ended (server-side close); id only.
+//
+// This module is the CODEC only (build + parse the JSON frames). Pair it with:
+//   - forge WebSocket server (forge.ws / forge.ws_room) for the transport.
+//   - forge_graphql executor (gql_execute_limited_vars) to run the query and push
+//     next messages as the hub topic publishes new data.
+//
+// JSON construction: ALL frames are built by constructing dicts and calling
+// json_stringify — literal { } are NEVER written inside string literals (NOVA string
+// interpolation scans for bare braces).
+//
+// Verified by reasoning:
+//   gqlws_next("1", d)  ->  {"type":"next","id":"1","payload":{"data":<d>}}
+//   gqlws_error("1","boom") -> {"type":"error","id":"1","payload":[{"message":"boom"}]}
+//   gqlws_complete("1") ->  {"type":"complete","id":"1"}
+//   gqlws_parse(gqlws_next("2",d)) round-trips: gqlws_type -> "next", gqlws_id -> "2"
+//   gqlws_query on a subscribe message returns the query string; "" when absent.
+//
+// LEAF MODULE — imports NOTHING. Built-ins: json_stringify, json_decode, contains.
+
+// ── builders ──────────────────────────────────────────────────────────────────
+
+// gqlws_connection_ack() -> string
+// Server -> client handshake reply. Signals that the connection is accepted and
+// the client may now send subscribe messages.
+fn gqlws_connection_ack() -> string
+    let o = {}
+    o["type"] = "connection_ack"
+    json_stringify(o)
+
+// gqlws_next(id, data) -> string
+// Server -> client: one subscription result event. `id` matches the subscribe id;
+// `data` is the resolver result (any serialisable value: dict, list, scalar).
+// Wire shape: {"type":"next","id":"<id>","payload":{"data":<data>}}
+fn gqlws_next(id: string, data) -> string
+    let p = {}
+    p["data"] = data
+    let o = {}
+    o["type"] = "next"
+    o["id"] = id
+    o["payload"] = p
+    json_stringify(o)
+
+// gqlws_error(id, message) -> string
+// Server -> client: the subscription produced an error. Per the spec the payload is a
+// LIST of error objects (each with at least a "message" key), matching the GraphQL
+// error array shape so clients can handle it the same way as query errors.
+// Wire shape: {"type":"error","id":"<id>","payload":[{"message":"<message>"}]}
+fn gqlws_error(id: string, message: string) -> string
+    let e = {}
+    e["message"] = message
+    let errs = []
+    push(errs, e)
+    let o = {}
+    o["type"] = "error"
+    o["id"] = id
+    o["payload"] = errs
+    json_stringify(o)
+
+// gqlws_complete(id) -> string
+// Bidirectional: client sends to cancel a subscription; server sends when the
+// subscription stream is exhausted or closed. Both directions use the same shape.
+// Wire shape: {"type":"complete","id":"<id>"}
+fn gqlws_complete(id: string) -> string
+    let o = {}
+    o["type"] = "complete"
+    o["id"] = id
+    json_stringify(o)
+
+// ── parser ────────────────────────────────────────────────────────────────────
+
+// gqlws_parse(text) -> any
+// Parse a raw graphql-ws frame (UTF-8 JSON text) into a dict.
+// Pass the result to the gqlws_type / gqlws_id / gqlws_query / gqlws_variables
+// accessors to inspect message fields without touching raw dict keys at the call site.
+fn gqlws_parse(text: string) -> any
+    json_decode(text)
+
+// ── accessors ─────────────────────────────────────────────────────────────────
+
+// gqlws_type(m) -> string
+// The "type" field of a parsed message: "connection_init", "subscribe", "next",
+// "error", "complete", "connection_ack". Returns "" when absent (malformed frame).
+fn gqlws_type(m) -> string
+    if contains(m, "type")
+        return m["type"]
+    ""
+
+// gqlws_id(m) -> string
+// The per-subscription id. Present on subscribe, next, error, complete.
+// Absent on connection_init and connection_ack. Returns "" when absent.
+fn gqlws_id(m) -> string
+    if contains(m, "id")
+        return m["id"]
+    ""
+
+// gqlws_query(m) -> string
+// Extract the GraphQL query string from a subscribe message.
+// subscribe payload shape: {"query":"...","variables":{...}}
+// Returns "" when the message has no payload or the payload has no "query" key.
+fn gqlws_query(m) -> string
+    if contains(m, "payload")
+        let pl = m["payload"]
+        if contains(pl, "query")
+            return pl["query"]
+    ""
+
+// gqlws_variables(m) -> any
+// Extract the variables dict from a subscribe message (may be absent or null).
+// Returns an empty dict when there is no payload or no "variables" key, so callers
+// can always treat the result as a dict without a nil-check.
+fn gqlws_variables(m) -> any
+    if contains(m, "payload")
+        let pl = m["payload"]
+        if contains(pl, "variables")
+            return pl["variables"]
+    let empty = {}
+    empty
