@@ -1,0 +1,124 @@
+// forge_negotiate -- HTTP content negotiation over the `Accept` header (Spring `produces`, Rails
+// `respond_to`, FastAPI content negotiation). Given the client's `Accept` header and the media types
+// the server can produce, pick the best match honoring q-weights and wildcards.
+//
+// Q-WEIGHTS are carried as INTEGERS in 0..1000 (q=0.9 -> 900, q=1/absent -> 1000, no match -> 0) so
+// this LEAF module needs no float builtins. Match specificity: exact `type/subtype` beats `type/*`
+// beats `*/*` -- accept_q returns the q of the MOST specific matching Accept entry.
+//
+// LEAF MODULE -- imports NOTHING. Built-ins: split, trim, slice, find, len, starts_with, str,
+// parse_int, lower, push, contains.
+
+// _q_to_milli -- parse a decimal q value (a string like "1", "0.9", "0.85", "0") into 0..1000.
+// Split on ".": the integer part contributes *1000; the fractional part is padded/truncated to 3
+// digits and added. Guards against empty segments so "" / "." / "1." / ".5" don't crash.
+fn _q_to_milli(qs: string) -> int
+    let s = trim(qs)
+    if s == ""
+        return 1000
+    let dot = find(s, ".")
+    if dot == -1
+        // integer-only q, e.g. "1" or "0"
+        return parse_int(s) * 1000
+    let ip = slice(s, 0, dot)
+    let fp = slice(s, dot + 1, len(s))
+    let whole = 0
+    if ip != ""
+        whole = parse_int(ip)
+    // pad/truncate fractional part to exactly 3 digits
+    let frac3 = fp
+    if len(frac3) > 3
+        frac3 = slice(frac3, 0, 3)
+    while len(frac3) < 3
+        frac3 = frac3 + "0"
+    let frac = 0
+    if frac3 != ""
+        frac = parse_int(frac3)
+    whole * 1000 + frac
+
+// _media_type -- the type portion of a `type/subtype` media range (lowercased). "application/json"
+// -> "application", "*/*" -> "*", a bare "application" -> "application".
+fn _media_type(range: string) -> string
+    let r = lower(trim(range))
+    let sl = find(r, "/")
+    if sl == -1
+        return r
+    slice(r, 0, sl)
+
+// _media_sub -- the subtype portion of a `type/subtype` media range (lowercased). "application/json"
+// -> "json", "*/*" -> "*", a bare "application" -> "*" (treated as any subtype).
+fn _media_sub(range: string) -> string
+    let r = lower(trim(range))
+    let sl = find(r, "/")
+    if sl == -1
+        return "*"
+    slice(r, sl + 1, len(r))
+
+// _match_specificity -- how specifically an Accept entry `range` matches a concrete `media` type.
+// Returns: 3 = exact type/subtype, 2 = type/* (type matches, subtype wildcard), 1 = */* (full
+// wildcard), 0 = no match. Higher wins when choosing which Accept entry's q applies.
+fn _match_specificity(range: string, media: string) -> int
+    let rt = _media_type(range)
+    let rs = _media_sub(range)
+    let mt = _media_type(media)
+    let ms = _media_sub(media)
+    if rt == "*" and rs == "*"
+        return 1
+    if rt == mt
+        if rs == "*"
+            return 2
+        if rs == ms
+            return 3
+    0
+
+// accept_q -- the client's q-weight for a specific media type as an INTEGER in 0..1000.
+// Scans every Accept entry, and among the entries that match `media` returns the q of the MOST
+// specific one (exact beats type/* beats */*). q=0.9 -> 900, q=1/absent -> 1000, no match -> 0.
+fn accept_q(accept: string, media: string) -> int
+    let hdr = trim(accept)
+    if hdr == ""
+        return 1000
+    let best_spec = 0
+    let best_q = 0
+    for part in split(hdr, ",")
+        let p = trim(part)
+        if p != ""
+            let segs = split(p, ";")
+            let range = trim(segs[0])
+            let spec = _match_specificity(range, media)
+            if spec > 0
+                // parse q from any `q=NNN` parameter; absent -> 1000
+                let q = 1000
+                let i = 1
+                while i < len(segs)
+                    let seg = trim(segs[i])
+                    if starts_with(lower(seg), "q=")
+                        q = _q_to_milli(slice(seg, 2, len(seg)))
+                    i = i + 1
+                if spec > best_spec
+                    best_spec = spec
+                    best_q = q
+    best_q
+
+// accept_best -- choose the offered media type with the highest client q-weight. `offered` is in
+// server-PREFERENCE order (earlier = preferred), which breaks ties. Offered types the header doesn't
+// match (q effectively 0) are ineligible. Empty/absent Accept -> offered[0]. Nothing matches -> "".
+fn accept_best(accept: string, offered: list) -> string
+    if len(offered) == 0
+        return ""
+    let hdr = trim(accept)
+    if hdr == ""
+        return offered[0]
+    let best = ""
+    let best_q = 0
+    for cand in offered
+        let q = accept_q(hdr, cand)
+        // strictly greater keeps the earlier (more-preferred) offer on ties
+        if q > 0 and q > best_q
+            best = cand
+            best_q = q
+    best
+
+// wants_json -- convenience: true if the client will accept application/json (its q-weight > 0).
+fn wants_json(accept: string) -> bool
+    accept_q(accept, "application/json") > 0
