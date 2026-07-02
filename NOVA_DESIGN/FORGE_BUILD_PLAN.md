@@ -19,6 +19,7 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 - [FORGE_STATUS.md](FORGE_STATUS.md) — vision, competitor matrix, substrate insight, capability inventory (the "what/why"; see its §0 for the current reconciliation).
 - [FORGE_8DAY_SPRINT.md](FORGE_8DAY_SPRINT.md) — the deadline-driven re-ordering of the sprints below + the model-split working method (Opus architecture/compiler/runtime/review/gate; Sonnet mechanical lib impl). Subordinate to this plan; kept for the working-method reference.
 - [HTTP2_PLAN.md](HTTP2_PLAN.md) — Sprint S7 / P4 flagship build plan (HPACK → frame codec → flow control → ALPN-TLS → serve_h2 multiplex). The XL item; HPACK + frames land even if ALPN-TLS stalls.
+- [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md) — the RAPID-DEV track (2026-07 push): feature → module → commit → what-the-test-pass-must-verify → status. Each row is syntax-checked (gen3, compile-only) but NOT yet functionally tested; the FINAL track-driven test pass gates every row and flips it to tested. The working queue for the "develop fast, test at the end" mode.
 - _(add future per-feature spec docs here as they're created)_
 
 ---
@@ -26,6 +27,16 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 ## Build progress (live ledger)
 
 > Updated as tasks ship. Each entry: task → commit → gate. (FORGE_STATUS.md §3 is the capability view; this is the task-by-task ledger.)
+
+**RAPID-DEV batch (2026-07-02) — 27 features shipped syntax-checked (functional test deferred to the track-driven pass; see [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md) rows 1–27):**
+- **P3 microservice resilience (L7) — the Resilience4j-beating set is now COMPLETE:** `forge_bulkhead` (concurrency cap) + `forge_ratelimit` (per-key token bucket) + `forge_circuit` (CLOSED/OPEN/HALF_OPEN breaker) + `forge_retry` (exp backoff + jitter policy) — all N>1-safe actors (or pure fns). Advances §0 "P3 resilience decorators (timeout/retry/circuit-breaker)" from open → shipped-at-primitive-level.
+- **L6 universal comms:** `forge_protobuf` (varint/zigzag/tag wire) + `forge_grpc` (5-byte framing + path routing + status/trailers + unary dispatch over a fn-value service map) + `forge_graphql` (tokenizer + recursive-descent parser + executor over a resolver map + §11 depth/complexity DoS limits) + `forge_jsonrpc` (2.0 codec). gRPC/GraphQL were the §0 XL-frontier S8 items (message framing + execution now exist; HTTP/2 multiplex transport wiring remains, gated).
+- **L6 messaging (S10):** `forge_mq` (broker + FIFO + DLQ) + `forge_outbox` (transactional outbox, at-least-once, poll-then-ack).
+- **L10 crown jewels (S12):** model-driven admin — `admin_resource_model` auto-derives columns from a struct (field_names RTTI, zero annotation) + adds UPDATE/edit (Django-admin parity; injection-safe params + attr-safe esc).
+- **L8 observability:** W3C Trace Context propagation in forge.nova (traceparent parse/child/continue, CSPRNG ids, trace_id_of for log correlation) — pairs with the existing OTLP exporter.
+- **L1/HTTP ergonomics (forge.nova):** RFC 7231 media-type negotiation (`negotiate_type`, permille q-values) + CSV (RFC 4180) + NDJSON export — high-level NOVA (comprehensions + join).
+- **Supporting libs:** `forge_cache`, `forge_discovery` (registry + round-robin LB), `forge_saga` (orchestration + compensation), `forge_flags` (feature flags/AB), `forge_storage` (blob store), `forge_query` (composable SQL DSL), problem+json, cursor pagination, deadline propagation, REST helpers.
+- **Method:** Opus (architecture + forge.nova/complex modules + review of every diff for soundness) ; Sonnet 4.6 (leaf modules under precise Opus specs). Every commit gen3 syntax-checked (compile-only). NO functional test yet — that is the tracked FINAL pass. Known flagged gaps: `grpc_deframe` needs a bounds check before untrusted use; GraphQL v1 = queries only.
 
 **Sprint S1 — typed data front door — IN PROGRESS:**
 - **T2.1 — let-site typed-wrapper rewrites — ✅ DONE (commit `47f66da`).** `let r: Result<T> = body_as(s)` → `<T>__from_json_safe(s)` (the SAFE path, B5); `query_as(dict)` → `<T>__from_dict`; `db_find(pool,table,id)` → `<T>__from_dict(`*result row*`)`. Purely additive (reconverge gen5.ll==gen6.ll byte-identical) + 585×2. Verified end-to-end (`ada:36` / `min=10` / `bob`). Guard: `forge_typed_wrapper_test.nova`.
