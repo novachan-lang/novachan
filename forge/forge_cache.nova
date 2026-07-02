@@ -1,0 +1,129 @@
+// forge_cache — in-process keyed memo cache for the Forge web framework.
+//
+// Architecture: a single-owner ACTOR (one spawned green task draining a request channel) owns
+// ALL mutable cache state. Every carrier (scheduler thread) that calls cache_get / cache_put /
+// cache_delete sends an env dict over the request channel and parks until the actor replies.
+// This is CORRECT under N>1 NOVA_CARRIERS by construction — no locks, no atomics, no races.
+//
+// Beats Spring @Cacheable:  zero annotations, zero proxy magic, no AOP, no class hierarchy.
+//   Spring: @Cacheable(value="products", key="#id") on a method wired through a CGLIB proxy.
+//   NOVA:   cache_get(c, key) / cache_put(c, key, val) — plain function calls.
+//
+// Beats Django cache framework: no settings.py CACHES dict, no cache.set(k,v,timeout) — the
+//   actor IS the timeout policy (add TTL as a follow-on by tracking insert_ms in the entry).
+//
+// Entry representation: store[key] = [val] means PRESENT; store[key] = [] means DELETED
+//   (NOVA has no dict-key-delete; we tombstone with an empty list). len(entry)==1 ↔ present.
+//
+// Future: a distributed cache backend can replace the actor with a remote_send/remote_recv pair
+//   over a forge_dist channel — the public API (cache_new / cache_get / cache_put / cache_delete /
+//   cache_clear / cache_stop / cache_get_or) stays identical.
+//
+// LEAF module — imports NOTHING (only built-ins: channel, spawn, send, receive, contains, len,
+//   ok, err, is_ok, unwrap).
+
+// ── private actor loop ────────────────────────────────────────────────────────────────────────────
+
+// _cache_loop -- PRIVATE. The single actor task that owns the cache store.
+// `c` is the handle dict (contains c["req"]). The store is born HERE so that all new-key inserts
+// happen inside the owning task — the deep-copy-on-spawn rule means a dict born outside and sent
+// through spawn arrives without its dynamic key-insert capability.
+fn _cache_loop(c)
+    let store = {}
+    let running = 1
+    while running == 1
+        let env = receive(c["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "put"
+            let pval = [env["val"]]
+            store[env["key"]] = pval
+        else if op == "delete"
+            if contains(store, env["key"])
+                store[env["key"]] = []
+        else if op == "clear"
+            store = {}
+        else if op == "get"
+            if contains(store, env["key"])
+                let entry = store[env["key"]]
+                if len(entry) == 1
+                    send(env["reply"], entry)
+                else
+                    send(env["reply"], [])
+            else
+                send(env["reply"], [])
+
+// ── public API ────────────────────────────────────────────────────────────────────────────────────
+
+// cache_new() -> any
+// Create a new in-process cache. Returns a handle dict that all cache_* functions accept.
+// Spawns the actor immediately; the cache is ready on return.
+fn cache_new() -> any
+    let c = {}
+    c["req"] = channel()
+    spawn _cache_loop(c)
+    c
+
+// cache_put(c, key, val)
+// Store `val` under `key`. Fire-and-forget: does not wait for the actor to acknowledge.
+// Overwrites any previous value or tombstone under `key`.
+fn cache_put(c, key: string, val: string)
+    let env = {}
+    env["op"] = "put"
+    env["key"] = key
+    env["val"] = val
+    send(c["req"], env)
+
+// cache_get(c, key) -> Result
+// Retrieve the value for `key`. Returns ok(val) if present, err("cache: miss") if absent or
+// deleted. Parks the calling task on a reply channel until the actor responds — correct under
+// any carrier count.
+fn cache_get(c, key: string) -> Result<string>
+    let rc = channel()
+    let env = {}
+    env["op"] = "get"
+    env["key"] = key
+    env["reply"] = rc
+    send(c["req"], env)
+    let r = receive(rc)
+    if len(r) == 1
+        ok(r[0])
+    else
+        err("cache: miss")
+
+// cache_delete(c, key)
+// Mark `key` as deleted (tombstone). Fire-and-forget. A subsequent cache_get returns miss.
+// NOVA has no dict-key-delete; the actor overwrites the entry with [] (empty list = tombstone).
+fn cache_delete(c, key: string)
+    let env = {}
+    env["op"] = "delete"
+    env["key"] = key
+    send(c["req"], env)
+
+// cache_clear(c)
+// Evict ALL entries. The actor replaces the entire store dict with a fresh {}. Fire-and-forget.
+fn cache_clear(c)
+    let env = {}
+    env["op"] = "clear"
+    send(c["req"], env)
+
+// cache_stop(c)
+// Shut down the cache actor. In-flight requests may not be served. Call when the cache handle
+// will no longer be used (e.g. in a test teardown or graceful server shutdown).
+fn cache_stop(c)
+    let env = {}
+    env["op"] = "stop"
+    send(c["req"], env)
+
+// cache_get_or(c, key, fallback) -> string
+// Read-through convenience: if `key` is present return its value; otherwise store `fallback`
+// and return it. The "compute-and-memo" pattern without requiring a closure — `fallback` is the
+// precomputed value the caller supplies (lazy computation: call cache_get first, compute only on
+// miss, then call cache_put + return).
+fn cache_get_or(c, key: string, fallback: string) -> string
+    let r = cache_get(c, key)
+    if is_ok(r)
+        return unwrap(r)
+    cache_put(c, key, fallback)
+    fallback
