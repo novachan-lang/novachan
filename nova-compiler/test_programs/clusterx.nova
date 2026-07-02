@@ -172,6 +172,7 @@ fn _manager_loop(cmd_ch, self_addr)
                                     // scale with N; liveness is a best-effort hint, membership is the
                                     // hard truth — a phi-accrual/suspicion detector is increment 3.)
     let registry = {}               // D6.3 global registry: name -> value (a handle/addr), registered locally
+    let subs = {}                   // D6.5 cluster pubsub: topic -> [subscriber channels] (local subscribers)
     last_seen[self_addr] = time_ms()
     while true
         let cmd = receive(cmd_ch)
@@ -230,6 +231,19 @@ fn _manager_loop(cmd_ch, self_addr)
             if contains(registry, cmd["name"])
                 lv = registry[cmd["name"]]
             send(cmd["reply"], lv)
+        else if c == "sub"
+            let tp = cmd["topic"]
+            if contains(subs, tp) == false
+                subs[tp] = []
+            push(subs[tp], cmd["ch"])
+        else if c == "pub_local"
+            let tp2 = cmd["topic"]
+            if contains(subs, tp2)
+                let sl = subs[tp2]
+                let si = 0
+                while si < len(sl)
+                    send(sl[si], cmd["msg"])
+                    si = si + 1
 
 // ── acceptor: inbound connections route to the manager ──────────────────────
 
@@ -275,6 +289,9 @@ fn _handle_peer(conn, cmd_ch)
             let wreply = channel()
             send(cmd_ch, {"cmd": "lookup", "name": msg["name"], "reply": wreply})
             remote_send(conn, {"type": "found", "val": receive(wreply)})
+        else if msg["type"] == "pub"
+            // D6.5: a peer broadcast a message -> deliver to our LOCAL subscribers of that topic.
+            send(cmd_ch, {"cmd": "pub_local", "topic": msg["topic"], "msg": msg["msg"]})
     remote_close(conn)
 
 // ── outbound: join a seed (with retry — a transient connect failure must NOT leave
@@ -364,3 +381,26 @@ fn global_whereis(info, name)
                 else
                     remote_close(conn)
     ""
+
+// ── D6.5 cluster PubSub: publish on any node reaches subscribers on every node ─────────────────────────
+// cluster_subscribe(info, topic) -> a channel the caller receive()s published messages on (registered with
+// the local manager). cluster_broadcast(info, topic, msg) delivers to LOCAL subscribers AND fans out to
+// every LIVE peer (remote "pub"), whose manager delivers to ITS local subscribers. So a publish on node A
+// reaches a subscriber on node B. Best-effort (a dead peer just misses the message; connect fails fast).
+fn cluster_subscribe(info, topic)
+    let ch = channel()
+    send(info["cmd_ch"], {"cmd": "sub", "topic": topic, "ch": ch})
+    ch
+
+fn cluster_broadcast(info, topic, msg)
+    send(info["cmd_ch"], {"cmd": "pub_local", "topic": topic, "msg": msg})
+    let members = cluster_alive(info)
+    let self_addr = info["self"]
+    for m in members
+        if m != self_addr
+            let parts = split(m, ":")
+            let conn = remote_connect(parts[0], parse_int(parts[1]))
+            if conn != -1
+                remote_send(conn, {"type": "pub", "topic": topic, "msg": msg})
+                remote_close(conn)
+    0
