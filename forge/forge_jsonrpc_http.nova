@@ -1,0 +1,70 @@
+// forge_jsonrpc_http — wire the forge_jsonrpc codec to a live Forge HTTP endpoint. One call,
+// jsonrpc_route(app, "/rpc", methods), and your app speaks JSON-RPC 2.0 over plain HTTP POST: single
+// calls, NOTIFICATIONS (no id => no reply), and BATCH arrays are all handled. Method handlers are plain
+// functions in a map (name -> fn(params) -> result) — no stubs, no codegen. JSON-RPC rides ordinary
+// HTTP, so this is fully usable today (no HTTP/2 needed, unlike gRPC).
+//
+// Use with the dict-request serve path (forge.app + forge.serve_app_n): the handler reads the body via
+// forge.body_json (json_decode of req["body"]).
+//
+// NOT a leaf: imports forge (router + json) and forge_jsonrpc (codec). Safe — nothing imports THIS module
+// and forge does not import forge_jsonrpc, so the codec is reached only through here (no diamond).
+import forge
+import forge_jsonrpc
+
+// Convenience: a fresh method map, and fluent registration.
+//   let m = jsonrpc_methods()
+//   jsonrpc_register(m, "add", my_add)      // my_add(params) -> result
+fn jsonrpc_methods() -> dict
+    {}
+
+fn jsonrpc_register(methods: dict, name: string, handler) -> dict
+    methods[name] = handler
+    methods
+
+// Dispatch ONE parsed JSON-RPC message against the method map. Returns the response JSON string, or ""
+// for a notification (a request with no "id" gets no reply, per the 2.0 spec). Unknown method -> a
+// standard -32601 error (unless it was a notification, which stays silent).
+fn _jsonrpc_one(msg, methods) -> string
+    let method = jsonrpc_method(msg)
+    let is_notif = jsonrpc_is_notification(msg)
+    if contains(methods, method) == false
+        if is_notif
+            return ""
+        return jsonrpc_error(jsonrpc_id(msg), jsonrpc_method_not_found(), "method not found: " + method)
+    let h = methods[method]
+    let result = h(jsonrpc_params(msg))
+    if is_notif
+        return ""
+    jsonrpc_success(jsonrpc_id(msg), result)
+
+// The Forge handler: parse the body (a single object OR a batch array), dispatch each, and reply.
+// Batch -> a JSON array of only the non-notification responses (an all-notification batch replies 204).
+// Single notification -> 204 No Content. Otherwise -> 200 with the response object.
+fn _jsonrpc_handle(req, methods) -> string
+    let parsed = forge.body_json(req)
+    if type_of(parsed) == "list"
+        let parts = []
+        let i = 0
+        while i < len(parsed)
+            let r = _jsonrpc_one(parsed[i], methods)
+            if len(r) > 0
+                push(parts, r)
+            i = i + 1
+        if len(parts) == 0
+            return forge.text(204, "")
+        return forge.json(200, "[" + join(parts, ",") + "]")
+    let one = _jsonrpc_one(parsed, methods)
+    if len(one) == 0
+        return forge.text(204, "")
+    forge.json(200, one)
+
+// Register POST <path> as a JSON-RPC 2.0 endpoint backed by the method map.
+//   let app = forge.app()
+//   let m = forge_jsonrpc_http.jsonrpc_methods()
+//   forge_jsonrpc_http.jsonrpc_register(m, "add", my_add)
+//   forge_jsonrpc_http.jsonrpc_route(app, "/rpc", m)
+//   forge.serve_app_n(app, 8080, 128)
+fn jsonrpc_route(app, path: string, methods)
+    forge.post(app, path, fn(req) _jsonrpc_handle(req, methods))
+    app
