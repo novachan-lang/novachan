@@ -221,3 +221,53 @@ fn live_client_js() -> string
 // dynamics are produced separately by the view_fn; len(statics) == len(dynamics)+1 must hold.
 fn live_statics(markup: string, marker: string) -> any
     split(markup, marker)
+
+// -- Server-push re-render (Phoenix handle_info parity): on_info -----------------------------------------
+// The existing live view re-renders only on a CLIENT event. on_info adds SERVER-initiated updates: another
+// process (a PubSub subscriber, a timer, a job completion) pushes a message and the view re-renders + emits
+// a patch to the client -- no client action needed. This is what powers live dashboards / collaborative UI.
+// Same single-owner-actor model; both client events and server messages flow through ONE inbound channel
+// as tagged envelopes {"k": "ev"|"info", "d": payload}, so no `select` is needed. update_fn(state, ev) and
+// info_fn(state, msg) BOTH return the NEXT (fresh) state -- same fresh-state contract as _live_loop.
+fn _live_loop_info(view_fn, update_fn, info_fn, initial_state, in_ch, out_ch)
+    let state = initial_state
+    let prev_dyn = view_fn(state)
+    let running = 1
+    while running == 1
+        let env = receive(in_ch)
+        let new_state = state
+        if env["k"] == "info"
+            new_state = info_fn(state, env["d"])
+        else
+            new_state = update_fn(state, env["d"])
+        let new_dyn = view_fn(new_state)
+        let patch = live_diff(prev_dyn, new_dyn)
+        if patch_size(patch) > 0
+            send(out_ch, patch)
+        prev_dyn = new_dyn
+        state = new_state
+
+// Spawn a live view that also handles server-push messages. Handle {in,out}: drive client events with
+// live_send_ev, push server messages with live_send_info, drain patches with live_recv.
+fn live_view_info(view_fn, update_fn, info_fn, initial_state) -> any
+    let lv = {}
+    lv["in"] = channel()
+    lv["out"] = channel()
+    spawn _live_loop_info(view_fn, update_fn, info_fn, initial_state, lv["in"], lv["out"])
+    lv
+
+// Send a CLIENT event into an on_info live view (drives update_fn).
+fn live_send_ev(lv, ev) -> int
+    let env = {}
+    env["k"] = "ev"
+    env["d"] = ev
+    send(lv["in"], env)
+    0
+
+// Push a SERVER message into an on_info live view (drives info_fn) -- e.g. forward a pubsub broadcast here.
+fn live_send_info(lv, msg) -> int
+    let env = {}
+    env["k"] = "info"
+    env["d"] = msg
+    send(lv["in"], env)
+    0
