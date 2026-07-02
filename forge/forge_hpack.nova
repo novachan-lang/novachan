@@ -47,3 +47,150 @@ fn hpack_decode_int(buf: list, off: int, n: int) -> list
         if (b & 128) == 0
             cont = 0
     [i, pos]
+
+// The HPACK static table (RFC 7541 Appendix A), 61 entries as [name, value] (index i = _hpack_static()[i-1]).
+// Built via push (NOVA has no multi-line list literal).
+fn _hpack_static() -> list
+    let t = []
+    push(t, [":authority", ""])
+    push(t, [":method", "GET"])
+    push(t, [":method", "POST"])
+    push(t, [":path", "/"])
+    push(t, [":path", "/index.html"])
+    push(t, [":scheme", "http"])
+    push(t, [":scheme", "https"])
+    push(t, [":status", "200"])
+    push(t, [":status", "204"])
+    push(t, [":status", "206"])
+    push(t, [":status", "304"])
+    push(t, [":status", "400"])
+    push(t, [":status", "404"])
+    push(t, [":status", "500"])
+    push(t, ["accept-charset", ""])
+    push(t, ["accept-encoding", "gzip, deflate"])
+    push(t, ["accept-language", ""])
+    push(t, ["accept-ranges", ""])
+    push(t, ["accept", ""])
+    push(t, ["access-control-allow-origin", ""])
+    push(t, ["age", ""])
+    push(t, ["allow", ""])
+    push(t, ["authorization", ""])
+    push(t, ["cache-control", ""])
+    push(t, ["content-disposition", ""])
+    push(t, ["content-encoding", ""])
+    push(t, ["content-language", ""])
+    push(t, ["content-length", ""])
+    push(t, ["content-location", ""])
+    push(t, ["content-range", ""])
+    push(t, ["content-type", ""])
+    push(t, ["cookie", ""])
+    push(t, ["date", ""])
+    push(t, ["etag", ""])
+    push(t, ["expect", ""])
+    push(t, ["expires", ""])
+    push(t, ["from", ""])
+    push(t, ["host", ""])
+    push(t, ["if-match", ""])
+    push(t, ["if-modified-since", ""])
+    push(t, ["if-none-match", ""])
+    push(t, ["if-range", ""])
+    push(t, ["if-unmodified-since", ""])
+    push(t, ["last-modified", ""])
+    push(t, ["link", ""])
+    push(t, ["location", ""])
+    push(t, ["max-forwards", ""])
+    push(t, ["proxy-authenticate", ""])
+    push(t, ["proxy-authorization", ""])
+    push(t, ["range", ""])
+    push(t, ["referer", ""])
+    push(t, ["refresh", ""])
+    push(t, ["retry-after", ""])
+    push(t, ["server", ""])
+    push(t, ["set-cookie", ""])
+    push(t, ["strict-transport-security", ""])
+    push(t, ["transfer-encoding", ""])
+    push(t, ["user-agent", ""])
+    push(t, ["vary", ""])
+    push(t, ["via", ""])
+    push(t, ["www-authenticate", ""])
+    t
+
+// Look up an index in the combined static(1..61) + dynamic(62..) address space (dyn is most-recent-first).
+fn hpack_lookup(dyn: list, index: int) -> list
+    if index >= 1 and index <= 61
+        return _hpack_static()[index - 1]
+    let di = index - 62
+    if di >= 0 and di < len(dyn)
+        return dyn[di]
+    ["", ""]
+
+// Decode an HPACK string literal at `off`: [H-bit | 7-bit length][octets]. Returns [string, next_off, huff].
+// v1 handles RAW octets (H=0); Huffman (H=1) is the next unit (RFC C.3 uses raw, C.4 uses Huffman).
+fn hpack_decode_string(buf: list, off: int) -> list
+    let huff = 0
+    if (buf[off] & 128) != 0
+        huff = 1
+    let li = hpack_decode_int(buf, off, 7)
+    let length = li[0]
+    let pos = li[1]
+    let s = ""
+    let i = 0
+    while i < length
+        s = s + chr(buf[pos + i])
+        i = i + 1
+    [s, pos + length, huff]
+
+fn _prepend(lst: list, item) -> list
+    let out = [item]
+    let i = 0
+    while i < len(lst)
+        push(out, lst[i])
+        i = i + 1
+    out
+
+// Decode a full HPACK header block (buf) against the current dynamic table `dyn`. Returns
+// [headers (list of [name,value]), updated_dyn]. Handles: §6.1 indexed, §6.2.1 literal+incremental (adds to
+// dyn), §6.2.2/§6.2.3 literal without/never indexed, §6.3 dynamic-table size update (skipped). RAW literals
+// (Huffman is the next unit). This is the decode path serve_h2 uses to turn HEADERS into a request.
+fn hpack_decode_header_block(buf: list, dyn: list) -> list
+    let headers = []
+    let d = dyn
+    let pos = 0
+    let n = len(buf)
+    while pos < n
+        let b = buf[pos]
+        if (b & 128) != 0
+            let ii = hpack_decode_int(buf, pos, 7)
+            push(headers, hpack_lookup(d, ii[0]))
+            pos = ii[1]
+        else if (b & 64) != 0
+            let ii = hpack_decode_int(buf, pos, 6)
+            pos = ii[1]
+            let name = ""
+            if ii[0] > 0
+                name = hpack_lookup(d, ii[0])[0]
+            else
+                let ns = hpack_decode_string(buf, pos)
+                name = ns[0]
+                pos = ns[1]
+            let vs = hpack_decode_string(buf, pos)
+            pos = vs[1]
+            push(headers, [name, vs[0]])
+            d = _prepend(d, [name, vs[0]])
+        else if (b & 32) != 0
+            let ii = hpack_decode_int(buf, pos, 5)
+            pos = ii[1]
+        else
+            let ii = hpack_decode_int(buf, pos, 4)
+            pos = ii[1]
+            let name = ""
+            if ii[0] > 0
+                name = hpack_lookup(d, ii[0])[0]
+            else
+                let ns = hpack_decode_string(buf, pos)
+                name = ns[0]
+                pos = ns[1]
+            let vs = hpack_decode_string(buf, pos)
+            pos = vs[1]
+            push(headers, [name, vs[0]])
+    [headers, d]
