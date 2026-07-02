@@ -1,0 +1,242 @@
+// forge_graphql — a real GraphQL query engine for Forge (tokenizer + recursive-descent parser + executor),
+// with the §11-mandated DoS guards (max depth + max complexity). NOVA is Erlang-shaped, so a GraphQL
+// resolver is just a function; the schema is the resolver MAP + your plain NOVA structs/dicts — no SDL
+// file, no code-gen, no macro DSL (beats Absinthe's macro schema and graphene's class hierarchy).
+//
+// SCOPE (v1, honest): QUERIES — fields, aliases, scalar arguments (int/string/enum), arbitrarily nested
+// selection sets, and list-of-object results. NOT yet: fragments, variables ($x), directives, mutations/
+// subscriptions, input objects. These are additive (the parser is structured to grow). Flagged for the
+// functional test pass.
+//
+// EXECUTION MODEL — a resolver map (fieldName -> fn(parent, args) -> value):
+//   let r = {}
+//   r["todos"] = fn(parent, args) todo_list()          // returns a list of dicts/structs
+//   r["title"] = fn(parent, args) parent["title"]       // (optional — trivial fields auto-read below)
+//   let res = gql_execute("{ todos { title done } }", r, 0)   // res["data"]["todos"] = [{title,done},...]
+// A selected field with NO explicit resolver is read from its parent automatically (parent[name] for a
+// dict, field_get(parent,name) for a struct) — the "trivial resolver", so nested object fields need no
+// boilerplate. A resolver returning a list applies the sub-selection to EACH element (the common case).
+//
+// LEAF MODULE — imports NOTHING. Built-ins: len/push/slice/find/chr/parse_int/contains/type_of/
+// field_names/field_get/str + first-class fn values.
+
+// ── character classes ───────────────────────────────────────────────────────────────────────────────
+fn _gql_is_name_start(c: string) -> bool
+    find("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", c) >= 0
+
+fn _gql_is_digit(c: string) -> bool
+    find("0123456789", c) >= 0
+
+fn _gql_is_name_char(c: string) -> bool
+    _gql_is_name_start(c) or _gql_is_digit(c)
+
+// ── tokenizer ───────────────────────────────────────────────────────────────────────────────────────
+// Each token is a 2-element list [kind, value]. kinds: "lbrace" "rbrace" "(" ")" ":" "name" "int" "str"
+// "end". (Brace kinds are spelled out — a literal "{" in a NOVA string would trigger string interpolation.)
+// Whitespace AND commas are insignificant in GraphQL, so both are skipped. Lenient: unknown chars skipped.
+fn _gql_tokenize(q: string) -> list
+    let toks = []
+    let i = 0
+    let n = len(q)
+    while i < n
+        let c = q[i]
+        if c == " " or c == chr(9) or c == chr(10) or c == chr(13) or c == ","
+            i = i + 1
+        else if c == chr(123)
+            push(toks, ["lbrace", c])
+            i = i + 1
+        else if c == chr(125)
+            push(toks, ["rbrace", c])
+            i = i + 1
+        else if c == "(" or c == ")" or c == ":"
+            push(toks, [c, c])
+            i = i + 1
+        else if c == chr(34)
+            let start = i + 1
+            let j = start
+            while j < n and q[j] != chr(34)
+                j = j + 1
+            push(toks, ["str", slice(q, start, j)])
+            i = j + 1
+        else if _gql_is_digit(c) or c == "-"
+            let start = i
+            let j = i + 1
+            while j < n and _gql_is_digit(q[j])
+                j = j + 1
+            push(toks, ["int", slice(q, start, j)])
+            i = j
+        else if _gql_is_name_start(c)
+            let start = i
+            let j = i + 1
+            while j < n and _gql_is_name_char(q[j])
+                j = j + 1
+            push(toks, ["name", slice(q, start, j)])
+            i = j
+        else
+            i = i + 1
+    push(toks, ["end", ""])
+    toks
+
+// ── parser (cursor in a state dict: st["toks"], st["pos"]) ──────────────────────────────────────────
+fn _gql_peek(st) -> list
+    st["toks"][st["pos"]]
+
+fn _gql_advance(st) -> list
+    let t = st["toks"][st["pos"]]
+    st["pos"] = st["pos"] + 1
+    t
+
+// Argument value: int -> parse_int; string/enum/name -> the raw string.
+fn _gql_arg_value(tok) -> any
+    if tok[0] == "int"
+        return parse_int(tok[1])
+    tok[1]
+
+// "(" name ":" value ("," name ":" value)* ")"  -> dict of arg name -> value.
+fn _gql_parse_args(st) -> dict
+    let args = {}
+    _gql_advance(st)
+    while _gql_peek(st)[0] != ")" and _gql_peek(st)[0] != "end"
+        let key = _gql_advance(st)
+        if _gql_peek(st)[0] == ":"
+            _gql_advance(st)
+        let val = _gql_advance(st)
+        args[key[1]] = _gql_arg_value(val)
+    if _gql_peek(st)[0] == ")"
+        _gql_advance(st)
+    args
+
+// A field: [alias ":"] name [args] [selection-set]. Returns dict {name, alias, args, selections}.
+fn _gql_parse_field(st) -> dict
+    let f = {}
+    let name1 = _gql_advance(st)
+    let fname = name1[1]
+    let alias = fname
+    if _gql_peek(st)[0] == ":"
+        _gql_advance(st)
+        let name2 = _gql_advance(st)
+        fname = name2[1]
+    f["name"] = fname
+    f["alias"] = alias
+    let args = {}
+    if _gql_peek(st)[0] == "("
+        args = _gql_parse_args(st)
+    f["args"] = args
+    let sels = []
+    if _gql_peek(st)[0] == "lbrace"
+        sels = _gql_parse_selset(st)
+    f["selections"] = sels
+    f
+
+// selection set: lbrace field+ rbrace -> list of field dicts.
+fn _gql_parse_selset(st) -> list
+    let fields = []
+    _gql_advance(st)
+    while _gql_peek(st)[0] != "rbrace" and _gql_peek(st)[0] != "end"
+        push(fields, _gql_parse_field(st))
+    if _gql_peek(st)[0] == "rbrace"
+        _gql_advance(st)
+    fields
+
+// Parse a whole query document into the top-level selection list. Skips a leading operation keyword/name
+// ("query", "query GetUser", "mutation ...") by advancing to the first "{".
+fn gql_parse(query: string) -> list
+    let st = {}
+    st["toks"] = _gql_tokenize(query)
+    st["pos"] = 0
+    while _gql_peek(st)[0] != "lbrace" and _gql_peek(st)[0] != "end"
+        _gql_advance(st)
+    if _gql_peek(st)[0] == "end"
+        return []
+    _gql_parse_selset(st)
+
+// ── DoS guards (§11: GraphQL query depth + complexity limit) ──────────────────────────────────────────
+// Nesting depth of the selection tree (a flat query = 1). Reject before executing to bound work.
+fn gql_depth(fields: list) -> int
+    let maxd = 0
+    let i = 0
+    while i < len(fields)
+        let d = 1
+        let subs = fields[i]["selections"]
+        if len(subs) > 0
+            d = 1 + gql_depth(subs)
+        if d > maxd
+            maxd = d
+        i = i + 1
+    maxd
+
+// Total number of fields in the query (a crude complexity/cost measure) — bounds fan-out.
+fn gql_complexity(fields: list) -> int
+    let total = 0
+    let i = 0
+    while i < len(fields)
+        total = total + 1
+        let subs = fields[i]["selections"]
+        if len(subs) > 0
+            total = total + gql_complexity(subs)
+        i = i + 1
+    total
+
+// ── executor ──────────────────────────────────────────────────────────────────────────────────────
+// The trivial resolver: read `name` off `parent` when the field has no explicit resolver.
+fn _gql_field_from_parent(parent, name: string) -> any
+    let t = type_of(parent)
+    if t == "dict"
+        if contains(parent, name)
+            return parent[name]
+        return ""
+    if len(field_names(parent)) > 0
+        return field_get(parent, name)
+    ""
+
+// Apply a sub-selection to a resolved value: map over a list, else resolve the single object.
+fn _gql_apply_selections(sels: list, resolvers: dict, value) -> any
+    if type_of(value) == "list"
+        let out = []
+        let i = 0
+        while i < len(value)
+            push(out, _gql_resolve(sels, resolvers, value[i]))
+            i = i + 1
+        return out
+    _gql_resolve(sels, resolvers, value)
+
+// Resolve a selection list against a parent, producing a result dict keyed by field alias.
+fn _gql_resolve(fields: list, resolvers: dict, parent) -> dict
+    let out = {}
+    let i = 0
+    while i < len(fields)
+        let f = fields[i]
+        let name = f["name"]
+        let value = 0
+        if contains(resolvers, name)
+            let r = resolvers[name]
+            value = r(parent, f["args"])
+        else
+            value = _gql_field_from_parent(parent, name)
+        if len(f["selections"]) > 0
+            value = _gql_apply_selections(f["selections"], resolvers, value)
+        out[f["alias"]] = value
+        i = i + 1
+    out
+
+// gql_execute(query, resolvers, root) -> dict — GraphQL-shaped {"data": {...}}.
+fn gql_execute(query: string, resolvers: dict, root) -> dict
+    let ast = gql_parse(query)
+    let out = {}
+    out["data"] = _gql_resolve(ast, resolvers, root)
+    out
+
+// gql_execute_limited(query, resolvers, root, max_depth, max_complexity) -> dict.
+// The production entry point: rejects an over-deep / over-complex query with {"errors":[...]} BEFORE
+// executing any resolver (DoS defense — a maliciously nested query cannot force unbounded work).
+fn gql_execute_limited(query: string, resolvers: dict, root, max_depth: int, max_complexity: int) -> dict
+    let ast = gql_parse(query)
+    let out = {}
+    if gql_depth(ast) > max_depth
+        out["errors"] = ["query exceeds max depth " + str(max_depth)]
+        return out
+    if gql_complexity(ast) > max_complexity
+        out["errors"] = ["query exceeds max complexity " + str(max_complexity)]
+        return out
+    out["data"] = _gql_resolve(ast, resolvers, root)
+    out
