@@ -1,0 +1,114 @@
+// forge_storage -- leaf storage abstraction for the Forge web framework.
+//
+// Provides a backend-agnostic file/blob storage interface. The local backend stores blobs on disk
+// under a configurable root directory. Future backends (S3, GCS, Azure Blob) will present the
+// IDENTICAL seven-function interface — swap `storage_local(root)` for `storage_s3(bucket, region)`
+// and NOTHING else in the application changes.
+//
+// Design goals:
+//   - One interface for all backends (local now; S3/GCS behind the same API later).
+//   - Path-traversal-safe by construction: _storage_safe_key drops ".." / "." / "" segments.
+//   - LEAF module: imports NOTHING — only built-in functions (write_file, read_file, file_exists,
+//     remove_file, mkdir, len, split, push, str, find, starts_with, slice, contains, ok, err).
+//   - Beats Django `storages` on simplicity (no class hierarchy, no adapter boilerplate).
+//   - Beats Spring `Resource` on ergonomics (no checked IOException, Result instead).
+
+// ── handle constructor ────────────────────────────────────────────────────────────────────────────
+
+// storage_local -- create a local-disk storage handle.
+// `root` is the absolute directory under which all blobs are stored (e.g. "/data/uploads").
+// Returns a dict handle that all storage_* functions accept as the first argument.
+fn storage_local(root: string) -> dict
+    let h = {}
+    h["backend"] = "local"
+    h["root"] = root
+    h
+
+// ── key sanitization (path-traversal defence) ─────────────────────────────────────────────────────
+
+// _storage_safe_key -- PRIVATE. Sanitize a caller-supplied key to a safe relative path.
+// Algorithm: split on "/", drop every segment that is "", ".", or ".." (covers both the
+// canonical traversal pattern "../../etc/passwd" and zero-length artifacts from leading/
+// trailing/doubled slashes), rejoin survivors with "/".
+// Examples:
+//   "avatars/user_42.png"   -> "avatars/user_42.png"   (unchanged)
+//   "../../etc/passwd"      -> "etc/passwd"             (traversal stripped)
+//   "/leading/slash"        -> "leading/slash"          (empty leading segment dropped)
+//   "a//b"                  -> "a/b"                    (double-slash collapsed)
+//   ".."                    -> ""                        (pure traversal -> empty -> caller rejects)
+fn _storage_safe_key(key: string) -> string
+    let parts = split(key, "/")
+    let safe = []
+    let i = 0
+    while i < len(parts)
+        let seg = parts[i]
+        if seg != "" and seg != "." and seg != ".."
+            push(safe, seg)
+        i = i + 1
+    let result = ""
+    let j = 0
+    while j < len(safe)
+        if j == 0
+            result = safe[j]
+        else
+            result = result + "/" + safe[j]
+        j = j + 1
+    result
+
+// ── storage operations ────────────────────────────────────────────────────────────────────────────
+
+// storage_put -- write `content` (a string) under `key` in storage `s`.
+// The key is sanitized before use. Returns ok(safekey) on success, err(...) on failure.
+// Best-effort mkdir on the root directory first so callers don't have to pre-create it.
+fn storage_put(s: dict, key: string, content: string) -> Result
+    mkdir(s["root"])
+    let safekey = _storage_safe_key(key)
+    if len(safekey) == 0
+        return err("storage: empty key")
+    let path = s["root"] + "/" + safekey
+    let rc = write_file(path, content)
+    if rc == 0
+        ok(safekey)
+    else
+        err("storage: write failed: " + safekey)
+
+// storage_get -- read a blob by `key` from storage `s`.
+// Returns ok(content) if the blob exists, err("storage: not found: <key>") otherwise.
+fn storage_get(s: dict, key: string) -> Result
+    let safekey = _storage_safe_key(key)
+    if len(safekey) == 0
+        return err("storage: empty key")
+    let path = s["root"] + "/" + safekey
+    if file_exists(path)
+        ok(read_file(path))
+    else
+        err("storage: not found: " + safekey)
+
+// storage_exists -- return true if `key` exists in storage `s`, false otherwise.
+fn storage_exists(s: dict, key: string) -> bool
+    let safekey = _storage_safe_key(key)
+    if len(safekey) == 0
+        return false
+    let path = s["root"] + "/" + safekey
+    file_exists(path)
+
+// storage_delete -- remove a blob by `key` from storage `s`.
+// Returns ok(safekey) if deleted, err("storage: not found: <key>") if the blob was absent.
+fn storage_delete(s: dict, key: string) -> Result
+    let safekey = _storage_safe_key(key)
+    if len(safekey) == 0
+        return err("storage: empty key")
+    let path = s["root"] + "/" + safekey
+    if file_exists(path)
+        remove_file(path)
+        ok(safekey)
+    else
+        err("storage: not found: " + safekey)
+
+// storage_url -- return a URL path suitable for serving `key` over HTTP.
+// For the local backend this is "/storage/<safekey>" — the application mounts a static route
+// (e.g. forge.static(app, "/storage", root)) to serve files from that prefix.
+// TODO S3/GCS: signed URL (time-limited, HMAC-authenticated) — return from the backend's
+//              presign endpoint instead of the local path below.
+fn storage_url(s: dict, key: string) -> string
+    "/storage/" + _storage_safe_key(key)

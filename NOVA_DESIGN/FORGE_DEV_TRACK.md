@@ -24,4 +24,6 @@
 
 | # | Feature (competitor beat) | Module | Commit | What the test pass must verify | Status |
 |---|---|---|---|---|---|
-| 0 | Baseline (rapid-dev phase begins) | — | (this commit) | full gate was 621/0 before phase | ✅ gated |
+| 0 | Baseline (rapid-dev phase begins) | — | 8a2eee4 | full gate was 621/0 before phase | ✅ gated |
+| 1 | RFC 9457 problem+json (beat Spring @ControllerAdvice) | forge.nova | 72c8ff4 | problem(404,"x")→status 404 + Content-Type application/problem+json + body {type,title,status,detail}; problem_full adds instance when non-empty; _problem_title maps common codes | untested (syntax✓) |
+| 2 | File/blob storage abstraction (beat Django storages / Spring Resource) | forge_storage.nova (leaf) | 72c8ff4 | storage_local(root); put/get/exists/delete round-trip on local disk; storage_url→/storage/key; _storage_safe_key strips traversal ("../../etc/x"→"etc/x", "a//b"→"a/b", ".."→"") | untested (syntax✓) |
