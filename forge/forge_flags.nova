@@ -1,0 +1,88 @@
+// forge_flags — runtime feature flags / toggles + A/B variants for Forge.
+//
+// Architecture: a single-owner ACTOR (one spawned green task draining a request channel) owns
+// ALL flag state. Callers on any carrier send an env dict over the request channel and park
+// until the actor replies (for reads) or fire-and-forget (for writes). Correct under N>1
+// NOVA_CARRIERS by construction — no locks, no atomics, no races.
+//
+// Beats hard-coded conditionals: flags are toggled at runtime, no recompile, no redeploy.
+// Beats LaunchDarkly-for-the-simple-case: zero SDK, zero network, zero cost — all in-process.
+// A remote flag backend (env-var loader, HTTP polling, forge_pg persistence) can replace the
+// actor internals later; the public API (flags_new / flag_set / flag_enable / flag_disable /
+// flag_value / flag_on) stays identical — callers need not change.
+//
+// Flag values are strings: "on" / "off" for boolean toggles, or any variant string for A/B
+// (e.g. "blue" / "green", "v1" / "v2" / "control"). Unset flags return "" (empty string) and
+// flag_on() treats "" as false — safe default.
+//
+// LEAF module — imports NOTHING (only built-ins: channel, spawn, send, receive, contains).
+
+// ── private actor loop ────────────────────────────────────────────────────────────────────────────
+
+// _flags_loop -- PRIVATE. The single actor task that owns the flag store.
+// `f` is the handle dict (contains f["req"]). The flags dict is born HERE inside the loop so
+// that dynamic key inserts happen inside the owning task (deep-copy-on-spawn safe).
+fn _flags_loop(f)
+    let flags = {}
+    let running = 1
+    while running == 1
+        let env = receive(f["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "set"
+            flags[env["name"]] = env["val"]
+        else if op == "get"
+            if contains(flags, env["name"])
+                send(env["reply"], flags[env["name"]])
+            else
+                send(env["reply"], "")
+
+// ── public API ────────────────────────────────────────────────────────────────────────────────────
+
+// flags_new() -> any
+// Create a new feature-flag store. Returns a handle dict that all flag_* functions accept.
+// Spawns the actor immediately; the store is ready on return.
+fn flags_new() -> any
+    let f = {}
+    f["req"] = channel()
+    spawn _flags_loop(f)
+    f
+
+// flag_set(f, name, value)
+// Write `value` for flag `name`. Fire-and-forget — does not wait for actor acknowledgement.
+// Pass "on" / "off" for boolean toggles, or any variant string for A/B experiments.
+fn flag_set(f, name: string, value: string)
+    let env = {}
+    env["op"] = "set"
+    env["name"] = name
+    env["val"] = value
+    send(f["req"], env)
+
+// flag_enable(f, name)
+// Convenience: set flag `name` to "on". Equivalent to flag_set(f, name, "on").
+fn flag_enable(f, name: string)
+    flag_set(f, name, "on")
+
+// flag_disable(f, name)
+// Convenience: set flag `name` to "off". Equivalent to flag_set(f, name, "off").
+fn flag_disable(f, name: string)
+    flag_set(f, name, "off")
+
+// flag_value(f, name) -> string
+// Read the current value for flag `name`. Parks the calling task on a reply channel until
+// the actor responds. Returns "" (empty string) if the flag has never been set.
+fn flag_value(f, name: string) -> string
+    let rc = channel()
+    let env = {}
+    env["op"] = "get"
+    env["name"] = name
+    env["reply"] = rc
+    send(f["req"], env)
+    receive(rc)
+
+// flag_on(f, name) -> bool
+// Boolean read: returns true iff the flag value is exactly "on". Unset flags return false.
+// Use this for feature toggles; use flag_value() for A/B variant strings.
+fn flag_on(f, name: string) -> bool
+    flag_value(f, name) == "on"

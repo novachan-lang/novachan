@@ -1,0 +1,114 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_bulkhead — OUTBOUND concurrency cap (bulkhead) for Forge resilience.
+//
+// A bulkhead isolates OUTBOUND calls to a slow/flaky dependency so that one
+// misbehaving backend cannot exhaust all worker tasks.  This is the OUTBOUND
+// bulkhead; the INBOUND one is already the server's connection cap (forge_limits
+// conn_guard).  Wire one bulkhead per external dependency (DB pool, payment API,
+// ML-inference service, …).
+//
+// Why this beats Resilience4j Bulkhead:
+//   * Resilience4j uses either a semaphore (thread-pool blocking) or a separate
+//     bounded thread pool (context-switch heavy).  Both share the JVM heap and
+//     can be starved by GC pauses.
+//   * NOVA bulkhead is a pure ACTOR: a single green task owns ALL permit state.
+//     Callers send a message and park their own green task — zero OS threads, zero
+//     mutexes, zero GC.  Throughput is limited only by message passing, which is
+//     NOVA's fastest primitive.
+//   * Explicit API forces the caller to handle the "at capacity" (0) return and
+//     send a 503 / apply backpressure — no silent queue buildup, no hidden retry
+//     storm.
+//   * Works across NOVA_CARRIERS (N>1): actor task is pinned to one carrier; all
+//     acquire/release are serialised through it, so permit count is always exact
+//     under any carrier count.
+//
+// LEAF MODULE — imports NOTHING; only NOVA builtins: channel / spawn / send /
+// receive / contains.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// _bh_loop(b) — actor; owns permit state born inside the loop.
+// b["req"]  : channel — inbound envelope channel.
+// b["max"]  : int     — maximum concurrent in-flight slots (read once at start).
+//
+// Protocol envelopes (all born as local dicts by callers):
+//   {"op":"acquire","reply":chan} -> send(reply, 1) if slot available else send(reply, 0)
+//   {"op":"release","reply":0}   -> permits + 1 (fire-and-forget; reply not used)
+//   {"op":"avail",  "reply":chan} -> send(reply, current permits)
+//   {"op":"stop",   "reply":0}   -> exit loop (fire-and-forget; reply not used)
+fn _bh_loop(b)
+    let permits = b["max"]
+    let running = 1
+    while running == 1
+        let env = receive(b["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "acquire"
+            if permits > 0
+                permits = permits - 1
+                send(env["reply"], 1)
+            else
+                send(env["reply"], 0)
+        else if op == "release"
+            permits = permits + 1
+        else if op == "avail"
+            send(env["reply"], permits)
+
+// bulkhead_new(max_concurrent) -> any
+// Create a bulkhead that allows at most max_concurrent simultaneous in-flight
+// calls to a single dependency.  Returns the handle dict that all other
+// functions accept.  The actor task is spawned immediately and runs for the
+// lifetime of the process (or until bulkhead_stop is called).
+fn bulkhead_new(max_concurrent: int) -> any
+    let b = {}
+    b["req"] = channel()
+    b["max"] = max_concurrent
+    spawn _bh_loop(b)
+    b
+
+// bulkhead_try_acquire(b) -> int
+// Attempt to reserve one concurrency slot.
+// Returns 1 if a slot was granted (caller may proceed with the outbound call).
+// Returns 0 if the bulkhead is at capacity (caller should reject with 503 /
+// apply backpressure — do NOT proceed with the downstream call).
+// ALWAYS pair a 1-return with exactly one bulkhead_release when the call ends
+// (success or error).
+fn bulkhead_try_acquire(b) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "acquire"
+    env["reply"] = rc
+    send(b["req"], env)
+    receive(rc)
+
+// bulkhead_release(b)
+// Return one concurrency slot to the bulkhead.  Call this in BOTH the success
+// and the error path of the outbound call — a missing release permanently
+// consumes a permit (resource leak that degrades under load).
+fn bulkhead_release(b)
+    let env = {}
+    env["op"] = "release"
+    env["reply"] = 0
+    send(b["req"], env)
+
+// bulkhead_available(b) -> int
+// Return the number of permits currently available (0 = fully saturated).
+// Useful for metrics / health-check endpoints; do not use as a substitute for
+// try_acquire (TOCTOU: the count may change between the read and the acquire).
+fn bulkhead_available(b) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "avail"
+    env["reply"] = rc
+    send(b["req"], env)
+    receive(rc)
+
+// bulkhead_stop(b)
+// Terminate the actor loop.  After this call the bulkhead handle is invalid;
+// any subsequent try_acquire / release / available will block forever.
+// Call only during controlled shutdown.
+fn bulkhead_stop(b)
+    let env = {}
+    env["op"] = "stop"
+    env["reply"] = 0
+    send(b["req"], env)
