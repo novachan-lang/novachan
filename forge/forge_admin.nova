@@ -91,3 +91,123 @@ fn admin_resource(app, pool, table: string, cols)
     post(app, base, fn(req) _admin_create_resp(req, pool, table, cols))
     post(app, base + "/:id/delete", fn(req) _admin_delete_resp(req, pool, table, cols))
     app
+
+// ── Model-driven admin: columns AUTO-DERIVED from a struct + full CRUD incl. edit/update ────────────────
+// This is the Django admin's "admin.site.register(User)" — but the model is a plain NOVA struct, no
+// admin.py, no ModelAdmin subclass. admin_resource_model(app, pool, table, User()) derives the columns
+// from the struct via the RTTI keystone (field_names works through `any`), so adding a field to the struct
+// automatically adds it to the admin — zero annotation, zero duplication.
+
+// Column names auto-derived from a model struct instance (zero annotation).
+fn admin_cols_of(model_sample) -> list
+    field_names(model_sample)
+
+// Form/editable columns = every column except the auto-generated "id" primary key (comprehension filter).
+fn admin_form_cols(cols) -> list
+    [c for c in cols if c != "id"]
+
+// Create form over the EDITABLE columns only (id is DB-generated, never a form input).
+fn admin_render_create_form(table: string, cols) -> string
+    admin_render_form(table, admin_form_cols(cols))
+
+// List table WITH edit + delete actions per row (+ a "new" link). Values HTML-escaped; the model variant
+// uses this instead of admin_render_table so the existing renderer's output stays byte-stable for its test.
+fn admin_render_table_ed(table: string, cols, rows) -> string
+    let h = "<h1>" + esc(table) + "</h1><p><a href='/admin/" + esc(table) + "/new'>+ new</a></p><table border='1'><tr>"
+    let i = 0
+    while i < len(cols)
+        h = h + "<th>" + esc(cols[i]) + "</th>"
+        i = i + 1
+    h = h + "<th>actions</th></tr>"
+    let r = 0
+    while r < len(rows)
+        let row = rows[r]
+        h = h + "<tr>"
+        let c = 0
+        while c < len(cols)
+            let v = ""
+            if contains(row, cols[c])
+                v = str(row[cols[c]])
+            h = h + "<td>" + esc(v) + "</td>"
+            c = c + 1
+        let idv = ""
+        if contains(row, "id")
+            idv = str(row["id"])
+        h = h + "<td><a href='/admin/" + esc(table) + "/" + esc(idv) + "/edit'>edit</a> "
+        h = h + "<form method='post' action='/admin/" + esc(table) + "/" + esc(idv) + "/delete' style='display:inline'><button>delete</button></form></td></tr>"
+        r = r + 1
+    h + "</table>"
+
+// Pre-filled edit form (editable cols), posts to /admin/<table>/<id>/update. Values go into single-quoted
+// attributes; esc() escapes ' (&#39;) and " (&quot;) so a value can't break out (attribute-injection-safe).
+fn admin_render_edit_form(table: string, cols, row) -> string
+    let ec = admin_form_cols(cols)
+    let idv = ""
+    if contains(row, "id")
+        idv = str(row["id"])
+    let h = "<h2>edit " + esc(table) + " #" + esc(idv) + "</h2><form method='post' action='/admin/" + esc(table) + "/" + esc(idv) + "/update'>"
+    let i = 0
+    while i < len(ec)
+        let c = ec[i]
+        let v = ""
+        if contains(row, c)
+            v = str(row[c])
+        h = h + "<label>" + esc(c) + " <input name='" + esc(c) + "' value='" + esc(v) + "'></label><br>"
+        i = i + 1
+    h + "<button>update</button></form>"
+
+// Parameterized UPDATE of the editable columns for row `id`. Column names come from the model struct
+// (developer-controlled, not user input); VALUES and the id are bound (?), never concatenated -> injection-
+// safe, same trust model as admin_create. No-op (returns 0) if the model has no editable columns.
+fn admin_update(pool, table: string, cols, id, fields) -> int
+    let ec = admin_form_cols(cols)
+    if len(ec) == 0
+        return 0
+    let setclause = ""
+    let params = []
+    let i = 0
+    while i < len(ec)
+        let c = ec[i]
+        if len(params) == 0
+            setclause = c + "=?"
+        else
+            setclause = setclause + "," + c + "=?"
+        let v = ""
+        if contains(fields, c)
+            v = fields[c]
+        push(params, v)
+        i = i + 1
+    push(params, id)
+    pool_query(pool, "UPDATE " + table + " SET " + setclause + " WHERE id=?", params)
+    0
+
+fn _admin_list_resp_ed(pool, table, cols)
+    html(200, admin_render_table_ed(table, cols, db_all(pool, table)))
+
+fn _admin_create_resp_ed(req, pool, table, cols)
+    admin_create(pool, table, admin_form_cols(cols), body_form(req))
+    html(200, admin_render_table_ed(table, cols, db_all(pool, table)))
+
+fn _admin_edit_resp(req, pool, table, cols)
+    html(200, admin_render_edit_form(table, cols, db_find(pool, table, req.params["id"])))
+
+fn _admin_update_resp(req, pool, table, cols)
+    admin_update(pool, table, cols, req.params["id"], body_form(req))
+    html(200, admin_render_table_ed(table, cols, db_all(pool, table)))
+
+fn _admin_delete_resp_ed(req, pool, table, cols)
+    admin_delete(pool, table, req.params["id"])
+    html(200, admin_render_table_ed(table, cols, db_all(pool, table)))
+
+// Full CRUD admin for a model struct — list (with edit/delete/new), create, edit, update, delete.
+// Columns auto-derived from the struct; no cols argument needed.
+fn admin_resource_model(app, pool, table: string, model_sample)
+    let cols = admin_cols_of(model_sample)
+    let base = "/admin/" + table
+    get(app, base, fn(req) _admin_list_resp_ed(pool, table, cols))
+    get(app, base + "/new", fn(req) html(200, admin_render_create_form(table, cols)))
+    post(app, base, fn(req) _admin_create_resp_ed(req, pool, table, cols))
+    get(app, base + "/:id/edit", fn(req) _admin_edit_resp(req, pool, table, cols))
+    post(app, base + "/:id/update", fn(req) _admin_update_resp(req, pool, table, cols))
+    post(app, base + "/:id/delete", fn(req) _admin_delete_resp_ed(req, pool, table, cols))
+    app
