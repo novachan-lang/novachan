@@ -40,6 +40,14 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 
 **Method:** Opus (architecture + forge.nova/complex modules + review of every diff for soundness) ; Sonnet 4.6 (leaf modules under precise Opus specs). Every commit gen3 syntax-checked (compile-only). NO functional test yet — that is the tracked FINAL pass. Known flagged gaps: `grpc_deframe` needs a bounds check before untrusted use; GraphQL v1 = queries only.
 
+**2026-07-02 continued — HTTP/2 serving + S8 gRPC serve + S5/S12 finish (all _fdb_one-tested, in the regression manifest):**
+- **D2.5 h2c serve — ✅ verified live** (`forge_h2c_test`) and now Huffman-capable (hpack_decode_string decodes H=1, so browser-compressed HEADERS parse; RFC C.4.1 header block decodes end-to-end).
+- **S8 gRPC-over-h2c SERVING — ✅ (`forge_grpc_h2.nova`).** `grpc_h2_handle` (HEADERS(:path)+DATA(framed msg) → grpc_dispatch → HEADERS(:status 200)+DATA(framed reply)+trailers(grpc-status)) + `serve_grpc_h2c` socket loop. SOCKET-VERIFIED via a NOVA-as-client loopback test (`forge_grpc_h2c_serve_test`; caught+fixed a serve-loop path-capture bug). Real gRPC over cleartext HTTP/2, no ALPN. (D3.3-ish without the typed `service` sugar, which needs #8.)
+- **S5 LiveView `on_info` — ✅ (`forge_live.nova`).** `live_view_info`/`live_send_ev`/`live_send_info` — server-push re-render (Phoenix handle_info parity), tagged-envelope dispatch, no select (`forge_live_oninfo_test`). Closes the S5 "GenServer on_info" remainder.
+- **S12 auto-admin model variant — ✅ (`forge_admin.nova`).** `admin_resource_model(app, pool, table, Sample())` — columns auto-derived from the struct (field_names) + UPDATE/edit added (D7.1 zero-annotation CRUD, over the existing cols-based admin) (`forge_admin_model_test`).
+- **S1 hero DB — ✅ re-hardened.** `orm_insert` now skips id==0 → DB auto-assigns the PK (`forge_orm_hero_test`: struct insert → typed get with auto id).
+- **~28 new tests registered in `_run_final_regression.ps1`** (parallel + the h2c-grpc server test serial); `_forge_ci` = 89/89 PASS both RC modes.
+
 **Sprint S1 — typed data front door — IN PROGRESS:**
 - **T2.1 — let-site typed-wrapper rewrites — ✅ DONE (commit `47f66da`).** `let r: Result<T> = body_as(s)` → `<T>__from_json_safe(s)` (the SAFE path, B5); `query_as(dict)` → `<T>__from_dict`; `db_find(pool,table,id)` → `<T>__from_dict(`*result row*`)`. Purely additive (reconverge gen5.ll==gen6.ll byte-identical) + 585×2. Verified end-to-end (`ada:36` / `min=10` / `bob`). Guard: `forge_typed_wrapper_test.nova`.
 - **T2.9 — crash-safe `from_json` — ✅ VERIFIED ALREADY DONE (no code change).** B5a ("raw `from_json` SEGFAULTs on partial input") was a STALE finding: `_make_from_dict_method`/`_make_from_json_method` already coerce non-dict input to `{}` and default every missing field. Tested: a partial body missing the nested-struct, float, and list fields returns a defaulted struct, exit 0, **no segfault**. → B5a should be struck from §4.
