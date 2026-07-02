@@ -54,6 +54,17 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 HIGH-LEVEL DEPTH — S14-S19 delivered (rows 48-61; the DEEP features from FORGE_FEATURE_AUDIT.md, gen3 syntax-checked, functional tests deferred):**
+- **S14 (P0) config + DI ergonomic** — `forge_config.nova`: config + profiles + typed getters + `config_from_env`/`config_for_profile`; service registry (provide/resolve) + request-scoped `ctx`. (Audit §A/§C.)
+- **S15 (P0/P1) declarative cross-cutting** — `forge_aspects.nova`: `cached`/`cache_forget` (@Cacheable), `retried` (@Retryable), `timed` (@Timed), `every` (@Scheduled) as HOF decorators over a 0-arg closure. (Audit §B.)
+- **S16 (P1) data depth** — `forge_repo.nova`: derived queries (repo_where_eq/find_sql), entity auditing (repo_audit_stamp), soft deletes (repo_soft_delete/active), optimistic locking (repo_versioned_update). (Audit §D.)
+- **S17 (P1) web/rendering depth** — `forge_template.nova` (interpolation+layout inheritance, auto-escape), `forge_forms.nova` (Django form objects define/validate/render), `forge_errmap.nova` (@ControllerAdvice registry), `forge_hateoas.nova` (HAL links). (Audit §E/§G.)
+- **S18 (P1) platform depth** — `forge_events.nova` (application event bus, sync+async), `forge_i18n.nova` (message bundles + locale + {param}), `forge_method_security.nova` (@PreAuthorize), `forge_lockout.nova` (brute-force guard), `forge_test.nova` (MockMvc/Django-Client test harness). (Audit §F/§H/§K/§L.)
+- **S19 (P2) ops/DX** — `forge_actuator.nova` (routes/info/redacted-env introspection), `forge_batch.nova` (chunk ETL). (Audit §I/§J.)
+- REMAINING audit gaps (smaller): TOTP 2FA (needs crypto), versioned migration files + seeding + model callbacks (S16), per-resource generators, DI request-scope wiring into serve, NATS/Kafka transport (external). Plus the GATED compiler/runtime tier (interfaces #8, ALPN-TLS, WASM, `with tx{}` syntax).
+
+
+
 > Updated as tasks ship. Each entry: task → commit → gate. (FORGE_STATUS.md §3 is the capability view; this is the task-by-task ledger.)
 
 **RAPID-DEV batch (2026-07-02) — 27 features shipped syntax-checked (functional test deferred to the track-driven pass; see [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md) rows 1–27):**
