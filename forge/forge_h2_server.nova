@@ -1,0 +1,79 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_h2_server — HTTP/2 serve integration (D2.5). Maps between HTTP/2 HEADERS/DATA frames and Forge's
+// Request/Response, so an h2 stream routes through the EXISTING router. Imports forge (Request/Response +
+// build_request) + forge_hpack (header compression) + forge_h2 (frame codec). Tests import ONLY this module
+// (single import path -> no module diamond). The socket serve loop (serve_h2c, cleartext h2c prior-knowledge)
+// rides these + tcp; this unit is the deterministic mapping core. See NOVA_DESIGN/HTTP2_PLAN.md.
+// ══════════════════════════════════════════════════════════════════════════════
+import forge
+import forge_hpack
+import forge_h2
+
+// Map a decoded HPACK header list ([[name,value],...], pseudo-headers first) to a Forge Request by
+// synthesizing the equivalent HTTP/1.1 message and reusing forge.build_request (so the router, params,
+// query all work unchanged). :method/:path drive the request line; :authority -> Host; :scheme/other
+// pseudo-headers are dropped; ordinary headers pass through.
+fn h2_request_from_headers(headers: list) -> Request
+    let method = "GET"
+    let path = "/"
+    let hdrs = ""
+    let i = 0
+    while i < len(headers)
+        let h = headers[i]
+        if h[0] == ":method"
+            method = h[1]
+        else if h[0] == ":path"
+            path = h[1]
+        else if h[0] == ":authority"
+            hdrs = hdrs + "Host: " + h[1] + "\r\n"
+        else if not starts_with(h[0], ":")
+            hdrs = hdrs + h[0] + ": " + h[1] + "\r\n"
+        i = i + 1
+    forge.build_request(method + " " + path + " HTTP/1.1\r\n" + hdrs + "\r\n", 0)
+
+// Encode a Forge Response as the HTTP/2 frames for a stream: a HEADERS frame ([:status] + response headers,
+// HPACK-encoded, END_HEADERS) followed by a DATA frame (body, END_STREAM). Returns the concatenated byte list.
+fn h2_response_frames(resp: Response, stream_id: int) -> list
+    let hdrs = []
+    push(hdrs, [":status", str(resp.status)])
+    let ks = keys(resp.headers)
+    let i = 0
+    while i < len(ks)
+        push(hdrs, [lower(ks[i]), resp.headers[ks[i]]])
+        i = i + 1
+    let hblock = forge_hpack.hpack_encode_header_block(hdrs)
+    let out = forge_h2.h2_frame(forge_h2.h2_HEADERS(), forge_h2.h2_END_HEADERS(), stream_id, hblock)
+    let body = []
+    let j = 0
+    while j < len(resp.body)
+        push(body, ord(char_at(resp.body, j)))
+        j = j + 1
+    let dframe = forge_h2.h2_frame(forge_h2.h2_DATA(), forge_h2.h2_END_STREAM(), stream_id, body)
+    let k = 0
+    while k < len(dframe)
+        push(out, dframe[k])
+        k = k + 1
+    out
+
+// Client/test-side: decode the response frames (HEADERS + DATA) back to [status, body]. Useful for an h2
+// client and to verify h2_response_frames without a second import of forge_h2/forge_hpack in the test.
+fn h2_decode_response(frames: list) -> list
+    let f1 = forge_h2.h2_frame_parse(frames, 0)
+    let dec = forge_hpack.hpack_decode_header_block(forge_h2.h2_payload(frames, f1), [])
+    let hs = dec[0]
+    let status = 0
+    let i = 0
+    while i < len(hs)
+        if hs[i][0] == ":status"
+            let sr = parse_int_safe(hs[i][1])
+            if is_ok(sr)
+                status = unwrap(sr)
+        i = i + 1
+    let f2 = forge_h2.h2_frame_parse(frames, f1[5])
+    let db = forge_h2.h2_payload(frames, f2)
+    let body = ""
+    let j = 0
+    while j < len(db)
+        body = body + chr(db[j])
+        j = j + 1
+    [status, body]
