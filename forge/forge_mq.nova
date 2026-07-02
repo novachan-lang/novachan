@@ -1,130 +1,80 @@
-// forge_mq -- in-process topic message broker + dead-letter queue (DLQ).
-// Beats Kafka/RabbitMQ/NATS for the single-node case: zero broker infra, one publish/consume API.
-// A real broker backend (RabbitMQ, NATS, Kafka) can sit behind the same API later with zero caller changes.
+// forge_mq -- an in-process message broker: NAMED queues with work-sharing (each message is delivered to
+// exactly ONE consumer, vs forge.hub() which broadcasts to ALL). This is the "background jobs / task
+// queue" substrate -- the thing apps reach for RabbitMQ/Sidekiq to do. The broker is a single-owner ACTOR
+// (a spawned loop draining a request channel) -> race-free queue registry, no locks. Queues are bounded
+// channels (natural backpressure + buffering so a publish doesn't block before a consumer exists).
 //
-// Design: single-owner ACTOR (spawned _mq_loop drains a request channel).
-// Per-topic FIFO queue via a list + head index: push appends O(1), consume advances head O(1).
-// List grows unbounded in v1 — compaction (trim head-dead prefix) is a follow-up.
-// All dict/list state is born inside _mq_loop, ensuring race-free ownership (no locks needed).
-//
-// Public API:
-//   mq_new()                             -> any           create broker handle + spawn actor
-//   mq_publish(m, topic, msg)                             deliver msg to topic queue
-//   mq_consume(m, topic)                 -> Result<string> pull next message or err("mq: empty")
-//   mq_depth(m, topic)                   -> int           unconsumed message count
-//   mq_dead_letter(m, topic, msg)                         push poison msg to topic DLQ
-//   mq_dlq(m, topic)                     -> list          all DLQ messages for topic
-//   mq_stop(m)                                            shut down the broker actor
+// v1 = named FIFO queues + work-sharing + a DEAD-LETTER queue (poison-message sink). A dead-letter queue
+// is just another named queue by convention (name + "._dlq"), drained like any other -- exactly how real
+// brokers model it. Follow-ons (design, not yet built): explicit ack/nack + redelivery on consumer crash,
+// topic->queue routing, and disk persistence for durability.
 
-// _mq_loop is the actor: owns ALL queue state; serialises every operation.
-fn _mq_loop(m)
+fn _mq_loop(req)
     let queues = {}
-    let heads = {}
-    let dlq = {}
     let running = 1
     while running == 1
-        let env = receive(m["req"])
+        let env = receive(req)
         let op = env["op"]
         if op == "stop"
             running = 0
-        else if op == "publish"
-            let tp = env["topic"]
-            if contains(queues, tp) == false
-                queues[tp] = []
-                heads[tp] = 0
-            push(queues[tp], env["msg"])
-        else if op == "consume"
-            let tp = env["topic"]
-            if contains(queues, tp) == false
-                send(env["reply"], [])
-            else
-                let q = queues[tp]
-                let h = heads[tp]
-                if h >= len(q)
-                    send(env["reply"], [])
-                else
-                    heads[tp] = h + 1
-                    let one = [q[h]]
-                    send(env["reply"], one)
-        else if op == "depth"
-            let tp = env["topic"]
-            if contains(queues, tp)
-                send(env["reply"], len(queues[tp]) - heads[tp])
-            else
-                send(env["reply"], 0)
-        else if op == "dlq_put"
-            let tp = env["topic"]
-            if contains(dlq, tp) == false
-                dlq[tp] = []
-            push(dlq[tp], env["msg"])
-        else if op == "dlq_list"
-            let tp = env["topic"]
-            if contains(dlq, tp)
-                send(env["reply"], dlq[tp])
-            else
-                send(env["reply"], [])
+        else
+            // "queue": ensure the named queue exists, reply with its (shared) channel handle
+            let nm = env["q"]
+            if contains(queues, nm) == false
+                queues[nm] = channel_bounded(1024)
+            send(env["reply"], queues[nm])
 
-// mq_new creates a broker handle and spawns its actor.
-fn mq_new() -> any
-    let m = {}
-    m["req"] = channel()
-    spawn _mq_loop(m)
-    m
+// Create a broker (spawns its actor). Use mq_publish / mq_consumer against the returned handle.
+fn mq_broker() -> any
+    let b = {}
+    b["req"] = channel()
+    spawn _mq_loop(b["req"])
+    b
 
-// mq_publish delivers msg to topic (fire-and-forget; creates topic on first use).
-fn mq_publish(m, topic: string, msg: string)
-    let env = {}
-    env["op"] = "publish"
-    env["topic"] = topic
-    env["msg"] = msg
-    send(m["req"], env)
-
-// mq_consume pulls the next unconsumed message from topic.
-// Returns ok(msg) if one is available, err("mq: empty") if the queue is drained or missing.
-fn mq_consume(m, topic: string) -> Result<string>
+// Look up (or create) a queue's channel via the broker. Internal -- callers use publish/consumer.
+fn _mq_queue(b, name)
     let rc = channel()
     let env = {}
-    env["op"] = "consume"
-    env["topic"] = topic
+    env["op"] = "queue"
+    env["q"] = name
     env["reply"] = rc
-    send(m["req"], env)
-    let r = receive(rc)
-    if len(r) == 1
-        ok(r[0])
-    else
-        err("mq: empty")
-
-// mq_depth returns the number of unconsumed messages on topic (0 if topic unknown).
-fn mq_depth(m, topic: string) -> int
-    let rc = channel()
-    let env = {}
-    env["op"] = "depth"
-    env["topic"] = topic
-    env["reply"] = rc
-    send(m["req"], env)
+    send(b["req"], env)
     receive(rc)
 
-// mq_dead_letter pushes msg onto the dead-letter queue for topic.
-// Call this when a consumer gives up retrying a poison message.
-fn mq_dead_letter(m, topic: string, msg: string)
-    let env = {}
-    env["op"] = "dlq_put"
-    env["topic"] = topic
-    env["msg"] = msg
-    send(m["req"], env)
+// Publish a message onto a named queue (creates the queue on first use).
+fn mq_publish(b, name, msg) -> int
+    send(_mq_queue(b, name), msg)
+    0
 
-// mq_dlq returns all dead-lettered messages for topic (empty list if none).
-fn mq_dlq(m, topic: string) -> list
-    let rc = channel()
-    let env = {}
-    env["op"] = "dlq_list"
-    env["topic"] = topic
-    env["reply"] = rc
-    send(m["req"], env)
-    receive(rc)
+// Get a consumer handle for a named queue. Multiple consumers on the same queue SHARE the work: each
+// message goes to exactly one of them (channel semantics). Pull messages with mq_pull (blocks/parks until
+// one is available).
+fn mq_consumer(b, name) -> any
+    _mq_queue(b, name)
 
-// mq_stop shuts down the broker actor (in-flight messages are abandoned).
-fn mq_stop(m)
+fn mq_pull(consumer) -> any
+    receive(consumer)
+
+// ── Dead-letter queue (poison-message sink) ─────────────────────────────────────────────────────────
+// The DLQ for queue `name` is the conventional queue `name + "._dlq"`. When a consumer decides a message
+// is unprocessable (bad payload, exceeded retries), it dead-letters it here instead of dropping it, so an
+// operator can inspect/replay poison messages. Drained with mq_pull on the dlq consumer, like any queue.
+fn _mq_dlq_name(name) -> string
+    name + "._dlq"
+
+// Route a poison message to queue `name`'s dead-letter queue.
+fn mq_dead_letter(b, name, msg) -> int
+    mq_publish(b, _mq_dlq_name(name), msg)
+
+// A consumer handle for queue `name`'s dead-letter queue (pull dead messages with mq_pull).
+fn mq_dlq_consumer(b, name) -> any
+    mq_consumer(b, _mq_dlq_name(name))
+
+// Stop the broker's actor (queues are abandoned; in-flight messages are dropped).
+fn mq_stop(b) -> int
     let env = {}
     env["op"] = "stop"
-    send(m["req"], env)
+    env["q"] = ""
+    env["reply"] = b["req"]
+    send(b["req"], env)
+    0
