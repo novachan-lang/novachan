@@ -168,3 +168,109 @@ fn grpc_trailers(status: int, message: string) -> dict
 // Clients that do not receive this type should reject the response.
 fn grpc_content_type() -> string
     "application/grpc+proto"
+
+// ── unary dispatch ────────────────────────────────────────────────────────────
+//
+// Unary handler shape:  fn my_handler(request_payload: list) -> list
+//   request_payload : protobuf-decoded request bytes (opaque byte list)
+//   return          : protobuf-encoded response bytes (opaque byte list)
+//
+// Service map convention:
+//   Keys are full gRPC paths: "/package.Service/Method"
+//   Values are handler fn values matching the unary handler shape above.
+//   Build a map with grpc_service_map(), register handlers with grpc_register(),
+//   then call grpc_dispatch() from the h2c server on each inbound DATA frame:
+//     1. Server reads the raw request body bytes (5-byte prefix + proto payload).
+//     2. Calls grpc_dispatch(smap, path, request_body) -> result dict.
+//     3. Writes result["framed"] as the response DATA frame.
+//     4. Writes grpc_trailers(result["status"], result["message"]) as HTTP/2 trailers.
+//
+// Streaming RPCs are future work; this layer is unary-only.
+// A handler that needs to signal an application error should return an error byte list
+// OR the caller should wrap grpc_dispatch and replace the result dict with
+// grpc_response_error(status, message) before writing trailers.
+//
+// Verified by reasoning:
+//   let m = grpc_service_map()                      -> empty dict
+//   let m2 = grpc_register(m, "/echo.Echo/Say", h)  -> m with one entry
+//   grpc_dispatch(m2, "/echo.Echo/Say", grpc_frame([1,2,3]))
+//       deframes -> payload=[1,2,3]; h([1,2,3]) -> [1,2,3]
+//       grpc_frame([1,2,3]) -> [0,0,0,0,3,1,2,3]
+//       returns {"framed":[0,0,0,0,3,1,2,3], "status":0, "message":""}
+//   grpc_dispatch(m2, "/no.Such/Method", grpc_frame([1,2,3]))
+//       -> {"framed":[], "status":12, "message":"method not implemented: /no.Such/Method"}
+
+// grpc_service_map() -> dict
+// Convenience constructor: returns an empty dict for use as a service map.
+// Usage:
+//   let smap = grpc_service_map()
+//   let smap2 = grpc_register(smap, "/echo.Echo/Say", my_echo_handler)
+fn grpc_service_map() -> dict
+    {}
+
+// grpc_register(smap, path, handler) -> dict
+// Register a unary handler fn for the given gRPC path in the service map.
+// Returns the same smap (mutated) for fluent chaining.
+// handler must conform to: fn(request_payload: list) -> list
+// Example:
+//   let smap = grpc_register(grpc_service_map(), "/echo.Echo/Say", my_handler)
+fn grpc_register(smap: dict, path: string, handler) -> dict
+    smap[path] = handler
+    smap
+
+// grpc_dispatch(smap, path, request_body) -> dict
+// Dispatch a single unary gRPC call.
+//   smap         : service map dict (path -> handler fn)
+//   path         : the gRPC :path header value e.g. "/echo.Echo/Say"
+//   request_body : RAW gRPC-framed request bytes (flag byte + 4-byte length + proto payload)
+//                  as produced by grpc_frame() on the client side.
+// Returns a result dict with keys:
+//   "framed"  : list  — gRPC-framed response bytes ready to write as the DATA frame
+//               (empty list when status != 0)
+//   "status"  : int   — gRPC status code (0 = OK, 12 = UNIMPLEMENTED, …)
+//   "message" : string — human-readable status message (empty on success)
+// The h2c server should write result["framed"] then grpc_trailers(status, message).
+// Unknown paths return grpc_unimplemented() (12); no try/catch — handlers are assumed sound.
+fn grpc_dispatch(smap: dict, path: string, request_body: list) -> dict
+    if contains(smap, path) == false
+        let emsg = "method not implemented: " + path
+        let miss = {}
+        miss["framed"] = []
+        miss["status"] = grpc_unimplemented()
+        miss["message"] = emsg
+        return miss
+    let dfr = grpc_deframe(request_body, 0)
+    let payload = dfr[0]
+    let h = smap[path]
+    let reply = h(payload)
+    let framed = grpc_frame(reply)
+    let res = {}
+    res["framed"] = framed
+    res["status"] = grpc_ok()
+    res["message"] = ""
+    res
+
+// grpc_response_ok(reply_payload) -> dict
+// Convenience for building a success response envelope from a handler.
+// Equivalent to: {"framed": grpc_frame(reply_payload), "status": 0, "message": ""}
+// Usage inside an h2c server:
+//   let result = grpc_response_ok(encode_my_response(resp))
+fn grpc_response_ok(reply_payload: list) -> dict
+    let r = {}
+    r["framed"] = grpc_frame(reply_payload)
+    r["status"] = grpc_ok()
+    r["message"] = ""
+    r
+
+// grpc_response_error(status, message) -> dict
+// Convenience for building an error response envelope.
+// status  : a gRPC status code integer (use grpc_internal(), grpc_not_found(), etc.)
+// message : human-readable error detail
+// The "framed" field is an empty list — no DATA frame body for error responses.
+// Usage: return grpc_response_error(grpc_not_found(), "user not found")
+fn grpc_response_error(status: int, message: string) -> dict
+    let e = {}
+    e["framed"] = []
+    e["status"] = status
+    e["message"] = message
+    e
