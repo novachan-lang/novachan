@@ -54,6 +54,11 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 ADDITIONAL BATTERIES (rows 65-79; more Spring/Django/Rails/Laravel depth, gen3 syntax-checked, tests deferred):**
+- **Enterprise/SaaS:** multi-tenancy (`forge_tenant` — resolve + scope, cross-tenant-leak-proof), API keys (`forge_apikey`), signed webhooks (`forge_webhook` — HMAC), CQRS bus (`forge_cqrs`), multi-channel notifications (`forge_notify`), named-lock/mutex (`forge_lock`).
+- **Web/data:** RFC5988 pagination Link headers (`forge_links`), CSP builder (`forge_csp`), 14 field validators (`forge_validators`), URL slugs (`forge_slug`), pluggable session store (`forge_session_store`), Markdown->HTML (`forge_markdown`), full-text search (`forge_search`).
+- **Scheduling/fintech:** cron matching (`forge_cron`), money/cents (`forge_money`).
+
 **2026-07-03 HIGH-LEVEL DEPTH — S14-S19 delivered (rows 48-61; the DEEP features from FORGE_FEATURE_AUDIT.md, gen3 syntax-checked, functional tests deferred):**
 - **S14 (P0) config + DI ergonomic** — `forge_config.nova`: config + profiles + typed getters + `config_from_env`/`config_for_profile`; service registry (provide/resolve) + request-scoped `ctx`. (Audit §A/§C.)
 - **S15 (P0/P1) declarative cross-cutting** — `forge_aspects.nova`: `cached`/`cache_forget` (@Cacheable), `retried` (@Retryable), `timed` (@Timed), `every` (@Scheduled) as HOF decorators over a 0-arg closure. (Audit §B.)
