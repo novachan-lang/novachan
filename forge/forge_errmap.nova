@@ -1,0 +1,131 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_errmap — GLOBAL EXCEPTION-HANDLER REGISTRY (@ControllerAdvice parity).
+//
+// PURPOSE
+// -------
+// In Spring you annotate one class @ControllerAdvice and write @ExceptionHandler
+// methods — one place, every controller's exceptions route there.  In Django you
+// set handler400/handler404/handler500 in urls.py for the same effect.  NOVA has
+// no exceptions: errors are TAGS carried in a Result's err payload.  This module
+// gives the same "register once, every route's error tag maps to a consistent
+// response" guarantee without exceptions.
+//
+// DESIGN
+// ------
+// A registry is a plain dict:
+//   { "handlers": { tag -> fn(detail: string) -> any },
+//     "default":  0 | fn(detail: string) -> any }
+//
+// The sentinel 0 (int) means "no default registered yet."  A real default
+// handler is a function value, which type_of() reports as something other than
+// "int" (it reports "fn" or similar).  So the check `type_of(reg["default"]) !=
+// "int"` cleanly distinguishes "not set" from "set to a callable."
+//
+// HANDLER SIGNATURE
+// -----------------
+//   fn my_handler(detail: string) -> any
+//
+// The handler receives the error detail string (human-readable context) and
+// returns whatever response value the application uses — a Response struct, a
+// JSON string, an HTTP status int, etc.  forge_errmap is response-type-agnostic.
+//
+// DISPATCH PRIORITY
+//   1. Exact tag match in reg["handlers"].
+//   2. Default handler if registered (reg["default"] is not 0).
+//   3. Last-resort string:  "error: " + tag + ": " + detail.
+//
+// TYPICAL USAGE
+// -------------
+//   let reg = errmap_new()
+//   errmap_on(reg, "not_found",    fn(d) resp_json(404, problem_json(404, d)))
+//   errmap_on(reg, "unauthorized", fn(d) resp_json(401, problem_json(401, d)))
+//   errmap_on(reg, "validation",   fn(d) resp_json(422, problem_json(422, d)))
+//   errmap_default(reg, fn(d) resp_json(500, problem_json(500, d)))
+//
+//   // In a route handler:
+//   let result = some_service_call()
+//   if is_err(result)
+//       return errmap_handle(reg, err_tag(result), err_detail(result))
+//
+// VERIFIED BY REASONING
+//   errmap_on(reg,"not_found",_nf) then errmap_handle(reg,"not_found","x")
+//   → contains(handlers,"not_found") true → h = handlers["not_found"] → h("x")
+//   errmap_handle(reg,"other","boom") with no default
+//   → not in handlers, type_of(0)=="int" → "error: other: boom"
+//   errmap_has(reg,"not_found") → contains(handlers,"not_found") → true
+//   errmap_has(reg,"missing")   → contains(handlers,"missing")   → false
+//
+// LEAF MODULE — imports NOTHING.  Built-ins: contains, type_of, len, str.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// errmap_new() -> dict
+// Create an empty registry.  The "handlers" key holds an inner dict mapping
+// error tags (strings) to handler functions.  The "default" key holds the int
+// sentinel 0 until a default handler is registered via errmap_default.
+fn errmap_new() -> dict
+    let reg = {}
+    reg["handlers"] = {}
+    reg["default"] = 0
+    reg
+
+// errmap_on(reg, tag, handler) -> dict
+// Register `handler` for error tag `tag`.  Overwrites any previous handler for
+// the same tag (last-write-wins — callers can update handlers at any time).
+// Returns reg to support fluent chaining:
+//   errmap_on(errmap_on(reg, "not_found", h1), "unauth", h2)
+fn errmap_on(reg: dict, tag: string, handler) -> dict
+    let handlers = reg["handlers"]
+    handlers[tag] = handler
+    reg
+
+// errmap_default(reg, handler) -> dict
+// Register a fallback handler invoked when errmap_handle is called with a tag
+// that has no specific handler registered.  Replaces any previous default.
+// Returns reg for fluent chaining.
+fn errmap_default(reg: dict, handler) -> dict
+    reg["default"] = handler
+    reg
+
+// errmap_has(reg, tag) -> bool
+// True if a specific handler is registered for `tag` (ignores the default).
+// Use this to branch before calling errmap_handle when you need to distinguish
+// "known error" from "unknown error" at the call site.
+fn errmap_has(reg: dict, tag: string) -> bool
+    let handlers = reg["handlers"]
+    contains(handlers, tag)
+
+// errmap_handle(reg, tag, detail) -> any
+// Central dispatch: map an error tag + detail string to a response value.
+//
+// Priority:
+//   1. Specific handler for `tag` → call it with `detail` and return.
+//   2. Default handler (reg["default"] is not the int sentinel 0) → call it.
+//   3. Last-resort: return the string "error: " + tag + ": " + detail.
+//
+// The sentinel check uses type_of(reg["default"]) == "int" because 0 is stored
+// as an integer and no callable value has type_of == "int".  This is the
+// canonical NOVA pattern for optional-function-value slots.
+fn errmap_handle(reg: dict, tag: string, detail: string) -> any
+    let handlers = reg["handlers"]
+    if contains(handlers, tag)
+        let h = handlers[tag]
+        return h(detail)
+    if type_of(reg["default"]) != "int"
+        let d = reg["default"]
+        return d(detail)
+    "error: " + tag + ": " + detail
+
+// errmap_size(reg) -> int
+// Return the number of specific (non-default) handlers registered.
+// Useful for diagnostics and assertions in tests.
+fn errmap_size(reg: dict) -> int
+    let handlers = reg["handlers"]
+    len(handlers)
+
+// errmap_tags(reg) -> list
+// Return the list of all registered error tags (the keys of reg["handlers"]).
+// Order is dict-iteration order (unspecified).  Use for introspection, OpenAPI
+// error-response generation, or logging the registry on startup.
+fn errmap_tags(reg: dict) -> list
+    let handlers = reg["handlers"]
+    keys(handlers)
