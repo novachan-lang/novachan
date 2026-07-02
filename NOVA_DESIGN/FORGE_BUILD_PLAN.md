@@ -19,8 +19,36 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 - [FORGE_STATUS.md](FORGE_STATUS.md) — vision, competitor matrix, substrate insight, capability inventory (the "what/why"; see its §0 for the current reconciliation).
 - [FORGE_8DAY_SPRINT.md](FORGE_8DAY_SPRINT.md) — the deadline-driven re-ordering of the sprints below + the model-split working method (Opus architecture/compiler/runtime/review/gate; Sonnet mechanical lib impl). Subordinate to this plan; kept for the working-method reference.
 - [HTTP2_PLAN.md](HTTP2_PLAN.md) — Sprint S7 / P4 flagship build plan (HPACK → frame codec → flow control → ALPN-TLS → serve_h2 multiplex). The XL item; HPACK + frames land even if ALPN-TLS stalls.
+- [FORGE_FEATURE_AUDIT.md](FORGE_FEATURE_AUDIT.md) — **★ the honest competitive feature audit vs Spring Boot / Django / Rails / Phoenix / NestJS (2026-07-03).** Forge has the plumbing but MISSES the deep developer-productivity features (DI/config/profiles, declarative tx/cache/retry/schedule, derived queries, event bus, form objects, template engine, i18n, testing harness, method security, entity auditing). Its prioritized gaps are the NEW sprints S14–S19 below.
 - [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md) — the RAPID-DEV track (2026-07 push): feature → module → commit → what-the-test-pass-must-verify → status. Each row is syntax-checked (gen3, compile-only) but NOT yet functionally tested; the FINAL track-driven test pass gates every row and flips it to tested. The working queue for the "develop fast, test at the end" mode.
 - _(add future per-feature spec docs here as they're created)_
+
+---
+
+## ★ HIGH-LEVEL FEATURE GAP — new sprints S14–S19 (2026-07-03, from FORGE_FEATURE_AUDIT.md)
+
+The framework so far is the PLUMBING; the incumbents' "batteries-included" feel is these DEEP features. Full
+matrix + honest status in [FORGE_FEATURE_AUDIT.md](FORGE_FEATURE_AUDIT.md). Sequenced by leverage:
+
+- **S14 — Config + Profiles + lightweight DI/service-registry + request-scoped `ctx`** (P0). `forge_config`
+  (env + toml + profile overlays + typed struct binding via RTTI); a typed service registry + a request `ctx`
+  dict threaded through handlers (the DI ergonomic without reflective magic).
+- **S15 — Declarative cross-cutting decorators** (P0/P1): `tx(pool, fn)` w/ propagation+nesting · `cached(cache,
+  key, fn)` method-result cache · `retried(policy, fn)` · `scheduled(cron, fn)` · `timed(ms, fn)`. HOF wrappers
+  over a service fn — the AOP substitute, NOVA-shaped (no proxies).
+- **S16 — Data depth** (P1): derived query-method parsing (`find_by_name_and_age`) · entity auditing
+  (created/updated timestamps + actor) · soft deletes · optimistic `@version` · versioned migration files
+  (up/down + history table) · model callbacks/signals · seeding/fixtures.
+- **S17 — Web + rendering depth** (P1): a **template engine** (layout inheritance, partials, auto-escape,
+  interpolation) · **form objects** (fields + widgets + per-field errors + re-render) · **global
+  exception-handler registry** · HATEOAS links.
+- **S18 — Platform depth** (P1): a typed **application event bus** (events + sync/async/after-commit listeners)
+  · **method-level security** guard · **i18n** (message bundles + locale resolution + pluralization) · a
+  **testing harness** (request builder + asserts + factories + per-test DB rollback) · account-lockout + TOTP.
+- **S19 — Ops/DX polish** (P2): actuator endpoints (routes/config/loggers/buildinfo) · batch/chunk processor
+  · per-resource generators · dev console.
+
+These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build order below.
 
 ---
 
