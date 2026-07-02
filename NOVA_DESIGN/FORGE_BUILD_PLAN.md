@@ -48,6 +48,13 @@ We build the whole thing. Everything in this plan is sequencing and prerequisite
 - **S1 hero DB — ✅ re-hardened.** `orm_insert` now skips id==0 → DB auto-assigns the PK (`forge_orm_hero_test`: struct insert → typed get with auto id).
 - **~28 new tests registered in `_run_final_regression.ps1`** (parallel + the h2c-grpc server test serial); `_forge_ci` = 89/89 PASS both RC modes.
 
+**2026-07-02 RAPID-DEV BATCH (lib-level plan tasks; gen3 syntax-checked, functional tests deferred to a final pass — [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md) rows 35-44):**
+- **S8 GraphQL:** D4.1 schema-from-types (`forge_gql_schema.nova`: gql_type_sdl/gql_schema — struct→SDL via field_names+type_of), D4.4 DataLoader (`forge_graphql.nova`: gql_loader/gql_load_many — N keys→1 batch call + per-request cache), D4.3 subscription codec (`forge_graphql_ws.nova`: the graphql-ws message codec).
+- **S9 data:** D9.2 struct-diff migrations (`forge_migrate.nova`: migrate_create_sql/add_columns_sql/plan — add-only, zero migration file), D9.4 API versioning + content-negotiation (`forge.nova`: version_group + respond_negotiated).
+- **S10 messaging:** D5.1 typed publish/consume (`forge_mq.nova`: mq_publish_typed/mq_consume_typed — struct IS the message), D5.4 retry-then-DLQ + prefetch helpers.
+- **S12 admin:** D7.2 list search+sort (whitelisted ORDER BY + LIKE-params, injection-safe), D7.3 FK-picker + bulk actions, D7.4 object-perms + D7.5 audit log.
+- Method: Opus (forge.nova/complex + review) + Sonnet leaves under precise specs. These advance **M3** (S8/S9/S10 → ~90%) and **M4** (S12 admin → nearly complete). REMAINING M4 lib = distribution (D6.x, multi-node) + WASM (S13, compiler). Everything else remaining is the compiler/runtime gated tier (#8, ALPN-TLS, with-tx sugar, remote_spawn-prod).
+
 **Sprint S1 — typed data front door — IN PROGRESS:**
 - **T2.1 — let-site typed-wrapper rewrites — ✅ DONE (commit `47f66da`).** `let r: Result<T> = body_as(s)` → `<T>__from_json_safe(s)` (the SAFE path, B5); `query_as(dict)` → `<T>__from_dict`; `db_find(pool,table,id)` → `<T>__from_dict(`*result row*`)`. Purely additive (reconverge gen5.ll==gen6.ll byte-identical) + 585×2. Verified end-to-end (`ada:36` / `min=10` / `bob`). Guard: `forge_typed_wrapper_test.nova`.
 - **T2.9 — crash-safe `from_json` — ✅ VERIFIED ALREADY DONE (no code change).** B5a ("raw `from_json` SEGFAULTs on partial input") was a STALE finding: `_make_from_dict_method`/`_make_from_json_method` already coerce non-dict input to `{}` and default every missing field. Tested: a partial body missing the nested-struct, float, and list fields returns a defaulted struct, exit 0, **no segfault**. → B5a should be struck from §4.
