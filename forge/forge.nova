@@ -2736,6 +2736,141 @@ fn negotiate_type(req: Request, offered: list) -> string
         i = i + 1
     best
 
+// ── W3C Trace Context propagation (distributed tracing) ───────────────────────────────────────────────
+// traceparent: "<version>-<trace-id>-<span-id>-<flags>", e.g.
+//   00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+// version=00, trace-id=16 bytes (32 hex, not all-zero), span-id=8 bytes (16 hex, not all-zero),
+// flags=1 byte (bit 0 = sampled). This is THE standard that lets a request's trace flow across service
+// boundaries (Forge -> gRPC -> another Forge -> a Go/Java service) so a tool like Jaeger/Tempo can stitch
+// the whole call tree. Every serious framework speaks it (Spring Sleuth, OTel SDKs). A handler calls
+// trace_continue(req) to get the traceparent to attach to its OUTBOUND calls, and trace_id_of(...) to tag
+// its logs so all logs for one request share a correlation id. IDs use the OS CSPRNG (secure_bytes).
+
+// PRIVATE: nbytes of CSPRNG entropy as lowercase hex (2*nbytes chars). Same scheme as _csrf_rand_hex.
+fn _rand_hex(nbytes: int) -> string
+    let b = secure_bytes(nbytes)
+    let n = bytes_len(b)
+    let digits = "0123456789abcdef"
+    let out = ""
+    let i = 0
+    while i < n
+        let byte = bytes_get(b, i)
+        out = out + digits[byte / 16] + digits[byte % 16]
+        i = i + 1
+    out
+
+// PRIVATE: is `s` exactly `n` lowercase-hex chars? (membership test — no char-ordering assumptions).
+fn _is_hex_str(s: string, n: int) -> bool
+    if len(s) != n
+        return false
+    let i = 0
+    while i < n
+        if find("0123456789abcdef", s[i]) < 0
+            return false
+        i = i + 1
+    true
+
+// PRIVATE: are all chars of `s` the digit '0'? (an all-zero trace-id/span-id is invalid per the spec).
+fn _all_zero(s: string) -> bool
+    let i = 0
+    while i < len(s)
+        if s[i] != "0"
+            return false
+        i = i + 1
+    true
+
+fn _hex1_val(c: string) -> int
+    find("0123456789abcdef", c)
+
+fn _hex2_to_int(s: string) -> int
+    _hex1_val(s[0]) * 16 + _hex1_val(s[1])
+
+// Generate a fresh 128-bit trace-id (32 hex) / 64-bit span-id (16 hex).
+fn trace_gen_trace_id() -> string
+    _rand_hex(16)
+
+fn trace_gen_span_id() -> string
+    _rand_hex(8)
+
+// A brand-new root traceparent (this service is the trace origin). sampled -> flags "01" else "00".
+fn trace_start(sampled: bool) -> string
+    let flags = "00"
+    if sampled
+        flags = "01"
+    "00-" + trace_gen_trace_id() + "-" + trace_gen_span_id() + "-" + flags
+
+// Parse a traceparent into a dict: valid(bool), version, trace_id, span_id, flags, sampled(bool).
+// valid=false (and empty fields) when malformed — callers should then trace_start a fresh trace.
+// Accepts >=4 fields (forward-compat with future versions) and lowercases the input.
+fn trace_parse(tp: string) -> dict
+    let d = {}
+    d["valid"] = false
+    d["version"] = ""
+    d["trace_id"] = ""
+    d["span_id"] = ""
+    d["flags"] = ""
+    d["sampled"] = false
+    let s = lower(trim(tp))
+    if len(s) == 0
+        return d
+    let parts = split(s, "-")
+    if len(parts) < 4
+        return d
+    let version = parts[0]
+    let tid = parts[1]
+    let sid = parts[2]
+    let flags = parts[3]
+    if _is_hex_str(version, 2) == false
+        return d
+    if _is_hex_str(tid, 32) == false or _all_zero(tid)
+        return d
+    if _is_hex_str(sid, 16) == false or _all_zero(sid)
+        return d
+    if _is_hex_str(flags, 2) == false
+        return d
+    d["version"] = version
+    d["trace_id"] = tid
+    d["span_id"] = sid
+    d["flags"] = flags
+    d["valid"] = true
+    d["sampled"] = (_hex2_to_int(flags) % 2) == 1
+    d
+
+// Continue a trace across a hop: SAME trace-id + flags, a NEW span-id (this hop's span, which becomes the
+// parent for the downstream call). If `tp` is malformed/empty, start a fresh trace instead.
+fn trace_child(tp: string) -> string
+    let p = trace_parse(tp)
+    if p["valid"] == false
+        return trace_start(true)
+    "00-" + p["trace_id"] + "-" + trace_gen_span_id() + "-" + p["flags"]
+
+// THE handler convenience: derive the traceparent to attach to OUTBOUND calls. Continues the incoming
+// trace if the request carried one, else starts a new (sampled) trace with this service as the origin.
+fn trace_continue(req: Request) -> string
+    trace_child(req_header(req, "traceparent"))
+
+// Is the trace sampled (should we export spans)? Head-based sampling honours the upstream decision.
+fn trace_sampled(tp: string) -> bool
+    let p = trace_parse(tp)
+    p["sampled"]
+
+// The 32-hex trace-id alone — tag every log line for a request with this so all logs across all services
+// for one request share a single correlation id ("" if tp is malformed).
+fn trace_id_of(tp: string) -> string
+    let p = trace_parse(tp)
+    p["trace_id"]
+
+// The vendor `tracestate` header verbatim (opaque key=value list) — propagate it unchanged alongside
+// traceparent so vendor-specific trace data survives the hop.
+fn tracestate_of(req: Request) -> string
+    req_header(req, "tracestate")
+
+// A header dict carrying `tp` as traceparent, ready to merge into an outbound request's headers.
+fn trace_headers(tp: string) -> dict
+    let h = {}
+    h["traceparent"] = tp
+    h
+
 // ── Conditional GET / HTTP caching for DYNAMIC responses ──────────────────────────────────────────────
 // A strong ETag (quoted sha256 content hash) for a response body. Same scheme the static path uses, but
 // for handler-generated JSON/HTML so dynamic routes also get cache revalidation.
