@@ -1,0 +1,237 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_circuit — CIRCUIT BREAKER resilience primitive for Forge.
+//
+// A circuit breaker prevents cascading failures by detecting when a downstream
+// dependency is struggling and STOPPING calls to it for a cooldown period,
+// rather than hammering it with requests it cannot service.  The caller gets
+// an immediate 0-return (reject fast) instead of waiting for a timeout — which
+// protects the caller's latency budget AND gives the dependency breathing room
+// to recover.  This is the Resilience4j CircuitBreaker pattern, reimplemented
+// as a pure NOVA actor — no locks, no atomics, race-free under any N>1
+// NOVA_CARRIERS count.
+//
+// ── THREE STATES ─────────────────────────────────────────────────────────────
+//
+//  0 = CLOSED (normal operating mode)
+//      All calls are allowed through.  Each failure increments a counter; each
+//      success resets it to 0.  When the consecutive-failure count reaches
+//      `threshold`, the breaker trips: state→OPEN, open_at = now (monotonic ms).
+//
+//  1 = OPEN (tripped; dependency assumed down)
+//      circuit_allow returns 0 immediately — callers must reject fast (e.g.
+//      return HTTP 503) without touching the dependency.  When
+//      (now - open_at) >= reset_ms the breaker transitions to HALF_OPEN and
+//      allows exactly ONE probe call through.
+//      NOTE: circuit_state does NOT advance the OPEN→HALF_OPEN timer.  Only
+//      circuit_allow advances it; this ensures the timer check happens exactly
+//      when a real call is ready, not speculatively.
+//
+//  2 = HALF_OPEN (probing; one call allowed to test recovery)
+//      Exactly one probe call is permitted (probe_inflight flag ensures this).
+//      A second circuit_allow while the probe is in-flight returns 0.
+//      If the probe succeeds (circuit_success): state→CLOSED, failures=0.
+//      If the probe fails  (circuit_failure): state→OPEN, open_at=now (reset
+//      the cooldown — the dependency is still sick).
+//
+// ── TRANSITIONS ──────────────────────────────────────────────────────────────
+//
+//   CLOSED ──(failures >= threshold)──▶ OPEN
+//   CLOSED ◀──(probe success)────────── HALF_OPEN
+//   OPEN   ──(timeout elapsed)────────▶ HALF_OPEN (on next circuit_allow call)
+//   HALF_OPEN ──(probe failure)────────▶ OPEN
+//
+// ── WHY ACTOR BEATS RESILIENCE4J ─────────────────────────────────────────────
+//
+//  Resilience4j guards state with ConcurrentHashMap + AtomicInteger, meaning
+//  every allowed/success/failure call acquires a lock or does a CAS loop under
+//  contention.  Under N>1 carriers all NOVA callers route through ONE green task
+//  (the actor), so state transitions are always serial — no lost updates, no
+//  double-trip, no double-probe.  The price is one channel round-trip for reads
+//  (circuit_allow, circuit_state) and a fire-and-forget for writes
+//  (circuit_success, circuit_failure, circuit_stop), which is NOVA's fastest
+//  primitive — cheaper than a JVM lock acquisition.
+//
+// ── USAGE PATTERN ────────────────────────────────────────────────────────────
+//
+//   let cb = circuit_new(3, 1000)   // trip after 3 consecutive failures; reset after 1 s
+//
+//   if circuit_allow(cb) == 0
+//       return 503                  // fast-reject; caller never touches dependency
+//   // else: call dependency
+//   if success
+//       circuit_success(cb)
+//   else
+//       circuit_failure(cb)
+//
+// ── VERIFIED BY REASONING ────────────────────────────────────────────────────
+//
+//   threshold=3, reset_ms=1000
+//   1. circuit_failure x3 → failures reaches 3 → state=OPEN.
+//   2. circuit_allow → (now - open_at) < 1000 → reply 0 (reject fast). ✓
+//   3. After 1000 ms: circuit_allow → (now - open_at) >= 1000 → state=HALF_OPEN,
+//      probe_inflight=1 → reply 1 (probe goes through). ✓
+//   4a. circuit_success → state=CLOSED, failures=0, probe_inflight=0. ✓
+//   4b. OR circuit_failure → state=OPEN, open_at=now. ✓
+//
+// ── MONOTONIC CLOCK ──────────────────────────────────────────────────────────
+//
+//   All timers use clock_ns() / 1000000 (monotonic ms).  clock_ns() never
+//   goes backward (unlike wall-clock which can jump on NTP adjustments), so
+//   the cooldown window is always accurate.
+//
+// LEAF MODULE — imports NOTHING; built-ins only: channel / spawn / send /
+// receive / contains / clock_ns / str.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// _cb_loop(cb) — PRIVATE actor task; owns ALL circuit-breaker state.
+// cb["req"]      : channel — inbound envelope channel.
+// cb["threshold"]: int     — consecutive-failure count that trips the breaker.
+// cb["reset_ms"] : int     — cooldown duration in monotonic milliseconds.
+//
+// Internal state (all ints; born here, never shared):
+//   state          0=CLOSED 1=OPEN 2=HALF_OPEN
+//   failures       consecutive failure count (only meaningful in CLOSED)
+//   open_at        monotonic ms when the breaker last tripped to OPEN
+//   probe_inflight 1 if a HALF_OPEN probe is already in-flight; 0 otherwise
+//
+// Protocol envelopes:
+//   op="allow"   reply=chan  -> send(reply, 1 or 0) per state machine
+//   op="success" reply=0    -> update state (fire-and-forget)
+//   op="failure" reply=0    -> update state (fire-and-forget)
+//   op="state"   reply=chan  -> send(reply, "closed"|"open"|"half_open")
+//   op="stop"    reply=0    -> exit loop (fire-and-forget)
+fn _cb_loop(cb)
+    let threshold = cb["threshold"]
+    let reset_ms = cb["reset_ms"]
+    let state = 0
+    let failures = 0
+    let open_at = 0
+    let probe_inflight = 0
+    let running = 1
+    while running == 1
+        let env = receive(cb["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "allow"
+            let now = clock_ns() / 1000000
+            if state == 0
+                send(env["reply"], 1)
+            else if state == 1
+                if now - open_at >= reset_ms
+                    state = 2
+                    probe_inflight = 1
+                    send(env["reply"], 1)
+                else
+                    send(env["reply"], 0)
+            else if state == 2
+                if probe_inflight == 0
+                    probe_inflight = 1
+                    send(env["reply"], 1)
+                else
+                    send(env["reply"], 0)
+        else if op == "success"
+            if state == 2
+                state = 0
+                failures = 0
+                probe_inflight = 0
+            else if state == 0
+                failures = 0
+        else if op == "failure"
+            let now = clock_ns() / 1000000
+            if state == 0
+                failures = failures + 1
+                if failures >= threshold
+                    state = 1
+                    open_at = now
+            else if state == 2
+                state = 1
+                open_at = now
+                probe_inflight = 0
+        else if op == "state"
+            if state == 0
+                send(env["reply"], "closed")
+            else if state == 1
+                send(env["reply"], "open")
+            else
+                send(env["reply"], "half_open")
+
+// circuit_new(failure_threshold, reset_timeout_ms) -> any
+// Create a circuit breaker that trips after `failure_threshold` consecutive
+// failures and stays OPEN for `reset_timeout_ms` monotonic milliseconds before
+// allowing one probe call.  Returns a handle dict accepted by all circuit_*
+// functions.  The actor task is spawned immediately and runs until circuit_stop.
+fn circuit_new(failure_threshold: int, reset_timeout_ms: int) -> any
+    let cb = {}
+    cb["req"] = channel()
+    cb["threshold"] = failure_threshold
+    cb["reset_ms"] = reset_timeout_ms
+    spawn _cb_loop(cb)
+    cb
+
+// circuit_allow(cb) -> int
+// Ask the breaker whether the caller MAY proceed with the outbound call.
+// Returns 1 = allowed (call the dependency), 0 = fast-reject (return 503).
+//
+// State machine (inside actor):
+//   CLOSED    → always 1.
+//   OPEN      → 0, UNLESS the cooldown has expired; then transition to
+//               HALF_OPEN, set probe_inflight=1, return 1 (this is the probe).
+//   HALF_OPEN → 1 only if no probe is in-flight; else 0.
+//
+// NOTE: circuit_allow is the ONLY function that advances OPEN→HALF_OPEN.
+// circuit_state does NOT do this — the timer fires on the next real call attempt.
+fn circuit_allow(cb) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "allow"
+    env["reply"] = rc
+    send(cb["req"], env)
+    receive(rc)
+
+// circuit_success(cb)
+// Report that the outbound call succeeded.  Fire-and-forget (no reply waited).
+//   HALF_OPEN → CLOSED, failures=0, probe_inflight=0 (recovery confirmed).
+//   CLOSED    → failures=0 (reset consecutive count on any success).
+//   OPEN      → ignored (success without a permit should not happen in practice).
+fn circuit_success(cb)
+    let env = {}
+    env["op"] = "success"
+    env["reply"] = 0
+    send(cb["req"], env)
+
+// circuit_failure(cb)
+// Report that the outbound call failed.  Fire-and-forget (no reply waited).
+//   CLOSED    → failures+1; if failures >= threshold: OPEN, open_at=now.
+//   HALF_OPEN → OPEN, open_at=now, probe_inflight=0 (probe failed; reset cooldown).
+//   OPEN      → ignored.
+fn circuit_failure(cb)
+    let env = {}
+    env["op"] = "failure"
+    env["reply"] = 0
+    send(cb["req"], env)
+
+// circuit_state(cb) -> string
+// Return the breaker's current state as a string: "closed", "open", or "half_open".
+// Useful for metrics and health-check endpoints.
+//
+// IMPORTANT: this call does NOT advance the OPEN→HALF_OPEN timer.  Only
+// circuit_allow does that.  So circuit_state may return "open" even after the
+// cooldown has elapsed — the transition happens on the next circuit_allow call.
+fn circuit_state(cb) -> string
+    let rc = channel()
+    let env = {}
+    env["op"] = "state"
+    env["reply"] = rc
+    send(cb["req"], env)
+    receive(rc)
+
+// circuit_stop(cb)
+// Terminate the actor loop.  After this call the handle is invalid; any
+// subsequent circuit_allow / circuit_success / circuit_failure / circuit_state
+// will block forever.  Call only during controlled shutdown.
+fn circuit_stop(cb)
+    let env = {}
+    env["op"] = "stop"
+    env["reply"] = 0
+    send(cb["req"], env)
