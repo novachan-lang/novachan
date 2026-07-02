@@ -2643,6 +2643,99 @@ fn negotiate_lang(req: Request, supported: list) -> string
         i = i + 1
     supported[0]
 
+// ── Proactive media-type negotiation (RFC 7231 §5.3.2) ────────────────────────────────────────────────
+// negotiate_type(req, offered) picks the best Content-Type the SERVER can produce for the client's Accept
+// header, honouring q-values and wildcard specificity. `offered` is the server's menu in preference order,
+// e.g. negotiate_type(req, ["application/json", "text/html", "text/csv"]). Returns "" when NOTHING the
+// server offers is acceptable -> the caller should reply 406 Not Acceptable. This is what Spring's
+// `produces=` / Django REST content negotiation / Phoenix `accepts` do; negotiate_lang is the sibling for
+// Accept-Language. q is handled as integer PERMILLE (0..1000) so there are no float-compare surprises.
+
+// _q_parse_permille -- "0.9"->900, "1"->1000, "1.0"->1000, "0.75"->750, "0"->0, ""->1000.
+// Only the first 3 fractional digits count (RFC allows at most 3). Integer part >= 1 clamps to 1000.
+fn _q_parse_permille(v: string) -> int
+    let dot = find(v, ".")
+    if dot < 0
+        if parse_int(v) >= 1
+            return 1000
+        return 0
+    let ipart = slice(v, 0, dot)
+    if len(ipart) > 0 and parse_int(ipart) >= 1
+        return 1000
+    let f3 = slice(v, dot + 1, len(v))
+    if len(f3) > 3
+        f3 = slice(f3, 0, 3)
+    while len(f3) < 3
+        f3 = f3 + "0"
+    parse_int(f3)
+
+// _q_permille -- extract the q param permille from one Accept entry (default 1000 when q is absent).
+// Splits the params on ';' and matches the segment that IS "q=..." (token-safe: won't fire on charset= etc.).
+fn _q_permille(entry: string) -> int
+    let semi = find(entry, ";")
+    if semi < 0
+        return 1000
+    let segs = split(slice(entry, semi + 1, len(entry)), ";")
+    let qval = ""
+    let i = 0
+    while i < len(segs)
+        let seg = trim(segs[i])
+        if len(seg) >= 2 and slice(seg, 0, 2) == "q="
+            qval = trim(slice(seg, 2, len(seg)))
+        i = i + 1
+    if len(qval) == 0
+        return 1000
+    _q_parse_permille(qval)
+
+// _mt_spec -- specificity of an Accept media-range against an offered type: 3=exact, 2="type/*", 1="*/*",
+// 0=no match. RFC 7231: the MOST SPECIFIC matching range decides the offered type's q.
+fn _mt_spec(offered: string, range: string) -> int
+    if range == offered
+        return 3
+    if range == "*/*"
+        return 1
+    let slash = find(offered, "/")
+    if slash > 0 and range == slice(offered, 0, slash) + "/*"
+        return 2
+    0
+
+// _mt_best_q -- for one offered type, the q (permille) of the most-specific Accept entry that matches it,
+// or -1 if no entry matches at all (offered type is unacceptable). `entries` are trimmed, lowercased.
+fn _mt_best_q(offered: string, entries: list) -> int
+    let best_spec = 0
+    let best_q = 0 - 1
+    let i = 0
+    while i < len(entries)
+        let raw = entries[i]
+        let mt = raw
+        let semi = find(raw, ";")
+        if semi >= 0
+            mt = trim(slice(raw, 0, semi))
+        let spec = _mt_spec(offered, mt)
+        if spec > best_spec
+            best_spec = spec
+            best_q = _q_permille(raw)
+        i = i + 1
+    best_q
+
+fn negotiate_type(req: Request, offered: list) -> string
+    if len(offered) == 0
+        return ""
+    let a = lower(req_header(req, "accept"))
+    if a == ""
+        return offered[0]
+    let entries = [trim(e) for e in split(a, ",")]
+    let best = ""
+    let best_q = 0
+    let i = 0
+    while i < len(offered)
+        let q = _mt_best_q(lower(offered[i]), entries)
+        if q > best_q
+            best_q = q
+            best = offered[i]
+        i = i + 1
+    best
+
 // ── Conditional GET / HTTP caching for DYNAMIC responses ──────────────────────────────────────────────
 // A strong ETag (quoted sha256 content hash) for a response body. Same scheme the static path uses, but
 // for handler-generated JSON/HTML so dynamic routes also get cache revalidation.
