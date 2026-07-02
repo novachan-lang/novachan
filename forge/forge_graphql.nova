@@ -65,6 +65,13 @@ fn _gql_tokenize(q: string) -> list
                 j = j + 1
             push(toks, ["int", slice(q, start, j)])
             i = j
+        else if c == "$"
+            let start = i + 1
+            let j = start
+            while j < n and _gql_is_name_char(q[j])
+                j = j + 1
+            push(toks, ["var", slice(q, start, j)])
+            i = j
         else if _gql_is_name_start(c)
             let start = i
             let j = i + 1
@@ -86,10 +93,15 @@ fn _gql_advance(st) -> list
     st["pos"] = st["pos"] + 1
     t
 
-// Argument value: int -> parse_int; string/enum/name -> the raw string.
+// Argument value: int -> parse_int; var ($x) -> a {"__var": name} marker resolved at execution against
+// the variables dict; string/enum/name -> the raw string.
 fn _gql_arg_value(tok) -> any
     if tok[0] == "int"
         return parse_int(tok[1])
+    if tok[0] == "var"
+        let m = {}
+        m["__var"] = tok[1]
+        return m
     tok[1]
 
 // "(" name ":" value ("," name ":" value)* ")"  -> dict of arg name -> value.
@@ -177,6 +189,38 @@ fn gql_complexity(fields: list) -> int
         i = i + 1
     total
 
+// ── variable substitution ($var) ─────────────────────────────────────────────────────────────────
+// GraphQL clients send `query GetUser($id: Int) { user(id: $id) { name } }` + a variables JSON
+// {"id": 7}. The parser skips the operation's variable DEFINITIONS (advances to the first "{") and
+// records each $ref in an arg as a {"__var": name} marker; this pass replaces those markers with the
+// concrete values from `variables` (missing -> "", GraphQL-null-ish) BEFORE resolution, so the executor
+// stays variable-agnostic. Arg values are otherwise scalars, so a dict value unambiguously = a var marker.
+fn _gql_subst_one(val, variables: dict) -> any
+    if type_of(val) == "dict"
+        if contains(val, "__var")
+            let name = val["__var"]
+            if contains(variables, name)
+                return variables[name]
+            return ""
+    val
+
+fn _gql_apply_vars(fields: list, variables: dict) -> list
+    let out = []
+    let i = 0
+    while i < len(fields)
+        let f = fields[i]
+        let nf = {}
+        nf["name"] = f["name"]
+        nf["alias"] = f["alias"]
+        let newargs = {}
+        for k in keys(f["args"])
+            newargs[k] = _gql_subst_one(f["args"][k], variables)
+        nf["args"] = newargs
+        nf["selections"] = _gql_apply_vars(f["selections"], variables)
+        push(out, nf)
+        i = i + 1
+    out
+
 // ── executor ──────────────────────────────────────────────────────────────────────────────────────
 // The trivial resolver: read `name` off `parent` when the field has no explicit resolver.
 fn _gql_field_from_parent(parent, name: string) -> any
@@ -219,18 +263,22 @@ fn _gql_resolve(fields: list, resolvers: dict, parent) -> dict
         i = i + 1
     out
 
-// gql_execute(query, resolvers, root) -> dict — GraphQL-shaped {"data": {...}}.
-fn gql_execute(query: string, resolvers: dict, root) -> dict
-    let ast = gql_parse(query)
+// gql_execute_vars(query, resolvers, root, variables) -> dict — with $variable substitution.
+fn gql_execute_vars(query: string, resolvers: dict, root, variables: dict) -> dict
+    let ast = _gql_apply_vars(gql_parse(query), variables)
     let out = {}
     out["data"] = _gql_resolve(ast, resolvers, root)
     out
 
-// gql_execute_limited(query, resolvers, root, max_depth, max_complexity) -> dict.
-// The production entry point: rejects an over-deep / over-complex query with {"errors":[...]} BEFORE
-// executing any resolver (DoS defense — a maliciously nested query cannot force unbounded work).
-fn gql_execute_limited(query: string, resolvers: dict, root, max_depth: int, max_complexity: int) -> dict
-    let ast = gql_parse(query)
+// gql_execute(query, resolvers, root) -> dict — GraphQL-shaped {"data": {...}}. No variables.
+fn gql_execute(query: string, resolvers: dict, root) -> dict
+    gql_execute_vars(query, resolvers, root, {})
+
+// gql_execute_limited_vars(...) -> dict — the production entry point: $variable substitution PLUS the
+// DoS guard. Rejects an over-deep / over-complex query with {"errors":[...]} BEFORE executing any
+// resolver (a maliciously nested query cannot force unbounded work).
+fn gql_execute_limited_vars(query: string, resolvers: dict, root, variables: dict, max_depth: int, max_complexity: int) -> dict
+    let ast = _gql_apply_vars(gql_parse(query), variables)
     let out = {}
     if gql_depth(ast) > max_depth
         out["errors"] = ["query exceeds max depth " + str(max_depth)]
@@ -240,3 +288,7 @@ fn gql_execute_limited(query: string, resolvers: dict, root, max_depth: int, max
         return out
     out["data"] = _gql_resolve(ast, resolvers, root)
     out
+
+// gql_execute_limited(query, resolvers, root, max_depth, max_complexity) -> dict — DoS guard, no variables.
+fn gql_execute_limited(query: string, resolvers: dict, root, max_depth: int, max_complexity: int) -> dict
+    gql_execute_limited_vars(query, resolvers, root, {}, max_depth, max_complexity)
