@@ -1,0 +1,176 @@
+// forge_jsonrpc — JSON-RPC 2.0 codec for the Forge web framework.
+//
+// What JSON-RPC 2.0 is:
+//   A stateless, transport-agnostic remote-procedure-call protocol encoded in JSON.
+//   Every message is a JSON object with a "jsonrpc": "2.0" field. The protocol defines
+//   four message shapes:
+//     Request      — caller sends method + params + id; server must reply.
+//     Notification — caller sends method + params, NO id; server must NOT reply.
+//     Success      — server replies with result + matching id.
+//     Error        — server replies with error.code + error.message + matching id.
+//   Batch — a JSON ARRAY of Request/Notification objects sent in a single call.
+//
+// CODEC — transport-agnostic:
+//   This module is a pure codec: it builds and parses JSON-RPC messages but does NOT
+//   own the transport. Layer it over Forge HTTP POST (read req body -> jsonrpc_parse,
+//   build reply with jsonrpc_success/jsonrpc_error, return as json response) or over a
+//   raw channel/socket — the codec does not care which.
+//
+// JSON construction:
+//   ALL JSON is built by constructing dicts and calling json_stringify(dict).
+//   Literal brace characters { } are NEVER written inside string literals, which would
+//   break NOVA's string-interpolation scanner.
+//
+// Verified by reasoning — expected output shapes:
+//
+//   jsonrpc_request("sum", [1, 2], 1)
+//     -> {"jsonrpc":"2.0","method":"sum","params":[1,2],"id":1}
+//
+//   jsonrpc_error(1, -32601, "no method")
+//     -> {"jsonrpc":"2.0","error":{"code":-32601,"message":"no method"},"id":1}
+//
+// LEAF module — imports NOTHING (only built-ins: json_stringify, json_decode, contains).
+
+// ── private helper ────────────────────────────────────────────────────────────────────────────────
+
+// _jsonrpc_base -- PRIVATE. Builds the common fields shared by request and notification.
+// Returns a dict with jsonrpc, method, and params already set; caller adds id if needed.
+fn _jsonrpc_base(method: string, params) -> dict
+    let o = {}
+    o["jsonrpc"] = "2.0"
+    o["method"] = method
+    o["params"] = params
+    o
+
+// ── builders ──────────────────────────────────────────────────────────────────────────────────────
+
+// jsonrpc_request(method, params, id) -> string
+// Build a JSON-RPC 2.0 Request message. The caller MUST supply an id (int); the server
+// will echo that id in its reply. params may be a list (positional) or dict (named).
+// Returns the JSON text ready to send over HTTP or a channel.
+fn jsonrpc_request(method: string, params, id: int) -> string
+    let o = _jsonrpc_base(method, params)
+    o["id"] = id
+    json_stringify(o)
+
+// jsonrpc_notification(method, params) -> string
+// Build a JSON-RPC 2.0 Notification. A notification has NO id field; the server
+// processes the call but MUST NOT send a response. Use for fire-and-forget calls.
+fn jsonrpc_notification(method: string, params) -> string
+    let o = _jsonrpc_base(method, params)
+    json_stringify(o)
+
+// jsonrpc_success(id, result) -> string
+// Build a JSON-RPC 2.0 Success Response. result may be any serializable value
+// (string, int, list, dict). id must match the id from the originating request.
+fn jsonrpc_success(id: int, result) -> string
+    let o = {}
+    o["jsonrpc"] = "2.0"
+    o["result"] = result
+    o["id"] = id
+    json_stringify(o)
+
+// jsonrpc_error(id, code, message) -> string
+// Build a JSON-RPC 2.0 Error Response. The error object is a nested dict with
+// "code" (int) and "message" (string). Use the jsonrpc_*_error() constants below
+// for the standard code values (-32700 .. -32603).
+fn jsonrpc_error(id: int, code: int, message: string) -> string
+    let e = {}
+    e["code"] = code
+    e["message"] = message
+    let o = {}
+    o["jsonrpc"] = "2.0"
+    o["error"] = e
+    o["id"] = id
+    json_stringify(o)
+
+// jsonrpc_batch(objs) -> string
+// Serialize a list of request/notification dicts as a JSON-RPC 2.0 Batch.
+// The caller builds each element with _jsonrpc_base (or parses with jsonrpc_parse)
+// and collects them into a list before passing here. Returns a JSON array string.
+fn jsonrpc_batch(objs: list) -> string
+    json_stringify(objs)
+
+// jsonrpc_parse(text) -> any
+// Parse a JSON-RPC 2.0 message (or batch array) from raw text.
+// Returns a dict for a single message or a list for a batch.
+// Use the jsonrpc_method / jsonrpc_params / jsonrpc_id accessors on the result.
+fn jsonrpc_parse(text: string) -> any
+    json_decode(text)
+
+// ── accessors ─────────────────────────────────────────────────────────────────────────────────────
+
+// jsonrpc_method(msg) -> string
+// Extract the "method" field from a parsed request or notification dict.
+// Returns "" if the field is absent (i.e. msg is a response, not a request).
+fn jsonrpc_method(msg) -> string
+    if contains(msg, "method")
+        return msg["method"]
+    ""
+
+// jsonrpc_params(msg) -> any
+// Extract the "params" field from a parsed request or notification dict.
+// Returns an empty dict if params is absent (treat as no-args call).
+fn jsonrpc_params(msg) -> any
+    if contains(msg, "params")
+        return msg["params"]
+    let empty = {}
+    empty
+
+// jsonrpc_id(msg) -> int
+// Extract the "id" field from a parsed message.
+// Returns -1 if absent (i.e. the message is a notification or a malformed response).
+fn jsonrpc_id(msg) -> int
+    if contains(msg, "id")
+        return msg["id"]
+    -1
+
+// jsonrpc_is_notification(msg) -> bool
+// True iff this is a notification (a request with no "id" field).
+// Notifications must not receive a server reply per the JSON-RPC 2.0 spec.
+fn jsonrpc_is_notification(msg) -> bool
+    if contains(msg, "id")
+        return false
+    true
+
+// jsonrpc_has_error(msg) -> bool
+// True iff the parsed message is an error response (contains the "error" field).
+fn jsonrpc_has_error(msg) -> bool
+    contains(msg, "error")
+
+// jsonrpc_result(msg) -> any
+// Extract the "result" field from a parsed success response.
+// Returns "" if absent (i.e. this is an error response or not a response at all).
+fn jsonrpc_result(msg) -> any
+    if contains(msg, "result")
+        return msg["result"]
+    ""
+
+// ── standard error codes ──────────────────────────────────────────────────────────────────────────
+// JSON-RPC 2.0 reserves -32768 to -32000 for pre-defined errors.
+// Each returns the int code; pass to jsonrpc_error(id, code, message).
+
+// jsonrpc_parse_error() -> int
+// -32700: Invalid JSON was received. The server cannot parse the request body.
+fn jsonrpc_parse_error() -> int
+    -32700
+
+// jsonrpc_invalid_request() -> int
+// -32600: The JSON is valid but the object is not a valid JSON-RPC 2.0 Request.
+fn jsonrpc_invalid_request() -> int
+    -32600
+
+// jsonrpc_method_not_found() -> int
+// -32601: The method named in the request does not exist or is not available.
+fn jsonrpc_method_not_found() -> int
+    -32601
+
+// jsonrpc_invalid_params() -> int
+// -32602: Invalid method parameters (wrong type, wrong count, missing required).
+fn jsonrpc_invalid_params() -> int
+    -32602
+
+// jsonrpc_internal_error() -> int
+// -32603: Internal JSON-RPC error (unexpected server-side failure).
+fn jsonrpc_internal_error() -> int
+    -32603
