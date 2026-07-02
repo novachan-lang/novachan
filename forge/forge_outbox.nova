@@ -1,0 +1,209 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_outbox — TRANSACTIONAL OUTBOX pattern for reliable event publishing.
+//
+// THE DUAL-WRITE PROBLEM
+// ─────────────────────
+// Naive event publishing does two independent writes: (1) update your DB, then
+// (2) publish to a broker (Kafka, AMQP, forge_mq, …).  If the process crashes
+// between the two, the DB write commits but the event is never published — a
+// SILENT LOSS.  Alternatively, publish first and the DB write fails — a
+// PHANTOM EVENT.  There is no atomic commit that spans a DB and a broker.
+//
+// THE OUTBOX SOLUTION
+// ───────────────────
+// You write the event into an OUTBOX TABLE inside the same DB transaction as
+// your data mutation.  If the transaction commits, the event is guaranteed to
+// exist.  A separate relay process (the "relay") polls the outbox, publishes
+// each event to the real broker, then marks it delivered.  This converts a
+// two-phase write across different systems into a two-phase write inside ONE
+// system (the DB), which is transactionally safe.
+//
+// AT-LEAST-ONCE SEMANTICS
+// ───────────────────────
+// If the relay crashes after publishing but before acking, the event is
+// re-published on restart — DUPLICATE DELIVERY IS POSSIBLE.  Consumers must
+// be idempotent (use event id as an idempotency key).  This is a deliberate
+// trade-off: at-least-once with cheap infra beats exactly-once with expensive
+// 2PC.
+//
+// WHY ACK IS SEPARATE FROM POLL
+// ─────────────────────────────
+// outbox_poll returns pending events WITHOUT marking them delivered.  The relay
+// publishes each event to the real broker, then calls outbox_ack.  If the
+// relay crashes between poll and ack, the next poll re-returns the same events
+// (re-delivery) — this is the at-least-once guarantee.  Marking delivered
+// inside poll would be at-most-once (event lost if relay crashes mid-publish).
+//
+// IN-MEMORY CORE
+// ──────────────
+// This module is the in-memory outbox: event list lives in the actor's heap.
+// A DB-backed implementation (using forge_orm to persist events across process
+// restarts) swaps only the actor internals — the public API (outbox_new /
+// outbox_add / outbox_poll / outbox_ack / outbox_pending / outbox_stop)
+// stays IDENTICAL so callers never change.
+//
+// PAIRING WITH forge_mq
+// ──────────────────────
+// Canonical relay pattern:
+//   let batch = outbox_poll(ob, 10)
+//   let i = 0
+//   while i < len(batch)
+//       let ev = batch[i]
+//       mq_publish(q, ev["topic"], ev["payload"])
+//       outbox_ack(ob, ev["id"])
+//       i = i + 1
+//
+// VERIFICATION (by reasoning)
+// ───────────────────────────
+// add("orders","a") -> id=1; add("orders","b") -> id=2; pending=2.
+// poll(10) -> [{id:1,...},{id:2,...}]; neither is acked yet.
+// ack(1) -> pending=1; poll(10) -> [{id:2,...}] only.
+//
+// ACTOR ARCHITECTURE
+// ──────────────────
+// A single spawned green task owns ALL event state.  Callers on any NOVA
+// carrier send an envelope dict to ob["req"] and park on a reply channel (for
+// reads) or fire-and-forget (for writes).  Race-free under any NOVA_CARRIERS
+// count — no locks, no atomics, no shared mutable state.
+//
+// LEAF MODULE — imports NOTHING; only NOVA built-ins: channel / spawn / send /
+// receive / len / contains / push / str.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// _outbox_loop(ob) — PRIVATE actor task owning all outbox state.
+// ob["req"] : channel — inbound envelope channel (set by outbox_new before spawn).
+//
+// Envelope protocol:
+//   op="add"     env["topic"]=str, env["payload"]=str, env["reply"]=chan -> send(reply, new_id)
+//   op="poll"    env["max"]=int,   env["reply"]=chan                     -> send(reply, list)
+//   op="ack"     env["id"]=int,    env["reply"]=0   (fire-and-forget)
+//   op="pending" env["reply"]=chan                                       -> send(reply, count)
+//   op="stop"    env["reply"]=0   (fire-and-forget)
+fn _outbox_loop(ob)
+    let events = []
+    let seq = 0
+    let running = 1
+    while running == 1
+        let env = receive(ob["req"])
+        let op = env["op"]
+        if op == "stop"
+            running = 0
+        else if op == "add"
+            seq = seq + 1
+            let ev = {}
+            ev["id"] = seq
+            ev["topic"] = env["topic"]
+            ev["payload"] = env["payload"]
+            ev["delivered"] = 0
+            push(events, ev)
+            send(env["reply"], seq)
+        else if op == "poll"
+            let result = []
+            let max_n = env["max"]
+            let idx = 0
+            let collected = 0
+            while idx < len(events)
+                if collected < max_n
+                    let e = events[idx]
+                    if e["delivered"] == 0
+                        let copy = {}
+                        copy["id"] = e["id"]
+                        copy["topic"] = e["topic"]
+                        copy["payload"] = e["payload"]
+                        push(result, copy)
+                        collected = collected + 1
+                idx = idx + 1
+            send(env["reply"], result)
+        else if op == "ack"
+            let target = env["id"]
+            let ai = 0
+            while ai < len(events)
+                if events[ai]["id"] == target
+                    events[ai]["delivered"] = 1
+                ai = ai + 1
+        else if op == "pending"
+            let count = 0
+            let pi = 0
+            while pi < len(events)
+                if events[pi]["delivered"] == 0
+                    count = count + 1
+                pi = pi + 1
+            send(env["reply"], count)
+
+// outbox_new() -> any
+// Create a new transactional outbox.  Returns a handle dict accepted by all
+// outbox_* functions.  The actor task is spawned immediately; the outbox is
+// ready on return.  Runs for the lifetime of the process or until
+// outbox_stop is called.
+fn outbox_new() -> any
+    let ob = {}
+    ob["req"] = channel()
+    spawn _outbox_loop(ob)
+    ob
+
+// outbox_add(ob, topic, payload) -> int
+// Append a new event with the given topic and payload.  Returns the event's
+// monotonically increasing sequence id (starting at 1).  The event is
+// immediately visible to outbox_poll and outbox_pending.
+// Call this INSIDE your DB transaction so that the event is persisted
+// atomically with your data mutation (in the DB-backed version).
+fn outbox_add(ob, topic: string, payload: string) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "add"
+    env["topic"] = topic
+    env["payload"] = payload
+    env["reply"] = rc
+    send(ob["req"], env)
+    receive(rc)
+
+// outbox_poll(ob, max_n) -> list
+// Return up to max_n UNDELIVERED events as a list of dicts, each with keys:
+// "id", "topic", "payload".  Does NOT mark them as delivered — delivery is
+// confirmed only via outbox_ack, so a relay crash between poll and ack causes
+// re-delivery (at-least-once guarantee).  Call outbox_ack for each event
+// after successfully publishing it to the real broker.
+fn outbox_poll(ob, max_n: int) -> list
+    let rc = channel()
+    let env = {}
+    env["op"] = "poll"
+    env["max"] = max_n
+    env["reply"] = rc
+    send(ob["req"], env)
+    receive(rc)
+
+// outbox_ack(ob, id)
+// Mark the event with the given id as delivered.  Fire-and-forget — does not
+// wait for acknowledgement.  Safe to call multiple times for the same id
+// (idempotent: subsequent acks on an already-delivered event are no-ops in
+// terms of visible state).  Call this AFTER the broker confirms receipt of
+// the event.
+fn outbox_ack(ob, id: int)
+    let env = {}
+    env["op"] = "ack"
+    env["id"] = id
+    env["reply"] = 0
+    send(ob["req"], env)
+
+// outbox_pending(ob) -> int
+// Return the number of events that have not yet been acknowledged.  Useful
+// for metrics, health checks, and relay back-pressure decisions.  Do not use
+// as a substitute for outbox_poll (TOCTOU: the count may change between this
+// read and the next poll).
+fn outbox_pending(ob) -> int
+    let rc = channel()
+    let env = {}
+    env["op"] = "pending"
+    env["reply"] = rc
+    send(ob["req"], env)
+    receive(rc)
+
+// outbox_stop(ob)
+// Terminate the actor loop.  After this call the handle is invalid; any
+// subsequent call will block forever.  Call only during controlled shutdown
+// (e.g. in the Forge app teardown path).
+fn outbox_stop(ob)
+    let env = {}
+    env["op"] = "stop"
+    env["reply"] = 0
+    send(ob["req"], env)
