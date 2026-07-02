@@ -1,0 +1,112 @@
+// forge_uuid -- RFC 9562 UUID generation, versions 4 (random) and 7 (time-ordered). A UUID is 128 bits
+// rendered as 32 lowercase hex digits in the 8-4-4-4-12 grouping xxxxxxxx-xxxx-Mxxx-Nxxx-xxxxxxxxxxxx.
+// The version nibble M (index 12) is 4 or 7; the variant nibble N (index 16) is one of 8,9,a,b (top two
+// bits = 10). UUIDv7 replaces the first 48 bits with a big-endian millisecond timestamp, giving ids that
+// sort in creation order as plain strings (great DB keys) while staying globally unique -- like a ULID but
+// in the canonical UUID shape that every driver/column type already understands.
+//
+// We avoid bit-shift operators (NOVA's 1<<64 is broken): every 8-bit byte splits into a high nibble by/16
+// and a low nibble by%16, so 16 CSPRNG bytes give exactly 32 uniform hex nibbles. Timestamp nibbles are
+// peeled most-significant-first with /16 and %16, the same way the ULID module encodes its 48-bit clock.
+//
+// LEAF -- imports NOTHING. Built-ins: secure_bytes/bytes_get (CSPRNG), time_ms (wall clock), char_at, find,
+// len, push, str, lower.
+
+// ── private helpers ──────────────────────────────────────────────────────────────────────────────
+
+// _uuid_nibbles: 32 uniform hex nibbles (each 0..15) from 16 CSPRNG bytes -- high nibble then low nibble
+// of each byte, so the byte order is preserved. This is the raw random material both versions start from.
+fn _uuid_nibbles() -> list
+    let b = secure_bytes(16)
+    let nibs = []
+    let i = 0
+    while i < 16
+        let by = bytes_get(b, i)
+        push(nibs, by / 16)
+        push(nibs, by % 16)
+        i = i + 1
+    nibs
+
+// _nibbles_from_ms: 12 hex nibbles of a 48-bit ms timestamp, most-significant-first (big-endian), so the
+// rendered id sorts in time order. Peeled with /16 and %16 (no bit-shifts), then reversed -- mirrors the
+// ULID timestamp encoding. 48 bits == 12 nibbles; higher bits of ms beyond 48 are dropped by the reversal
+// keeping only the low 12 nibbles' worth we accumulate.
+fn _nibbles_from_ms(ms: int) -> list
+    let rev = []
+    let v = ms
+    let i = 0
+    while i < 12
+        push(rev, v % 16)
+        v = v / 16
+        i = i + 1
+    let out = []
+    let j = len(rev) - 1
+    while j >= 0
+        push(out, rev[j])
+        j = j - 1
+    out
+
+// _render: map 32 nibbles (0..15) to lowercase hex chars and splice in the four hyphens, producing the
+// canonical 36-char 8-4-4-4-12 form. Hyphens go AFTER nibble indices 8, 12, 16, 20.
+fn _render(nibs: list) -> string
+    let hex = "0123456789abcdef"
+    let out = ""
+    let i = 0
+    while i < 32
+        out = out + char_at(hex, nibs[i])
+        if i == 7
+            out = out + "-"
+        if i == 11
+            out = out + "-"
+        if i == 15
+            out = out + "-"
+        if i == 19
+            out = out + "-"
+        i = i + 1
+    out
+
+// ── public API ───────────────────────────────────────────────────────────────────────────────────
+
+// uuid4: a random UUIDv4. All 122 non-fixed bits are CSPRNG; nibble 12 = version 4, nibble 16 forced to the
+// variant class 8/9/a/b via 8 + (nib % 4) (256 is divisible by 4, so the source byte gives a uniform pick).
+fn uuid4() -> string
+    let nibs = _uuid_nibbles()
+    nibs[12] = 4
+    nibs[16] = 8 + (nibs[16] % 4)
+    _render(nibs)
+
+// uuid7_at: a UUIDv7 stamped with a caller-supplied ms time (for deterministic tests / backfill). First 12
+// nibbles = the 48-bit big-endian timestamp; the rest stay random; nibble 12 = version 7, nibble 16 = variant.
+fn uuid7_at(ms: int) -> string
+    let nibs = _uuid_nibbles()
+    let ts = _nibbles_from_ms(ms)
+    let i = 0
+    while i < 12
+        nibs[i] = ts[i]
+        i = i + 1
+    nibs[12] = 7
+    nibs[16] = 8 + (nibs[16] % 4)
+    _render(nibs)
+
+// uuid7: a time-ordered UUIDv7 at the current wall-clock time.
+fn uuid7() -> string
+    uuid7_at(time_ms())
+
+// uuid_is_valid: true iff s is a well-formed UUID -- length 36, hyphens exactly at indices 8,13,18,23, and
+// every other position a hex digit (lowercase OR uppercase accepted). Does NOT enforce a specific version or
+// variant, only the canonical textual shape.
+fn uuid_is_valid(s: string) -> bool
+    if len(s) != 36
+        return false
+    let hexd = "0123456789abcdefABCDEF"
+    let i = 0
+    while i < 36
+        let c = char_at(s, i)
+        if i == 8 or i == 13 or i == 18 or i == 23
+            if c != "-"
+                return false
+        else
+            if find(hexd, c) < 0
+                return false
+        i = i + 1
+    true
