@@ -171,6 +171,7 @@ fn _manager_loop(cmd_ch, self_addr)
                                     // never false-positives a live node. (For larger clusters T should
                                     // scale with N; liveness is a best-effort hint, membership is the
                                     // hard truth — a phi-accrual/suspicion detector is increment 3.)
+    let registry = {}               // D6.3 global registry: name -> value (a handle/addr), registered locally
     last_seen[self_addr] = time_ms()
     while true
         let cmd = receive(cmd_ch)
@@ -222,6 +223,13 @@ fn _manager_loop(cmd_ch, self_addr)
                     s = "down"
                 push(result, {"addr": m, "status": s})
             send(cmd["reply"], result)
+        else if c == "reg"
+            registry[cmd["name"]] = cmd["val"]
+        else if c == "lookup"
+            let lv = ""
+            if contains(registry, cmd["name"])
+                lv = registry[cmd["name"]]
+            send(cmd["reply"], lv)
 
 // ── acceptor: inbound connections route to the manager ──────────────────────
 
@@ -262,6 +270,11 @@ fn _handle_peer(conn, cmd_ch)
             // deep-copied off the wire (process isolation), so this is a normal local call.
             let rv = call_by_name(msg["fn"], msg["args"])
             remote_send(conn, {"type": "result", "value": rv})
+        else if msg["type"] == "whereis"
+            // D6.3: a peer asks who holds a registered name -> local lookup, reply with the value ("" if none).
+            let wreply = channel()
+            send(cmd_ch, {"cmd": "lookup", "name": msg["name"], "reply": wreply})
+            remote_send(conn, {"type": "found", "val": receive(wreply)})
     remote_close(conn)
 
 // ── outbound: join a seed (with retry — a transient connect failure must NOT leave
@@ -318,3 +331,36 @@ fn _gossip_loop(cmd_ch, self_addr)
             let mine = receive(lch)
             spawn _gossip_once(cmd_ch, self_addr, peer, mine)   // decoupled: dead peer can't stall the loop
         sleep(300)
+
+// ── D6.3 global registry: register a name -> value locally; resolve cluster-wide ──────────────────────
+// global_register(info, name, value) records name->value on THIS node. global_whereis(info, name) resolves
+// it: local first, else a fan-out "whereis" query to each LIVE peer (first hit wins). A bounded query (per
+// the _spawn_to model: connect + tcp_wait_readable deadline), so a dead peer can't hang the resolve. Names
+// are cluster-unique by convention; the caller registers on exactly one node.
+fn global_register(info, name, value)
+    send(info["cmd_ch"], {"cmd": "reg", "name": name, "val": value})
+    0
+
+fn global_whereis(info, name)
+    let reply = channel()
+    send(info["cmd_ch"], {"cmd": "lookup", "name": name, "reply": reply})
+    let local = receive(reply)
+    if local != ""
+        return local
+    let live = cluster_alive(info)
+    let self_addr = info["self"]
+    for m in live
+        if m != self_addr
+            let parts = split(m, ":")
+            let conn = remote_connect(parts[0], parse_int(parts[1]))
+            if conn != -1
+                remote_send(conn, {"type": "whereis", "name": name})
+                let ready = tcp_wait_readable(conn, 5000)
+                if ready == 1
+                    let r = remote_recv(conn)
+                    remote_close(conn)
+                    if r != 0 and r["val"] != ""
+                        return r["val"]
+                else
+                    remote_close(conn)
+    ""
