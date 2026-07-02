@@ -1,0 +1,64 @@
+// forge_grpc_h2c_serve_test -- REAL loopback: NOVA acts as its own gRPC-over-h2c CLIENT (preface+SETTINGS
+// via server + HEADERS(:path) + DATA(framed msg)) against serve_grpc_h2c, which dispatches the unary call
+// and replies HEADERS+DATA+trailers. Bounded (accepts 1 conn) + kill-on-timeout via _fdb_one. SERVER test.
+import forge_grpc_h2
+import forge_h2
+import forge_hpack
+import forge_grpc
+import forge_h2_server
+
+fn _echo(payload: list) -> list
+    payload
+
+fn _server(port: int)
+    let smap = forge_grpc.grpc_register(forge_grpc.grpc_service_map(), "/echo.Echo/Say", _echo)
+    forge_grpc_h2.serve_grpc_h2c(smap, port, 1)
+
+fn _client(port: int, rch)
+    sleep(80)
+    let sock = tcp_connect("127.0.0.1", port)
+    let pf = forge_h2.h2_preface()
+    let req = []
+    let pi = 0
+    while pi < len(pf)
+        push(req, ord(char_at(pf, pi)))
+        pi = pi + 1
+    let hdrs = []
+    push(hdrs, [":method", "POST"])
+    push(hdrs, [":path", "/echo.Echo/Say"])
+    push(hdrs, ["content-type", "application/grpc"])
+    let hf = forge_h2.h2_frame(forge_h2.h2_HEADERS(), forge_h2.h2_END_HEADERS(), 1, forge_hpack.hpack_encode_header_block(hdrs))
+    let hi = 0
+    while hi < len(hf)
+        push(req, hf[hi])
+        hi = hi + 1
+    let df = forge_h2.h2_frame(forge_h2.h2_DATA(), forge_h2.h2_END_STREAM(), 1, forge_grpc.grpc_frame([7, 8, 9]))
+    let dfi = 0
+    while dfi < len(df)
+        push(req, df[dfi])
+        dfi = dfi + 1
+    tcp_send_bytes(sock, forge_h2_server.list_to_bytes(req))
+    let resp = bytes(0)
+    let more = tcp_recv_bytes(sock)
+    while bytes_len(more) > 0
+        resp = bytes_concat(resp, more)
+        more = tcp_recv_bytes(sock)
+    tcp_close(sock)
+    send(rch, forge_grpc_h2.grpc_h2_decode_reply(forge_h2_server.bytes_to_list(resp)))
+
+fn main()
+    let port = 19531
+    let p = port
+    spawn fn()
+        _server(p)
+    sleep(300)
+    let rc = channel()
+    let pp = port
+    let rcc = rc
+    spawn fn()
+        _client(pp, rcc)
+    let dr = recv(rc)
+    assert(dr[0] == 0, "grpc-status 0 over socket (got " + str(dr[0]) + ")")
+    assert(str(dr[1]) == str([0, 0, 0, 0, 3, 7, 8, 9]), "framed echo reply [" + str(dr[1]) + "]")
+    print("PASS forge_grpc_h2c_serve (real socket: serve_grpc_h2c dispatch -> reply+trailers)")
+    print("forge_grpc_h2c_serve_test passed")

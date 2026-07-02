@@ -132,6 +132,8 @@ fn _grpc_h2c_conn(smap: dict, conn: int)
     tcp_send_bytes(conn, forge_h2_server.list_to_bytes(forge_h2.h2_settings([])))
     let blist = forge_h2_server.bytes_to_list(bytes_slice(buf, 24, bytes_len(buf)))
     let sid = 1
+    let path = ""
+    let reqbody = []
     let done = false
     while done == false
         let fp = forge_h2.h2_frame_parse(blist, 0)
@@ -146,12 +148,21 @@ fn _grpc_h2c_conn(smap: dict, conn: int)
                     push(blist, ml[k])
                     k = k + 1
         else
+            // Capture the :path from HEADERS and accumulate DATA payload INCREMENTALLY, because frames are
+            // sliced off blist as they are consumed (so we cannot re-scan the whole request at the end).
             if fp[0] == forge_h2.h2_HEADERS()
                 sid = fp[2]
-            let is_end = (fp[1] & forge_h2.h2_END_STREAM()) != 0
-            if fp[0] == forge_h2.h2_DATA()
-                if is_end
-                    tcp_send_bytes(conn, forge_h2_server.list_to_bytes(grpc_h2_handle(smap, blist, sid)))
+                let dec = forge_hpack.hpack_decode_header_block(forge_h2.h2_payload(blist, fp), [])
+                path = grpc_h2_path(dec[0])
+            else if fp[0] == forge_h2.h2_DATA()
+                let db = forge_h2.h2_payload(blist, fp)
+                let di = 0
+                while di < len(db)
+                    push(reqbody, db[di])
+                    di = di + 1
+                if (fp[1] & forge_h2.h2_END_STREAM()) != 0
+                    let res = forge_grpc.grpc_dispatch(smap, path, reqbody)
+                    tcp_send_bytes(conn, forge_h2_server.list_to_bytes(grpc_h2_reply_frames(sid, res["framed"], res["status"], res["message"])))
                     done = true
             if done == false
                 blist = _grpc_slice(blist, fp[5])
