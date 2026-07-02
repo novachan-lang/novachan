@@ -1,0 +1,97 @@
+// forge_migrate -- struct-diff schema migrations (zero migration file).
+//
+// The struct IS the schema. Call migrate_plan(table, existing_cols, sample) and run each returned DDL
+// statement via orm_exec / pool_query to bring the table up to date.
+//
+// v1 is ADD-ONLY:
+//   * New struct fields become new columns via ALTER TABLE ... ADD COLUMN.
+//   * Drops and renames require an explicit annotation (out of scope here). A bare rename without a hint
+//     would emit DROP+ADD and destroy data -- so NOVA deliberately does not infer renames automatically.
+//     Document any rename as a known limitation: annotate the old name in a comment and handle manually.
+//
+// Scalar -> SQL type mapping (_mig_sqltype):
+//   "int"    -> "INTEGER"
+//   "bool"   -> "INTEGER"   (SQLite/PG boolean stored as 0/1)
+//   "float"  -> "REAL"
+//   "string" -> "TEXT"
+//   anything else -> "TEXT"  (structs, lists, bytes -- callers serialize before storing)
+//
+// LEAF module -- no imports. Only built-ins used: field_names, field_get, type_of, len, push, contains, str.
+//
+// Verified by reasoning:
+//   migrate_create_sql("todos", Todo(0,"",false))
+//     -> "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT, done INTEGER)"
+//   migrate_add_columns_sql("todos", ["id","title"], Todo(0,"",false))
+//     -> ["ALTER TABLE todos ADD COLUMN done INTEGER"]
+//   migrate_plan("todos", [], Todo(0,"",false))
+//     -> ["CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT, done INTEGER)"]
+//   migrate_plan("todos", ["id","title"], Todo(0,"",false))
+//     -> ["ALTER TABLE todos ADD COLUMN done INTEGER"]
+
+// _mig_sqltype -- scalar NOVA type name -> SQL column type.
+// "bool" maps to INTEGER because SQLite has no native boolean, and PostgreSQL ORM callers coerce via the
+// struct field type anyway (same as forge_orm does for bool columns).
+fn _mig_sqltype(t: string) -> string
+    if t == "int"
+        return "INTEGER"
+    if t == "bool"
+        return "INTEGER"
+    if t == "float"
+        return "REAL"
+    if t == "string"
+        return "TEXT"
+    "TEXT"
+
+// migrate_col_type -- return the SQL type for a single field on a struct sample value.
+// Uses type_of(field_get(...)) so the mapping is driven by the live struct, not a hand-maintained list.
+fn migrate_col_type(sample, field: string) -> string
+    _mig_sqltype(type_of(field_get(sample, field)))
+
+// migrate_create_sql -- emit a CREATE TABLE IF NOT EXISTS DDL for the struct.
+// The "id" field is always emitted as INTEGER PRIMARY KEY (first column); all other fields follow in
+// field_names order. If the struct has no "id" field the table still gets an id column as primary key
+// but no corresponding struct field maps to it -- callers with no id field should pass existing_cols
+// that already contain "id" so migrate_plan emits ALTER TABLE instead.
+fn migrate_create_sql(table: string, sample) -> string
+    let cols = "id INTEGER PRIMARY KEY"
+    let fields = field_names(sample)
+    let i = 0
+    while i < len(fields)
+        let f = fields[i]
+        if f != "id"
+            let sqltype = migrate_col_type(sample, f)
+            cols = cols + ", " + f + " " + sqltype
+        i = i + 1
+    "CREATE TABLE IF NOT EXISTS " + table + " (" + cols + ")"
+
+// migrate_add_columns_sql -- emit ALTER TABLE ... ADD COLUMN for each field that is not in existing_cols.
+// "id" is always skipped (it is the primary key and can never be added via ALTER TABLE ADD COLUMN).
+// existing_cols is a list of column name strings already present in the live table (from PRAGMA
+// table_info / information_schema.columns etc -- the caller supplies them).
+// Returns an empty list if the table already has every non-id field in the struct.
+fn migrate_add_columns_sql(table: string, existing_cols, sample) -> list
+    let stmts = []
+    let fields = field_names(sample)
+    let i = 0
+    while i < len(fields)
+        let f = fields[i]
+        if f != "id"
+            if contains(existing_cols, f) == false
+                let sqltype = migrate_col_type(sample, f)
+                push(stmts, "ALTER TABLE " + table + " ADD COLUMN " + f + " " + sqltype)
+        i = i + 1
+    stmts
+
+// migrate_plan -- the top-level entry point.
+// Pass the live table's column names as existing_cols (empty list [] for a brand-new table).
+//   * existing_cols is empty  -> returns [migrate_create_sql(...)]  (table does not exist yet)
+//   * existing_cols non-empty -> returns migrate_add_columns_sql(...) (table exists, diff the fields)
+// The caller runs each returned statement in order via orm_exec / pool_query inside a transaction.
+// For a fully up-to-date table this returns an empty list -- safe to call on every app startup.
+fn migrate_plan(table: string, existing_cols, sample) -> list
+    if len(existing_cols) == 0
+        let create = migrate_create_sql(table, sample)
+        let plan = []
+        push(plan, create)
+        return plan
+    migrate_add_columns_sql(table, existing_cols, sample)
