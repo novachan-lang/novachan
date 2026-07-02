@@ -1,0 +1,101 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// forge_h2 — HTTP/2 frame codec (RFC 7540 §4-6). LEAF module (byte-list based, no sockets/forge dep).
+// The 9-octet frame header: Length(24) | Type(8) | Flags(8) | R(1)+StreamID(31), big-endian, followed by
+// the payload. Plus the connection preface and the frame-type/flag constants. HPACK (forge_hpack) supplies
+// the HEADERS payload; serve_h2 (later) drives these over the netpoller. See NOVA_DESIGN/HTTP2_PLAN.md.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Frame types (RFC 7540 §6).
+fn h2_DATA() -> int
+    0
+fn h2_HEADERS() -> int
+    1
+fn h2_RST_STREAM() -> int
+    3
+fn h2_SETTINGS() -> int
+    4
+fn h2_PING() -> int
+    6
+fn h2_GOAWAY() -> int
+    7
+fn h2_WINDOW_UPDATE() -> int
+    8
+
+// Flags (RFC 7540 §6): END_STREAM=0x1 (DATA/HEADERS), END_HEADERS=0x4 (HEADERS), ACK=0x1 (SETTINGS/PING).
+fn h2_END_STREAM() -> int
+    1
+fn h2_END_HEADERS() -> int
+    4
+fn h2_ACK() -> int
+    1
+
+// The client connection preface (RFC 7540 §3.5). The server reads exactly this before the first frame.
+fn h2_preface() -> string
+    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+// Encode one frame: the 9-octet header (length = len(payload)) followed by the payload bytes.
+fn h2_frame(ftype: int, flags: int, stream_id: int, payload: list) -> list
+    let length = len(payload)
+    let out = []
+    push(out, (length / 65536) & 255)
+    push(out, (length / 256) & 255)
+    push(out, length & 255)
+    push(out, ftype & 255)
+    push(out, flags & 255)
+    push(out, (stream_id / 16777216) & 127)
+    push(out, (stream_id / 65536) & 255)
+    push(out, (stream_id / 256) & 255)
+    push(out, stream_id & 255)
+    let i = 0
+    while i < length
+        push(out, payload[i])
+        i = i + 1
+    out
+
+// Parse one frame from `buf` at `off`. Returns [ftype, flags, stream_id, payload_off, payload_len, next_off],
+// or [] if fewer than a full frame (header + declared payload) is available yet (caller reads more).
+fn h2_frame_parse(buf: list, off: int) -> list
+    if off + 9 > len(buf)
+        return []
+    let length = buf[off] * 65536 + buf[off + 1] * 256 + buf[off + 2]
+    let ftype = buf[off + 3]
+    let flags = buf[off + 4]
+    let sid = (buf[off + 5] & 127) * 16777216 + buf[off + 6] * 65536 + buf[off + 7] * 256 + buf[off + 8]
+    let payoff = off + 9
+    if payoff + length > len(buf)
+        return []
+    [ftype, flags, sid, payoff, length, payoff + length]
+
+// Extract a frame's payload bytes (given a parse result).
+fn h2_payload(buf: list, parsed: list) -> list
+    let out = []
+    let i = 0
+    while i < parsed[4]
+        push(out, buf[parsed[3] + i])
+        i = i + 1
+    out
+
+// A SETTINGS frame from [id, value] pairs (each id is 16-bit, value 32-bit; RFC 7540 §6.5). ACK is a
+// zero-length SETTINGS with the ACK flag.
+fn h2_settings(pairs: list) -> list
+    let payload = []
+    let i = 0
+    while i < len(pairs)
+        let p = pairs[i]
+        push(payload, (p[0] / 256) & 255)
+        push(payload, p[0] & 255)
+        push(payload, (p[1] / 16777216) & 255)
+        push(payload, (p[1] / 65536) & 255)
+        push(payload, (p[1] / 256) & 255)
+        push(payload, p[1] & 255)
+        i = i + 1
+    h2_frame(h2_SETTINGS(), 0, 0, payload)
+
+// WINDOW_UPDATE frame (RFC 7540 §6.9): a 31-bit increment on the given stream (0 = connection-level).
+fn h2_window_update(stream_id: int, increment: int) -> list
+    let payload = []
+    push(payload, (increment / 16777216) & 127)
+    push(payload, (increment / 65536) & 255)
+    push(payload, (increment / 256) & 255)
+    push(payload, increment & 255)
+    h2_frame(h2_WINDOW_UPDATE(), 0, stream_id, payload)

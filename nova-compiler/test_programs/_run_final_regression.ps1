@@ -192,6 +192,7 @@ $domain_tests = @(
     'forge_idempotency_test',
     'forge_exporters_test',
     'forge_hpack_test',
+    'forge_h2_test',
     'forge_header_security_test',
     'forge_recv_security_test',
     'forge_routing_correctness_test',
