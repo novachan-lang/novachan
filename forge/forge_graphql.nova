@@ -292,3 +292,70 @@ fn gql_execute_limited_vars(query: string, resolvers: dict, root, variables: dic
 // gql_execute_limited(query, resolvers, root, max_depth, max_complexity) -> dict — DoS guard, no variables.
 fn gql_execute_limited(query: string, resolvers: dict, root, max_depth: int, max_complexity: int) -> dict
     gql_execute_limited_vars(query, resolvers, root, {}, max_depth, max_complexity)
+
+// ── DataLoader (GraphQL N+1 batching, task D4.4) ─────────────────────────────────────────────────
+// The classic GraphQL N+1 problem: a query for 100 users each with a `posts` field fires 1+100
+// resolver calls instead of 2. A DataLoader fixes this by collecting all keys requested during one
+// execution phase and flushing them in a single batch_fn(keys)->values call, then serving results
+// from an in-memory cache for the rest of the request.
+//
+// CONTRACT: batch_fn(keys: list) -> list  must return values in the SAME ORDER as keys.
+//   e.g. batch_fn([1,2,3]) must return [v1, v2, v3]  (index alignment, not arbitrary order).
+// Cache keys are stored as str(key) so any scalar key (int or string) works uniformly.
+//
+// Verified by reasoning:
+//   Let L = gql_loader(fn(ks) [ks[i]*10 for i ...]).
+//   gql_load_many(L, [1,2,3]) -> missing=[1,2,3] -> batch_fn called ONCE -> results=[10,20,30]
+//   -> cache: "1"->10, "2"->20, "3"->30 -> output=[10,20,30]. ONE batch call.
+//   gql_load_many(L, [2,3]) now -> missing=[] (both cached) -> batch_fn NOT called -> [20,30].
+//   gql_load(L, 2) -> gql_load_many(L,[2])[0] -> 20 from cache.
+
+// gql_loader(batch_fn) -> dict
+//   Create a loader dict with the batch function and an empty per-request cache.
+//   batch_fn is a first-class fn: fn(keys: list) -> list.
+fn gql_loader(batch_fn) -> dict
+    let L = {}
+    L["batch"] = batch_fn
+    L["cache"] = {}
+    L
+
+// gql_load_many(loader, keys) -> list
+//   Core batching operation: resolve a list of keys, calling batch_fn at most ONCE for any
+//   uncached keys, then returning all values in the same order as the input keys list.
+fn gql_load_many(loader, keys: list) -> list
+    let cache = loader["cache"]
+    let missing = []
+    let ki = 0
+    while ki < len(keys)
+        let sk = str(keys[ki])
+        if not contains(cache, sk)
+            push(missing, keys[ki])
+        ki = ki + 1
+    if len(missing) > 0
+        let bfn = loader["batch"]
+        let results = bfn(missing)
+        let mi = 0
+        while mi < len(missing)
+            let msk = str(missing[mi])
+            cache[msk] = results[mi]
+            mi = mi + 1
+    let out = []
+    let oi = 0
+    while oi < len(keys)
+        let osk = str(keys[oi])
+        push(out, cache[osk])
+        oi = oi + 1
+    out
+
+// gql_load(loader, key) -> any
+//   Convenience wrapper for a single key lookup. Delegates to gql_load_many so the cache
+//   and batch machinery is always used consistently.
+fn gql_load(loader, key) -> any
+    let vals = gql_load_many(loader, [key])
+    vals[0]
+
+// gql_loader_clear(loader)
+//   Reset the cache to empty. Call at the start of each request so that the per-request
+//   batching/caching invariant holds: no stale values bleed across requests.
+fn gql_loader_clear(loader)
+    loader["cache"] = {}
