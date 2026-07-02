@@ -1,0 +1,186 @@
+// forge_markdown -- a minimal Markdown->HTML renderer (headings, lists, paragraphs,
+// bold/italic/code/links), XSS-safe (text esc()'d before markup added).
+// Verified by reasoning: "# Hi" -> "<h1>Hi</h1>"; "**b**" -> "<strong>b</strong>";
+// "[x](http://a)" -> "<a href='http://a'>x</a>".
+import forge_html
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Strip leading and trailing spaces from a string.
+fn _md_trim(s: string) -> string
+    let a = 0
+    let n = len(s)
+    while a < n and s[a] == " "
+        a = a + 1
+    let b = n
+    while b > a and s[b - 1] == " "
+        b = b - 1
+    slice(s, a, b)
+
+// Wrap inner HTML in an opening/closing tag pair: <tag>inner</tag>.
+fn _md_wrap(tag: string, inner: string) -> string
+    "<" + tag + ">" + inner + "</" + tag + ">"
+
+// Return the heading level (1, 2, 3) if the line starts with the appropriate
+// number of '#' characters followed by a space, else 0.
+fn _md_heading_level(line: string) -> int
+    let n = len(line)
+    if n > 4 and starts_with(line, "### ")
+        return 3
+    if n > 3 and starts_with(line, "## ")
+        return 2
+    if n > 2 and starts_with(line, "# ")
+        return 1
+    0
+
+// Strip the leading heading marker ("# ", "## ", "### ") from a line.
+fn _md_heading_text(line: string, level: int) -> string
+    slice(line, level + 1, len(line))
+
+// Return true if the line is a list item (starts with "- " or "* ").
+fn _md_is_list(line: string) -> bool
+    starts_with(line, "- ") or starts_with(line, "* ")
+
+// Strip the "- " or "* " prefix from a list item.
+fn _md_list_text(line: string) -> string
+    slice(line, 2, len(line))
+
+// ── Inline renderer ─────────────────────────────────────────────────────────
+// Apply inline markup rules to ALREADY-ESCAPED text.
+// Rules in order: code (`…`), bold (**…**), italic (*…*), link ([t](url)).
+// A best-effort single pass per rule; unclosed markers are left literal.
+
+// Replace the first occurrence of pattern open..close with <tag>inner</tag>.
+// Returns the transformed string. Only replaces the FIRST match (called in a loop
+// by callers who need all occurrences replaced).
+fn _md_replace_one(s: string, op: string, cl: string, tag: string) -> string
+    let op_len = len(op)
+    let cl_len = len(cl)
+    let start = find(s, op)
+    if start < 0
+        return s
+    let after_open = start + op_len
+    let rest = slice(s, after_open, len(s))
+    let end_rel = find(rest, cl)
+    if end_rel < 0
+        return s
+    let inner = slice(rest, 0, end_rel)
+    let tail = slice(rest, end_rel + cl_len, len(rest))
+    slice(s, 0, start) + "<" + tag + ">" + inner + "</" + tag + ">" + tail
+
+// Apply a single inline rule (open/close markers -> tag) for ALL occurrences.
+fn _md_apply_rule(s: string, op: string, cl: string, tag: string) -> string
+    let out = s
+    let prev_len = len(out) + 1
+    while len(out) < prev_len
+        prev_len = len(out)
+        out = _md_replace_one(out, op, cl, tag)
+    out
+
+// Parse one [text](url) link. Scans for "[", then "](", then ")".
+// Returns the transformed string with at most one link replaced per call.
+fn _md_replace_link_one(s: string) -> string
+    let n = len(s)
+    let ob = find(s, "[")
+    if ob < 0
+        return s
+    let rest1 = slice(s, ob + 1, n)
+    let sep = find(rest1, "](")
+    if sep < 0
+        return s
+    let link_text = slice(rest1, 0, sep)
+    let rest2 = slice(rest1, sep + 2, len(rest1))
+    let cp = find(rest2, ")")
+    if cp < 0
+        return s
+    let url = slice(rest2, 0, cp)
+    let tail = slice(rest2, cp + 1, len(rest2))
+    slice(s, 0, ob) + "<a href='" + esc(url) + "'>" + link_text + "</a>" + tail
+
+// Apply link replacement for ALL occurrences.
+fn _md_apply_links(s: string) -> string
+    let out = s
+    let prev_len = len(out) + 1
+    while len(out) < prev_len
+        prev_len = len(out)
+        out = _md_replace_link_one(out)
+    out
+
+// Apply all inline rules to already-escaped text. Order matters:
+// code first (protects its contents), bold before italic (** before *),
+// links last.
+fn _md_inline(text: string) -> string
+    let s = _md_apply_rule(text, "`", "`", "code")
+    s = _md_apply_rule(s, "**", "**", "strong")
+    s = _md_apply_rule(s, "*", "*", "em")
+    s = _md_apply_links(s)
+    s
+
+// ── Block renderer ───────────────────────────────────────────────────────────
+
+// Flush a paragraph buffer (list of raw lines) as a <p> element.
+// Escapes and inlines each line, joins with a space.
+fn _md_flush_para(buf: list) -> string
+    if len(buf) == 0
+        return ""
+    let i = 0
+    let parts = []
+    while i < len(buf)
+        push(parts, _md_inline(esc(buf[i])))
+        i = i + 1
+    _md_wrap("p", join(parts, " "))
+
+// Render a list of already-collected raw list-item lines as <ul><li>...</li>...</ul>.
+fn _md_flush_list(items: list) -> string
+    if len(items) == 0
+        return ""
+    let i = 0
+    let inner = ""
+    while i < len(items)
+        inner = inner + _md_wrap("li", _md_inline(esc(items[i])))
+        i = i + 1
+    _md_wrap("ul", inner)
+
+// Convert Markdown source to HTML. Split on newlines, walk line by line.
+fn markdown_to_html(src: string) -> string
+    let lines = split(src, "\n")
+    let out = ""
+    let para_buf = []
+    let list_buf = []
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        let trimmed = _md_trim(line)
+        let hlevel = _md_heading_level(trimmed)
+        if hlevel > 0
+            // Flush any pending paragraph or list first.
+            out = out + _md_flush_para(para_buf)
+            para_buf = []
+            out = out + _md_flush_list(list_buf)
+            list_buf = []
+            // Render heading.
+            let htext = _md_heading_text(trimmed, hlevel)
+            let htag = "h" + str(hlevel)
+            out = out + _md_wrap(htag, _md_inline(esc(htext)))
+        else if _md_is_list(trimmed)
+            // Flush any pending paragraph first.
+            out = out + _md_flush_para(para_buf)
+            para_buf = []
+            // Accumulate list item.
+            push(list_buf, _md_list_text(trimmed))
+        else if trimmed == ""
+            // Blank line: flush both buffers.
+            out = out + _md_flush_para(para_buf)
+            para_buf = []
+            out = out + _md_flush_list(list_buf)
+            list_buf = []
+        else
+            // Normal line: flush list (different block type), accumulate paragraph.
+            out = out + _md_flush_list(list_buf)
+            list_buf = []
+            push(para_buf, line)
+        i = i + 1
+    // Flush remaining buffers at end of input.
+    out = out + _md_flush_para(para_buf)
+    out = out + _md_flush_list(list_buf)
+    out
