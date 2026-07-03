@@ -54,6 +54,10 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 11 (rows 225-230; utility/HTTP polish, ALL KAT-verified). ★ 230 FORGE MODULES. See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- deep structural equality (`forge_deep_equal`), integer numeric helpers clamp/map-range (`forge_numeric`), unit conversions temp/distance/weight (`forge_units`), HTTP status reasons+categories+is_retryable (`forge_http_status`), Content-Type header parse/build (`forge_content_type`), Retry-After parse seconds/HTTP-date (`forge_retry_after`).
+- **★ 230 modules total; ≈167 shipped this session (rows 64-230).** The batteries-included space is now comprehensively saturated: full Spring/Django/Rails/Laravel/NestJS depth + cloud + Redis + all encodings/formats + complete crypto (every primitive KAT-vector-verified) + full security + resilience + i18n + reference data + fuzzy matching + SEO + fintech + analytics + a complete data-structures/algorithms/collections toolkit + HTTP/date/text/numeric utilities. Discipline held to the end: grep-verify before every build, KAT with standard vectors where one exists, plan + memory current.
+
 **2026-07-03 BATTERIES WAVE 10 (rows 214-224; reference data + collections, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Reference data:** ISO 3166 countries (wave 9) + ISO 4217 currencies (`forge_currency`) + ISO 639 languages+RTL (`forge_language`) + US states (`forge_us_states`) + country->flag emoji (`forge_flag` — 4-byte UTF-8 astral).
 - **Collections toolkit (now COMPLETE):** set (`forge_set`), multimap/group-by (`forge_multimap`), frequency counter (`forge_counter`), list utils page/chunk/flatten/unique (`forge_listutil`) — joining heap/ring/trie/union-find/bitset/dag/graph/lru/bloom/hashring.
