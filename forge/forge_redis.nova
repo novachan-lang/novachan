@@ -1,0 +1,122 @@
+// forge_redis -- a pure-NOVA Redis client over RESP2 (the protocol libredis/Jedis/ioredis speak), on the same
+// tcp_* runtime seam as the Postgres/MySQL drivers. The correctness-critical half -- resp_encode (command ->
+// wire) and resp_parse (wire -> value) -- are PURE functions, testable without a live server (KAT-verified);
+// the socket glue just pumps bytes until one full reply is buffered. Redis is NOVA's caching / session-store /
+// rate-limit / pub-sub backend. Commands: get/set/del/exists/incr/expire/ping + a generic redis_command.
+//
+// Uses tcp_connect/tcp_send/tcp_recv/tcp_close builtins. NO module imports.
+
+// Encode a command (list of string args) as a RESP array of bulk strings.
+fn resp_encode(args: list) -> string
+    let crlf = chr(13) + chr(10)
+    let out = "*" + str(len(args)) + crlf
+    let i = 0
+    while i < len(args)
+        let a = str(args[i])
+        out = out + "$" + str(len(a)) + crlf + a + crlf
+        i = i + 1
+    out
+
+// PRIVATE: index of the CRLF pair at/after `from`, or -1 if none complete yet.
+fn _resp_find_crlf(buf: string, from: int) -> int
+    let n = len(buf)
+    let i = from
+    while i + 1 < n
+        if char_at(buf, i) == chr(13) and char_at(buf, i + 1) == chr(10)
+            return i
+        i = i + 1
+    -1
+
+// Parse ONE RESP reply from `buf` at `off`. Returns [kind, value, next_off]:
+//   kind = "str"|"int"|"bulk"|"nil"|"array"|"err"|"incomplete"
+//   value = string (str/err/bulk), int (int), list (array), "" (nil/incomplete)
+//   next_off = index just past this reply (== off when incomplete, so the caller reads more bytes).
+fn resp_parse(buf: string, off: int) -> list
+    let n = len(buf)
+    if off >= n
+        return ["incomplete", "", off]
+    let t = char_at(buf, off)
+    let eol = _resp_find_crlf(buf, off + 1)
+    if eol < 0
+        return ["incomplete", "", off]
+    let line = slice(buf, off + 1, eol)
+    let after = eol + 2
+    if t == "+"
+        return ["str", line, after]
+    if t == "-"
+        return ["err", line, after]
+    if t == ":"
+        return ["int", parse_int(line), after]
+    if t == "$"
+        let blen = parse_int(line)
+        if blen < 0
+            return ["nil", "", after]
+        let bend = after + blen
+        if bend + 2 > n
+            return ["incomplete", "", off]
+        return ["bulk", slice(buf, after, bend), bend + 2]
+    if t == "*"
+        let count = parse_int(line)
+        if count < 0
+            return ["nil", "", after]
+        let items = []
+        let cur = after
+        let i = 0
+        while i < count
+            let sub = resp_parse(buf, cur)
+            if sub[0] == "incomplete"
+                return ["incomplete", "", off]
+            push(items, sub[1])
+            cur = sub[2]
+            i = i + 1
+        return ["array", items, cur]
+    ["err", "protocol error", after]
+
+// ---- socket layer ----
+
+fn redis_connect(host: string, port: int) -> Result<int>
+    tcp_connect(host, port)
+
+// Send a command (list of args) and read exactly one full reply -> [kind, value]. Pumps tcp_recv until
+// resp_parse reports a complete reply. A closed connection mid-reply -> ["err","connection closed"].
+fn redis_command(sock: int, args: list) -> list
+    tcp_send(sock, resp_encode(args))
+    let buf = ""
+    let parsed = resp_parse(buf, 0)
+    while parsed[0] == "incomplete"
+        let chunk = tcp_recv(sock)
+        if len(chunk) == 0
+            return ["err", "connection closed"]
+        buf = buf + chunk
+        parsed = resp_parse(buf, 0)
+    [parsed[0], parsed[1]]
+
+// SET key value -> true on +OK.
+fn redis_set(sock: int, key: string, value: string) -> bool
+    let r = redis_command(sock, ["SET", key, value])
+    r[0] == "str" and r[1] == "OK"
+
+// GET key -> [found, value] (found=false for a missing key so "" the value is unambiguous).
+fn redis_get(sock: int, key: string) -> list
+    let r = redis_command(sock, ["GET", key])
+    if r[0] == "nil"
+        return [false, ""]
+    [true, r[1]]
+
+fn redis_del(sock: int, key: string) -> int
+    (redis_command(sock, ["DEL", key]))[1]
+
+fn redis_exists(sock: int, key: string) -> bool
+    (redis_command(sock, ["EXISTS", key]))[1] == 1
+
+fn redis_incr(sock: int, key: string) -> int
+    (redis_command(sock, ["INCR", key]))[1]
+
+fn redis_expire(sock: int, key: string, seconds: int) -> int
+    (redis_command(sock, ["EXPIRE", key, str(seconds)]))[1]
+
+fn redis_ping(sock: int) -> bool
+    (redis_command(sock, ["PING"]))[0] == "str"
+
+fn redis_close(sock: int)
+    tcp_close(sock)
