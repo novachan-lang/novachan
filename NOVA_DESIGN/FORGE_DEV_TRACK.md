@@ -290,6 +290,7 @@
 | 261 | Flesch readability scoring | forge_readability.nova | grep:flesch_reading_ease | flesch_reading_ease + flesch_kincaid_grade (syllable-group estimate, integer). Content/SEO/education/UX-writing quality. KAT: simple=116 exact, dense=far lower | TESTED ✓ |
 | 262 | HTML to plain text | forge_html_to_text.nova | grep:html_to_text | html_to_text: strip tags + block-close->newline + entity decode. Email plain-text fallback, search indexing, previews. Composes forge_htmlentities. KAT text/tags/entities/newlines | TESTED ✓ |
 | 263 | ASCII/control-char helpers | forge_ascii.nova | grep:has_control | is_ascii/is_printable + strip_control + has_control (rejects control incl ESC/DEL for header-injection safety). Input sanitization, protocol validation. KAT control-detection/strip/printable | TESTED ✓ |
+| 264 | Byte-size string parsing | forge_bytesize.nova | grep:parse_bytesize | parse_bytesize ('1.5GB'/'500MB'->bytes, base-1024, 1 decimal). Inverse of humanize_bytes. Config max-upload/memory/quota limits. KAT 1.5GB=1610612736/TB/spaced | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
