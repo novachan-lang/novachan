@@ -349,6 +349,7 @@
 | 320 | Fenwick tree (Binary Indexed Tree) | forge_fenwick.nova | grep:fenwick_add | fenwick_new/add/prefix_sum/range_sum, O(log n) update+query via i&(-i). Leaderboards/frequency/cumulative stats. KAT 9 | TESTED ✓ |
 | 321 | Segment tree (range-min-query) | forge_segtree.nova | grep:segtree_query_min | segtree_build/query_min/update, O(log n) RMQ + point update (min not invertible, complements Fenwick sums). Sliding-window min/RMQ. KAT 8 | TESTED ✓ |
 | 322 | Count-Min Sketch (frequency estimation) | forge_countmin.nova | grep:cms_estimate | cms_new/add/estimate, fixed-memory per-item count estimate (vs exact-unbounded counter), min-across-rows never under-counts. Heavy-hitters/rate-limit at scale. KAT 7 | TESTED ✓ |
+| 323 | Aho-Corasick multi-pattern search | forge_aho.nova | grep:ac_search | ac_new/add/build/search, find ALL of a keyword set in one O(text+matches) pass (vs per-keyword find). Filters/highlighting/IDS. Trie+BFS fail links. KAT classic ushers + multi + empty | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
