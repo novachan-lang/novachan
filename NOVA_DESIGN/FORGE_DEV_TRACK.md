@@ -199,5 +199,6 @@
 | 170 | Descriptive statistics (dashboards/monitoring/SLA) | forge_stats.nova | grep:stats_stddev | sum/mean/min/max/median/variance/stddev/percentile over int|float lists (insertion sort + sqrt). KAT mean=5/stddev=2/median=4.5. p95/p99 latency SLAs | TESTED ✓ |
 | 171 | HTML entity decode (feed/scraped content, inverse of esc) | forge_htmlentities.nova | grep:html_decode | html_decode named (17: amp/lt/copy/euro/mdash/...) + decimal &#NNN; + hex &#xHH;, correct UTF-8 for BMP (/,% no shifts). KAT ©=2B €=3B &#x41;=A passthrough | TESTED ✓ |
 | 172 | TOML config parser (subset) | forge_toml.nova | grep:toml_parse | toml_parse->nested dict ([table]/[a.b] nesting, quoted/literal strings+escapes, single-line arrays, #comments) + toml_get dotted-path + toml_is_int. Scalars as STRINGS (dotenv/ini convention; parse_int-through-any coercion hit a codegen edge). KAT verified | TESTED ✓ |
+| 173 | DAG topological sort + cycle detection (task/build/migration order) | forge_dag.nova | grep:dag_topo_sort | dag_add(node depends on dep) + dag_topo_sort (deps-first order, [] on cycle) + dag_has_cycle. Kahn-style. KAT: a->b->c order valid, cycle detected | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
