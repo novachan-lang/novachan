@@ -297,6 +297,7 @@
 | 268 | Integer math (gcd/lcm/fraction/isqrt) | forge_math.nova | grep:reduce_fraction | gcd + lcm + reduce_fraction + isqrt (Newton). Ratios, aspect ratios (1920x1080->16:9), LCM scheduling. KAT gcd=6/lcm=12/16:9/isqrt | TESTED ✓ |
 | 269 | int<->binary + popcount | forge_binary.nova | grep:to_binary | to_binary/padded/from_binary + popcount. Bit flags/bitmask display, protocol fields. KAT 10=1010, round-trip, popcount 7=3/255=8 | TESTED ✓ |
 | 270 | Aspect-ratio + fit-to-box | forge_ratio.nova | grep:fit_within | fit_within (scale preserving aspect into box) + ratio_simplify + ratio_string (16:9). Image/video sizing, thumbnails, layout. Composes forge_math gcd. KAT fit + 16:9/4:3 | TESTED ✓ |
+| 271 | RGB color blend/lighten/darken | forge_color_blend.nova | grep:color_blend | color_blend (linear RGB interp) + color_lighten/darken. Gradients, tints, hover states, overlays. Composes forge_color. KAT blend (floor)/darken-exact/100%=hex2 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
