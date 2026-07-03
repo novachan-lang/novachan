@@ -216,5 +216,6 @@
 | 187 | Password + passphrase generator (CSPRNG) | forge_pwgen.nova | grep:fn pwgen | pwgen/pwgen_alnum/pwgen_digits + Diceware passphrase. NUL-safe byte->char, shell/JSON-safe symbols, modulo-bias documented. Generator side of forge_pwpolicy. KAT verified | TESTED ✓ |
 | 188 | Duration-string parse ('2h30m'->ms) | forge_duration_parse.nova | grep:parse_duration_ms | parse_duration_ms/seconds (ms/s/m/h/d/w, ms-before-m). Inverse of forge_duration humanize. Config timeouts/TTLs. KAT 2h30m=9000000, 1d=86400s | TESTED ✓ |
 | 189 | Run-length encoding | forge_rle.nova | grep:rle_encode | rle_encode/rle_decode (aaabbc<->3a2b1c). Sparse bitmaps, telemetry, sprite/terminal data. KAT round-trip | TESTED ✓ |
+| 190 | Base58 encoding (Bitcoin/IPFS, transcribable) | forge_base58.nova | grep:base58_encode | base58_encode/decode (drops ambiguous 0OIl). Crypto addresses, content IDs, shareable tokens. KAT round-trip + ambiguous-char reject. Completes base32/58/62/64 | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
