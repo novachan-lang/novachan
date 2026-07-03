@@ -255,5 +255,6 @@
 | 226 | Numeric helpers (clamp/map-range) | forge_numeric.nova | grep:map_range | clamp/num_min/num_max/map_range/percent_in_range. UI layout, gauges, progress bars, bounds. KAT clamp=10/map=50/pct=38 | TESTED ✓ |
 | 227 | Unit conversions (temp/distance/weight) | forge_units.nova | grep:c_to_f | c_to_f/f_to_c/c_to_k + mi_to_km/km_to_mi + lb_to_kg/kg_to_lb (integer-rounded). Weather/fitness/international. KAT 100C=212F/5mi=8km/100lb=45kg | TESTED ✓ |
 | 228 | HTTP status reason phrases + categories | forge_http_status.nova | grep:status_reason | status_reason (25 codes) + status_category + is_success/redirect/client_error/server_error + is_retryable (408/429/5xx!=501). Response building, retry logic, logging. KAT | TESTED ✓ |
+| 229 | Content-Type header parse/build | forge_content_type.nova | grep:content_type_parse | content_type_parse (media + charset/boundary params, unquoted) + content_type_media/charset + content_type_build. Complements forge_mime/negotiate. KAT | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
