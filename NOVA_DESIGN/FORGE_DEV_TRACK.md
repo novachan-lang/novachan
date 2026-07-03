@@ -220,5 +220,7 @@
 | 191 | ISBN-10/13 book identifiers (validate + convert) | forge_isbn.nova | grep:isbn13_valid | isbn10_valid (mod-11,X) + isbn13_valid (EAN mod-10) + isbn_valid + isbn10_to_13. Library/bookstore/publishing. KAT valid/invalid + conversion | TESTED ✓ |
 | 192 | SWIFT/BIC bank code validation (ISO 9362) | forge_bic.nova | grep:bic_valid | bic_valid (8/11 chars, letter bank+country, alnum location/branch) + bic_bank/bic_country. Pairs w/ forge_iban for wire/SEPA. KAT verified | TESTED ✓ |
 | 193 | GDPR/CCPA consent management | forge_consent.nova | grep:consent_allowed | consent_new (deny-default) + grant/revoke + consent_allowed (necessary always, else opt-in) + encode/decode cookie. Gate analytics/marketing on consent. KAT round-trip | TESTED ✓ |
+| 194 | UTM campaign attribution (parse/build) | forge_utm.nova | grep:utm_parse | utm_parse (strip utm_ prefix->dict) + utm_build (campaign-tagged URL) + utm_source. Marketing attribution. KAT verified | TESTED ✓ |
+| 195 | Referrer/traffic-source classification | forge_referrer.nova | grep:referrer_channel | referrer_channel (search/social/direct/referral by known domains) + referrer_domain. Analytics attribution. KAT all channels | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
