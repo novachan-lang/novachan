@@ -281,6 +281,7 @@
 | 252 | IPv4 subnet math (network/broadcast/netmask) | forge_subnet.nova | grep:subnet_network | subnet_size/network/broadcast/netmask from CIDR (boundary-floor, no bitwise-AND). Network planning, IP allocation. Complements forge_ipcidr. KAT /24 + /16 | TESTED ✓ |
 | 253 | MAC address validation/normalization | forge_mac.nova | grep:mac_normalize | mac_valid (colon/hyphen/Cisco-dot) + mac_normalize (lowercase colon) + mac_oui (vendor prefix). Device tracking, DHCP, ARP. KAT 3 forms + normalize + OUI | TESTED ✓ |
 | 254 | RFC 1123 hostname/domain validation | forge_hostname.nova | grep:hostname_valid | hostname_valid (labels 1-63, no leading/trailing hyphen, <=253, FQDN-tolerant) + hostname_tld. URL/email-domain, TLS SNI, allow-lists. KAT valid/hyphen/empty/FQDN/TLD | TESTED ✓ |
+| 255 | Port validation + service names + scheme defaults | forge_port.nova | grep:port_for_scheme | port_valid (1-65535) + port_service (well-known) + port_for_scheme (http=80/https=443/redis=6379). URL parsing, firewall, config. KAT | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
