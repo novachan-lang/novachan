@@ -186,5 +186,7 @@
 | 158 | Color utils + WCAG contrast (a11y/theming) | forge_color.nova | grep:color_contrast | hex<->RGB(+3-digit), RGB->HSL, WCAG luminance+contrast+passes_aa(4.5:1). VERIFIED black/white=21.0, #777/#fff=4.478. Confirms int/round/floor/ceil builtins | TESTED ✓ |
 | 159 | Levenshtein fuzzy-match (did-you-mean / dedup) | forge_levenshtein.nova | grep:levenshtein | edit distance (KAT kitten/sitting=3) + similarity 0-100 + closest_match + fuzzy_match. O(n*m) rolling-row DP. Typo-tolerant search | TESTED ✓ |
 | 160 | Text content helpers (truncate/word-count/reading-time/highlight) | forge_text.nova | grep:reading_time | truncate_words/excerpt (word-boundary+ellipsis), word_count, reading_time, highlight (<mark>, case-preserving). CMS/blog/search-results. KAT verified | TESTED ✓ |
+| 161 | Snowflake distributed IDs (Twitter, coordination-free) | forge_snowflake.nova | grep:snowflake_next | 64-bit time-ordered id (41-bit ts|10-bit machine|12-bit seq), snowflake_next + timestamp/machine/sequence decode. KAT round-trip exact. Sortable, 1024 machines x 4096/ms | TESTED ✓ |
+| 162 | Geohash proximity encoding (Redis GEO / tile index) | forge_geohash.nova | grep:geohash_encode | lat/lon bit-interleave -> base32 shared-prefix cells. KAT (57.64911,10.40744)=u4pruydqqvj exact. Complements forge_geo haversine | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
