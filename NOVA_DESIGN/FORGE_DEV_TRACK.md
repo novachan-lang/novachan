@@ -315,6 +315,7 @@
 | 286 | Covariance + Pearson correlation + linear regression | forge_stats.nova | grep:stats_correlation | stats_covariance/correlation(Pearson r)/linreg_slope/linreg_intercept (OLS). /n matches variance so ratios cancel; zero-var+len guards. KAT 12 hand-computed incl r=0.7746 | TESTED ✓ |
 | 287 | CBOR encoder (RFC 8949) | forge_cbor.nova | grep:cbor_encode | cbor_uint/int(major0/1 min-width)/text/array(recursive)/bool/null. Binary encoding under COSE/WebAuthn/IoT (distinct from msgpack). KAT 20 vs RFC 8949 Appendix A | TESTED ✓ |
 | 288 | Base45 encoder (RFC 9285) | forge_base45.nova | grep:base45_encode | base45_encode(byte-list) QR-alphanumeric encoding (EU Digital COVID Cert payload). 2 bytes->3 digits LSB-first. Encoding family w/ base32/58/62/64. KAT 6 vs RFC 9285 | TESTED ✓ |
+| 289 | HSL-inverse + HSV<->RGB color conversions | forge_color.nova | grep:color_hsl_to_rgb | color_hsl_to_rgb (inverse of rgb_to_hsl) + color_rgb_to_hsv + color_hsv_to_rgb (picker/theme model). KAT 16 exact + 4 round-trips within ±2 (integer HSL/HSV lossy) | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
