@@ -211,5 +211,6 @@
 | 182 | Unweighted graph BFS shortest-path + reachability | forge_graph.nova | grep:graph_bfs_path | graph_edge/biedge + graph_bfs_path (shortest, head-index queue) + reachable + distance. Degrees-of-separation, dependency reachability, routing. KAT a-e-d=2 beats a-b-c-d=3 | TESTED ✓ |
 | 183 | POSIX path utilities (basename/dirname/extname/join/normalize) | forge_path.nova | grep:path_normalize | path_basename/dirname/extname/join + normalize (resolves ./.. collapses //). URL paths/storage keys/routes. KAT /a/./b/../c=/a/c, a/b/../../c=c | TESTED ✓ |
 | 184 | CRC-32 checksum (data integrity) | forge_checksum.nova | grep:crc32 | crc32 + crc32_hex, bitwise IEEE 802.3 (poly 0xEDB88320, no table). File/blob integrity, network frames, dedup. KAT EXACT vs standard: 123456789=0xCBF43926, hello=0x3610a686 | TESTED ✓ |
+| 185 | Hex encode/decode + hexdump | forge_hex.nova | grep:hex_encode | hex_encode/hex_decode (byte<->2-hex) + hex_spaced. Hexdump/wire-debug/binary-in-text. NUL-decode caveat noted. KAT Hi!=486921 round-trip. Complements base32/62/64 | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
