@@ -351,6 +351,7 @@
 | 322 | Count-Min Sketch (frequency estimation) | forge_countmin.nova | grep:cms_estimate | cms_new/add/estimate, fixed-memory per-item count estimate (vs exact-unbounded counter), min-across-rows never under-counts. Heavy-hitters/rate-limit at scale. KAT 7 | TESTED ✓ |
 | 323 | Aho-Corasick multi-pattern search | forge_aho.nova | grep:ac_search | ac_new/add/build/search, find ALL of a keyword set in one O(text+matches) pass (vs per-keyword find). Filters/highlighting/IDS. Trie+BFS fail links. KAT classic ushers + multi + empty | TESTED ✓ |
 | 324 | Reservoir sampling (Algorithm R) | forge_reservoir.nova | grep:reservoir_sample | reservoir_sample(items,k,seed): uniform k-sample from unknown-length stream, O(k) mem, seeded/reproducible. Log sampling/subsampling. KAT 7 properties | TESTED ✓ |
+| 325 | HyperLogLog cardinality estimation | forge_hll.nova | grep:hll_count | hll_new/add/count, distinct-count in KB (unique visitors at scale). Cardinality companion to countmin/reservoir. Harmonic estimator + linear-counting via hand-rolled ln (_hll_ln atanh series). KAT 10000->9407, 500->533 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
