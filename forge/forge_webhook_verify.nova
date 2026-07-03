@@ -1,0 +1,59 @@
+// forge_webhook_verify -- verify INBOUND webhook signatures from Stripe, GitHub, and Slack (forge_webhook does
+// the OUTBOUND signing). Each provider HMAC-SHA256-signs the raw request body under your endpoint secret in its
+// own header format; verifying proves the request genuinely came from them and wasn't tampered -- a webhook
+// endpoint is public and unauthenticated, so an UNVERIFIED webhook must never be trusted. Constant-time compare;
+// timestamp tolerance blocks replay. Uses the hmac_sha256 builtin (secret,msg)->hex. LEAF -- imports NOTHING.
+
+// PRIVATE: constant-work hex-string compare (no early-exit timing oracle).
+fn _wv_eq(a: string, b: string) -> bool
+    if len(a) != len(b)
+        return false
+    let diff = 0
+    let i = 0
+    while i < len(a)
+        if char_at(a, i) != char_at(b, i)
+            diff = diff + 1
+        i = i + 1
+    diff == 0
+
+// GitHub: X-Hub-Signature-256 = "sha256=<hex>" over the raw body under the webhook secret.
+fn github_webhook_verify(secret: string, body: string, signature_header: string) -> bool
+    _wv_eq(signature_header, "sha256=" + hmac_sha256(secret, body))
+
+// Stripe: Stripe-Signature = "t=<ts>,v1=<hex>[,...]". signed_payload = "<t>.<body>". Verifies v1 AND (when
+// tolerance>0) |now - t| <= tolerance seconds (replay guard). now/tolerance in unix seconds.
+fn stripe_webhook_verify(secret: string, body: string, sig_header: string, now: int, tolerance: int) -> bool
+    let parts = split(sig_header, ",")
+    let t = ""
+    let v1 = ""
+    let i = 0
+    while i < len(parts)
+        let p = trim(parts[i])
+        if starts_with(p, "t=")
+            t = slice(p, 2, len(p))
+        else
+            if starts_with(p, "v1=")
+                v1 = slice(p, 3, len(p))
+        i = i + 1
+    if len(t) == 0 or len(v1) == 0
+        return false
+    if _wv_eq(v1, hmac_sha256(secret, t + "." + body)) == false
+        return false
+    if tolerance > 0
+        let d = now - parse_int(t)
+        if d < 0
+            d = 0 - d
+        if d > tolerance
+            return false
+    true
+
+// Slack: X-Slack-Signature = "v0=<hex>" over "v0:<X-Slack-Request-Timestamp>:<raw body>". tolerance secs
+// (Slack recommends 300). Rejects a stale timestamp before checking the MAC.
+fn slack_verify(signing_secret: string, timestamp: string, body: string, signature_header: string, now: int, tolerance: int) -> bool
+    if tolerance > 0
+        let d = now - parse_int(timestamp)
+        if d < 0
+            d = 0 - d
+        if d > tolerance
+            return false
+    _wv_eq(signature_header, "v0=" + hmac_sha256(signing_secret, "v0:" + timestamp + ":" + body))

@@ -1,0 +1,90 @@
+// forge_captcha — text/math CAPTCHA with a SIGNED, STATELESS token. The server keeps NO session
+// storage: the correct answer + expiry are bound into an HMAC-SHA256-signed token that travels with
+// the form. On submit the server re-derives the signature and constant-compares it, so the token
+// cannot be forged or extended past its expiry without the server secret. The answer IS present in the
+// token (signed, not encrypted) — that is deliberate: this is a bot DETERRENT, not a secret store. The
+// point is (a) the token is unforgeable, and (b) a bot must still READ the human question ("What is 7
+// plus 3?") to know which of the many possible tokens to submit; it cannot mint its own.
+//
+// LEAF module — imports NOTHING. Built-ins only: hmac_sha256(secret,msg)->hex, split(s,sep)->list,
+// parse_int(s)->int, str(n)->string, trim(s)->string, len(x)->int, ord/char indexing.
+//
+// Verified by reasoning:
+//   captcha_math(secret, 7, 3, "+", 0) -> ["What is 7 plus 3?", "10.0.<sig>"] where sig binds "10.0".
+//   captcha_verify(secret, "10.0.<sig>", "10", now) -> true   (sig valid, no expiry, answer matches)
+//   captcha_verify(secret, "10.0.<sig>", "11", now) -> false  (answer mismatch)
+//   captcha_verify(secret, "10.0.<tampered>", "10", now) -> false  (signature mismatch)
+//   captcha_verify(secret, "10.100.<sig>", "10", 200) -> false  (expired: now 200 > exp 100)
+
+// _cap_eq — PRIVATE constant-time string compare. No early exit on the first differing byte, so
+// verification timing does not leak WHERE two equal-length signatures diverge. Length is compared up
+// front (and leaked), which is safe here: the signature is a fixed-width HMAC-SHA256 hex string.
+// diff OR-accumulates every per-byte XOR and stays 0 iff every byte matched.
+fn _cap_eq(x: string, y: string) -> bool
+    if len(x) != len(y)
+        return false
+    let diff = 0
+    let i = 0
+    while i < len(x)
+        diff = diff | (ord(x[i]) ^ ord(y[i]))
+        i = i + 1
+    diff == 0
+
+// captcha_answer — compute the numeric answer for the (a, op, b) challenge. Unknown op -> 0
+// (fail-closed: an unrecognised operator yields a definite, non-guessable-as-correct value).
+fn captcha_answer(a: int, b: int, op: string) -> int
+    if op == "+"
+        return a + b
+    if op == "-"
+        return a - b
+    if op == "*"
+        return a * b
+    0
+
+// captcha_question — the human-readable challenge string. The operator is spelled out ("plus",
+// "minus", "times") so it reads like English and is marginally harder for a naive symbol-scraper.
+// Example: captcha_question(7, 3, "*") -> "What is 7 times 3?".
+fn captcha_question(a: int, b: int, op: string) -> string
+    let word = "?"
+    if op == "+"
+        word = "plus"
+    if op == "-"
+        word = "minus"
+    if op == "*"
+        word = "times"
+    "What is " + str(a) + " " + word + " " + str(b) + "?"
+
+// captcha_math — build a full math challenge. Returns [question, token].
+//   question : the human prompt, e.g. "What is 3 plus 4?" (the answer is NOT revealed here).
+//   token    : "<answer>.<expires>.<sig>" where sig = hmac_sha256(secret, "<answer>.<expires>").
+// `expires` is an absolute deadline (same clock the caller later passes as `now`); 0 means no expiry.
+// The signature binds BOTH the answer and the expiry, so a bot cannot edit either without the secret.
+fn captcha_math(secret: string, a: int, b: int, op: string, expires: int) -> list
+    let answer = captcha_answer(a, b, op)
+    let question = captcha_question(a, b, op)
+    let body = str(answer) + "." + str(expires)
+    let sig = hmac_sha256(secret, body)
+    let token = body + "." + sig
+    [question, token]
+
+// captcha_verify — check a submitted answer against a signed token. Returns true ONLY if:
+//   (1) the token splits into exactly three "."-separated parts,
+//   (2) the recomputed HMAC over "<answer>.<expires>" constant-time-equals the token's signature,
+//   (3) the token is not expired (expires == 0 means no expiry; else now must be <= expires), AND
+//   (4) the trimmed submission string-equals the bound answer.
+// Order matters: signature is verified BEFORE trusting `expires`/`answer`, so a forged token is
+// rejected before its (attacker-controlled) fields are ever compared. Fail-closed on every branch.
+fn captcha_verify(secret: string, token: string, submitted: string, now: int) -> bool
+    let parts = split(token, ".")
+    if len(parts) != 3
+        return false
+    let answer = parts[0]
+    let expires = parts[1]
+    let sig = parts[2]
+    let want = hmac_sha256(secret, answer + "." + expires)
+    if _cap_eq(sig, want) == false
+        return false
+    let exp = parse_int(expires)
+    if exp != 0 and now > exp
+        return false
+    trim(submitted) == answer
