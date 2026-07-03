@@ -339,6 +339,7 @@
 | 310 | GFM strikethrough (markdown) | forge_markdown.nova | grep:_md_inline | ~~text~~ -> <del> added to markdown_to_html inline pipeline (reuses _md_apply_rule). KAT 6 strikethrough + no regression | TESTED ✓ |
 | 311 | Bezier curves (quadratic/cubic) | forge_bezier.nova | grep:bezier_cubic | bezier_quad/bezier_cubic/bezier_cubic_path over [x,y]. SVG paths/fonts/animation motion (Reactor); complements easing/vec3. KAT 9 endpoints+midpoints+path | TESTED ✓ |
 | 312 | AABB collision + spatial tests | forge_aabb.nova | grep:aabb_intersects | aabb_intersects/contains_point/contains/intersection over [x,y,w,h]. O(1) broad-phase for game physics (Reactor)/hit-testing/spatial index. KAT 10. FOUND mixed float-var-vs-int compare bug | TESTED ✓ |
+| 313 | International Morse Code | forge_morse.nova | grep:morse_encode | morse_encode/morse_decode (A-Z 0-9, letters space-sep, words ' / '). Accessibility/ham-radio/reversible codec. KAT 8 SOS/words/roundtrip | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
