@@ -277,6 +277,7 @@
 | 248 | Keep-a-Changelog builder | forge_changelog.nova | grep:changelog_render | changelog_new/add (Added/Changed/Deprecated/Removed/Fixed/Security) + changelog_render (versioned markdown, non-empty only). Release notes, pairs w/ semver_bump. KAT | TESTED ✓ |
 | 249 | JSON pretty-printer (indented) | forge_json_pretty.nova | grep:json_pretty | json_pretty (parse+re-emit indented, recursive) + json_pretty_value. Config, API debugging, log inspection. Braces via chr(), bool->0/1 noted. KAT nested indent | TESTED ✓ |
 | 250 | Recursive PII masking (nested payloads) | forge_json_mask.nova | grep:json_mask | json_mask: deep-redact sensitive keys to *** at ANY depth (dict/list), non-destructive copy. Deep GDPR logging of nested payloads. Complements flat forge_mask. KAT top+nested masked, original intact | TESTED ✓ |
+| 251 | Day-of-year / week-of-year | forge_ordinal_date.nova | grep:date_day_of_year | date_day_of_year (1-366) + date_week_of_year + date_days_left_in_year (leap-aware). Progress-of-year, week numbering. Composes forge_date. KAT Jul3=184/Dec31=365/leap366 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
