@@ -222,5 +222,6 @@
 | 193 | GDPR/CCPA consent management | forge_consent.nova | grep:consent_allowed | consent_new (deny-default) + grant/revoke + consent_allowed (necessary always, else opt-in) + encode/decode cookie. Gate analytics/marketing on consent. KAT round-trip | TESTED ✓ |
 | 194 | UTM campaign attribution (parse/build) | forge_utm.nova | grep:utm_parse | utm_parse (strip utm_ prefix->dict) + utm_build (campaign-tagged URL) + utm_source. Marketing attribution. KAT verified | TESTED ✓ |
 | 195 | Referrer/traffic-source classification | forge_referrer.nova | grep:referrer_channel | referrer_channel (search/social/direct/referral by known domains) + referrer_domain. Analytics attribution. KAT all channels | TESTED ✓ |
+| 196 | Gravatar avatar URLs | forge_gravatar.nova | grep:gravatar_hash | gravatar_hash (md5 trim+lowercase email) + gravatar_url (size+default style) + gravatar. Composes forge_crypto md5. KAT EXACT vs documented: MyEmailAddress@example.com=0bc83cb571cd1c50ba6f3e8a78ef1346 | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
