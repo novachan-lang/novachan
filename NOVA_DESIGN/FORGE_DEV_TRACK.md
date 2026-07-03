@@ -195,5 +195,6 @@
 | 166 | NanoID compact URL-safe ids | forge_nanoid.nova | grep:fn nanoid | nanoid(size)/nanoid_default(21)/nanoid_custom over 64-symbol unbiased alphabet. NUL-safe (bytes_get). KAT len 21/10. Completes id family (ulid/uuid/snowflake/nanoid) | TESTED ✓ |
 | 167 | INI config parser (git config/php.ini/systemd) | forge_ini.nova | grep:ini_parse | [section] key=value -> nested dict (top keys under ""), ; and # comments, quoted values, ini_get default. KAT verified | TESTED ✓ |
 | 168 | Jaro-Winkler similarity (fuzzy name/record matching) | forge_jaro.nova | grep:jaro_winkler | jaro + jaro_winkler (0..1, transposition-aware, prefix-boosted). KAT exact MARTHA/MARHTA=0.944/0.961, DIXON/DICKSONX=0.813. Completes fuzzy toolkit (levenshtein+phonetic+jaro) | TESTED ✓ |
+| 169 | Deterministic default avatars (initials + color) | forge_avatar.nova | grep:avatar_initials | avatar_initials (up to 2, GitHub/Slack style) + avatar_color (stable palette pick, FNV hash) + avatar dict. Same user->same avatar, no image storage. KAT verified | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
