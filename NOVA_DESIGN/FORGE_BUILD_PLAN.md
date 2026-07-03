@@ -54,6 +54,10 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 25 (rows 305-306; the COMPLETE search-indexing pipeline, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- Search preprocessing (`forge_tokenize` — text_tokenize + stop-words + n-grams) + document similarity (`forge_cosine` — term-freq cosine, length-independent). Together with the Porter stemmer (row 304) this is a full classic search stack most web frameworks lack: **text_tokenize → remove_stopwords → stem → (ngrams) → cosine_similarity** for ranked "more-like-this"/near-dup/clustering.
+- **★ 306 modules, ≈243 this session (rows 64-306).** forge_cosine's norms use the sqrt(accumulator) form to dodge the float-return codegen edge found in wave 23 — the workaround is now applied proactively. Remaining HIGH-value work stays DEFERRED (final test pass + gated compiler tier).
+
 **2026-07-03 BATTERIES WAVE 24 (rows 301-304; crypto-address encodings + dev tools + NLP, ALL KAT-verified vs published/canonical vectors). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Crypto-address encodings:** Base58Check (`forge_base58check` — byte-array bignum base58 + double-SHA256 checksum, KAT vs the CANONICAL Satoshi genesis address `1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`, full pipeline) · Bech32/BIP173 (`forge_bech32` — BCH-over-GF(32) checksum for SegWit bc1/BOLT11/Nostr/Cosmos, KAT vs exact BIP173 `a12uel5l` + 32-symbol + 90-char max vectors).
 - **Dev tool:** canonical hexdump -C (`forge_hexdump` — offset + hex + ASCII gutter, for eyeballing binary payloads in logs).
