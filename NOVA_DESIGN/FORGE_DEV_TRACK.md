@@ -188,5 +188,8 @@
 | 160 | Text content helpers (truncate/word-count/reading-time/highlight) | forge_text.nova | grep:reading_time | truncate_words/excerpt (word-boundary+ellipsis), word_count, reading_time, highlight (<mark>, case-preserving). CMS/blog/search-results. KAT verified | TESTED ✓ |
 | 161 | Snowflake distributed IDs (Twitter, coordination-free) | forge_snowflake.nova | grep:snowflake_next | 64-bit time-ordered id (41-bit ts|10-bit machine|12-bit seq), snowflake_next + timestamp/machine/sequence decode. KAT round-trip exact. Sortable, 1024 machines x 4096/ms | TESTED ✓ |
 | 162 | Geohash proximity encoding (Redis GEO / tile index) | forge_geohash.nova | grep:geohash_encode | lat/lon bit-interleave -> base32 shared-prefix cells. KAT (57.64911,10.40744)=u4pruydqqvj exact. Complements forge_geo haversine | TESTED ✓ |
+| 163 | .env config parsing (12-factor / dotenv) | forge_dotenv.nova | grep:dotenv_parse | dotenv_parse (export prefix, #comments, single/double quotes + 
+	\ escapes, inline comments) + dotenv_get default. KAT verified. Feeds forge_config | TESTED ✓ |
+| 164 | Soundex phonetic matching (name sounds-alike search/dedup) | forge_phonetic.nova | grep:fn soundex | soundex (letter+3 digits, h/w-aware collapse) + soundex_match. KAT: Robert/Rupert=R163, Ashcraft=A261, Pfister=P236, Smith/Smyth=S530 all exact | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
