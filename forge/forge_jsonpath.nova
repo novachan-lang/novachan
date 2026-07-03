@@ -1,0 +1,120 @@
+// forge_jsonpath -- JSONPath-lite: extract a value from a nested dict/list structure (e.g. from json_decode)
+// with a dot/bracket path like "$.store.book[0].title" or "user.roles[2]". A practical subset of JSONPath:
+// an optional leading "$" (root) and optional leading "."; dot-separated keys "a.b.c"; bracket INDEX access on
+// the previous key "a[0]" (and chained "a[0][1]"); bracket KEY access with quotes "a['b']" / a[\"b\"] so keys
+// with dots or spaces work; and any combination "$.store.book[0].title". Used for config lookups, webhook
+// payload extraction, and API response mining. This is DIFFERENT from forge_jsonpointer (RFC 6901 "/a/0/b").
+// LEAF -- imports NOTHING.
+
+// A token is a valid array index iff it is non-empty and every char is a digit. Used by the resolvers to decide
+// whether a step may index into a list (vs. a dict key). We do NOT use parse_int for the test because a
+// negative sign or stray char must be rejected, not silently coerced.
+fn _jp_is_index(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    while i < len(s)
+        if find("0123456789", char_at(s, i)) < 0
+            return false
+        i = i + 1
+    true
+
+// Parse a path into a flat list of step STRINGS: each step is a key name or a numeric index (as a string).
+// "$.store.book[0].title" -> ["store","book","0","title"]; a['b'][2] -> ["a","b","2"]. Scan char by char:
+// skip a leading "$"; a "." separator or a "[" ends the current bare-key token (push it if non-empty); a "["
+// opens a bracket read up to the matching "]" -- a quoted body (starts with ' or ") is a KEY (strip the one
+// quote at each end), otherwise it is an INDEX pushed verbatim; every other char accumulates into the bare key.
+// This is the shared tokenizer both resolvers use.
+fn jsonpath_tokens(path: string) -> list
+    let out = []
+    let n = len(path)
+    let sq = chr(39)
+    let dq = chr(34)
+    let i = 0
+    let key = ""
+    while i < n
+        let c = char_at(path, i)
+        if c == "$"
+            i = i + 1
+        else
+            if c == "."
+                if len(key) > 0
+                    push(out, key)
+                    key = ""
+                i = i + 1
+            else
+                if c == "["
+                    if len(key) > 0
+                        push(out, key)
+                        key = ""
+                    // read the bracket body up to the next "]"
+                    let j = i + 1
+                    let body = ""
+                    while j < n and char_at(path, j) != "]"
+                        body = body + char_at(path, j)
+                        j = j + 1
+                    // quoted body -> key (strip one quote each end); otherwise -> index verbatim
+                    let bn = len(body)
+                    if bn >= 2 and (char_at(body, 0) == sq or char_at(body, 0) == dq)
+                        push(out, slice(body, 1, bn - 1))
+                    else
+                        push(out, body)
+                    // advance past the "]" if present
+                    if j < n
+                        i = j + 1
+                    else
+                        i = j
+                else
+                    key = key + c
+                    i = i + 1
+    if len(key) > 0
+        push(out, key)
+    out
+
+// Resolve `path` against `node` (a nested dict/list). Returns the found value, or "" if any step does not
+// resolve: a missing dict key, an out-of-range or non-numeric list index, or descending into a scalar. Return
+// type is `any` because a resolved node may be a dict, list, string, int, etc.
+fn jsonpath_get(node: any, path: string) -> any
+    let cur = node
+    let toks = jsonpath_tokens(path)
+    for tok in toks
+        let kind = type_of(cur)
+        if kind == "dict"
+            if contains(cur, tok) == false
+                return ""
+            cur = cur[tok]
+        else
+            if kind == "list"
+                if _jp_is_index(tok) == false
+                    return ""
+                let idx = parse_int(tok)
+                if idx < 0 or idx >= len(cur)
+                    return ""
+                cur = cur[idx]
+            else
+                return ""
+    cur
+
+// True iff `path` resolves to an existing value in `node`. Same walk as jsonpath_get but returns false on the
+// first miss -- so it is correct even when the resolved value is legitimately "" (which jsonpath_get cannot
+// distinguish from a miss).
+fn jsonpath_has(node: any, path: string) -> bool
+    let cur = node
+    let toks = jsonpath_tokens(path)
+    for tok in toks
+        let kind = type_of(cur)
+        if kind == "dict"
+            if contains(cur, tok) == false
+                return false
+            cur = cur[tok]
+        else
+            if kind == "list"
+                if _jp_is_index(tok) == false
+                    return false
+                let idx = parse_int(tok)
+                if idx < 0 or idx >= len(cur)
+                    return false
+                cur = cur[idx]
+            else
+                return false
+    true
