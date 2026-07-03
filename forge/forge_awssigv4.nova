@@ -1,0 +1,53 @@
+// forge_awssigv4 -- AWS Signature Version 4 request signing (S3, DynamoDB, SQS, Bedrock -- every AWS API).
+// SigV4 derives a per-request signing key by HMAC-chaining the secret through date/region/service, then signs
+// a canonical form of the request. This lets NOVA call any AWS service directly (upload to S3, invoke a model)
+// with no SDK. Composes forge_crypto (hmac_sha256_bytes + hex_of) and the sha256_hex builtin. ASCII inputs.
+import forge_crypto
+
+// PRIVATE: ASCII string -> byte list (SigV4 inputs are ASCII; HMAC keys stay as byte lists, never stringified
+// mid-chain, so the string-NUL-truncation gotcha does not apply here).
+fn _s2b(s: string) -> list
+    let out = []
+    let i = 0
+    while i < len(s)
+        push(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+// PRIVATE: HMAC-SHA256(key_bytes, ascii_msg) -> byte list.
+fn _sig_hmac(key: list, msg: string) -> list
+    hmac_sha256_bytes(key, _s2b(msg))
+
+// The SigV4 signing key: HMAC chain seeded with "AWS4"+secret over date -> region -> service -> "aws4_request".
+fn sigv4_signing_key(secret: string, date_stamp: string, region: string, service: string) -> list
+    let k1 = _sig_hmac(_s2b("AWS4" + secret), date_stamp)
+    let k2 = _sig_hmac(k1, region)
+    let k3 = _sig_hmac(k2, service)
+    _sig_hmac(k3, "aws4_request")
+
+// Credential scope: "<yyyymmdd>/<region>/<service>/aws4_request".
+fn sigv4_scope(date_stamp: string, region: string, service: string) -> string
+    date_stamp + "/" + region + "/" + service + "/aws4_request"
+
+// hex SHA-256 of a payload body (the x-amz-content-sha256 value; "" body -> the empty-string hash).
+fn sigv4_payload_hash(body: string) -> string
+    sha256_hex(body)
+
+// CanonicalRequest = METHOD\nURI\nQUERY\nCANONICAL_HEADERS\n\nSIGNED_HEADERS\nPAYLOAD_HASH. The caller
+// supplies the pieces already canonicalized (sorted query, lowercased "h:v\n" headers, ";"-joined names).
+fn sigv4_canonical_request(method: string, uri: string, query: string, canonical_headers: string, signed_headers: string, payload_hash: string) -> string
+    let nl = chr(10)
+    method + nl + uri + nl + query + nl + canonical_headers + nl + nl + signed_headers + nl + payload_hash
+
+// StringToSign = "AWS4-HMAC-SHA256\n<amz_date>\n<scope>\nHEX(SHA256(canonical_request))".
+fn sigv4_string_to_sign(amz_date: string, scope: string, canonical_request: string) -> string
+    let nl = chr(10)
+    "AWS4-HMAC-SHA256" + nl + amz_date + nl + scope + nl + sha256_hex(canonical_request)
+
+// The final signature (hex) = HEX(HMAC(signing_key, string_to_sign)).
+fn sigv4_signature(secret: string, date_stamp: string, region: string, service: string, string_to_sign: string) -> string
+    hex_of(_sig_hmac(sigv4_signing_key(secret, date_stamp, region, service), string_to_sign))
+
+// The Authorization header value to send with the request.
+fn sigv4_auth_header(access_key: string, scope: string, signed_headers: string, signature: string) -> string
+    "AWS4-HMAC-SHA256 Credential=" + access_key + "/" + scope + ", SignedHeaders=" + signed_headers + ", Signature=" + signature
