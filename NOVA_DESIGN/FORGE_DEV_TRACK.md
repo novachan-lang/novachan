@@ -202,5 +202,7 @@
 | 173 | DAG topological sort + cycle detection (task/build/migration order) | forge_dag.nova | grep:dag_topo_sort | dag_add(node depends on dep) + dag_topo_sort (deps-first order, [] on cycle) + dag_has_cycle. Kahn-style. KAT: a->b->c order valid, cycle detected | TESTED ✓ |
 | 174 | Binary min-heap / priority queue | forge_heap.nova | grep:heap_pop | heap_push/heap_pop (O(log n) sift up/down) + peek/size/empty. Array-backed, explicit logical size (no list-shrink). Scheduling/Dijkstra/top-K. KAT pop order dbac by priority | TESTED ✓ |
 | 175 | Fixed-capacity ring/circular buffer | forge_ring.nova | grep:ring_push | ring_push (overwrite oldest when full) + ring_to_list (oldest->newest) + size/full/oldest. Pre-sized array+head/count, O(1). Log tailing / sliding windows / metric sampling. KAT cap-3+5=cde | TESTED ✓ |
+| 176 | Union-Find / disjoint-set (connected components, clustering, MST) | forge_union_find.nova | grep:uf_union | uf_union/uf_find (path compression + union by size) + uf_connected + uf_size. KAT: connectivity+sizes 3/2/5 correct. Kruskal MST / dedup grouping | TESTED ✓ |
+| 177 | Trie / prefix tree (autocomplete, type-ahead) | forge_trie.nova | grep:trie_complete | trie_insert/contains/has_prefix/complete (nested-dict, $end marker). KAT: contains car=true ca=false, complete car=2 ca=3. Search suggestions/command completion | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
