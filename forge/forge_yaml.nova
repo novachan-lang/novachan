@@ -1,0 +1,224 @@
+// forge_yaml -- a practical SUBSET YAML config parser (the ~90% that CI configs / Kubernetes-lite / app
+// config actually use). Parses indentation-based YAML into nested NOVA dicts + lists. Supports: `#` line
+// comments (a hash at line start or preceded by a space is stripped), `key: value` mappings, indentation
+// nesting (any consistent step -- 2 spaces is typical), block sequences (`- value` scalars and `- key: value`
+// mapping items), and single/double-quoted scalars (quotes stripped). LEAF -- imports NOTHING.
+//
+// SUBSET LIMITS (out of scope): flow style ([a, b] / {a: 1}), multi-line block scalars (| and >), anchors &
+// aliases, multiple documents (---), tabs for indentation (YAML forbids them anyway), and explicit typing
+// tags (!!int). A `#` glued to non-space inside an unquoted value survives (same "space-hash or leading-hash"
+// rule as forge_toml), which matches how most real config `#`-in-value cases behave.
+//
+// TYPING NOTE: every scalar value is returned as a STRING -- the same decision forge_toml / forge_dotenv /
+// forge_ini made. Coercing int/bool and returning them through an `any`-typed function then storing into a
+// nested dict tripped a NOVA codegen edge (the scalar came back empty). Keeping scalars as strings is sound
+// and keeps yaml_get uniform. The caller coerces with parse_int / an `== "true"` check.
+
+// PRIVATE: count leading spaces (the indentation level) of a raw line.
+fn _yaml_indent(line: string) -> int
+    let n = len(line)
+    let i = 0
+    while i < n
+        if char_at(line, i) == " "
+            i = i + 1
+        else
+            return i
+    i
+
+// PRIVATE: strip a trailing `#` comment using the "space-hash or leading-hash" rule, then return the line
+// UNTRIMMED on the left (indentation must be preserved) but with the comment and trailing spaces removed.
+fn _yaml_strip_comment(line: string) -> string
+    let hash = chr(35)
+    let ind = _yaml_indent(line)
+    let body = slice(line, ind, len(line))
+    if starts_with(body, hash)
+        return ""
+    let sh = find(line, " " + hash)
+    if sh >= 0
+        return slice(line, 0, sh)
+    line
+
+// PRIVATE: strip one pair of matching surrounding quotes (single or double) from a trimmed scalar.
+fn _yaml_unquote(raw: string) -> string
+    let s = trim(raw)
+    if len(s) >= 2
+        let f = char_at(s, 0)
+        let q = chr(34)
+        let sq = chr(39)
+        if (f == q or f == sq) and char_at(s, len(s) - 1) == f
+            return slice(s, 1, len(s) - 1)
+    s
+
+// PRIVATE: index of the first ": " (or a trailing ":") key/value separator in a content string, so we can
+// split a `key: value` mapping line. Returns the index of the ':' or -1 if this is not a mapping line.
+// A ':' must be followed by a space OR be the last char of the line to count as a separator.
+fn _yaml_colon(content: string) -> int
+    let n = len(content)
+    let i = 0
+    while i < n
+        if char_at(content, i) == ":"
+            if i == n - 1
+                return i
+            if char_at(content, i + 1) == " "
+                return i
+        i = i + 1
+    -1
+
+// PRIVATE: for the line at index `idx`, find the end of the block of lines strictly more-indented than
+// `min_indent` (i.e. children of `idx`). Scans forward from `idx+1` while indent > min_indent, returning the
+// first index whose indent is <= min_indent (or `end` if none).
+fn _yaml_child_end(lines: list, idx: int, end: int, min_indent: int) -> int
+    let j = idx + 1
+    while j < end
+        let row = lines[j]
+        if row[0] > min_indent
+            j = j + 1
+        else
+            return j
+    end
+
+// PRIVATE: build a NOVA value from the block lines[start..end) that sit at exactly `base_indent`. `lines` is a
+// list of [indent:int, content:string] rows (blank/comment-only lines already dropped). Returns a LIST if the
+// block's rows are sequence items (`- ...`), otherwise a MAPPING (dict). Recurses for nested blocks.
+fn _yaml_block(lines: list, start: int, end: int, base_indent: int) -> any
+    // Peek the first row at base_indent to decide list vs mapping.
+    let firstContent = ""
+    let k = start
+    while k < end
+        let probe = lines[k]
+        if probe[0] == base_indent
+            firstContent = probe[1]
+            k = end
+        else
+            k = k + 1
+
+    let isList = starts_with(firstContent, "- ") or firstContent == "-"
+
+    if isList
+        let arr = []
+        let i = start
+        while i < end
+            let row = lines[i]
+            if row[0] == base_indent
+                let content = row[1]
+                if starts_with(content, "- ") or content == "-"
+                    // Strip the "- " marker; the remainder is either a scalar or the first key of a map item.
+                    let rest = ""
+                    if len(content) > 2
+                        rest = trim(slice(content, 2, len(content)))
+                    let childEnd = _yaml_child_end(lines, i, end, base_indent)
+                    let colon = _yaml_colon(rest)
+                    if colon < 0 and len(rest) > 0
+                        // Pure scalar sequence item: `- value`.
+                        push(arr, _yaml_unquote(rest))
+                        i = i + 1
+                    else
+                        // Mapping sequence item: `- key: value` (+ possibly deeper child lines). Build a dict
+                        // from this item's inline pair PLUS a synthesized sub-block of the deeper lines. The
+                        // inline `key` sits at column base_indent+2 (after "- "); build one child dict.
+                        let item = {}
+                        if colon >= 0
+                            let ikey = trim(slice(rest, 0, colon))
+                            let ival = trim(slice(rest, colon + 1, len(rest)))
+                            if len(ival) > 0
+                                item[ikey] = _yaml_unquote(ival)
+                            else
+                                // key: with nested children under this item.
+                                if childEnd > i + 1
+                                    let deeper = lines[i + 1]
+                                    item[ikey] = _yaml_block(lines, i + 1, childEnd, deeper[0])
+                                else
+                                    item[ikey] = ""
+                        // Any further sibling keys of this map item are the deeper lines whose indent equals
+                        // the inline key's column (base_indent + 2). Merge them into `item`.
+                        let mapIndent = base_indent + 2
+                        let j = i + 1
+                        while j < childEnd
+                            let mrow = lines[j]
+                            if mrow[0] == mapIndent
+                                let mcontent = mrow[1]
+                                let mcolon = _yaml_colon(mcontent)
+                                if mcolon >= 0
+                                    let mkey = trim(slice(mcontent, 0, mcolon))
+                                    let mval = trim(slice(mcontent, mcolon + 1, len(mcontent)))
+                                    if len(mval) > 0
+                                        item[mkey] = _yaml_unquote(mval)
+                                    else
+                                        let mchildEnd = _yaml_child_end(lines, j, childEnd, mapIndent)
+                                        if mchildEnd > j + 1
+                                            let mdeeper = lines[j + 1]
+                                            item[mkey] = _yaml_block(lines, j + 1, mchildEnd, mdeeper[0])
+                                        else
+                                            item[mkey] = ""
+                                        j = mchildEnd - 1
+                                j = j + 1
+                            else
+                                j = j + 1
+                        push(arr, item)
+                        i = childEnd
+                else
+                    i = i + 1
+            else
+                i = i + 1
+        return arr
+
+    // Otherwise: a MAPPING.
+    let out = {}
+    let i = start
+    while i < end
+        let row = lines[i]
+        if row[0] == base_indent
+            let content = row[1]
+            let colon = _yaml_colon(content)
+            if colon >= 0
+                let key = trim(slice(content, 0, colon))
+                let val = trim(slice(content, colon + 1, len(content)))
+                if len(val) > 0
+                    out[key] = _yaml_unquote(val)
+                    i = i + 1
+                else
+                    // Empty value -> nested block (mapping or list) from the deeper lines that follow.
+                    let childEnd = _yaml_child_end(lines, i, end, base_indent)
+                    if childEnd > i + 1
+                        let deeper = lines[i + 1]
+                        out[key] = _yaml_block(lines, i + 1, childEnd, deeper[0])
+                    else
+                        out[key] = ""
+                    i = childEnd
+            else
+                i = i + 1
+        else
+            i = i + 1
+    out
+
+// Parse a whole YAML document into a nested dict (or a list, if the top level is a sequence). Blank lines and
+// comment-only lines are dropped; every remaining line becomes an [indent, content] row, then the recursive
+// block parser builds the structure from indentation.
+fn yaml_parse(text: string) -> any
+    let raw = split(text, chr(10))
+    let lines = []
+    for rl in raw
+        let stripped = _yaml_strip_comment(rl)
+        let content = trim(stripped)
+        if len(content) > 0
+            let row = []
+            push(row, _yaml_indent(stripped))
+            push(row, content)
+            push(lines, row)
+    if len(lines) == 0
+        let empty = {}
+        return empty
+    let first = lines[0]
+    _yaml_block(lines, 0, len(lines), first[0])
+
+// Dotted-path lookup ("database.port") into the parsed structure; "" if any segment is missing or a segment
+// is not a dict. Walks dicts only (list indexing is not part of the path grammar).
+fn yaml_get(node: any, path: string) -> any
+    let segs = split(path, ".")
+    let cur = node
+    for seg in segs
+        if type_of(cur) == "dict" and contains(cur, seg)
+            cur = cur[seg]
+        else
+            return ""
+    cur
