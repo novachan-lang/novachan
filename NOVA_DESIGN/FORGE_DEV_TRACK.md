@@ -210,5 +210,6 @@
 | 181 | Natural / human sort (file2<file10, version-aware) | forge_natsort.nova | grep:natcompare | natcompare/natless: digit-runs compared numerically (strip leading zeros), else lexical. File managers, version lists. KAT file2<file10, v1.9<v1.10, x007==x7 | TESTED ✓ |
 | 182 | Unweighted graph BFS shortest-path + reachability | forge_graph.nova | grep:graph_bfs_path | graph_edge/biedge + graph_bfs_path (shortest, head-index queue) + reachable + distance. Degrees-of-separation, dependency reachability, routing. KAT a-e-d=2 beats a-b-c-d=3 | TESTED ✓ |
 | 183 | POSIX path utilities (basename/dirname/extname/join/normalize) | forge_path.nova | grep:path_normalize | path_basename/dirname/extname/join + normalize (resolves ./.. collapses //). URL paths/storage keys/routes. KAT /a/./b/../c=/a/c, a/b/../../c=c | TESTED ✓ |
+| 184 | CRC-32 checksum (data integrity) | forge_checksum.nova | grep:crc32 | crc32 + crc32_hex, bitwise IEEE 802.3 (poly 0xEDB88320, no table). File/blob integrity, network frames, dedup. KAT EXACT vs standard: 123456789=0xCBF43926, hello=0x3610a686 | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
