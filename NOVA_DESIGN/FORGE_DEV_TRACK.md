@@ -205,5 +205,6 @@
 | 176 | Union-Find / disjoint-set (connected components, clustering, MST) | forge_union_find.nova | grep:uf_union | uf_union/uf_find (path compression + union by size) + uf_connected + uf_size. KAT: connectivity+sizes 3/2/5 correct. Kruskal MST / dedup grouping | TESTED ✓ |
 | 177 | Trie / prefix tree (autocomplete, type-ahead) | forge_trie.nova | grep:trie_complete | trie_insert/contains/has_prefix/complete (nested-dict, $end marker). KAT: contains car=true ca=false, complete car=2 ca=3. Search suggestions/command completion | TESTED ✓ |
 | 178 | Glob wildcard matching (routes/ACLs/topics) | forge_wildcard.nova | grep:wildcard_match | wildcard_match (* run, ? one char, iterative backtrack no recursion) + wildcard_any (glob list). Route patterns/file filters/ACL/pub-sub topics. KAT all correct | TESTED ✓ |
+| 179 | POSIX shell-argument quoting (command-injection-safe) | forge_shellquote.nova | grep:shell_quote | shell_quote (single-quote wrap, embedded ' -> ''' escape) + shell_join + shell_is_safe. Safe subprocess/CLI command lines. KAT: a'b -> 'a'''b' exact | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
