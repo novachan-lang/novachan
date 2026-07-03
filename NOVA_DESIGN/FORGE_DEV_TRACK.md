@@ -310,6 +310,7 @@
 | 281 | JSON:API v1.0 document builder | forge_jsonapi.nova | grep:jsonapi_resource | resource objects (type/id/attributes) + to-one relationships + data/errors documents + vnd.api+json media type. jsonapi.org hypermedia (alongside HAL). KAT 12 serialize | TESTED ✓ |
 | 282 | W3C Server-Timing header | forge_server_timing.nova | grep:st_header | st_metric/st_metric_desc/st_name + st_header join -> Server-Timing value (backend timings to browser DevTools). Integer-ms. KAT 6 grammar+join+edges | TESTED ✓ |
 | 283 | RFC 9530 Content-Digest (SHA-256) | forge_content_digest.nova | grep:content_digest_sha256 | content_digest_sha256(body)->sha-256=:b64: + verify(). Body integrity (webhooks/uploads). Composes forge_crypto. KAT vs independent SHA-256 b64 vectors + tamper | TESTED ✓ |
+| 284 | WWW-Authenticate Bearer/Basic challenge | forge_www_authenticate.nova | grep:bearer_error | bearer_challenge/bearer_error(realm,error,desc,scope)/basic_challenge. RFC 6750/7617 401 challenge, quoted+escaped params, empty optionals omitted. KAT 5 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
