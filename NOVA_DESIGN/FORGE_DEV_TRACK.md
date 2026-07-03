@@ -246,5 +246,6 @@
 | 217 | IPv6 address validation (:: compression) | forge_ip6.nova | grep:ip6_valid | ip6_valid (8-group hex + single :: zero-compression) + ip6_is_loopback. Complements IPv4 forge_ipcidr. KAT full/compressed/::/bad-hex/double-:: | TESTED ✓ |
 | 218 | ISO 639 language data + RTL | forge_language.nova | grep:language_name | language_valid/name/native + language_is_rtl (ar/he/fa/ur/yi) + language_dir (rtl/ltr). 41 languages. i18n pickers, Accept-Language, HTML dir. Complements forge_country | TESTED ✓ |
 | 219 | Have-I-Been-Pwned k-anonymity password check | forge_pwned.nova | grep:pwned_prefix | pwned_prefix (5-char range query) + pwned_suffix (35-char local match) + pwned_count/is_breached. Password never leaves client. Composes forge_crypto sha1. KAT EXACT SHA1('password')=5BAA6... | TESTED ✓ |
+| 220 | Multimap / group-by (key->list) | forge_multimap.nova | grep:mm_group_by | mm_add/get/count/keys + mm_group_by (group record dicts by a field). Inverted indexes, grouping, dup collection. KAT multi-value + group_by | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
