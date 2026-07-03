@@ -314,6 +314,7 @@
 | 285 | Permissions-Policy + Clear-Site-Data builders | forge_browser_policy.nova | grep:permissions_policy | pp_none/self/any/allow(origins)+permissions_policy join (precise feature allowlists beyond static security_headers) + clear_site_data(logout purge). KAT 9 | TESTED ✓ |
 | 286 | Covariance + Pearson correlation + linear regression | forge_stats.nova | grep:stats_correlation | stats_covariance/correlation(Pearson r)/linreg_slope/linreg_intercept (OLS). /n matches variance so ratios cancel; zero-var+len guards. KAT 12 hand-computed incl r=0.7746 | TESTED ✓ |
 | 287 | CBOR encoder (RFC 8949) | forge_cbor.nova | grep:cbor_encode | cbor_uint/int(major0/1 min-width)/text/array(recursive)/bool/null. Binary encoding under COSE/WebAuthn/IoT (distinct from msgpack). KAT 20 vs RFC 8949 Appendix A | TESTED ✓ |
+| 288 | Base45 encoder (RFC 9285) | forge_base45.nova | grep:base45_encode | base45_encode(byte-list) QR-alphanumeric encoding (EU Digital COVID Cert payload). 2 bytes->3 digits LSB-first. Encoding family w/ base32/58/62/64. KAT 6 vs RFC 9285 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
