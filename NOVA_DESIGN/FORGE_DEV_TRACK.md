@@ -179,5 +179,7 @@
 | 151 | Inbound webhook signature verify (Stripe/GitHub/Slack) | forge_webhook_verify.nova | grep:stripe_webhook_verify | github(sha256=)/stripe(t=,v1=+replay)/slack(v0:) HMAC-SHA256, constant-time. KAT: valid→accept, replay→reject. (forge_webhook=outbound) | TESTED ✓ KAT |
 | 152 | Math CAPTCHA (stateless signed token) | forge_captcha.nova | grep:captcha_verify | captcha_math→[question,token]; captcha_verify HMAC constant-time + expiry + answer match, fail-closed. No session storage | untested (syntax✓) |
 | 153 | vCard 4.0 contact cards (RFC 6350, Add-to-Contacts) | forge_vcard.nova | grep:vcard_build | vcard_build from name/org/email/phone/url/note/address (TEXT-escaped, structured N/ADR) + vcard_simple. .vcf for phones/CRMs | untested (syntax✓) |
+| 154 | Signed S3 object requests (GET/PUT/DELETE, no SDK) | forge_s3.nova | grep:s3_request | s3_request/get/put/delete: S3 canonical request (virtual-host, host/x-amz-date/x-amz-content-sha256 signed) via KAT-verified sigv4 → request dict. forge_storage cloud backend. Live-S3 deferred | untested (syntax✓) |
+| 155 | Signed DynamoDB requests (PutItem/GetItem/Query) | forge_dynamodb.nova | grep:dynamodb_request | X-Amz-Target op + JSON body, SigV4-signed (5 sorted canonical headers) → request dict. Serverless NoSQL backend. Composes KAT sigv4. Live deferred | untested (syntax✓) |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
