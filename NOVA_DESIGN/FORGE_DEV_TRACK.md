@@ -322,6 +322,7 @@
 | 293 | Point-in-polygon (ray casting) + area | forge_polygon.nova | grep:point_in_polygon | point_in_polygon(even-odd, convex+concave) + polygon_area(shoelace). Geofencing forge_geo lacks (geo_within=circle only). KAT 13 incl concave-notch-outside + exact areas | TESTED ✓ |
 | 294 | VIN validation (ISO 3779) | forge_vin.nova | grep:vin_valid | vin_valid + vin_check_char (17-char, position-9 weighted-mod-11 check, X=10, I/O/Q forbidden). Automotive/logistics; w/ ISIN/CUSIP/IBAN. KAT classic 1HGCM82633A004352 + rejects | TESTED ✓ |
 | 295 | Dense matrix linear algebra | forge_matrix.nova | grep:mat_mul | mat_mul(conformable/non-square)/transpose/identity/add + mat_det2/det3. Row-major, exact int results. Graphics/physics/ML host math. KAT 9 known products+dets(-2/-306/1) | TESTED ✓ |
+| 296 | 3D vector math (vec3) | forge_vec3.nova | grep:vec3_cross | vec3_add/sub/scale/dot/cross/length/normalize. 3D graphics/physics/games (Reactor) + geometric ML; companion to matrix. Zero-safe. KAT 11 incl right-handed cross + orthogonality | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
