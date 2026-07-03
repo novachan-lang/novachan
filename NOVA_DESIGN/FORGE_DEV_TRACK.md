@@ -329,6 +329,7 @@
 | 300 | Quaternion 3D rotation math | forge_quat.nova | grep:quat_mul | quat_identity/mul(Hamilton)/conj/norm/normalize/from_axis_angle/rotate_vec. Gimbal-free 3D rotation (Reactor); completes vec3/matrix/complex. KAT 8 incl i*j=k, rotate-90/180-z. Found+fixed a sqrt float-return codegen edge | TESTED ✓ |
 | 301 | Base58Check encoding (Bitcoin addresses) | forge_base58check.nova | grep:base58check_encode | base58_encode_bytes(byte-array bignum, leading-zero->1) + base58check_encode(version+payload+double-SHA256 checksum). Composes forge_crypto. KAT vs CANONICAL genesis address 1A1zP1eP5... | TESTED ✓ |
 | 302 | Canonical hexdump -C byte dump | forge_hexdump.nova | grep:hexdump | hexdump(byte-list)->offset+16 hex(two 8-cols)+ASCII gutter(printable/dot). Binary-payload debugging. Avoids 1<<64 edge. KAT 8 offset/hex/gap/gutter/dots/multirow | TESTED ✓ |
+| 303 | Bech32 encoding (BIP 173) | forge_bech32.nova | grep:bech32_encode | bech32_encode(hrp,5-bit data) + BCH-GF(32) 6-symbol checksum. SegWit bc1/BOLT11/Nostr/Cosmos. Avoids 1<<64 edge. KAT exact BIP173 a12uel5l + abcdef1...mqqqxw + max-len 90 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
