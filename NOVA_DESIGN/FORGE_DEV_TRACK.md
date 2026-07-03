@@ -214,5 +214,7 @@
 | 185 | Hex encode/decode + hexdump | forge_hex.nova | grep:hex_encode | hex_encode/hex_decode (byte<->2-hex) + hex_spaced. Hexdump/wire-debug/binary-in-text. NUL-decode caveat noted. KAT Hi!=486921 round-trip. Complements base32/62/64 | TESTED ✓ |
 | 186 | Fake seed-data generator (Faker/factory_bot) | forge_faker.nova | grep:fake_name | fake_name/email/username/sentence, deterministic from a seed (reproducible or varied). Seed dev DBs, demos, load tests. KAT deterministic+varied | TESTED ✓ |
 | 187 | Password + passphrase generator (CSPRNG) | forge_pwgen.nova | grep:fn pwgen | pwgen/pwgen_alnum/pwgen_digits + Diceware passphrase. NUL-safe byte->char, shell/JSON-safe symbols, modulo-bias documented. Generator side of forge_pwpolicy. KAT verified | TESTED ✓ |
+| 188 | Duration-string parse ('2h30m'->ms) | forge_duration_parse.nova | grep:parse_duration_ms | parse_duration_ms/seconds (ms/s/m/h/d/w, ms-before-m). Inverse of forge_duration humanize. Config timeouts/TTLs. KAT 2h30m=9000000, 1d=86400s | TESTED ✓ |
+| 189 | Run-length encoding | forge_rle.nova | grep:rle_encode | rle_encode/rle_decode (aaabbc<->3a2b1c). Sparse bitmaps, telemetry, sprite/terminal data. KAT round-trip | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
