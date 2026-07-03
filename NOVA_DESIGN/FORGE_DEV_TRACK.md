@@ -270,6 +270,7 @@
 | 241 | Nested dict flatten/unflatten (dotted keys) | forge_json_flatten.nova | grep:json_flatten | json_flatten (nested -> {a.b.c: value}) + json_unflatten. Config diffing, form serialization, analytics events. KAT a.b.c round-trip | TESTED ✓ |
 | 242 | CSPRNG random selection (pick/shuffle/sample) | forge_random_pick.nova | grep:pick_one | pick_one + shuffle (Fisher-Yates) + sample (without replacement). A/B bucketing, raffles, sampling, randomized order. secure_bytes. KAT pick/shuffle/sample | TESTED ✓ |
 | 243 | Monotonic stopwatch (profiling/benchmarks) | forge_stopwatch.nova | grep:sw_elapsed_ms | sw_start + sw_elapsed_ms/us/ns via clock_ns (monotonic, NTP-immune). Profiling, benchmarks, latency. KAT: real sleep(50)->>=40ms | TESTED ✓ |
+| 244 | Boolean string parsing | forge_boolean.nova | grep:parse_bool | parse_bool (yes/true/1/on/y/t->true) + parse_bool_default (unknown->default) + bool_str. Config, checkboxes, env vars. Complements dotenv. KAT truthy/falsy/default | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
