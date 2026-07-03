@@ -260,5 +260,6 @@
 | 231 | Canonical query string (sort params) | forge_query_canon.nova | grep:query_canon | query_canon (sort params -> stable) + query_equal (order-insensitive). Cache keys, request signatures, canonical URLs, dedup. Complements forge_qs. KAT | TESTED ✓ |
 | 232 | In-memory KV store with TTL expiry | forge_kv_ttl.nova | grep:kv_ttl_remaining | kv_new/set(ttl)/get/has/ttl_remaining/delete, lazy eviction. Request caches, short-lived tokens, OTP/nonce, rate-limit state. KAT fresh/expired/ttl=70 | TESTED ✓ |
 | 233 | Navigation breadcrumbs from path | forge_breadcrumb.nova | grep:breadcrumbs | breadcrumbs(path)->[label,url] (title-cased labels nike-air->Nike Air, cumulative URLs, Home prepended). Nav UIs + JSON-LD BreadcrumbList. KAT | TESTED ✓ |
+| 234 | Word-wrap to max width | forge_wordwrap.nova | grep:word_wrap | word_wrap: break lines at word boundaries to a max width, preserve newlines. Terminal/email/plain-text/chat. KAT: width-10 wrap, no line exceeds | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
