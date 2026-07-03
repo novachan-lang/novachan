@@ -334,6 +334,7 @@
 | 305 | Search tokenizer + stop-words + n-grams | forge_tokenize.nova | grep:text_tokenize | text_tokenize + is_stopword/remove_stopwords + ngrams. Completes search-index pipeline w/ Porter stemmer (tokenize->stopwords->stem->index). KAT 9 | TESTED ✓ |
 | 306 | Cosine similarity (document similarity) | forge_cosine.nova | grep:cosine_similarity | cosine_similarity(token lists) term-freq vectors -> (A.B)/(|A||B|), length-independent. Caps search pipeline (more-like-this/near-dup/clustering). sqrt-accumulator dodges float edge. KAT 6 | TESTED ✓ |
 | 307 | Set-similarity metrics (Jaccard/Dice/overlap) | forge_setsim.nova | grep:jaccard | jaccard/dice_coef/overlap_coef over token sets (membership not frequency). Tag similarity/near-dup/recs; set-based complement to cosine. KAT 9 | TESTED ✓ |
+| 308 | Dijkstra weighted shortest path | forge_dijkstra.nova | grep:dijkstra_dist | wgraph_new/edge + dijkstra_dist + dijkstra_path (weighted least-cost, vs forge_graph unweighted BFS). Routing/network/game-AI pathfinding. KAT least-cost route + unreachable + self | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
