@@ -268,6 +268,7 @@
 | 239 | Reversible sequential-ID obfuscation | forge_obfuscate_id.nova | grep:obfuscate_encode | obfuscate_encode/decode: modular-multiplicative permutation over 2^31-1, inverse via extended Euclid. Hide row order/count in public URLs, no lookup. Bijective, pair w/ base62. KAT round-trip | TESTED ✓ |
 | 240 | TSV parse/build (spreadsheet/export) | forge_tsv.nova | grep:tsv_parse | tsv_parse (rows of fields, 
 | 241 | Nested dict flatten/unflatten (dotted keys) | forge_json_flatten.nova | grep:json_flatten | json_flatten (nested -> {a.b.c: value}) + json_unflatten. Config diffing, form serialization, analytics events. KAT a.b.c round-trip | TESTED ✓ |
+| 242 | CSPRNG random selection (pick/shuffle/sample) | forge_random_pick.nova | grep:pick_one | pick_one + shuffle (Fisher-Yates) + sample (without replacement). A/B bucketing, raffles, sampling, randomized order. secure_bytes. KAT pick/shuffle/sample | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
