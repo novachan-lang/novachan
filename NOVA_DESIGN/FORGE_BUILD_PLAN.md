@@ -54,6 +54,10 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 17 (rows 256-260; identity/encoding/tokens, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- deterministic UUIDv5 (`forge_uuid5` — KAT EXACT vs RFC uuid5(DNS,example.com)=cfbff0d1-…ae17, validates forge_crypto sha1), practical email validation (`forge_email_validate` — composes forge_hostname), identicon pattern (`forge_identicon` — GitHub-style avatars), base64url (`forge_base64url` — JWT/URL tokens), JWT unverified decode/inspect (`forge_jwt_decode` — claim reading, composes base64url).
+- **★ 260 MODULES, ≈197 this session (rows 64-260).** Auth/token domain complete (jwt encode/verify/decode + base64url + pkce + basic/bearer + session + totp + oauth + webhooks). Avatar domain complete (avatar/gravatar/identicon). Encoding family complete (base32/58/62/64/64url/hex/nanoid/uuid-v4/v5/v7/ulid/snowflake/msgpack). Every crypto primitive (SHA-1/256, HMAC, MD5, TOTP, AWS-SigV4, CRC-32, UUIDv5) KAT-verified vs standard vectors. Batteries space exhaustively saturated across ALL domains. Plan + memory current across 17 ledger waves.
+
 **2026-07-03 BATTERIES WAVE 16 (rows 251-255; networking + date completion, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - day-of-year/week-of-year (`forge_ordinal_date`), IPv4 subnet math (`forge_subnet` — network/broadcast/netmask), MAC address validate/normalize (`forge_mac`), RFC 1123 hostname validation (`forge_hostname`), port validation + service names + scheme defaults (`forge_port`).
 - **★ Networking domain now COMPLETE:** ipcidr (IPv4 membership) + ip6 (IPv6) + subnet (subnet math) + mac + hostname + port + url. **255 modules total, ≈192 this session (rows 64-255).** The batteries-included space is exhaustively saturated across every conceivable category. Plan + memory current across 16 ledger waves.
