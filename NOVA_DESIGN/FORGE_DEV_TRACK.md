@@ -296,6 +296,7 @@
 | 267 | base36 encode/decode (case-insensitive) | forge_base36.nova | grep:base36_encode | base36_encode/decode (0-9a-z, case-insensitive). Reddit-style ids, transcribable short codes. Completes radix family (32/36/58/62/64). KAT 1295<->zz round-trip | TESTED ✓ |
 | 268 | Integer math (gcd/lcm/fraction/isqrt) | forge_math.nova | grep:reduce_fraction | gcd + lcm + reduce_fraction + isqrt (Newton). Ratios, aspect ratios (1920x1080->16:9), LCM scheduling. KAT gcd=6/lcm=12/16:9/isqrt | TESTED ✓ |
 | 269 | int<->binary + popcount | forge_binary.nova | grep:to_binary | to_binary/padded/from_binary + popcount. Bit flags/bitmask display, protocol fields. KAT 10=1010, round-trip, popcount 7=3/255=8 | TESTED ✓ |
+| 270 | Aspect-ratio + fit-to-box | forge_ratio.nova | grep:fit_within | fit_within (scale preserving aspect into box) + ratio_simplify + ratio_string (16:9). Image/video sizing, thumbnails, layout. Composes forge_math gcd. KAT fit + 16:9/4:3 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
