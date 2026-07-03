@@ -238,5 +238,7 @@
 | 209 | URL shortener (bit.ly-style) | forge_shortlink.nova | grep:shortlink_code | shortlink_code/id (id<->base62) + shortlink_url + shortlink_resolve. Composes forge_base62. KAT 1000000<->4c92 + URL build/resolve | TESTED ✓ |
 | 210 | Business-day arithmetic (weekend-skipping) | forge_business_days.nova | grep:add_business_days | is_business_day + business_days_between + add_business_days (skip Sat/Sun). SLA deadlines, delivery/invoice dates. Composes forge_date. KAT Fri+1biz=Mon, Fri+5biz=next-Fri | TESTED ✓ |
 | 211 | Age from birthdate + age-gating | forge_age.nova | grep:age_years | age_years (birthday-passed-aware) + age_at_least (18+/21+ gating). Eligibility, age-gates, profiles. KAT birthday-today=26/tomorrow=25/exactly-18 | TESTED ✓ |
+| 212 | Countdown / deadline labels | forge_countdown.nova | grep:days_until | days_until + is_past + countdown_label (today/tomorrow/yesterday/in N days/N days ago). Deadlines, trial expiry, timers. Composes forge_date. KAT | TESTED ✓ |
+| 213 | ISO 3166 country data + validation | forge_country.nova | grep:country_name | country_valid/name/alpha3/calling_code/from_alpha3 (50 countries, alpha2<->alpha3<->name<->tel). Address forms, dropdowns, shipping/tax, phone codes. KAT | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
