@@ -292,6 +292,7 @@
 | 263 | ASCII/control-char helpers | forge_ascii.nova | grep:has_control | is_ascii/is_printable + strip_control + has_control (rejects control incl ESC/DEL for header-injection safety). Input sanitization, protocol validation. KAT control-detection/strip/printable | TESTED ✓ |
 | 264 | Byte-size string parsing | forge_bytesize.nova | grep:parse_bytesize | parse_bytesize ('1.5GB'/'500MB'->bytes, base-1024, 1 decimal). Inverse of humanize_bytes. Config max-upload/memory/quota limits. KAT 1.5GB=1610612736/TB/spaced | TESTED ✓ |
 | 265 | Tip/gratuity + bill-split math | forge_tip.nova | grep:split_bill | tip_amount/tip_total + split_bill (per-person + remainder surfaced) + tip_split. Integer cents, no rounding loss. Restaurant/bill-split apps. KAT 18%=1800, \$100/3=3333r1 | TESTED ✓ |
+| 266 | Roman numeral encode/decode | forge_roman.nova | grep:to_roman | to_roman (1-3999, subtractive) + from_roman. Copyright years, outlines, clock faces. KAT 1994<->MCMXCIV, 2024=MMXXIV, round-trip | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
