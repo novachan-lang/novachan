@@ -54,6 +54,13 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 7 (rows 178-190; algorithms + utilities, ALL functionally KAT-verified — several against standard vectors). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Algorithms/matching:** glob wildcard (`forge_wildcard`), natural/version sort (`forge_natsort`), unweighted graph BFS/reachability (`forge_graph`), POSIX path utils (`forge_path`).
+- **Data/integrity:** compact bit set (`forge_bitset`), CRC-32 (`forge_checksum` — KAT vs standard 0xCBF43926), hex codec (`forge_hex`), Base58 (`forge_base58`), run-length encoding (`forge_rle`), duration-string parse (`forge_duration_parse`).
+- **Security/dev-ex:** POSIX shell-argument quoting (`forge_shellquote` — injection-safe), password/passphrase generator (`forge_pwgen` — CSPRNG, NUL-safe), fake seed-data (`forge_faker`).
+- **★ NOVA fact:** there is NO `reverse` builtin (manual index-flip); confirmed float builtins pow/sqrt/sin/cos/asin/atan2/round/floor/ceil/int() all work. Every module grep-verified before write; the whole 64-190 batteries push (127 modules) is committed with the DEV_TRACK + this ledger current.
+- **NEXT (still deferred per rapid-dev rule):** ONE final functional test pass over all 190 rows; the gated compiler tier — now includes the 3 codegen edges found this session (geo_bearing float-return, parse_int-through-any coercion, + the interfaces#8/ALPN-TLS/WASM/with-tx-syntax items).
+
 **2026-07-03 BATTERIES WAVE 6 (rows 171-177; core data structures + config formats — ALL functionally KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Data structures:** DAG topological sort + cycle detection (`forge_dag`), binary min-heap / priority queue (`forge_heap`), ring/circular buffer (`forge_ring`), Union-Find / disjoint-set (`forge_union_find`), Trie / prefix-tree autocomplete (`forge_trie`). Join the existing lru/bloom/hashring for a full algorithmic toolkit.
 - **Formats:** TOML parser (`forge_toml` — scalars-as-strings), HTML entity decode (`forge_htmlentities` — UTF-8 numeric refs).
