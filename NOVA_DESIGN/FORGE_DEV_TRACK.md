@@ -249,5 +249,6 @@
 | 220 | Multimap / group-by (key->list) | forge_multimap.nova | grep:mm_group_by | mm_add/get/count/keys + mm_group_by (group record dicts by a field). Inverted indexes, grouping, dup collection. KAT multi-value + group_by | TESTED ✓ |
 | 221 | Frequency counter (Counter) | forge_counter.nova | grep:counter_most_common | counter_add/add_n/get/most_common/of/distinct. Word freq, tag counts, top-N, histograms. KAT a=3/most-common/add_n. Confirms int-in-dict increment sound | TESTED ✓ |
 | 222 | String set (union/intersect/diff) | forge_set.nova | grep:set_union | set_new/add/has/remove/size/of + union/intersect/diff. Dedup, tag/permission sets. Dict-backed. KAT dedup + set algebra (union=4/inter=2/diff=1) | TESTED ✓ |
+| 223 | In-memory list utilities (page/chunk/flatten/unique) | forge_listutil.nova | grep:list_chunk | list_page (paginate loaded array) + list_chunk (batch) + list_flatten + list_unique (order-preserving dedup). Pairs w/ forge_pagination. KAT all + nested-list access | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
