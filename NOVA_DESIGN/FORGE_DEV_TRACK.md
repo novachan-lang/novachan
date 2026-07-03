@@ -288,6 +288,7 @@
 | 259 | base64url encode/decode (JWT/URL tokens) | forge_base64url.nova | grep:base64url_encode | base64url_encode/decode (RFC 4648 §5, +->- /->_ no padding, re-pad on decode). JWT/JWS/WebAuthn/URL tokens. KAT no-padding+round-trip+URL-safe. Completes encoding family | TESTED ✓ |
 | 260 | JWT unverified decode/inspect | forge_jwt_decode.nova | grep:jwt_decode_payload | jwt_decode_payload/header (base64url+json_decode, NO verify) + jwt_is_expired. Claim inspection/debug/gateway tokens. forge.nova jwt_verify=signed. Composes base64url. KAT sub/alg/exp | TESTED ✓ |
 | 261 | Flesch readability scoring | forge_readability.nova | grep:flesch_reading_ease | flesch_reading_ease + flesch_kincaid_grade (syllable-group estimate, integer). Content/SEO/education/UX-writing quality. KAT: simple=116 exact, dense=far lower | TESTED ✓ |
+| 262 | HTML to plain text | forge_html_to_text.nova | grep:html_to_text | html_to_text: strip tags + block-close->newline + entity decode. Email plain-text fallback, search indexing, previews. Composes forge_htmlentities. KAT text/tags/entities/newlines | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
