@@ -273,6 +273,7 @@
 | 244 | Boolean string parsing | forge_boolean.nova | grep:parse_bool | parse_bool (yes/true/1/on/y/t->true) + parse_bool_default (unknown->default) + bool_str. Config, checkboxes, env vars. Complements dotenv. KAT truthy/falsy/default | TESTED ✓ |
 | 245 | Cron next-fire-time computation | forge_cron_next.nova | grep:cron_next | cron_next (next epoch-minute matching expr, bounded) + cron_minutes_until. Composes forge_cron cron_matches + forge_date. Job schedulers, next-run displays. KAT: every-min->+1, hourly<=60, Feb30->-1 | TESTED ✓ |
 | 246 | Semver version bumping | forge_semver_bump.nova | grep:bump_major | bump_major/minor/patch (semver rules, prerelease dropped). Release tooling. Composes forge_semver. KAT 1.2.3->2.0.0/1.3.0/1.2.4, v-prefix | TESTED ✓ |
+| 247 | Time-of-day formatting (HH:MM:SS / 12-hour) | forge_clock.nova | grep:clock_12h | clock_hms/hm/clock_12h (AM/PM) + clock_from_epoch. Complements forge_date/duration. KAT 45296s=12:34:56, noon/midnight/1PM/9AM. Completes date/time domain | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
