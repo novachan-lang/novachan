@@ -54,6 +54,10 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 19 (rows 266-269; number/base utilities, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- Roman numerals (`forge_roman` — 1994<->MCMXCIV), base36 (`forge_base36` — case-insensitive), integer math gcd/lcm/fraction/isqrt (`forge_math` — 1920x1080->16:9), int<->binary + popcount (`forge_binary`).
+- **★ 269 modules, ≈206 this session (rows 64-269).** Radix/number-base family complete (binary/base32/36/58/62/64/64url/hex/roman). Batteries space exhaustively + demonstrably saturated across ALL domains (candidates now hit existing coverage). Plan + memory current across 19 ledger waves; every module grep-verified + KAT'd. Remaining HIGH-value work stays DEFERRED per the rapid-dev rule (final test pass + gated compiler tier).
+
 **2026-07-03 BATTERIES WAVE 18 (rows 261-265; content/text/config/fintech utilities, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - Flesch readability scoring (`forge_readability` — KAT exact 116), HTML->plain-text (`forge_html_to_text`), ASCII/control-char safety (`forge_ascii`), byte-size parse (`forge_bytesize` — inverse of humanize_bytes), tip/bill-split (`forge_tip`).
 - **★ 265 modules, ≈202 this session (rows 64-265). SATURATION CONFIRMED:** a candidate module (general Luhn) was found to already exist in forge_card and was DELETED rather than shipped as a name-clashing duplicate — the batteries space is so complete that new ideas now hit existing coverage. Grep-verify-before-write discipline held (caught it). All domains complete + KAT-verified. Plan + memory current across 18 ledger waves. **Remaining HIGH-value work stays DEFERRED per the rapid-dev rule: (1) final functional test pass over all 265 rows, (2) gated compiler tier (3 codegen edges + interfaces#8/ALPN-TLS/WASM/with-tx).**
