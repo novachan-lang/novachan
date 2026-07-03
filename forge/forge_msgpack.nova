@@ -1,0 +1,239 @@
+// forge_msgpack -- MessagePack (https://msgpack.org) encode/decode: the compact binary JSON alternative used
+// by Redis (RESP3 payloads), Fluentd's forward protocol, and countless RPC systems. It gives Forge a wire
+// codec that is smaller and faster to parse than JSON while carrying the same nil/bool/int/string/list/map
+// value shapes. LEAF -- imports NOTHING (built-ins only: type_of, str, len, push, keys, contains, str_to_bytes,
+// bytes_to_str, and the binary-safe bytes seam: bytes / bytes_len / bytes_get / bytes_append / bytes_slice).
+//
+// BYTE REPRESENTATION -- WHY bytes, NOT a byte-as-char string:
+//   The natural first instinct (forge_base32 / forge_redis style) is to carry octets in a NOVA string, one
+//   char per byte via chr()/ord(). That is SOUND only for ASCII-range output. It is UNSOUND for MessagePack:
+//   NOVA string concatenation is NUL-terminated (verified -- "A" + chr(0) + "B" has len 2), and MessagePack
+//   blobs routinely contain 0x00 octets (every int64 of a small number, u16 length prefixes 0x00LL, str16 of
+//   a 256-byte payload, etc.). Building such a blob with string `+` silently TRUNCATES at the first NUL and
+//   corrupts the wire. So this module uses NOVA's first-class binary-safe `bytes` type -- the same seam
+//   forge.nova, forge_crypto and deflatex use for real binary. msgpack_encode returns a `bytes` handle;
+//   msgpack_decode takes one. This is the correct NOVA-way representation; the char-string convention is
+//   deliberately NOT used here because it cannot hold a MessagePack blob without loss.
+//
+// Supported subset (spec: github.com/msgpack/msgpack/blob/master/spec.md):
+//   nil 0xc0 | false 0xc2 | true 0xc3 | int (fixint / int32 0xd2 / int64 0xd3) | str (fixstr / str16 0xda) |
+//   array (fixarray / array16 0xdc) | map (fixmap / map16 0xde). Lengths are assumed < 65536.
+//
+// VALUE REPRESENTATION EDGES (NOVA runtime reality, verified against nova_rt_type_of):
+//   * A NOVA `bool` flowing through `any` is stored as an int (true==1, false==0) and type_of() reports "int",
+//     NOT "bool" -- there is no distinct unboxed-bool RTTI. So msgpack_encode(true) encodes as the integer 1
+//     and msgpack_encode(false) as 0 (valid positive fixints). The dedicated 0xc2/0xc3 wire forms are still
+//     DECODED to true/false; and the "bool"/"nil" encode branches are kept so a future runtime that
+//     distinguishes them upgrades for free. This is the only lossy encode edge, documented not hidden.
+//   * nil has no NOVA literal; it is represented on the NOVA side as the empty string "". type_of("") is
+//     "string", so encode("") emits a zero-length fixstr; DECODING 0xc0 yields "" -- the canonical stand-in.
+//   * A decoded string is materialized via bytes_to_str, which stops at an embedded NUL. Text payloads never
+//     contain NUL, so this is a non-issue for real string data; binary payloads belong in a bytes value.
+
+// ---- byte-buffer writers (append into a growing `bytes`) --------------------------------------------------
+
+// Append one octet (masked 0..255) to buf; returns the grown handle (amortized-doubling, NUL-safe).
+fn _mp_put(buf, n: int)
+    return bytes_append(buf, n % 256)
+
+// Append two big-endian octets (str16 / array16 / map16 lengths, all < 65536).
+fn _mp_put_u16(buf, n: int)
+    buf = bytes_append(buf, (n / 256) % 256)
+    buf = bytes_append(buf, n % 256)
+    return buf
+
+// Append eight big-endian octets of a (possibly negative) 64-bit int, two's-complement. NOVA int is 64-bit
+// signed, so `(n >> (8*k)) & 255` extracts octet k directly and negatives come out as their two's-complement
+// bytes (e.g. -5 -> ff ff ff ff ff ff ff fb). k runs 7..0 for big-endian; max shift is 56, never 64.
+fn _mp_put_u64(buf, n: int)
+    let k = 7
+    while k >= 0
+        buf = bytes_append(buf, (n >> (8 * k)) & 255)
+        k = k - 1
+    return buf
+
+// Append every octet of an existing bytes handle `src` onto buf (binary-safe copy).
+fn _mp_put_bytes(buf, src)
+    let m = bytes_len(src)
+    let i = 0
+    while i < m
+        buf = bytes_append(buf, bytes_get(src, i))
+        i = i + 1
+    return buf
+
+// ---- byte-buffer readers ---------------------------------------------------------------------------------
+
+// Big-endian u16 at off.
+fn _mp_read_u16(buf, off: int) -> int
+    bytes_get(buf, off) * 256 + bytes_get(buf, off + 1)
+
+// Big-endian signed int over `count` octets from off. Accumulating v = v*256 + octet reconstructs the signed
+// value by natural 64-bit wraparound: for count==8 a top-bit-set blob wraps back to the negative it encoded
+// (verified: the 8 bytes of -5 rebuild to -5). For count==4 (int32) the sum stays in 0..2^32-1, so we
+// sign-extend explicitly when the high bit is set.
+fn _mp_read_int(buf, off: int, count: int) -> int
+    let v = 0
+    let i = 0
+    while i < count
+        v = v * 256 + bytes_get(buf, off + i)
+        i = i + 1
+    if count == 4 and v >= 2147483648
+        v = v - 4294967296
+    v
+
+// ---- encode ----------------------------------------------------------------------------------------------
+
+// Encode any supported value -> a MessagePack `bytes` blob. Dispatches on type_of(value); recurses for list
+// (array) and dict (map, string keys). See the header for the bool/nil representation edges.
+fn msgpack_encode(value) -> any
+    let buf = bytes(0)
+    buf = _mp_encode_into(buf, value)
+    return buf
+
+// Append the encoding of `value` onto buf and return the grown handle (the recursive workhorse).
+fn _mp_encode_into(buf, value)
+    let t = type_of(value)
+    if t == "nil"
+        return _mp_put(buf, 0xc0)
+    if t == "bool"
+        if value
+            return _mp_put(buf, 0xc3)
+        return _mp_put(buf, 0xc2)
+    if t == "int"
+        return _mp_encode_int(buf, value)
+    if t == "string"
+        return _mp_encode_str(buf, value)
+    if t == "list"
+        return _mp_encode_list(buf, value)
+    if t == "dict"
+        return _mp_encode_dict(buf, value)
+    // Unknown kind: emit nil rather than malformed bytes.
+    return _mp_put(buf, 0xc0)
+
+// int: positive fixint (0..127) / negative fixint (-32..-1) as single bytes; everything else as int64
+// (0xd3 + 8 big-endian octets). int64-always for the wide range is valid MessagePack and dodges 32-bit range
+// branching -- the decoder reads whatever tag it finds.
+fn _mp_encode_int(buf, n: int)
+    if n >= 0 and n <= 127
+        return _mp_put(buf, n)
+    if n >= 0 - 32 and n <= 0 - 1
+        return _mp_put(buf, 0xe0 | (n & 0x1f))
+    buf = _mp_put(buf, 0xd3)
+    return _mp_put_u64(buf, n)
+
+// string: fixstr (len 0..31) else str16 (0xda + u16 len). The payload is the string's real UTF-8 octets,
+// taken via str_to_bytes so multi-byte chars and length are exact (not codepoint-count).
+fn _mp_encode_str(buf, s: string)
+    let sb = str_to_bytes(s)
+    let n = bytes_len(sb)
+    if n <= 31
+        buf = _mp_put(buf, 0xa0 | n)
+    else
+        buf = _mp_put(buf, 0xda)
+        buf = _mp_put_u16(buf, n)
+    return _mp_put_bytes(buf, sb)
+
+// list -> array: fixarray (len 0..15) else array16 (0xdc + u16 len), then each element encoded in order.
+fn _mp_encode_list(buf, xs: list)
+    let n = len(xs)
+    if n <= 15
+        buf = _mp_put(buf, 0x90 | n)
+    else
+        buf = _mp_put(buf, 0xdc)
+        buf = _mp_put_u16(buf, n)
+    for x in xs
+        buf = _mp_encode_into(buf, x)
+    return buf
+
+// dict -> map: fixmap (len 0..15) else map16 (0xde + u16 len), then each (key, value) pair. Keys are encoded
+// as strings (str(k) coerces defensively; NOVA dict keys here are already strings).
+fn _mp_encode_dict(buf, d: dict)
+    let ks = keys(d)
+    let n = len(ks)
+    if n <= 15
+        buf = _mp_put(buf, 0x80 | n)
+    else
+        buf = _mp_put(buf, 0xde)
+        buf = _mp_put_u16(buf, n)
+    for k in ks
+        buf = _mp_encode_str(buf, str(k))
+        buf = _mp_encode_into(buf, d[k])
+    return buf
+
+// ---- decode ----------------------------------------------------------------------------------------------
+
+// Decode the FIRST value from a MessagePack `bytes` blob.
+fn msgpack_decode(buf) -> any
+    let r = _mp_decode_at(buf, 0)
+    r[0]
+
+// Decode the value starting at offset `off` -> [value, next_off]. Recursive for array / map. Dispatch is on
+// the lead byte; length-prefixed forms read their length then slice / recurse. nil decodes to "" (see header).
+fn _mp_decode_at(buf, off: int) -> list
+    let b = bytes_get(buf, off)
+    if b == 0xc0
+        return ["", off + 1]
+    if b == 0xc2
+        return [false, off + 1]
+    if b == 0xc3
+        return [true, off + 1]
+    // positive fixint 0x00..0x7f
+    if b <= 0x7f
+        return [b, off + 1]
+    // negative fixint 0xe0..0xff  (value = b - 256, giving -32..-1)
+    if b >= 0xe0
+        return [b - 256, off + 1]
+    // int32 / int64
+    if b == 0xd2
+        return [_mp_read_int(buf, off + 1, 4), off + 5]
+    if b == 0xd3
+        return [_mp_read_int(buf, off + 1, 8), off + 9]
+    // fixstr 0xa0..0xbf
+    if b >= 0xa0 and b <= 0xbf
+        let sl = b & 0x1f
+        return [bytes_to_str(bytes_slice(buf, off + 1, off + 1 + sl)), off + 1 + sl]
+    // str16 0xda
+    if b == 0xda
+        let sl16 = _mp_read_u16(buf, off + 1)
+        return [bytes_to_str(bytes_slice(buf, off + 3, off + 3 + sl16)), off + 3 + sl16]
+    // fixarray 0x90..0x9f
+    if b >= 0x90 and b <= 0x9f
+        return _mp_decode_array(buf, off + 1, b & 0x0f)
+    // array16 0xdc
+    if b == 0xdc
+        return _mp_decode_array(buf, off + 3, _mp_read_u16(buf, off + 1))
+    // fixmap 0x80..0x8f
+    if b >= 0x80 and b <= 0x8f
+        return _mp_decode_map(buf, off + 1, b & 0x0f)
+    // map16 0xde
+    if b == 0xde
+        return _mp_decode_map(buf, off + 3, _mp_read_u16(buf, off + 1))
+    // Unknown / unsupported lead byte: yield nil-as-"" and advance one byte so the caller makes progress.
+    ["", off + 1]
+
+// Decode `count` elements starting at `pos` -> [list, next_off]. Each element advances pos via its next_off.
+fn _mp_decode_array(buf, pos: int, count: int) -> list
+    let out = []
+    let p = pos
+    let i = 0
+    while i < count
+        let e = _mp_decode_at(buf, p)
+        push(out, e[0])
+        p = e[1]
+        i = i + 1
+    [out, p]
+
+// Decode `count` (key, value) pairs starting at `pos` -> [dict, next_off]. Keys are decoded (as strings) then
+// used to index the built dict; values follow immediately after each key.
+fn _mp_decode_map(buf, pos: int, count: int) -> list
+    let d = {}
+    let p = pos
+    let i = 0
+    while i < count
+        let ke = _mp_decode_at(buf, p)
+        p = ke[1]
+        let ve = _mp_decode_at(buf, p)
+        p = ve[1]
+        d[ke[0]] = ve[0]
+        i = i + 1
+    [d, p]
