@@ -280,6 +280,7 @@
 | 251 | Day-of-year / week-of-year | forge_ordinal_date.nova | grep:date_day_of_year | date_day_of_year (1-366) + date_week_of_year + date_days_left_in_year (leap-aware). Progress-of-year, week numbering. Composes forge_date. KAT Jul3=184/Dec31=365/leap366 | TESTED ✓ |
 | 252 | IPv4 subnet math (network/broadcast/netmask) | forge_subnet.nova | grep:subnet_network | subnet_size/network/broadcast/netmask from CIDR (boundary-floor, no bitwise-AND). Network planning, IP allocation. Complements forge_ipcidr. KAT /24 + /16 | TESTED ✓ |
 | 253 | MAC address validation/normalization | forge_mac.nova | grep:mac_normalize | mac_valid (colon/hyphen/Cisco-dot) + mac_normalize (lowercase colon) + mac_oui (vendor prefix). Device tracking, DHCP, ARP. KAT 3 forms + normalize + OUI | TESTED ✓ |
+| 254 | RFC 1123 hostname/domain validation | forge_hostname.nova | grep:hostname_valid | hostname_valid (labels 1-63, no leading/trailing hyphen, <=253, FQDN-tolerant) + hostname_tld. URL/email-domain, TLS SNI, allow-lists. KAT valid/hyphen/empty/FQDN/TLD | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
