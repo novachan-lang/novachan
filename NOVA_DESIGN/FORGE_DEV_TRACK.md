@@ -175,5 +175,9 @@
 | 147 | Open Graph + Twitter Card meta tags (social link previews) | forge_opengraph.nova | grep:opengraph | opengraph(title/desc/image/url/type)->og:* + twitter:card meta tags (FB/X/LinkedIn/Slack/iMessage unfurl), HTML-attr-escaped | untested (syntax✓) |
 | 148 | RSS 2.0 + Atom 1.0 feed generation | forge_feed.nova | grep:feed_rss | feed_rss/feed_atom from item dicts + feed_escape (single-pass, & first, no double-escape). Blog/news/podcast syndication | untested (syntax✓) |
 | 149 | Honeypot form spam prevention (no-CAPTCHA, accessible) | forge_honeypot.nova | grep:honeypot_is_bot | honeypot_field_name trap + honeypot_is_bot/ok: hidden-field (bots fill, humans don't) + min render-to-submit timing. WCAG-friendly, zero friction | untested (syntax✓) |
+| 150 | AWS Signature V4 request signing (S3/DynamoDB/Bedrock, no SDK) | forge_awssigv4.nova | grep:sigv4_signature | sigv4_signing_key (HMAC chain) + canonical_request/string_to_sign/signature/auth_header; composes forge_crypto. KAT-VERIFIED vs AWS official vector (sig 5d672d79...a6f2b5d7) | TESTED ✓ AWS KAT |
+| 151 | Inbound webhook signature verify (Stripe/GitHub/Slack) | forge_webhook_verify.nova | grep:stripe_webhook_verify | github(sha256=)/stripe(t=,v1=+replay)/slack(v0:) HMAC-SHA256, constant-time. KAT: valid→accept, replay→reject. (forge_webhook=outbound) | TESTED ✓ KAT |
+| 152 | Math CAPTCHA (stateless signed token) | forge_captcha.nova | grep:captcha_verify | captcha_math→[question,token]; captcha_verify HMAC constant-time + expiry + answer match, fail-closed. No session storage | untested (syntax✓) |
+| 153 | vCard 4.0 contact cards (RFC 6350, Add-to-Contacts) | forge_vcard.nova | grep:vcard_build | vcard_build from name/org/email/phone/url/note/address (TEXT-escaped, structured N/ADR) + vcard_simple. .vcf for phones/CRMs | untested (syntax✓) |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
