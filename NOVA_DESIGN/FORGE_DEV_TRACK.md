@@ -284,6 +284,7 @@
 | 255 | Port validation + service names + scheme defaults | forge_port.nova | grep:port_for_scheme | port_valid (1-65535) + port_service (well-known) + port_for_scheme (http=80/https=443/redis=6379). URL parsing, firewall, config. KAT | TESTED ✓ |
 | 256 | Deterministic UUIDv5 (name-based) | forge_uuid5.nova | grep:uuid5 | uuid5 (SHA-1 namespace||name, v5+variant) + uuid5_ns_dns/url + uuid5_dns. Idempotent storage-free ids. Composes forge_crypto sha1. KAT EXACT vs RFC: uuid5(DNS,'example.com')=cfbff0d1-...ae17 | TESTED ✓ |
 | 257 | Practical email validation | forge_email_validate.nova | grep:email_valid | email_valid (local + one @ + valid domain-with-TLD via forge_hostname) + email_domain. Signup/contact forms. Complements email_normalize. KAT valid/complex + rejections | TESTED ✓ |
+| 258 | Deterministic identicon pattern | forge_identicon.nova | grep:identicon | identicon(seed)->[color_hex, 5x5 symmetric 0/1 grid]. GitHub-style avatars, render SVG/CSS, no storage. KAT 5x5/mirror-symmetry/determinism. Completes avatar domain | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
