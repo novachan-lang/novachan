@@ -285,6 +285,7 @@
 | 256 | Deterministic UUIDv5 (name-based) | forge_uuid5.nova | grep:uuid5 | uuid5 (SHA-1 namespace||name, v5+variant) + uuid5_ns_dns/url + uuid5_dns. Idempotent storage-free ids. Composes forge_crypto sha1. KAT EXACT vs RFC: uuid5(DNS,'example.com')=cfbff0d1-...ae17 | TESTED ✓ |
 | 257 | Practical email validation | forge_email_validate.nova | grep:email_valid | email_valid (local + one @ + valid domain-with-TLD via forge_hostname) + email_domain. Signup/contact forms. Complements email_normalize. KAT valid/complex + rejections | TESTED ✓ |
 | 258 | Deterministic identicon pattern | forge_identicon.nova | grep:identicon | identicon(seed)->[color_hex, 5x5 symmetric 0/1 grid]. GitHub-style avatars, render SVG/CSS, no storage. KAT 5x5/mirror-symmetry/determinism. Completes avatar domain | TESTED ✓ |
+| 259 | base64url encode/decode (JWT/URL tokens) | forge_base64url.nova | grep:base64url_encode | base64url_encode/decode (RFC 4648 §5, +->- /->_ no padding, re-pad on decode). JWT/JWS/WebAuthn/URL tokens. KAT no-padding+round-trip+URL-safe. Completes encoding family | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
