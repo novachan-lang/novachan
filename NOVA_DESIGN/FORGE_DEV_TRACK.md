@@ -229,5 +229,6 @@
 | 200 | Locale currency formatting (US/EU from cents) | forge_money_fmt.nova | grep:money_us | money_us (\$1,234.56) + money_eu (1.234,56 EUR): symbol placement, thousands grouping, decimal style, integer cents. Complements forge_money/percent. KAT US/EU/cents/neg/millions | TESTED ✓ |
 | 201 | Promo/discount coupons | forge_coupon.nova | grep:coupon_discount | coupon_percent/fixed + coupon_valid (min-order+expiry) + coupon_discount (rounded pct / capped fixed) + coupon_apply. Integer cents. KAT 20%=2000, cap, expiry, below-min | TESTED ✓ |
 | 202 | Ordered allow/deny ACL (glob patterns, first-match) | forge_acl.nova | grep:acl_check | acl_allow/acl_deny + acl_check (first-match-wins, default-deny). AWS-IAM/firewall fine-grained resource perms. Composes forge_wildcard, complements forge_rbac. KAT verified | TESTED ✓ |
+| 203 | Env-var expansion in strings (config templating) | forge_env_expand.nova | grep:env_expand | env_expand: substitute ${VAR}/$VAR from a vars dict, unknown->'', lone-$ literal. dotenv interpolation/command templates. chr()-built braces. KAT braced/bare/mixed/unknown | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
