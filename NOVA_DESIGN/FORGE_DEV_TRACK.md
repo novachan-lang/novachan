@@ -240,5 +240,6 @@
 | 211 | Age from birthdate + age-gating | forge_age.nova | grep:age_years | age_years (birthday-passed-aware) + age_at_least (18+/21+ gating). Eligibility, age-gates, profiles. KAT birthday-today=26/tomorrow=25/exactly-18 | TESTED ✓ |
 | 212 | Countdown / deadline labels | forge_countdown.nova | grep:days_until | days_until + is_past + countdown_label (today/tomorrow/yesterday/in N days/N days ago). Deadlines, trial expiry, timers. Composes forge_date. KAT | TESTED ✓ |
 | 213 | ISO 3166 country data + validation | forge_country.nova | grep:country_name | country_valid/name/alpha3/calling_code/from_alpha3 (50 countries, alpha2<->alpha3<->name<->tel). Address forms, dropdowns, shipping/tax, phone codes. KAT | TESTED ✓ |
+| 214 | HTTP Basic + Bearer auth header parse/build | forge_basic_auth.nova | grep:basic_auth_parse | basic_auth_header (Basic base64) + basic_auth_parse (->[user,pass]) + bearer_from_header (renamed vs core bearer_token(req)). RFC 7617/6750. KAT base64 round-trip | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
