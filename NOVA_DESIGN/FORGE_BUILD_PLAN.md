@@ -54,6 +54,11 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 27 (rows 310-313; graphics/games + text, ALL KAT-verified — ★ found a 3rd compiler bug). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- GFM strikethrough added to `forge_markdown` · Bezier curves (`forge_bezier` — quad/cubic + path sampling, SVG/animation) · AABB collision (`forge_aabb` — game broad-phase/hit-testing) · International Morse (`forge_morse` — encode/decode, KAT SOS).
+- **★★ FOUND a 3rd NOVA compiler bug (soundness): mixed float-variable-vs-int comparison is WRONG.** `let px=5.0; px >= (int expr 10)` returns TRUE (should be false) — no int→float promotion, the int is compared against the float's raw bits (always huge → float>=int always true). ONLY the variable case; literals `5.0>=10` are correct. Caught by forge_aabb's point-in-box KAT. Workaround (applied): coerce the int side with `*1.0`. Recorded in [[reference-nova-float-int-compare-unsound]] with gated-tier fix guidance (insert sitofp on mixed relational operands). This is the KAT-driven "hunt for failure" paying off — a real soundness hole most codebases would ship silently.
+- **★ 313 modules, ≈250 this session (rows 64-313).** THREE compiler findings now recorded this session (string-indexing semantics; float-RETURN codegen edge + workaround; float/int COMPARE unsoundness + workaround) — all with concrete repros for the gated compiler tier. Remaining HIGH-value work stays DEFERRED (final test pass + gated tier).
+
 **2026-07-03 BATTERIES WAVE 26 (rows 307-309; similarity + graph + animation, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - Set-similarity (`forge_setsim` — Jaccard/Dice/overlap, the set-based complement to cosine) · Dijkstra weighted shortest path (`forge_dijkstra` — least-COST routing/pathfinding, vs forge_graph's unweighted BFS) · easing/tweening (`forge_easing` — quad/cubic in/out/in-out + lerp for Reactor animation/UI transitions).
 - **★ 309 modules, ≈246 this session (rows 64-309).** Rounds out three orthogonal capabilities: similarity scoring (cosine + Jaccard family), weighted graph search, and animation math. Remaining HIGH-value work stays DEFERRED (final test pass + gated compiler tier).
