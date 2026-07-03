@@ -1,0 +1,126 @@
+// forge_hll -- HyperLogLog: estimate the number of DISTINCT items in a huge stream using only a few KB, no
+// matter how many billions flow through. Where forge_countmin estimates per-item FREQUENCY, HyperLogLog
+// estimates CARDINALITY (unique count): unique visitors/IPs/queries, distinct-value analytics, dedup metrics.
+// It hashes each item, uses the top p bits to pick a register and the run of leading zeros in the rest to
+// update that register's max; the harmonic mean of the registers yields the estimate. Uses the raw estimator
+// (accurate for large cardinalities; small-range linear-counting correction is omitted -- it needs a natural
+// log NOVA does not expose). Layout: [p, m, reg0..reg(m-1)]. LEAF -- imports NOTHING.
+
+// PRIVATE: 2^e (register values and index math; small e).
+fn _hll_pow2(e: int) -> int
+    let p = 1
+    let i = 0
+    while i < e
+        p = p * 2
+        i = i + 1
+    p
+
+// PRIVATE: FNV-1a 32-bit hash of an ASCII string.
+fn _hll_hash(s: string) -> int
+    let mask = 4294967295
+    let h = 2166136261
+    let i = 0
+    while i < len(s)
+        h = h ^ ord(char_at(s, i))
+        h = (h * 16777619) & mask
+        i = i + 1
+    h
+
+// PRIVATE: rho = (leading zero run in the low `bits`-bit value w) + 1.
+fn _hll_rho(w: int, bits: int) -> int
+    let r = 1
+    let mask = _hll_pow2(bits - 1)
+    let done = false
+    while mask > 0 and done == false
+        if (w & mask) == 0
+            r = r + 1
+            mask = mask / 2
+        else
+            done = true
+    r
+
+// PRIVATE: natural log via range-reduction + atanh series (NOVA exposes no ln). x > 0. Reduce to mantissa in
+// [1,2): ln(x) = k*ln2 + ln(mantissa); ln(mantissa) = 2*(y + y^3/3 + y^5/5 + ...) with y = (m-1)/(m+1).
+// All comparisons here are float-var vs float-LITERAL (sound; the float-var-vs-int compare bug does not apply).
+fn _hll_ln(x: float) -> float
+    let mant = x
+    let k = 0
+    while mant >= 2.0
+        mant = mant / 2.0
+        k = k + 1
+    while mant < 1.0
+        mant = mant * 2.0
+        k = k - 1
+    let y = (mant - 1.0) / (mant + 1.0)
+    let y2 = y * y
+    let t = y
+    let denom = 1.0
+    let acc = 0.0
+    let iter = 0
+    while iter < 20
+        acc = acc + t / denom
+        t = t * y2
+        denom = denom + 2.0
+        iter = iter + 1
+    let ln2 = 0.6931471805599453
+    let result = 2.0 * acc + (k * 1.0) * ln2
+    result
+
+// PRIVATE: the HyperLogLog bias constant alpha_m.
+fn _hll_alpha(m: int) -> float
+    if m == 16
+        return 0.673
+    if m == 32
+        return 0.697
+    if m == 64
+        return 0.709
+    0.7213 / (1.0 + 1.079 / (m * 1.0))
+
+// A new HyperLogLog with 2^p registers (p in ~4..16; larger p -> more memory, less error ~1.04/sqrt(2^p)).
+fn hll_new(p: int) -> list
+    let m = _hll_pow2(p)
+    let h = [p, m]
+    let i = 0
+    while i < m
+        push(h, 0)
+        i = i + 1
+    h
+
+// Observe an item.
+fn hll_add(hll: list, item: string) -> list
+    let p = hll[0]
+    let m = hll[1]
+    let hash = _hll_hash(item)
+    let idx = hash & (m - 1)
+    let w = hash / m
+    let rho = _hll_rho(w, 32 - p)
+    let slot = 2 + idx
+    if rho > hll[slot]
+        hll[slot] = rho
+    hll
+
+// Estimated distinct-item count (rounded to an int).
+fn hll_count(hll: list) -> int
+    let m = hll[1]
+    let alpha = _hll_alpha(m)
+    let sum = 0.0
+    let j = 0
+    while j < m
+        let r = hll[2 + j]
+        sum = sum + 1.0 / (_hll_pow2(r) * 1.0)
+        j = j + 1
+    let mf = m * 1.0
+    let raw = alpha * mf * mf / sum
+    // small-range correction (linear counting) when the raw estimate is small relative to m
+    let threshold = 2.5 * mf
+    if raw <= threshold
+        let zeros = 0
+        let z = 0
+        while z < m
+            if hll[2 + z] == 0
+                zeros = zeros + 1
+            z = z + 1
+        if zeros > 0
+            let lc = mf * _hll_ln(mf / (zeros * 1.0))
+            return int(round(lc))
+    int(round(raw))
