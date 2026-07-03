@@ -204,5 +204,6 @@
 | 175 | Fixed-capacity ring/circular buffer | forge_ring.nova | grep:ring_push | ring_push (overwrite oldest when full) + ring_to_list (oldest->newest) + size/full/oldest. Pre-sized array+head/count, O(1). Log tailing / sliding windows / metric sampling. KAT cap-3+5=cde | TESTED ✓ |
 | 176 | Union-Find / disjoint-set (connected components, clustering, MST) | forge_union_find.nova | grep:uf_union | uf_union/uf_find (path compression + union by size) + uf_connected + uf_size. KAT: connectivity+sizes 3/2/5 correct. Kruskal MST / dedup grouping | TESTED ✓ |
 | 177 | Trie / prefix tree (autocomplete, type-ahead) | forge_trie.nova | grep:trie_complete | trie_insert/contains/has_prefix/complete (nested-dict, $end marker). KAT: contains car=true ca=false, complete car=2 ca=3. Search suggestions/command completion | TESTED ✓ |
+| 178 | Glob wildcard matching (routes/ACLs/topics) | forge_wildcard.nova | grep:wildcard_match | wildcard_match (* run, ? one char, iterative backtrack no recursion) + wildcard_any (glob list). Route patterns/file filters/ACL/pub-sub topics. KAT all correct | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
