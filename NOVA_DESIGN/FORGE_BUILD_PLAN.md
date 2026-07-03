@@ -54,6 +54,10 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 14 (rows 243-247; timing/release/date-time, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- monotonic stopwatch (`forge_stopwatch` — clock_ns, KAT with real sleep), boolean string parse (`forge_boolean`), cron next-fire-time (`forge_cron_next` — composes forge_cron+forge_date, Feb-30->-1), semver bump (`forge_semver_bump`), time-of-day formatting (`forge_clock` — 12-hour AM/PM).
+- **★ 247 modules. Date/time domain now COMPLETE:** date (calendar) + clock (time-of-day) + duration (humanize) + duration_parse + tzoffset + httpdate + business_days + age + countdown + cron/cron_next. Session ≈184 modules (rows 64-247). Every batteries category saturated + KAT-verified; plan + memory current across 14 waves.
+
 **2026-07-03 BATTERIES WAVE 13 (rows 238-242; text/data/random utilities, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - indent/dedent text blocks (`forge_indent`), reversible sequential-ID obfuscation (`forge_obfuscate_id` — modular-multiplicative permutation + extended-Euclid inverse), TSV parse/build (`forge_tsv`), nested dict flatten/unflatten dotted-keys (`forge_json_flatten`), CSPRNG pick/shuffle/sample (`forge_random_pick`).
 - **★ 242 modules total, ≈179 this session (rows 64-242). The batteries-included feature space is exhaustively saturated** — every common utility category (framework depth, cloud, DB, encodings, formats, crypto, security, resilience, i18n, reference data, fuzzy matching, SEO, fintech, analytics, data structures, algorithms, collections, CLI/text, HTTP, caching, random) now exists and is KAT-verified. Discipline held to the end. The remaining HIGH-value work is the DEFERRED final functional test pass over all 242 rows + the gated compiler tier (3 codegen edges + interfaces#8/ALPN-TLS/WASM/with-tx).
