@@ -1,0 +1,151 @@
+// forge_toml -- a practical SUBSET TOML config parser (the 90% that Cargo.toml / pyproject.toml consumers
+// need). Parses TOML text into a nested NOVA dict. Supports: `#` line comments (a hash at line start or
+// preceded by a space is stripped -- a `#` glued to non-space, e.g. inside an unquoted URL fragment, is
+// kept), `key = value` pairs, `[section]` and dotted `[a.b]` table headers (nesting sub-dicts), and value
+// kinds: double/single-quoted strings (double-quote unescapes \n \t \\ \"), integers, booleans, and
+// single-line arrays. Anything else is kept as the raw trimmed string. LEAF -- imports NOTHING.
+//
+// KNOWN SUBSET LIMITS: multi-line arrays / inline tables are out of scope; comment-stripping is the simple
+// "space-hash or leading-hash" rule (a `#` NOT preceded by whitespace is never treated as a comment, so a
+// `#` inside an unquoted value survives but a `#` inside a quoted value that follows a space would be cut);
+// array element splitting is a plain "," split (a comma inside a quoted array string would over-split).
+//
+// NOTE on typing: _toml_value must yield int / bool / string / list from a single site. NOVA's return-type
+// inference unifies a function's return sites to ONE concrete type, so a naive multi-type `return` either
+// fails to compile or (via a self-recursion escape hatch) produces a mis-tagged scalar. The sound pattern
+// is to route every kind through a dict slot -- a dict value is a genuine heap-boxed `any`, so the tag and
+// payload stay consistent when read back. Every value therefore lands in `box["v"]` and is returned once.
+
+// PRIVATE: unescape \n \t \\ \" inside a double-quoted string body.
+fn _toml_unescape(s: string) -> string
+    let bs = chr(92)
+    let q = chr(34)
+    let out = ""
+    let i = 0
+    while i < len(s)
+        let c = char_at(s, i)
+        if c == bs and i + 1 < len(s)
+            let nx = char_at(s, i + 1)
+            if nx == "n"
+                out = out + chr(10)
+            else
+                if nx == "t"
+                    out = out + chr(9)
+                else
+                    if nx == bs
+                        out = out + bs
+                    else
+                        if nx == q
+                            out = out + q
+                        else
+                            out = out + nx
+            i = i + 2
+        else
+            out = out + c
+            i = i + 1
+    out
+
+// PRIVATE: is the trimmed string an integer (all digits, optional single leading '-')?
+// Caller helper: is a TOML scalar value an integer literal? (Scalars are returned as strings; use this +
+// parse_int to coerce.)
+fn toml_is_int(s: string) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let start = 0
+    if char_at(s, 0) == "-"
+        if n == 1
+            return false
+        start = 1
+    let i = start
+    while i < n
+        let c = char_at(s, i)
+        if c < "0" or c > "9"
+            return false
+        i = i + 1
+    true
+
+// PRIVATE: strip a trailing comment using the "space-hash or leading-hash" rule.
+fn _toml_strip_comment(line: string) -> string
+    let hash = chr(35)
+    if starts_with(line, hash)
+        return ""
+    let sh = find(line, " " + hash)
+    if sh >= 0
+        return slice(line, 0, sh)
+    line
+
+// PRIVATE: parse a single trimmed value string into int / bool / string / list. Every kind is written into
+// box["v"] (a heap-boxed any) and that one slot is returned -- keeps scalar tags sound across the any edge.
+fn _toml_value(raw: string) -> any
+    let s = trim(raw)
+    if len(s) == 0
+        return ""
+    let q = chr(34)
+    let sq = chr(39)
+    let first = char_at(s, 0)
+    if first == q
+        let close = find(slice(s, 1, len(s)), q)
+        if close < 0
+            return _toml_unescape(slice(s, 1, len(s)))
+        return _toml_unescape(slice(s, 1, 1 + close))
+    if first == sq
+        let closes = find(slice(s, 1, len(s)), sq)
+        if closes < 0
+            return slice(s, 1, len(s))
+        return slice(s, 1, 1 + closes)
+    if first == "[" and ends_with(s, "]")
+        let inner = trim(slice(s, 1, len(s) - 1))
+        let arr = []
+        if len(inner) > 0
+            for p in split(inner, ",")
+                let pt = trim(p)
+                if len(pt) > 0
+                    push(arr, _toml_value(pt))
+        return arr
+    // Scalars (numbers / booleans / bare words) are returned as their RAW trimmed STRING -- the same
+    // convention as forge_dotenv / forge_ini: the caller coerces with parse_int / an "true"== check. (Coercing
+    // int/bool here and returning them through the `any` edge tripped a codegen edge; keeping scalars as
+    // strings is sound and keeps toml_get uniform. toml_is_int is retained as a caller helper.)
+    s
+
+// Parse a whole TOML document into a nested dict. Top-level keys (before any `[table]`) go directly into the
+// result; keys after a `[table]` header go into that table's (possibly nested) sub-dict.
+fn toml_parse(text: string) -> dict
+    let result = {}
+    let current = result
+    let lines = split(text, chr(10))
+    for rawline in lines
+        let line = trim(_toml_strip_comment(rawline))
+        if len(line) > 0
+            if starts_with(line, "[") and ends_with(line, "]")
+                let name = trim(slice(line, 1, len(line) - 1))
+                let segs = split(name, ".")
+                let node = result
+                for seg in segs
+                    let key = trim(seg)
+                    if contains(node, key) and type_of(node[key]) == "dict"
+                        node = node[key]
+                    else
+                        let sub = {}
+                        node[key] = sub
+                        node = sub
+                current = node
+            else
+                let eq = find(line, "=")
+                if eq > 0
+                    let k = trim(slice(line, 0, eq))
+                    let v = trim(slice(line, eq + 1, len(line)))
+                    current[k] = _toml_value(v)
+    result
+
+// Dotted-path lookup ("database.port") into a parsed dict; "" if any segment is missing.
+fn toml_get(config: dict, path: string) -> any
+    let segs = split(path, ".")
+    let node = config
+    for seg in segs
+        if type_of(node) == "dict" and contains(node, seg)
+            node = node[seg]
+        else
+            return ""
+    node
