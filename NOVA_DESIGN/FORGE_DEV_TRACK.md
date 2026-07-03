@@ -335,6 +335,7 @@
 | 306 | Cosine similarity (document similarity) | forge_cosine.nova | grep:cosine_similarity | cosine_similarity(token lists) term-freq vectors -> (A.B)/(|A||B|), length-independent. Caps search pipeline (more-like-this/near-dup/clustering). sqrt-accumulator dodges float edge. KAT 6 | TESTED ✓ |
 | 307 | Set-similarity metrics (Jaccard/Dice/overlap) | forge_setsim.nova | grep:jaccard | jaccard/dice_coef/overlap_coef over token sets (membership not frequency). Tag similarity/near-dup/recs; set-based complement to cosine. KAT 9 | TESTED ✓ |
 | 308 | Dijkstra weighted shortest path | forge_dijkstra.nova | grep:dijkstra_dist | wgraph_new/edge + dijkstra_dist + dijkstra_path (weighted least-cost, vs forge_graph unweighted BFS). Routing/network/game-AI pathfinding. KAT least-cost route + unreachable + self | TESTED ✓ |
+| 309 | Easing/tweening functions | forge_easing.nova | grep:ease_in_out_cubic | ease_linear + quad/cubic in/out/in-out + lerp. Natural UI transitions + game animation (Reactor); animate via a+(b-a)*ease(t). KAT 14 curve values + endpoints + lerp | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
