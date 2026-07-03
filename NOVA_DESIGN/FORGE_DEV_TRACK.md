@@ -237,5 +237,6 @@
 | 208 | US SSN validation + PII masking | forge_ssn.nova | grep:ssn_valid | ssn_valid (SSA rules: area!=000/666/900+, group!=00, serial!=0000) + ssn_mask (***-**-1234) + ssn_format. KAT valid+exclusions+mask | TESTED ✓ |
 | 209 | URL shortener (bit.ly-style) | forge_shortlink.nova | grep:shortlink_code | shortlink_code/id (id<->base62) + shortlink_url + shortlink_resolve. Composes forge_base62. KAT 1000000<->4c92 + URL build/resolve | TESTED ✓ |
 | 210 | Business-day arithmetic (weekend-skipping) | forge_business_days.nova | grep:add_business_days | is_business_day + business_days_between + add_business_days (skip Sat/Sun). SLA deadlines, delivery/invoice dates. Composes forge_date. KAT Fri+1biz=Mon, Fri+5biz=next-Fri | TESTED ✓ |
+| 211 | Age from birthdate + age-gating | forge_age.nova | grep:age_years | age_years (birthday-passed-aware) + age_at_least (18+/21+ gating). Eligibility, age-gates, profiles. KAT birthday-today=26/tomorrow=25/exactly-18 | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
