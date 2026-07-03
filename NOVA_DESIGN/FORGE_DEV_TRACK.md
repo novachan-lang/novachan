@@ -272,6 +272,7 @@
 | 243 | Monotonic stopwatch (profiling/benchmarks) | forge_stopwatch.nova | grep:sw_elapsed_ms | sw_start + sw_elapsed_ms/us/ns via clock_ns (monotonic, NTP-immune). Profiling, benchmarks, latency. KAT: real sleep(50)->>=40ms | TESTED ✓ |
 | 244 | Boolean string parsing | forge_boolean.nova | grep:parse_bool | parse_bool (yes/true/1/on/y/t->true) + parse_bool_default (unknown->default) + bool_str. Config, checkboxes, env vars. Complements dotenv. KAT truthy/falsy/default | TESTED ✓ |
 | 245 | Cron next-fire-time computation | forge_cron_next.nova | grep:cron_next | cron_next (next epoch-minute matching expr, bounded) + cron_minutes_until. Composes forge_cron cron_matches + forge_date. Job schedulers, next-run displays. KAT: every-min->+1, hourly<=60, Feb30->-1 | TESTED ✓ |
+| 246 | Semver version bumping | forge_semver_bump.nova | grep:bump_major | bump_major/minor/patch (semver rules, prerelease dropped). Release tooling. Composes forge_semver. KAT 1.2.3->2.0.0/1.3.0/1.2.4, v-prefix | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
