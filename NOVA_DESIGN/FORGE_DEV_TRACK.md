@@ -226,5 +226,6 @@
 | 197 | Timezone offset parse/apply (fixed-offset ISO-8601) | forge_tzoffset.nova | grep:tz_offset_minutes | tz_offset_minutes (+05:30/-0800/Z) + tz_to_local/utc + tz_format. User-zone display, offset timestamps. KAT +05:30=330 -0800=-480 | TESTED ✓ |
 | 198 | Percentage/money math (discount/tax/change, integer cents) | forge_percent.nova | grep:percent_of | percent_of/bps_of/apply_discount/apply_tax(_bps)/percent_change, integer cents+rounding (no float money errors). KAT 8.25%bps=10825, signed change | TESTED ✓ |
 | 199 | YAML config parser (practical subset) | forge_yaml.nova | grep:yaml_parse | yaml_parse->nested dict/list (mappings/nested/scalar-seq/mapping-seq, auto indent step) + yaml_get. Scalars-as-strings. CI/K8s-lite/app config. KAT full nesting incl services list-of-dicts | TESTED ✓ |
+| 200 | Locale currency formatting (US/EU from cents) | forge_money_fmt.nova | grep:money_us | money_us (\$1,234.56) + money_eu (1.234,56 EUR): symbol placement, thousands grouping, decimal style, integer cents. Complements forge_money/percent. KAT US/EU/cents/neg/millions | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
