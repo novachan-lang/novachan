@@ -346,6 +346,7 @@
 | 317 | Catmull-Rom spline | forge_spline.nova | grep:catmull_rom | catmull_rom + catmull_rom_path, passes THROUGH control points (vs Bezier). Camera paths/waypoints/data-smoothing. Companion to bezier. KAT 7 through-points + collinear-line | TESTED ✓ |
 | 318 | CSS named colors name<->hex | forge_color_name.nova | grep:color_name_to_hex | color_name_to_hex + color_hex_to_name (16 HTML + common CSS names). Theme config/CSS gen/admin UIs. Companion to forge_color. KAT 9 both directions | TESTED ✓ |
 | 319 | UI text helpers (list/count/abbreviate) | forge_uitext.nova | grep:abbreviate_number | humanize_list('a, b and c') + pluralize_count('2 files', composes inflect) + abbreviate_number(1.5K/2M/3.2B). Dashboard/notification copy. KAT 16 | TESTED ✓ |
+| 320 | Fenwick tree (Binary Indexed Tree) | forge_fenwick.nova | grep:fenwick_add | fenwick_new/add/prefix_sum/range_sum, O(log n) update+query via i&(-i). Leaderboards/frequency/cumulative stats. KAT 9 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
