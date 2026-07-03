@@ -54,6 +54,14 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 5 (rows 150-170; cloud/crypto-signing/fuzzy-matching/config/analytics — MANY functionally KAT-verified this wave). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Cloud/AWS (no SDK):** ⭐ AWS SigV4 signer (`forge_awssigv4` — KAT vs AWS official vector, sig 5d672d79...) + signed S3 (`forge_s3`) + signed DynamoDB (`forge_dynamodb`). NOVA calls any AWS service directly.
+- **Crypto/security:** inbound webhook verify Stripe/GitHub/Slack (`forge_webhook_verify` — KAT, replay-guarded) + math CAPTCHA (`forge_captcha`) + 2FA recovery codes (wave 4).
+- **Fuzzy matching toolkit (all KAT-verified):** Levenshtein edit distance (`forge_levenshtein`), Soundex phonetic (`forge_phonetic` — all 6 classic codes exact), Jaro-Winkler (`forge_jaro` — MARTHA/MARHTA=0.944/0.961). Plus text helpers (`forge_text`) + LCS line diff (`forge_diff_text`).
+- **IDs:** Snowflake (`forge_snowflake` — KAT round-trip), geohash (`forge_geohash` — u4pruydqqvj exact), NanoID (`forge_nanoid`). Id family now ulid/uuid/snowflake/nanoid.
+- **Config/data-format:** .env (`forge_dotenv`), INI (`forge_ini`), TOML (`forge_toml`), CLDR plural rules (`forge_plural`), descriptive stats (`forge_stats` — mean/stddev/percentile KAT), color+WCAG contrast (`forge_color` — KAT), avatars (`forge_avatar`), vCard (`forge_vcard`), iCal (wave 4), JSON-LD SEO (`forge_jsonld`).
+- **★ Confirmed NOVA float builtins** exist and work: pow/sqrt/sin/cos/asin/atan2/round/floor/ceil/int() (float returns are fine EXCEPT the specific geo_bearing codegen pattern — see memory). Discipline held: grep-verify BEFORE `cat >` every hand-built module; ~10 duplicates avoided across all waves (jsonrpc/protobuf/outbox/saga/lock/problem/prometheus/cors/smtp/storage already existed).
+
 **2026-07-03 BATTERIES WAVE 4 (rows 122-149; encoding/date/auth/web-protocol/data-format depth — gen3 syntax-checked; TOTP + RESP-codec + geo + ean + msgpack functionally KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Data/backends:** ⭐ Redis RESP2 client (`forge_redis` — pure codec KAT-verified), MessagePack over the sound bytes type (`forge_msgpack` — KAT), civil-date arithmetic (`forge_date` — Hinnant chrono math), HTTP-date IMF-fixdate (`forge_httpdate`), deep-merge config layering (`forge_deepmerge`), DataLoader-style already in wave 3.
 - **Web protocol:** URL parse/build (`forge_url`), HTTP Range/206 (`forge_range`), Content-Disposition downloads (`forge_content_disposition`), content negotiation (wave 3), JSON-RPC server dispatch (added to `forge_jsonrpc`), RSS/Atom feeds (`forge_feed`), iCalendar (`forge_ical`), Open Graph/Twitter cards (`forge_opengraph`), .well-known OIDC/OAuth/security.txt/JWKS (`forge_wellknown`).
