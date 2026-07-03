@@ -1,0 +1,217 @@
+// forge_stemmer -- the Porter stemming algorithm (M.F. Porter, 1980): reduce an English word to its root form
+// ("running" -> "run", "argued" -> "argu", "nationalization" -> "nation") so a search index treats inflections
+// of the same word as one term. This is the classic IR/search primitive that powers query expansion and is
+// absent from essentially every web framework's standard library -- with it, forge's search/indexing can match
+// "connect", "connected", "connecting", "connection" to one stem. Faithful to Porter's five-step spec. LEAF.
+
+// PRIVATE: is w[i] a consonant? A consonant is any letter but a/e/i/o/u, and Y counts as a consonant ONLY when
+// it is at the start or preceded by a vowel (a Y after a consonant is treated as a vowel).
+fn _st_cons(w: string, i: int) -> bool
+    let c = char_at(w, i)
+    if c == "a" or c == "e" or c == "i" or c == "o" or c == "u"
+        return false
+    if c == "y"
+        if i == 0
+            return true
+        return not _st_cons(w, i - 1)
+    true
+
+// PRIVATE: the measure m of w -- the number of vowel->consonant transitions (VC sequences).
+fn _st_measure(w: string) -> int
+    let n = len(w)
+    let m = 0
+    let i = 1
+    let prev_cons = true
+    if n > 0
+        prev_cons = _st_cons(w, 0)
+    while i < n
+        let cur = _st_cons(w, i)
+        if prev_cons == false and cur == true
+            m = m + 1
+        prev_cons = cur
+        i = i + 1
+    m
+
+// PRIVATE: does the stem contain a vowel?
+fn _st_has_vowel(w: string) -> bool
+    let i = 0
+    while i < len(w)
+        if _st_cons(w, i) == false
+            return true
+        i = i + 1
+    false
+
+// PRIVATE: does w end in a double consonant (same letter twice, and a consonant)?
+fn _st_double_cons(w: string) -> bool
+    let n = len(w)
+    if n < 2
+        return false
+    if char_at(w, n - 1) != char_at(w, n - 2)
+        return false
+    _st_cons(w, n - 1)
+
+// PRIVATE: *o -- does w end in consonant-vowel-consonant where the final consonant is not w, x, or y?
+fn _st_cvc(w: string) -> bool
+    let n = len(w)
+    if n < 3
+        return false
+    if _st_cons(w, n - 1) == false
+        return false
+    if _st_cons(w, n - 2)
+        return false
+    if _st_cons(w, n - 3) == false
+        return false
+    let c = char_at(w, n - 1)
+    if c == "w" or c == "x" or c == "y"
+        return false
+    true
+
+// PRIVATE: replace the suffix `suf` of `w` with `rep` (assumes w ends with suf).
+fn _st_swap(w: string, suf: string, rep: string) -> string
+    slice(w, 0, len(w) - len(suf)) + rep
+
+// PRIVATE: measure of the stem obtained by removing suffix `suf`.
+fn _st_m_stem(w: string, suf: string) -> int
+    _st_measure(slice(w, 0, len(w) - len(suf)))
+
+// PRIVATE: does removing `suf` leave a stem that contains a vowel?
+fn _st_vowel_stem(w: string, suf: string) -> bool
+    _st_has_vowel(slice(w, 0, len(w) - len(suf)))
+
+// Step 1a: plurals / -ed / -ing plural forms.
+fn _st_step1a(w: string) -> string
+    if ends_with(w, "sses")
+        return _st_swap(w, "sses", "ss")
+    if ends_with(w, "ies")
+        return _st_swap(w, "ies", "i")
+    if ends_with(w, "ss")
+        return w
+    if ends_with(w, "s")
+        return _st_swap(w, "s", "")
+    w
+
+// Step 1b post-process (after removing -ed/-ing): fix up the stem.
+fn _st_step1b_post(w: string) -> string
+    if ends_with(w, "at")
+        return _st_swap(w, "at", "ate")
+    if ends_with(w, "bl")
+        return _st_swap(w, "bl", "ble")
+    if ends_with(w, "iz")
+        return _st_swap(w, "iz", "ize")
+    if _st_double_cons(w)
+        let c = char_at(w, len(w) - 1)
+        if c == "l" or c == "s" or c == "z"
+            return w
+        return slice(w, 0, len(w) - 1)
+    if _st_measure(w) == 1 and _st_cvc(w)
+        return w + "e"
+    w
+
+// Step 1b: -eed / -ed / -ing.
+fn _st_step1b(w: string) -> string
+    if ends_with(w, "eed")
+        if _st_m_stem(w, "eed") > 0
+            return _st_swap(w, "eed", "ee")
+        return w
+    if ends_with(w, "ed")
+        if _st_vowel_stem(w, "ed")
+            return _st_step1b_post(_st_swap(w, "ed", ""))
+        return w
+    if ends_with(w, "ing")
+        if _st_vowel_stem(w, "ing")
+            return _st_step1b_post(_st_swap(w, "ing", ""))
+        return w
+    w
+
+// Step 1c: (*v*) Y -> I.
+fn _st_step1c(w: string) -> string
+    if ends_with(w, "y")
+        if _st_vowel_stem(w, "y")
+            return _st_swap(w, "y", "i")
+    w
+
+// PRIVATE: apply a (suffix -> replacement) rule gated on m(stem) > 0. Returns the replaced word, or "" if the
+// suffix did not match.
+fn _st_rule(w: string, suf: string, rep: string) -> string
+    if ends_with(w, suf)
+        if _st_m_stem(w, suf) > 0
+            return _st_swap(w, suf, rep)
+        return w
+    ""
+
+// Step 2: longer derivational suffixes -> shorter (m>0).
+fn _st_step2(w: string) -> string
+    let pairs = [["ational", "ate"], ["tional", "tion"], ["enci", "ence"], ["anci", "ance"], ["izer", "ize"], ["bli", "ble"], ["alli", "al"], ["entli", "ent"], ["eli", "e"], ["ousli", "ous"], ["ization", "ize"], ["ation", "ate"], ["ator", "ate"], ["alism", "al"], ["iveness", "ive"], ["fulness", "ful"], ["ousness", "ous"], ["aliti", "al"], ["iviti", "ive"], ["biliti", "ble"], ["logi", "log"]]
+    let i = 0
+    while i < len(pairs)
+        let suf = pairs[i][0]
+        if ends_with(w, suf)
+            if _st_m_stem(w, suf) > 0
+                return _st_swap(w, suf, pairs[i][1])
+            return w
+        i = i + 1
+    w
+
+// Step 3: (m>0) suffix reductions.
+fn _st_step3(w: string) -> string
+    let pairs = [["icate", "ic"], ["ative", ""], ["alize", "al"], ["iciti", "ic"], ["ical", "ic"], ["ful", ""], ["ness", ""]]
+    let i = 0
+    while i < len(pairs)
+        let suf = pairs[i][0]
+        if ends_with(w, suf)
+            if _st_m_stem(w, suf) > 0
+                return _st_swap(w, suf, pairs[i][1])
+            return w
+        i = i + 1
+    w
+
+// Step 4: (m>1) remove derivational suffixes. -ion only after s or t.
+fn _st_step4(w: string) -> string
+    let sufs = ["al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent", "ou", "ism", "ate", "iti", "ous", "ive", "ize"]
+    let i = 0
+    while i < len(sufs)
+        let suf = sufs[i]
+        if ends_with(w, suf)
+            if _st_m_stem(w, suf) > 1
+                return _st_swap(w, suf, "")
+            return w
+        i = i + 1
+    if ends_with(w, "ion")
+        let stem = slice(w, 0, len(w) - 3)
+        if _st_measure(stem) > 1
+            if len(stem) > 0
+                let last = char_at(stem, len(stem) - 1)
+                if last == "s" or last == "t"
+                    return stem
+    w
+
+// Step 5a: remove a final -e (m>1, or m==1 and not *o).
+fn _st_step5a(w: string) -> string
+    if ends_with(w, "e")
+        let stem = slice(w, 0, len(w) - 1)
+        let m = _st_measure(stem)
+        if m > 1
+            return stem
+        if m == 1 and _st_cvc(stem) == false
+            return stem
+    w
+
+// Step 5b: (m>1 and *d and ends with l) -> remove one l.
+fn _st_step5b(w: string) -> string
+    if _st_measure(w) > 1 and _st_double_cons(w) and ends_with(w, "l")
+        return slice(w, 0, len(w) - 1)
+    w
+
+// Stem an English word (assumes lowercase a-z). Words of 1-2 letters are returned unchanged.
+fn stem(word: string) -> string
+    if len(word) <= 2
+        return word
+    let w = _st_step1a(word)
+    w = _st_step1b(w)
+    w = _st_step1c(w)
+    w = _st_step2(w)
+    w = _st_step3(w)
+    w = _st_step4(w)
+    w = _st_step5a(w)
+    w = _st_step5b(w)
+    w
