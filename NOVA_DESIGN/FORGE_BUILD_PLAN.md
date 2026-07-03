@@ -54,6 +54,12 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 24 (rows 301-304; crypto-address encodings + dev tools + NLP, ALL KAT-verified vs published/canonical vectors). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Crypto-address encodings:** Base58Check (`forge_base58check` — byte-array bignum base58 + double-SHA256 checksum, KAT vs the CANONICAL Satoshi genesis address `1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`, full pipeline) · Bech32/BIP173 (`forge_bech32` — BCH-over-GF(32) checksum for SegWit bc1/BOLT11/Nostr/Cosmos, KAT vs exact BIP173 `a12uel5l` + 32-symbol + 90-char max vectors).
+- **Dev tool:** canonical hexdump -C (`forge_hexdump` — offset + hex + ASCII gutter, for eyeballing binary payloads in logs).
+- **NLP/search (the meaty one):** Porter stemmer (`forge_stemmer` — faithful 1980 5-step algorithm: measure m, *v*/*d/*o, steps 1a-5b; KAT vs **29 of Porter's own canonical word pairs** across every step — generalization->gener, digitizer->digit, relational->relat). The classic IR term-unification primitive, absent from web-framework stdlibs.
+- **★ 304 modules, ≈241 this session (rows 64-304).** Base58Check re-validated forge_crypto's SHA-256 end-to-end against a real Bitcoin address; Bech32 and ISIN each surfaced a hand-typed test-vector error (miscounted q's / wrong check digit) that was correctly triaged to a KAT-vector fix, NOT a module change — the modules were right. Remaining HIGH-value work stays DEFERRED (final test pass + gated compiler tier).
+
 **2026-07-03 BATTERIES WAVE 23 (rows 294-300; validators + numeric/geometry math — ★ 300 FORGE MODULES. ALL KAT-verified vs published/known vectors). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Validators (fintech/automotive):** ISIN (row 291, wave 22) + CUSIP (`forge_cusip` — published Apple/Cisco) + VIN (`forge_vin` — ISO 3779, classic 1HGCM82633A004352). Join IBAN/BIC/card/luhn.
 - **Numeric/geometry math family (new):** point-in-polygon + shoelace area (`forge_polygon` — ray casting, concave-correct; the geofencing forge_geo lacked) · dense matrix LA (`forge_matrix` — mul/transpose/identity/det2/det3) · 3D vectors (`forge_vec3` — dot/cross/length/normalize) · complex numbers (`forge_complex`) · CRC-16 CCITT/XMODEM (`forge_crc16` — 0x29B1/0x31C3) · Damerau-Levenshtein (`forge_damerau` — transposition=1 edit) · **quaternions** (`forge_quat` — Hamilton/axis-angle/rotate, for Reactor 3D).
