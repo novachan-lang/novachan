@@ -266,5 +266,7 @@
 | 237 | ANSI terminal colors + strip | forge_ansi.nova | grep:ansi_strip | ansi_color/red/green/yellow/blue/bold (SGR+reset) + ansi_strip (non-TTY/logs). CLI tools, test runners. KAT colorize + strip round-trip. Completes CLI toolkit (table/progress/wordwrap/ansi) | TESTED ✓ |
 | 238 | Indent/dedent text blocks | forge_indent.nova | grep:dedent | indent (add N spaces to non-empty lines) + dedent (remove up to N leading spaces). Codegen, nested logging, quoting. KAT indent/dedent verified | TESTED ✓ |
 | 239 | Reversible sequential-ID obfuscation | forge_obfuscate_id.nova | grep:obfuscate_encode | obfuscate_encode/decode: modular-multiplicative permutation over 2^31-1, inverse via extended Euclid. Hide row order/count in public URLs, no lookup. Bijective, pair w/ base62. KAT round-trip | TESTED ✓ |
+| 240 | TSV parse/build (spreadsheet/export) | forge_tsv.nova | grep:tsv_parse | tsv_parse (rows of fields, 
+) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
