@@ -219,5 +219,6 @@
 | 190 | Base58 encoding (Bitcoin/IPFS, transcribable) | forge_base58.nova | grep:base58_encode | base58_encode/decode (drops ambiguous 0OIl). Crypto addresses, content IDs, shareable tokens. KAT round-trip + ambiguous-char reject. Completes base32/58/62/64 | TESTED ✓ |
 | 191 | ISBN-10/13 book identifiers (validate + convert) | forge_isbn.nova | grep:isbn13_valid | isbn10_valid (mod-11,X) + isbn13_valid (EAN mod-10) + isbn_valid + isbn10_to_13. Library/bookstore/publishing. KAT valid/invalid + conversion | TESTED ✓ |
 | 192 | SWIFT/BIC bank code validation (ISO 9362) | forge_bic.nova | grep:bic_valid | bic_valid (8/11 chars, letter bank+country, alnum location/branch) + bic_bank/bic_country. Pairs w/ forge_iban for wire/SEPA. KAT verified | TESTED ✓ |
+| 193 | GDPR/CCPA consent management | forge_consent.nova | grep:consent_allowed | consent_new (deny-default) + grant/revoke + consent_allowed (necessary always, else opt-in) + encode/decode cookie. Gate analytics/marketing on consent. KAT round-trip | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
