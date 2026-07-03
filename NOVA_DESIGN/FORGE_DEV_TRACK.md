@@ -251,5 +251,7 @@
 | 222 | String set (union/intersect/diff) | forge_set.nova | grep:set_union | set_new/add/has/remove/size/of + union/intersect/diff. Dedup, tag/permission sets. Dict-backed. KAT dedup + set algebra (union=4/inter=2/diff=1) | TESTED ✓ |
 | 223 | In-memory list utilities (page/chunk/flatten/unique) | forge_listutil.nova | grep:list_chunk | list_page (paginate loaded array) + list_chunk (batch) + list_flatten + list_unique (order-preserving dedup). Pairs w/ forge_pagination. KAT all + nested-list access | TESTED ✓ |
 | 224 | US state data (50 + DC) | forge_us_states.nova | grep:state_name | state_valid/name/code (2-letter<->full, reverse) + state_count=51. Address forms, dropdowns, shipping/tax. Complements forge_country. KAT ca=California/Texas=TX/51 | TESTED ✓ |
+| 225 | Deep structural equality | forge_deep_equal.nova | grep:deep_equal | deep_equal recursive over nested dicts/lists/scalars (dict order-insensitive, list order-sensitive). Test assertions, change detection, cache keys. KAT nested eq true->false | TESTED ✓ |
+| 226 | Numeric helpers (clamp/map-range) | forge_numeric.nova | grep:map_range | clamp/num_min/num_max/map_range/percent_in_range. UI layout, gauges, progress bars, bounds. KAT clamp=10/map=50/pct=38 | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
