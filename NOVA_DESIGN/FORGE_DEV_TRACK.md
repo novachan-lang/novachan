@@ -306,6 +306,7 @@
 | 277 | logfmt structured logging | forge_logfmt.nova | grep:logfmt_encode | logfmt_encode(dict)->key=value line + logfmt_decode(line)->dict; selective quoting (space/=/quote), backslash-escape, bare-key->true. KAT 10 round-trip+quoting | TESTED ✓ |
 | 278 | Stable A/B/n variant assignment | forge_targeting.nova | grep:ab_variant | ab_variant(feature,user,variants) sticky per-subject arm, no store, cross-node consistent. Complements rollout_on(bool%). KAT deterministic/in-set/uniform 500-500 + 300-299-301 | TESTED ✓ |
 | 279 | Test-harness response decomposition + assertions | forge_test.nova | grep:assert_json_field | response_status/response_body + assert_header(header-scoped)/assert_not_contains/assert_json_field(jsonPath-style). MockMvc/Django-Client depth. KAT 10 synthetic-response | TESTED ✓ |
+| 280 | CloudEvents HTTP binary content mode | forge_cloudevents.nova | grep:cloudevent_to_headers | cloudevent_to_headers(attrs->ce-* + datacontenttype->content-type, data=body) + from_headers reverse. Knative/EventBridge HTTP delivery. KAT 12 round-trip | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
