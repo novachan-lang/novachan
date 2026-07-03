@@ -197,5 +197,6 @@
 | 168 | Jaro-Winkler similarity (fuzzy name/record matching) | forge_jaro.nova | grep:jaro_winkler | jaro + jaro_winkler (0..1, transposition-aware, prefix-boosted). KAT exact MARTHA/MARHTA=0.944/0.961, DIXON/DICKSONX=0.813. Completes fuzzy toolkit (levenshtein+phonetic+jaro) | TESTED ✓ |
 | 169 | Deterministic default avatars (initials + color) | forge_avatar.nova | grep:avatar_initials | avatar_initials (up to 2, GitHub/Slack style) + avatar_color (stable palette pick, FNV hash) + avatar dict. Same user->same avatar, no image storage. KAT verified | TESTED ✓ |
 | 170 | Descriptive statistics (dashboards/monitoring/SLA) | forge_stats.nova | grep:stats_stddev | sum/mean/min/max/median/variance/stddev/percentile over int|float lists (insertion sort + sqrt). KAT mean=5/stddev=2/median=4.5. p95/p99 latency SLAs | TESTED ✓ |
+| 171 | HTML entity decode (feed/scraped content, inverse of esc) | forge_htmlentities.nova | grep:html_decode | html_decode named (17: amp/lt/copy/euro/mdash/...) + decimal &#NNN; + hex &#xHH;, correct UTF-8 for BMP (/,% no shifts). KAT ©=2B €=3B &#x41;=A passthrough | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
