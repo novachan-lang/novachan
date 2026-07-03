@@ -174,5 +174,6 @@
 | 146 | .well-known discovery (OIDC/OAuth metadata, security.txt, JWKS) | forge_wellknown.nova | grep:oidc_discovery | oidc_discovery (openid-configuration), oauth_metadata (RFC 8414), jwks wrapper, security_txt (RFC 9116). Makes a service an auto-discoverable OIDC/OAuth provider | untested (syntax✓) |
 | 147 | Open Graph + Twitter Card meta tags (social link previews) | forge_opengraph.nova | grep:opengraph | opengraph(title/desc/image/url/type)->og:* + twitter:card meta tags (FB/X/LinkedIn/Slack/iMessage unfurl), HTML-attr-escaped | untested (syntax✓) |
 | 148 | RSS 2.0 + Atom 1.0 feed generation | forge_feed.nova | grep:feed_rss | feed_rss/feed_atom from item dicts + feed_escape (single-pass, & first, no double-escape). Blog/news/podcast syndication | untested (syntax✓) |
+| 149 | Honeypot form spam prevention (no-CAPTCHA, accessible) | forge_honeypot.nova | grep:honeypot_is_bot | honeypot_field_name trap + honeypot_is_bot/ok: hidden-field (bots fill, humans don't) + min render-to-submit timing. WCAG-friendly, zero friction | untested (syntax✓) |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
