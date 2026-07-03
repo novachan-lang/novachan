@@ -13153,6 +13153,32 @@ int64_t nova_rt_bytes_append(int64_t handle, int64_t byte_val) {
     return handle;
 }
 
+/* Bulk-append ALL bytes of a NOVA string to the buffer, growing with amortized doubling. This is the O(n)
+   string-builder primitive: repeated appends build a large result in O(total) time, avoiding the O(n^2) cost
+   of immutable `s = s + x` concatenation (each of which copies the whole prefix). Idiom:
+       let b = bytes(0); ... bytes_append_str(b, part) ...; let s = bytes_to_str(b)
+   Returns the same handle (only b->data may be reallocated). Text semantics (strlen length, like str concat). */
+int64_t nova_rt_bytes_append_str(int64_t handle, int64_t str_ptr) {
+    NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
+    if (!b) return handle;
+    const char* s = nova_str_safe(str_ptr);
+    if (!s) return handle;
+    size_t sl = strlen(s);
+    if (sl == 0) return handle;
+    int64_t need = b->size + (int64_t)sl;
+    if (need > b->cap) {
+        int64_t newcap = b->cap < 16 ? 16 : b->cap;
+        while (newcap < need) newcap = newcap * 2;
+        uint8_t* nd = (uint8_t*)nova_back_grow((void*)b, (size_t)b->cap, (size_t)newcap, (void*)b->data);
+        if (!nd) return handle;   /* OOM: drop the append, buffer unchanged */
+        b->data = nd;
+        b->cap = newcap;
+    }
+    memcpy(b->data + b->size, s, sl);
+    b->size = b->size + (int64_t)sl;
+    return handle;
+}
+
 int64_t nova_rt_bytes_to_str(int64_t handle) {
     NovaBytes* b = (NovaBytes*)(uintptr_t)handle;
     if (!b || b->size == 0) return (int64_t)(uintptr_t)"";
