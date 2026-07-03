@@ -302,6 +302,7 @@
 | 273 | Server-side SVG builders | forge_svg.nova | grep:svg_document | svg_rect/circle/line/text/document (element+doc, XML-escaped text). Charts, badges, icons, identicon render, sparklines. KAT svg/rect/circle/escaped/closed | TESTED ✓ |
 | 274 | Unicode block-char sparklines | forge_sparkline.nova | grep:sparkline | sparkline(list)->U+2581..U+2588 inline chart, auto-scaled 8 levels; sparkline_points(). Dashboards/log-trends/CLI metrics. KAT exact-byte glyphs (ramp/flat/single/empty/neg/desc) | TESTED ✓ |
 | 275 | ORM/REST naming inflections | forge_naming.nova | grep:tableize | classify(table->model)/tableize(model->table)/humanize_label(col->label)/foreign_key(assoc->fk). Composes forge_case+forge_inflect. KAT 12 Rails vectors | TESTED ✓ |
+| 276 | CloudEvents v1.0 (CNCF) envelopes | forge_cloudevents.nova | grep:cloudevent | vendor-neutral event envelope (Knative/EventBridge/Kafka interop). build/full/valid(required-attrs)/to_json/from_json structured mode/is(routing). KAT 12: attrs serialized, invalid rejected, round-trip | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
