@@ -341,6 +341,7 @@
 | 312 | AABB collision + spatial tests | forge_aabb.nova | grep:aabb_intersects | aabb_intersects/contains_point/contains/intersection over [x,y,w,h]. O(1) broad-phase for game physics (Reactor)/hit-testing/spatial index. KAT 10. FOUND mixed float-var-vs-int compare bug | TESTED ✓ |
 | 313 | International Morse Code | forge_morse.nova | grep:morse_encode | morse_encode/morse_decode (A-Z 0-9, letters space-sep, words ' / '). Accessibility/ham-radio/reversible codec. KAT 8 SOS/words/roundtrip | TESTED ✓ |
 | 314 | Deterministic Lorem Ipsum generator | forge_lorem.nova | grep:lorem_words | lorem_words/sentence/paragraph, deterministic (cycles pool) for stable snapshots. UI mockups/demo-data. KAT 9 | TESTED ✓ |
+| 315 | Password strength estimator | forge_pwstrength.nova | grep:password_strength | password_strength(0-4)+label, length+class-diversity heuristic w/ short/all-same penalty. Registration meter; distinct from pwpolicy/pwgen. KAT scoring+ordering+labels | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
