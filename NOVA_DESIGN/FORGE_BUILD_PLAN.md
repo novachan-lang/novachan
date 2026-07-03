@@ -54,6 +54,11 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 12 (rows 231-237; CLI/text toolkit + caching, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **CLI/text toolkit (now complete):** aligned tables (`forge_table`), progress bars (`forge_progress`), ANSI colors+strip (`forge_ansi`), word-wrap (`forge_wordwrap`).
+- **Web/cache:** canonical query string (`forge_query_canon` — for cache keys/signatures), in-memory KV+TTL store (`forge_kv_ttl`), nav breadcrumbs (`forge_breadcrumb` — feeds jsonld BreadcrumbList).
+- **★ 237 modules total, ≈174 this session (rows 64-237).** The batteries space is exhaustively saturated. Discipline held throughout: grep-verify before build, KAT with standard vectors, caught 2 driver-only bugs (unbalanced paren, literal-brace interpolation) vs module bugs. Plan + memory current.
+
 **2026-07-03 BATTERIES WAVE 11 (rows 225-230; utility/HTTP polish, ALL KAT-verified). ★ 230 FORGE MODULES. See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - deep structural equality (`forge_deep_equal`), integer numeric helpers clamp/map-range (`forge_numeric`), unit conversions temp/distance/weight (`forge_units`), HTTP status reasons+categories+is_retryable (`forge_http_status`), Content-Type header parse/build (`forge_content_type`), Retry-After parse seconds/HTTP-date (`forge_retry_after`).
 - **★ 230 modules total; ≈167 shipped this session (rows 64-230).** The batteries-included space is now comprehensively saturated: full Spring/Django/Rails/Laravel/NestJS depth + cloud + Redis + all encodings/formats + complete crypto (every primitive KAT-vector-verified) + full security + resilience + i18n + reference data + fuzzy matching + SEO + fintech + analytics + a complete data-structures/algorithms/collections toolkit + HTTP/date/text/numeric utilities. Discipline held to the end: grep-verify before every build, KAT with standard vectors where one exists, plan + memory current.
