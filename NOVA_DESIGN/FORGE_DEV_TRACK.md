@@ -308,6 +308,7 @@
 | 279 | Test-harness response decomposition + assertions | forge_test.nova | grep:assert_json_field | response_status/response_body + assert_header(header-scoped)/assert_not_contains/assert_json_field(jsonPath-style). MockMvc/Django-Client depth. KAT 10 synthetic-response | TESTED ✓ |
 | 280 | CloudEvents HTTP binary content mode | forge_cloudevents.nova | grep:cloudevent_to_headers | cloudevent_to_headers(attrs->ce-* + datacontenttype->content-type, data=body) + from_headers reverse. Knative/EventBridge HTTP delivery. KAT 12 round-trip | TESTED ✓ |
 | 281 | JSON:API v1.0 document builder | forge_jsonapi.nova | grep:jsonapi_resource | resource objects (type/id/attributes) + to-one relationships + data/errors documents + vnd.api+json media type. jsonapi.org hypermedia (alongside HAL). KAT 12 serialize | TESTED ✓ |
+| 282 | W3C Server-Timing header | forge_server_timing.nova | grep:st_header | st_metric/st_metric_desc/st_name + st_header join -> Server-Timing value (backend timings to browser DevTools). Integer-ms. KAT 6 grammar+join+edges | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
