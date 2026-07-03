@@ -258,5 +258,6 @@
 | 229 | Content-Type header parse/build | forge_content_type.nova | grep:content_type_parse | content_type_parse (media + charset/boundary params, unquoted) + content_type_media/charset + content_type_build. Complements forge_mime/negotiate. KAT | TESTED ✓ |
 | 230 | Retry-After header parse (seconds/HTTP-date) | forge_retry_after.nova | grep:retry_after_seconds | retry_after_seconds: digits->seconds, HTTP-date->(date-now) floored, -1 unparseable. Client backoff 429/503. Composes forge_httpdate. KAT 120s/delta=777/past=0/bad=-1 | TESTED ✓ |
 | 231 | Canonical query string (sort params) | forge_query_canon.nova | grep:query_canon | query_canon (sort params -> stable) + query_equal (order-insensitive). Cache keys, request signatures, canonical URLs, dedup. Complements forge_qs. KAT | TESTED ✓ |
+| 232 | In-memory KV store with TTL expiry | forge_kv_ttl.nova | grep:kv_ttl_remaining | kv_new/set(ttl)/get/has/ttl_remaining/delete, lazy eviction. Request caches, short-lived tokens, OTP/nonce, rate-limit state. KAT fresh/expired/ttl=70 | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
