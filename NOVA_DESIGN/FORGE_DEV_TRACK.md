@@ -230,5 +230,7 @@
 | 201 | Promo/discount coupons | forge_coupon.nova | grep:coupon_discount | coupon_percent/fixed + coupon_valid (min-order+expiry) + coupon_discount (rounded pct / capped fixed) + coupon_apply. Integer cents. KAT 20%=2000, cap, expiry, below-min | TESTED ✓ |
 | 202 | Ordered allow/deny ACL (glob patterns, first-match) | forge_acl.nova | grep:acl_check | acl_allow/acl_deny + acl_check (first-match-wins, default-deny). AWS-IAM/firewall fine-grained resource perms. Composes forge_wildcard, complements forge_rbac. KAT verified | TESTED ✓ |
 | 203 | Env-var expansion in strings (config templating) | forge_env_expand.nova | grep:env_expand | env_expand: substitute ${VAR}/$VAR from a vars dict, unknown->'', lone-$ literal. dotenv interpolation/command templates. chr()-built braces. KAT braced/bare/mixed/unknown | TESTED ✓ |
+| 204 | JSONPath-lite query ($.a[0].b) | forge_jsonpath.nova | grep:jsonpath_get | jsonpath_get/has (dict-key + array-index + quoted-bracket-key) + jsonpath_tokens. Config lookups, webhook extraction, API mining. Distinct from jsonpointer (RFC 6901). KAT nested/index/tokens | TESTED ✓ |
+| 205 | Email normalization for dedup | forge_email_normalize.nova | grep:email_normalize | email_normalize (lowercase+strip +tag; Gmail drops dots+unify domain) + email_same. Prevents duplicate signups. KAT gmail plus/dots/googlemail collapse | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
