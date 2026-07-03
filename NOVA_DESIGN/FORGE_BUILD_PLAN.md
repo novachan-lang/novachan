@@ -54,6 +54,12 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 9 (rows 201-213; commerce/security/SEO/reference — ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Commerce/date:** coupons (`forge_coupon`), URL shortener (`forge_shortlink`), business-day math (`forge_business_days`), age/age-gating (`forge_age`), deadline countdowns (`forge_countdown`).
+- **Security/PII:** allow/deny ACL w/ globs (`forge_acl` — composes wildcard), US SSN validate+mask (`forge_ssn`), email normalization for dedup (`forge_email_normalize`), env-var expansion (`forge_env_expand`).
+- **Query/SEO/reference:** JSONPath-lite (`forge_jsonpath`), robots.txt (`forge_robots`) + sitemap.xml (`forge_sitemap`), ISO 3166 country data (`forge_country` — 50 countries, alpha2/3/name/tel).
+- **★ Session running total ≈ 150 batteries modules (rows 64-213).** Same discipline throughout: grep-verify before every `cat >`; KAT-verify with known-answer/standard vectors where one exists; caught a driver-only interpolation bug (`"${VAR}"` literal braces) vs a module bug and fixed the driver, not the module. Plan + memory current.
+
 **2026-07-03 BATTERIES WAVE 8 (rows 191-200; fintech/compliance/analytics/config — ALL KAT-verified). ★ 200 FORGE MODULES. See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Fintech:** ISBN-10/13 (`forge_isbn`), SWIFT/BIC (`forge_bic`), percentage/tax/discount in integer cents (`forge_percent`), locale currency formatting (`forge_money_fmt`). Join IBAN/card/luhn/money for a full fintech-validation set.
 - **Compliance/analytics:** GDPR/CCPA consent (`forge_consent`), UTM attribution (`forge_utm`), referrer/traffic-source classification (`forge_referrer`), Gravatar (`forge_gravatar` — KAT vs documented md5 example).
