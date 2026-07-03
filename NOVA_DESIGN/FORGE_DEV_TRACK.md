@@ -326,6 +326,7 @@
 | 297 | Complex-number arithmetic | forge_complex.nova | grep:complex_mul | complex_add/sub/mul/div/conj/abs/arg over [re,im]. FFT/signal-processing/control/AC math; companion to vec3/matrix. KAT 10: (1+2i)(3+4i)=-5+10i, i^2=-1, |z|=5, div round-trip, arg(i)=pi/2 | TESTED ✓ |
 | 298 | CRC-16 (CCITT-FALSE + XMODEM) | forge_crc16.nova | grep:crc16_ccitt | crc16_ccitt(init FFFF)/crc16_xmodem(init 0)/crc16_hex, poly 0x1021 MSB-first. 16-bit companion to CRC-32 for Modbus/XMODEM/USB. KAT std check '123456789'=0x29B1/0x31C3 | TESTED ✓ |
 | 299 | Damerau-Levenshtein edit distance | forge_damerau.nova | grep:damerau_levenshtein | damerau_levenshtein (Levenshtein + adjacent-transposition=1 edit, OSA). Better fuzzy/spell-check than plain Levenshtein. Flat 1D DP (sound). KAT 9 incl teh->the=1 | TESTED ✓ |
+| 300 | Quaternion 3D rotation math | forge_quat.nova | grep:quat_mul | quat_identity/mul(Hamilton)/conj/norm/normalize/from_axis_angle/rotate_vec. Gimbal-free 3D rotation (Reactor); completes vec3/matrix/complex. KAT 8 incl i*j=k, rotate-90/180-z. Found+fixed a sqrt float-return codegen edge | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
