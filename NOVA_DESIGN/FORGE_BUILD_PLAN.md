@@ -54,6 +54,13 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 8 (rows 191-200; fintech/compliance/analytics/config — ALL KAT-verified). ★ 200 FORGE MODULES. See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Fintech:** ISBN-10/13 (`forge_isbn`), SWIFT/BIC (`forge_bic`), percentage/tax/discount in integer cents (`forge_percent`), locale currency formatting (`forge_money_fmt`). Join IBAN/card/luhn/money for a full fintech-validation set.
+- **Compliance/analytics:** GDPR/CCPA consent (`forge_consent`), UTM attribution (`forge_utm`), referrer/traffic-source classification (`forge_referrer`), Gravatar (`forge_gravatar` — KAT vs documented md5 example).
+- **Config/time:** YAML parser (`forge_yaml` — full indentation nesting incl. mapping-sequences), timezone-offset parse/apply (`forge_tzoffset`).
+- **★ Session total: ~137 batteries modules (rows 64-200) shipped this session on top of the pre-existing framework; dozens KAT-verified against STANDARD vectors** (TOTP RFC 4226/6238, AWS SigV4 official, CRC-32 0xCBF43926, Soundex, Jaro-Winkler, geohash, Gravatar/MD5, ISBN). 3 NOVA codegen edges found + recorded. Plan kept fully current across 8 ledger waves + a 200-row DEV_TRACK. Model split (Opus complex/review + Sonnet leaf agents) sustained throughout.
+- **NEXT (deferred per rapid-dev rule):** the ONE final functional test pass over all 200 rows; the gated compiler tier (3 codegen edges + interfaces#8/ALPN-TLS/WASM/with-tx-syntax).
+
 **2026-07-03 BATTERIES WAVE 7 (rows 178-190; algorithms + utilities, ALL functionally KAT-verified — several against standard vectors). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Algorithms/matching:** glob wildcard (`forge_wildcard`), natural/version sort (`forge_natsort`), unweighted graph BFS/reachability (`forge_graph`), POSIX path utils (`forge_path`).
 - **Data/integrity:** compact bit set (`forge_bitset`), CRC-32 (`forge_checksum` — KAT vs standard 0xCBF43926), hex codec (`forge_hex`), Base58 (`forge_base58`), run-length encoding (`forge_rle`), duration-string parse (`forge_duration_parse`).
