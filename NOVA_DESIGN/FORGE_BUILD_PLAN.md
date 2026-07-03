@@ -54,6 +54,12 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 10 (rows 214-224; reference data + collections, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Reference data:** ISO 3166 countries (wave 9) + ISO 4217 currencies (`forge_currency`) + ISO 639 languages+RTL (`forge_language`) + US states (`forge_us_states`) + country->flag emoji (`forge_flag` — 4-byte UTF-8 astral).
+- **Collections toolkit (now COMPLETE):** set (`forge_set`), multimap/group-by (`forge_multimap`), frequency counter (`forge_counter`), list utils page/chunk/flatten/unique (`forge_listutil`) — joining heap/ring/trie/union-find/bitset/dag/graph/lru/bloom/hashring.
+- **Security/net:** HTTP Basic+Bearer (`forge_basic_auth`), IPv6 validation (`forge_ip6`), HIBP k-anonymity password check (`forge_pwned` — KAT vs SHA1('password')=5BAA6…, also validates forge_crypto sha1).
+- **★ Every crypto primitive now KAT-verified vs standard vectors** across the session: SHA-1 (pwned), SHA-256/HMAC (SCRAM/PBKDF2/awssigv4), MD5 (gravatar), TOTP/HOTP (RFC), AWS SigV4 (official), CRC-32. Session total ≈ 161 batteries modules (rows 64-224). Confirmed: int-in-dict increment is sound (counter); nested-list access works (listutil ch[0][0]).
+
 **2026-07-03 BATTERIES WAVE 9 (rows 201-213; commerce/security/SEO/reference — ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Commerce/date:** coupons (`forge_coupon`), URL shortener (`forge_shortlink`), business-day math (`forge_business_days`), age/age-gating (`forge_age`), deadline countdowns (`forge_countdown`).
 - **Security/PII:** allow/deny ACL w/ globs (`forge_acl` — composes wildcard), US SSN validate+mask (`forge_ssn`), email normalization for dedup (`forge_email_normalize`), env-var expansion (`forge_env_expand`).
