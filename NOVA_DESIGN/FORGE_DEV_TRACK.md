@@ -342,6 +342,7 @@
 | 313 | International Morse Code | forge_morse.nova | grep:morse_encode | morse_encode/morse_decode (A-Z 0-9, letters space-sep, words ' / '). Accessibility/ham-radio/reversible codec. KAT 8 SOS/words/roundtrip | TESTED ✓ |
 | 314 | Deterministic Lorem Ipsum generator | forge_lorem.nova | grep:lorem_words | lorem_words/sentence/paragraph, deterministic (cycles pool) for stable snapshots. UI mockups/demo-data. KAT 9 | TESTED ✓ |
 | 315 | Password strength estimator | forge_pwstrength.nova | grep:password_strength | password_strength(0-4)+label, length+class-diversity heuristic w/ short/all-same penalty. Registration meter; distinct from pwpolicy/pwgen. KAT scoring+ordering+labels | TESTED ✓ |
+| 316 | PID controller | forge_pid.nova | grep:pid_step | pid_new/step/control/reset (P+I+D feedback loop) for control systems/robotics/embedded. Float-in-list state persists by ref. KAT 8 incl integral accumulation 2/4/6 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
