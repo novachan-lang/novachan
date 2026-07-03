@@ -192,5 +192,7 @@
 	\ escapes, inline comments) + dotenv_get default. KAT verified. Feeds forge_config | TESTED ✓ |
 | 164 | Soundex phonetic matching (name sounds-alike search/dedup) | forge_phonetic.nova | grep:fn soundex | soundex (letter+3 digits, h/w-aware collapse) + soundex_match. KAT: Robert/Rupert=R163, Ashcraft=A261, Pfister=P236, Smith/Smyth=S530 all exact | TESTED ✓ |
 | 165 | LCS line diff (git/PR change review) | forge_diff_text.nova | grep:diff_lines | diff_lines LCS-aligned [op,line] (same/add/del, flat 1D DP i*w+j) + diff_unified (+/-/space) + diff_changes. KAT: beta->delta=2 changes, correct marks. Version history/audit | TESTED ✓ |
+| 166 | NanoID compact URL-safe ids | forge_nanoid.nova | grep:fn nanoid | nanoid(size)/nanoid_default(21)/nanoid_custom over 64-symbol unbiased alphabet. NUL-safe (bytes_get). KAT len 21/10. Completes id family (ulid/uuid/snowflake/nanoid) | TESTED ✓ |
+| 167 | INI config parser (git config/php.ini/systemd) | forge_ini.nova | grep:ini_parse | [section] key=value -> nested dict (top keys under ""), ; and # comments, quoted values, ini_get default. KAT verified | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
