@@ -323,6 +323,7 @@
 | 294 | VIN validation (ISO 3779) | forge_vin.nova | grep:vin_valid | vin_valid + vin_check_char (17-char, position-9 weighted-mod-11 check, X=10, I/O/Q forbidden). Automotive/logistics; w/ ISIN/CUSIP/IBAN. KAT classic 1HGCM82633A004352 + rejects | TESTED ✓ |
 | 295 | Dense matrix linear algebra | forge_matrix.nova | grep:mat_mul | mat_mul(conformable/non-square)/transpose/identity/add + mat_det2/det3. Row-major, exact int results. Graphics/physics/ML host math. KAT 9 known products+dets(-2/-306/1) | TESTED ✓ |
 | 296 | 3D vector math (vec3) | forge_vec3.nova | grep:vec3_cross | vec3_add/sub/scale/dot/cross/length/normalize. 3D graphics/physics/games (Reactor) + geometric ML; companion to matrix. Zero-safe. KAT 11 incl right-handed cross + orthogonality | TESTED ✓ |
+| 297 | Complex-number arithmetic | forge_complex.nova | grep:complex_mul | complex_add/sub/mul/div/conj/abs/arg over [re,im]. FFT/signal-processing/control/AC math; companion to vec3/matrix. KAT 10: (1+2i)(3+4i)=-5+10i, i^2=-1, |z|=5, div round-trip, arg(i)=pi/2 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
