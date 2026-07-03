@@ -232,5 +232,7 @@
 | 203 | Env-var expansion in strings (config templating) | forge_env_expand.nova | grep:env_expand | env_expand: substitute ${VAR}/$VAR from a vars dict, unknown->'', lone-$ literal. dotenv interpolation/command templates. chr()-built braces. KAT braced/bare/mixed/unknown | TESTED ✓ |
 | 204 | JSONPath-lite query ($.a[0].b) | forge_jsonpath.nova | grep:jsonpath_get | jsonpath_get/has (dict-key + array-index + quoted-bracket-key) + jsonpath_tokens. Config lookups, webhook extraction, API mining. Distinct from jsonpointer (RFC 6901). KAT nested/index/tokens | TESTED ✓ |
 | 205 | Email normalization for dedup | forge_email_normalize.nova | grep:email_normalize | email_normalize (lowercase+strip +tag; Gmail drops dots+unify domain) + email_same. Prevents duplicate signups. KAT gmail plus/dots/googlemail collapse | TESTED ✓ |
+| 206 | robots.txt generation (crawler control) | forge_robots.nova | grep:robots_render | robots_agent/allow/disallow/crawl_delay/sitemap + robots_render. Search-engine + bot crawl control. KAT directives present | TESTED ✓ |
+| 207 | sitemap.xml generation (SEO page discovery) | forge_sitemap.nova | grep:sitemap_render | sitemap_add (loc/lastmod/changefreq/priority) + sitemap_render (<urlset>, XML-escaped URLs). Pairs w/ robots. KAT escaping+priority | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
