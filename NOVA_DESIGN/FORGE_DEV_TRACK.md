@@ -294,6 +294,7 @@
 | 265 | Tip/gratuity + bill-split math | forge_tip.nova | grep:split_bill | tip_amount/tip_total + split_bill (per-person + remainder surfaced) + tip_split. Integer cents, no rounding loss. Restaurant/bill-split apps. KAT 18%=1800, \$100/3=3333r1 | TESTED ✓ |
 | 266 | Roman numeral encode/decode | forge_roman.nova | grep:to_roman | to_roman (1-3999, subtractive) + from_roman. Copyright years, outlines, clock faces. KAT 1994<->MCMXCIV, 2024=MMXXIV, round-trip | TESTED ✓ |
 | 267 | base36 encode/decode (case-insensitive) | forge_base36.nova | grep:base36_encode | base36_encode/decode (0-9a-z, case-insensitive). Reddit-style ids, transcribable short codes. Completes radix family (32/36/58/62/64). KAT 1295<->zz round-trip | TESTED ✓ |
+| 268 | Integer math (gcd/lcm/fraction/isqrt) | forge_math.nova | grep:reduce_fraction | gcd + lcm + reduce_fraction + isqrt (Newton). Ratios, aspect ratios (1920x1080->16:9), LCM scheduling. KAT gcd=6/lcm=12/16:9/isqrt | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
