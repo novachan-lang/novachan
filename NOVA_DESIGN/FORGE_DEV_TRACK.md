@@ -253,5 +253,6 @@
 | 224 | US state data (50 + DC) | forge_us_states.nova | grep:state_name | state_valid/name/code (2-letter<->full, reverse) + state_count=51. Address forms, dropdowns, shipping/tax. Complements forge_country. KAT ca=California/Texas=TX/51 | TESTED ✓ |
 | 225 | Deep structural equality | forge_deep_equal.nova | grep:deep_equal | deep_equal recursive over nested dicts/lists/scalars (dict order-insensitive, list order-sensitive). Test assertions, change detection, cache keys. KAT nested eq true->false | TESTED ✓ |
 | 226 | Numeric helpers (clamp/map-range) | forge_numeric.nova | grep:map_range | clamp/num_min/num_max/map_range/percent_in_range. UI layout, gauges, progress bars, bounds. KAT clamp=10/map=50/pct=38 | TESTED ✓ |
+| 227 | Unit conversions (temp/distance/weight) | forge_units.nova | grep:c_to_f | c_to_f/f_to_c/c_to_k + mi_to_km/km_to_mi + lb_to_kg/kg_to_lb (integer-rounded). Weather/fitness/international. KAT 100C=212F/5mi=8km/100lb=45kg | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
