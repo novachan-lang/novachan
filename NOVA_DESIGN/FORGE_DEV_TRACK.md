@@ -217,5 +217,7 @@
 | 188 | Duration-string parse ('2h30m'->ms) | forge_duration_parse.nova | grep:parse_duration_ms | parse_duration_ms/seconds (ms/s/m/h/d/w, ms-before-m). Inverse of forge_duration humanize. Config timeouts/TTLs. KAT 2h30m=9000000, 1d=86400s | TESTED ✓ |
 | 189 | Run-length encoding | forge_rle.nova | grep:rle_encode | rle_encode/rle_decode (aaabbc<->3a2b1c). Sparse bitmaps, telemetry, sprite/terminal data. KAT round-trip | TESTED ✓ |
 | 190 | Base58 encoding (Bitcoin/IPFS, transcribable) | forge_base58.nova | grep:base58_encode | base58_encode/decode (drops ambiguous 0OIl). Crypto addresses, content IDs, shareable tokens. KAT round-trip + ambiguous-char reject. Completes base32/58/62/64 | TESTED ✓ |
+| 191 | ISBN-10/13 book identifiers (validate + convert) | forge_isbn.nova | grep:isbn13_valid | isbn10_valid (mod-11,X) + isbn13_valid (EAN mod-10) + isbn_valid + isbn10_to_13. Library/bookstore/publishing. KAT valid/invalid + conversion | TESTED ✓ |
+| 192 | SWIFT/BIC bank code validation (ISO 9362) | forge_bic.nova | grep:bic_valid | bic_valid (8/11 chars, letter bank+country, alnum location/branch) + bic_bank/bic_country. Pairs w/ forge_iban for wire/SEPA. KAT verified | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
