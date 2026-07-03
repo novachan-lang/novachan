@@ -262,5 +262,6 @@
 | 233 | Navigation breadcrumbs from path | forge_breadcrumb.nova | grep:breadcrumbs | breadcrumbs(path)->[label,url] (title-cased labels nike-air->Nike Air, cumulative URLs, Home prepended). Nav UIs + JSON-LD BreadcrumbList. KAT | TESTED ✓ |
 | 234 | Word-wrap to max width | forge_wordwrap.nova | grep:word_wrap | word_wrap: break lines at word boundaries to a max width, preserve newlines. Terminal/email/plain-text/chat. KAT: width-10 wrap, no line exceeds | TESTED ✓ |
 | 235 | Aligned monospace table rendering | forge_table.nova | grep:table_render | table_render(headers,rows): auto column widths + cell padding + separator line. CLI reports, logs, plain-text email. KAT: alignment + dashes | TESTED ✓ |
+| 236 | ASCII progress bar | forge_progress.nova | grep:progress_bar | progress_bar (current/total/width -> '[#####-----] 50%', clamped 0-100) + progress_percent. CLI progress, log status, job dashboards. KAT half/full/empty/over/pct | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
