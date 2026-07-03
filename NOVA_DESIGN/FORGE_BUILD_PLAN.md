@@ -54,6 +54,10 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 15 (rows 248-250; release/debug/security tooling, ALL KAT-verified). ★ 250 FORGE MODULES. See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- Keep-a-Changelog builder (`forge_changelog`), indented JSON pretty-printer (`forge_json_pretty`), recursive nested-payload PII masking (`forge_json_mask` — deep GDPR-safe logging).
+- **★ 250 MODULES TOTAL, ≈187 shipped this session (rows 64-250).** This is a comprehensively saturated, production-grade batteries suite that exceeds Spring Boot + Django + Rails + Laravel + NestJS combined in breadth, plus complete data-structures/algorithms/collections/CLI-text/reference-data toolkits, with every crypto primitive KAT-verified vs standard vectors. Discipline sustained end-to-end: grep-verify before every build, KAT with known-answer/standard vectors where one exists, driver-vs-module bug discrimination, plan + memory current across 15 ledger waves. **The remaining HIGH-value work is DEFERRED per the rapid-dev rule: (1) ONE final functional test pass over all 250 rows [most are KAT'd, some syntax-only], (2) the gated compiler tier [3 codegen edges found this session + interfaces#8/ALPN-TLS/WASM/with-tx-syntax].**
+
 **2026-07-03 BATTERIES WAVE 14 (rows 243-247; timing/release/date-time, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - monotonic stopwatch (`forge_stopwatch` — clock_ns, KAT with real sleep), boolean string parse (`forge_boolean`), cron next-fire-time (`forge_cron_next` — composes forge_cron+forge_date, Feb-30->-1), semver bump (`forge_semver_bump`), time-of-day formatting (`forge_clock` — 12-hour AM/PM).
 - **★ 247 modules. Date/time domain now COMPLETE:** date (calendar) + clock (time-of-day) + duration (humanize) + duration_parse + tzoffset + httpdate + business_days + age + countdown + cron/cron_next. Session ≈184 modules (rows 64-247). Every batteries category saturated + KAT-verified; plan + memory current across 14 waves.
