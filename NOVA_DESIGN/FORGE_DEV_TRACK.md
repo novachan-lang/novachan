@@ -304,6 +304,7 @@
 | 275 | ORM/REST naming inflections | forge_naming.nova | grep:tableize | classify(table->model)/tableize(model->table)/humanize_label(col->label)/foreign_key(assoc->fk). Composes forge_case+forge_inflect. KAT 12 Rails vectors | TESTED ✓ |
 | 276 | CloudEvents v1.0 (CNCF) envelopes | forge_cloudevents.nova | grep:cloudevent | vendor-neutral event envelope (Knative/EventBridge/Kafka interop). build/full/valid(required-attrs)/to_json/from_json structured mode/is(routing). KAT 12: attrs serialized, invalid rejected, round-trip | TESTED ✓ |
 | 277 | logfmt structured logging | forge_logfmt.nova | grep:logfmt_encode | logfmt_encode(dict)->key=value line + logfmt_decode(line)->dict; selective quoting (space/=/quote), backslash-escape, bare-key->true. KAT 10 round-trip+quoting | TESTED ✓ |
+| 278 | Stable A/B/n variant assignment | forge_targeting.nova | grep:ab_variant | ab_variant(feature,user,variants) sticky per-subject arm, no store, cross-node consistent. Complements rollout_on(bool%). KAT deterministic/in-set/uniform 500-500 + 300-299-301 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
