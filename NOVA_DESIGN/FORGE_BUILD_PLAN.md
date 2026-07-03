@@ -54,6 +54,10 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 26 (rows 307-309; similarity + graph + animation, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- Set-similarity (`forge_setsim` — Jaccard/Dice/overlap, the set-based complement to cosine) · Dijkstra weighted shortest path (`forge_dijkstra` — least-COST routing/pathfinding, vs forge_graph's unweighted BFS) · easing/tweening (`forge_easing` — quad/cubic in/out/in-out + lerp for Reactor animation/UI transitions).
+- **★ 309 modules, ≈246 this session (rows 64-309).** Rounds out three orthogonal capabilities: similarity scoring (cosine + Jaccard family), weighted graph search, and animation math. Remaining HIGH-value work stays DEFERRED (final test pass + gated compiler tier).
+
 **2026-07-03 BATTERIES WAVE 25 (rows 305-306; the COMPLETE search-indexing pipeline, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - Search preprocessing (`forge_tokenize` — text_tokenize + stop-words + n-grams) + document similarity (`forge_cosine` — term-freq cosine, length-independent). Together with the Porter stemmer (row 304) this is a full classic search stack most web frameworks lack: **text_tokenize → remove_stopwords → stem → (ngrams) → cosine_similarity** for ranked "more-like-this"/near-dup/clustering.
 - **★ 306 modules, ≈243 this session (rows 64-306).** forge_cosine's norms use the sqrt(accumulator) form to dodge the float-return codegen edge found in wave 23 — the workaround is now applied proactively. Remaining HIGH-value work stays DEFERRED (final test pass + gated compiler tier).
