@@ -243,5 +243,7 @@
 | 214 | HTTP Basic + Bearer auth header parse/build | forge_basic_auth.nova | grep:basic_auth_parse | basic_auth_header (Basic base64) + basic_auth_parse (->[user,pass]) + bearer_from_header (renamed vs core bearer_token(req)). RFC 7617/6750. KAT base64 round-trip | TESTED ✓ |
 | 215 | ISO 4217 currency data | forge_currency.nova | grep:currency_decimals | currency_valid/symbol/name/decimals (26 currencies; JPY/KRW=0, BHD/KWD=3, else 2). Multi-currency checkout, price display, rounding. Complements money/country. KAT | TESTED ✓ |
 | 216 | Country-code -> flag emoji | forge_flag.nova | grep:flag_emoji | flag_emoji: 2-letter code -> flag via regional-indicator symbols (4-byte UTF-8 astral, /,% no shifts). Country pickers/locale badges. KAT US/GB=8 bytes, 0xF0 lead. Distinct from forge_flags | TESTED ✓ |
+| 217 | IPv6 address validation (:: compression) | forge_ip6.nova | grep:ip6_valid | ip6_valid (8-group hex + single :: zero-compression) + ip6_is_loopback. Complements IPv4 forge_ipcidr. KAT full/compressed/::/bad-hex/double-:: | TESTED ✓ |
+| 218 | ISO 639 language data + RTL | forge_language.nova | grep:language_name | language_valid/name/native + language_is_rtl (ar/he/fa/ur/yi) + language_dir (rtl/ltr). 41 languages. i18n pickers, Accept-Language, HTML dir. Complements forge_country | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
