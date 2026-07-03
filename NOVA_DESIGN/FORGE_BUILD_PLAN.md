@@ -54,6 +54,12 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 21 (rows 279-287; framework-depth + interop standards + analytics, ALL KAT-verified vs canonical/independent vectors). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Framework depth (additive to strong modules):** MockMvc/Django-Client response decomposition + assertions in `forge_test` (response_status/response_body/assert_header/assert_not_contains/assert_json_field) · CloudEvents HTTP **binary** content mode added to `forge_cloudevents` (ce-* headers ↔ event).
+- **Interop standards:** JSON:API v1.0 documents (`forge_jsonapi` — resource/relationships/errors, vnd.api+json) · W3C Server-Timing (`forge_server_timing`) · RFC 9530 Content-Digest SHA-256 (`forge_content_digest` — KAT vs independent base64 of SHA-256, tamper-detection) · WWW-Authenticate Bearer/Basic 401 challenge (`forge_www_authenticate`, RFC 6750/7617) · Permissions-Policy + Clear-Site-Data builders (`forge_browser_policy`) · **CBOR encoder** (`forge_cbor` — RFC 8949, KAT vs Appendix A: 20 vectors incl. all int-width boundaries + nested arrays; the encoding under COSE/WebAuthn/IoT).
+- **Analytics:** covariance + Pearson correlation + OLS linear regression added to `forge_stats` (KAT vs hand-computed incl. r=0.7746, ±1 correlation, y=2x+3).
+- **★ 287 modules, ≈224 this session (rows 64-287).** This wave deliberately shifted from leaf utilities (saturated) to (a) additive depth in already-strong modules and (b) genuinely-missing named standards — every landed module is KAT-verified against a canonical or hand-computed vector, not merely syntax-checked. Confirmed forge_stats float returns are sound (geo_bearing atan2 edge is specific). Remaining HIGH-value work stays DEFERRED (final test pass + gated compiler tier).
+
 **2026-07-03 BATTERIES WAVE 20 (rows 270-278; rendering/naming/interop/observability, ALL KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Rendering:** server-side SVG element/document builders (`forge_svg` — rect/circle/line/text/document, XML-escaped) + Unicode block-char sparklines (`forge_sparkline` — U+2581..U+2588, exact-byte KAT, auto-scaled).
 - **Naming/interop:** ORM/REST inflections composing forge_case + forge_inflect (`forge_naming` — classify/tableize/humanize_label/foreign_key, 12 Rails vectors) + CloudEvents v1.0 CNCF envelopes (`forge_cloudevents` — build/valid/to_json/from_json/is, structured mode).
