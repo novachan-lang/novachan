@@ -223,5 +223,7 @@
 | 194 | UTM campaign attribution (parse/build) | forge_utm.nova | grep:utm_parse | utm_parse (strip utm_ prefix->dict) + utm_build (campaign-tagged URL) + utm_source. Marketing attribution. KAT verified | TESTED ✓ |
 | 195 | Referrer/traffic-source classification | forge_referrer.nova | grep:referrer_channel | referrer_channel (search/social/direct/referral by known domains) + referrer_domain. Analytics attribution. KAT all channels | TESTED ✓ |
 | 196 | Gravatar avatar URLs | forge_gravatar.nova | grep:gravatar_hash | gravatar_hash (md5 trim+lowercase email) + gravatar_url (size+default style) + gravatar. Composes forge_crypto md5. KAT EXACT vs documented: MyEmailAddress@example.com=0bc83cb571cd1c50ba6f3e8a78ef1346 | TESTED ✓ |
+| 197 | Timezone offset parse/apply (fixed-offset ISO-8601) | forge_tzoffset.nova | grep:tz_offset_minutes | tz_offset_minutes (+05:30/-0800/Z) + tz_to_local/utc + tz_format. User-zone display, offset timestamps. KAT +05:30=330 -0800=-480 | TESTED ✓ |
+| 198 | Percentage/money math (discount/tax/change, integer cents) | forge_percent.nova | grep:percent_of | percent_of/bps_of/apply_discount/apply_tax(_bps)/percent_change, integer cents+rounding (no float money errors). KAT 8.25%bps=10825, signed change | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
