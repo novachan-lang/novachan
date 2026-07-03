@@ -317,6 +317,7 @@
 | 288 | Base45 encoder (RFC 9285) | forge_base45.nova | grep:base45_encode | base45_encode(byte-list) QR-alphanumeric encoding (EU Digital COVID Cert payload). 2 bytes->3 digits LSB-first. Encoding family w/ base32/58/62/64. KAT 6 vs RFC 9285 | TESTED ✓ |
 | 289 | HSL-inverse + HSV<->RGB color conversions | forge_color.nova | grep:color_hsl_to_rgb | color_hsl_to_rgb (inverse of rgb_to_hsl) + color_rgb_to_hsv + color_hsv_to_rgb (picker/theme model). KAT 16 exact + 4 round-trips within ±2 (integer HSL/HSV lossy) | TESTED ✓ |
 | 290 | Ascii85 (base-85) encoder | forge_ascii85.nova | grep:ascii85_encode | ascii85_encode(byte-list): 4B->5 chars '!'..'u', zero-group->z, partial->n+1. PDF/PostScript/git-diff encoding. KAT 6 vs PUBLISHED 'Man '->'9jqo^' + partial/multi | TESTED ✓ |
+| 291 | ISIN validation (ISO 6166) | forge_isin.nova | grep:isin_valid | isin_valid + isin_check_digit for securities IDs (Luhn-mod-10 after A=10..Z=35 expansion). Fintech w/ IBAN/BIC/card. KAT real Apple/BAE valid + hand-verified cd=5 + 4 reject classes | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
