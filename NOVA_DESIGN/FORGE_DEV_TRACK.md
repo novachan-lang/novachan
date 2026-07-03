@@ -344,6 +344,7 @@
 | 315 | Password strength estimator | forge_pwstrength.nova | grep:password_strength | password_strength(0-4)+label, length+class-diversity heuristic w/ short/all-same penalty. Registration meter; distinct from pwpolicy/pwgen. KAT scoring+ordering+labels | TESTED ✓ |
 | 316 | PID controller | forge_pid.nova | grep:pid_step | pid_new/step/control/reset (P+I+D feedback loop) for control systems/robotics/embedded. Float-in-list state persists by ref. KAT 8 incl integral accumulation 2/4/6 | TESTED ✓ |
 | 317 | Catmull-Rom spline | forge_spline.nova | grep:catmull_rom | catmull_rom + catmull_rom_path, passes THROUGH control points (vs Bezier). Camera paths/waypoints/data-smoothing. Companion to bezier. KAT 7 through-points + collinear-line | TESTED ✓ |
+| 318 | CSS named colors name<->hex | forge_color_name.nova | grep:color_name_to_hex | color_name_to_hex + color_hex_to_name (16 HTML + common CSS names). Theme config/CSS gen/admin UIs. Companion to forge_color. KAT 9 both directions | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
