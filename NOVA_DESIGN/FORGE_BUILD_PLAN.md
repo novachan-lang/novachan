@@ -54,6 +54,11 @@ These are the real "beats Spring Boot / Django" work — NOT the plumbing. Build
 
 ## Build progress (live ledger)
 
+**2026-07-03 BATTERIES WAVE 6 (rows 171-177; core data structures + config formats — ALL functionally KAT-verified). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
+- **Data structures:** DAG topological sort + cycle detection (`forge_dag`), binary min-heap / priority queue (`forge_heap`), ring/circular buffer (`forge_ring`), Union-Find / disjoint-set (`forge_union_find`), Trie / prefix-tree autocomplete (`forge_trie`). Join the existing lru/bloom/hashring for a full algorithmic toolkit.
+- **Formats:** TOML parser (`forge_toml` — scalars-as-strings), HTML entity decode (`forge_htmlentities` — UTF-8 numeric refs).
+- **★ Third NOVA codegen edge found (forge_toml):** returning a COERCED scalar (`parse_int(s)` / a bool) through an `any`-typed fn then storing in a nested dict + str() came back empty; strings/lists were fine. Workaround = scalars-as-strings (caller coerces). Recorded in memory [[reference-nova-float-codegen-geo-bearing]] (sibling of the geo float edge). Discipline: killed the stuck TOML agent, root-caused + fixed in-repo rather than trust the agent's box-dict workaround.
+
 **2026-07-03 BATTERIES WAVE 5 (rows 150-170; cloud/crypto-signing/fuzzy-matching/config/analytics — MANY functionally KAT-verified this wave). See [FORGE_DEV_TRACK.md](FORGE_DEV_TRACK.md):**
 - **Cloud/AWS (no SDK):** ⭐ AWS SigV4 signer (`forge_awssigv4` — KAT vs AWS official vector, sig 5d672d79...) + signed S3 (`forge_s3`) + signed DynamoDB (`forge_dynamodb`). NOVA calls any AWS service directly.
 - **Crypto/security:** inbound webhook verify Stripe/GitHub/Slack (`forge_webhook_verify` — KAT, replay-guarded) + math CAPTCHA (`forge_captcha`) + 2FA recovery codes (wave 4).
