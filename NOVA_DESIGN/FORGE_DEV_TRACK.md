@@ -324,6 +324,7 @@
 | 295 | Dense matrix linear algebra | forge_matrix.nova | grep:mat_mul | mat_mul(conformable/non-square)/transpose/identity/add + mat_det2/det3. Row-major, exact int results. Graphics/physics/ML host math. KAT 9 known products+dets(-2/-306/1) | TESTED ✓ |
 | 296 | 3D vector math (vec3) | forge_vec3.nova | grep:vec3_cross | vec3_add/sub/scale/dot/cross/length/normalize. 3D graphics/physics/games (Reactor) + geometric ML; companion to matrix. Zero-safe. KAT 11 incl right-handed cross + orthogonality | TESTED ✓ |
 | 297 | Complex-number arithmetic | forge_complex.nova | grep:complex_mul | complex_add/sub/mul/div/conj/abs/arg over [re,im]. FFT/signal-processing/control/AC math; companion to vec3/matrix. KAT 10: (1+2i)(3+4i)=-5+10i, i^2=-1, |z|=5, div round-trip, arg(i)=pi/2 | TESTED ✓ |
+| 298 | CRC-16 (CCITT-FALSE + XMODEM) | forge_crc16.nova | grep:crc16_ccitt | crc16_ccitt(init FFFF)/crc16_xmodem(init 0)/crc16_hex, poly 0x1021 MSB-first. 16-bit companion to CRC-32 for Modbus/XMODEM/USB. KAT std check '123456789'=0x29B1/0x31C3 | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
