@@ -275,6 +275,7 @@
 | 246 | Semver version bumping | forge_semver_bump.nova | grep:bump_major | bump_major/minor/patch (semver rules, prerelease dropped). Release tooling. Composes forge_semver. KAT 1.2.3->2.0.0/1.3.0/1.2.4, v-prefix | TESTED ✓ |
 | 247 | Time-of-day formatting (HH:MM:SS / 12-hour) | forge_clock.nova | grep:clock_12h | clock_hms/hm/clock_12h (AM/PM) + clock_from_epoch. Complements forge_date/duration. KAT 45296s=12:34:56, noon/midnight/1PM/9AM. Completes date/time domain | TESTED ✓ |
 | 248 | Keep-a-Changelog builder | forge_changelog.nova | grep:changelog_render | changelog_new/add (Added/Changed/Deprecated/Removed/Fixed/Security) + changelog_render (versioned markdown, non-empty only). Release notes, pairs w/ semver_bump. KAT | TESTED ✓ |
+| 249 | JSON pretty-printer (indented) | forge_json_pretty.nova | grep:json_pretty | json_pretty (parse+re-emit indented, recursive) + json_pretty_value. Config, API debugging, log inspection. Braces via chr(), bool->0/1 noted. KAT nested indent | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
