@@ -241,5 +241,6 @@
 | 212 | Countdown / deadline labels | forge_countdown.nova | grep:days_until | days_until + is_past + countdown_label (today/tomorrow/yesterday/in N days/N days ago). Deadlines, trial expiry, timers. Composes forge_date. KAT | TESTED ✓ |
 | 213 | ISO 3166 country data + validation | forge_country.nova | grep:country_name | country_valid/name/alpha3/calling_code/from_alpha3 (50 countries, alpha2<->alpha3<->name<->tel). Address forms, dropdowns, shipping/tax, phone codes. KAT | TESTED ✓ |
 | 214 | HTTP Basic + Bearer auth header parse/build | forge_basic_auth.nova | grep:basic_auth_parse | basic_auth_header (Basic base64) + basic_auth_parse (->[user,pass]) + bearer_from_header (renamed vs core bearer_token(req)). RFC 7617/6750. KAT base64 round-trip | TESTED ✓ |
+| 215 | ISO 4217 currency data | forge_currency.nova | grep:currency_decimals | currency_valid/symbol/name/decimals (26 currencies; JPY/KRW=0, BHD/KWD=3, else 2). Multi-currency checkout, price display, rounding. Complements money/country. KAT | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
