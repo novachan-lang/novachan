@@ -313,6 +313,7 @@
 | 284 | WWW-Authenticate Bearer/Basic challenge | forge_www_authenticate.nova | grep:bearer_error | bearer_challenge/bearer_error(realm,error,desc,scope)/basic_challenge. RFC 6750/7617 401 challenge, quoted+escaped params, empty optionals omitted. KAT 5 | TESTED ✓ |
 | 285 | Permissions-Policy + Clear-Site-Data builders | forge_browser_policy.nova | grep:permissions_policy | pp_none/self/any/allow(origins)+permissions_policy join (precise feature allowlists beyond static security_headers) + clear_site_data(logout purge). KAT 9 | TESTED ✓ |
 | 286 | Covariance + Pearson correlation + linear regression | forge_stats.nova | grep:stats_correlation | stats_covariance/correlation(Pearson r)/linreg_slope/linreg_intercept (OLS). /n matches variance so ratios cancel; zero-var+len guards. KAT 12 hand-computed incl r=0.7746 | TESTED ✓ |
+| 287 | CBOR encoder (RFC 8949) | forge_cbor.nova | grep:cbor_encode | cbor_uint/int(major0/1 min-width)/text/array(recursive)/bool/null. Binary encoding under COSE/WebAuthn/IoT (distinct from msgpack). KAT 20 vs RFC 8949 Appendix A | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
