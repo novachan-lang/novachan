@@ -212,5 +212,7 @@
 | 183 | POSIX path utilities (basename/dirname/extname/join/normalize) | forge_path.nova | grep:path_normalize | path_basename/dirname/extname/join + normalize (resolves ./.. collapses //). URL paths/storage keys/routes. KAT /a/./b/../c=/a/c, a/b/../../c=c | TESTED ✓ |
 | 184 | CRC-32 checksum (data integrity) | forge_checksum.nova | grep:crc32 | crc32 + crc32_hex, bitwise IEEE 802.3 (poly 0xEDB88320, no table). File/blob integrity, network frames, dedup. KAT EXACT vs standard: 123456789=0xCBF43926, hello=0x3610a686 | TESTED ✓ |
 | 185 | Hex encode/decode + hexdump | forge_hex.nova | grep:hex_encode | hex_encode/hex_decode (byte<->2-hex) + hex_spaced. Hexdump/wire-debug/binary-in-text. NUL-decode caveat noted. KAT Hi!=486921 round-trip. Complements base32/62/64 | TESTED ✓ |
+| 186 | Fake seed-data generator (Faker/factory_bot) | forge_faker.nova | grep:fake_name | fake_name/email/username/sentence, deterministic from a seed (reproducible or varied). Seed dev DBs, demos, load tests. KAT deterministic+varied | TESTED ✓ |
+| 187 | Password + passphrase generator (CSPRNG) | forge_pwgen.nova | grep:fn pwgen | pwgen/pwgen_alnum/pwgen_digits + Diceware passphrase. NUL-safe byte->char, shell/JSON-safe symbols, modulo-bias documented. Generator side of forge_pwpolicy. KAT verified | TESTED ✓ |
 
  handling, no spurious trailing row; csv_parse_dicts (header→dict); csv_field safe accessor | untested (syntax✓) |
