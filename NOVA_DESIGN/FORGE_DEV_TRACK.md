@@ -338,6 +338,7 @@
 | 309 | Easing/tweening functions | forge_easing.nova | grep:ease_in_out_cubic | ease_linear + quad/cubic in/out/in-out + lerp. Natural UI transitions + game animation (Reactor); animate via a+(b-a)*ease(t). KAT 14 curve values + endpoints + lerp | TESTED ✓ |
 | 310 | GFM strikethrough (markdown) | forge_markdown.nova | grep:_md_inline | ~~text~~ -> <del> added to markdown_to_html inline pipeline (reuses _md_apply_rule). KAT 6 strikethrough + no regression | TESTED ✓ |
 | 311 | Bezier curves (quadratic/cubic) | forge_bezier.nova | grep:bezier_cubic | bezier_quad/bezier_cubic/bezier_cubic_path over [x,y]. SVG paths/fonts/animation motion (Reactor); complements easing/vec3. KAT 9 endpoints+midpoints+path | TESTED ✓ |
+| 312 | AABB collision + spatial tests | forge_aabb.nova | grep:aabb_intersects | aabb_intersects/contains_point/contains/intersection over [x,y,w,h]. O(1) broad-phase for game physics (Reactor)/hit-testing/spatial index. KAT 10. FOUND mixed float-var-vs-int compare bug | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
