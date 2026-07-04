@@ -42,13 +42,20 @@ The old doc's root-cause (inferred local types dropped at codegen) has since bee
 
 ---
 
-## GAP 2 — Float Array Sum: ✅ Largely Closed
+## GAP 2 — Float Array Sum: ✅ Closed further (S3 raw storage now on, sound)
 
-| | C | NOVA |
-|--|---|------|
-| sum 100k floats | <1ms | ~2ms (**~2–3x**, was claimed 120x) |
+| | C | NOVA (boxed S2) | **NOVA (raw S3, now)** |
+|--|---|-----------------|------------------------|
+| sum 1M floats | ~1ms | ~15ms | **~7ms (2.1x faster)** |
 
-Repr-inference now emits native `fadd double` + typed loads for float-list reductions instead of boxing every element through a `NovaBox`. A residual ~2x remains vs raw `double[]` because a general `list` still carries per-element tag/representation metadata (the fully-typed `elem_kind` array design, `S4_TYPED_ARRAYS_DESIGN.md`, would close the last ~2x for AI/dense-numeric workloads). This is now a *nice-to-have*, not a blocker.
+**2026-07-04 — S3 raw `double[]` storage landed (the previously-reverted step), sound + bootstrap-converged.**
+A push-built homogeneous float list now stores raw inline doubles (`elem_kind=2`), so a typed read is a single native load with no box-pointer chase (vs S2's boxed storage + unbox). This was the step reverted twice before because it corrupted `stats` (raw IEEE-754 bits read as a box pointer → `8.96e-312`).
+
+**Root cause found (by instrumenting the runtime) + fixed:** the corruption was *not* a missing reader — it was `nova_rt_list_append_fraw` being handed a **boxed-repr** float. A `fn f(x) -> float` whose body is `x * 1.0` on an `any` param returns a *boxed* float; pushing it into raw storage stored the box **pointer** as if it were raw double bits. **Fix (compiler-only, ~10 lines):** at the `append_fraw` codegen site, `ire_float_load` the value arg to guaranteed-raw double bits first (repr-aware: a no-op bitcast on a proven-raw SSA reg, an unbox on a box/unknown). Now every float — raw or boxed-repr — is stored as raw bits.
+
+**Validated:** all 8 historical corruptors (`stats`/`math3d`/`geox`/`complexnum`/`colorconvx` + 3 float-escape oracles) match their golden output, a 7-pattern float-egress stress test (coerce-fn/any-param/comparison/index_set/dict/nested/negative-index) is correct, the broad differential regression is clean, and **gen5.ll == gen6.ll (bootstrap converged)**.
+
+Residual ~7x vs C is now purely the per-element **call** to `nova_rt_list_get_f` (not inlined/vectorized). Closing that is S3 Stage B (an inlined guarded `load double` — hoistable, vectorizable), a follow-on codegen optimization, not a correctness item.
 
 ---
 
