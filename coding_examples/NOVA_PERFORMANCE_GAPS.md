@@ -55,11 +55,24 @@ A push-built homogeneous float list now stores raw inline doubles (`elem_kind=2`
 
 **Validated:** all 8 historical corruptors (`stats`/`math3d`/`geox`/`complexnum`/`colorconvx` + 3 float-escape oracles) match their golden output, a 7-pattern float-egress stress test (coerce-fn/any-param/comparison/index_set/dict/nested/negative-index) is correct, the broad differential regression is clean, and **gen5.ll == gen6.ll (bootstrap converged)**.
 
-Residual ~7x vs C is the per-element read (measured: an identical loop with `s + 1.0` instead of `s + xs[i]` runs in **1ms** = C-parity, so the read is the whole cost).
+**2026-07-05 sharpened measurement — the residual is NARROWER than "the whole float story":**
+
+| Float-array pattern | NOVA | C | Ratio |
+|---|---|---|---|
+| **`sum(xs)` / built-in reductions** (min/max/mean) | 153–164ms | 177–184ms | **~1.0x (PARITY or better)** |
+| **manual `while j<len: s = s + xs[j]` read loop** | 426–444ms | 114–122ms | **~3.6x** |
+
+So the built-in reductions are already C-parity (`nova_rt_sum_f` hoists the `elem_kind` check and loops tightly over the raw `double[]`). The residual lives **only** in the *compiler-emitted per-element read* `xs[j]` inside a user's own loop — each read is a `call nova_rt_list_get_f` (call frame + bounds check + kind branch), ~16ns/read over C's ~5.5ns.
+
+**LTO tried (2026-07-05) — does NOT help:** built `nova_runtime` as LTO bitcode and linked the read-loop with `-flto -fuse-ld=lld`. Cross-module inlining of `nova_rt_list_get_f` did *not* close the gap (449–566ms, same/worse) — clang's alias analysis won't hoist the loop-invariant `elem_kind`/`data` loads because it can't prove the `NovaList` isn't mutated/aliased in the loop. A zero-risk build-flag fix is therefore ruled out.
 
 **Stage B (inline the read) — attempted, measured, reverted (a useful negative result).** I inlined a guarded native `load double` (fast path: `elem_kind==2` + in-bounds; else fall back to the call) at all three read-emission sites, sound (all 8 corruptors passed). It removed the call overhead (9ms → 6ms) but **did not vectorize** (0 vector ops in the optimized IR): the per-iteration `elem_kind` guard branch blocks LLVM's loop vectorizer, and LLVM won't hoist the (loop-invariant) kind/size loads because it can't prove the list isn't aliased/mutated in the loop. A ~15% gain at the cost of 6 extra basic blocks *per float read* (heavy IR bloat) isn't worth shipping, so it was reverted.
 
-**The real path to float C-parity** is therefore NOT per-read inlining but **loop-level specialization**: recognize a read-only float-list loop, hoist the `elem_kind==2` check *out* of the loop once, and emit a specialized raw-`double[]` inner loop that LLVM can vectorize — or a first-class `[float]` typed-array type so the element representation is statically known. Both are sizeable features (loop analysis / a language-level array type), not a codegen tweak. Tracked as the remaining ~7x → 1x work.
+**The real path to float C-parity** is therefore NOT per-read inlining but one of two sound-but-sizeable features:
+1. **Loop-level specialization** — recognize a read-only float-list loop, prove the list isn't mutated in the body, hoist the `elem_kind==2`/`data` loads to the loop preheader once, and emit a specialized raw-`double[]` inner loop (no per-iter call/branch → scalar-FP-reduction at C speed). Blocked by the current codegen being *expression-oriented* — the read emission has no loop context, so this needs a loop-analysis pass that threads a preheader down to read sites.
+2. **A sound `floatlist ⟹ kind==2` invariant** — guarantee every statically-typed float list is *always* raw-backed (every construction path uses `append_fraw`, `index_set` stores raw instead of deopting, and `any`-round-trips preserve kind), so a typed read can be an **unguarded** raw `load double`.
+
+**Why neither is an overnight change:** the float-raw storage surface has already corrupted the compiler *twice* (S3 revert, then the boxed-float-stored-raw bug fixed this pass). An unguarded raw load or a hoisted guard that is wrong by one construction path reintroduces the `8.96e-312` class of corruption into the *self-hosted compiler* — catastrophic. This is tracked as supervised feature work (~3.6x → 1x on manual float read loops), not a codegen tweak to slip in unreviewed.
 
 ---
 
