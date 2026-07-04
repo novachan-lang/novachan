@@ -55,7 +55,11 @@ A push-built homogeneous float list now stores raw inline doubles (`elem_kind=2`
 
 **Validated:** all 8 historical corruptors (`stats`/`math3d`/`geox`/`complexnum`/`colorconvx` + 3 float-escape oracles) match their golden output, a 7-pattern float-egress stress test (coerce-fn/any-param/comparison/index_set/dict/nested/negative-index) is correct, the broad differential regression is clean, and **gen5.ll == gen6.ll (bootstrap converged)**.
 
-Residual ~7x vs C is now purely the per-element **call** to `nova_rt_list_get_f` (not inlined/vectorized). Closing that is S3 Stage B (an inlined guarded `load double` — hoistable, vectorizable), a follow-on codegen optimization, not a correctness item.
+Residual ~7x vs C is the per-element read (measured: an identical loop with `s + 1.0` instead of `s + xs[i]` runs in **1ms** = C-parity, so the read is the whole cost).
+
+**Stage B (inline the read) — attempted, measured, reverted (a useful negative result).** I inlined a guarded native `load double` (fast path: `elem_kind==2` + in-bounds; else fall back to the call) at all three read-emission sites, sound (all 8 corruptors passed). It removed the call overhead (9ms → 6ms) but **did not vectorize** (0 vector ops in the optimized IR): the per-iteration `elem_kind` guard branch blocks LLVM's loop vectorizer, and LLVM won't hoist the (loop-invariant) kind/size loads because it can't prove the list isn't aliased/mutated in the loop. A ~15% gain at the cost of 6 extra basic blocks *per float read* (heavy IR bloat) isn't worth shipping, so it was reverted.
+
+**The real path to float C-parity** is therefore NOT per-read inlining but **loop-level specialization**: recognize a read-only float-list loop, hoist the `elem_kind==2` check *out* of the loop once, and emit a specialized raw-`double[]` inner loop that LLVM can vectorize — or a first-class `[float]` typed-array type so the element representation is statically known. Both are sizeable features (loop analysis / a language-level array type), not a codegen tweak. Tracked as the remaining ~7x → 1x work.
 
 ---
 
