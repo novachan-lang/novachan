@@ -352,6 +352,7 @@
 | 323 | Aho-Corasick multi-pattern search | forge_aho.nova | grep:ac_search | ac_new/add/build/search, find ALL of a keyword set in one O(text+matches) pass (vs per-keyword find). Filters/highlighting/IDS. Trie+BFS fail links. KAT classic ushers + multi + empty | TESTED ✓ |
 | 324 | Reservoir sampling (Algorithm R) | forge_reservoir.nova | grep:reservoir_sample | reservoir_sample(items,k,seed): uniform k-sample from unknown-length stream, O(k) mem, seeded/reproducible. Log sampling/subsampling. KAT 7 properties | TESTED ✓ |
 | 325 | HyperLogLog cardinality estimation | forge_hll.nova | grep:hll_count | hll_new/add/count, distinct-count in KB (unique visitors at scale). Cardinality companion to countmin/reservoir. Harmonic estimator + linear-counting via hand-rolled ln (_hll_ln atanh series). KAT 10000->9407, 500->533 | TESTED ✓ |
+| 326 | Deque (double-ended queue, O(1) both ends) | forge_deque.nova | grep:deque_push_front | deque_new/from_list + push/pop/peek _front/_back (all TRUE O(1)) + len/is_empty/to_list/clear. Repr [head,tail,slots-dict], cursors grow monotonically, keys del'd on pop (no leak), no ring wraparound. Work queues/BFS/sliding-window/LRU. Empty->null (single-exit null-init dodges the return-null mistag bug). KAT 25: FIFO/LIFO/both-ends/peek/empty-guards/from_list/clear+reuse/200-elt adversarial drain/mixed-types | TESTED ✓ |
 
 ) + tsv_build + tsv_parse_dicts (header-keyed). Spreadsheet paste, data export. Complements forge_csv_parse. KAT round-trip + dicts | TESTED ✓ |
 
