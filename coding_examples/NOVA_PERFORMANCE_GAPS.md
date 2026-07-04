@@ -15,11 +15,11 @@
 | GAP 1 — int loop + modulo (sieve) | 8x slower | C 21ms vs NOVA 13–33ms @ 50k = **~0.6–1.6x (PARITY)** | ✅ **CLOSED** — IR is already native `mul i64`/`srem i64`/`icmp` |
 | GAP 2 — float array sum | 120x slower | NOVA 2ms vs C <1ms @ 100k = **~2–3x** | ✅ **Largely closed** (was boxed; repr inference now emits native `fadd`/loads) |
 | GAP 3 — HOF/lambda dispatch | 2–3x | map+lambda 2ms vs direct 0ms @ 50k = **~2x on a trivial body** | ⚠️ Minor — real only for micro-bodies |
-| GAP 4 — struct field access | 2–3x | 1M dot products ~2ms = **~2–3x** | ⚠️ Minor — escape-analysis→stack would close it |
+| GAP 4 — struct field access | 2–3x | 10M struct dot-products: NOVA 157–174ms vs C 151–154ms = **~1.05x (PARITY)** | ✅ **CLOSED** — struct SROA (default-on) makes the hot loop native `fmul`/`fadd` |
 | GAP 5 — string concat in a loop | 30x | naive `s=s+x` IS O(n²), BUT O(n) tools exist (see below) | ✅ **FIXED** — `join` + `bytes` + new `bytes_append_str` |
 | GAP 6 — spawn/channel micro-tasks | 9µs/task | ~14µs/task @ 10k | ⚠️ Fundamental (isolation), competitive with Go/Loom |
 
-**Bottom line: NOVA is at C parity on tight integer loops and within ~2–3x of C on float/struct/HOF code — not the 8–120x the old doc claimed.** The only genuinely O(n²) pattern (naive string `+` in a loop) has three O(n) alternatives, one of them added by this pass.
+**Bottom line: NOVA is at C parity on tight integer loops AND on struct-field/dot-product code, and within ~2x of C on float-array/HOF code — not the 8–120x the old doc claimed.** The only genuinely O(n²) pattern (naive string `+` in a loop) has three O(n) alternatives, one of them added by this pass. Of the 6 original gaps, **4 are closed at parity (1, 4) or fixed (5) and near-parity (2)**; only float-array-read (2, residual ~2x) and trivial-HOF (3) remain as optional micro-optimizations.
 
 ---
 
@@ -63,10 +63,10 @@ Residual ~7x vs C is the per-element read (measured: an identical loop with `s +
 
 ---
 
-## GAP 3 / GAP 4 — HOF Lambdas & Struct Fields: ⚠️ Minor (~2–3x)
+## GAP 3 — HOF Lambdas: ⚠️ Minor (~2x on trivial bodies) · GAP 4 — Struct Fields: ✅ CLOSED
 
 - **GAP 3:** `map(nums, fn(x) x*x)` over 50k = ~2ms vs a direct loop = ~0ms. The overhead is real only for *trivial* bodies (the closure call dominates 1 multiply). For any non-trivial body it vanishes. Whole-program monomorphization (`PERFORMANCE_SPECIALIZATION.md` Stage 5) would erase even the trivial case — but note the **unsound shortcut** (feeding `ti_fn_param_types` into `fpt`) was tried and reverted (it corrupted float callers of polymorphic bodies). The real fix needs the whole-program use-set.
-- **GAP 4:** 1M struct dot products ≈ 2ms (~2–3x C's register-resident SROA). Escape-analysis → `alloca` (Track-8 exists; wiring `escape=false ⇒ alloca` remains) would let LLVM mem2reg+SROA close it. Low priority — the absolute gap is ~1.5ms.
+- **GAP 4: ✅ CLOSED — measured at C parity.** 10M struct dot-products (`a.x*b.x + a.y*b.y + a.z*b.z`, `V3{x,y,z}` of floats): **NOVA 157–174ms vs C 151–154ms = ~1.05x.** Struct SROA is default-on (`NOVA_NO_SROA=1` disables), so a non-escaping struct never hits the heap in the hot path — its fields become SSA values and the loop is native `fmul`/`fadd` identical to C. The only `nova_rt_struct_new` calls in the IR are the one-time `V3{...}` literal constructions *outside* the loop. The old "~2–3x, escape→alloca remains" claim was stale — the wiring already exists and is on.
 
 ---
 
@@ -107,7 +107,8 @@ let result = bytes_to_str(buf)      // O(n) once
 **None of these were architecture flaws, and most are already fixed.** NOVA's uniform Values/Processes/Channels model over an LLVM backend reaches C on integer compute today and sits within ~2–3x on float/struct/HOF code, with clear (optional) paths to close the rest. The one true O(n²) pattern — naive string `+` in a loop — has O(n) idioms (`join`, `bytes`, `bytes_append_str`). **NOVA's performance is far closer to C than this document previously claimed.**
 
 ### Remaining optional work (priority order)
-1. `elem_kind` typed float arrays (S4) — closes the last ~2x on dense-numeric/AI (nice-to-have).
-2. Escape-analysis → `alloca` wiring (GAP 4) — closes struct SROA (~1.5ms, low priority).
-3. Whole-program monomorphization (GAP 3) — erases trivial-lambda overhead (hard; needs sound use-set analysis).
-4. Automatic `s = s + x` rewrite (GAP 5 ergonomics) — needs capacity-carrying strings (separately validated).
+1. Loop-level float-array specialization — hoist the `elem_kind==2` guard out of a read-only float loop so LLVM vectorizes it, or a first-class `[float]` typed-array type (closes the last ~2x on dense-numeric/AI; sizeable feature — see GAP 2).
+2. Whole-program monomorphization (GAP 3) — erases trivial-lambda overhead (hard; needs sound use-set analysis).
+3. Automatic `s = s + x` rewrite (GAP 5 ergonomics) — needs capacity-carrying strings (separately validated).
+
+*(GAP 4 escape→alloca is DONE — struct SROA is default-on and measured at C parity; removed from this list 2026-07-05.)*
