@@ -4463,8 +4463,29 @@ int64_t nova_rt_mul(int64_t a, int64_t b) {
 int64_t nova_rt_div(int64_t a, int64_t b) {
     if (nova_is_likely_float(a) || nova_is_likely_float(b))
         return nova_rt_box_float(nova_from_double(nova_to_double(a) / nova_to_double(b)));
-    if (b == 0) return 0;
+    if (b == 0) return 0;                                 /* CORE_GAP 0.2: x/0 is defined 0, never UB */
+    if (b == -1) return (int64_t)(0ULL - (uint64_t)a);    /* CORE_GAP 0.2: INT64_MIN/-1 wraps (no sdiv overflow UB) */
     return a / b;
+}
+
+/* CORE_GAP 0.2/0.3: integer/float modulo. Box-aware (a boxed float operand -> fmod, matching nova_rt_div's
+   float division) so `%` on an `any`/boxed value is never a srem on pointer bits; and x%0 / INT64_MIN%-1 are
+   defined (0) rather than UB. For raw ints this returns exactly a%b -- identical to the old inline srem. */
+int64_t nova_rt_mod(int64_t a, int64_t b) {
+    if (nova_is_likely_float(a) || nova_is_likely_float(b))
+        return nova_rt_box_float(nova_from_double(fmod(nova_to_double(a), nova_to_double(b))));
+    if (b == 0) return 0;
+    if (b == -1) return 0;                                /* a % -1 == 0 for all a (avoids INT64_MIN%-1 UB) */
+    return a % b;
+}
+
+/* CORE_GAP 0.3: unary negation. Box-aware -- a boxed float negates as a float (was `sub i64 0, x` on the box
+   POINTER = garbage); a boxed bool negates its int value. For raw ints this is -a with a defined two's-complement
+   wrap for INT64_MIN (matching the old `sub i64 0, x`, which also wrapped). */
+int64_t nova_rt_neg(int64_t a) {
+    if (nova_is_likely_float(a))
+        return nova_rt_box_float(nova_from_double(-nova_to_double(a)));
+    return (int64_t)(0ULL - (uint64_t)a);
 }
 
 int64_t nova_rt_print_float(int64_t bits) {
