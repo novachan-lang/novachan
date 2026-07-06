@@ -8,8 +8,8 @@
 #   2. Perf-regression gate  -> scalar/float/struct stay C-level native (no re-boxing)
 #   3. Full regression       -> NORMAL mode + NOVA_T8_FULLRC mode (all tests, both RC paths)
 #
-# Usage:  powershell -ExecutionPolicy Bypass -File ./nova_ci.ps1   [-SkipReconverge]  [-Quick]
-param([switch]$SkipReconverge, [switch]$Quick)
+# Usage:  powershell -ExecutionPolicy Bypass -File ./nova_ci.ps1   [-SkipReconverge]  [-Quick]  [-SkipPerfTrack]
+param([switch]$SkipReconverge, [switch]$Quick, [switch]$SkipPerfTrack)
 Set-Location $PSScriptRoot
 $ErrorActionPreference = "Continue"
 
@@ -29,6 +29,18 @@ if (-not $SkipReconverge) {
 Write-Host "`n[CI 2/3] Perf-regression gate..."
 & .\_perf_gate.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2 (perf regression) ==="; exit 1 }
+
+# CORE_GAP 2.5: continuous perf TRACKING. Run the timed bench harness and append one record per
+# (bench,mode) to bench/history.jsonl, then compare vs the previous commit. NON-FATAL: absolute times
+# on this host are tiny (0-42 ms) and memory-pressure-noisy, so a timing wobble must NOT red the CI.
+# The FATAL codegen-regression guard is _perf_gate.ps1 above (native-op check). This stage makes every
+# perf change *measured* over time (the 2.5 gap) without introducing flaky failures. -SkipPerfTrack to skip.
+if (-not $SkipPerfTrack) {
+    Write-Host "`n[CI 2/3b] Perf TRACKING (bench history append, non-fatal)..."
+    & (Join-Path $PSScriptRoot "..\..\bench\run_bench.ps1") 2>&1 | Write-Host
+    & (Join-Path $PSScriptRoot "..\..\bench\regression_check.ps1") -Threshold 40 2>&1 | Write-Host
+    Write-Host "  (perf tracking is informational; see bench/history.jsonl)"
+}
 
 Write-Host "`n[CI 2c/3] #25 C-ABI @export gate (NOVA lib called from a pure-C host)..."
 & .\_s25_export_check.ps1
