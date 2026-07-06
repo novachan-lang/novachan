@@ -66,6 +66,10 @@ Write-Host "`n[CI 2b/3] N>1 multi-core gate (concurrency flagships at NOVA_CARRI
 & .\_n_carriers_ci.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2b (N>1 concurrency regression) ==="; exit 1 }
 
+Write-Host "`n[CI 2k/3] Negative type-error gate (Tier 1.5 - wrong programs MUST be rejected)..."
+& .\_neg_type_tests.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2k (negative type-error soundness) ==="; exit 1 }
+
 Write-Host "`n[CI 3/3] Full regression (NORMAL)..."
 Remove-Item Env:NOVA_T8_FULLRC -ErrorAction SilentlyContinue
 & .\_run_final_regression.ps1
