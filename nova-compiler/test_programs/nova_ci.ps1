@@ -62,6 +62,10 @@ Write-Host "`n[CI 2g/3] #32 semantic-LSP gate (hover returns the real function s
 & .\_s32_hover_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2g (LSP hover signature) ==="; exit 1 }
 
+Write-Host "`n[CI 2g2/3] #32b semantic-LSP diagnostics gate (CORE_GAP 6.4: real errors flagged, modern features clean)..."
+& .\_s32b_lsp_diag_check.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2g2 (LSP diagnostics / false positives) ==="; exit 1 }
+
 Write-Host "`n[CI 2h/3] #35 const-fn-eval gate (compile-time fold of const fn calls; fold==runtime)..."
 & .\_s35_constfn_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2h (const-fn-eval) ==="; exit 1 }
