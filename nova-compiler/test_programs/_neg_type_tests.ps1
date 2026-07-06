@@ -51,6 +51,13 @@ Test-ShouldReject "_negty_fieldtype.nova"  "type mismatch"
 Test-ShouldReject "_negty_exhaustive.nova" "non-exhaustive"
 Test-ShouldReject "_negty_traitconf.nova"  "does not fully implement"
 
+# Previously-orphaned negative tests reclaimed from the *_test.nova sweep (CORE_GAP 7.3): real programs
+# the compiler MUST reject. These broaden soundness coverage beyond the _negty_* minimal repros.
+Test-ShouldReject "trait_bounds_fail_test.nova"   "does not implement trait"
+Test-ShouldReject "trait_unknown_test.nova"       "unknown trait"
+Test-ShouldReject "ffi_unsafe_required_test.nova" "requires an enclosing 'unsafe'"
+Test-ShouldReject "multi_error_test.nova"         "expected"
+
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"
 if ($fail -gt 0) { exit 1 } else { exit 0 }
