@@ -84,7 +84,21 @@ See [MASTER_EXECUTION_PLAN.md](NOVA_DESIGN/MASTER_EXECUTION_PLAN.md) for the com
 ### The Rule
 Nothing moves forward until the step before it is validated. Every change is checked against everything else. Upstream mistakes are catastrophic — a grammar error costs hours at Layer 0 but months at Layer 4.
 
-### Current Phase: Phase 0 — Language Specification
+### Current State (updated 2026-07) — NOVA is SELF-HOSTED; hardening the core
+The original phased plan (below) is long since executed. NOVA now **self-hosts**: the compiler is
+written in NOVA (~22k lines, `nova-compiler/test_programs/nova_compiler.nova`) and compiles itself to a
+**byte-identical fixpoint** (gen5.ll == gen6.ll). It has a real C runtime, an LLVM backend at C-class
+scalar speed, a working concurrency runtime, and the Forge framework on top.
+
+**The live work is the CORE_GAPS hardening campaign** — canonical plan =
+[`NOVA_DESIGN/CORE_GAPS_2026_07_03.md`](NOVA_DESIGN/CORE_GAPS_2026_07_03.md) (Tiers 0–7 with evidence).
+As of 2026-07-06: **Tier 0 (runtime soundness) is 100% closed** and **Tier 1 (type-system soundness) is
+essentially done — the type checker is now SOUND BY DEFAULT** (strict is the default; it no longer fails
+open). Remaining: Tier 2 (non-scalar/float-array perf — the real mountain), Tier 3 (exhaustive-match ADTs
++ interfaces; *generics already exist*), Tier 4 (N>1 concurrency), Tiers 5–6 (platform reach, toolchain).
+See also [`reference_implemented_status`] / `IMPLEMENTATION_AUDIT.md` for the as-built inventory.
+
+*(historical) The original Phase 0 spec steps were:*
 1. **Step 0.1: Syntax Design** — Write 10 real programs, validate each is simpler than Python
 2. **Step 0.2: Type System Rules** — Hand-trace inference on the 10 programs, prove 95%+ needs zero annotations
 3. **Step 0.3: Process/Channel Semantics** — Trace 5 execution scenarios, verify ownership is always clear
@@ -101,7 +115,11 @@ Nothing moves forward until the step before it is validated. Every change is che
 ### Build Order
 Phase 0 (Specification) → Phase 1 (Frontend) → Phase 2 (Semantic Analysis) → Phase 3 (IR) → Phase 4 (Codegen) → Phase 5 (Runtime) → Phase 6 (Stdlib) → Phase 7 (Toolchain)
 
-Compiler written in Java (creator's strongest language). Self-hosting in NOVA is Phase 8+.
+**The compiler is SELF-HOSTED in NOVA** (`nova-compiler/test_programs/nova_compiler.nova`, ~22k lines);
+it self-compiles to a byte-identical fixpoint. (The original bootstrap was written in Java — that is
+historical; do NOT edit Java sources expecting them to be the live compiler.) The canonical build/verify
+loop: edit `nova_compiler.nova` → build gen4 with `gen3_test.exe` → 3-pass reconverge (gen5.ll == gen6.ll)
+→ both-mode regression via `nova_ci.ps1` → commit. Kill-on-timeout is mandatory for every binary run.
 
 ---
 
