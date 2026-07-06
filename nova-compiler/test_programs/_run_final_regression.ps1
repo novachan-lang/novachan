@@ -488,7 +488,17 @@ $concurrency_tests = @(
     'http_offload_test'
 )
 
-$all_tests = $core_tests + $track7_tests + $new_tests + $domain_tests + $concurrency_tests
+# CORE_GAP 7.3 — orphan-coverage: previously-unwired *_test.nova feature tests, confirmed clean in BOTH
+# NORMAL and FULLRC modes, loaded from a manifest FILE ("one manifest; every test in the gate"). This
+# closes the "features regress silently" hole for ~190 core-language features. Data, not code — append
+# newly-classified CLEAN orphans to _orphan_coverage_manifest.txt (see _classify_orphans.ps1).
+$orphan_manifest = "$PSScriptRoot\_orphan_coverage_manifest.txt"
+$orphan_coverage_tests = @()
+if (Test-Path $orphan_manifest) {
+    $orphan_coverage_tests = @(Get-Content $orphan_manifest | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" -and -not $_.StartsWith("#") })
+}
+
+$all_tests = @($core_tests + $track7_tests + $new_tests + $domain_tests + $concurrency_tests + $orphan_coverage_tests | Select-Object -Unique)
 
 # Server-binding tests run their OWN in-process green TCP server + client (real I/O). Running
 # many concurrently starves the green server's scheduling under CPU load -> intermittent
