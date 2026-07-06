@@ -7,7 +7,8 @@ Run after run_bench.ps1 in CI.
 #>
 
 param(
-    [int]$Threshold = 20    # percent slower allowed
+    [int]$Threshold = 20,     # percent slower allowed
+    [int]$MinCompareMs = 100  # skip benches with baseline < this (too noisy to compare reliably)
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +48,16 @@ foreach ($g in $groups) {
 
     $curr = $byCommit[$distinctCommits[0]]
     $prev = $byCommit[$distinctCommits[1]]
+
+    # Skip benches whose baseline time is too small to compare reliably: at <100 ms, host scheduling
+    # jitter (esp. under memory pressure) dominates and a wobble like 42->80 ms reads as "+90%" even
+    # with the identical compiler. Comparing noise produces false regressions. (Fix the SIGNAL by
+    # making such benches iterate more; until then, don't flag them.)
+    if ($prev.elapsed_ms -lt $MinCompareMs) {
+        Write-Host "skip $($curr.bench) ($($curr.mode)): baseline $($prev.elapsed_ms) ms < ${MinCompareMs} ms (too noisy to compare)"
+        continue
+    }
+
     $delta = 0
     if ($prev.elapsed_ms -gt 0) {
         $delta = [int]((($curr.elapsed_ms - $prev.elapsed_ms) * 100) / $prev.elapsed_ms)
