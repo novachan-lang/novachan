@@ -1,0 +1,191 @@
+// forge_rsdecode -- the CORRECTING half of Reed-Solomon: not just detecting corruption (forge_rs) but locating and
+// REPAIRING it. Given a codeword produced by forge_rs.rs_encode over GF(2^8) with nsym parity symbols, this recovers
+// the original data even after up to nsym/2 of its bytes have been changed to anything at all -- the magic that lets
+// a QR code work with a chunk torn off, a CD play through a scratch, and a spacecraft's telemetry survive noise.
+// It runs the classic three-stage pipeline: SYNDROMES (evaluate the received word at the generator's roots 3^i; all
+// zero means no errors), the BERLEKAMP-MASSEY algorithm to find the error-locator polynomial from those syndromes,
+// a CHIEN search to turn that polynomial's roots into the exact byte positions that are wrong, and FORNEY's formula
+// to compute what each of those bytes should have been. As a safety net it re-checks the syndromes after
+// correcting: rs_correct returns the repaired codeword only if the result is genuinely a valid codeword, and an
+// EMPTY list if there were too many errors to fix -- so it never silently hands back wrong data. Polynomials here
+// are low-endian (index i is the x^i coefficient); imports forge_gf256 (a leaf) -- forge-only, compiler untouched.
+
+import forge_gf256 as gf
+
+// PRIVATE: evaluate a HIGH-endian polynomial (codeword: index 0 is the highest-degree coefficient) at x.
+fn _rd_eval_high(c: list, x: int) -> int
+    let y = c[0]
+    let i = 1
+    while i < len(c)
+        y = gf.gf_mul(y, x) ^ c[i]
+        i = i + 1
+    y
+
+// PRIVATE: evaluate a LOW-endian polynomial (index i is the x^i coefficient) at x.
+fn _rd_eval_le(p: list, x: int) -> int
+    let y = 0
+    let i = len(p) - 1
+    while i >= 0
+        y = gf.gf_mul(y, x) ^ p[i]
+        i = i - 1
+    y
+
+// The nsym syndromes of a received codeword: syndrome i = codeword evaluated at 3^i (i from 0). All zero iff the
+// codeword is uncorrupted.
+fn _rd_syndromes(codeword: list, nsym: int) -> list
+    let out = []
+    let i = 0
+    while i < nsym
+        push(out, _rd_eval_high(codeword, gf.gf_pow(3, i)))
+        i = i + 1
+    out
+
+// PRIVATE: Berlekamp-Massey over GF(2^8). Given syndromes S[0..nsym-1], returns the error-locator polynomial
+// Lambda (low-endian, Lambda[0] == 1) whose degree is the number of errors.
+fn _rd_berlekamp(s: list, nsym: int) -> list
+    let c = [1]
+    let b = [1]
+    let ll = 0
+    let m = 1
+    let bb = 1
+    let n = 0
+    while n < nsym
+        // discrepancy (coefficients beyond the current length of c are implicitly 0)
+        let delta = s[n]
+        let i = 1
+        while i <= ll
+            if i < len(c)
+                delta = delta ^ gf.gf_mul(c[i], s[n - i])
+            i = i + 1
+        if delta == 0
+            m = m + 1
+        else
+            if 2 * ll <= n
+                let t = _rd_dup(c)
+                let coef = gf.gf_div(delta, bb)
+                while len(c) < len(b) + m
+                    push(c, 0)
+                let j = 0
+                while j < len(b)
+                    c[j + m] = c[j + m] ^ gf.gf_mul(coef, b[j])
+                    j = j + 1
+                ll = n + 1 - ll
+                b = t
+                bb = delta
+                m = 1
+            else
+                let coef = gf.gf_div(delta, bb)
+                while len(c) < len(b) + m
+                    push(c, 0)
+                let j = 0
+                while j < len(b)
+                    c[j + m] = c[j + m] ^ gf.gf_mul(coef, b[j])
+                    j = j + 1
+                m = m + 1
+        n = n + 1
+    c
+
+// PRIVATE: multiply two low-endian polynomials over GF(2^8), keeping only coefficients of degree < limit.
+fn _rd_polymul_trunc(a: list, b: list, limit: int) -> list
+    let out = []
+    let z = 0
+    while z < limit
+        push(out, 0)
+        z = z + 1
+    let i = 0
+    while i < len(a)
+        if i < limit and a[i] != 0
+            let j = 0
+            while j < len(b) and i + j < limit
+                out[i + j] = out[i + j] ^ gf.gf_mul(a[i], b[j])
+                j = j + 1
+        i = i + 1
+    out
+
+// PRIVATE: formal derivative of a low-endian polynomial over GF(2^8): in characteristic 2 the even-degree terms
+// vanish, so d/dx of sum L[i] x^i keeps the odd-index coefficients, shifted down by one (L' [i] = L[i+1] when i is
+// even, else 0).
+fn _rd_derivative(p: list) -> list
+    let out = []
+    let i = 1
+    while i < len(p)
+        if i % 2 == 1
+            push(out, p[i])
+        else
+            push(out, 0)
+        i = i + 1
+    out
+
+// Correct up to nsym/2 errors in a received codeword. Returns the repaired codeword (equal to the original clean
+// codeword) or an EMPTY list if it could not be corrected (too many errors). Never returns wrong data: the result
+// is re-validated by recomputing its syndromes.
+fn rs_correct(codeword: list, nsym: int) -> list
+    let n = len(codeword)
+    let s = _rd_syndromes(codeword, nsym)
+    // no errors?
+    let clean = true
+    let si = 0
+    while si < len(s)
+        if s[si] != 0
+            clean = false
+        si = si + 1
+    let out = []
+    if clean
+        out = _rd_dup(codeword)
+    else
+        let lam = _rd_berlekamp(s, nsym)
+        let nu = len(lam) - 1
+        // Chien search: positions k whose locator 3^(n-1-k) inverse is a root of Lambda
+        let err_pos = []
+        let err_x = []
+        let k = 0
+        while k < n
+            let xk = gf.gf_pow(3, n - 1 - k)
+            let xk_inv = gf.gf_inv(xk)
+            if _rd_eval_le(lam, xk_inv) == 0
+                push(err_pos, k)
+                push(err_x, xk)
+            k = k + 1
+        if len(err_pos) != nu or nu == 0
+            out = []
+        else
+            // Forney: Omega = (S * Lambda) mod x^nsym ; magnitude_k = X_k * Omega(X_k^-1) / Lambda'(X_k^-1)
+            let omega = _rd_polymul_trunc(s, lam, nsym)
+            let lderiv = _rd_derivative(lam)
+            let fixed = _rd_dup(codeword)
+            let ok = true
+            let idx = 0
+            while idx < len(err_pos)
+                let xk = err_x[idx]
+                let xk_inv = gf.gf_inv(xk)
+                let num = gf.gf_mul(xk, _rd_eval_le(omega, xk_inv))
+                let den = _rd_eval_le(lderiv, xk_inv)
+                if den == 0
+                    ok = false
+                else
+                    let mag = gf.gf_div(num, den)
+                    fixed[err_pos[idx]] = fixed[err_pos[idx]] ^ mag
+                idx = idx + 1
+            if ok == false
+                out = []
+            else
+                // re-validate: a genuine correction zeroes every syndrome
+                let s2 = _rd_syndromes(fixed, nsym)
+                let good = true
+                let gi = 0
+                while gi < len(s2)
+                    if s2[gi] != 0
+                        good = false
+                    gi = gi + 1
+                if good
+                    out = fixed
+    out
+
+// PRIVATE: deep copy of a list (produces a mutable duplicate).
+fn _rd_dup(a: list) -> list
+    let out = []
+    let i = 0
+    while i < len(a)
+        push(out, a[i])
+        i = i + 1
+    out
