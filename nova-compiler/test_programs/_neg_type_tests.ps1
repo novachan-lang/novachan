@@ -44,6 +44,7 @@ Test-ShouldReject "_negty_arity.nova"      "expects 2 arguments"
 Test-ShouldReject "_negty_rettype.nova"    "type mismatch"
 Test-ShouldReject "_negty_argtype.nova"    "type mismatch"
 Test-ShouldReject "_negty_undeclared.nova" "unknown identifier"
+Test-ShouldReject "_negty_recursive.nova"  "recursive type"
 
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"
