@@ -509,8 +509,13 @@ static inline int nova_strpool_rc_dec(const void* ptr) {
     nova_strpool_acquire();
     int idx = (int)(((const char*)ptr - nova_strpool_data[0]) / NOVA_STRPOOL_SLOT_SIZE);
     int freed = 0;
-    if (--nova_strpool_rc[idx] <= 0) {
-        nova_strpool_stack[++nova_strpool_top] = idx;
+    /* CORE_GAP 0.5: only free on the 1->0 transition, and NEVER re-push an already-freed slot.
+       The old `--rc <= 0` re-pushed a slot on every double-dec (handing the same slot out twice AND
+       driving nova_strpool_top past the end of nova_strpool_stack -> OOB write). Guard the double-dec
+       (rc already <= 0 is a no-op) and bound the push so top can never exceed the buffer. */
+    if (nova_strpool_rc[idx] > 0 && --nova_strpool_rc[idx] == 0) {
+        if (nova_strpool_top < NOVA_STRPOOL_COUNT - 1)
+            nova_strpool_stack[++nova_strpool_top] = idx;
         freed = 1;
     }
     nova_strpool_release();
@@ -1574,9 +1579,12 @@ int64_t nova_rt_list_set(int64_t handle, int64_t index, int64_t value) {
         nova_set_error(buf);
         return 0;
     }
+    /* CORE_GAP 0.1: inc-before-dec so a self-assign `arr[i]=arr[i]` on a uniquely-held (rc==1) element
+       does not free-then-use it. inc(value) first pins the incoming handle (rc 1->2), so dec of the old
+       slot (== value on a self-store) drops 2->1 and never frees. Both are no-ops on non-heap values. */
+    nova_rc_inc(value);
     nova_rc_dec(list->data[index]);
     list->data[index] = value;
-    nova_rc_inc(value);
     return 0;
 }
 
@@ -1657,7 +1665,11 @@ int64_t nova_rt_list_remove_at(int64_t handle, int64_t index) {
 }
 
 int64_t nova_rt_list_len(int64_t handle) {
-    NovaList* list = (NovaList*)(uintptr_t)handle;
+    /* CORE_GAP 0.4: guard the ->size read. A NULL handle (e.g. list_create OOM) or a mistyped `any`
+       handle (unsound inference degrading to a non-list) must not be dereferenced as a NovaList. */
+    void* p = (void*)(uintptr_t)handle;
+    if (!p || nova_mem_find_tag(p) != NOVA_MEM_LIST) return 0;
+    NovaList* list = (NovaList*)p;
     return list->size;
 }
 
@@ -2471,9 +2483,10 @@ int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
     while (d->idx[slot] != DICT_IDX_EMPTY) {
         int64_t ei = d->idx[slot];
         if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str)) {
+            /* CORE_GAP 0.1: inc-before-dec so `d[k]=d[k]` on a uniquely-held (rc==1) value is safe. */
+            nova_rc_inc(val);
             nova_rc_dec(d->vals[ei]);
             d->vals[ei] = val;
-            nova_rc_inc(val);
             return 0;
         }
         slot = (slot + 1) & (d->idx_cap - 1);
@@ -2869,7 +2882,10 @@ int64_t nova_rt_deep_copy(int64_t v) {
 }
 
 int64_t nova_rt_dict_len(int64_t handle) {
-    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    /* CORE_GAP 0.4: guard the ->size read against a NULL or mistyped (non-dict) handle. */
+    void* p = (void*)(uintptr_t)handle;
+    if (!p || nova_mem_find_tag(p) != NOVA_MEM_DICT) return 0;
+    NovaDict* d = (NovaDict*)p;
     return d->size;
 }
 
