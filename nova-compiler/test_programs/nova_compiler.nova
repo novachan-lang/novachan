@@ -6174,6 +6174,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare i64 @nova_rt_div(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_mod(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_neg(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_truthy(i64) nounwind readonly")
     emit(cg, "declare i64 @nova_rt_eq(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_neq(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_any_to_str(i64) nounwind")
@@ -14991,9 +14992,66 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                 push(new_insts, IrInst("call", fbr, ir_type_float(), [args[1]], "nova_rt_unbox", 0, "pure", line))
                                 push(new_insts, IrInst(op, dest, typ, [args[0], fbr], value, num, effect, line))
                                 handled = true
+                        else if op == "not" or op == "and" or op == "or"
+                            // CORE_GAP 0.7: a not/and/or on an `any`-typed operand (a boxed
+                            // value used directly as a boolean, e.g. `not fs[0]`) must be
+                            // coerced via nova_rt_truthy first — a boxed 0.0 is a non-null
+                            // pointer, so the emitter's raw `icmp {ne,eq} i64 <ptr>, 0` reads
+                            // it truthy. We push the coercion here (same pattern as the
+                            // widen-box above) and leave the emitter untouched: its raw icmp
+                            // now runs on a clean 0/1 int. Only rewrite when an operand is
+                            // `any`, so typed bool/int code stays byte-identical.
+                            // "val" is the generic index_get/dynamic egress label (a boxed value,
+                            // e.g. fs[0]); "any" is the other dynamic slot. BOTH may hold a boxed
+                            // float and must be coerced. Raw "float"/"int"/"bool" operands are left
+                            // untouched (byte-identical + already correct: raw 0.0 = bits 0 = falsy).
+                            let bool_any = false
+                            for ba in args
+                                let bat = ir_reg_type(rt, ba)
+                                if bat == "any" or bat == "val"
+                                    bool_any = true
+                            if bool_any
+                                let co_args = []
+                                for ca in args
+                                    let cat = ir_reg_type(rt, ca)
+                                    if cat == "any" or cat == "val"
+                                        let tbc = 0
+                                        if contains(rt, "@wbox@")
+                                            tbc = rt["@wbox@"]
+                                        let tbr = "%wbox" + str(tbc)
+                                        rt["@wbox@"] = tbc + 1
+                                        push(new_insts, IrInst("call", tbr, ir_type_int(), [ca], "nova_rt_truthy", 0, "pure", line))
+                                        push(co_args, tbr)
+                                    else
+                                        push(co_args, ca)
+                                push(new_insts, IrInst(op, dest, typ, co_args, value, num, effect, line))
+                                handled = true
                 if not handled
                     push(new_insts, ti)
-            IrBlock(label, new_insts, terminator)
+            // CORE_GAP 0.7: a `branch` on an `any`-typed condition (a boxed value used
+            // directly, e.g. `if fs[0]`) has the same boxed-0.0-reads-truthy bug. Coerce
+            // the condition via nova_rt_truthy and rewrite the terminator. Only the `any`
+            // case is touched; typed conditions keep the raw branch icmp (byte-identical).
+            let fixed_term = terminator
+            match terminator
+                IrInst(btop, btdest, bttyp, btargs, btval, btnum, bteff, btline) =>
+                    let bcond_t = ""
+                    if btop == "branch" and len(btargs) > 0
+                        bcond_t = ir_reg_type(rt, btargs[0])
+                    if btop == "branch" and len(btargs) > 0 and (bcond_t == "any" or bcond_t == "val")
+                        let brc = 0
+                        if contains(rt, "@wbox@")
+                            brc = rt["@wbox@"]
+                        let brr = "%wbox" + str(brc)
+                        rt["@wbox@"] = brc + 1
+                        push(new_insts, IrInst("call", brr, ir_type_int(), [btargs[0]], "nova_rt_truthy", 0, "pure", btline))
+                        let br_args = [brr]
+                        let bri = 1
+                        while bri < len(btargs)
+                            push(br_args, btargs[bri])
+                            bri = bri + 1
+                        fixed_term = IrInst(btop, btdest, bttyp, br_args, btval, btnum, bteff, btline)
+            IrBlock(label, new_insts, fixed_term)
 
 fn ir_infer_types(func: IrFunction, frt: dict, fpt: dict) -> IrFunction
     match func
@@ -17467,6 +17525,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_div(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_mod(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_neg(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_truthy(i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_eq(i64, i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_neq(i64, i64) nounwind readonly")
     ire_line(e, "declare i64 @nova_rt_any_to_str(i64) nounwind")

@@ -4488,6 +4488,22 @@ int64_t nova_rt_neg(int64_t a) {
     return (int64_t)(0ULL - (uint64_t)a);
 }
 
+/* CORE_GAP 0.7: box-aware truthiness for a DYNAMIC (any-typed) condition operand.
+   A boxed float 0.0 is a non-null pointer, so a raw `icmp ne i64 <ptr>, 0` would
+   read it as truthy — but 0.0 must be falsy (C-style truthiness). Returns a clean
+   1/0 the caller feeds to the usual icmp. Only emitted for `any`-typed conditions
+   (if/while/not/and/or on a boxed value); statically int/bool/float conditions keep
+   the raw icmp and never reach here. Boxed float -> d != 0.0; other boxed kinds ->
+   truthy (non-null, unchanged semantics); raw int -> v != 0. */
+int64_t nova_rt_truthy(int64_t v) {
+    if (nova_is_box(v)) {
+        NovaBox* bx = (NovaBox*)(uintptr_t)v;
+        if (bx->kind == NOVA_BOX_FLOAT) { double d; memcpy(&d, &bx->payload, 8); return d != 0.0 ? 1 : 0; }
+        return 1;
+    }
+    return v != 0 ? 1 : 0;
+}
+
 int64_t nova_rt_print_float(int64_t bits) {
     int64_t s = nova_rt_float_to_str(bits);
     puts((const char*)(uintptr_t)s);

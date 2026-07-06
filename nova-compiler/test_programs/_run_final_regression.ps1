@@ -44,7 +44,8 @@ $core_tests = @(
     'prof_test','demo_sqlite_test','demo_sqlite_bind_test','sqlitex_test','forge_db_test','forge_typed_db_test','forge_hero_test','demo_forge_crud_test','forge_typed_query_test','forge_orm_test','_orm_null_test','_mysql_test','demo_http_server_test','demo_forge_test','demo_forge_v2_test',
     'demo_forge_todo_test','demo_cortex_serve_test','demo_pulse_test','demo_mesh_test','demo_sentinel_test',
     'demo_ops_test','demo_reactor_test','demo_prism_test','demo_edge_test','demo_full_stack_test','demo_frameworks_v2_test',
-    't8_w5_test','t8_w5b_test','t8_w5b_auto','t8_w6_test','t8_w7_test','t8_soundness_test','t8_channel_test','t8_w8_test'
+    't8_w5_test','t8_w5b_test','t8_w5b_auto','t8_w6_test','t8_w7_test','t8_soundness_test','t8_channel_test','t8_w8_test',
+    '_truthmodel_test'
 )
 
 # Track 7 stdlib breadth tests
