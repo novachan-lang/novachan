@@ -23,7 +23,18 @@ if (-not $SkipReconverge) {
     & .\_bootstrap_reconverge_slow.ps1
     if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 1 (reconverge/divergence) ==="; exit 1 }
 } else {
-    Write-Host "`n[CI 1/3] Reconverge SKIPPED (-SkipReconverge)"
+    # CORE_GAP 7.4 — do NOT let the self-hosting check be skipped SILENTLY. Reconverge (gen5.ll==gen6.ll)
+    # is the ONLY proof the compiler still compiles itself byte-identically; skipping it on a commit that
+    # touches the compiler/runtime can merge a compiler that no longer converges. -SkipReconverge is for
+    # fast inner-loop iteration on test/doc-only changes ONLY. Make the bypass loud + auditable.
+    Write-Host ""
+    Write-Host "  ############################################################################"
+    Write-Host "  ##  WARNING: BOOTSTRAP RECONVERGE SKIPPED (-SkipReconverge)                ##"
+    Write-Host "  ##  The self-hosting byte-identical fixpoint was NOT checked.              ##"
+    Write-Host "  ##  This is SAFE ONLY for test/doc-only changes. NEVER use -SkipReconverge ##"
+    Write-Host "  ##  to gate a commit that touches nova_compiler.nova or the runtime.       ##"
+    Write-Host "  ############################################################################"
+    Write-Host ""
 }
 
 Write-Host "`n[CI 2/3] Perf-regression gate..."
