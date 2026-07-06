@@ -10226,6 +10226,9 @@ type TiState
     ti_trait_method_arity: dict
     ti_type_method_arity: dict
     ti_fn_ret_stypes: dict
+    ti_ret_open: bool           // TIER 1: current fn has NO concrete return annotation -> DEFERRED tolerant return join (collect returns, widen to `any` only on genuine concrete conflict AFTER ti_solve resolves them). Preserves the inferred concrete type when returns agree.
+    ti_ret_seen: list           // TIER 1: collected return-expression types for the current open fn (joined + bound to ret_var after ti_solve).
+    ti_fn_hetero: dict          // TIER 1: fn name -> 1 if its return type was widened to `any` because its returns GENUINELY DISAGREE (heterogeneous). The IR frt fixpoint must NOT refine these back to a first-return concrete type (else print/box dispatch on a non-primary-type return is wrong). Distinct from an incomplete `any` (which the IR MAY refine).
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -10295,7 +10298,7 @@ fn ti_new_named(source_lines: list, filename: string) -> TiState
     let stdlib = ti_build_stdlib()
     let _ti_strict_env = env("NOVA_TI_STRICT")
     let _ti_strict = len(_ti_strict_env) > 0 and _ti_strict_env[0] == "1"
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -10357,6 +10360,102 @@ fn ti_occurs(st: TiState, vid: int, t: NType) -> bool
 
 fn ti_constrain(st: TiState, a: NType, b: NType, line: int)
     push(st.ti_constraints, NConstraint(a, b, line))
+
+// TIER 1: return-position handling. A function WITH a concrete return annotation (is_open=false)
+// is STRICT — a `-> int` that returns a string must error, so we add the normal constraint.
+// An UN-annotated function (is_open=true) DEFERS: we COLLECT the return-expr type (which is often
+// an unresolved type var at this point) and do the join later, in ti_ret_join_bind, AFTER the
+// function's ti_solve has resolved those vars. (An earlier EAGER attempt bound ret_var to the first
+// return here and skipped var-typed returns -> float fns mis-typed -> boxed garbage. Deferring fixes that.)
+fn ti_ret_collect(st: TiState, retvar: NType, rt: NType, line: int, is_open: bool)
+    if not is_open
+        ti_constrain(st, retvar, rt, line)
+        return
+    push(st.ti_ret_seen, rt)
+
+// TIER 1: after the open function's ti_solve, JOIN the now-resolved collected return types and
+// bind ret_var once. First concrete kind seen wins; a second DIFFERENT concrete kind widens to
+// `any` (genuinely heterogeneous returns are legal — NOVA's zero-annotation, first-class `any`
+// thesis). any/var/unit/nothing are absorbed (an early `return 0` in an otherwise-unit procedure
+// keeps its inferred type; a dynamic/boxed path doesn't force widening). When all concrete returns
+// AGREE the concrete type is preserved (no perf/typing loss). Only binds if ret_var is still an
+// unbound var (a recursion/annotation may have already resolved it — leave that alone).
+// Returns true iff the return type was widened to `any` because the returns GENUINELY DISAGREE
+// (heterogeneous) — the caller records that so the IR frt fixpoint won't refine it back.
+fn ti_ret_join_bind(st: TiState, retvar: NType, seen: list, line: int) -> bool
+    let wret = ti_walk(st, retvar)
+    match wret
+        NType(wk, wn, wp, wid) =>
+            if wk != "var"
+                return false
+            // int/float/bool are mutually-coercible numerics (mirror the IR join + ti_unify's
+            // numeric rule): a fn returning float in one branch and int in another is FLOAT, not
+            // `any`. Non-numeric concrete kinds must match; numeric+non-numeric or two different
+            // non-numerics -> `any`.
+            let has_float = false
+            let has_int = false
+            let has_fn = false
+            let has_any = false             // a return is genuinely `any` (e.g. a list element / dynamic
+                                            // value) -> the whole return is `any` (DOMINANT). Distinct
+                                            // from unit/nothing/var (no-value/unresolved = absorbed).
+            let chosen_fn = nt_any()        // a function return is CALLABLE; `return f ... 0` is the
+                                            // `fn OR null` idiom (NOVA has no null for fns) -> keep the
+                                            // fn type, treat int/float as null-ish. Distinct from mixed
+                                            // DATA returns (int+str) which are genuinely heterogeneous.
+            let nonnum = ""
+            let chosen_nonnum = nt_any()    // preserve the full first non-numeric NType (keeps list<T> etc.)
+            let nonnum_conflict = false
+            for t in seen
+                let wt = ti_walk(st, t)
+                match wt
+                    NType(tk, tn, tp, tid) =>
+                        if tk == "float"
+                            has_float = true
+                        else if tk == "int" or tk == "bool"
+                            has_int = true
+                        else if tk == "fn"
+                            has_fn = true
+                            chosen_fn = wt
+                        else if tk == "any"
+                            has_any = true
+                        else if tk != "var" and tk != "unit" and tk != "nothing"
+                            if nonnum == ""
+                                nonnum = tk
+                                chosen_nonnum = wt
+                            else if nonnum != tk
+                                nonnum_conflict = true
+            let has_num = has_float or has_int
+            // A genuinely-`any` return (dynamic value) makes the whole result `any` — it dominates a
+            // concrete fallback (e.g. `return list_elem ... 0`: the fn stays callable/dynamic, not int).
+            if has_any
+                ti_bind(st, wid, nt_any())
+                return false
+            if nonnum_conflict
+                ti_bind(st, wid, nt_any())
+                return true
+            if has_fn
+                // fn + another non-numeric DATA kind (list/str/...) is genuinely mixed -> any.
+                // fn + int/float (null-ish) keeps the callable fn type.
+                if nonnum != ""
+                    ti_bind(st, wid, nt_any())
+                    return true
+                ti_bind(st, wid, chosen_fn)
+                return false
+            if nonnum != "" and has_num
+                ti_bind(st, wid, nt_any())
+                return true
+            if nonnum != ""
+                ti_bind(st, wid, chosen_nonnum)
+                return false
+            if has_float
+                ti_bind(st, wid, nt_float())
+                return false
+            if has_int
+                ti_bind(st, wid, nt_int())
+                return false
+            ti_bind(st, wid, nt_any())
+            return false
+    false
 
 fn ti_error_full(st: TiState, code: string, msg: string, line: int, help: string)
     let out = ""
@@ -12235,14 +12334,19 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                                 pt = ti_ann_to_type_g(st, ptype, gmap)
                             push(param_types, pt)
                 let ret_var = ti_fresh(st)
+                // TIER 1: a function with NO concrete return annotation is "open" -> its return type
+                // is inferred with a DEFERRED tolerant join (heterogeneous returns widen to `any`).
+                // An explicit annotation (`-> int` OR `-> any`) constrains ret_var and is strict.
+                let ret_open = true
                 match expr
                     Expr(rxt, rxv, rxn, rxc, rxf, rxl) =>
-                        if rxt == "rettype" and rxv != "" and rxv != "any"
+                        if rxt == "rettype" and rxv != ""
+                            // Constrain ret_var to the annotation for BOTH concrete types AND `any`.
+                            // (Previously `-> any` was skipped, leaving ret_var a free var that bound
+                            // to the first return and then FALSE-conflicted with heterogeneous returns.)
                             let ann_t = ti_ann_to_type_g(st, rxv, gmap)
-                            match ann_t
-                                NType(ak, an2, ap, ai) =>
-                                    if ak != "any"
-                                        ti_constrain(st, ret_var, ann_t, sline)
+                            ti_constrain(st, ret_var, ann_t, sline)
+                            ret_open = false
                 let fn_type = nt_fn(param_types, ret_var)
                 let fn_name = name
                 if fn_name == "main"
@@ -12261,6 +12365,10 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                 ti_define(st, name, fn_scheme)
                 let saved_ret = st.ti_ret_var
                 st.ti_ret_var = ret_var
+                let saved_ret_open = st.ti_ret_open
+                st.ti_ret_open = ret_open
+                let saved_ret_seen = st.ti_ret_seen
+                st.ti_ret_seen = []
                 ti_push_scope(st)
                 let pi = 0
                 for p in params
@@ -12277,12 +12385,24 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                         if lk == "nothing"
                             is_nothing = true
                 if not is_nothing
-                    ti_constrain(st, ret_var, last_t, sline)
+                    ti_ret_collect(st, ret_var, last_t, sline, ret_open)
                 unused_check_function(body, params, name, st)
                 break_continue_check(body, st)
                 ti_pop_scope(st)
                 st.ti_ret_var = saved_ret
+                st.ti_ret_open = saved_ret_open
+                // Capture this fn's collected returns, restore the outer fn's list, THEN solve.
+                let my_ret_seen = st.ti_ret_seen
+                st.ti_ret_seen = saved_ret_seen
                 ti_solve(st)
+                // TIER 1: now that ti_solve has resolved the return-expr vars, join them and bind
+                // ret_var (open fns only; annotated fns already constrained ret_var strictly). If the
+                // join widened to `any` because the returns genuinely DISAGREE, record the fn as
+                // heterogeneous so the IR frt fixpoint keeps it `any` (correct print/box dispatch).
+                if ret_open
+                    let _het = ti_ret_join_bind(st, ret_var, my_ret_seen, sline)
+                    if _het
+                        st.ti_fn_hetero[fn_name] = 1
                 let _mu_last_line = -1
                 if len(body) > 0
                     match body[len(body) - 1]
@@ -12478,7 +12598,7 @@ fn ti_infer_stmt_inner(st: TiState, stmt: Stmt) -> NType
                     Expr(et, ev, en, ec, ef, eln) =>
                         if et != "null" or ev != "" or en != 0
                             let rt = ti_infer_expr(st, expr)
-                            ti_constrain(st, st.ti_ret_var, rt, sline)
+                            ti_ret_collect(st, st.ti_ret_var, rt, sline, st.ti_ret_open)
                             return nt_nothing()
                 return nt_nothing()
             if tag == "yield"
@@ -15133,6 +15253,24 @@ fn ir_analyze_return_type(func: IrFunction, frt: dict, fpt: dict) -> string
                 rt = {}
                 for block in blocks
                     ir_infer_block(rt, st, frt, {}, block)
+            // TIER 1: JOIN all return types (mirror of the ti_-level tolerant return join) —
+            // genuinely heterogeneous CONCRETE returns (e.g. int in one branch, string in another)
+            // widen to "any" so callers dispatch print_any / box correctly, instead of narrowing to
+            // the FIRST return's type (which mis-typed a later string return as int -> garbage).
+            // CRITICAL: an "any"/"val" return is a DYNAMIC path (a container element, a generic call
+            // result) — it does NOT force widening; a concrete type wins over it. Otherwise a
+            // float-returning fn with one boxed/dynamic path would over-widen float->any and the raw
+            // double would be read as a boxed pointer (the math3d/physics2d e-156 regression).
+            // Consistent concrete returns keep their type (no perf loss); an "any" result leaves frt
+            // at its default any (the caller only pins non-any).
+            // NOTE: this returns the FIRST return's register type (single/consistent-return fns).
+            // A tolerant JOIN here (to type heterogeneous-return call results as `any` for correct
+            // print/box dispatch) was tried and REVERTED — it perturbs the S4 floatlist/param-type
+            // fixpoint (this fn runs interleaved with ir_collect_param_types), de-typing float list
+            // params -> boxed reads -> math3d/physics2d e-156. The TYPE-CHECKING correctness (the 7
+            // false-rejections that block the budget fix) is handled at the ti_ level, which does NOT
+            // touch this analysis. Heterogeneous-return print DISPATCH remains a separate follow-up
+            // that must be made S4-aware. See CORE_GAPS 1.0 / TIER1_BUDGET_ANALYSIS.md.
             for block in blocks
                 match block
                     IrBlock(label, insts, terminator) =>
@@ -18501,7 +18639,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
                     if contains(frt, fname)
                         old_type = frt[fname]
                     let new_type = ir_analyze_return_type(ir_fn, frt, fpt)
-                    if new_type != old_type and new_type != "any"
+                    // TIER 1: a GENUINELY heterogeneous fn (ti_ widened its return to `any` on a real
+                    // conflict) must STAY `any` — do not refine it to a first-return concrete type, or
+                    // callers mis-dispatch print/box on the non-primary-type returns. (Incomplete-`any`
+                    // fns are NOT in ti_fn_hetero, so the IR may still refine those for perf.)
+                    if new_type != old_type and new_type != "any" and not contains(ti_state.ti_fn_hetero, fname)
                         frt[fname] = new_type
                         changed = true
     fpt = ir_collect_param_types(all_fns, frt, _s5_tramp_map)

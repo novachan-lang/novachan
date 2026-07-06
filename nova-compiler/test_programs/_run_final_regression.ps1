@@ -45,7 +45,7 @@ $core_tests = @(
     'demo_forge_todo_test','demo_cortex_serve_test','demo_pulse_test','demo_mesh_test','demo_sentinel_test',
     'demo_ops_test','demo_reactor_test','demo_prism_test','demo_edge_test','demo_full_stack_test','demo_frameworks_v2_test',
     't8_w5_test','t8_w5b_test','t8_w5b_auto','t8_w6_test','t8_w7_test','t8_soundness_test','t8_channel_test','t8_w8_test',
-    '_truthmodel_test'
+    '_truthmodel_test','_hetreturn_test'
 )
 
 # Track 7 stdlib breadth tests
