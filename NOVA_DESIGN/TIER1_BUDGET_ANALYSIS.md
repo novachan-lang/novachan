@@ -87,3 +87,63 @@ NOVA's recursive **nominal** structs (`type Node ... next: Node`) do **not** cre
 var-cycles (they're nominal), so they won't trip this. Still needs reconverge + full regression
 (the compiler's own source must not contain a legitimate var-cycle that currently rides the
 silent-degrade path). Effort: S. Do after 1.1.
+
+---
+
+## ★ THE REAL 1.1/1.2 BLOCKER (discovered 2026-07-06): strict-mode surfaces 7 return-inference false-rejections
+
+**What happened.** `NOVA_TI_STRICT=1 ./gen3_test.exe nova_compiler.nova` fails with **7 type
+errors** — so the "IrInst arity" comment at `:10583` is *not* stale; strict genuinely can't be the
+default yet. But the deeper find: **any budget fix that increases checking (per-drain reset OR a
+raised cap) surfaces these SAME 7 errors** — they are ordinary type-mismatch errors detected once
+more unifications complete, NOT budget-exhaustion errors. The budget hole was *masking* them. So
+these 7 must be resolved BEFORE (or together with) any budget change, or the budget change breaks
+the compiler's own self-compile.
+
+**The 7, two classes (both = return-position inference is too strict):**
+- **Class A (2) — `-> any` heterogeneous returns.** `eval_expr(env, e) -> any` returns bool
+  (`==`), string (`str(...)`), int (`len(...)`), … Root cause: at
+  [nova_compiler.nova:12240-12245](../nova-compiler/test_programs/nova_compiler.nova#L12240) the
+  code *skips* constraining `ret_var` to the annotation when the annotation is `any` (guards
+  `rxv != "any"` + `if ak != "any"`). So `ret_var` stays a free var, binds to the *first* concrete
+  return, then conflicts with the rest. **A `-> any` function should accept any return type.**
+- **Class B (5) — unannotated procedure with `return 0` early-exit + unit fall-through.**
+  e.g. `move_expr_uses` ([:12909](../nova-compiler/test_programs/nova_compiler.nova#L12909)) uses
+  `return 0` as "return early" (the 0 is a dummy) but falls through to a `for` loop (unit) at the
+  end. `ret_var` binds to `int` (from `return 0`), then the fall-through constraint
+  [:12280](../nova-compiler/test_programs/nova_compiler.nova#L12280)
+  `ti_constrain(ret_var, last_t=unit)` conflicts → "expected int, found unit". Same for
+  `ire_emit_function`, `nova_pkg_init`, `nova_fmt_file_ast`, `nova_pkg_install`.
+
+**Confirmed it's a REAL bug, not just strict-only:** the minimal `_anyret_repro.nova`
+(`fn poly(k)->any` returning 42 / "hello" / true) **fails to compile in DEFAULT mode** — the
+budget only masks it in *large* files (the compiler) where 5000 unifications exhaust before the
+offending declaration. So today, a small `-> any` (or early-`return`-in-procedure) program
+false-rejects. This is a **soundness/usability defect in its own right** (independent of the
+budget) and arguably deserves a Tier-0-adjacent priority.
+
+**Fix direction — make return-position unification tolerant, WITHOUT losing perf:**
+- Class A: at :12240, when the annotation is `any`, DO constrain `ret_var` to `nt_any()` (drop the
+  `!= "any"` exclusion). Returns then unify with `any` → success. Unambiguously correct, low risk.
+- Class B (harder): return-position unification at :12481 (each `return`) and :12280 (fall-through)
+  must **widen `ret_var` to `any` on a genuine conflict** for functions with **no concrete non-any
+  annotation** — instead of erroring. Preserve STRICT for annotated functions (`-> int` returning a
+  string must still error) and preserve the **inferred concrete type when returns agree** (else every
+  zero-annotation function's return deopts to boxed `any` → GATE-4/5 perf regression). So the fix is
+  *not* "blanket ret_var = any" (too aggressive) but "infer normally; on conflict among returns of an
+  un-annotated fn, widen to any". Needs a widen-on-conflict mechanism at the return sites (a
+  new tolerant path, distinct from `ti_unify_arms` which only *skips* when a side is any/var/unit).
+
+**THE ONE DESIGN DECISION for the user:** should an un-annotated function whose `return`s genuinely
+disagree (int in one branch, string in another) be (a) **accepted, return type widened to `any`**
+(Python-like, zero-ceremony, matches "simpler than Python"), or (b) **rejected** with "this function
+returns inconsistent types; annotate `-> any` if intended" (stricter, catches real mistakes)?
+Recommendation: **(a) widen to `any`** for un-annotated, because NOVA's thesis is zero-annotation +
+`any` is a first-class type; but emit the strict error for a **concrete** annotation mismatch. Class B's
+`return 0`-as-early-exit is the common idiom (a procedure), so widening there specifically to *unit*
+(treat a bare early `return`/`return 0` in an otherwise-unit fn as unit) may be cleaner than `any`.
+
+**Sequence:** (1) land Class A + Class B return-inference fix → strict self-compiles clean →
+reconverge + FULL regression under BOTH default and (spot) strict. (2) THEN the budget per-drain
+reset (1.1) lands safely. (3) THEN flip strict/fail-closed default (1.2). Each its own reconverge.
+Repros saved: `_anyret_repro.nova`; strict error dump `_strict_errors_full.log`.
