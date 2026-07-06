@@ -48,6 +48,8 @@ Test-ShouldReject "_negty_recursive.nova"  "recursive type"
 Test-ShouldReject "_negty_notfn.nova"      "type mismatch"
 Test-ShouldReject "_negty_nofield.nova"    "has no field"
 Test-ShouldReject "_negty_fieldtype.nova"  "type mismatch"
+Test-ShouldReject "_negty_exhaustive.nova" "non-exhaustive"
+Test-ShouldReject "_negty_traitconf.nova"  "does not fully implement"
 
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"
