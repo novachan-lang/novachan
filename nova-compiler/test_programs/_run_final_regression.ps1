@@ -492,6 +492,7 @@ $concurrency_tests = @(
     'showcase_stats_test',
     'showcase_sudoku_test',
     'showcase_parallel_test',
+    'showcase_calc_test',
     'auto_reflect_test',
     'json_list_test',
     'list_dict_ops_test',

@@ -14,6 +14,7 @@ map of where the language is production-solid versus where it still has sharp ed
 | [`showcase_stats_test.nova`](../nova-compiler/test_programs/showcase_stats_test.nova) | Numerics: descriptive stats + OLS linear regression + R² over float arrays | ✅ passes — **found CORE_GAP 0.11** (worked around) |
 | [`showcase_sudoku_test.nova`](../nova-compiler/test_programs/showcase_sudoku_test.nova) | Backtracking solver: deep recursion + integer grid + in-place integer mutation | ✅ passes clean |
 | [`showcase_parallel_test.nova`](../nova-compiler/test_programs/showcase_parallel_test.nova) | Concurrency: spawn + channels + map-reduce + deep-copy isolation (+ multi-core) | ✅ passes clean (incl. `NOVA_CARRIERS=4`) |
+| [`showcase_calc_test.nova`](../nova-compiler/test_programs/showcase_calc_test.nova) | Recursive-descent expression evaluator: tokenizing + mutual recursion + precedence + error handling | ✅ passes clean (valid exprs + all malformed rejected) |
 
 Run any of them (Windows, kill-on-timeout runner) from `nova-compiler/test_programs`:
 
