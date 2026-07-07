@@ -267,6 +267,66 @@ but correct). VERIFY: _escprobe prints 1,2,3.5,4 after the fix; the common `sum(
 - If find_tag-reuse lets an any-typed heterogeneous read mis-read an unboxed buffer -> UAF. The whole-
   lifetime proof must close this; ASAN + an adversarial any-read-of-typed-list test is the guard.
 
+## ★★★ S4.2 ESCAPE-SURVIVAL — DESIGN (2026-07-07, grounded by measurement + codegen recon)
+
+**The gap (re-measured 2026-07-07, current compiler):** `_fa_bench.nova` (push-built float array, sum
+loop, no escape) = **176 ms ≈ C (171 ms)**. `_fa_bench_boxed.nova` = the SAME loop but with one
+`let _ = touch(xs)` (a callee that only does `return len(ys)`) = **27390 ms = 160×C**. So the
+non-escaping float path is already at C-parity; the ENTIRE remaining gap is the escape cliff. Any float
+code that passes an array to any function hits it → this is THE #1 perf gap (blocks Cortex/Pulse AI).
+
+**Root cause = compiler TYPING, not runtime.** The runtime `elem_kind` (0=boxed/heterogeneous,
+1=int-raw, 2=double-raw) is a SOUND homogeneity invariant that SURVIVES escape: any conflicting write
+`nova_list_deopt`s kind 2→0, and because the list is shared by reference every alias observes it. So a
+list still at `elem_kind==2` after `touch(xs)` is *provably* all raw doubles. The builtins
+(`nova_rt_sum/min/max`) already check `elem_kind==2` and stay fast post-escape. The ONLY slow thing is
+the MANUAL `xs[j]` read loop: escape (a) demotes the register type floatlist→val and (b) sets a slot
+taint flag (`nova_compiler.nova:14827-14831`), so the read at `:14836` misses the `floatlist` fast case
+and emits boxed `nova_rt_index_get` → the accumulator becomes boxed → per-iteration `nova_rt_add`
+(2× `find_tag` + box ALLOCATION) → 160×.
+
+**Proven: there is NO sound read-level fix.** The fast read's dest is typed `float` (feeds `fadd`); the
+boxed read's dest is `any` (feeds `nova_rt_add`). They can't be unified at the read site. And the boxed
+fallback CANNOT be replaced by "coerce to double" because `nova_rt_add(float, non-numeric)` has DEFINED
+observable semantics — `float + string` = **string concat** (`nova_rt_add` runtime). A was-floatlist can
+hold a non-numeric after a mutating escape, so forcing `to_double` would corrupt semantics. Therefore the
+two paths must be separated at the **LOOP** level, each with its own accumulator (loop-versioning).
+
+**The design (Tier-0-safe by construction — the runtime guard cannot be "incomplete"):** for a
+qualifying loop, emit
+```
+if nova_rt_list_is_kind2(xs):        // runtime: xs->elem_kind == 2 ? 1 : 0  (loop-invariant guard)
+    let xs = _floatlist_view(xs)     // NEW: identity at runtime, result TYPED "floatlist" (fresh, untainted)
+    <the loop, unchanged>            //  -> xs[j] now hits :14836 fast path -> list_get_f + native fadd
+else:
+    <the loop, unchanged>            // original boxed semantics, byte-identical to today
+```
+The `_floatlist_view` shadow is the key trick: it re-establishes `floatlist` typing on a FRESH register
+(so the taint doesn't apply), and it is SOUND because it runs only inside the `elem_kind==2` guard.
+Two tiny new builtins: `nova_rt_list_is_kind2` (trivial) and `_floatlist_view` (runtime identity; compiler
+special-cases its result type to `"floatlist"`, like the existing floatlist cases at `:14812`).
+
+**THE CRUX / open question the implementation must resolve first (cheap gen4 experiment):** is the
+accumulator `s` typed FLOW-SENSITIVELY (float inside the fast branch, `any` after the merge) or
+SLOT-UNIFIED (one slot typed `any` across both branches)? If flow-sensitive → the shadow alone works and
+this is TRACTABLE. If slot-unified → the fast branch needs a separate native-float temp accumulator +
+reconcile-to-`s` at branch exit (identify accumulators = float vars written in the loop & live after),
+which is the fiddly part. **Validate empirically before building the auto-transform:** add the 2
+builtins, hand-write the transformed source above as a probe, build gen4, and check whether the loop
+emits `list_get_f`+`fadd` (fast) — measures both the shadow trick AND the accumulator behavior.
+
+**Qualification (bail → original, byte-identical, for anything unhandled → low blast radius):** single
+float accumulator; reads `xs[idx]` where `xs` is a was-floatlist tainted local and `idx` is a simple
+int; the loop body does NOT mutate `xs` (no `push`/`index_set` on it — else kind could change mid-loop);
+no nested capture of `xs`. Everything else uses the current path unchanged.
+
+**Staging:** (1) 2 builtins + gen4 shadow-probe to resolve the crux. (2) auto-transform for the
+single-accumulator qualifying loop. (3) generalize to N accumulators + `for` loops. (4) reconverge +
+both-mode regression + perf gate (bench must go ~160×→~1×C, and EVERY non-applicable program must stay
+byte-identical). Iterate stages 1-3 on gen4 (cheap ~10 min build); reconverge ONCE at the end.
+Injection point = `nova_compiler.nova` while-lowering `:9181` (guard+shadow wrap) + the call-result
+type special-case in the infer pass.
+
 ## Competitive check
 - C: contiguous double[] -- S4.0-4.4 matches (native load), S4.5 (SIMD) beats only with reduction reassoc.
 - Rust Vec<f64>: same machine code after S4.3, but NOVA needs ZERO annotation (Rust declares the type) -> NOVA wins on ergonomics at equal speed.
