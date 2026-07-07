@@ -486,6 +486,8 @@ $concurrency_tests = @(
     '_closure_capture_leak_test',
     '_struct_arena_masked_test',
     '_eq_mixed_test',
+    '_alias_swap_leak_test',
+    'showcase_report_test',
     'auto_reflect_test',
     'json_list_test',
     'list_dict_ops_test',

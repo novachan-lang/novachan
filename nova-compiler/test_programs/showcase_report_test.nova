@@ -1,0 +1,135 @@
+// showcase_report -- a CLI-style data-analytics tool in NOVA. It parses transaction records
+// (category,amount CSV lines), aggregates by category (total / count / average / min / max in cents),
+// ranks categories by total spend, and renders an ALIGNED text report plus a JSON summary. This
+// deliberately exercises a DIFFERENT subsystem mix than the TaskFlow HTTP app: string splitting/
+// trimming, integer money parsing/formatting, dict aggregation, a hand-written numeric sort, and
+// column alignment (padding). Self-verifying via asserts. Money is held in integer CENTS end-to-end
+// (no float rounding); averages truncate to cents.
+
+// Parse "12.50" (dollars) -> 1250 (cents). Tolerates whole dollars ("12" -> 1200) and a leading '$'.
+fn parse_cents(s: string) -> int
+    let t = s
+    if len(t) > 0 and slice(t, 0, 1) == "$"
+        t = slice(t, 1, len(t))
+    let dot = find(t, ".")
+    if dot < 0
+        return parse_int(t) * 100
+    let dollars = parse_int(slice(t, 0, dot))
+    let frac = slice(t, dot + 1, len(t))
+    if len(frac) == 1
+        frac = frac + "0"
+    if len(frac) > 2
+        frac = slice(frac, 0, 2)
+    return dollars * 100 + parse_int(frac)
+
+// Format cents -> "X.YZ" (e.g. 1250 -> "12.50", 5 -> "0.05").
+fn fmt_cents(c: int) -> string
+    let d = c / 100
+    let r = c % 100
+    let rs = str(r)
+    if r < 10
+        rs = "0" + rs
+    return str(d) + "." + rs
+
+// Right-pad a string to width w (left-justify in a column).
+fn pad_right(s: string, w: int) -> string
+    let out = s
+    while len(out) < w
+        out = out + " "
+    return out
+
+// Left-pad a string to width w (right-justify numbers).
+fn pad_left(s: string, w: int) -> string
+    let out = s
+    while len(out) < w
+        out = " " + out
+    return out
+
+fn main()
+    // Embedded sample data: category, amount (dollars). No multi-line literals in NOVA.
+    let rows = ["Food, 12.50", "Transport,3.75", "Food, 8.00", "Rent, 1500", "Transport, 2.25", "Food,20.00", "Entertainment, 45.90", "Rent,1500.00", "Transport, 3.75"]
+
+    let totals = {}
+    let counts = {}
+    let mins = {}
+    let maxes = {}
+    let cats = []
+
+    for line in rows
+        let parts = split(line, ",")
+        let cat = trim(parts[0])
+        let amt = parse_cents(trim(parts[1]))
+        if contains(totals, cat)
+            totals[cat] = totals[cat] + amt
+            counts[cat] = counts[cat] + 1
+            if amt < mins[cat]
+                mins[cat] = amt
+            if amt > maxes[cat]
+                maxes[cat] = amt
+        else
+            totals[cat] = amt
+            counts[cat] = 1
+            mins[cat] = amt
+            maxes[cat] = amt
+            push(cats, cat)
+
+    // Rank categories by total spend (descending). Build a FRESH `ranked` list by repeated
+    // max-selection instead of sorting `cats` in place: the category strings are ALSO dict keys
+    // (totals/counts/...), and in-place list mutation of a string aliased into a dict currently
+    // triggers a use-after-free (CORE_GAP 0.10). Repeated selection only READS cats/totals and
+    // appends to a new list -- it never overwrites a live aliased slot -- so it is robust.
+    let ranked = []
+    let used = {}
+    let picked = 0
+    while picked < len(cats)
+        let bestc = ""
+        for c in cats
+            if not contains(used, c)
+                if bestc == "" or totals[c] > totals[bestc]
+                    bestc = c
+        push(ranked, bestc)
+        used[bestc] = 1
+        picked = picked + 1
+    let n = len(ranked)
+
+    // Render an aligned report.
+    let grand = 0
+    for c in ranked
+        grand = grand + totals[c]
+
+    print("=== Spend Report ===")
+    print(pad_right("CATEGORY", 16) + pad_left("TOTAL", 12) + pad_left("COUNT", 8) + pad_left("AVG", 12) + pad_left("MAX", 12))
+    for c in ranked
+        let avg = totals[c] / counts[c]
+        let pct = (totals[c] * 100) / grand
+        let row = pad_right(c, 16) + pad_left(fmt_cents(totals[c]), 12) + pad_left(str(counts[c]), 8) + pad_left(fmt_cents(avg), 12) + pad_left(fmt_cents(maxes[c]), 12)
+        print(row + "   (" + str(pct) + "%)")
+    print(pad_right("TOTAL", 16) + pad_left(fmt_cents(grand), 12))
+
+    // JSON summary (top category).
+    let q = chr(34)
+    let top = ranked[0]
+    let summary = "\{" + q + "top_category" + q + ":" + q + top + q + "," + q + "top_total" + q + ":" + q + fmt_cents(totals[top]) + q + "," + q + "categories" + q + ":" + str(n) + "\}"
+    print("summary=" + summary)
+
+    // --- self-verification ---
+    assert(parse_cents("12.50") == 1250, "parse 12.50")
+    assert(parse_cents("1500") == 150000, "parse whole dollars")
+    assert(parse_cents("$3.75") == 375, "parse with $ and cents")
+    assert(parse_cents("0.05") == 5, "parse small")
+    assert(fmt_cents(1250) == "12.50", "fmt 1250")
+    assert(fmt_cents(5) == "0.05", "fmt 5 -> 0.05")
+    assert(fmt_cents(150000) == "1500.00", "fmt 150000")
+    // Food: 12.50 + 8.00 + 20.00 = 40.50 (4050c, 3 items). Rent: 1500 + 1500 = 3000.00 (300000c, 2).
+    assert(totals["Food"] == 4050, "Food total 40.50")
+    assert(counts["Food"] == 3, "Food count 3")
+    assert(totals["Rent"] == 300000, "Rent total 3000.00")
+    assert(maxes["Food"] == 2000, "Food max 20.00")
+    assert(mins["Food"] == 800, "Food min 8.00")
+    // Ranking by total: Rent (3000.00) > Entertainment (45.90) > Food (40.50) > Transport (9.75).
+    assert(ranked[0] == "Rent", "Rent ranks first by total")
+    assert(ranked[1] == "Entertainment", "Entertainment ranks second (45.90 > 40.50)")
+    assert(ranked[3] == "Transport", "Transport ranks last")
+    assert(grand == 300000 + 4050 + 4590 + 975, "grand total")
+    assert(find(summary, q + "top_category" + q + ":" + q + "Rent" + q) >= 0, "summary top is Rent")
+    print("showcase_report_test passed -- CSV parse + aggregate + rank + aligned report, pure NOVA")
