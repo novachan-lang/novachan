@@ -348,6 +348,32 @@ no win). Bail→original (byte-identical) for anything unqualified. Builtins are
 (WIP) — commit the complete feature (builtins + auto-transform) together after reconverge, not the
 foundation alone.
 
+### ★★★ AUTO-TRANSFORM — refined plan (2026-07-07, after gen4 structure probes)
+Three constraints found by probing the exact emitted structure:
+1. **NOVA uses NAME-based slots, not lexical scoping.** `let s` in the fast branch + `let s` in the slow
+   branch share ONE slot → `s`'s type unifies to boxed → the fast loop stays boxed. Proof: same-name
+   shadow `_s42_full` = 31105ms boxed; ALL-fast-locals-renamed `_s42_full3` (`xsf/totalf/rf/sf/jf`) =
+   **343ms, list_get_f+fadd, correct**. So the fast clone MUST alpha-rename EVERY local it declares/writes
+   (list AND every accumulator/counter), with copy-in `let Vf = V` for vars declared before the loop and
+   copy-out `V = Vf` after (loop-carried reconcile).
+2. **Taint (`@taint@`) is set in the INFER pass (post-lowering ~14285)**, so a transform at while-lowering
+   `:9181` can't see it. **Do it as an AST PRE-PASS** (after parse, before lower): detect escape at the
+   AST level (list var appears as a user-call arg / stored / returned).
+3. **The runtime `list_is_kind2` guard makes precise "was-floatlist" typing UNNECESSARY** — the pre-pass
+   only needs "a built list var that escapes AST-visibly and is read `xs[idx]` in a later while/for"; the
+   guard gives the fast path only when the runtime list is actually kind 2, else the byte-identical slow
+   clone. Broad + sound + self-correcting.
+**Pre-pass shape (self-contained, no lowering changes):** replace qualifying loop L with
+`Stmt("if", list_is_kind2(xs)==1, then=[xsf=floatlist_view(xs); copy-ins; alpha-renamed clone of L;
+copy-outs], else=[L])`. **Bounded alpha-rename** over a FIXED tag set {assign, while, for, if, expr,
+return, break, continue / ident, index, int, float, str, bool, call, binop, unary, field}, handling each
+Stmt's polymorphic fields (esp. `else_body` = Stmt-list for while/if but Expr-list for indexed-assign).
+**BAIL the whole transform (→ original, byte-identical) if** the loop has any tag outside the set, OR
+mutates `xs` (`push(xs...)`/`xs[i]=`), OR `xs` is captured/aliased. rename-set = all assignment targets
+in L ∪ {xs}; copy-in/out only for targets in scope before L. Then gen4 (original `_fa_bench_boxed` must
+auto-drop 160×→~2×C) + adversarial suite + broad byte-identical check → reconverge → both-mode regression
++ perf gate → commit. This bridges the taint/structure levels WITHOUT IR block-cloning.
+
 ## Competitive check
 - C: contiguous double[] -- S4.0-4.4 matches (native load), S4.5 (SIMD) beats only with reduction reassoc.
 - Rust Vec<f64>: same machine code after S4.3, but NOVA needs ZERO annotation (Rust declares the type) -> NOVA wins on ergonomics at equal speed.
