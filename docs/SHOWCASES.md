@@ -15,6 +15,9 @@ map of where the language is production-solid versus where it still has sharp ed
 | [`showcase_sudoku_test.nova`](../nova-compiler/test_programs/showcase_sudoku_test.nova) | Backtracking solver: deep recursion + integer grid + in-place integer mutation | ✅ passes clean |
 | [`showcase_parallel_test.nova`](../nova-compiler/test_programs/showcase_parallel_test.nova) | Concurrency: spawn + channels + map-reduce + deep-copy isolation (+ multi-core) | ✅ passes clean (incl. `NOVA_CARRIERS=4`) |
 | [`showcase_calc_test.nova`](../nova-compiler/test_programs/showcase_calc_test.nova) | Recursive-descent expression evaluator: tokenizing + mutual recursion + precedence + error handling | ✅ passes clean (valid exprs + all malformed rejected) |
+| [`showcase_life_test.nova`](../nova-compiler/test_programs/showcase_life_test.nova) | Conway's Game of Life: 2D grid, double-buffered generations, neighbor rules | ✅ passes clean (still-life + oscillator verified) |
+| [`showcase_graph_test.nova`](../nova-compiler/test_programs/showcase_graph_test.nova) | BFS shortest paths over an adjacency list-of-lists, integer nodes + queue | ✅ passes clean |
+| [`showcase_hex_test.nova`](../nova-compiler/test_programs/showcase_hex_test.nova) | Binary codec: bytes↔hex + byte-wise XOR (bytes value type + bit ops) | ✅ passes clean (round-trip + OTP identity) |
 
 Run any of them (Windows, kill-on-timeout runner) from `nova-compiler/test_programs`:
 
