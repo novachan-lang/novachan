@@ -1,0 +1,133 @@
+// forge_persistseg -- persistent segment tree (fully persistent, path-copying).
+// An ordinary segment tree lets you update and query the CURRENT array. A PERSISTENT segment tree keeps
+// EVERY historical version alive: each update returns a NEW root that shares all untouched nodes with the
+// previous version and copies only the O(log n) nodes along the updated path. So you can query any past
+// version in O(log n) while using only O(log n) extra memory per update (not O(n) per version).
+// This unlocks a family of otherwise-hard queries:
+//   - "value of a[i] as of version v" / point + range-sum queries on any historical snapshot
+//   - the classic RANGE K-TH SMALLEST (a.k.a. "k-th order statistic in a[l..r]"): build one persistent
+//     version per prefix over the value axis, then version[r] MINUS version[l-1] is a segment tree of the
+//     value-frequencies in a[l..r], and a walk down it finds the k-th smallest in O(log n) -- a wavelet-
+//     tree alternative that also supports online updates.
+//   - undo/redo, time-travel debugging, functional/immutable data snapshots.
+//
+// Nodes live in flat parallel arrays (node pool): left[i], right[i], sum[i]. Version roots are node ids.
+// Node 0 is the shared NULL node (empty subtree, sum 0, points to itself). We never mutate an existing
+// node; update allocates fresh nodes for the copied path -> full persistence, no aliasing hazards.
+//
+// API:
+//   ps_new(n) -> tree                    build an empty persistent segtree over indices [0, n) (one root)
+//   ps_root(tree, v) -> int              node id of version v (0-based; version 0 = initial empty)
+//   ps_update(tree, root, pos, delta) -> int   add delta at index pos on top of `root`; returns NEW root id
+//   ps_query(tree, root, l, r) -> int    sum of a[l..r] (inclusive) in the version rooted at `root`
+//   ps_kth(tree, root_lo, root_hi, k) -> int   k-th smallest value-index using two versions (root_hi minus root_lo)
+// (For range-kth: build versions over the VALUE axis, one per array prefix, then call ps_kth(prefix[l-1], prefix[r], k).)
+// LEAF (imports nothing).
+
+// Create a new persistent segment tree over the domain [0, n).
+// Returns [n, left_arr, right_arr, sum_arr, roots] where roots is a list of version root node ids.
+// Node 0 is the shared empty node.
+fn ps_new(n: int) -> list
+    let left_arr = []
+    let right_arr = []
+    let sum_arr = []
+    // Node 0 = shared NULL: children point to itself, sum 0
+    push(left_arr, 0)
+    push(right_arr, 0)
+    push(sum_arr, 0)
+    let roots = []
+    // Initial version 0 = empty tree, root is the null node
+    push(roots, 0)
+    return [n, left_arr, right_arr, sum_arr, roots]
+
+// Allocate a fresh node with given left, right children and sum. Returns its id.
+fn _ps_alloc(tree: list, lc: int, rc: int, s: int) -> int
+    let left_arr = tree[1]
+    let right_arr = tree[2]
+    let sum_arr = tree[3]
+    push(left_arr, lc)
+    push(right_arr, rc)
+    push(sum_arr, s)
+    return len(sum_arr) - 1
+
+// Internal recursive update: return a NEW node id representing prev_node with +delta at pos, over [l, r].
+fn _ps_update(tree: list, prev_node: int, l: int, r: int, pos: int, delta: int) -> int
+    let left_arr = tree[1]
+    let right_arr = tree[2]
+    let sum_arr = tree[3]
+    if l == r
+        // leaf: new node with updated sum
+        return _ps_alloc(tree, 0, 0, sum_arr[prev_node] + delta)
+    let mid = (l + r) / 2
+    let prev_l = left_arr[prev_node]
+    let prev_r = right_arr[prev_node]
+    let new_l = prev_l
+    let new_r = prev_r
+    if pos <= mid
+        new_l = _ps_update(tree, prev_l, l, mid, pos, delta)
+    else
+        new_r = _ps_update(tree, prev_r, mid + 1, r, pos, delta)
+    // sum = sum of children
+    let s = sum_arr[new_l] + sum_arr[new_r]
+    return _ps_alloc(tree, new_l, new_r, s)
+
+// Public update: create a new version on top of an existing root node id. Returns the NEW root id
+// and appends it to the version list. `root` is a node id (e.g. from ps_root or a previous ps_update).
+fn ps_update(tree: list, root: int, pos: int, delta: int) -> int
+    let n = tree[0]
+    let new_root = _ps_update(tree, root, 0, n - 1, pos, delta)
+    let roots = tree[4]
+    push(roots, new_root)
+    return new_root
+
+// Get the root node id of version v.
+fn ps_root(tree: list, v: int) -> int
+    let roots = tree[4]
+    return roots[v]
+
+// Internal recursive range-sum query on the version rooted at `node`, over segment [l, r], asking [ql, qr].
+fn _ps_query(tree: list, node: int, l: int, r: int, ql: int, qr: int) -> int
+    if node == 0
+        return 0
+    if qr < l or r < ql
+        return 0
+    let sum_arr = tree[3]
+    if ql <= l and r <= qr
+        return sum_arr[node]
+    let left_arr = tree[1]
+    let right_arr = tree[2]
+    let mid = (l + r) / 2
+    let left_sum = _ps_query(tree, left_arr[node], l, mid, ql, qr)
+    let right_sum = _ps_query(tree, right_arr[node], mid + 1, r, ql, qr)
+    return left_sum + right_sum
+
+// Public range-sum query [l..r] inclusive on the version rooted at node id `root`.
+fn ps_query(tree: list, root: int, l: int, r: int) -> int
+    let n = tree[0]
+    return _ps_query(tree, root, 0, n - 1, l, r)
+
+// k-th smallest across the frequency difference of two versions (root_hi - root_lo), 1-based.
+// Used for range-kth-smallest: build one version per array prefix over the value axis, where each
+// prefix version has +1 at the value of each element. Then (prefix[r] - prefix[l-1]) is the value-
+// frequency histogram of a[l..r]; walking it finds the k-th smallest VALUE INDEX. Returns the leaf
+// index (value) or -1 if k is out of range.
+fn ps_kth(tree: list, root_lo: int, root_hi: int, k: int) -> int
+    let n = tree[0]
+    return _ps_kth(tree, root_lo, root_hi, 0, n - 1, k)
+
+fn _ps_kth(tree: list, node_lo: int, node_hi: int, l: int, r: int, k: int) -> int
+    if l == r
+        return l
+    let left_arr = tree[1]
+    let right_arr = tree[2]
+    let sum_arr = tree[3]
+    let lo_left = left_arr[node_lo]
+    let hi_left = left_arr[node_hi]
+    let left_count = sum_arr[hi_left] - sum_arr[lo_left]
+    let mid = (l + r) / 2
+    if k <= left_count
+        return _ps_kth(tree, lo_left, hi_left, l, mid, k)
+    else
+        let lo_right = right_arr[node_lo]
+        let hi_right = right_arr[node_hi]
+        return _ps_kth(tree, lo_right, hi_right, mid + 1, r, k - left_count)

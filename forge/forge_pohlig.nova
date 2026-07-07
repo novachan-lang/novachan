@@ -1,0 +1,178 @@
+// forge_pohlig -- Pohlig-Hellman algorithm for discrete logarithms in groups of SMOOTH order.
+// The plain baby-step-giant-step discrete log (forge_modsolve.discrete_log) costs O(sqrt(p)) time AND
+// O(sqrt(p)) memory -- infeasible when p is large. Pohlig-Hellman is dramatically faster when the group
+// order n = p-1 (the order of the multiplicative group mod prime p) factors into SMALL prime powers:
+// it solves the discrete log SEPARATELY in each prime-power subgroup (each a tiny BSGS of size sqrt(prime))
+// then recombines the partial answers with the Chinese Remainder Theorem. If p-1 = prod(q_i^e_i), the
+// cost drops to about sum(e_i * sqrt(q_i)) -- so if all prime factors of p-1 are small, discrete log is
+// EASY. This is exactly WHY cryptographic protocols demand a "safe prime" p where p-1 = 2*q with q also
+// prime: to make p-1 NON-smooth and defeat Pohlig-Hellman. Understanding this attack is core to why
+// Diffie-Hellman / DSA parameters are chosen the way they are.
+//
+// Given g (a generator, or an element of known order), h, prime p: find x with g^x == h (mod p).
+// Requires the factorization of the group order ord(g) = p-1 (we take the full multiplicative order p-1).
+//
+// API:
+//   pohlig_hellman(g, h, p, factors) -> int    solve g^x=h mod p; factors = list of [prime, exponent]
+//   factor_order(n) -> list                     factor n into [[prime, exp], ...] (trial division)
+//   discrete_log_smooth(g, h, p) -> int         convenience: factor p-1 then run Pohlig-Hellman
+// Returns the discrete log x in [0, p-2], or -1 if no solution exists.
+// LEAF (imports nothing).
+
+fn _ph_powmod(base: int, exp: int, m: int) -> int
+    let r = 1 % m
+    let b = ((base % m) + m) % m
+    let e = exp
+    while e > 0
+        if e % 2 == 1
+            r = (r * b) % m
+        b = (b * b) % m
+        e = e / 2
+    return r
+
+// Modular inverse via extended Euclidean (m prime or gcd(a,m)=1).
+fn _ph_modinv(a: int, m: int) -> int
+    let old_r = ((a % m) + m) % m
+    let r = m
+    let old_s = 1
+    let s = 0
+    while r != 0
+        let q = old_r / r
+        let tr = r
+        r = old_r - q * r
+        old_r = tr
+        let ts = s
+        s = old_s - q * s
+        old_s = ts
+    return ((old_s % m) + m) % m
+
+// Factor n into a list of [prime, exponent] pairs via trial division.
+fn factor_order(n: int) -> list
+    let factors = []
+    let m = n
+    let d = 2
+    while d * d <= m
+        if m % d == 0
+            let e = 0
+            while m % d == 0
+                m = m / d
+                e = e + 1
+            push(factors, [d, e])
+        d = d + 1
+    if m > 1
+        push(factors, [m, 1])
+    return factors
+
+// Baby-step giant-step for discrete log in a subgroup: find x in [0, order) with base^x == target (mod p).
+// order is small (a prime power's worth). Returns -1 if not found.
+fn _ph_bsgs(base: int, target: int, p: int, order: int) -> int
+    // m = ceil(sqrt(order))
+    let m = 1
+    while m * m < order
+        m = m + 1
+    // baby steps: base^j for j in [0, m)
+    let table = {}
+    let cur = 1 % p
+    let j = 0
+    while j < m
+        let key = str(cur)
+        if get(table, key, 0 - 1) < 0
+            table[key] = j
+        cur = (cur * base) % p
+        j = j + 1
+    // giant step factor = base^(-m)
+    let bm = _ph_powmod(base, m, p)
+    let factor = _ph_modinv(bm, p)
+    let gamma = target % p
+    let out = 0 - 1
+    let i = 0
+    while i <= m and out < 0
+        let jj = get(table, str(gamma), 0 - 1)
+        if jj >= 0
+            let cand = i * m + jj
+            if cand < order
+                out = cand
+        gamma = (gamma * factor) % p
+        i = i + 1
+    return out
+
+// Solve the discrete log in the subgroup of order q^e (a single prime power).
+// Returns x mod q^e such that g^x == h in this subgroup, using the digit-by-digit lifting.
+fn _ph_prime_power(g: int, h: int, p: int, group_order: int, q: int, e: int) -> int
+    // qe = q^e
+    let qe = 1
+    let t = 0
+    while t < e
+        qe = qe * q
+        t = t + 1
+    // gamma = g^(group_order/q) -- a generator of the order-q subgroup
+    let gamma = _ph_powmod(g, group_order / q, p)
+    let x = 0
+    let g_inv = _ph_modinv(g, p)
+    let k = 0
+    while k < e
+        // h_k = (g^(-x) * h)^(group_order / q^(k+1))
+        let gx = _ph_powmod(g_inv, x, p)
+        let base_val = (gx * h) % p
+        let exponent = group_order / _ph_pow(q, k + 1)
+        let hk = _ph_powmod(base_val, exponent, p)
+        // solve gamma^d = hk for d in [0, q)
+        let d = _ph_bsgs(gamma, hk, p, q)
+        if d < 0
+            return 0 - 1
+        // x += d * q^k
+        x = x + d * _ph_pow(q, k)
+        k = k + 1
+    return x % qe
+
+fn _ph_pow(b: int, e: int) -> int
+    let r = 1
+    let i = 0
+    while i < e
+        r = r * b
+        i = i + 1
+    return r
+
+// CRT combine: given residues x_i mod m_i (pairwise coprime), find x mod prod(m_i).
+fn _ph_crt(residues: list, moduli: list) -> int
+    let x = 0
+    let prod = 1
+    let i = 0
+    while i < len(moduli)
+        prod = prod * moduli[i]
+        i = i + 1
+    let j = 0
+    while j < len(moduli)
+        let mi = moduli[j]
+        let ri = residues[j]
+        let ni = prod / mi
+        let inv = _ph_modinv(ni % mi, mi)
+        x = x + ri * ni % prod * inv % prod
+        x = x % prod
+        j = j + 1
+    return ((x % prod) + prod) % prod
+
+// Pohlig-Hellman: solve g^x == h (mod p) where the multiplicative group has order p-1.
+// factors = factorization of the group order (p-1) as [[prime, exp], ...].
+fn pohlig_hellman(g: int, h: int, p: int, factors: list) -> int
+    let group_order = p - 1
+    let residues = []
+    let moduli = []
+    let i = 0
+    while i < len(factors)
+        let fe = factors[i]
+        let q = fe[0]
+        let e = fe[1]
+        let qe = _ph_pow(q, e)
+        let xi = _ph_prime_power(g, h, p, group_order, q, e)
+        if xi < 0
+            return 0 - 1
+        push(residues, xi)
+        push(moduli, qe)
+        i = i + 1
+    return _ph_crt(residues, moduli)
+
+// Convenience: factor p-1, then run Pohlig-Hellman.
+fn discrete_log_smooth(g: int, h: int, p: int) -> int
+    let factors = factor_order(p - 1)
+    return pohlig_hellman(g, h, p, factors)
