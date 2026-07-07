@@ -1,0 +1,245 @@
+// forge_linkcut -- link-cut tree (Sleator-Tarjan): maintain a FOREST of rooted trees under LINK and CUT
+// with O(log n) amortized per operation. This is the canonical dynamic-trees structure: unlike a static
+// tree (forge_hld) whose shape is fixed, a link-cut tree supports EDGES BEING ADDED AND REMOVED over time
+// while still answering connectivity and path queries. It underlies dynamic connectivity, online MST
+// (link-cut for the tree part), max-flow (dynamic-trees speedup), network routing under topology change,
+// and the theory of self-adjusting data structures. Operations:
+//   - link(u, v): attach tree containing u (as a root) under v -> merges two trees
+//   - cut(u): detach u from its parent -> splits one tree into two
+//   - connected(u, v): are u and v in the same tree?
+//   - find_root(u): the root of u's tree
+//   - lca(u, v): lowest common ancestor (when in the same tree)
+//   - path_sum(u, v): aggregate node values on the path (we support SUM)
+//
+// IMPLEMENTATION: represent each tree's PREFERRED PATHS as splay trees (auxiliary trees) keyed by depth,
+// connected by "path-parent" pointers. The core primitive is access(x): splay x to the root of its
+// auxiliary tree and make the path from the real root to x preferred. On top of access we build makeroot
+// (re-root via a lazy REVERSE flag), link, cut, etc. Nodes are flat parallel arrays:
+//   left[], right[], parent[] (aux-tree pointers; parent doubles as path-parent when x is a splay root),
+//   rev[] (lazy subtree-reverse flag), val[] (node value), sum[] (subtree sum in the aux tree).
+//
+// API:
+//   lc_new(n, values) -> lct                 n nodes 0..n-1 with integer values
+//   lc_link(lct, u, v)                        add edge making u a child of v (u must be a tree root)
+//   lc_cut(lct, u, v)                         remove edge between u and v if it exists
+//   lc_connected(lct, u, v) -> bool           same tree?
+//   lc_find_root(lct, u) -> int               root of u's tree
+//   lc_path_sum(lct, u, v) -> int             sum of values on path u..v (u,v must be connected)
+//   lc_set_val(lct, u, x)                      set node u's value
+// LEAF (imports nothing).
+
+fn lc_new(n: int, values: list) -> list
+    let left = []
+    let right = []
+    let parent = []
+    let rev = []
+    let val = []
+    let sum = []
+    let i = 0
+    while i < n
+        push(left, 0 - 1)
+        push(right, 0 - 1)
+        push(parent, 0 - 1)
+        push(rev, 0)
+        push(val, values[i])
+        push(sum, values[i])
+        i = i + 1
+    return [left, right, parent, rev, val, sum]
+
+// Is x the root of its SPLAY (auxiliary) tree? True when its parent doesn't point back to it as a child.
+fn _lc_is_root(lct: list, x: int) -> bool
+    let left = lct[0]
+    let right = lct[1]
+    let parent = lct[2]
+    let p = parent[x]
+    if p == 0 - 1
+        return true
+    if left[p] != x and right[p] != x
+        return true
+    return false
+
+// Recompute sum[x] from its children and own value.
+fn _lc_pull(lct: list, x: int)
+    let left = lct[0]
+    let right = lct[1]
+    let val = lct[4]
+    let sum = lct[5]
+    let s = val[x]
+    let l = left[x]
+    let r = right[x]
+    if l != 0 - 1
+        s = s + sum[l]
+    if r != 0 - 1
+        s = s + sum[r]
+    sum[x] = s
+
+// Apply a reverse to node x (swap children, toggle rev flag).
+fn _lc_apply_rev(lct: list, x: int)
+    let left = lct[0]
+    let right = lct[1]
+    let rev = lct[3]
+    let tmp = left[x]
+    left[x] = right[x]
+    right[x] = tmp
+    if rev[x] == 0
+        rev[x] = 1
+    else
+        rev[x] = 0
+
+// Push down the lazy reverse flag.
+fn _lc_push(lct: list, x: int)
+    let left = lct[0]
+    let right = lct[1]
+    let rev = lct[3]
+    if rev[x] == 1
+        let l = left[x]
+        let r = right[x]
+        if l != 0 - 1
+            _lc_apply_rev(lct, l)
+        if r != 0 - 1
+            _lc_apply_rev(lct, r)
+        rev[x] = 0
+
+// Rotate x up one level in its splay tree.
+fn _lc_rotate(lct: list, x: int)
+    let left = lct[0]
+    let right = lct[1]
+    let parent = lct[2]
+    let p = parent[x]
+    let g = parent[p]
+    let p_is_root = _lc_is_root(lct, p)
+    if left[p] == x
+        // right rotation
+        left[p] = right[x]
+        if right[x] != 0 - 1
+            parent[right[x]] = p
+        right[x] = p
+    else
+        // left rotation
+        right[p] = left[x]
+        if left[x] != 0 - 1
+            parent[left[x]] = p
+        left[x] = p
+    parent[p] = x
+    parent[x] = g
+    if p_is_root == false
+        if left[g] == p
+            left[g] = x
+        else
+            if right[g] == p
+                right[g] = x
+    _lc_pull(lct, p)
+    _lc_pull(lct, x)
+
+// Splay x to the root of its auxiliary tree (pushing lazy flags down the path first).
+fn _lc_splay(lct: list, x: int)
+    let left = lct[0]
+    let right = lct[1]
+    let parent = lct[2]
+    // push down from the top of the splay tree to x
+    let stack = [x]
+    let cur = x
+    while _lc_is_root(lct, cur) == false
+        cur = parent[cur]
+        push(stack, cur)
+    let si = len(stack) - 1
+    while si >= 0
+        _lc_push(lct, stack[si])
+        si = si - 1
+    while _lc_is_root(lct, x) == false
+        let p = parent[x]
+        let g = parent[p]
+        if _lc_is_root(lct, p) == false
+            // zig-zig or zig-zag
+            let x_is_left = left[p] == x
+            let p_is_left = left[g] == p
+            if x_is_left == p_is_left
+                _lc_rotate(lct, p)
+                _lc_rotate(lct, x)
+            else
+                _lc_rotate(lct, x)
+                _lc_rotate(lct, x)
+        else
+            _lc_rotate(lct, x)
+    _lc_pull(lct, x)
+
+// access(x): make the path from the root of x's tree to x preferred; splay x to the top.
+// Returns the last path-parent seen (used by lca).
+fn _lc_access(lct: list, x: int) -> int
+    let left = lct[0]
+    let right = lct[1]
+    let parent = lct[2]
+    let last = 0 - 1
+    let cur = x
+    while cur != 0 - 1
+        _lc_splay(lct, cur)
+        // replace right child (deeper preferred path) with the path from below
+        right[cur] = last
+        _lc_pull(lct, cur)
+        last = cur
+        cur = parent[cur]
+    _lc_splay(lct, x)
+    return last
+
+// makeroot(x): make x the root of its tree (reverse the path from current root to x).
+fn _lc_makeroot(lct: list, x: int)
+    let ig = _lc_access(lct, x)
+    _lc_apply_rev(lct, x)
+
+fn lc_find_root(lct: list, x: int) -> int
+    let left = lct[0]
+    let ig = _lc_access(lct, x)
+    let cur = x
+    _lc_push(lct, cur)
+    while left[cur] != 0 - 1
+        cur = left[cur]
+        _lc_push(lct, cur)
+    _lc_splay(lct, cur)
+    return cur
+
+fn lc_connected(lct: list, u: int, v: int) -> bool
+    if u == v
+        return true
+    return lc_find_root(lct, u) == lc_find_root(lct, v)
+
+// link(u, v): u must be a tree root; make u a child of v.
+fn lc_link(lct: list, u: int, v: int)
+    let parent = lct[2]
+    _lc_makeroot(lct, u)
+    // after makeroot, u is root; set its path-parent to v (only if not already connected)
+    if lc_find_root(lct, v) != u
+        _lc_makeroot(lct, u)
+        parent[u] = v
+
+// cut(u, v): remove edge (u,v) if present.
+fn lc_cut(lct: list, u: int, v: int)
+    let left = lct[0]
+    let right = lct[1]
+    let parent = lct[2]
+    _lc_makeroot(lct, u)
+    let ig = _lc_access(lct, v)
+    // now v is splay root; u should be its left child with no right child if edge (u,v) direct
+    if left[v] == u and right[u] == 0 - 1
+        left[v] = 0 - 1
+        parent[u] = 0 - 1
+        _lc_pull(lct, v)
+
+// path_sum(u, v): make u root, access v; sum of v's aux tree = path sum.
+fn lc_path_sum(lct: list, u: int, v: int) -> int
+    let sum = lct[5]
+    _lc_makeroot(lct, u)
+    let ig = _lc_access(lct, v)
+    return sum[v]
+
+// lca(u, v): assumes u, v connected. Returns the LCA relative to the CURRENT root.
+fn lc_lca(lct: list, root: int, u: int, v: int) -> int
+    _lc_makeroot(lct, root)
+    let iga = _lc_access(lct, u)
+    let l = _lc_access(lct, v)
+    return l
+
+fn lc_set_val(lct: list, u: int, x: int)
+    let val = lct[4]
+    _lc_access(lct, u)
+    val[u] = x
+    _lc_pull(lct, u)
