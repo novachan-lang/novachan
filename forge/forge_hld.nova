@@ -1,0 +1,298 @@
+// forge_hld -- heavy-light decomposition (HLD): turn tree PATH queries into a few contiguous ARRAY ranges.
+// Given a rooted tree and a query "aggregate the values on the path between u and v" (sum/max/min, or a
+// point update on a node), the naive walk is O(n) per query. HLD decomposes the tree into "heavy" chains
+// (each node points to its child with the largest subtree) so that ANY root-to-node path crosses at most
+// O(log n) chains. Assigning each node a position in a linear array by chain order makes every tree path
+// a union of O(log n) contiguous array segments -- which a segment tree / BIT answers in O(log n) each,
+// giving O(log^2 n) per path query. It is the standard technique for path-sum / path-max / subtree
+// queries, LCA (a by-product), tree-DP with updates, and network/routing aggregates over tree topologies.
+//
+// This module builds the decomposition and, on top of a built-in Fenwick/BIT over node values, supports
+// point updates and path-sum queries. It also yields LCA as a natural by-product of the chain walk.
+//
+// Tree is given as a parent array (parent[root] = -1) OR an edge list with a chosen root. Node values are
+// integers. All indices are 0-based node ids.
+//
+// API:
+//   hld_build(n, parent, root, values) -> hld     build decomposition; values = per-node ints
+//   hld_path_sum(hld, u, v) -> int                sum of values on the path u..v (inclusive)
+//   hld_update(hld, node, new_value)              set node's value (updates the BIT)
+//   hld_lca(hld, u, v) -> int                     lowest common ancestor of u and v
+//   hld_subtree_sum(hld, u) -> int                sum of values in the subtree rooted at u
+// LEAF (imports nothing).
+
+// Build children adjacency from parent array.
+fn _hld_children(n: int, parent: list) -> list
+    let children = []
+    let i = 0
+    while i < n
+        push(children, [])
+        i = i + 1
+    let v = 0
+    while v < n
+        let p = parent[v]
+        if p >= 0
+            push(children[p], v)
+        v = v + 1
+    return children
+
+// Iterative subtree-size + heavy-child computation (post-order via explicit stack).
+fn _hld_sizes(n: int, root: int, children: list) -> list
+    let size = []
+    let heavy = []
+    let order = []
+    let i = 0
+    while i < n
+        push(size, 1)
+        push(heavy, 0 - 1)
+        push(order, 0)
+        i = i + 1
+    // produce a post-order via stack
+    let stack = [root]
+    let post = []
+    while len(stack) > 0
+        let node = stack[len(stack) - 1]
+        let new_stack = []
+        let si = 0
+        while si < len(stack) - 1
+            push(new_stack, stack[si])
+            si = si + 1
+        stack = new_stack
+        push(post, node)
+        let ch = children[node]
+        let ci = 0
+        while ci < len(ch)
+            push(stack, ch[ci])
+            ci = ci + 1
+    // process post in REVERSE (children before parents)
+    let idx = len(post) - 1
+    while idx >= 0
+        let node = post[idx]
+        let ch = children[node]
+        let max_sz = 0
+        let hc = 0 - 1
+        let ci = 0
+        while ci < len(ch)
+            let c = ch[ci]
+            size[node] = size[node] + size[c]
+            if size[c] > max_sz
+                max_sz = size[c]
+                hc = c
+            ci = ci + 1
+        heavy[node] = hc
+        idx = idx - 1
+    return [size, heavy]
+
+// Build HLD. Returns a big struct list.
+fn hld_build(n: int, parent: list, root: int, values: list) -> list
+    let children = _hld_children(n, parent)
+    let sh = _hld_sizes(n, root, children)
+    let size = sh[0]
+    let heavy = sh[1]
+    // head[], pos[] (position in base array), depth[], tin[], tout[] (Euler for subtree)
+    let head = []
+    let pos = []
+    let depth = []
+    let tin = []
+    let tout = []
+    let i = 0
+    while i < n
+        push(head, 0)
+        push(pos, 0)
+        push(depth, 0)
+        push(tin, 0)
+        push(tout, 0)
+        i = i + 1
+    // compute depth via BFS
+    let bfsq = [root]
+    depth[root] = 0
+    let qi = 0
+    while qi < len(bfsq)
+        let node = bfsq[qi]
+        qi = qi + 1
+        let ch = children[node]
+        let ci = 0
+        while ci < len(ch)
+            depth[ch[ci]] = depth[node] + 1
+            push(bfsq, ch[ci])
+            ci = ci + 1
+    // decompose: iterative DFS assigning pos in heavy-path order
+    let cur_pos_box = [0]
+    _hld_decompose(root, root, children, heavy, head, pos, tin, tout, cur_pos_box)
+    // base array laid out by pos: base[pos[v]] = values[v]
+    let base = []
+    let z = 0
+    while z < n
+        push(base, 0)
+        z = z + 1
+    let v2 = 0
+    while v2 < n
+        base[pos[v2]] = values[v2]
+        v2 = v2 + 1
+    // build Fenwick/BIT over base (1-indexed internally)
+    let bit = _hld_bit_build(base)
+    return [n, parent, root, head, pos, depth, tin, tout, bit, size, base]
+
+// Iterative decompose using a stack of [node, chain_head].
+fn _hld_decompose(root: int, chain_head: int, children: list, heavy: list, head: list, pos: list, tin: list, tout: list, cur_pos_box: list)
+    // Use a manual stack with state; we do a heavy-path-first traversal.
+    // stack entries: [node, head_of_its_chain]
+    let stack = [[root, root]]
+    // We also need Euler tin/tout for subtree; we do a separate DFS below.
+    while len(stack) > 0
+        let top = stack[len(stack) - 1]
+        let new_stack = []
+        let si = 0
+        while si < len(stack) - 1
+            push(new_stack, stack[si])
+            si = si + 1
+        stack = new_stack
+        let node = top[0]
+        let h = top[1]
+        head[node] = h
+        pos[node] = cur_pos_box[0]
+        cur_pos_box[0] = cur_pos_box[0] + 1
+        // push light children first (each starts a new chain), heavy child LAST so it is processed next
+        let ch = children[node]
+        let hc = heavy[node]
+        let ci = 0
+        while ci < len(ch)
+            let c = ch[ci]
+            if c != hc
+                push(stack, [c, c])
+            ci = ci + 1
+        if hc != 0 - 1
+            push(stack, [hc, h])
+    // compute Euler tin/tout for subtree queries via a separate iterative DFS
+    _hld_euler(root, children, tin, tout)
+
+// Euler tour tin/tout (tin = entry order, tout = exit order) for subtree = contiguous [tin, tout].
+fn _hld_euler(root: int, children: list, tin: list, tout: list)
+    let timer_box = [0]
+    // stack entries: [node, state] state 0=enter, 1=exit
+    let stack = [[root, 0]]
+    while len(stack) > 0
+        let top = stack[len(stack) - 1]
+        let new_stack = []
+        let si = 0
+        while si < len(stack) - 1
+            push(new_stack, stack[si])
+            si = si + 1
+        stack = new_stack
+        let node = top[0]
+        let state = top[1]
+        if state == 0
+            tin[node] = timer_box[0]
+            timer_box[0] = timer_box[0] + 1
+            // push exit marker then children
+            push(stack, [node, 1])
+            let ch = children[node]
+            let ci = len(ch) - 1
+            while ci >= 0
+                push(stack, [ch[ci], 0])
+                ci = ci - 1
+        else
+            tout[node] = timer_box[0] - 1
+
+// --- Fenwick / BIT over an array (1-indexed) ---
+// low-bit isolates the lowest set bit: x & (-x) == x - (x & (x-1)).
+fn _hld_lowbit(x: int) -> int
+    return x - (x & (x - 1))
+
+fn _hld_bit_build(base: list) -> list
+    let n = len(base)
+    let tree = []
+    let i = 0
+    while i <= n
+        push(tree, 0)
+        i = i + 1
+    // point-add each
+    let j = 0
+    while j < n
+        _hld_bit_add2(tree, j + 1, base[j])
+        j = j + 1
+    return tree
+
+fn _hld_bit_prefix(tree: list, idx: int) -> int
+    let s = 0
+    let i = idx
+    while i > 0
+        s = s + tree[i]
+        i = i - _hld_lowbit(i)
+    return s
+
+fn _hld_bit_range(tree: list, l: int, r: int) -> int
+    return _hld_bit_prefix(tree, r) - _hld_bit_prefix(tree, l - 1)
+
+// Update a node's value (point update on the BIT at its pos).
+fn hld_update(hld: list, node: int, new_value: int)
+    let pos = hld[4]
+    let bit = hld[8]
+    let base = hld[10]
+    let p = pos[node]
+    let old = base[p]
+    let delta = new_value - old
+    base[p] = new_value
+    _hld_bit_add2(bit, p + 1, delta)
+
+// Correct BIT add with proper low-bit increment.
+fn _hld_bit_add2(tree: list, idx: int, delta: int)
+    let n = len(tree) - 1
+    let i = idx
+    while i <= n
+        tree[i] = tree[i] + delta
+        i = i + _hld_lowbit(i)
+
+// LCA via chain heads.
+fn hld_lca(hld: list, u0: int, v0: int) -> int
+    let parent = hld[1]
+    let head = hld[3]
+    let depth = hld[5]
+    let u = u0
+    let v = v0
+    while head[u] != head[v]
+        if depth[head[u]] < depth[head[v]]
+            v = parent[head[v]]
+        else
+            u = parent[head[u]]
+    if depth[u] < depth[v]
+        return u
+    return v
+
+// Path sum between u and v (inclusive), climbing chains and summing BIT ranges.
+fn hld_path_sum(hld: list, u0: int, v0: int) -> int
+    let parent = hld[1]
+    let head = hld[3]
+    let pos = hld[4]
+    let depth = hld[5]
+    let bit = hld[8]
+    let u = u0
+    let v = v0
+    let total = 0
+    while head[u] != head[v]
+        if depth[head[u]] < depth[head[v]]
+            // swap so u is on the deeper chain
+            let tmp = u
+            u = v
+            v = tmp
+        // sum the chain from head[u] to u
+        total = total + _hld_bit_range(bit, pos[head[u]] + 1, pos[u] + 1)
+        u = parent[head[u]]
+    // now on the same chain
+    if depth[u] > depth[v]
+        let tmp = u
+        u = v
+        v = tmp
+    total = total + _hld_bit_range(bit, pos[u] + 1, pos[v] + 1)
+    return total
+
+// Subtree sum: needs base laid out by pos, but subtree is contiguous in Euler order (tin..tout), NOT pos.
+// Our BIT is over pos. In standard HLD pos == tin when we assign heavy-first (subtree IS contiguous in pos
+// too because we assign node then its whole subtree before siblings). So subtree of u = [pos[u], pos[u]+size-1].
+fn hld_subtree_sum(hld: list, u: int) -> int
+    let pos = hld[4]
+    let bit = hld[8]
+    let size = hld[9]
+    let l = pos[u] + 1
+    let r = pos[u] + size[u]
+    return _hld_bit_range(bit, l, r)
