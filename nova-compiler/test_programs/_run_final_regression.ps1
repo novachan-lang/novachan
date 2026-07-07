@@ -483,6 +483,7 @@ $concurrency_tests = @(
     'sort_string_test',
     'leak_baseline_test',
     '_struct_field_leak_test',
+    '_closure_capture_leak_test',
     'auto_reflect_test',
     'json_list_test',
     'list_dict_ops_test',
