@@ -327,6 +327,27 @@ byte-identical). Iterate stages 1-3 on gen4 (cheap ~10 min build); reconverge ON
 Injection point = `nova_compiler.nova` while-lowering `:9181` (guard+shadow wrap) + the call-result
 type special-case in the infer pass.
 
+### ★★★ STAGE 1 VALIDATED ON GEN4 (2026-07-07) — the mechanism WORKS, crux resolved
+Implemented the two builtins: `nova_rt_list_is_kind2` (sound guard) + `nova_rt_floatlist_view` (runtime
+identity; infer-pass special-case at the `op=="call"` head types its result `"floatlist"`). Built gen4
+and ran probes. Results:
+- **Soundness:** `list_is_kind2` = 1 for push-built `[1.5,2.5]` (kind 2), = **0** for mixed
+  `[1.5,"hello"]` (deopted to kind 0). Guarded reads exact (`sum_a=4.0`; the `else` boxed branch reads
+  `1.5`/`"hello"` correctly).
+- **Crux RESOLVED:** the hand-transformed probe (`touch(xs)` taint → `let xf = floatlist_view(xs)` →
+  `s = s + xf[j]` loop) compiled to **`list_get_f` + native `fadd`** (counts 2/2), only 1 residual
+  boxed add (the outer 50-iter total). So the shadow survives `slot_load` and **the accumulator stays
+  native float** — no separate temp/reconcile needed as long as the accumulator's `let` is inside the
+  versioned region.
+- **Perf:** `374 ms` vs boxed `27390 ms` = **73× faster, ~2.2×C** (from 160×C). Cliff eliminated.
+**Consequence for staging:** the auto-transform is now DE-RISKED. Best granularity = wrap the region
+that contains BOTH the `xs[j]` reads AND the accumulator `let`s (e.g. the outermost enclosing loop, or a
+function-tail split at the taint site) so cloning gives each branch its own accumulator slot (versioning
+only the innermost read-loop would leave the accumulator in a shared outer slot → typed `any` → boxed →
+no win). Bail→original (byte-identical) for anything unqualified. Builtins are implemented but UNCOMMITTED
+(WIP) — commit the complete feature (builtins + auto-transform) together after reconverge, not the
+foundation alone.
+
 ## Competitive check
 - C: contiguous double[] -- S4.0-4.4 matches (native load), S4.5 (SIMD) beats only with reduction reassoc.
 - Rust Vec<f64>: same machine code after S4.3, but NOVA needs ZERO annotation (Rust declares the type) -> NOVA wins on ergonomics at equal speed.
