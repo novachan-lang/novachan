@@ -482,6 +482,7 @@ $concurrency_tests = @(
     'deep_copy_depth_test',
     'sort_string_test',
     'leak_baseline_test',
+    '_struct_field_leak_test',
     'auto_reflect_test',
     'json_list_test',
     'list_dict_ops_test',

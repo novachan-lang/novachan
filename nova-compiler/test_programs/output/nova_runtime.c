@@ -9906,12 +9906,34 @@ static void nova_rc_free(void* ptr) {
             break;
         }
         case NOVA_MEM_STRUCT: {
-            /* A struct/closure owns its fields/captures (W5b transferred ownership;
-               make_struct rc_inc's managed field values, deep_copy deep-copies them).
-               Without dec'ing them here, a struct's heap fields (list/string/nested
-               struct) LEAK on death. Slot 0 is the type hash (non-repr-C struct) or fn
-               ptr (closure) — never a managed field, so dec slots 1..nslots-1 only.
-               (Mirrors deep_copy at ~1958: raw-copy slot 0, manage slots 1..N-1.) */
+            /* ┌── CORE_GAP (tracked): struct heap fields LEAK on drop outside arenas ──┐
+               │ This case is UNREACHABLE for the common case (nslots>0). switch(tag)   │
+               │ above uses the RAW NOVA_RC_TAG = header[-1]&0xFFFF, which for a struct  │
+               │ is the PACKED (nslots<<3)|5 (e.g. 21 for a 2-slot struct) — NOT 5. So   │
+               │ real structs fall to `default:` (header freed, fields NOT dec'd). Only  │
+               │ a 0-slot repr_c struct (tag==5) ever lands here, where the loop is a    │
+               │ no-op. Net effect: a struct's managed heap fields (list/dict/string/    │
+               │ nested struct/bytes) are NEVER released on death -> they LEAK.          │
+               │                                                                         │
+               │ Why this has been invisible: (a) Forge request handlers run in a per-   │
+               │ request ARENA (structs are ARENA_BIT -> rc no-op -> freed wholesale), so │
+               │ the whole server path is unaffected; (b) no test covered struct-field   │
+               │ drop until _struct_field_leak_test. The leak bites only NON-arena       │
+               │ struct churn (compute/game/CLI loops, the compiler itself).             │
+               │                                                                         │
+               │ DO NOT "fix" this by normalizing the tag to enable this dec loop as-is. │
+               │ make_struct (nova_compiler.nova ~16766) stores fields RAW with NO       │
+               │ nova_rc_inc — the struct is NON-OWNING. Dec'ing here would over-release  │
+               │ every aliased field -> DOUBLE-FREE / UAF. Also struct slots mix raw     │
+               │ int/float with pointers; a float field's bits fed to rc_dec are the     │
+               │ same unsoundness that makes kind=2 float-lists skip dec. The CORRECT     │
+               │ fix is type-directed ownership: emit rc_inc for MANAGED fields on        │
+               │ construct + a per-type managed-slot bitmap (type_hash->bitmap, like the  │
+               │ existing reflection registry) so this case dec's ONLY pointer slots.     │
+               │ Tracked in NOVA_DESIGN/CORE_GAPS_2026_07_03.md (Tier 0 residual).        │
+               └─────────────────────────────────────────────────────────────────────────┘
+               Slot 0 is the type hash / fn ptr — never a managed field, so the loop
+               would start at slot 1 (harmless: only runs for the nslots==0 no-op case). */
             int64_t nslots = NOVA_STRUCT_NSLOTS(ptr);
             int64_t* slots = (int64_t*)ptr;
             for (int64_t i = 1; i < nslots; i++)

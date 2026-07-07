@@ -1,0 +1,56 @@
+// _struct_field_leak_test.nova -- pins a KNOWN Tier-0 leak (see NOVA_DESIGN/CORE_GAPS_2026_07_03.md,
+// "struct heap fields leak on drop outside arenas"). A struct's managed heap fields are NOT released
+// when the struct is dropped: rc_free's `case NOVA_MEM_STRUCT` is unreachable for nslots>0 (switch
+// sees the packed tag (nslots<<3)|5, not 5), so real structs fall to `default:` (header freed, fields
+// leaked). AND make_struct stores fields with NO rc_inc (non-owning), so the case can't simply be
+// enabled without double-free. The correct fix = type-directed ownership (rc_inc managed fields on
+// construct + per-type managed-slot bitmap to dec on free). Until then, this test:
+//   (1) DOCUMENTS the leak with a live measurement (visibility for when the fix lands),
+//   (2) GUARDS against regressions that make it WORSE, and
+//   (3) VERIFIES the struct HEADER itself is still correctly reclaimed (int-only struct = 0 leak),
+//       so only the fields leak -- proving the drop machinery works and isolating the gap precisely.
+// Run under NOVA_T8_FULLRC=1 (default-on). When the field-ownership fix lands, listbox_delta -> ~O(1);
+// tighten LB_STRUCT_FIELD_MAX to catch it and flip the pass message.
+
+type IntBox
+    v: int
+
+type ListBox
+    v: list
+
+fn main()
+    // (A) struct HEADER reclamation: an int-only struct must NOT leak (proves drop fires + header freed).
+    let b0 = live_count()
+    let i = 0
+    while i < 2000
+        let x = IntBox(i)
+        let _u = x.v
+        i = i + 1
+    let intbox_delta = live_count() - b0
+
+    // (B) struct FIELD reclamation: a heap-field struct currently leaks its field on drop (the gap).
+    let b1 = live_count()
+    let j = 0
+    while j < 2000
+        let y = ListBox([j, j + 1])
+        let _w = len(y.v)
+        j = j + 1
+    let listbox_delta = live_count() - b1
+
+    print("struct_field_leak intbox=" + str(intbox_delta) + " listbox=" + str(listbox_delta))
+
+    // Invariant (A): the struct header path is SOUND -- int-only structs are fully reclaimed.
+    if intbox_delta > 10
+        print("struct_field_leak_test FAILED: struct HEADER leaks (drop machinery regressed) intbox=" + str(intbox_delta))
+        exit(1)
+
+    // Guard (B): the KNOWN field leak must not get WORSE. Current baseline ~4000 (2 objs/iter x 2000).
+    // When the type-directed field-ownership fix lands, this drops to ~O(1) -- tighten the bound then.
+    let LB_STRUCT_FIELD_MAX = 6000
+    if listbox_delta > LB_STRUCT_FIELD_MAX
+        print("struct_field_leak_test FAILED: field leak got WORSE than baseline listbox=" + str(listbox_delta))
+        exit(1)
+
+    if listbox_delta <= 10
+        print("struct_field_leak_test: FIELD LEAK CLOSED (listbox=" + str(listbox_delta) + ") -- tighten this test + update CORE_GAPS")
+    print("struct_field_leak_test passed (header sound; field leak pinned at known baseline)")
