@@ -41,7 +41,7 @@ $core_tests = @(
     'corex_lib_test','strx_lib_test','urlx_lib_test','csvx_lib_test','bignum_lib_test','complexnum_lib_test','rational_lib_test','basex_lib_test','setops_lib_test','matrixx_lib_test','collx_lib_test','getin_lib_test','prng_lib_test','uuid_lib_test','bitset_lib_test','graphemex_lib_test','pvecx_lib_test','coro_lib_test','dframe_lib_test','linalg_lib_test','autograd_lib_test','autograd_train_test','qb_lib_test','optimizers_lib_test','schema_lib_test','ndarray_lib_test','unitext_lib_test','forge_limits_lib_test','forge_connguard_test','otp_lib_test','telemetry_lib_test',
     'audio_synth_test','render_test','gpu_vadd_test','unsafe_test',
     'ffi_strlen_test','ffi_libc_test','ffi_dedupe_test','ffi_link_test','ffi_linksrc_test','ffi_opaque_test','ffi_out_test','ffi_repr_c_test',
-    'prof_test','demo_sqlite_test','demo_sqlite_bind_test','sqlitex_test','forge_db_test','forge_typed_db_test','forge_hero_test','demo_forge_crud_test','forge_typed_query_test','forge_orm_test','_orm_null_test','_mysql_test','demo_http_server_test','demo_forge_test','demo_forge_v2_test',
+    'prof_test','demo_sqlite_test','demo_sqlite_bind_test','sqlitex_test','forge_db_test','forge_typed_db_test','forge_hero_test','demo_forge_crud_test','showcase_taskflow_test','forge_typed_query_test','forge_orm_test','_orm_null_test','_mysql_test','demo_http_server_test','demo_forge_test','demo_forge_v2_test',
     'demo_forge_todo_test','demo_cortex_serve_test','demo_pulse_test','demo_mesh_test','demo_sentinel_test',
     'demo_ops_test','demo_reactor_test','demo_prism_test','demo_edge_test','demo_full_stack_test','demo_frameworks_v2_test',
     't8_w5_test','t8_w5b_test','t8_w5b_auto','t8_w6_test','t8_w7_test','t8_soundness_test','t8_channel_test','t8_w8_test',
@@ -485,6 +485,7 @@ $concurrency_tests = @(
     '_struct_field_leak_test',
     '_closure_capture_leak_test',
     '_struct_arena_masked_test',
+    '_eq_mixed_test',
     'auto_reflect_test',
     'json_list_test',
     'list_dict_ops_test',
@@ -597,7 +598,11 @@ $testScript = {
     $ll  = "$workDir\$testName.ll"
     $exe = "$workDir\$testName.exe"
 
-    $cr = _RunProc $compilerPath "$testName.nova" 60000 $workDir
+    # 150s (was 60s): the self-hosted compiler is a heavy binary; with up to 8 compiles running
+    # concurrently (maxParallel) on a contended machine a single compile can exceed 60s wall-time and
+    # spuriously "COMPILE exit=-1" (a timeout), failing the CI on a ROTATING set of innocent tests that
+    # all pass individually. 150s absorbs the contention while still catching a genuinely hung compile.
+    $cr = _RunProc $compilerPath "$testName.nova" 150000 $workDir
     if ($cr.T -or $cr.X -ne 0) {
         $r.Status = "FAIL"; $r.Detail = "COMPILE exit=$($cr.X)"; return $r
     }

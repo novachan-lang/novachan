@@ -1,0 +1,284 @@
+// showcase_taskflow -- a REAL, substantial full-stack NOVA service in ONE language, ONE file.
+// A task/project-management REST API that a person would actually ship:
+//   * HTTP routing with path params (/api/projects/:id/tasks) and query filters (?status=&page=)
+//   * API-key auth middleware (X-API-Key) that leaves /health open
+//   * typed JSON in/out -- from_json into a struct, return your type -> JSON array/object
+//   * SQLite persistence via forge_db, every value parameterized (injection-safe)
+//   * input validation with correct status codes (400/401/404)
+//   * pagination + status filtering + an aggregation endpoint
+// It is exercised END-TO-END in-process via forge.dispatch_req, so it is fully self-verifying with
+// no sockets (deterministic + kill-safe). This is NOVA's "one dev builds a real product" identity.
+import forge
+import forge_db
+
+// ---------------------------------------------------------------- domain model
+type Project
+    id: int
+    name: string
+    created: string
+
+type Task
+    id: int
+    project_id: int
+    title: string
+    status: string
+    created: string
+
+// ---------------------------------------------------------------- helpers
+// Next surrogate id for a table (COALESCE(MAX(id),0)+1). Table name is an internal constant,
+// never user input -> no injection surface; all VALUES below are parameterized.
+fn _next_id(pool, table: string) -> int
+    let rows = forge_db.pool_query(pool, "SELECT COALESCE(MAX(id),0)+1 FROM " + table, [])
+    if len(rows) == 0
+        return 1
+    return parse_int(rows[0][0])
+
+// A monotonically increasing pseudo-timestamp keeps the self-test deterministic while modelling
+// a "created" column. In a real deploy this would be an epoch/ISO clock.
+fn _stamp(pool, table: string) -> string
+    return "t" + str(_next_id(pool, table))
+
+fn _project_exists(pool, pid: int) -> int
+    let rows = forge_db.pool_query(pool, "SELECT id FROM projects WHERE id = ?", [pid])
+    return len(rows)
+
+// Safe string accessors: a missing dict key yields int 0 (not ""), so guard with contains() before
+// treating a header/query value as a string -- otherwise "0 != ''" is true and downstream string ops
+// (parse_int, comparisons) see a non-string. This is the robust idiom for optional request params.
+fn _hget(req: Request, name: string) -> string
+    if contains(req.headers, name)
+        return req.headers[name]
+    return ""
+
+fn _qget(req: Request, name: string) -> string
+    if contains(req.query, name)
+        return req.query[name]
+    return ""
+
+// ---------------------------------------------------------------- middleware
+// API-key gate. /health is public; everything else needs a matching X-API-Key.
+fn require_key(req: Request, next, key: string)
+    if req.path == "/health"
+        return next(req)
+    if _hget(req, "x-api-key") != key
+        return forge.resp_error(401, "missing or invalid API key")
+    return next(req)
+
+// ---------------------------------------------------------------- handlers: projects
+// POST /api/projects  {"name": "..."} -> 201 Project
+fn create_project(req: Request, pool) -> Response
+    let inp: Project = from_json(req.body)
+    if inp.name == ""
+        return forge.resp_error(400, "project name is required")
+    let pid = _next_id(pool, "projects")
+    let ts = _stamp(pool, "projects")
+    forge_db.pool_query(pool, "INSERT INTO projects (id, name, created) VALUES (?, ?, ?)", [pid, inp.name, ts])
+    return forge.resp_json(201, Project(pid, inp.name, ts))
+
+// GET /api/projects?page=N  -> paginated JSON array (page size 5)
+fn list_projects(req: Request, pool) -> Response
+    let page = 1
+    let qp = _qget(req, "page")
+    if qp != ""
+        page = parse_int(qp)
+    if page < 1
+        page = 1
+    let size = 5
+    let off = (page - 1) * size
+    let rows = forge_db.pool_query(pool, "SELECT id, name, created FROM projects ORDER BY id LIMIT ? OFFSET ?", [size, off])
+    let out = []
+    for r in rows
+        push(out, Project(parse_int(r[0]), r[1], r[2]))
+    return forge.resp_json(200, out)
+
+// GET /api/projects/:id  -> 200 Project | 404
+fn get_project(req: Request, pool) -> Response
+    let pid = parse_int(req.params["id"])
+    let rows = forge_db.pool_query(pool, "SELECT id, name, created FROM projects WHERE id = ?", [pid])
+    if len(rows) == 0
+        return forge.resp_error(404, "project not found")
+    let r = rows[0]
+    return forge.resp_json(200, Project(parse_int(r[0]), r[1], r[2]))
+
+// DELETE /api/projects/:id  -> 204 (cascades its tasks) | 404
+fn delete_project(req: Request, pool) -> Response
+    let pid = parse_int(req.params["id"])
+    if _project_exists(pool, pid) == 0
+        return forge.resp_error(404, "project not found")
+    forge_db.pool_query(pool, "DELETE FROM tasks WHERE project_id = ?", [pid])
+    forge_db.pool_query(pool, "DELETE FROM projects WHERE id = ?", [pid])
+    return forge.resp_no_content()
+
+// ---------------------------------------------------------------- handlers: tasks
+// POST /api/projects/:id/tasks  {"title": "..."} -> 201 Task | 400 | 404
+fn create_task(req: Request, pool) -> Response
+    let pid = parse_int(req.params["id"])
+    if _project_exists(pool, pid) == 0
+        return forge.resp_error(404, "project not found")
+    let inp: Task = from_json(req.body)
+    if inp.title == ""
+        return forge.resp_error(400, "task title is required")
+    let tid = _next_id(pool, "tasks")
+    let ts = _stamp(pool, "tasks")
+    forge_db.pool_query(pool, "INSERT INTO tasks (id, project_id, title, status, created) VALUES (?, ?, ?, ?, ?)", [tid, pid, inp.title, "open", ts])
+    return forge.resp_json(201, Task(tid, pid, inp.title, "open", ts))
+
+// GET /api/projects/:id/tasks?status=open  -> filtered JSON array
+fn list_tasks(req: Request, pool) -> Response
+    let pid = parse_int(req.params["id"])
+    if _project_exists(pool, pid) == 0
+        return forge.resp_error(404, "project not found")
+    let want = _qget(req, "status")
+    let rows = []
+    if want == ""
+        rows = forge_db.pool_query(pool, "SELECT id, project_id, title, status, created FROM tasks WHERE project_id = ? ORDER BY id", [pid])
+    else
+        rows = forge_db.pool_query(pool, "SELECT id, project_id, title, status, created FROM tasks WHERE project_id = ? AND status = ? ORDER BY id", [pid, want])
+    let out = []
+    for r in rows
+        push(out, Task(parse_int(r[0]), parse_int(r[1]), r[2], r[3], r[4]))
+    return forge.resp_json(200, out)
+
+// PATCH /api/tasks/:id  {"status": "done"} -> 200 Task | 400 | 404
+fn update_task(req: Request, pool) -> Response
+    let tid = parse_int(req.params["id"])
+    let rows = forge_db.pool_query(pool, "SELECT id, project_id, title, status, created FROM tasks WHERE id = ?", [tid])
+    if len(rows) == 0
+        return forge.resp_error(404, "task not found")
+    let inp: Task = from_json(req.body)
+    let st = inp.status
+    if st != "open" and st != "in_progress" and st != "done"
+        return forge.resp_error(400, "status must be open|in_progress|done")
+    forge_db.pool_query(pool, "UPDATE tasks SET status = ? WHERE id = ?", [st, tid])
+    let r = rows[0]
+    return forge.resp_json(200, Task(tid, parse_int(r[1]), r[2], st, r[4]))
+
+// ---------------------------------------------------------------- handlers: stats + health
+// GET /api/stats -> aggregated counts by task status (a real dashboard summary)
+fn stats(req: Request, pool) -> Response
+    let rows = forge_db.pool_query(pool, "SELECT status, COUNT(*) FROM tasks GROUP BY status ORDER BY status", [])
+    let counts = {}
+    for r in rows
+        counts[r[0]] = parse_int(r[1])
+    let pr = forge_db.pool_query(pool, "SELECT COUNT(*) FROM projects", [])
+    let nprojects = 0
+    if len(pr) > 0
+        nprojects = parse_int(pr[0][0])
+    let body = {}
+    body["projects"] = nprojects
+    body["tasks_by_status"] = counts
+    return forge.resp_json(200, body)
+
+fn health(req: Request) -> Response
+    let body = {}
+    body["status"] = "ok"
+    body["service"] = "taskflow"
+    return forge.resp_json(200, body)
+
+// ---------------------------------------------------------------- wiring
+fn build_app(pool, key: string)
+    let a = forge.app()
+    let p = pool
+    let k = key
+    forge.use(a, fn(req, next) require_key(req, next, k))
+
+    forge.get(a, "/health", fn(req) health(req))
+    forge.post(a, "/api/projects", fn(req) create_project(req, p))
+    forge.get(a, "/api/projects", fn(req) list_projects(req, p))
+    forge.get(a, "/api/projects/:id", fn(req) get_project(req, p))
+    forge.delete(a, "/api/projects/:id", fn(req) delete_project(req, p))
+    forge.post(a, "/api/projects/:id/tasks", fn(req) create_task(req, p))
+    forge.get(a, "/api/projects/:id/tasks", fn(req) list_tasks(req, p))
+    forge.patch(a, "/api/tasks/:id", fn(req) update_task(req, p))
+    forge.get(a, "/api/stats", fn(req) stats(req, p))
+    return a
+
+// ---------------------------------------------------------------- in-process test harness
+fn _req(a, key: string, line: string, body: string) -> Response
+    let hdr = line + "\r\nX-API-Key: " + key + "\r\nContent-Length: " + str(len(body)) + "\r\n\r\n"
+    return forge.dispatch_req(a, forge.build_request(hdr + body, 0))
+
+fn _req_nokey(a, line: string) -> Response
+    return forge.dispatch_req(a, forge.build_request(line + "\r\n\r\n", 0))
+
+fn main()
+    let q = chr(34)
+    let key = "secret-key-123"
+    let pool = forge_db.pool_open("_taskflow.db", 2)
+    forge_db.pool_exec(pool, "DROP TABLE IF EXISTS tasks")
+    forge_db.pool_exec(pool, "DROP TABLE IF EXISTS projects")
+    forge_db.pool_exec(pool, "CREATE TABLE projects (id INTEGER, name TEXT, created TEXT)")
+    forge_db.pool_exec(pool, "CREATE TABLE tasks (id INTEGER, project_id INTEGER, title TEXT, status TEXT, created TEXT)")
+    let a = build_app(pool, key)
+
+    // --- health is public (no key) ---
+    let h: Response = _req_nokey(a, "GET /health HTTP/1.1")
+    assert(h.status == 200, "GET /health -> 200 (public)")
+    assert(find(h.body, q + "status" + q + ":" + q + "ok" + q) >= 0, "health reports ok")
+
+    // --- auth gate: no key -> 401 ---
+    let unauth: Response = _req_nokey(a, "GET /api/projects HTTP/1.1")
+    assert(unauth.status == 401, "GET /api/projects without key -> 401")
+
+    // --- create two projects ---
+    let cp1: Response = _req(a, key, "POST /api/projects HTTP/1.1", "\{" + q + "name" + q + ":" + q + "Website" + q + "\}")
+    assert(cp1.status == 201, "POST /api/projects -> 201")
+    assert(find(cp1.body, q + "name" + q + ":" + q + "Website" + q) >= 0, "created project echoes name")
+    let cp2: Response = _req(a, key, "POST /api/projects HTTP/1.1", "\{" + q + "name" + q + ":" + q + "Mobile App" + q + "\}")
+    assert(cp2.status == 201, "POST /api/projects (2) -> 201")
+
+    // --- validation: empty name -> 400 ---
+    let bad: Response = _req(a, key, "POST /api/projects HTTP/1.1", "\{" + q + "name" + q + ":" + q + q + "\}")
+    assert(bad.status == 400, "POST /api/projects empty name -> 400")
+
+    // --- get one project / 404 ---
+    let g1: Response = _req(a, key, "GET /api/projects/1 HTTP/1.1", "")
+    assert(g1.status == 200, "GET /api/projects/1 -> 200")
+    assert(find(g1.body, q + "name" + q + ":" + q + "Website" + q) >= 0, "project 1 is Website")
+    let g404: Response = _req(a, key, "GET /api/projects/999 HTTP/1.1", "")
+    assert(g404.status == 404, "GET /api/projects/999 -> 404")
+
+    // --- list projects (paginated) ---
+    let lp: Response = _req(a, key, "GET /api/projects HTTP/1.1", "")
+    assert(lp.status == 200, "GET /api/projects -> 200")
+    assert(find(lp.body, q + "Website" + q) >= 0, "list has Website")
+    assert(find(lp.body, q + "Mobile App" + q) >= 0, "list has Mobile App")
+
+    // --- tasks under project 1 ---
+    let ct1: Response = _req(a, key, "POST /api/projects/1/tasks HTTP/1.1", "\{" + q + "title" + q + ":" + q + "Design homepage" + q + "\}")
+    assert(ct1.status == 201, "POST task -> 201")
+    assert(find(ct1.body, q + "status" + q + ":" + q + "open" + q) >= 0, "new task defaults to open")
+    let ct2: Response = _req(a, key, "POST /api/projects/1/tasks HTTP/1.1", "\{" + q + "title" + q + ":" + q + "Write copy" + q + "\}")
+    assert(ct2.status == 201, "POST task 2 -> 201")
+
+    // task under missing project -> 404
+    let ctm: Response = _req(a, key, "POST /api/projects/999/tasks HTTP/1.1", "\{" + q + "title" + q + ":" + q + "x" + q + "\}")
+    assert(ctm.status == 404, "POST task on missing project -> 404")
+
+    // --- update a task's status ---
+    let up: Response = _req(a, key, "PATCH /api/tasks/1 HTTP/1.1", "\{" + q + "status" + q + ":" + q + "done" + q + "\}")
+    assert(up.status == 200, "PATCH /api/tasks/1 -> 200")
+    assert(find(up.body, q + "status" + q + ":" + q + "done" + q) >= 0, "task 1 now done")
+    let upbad: Response = _req(a, key, "PATCH /api/tasks/1 HTTP/1.1", "\{" + q + "status" + q + ":" + q + "bogus" + q + "\}")
+    assert(upbad.status == 400, "PATCH bad status -> 400")
+
+    // --- filter tasks by status ---
+    let lt_open: Response = _req(a, key, "GET /api/projects/1/tasks?status=open HTTP/1.1", "")
+    assert(lt_open.status == 200, "GET tasks?status=open -> 200")
+    assert(find(lt_open.body, q + "Write copy" + q) >= 0, "open filter includes Write copy")
+    assert(find(lt_open.body, q + "Design homepage" + q) < 0, "open filter excludes the done task")
+
+    // --- stats aggregation ---
+    let st: Response = _req(a, key, "GET /api/stats HTTP/1.1", "")
+    assert(st.status == 200, "GET /api/stats -> 200")
+    assert(find(st.body, q + "done" + q + ":1") >= 0, "stats: 1 done task")
+    assert(find(st.body, q + "open" + q + ":1") >= 0, "stats: 1 open task")
+
+    // --- delete a project (cascade) then confirm 404 ---
+    let del: Response = _req(a, key, "DELETE /api/projects/2 HTTP/1.1", "")
+    assert(del.status == 204, "DELETE /api/projects/2 -> 204")
+    let after: Response = _req(a, key, "GET /api/projects/2 HTTP/1.1", "")
+    assert(after.status == 404, "deleted project now 404")
+
+    forge_db.pool_close(pool, 2)
+    print("showcase_taskflow_test passed -- full REST service: auth + CRUD + tasks + filter + stats, all in one NOVA file")
