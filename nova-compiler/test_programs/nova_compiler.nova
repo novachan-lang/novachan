@@ -5298,6 +5298,10 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_stdin_read_n"
     else if name == "stdout_write"
         "nova_rt_stdout_write"
+    else if name == "list_is_kind2"
+        "nova_rt_list_is_kind2"
+    else if name == "floatlist_view"
+        "nova_rt_floatlist_view"
     else if name == "tensor_zeros"
         "nova_rt_tensor_zeros"
     else if name == "tensor_from_list"
@@ -6509,6 +6513,8 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare void @nova_rt_http_send_raw(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_stdin_read_n(i64) nounwind")
     emit(cg, "declare void @nova_rt_stdout_write(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_list_is_kind2(i64) nounwind readonly")
+    emit(cg, "declare i64 @nova_rt_floatlist_view(i64) nounwind readnone")
     emit(cg, "declare i64 @nova_rt_tensor_zeros(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_tensor_from_list(i64, i64) nounwind")
     emit(cg, "declare i64 @nova_rt_tensor_shape(i64) nounwind")
@@ -10080,6 +10086,295 @@ fn ir_try_fill_loop(b: IrBuilder, body: list, i: int) -> int
     b.ir_locals[cvname] = 1
     return 3
 
+// ── S4.2 escape-versioning pre-pass (see S4_TYPED_ARRAYS_DESIGN.md §AUTO-TRANSFORM) ──────────────────
+// A float array that ESCAPES (passed to a fn) is demoted floatlist->val by taint, so a later hot
+// `xs[j]` read falls to the boxed path (160xC). This pre-pass wraps such a loop in
+// `if list_is_kind2(xs) == 1: <fast clone> else: <original>`; the fast clone shadows xs via
+// `floatlist_view(xs)` (typed floatlist on a fresh reg) and ALPHA-RENAMES every local it declares/writes
+// (NOVA uses name-based slots -> a shared name = shared boxed slot = no win). SOUND by construction (the
+// runtime guard yields the fast path ONLY for a kind-2 list, else the byte-identical original). BOUNDED:
+// bails (-> original) on any tag/shape it does not fully handle. Stmt fields are polymorphic per tag, so
+// body is always Stmt-list; else_body is Stmt-list ONLY for while/if (Expr-list [LHS] for indexed-assign).
+
+fn s4_stmt_is_block(tag: string) -> int
+    if tag == "while" or tag == "if" or tag == "for"
+        return 1
+    return 0
+
+// Typed accessors: a list element (body[i]/children[i]/else_body[i]) is `any`; field access `.tag` on
+// `any` reads a wrong offset. Passing it through a typed param coerces it (same as ir_lower_stmt(body[i]))
+// so the field read is correct. ALWAYS route list-element field reads through these.
+fn s4_et(e: Expr) -> string
+    return e.tag
+fn s4_ev(e: Expr) -> string
+    return e.value
+fn s4_st(s: Stmt) -> string
+    return s.tag
+fn s4_child0(e: Expr) -> Expr
+    return e.children[0]
+
+// does Expr e read `var[...]` anywhere?
+fn s4_e_reads_idx(e: Expr, var: string) -> int
+    if e.tag == "index" and len(e.children) >= 1
+        let h0 = s4_child0(e)
+        if h0.tag == "ident" and h0.value == var
+            return 1
+    for c in e.children
+        if s4_e_reads_idx(c, var) == 1
+            return 1
+    for f in e.fields
+        if s4_e_reads_idx(f, var) == 1
+            return 1
+    return 0
+
+// does Stmt s (recursively) read `var[...]`?
+fn s4_s_reads_idx(s: Stmt, var: string) -> int
+    if s4_e_reads_idx(s.expr, var) == 1
+        return 1
+    for bs in s.body
+        if s4_s_reads_idx(bs, var) == 1
+            return 1
+    if s4_stmt_is_block(s.tag) == 1
+        for es in s.else_body
+            if s4_s_reads_idx(es, var) == 1
+                return 1
+    return 0
+
+// does Expr e use `var` as a plain call ARGUMENT (an escape)? (var appearing as an ident child of a
+// "call" -- excludes `var[j]` which is an "index" node, not a call arg)
+fn s4_e_escapes(e: Expr, var: string) -> int
+    if e.tag == "call"
+        for a in e.children
+            if s4_et(a) == "ident" and s4_ev(a) == var
+                return 1
+    for c in e.children
+        if s4_e_escapes(c, var) == 1
+            return 1
+    for f in e.fields
+        if s4_e_escapes(f, var) == 1
+            return 1
+    return 0
+
+fn s4_s_escapes(s: Stmt, var: string) -> int
+    if s4_e_escapes(s.expr, var) == 1
+        return 1
+    for bs in s.body
+        if s4_s_escapes(bs, var) == 1
+            return 1
+    if s4_stmt_is_block(s.tag) == 1
+        for es in s.else_body
+            if s4_s_escapes(es, var) == 1
+                return 1
+    return 0
+
+// does Stmt s mutate `var` in place? push(var,..) OR var[i]=.. (index-set). Over-detect -> safer bail.
+fn s4_s_mutates(s: Stmt, var: string) -> int
+    // indexed-assign: Stmt("assign", "", rhs, .., else_body=[LHS index Expr])
+    if s.tag == "assign" and s.name == ""
+        for lhs in s.else_body
+            if s4_et(lhs) == "index" and s4_e_reads_idx(lhs, var) == 1
+                return 1
+    if s4_e_mutates(s.expr, var) == 1
+        return 1
+    for bs in s.body
+        if s4_s_mutates(bs, var) == 1
+            return 1
+    if s4_stmt_is_block(s.tag) == 1
+        for es in s.else_body
+            if s4_s_mutates(es, var) == 1
+                return 1
+    return 0
+
+fn s4_e_mutates(e: Expr, var: string) -> int
+    // push(var, ..) / insert / remove / sort / index_set-style builtins with var as arg0
+    if e.tag == "call" and len(e.children) >= 1
+        let a0 = s4_child0(e)
+        if a0.tag == "ident" and a0.value == var
+            let fn2 = e.value
+            if fn2 == "push" or fn2 == "pop" or fn2 == "insert" or fn2 == "remove" or fn2 == "sort" or fn2 == "sort_by" or fn2 == "reverse" or fn2 == "clear" or fn2 == "extend" or fn2 == "append" or fn2 == "set"
+                return 1
+    for c in e.children
+        if s4_e_mutates(c, var) == 1
+            return 1
+    for f in e.fields
+        if s4_e_mutates(f, var) == 1
+            return 1
+    return 0
+
+// is Stmt s in the fully-handled tag set (so the alpha-rename below is total over it)? Exprs are handled
+// uniformly by s4_rename_e (rename idents, recurse) -- EXCEPT nodes carrying Stmt children (lambda/closure)
+// which we reject here so the rename never mis-walks a Stmt as an Expr.
+fn s4_s_ok(s: Stmt) -> int
+    let t = s.tag
+    if t != "assign" and t != "while" and t != "if" and t != "for" and t != "expr" and t != "return" and t != "break" and t != "continue"
+        return 0
+    if s4_e_ok(s.expr) == 0
+        return 0
+    for bs in s.body
+        if s4_s_ok(bs) == 0
+            return 0
+    if s4_stmt_is_block(t) == 1
+        for es in s.else_body
+            if s4_s_ok(es) == 0
+                return 0
+    else
+        for ex in s.else_body
+            if s4_e_ok(ex) == 0
+                return 0
+    for pp in s.params
+        if s4_e_ok(pp) == 0
+            return 0
+    for an in s.annotations
+        if s4_e_ok(an) == 0
+            return 0
+    return 1
+
+fn s4_e_ok(e: Expr) -> int
+    if e.tag == "lambda" or e.tag == "closure" or e.tag == "fn" or e.tag == "match" or e.tag == "block"
+        return 0
+    for c in e.children
+        if s4_e_ok(c) == 0
+            return 0
+    for f in e.fields
+        if s4_e_ok(f) == 0
+            return 0
+    return 1
+
+// collect assignment TARGET names (both `let` and reassign use tag "assign" with name) into acc
+fn s4_collect_writes(s: Stmt, acc: list)
+    if s.tag == "assign" and s.name != ""
+        if not contains(acc, s.name)
+            push(acc, s.name)
+    if s.tag == "for" and s.name != ""
+        if not contains(acc, s.name)
+            push(acc, s.name)
+    for bs in s.body
+        s4_collect_writes(bs, acc)
+    if s4_stmt_is_block(s.tag) == 1
+        for es in s.else_body
+            s4_collect_writes(es, acc)
+
+// bounded alpha-rename: clone e/s renaming any ident/target whose name is a key of map m
+fn s4_rename_e(e: Expr, m: dict) -> Expr
+    let nv = e.value
+    if e.tag == "ident" and contains(m, e.value)
+        nv = m[e.value]
+    let nc = []
+    for c in e.children
+        push(nc, s4_rename_e(c, m))
+    let nf = []
+    for f in e.fields
+        push(nf, s4_rename_e(f, m))
+    return Expr(e.tag, nv, e.num, nc, nf, e.eline)
+
+fn s4_rename_s(s: Stmt, m: dict) -> Stmt
+    let nn = s.name
+    if s.name != "" and contains(m, s.name)
+        nn = m[s.name]
+    let nexpr = s4_rename_e(s.expr, m)
+    let nbody = []
+    for bs in s.body
+        push(nbody, s4_rename_s(bs, m))
+    let neb = []
+    if s4_stmt_is_block(s.tag) == 1
+        for es in s.else_body
+            push(neb, s4_rename_s(es, m))
+    else
+        for ex in s.else_body
+            push(neb, s4_rename_e(ex, m))
+    let nparams = []
+    for pp in s.params
+        push(nparams, s4_rename_e(pp, m))
+    let nann = []
+    for an in s.annotations
+        push(nann, s4_rename_e(an, m))
+    return Stmt(s.tag, nn, nexpr, nbody, nparams, neb, nann, s.sline)
+
+// collect the base var names of index reads `V[..]` in an Expr/Stmt
+fn s4_idx_bases_e(e: Expr, acc: list)
+    if e.tag == "index" and len(e.children) >= 1
+        let b0 = s4_child0(e)
+        if b0.tag == "ident" and not contains(acc, b0.value)
+            push(acc, b0.value)
+    for c in e.children
+        s4_idx_bases_e(c, acc)
+    for f in e.fields
+        s4_idx_bases_e(f, acc)
+
+fn s4_idx_bases_s(s: Stmt, acc: list)
+    s4_idx_bases_e(s.expr, acc)
+    for bs in s.body
+        s4_idx_bases_s(bs, acc)
+    if s4_stmt_is_block(s.tag) == 1
+        for es in s.else_body
+            s4_idx_bases_s(es, acc)
+
+// build the guarded/versioned replacement for a qualifying loop reading escaped float array `xs`.
+// prevars = var names in scope BEFORE this loop (params + earlier top-level assigns) -> loop-carried.
+fn s4_make_versioned(lp: Stmt, xs: string, prevars: list) -> Stmt
+    let ln = lp.sline
+    let sfx = "__s4f" + str(ln)
+    let writes = []
+    s4_collect_writes(lp, writes)
+    let m = {}
+    m[xs] = xs + sfx
+    for w in writes
+        m[w] = w + sfx
+    let fast = []
+    for w in writes
+        if w != xs and contains(prevars, w)
+            push(fast, Stmt("assign", w + sfx, Expr("ident", w, 0, [], [], ln), [], [], [], [], ln))
+    push(fast, Stmt("assign", xs + sfx, Expr("call", "floatlist_view", 0, [Expr("ident", xs, 0, [], [], ln)], [], ln), [], [], [], [], ln))
+    push(fast, s4_rename_s(lp, m))
+    for w in writes
+        if w != xs and contains(prevars, w)
+            push(fast, Stmt("assign", w, Expr("ident", w + sfx, 0, [], [], ln), [], [], [], [], ln))
+    let guard = Expr("call", "list_is_kind2", 0, [Expr("ident", xs, 0, [], [], ln)], [], ln)
+    let slow = []
+    push(slow, lp)
+    return Stmt("if", "", guard, fast, [], slow, [], ln)
+
+// the pre-pass: transform each qualifying top-level loop in a function body. Gated OFF by default
+// (NOVA_S4_ESCAPE=1) so the default build stays byte-identical until validated.
+fn s4_versioning(body: list, pnames: list) -> list
+    let prevars = []
+    for pn in pnames
+        push(prevars, pn)
+    let out = []
+    let k = 0
+    let n = len(body)
+    while k < n
+        let s = body[k]
+        let stag = s4_st(s)
+        let did = 0
+        if (stag == "while" or stag == "for") and s4_s_ok(s) == 1
+            let bases = []
+            s4_idx_bases_s(s, bases)
+            let chosen = ""
+            for xs in bases
+                // qualify: xs not mutated in the loop, AND xs is not passed to a function INSIDE the
+                // loop (a callee could mutate/alias it mid-loop -> deopt elem_kind 2->0 -> a subsequent
+                // fast read would unbox a non-float = corruption; s4_s_mutates only catches builtin
+                // mutators, so this escape-in-loop guard closes the user-function case). `f(xs[j])` passes
+                // an element (an index node), not xs, so it does NOT trip this.
+                if chosen == "" and s4_s_mutates(s, xs) == 0 and s4_s_escapes(s, xs) == 0
+                    let esc = 0
+                    let j = 0
+                    while j < k
+                        if s4_s_escapes(body[j], xs) == 1
+                            esc = 1
+                        j = j + 1
+                    if esc == 1
+                        chosen = xs
+            if chosen != ""
+                push(out, s4_make_versioned(s, chosen, prevars))
+                did = 1
+        if did == 0
+            push(out, s)
+        s4_collect_writes(s, prevars)
+        k = k + 1
+    return out
+
 fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
     match stmt
         Stmt(tag, name, expr, body, params, else_body, annotations, sline) =>
@@ -10096,10 +10391,12 @@ fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
             if contains(b.ir_fn_param_stypes, _fnkey)
                 _inf_pst = b.ir_fn_param_stypes[_fnkey]
             let _pidx = 0
+            let _s4_pnames = []
             for p in params
                 match p
                     Param(pname, ptype, pdefault) =>
                         push(ir_params, IrParam(pname, source_type_to_ir(ptype)))
+                        push(_s4_pnames, pname)
                         if ptype != "" and (contains(b.ir_sdefs, ptype) or _is_builtin_type_name(ptype))
                             b.ir_locals[pname] = ptype
                         else if _pidx < len(_inf_pst) and contains(b.ir_sdefs, _inf_pst[_pidx])
@@ -10140,17 +10437,22 @@ fn ir_lower_function(b: IrBuilder, stmt: Stmt) -> IrFunction
                 ir_emit_defers(b)
                 ir_finish_block(b, IrInst("return", "", ir_type_void(), [gen_fib], "", 0, "pure", b.ir_cur_line))
             else
-                let n_body = len(body)
+                // S4.2 escape-versioning pre-pass (gated OFF by default -> byte-identical). When on,
+                // wraps a hot loop over an escaped float array in a list_is_kind2 guard + fast clone.
+                let s4body = body
+                if len(env("NOVA_S4_ESCAPE")) > 0
+                    s4body = s4_versioning(body, _s4_pnames)
+                let n_body = len(s4body)
                 if n_body > 0
                     let i = 0
                     while i < n_body - 1
-                        let consumed = ir_try_fill_loop(b, body, i)
+                        let consumed = ir_try_fill_loop(b, s4body, i)
                         if consumed > 0
                             i = i + consumed
                         else
-                            ir_lower_stmt(b, body[i])
+                            ir_lower_stmt(b, s4body[i])
                             i = i + 1
-                    ir_lower_last_stmt(b, body[n_body - 1])
+                    ir_lower_last_stmt(b, s4body[n_body - 1])
             ir_flush_pending_block(b)
             if len(b.ir_blocks) == 0
                 ir_finish_block(b, IrInst("return", "", ir_type_void(), ["0"], "", 0, "pure", b.ir_cur_line))
@@ -11212,6 +11514,8 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["http_send_raw"] = NTypeScheme([], nt_fn([nt_int(), nt_string()], nt_unit()))
     reg["stdin_read_n"] = NTypeScheme([], nt_fn([nt_int()], nt_string()))
     reg["stdout_write"] = NTypeScheme([], nt_fn([nt_string()], nt_unit()))
+    reg["list_is_kind2"] = NTypeScheme([], nt_fn([nt_list(nt_any())], nt_int()))
+    reg["floatlist_view"] = NTypeScheme([], nt_fn([nt_list(nt_any())], nt_list(nt_any())))
     reg["tensor_zeros"] = NTypeScheme([], nt_fn([nt_list(nt_int())], nt_any()))
     reg["tensor_from_list"] = NTypeScheme([], nt_fn([nt_list(nt_any()), nt_list(nt_int())], nt_any()))
     reg["tensor_shape"] = NTypeScheme([], nt_fn([nt_any()], nt_list(nt_int())))
@@ -14488,6 +14792,18 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     st["@nn@" + value] = store_nn
                 return inst
             else if op == "call"
+                // S4.2 escape-survival: floatlist_view(xs) is a runtime identity whose RESULT is typed
+                // "floatlist" on a fresh (untainted) register, so a post-escape xs[j] read reached via
+                // this view takes the native list_get_f path (:14836). SOUND only because the compiler
+                // emits it under a list_is_kind2(xs) guard (elem_kind==2 => provably all raw doubles).
+                if value == "nova_rt_floatlist_view" and len(args) == 1
+                    if dest != ""
+                        rt[dest] = "floatlist"
+                    return IrInst(op, dest, ir_type_any(), args, value, num, effect, line)
+                if value == "nova_rt_list_is_kind2" and len(args) == 1
+                    if dest != ""
+                        rt[dest] = "int"
+                    return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
                 if value == "nova_rt_print_any" and len(args) == 1
                     let arg_type = ir_reg_type(rt, args[0])
                     if arg_type == "bool"
@@ -18052,6 +18368,8 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare void @nova_rt_http_send_raw(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_stdin_read_n(i64) nounwind")
     ire_line(e, "declare void @nova_rt_stdout_write(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_list_is_kind2(i64) nounwind readonly")
+    ire_line(e, "declare i64 @nova_rt_floatlist_view(i64) nounwind readnone")
     ire_line(e, "declare i64 @nova_rt_tensor_zeros(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_tensor_from_list(i64, i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_tensor_shape(i64) nounwind")

@@ -1544,6 +1544,18 @@ int64_t nova_rt_list_get_f(int64_t handle, int64_t index) {
     if (list->elem_kind == 2) return list->data[index];   /* raw double bits, no deref */
     return nova_rt_unbox(list->data[index]);              /* boxed float -> raw double bits */
 }
+/* S4.2 escape-survival helpers. list_is_kind2: SOUND runtime guard — true iff the list is still the
+   raw-double homogeneous mode (elem_kind==2). Any conflicting write deopts kind 2->0 and every alias
+   observes it, so kind==2 => provably all raw doubles. floatlist_view: runtime identity; the compiler
+   types its result "floatlist" on a FRESH untainted register so a post-escape xs[j] can take the native
+   list_get_f read — SOUND only because it is emitted under a list_is_kind2 guard. */
+int64_t nova_rt_list_is_kind2(int64_t handle) {
+    void* p = (void*)(uintptr_t)handle;
+    if (!p) return 0;
+    if (nova_mem_find_tag(p) != NOVA_MEM_LIST) return 0;
+    return (((NovaList*)p)->elem_kind == 2) ? 1 : 0;
+}
+int64_t nova_rt_floatlist_view(int64_t handle) { return handle; }
 int64_t nova_rt_list_append_bbox(int64_t handle, int64_t v) {
     return nova_rt_list_append(handle, nova_rt_box_bool(v));
 }
