@@ -1,0 +1,274 @@
+// forge_ett -- Euler-tour tree (ETT): dynamic connectivity in a FOREST via a balanced BST over the tree's
+// Euler tour. Like the link-cut tree (forge_linkcut) it maintains a forest under LINK and CUT in O(log n)
+// amortized, but via a different mechanism that also makes SUBTREE ranges contiguous. Each undirected
+// tree edge {u,v} is represented by TWO directed half-edge occurrences -- (u->v) when the DFS descends the
+// edge and (v->u) when it ascends -- and each node also has one self occurrence. This sequence of
+// occurrences (the Euler tour) is stored in an implicit treap (balanced BST keyed by in-order position).
+// Then:
+//   - CONNECTED(u,v): u,v are in the same tree iff their self-occurrences share the same treap root.
+//   - LINK(u,v): reroot u's tour to start at u, then insert  u-tour  between the two halves of v's tour
+//     split right after v's self-occurrence, plus the two new half-edges (v->u) ... (u->v).
+//   - CUT(u,v): the two half-edges (u->v) and (v->u) bound a contiguous interval that is exactly v's
+//     subtree (after rerooting to u); split that interval out and stitch the remainder back together.
+// ETT is the foundation of fully-dynamic connectivity (Holm-de Lichtenberg-Thorup) and, unlike link-cut
+// trees, makes subtree aggregates trivial (a subtree is a tour interval). It answers "are u and v
+// connected?" under an evolving edge set -- failing networks, incremental/decremental connectivity,
+// union-find with deletion.
+//
+// Occurrence model: node i's self-occurrence is treap node i (0..n-1). Half-edge occurrences are treap
+// nodes allocated on demand; edge {u,v} remembers its two occurrence ids so cut can locate them. We map
+// an undirected edge to a canonical dict key.
+//
+// API:
+//   ett_new(n) -> ett                 n isolated nodes 0..n-1
+//   ett_link(ett, u, v)               add edge {u,v} (u,v must be in different trees)
+//   ett_cut(ett, u, v)                remove edge {u,v} if present
+//   ett_connected(ett, u, v) -> bool  are u and v in the same tree?
+//   ett_component_size(ett, u) -> int number of DISTINCT nodes in u's tree
+// LEAF (imports nothing).
+
+// ett = [prio, left, right, parent, sz, is_node, edgeocc, seed_box, ncnt]
+// prio/left/right/parent/sz : treap arrays (indexed by occurrence id)
+// is_node[i] = 1 if occurrence i is a NODE self-occurrence (counts toward component size), 0 if half-edge
+// edgeocc : dict "min|max" -> [occ_uv, occ_vu] the two half-edge occurrence ids for edge {u,v}
+// seed_box : RNG state
+// ncnt[i] = number of NODE occurrences in the treap subtree rooted at i (for component size)
+fn ett_new(n: int) -> list
+    let prio = []
+    let left = []
+    let right = []
+    let parent = []
+    let sz = []
+    let is_node = []
+    let ncnt = []
+    let seed_box = [2463534242]
+    let i = 0
+    while i < n
+        push(prio, _ett_rand(seed_box))
+        push(left, 0 - 1)
+        push(right, 0 - 1)
+        push(parent, 0 - 1)
+        push(sz, 1)
+        push(is_node, 1)
+        push(ncnt, 1)
+        i = i + 1
+    let edgeocc = {}
+    return [prio, left, right, parent, sz, is_node, edgeocc, seed_box, ncnt]
+
+fn _ett_rand(seed_box: list) -> int
+    let s = seed_box[0]
+    s = s ^ (s << 13)
+    s = s & 4611686018427387903
+    s = s ^ (s >> 7)
+    s = s ^ (s << 17)
+    s = s & 4611686018427387903
+    seed_box[0] = s
+    return s
+
+// Allocate a new half-edge occurrence node; returns its id.
+fn _ett_alloc(ett: list) -> int
+    let prio = ett[0]
+    let left = ett[1]
+    let right = ett[2]
+    let parent = ett[3]
+    let sz = ett[4]
+    let is_node = ett[5]
+    let seed_box = ett[7]
+    let ncnt = ett[8]
+    push(prio, _ett_rand(seed_box))
+    push(left, 0 - 1)
+    push(right, 0 - 1)
+    push(parent, 0 - 1)
+    push(sz, 1)
+    push(is_node, 0)
+    push(ncnt, 0)
+    return len(prio) - 1
+
+fn _ett_size(ett: list, x: int) -> int
+    if x == 0 - 1
+        return 0
+    let sz = ett[4]
+    return sz[x]
+
+fn _ett_node_count(ett: list, x: int) -> int
+    // number of NODE occurrences in subtree of treap node x (for component size)
+    if x == 0 - 1
+        return 0
+    let ncnt = ett[8]
+    return ncnt[x]
+
+fn _ett_pull(ett: list, x: int)
+    if x == 0 - 1
+        return
+    let left = ett[1]
+    let right = ett[2]
+    let sz = ett[4]
+    let is_node = ett[5]
+    let ncnt = ett[8]
+    sz[x] = 1 + _ett_size(ett, left[x]) + _ett_size(ett, right[x])
+    ncnt[x] = is_node[x] + _ett_node_count(ett, left[x]) + _ett_node_count(ett, right[x])
+
+fn _ett_set_parent(ett: list, child: int, p: int)
+    if child != 0 - 1
+        let parent = ett[3]
+        parent[child] = p
+
+fn _ett_merge(ett: list, a: int, b: int) -> int
+    if a == 0 - 1
+        return b
+    if b == 0 - 1
+        return a
+    let prio = ett[0]
+    let left = ett[1]
+    let right = ett[2]
+    if prio[a] > prio[b]
+        let nr = _ett_merge(ett, right[a], b)
+        right[a] = nr
+        _ett_set_parent(ett, nr, a)
+        _ett_pull(ett, a)
+        return a
+    else
+        let nl = _ett_merge(ett, a, left[b])
+        left[b] = nl
+        _ett_set_parent(ett, nl, b)
+        _ett_pull(ett, b)
+        return b
+
+fn _ett_split(ett: list, t: int, k: int) -> list
+    if t == 0 - 1
+        return [0 - 1, 0 - 1]
+    let left = ett[1]
+    let right = ett[2]
+    let ls = _ett_size(ett, left[t])
+    if ls >= k
+        let res = _ett_split(ett, left[t], k)
+        left[t] = res[1]
+        _ett_set_parent(ett, res[1], t)
+        _ett_pull(ett, t)
+        _ett_set_parent(ett, res[0], 0 - 1)
+        return [res[0], t]
+    else
+        let res = _ett_split(ett, right[t], k - ls - 1)
+        right[t] = res[0]
+        _ett_set_parent(ett, res[0], t)
+        _ett_pull(ett, t)
+        _ett_set_parent(ett, res[1], 0 - 1)
+        return [t, res[1]]
+
+fn _ett_root(ett: list, x: int) -> int
+    let parent = ett[3]
+    let cur = x
+    while parent[cur] != 0 - 1
+        cur = parent[cur]
+    return cur
+
+fn _ett_position(ett: list, x: int) -> int
+    let left = ett[1]
+    let right = ett[2]
+    let parent = ett[3]
+    let pos = _ett_size(ett, left[x])
+    let cur = x
+    while parent[cur] != 0 - 1
+        let p = parent[cur]
+        if right[p] == cur
+            pos = pos + 1 + _ett_size(ett, left[p])
+        cur = p
+    return pos
+
+fn ett_connected(ett: list, u: int, v: int) -> bool
+    if u == v
+        return true
+    return _ett_root(ett, u) == _ett_root(ett, v)
+
+fn ett_component_size(ett: list, u: int) -> int
+    let r = _ett_root(ett, u)
+    return _ett_node_count(ett, r)
+
+// canonical edge key "min|max"
+fn _ett_ekey(u: int, v: int) -> str
+    let a = u
+    let b = v
+    if a > b
+        a = v
+        b = u
+    return str(a) + "|" + str(b)
+
+// Reroot u's tour so u's self-occurrence is at the FRONT.
+fn _ett_reroot(ett: list, u: int)
+    let root = _ett_root(ett, u)
+    let pos = _ett_position(ett, u)
+    let sp = _ett_split(ett, root, pos)
+    let a = sp[0]
+    let b = sp[1]
+    let ig = _ett_merge(ett, b, a)
+
+// Link u,v (different trees). After: v ... (v->u) u-tour (u->v) ... rest-of-v.
+fn ett_link(ett: list, u: int, v: int)
+    if ett_connected(ett, u, v)
+        return
+    let edgeocc = ett[6]
+    _ett_reroot(ett, u)
+    let root_u = _ett_root(ett, u)   // u-tour, u at front
+    // create half-edge occurrences
+    let occ_vu = _ett_alloc(ett)     // (v->u), placed BEFORE u-tour
+    let occ_uv = _ett_alloc(ett)     // (u->v), placed AFTER u-tour
+    edgeocc[_ett_ekey(u, v)] = [occ_uv, occ_vu]
+    // splice into v's tour right after v's self-occurrence
+    let root_v = _ett_root(ett, v)
+    let pos_v = _ett_position(ett, v)
+    let sp = _ett_split(ett, root_v, pos_v + 1)   // [ ...v ] [ rest ]
+    let v1 = sp[0]
+    let v2 = sp[1]
+    // new = v1 ++ (v->u) ++ u-tour ++ (u->v) ++ v2
+    let m1 = _ett_merge(ett, v1, occ_vu)
+    let m2 = _ett_merge(ett, m1, root_u)
+    let m3 = _ett_merge(ett, m2, occ_uv)
+    let ig = _ett_merge(ett, m3, v2)
+
+// Cut edge {u,v}: the two half-edge occurrences bound a contiguous interval = the child's subtree.
+// We locate both occurrences, order them, split out the interval strictly between them plus one endpoint,
+// then stitch the remaining parts and free nothing (occurrences just become detached / ignored).
+fn ett_cut(ett: list, u: int, v: int)
+    let edgeocc = ett[6]
+    let key = _ett_ekey(u, v)
+    if contains(edgeocc, key) == false
+        return
+    let occs = get(edgeocc, key, [])
+    let o1 = occs[0]
+    let o2 = occs[1]
+    let root = _ett_root(ett, o1)
+    let p1 = _ett_position(ett, o1)
+    let p2 = _ett_position(ett, o2)
+    let lo = p1
+    let hi = p2
+    if lo > hi
+        lo = p2
+        hi = p1
+    // The interval [lo, hi] inclusive is: (first half-edge) ... child-subtree ... (second half-edge).
+    // Remove positions lo..hi. Split root into A=[0,lo), B=[lo,hi], C=(hi, end].
+    // B contains the two half-edges plus the child's subtree occurrences. The child's subtree (minus the
+    // two half-edges) becomes its own tree; A ++ C becomes the parent's tree.
+    let s1 = _ett_split(ett, root, lo)       // A = s1[0], rest = s1[1]
+    let a = s1[0]
+    let rest = s1[1]
+    let s2 = _ett_split(ett, rest, hi - lo + 1)  // B = s2[0], C = s2[1]
+    let b = s2[0]
+    let c = s2[1]
+    // parent tree = A ++ C
+    let parent_tree = _ett_merge(ett, a, c)
+    _ett_set_parent(ett, parent_tree, 0 - 1)
+    // child tree = B with its two bounding half-edges removed (they're at the two ends of B).
+    // Remove first element of B (the lower half-edge) and last element of B (the higher half-edge).
+    let bsz = _ett_size(ett, b)
+    // strip first
+    let sb1 = _ett_split(ett, b, 1)          // [firstHalfEdge] [restB]
+    let restb = sb1[1]
+    // strip last of restb
+    let rbsz = _ett_size(ett, restb)
+    let child_tree = restb
+    if rbsz > 0
+        let sb2 = _ett_split(ett, restb, rbsz - 1)  // [childCore] [lastHalfEdge]
+        child_tree = sb2[0]
+    _ett_set_parent(ett, child_tree, 0 - 1)
+    // forget the edge
+    edgeocc[key] = []
