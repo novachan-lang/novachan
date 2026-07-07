@@ -1,0 +1,199 @@
+// forge_pollardbrent -- Pollard-Brent integer factorization: Brent's improvement of Pollard's rho.
+// forge_factor factors integers using Pollard's rho with FLOYD cycle detection (the tortoise-and-hare).
+// Brent's 1980 variant is a genuinely different and FASTER cycle-finding strategy: instead of advancing
+// two pointers at 1x and 2x speed (which recomputes the slow pointer's f() and costs ~3 evaluations per
+// step), Brent uses geometrically-growing "teleport" episodes (the hare jumps 1,2,4,8,... steps and the
+// tortoise is reset to the hare's position each episode), needing only ~1 f() evaluation per step. It
+// also BATCHES the gcd: instead of a gcd every iteration, it multiplies |x - y| differences together
+// modulo n and takes ONE gcd per batch of ~128, cutting expensive gcd calls ~100x. In practice Brent's
+// rho is about 25% faster than Floyd's and the standard choice in production factorers (used inside GMP,
+// SymPy, PARI/GP). All arithmetic is OVERFLOW-SAFE via a Russian-peasant mulmod so it works across the
+// full signed-64-bit range (products of two ~9e9 numbers would otherwise wrap i64).
+//
+// API:
+//   pb_factor(n) -> list       sorted prime factors of n with multiplicity (n >= 1; returns [] for n=1)
+//   pb_rho(n) -> int           one non-trivial factor of composite n via Brent's rho (or n if it fails)
+//   pb_is_prime(n) -> bool     deterministic Miller-Rabin (exact for all n < 3.3e18)
+// LEAF (imports nothing).
+
+fn _pb_addmod(a: int, b: int, m: int) -> int
+    if a >= m - b
+        return a - (m - b)
+    return a + b
+
+// overflow-safe (a*b) mod m via double-and-add
+fn _pb_mulmod(a: int, b: int, m: int) -> int
+    let r = 0
+    let x = ((a % m) + m) % m
+    let y = ((b % m) + m) % m
+    while y > 0
+        if y % 2 == 1
+            r = _pb_addmod(r, x, m)
+        x = _pb_addmod(x, x, m)
+        y = y / 2
+    return r
+
+fn _pb_powmod(base: int, exp: int, m: int) -> int
+    let r = 1 % m
+    let b = ((base % m) + m) % m
+    let e = exp
+    while e > 0
+        if e % 2 == 1
+            r = _pb_mulmod(r, b, m)
+        b = _pb_mulmod(b, b, m)
+        e = e / 2
+    return r
+
+fn _pb_gcd(a: int, b: int) -> int
+    let x = a
+    let y = b
+    if x < 0
+        x = 0 - x
+    if y < 0
+        y = 0 - y
+    while y != 0
+        let t = y
+        y = x % y
+        x = t
+    return x
+
+fn _pb_abs(x: int) -> int
+    if x < 0
+        return 0 - x
+    return x
+
+// Deterministic Miller-Rabin (12 witnesses -> exact for all n < 3.3e18).
+fn pb_is_prime(n: int) -> bool
+    if n < 2
+        return false
+    let small = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+    let i = 0
+    while i < len(small)
+        if n == small[i]
+            return true
+        if n % small[i] == 0
+            return false
+        i = i + 1
+    // write n-1 = d * 2^s
+    let d = n - 1
+    let s = 0
+    while d % 2 == 0
+        d = d / 2
+        s = s + 1
+    let wi = 0
+    while wi < len(small)
+        let a = small[wi]
+        let x = _pb_powmod(a, d, n)
+        if x != 1 and x != n - 1
+            let composite = true
+            let r = 1
+            while r < s and composite
+                x = _pb_mulmod(x, x, n)
+                if x == n - 1
+                    composite = false
+                r = r + 1
+            if composite
+                return false
+        wi = wi + 1
+    return true
+
+// f(x) = x^2 + c mod n
+fn _pb_f(x: int, c: int, n: int) -> int
+    return _pb_addmod(_pb_mulmod(x, x, n), ((c % n) + n) % n, n)
+
+// Brent's rho: find one non-trivial factor of composite n. Returns n on failure (caller retries with new c).
+fn pb_rho(n: int) -> int
+    if n % 2 == 0
+        return 2
+    // try increasing constants c and starting y until a factor emerges
+    let attempt = 1
+    while attempt <= 50
+        let c = attempt
+        let y = attempt % n
+        let m = 128
+        let g = 1
+        let r = 1
+        let q = 1
+        let x = y
+        let ys = y
+        while g == 1
+            x = y
+            let i = 0
+            while i < r
+                y = _pb_f(y, c, n)
+                i = i + 1
+            let k = 0
+            while k < r and g == 1
+                ys = y
+                let lim = m
+                if r - k < lim
+                    lim = r - k
+                let j = 0
+                while j < lim
+                    y = _pb_f(y, c, n)
+                    q = _pb_mulmod(q, _pb_abs(x - y), n)
+                    j = j + 1
+                g = _pb_gcd(q, n)
+                k = k + m
+            r = r * 2
+        if g == n
+            // backtrack step-by-step from ys
+            g = 1
+            while g == 1
+                ys = _pb_f(ys, c, n)
+                g = _pb_gcd(_pb_abs(x - ys), n)
+        if g != n and g != 1
+            return g
+        attempt = attempt + 1
+    return n
+
+// Factor n fully. Returns sorted prime factors with multiplicity.
+fn pb_factor(n: int) -> list
+    let factors = []
+    if n <= 1
+        return factors
+    // strip small primes first (fast + ensures rho gets a composite)
+    let small = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+    let m = n
+    let i = 0
+    while i < len(small)
+        let p = small[i]
+        while m % p == 0
+            push(factors, p)
+            m = m / p
+        i = i + 1
+    // recursively split the rest using a work stack
+    let stack = []
+    if m > 1
+        push(stack, m)
+    while len(stack) > 0
+        let v = stack[len(stack) - 1]
+        let new_stack = []
+        let si = 0
+        while si < len(stack) - 1
+            push(new_stack, stack[si])
+            si = si + 1
+        stack = new_stack
+        if pb_is_prime(v)
+            push(factors, v)
+        else
+            let d = pb_rho(v)
+            if d == v or d <= 1
+                // failed to split; treat as prime to avoid infinite loop (shouldn't happen for our range)
+                push(factors, v)
+            else
+                push(stack, d)
+                push(stack, v / d)
+    // sort ascending (insertion sort)
+    let a = factors
+    let n2 = len(a)
+    let k = 1
+    while k < n2
+        let key = a[k]
+        let j = k - 1
+        while j >= 0 and a[j] > key
+            a[j + 1] = a[j]
+            j = j - 1
+        a[j + 1] = key
+        k = k + 1
+    return a
