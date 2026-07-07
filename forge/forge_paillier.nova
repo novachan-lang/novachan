@@ -1,0 +1,135 @@
+// forge_paillier -- Paillier partially homomorphic encryption (1999, Pascal Paillier).
+// Paillier is the most widely deployed additive homomorphic encryption scheme: given ciphertexts
+// Enc(m1) and Enc(m2), anyone can compute Enc(m1 + m2) WITHOUT decrypting (the key never leaves
+// the server). Use cases: privacy-preserving vote tallying (e-voting, used in real elections),
+// private information retrieval, secure multi-party computation, private set intersection,
+// medical/genomic data aggregation, federated ML gradient aggregation, anonymous surveys.
+// Unlike fully-homomorphic encryption (FHE, complex/slow), Paillier supports ADDITION only but is
+// fast enough for production (used in e-voting systems, Sharemind MPC platform, etc.).
+//
+// Math: keypair uses n=p*q (product of two primes). Encrypt: c = g^m * r^n mod n^2 (r random).
+// Decrypt: uses lambda=lcm(p-1,q-1) and mu=lambda^(-1) mod n.
+// Homomorphic: c1*c2 mod n^2 decrypts to m1+m2 mod n (mul of ciphertexts = add of plaintexts).
+// Scalar multiply: c^k mod n^2 decrypts to m*k mod n (exponentiation = scalar multiplication).
+//
+// NOTE: Real Paillier needs CSPRNG for r (here we use a seeded LCG for KAT reproducibility)
+// and large n (~2048-bit) for security. This implementation uses small primes for DEMONSTRATION
+// and testing -- do NOT use for production security; use a proper crypto library for real keys.
+// The algebraic correctness is fully validated.
+//
+// API:
+//   paillier_keygen(p, q) -> [n, g, lambda, mu]   generate keypair from primes p, q
+//   paillier_encrypt(m, n, g, r) -> int            encrypt plaintext m with randomness r
+//   paillier_decrypt(c, n, lambda, mu) -> int      decrypt ciphertext c
+//   paillier_add(c1, c2, n) -> int                 homomorphic addition: Enc(m1+m2)
+//   paillier_scalar_mul(c, k, n) -> int            homomorphic scalar mul: Enc(m*k)
+// LEAF (imports nothing).
+
+// Overflow-safe addmod
+fn _pa_addmod(a: int, b: int, m: int) -> int
+    if a >= m - b
+        return a - (m - b)
+    return a + b
+
+// Overflow-safe mulmod via Russian-peasant
+fn _pa_mulmod(a: int, b: int, m: int) -> int
+    let r = 0
+    let x = ((a % m) + m) % m
+    let y = ((b % m) + m) % m
+    while y > 0
+        if y % 2 == 1
+            r = _pa_addmod(r, x, m)
+        x = _pa_addmod(x, x, m)
+        y = y / 2
+    return r
+
+// base^exp mod m (square-and-multiply, overflow-safe)
+fn _pa_powmod(base: int, exp: int, m: int) -> int
+    let r = 1 % m
+    let b = ((base % m) + m) % m
+    let e = exp
+    while e > 0
+        if e % 2 == 1
+            r = _pa_mulmod(r, b, m)
+        b = _pa_mulmod(b, b, m)
+        e = e / 2
+    return r
+
+// GCD (Euclidean)
+fn _pa_gcd(a: int, b: int) -> int
+    let x = a
+    let y = b
+    while y != 0
+        let t = y
+        y = x % y
+        x = t
+    return x
+
+// LCM
+fn _pa_lcm(a: int, b: int) -> int
+    return (a / _pa_gcd(a, b)) * b
+
+// Modular inverse via extended Euclidean
+fn _pa_modinv(a: int, m: int) -> int
+    let old_r = a
+    let r = m
+    let old_s = 1
+    let s = 0
+    while r != 0
+        let q = old_r / r
+        let tmp_r = r
+        r = old_r - q * r
+        old_r = tmp_r
+        let tmp_s = s
+        s = old_s - q * s
+        old_s = tmp_s
+    return ((old_s % m) + m) % m
+
+// L function: L(x) = (x - 1) / n  (exact integer division, x = 1 mod n guaranteed)
+fn _pa_L(x: int, n: int) -> int
+    return (x - 1) / n
+
+// Generate Paillier keypair from two distinct primes p and q.
+// Returns [n, g, lambda, mu] where:
+//   n = p*q (public modulus)
+//   g = n+1 (standard choice, simplifies decryption)
+//   lambda = lcm(p-1, q-1)
+//   mu = lambda^(-1) mod n (needed for decryption)
+fn paillier_keygen(p: int, q: int) -> list
+    let n = p * q
+    let g = n + 1
+    let lam = _pa_lcm(p - 1, q - 1)
+    // mu = (L(g^lambda mod n^2))^(-1) mod n
+    // With g = n+1: g^lambda mod n^2 = (1 + n)^lambda mod n^2 = 1 + lambda*n (binomial, n^2 terms vanish)
+    // So L(g^lambda mod n^2) = lambda mod n
+    // Therefore mu = lambda^(-1) mod n
+    let mu = _pa_modinv(lam, n)
+    return [n, g, lam, mu]
+
+// Encrypt plaintext m in [0, n-1] with randomness r in [1, n-1] with gcd(r, n)=1.
+// c = g^m * r^n mod n^2
+fn paillier_encrypt(m: int, n: int, g: int, r: int) -> int
+    let n2 = n * n
+    let gm = _pa_powmod(g, m, n2)
+    let rn = _pa_powmod(r, n, n2)
+    return _pa_mulmod(gm, rn, n2)
+
+// Decrypt ciphertext c using private key (lambda, mu).
+// m = L(c^lambda mod n^2) * mu mod n
+fn paillier_decrypt(c: int, n: int, lam: int, mu: int) -> int
+    let n2 = n * n
+    let cl = _pa_powmod(c, lam, n2)
+    let lv = _pa_L(cl, n)
+    return _pa_mulmod(lv, mu, n)
+
+// Homomorphic addition: given Enc(m1) and Enc(m2), return Enc(m1 + m2 mod n).
+// This is PURELY a multiplication of ciphertexts mod n^2 -- no key needed.
+fn paillier_add(c1: int, c2: int, n: int) -> int
+    let n2 = n * n
+    return _pa_mulmod(c1, c2, n2)
+
+// Homomorphic scalar multiplication: given Enc(m), return Enc(m * k mod n).
+// c^k mod n^2 -- no key needed.
+fn paillier_scalar_mul(c: int, k: int, n: int) -> int
+    let n2 = n * n
+    return _pa_powmod(c, k, n2)
