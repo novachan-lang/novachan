@@ -21,6 +21,7 @@ map of where the language is production-solid versus where it still has sharp ed
 | [`showcase_bst_test.nova`](../nova-compiler/test_programs/showcase_bst_test.nova) | Binary search tree: recursive struct nodes + mutable child links + insert/search/traversal | ✅ passes clean (in-order = sorted) |
 | [`showcase_rpn_test.nova`](../nova-compiler/test_programs/showcase_rpn_test.nova) | RPN calculator returning `Result` (ok/err) with `match`-based error handling over a stack | ✅ passes clean (valid + all error cases) |
 | [`showcase_hof_test.nova`](../nova-compiler/test_programs/showcase_hof_test.nova) | Functional pipeline: map/filter/reduce with `x => expr` lambdas, capturing closures, a closure factory | ✅ passes clean |
+| [`showcase_kvstore_test.nova`](../nova-compiler/test_programs/showcase_kvstore_test.nova) | Mini Redis-like key-value DB: command parsing + dict store + INCR/DECR/APPEND/DEL + error handling | ✅ passes clean (scripted session) |
 
 Run any of them (Windows, kill-on-timeout runner) from `nova-compiler/test_programs`:
 
