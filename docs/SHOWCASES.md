@@ -19,6 +19,7 @@ map of where the language is production-solid versus where it still has sharp ed
 | [`showcase_graph_test.nova`](../nova-compiler/test_programs/showcase_graph_test.nova) | BFS shortest paths over an adjacency list-of-lists, integer nodes + queue | ✅ passes clean |
 | [`showcase_hex_test.nova`](../nova-compiler/test_programs/showcase_hex_test.nova) | Binary codec: bytes↔hex + byte-wise XOR (bytes value type + bit ops) | ✅ passes clean (round-trip + OTP identity) |
 | [`showcase_bst_test.nova`](../nova-compiler/test_programs/showcase_bst_test.nova) | Binary search tree: recursive struct nodes + mutable child links + insert/search/traversal | ✅ passes clean (in-order = sorted) |
+| [`showcase_rpn_test.nova`](../nova-compiler/test_programs/showcase_rpn_test.nova) | RPN calculator returning `Result` (ok/err) with `match`-based error handling over a stack | ✅ passes clean (valid + all error cases) |
 
 Run any of them (Windows, kill-on-timeout runner) from `nova-compiler/test_programs`:
 
