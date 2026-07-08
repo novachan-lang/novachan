@@ -655,7 +655,10 @@ $testScript = {
     }
 
     $la = "-O2 -o `"$exe`" `"$ll`" `"$rtObjPath`"$xsrc $lFlags$xlib -D_CRT_SECURE_NO_WARNINGS -w"
-    $lr = _RunProc $clangExe $la 60000 $workDir
+    # 150s (was 60s): heavy networking links (-lws2_32/-ladvapi32 + large test .ll at -O2) exceed 60s
+    # under ~8-16x parallel CPU contention and spuriously "LINK"-fail a ROTATING set of forge/ws/tls
+    # tests that all link fine standalone. Matches the compile-timeout bump above.
+    $lr = _RunProc $clangExe $la 150000 $workDir
     if (-not (Test-Path $exe)) {
         $r.Status = "FAIL"; $r.Detail = "LINK"
         Remove-Item $ll -Force -ErrorAction SilentlyContinue
