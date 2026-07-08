@@ -2213,6 +2213,14 @@ int64_t nova_rt_chars(int64_t s) {
 /* ── List stdlib ──────────────────────────────────────────────────────────── */
 
 int64_t nova_rt_list_concat(int64_t a, int64_t b) {
+    /* SOUNDNESS: the `+` lowering routes here when EITHER static operand is a list, so a DYNAMIC
+       operand (any/val) that actually holds a NON-list at runtime — e.g. `[1,2] + dict["missing"]`
+       where the missing key yields int 0 — would be dereferenced as a NovaList* below (NULL/wild
+       deref -> segfault). Tag-check both first: list+list concatenates; anything else is a defined
+       type error (like `mul`/bytes), never a wild deref. */
+    if (nova_mem_find_tag((void*)(uintptr_t)a) != NOVA_MEM_LIST ||
+        nova_mem_find_tag((void*)(uintptr_t)b) != NOVA_MEM_LIST)
+        nova_panic("'+' with a list requires both operands to be lists");
     nova_list_deopt(a); nova_list_deopt(b);  /* S4.2 */
     NovaList* la = (NovaList*)(uintptr_t)a;
     NovaList* lb = (NovaList*)(uintptr_t)b;
