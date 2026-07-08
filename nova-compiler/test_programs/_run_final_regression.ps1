@@ -498,6 +498,7 @@ $concurrency_tests = @(
     'showcase_life_test',
     'showcase_graph_test',
     'showcase_hex_test',
+    'showcase_bst_test',
     'auto_reflect_test',
     'json_list_test',
     'list_dict_ops_test',

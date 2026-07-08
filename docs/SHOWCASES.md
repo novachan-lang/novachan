@@ -18,6 +18,7 @@ map of where the language is production-solid versus where it still has sharp ed
 | [`showcase_life_test.nova`](../nova-compiler/test_programs/showcase_life_test.nova) | Conway's Game of Life: 2D grid, double-buffered generations, neighbor rules | ✅ passes clean (still-life + oscillator verified) |
 | [`showcase_graph_test.nova`](../nova-compiler/test_programs/showcase_graph_test.nova) | BFS shortest paths over an adjacency list-of-lists, integer nodes + queue | ✅ passes clean |
 | [`showcase_hex_test.nova`](../nova-compiler/test_programs/showcase_hex_test.nova) | Binary codec: bytes↔hex + byte-wise XOR (bytes value type + bit ops) | ✅ passes clean (round-trip + OTP identity) |
+| [`showcase_bst_test.nova`](../nova-compiler/test_programs/showcase_bst_test.nova) | Binary search tree: recursive struct nodes + mutable child links + insert/search/traversal | ✅ passes clean (in-order = sorted) |
 
 Run any of them (Windows, kill-on-timeout runner) from `nova-compiler/test_programs`:
 
