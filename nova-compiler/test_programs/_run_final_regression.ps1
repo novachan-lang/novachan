@@ -504,6 +504,7 @@ $concurrency_tests = @(
     'showcase_kvstore_test',
     'showcase_date_test',
     'showcase_sieve_test',
+    'showcase_vm_test',
     'auto_reflect_test',
     'json_list_test',
     'list_dict_ops_test',
