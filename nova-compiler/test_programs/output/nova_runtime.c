@@ -1481,17 +1481,23 @@ int64_t nova_rt_dict_free_local(int64_t handle) {
    garbage-collects without dec'ing elements (because the compiler
    guarantees no other holder exists). */
 int64_t nova_rt_list_append_no_rc(int64_t handle, int64_t elem) {
-    NovaList* list = (NovaList*)(uintptr_t)handle;
-    if (list->size >= list->cap) {
-        int64_t old_cap = list->cap;
-        list->cap *= 2;
-        list->data = (int64_t*)nova_back_grow((void*)list,
-            (size_t)old_cap * sizeof(int64_t),
-            (size_t)list->cap * sizeof(int64_t), list->data);
-    }
-    list->data[list->size++] = elem;
-    /* INTENTIONALLY no nova_rc_inc — caller proven local. */
-    return 0;
+    /* CORE_GAP 0.10 (SOUNDNESS, 2026-07-08): the "no_rc" element-retain elision is UNSOUND and is
+       hereby DISABLED — this now retains exactly like nova_rt_list_append.
+       WHY: an UNCOUNTED insert (this elision) is irreconcilable with the COUNTED removal/overwrite
+       (nova_rt_list_set does inc-before-dec; list_remove/pop dec) and the COUNTED destructor
+       (nova_rc_free dec's every element). A process-local list built here and then mutated in place
+       (e.g. a selection-sort swap `t=xs[i]; xs[i]=xs[j]; xs[j]=t`) or freed under FULLRC over-dec'd
+       its elements: an element inserted at rc=1 (with NO insert-inc) was dec'd 1->0 by list_set's
+       drop-of-old and FREED while still aliased (the classic aggregate-into-dict-AND-list then sort
+       pattern — the freed string was ALSO a dict key). Confirmed via ASAN: heap-UAF, freed inside
+       nova_rt_list_set, string allocated by nova_rt_trim, rc 1->0. There is NO cheap precondition
+       that rescues the elision (a container must, in general, retain its elements past the scope of
+       their local owner), so we restore the universal RC invariant: INSERT RETAINS, removal/
+       destruction releases. (Matches the WASM shim _wrt_min.c, which already delegates here.)
+       The compiler still EMITS this symbol on its proven-local fast path; a genuinely-safe elision
+       would require proving no element has a droppable local owner AND the container is never
+       element-mutated — tracked as a future perf item, never a correctness shortcut. */
+    return nova_rt_list_append(handle, elem);
 }
 
 /* Append a float to a list, boxed so it keeps its type through the Any element slot.
@@ -2532,40 +2538,17 @@ int64_t nova_rt_dict_set(int64_t handle, int64_t key, int64_t val) {
     return 0;
 }
 
-/* Track 8 Week 3 (extended): dict_set variant that skips nova_rc_inc on
-   both key and value. Used when the compiler proves the dict is
-   process-local. */
+/* Track 8 Week 3 (extended): dict_set variant that USED TO skip nova_rc_inc on both key and value
+   for a compiler-proven process-local dict. CORE_GAP 0.10 (SOUNDNESS, 2026-07-08): that elision is
+   UNSOUND for the same reason as nova_rt_list_append_no_rc (see there) — an uncounted key/val insert
+   is irreconcilable with the counted dict destructor (nova_rc_free dec's every key AND val) and the
+   counted update-overwrite path. A string used as BOTH a local dict key and a local list element was
+   inserted uncounted here, then freed 1->0 by the list's in-place swap while this dict still keyed on
+   it -> UAF. Restore INSERT RETAINS by delegating to the counted nova_rt_dict_set (which also adds a
+   find_tag soundness guard on the handle). The compiler still emits this symbol on its local fast
+   path; behavior is now identical to nova_rt_dict_set. */
 int64_t nova_rt_dict_set_no_rc(int64_t handle, int64_t key, int64_t val) {
-    NovaDict* d = (NovaDict*)(uintptr_t)handle;
-    int key_is_str = nova_is_readable_str((const void*)(uintptr_t)key);  /* SOUND: drives both hash + match; a non-string key is never strcmp'd */
-    uint64_t h = nova_dict_keyhash(key, key_is_str);
-    int64_t slot = (int64_t)(h & (uint64_t)(d->idx_cap - 1));
-    while (d->idx[slot] != DICT_IDX_EMPTY) {
-        int64_t ei = d->idx[slot];
-        if (d->hashes[ei] == h && nova_dict_keymatch(d->keys[ei], key, key_is_str)) {
-            d->vals[ei] = val;
-            return 0;
-        }
-        slot = (slot + 1) & (d->idx_cap - 1);
-    }
-    if (d->size >= d->cap) {
-        int64_t old_cap = d->cap;
-        d->cap *= 2;
-        d->keys = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
-            (size_t)d->cap * sizeof(int64_t), d->keys);
-        d->vals = (int64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(int64_t),
-            (size_t)d->cap * sizeof(int64_t), d->vals);
-        d->hashes = (uint64_t*)nova_back_grow((void*)d, (size_t)old_cap * sizeof(uint64_t),
-            (size_t)d->cap * sizeof(uint64_t), d->hashes);
-    }
-    d->keys[d->size] = key;
-    d->vals[d->size] = val;
-    d->hashes[d->size] = h;
-    /* INTENTIONALLY no nova_rc_inc on key OR val — caller proven local. */
-    d->idx[slot] = d->size;
-    d->size++;
-    dict_maybe_grow(d);
-    return 0;
+    return nova_rt_dict_set(handle, key, val);
 }
 
 int64_t nova_rt_dict_get(int64_t handle, int64_t key) {
