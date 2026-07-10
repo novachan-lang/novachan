@@ -622,7 +622,20 @@ static pthread_mutex_t g_green_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
 #define NOVA_RC_MAGIC    0x4E560000
 #define NOVA_RC_ENCODE(tag) (NOVA_RC_MAGIC | (int32_t)(tag))
 #define NOVA_RC_TAG(ptr)    ((NovaMemTag)(((const int32_t*)(ptr))[-1] & 0xFFFF))
-#define NOVA_RC_VALID(ptr)  ((((const int32_t*)(ptr))[-1] & 0xFFFF0000) == (uint32_t)NOVA_RC_MAGIC)
+/* CORE_GAP 0.8: bit 16 of the tag word (0x00010000) is the HASHED flag — set ONLY by
+   nova_rt_hashed_struct_alloc to mark "slot 0 holds a registered DJB2 type hash" (a normal
+   reflectable struct). Closures (slot0=fn_ptr) and repr_c/aligned structs (no hash) never set it,
+   so nova_rc_free never does a managed-slot bitmap lookup on a non-hash slot0 (eliminates the
+   fn_ptr/first-field vs type-hash collision class structurally, not probabilistically). Bit 16 sits
+   in the magic half, so NOVA_RC_TAG (& 0xFFFF) and NOVA_STRUCT_NSLOTS are UNCHANGED; only VALID must
+   ignore it — the magic check drops 16->15 bits, immaterial given find_tag's align+range+rc+struct
+   checks. 0x4E560000 already has bit 16 = 0, so a set bit 16 yields 0x4E57xxxx. */
+#define NOVA_RC_VALID(ptr)  ((((const int32_t*)(ptr))[-1] & 0xFFFE0000) == (uint32_t)NOVA_RC_MAGIC)
+#define NOVA_STRUCT_HASHED_BIT 0x10000
+#define NOVA_STRUCT_HASHED(ptr) ((((const uint32_t*)(ptr))[-1] & 0x10000u) != 0u)
+/* CORE_GAP 0.8: per-type managed-slot bitmap lookup, consumed by nova_rc_free (above its
+   definition with the reflection registry). Forward-declared here. */
+static uint64_t nova_struct_bitmap_for_hash(int64_t hash);
 #define NOVA_RC_COUNT(ptr)  (((int32_t*)(ptr))[-2])
 /* Arena-owned marker stored in the rc field: rc_inc/dec treat the object as
    immortal (no-op) so it is never individually freed; the arena frees it wholesale.
@@ -708,6 +721,19 @@ void* nova_rt_struct_alloc(int64_t size) {
     if (nslots < 0) nslots = 0;
     if (nslots > 0x1FFF) nslots = 0x1FFF;
     NovaMemTag packed = (NovaMemTag)(((int32_t)nslots << 3) | NOVA_MEM_STRUCT);
+    return nova_heap_alloc((size_t)size, packed);
+}
+
+/* CORE_GAP 0.8: like nova_rt_struct_alloc but marks the object HASHED (slot 0 = registered DJB2
+   type hash), so nova_rc_free consults the per-type managed-slot bitmap to release the struct's
+   heap fields on death. Used by make_struct codegen for normal structs (non-repr_c, non-over-aligned).
+   Closures and repr_c/aligned structs keep nova_rt_struct_alloc (unhashed) -> no bitmap lookup on a
+   non-hash slot0 -> the fn_ptr/first-field vs type-hash collision class cannot occur. */
+void* nova_rt_hashed_struct_alloc(int64_t size) {
+    int64_t nslots = size / 8;
+    if (nslots < 0) nslots = 0;
+    if (nslots > 0x1FFF) nslots = 0x1FFF;
+    NovaMemTag packed = (NovaMemTag)((((int32_t)nslots << 3) | NOVA_MEM_STRUCT) | NOVA_STRUCT_HASHED_BIT);
     return nova_heap_alloc((size_t)size, packed);
 }
 
@@ -2825,6 +2851,11 @@ static int64_t nova_deep_copy_rec(int64_t v, NovaCopyMap* m, int depth) {
         if (!dst) { nova_rc_inc(v); return v; }
         nova_copymap_put(m, v, (int64_t)(uintptr_t)dst);
         if (nslots > 0) dst[0] = src[0];               /* type hash / fn ptr */
+        /* CORE_GAP 0.8: preserve the HASHED flag so the COPY also releases its managed fields on
+           death (deep_copy_rec returns owned rc=1 refs; without the flag the copy's rc_free would
+           skip the bitmap and leak them). Non-hashed src (closure/repr_c) -> copy stays non-hashed
+           (same status-quo behavior). */
+        if (NOVA_STRUCT_HASHED(p)) ((int32_t*)dst)[-1] |= NOVA_STRUCT_HASHED_BIT;
         for (int64_t i = 1; i < nslots; i++)
             dst[i] = nova_deep_copy_rec(src[i], m, depth + 1);
         return (int64_t)(uintptr_t)dst;
@@ -9825,6 +9856,29 @@ static void nova_rc_free(void* ptr) {
         nova_debug_record_free(ptr, 0);
     }
 #endif
+    /* CORE_GAP 0.8: struct/closure objects pack the slot count into the tag, so the raw switch value
+       ((nslots<<3)|5) never matches case NOVA_MEM_STRUCT for nslots>0 (real structs used to fall to
+       default: and LEAK their heap fields). Intercept them here via the low-3-bit kind. A HASHED
+       struct (slot0 = registered DJB2 type hash) dec's ONLY its managed pointer slots per the per-type
+       bitmap; scalar/float slots are never fed to rc_dec. Non-hashed struct-tagged objects (closures
+       with a fn_ptr slot0, repr_c/over-aligned structs with no hash) skip the bitmap entirely and free
+       the header only (status-quo: closures leak captures until Stage 2 — memory-safe, no wrong-slot
+       dec because no bitmap lookup happens on a non-hash slot0). */
+    if ((tag & 0x7) == NOVA_MEM_STRUCT) {
+        if (NOVA_STRUCT_HASHED(ptr)) {
+            int64_t nslots = NOVA_STRUCT_NSLOTS(ptr);
+            int64_t* slots = (int64_t*)ptr;
+            uint64_t mask = nova_struct_bitmap_for_hash(slots[0]);
+            if (mask) {
+                int64_t lim = nslots < 64 ? nslots : 64;   /* bitmap caps at 64 slots */
+                for (int64_t i = 1; i < lim; i++)
+                    if ((mask >> (uint64_t)i) & 1ull)
+                        nova_rc_dec_internal(slots[i]);
+            }
+        }
+        free((char*)ptr - NOVA_RC_HDR_SIZE);
+        return;
+    }
     switch (tag) {
         case NOVA_MEM_LIST: {
             NovaList* l = (NovaList*)ptr;
@@ -9896,42 +9950,10 @@ static void nova_rc_free(void* ptr) {
             free((char*)ptr - NOVA_RC_HDR_SIZE);
             break;
         }
-        case NOVA_MEM_STRUCT: {
-            /* ┌── CORE_GAP (tracked): struct heap fields LEAK on drop outside arenas ──┐
-               │ This case is UNREACHABLE for the common case (nslots>0). switch(tag)   │
-               │ above uses the RAW NOVA_RC_TAG = header[-1]&0xFFFF, which for a struct  │
-               │ is the PACKED (nslots<<3)|5 (e.g. 21 for a 2-slot struct) — NOT 5. So   │
-               │ real structs fall to `default:` (header freed, fields NOT dec'd). Only  │
-               │ a 0-slot repr_c struct (tag==5) ever lands here, where the loop is a    │
-               │ no-op. Net effect: a struct's managed heap fields (list/dict/string/    │
-               │ nested struct/bytes) are NEVER released on death -> they LEAK.          │
-               │                                                                         │
-               │ Why this has been invisible: (a) Forge request handlers run in a per-   │
-               │ request ARENA (structs are ARENA_BIT -> rc no-op -> freed wholesale), so │
-               │ the whole server path is unaffected; (b) no test covered struct-field   │
-               │ drop until _struct_field_leak_test. The leak bites only NON-arena       │
-               │ struct churn (compute/game/CLI loops, the compiler itself).             │
-               │                                                                         │
-               │ DO NOT "fix" this by normalizing the tag to enable this dec loop as-is. │
-               │ make_struct (nova_compiler.nova ~16766) stores fields RAW with NO       │
-               │ nova_rc_inc — the struct is NON-OWNING. Dec'ing here would over-release  │
-               │ every aliased field -> DOUBLE-FREE / UAF. Also struct slots mix raw     │
-               │ int/float with pointers; a float field's bits fed to rc_dec are the     │
-               │ same unsoundness that makes kind=2 float-lists skip dec. The CORRECT     │
-               │ fix is type-directed ownership: emit rc_inc for MANAGED fields on        │
-               │ construct + a per-type managed-slot bitmap (type_hash->bitmap, like the  │
-               │ existing reflection registry) so this case dec's ONLY pointer slots.     │
-               │ Tracked in NOVA_DESIGN/CORE_GAPS_2026_07_03.md (Tier 0 residual).        │
-               └─────────────────────────────────────────────────────────────────────────┘
-               Slot 0 is the type hash / fn ptr — never a managed field, so the loop
-               would start at slot 1 (harmless: only runs for the nslots==0 no-op case). */
-            int64_t nslots = NOVA_STRUCT_NSLOTS(ptr);
-            int64_t* slots = (int64_t*)ptr;
-            for (int64_t i = 1; i < nslots; i++)
-                nova_rc_dec_internal(slots[i]);
-            free((char*)ptr - NOVA_RC_HDR_SIZE);
-            break;
-        }
+        /* CORE_GAP 0.8 CLOSED: struct/closure objects (low-3-bit kind == NOVA_MEM_STRUCT) are now
+           intercepted by the pre-switch block above (type-directed managed-slot bitmap dec for HASHED
+           structs; header-only free for closures/repr_c). This case is therefore unreachable for every
+           struct tag and is intentionally omitted here — the pre-switch `return` handles them all. */
         default:
             free((char*)ptr - NOVA_RC_HDR_SIZE);
             break;
@@ -15827,6 +15849,66 @@ static const char* nova_struct_name_for_hash(int64_t hash) {
     for (int i = 0; i < g_struct_type_count; i++)
         if (g_struct_type_hashes[i] == hash) return g_struct_type_names[i];
     return NULL;
+}
+
+/* CORE_GAP 0.8 — per-type MANAGED-SLOT bitmap. Parallel to the name registry above, keyed on the
+   SAME slot-0 DJB2 type hash. Bit i set => physical slot i holds a MANAGED heap/any field that
+   nova_rc_free must dec; scalar (int/float/bool) slots stay clear so raw double bits are NEVER fed to
+   rc_dec (the kind=2 float-list hazard). The compiler registers one entry per non-repr_c struct type
+   that has >=1 managed field (mask!=0); an unregistered hash looks up 0 => dec nothing. Only objects
+   tagged HASHED reach this lookup (see nova_rc_free), so closures/repr_c never key it with a non-hash
+   slot0. Linear scan (bounded by struct-type count; only HASHED managed-field heap structs hit it —
+   all-scalar structs are SROA-stackable and never freed). Same struct/struct collision profile as the
+   name registry above (accepted; DJB2 over distinct names). */
+static int64_t  g_struct_bitmap_hashes[NOVA_MAX_STRUCT_TYPES];
+static uint64_t g_struct_bitmaps[NOVA_MAX_STRUCT_TYPES];
+static int      g_struct_bitmap_count = 0;
+void nova_rt_register_struct_bitmap(int64_t hash, int64_t mask) {
+    if (g_struct_bitmap_count >= NOVA_MAX_STRUCT_TYPES) return;
+    for (int i = 0; i < g_struct_bitmap_count; i++)
+        if (g_struct_bitmap_hashes[i] == hash) return;   /* idempotent */
+    g_struct_bitmap_hashes[g_struct_bitmap_count] = hash;
+    g_struct_bitmaps[g_struct_bitmap_count] = (uint64_t)mask;
+    g_struct_bitmap_count++;
+}
+static uint64_t nova_struct_bitmap_for_hash(int64_t hash) {
+    for (int i = 0; i < g_struct_bitmap_count; i++)
+        if (g_struct_bitmap_hashes[i] == hash) return g_struct_bitmaps[i];
+    return 0;
+}
+
+/* CORE_GAP 0.8 — mutable managed-struct field write with correct ownership. Self-classifies the
+   target slot via the type's managed-slot bitmap (slot-0 hash), so it is consistent with nova_rc_free
+   BY CONSTRUCTION and needs no compile-time field type at the call site (handles arr[i].f = x where
+   the receiver's static type is unknown). do_inc=1 => SHARE (new value came from a slot, may alias):
+   inc-BEFORE-dec so a self-assign s.f=s.f or an aliased new==old survives. do_inc=0 => MOVE (new value
+   is a fresh uniquely-owned temp): store then release the old. Non-managed slots and unhashed/closure
+   objects: plain store. Arena structs are immortal (freed wholesale) -> no per-field RC, matching
+   rc_dec's arena no-op. */
+int64_t nova_rt_field_set(int64_t struct_val, int64_t slot, int64_t newv, int64_t do_inc) {
+    int64_t* slots = (int64_t*)(uintptr_t)struct_val;
+    if (!slots) return 0;
+    /* Only a HASHED struct has a managed-slot bitmap; anything else is a plain store. */
+    if (!NOVA_STRUCT_HASHED((void*)slots)) { slots[slot] = newv; return 0; }
+    if (NOVA_RC_COUNT((void*)slots) & NOVA_RC_ARENA_BIT) { slots[slot] = newv; return 0; }
+    uint64_t mask = nova_struct_bitmap_for_hash(slots[0]);
+    if (slot >= 1 && slot < 64 && ((mask >> (uint64_t)slot) & 1ull)) {
+        /* CORE_GAP 0.8: inc-NEW only (do_inc = new value is slot-sourced / may alias; a fresh temp is
+           MOVEd, so the struct takes its existing rc=1). We deliberately do NOT dec the OLD value:
+           NOVA field reads are BORROW-based -- field_get returns the field WITHOUT rc_inc -- so the
+           ubiquitous save/restore idiom `saved = obj.f; obj.f = new; ...; obj.f = saved` holds a LIVE,
+           un-counted borrow of the old value in `saved`. Dec'ing the old here would free it out from
+           under that borrow -> use-after-free (the self-compile reconverge caught exactly this in
+           ti_infer_stmt_inner's ret_var save/restore). Net: rc_free still releases the CURRENT field on
+           drop (inc-new balances that dec); a value that is REASSIGNED away leaks (safe, bounded by the
+           reassignment count) until field_get-inc / borrow tracking lands (tracked follow-on). This keeps
+           the headline 0.8 win -- managed fields are released on struct DROP -- while staying UAF-safe. */
+        if (do_inc) nova_rc_inc(newv);
+        slots[slot] = newv;
+    } else {
+        slots[slot] = newv;
+    }
+    return 0;
 }
 
 /* Hash-keyed struct field metadata (RTTI). Recovers a struct's field names/types

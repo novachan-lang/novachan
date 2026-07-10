@@ -1,0 +1,41 @@
+// _struct_field_read_stress_test.nova -- CORE_GAP 0.8: validates the FULLRC field-read-drop relaxation.
+// The relaxation lets a struct become droppable even when its fields are read via generic (any-typed)
+// runtime calls -- len(h.items), h.items[i], len(h.name). Those calls take a BORROW of the field; the
+// relaxation trusts that a read-only nova_rt_ call at arg0 never retains the pointer, so the struct can
+// be dropped after. If that trust is WRONG (a call retains the borrow), dropping the struct on the next
+// loop-rebind frees a still-live field -> UAF, which the exact-sum check + the allocation churn catch.
+// Also asserts the struct IS actually dropped (delta ~O(1)) -- i.e. the relaxation closes the leak.
+
+type Holder
+    items: list
+    name: string
+
+fn main()
+    let base = live_count()
+    let acc = 0
+    let i = 0
+    while i < 2000
+        let h = Holder([i, i * 2, i * 3], "hh")
+        acc = acc + len(h.items)      // len_any(borrow of h.items)  -> read-only nova_rt_ call at arg0
+        acc = acc + h.items[1]        // index_get on a borrow        -> element i*2
+        acc = acc + len(h.name)       // len on a string field borrow -> 2
+        i = i + 1
+    let delta = live_count() - base
+    // churn: a UAF from wrongly dropping h while a borrow is live corrupts these reused blocks.
+    let junk = []
+    let k = 0
+    while k < 500
+        push(junk, [k, k])
+        k = k + 1
+    print("field_read_stress acc=" + str(acc) + " delta=" + str(delta))
+    // per iter: len(items)=3 + items[1]=i*2 + len("hh")=2  -> 5 + i*2
+    // sum(5, i=0..1999)=10000 ; sum(i*2)=2*1999000=3998000 ; total 4008000
+    if acc != 4008000
+        print("field_read_stress_test FAILED: value corruption (UAF from over-eager drop?) acc=" + str(acc))
+        exit(1)
+    // relaxation must make Holder droppable despite the field reads -> struct + list + string freed each
+    // iter -> delta ~O(1). (Interned "hh" is pooled, so it never contributes to the delta.)
+    if delta > 100
+        print("field_read_stress_test FAILED: struct still pinned by field read (leak) delta=" + str(delta))
+        exit(1)
+    print("field_read_stress_test passed (field reads keep the struct droppable; no UAF; leak closed)")

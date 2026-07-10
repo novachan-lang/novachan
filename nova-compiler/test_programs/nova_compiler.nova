@@ -7379,6 +7379,21 @@ fn type_name_hash(name: string) -> int
         i = i + 1
     h
 
+// CORE_GAP 0.8: is a struct/enum field's declared type a MANAGED heap value the struct must own
+// (rc_inc on construct, bitmap dec on free)? SCALARS are non-managed. CRITICAL: field type strings
+// in ir_sdefs/ir_field_types are the RAW source annotations (NOT normalized), so both cases and the
+// FFI width aliases must be recognized — a `float`/`Float` field can hold raw IEEE-754 double bits,
+// and feeding those to rc_dec is the kind=2 float-list hazard (wild deref). Excluding every scalar
+// spelling guarantees no raw scalar is ever dec'd. Everything else (string/list/dict/bytes/user
+// struct+enum names/any/generic params) is a heap pointer -> managed. This SAME predicate drives
+// make_struct's inc AND @main's bitmap mask, so they cannot disagree.
+fn ire_field_is_managed(t: string) -> bool
+    if t == "int" or t == "Int" or t == "float" or t == "Float" or t == "bool" or t == "Bool"
+        return false
+    if t == "i32" or t == "int32" or t == "i64" or t == "int64" or t == "u32" or t == "uint32" or t == "u64" or t == "uint64" or t == "isize" or t == "usize"
+        return false
+    true
+
 // Format an int64 as a decimal string using ONLY integer arithmetic. The generic
 // str() builtin falls back to nova_rt_any_to_str for values the IR optimizer
 // can't statically pin to `int`; that fallback guesses int-vs-float from the bit
@@ -9886,7 +9901,14 @@ fn ir_lower_assign_target(b: IrBuilder, target: Expr, val_reg: string)
                             mstype = mc0v
                 let fi = get_ir_field_index_for(b, mstype, value)
                 let ptr_reg = ir_fresh_reg(b)
-                ir_emit_inst(b, "field_set", ptr_reg, ir_type_void(), [target_r, val_reg], value, fi)
+                // CORE_GAP 0.8: thread the field's declared type (kind slot of typ) so the emitter can
+                // keep scalar writes inline and route managed/unknown writes through nova_rt_field_set.
+                // "" (receiver type unknown, e.g. arr[i].f=x) is treated as non-scalar -> the runtime
+                // helper self-classifies via the struct's bitmap.
+                let _fs_ftype = ""
+                if mstype != "" and contains(b.ir_field_types, mstype + "." + value)
+                    _fs_ftype = b.ir_field_types[mstype + "." + value]
+                ir_emit_inst(b, "field_set", ptr_reg, IrType(_fs_ftype, "", [], 0), [target_r, val_reg], value, fi)
             else if tag == "tuple"
                 let ti = 0
                 for tc in children
@@ -16755,6 +16777,7 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                 if is_repr_c
                     extra_slots = 0
                 let size = (num + extra_slots) * 8
+                let did_hash_alloc = false      // CORE_GAP 0.8: true when this struct is HASHED (rc_free bitmap-managed)
                 if contains(e.ire_stackable, dest)
                     // Stage 4 SROA: dest.ptr is an entry-block alloca (hoisted above) — no heap
                     // allocation. The hash + field stores + ptrtoint below are unchanged; the
@@ -16763,8 +16786,13 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     ire_indent(e, "; sroa stack struct " + dest)
                 else if contains(e.ire_repr_align, value) and e.ire_repr_align[value] > 16
                     ire_indent(e, dest + ".ptr = call ptr @nova_rt_aligned_struct_alloc(i64 " + str(size) + ", i64 " + str(e.ire_repr_align[value]) + ")")
-                else
+                else if is_repr_c
                     ire_indent(e, dest + ".ptr = call ptr @nova_rt_struct_alloc(i64 " + str(size) + ")")
+                else
+                    // CORE_GAP 0.8: normal (non-repr_c, non-over-aligned) struct -> HASHED alloc so
+                    // nova_rc_free consults the per-type managed-slot bitmap to release heap fields.
+                    ire_indent(e, dest + ".ptr = call ptr @nova_rt_hashed_struct_alloc(i64 " + str(size) + ")")
+                    did_hash_alloc = true
                 if not is_repr_c
                     let hash_val = type_name_hash(value)
                     let hash_gep = dest + ".thash"
@@ -16774,6 +16802,13 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     // runtime reflection: type_name(struct) reads slot 0 and looks up
                     // the concrete name. Dedup via the dict; zero per-construction cost.
                     e.ire_struct_types[value] = fmt_i64_decimal(hash_val)
+                // CORE_GAP 0.8: positional field types for managed-slot ownership (same source as @sfkinds@).
+                let _s8_ftypes = []
+                if did_hash_alloc and contains(e.ire_s5_sdefs, value)
+                    for _s8p in e.ire_s5_sdefs[value]
+                        match _s8p
+                            Param(_s8pn, _s8pt, _s8pd) =>
+                                push(_s8_ftypes, _s8pt)
                 let fi = 0
                 while fi < len(args)
                     let gep = dest + ".f" + str(fi)
@@ -16782,6 +16817,14 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                     ire_indent(e, "store i64 " + args[fi] + ", ptr " + gep + ", align " + str(field_align))
                     if contains(e.ire_load_origin, args[fi])
                         e.ire_slot_escaped[e.ire_load_origin[args[fi]]] = 1
+                    // CORE_GAP 0.8: the struct OWNS its managed fields. SHARE (rc_inc) a slot-sourced
+                    // value (may be aliased/reused); MOVE (no inc) a fresh temp (struct takes its rc=1).
+                    // rc_free dec's every managed slot via the bitmap, so both balance. Skip scalar
+                    // (int/float/bool) fields (never dec raw bits) and fields >=63 (bitmap caps at 63).
+                    if did_hash_alloc and fi < 63 and fi < len(_s8_ftypes)
+                        if ire_field_is_managed(_s8_ftypes[fi])
+                            if contains(e.ire_load_origin, args[fi])
+                                ire_indent(e, "call void @nova_rc_inc(i64 " + args[fi] + ")")
                     fi = fi + 1
                 ire_indent(e, dest + " = ptrtoint ptr " + dest + ".ptr to i64")
                 // #15 S5 ABI: record .ptr name so call-site scalarization can GEP from it.
@@ -16860,11 +16903,27 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                         if fg_tk == "float"
                             ire_mark_float(e, dest)
             else if op == "field_set"
-                let ptr_name = dest + ".ptr"
-                ire_indent(e, ptr_name + " = inttoptr i64 " + args[0] + " to ptr")
-                let gep = dest + ".gep"
-                ire_indent(e, gep + " = getelementptr i64, ptr " + ptr_name + ", i64 " + str(num))
-                ire_indent(e, "store i64 " + args[1] + ", ptr " + gep + ", align 8")
+                // CORE_GAP 0.8: a scalar (int/float/bool) field stays an INLINE store (fast; preserves
+                // SROA struct-math). A managed OR unknown-typed field routes through nova_rt_field_set,
+                // which self-classifies the slot via the struct's managed-slot bitmap (consistent with
+                // rc_free) and does inc-new/dec-old ownership. do_inc=1 when the new value is slot-sourced
+                // (SHARE, may alias); 0 for a fresh temp (MOVE).
+                let _fs_kind = ""
+                match typ
+                    IrType(_fstk, _fstn, _fstp, _fstid) =>
+                        _fs_kind = _fstk
+                if _fs_kind == "int" or _fs_kind == "float" or _fs_kind == "bool"
+                    let ptr_name = dest + ".ptr"
+                    ire_indent(e, ptr_name + " = inttoptr i64 " + args[0] + " to ptr")
+                    let gep = dest + ".gep"
+                    ire_indent(e, gep + " = getelementptr i64, ptr " + ptr_name + ", i64 " + str(num))
+                    ire_indent(e, "store i64 " + args[1] + ", ptr " + gep + ", align 8")
+                else
+                    let _fs_do_inc = "0"
+                    if len(args) >= 2 and contains(e.ire_load_origin, args[1])
+                        _fs_do_inc = "1"
+                    let _fs_r = ire_fresh_tmp(e, "_fs.r")
+                    ire_indent(e, _fs_r + " = call i64 @nova_rt_field_set(i64 " + args[0] + ", i64 " + str(num) + ", i64 " + args[1] + ", i64 " + _fs_do_inc + ")")
                 // W5b soundness: a struct field now holds a pointer to args[1].
                 // If args[1] came from a local slot, dropping that slot at fn
                 // return would dangle the struct's field. Skip drop.
@@ -17326,7 +17385,24 @@ fn ire_emit_function(e: IrEmitter, func: IrFunction)
                                             let _fc_ai = 0
                                             while _fc_ai < len(_fca)
                                                 if contains(_frc_loadof, _fca[_fc_ai])
-                                                    if not (_fc_safe and _fc_ai == 0)
+                                                    // CORE_GAP 0.8: PRECISE borrow-escape. A field/element BORROW
+                                                    // (loadof a droppable slot) escapes ONLY if it FLOWS into a location
+                                                    // that outlives the statement: stored into a heap container (make_*),
+                                                    // written into an object (field_set/index_set value), passed to a
+                                                    // USER fn / call_by_name / dyn_call (may retain), a nova_rt_ container-
+                                                    // mutator VALUE arg (ai>0), or the spawn family (MOVE-retains arg0).
+                                                    // Every READ-ONLY use -- arithmetic/logical/compare ops, list_len,
+                                                    // index_get/field_get, copy, and read-only nova_rt_ calls at arg0
+                                                    // (len/print/get/str) -- CANNOT retain the pointer (an op yields a new
+                                                    // value; a scalar element is a value copy, not a live pointer), so the
+                                                    // owning struct stays droppable. (slot_store + return are handled by
+                                                    // their own branches above/below.) Without this, reading a managed
+                                                    // struct field via a generic call (len(y.items), y.items[i]+n,
+                                                    // print(y.name)) wrongly pinned the struct as non-droppable -> it AND
+                                                    // its heap fields leaked on loop-rebind: the 0.8 headline symptom.
+                                                    let _fc_call_esc = _fco == "call" and (not starts_with(_fcv, "nova_rt_") or _fc_ai > 0 or contains(_fcv, "spawn") or _fcv == "nova_rt_fiber_create")
+                                                    let _fc_stores = _fco == "make_struct" or _fco == "make_list" or _fco == "make_dict" or _fco == "make_closure" or _fco == "field_set" or _fco == "index_set" or _fco == "call_by_name" or _fco == "dyn_call" or _fc_call_esc
+                                                    if _fc_stores
                                                         _frc_bad[_frc_loadof[_fca[_fc_ai]]] = 1
                                                 if contains(_frc_reg2slot, _fca[_fc_ai])
                                                     // arg[0] of a nova_rt_* call is normally NON-escaping (the
@@ -18055,6 +18131,11 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare i64 @nova_rt_float_bits(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_float_to_str(i64) nounwind")
     ire_line(e, "declare ptr @nova_rt_struct_alloc(i64) nounwind")
+    // CORE_GAP 0.8: struct field ownership (managed-slot bitmap model).
+    ire_line(e, "declare ptr @nova_rt_hashed_struct_alloc(i64) nounwind")
+    ire_line(e, "declare void @nova_rc_inc(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_field_set(i64, i64, i64, i64) nounwind")
+    ire_line(e, "declare void @nova_rt_register_struct_bitmap(i64, i64) nounwind")
     // BEAT C: LLVM hardware math intrinsics (sqrtsd / native libm, no errno branch) used to
     // inline the float math builtins when the arg is a PROVEN raw double (ire_proven_float).
     ire_line(e, "declare double @llvm.sqrt.f64(double)")
@@ -19340,6 +19421,20 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
             if contains(b.ir_sdefs, st_name)
                 let _flds = b.ir_sdefs[st_name]
                 ire_indent(e, "call void @nova_rt_register_struct_meta(i64 " + st_hash + ", i64 " + spi_reg + ", i64 " + str(len(_flds)) + ")")
+                // CORE_GAP 0.8: per-type MANAGED-SLOT bitmap. Bit (field_i + 1) set iff the field is
+                // managed (type not in {int,float,bool}) -> nova_rc_free dec's ONLY those pointer slots.
+                // Physical slot = field_i + 1 (slot 0 = type hash). Cap at 63 (uint64 bitmap; fields >=63
+                // stay non-owning, a safe rare leak). Registered only when non-empty (else lookup -> 0).
+                let _bmask = 0
+                let _bfi = 0
+                for _bfp in _flds
+                    match _bfp
+                        Param(_bpn, _bpt, _bpd) =>
+                            if _bfi < 63 and ire_field_is_managed(_bpt)
+                                _bmask = _bmask + (1 << (_bfi + 1))
+                            _bfi = _bfi + 1
+                if _bmask != 0
+                    ire_indent(e, "call void @nova_rt_register_struct_bitmap(i64 " + st_hash + ", i64 " + fmt_i64_decimal(_bmask) + ")")
                 let _fi = 0
                 for _fp in _flds
                     match _fp
