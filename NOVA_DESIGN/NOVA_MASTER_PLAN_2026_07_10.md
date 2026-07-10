@@ -49,6 +49,616 @@
 ---
 ---
 
+
+---
+---
+
+# §0 · THE NOVA WAY DOCTRINE — how we add EVERYTHING without becoming C++
+
+## Governing Law for Capability Acquisition Without Complexity Explosion
+
+> **The problem this document solves.** NOVA must do everything C/C++/Java/Python/Go/Erlang/Elixir/Rust/
+> Swift/Zig can do, and do it BETTER. Those languages collectively expose ~200+ distinct "features." If NOVA
+> adds each one as a separate mechanism, NOVA becomes C++ -- the language whose complexity has driven three
+> generations of replacements (Java, Go, Rust) and is still too complex for most developers. This document is
+> the METHOD by which NOVA acquires all of the CAPABILITY without any of the MECHANISM proliferation. It is
+> not a manifesto; it is a decision procedure with worked examples, grounded in the compiler that exists
+> (`nova_compiler.nova`, ~22k lines, self-hosting to a byte-identical fixpoint).
+
+---
+
+## 1. THE CORE PRINCIPLE: CAPABILITY, NOT MECHANISM
+
+The wrong question: "How many features does NOVA have?"
+The right question: "How many real-world programs can a developer build, and how simple is the code?"
+
+**Feature count is the wrong metric because it conflates two entirely different things:**
+
+1. **Capability** -- what a developer can BUILD. "I can write a web server, a GPU kernel, a distributed
+   system, and an embedded controller" is capability. Capability is measured by the set of programs expressible
+   in the language.
+
+2. **Mechanism** -- what the developer must LEARN. "I must understand templates, concepts, SFINAE, `decltype`,
+   `constexpr`, `consteval`, `constinit`, fold expressions, and parameter packs to do generic programming in
+   C++" is mechanism. Mechanism is measured by the number of distinct language-level concepts the developer
+   carries in their head.
+
+C++ has enormous capability AND enormous mechanism. Python has large capability but small mechanism (at the cost
+of performance). Go has moderate capability and tiny mechanism. **NOVA's thesis is that you can have MAXIMAL
+capability with MINIMAL mechanism** -- because the right ~7 composable mechanisms, combined with a genius
+compiler, subsume the ~200+ separate features of the incumbents.
+
+**The principle in one sentence:** *The compiler pays the complexity cost; the developer pays only in
+capability. Every feature from every incumbent must map onto one of the ~7 unifying mechanisms; if it cannot,
+it is either redesigned until it can, or it is excluded.*
+
+**Why this works (and is not hand-waving).** Consider what `expand_derives` does in `nova_compiler.nova`
+(line 3928): for EVERY record struct, the compiler synthesizes `__show`, `__to_json`, `__from_json`,
+`__from_json_safe`, `__from_dict`, `__from_dict_list`, `__fields`, `__type_name`, `__field_types`,
+`__field_names`, and `__field_get` -- eleven methods, all from the struct's STRUCTURE alone, zero annotations.
+In Rust, the developer writes `#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]` -- five explicit
+derive invocations, each backed by a proc-macro in a separate crate. In Java, they write `toString()`,
+`equals()`, `hashCode()`, implement `Serializable`, add Jackson annotations. In Python, they use
+`@dataclass`, `json.dumps()`, `__repr__`. **NOVA achieves the CAPABILITY of all of these with ZERO developer-
+facing mechanism.** The mechanism is inside the compiler; the developer sees only the struct definition and
+the fact that `str(x)`, `json_stringify(x)`, `from_json(d)` all work. This is the doctrine made concrete.
+
+---
+
+## 2. THE ~7 UNIFYING MECHANISMS
+
+Each mechanism below is identified by: what it IS in NOVA, where it EXISTS in the compiler (file:line or
+function name), and the FULL LIST of features from other languages it SUBSUMES. The count is deliberate:
+~7 mechanisms replace ~200+ incumbent features. This is the heart of the doctrine.
+
+---
+
+### MECHANISM 1: The Three Primitives (Values, Processes, Channels)
+
+**What it is.** NOVA's entire computational universe is three things. VALUES are all data (scalars, structs,
+enums, tensors, messages, DOM nodes). PROCESSES are all execution (threads, actors, GPU kernels, distributed
+nodes, browser workers). CHANNELS are all communication (function returns, network streams, GPU transfers,
+events). This is not a metaphor; it is the literal runtime model.
+
+**Where it exists in the compiler.**
+- Values: every `NType` in the type system (`nova_compiler.nova` line 10504) -- `int`, `float`, `string`,
+  `bool`, `struct`, `list`, `dict`, `tuple`, `sum`, `channel`, `fn`, `process`.
+- Processes: `nova_rt_spawn` (codegen line ~8454), the M:N green-task scheduler in the C runtime.
+- Channels: `nova_rt_channel_create`/`send`/`recv`/`close` (codegen lines 4858-4870), `nova_rt_select`
+  (line ~8043), typed channel types `nt_channel(payload)` (line 10595).
+
+**What it subsumes (features from other languages replaced by composition of V/P/C):**
+
+| Incumbent feature | Language(s) | How V/P/C subsumes it |
+|---|---|---|
+| Threads + `synchronized` | Java, C# | Process = green task; no shared state by construction |
+| `goroutine` + `chan` | Go | Process = `spawn`; Channel = `channel()` -- typed, unlike Go's `interface{}` |
+| Erlang process + mailbox | Erlang/Elixir | Process isolation IS the model; channels ARE typed mailboxes |
+| `async`/`await`/`Future`/`Promise` | Rust, JS, C#, Python, Kotlin | Implicit async: ALL I/O parks on the netpoller; no `async` keyword exists |
+| `Mutex`/`RwLock`/`Arc` | Rust | Process isolation = no shared mutable state = no locks needed for safety |
+| `Actor` trait/framework | Akka, Orleans | A Process with a `recv` loop on a Channel IS an actor |
+| Signal/slot (Qt) | C++ | A Channel IS a typed signal; `recv` IS a slot |
+| Event bus / pub-sub | Various | A shared Channel IS a typed event bus |
+| `select`/`epoll`/`poll` | C, Go | `select(ch1, ch2, ...)` (line ~8043) -- typed, user-facing |
+| Observable/Reactive streams | RxJava, RxJS | A Channel IS a typed observable; `for msg in ch` = subscribe |
+| CSP | Go, Clojure | Three Primitives ARE CSP with static types |
+| GPU kernel dispatch | CUDA, OpenCL | A Process targeting GPU; buffer transfer = channel send (planned) |
+| Distributed node | Erlang, Akka | A Process on a remote node; channel over TCP (distributed channels) |
+| Service mesh sidecar | Istio, Linkerd | A supervisor Process managing service Processes |
+
+**Net count: ~15 incumbent features, ONE mechanism.**
+
+---
+
+### MECHANISM 2: Whole-Program Hindley-Milner Inference + Automatic Structural Reflection
+
+**What it is.** The type inferrer (`ti_infer_program_named`, line 13449) performs whole-program HM inference:
+every expression gets a type without the developer writing annotations. The unifier (`ti_unify_d`, line 11006)
+handles all type kinds (int, float, string, bool, struct, list, dict, tuple, channel, fn, sum, process) with
+occurs-check (line 11057), numeric coercion (lines 11078-11081), and a fuel-bounded strict mode (line 11014).
+On top of inference, `expand_derives` (line 3928) synthesizes structural reflection methods for every struct --
+show, to_json, from_json, from_dict, fields, type_name, field_types, field_names, field_get -- from the
+struct's field list alone, zero annotations.
+
+**Where it exists in the compiler.**
+- Inference: `ti_infer_expr_inner` (line 12246), `ti_infer_stmt_inner` (line 12644), `ti_unify_d` (line 11006).
+- Reflection: `expand_derives` (line 3928), `_make_show_method` (line 3340), `_make_to_json_method`
+  (line 3375), `_make_from_json_method` (line ~3425), plus 8 more synthesized methods.
+- Exhaustive match: `ti_check_exhaustive` (line 13147).
+
+**What it subsumes:**
+
+| Incumbent feature | Language(s) | How HM + auto-reflection subsumes it |
+|---|---|---|
+| Type annotations on every signature | Java, C#, Go, Rust | HM infers them; ~95% need zero annotations |
+| `var`/`:=` local inference only | Java, Kotlin, Go | NOVA infers across function boundaries |
+| `#[derive(Debug, Serialize, ...)]` | Rust | `expand_derives` does it for ALL structs, zero annotation |
+| `@dataclass` / `__repr__` / `__eq__` | Python | Structural -- str/==/hash work on every Value |
+| `toString()`/`equals()`/`hashCode()` | Java | Structural runtime operations, never written by hand |
+| Jackson `@JsonProperty` annotations | Java | `__to_json`/`__from_json` are automatic and correct |
+| `Codable`/`Encodable`/`Decodable` | Swift | Structural -- from_json/to_json work on all structs |
+| `json.Marshal`/`Unmarshal` with tags | Go | Automatic, no struct tags |
+| Reflection API (`java.lang.reflect`) | Java, C# | `field_names`/`field_types`/`field_get` compile-time derived |
+| Pattern matching + exhaustiveness | Rust, OCaml, Haskell | `match` with `ti_check_exhaustive` (line 13147) |
+| Null safety / `Option<T>` ceremony | Kotlin, Swift | `Option` type + inference; no `?.` chains needed |
+| Sum types / tagged unions | Rust, Haskell, OCaml | `type`-declared enums with variant fields |
+| Type classes / `impl Trait` inference | Haskell, Rust | Traits with bounds (`ti_check_bounds`, line 13659) |
+| Generics with constraints | Java, C#, Rust, Swift | Generic params with trait bounds (line ~2422) |
+
+**Net count: ~15 incumbent features, ONE mechanism (inference + structural reflection).**
+
+---
+
+### MECHANISM 3: Process Isolation as Memory Safety
+
+**What it is.** Values are OWNED by the Process that created them. Sending a Value on a Channel MOVES it
+(or deep-copies it for non-move-safe values). A Process can never access another Process's memory. This
+means: no data races (by construction), no use-after-free across processes, no shared mutable state bugs.
+The C runtime enforces this with RC (reference counting) per-process and arena allocation per-request
+(Forge's per-request arena dies in O(1), like BEAM's per-process heap).
+
+**Where it exists in the compiler.**
+- Move semantics on channel send: `nova_rt_channel_send_move` (codegen line ~8066).
+- RC: the entire `rc_inc`/`rc_dec`/`rc_free` machinery in `nova_runtime.c`.
+- Arena: per-request allocation that bulk-frees on request completion.
+- Deep-copy isolation: values crossing process boundaries are deep-copied to ensure independence.
+
+**What it subsumes:**
+
+| Incumbent feature | Language(s) | How process isolation subsumes it |
+|---|---|---|
+| Borrow checker / lifetimes | Rust | Process ownership replaces borrow checking -- no `'a` annotations |
+| `Send`/`Sync` traits | Rust | Process isolation = all Values are safe to send; no marker traits |
+| `Arc<Mutex<T>>` shared-state patterns | Rust | No shared state between processes; channels instead |
+| Garbage collector (GC) | Java, Go, Python, C#, Erlang | RC per-process + arena; no GC pauses, deterministic |
+| Manual `malloc`/`free` | C | Compiler-managed RC; no manual allocation |
+| `unique_ptr`/`shared_ptr` | C++ | RC is automatic and invisible |
+| Data race detector | Go | No races possible -- isolation by construction |
+| Thread sanitizer (TSan) | C/C++ | No shared mutable state to race on |
+| Memory pools / arenas | C, Rust | Arena per-request is automatic (Forge); RC for long-lived |
+| RAII / destructor ordering | C++, Rust | RC release is deterministic; arena death is O(1) |
+| `volatile` / memory ordering | C/C++, Java | Channel send/recv ARE the synchronization points |
+
+**Net count: ~11 incumbent features, ONE mechanism.**
+
+---
+
+### MECHANISM 4: Comptime (Compile-Time Evaluation as the Language Itself)
+
+**What it is (planned, L2 in master plan).** A `comptime fn` is an ordinary NOVA function that the compiler
+evaluates at build time. It has access to all of NOVA except I/O/randomness/time (enforced by capability
+inference). The output is a Value or an AST fragment (via typed quasi-quotation). It replaces: C preprocessor
+macros, C++ templates/constexpr/consteval, Rust proc-macros/`macro_rules!`, Zig comptime, Swift macros,
+Java annotation processors.
+
+**Precursor that exists today.** `inject_ensures` (line 3836) is ALREADY a compile-time code generator: it
+reads `ensures` annotations on functions, generates wrapper functions with postcondition assertions, and
+emits them as ordinary AST. `expand_derives` (line 3928) is another: it reads struct definitions and generates
+11 methods per struct. Both run inside the compiler at parse-time over typed AST nodes. They are bespoke
+today; comptime generalizes them into user-accessible machinery.
+
+**What it will subsume:**
+
+| Incumbent feature | Language(s) | How comptime subsumes it |
+|---|---|---|
+| `#define` / `#ifdef` / `#include` | C/C++ | Comptime functions + conditional compilation |
+| Templates / SFINAE / concepts | C++ | Comptime + generics -- typed, debuggable, no error cascades |
+| `constexpr` / `consteval` / `constinit` | C++ | One mechanism: `comptime fn` |
+| `macro_rules!` (pattern macros) | Rust | Typed quasi-quotation |
+| Proc-macros (separate crate) | Rust | Same-unit comptime functions, not a separate crate |
+| `@derive(...)` | Rust | Already subsumed by auto-reflection; comptime generalizes further |
+| `comptime` blocks | Zig | Same concept, but with heap + quasi-quotation + fuel bound |
+| Annotation processors (APT) | Java | Annotations + codegen hooks (L1), which ARE comptime functions |
+| Source generators | C# | Same-unit, typed, zero-runtime-cost |
+| `@macro` / five macro kinds | Swift | One mechanism, not five |
+| Build scripts (`build.rs`) | Rust | Comptime replaces most build-script use cases |
+| Code generation tools (protoc, thrift) | Various | Comptime can read schema files and generate code |
+
+**Net count: ~12 incumbent features, ONE mechanism.**
+
+---
+
+### MECHANISM 5: Traits + Structural Conventions
+
+**What it is.** NOVA has two complementary dispatch paths:
+
+1. **Traits** (nominal): `trait Shape { fn area(self) -> float }` with explicit conformance (`type Circle
+   impl Shape`). Trait bounds on generics (`fn sum<T: Summable>(xs: list<T>)`). Dynamic dispatch through
+   trait objects. Default methods. Conformance checking (`ti_check_trait_conformance`, line 13680).
+
+2. **Structural conventions** (duck-typed): the compiler recognizes specific function shapes and desugars
+   them. `__show` on a struct = `str(x)` dispatches to it. `__to_json` = `json_stringify(x)` uses it.
+   The planned L8 (custom operators): `fn index(self, i)` = `x[i]`; `fn iter(self)` + `fn next(self)` =
+   `for x in collection`; `fn call(self, ...)` = `obj(args)`. Zero trait-impl ceremony.
+
+**Where it exists in the compiler.**
+- Trait declarations: `parse_trait_decl` (line 2791).
+- Generic bounds: lines 2422-2436 (parse), `ti_check_bounds` (line 13659).
+- Structural dispatch: codegen at line ~7953 (`str(p)` on a struct dispatches to `<Type>__show`).
+- Conformance: `ti_check_trait_conformance` (line 13680).
+
+**What it subsumes:**
+
+| Incumbent feature | Language(s) | How traits + structural conventions subsume it |
+|---|---|---|
+| Interfaces | Java, C#, Go | Traits = interfaces with default methods |
+| Abstract classes | Java, C# | Traits with default methods |
+| Protocols | Swift | Traits |
+| Type classes | Haskell | Traits + inference |
+| `impl Trait` / `dyn Trait` | Rust | Both paths available |
+| Go-style structural interfaces | Go | Structural conventions for operators; nominal traits for APIs |
+| Operator overloading | C++, Rust, Python, Kotlin | Structural convention: `fn add(self, other)` = `a + b` |
+| `__getitem__`/`__iter__`/`__call__` | Python | L8 structural conventions: index/iter/call |
+| Extension methods / UFCS | Kotlin, C#, Rust | NOVA has UFCS already; methods on types |
+| Mixins / default implementations | Ruby, Kotlin, Rust | Trait default methods |
+| Multiple dispatch | Julia | Match + traits (not identical, but covers the use cases) |
+
+**Net count: ~11 incumbent features, ONE mechanism.**
+
+---
+
+### MECHANISM 6: Sized Types as Value Refinements (Planned, L7)
+
+**What it is.** `let x = 42` stays `i64` (zero ceremony). Sized types are REFINEMENTS within HM inference:
+`let x: u32 = 42` adds a width+signedness constraint. Implicit widening (`u8 + u32 -> u32`), explicit checked
+narrowing (`u32(x)` panics on overflow, `u32!(x)` wraps). Arrays of sized types store as flat native buffers.
+Float variants: `f32`, `f64`. This is NOT a parallel type system; it is the SAME `NType` with an added
+`width`/`signed` field.
+
+**Where it will exist.** The `NType` struct (line 10504) gains `width: int` and `signed: int` fields. The
+unifier (line 11006) gains widening/narrowing rules. The codegen gains native-width LLVM instructions.
+
+**What it subsumes:**
+
+| Incumbent feature | Language(s) | How sized-type refinements subsume it |
+|---|---|---|
+| `int8/16/32/64`, `uint8/16/32/64` | C, Go, Rust, Zig | `i8`..`i64`, `u8`..`u64` as refinements |
+| `float`/`double`/`f32`/`f64` | C, Rust | `f32`/`f64` refinements |
+| `size_t` / `usize` / `isize` | C, Rust | `usize`/`isize` target-dependent |
+| Implicit integer promotion (CVE source) | C | NOVA: implicit WIDENING only; narrowing is checked |
+| `as` casts (silent truncation) | Rust | `u32(x)` = checked; `u32!(x)` = explicit wrapping |
+| Fixed-size arrays `[T; N]` (layout) | Rust | Sized-type arrays store as flat native buffers |
+| Byte-level manipulation | C | `u8` + binary pack/unpack |
+| SIMD-width types | C intrinsics, Rust | Sized float arrays enable auto-vectorization |
+| `half`/`bfloat16` for ML | CUDA, Zig | `f16`/`bf16` as further refinements (future) |
+
+**Net count: ~9 incumbent features, ONE mechanism.**
+
+---
+
+### MECHANISM 7: Annotations as Compile-Time Metadata (Planned, L1)
+
+**What it is.** Annotations are typed metadata on declarations (structs, functions, fields, parameters). They
+are read by compile-time codegen hooks (which are comptime functions -- Mechanism 4) and ERASED after
+compilation. They have zero runtime cost. `@route("GET", "/users")` is compile-time metadata that the Forge
+codegen hook reads and wires into the dispatch table. Invalid annotations are compile errors.
+
+**Precursor that exists today.** The `annotations` field already exists on every `Stmt` (line 33). Generics
+and bounds are stored as annotation `Expr` nodes (lines 2614-2624). `inject_ensures` (line 3836) reads
+`ensures` annotations and generates postcondition wrappers. The MECHANISM is present; the USER-EXTENSIBLE
+form is planned (L1).
+
+**What it subsumes:**
+
+| Incumbent feature | Language(s) | How annotations-as-metadata subsume it |
+|---|---|---|
+| Java annotations + runtime reflection | Java | Compile-time only; zero runtime cost; compile errors on misuse |
+| C# attributes + source generators | C# | Same, but same-unit (no separate assembly) |
+| Python decorators (runtime wrapping) | Python | Compile-time; no per-call dispatch overhead |
+| Kotlin annotations + KSP | Kotlin | Same-unit, typed |
+| Spring `@Component`/`@Autowired`/`@Service` | Java | `@component`/`@inject` with compile-time DI wiring |
+| Spring `@GetMapping`/`@PostMapping` | Java | `@route("GET", "/path")` with compile-time route table |
+| JPA `@Entity`/`@Column`/`@Table` | Java | `@entity`/`@column` with compile-time ORM generation |
+| `#[test]`/`#[should_panic]` | Rust | `@test`/`@property` with compile-time test discovery |
+| Django/Rails decorators/annotations | Python, Ruby | Same pattern, compile-time |
+| Dependency injection framework | Various | `@inject` with compile-time wiring (Dagger model) |
+| Validation annotations | Various | `@validate` with compile-time constraint generation |
+
+**Net count: ~11 incumbent features, ONE mechanism.**
+
+---
+
+### TOTAL: ~7 mechanisms subsume ~84+ distinct incumbent features.
+
+The remaining features not covered above (error handling with `Result`/`try`, string interpolation, default
+parameters, named parameters, variadic params, UFCS, `for`-in loops, range syntax, destructuring, raw
+strings) are SUGAR -- trivially expressible syntax that compiles to the primitives above with zero new
+conceptual weight. Sugar does not violate the doctrine because it adds zero new MECHANISMS; it adds only
+convenience within existing mechanisms.
+
+---
+
+## 3. THE 5-GATE FEATURE ADMISSION PROCEDURE
+
+Every proposed feature must pass all five gates IN ORDER. Failure at any gate means redesign or rejection.
+This is not a checklist; it is a mandatory sequential evaluation.
+
+### GATE 1: THE PROBLEM GATE
+> *"What real-world program CANNOT be written (or is unacceptably painful to write) without this feature?"*
+
+**Requirement:** Name a concrete program -- not "it would be nice" but "this real program fails or is 5x
+harder." If the program can already be written naturally with existing mechanisms, the feature is REJECTED
+as unnecessary complexity.
+
+**Worked example -- PASSING:** Sized numerics (L7).
+- Problem: A PNG decoder must read `u8` pixel values, `u32` chunk lengths, and `u16` CRC checksums from a
+  binary stream. Today, NOVA has only `i64`. The developer must manually mask (`val & 0xFF`), shift, and
+  verify non-negative on every byte read. A crypto module cannot express unsigned modular arithmetic (`1<<64`
+  is UB). An embedded controller with 2KB RAM cannot waste 8 bytes per integer.
+- Verdict: REAL programs fail or are unacceptably painful. **PASS.**
+
+**Worked example -- REJECTED:** Full dependent types.
+- Problem: What program cannot be written? "Prove at compile time that an array index is in bounds" -- but
+  NOVA already has runtime bounds checks (C-speed, branch-predicted). "Prove that a matrix multiplication's
+  dimensions match" -- but const generics (L5) solve this specific case without the full dependent-type
+  apparatus. No concrete PROGRAM is impossible; the proofs are a developer-facing complexity cost with no
+  end-user benefit.
+- Verdict: No real program is blocked. **FAIL -- REJECTED.**
+
+---
+
+### GATE 2: THE PRIMITIVE GATE
+> *"Which of the ~7 mechanisms does this feature compose from? If none, can it be redesigned to compose from
+> one?"*
+
+**Requirement:** The feature must be expressible as a composition of existing mechanisms. If it requires a
+fundamentally NEW mechanism (a new keyword class, a new runtime subsystem, a new type-system axis), it is
+likely a complexity cost that violates the doctrine.
+
+**Worked example -- PASSING:** `@route("GET", "/users")` (declarative routing).
+- Mechanism: Annotation (Mechanism 7) read by a comptime function (Mechanism 4) that generates channel-based
+  dispatch (Mechanism 1). Three existing mechanisms composed. No new keyword, no new runtime, no new type
+  concept.
+- Verdict: Pure composition. **PASS.**
+
+**Worked example -- REDESIGNED:** GPU kernel dispatch.
+- Initial proposal: Add a `__gpu__` function qualifier and a `cuda_launch<<<grid, block>>>` syntax.
+- Primitive Gate failure: This is a NEW keyword class (`__gpu__`) and a NEW dispatch syntax (`<<<>>>`).
+  It does not compose from any existing mechanism.
+- Redesign: A GPU kernel IS a Process (Mechanism 1) whose body is a pure data-parallel function over Values
+  (verified by capability inference). Buffer transfer IS a Channel send. The `@gpu` annotation (Mechanism 7)
+  is a hint the compiler can also infer. The compiler lowers via LLVM's `nvptx`/`spirv` backends.
+- Verdict after redesign: Composes from Processes + Channels + Annotations. **PASS.**
+
+---
+
+### GATE 3: THE COMPILER GATE
+> *"Can the COMPILER bear this complexity so the DEVELOPER does not have to?"*
+
+**Requirement:** The developer-facing surface must be simpler than the incumbent's version. If the feature
+requires the developer to learn new syntax, new concepts, or new ceremony that the compiler could handle
+automatically, it fails this gate.
+
+**Worked example -- PASSING:** Automatic structural reflection.
+- In Rust, the developer writes: `#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash)]`.
+  Six explicit annotations, each a separate proc-macro crate, each adding compile time.
+- In NOVA: the developer writes nothing. `expand_derives` (line 3928) synthesizes everything from the struct
+  definition. `str(x)` works. `json_stringify(x)` works. `from_json(d)` works. `==` works. `copy(x)` works.
+- Compiler cost: ~660 lines of AST generation code in the compiler.
+- Developer cost: ZERO.
+- Verdict: Compiler bears all complexity. **PASS.**
+
+**Worked example -- REJECTED (then REDESIGNED):** Explicit lifetime annotations (Rust-style).
+- Proposal: Add `'a` lifetime parameters to track reference validity across function boundaries.
+- Developer cost: Every function signature gains `<'a, 'b>` parameters; `&'a mut T` replaces `T`; lifetime
+  elision rules must be memorized; `'static` vs bounded lifetimes confuse 80% of developers.
+- Compiler Gate failure: The developer bears the complexity, not the compiler.
+- NOVA redesign: Process isolation (Mechanism 3) + RC + arena. The compiler infers ownership (single-owner
+  values, RC for shared, arena for request-scoped). The developer writes `x` and the compiler decides whether
+  it is stack-allocated, RC'd, or arena'd. No `'a`, no `&mut`, no `Pin<Box<>>`.
+- Verdict: Original fails Gate 3. Redesign passes. **REDESIGNED.**
+
+---
+
+### GATE 4: THE DRAWBACK GATE
+> *"What is the KNOWN DRAWBACK of this feature in the incumbent, and does NOVA's version AVOID it?"*
+
+**Requirement:** Every feature has a historical drawback in the language that invented it. If NOVA's version
+reproduces the same drawback, it has failed -- we have just imported someone else's mistake. The NOVA-way
+design MUST explicitly avoid the identified drawback.
+
+**Worked example -- PASSING:** Comptime (L2).
+- C++ drawback: Template error messages are 100+ lines of nested substitution failures (`SFINAE`); template
+  instantiation is exponential; the template language is a separate Turing-complete language (not C++) that
+  nobody asked for. Compilation of template-heavy code takes minutes.
+- Rust drawback: Proc-macros must be in a separate crate; they operate on untyped token streams (no type
+  info); their errors are opaque; they can do arbitrary I/O (non-reproducible builds).
+- Zig drawback: Comptime functions cannot allocate on the heap and cannot use quasi-quotation; `@compileLog`
+  is primitive debugging.
+- NOVA's version: Comptime is the SAME language (typed NOVA, not a separate language); quasi-quotation is
+  hygienic with typed splices; fuel-bounded (no exponential blowup); sandboxed (no I/O); same-unit (no
+  separate crate); output visible via `--emit-ir`. Avoids ALL three drawbacks.
+- Verdict: Drawbacks identified and avoided. **PASS.**
+
+**Worked example -- REJECTED:** C++-style multiple inheritance.
+- C++ drawback: The diamond problem; virtual vs non-virtual inheritance confusion; memory layout complexity;
+  fragile base class problem.
+- Any NOVA version would reproduce: ambiguous method resolution, memory layout complexity, and the diamond
+  problem. There is no known design that avoids these while retaining MI's capability.
+- NOVA alternative: Traits with default methods + composition (Mechanism 5). Provides method reuse without
+  state inheritance, diamond ambiguity, or layout complexity.
+- Verdict: Cannot avoid the drawback. **REJECTED; traits used instead.**
+
+---
+
+### GATE 5: THE SIMPLICITY VETO
+> *"After adding this feature, is NOVA still simpler to write than Python for the 95% case?"*
+
+**Requirement:** The feature must not tax the 95% of developers who do not use it. It must not add ceremony
+to simple programs. It must not create a "two-language" feeling (the way Rust's `async` divides the ecosystem
+into sync and async worlds). If it does, it is VETOED regardless of how useful it is for the 5%.
+
+**Worked example -- PASSING:** Sized numerics (L7).
+- The 95% case: `let x = 42` stays `i64`. Nothing changes. Zero new ceremony.
+- The 5% case: `let x: u32 = 42` or `let x = 42u32` -- an opt-in suffix or annotation.
+- Ecosystem split: None. `u32` participates in HM inference; `u32 + i64` auto-widens to `i64`.
+- Simple programs are byte-for-byte identical to today. **PASS.**
+
+**Worked example -- VETOED:** Colored async (Rust/JS/C#/Python model).
+- The 95% case: `let data = http_get(url)` -- every I/O call now needs `await`. Or: every function that
+  calls an async function must itself be `async`. The developer writes `async fn main()`, `async fn handler()`,
+  and `.await` on every call -- even in programs that have zero concurrency.
+- The 5% case: High-throughput servers with 10k concurrent connections need non-blocking I/O.
+- NOVA's solution: Implicit async. ALL green tasks park on the netpoller automatically. The developer writes
+  `http_get(url)` and the runtime handles it. The 95% never see a concurrency keyword; the 5% get 10k
+  concurrent connections anyway.
+- Colored async VETOED. Implicit async passes. **VETOED.**
+
+---
+
+## 4. WHAT NOVA DELIBERATELY EXCLUDES AND WHY
+
+Exclusion is a design act. Every item below was evaluated against the 5-Gate procedure and REJECTED or
+REPLACED. This is not "we haven't gotten to it"; this is "we will never add it."
+
+| Excluded feature | Why excluded (which gate failed) | What NOVA uses instead |
+|---|---|---|
+| **Dependent types** | Gate 1: No concrete program blocked. Gate 5: Taxes the 95% with proof obligations. | Const generics for dimension checks; runtime bounds checks for array safety. |
+| **Explicit lifetime annotations** | Gate 3: Developer bears all complexity. Gate 5: `'a` annotations on 95% of functions. | Process isolation + RC + arena. The compiler infers ownership. |
+| **C++ multiple inheritance** | Gate 4: Diamond problem, memory layout complexity cannot be avoided. | Traits with default methods + composition. |
+| **Class hierarchies / `extends`** | Gate 2: Requires a new mechanism (inheritance chains). Gate 5: Leads to deep hierarchies (Java's 12-class `InputStream` tree). | Structs + traits + composition. Flat, composable, no hierarchy. |
+| **`null` as a value** | Gate 4: Null pointer exceptions are the #1 production crash cause (Hoare's "billion-dollar mistake"). | `Option<T>` with exhaustive `match`. Null exists only as a literal for backward compat; the type system tracks it. |
+| **Exceptions (`throw`/`catch`)** | Gate 4: Hidden control flow; `catch(Exception e)` swallows bugs silently; performance cliff on throw. Gate 5: `try-catch-finally` is 6 keywords for error handling. | `Result<T, E>` + `try` + `?`. One-word error handling. Errors are Values in the type system. |
+| **C preprocessor / `#include`** | Gate 4: Unhygienic text substitution; `#define TRUE FALSE` is legal; include-order dependency. | Comptime functions (typed, hygienic, debuggable). Module system. |
+| **Header files** | Gate 4: Duplicate declarations; include-guard boilerplate; declaration/definition mismatch. | Module system; the compiler reads the source directly. |
+| **Colored `async`/`await`** | Gate 5: Every function becomes sync-or-async; the 95% who write sequential code pay the ceremony tax. | Implicit async. ALL I/O is non-blocking; the developer writes sequential code. |
+| **`unsafe` as an escape hatch for memory** | Gate 4: In Rust, `unsafe` blocks accumulate and are audited poorly; in C, the entire language is unsafe. | NOVA has `unsafe` only for FFI interop (`extern fn`). Process isolation provides memory safety without needing an escape hatch for data races. |
+| **Template metaprogramming (C++ TMP)** | Gate 4: Error messages from hell; compile-time explosion; a separate Turing-complete language. Gate 3: Developer bears complexity. | Comptime (Mechanism 4): the same language, typed, debuggable, fuel-bounded. |
+| **Implicit conversions (C-style)** | Gate 4: `unsigned - unsigned` wrapping, `int -> float` precision loss, `0 -> null pointer`. CVE factory. | Explicit widening (safe) + checked narrowing (panics on loss). |
+| **Method overloading by type** | Gate 5: Which `f(x)` is called depends on a type the developer may not see (inference + overloading interact badly). | Different function names. Named params for variation. |
+| **Property getters/setters** | Gate 2: A new mechanism (invisible function calls on field access). Gate 5: Hidden side effects on `x.y`. | Plain fields. Methods when behavior is needed. Transparent. |
+| **Inheritance-based polymorphism** | Gate 2: Requires class hierarchies (excluded above). | Trait-based polymorphism + structural conventions. |
+
+---
+
+## 5. THE ANTI-C++ TRIPWIRES
+
+Concrete, enforceable rules that detect and stop feature creep. These are checked mechanically or by
+code review on every proposed addition.
+
+### TRIPWIRE 1: The Parallel Subsystem Rule
+> *"If a feature requires a NEW runtime subsystem that operates independently of the existing
+> Values/Processes/Channels runtime, REJECT it or REDESIGN it to compose from the existing runtime."*
+
+**Rationale:** C++ has at least 5 independent runtime subsystems (exceptions, RTTI, vtable dispatch, thread
+support library, `<memory>` smart pointers), each with its own overhead model and interaction effects. NOVA
+has ONE runtime: Values allocated by RC/arena, Processes scheduled by the M:N scheduler, Channels for
+communication. Every new feature must compose from this runtime.
+
+**Enforcement:** On every proposal, grep the design for "new runtime data structure," "new thread," "new
+global state," "new scheduler." If found, send back for redesign.
+
+**Example caught:** A proposal for a "background GC thread for cycle collection" would be a new subsystem.
+Redesign: trial-deletion cycle collector runs WITHIN the existing RC release path (when refcount hits 0,
+check for cycles in the object graph) -- no new thread, no new scheduler, no new subsystem.
+
+### TRIPWIRE 2: The 95% Tax Rule
+> *"If a feature adds syntax, a keyword, or a mandatory annotation that appears in programs that DO NOT USE
+> the feature, REJECT it."*
+
+**Rationale:** Go has 25 keywords and every Go program uses most of them. C++ has 97+ keywords and most
+programs use fewer than 30. The difference is that C++'s additions taxed everyone. NOVA must not add ceremony
+that infects programs that do not need the feature.
+
+**Enforcement:** For every proposed keyword/syntax, write a "hello world," a "web server," and a "CLI tool"
+in NOVA. If any of them changes, the feature taxes the 95%.
+
+**Example caught:** `async`/`await` keywords would appear in every I/O program (the 95%). VETOED in favor
+of implicit async (zero keywords in any program).
+
+### TRIPWIRE 3: The Redundant Solution Rule
+> *"If two features solve the same problem, one must go. Prefer the one that is more general (subsumes more
+> other features) and simpler (fewer concepts for the developer)."*
+
+**Rationale:** Scala allowed both OOP inheritance and FP type classes, both implicits and extension methods,
+both for-comprehensions and monadic operations. The result: every concept had 3 ways to express it, no code
+looked the same, and the community fragmented. NOVA has ONE way for each concept.
+
+**Enforcement:** On every proposal, list existing mechanisms that partially solve the problem. If overlap
+exceeds 50%, the proposal must either REPLACE the existing mechanism entirely or be REJECTED.
+
+**Example:** If someone proposes "interface" as distinct from "trait," reject -- traits ARE interfaces.
+If someone proposes "abstract class," reject -- traits with default methods serve the same purpose.
+
+### TRIPWIRE 4: The Interaction Audit Rule
+> *"Before adding feature F, list every existing mechanism (M1-M7) and show that F composes cleanly with
+> each. If F creates a special case, an exception, or a 'does not work with' warning for ANY mechanism,
+> REJECT or REDESIGN."*
+
+**Rationale:** C++'s `constexpr` does not work with `virtual`. `noexcept` interacts with `std::terminate`
+differently than expected. Move semantics + exceptions = the moved-from state problem. Every interaction
+between independently-designed features is a new special case the developer must memorize.
+
+**Enforcement:** A mandatory 7-row table in every design document:
+
+| Mechanism | Interaction with proposed feature | Clean? |
+|---|---|---|
+| Three Primitives | ... | Y/N |
+| HM Inference + Reflection | ... | Y/N |
+| Process Isolation | ... | Y/N |
+| Comptime | ... | Y/N |
+| Traits + Structural | ... | Y/N |
+| Sized Types | ... | Y/N |
+| Annotations | ... | Y/N |
+
+If ANY cell is "N" or "special case," the feature goes back for redesign.
+
+### TRIPWIRE 5: The Spec Completeness Rule
+> *"If the spec says 'the compiler handles it' without specifying the ALGORITHM, the HEURISTIC, or the
+> DECISION PROCEDURE, the spec is incomplete and the feature is NOT approved."*
+
+**Rationale:** "The compiler infers ownership" is not a design. "The compiler marks values as MOVED after
+channel send by setting a `moved` flag in the IR, and any subsequent use of a moved value emits error E1042
+with the source location of both the send and the attempted use" is a design. Hand-waving leads to
+implementation-defined behavior, which leads to platform-specific bugs, which leads to C.
+
+**Enforcement:** Every feature spec must contain pseudocode or an algorithm description that a junior engineer
+could implement correctly. If the reviewer cannot trace the feature's behavior on a concrete example by
+reading only the spec, the spec is rejected.
+
+### TRIPWIRE 6: The Complexity Budget
+> *"NOVA has a hard cap: the language specification (not the compiler implementation, not the standard library)
+> must never exceed ~50 core concepts. Today it has ~30. Each new concept must justify itself against
+> the remaining ~20 slots."*
+
+**Rationale:** This is the Go lesson. Go shipped with 25 keywords and fought to keep it there for 12 years
+before adding generics (the 26th concept). The discipline is: every slot is precious; a concept that takes a
+slot must earn more capability than ANY alternative use of that slot.
+
+The current ~30 concepts: Values (scalars, structs, enums, lists, dicts, tuples, bytes, channels, functions,
+processes, options, results), Control flow (if, for, while, match, try, return, break, continue), Definitions
+(fn, type, trait, import, let), Execution (spawn), Error handling (try, `?`), and Operators (+, -, *, /, etc).
+
+The remaining ~20 slots are for: comptime, annotations, sized types, mut, const generics, associated types,
+variance (inferred -- invisible), weak references, custom operators (structural), and a small reserve for
+genuinely novel needs not yet imagined.
+
+**Enforcement:** Maintain a numbered concept list. Any addition must be approved against the budget. If we
+approach 45, convene a "what can we REMOVE?" session before adding anything.
+
+---
+
+## HOW TO USE THIS DOCUMENT
+
+1. **Before proposing any feature:** Run it through the 5-Gate procedure (Section 3). Write the answers.
+   If it fails any gate, do not propose it -- redesign it first.
+
+2. **Before implementing any feature:** Check which of the ~7 mechanisms (Section 2) it maps to. If it
+   does not map, the feature is either excluded (Section 4) or needs redesign.
+
+3. **During code review:** Check the 6 tripwires (Section 5). Any violation is a blocking review comment.
+
+4. **Quarterly:** Audit the concept count against the ~50 budget. Audit the mechanism list for any
+   mechanism that has fewer than 5 subsumed features -- it may not be pulling its weight.
+
+5. **When in doubt:** Ask: "Does this make NOVA more like C++ (complexity explosion) or more like Go
+   (radical simplicity with real capability)?" If the answer is C++, reject.
+
+The test of this doctrine is not whether it sounds good in a document. The test is whether, after NOVA has
+acquired all the capability of C/C++/Java/Python/Go/Erlang/Rust/Swift/Zig, a new developer can still sit
+down, write a program, and feel: "This is simpler than Python." If that feeling survives, the doctrine held.
+If it does not, we built C++.
+
 # ═══════════════════════ PART I — STRATEGY, COMPETITIVE POSITIONING & ROADMAP ═══════════════════════
 
 ---
@@ -1003,6 +1613,362 @@ drawback* — is the discipline that carries NOVA from "a better language" to "e
 
 ---
 ---
+
+
+---
+---
+
+# §I-APPENDIX · Language-Feature Completeness Matrix + the gaps the plan forgot
+
+> **ROADMAP DELTAS FROM THIS AUDIT (fold these into the plan — the "won't surprise us mid-build" list).**
+> The matrix below confirms NOVA already HAVE/PLANNED the vast majority of every language's features. The
+> devils-advocate found a small, real set the plan missed or under-weighted — now tracked:
+> - **ELEVATE LOCK-6 (`@cdecl` FFI callbacks): it's the ENTIRE FFI story, not 5/9 frameworks.** Any C library
+>   taking a function pointer (sqlite3_exec, qsort comparators, PCRE2 callouts, custom allocators, signal
+>   handlers, plugin hooks) is blocked without it. Re-rank it a Phase-0/foundation must-have.
+> - **NEW [lang] — monotonic type-id vtables for trait dispatch.** Today djb2-hash dispatch is O(n)-arm-scan +
+>   collision-prone (audit's "latent mis-dispatch"). Hot-path trait calls (Cortex Layer/Optimizer, iterators)
+>   need O(1) vtable lookup. Add as an item; pairs with LOCK-3 (trait-conformance) + L4.
+> - **NEW [stdlib/lang] — interim scoped resource management** (`with_resource` / auto-defer-on-scope for
+>   known handle types) BEFORE L10 (Drop is months out). A framework user WILL forget `defer db_close(conn)`
+>   and leak. Pull an interim in at Phase 1.
+> - **NEW [lang] — explicit SIMD path** (comptime + LLVM vector intrinsics). Auto-vectorization (S4.2) is
+>   insufficient for image codecs (F5), AES-NI crypto, scientific — hand-SIMD is 2-10×. Gates the "C-class
+>   perf on vectorizable workloads" claim. Add an L#-item; do the NOVA way (sized-vector Values, not raw
+>   intrinsics).
+> - **RECLASSIFY hot code reload from EXCLUDED → FUTURE-POSSIBLE.** The process/message model is *structurally*
+>   built for it (swap a process's code, keep its state) — it's how Erlang hits 99.999% uptime, which NOVA
+>   claims parity on. Don't permanently exclude; track as a natural consequence of the Three Primitives.
+> - **MINOR [lexer/parser]** — numeric literal separators (`1_000_000`), labeled break/continue, verify
+>   `\u{XXXX}` unicode escapes, and state "channels ARE async iterators" + verify `for x in channel`. S each.
+>
+> Everything else in the matrix is HAVE, PLANNED (with the plan item id), or DELIBERATELY-EXCLUDED (with the
+> NOVA-way reason). **No large capability is missing.** The full evidence-grounded matrix:
+
+Date: 2026-07-10
+Method: Exhaustive cross-language feature enumeration, each verified against
+`nova_compiler.nova` (grep/read) and the master plan (`NOVA_MASTER_PLAN_2026_07_10.md`).
+
+Legend:
+- **HAVE** = verified in compiler source (file:line or grep evidence)
+- **PLANNED** = cited in master plan with item ID
+- **EXCLUDED** = deliberately omitted with stated NOVA-way rationale
+- **GAP** = MISSING from plan AND not deliberately excluded
+
+---
+
+## 1. TYPE SYSTEM
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Haskell | Zig | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|---------|-----|-------------|---------------------|
+| Static typing | Y | Y | Y | Y | Y | Y | Y | Y | (opt) | Y | Y | **HAVE** | HM inference, `ti_infer_program_named` |
+| Type inference (local) | - | Y | Y | Y | Y | Y | Y | Y | - | Y | Y | **HAVE** | Whole-program HM; deeper than all listed |
+| Type inference (global/whole-program) | - | - | - | - | - | - | - | - | - | Y | - | **HAVE** | HM let-poly; zero annotations ~95% |
+| Generics / parametric polymorphism | - | Y | Y | Y | Y | Y | Y | Y | - | Y | Y | **HAVE** | `parse_generics` absent but `fn<T,U>`, `tgmap`, `ti_extract_bounds` verified |
+| Trait / interface / typeclass | - | Y | Y | Y | Y | Y | Y | Y | (duck) | Y | - | **HAVE** | `parse_trait_decl` :2791, `ti_check_trait_conformance` :13680 |
+| Trait bounds on generics | - | Y | Y | Y | Y | Y | Y | - | - | Y | - | **HAVE** | `ti_extract_bounds`, `ti_check_bounds` |
+| Trait default methods | - | Y | Y | Y | Y | Y | Y | - | - | Y | - | **HAVE** | `ti_trait_defaults` dict verified |
+| Dynamic dispatch (trait objects) | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | - | **HAVE** | `type_name_hash` + djb2 dispatch :7374 |
+| Associated types | - | Y | Y | - | - | - | Y | - | - | Y | - | **PLANNED** | L4, XL, after L3+L1 |
+| Higher-kinded types | - | - | - | - | - | - | - | - | - | Y | - | **EXCLUDED** | Not planned; L4 associated types covers practical needs without HKT complexity |
+| Variance (co/contra/in) | - | - | Y | Y | Y | Y | Y | - | - | Y | - | **PLANNED** | L3, L effort, inferred |
+| Const generics / type-level values | - | Y | Y | - | - | - | (ltd) | - | - | Y | Y | **PLANNED** | L5, L, after L7+L2 |
+| Sum types / tagged unions / ADTs | - | Y | Y | (sealed) | - | Y | Y | - | - | Y | Y | **HAVE** | `parse_enum_decl` :2873, exhaustive match |
+| Exhaustive pattern matching | - | - | Y | (17+) | - | Y | Y | - | (3.10) | Y | - | **HAVE** | `ti_check_exhaustive`, E1009 |
+| Pattern matching (guards, ranges, or-patterns) | - | - | Y | - | - | Y | Y | - | (3.10) | Y | - | **HAVE** | `parse_match_expr` :1811, range/or/guard/binder |
+| Null safety / Option type | - | - | Y | - | Y | Y | Y | - | - | Y | Y | **HAVE** | Built-in Option, `T?` sugar |
+| Result type for errors | - | - | Y | - | - | Y | Y | - | - | Y | Y | **HAVE** | Built-in Result, `try`/`catch`/`?` |
+| Structural typing / width subtyping | - | - | - | - | - | - | - | Y | Y | - | - | **HAVE** | Structural width subtyping on records |
+| Type aliases | Y | Y | Y | - | Y | Y | Y | Y | Y | Y | Y | **HAVE** | `type_alias` :2641-2684 |
+| Distinct / newtype | - | - | Y | - | - | Y | Y | - | - | Y | - | **HAVE** | `type Name = distinct Target` :2648 |
+| Sized/unsigned numeric types | Y | Y | Y | Y | Y | Y | Y | Y | - | Y | Y | **PLANNED** | L7, M effort (LOCK-4) |
+| f32 type | Y | Y | Y | Y | Y | Y | Y | Y | - | Y | Y | **PLANNED** | L7, included with sized numerics |
+| Automatic numeric tower (bigint on overflow) | - | - | - | - | - | - | - | - | Y | Y | - | **PLANNED** | L9, L, after L7 |
+
+## 2. FUNCTIONS & CLOSURES
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Haskell | Zig | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|---------|-----|-------------|---------------------|
+| First-class functions | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | **HAVE** | Verified throughout compiler |
+| Closures / lambdas | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | - | **HAVE** | `make_closure` :17005, 870 closure references |
+| Default parameters | - | Y | - | - | Y | Y | Y | - | Y | - | Y | **HAVE** | `default_val` on Param struct :39, :2459 |
+| Named arguments | - | - | - | - | Y | Y | Y | - | Y | - | - | **HAVE** | `named_arg` :1738 |
+| Variadic parameters | Y | Y | - | Y | Y | Y | Y | Y | Y | - | - | **HAVE** | Variadic `T...` verified |
+| UFCS (uniform function call syntax) | - | - | - | - | Y | Y | Y | - | - | - | Y | **HAVE** | `ufcs_arg_types` :12414 |
+| Operator overloading | - | Y | Y | - | Y | Y | Y | - | Y | Y | - | **HAVE** | `ir_resolve_op_overload` :7546 |
+| Custom index operator (`[]`) | - | Y | Y | - | Y | Y | Y | - | Y | Y | - | **PLANNED** | L8, M |
+| Custom iterator protocol (for-in) | - | Y | Y | Y | Y | Y | Y | - | Y | Y | - | **PLANNED** | L8, M |
+| Custom call operator (`()`) | - | Y | Y | - | - | Y | Y | - | Y | - | - | **PLANNED** | L8, M |
+| Tail call optimization | - | - | (ltd) | - | - | (ltd) | - | - | - | Y | Y | **HAVE** | `ir_tco_rewrite_block` :13738 |
+| Design-by-contract (pre/postconditions) | - | - | - | - | Y | - | - | - | - | - | - | **HAVE** | `requires`/`ensures` :2555-2569 |
+| Pipe operator | - | - | - | - | - | - | - | - | - | Y | - | **HAVE** | `PIPE_GT` :989 (|> operator) |
+
+## 3. MEMORY MANAGEMENT
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Haskell | Zig | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|---------|-----|-------------|---------------------|
+| Manual allocation | Y | Y | Y | - | - | - | - | - | - | - | Y | **HAVE** (limited) | `ptr_read`/`ptr_write`/`mem_alloc`/`mem_free` in unsafe |
+| Reference counting | - | Y | Y | - | - | - | Y | - | Y | - | - | **HAVE** | FULLRC default-on, `nova_rc_inc`/`nova_rc_free` |
+| Arena/region allocation | - | - | - | - | - | - | - | - | - | - | Y | **HAVE** | Per-request arenas, `arena_new`/`arena_alloc` |
+| Garbage collection | - | - | - | Y | Y | Y | - | Y | Y | Y | - | **EXCLUDED** | No GC by design; RC + arena = deterministic |
+| Ownership / move semantics | - | Y | Y | - | - | - | - | - | - | - | Y | **HAVE** (partial) | Process isolation = ownership; MOVE-on-insert PLANNED (Wave B) |
+| Borrow checker / lifetime annotations | - | - | Y | - | - | - | - | - | - | - | - | **EXCLUDED** | Process isolation replaces borrow checker; no annotation tax |
+| Weak references | - | Y | Y | Y | Y | Y | Y | - | Y | Y | - | **HAVE** (runtime) | `weak_create`/`weak_deref` builtins; language surface PLANNED L10 |
+| Cycle collector | - | - | - | Y | Y | Y | - | Y | Y | Y | - | **PLANNED** | Wave B item 9, opt-in trial-deletion, XL |
+| User-defined destructors (Drop/RAII) | - | Y | Y | - | Y | - | Y | - | - | - | - | **PLANNED** | L10, M, after Wave B |
+| Defer statement | - | - | - | - | - | - | Y | Y | - | - | Y | **HAVE** | `defer` keyword :2138 |
+
+## 4. CONCURRENCY & PARALLELISM
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Erlang | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|--------|-------------|---------------------|
+| Green threads / lightweight tasks | - | - | Y | Y | - | Y | Y | Y | - | Y | **HAVE** | M:N scheduler, `spawn`, fiber stacks |
+| Channels (typed) | - | - | Y | - | Y | Y | - | Y | - | Y | **HAVE** | `chan_new`/`chan_send`/`chan_recv`, typed |
+| Select on channels | - | - | - | - | - | - | - | Y | - | Y | **HAVE** | `select { ... }` syntax verified |
+| Async/await | - | Y | Y | - | Y | Y | Y | - | Y | - | **HAVE** (implicit) | No coloring; `async`/`await`/`await_all`/`await_any` |
+| Parallel map/filter/for | - | Y | Y | Y | Y | Y | - | - | - | - | **HAVE** | `pmap`/`pfilter`/`pfor` |
+| Actor model / process isolation | - | - | - | - | Y | - | Y | - | - | Y | **HAVE** | Deep-copy-on-send, process isolation |
+| OTP supervision trees | - | - | - | - | - | - | - | - | - | Y | **HAVE** | `forge_otp.nova`, per-child restart policies |
+| Monitors / links | - | - | - | - | - | - | - | - | - | Y | **HAVE** | `monitor`/`link` verified |
+| Preemptive scheduling | - | Y | - | Y | Y | Y | - | Y | - | Y | **PLANNED** | LOCK-5, XL supervised |
+| Process kill | - | - | - | Y | - | - | Y | - | - | Y | **PLANNED** | LOCK-5 (safepoint + `kill`) |
+| OS thread primitives (mutex/rwlock/etc.) | Y | Y | Y | Y | Y | Y | Y | Y | Y | - | **PLANNED** | S3, M effort |
+| Atomics | Y | Y | Y | Y | Y | - | - | Y | - | - | **HAVE** | Integer atomics in runtime |
+| Hot code reload | - | - | - | Y | - | - | - | - | Y | Y | **EXCLUDED** | Not planned; AOT compilation model |
+
+## 5. METAPROGRAMMING & REFLECTION
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Haskell | Zig | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|---------|-----|-------------|---------------------|
+| User-extensible annotations/attributes | - | Y | Y | Y | Y | Y | Y | - | Y | - | - | **PLANNED** | L1, XL (LOCK-2, BET 1) |
+| Compile-time code execution (comptime) | - | Y | - | - | - | - | - | - | - | Y | Y | **PLANNED** | L2, XL |
+| Hygienic macros | - | - | Y | - | - | - | Y | - | - | Y | - | **PLANNED** | L2, XL |
+| Runtime reflection (type info) | - | Y | - | Y | Y | Y | Y | Y | Y | - | - | **HAVE** | RTTI: `type_of`/`field_names`/`field_types`/`call_by_name` |
+| Automatic serialization (zero-annotation) | - | - | - | - | - | - | Y | - | - | - | - | **HAVE** | Compiler-derived `to_json`/`from_json`/`print`/`==` |
+| Static assert | - | Y | Y | - | - | - | - | - | - | - | Y | **HAVE** | `static_assert` + const-fn eval :17934 |
+| Conditional compilation | Y | Y | Y | - | Y | - | Y | Y | - | - | Y | **HAVE** (env-based) | `env("NOVA_X")` compile-time checks; no `#ifdef` preprocessor |
+| Code generation (source generators) | - | - | Y | Y | Y | - | Y | - | - | Y | - | **PLANNED** | L1/L2, same-unit codegen hooks |
+| Decorators / annotations (non-extensible) | - | - | - | - | - | - | - | - | Y | - | - | **HAVE** | `@link`/`@repr(C)`/`@inline`/`@gpu` (fixed set) |
+
+## 6. ERROR HANDLING
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Haskell | Zig | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|---------|-----|-------------|---------------------|
+| Exceptions (try/catch/throw) | - | Y | - | Y | Y | Y | - | - | Y | - | - | **EXCLUDED** | No exceptions; Result/Option + `try`/`catch`/`?` |
+| Result type | - | - | Y | - | - | Y | Y | - | - | Y | Y | **HAVE** | Built-in Result |
+| Option type | - | Y | Y | Y | Y | Y | Y | - | - | Y | Y | **HAVE** | Built-in Option |
+| `?` / early-return error propagation | - | - | Y | - | - | - | Y | - | - | - | Y | **HAVE** | `try`/`?` verified |
+| Panic / abort | Y | Y | Y | - | - | - | - | Y | - | - | Y | **HAVE** | `panic` :5247, containment per-process |
+| Error values (Go-style) | Y | - | - | - | - | - | - | Y | - | - | Y | **EXCLUDED** | Subsumed by Result |
+
+## 7. MODULES & PACKAGES
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Haskell | Zig | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|---------|-----|-------------|---------------------|
+| Module system | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | **HAVE** | file=module, `import`/`import as`/selective |
+| Hierarchical namespaces | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | - | **PLANNED** | L11 module namespacing (LOCK-1) |
+| Private/public visibility | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | **HAVE** | `_` prefix = private |
+| Fine-grained visibility (`pub(crate)`, `internal`) | - | - | Y | Y | Y | Y | Y | Y | - | - | - | **PLANNED** | L11, mentioned as future tier |
+| Package manager | - | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | **HAVE** (partial) | `nova get`/`install` work but no transitive solver; resolver EXISTS unwired |
+| Transitive dependency resolution | - | - | Y | Y | Y | Y | Y | Y | Y | Y | - | **PLANNED** | T-Pkg, L (wire existing resolver) |
+| Lockfile | - | - | Y | Y | Y | Y | Y | Y | Y | - | Y | **PLANNED** | T-Pkg, `nova.lock` |
+| Package registry | - | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | **PLANNED** | T2, XL (Vault) |
+
+## 8. FFI & INTEROP
+
+| Feature | C | C++ | Rust | Java | C# | Kotlin | Swift | Go | Python | Haskell | Zig | NOVA Status | Evidence / Plan Item |
+|---------|---|-----|------|------|----|--------|-------|----|--------|---------|-----|-------------|---------------------|
+| Call C from NOVA | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | **HAVE** | `extern fn` + `@link` :2021,:2370 |
+| C callback to NOVA (`@cdecl`) | - | Y | Y | Y | Y | Y | Y | Y | Y | Y | - | **PLANNED** | LOCK-6, L-XL |
+| Struct-by-value FFI | Y | Y | Y | - | Y | - | Y | - | Y | Y | Y | **PLANNED** | LOCK-11, depends on L7 |
+| Opaque pointer FFI | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | **HAVE** | `@opaque` |
+| Out-parameter FFI | Y | Y | - | - | Y | - | - | - | Y | - | - | **HAVE** | `out<T>` annotation |
+| Dynamic library loading | Y | Y | Y | Y | Y | - | Y | - | Y | Y | Y | **HAVE** (limited) | `@link` static; no `dlopen`/`dlsym` at runtime |
+
+## 9. STRINGS & TEXT
+
+| Feature | NOVA Status | Evidence / Plan Item |
+|---------|-------------|---------------------|
+| String type (immutable, UTF-8) | **HAVE** | Fat strings, RC-managed |
+| String interpolation | **HAVE** | `str_interp` :1677, `"{expr}"` syntax |
+| Regex (match/find/replace/split) | **HAVE** | PCRE-subset NFA engine |
+| Regex capture groups (numbered/named) | **PLANNED** | D3, M effort |
+| Unicode NFC/NFD normalization | **HAVE** | `nova_rt_normalize_nfc/nfd` in runtime |
+| Unicode casefold + graphemes | **PLANNED** | D6, L effort |
+| Unicode collation | **PLANNED** | D6, XL (deferred) |
+| Raw strings / multiline strings | **HAVE** | String literals verified |
+| Char type (distinct from int) | **EXCLUDED** | `chr()`/`char_at()` functions; no separate char type (simplicity) |
+| Binary bytes type | **HAVE** | `NovaBytes` tag, NOVA_MEM_BYTES=8 |
+
+## 10. COLLECTIONS & DATA STRUCTURES
+
+| Feature | NOVA Status | Evidence / Plan Item |
+|---------|-------------|---------------------|
+| Dynamic array (list) | **HAVE** | Built-in `list` |
+| Hash map (dict) | **HAVE** | Built-in `dict` |
+| Set | **HAVE** | Built-in `set` |
+| Tuple | **HAVE** | `tuple` :1264, `nt_tuple` :10592 |
+| Priority queue | **HAVE** | Runtime builtin |
+| Deque | **HAVE** | Runtime builtin |
+| Sorted map | **HAVE** | `smap` builtin |
+| LRU cache | **HAVE** | Runtime builtin |
+| Ring buffer | **HAVE** | Runtime builtin |
+| Lazy iterators | **HAVE** | `iter_map`/`iter_filter`/`iter_take` :5407 |
+| Immutable/persistent collections | **PLANNED** | D7, L (HAMT map + bitmapped-vector-trie) |
+| Fixed-size array (`[T; N]`) | **PLANNED** | L5 const generics enables this |
+| Stack-allocated arrays | **PLANNED** | L5 + L7 |
+
+## 11. CONTROL FLOW
+
+| Feature | NOVA Status | Evidence / Plan Item |
+|---------|-------------|---------------------|
+| if/else | **HAVE** | Verified |
+| while loop | **HAVE** | `parse_while_stmt` :2978 |
+| for-in loop | **HAVE** | `parse_for_stmt` :3021, `parse_for_expr` :1911 |
+| loop (infinite) | **HAVE** | `loop` keyword verified |
+| break / continue | **HAVE** | 489 occurrences of break/continue/loop |
+| match / switch | **HAVE** | `parse_match_stmt` :3091 |
+| Generators / yield | **HAVE** | `yield` :1716, `nova_rt_gen_yield` :6482 |
+| for-else / while-else | **EXCLUDED** | Not planned; Python-ism deemed non-essential |
+| goto | **EXCLUDED** | Structured control flow only |
+| Labeled break/continue | **GAP** | See analysis below |
+| do-while / repeat-until | **EXCLUDED** | `loop` + `break` covers this |
+
+## 12. ASYNC & I/O MODEL
+
+| Feature | NOVA Status | Evidence / Plan Item |
+|---------|-------------|---------------------|
+| Implicit async (no coloring) | **HAVE** | Green tasks + netpoller; no async/await keywords required |
+| Explicit async/await (opt-in) | **HAVE** | `async`/`await`/`await_all`/`await_any` |
+| Netpoller / epoll / kqueue | **HAVE** (partial) | Windows OK; Linux `select` only (FD_SETSIZE CVE); no kqueue |
+| OS signal handling | **PLANNED** | S1, M |
+| File I/O (buffered) | **HAVE** | `open`/`read_line`/`seek`/`tell`/`flush` |
+| Subprocess | **HAVE** | `system`/`exec`/subprocess-with-pipes |
+| TCP / UDP / TLS / DNS / WebSocket | **HAVE** | Full verified |
+
+## 13. PLATFORM & COMPILATION
+
+| Feature | NOVA Status | Evidence / Plan Item |
+|---------|-------------|---------------------|
+| AOT compilation (LLVM) | **HAVE** | Text-LLVM-IR -> clang backend |
+| Cross-compilation | **HAVE** | `--target=linux/macos/wasm` |
+| WASM target | **HAVE** (partial) | Codegen works; value-model runtime not auto-linked |
+| ARM / aarch64 | **PLANNED** | Wave C: ARM fibers, L |
+| Embedded / freestanding | **PLANNED** | Edge framework, `--freestanding` capability-gating |
+| GPU compute | **PLANNED** | LOCK-8/9, F7, XL |
+| Debug info (DWARF) | **HAVE** | `ire_dwarf_local` :15996 |
+| Incremental compilation | **HAVE** | `nova build` incremental |
+| LTO | **HAVE** | Supported |
+| Hot code reload | **EXCLUDED** | AOT model; not planned |
+
+## 14. TOOLING
+
+| Feature | NOVA Status | Evidence / Plan Item |
+|---------|-------------|---------------------|
+| LSP (diagnostics) | **HAVE** | Real inferer for diagnostics |
+| LSP (hover/completion) | **HAVE** (broken) | Regex text-scan, not inferer-backed; PLANNED T-LSP |
+| Formatter | **HAVE** | `nova fmt` AST-reprint |
+| Linter | **HAVE** | `nova lint` |
+| Test runner | **HAVE** | `nova test` (file-granular) |
+| Per-fn test discovery | **PLANNED** | T5, M |
+| Property-based testing | **PLANNED** | T4, M |
+| Code coverage | **HAVE** | `nova cov` (LCOV) |
+| Benchmarking | **HAVE** | `nova bench` |
+| REPL | **HAVE** (broken) | Dev-tree-only, recompiles per line; productization PLANNED T-REPL |
+| Debugger | **HAVE** (partial) | DWARF + lldb-dap handoff; CLI stub |
+| Profiler | **PLANNED** | T-Profile, L |
+| Docs generator | **PLANNED** | T-Doc, L |
+| Installer | **PLANNED** | T-Install, M |
+
+---
+
+# GAPS THE PLAN FORGOT
+
+After auditing ~160 features across 14 languages, comparing against the master plan's
+L1-L13, D1-D12, S1-S9, T1-T8, F1-F11, and LOCK-1 through LOCK-12, here are the features
+that are NOT in the plan AND NOT deliberately excluded:
+
+## GENUINELY MISSING (not in any plan item, would cause a real problem)
+
+### GAP-1: Labeled break/continue (nested loop control)
+**Severity: CONCERN**
+Languages that have it: Rust (`'label: loop`), Java (`label:`), Go (`label:`), Kotlin,
+Swift, JS, Zig.
+NOVA has `break`/`continue` but grep for `labeled_break`, `break_label`, `label:`,
+`loop_label` in the compiler = 0. In nested loops (common in graph algorithms, matrix
+ops, parsers), you must use boolean flags to break an outer loop. This is a daily
+papercut for systems/algorithm code. The 570 KAT-gated algorithm modules likely work
+around this with flags or early returns. Not in any L# item.
+
+### GAP-2: Async generators / async iteration protocol
+**Severity: CONCERN**
+Languages that have it: JS (`async function*`), Python (`async for`), C# (`IAsyncEnumerable`),
+Kotlin (`Flow`).
+NOVA has generators (`yield`) and implicit async, but there is no way to `yield` values
+from an async producer to be consumed lazily. A database cursor streaming 1M rows, a
+paginated API, or a real-time event feed must either buffer everything into a list or use
+channels (which is the NOVA-way workaround). This is arguably covered by channels, but
+channels require explicit `send`/`recv` ceremony vs the `for row in cursor` pattern. The
+L8 custom-iterator plan does not mention async iteration. If the NOVA thesis is "channels
+are async iterators," it should be stated explicitly and the `for x in channel` sugar
+should be verified (it may already work -- needs confirmation).
+
+### GAP-3: No numeric literal separators (`1_000_000`)
+**Severity: MINOR**
+Every modern language has this: Rust, Swift, Kotlin, Java, Python, Go, C#, Zig, C23.
+Trivial lexer change. Not in any plan item. A readability papercut for the crypto/finance
+code that is a stated NOVA target.
+
+### GAP-4: No string escape sequences beyond the basics (no `\u{XXXX}` unicode escapes verified)
+**Severity: MINOR**
+Needs verification -- may already exist. If not, `\u{1F600}` for emoji/unicode outside
+BMP is missing. All modern languages support this.
+
+## FEATURES THE PLAN COVERS BUT WHOSE ABSENCE IS MORE DANGEROUS THAN THE PLAN ADMITS
+
+### RISK-1: No `@cdecl` (LOCK-6) blocks MORE than the plan lists
+The plan correctly identifies Prism-desktop, Edge, Forge-ALPN, and Reactor as blocked.
+But it UNDERESTIMATES the blast: ANY third-party C library that uses callbacks is blocked.
+This includes: SQLite's `sqlite3_exec` callback, PCRE2 callouts, custom allocators,
+signal handlers, sort comparators for C `qsort`, profiling hooks, plugin systems. Every
+C library integration that takes a function pointer is dead. This is not 5/9 frameworks --
+this is "the entire FFI story is half-broken."
+
+### RISK-2: No runtime dynamic dispatch / vtable for traits
+The plan says traits use djb2-hash dispatch. This is:
+(a) A latent collision bug (plan acknowledges as "latent hash-collision mis-dispatch")
+(b) O(n) arm scan per dispatch, not O(1) vtable lookup
+For hot paths (iterator protocols, collection abstractions, Cortex Layer/Optimizer traits),
+this adds real overhead. The plan's L4 (associated types) will make this worse as trait
+dispatch becomes more common. No plan item addresses switching to monotonic-id vtables.
+
+### RISK-3: No try-finally / resource management pattern beyond `defer`
+NOVA has `defer` but no scoped resource management (Rust's RAII Drop, Python's `with`,
+Java's try-with-resources, C#'s `using`, Go's `defer` + explicit Close). L10 plans
+user-defined Drop, but until then, every file handle / DB connection / lock must be
+manually `defer`'d. This is fine for the owner who knows the pattern, but a framework
+user WILL forget `defer db_close(conn)` and leak connections. The plan sequence puts
+L10 AFTER Wave B (RC completeness) -- potentially months away. An interim `with_resource`
+builtin or auto-defer-on-scope-exit for known types would help.
+
+## FEATURES THAT ARE DELIBERATELY EXCLUDED BUT THE RATIONALE IS WEAK
+
+### QUESTION-1: Hot code reload
+**Exclusion rationale: "AOT model"**
+Erlang's hot code reload is called out as a win for Erlang in the competitive analysis.
+NOVA claims Erlang-parity fault tolerance. Hot reload is how Erlang achieves 99.999%
+uptime WITHOUT restarts. NOVA's process model (isolated processes, message-passing)
+is structurally PERFECT for hot reload (swap the code a process runs, keep its state).
+The exclusion is premature -- at minimum it should be tracked as a future possibility
+rather than permanently excluded, since it is a natural consequence of the Three
+Primitives model.
+
+### QUESTION-2: No mention of SIMD intrinsics anywhere in the plan
+C/C++/Rust/Zig all expose SIMD intrinsics. The plan mentions LLVM auto-vectorization
+for float arrays (S4.2) but has NO path for explicit SIMD. For image codecs (F5),
+crypto (AES-NI), and scientific computing, auto-vectorization is insufficient --
+hand-written SIMD is 2-10x faster. Not even an L# item. This is a real gap for the
+"C-class performance" claim on vectorizable workloads.
 
 # ═══════════════════════ PART II — FRAMEWORK FOUNDATION READINESS ═══════════════════════
 
