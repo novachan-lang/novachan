@@ -1226,7 +1226,7 @@ non-deterministic (CSPRNG). Two use cases, two APIs — no confusion.
 the primary special-float check (no surprising `nan == nan`); `clamp` is one function (not the `max(lo,
 min(hi,x))` developers get wrong). *Unlocks:* stats/ML/scientific code. **cheap.**
 
-**D9 — Binary pack/unpack + endianness codec.** [runtime+lib] **M.**
+**✅ DONE-integer (std/encoding/pack: u8..u64/i8..i64 be/le + pack_fmt/unpack_fmt, rejects bad fmt; f32/f64 deferred — needs float-bits builtin) · D9 — Binary pack/unpack + endianness codec.** [runtime+lib] **M.**
 *NOVA way:* typed reads/writes (`bytes_write_u32_be`, `bytes_read_f64_le` — self-documenting) + an optional
 Python-style `pack(">Ihd", [...])` format-string API. A future comptime pass validates format strings at
 compile time.

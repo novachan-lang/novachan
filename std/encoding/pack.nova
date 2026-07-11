@@ -1,0 +1,403 @@
+// ============================================================================
+// NOVA Standard Library — pack module (binary structured pack/unpack)
+// ============================================================================
+// WHAT: Reads/writes fixed-width INTEGERS to/from NOVA's binary-safe `bytes`.
+// This is the base layer for file-format headers (PNG/WAV/ELF), network wire
+// codecs, and it removes the hand-rolled byte-shift math that every driver
+// (PG/MySQL/TLS/Redis) would otherwise re-invent by hand.
+//
+// THE NOVA WAY — binary-safe bytes, not char strings.
+//   Everything here operates on `bytes` handles (bytes_create / bytes_get /
+//   bytes_set), NOT on NOVA strings. A NOVA string is C-string-shaped: a 0x00
+//   byte inside it TRUNCATES (see reference_nova_string_nul_truncation). Binary
+//   data contains 0x00 constantly, so char-string byte math is a latent
+//   corruption bug. `bytes` treats 0x00 as ordinary data — the only sound
+//   substrate for wire formats.
+//
+// THE DRAWBACK AVOIDED.
+//   * Python `struct`: the format string ('>IH') is powerful but its errors are
+//     CRYPTIC and RUNTIME-ONLY ("unpack requires a buffer of 6 bytes"), and the
+//     char vocabulary (b/B/h/H/i/I/q/Q + @=<>!) is a memorization tax. NOVA keeps
+//     the ergonomic one-line format API but ALSO exposes named typed helpers
+//     (pack_u32_be) so the common path is self-documenting, not a cipher.
+//   * Go `encoding/binary`: sound but verbose — binary.BigEndian.PutUint32(buf,v)
+//     per field, manual slice offset bookkeeping. NOVA composes the whole record
+//     in one pack_fmt call with zero manual offsets.
+//
+// ENDIANNESS. `be` = big-endian = network byte order (most-significant byte
+// first). `le` = little-endian (least-significant byte first, x86/ARM native).
+//
+// SIGNED. Two's complement: a signed value is packed by reinterpreting it into
+// the unsigned range (v < 0 -> v + 2^bits), and unpacked by folding the top bit
+// back (u >= 2^(bits-1) -> u - 2^bits). Bit patterns are identical to unsigned.
+//
+// FLOATS (f32/f64) are OUT OF SCOPE in this cut: they need a float-bits
+// reinterpret builtin (bitcast f64<->i64) that NOVA does not yet expose. Integer
+// widths only. Documented here so the gap is explicit, not silent.
+//
+// PUBLIC API
+//   pack_u8(v)  pack_i8(v)                       -> bytes  (1 byte)
+//   pack_u16_be/le(v)   pack_i16_be/le(v)        -> bytes  (2 bytes)
+//   pack_u32_be/le(v)   pack_i32_be/le(v)        -> bytes  (4 bytes)
+//   pack_u64_be/le(v)   pack_i64_be/le(v)        -> bytes  (8 bytes)
+//   unpack_u8(b,off) unpack_i8(b,off)            -> int
+//   unpack_u16_be/le  unpack_i16_be/le           -> int
+//   unpack_u32_be/le  unpack_i32_be/le           -> int
+//   unpack_u64_be/le  unpack_i64_be/le           -> int
+//   bytes_concat(a,b)                            -> bytes  (join two buffers)
+//   pack_fmt(fmt, vals) -> bytes                 (Python-struct-style)
+//   unpack_fmt(fmt, bytes) -> list               (inverse)
+//     fmt: optional leading '>' (big-endian, default) or '<' (little-endian),
+//     then one char per value: 'B'/'b' u8/i8  'H'/'h' u16/i16
+//                              'I'/'i' u32/i32 'Q'/'q' u64/i64
+//     e.g. pack_fmt(">IH", vals) writes a 4-byte then a 2-byte big-endian field.
+
+// ── two's-complement boundary constants ─────────────────────────────────────
+// Named so the signed reinterpret reads as intent, not as magic numbers. Kept
+// as literals (no 2**n) so nothing routes through float conversion.
+fn _p8() -> int
+    256                              // 2^8
+fn _p16() -> int
+    65536                            // 2^16
+fn _p32() -> int
+    4294967296                       // 2^32
+
+// ── unsigned pack helpers ───────────────────────────────────────────────────
+// Each writes big/little-endian bytes into a fresh buffer. Byte j is extracted
+// with a shift + `& 0xFF` mask (>> is arithmetic; the mask keeps it a clean
+// 0..255). Shift amounts here are always 0..56, well inside the valid range.
+
+fn pack_u8(v) -> any
+    let b = bytes_create(1)
+    bytes_set(b, 0, v & 0xFF)
+    b
+
+fn pack_u16_be(v) -> any
+    let b = bytes_create(2)
+    bytes_set(b, 0, (v >> 8) & 0xFF)
+    bytes_set(b, 1, v & 0xFF)
+    b
+
+fn pack_u16_le(v) -> any
+    let b = bytes_create(2)
+    bytes_set(b, 0, v & 0xFF)
+    bytes_set(b, 1, (v >> 8) & 0xFF)
+    b
+
+fn pack_u32_be(v) -> any
+    let b = bytes_create(4)
+    bytes_set(b, 0, (v >> 24) & 0xFF)
+    bytes_set(b, 1, (v >> 16) & 0xFF)
+    bytes_set(b, 2, (v >> 8) & 0xFF)
+    bytes_set(b, 3, v & 0xFF)
+    b
+
+fn pack_u32_le(v) -> any
+    let b = bytes_create(4)
+    bytes_set(b, 0, v & 0xFF)
+    bytes_set(b, 1, (v >> 8) & 0xFF)
+    bytes_set(b, 2, (v >> 16) & 0xFF)
+    bytes_set(b, 3, (v >> 24) & 0xFF)
+    b
+
+fn pack_u64_be(v) -> any
+    let b = bytes_create(8)
+    bytes_set(b, 0, (v >> 56) & 0xFF)
+    bytes_set(b, 1, (v >> 48) & 0xFF)
+    bytes_set(b, 2, (v >> 40) & 0xFF)
+    bytes_set(b, 3, (v >> 32) & 0xFF)
+    bytes_set(b, 4, (v >> 24) & 0xFF)
+    bytes_set(b, 5, (v >> 16) & 0xFF)
+    bytes_set(b, 6, (v >> 8) & 0xFF)
+    bytes_set(b, 7, v & 0xFF)
+    b
+
+fn pack_u64_le(v) -> any
+    let b = bytes_create(8)
+    bytes_set(b, 0, v & 0xFF)
+    bytes_set(b, 1, (v >> 8) & 0xFF)
+    bytes_set(b, 2, (v >> 16) & 0xFF)
+    bytes_set(b, 3, (v >> 24) & 0xFF)
+    bytes_set(b, 4, (v >> 32) & 0xFF)
+    bytes_set(b, 5, (v >> 40) & 0xFF)
+    bytes_set(b, 6, (v >> 48) & 0xFF)
+    bytes_set(b, 7, (v >> 56) & 0xFF)
+    b
+
+// ── signed pack helpers ─────────────────────────────────────────────────────
+// A negative value is folded into the unsigned range (v + 2^bits), producing the
+// exact two's-complement bit pattern, then delegated to the unsigned packer so
+// there is ONE place that lays down bytes per width.
+
+fn pack_i8(v) -> any
+    let u = v
+    if v < 0
+        u = v + _p8()
+    pack_u8(u)
+
+fn pack_i16_be(v) -> any
+    let u = v
+    if v < 0
+        u = v + _p16()
+    pack_u16_be(u)
+
+fn pack_i16_le(v) -> any
+    let u = v
+    if v < 0
+        u = v + _p16()
+    pack_u16_le(u)
+
+fn pack_i32_be(v) -> any
+    let u = v
+    if v < 0
+        u = v + _p32()
+    pack_u32_be(u)
+
+fn pack_i32_le(v) -> any
+    let u = v
+    if v < 0
+        u = v + _p32()
+    pack_u32_le(u)
+
+// For i64 the unsigned image is v itself: NOVA ints ARE 64-bit two's complement,
+// so a negative i64 already carries the correct 64-bit pattern; the byte
+// extraction (v >> k) & 0xFF reads it directly. No fold needed.
+fn pack_i64_be(v) -> any
+    pack_u64_be(v)
+
+fn pack_i64_le(v) -> any
+    pack_u64_le(v)
+
+// ── unsigned unpack helpers ─────────────────────────────────────────────────
+// Read `width` bytes at `off` and recompose. Each byte is masked to 0..255
+// before shifting into place so a stray sign bit can never leak in.
+
+fn unpack_u8(b, off) -> int
+    bytes_get(b, off) & 0xFF
+
+fn unpack_u16_be(b, off) -> int
+    let hi = bytes_get(b, off) & 0xFF
+    let lo = bytes_get(b, off + 1) & 0xFF
+    (hi << 8) | lo
+
+fn unpack_u16_le(b, off) -> int
+    let lo = bytes_get(b, off) & 0xFF
+    let hi = bytes_get(b, off + 1) & 0xFF
+    (hi << 8) | lo
+
+fn unpack_u32_be(b, off) -> int
+    let b0 = bytes_get(b, off) & 0xFF
+    let b1 = bytes_get(b, off + 1) & 0xFF
+    let b2 = bytes_get(b, off + 2) & 0xFF
+    let b3 = bytes_get(b, off + 3) & 0xFF
+    (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+fn unpack_u32_le(b, off) -> int
+    let b0 = bytes_get(b, off) & 0xFF
+    let b1 = bytes_get(b, off + 1) & 0xFF
+    let b2 = bytes_get(b, off + 2) & 0xFF
+    let b3 = bytes_get(b, off + 3) & 0xFF
+    (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+fn unpack_u64_be(b, off) -> int
+    let b0 = bytes_get(b, off) & 0xFF
+    let b1 = bytes_get(b, off + 1) & 0xFF
+    let b2 = bytes_get(b, off + 2) & 0xFF
+    let b3 = bytes_get(b, off + 3) & 0xFF
+    let b4 = bytes_get(b, off + 4) & 0xFF
+    let b5 = bytes_get(b, off + 5) & 0xFF
+    let b6 = bytes_get(b, off + 6) & 0xFF
+    let b7 = bytes_get(b, off + 7) & 0xFF
+    (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+
+fn unpack_u64_le(b, off) -> int
+    let b0 = bytes_get(b, off) & 0xFF
+    let b1 = bytes_get(b, off + 1) & 0xFF
+    let b2 = bytes_get(b, off + 2) & 0xFF
+    let b3 = bytes_get(b, off + 3) & 0xFF
+    let b4 = bytes_get(b, off + 4) & 0xFF
+    let b5 = bytes_get(b, off + 5) & 0xFF
+    let b6 = bytes_get(b, off + 6) & 0xFF
+    let b7 = bytes_get(b, off + 7) & 0xFF
+    (b7 << 56) | (b6 << 48) | (b5 << 40) | (b4 << 32) | (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+// ── signed unpack helpers ───────────────────────────────────────────────────
+// Read as unsigned, then fold the top bit: if the value is >= 2^(bits-1) it
+// represents a negative number, so subtract 2^bits. One shared shape per width.
+
+fn unpack_i8(b, off) -> int
+    let u = unpack_u8(b, off)
+    if u >= 128
+        return u - _p8()
+    u
+
+fn unpack_i16_be(b, off) -> int
+    let u = unpack_u16_be(b, off)
+    if u >= 32768
+        return u - _p16()
+    u
+
+fn unpack_i16_le(b, off) -> int
+    let u = unpack_u16_le(b, off)
+    if u >= 32768
+        return u - _p16()
+    u
+
+fn unpack_i32_be(b, off) -> int
+    let u = unpack_u32_be(b, off)
+    if u >= 2147483648
+        return u - _p32()
+    u
+
+fn unpack_i32_le(b, off) -> int
+    let u = unpack_u32_le(b, off)
+    if u >= 2147483648
+        return u - _p32()
+    u
+
+// i64: the recomposed unsigned value already occupies all 64 bits. In NOVA's
+// 64-bit two's-complement ints that pattern IS the signed value, so u64_be
+// already yields the correct signed integer — just return it.
+fn unpack_i64_be(b, off) -> int
+    unpack_u64_be(b, off)
+
+fn unpack_i64_le(b, off) -> int
+    unpack_u64_le(b, off)
+
+// ── format-string dispatch (Python-struct-style) ────────────────────────────
+// The format is scanned char-by-char. A leading '>' selects big-endian, '<'
+// little-endian; big-endian is the default (network order). Each remaining char
+// packs/unpacks ONE value using the named helpers above + bytes_concat — the
+// byte math lives in exactly one place per width, never re-inlined per char.
+
+// Width in bytes for one format char (used to advance the unpack offset).
+fn _fmt_width(c) -> int
+    if c == "B" or c == "b"
+        return 1
+    if c == "H" or c == "h"
+        return 2
+    if c == "I" or c == "i"
+        return 4
+    if c == "Q" or c == "q"
+        return 8
+    0
+
+// Is `c` a valid per-value format char? (endianness markers '>'/'<' are handled separately.)
+fn _is_fmt_char(c) -> bool
+    return c == "B" or c == "b" or c == "H" or c == "h" or c == "I" or c == "i" or c == "Q" or c == "q"
+
+// Pack a single value `v` for format char `c` at the given endianness.
+fn _pack_one(c, v, big) -> any
+    if c == "B"
+        return pack_u8(v)
+    if c == "b"
+        return pack_i8(v)
+    if c == "H"
+        if big
+            return pack_u16_be(v)
+        return pack_u16_le(v)
+    if c == "h"
+        if big
+            return pack_i16_be(v)
+        return pack_i16_le(v)
+    if c == "I"
+        if big
+            return pack_u32_be(v)
+        return pack_u32_le(v)
+    if c == "i"
+        if big
+            return pack_i32_be(v)
+        return pack_i32_le(v)
+    if c == "Q"
+        if big
+            return pack_u64_be(v)
+        return pack_u64_le(v)
+    if c == "q"
+        if big
+            return pack_i64_be(v)
+        return pack_i64_le(v)
+    bytes_create(0)                  // unknown char -> empty (skipped)
+
+// Unpack a single value for format char `c` from `b` at `off`.
+fn _unpack_one(c, b, off, big) -> int
+    if c == "B"
+        return unpack_u8(b, off)
+    if c == "b"
+        return unpack_i8(b, off)
+    if c == "H"
+        if big
+            return unpack_u16_be(b, off)
+        return unpack_u16_le(b, off)
+    if c == "h"
+        if big
+            return unpack_i16_be(b, off)
+        return unpack_i16_le(b, off)
+    if c == "I"
+        if big
+            return unpack_u32_be(b, off)
+        return unpack_u32_le(b, off)
+    if c == "i"
+        if big
+            return unpack_i32_be(b, off)
+        return unpack_i32_le(b, off)
+    if c == "Q"
+        if big
+            return unpack_u64_be(b, off)
+        return unpack_u64_le(b, off)
+    if c == "q"
+        if big
+            return unpack_i64_be(b, off)
+        return unpack_i64_le(b, off)
+    0
+
+// pack_fmt(">IH", [v0, v1, ...]) -> bytes. Walks the format string, tracking a
+// value index; concatenates each per-field buffer. A leading '>'/'<' only sets
+// endianness and consumes no value.
+fn pack_fmt(fmt, vals) -> any
+    let big = 1
+    let out = bytes_create(0)
+    let vi = 0
+    let i = 0
+    let n = len(fmt)
+    while i < n
+        let c = fmt[i]
+        if c == ">"
+            big = 1
+        else if c == "<"
+            big = 0
+        else
+            if not _is_fmt_char(c)
+                print("pack_fmt: unknown format char '" + c + "' in '" + fmt + "'")
+                exit(1)
+            let piece = _pack_one(c, vals[vi], big)
+            out = bytes_concat(out, piece)
+            vi = vi + 1
+        i = i + 1
+    out
+
+// unpack_fmt(">IH", bytes) -> list of ints in field order. Walks the format,
+// advancing the byte offset by each field's width.
+fn unpack_fmt(fmt, b) -> any
+    let big = 1
+    let out = []
+    let off = 0
+    let i = 0
+    let n = len(fmt)
+    while i < n
+        let c = fmt[i]
+        if c == ">"
+            big = 1
+        else if c == "<"
+            big = 0
+        else
+            if not _is_fmt_char(c)
+                print("unpack_fmt: unknown format char '" + c + "' in '" + fmt + "'")
+                exit(1)
+            if off + _fmt_width(c) > bytes_len(b)
+                print("unpack_fmt: buffer too short for format '" + fmt + "' (need " + str(off + _fmt_width(c)) + " bytes, have " + str(bytes_len(b)) + ")")
+                exit(1)
+            let v = _unpack_one(c, b, off, big)
+            push(out, v)
+            off = off + _fmt_width(c)
+        i = i + 1
+    out
