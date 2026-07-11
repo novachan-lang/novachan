@@ -12,11 +12,17 @@
 > - **Runtime builtins** — **D11** extended math (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf) ·
 >   **D8** seedable PRNG (xoshiro256**). *(batch 2)*
 >
-> **IN PROGRESS / NEXT:** **LOCK-1 module namespacing** — a proper `std/` standard-library tree with path
-> imports (`import std/numeric/bignum`); relocate the Wave-1 modules out of `forge/` (which stays framework-
-> only). Then breadth Wave-2 (**D2** BigDecimal · Argon2id · **D6** unicode · **S2** HTTP-client) + more
-> runtime builtins (signals/sync/glob/pack). **This file is REFERENCED (read as the backlog), not the tracker
-> — the tracker is `EXECUTION_STATE.md`.**
+> **✅ PROJECT STRUCTURE DONE** — the NOVA **standard library** now lives in a proper hierarchical `std/`
+> tree by category (22 modules: numeric/crypto/collections/text/encoding/core/util) with **path imports**
+> (`import std/numeric/bignum`), bundled into the toolchain. `forge/` = FRAMEWORK, untouched. The
+> compiler/runtime stay in `nova-compiler/` (relocating them = 585-script self-hosting risk for internal-only
+> gain — a recorded decision, see `PROJECT_STRUCTURE.md`). *Path-import module resolution is done; LOCK-1's
+> `@mod__fn` symbol mangling is the remaining piece, mitigated today by the per-module prefix convention.*
+>
+> **NEXT (master plan, non-stop, in order, ✅-ticked, 30-task arcs):** **D2** BigDecimal (on `std/numeric/
+> bignum`) → **D1** tz → **D3** regex-captures → **D6** unicode → **D9** pack → Argon2id → **S2** HTTP-client
+> → S1/S3/S4-8 runtime → Wave-B RC completeness. **This file is REFERENCED (the backlog); the tracker is
+> `EXECUTION_STATE.md`.**
 
 > **This is THE single source of truth** for NOVA's multi-month build to *"do everything C/C++/Java/Python/
 > Go/Erlang/Elixir/Rust can do, and do it BETTER — the NOVA way, so developers CHOOSE NOVA."* It consolidates

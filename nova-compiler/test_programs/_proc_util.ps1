@@ -125,13 +125,7 @@ if (Test-Path $StdSrcDir) {
         Copy-Item -Force $_.FullName $dst
     }
 }
-# Install the curated pure-NOVA STDLIB modules into $NOVA_HOME/lib so an out-of-tree project resolves
-# `import corex` (etc.) from the toolchain -- exactly like an installed standard library. Canonical source
-# lives in test_programs/ for now (validated in-tree by the *_lib_test.nova suite); a dedicated stdlib/
-# source dir is a future cleanup. Each is a pure library (its self-test main is ignored on import).
-$StdlibModules = @('corex','strx','urlx','csvx','bignum','complexnum','rational','basex','setops','matrixx','collx','getin','prng','uuid','bitset','graphemex','pvecx','coro')
-New-Item -ItemType Directory -Force -Path $LibDir | Out-Null
-foreach ($m in $StdlibModules) {
-    $src = Join-Path $PSScriptRoot "$m.nova"
-    if (Test-Path $src) { Copy-Item -Force $src (Join-Path $LibDir "$m.nova") }
-}
+# (The curated pure-NOVA stdlib modules — corex/strx/nat/prng/bitset/pvecx/graphemex/etc. — were migrated
+#  from the flat test_programs/ dump into the hierarchical std/ tree by category. They now sync recursively
+#  above (std/ -> $NOVA_HOME/std) and resolve as `import std/<category>/<name>`. The old flat-list + lib/
+#  install is gone; the "dedicated stdlib source dir" the previous cleanup-comment anticipated is now std/.)
