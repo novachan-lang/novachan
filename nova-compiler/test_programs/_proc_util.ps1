@@ -111,6 +111,20 @@ if (Test-Path $ForgeSrcDir) {
         Copy-Item -Force $_.FullName (Join-Path $LibDir $_.Name)
     }
 }
+# NOVA STANDARD LIBRARY (LOCK-1): the std/ tree (<repo>/std, organized by category) is bundled into the
+# toolchain at $NOVA_HOME/std, preserving subdirs, so `import std/<category>/<name>` resolves from any
+# project -- exactly like forge/ -> lib/, but hierarchical. forge/ is the FRAMEWORK; std/ is the LANGUAGE.
+$StdSrcDir = Join-Path $env:NOVA_HOME "..\std"
+$StdDstDir = Join-Path $env:NOVA_HOME "std"
+if (Test-Path $StdSrcDir) {
+    $stdRoot = (Resolve-Path $StdSrcDir).Path
+    Get-ChildItem -Path $StdSrcDir -Recurse -Filter *.nova | ForEach-Object {
+        $rel = $_.FullName.Substring($stdRoot.Length).TrimStart('\','/')
+        $dst = Join-Path $StdDstDir $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+        Copy-Item -Force $_.FullName $dst
+    }
+}
 # Install the curated pure-NOVA STDLIB modules into $NOVA_HOME/lib so an out-of-tree project resolves
 # `import corex` (etc.) from the toolchain -- exactly like an installed standard library. Canonical source
 # lives in test_programs/ for now (validated in-tree by the *_lib_test.nova suite); a dedicated stdlib/
