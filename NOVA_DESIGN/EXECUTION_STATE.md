@@ -47,16 +47,25 @@
 | `@cdecl` FFI callbacks (LOCK-6) + struct-by-value | ceil | A | ⬜ | |
 | monotonic type-id vtables | ceil | A | ⬜ | |
 | explicit SIMD path | ceil | A | ⬜ | |
-| runtime builtins: signals/sockets/glob/sync/PRNG/pack/math | rt | B/C | ⬜ | |
+| runtime builtins: math (D11) | rt | C | ✅ DONE (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf; reconverge pending) | (batch 2) |
+| runtime builtins: PRNG (D8) | rt | C | ✅ DONE (xoshiro256** seedable: rng_new/next/int/float; reconverge pending) | (batch 2) |
+| runtime builtins: signals/sockets/glob/sync/pack | rt | B/C | ⬜ | |
 | regex capture-group engine | rt | B | ⬜ | |
 | GPU lowering (SPIR-V/PTX) · MCU triples | backend | A(XL) | ⬜ | |
 
 ## Stream 2 — std/ stdlib (Sonnet fleet) — status
 | Module | Category | Needs (Stream 1) | Status | Commit |
 |---|---|---|---|---|
-| (bootstrapping std/ structure) | — | — | 🔵 | |
+| forge_xmlparse (D5 XML parser) | data | — | ✅ DONE (ACCEPT) | a051c26a |
+| forge_signum (D4 signed bignum) | numeric | — | ✅ DONE (fixed INT_MIN) | d708af6f |
+| forge_blake2b (RFC 7693 hash) | crypto | — | ✅ DONE (fixed validation) | d708af6f |
+| forge_hamt (D7 persistent map) | collections | — | ✅ DONE (fixed real-trie) | d708af6f |
+| forge_decimal (D2 BigDecimal) | numeric | signum | ⬜ Wave-2 | |
+| forge_argon2id (KDF) | crypto | blake2b | ⬜ Wave-2 | |
+| forge_unicode (D6 casefold/graphemes) | text | — | ⬜ Wave-2 | |
+| S2 HTTP-client redirects/cookies | net | — | ⬜ Wave-2 | |
 
-*(rows added as modules are assigned/landed)*
+*(Wave-1 = 4/4 landed, each KAT-gated + adversarially verified; the verify pass forced fixes to hamt/signum/blake2b before accept.)*
 
 ## Batch log (what we did per task; full-arc runs after ~10 tasks)
 ### Batch 1 (Phase-0 foundation) — ✅ FULL-ARC CERTIFIED (2026-07-11)
@@ -121,3 +130,17 @@ soundness = DONE. Next: task 5 (float-payload codegen, empirical) then the bread
    "float" on an already-correct (Rect) path could BREAK it. MUST build gen4 + test Circle AND Rect AND F
    AND existing enum_test/enum_full_test, iterate. Also 3 match codegen sites exist (~8503, ~9406, ~9676) —
    check which the repro hits. DEFERRED to a focused build-test loop right after the Wave-A arc.
+
+### Batch 2 (breadth + runtime builtins) — reconverge in progress
+- **task 5 float-enum-payload** → FIXED + CERTIFIED (`29e380c1`). See Stream-1 table + memory.
+- **Breadth Wave-1 (Stream-2 fleet, 4/4 landed):** forge_xmlparse (`a051c26a`), forge_signum + forge_blake2b
+  + forge_hamt (`d708af6f`). Each KAT-gated by an impl agent + ADVERSARIALLY VERIFIED by a second agent that
+  independently recomputed the KATs — the verify pass caught + forced fixes to: hamt (was a flat 32-bucket
+  table, not a trie → real leaf/internal split, maxdepth 3-4 at scale), signum (sn_from_int(INT_MIN) double-
+  minus corruption → parse str(i)), blake2b (missing out_len/key validation). Pure-NOVA LEAF modules → no
+  reconverge; canonical import tests in the manifest.
+- **D11 extended math** (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf) + **D8 seedable PRNG**
+  (xoshiro256** over a 32-byte NOVA-managed bytes state: rng_new/rng_next/rng_int/rng_float). Runtime +
+  compiler (name-map, type schemes, 2× LLVM declares, raw-double lists). gen4-tested: D11 14/14, D8 5/5
+  (determinism/seed-independence/range/reproducibility). Reconverge (gen5==gen6) + full both-mode regression
+  running now — validates D11 + D8 AND re-certifies the 4 breadth modules. Commit after green.

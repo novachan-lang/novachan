@@ -1,5 +1,23 @@
 # NOVA — MASTER PLAN (Consolidated) · 2026-07-10
 
+> **⚡ EXECUTION STATUS** — live progress against this plan; **full per-task detail + the live backlog is in
+> [`EXECUTION_STATE.md`](EXECUTION_STATE.md)** (updated every commit). This banner is refreshed as backlog
+> items land, so the plan stays an accurate picture. Execution began **2026-07-11**.
+>
+> **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
+> - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
+>   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*
+> - **Stdlib breadth Wave-1 (4 modules, each ADVERSARIALLY verified)** — **D5** XML parser · **D4** signed
+>   bignum · BLAKE2b (Argon2 dep) · **D7** persistent HAMT map. *(`a051c26a`, `d708af6f`)*
+> - **Runtime builtins** — **D11** extended math (isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf) ·
+>   **D8** seedable PRNG (xoshiro256**). *(batch 2)*
+>
+> **IN PROGRESS / NEXT:** **LOCK-1 module namespacing** — a proper `std/` standard-library tree with path
+> imports (`import std/numeric/bignum`); relocate the Wave-1 modules out of `forge/` (which stays framework-
+> only). Then breadth Wave-2 (**D2** BigDecimal · Argon2id · **D6** unicode · **S2** HTTP-client) + more
+> runtime builtins (signals/sync/glob/pack). **This file is REFERENCED (read as the backlog), not the tracker
+> — the tracker is `EXECUTION_STATE.md`.**
+
 > **This is THE single source of truth** for NOVA's multi-month build to *"do everything C/C++/Java/Python/
 > Go/Erlang/Elixir/Rust can do, and do it BETTER — the NOVA way, so developers CHOOSE NOVA."* It consolidates
 > four code-verified workstreams into one file (nothing scattered):
@@ -958,7 +976,7 @@ file:line-grounded backlog. These are NOT stale ledger claims; every one has evi
 
 | # | Gap | Area | Sev | Effort | Status |
 |---|---|---|---|---|---|
-| 1 | **Float-return reads an UNINIT float slot → silent garbage (0.11)** | Runtime/Perf/Type | High | XL | The one remaining silent-wrong-answer bug. `sqrt(variance)`→3e-156. Layout-dependent Heisenbug; same class as geo_bearing/atan2. |
+| 1 ✅ | **Float-return reads an UNINIT float slot → silent garbage (0.11)** — DONE `bfc55fba`+`29e380c1` | Runtime/Perf/Type | High | XL | The one remaining silent-wrong-answer bug. `sqrt(variance)`→3e-156. Layout-dependent Heisenbug; same class as geo_bearing/atan2. |
 | 2 | No ARM/aarch64 fiber context switch — concurrency compiled OUT on ARM | Platform | High | L | `nova_asm_switch` has no aarch64 branch and no `#else`. `spawn`/generators silently no-op on ARM. |
 | 3 | N>1 I/O throughput regresses (0.76–0.82× single-core) | Concurrency | High | L | Single global `nova_io_waiters` under `g_sched_lock`; per-carrier sharding absent. More cores = slower I/O. |
 | 4 | HTTP/2 & gRPC over TLS impossible — ALPN missing | Forge-core | High | L | `grep -i alpn` = 0. h2/gRPC exist only as cleartext h2c. No browser HTTP/2. |
@@ -970,7 +988,7 @@ file:line-grounded backlog. These are NOT stale ledger claims; every one has evi
 | 10 | Package manager: no transitive solver/semver/lockfile in the CLI path | Toolchain | High | L | A full resolver EXISTS in `nova_pkg.nova` but is UNWIRED. |
 | 11 | No preemption (cooperative-only); CPU-bound task starves; OTP can't kill | Concurrency | High | XL | Blocks soft-realtime + true Erlang-parity supervision (zombies survive restart). |
 | 12 | Closure captures leak on closure death (memory-SAFE) | Runtime/RC | Med | M | `make_closure` stores captures raw + marks source ESCAPED; header-only free. |
-| 13 | Trait conformance checks name+arity only, NOT param/return types | Type-system | Med (soundness) | M | `Shape{area()->float}` satisfied by `area()->string` → mistyped through dynamic dispatch. |
+| 13 ✅ | Trait conformance checks name+arity only, NOT param/return types — DONE `0f5d9f94` (LOCK-3) | Type-system | Med (soundness) | M | `Shape{area()->float}` satisfied by `area()->string` → mistyped through dynamic dispatch. |
 | 14 | User-enum match-arm payload degrades to `any` (float reads raw bits) | Type-system | Med (soundness) | M | The Result/Option fix, still open for user enums. |
 | 15 | RC cycles leak forever (no cycle collector, memory-SAFE) | Runtime/RC | Med | XL | `Node{nxt=self}` never reclaimed. Slow RAM leak, not a crash. |
 
@@ -1151,14 +1169,14 @@ no ordering + hang-hangs-the-JVM; Go's `signal.Notify` verbosity (channel + goro
 *Unlocks:* graceful server shutdown, container/k8s lifecycle compliance, CLI cleanup. **Table stakes for
 any deployed service. must-have.**
 
-**D4 — Signed bignum.** [lib] **M.**
+**✅ DONE (`d708af6f`, std/numeric/bignum) · D4 — Signed bignum.** [lib] **M.**
 *NOVA way:* add a sign to `forge_bignum` (`"-12345"`); all ops handle sign (dividend-sign mod, XOR-sign mul).
 *Drawback avoided:* Python's per-op bignum overhead on small ints; Java `BigInteger`'s `a.add(b).multiply(c)`
 allocation-heavy chains.
 *Unlocks:* exact-integer domains with subtraction (accounting deltas, crypto intermediates, signed modular
 math). Prerequisite for D2.
 
-**Sentinel-Argon2id — memory-hard KDF.** [lib] **M.**
+**⏳ BLAKE2b dependency ✅ DONE (`d708af6f`, std/crypto/blake2b, RFC 7693); Argon2id itself pending · Sentinel-Argon2id — memory-hard KDF.** [lib] **M.**
 *NOVA way:* pure-NOVA `argon2id_hash`/`argon2id_verify` (RFC 9106, OWASP recommendation) over Blake2b +
 a `bytes` memory array; lane parallelism maps to `pfor`; PHC-format self-describing output.
 *Drawback avoided:* everyone else FFI-binds `libargon2` (native dependency, platform build issues). NOVA's is
@@ -1191,13 +1209,13 @@ permissions + symlinks (`file_chmod(0o600)` for TLS keys, documented best-effort
 (`unix_listen("/var/run/app.sock")` — Docker/nginx/systemd sidecars).
 *Unlocks:* build tools, secure file creation, latency tuning, UDP servers, local IPC. **high, cheap.**
 
-**D8 — Seedable/deterministic PRNG.** [runtime] **S.**
+**✅ DONE (batch 2, xoshiro256**: rng_new/rng_next/rng_int/rng_float) · D8 — Seedable/deterministic PRNG.** [runtime] **S.**
 *NOVA way:* `rng_new(42)` returns an independent stream (xoshiro256**); `random_int/float` stay
 non-deterministic (CSPRNG). Two use cases, two APIs — no confusion.
 *Drawback avoided:* Python's global `random.seed` shared mutable state; Go's pre/post-1.20 seed-default flip.
 *Unlocks:* deterministic tests, reproducible simulations, procedural generation. **high, cheap.**
 
-**D11 — Extended math builtins.** [runtime] **S.**
+**✅ DONE (batch 2: isnan/isinf/clamp/copysign/fma/nextafter/lgamma/erf) · D11 — Extended math builtins.** [runtime] **S.**
 `isnan`/`isinf`/`clamp`/`copysign`/`fma`/`nextafter`/`lgamma`/`erf` — thin `<math.h>` wrappers. `isnan` is
 the primary special-float check (no surprising `nan == nan`); `clamp` is one function (not the `max(lo,
 min(hi,x))` developers get wrong). *Unlocks:* stats/ML/scientific code. **cheap.**
@@ -1217,14 +1235,14 @@ audit's `==`-ignores-NFC/NFD correctness bug.
 *Drawback avoided:* Java's non-thread-safe stateful `Collator`; Go/Rust's external-module requirement.
 *Unlocks:* correct case-insensitive compare (auth/search/dedup), correct truncation, emoji, i18n. **high.**
 
-**D5 — XML parser.** [lib] **L.**
+**✅ DONE (`a051c26a`, std/text/xml) · D5 — XML parser.** [lib] **L.**
 *NOVA way:* `xml_parse` returns a dict tree (`{tag, attrs, children, text}`) — dicts and lists, no special
 XML types; `xml_find`/`xml_text`/`xml_attr`. Safe-by-default (no DTD/external-entity/billion-laughs).
 *Drawback avoided:* Java's three-parser (DOM/SAX/StAX) + JAXB + XPath overwhelm; Python's unsafe-by-default
 `expat` (needed a separate `defusedxml`).
 *Unlocks:* SOAP/RSS/Atom/sitemap/config-XML consumption. **high.**
 
-**D7 — Persistent/immutable collections.** [lib] **L.**
+**✅ DONE (`d708af6f`, std/collections/hamt — HAMT map; BVT vector pending) · D7 — Persistent/immutable collections.** [lib] **L.**
 *NOVA way:* HAMT map + bitmapped-vector-trie vector; being immutable, they cross channels WITHOUT deep-copy
 (O(log32 n) update + O(1) send vs O(n) copy for mutable collections). Explicit opt-in — regular list/dict
 stay mutable+fast.
@@ -1422,20 +1440,20 @@ verified backlog from §3.2, ordered as the mandatory foundation.
 
 ### Wave A — Soundness (silent-wrong-answer bugs). These block correctness; nothing ships until they close.
 
-1. **0.11 float-return-uninit (XL, High).** A float-returning helper reads an uninitialized float slot →
+1. **✅ DONE (`bfc55fba` guarded + `29e380c1` root codegen) · 0.11 float-return-uninit (XL, High).** A float-returning helper reads an uninitialized float slot →
    silent garbage (`sqrt(variance)` → 3e-156). The ONE remaining silent-wrong-answer bug. Needs a dedicated
    codegen session: LLVM-IR diff working-vs-garbage layouts, zero-init / correctly wire the float return slot
    (the S1 float ABI). Same class as geo_bearing/atan2. **This gates every numeric/AI/data claim.**
-2. **Trait-conformance signature check (M, soundness).** Conformance checks name+arity only — `Shape{area()
+2. **✅ DONE (`0f5d9f94`, LOCK-3) · Trait-conformance signature check (M, soundness).** Conformance checks name+arity only — `Shape{area()
    ->float}` is satisfied by `area()->string`, mistyped through dynamic dispatch. Record + unify per-method
    param/return types; emit E1006-family on mismatch. **Gates the type-system-soundness claim and L1/L4.**
-3. **User-enum payload typing (M, soundness).** Match-arm payload binds to a fresh unconstrained var →
+3. **✅ DONE (`742cf71c` typing + `29e380c1` codegen unbox) · User-enum payload typing (M, soundness).** Match-arm payload binds to a fresh unconstrained var →
    degrades to `any` (a float field reads raw IEEE bits). The Result/Option fix, still open for user enums.
    Unify each binder against the recorded variant field types.
-4. **String `==` NFC/NFD (S/M, correctness/auth-adjacent).** `==` is byte-wise, ignoring the shipped
+4. **❌ NOT A GAP — dropped (byte-wise `==` is CORRECT; matches Python/Rust/Go; NFC-normalizing `==` would be *wrong*). `str_eq_canon` deferred to the D6 unicode lib. · String `==` NFC/NFD (S/M).** `==` is byte-wise, ignoring the shipped
    normalizers → `"é"` (U+00E9) ≠ `"e"`+U+0301 despite canonical equality. Add `str_eq_canon` + document (and
    the D6 casefold/graphemes library on top).
-5. **Scalar `1<<64` UB (S).** Bare `shl i64` with no guard ≥ bitwidth = poison. Clamp in codegen. (Folds into
+5. **✅ DONE (`2d999d51`, mask+select) · Scalar `1<<64` UB (S).** Bare `shl i64` with no guard ≥ bitwidth = poison. Clamp in codegen. (Folds into
    L7 sized numerics, but the guard is trivial and independent.)
 
 ### Wave B — RC completeness + memory leaks (memory-SAFE, but "it leaks" is not production-acceptable).

@@ -8850,6 +8850,60 @@ int64_t nova_rt_cosh(int64_t x)  { return f2i(cosh(nova_float_arg(x))); }
 int64_t nova_rt_tanh(int64_t x)  { return f2i(tanh(nova_float_arg(x))); }
 int64_t nova_rt_cbrt(int64_t x)  { return f2i(cbrt(nova_float_arg(x))); }
 int64_t nova_rt_hypot(int64_t x, int64_t y) { return f2i(hypot(nova_float_arg(x), nova_float_arg(y))); }
+/* D11 extended math builtins: thin <math.h> wrappers (float args via nova_float_arg, float results via f2i). */
+int64_t nova_rt_isnan(int64_t x) { return isnan(nova_float_arg(x)) ? 1 : 0; }
+int64_t nova_rt_isinf(int64_t x) { return isinf(nova_float_arg(x)) ? 1 : 0; }
+int64_t nova_rt_clamp(int64_t x, int64_t lo, int64_t hi) {
+    double v = nova_float_arg(x), l = nova_float_arg(lo), h = nova_float_arg(hi);
+    return f2i(v < l ? l : (v > h ? h : v));
+}
+int64_t nova_rt_copysign(int64_t x, int64_t y) { return f2i(copysign(nova_float_arg(x), nova_float_arg(y))); }
+int64_t nova_rt_fma(int64_t a, int64_t b, int64_t c) { return f2i(fma(nova_float_arg(a), nova_float_arg(b), nova_float_arg(c))); }
+int64_t nova_rt_nextafter(int64_t x, int64_t y) { return f2i(nextafter(nova_float_arg(x), nova_float_arg(y))); }
+int64_t nova_rt_lgamma(int64_t x) { return f2i(lgamma(nova_float_arg(x))); }
+int64_t nova_rt_erf(int64_t x) { return f2i(erf(nova_float_arg(x))); }
+/* D8 seedable deterministic PRNG (xoshiro256**). State = a 32-byte NOVA-managed `bytes` (4x u64 LE), so it
+ * is GC/RC-tracked (no leak, no raw-pointer confusion). rng_new(seed) seeds via splitmix64; rng_next advances
+ * the state IN PLACE (bytes are ref-semantic). Distinct API from the non-deterministic random_* (CSPRNG). */
+static inline uint64_t nova_rng_rd(int64_t st, int i) {
+    uint64_t v = 0;
+    for (int j = 0; j < 8; j++) v |= ((uint64_t)(nova_rt_bytes_get(st, (int64_t)(i * 8 + j)) & 0xFF)) << (j * 8);
+    return v;
+}
+static inline void nova_rng_wr(int64_t st, int i, uint64_t v) {
+    for (int j = 0; j < 8; j++) nova_rt_bytes_set(st, (int64_t)(i * 8 + j), (int64_t)((v >> (j * 8)) & 0xFF));
+}
+static inline uint64_t nova_rng_rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+int64_t nova_rt_rng_new(int64_t seed) {
+    int64_t st = nova_rt_bytes_create(32);
+    uint64_t sm = (uint64_t)seed;
+    for (int i = 0; i < 4; i++) {
+        uint64_t z = (sm += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z = z ^ (z >> 31);
+        nova_rng_wr(st, i, z);
+    }
+    return st;
+}
+int64_t nova_rt_rng_next(int64_t st) {
+    uint64_t s0 = nova_rng_rd(st, 0), s1 = nova_rng_rd(st, 1), s2 = nova_rng_rd(st, 2), s3 = nova_rng_rd(st, 3);
+    uint64_t result = nova_rng_rotl(s1 * 5, 7) * 9;
+    uint64_t t = s1 << 17;
+    s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3; s2 ^= t; s3 = nova_rng_rotl(s3, 45);
+    nova_rng_wr(st, 0, s0); nova_rng_wr(st, 1, s1); nova_rng_wr(st, 2, s2); nova_rng_wr(st, 3, s3);
+    return (int64_t)result;
+}
+int64_t nova_rt_rng_int(int64_t st, int64_t n) {
+    if (n <= 0) return 0;
+    uint64_t r = (uint64_t)nova_rt_rng_next(st);
+    return (int64_t)(r % (uint64_t)n);
+}
+int64_t nova_rt_rng_float(int64_t st) {
+    uint64_t r = (uint64_t)nova_rt_rng_next(st);
+    double d = (double)(r >> 11) * (1.0 / 9007199254740992.0);
+    return f2i(d);
+}
 int64_t nova_rt_pi(void) { return f2i(3.14159265358979323846); }
 int64_t nova_rt_e(void)  { return f2i(2.71828182845904523536); }
 int64_t nova_rt_gcd(int64_t a, int64_t b) {
