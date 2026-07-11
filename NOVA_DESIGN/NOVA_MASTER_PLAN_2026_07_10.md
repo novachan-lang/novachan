@@ -1139,7 +1139,7 @@ binding names against the keyword set and emit a clean E-code. Pure parser fixes
 
 ### 4.B Stdlib + OS/IO correctness-edge — the "never leave NOVA" layer
 
-**D3 — Regex capture groups (numbered + named).** [runtime] **M.**
+**✅ DONE (regex_captures + regex_named_captures; slot-numbered RE_SAVE + heap backtrack-trail; 9 KATs incl. greedy-backtrack/alternation/nesting; adversarial-reviewed, N5 trail-overflow bug fixed; reconverged + 1148/0 both modes) · D3 — Regex capture groups (numbered + named).** [runtime] **M.**
 *NOVA way:* the NFA engine already emits `RE_SAVE` opcodes and allocates save slots — write them on match,
 snapshot/restore on backtrack, expose `regex_captures(text, pat) -> list<string>` and `regex_named_captures
 -> dict`. Pure function (pattern in, list out); empty list on no-match (falsy).
@@ -1518,8 +1518,8 @@ gap is open.**
 
 ### PHASE 1 — Stdlib correctness-edge (the cheapest high-trust breadth; the "never leave NOVA" papercuts).
 
-- **[stdlib]** D3 regex captures (M) · ✅ D8 seedable PRNG (S) · ✅ D11 extended math (S) · ✅ S4 glob (S) · S8 UDP
-  peer (S) · S7 socket options (S).
+- **[stdlib]** ✅ D3 regex captures (M) · ✅ D8 seedable PRNG (S) · ✅ D11 extended math (S) · ✅ S4 glob (S) · ✅ S8 UDP
+  peer (S) · ✅ S7 socket options (S).
 - **[stdlib]** S1 signal handling (M) — the deploy/container blocker.
 - **[lib]** D4 signed bignum (M) → D2 BigDecimal (L) — the finance blocker.
 - **[lib]** Argon2id (M) — password-storage best practice.

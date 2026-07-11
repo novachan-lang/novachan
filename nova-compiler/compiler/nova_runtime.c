@@ -10576,10 +10576,17 @@ typedef struct {
 
 #define RE_MAX_INST 1024
 #define RE_MAX_SAVE 20
+#define RE_MAX_NAMES 10
+#define RE_NAME_MAXLEN 48
+
+typedef struct { char name[RE_NAME_MAXLEN]; int group; } ReName;
 
 typedef struct {
     ReInst code[RE_MAX_INST];
     int len;
+    int ngroups;   /* number of capture groups; group g uses save slots 2g (open) and 2g+1 (close) */
+    ReName names[RE_MAX_NAMES];   /* (?<name>...) named-group table: name -> group index */
+    int nnames;
 } ReProg;
 
 static int re_class_match(const char* cls, int cls_len, int c) {
@@ -10603,7 +10610,8 @@ static int re_is_space(int c) { return c == ' ' || c == '\t' || c == '\n' || c =
 /* When alternation inserts a SPLIT at index `threshold`, every instruction in
    [from,to) shifted right by 1 must have its absolute jump targets (RE_SPLIT.x/y,
    RE_JMP.x) bumped by 1 if they point at or past the insertion point. RE_SAVE's
-   x is a -1/-2 sentinel (never an index), so it is left alone. */
+   x is a capture-slot number (never a jump index), so it is left alone — do NOT
+   generalize this to a "bump every x >= threshold" pass, or it would corrupt slots. */
 static void re_bump(ReProg* prog, int from, int to, int threshold) {
     for (int k = from; k < to; k++) {
         ReInst* in = &prog->code[k];
@@ -10620,7 +10628,9 @@ static int re_compile(const char* pattern, ReProg* prog) {
     int pc = 0;
     int len = (int)strlen(pattern);
     int pstack[64];
+    int gstack[64];        /* capture-group id for each currently-open paren */
     int pstack_top = 0;
+    int group_count = 0;   /* capture-group counter (pre-order, 1-based) */
     int i = 0;
 
     /* Alternation state, indexed by group depth (pstack_top). alt_start[d] is the
@@ -10716,13 +10726,30 @@ static int re_compile(const char* pattern, ReProg* prog) {
         }
         case '(': {
             if (pstack_top >= 64) return -1;
+            group_count++;
+            int g = group_count;
+            gstack[pstack_top] = g;
             pstack[pstack_top++] = pc;
             EMIT(RE_SAVE);
-            prog->code[pc-1].x = -1;
+            prog->code[pc-1].x = 2 * g;         /* group g open slot (was -1 sentinel) */
             /* a fresh alternation scope for this group, starting after the SAVE */
             alt_start[pstack_top] = pc;
             alt_njmp[pstack_top] = 0;
-            i++;
+            i++;   /* consume '(' */
+            /* named group (?<name>...) : record name -> group g (still a numbered group too) */
+            if (i + 1 < len && pattern[i] == '?' && pattern[i+1] == '<') {
+                i += 2;   /* consume "?<" */
+                int nstart = i;
+                while (i < len && pattern[i] != '>') i++;
+                int nlen = i - nstart;
+                if (i < len && nlen > 0 && nlen < RE_NAME_MAXLEN && prog->nnames < RE_MAX_NAMES) {
+                    memcpy(prog->names[prog->nnames].name, pattern + nstart, (size_t)nlen);
+                    prog->names[prog->nnames].name[nlen] = 0;
+                    prog->names[prog->nnames].group = g;
+                    prog->nnames++;
+                }
+                if (i < len) i++;   /* consume '>' */
+            }
             break;
         }
         case ')': {
@@ -10734,7 +10761,7 @@ static int re_compile(const char* pattern, ReProg* prog) {
             alt_njmp[pstack_top] = 0;
             pstack_top--;
             EMIT(RE_SAVE);
-            prog->code[pc-1].x = -2;
+            prog->code[pc-1].x = 2 * gstack[pstack_top] + 1;   /* group's close slot (was -2 sentinel) */
             i++;
             break;
         }
@@ -10845,6 +10872,7 @@ static int re_compile(const char* pattern, ReProg* prog) {
         prog->code[ alt_jmp[0][z] ].x = pc;
     EMIT(RE_MATCH);
     prog->len = pc;
+    prog->ngroups = group_count;
     #undef EMIT
     #undef RE_MAX_ALT
     return 0;
@@ -10862,15 +10890,38 @@ static int re_exec(ReProg* prog, const char* text, const char** saves, int nsave
     /* Try matching at each position (for unanchored match) */
     int anchored = (prog->len > 0 && prog->code[0].op == RE_START);
 
+    /* Capture-save backtracking trail. Snapshotting the whole saves[] per SPLIT
+       would blow the 32KB fiber stack, so we heap-trail (slot, old_value) pairs
+       and unwind them on backtrack. Only allocated when captures are requested. */
+    int use_trail = (saves && nsaves > 2);
+    int trail_cap = 8192;
+    int* trail_slot = NULL;
+    const char** trail_old = NULL;
+    int* mark_stack = NULL;
+    if (use_trail) {
+        trail_slot = (int*)malloc((size_t)trail_cap * sizeof(int));
+        trail_old  = (const char**)malloc((size_t)trail_cap * sizeof(const char*));
+        mark_stack = (int*)malloc((size_t)RE_MAX_INST * sizeof(int));
+        if (!trail_slot || !trail_old || !mark_stack) {
+            free(trail_slot); free(trail_old); free(mark_stack);
+            trail_slot = NULL; trail_old = NULL; mark_stack = NULL; use_trail = 0;
+        }
+    }
+    int re_result = 0;
+
     for (int start = 0; start <= text_len; start++) {
         /* Recursive backtracking */
         int sp_stack[RE_MAX_INST];
         int tp_stack[RE_MAX_INST];
         int stack_top = 0;
+        int trail_top = 0;
         int pc = 0, tp = start;
         int matched = 0;
 
         if (saves && nsaves > 0) saves[0] = text + start;
+        /* reset group slots for this start attempt (a group that does not
+           participate stays NULL -> reported as "") */
+        if (saves) { for (int _s = 2; _s < nsaves; _s++) saves[_s] = NULL; }
 
         while (1) {
             if (pc >= prog->len) break;
@@ -10929,6 +10980,7 @@ static int re_exec(ReProg* prog, const char* text, const char** saves, int nsave
                 if (stack_top >= RE_MAX_INST) goto backtrack;
                 sp_stack[stack_top] = inst->y;
                 tp_stack[stack_top] = tp;
+                if (use_trail) mark_stack[stack_top] = trail_top;
                 stack_top++;
                 pc = inst->x;
                 break;
@@ -10936,6 +10988,18 @@ static int re_exec(ReProg* prog, const char* text, const char** saves, int nsave
                 pc = inst->x;
                 break;
             case RE_SAVE:
+                /* Write the capture slot (open=2g, close=2g+1) ONLY when we can also trail the
+                   old value — otherwise a later backtrack could not undo the write, leaving a
+                   stale/wrong capture. On trail overflow we skip the write, which keeps captures
+                   internally consistent (memory-safe either way). */
+                if (use_trail && inst->x >= 0 && inst->x < nsaves && inst->x < RE_MAX_SAVE) {
+                    if (trail_top < trail_cap) {
+                        trail_slot[trail_top] = inst->x;
+                        trail_old[trail_top] = saves[inst->x];
+                        trail_top++;
+                        saves[inst->x] = text + tp;
+                    }
+                }
                 pc++;
                 break;
             case RE_MATCH:
@@ -10949,12 +11013,19 @@ backtrack:
             stack_top--;
             pc = sp_stack[stack_top];
             tp = tp_stack[stack_top];
+            if (use_trail) {
+                while (trail_top > mark_stack[stack_top]) {
+                    trail_top--;
+                    saves[trail_slot[trail_top]] = trail_old[trail_top];
+                }
+            }
         }
 done:
-        if (matched) return 1;
+        if (matched) { re_result = 1; break; }
         if (anchored) break;
     }
-    return 0;
+    free(trail_slot); free(trail_old); free(mark_stack);
+    return re_result;
 }
 
 static void re_free(ReProg* prog) {
@@ -11115,6 +11186,95 @@ int64_t nova_rt_regex_find_all(int64_t text_ptr, int64_t pattern_ptr) {
     }
     re_free(&prog);
     return list;
+}
+
+/* regex_captures(text, pattern) -> list of the numbered capture-group substrings [g1, g2, ...] from the
+   FIRST match. Empty list on no match (falsy). A group that did not participate yields "". Pure function.
+   LIMIT: up to 9 groups (RE_MAX_SAVE=20 = 2 whole-match slots + 2 per group); extra groups report "". */
+int64_t nova_rt_regex_captures(int64_t text_ptr, int64_t pattern_ptr) {
+    const char* text = (const char*)(uintptr_t)text_ptr;
+    const char* pattern = (const char*)(uintptr_t)pattern_ptr;
+    int64_t list = nova_rt_list_create();
+    if (!text || !pattern) return list;
+
+    ReProg prog;
+    memset(&prog, 0, sizeof(prog));
+    if (re_compile(pattern, &prog) != 0) {
+        nova_set_error("regex: invalid pattern");
+        re_free(&prog);
+        return list;
+    }
+
+    int nsaves = 2 + 2 * prog.ngroups;
+    if (nsaves > RE_MAX_SAVE) nsaves = RE_MAX_SAVE;
+    const char* saves[RE_MAX_SAVE];
+    for (int s = 0; s < RE_MAX_SAVE; s++) saves[s] = NULL;
+
+    if (re_exec(&prog, text, saves, nsaves)) {
+        for (int g = 1; g <= prog.ngroups; g++) {
+            int so = 2 * g, sc = 2 * g + 1;
+            const char* a = (sc < nsaves) ? saves[so] : NULL;
+            const char* b = (sc < nsaves) ? saves[sc] : NULL;
+            char* grp;
+            if (a && b && b >= a) {
+                size_t glen = (size_t)(b - a);
+                grp = (char*)nova_heap_alloc(glen + 1, NOVA_MEM_RAW);
+                if (grp) { memcpy(grp, a, glen); grp[glen] = 0; } else grp = (char*)"";
+            } else {
+                grp = (char*)nova_heap_alloc(1, NOVA_MEM_RAW);   /* non-participating group -> "" */
+                if (grp) grp[0] = 0; else grp = (char*)"";
+            }
+            nova_rt_list_append(list, (int64_t)(uintptr_t)grp);
+        }
+    }
+    re_free(&prog);
+    return list;
+}
+
+/* regex_named_captures(text, pattern) -> dict {name: substring} for each (?<name>...) group in the FIRST
+   match. Empty dict on no match / no named groups. A named group that didn't participate maps to "". */
+int64_t nova_rt_regex_named_captures(int64_t text_ptr, int64_t pattern_ptr) {
+    const char* text = (const char*)(uintptr_t)text_ptr;
+    const char* pattern = (const char*)(uintptr_t)pattern_ptr;
+    int64_t dict = nova_rt_dict_create();
+    if (!text || !pattern) return dict;
+
+    ReProg prog;
+    memset(&prog, 0, sizeof(prog));
+    if (re_compile(pattern, &prog) != 0) {
+        nova_set_error("regex: invalid pattern");
+        re_free(&prog);
+        return dict;
+    }
+
+    int nsaves = 2 + 2 * prog.ngroups;
+    if (nsaves > RE_MAX_SAVE) nsaves = RE_MAX_SAVE;
+    const char* saves[RE_MAX_SAVE];
+    for (int s = 0; s < RE_MAX_SAVE; s++) saves[s] = NULL;
+
+    if (re_exec(&prog, text, saves, nsaves)) {
+        for (int n = 0; n < prog.nnames; n++) {
+            int g = prog.names[n].group;
+            int so = 2 * g, sc = 2 * g + 1;
+            const char* a = (sc < nsaves) ? saves[so] : NULL;
+            const char* b = (sc < nsaves) ? saves[sc] : NULL;
+            size_t klen = strlen(prog.names[n].name);
+            char* key = (char*)nova_heap_alloc(klen + 1, NOVA_MEM_RAW);
+            if (key) memcpy(key, prog.names[n].name, klen + 1); else key = (char*)"";
+            char* val;
+            if (a && b && b >= a) {
+                size_t vlen = (size_t)(b - a);
+                val = (char*)nova_heap_alloc(vlen + 1, NOVA_MEM_RAW);
+                if (val) { memcpy(val, a, vlen); val[vlen] = 0; } else val = (char*)"";
+            } else {
+                val = (char*)nova_heap_alloc(1, NOVA_MEM_RAW);   /* non-participating -> "" */
+                if (val) val[0] = 0; else val = (char*)"";
+            }
+            nova_rt_dict_set(dict, (int64_t)(uintptr_t)key, (int64_t)(uintptr_t)val);
+        }
+    }
+    re_free(&prog);
+    return dict;
 }
 
 /* regex_replace_all(text, pattern, replacement) — replaces ALL matches */
