@@ -1,0 +1,429 @@
+// forge_xmlparse -- a SAFE inbound XML PARSER (forge_xml.nova only SERIALIZES; this parses).
+// xml_parse(text) walks the document char-by-char and returns a NODE tree, where a node is a
+// plain dict {"tag":string, "attrs":dict, "children":list<node>, "text":string}. It handles
+// elements, attributes (single- OR double-quoted, and valueless), self-closing <br/>, text
+// content, comments <!-- -->, CDATA <![CDATA[..]]> (raw), processing instructions/prolog <?..?>,
+// and the 5 predefined entities &lt; &gt; &amp; &quot; &apos; (decoded in both text and attribute
+// values). Query helpers: xml_find / xml_find_all / xml_text / xml_attr.
+//
+// SAFE BY DEFAULT: <!DOCTYPE>/DTDs are SKIPPED, never processed, and NO custom or external entity
+// is ever expanded -- an unknown "&x;" is passed through literally. This makes the classic
+// billion-laughs / XXE entity-expansion attacks structurally impossible; there is no expansion
+// engine to abuse. Malformed input never crashes: xml_parse returns a node carrying an "error"
+// attr, and every scan is bounded (unclosed tags/comments simply stop at EOF, never loop).
+//
+// NOVA-WAY: no visitor classes, no schema, no builder objects -- the parse tree is just NOVA's
+// own dict/list values, so it composes directly with json_encode, forge templating, and pattern
+// dispatch. The moving cursor is a state dict {"text","pos","n"} threaded through recursive
+// descent (dicts are reference values in NOVA, so a nested call's advance is seen by the caller)
+// -- no out-params, no global mutable parser state, fully re-entrant.
+//
+// DRAWBACK-AVOIDED: Java's DOM/SAX/StAX + JAXB force you to pick a model and wire up factories,
+// handlers, and generated bindings before reading one tag; Python's stdlib expat is UNSAFE by
+// default (entity/DTD attacks) so real code needs the third-party `defusedxml` shim. NOVA gives
+// one function, safe by construction, returning ordinary values.
+//
+// LIMITATION (flat-model, honest): a node's "text" is its concatenated DIRECT text; xml_text
+// concatenates own text then descendant text. For MIXED content ("a <b/> c") the relative ORDER
+// of text vs. child elements is not preserved (all direct text is collapsed together). Leaf text
+// -- the common case, e.g. <b>hi</b> -- is exact. LEAF -- imports NOTHING.
+
+// PRIVATE: a fresh empty node with the canonical 4-key shape.
+fn _xml_new_node(tag: string) -> dict
+    let node = {}
+    node["tag"] = tag
+    node["attrs"] = {}
+    node["children"] = []
+    node["text"] = ""
+    node
+
+// PRIVATE: a node carrying an "error" attr, returned instead of crashing on malformed input.
+fn _xml_error_node(msg: string) -> dict
+    let node = _xml_new_node("")
+    let a = node["attrs"]
+    a["error"] = msg
+    node
+
+// PRIVATE: XML whitespace test (space, tab, LF, CR).
+fn _xml_is_space(c: string) -> bool
+    c == " " or c == chr(9) or c == chr(10) or c == chr(13)
+
+// PRIVATE: is `c` a legal char inside a tag/attribute NAME? (stops at space and any XML delimiter)
+fn _xml_is_name_char(c: string) -> bool
+    if c == ""
+        return false
+    if _xml_is_space(c)
+        return false
+    if c == "<" or c == ">" or c == "/" or c == "=" or c == chr(34) or c == chr(39)
+        return false
+    true
+
+// PRIVATE: advance st["pos"] past any run of whitespace.
+fn _xml_skip_space(st: dict)
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"]
+    while i < n and _xml_is_space(char_at(text, i))
+        i = i + 1
+    st["pos"] = i
+
+// PRIVATE: does `text` contain literal `pat` starting exactly at index `i`? (bounded, no alloc)
+fn _xml_starts_with_at(text: string, i: int, pat: string) -> bool
+    let n = len(text)
+    let m = len(pat)
+    if i + m > n
+        return false
+    let j = 0
+    while j < m
+        if char_at(text, i + j) != char_at(pat, j)
+            return false
+        j = j + 1
+    true
+
+// PRIVATE: decode ONLY the 5 predefined entities. Any other "&name;" is left VERBATIM -- this is
+// the safety boundary: with no custom/external entity expansion, entity-expansion attacks cannot
+// occur. Character references are intentionally not expanded here (keeps the surface minimal/safe).
+fn _xml_decode_entities(s: string) -> string
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = char_at(s, i)
+        if c == "&"
+            if _xml_starts_with_at(s, i, "&lt;")
+                out = out + "<"
+                i = i + 4
+            else
+                if _xml_starts_with_at(s, i, "&gt;")
+                    out = out + ">"
+                    i = i + 4
+                else
+                    if _xml_starts_with_at(s, i, "&amp;")
+                        out = out + "&"
+                        i = i + 5
+                    else
+                        if _xml_starts_with_at(s, i, "&quot;")
+                            out = out + chr(34)
+                            i = i + 6
+                        else
+                            if _xml_starts_with_at(s, i, "&apos;")
+                                out = out + chr(39)
+                                i = i + 6
+                            else
+                                out = out + c
+                                i = i + 1
+        else
+            out = out + c
+            i = i + 1
+    out
+
+// PRIVATE: read raw chars until any char in `stops`, then entity-decode. Advances st["pos"].
+fn _xml_read_until(st: dict, stops: string) -> string
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"]
+    let raw = ""
+    while i < n and find(stops, char_at(text, i)) < 0
+        raw = raw + char_at(text, i)
+        i = i + 1
+    st["pos"] = i
+    _xml_decode_entities(raw)
+
+// PRIVATE: read an XML name (tag or attribute name); advances past it.
+fn _xml_read_name(st: dict) -> string
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"]
+    let name = ""
+    while i < n and _xml_is_name_char(char_at(text, i))
+        name = name + char_at(text, i)
+        i = i + 1
+    st["pos"] = i
+    name
+
+// PRIVATE: read an attribute value. Consumes the opening quote (single OR double), reads to the
+// matching quote, then entity-decodes. Unquoted values fall back to a bare name token.
+fn _xml_read_attr_value(st: dict) -> string
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"]
+    if i >= n
+        return ""
+    let q = char_at(text, i)
+    if q == chr(34) or q == chr(39)
+        i = i + 1
+        let raw = ""
+        while i < n and char_at(text, i) != q
+            raw = raw + char_at(text, i)
+            i = i + 1
+        if i < n
+            i = i + 1
+        st["pos"] = i
+        return _xml_decode_entities(raw)
+    st["pos"] = i
+    let name = _xml_read_name(st)
+    _xml_decode_entities(name)
+
+// PRIVATE: parse the attribute list after a tag name, up to (but NOT consuming) ">" or "/>".
+// A guard bounds the loop so a stray char can never spin forever.
+fn _xml_parse_attrs(st: dict, node: dict)
+    let text = st["text"]
+    let n = st["n"]
+    let attrs = node["attrs"]
+    let guard = 0
+    while guard < 100000
+        guard = guard + 1
+        _xml_skip_space(st)
+        let i = st["pos"]
+        if i >= n
+            return
+        let c = char_at(text, i)
+        if c == ">" or c == "/"
+            return
+        let name = _xml_read_name(st)
+        if name == ""
+            st["pos"] = st["pos"] + 1
+        else
+            _xml_skip_space(st)
+            let j = st["pos"]
+            if j < n and char_at(text, j) == "="
+                st["pos"] = j + 1
+                _xml_skip_space(st)
+                let v = _xml_read_attr_value(st)
+                attrs[name] = v
+            else
+                attrs[name] = ""
+
+// PRIVATE: skip a comment <!-- ... -->. Assumes st["pos"] is at "<!--". Stops at EOF if unclosed.
+fn _xml_skip_comment(st: dict)
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"] + 4
+    while i < n and (not _xml_starts_with_at(text, i, "-->"))
+        i = i + 1
+    if i < n
+        i = i + 3
+    st["pos"] = i
+
+// PRIVATE: skip a <!DOCTYPE ...> / <!...> declaration (SAFE: DTDs ignored, never processed).
+// Tracks internal-subset "[...]" depth so a ">" inside the subset does not end it early.
+fn _xml_skip_decl(st: dict)
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"] + 2
+    let depth = 0
+    while i < n
+        let c = char_at(text, i)
+        if c == "["
+            depth = depth + 1
+        else
+            if c == "]"
+                if depth > 0
+                    depth = depth - 1
+            else
+                if c == ">" and depth == 0
+                    i = i + 1
+                    st["pos"] = i
+                    return
+        i = i + 1
+    st["pos"] = i
+
+// PRIVATE: skip a processing instruction / XML prolog <? ... ?>. Advances past "?>".
+fn _xml_skip_pi(st: dict)
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"] + 2
+    while i < n and (not _xml_starts_with_at(text, i, "?>"))
+        i = i + 1
+    if i < n
+        i = i + 2
+    st["pos"] = i
+
+// PRIVATE: read a CDATA section <![CDATA[ ... ]]> and return its RAW body (no entity decoding).
+fn _xml_read_cdata(st: dict) -> string
+    let text = st["text"]
+    let n = st["n"]
+    let i = st["pos"] + 9
+    let raw = ""
+    while i < n and (not _xml_starts_with_at(text, i, "]]>"))
+        raw = raw + char_at(text, i)
+        i = i + 1
+    if i < n
+        i = i + 3
+    st["pos"] = i
+    raw
+
+// PRIVATE: parse one element starting at "<name ...". Assumes st["pos"] is at "<" and the tag is
+// a real element (not a comment/PI/decl/closing tag). Handles self-closing and open/close forms.
+fn _xml_parse_element(st: dict) -> dict
+    let text = st["text"]
+    let n = st["n"]
+    st["pos"] = st["pos"] + 1
+    let name = _xml_read_name(st)
+    let node = _xml_new_node(name)
+    _xml_parse_attrs(st, node)
+    _xml_skip_space(st)
+    let i = st["pos"]
+    if i >= n
+        return node
+    let c = char_at(text, i)
+    if c == "/"
+        st["pos"] = i + 1
+        let j = st["pos"]
+        if j < n and char_at(text, j) == ">"
+            st["pos"] = j + 1
+        return node
+    if c == ">"
+        st["pos"] = i + 1
+        _xml_parse_children(st, node)
+        return node
+    node
+
+// PRIVATE: parse child content of `node` until its closing tag </...> (or EOF). Appends child
+// element nodes to node["children"] and accumulates direct text into node["text"]. Comments,
+// CDATA, declarations and PIs encountered inside are handled/skipped. Bounded by a guard.
+fn _xml_parse_children(st: dict, node: dict)
+    let text = st["text"]
+    let n = st["n"]
+    let guard = 0
+    while guard < 10000000
+        guard = guard + 1
+        let i = st["pos"]
+        if i >= n
+            return
+        let c = char_at(text, i)
+        if c == "<"
+            if _xml_starts_with_at(text, i, "<!--")
+                _xml_skip_comment(st)
+            else
+                if _xml_starts_with_at(text, i, "<![CDATA[")
+                    let cd = _xml_read_cdata(st)
+                    node["text"] = node["text"] + cd
+                else
+                    if _xml_starts_with_at(text, i, "<!")
+                        _xml_skip_decl(st)
+                    else
+                        if _xml_starts_with_at(text, i, "<?")
+                            _xml_skip_pi(st)
+                        else
+                            if _xml_starts_with_at(text, i, "</")
+                                let k = i + 2
+                                while k < n and char_at(text, k) != ">"
+                                    k = k + 1
+                                if k < n
+                                    k = k + 1
+                                st["pos"] = k
+                                return
+                            else
+                                let child = _xml_parse_element(st)
+                                push(node["children"], child)
+        else
+            let t = _xml_read_until(st, "<")
+            node["text"] = node["text"] + t
+
+// PUBLIC: parse an XML document into a node tree. Skips the prolog / leading comments / DTDs, then
+// parses the single root element. On malformed input (no root, leading text, a lone closing tag,
+// empty string) returns a node whose "attrs" carries an "error" message -- it NEVER crashes.
+fn xml_parse(text: string) -> dict
+    let st = {}
+    st["text"] = text
+    st["n"] = len(text)
+    st["pos"] = 0
+    let guard = 0
+    while guard < 100000
+        guard = guard + 1
+        _xml_skip_space(st)
+        let i = st["pos"]
+        let n = st["n"]
+        if i >= n
+            return _xml_error_node("no root element")
+        let c = char_at(text, i)
+        if c != "<"
+            return _xml_error_node("expected element")
+        if _xml_starts_with_at(text, i, "<!--")
+            _xml_skip_comment(st)
+        else
+            if _xml_starts_with_at(text, i, "<?")
+                _xml_skip_pi(st)
+            else
+                if _xml_starts_with_at(text, i, "<!")
+                    _xml_skip_decl(st)
+                else
+                    if _xml_starts_with_at(text, i, "</")
+                        return _xml_error_node("unexpected closing tag")
+                    else
+                        return _xml_parse_element(st)
+    _xml_error_node("no root element")
+
+// PUBLIC: concatenated text of a node -- its own direct text followed by every descendant's text,
+// depth-first. Safe on null / non-node inputs (returns ""). See header LIMITATION on mixed-content
+// ordering.
+fn xml_text(node) -> string
+    if node == null
+        return ""
+    if type_of(node) != "dict"
+        return ""
+    if not contains(node, "text")
+        return ""
+    let out = node["text"]
+    if contains(node, "children")
+        let kids = node["children"]
+        let i = 0
+        while i < len(kids)
+            out = out + xml_text(kids[i])
+            i = i + 1
+    out
+
+// PUBLIC: value of attribute `name`, or "" if the node has no such attribute. Null-safe.
+fn xml_attr(node, name: string) -> string
+    if node == null
+        return ""
+    if type_of(node) != "dict"
+        return ""
+    if not contains(node, "attrs")
+        return ""
+    let a = node["attrs"]
+    if contains(a, name)
+        return a[name]
+    ""
+
+// PUBLIC: first node (root included, then depth-first pre-order over children) whose tag == `tag`.
+// Returns null if none match. Null-safe.
+fn xml_find(node, tag: string) -> dict
+    if node == null
+        return null
+    if type_of(node) != "dict"
+        return null
+    if contains(node, "tag") and node["tag"] == tag
+        return node
+    if not contains(node, "children")
+        return null
+    let kids = node["children"]
+    let i = 0
+    while i < len(kids)
+        let r = xml_find(kids[i], tag)
+        if r != null
+            return r
+        i = i + 1
+    null
+
+// PRIVATE: recursive collector backing xml_find_all.
+fn _xml_collect(node, tag: string, out: list)
+    if node == null
+        return
+    if type_of(node) != "dict"
+        return
+    if contains(node, "tag") and node["tag"] == tag
+        push(out, node)
+    if contains(node, "children")
+        let kids = node["children"]
+        let i = 0
+        while i < len(kids)
+            _xml_collect(kids[i], tag, out)
+            i = i + 1
+
+// PUBLIC: every node (root included) whose tag == `tag`, in document order.
+fn xml_find_all(node, tag: string) -> list
+    let out = []
+    _xml_collect(node, tag, out)
+    out
