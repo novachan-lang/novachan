@@ -24,9 +24,10 @@
 | 0.11 float-return-uninit | 0-A | A | ✅ GUARDED | (batch 1) |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ⬜ NEXT | |
 | user-enum payload typing | 0-A | A | ⬜ | |
-| `==` NFC/NFD helper | 0-A | C | ⬜ | |
-| `1<<64` shift guard | 0-A | C | ⬜ | |
-| lexer: numeric separators / labeled break / `\u{}` | 0-A | C | ⬜ | |
+| `==` NFC/NFD helper | 0-A | C | ❌ DROPPED — not a gap (byte-equality is correct; matches Python/Rust/Go — NFC-by-default would be *wrong*) | |
+| `1<<64` shift guard | 0-A | C | ✅ DONE (gen4-verified; reconverge at batch arc) | (batch 1) |
+| lexer: numeric separators | 0-A | C | ✅ ALREADY DONE (decimal/hex/binary all strip `_`; audit stale) | |
+| lexer: `\u{}` escapes / labeled break | 0-A | C | ⏸ DEFERRED (low-value: `from_codepoint` covers `\u`; labeled-break is involved, not a quick win) | |
 | RC: push/closure/reassign leaks (MOVE-on-insert) | 0-B | A | ⬜ | |
 | RC cycle collector | 0-B | A(XL) | ⬜ | |
 | ARM aarch64 fibers | 0-C | B | ⬜ | |
@@ -64,3 +65,10 @@
    to pure SSA (no uninit temp). Action: tightened `_floatret_uninit_test.nova` from CI-safe (always exit 0)
    to a HARD ASSERT on stddev≈√2 + pearson≈0.7746, so any future layout shift that re-triggers it fails LOUD
    with a live repro. Test-only change (no compiler edit → no reconverge). *Next arc validates.*
+2. **`1<<64` shift-UB guard -> DONE.** LLVM `shl`/`ashr` by >= bit-width is POISON (the `1<<64 -> garbage`
+   bug). Fixed the ire emitter (nova_compiler.nova ~16462): mask the amount `& 63` for a valid shift +
+   `select` the defined big-shift result (NOVA wraps: `shl`>=64 = 0; `ashr`>=64 = sign-ext). LLVM -O2
+   constant-folds the guard away for constant amounts (zero cost); variable amounts keep it. gen4 built
+   (compiler self-compiles with the new codegen) + `_shift64_guard_test` PASS (13/13). Compiler-only. Reconverge at arc.
+3. **lexer scan (no code change):** numeric separators ALREADY done; `==`NFC/NFD is NOT a gap (byte-eq
+   matches Python/Rust/Go); `\u{}` + labeled-break deferred (low-value; `from_codepoint` covers `\u`).
