@@ -1234,7 +1234,7 @@ compile time.
 per-field `binary.BigEndian.PutUint32`.
 *Unlocks:* file formats (PNG/WAV/ELF), removes per-driver wire-encoding duplication, embedded/IoT.
 
-**D6 — Unicode casefold + graphemes (+ collation later).** [lib] **L** (collation XL, deferred).
+**✅ DONE (casefold: std/text/casefold range-fold ASCII/Latin-1/Greek/Cyrillic over UTF-8, str_eq_ci/contains_ci, adversarially verified; graphemes = std/text/graphemex; full-Unicode/collation deferred) · D6 — Unicode casefold + graphemes (+ collation later).** [lib] **L** (collation XL, deferred).
 *NOVA way:* `casefold(s)` (pure function, no stateful Collator) + `graphemes(s)` (UAX-29 state machine, so
 `len(graphemes(s))` is visual length and emoji don't split). Plus the `str_eq_canon` helper for the
 audit's `==`-ignores-NFC/NFD correctness bug.
