@@ -1198,7 +1198,7 @@ leaks; Go's nil-default cookie jar + `CheckRedirect` function-field ceremony.
 *Unlocks:* real API integration (OAuth redirects), CDN compatibility, corporate proxy, session-auth scraping.
 The single most-used networking surface. **high.**
 
-**S3 — Thread sync primitives (mutex/rwlock/semaphore/barrier).** [runtime] **M.**
+**✅ DONE (std/sync/mutex + semaphore — PURE NOVA: a lock IS a channel_bounded(1) token, so green-task park/wake comes free; try_lock via try_recv. Tier-1 semantic + tier-2 mutual-exclusion KATs (8×1000@CARRIERS=4 = 8000, 0 lost updates, 5 runs) live + adversarially verified. Finding: NOVA tasks share channels by identity, deep-copy other values → shared state must live in a channel. rwlock/barrier + with_lock = follow-on) · S3 — Thread sync primitives (mutex/rwlock/semaphore/barrier).** [runtime] **M.**
 *NOVA way:* green-task-aware locks (`mutex_new`/`lock`/`unlock`, `rwlock_*`, `semaphore_*`) — park on
 contention (like channels), fast-path trylock uncontended (Go `sync.Mutex` model, not raw `pthread_mutex`
 which would starve the carrier). `with_lock(m, fn())` after L10 lands.
