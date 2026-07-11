@@ -10556,6 +10556,10 @@ type TiState
     ti_ret_open: bool           // TIER 1: current fn has NO concrete return annotation -> DEFERRED tolerant return join (collect returns, widen to `any` only on genuine concrete conflict AFTER ti_solve resolves them). Preserves the inferred concrete type when returns agree.
     ti_ret_seen: list           // TIER 1: collected return-expression types for the current open fn (joined + bound to ret_var after ti_solve).
     ti_fn_hetero: dict          // TIER 1: fn name -> 1 if its return type was widened to `any` because its returns GENUINELY DISAGREE (heterogeneous). The IR frt fixpoint must NOT refine these back to a first-return concrete type (else print/box dispatch on a non-primary-type return is wrong). Distinct from an incomplete `any` (which the IR MAY refine).
+    ti_trait_method_ptypes: dict   // LOCK-3: trait -> {method -> [self-excluded param type annotations]} for signature conformance
+    ti_trait_method_rtype: dict    // LOCK-3: trait -> {method -> return type annotation} for signature conformance
+    ti_type_method_ptypes: dict    // LOCK-3: impl type -> {method -> [self-excluded param type annotations]}
+    ti_type_method_rtype: dict     // LOCK-3: impl type -> {method -> return type annotation}
 
 // ── NType constructors ───────────────────────────────────────────────────────
 
@@ -10628,7 +10632,7 @@ fn ti_new_named(source_lines: list, filename: string) -> TiState
     // self-compiles the compiler with 0 errors. Opt OUT with NOVA_TI_STRICT=0 (the old fail-open path).
     let _ti_strict_env = env("NOVA_TI_STRICT")
     let _ti_strict = not (len(_ti_strict_env) > 0 and _ti_strict_env[0] == "0")
-    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {})
+    TiState(1, {}, [], [], [{}], {}, {}, nt_unit(), "", stdlib, 0, false, _ti_strict, source_lines, {}, {}, {}, filename, {}, {}, {}, {}, {}, {}, [], {}, 0, {}, {}, {}, {}, [], {}, {}, {}, {}, false, [], {}, {}, {}, {}, {})
 
 fn ti_fresh(st: TiState) -> NType
     let vid = st.ti_next_id
@@ -10840,6 +10844,12 @@ fn ti_error(st: TiState, msg: string, line: int)
     else if contains(msg, "does not fully implement trait")
         code = "E1006"
         help = "add the missing method(s) as TypeName__method_name functions"
+    else if contains(msg, "incompatible method signature")
+        code = "E1006"
+        help = "the impl's parameter/return types must match the trait's declared signature (dynamic dispatch relies on it)"
+    else if contains(msg, "wrong method arity")
+        code = "E1006"
+        help = "the impl must take the same number of arguments as the trait method declares"
     else if contains(msg, "unknown trait")
         code = "E1007"
         help = "declare the trait with `trait Name` before implementing it"
@@ -13566,25 +13576,39 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                     let trait_methods = []
                     let trait_defs = {}
                     let trait_arity = {}
+                    let trait_ptypes = {}
+                    let trait_rtype = {}
                     for tm in body
                         match tm
                             Stmt(tmt, tmn, tme, tmb, tmp, tmeb, tma, tml) =>
                                 if tmt == "fn_sig" or tmt == "fn_default"
                                     let param_count = len(tmp)
                                     let has_self = false
+                                    let _tr_ptl = []
                                     for tp in tmp
                                         match tp
                                             Param(tpn, tpt, tpd) =>
                                                 if tpn == "self"
                                                     has_self = true
+                                                else
+                                                    push(_tr_ptl, tpt)          // LOCK-3: self-excluded param type annotations
                                     if has_self
                                         param_count = param_count - 1
                                     push(trait_methods, tmn)
                                     trait_arity[tmn] = param_count          // #8 S8.1: record required arity (self-excluded)
+                                    trait_ptypes[tmn] = _tr_ptl
+                                    let _tr_rt = ""                         // LOCK-3: return type annotation (from the rettype expr slot)
+                                    match tme
+                                        Expr(_ert, _erv, _ern, _erc, _erf, _erl) =>
+                                            if _ert == "rettype"
+                                                _tr_rt = _erv
+                                    trait_rtype[tmn] = _tr_rt
                                     if tmt == "fn_default"
                                         trait_defs[tmn] = tm
                     st.ti_traits[name] = trait_methods
                     st.ti_trait_method_arity[name] = trait_arity
+                    st.ti_trait_method_ptypes[name] = trait_ptypes
+                    st.ti_trait_method_rtype[name] = trait_rtype
                     if len(trait_defs) > 0
                         st.ti_trait_defaults[name] = trait_defs
                 if tag == "fn"
@@ -13598,16 +13622,35 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                         // #8 S8.1: record this method's arity (self-excluded, SAME convention as the trait
                         // side) so conformance can verify the impl's arity matches the trait's required arity.
                         let _m_arity = len(params)
+                        let _ty_ptl = []
                         for _mp in params
                             match _mp
                                 Param(_mpn, _mpt, _mpd) =>
                                     if _mpn == "self"
                                         _m_arity = _m_arity - 1
+                                    else
+                                        push(_ty_ptl, _mpt)                  // LOCK-3: self-excluded impl param type annotations
                         let _tma = {}
                         if contains(st.ti_type_method_arity, type_name)
                             _tma = st.ti_type_method_arity[type_name]
                         _tma[method_name] = _m_arity
                         st.ti_type_method_arity[type_name] = _tma
+                        // LOCK-3: record impl param type annotations + return type annotation for sig conformance
+                        let _tpt = {}
+                        if contains(st.ti_type_method_ptypes, type_name)
+                            _tpt = st.ti_type_method_ptypes[type_name]
+                        _tpt[method_name] = _ty_ptl
+                        st.ti_type_method_ptypes[type_name] = _tpt
+                        let _ty_rt = ""
+                        match expr
+                            Expr(_ert2, _erv2, _ern2, _erc2, _erf2, _erl2) =>
+                                if _ert2 == "rettype"
+                                    _ty_rt = _erv2
+                        let _trt = {}
+                        if contains(st.ti_type_method_rtype, type_name)
+                            _trt = st.ti_type_method_rtype[type_name]
+                        _trt[method_name] = _ty_rt
+                        st.ti_type_method_rtype[type_name] = _trt
         si = si + 1
     si = 0
     while si < len(stmts)
@@ -13677,6 +13720,38 @@ fn ti_check_bounds(st: TiState)
                 if not has_trait
                     ti_error(st, "type " + ti_type_str(resolved) + " does not implement trait '" + bc_trait + "' (required by " + bc_fn + ")", bc_line)
 
+fn _sig_norm_ty(t: string) -> string
+    if t == "Int" or t == "int"
+        return "int"
+    if t == "Float" or t == "float"
+        return "float"
+    if t == "Bool" or t == "bool"
+        return "bool"
+    if t == "String" or t == "string" or t == "str"
+        return "string"
+    if t == "Bytes" or t == "bytes"
+        return "bytes"
+    return t
+
+fn _sig_is_known_prim(t: string) -> bool
+    return t == "int" or t == "float" or t == "bool" or t == "string" or t == "bytes"
+
+// LOCK-3 signature conformance: return false ONLY when both sides are provably-distinct primitives
+// (int/float/bool/string/bytes) — the type-confusion-dangerous case for dynamic dispatch, where the
+// runtime returns the impl's value reinterpreted as the trait's DECLARED type. Anything involving an
+// unannotated slot, `any`, a user type, a generic parameter, or a container is treated as compatible ->
+// no false positives; whole-program inference + call-site unification still guard the static-dispatch cases.
+fn _sig_type_compatible(a: string, b: string) -> bool
+    if a == "" or b == "" or a == "any" or b == "any"
+        return true
+    let na = _sig_norm_ty(a)
+    let nb = _sig_norm_ty(b)
+    if na == nb
+        return true
+    if _sig_is_known_prim(na) and _sig_is_known_prim(nb)
+        return false
+    return true
+
 fn ti_check_trait_conformance(st: TiState)
     let type_names = keys(st.ti_type_traits)
     for tn in type_names
@@ -13697,6 +13772,7 @@ fn ti_check_trait_conformance(st: TiState)
                     trait_def_map = st.ti_trait_defaults[trait_name]
                 let missing = []
                 let arity_errs = []
+                let type_errs = []
                 // #8 S8.1: pull the recorded per-method arities (self-excluded) for trait + impl
                 let _tr_ar = {}
                 if contains(st.ti_trait_method_arity, trait_name)
@@ -13704,6 +13780,19 @@ fn ti_check_trait_conformance(st: TiState)
                 let _ty_ar = {}
                 if contains(st.ti_type_method_arity, tn)
                     _ty_ar = st.ti_type_method_arity[tn]
+                // LOCK-3: pull the recorded per-method param/return TYPE annotations for trait + impl
+                let _tr_pt = {}
+                if contains(st.ti_trait_method_ptypes, trait_name)
+                    _tr_pt = st.ti_trait_method_ptypes[trait_name]
+                let _ty_pt = {}
+                if contains(st.ti_type_method_ptypes, tn)
+                    _ty_pt = st.ti_type_method_ptypes[tn]
+                let _tr_rt2 = {}
+                if contains(st.ti_trait_method_rtype, trait_name)
+                    _tr_rt2 = st.ti_trait_method_rtype[trait_name]
+                let _ty_rt2 = {}
+                if contains(st.ti_type_method_rtype, tn)
+                    _ty_rt2 = st.ti_type_method_rtype[tn]
                 for rm in required
                     if not list_contains(implemented, rm)
                         if not contains(trait_def_map, rm)
@@ -13714,6 +13803,22 @@ fn ti_check_trait_conformance(st: TiState)
                         if contains(_tr_ar, rm) and contains(_ty_ar, rm)
                             if _tr_ar[rm] != _ty_ar[rm]
                                 push(arity_errs, rm + "() wants " + str(_tr_ar[rm]) + " arg(s), impl has " + str(_ty_ar[rm]))
+                        // LOCK-3: SIGNATURE TYPE conformance. Where both sides declare a type, a provably-distinct
+                        // primitive mismatch is unsound under dynamic dispatch (the runtime returns/consumes the
+                        // impl's value AS the trait's declared type). Conservative: only fires on clear primitive
+                        // mismatches; unannotated/any/user-type/generic slots pass (inference guards those).
+                        if contains(_tr_pt, rm) and contains(_ty_pt, rm)
+                            let _tps = _tr_pt[rm]
+                            let _ips = _ty_pt[rm]
+                            if len(_tps) == len(_ips)
+                                let _pk = 0
+                                while _pk < len(_tps)
+                                    if not _sig_type_compatible(_tps[_pk], _ips[_pk])
+                                        push(type_errs, rm + "() param " + str(_pk + 1) + ": trait requires " + _tps[_pk] + ", impl has " + _ips[_pk])
+                                    _pk = _pk + 1
+                        if contains(_tr_rt2, rm) and contains(_ty_rt2, rm)
+                            if not _sig_type_compatible(_tr_rt2[rm], _ty_rt2[rm])
+                                push(type_errs, rm + "() returns " + _ty_rt2[rm] + ", trait requires " + _tr_rt2[rm])
                 if len(missing) > 0
                     let msg = "type '" + tn + "' does not fully implement trait '" + trait_name + "': missing "
                     let mi = 0
@@ -13732,6 +13837,15 @@ fn ti_check_trait_conformance(st: TiState)
                         amsg = amsg + arity_errs[ai2]
                         ai2 = ai2 + 1
                     ti_error(st, amsg, decl_line)
+                if len(type_errs) > 0
+                    let tmsg = "type '" + tn + "' implements trait '" + trait_name + "' with an incompatible method signature: "
+                    let ti3 = 0
+                    while ti3 < len(type_errs)
+                        if ti3 > 0
+                            tmsg = tmsg + "; "
+                        tmsg = tmsg + type_errs[ti3]
+                        ti3 = ti3 + 1
+                    ti_error(st, tmsg, decl_line)
 
 // ── Tail Call Optimization ───────────────────────────────────────────────────
 

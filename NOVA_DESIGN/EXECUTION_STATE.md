@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | 0.8 struct-field-leak | 0-A | A | ✅ DONE | fb1167cf |
 | 0.11 float-return-uninit | 0-A | A | ✅ GUARDED | (batch 1) |
-| trait-conformance sig type-check (LOCK-3) | 0-A | A | ⬜ NEXT | |
+| trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | user-enum payload typing | 0-A | A | ⬜ | |
 | `==` NFC/NFD helper | 0-A | C | ❌ DROPPED — not a gap (byte-equality is correct; matches Python/Rust/Go — NFC-by-default would be *wrong*) | |
 | `1<<64` shift guard | 0-A | C | ✅ DONE (gen4-verified; reconverge at batch arc) | (batch 1) |
@@ -72,3 +72,14 @@
    (compiler self-compiles with the new codegen) + `_shift64_guard_test` PASS (13/13). Compiler-only. Reconverge at arc.
 3. **lexer scan (no code change):** numeric separators ALREADY done; `==`NFC/NFD is NOT a gap (byte-eq
    matches Python/Rust/Go); `\u{}` + labeled-break deferred (low-value; `from_codepoint` covers `\u`).
+4. **trait-conformance signature TYPE check (LOCK-3) -> DONE.** Prior state checked name + arity only; a
+   same-name/same-arity impl with WRONG param/return types was silently accepted -> unsound under DYNAMIC
+   dispatch (runtime returns/consumes the impl's value AS the trait's declared type = type confusion).
+   Fix: record self-excluded param type annotations + return type for trait methods AND impls (4 new TiState
+   dicts), then compare in ti_check_trait_conformance. Conservative `_sig_type_compatible`: fires ONLY on
+   provably-distinct primitives (int/float/bool/string/bytes); unannotated/`any`/user-type/generic slots
+   pass (no false positives — inference + call-site unification guard those). New E1006 message. gen4-verified:
+   OK impl compiles+runs; bad-return + bad-param REJECTED with precise messages; dyn_trait/bounds compile
+   (no false positive); conformance_test still errors correctly. (phase75_default is a PRE-EXISTING failure,
+   identical under old gen3 — unrelated from_json_safe orphan.) Compiler-only. *Reconverge at arc; wire the 2
+   negatives into the neg-test gate at arc.*
