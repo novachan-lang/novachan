@@ -1,0 +1,420 @@
+// forge_blake2b -- BLAKE2b cryptographic hash (RFC 7693). The modern fast hash used by Argon2,
+// libsodium, and many blockchains (Zcash, Polkadot, ...). Pure NOVA, binary-safe: it operates on the
+// first-class `bytes` type so digests -- which contain 0x00 octets -- are never truncated the way a
+// NUL-terminated string would truncate them.
+//
+// NOVA-WAY: the whole state machine is expressed with plain 64-bit int arithmetic. NOVA ints are 64-bit
+// two's-complement and ADD WRAPS exactly like u64 (0xFFFFFFFFFFFFFFFF + 1 == 0), so the compression
+// function needs no bignum -- we just mask with & 0xFFFFFFFFFFFFFFFF after each add and get modular u64.
+//
+// DRAWBACK-AVOIDED: every other ecosystem FFI-binds libb2 (a native C dependency) to get BLAKE2b, which
+// means a different compiled artifact per platform and an out-of-language attack surface. NOVA's is pure,
+// so the SAME binary hashes identically on every OS/arch, and there is no unsafe C boundary to audit.
+//
+// GOTCHA baked in below: NOVA's `>>` is ARITHMETIC (sign-extending) -- 0x8000000000000000 >> 4 yields
+// 0xf800000000000000, not 0x0800000000000000. BLAKE2b's G-mixing needs LOGICAL right rotation, so
+// _rotr64 masks off the sign-extended high bits with & ((1 << (64 - n)) - 1) before OR-ing the wrap-around
+// bits back in. The four rotation amounts (32, 24, 16, 63) are all in 1..63 so 1 << (64 - n) never hits
+// the 1<<64 == 0 edge case.
+//
+// INPUT VALIDATION (added): RFC 7693 fixes the BLAKE2b digest length at 1..64 bytes and the key at 0..64
+// bytes. Feeding an out-of-range out_len used to emit a MALFORMED digest silently (out_len=100 wrote 100
+// bytes reading past the 64-byte state; out_len=0 emitted an empty digest), and a >64-byte key silently
+// diverged from every reference implementation because only the first 64 bytes fit the padded key block.
+// Both are now REJECTED LOUDLY (print a one-line error + exit 1) so misuse is a hard stop, never a
+// silent wrong hash. The correct-path output is byte-for-byte unchanged.
+
+// Mask a value to unsigned 64-bit (identity on the bit pattern; NOVA ints are already 64-bit).
+fn _u64(x: int) -> int
+    x & 0xFFFFFFFFFFFFFFFF
+
+// Right-rotate a 64-bit word by n (n in 1..63). Uses a LOGICAL right shift (masked) so the sign bit does
+// not leak into the low half -- NOVA's >> is arithmetic.
+fn _rotr64(x: int, n: int) -> int
+    let low = (x >> n) & ((1 << (64 - n)) - 1)
+    let high = (x << (64 - n)) & 0xFFFFFFFFFFFFFFFF
+    (low | high) & 0xFFFFFFFFFFFFFFFF
+
+// The 8 BLAKE2b IV words (fractional parts of sqrt of the first 8 primes) -- same as SHA-512.
+fn _blake2b_iv() -> list
+    let iv = []
+    push(iv, 0x6a09e667f3bcc908)
+    push(iv, 0xbb67ae8584caa73b)
+    push(iv, 0x3c6ef372fe94f82b)
+    push(iv, 0xa54ff53a5f1d36f1)
+    push(iv, 0x510e527fade682d1)
+    push(iv, 0x9b05688c2b3e6c1f)
+    push(iv, 0x1f83d9abfb41bd6b)
+    push(iv, 0x5be0cd19137e2179)
+    iv
+
+// SIGMA[round][k] message-word permutation, 12 rounds x 16 indices, flattened (row-major).
+fn _blake2b_sigma() -> list
+    let s = []
+    // round 0
+    push(s, 0)
+    push(s, 1)
+    push(s, 2)
+    push(s, 3)
+    push(s, 4)
+    push(s, 5)
+    push(s, 6)
+    push(s, 7)
+    push(s, 8)
+    push(s, 9)
+    push(s, 10)
+    push(s, 11)
+    push(s, 12)
+    push(s, 13)
+    push(s, 14)
+    push(s, 15)
+    // round 1
+    push(s, 14)
+    push(s, 10)
+    push(s, 4)
+    push(s, 8)
+    push(s, 9)
+    push(s, 15)
+    push(s, 13)
+    push(s, 6)
+    push(s, 1)
+    push(s, 12)
+    push(s, 0)
+    push(s, 2)
+    push(s, 11)
+    push(s, 7)
+    push(s, 5)
+    push(s, 3)
+    // round 2
+    push(s, 11)
+    push(s, 8)
+    push(s, 12)
+    push(s, 0)
+    push(s, 5)
+    push(s, 2)
+    push(s, 15)
+    push(s, 13)
+    push(s, 10)
+    push(s, 14)
+    push(s, 3)
+    push(s, 6)
+    push(s, 7)
+    push(s, 1)
+    push(s, 9)
+    push(s, 4)
+    // round 3
+    push(s, 7)
+    push(s, 9)
+    push(s, 3)
+    push(s, 1)
+    push(s, 13)
+    push(s, 12)
+    push(s, 11)
+    push(s, 14)
+    push(s, 2)
+    push(s, 6)
+    push(s, 5)
+    push(s, 10)
+    push(s, 4)
+    push(s, 0)
+    push(s, 15)
+    push(s, 8)
+    // round 4
+    push(s, 9)
+    push(s, 0)
+    push(s, 5)
+    push(s, 7)
+    push(s, 2)
+    push(s, 4)
+    push(s, 10)
+    push(s, 15)
+    push(s, 14)
+    push(s, 1)
+    push(s, 11)
+    push(s, 12)
+    push(s, 6)
+    push(s, 8)
+    push(s, 3)
+    push(s, 13)
+    // round 5
+    push(s, 2)
+    push(s, 12)
+    push(s, 6)
+    push(s, 10)
+    push(s, 0)
+    push(s, 11)
+    push(s, 8)
+    push(s, 3)
+    push(s, 4)
+    push(s, 13)
+    push(s, 7)
+    push(s, 5)
+    push(s, 15)
+    push(s, 14)
+    push(s, 1)
+    push(s, 9)
+    // round 6
+    push(s, 12)
+    push(s, 5)
+    push(s, 1)
+    push(s, 15)
+    push(s, 14)
+    push(s, 13)
+    push(s, 4)
+    push(s, 10)
+    push(s, 0)
+    push(s, 7)
+    push(s, 6)
+    push(s, 3)
+    push(s, 9)
+    push(s, 2)
+    push(s, 8)
+    push(s, 11)
+    // round 7
+    push(s, 13)
+    push(s, 11)
+    push(s, 7)
+    push(s, 14)
+    push(s, 12)
+    push(s, 1)
+    push(s, 3)
+    push(s, 9)
+    push(s, 5)
+    push(s, 0)
+    push(s, 15)
+    push(s, 4)
+    push(s, 8)
+    push(s, 6)
+    push(s, 2)
+    push(s, 10)
+    // round 8
+    push(s, 6)
+    push(s, 15)
+    push(s, 14)
+    push(s, 9)
+    push(s, 11)
+    push(s, 3)
+    push(s, 0)
+    push(s, 8)
+    push(s, 12)
+    push(s, 2)
+    push(s, 13)
+    push(s, 7)
+    push(s, 1)
+    push(s, 4)
+    push(s, 10)
+    push(s, 5)
+    // round 9
+    push(s, 10)
+    push(s, 2)
+    push(s, 8)
+    push(s, 4)
+    push(s, 7)
+    push(s, 6)
+    push(s, 1)
+    push(s, 5)
+    push(s, 15)
+    push(s, 11)
+    push(s, 9)
+    push(s, 14)
+    push(s, 3)
+    push(s, 12)
+    push(s, 13)
+    push(s, 0)
+    // round 10 (== round 0)
+    push(s, 0)
+    push(s, 1)
+    push(s, 2)
+    push(s, 3)
+    push(s, 4)
+    push(s, 5)
+    push(s, 6)
+    push(s, 7)
+    push(s, 8)
+    push(s, 9)
+    push(s, 10)
+    push(s, 11)
+    push(s, 12)
+    push(s, 13)
+    push(s, 14)
+    push(s, 15)
+    // round 11 (== round 1)
+    push(s, 14)
+    push(s, 10)
+    push(s, 4)
+    push(s, 8)
+    push(s, 9)
+    push(s, 15)
+    push(s, 13)
+    push(s, 6)
+    push(s, 1)
+    push(s, 12)
+    push(s, 0)
+    push(s, 2)
+    push(s, 11)
+    push(s, 7)
+    push(s, 5)
+    push(s, 3)
+    s
+
+// The G mixing function, applied to working vector v (a 16-element list) in place. a,b,c,d are indices.
+fn _blake2b_g(v: list, a: int, b: int, c: int, d: int, x: int, y: int)
+    v[a] = (v[a] + v[b] + x) & 0xFFFFFFFFFFFFFFFF
+    v[d] = _rotr64((v[d] ^ v[a]) & 0xFFFFFFFFFFFFFFFF, 32)
+    v[c] = (v[c] + v[d]) & 0xFFFFFFFFFFFFFFFF
+    v[b] = _rotr64((v[b] ^ v[c]) & 0xFFFFFFFFFFFFFFFF, 24)
+    v[a] = (v[a] + v[b] + y) & 0xFFFFFFFFFFFFFFFF
+    v[d] = _rotr64((v[d] ^ v[a]) & 0xFFFFFFFFFFFFFFFF, 16)
+    v[c] = (v[c] + v[d]) & 0xFFFFFFFFFFFFFFFF
+    v[b] = _rotr64((v[b] ^ v[c]) & 0xFFFFFFFFFFFFFFFF, 63)
+
+// The compression function F. h = 8-word state (mutated in place). block = 16 message words (list of ints).
+// t0/t1 = 128-bit byte counter (low/high). last = true on the final block (inverts v[14]).
+fn _blake2b_compress(h: list, block: list, t0: int, t1: int, last: bool)
+    let iv = _blake2b_iv()
+    let sigma = _blake2b_sigma()
+    let v = []
+    let i = 0
+    while i < 8
+        push(v, h[i])
+        i = i + 1
+    i = 0
+    while i < 8
+        push(v, iv[i])
+        i = i + 1
+    v[12] = (v[12] ^ t0) & 0xFFFFFFFFFFFFFFFF
+    v[13] = (v[13] ^ t1) & 0xFFFFFFFFFFFFFFFF
+    if last
+        v[14] = (v[14] ^ 0xFFFFFFFFFFFFFFFF) & 0xFFFFFFFFFFFFFFFF
+    let r = 0
+    while r < 12
+        let so = r * 16
+        _blake2b_g(v, 0, 4, 8, 12, block[sigma[so + 0]], block[sigma[so + 1]])
+        _blake2b_g(v, 1, 5, 9, 13, block[sigma[so + 2]], block[sigma[so + 3]])
+        _blake2b_g(v, 2, 6, 10, 14, block[sigma[so + 4]], block[sigma[so + 5]])
+        _blake2b_g(v, 3, 7, 11, 15, block[sigma[so + 6]], block[sigma[so + 7]])
+        _blake2b_g(v, 0, 5, 10, 15, block[sigma[so + 8]], block[sigma[so + 9]])
+        _blake2b_g(v, 1, 6, 11, 12, block[sigma[so + 10]], block[sigma[so + 11]])
+        _blake2b_g(v, 2, 7, 8, 13, block[sigma[so + 12]], block[sigma[so + 13]])
+        _blake2b_g(v, 3, 4, 9, 14, block[sigma[so + 14]], block[sigma[so + 15]])
+        r = r + 1
+    i = 0
+    while i < 8
+        h[i] = (h[i] ^ v[i] ^ v[i + 8]) & 0xFFFFFFFFFFFFFFFF
+        i = i + 1
+
+// Read 8 little-endian bytes from `data` starting at offset `off` into a 64-bit word.
+// Missing bytes (past end) are treated as zero (final-block padding).
+fn _blake2b_load64(data, off: int, n: int) -> int
+    let w = 0
+    let i = 0
+    while i < 8
+        let b = 0
+        if (off + i) < n
+            b = bytes_get(data, off + i)
+        w = w | ((b & 255) << (i * 8))
+        i = i + 1
+    w & 0xFFFFFFFFFFFFFFFF
+
+// Core BLAKE2b over `data` (bytes) and `key` (bytes, may be empty) producing out_len bytes (1..64).
+fn _blake2b_core(data, key, out_len: int) -> list
+    // VALIDATION: RFC 7693 fixes the digest length at 1..64 bytes. Out of range used to write a
+    // malformed digest (out_len>64 read past the 64-byte state; out_len<1 emitted an empty digest).
+    // Reject loudly so misuse is a hard stop rather than a silent wrong hash.
+    if out_len < 1
+        print("blake2b: out_len must be 1..64 (got " + str(out_len) + ")")
+        exit(1)
+    if out_len > 64
+        print("blake2b: out_len must be 1..64 (got " + str(out_len) + ")")
+        exit(1)
+    // VALIDATION: the key (MAC mode) is at most 64 bytes -- only the first 64 fit the padded key block,
+    // so a longer key would silently diverge from every reference implementation. Reject it.
+    if bytes_len(key) > 64
+        print("blake2b: key must be 0..64 bytes (got " + str(bytes_len(key)) + ")")
+        exit(1)
+
+    // parameter block: h[0] ^= 0x01010000 ^ (keylen << 8) ^ out_len
+    let h = _blake2b_iv()
+    let keylen = bytes_len(key)
+    h[0] = (h[0] ^ 0x01010000 ^ (keylen << 8) ^ out_len) & 0xFFFFFFFFFFFFFFFF
+
+    // If keyed, the first data block is the key padded to 128 bytes.
+    let msg = bytes(0)
+    if keylen > 0
+        let ki = 0
+        while ki < 128
+            let kb = 0
+            if ki < keylen
+                kb = bytes_get(key, ki)
+            msg = bytes_append(msg, kb)
+            ki = ki + 1
+    let dn = bytes_len(data)
+    let di = 0
+    while di < dn
+        msg = bytes_append(msg, bytes_get(data, di))
+        di = di + 1
+
+    let mlen = bytes_len(msg)
+    // Number of 128-byte blocks; BLAKE2b always processes at least one block (even for empty unkeyed input).
+    let nblocks = mlen / 128
+    if (mlen % 128) != 0
+        nblocks = nblocks + 1
+    if nblocks == 0
+        nblocks = 1
+
+    let counter = 0
+    let bi = 0
+    while bi < nblocks
+        let base = bi * 128
+        // bytes consumed so far after this block
+        let consumed = base + 128
+        let is_last = false
+        if bi == (nblocks - 1)
+            is_last = true
+            consumed = mlen
+        counter = consumed
+        // build the 16-word little-endian block
+        let block = []
+        let w = 0
+        while w < 16
+            push(block, _blake2b_load64(msg, base + w * 8, mlen))
+            w = w + 1
+        // t0 = low 64 bits of the byte counter, t1 = high (0 for our sizes)
+        _blake2b_compress(h, block, counter & 0xFFFFFFFFFFFFFFFF, 0, is_last)
+        bi = bi + 1
+
+    // Serialize first out_len bytes of h, little-endian.
+    let out = bytes(0)
+    let oi = 0
+    while oi < out_len
+        let word = h[oi / 8]
+        let shift = (oi % 8) * 8
+        out = bytes_append(out, (word >> shift) & 255)
+        oi = oi + 1
+    out
+
+// PUBLIC: BLAKE2b of `data` (bytes) producing `out_len` bytes (1..64). No key.
+fn blake2b(data, out_len: int) -> list
+    _blake2b_core(data, bytes(0), out_len)
+
+// PUBLIC: keyed BLAKE2b (MAC mode). `key` up to 64 bytes.
+fn blake2b_keyed(data, key, out_len: int) -> list
+    // VALIDATION (guarded here too so misuse is caught at the public boundary, not only deep in _core):
+    // a key longer than 64 bytes is rejected loudly. RFC 7693 caps the key at 64 bytes.
+    if bytes_len(key) > 64
+        print("blake2b_keyed: key must be 0..64 bytes (got " + str(bytes_len(key)) + ")")
+        exit(1)
+    _blake2b_core(data, key, out_len)
+
+// PUBLIC: lowercase-hex string of blake2b(data, out_len).
+fn blake2b_hex(data, out_len: int) -> string
+    let digest = _blake2b_core(data, bytes(0), out_len)
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = bytes_len(digest)
+    let i = 0
+    while i < n
+        let b = bytes_get(digest, i)
+        out = out + char_at(digs, (b >> 4) & 15) + char_at(digs, b & 15)
+        i = i + 1
+    out
