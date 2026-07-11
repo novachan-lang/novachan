@@ -23,7 +23,8 @@
 | 0.8 struct-field-leak | 0-A | A | ✅ DONE | fb1167cf |
 | 0.11 float-return-uninit | 0-A | A | ✅ GUARDED | (batch 1) |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
-| user-enum payload typing | 0-A | A | ⬜ | |
+| user-enum payload typing | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
+| **enum float-payload unbox** (codegen; DISCOVERED) | 0-A | A | 🔴 NEW — float enum payload extracts raw i64 bits (garbage) when field-count/route hits `any`; pre-existing (gen3 identical) | (task 5) |
 | `==` NFC/NFD helper | 0-A | C | ❌ DROPPED — not a gap (byte-equality is correct; matches Python/Rust/Go — NFC-by-default would be *wrong*) | |
 | `1<<64` shift guard | 0-A | C | ✅ DONE (gen4-verified; reconverge at batch arc) | (batch 1) |
 | lexer: numeric separators | 0-A | C | ✅ ALREADY DONE (decimal/hex/binary all strip `_`; audit stale) | |
@@ -83,3 +84,17 @@
    (no false positive); conformance_test still errors correctly. (phase75_default is a PRE-EXISTING failure,
    identical under old gen3 — unrelated from_json_safe orphan.) Compiler-only. *Reconverge at arc; wire the 2
    negatives into the neg-test gate at arc.*
+5. **user-enum payload TYPING -> DONE.** Matching a USER enum variant `Circle(r)` bound payload vars to a
+   fresh type var (untyped) — unlike the built-in Ok/Err/Some/None path — so payload misuse went uncaught
+   (a float payload used as a string unified to `string` -> the runtime treated float bits as a string
+   pointer = type confusion). Fix: record ordered payload field type annotations per variant (new TiState
+   `ti_variant_ptypes`, populated in the enum pre-pass), and at match bind each positional binder to the
+   DECLARED type. Conservative — concrete types only (empty/generic/`var` -> fresh, no regression).
+   gen4-verified: bad test (float payload -> needs_string) COMPILED on old gen3 (unsound) but is REJECTED on
+   gen4 (hole closed); int-payload OK test runs (move sum=7, wait=10); existing enum tests byte-identical
+   gen3/gen4 (no regression). Compiler-only. *Reconverge at arc.*
+   **DISCOVERED (task 5, separate pre-existing CODEGEN bug):** a FLOAT enum payload extracts as its raw
+   IEEE-754 i64 bit-pattern (garbage, e.g. `str(r)`=4617315517961601024 for 5.0) instead of unboxing to a
+   float — happens for the single-field float variant (`Circle`) routed through an `any`-typed fn param; the
+   2-field `Rect` and direct single-variant `F(x:float)` unbox fine. Identical on gen3 -> NOT my change;
+   boxed-float-through-any-variant unbox class. High-value (enums with float data are common). Next task.
