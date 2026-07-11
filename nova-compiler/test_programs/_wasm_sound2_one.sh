@@ -4,7 +4,7 @@
 # undefined compiler-rt builtin. Expected (== native): recur=317811 bigsum=49995000 bitops=639900 signed=-7301 strops=23012.
 cd "$(dirname "$0")" || exit 1
 ./gen3_test.exe _wasm_sound2.nova >/dev/null 2>&1
-clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c output/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_sound2: runtime"; exit 1; }
+clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c ../compiler/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_sound2: runtime"; exit 1; }
 clang --target=wasm32 -O2 -fno-builtin -nostdlib -c _wasm_sound2.ll -o _s2prog.o 2>/dev/null || { echo "FAIL wasm_sound2: prog"; exit 1; }
 wasm-ld --no-entry --export-all --allow-undefined --gc-sections _s2prog.o output/nova_runtime_wasm.o -o _sound2.wasm 2>/dev/null
 [ -f _sound2.wasm ] || { echo "FAIL wasm_sound2: link"; exit 1; }

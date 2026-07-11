@@ -86,7 +86,7 @@ Nothing moves forward until the step before it is validated. Every change is che
 
 ### Current State (updated 2026-07) — NOVA is SELF-HOSTED; hardening the core
 The original phased plan (below) is long since executed. NOVA now **self-hosts**: the compiler is
-written in NOVA (~22k lines, `nova-compiler/test_programs/nova_compiler.nova`) and compiles itself to a
+written in NOVA (~22k lines, `nova-compiler/compiler/nova_compiler.nova`) and compiles itself to a
 **byte-identical fixpoint** (gen5.ll == gen6.ll). It has a real C runtime, an LLVM backend at C-class
 scalar speed, a working concurrency runtime, and the Forge framework on top.
 
@@ -115,9 +115,10 @@ See also [`reference_implemented_status`] / `IMPLEMENTATION_AUDIT.md` for the as
 ### Build Order
 Phase 0 (Specification) → Phase 1 (Frontend) → Phase 2 (Semantic Analysis) → Phase 3 (IR) → Phase 4 (Codegen) → Phase 5 (Runtime) → Phase 6 (Stdlib) → Phase 7 (Toolchain)
 
-**The compiler is SELF-HOSTED in NOVA** (`nova-compiler/test_programs/nova_compiler.nova`, ~22k lines);
-it self-compiles to a byte-identical fixpoint. (The original bootstrap was written in Java — that is
-historical; do NOT edit Java sources expecting them to be the live compiler.) The canonical build/verify
+**The compiler is SELF-HOSTED in NOVA** (`nova-compiler/compiler/nova_compiler.nova`, ~22k
+lines; the C runtime `nova_runtime.c` is its sibling in that same `compiler/` folder); it self-compiles to a
+byte-identical fixpoint. (The original bootstrap was written in Java — that is historical; do NOT edit Java
+sources expecting them to be the live compiler.) The canonical build/verify
 loop: edit `nova_compiler.nova` → build gen4 with `gen3_test.exe` → 3-pass reconverge (gen5.ll == gen6.ll)
 → both-mode regression via `nova_ci.ps1` → commit. Kill-on-timeout is mandatory for every binary run.
 

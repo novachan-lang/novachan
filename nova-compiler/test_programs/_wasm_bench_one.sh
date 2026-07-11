@@ -5,7 +5,7 @@
 # __multi3 import gets stubbed -> WRONG result; this gate catches that regression.
 cd "$(dirname "$0")" || exit 1
 ./gen3_test.exe _wasm_bench.nova >/dev/null 2>&1
-clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c output/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_bench: runtime"; exit 1; }
+clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c ../compiler/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_bench: runtime"; exit 1; }
 clang --target=wasm32 -O2 -fno-builtin -nostdlib -c _wasm_bench.ll -o _bprog.o 2>/dev/null || { echo "FAIL wasm_bench: prog"; exit 1; }
 wasm-ld --no-entry --export-all --allow-undefined --gc-sections _bprog.o output/nova_runtime_wasm.o -o _bench.wasm 2>/dev/null
 [ -f _bench.wasm ] || { echo "FAIL wasm_bench: link"; exit 1; }

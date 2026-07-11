@@ -9,7 +9,7 @@ if (-not (Test-Path _export_lib.ll)) { Write-Host "FAIL: lib did not compile"; e
 if ((Select-String -Path _export_lib.ll -Pattern 'define i32 @main\b' -Quiet)) { Write-Host "FAIL: @export lib still emits @main"; exit 1 }
 if (-not (Select-String -Path _export_lib.ll -Pattern '@__nova_export_init' -Quiet)) { Write-Host "FAIL: missing __nova_export_init entry"; exit 1 }
 & $clang -O2 -c _export_lib.ll -o _export_lib.o 2>$null
-& $clang -O2 -c output/nova_runtime.c -o _rt25.o -D_CRT_SECURE_NO_WARNINGS -w 2>$null
+& $clang -O2 -c ../compiler/nova_runtime.c -o _rt25.o -D_CRT_SECURE_NO_WARNINGS -w 2>$null
 & $clang -O2 -o _export_test.exe _export_driver.c _export_lib.o _rt25.o -lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w 2>$null
 if (-not (Test-Path _export_test.exe)) { Write-Host "FAIL: C host did not link against the NOVA @export lib"; exit 1 }
 $o = "$env:TEMP\s25o.txt"

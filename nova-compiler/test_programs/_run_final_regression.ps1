@@ -5,9 +5,9 @@ Set-Location $PSScriptRoot
 $env:NOVA_NO_CACHE = "1"
 $compilerName = if ($env:NOVA_REGRESSION_COMPILER) { $env:NOVA_REGRESSION_COMPILER } else { "gen3_test.exe" }
 $compiler = (Resolve-Path "$PSScriptRoot\$compilerName").Path
-$runtimeSrc = "$PSScriptRoot\output\nova_runtime.c"
+$runtimeSrc = "$PSScriptRoot\..\compiler\nova_runtime.c"
 $runtimeObj = "$PSScriptRoot\nova_runtime_test.o"
-$sqliteSrc  = "$PSScriptRoot\output\sqlite3.c"
+$sqliteSrc  = "$PSScriptRoot\..\compiler\sqlite3.c"
 
 # Core language regression tests
 $core_tests = @(

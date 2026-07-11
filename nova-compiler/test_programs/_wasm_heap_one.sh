@@ -4,7 +4,7 @@
 # never a NULL-deref corruption (address 0 is a valid wasm linear-memory address). Asserts bigalloc()==0.
 cd "$(dirname "$0")" || exit 1
 ./gen3_test.exe _wasm_heap.nova >/dev/null 2>&1
-clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c output/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_heap: runtime"; exit 1; }
+clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c ../compiler/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_heap: runtime"; exit 1; }
 clang --target=wasm32 -O2 -fno-builtin -nostdlib -c _wasm_heap.ll -o _hprog.o 2>/dev/null || { echo "FAIL wasm_heap: prog"; exit 1; }
 wasm-ld --no-entry --export-all --allow-undefined --gc-sections _hprog.o output/nova_runtime_wasm.o -o _heap.wasm 2>/dev/null
 [ -f _heap.wasm ] || { echo "FAIL wasm_heap: link"; exit 1; }

@@ -5,7 +5,7 @@
 cd "$(dirname "$0")" || exit 1
 ./gen3_test.exe _wasm_todo.nova >/dev/null 2>&1
 [ -f _wasm_todo.ll ] || { echo "FAIL wasm_todo: NOVA->LLVM"; exit 1; }
-clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c output/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_todo: runtime"; exit 1; }
+clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c ../compiler/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_todo: runtime"; exit 1; }
 clang --target=wasm32 -O2 -fno-builtin -nostdlib -c _wasm_todo.ll -o _tprog.o 2>/dev/null || { echo "FAIL wasm_todo: prog"; exit 1; }
 wasm-ld --no-entry --export-all --allow-undefined --gc-sections _tprog.o output/nova_runtime_wasm.o -o _todo.wasm 2>/dev/null
 [ -f _todo.wasm ] || { echo "FAIL wasm_todo: link"; exit 1; }

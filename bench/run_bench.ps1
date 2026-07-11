@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot   = Split-Path -Parent $PSScriptRoot
 $novaDir    = Join-Path $repoRoot "nova-compiler\test_programs"
 $compiler   = Join-Path $novaDir  "gen3_test.exe"
-$runtime    = Join-Path $novaDir  "output\nova_runtime.c"
+$runtime    = Join-Path $novaDir  "..\compiler\nova_runtime.c"
 $histFile   = Join-Path $PSScriptRoot "history.jsonl"
 $progDir    = Join-Path $PSScriptRoot "programs"
 

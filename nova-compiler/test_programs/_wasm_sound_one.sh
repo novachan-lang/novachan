@@ -5,7 +5,7 @@
 # builtin (like the __multi3 bug) FAILS LOUD here instead of silently computing wrong.
 cd "$(dirname "$0")" || exit 1
 ./gen3_test.exe _wasm_sound.nova >/dev/null 2>&1
-clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c output/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_sound: runtime"; exit 1; }
+clang --target=wasm32 -ffreestanding -nostdlib -fno-builtin -O2 -c ../compiler/nova_runtime_wasm.c -o output/nova_runtime_wasm.o 2>/dev/null || { echo "FAIL wasm_sound: runtime"; exit 1; }
 clang --target=wasm32 -O2 -fno-builtin -nostdlib -c _wasm_sound.ll -o _soprog.o 2>/dev/null || { echo "FAIL wasm_sound: prog"; exit 1; }
 wasm-ld --no-entry --export-all --allow-undefined --gc-sections _soprog.o output/nova_runtime_wasm.o -o _sound.wasm 2>/dev/null
 [ -f _sound.wasm ] || { echo "FAIL wasm_sound: link"; exit 1; }

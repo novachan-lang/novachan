@@ -17,7 +17,7 @@ foreach ($t in @("forge_spawn_test", "forge_recover_test")) {
     Remove-Item "$t.ll", "${t}_asan.exe" -Force -ErrorAction SilentlyContinue
     $c = Invoke-Timed -FilePath ".\gen3_test.exe" -Arguments "$t.nova" -TimeoutMs 120000 -WorkingDirectory $PSScriptRoot
     if ($c.ExitCode -ne 0) { Write-Host "$t ASAN compile FAIL"; if ($c.StdOut) { Write-Host $c.StdOut }; exit 1 }
-    $la = "-fsanitize=address -g -O1 -o ${t}_asan.exe $t.ll output\nova_runtime.c -lws2_32 -ladvapi32 -D_CRT_SECURE_NO_WARNINGS -w"
+    $la = "-fsanitize=address -g -O1 -o ${t}_asan.exe $t.ll ..\compiler\nova_runtime.c -lws2_32 -ladvapi32 -D_CRT_SECURE_NO_WARNINGS -w"
     Invoke-Timed -FilePath $ClangPath -Arguments $la -TimeoutMs 240000 -WorkingDirectory $PSScriptRoot | Out-Null
     if (!(Test-Path "${t}_asan.exe")) { Write-Host "$t ASAN link FAIL"; exit 1 }
     $r = Invoke-Timed -FilePath ".\${t}_asan.exe" -Arguments "" -TimeoutMs 30000 -WorkingDirectory $PSScriptRoot

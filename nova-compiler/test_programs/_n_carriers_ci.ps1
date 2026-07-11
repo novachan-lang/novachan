@@ -7,7 +7,7 @@
 param([int]$Iters = 3, [int]$TimeoutSec = 20)
 Set-Location $PSScriptRoot
 $compiler = (Resolve-Path ".\gen3_test.exe").Path
-$runtimeSrc = "$PSScriptRoot\output\nova_runtime.c"
+$runtimeSrc = "$PSScriptRoot\..\compiler\nova_runtime.c"
 $clang = "clang"
 $lflags = "-lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w"
 

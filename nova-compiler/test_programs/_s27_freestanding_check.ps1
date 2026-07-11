@@ -5,7 +5,7 @@ Remove-Item _freestanding_test.ll,_fs_free.exe -ErrorAction SilentlyContinue
 $env:NOVA_NO_CACHE = "1"
 & .\gen3_test.exe _freestanding_test.nova *> $null
 if (-not (Test-Path _freestanding_test.ll)) { Write-Host "FAIL: freestanding test did not compile"; exit 1 }
-& clang -O2 -DNOVA_FREESTANDING -o _fs_free.exe _freestanding_test.ll output/nova_runtime.c -lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w 2>$null
+& clang -O2 -DNOVA_FREESTANDING -o _fs_free.exe _freestanding_test.ll ../compiler/nova_runtime.c -lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w 2>$null
 if (-not (Test-Path _fs_free.exe)) { Write-Host "FAIL: freestanding runtime did not build"; exit 1 }
 $o = "$env:TEMP\s27o.txt"
 $p = Start-Process -FilePath (Resolve-Path ".\_fs_free.exe").Path -PassThru -NoNewWindow -RedirectStandardOutput $o

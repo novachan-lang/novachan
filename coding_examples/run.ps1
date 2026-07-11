@@ -15,7 +15,7 @@ if (-not (Test-Path $File)) {
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $Compiler    = Join-Path $ProjectRoot "nova-compiler\test_programs\gen3_test.exe"
-$Runtime     = Join-Path $ProjectRoot "nova-compiler\test_programs\output\nova_runtime.c"
+$Runtime     = Join-Path $ProjectRoot "nova-compiler\compiler\nova_runtime.c"
 $BaseName    = [System.IO.Path]::GetFileNameWithoutExtension($File)
 $LlFile      = "$BaseName.ll"
 $ExeFile     = "$BaseName.exe"

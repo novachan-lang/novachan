@@ -9,7 +9,7 @@ if (-not (Test-Path _s35_constfn.ll)) { Write-Host "FAIL: #35 test did not compi
 $ll = (Get-Content _s35_constfn.ll -Raw)
 if ($ll -notmatch '3628800') { Write-Host "FAIL #35: fact(10) was NOT folded to 3628800 (const-fn-eval inactive)"; exit 1 }
 if ($ll -notmatch '6765')    { Write-Host "FAIL #35: fib(20) was NOT folded to 6765"; exit 1 }
-& clang -O2 -o _s35x.exe _s35_constfn.ll output/nova_runtime.c -lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w 2>$null
+& clang -O2 -o _s35x.exe _s35_constfn.ll ../compiler/nova_runtime.c -lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w 2>$null
 if (-not (Test-Path _s35x.exe)) { Write-Host "FAIL #35: did not build"; exit 1 }
 $o = "$env:TEMP\s35o.txt"
 $p = Start-Process -FilePath (Resolve-Path ".\_s35x.exe").Path -PassThru -NoNewWindow -RedirectStandardOutput $o

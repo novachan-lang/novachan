@@ -22,14 +22,18 @@ std/                         ← THE NOVA STANDARD LIBRARY, hierarchical by cate
 forge/                       ← the FORGE FRAMEWORK (web) — separate from the language, owner's domain
 NOVA_DESIGN/                 ← the master plan + design docs + the live execution ledger
 bench/                       ← benchmarks
-nova-compiler/               ← the compiler's build home (see "the honest reality" below)
-  test_programs/
-    nova_compiler.nova       ← THE self-hosted compiler (~22k lines, written in NOVA)
-    output/nova_runtime.c    ← THE C runtime
-    gen3_test.exe            ← the pinned bootstrap binary
-    *.ps1                    ← build / CI / reconverge scripts (nova_ci, _proc_util, _build_gen4, …)
-    *_test.nova              ← test programs
-    lib/  std/               ← installed toolchain copies (synced, gitignored)
+nova-compiler/               ← the compiler's home (see "the honest reality" below)
+  compiler/                  ← ★ THE canonical source (moved OUT of the test folder — easy to find)
+    nova_compiler.nova       ←   THE self-hosted compiler (~22k lines, written in NOVA)
+    nova_runtime.c           ←   THE C runtime
+    sqlite3.c                ←   bundled SQLite amalgamation (runtime sibling)
+    nova_runtime_wasm.c      ←   the wasm C runtime
+  test_programs/             ← the toolchain: bootstrap + build/CI scripts + tests (co-located, cwd-relative)
+    gen3_test.exe            ←   the pinned bootstrap binary
+    output/                  ←   build-output dir (*.ll / *.exe artifacts — NOT canonical source)
+    *.ps1                    ←   build / CI / reconverge scripts (nova_ci, _proc_util, _build_gen4, …)
+    *_test.nova              ←   test programs
+    lib/  std/               ←   installed toolchain copies (synced, gitignored)
 ```
 
 ## How it's built (the pipeline)
@@ -50,14 +54,19 @@ into the toolchain, like `forge/` → `lib/`). Bare `import forge` still resolve
 `/`; the default alias is the last segment.
 
 ## The honest reality about `nova-compiler/test_programs/`
-The compiler + runtime + build scripts + tests currently live inside a directory named `test_programs/` — a
-scratch dir. A textbook layout would be `compiler/ runtime/ tools/ tests/`. **We are deliberately NOT
-relocating them right now**, because: `gen3_test.exe`, `output/nova_runtime.c`, and `nova_compiler.nova` are
-hardcoded across the core build chain, the bootstrap, and the compiler's own path logic — moving them risks
-breaking self-hosting for a purely *internal* gain (users of NOVA never see this directory; they see `std/`
-and `forge/`, which ARE properly organized). If we ever do it, it's a dedicated, carefully-staged,
-reconverge-gated project — not interleaved with feature work. This is a conscious risk/reward call, recorded
-here so it's a decision, not drift.
+The two canonical source files you actually edit — `nova_compiler.nova` and `nova_runtime.c` — **now live
+together in `nova-compiler/compiler/`** (with the runtime's siblings `sqlite3.c` + `nova_runtime_wasm.c`),
+**out of the `test_programs/` scratch dir entirely**, so they're trivially findable instead of buried among
+~1300 scripts and ~1400 build artifacts. This move was **reconverge-gated** (`gen5.ll == gen6.ll` byte-identical
+after the move proved self-hosting survived) + full `nova_ci` green. `compiler/` sits next to `test_programs/`
+because the compiler's runtime discovery is anchored at `NOVA_HOME` (= `nova-compiler/`), so
+`NOVA_HOME/compiler/nova_runtime.c` resolves with no path hacks.
+
+`gen3_test.exe`, the build/CI scripts, and the `*_test.nova` corpus **stay** in `test_programs/` on purpose:
+the whole toolchain assumes they're co-located and cwd-relative (the scripts `cd` into their own dir and use
+relative paths), so the build scripts reference the source at `..\compiler\`. A fuller professional layout
+(`compiler/ runtime/ tools/ tests/` at repo root, retiring the historical Java `nova-compiler/`) remains a
+possible future project — a dedicated, reconverge-gated effort, not interleaved with feature work.
 
 ## Quick "where do I put X?"
 - A new **stdlib** capability → `std/<category>/<name>.nova` + a `_<name>_test.nova` (KAT) + orphan manifest.

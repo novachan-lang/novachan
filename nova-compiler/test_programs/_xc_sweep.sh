@@ -6,7 +6,7 @@
 base="$1"
 mkdir -p /tmp/novaxc
 cd /tmp/novaxc || exit 1
-cp "$base/output/nova_runtime.c" .
+cp "$base/../compiler/nova_runtime.c" .
 echo "building nova_runtime.o (linux gcc, once)..."
 if ! gcc -O2 -c nova_runtime.c -o nrt.o 2>/tmp/nrt_cc.err; then
   echo NRT_BUILD_FAIL

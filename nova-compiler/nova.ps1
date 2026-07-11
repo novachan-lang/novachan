@@ -23,8 +23,8 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # ─── Configuration ────────────────────────────────────────────────────
 $CompilerExe  = Join-Path $ScriptDir "test_programs\gen3_test.exe"
 $CompilerJar  = Join-Path $ScriptDir "build\libs\nova-compiler-0.1.0-all.jar"
-$RuntimeSrc   = Join-Path $ScriptDir "test_programs\output\nova_runtime.c"
-$SqliteSrc    = Join-Path $ScriptDir "test_programs\output\sqlite3.c"
+$RuntimeSrc   = Join-Path $ScriptDir "compiler\nova_runtime.c"
+$SqliteSrc    = Join-Path $ScriptDir "compiler\sqlite3.c"
 $CacheDir     = Join-Path $ScriptDir ".nova_cache"
 $ClangPath    = "clang"
 $DefaultFlags = "-O2 -D_CRT_SECURE_NO_WARNINGS -w"

@@ -7,7 +7,7 @@
 #      published nova_compiler.ll is always a COMPLETE file — never a 0-byte/partial race.
 #   3. Invoke-Timed guarantees the compiler is dead (not just abandoned) on timeout.
 #   4. We link the runtime .c (not the possibly-stale prebuilt .o) so gen4.exe always
-#      reflects the current output/nova_runtime.c.
+#      reflects the current ../compiler/nova_runtime.c.
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
 
@@ -17,7 +17,7 @@ $tmp = "nova_compiler.$PID.ll"
 Remove-Item $tmp -Force -ErrorAction SilentlyContinue
 
 Write-Host "Compiling nova_compiler.nova -> $tmp (gen3_test.exe)..."
-$r = Invoke-Timed -FilePath '.\gen3_test.exe' -Arguments "compile -o $tmp nova_compiler.nova" -TimeoutMs 600000 -WorkingDirectory $PSScriptRoot
+$r = Invoke-Timed -FilePath '.\gen3_test.exe' -Arguments "compile -o $tmp ..\compiler\nova_compiler.nova" -TimeoutMs 600000 -WorkingDirectory $PSScriptRoot
 if ($r.TimedOut) { Write-Host "COMPILE TIMEOUT (process killed)"; Remove-Item $tmp -Force -ErrorAction SilentlyContinue; exit 1 }
 if ($r.ExitCode -ne 0) {
     Write-Host "COMPILE FAIL exit=$($r.ExitCode)"
@@ -34,8 +34,8 @@ if (!(Test-Path $tmp) -or (Get-Item $tmp).Length -lt 1000000) {
 Move-Item -Force $tmp nova_compiler.ll
 Write-Host "nova_compiler.ll built ($((Get-Item nova_compiler.ll).Length) bytes)"
 
-Write-Host "Linking gen4.exe (against the current output/nova_runtime.c)..."
-$link = "-O2 -o gen4.exe nova_compiler.ll output\nova_runtime.c -lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w"
+Write-Host "Linking gen4.exe (against the current ../compiler/nova_runtime.c)..."
+$link = "-O2 -o gen4.exe nova_compiler.ll ..\compiler\nova_runtime.c -lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w"
 $cr = Invoke-Timed -FilePath $ClangPath -Arguments $link -TimeoutMs 300000 -WorkingDirectory $PSScriptRoot
 if ($cr.TimedOut) { Write-Host "LINK TIMEOUT (process killed)"; exit 1 }
 if ($cr.ExitCode -ne 0) {
