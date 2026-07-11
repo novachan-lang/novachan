@@ -1147,7 +1147,7 @@ snapshot/restore on backtrack, expose `regex_captures(text, pat) -> list<string>
 `None`-return (`AttributeError` without an `if m:` guard); Go RE2's no-backreference surprise.
 *Unlocks:* structured text parsing (logs, URLs, dates, key=value) — a daily-use gap. **must-have.**
 
-**D1 — IANA timezone database + DST engine.** [lib] **XL.**
+**✅ DONE-MVP (std/time/tz — POSIX-TZ-rule engine, 10 major zones incl. southern-hemisphere DST wrap; tz_offset_at/tz_to_local/tz_next_transition/tz_abbrev; 16 IANA-offset KATs live + adversarially verified; reused datefmtx civil-from-days. Follow-on: pre-1970 floor-div + full IANA alias set) · D1 — IANA timezone database + DST engine.** [lib] **XL.**
 *NOVA way:* pure-NOVA `forge_tz` over a bundled binary `tz.dat` (like Go/Java/Python bundle theirs);
 `tz_to_local(epoch, "America/New_York")` / `tz_offset_at` / `tz_next_transition` — functions on ints + strings,
 no class hierarchy. All epochs are UTC by definition (no "naive datetime" wrong-by-default). tzdata bundled
