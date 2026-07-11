@@ -1157,7 +1157,7 @@ wrong; Go's filesystem-zoneinfo Docker failure.
 *Unlocks:* correct cross-timezone scheduling, recurring events, historical timestamps — the calendar/booking/
 finance blocker. **must-have.**
 
-**D2 — BigDecimal / arbitrary-precision decimal.** [lib] **L** (needs signed bignum D4).
+**✅ DONE (std/numeric/decimal, high-level + adversarially-verified: 0.1+0.2==0.3, banker's rounding, 1/3@5) · D2 — BigDecimal / arbitrary-precision decimal.** [lib] **L** (needs signed bignum D4).
 *NOVA way:* `Decimal{digits, scale, sign}` over `forge_bignum`; `dec("123.45")`, `dec_round(t, 2,
 "half_even")`, and — the key — operator overloading so `price + tax * rate` reads naturally. HM infers
 `Decimal + Decimal → Decimal`. Precision is per-operation (no global mutable context).

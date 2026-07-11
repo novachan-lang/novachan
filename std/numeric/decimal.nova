@@ -1,0 +1,326 @@
+// ============================================================================
+// std/numeric/decimal.nova -- arbitrary-precision SIGNED decimal (BigDecimal)
+// ============================================================================
+//
+// WHAT
+//   Exact base-10 arithmetic with a decimal point. A Decimal is
+//       value = unscaled * 10^(-scale)
+//   where `unscaled` is a SIGNED decimal-integer STRING and `scale` is the
+//   number of digits after the point. So dec("123.45") is {unscaled:"12345",
+//   scale:2} and dec("-0.001") is {unscaled:"-1", scale:3}. This is the classic
+//   "exact money math" the way BigDecimal, SQL NUMERIC, and Python's decimal do
+//   it -- 0.1 + 0.2 is EXACTLY 0.3, never 0.30000000000000004.
+//
+// THE NOVA WAY
+//   This module owns ZERO digit loops. Every integer operation is delegated to
+//   std/numeric/bignum's arbitrary-precision signed integers (Signum). A decimal
+//   op is: (1) align the two scales by multiplying one unscaled magnitude by a
+//   power of ten (append zeros -- itself a bignum multiply), then (2) a SINGLE
+//   bignum op on the aligned unscaled integers. Sign / rounding-mode / value-shape
+//   dispatch is expressed with `match` and small composed helpers (align_scales,
+//   _strip / normalize, _split_parse) -- never a tangle of nested ifs, never a
+//   raw char_at/ord digit loop.
+//
+// THE DRAWBACK AVOIDED
+//   * Java's BigDecimal is a 50-method mutable-LOOKING API with two traps:
+//       - `new BigDecimal(0.1)` silently captures the binary float error
+//         (0.1000000000000000055511151231257827021181583404541015625);
+//       - `equals` compares SCALE too, so "1.0".equals("1.00") is FALSE while
+//         compareTo says equal. NOVA parses from TEXT only (no float door), and
+//         dec_cmp is a pure VALUE compare: dec_cmp("1.10","1.1") == 0.
+//   * Python's decimal hangs precision/rounding off a GLOBAL getcontext() -- a
+//       piece of shared mutable state that makes results depend on ambient
+//       configuration. NOVA takes scale + mode as EXPLICIT arguments to dec_div
+//       and dec_round; there is no hidden context, so a call is reproducible in
+//       isolation.
+//
+// PUBLIC API
+//   dec(s) dec_from_int(i) dec_str(d)
+//   dec_add dec_sub dec_mul  dec_div(a,b,scale,mode)  dec_round(d,scale,mode)
+//   dec_cmp dec_neg dec_abs dec_is_zero
+// ROUNDING MODES (string): "half_even"(banker's, default demo) "half_up"
+//   "half_down" "up" "down" "floor" "ceil".
+// ============================================================================
+
+import std/numeric/bignum
+
+// ---- Decimal value ---------------------------------------------------------
+// unscaled: SIGNED decimal-integer string ("12345", "-7", "0")
+// scale:    digits after the point (>= 0);  value = unscaled * 10^(-scale)
+type Decimal
+    unscaled: string
+    scale: int
+
+// ---- bridges to bignum (Signum <-> signed string) --------------------------
+fn _sn(s: string) -> dict
+    return sn_from_str(s)                       // signed string -> Signum
+
+fn _s(x: dict) -> string
+    return sn_to_str(x)                         // Signum -> signed string
+
+// 10^k as a Signum. k >= 0.  Built by appending zeros to "1" (a string op on a
+// LITERAL, not a digit loop over data) -- the magnitude never needs bignum here.
+fn _pow10(k: int) -> dict
+    let s = "1"
+    let i = 0
+    while i < k
+        s = s + "0"
+        i = i + 1
+    return sn_from_str(s)
+
+// ---- construction ----------------------------------------------------------
+// _make normalizes only the SIGN of the unscaled string via bignum, so we never
+// carry a stray "+", a "-0", or leading zeros into the struct.
+fn _make(unscaled_signed: string, scale: int) -> Decimal
+    return Decimal(sn_to_str(sn_from_str(unscaled_signed)), scale)
+
+fn dec_from_int(i: int) -> Decimal
+    return _make(str(i), 0)
+
+// Parse "123.45" / "-0.001" / "42" / "+7" / ".5" / "5." -- reject junk clearly.
+// We split on the point into (sign, int-part, frac-part); the unscaled string is
+// sign + intpart + fracpart and the scale is len(fracpart). All validation is on
+// characters (a shape check), NOT arithmetic -- bignum still owns every digit's
+// numeric meaning.
+fn dec(text: string) -> Decimal
+    let s = text
+    let n = len(s)
+    if n == 0
+        print("dec: empty string")
+        exit(1)
+    // sign
+    let sign = ""
+    let i = 0
+    let c0 = char_at(s, 0)
+    if c0 == "+"
+        i = 1
+    if c0 == "-"
+        sign = "-"
+        i = 1
+    // scan digits / at most one '.'
+    let intpart = ""
+    let fracpart = ""
+    let seen_dot = false
+    let seen_digit = false
+    while i < n
+        let c = char_at(s, i)
+        if c == "."
+            if seen_dot
+                print("dec: two decimal points in '" + text + "'")
+                exit(1)
+            seen_dot = true
+        else
+            if c >= "0" and c <= "9"
+                seen_digit = true
+                if seen_dot
+                    fracpart = fracpart + c
+                else
+                    intpart = intpart + c
+            else
+                print("dec: invalid character '" + c + "' in '" + text + "'")
+                exit(1)
+        i = i + 1
+    if seen_digit == false
+        print("dec: no digits in '" + text + "'")
+        exit(1)
+    // unscaled magnitude = intpart ++ fracpart ; scale = len(fracpart)
+    let mag = intpart + fracpart
+    if len(mag) == 0
+        mag = "0"
+    return _make(sign + mag, len(fracpart))
+
+// ---- normalization: strip trailing fractional zeros for canonical text -----
+// Value-preserving: dropping a trailing fractional zero divides unscaled by 10
+// and scale by 1 simultaneously. Uses bignum divmod (sn_div/sn_mod) -- no digit
+// poking. Stops when scale hits 0 or the last digit is non-zero.
+fn _strip(d: Decimal) -> Decimal
+    let u = _sn(d.unscaled)
+    let sc = d.scale
+    let ten = sn_from_str("10")
+    let done = false
+    while sc > 0 and done == false
+        if sn_is_zero(sn_mod(u, ten))
+            u = sn_div(u, ten)
+            sc = sc - 1
+        else
+            done = true
+    return _make(_s(u), sc)
+
+// ---- canonical text --------------------------------------------------------
+// Place the point using string slicing on the STRIPPED magnitude. Slicing to
+// position the '.' is not digit arithmetic -- it's presentation over a string
+// bignum already produced -- so this stays within the "bignum owns digits" rule.
+fn dec_str(d0: Decimal) -> string
+    let d = _strip(d0)
+    let x = _sn(d.unscaled)
+    if sn_is_zero(x)
+        return "0"
+    let neg = ""
+    if sn_cmp(x, sn_from_str("0")) < 0
+        neg = "-"
+    let mag = sn_to_str(sn_abs(x))               // unsigned magnitude string
+    let sc = d.scale
+    if sc == 0
+        return neg + mag
+    // left-pad magnitude with zeros so it has at least sc+1 digits (one before .)
+    while len(mag) <= sc
+        mag = "0" + mag
+    let cut = len(mag) - sc
+    let ip = slice(mag, 0, cut)
+    let fp = slice(mag, cut, len(mag))
+    return neg + ip + "." + fp
+
+// ---- scale alignment -------------------------------------------------------
+// Return [ua, ub, scale] : both unscaled Signums lifted to the common (max)
+// scale by multiplying the lower-scale operand by 10^(diff). Delegates the
+// multiply to bignum. This is THE core move every add/sub/cmp shares.
+fn _align(a: Decimal, b: Decimal) -> list
+    let ua = _sn(a.unscaled)
+    let ub = _sn(b.unscaled)
+    let sc = a.scale
+    if a.scale < b.scale
+        ua = sn_mul(ua, _pow10(b.scale - a.scale))
+        sc = b.scale
+    else
+        if b.scale < a.scale
+            ub = sn_mul(ub, _pow10(a.scale - b.scale))
+            sc = a.scale
+    let out = []
+    push(out, ua)
+    push(out, ub)
+    push(out, sc)
+    return out
+
+// ---- add / sub / mul -------------------------------------------------------
+fn dec_add(a: Decimal, b: Decimal) -> Decimal
+    let al = _align(a, b)
+    return _make(_s(sn_add(al[0], al[1])), al[2])
+
+fn dec_sub(a: Decimal, b: Decimal) -> Decimal
+    let al = _align(a, b)
+    return _make(_s(sn_sub(al[0], al[1])), al[2])
+
+// mul: multiply unscaled integers, ADD scales. No alignment needed.
+fn dec_mul(a: Decimal, b: Decimal) -> Decimal
+    let p = sn_mul(_sn(a.unscaled), _sn(b.unscaled))
+    return _make(_s(p), a.scale + b.scale)
+
+// ---- compare / sign helpers ------------------------------------------------
+fn dec_cmp(a: Decimal, b: Decimal) -> int
+    let al = _align(a, b)
+    return sn_cmp(al[0], al[1])
+
+fn dec_neg(d: Decimal) -> Decimal
+    return _make(_s(sn_neg(_sn(d.unscaled))), d.scale)
+
+fn dec_abs(d: Decimal) -> Decimal
+    return _make(_s(sn_abs(_sn(d.unscaled))), d.scale)
+
+fn dec_is_zero(d: Decimal) -> bool
+    return sn_is_zero(_sn(d.unscaled))
+
+// ---- rounding core ---------------------------------------------------------
+// Round the value (q with a dropped remainder r out of divisor `div`) to an
+// integer quotient, applying `mode`. Inputs, all Signums:
+//   q       = truncated-toward-zero quotient
+//   r       = |remainder|            (>= 0, unsigned magnitude Signum)
+//   div     = |divisor|              (> 0)
+//   neg     = true if the exact value is negative
+// Returns the possibly-incremented (in magnitude) quotient Signum.
+// Decision = match on mode, using cmp of 2*r vs div for the "half" family. This
+// keeps the whole policy a single readable dispatch, not nested sign*mode ifs.
+fn _apply_round(q: dict, r: dict, div: dict, neg: bool, mode: string) -> dict
+    if sn_is_zero(r)
+        return q                                 // exact -- nothing to decide
+    // c = cmp(2*|r|, |div|):  -1 below half, 0 exactly half, 1 above half
+    let two_r = sn_mul(r, sn_from_str("2"))
+    let c = sn_cmp(two_r, div)
+    let bump = false
+    match mode
+        "down" =>
+            bump = false                         // toward zero: truncate
+        "up" =>
+            bump = true                          // away from zero: always up
+        "floor" =>
+            bump = neg                           // toward -inf
+        "ceil" =>
+            bump = (neg == false)                // toward +inf
+        "half_up" =>
+            bump = (c >= 0)                       // >= .5 rounds away
+        "half_down" =>
+            bump = (c > 0)                        // > .5 rounds away
+        "half_even" =>
+            if c > 0
+                bump = true
+            else
+                if c < 0
+                    bump = false
+                else
+                    bump = _is_odd(q)             // tie -> make quotient even
+        _ =>
+            print("round: unknown mode '" + mode + "'")
+            exit(1)
+    if bump
+        // increase MAGNITUDE by 1, preserving sign of the true value
+        let one = sn_from_str("1")
+        if neg
+            return sn_sub(q, one)                 // q is <= 0 -> more negative
+        return sn_add(q, one)
+    return q
+
+fn _is_odd(x: dict) -> bool
+    return sn_is_zero(sn_mod(x, sn_from_str("2"))) == false
+
+// ---- dec_round -------------------------------------------------------------
+// Round d to `scale` fractional digits with `mode`. Strategy: express d as an
+// integer over 10^(cur-scale) when cur > scale, divmod by that power (bignum),
+// round the quotient, land at the target scale. If cur <= scale, just pad.
+fn dec_round(d: Decimal, scale: int, mode: string) -> Decimal
+    if d.scale <= scale
+        // already at or finer-than needed only when equal; if coarser, pad zeros
+        let u = _sn(d.unscaled)
+        let padded = sn_mul(u, _pow10(scale - d.scale))
+        return _make(_s(padded), scale)
+    let u = _sn(d.unscaled)
+    let neg = sn_cmp(u, sn_from_str("0")) < 0
+    let div = _pow10(d.scale - scale)            // > 1
+    let q = sn_div(u, div)                       // trunc toward zero
+    let r = sn_abs(sn_mod(u, div))               // |remainder|
+    let rq = _apply_round(q, r, div, neg, mode)
+    return _make(_s(rq), scale)
+
+// ---- dec_div ---------------------------------------------------------------
+// Divide a/b to `scale` fractional digits with rounding `mode`. Compute one
+// extra digit's worth of precision by scaling the dividend, do a single bignum
+// divmod, then round using the remainder. value(a)/value(b) at target scale:
+//   want unscaled U with U*10^-scale ~= (ua*10^-sa)/(ub*10^-sb)
+//   => U ~= ua * 10^(scale - sa + sb) / ub
+// Let P = scale - sa + sb. Scale the dividend by 10^P (or shrink divisor if P<0),
+// divmod, round on the remainder vs the divisor.
+fn dec_div(a: Decimal, b: Decimal, scale: int, mode: string) -> Decimal
+    let ub = _sn(b.unscaled)
+    if sn_is_zero(ub)
+        print("dec_div: division by zero")
+        exit(1)
+    let ua = _sn(a.unscaled)
+    let p = scale - a.scale + b.scale
+    let num = ua
+    let den = ub
+    if p >= 0
+        num = sn_mul(ua, _pow10(p))
+    else
+        den = sn_mul(ub, _pow10(0 - p))
+    // sign of the true quotient
+    let neg = (sn_cmp(num, sn_from_str("0")) < 0) != (sn_cmp(den, sn_from_str("0")) < 0)
+    if sn_is_zero(num)
+        neg = false
+    let absnum = sn_abs(num)
+    let absden = sn_abs(den)
+    let qmag = sn_div(absnum, absden)            // unsigned quotient magnitude
+    let rmag = sn_mod(absnum, absden)            // unsigned remainder
+    // signed quotient at target scale
+    let q = qmag
+    if neg
+        q = sn_neg(qmag)
+    let rq = _apply_round(q, rmag, absden, neg, mode)
+    return _make(_s(rq), scale)
