@@ -58,6 +58,11 @@ Test-ShouldReject "trait_unknown_test.nova"       "unknown trait"
 Test-ShouldReject "ffi_unsafe_required_test.nova" "requires an enclosing 'unsafe'"
 Test-ShouldReject "multi_error_test.nova"         "expected"
 
+# Batch-1 Wave-A soundness negatives (LOCK-3 trait signature conformance + enum payload typing).
+Test-ShouldReject "_trait_sig_bad_ret_test.nova"   "incompatible method signature"
+Test-ShouldReject "_trait_sig_bad_param_test.nova" "incompatible method signature"
+Test-ShouldReject "_enum_payload_bad_test.nova"    "type mismatch"
+
 Write-Host ""
 Write-Host "Result: $pass passed, $fail failed"
 if ($fail -gt 0) { exit 1 } else { exit 0 }

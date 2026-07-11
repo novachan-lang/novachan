@@ -59,7 +59,13 @@
 *(rows added as modules are assigned/landed)*
 
 ## Batch log (what we did per task; full-arc runs after ~10 tasks)
-### Batch 1 (Phase-0 foundation) — full-arc pending
+### Batch 1 (Phase-0 foundation) — ✅ FULL-ARC CERTIFIED (2026-07-11)
+**Arc result:** `nova_ci.ps1` ALL GREEN — reconverge **gen5 == gen6 byte-identical** (gen5 installed as
+gen3_test.exe/nova.exe), all feature gates PASS, negative gate PASS (incl. the 3 new Wave-A negatives),
+**regression 1154 PASS / 0 FAIL / 2 SKIP in BOTH NORMAL and FULLRC modes**. The 4 new positive guards
+(_shift64_guard / _trait_sig_ok / _enum_payload_ok / _floatret_uninit) run green in both modes. The 3
+compiler changes (1<<64, trait-conformance, enum-payload) preserve the self-hosting fixpoint. Wave A
+soundness = DONE. Next: task 5 (float-payload codegen, empirical) then the breadth phase.
 1. **0.11 float-return-uninit → GUARDED.** Investigated: does NOT reproduce on the current post-0.8 compiler
    (correct at -O0 and -O2). Root: the garbage-uninit path is closed — every local slot (incl. all float
    locals) gets `store i64 0` zero-init at fn entry, and complex float returns (`sqrt(variance(xs))`) lower
@@ -98,3 +104,20 @@
    float — happens for the single-field float variant (`Circle`) routed through an `any`-typed fn param; the
    2-field `Rect` and direct single-variant `F(x:float)` unbox fine. Identical on gen3 -> NOT my change;
    boxed-float-through-any-variant unbox class. High-value (enums with float data are common). Next task.
+
+   **FULL DIAGNOSIS (for the fix, do empirically after the arc):** The match-arm payload binder codegen at
+   nova_compiler.nova ~8531-8544 (`m_pt == "pat_ctor"` loop) emits `field_get m_fd ir_type_any() [subject]
+   m_fpv m_fi` and then sets the binder's codegen type via `ir_match_ok_payload_stype` — which returns a
+   type ONLY for built-in Ok/Some (7479). For a USER variant it returns "" -> `b.ir_locals[m_fpv] = 1`
+   (the any/default code). So the binder's static type is lost. Consumer = `ir_expr_struct_type` (8738-41):
+   for an ident it returns `b.ir_locals[ev]` when that is a struct name OR a builtin-type name
+   (`_is_builtin_type_name` @8702 = int/float/string/list/dict/bool). So the ENCODING to set is the
+   declared type STRING ("float"), not `1`. The variant's ordered field types are already available as
+   `b.ir_sdefs[m_pv]` = list of `Param(name, type, _)` (populated @18082). FIX TEMPLATE (mirror the struct
+   field-access path @8316-8333): for each payload position m_fi, read `b.ir_sdefs[m_pv][m_fi-1]` -> field
+   ann; set the `field_get` result type (float/int/str) like @8324-8329 AND set `b.ir_locals[m_fpv]` to that
+   ann string. CAVEAT/why empirically: `Circle`(1 field) corrupts but `Rect`(2 fields, same enum) works —
+   so the raw-vs-boxed representation of variant scalar payloads may differ by arity; setting ir_locals=
+   "float" on an already-correct (Rect) path could BREAK it. MUST build gen4 + test Circle AND Rect AND F
+   AND existing enum_test/enum_full_test, iterate. Also 3 match codegen sites exist (~8503, ~9406, ~9676) —
+   check which the repro hits. DEFERRED to a focused build-test loop right after the Wave-A arc.
