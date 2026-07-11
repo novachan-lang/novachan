@@ -1,0 +1,188 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/base45
+// ============================================================================
+// RFC 9285 Base45: a compact, QR-code-friendly binary-to-text encoding.
+// Base45 is the payload encoding used by EU Digital COVID Certificates and
+// other QR-carried structured data because QR "alphanumeric" mode encodes
+// exactly this 45-character set densely. This module is binary-safe: both
+// encode and decode use `bytes` for the raw-data side, making 0x00 an
+// ordinary byte that survives every round-trip intact.
+//
+// WHY THIS EXISTS (and why forge/forge_base45.nova is insufficient):
+//   forge_base45 takes a NOVA `list` (not `bytes`), has no decode, and
+//   passes encoded output through NOVA strings — which NUL-truncate on 0x00
+//   (reference_nova_string_nul_truncation). Binary payloads ROUTINELY contain
+//   0x00 bytes. This std module takes and returns `bytes` on the data side.
+//   The BASE45 TEXT side is a plain string (the 45-char alphabet has no 0x00).
+//
+// THE DRAWBACK AVOIDED:
+//   Python has no base45 in its stdlib (only third-party packages). Those
+//   packages typically require the caller to manage `bytes` vs `str` duality
+//   and provide no clear binary-safety contract. NOVA cleanly separates:
+//   raw payload = bytes, encoded text = string. No confusion possible.
+//
+// PUBLIC API:
+//   base45_encode(data: bytes) -> string
+//   base45_decode(s: string) -> bytes
+//
+// ALPHABET (RFC 9285, index 0..44):
+//   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+//   Positions: 0-9 = digits, 10-35 = uppercase letters, 36 = space,
+//              37=$, 38=%, 39=*, 40=+, 41=-, 42=., 43=/, 44=:
+//
+// ALGORITHM (RFC 9285 section 4):
+//   Encode — bytes taken in PAIRS:
+//     pair (b0, b1): n = b0*256 + b1; emit THREE chars
+//       alpha[n%45], alpha[(n/45)%45], alpha[n/45/45]
+//       (least-significant base-45 digit first in the encoded triplet)
+//     trailing single byte b: n = b; emit TWO chars
+//       alpha[n%45], alpha[n/45]
+//   Decode — inverse:
+//     3 chars (a, b, c): n = a + 45*b + 2025*c -> bytes (n>>8)&0xFF, n&0xFF
+//     2 chars (a, b):    n = a + 45*b           -> byte  n&0xFF
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   All right-shifts mask with & 0xFF when extracting a byte value to guard
+//   against sign-extension. In practice Base45 n values are at most 65535
+//   (well within i64 positive range), but masking is present for correctness.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _b45_ to avoid collisions with other
+//   std modules compiled into the same binary.
+
+// ── Alphabet ─────────────────────────────────────────────────────────────────
+
+// The RFC 9285 45-character Base45 alphabet, index 0..44.
+// Index 36 is a literal ASCII space character.
+// Order: digits 0-9, uppercase A-Z, then special chars: space $ % * + - . / :
+fn _b45_alpha() -> string
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+
+// Map one Base45 CHARACTER to its alphabet index (0..44).
+// Returns -1 for any character not in the Base45 alphabet.
+// Uses ord-range arithmetic (no table; NOVA has no multi-line list literals).
+// Charset by ASCII code:
+//   '0'..'9' -> 0..9   (ASCII 48..57)
+//   'A'..'Z' -> 10..35 (ASCII 65..90)
+//   ' '      -> 36     (ASCII 32)
+//   '$'      -> 37     (ASCII 36)
+//   '%'      -> 38     (ASCII 37)
+//   '*'      -> 39     (ASCII 42)
+//   '+'      -> 40     (ASCII 43)
+//   '-'      -> 41     (ASCII 45)
+//   '.'      -> 42     (ASCII 46)
+//   '/'      -> 43     (ASCII 47)
+//   ':'      -> 44     (ASCII 58)
+fn _b45_val(c) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 65 and b <= 90
+        return b - 65 + 10
+    if b == 32
+        return 36
+    if b == 36
+        return 37
+    if b == 37
+        return 38
+    if b == 42
+        return 39
+    if b == 43
+        return 40
+    if b == 45
+        return 41
+    if b == 46
+        return 42
+    if b == 47
+        return 43
+    if b == 58
+        return 44
+    -1
+
+// ── Encode ───────────────────────────────────────────────────────────────────
+
+// base45_encode: convert binary bytes to an RFC 9285 Base45 string.
+//
+// Each pair of input bytes (b0, b1) is packed into n = b0*256 + b1 and
+// emitted as three Base45 characters: the digits of n in base 45, LSB-first.
+// A trailing single byte is emitted as two characters.
+// The encoded string consists only of the 45 printable ASCII chars in the
+// RFC 9285 alphabet — no 0x00 byte ever appears, so the string side is safe.
+
+fn base45_encode(data) -> string
+    let alpha = _b45_alpha()
+    let out = ""
+    let nb = bytes_len(data)
+    let i = 0
+    while i + 1 < nb
+        let b0 = bytes_get(data, i) & 0xFF
+        let b1 = bytes_get(data, i + 1) & 0xFF
+        let x = b0 * 256 + b1
+        // Compute three base-45 digits LSB-first via integer division.
+        let q1 = x / 45
+        let c = x - q1 * 45
+        let e = q1 / 45
+        let d = q1 - e * 45
+        out = out + alpha[c] + alpha[d] + alpha[e]
+        i = i + 2
+    if i < nb
+        let bx = bytes_get(data, i) & 0xFF
+        let d2 = bx / 45
+        let c2 = bx - d2 * 45
+        out = out + alpha[c2] + alpha[d2]
+    out
+
+// ── Decode ───────────────────────────────────────────────────────────────────
+
+// base45_decode: convert an RFC 9285 Base45 string back to bytes.
+//
+// Strategy: first compact the input by mapping each character to its 0..44
+// index, skipping characters not in the alphabet (e.g. whitespace from QR
+// scanning), building a list of int digit values.  Then process that list in
+// chunks of 3 (two output bytes each) with an optional trailing pair (one byte).
+//
+//   3-value group (a, b, c): n = a + 45*b + 2025*c -> bytes (n>>8)&0xFF, n&0xFF
+//   2-value group (a, b):    n = a + 45*b           -> byte  n&0xFF
+//
+// The list-of-ints approach avoids repeated character lookups in the hot path
+// and uses integer arithmetic directly, which is the most reliable codegen
+// pattern in NOVA.
+
+fn base45_decode(s) -> any
+    // Phase 1: collect valid digit values from the input string.
+    let vals = []
+    let sn = len(s)
+    let si = 0
+    while si < sn
+        let v = _b45_val(s[si])
+        if v >= 0
+            push(vals, v)
+        si = si + 1
+    // Phase 2: process digit values in groups of 3 (or 2 for trailing group).
+    let out = bytes(0)
+    let vn = len(vals)
+    let vi = 0
+    while vi < vn
+        if vi + 2 < vn
+            // 3-value group -> 2 output bytes (big-endian reconstruction).
+            let va = vals[vi]
+            let vb = vals[vi + 1]
+            let vc = vals[vi + 2]
+            let nv = va + 45 * vb + 2025 * vc
+            out = bytes_append(out, (nv >> 8) & 0xFF)
+            out = bytes_append(out, nv & 0xFF)
+            vi = vi + 3
+        else if vi + 1 < vn
+            // 2-value group -> 1 output byte.
+            let va2 = vals[vi]
+            let vb2 = vals[vi + 1]
+            let nv2 = va2 + 45 * vb2
+            out = bytes_append(out, nv2 & 0xFF)
+            vi = vi + 2
+        else
+            // Lone value at end: RFC 9285 declares this malformed, but we
+            // handle it gracefully rather than crashing, consistent with the
+            // lenient QR-scanning context that Base45 is designed for.
+            out = bytes_append(out, vals[vi] & 0xFF)
+            vi = vi + 1
+    out

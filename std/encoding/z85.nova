@@ -1,0 +1,223 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/z85
+// ============================================================================
+// ZeroMQ Z85 encoding (RFC 32, base-85, binary-safe).
+//
+// THE BINARY-SAFETY PROPERTY:
+//   forge/ string-based codecs NUL-truncate on 0x00 bytes. This module uses
+//   `bytes` for the raw-data side — 0x00 is an ordinary byte, never lost.
+//   The encoded side is a plain ASCII string (the Z85 alphabet has no 0x00).
+//
+// THE DRAWBACK AVOIDED:
+//   Python's base64.b85encode pads silently; Z85 (per RFC 32/ZeroMQ) mandates
+//   that the input length be a multiple of 4 bytes. We enforce this strictly:
+//   if bytes_len(data) % 4 != 0, z85_encode returns "". No silent corruption.
+//
+// PUBLIC API:
+//   z85_encode(data: bytes) -> string   (len(data) must be multiple of 4; else "")
+//   z85_decode(s: string) -> bytes      (len(s) must be multiple of 5; else bytes(0))
+//
+// ALGORITHM (RFC 32 / ZeroMQ reference):
+//   Encode: each 4-byte group -> 32-bit BIG-ENDIAN unsigned value v; emit 5
+//     base-85 characters, most-significant first.
+//     Powers: 85^4=52200625, 85^3=614125, 85^2=7225, 85^1=85, 85^0=1.
+//     char_k = alphabet[(v / 85^(4-k)) % 85]  for k in 0..4.
+//   Decode: each 5-char group -> value v via Horner's method:
+//     v = ((((c0*85)+c1)*85+c2)*85+c3)*85+c4
+//     emit 4 big-endian bytes: v>>24, (v>>16)&0xFF, (v>>8)&0xFF, v&0xFF.
+//
+// KAT (RFC 32 / ZeroMQ ground truth):
+//   [0x86,0x4F,0xD2,0x6F,0xB5,0x59,0xF7,0x5B] == z85_decode("HelloWorld")
+//   z85_encode([0x86,...,0x5B]) == "HelloWorld"
+//   [0x00,0x00,0x00,0x00] round-trips through "00000" (binary safety + big-endian).
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   All shift results are masked explicitly (&0xFF, &0xFFFFFF, etc.) to avoid
+//   sign-extension artifacts on intermediate values that could be negative.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _z85_ to avoid collisions when multiple
+//   std modules are compiled into the same binary.
+
+// ── Alphabet ─────────────────────────────────────────────────────────────────
+// Z85 alphabet: 85 printable ASCII chars, ordered to give "HelloWorld" for the
+// RFC 32 reference vector. Indices 0..84.
+//
+// NOVA STRING INTERPOLATION HAZARD: a literal "{}" inside a string is treated
+// as an interpolation expression (NOVA_MODULE_AUTHORING_GOTCHAS). The chars
+// '{' (123) and '}' (125) are inserted via chr() to avoid this parse error.
+//
+// Alphabet split into segments around the brace pair:
+//   seg0: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()"
+//   seg1: "[]"
+//   brace_open: chr(123) -> '{'
+//   brace_close: chr(125) -> '}'
+//   seg2: "@%$#"
+// Final: seg0 + seg1 + brace_open + brace_close + seg2  (85 chars total)
+fn _z85_alpha() -> string
+    let seg0 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]"
+    let brace_open = chr(123)
+    let brace_close = chr(125)
+    seg0 + brace_open + brace_close + "@%$#"
+
+// ── Lookup: char -> index ─────────────────────────────────────────────────────
+// Map one Z85 character to its 0..84 index. Returns -1 for illegal characters.
+// Implemented as ord-range comparisons for speed (no string scan per call).
+fn _z85_char_index(c) -> int
+    let b = ord(c)
+    // '0'..'9' -> 0..9
+    if b >= 48 and b <= 57
+        return b - 48
+    // 'a'..'z' -> 10..35
+    if b >= 97 and b <= 122
+        return b - 97 + 10
+    // 'A'..'Z' -> 36..61
+    if b >= 65 and b <= 90
+        return b - 65 + 36
+    // '.' -> 62
+    if b == 46
+        return 62
+    // '-' -> 63
+    if b == 45
+        return 63
+    // ':' -> 64
+    if b == 58
+        return 64
+    // '+' -> 65
+    if b == 43
+        return 65
+    // '=' -> 66
+    if b == 61
+        return 66
+    // '^' -> 67
+    if b == 94
+        return 67
+    // '!' -> 68
+    if b == 33
+        return 68
+    // '/' -> 69
+    if b == 47
+        return 69
+    // '*' -> 70
+    if b == 42
+        return 70
+    // '?' -> 71
+    if b == 63
+        return 71
+    // '&' -> 72
+    if b == 38
+        return 72
+    // '<' -> 73
+    if b == 60
+        return 73
+    // '>' -> 74
+    if b == 62
+        return 74
+    // '(' -> 75
+    if b == 40
+        return 75
+    // ')' -> 76
+    if b == 41
+        return 76
+    // '[' -> 77
+    if b == 91
+        return 77
+    // ']' -> 78
+    if b == 93
+        return 78
+    // '{' -> 79
+    if b == 123
+        return 79
+    // '}' -> 80
+    if b == 125
+        return 80
+    // '@' -> 81
+    if b == 64
+        return 81
+    // '%' -> 82
+    if b == 37
+        return 82
+    // '$' -> 83
+    if b == 36
+        return 83
+    // '#' -> 84
+    if b == 35
+        return 84
+    // illegal
+    -1
+
+// ── z85_encode ───────────────────────────────────────────────────────────────
+// Encode binary data (bytes) to Z85 string.
+// Input length MUST be a multiple of 4. Returns "" if not.
+// Each 4-byte group becomes 5 ASCII characters.
+fn z85_encode(data) -> string
+    let nbytes = bytes_len(data)
+    // Z85 spec: input must be multiple of 4 bytes. No padding defined.
+    if nbytes - (nbytes / 4) * 4 != 0
+        return ""
+    let alpha = _z85_alpha()
+    let out = ""
+    let group = 0
+    let ngroups = nbytes / 4
+    while group < ngroups
+        let base = group * 4
+        // Load 4 bytes and compose a 32-bit big-endian value.
+        // Mask each byte to prevent sign-extension on the shift.
+        let b0 = bytes_get(data, base) & 0xFF
+        let b1 = bytes_get(data, base + 1) & 0xFF
+        let b2 = bytes_get(data, base + 2) & 0xFF
+        let b3 = bytes_get(data, base + 3) & 0xFF
+        let v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        // Mask to 32-bit unsigned: prevents negative-value issues from sign-ext.
+        let uv = v & 0xFFFFFFFF
+        // Extract 5 base-85 digits, most-significant first.
+        // Powers: 85^4=52200625, 85^3=614125, 85^2=7225, 85^1=85, 85^0=1.
+        let d4 = uv / 52200625
+        let r4 = uv - d4 * 52200625
+        let d3 = r4 / 614125
+        let r3 = r4 - d3 * 614125
+        let d2 = r3 / 7225
+        let r2 = r3 - d2 * 7225
+        let d1 = r2 / 85
+        let d0 = r2 - d1 * 85
+        out = out + alpha[d4] + alpha[d3] + alpha[d2] + alpha[d1] + alpha[d0]
+        group = group + 1
+    out
+
+// ── z85_decode ───────────────────────────────────────────────────────────────
+// Decode a Z85 string to bytes.
+// Input length MUST be a multiple of 5. Returns bytes(0) if not.
+// Each 5-character group becomes 4 bytes.
+fn z85_decode(s) -> any
+    let n = len(s)
+    // Z85 spec: encoded length must be multiple of 5.
+    if n - (n / 5) * 5 != 0
+        return bytes(0)
+    let out = bytes(0)
+    let group = 0
+    let ngroups = n / 5
+    while group < ngroups
+        let base = group * 5
+        // Map 5 characters to their 0..84 indices.
+        let i0 = _z85_char_index(s[base])
+        let i1 = _z85_char_index(s[base + 1])
+        let i2 = _z85_char_index(s[base + 2])
+        let i3 = _z85_char_index(s[base + 3])
+        let i4 = _z85_char_index(s[base + 4])
+        // Reconstruct 32-bit value via Horner's method:
+        //   v = ((((i0*85)+i1)*85+i2)*85+i3)*85+i4
+        let v0 = i0 * 85 + i1
+        let v1 = v0 * 85 + i2
+        let v2 = v1 * 85 + i3
+        let v = v2 * 85 + i4
+        // Emit 4 big-endian bytes. Mask each to avoid sign-extension.
+        let byte3 = (v >> 24) & 0xFF
+        let byte2 = (v >> 16) & 0xFF
+        let byte1 = (v >> 8) & 0xFF
+        let byte0 = v & 0xFF
+        out = bytes_append(out, byte3)
+        out = bytes_append(out, byte2)
+        out = bytes_append(out, byte1)
+        out = bytes_append(out, byte0)
+        group = group + 1
+    out
