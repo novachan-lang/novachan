@@ -50,6 +50,7 @@
 #include <dirent.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>  /* TCP_NODELAY for socket_option */
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/wait.h>     /* waitpid (nova_rt_proc_wait) */
@@ -11771,6 +11772,80 @@ int64_t nova_rt_udp_recv(int64_t sock_val) {
     return (int64_t)(uintptr_t)result;
 }
 
+/* ── S8/S7/S6 POSIX net last-mile ──────────────────────────────────────────── */
+
+/* Helper: heap-copy a C string as a NOVA raw list element (same discipline as list_dir). */
+static int64_t nova_rt__list_str(int64_t list, const char* s) {
+    size_t m = strlen(s);
+    char* p = (char*)nova_heap_alloc(m + 1, NOVA_MEM_RAW);
+    if (p) { memcpy(p, s, m + 1); nova_rt_list_append(list, (int64_t)(uintptr_t)p); }
+    return list;
+}
+
+/* udp_recv_from(fd) -> [data, host, port] (all strings; port is decimal). One call captures the peer address,
+   unlike udp_recv which drops it. Empty list on error/no-data (falsy). NOTE: data is NUL-terminated like
+   udp_recv — a binary-safe udp_recv_bytes (mirroring tcp_recv_bytes) is a documented follow-on. */
+int64_t nova_rt_udp_recv_from(int64_t sock_val) {
+    NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
+    char buf[65536];
+    struct sockaddr_in from;
+    memset(&from, 0, sizeof(from));
+    int fromlen = (int)sizeof(from);
+#ifdef _WIN32
+    int n = recvfrom(sock, buf, (int)sizeof(buf) - 1, 0, (struct sockaddr*)&from, &fromlen);
+#else
+    socklen_t slen = (socklen_t)fromlen;
+    int n = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr*)&from, &slen);
+#endif
+    int64_t list = nova_rt_list_create();
+    if (n < 0) { nova_set_error("udp_recv_from: recvfrom failed"); return list; }
+    buf[n] = 0;
+    char host[64]; host[0] = 0;
+    if (!inet_ntop(AF_INET, &from.sin_addr, host, sizeof(host))) host[0] = 0;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%u", (unsigned)ntohs(from.sin_port));
+    nova_rt__list_str(list, buf);
+    nova_rt__list_str(list, host);
+    nova_rt__list_str(list, portstr);
+    return list;
+}
+
+/* socket_option(fd, name, value) -> bool. String-keyed setsockopt so new options need no new API. `value` is
+   an int: 0/1 for flags, a size for buffer options. Unknown key or a failing call returns false (never UB). */
+int64_t nova_rt_socket_option(int64_t sock_val, int64_t name_val, int64_t value) {
+    NOVA_SOCKET sock = (NOVA_SOCKET)sock_val;
+    const char* name = nova_str_safe(name_val);
+    if (!name) { nova_set_error("socket_option: null name"); return 0; }
+    int level = SOL_SOCKET;
+    int opt = -1;
+    if (strcmp(name, "reuseaddr") == 0) opt = SO_REUSEADDR;
+    else if (strcmp(name, "reuseport") == 0) {
+#ifdef SO_REUSEPORT
+        opt = SO_REUSEPORT;                 /* Linux/BSD: true per-socket load balancing */
+#else
+        opt = SO_REUSEADDR;                 /* Windows has no SO_REUSEPORT; REUSEADDR is the closest analogue */
+#endif
+    }
+    else if (strcmp(name, "keepalive") == 0) opt = SO_KEEPALIVE;
+    else if (strcmp(name, "broadcast") == 0) opt = SO_BROADCAST;
+    else if (strcmp(name, "rcvbuf") == 0) opt = SO_RCVBUF;
+    else if (strcmp(name, "sndbuf") == 0) opt = SO_SNDBUF;
+    else if (strcmp(name, "nodelay") == 0) { level = IPPROTO_TCP; opt = TCP_NODELAY; }
+    else { nova_set_error("socket_option: unknown option name"); return 0; }
+    int optval = (int)value;
+#ifdef _WIN32
+    if (setsockopt(sock, level, opt, (const char*)&optval, sizeof(optval)) != 0) { nova_set_error("socket_option: setsockopt failed"); return 0; }
+#else
+    if (setsockopt(sock, level, opt, &optval, sizeof(optval)) != 0) { nova_set_error("socket_option: setsockopt failed"); return 0; }
+#endif
+    return 1;
+}
+
+/* S6 — Unix domain sockets: DEFERRED. unix_listen/unix_connect create AF_UNIX sockets fine, but the shared
+   tcp_accept green path parks on the netpoller, which does not support AF_UNIX fds on Windows (segfaults);
+   their real target is Linux (Docker/systemd/nginx sidecars) where AF_UNIX + epoll is native. S6 needs proper
+   netpoller integration + a Linux round-trip test, so it is a dedicated task — not shipped as a bolt-on here. */
+
 /* ── DNS / host identity ───────────────────────────────────────────────────── */
 
 /* dns_resolve(host): resolve a hostname to its first IPv4 dotted-quad address,
@@ -13531,6 +13606,44 @@ int64_t nova_rt_is_file(int64_t path_val) {
     if (stat(p, &st) != 0) return 0;
     return S_ISREG(st.st_mode) ? 1 : 0;
 #endif
+}
+
+/* ── S4/S5 last-mile builtins: make_dir + file_chmod. NOTE: is_dir/remove_dir/rename_path/list_dir already
+ * existed in this runtime + were registered in the compiler — do NOT re-add them. Platform-portable. ── */
+int64_t nova_rt_make_dir(int64_t path_val) {
+    const char* p = nova_str_safe(path_val);
+    if (!p) { nova_set_error("make_dir: null path"); return 0; }
+#ifdef _WIN32
+    if (!CreateDirectoryA(p, NULL)) {
+        if (GetLastError() == ERROR_ALREADY_EXISTS) return 1;
+        nova_set_error("make_dir: failed"); return 0;
+    }
+#else
+    if (mkdir(p, 0777) != 0) {
+        if (errno == EEXIST) return 1;
+        char e[512]; snprintf(e, sizeof(e), "make_dir '%s': %s", p, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
+}
+/* file_chmod: POSIX honors the full mode; Windows maps owner-write (0o200) to the read-only attribute
+ * (documented best-effort — Windows has no POSIX permission bits). */
+int64_t nova_rt_file_chmod(int64_t path_val, int64_t mode) {
+    const char* p = nova_str_safe(path_val);
+    if (!p) { nova_set_error("file_chmod: null path"); return 0; }
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(p);
+    if (a == INVALID_FILE_ATTRIBUTES) { nova_set_error("file_chmod: no such file"); return 0; }
+    if (mode & 0200) a &= ~FILE_ATTRIBUTE_READONLY; else a |= FILE_ATTRIBUTE_READONLY;
+    if (!SetFileAttributesA(p, a)) { nova_set_error("file_chmod: failed"); return 0; }
+#else
+    if (chmod(p, (mode_t)mode) != 0) {
+        char e[512]; snprintf(e, sizeof(e), "file_chmod '%s': %s", p, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
 }
 
 /* write_bytes(path, bytes): the binary-write complement of read_bytes. */

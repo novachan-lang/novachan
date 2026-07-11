@@ -1208,6 +1208,9 @@ keyword vs `j.u.c.locks` hierarchy).
 are awkward for. **high.**
 
 **S4/S5/S7/S8/S6 — POSIX last-mile.** [runtime/lib] **S–M each.**
+✅ **S4 glob DONE** (`std/os/glob.nova`, pure NOVA composing `list_dir`+`is_dir` — `*`/`?`/`**` verified at 3
+depths, no dupes; `**` always recursive). ✅ **S5 file_chmod + make_dir DONE** (runtime builtins, gen4-probed;
+Windows maps `0o200`→read-only attr). ⏳ Remaining: S7 socket options · S8 UDP peer · S6 unix sockets (net batch).
 Glob (`glob("src/**/*.nova")`, `**` always recursive — no Python `recursive=True` trap); file
 permissions + symlinks (`file_chmod(0o600)` for TLS keys, documented best-effort on Windows); socket options
 (`socket_option(fd, "reuseport", true)` — string-keyed, extensible without new API); UDP peer address
@@ -1515,7 +1518,7 @@ gap is open.**
 
 ### PHASE 1 — Stdlib correctness-edge (the cheapest high-trust breadth; the "never leave NOVA" papercuts).
 
-- **[stdlib]** D3 regex captures (M) · D8 seedable PRNG (S) · D11 extended math (S) · S4 glob (S) · S8 UDP
+- **[stdlib]** D3 regex captures (M) · ✅ D8 seedable PRNG (S) · ✅ D11 extended math (S) · ✅ S4 glob (S) · S8 UDP
   peer (S) · S7 socket options (S).
 - **[stdlib]** S1 signal handling (M) — the deploy/container blocker.
 - **[lib]** D4 signed bignum (M) → D2 BigDecimal (L) — the finance blocker.
