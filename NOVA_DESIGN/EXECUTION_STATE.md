@@ -24,7 +24,7 @@
 | 0.11 float-return-uninit | 0-A | A | ✅ GUARDED | (batch 1) |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | user-enum payload typing | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
-| **enum float-payload unbox** (codegen; DISCOVERED) | 0-A | A | 🔴 NEW — float enum payload extracts raw i64 bits (garbage) when field-count/route hits `any`; pre-existing (gen3 identical) | (task 5) |
+| **enum float-payload unbox** (codegen) | 0-A | A | ✅ FIXED + CERTIFIED (gen5==gen6, 1155/0 both modes) | (task 5) |
 | `==` NFC/NFD helper | 0-A | C | ❌ DROPPED — not a gap (byte-equality is correct; matches Python/Rust/Go — NFC-by-default would be *wrong*) | |
 | `1<<64` shift guard | 0-A | C | ✅ DONE (gen4-verified; reconverge at batch arc) | (batch 1) |
 | lexer: numeric separators | 0-A | C | ✅ ALREADY DONE (decimal/hex/binary all strip `_`; audit stale) | |
