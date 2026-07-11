@@ -1,0 +1,667 @@
+// std/crypto/argon2id -- Argon2id memory-hard password hash (RFC 9106). The OWASP-recommended password
+// KDF: memory-hard, so an attacker with GPUs/ASICs cannot parallelize the guessing cheaply the way they
+// can against SHA-256/bcrypt. Argon2id is the hybrid variant -- data-INDEPENDENT addressing for the first
+// half of the first pass (resists side-channel timing leaks of the password) and data-DEPENDENT addressing
+// afterward (resists time-memory tradeoff / GPU cracking). This is the default recommendation.
+//
+// WHAT: argon2id_raw() implements the full RFC 9106 machine over the first-class `bytes` type; a 1024-byte
+// Argon2 block is a real 1024-byte buffer (0x00 is DATA, never a terminator). argon2id_hash() is the
+// ergonomic wrapper; argon2id_encode()/argon2id_verify() are the PHC-string ($argon2id$...) round trip
+// used to STORE a hash and later CHECK a password.
+//
+// NOVA-WAY: pure NOVA, built on std/crypto/blake2b (import it). All of Argon2's mixing is 64-bit modular
+// arithmetic and NOVA ints are 64-bit two's-complement whose ADD WRAPS exactly like u64
+// (0xFFFFFFFFFFFFFFFF + 1 == 0), so the compression function G needs no bignum -- we mask with
+// & 0xFFFFFFFFFFFFFFFF after each add to get modular u64. Blocks live as lists of 128 u64 words for O(1)
+// random access in the hot loop, and cross the bytes boundary only at H0 / H' (the BLAKE2b calls).
+//
+// DRAWBACK-AVOIDED: every other ecosystem FFI-binds the native libargon2 C library to get Argon2 -- which
+// means a per-platform build, a native dependency, and an out-of-language attack surface to audit. NOVA's
+// is pure, so the SAME compiled artifact hashes identically on every OS/arch and there is no unsafe C
+// boundary. (Sentinel, the Forge auth layer, hashes with SHA-256 today -- which is NOT best practice; this
+// module is the drop-in memory-hard replacement.)
+//
+// GOTCHAS baked in: (1) NOVA strings NUL-terminate, so EVERY value here is `bytes` -- the KAT password is
+// 32 raw 0x01 bytes, built with a fill loop, never a char-string. (2) `>>` is arithmetic; we only ever
+// shift by 1..63 and mask, and Argon2's word ops are XOR/add/mul so sign-extension never leaks.
+// (3) The index-addressing multiply J1*J1 is a full 64x64->64 product; NOVA `*` wraps at 64 bits, but
+// Argon2 needs the HIGH 32 bits of (x * y) where x,y are 32-bit, so that product fits in 64 bits exactly
+// and we just take >> 32 -- no overflow. (4) LE32 fields in H0 are exactly 4 bytes each.
+//
+// KAT: RFC 9106 test vector (t=3, m=32, p=4, tag=32, pwd=32x0x01, salt=16x0x02, secret=8x0x03, ad=12x0x04)
+//      => tag 0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659.
+
+import std/crypto/blake2b
+
+// ---- little helpers ---------------------------------------------------------------------------------
+
+// Right-rotate a 64-bit word by n (n in 1..63). NOVA's >> is ARITHMETIC, so mask off the sign-extended
+// high bits before OR-ing the wrapped-around low bits back on.
+fn _a2_rotr64(x: int, n: int) -> int
+    let low = (x >> n) & ((1 << (64 - n)) - 1)
+    let high = (x << (64 - n)) & 0xFFFFFFFFFFFFFFFF
+    (low | high) & 0xFFFFFFFFFFFFFFFF
+
+// Append a 32-bit little-endian integer to a bytes buffer, returning the extended buffer.
+fn _put_le32(buf, v: int) -> list
+    let out = buf
+    out = bytes_append(out, v & 255)
+    out = bytes_append(out, (v >> 8) & 255)
+    out = bytes_append(out, (v >> 16) & 255)
+    out = bytes_append(out, (v >> 24) & 255)
+    out
+
+// Read one little-endian 64-bit word from bytes `b` at byte offset `off` (bytes past the end read as 0).
+fn _load64(b, off: int) -> int
+    let w = 0
+    let n = bytes_len(b)
+    let i = 0
+    while i < 8
+        let byte = 0
+        if (off + i) < n
+            byte = bytes_get(b, off + i)
+        w = w | ((byte & 255) << (i * 8))
+        i = i + 1
+    w & 0xFFFFFFFFFFFFFFFF
+
+// Store a 64-bit word as 8 little-endian bytes into buffer `b` starting at byte offset `off` (in place).
+fn _store64(b, off: int, v: int)
+    let j = 0
+    while j < 8
+        bytes_set(b, off + j, (v >> (j * 8)) & 255)
+        j = j + 1
+
+// ---- H0 : the initial 64-byte prehash (RFC 9106 section 3.2) ----------------------------------------
+
+// H0 = BLAKE2b-512( LE32(p) || LE32(tagLen) || LE32(m) || LE32(t) || LE32(0x13) || LE32(type)
+//                   || LE32(len(pwd))||pwd || LE32(len(salt))||salt
+//                   || LE32(len(secret))||secret || LE32(len(ad))||ad )
+// type = 2 for Argon2id. Returns 64 bytes.
+fn _h0(pwd, salt, secret, ad, t: int, m: int, p: int, tag_len: int, type_id: int) -> list
+    let buf = bytes(0)
+    buf = _put_le32(buf, p)
+    buf = _put_le32(buf, tag_len)
+    buf = _put_le32(buf, m)
+    buf = _put_le32(buf, t)
+    buf = _put_le32(buf, 0x13)
+    buf = _put_le32(buf, type_id)
+    buf = _put_le32(buf, bytes_len(pwd))
+    buf = bytes_concat(buf, pwd)
+    buf = _put_le32(buf, bytes_len(salt))
+    buf = bytes_concat(buf, salt)
+    buf = _put_le32(buf, bytes_len(secret))
+    buf = bytes_concat(buf, secret)
+    buf = _put_le32(buf, bytes_len(ad))
+    buf = bytes_concat(buf, ad)
+    blake2b(buf, 64)
+
+// ---- H' : the variable-length hash (RFC 9106 section 3.2) -------------------------------------------
+
+// H'(X, out_len): if out_len <= 64, BLAKE2b(LE32(out_len)||X, out_len).
+// Otherwise (out_len > 64) the RFC's 32-byte-chunk extension:
+//   r = ceil(out_len/32) - 2
+//   V1 = BLAKE2b(LE32(out_len)||X, 64);  V_{i+1} = BLAKE2b(V_i, 64)
+//   result = A1 || A2 || ... || Ar || V_{r+1}   where Ai = first 32 bytes of Vi,
+//   V_{r+1} = BLAKE2b(V_r, out_len - 32*r).
+// Returns exactly out_len bytes. Used to fill the two seed blocks and to extract the final tag.
+fn _hprime(x, out_len: int) -> list
+    let prefixed = bytes(0)
+    prefixed = _put_le32(prefixed, out_len)
+    prefixed = bytes_concat(prefixed, x)
+    if out_len <= 64
+        return blake2b(prefixed, out_len)
+    let out = bytes(0)
+    // V1 = BLAKE2b(LE32(out_len) || X, 64)
+    let v = blake2b(prefixed, 64)
+    // number of 32-byte prefixes to emit (V1..Vr), then the tail is BLAKE2b(Vr, out_len - 32*r).
+    let chunks = ((out_len + 31) / 32) - 2
+    let emitted = 0
+    let i = 0
+    while i < chunks
+        // emit first 32 bytes of the CURRENT V (V_{i+1})
+        let k = 0
+        while k < 32
+            out = bytes_append(out, bytes_get(v, k))
+            k = k + 1
+        emitted = emitted + 32
+        // advance to the next V ONLY between chunks -- after the final prefix `v` must stay = Vr,
+        // because the tail hashes Vr (NOT Vr+1). Over-advancing here is a classic blake2b_long bug.
+        if i < (chunks - 1)
+            v = blake2b(v, 64)
+        i = i + 1
+    // final chunk: BLAKE2b(Vr, out_len - 32*r) -- the remaining tail (33..64 bytes)
+    let tail_len = out_len - emitted
+    let last = blake2b(v, tail_len)
+    let j = 0
+    while j < tail_len
+        out = bytes_append(out, bytes_get(last, j))
+        j = j + 1
+    out
+
+// ---- The compression function G (RFC 9106 section 3.5) ----------------------------------------------
+// Blocks are lists of 128 u64 words (1024 bytes). G(X, Y) = with R = X XOR Y:
+//   Q = P applied to each of the 8 rows of R,
+//   Z = P applied to each of the 8 columns of Q,
+//   output = Z XOR R.
+// P is the Argon2 permutation over 16 words = 8 registers of 2 words, using the BLAKE2 round GB.
+
+// GB(v[a],v[b],v[c],v[d]) -- the Argon2 mixing function (RFC section 3.5). Differs from BLAKE2's G: the
+// two additions each add a truncated 64x64 product 2*floor(a/2^32)*floor(b/2^32) of the low 32 bits.
+fn _gb(v: list, a: int, b: int, c: int, d: int)
+    // a = a + b + 2 * lo32(a) * lo32(b)
+    let m1 = (2 * (v[a] & 0xFFFFFFFF) * (v[b] & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+    v[a] = (v[a] + v[b] + m1) & 0xFFFFFFFFFFFFFFFF
+    v[d] = _a2_rotr64((v[d] ^ v[a]) & 0xFFFFFFFFFFFFFFFF, 32)
+    let m2 = (2 * (v[c] & 0xFFFFFFFF) * (v[d] & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+    v[c] = (v[c] + v[d] + m2) & 0xFFFFFFFFFFFFFFFF
+    v[b] = _a2_rotr64((v[b] ^ v[c]) & 0xFFFFFFFFFFFFFFFF, 24)
+    let m3 = (2 * (v[a] & 0xFFFFFFFF) * (v[b] & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+    v[a] = (v[a] + v[b] + m3) & 0xFFFFFFFFFFFFFFFF
+    v[d] = _a2_rotr64((v[d] ^ v[a]) & 0xFFFFFFFFFFFFFFFF, 16)
+    let m4 = (2 * (v[c] & 0xFFFFFFFF) * (v[d] & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+    v[c] = (v[c] + v[d] + m4) & 0xFFFFFFFFFFFFFFFF
+    v[b] = _a2_rotr64((v[b] ^ v[c]) & 0xFFFFFFFFFFFFFFFF, 63)
+
+// P: the Argon2 round over 16 words held in `v` at the 16 offsets given (a permutation view). It runs the
+// BLAKE2 round's column step then diagonal step on those 16 words. `idx` is a list of 16 word positions.
+fn _p_round(v: list, idx: list)
+    // column step
+    _gb(v, idx[0], idx[4], idx[8], idx[12])
+    _gb(v, idx[1], idx[5], idx[9], idx[13])
+    _gb(v, idx[2], idx[6], idx[10], idx[14])
+    _gb(v, idx[3], idx[7], idx[11], idx[15])
+    // diagonal step
+    _gb(v, idx[0], idx[5], idx[10], idx[15])
+    _gb(v, idx[1], idx[6], idx[11], idx[12])
+    _gb(v, idx[2], idx[7], idx[8], idx[13])
+    _gb(v, idx[3], idx[4], idx[9], idx[14])
+
+// Build the 16 word offsets for row r (r in 0..7): consecutive words r*16 .. r*16+15.
+fn _row_idx(r: int) -> list
+    let idx = []
+    let k = 0
+    while k < 16
+        push(idx, r * 16 + k)
+        k = k + 1
+    idx
+
+// Build the 16 word offsets for column c (c in 0..7). Argon2 columns pair 2 words per register: for column
+// c the registers are at positions (2*c) and (2*c+1) of each of the 8 rows -> word offsets
+// row*16 + 2*c and row*16 + 2*c + 1, for row 0..7 (16 words total).
+fn _col_idx(c: int) -> list
+    let idx = []
+    let row = 0
+    while row < 8
+        push(idx, row * 16 + 2 * c)
+        push(idx, row * 16 + 2 * c + 1)
+        row = row + 1
+    idx
+
+// G(x, y) -> new 128-word block. x and y are 128-word lists. See section 3.5.
+fn _g_compress(x: list, y: list) -> list
+    // R = X XOR Y
+    let r = []
+    let i = 0
+    while i < 128
+        push(r, (x[i] ^ y[i]) & 0xFFFFFFFFFFFFFFFF)
+        i = i + 1
+    // Q = P over the rows of R (mutate a copy of R)
+    let q = []
+    i = 0
+    while i < 128
+        push(q, r[i])
+        i = i + 1
+    let row = 0
+    while row < 8
+        _p_round(q, _row_idx(row))
+        row = row + 1
+    // Z = P over the columns of Q (mutate q in place -- columns operate on the row-permuted state)
+    let col = 0
+    while col < 8
+        _p_round(q, _col_idx(col))
+        col = col + 1
+    // output = Z XOR R
+    let out = []
+    i = 0
+    while i < 128
+        push(out, (q[i] ^ r[i]) & 0xFFFFFFFFFFFFFFFF)
+        i = i + 1
+    out
+
+// XOR two 128-word blocks into a new block (used when G's result is XOR-merged in passes > 0).
+fn _xor_block(a: list, b: list) -> list
+    let out = []
+    let i = 0
+    while i < 128
+        push(out, (a[i] ^ b[i]) & 0xFFFFFFFFFFFFFFFF)
+        i = i + 1
+    out
+
+// Convert 1024 bytes -> a 128-word (little-endian) block list.
+fn _bytes_to_block(b) -> list
+    let out = []
+    let i = 0
+    while i < 128
+        push(out, _load64(b, i * 8))
+        i = i + 1
+    out
+
+// Convert a 128-word block list -> 1024 bytes (little-endian).
+fn _block_to_bytes(blk: list) -> list
+    let b = bytes(1024)
+    let i = 0
+    while i < 128
+        _store64(b, i * 8, blk[i])
+        i = i + 1
+    b
+
+// ---- Memory matrix helpers (flat list of p*q blocks, each a 128-word list) --------------------------
+
+// A block reference is a lane and a column; memory is stored as one list `mem` of (p*q) block lists,
+// indexed by (lane * q + col).
+
+// ---- reference-block indexing (RFC 9106 section 3.4) ------------------------------------------------
+
+// Given J1 (a pseudo-random 32-bit value), the current lane, the reference lane, the pass number, the
+// slice number, and the position within the segment, compute the absolute reference COLUMN in the
+// reference lane. This is the RFC's "reference index" mapping with the non-linear area size.
+//   For pass 0: the reference set is [start .. current) within the lane (or full built area of another lane).
+//   For pass > 0: it wraps to include the whole lane except the current segment.
+fn _ref_column(j1: int, same_lane: bool, pass: int, slice: int, q: int, seg_len: int, index: int) -> int
+    // reference_area_size
+    let ref_area = 0
+    if pass == 0
+        if slice == 0
+            // first slice, first pass: only blocks before current in this segment
+            ref_area = index - 1
+        else
+            if same_lane
+                ref_area = slice * seg_len + index - 1
+            else
+                // other lane: all finished slices; if index==0 subtract one to avoid the current block's row
+                ref_area = slice * seg_len
+                if index == 0
+                    ref_area = ref_area - 1
+    else
+        if same_lane
+            ref_area = q - seg_len + index - 1
+        else
+            ref_area = q - seg_len
+            if index == 0
+                ref_area = ref_area - 1
+    // relative position (RFC 9106 section 3.4.2). J1 is a 32-bit value, but J1*J1 is a full 32x32->64-bit
+    // product that CAN set bit 63 (e.g. J1 ~ 3.6e9 -> J1^2 ~ 1.3e19 > 2^63). NOVA's `>>` is ARITHMETIC, so
+    // a bare `(j1*j1) >> 32` would sign-extend and corrupt the high word. Mask each intermediate to 32 bits
+    // AFTER the shift to recover the correct LOGICAL high half. Same for ref_area*x.
+    let x = ((j1 * j1) >> 32) & 0xFFFFFFFF
+    let y = ((ref_area * x) >> 32) & 0xFFFFFFFF
+    let rel = ref_area - 1 - y
+    // start position of the reference window
+    let start_pos = 0
+    if pass != 0
+        if slice != (4 - 1)
+            start_pos = (slice + 1) * seg_len
+    let abs_col = (start_pos + rel) % q
+    abs_col
+
+// ---- data-independent address generation (Argon2i pseudo-random, RFC section 3.4.1.2) ---------------
+// For Argon2id pass 0 slices 0 and 1, addresses come from running G twice on a counter input block. Each
+// such "address block" yields 128 words; word w holds a (J1,J2) pair as its low/high 32 bits. This
+// function produces one address block for the given (pass, lane, slice, counter). ZERO block is a
+// 128-word list of zeros.
+fn _zero_block() -> list
+    let z = []
+    let i = 0
+    while i < 128
+        push(z, 0)
+        i = i + 1
+    z
+
+// Build the input block for the data-independent generator:
+// words: [ pass, lane, slice, total_blocks(m'), total_passes(t), type=2, counter, 0, 0, ... ].
+fn _addr_input(pass: int, lane: int, slice: int, m_prime: int, t: int, type_id: int, counter: int) -> list
+    let inp = _zero_block()
+    inp[0] = pass & 0xFFFFFFFFFFFFFFFF
+    inp[1] = lane & 0xFFFFFFFFFFFFFFFF
+    inp[2] = slice & 0xFFFFFFFFFFFFFFFF
+    inp[3] = m_prime & 0xFFFFFFFFFFFFFFFF
+    inp[4] = t & 0xFFFFFFFFFFFFFFFF
+    inp[5] = type_id & 0xFFFFFFFFFFFFFFFF
+    inp[6] = counter & 0xFFFFFFFFFFFFFFFF
+    inp
+
+// Generate the address block for a given counter: G( ZERO, G( ZERO, input ) ). (RFC: the input is run
+// through G twice.)
+fn _address_block(pass: int, lane: int, slice: int, m_prime: int, t: int, type_id: int, counter: int) -> list
+    let zero = _zero_block()
+    let inp = _addr_input(pass, lane, slice, m_prime, t, type_id, counter)
+    let tmp = _g_compress(zero, inp)
+    _g_compress(zero, tmp)
+
+// ---- segment fill (the core loop) -------------------------------------------------------------------
+
+// Fill one segment (lane, slice) of the memory. `mem` is the flat list of p*q block lists (indexed
+// lane*q+col). Argon2id uses data-INDEPENDENT addressing for pass 0 slices 0 & 1; data-DEPENDENT
+// otherwise.
+fn _fill_segment(mem: list, pass: int, lane: int, slice: int, p: int, q: int, seg_len: int, m_prime: int, t: int, type_id: int)
+    let data_independent = false
+    if pass == 0
+        if slice < 2
+            data_independent = true
+
+    // For data-independent mode we pull (J1,J2) pairs from address blocks generated on demand. Each
+    // address block supplies 128 pairs; we regenerate every 128 indices with an incremented counter.
+    let addr = _zero_block()
+    let addr_counter = 0
+    if data_independent
+        addr_counter = 1
+        addr = _address_block(pass, lane, slice, m_prime, t, type_id, addr_counter)
+
+    // starting index within the segment: skip the two seed blocks on pass 0 slice 0
+    let start_index = 0
+    if pass == 0
+        if slice == 0
+            start_index = 2
+
+    let index = start_index
+    while index < seg_len
+        // current absolute column in this lane
+        let cur_col = slice * seg_len + index
+
+        // previous block column (wraps within the lane at the lane boundary)
+        let prev_col = cur_col - 1
+        if cur_col == 0
+            prev_col = q - 1
+        let prev_block = mem[lane * q + prev_col]
+
+        // obtain J1, J2
+        let j1 = 0
+        let j2 = 0
+        if data_independent
+            // which pair within the current 128-pair address block
+            let pair_pos = index % 128
+            if pair_pos == 0
+                if index != start_index
+                    addr_counter = addr_counter + 1
+                    addr = _address_block(pass, lane, slice, m_prime, t, type_id, addr_counter)
+            let word = addr[pair_pos]
+            j1 = word & 0xFFFFFFFF
+            j2 = (word >> 32) & 0xFFFFFFFF
+        else
+            j1 = prev_block[0] & 0xFFFFFFFF
+            j2 = (prev_block[0] >> 32) & 0xFFFFFFFF
+
+        // reference lane
+        let ref_lane = j2 % p
+        if pass == 0
+            if slice == 0
+                ref_lane = lane
+        let same_lane = ref_lane == lane
+
+        // reference column
+        let ref_col = _ref_column(j1, same_lane, pass, slice, q, seg_len, index)
+        let ref_block = mem[ref_lane * q + ref_col]
+
+        // compress
+        let new_block = _g_compress(prev_block, ref_block)
+        if pass == 0
+            mem[lane * q + cur_col] = new_block
+        else
+            // subsequent passes XOR the new value into the existing block
+            let old_block = mem[lane * q + cur_col]
+            mem[lane * q + cur_col] = _xor_block(old_block, new_block)
+
+        index = index + 1
+
+// ---- the main driver --------------------------------------------------------------------------------
+
+// argon2id_raw -- the full RFC 9106 machine with explicit secret and associated-data (needed for the
+// official KAT). Returns the tag as `bytes` of length tag_len.
+//   pwd, salt, secret, ad : bytes (secret/ad may be empty)
+//   t : passes (>=1) ;  m : memory in KiB (>= 8*p) ;  p : parallelism/lanes (>=1) ;  tag_len : bytes (>=4)
+fn argon2id_raw(pwd, salt, secret, ad, t: int, m: int, p: int, tag_len: int) -> list
+    // ---- validation ----
+    if t < 1
+        print("argon2id: t (passes) must be >= 1 (got " + str(t) + ")")
+        exit(1)
+    if p < 1
+        print("argon2id: p (parallelism) must be >= 1 (got " + str(p) + ")")
+        exit(1)
+    if m < 8 * p
+        print("argon2id: m (KiB) must be >= 8*p (got " + str(m) + ", need >= " + str(8 * p) + ")")
+        exit(1)
+    if tag_len < 4
+        print("argon2id: tag_len must be >= 4 (got " + str(tag_len) + ")")
+        exit(1)
+
+    let type_id = 2
+
+    // ---- memory geometry ----
+    // m_prime = 4*p*floor(m/(4*p)) blocks; q = m_prime/p columns per lane; segment = q/4.
+    let m_prime = 4 * p * (m / (4 * p))
+    let q = m_prime / p
+    let seg_len = q / 4
+
+    // ---- H0 ----
+    let h0 = _h0(pwd, salt, secret, ad, t, m, p, tag_len, type_id)
+
+    // ---- allocate memory (p*q block lists) and seed the first two columns of each lane ----
+    let mem = []
+    let total = p * q
+    let z = 0
+    while z < total
+        push(mem, _zero_block())
+        z = z + 1
+
+    let lane = 0
+    while lane < p
+        // B[lane][0] = H'( H0 || LE32(0) || LE32(lane), 1024 )
+        let in0 = bytes_concat(h0, bytes(0))
+        in0 = _put_le32(in0, 0)
+        in0 = _put_le32(in0, lane)
+        let blk0 = _hprime(in0, 1024)
+        mem[lane * q + 0] = _bytes_to_block(blk0)
+        // B[lane][1] = H'( H0 || LE32(1) || LE32(lane), 1024 )
+        let in1 = bytes_concat(h0, bytes(0))
+        in1 = _put_le32(in1, 1)
+        in1 = _put_le32(in1, lane)
+        let blk1 = _hprime(in1, 1024)
+        mem[lane * q + 1] = _bytes_to_block(blk1)
+        lane = lane + 1
+
+    // ---- fill: t passes, 4 slices per pass, p lanes per slice ----
+    let pass = 0
+    while pass < t
+        let slice = 0
+        while slice < 4
+            let ln = 0
+            while ln < p
+                _fill_segment(mem, pass, ln, slice, p, q, seg_len, m_prime, t, type_id)
+                ln = ln + 1
+            slice = slice + 1
+        pass = pass + 1
+
+    // ---- final block C = XOR of last column across all lanes ----
+    let c = mem[0 * q + (q - 1)]
+    let l = 1
+    while l < p
+        c = _xor_block(c, mem[l * q + (q - 1)])
+        l = l + 1
+
+    // ---- tag = H'( C, tag_len ) ----
+    let c_bytes = _block_to_bytes(c)
+    _hprime(c_bytes, tag_len)
+
+// ---- convenience & PHC encoding ---------------------------------------------------------------------
+
+// argon2id_hash -- convenience wrapper with empty secret and associated data. Returns tag `bytes`.
+fn argon2id_hash(pwd_bytes, salt_bytes, t: int, m: int, p: int, out_len: int) -> list
+    argon2id_raw(pwd_bytes, salt_bytes, bytes(0), bytes(0), t, m, p, out_len)
+
+// ---- base64 (standard, no padding removed here -- PHC omits '=' padding) ----------------------------
+
+fn _b64_alphabet() -> string
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// Encode bytes as base64 WITHOUT '=' padding (PHC-string convention).
+fn _b64_encode(b) -> string
+    let alpha = _b64_alphabet()
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i + 3 <= n
+        let b0 = bytes_get(b, i)
+        let b1 = bytes_get(b, i + 1)
+        let b2 = bytes_get(b, i + 2)
+        let v = (b0 << 16) | (b1 << 8) | b2
+        out = out + char_at(alpha, (v >> 18) & 63)
+        out = out + char_at(alpha, (v >> 12) & 63)
+        out = out + char_at(alpha, (v >> 6) & 63)
+        out = out + char_at(alpha, v & 63)
+        i = i + 3
+    let rem = n - i
+    if rem == 1
+        let b0 = bytes_get(b, i)
+        let v = b0 << 16
+        out = out + char_at(alpha, (v >> 18) & 63)
+        out = out + char_at(alpha, (v >> 12) & 63)
+    if rem == 2
+        let b0 = bytes_get(b, i)
+        let b1 = bytes_get(b, i + 1)
+        let v = (b0 << 16) | (b1 << 8)
+        out = out + char_at(alpha, (v >> 18) & 63)
+        out = out + char_at(alpha, (v >> 12) & 63)
+        out = out + char_at(alpha, (v >> 6) & 63)
+    out
+
+// Find a character's value in the base64 alphabet (-1 if not present).
+fn _b64_value(ch: string) -> int
+    let alpha = _b64_alphabet()
+    let n = 64
+    let i = 0
+    while i < n
+        if char_at(alpha, i) == ch
+            return i
+        i = i + 1
+    0 - 1
+
+// Decode a base64 (no-padding) string into bytes.
+fn _b64_decode(s: string) -> list
+    let out = bytes(0)
+    let n = len(s)
+    let acc = 0
+    let bits = 0
+    let i = 0
+    while i < n
+        let ch = char_at(s, i)
+        let val = _b64_value(ch)
+        if val >= 0
+            acc = (acc << 6) | val
+            bits = bits + 6
+            if bits >= 8
+                bits = bits - 8
+                out = bytes_append(out, (acc >> bits) & 255)
+        i = i + 1
+    out
+
+// argon2id_encode -- produce the PHC string
+//   $argon2id$v=19$m=<m>,t=<t>,p=<p>$<b64 salt>$<b64 tag>
+fn argon2id_encode(salt, tag, t: int, m: int, p: int) -> string
+    let s = "$argon2id$v=19$m="
+    s = s + str(m) + ",t=" + str(t) + ",p=" + str(p)
+    s = s + "$" + _b64_encode(salt)
+    s = s + "$" + _b64_encode(tag)
+    s
+
+// ---- PHC parsing helpers ----------------------------------------------------------------------------
+
+// Split a string on a single-character delimiter, returning a list of string parts.
+fn _split(s: string, delim: string) -> list
+    let parts = []
+    let cur = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let ch = char_at(s, i)
+        if ch == delim
+            push(parts, cur)
+            cur = ""
+        else
+            cur = cur + ch
+        i = i + 1
+    push(parts, cur)
+    parts
+
+// Parse an integer prefixed with "<key>=" (e.g. "m=32" with key "m=" -> 32). Returns -1 on mismatch.
+fn _parse_kv_int(field: string, key: string) -> int
+    let klen = len(key)
+    if len(field) < klen
+        return 0 - 1
+    let prefix = ""
+    let i = 0
+    while i < klen
+        prefix = prefix + char_at(field, i)
+        i = i + 1
+    if prefix != key
+        return 0 - 1
+    // remaining chars are the number
+    let numstr = ""
+    let j = klen
+    let n = len(field)
+    while j < n
+        numstr = numstr + char_at(field, j)
+        j = j + 1
+    parse_int(numstr)
+
+// ---- constant-time compare --------------------------------------------------------------------------
+
+// XOR-accumulate compare of two byte buffers: returns true iff equal, in time depending only on the
+// LENGTHS (not the contents) once lengths match -- avoids leaking how many leading bytes matched.
+fn _bytes_eq_ct(a, b) -> bool
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return false
+    let diff = 0
+    let i = 0
+    while i < na
+        diff = diff | (bytes_get(a, i) ^ bytes_get(b, i))
+        i = i + 1
+    diff == 0
+
+// argon2id_verify -- parse a PHC $argon2id$ string, recompute the tag from `pwd_bytes`, and compare in
+// (near) constant time. Returns true iff the password matches and the string is a well-formed argon2id
+// PHC record. Any malformation (wrong scheme, bad version, missing fields) returns false.
+fn argon2id_verify(pwd_bytes, phc_string: string) -> bool
+    // Layout: "" / "argon2id" / "v=19" / "m=..,t=..,p=.." / b64salt / b64tag  (split on '$')
+    let parts = _split(phc_string, "$")
+    if len(parts) != 6
+        return false
+    if parts[1] != "argon2id"
+        return false
+    if parts[2] != "v=19"
+        return false
+    // parse params
+    let pfields = _split(parts[3], ",")
+    if len(pfields) != 3
+        return false
+    let m = _parse_kv_int(pfields[0], "m=")
+    let t = _parse_kv_int(pfields[1], "t=")
+    let p = _parse_kv_int(pfields[2], "p=")
+    // Reject out-of-range params IN-BAND (return false) so a crafted/corrupted stored PHC record can never
+    // reach argon2id_raw's exit(1) path -- that would be a DoS on the verifier. Mirrors the raw validation.
+    if t < 1
+        return false
+    if p < 1
+        return false
+    if m < 8 * p
+        return false
+    let salt = _b64_decode(parts[4])
+    let expected = _b64_decode(parts[5])
+    let tag_len = bytes_len(expected)
+    if tag_len < 4
+        return false
+    if bytes_len(salt) < 1
+        return false
+    let computed = argon2id_hash(pwd_bytes, salt, t, m, p, tag_len)
+    _bytes_eq_ct(computed, expected)

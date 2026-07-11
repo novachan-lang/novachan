@@ -1182,7 +1182,7 @@ allocation-heavy chains.
 *Unlocks:* exact-integer domains with subtraction (accounting deltas, crypto intermediates, signed modular
 math). Prerequisite for D2.
 
-**⏳ BLAKE2b dependency ✅ DONE (`d708af6f`, std/crypto/blake2b, RFC 7693); Argon2id itself pending · Sentinel-Argon2id — memory-hard KDF.** [lib] **M.**
+**✅ DONE (std/crypto/argon2id, RFC 9106 EXACT vector match + 6 independent cross-checks; PHC format; DoS-safe verify; on std/crypto/blake2b) · Sentinel-Argon2id — memory-hard KDF.** [lib] **M.**
 *NOVA way:* pure-NOVA `argon2id_hash`/`argon2id_verify` (RFC 9106, OWASP recommendation) over Blake2b +
 a `bytes` memory array; lane parallelism maps to `pfor`; PHC-format self-describing output.
 *Drawback avoided:* everyone else FFI-binds `libargon2` (native dependency, platform build issues). NOVA's is
