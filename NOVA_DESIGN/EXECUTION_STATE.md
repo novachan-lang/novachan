@@ -33,6 +33,7 @@
 | 0.11 float-return-uninit | 0-A | A | ✅ DONE + RE-VERIFIED (stddev=1.4142; `bfc55fba`+`29e380c1`) | 29e380c1 |
 | abs(float) mistypes return -> i64/pointer | 0-A | A | ✅ DONE (compiler types abs-of-any 'any' + runtime nova_rt_abs re-boxes) | 058cbea5 |
 | is_dict/is_list/is_* return 0 on any-typed | 0-A | A | ✅ DONE (new nova_rt_type_pred; compiler emits runtime check for undecidable case) | 441819d6 |
+| type_of() returns "int" for float AND bool (can't discriminate scalars) | 0-A | C | ⬜ NEW (found via std/data/schema; runtime nova_rt_type_of@4700 has no FLOAT/BOOL case → default "int". is_float/is_bool on any therefore weak. Fix = box-kind checks in type_of) | |
 | module-level `let X=<scalar literal>` read 0/"" inside fns | 0-A | A | ✅ DONE (scalar consts) via backend-agnostic AST pre-pass `inline_module_consts` — inlines int/float/str/bool module consts into reading fns (local-shadow-safe); reconverged | 1f141de9 |
 | module-level NON-scalar/non-literal/MUTABLE globals still per-fn copies | 0-A | B(XL) | ⬜ REMAINS (rarer) — true-globals `@nova_g_X` storage-model change in the active ire_line backend (SSA-style; deep) + keep cg/emit byte-identical. Workaround: init inside a fn. | |
 | ~~floor()/ceil() boxed-float corrupts layout~~ | 0-A | — | ❌ NOT A BUG — nova_rt_floor returns clean `(int64_t)floor(x)`, typed int. Agent misdiagnosed; float_to_int helped an unrelated float-slot issue. | |
@@ -75,7 +76,8 @@
 | forge_signum (D4 signed bignum) | numeric | — | ✅ DONE (fixed INT_MIN) | d708af6f |
 | forge_blake2b (RFC 7693 hash) | crypto | — | ✅ DONE (fixed validation) | d708af6f |
 | forge_hamt (D7 persistent map) | collections | — | ✅ DONE (fixed real-trie) | d708af6f |
-| **JDK-SCALE BREADTH — 90 modules (3× 30-task cycles)** | (all) | — | ✅ DONE (each KAT-gated + independently re-verified; ONE full-CI both-mode arc per 30) | cyc1 b80b7e24·3dc1086d·b4641598·2f5fba65 · cyc2 85fa62b2·d29951ec·fd4d82bc·d0699a19 · cyc3 01d9214e·ac7f0287·febd7584·753a5256 (1290 tests green) |
+| **JDK-SCALE BREADTH — 120 modules (4× 30-task cycles)** | (all) | — | ✅ DONE (each KAT-gated + independently re-verified; ONE full-CI both-mode arc per 30) | cyc1 b80b7e24·3dc1086d·b4641598·2f5fba65 · cyc2 85fa62b2·d29951ec·fd4d82bc·d0699a19 · cyc3 01d9214e·ac7f0287·febd7584·753a5256 · cyc4 bce96075·5c57e071·2537a25c·30b1f453 |
+|   ↳ cyc4 adds | logging·httpdate·wcwidth·btreemap·useragent·roundmode·proplist·typename·stats_ext·env·flatten·frozendict·iprange·hexdump·shellquote·combinations·query·worddiff·whitespace·normaldist·schema·ipclass·morse·acronym·percent·pigify·reverse_words·pipe·gcd_list·netmask | (all) | — | ✅ | |
 |   ↳ cyc3 adds | http_status·similarity·sequences·base64·indexmap·box·enumflags·graycode·color·ipv6·geo·ratelimiter·banner·cron·damerau·jsonmerge·url·orderedset·rot13·metaphone·latin1·deepcopy·highlight·titlecase·mime·humanize_number·uuencode·introot·frozenlist·portname | (all) | — | ✅ | |
 |   ↳ collections | unionfind·ordereddict·bloomfilter·sortedlist·bimap·trie·graph·multimap·fenwick·rangeset·defaultdict·segmenttree | — | ✅ | |
 |   ↳ text | distance·format·tablefmt·shlex·roman·ordinal·pluralize·soundex·ansi·diff·wordcount·lorem·truncate·naturalsort | — | ✅ | |
