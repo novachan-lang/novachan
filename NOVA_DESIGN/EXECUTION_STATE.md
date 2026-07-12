@@ -31,8 +31,8 @@
 |---|---|---|---|---|
 | 0.8 struct-field-leak | 0-A | A | ✅ DONE | fb1167cf |
 | 0.11 float-return-uninit | 0-A | A | ✅ DONE + RE-VERIFIED (stddev=1.4142; `bfc55fba`+`29e380c1`) | 29e380c1 |
-| abs(float) mistypes return -> i64/pointer | 0-A | A | ⬜ NEW (found via std/math/geometry2d; workaround: `if x<0.0 then 0.0-x else x`) | |
-| is_dict/is_list are compile-time preds (return 0 on any-typed) | 0-A | C | ⬜ NEW (found via std/data/jsonpointer; workaround: `type_of(x)=="dict"`) | |
+| abs(float) mistypes return -> i64/pointer | 0-A | A | ✅ DONE (compiler types abs-of-any 'any' + runtime nova_rt_abs re-boxes) | 058cbea5 |
+| is_dict/is_list/is_* return 0 on any-typed | 0-A | A | ✅ DONE (new nova_rt_type_pred; compiler emits runtime check for undecidable case) | 441819d6 |
 | module-level `let X=<float>` truncates to int 0 | 0-A | C | ⬜ NEW (declare float consts inside fns; found via quaternion/polynomial) | |
 | floor()/ceil() boxed-float corrupts float-slot layout in imported fns | 0-A | B | ⬜ NEW (workaround: `float_to_int()` builtin; found via std/math/angle) | |
 | multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ⬜ NEW (whole import yields 0 symbols; use single-line/if-chain; found via calendar) | |
