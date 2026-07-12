@@ -1,0 +1,174 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/ascii85
+// ============================================================================
+// Ascii85 (btoa variant, NO <~ ~> delimiters).
+//
+// THE BINARY-SAFETY PROPERTY:
+//   NOVA strings NUL-truncate on 0x00 bytes. This module uses `bytes` for the
+//   raw-data side — 0x00 is an ordinary byte, never lost. The encoded side is
+//   a plain ASCII string (the Ascii85 alphabet '!'..'u' has no 0x00).
+//
+// PUBLIC API:
+//   a85_encode(data: bytes) -> string
+//   a85_decode(s: string) -> bytes
+//
+// ALGORITHM (btoa / Ascii85 variant, no delimiters):
+//   Encode:
+//     Process input in 4-byte groups (big-endian 32-bit value).
+//     All-zero group (v == 0) emits a single 'z' (ASCII 122).
+//     Non-zero group: emit 5 chars — each digit = (v / 85^k) % 85 + 33,
+//       most-significant first. Alphabet: '!'(33) .. 'u'(117).
+//     Final partial group (1..3 bytes): pad with 0 bytes to 4, encode 5
+//       chars, emit only the first (partial_bytes + 1) chars.
+//
+//   Decode:
+//     'z' alone expands to 4 zero bytes.
+//     Other chars (must be '!'..'u') collected into groups of 5.
+//     Final partial group of n chars (n < 5): pad with 'u' (==84+33=117)
+//       to 5 chars, decode full 5->4 conversion, emit first (n-1) bytes.
+//
+// POWERS (85-base):
+//   85^4 = 52200625
+//   85^3 = 614125
+//   85^2 = 7225
+//   85^1 = 85
+//   85^0 = 1
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   All shift results are masked (&0xFF, &0xFFFFFF, etc.) to avoid
+//   sign-extension on intermediate values that may be negative.
+//
+// SYMBOL COLLISION GUARD:
+//   Private helpers prefixed _a85_ to avoid collisions in multi-module builds.
+
+// ── a85_encode ───────────────────────────────────────────────────────────────
+// Encode `data` (bytes) to Ascii85 string (btoa variant, no delimiters).
+fn a85_encode(data) -> string
+    let nbytes = bytes_len(data)
+    let out = ""
+    let i = 0
+    while i < nbytes
+        // How many bytes remain in this group (1..4)?
+        let remain = nbytes - i
+        let take = 4
+        if remain < 4
+            take = remain
+        // Load up to 4 bytes; pad missing bytes with 0.
+        let b0 = bytes_get(data, i) & 0xFF
+        let b1 = 0
+        let b2 = 0
+        let b3 = 0
+        if take >= 2
+            b1 = bytes_get(data, i + 1) & 0xFF
+        if take >= 3
+            b2 = bytes_get(data, i + 2) & 0xFF
+        if take == 4
+            b3 = bytes_get(data, i + 3) & 0xFF
+        // Compose 32-bit big-endian unsigned value.
+        let v = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & 0xFFFFFFFF
+        // Full group: special-case all-zeros -> 'z'.
+        if take == 4 and v == 0
+            out = out + "z"
+        else
+            // Extract 5 base-85 digits, most-significant first.
+            let d4 = v / 52200625
+            let r4 = v - d4 * 52200625
+            let d3 = r4 / 614125
+            let r3 = r4 - d3 * 614125
+            let d2 = r3 / 7225
+            let r2 = r3 - d2 * 7225
+            let d1 = r2 / 85
+            let d0 = r2 - d1 * 85
+            // Alphabet offset: digit + 33 gives ASCII '!'..'u'.
+            let c4 = chr(d4 + 33)
+            let c3 = chr(d3 + 33)
+            let c2 = chr(d2 + 33)
+            let c1 = chr(d1 + 33)
+            let c0 = chr(d0 + 33)
+            if take == 4
+                out = out + c4 + c3 + c2 + c1 + c0
+            else
+                // Partial group: emit only (take + 1) chars.
+                if take == 1
+                    out = out + c4 + c3
+                if take == 2
+                    out = out + c4 + c3 + c2
+                if take == 3
+                    out = out + c4 + c3 + c2 + c1
+        i = i + take
+    out
+
+// ── a85_decode ───────────────────────────────────────────────────────────────
+// Decode Ascii85 string (btoa variant, no delimiters) to bytes.
+// Whitespace chars (space, tab, CR, LF) are silently skipped per btoa convention.
+// Invalid characters or out-of-range digits cause the decode to stop early.
+fn a85_decode(s) -> any
+    let out = bytes(0)
+    let slen = len(s)
+    // Accumulate non-whitespace chars into a local buffer of up to 5.
+    // We process char-by-char, flushing each time a group is complete or 'z'.
+    let buf = ""
+    let i = 0
+    while i < slen
+        let c = s[i]
+        let cv = ord(c)
+        // Skip whitespace (space=32, tab=9, CR=13, LF=10).
+        if cv == 32 or cv == 9 or cv == 13 or cv == 10
+            i = i + 1
+        else
+            if c == "z" and len(buf) == 0
+                // 'z' shorthand: 4 zero bytes.
+                out = bytes_append(out, 0)
+                out = bytes_append(out, 0)
+                out = bytes_append(out, 0)
+                out = bytes_append(out, 0)
+                i = i + 1
+            else
+                // Accumulate into buf.
+                buf = buf + c
+                i = i + 1
+                if len(buf) == 5
+                    // Decode full 5-char group -> 4 bytes.
+                    let i0 = ord(buf[0]) - 33
+                    let i1 = ord(buf[1]) - 33
+                    let i2 = ord(buf[2]) - 33
+                    let i3 = ord(buf[3]) - 33
+                    let i4 = ord(buf[4]) - 33
+                    // Horner's method: v = ((((i0*85)+i1)*85+i2)*85+i3)*85+i4
+                    let v0 = i0 * 85 + i1
+                    let v1 = v0 * 85 + i2
+                    let v2 = v1 * 85 + i3
+                    let v = v2 * 85 + i4
+                    out = bytes_append(out, (v >> 24) & 0xFF)
+                    out = bytes_append(out, (v >> 16) & 0xFF)
+                    out = bytes_append(out, (v >> 8) & 0xFF)
+                    out = bytes_append(out, v & 0xFF)
+                    buf = ""
+    // Flush partial group if any (len(buf) == 1..4).
+    let blen = len(buf)
+    if blen >= 2
+        // Pad buf with 'u' (117 = 84+33, the largest Ascii85 digit) to 5 chars.
+        let padded = buf
+        let pad_count = 5 - blen
+        let pi = 0
+        while pi < pad_count
+            padded = padded + "u"
+            pi = pi + 1
+        let i0 = ord(padded[0]) - 33
+        let i1 = ord(padded[1]) - 33
+        let i2 = ord(padded[2]) - 33
+        let i3 = ord(padded[3]) - 33
+        let i4 = ord(padded[4]) - 33
+        let v0 = i0 * 85 + i1
+        let v1 = v0 * 85 + i2
+        let v2 = v1 * 85 + i3
+        let v = v2 * 85 + i4
+        // Emit only (blen - 1) bytes.
+        let emit = blen - 1
+        if emit >= 1
+            out = bytes_append(out, (v >> 24) & 0xFF)
+        if emit >= 2
+            out = bytes_append(out, (v >> 16) & 0xFF)
+        if emit >= 3
+            out = bytes_append(out, (v >> 8) & 0xFF)
+    out

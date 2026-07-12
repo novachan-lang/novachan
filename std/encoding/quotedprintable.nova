@@ -1,0 +1,143 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/quotedprintable
+// ============================================================================
+// Quoted-Printable encoding per RFC 2045, operating at the ASCII-string level.
+//
+// PUBLIC API:
+//   qp_encode(s: string) -> string
+//     Printable ASCII (bytes 33..126) except '=' (61) passes through literally.
+//     Space (32) and tab (9) pass through as literals (mid-line; optional per
+//     RFC — we keep it simple: literal space/tab stays always).
+//     '=' and any byte <32 or >126 is encoded as "=XX" (uppercase hex).
+//     CR (13) and LF (10) inside the source string encode as "=0D" / "=0A"
+//     so the output is single-line (no embedded line breaks).
+//
+//   qp_decode(s: string) -> string
+//     "=XX" (uppercase or lowercase hex) -> the corresponding byte as chr().
+//     "=\n" (soft line break: '=' followed immediately by LF, or CRLF then LF)
+//       is removed (the continuation is joined).
+//     Any other character passes through as-is.
+//
+// ROUND-TRIP GUARANTEE:
+//   qp_decode(qp_encode(x)) == x  for any string x whose bytes are all in
+//   0..255 and which contains no embedded NUL bytes (NOVA string limit).
+//
+// ARITHMETIC HAZARD NOTE — >> IS ARITHMETIC IN NOVA:
+//   Use (b >> 4) & 0x0F for the high nibble; the mask guards sign-extension.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers prefixed _qpe_ to avoid clashes with other std modules.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Hex alphabet for encoding (uppercase per RFC 2045).
+fn _qpe_alpha() -> string
+    "0123456789ABCDEF"
+
+// Map one ASCII code to its hex nibble value (0..15); -1 if not a hex digit.
+fn _qpe_hexval(b) -> int
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 65 and b <= 70
+        return b - 55
+    if b >= 97 and b <= 102
+        return b - 87
+    return -1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// qp_encode: encode a string using Quoted-Printable (RFC 2045).
+//
+// Rules applied (in order of priority):
+//   1. '=' (61)            -> "=3D"
+//   2. Printable ASCII (33..126, excluding '=') -> literal character
+//   3. Space (32), Tab (9) -> literal character
+//   4. Everything else     -> "=XX" uppercase hex
+//
+// CR (13) and LF (10) encode as "=0D" / "=0A" so the output is a single
+// unbroken string (the caller is responsible for line-length wrapping if
+// needed for MIME transport — RFC 2045 §6.7 allows up to 76 chars/line).
+//
+// Examples:
+//   qp_encode("Hello")          == "Hello"
+//   qp_encode("a=b")            == "a=3Db"
+//   qp_encode("caf"+chr(233))   contains "=E9"
+fn qp_encode(s) -> string
+    let alpha = _qpe_alpha()
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let b = ord(char_at(s, i)) & 0xFF
+        // '=' must encode first to avoid ambiguity
+        if b == 61
+            let hi = (b >> 4) & 0x0F
+            let lo = b & 0x0F
+            out = out + "=" + alpha[hi] + alpha[lo]
+        else if (b >= 33 and b <= 126) or b == 32 or b == 9
+            // printable ASCII (except '=' already handled) + space + tab
+            out = out + chr(b)
+        else
+            let hi = (b >> 4) & 0x0F
+            let lo = b & 0x0F
+            out = out + "=" + alpha[hi] + alpha[lo]
+        i = i + 1
+    return out
+
+// qp_decode: decode a Quoted-Printable string (RFC 2045).
+//
+// Decoding rules:
+//   "=XX"  (two hex digits, case-insensitive) -> chr(value)
+//   "=\n"  (soft line break: '=' then LF)     -> removed (join continuation)
+//   "=\r\n" (CRLF soft break)                 -> removed (join continuation)
+//   Anything else                              -> literal character
+//
+// Malformed "=X" or "=." sequences (non-hex) pass through literally
+// (the '=' and the following characters are emitted as-is) per lenient decode.
+//
+// Examples:
+//   qp_decode("=3D")          == "="
+//   qp_decode("Hello=20World") == "Hello World"
+//   qp_decode("a=\nb")        == "ab"
+fn qp_decode(s) -> string
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let b = ord(char_at(s, i)) & 0xFF
+        if b == 61
+            // '=' — look ahead
+            if i + 1 < n
+                let next = ord(char_at(s, i + 1)) & 0xFF
+                // soft line break: "=\n"
+                if next == 10
+                    i = i + 2
+                // soft line break with CRLF: "=\r\n"
+                else if next == 13 and i + 2 < n and (ord(char_at(s, i + 2)) & 0xFF) == 10
+                    i = i + 3
+                // encoded byte: "=XX"
+                else if i + 2 < n
+                    let hi = _qpe_hexval(next)
+                    let lo = _qpe_hexval(ord(char_at(s, i + 2)) & 0xFF)
+                    if hi >= 0 and lo >= 0
+                        let v = (hi * 16 + lo) & 0xFF
+                        out = out + chr(v)
+                        i = i + 3
+                    else
+                        // malformed: emit '=' literally
+                        out = out + "="
+                        i = i + 1
+                else
+                    // '=' at end with only one char after — emit literally
+                    out = out + "="
+                    i = i + 1
+            else
+                // trailing '=' with nothing after — emit literally
+                out = out + "="
+                i = i + 1
+        else
+            out = out + chr(b)
+            i = i + 1
+    return out
