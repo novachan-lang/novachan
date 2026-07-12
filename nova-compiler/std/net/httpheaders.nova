@@ -1,0 +1,180 @@
+// ============================================================================
+// NOVA Standard Library — std/net/httpheaders
+// ============================================================================
+// HTTP header parsing and building with case-insensitive name handling.
+//
+// PUBLIC API:
+//   hh_parse(text: string) -> dict
+//     Parse HTTP header text (lines separated by LF or CRLF) into a dict
+//     mapping lowercased header names to their trimmed values.
+//     Lines without ":" are skipped (handles request/status lines).
+//     Blank lines are skipped.
+//     The first ":" in each line is the name/value delimiter (values may
+//     contain colons, e.g. "Date: Mon, 01 Jan 2024 00:00:00 GMT").
+//
+//   hh_get(headers: dict, name: string) -> string
+//     Safe case-insensitive lookup: lowercase the name, return value or "".
+//
+//   hh_has(headers: dict, name: string) -> bool
+//     Case-insensitive existence check (lowercases the name).
+//
+//   hh_build(headers: dict) -> string
+//     Serialize headers to "Name: value\r\nName: value" text (CRLF separated,
+//     sorted by key for deterministic output).  Keys are emitted as-is (callers
+//     should provide canonical casing); values are emitted as-is.
+//
+// DESIGN NOTES:
+//   * Case-insensitivity: RFC 7230 §3.2 mandates case-insensitive header names.
+//     We lowercase at parse time so all lookups are O(1) with no re-lowercasing.
+//   * First-colon split: values such as "Location: http://example.com:8080/"
+//     contain colons; only the FIRST colon separates name from value.
+//   * Trimming: whitespace (space/tab/CR) stripped from both name and value ends.
+//   * NOVA GOTCHA: >> is arithmetic; no right-shifts used here.
+//   * NOVA GOTCHA: {} in string literals interpolate — never use bare {}.
+//   * NOVA GOTCHA: missing dict key returns int 0, not ""; guard with contains().
+//   * Private helpers prefixed _hh_ to avoid symbol collisions.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private: whitespace check ─────────────────────────────────────────────────
+
+// _hh_is_ws: true for space (32), tab (9), and carriage-return (13).
+fn _hh_is_ws(b: int) -> bool
+    if b == 32
+        return true
+    if b == 9
+        return true
+    if b == 13
+        return true
+    false
+
+// ── Private: trim leading + trailing whitespace from a string ─────────────────
+
+fn _hh_trim(s: string) -> string
+    let n = len(s)
+    if n == 0
+        return ""
+    // find first non-ws index (lo)
+    let lo = 0
+    let scanning_lo = true
+    while scanning_lo
+        if lo >= n
+            // entire string is whitespace
+            return ""
+        if _hh_is_ws(ord(char_at(s, lo)))
+            lo = lo + 1
+        else
+            scanning_lo = false
+    // find last non-ws index (hi)
+    let hi = n - 1
+    let scanning_hi = true
+    while scanning_hi
+        if hi < lo
+            return ""
+        if _hh_is_ws(ord(char_at(s, hi)))
+            hi = hi - 1
+        else
+            scanning_hi = false
+    slice(s, lo, hi + 1)
+
+// ── Private: find index of first occurrence of char c in s ───────────────────
+
+fn _hh_index_of(s: string, c: string) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if char_at(s, i) == c
+            return i
+        i = i + 1
+    -1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// hh_parse: parse HTTP header block text into a dict.
+//
+// Input may be:
+//   - A block of "Name: value" lines (one per LF or CRLF)
+//   - A full HTTP request/response (request line or status line will be skipped
+//     because it contains no ":" before the first space, but we skip any line
+//     without a ":" anywhere)
+//   - Lines may end in LF or CRLF (CR is treated as whitespace and trimmed)
+//
+// Returns a dict: lowercased-name -> trimmed-value.
+// Duplicate names: last value wins (matches HTTP/1.1 behaviour for most fields).
+//
+// Examples:
+//   hh_parse("Content-Type: text/html\nX-Custom: 42")
+//     -> {"content-type": "text/html", "x-custom": "42"}
+fn hh_parse(text: string) -> dict
+    let result = {}
+    let lines = split(text, chr(10))
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        // Trim CR/space/tab from ends of each line
+        let trimmed = _hh_trim(line)
+        if len(trimmed) > 0
+            // Find first ':'
+            let colon = _hh_index_of(trimmed, ":")
+            if colon > 0
+                let raw_name = slice(trimmed, 0, colon)
+                let raw_val  = slice(trimmed, colon + 1, len(trimmed))
+                let name = lower(_hh_trim(raw_name))
+                let val  = _hh_trim(raw_val)
+                if len(name) > 0
+                    result[name] = val
+        i = i + 1
+    result
+
+// hh_get: case-insensitive header lookup.
+// Lowercases `name` before lookup (keys are stored lowercased by hh_parse).
+// Returns the header value, or "" when absent.
+//
+// Examples:
+//   let p = hh_parse("Content-Type: text/html")
+//   hh_get(p, "content-type")  -> "text/html"
+//   hh_get(p, "Content-Type")  -> "text/html"
+//   hh_get(p, "missing")       -> ""
+fn hh_get(headers: dict, name: string) -> string
+    let k = lower(name)
+    if contains(headers, k)
+        return headers[k]
+    ""
+
+// hh_has: case-insensitive header existence check.
+// Returns true if the header (lowercased) is present in headers.
+//
+// Examples:
+//   let p = hh_parse("X-Custom: 42")
+//   hh_has(p, "X-Custom")  -> true
+//   hh_has(p, "x-custom")  -> true
+//   hh_has(p, "missing")   -> false
+fn hh_has(headers: dict, name: string) -> bool
+    let k = lower(name)
+    contains(headers, k)
+
+// hh_build: serialize a headers dict to "Name: value\r\nName: value" text.
+// Keys are sorted for deterministic output.  Keys and values emitted as-is.
+// Lines are separated by CRLF (chr(13)+chr(10)).
+// The result does NOT end with a trailing CRLF.
+//
+// Examples:
+//   hh_build({"content-type": "text/html", "x-custom": "42"})
+//     -> "content-type: text/html\r\nx-custom: 42"
+fn hh_build(headers: dict) -> string
+    let ks = keys(headers)
+    sort(ks)
+    let crlf = chr(13) + chr(10)
+    let result = ""
+    let i = 0
+    while i < len(ks)
+        let k = ks[i]
+        let v = headers[k]
+        let line = k + ": " + v
+        if i == 0
+            result = line
+        else
+            result = result + crlf + line
+        i = i + 1
+    result

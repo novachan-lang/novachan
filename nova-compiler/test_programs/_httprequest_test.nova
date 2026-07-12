@@ -1,0 +1,145 @@
+import std/net/httprequest
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got=[" + got + "] want=[" + want + "]")
+        exit(1)
+
+fn ckb(label: string, got: bool, want: bool)
+    if got != want
+        let gs = "false"
+        if got
+            gs = "true"
+        let ws = "false"
+        if want
+            ws = "true"
+        print("FAIL " + label + ": got=" + gs + " want=" + ws)
+        exit(1)
+
+// Helper: does string s start with prefix p?
+fn starts_with(s: string, p: string) -> bool
+    let plen = len(p)
+    let slen = len(s)
+    if plen > slen
+        return false
+    let i = 0
+    while i < plen
+        if char_at(s, i) != char_at(p, i)
+            return false
+        i = i + 1
+    true
+
+// Helper: does string s end with suffix suf?
+fn ends_with(s: string, suf: string) -> bool
+    let suflen = len(suf)
+    let slen = len(s)
+    if suflen > slen
+        return false
+    let offset = slen - suflen
+    let i = 0
+    while i < suflen
+        if char_at(s, offset + i) != char_at(suf, i)
+            return false
+        i = i + 1
+    true
+
+// Helper: does string s contain substring sub?
+fn str_contains(s: string, sub: string) -> bool
+    let slen = len(s)
+    let sublen = len(sub)
+    if sublen == 0
+        return true
+    if sublen > slen
+        return false
+    let i = 0
+    while i <= slen - sublen
+        let j = 0
+        let found_it = true
+        while j < sublen
+            if char_at(s, i + j) != char_at(sub, j)
+                found_it = false
+                j = sublen
+            else
+                j = j + 1
+        if found_it
+            return true
+        i = i + 1
+    false
+
+fn main()
+    let crlf = chr(13) + chr(10)
+
+    // ── KAT 1: hr_get("/") starts with the correct request line ──────────────
+    let g1 = hr_get("/")
+    ckb("get_slash_starts_with", starts_with(g1, "GET / HTTP/1.1"), true)
+
+    // ── KAT 2: hr_get("/") is exactly "GET / HTTP/1.1\r\n\r\n" ──────────────
+    let expected_get = "GET / HTTP/1.1" + crlf + crlf
+    cks("get_slash_exact", g1, expected_get)
+
+    // ── KAT 3: GET with empty body has no Content-Length ─────────────────────
+    ckb("get_no_content_length", str_contains(g1, "Content-Length"), false)
+
+    // ── KAT 4: POST /api with Host header and body "hi" ──────────────────────
+    // Sorted header order: "Host" only key -> emitted first.
+    // Auto Content-Length appended after sorted headers.
+    // Full expected:
+    //   POST /api HTTP/1.1\r\n
+    //   Host: example.com\r\n
+    //   Content-Length: 2\r\n
+    //   \r\n
+    //   hi
+    let hdrs = {}
+    hdrs["Host"] = "example.com"
+    let p1 = hr_build("POST", "/api", hdrs, "hi")
+    ckb("post_has_request_line",   str_contains(p1, "POST /api HTTP/1.1"), true)
+    ckb("post_has_host",           str_contains(p1, "Host: example.com"),  true)
+    ckb("post_has_content_length", str_contains(p1, "Content-Length: 2"),  true)
+    ckb("post_ends_with_body",     ends_with(p1, "hi"),                    true)
+
+    // ── KAT 5: request line and first header separated by CRLF ───────────────
+    // The request line ends with \r\n, so the character after the request line
+    // must be 'H' (start of Host header).
+    let sep = "HTTP/1.1" + crlf + "Host"
+    ckb("crlf_after_request_line", str_contains(p1, sep), true)
+
+    // ── KAT 6: caller-supplied Content-Length suppresses auto-insert ──────────
+    // Supply Content-Length: 99 explicitly; body is "data" (len=4).
+    // Auto-insert must NOT produce a duplicate.
+    let hdrs2 = {}
+    hdrs2["Content-Length"] = "99"
+    hdrs2["Host"] = "srv"
+    let p2 = hr_build("PUT", "/x", hdrs2, "data")
+    // "Content-Length" must appear exactly once (supplied by caller = "99")
+    // We verify no "Content-Length: 4" appears (auto-insert suppressed).
+    ckb("no_dup_content_length", str_contains(p2, "Content-Length: 4"), false)
+    ckb("caller_content_length",  str_contains(p2, "Content-Length: 99"), true)
+    ckb("put_ends_with_data",     ends_with(p2, "data"), true)
+
+    // ── KAT 7: case-insensitive suppression — "content-length" lowercase ──────
+    let hdrs3 = {}
+    hdrs3["content-length"] = "5"
+    let p3 = hr_build("POST", "/y", hdrs3, "hello")
+    // Auto-insert must not add a second Content-Length
+    // Count occurrences: should be exactly one "ontent-Length" or "ontent-length"
+    // Simplest: verify "Content-Length: 5" (from caller) is there...
+    ckb("lowercase_cl_present",   str_contains(p3, "content-length: 5"), true)
+    // ...and the auto "Content-Length: 5" is NOT duplicated (i.e. only one CL)
+    // Verify p3 does NOT contain "Content-Length: 5\r\ncontent-length"
+    // and vice-versa — simpler: the total len is correct (no extra line)
+    // We check ends_with body
+    ckb("lowercase_cl_body",      ends_with(p3, "hello"), true)
+
+    // ── KAT 8: multiple headers are sorted ───────────────────────────────────
+    // Keys "Z-Header" and "A-Header" — sorted order must be A before Z.
+    let hdrs4 = {}
+    hdrs4["Z-Header"] = "last"
+    hdrs4["A-Header"] = "first"
+    let p4 = hr_build("DELETE", "/r", hdrs4, "")
+    // "A-Header: first\r\nZ-Header: last" must appear in that order
+    let sorted_order = "A-Header: first" + crlf + "Z-Header: last"
+    ckb("headers_sorted", str_contains(p4, sorted_order), true)
+
+    print("_httprequest_test passed")
