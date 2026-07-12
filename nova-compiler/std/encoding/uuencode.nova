@@ -1,0 +1,132 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/uuencode
+// ============================================================================
+// Uuencode per-line body codec (data encoding only, not begin/end envelope).
+//
+// ALGORITHM:
+//   uu_encode_line: encodes up to 45 bytes from a bytes value.
+//     Output = length char + groups of 4 chars per 3-byte input group.
+//     Length char = chr(actual_byte_count + 32).
+//     Each 6-bit chunk = (chunk_value + 32) — 0 maps to chr(32) = space.
+//     Short final groups are zero-padded to 3 bytes for encoding (decoder
+//     truncates via the length char on decode).
+//
+//   uu_decode_line: reverses the above.
+//     First char = length. Then consume 4-char groups -> 3 bytes each.
+//     Truncate output bytes to the decoded length.
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA (sign-extends for negative):
+//   All shifts mask with & 0xFF or & 0x3F to prevent sign-extension bleed.
+//
+// BINARY SAFETY:
+//   The codec operates entirely on `bytes` for raw data. 0x00 bytes encode
+//   and decode correctly. The encoded line is a NOVA string (printable ASCII
+//   range 32..95), which contains no interior NUL bytes.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _uu_ to avoid collisions with other
+//   std modules compiled into the same binary.
+//
+// PUBLIC API:
+//   uu_encode_line(data: bytes) -> string
+//   uu_decode_line(s: string) -> bytes
+
+// ── Encode ────────────────────────────────────────────────────────────────────
+
+// _uu_enc6: encode a single 6-bit value (0..63) to its uuencode character.
+// Classic uuencode: add 32; 0 becomes chr(32) = space.
+fn _uu_enc6(v) -> string
+    chr((v & 0x3F) + 32)
+
+// uu_encode_line: encode up to 45 bytes of `data` into a uuencode line string.
+//
+// Format: length_char followed by ceil(n/3)*4 data characters.
+// The length character encodes the number of actual data bytes (0..45):
+//   chr(n + 32)
+// Each 3-byte group becomes 4 characters (6 bits each, each +32).
+// If the final group has < 3 bytes, it is zero-padded for encoding; the
+// decoder uses the length char to truncate, so no spurious bytes appear.
+//
+// KAT:
+//   uu_encode_line(bytes from "Cat") -> "#0V%T"
+//   uu_encode_line(empty bytes)      -> " "  (chr(32) = 0 bytes length)
+fn uu_encode_line(data) -> string
+    let nb = bytes_len(data)
+    // Clamp to 45 bytes (classic uuencode line limit).
+    let n = nb
+    if n > 45
+        n = 45
+    // Build output: start with the length character.
+    let out = chr(n + 32)
+    let i = 0
+    while i < n
+        // Load three bytes; zero-pad if fewer than 3 remain.
+        let b0 = bytes_get(data, i) & 0xFF
+        let b1 = 0
+        let b2 = 0
+        if i + 1 < n
+            b1 = bytes_get(data, i + 1) & 0xFF
+        if i + 2 < n
+            b2 = bytes_get(data, i + 2) & 0xFF
+        // Pack into 24-bit accumulator.
+        let acc = (b0 << 16) | (b1 << 8) | b2
+        // Extract four 6-bit groups (MSB-first) and encode each.
+        let c0 = (acc >> 18) & 0x3F
+        let c1 = (acc >> 12) & 0x3F
+        let c2 = (acc >> 6) & 0x3F
+        let c3 = acc & 0x3F
+        out = out + _uu_enc6(c0) + _uu_enc6(c1) + _uu_enc6(c2) + _uu_enc6(c3)
+        i = i + 3
+    out
+
+// ── Decode ────────────────────────────────────────────────────────────────────
+
+// _uu_dec6: decode one uuencode character to its 6-bit value.
+// Subtracts 32 then masks to 6 bits. Space (chr(32)) -> 0.
+// Backtick (chr(96)) is also 0 in some dialects (96-32=64, &0x3F=0); handled.
+fn _uu_dec6(c) -> int
+    (ord(c) - 32) & 0x3F
+
+// uu_decode_line: decode a uuencode line string back to bytes.
+//
+// First character of `s` is the length character: ord(c) - 32 = byte count.
+// Remaining characters are 4-char groups, each yielding 3 bytes.
+// Output is truncated to the declared length (handles zero-padded last group).
+//
+// KAT:
+//   uu_decode_line(uu_encode_line(b)) == b   for any bytes b
+fn uu_decode_line(s) -> any
+    let slen = len(s)
+    let out_raw = bytes(0)
+    if slen < 1
+        return out_raw
+    // First char is the length marker.
+    let n = (ord(s[0]) - 32) & 0xFF
+    if n == 0
+        return out_raw
+    // Decode 4-char groups starting at index 1.
+    // Each group at position i uses s[i], s[i+1], s[i+2], s[i+3].
+    // We need i+3 < slen, i.e. i <= slen-4.
+    let i = 1
+    while i <= slen - 4
+        let v0 = _uu_dec6(s[i])
+        let v1 = _uu_dec6(s[i + 1])
+        let v2 = _uu_dec6(s[i + 2])
+        let v3 = _uu_dec6(s[i + 3])
+        // Reconstruct 24 bits.
+        let acc = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3
+        // Emit 3 bytes.
+        let byte0 = (acc >> 16) & 0xFF
+        let byte1 = (acc >> 8) & 0xFF
+        let byte2 = acc & 0xFF
+        out_raw = bytes_append(out_raw, byte0)
+        out_raw = bytes_append(out_raw, byte1)
+        out_raw = bytes_append(out_raw, byte2)
+        i = i + 4
+    // Truncate to declared length (removes zero-padding from final group).
+    let result = bytes(0)
+    let j = 0
+    while j < n
+        result = bytes_append(result, bytes_get(out_raw, j) & 0xFF)
+        j = j + 1
+    result
