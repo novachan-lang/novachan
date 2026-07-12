@@ -1,0 +1,247 @@
+// ============================================================================
+// NOVA Standard Library — std/data/query
+// ============================================================================
+// Tiny in-memory query engine over a list of row dicts.
+// Each "row" is a dict whose values may be int, float, or string.
+//
+// PUBLIC API
+//   qr_where(rows, key, op, value) -> list
+//       Filter rows where row[key] <op> value.
+//       op must be one of: "eq" "ne" "gt" "lt" "ge" "le"
+//       Rows missing the key are silently skipped.
+//
+//   qr_select(rows, keys_list) -> list
+//       Project each row to only the columns in keys_list.
+//       Missing keys are omitted from the output row.
+//
+//   qr_order_by(rows, key, ascending) -> list
+//       Return a sorted COPY of rows ordered by row[key].
+//       ascending=1 -> smallest first; ascending=0 -> largest first.
+//       Rows missing the key sort last.
+//
+//   qr_limit(rows, n) -> list
+//       Return the first n rows (or all rows if len(rows) <= n).
+//
+//   qr_pluck(rows, key) -> list
+//       Return a list of the values at key for every row.
+//       Rows missing the key contribute null.
+//
+//   qr_count(rows) -> int
+//       Return len(rows).
+//
+// IMPLEMENTATION NOTES
+//   • type_of(v) == "dict" used for row-type guard.
+//   • Comparison dispatches on type_of(a): "int"/"float" use numeric compare,
+//     "string" uses lexicographic compare via builtin < / > / == on strings.
+//   • Single-exit pattern used everywhere to avoid return-null mistag bug.
+//   • Insertion sort for qr_order_by (small table assumption; stable).
+//   • All private helpers prefixed _qr_.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _qr_cmp: compare two scalar values (int, float, or string).
+// Returns -1 (a < b), 0 (a == b), or 1 (a > b).
+// If types differ, falls back to string comparison of str() forms.
+fn _qr_cmp(a, b) -> int
+    let result = 0
+    let ta = type_of(a)
+    let tb = type_of(b)
+    if ta == "string" and tb == "string"
+        if a < b
+            result = -1
+        else
+            if a > b
+                result = 1
+            else
+                result = 0
+    else
+        // Treat as numeric (int or float).
+        let af = a * 1.0
+        let bf = b * 1.0
+        if af < bf
+            result = -1
+        else
+            if af > bf
+                result = 1
+            else
+                result = 0
+    return result
+
+// _qr_match: return 1 if the comparison result `c` (from _qr_cmp) satisfies `op`.
+fn _qr_match(c, op) -> int
+    let result = 0
+    if op == "eq"
+        if c == 0
+            result = 1
+    else
+        if op == "ne"
+            if c != 0
+                result = 1
+        else
+            if op == "lt"
+                if c < 0
+                    result = 1
+            else
+                if op == "le"
+                    if c <= 0
+                        result = 1
+                else
+                    if op == "gt"
+                        if c > 0
+                            result = 1
+                    else
+                        if op == "ge"
+                            if c >= 0
+                                result = 1
+    return result
+
+// _qr_copy_row: produce a shallow copy of a row dict.
+fn _qr_copy_row(row)
+    let out = {}
+    let ks = keys(row)
+    let n = len(ks)
+    let i = 0
+    while i < n
+        let k = ks[i]
+        out[k] = row[k]
+        i = i + 1
+    return out
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// qr_where: filter rows by op comparison of row[key] vs value.
+// Rows that do not contain key are silently excluded.
+//
+// Examples:
+//   qr_where(rows, "age", "gt", 28)  ->  rows where age > 28
+//   qr_where(rows, "name", "eq", "alice")  ->  rows where name == "alice"
+fn qr_where(rows, key, op, value)
+    let out = []
+    let n = len(rows)
+    let i = 0
+    while i < n
+        let row = rows[i]
+        if contains(row, key) == 1
+            let c = _qr_cmp(row[key], value)
+            if _qr_match(c, op) == 1
+                out.push(row)
+        i = i + 1
+    return out
+
+// qr_select: project each row to only the listed keys.
+// Keys absent in a row are omitted (no null padding).
+//
+// Example:
+//   qr_select(rows, ["name", "age"])  ->  rows with only "name" and "age"
+fn qr_select(rows, keys_list)
+    let out = []
+    let n = len(rows)
+    let m = len(keys_list)
+    let i = 0
+    while i < n
+        let row = rows[i]
+        let new_row = {}
+        let j = 0
+        while j < m
+            let k = keys_list[j]
+            if contains(row, k) == 1
+                new_row[k] = row[k]
+            j = j + 1
+        out.push(new_row)
+        i = i + 1
+    return out
+
+// qr_order_by: return a sorted copy of rows by row[key].
+// ascending=1 -> smallest first; 0 -> largest first.
+// Rows lacking the sort key sort AFTER all rows that have it.
+// Uses insertion sort (stable for small tables).
+//
+// Example:
+//   qr_order_by(rows, "age", 1)  ->  youngest first
+fn qr_order_by(rows, key, ascending)
+    // Build a list copy first so we never mutate the original.
+    let sorted = []
+    let n = len(rows)
+    let i = 0
+    while i < n
+        sorted.push(rows[i])
+        i = i + 1
+    // Insertion sort: for each element j, bubble it left while it is "less than"
+    // its predecessor according to the desired order.
+    let j = 1
+    while j < n
+        let cur = sorted[j]
+        let k = j
+        while k > 0
+            let prev = sorted[k - 1]
+            // Determine the comparison result between prev and cur.
+            let prev_has = contains(prev, key)
+            let cur_has = contains(cur, key)
+            let should_swap = 0
+            if cur_has == 1 and prev_has == 0
+                // cur has the key, prev doesn't -> cur sorts before prev (missing last).
+                should_swap = 1
+            else
+                if cur_has == 1 and prev_has == 1
+                    let c = _qr_cmp(prev[key], cur[key])
+                    // In ascending order, swap if prev > cur (c == 1).
+                    // In descending order, swap if prev < cur (c == -1).
+                    if ascending == 1
+                        if c > 0
+                            should_swap = 1
+                    else
+                        if c < 0
+                            should_swap = 1
+            if should_swap == 1
+                sorted[k] = sorted[k - 1]
+                sorted[k - 1] = cur
+                k = k - 1
+            else
+                k = 0
+        j = j + 1
+    return sorted
+
+// qr_limit: return the first n rows.
+// If n >= len(rows), returns the full list (a copy).
+//
+// Example:
+//   qr_limit(rows, 10)  ->  first 10 rows
+fn qr_limit(rows, n)
+    let out = []
+    let total = len(rows)
+    let cap = n
+    if total < cap
+        cap = total
+    let i = 0
+    while i < cap
+        out.push(rows[i])
+        i = i + 1
+    return out
+
+// qr_pluck: extract a single column from each row as a flat list.
+// Rows lacking the key contribute null.
+//
+// Example:
+//   qr_pluck(rows, "name")  ->  ["alice", "bob", "carol"]
+fn qr_pluck(rows, key)
+    let out = []
+    let n = len(rows)
+    let i = 0
+    while i < n
+        let row = rows[i]
+        if contains(row, key) == 1
+            out.push(row[key])
+        else
+            out.push(null)
+        i = i + 1
+    return out
+
+// qr_count: return the number of rows.
+//
+// Example:
+//   qr_count(rows)  ->  3
+fn qr_count(rows) -> int
+    return len(rows)
