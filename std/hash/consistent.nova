@@ -1,0 +1,158 @@
+// std/hash/consistent.nova — Consistent hashing ring for key-to-node sharding.
+//
+// Uses FNV-1a 32-bit as the position hash (deterministic, collision-resistant enough
+// for ring distribution; same algorithm as std/hash/noncrypto.nova but private here
+// under the _ch_ prefix to avoid symbol collision in the linked binary).
+//
+// Ring representation (a plain NOVA dict):
+//   "points"   -> dict  { str(position_int) -> node_name }
+//   "keys"     -> list  sorted list of ints (ring positions, ascending)
+//   "replicas" -> int   number of virtual points per real node
+//   "nodes"    -> list  sorted list of distinct node names currently in the ring
+//
+// Public API:
+//   ch_new(replicas)         -> ring dict
+//   ch_add(ch, node)         unit — add a node (N virtual points); idempotent-safe if called once per node
+//   ch_get(ch, key)  -> str  map a key to its owning node ("" if ring is empty)
+//   ch_remove(ch, node)      unit — remove a node and all its virtual points
+//   ch_nodes(ch)     -> list sorted list of current node names
+//
+// Design notes:
+//   • Virtual points avoid the "hot spot" problem of naive sharding: each real node
+//     owns roughly 1/N of the ring regardless of node name hash values.
+//   • Position strings are str(hash_int) so dict keys are always strings (NOVA requirement).
+//   • Binary-search insert keeps "keys" sorted without an O(n log n) full re-sort per add.
+//   • ch_get wraps: if the key hashes past the last ring position it falls to the first node.
+//   • Determinism: FNV-1a on a fixed input always produces the same 32-bit value.
+
+// ---------------------------------------------------------------------------
+// Private: FNV-1a 32-bit hash  (private to this module, _ch_ prefix)
+// ---------------------------------------------------------------------------
+
+// Compute FNV-1a 32-bit hash of string s.
+// Returns an int in [0, 4294967295].
+fn _ch_fnv1a32(s)
+    let h = 2166136261
+    let prime = 16777619
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = ord(char_at(s, i))
+        h = ((h ^ c) * prime) & 0xFFFFFFFF
+        i = i + 1
+    return h
+
+// ---------------------------------------------------------------------------
+// Private: sorted-insert a single int into a list (binary-search, O(log n + n))
+// ---------------------------------------------------------------------------
+
+// Insert val into a sorted list in-place, maintaining ascending order.
+// Finds the leftmost index where val may be inserted via bisect-left.
+fn _ch_insort(lst, val)
+    let lo = 0
+    let hi = len(lst)
+    while lo < hi
+        let mid = (lo + hi) / 2
+        if lst[mid] < val
+            lo = mid + 1
+        else
+            hi = mid
+    insert(lst, lo, val)
+
+// ---------------------------------------------------------------------------
+// Private: sorted-insert a string into a list (for the nodes list)
+// ---------------------------------------------------------------------------
+
+fn _ch_str_insort(lst, s)
+    let lo = 0
+    let hi = len(lst)
+    while lo < hi
+        let mid = (lo + hi) / 2
+        if lst[mid] < s
+            lo = mid + 1
+        else
+            hi = mid
+    insert(lst, lo, s)
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// ch_new(replicas) — create an empty consistent-hashing ring.
+// replicas: number of virtual points per node (50–200 is typical; higher = better balance).
+fn ch_new(replicas)
+    let ch = {}
+    ch["points"] = {}
+    ch["keys"] = []
+    ch["replicas"] = replicas
+    ch["nodes"] = []
+    return ch
+
+// ch_add(ch, node) — add a node to the ring with `replicas` virtual points.
+// Each virtual point is hashed as node+"#"+str(i) for i in 0..replicas-1.
+// The caller must ensure ch_add is not called twice for the same node.
+fn ch_add(ch, node)
+    let replicas = ch["replicas"]
+    let points = ch["points"]
+    let keys = ch["keys"]
+    let i = 0
+    while i < replicas
+        let vkey = node + "#" + str(i)
+        let pos = _ch_fnv1a32(vkey)
+        let pk = str(pos)
+        // Only insert if this position is not already occupied (hash collision guard)
+        if contains(points, pk) == 0
+            points[pk] = node
+            _ch_insort(keys, pos)
+        i = i + 1
+    // Add to sorted nodes list
+    _ch_str_insort(ch["nodes"], node)
+
+// ch_get(ch, key) — find the node responsible for key.
+// Hashes key to a 32-bit position, then finds the first ring position >= it (clockwise).
+// Wraps around to the first position if the key falls past the last entry.
+// Returns "" if the ring is empty.
+fn ch_get(ch, key)
+    let keys = ch["keys"]
+    let n = len(keys)
+    if n == 0
+        return ""
+    let h = _ch_fnv1a32(key)
+    // Binary search: find leftmost index where keys[idx] >= h (bisect-left)
+    let lo = 0
+    let hi = n
+    while lo < hi
+        let mid = (lo + hi) / 2
+        if keys[mid] < h
+            lo = mid + 1
+        else
+            hi = mid
+    // lo == n means h is past the last point; wrap to index 0
+    if lo == n
+        lo = 0
+    let pos = keys[lo]
+    let points = ch["points"]
+    return points[str(pos)]
+
+// ch_remove(ch, node) — remove a node and all its virtual points from the ring.
+// After removal ch_get will never return this node.
+fn ch_remove(ch, node)
+    let replicas = ch["replicas"]
+    let points = ch["points"]
+    let keys = ch["keys"]
+    let i = 0
+    while i < replicas
+        let vkey = node + "#" + str(i)
+        let pos = _ch_fnv1a32(vkey)
+        let pk = str(pos)
+        if contains(points, pk) == 1
+            del(points, pk)
+            // Remove pos from sorted keys list (remove first occurrence == pos)
+            remove(keys, pos)
+        i = i + 1
+    // Remove from nodes list
+    remove(ch["nodes"], node)
+
+// ch_nodes(ch) — return a sorted list of all node names currently in the ring.
+fn ch_nodes(ch)
+    return ch["nodes"]

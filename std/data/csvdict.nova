@@ -1,0 +1,237 @@
+// ============================================================================
+// NOVA Standard Library — std/data/csvdict
+// ============================================================================
+// CSV <-> list-of-dicts (header row supplies the keys for each data row).
+//
+// PUBLIC API:
+//   cd_parse(csv_text) -> list
+//     Parse a CSV string into a list of dicts.  The first non-empty line is
+//     the header row; its fields become the dict keys for every subsequent
+//     non-empty data line.  Double-quoted fields are supported: a field
+//     starting with a double-quote is read until a matching closing quote;
+//     within a quoted field a doubled quote ("") represents a literal quote
+//     character, and commas are treated as ordinary characters.  Rows are
+//     split on chr(10); a trailing chr(13) (CRLF) is stripped from each line.
+//
+//   cd_headers(csv_text) -> list
+//     Return the header fields from the first non-empty line.  Returns []
+//     if the text is empty or contains only blank lines.
+//
+//   cd_write(rows, headers) -> string
+//     Serialize a list of dicts to CSV.  The first output line is the header
+//     row (fields from the headers list joined by commas).  Each subsequent
+//     line contains the field values for that dict in header order.  Any
+//     field value that contains a comma, a double-quote, or a newline is
+//     wrapped in double-quotes, with internal double-quotes doubled.  Rows
+//     are joined by chr(10) (no trailing newline).  Missing keys produce "".
+//
+//   cd_get(row, key, dflt) -> value
+//     Safe dict read: returns row[key] if key is present, otherwise dflt.
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing.
+//   - State machine (in-quote flag) for field parsing; char-by-char via
+//     char_at / ord.
+//   - Single-exit style avoids NOVA return-null mistag bug.
+//   - No multi-line list/dict literals in module body.
+//   - ord(34) == 34 is the double-quote character (chr(34)).
+//   - ord(44) == 44 is the comma (chr(44)).
+//   - Brace chars via chr(123)/chr(125) to avoid string interpolation.
+//
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// Strip a trailing CR (chr(13)) from a line if present.
+fn _cd_strip_cr(line) -> string
+    let result = line
+    let n = len(line)
+    if n > 0
+        if ord(char_at(line, n - 1)) == 13
+            result = slice(line, 0, n - 1)
+    result
+
+// Parse one CSV row (a single line string) into a list of field strings.
+// Uses a two-state machine:
+//   in_q == 0  →  normal field mode
+//   in_q == 1  →  inside a double-quoted field
+// Returns a list of strings (always at least one element for a non-empty input
+// line; for a truly empty line returns a list with one empty string, matching
+// standard CSV parsers).
+fn _cd_parse_row(line) -> list
+    let fields = []
+    let cur = ""
+    let n = len(line)
+    let i = 0
+    let in_q = 0
+    while i < n
+        let ch = char_at(line, i)
+        let code = ord(ch)
+        if in_q == 0
+            if code == 34
+                // Opening double-quote — switch to quoted mode.
+                in_q = 1
+            else
+                if code == 44
+                    // Comma — end of field.
+                    fields.push(cur)
+                    cur = ""
+                else
+                    cur = cur + ch
+        else
+            // Inside a quoted field.
+            if code == 34
+                // Peek at next char: "" means escaped quote, else end-quote.
+                let peek = 0
+                if i + 1 < n
+                    peek = ord(char_at(line, i + 1))
+                if peek == 34
+                    // Doubled quote — emit one literal quote, skip both.
+                    cur = cur + chr(34)
+                    i = i + 1
+                else
+                    // Closing quote — return to normal mode.
+                    in_q = 0
+            else
+                cur = cur + ch
+        i = i + 1
+    // Push the last (or only) field.
+    fields.push(cur)
+    fields
+
+// Quote a single field value for CSV output if necessary.
+// A field must be quoted if it contains a comma (44), double-quote (34), or
+// newline (10).  Internal double-quotes are doubled.  Otherwise returned as-is.
+fn _cd_quote_field(val) -> string
+    let result = val
+    let needs_quote = 0
+    let n = len(val)
+    let i = 0
+    while i < n
+        let code = ord(char_at(val, i))
+        if code == 44
+            needs_quote = 1
+        if code == 34
+            needs_quote = 1
+        if code == 10
+            needs_quote = 1
+        i = i + 1
+    if needs_quote == 1
+        // Build quoted version: double any internal quotes.
+        let inner = ""
+        let j = 0
+        while j < n
+            let ch = char_at(val, j)
+            if ord(ch) == 34
+                inner = inner + chr(34) + chr(34)
+            else
+                inner = inner + ch
+            j = j + 1
+        result = chr(34) + inner + chr(34)
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// cd_parse: parse a CSV string into a list of dicts.
+//
+// Algorithm:
+//   1. Split on chr(10) to get candidate lines.
+//   2. Strip trailing chr(13) from each line (CRLF tolerance).
+//   3. The first non-empty line is the header; parse it to get field names.
+//   4. Each subsequent non-empty line is parsed into a list of fields and
+//      zipped with the header into a dict.  Short rows get "" for missing
+//      fields; extra fields beyond the header width are ignored.
+fn cd_parse(csv_text) -> list
+    let result = []
+    let lines = split(csv_text, chr(10))
+    let n = len(lines)
+    let header = []
+    let header_found = 0
+    let i = 0
+    while i < n
+        let raw = lines[i]
+        let line = _cd_strip_cr(raw)
+        if len(line) > 0
+            if header_found == 0
+                header = _cd_parse_row(line)
+                header_found = 1
+            else
+                let fields = _cd_parse_row(line)
+                let nf = len(fields)
+                let nh = len(header)
+                let d = {}
+                let j = 0
+                while j < nh
+                    let key = header[j]
+                    let val = ""
+                    if j < nf
+                        val = fields[j]
+                    d[key] = val
+                    j = j + 1
+                result.push(d)
+        i = i + 1
+    result
+
+// cd_headers: return the field names from the first non-empty line.
+fn cd_headers(csv_text) -> list
+    let result = []
+    let lines = split(csv_text, chr(10))
+    let n = len(lines)
+    let found = 0
+    let i = 0
+    while i < n
+        if found == 0
+            let raw = lines[i]
+            let line = _cd_strip_cr(raw)
+            if len(line) > 0
+                result = _cd_parse_row(line)
+                found = 1
+        i = i + 1
+    result
+
+// cd_write: serialize a list of dicts to CSV text.
+//
+// Emits the header line, then one line per row dict.  Fields that need
+// quoting (contain comma, quote, or newline) are wrapped in double-quotes
+// with internal quotes doubled.  Rows are joined by chr(10).
+fn cd_write(rows, headers) -> string
+    let nh = len(headers)
+    // Build header line.
+    let hline = ""
+    let h = 0
+    while h < nh
+        let hf = _cd_quote_field(headers[h])
+        if h == 0
+            hline = hf
+        else
+            hline = hline + chr(44) + hf
+        h = h + 1
+    let result = hline
+    // Build one line per row.
+    let nr = len(rows)
+    let i = 0
+    while i < nr
+        let row = rows[i]
+        let rline = ""
+        let j = 0
+        while j < nh
+            let key = headers[j]
+            let val = ""
+            if contains(row, key)
+                val = row[key]
+            let qf = _cd_quote_field(val)
+            if j == 0
+                rline = qf
+            else
+                rline = rline + chr(44) + qf
+            j = j + 1
+        result = result + chr(10) + rline
+        i = i + 1
+    result
+
+// cd_get: safe dict read with a default value.
+fn cd_get(row, key, dflt) -> any
+    let result = dflt
+    if contains(row, key)
+        result = row[key]
+    result
