@@ -1,0 +1,289 @@
+// ============================================================================
+// NOVA Standard Library — std/data/csvschema
+// ============================================================================
+// CSV column schema inference: scan a CSV text and determine the best type
+// for each column ("int", "float", "bool", or "string").
+//
+// PUBLIC API:
+//   cs_infer(csv_text) -> dict
+//     Parse the CSV text (comma-delimited, first row = header), scan all data
+//     rows, and return a dict mapping each header name to its inferred type.
+//     Type hierarchy (strictest first):
+//       "int"    — every non-empty cell is a valid integer (optional leading '-',
+//                  then only digits, no dot)
+//       "float"  — every non-empty cell is a valid integer or decimal number
+//                  (but at least one is NOT an integer, or falls through from int)
+//       "bool"   — every non-empty cell (case-insensitive) is in the set
+//                  {true, false, yes, no} AND the column is NOT classifiable as
+//                  int (so "0"/"1"-only columns go to "int", not "bool")
+//       "string" — otherwise
+//     Columns with zero data cells default to "string".
+//
+//   cs_is_int(s) -> bool (int 1/0)
+//     Return 1 if s is a valid integer string (optional leading '-', then one
+//     or more decimal digits, no dot, no trailing spaces).
+//
+//   cs_is_float(s) -> bool (int 1/0)
+//     Return 1 if s is a valid integer or decimal number string.
+//     Accepts: optional '-', digits, optional single '.' followed by more digits.
+//
+//   cs_coerce(value_str, type) -> value
+//     Parse value_str to the given type and return the typed value.
+//     type="int"    -> integer (returns 0 on empty/invalid)
+//     type="float"  -> float   (returns 0.0 on empty/invalid)
+//     type="bool"   -> int 1/0 (true/yes=1, false/no=0, else 0)
+//     type="string" -> string as-is
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing from std/.
+//   - Single-exit style throughout (avoids NOVA return-null mistag).
+//   - No multi-line list/dict literals in module body.
+//   - No && / || — uses 'and' / 'or' or nested if.
+//   - Brace chars via chr(123)/chr(125) to avoid string interpolation.
+//   - '/' on two ints is integer division.
+//   - ord('0')=48, ord('9')=57, ord('-')=45, ord('.')=46.
+//
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// Strip trailing CR (chr(13)) from a line (CRLF tolerance).
+fn _csc_strip_cr(line) -> string
+    let result = line
+    let n = len(line)
+    if n > 0
+        if ord(char_at(line, n - 1)) == 13
+            result = slice(line, 0, n - 1)
+    result
+
+// Split a line on ',' into a list of raw field strings.
+fn _csc_split_comma(line) -> list
+    let fields = []
+    let n = len(line)
+    let cur = ""
+    let i = 0
+    while i < n
+        if char_at(line, i) == ","
+            fields.push(cur)
+            cur = ""
+        else
+            cur = cur + char_at(line, i)
+        i = i + 1
+    fields.push(cur)
+    fields
+
+// Return 1 if s is a valid integer string; 0 otherwise.
+// Rules: optional leading '-', then one or more decimal digits, no dot.
+fn _csc_is_int_raw(s) -> int
+    let result = 0
+    let n = len(s)
+    if n > 0
+        let i = 0
+        if char_at(s, 0) == "-"
+            i = 1
+        if i < n
+            let ok = 1
+            let has_digit = 0
+            while i < n
+                let ch = char_at(s, i)
+                let code = ord(ch)
+                if code >= 48
+                    if code <= 57
+                        has_digit = 1
+                    else
+                        ok = 0
+                else
+                    ok = 0
+                i = i + 1
+            if ok == 1
+                if has_digit == 1
+                    result = 1
+    result
+
+// Return 1 if s is a valid float string (integer or decimal); 0 otherwise.
+// Rules: optional leading '-', digits with at most one '.', at least one digit.
+fn _csc_is_float_raw(s) -> int
+    let result = 0
+    let n = len(s)
+    if n > 0
+        let i = 0
+        if char_at(s, 0) == "-"
+            i = 1
+        if i < n
+            let ok = 1
+            let has_digit = 0
+            let has_dot = 0
+            while i < n
+                let ch = char_at(s, i)
+                if ch == "."
+                    if has_dot == 1
+                        ok = 0
+                    else
+                        has_dot = 1
+                else
+                    let code = ord(ch)
+                    if code >= 48
+                        if code <= 57
+                            has_digit = 1
+                        else
+                            ok = 0
+                    else
+                        ok = 0
+                i = i + 1
+            if ok == 1
+                if has_digit == 1
+                    result = 1
+    result
+
+// Return 1 if s (already lower-cased) is a bool word: true/false/yes/no.
+fn _csc_is_bool_word(s) -> int
+    let result = 0
+    if s == "true"
+        result = 1
+    else
+        if s == "false"
+            result = 1
+        else
+            if s == "yes"
+                result = 1
+            else
+                if s == "no"
+                    result = 1
+    result
+
+// Infer the type of a single column given a list of its raw string values.
+// Returns "int", "float", "bool", or "string".
+// Empty cells ("") are skipped (don't affect the type).
+fn _csc_infer_col(values) -> string
+    let n = len(values)
+    // Track which categories all non-empty cells satisfy.
+    let all_int = 1
+    let all_float = 1
+    let all_bool = 1
+    let has_data = 0
+    let i = 0
+    while i < n
+        let v = values[i]
+        if len(v) > 0
+            has_data = 1
+            // Check int.
+            if _csc_is_int_raw(v) == 0
+                all_int = 0
+            // Check float.
+            if _csc_is_float_raw(v) == 0
+                all_float = 0
+            // Check bool: lower-case the value first.
+            let lv = lower(v)
+            if _csc_is_bool_word(lv) == 0
+                all_bool = 0
+        i = i + 1
+    // Default for empty columns.
+    let result = "string"
+    if has_data == 1
+        // Priority: int > float > bool > string.
+        // Note: "0"/"1" are valid ints, so they go to "int" not "bool".
+        if all_int == 1
+            result = "int"
+        else
+            if all_float == 1
+                result = "float"
+            else
+                if all_bool == 1
+                    result = "bool"
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// cs_infer: infer column types from a comma-delimited CSV text.
+//
+// Algorithm:
+//   1. Split text on chr(10); strip CR from each line; skip empty lines.
+//   2. First non-empty line = header row; extract column names.
+//   3. For each subsequent row, split on ',' and collect cell values per column.
+//   4. Call _csc_infer_col for each column.
+//   5. Return dict mapping column_name -> type_string.
+fn cs_infer(csv_text) -> dict
+    let result = {}
+    let raw_lines = split(csv_text, chr(10))
+    let total = len(raw_lines)
+    // Collect non-empty stripped lines.
+    let lines = []
+    let li = 0
+    while li < total
+        let stripped = _csc_strip_cr(raw_lines[li])
+        if len(stripped) > 0
+            lines.push(stripped)
+        li = li + 1
+    let nlines = len(lines)
+    if nlines > 0
+        // Extract header column names from the first line.
+        let headers = _csc_split_comma(lines[0])
+        let ncols = len(headers)
+        // Build per-column value buckets (list of lists).
+        let col_values = []
+        let ci = 0
+        while ci < ncols
+            col_values.push([])
+            ci = ci + 1
+        // Scan data rows.
+        let ri = 1
+        while ri < nlines
+            let row_fields = _csc_split_comma(lines[ri])
+            let nf = len(row_fields)
+            let fi = 0
+            while fi < ncols
+                let cell = ""
+                if fi < nf
+                    cell = row_fields[fi]
+                col_values[fi].push(cell)
+                fi = fi + 1
+            ri = ri + 1
+        // Infer type per column and populate result dict.
+        let ki = 0
+        while ki < ncols
+            let col_name = headers[ki]
+            let inferred = _csc_infer_col(col_values[ki])
+            result[col_name] = inferred
+            ki = ki + 1
+    result
+
+// cs_is_int: return 1 if s is a valid integer string, 0 otherwise.
+fn cs_is_int(s) -> int
+    _csc_is_int_raw(s)
+
+// cs_is_float: return 1 if s is a valid integer or decimal float string, 0 otherwise.
+fn cs_is_float(s) -> int
+    _csc_is_float_raw(s)
+
+// cs_coerce: parse value_str to the given type and return the typed value.
+//
+//   type="int"    -> int  (returns 0 on empty/unparseable)
+//   type="float"  -> float (returns 0.0 equivalent via int_to_float on 0 path)
+//   type="bool"   -> int 1 (true/yes) or 0 (false/no/anything else)
+//   type="string" -> string as-is
+fn cs_coerce(value_str, coltype) -> any
+    let result = null
+    if coltype == "int"
+        let v = 0
+        if len(value_str) > 0
+            v = int(value_str)
+        result = v
+    else
+        if coltype == "float"
+            let fv = 0.0
+            if len(value_str) > 0
+                fv = float(value_str)
+            result = fv
+        else
+            if coltype == "bool"
+                let lv = lower(value_str)
+                let bv = 0
+                if lv == "true"
+                    bv = 1
+                else
+                    if lv == "yes"
+                        bv = 1
+                result = bv
+            else
+                result = value_str
+    result

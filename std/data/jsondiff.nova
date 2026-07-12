@@ -1,0 +1,313 @@
+// ============================================================================
+// NOVA Standard Library — std/data/jsondiff
+// ============================================================================
+// Structural diff of two JSON-like values (nested dicts / lists / scalars).
+//
+// PUBLIC API:
+//   jd_diff(a, b)   -> list   — list of change records (see below)
+//   jd_equal(a, b)  -> bool   — deep structural equality
+//   jd_paths(value) -> list   — all dotted leaf paths in value
+//
+// CHANGE RECORD FORMAT (each element is a dict):
+//   {"op": "replace", "path": "a.b", "old": oldval, "value": newval}
+//   {"op": "remove",  "path": "a.x", "old": oldval}
+//   {"op": "add",     "path": "a.c", "value": newval}
+//
+// PATH FORMAT:
+//   Dict keys use the key name as the segment.
+//   List indices use the numeric string "0", "1", etc.
+//   Segments are joined with "." — e.g. "users.0.name".
+//   Root-level keys have no prefix dot (just "key", not ".key").
+//
+// RUNTIME TYPE DISPATCH:
+//   type_of(x) == "dict" / "list" used everywhere — is_dict/is_list
+//   are compile-time predicates that return 0 for any-typed values.
+//
+// SINGLE-EXIT RULE:
+//   All functions with mixed return paths use `let result = ...` +
+//   reassignment to avoid the NOVA `return null` + `return <value>` mistag.
+//
+// SYMBOL GUARD:
+//   All private helpers are prefixed _jdf_ (jsondiff) to avoid cross-module
+//   symbol collisions in the single linked binary.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _jdf_prefix: build a child path from a parent prefix and a segment.
+// prefix == "" -> just the segment itself (no leading dot).
+// prefix != "" -> "prefix.segment".
+fn _jdf_prefix(prefix, segment) -> string
+    let result = segment
+    if len(prefix) > 0
+        result = prefix + "." + segment
+    result
+
+// _jdf_scalar_equal: compare two scalar (non-dict, non-list) values.
+// Compares via string representation since NOVA any-equality works for
+// int/float/string/null scalars through == when both sides are the same type.
+// We use type_of to guard: if types differ, they can't be equal.
+fn _jdf_scalar_equal(a, b) -> int
+    let result = 0
+    let ta = type_of(a)
+    let tb = type_of(b)
+    if ta == tb
+        if str(a) == str(b)
+            result = 1
+    result
+
+// _jdf_keys_match: check if two sorted key-lists are identical.
+// Returns 1 if same length and every ka[i] == kb[i], else 0.
+fn _jdf_keys_match(ka, kb) -> int
+    let result = 0
+    let na = len(ka)
+    let nb = len(kb)
+    if na == nb
+        result = 1
+        let i = 0
+        while i < na
+            if ka[i] != kb[i]
+                result = 0
+            i = i + 1
+    result
+
+// _jdf_equal_inner: recursive deep equality check.
+// Returns 1 if a and b are structurally equal, 0 otherwise.
+// Broken into flat cases to avoid deep nesting that confuses the codegen.
+fn _jdf_equal_inner(a, b) -> int
+    let result = 0
+    let ta = type_of(a)
+    let tb = type_of(b)
+    if ta == tb
+        if ta == "dict"
+            let ka = sort(keys(a))
+            let kb = sort(keys(b))
+            let km = _jdf_keys_match(ka, kb)
+            if km == 1
+                // Keys match — now recurse into values.
+                let ok = 1
+                let j = 0
+                let nka = len(ka)
+                while j < nka
+                    let k = ka[j]
+                    let sub = _jdf_equal_inner(a[k], b[k])
+                    if sub == 0
+                        ok = 0
+                    j = j + 1
+                result = ok
+        if ta == "list"
+            let na = len(a)
+            let nb = len(b)
+            if na == nb
+                let ok = 1
+                let i = 0
+                while i < na
+                    let sub = _jdf_equal_inner(a[i], b[i])
+                    if sub == 0
+                        ok = 0
+                    i = i + 1
+                result = ok
+        if ta != "dict"
+            if ta != "list"
+                result = _jdf_scalar_equal(a, b)
+    result
+
+// _jdf_diff_dict: diff two dicts and append change records to changes.
+// Scans keys-in-a (emit remove if not in b; else recurse)
+// then keys-in-b (emit add if not in a).
+fn _jdf_diff_dict(a, b, prefix, changes)
+    let ka = keys(a)
+    let i = 0
+    while i < len(ka)
+        let k = ka[i]
+        let child_path = _jdf_prefix(prefix, k)
+        if contains(b, k) == 1
+            _jdf_diff_inner(a[k], b[k], child_path, changes)
+        else
+            let rec = {}
+            rec["op"] = "remove"
+            rec["path"] = child_path
+            rec["old"] = a[k]
+            changes.push(rec)
+        i = i + 1
+    let kb = keys(b)
+    let j = 0
+    while j < len(kb)
+        let k2 = kb[j]
+        if contains(a, k2) == 0
+            let child_path2 = _jdf_prefix(prefix, k2)
+            let rec2 = {}
+            rec2["op"] = "add"
+            rec2["path"] = child_path2
+            rec2["value"] = b[k2]
+            changes.push(rec2)
+        j = j + 1
+
+// _jdf_diff_list: diff two lists and append change records to changes.
+fn _jdf_diff_list(a, b, prefix, changes)
+    let na = len(a)
+    let nb = len(b)
+    let minlen = na
+    if nb < na
+        minlen = nb
+    let i = 0
+    while i < minlen
+        let child_path = _jdf_prefix(prefix, str(i))
+        _jdf_diff_inner(a[i], b[i], child_path, changes)
+        i = i + 1
+    let r = minlen
+    while r < na
+        let child_path2 = _jdf_prefix(prefix, str(r))
+        let rec = {}
+        rec["op"] = "remove"
+        rec["path"] = child_path2
+        rec["old"] = a[r]
+        changes.push(rec)
+        r = r + 1
+    let s = minlen
+    while s < nb
+        let child_path3 = _jdf_prefix(prefix, str(s))
+        let rec2 = {}
+        rec2["op"] = "add"
+        rec2["path"] = child_path3
+        rec2["value"] = b[s]
+        changes.push(rec2)
+        s = s + 1
+
+// _jdf_diff_inner: recursive diff engine.
+// Appends change records into `changes` list (mutated in place).
+// `prefix` is the dotted path up to (but not including) this node.
+fn _jdf_diff_inner(a, b, prefix, changes)
+    let ta = type_of(a)
+    let tb = type_of(b)
+    if ta == "dict"
+        if tb == "dict"
+            _jdf_diff_dict(a, b, prefix, changes)
+        else
+            let rec = {}
+            rec["op"] = "replace"
+            rec["path"] = prefix
+            rec["old"] = a
+            rec["value"] = b
+            changes.push(rec)
+    else if ta == "list"
+        if tb == "list"
+            _jdf_diff_list(a, b, prefix, changes)
+        else
+            let rec2 = {}
+            rec2["op"] = "replace"
+            rec2["path"] = prefix
+            rec2["old"] = a
+            rec2["value"] = b
+            changes.push(rec2)
+    else
+        // a is scalar.
+        if tb == "dict"
+            let rec3 = {}
+            rec3["op"] = "replace"
+            rec3["path"] = prefix
+            rec3["old"] = a
+            rec3["value"] = b
+            changes.push(rec3)
+        else if tb == "list"
+            let rec4 = {}
+            rec4["op"] = "replace"
+            rec4["path"] = prefix
+            rec4["old"] = a
+            rec4["value"] = b
+            changes.push(rec4)
+        else
+            let eq = _jdf_scalar_equal(a, b)
+            if eq == 0
+                let rec5 = {}
+                rec5["op"] = "replace"
+                rec5["path"] = prefix
+                rec5["old"] = a
+                rec5["value"] = b
+                changes.push(rec5)
+
+// _jdf_paths_inner: collect all dotted leaf paths from `value`.
+// A "leaf" is any non-dict, non-list node (scalar, null).
+// Appends collected paths to `out`.
+fn _jdf_paths_inner(value, prefix, out)
+    let tv = type_of(value)
+    if tv == "dict"
+        let ks = sort(keys(value))
+        let i = 0
+        while i < len(ks)
+            let k = ks[i]
+            let child_path = _jdf_prefix(prefix, k)
+            _jdf_paths_inner(value[k], child_path, out)
+            i = i + 1
+    else if tv == "list"
+        let n = len(value)
+        let i = 0
+        while i < n
+            let child_path2 = _jdf_prefix(prefix, str(i))
+            _jdf_paths_inner(value[i], child_path2, out)
+            i = i + 1
+    else
+        let p = prefix
+        if len(p) == 0
+            p = "."
+        out.push(p)
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// jd_diff: compute the structural difference between two JSON-like values.
+//
+// Returns a list of change records, each a dict with:
+//   "op"    -> "add" | "remove" | "replace"
+//   "path"  -> dotted path string (e.g. "a.b", "users.0.name")
+//   "value" -> new value (present for "add" and "replace")
+//   "old"   -> old value (present for "remove" and "replace")
+//
+// Returns [] if a and b are structurally equal.
+//
+// Examples:
+//   jd_diff({"a":1,"b":2}, {"a":1,"b":3})
+//     -> [{"op":"replace","path":"b","old":2,"value":3}]
+//   jd_diff({"a":1}, {"a":1,"c":9})
+//     -> [{"op":"add","path":"c","value":9}]
+//   jd_diff({"a":1,"x":9}, {"a":1})
+//     -> [{"op":"remove","path":"x","old":9}]
+//   jd_diff([1,2,3], [1,2,4])
+//     -> [{"op":"replace","path":"2","old":3,"value":4}]
+fn jd_diff(a, b) -> list
+    let changes = []
+    _jdf_diff_inner(a, b, "", changes)
+    changes
+
+// jd_equal: deep structural equality of two JSON-like values.
+//
+// Returns true iff a and b have the same type, same structure, and same
+// scalar values at every leaf node.
+//
+// Examples:
+//   jd_equal({"a":1}, {"a":1})       -> true
+//   jd_equal({"a":1}, {"a":2})       -> false
+//   jd_equal([1,2,3], [1,2,3])       -> true
+//   jd_equal([1,2], [1,2,3])         -> false
+//   jd_equal("hello", "hello")       -> true
+//   jd_equal(42, 42)                 -> true
+fn jd_equal(a, b) -> bool
+    let r = _jdf_equal_inner(a, b)
+    r == 1
+
+// jd_paths: return a sorted list of all dotted leaf paths in `value`.
+//
+// A "leaf" is any value that is not a dict or list (scalars and null).
+// Dict keys are used as path segments; list indices use numeric strings.
+// A root-level scalar is represented as ".".
+//
+// Examples:
+//   jd_paths({"a":1,"b":{"x":2,"y":3}})  -> ["a","b.x","b.y"]
+//   jd_paths([10,20,30])                  -> ["0","1","2"]
+//   jd_paths(42)                          -> ["."]
+//   jd_paths({})                          -> []
+fn jd_paths(value) -> list
+    let out = []
+    _jdf_paths_inner(value, "", out)
+    out
