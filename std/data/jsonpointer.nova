@@ -1,0 +1,147 @@
+// ============================================================================
+// NOVA Standard Library — std/data/jsonpointer
+// ============================================================================
+// RFC-6901 JSON Pointer over a parsed JSON value.
+//
+// A JSON Pointer is a string like "/a/b/0" that identifies a location inside
+// a JSON document. The empty string "" identifies the root document.
+//
+// POINTER SYNTAX (RFC 6901):
+//   - The pointer is split on "/" to get reference tokens.
+//   - The leading "/" produces an empty first token which is dropped.
+//   - Each token is unescaped: "~1" -> "/" then "~0" -> "~"
+//     (order matters: "~01" must become "~/" not "~0" then "/" then ...)
+//   - For a dict step: look up token as a string key.
+//   - For a list step: convert token to an integer index, then index the list.
+//   - If any step is out of bounds or the key is absent, return a sentinel.
+//
+// PUBLIC API:
+//   jp_get(root, pointer) -> any
+//     Walk the JSON value `root` following `pointer`.
+//     Returns the value at that location, or null on any error (missing key,
+//     out-of-bounds index, wrong node type, invalid pointer).
+//     pointer == "" returns root unchanged (root document).
+//
+//   jp_exists(root, pointer) -> bool
+//     Returns true iff jp_get would return a non-null value for this pointer.
+//     Note: if the target value IS literally JSON null, this returns false.
+//     That is the RFC-safe conservative behaviour — callers that need to
+//     distinguish "present+null" from "absent" should use jp_get directly.
+//
+// RUNTIME TYPE CHECKING:
+//   `is_dict` and `is_list` are COMPILE-TIME predicates — they resolve to 0
+//   for `any`-typed values. For values returned by json_parse (typed `any`),
+//   use `type_of(v) == "dict"` / `type_of(v) == "list"` instead, which
+//   dispatches at RUNTIME via the NOVA tag word.
+//
+// SINGLE-EXIT RULE:
+//   Every function with mixed return types uses a single `let result = null`
+//   pattern to avoid the NOVA `return null` + `return <value>` mistag bug.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _jp_ to avoid collisions.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// Unescape one RFC-6901 reference token.
+// Rule: replace "~1" with "/" first, then replace "~0" with "~".
+// This order is MANDATORY — reversing it would corrupt "~01".
+fn _jp_unescape(token) -> string
+    let s = replace(token, "~1", "/")
+    replace(s, "~0", "~")
+
+// Parse a string token as a non-negative integer index.
+// Returns -1 if the token is empty, contains a non-digit, or is prefixed '-'.
+// We parse manually to ensure strict non-negative decimal only (per RFC 6901).
+fn _jp_parse_index(token) -> int
+    let n = len(token)
+    let result = -1
+    if n > 0
+        // Leading '-' (ord 45) is not a valid array index per RFC 6901.
+        if ord(token[0]) != 45
+            result = 0
+            let i = 0
+            let ok = 1
+            while i < n and ok == 1
+                let c = ord(token[i])
+                // '0'..'9' = 48..57
+                if c < 48 or c > 57
+                    ok = 0
+                    result = -1
+                else
+                    result = result * 10 + (c - 48)
+                i = i + 1
+    result
+
+// Walk one step into `node` using `token` (already unescaped).
+// Uses type_of() for runtime dispatch — is_dict/is_list are compile-time
+// predicates that return 0 for any-typed json_parse results.
+// Returns the child value, or null if the step fails.
+fn _jp_step(node, token) -> any
+    let result = null
+    let kind = type_of(node)
+    if kind == "dict"
+        if contains(node, token) == 1
+            result = node[token]
+    else if kind == "list"
+        let idx = _jp_parse_index(token)
+        if idx >= 0
+            if idx < len(node)
+                result = node[idx]
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// jp_get: resolve a JSON Pointer against a parsed JSON value.
+//
+// pointer == ""  -> root document (returns `root` unchanged, no walking).
+// pointer == "/" -> the key with the empty-string name in the root object.
+//
+// On any error (absent key, out-of-bounds index, wrong node type):
+//   returns null.
+//
+// Examples (root = json_parse of {"a":{"b":[10,20,30]},"x":"hi","p~q":5}):
+//   jp_get(root, "/a/b/1")  -> 20
+//   jp_get(root, "/a/b/0")  -> 10
+//   jp_get(root, "/x")      -> "hi"
+//   jp_get(root, "/p~0q")   -> 5       (token "p~0q" unescapes to "p~q")
+//   jp_get(root, "")        -> root dict
+//   jp_get(root, "/a/z")    -> null    (absent key)
+//   jp_get(root, "/a/b/9")  -> null    (out of bounds)
+fn jp_get(root, pointer) -> any
+    let result = root
+    if len(pointer) > 0
+        // A valid non-empty pointer MUST start with '/'.
+        if pointer[0] != "/"
+            result = null
+        else
+            // Split on "/" — the leading "/" produces an empty first token we skip.
+            let parts = split(pointer, "/")
+            let node = root
+            // parts[0] is always "" (from the leading "/"); start at index 1.
+            let i = 1
+            let ok = 1
+            while i < len(parts) and ok == 1
+                let raw_token = parts[i]
+                let token = _jp_unescape(raw_token)
+                node = _jp_step(node, token)
+                if node == null
+                    ok = 0
+                i = i + 1
+            if ok == 1
+                result = node
+            else
+                result = null
+    result
+
+// jp_exists: return true iff the pointer resolves to a non-null value.
+//
+// Conservative: if the target value is JSON null itself, this returns false.
+// Callers that need to distinguish "present+null" vs "absent" should call
+// jp_get and inspect the result directly.
+fn jp_exists(root, pointer) -> bool
+    let v = jp_get(root, pointer)
+    v != null
