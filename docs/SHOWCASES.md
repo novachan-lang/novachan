@@ -26,6 +26,7 @@ map of where the language is production-solid versus where it still has sharp ed
 | [`showcase_sieve_test.nova`](../nova-compiler/test_programs/showcase_sieve_test.nova) | Sieve of Eratosthenes at **scale** (100k-element array + nested loops), verified vs π(n) | ✅ passes clean (π(100000)=9592) |
 | [`showcase_vm_test.nova`](../nova-compiler/test_programs/showcase_vm_test.nova) | A bytecode VM: operand stack + registers + jumps → real loops (runs factorial + sum programs) | ✅ passes clean (an interpreter in NOVA) |
 | [`showcase_mandelbrot_test.nova`](../nova-compiler/test_programs/showcase_mandelbrot_test.nova) | ASCII Mandelbrot fractal: float escape-time iteration `z=z²+c` in tight loops, rendered + verified | ✅ passes clean (renders the set) |
+| [`showcase_timeline_test.nova`](../nova-compiler/test_programs/showcase_timeline_test.nova) | Project-timeline reporter **integrating 5 `std/` modules**: `std/time/datetime` (ISO parse + calendar + weekday + day arithmetic) + `std/text/pad` (aligned columns) + `std/math/stats` (gap mean/min/max) + `std/text/template` (`{{key}}` header) + `std/text/wrap` (footer reflow) | ✅ passes clean (dates verified vs known calendar; first cross-`std/` integration test) |
 
 Run any of them (Windows, kill-on-timeout runner) from `nova-compiler/test_programs`:
 
