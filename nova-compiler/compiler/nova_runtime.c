@@ -9809,13 +9809,16 @@ int64_t nova_rt_is_valid_utf8(int64_t s_val) {
 int64_t nova_rt_floor(int64_t x) { return (int64_t)floor(nova_float_arg(x)); }
 int64_t nova_rt_ceil(int64_t x)  { return (int64_t)ceil(nova_float_arg(x)); }
 int64_t nova_rt_abs(int64_t x) {
+    /* A float arg (boxed, or a raw-double bit-pattern flowing as `any`) must return a BOXED float,
+       not raw double bits — the compiler types abs-of-any as "any", so an unboxed result would be
+       misread as an integer by any_to_str / any-arithmetic. Only a genuine integer stays raw. */
     if (nova_is_box(x)) {
         NovaBox* bx = (NovaBox*)(uintptr_t)x;
-        if (bx->kind == NOVA_BOX_FLOAT) return f2i(fabs(nova_float_arg(x)));
+        if (bx->kind == NOVA_BOX_FLOAT) return nova_rt_box_float(f2i(fabs(nova_float_arg(x))));
     }
     uint64_t ux = (uint64_t)x;
     uint64_t exp = (ux >> 52) & 0x7FF;
-    if (exp > 0 && exp < 0x7FF) return (int64_t)(ux & 0x7FFFFFFFFFFFFFFFULL);
+    if (exp > 0 && exp < 0x7FF) return nova_rt_box_float((int64_t)(ux & 0x7FFFFFFFFFFFFFFFULL));
     return x < 0 ? -x : x;
 }
 int64_t nova_rt_max(int64_t a, int64_t b) { return a > b ? a : b; }
