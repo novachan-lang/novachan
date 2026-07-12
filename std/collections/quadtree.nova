@@ -1,0 +1,303 @@
+// quadtree — point-region quadtree for 2D integer points.
+//
+// Each node is a NOVA dict:
+//   "x","y"  -> int  origin of bounding box (inclusive lower-left)
+//   "w","h"  -> int  width / height of bounding box
+//   "cap"    -> int  max points before subdivision (e.g. 4)
+//   "pts"    -> list of [px,py]   points stored in THIS node (leaf)
+//   "div"    -> int  1 = subdivided, 0 = leaf
+//   "nw","ne","sw","se" -> child node dicts (present only when div==1)
+//   "cnt"    -> int  total points in this subtree (updated on insert)
+//
+// Bounding box is half-open: contains point (px,py) iff
+//   x <= px < x+w  AND  y <= py < y+h
+//
+// Public API:
+//   qt_new(x,y,w,h)           -> quadtree dict  (capacity hardcoded to 4)
+//   qt_new_cap(x,y,w,h,cap)   -> quadtree dict  (explicit capacity)
+//   qt_insert(t,px,py)        -> int  1=inserted, 0=outside bounds
+//   qt_size(t)                -> int  total points stored
+//   qt_query_range(t,x,y,w,h) -> list of [px,py]  points inside query rect (sorted)
+//   qt_contains_point(t,px,py)-> int  1 if the point was inserted
+
+// ---- private helpers --------------------------------------------------------
+
+// _qt_in_box: 1 if (px,py) is inside the half-open box [x,x+w) x [y,y+h).
+fn _qt_in_box(bx, by, bw, bh, px, py)
+    if px < bx
+        return 0
+    if px >= bx + bw
+        return 0
+    if py < by
+        return 0
+    if py >= by + bh
+        return 0
+    return 1
+
+// _qt_ranges_overlap: 1 if the half-open boxes overlap.
+// Query box [qx,qx+qw) x [qy,qy+qh)  vs  node box [bx,bx+bw) x [by,by+bh).
+fn _qt_ranges_overlap(bx, by, bw, bh, qx, qy, qw, qh)
+    // no overlap if one box is entirely to the side of the other
+    if qx >= bx + bw
+        return 0
+    if qx + qw <= bx
+        return 0
+    if qy >= by + bh
+        return 0
+    if qy + qh <= by
+        return 0
+    return 1
+
+// _qt_subdivide: split a leaf node into four children.
+// Half-widths (integer division — each child gets floor(w/2) or ceil).
+// NW = top-left, NE = top-right, SW = bottom-left, SE = bottom-right
+// (using screen coords where y increases downward; arbitrary choice, consistent).
+fn _qt_subdivide(t)
+    let x = t["x"]
+    let y = t["y"]
+    let w = t["w"]
+    let h = t["h"]
+    let cap = t["cap"]
+    let hw = w / 2
+    let hh = h / 2
+    // right half gets the remainder so total coverage = full w
+    let hw2 = w - hw
+    let hh2 = h - hh
+    let nw = {}
+    nw["x"] = x
+    nw["y"] = y
+    nw["w"] = hw
+    nw["h"] = hh
+    nw["cap"] = cap
+    nw["pts"] = []
+    nw["div"] = 0
+    nw["cnt"] = 0
+    let ne = {}
+    ne["x"] = x + hw
+    ne["y"] = y
+    ne["w"] = hw2
+    ne["h"] = hh
+    ne["cap"] = cap
+    ne["pts"] = []
+    ne["div"] = 0
+    ne["cnt"] = 0
+    let sw = {}
+    sw["x"] = x
+    sw["y"] = y + hh
+    sw["w"] = hw
+    sw["h"] = hh2
+    sw["cap"] = cap
+    sw["pts"] = []
+    sw["div"] = 0
+    sw["cnt"] = 0
+    let se = {}
+    se["x"] = x + hw
+    se["y"] = y + hh
+    se["w"] = hw2
+    se["h"] = hh2
+    se["cap"] = cap
+    se["pts"] = []
+    se["div"] = 0
+    se["cnt"] = 0
+    t["nw"] = nw
+    t["ne"] = ne
+    t["sw"] = sw
+    t["se"] = se
+    t["div"] = 1
+    // re-insert existing points into children
+    let pts = t["pts"]
+    let n = len(pts)
+    let i = 0
+    while i < n
+        let p = pts[i]
+        _qt_insert_node(t, p[0], p[1])
+        i = i + 1
+    // clear leaf storage (points now live in children)
+    t["pts"] = []
+
+// _qt_insert_node: insert (px,py) into node t (assumed in bounds).
+// Returns 1 always (caller already checked bounds).
+fn _qt_insert_node(t, px, py)
+    if t["div"] == 1
+        // internal node — delegate to the correct child
+        let x = t["x"]
+        let y = t["y"]
+        let w = t["w"]
+        let h = t["h"]
+        let hw = w / 2
+        let hh = h / 2
+        let nw = t["nw"]
+        if _qt_in_box(nw["x"], nw["y"], nw["w"], nw["h"], px, py) == 1
+            _qt_insert_node(nw, px, py)
+            nw["cnt"] = nw["cnt"] + 1
+            return 1
+        let ne = t["ne"]
+        if _qt_in_box(ne["x"], ne["y"], ne["w"], ne["h"], px, py) == 1
+            _qt_insert_node(ne, px, py)
+            ne["cnt"] = ne["cnt"] + 1
+            return 1
+        let sw = t["sw"]
+        if _qt_in_box(sw["x"], sw["y"], sw["w"], sw["h"], px, py) == 1
+            _qt_insert_node(sw, px, py)
+            sw["cnt"] = sw["cnt"] + 1
+            return 1
+        let se = t["se"]
+        if _qt_in_box(se["x"], se["y"], se["w"], se["h"], px, py) == 1
+            _qt_insert_node(se, px, py)
+            se["cnt"] = se["cnt"] + 1
+            return 1
+        // point on the exact boundary edge not covered by any child (rounding edge case)
+        // insert into se as fallback
+        _qt_insert_node(se, px, py)
+        se["cnt"] = se["cnt"] + 1
+        return 1
+    // leaf node
+    let pts = t["pts"]
+    let pt = [px, py]
+    pts.push(pt)
+    // subdivide if over capacity
+    if len(pts) > t["cap"]
+        _qt_subdivide(t)
+    return 1
+
+// _qt_query_node: collect all points in node that fall inside query box.
+// Appends to `out` list.
+fn _qt_query_node(t, qx, qy, qw, qh, out)
+    // prune if node box doesn't overlap query box
+    let bx = t["x"]
+    let by = t["y"]
+    let bw = t["w"]
+    let bh = t["h"]
+    if _qt_ranges_overlap(bx, by, bw, bh, qx, qy, qw, qh) == 0
+        return 0
+    if t["div"] == 1
+        _qt_query_node(t["nw"], qx, qy, qw, qh, out)
+        _qt_query_node(t["ne"], qx, qy, qw, qh, out)
+        _qt_query_node(t["sw"], qx, qy, qw, qh, out)
+        _qt_query_node(t["se"], qx, qy, qw, qh, out)
+        return 0
+    // leaf: test each stored point
+    let pts = t["pts"]
+    let n = len(pts)
+    let i = 0
+    while i < n
+        let p = pts[i]
+        if _qt_in_box(qx, qy, qw, qh, p[0], p[1]) == 1
+            out.push(p)
+        i = i + 1
+    return 0
+
+// _qt_sort_points: sort a list of [px,py] lexicographically (px asc, then py asc).
+// Insertion sort — adequate for typical small result sets.
+fn _qt_sort_points(pts)
+    let n = len(pts)
+    let i = 1
+    while i < n
+        let key = pts[i]
+        let kx = key[0]
+        let ky = key[1]
+        let j = i - 1
+        let pos = i
+        let going = 1
+        while going == 1
+            if j >= 0
+                let cur = pts[j]
+                let cx = cur[0]
+                let cy = cur[1]
+                let before = 0
+                if cx > kx
+                    before = 1
+                if cx == kx
+                    if cy > ky
+                        before = 1
+                if before == 1
+                    pts[j + 1] = cur
+                    j = j - 1
+                    pos = j + 1
+                else
+                    pos = j + 1
+                    going = 0
+            else
+                pos = 0
+                going = 0
+        pts[pos] = key
+        i = i + 1
+    return pts
+
+// _qt_search_node: look for exact point (px,py) in the tree.
+fn _qt_search_node(t, px, py)
+    if _qt_in_box(t["x"], t["y"], t["w"], t["h"], px, py) == 0
+        return 0
+    if t["div"] == 1
+        if _qt_search_node(t["nw"], px, py) == 1
+            return 1
+        if _qt_search_node(t["ne"], px, py) == 1
+            return 1
+        if _qt_search_node(t["sw"], px, py) == 1
+            return 1
+        if _qt_search_node(t["se"], px, py) == 1
+            return 1
+        return 0
+    // leaf: scan
+    let pts = t["pts"]
+    let n = len(pts)
+    let i = 0
+    while i < n
+        let p = pts[i]
+        if p[0] == px
+            if p[1] == py
+                return 1
+        i = i + 1
+    return 0
+
+// ---- public API -------------------------------------------------------------
+
+// qt_new: create a quadtree with bounding box [x,x+w) x [y,y+h) and capacity 4.
+fn qt_new(x, y, w, h)
+    let t = {}
+    t["x"] = x
+    t["y"] = y
+    t["w"] = w
+    t["h"] = h
+    t["cap"] = 4
+    t["pts"] = []
+    t["div"] = 0
+    t["cnt"] = 0
+    return t
+
+// qt_new_cap: create a quadtree with explicit capacity per node.
+fn qt_new_cap(x, y, w, h, cap)
+    let t = {}
+    t["x"] = x
+    t["y"] = y
+    t["w"] = w
+    t["h"] = h
+    t["cap"] = cap
+    t["pts"] = []
+    t["div"] = 0
+    t["cnt"] = 0
+    return t
+
+// qt_insert: insert point (px,py).  Returns 1 if inserted, 0 if outside bounds.
+fn qt_insert(t, px, py)
+    if _qt_in_box(t["x"], t["y"], t["w"], t["h"], px, py) == 0
+        return 0
+    _qt_insert_node(t, px, py)
+    t["cnt"] = t["cnt"] + 1
+    return 1
+
+// qt_size: total number of points stored in the tree.
+fn qt_size(t)
+    return t["cnt"]
+
+// qt_query_range: return all stored points inside query rect [x,x+w) x [y,y+h).
+// Result list is sorted lexicographically by (px, py).
+fn qt_query_range(t, x, y, w, h)
+    let out = []
+    _qt_query_node(t, x, y, w, h, out)
+    _qt_sort_points(out)
+    return out
+
+// qt_contains_point: 1 if point (px,py) was previously inserted, else 0.
+fn qt_contains_point(t, px, py)
+    return _qt_search_node(t, px, py)

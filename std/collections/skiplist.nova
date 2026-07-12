@@ -1,0 +1,210 @@
+// skiplist — ordered set of ints backed by a skip list.
+//
+// Level assignment is DETERMINISTIC: level(key) = number of trailing zero
+// bits of (key * 2654435761) & 0xFFFFFFFF, capped at SK_MAXLEVEL-1.
+// This makes the structure fully reproducible for any given set of keys.
+//
+// Representation:
+//   skip-list dict:
+//     "head"     -> sentinel node (key = -2147483648, never exposed)
+//     "size"     -> int
+//     "maxlevel" -> int  (SK_MAXLEVEL = 8)
+//
+//   each node is a dict:
+//     "k"    -> int key  (-2147483648 for head sentinel)
+//     "next" -> list of forward-pointer nodes (one per level, null = end-of-level)
+//
+// The list is linked at level 0 in ascending key order.
+// Levels above 0 are express lanes that skip over multiple nodes.
+//
+// Public API:
+//   sk_new()            -> skiplist
+//   sk_insert(t, key)   -> unit  (no-op if already present)
+//   sk_contains(t, key) -> 1 if present, 0 otherwise
+//   sk_delete(t, key)   -> unit  (no-op if absent)
+//   sk_to_list(t)       -> list  (ascending, walking level-0 lane)
+//   sk_size(t)          -> int
+//   sk_min(t)           -> int   (undefined on empty list)
+//   sk_max(t)           -> int   (undefined on empty list)
+
+let SK_MAXLEVEL = 8
+// Sentinel key: smallest possible value, always < any real key.
+let SK_SENTINEL = -2147483648
+
+// _sk_hash: Knuth multiplicative hash, 32-bit mask.
+fn _sk_hash(key)
+    let h = key * 2654435761
+    let base = 4294967296
+    let r = h - (h / base) * base
+    if r < 0
+        r = r + base
+    return r
+
+// _sk_level: count trailing zero bits of hash, capped at SK_MAXLEVEL - 1.
+// This gives a geometric-like distribution: level 0 always, level k with
+// probability 1/2^(k+1) on average over arbitrary key sets.
+fn _sk_level(key)
+    let h = _sk_hash(key)
+    let lv = 0
+    let v = h
+    while lv < SK_MAXLEVEL - 1
+        // Check if lowest bit is zero
+        let bit = v - (v / 2) * 2
+        if bit != 0
+            return lv
+        lv = lv + 1
+        v = v / 2
+    return lv
+
+// _sk_node: create a new node with the given key and `lv+1` null forward pointers.
+fn _sk_node(key, lv)
+    let nd = {}
+    nd["k"] = key
+    let fwd = []
+    let i = 0
+    while i <= lv
+        fwd.push(null)
+        i = i + 1
+    nd["next"] = fwd
+    return nd
+
+// _sk_head: create the sentinel head node with SK_MAXLEVEL forward pointers.
+fn _sk_head()
+    return _sk_node(SK_SENTINEL, SK_MAXLEVEL - 1)
+
+// sk_new: create a new empty skip list.
+fn sk_new()
+    let t = {}
+    t["head"] = _sk_head()
+    t["size"] = 0
+    t["maxlevel"] = SK_MAXLEVEL
+    return t
+
+// _sk_find_preds: walk from head down each level, collecting the predecessor
+// node at each level just before where `key` would appear.
+// Returns a list of SK_MAXLEVEL predecessor nodes (one per level).
+fn _sk_find_preds(t, key)
+    let preds = []
+    let i = 0
+    while i < SK_MAXLEVEL
+        preds.push(null)
+        i = i + 1
+    let cur = t["head"]
+    let lv = SK_MAXLEVEL - 1
+    while lv >= 0
+        let fwd = cur["next"]
+        // Advance while the next node at this level exists and has key < target
+        let nx = fwd[lv]
+        while nx != null
+            if nx["k"] < key
+                cur = nx
+                fwd = cur["next"]
+                nx = fwd[lv]
+            else
+                nx = null
+        preds[lv] = cur
+        lv = lv - 1
+    return preds
+
+// sk_contains: return 1 if key is present, 0 otherwise.
+fn sk_contains(t, key)
+    let preds = _sk_find_preds(t, key)
+    let pred0 = preds[0]
+    let fwd = pred0["next"]
+    let nx = fwd[0]
+    if nx == null
+        return 0
+    if nx["k"] == key
+        return 1
+    return 0
+
+// sk_insert: insert key. No-op if already present.
+fn sk_insert(t, key)
+    let preds = _sk_find_preds(t, key)
+    // Check for duplicate
+    let pred0 = preds[0]
+    let fwd0 = pred0["next"]
+    let nx0 = fwd0[0]
+    if nx0 != null
+        if nx0["k"] == key
+            return 0
+    // Create node at its deterministic level
+    let lv = _sk_level(key)
+    let nd = _sk_node(key, lv)
+    let ndfwd = nd["next"]
+    // Splice into each level 0..lv
+    let i = 0
+    while i <= lv
+        let pr = preds[i]
+        let prfwd = pr["next"]
+        // nd.next[i] = pred.next[i]
+        ndfwd[i] = prfwd[i]
+        // pred.next[i] = nd
+        prfwd[i] = nd
+        i = i + 1
+    t["size"] = t["size"] + 1
+    return 0
+
+// sk_delete: remove key. No-op if absent.
+fn sk_delete(t, key)
+    let preds = _sk_find_preds(t, key)
+    // Confirm the node actually exists
+    let pred0 = preds[0]
+    let fwd0 = pred0["next"]
+    let target = fwd0[0]
+    if target == null
+        return 0
+    if target["k"] != key
+        return 0
+    // Unlink from each level where target appears
+    let tfwd = target["next"]
+    let nlvs = len(tfwd)
+    let i = 0
+    while i < nlvs
+        let pr = preds[i]
+        let prfwd = pr["next"]
+        // Only unlink if the predecessor actually points to target at this level
+        if prfwd[i] == target
+            prfwd[i] = tfwd[i]
+        i = i + 1
+    t["size"] = t["size"] - 1
+    return 0
+
+// sk_to_list: return all keys in ascending order by walking level-0 lane.
+fn sk_to_list(t)
+    let result = []
+    let cur = t["head"]
+    let fwd = cur["next"]
+    let nx = fwd[0]
+    while nx != null
+        result.push(nx["k"])
+        fwd = nx["next"]
+        nx = fwd[0]
+    return result
+
+// sk_size: return number of elements in the skip list.
+fn sk_size(t)
+    return t["size"]
+
+// sk_min: return the smallest key. Undefined on empty list.
+fn sk_min(t)
+    let head = t["head"]
+    let fwd = head["next"]
+    let nx = fwd[0]
+    return nx["k"]
+
+// sk_max: return the largest key. Walk the level-0 lane to the end.
+fn sk_max(t)
+    let cur = t["head"]
+    let fwd = cur["next"]
+    let nx = fwd[0]
+    while nx != null
+        let nfwd = nx["next"]
+        let nnx = nfwd[0]
+        if nnx == null
+            return nx["k"]
+        cur = nx
+        fwd = nfwd
+        nx = nnx
+    // Should not reach here on a non-empty list
+    return cur["k"]
