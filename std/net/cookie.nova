@@ -1,0 +1,178 @@
+// ============================================================================
+// NOVA Standard Library — std/net/cookie
+// ============================================================================
+// HTTP cookie parsing and serialization.
+//
+// PUBLIC API:
+//   ck_parse(header: string) -> dict
+//     Parse a Cookie request header value ("a=1; b=2") into a dict mapping
+//     cookie name -> value strings.  Trims leading/trailing spaces around
+//     each pair.  On duplicate names, last value wins.  Cookie values with
+//     no '=' get value "".
+//
+//   ck_build(pairs: dict) -> string
+//     Serialise a dict of name->value cookies into a Cookie header value
+//     ("a=1; b=2").  Keys are sorted for deterministic output.
+//
+//   ck_set_cookie(name: string, value: string, opts: dict) -> string
+//     Build a Set-Cookie response header value.  Always emits "name=value".
+//     Appends (in order):
+//       "; Path=<v>"     if opts has key "path"
+//       "; Domain=<v>"   if opts has key "domain"
+//       "; Max-Age=<v>"  if opts has key "max_age"
+//       "; HttpOnly"     if opts has key "HttpOnly" and value is truthy
+//       "; Secure"       if opts has key "Secure" and value is truthy
+//       "; SameSite=<v>" if opts has key "samesite"
+//
+// DESIGN NOTES:
+//   * Parsing splits on "; " (semicolon+space) per RFC 6265 §5.2.
+//     We also handle bare ";" with optional surrounding spaces via trim.
+//   * Bare flags HttpOnly and Secure: the spec emits them without a value.
+//     We check contains(opts, key) — if present, the value is emitted only
+//     if it is truthy (non-zero int or non-empty string).
+//   * NOVA dict missing-key yields int 0, not "".  Always guard with
+//     contains() before reading a value as string.
+//   * type_of(v)=="int" vs "string" used to pick the truthy check path.
+//   * All private helpers prefixed _ck_ to avoid symbol collisions.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _ck_trim: strip leading and trailing ASCII spaces (0x20) from a string.
+fn _ck_trim(s: string) -> string
+    let n = len(s)
+    let start = 0
+    while start < n and char_at(s, start) == " "
+        start = start + 1
+    let stop = n - 1
+    while stop >= start and char_at(s, stop) == " "
+        stop = stop - 1
+    if start > stop
+        return ""
+    slice(s, start, stop + 1)
+
+// _ck_split_first_eq: split on the first '=' in s.
+// Returns a 2-element list [left, right].  If no '=' found returns [s, ""].
+fn _ck_split_first_eq(s: string) -> list
+    let n = len(s)
+    let i = 0
+    let found = -1
+    while i < n
+        if char_at(s, i) == "="
+            found = i
+            i = n
+        else
+            i = i + 1
+    let res = []
+    if found < 0
+        res.push(s)
+        res.push("")
+    else
+        res.push(slice(s, 0, found))
+        res.push(slice(s, found + 1, n))
+    res
+
+// _ck_truthy: return 1 if dict value at opts[key] is truthy.
+// int: non-zero is truthy.  string: non-empty is truthy.  Anything else: truthy.
+fn _ck_truthy(opts: dict, key: string) -> int
+    if not contains(opts, key)
+        return 0
+    let v = opts[key]
+    if type_of(v) == "int"
+        if v == 0
+            return 0
+        return 1
+    if type_of(v) == "string"
+        if v == ""
+            return 0
+        return 1
+    1
+
+// _ck_str_val: safely read a string value from opts; returns "" if absent.
+fn _ck_str_val(opts: dict, key: string) -> string
+    if not contains(opts, key)
+        return ""
+    str(opts[key])
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ck_parse: parse a Cookie header value into a dict of name->value strings.
+//
+// Examples:
+//   ck_parse("a=1; b=2")         -> {"a":"1", "b":"2"}
+//   ck_parse("session=abc123")   -> {"session":"abc123"}
+//   ck_parse("x=hello world")    -> {"x":"hello world"}
+//   ck_parse("")                 -> {}
+fn ck_parse(header: string) -> dict
+    let result = {}
+    if len(header) == 0
+        return result
+    let parts = split(header, ";")
+    let i = 0
+    while i < len(parts)
+        let raw = _ck_trim(parts[i])
+        if len(raw) > 0
+            let pair = _ck_split_first_eq(raw)
+            let name = _ck_trim(pair[0])
+            let value = _ck_trim(pair[1])
+            if len(name) > 0
+                result[name] = value
+        i = i + 1
+    result
+
+// ck_build: serialise a name->value dict to a Cookie header value.
+// Keys are sorted for deterministic output, pairs joined by "; ".
+//
+// Examples:
+//   ck_build({"a":"1","b":"2"})  -> "a=1; b=2"
+//   ck_build({"z":"9","a":"1"})  -> "a=1; z=9"
+//   ck_build({})                 -> ""
+fn ck_build(pairs: dict) -> string
+    let ks = keys(pairs)
+    sort(ks)
+    let result = ""
+    let i = 0
+    while i < len(ks)
+        let k = ks[i]
+        let v = pairs[k]
+        let seg = k + "=" + str(v)
+        if i == 0
+            result = seg
+        else
+            result = result + "; " + seg
+        i = i + 1
+    result
+
+// ck_set_cookie: build a Set-Cookie response header value.
+//
+// Recognised opts keys:
+//   "path"      -> "; Path=<value>"
+//   "domain"    -> "; Domain=<value>"
+//   "max_age"   -> "; Max-Age=<value>"
+//   "HttpOnly"  -> "; HttpOnly"  (emitted if present and truthy)
+//   "Secure"    -> "; Secure"    (emitted if present and truthy)
+//   "samesite"  -> "; SameSite=<value>"
+//
+// Examples:
+//   ck_set_cookie("sid","xyz",{})                     -> "sid=xyz"
+//   ck_set_cookie("sid","xyz",{"path":"/"})           -> "sid=xyz; Path=/"
+//   ck_set_cookie("sid","xyz",{"HttpOnly":1})         -> "sid=xyz; HttpOnly"
+//   ck_set_cookie("a","b",{"path":"/","domain":"example.com","max_age":"3600","HttpOnly":1,"Secure":1,"samesite":"Strict"})
+//     -> "a=b; Path=/; Domain=example.com; Max-Age=3600; HttpOnly; Secure; SameSite=Strict"
+fn ck_set_cookie(name: string, value: string, opts: dict) -> string
+    let result = name + "=" + value
+    if contains(opts, "path")
+        result = result + "; Path=" + _ck_str_val(opts, "path")
+    if contains(opts, "domain")
+        result = result + "; Domain=" + _ck_str_val(opts, "domain")
+    if contains(opts, "max_age")
+        result = result + "; Max-Age=" + _ck_str_val(opts, "max_age")
+    if _ck_truthy(opts, "HttpOnly") == 1
+        result = result + "; HttpOnly"
+    if _ck_truthy(opts, "Secure") == 1
+        result = result + "; Secure"
+    if contains(opts, "samesite")
+        result = result + "; SameSite=" + _ck_str_val(opts, "samesite")
+    result
