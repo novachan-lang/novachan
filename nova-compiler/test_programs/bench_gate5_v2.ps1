@@ -1,6 +1,6 @@
 Set-Location $PSScriptRoot
 . "$PSScriptRoot\_proc_util.ps1"
-Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
+Copy-Item "../compiler/nova_runtime.c" "nova_runtime.c" -Force
 
 # NOTE: c_ms are clang -O2 reference times measured 2026-05-22 on this machine.
 # For an always-accurate comparison use measure_perf.ps1, which recompiles the

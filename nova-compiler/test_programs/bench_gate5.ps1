@@ -1,5 +1,5 @@
 Set-Location $PSScriptRoot
-Copy-Item "output\nova_runtime.c" "nova_runtime.c" -Force
+Copy-Item "../compiler/nova_runtime.c" "nova_runtime.c" -Force
 
 $benches = @(
     @{ name="primes_seq"; file="bench_g5_primes_seq.nova"; c_ms=820 },
