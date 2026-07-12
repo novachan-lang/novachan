@@ -14,7 +14,10 @@
   commit/module, NO reconverge. Independent libs start now; feature-dependent libs wait for Stream 1.
 
 ## ⏱ EXECUTION RHYTHM (OWNER RULE — do NOT violate)
-- **Complete ~30 plan tasks IN ORDER, THEN one full arc.** NOT an arc every few commits (that was the mistake).
+- **UPDATED 2026-07-13: ~100 plan tasks IN ORDER, THEN one full arc** (owner raised 30→100 for the autonomous run;
+  "just check syntax/compile and go ahead" per task; end-of-100 testing must be done very correctly). FULL AUTONOMY —
+  do NOT stop or ask; decide independently. Sonnet-fleet builds / Opus verifies + commits.
+- **Complete ~100 plan tasks IN ORDER, THEN one full arc.** NOT an arc every few commits (that was the mistake).
 - Between tasks: FAST check only — gen4-probe / KAT / standalone-run. **Pure-NOVA stdlib (Stream 2) needs NO reconverge.**
 - The full arc (per ~30 tasks) = reconverge gen5==gen6 IF the compiler/runtime was touched + full nova_ci BOTH modes.
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
@@ -76,7 +79,9 @@
 | forge_signum (D4 signed bignum) | numeric | — | ✅ DONE (fixed INT_MIN) | d708af6f |
 | forge_blake2b (RFC 7693 hash) | crypto | — | ✅ DONE (fixed validation) | d708af6f |
 | forge_hamt (D7 persistent map) | collections | — | ✅ DONE (fixed real-trie) | d708af6f |
-| **JDK-SCALE BREADTH — 120 modules (4× 30-task cycles)** | (all) | — | ✅ DONE (each KAT-gated + independently re-verified; ONE full-CI both-mode arc per 30) | cyc1 b80b7e24·3dc1086d·b4641598·2f5fba65 · cyc2 85fa62b2·d29951ec·fd4d82bc·d0699a19 · cyc3 01d9214e·ac7f0287·febd7584·753a5256 · cyc4 bce96075·5c57e071·2537a25c·30b1f453 |
+| **JDK-SCALE BREADTH — 199 modules (cyc1-5; cyc5 arc ALL GREEN both modes, 1344 tests)** | (all) | — | ✅ DONE (each KAT-gated + independently re-verified; ONE full-CI both-mode arc per cycle) | cyc1 b80b7e24·3dc1086d·b4641598·2f5fba65 · cyc2 85fa62b2·d29951ec·fd4d82bc·d0699a19 · cyc3 01d9214e·ac7f0287·febd7584·753a5256 · cyc4 bce96075·5c57e071·2537a25c·30b1f453 · **cyc5 [30] 7119ba60·d4fb830a·f64fa588·2ab40967 (arc green)** |
+|   ↳ cyc5 adds (io/* gap + algos) | platform·httpheaders·httprequest·crc16·summary·idgen·wraphard·xmlbuild·primes·mimetype·multiset·trie·graph·soundex·cookie·polynomial·bytebuffer·linereader·textwriter·jsonpath·ngram·tokenize·fixedpoint·varint·checkdigit·radix·consistent·shuffle·csvdict·sample | (all) | — | ✅ | |
+|   ↳ cyc6 (100-task, ACTIVE) | batch21 running: hash{djb2·adler32·fletcher·jenkins·pearson·sdbm}+math{fibonacci·collatz·catalan·perfectnum·harmonic·variance} | (all) | — | ⏳ | |
 |   ↳ cyc4 adds | logging·httpdate·wcwidth·btreemap·useragent·roundmode·proplist·typename·stats_ext·env·flatten·frozendict·iprange·hexdump·shellquote·combinations·query·worddiff·whitespace·normaldist·schema·ipclass·morse·acronym·percent·pigify·reverse_words·pipe·gcd_list·netmask | (all) | — | ✅ | |
 |   ↳ cyc3 adds | http_status·similarity·sequences·base64·indexmap·box·enumflags·graycode·color·ipv6·geo·ratelimiter·banner·cron·damerau·jsonmerge·url·orderedset·rot13·metaphone·latin1·deepcopy·highlight·titlecase·mime·humanize_number·uuencode·introot·frozenlist·portname | (all) | — | ✅ | |
 |   ↳ collections | unionfind·ordereddict·bloomfilter·sortedlist·bimap·trie·graph·multimap·fenwick·rangeset·defaultdict·segmenttree | — | ✅ | |
