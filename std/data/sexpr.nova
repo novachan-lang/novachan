@@ -1,0 +1,208 @@
+// ============================================================================
+// NOVA Standard Library — std/data/sexpr
+// ============================================================================
+// S-expression parser and serializer.
+//
+// An S-expression (sexp) is either:
+//   • an ATOM  — any sequence of non-whitespace, non-paren characters
+//   • a LIST   — zero or more sexps enclosed in parentheses: (e1 e2 ... eN)
+//
+// NOVA representation:
+//   • atom  -> string
+//   • list  -> NOVA list (whose elements are atoms or nested lists)
+//
+// PUBLIC API
+//   sx_parse(s)        -> any   parse string s to an atom (string) or list
+//   sx_write(tree)     -> string  serialise atom/list back to sexp string
+//   sx_is_atom(x)      -> int   1 if x is a string (atom), 0 if list
+//
+// EXAMPLES
+//   sx_parse("atom")            -> "atom"
+//   sx_parse("(a b c)")        -> ["a", "b", "c"]
+//   sx_parse("(a (b c) d)")    -> ["a", ["b", "c"], "d"]
+//   sx_parse("()")             -> []
+//   sx_write(["a","b"])        -> "(a b)"
+//   sx_write(["+",["*","2","3"],"4"]) -> "(+ (* 2 3) 4)"
+//   sx_is_atom("x")            -> 1
+//   sx_is_atom(["x"])          -> 0
+//
+// IMPLEMENTATION NOTES
+//   • All private helpers are prefixed _sx_ to avoid symbol collisions.
+//   • Position state is threaded as a single-element dict {"pos": int} so the
+//     recursive sub-parsers can advance the shared cursor.  NOVA has no
+//     mutable reference semantics — passing a dict is the idiomatic solution.
+//   • Single-exit style (let result = ...; ... return result) prevents the
+//     NOVA early-return mistag bug.
+//   • NO multi-line list/dict literals in module body (NOVA parser limitation).
+//   • Brace chars via chr(123)/chr(125) to avoid accidental string interpolation.
+//   • LEAF module — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _sx_is_space: return 1 if character at code-point o is whitespace.
+// We treat space (32), tab (9), newline (10), carriage-return (13) as space.
+fn _sx_is_space(o)
+    let result = 0
+    if o == 32
+        result = 1
+    else
+        if o == 9
+            result = 1
+        else
+            if o == 10
+                result = 1
+            else
+                if o == 13
+                    result = 1
+    return result
+
+// _sx_skip_ws: advance st["pos"] past any whitespace characters.
+fn _sx_skip_ws(s, n, st)
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if _sx_is_space(o) == 1
+                st["pos"] = p + 1
+            else
+                go = 0
+
+// _sx_read_atom: read a contiguous atom starting at st["pos"].
+// An atom ends at whitespace, '(' (40), ')' (41), or end-of-string.
+// Returns the atom string.
+fn _sx_read_atom(s, n, st)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let ch = char_at(s, p)
+            let o = ord(ch)
+            if _sx_is_space(o) == 1
+                go = 0
+            else
+                if o == 40
+                    go = 0
+                else
+                    if o == 41
+                        go = 0
+                    else
+                        buf = buf + ch
+                        st["pos"] = p + 1
+    return buf
+
+// _sx_read_list: parse a list starting AFTER the opening '('.
+// Reads elements until it sees a ')' at the current depth, then consumes it.
+// Returns a NOVA list of parsed elements (each is atom-string or sub-list).
+fn _sx_read_list(s, n, st)
+    let result = []
+    let go = 1
+    while go == 1
+        _sx_skip_ws(s, n, st)
+        let p = st["pos"]
+        if p >= n
+            // Unterminated list — treat as end.
+            go = 0
+        else
+            let ch = char_at(s, p)
+            let o = ord(ch)
+            if o == 41
+                // ')' — consume it and stop.
+                st["pos"] = p + 1
+                go = 0
+            else
+                if o == 40
+                    // '(' — recurse into sub-list.
+                    st["pos"] = p + 1
+                    let sub = _sx_read_list(s, n, st)
+                    result.push(sub)
+                else
+                    // Atom character.
+                    let atom = _sx_read_atom(s, n, st)
+                    result.push(atom)
+    return result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// sx_parse: parse an S-expression string into a NOVA value.
+//
+// Leading and trailing whitespace is ignored.  If the first non-space character
+// is '(' the result is a list (possibly nested); otherwise it is a string atom.
+//
+// Examples:
+//   sx_parse("atom")         -> "atom"
+//   sx_parse("(a b c)")     -> ["a","b","c"]
+//   sx_parse("(a (b c) d)") -> ["a",["b","c"],"d"]
+//   sx_parse("()")          -> []
+fn sx_parse(s) -> any
+    let n = len(s)
+    let st = {}
+    st["pos"] = 0
+    _sx_skip_ws(s, n, st)
+    let result = null
+    let p = st["pos"]
+    if p >= n
+        // Empty / all-whitespace input -> empty atom.
+        result = ""
+    else
+        let ch = char_at(s, p)
+        let o = ord(ch)
+        if o == 40
+            // Opening '(' — parse a list.
+            st["pos"] = p + 1
+            result = _sx_read_list(s, n, st)
+        else
+            // Atom.
+            result = _sx_read_atom(s, n, st)
+    return result
+
+// sx_write: serialise a NOVA sexp value back to a string.
+//
+// Atoms (strings) are returned verbatim.
+// Lists are serialised as "(" + space-joined children + ")".
+// Nested lists are handled recursively.
+//
+// Examples:
+//   sx_write("x")                      -> "x"
+//   sx_write(["a","b"])                -> "(a b)"
+//   sx_write(["+",["*","2","3"],"4"])  -> "(+ (* 2 3) 4)"
+//   sx_write([])                       -> "()"
+fn sx_write(tree) -> string
+    let result = ""
+    if type_of(tree) == "string"
+        result = tree
+    else
+        // It's a list.
+        let n = len(tree)
+        if n == 0
+            result = "()"
+        else
+            let inner = ""
+            let i = 0
+            while i < n
+                let child_str = sx_write(tree[i])
+                if i == 0
+                    inner = child_str
+                else
+                    inner = inner + " " + child_str
+                i = i + 1
+            result = "(" + inner + ")"
+    return result
+
+// sx_is_atom: return 1 if x is an atom (string), 0 if it is a list.
+//
+// Examples:
+//   sx_is_atom("x")   -> 1
+//   sx_is_atom(["x"]) -> 0
+//   sx_is_atom([])    -> 0
+fn sx_is_atom(x) -> int
+    let result = 0
+    if type_of(x) == "string"
+        result = 1
+    return result

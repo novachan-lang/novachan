@@ -1,0 +1,308 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/htmlentities
+// ============================================================================
+// HTML entity encoding and decoding for safe insertion of text into HTML.
+//
+// THREE LEVELS OF ESCAPING:
+//
+//   he_encode(s) -> string
+//     Full escaping for attribute values or element content where ALL five
+//     special characters must be escaped:
+//       &  -> &amp;    (MUST be first; guards against double-encoding)
+//       <  -> &lt;
+//       >  -> &gt;
+//       "  -> &quot;   (safe inside double-quoted attributes)
+//       '  -> &#39;    (safe inside single-quoted attributes)
+//
+//   he_encode_min(s) -> string
+//     Minimal escaping for element TEXT NODES only (not attributes).
+//     Only the three characters that matter for text context:
+//       &  -> &amp;
+//       <  -> &lt;
+//       >  -> &gt;
+//     Single and double quotes are NOT escaped here because they carry no
+//     special meaning inside element text content (only in attribute values).
+//
+//   he_decode(s) -> string
+//     Decodes HTML entities back to their character equivalents.
+//     Handles:
+//       Named: &amp; &lt; &gt; &quot; &#39; (the five this module produces)
+//       Decimal numeric: &#NN; where NN is a decimal codepoint (e.g. &#65; -> A)
+//       Hex numeric:     &#xHH; where HH is hex digits, case-insensitive
+//                        (e.g. &#x41; -> A, &#X41; -> A)
+//     Unrecognised entities are passed through unchanged (lenient/browser-compatible).
+//
+// ROUND-TRIP GUARANTEE:
+//   he_decode(he_encode(s)) == s    for any string s
+//   he_decode(he_encode_min(s)) == s for any string s
+//
+// CHARACTER CONSTANTS (chr() avoids brace-interpolation issues in NOVA strings):
+//   chr(38) = &    chr(60) = <    chr(62) = >
+//   chr(34) = "    chr(39) = '    chr(59) = ;
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _hte_ to avoid collisions with other
+//   std modules compiled into the same binary.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _hte_hexval: convert a hex-digit character to its value (0..15).
+// Returns -1 if c is not a valid hex digit.
+fn _hte_hexval(c) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 65 and b <= 70
+        return b - 55
+    if b >= 97 and b <= 102
+        return b - 87
+    return -1
+
+// _hte_is_digit: 1 if c is ASCII decimal digit '0'..'9', 0 otherwise.
+fn _hte_is_digit(c) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return 1
+    return 0
+
+// _hte_is_alpha: 1 if c is ASCII letter a-z or A-Z, 0 otherwise.
+fn _hte_is_alpha(c) -> int
+    let b = ord(c)
+    if b >= 65 and b <= 90
+        return 1
+    if b >= 97 and b <= 122
+        return 1
+    return 0
+
+// _hte_is_entity_char: 1 if c is a valid character inside an &...;  entity token.
+// We allow: letters, digits, '#' (35), 'x' (120), 'X' (88).
+// In practice this is: letter, digit, or '#'.
+// 'x'/'X' are already covered by _hte_is_alpha / _hte_is_digit subset check,
+// but we keep explicit coverage for '#'.
+fn _hte_is_entity_char(c) -> int
+    if _hte_is_alpha(c) == 1
+        return 1
+    if _hte_is_digit(c) == 1
+        return 1
+    if ord(c) == 35
+        return 1
+    return 0
+
+// _hte_decode_named: given the token between & and ; (exclusive),
+// return the replacement string if it is a recognised entity, or "" otherwise.
+fn _hte_decode_named(tok) -> string
+    if tok == "amp"
+        return chr(38)
+    if tok == "lt"
+        return chr(60)
+    if tok == "gt"
+        return chr(62)
+    if tok == "quot"
+        return chr(34)
+    return ""
+
+// _hte_decode_numeric: decode a numeric entity token (without & and ;).
+// tok must start with '#'.  Returns "" on failure.
+//   "#65"    -> "A"  (decimal)
+//   "#x41"   -> "A"  (hex)
+//   "#X41"   -> "A"  (hex, uppercase X)
+fn _hte_decode_numeric(tok) -> string
+    let tlen = len(tok)
+    // minimum: "#1" = 2 chars
+    if tlen < 2
+        return ""
+    // first char must be '#'
+    if tok[0] != "#"
+        return ""
+    let second = tok[1]
+    // Hex: &#xHH; or &#XHH;
+    if second == "x" or second == "X"
+        if tlen < 3
+            return ""
+        let cp = 0
+        let i = 2
+        let ok = 1
+        while i < tlen
+            let hv = _hte_hexval(tok[i])
+            if hv < 0
+                ok = 0
+            if ok == 1
+                cp = cp * 16 + hv
+            i = i + 1
+        if ok == 0
+            return ""
+        return from_codepoint(cp)
+    // Decimal: &#NN;
+    let cp = 0
+    let i = 1
+    let ok = 1
+    while i < tlen
+        if _hte_is_digit(tok[i]) == 0
+            ok = 0
+        if ok == 1
+            cp = cp * 10 + (ord(tok[i]) - 48)
+        i = i + 1
+    if ok == 0
+        return ""
+    return from_codepoint(cp)
+
+// _hte_decode_entity: dispatch to named or numeric decoder.
+// tok is the raw token between & and ; (e.g. "amp", "lt", "#65", "#x41").
+// Returns "" if unrecognised.
+fn _hte_decode_entity(tok) -> string
+    if len(tok) == 0
+        return ""
+    if tok[0] == "#"
+        return _hte_decode_numeric(tok)
+    return _hte_decode_named(tok)
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// he_encode: full HTML entity encoding for attribute values and element content.
+//
+// Escapes the five HTML-special characters:
+//   &  -> &amp;    chr(38)
+//   <  -> &lt;     chr(60)
+//   >  -> &gt;     chr(62)
+//   "  -> &quot;   chr(34)
+//   '  -> &#39;    chr(39)
+//
+// Examples:
+//   he_encode(chr(60)+"a"+chr(62))  == "&lt;a&gt;"
+//   he_encode("Tom & Jerry")        == "Tom &amp; Jerry"
+//   he_encode(chr(34))              == "&quot;"
+//   he_encode(chr(39))              == "&#39;"
+//   he_encode("a<b>&c")            == "a&lt;b&gt;&amp;c"
+fn he_encode(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        let b = ord(c)
+        if b == 38
+            out = out + "&amp;"
+        else if b == 60
+            out = out + "&lt;"
+        else if b == 62
+            out = out + "&gt;"
+        else if b == 34
+            out = out + "&quot;"
+        else if b == 39
+            out = out + "&#39;"
+        else
+            out = out + c
+        i = i + 1
+    return out
+
+// he_encode_min: minimal HTML entity encoding for element text nodes only.
+//
+// Escapes only the three characters significant in element text:
+//   &  -> &amp;    chr(38)
+//   <  -> &lt;     chr(60)
+//   >  -> &gt;     chr(62)
+//
+// Double-quote and single-quote are NOT escaped (they are harmless in
+// element text; only dangerous in attribute values). Use he_encode for
+// attribute contexts.
+//
+// Examples:
+//   he_encode_min("Hello <World>")      == "Hello &lt;World&gt;"
+//   he_encode_min("Tom & Jerry")        == "Tom &amp; Jerry"
+//   he_encode_min(chr(34)+"x"+chr(34)) == chr(34)+"x"+chr(34)
+fn he_encode_min(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        let b = ord(c)
+        if b == 38
+            out = out + "&amp;"
+        else if b == 60
+            out = out + "&lt;"
+        else if b == 62
+            out = out + "&gt;"
+        else
+            out = out + c
+        i = i + 1
+    return out
+
+// he_decode: decode HTML entities in a string back to their characters.
+//
+// Algorithm: scan left-to-right. On '&', look ahead for a semicolon within
+// 20 characters while accumulating only valid entity characters (letters,
+// digits, '#'). If a semicolon is found, attempt to decode the accumulated
+// token. On success emit the replacement; on failure emit the raw &...;
+// verbatim. If no semicolon is found (or an invalid char is seen before ';'),
+// emit '&' literally and resume scanning from the character after '&'.
+//
+// Recognised patterns:
+//   &amp; &lt; &gt; &quot; &#39; — named entities from this module
+//   &#NN;  — decimal codepoint
+//   &#xHH; &#XHH; — hexadecimal codepoint (case-insensitive 'x')
+//
+// Unrecognised entities (e.g. "&nbsp;") are passed through verbatim.
+//
+// Examples:
+//   he_decode("&lt;b&gt;")   == chr(60)+"b"+chr(62)
+//   he_decode("&amp;")       == chr(38)
+//   he_decode("&#65;")       == "A"
+//   he_decode("&#x41;")      == "A"
+//   he_decode("Tom &amp; Jerry") == "Tom & Jerry"
+fn he_decode(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        let b = ord(c)
+        if b != 38
+            // Fast path: not '&', copy verbatim
+            out = out + c
+            i = i + 1
+        else
+            // Slow path: encountered '&', try to decode an entity.
+            // Phase 1: accumulate token characters until ';' or non-entity char.
+            // We scan ahead WITHOUT advancing i yet.
+            let tok = ""
+            let j = i + 1
+            // State: 0=scanning, 1=found semicolon, 2=invalid (no semi)
+            let state = 0
+            while state == 0
+                if j >= n
+                    // ran off end without finding ';'
+                    state = 2
+                else if j - i > 20
+                    // entity too long — not a real entity
+                    state = 2
+                else
+                    let ec = s[j]
+                    let eb = ord(ec)
+                    if eb == 59
+                        // semicolon found — entity token complete
+                        state = 1
+                    else if _hte_is_entity_char(ec) == 1
+                        tok = tok + ec
+                        j = j + 1
+                    else
+                        // unexpected char — not a valid entity
+                        state = 2
+            if state == 1
+                // Found '&' + tok + ';'  — try to decode
+                let replacement = _hte_decode_entity(tok)
+                if len(replacement) > 0
+                    out = out + replacement
+                    // advance past '&' + tok + ';'  (j currently AT ';', so +1)
+                    i = j + 1
+                else
+                    // Unrecognised entity: emit verbatim &...;
+                    out = out + chr(38) + tok + chr(59)
+                    i = j + 1
+            else
+                // No valid entity found: emit literal '&' and move past it
+                out = out + chr(38)
+                i = i + 1
+    return out

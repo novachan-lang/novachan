@@ -1,0 +1,296 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/base91
+// ============================================================================
+// basE91 binary-to-text encoding (Joachim Henke).
+//   http://base91.sourceforge.net/
+//
+// WHY BASE91:
+//   basE91 achieves ~23% overhead (vs 33% for base64) with a 91-character
+//   printable-ASCII alphabet. It encodes 13 or 14 input bits per two output
+//   chars: when the 13-bit value v <= 88, 14 bits are consumed; otherwise 13.
+//   This variable-width trick squeezes out extra density vs base64's fixed
+//   6-bits-per-char scheme, making basE91 the most space-efficient
+//   printable-ASCII encoding for general binary data.
+//
+// THE BINARY-SAFETY PROPERTY:
+//   NOVA strings are C-string-shaped: a 0x00 byte inside a string silently
+//   truncates (reference_nova_string_nul_truncation). Binary data routinely
+//   contains 0x00 bytes. This module takes and returns `bytes` for the raw
+//   data side, making 0x00 an ordinary byte — never truncated, never lost.
+//
+// PUBLIC API:
+//   b91_encode(data: bytes) -> string   encode bytes to basE91 string
+//   b91_decode(s: string) -> bytes      decode basE91 string to bytes
+//
+// ALPHABET (91 chars, index 0..90):
+//   A-Z (0..25) + a-z (26..51) + 0-9 (52..61) +
+//   !#$%&()*+,./:;<=>?@[]^_`{|}~" (62..90)
+//   Index 90 is the double-quote character '"'.
+//   Note: { } $ ` " cannot appear literally in NOVA strings; they are built
+//   via chr(123)/chr(125)/chr(36)/chr(96)/chr(34) to avoid interpolation.
+//
+// ALGORITHM (Henke 2000):
+//   ENCODE:
+//     Accumulate input bits in a 64-bit buffer b, counting nbits.
+//     When nbits > 13:
+//       Extract v = b & 8191 (low 13 bits)
+//       if v > 88: consume 13 bits (b >>= 13, nbits -= 13)
+//       else:      v = b & 16383 (14 bits), consume 14 (b >>= 14, nbits -= 14)
+//       emit alpha[v % 91] and alpha[v / 91]
+//     Trailer (remaining bits):
+//       emit alpha[b % 91]
+//       if nbits > 7 OR b > 90: emit alpha[b / 91]
+//
+//   DECODE:
+//     Maintain accumulator pair (b, nbits) and pending first-symbol v (or -1).
+//     For each char: look up symbol index c (0..90).
+//     If v < 0: v = c (first of pair)
+//     Else:
+//       v += c * 91
+//       b |= v << nbits
+//       if (v & 8191) > 88: nbits += 13 else nbits += 14
+//       while nbits > 7: emit (b & 0xFF), b >>= 8, nbits -= 8
+//       v = -1
+//     Trailer: if v >= 0: emit (b | (v << nbits)) & 0xFF
+//
+// ARITHMETIC HAZARDS — >> IS ARITHMETIC IN NOVA:
+//   All right-shifts of values that might have the high bit set must be
+//   masked with & 0xFF (byte extraction) or handled via explicit mask.
+//   We keep b in the range 0..16383 by masking after extraction, so the
+//   accumulator stays non-negative throughout.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _b91_ to avoid collisions with other
+//   std modules compiled into the same binary.
+
+// ── Alphabet ─────────────────────────────────────────────────────────────────
+
+// Build the 91-char basE91 alphabet string.
+// Characters that would interpolate in NOVA string literals are built via chr():
+//   chr(36) = '$'   chr(96) = '`'   chr(123) = '{'
+//   chr(124) = '|'  chr(125) = '}'  chr(126) = '~'  chr(34) = '"'
+// This function is called once per encode/decode; its cost is negligible.
+fn _b91_alpha() -> string
+    let az = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    let sp = "!#" + chr(36) + "%&()*+,./:;<=>?@[]^_" + chr(96) + chr(123) + "|" + chr(125) + "~" + chr(34)
+    az + sp
+
+// Return the char at alphabet index i (0..90).
+fn _b91_char(alpha, i) -> string
+    alpha[i]
+
+// Return the alphabet index for character c, or -1 if not in alphabet.
+// The alphabet is:
+//   A-Z: 0..25    (ASCII 65..90)
+//   a-z: 26..51   (ASCII 97..122)
+//   0-9: 52..61   (ASCII 48..57)
+//   !   (33) -> 62
+//   #   (35) -> 63
+//   $   (36) -> 64
+//   %   (37) -> 65
+//   &   (38) -> 66
+//   (   (40) -> 67
+//   )   (41) -> 68
+//   *   (42) -> 69
+//   +   (43) -> 70
+//   ,   (44) -> 71
+//   .   (46) -> 72
+//   /   (47) -> 73
+//   :   (58) -> 74
+//   ;   (59) -> 75
+//   <   (60) -> 76
+//   =   (61) -> 77
+//   >   (62) -> 78
+//   ?   (63) -> 79
+//   @   (64) -> 80
+//   [   (91) -> 81
+//   ]   (93) -> 82
+//   ^   (94) -> 83
+//   _   (95) -> 84
+//   `   (96) -> 85
+//   {  (123) -> 86
+//   |  (124) -> 87
+//   }  (125) -> 88
+//   ~  (126) -> 89
+//   "   (34) -> 90
+fn _b91_val(b) -> int
+    // A-Z -> 0..25
+    if b >= 65 and b <= 90
+        return b - 65
+    // a-z -> 26..51
+    if b >= 97 and b <= 122
+        return b - 97 + 26
+    // 0-9 -> 52..61
+    if b >= 48 and b <= 57
+        return b - 48 + 52
+    // special characters (in alphabet order)
+    if b == 33
+        return 62
+    if b == 35
+        return 63
+    if b == 36
+        return 64
+    if b == 37
+        return 65
+    if b == 38
+        return 66
+    if b == 40
+        return 67
+    if b == 41
+        return 68
+    if b == 42
+        return 69
+    if b == 43
+        return 70
+    if b == 44
+        return 71
+    if b == 46
+        return 72
+    if b == 47
+        return 73
+    if b == 58
+        return 74
+    if b == 59
+        return 75
+    if b == 60
+        return 76
+    if b == 61
+        return 77
+    if b == 62
+        return 78
+    if b == 63
+        return 79
+    if b == 64
+        return 80
+    if b == 91
+        return 81
+    if b == 93
+        return 82
+    if b == 94
+        return 83
+    if b == 95
+        return 84
+    if b == 96
+        return 85
+    if b == 123
+        return 86
+    if b == 124
+        return 87
+    if b == 125
+        return 88
+    if b == 126
+        return 89
+    if b == 34
+        return 90
+    -1
+
+// ── Encode ───────────────────────────────────────────────────────────────────
+// b91_encode: encode arbitrary binary bytes to a basE91 string.
+//
+// Algorithm (Henke reference C implementation):
+//   b = bit accumulator (13-14 bits at most between emissions)
+//   n = number of valid bits in b
+//   For each input byte:
+//     b |= byte << n; n += 8
+//     if n > 13:
+//       v = b & 8191   (low 13 bits)
+//       if v > 88: consume 13 bits (b >>= 13; n -= 13)
+//       else:      v = b & 16383; consume 14 bits (b >>= 14; n -= 14)
+//       emit alpha[v%91] + alpha[v/91]
+//   Trailer:
+//     if n > 0: emit alpha[b%91]; if n > 7 or b > 90: emit alpha[b/91]
+
+fn b91_encode(data) -> string
+    let alpha = _b91_alpha()
+    let nb = bytes_len(data)
+    if nb == 0
+        return ""
+    let out = ""
+    let b = 0
+    let n = 0
+    let i = 0
+    while i < nb
+        let bv = bytes_get(data, i) & 0xFF
+        b = b | (bv << n)
+        n = n + 8
+        if n > 13
+            let v = b & 8191
+            if v > 88
+                b = b >> 13
+                // mask to keep only unconsumed bits (n-13 bits)
+                let keepmask = (1 << (n - 13)) - 1
+                b = b & keepmask
+                n = n - 13
+            else
+                v = b & 16383
+                b = b >> 14
+                let keepmask2 = (1 << (n - 14)) - 1
+                b = b & keepmask2
+                n = n - 14
+            out = out + _b91_char(alpha, v % 91) + _b91_char(alpha, v / 91)
+        i = i + 1
+    // trailer: emit remaining bits
+    if n > 0
+        out = out + _b91_char(alpha, b % 91)
+        if n > 7 or b > 90
+            out = out + _b91_char(alpha, b / 91)
+    out
+
+// ── Decode ───────────────────────────────────────────────────────────────────
+// b91_decode: decode a basE91 string back to bytes.
+//
+// Algorithm (Henke reference C implementation):
+//   v = -1 (sentinel: no first symbol yet)
+//   b = bit accumulator; n = valid bits in b
+//   For each char c in input:
+//     idx = _b91_val(ord(c))
+//     if idx < 0: skip (not in alphabet)
+//     if v < 0: v = idx   (store first symbol of pair)
+//     else:
+//       v += idx * 91     (combine with second symbol)
+//       b |= v << n
+//       n += ((v & 8191) > 88) ? 13 : 14
+//       v = -1
+//       while n > 7: emit b & 0xFF; b >>= 8; n -= 8
+//   Trailer: if v >= 0: emit (b | (v << n)) & 0xFF
+
+fn b91_decode(s) -> any
+    let slen = len(s)
+    let out = bytes(0)
+    if slen == 0
+        return out
+    let v = -1
+    let b = 0
+    let n = 0
+    let i = 0
+    while i < slen
+        let bo = ord(s[i])
+        let idx = _b91_val(bo)
+        if idx >= 0
+            if v < 0
+                v = idx
+            else
+                v = v + idx * 91
+                b = b | (v << n)
+                // decide 13 vs 14 bits consumed
+                let vlow = v & 8191
+                if vlow > 88
+                    n = n + 13
+                else
+                    n = n + 14
+                v = -1
+                // flush complete bytes
+                while n > 7
+                    let bval = b & 0xFF
+                    out = bytes_append(out, bval)
+                    b = b >> 8
+                    // mask to prevent sign extension artifacts from arithmetic >>
+                    let flushmask = (1 << (n - 8)) - 1
+                    b = b & flushmask
+                    n = n - 8
+        i = i + 1
+    // trailer: one pending symbol
+    if v >= 0
+        let lastbyte = (b | (v << n)) & 0xFF
+        out = bytes_append(out, lastbyte)
+    out

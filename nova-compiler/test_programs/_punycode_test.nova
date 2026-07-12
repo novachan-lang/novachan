@@ -1,0 +1,108 @@
+// KAT test for std/encoding/punycode
+// RFC 3492 Bootstring / Punycode codec
+// Verified vectors: Node.js punycode module + manual RFC 3492 §7.1 trace
+
+import std/encoding/punycode
+
+// Helper: check string equality, print FAIL and exit(1) if wrong.
+fn cks(label, got, want)
+    if got != want
+        print("FAIL " + label + ": got=[" + got + "] want=[" + want + "]")
+        exit(1)
+
+// ── KAT 1: pc_encode("bücher") == "bcher-kva" ────────────────────────────────
+// bücher codepoints: [98, 252, 99, 104, 101, 114]
+// basics: b,c,h,e,r -> "bcher", 1 non-basic (ü=252)
+// delta trace: (252-128)*(5+1)=744; scan: b(98)<252->+1=745; ü=252: q=745
+//   k=36: t=clamp(36-72,1,26)=1; digit=1+(745-1)%(36-1)=1+744%35=1+9=10 -> 'k'
+//         q=(745-1)/(36-1)=744/35=21
+//   k=72: t=clamp(72-0,1,26)=26; 21<26 -> emit digit(21) -> 'v'  (bias is 0 after adapt)
+//   Wait: after emitting 'k', bias = adapt(745, 6, firsttime=1)
+//     = adapt(745/700, 6, true) = adapt(1, 6, true)
+//     delta=1 + 1/6=1, k=0: 1 <= (36-1)*26/2=455 -> no loop
+//     = 0 + (36-1+1)*1/(1+38) = 36*1/39 = 0
+//   So bias=0 for second digit emission.
+//   k=72: t=clamp(72-0,1,26)=26; q=21; 21<26 -> emit digit(21) -> 'v'
+// Expected: "bcher-kva"
+let e1 = pc_encode("b" + from_codepoint(252) + "cher")
+cks("pc_encode_buecher", e1, "bcher-kva")
+
+// ── KAT 2: pc_decode("bcher-kva") == "bücher" ────────────────────────────────
+// last_dash at index 5; basic="bcher"; extended="kva"
+// k=10 (digit of 'k'), w=1, k=36: t=clamp(36-72,1,26)=1; 10>=1 -> w=35
+// k=72: digit='v'=21; i=10+21*35=745; t=clamp(72-0,1,26)=26; 21<26 -> stop
+// out_len=6, bias=adapt(745,6,true)=0
+// n=128+745/6=128+124=252; i=745%6=1
+// insert cp=252 at pos=1 -> [98,252,99,104,101,114]; i=2
+// extended done.
+let d1 = pc_decode("bcher-kva")
+cks("pc_decode_bcher_kva", d1, "b" + from_codepoint(252) + "cher")
+
+// ── KAT 3: pc_encode("münchen") == "mnchen-3ya" ──────────────────────────────
+// münchen codepoints: [109, 252, 110, 99, 104, 101, 110]
+// basics: m,n,c,h,e,n -> "mnchen" (6), 1 non-basic ü(252) at position 1
+// delta: (252-128)*(6+1)=868; scan: m(109)<252->+1=869; ü=252 q=869
+//   bias=72; k=36: t=clamp(36-72,1,26)=1; digit=1+(869-1)%(36-1)=1+868%35=1+28=29->'3'
+//   q=(869-1)/(36-1)=868/35=24
+//   adapt(869,7,true): d=869/700=1; 1+1/7=1; 1<=455 no loop -> (0+36*1)/(1+38)=36/39=0
+//   bias=0; k=72: t=clamp(72-0,1,26)=26; q=24; 24<26 -> emit digit(24) -> 'y'
+//   then q=0 final digit -> emit 'a'; but wait: after emitting '3' we stop at q<t
+//   Re-check: q=24, k=72, t=26; 24<26 -> emit char(24)='y' and stop. Output="3y"
+//   Then final q=0... wait, that's the inner loop. Let me re-check.
+//   Actually: first iter k=36: digit=29 -> '3', q=24; 29>=1 continue
+//   k=72: t=26; q=24<26 -> emit '24'='y'; stop inner loop.
+//   But we haven't emitted q=0 yet... wait digit IS 24 (='y'), not q=0.
+//   Hmm, '3ya': 3=digit29, y=digit24, a=digit0. Let me re-examine:
+//   After emitting '3': q=(869-1)/(35)=868/35=24; continue.
+//   k=72: t=clamp(72-72,1,26)=clamp(0,1,26)=1; 24>=1 -> digit=1+(24-1)%(35)=1+23=24='y'; q=(24-1)/35=23/35=0
+//   k=108: t=clamp(108-0,1,26)=26; q=0<26 -> emit digit(0)='a'; stop.
+//   Output: "mnchen-3ya". Correct!
+let e3 = pc_encode("m" + from_codepoint(252) + "nchen")
+cks("pc_encode_muenchen", e3, "mnchen-3ya")
+
+// ── KAT 4: pc_decode("mnchen-3ya") == "münchen" ──────────────────────────────
+let d4 = pc_decode("mnchen-3ya")
+cks("pc_decode_mnchen_3ya", d4, "m" + from_codepoint(252) + "nchen")
+
+// ── KAT 5: pc_encode("abc") == "abc-" (all-ASCII trailing delimiter) ─────────
+// RFC 3492 §5: all-ASCII input outputs basics + '-' delimiter, no deltas.
+let e5 = pc_encode("abc")
+cks("pc_encode_abc", e5, "abc-")
+
+// ── KAT 6: pc_decode("abc-") == "abc" (trailing delimiter, no extended part) ─
+// last_dash at index 3; basic="abc"; extended="" (empty) -> no delta processing
+let d6 = pc_decode("abc-")
+cks("pc_decode_abc_dash", d6, "abc")
+
+// ── KAT 7: round-trip bücher ─────────────────────────────────────────────────
+let buecher = "b" + from_codepoint(252) + "cher"
+let rt = pc_decode(pc_encode(buecher))
+cks("round_trip_buecher", rt, buecher)
+
+// ── KAT 8: round-trip münchen ────────────────────────────────────────────────
+let muenchen = "m" + from_codepoint(252) + "nchen"
+let rt2 = pc_decode(pc_encode(muenchen))
+cks("round_trip_muenchen", rt2, muenchen)
+
+// ── KAT 9: pure ASCII no-op round-trip ───────────────────────────────────────
+let hello = "hello"
+let rt3 = pc_decode(pc_encode(hello))
+cks("round_trip_ascii", rt3, hello)
+
+// ── KAT 10: single non-ASCII codepoint ───────────────────────────────────────
+// Just ü = codepoint 252. No basics, so no '-' before deltas?
+// Actually basics count = 0, so output = "" + "-" = "-" (delimiter always appended)
+// Then delta = 252 - 128 = 124 (initial n=128, m=252, h=0, (m-n)*(h+1)=124)
+// Scan: cp=252==n: q=124
+//   bias=72; k=36: t=clamp(36-72,1,26)=1; digit=1+(124-1)%35=1+123%35=1+18=19->'t'
+//   q=(124-1)/35=123/35=3; continue
+//   adapt(124,1,true): d=124/700=0; 0+0/1=0; 0<=455 -> k=0; (36*0)/(0+38)=0. bias=0
+//   k=72: t=clamp(72-0,1,26)=26; q=3; 3<26 -> emit digit(3)='d'; stop
+//   Output: "-td"
+// Decode "-td": last_dash at 0, basic="" (last_dash==0 case), extended="td"
+let single_u = from_codepoint(252)
+let enc10 = pc_encode(single_u)
+let dec10 = pc_decode(enc10)
+cks("round_trip_single_u_umlaut", dec10, single_u)
+
+print("_punycode_test passed")

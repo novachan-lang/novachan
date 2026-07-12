@@ -1,0 +1,404 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/punycode
+// ============================================================================
+// Punycode (RFC 3492) codec — the Bootstring encoding used for IDN (IDNA).
+//
+// WHAT PUNYCODE IS:
+//   Punycode encodes a Unicode string as a subset of ASCII so that
+//   internationalized domain names can be carried in DNS (which only allows
+//   A-Za-z0-9 and hyphens). A domain like "münchen.de" becomes
+//   "xn--mnchen-3ya.de" — the "xn--" prefix plus the Punycode of the label.
+//   This module provides the CODEC LAYER (encode/decode); the "xn--" prefix
+//   management (IDNA) is a caller concern and is NOT added here.
+//
+// ALGORITHM OVERVIEW (RFC 3492 §5, "Bootstring"):
+//   Encode:
+//     1. Output all basic (ASCII < 128) code points verbatim.
+//     2. If any basics, append delimiter '-'.
+//     3. Iterate over non-basic code points in ascending order, each time
+//        encoding the insertion delta as a generalized variable-length integer
+//        in a 36-character alphabet (a-z for digits 0-25, 0-9 for 26-35).
+//     4. Each delta is bias-adapted so that common deltas use fewer symbols.
+//   Decode:
+//     1. Split at the LAST '-'. Everything before is the initial basic sequence.
+//     2. Consume the extended part as generalized variable-length integers to
+//        reconstruct the sequence of (codepoint, insertion-position) pairs.
+//     3. After all insertions, re-encode the code-point list to UTF-8.
+//
+// BOOTSTRING PARAMETERS (RFC 3492 §5):
+//   base=36, tmin=1, tmax=26, skew=38, damp=700,
+//   initial_bias=72, initial_n=128
+//
+// PUBLIC API:
+//   pc_encode(s: string) -> string
+//     Encodes a UTF-8 string to its Punycode representation (no "xn--" prefix).
+//     All-ASCII input appends a trailing '-' per RFC 3492 §5 ("abc" -> "abc-").
+//
+//   pc_decode(s: string) -> string
+//     Decodes a Punycode string to UTF-8. The input must NOT include "xn--".
+//     Returns the original Unicode string.
+//
+// KAT VECTORS (RFC 3492 examples / Node.js punycode verified):
+//   pc_encode("bücher")   == "bcher-kva"
+//   pc_encode("münchen")  == "mnchen-3ya"
+//   pc_encode("abc")      == "abc-"
+//   pc_decode("bcher-kva") == "bücher"
+//   pc_decode("mnchen-3ya") == "münchen"
+//   round-trip: pc_decode(pc_encode(s)) == s
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _pc_ to avoid collisions with other
+//   std modules compiled into the same binary.
+//
+// LEAF — imports NOTHING (no sibling std imports needed).
+// ============================================================================
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+fn _pc_base() -> int         36
+fn _pc_tmin() -> int          1
+fn _pc_tmax() -> int         26
+fn _pc_skew() -> int         38
+fn _pc_damp() -> int        700
+fn _pc_initial_bias() -> int  72
+fn _pc_initial_n() -> int   128
+
+// ── UTF-8 decode: string -> list of int codepoints ───────────────────────────
+//
+// NOVA strings are raw UTF-8 bytes. We step through bytes manually:
+//   1-byte:  0xxxxxxx  (0x00..0x7F)
+//   2-byte:  110xxxxx 10xxxxxx  (0xC0..0xDF + continuation)
+//   3-byte:  1110xxxx 10xxxxxx 10xxxxxx
+//   4-byte:  11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+// Invalid or truncated sequences fall back to the lead byte's raw value.
+// ord(s[i]) reads the FIRST BYTE of the single-char slice s[i] (0..255).
+
+fn _pc_byte_at(s, i) -> int
+    ord(s[i])
+
+fn _pc_utf8_to_codepoints(s) -> list
+    let cps = []
+    let n = len(s)
+    let i = 0
+    while i < n
+        let b0 = _pc_byte_at(s, i)
+        if b0 < 0x80
+            // 1-byte ASCII
+            cps.push(b0)
+            i = i + 1
+        else if b0 >= 0xC0 and b0 < 0xE0 and i + 1 < n
+            // 2-byte
+            let b1 = _pc_byte_at(s, i + 1)
+            if b1 >= 0x80 and b1 < 0xC0
+                let cp = ((b0 - 0xC0) * 64) + (b1 - 0x80)
+                cps.push(cp)
+                i = i + 2
+            else
+                cps.push(b0)
+                i = i + 1
+        else if b0 >= 0xE0 and b0 < 0xF0 and i + 2 < n
+            // 3-byte
+            let b1 = _pc_byte_at(s, i + 1)
+            let b2 = _pc_byte_at(s, i + 2)
+            if b1 >= 0x80 and b1 < 0xC0 and b2 >= 0x80 and b2 < 0xC0
+                let cp = ((b0 - 0xE0) * 4096) + ((b1 - 0x80) * 64) + (b2 - 0x80)
+                cps.push(cp)
+                i = i + 3
+            else
+                cps.push(b0)
+                i = i + 1
+        else if b0 >= 0xF0 and b0 < 0xF8 and i + 3 < n
+            // 4-byte
+            let b1 = _pc_byte_at(s, i + 1)
+            let b2 = _pc_byte_at(s, i + 2)
+            let b3 = _pc_byte_at(s, i + 3)
+            if b1 >= 0x80 and b1 < 0xC0 and b2 >= 0x80 and b2 < 0xC0 and b3 >= 0x80 and b3 < 0xC0
+                let cp = ((b0 - 0xF0) * 262144) + ((b1 - 0x80) * 4096) + ((b2 - 0x80) * 64) + (b3 - 0x80)
+                cps.push(cp)
+                i = i + 4
+            else
+                cps.push(b0)
+                i = i + 1
+        else
+            // lone/invalid lead byte
+            cps.push(b0)
+            i = i + 1
+    cps
+
+// ── Digit encoding/decoding ───────────────────────────────────────────────────
+//
+// RFC 3492 §5: digit d maps to:
+//   0-25  -> 'a'-'z' (lowercase)
+//   26-35 -> '0'-'9'
+
+fn _pc_digit_to_char(d) -> string
+    if d < 26
+        chr(d + 97)
+    else
+        chr(d - 26 + 48)
+
+// Map one Punycode character to its digit value (0..35), or 36 for invalid.
+fn _pc_char_to_digit(c) -> int
+    let b = ord(c)
+    if b >= 97 and b <= 122
+        // 'a'-'z' -> 0-25
+        b - 97
+    else if b >= 65 and b <= 90
+        // 'A'-'Z' -> 0-25 (case-insensitive)
+        b - 65
+    else if b >= 48 and b <= 57
+        // '0'-'9' -> 26-35
+        b - 22
+    else
+        36
+
+// ── Bias adaptation (RFC 3492 §6.1) ──────────────────────────────────────────
+//
+// adapt(delta, numpoints, firsttime):
+//   If firsttime: delta = delta / damp   (reduce the raw first-pass delta)
+//   Else:         delta = delta / 2
+//   Then: delta += delta / numpoints
+//   Threshold loop: while delta > (base-tmin)*tmax/2: delta /= (base-tmin); k += base
+//   return k + (base-tmin+1)*delta / (delta + skew)
+
+fn _pc_adapt(delta_in, numpoints, firsttime) -> int
+    let delta = delta_in
+    if firsttime == 1
+        delta = delta / _pc_damp()
+    else
+        delta = delta / 2
+    delta = delta + (delta / numpoints)
+    let k = 0
+    let threshold = ((_pc_base() - _pc_tmin()) * _pc_tmax()) / 2
+    while delta > threshold
+        delta = delta / (_pc_base() - _pc_tmin())
+        k = k + _pc_base()
+    k + ((_pc_base() - _pc_tmin() + 1) * delta) / (delta + _pc_skew())
+
+// ── Generalized variable-length integer encode ────────────────────────────────
+//
+// RFC 3492 §5.2 encodes an integer q >= 0 starting from k=base:
+//   Repeatedly:
+//     t = clamp(k - bias, tmin, tmax)
+//     if q < t: emit digit(q) and stop
+//     else: emit digit(t + (q-t) % (base-t)); q = (q-t) / (base-t); k += base
+//
+// Returns the encoded string fragment.
+
+fn _pc_encode_delta(q_in, bias) -> string
+    let q = q_in
+    let out = ""
+    let k = _pc_base()
+    let going = 1
+    while going == 1
+        let raw_t = k - bias
+        let t = raw_t
+        if raw_t < _pc_tmin()
+            t = _pc_tmin()
+        else if raw_t > _pc_tmax()
+            t = _pc_tmax()
+        if q < t
+            out = out + _pc_digit_to_char(q)
+            going = 0
+        else
+            let digit = t + ((q - t) % (_pc_base() - t))
+            out = out + _pc_digit_to_char(digit)
+            q = (q - t) / (_pc_base() - t)
+            k = k + _pc_base()
+    out
+
+// ── List helpers ──────────────────────────────────────────────────────────────
+
+// Count how many codepoints in a list are < threshold.
+fn _pc_count_less(cps, threshold) -> int
+    let count = 0
+    let i = 0
+    let n = len(cps)
+    while i < n
+        if cps[i] < threshold
+            count = count + 1
+        i = i + 1
+    count
+
+// Find minimum codepoint in list that is >= lower_bound.
+// Returns sentinel 0x110000 if none found (above the Unicode maximum).
+fn _pc_min_gte(cps, lower_bound) -> int
+    let result = 0x110000
+    let i = 0
+    let n = len(cps)
+    while i < n
+        if cps[i] >= lower_bound and cps[i] < result
+            result = cps[i]
+        i = i + 1
+    result
+
+// Insert element at position idx in a list (returns a new list).
+// We build by copying prefix, appending element, then copying suffix.
+fn _pc_list_insert(src, idx, val) -> list
+    let out = []
+    let n = len(src)
+    let i = 0
+    while i < idx
+        out.push(src[i])
+        i = i + 1
+    out.push(val)
+    i = idx
+    while i < n
+        out.push(src[i])
+        i = i + 1
+    out
+
+// ── PUBLIC: pc_encode ─────────────────────────────────────────────────────────
+//
+// Encode a UTF-8 string to its Punycode representation (no "xn--" prefix).
+//
+// Algorithm (RFC 3492 §6.3):
+//   1. Decode input to codepoints.
+//   2. Output all basic (< 128) codepoints verbatim.
+//   3. Append delimiter '-' (always, even if all-ASCII per RFC 3492 §5 note).
+//   4. n = initial_n, delta = 0, bias = initial_bias, h = b (basic count).
+//   5. While h < total length:
+//      a. m = smallest non-basic codepoint >= n
+//      b. delta += (m - n) * (h + 1)
+//      c. n = m
+//      d. For each cp in input order:
+//           if cp < n: delta++
+//           if cp == n: encode delta; adapt bias; delta=0; h++
+//      e. delta++, n++
+
+fn pc_encode(s) -> string
+    let cps = _pc_utf8_to_codepoints(s)
+    let total = len(cps)
+    // Step 1: output basic codepoints
+    let out = ""
+    let b = 0
+    let i = 0
+    while i < total
+        if cps[i] < 128
+            out = out + chr(cps[i])
+            b = b + 1
+        i = i + 1
+    // Step 2: delimiter (RFC 3492: append '-' if any basic codepoints; for
+    //   all-ASCII input, still append '-' to mark that no deltas follow)
+    out = out + "-"
+    // State
+    let n = _pc_initial_n()
+    let delta = 0
+    let bias = _pc_initial_bias()
+    let h = b
+    while h < total
+        // a. next m = smallest cp >= n
+        let m = _pc_min_gte(cps, n)
+        // b. delta += (m - n) * (h + 1)
+        delta = delta + (m - n) * (h + 1)
+        // c. n = m
+        n = m
+        // d. scan all cps in order
+        let j = 0
+        while j < total
+            let cp = cps[j]
+            if cp < n
+                delta = delta + 1
+            else if cp == n
+                // encode delta as variable-length int
+                out = out + _pc_encode_delta(delta, bias)
+                // adapt bias
+                let is_first = 0
+                if h == b
+                    is_first = 1
+                bias = _pc_adapt(delta, h + 1, is_first)
+                delta = 0
+                h = h + 1
+            j = j + 1
+        // e.
+        delta = delta + 1
+        n = n + 1
+    out
+
+// ── PUBLIC: pc_decode ─────────────────────────────────────────────────────────
+//
+// Decode a Punycode string to UTF-8. Input must NOT include "xn--".
+//
+// Algorithm (RFC 3492 §6.2):
+//   1. Find the last '-'. Everything before it is the initial basic sequence.
+//      If no '-' exists, or '-' is at position 0, the basic sequence is empty.
+//   2. The portion after the last '-' is the "extended" part.
+//   3. Decode generalized variable-length integers from the extended part to
+//      produce (codepoint, insertion-position) pairs:
+//        i=0, n=initial_n, bias=initial_bias
+//        For each digit sequence in extended part:
+//          Decode integer -> add to i
+//          outputLen = current output length + 1
+//          adapt bias
+//          n += i / outputLen
+//          i %= outputLen
+//          insert codepoint n at position i
+//          i++
+//   4. Re-encode the resulting codepoint list as UTF-8.
+
+fn pc_decode(s) -> string
+    // Step 1: find last '-'
+    let n_s = len(s)
+    let last_dash = -1
+    let ki = 0
+    while ki < n_s
+        if ord(s[ki]) == 45
+            last_dash = ki
+        ki = ki + 1
+    // Build initial output from basic part (before last '-')
+    let output = []
+    if last_dash > 0
+        let bi = 0
+        while bi < last_dash
+            output.push(ord(s[bi]))
+            bi = bi + 1
+    // Extended part starts after last '-'
+    // If last_dash == -1: no '-' at all, entire string is extended (no basics)
+    // If last_dash == 0: '-' at start, empty basic part, extended from index 1
+    let ext_start = 0
+    if last_dash == -1
+        ext_start = 0
+    else
+        ext_start = last_dash + 1
+    // State
+    let n = _pc_initial_n()
+    let bias = _pc_initial_bias()
+    let i = 0
+    let ei = ext_start    // index into s for extended part
+    let is_first_seq = 1
+    while ei < n_s
+        let oldi = i
+        let w = 1
+        let k = _pc_base()
+        let inner_done = 0
+        while inner_done == 0
+            let digit = _pc_char_to_digit(s[ei])
+            ei = ei + 1
+            i = i + digit * w
+            let raw_t = k - bias
+            let t = raw_t
+            if raw_t < _pc_tmin()
+                t = _pc_tmin()
+            else if raw_t > _pc_tmax()
+                t = _pc_tmax()
+            if digit < t
+                inner_done = 1
+            else
+                w = w * (_pc_base() - t)
+                k = k + _pc_base()
+        let out_len = len(output) + 1
+        bias = _pc_adapt(i - oldi, out_len, is_first_seq)
+        is_first_seq = 0
+        n = n + (i / out_len)
+        i = i % out_len
+        // Insert codepoint n at position i
+        output = _pc_list_insert(output, i, n)
+        i = i + 1
+    // Re-encode codepoints to UTF-8 string
+    let result = ""
+    let ri = 0
+    let rn = len(output)
+    while ri < rn
+        result = result + from_codepoint(output[ri])
+        ri = ri + 1
+    result

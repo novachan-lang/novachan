@@ -1,0 +1,282 @@
+// ============================================================================
+// NOVA Standard Library — std/data/csvsniff
+// ============================================================================
+// CSV dialect detection: sniff the delimiter and detect presence of a header
+// row from a small sample of CSV text.
+//
+// PUBLIC API:
+//   cs_delimiter(sample) -> string
+//     Guess the column delimiter among "," ";" chr(9) (tab) and "|".
+//     Strategy: for each candidate, count occurrences per non-empty line,
+//     then pick the candidate whose per-line counts are most CONSISTENT
+//     (lowest coefficient-of-variation among lines with count > 0) and whose
+//     mean count is highest as a tie-breaker.  Returns "," when no candidate
+//     produces any splits.
+//
+//   cs_has_header(sample) -> bool
+//     Heuristic: the first non-empty row is a header when ALL of its cells are
+//     non-numeric AND at least one later row contains at least one numeric cell.
+//     "Numeric" = the trimmed field string represents an integer or decimal
+//     number (optional leading minus, digits, optional single dot with digits).
+//
+//   cs_dialect(sample) -> dict
+//     Returns {"delimiter": d, "has_header": h, "line_count": n} where d is
+//     cs_delimiter(sample), h is cs_has_header(sample), and n is the number
+//     of non-empty lines in the sample.
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing.
+//   - Single-exit style throughout (avoids NOVA return-null mistag).
+//   - No multi-line list/dict literals in module body.
+//   - No && / || — uses 'and' / 'or' or nested if.
+//   - Brace chars via chr(123)/chr(125) to avoid string interpolation.
+//   - '/' on two ints is integer division; float comparisons need *1.0 coerce.
+//   - Consistency score uses integer arithmetic scaled by 1000 to avoid floats.
+//
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// Strip trailing CR (chr(13)) from a single line.
+fn _cs_strip_cr(line) -> string
+    let result = line
+    let n = len(line)
+    if n > 0
+        if ord(char_at(line, n - 1)) == 13
+            result = slice(line, 0, n - 1)
+    result
+
+// Count occurrences of a single-char delimiter in a string.
+fn _cs_count_delim(line, delim) -> int
+    let n = len(line)
+    let count = 0
+    let i = 0
+    while i < n
+        if char_at(line, i) == delim
+            count = count + 1
+        i = i + 1
+    count
+
+// Compute mean * 1000 (integer scaled) of a list of ints (for consistency).
+// Returns 0 for an empty list.
+fn _cs_mean1000(counts, n) -> int
+    let result = 0
+    if n > 0
+        let total = 0
+        let i = 0
+        while i < n
+            total = total + counts[i]
+            i = i + 1
+        result = (total * 1000) / n
+    result
+
+// Compute variance * 1000 relative to mean1000 (scaled integer variance).
+// We compute sum of squared deviations from mean, scaled.
+// To avoid floats: deviation_i = counts[i]*1000 - mean1000; variance1000 = sum(dev^2) / n.
+// This is proportional to true variance (just *1000 scaled), enough for comparison.
+fn _cs_var1000(counts, n, mean1000) -> int
+    let result = 0
+    if n > 0
+        let sumsq = 0
+        let i = 0
+        while i < n
+            let dev = counts[i] * 1000 - mean1000
+            // dev can be negative; dev*dev always positive
+            if dev < 0
+                dev = 0 - dev
+            sumsq = sumsq + dev * dev
+            i = i + 1
+        result = sumsq / n
+    result
+
+// Check whether a trimmed field string looks like a number.
+// Accepts: optional leading '-', then digits, then optional '.' followed by digits.
+// Returns 1 if numeric, 0 otherwise.
+// Note: ord('.') = 46, ord('0') = 48, ord('9') = 57, ord('-') = 45.
+fn _cs_is_numeric(field) -> int
+    let result = 0
+    let n = len(field)
+    if n > 0
+        let i = 0
+        // Optional leading minus (ord('-') = 45).
+        if char_at(field, 0) == "-"
+            i = 1
+        // Must have at least one digit after optional minus.
+        if i < n
+            let has_digit = 0
+            let has_dot = 0
+            let ok = 1
+            while i < n
+                let ch = char_at(field, i)
+                let code = ord(ch)
+                // Check for decimal point first (ord('.') = 46, below digit range).
+                if ch == "."
+                    if has_dot == 1
+                        // Second dot — not numeric.
+                        ok = 0
+                    else
+                        has_dot = 1
+                else
+                    // 48='0' .. 57='9'
+                    if code >= 48
+                        if code <= 57
+                            has_digit = 1
+                        else
+                            // Non-digit, non-dot character — not numeric.
+                            ok = 0
+                    else
+                        // Code below 48 and not '.' — not numeric.
+                        ok = 0
+                i = i + 1
+            if ok == 1
+                if has_digit == 1
+                    result = 1
+    result
+
+// Split a line by a single-char delimiter into a list of fields.
+fn _cs_split_line(line, delim) -> list
+    let fields = []
+    let n = len(line)
+    let cur = ""
+    let i = 0
+    while i < n
+        if char_at(line, i) == delim
+            fields.push(cur)
+            cur = ""
+        else
+            cur = cur + char_at(line, i)
+        i = i + 1
+    fields.push(cur)
+    fields
+
+// Collect non-empty lines from a sample string (CRLF-tolerant).
+// Returns list of stripped non-empty lines.
+fn _cs_lines(sample) -> list
+    let raw_lines = split(sample, chr(10))
+    let result = []
+    let n = len(raw_lines)
+    let i = 0
+    while i < n
+        let line = _cs_strip_cr(raw_lines[i])
+        if len(line) > 0
+            result.push(line)
+        i = i + 1
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// cs_delimiter: detect the most likely delimiter character.
+//
+// Algorithm:
+//   For each candidate delimiter D:
+//     1. Count occurrences of D in each non-empty line -> counts[].
+//     2. Filter to lines where count > 0 -> active_counts[].
+//     3. Compute mean and variance of active_counts (scaled integers).
+//     4. Score = mean1000 / (1 + variance_ratio):
+//          lower variance relative to mean = more consistent = better.
+//     5. Pick the candidate with the highest score (most splits, most uniform).
+//   Returns "," if no candidate produces any splits at all.
+fn cs_delimiter(sample) -> string
+    let lines = _cs_lines(sample)
+    let nlines = len(lines)
+    let result = ","
+    if nlines > 0
+        // Candidate delimiters: comma(44), semicolon(59), tab(9), pipe(124).
+        let cands = [chr(44), chr(59), chr(9), chr(124)]
+        let nc = len(cands)
+        let best_score = 0 - 1    // -1 so first real candidate always wins
+        let ci = 0
+        while ci < nc
+            let delim = cands[ci]
+            // Build per-line count list.
+            let counts = []
+            let li = 0
+            while li < nlines
+                let c = _cs_count_delim(lines[li], delim)
+                counts.push(c)
+                li = li + 1
+            // Filter to active lines (count > 0).
+            let active = []
+            let ai = 0
+            while ai < nlines
+                if counts[ai] > 0
+                    active.push(counts[ai])
+                ai = ai + 1
+            let na = len(active)
+            if na > 0
+                let mean1k = _cs_mean1000(active, na)
+                let var1k = _cs_var1000(active, na, mean1k)
+                // Score: mean scaled, divided by (1 + relative variance).
+                // To avoid div by zero we add 1 to variance.
+                // score = mean1k * 1000 / (1 + var1k / (mean1k + 1))
+                // Use integer arithmetic throughout:
+                //   score = mean1k * 1000 * (mean1k + 1) / (mean1k + 1 + var1k)
+                let denom = mean1k + 1 + var1k
+                let score = 0
+                if denom > 0
+                    score = (mean1k * 1000 * (mean1k + 1)) / denom
+                // Also weight by fraction of lines that are active.
+                // multiply score by na*1000/nlines to prefer delimiters that appear in more lines.
+                score = (score * na * 1000) / nlines
+                if score > best_score
+                    best_score = score
+                    result = delim
+            ci = ci + 1
+    result
+
+// cs_has_header: heuristic header detection.
+//
+// Returns true (1) when:
+//   - The first non-empty line exists and ALL its fields (split by the detected
+//     delimiter) are non-numeric (trimmed).
+//   - At least one subsequent non-empty line has at least one numeric field.
+// Returns false (0) otherwise.
+fn cs_has_header(sample) -> int
+    let result = 0
+    let lines = _cs_lines(sample)
+    let nlines = len(lines)
+    if nlines >= 2
+        let delim = cs_delimiter(sample)
+        // Check first row: all fields must be non-numeric.
+        let first_fields = _cs_split_line(lines[0], delim)
+        let nff = len(first_fields)
+        let first_all_nonnum = 1
+        let fi = 0
+        while fi < nff
+            let f = first_fields[fi]
+            if _cs_is_numeric(f) == 1
+                first_all_nonnum = 0
+            fi = fi + 1
+        if first_all_nonnum == 1
+            // Check remaining rows: at least one must have a numeric field.
+            let found_numeric = 0
+            let li = 1
+            while li < nlines
+                let row_fields = _cs_split_line(lines[li], delim)
+                let nrf = len(row_fields)
+                let ri = 0
+                while ri < nrf
+                    if _cs_is_numeric(row_fields[ri]) == 1
+                        found_numeric = 1
+                    ri = ri + 1
+                li = li + 1
+            if found_numeric == 1
+                result = 1
+    result
+
+// cs_dialect: return a dict summarising the CSV dialect of the sample.
+//
+// Returns: {"delimiter": d, "has_header": h, "line_count": n}
+//   d = cs_delimiter(sample)   (string)
+//   h = cs_has_header(sample)  (int: 1=true, 0=false)
+//   n = number of non-empty lines in sample (int)
+fn cs_dialect(sample) -> dict
+    let d = cs_delimiter(sample)
+    let h = cs_has_header(sample)
+    let lines = _cs_lines(sample)
+    let n = len(lines)
+    let result = {}
+    result["delimiter"] = d
+    result["has_header"] = h
+    result["line_count"] = n
+    result

@@ -1,0 +1,137 @@
+// KAT test for std/encoding/yenc
+// Tests: ye_encode + ye_decode using round-trip and known-answer vectors.
+//
+// yEnc algorithm:
+//   encode: e = (b + 42) % 256; if e in {0,10,13,61} -> emit 61, (e+64)%256
+//           else emit e
+//   decode: if byte==61 -> next byte c, output (c-64-42)%256
+//           else output (byte-42)%256
+//
+// Hand-verified spot-checks:
+//   byte 0:   e=(0+42)%256=42  -> not critical -> emit 42
+//   byte 214: e=(214+42)%256=0 -> critical NUL -> emit 61,64
+//   byte 224: e=(224+42)%256=10 -> critical LF -> emit 61,74
+//   byte 227: e=(227+42)%256=13 -> critical CR -> emit 61,77
+//   byte 219: e=(219+42)%256=5  -> NOT critical -> emit 5  (check 219+42=261, 261%256=5)
+// Wait: 219+42=261, 261%256=5, not critical -> emit 5.
+// Let me re-pick critical input bytes:
+//   NUL critical: b such that (b+42)%256==0 -> b=256-42=214
+//   LF  critical: b such that (b+42)%256==10 -> b=10+256-42=224
+//   CR  critical: b such that (b+42)%256==13 -> b=13+256-42=227
+//   '=' critical: b such that (b+42)%256==61 -> b=61-42=19
+// So input [214, 224, 227, 19] should trigger all four escape cases.
+
+import std/encoding/yenc
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Build a bytes value from an ASCII string.
+fn _bytes(s) -> any
+    let b = bytes(0)
+    let i = 0
+    while i < len(s)
+        let ch = ord(s[i]) & 0xFF
+        b = bytes_append(b, ch)
+        i = i + 1
+    b
+
+fn cki(label, got, expected)
+    if got != expected
+        print("FAIL " + label + ": got=" + str(got) + " expected=" + str(expected))
+        exit(1)
+
+fn _bytes_eq(a, b) -> int
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return 0
+    let i = 0
+    let ok = 1
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            ok = 0
+        i = i + 1
+    ok
+
+fn ck_bytes_eq(label, got, expected)
+    if _bytes_eq(got, expected) != 1
+        print("FAIL " + label + ": bytes differ")
+        exit(1)
+
+// ── KAT 1: empty input encodes to zero-length bytes ───────────────────────────
+let empty_in = _bytes("")
+let empty_enc = ye_encode(empty_in)
+cki("encode_empty_len", bytes_len(empty_enc), 0)
+
+// ── KAT 2: empty round-trip ───────────────────────────────────────────────────
+let empty_dec = ye_decode(empty_enc)
+cki("rt_empty_len", bytes_len(empty_dec), 0)
+
+// ── KAT 3: "Hello" round-trip ─────────────────────────────────────────────────
+// 'H'=72 -> e=114, 'e'=101 -> e=143, 'l'=108 -> e=150, 'l' -> e=150, 'o'=111 -> e=153
+// None are 0/10/13/61, so no escaping. Encoded length == 5.
+let hello_in = _bytes("Hello")
+let hello_enc = ye_encode(hello_in)
+cki("encode_Hello_len", bytes_len(hello_enc), 5)
+cki("encode_Hello_H", bytes_get(hello_enc, 0), 114)
+cki("encode_Hello_e", bytes_get(hello_enc, 1), 143)
+let hello_dec = ye_decode(hello_enc)
+ck_bytes_eq("rt_Hello", hello_dec, hello_in)
+
+// ── KAT 4: all four critical input bytes trigger escaping ─────────────────────
+// Input [214, 224, 227, 19] -> all produce critical e values -> all escaped
+// Each raw byte produces 2 output bytes -> encoded length == 8
+let crit_in = bytes(0)
+crit_in = bytes_append(crit_in, 214)
+crit_in = bytes_append(crit_in, 224)
+crit_in = bytes_append(crit_in, 227)
+crit_in = bytes_append(crit_in, 19)
+let crit_enc = ye_encode(crit_in)
+cki("encode_crit_len", bytes_len(crit_enc), 8)
+// First escaped pair: e=(214+42)%256=0; emit 61 then (0+64)%256=64
+cki("encode_crit_esc0_marker", bytes_get(crit_enc, 0), 61)
+cki("encode_crit_esc0_val", bytes_get(crit_enc, 1), 64)
+// Second escaped pair: e=(224+42)%256=10; emit 61 then (10+64)%256=74
+cki("encode_crit_esc1_marker", bytes_get(crit_enc, 2), 61)
+cki("encode_crit_esc1_val", bytes_get(crit_enc, 3), 74)
+// Third: e=(227+42)%256=13; emit 61 then (13+64)%256=77
+cki("encode_crit_esc2_marker", bytes_get(crit_enc, 4), 61)
+cki("encode_crit_esc2_val", bytes_get(crit_enc, 5), 77)
+// Fourth: e=(19+42)%256=61; emit 61 then (61+64)%256=125
+cki("encode_crit_esc3_marker", bytes_get(crit_enc, 6), 61)
+cki("encode_crit_esc3_val", bytes_get(crit_enc, 7), 125)
+// Round-trip
+let crit_dec = ye_decode(crit_enc)
+ck_bytes_eq("rt_crit", crit_dec, crit_in)
+
+// ── KAT 5: bytes [0..20] round-trip ──────────────────────────────────────────
+let seq_in = bytes(0)
+let si = 0
+while si < 21
+    seq_in = bytes_append(seq_in, si)
+    si = si + 1
+let seq_enc = ye_encode(seq_in)
+let seq_dec = ye_decode(seq_enc)
+ck_bytes_eq("rt_seq_0_20", seq_dec, seq_in)
+
+// ── KAT 6: spot-check bytes [0..255] round-trip ──────────────────────────────
+let full_in = bytes(0)
+let fi = 0
+while fi < 256
+    full_in = bytes_append(full_in, fi)
+    fi = fi + 1
+let full_enc = ye_encode(full_in)
+let full_dec = ye_decode(full_enc)
+ck_bytes_eq("rt_full_0_255", full_dec, full_in)
+
+// ── KAT 7: single non-critical byte (byte=0 -> e=42, not critical) ────────────
+// b=0: e=(0+42)%256=42, not in {0,10,13,61}, emit 42 directly -> len=1
+let b0_in = bytes(0)
+b0_in = bytes_append(b0_in, 0)
+let b0_enc = ye_encode(b0_in)
+cki("encode_byte0_len", bytes_len(b0_enc), 1)
+cki("encode_byte0_val", bytes_get(b0_enc, 0), 42)
+let b0_dec = ye_decode(b0_enc)
+cki("rt_byte0_val", bytes_get(b0_dec, 0), 0)
+
+print("_yenc_test passed")

@@ -1,0 +1,207 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/base62
+// ============================================================================
+// Base62 integer <-> string encoding, and bytes <-> string encoding.
+//
+// ALPHABET (index 0..61):
+//   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+//   Digits first (0-9 → indices 0-9), then uppercase (A-Z → 10-35),
+//   then lowercase (a-z → 36-61).
+//
+// PUBLIC API:
+//   b62_encode(n: int)      -> string   (n>=0; "0" for n==0)
+//   b62_decode(s: string)   -> int
+//   b62_encode_bytes(b: bytes) -> string  (big-endian bignum; small inputs fit int)
+//   b62_decode_bytes(s: string) -> bytes
+//
+// ALGORITHM:
+//   For integers: standard repeated-division by 62, collecting remainders in
+//   reverse, then reversing for the final string.
+//   For bytes: treat the byte array as a big-endian arbitrary-precision integer
+//   using carry-based long division (same approach as base58). For small inputs
+//   (<= 8 bytes) we accumulate into a NOVA int and delegate to b62_encode.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers use the _b62_ prefix.
+
+// ── Alphabet helpers ──────────────────────────────────────────────────────────
+
+// Return the single character at alphabet index v (0..61).
+fn _b62_char(v) -> string
+    // 0..9 → '0'..'9'  (ASCII 48..57)
+    if v < 10
+        return chr(48 + v)
+    // 10..35 → 'A'..'Z' (ASCII 65..90)
+    if v < 36
+        return chr(65 + v - 10)
+    // 36..61 → 'a'..'z' (ASCII 97..122)
+    chr(97 + v - 36)
+
+// Return the numeric value (0..61) for a Base62 character, or -1 if invalid.
+fn _b62_val(c) -> int
+    let b = ord(c)
+    // '0'..'9'  → 0..9   (ASCII 48..57)
+    if b >= 48 and b <= 57
+        return b - 48
+    // 'A'..'Z'  → 10..35 (ASCII 65..90)
+    if b >= 65 and b <= 90
+        return b - 65 + 10
+    // 'a'..'z'  → 36..61 (ASCII 97..122)
+    if b >= 97 and b <= 122
+        return b - 97 + 36
+    -1
+
+// ── Integer encode/decode ─────────────────────────────────────────────────────
+
+// b62_encode: encode a non-negative integer as a Base62 string.
+// b62_encode(0) == "0"
+fn b62_encode(n) -> string
+    if n == 0
+        return "0"
+    // Collect digits LSB-first, then reverse.
+    let digits = ""
+    let v = n
+    while v > 0
+        let rem = v - (v / 62) * 62
+        digits = digits + _b62_char(rem)
+        v = v / 62
+    // Reverse digits string.
+    let result = ""
+    let ri = len(digits) - 1
+    while ri >= 0
+        result = result + digits[ri]
+        ri = ri - 1
+    result
+
+// b62_decode: decode a Base62 string to a non-negative integer.
+fn b62_decode(s) -> int
+    let n = len(s)
+    let result = 0
+    let i = 0
+    while i < n
+        let dv = _b62_val(s[i])
+        if dv >= 0
+            result = result * 62 + dv
+        i = i + 1
+    result
+
+// ── Bytes encode/decode ───────────────────────────────────────────────────────
+// For small inputs (<= 8 bytes) we accumulate the big-endian value into a NOVA
+// int (safe up to 2^63-1 ≈ 9.2e18; 8 bytes = max 256^8 = 1.8e19 which just
+// overflows, so we cap at 7 bytes via the int path and use the carry path for 8+).
+// For 8+ bytes we use carry-based long-division over a byte-array working buffer,
+// exactly like base58 but dividing by 62.
+
+// b62_encode_bytes: encode bytes as a Base62 string (big-endian big integer).
+fn b62_encode_bytes(data) -> string
+    let n = bytes_len(data)
+    if n == 0
+        return "0"
+
+    // Small path: <= 7 bytes → accumulate into int, delegate to b62_encode.
+    if n <= 7
+        let acc = 0
+        let si = 0
+        while si < n
+            acc = acc * 256 + (bytes_get(data, si) & 0xFF)
+            si = si + 1
+        return b62_encode(acc)
+
+    // Large path: carry-based long division over byte array.
+    // Build a mutable working copy.
+    let work = bytes(0)
+    let ci = 0
+    while ci < n
+        work = bytes_append(work, bytes_get(data, ci))
+        ci = ci + 1
+
+    let digits = ""
+    let running = 1
+    while running == 1
+        // One carry-based division pass: divide work[] by 62, collect remainder.
+        let carry = 0
+        let new_work = bytes(0)
+        let di = 0
+        let wn = bytes_len(work)
+        while di < wn
+            let val = carry * 256 + (bytes_get(work, di) & 0xFF)
+            let q = val / 62
+            carry = val - q * 62
+            new_work = bytes_append(new_work, q & 0xFF)
+            di = di + 1
+        work = new_work
+        digits = digits + _b62_char(carry)
+        // Check termination: all bytes in work are zero.
+        let chk = 0
+        let wn2 = bytes_len(work)
+        let all_z = 1
+        while chk < wn2
+            if bytes_get(work, chk) != 0
+                all_z = 0
+            chk = chk + 1
+        if all_z == 1
+            running = 0
+
+    // Reverse digits (collected LSB-first).
+    let rev = ""
+    let rr = len(digits) - 1
+    while rr >= 0
+        rev = rev + digits[rr]
+        rr = rr - 1
+    rev
+
+// b62_decode_bytes: decode a Base62 string back to bytes.
+// Uses carry-based multiply-add into a byte array (big-endian).
+// Buffer size: log(62)/log(256)*len(s) bytes needed; len(s) is a safe upper bound.
+fn b62_decode_bytes(s) -> any
+    let slen = len(s)
+    if slen == 0
+        return bytes(0)
+
+    // Allocate zero-filled working buffer of slen bytes.
+    let buflen = slen
+    let buf = bytes(0)
+    let bfi = 0
+    while bfi < buflen
+        buf = bytes_append(buf, 0)
+        bfi = bfi + 1
+
+    // Process each character: carry-based multiply-add into buf[] (right-to-left).
+    let si = 0
+    while si < slen
+        let dv = _b62_val(s[si])
+        if dv >= 0
+            let carry = dv
+            // Right-to-left pass: collect results in a reversed buffer, then un-reverse.
+            let rtl = bytes(0)
+            let ml = buflen - 1
+            while ml >= 0
+                let cur = (bytes_get(buf, ml) & 0xFF) * 62 + carry
+                carry = (cur >> 8) & 0xFF
+                rtl = bytes_append(rtl, cur & 0xFF)
+                ml = ml - 1
+            // Un-reverse rtl back to buf (left-to-right).
+            let rev2 = bytes(0)
+            let rl2 = bytes_len(rtl) - 1
+            while rl2 >= 0
+                rev2 = bytes_append(rev2, bytes_get(rtl, rl2))
+                rl2 = rl2 - 1
+            buf = rev2
+        si = si + 1
+
+    // Strip leading zero-padding bytes (from initialisation, not from data).
+    let strip = 0
+    let strip_done = 0
+    while strip < buflen and strip_done == 0
+        if bytes_get(buf, strip) == 0
+            strip = strip + 1
+        else
+            strip_done = 1
+
+    // Build final output from the meaningful bytes.
+    let out = bytes(0)
+    let oi = strip
+    while oi < buflen
+        out = bytes_append(out, bytes_get(buf, oi))
+        oi = oi + 1
+    out
