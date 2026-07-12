@@ -75,7 +75,8 @@
 | forge_signum (D4 signed bignum) | numeric | — | ✅ DONE (fixed INT_MIN) | d708af6f |
 | forge_blake2b (RFC 7693 hash) | crypto | — | ✅ DONE (fixed validation) | d708af6f |
 | forge_hamt (D7 persistent map) | collections | — | ✅ DONE (fixed real-trie) | d708af6f |
-| **JDK-SCALE BREADTH — 60 modules (2× 30-task cycles)** | (all) | — | ✅ DONE (each KAT-gated + independently re-verified; one full-CI arc per 30) | cyc1 b80b7e24·3dc1086d·b4641598·2f5fba65 · cyc2 85fa62b2·d29951ec·fd4d82bc·d0699a19 |
+| **JDK-SCALE BREADTH — 90 modules (3× 30-task cycles)** | (all) | — | ✅ DONE (each KAT-gated + independently re-verified; ONE full-CI both-mode arc per 30) | cyc1 b80b7e24·3dc1086d·b4641598·2f5fba65 · cyc2 85fa62b2·d29951ec·fd4d82bc·d0699a19 · cyc3 01d9214e·ac7f0287·febd7584·753a5256 (1290 tests green) |
+|   ↳ cyc3 adds | http_status·similarity·sequences·base64·indexmap·box·enumflags·graycode·color·ipv6·geo·ratelimiter·banner·cron·damerau·jsonmerge·url·orderedset·rot13·metaphone·latin1·deepcopy·highlight·titlecase·mime·humanize_number·uuencode·introot·frozenlist·portname | (all) | — | ✅ | |
 |   ↳ collections | unionfind·ordereddict·bloomfilter·sortedlist·bimap·trie·graph·multimap·fenwick·rangeset·defaultdict·segmenttree | — | ✅ | |
 |   ↳ text | distance·format·tablefmt·shlex·roman·ordinal·pluralize·soundex·ansi·diff·wordcount·lorem·truncate·naturalsort | — | ✅ | |
 |   ↳ math | numtheory·geometry2d·combinatorics·bits·quaternion·easing·polynomial·regression·angle·primesieve | — | ✅ | |
