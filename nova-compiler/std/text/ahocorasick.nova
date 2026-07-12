@@ -1,0 +1,252 @@
+// ============================================================================
+// NOVA Standard Library — std/text/ahocorasick
+// ============================================================================
+// Aho-Corasick multi-pattern string search.
+//
+// Public API:
+//   ac_build(patterns) -> dict
+//       Build an Aho-Corasick automaton from a list of pattern strings.
+//       Returns a dict representing the automaton (trie + failure links +
+//       output links).  Pass this to ac_search / ac_count / ac_matches_any.
+//
+//   ac_search(auto, text) -> list
+//       Search text for all occurrences of any pattern.  Returns a list of
+//       [patternString, startIndex] pairs (each pair is itself a list of
+//       length 2).  All overlapping and simultaneous matches are reported.
+//       Order within the result is the order that match-ends are encountered
+//       left-to-right in text.
+//
+//   ac_count(auto, text) -> int
+//       Return the total number of matches of any pattern in text.
+//
+//   ac_matches_any(auto, text) -> int
+//       Return 1 if text contains at least one match of any pattern, else 0.
+//
+// Algorithm:
+//   Phase 1 — build goto trie:
+//       Insert each pattern character by character into a trie of nodes.
+//       Each node is represented as a dict stored in the automaton's node list.
+//       A node dict has three keys:
+//           "g"  — goto dict: char (1-char string) -> child node index (int)
+//           "f"  — failure link: int (node index to fall back to on mismatch)
+//           "o"  — output list: list of pattern strings that end at this node
+//
+//   Phase 2 — compute failure links (BFS):
+//       Root's children have failure link = 0 (root).
+//       For each deeper node n reachable via character c from parent p:
+//           follow p's failure link and look for a goto-c edge; repeat until
+//           root; set n's failure link to the node found.
+//       Propagate outputs: n["o"] += fail_node["o"] so every accepting state
+//       carries the complete set of patterns that match at that position.
+//
+//   Phase 3 — search:
+//       Walk text character by character.  On each character, follow goto
+//       edges; if none exists follow failure links until root.  Collect all
+//       outputs at the current node.
+//
+// Complexity: O(total_pattern_length) build; O(text_length + matches) search.
+//
+// Private helpers are prefixed _ac_ (unique per-module tag).
+// ============================================================================
+
+// ── private: node construction ───────────────────────────────────────────────
+
+// _ac_new_node returns a fresh trie node dict.
+// g = goto dict (char -> child id), f = failure link (int), o = output list.
+fn _ac_new_node() -> dict
+    let nd = {}
+    nd["g"] = {}
+    nd["f"] = 0
+    nd["o"] = []
+    nd
+
+// ── private: goto lookup with failure fallback ───────────────────────────────
+
+// _ac_goto returns the node index reached from node `nid` on character `c`
+// following failure links all the way to root when no goto edge exists.
+// `nodes` is the list of all node dicts in the automaton.
+fn _ac_goto(nodes, nid, c) -> int
+    let cur = nid
+    let done = 0
+    while done == 0
+        let nd = nodes[cur]
+        let g = nd["g"]
+        if contains(g, c)
+            return g[c]
+        // no edge from cur on c
+        if cur == 0
+            // already at root and no edge — stay at root
+            return 0
+        // follow failure link
+        cur = nd["f"]
+    // unreachable but satisfies the compiler
+    0
+
+// ── public: ac_build ─────────────────────────────────────────────────────────
+
+// ac_build constructs the Aho-Corasick automaton from a list of pattern strings.
+// Returns a dict with key "n" -> list of node dicts.
+fn ac_build(patterns) -> dict
+    // ── Phase 1: insert patterns into goto trie ──
+    let nodes = []
+    // create root node (index 0)
+    let root = _ac_new_node()
+    nodes.push(root)
+
+    let pi = 0
+    while pi < len(patterns)
+        let pat = patterns[pi]
+        let cur = 0
+        let ci = 0
+        while ci < len(pat)
+            let c = slice(pat, ci, ci + 1)
+            let nd = nodes[cur]
+            let g = nd["g"]
+            if contains(g, c)
+                cur = g[c]
+            else
+                // create new node
+                let nid = len(nodes)
+                let new_nd = _ac_new_node()
+                nodes.push(new_nd)
+                // update goto of current node
+                let upd = nodes[cur]
+                let ug = upd["g"]
+                ug[c] = nid
+                cur = nid
+            ci = ci + 1
+        // mark pattern output at terminal node
+        let term = nodes[cur]
+        let outs = term["o"]
+        outs.push(pat)
+        pi = pi + 1
+
+    // ── Phase 2: BFS to compute failure links and propagate outputs ──
+    // Queue stores node indices; use list + head pointer as queue.
+    let queue = []
+    let qhead = 0
+
+    // Root's children: failure link = 0, enqueue them
+    let root_nd = nodes[0]
+    let root_g = root_nd["g"]
+    let root_chars = keys(root_g)
+    let ri = 0
+    while ri < len(root_chars)
+        let rc = root_chars[ri]
+        let child_id = root_g[rc]
+        // failure link already 0 by construction
+        queue.push(child_id)
+        ri = ri + 1
+
+    // BFS
+    while qhead < len(queue)
+        let cur_id = queue[qhead]
+        qhead = qhead + 1
+        let cur_nd = nodes[cur_id]
+        let cur_g = cur_nd["g"]
+        let cur_chars = keys(cur_g)
+        let cci = 0
+        while cci < len(cur_chars)
+            let ch = cur_chars[cci]
+            let child_id = cur_g[ch]
+            // compute failure link for child_id:
+            // start from cur_id's failure link and follow until we find a
+            // goto-ch edge or reach root.
+            let f = cur_nd["f"]
+            let fail_id = 0
+            let found = 0
+            while found == 0
+                let f_nd = nodes[f]
+                let f_g = f_nd["g"]
+                if contains(f_g, ch)
+                    fail_id = f_g[ch]
+                    found = 1
+                else
+                    if f == 0
+                        fail_id = 0
+                        found = 1
+                    else
+                        f = f_nd["f"]
+            // set failure link on child
+            let child_nd = nodes[child_id]
+            child_nd["f"] = fail_id
+            // propagate outputs: child["o"] += fail["o"]
+            let fail_nd = nodes[fail_id]
+            let fail_outs = fail_nd["o"]
+            let fo_i = 0
+            while fo_i < len(fail_outs)
+                child_nd["o"].push(fail_outs[fo_i])
+                fo_i = fo_i + 1
+            // enqueue child for further BFS
+            queue.push(child_id)
+            cci = cci + 1
+
+    // return automaton: dict with "n" = nodes list
+    let auto = {}
+    auto["n"] = nodes
+    auto
+
+// ── public: ac_search ────────────────────────────────────────────────────────
+
+// ac_search returns all [pattern, startIndex] matches in text.
+// start_index = end_pos - len(pattern) + 1  (0-based).
+fn ac_search(auto, text) -> list
+    let nodes = auto["n"]
+    let results = []
+    let tlen = len(text)
+    let cur = 0
+    let ti = 0
+    while ti < tlen
+        let c = slice(text, ti, ti + 1)
+        cur = _ac_goto(nodes, cur, c)
+        let nd = nodes[cur]
+        let outs = nd["o"]
+        let oi = 0
+        while oi < len(outs)
+            let pat = outs[oi]
+            let start = ti - len(pat) + 1
+            let pair = []
+            pair.push(pat)
+            pair.push(start)
+            results.push(pair)
+            oi = oi + 1
+        ti = ti + 1
+    results
+
+// ── public: ac_count ─────────────────────────────────────────────────────────
+
+// ac_count returns the total number of pattern matches in text.
+fn ac_count(auto, text) -> int
+    let nodes = auto["n"]
+    let count = 0
+    let tlen = len(text)
+    let cur = 0
+    let ti = 0
+    while ti < tlen
+        let c = slice(text, ti, ti + 1)
+        cur = _ac_goto(nodes, cur, c)
+        let nd = nodes[cur]
+        count = count + len(nd["o"])
+        ti = ti + 1
+    count
+
+// ── public: ac_matches_any ───────────────────────────────────────────────────
+
+// ac_matches_any returns 1 if text contains at least one pattern match, else 0.
+fn ac_matches_any(auto, text) -> int
+    let nodes = auto["n"]
+    let tlen = len(text)
+    let cur = 0
+    let ti = 0
+    while ti < tlen
+        let c = slice(text, ti, ti + 1)
+        cur = _ac_goto(nodes, cur, c)
+        let nd = nodes[cur]
+        if len(nd["o"]) > 0
+            return 1
+        ti = ti + 1
+    0
+
+// ============================================================================
+fn main()
+    print("std/text/ahocorasick loaded")

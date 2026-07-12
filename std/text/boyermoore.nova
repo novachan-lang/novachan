@@ -1,0 +1,198 @@
+// ============================================================================
+// NOVA Standard Library — std/text/boyermoore
+// ============================================================================
+// Boyer-Moore substring search with the bad-character heuristic.
+// The good-suffix rule is intentionally omitted: bad-character alone gives
+// sub-linear average-case performance and is simpler to implement soundly in
+// a language without mutable array indexing.
+//
+// Public API:
+//   bm_search(text, pat)     -> int   first index of pat in text; -1 if absent
+//   bm_search_all(text, pat) -> list  all (possibly overlapping) start indices
+//   bm_count(text, pat)      -> int   number of (possibly overlapping) occurrences
+//
+// Algorithm — bad-character preprocessing:
+//   _bm_build_bc(pat) builds a dict mapping each character (as a one-byte
+//   string key) to its rightmost zero-based index in pat.  During search, when
+//   text[i+j] mismatches pat[j], we shift the window right by
+//     max(1, j - rightmost_occurrence(text[i+j]))
+//   where rightmost_occurrence is -1 for characters absent from pat.
+//
+// Complexity:
+//   Preprocessing — O(m) time and space.
+//   Search        — O(n*m) worst case (degenerate on repetitive input);
+//                   O(n/m) average case on random text (Boyer-Moore's classic).
+//
+// NOVA implementation notes:
+//   - Dict keys are always strings; character keys use the single-byte string
+//     form directly (s[i] in NOVA is a one-character string).
+//   - Lists have no in-place element write; we accumulate results via push().
+//   - No '&&'/'||'; use 'and'/'or'.
+//   - '/' on two ints is integer division (intentional for shifts).
+//   - Inner compare loop uses a single mismatch flag (done-flag idiom) to
+//     avoid the known NOVA IR bug with compound 'while ... and ...' conditions.
+//   - Private helpers carry the _bm_ prefix to avoid shadowing other modules.
+// ============================================================================
+
+// ── Preprocessing ─────────────────────────────────────────────────────────────
+
+// _bm_build_bc returns the bad-character table for pat as a dict.
+// Each key is a one-byte string (a single character of pat); the value is
+// that character's rightmost zero-based index in pat.  Characters that appear
+// more than once are overwritten, keeping the last (rightmost) occurrence.
+fn _bm_build_bc(pat) -> dict
+    let m = len(pat)
+    let bc = {}
+    let i = 0
+    while i < m
+        let ch = pat[i]
+        bc[ch] = i
+        i = i + 1
+    bc
+
+// _bm_bc_val returns the last-occurrence index of character ch in pat according
+// to the bad-character table bc, or -1 if ch is absent from pat.
+fn _bm_bc_val(bc, ch) -> int
+    if contains(bc, ch)
+        return bc[ch]
+    -1
+
+// _bm_compare walks the pattern against text[i..i+m-1] right-to-left.
+// Returns -1 if the pattern matches fully (all m characters agree).
+// Returns the index j (0..m-1) of the first (rightmost) mismatch position.
+//
+// Uses a single 'stop' flag with a scalar 'while j >= 0' guarded by an inner
+// if-break idiom rather than a compound condition, avoiding the NOVA IR bug
+// that can manifest when 'while cond_a and cond_b' appears inside a function
+// that is itself called from within an outer while loop.
+fn _bm_compare(text, pat, i, m) -> int
+    let j = m - 1
+    let stop = 0
+    while stop == 0
+        if j < 0
+            stop = 2
+        else
+            let tc = text[i + j]
+            let pc = pat[j]
+            if tc != pc
+                stop = 1
+            else
+                j = j - 1
+    // stop == 2 means full match (j went below 0); stop == 1 means mismatch at j.
+    if stop == 2
+        return -1
+    j
+
+// ── bm_search ────────────────────────────────────────────────────────────────
+
+// bm_search returns the index of the first occurrence of pat in text,
+// or -1 if pat does not appear in text.
+//
+// The search window starts with pat aligned at text[0..m-1].  We compare
+// right-to-left: if the rightmost characters match we walk left, otherwise
+// we apply the bad-character shift and jump right.  The window advances
+// until its right edge passes the end of text.
+fn bm_search(text, pat) -> int
+    let n = len(text)
+    let m = len(pat)
+    if m == 0
+        return 0
+    if m > n
+        return -1
+
+    let bc = _bm_build_bc(pat)
+    let result = -1
+    let i = 0
+    let done = 0
+    while done == 0
+        if i > n - m
+            done = 1
+        else
+            let j = _bm_compare(text, pat, i, m)
+            if j < 0
+                result = i
+                done = 1
+            else
+                let tc2 = text[i + j]
+                let last = _bm_bc_val(bc, tc2)
+                let sh = j - last
+                if sh < 1
+                    sh = 1
+                i = i + sh
+    result
+
+// ── bm_search_all ────────────────────────────────────────────────────────────
+
+// bm_search_all returns a list of all start indices (possibly overlapping)
+// where pat occurs in text.  Overlapping matches are included because the
+// caller may require them (e.g. bm_search_all("aaaa","aa") == [0,1,2]).
+//
+// After each match the window advances by 1 so overlapping occurrences are
+// not missed.  After each non-match the bad-character shift is applied as
+// in bm_search.
+fn bm_search_all(text, pat) -> list
+    let n = len(text)
+    let m = len(pat)
+    let results = []
+    if m == 0
+        return results
+    if m > n
+        return results
+
+    let bc = _bm_build_bc(pat)
+    let i = 0
+    let done = 0
+    while done == 0
+        if i > n - m
+            done = 1
+        else
+            let j = _bm_compare(text, pat, i, m)
+            if j < 0
+                results.push(i)
+                i = i + 1
+            else
+                let tc2 = text[i + j]
+                let last = _bm_bc_val(bc, tc2)
+                let sh = j - last
+                if sh < 1
+                    sh = 1
+                i = i + sh
+    results
+
+// ── bm_count ─────────────────────────────────────────────────────────────────
+
+// bm_count returns the total number of (possibly overlapping) occurrences
+// of pat in text.  It uses the same overlapping-match strategy as
+// bm_search_all but avoids building a result list.
+fn bm_count(text, pat) -> int
+    let n = len(text)
+    let m = len(pat)
+    if m == 0
+        return 0
+    if m > n
+        return 0
+
+    let bc = _bm_build_bc(pat)
+    let count = 0
+    let i = 0
+    let done = 0
+    while done == 0
+        if i > n - m
+            done = 1
+        else
+            let j = _bm_compare(text, pat, i, m)
+            if j < 0
+                count = count + 1
+                i = i + 1
+            else
+                let tc2 = text[i + j]
+                let last = _bm_bc_val(bc, tc2)
+                let sh = j - last
+                if sh < 1
+                    sh = 1
+                i = i + sh
+    count
+
+// ============================================================================
+fn main()
+    print("std/text/boyermoore loaded")
