@@ -33,6 +33,9 @@
 | 0.11 float-return-uninit | 0-A | A | ✅ DONE + RE-VERIFIED (stddev=1.4142; `bfc55fba`+`29e380c1`) | 29e380c1 |
 | abs(float) mistypes return -> i64/pointer | 0-A | A | ⬜ NEW (found via std/math/geometry2d; workaround: `if x<0.0 then 0.0-x else x`) | |
 | is_dict/is_list are compile-time preds (return 0 on any-typed) | 0-A | C | ⬜ NEW (found via std/data/jsonpointer; workaround: `type_of(x)=="dict"`) | |
+| module-level `let X=<float>` truncates to int 0 | 0-A | C | ⬜ NEW (declare float consts inside fns; found via quaternion/polynomial) | |
+| floor()/ceil() boxed-float corrupts float-slot layout in imported fns | 0-A | B | ⬜ NEW (workaround: `float_to_int()` builtin; found via std/math/angle) | |
+| multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ⬜ NEW (whole import yields 0 symbols; use single-line/if-chain; found via calendar) | |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | user-enum payload typing | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | **enum float-payload unbox** (codegen) | 0-A | A | ✅ FIXED + CERTIFIED (gen5==gen6, 1155/0 both modes) | (task 5) |
@@ -71,11 +74,12 @@
 | forge_signum (D4 signed bignum) | numeric | — | ✅ DONE (fixed INT_MIN) | d708af6f |
 | forge_blake2b (RFC 7693 hash) | crypto | — | ✅ DONE (fixed validation) | d708af6f |
 | forge_hamt (D7 persistent map) | collections | — | ✅ DONE (fixed real-trie) | d708af6f |
-| **JDK-SCALE BREADTH BATCH — 30 modules** | (all) | — | ✅ DONE (30-task arc; each KAT-gated + re-verified) | b80b7e24·3dc1086d·b4641598·2f5fba65 |
-|   ↳ collections | unionfind·ordereddict·bloomfilter·sortedlist·bimap | — | ✅ | |
-|   ↳ text | distance·format·tablefmt·shlex·roman·ordinal·pluralize | — | ✅ | |
-|   ↳ math | numtheory·geometry2d·combinatorics·bits | — | ✅ | |
-|   ↳ other | itertools·functional/func·hash/noncrypto·cli/args·random/dist·net/{querystring,mac}·time/stopwatch·util/{retry,nanoid,humansize}·encoding/{inifmt,properties}·data/jsonpointer | — | ✅ | |
+| **JDK-SCALE BREADTH — 60 modules (2× 30-task cycles)** | (all) | — | ✅ DONE (each KAT-gated + independently re-verified; one full-CI arc per 30) | cyc1 b80b7e24·3dc1086d·b4641598·2f5fba65 · cyc2 85fa62b2·d29951ec·fd4d82bc·d0699a19 |
+|   ↳ collections | unionfind·ordereddict·bloomfilter·sortedlist·bimap·trie·graph·multimap·fenwick·rangeset·defaultdict·segmenttree | — | ✅ | |
+|   ↳ text | distance·format·tablefmt·shlex·roman·ordinal·pluralize·soundex·ansi·diff·wordcount·lorem·truncate·naturalsort | — | ✅ | |
+|   ↳ math | numtheory·geometry2d·combinatorics·bits·quaternion·easing·polynomial·regression·angle·primesieve | — | ✅ | |
+|   ↳ encoding/data | inifmt·properties·jsonpointer·ascii85·quotedprintable·ndjson·tsv | — | ✅ | |
+|   ↳ util/net/time/other | itertools·func·hash/noncrypto·cli/args·random/dist·querystring·mac·cookie·stopwatch·humanize·calendar·retry·nanoid·humansize·ulid·validate·dotenv | — | ✅ | |
 | forge_decimal (D2 BigDecimal) | numeric | signum | ⬜ Wave-2 | |
 | forge_argon2id (KDF) | crypto | blake2b | ⬜ Wave-2 | |
 | forge_unicode (D6 casefold/graphemes) | text | — | ⬜ Wave-2 | |
