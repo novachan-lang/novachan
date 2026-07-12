@@ -1,0 +1,258 @@
+// ============================================================================
+// NOVA Standard Library — std/net/url
+// ============================================================================
+// RFC-3986-ish URL parsing and building.
+//
+// PUBLIC API:
+//   url_parse(s: string) -> dict
+//     Parse a URL string into a dict with keys:
+//       "scheme"   — e.g. "https", "http", "ftp"  (empty string if absent)
+//       "host"     — hostname without port          (empty string if absent)
+//       "port"     — port as string e.g. "8080"    (empty string if absent)
+//       "path"     — e.g. "/a/b"                   (empty string if absent)
+//       "query"    — everything after "?" up to "#" (empty string if absent)
+//       "fragment" — everything after "#"           (empty string if absent)
+//
+//   url_build(parts: dict) -> string
+//     Reassemble a dict (as returned by url_parse) back into a URL string.
+//     Missing keys are treated as "".
+//
+//   url_host(s: string) -> string
+//     Convenience: parse and return the host component.
+//
+//   url_path(s: string) -> string
+//     Convenience: parse and return the path component.
+//
+// PARSING ALGORITHM (RFC-3986-ish):
+//   1. scheme: text before "://".  If "://" absent, scheme = "".
+//   2. authority: text from end-of-scheme to first "/" "?" or "#".
+//      Split authority on last ":" to separate host and port.
+//   3. path: text from end-of-authority to first "?" or "#".
+//   4. query: text from first "?" to first "#" (exclusive of delimiters).
+//   5. fragment: text after first "#".
+//
+// DESIGN NOTES:
+//   * All helpers prefixed _url_ to avoid symbol collisions.
+//   * '/' two ints = integer division in NOVA.
+//   * dict keys are strings; missing key returns int 0 not "".
+//     Always use contains() before reading a string value.
+//   * NOVA has no ~ operator; use XOR for bit manipulation.
+//   * slice(s, start, end) — end is EXCLUSIVE.
+//   * char_at(s, i) returns a single-char string.
+//   * split() splits on exact substring.
+//
+// LEAF — imports NOTHING.
+
+// ── Private: find first occurrence of a single-char needle in haystack ────────
+
+// _url_index_of: return index of first occurrence of single-char needle in s
+// starting at position from_pos.  Returns -1 if not found.
+fn _url_index_of(s: string, needle: string, from_pos: int) -> int
+    let n = len(s)
+    let i = from_pos
+    while i < n
+        if char_at(s, i) == needle
+            return i
+        i = i + 1
+    -1
+
+// _url_index_of_any: return index of first occurrence of any char in needles
+// starting at from_pos.  Returns -1 if none found.
+fn _url_index_of_any(s: string, n1: string, n2: string, n3: string, from_pos: int) -> int
+    let n = len(s)
+    let i = from_pos
+    while i < n
+        let c = char_at(s, i)
+        if c == n1 or c == n2 or c == n3
+            return i
+        i = i + 1
+    -1
+
+// ── Private: parse the authority string into host + port ─────────────────────
+
+// _url_parse_authority: given "host:port" or "host", fill d with "host" and "port".
+// IPv6 addresses like "[::1]:8080" are left as-is in host (brackets kept).
+fn _url_parse_authority(auth: string, d: dict)
+    let n = len(auth)
+    // Find the LAST ':' to handle IPv6 addresses.
+    // But if auth starts with '[', we need only look for ':' after ']'.
+    if n == 0
+        d["host"] = ""
+        d["port"] = ""
+        return
+    // Check for IPv6 bracketed address
+    let host_part = ""
+    let port_part = ""
+    if char_at(auth, 0) == "["
+        // IPv6: find ']', then check for ':' after it
+        let close_bracket = _url_index_of(auth, "]", 1)
+        if close_bracket < 0
+            // Malformed IPv6 — treat whole thing as host
+            d["host"] = auth
+            d["port"] = ""
+            return
+        let after_bracket = close_bracket + 1
+        if after_bracket < n and char_at(auth, after_bracket) == ":"
+            // Has port after bracket
+            d["host"] = slice(auth, 0, after_bracket)
+            d["port"] = slice(auth, after_bracket + 1, n)
+        else
+            d["host"] = auth
+            d["port"] = ""
+        return
+    // Normal host: find last ':'
+    let last_colon = -1
+    let i = 0
+    while i < n
+        if char_at(auth, i) == ":"
+            last_colon = i
+        i = i + 1
+    if last_colon < 0
+        d["host"] = auth
+        d["port"] = ""
+    else
+        d["host"] = slice(auth, 0, last_colon)
+        d["port"] = slice(auth, last_colon + 1, n)
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// url_parse: parse a URL string into its components.
+//
+// Examples:
+//   url_parse("https://example.com:8080/a/b?x=1&y=2#top")
+//     -> {"scheme":"https","host":"example.com","port":"8080",
+//         "path":"/a/b","query":"x=1&y=2","fragment":"top"}
+//   url_parse("http://h/p")
+//     -> {"scheme":"http","host":"h","port":"","path":"/p",
+//         "query":"","fragment":""}
+//   url_parse("ftp://f")
+//     -> {"scheme":"ftp","host":"f","port":"","path":"",
+//         "query":"","fragment":""}
+//   url_parse("/relative/path?a=1")
+//     -> {"scheme":"","host":"","port":"","path":"/relative/path",
+//         "query":"a=1","fragment":""}
+fn url_parse(s: string) -> dict
+    let d = {}
+    d["scheme"] = ""
+    d["host"] = ""
+    d["port"] = ""
+    d["path"] = ""
+    d["query"] = ""
+    d["fragment"] = ""
+
+    let total = len(s)
+    let pos = 0
+
+    // Step 1: extract scheme (look for "://")
+    // We scan for ':' and check that it is followed by "//"
+    let colon_pos = _url_index_of(s, ":", 0)
+    if colon_pos > 0 and colon_pos + 2 < total
+        if char_at(s, colon_pos + 1) == "/" and char_at(s, colon_pos + 2) == "/"
+            d["scheme"] = slice(s, 0, colon_pos)
+            pos = colon_pos + 3
+        // else: colon not followed by // — no scheme (e.g. "localhost:8080/path")
+    // if colon_pos <= 0 or not followed by //, pos stays 0 and scheme stays ""
+
+    // Step 2: extract authority (host[:port]) — only when scheme was found
+    // Authority ends at first '/', '?', '#', or end-of-string.
+    let has_scheme = len(d["scheme"]) > 0
+    if has_scheme
+        let auth_end = _url_index_of_any(s, "/", "?", "#", pos)
+        if auth_end < 0
+            // Rest of string is the authority, no path/query/fragment
+            let auth = slice(s, pos, total)
+            _url_parse_authority(auth, d)
+            return d
+        let auth = slice(s, pos, auth_end)
+        _url_parse_authority(auth, d)
+        pos = auth_end
+
+    // Step 3: extract fragment (everything after the LAST '#')
+    // We find '#' searching forward from current pos.
+    let hash_pos = _url_index_of(s, "#", pos)
+    let path_query_end = total
+    if hash_pos >= 0
+        d["fragment"] = slice(s, hash_pos + 1, total)
+        path_query_end = hash_pos
+
+    // Step 4: extract query (between first '?' and '#' or end)
+    let qmark_pos = _url_index_of(s, "?", pos)
+    let path_end = path_query_end
+    if qmark_pos >= 0 and qmark_pos < path_query_end
+        d["query"] = slice(s, qmark_pos + 1, path_query_end)
+        path_end = qmark_pos
+
+    // Step 5: path is from pos to first '?' or '#'
+    d["path"] = slice(s, pos, path_end)
+
+    d
+
+// url_build: reassemble a URL from its component dict.
+// All keys are optional — missing or empty values are simply omitted.
+//
+// Examples:
+//   url_build({"scheme":"https","host":"example.com","port":"8080",
+//              "path":"/a/b","query":"x=1&y=2","fragment":"top"})
+//     -> "https://example.com:8080/a/b?x=1&y=2#top"
+//   url_build({"scheme":"http","host":"h","path":"/p"})
+//     -> "http://h/p"
+fn url_build(parts: dict) -> string
+    let result = ""
+
+    // scheme
+    let scheme = ""
+    if contains(parts, "scheme")
+        scheme = parts["scheme"]
+    if len(scheme) > 0
+        result = result + scheme + "://"
+
+    // host
+    let host = ""
+    if contains(parts, "host")
+        host = parts["host"]
+    result = result + host
+
+    // port
+    let port = ""
+    if contains(parts, "port")
+        port = parts["port"]
+    if len(port) > 0
+        result = result + ":" + port
+
+    // path
+    let path = ""
+    if contains(parts, "path")
+        path = parts["path"]
+    result = result + path
+
+    // query
+    let query = ""
+    if contains(parts, "query")
+        query = parts["query"]
+    if len(query) > 0
+        result = result + "?" + query
+
+    // fragment
+    let fragment = ""
+    if contains(parts, "fragment")
+        fragment = parts["fragment"]
+    if len(fragment) > 0
+        result = result + "#" + fragment
+
+    result
+
+// url_host: convenience — parse s and return its host component.
+//
+// Example:
+//   url_host("https://example.com:8080/path") -> "example.com"
+fn url_host(s: string) -> string
+    let d = url_parse(s)
+    d["host"]
+
+// url_path: convenience — parse s and return its path component.
+//
+// Example:
+//   url_path("https://example.com/a/b?q=1") -> "/a/b"
+fn url_path(s: string) -> string
+    let d = url_parse(s)
+    d["path"]
