@@ -1,0 +1,170 @@
+// std/random/dist -- Random distributions on a seedable PRNG.
+//
+// All functions follow the functional (state-threading) convention of
+// std/util/prng: the RNG state is an opaque int threaded explicitly through
+// every call.  No global state is mutated.  Same seed -> same output always.
+//
+// Public API:
+//   dist_uniform(state, a, b)     -> [float, new_state]  -- float in [a, b)
+//   dist_gaussian(state, mean, sd)-> [float, new_state]  -- Box-Muller transform
+//   dist_shuffle(state, xs)       -> [list, new_state]   -- Fisher-Yates, new copy
+//   dist_choice(state, xs)        -> [value, new_state]  -- uniformly random element
+//   dist_sample(state, xs, k)     -> [list, new_state]   -- k without replacement
+//
+// INVARIANTS:
+//   dist_uniform(s, a, b)  -- result r satisfies a <= r < b
+//   dist_gaussian          -- Box-Muller; Marsaglia polar used so no trig needed
+//   dist_shuffle           -- returns a PERMUTATION of the input list (same elements)
+//   dist_choice            -- returned value IS in xs
+//   dist_sample(s,xs,k)    -- returned list has exactly k distinct elements from xs
+//
+// Implementation notes:
+//   * prng_next returns [non_negative_int, new_state].  We map that to [0,1)
+//     as uint / (INT64_MAX+1.0).  INT63_MAX = 9223372036854775807.
+//   * >> is ARITHMETIC in NOVA; all right-shifts on non-negative ints (prng output
+//     is always >= 0) are safe.
+//   * floor()/ceil() return boxed floats; we avoid them -- use int casts.
+//   * Any complex float expression returned directly triggers a codegen bug; always
+//     bind to an intermediate 'let' before returning.
+//   * No multi-line list/dict literals.
+//   * '{'/'}' in strings interpolate -- use chr(123)/chr(125) if needed.
+
+import std/util/prng
+
+// ── internal: map a non-negative prng integer to float in [0,1) ────────────
+// INT63_MAX+1 = 9223372036854775808.0; dividing gives us full [0,1) coverage.
+fn _dist_to_unit(v: int) -> float
+    let denom = 9223372036854775808.0
+    let fv = v * 1.0
+    let r = fv / denom
+    r
+
+// ── dist_uniform ────────────────────────────────────────────────────────────
+// Returns a float uniformly in [a, b).
+// If a >= b, collapses to a (defensive).
+fn dist_uniform(state: int, a: float, b: float)
+    if a >= b
+        let step0 = prng_next(state)
+        return [a, step0[1]]
+    let step = prng_next(state)
+    let v = step[0]
+    let ns = step[1]
+    let u = _dist_to_unit(v)
+    let span = b - a
+    let result = a + u * span
+    [result, ns]
+
+// ── dist_gaussian ────────────────────────────────────────────────────────────
+// Box-Muller transform (basic form), using two uniform samples u1, u2.
+//   z = sqrt(-2 * log(u1)) * cos(2 * pi * u2)
+// We produce ONE variate per call (the second z1 is discarded for simplicity;
+// stateless API means we can't cache it without returning it, which would change
+// the API shape).  We draw u1 > 0 by rejection on the very rare u1==0 case.
+//
+// All intermediate float expressions MUST be bound to lets before use (NOVA
+// codegen gotcha: large float sub-expressions returned bare can produce uninit
+// garbage).
+fn dist_gaussian(state: int, mean: float, sd: float)
+    // Draw u1 in (0,1) -- re-draw on the astronomically unlikely u1==0.0
+    let st0 = state
+    let u1 = 0.0
+    let ns1 = st0
+    let done = 0
+    while done == 0
+        let s1 = prng_next(st0)
+        let raw1 = _dist_to_unit(s1[0])
+        ns1 = s1[1]
+        st0 = s1[1]
+        if raw1 > 0.0
+            u1 = raw1
+            done = 1
+    // Draw u2 in [0,1)
+    let s2 = prng_next(ns1)
+    let u2 = _dist_to_unit(s2[0])
+    let ns2 = s2[1]
+    // Box-Muller: z = sqrt(-2*ln(u1)) * cos(2*pi*u2)
+    let pi2 = 6.283185307179586
+    let neg2_ln_u1 = -2.0 * log(u1)
+    let r = sqrt(neg2_ln_u1)
+    let angle = pi2 * u2
+    let z = r * cos(angle)
+    let result = mean + sd * z
+    [result, ns2]
+
+// ── _list_copy ──────────────────────────────────────────────────────────────
+fn _list_copy(xs: list) -> list
+    let out = []
+    let i = 0
+    while i < len(xs)
+        out = out + [xs[i]]
+        i = i + 1
+    out
+
+// ── dist_shuffle ────────────────────────────────────────────────────────────
+// Fisher-Yates (Knuth) shuffle on a COPY of xs.  The original xs is unchanged.
+// Returns [shuffled_list, new_state].
+fn dist_shuffle(state: int, xs: list)
+    let buf = _list_copy(xs)
+    let n = len(buf)
+    let st = state
+    let i = n - 1
+    while i > 0
+        // pick j in [0, i] inclusive
+        let step = prng_range(st, 0, i)
+        let j = step[0]
+        st = step[1]
+        // swap buf[i] and buf[j]
+        let tmp = buf[i]
+        buf[i] = buf[j]
+        buf[j] = tmp
+        i = i - 1
+    [buf, st]
+
+// ── dist_choice ─────────────────────────────────────────────────────────────
+// Return one uniformly random element from xs.
+// If xs is empty, returns [null, new_state].
+fn dist_choice(state: int, xs: list)
+    let n = len(xs)
+    if n == 0
+        let step0 = prng_next(state)
+        return [null, step0[1]]
+    let step = prng_range(state, 0, n - 1)
+    let idx = step[0]
+    let ns = step[1]
+    [xs[idx], ns]
+
+// ── dist_sample ─────────────────────────────────────────────────────────────
+// Sample k elements WITHOUT replacement from xs, using a partial Fisher-Yates
+// on a copy.  If k >= len(xs), returns a full shuffle.
+// Returns [list_of_k_elements, new_state].
+fn dist_sample(state: int, xs: list, k: int)
+    let n = len(xs)
+    if k <= 0
+        let step0 = prng_next(state)
+        return [[], step0[1]]
+    let take = k
+    if take > n
+        take = n
+    // Work on a shallow copy so xs is unchanged.
+    let buf = _list_copy(xs)
+    let st = state
+    let i = 0
+    while i < take
+        // pick j in [i, n-1] inclusive
+        let hi = n - 1 - i
+        let step = prng_range(st, 0, hi)
+        let j_rel = step[0]
+        st = step[1]
+        let j = i + j_rel
+        // swap buf[i] and buf[j]
+        let tmp = buf[i]
+        buf[i] = buf[j]
+        buf[j] = tmp
+        i = i + 1
+    // collect the first `take` elements
+    let out = []
+    let ii = 0
+    while ii < take
+        out = out + [buf[ii]]
+        ii = ii + 1
+    [out, st]

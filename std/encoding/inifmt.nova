@@ -1,0 +1,274 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/inifmt
+// ============================================================================
+// Parse and serialize INI-format configuration files.
+//
+// INI is the ubiquitous Windows/.INI / Python configparser / Git config style
+// config format. No standard exists, but the common denominator is:
+//   - Sections:  [SectionName] — lines starting with '['
+//   - Entries:   key=value     — first '=' is the delimiter
+//   - Comments:  ; or #        — entire line is a comment
+//   - Blanks:    ignored
+//   - Whitespace around keys and values is trimmed.
+//   - Keys before the first [section] belong to the DEFAULT section "".
+//
+// PUBLIC API:
+//   ini_parse(text: string) -> dict
+//     Parse INI text. Returns a dict mapping section-name -> inner-dict.
+//     The inner dict maps key -> value (both strings, trimmed).
+//     Pre-section keys land in section "". Comment and blank lines are
+//     ignored. On duplicate keys within a section, the LAST value wins
+//     (standard INI behaviour — last definition prevails).
+//
+//   ini_get(parsed: dict, section: string, key: string) -> string
+//     Safe lookup: returns value string, or "" if the section or key is
+//     absent. Use contains() to distinguish "missing" from "empty value".
+//
+//   ini_sections(parsed: dict) -> list
+//     Returns a list of all section names present in parsed (including ""
+//     if pre-section keys exist). Order is not guaranteed by the dict
+//     implementation, but "" is emitted first when present.
+//
+//   ini_serialize(parsed: dict) -> string
+//     Produce canonical INI text from a parsed dict. Default section ("")
+//     keys are emitted first (no header line). Named sections follow, each
+//     preceded by a [name] header. The result is round-trip stable:
+//     ini_parse(ini_serialize(p)) produces a dict with identical contents.
+//
+// IMPLEMENTATION NOTES — NOVA GOTCHAS:
+//   - dict keys are ALWAYS strings; section names are strings.
+//   - Multi-line list/dict literals are ILLEGAL — build incrementally.
+//   - chr(10) = LF, chr(13) = CR, chr(9) = TAB.
+//   - contains(dict, key) MUST precede every dict lookup.
+//   - '{'/'}' in string literals INTERPOLATE — avoid or use chr(123)/chr(125).
+//   - >> is ARITHMETIC in NOVA — not needed here, noted for completeness.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _ini_is_ws: true for space (32) or tab (9).
+fn _ini_is_ws(c) -> int
+    let b = ord(c)
+    if b == 32 or b == 9
+        return 1
+    return 0
+
+// _ini_trim: remove leading and trailing whitespace (space and tab) from s.
+fn _ini_trim(s) -> string
+    let n = len(s)
+    let st = 0
+    while st < n and _ini_is_ws(char_at(s, st)) == 1
+        st = st + 1
+    let en = n
+    while en > st and _ini_is_ws(char_at(s, en - 1)) == 1
+        en = en - 1
+    if st == 0 and en == n
+        return s
+    slice(s, st, en)
+
+// _ini_starts_with: true if s[0] == c_ord (by ordinal).
+fn _ini_char0_ord(s) -> int
+    if len(s) == 0
+        return -1
+    ord(char_at(s, 0))
+
+// _ini_index_of_eq: return index of first '=' in s, or -1 if none.
+// Used to split key=value. We do NOT use ':', so git-style ':' separators
+// are treated as part of the key (narrowest-compatible behaviour).
+fn _ini_index_of_eq(s) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if ord(char_at(s, i)) == 61
+            return i
+        i = i + 1
+    return -1
+
+// _ini_ensure_section: if parsed dict does not yet have section `sec`,
+// insert an empty dict for it. Returns parsed (mutated in-place via dict
+// reference semantics).
+fn _ini_ensure_section(parsed, sec) -> any
+    if contains(parsed, sec) == 0
+        let empty = {}
+        parsed[sec] = empty
+    parsed
+
+// _ini_set_key: set key->val inside the inner dict for section sec.
+// Assumes _ini_ensure_section was already called.
+fn _ini_set_key(parsed, sec, key, val)
+    let inner = parsed[sec]
+    inner[key] = val
+    parsed[sec] = inner
+
+// _ini_split_lines: split text into a list of lines. Handles LF, CRLF, CR.
+// Returns a list of strings (lines WITHOUT the line terminator).
+fn _ini_split_lines(text) -> list
+    let lines = []
+    let n = len(text)
+    let i = 0
+    let cur = ""
+    while i < n
+        let c = char_at(text, i)
+        let b = ord(c)
+        if b == 10
+            // LF: end of line
+            lines.push(cur)
+            cur = ""
+        else if b == 13
+            // CR: end of line; skip following LF if present
+            lines.push(cur)
+            cur = ""
+            if i + 1 < n and ord(char_at(text, i + 1)) == 10
+                i = i + 1
+        else
+            cur = cur + c
+        i = i + 1
+    // Last line (no trailing newline)
+    if len(cur) > 0
+        lines.push(cur)
+    lines
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ini_parse: parse INI-format text into a nested dict.
+//
+// Returns: dict { section_name -> dict { key -> value } }
+//
+// The default section (pre-first-[header] keys) is stored under key "".
+// If no keys exist before the first header, "" is absent from the result.
+//
+// Parsing rules (applied per line after splitting on LF/CRLF/CR):
+//   1. Trim leading/trailing whitespace.
+//   2. Skip blank lines.
+//   3. Skip comment lines: first non-whitespace char is ';' or '#'.
+//   4. If line starts with '[': parse section name = text between '[' and ']'.
+//      If ']' is absent, the whole remainder after '[' is the section name.
+//      Section name is trimmed.
+//   5. Otherwise: split on first '='. Left side = key (trimmed), right = value
+//      (trimmed). If no '=' found, the line is silently ignored.
+//
+// Duplicate keys in the same section: last definition wins.
+fn ini_parse(text) -> any
+    let parsed = {}
+    let cur_sec = ""
+    let lines = _ini_split_lines(text)
+    let li = 0
+    let nl = len(lines)
+    while li < nl
+        let raw = lines[li]
+        let line = _ini_trim(raw)
+        li = li + 1
+        // Skip blank lines
+        if len(line) == 0
+            // continue
+        else
+            let c0 = _ini_char0_ord(line)
+            // Skip comment lines starting with ';' (59) or '#' (35)
+            if c0 == 59 or c0 == 35
+                // comment — skip
+            else if c0 == 91
+                // '[' (91) — section header
+                // Find matching ']' (93)
+                let sn = len(line)
+                let rbracket = -1
+                let si = 1
+                while si < sn
+                    if ord(char_at(line, si)) == 93
+                        rbracket = si
+                        si = sn
+                    si = si + 1
+                let sec_name = ""
+                if rbracket == -1
+                    // No closing ']' — take everything after '['
+                    sec_name = _ini_trim(slice(line, 1, sn))
+                else
+                    sec_name = _ini_trim(slice(line, 1, rbracket))
+                cur_sec = sec_name
+                _ini_ensure_section(parsed, cur_sec)
+            else
+                // key=value line
+                let eq_pos = _ini_index_of_eq(line)
+                if eq_pos >= 0
+                    let key = _ini_trim(slice(line, 0, eq_pos))
+                    let val = _ini_trim(slice(line, eq_pos + 1, len(line)))
+                    if len(key) > 0
+                        _ini_ensure_section(parsed, cur_sec)
+                        _ini_set_key(parsed, cur_sec, key, val)
+    parsed
+
+// ini_get: safe lookup of key in section. Returns "" if missing.
+//
+// To distinguish a missing key from a key with value "":
+//   let inner = parsed[section]  (after contains check)
+//   contains(inner, key)
+fn ini_get(parsed, section, key) -> string
+    if contains(parsed, section) == 0
+        return ""
+    let inner = parsed[section]
+    if contains(inner, key) == 0
+        return ""
+    inner[key]
+
+// ini_sections: return list of all section names in parsed.
+//
+// The empty-string section "" (default section) is emitted first when
+// present, followed by named sections in iteration order.
+fn ini_sections(parsed) -> list
+    let result = []
+    // Emit "" first if present
+    if contains(parsed, "") == 1
+        result.push("")
+    // Emit all other sections
+    let all_keys = keys(parsed)
+    let i = 0
+    while i < len(all_keys)
+        let k = all_keys[i]
+        if k != ""
+            result.push(k)
+        i = i + 1
+    result
+
+// ini_serialize: convert parsed INI dict back to INI text.
+//
+// Format:
+//   - Default section ("") keys emitted first, no [header].
+//   - Named sections: [name] header on its own line, then key=value lines.
+//   - Sections are separated by a blank line for readability.
+//   - Result always ends with a newline.
+//
+// Round-trip guarantee: ini_parse(ini_serialize(p)) produces an equivalent
+// dict (same sections, same keys, same values). Whitespace may differ.
+fn ini_serialize(parsed) -> string
+    let nl = chr(10)
+    let out = ""
+    let first_block = 1
+    // 1. Default section ("") first — no header line
+    if contains(parsed, "") == 1
+        let inner = parsed[""]
+        let dk = keys(inner)
+        let di = 0
+        while di < len(dk)
+            let k = dk[di]
+            out = out + k + "=" + inner[k] + nl
+            di = di + 1
+        first_block = 0
+    // 2. Named sections
+    let all_secs = keys(parsed)
+    let si = 0
+    while si < len(all_secs)
+        let sec = all_secs[si]
+        si = si + 1
+        if sec != ""
+            if first_block == 0
+                out = out + nl
+            first_block = 0
+            out = out + chr(91) + sec + chr(93) + nl
+            let inner = parsed[sec]
+            let sk = keys(inner)
+            let ki = 0
+            while ki < len(sk)
+                let k = sk[ki]
+                out = out + k + "=" + inner[k] + nl
+                ki = ki + 1
+    out

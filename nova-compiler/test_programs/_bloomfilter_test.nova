@@ -1,0 +1,123 @@
+// KAT test for std/collections/bloomfilter.
+// All expected values hand-computed (Python reference implementation) with:
+//   h1 = FNV-1a (offset=2166136261, prime=16777619, mask=0xFFFFFFFF)
+//   h2 = djb2   (init=5381,         factor=33,      mask=0xFFFFFFFF)
+//   bit_j = (h1 + j*h2) % nbits  for j in 0..k-1
+// nbits=2048, k=4 → false-positive rate < 0.01% for n<=50 items.
+//
+// Reference KAT bit positions (nbits=2048, k=4):
+//   apple:  h1=81354409, h2=253337143 → bits [1705,1248,791,334]
+//   banana: h1=3361144642,h2=4086421542 → bits [1858,1896,1934,1972]  (mod 2048)
+//   cherry: h1=2487343670,h2=4133553618 → bits [566,8,1498,940]  (mod 2048)
+
+import std/collections/bloomfilter
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got " + got + " want " + want)
+        exit(1)
+
+fn main()
+    // --- KAT 1: basic structure from bf_new ---
+    let bf = bf_new(2048, 4)
+    cki("nbits", bf["nbits"], 2048)
+    cki("k", bf["k"], 4)
+    cki("bits_len", len(bf["bits"]), 2048)
+    // all bits initially zero
+    let bits0 = bf["bits"]
+    cki("bit0_initial", bits0[0], 0)
+    cki("bit100_initial", bits0[100], 0)
+    cki("bit2047_initial", bits0[2047], 0)
+
+    // --- KAT 2: bf_maybe returns false before any add ---
+    if bf_maybe(bf, "apple") == true
+        print("FAIL maybe_before_add: apple should be absent")
+        exit(1)
+    if bf_maybe(bf, "banana") == true
+        print("FAIL maybe_before_add: banana should be absent")
+        exit(1)
+
+    // --- KAT 3: add "apple" — probe bits [1705,1248,791,334] must be 1 ---
+    bf_add(bf, "apple")
+    let bits_a = bf["bits"]
+    cki("apple_bit_1705", bits_a[1705], 1)
+    cki("apple_bit_1248", bits_a[1248], 1)
+    cki("apple_bit_791",  bits_a[791],  1)
+    cki("apple_bit_334",  bits_a[334],  1)
+
+    // --- KAT 4: bf_maybe("apple") = true after add ---
+    if bf_maybe(bf, "apple") == false
+        print("FAIL maybe_apple: must be true after add")
+        exit(1)
+
+    // --- KAT 5: add "banana" and "cherry", verify all three present ---
+    bf_add(bf, "banana")
+    bf_add(bf, "cherry")
+    if bf_maybe(bf, "apple") == false
+        print("FAIL maybe_apple_post: apple must still be true")
+        exit(1)
+    if bf_maybe(bf, "banana") == false
+        print("FAIL maybe_banana: banana must be true")
+        exit(1)
+    if bf_maybe(bf, "cherry") == false
+        print("FAIL maybe_cherry: cherry must be true")
+        exit(1)
+
+    // --- KAT 6: "zzz-not-added" must be false (2048 bits → near-zero FP rate) ---
+    // Probe bits for zzz-not-added: h1=1775978506, h2=2814221808
+    //   bit_0 = (1775978506 + 0*2814221808) % 2048 = 1775978506 % 2048 = 10
+    //   bit_1 = (1775978506 + 2814221808)   % 2048 = 4590200314 % 2048 = 1530
+    //   bit_2 = (1775978506 + 5628443616)   % 2048 = 7404422122 % 2048 = 1002
+    //   bit_3 = (1775978506 + 8442665424)   % 2048 = 10218643930 % 2048 = 474
+    // None of [10, 1530, 1002, 474] overlap [1705,1248,791,334,1858,1896,1934,1972,566,8,1498,940]
+    if bf_maybe(bf, "zzz-not-added") == true
+        print("FAIL maybe_zzz: must be false (not added, no FP at 2048 bits)")
+        exit(1)
+
+    // --- KAT 7: six distinct strings, each add-then-maybe must hold ---
+    let bf2 = bf_new(2048, 4)
+    let words = ["grape", "mango", "kiwi", "pear", "plum", "fig"]
+    let wi = 0
+    while wi < 6
+        bf_add(bf2, words[wi])
+        if bf_maybe(bf2, words[wi]) == false
+            print("FAIL add_then_maybe: " + words[wi])
+            exit(1)
+        wi = wi + 1
+    // "zzz-not-added" is still absent even after adding 6 words
+    // (its probe bits [10,1530,1002,474] don't overlap any of the 6 items' bits)
+    if bf_maybe(bf2, "zzz-not-added") == true
+        print("FAIL maybe_zzz_bf2: must be false")
+        exit(1)
+
+    // --- KAT 8: bf_new with different parameters (k=1, nbits=64) ---
+    let bf3 = bf_new(64, 1)
+    cki("bf3_nbits", bf3["nbits"], 64)
+    cki("bf3_k", bf3["k"], 1)
+    cki("bf3_bits_len", len(bf3["bits"]), 64)
+    if bf_maybe(bf3, "test") == true
+        print("FAIL bf3_before_add")
+        exit(1)
+    bf_add(bf3, "test")
+    if bf_maybe(bf3, "test") == false
+        print("FAIL bf3_after_add")
+        exit(1)
+
+    // --- KAT 9: mutation is independent between two filters ---
+    // bf (from KAT 3-6) and bf2 (from KAT 7) are separate: adding to bf2
+    // must not affect bf.
+    // "grape" is in bf2 but not in bf (original) — check it's absent from bf.
+    // (h1 grape=764090826, h2=260508340; bits [458,1150,1842,486])
+    // None of 458,1150,1842,486 in [1705,1248,791,334,1858,1896,1934,1972,566,8,1498,940]
+    if bf_maybe(bf, "grape") == true
+        print("FAIL isolation: grape should not be in bf")
+        exit(1)
+
+    print("_bloomfilter_test passed")
+
+main()
