@@ -33,8 +33,8 @@
 | 0.11 float-return-uninit | 0-A | A | ✅ DONE + RE-VERIFIED (stddev=1.4142; `bfc55fba`+`29e380c1`) | 29e380c1 |
 | abs(float) mistypes return -> i64/pointer | 0-A | A | ✅ DONE (compiler types abs-of-any 'any' + runtime nova_rt_abs re-boxes) | 058cbea5 |
 | is_dict/is_list/is_* return 0 on any-typed | 0-A | A | ✅ DONE (new nova_rt_type_pred; compiler emits runtime check for undecidable case) | 441819d6 |
-| module-level `let X=<float>` truncates to int 0 | 0-A | C | ⬜ NEW (declare float consts inside fns; found via quaternion/polynomial) | |
-| floor()/ceil() boxed-float corrupts float-slot layout in imported fns | 0-A | B | ⬜ NEW (workaround: `float_to_int()` builtin; found via std/math/angle) | |
+| module-level `let X=<init>` DROPS the initializer (all globals zero-init) | 0-A | B | ⬜ NEW+SHARPENED — not just float: `let COUNT=42`→0, `let NAME="x"`→"", `let PI=3.14`→0. Global storage/mutation works but the init expr never runs. Fix = emit a global-init prelude at main-start (both backends). Workaround: init inside a fn. | |
+| ~~floor()/ceil() boxed-float corrupts layout~~ | 0-A | — | ❌ NOT A BUG — nova_rt_floor returns clean `(int64_t)floor(x)`, typed int. Agent misdiagnosed; float_to_int helped an unrelated float-slot issue. | |
 | multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ⬜ NEW (whole import yields 0 symbols; use single-line/if-chain; found via calendar) | |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | user-enum payload typing | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
