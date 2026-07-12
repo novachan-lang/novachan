@@ -4717,6 +4717,28 @@ int64_t nova_rt_type_of(int64_t val) {
     }
 }
 
+/* Runtime type predicate — evaluated when a type predicate (is_dict/is_list/...) is applied
+   to an 'any'/undecidable-at-compile-time value. The compiler emits this instead of a static
+   const so the actual runtime type tag decides. pred_id: 0=is_int 1=is_float 2=is_string
+   3=is_list 4=is_dict 5=is_bool 6=is_struct 7=is_numeric. Classification mirrors nova_rt_type_of
+   (correct for list/dict/string/struct; int/float/bool follow type_of's scalar view). */
+int64_t nova_rt_type_pred(int64_t val, int64_t pred_id) {
+    const char* t = (const char*)(uintptr_t)nova_rt_type_of(val);
+    int is_i = (strcmp(t, "int") == 0);
+    int is_f = (strcmp(t, "float") == 0);
+    switch (pred_id) {
+        case 0: return is_i ? 1 : 0;
+        case 1: return is_f ? 1 : 0;
+        case 2: return (strcmp(t, "string") == 0) ? 1 : 0;
+        case 3: return (strcmp(t, "list") == 0) ? 1 : 0;
+        case 4: return (strcmp(t, "dict") == 0) ? 1 : 0;
+        case 5: return (strcmp(t, "bool") == 0) ? 1 : 0;
+        case 6: return (!is_i && !is_f && strcmp(t, "string") && strcmp(t, "list") && strcmp(t, "dict") && strcmp(t, "bool")) ? 1 : 0;
+        case 7: return (is_i || is_f) ? 1 : 0;
+        default: return 0;
+    }
+}
+
 int64_t nova_rt_print_any(int64_t val) {
     int64_t s = nova_rt_any_to_str(val);
     puts((const char*)(uintptr_t)s);
