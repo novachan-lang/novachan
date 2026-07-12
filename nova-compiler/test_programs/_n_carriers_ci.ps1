@@ -6,6 +6,7 @@
 # Usage: powershell -ExecutionPolicy Bypass -File ./_n_carriers_ci.ps1  [-Iters 3] [-TimeoutSec 20]
 param([int]$Iters = 3, [int]$TimeoutSec = 20)
 Set-Location $PSScriptRoot
+. "$PSScriptRoot\_proc_util.ps1"   # sets NOVA_HOME (+ syncs std/ & forge/) so tests importing std/ modules resolve
 $compiler = (Resolve-Path ".\gen3_test.exe").Path
 $runtimeSrc = "$PSScriptRoot\..\compiler\nova_runtime.c"
 $clang = "clang"
@@ -15,7 +16,8 @@ $lflags = "-lws2_32 -ladvapi32 -lkernel32 -D_CRT_SECURE_NO_WARNINGS -w"
 $tests = @(
     @{ name = "green_scale_test"; ok = "GREEN SCALE PASS" },
     @{ name = "_mn_stress_test";  ok = "MN_STRESS_OK" },
-    @{ name = "_mn_churn";        ok = "MN CHURN OK" }   # sequential slot-reuse + reclaim-bounds-the-pool proof (default reclaim ON at N>1)
+    @{ name = "_mn_churn";        ok = "MN CHURN OK" },  # sequential slot-reuse + reclaim-bounds-the-pool proof (default reclaim ON at N>1)
+    @{ name = "showcase_concurrency_test"; ok = "showcase_concurrency_test passed" }  # std/sync semaphore + channel-serialized counter: no lost updates + ceiling never exceeded under N>1
 )
 
 $fail = 0

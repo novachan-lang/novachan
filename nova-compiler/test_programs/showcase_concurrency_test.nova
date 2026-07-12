@@ -1,0 +1,100 @@
+// showcase_concurrency — SHOWCASE + gated concurrency stress test.
+// Dogfoods the concurrency runtime + std/sync/semaphore under REAL contention.
+// Two invariants that a race would break:
+//   (1) A shared counter living in a channel_bounded(1) and updated via recv/modify/send
+//       must have NO lost updates: 8 workers x 500 increments == exactly 4000. If channel
+//       send/recv weren't atomic serialization points, we'd see < 4000.
+//   (2) std/sync/semaphore(2) is a HARD ceiling: at most 2 workers may be inside the
+//       permit-guarded critical section at once. Workers record the observed peak
+//       concurrency in a second channel-held state; peak must be <= 2 and end balanced at 0.
+// Designed to also run under NOVA_CARRIERS=4 (true multi-core), where races actually surface.
+import std/sync/semaphore
+
+// Worker: K counter increments (channel-serialized), then a semaphore-guarded critical section
+// that bumps/records/unbumps a shared concurrency gauge. Signals done at the end.
+// All of counter_ch / sem / state_ch / done_ch are CHANNELS -> shared by identity across tasks.
+fn worker(id, counter_ch, sem, state_ch, done_ch, K, R)
+    // ---- R rounds of a semaphore-guarded critical section (FIRST, so 8 workers overlap) ----
+    // At most `sem` permits (2) may be inside at once. A semaphore that failed to share across
+    // tasks (each task getting its own permits) would let peak concurrency climb toward N=8.
+    let r = 0
+    while r < R
+        sem_acquire(sem)
+        let st = recv(state_ch)
+        st["cur"] = st["cur"] + 1
+        if st["cur"] > st["max"]
+            st["max"] = st["cur"]
+        send(state_ch, st)
+        // widen the concurrency window so real overlap is actually observed under multi-core
+        let spin = 0
+        while spin < 500
+            spin = spin + 1
+        let st2 = recv(state_ch)
+        st2["cur"] = st2["cur"] - 1
+        send(state_ch, st2)
+        sem_release(sem)
+        r = r + 1
+    // ---- then K counter increments (channel-serialized no-lost-update test) ----
+    let i = 0
+    while i < K
+        let c = recv(counter_ch)
+        send(counter_ch, c + 1)
+        i = i + 1
+    send(done_ch, id)
+
+fn main()
+    let N = 8
+    let K = 500
+    let R = 50
+
+    // shared counter starts at 0, lives inside a bounded(1) channel (single-slot => serialized)
+    let counter_ch = channel_bounded(1)
+    send(counter_ch, 0)
+
+    // semaphore with 2 permits (channel-token based)
+    let sem = sem_new(2)
+
+    // concurrency gauge {cur,max} lives inside a bounded(1) channel
+    let state_ch = channel_bounded(1)
+    let st0 = {}
+    st0["cur"] = 0
+    st0["max"] = 0
+    send(state_ch, st0)
+
+    // done signals
+    let done_ch = channel()
+
+    // fan out N workers
+    let s = 0
+    while s < N
+        spawn worker(s, counter_ch, sem, state_ch, done_ch, K, R)
+        s = s + 1
+
+    // join: wait for all N workers
+    let d = 0
+    while d < N
+        recv(done_ch)
+        d = d + 1
+
+    // (1) no lost updates
+    let total = recv(counter_ch)
+    if total != N * K
+        print("FAIL counter: got " + str(total) + " want " + str(N * K))
+        exit(1)
+
+    // (2) semaphore ceiling respected + balanced
+    let stf = recv(state_ch)
+    if stf["max"] > 2
+        print("FAIL sem ceiling: peak concurrency " + str(stf["max"]) + " > 2 (semaphore not enforcing)")
+        exit(1)
+    if stf["max"] < 1
+        print("FAIL sem gauge: peak concurrency " + str(stf["max"]) + " < 1 (critical section never entered?)")
+        exit(1)
+    if stf["cur"] != 0
+        print("FAIL sem balance: gauge ended at " + str(stf["cur"]) + " (acquire/release imbalance)")
+        exit(1)
+
+    print("carriers=" + str(sched_carrier_count()) + " (of " + str(cpu_count()) + " cpus)")
+    print("workers=" + str(N) + " increments_each=" + str(K) + " counter_total=" + str(total) + " (expected " + str(N * K) + ", no lost updates)")
+    print("semaphore_permits=2  observed_peak_concurrency=" + str(stf["max"]) + "  final_gauge=" + str(stf["cur"]) + " (ceiling never exceeded)")
+    print("showcase_concurrency_test passed")
