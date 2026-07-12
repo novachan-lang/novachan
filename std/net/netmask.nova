@@ -1,0 +1,209 @@
+// ============================================================================
+// NOVA Standard Library — std/net/netmask
+// ============================================================================
+// IPv4 CIDR prefix <-> dotted netmask conversions and validation.
+//
+// PUBLIC API:
+//   nm_prefix_to_mask(prefix: int) -> string
+//     Convert a CIDR prefix length (0..32) to a dotted-quad netmask string.
+//     e.g. 24 -> "255.255.255.0", 0 -> "0.0.0.0", 32 -> "255.255.255.255".
+//     Out-of-range prefix returns "0.0.0.0".
+//
+//   nm_mask_to_prefix(mask: string) -> int
+//     Convert a dotted-quad netmask string to the equivalent prefix length.
+//     Returns -1 if the string is malformed or the mask is not a valid
+//     contiguous netmask (all 1-bits left, all 0-bits right).
+//     e.g. "255.255.255.0" -> 24, "255.0.255.0" -> -1 (non-contiguous).
+//
+//   nm_wildcard(prefix: int) -> string
+//     Return the wildcard (inverse) mask for the given prefix length.
+//     This is the bitwise NOT of the netmask, kept to 32 bits.
+//     e.g. 24 -> "0.0.0.255", 0 -> "255.255.255.255".
+//     Out-of-range prefix returns "255.255.255.255".
+//
+//   nm_is_valid_mask(s: string) -> bool
+//     Return true iff s is a well-formed dotted-quad and represents a valid
+//     contiguous netmask (contiguous block of 1-bits followed by 0-bits).
+//     Equivalently: nm_mask_to_prefix(s) >= 0.
+//
+// DESIGN NOTES:
+//   * NOVA ints are signed 64-bit. All 32-bit IPv4 values are kept in
+//     [0, 0xFFFFFFFF] by masking with & 0xFFFFFFFF at every step.
+//   * We avoid << for the mask computation because 1<<64 is broken in NOVA
+//     (returns 0xFFFFFFFF rather than 0). Instead, the 32-bit mask for prefix p
+//     is computed as:
+//         if p == 0: mask = 0
+//         else:      mask = 0xFFFFFFFF - (_nm_pow2(32 - p) - 1)
+//     where _nm_pow2(n) = 2^n computed by repeated doubling (loop).
+//     This is algebraically identical to (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF
+//     but safe for p=0 and p=32.
+//   * >> is ARITHMETIC in NOVA (sign-extends). We right-shift only values that
+//     are guaranteed non-negative and immediately mask with & 0xFF.
+//   * Contiguity check: a mask M is a valid netmask iff it equals the mask
+//     recomputed from its own prefix length (count of leading 1-bits).
+//
+// PRIVATE helpers are all prefixed _nm_ to avoid symbol collision.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _nm_pow2: compute 2^n via repeated doubling. Safe for n in 0..32.
+// 2^0 = 1, 2^32 = 4294967296.
+fn _nm_pow2(n: int) -> int
+    let v = 1
+    let i = 0
+    while i < n
+        v = v * 2
+        i = i + 1
+    v
+
+// _nm_mask_from_prefix: return the 32-bit netmask for a given prefix length.
+// prefix must be in 0..32; caller is responsible for range-checking.
+// prefix=0  -> 0x00000000 (0)
+// prefix=32 -> 0xFFFFFFFF (4294967295)
+// prefix=24 -> 0xFFFFFF00 (4294967040)
+fn _nm_mask_from_prefix(prefix: int) -> int
+    if prefix == 0
+        return 0
+    // mask = 0xFFFFFFFF - (2^(32-prefix) - 1)
+    //      = 0xFFFFFFFF - 2^(32-prefix) + 1
+    let host_bits = 32 - prefix
+    let host_count = _nm_pow2(host_bits)
+    // host_count - 1 = number of host addresses (the wildcard mask)
+    (0xFFFFFFFF - (host_count - 1)) & 0xFFFFFFFF
+
+// _nm_fmt: format a 32-bit int as a dotted-quad string.
+fn _nm_fmt(n: int) -> string
+    let a = (n >> 24) & 0xFF
+    let b = (n >> 16) & 0xFF
+    let c = (n >> 8) & 0xFF
+    let d = n & 0xFF
+    str(a) + "." + str(b) + "." + str(c) + "." + str(d)
+
+// _nm_digits_only: true iff s is non-empty and contains only ASCII digits.
+fn _nm_digits_only(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    while i < len(s)
+        let b = ord(char_at(s, i))
+        if b < 48 or b > 57
+            return false
+        i = i + 1
+    true
+
+// _nm_parse_octet: parse one dotted-quad octet to 0..255, or -1 on error.
+fn _nm_parse_octet(s: string) -> int
+    if _nm_digits_only(s) == false
+        return -1
+    let v = parse_int(s)
+    if v < 0 or v > 255
+        return -1
+    v
+
+// _nm_parse_dotted: parse a dotted-quad string to a 32-bit int, or -1.
+fn _nm_parse_dotted(s: string) -> int
+    let parts = split(s, ".")
+    if len(parts) != 4
+        return -1
+    let a = _nm_parse_octet(parts[0])
+    if a < 0
+        return -1
+    let b = _nm_parse_octet(parts[1])
+    if b < 0
+        return -1
+    let c = _nm_parse_octet(parts[2])
+    if c < 0
+        return -1
+    let d = _nm_parse_octet(parts[3])
+    if d < 0
+        return -1
+    (a * 16777216 + b * 65536 + c * 256 + d) & 0xFFFFFFFF
+
+// _nm_count_prefix: count leading 1-bits in a 32-bit value.
+// Used to determine the prefix length candidate for a mask.
+// Scans from bit 31 down to bit 0, counting consecutive 1-bits.
+fn _nm_count_prefix(mask: int) -> int
+    let count = 0
+    let bit = 31
+    while bit >= 0
+        // Extract bit `bit` of mask: shift right by `bit` positions, check LSB.
+        // We compute the divisor = 2^bit via _nm_pow2, then divide to get the bit.
+        // But a simpler approach: test (mask & _nm_pow2(bit)) != 0.
+        let pow = _nm_pow2(bit)
+        if (mask & pow) != 0
+            count = count + 1
+            bit = bit - 1
+        else
+            // First 0-bit found; remaining bits must all be 0 for a valid mask.
+            return count
+    count
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// nm_prefix_to_mask: convert CIDR prefix length to dotted-quad netmask string.
+//
+// nm_prefix_to_mask(0)  -> "0.0.0.0"
+// nm_prefix_to_mask(8)  -> "255.0.0.0"
+// nm_prefix_to_mask(16) -> "255.255.0.0"
+// nm_prefix_to_mask(24) -> "255.255.255.0"
+// nm_prefix_to_mask(25) -> "255.255.255.128"
+// nm_prefix_to_mask(32) -> "255.255.255.255"
+fn nm_prefix_to_mask(prefix: int) -> string
+    if prefix < 0 or prefix > 32
+        return "0.0.0.0"
+    let mask = _nm_mask_from_prefix(prefix)
+    _nm_fmt(mask)
+
+// nm_mask_to_prefix: convert dotted-quad netmask to prefix length, or -1.
+//
+// Valid contiguous masks only (all 1s then all 0s in binary).
+// "255.255.255.0"   -> 24
+// "255.255.255.128" -> 25
+// "255.255.0.0"     -> 16
+// "0.0.0.0"         -> 0
+// "255.255.255.255" -> 32
+// "255.0.255.0"     -> -1  (non-contiguous)
+// "255.255.255.1"   -> -1  (non-contiguous)
+fn nm_mask_to_prefix(mask: string) -> int
+    let n = _nm_parse_dotted(mask)
+    if n < 0
+        return -1
+    // Count leading 1-bits to get the candidate prefix length.
+    let prefix = _nm_count_prefix(n)
+    // Validate: recompute the expected mask for this prefix and compare.
+    let expected = _nm_mask_from_prefix(prefix)
+    if expected != n
+        return -1
+    prefix
+
+// nm_wildcard: return the wildcard (inverse) mask for a CIDR prefix as a string.
+//
+// The wildcard mask is the bitwise complement of the netmask, kept to 32 bits.
+// Wildcard = 0xFFFFFFFF - netmask = 2^(32-prefix) - 1  (for prefix > 0).
+// For prefix=0: wildcard = 0xFFFFFFFF (all bits wildcarded).
+// For prefix=32: wildcard = 0 (exact host, no wildcard).
+//
+// nm_wildcard(0)  -> "255.255.255.255"
+// nm_wildcard(8)  -> "0.255.255.255"
+// nm_wildcard(24) -> "0.0.0.255"
+// nm_wildcard(32) -> "0.0.0.0"
+fn nm_wildcard(prefix: int) -> string
+    if prefix < 0 or prefix > 32
+        return "255.255.255.255"
+    let mask = _nm_mask_from_prefix(prefix)
+    // wildcard = bitwise NOT of mask, 32-bit: 0xFFFFFFFF XOR mask = 0xFFFFFFFF - mask
+    let wild = (0xFFFFFFFF - mask) & 0xFFFFFFFF
+    _nm_fmt(wild)
+
+// nm_is_valid_mask: true iff s is a well-formed dotted-quad contiguous netmask.
+//
+// "255.255.0.0"   -> true
+// "255.0.255.0"   -> false  (non-contiguous)
+// "255.255.255.1" -> false  (non-contiguous: isolated low bit)
+// "0.0.0.0"       -> true   (prefix 0)
+// "255.255.255.255" -> true (prefix 32)
+fn nm_is_valid_mask(s: string) -> bool
+    nm_mask_to_prefix(s) >= 0
