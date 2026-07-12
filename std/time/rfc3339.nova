@@ -1,0 +1,245 @@
+// ============================================================================
+// NOVA Standard Library — std/time/rfc3339
+// RFC 3339 timestamp parse / format / epoch conversion.
+// Proleptic Gregorian calendar, UTC-normalised output.
+// All private helpers carry the _rf_ prefix to avoid collisions.
+// ============================================================================
+//
+// PUBLIC API:
+//   rf_parse(s)         -> dict  {year,month,day,hour,minute,second,tzoff}
+//                          tzoff = minutes east of UTC ("Z"->0, "+05:30"->330,
+//                          "-08:00"->-480).  Returns null on malformed input.
+//   rf_format(d)        -> string  "YYYY-MM-DDTHH:MM:SSZ"  (UTC-normalised)
+//   rf_to_epoch(d)      -> int    Unix seconds UTC
+//   rf_from_epoch(secs) -> dict   {year,month,day,hour,minute,second,tzoff=0}
+//
+// ALGORITHM: Howard Hinnant civil_from_days / days_from_civil, integer only.
+
+// ── Floor-division helpers ────────────────────────────────────────────────────
+// NOVA integer division truncates toward zero; for negative dividends we need
+// proper floor division.
+
+fn _rf_fdiv(a, b) -> int
+    let q = a / b
+    if (a < 0) != (b < 0)
+        if a - q * b != 0
+            return q - 1
+    q
+
+fn _rf_fmod(a, b) -> int
+    a - b * _rf_fdiv(a, b)
+
+// ── Calendar helpers (Howard Hinnant) ─────────────────────────────────────────
+
+// _rf_civil_from_days: days since 1970-01-01 -> [year, month, day]
+fn _rf_civil_from_days(z0) -> list
+    let z = z0 + 719468
+    let era = _rf_fdiv(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = mp + 3
+    if mp >= 10
+        m = mp - 9
+    if m <= 2
+        y = y + 1
+    [y, m, d]
+
+// _rf_days_from_civil: calendar date -> days since 1970-01-01
+fn _rf_days_from_civil(y0, m, d) -> int
+    let y = y0
+    if m <= 2
+        y = y - 1
+    let era = _rf_fdiv(y, 400)
+    let yoe = y - era * 400
+    let mp = m - 3
+    if m <= 2
+        mp = m + 9
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+
+// ── String helpers ────────────────────────────────────────────────────────────
+
+fn _rf_pad2(n) -> string
+    if n < 10
+        return "0" + str(n)
+    str(n)
+
+fn _rf_pad4(n) -> string
+    if n < 10
+        return "000" + str(n)
+    if n < 100
+        return "00" + str(n)
+    if n < 1000
+        return "0" + str(n)
+    str(n)
+
+// Parse exactly `width` decimal ASCII digits from s starting at pos.
+// Returns [value, new_pos].  new_pos == pos+width on success.
+fn _rf_parse_digits(s, pos, width) -> list
+    let val = 0
+    let i = pos
+    let end = pos + width
+    let slen = len(s)
+    if end > slen
+        return [0, pos]
+    while i < end
+        let c = ord(s[i:i + 1])
+        if c >= 48 and c <= 57
+            val = val * 10 + (c - 48)
+        else
+            return [val, i]
+        i = i + 1
+    [val, i]
+
+// ── PUBLIC API ────────────────────────────────────────────────────────────────
+
+// rf_parse: parse an RFC 3339 timestamp string.
+// Accepts:  YYYY-MM-DDTHH:MM:SSZ
+//           YYYY-MM-DDTHH:MM:SS+HH:MM
+//           YYYY-MM-DDTHH:MM:SS-HH:MM
+// Returns dict {year,month,day,hour,minute,second,tzoff} or null on error.
+fn rf_parse(s) -> dict
+    let slen = len(s)
+    // Minimum length: "YYYY-MM-DDTHH:MM:SSZ" = 20 chars
+    if slen < 20
+        return null
+    // YYYY
+    let yr_r = _rf_parse_digits(s, 0, 4)
+    let y = yr_r[0]
+    if yr_r[1] != 4
+        return null
+    if s[4:5] != "-"
+        return null
+    // MM
+    let mo_r = _rf_parse_digits(s, 5, 2)
+    let mo = mo_r[0]
+    if mo_r[1] != 7
+        return null
+    if s[7:8] != "-"
+        return null
+    // DD
+    let dy_r = _rf_parse_digits(s, 8, 2)
+    let dy = dy_r[0]
+    if dy_r[1] != 10
+        return null
+    // T separator (RFC 3339 mandates 'T'; allow 't' for robustness)
+    let sep = s[10:11]
+    if sep != "T" and sep != "t"
+        return null
+    // HH
+    let hr_r = _rf_parse_digits(s, 11, 2)
+    let h = hr_r[0]
+    if hr_r[1] != 13
+        return null
+    if s[13:14] != ":"
+        return null
+    // MM
+    let mi_r = _rf_parse_digits(s, 14, 2)
+    let mi = mi_r[0]
+    if mi_r[1] != 16
+        return null
+    if s[16:17] != ":"
+        return null
+    // SS
+    let sc_r = _rf_parse_digits(s, 17, 2)
+    let sc = sc_r[0]
+    if sc_r[1] != 19
+        return null
+    // Timezone offset
+    let tzoff = 0
+    let tz_ok = 1
+    let tz_char = s[19:20]
+    if tz_char == "Z" or tz_char == "z"
+        tzoff = 0
+    else
+        if tz_char == "+" or tz_char == "-"
+            if slen < 25
+                tz_ok = 0
+            if tz_ok == 1
+                let tzh_r = _rf_parse_digits(s, 20, 2)
+                let tzh = tzh_r[0]
+                if tzh_r[1] != 22
+                    tz_ok = 0
+                if tz_ok == 1
+                    if s[22:23] != ":"
+                        tz_ok = 0
+                if tz_ok == 1
+                    let tzm_r = _rf_parse_digits(s, 23, 2)
+                    let tzm = tzm_r[0]
+                    if tzm_r[1] != 25
+                        tz_ok = 0
+                    if tz_ok == 1
+                        tzoff = tzh * 60 + tzm
+                        if tz_char == "-"
+                            tzoff = 0 - tzoff
+        else
+            tz_ok = 0
+    if tz_ok == 0
+        return null
+    // Basic range validation
+    if mo < 1 or mo > 12
+        return null
+    if dy < 1 or dy > 31
+        return null
+    if h > 23
+        return null
+    if mi > 59
+        return null
+    if sc > 60
+        return null
+    let r = {}
+    r["year"] = y
+    r["month"] = mo
+    r["day"] = dy
+    r["hour"] = h
+    r["minute"] = mi
+    r["second"] = sc
+    r["tzoff"] = tzoff
+    r
+
+// rf_to_epoch: dict -> Unix seconds UTC.
+// tzoff is minutes east of UTC; we subtract it to convert to UTC.
+fn rf_to_epoch(d) -> int
+    let y = d["year"]
+    let mo = d["month"]
+    let dy = d["day"]
+    let h = d["hour"]
+    let mi = d["minute"]
+    let sc = d["second"]
+    let tzoff = d["tzoff"]
+    let days = _rf_days_from_civil(y, mo, dy)
+    let wall = days * 86400 + h * 3600 + mi * 60 + sc
+    wall - tzoff * 60
+
+// rf_from_epoch: Unix seconds UTC -> dict (tzoff always 0).
+fn rf_from_epoch(secs) -> dict
+    let days = _rf_fdiv(secs, 86400)
+    let rem = _rf_fmod(secs, 86400)
+    let ymd = _rf_civil_from_days(days)
+    let r = {}
+    r["year"] = ymd[0]
+    r["month"] = ymd[1]
+    r["day"] = ymd[2]
+    r["hour"] = rem / 3600
+    r["minute"] = (rem % 3600) / 60
+    r["second"] = rem % 60
+    r["tzoff"] = 0
+    r
+
+// rf_format: dict -> "YYYY-MM-DDTHH:MM:SSZ" (UTC-normalised).
+// If tzoff != 0 the local time is first converted to UTC.
+fn rf_format(d) -> string
+    let epoch = rf_to_epoch(d)
+    let u = rf_from_epoch(epoch)
+    let yr = u["year"]
+    let mo = u["month"]
+    let dy = u["day"]
+    let h = u["hour"]
+    let mi = u["minute"]
+    let sc = u["second"]
+    _rf_pad4(yr) + "-" + _rf_pad2(mo) + "-" + _rf_pad2(dy) + "T" + _rf_pad2(h) + ":" + _rf_pad2(mi) + ":" + _rf_pad2(sc) + "Z"
