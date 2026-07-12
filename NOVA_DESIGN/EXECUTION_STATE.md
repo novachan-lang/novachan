@@ -13,15 +13,26 @@
 - **Stream 2 — Sonnet fleet (stdlib breadth)** — pure-NOVA modules in `std/`. Parallel, KAT-gated, one
   commit/module, NO reconverge. Independent libs start now; feature-dependent libs wait for Stream 1.
 
+## ⏱ EXECUTION RHYTHM (OWNER RULE — do NOT violate)
+- **Complete ~30 plan tasks IN ORDER, THEN one full arc.** NOT an arc every few commits (that was the mistake).
+- Between tasks: FAST check only — gen4-probe / KAT / standalone-run. **Pure-NOVA stdlib (Stream 2) needs NO reconverge.**
+- The full arc (per ~30 tasks) = reconverge gen5==gen6 IF the compiler/runtime was touched + full nova_ci BOTH modes.
+- Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
+- Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
+
 ## Current focus
-- Stream 1: **CORE_GAP 0.11 float-return-uninit** (Phase-0 Wave A #1 — the last silent-wrong-answer bug).
-- Stream 2: standing up `std/` + first wave of foundation-independent stdlib modules.
+- **Stream 2 (ACTIVE — 30-task batch): JDK-scale `std/` breadth.** Goal ~200k+ lines; std/ barely started.
+  Marching genuine KAT-gated non-native-shadow modules; ONE full-CI arc per ~30 modules.
+- Stream 1 (parallel, sequential): **CORE_GAP 0.11 = ✅ DONE** (`bfc55fba`+`29e380c1`, re-verified). Next = **Wave B #6
+  MOVE-on-insert** (leak confirmed 2001, gated `_move6_insert_leak_test`; XL/UAF-prone — borrow-builtins must stay rc-inc).
 
 ## Stream 1 — compiler/runtime (Opus) — status
 | Item | Phase | Tier | Status | Commit |
 |---|---|---|---|---|
 | 0.8 struct-field-leak | 0-A | A | ✅ DONE | fb1167cf |
-| 0.11 float-return-uninit | 0-A | A | ✅ GUARDED | (batch 1) |
+| 0.11 float-return-uninit | 0-A | A | ✅ DONE + RE-VERIFIED (stddev=1.4142; `bfc55fba`+`29e380c1`) | 29e380c1 |
+| abs(float) mistypes return -> i64/pointer | 0-A | A | ⬜ NEW (found via std/math/geometry2d; workaround: `if x<0.0 then 0.0-x else x`) | |
+| is_dict/is_list are compile-time preds (return 0 on any-typed) | 0-A | C | ⬜ NEW (found via std/data/jsonpointer; workaround: `type_of(x)=="dict"`) | |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | user-enum payload typing | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
 | **enum float-payload unbox** (codegen) | 0-A | A | ✅ FIXED + CERTIFIED (gen5==gen6, 1155/0 both modes) | (task 5) |
@@ -29,7 +40,7 @@
 | `1<<64` shift guard | 0-A | C | ✅ DONE (gen4-verified; reconverge at batch arc) | (batch 1) |
 | lexer: numeric separators | 0-A | C | ✅ ALREADY DONE (decimal/hex/binary all strip `_`; audit stale) | |
 | lexer: `\u{}` escapes / labeled break | 0-A | C | ⏸ DEFERRED (low-value: `from_codepoint` covers `\u`; labeled-break is involved, not a quick win) | |
-| RC: push/closure/reassign leaks (MOVE-on-insert) | 0-B | A | ⬜ | |
+| RC: push/closure/reassign leaks (MOVE-on-insert) | 0-B | A | ⬜ Wave-B #6 NEXT (leak CONFIRMED 2001; gated `_move6_insert_leak_test` 83650843; design=MOVE owned-temps only, borrow-builtins stay rc-inc=the 0.10 UAF) | |
 | RC cycle collector | 0-B | A(XL) | ⬜ | |
 | ARM aarch64 fibers | 0-C | B | ⬜ | |
 | N>1 per-carrier I/O | 0-C | B | ⬜ | |
@@ -60,6 +71,11 @@
 | forge_signum (D4 signed bignum) | numeric | — | ✅ DONE (fixed INT_MIN) | d708af6f |
 | forge_blake2b (RFC 7693 hash) | crypto | — | ✅ DONE (fixed validation) | d708af6f |
 | forge_hamt (D7 persistent map) | collections | — | ✅ DONE (fixed real-trie) | d708af6f |
+| **JDK-SCALE BREADTH BATCH — 30 modules** | (all) | — | ✅ DONE (30-task arc; each KAT-gated + re-verified) | b80b7e24·3dc1086d·b4641598·2f5fba65 |
+|   ↳ collections | unionfind·ordereddict·bloomfilter·sortedlist·bimap | — | ✅ | |
+|   ↳ text | distance·format·tablefmt·shlex·roman·ordinal·pluralize | — | ✅ | |
+|   ↳ math | numtheory·geometry2d·combinatorics·bits | — | ✅ | |
+|   ↳ other | itertools·functional/func·hash/noncrypto·cli/args·random/dist·net/{querystring,mac}·time/stopwatch·util/{retry,nanoid,humansize}·encoding/{inifmt,properties}·data/jsonpointer | — | ✅ | |
 | forge_decimal (D2 BigDecimal) | numeric | signum | ⬜ Wave-2 | |
 | forge_argon2id (KDF) | crypto | blake2b | ⬜ Wave-2 | |
 | forge_unicode (D6 casefold/graphemes) | text | — | ⬜ Wave-2 | |
