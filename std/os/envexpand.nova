@@ -1,0 +1,243 @@
+// std/os/envexpand — environment-variable reference expansion in strings.
+//
+// WHAT: Expand $NAME and ${NAME} references in a template string using a supplied dict.
+//   ev_expand(s, env) -> string
+//       Replace every $NAME and ${NAME} occurrence.  Missing key -> empty string.
+//   ev_expand_default(s, env) -> string
+//       Like ev_expand, but the braced form also supports ${NAME:-default} fallback syntax.
+//       If NAME is absent (or empty) in env, the text after :- is used verbatim.
+//   ev_vars(s) -> list<string>
+//       Return the list of variable names referenced in s, in first-occurrence order, deduped.
+//
+// SYNTAX RULES (both functions):
+//   $NAME          — dollar + bare identifier  [A-Za-z_][A-Za-z0-9_]*
+//   ${NAME}        — dollar + brace-delimited identifier
+//   ${NAME:-text}  — only ev_expand_default; text is the fallback value when NAME is missing
+//   Any other character after $ (e.g. a digit, whitespace) is passed through literally.
+//   Guard: every dict read is protected with contains().
+//
+// All private helpers are prefixed _ev_ to avoid cross-module link collisions.
+
+// True iff c is a valid identifier-start character: [A-Za-z_]
+fn _ev_is_id_start(c: string) -> int
+    let o = ord(c)
+    if o >= 65
+        if o <= 90
+            return 1
+    if o >= 97
+        if o <= 122
+            return 1
+    if o == 95
+        return 1
+    return 0
+
+// True iff c is a valid identifier-continuation character: [A-Za-z0-9_]
+fn _ev_is_id_cont(c: string) -> int
+    let o = ord(c)
+    if o >= 65
+        if o <= 90
+            return 1
+    if o >= 97
+        if o <= 122
+            return 1
+    if o >= 48
+        if o <= 57
+            return 1
+    if o == 95
+        return 1
+    return 0
+
+// Read a bare NAME starting at position i in s (caller already checked i is a valid id-start).
+// Returns the end index (first char that is NOT part of the name).
+fn _ev_read_name_end(s: string, i: int) -> int
+    let n = len(s)
+    let pos = i
+    let going = 1
+    while going == 1
+        if pos >= n
+            going = 0
+        else
+            let c = char_at(s, pos)
+            if _ev_is_id_cont(c) == 1
+                pos = pos + 1
+            else
+                going = 0
+    return pos
+
+// Collect the bare NAME from i to end_pos (exclusive).
+fn _ev_slice_name(s: string, i: int, end_pos: int) -> string
+    let name = ""
+    let pos = i
+    while pos < end_pos
+        name = name + char_at(s, pos)
+        pos = pos + 1
+    return name
+
+// Parse a braced variable reference starting just after the opening '{' at position i.
+// Handles both plain ${NAME} and the ${NAME:-default} fallback form (for ev_expand_default).
+// Returns a four-element list: [name, fallback_or_empty, end_index, has_default_int].
+// end_index points to the character AFTER the closing '}'.
+// If '}' is never found, gracefully returns end_index == len(s).
+fn _ev_parse_brace(s: string, i: int, allow_default: int) -> any
+    let n = len(s)
+    let name = ""
+    let fallback = ""
+    let has_def = 0
+    let pos = i
+    // Phase 1: collect NAME chars until '}', ':-' (when allow_default), or end-of-string.
+    let in_name = 1
+    while in_name == 1
+        if pos >= n
+            in_name = 0
+        else
+            let c = char_at(s, pos)
+            if c == chr(125)
+                // Closing brace: done, no default.
+                pos = pos + 1
+                in_name = 0
+            else
+                if allow_default == 1
+                    if c == ":"
+                        if pos + 1 < n
+                            if char_at(s, pos + 1) == "-"
+                                has_def = 1
+                                pos = pos + 2
+                                in_name = 0
+                            else
+                                name = name + c
+                                pos = pos + 1
+                        else
+                            name = name + c
+                            pos = pos + 1
+                    else
+                        name = name + c
+                        pos = pos + 1
+                else
+                    name = name + c
+                    pos = pos + 1
+    // Phase 2 (only when has_def==1): collect fallback until '}' or end-of-string.
+    if has_def == 1
+        let in_fb = 1
+        while in_fb == 1
+            if pos >= n
+                in_fb = 0
+            else
+                let fb_c = char_at(s, pos)
+                if fb_c == chr(125)
+                    pos = pos + 1
+                    in_fb = 0
+                else
+                    fallback = fallback + fb_c
+                    pos = pos + 1
+    let result = []
+    push(result, name)
+    push(result, fallback)
+    push(result, pos)
+    push(result, has_def)
+    return result
+
+// Core expansion engine shared by both public functions.
+// allow_default controls whether ${NAME:-text} fallback syntax is active.
+fn _ev_expand_core(s: string, envdict: any, allow_default: int) -> string
+    let n = len(s)
+    let out = ""
+    let i = 0
+    let dollar = chr(36)
+    let open_brace = chr(123)
+    while i < n
+        let c = char_at(s, i)
+        if c == dollar
+            let ni = i + 1
+            if ni < n
+                let nc = char_at(s, ni)
+                if nc == open_brace
+                    // Braced form: ${NAME} or ${NAME:-default}
+                    let parsed = _ev_parse_brace(s, ni + 1, allow_default)
+                    let vname = parsed[0]
+                    let vfallback = parsed[1]
+                    let vend = parsed[2]
+                    let vhasdef = parsed[3]
+                    let resolved = ""
+                    if contains(envdict, vname)
+                        resolved = str(envdict[vname])
+                    else
+                        if vhasdef == 1
+                            resolved = vfallback
+                    out = out + resolved
+                    i = vend
+                else
+                    if _ev_is_id_start(nc) == 1
+                        // Bare form: $NAME — find the end of the name first, then slice it.
+                        let vend2 = _ev_read_name_end(s, ni)
+                        let vname2 = _ev_slice_name(s, ni, vend2)
+                        let resolved2 = ""
+                        if contains(envdict, vname2)
+                            resolved2 = str(envdict[vname2])
+                        out = out + resolved2
+                        i = vend2
+                    else
+                        // '$' followed by a non-identifier char: pass through literally.
+                        out = out + c
+                        i = i + 1
+            else
+                // '$' at end of string: pass through literally.
+                out = out + c
+                i = i + 1
+        else
+            out = out + c
+            i = i + 1
+    return out
+
+// ev_expand(s, envdict) -> string
+// Expand $NAME and ${NAME} references.  Missing keys become empty string.
+fn ev_expand(s: string, envdict: any) -> string
+    return _ev_expand_core(s, envdict, 0)
+
+// ev_expand_default(s, envdict) -> string
+// Like ev_expand but also handles ${NAME:-fallback} in the braced form.
+// If NAME is absent in envdict the fallback text is substituted instead of empty string.
+fn ev_expand_default(s: string, envdict: any) -> string
+    return _ev_expand_core(s, envdict, 1)
+
+// ev_vars(s) -> list<string>
+// Return all variable names referenced in s (both $NAME and ${NAME} forms),
+// in first-occurrence order, deduped.  Fallback text in ${NAME:-default} is NOT treated
+// as a variable name.
+fn ev_vars(s: string) -> any
+    let n = len(s)
+    let seen = {}
+    let order = []
+    let i = 0
+    let dollar = chr(36)
+    let open_brace = chr(123)
+    while i < n
+        let c = char_at(s, i)
+        if c == dollar
+            let ni = i + 1
+            if ni < n
+                let nc = char_at(s, ni)
+                if nc == open_brace
+                    let parsed = _ev_parse_brace(s, ni + 1, 0)
+                    let vname = parsed[0]
+                    let vend = parsed[2]
+                    if len(vname) > 0
+                        if contains(seen, vname) == 0
+                            seen[vname] = 1
+                            push(order, vname)
+                    i = vend
+                else
+                    if _ev_is_id_start(nc) == 1
+                        let vend2 = _ev_read_name_end(s, ni)
+                        let vname2 = _ev_slice_name(s, ni, vend2)
+                        if len(vname2) > 0
+                            if contains(seen, vname2) == 0
+                                seen[vname2] = 1
+                                push(order, vname2)
+                        i = vend2
+                    else
+                        i = i + 1
+            else
+                i = i + 1
+        else
+            i = i + 1
+    return order

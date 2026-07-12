@@ -1,0 +1,164 @@
+// std/random/dice -- Dice-notation roller with deterministic seeded LCG.
+//
+// Parses standard dice notation like "3d6+2", "2d10-1", "d20".
+// All public functions accept notation as a string; dc_roll also takes a seed.
+// Same seed always produces the same result (deterministic/reproducible).
+//
+// Embedded 64-bit LCG (Knuth multiplicative congruential):
+//   state = (state * 6364136223846793005 + 1442695040888963407)
+//   mask to 63 bits (clear sign bit) to keep non-negative in NOVA i64.
+//
+// Public API:
+//   dc_parse(notation)          -> dict  {count, sides, modifier}
+//   dc_min(notation)            -> int   minimum possible roll (all dice show 1)
+//   dc_max(notation)            -> int   maximum possible roll (all dice show sides)
+//   dc_average(notation)        -> float expected value: count*(sides+1)/2.0 + modifier
+//   dc_roll(notation, seed)     -> int   deterministic roll, sum + modifier
+//
+// Notation rules:
+//   [N]dS[+M|-M]
+//   N = number of dice (default 1 if omitted before 'd')
+//   S = number of sides (required)
+//   M = integer modifier, may be negative (default 0)
+//
+// NOVA GOTCHAS obeyed:
+//   * >> arithmetic — mask with & for unsigned semantics
+//   * No multi-line list/dict literals
+//   * No '&&'/'||' — use 'and'/'or'
+//   * '/' on ints is integer division
+//   * Bare complex float return -> bind to let first
+//   * Unused local = compile error
+
+// ── Private: LCG constants and step ─────────────────────────────────────────
+
+let _dc_MULT = 6364136223846793005
+let _dc_INC  = 1442695040888963407
+let _dc_MASK = 9223372036854775807   // 0x7FFFFFFFFFFFFFFF
+
+// _dc_step: advance one LCG step, return non-negative 63-bit int.
+fn _dc_step(state: int) -> int
+    let s = state * _dc_MULT + _dc_INC
+    s & _dc_MASK
+
+// ── Private: string parsing helpers ─────────────────────────────────────────
+
+// _dc_is_digit: return 1 if character c (as int ord) is '0'-'9'.
+fn _dc_is_digit(c: int) -> int
+    if c >= 48
+        if c <= 57
+            return 1
+    0
+
+// _dc_parse_int_at: parse a decimal integer starting at position i in s.
+// Returns a list [value, end_pos].  Reads digits until non-digit or end.
+// If no digits found at i, returns [0, i].
+// We use separate tracking vars because NOVA has no break.
+fn _dc_parse_int_at(s: string, start: int) -> list
+    let n = len(s)
+    let val = 0
+    let end_pos = start
+    let pos = start
+    while pos < n
+        let c = ord(char_at(s, pos))
+        if _dc_is_digit(c) == 1
+            val = val * 10 + (c - 48)
+            end_pos = pos + 1
+            pos = pos + 1
+        else
+            pos = n
+    if end_pos == start
+        return [0, start]
+    [val, end_pos]
+
+// ── dc_parse ─────────────────────────────────────────────────────────────────
+// Parse dice notation string into a dict with keys "count","sides","modifier".
+// Supports: [N]dS[+M|-M]
+// "d6"    -> count=1, sides=6,  modifier=0
+// "2d8"   -> count=2, sides=8,  modifier=0
+// "3d6+2" -> count=3, sides=6,  modifier=2
+// "2d10-1"-> count=2, sides=10, modifier=-1
+fn dc_parse(notation: string) -> dict
+    let result = {}
+    result["count"] = 1
+    result["sides"] = 6
+    result["modifier"] = 0
+    let n = len(notation)
+    let i = 0
+    // Try to parse leading count (digits before 'd')
+    // Find the 'd' position first to know if there's a leading count
+    let d_pos = -1
+    let scan = 0
+    while scan < n
+        let ch = char_at(notation, scan)
+        if ch == "d"
+            if d_pos < 0
+                d_pos = scan
+        scan = scan + 1
+    if d_pos < 0
+        return result   // invalid notation, return defaults
+    // If 'd' is not at position 0, parse the leading number
+    if d_pos > 0
+        let cnt_res = _dc_parse_int_at(notation, 0)
+        result["count"] = cnt_res[0]
+    // Parse sides after 'd'
+    let sides_res = _dc_parse_int_at(notation, d_pos + 1)
+    result["sides"] = sides_res[0]
+    // Parse optional modifier
+    let after_sides = sides_res[1]
+    if after_sides < n
+        let mod_char = char_at(notation, after_sides)
+        let mod_pos = after_sides + 1
+        if mod_char == "+"
+            let mod_res = _dc_parse_int_at(notation, mod_pos)
+            result["modifier"] = mod_res[0]
+        if mod_char == "-"
+            let mod_res2 = _dc_parse_int_at(notation, mod_pos)
+            result["modifier"] = 0 - mod_res2[0]
+    result
+
+// ── dc_min ───────────────────────────────────────────────────────────────────
+// Minimum possible result: each die shows 1, plus modifier.
+fn dc_min(notation: string) -> int
+    let p = dc_parse(notation)
+    let cnt = p["count"]
+    let mod = p["modifier"]
+    cnt + mod
+
+// ── dc_max ───────────────────────────────────────────────────────────────────
+// Maximum possible result: each die shows sides, plus modifier.
+fn dc_max(notation: string) -> int
+    let p = dc_parse(notation)
+    let cnt = p["count"]
+    let sides = p["sides"]
+    let mod = p["modifier"]
+    cnt * sides + mod
+
+// ── dc_average ───────────────────────────────────────────────────────────────
+// Expected value: count * (sides + 1) / 2.0 + modifier
+fn dc_average(notation: string) -> float
+    let p = dc_parse(notation)
+    let cnt = p["count"]
+    let sides = p["sides"]
+    let mod = p["modifier"]
+    let avg_per_die = (sides + 1) * 1.0 / 2.0
+    let result = cnt * 1.0 * avg_per_die + mod * 1.0
+    result
+
+// ── dc_roll ──────────────────────────────────────────────────────────────────
+// Roll all dice deterministically using the embedded LCG seeded with `seed`.
+// Each die advances the LCG once; result = sum of all dice + modifier.
+// Same notation + same seed always produces the same integer result.
+fn dc_roll(notation: string, seed: int) -> int
+    let p = dc_parse(notation)
+    let cnt = p["count"]
+    let sides = p["sides"]
+    let mod = p["modifier"]
+    let total = 0
+    let st = seed
+    let i = 0
+    while i < cnt
+        st = _dc_step(st)
+        let face = (st % sides) + 1
+        total = total + face
+        i = i + 1
+    total + mod
