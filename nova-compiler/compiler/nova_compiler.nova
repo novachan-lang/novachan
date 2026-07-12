@@ -4023,7 +4023,81 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    expand_derives(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts))))))
+    inline_module_consts(expand_derives(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts)))))))
+
+// Module-level `let X = <scalar literal>` constant propagation. Module lets are NOT true
+// shared globals in either backend (each fn that references one gets its own zero-init'd copy,
+// so only nova_main's own scope ever sees the initializer). Fixing that at the storage-model
+// level is XL and backend-specific; instead we inline scalar module CONSTANTS (int/float/str/bool)
+// into the functions that read them (proper constant propagation) — backend-agnostic, so both
+// backends stay byte-identical. A function that LOCALLY binds the name (param/let/assign/loop/
+// pattern) is skipped for that name (the local shadows the const). Non-literal / mutable module
+// lets are unchanged (rare; init them inside a fn).
+fn _is_scalar_literal(e: Expr) -> int
+    match e
+        Expr(t, v, n, ch, f, ln) =>
+            if t == "int" or t == "float" or t == "str" or t == "bool"
+                return 1
+            return 0
+    return 0
+
+fn _subst_stmt_ident(s: Stmt, old_name: string, new_e: Expr) -> Stmt
+    match s
+        Stmt(tag, name, expr, body, params, eb, ann, sl) =>
+            let nexpr = _comp_subst(expr, old_name, new_e)
+            let nbody = []
+            for st in body
+                push(nbody, _subst_stmt_ident(st, old_name, new_e))
+            let neb = []
+            for st in eb
+                push(neb, _subst_stmt_ident(st, old_name, new_e))
+            let nann = []
+            for a in ann
+                push(nann, _comp_subst(a, old_name, new_e))
+            return Stmt(tag, name, nexpr, nbody, params, neb, nann, sl)
+    return s
+
+fn inline_module_consts(stmts: list) -> list
+    let cmap = {}
+    let cnames = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, eb, ann, sl) =>
+                if tag == "assign" and name != "" and len(ann) == 0
+                    if _is_scalar_literal(expr) == 1
+                        if not contains(cmap, name)
+                            cmap[name] = expr
+                            push(cnames, name)
+    if len(cnames) == 0
+        return stmts
+    let out = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, eb, ann, sl) =>
+                if tag == "fn"
+                    let locals = collect_locals(body)
+                    let pnames = []
+                    for p in params
+                        match p
+                            Param(pn, pt, pd) =>
+                                push(pnames, pn)
+                    let newbody = body
+                    let changed = 0
+                    for cn in cnames
+                        if not list_contains(locals, cn)
+                            if not list_contains(pnames, cn)
+                                let nb = []
+                                for st in newbody
+                                    push(nb, _subst_stmt_ident(st, cn, cmap[cn]))
+                                newbody = nb
+                                changed = 1
+                    if changed == 1
+                        push(out, Stmt(tag, name, expr, newbody, params, eb, ann, sl))
+                    else
+                        push(out, s)
+                else
+                    push(out, s)
+    return out
 
 // ── LLVM IR Code Generator ───────────────────────────────────────────────────
 
