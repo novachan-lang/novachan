@@ -1,0 +1,146 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/percent
+// ============================================================================
+// RFC 3986 URL percent-encoding. Binary-safe: the raw-data side is `bytes`
+// so 0x00 bytes survive encode and decode without truncation.
+//
+// THE BINARY-SAFETY PROPERTY:
+//   NOVA strings are C-string-shaped: a 0x00 byte in a string silently
+//   truncates it (reference_nova_string_nul_truncation). Percent-encoding is
+//   used for binary payloads (query values, path segments, auth tokens) which
+//   CAN contain 0x00. This module takes and returns `bytes` on the data side.
+//   The encoded TEXT side is a plain string (only [A-Za-z0-9\-._~%] appear —
+//   none of which is 0x00, so the text side is always NUL-safe).
+//
+// THE DRAWBACK AVOIDED — form-encoding confusion:
+//   application/x-www-form-urlencoded maps SPACE <-> '+' in addition to %20.
+//   RFC 3986 percent-encoding does NOT do this. This module is STRICT RFC 3986:
+//   '+' encodes as "%2B" and decodes as its literal byte value 0x2B (43).
+//   If you need form-encoding, use a form-encoding module; do NOT use this one.
+//
+// PUBLIC API:
+//   percent_encode(data: bytes) -> string
+//     RFC 3986 unreserved characters (A-Za-z0-9 - . _ ~) pass through as-is.
+//     Every other byte encodes as "%XX" with UPPERCASE hex digits.
+//     A zero byte (0x00) encodes as "%00" and round-trips correctly.
+//
+//   percent_decode(s: string) -> bytes
+//     "%XX" sequences (uppercase or lowercase hex) decode to the byte value.
+//     A literal '+' decodes as its byte value 0x2B — NOT a space.
+//     A lone or malformed '%' passes through as its byte value 0x25.
+//     The result is always a valid `bytes` value; never errors hard.
+//
+// ROUND-TRIP GUARANTEE:
+//   percent_decode(percent_encode(x)) == x  for any bytes value x.
+//   This holds even when x contains 0x00, 0xFF, or any binary value.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _pct_ to avoid collisions with other
+//   std modules compiled into the same binary.
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   We use (b >> 4) & 0x0F and b & 0x0F to extract nibbles. The mask after
+//   the shift is mandatory to guard against sign-extension on any negative value
+//   (bytes_get returns an int; & 0xFF first, then nibble-split).
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Uppercase hex alphabet for encoding.
+fn _pct_alpha() -> string
+    "0123456789ABCDEF"
+
+// Map one ASCII character byte-value to its hex nibble (0..15).
+// Returns -1 if the character is not a valid hex digit.
+fn _pct_hexval(b) -> int
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 65 and b <= 70
+        return b - 55
+    if b >= 97 and b <= 102
+        return b - 87
+    return -1
+
+// Return 1 if byte value b is an RFC 3986 unreserved character, 0 otherwise.
+// Unreserved set: A-Z (65-90), a-z (97-122), 0-9 (48-57), '-'(45), '.'(46),
+// '_'(95), '~'(126).
+fn _pct_unreserved(b) -> int
+    if b >= 65 and b <= 90
+        return 1
+    if b >= 97 and b <= 122
+        return 1
+    if b >= 48 and b <= 57
+        return 1
+    if b == 45 or b == 46 or b == 95 or b == 126
+        return 1
+    return 0
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// percent_encode: convert binary bytes to an RFC 3986 percent-encoded string.
+//
+// Each byte in `data` that belongs to the RFC 3986 unreserved set
+// (A-Za-z0-9 - . _ ~) is passed through as the corresponding ASCII character.
+// Every other byte, including 0x00, is encoded as "%XX" where XX is two
+// uppercase hex digits.
+//
+// Examples:
+//   percent_encode(bytes of "hello")   == "hello"          (all unreserved)
+//   percent_encode(bytes of "a b")     == "a%20b"          (space = 0x20)
+//   percent_encode(bytes of "a/b?c=d") == "a%2Fb%3Fc%3Dd"  (reserved encoded)
+//   percent_encode(bytes of "~-._")    == "~-._"           (all unreserved)
+//   percent_encode(bytes of [0x00,0xFF]) == "%00%FF"
+fn percent_encode(data) -> string
+    let alpha = _pct_alpha()
+    let out = ""
+    let nb = bytes_len(data)
+    let i = 0
+    while i < nb
+        let b = bytes_get(data, i) & 0xFF
+        if _pct_unreserved(b) == 1
+            out = out + chr(b)
+        else
+            let hi = (b >> 4) & 0x0F
+            let lo = b & 0x0F
+            out = out + "%" + alpha[hi] + alpha[lo]
+        i = i + 1
+    return out
+
+// percent_decode: convert an RFC 3986 percent-encoded string back to bytes.
+//
+// "%XX" sequences (case-insensitive hex digits) decode to the corresponding
+// byte value. A literal '+' is NOT treated as a space — it decodes as byte
+// 0x2B (this is RFC 3986, not form-encoding). A lone '%' or a '%' followed
+// by fewer than two hex digits passes through as byte 0x25. A '%' followed
+// by non-hex characters passes through as byte 0x25 and the non-hex
+// characters are processed normally.
+//
+// Returns a `bytes` value. Never throws; always returns a valid result.
+//
+// Examples:
+//   percent_decode("a%20b")  -> bytes [0x61, 0x20, 0x62]   (= "a b")
+//   percent_decode("%00%ff") -> bytes [0x00, 0xFF]          (case-insensitive)
+//   percent_decode("hello")  -> bytes [0x68,0x65,0x6C,0x6C,0x6F]
+fn percent_decode(s) -> any
+    let out = bytes(0)
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(s[i])
+        if b == 37 and i + 2 < n
+            let hi = _pct_hexval(ord(s[i + 1]))
+            let lo = _pct_hexval(ord(s[i + 2]))
+            if hi >= 0 and lo >= 0
+                out = bytes_append(out, (hi * 16 + lo) & 0xFF)
+                i = i + 3
+            else
+                out = bytes_append(out, 37)
+                i = i + 1
+        else if b == 37
+            out = bytes_append(out, 37)
+            i = i + 1
+        else
+            out = bytes_append(out, b & 0xFF)
+            i = i + 1
+    return out
