@@ -1,0 +1,140 @@
+// ============================================================================
+// NOVA Standard Library — ulid module
+// ============================================================================
+// ULID (Universally Unique Lexicographically Sortable Identifier).
+//
+// A ULID is a 26-character, URL-safe, case-insensitive string encoded in
+// Crockford Base32. It encodes:
+//   - 10 chars  — 48-bit millisecond timestamp (big-endian, MSB first)
+//   - 16 chars  — 80 bits of randomness (from the caller-threaded PRNG)
+//
+// Total entropy: 80 random bits (10^24 possibilities per millisecond).
+// Lexicographic ordering matches chronological ordering on the timestamp
+// portion, making ULIDs excellent as database primary keys.
+//
+// Alphabet: Crockford Base32 — 32 characters, all uppercase, excluding the
+// four ambiguous characters I, L, O, U to avoid visual confusion.
+//
+//   Index: 0123456789...
+//   Chars: 0123456789ABCDEFGHJKMNPQRSTVWXYZ
+//
+// Encoding strategy for the 10 timestamp chars:
+//   1. Extract the lowest 5 bits: digit = ts_ms % 32 -> alphabet[digit]
+//   2. Shift right: ts_ms = ts_ms / 32
+//   3. Repeat 10 times, collecting digits in LSB-first order
+//   4. Reverse the 10-element list to get MSB-first (big-endian) order
+// This uses only integer division/mod so it is bit-exact, has no sign-bit
+// hazards, and does not depend on shift operators (>> is arithmetic in NOVA).
+//
+// Public API:
+//   ul_gen(ts_ms, state)  -> [ulid_string, newstate]
+//       Generate a ULID for the given millisecond timestamp using the given
+//       PRNG state (from prng_seed or a previous ul_gen call). Returns the
+//       26-character ULID and the advanced PRNG state for chaining.
+//
+//   ul_timestamp(ulid)    -> int
+//       Decode the timestamp portion (first 10 characters) of a ULID back to
+//       milliseconds. Behaviour on malformed input is undefined — callers must
+//       ensure the string was produced by ul_gen or is otherwise well-formed.
+//
+// NOT cryptographically secure — uses std/util/prng (xorshift64). Suitable
+// for distributed IDs, event log keys, cursor tokens, and similar use cases
+// where deterministic reproducibility and sortability matter more than secrecy.
+//
+// State threading: every function that advances the PRNG returns [result,
+// newstate]. Thread the returned state into the next call for a reproducible,
+// non-repeating sequence.
+
+import std/util/prng
+
+// The 32-character Crockford Base32 alphabet. Characters are uppercase and
+// exclude I, L, O, U to avoid visual confusion with 1, 1, 0, V.
+// Index i (0..31) is the symbol for value i.
+fn _ul_alphabet() -> str
+    "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+// Build the 10-character timestamp segment of a ULID from a millisecond
+// timestamp. The 48-bit value is decomposed into ten 5-bit groups via
+// repeated (% 32, / 32), collecting digits LSB-first, then reversing to
+// produce the big-endian (MSB-first) Crockford encoding.
+//
+// Because we use integer division and modulo exclusively (no bit shifts) the
+// result is bit-exact on all values in [0, 2^48 - 1]. Values above 2^48
+// silently overflow the timestamp field — this matches the ULID spec which
+// caps timestamps at 48 bits.
+fn _ul_encode_ts(ts_ms: int) -> str
+    let alpha = _ul_alphabet()
+    // Collect 10 digits, LSB first.
+    let d0 = ts_ms % 32
+    let r0 = ts_ms / 32
+    let d1 = r0 % 32
+    let r1 = r0 / 32
+    let d2 = r1 % 32
+    let r2 = r1 / 32
+    let d3 = r2 % 32
+    let r3 = r2 / 32
+    let d4 = r3 % 32
+    let r4 = r3 / 32
+    let d5 = r4 % 32
+    let r5 = r4 / 32
+    let d6 = r5 % 32
+    let r6 = r5 / 32
+    let d7 = r6 % 32
+    let r7 = r6 / 32
+    let d8 = r7 % 32
+    let r8 = r7 / 32
+    let d9 = r8 % 32
+    // Reverse: d9 is the most-significant group (leftmost char), d0 is least.
+    alpha[d9] + alpha[d8] + alpha[d7] + alpha[d6] + alpha[d5] + alpha[d4] + alpha[d3] + alpha[d2] + alpha[d1] + alpha[d0]
+
+// Decode a single Crockford Base32 character to its value (0..31).
+// Returns -1 for any character not in the alphabet (defensive).
+// Scans linearly; only called 10 times per ul_timestamp, so O(10*32) is fine.
+fn _ul_char_value(c: str) -> int
+    let alpha = _ul_alphabet()
+    let i = 0
+    while i < 32
+        if alpha[i] == c
+            return i
+        i = i + 1
+    -1
+
+// Decode the first 10 characters of a ULID back to a millisecond timestamp.
+// The 10 big-endian Crockford digits are converted one by one; each digit
+// contributes 5 bits, so the accumulation is: ts = ts * 32 + digit_value.
+fn ul_timestamp(ulid: str) -> int
+    let ts = 0
+    let i = 0
+    while i < 10
+        let c = ulid[i]
+        let v = _ul_char_value(c)
+        ts = ts * 32 + v
+        i = i + 1
+    ts
+
+// Generate a ULID for the given millisecond timestamp `ts_ms` using the
+// given PRNG state. Returns [ulid_string, newstate].
+//
+// The 16 random characters are each produced by:
+//   1. Advancing the PRNG via prng_next -> [value, newstate]
+//   2. Masking value & 31              -> index in [0, 31]
+//   3. Indexing the 32-char alphabet   -> one Crockford character
+//
+// The final PRNG state after all 16 draws is returned so the caller can
+// chain ul_gen calls without re-seeding.
+fn ul_gen(ts_ms: int, state: int)
+    let alpha = _ul_alphabet()
+    // 10-char timestamp prefix.
+    let ts_part = _ul_encode_ts(ts_ms)
+    // 16-char random suffix — thread PRNG state through each draw.
+    let rand_part = ""
+    let st = state
+    let i = 0
+    while i < 16
+        let step = prng_next(st)
+        let value = step[0]
+        st = step[1]
+        let idx = value & 31
+        rand_part = rand_part + alpha[idx]
+        i = i + 1
+    [ts_part + rand_part, st]
