@@ -1,0 +1,149 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/xxencode
+// ============================================================================
+// xxencode binary-to-text codec.
+//
+// ALPHABET (64 chars, index 0..63):
+//   "+-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+//    0  1  2..11     12..37               38..63
+//
+//   +  -> 0     -  -> 1     0..9 -> 2..11    A..Z -> 12..37
+//   a..z -> 38..63
+//
+// ALGORITHM:
+//   Encode: process 3-byte groups -> 4 alphabet characters (6 bits each, MSB-first).
+//     Final partial group is zero-padded to 3 bytes; encoder emits exactly
+//     ceil(n*4/3) characters (no padding chars / no length prefix / no line headers).
+//   Decode: consume 4-char groups -> 3 bytes; final group produces 1 or 2 bytes
+//     based on the number of remaining characters (which must be 1, 2, or 3 mod 4;
+//     1 mod 4 is degenerate/ignored).
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA (sign-extends for negatives):
+//   All right-shifts are masked with & 0x3F (6-bit) or & 0xFF (byte) to prevent
+//   sign-extension bleed.
+//
+// BINARY SAFETY:
+//   The codec operates entirely on `bytes` for the raw-data side.  The encoded
+//   result is a NOVA string containing only printable ASCII from the 64-char
+//   alphabet — no interior NUL bytes, safe to embed in text protocols.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _xx_ to avoid link collisions with other
+//   std modules compiled into the same binary.
+//
+// PUBLIC API:
+//   xx_encode(data: bytes) -> string
+//   xx_decode(s: string) -> bytes
+
+// ── Alphabet ──────────────────────────────────────────────────────────────────
+
+// _xx_alpha: the 64-character xxencode alphabet.
+//   alphabet[0]  = '+'
+//   alphabet[1]  = '-'
+//   alphabet[2]  = '0'  ..  alphabet[11] = '9'
+//   alphabet[12] = 'A'  ..  alphabet[37] = 'Z'
+//   alphabet[38] = 'a'  ..  alphabet[63] = 'z'
+fn _xx_alpha() -> string
+    "+-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// _xx_char_to_val: map one xxencode character to its 6-bit value (0..63).
+// Returns -1 for any character not in the alphabet (skip/ignore on decode).
+fn _xx_char_to_val(c) -> int
+    let b = ord(c)
+    // '+' -> 0
+    if b == 43
+        return 0
+    // '-' -> 1
+    if b == 45
+        return 1
+    // '0'..'9' -> 2..11
+    if b >= 48 and b <= 57
+        return b - 48 + 2
+    // 'A'..'Z' -> 12..37
+    if b >= 65 and b <= 90
+        return b - 65 + 12
+    // 'a'..'z' -> 38..63
+    if b >= 97 and b <= 122
+        return b - 97 + 38
+    // Not in alphabet
+    -1
+
+// ── Encode ────────────────────────────────────────────────────────────────────
+
+// xx_encode: encode raw bytes to an xxencode string.
+//
+// Each group of 3 bytes becomes 4 alphabet characters (6 bits each, MSB-first).
+// The final partial group (if any) is zero-padded to 3 bytes; the encoder emits
+// exactly ceil(n*4/3) output characters with no trailing pad or header.
+//
+// KAT:
+//   xx_encode(bytes(""))           == ""
+//   xx_encode(bytes of 3 NUL)      == "++++"    (all 6-bit groups = 0 -> alphabet[0])
+//   xx_encode(bytes("Cat"))        -> round-trips via xx_decode
+//   xx_encode(bytes("hello world"))-> round-trips via xx_decode
+fn xx_encode(data) -> string
+    let alpha = _xx_alpha()
+    let out = ""
+    let nb = bytes_len(data)
+    let i = 0
+    while i < nb
+        // Load up to 3 bytes; zero-pad if fewer remain.
+        let b0 = bytes_get(data, i) & 0xFF
+        let b1 = 0
+        let b2 = 0
+        if i + 1 < nb
+            b1 = bytes_get(data, i + 1) & 0xFF
+        if i + 2 < nb
+            b2 = bytes_get(data, i + 2) & 0xFF
+        // Pack 24 bits.
+        let acc = (b0 << 16) | (b1 << 8) | b2
+        // Extract four 6-bit groups (MSB-first) and map through alphabet.
+        let v0 = (acc >> 18) & 0x3F
+        let v1 = (acc >> 12) & 0x3F
+        let v2 = (acc >> 6) & 0x3F
+        let v3 = acc & 0x3F
+        let remain = nb - i
+        // Always emit first 2 chars (valid for any group >= 1 byte).
+        out = out + alpha[v0] + alpha[v1]
+        // Third char: present if >= 2 bytes in this group.
+        if remain >= 2
+            out = out + alpha[v2]
+        // Fourth char: present if == 3 bytes in this group.
+        if remain >= 3
+            out = out + alpha[v3]
+        i = i + 3
+    out
+
+// ── Decode ────────────────────────────────────────────────────────────────────
+
+// xx_decode: decode an xxencode string back to raw bytes.
+//
+// Collects 6-bit values into a 24-bit accumulator. Each time 8+ bits are
+// accumulated, one output byte is emitted (MSB-first). Characters not in the
+// xxencode alphabet are silently skipped (lenient for whitespace / line endings).
+//
+// KAT:
+//   xx_decode(xx_encode(b)) == b   for any bytes b (full round-trip)
+//   xx_decode("") == bytes(0)      (empty string -> empty bytes)
+fn xx_decode(s) -> any
+    let out = bytes(0)
+    let acc = 0
+    let nbits = 0
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        let v = _xx_char_to_val(c)
+        if v >= 0
+            // Valid 6-bit symbol: push onto accumulator MSB-first.
+            acc = (acc << 6) | v
+            nbits = nbits + 6
+            if nbits >= 8
+                nbits = nbits - 8
+                let bval = (acc >> nbits) & 0xFF
+                out = bytes_append(out, bval)
+                // Retain only the unconsumed low bits.
+                let mask = (1 << nbits) - 1
+                acc = acc & mask
+        i = i + 1
+    out
