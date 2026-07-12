@@ -1,0 +1,220 @@
+// ============================================================================
+// NOVA Standard Library — std/net/querystring
+// ============================================================================
+// URL query-string parsing, building, and key lookup.
+//
+// PUBLIC API:
+//   qs_parse(s: string) -> dict
+//     Parse a URL query string (everything after '?') into a dict mapping
+//     string keys to string values.  Percent-decodes both keys and values;
+//     treats '+' as a space (application/x-www-form-urlencoded).
+//     Duplicate keys: last value wins.  Key with no '=' gets value "".
+//     Leading '?' is silently stripped if present.
+//
+//   qs_build(pairs: dict) -> string
+//     Serialise a dict back to a query string "k1=v1&k2=v2" with keys SORTED
+//     for deterministic output.  Values are percent-encoded (RFC 3986
+//     unreserved characters A-Za-z0-9 - _ . ~ are left as-is; all other
+//     bytes become %XX).  Keys are encoded the same way.
+//
+//   qs_get(parsed: dict, key: string) -> string
+//     Safe key lookup: returns the value for `key`, or "" when absent.
+//
+// DESIGN NOTES:
+//   * Percent-decode: %XX where X is a hex digit (0-9 A-F a-f).  Invalid
+//     escape sequences (%GG, truncated % at end, etc.) are passed through
+//     literally (lenient parser).
+//   * '+' is decoded as space only in values and keys (form encoding).
+//   * >> is ARITHMETIC in NOVA.  We never right-shift here; nibble decode
+//     uses subtraction/comparison only.
+//   * ord(char_at(s,i)) yields 0..255 for all byte values.
+//   * NOVA dict keys are strings; missing key lookup returns int 0 not "".
+//     Always guard with contains(d, key) before reading a string value.
+//   * chr(code) accepts 0..127; all %XX output values are in 0..127 for
+//     standard ASCII query strings.  For non-ASCII bytes we fall back to
+//     outputting the raw byte value via chr(byte & 0x7F) — safe for the
+//     common case; full UTF-8 passthrough is a future enhancement.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _qs_ to avoid clashes when multiple
+//   std modules are compiled into the same binary.
+//
+// LEAF — imports NOTHING.
+
+// ── Private: hex nibble decoder ───────────────────────────────────────────────
+
+// _qs_hex_val: decode one ASCII hex character to its 0..15 value.
+// Returns -1 for non-hex characters.
+fn _qs_hex_val(c: string) -> int
+    let b = ord(c)
+    // '0'..'9' = 48..57
+    if b >= 48 and b <= 57
+        return b - 48
+    // 'A'..'F' = 65..70
+    if b >= 65 and b <= 70
+        return b - 55
+    // 'a'..'f' = 97..102
+    if b >= 97 and b <= 102
+        return b - 87
+    -1
+
+// _qs_decode: percent-decode a query-string component.
+// '+' -> space; %XX -> the byte chr(XX); invalid escapes -> literal chars.
+fn _qs_decode(s: string) -> string
+    let result = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let ch = char_at(s, i)
+        if ch == "+"
+            result = result + " "
+            i = i + 1
+        else if ch == "%"
+            // Need at least 2 more chars for valid %XX
+            if i + 2 < n
+                let hi = _qs_hex_val(char_at(s, i + 1))
+                let lo = _qs_hex_val(char_at(s, i + 2))
+                if hi >= 0 and lo >= 0
+                    let byte_val = hi * 16 + lo
+                    result = result + chr(byte_val)
+                    i = i + 3
+                else
+                    // Invalid hex digits — pass '%' through literally
+                    result = result + ch
+                    i = i + 1
+            else
+                // Truncated escape at end of string — pass through literally
+                result = result + ch
+                i = i + 1
+        else
+            result = result + ch
+            i = i + 1
+    result
+
+// _qs_is_unreserved: true for RFC 3986 unreserved characters.
+// A-Z (65-90), a-z (97-122), 0-9 (48-57), '-' (45), '_' (95), '.' (46), '~' (126).
+fn _qs_is_unreserved(b: int) -> bool
+    if b >= 65 and b <= 90
+        return true
+    if b >= 97 and b <= 122
+        return true
+    if b >= 48 and b <= 57
+        return true
+    if b == 45 or b == 95 or b == 46 or b == 126
+        return true
+    false
+
+// _qs_hex_char: encode a nibble 0..15 as uppercase hex character string.
+fn _qs_hex_char(n: int) -> string
+    if n < 10
+        return chr(48 + n)
+    chr(55 + n)
+
+// _qs_encode: percent-encode a string for use in a query string component.
+// Unreserved characters are passed through; all others become %XX.
+fn _qs_encode(s: string) -> string
+    let result = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(char_at(s, i))
+        if _qs_is_unreserved(b)
+            result = result + char_at(s, i)
+        else
+            let hi = (b & 0xFF) / 16
+            let lo = (b & 0xFF) - hi * 16
+            result = result + "%" + _qs_hex_char(hi) + _qs_hex_char(lo)
+        i = i + 1
+    result
+
+// ── Private: split on first '=' only ─────────────────────────────────────────
+
+// _qs_split_pair: split "key=value" on the FIRST '=' only.
+// Returns a 2-element list [key, value].  If no '=' present, returns [s, ""].
+fn _qs_split_pair(s: string) -> list
+    let i = 0
+    let n = len(s)
+    let found = -1
+    while i < n
+        if char_at(s, i) == "="
+            found = i
+            // break by setting i = n
+            i = n
+        else
+            i = i + 1
+    let result = []
+    if found < 0
+        result.push(s)
+        result.push("")
+    else
+        result.push(slice(s, 0, found))
+        result.push(slice(s, found + 1, n))
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// qs_parse: parse a URL query string into a dict.
+//
+// Examples:
+//   qs_parse("a=1&b=2")         -> {"a":"1", "b":"2"}
+//   qs_parse("q=hello%20world") -> {"q":"hello world"}
+//   qs_parse("q=a+b")           -> {"q":"a b"}
+//   qs_parse("x=a%26b")         -> {"x":"a&b"}
+//   qs_parse("")                -> {}
+//   qs_parse("?a=1")            -> {"a":"1"}  (leading '?' stripped)
+fn qs_parse(s: string) -> dict
+    // Strip optional leading '?'
+    let src = s
+    if len(src) > 0 and char_at(src, 0) == "?"
+        src = slice(src, 1, len(src))
+    let result = {}
+    if len(src) == 0
+        return result
+    let parts = split(src, "&")
+    let i = 0
+    while i < len(parts)
+        let raw = parts[i]
+        if len(raw) > 0
+            let pair = _qs_split_pair(raw)
+            let k = _qs_decode(pair[0])
+            let v = _qs_decode(pair[1])
+            result[k] = v
+        i = i + 1
+    result
+
+// qs_build: build a query string from a dict, keys sorted for determinism.
+//
+// Examples:
+//   qs_build({"a":"1","b":"2"})     -> "a=1&b=2"
+//   qs_build({"q":"hello world"})   -> "q=hello%20world"
+//   qs_build({"x":"a&b"})          -> "x=a%26b"
+//   qs_build({})                    -> ""
+fn qs_build(pairs: dict) -> string
+    let ks = keys(pairs)
+    sort(ks)
+    let result = ""
+    let i = 0
+    while i < len(ks)
+        let k = ks[i]
+        let v = pairs[k]
+        let enc_k = _qs_encode(k)
+        let enc_v = _qs_encode(v)
+        if i == 0
+            result = enc_k + "=" + enc_v
+        else
+            result = result + "&" + enc_k + "=" + enc_v
+        i = i + 1
+    result
+
+// qs_get: safe key lookup on a parsed query dict.
+// Returns the value string, or "" when the key is absent.
+//
+// Examples:
+//   let p = qs_parse("a=1&b=hello")
+//   qs_get(p, "a")   -> "1"
+//   qs_get(p, "b")   -> "hello"
+//   qs_get(p, "c")   -> ""
+fn qs_get(parsed: dict, key: string) -> string
+    if contains(parsed, key)
+        return parsed[key]
+    ""

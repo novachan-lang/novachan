@@ -1,0 +1,102 @@
+// NOVA std/util/retry — Retry/backoff policy (pure computation, no sleeping).
+//
+// Exponential backoff with a cap is the industry standard for retrying
+// transient failures (network calls, distributed locks, cloud APIs). This
+// module provides PURE, DETERMINISTIC computation of delay schedules so
+// callers own the actual sleeping — the policy is testable and portable.
+//
+// LCG for jitter: state = (1664525 * state + 1013904223) & 0xFFFFFFFF
+// (Numerical Recipes coefficients; full period over 2^32, fast, no division).
+// All intermediate values are masked to stay 32-bit unsigned (never negative).
+//
+// Public API:
+//   rt_delay_at(i, base_ms, factor, cap_ms) -> int
+//     Compute the i-th delay: min(base * factor^i, cap).
+//
+//   rt_delays(n, base_ms, factor, cap_ms) -> list
+//     Return the first n delays as a list.
+//
+//   rt_jittered(delays, seed) -> list
+//     Apply deterministic +/-50% jitter: each d becomes
+//       d - (d/2) + (lcg % d)    [d/2 .. d + d/2 - 1]
+//     LCG is advanced once per element.  d==0 stays 0.
+
+// ── LCG helpers ─────────────────────────────────────────────────────────────
+
+// One step of the 32-bit Numerical Recipes LCG.
+// mask &0xFFFFFFFF keeps the value in [0, 2^32-1] (unsigned 32-bit) on a
+// 64-bit int runtime.  '>>' in NOVA is arithmetic so we MUST mask before
+// using as unsigned.
+fn _lcg_step(state: int) -> int
+    let s = (1664525 * state + 1013904223) & 0xFFFFFFFF
+    s
+
+// ── Core computation ─────────────────────────────────────────────────────────
+
+// Compute base * factor^i without floating point: just repeated integer
+// multiplication capped at cap_ms.  factor must be >= 1; if factor==1 every
+// delay equals base (linear degenerate case, still correct).
+// i < 0 is treated as 0 (defensive).
+fn rt_delay_at(i: int, base_ms: int, factor: int, cap_ms: int) -> int
+    if base_ms <= 0
+        return 0
+    if cap_ms <= 0
+        return 0
+    // cap base itself
+    if base_ms >= cap_ms
+        return cap_ms
+    let delay = base_ms
+    let steps = i
+    if steps < 0
+        steps = 0
+    let k = 0
+    while k < steps
+        // multiply, but stop early if we already exceeded cap
+        if delay >= cap_ms
+            return cap_ms
+        let f = factor
+        if f < 1
+            f = 1
+        delay = delay * f
+        // overflow guard: if delay went negative or past cap, clamp
+        if delay > cap_ms
+            delay = cap_ms
+        if delay < 0
+            delay = cap_ms
+        k = k + 1
+    if delay > cap_ms
+        delay = cap_ms
+    delay
+
+// Return the first n delays as a list.
+// n <= 0 -> empty list.
+fn rt_delays(n: int, base_ms: int, factor: int, cap_ms: int) -> list
+    let out = []
+    let i = 0
+    while i < n
+        let d = rt_delay_at(i, base_ms, factor, cap_ms)
+        out = out + [d]
+        i = i + 1
+    out
+
+// Apply deterministic +/-50% jitter to each delay.
+// Each element d is replaced by: d - (d/2) + (lcg % d)
+//   => range [d/2, d + d/2 - 1]  (all integer, deterministic per seed)
+// d == 0 stays 0 (avoid modulo by zero).
+// seed can be any int; it is passed through _lcg_step first so seed=0 works.
+fn rt_jittered(delays: list, seed: int) -> list
+    let out = []
+    let state = _lcg_step(seed)
+    let i = 0
+    while i < len(delays)
+        let d = delays[i]
+        if d <= 0
+            out = out + [0]
+        else
+            state = _lcg_step(state)
+            let lo = d - (d / 2)
+            let rnd = state % d
+            let jd = lo + rnd
+            out = out + [jd]
+        i = i + 1
+    out

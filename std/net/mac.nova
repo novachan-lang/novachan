@@ -1,0 +1,220 @@
+// ============================================================================
+// NOVA Standard Library — std/net/mac
+// ============================================================================
+// MAC-48 (Ethernet) address parsing, normalization, validation, and formatting.
+//
+// PUBLIC API:
+//   mac_is_valid(s: string) -> bool
+//     Returns true iff s is a well-formed MAC-48 address in any accepted form.
+//
+//   mac_parse(s: string) -> string
+//     Parse a MAC address and return normalized "aa:bb:cc:dd:ee:ff" (lowercase,
+//     colon-separated). Returns "" on any malformed input.
+//     Accepted formats:
+//       "AA:BB:CC:DD:EE:FF"   colon-separated (case-insensitive)
+//       "AA-BB-CC-DD-EE-FF"   hyphen-separated (case-insensitive)
+//       "AABB.CCDD.EEFF"      Cisco-style dotted pairs (case-insensitive)
+//
+//   mac_bytes(s: string) -> bytes
+//     Parse a MAC address and return the 6 raw bytes (big-endian, index 0 = OUI
+//     first byte).  Returns empty bytes on any malformed input.
+//
+//   mac_format(b: bytes, sep: string) -> string
+//     Format 6 bytes as lowercase hex joined by sep. Returns "" if len(b) != 6.
+//
+// DESIGN NOTES:
+//   * All hex parsing uses ord() nibble arithmetic; no sprintf, no round-trip
+//     through a string for binary data.
+//   * NOVA >> is ARITHMETIC; we use & 0xFF / & 0xF throughout to keep results
+//     unsigned.
+//   * '{' / '}' in string literals interpolate — avoided entirely here.
+//   * Private helpers are prefixed _mac_ to avoid symbol collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Convert a single hex character (case-insensitive) to its 0..15 value.
+// Returns -1 for any non-hex character.
+fn _mac_hex_val(c: string) -> int
+    let b = ord(c)
+    // '0'..'9'  -> 48..57
+    if b >= 48 and b <= 57
+        return b - 48
+    // 'A'..'F' -> 65..70
+    if b >= 65 and b <= 70
+        return b - 55
+    // 'a'..'f' -> 97..102
+    if b >= 97 and b <= 102
+        return b - 87
+    -1
+
+// Convert a nibble value 0..15 to its lowercase hex character.
+fn _mac_nibble_char(n: int) -> string
+    if n < 10
+        return chr(48 + n)
+    chr(87 + n)
+
+// Parse exactly two hex characters at position pos in s, returning 0..255.
+// Returns -1 if either character is not a valid hex digit or pos is out of range.
+fn _mac_parse_byte(s: string, pos: int) -> int
+    if pos + 1 >= len(s)
+        return -1
+    let hi = _mac_hex_val(char_at(s, pos))
+    if hi < 0
+        return -1
+    let lo = _mac_hex_val(char_at(s, pos + 1))
+    if lo < 0
+        return -1
+    (hi * 16 + lo) & 0xFF
+
+// Format one byte (0..255) as two lowercase hex chars.
+fn _mac_fmt_byte(v: int) -> string
+    let hi = (v >> 4) & 0xF
+    let lo = v & 0xF
+    _mac_nibble_char(hi) + _mac_nibble_char(lo)
+
+// Try parsing colon or hyphen separated format: "XX[sep]XX[sep]XX[sep]XX[sep]XX[sep]XX"
+// sep is the expected separator character string (":" or "-").
+// Returns a list of 6 ints (0..255), or empty list on failure.
+fn _mac_parse_sep(s: string, sep: string) -> list
+    let empty = []
+    // Exact length: 6 pairs * 2 chars + 5 separators = 17
+    if len(s) != 17
+        return empty
+    let b0 = _mac_parse_byte(s, 0)
+    if b0 < 0
+        return empty
+    if char_at(s, 2) != sep
+        return empty
+    let b1 = _mac_parse_byte(s, 3)
+    if b1 < 0
+        return empty
+    if char_at(s, 5) != sep
+        return empty
+    let b2 = _mac_parse_byte(s, 6)
+    if b2 < 0
+        return empty
+    if char_at(s, 8) != sep
+        return empty
+    let b3 = _mac_parse_byte(s, 9)
+    if b3 < 0
+        return empty
+    if char_at(s, 11) != sep
+        return empty
+    let b4 = _mac_parse_byte(s, 12)
+    if b4 < 0
+        return empty
+    if char_at(s, 14) != sep
+        return empty
+    let b5 = _mac_parse_byte(s, 15)
+    if b5 < 0
+        return empty
+    [b0, b1, b2, b3, b4, b5]
+
+// Try parsing Cisco dotted format: "XXXX.XXXX.XXXX" (4 hex chars per group).
+// Returns a list of 6 ints (0..255), or empty list on failure.
+fn _mac_parse_dot(s: string) -> list
+    let empty = []
+    // Exact length: 3 groups * 4 chars + 2 dots = 14
+    if len(s) != 14
+        return empty
+    if char_at(s, 4) != "."
+        return empty
+    if char_at(s, 9) != "."
+        return empty
+    // Group 1: positions 0..3 -> bytes 0 and 1
+    let b0 = _mac_parse_byte(s, 0)
+    if b0 < 0
+        return empty
+    let b1 = _mac_parse_byte(s, 2)
+    if b1 < 0
+        return empty
+    // Group 2: positions 5..8 -> bytes 2 and 3
+    let b2 = _mac_parse_byte(s, 5)
+    if b2 < 0
+        return empty
+    let b3 = _mac_parse_byte(s, 7)
+    if b3 < 0
+        return empty
+    // Group 3: positions 10..13 -> bytes 4 and 5
+    let b4 = _mac_parse_byte(s, 10)
+    if b4 < 0
+        return empty
+    let b5 = _mac_parse_byte(s, 12)
+    if b5 < 0
+        return empty
+    [b0, b1, b2, b3, b4, b5]
+
+// Core: try all three formats and return list of 6 ints, or empty list.
+fn _mac_to_bytes_list(s: string) -> list
+    let empty = []
+    if len(s) == 0
+        return empty
+    // Try colon-separated
+    let r1 = _mac_parse_sep(s, ":")
+    if len(r1) == 6
+        return r1
+    // Try hyphen-separated
+    let r2 = _mac_parse_sep(s, "-")
+    if len(r2) == 6
+        return r2
+    // Try Cisco dotted
+    let r3 = _mac_parse_dot(s)
+    if len(r3) == 6
+        return r3
+    empty
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// mac_is_valid: returns true iff the string is a well-formed MAC-48 address.
+//
+// "AA:BB:CC:DD:EE:FF"  -> true
+// "aa-bb-cc-dd-ee-ff"  -> true
+// "aabb.ccdd.eeff"     -> true
+// "zz:bb:cc:dd:ee:ff"  -> false   (invalid hex)
+// "aa:bb"              -> false   (too short)
+// ""                   -> false
+fn mac_is_valid(s: string) -> bool
+    len(_mac_to_bytes_list(s)) == 6
+
+// mac_parse: parse any accepted MAC format and return "aa:bb:cc:dd:ee:ff".
+// Returns "" if the input is malformed.
+//
+// "AA-BB-CC-DD-EE-FF"  -> "aa:bb:cc:dd:ee:ff"
+// "aabb.ccdd.eeff"     -> "aa:bb:cc:dd:ee:ff"
+// "aa:bb:cc:dd:ee:ff"  -> "aa:bb:cc:dd:ee:ff"
+// "zz:bb:cc:dd:ee:ff"  -> ""
+fn mac_parse(s: string) -> string
+    let bl = _mac_to_bytes_list(s)
+    if len(bl) != 6
+        return ""
+    _mac_fmt_byte(bl[0]) + ":" + _mac_fmt_byte(bl[1]) + ":" + _mac_fmt_byte(bl[2]) + ":" + _mac_fmt_byte(bl[3]) + ":" + _mac_fmt_byte(bl[4]) + ":" + _mac_fmt_byte(bl[5])
+
+// mac_bytes: parse a MAC address string and return 6 raw bytes.
+// Returns empty bytes if the input is malformed.
+//
+// mac_bytes("aa:bb:cc:dd:ee:ff") -> bytes of length 6
+// mac_bytes("bad")               -> bytes of length 0
+fn mac_bytes(s: string) -> bytes
+    let bl = _mac_to_bytes_list(s)
+    let result = bytes(0)
+    if len(bl) != 6
+        return result
+    result = bytes_append(result, bl[0])
+    result = bytes_append(result, bl[1])
+    result = bytes_append(result, bl[2])
+    result = bytes_append(result, bl[3])
+    result = bytes_append(result, bl[4])
+    result = bytes_append(result, bl[5])
+    result
+
+// mac_format: format 6 bytes as lowercase hex joined by sep.
+// Returns "" if len(b) != 6.
+//
+// mac_format(mac_bytes("aa:bb:cc:dd:ee:ff"), "-") -> "aa-bb-cc-dd-ee-ff"
+// mac_format(mac_bytes("aa:bb:cc:dd:ee:ff"), ":") -> "aa:bb:cc:dd:ee:ff"
+fn mac_format(b: bytes, sep: string) -> string
+    if bytes_len(b) != 6
+        return ""
+    _mac_fmt_byte(bytes_get(b, 0)) + sep + _mac_fmt_byte(bytes_get(b, 1)) + sep + _mac_fmt_byte(bytes_get(b, 2)) + sep + _mac_fmt_byte(bytes_get(b, 3)) + sep + _mac_fmt_byte(bytes_get(b, 4)) + sep + _mac_fmt_byte(bytes_get(b, 5))
