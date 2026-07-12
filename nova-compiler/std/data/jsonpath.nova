@@ -1,0 +1,161 @@
+// ============================================================================
+// NOVA Standard Library — std/data/jsonpath
+// ============================================================================
+// Navigate a nested dict/list value using a dotted path string.
+//
+// PATH SYNTAX:
+//   - Segments are separated by "." (period).
+//   - A segment that parses as a non-negative integer indexes a LIST.
+//   - Any other segment reads a DICT key (string lookup).
+//   - The empty path "" returns the root value unchanged.
+//   - Examples: "a.b.0.c"  "users.0.name"  "config.db.port"
+//
+// RUNTIME TYPE DISPATCH:
+//   is_dict / is_list are COMPILE-TIME predicates that resolve to 0 for
+//   any-typed values. We use type_of(v) == "dict" / "list" everywhere so
+//   that values produced by json_parse (typed `any`) are handled correctly.
+//
+// SINGLE-EXIT RULE:
+//   Every function uses `let result = ...` + reassignment to avoid the NOVA
+//   `return null` + `return <value>` mistag bug.
+//
+// SYMBOL GUARD:
+//   All private helpers are prefixed _jdp_ (jsonpath dotted-path) to avoid
+//   cross-module symbol collisions in the single linked binary.
+//
+// PUBLIC API:
+//   jp_get(root, path)       -> any   — value at path, or null if missing/error
+//   jp_get_or(root, path, d) -> any   — jp_get result or default d when null
+//   jp_exists(root, path)    -> bool  — true iff jp_get != null
+//   jp_keys(root, path)      -> list  — sorted dict keys at path, or [] otherwise
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _jdp_is_uint: return 1 iff every character in s is an ASCII digit (0-9),
+// and the string is non-empty. We do NOT allow a leading '-' — negative
+// indices are not valid path segments.
+fn _jdp_is_uint(s) -> int
+    let n = len(s)
+    let result = 0
+    if n > 0
+        result = 1
+        let i = 0
+        while i < n and result == 1
+            let c = ord(s[i])
+            // '0' = 48, '9' = 57
+            if c < 48 or c > 57
+                result = 0
+            i = i + 1
+    result
+
+// _jdp_parse_uint: convert a non-empty all-digit string to int.
+// Caller MUST have already confirmed _jdp_is_uint == 1.
+fn _jdp_parse_uint(s) -> int
+    let n = len(s)
+    let v = 0
+    let i = 0
+    while i < n
+        v = v * 10 + (ord(s[i]) - 48)
+        i = i + 1
+    v
+
+// _jdp_step: walk one segment into `node`.
+// If node is a dict and segment is a string key -> dict lookup (guards with contains()).
+// If node is a list and segment is a non-negative int -> list index (bounds-checked).
+// Any other combination -> null.
+// Uses type_of() for runtime dispatch on any-typed values.
+fn _jdp_step(node, segment) -> any
+    let result = null
+    let kind = type_of(node)
+    if kind == "dict"
+        // A numeric segment in a dict still does a key lookup — dotted paths
+        // treat the context type, not the segment form, as canonical.
+        if contains(node, segment) == 1
+            result = node[segment]
+    else if kind == "list"
+        if _jdp_is_uint(segment) == 1
+            let idx = _jdp_parse_uint(segment)
+            if idx < len(node)
+                result = node[idx]
+    result
+
+// _jdp_walk: walk every segment in `parts` starting at index `start`
+// through `node`. Returns the final value or null on any miss.
+fn _jdp_walk(node, parts, start) -> any
+    let result = node
+    let i = start
+    let n = len(parts)
+    let ok = 1
+    while i < n and ok == 1
+        let next = _jdp_step(result, parts[i])
+        if next == null
+            ok = 0
+            result = null
+        else
+            result = next
+        i = i + 1
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// jp_get: navigate `root` by the dotted `path` and return the value there,
+// or null if any segment is missing, the type is wrong, or an index is
+// out of range.
+//
+// path == "" returns root unchanged.
+//
+// Examples (root = {"a": {"b": [10, 20, {"c": 99}]}}):
+//   jp_get(root, "a.b.0")    -> 10
+//   jp_get(root, "a.b.2.c")  -> 99
+//   jp_get(root, "a.x")      -> null   (absent key)
+//   jp_get(root, "a.b.9")    -> null   (out of bounds)
+//   jp_get(root, "")         -> root
+fn jp_get(root, path) -> any
+    let result = null
+    if len(path) == 0
+        result = root
+    else
+        let parts = split(path, ".")
+        result = _jdp_walk(root, parts, 0)
+    result
+
+// jp_get_or: like jp_get but returns `dflt` instead of null when the path
+// does not resolve to a value.
+//
+//   jp_get_or(root, "a.z", -1)   -> -1
+//   jp_get_or(root, "a.b.1", -1) -> 20
+fn jp_get_or(root, path, dflt) -> any
+    let v = jp_get(root, path)
+    let result = dflt
+    if v != null
+        result = v
+    result
+
+// jp_exists: return true iff jp_get would return a non-null value.
+//
+// Note: if the value at `path` IS literally null, this returns false.
+// Callers that need "present AND null" semantics should call jp_get directly.
+//
+//   jp_exists(root, "a.b.1") -> true
+//   jp_exists(root, "a.z")   -> false
+fn jp_exists(root, path) -> bool
+    let v = jp_get(root, path)
+    v != null
+
+// jp_keys: return the sorted list of dict keys at `path`.
+// Returns [] if the value at path is not a dict (or path does not resolve).
+//
+//   jp_keys(root, "a")   -> ["b"]
+//   jp_keys(root, "a.b") -> []     (it is a list, not a dict)
+//   jp_keys(root, "a.z") -> []     (path missing)
+fn jp_keys(root, path) -> list
+    let result = []
+    let v = jp_get(root, path)
+    if v != null
+        if type_of(v) == "dict"
+            let ks = keys(v)
+            result = sort(ks)
+    result
