@@ -1,0 +1,222 @@
+// ============================================================================
+// NOVA Standard Library — std/net/iprange
+// ============================================================================
+// IPv4 range / host enumeration.
+//
+// All IPv4 addresses are represented as plain NOVA ints holding the 32-bit
+// host-order value (0 .. 4294967295).  We keep them in that range by masking
+// with & 0xFFFFFFFF at every step where the result could overflow 32 bits.
+//
+// PUBLIC API:
+//   ipr_to_int(s)              -> int   dotted-quad -> 32-bit integer, -1 on error
+//   ipr_to_str(n)              -> string 32-bit integer -> dotted-quad
+//   ipr_hosts_in_cidr(cidr)    -> int   usable host count for the CIDR block
+//   ipr_network(cidr)          -> int   network address (host bits zeroed)
+//   ipr_broadcast(cidr)        -> int   broadcast address (host bits all 1)
+//   ipr_contains(cidr, ip)     -> bool  true iff ip falls inside cidr
+//   ipr_iter(start_ip, count)  -> list  next `count` IP strings from start_ip
+//
+// DESIGN NOTES:
+//   * NOVA ints are signed 64-bit.  IPv4 32-bit values are kept in [0, 2^32-1]
+//     by masking with & 0xFFFFFFFF wherever needed.
+//   * >> is ARITHMETIC (sign-extends) in NOVA; we only right-shift values that
+//     are guaranteed to be positive and immediately mask with & 0xFF, so sign
+//     extension is harmless.
+//   * 1<<32 is valid in NOVA (shifts 1..63 work correctly).  We use 1<<(32-p)
+//     to compute host counts without ever shifting 64 bits.
+//   * ipr_hosts_in_cidr: for prefix 0..30 usable = 2^(32-prefix) - 2
+//     (subtract network + broadcast); for prefix 31..32 the raw count is
+//     returned (point-to-point links / host routes have no unusable addresses).
+//
+// GOTCHA — >> ARITHMETIC:
+//   mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+//   When prefix = 0 the shift is << 32.  0xFFFFFFFF << 32 in 64-bit gives 0,
+//   so & 0xFFFFFFFF = 0 (no bits must match — every address is in /0).  Correct.
+//   When prefix = 32 the shift is << 0, giving 0xFFFFFFFF.  Correct exact match.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// True iff s is non-empty and all characters are ASCII decimal digits.
+fn _ipr_digits_only(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    while i < len(s)
+        let b = ord(char_at(s, i))
+        if b < 48 or b > 57
+            return false
+        i = i + 1
+    true
+
+// Parse one octet string to 0..255, or -1 on any error.
+fn _ipr_parse_octet(s: string) -> int
+    if _ipr_digits_only(s) == false
+        return -1
+    let v = parse_int(s)
+    if v < 0 or v > 255
+        return -1
+    v
+
+// Parse dotted-quad string to 32-bit int, or -1 on error.
+fn _ipr_parse(s: string) -> int
+    let parts = split(s, ".")
+    if len(parts) != 4
+        return -1
+    let a = _ipr_parse_octet(parts[0])
+    if a < 0
+        return -1
+    let b = _ipr_parse_octet(parts[1])
+    if b < 0
+        return -1
+    let c = _ipr_parse_octet(parts[2])
+    if c < 0
+        return -1
+    let d = _ipr_parse_octet(parts[3])
+    if d < 0
+        return -1
+    (a * 16777216 + b * 65536 + c * 256 + d) & 0xFFFFFFFF
+
+// Format 32-bit int to dotted-quad string.
+fn _ipr_fmt(n: int) -> string
+    let a = (n >> 24) & 0xFF
+    let b = (n >> 16) & 0xFF
+    let c = (n >> 8) & 0xFF
+    let d = n & 0xFF
+    str(a) + "." + str(b) + "." + str(c) + "." + str(d)
+
+// Parse a CIDR string "a.b.c.d/prefix" and return [network_int, prefix] in a
+// list, or [-1, -1] on any error.
+fn _ipr_parse_cidr(cidr: string) -> list
+    let slash = find(cidr, "/")
+    if slash < 0
+        let bad = [-1, -1]
+        return bad
+    let pstr = slice(cidr, slash + 1, len(cidr))
+    if _ipr_digits_only(pstr) == false
+        let bad = [-1, -1]
+        return bad
+    let prefix = parse_int(pstr)
+    if prefix < 0 or prefix > 32
+        let bad = [-1, -1]
+        return bad
+    let network = _ipr_parse(slice(cidr, 0, slash))
+    if network < 0
+        let bad = [-1, -1]
+        return bad
+    let result = [network, prefix]
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ipr_to_int: dotted-quad -> 32-bit host-order integer, or -1 on malformed input.
+//
+// "192.168.1.1"     -> 3232235777
+// "0.0.0.0"         -> 0
+// "255.255.255.255" -> 4294967295
+// "256.0.0.1"       -> -1
+fn ipr_to_int(s: string) -> int
+    _ipr_parse(s)
+
+// ipr_to_str: 32-bit host-order integer -> dotted-quad string.
+//
+// 3232235777 -> "192.168.1.1"
+// 0          -> "0.0.0.0"
+fn ipr_to_str(n: int) -> string
+    _ipr_fmt(n)
+
+// ipr_hosts_in_cidr: number of usable host addresses in the CIDR block.
+//
+// For prefix 0..30: 2^(32-prefix) - 2  (subtract network and broadcast)
+// For prefix 31..32: 2^(32-prefix)     (point-to-point / host route, no waste)
+//
+// "10.0.0.0/24" -> 254
+// "10.0.0.0/30" -> 2
+// "10.0.0.0/31" -> 2
+// "10.0.0.0/32" -> 1
+fn ipr_hosts_in_cidr(cidr: string) -> int
+    let parts = _ipr_parse_cidr(cidr)
+    let network = parts[0]
+    let prefix = parts[1]
+    if network < 0
+        return 0
+    let bits = 32 - prefix
+    let raw = 1 << bits
+    if prefix <= 30
+        return raw - 2
+    raw
+
+// ipr_network: network address of the CIDR block (host bits zeroed).
+//
+// "192.168.1.128/25" -> ipr_to_int("192.168.1.128")  (= 3232235904)
+// "10.0.0.5/8"       -> ipr_to_int("10.0.0.0")
+fn ipr_network(cidr: string) -> int
+    let parts = _ipr_parse_cidr(cidr)
+    let network = parts[0]
+    let prefix = parts[1]
+    if network < 0
+        return -1
+    if prefix == 0
+        return 0
+    let mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+    network & mask
+
+// ipr_broadcast: broadcast address of the CIDR block (host bits all 1).
+//
+// "192.168.1.0/24" -> ipr_to_int("192.168.1.255")  (= 3232235775 + 255 = 3232236031? no)
+// Hand-check: 192.168.1.0/24
+//   network = 3232235776 (192*16777216+168*65536+1*256+0)
+//   mask    = 0xFFFFFF00
+//   ~mask & 0xFFFFFFFF = 0x000000FF = 255
+//   broadcast = 3232235776 | 255 = 3232236031
+//   ipr_to_str(3232236031) = "192.168.1.255"  ✓
+fn ipr_broadcast(cidr: string) -> int
+    let parts = _ipr_parse_cidr(cidr)
+    let network = parts[0]
+    let prefix = parts[1]
+    if network < 0
+        return -1
+    if prefix == 0
+        return 4294967295
+    let mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+    let net = network & mask
+    // host_mask = bitwise NOT of mask, kept to 32 bits
+    // NOVA has no ~ operator; compute as 0xFFFFFFFF XOR mask
+    let host_mask = (0xFFFFFFFF - mask) & 0xFFFFFFFF
+    (net + host_mask) & 0xFFFFFFFF
+
+// ipr_contains: true iff the dotted-quad ip falls inside the CIDR block.
+//
+// "10.0.0.0/8"  "10.5.5.5"  -> true
+// "10.0.0.0/8"  "11.0.0.0"  -> false
+fn ipr_contains(cidr: string, ip: string) -> bool
+    let parts = _ipr_parse_cidr(cidr)
+    let network = parts[0]
+    let prefix = parts[1]
+    if network < 0
+        return false
+    let addr = _ipr_parse(ip)
+    if addr < 0
+        return false
+    if prefix == 0
+        return true
+    let mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+    (addr & mask) == (network & mask)
+
+// ipr_iter: return a list of `count` consecutive IP strings starting at start_ip.
+//
+// ipr_iter("10.0.0.1", 3) -> ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+// Wraps around at 255.255.255.255 -> 0.0.0.0 (mod 2^32).
+fn ipr_iter(start_ip: string, count: int) -> list
+    let result = []
+    let base = _ipr_parse(start_ip)
+    if base < 0
+        return result
+    let i = 0
+    while i < count
+        let cur = (base + i) & 0xFFFFFFFF
+        result.push(_ipr_fmt(cur))
+        i = i + 1
+    result

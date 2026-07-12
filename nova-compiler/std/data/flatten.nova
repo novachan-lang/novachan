@@ -1,0 +1,161 @@
+// ============================================================================
+// NOVA Standard Library — std/data/flatten
+// ============================================================================
+// Flatten / unflatten a NESTED DICT into / from dotted-key form.
+//
+// NOTE: this is DICT flattening (nested maps -> single-level dotted keys).
+//       The native builtin `flatten` is LIST flattening — distinct concern.
+//
+// PUBLIC API
+//   fd_flatten(d)            -> dict   flat dict with dotted keys
+//   fd_unflatten(flat)       -> dict   nested dict rebuilt from dotted keys
+//   fd_get(d, dotted_path)   -> any    safe dotted-path lookup (null on miss)
+//
+// SEMANTICS
+//   fd_flatten({"a":1,"b":{"x":2,"y":{"z":3}}})
+//     -> {"a":1, "b.x":2, "b.y.z":3}
+//
+//   fd_unflatten({"a":1,"b.x":2,"b.y.z":3})
+//     -> {"a":1,"b":{"x":2,"y":{"z":3}}}
+//
+//   fd_get(d, "b.y.z") -> 3   (works on EITHER nested or already-flat input)
+//   fd_get(d, "b.q")   -> null
+//
+// IMPLEMENTATION NOTES
+//   • type_of(x) == "dict" is used throughout — is_dict() is a compile-time
+//     predicate that returns 0 for any-typed values such as dict elements.
+//   • Single-exit pattern (let result = null; ...; return result) prevents the
+//     NOVA `return null` + `return <value>` mistag bug.
+//   • All private helpers are prefixed _fd_ to avoid symbol collisions.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _fd_flatten_into: recursively visit dict `d`, building flat entries in `out`.
+// `prefix` is the dotted path accumulated so far (empty string = top level).
+// Entries whose values are dicts are recursed; all other values are emitted.
+fn _fd_flatten_into(d, prefix, out)
+    let ks = keys(d)
+    let n = len(ks)
+    let i = 0
+    while i < n
+        let k = ks[i]
+        let full_key = ""
+        if len(prefix) == 0
+            full_key = k
+        else
+            full_key = prefix + "." + k
+        let v = d[k]
+        if type_of(v) == "dict"
+            _fd_flatten_into(v, full_key, out)
+        else
+            out[full_key] = v
+        i = i + 1
+
+// _fd_ensure_nested: walk (or create) nested dicts in `root` following `parts`
+// up to but NOT including the last part, and return the innermost dict.
+// Creates intermediate dicts when absent.
+fn _fd_ensure_nested(root, parts, stop_before)
+    let node = root
+    let i = 0
+    while i < stop_before
+        let seg = parts[i]
+        if contains(node, seg) == 1
+            // Key exists — check if it's already a dict we can descend into.
+            if type_of(node[seg]) == "dict"
+                node = node[seg]
+            else
+                // Existing leaf will be shadowed by a nested dict (deeper key wins).
+                let sub = {}
+                node[seg] = sub
+                node = sub
+        else
+            let sub = {}
+            node[seg] = sub
+            node = sub
+        i = i + 1
+    return node
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// fd_flatten: produce a single-level dict whose keys are dotted paths.
+//
+// Non-dict values at any depth become leaf entries.
+// An empty input dict yields an empty output dict.
+//
+// Examples:
+//   fd_flatten({"a":1,"b":{"x":2,"y":{"z":3}}})  ->  {"a":1,"b.x":2,"b.y.z":3}
+//   fd_flatten({"x":42})                           ->  {"x":42}
+//   fd_flatten({})                                 ->  {}
+fn fd_flatten(d)
+    let out = {}
+    _fd_flatten_into(d, "", out)
+    return out
+
+// fd_unflatten: rebuild a nested dict from a flat dotted-key dict.
+//
+// Each key is split on "." to determine the path in the output tree.
+// Intermediate dicts are created as needed.  When two keys share a prefix
+// (e.g. "b.x" and "b.y"), they share the same intermediate dict node.
+// If a shorter key and a longer key collide at the same node (e.g. "a" and
+// "a.b"), the longer key (deeper path) overwrites the shorter one — deeper
+// paths win.
+//
+// Examples:
+//   fd_unflatten({"a":1,"b.x":2,"b.y.z":3})
+//     -> {"a":1,"b":{"x":2,"y":{"z":3}}}
+//   fd_unflatten({"x":42})  ->  {"x":42}
+//   fd_unflatten({})        ->  {}
+fn fd_unflatten(flat)
+    let root = {}
+    let ks = keys(flat)
+    let n = len(ks)
+    let i = 0
+    while i < n
+        let dotted = ks[i]
+        let parts = split(dotted, ".")
+        let depth = len(parts)
+        if depth == 1
+            // No dot — assign directly into root.
+            root[dotted] = flat[dotted]
+        else
+            // Descend / create intermediates, then set the leaf.
+            let parent = _fd_ensure_nested(root, parts, depth - 1)
+            let last_seg = parts[depth - 1]
+            parent[last_seg] = flat[dotted]
+        i = i + 1
+    return root
+
+// fd_get: safe dotted-path lookup on a NESTED dict.
+//
+// Splits `dotted_path` on "." and walks `d` one segment at a time.
+// Returns null if any segment is absent or an intermediate value is not a dict.
+// Returns the leaf value when the full path resolves successfully.
+//
+// Examples:
+//   fd_get({"b":{"y":{"z":3}}}, "b.y.z")  -> 3
+//   fd_get({"b":{"y":{"z":3}}}, "b.q")    -> null   (absent)
+//   fd_get({"a":1},             "a")       -> 1      (single-segment)
+//   fd_get({},                  "x")       -> null   (empty dict)
+fn fd_get(d, dotted_path) -> any
+    let parts = split(dotted_path, ".")
+    let n = len(parts)
+    let result = null
+    let node = d
+    let ok = 1
+    let i = 0
+    while i < n and ok == 1
+        let seg = parts[i]
+        if type_of(node) == "dict"
+            if contains(node, seg) == 1
+                node = node[seg]
+            else
+                ok = 0
+        else
+            ok = 0
+        i = i + 1
+    if ok == 1
+        result = node
+    return result
