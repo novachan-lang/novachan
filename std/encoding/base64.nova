@@ -1,0 +1,212 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/base64
+// ============================================================================
+// RFC 4648 §4 Base64 and §5 Base64url encode/decode.
+//
+// THE BINARY-SAFETY PROPERTY:
+//   NOVA strings are C-string-shaped: a 0x00 byte inside a string silently
+//   truncates (reference_nova_string_nul_truncation). Binary data ROUTINELY
+//   contains 0x00 bytes. Base64 is the dominant encoding for binary payloads
+//   (JWT, PEM keys, email attachments, image data, TLS certificates). This
+//   module takes and returns `bytes` for the raw-data side, making 0x00 an
+//   ordinary byte — never truncated, never lost.
+//
+// PUBLIC API:
+//   b64_encode(data: bytes) -> string      RFC 4648 §4 standard (A-Za-z0-9+/)
+//   b64_decode(s: string) -> bytes         tolerates missing/present padding
+//   b64_encode_url(data: bytes) -> string  RFC 4648 §5 URL-safe (-_, no pad)
+//   b64_decode_url(s: string) -> bytes     URL-safe decode
+//
+// ALGORITHM (RFC 4648 §4):
+//   Encode: process 3-byte groups into 4 base64 characters (6 bits each).
+//   Partial final group: pad to multiple of 4 with '='.
+//     3 bytes -> 4 chars, 0 pad
+//     2 bytes -> 3 chars, 1 pad ('=')
+//     1 byte  -> 2 chars, 2 pad ('==')
+//   Decode: each base64 char yields 6 bits; accumulate 24 bits per group
+//   and emit 3 bytes. Stop on '='.
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   All shifts mask with & 0xFF or & 0x3F (6-bit) to prevent sign-extension.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _b64_ to avoid collisions with other
+//   std modules compiled into the same binary.
+
+// ── Alphabet helpers ──────────────────────────────────────────────────────────
+
+// Standard RFC 4648 §4 alphabet: A-Za-z0-9+/
+fn _b64_alpha() -> string
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// RFC 4648 §5 URL-safe alphabet: A-Za-z0-9-_
+fn _b64url_alpha() -> string
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// Map one standard base64 char to its 6-bit value (0..63).
+// Returns -1 for '=' (padding stop), -2 for whitespace (strip), -3 for illegal.
+fn _b64_char_to_val(c) -> int
+    let b = ord(c)
+    // '=' padding stop
+    if b == 61
+        return -1
+    // whitespace: space(32) tab(9) CR(13) LF(10)
+    if b == 32 or b == 9 or b == 13 or b == 10
+        return -2
+    // 'A'..'Z' -> 0..25
+    if b >= 65 and b <= 90
+        return b - 65
+    // 'a'..'z' -> 26..51
+    if b >= 97 and b <= 122
+        return b - 97 + 26
+    // '0'..'9' -> 52..61
+    if b >= 48 and b <= 57
+        return b - 48 + 52
+    // '+' -> 62
+    if b == 43
+        return 62
+    // '/' -> 63
+    if b == 47
+        return 63
+    // illegal
+    -3
+
+// Map one URL-safe base64 char to its 6-bit value.
+// Returns -1/'=', -2/ws, -3/illegal.
+fn _b64url_char_to_val(c) -> int
+    let b = ord(c)
+    // '=' padding stop (some URL-safe may still include it)
+    if b == 61
+        return -1
+    // whitespace strip
+    if b == 32 or b == 9 or b == 13 or b == 10
+        return -2
+    // 'A'..'Z' -> 0..25
+    if b >= 65 and b <= 90
+        return b - 65
+    // 'a'..'z' -> 26..51
+    if b >= 97 and b <= 122
+        return b - 97 + 26
+    // '0'..'9' -> 52..61
+    if b >= 48 and b <= 57
+        return b - 48 + 52
+    // '-' -> 62
+    if b == 45
+        return 62
+    // '_' -> 63
+    if b == 95
+        return 63
+    // illegal
+    -3
+
+// ── Core encode ───────────────────────────────────────────────────────────────
+// Shared encode: takes bytes + alphabet string + pad flag.
+// pad=1 → emit '=' padding (standard); pad=0 → no padding (URL-safe).
+
+fn _b64_encode_core(data, alpha, pad) -> string
+    let out = ""
+    let nb = bytes_len(data)
+    let i = 0
+    while i < nb
+        // Load up to 3 bytes from the current position.
+        let b0 = bytes_get(data, i) & 0xFF
+        let b1 = 0
+        let b2 = 0
+        if i + 1 < nb
+            b1 = bytes_get(data, i + 1) & 0xFF
+        if i + 2 < nb
+            b2 = bytes_get(data, i + 2) & 0xFF
+        // Pack into 24-bit accumulator.
+        let acc = (b0 << 16) | (b1 << 8) | b2
+        // Always emit the first two characters (cover >=6 and >=12 bits).
+        let c0 = (acc >> 18) & 0x3F
+        let c1 = (acc >> 12) & 0x3F
+        out = out + alpha[c0] + alpha[c1]
+        // Third character: exists if we had >= 2 bytes.
+        let remain = nb - i
+        if remain >= 2
+            let c2 = (acc >> 6) & 0x3F
+            out = out + alpha[c2]
+        else if pad == 1
+            out = out + "="
+        // Fourth character: exists only if we had 3 bytes.
+        if remain >= 3
+            let c3 = acc & 0x3F
+            out = out + alpha[c3]
+        else if pad == 1
+            out = out + "="
+        i = i + 3
+    out
+
+// ── Core decode ───────────────────────────────────────────────────────────────
+// Shared decode: strips whitespace, maps chars to 6-bit values, accumulates
+// 24 bits per group, emits 3 bytes (or 2/1 for partial final group).
+// use_url=0 → standard alphabet; use_url=1 → URL-safe alphabet.
+
+fn _b64_decode_core(s, use_url) -> any
+    let out = bytes(0)
+    let acc = 0
+    let nbits = 0
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        let v = 0
+        if use_url == 1
+            v = _b64url_char_to_val(c)
+        else
+            v = _b64_char_to_val(c)
+        if v == -1
+            // '=' padding: stop consuming input
+            i = n
+        else if v == -2
+            // whitespace: skip, advance
+            i = i + 1
+        else if v >= 0
+            // valid 6-bit symbol: push onto accumulator
+            acc = (acc << 6) | v
+            nbits = nbits + 6
+            if nbits >= 8
+                nbits = nbits - 8
+                let bval = (acc >> nbits) & 0xFF
+                out = bytes_append(out, bval)
+                // keep only the unconsumed low bits
+                let mask = (1 << nbits) - 1
+                acc = acc & mask
+            i = i + 1
+        else
+            // v == -3: illegal char, skip (lenient for forward-compat)
+            i = i + 1
+    out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// b64_encode: encode binary bytes to RFC 4648 §4 standard base64 string.
+//   Uses alphabet A-Za-z0-9+/ with '=' padding to nearest multiple of 4.
+//   A 0x00 input byte encodes as part of the normal 6-bit groups and
+//   round-trips through b64_decode correctly — no NUL-truncation hazard.
+//
+// KAT (RFC 4648 §10):
+//   b64_encode(_bytes("Man")) == "TWFu"
+//   b64_encode(_bytes("Ma"))  == "TWE="
+//   b64_encode(_bytes("M"))   == "TQ=="
+//   b64_encode(_bytes(""))    == ""
+fn b64_encode(data) -> string
+    _b64_encode_core(data, _b64_alpha(), 1)
+
+// b64_decode: decode RFC 4648 §4 standard base64 string to bytes.
+//   Tolerates missing trailing '=' padding and surrounding whitespace.
+//   Non-alphabet characters are skipped (lenient for forward-compat).
+fn b64_decode(s) -> any
+    _b64_decode_core(s, 0)
+
+// b64_encode_url: encode binary bytes to RFC 4648 §5 URL-safe base64 string.
+//   Uses alphabet A-Za-z0-9-_ with NO '=' padding (safe in URLs/filenames).
+//   Characters '+' and '/' are replaced with '-' and '_' respectively.
+fn b64_encode_url(data) -> string
+    _b64_encode_core(data, _b64url_alpha(), 0)
+
+// b64_decode_url: decode RFC 4648 §5 URL-safe base64 string to bytes.
+//   Accepts '-' and '_' in place of '+' and '/'. Tolerates '=' if present.
+fn b64_decode_url(s) -> any
+    _b64_decode_core(s, 1)
