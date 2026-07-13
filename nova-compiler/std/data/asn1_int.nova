@@ -1,0 +1,162 @@
+// ============================================================================
+// NOVA Standard Library — std/data/asn1_int
+// ============================================================================
+// ASN.1 DER INTEGER (tag 0x02) encoder/decoder.
+//
+// Handles the full signed two's-complement range.  Every byte read is
+// bounds-checked; malformed input returns a safe error sentinel.
+//
+// PUBLIC API:
+//   asn1_int_encode(n: int) -> bytes
+//     DER TLV for INTEGER n.  Content is minimal big-endian two's-complement:
+//       - n == 0  -> content = [0x00]
+//       - n > 0   -> minimal big-endian; prepend 0x00 if MSB >= 0x80
+//       - n < 0   -> two's-complement, minimal (MSB must have bit-7 set)
+//     Result always starts with tag 0x02.
+//
+//   asn1_int_decode(b: bytes, pos: int) -> list
+//     Decode one DER INTEGER TLV beginning at byte offset pos in b.
+//     Returns [value: int, next_pos: int].
+//     On any error (wrong tag, truncated, over-long, etc.) returns [-1, -1].
+//
+// PRIVATE helpers:
+//   _asn1i_encode_content(n) -> bytes   — content bytes only (no tag/length)
+//   _asn1i_tlv(content) -> bytes        — wrap content with tag 0x02 + length
+//   _asn1i_read_length(b, pos) -> list  — [decoded_len, next_pos] or [-1,-1]
+//
+// DESIGN NOTES:
+//   - Leaf module, no imports.
+//   - >>  is arithmetic (sign-extending) in NOVA — used for signed encode loop.
+//   - &   is bitwise AND — used for byte extraction.
+//   - Single-exit style (let result / reassign) to avoid return-null mistag.
+//   - bytes_append returns a NEW bytes value (always reassigned).
+//   - push(list, x) mutates in place — called as a statement only.
+//
+// KAT vectors (X.690 / RFC 5280 verified):
+//   asn1_int_encode(0)    == [0x02,0x01,0x00]
+//   asn1_int_encode(127)  == [0x02,0x01,0x7F]
+//   asn1_int_encode(128)  == [0x02,0x02,0x00,0x80]
+//   asn1_int_encode(256)  == [0x02,0x02,0x01,0x00]
+//   asn1_int_encode(-1)   == [0x02,0x01,0xFF]
+//   asn1_int_encode(-128) == [0x02,0x01,0x80]
+//   asn1_int_encode(300)  == [0x02,0x02,0x01,0x2C]
+// ============================================================================
+
+// _asn1i_encode_content: produce the minimal two's-complement big-endian
+// content bytes for integer n (no tag, no length wrapper).
+//
+// Algorithm: extract bytes LSB-first using n & 0xFF / n >> 8.
+// For positive n, stop when remaining==0 AND current byte MSB==0 (unambiguous).
+// For negative n, stop when remaining==-1 AND current byte MSB==1 (sign preserved).
+// Then reverse the accumulated limbs into big-endian order.
+fn _asn1i_encode_content(n: int) -> any
+    let limbs = []
+    let rem = n
+    let stop = 0
+    while stop == 0
+        let b = rem & 0xFF
+        push(limbs, b)
+        rem = rem >> 8
+        if rem == 0 and (b & 0x80) == 0
+            stop = 1
+        if rem == -1 and (b & 0x80) != 0
+            stop = 1
+    // reverse limbs (LSB-first) into big-endian bytes
+    let count = len(limbs)
+    let out = bytes(0)
+    let i = count - 1
+    while i >= 0
+        out = bytes_append(out, limbs[i])
+        i = i - 1
+    out
+
+// _asn1i_tlv: wrap content bytes with DER tag 0x02 and length field.
+// Short form (<128 bytes): one byte.  Long form: 0x81/0x82 prefix.
+fn _asn1i_tlv(content: any) -> any
+    let clen = bytes_len(content)
+    let out = bytes(0)
+    out = bytes_append(out, 2)
+    if clen < 128
+        out = bytes_append(out, clen)
+    else
+        if clen < 256
+            out = bytes_append(out, 129)
+            out = bytes_append(out, clen)
+        else
+            let hi = clen / 256
+            let lo = clen % 256
+            out = bytes_append(out, 130)
+            out = bytes_append(out, hi)
+            out = bytes_append(out, lo)
+    out = bytes_concat(out, content)
+    out
+
+// asn1_int_encode: full DER TLV encoding of signed integer n.
+fn asn1_int_encode(n: int) -> any
+    let content = _asn1i_encode_content(n)
+    _asn1i_tlv(content)
+
+// _asn1i_read_length: parse DER length field starting at pos in b.
+// Returns [decoded_length, next_pos_after_length] or [-1,-1] on error.
+fn _asn1i_read_length(b: any, pos: int) -> any
+    let blen = bytes_len(b)
+    let result = [-1, -1]
+    if pos < blen
+        let first = bytes_get(b, pos)
+        if first < 128
+            result = [first, pos + 1]
+        else
+            if first == 129
+                // one length byte follows
+                if pos + 1 < blen
+                    let lv = bytes_get(b, pos + 1)
+                    result = [lv, pos + 2]
+            else
+                if first == 130
+                    // two length bytes follow
+                    if pos + 2 < blen
+                        let hi = bytes_get(b, pos + 1)
+                        let lo = bytes_get(b, pos + 2)
+                        result = [hi * 256 + lo, pos + 3]
+    result
+
+// asn1_int_decode: decode one DER INTEGER TLV from bytes b at offset pos.
+// Returns [signed_value, next_pos_after_tlv] or [-1,-1] on any error.
+//
+// Decoding signed two's-complement:
+//   Shift in each byte MSB-first: val = (val << 8) | byte.
+//   If the first content byte has bit-7 set, the value is negative.
+//   Sign-extend by subtracting 256^content_length.
+//   We compute 256^k incrementally to avoid overflow on large k.
+fn asn1_int_decode(b: any, pos: int) -> any
+    let blen = bytes_len(b)
+    let result = [-1, -1]
+    // bounds: need at least tag + 1 length byte
+    if pos + 1 < blen
+        let tag = bytes_get(b, pos)
+        if tag == 2
+            let lr = _asn1i_read_length(b, pos + 1)
+            let clen = lr[0]
+            let cpos = lr[1]
+            if clen > 0 and cpos >= 0
+                // bounds: content must fit
+                if cpos + clen <= blen
+                    // accumulate value big-endian
+                    let val = 0
+                    let ci = 0
+                    while ci < clen
+                        let bv = bytes_get(b, cpos + ci)
+                        val = (val << 8) | bv
+                        ci = ci + 1
+                    // sign-extend if first content byte has bit-7 set
+                    let first_cb = bytes_get(b, cpos)
+                    if (first_cb & 0x80) != 0
+                        // subtract 256^clen to get the signed value
+                        let sub = 1
+                        let si = 0
+                        while si < clen
+                            sub = sub * 256
+                            si = si + 1
+                        val = val - sub
+                    result = [val, cpos + clen]
+    result

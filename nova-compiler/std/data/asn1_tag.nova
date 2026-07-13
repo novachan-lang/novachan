@@ -1,0 +1,154 @@
+// ============================================================================
+// NOVA Standard Library — std/data/asn1_tag
+// ============================================================================
+// ASN.1 tag byte codec (X.690 §8.1.2).
+//
+// An ASN.1 tag carries three pieces of information:
+//   class       — 2 bits: 0=Universal, 1=Application, 2=Context-specific, 3=Private
+//   constructed — 1 bit:  0=primitive, 1=constructed (value contains nested TLVs)
+//   number      — tag number (≥0)
+//
+// ENCODING FORMAT:
+//   Low-tag-number form (number 0..30):
+//     One byte: (class<<6) | (constructed<<5) | number
+//
+//   High-tag-number form (number >= 31):
+//     First byte: (class<<6) | (constructed<<5) | 0x1F
+//     Subsequent bytes: base-128 encoding of number, big-endian, with the
+//       high bit (0x80) SET on all but the LAST byte.
+//     DER/BER mandates the minimal encoding (no leading 0x80 bytes).
+//
+// PUBLIC API:
+//   asn1_tag_encode(cls, constructed, number) -> bytes
+//     Encode the tag. cls in 0..3; constructed in 0..1; number >= 0.
+//     number 0..30 uses low-tag form (1 byte).
+//     number >= 31 uses high-tag-number form (2+ bytes).
+//
+//   asn1_tag_decode(b, pos) -> list
+//     Decode tag bytes starting at position pos in bytes b.
+//     Returns [info_dict, next_pos] where info_dict has keys:
+//       "class"       -> int (0..3)
+//       "constructed" -> int (0 or 1)
+//       "number"      -> int
+//     Returns [{}, -1] if input is malformed or truncated.
+//
+// PRIVATE helpers:
+//   _atag_base128_enc(n) -> bytes   — encode n as base-128 (big-endian, high-bit flag)
+//   _atag_low_byte(cls, cons, num)  — encode low-tag-form byte
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing.
+//   - Bounds-checked on every byte read in decode path.
+//   - Malformed input returns sentinel next_pos = -1 (caller must check).
+//   - High-tag-number form with number=0..30 is technically valid per X.690
+//     but DER tools generate low form; this encoder always uses low form for 0..30.
+//   - The decoder accepts both forms for robustness.
+//
+// KAT vectors (X.690 verified):
+//   asn1_tag_encode(0,0,2)  == [0x02]          (INTEGER, universal primitive)
+//   asn1_tag_encode(0,1,16) == [0x30]          (SEQUENCE, universal constructed)
+//   asn1_tag_encode(2,1,0)  == [0xA0]          (context [0] constructed)
+//   asn1_tag_encode(0,0,31) == [0x1F,0x1F]     (high-tag universal primitive 31)
+//   asn1_tag_encode(0,0,128)== [0x1F,0x81,0x00](high-tag number 128)
+//   Round-trip: decode(encode(c,x,n)) recovers {class:c, constructed:x, number:n}
+// ============================================================================
+
+// _atag_low_byte: compose the single-byte form for low-tag numbers (0..30).
+fn _atag_low_byte(cls: int, cons: int, num: int) -> int
+    (cls * 64) + (cons * 32) + num
+
+// _atag_base128_enc: encode integer n >= 0 as base-128 big-endian bytes.
+// Each byte holds 7 bits of payload; the high bit is SET on all bytes EXCEPT
+// the last. This is the standard base-128 / variable-length encoding used by
+// ASN.1 for OID arcs and high-tag numbers.
+//
+// n=0 encodes as a single byte 0x00.
+// n=127 encodes as [0x7F].
+// n=128 encodes as [0x81, 0x00].
+// n=256 encodes as [0x82, 0x00]. Wait: 256 = 2*128 + 0 -> [0x82, 0x00]? No.
+// Correct: 256 in base-128: 256 = 2*128 + 0 -> limbs[LSB first]=[0,2] -> [0x82, 0x00].
+// But 0x82=130 which would be high bit set + value 2. Let's verify:
+//   256 / 128 = 2 remainder 0 -> low limb = 0, remaining = 2
+//   2 / 128 = 0 remainder 2 -> limb = 2, remaining = 0
+//   Limbs LSB-first: [0, 2]; reverse to big-endian: [2, 0]
+//   All but last get 0x80 set: [2|0x80, 0] = [0x82, 0x00] ✓
+fn _atag_base128_enc(n: int) -> any
+    let limbs = []
+    let remaining = n
+    let cont = 1
+    while cont == 1
+        let piece = remaining % 128
+        push(limbs, piece)
+        remaining = remaining / 128
+        if remaining == 0
+            cont = 0
+    let count = len(limbs)
+    let out = bytes(0)
+    let i = count - 1
+    while i >= 0
+        let piece = limbs[i]
+        if i > 0
+            out = bytes_append(out, piece + 128)
+        else
+            out = bytes_append(out, piece)
+        i = i - 1
+    out
+
+// asn1_tag_encode: encode an ASN.1 tag into bytes.
+//
+// cls:         0=Universal, 1=Application, 2=Context-specific, 3=Private
+// constructed: 0=primitive, 1=constructed
+// number:      tag number (0..30 = low form; >=31 = high-tag form)
+//
+// Returns bytes representing the encoded tag (1 byte for low form,
+// 2+ bytes for high-tag form).
+fn asn1_tag_encode(cls: int, constructed: int, number: int) -> any
+    let out = bytes(0)
+    if number < 31
+        let b = _atag_low_byte(cls, constructed, number)
+        out = bytes_append(out, b)
+    else
+        let first = _atag_low_byte(cls, constructed, 31)
+        out = bytes_append(out, first)
+        let tail = _atag_base128_enc(number)
+        out = bytes_concat(out, tail)
+    out
+
+// asn1_tag_decode: decode an ASN.1 tag from bytes b starting at position pos.
+//
+// Returns a list: [info_dict, next_pos]
+//   info_dict keys: "class" (int), "constructed" (int), "number" (int)
+//   next_pos: byte index immediately after the tag bytes (first byte of length)
+//
+// On error (truncated input, invalid encoding): returns [{}, -1].
+// Caller MUST check next_pos != -1 before using info_dict.
+fn asn1_tag_decode(b: any, pos: int) -> list
+    let blen = bytes_len(b)
+    let err_info = {}
+    let err_result = [err_info, -1]
+    if pos < 0
+        return err_result
+    if pos >= blen
+        return err_result
+    let first = bytes_get(b, pos)
+    let cls = (first / 64) % 4
+    let cons = (first / 32) % 2
+    let low_bits = first % 32
+    if low_bits < 31
+        let info = {"class": cls, "constructed": cons, "number": low_bits}
+        return [info, pos + 1]
+    // High-tag-number form: read base-128 bytes until one with high bit clear.
+    let number = 0
+    let cur = pos + 1
+    let done = 0
+    while done == 0
+        if cur >= blen
+            return err_result
+        let byte_val = bytes_get(b, cur)
+        let payload = byte_val % 128
+        number = number * 128 + payload
+        cur = cur + 1
+        if byte_val < 128
+            done = 1
+    let info2 = {"class": cls, "constructed": cons, "number": number}
+    [info2, cur]

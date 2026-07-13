@@ -1,0 +1,181 @@
+// ============================================================================
+// NOVA Standard Library — std/data/asn1_octetstring
+// ============================================================================
+// ASN.1 DER OCTET STRING (tag 0x04) encoder and decoder.
+//
+// DER OCTET STRING encoding (X.690 §8.7):
+//   Tag  = 0x04  (universal primitive, class=0, constructed=0, number=4)
+//   Len  = DER-minimal length of the content in bytes
+//   Value: the raw octets, copied verbatim
+//
+// Length encoding uses the DER minimal form (X.690 §8.1.3):
+//   0..127   — short form: one byte equal to the length.
+//   128..255 — long form: 0x81 followed by one byte of length.
+//   256..65535 — long form: 0x82 followed by two big-endian bytes of length.
+//   (DER prohibits the indefinite form and requires the shortest encoding.)
+//
+// PUBLIC API:
+//   asn1_octetstring_encode(data) -> bytes
+//     Encode a bytes value as a complete DER OCTET STRING TLV.
+//     Returns tag(0x04) || DER_length || content bytes.
+//     Empty data (bytes(0)) encodes as [0x04, 0x00] (2 bytes, zero content).
+//
+//   asn1_octetstring_decode(b, pos) -> list
+//     Decode a DER OCTET STRING TLV starting at byte position pos in bytes b.
+//     Returns a 2-element list: [content_bytes, next_pos].
+//       content_bytes = the decoded payload as a bytes value.
+//       next_pos      = position of the first byte AFTER this TLV.
+//     Bounds-checked; returns [bytes(0), pos] on any malformed input:
+//       - wrong tag (not 0x04)
+//       - buffer too short to hold the declared length
+//       - unsupported long-form length indicator (>= 0x83)
+//
+// PRIVATE helpers:
+//   _asn1_oct_encode_len(clen) -> bytes   DER-minimal length bytes only (no tag, no value)
+//   _asn1_oct_decode_len(b, pos, total) -> list  [clen, content_start] or [-1, pos]
+//
+// LEAF module — imports nothing.
+//
+// KAT VECTORS (X.690 verified):
+//   asn1_octetstring_encode(bytes{0x01,0x02,0x03}) == [0x04,0x03,0x01,0x02,0x03]
+//   asn1_octetstring_encode(bytes(0))              == [0x04,0x00]
+//   asn1_octetstring_encode(bytes(200)):
+//     bytes_len == 203, starts with [0x04, 0x81, 0xC8]
+//   asn1_octetstring_decode(asn1_octetstring_encode(data), 0)[0] == data  (round-trip)
+// ============================================================================
+
+// _asn1_oct_encode_len: return the DER-minimal length field bytes for a given
+// content length clen.  Does NOT include the tag byte or any content bytes.
+//
+// DER minimal-length rules:
+//   clen  0..127   -> [clen]               (short form, 1 byte)
+//   clen  128..255 -> [0x81, clen]         (long form, 2 bytes)
+//   clen  256..    -> [0x82, hi, lo]       (long form, 3 bytes)
+fn _asn1_oct_encode_len(clen: int) -> any
+    let out = bytes(0)
+    if clen < 128
+        out = bytes_append(out, clen)
+    else
+        if clen < 256
+            out = bytes_append(out, 129)
+            out = bytes_append(out, clen)
+        else
+            let hi = clen / 256
+            let lo = clen % 256
+            out = bytes_append(out, 130)
+            out = bytes_append(out, hi)
+            out = bytes_append(out, lo)
+    out
+
+// _asn1_oct_decode_len: decode the DER length field starting at pos within b.
+// total = bytes_len(b), used for bounds-checking.
+//
+// Returns [clen, content_start] where:
+//   clen          = declared content length (>= 0)
+//   content_start = index of the first content byte
+//
+// Returns [-1, pos] on any error:
+//   - pos is past end of buffer
+//   - long-form marker but not enough bytes for length octets
+//   - unsupported long-form (0x83 or higher; we support up to 0x82)
+//   - indefinite form (0x80) — forbidden in DER
+fn _asn1_oct_decode_len(b: any, pos: int, total: int) -> list
+    let res = []
+    let ok = 1
+    let clen = 0
+    let cs = pos
+    if pos >= total
+        ok = 0
+    if ok == 1
+        let len_byte = bytes_get(b, pos)
+        if len_byte < 128
+            clen = len_byte
+            cs = pos + 1
+        else
+            if len_byte == 129
+                if pos + 1 >= total
+                    ok = 0
+                else
+                    clen = bytes_get(b, pos + 1)
+                    cs = pos + 2
+            else
+                if len_byte == 130
+                    if pos + 2 >= total
+                        ok = 0
+                    else
+                        let hi = bytes_get(b, pos + 1)
+                        let lo = bytes_get(b, pos + 2)
+                        clen = hi * 256 + lo
+                        cs = pos + 3
+                else
+                    ok = 0
+    if ok == 0
+        push(res, -1)
+        push(res, pos)
+    else
+        push(res, clen)
+        push(res, cs)
+    res
+
+// asn1_octetstring_encode: DER-encode a bytes value as an OCTET STRING TLV.
+//
+// data — a bytes value of any length (including empty).
+//
+// Returns tag byte (0x04), DER-minimal length field, then the content bytes.
+// The returned bytes value is the complete TLV ready for embedding in a SEQUENCE
+// or writing to a DER stream.
+fn asn1_octetstring_encode(data: any) -> any
+    let clen = bytes_len(data)
+    let out = bytes(0)
+    out = bytes_append(out, 4)
+    let lbytes = _asn1_oct_encode_len(clen)
+    out = bytes_concat(out, lbytes)
+    out = bytes_concat(out, data)
+    out
+
+// asn1_octetstring_decode: decode a DER OCTET STRING TLV at position pos in b.
+//
+// b   — bytes buffer containing the TLV (may have more data after this TLV)
+// pos — byte offset of the 0x04 tag byte
+//
+// Validates:
+//   - b[pos] == 0x04 (OCTET STRING tag)
+//   - DER length field is parseable (short or 1-byte/2-byte long form)
+//   - declared content fits within the buffer
+//
+// Returns [content_bytes, next_pos] where:
+//   content_bytes = bytes_slice(b, content_start, content_end)
+//   next_pos      = content_end (first byte after this TLV)
+//
+// On any malformed input returns [bytes(0), pos] (safe, caller can detect stall).
+fn asn1_octetstring_decode(b: any, pos: int) -> list
+    let total = bytes_len(b)
+    let fail_content = bytes(0)
+    let result = []
+    let ok = 1
+    if pos >= total
+        ok = 0
+    if ok == 1
+        let tag = bytes_get(b, pos)
+        if tag != 4
+            ok = 0
+    if ok == 0
+        push(result, fail_content)
+        push(result, pos)
+    else
+        let len_res = _asn1_oct_decode_len(b, pos + 1, total)
+        let clen = len_res[0]
+        let cs = len_res[1]
+        if clen < 0
+            push(result, fail_content)
+            push(result, pos)
+        else
+            let content_end = cs + clen
+            if content_end > total
+                push(result, fail_content)
+                push(result, pos)
+            else
+                let content = bytes_slice(b, cs, content_end)
+                push(result, content)
+                push(result, content_end)
+    result

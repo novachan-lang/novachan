@@ -1,0 +1,240 @@
+// ============================================================================
+// NOVA Standard Library — std/data/asn1_bitstring
+// ============================================================================
+// ASN.1 DER BIT STRING (tag 0x03) encoder and decoder.
+//
+// DER BIT STRING encoding (X.690 §8.6):
+//   Tag  = 0x03  (universal primitive, class=0, constructed=0, number=3)
+//   Len  = DER-encoded length of the content (1 + number of bit bytes)
+//   Content: first byte = number of unused bits in the last byte (0..7),
+//            then the bit bytes in MSB-first order.
+//
+// DER requires unused bits in the last byte to be zero.
+// Empty bit string: content = single byte 0x00 (no bit bytes, zero unused).
+//
+// PUBLIC API:
+//   asn1_bitstring_encode(bit_bytes, unused) -> bytes
+//     Build full DER TLV for a BIT STRING.
+//     bit_bytes: the raw bit payload (a bytes value).
+//     unused:    number of unused bits in the last byte (0..7).
+//     Returns:  tag(0x03) || DER-length || unused_byte || bit_bytes
+//
+//   asn1_bitstring_decode(b, pos) -> list
+//     Decode a DER BIT STRING TLV starting at byte position pos in b.
+//     Returns a 2-element list:
+//       [0] = dict {"unused": <int>, "bytes": <bytes>}
+//       [1] = next_pos (position after the TLV)
+//     On malformed input: returns [{"unused":0,"bytes":bytes(0)}, pos]
+//     (safe stall; caller detects by next_pos == pos).
+//
+//   asn1_bitstring_from_bits(bits) -> bytes
+//     Convert a list of 0/1 integers (MSB-first) into a complete DER BIT
+//     STRING TLV.  Packs bits into bytes (MSB-first per byte), computes the
+//     number of unused bits in the last byte, sets those trailing bits to
+//     zero (DER requirement), then calls asn1_bitstring_encode.
+//     bits = [] -> same as asn1_bitstring_encode(bytes(0), 0).
+//
+// PRIVATE helpers:
+//   _asn1_bs_tlv(tag, content) -> bytes   DER TLV builder (short+long form)
+//   _asn1_bs_decode_length(b, pos) -> int decoded content length (-1 on error)
+//   _asn1_bs_header_bytes(clen) -> int    number of header bytes (tag+len)
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing.
+//   - Single-exit style throughout (avoids NOVA return-null mistag).
+//   - All byte reads are bounds-checked before access.
+//   - DER: unused bits in last byte MUST be zero; enforced in from_bits.
+//   - Only bytes API used for binary data; never string+chr.
+//
+// KAT VECTORS (RFC / X.690 verified):
+//   asn1_bitstring_encode(bytes{0x6E,0x5D,0xC0}, 6)
+//       == [0x03,0x04,0x06,0x6E,0x5D,0xC0]        (RFC example, 18 bits)
+//   asn1_bitstring_encode(bytes(0), 0)
+//       == [0x03,0x01,0x00]                        (empty bit string)
+//   asn1_bitstring_from_bits([1,0,1])
+//       -> unused=5, packed=0xA0
+//       == [0x03,0x02,0x05,0xA0]
+//   Round-trip: decode(encode(x,u)) recovers x and u.
+// ============================================================================
+
+// _asn1_bs_tlv: wrap content bytes with tag 0x03 and DER-encoded length.
+// DER minimal length form (X.690 §8.1.3):
+//   0..127   -> short form: 1 byte
+//   128..255 -> long form: 0x81 then 1 byte
+//   256..    -> long form: 0x82 then 2 bytes (big-endian)
+fn _asn1_bs_tlv(content) -> any
+    let clen = bytes_len(content)
+    let out = bytes(0)
+    out = bytes_append(out, 3)
+    if clen < 128
+        out = bytes_append(out, clen)
+    else
+        if clen < 256
+            out = bytes_append(out, 129)
+            out = bytes_append(out, clen)
+        else
+            let hi = clen / 256
+            let lo = clen % 256
+            out = bytes_append(out, 130)
+            out = bytes_append(out, hi)
+            out = bytes_append(out, lo)
+    out = bytes_concat(out, content)
+    out
+
+// _asn1_bs_decode_length: decode DER content-length field starting at pos+1.
+// Returns the decoded length, or -1 if the buffer is too short.
+// Sets the number of header bytes consumed as a side-channel via the encoding:
+//   short form: header = 2 bytes (tag + 1 len byte)
+//   0x81 form:  header = 3 bytes
+//   0x82 form:  header = 4 bytes
+// This helper returns only the length; the caller uses _asn1_bs_header_bytes.
+fn _asn1_bs_decode_length(b, pos) -> int
+    let blen = bytes_len(b)
+    let result = -1
+    if blen > pos + 1
+        let lb = bytes_get(b, pos + 1)
+        if lb < 128
+            result = lb
+        else
+            if lb == 129
+                if blen > pos + 2
+                    result = bytes_get(b, pos + 2)
+            else
+                if lb == 130
+                    if blen > pos + 3
+                        let hi = bytes_get(b, pos + 2)
+                        let lo = bytes_get(b, pos + 3)
+                        result = hi * 256 + lo
+    result
+
+// _asn1_bs_header_bytes: return the number of bytes used by tag+length fields.
+// Mirrors the encoding logic in _asn1_bs_tlv:
+//   content len 0..127  -> 2 header bytes (tag + 1-byte short length)
+//   content len 128..255 -> 3 header bytes (tag + 0x81 + 1-byte length)
+//   content len 256+     -> 4 header bytes (tag + 0x82 + 2-byte length)
+fn _asn1_bs_header_bytes(clen) -> int
+    let result = 2
+    if clen >= 128
+        if clen < 256
+            result = 3
+        else
+            result = 4
+    result
+
+// asn1_bitstring_encode: build a complete DER BIT STRING TLV.
+//
+// bit_bytes: bytes value containing the bit payload.
+// unused:    integer 0..7 — number of unused bits in the last byte.
+//            For an empty bit string (bytes_len(bit_bytes)==0), unused must be 0.
+//
+// Content layout: [unused_byte] || bit_bytes
+// Returns full TLV: tag(0x03) || DER-length || unused_byte || bit_bytes
+fn asn1_bitstring_encode(bit_bytes, unused) -> any
+    let content = bytes(0)
+    content = bytes_append(content, unused)
+    content = bytes_concat(content, bit_bytes)
+    _asn1_bs_tlv(content)
+
+// asn1_bitstring_decode: parse a DER BIT STRING TLV at position pos in b.
+//
+// Validates:
+//   - tag byte == 0x03
+//   - length field is well-formed and within buffer bounds
+//   - content length >= 1 (must have at least the unused-bits byte)
+//   - unused bits byte is in range 0..7
+//
+// Returns a 2-element list:
+//   [0] = dict with keys "unused" (int) and "bytes" (bytes of bit payload)
+//   [1] = next_pos = pos + header_bytes + content_length
+//
+// On any error: returns [{"unused":0,"bytes":bytes(0)}, pos] (safe stall).
+fn asn1_bitstring_decode(b, pos) -> list
+    let result = []
+    let blen = bytes_len(b)
+    let ok = 1
+    let clen = 0
+    let hdr = 2
+    if blen <= pos
+        ok = 0
+    if ok == 1
+        if bytes_get(b, pos) != 3
+            ok = 0
+    if ok == 1
+        let dlen = _asn1_bs_decode_length(b, pos)
+        if dlen < 0
+            ok = 0
+        else
+            clen = dlen
+            hdr = _asn1_bs_header_bytes(clen)
+    if ok == 1
+        if clen < 1
+            ok = 0
+    if ok == 1
+        if blen < pos + hdr + clen
+            ok = 0
+    if ok == 1
+        let unused_val = bytes_get(b, pos + hdr)
+        if unused_val > 7
+            ok = 0
+        else
+            let payload_start = pos + hdr + 1
+            let payload_len = clen - 1
+            let payload = bytes_slice(b, payload_start, payload_start + payload_len)
+            let info = {}
+            info["unused"] = unused_val
+            info["bytes"] = payload
+            push(result, info)
+            push(result, pos + hdr + clen)
+    if ok == 0
+        let info2 = {}
+        info2["unused"] = 0
+        info2["bytes"] = bytes(0)
+        push(result, info2)
+        push(result, pos)
+    result
+
+// asn1_bitstring_from_bits: encode a list of 0/1 values as a DER BIT STRING.
+//
+// bits: list of integers 0 or 1, MSB-first order.
+//       Example: [1,0,1] represents the 3-bit value 101b.
+//
+// Packing (MSB-first per byte):
+//   bit index 0 -> byte 0, bit 7 (0x80)
+//   bit index 1 -> byte 0, bit 6 (0x40)
+//   ...
+//   bit index 7 -> byte 0, bit 0 (0x01)
+//   bit index 8 -> byte 1, bit 7 (0x80)  etc.
+//
+// Unused bits: if (len(bits) % 8) != 0, the last byte has (8 - len%8) unused
+// bits (those bit positions are set to 0, satisfying DER §8.6.2.2).
+//
+// Returns the complete DER TLV bytes.
+fn asn1_bitstring_from_bits(bits) -> any
+    let n = len(bits)
+    let result_bytes = bytes(0)
+    if n == 0
+        result_bytes = asn1_bitstring_encode(bytes(0), 0)
+    else
+        let num_bytes = (n + 7) / 8
+        let unused = 0
+        let rem = n % 8
+        if rem != 0
+            unused = 8 - rem
+        let packed = bytes(num_bytes)
+        let i = 0
+        while i < n
+            let byte_idx = i / 8
+            let bit_pos = 7 - (i % 8)
+            let shift_val = bit_pos
+            let bit_val = bits[i]
+            let cur = bytes_get(packed, byte_idx)
+            if bit_val != 0
+                let added = 1
+                let s = 0
+                while s < shift_val
+                    added = added * 2
+                    s = s + 1
+                bytes_set(packed, byte_idx, cur + added)
+            i = i + 1
+        result_bytes = asn1_bitstring_encode(packed, unused)
+    result_bytes

@@ -1,0 +1,253 @@
+// ============================================================================
+// NOVA Standard Library — std/data/asn1_time
+// ============================================================================
+// ASN.1 DER UTCTime (tag 0x17) and GeneralizedTime (tag 0x18) encoder/decoder.
+//
+// UTCTime:        tag=0x17, content = "YYMMDDHHMMSSZ"   (13 ASCII bytes)
+// GeneralizedTime: tag=0x18, content = "YYYYMMDDHHMMSSZ" (15 ASCII bytes)
+//
+// DER requires the "Z" suffix (UTC); no fractional seconds; no local offsets.
+//
+// Year encoding:
+//   UTCTime: 2-digit year YY.  The 50-cutoff rule (RFC 5280 §4.1.2.5.1):
+//     00-49 -> 2000-2049;  50-99 -> 1950-1999.
+//   GeneralizedTime: 4-digit year YYYY; no ambiguity.
+//
+// PUBLIC API:
+//   asn1_utctime_encode(y, mo, d, h, mi, s) -> bytes
+//     DER TLV for UTCTime.  y is the full year (e.g. 2024).
+//     Uses only the last 2 digits (y % 100).
+//     Returns [0x17, 0x0D, <13 ASCII bytes>].
+//
+//   asn1_gentime_encode(y, mo, d, h, mi, s) -> bytes
+//     DER TLV for GeneralizedTime.  y is the full 4-digit year.
+//     Returns [0x18, 0x0F, <15 ASCII bytes>].
+//
+//   asn1_time_decode(b, pos) -> list
+//     Decode one UTCTime or GeneralizedTime TLV beginning at byte offset pos.
+//     Auto-detects tag: 0x17 -> UTCTime; 0x18 -> GeneralizedTime.
+//     Returns [dict, next_pos] where dict has keys:
+//       "tag"   -> int (0x17 or 0x18)
+//       "year"  -> int (full 4-digit, 50-cutoff applied for UTCTime)
+//       "month" -> int 1..12
+//       "day"   -> int 1..31
+//       "hour"  -> int 0..23
+//       "min"   -> int 0..59
+//       "sec"   -> int 0..59
+//     On malformed input returns [null, pos] (safe stall).
+//
+// PRIVATE helpers:
+//   _asn1t_d2(n)         -> append 2 ASCII digit bytes to bytes buffer (returned)
+//   _asn1t_d4(n)         -> append 4 ASCII digit bytes to bytes buffer (returned)
+//   _asn1t_parse2(b, p)  -> int: parse 2 ASCII digits from bytes b at offset p
+//   _asn1t_parse4(b, p)  -> int: parse 4 ASCII digits from bytes b at offset p
+//   _asn1t_digit(b, p)   -> int: single ASCII digit value at offset p (bounds-checked)
+//
+// DESIGN NOTES:
+//   - Leaf module — imports nothing.
+//   - Every byte read is bounds-checked; malformed input returns safe sentinel.
+//   - Single-exit style (let result / reassign) to avoid return-null mistag.
+//   - ASCII digit '0'=48, '9'=57, 'Z'=90.
+//   - NOVA >> is arithmetic shift; & is bitwise AND; / is integer division.
+// ============================================================================
+
+// _asn1t_digit: return the value of ASCII digit byte at position p in b.
+// Bounds-checked; returns -1 if out of range or not a digit.
+fn _asn1t_digit(b: any, p: int) -> int
+    let result = -1
+    if p >= 0
+        if p < bytes_len(b)
+            let bv = bytes_get(b, p)
+            if bv >= 48
+                if bv <= 57
+                    result = bv - 48
+    result
+
+// _asn1t_parse2: parse two ASCII digit bytes from b at offset p.
+// Returns the integer value (0..99) or -1 if any digit is invalid.
+fn _asn1t_parse2(b: any, p: int) -> int
+    let d0 = _asn1t_digit(b, p)
+    let d1 = _asn1t_digit(b, p + 1)
+    let result = -1
+    if d0 >= 0
+        if d1 >= 0
+            result = d0 * 10 + d1
+    result
+
+// _asn1t_parse4: parse four ASCII digit bytes from b at offset p.
+// Returns the integer value (0..9999) or -1 if any digit is invalid.
+fn _asn1t_parse4(b: any, p: int) -> int
+    let d0 = _asn1t_digit(b, p)
+    let d1 = _asn1t_digit(b, p + 1)
+    let d2 = _asn1t_digit(b, p + 2)
+    let d3 = _asn1t_digit(b, p + 3)
+    let result = -1
+    if d0 >= 0
+        if d1 >= 0
+            if d2 >= 0
+                if d3 >= 0
+                    result = d0 * 1000 + d1 * 100 + d2 * 10 + d3
+    result
+
+// _asn1t_app2: append a 2-digit zero-padded decimal field for value n (0..99)
+// as two ASCII bytes to bytes buffer out.  Returns the new bytes value.
+fn _asn1t_app2(out: any, n: int) -> any
+    let hi = (n / 10) & 0xFF
+    let lo = (n % 10) & 0xFF
+    let o2 = bytes_append(out, hi + 48)
+    o2 = bytes_append(o2, lo + 48)
+    o2
+
+// _asn1t_app4: append a 4-digit zero-padded decimal field for value n (0..9999)
+// as four ASCII bytes to bytes buffer out.  Returns the new bytes value.
+fn _asn1t_app4(out: any, n: int) -> any
+    let d0 = (n / 1000) & 0xFF
+    let d1 = ((n / 100) % 10) & 0xFF
+    let d2 = ((n / 10) % 10) & 0xFF
+    let d3 = (n % 10) & 0xFF
+    let o2 = bytes_append(out, d0 + 48)
+    o2 = bytes_append(o2, d1 + 48)
+    o2 = bytes_append(o2, d2 + 48)
+    o2 = bytes_append(o2, d3 + 48)
+    o2
+
+// _asn1t_build_content_utc: build the 13-byte UTCTime content string "YYMMDDHHMMSSZ"
+// using the last 2 digits of y (y % 100).
+fn _asn1t_build_content_utc(y: int, mo: int, d: int, h: int, mi: int, s: int) -> any
+    let yy = y % 100
+    let out = bytes(0)
+    out = _asn1t_app2(out, yy)
+    out = _asn1t_app2(out, mo)
+    out = _asn1t_app2(out, d)
+    out = _asn1t_app2(out, h)
+    out = _asn1t_app2(out, mi)
+    out = _asn1t_app2(out, s)
+    out = bytes_append(out, 90)
+    out
+
+// _asn1t_build_content_gen: build the 15-byte GeneralizedTime content string
+// "YYYYMMDDHHMMSSZ".
+fn _asn1t_build_content_gen(y: int, mo: int, d: int, h: int, mi: int, s: int) -> any
+    let out = bytes(0)
+    out = _asn1t_app4(out, y)
+    out = _asn1t_app2(out, mo)
+    out = _asn1t_app2(out, d)
+    out = _asn1t_app2(out, h)
+    out = _asn1t_app2(out, mi)
+    out = _asn1t_app2(out, s)
+    out = bytes_append(out, 90)
+    out
+
+// asn1_utctime_encode: DER-encode a UTCTime TLV.
+// y = full year (e.g. 2024); only the last 2 digits are encoded.
+// Returns [0x17, 0x0D, ...13 ASCII bytes...] (15 bytes total).
+fn asn1_utctime_encode(y: int, mo: int, d: int, h: int, mi: int, s: int) -> any
+    let content = _asn1t_build_content_utc(y, mo, d, h, mi, s)
+    let clen = bytes_len(content)
+    let out = bytes(0)
+    out = bytes_append(out, 23)
+    out = bytes_append(out, clen)
+    out = bytes_concat(out, content)
+    out
+
+// asn1_gentime_encode: DER-encode a GeneralizedTime TLV.
+// Returns [0x18, 0x0F, ...15 ASCII bytes...] (17 bytes total).
+fn asn1_gentime_encode(y: int, mo: int, d: int, h: int, mi: int, s: int) -> any
+    let content = _asn1t_build_content_gen(y, mo, d, h, mi, s)
+    let clen = bytes_len(content)
+    let out = bytes(0)
+    out = bytes_append(out, 24)
+    out = bytes_append(out, clen)
+    out = bytes_concat(out, content)
+    out
+
+// asn1_time_decode: decode one UTCTime or GeneralizedTime TLV from bytes b at pos.
+// Returns [result_dict, next_pos] where result_dict has keys:
+//   "tag", "year", "month", "day", "hour", "min", "sec"
+// On any error returns [null, pos].
+//
+// UTCTime  (tag=0x17): content = "YYMMDDHHMMSSZ" (13 bytes); 50-cutoff on year.
+// GenTime  (tag=0x18): content = "YYYYMMDDHHMMSSZ" (15 bytes).
+fn asn1_time_decode(b: any, pos: int) -> any
+    let blen = bytes_len(b)
+    let bad = [null, pos]
+    let result = bad
+    if pos >= 0
+        if pos < blen
+            let tag = bytes_get(b, pos)
+            let is_utc = 0
+            let is_gen = 0
+            if tag == 23
+                is_utc = 1
+            if tag == 24
+                is_gen = 1
+            if is_utc == 1
+                // expect length byte next
+                if pos + 1 < blen
+                    let clen = bytes_get(b, pos + 1)
+                    // UTCTime content must be exactly 13 bytes
+                    if clen == 13
+                        let cp = pos + 2
+                        // cp+13 must be within buffer
+                        if cp + 13 <= blen
+                            // check terminal 'Z' (ASCII 90)
+                            let zb = bytes_get(b, cp + 12)
+                            if zb == 90
+                                let yy = _asn1t_parse2(b, cp)
+                                let mo2 = _asn1t_parse2(b, cp + 2)
+                                let dd = _asn1t_parse2(b, cp + 4)
+                                let hh = _asn1t_parse2(b, cp + 6)
+                                let mm = _asn1t_parse2(b, cp + 8)
+                                let ss = _asn1t_parse2(b, cp + 10)
+                                if yy >= 0
+                                    if mo2 >= 0
+                                        if dd >= 0
+                                            if hh >= 0
+                                                if mm >= 0
+                                                    if ss >= 0
+                                                        // apply 50-cutoff rule
+                                                        let fullyear = 0
+                                                        if yy < 50
+                                                            fullyear = 2000 + yy
+                                                        else
+                                                            fullyear = 1950 + yy - 50
+                                                        let d2 = {}
+                                                        d2["tag"] = tag
+                                                        d2["year"] = fullyear
+                                                        d2["month"] = mo2
+                                                        d2["day"] = dd
+                                                        d2["hour"] = hh
+                                                        d2["min"] = mm
+                                                        d2["sec"] = ss
+                                                        result = [d2, pos + 2 + 13]
+            if is_gen == 1
+                if pos + 1 < blen
+                    let clen2 = bytes_get(b, pos + 1)
+                    // GeneralizedTime content must be exactly 15 bytes
+                    if clen2 == 15
+                        let cp2 = pos + 2
+                        if cp2 + 15 <= blen
+                            let zb2 = bytes_get(b, cp2 + 14)
+                            if zb2 == 90
+                                let yyyy = _asn1t_parse4(b, cp2)
+                                let mo3 = _asn1t_parse2(b, cp2 + 4)
+                                let dd2 = _asn1t_parse2(b, cp2 + 6)
+                                let hh2 = _asn1t_parse2(b, cp2 + 8)
+                                let mm2 = _asn1t_parse2(b, cp2 + 10)
+                                let ss2 = _asn1t_parse2(b, cp2 + 12)
+                                if yyyy >= 0
+                                    if mo3 >= 0
+                                        if dd2 >= 0
+                                            if hh2 >= 0
+                                                if mm2 >= 0
+                                                    if ss2 >= 0
+                                                        let d3 = {}
+                                                        d3["tag"] = tag
+                                                        d3["year"] = yyyy
+                                                        d3["month"] = mo3
+                                                        d3["day"] = dd2
+                                                        d3["hour"] = hh2
+                                                        d3["min"] = mm2
+                                                        d3["sec"] = ss2
+                                                        result = [d3, pos + 2 + 15]
+    result
