@@ -1,0 +1,586 @@
+// ============================================================================
+// NOVA Standard Library — std/automata/regex
+// ============================================================================
+// Self-contained recursive-backtracking regular expression engine.
+//
+// Supported syntax:
+//   .         any single character
+//   *         zero or more of the preceding atom (greedy)
+//   +         one or more of the preceding atom (greedy)
+//   ?         zero or one of the preceding atom (greedy)
+//   |         alternation  (lower precedence than concatenation)
+//   (...)     grouping
+//   [...]     character class; [a-z] ranges; [^...] negation
+//   ^         anchor at start of string (only at pattern start)
+//   $         anchor at end of string   (only at pattern end)
+//   \x        escape literal x
+//
+// Public API:
+//   rgx_match(pattern, text) -> int   1 if whole text matches, else 0
+//   rgx_search(pattern, text) -> int  1 if match found anywhere, else 0
+//   rgx_test(pattern, text) -> int    alias for rgx_search
+//
+// Architecture: direct recursive backtracking on the pattern string.
+// The pattern bytes serve as the "NFA" — no parse tree is built.
+// All helpers are prefixed _rgx_ to avoid collisions.
+//
+// NOVA constraints:
+//   - No && / ||; uses 'and' / 'or' or done-flag idiom.
+//   - while body must start with a let (leading 'let _nv = 0').
+//   - slice(s, i, j) for single-char extraction (string-only).
+//   - Recursion is used for group/alternation (NOVA allows it).
+//   - No multi-line list/dict literals.
+//   - All locals must be used (no dead variables).
+// ============================================================================
+
+// ── char helpers ─────────────────────────────────────────────────────────────
+
+// _rgx_ch: one-character string at position i in s.
+fn _rgx_ch(s, i) -> string
+    slice(s, i, i + 1)
+
+// ── character class ───────────────────────────────────────────────────────────
+
+// _rgx_in_class: returns 1 if ch is accepted by the char class at pat[cls].
+// Supports [abc], [a-z], [^...], escaped chars inside class.
+fn _rgx_in_class(pat, cls, ch) -> int
+    let plen = len(pat)
+    let i = cls + 1
+    let negate = 0
+    if i < plen
+        let fc = _rgx_ch(pat, i)
+        if fc == "^"
+            negate = 1
+            i = i + 1
+    let matched = 0
+    let done = 0
+    while done == 0
+        let _nv = 0
+        if i >= plen
+            done = 1
+        else
+            let c = _rgx_ch(pat, i)
+            if c == "]"
+                done = 1
+            else
+                let is_range = 0
+                if i + 2 < plen
+                    let dash = _rgx_ch(pat, i + 1)
+                    let nc2  = _rgx_ch(pat, i + 2)
+                    if dash == "-"
+                        if nc2 != "]"
+                            is_range = 1
+                if is_range == 1
+                    let lo = ord(c)
+                    let hi = ord(_rgx_ch(pat, i + 2))
+                    let cv = ord(ch)
+                    if cv >= lo
+                        if cv <= hi
+                            matched = 1
+                    i = i + 3
+                else
+                    if c == "\\"
+                        if i + 1 < plen
+                            let ec = _rgx_ch(pat, i + 1)
+                            if ec == ch
+                                matched = 1
+                            i = i + 2
+                        else
+                            i = i + 1
+                    else
+                        if c == ch
+                            matched = 1
+                        i = i + 1
+    if negate == 1
+        if matched == 1
+            return 0
+        return 1
+    matched
+
+// ── skip helpers ──────────────────────────────────────────────────────────────
+
+// _rgx_skip_cls: index just past ']' whose '[' is at pat[i].
+fn _rgx_skip_cls(pat, i) -> int
+    let plen = len(pat)
+    let j = i + 1
+    if j < plen
+        let fc = _rgx_ch(pat, j)
+        if fc == "^"
+            j = j + 1
+    let done = 0
+    while done == 0
+        let _nv = 0
+        if j >= plen
+            done = 1
+        else
+            let c = _rgx_ch(pat, j)
+            if c == "]"
+                j = j + 1
+                done = 1
+            else
+                if c == "\\"
+                    j = j + 2
+                else
+                    j = j + 1
+    j
+
+// _rgx_skip_grp: index just past ')' whose '(' is at pat[i]. Handles nesting.
+fn _rgx_skip_grp(pat, i) -> int
+    let plen = len(pat)
+    let j = i + 1
+    let depth = 1
+    let done = 0
+    while done == 0
+        let _nv = 0
+        if j >= plen
+            done = 1
+        else
+            let c = _rgx_ch(pat, j)
+            if c == "\\"
+                j = j + 2
+            else
+                if c == "("
+                    depth = depth + 1
+                    j = j + 1
+                else
+                    if c == ")"
+                        depth = depth - 1
+                        j = j + 1
+                        if depth == 0
+                            done = 1
+                    else
+                        if c == "["
+                            j = _rgx_skip_cls(pat, j)
+                        else
+                            j = j + 1
+    j
+
+// _rgx_atom_end: index just past the atom at pat[pi].
+fn _rgx_atom_end(pat, pi) -> int
+    let plen = len(pat)
+    if pi >= plen
+        return pi
+    let c = _rgx_ch(pat, pi)
+    if c == "("
+        return _rgx_skip_grp(pat, pi)
+    if c == "["
+        return _rgx_skip_cls(pat, pi)
+    if c == "\\"
+        return pi + 2
+    pi + 1
+
+// ── atom matching ─────────────────────────────────────────────────────────────
+
+// _rgx_atom_ok: 1 if atom at pat[pi] matches text[ti]. Groups not handled here.
+// Uses len(text) (not the required-end tlen) to bounds-check ti.
+fn _rgx_atom_ok(pat, pi, text, ti) -> int
+    let plen = len(pat)
+    let tlen = len(text)
+    if pi >= plen
+        return 0
+    if ti >= tlen
+        return 0
+    let c  = _rgx_ch(pat, pi)
+    let tc = _rgx_ch(text, ti)
+    if c == "."
+        return 1
+    if c == "["
+        return _rgx_in_class(pat, pi, tc)
+    if c == "\\"
+        if pi + 1 < plen
+            let ec = _rgx_ch(pat, pi + 1)
+            if ec == tc
+                return 1
+        return 0
+    if c == tc
+        return 1
+    0
+
+// ── core recursive matcher ────────────────────────────────────────────────────
+//
+// _rgx_here(pat, pi, pe, text, ti, tlen) -> int
+//   Match pat[pi..pe) against text[ti..tlen).
+//   tlen is the required end position: succeeds only when pattern exhausted
+//   AND ti == tlen.  pe is the exclusive end of the current pattern segment.
+//   Returns 1 on success, 0 on failure.
+//
+// _rgx_alt(pat, pi, pe, text, ti, tlen) -> int
+//   Handle alternation '|' at the top level of pat[pi..pe).
+//   Tries each '|'-separated branch; delegates to _rgx_here for each.
+//
+// Mutually recursive — all functions in a NOVA file are mutually visible.
+
+fn _rgx_alt(pat, pi, pe, text, ti, tlen) -> int
+    // Find first '|' at depth 0 in pat[pi..pe)
+    let alt = -1
+    let i   = pi
+    let dep = 0
+    let done = 0
+    while done == 0
+        let _nv = 0
+        if i >= pe
+            done = 1
+        else
+            let c = _rgx_ch(pat, i)
+            if c == "\\"
+                i = i + 2
+            else
+                if c == "("
+                    dep = dep + 1
+                    i = i + 1
+                else
+                    if c == ")"
+                        dep = dep - 1
+                        i = i + 1
+                    else
+                        if c == "["
+                            i = _rgx_skip_cls(pat, i)
+                        else
+                            if c == "|"
+                                if dep == 0
+                                    alt = i
+                                    done = 1
+                                else
+                                    i = i + 1
+                            else
+                                i = i + 1
+    if alt < 0
+        return _rgx_here(pat, pi, pe, text, ti, tlen)
+    // Try left branch
+    let l = _rgx_here(pat, pi, alt, text, ti, tlen)
+    if l == 1
+        return 1
+    // Try right branch (recurse for multiple '|')
+    _rgx_alt(pat, alt + 1, pe, text, ti, tlen)
+
+fn _rgx_here(pat, pi, pe, text, ti, tlen) -> int
+    // Base case: pattern segment exhausted; must be at required end
+    if pi >= pe
+        if ti == tlen
+            return 1
+        return 0
+    let c = _rgx_ch(pat, pi)
+    // '$' anchor: text must be at required end
+    if c == "$"
+        if ti == tlen
+            return _rgx_here(pat, pi + 1, pe, text, ti, tlen)
+        return 0
+    // '^' inside segment: no-op (anchoring handled by the caller)
+    if c == "^"
+        return _rgx_here(pat, pi + 1, pe, text, ti, tlen)
+    // Compute atom boundary and check for quantifier
+    let ae = _rgx_atom_end(pat, pi)
+    let qv = 0    // 0=none 1=* 2=+ 3=?
+    if ae < pe
+        let qc = _rgx_ch(pat, ae)
+        if qc == "*"
+            qv = 1
+        else
+            if qc == "+"
+                qv = 2
+            else
+                if qc == "?"
+                    qv = 3
+    let aq = ae
+    if qv != 0
+        aq = ae + 1
+    // ── group atom '(' ────────────────────────────────────────────────────────
+    if c == "("
+        let gpe = ae - 1    // index of ')', inner content = pat[pi+1 .. ae-1)
+        let gpi = pi + 1
+        if qv == 0
+            return _rgx_grp_none(pat, gpi, gpe, aq, pe, text, ti, tlen)
+        if qv == 3
+            // '?': try one then zero
+            let one = _rgx_grp_none(pat, gpi, gpe, aq, pe, text, ti, tlen)
+            if one == 1
+                return 1
+            return _rgx_here(pat, aq, pe, text, ti, tlen)
+        if qv == 1
+            // '*': zero or more (greedy)
+            return _rgx_grp_star(pat, gpi, gpe, aq, pe, text, ti, tlen)
+        if qv == 2
+            // '+': one or more
+            return _rgx_grp_plus(pat, gpi, gpe, aq, pe, text, ti, tlen)
+        return 0
+    // ── non-group atom (literal, '.', '[...]', '\x') ──────────────────────────
+    if qv == 0
+        let am = _rgx_atom_ok(pat, pi, text, ti)
+        if am == 0
+            return 0
+        return _rgx_here(pat, ae, pe, text, ti + 1, tlen)
+    if qv == 3
+        // '?': try one then zero
+        let am2 = _rgx_atom_ok(pat, pi, text, ti)
+        if am2 == 1
+            let ok2 = _rgx_here(pat, aq, pe, text, ti + 1, tlen)
+            if ok2 == 1
+                return 1
+        return _rgx_here(pat, aq, pe, text, ti, tlen)
+    if qv == 1
+        // '*': zero or more
+        return _rgx_atom_star(pat, pi, aq, pe, text, ti, tlen)
+    if qv == 2
+        // '+': one or more — must match at least one
+        let am3 = _rgx_atom_ok(pat, pi, text, ti)
+        if am3 == 0
+            return 0
+        return _rgx_atom_star(pat, pi, aq, pe, text, ti + 1, tlen)
+    0
+
+// ── group matching helpers ────────────────────────────────────────────────────
+
+// _rgx_grp_none: group with no quantifier.
+// The group pat[gpi..gpe) must match some sub-range text[ti..tj);
+// the rest of the pattern pat[aq..pe) must match text[tj..tlen).
+// We enumerate all valid tj values (shortest first, stops at first success
+// because leftmost match is the natural semantic; but we don't need greedy
+// for ungrouped so this is fine for correctness).
+fn _rgx_grp_none(pat, gpi, gpe, aq, pe, text, ti, tlen) -> int
+    let tj = ti
+    let result = 0
+    let done = 0
+    while done == 0
+        let _nv = 0
+        if tj > tlen
+            done = 1
+        else
+            let gok = _rgx_alt(pat, gpi, gpe, text, ti, tj)
+            if gok == 1
+                let rok = _rgx_here(pat, aq, pe, text, tj, tlen)
+                if rok == 1
+                    result = 1
+                    done = 1
+            if done == 0
+                tj = tj + 1
+    result
+
+// _rgx_grp_star: group with '*' (greedy, zero or more).
+// Greedy approach: collect all text positions reachable by repeating the group
+// (we track the MAXIMUM advance at each step), then try from longest down.
+//
+// To avoid the "minimum-advance" trap, we use a different strategy:
+// recursively try consuming one group-match (all possible lengths, longest
+// first) followed by star of the rest.  Since NOVA allows recursion this
+// is expressed as _rgx_grp_star_from.
+//
+// _rgx_grp_star_from(gpi, gpe, aq, pe, text, ti, tlen):
+//   Tries: for each valid group-match length L at ti (from longest to shortest)
+//     if grp_star_from(ti+L) succeeds: return 1
+//   Then tries: rest-of-pattern from ti (zero repetitions).
+fn _rgx_grp_star(pat, gpi, gpe, aq, pe, text, ti, tlen) -> int
+    // Collect all lengths the group can match from ti (0..tlen-ti)
+    let lengths = []
+    let L = tlen - ti
+    let collecting = 1
+    while collecting == 1
+        let _nv = 0
+        if L < 0
+            collecting = 0
+        else
+            let ok = _rgx_alt(pat, gpi, gpe, text, ti, ti + L)
+            if ok == 1
+                lengths.push(L)
+            L = L - 1
+    // Try each valid length (collected longest-first because we iterated down)
+    // Then try zero (rest of pattern from ti)
+    let n    = len(lengths)
+    let idx  = 0
+    let result = 0
+    let done = 0
+    while done == 0
+        let _nv = 0
+        if idx >= n
+            done = 1
+        else
+            let ln = lengths[idx]
+            if ln > 0
+                // one more group repetition, then star
+                let ok2 = _rgx_grp_star(pat, gpi, gpe, aq, pe, text, ti + ln, tlen)
+                if ok2 == 1
+                    result = 1
+                    done = 1
+            idx = idx + 1
+    if result == 0
+        // zero repetitions: try rest of pattern from ti
+        result = _rgx_here(pat, aq, pe, text, ti, tlen)
+    result
+
+// _rgx_grp_plus: group with '+' (one or more).
+// Must match at least one group then behave like star.
+fn _rgx_grp_plus(pat, gpi, gpe, aq, pe, text, ti, tlen) -> int
+    // Collect all non-zero lengths the group can match from ti
+    let lengths = []
+    let L = tlen - ti
+    let collecting = 1
+    while collecting == 1
+        let _nv = 0
+        if L <= 0
+            collecting = 0
+        else
+            let ok = _rgx_alt(pat, gpi, gpe, text, ti, ti + L)
+            if ok == 1
+                lengths.push(L)
+            L = L - 1
+    let n    = len(lengths)
+    if n == 0
+        return 0
+    let idx  = 0
+    let result = 0
+    let done = 0
+    while done == 0
+        let _nv = 0
+        if idx >= n
+            done = 1
+        else
+            let ln = lengths[idx]
+            // one match of length ln, then star
+            let ok2 = _rgx_grp_star(pat, gpi, gpe, aq, pe, text, ti + ln, tlen)
+            if ok2 == 1
+                result = 1
+                done = 1
+            idx = idx + 1
+    result
+
+// ── atom star helper ──────────────────────────────────────────────────────────
+
+// _rgx_atom_star: greedy '*' for a non-group atom at pat[api].
+// Greedily consumes as many matches as possible, then backtracks.
+fn _rgx_atom_star(pat, api, aq, pe, text, ti, tlen) -> int
+    // Collect greedy positions
+    let positions = []
+    positions.push(ti)
+    let cur = ti
+    let collecting = 1
+    while collecting == 1
+        let _nv = 0
+        if cur >= tlen
+            collecting = 0
+        else
+            let am = _rgx_atom_ok(pat, api, text, cur)
+            if am == 0
+                collecting = 0
+            else
+                cur = cur + 1
+                positions.push(cur)
+    // Greedy: try from the longest match down
+    let n   = len(positions)
+    let idx = n - 1
+    let result = 0
+    let done   = 0
+    while done == 0
+        let _nv = 0
+        if idx < 0
+            done = 1
+        else
+            let pos = positions[idx]
+            let ok  = _rgx_here(pat, aq, pe, text, pos, tlen)
+            if ok == 1
+                result = 1
+                done   = 1
+            else
+                idx = idx - 1
+    result
+
+// ── public API ────────────────────────────────────────────────────────────────
+
+// rgx_match: full match — the entire text must match the pattern.
+// Returns 1 if matched, 0 otherwise.
+fn rgx_match(pattern, text) -> int
+    let plen = len(pattern)
+    let tlen = len(text)
+    // Strip leading '^' (full match is already start-anchored)
+    let pi = 0
+    if plen > 0
+        let fc = _rgx_ch(pattern, 0)
+        if fc == "^"
+            pi = 1
+    // Strip trailing unescaped '$'
+    let pe = plen
+    if pe > pi
+        let lc = _rgx_ch(pattern, pe - 1)
+        if lc == "$"
+            let esc = 0
+            if pe - 2 >= pi
+                let pv = _rgx_ch(pattern, pe - 2)
+                if pv == "\\"
+                    esc = 1
+            if esc == 0
+                pe = pe - 1
+    _rgx_alt(pattern, pi, pe, text, 0, tlen)
+
+// rgx_search: find a match anywhere in text.
+// Returns 1 if any position in text matches, 0 otherwise.
+// Respects '^' (start-anchor) and '$' (end-anchor).
+fn rgx_search(pattern, text) -> int
+    let plen = len(pattern)
+    let tlen = len(text)
+    if plen == 0
+        return 1
+    // Detect '^' anchor
+    let anchored = 0
+    let pi = 0
+    if plen > 0
+        let fc = _rgx_ch(pattern, 0)
+        if fc == "^"
+            anchored = 1
+            pi = 1
+    // Detect trailing '$'
+    let pe      = plen
+    let req_end = 0
+    if pe > pi
+        let lc = _rgx_ch(pattern, pe - 1)
+        if lc == "$"
+            let esc2 = 0
+            if pe - 2 >= pi
+                let pv2 = _rgx_ch(pattern, pe - 2)
+                if pv2 == "\\"
+                    esc2 = 1
+            if esc2 == 0
+                pe      = pe - 1
+                req_end = 1
+    // Try each start position in text
+    let max_start = tlen
+    if anchored == 1
+        max_start = 0
+    let start  = 0
+    let result = 0
+    let done   = 0
+    while done == 0
+        let _nv = 0
+        if start > max_start
+            done = 1
+        else
+            if req_end == 1
+                // Must match text[start..tlen)
+                let ok = _rgx_alt(pattern, pi, pe, text, start, tlen)
+                if ok == 1
+                    result = 1
+                    done   = 1
+            else
+                // Try all end positions from start to tlen
+                let tend  = start
+                let idone = 0
+                while idone == 0
+                    let _nv2 = 0
+                    if tend > tlen
+                        idone = 1
+                    else
+                        let ok2 = _rgx_alt(pattern, pi, pe, text, start, tend)
+                        if ok2 == 1
+                            result = 1
+                            idone  = 1
+                            done   = 1
+                        if idone == 0
+                            tend = tend + 1
+            if done == 0
+                start = start + 1
+    result
+
+// rgx_test is an alias for rgx_search.
+fn rgx_test(pattern, text) -> int
+    rgx_search(pattern, text)
+
+// ============================================================================
+fn main()
+    print("std/automata/regex loaded")
