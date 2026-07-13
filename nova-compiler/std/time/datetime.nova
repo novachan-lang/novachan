@@ -1,0 +1,226 @@
+// ============================================================================
+// NOVA Standard Library — std/time/datetime
+// UTC epoch ↔ calendar decomposition, ISO 8601 formatting & parsing.
+// Pure integer arithmetic, correct for all epochs (including pre-1970).
+// ============================================================================
+//
+// PUBLIC API:
+//   dt_from_epoch(epoch)           -> dict  {year,month,day,hour,min,sec,weekday,yday}
+//   dt_to_epoch(y,mo,d,h,mi,s)    -> int   (UTC seconds)
+//   dt_format_iso(epoch)           -> string "YYYY-MM-DDTHH:MM:SSZ"
+//   dt_parse_iso(s)                -> int   (-1 on malformed input)
+//   dt_add_seconds(epoch,secs)     -> int
+//   dt_add_days(epoch,days)        -> int
+//
+// EPOCHS: all in UTC seconds (int).  Negative epochs = pre-1970 dates.
+//
+// DRAWBACKS AVOIDED:
+//   Python  — naive datetime that is silently wrong across DST boundaries.
+//             NOVA: everything is an int (UTC seconds); no "naive" mode.
+//   Java    — ZonedDateTime / LocalDateTime class zoo; 10+ interacting types.
+//             NOVA: one dict, everything is an int or string.
+//   Go      — time.LoadLocation reads the filesystem at runtime; absent in
+//             many Docker images.  NOVA: zero filesystem dependency.
+//
+// ALGORITHM: Howard Hinnant's civil_from_days / days_from_civil (ISO 8601
+// proleptic Gregorian calendar).  Integer divisions are floor divisions
+// (critical for pre-1970 epochs where days < 0).
+
+// ── Floor-division helpers ───────────────────────────────────────────────────
+//
+// NOVA integer division TRUNCATES toward zero (like C).
+// For negative values that is not floor division:
+//   -1 / 4 = 0 in C/NOVA, but floor(-1/4) = -1.
+// These helpers produce the mathematical floor result.
+
+fn _fdiv(a, b) -> int
+    let q = a / b
+    // If signs differ and there is a remainder, subtract 1.
+    if (a < 0) != (b < 0)
+        if a - q * b != 0
+            return q - 1
+    q
+
+fn _fmod(a, b) -> int
+    a - b * _fdiv(a, b)
+
+// ── Calendar helpers ─────────────────────────────────────────────────────────
+//
+// Howard Hinnant's algorithm: correct for all Gregorian dates.
+// z0 = days since 1970-01-01 (may be negative for pre-1970).
+// Returns [year, month, day].
+
+fn _civil_from_days(z0) -> list
+    // Shift to an era-aligned epoch (civil day 0 = 0000-03-01 in the proleptic
+    // Gregorian calendar, which is much more regular than the Jan-based epoch).
+    let z = z0 + 719468
+    // era: 400-year period index.  Must be floor div for negative z.
+    let era = _fdiv(z, 146097)
+    let doe = z - era * 146097          // day-of-era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365  // year-of-era [0, 399]
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)  // day-of-year [0, 365]
+    let mp = (5 * doy + 2) / 153       // month-of-period [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = mp + 3
+    if mp >= 10
+        m = mp - 9
+    if m <= 2
+        y = y + 1
+    [y, m, d]
+
+// Inverse: calendar date → days since 1970-01-01.
+fn _days_from_civil(y0, m, d) -> int
+    let y = y0
+    if m <= 2
+        y = y - 1
+    let era = _fdiv(y, 400)
+    let yoe = y - era * 400
+    let mp = m - 3
+    if m <= 2
+        mp = m + 9
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+
+// ── String helpers ───────────────────────────────────────────────────────────
+
+fn _pad2(n) -> string
+    if n < 10
+        return "0" + str(n)
+    str(n)
+
+fn _pad4(n) -> string
+    if n < 10
+        return "000" + str(n)
+    if n < 100
+        return "00" + str(n)
+    if n < 1000
+        return "0" + str(n)
+    str(n)
+
+// Parse up to `width` decimal digits from s starting at pos.
+// Returns [value, new_pos].
+fn _parse_digits(s, pos, width) -> list
+    let val = 0
+    let i = pos
+    let end = pos + width
+    let slen = len(s)
+    if end > slen
+        end = slen
+    while i < end
+        let c = ord(s[i:i + 1])
+        if c >= 48 and c <= 57
+            val = val * 10 + (c - 48)
+        else
+            return [val, i]
+        i = i + 1
+    [val, i]
+
+// ── PUBLIC API ────────────────────────────────────────────────────────────────
+
+// dt_from_epoch: decompose a UTC epoch into its calendar components.
+// Returns a dict with keys: year, month, day, hour, min, sec, weekday, yday.
+//   weekday: 0=Sun, 1=Mon, ..., 6=Sat
+//   yday:    1..366 (day of year, 1-based)
+fn dt_from_epoch(epoch) -> dict
+    let days = _fdiv(epoch, 86400)
+    let rem = _fmod(epoch, 86400)
+    let ymd = _civil_from_days(days)
+    let yr = ymd[0]
+
+    // yday: 1..366, Jan-1-based day of the CALENDAR year.
+    // NOTE: Hinnant's internal "doy" is March-1-based (era-aligned), NOT the
+    // calendar day-of-year — so we derive yday from the reconstructed year by
+    // counting days since Jan 1 of that year.
+    let jan1 = _days_from_civil(yr, 1, 1)
+    let yday = days - jan1 + 1
+
+    // Weekday: 1970-01-01 was Thursday (4).  floor-mod to handle negatives.
+    let wd = _fmod(_fmod(days, 7) + 4 + 7, 7)
+
+    let r = {}
+    r["year"] = yr
+    r["month"] = ymd[1]
+    r["day"] = ymd[2]
+    r["hour"] = rem / 3600
+    r["min"] = (rem % 3600) / 60
+    r["sec"] = rem % 60
+    r["weekday"] = wd
+    r["yday"] = yday
+    r
+
+// dt_to_epoch: calendar date + time → UTC epoch seconds.
+fn dt_to_epoch(y, mo, d, h, mi, s) -> int
+    _days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s
+
+// dt_format_iso: produce "YYYY-MM-DDTHH:MM:SSZ".
+fn dt_format_iso(epoch) -> string
+    let r = dt_from_epoch(epoch)
+    _pad4(r["year"]) + "-" + _pad2(r["month"]) + "-" + _pad2(r["day"]) + "T" + _pad2(r["hour"]) + ":" + _pad2(r["min"]) + ":" + _pad2(r["sec"]) + "Z"
+
+// dt_parse_iso: parse "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DD HH:MM:SS[Z]".
+// Returns epoch (int), or -1 on any malformed input.
+fn dt_parse_iso(s) -> int
+    let slen = len(s)
+    // Minimum: "YYYY-MM-DDTHH:MM:SS" = 19 chars
+    if slen < 19
+        return -1
+    // YYYY
+    let yr = _parse_digits(s, 0, 4)
+    let y = yr[0]
+    if yr[1] != 4
+        return -1
+    if s[4:5] != "-"
+        return -1
+    // MM
+    let mr = _parse_digits(s, 5, 2)
+    let mo = mr[0]
+    if mr[1] != 7
+        return -1
+    if s[7:8] != "-"
+        return -1
+    // DD
+    let dr = _parse_digits(s, 8, 2)
+    let dy = dr[0]
+    if dr[1] != 10
+        return -1
+    // separator: T or space
+    let sep = s[10:11]
+    if sep != "T" and sep != " "
+        return -1
+    // HH
+    let hr = _parse_digits(s, 11, 2)
+    let h = hr[0]
+    if hr[1] != 13
+        return -1
+    if s[13:14] != ":"
+        return -1
+    // MM
+    let mir = _parse_digits(s, 14, 2)
+    let mi = mir[0]
+    if mir[1] != 16
+        return -1
+    if s[16:17] != ":"
+        return -1
+    // SS
+    let sr = _parse_digits(s, 17, 2)
+    let sc = sr[0]
+    if sr[1] != 19
+        return -1
+    // Basic range checks
+    if mo < 1 or mo > 12
+        return -1
+    if dy < 1 or dy > 31
+        return -1
+    if h > 23 or mi > 59 or sc > 59
+        return -1
+    dt_to_epoch(y, mo, dy, h, mi, sc)
+
+// dt_add_seconds: add (or subtract) seconds.
+fn dt_add_seconds(epoch, secs) -> int
+    epoch + secs
+
+// dt_add_days: add (or subtract) whole days.
+fn dt_add_days(epoch, days) -> int
+    epoch + days * 86400
