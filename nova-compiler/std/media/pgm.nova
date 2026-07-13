@@ -1,0 +1,304 @@
+// ============================================================================
+// NOVA Standard Library — std/media/pgm
+// ============================================================================
+// Netpbm PGM (Portable GrayMap) encoder and decoder.
+//
+// Supports two PGM variants:
+//   P5 (binary): compact binary format — header in ASCII, pixels as raw bytes.
+//   P2 (ASCII):  fully human-readable — header and pixels all in plain text.
+//
+// Both variants support only 8-bit grayscale (maxval == 255), which covers the
+// vast majority of real-world PGM usage. 16-bit PGM (maxval 256..65535) is not
+// supported; decode returns {} if maxval != 255.
+//
+// PIXEL REPRESENTATION:
+//   px is a flat list of integers, length == w*h.
+//   Pixel (col, row) is at index row*w + col.
+//   Values are clamped to [0,255] on encode: negative values become 0,
+//   values > 255 become 255.
+//
+// PUBLIC API:
+//   pgm_p5_encode(w, h, px) -> bytes
+//     Encode a grayscale image as binary PGM (P5).
+//     Header: "P5\n<w> <h>\n255\n"   (all ASCII)
+//     Body:   w*h raw bytes, one per pixel, row-major.
+//     Returns bytes(0) if w*h != len(px) or w<=0 or h<=0.
+//
+//   pgm_p5_decode(b) -> dict
+//     Decode binary PGM (P5) from bytes.
+//     Returns {"w": int, "h": int, "px": list} on success.
+//     Returns {} on any error: bad magic, wrong maxval, truncated data.
+//
+//   pgm_p2_encode(w, h, px) -> string
+//     Encode as ASCII PGM (P2).
+//     Header: "P2\n<w> <h>\n255\n"
+//     Body:   space-separated decimal values, one per pixel, row-major.
+//     Final pixel is followed by a newline.
+//     Returns "" on dimension/length mismatch or w<=0 or h<=0.
+//
+//   pgm_p2_decode(s) -> dict
+//     Decode ASCII PGM (P2) from string.
+//     Returns {"w": int, "h": int, "px": list} on success.
+//     Returns {} on any error.
+//
+// SAFETY:
+//   Every byte read in decode is bounds-checked (i < bytes_len(b)) before
+//   bytes_get(b, i). Malformed / truncated input never panics.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _pgm_ to avoid link collisions when
+//   other std modules are compiled into the same binary.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Clamp an integer to [0, 255].
+fn _pgm_clamp(v) -> int
+    if v < 0
+        return 0
+    if v > 255
+        return 255
+    return v
+
+// Convert an integer to its decimal string representation.
+// Handles 0 and positive integers (pixel values are always 0..255).
+fn _pgm_itoa(n) -> string
+    if n == 0
+        return "0"
+    let s = ""
+    let v = n
+    while v > 0
+        let digit = v - (v / 10) * 10
+        s = str(digit) + s
+        v = v / 10
+    return s
+
+// Build the shared ASCII header for both P5 and P2.
+// Returns "P<magic_char>\n<w> <h>\n255\n"
+fn _pgm_header(magic_char, w, h) -> string
+    let header = "P" + magic_char + "\n" + _pgm_itoa(w) + " " + _pgm_itoa(h) + "\n255\n"
+    return header
+
+// Skip whitespace and comments in an ASCII PGM byte stream.
+// `b` is a bytes value, `i` is the current position, `blen` is bytes_len(b).
+// Returns the new position after skipping all whitespace and #-comments.
+// (For P2 decode we work on a string, but we use a string-index variant below.)
+fn _pgm_skip_ws_str(s, i, slen) -> int
+    let cur = i
+    let running = 1
+    while running == 1 and cur < slen
+        let c = char_at(s, cur)
+        if c == " " or c == "\t" or c == "\n" or c == "\r"
+            cur = cur + 1
+        else
+            if c == "#"
+                // skip until end of line
+                while cur < slen and char_at(s, cur) != "\n"
+                    cur = cur + 1
+            else
+                running = 0
+    return cur
+
+// Parse a non-negative decimal integer from string s starting at position i.
+// Returns a two-element list: [value, new_position].
+// If no digit found returns [-1, i].
+fn _pgm_parse_int_str(s, i, slen) -> list
+    let cur = i
+    let val = 0
+    let found = 0
+    while cur < slen
+        let c = char_at(s, cur)
+        let o = ord(c)
+        if o >= 48 and o <= 57
+            val = val * 10 + (o - 48)
+            cur = cur + 1
+            found = 1
+        else
+            break
+    if found == 0
+        let r = [-1, i]
+        return r
+    let r = [val, cur]
+    return r
+
+// Skip whitespace in a bytes buffer (for P5 header parsing — header is ASCII).
+fn _pgm_skip_ws_b(b, i, blen) -> int
+    let cur = i
+    while cur < blen
+        let v = bytes_get(b, cur)
+        // space=32 tab=9 CR=13 LF=10
+        if v == 32 or v == 9 or v == 13 or v == 10
+            cur = cur + 1
+        else
+            if v == 35
+                // '#' — skip comment to end of line
+                while cur < blen and bytes_get(b, cur) != 10
+                    cur = cur + 1
+            else
+                return cur
+    return cur
+
+// Parse a non-negative decimal integer from bytes b starting at position i.
+// Header fields are plain ASCII, so this is safe.
+// Returns [value, new_position]. If no digit found returns [-1, i].
+fn _pgm_parse_int_b(b, i, blen) -> list
+    let cur = i
+    let val = 0
+    let found = 0
+    while cur < blen
+        let v = bytes_get(b, cur)
+        if v >= 48 and v <= 57
+            val = val * 10 + (v - 48)
+            cur = cur + 1
+            found = 1
+        else
+            break
+    if found == 0
+        let r = [-1, i]
+        return r
+    let r = [val, cur]
+    return r
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// pgm_p5_encode — encode a grayscale image as binary PGM (P5 format).
+// w: image width (pixels), h: image height (pixels), px: flat pixel list.
+// Returns the complete PGM file as bytes. Returns bytes(0) on error.
+fn pgm_p5_encode(w, h, px) -> any
+    // Validate dimensions and pixel count.
+    if w <= 0 or h <= 0
+        return bytes(0)
+    let total = w * h
+    if len(px) != total
+        return bytes(0)
+    // Build ASCII header as string then convert to bytes.
+    let hdr = _pgm_header("5", w, h)
+    let out = str_to_bytes(hdr)
+    // Append raw pixel bytes.
+    let i = 0
+    while i < total
+        let pv = px[i]
+        out = bytes_append(out, _pgm_clamp(pv))
+        i = i + 1
+    return out
+
+// pgm_p5_decode — decode a binary PGM (P5) file from bytes.
+// Returns {"w":int,"h":int,"px":list} on success, {} on any error.
+fn pgm_p5_decode(b) -> dict
+    let empty = {}
+    let blen = bytes_len(b)
+    // Minimum header: "P5\n1 1\n255\n" + 1 pixel = 12 bytes.
+    if blen < 12
+        return empty
+    // Check magic: bytes 0-1 must be 'P' (80) and '5' (53).
+    if bytes_get(b, 0) != 80 or bytes_get(b, 1) != 53
+        return empty
+    // Byte 2 must be whitespace (typically '\n' = 10).
+    let b2 = bytes_get(b, 2)
+    if b2 != 10 and b2 != 32 and b2 != 9 and b2 != 13
+        return empty
+    // Parse width.
+    let pos = _pgm_skip_ws_b(b, 2, blen)
+    let wr = _pgm_parse_int_b(b, pos, blen)
+    if wr[0] <= 0
+        return empty
+    let w = wr[0]
+    pos = wr[1]
+    // Parse height.
+    pos = _pgm_skip_ws_b(b, pos, blen)
+    let hr = _pgm_parse_int_b(b, pos, blen)
+    if hr[0] <= 0
+        return empty
+    let h = hr[0]
+    pos = hr[1]
+    // Parse maxval — must be 255 for 8-bit PGM.
+    pos = _pgm_skip_ws_b(b, pos, blen)
+    let mr = _pgm_parse_int_b(b, pos, blen)
+    if mr[0] != 255
+        return empty
+    pos = mr[1]
+    // After maxval there must be exactly one whitespace byte before pixel data.
+    if pos >= blen
+        return empty
+    pos = pos + 1
+    // Verify enough pixel data follows.
+    let total = w * h
+    if blen - pos < total
+        return empty
+    // Read pixels.
+    let px = []
+    let i = 0
+    while i < total
+        if pos >= blen
+            return empty
+        px.push(bytes_get(b, pos))
+        pos = pos + 1
+        i = i + 1
+    let result = {"w": w, "h": h, "px": px}
+    return result
+
+// pgm_p2_encode — encode a grayscale image as ASCII PGM (P2 format).
+// Returns the complete PGM file as a string. Returns "" on error.
+fn pgm_p2_encode(w, h, px) -> string
+    if w <= 0 or h <= 0
+        return ""
+    let total = w * h
+    if len(px) != total
+        return ""
+    let out = _pgm_header("2", w, h)
+    let i = 0
+    while i < total
+        let pv = _pgm_clamp(px[i])
+        if i > 0
+            out = out + " "
+        out = out + _pgm_itoa(pv)
+        i = i + 1
+    out = out + "\n"
+    return out
+
+// pgm_p2_decode — decode an ASCII PGM (P2) string.
+// Returns {"w":int,"h":int,"px":list} on success, {} on any error.
+fn pgm_p2_decode(s) -> dict
+    let empty = {}
+    let slen = len(s)
+    if slen < 8
+        return empty
+    // Check magic "P2" at start.
+    if char_at(s, 0) != "P" or char_at(s, 1) != "2"
+        return empty
+    // Skip past magic and whitespace.
+    let pos = _pgm_skip_ws_str(s, 2, slen)
+    // Parse width.
+    let wr = _pgm_parse_int_str(s, pos, slen)
+    if wr[0] <= 0
+        return empty
+    let w = wr[0]
+    pos = wr[1]
+    // Parse height.
+    pos = _pgm_skip_ws_str(s, pos, slen)
+    let hr = _pgm_parse_int_str(s, pos, slen)
+    if hr[0] <= 0
+        return empty
+    let h = hr[0]
+    pos = hr[1]
+    // Parse maxval — must be 255.
+    pos = _pgm_skip_ws_str(s, pos, slen)
+    let mr = _pgm_parse_int_str(s, pos, slen)
+    if mr[0] != 255
+        return empty
+    pos = mr[1]
+    // Read w*h pixel values.
+    let total = w * h
+    let px = []
+    let i = 0
+    while i < total
+        pos = _pgm_skip_ws_str(s, pos, slen)
+        let vr = _pgm_parse_int_str(s, pos, slen)
+        if vr[0] < 0
+            return empty
+        px.push(vr[0])
+        pos = vr[1]
+        i = i + 1
+    let result = {"w": w, "h": h, "px": px}
+    return result

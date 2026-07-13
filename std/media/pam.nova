@@ -1,0 +1,177 @@
+// ============================================================================
+// NOVA Standard Library — std/media/pam
+// ============================================================================
+// Netpbm PAM (Portable Arbitrary Map, magic "P7") encode/decode.
+//
+// PAM is the most general Netpbm format: each pixel has an arbitrary number
+// of samples (DEPTH) of arbitrary semantic meaning (TUPLTYPE).
+// Common tuple types: "BLACKANDWHITE", "GRAYSCALE", "RGB",
+//   "BLACKANDWHITE_ALPHA", "GRAYSCALE_ALPHA", "RGB_ALPHA".
+//
+// FORMAT (Netpbm spec):
+//   Header — pure ASCII lines, each terminated by LF (0x0A):
+//     P7
+//     WIDTH <w>
+//     HEIGHT <h>
+//     DEPTH <d>
+//     MAXVAL 255
+//     TUPLTYPE <t>
+//     ENDHDR
+//   Pixel raster — w * h * d raw bytes immediately after ENDHDR\n.
+//   Row-major, top-left to bottom-right; sample order within each pixel
+//   follows DEPTH index (e.g. R,G,B for RGB).
+//
+// SAFETY:
+//   * Header is pure ASCII text with no 0x00 bytes — building it via string
+//     concatenation is correct and safe (no NUL-truncation hazard).
+//   * The pixel raster is binary — always stored/read as `bytes`.
+//   * Every bytes_get call is guarded by a bounds check (i < blen first).
+//   * Malformed input returns a zeroed/empty result rather than crashing.
+//
+// PUBLIC API:
+//   pam_encode(w, h, depth, tupltype, px) -> bytes
+//     Encodes a PAM image. px is a flat list of sample values (ints 0..255),
+//     length w*h*depth, row-major, depth-interleaved.
+//     Returns the full PAM binary blob (header + raster).
+//
+//   pam_decode(b) -> dict
+//     Decodes a PAM blob. Returns a dict with keys:
+//       "w"        -> int    (image width)
+//       "h"        -> int    (image height)
+//       "depth"    -> int    (samples per pixel)
+//       "tupltype" -> string (tuple type string)
+//       "px"       -> list   (flat sample list, ints 0..255, length w*h*depth)
+//     On malformed/truncated input: returns {"w":0,"h":0,"depth":0,"tupltype":"","px":[]}.
+//
+// LEAF — imports NOTHING.
+
+// ── Private: read one LF-terminated line from bytes b starting at offset. ───────
+// Returns the line content as a string (excluding the trailing LF).
+// If start >= blen or the line is not LF-terminated before end, returns "".
+// Caller advances offset separately using _pam_skip_to_after_lf.
+fn _pam_read_line(b, start, blen) -> string
+    let out = ""
+    let i = start
+    while i < blen
+        let c = bytes_get(b, i)
+        i = i + 1
+        if c == 10
+            return out
+        out = out + chr(c)
+    ""
+
+// Advance past one LF-terminated line from offset start.
+// Returns the new offset (byte index just after the LF), or blen if no LF found.
+fn _pam_skip_to_after_lf(b, start, blen) -> int
+    let i = start
+    while i < blen
+        let c = bytes_get(b, i)
+        i = i + 1
+        if c == 10
+            return i
+    blen
+
+// ── Private: return the portion of s after the first space. ─────────────────────
+// PAM header fields are "KEYWORD value"; this extracts "value".
+// Returns "" if no space found.
+fn _pam_value_of(s) -> string
+    let n = len(s)
+    let i = 0
+    while i < n
+        if s[i] == " "
+            return slice(s, i + 1, n)
+        i = i + 1
+    ""
+
+// ── Private: parse a non-negative decimal integer string. ───────────────────────
+// Returns 0 on empty input or any non-digit character.
+fn _pam_atoi(s) -> int
+    let n = len(s)
+    if n == 0
+        return 0
+    let v = 0
+    let i = 0
+    while i < n
+        let d = ord(s[i]) - 48
+        if d < 0 or d > 9
+            return 0
+        v = v * 10 + d
+        i = i + 1
+    v
+
+// ── Private: check that line starts with a given prefix of length plen. ─────────
+// Returns 1 if slice(line,0,plen) == prefix, 0 otherwise.
+fn _pam_starts_with(line, prefix, plen) -> int
+    if len(line) < plen
+        return 0
+    if slice(line, 0, plen) == prefix
+        return 1
+    0
+
+// ── pam_encode ───────────────────────────────────────────────────────────────────
+// Build the PAM binary: ASCII header + raw pixel raster.
+// The header is constructed as a string and converted to bytes via str_to_bytes.
+// Each pixel sample is appended as a single byte (value & 0xFF for safety).
+fn pam_encode(w, h, depth, tupltype, px) -> any
+    let hdr = "P7\nWIDTH " + str(w) + "\nHEIGHT " + str(h) + "\nDEPTH " + str(depth) + "\nMAXVAL 255\nTUPLTYPE " + tupltype + "\nENDHDR\n"
+    let out = str_to_bytes(hdr)
+    let total = w * h * depth
+    let i = 0
+    while i < total
+        out = bytes_append(out, px[i] & 0xFF)
+        i = i + 1
+    out
+
+// ── pam_decode ───────────────────────────────────────────────────────────────────
+// Parse the PAM header byte-by-byte (each line is LF-terminated ASCII text),
+// then read the raw pixel raster that follows the ENDHDR\n marker.
+// Returns a dict of decoded fields; zeroed/empty on any malformed input.
+fn pam_decode(b) -> any
+    let empty = {"w": 0, "h": 0, "depth": 0, "tupltype": "", "px": []}
+    let blen = bytes_len(b)
+    // Minimum: "P7\n" (3 bytes) plus at least an ENDHDR line
+    if blen < 3
+        return empty
+    // Validate magic: P(80) 7(55) LF(10)
+    if bytes_get(b, 0) != 80
+        return empty
+    if bytes_get(b, 1) != 55
+        return empty
+    if bytes_get(b, 2) != 10
+        return empty
+    // Parse header lines starting after "P7\n"
+    let off = 3
+    let out_w = 0
+    let out_h = 0
+    let out_depth = 0
+    let out_tupltype = ""
+    let found_endhdr = 0
+    let max_lines = 64
+    let li = 0
+    while li < max_lines and off < blen and found_endhdr == 0
+        let line = _pam_read_line(b, off, blen)
+        off = _pam_skip_to_after_lf(b, off, blen)
+        if line == "ENDHDR"
+            found_endhdr = 1
+        else if _pam_starts_with(line, "WIDTH ", 6) == 1
+            out_w = _pam_atoi(_pam_value_of(line))
+        else if _pam_starts_with(line, "HEIGHT ", 7) == 1
+            out_h = _pam_atoi(_pam_value_of(line))
+        else if _pam_starts_with(line, "DEPTH ", 6) == 1
+            out_depth = _pam_atoi(_pam_value_of(line))
+        else if _pam_starts_with(line, "TUPLTYPE ", 9) == 1
+            out_tupltype = _pam_value_of(line)
+        li = li + 1
+    if found_endhdr == 0
+        return empty
+    // Read pixel raster: w * h * depth raw bytes
+    let total = out_w * out_h * out_depth
+    let px = []
+    let pi = 0
+    while pi < total
+        if off >= blen
+            return empty
+        push(px, bytes_get(b, off) & 0xFF)
+        off = off + 1
+        pi = pi + 1
+    {"w": out_w, "h": out_h, "depth": out_depth, "tupltype": out_tupltype, "px": px}

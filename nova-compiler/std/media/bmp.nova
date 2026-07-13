@@ -1,0 +1,284 @@
+// ============================================================================
+// NOVA Standard Library — std/media/bmp
+// ============================================================================
+// BMP 24-bit (BI_RGB) image codec — encode and decode Windows Bitmap files.
+//
+// FORMAT OVERVIEW
+//   A BMP file consists of three sections in order:
+//
+//   1. BITMAPFILEHEADER (14 bytes, all fields little-endian)
+//        offset  0: u16 signature = 0x4D42 ('B','M')
+//        offset  2: u32 filesize  = total file size in bytes
+//        offset  6: u32 reserved  = 0
+//        offset 10: u32 pixoffset = byte offset to start of pixel data (54)
+//
+//   2. BITMAPINFOHEADER (40 bytes, all fields little-endian)
+//        offset 14: u32 hdrsize     = 40
+//        offset 18: i32 width       = image width in pixels (positive)
+//        offset 22: i32 height      = image height (positive = bottom-up storage)
+//        offset 26: u16 planes      = 1
+//        offset 28: u16 bpp         = 24 (bits per pixel)
+//        offset 30: u32 compression = 0 (BI_RGB, uncompressed)
+//        offset 34: u32 imgsize     = pixel data size in bytes (padded rows)
+//        offset 38: u32 xppm        = 0 (pixels per metre, X)
+//        offset 42: u32 yppm        = 0 (pixels per metre, Y)
+//        offset 46: u32 clrused     = 0
+//        offset 50: u32 clrimp      = 0
+//
+//   3. PIXEL DATA  (starting at offset 54)
+//        Rows stored BOTTOM-UP: last image row (bottom) is first in file.
+//        Each pixel is 3 bytes in BGR order (Blue, Green, Red).
+//        Each row is zero-padded to the next multiple of 4 bytes.
+//
+// ROW STRIDE CALCULATION
+//   raw_stride = width * 3                     (bytes without padding)
+//   pad        = (4 - (raw_stride % 4)) % 4   (0, 1, 2, or 3 pad bytes)
+//   row_stride = raw_stride + pad              (must be divisible by 4)
+//   imgsize    = row_stride * height
+//
+// PUBLIC API
+//   bmp_encode(w, h, px_rgb) -> bytes
+//     Encode a w×h image to a valid BMP bytes value.
+//     px_rgb is a flat list of RGB byte values, length = w*h*3, in TOP-DOWN
+//     row-major order.  Each pixel is [R, G, B] — three consecutive list
+//     elements.
+//     Returns bytes(0) if w<=0, h<=0, or len(px_rgb) != w*h*3.
+//
+//   bmp_decode(b) -> dict
+//     Decode a BMP bytes value.
+//     Returns a dict {"w": int, "h": int, "px": list} where px is a flat
+//     TOP-DOWN RGB list (same layout as the input to bmp_encode).
+//     Returns {"w":0,"h":0,"px":[]} on any error (bad magic, truncated file,
+//     unsupported format).
+//
+// KNOWN-ANSWER FACTS (2×2, verified by hand)
+//   Input: bmp_encode(2, 2, [255,0,0, 0,255,0, 0,0,255, 255,255,255])
+//   raw_stride=6, pad=2, row_stride=8, imgsize=16, filesize=70, pixoffset=54
+//   byte 0 == 66 ('B'), byte 1 == 77 ('M')
+//   u32 @ 2  == 70    (filesize)
+//   u32 @ 10 == 54    (pixoffset)
+//   u32 @ 14 == 40    (hdrsize)
+//   i32 @ 18 == 2     (width)
+//   i32 @ 22 == 2     (height)
+//   u16 @ 26 == 1     (planes)
+//   u16 @ 28 == 24    (bpp)
+//   u32 @ 30 == 0     (compression)
+//   u32 @ 34 == 16    (imgsize)
+//   Pixel bytes (starting at 54, bottom-up BGR with pad):
+//     Row 1 (bottom in file, row index 1 of top-down input = blue + white):
+//       255,0,0,  255,255,255,  0,0   (BGR: blue=(255,0,0); white=(255,255,255); 2 pad)
+//     Row 0 (top of image, second in file = red + green):
+//       0,0,255,  0,255,0,  0,0       (BGR: red=(0,0,255); green=(0,255,0); 2 pad)
+//
+// IMPLEMENTATION NOTES
+//   • NOVA >> is arithmetic shift — always mask byte extractions: (v>>k)&0xFF
+//   • bytes_append returns a NEW bytes — ALWAYS reassign the result
+//   • All multi-byte integers in BMP are LITTLE-ENDIAN: low byte first
+//   • Private helpers prefixed _bmp_ to avoid link collisions
+//   • Single-exit style throughout to avoid NOVA early-return mistag
+//   • LEAF module — imports nothing
+// ============================================================================
+
+// ── Private: write a little-endian u16 (2 bytes) into b ──────────────────────
+fn _bmp_put_u16_le(b, v)
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out
+
+// ── Private: write a little-endian u32 (4 bytes) into b ──────────────────────
+fn _bmp_put_u32_le(b, v)
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out
+
+// ── Private: read a little-endian u32 from bytes b at offset pos ─────────────
+// Bounds-checked: returns 0 if any of the 4 bytes would be out of range.
+fn _bmp_get_u32_le(b, pos)
+    let blen = bytes_len(b)
+    let result = 0
+    if pos + 3 < blen
+        let b0 = bytes_get(b, pos)
+        let b1 = bytes_get(b, pos + 1)
+        let b2 = bytes_get(b, pos + 2)
+        let b3 = bytes_get(b, pos + 3)
+        result = b0 | (b1 * 256) | (b2 * 65536) | (b3 * 16777216)
+    result
+
+// ── Private: read a little-endian u16 from bytes b at offset pos ─────────────
+// Bounds-checked: returns 0 if any of the 2 bytes would be out of range.
+fn _bmp_get_u16_le(b, pos)
+    let blen = bytes_len(b)
+    let result = 0
+    if pos + 1 < blen
+        let lo = bytes_get(b, pos)
+        let hi = bytes_get(b, pos + 1)
+        result = lo | (hi * 256)
+    result
+
+// ── Private: compute padded row stride for a given width ─────────────────────
+// raw_stride = width * 3 bytes; padded to multiple of 4.
+fn _bmp_row_stride(width)
+    let raw = width * 3
+    let rem = raw - ((raw / 4) * 4)
+    let pad = 0
+    if rem != 0
+        pad = 4 - rem
+    raw + pad
+
+// ── bmp_encode ───────────────────────────────────────────────────────────────
+// Encode a w×h image to BMP 24-bit bytes.
+// px_rgb: flat TOP-DOWN RGB list, length = w*h*3.
+// Returns bytes(0) on bad inputs.
+fn bmp_encode(w, h, px_rgb) -> any
+    let out = bytes(0)
+    let ok = 1
+    if w <= 0
+        ok = 0
+    if h <= 0
+        ok = 0
+    let expected_len = w * h * 3
+    if len(px_rgb) != expected_len
+        ok = 0
+    if ok == 1
+        let row_stride = _bmp_row_stride(w)
+        let imgsize = row_stride * h
+        let filesize = 54 + imgsize
+        // ── BITMAPFILEHEADER (14 bytes) ──
+        // signature 'B','M'
+        out = bytes_append(out, 66)
+        out = bytes_append(out, 77)
+        // u32 filesize
+        out = _bmp_put_u32_le(out, filesize)
+        // u32 reserved = 0
+        out = _bmp_put_u32_le(out, 0)
+        // u32 pixoffset = 54
+        out = _bmp_put_u32_le(out, 54)
+        // ── BITMAPINFOHEADER (40 bytes) ──
+        // u32 hdrsize = 40
+        out = _bmp_put_u32_le(out, 40)
+        // i32 width
+        out = _bmp_put_u32_le(out, w)
+        // i32 height (positive = bottom-up)
+        out = _bmp_put_u32_le(out, h)
+        // u16 planes = 1
+        out = _bmp_put_u16_le(out, 1)
+        // u16 bpp = 24
+        out = _bmp_put_u16_le(out, 24)
+        // u32 compression = 0
+        out = _bmp_put_u32_le(out, 0)
+        // u32 imgsize
+        out = _bmp_put_u32_le(out, imgsize)
+        // u32 xppm = 0
+        out = _bmp_put_u32_le(out, 0)
+        // u32 yppm = 0
+        out = _bmp_put_u32_le(out, 0)
+        // u32 clrused = 0
+        out = _bmp_put_u32_le(out, 0)
+        // u32 clrimp = 0
+        out = _bmp_put_u32_le(out, 0)
+        // ── PIXEL DATA (bottom-up, BGR) ──
+        // Iterate from last row (row h-1) down to row 0.
+        let row = h - 1
+        while row >= 0
+            // Write each pixel in this row as BGR.
+            let col = 0
+            while col < w
+                // px_rgb index for pixel (row, col) in top-down layout:
+                let pxi = (row * w + col) * 3
+                let r = px_rgb[pxi]
+                let g = px_rgb[pxi + 1]
+                let bv = px_rgb[pxi + 2]
+                // BMP stores BGR
+                out = bytes_append(out, bv)
+                out = bytes_append(out, g)
+                out = bytes_append(out, r)
+                col = col + 1
+            // Write row padding bytes.
+            let raw_stride = w * 3
+            let rem = raw_stride - ((raw_stride / 4) * 4)
+            let pad = 0
+            if rem != 0
+                pad = 4 - rem
+            let pi = 0
+            while pi < pad
+                out = bytes_append(out, 0)
+                pi = pi + 1
+            row = row - 1
+    out
+
+// ── bmp_decode ───────────────────────────────────────────────────────────────
+// Decode a BMP bytes value.
+// Returns {"w": int, "h": int, "px": list} with px in TOP-DOWN RGB order.
+// Returns {"w":0, "h":0, "px": []} on any error.
+fn bmp_decode(b) -> any
+    let empty_px = []
+    let bad = {"w": 0, "h": 0, "px": empty_px}
+    let result = bad
+    let blen = bytes_len(b)
+    // Minimum valid BMP is 54 bytes (headers only, zero pixels).
+    let ok = 1
+    if blen < 54
+        ok = 0
+    if ok == 1
+        // Check signature 'B' (66), 'M' (77).
+        let sig0 = bytes_get(b, 0)
+        let sig1 = bytes_get(b, 1)
+        if sig0 != 66
+            ok = 0
+        if sig1 != 77
+            ok = 0
+    if ok == 1
+        // Read key header fields.
+        let pixoffset = _bmp_get_u32_le(b, 10)
+        let hdrsize = _bmp_get_u32_le(b, 14)
+        let width = _bmp_get_u32_le(b, 18)
+        let height = _bmp_get_u32_le(b, 22)
+        let bpp = _bmp_get_u16_le(b, 28)
+        let compression = _bmp_get_u32_le(b, 30)
+        // Validate: must be 24-bit BI_RGB.
+        if bpp != 24
+            ok = 0
+        if compression != 0
+            ok = 0
+        if width <= 0
+            ok = 0
+        if height <= 0
+            ok = 0
+        if ok == 1
+            // Verify the file is large enough to contain all pixel data.
+            let row_stride = _bmp_row_stride(width)
+            let imgsize = row_stride * height
+            let needed = pixoffset + imgsize
+            if blen < needed
+                ok = 0
+            if ok == 1
+                // Decode pixels: BMP stores rows bottom-up in BGR.
+                // We output top-down RGB.
+                let px = []
+                // row 0 in top-down output = row (height-1) in file
+                let row = 0
+                while row < height
+                    // File row for top-down row `row` is (height-1-row).
+                    let file_row = height - 1 - row
+                    let row_base = pixoffset + file_row * row_stride
+                    let col = 0
+                    while col < width
+                        let pix_off = row_base + col * 3
+                        // Bounds-check each byte before reading.
+                        if pix_off + 2 < blen
+                            let bv = bytes_get(b, pix_off)
+                            let gv = bytes_get(b, pix_off + 1)
+                            let rv = bytes_get(b, pix_off + 2)
+                            // Push as RGB (reverse BGR).
+                            px.push(rv)
+                            px.push(gv)
+                            px.push(bv)
+                        col = col + 1
+                    row = row + 1
+                let d = {"w": width, "h": height, "px": px}
+                result = d
+    result

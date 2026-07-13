@@ -1,0 +1,197 @@
+// ============================================================================
+// NOVA Standard Library — std/media/farbfeld
+// ============================================================================
+// farbfeld is a lossless image format designed by suckless.org. It is
+// intentionally simple: a fixed 16-byte header followed by raw RGBA pixels
+// where each channel is a 16-bit big-endian unsigned integer (u16 BE).
+//
+// FORMAT LAYOUT (byte-exact):
+//   offset  0..7 : magic = "farbfeld" (8 ASCII bytes, no NUL terminator)
+//   offset  8..11: u32 BE — image width  in pixels
+//   offset 12..15: u32 BE — image height in pixels
+//   offset 16+   : pixel data, row-major top-down
+//                  Each pixel is 8 bytes: R(u16 BE), G(u16 BE), B(u16 BE), A(u16 BE)
+//                  Total pixel bytes = width * height * 8
+//
+// Total file size = 16 + width * height * 8 bytes.
+//
+// PUBLIC API:
+//   ff_encode(w, h, px) -> bytes
+//     Encodes a w×h image to farbfeld format. px is a flat list of u16 values
+//     in RGBA order: [R0,G0,B0,A0, R1,G1,B1,A1, ...], length must be w*h*4.
+//     Each value is masked to 0..65535 via & 0xFFFF. Missing values are
+//     written as 0; extra values are ignored. Returns the full farbfeld file
+//     as a bytes value of length 16 + w*h*8.
+//
+//   ff_decode(b) -> dict
+//     Decodes a farbfeld bytes value. Returns {"w": int, "h": int, "px": list}
+//     where px is a flat RGBA list of u16 values, length = w*h*4. On invalid
+//     input (wrong magic, truncated data, zero dimensions) returns
+//     {"w": 0, "h": 0, "px": []}.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _ff_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Append a big-endian u32 to buffer out. Returns new buffer.
+fn _ff_append_u32be(out, v) -> bytes
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append a big-endian u16 to buffer out. Returns new buffer.
+fn _ff_append_u16be(out, v) -> bytes
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Read a big-endian u32 from bytes b at offset i.
+// Bounds-checks before reading; returns 0 if out of range.
+fn _ff_u32be(b, i) -> int
+    let blen = bytes_len(b)
+    if i + 3 >= blen
+        return 0
+    let b0 = bytes_get(b, i)
+    let b1 = bytes_get(b, i + 1)
+    let b2 = bytes_get(b, i + 2)
+    let b3 = bytes_get(b, i + 3)
+    ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & 0xFFFFFFFF
+
+// Read a big-endian u16 from bytes b at offset i.
+// Bounds-checks before reading; returns 0 if out of range.
+fn _ff_u16be(b, i) -> int
+    let blen = bytes_len(b)
+    if i + 1 >= blen
+        return 0
+    let hi = bytes_get(b, i)
+    let lo = bytes_get(b, i + 1)
+    (hi << 8) | lo
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ff_encode: produce a farbfeld file from RGBA u16 pixel data.
+//
+// Parameters:
+//   w  — image width  in pixels (u32 range: 1..4294967295)
+//   h  — image height in pixels (u32 range: 1..4294967295)
+//   px — flat list of u16 integers [R0,G0,B0,A0, R1,G1,B1,A1, ...],
+//        length should be w*h*4. Each value masked to 0..65535 via & 0xFFFF.
+//        Extra entries are ignored; missing entries are written as 0.
+//
+// Returns:
+//   bytes value: 16-byte farbfeld header followed by w*h*8 bytes of pixel data.
+//   Total length = 16 + w*h*8.
+//
+// Example (1x1 pixel, RGBA = [0x1234, 0x5678, 0x9ABC, 0xDEF0]):
+//   ff_encode(1, 1, [0x1234, 0x5678, 0x9ABC, 0xDEF0])
+//   -> 24 bytes; bytes[0..7]="farbfeld"; u32@8=1; u32@12=1;
+//      bytes[16..23] = 0x12,0x34,0x56,0x78,0x9A,0xBC,0xDE,0xF0
+fn ff_encode(w, h, px) -> bytes
+    let out = bytes(0)
+    // ── Magic: 8 ASCII bytes "farbfeld" ─────────────────────────────────────
+    out = bytes_append(out, 102)
+    out = bytes_append(out, 97)
+    out = bytes_append(out, 114)
+    out = bytes_append(out, 98)
+    out = bytes_append(out, 102)
+    out = bytes_append(out, 101)
+    out = bytes_append(out, 108)
+    out = bytes_append(out, 100)
+    // ── Width (u32 BE) ───────────────────────────────────────────────────────
+    out = _ff_append_u32be(out, w)
+    // ── Height (u32 BE) ──────────────────────────────────────────────────────
+    out = _ff_append_u32be(out, h)
+    // ── Pixel data: RGBA, each channel u16 BE ────────────────────────────────
+    let npix = w * h
+    let src_len = len(px)
+    let pi = 0
+    while pi < npix
+        let base = pi * 4
+        let rv = 0
+        let gv = 0
+        let bv = 0
+        let av = 0
+        if base < src_len
+            rv = px[base] & 0xFFFF
+        if base + 1 < src_len
+            gv = px[base + 1] & 0xFFFF
+        if base + 2 < src_len
+            bv = px[base + 2] & 0xFFFF
+        if base + 3 < src_len
+            av = px[base + 3] & 0xFFFF
+        out = _ff_append_u16be(out, rv)
+        out = _ff_append_u16be(out, gv)
+        out = _ff_append_u16be(out, bv)
+        out = _ff_append_u16be(out, av)
+        pi = pi + 1
+    out
+
+// ff_decode: parse a farbfeld bytes value into width, height, and flat RGBA u16 list.
+//
+// Validates:
+//   - Total length >= 16 (minimum header size)
+//   - bytes[0..7] == "farbfeld" (exact magic match)
+//   - Width > 0 and Height > 0
+//   - Total data length >= 16 + w*h*8 (sufficient pixel data)
+//
+// Returns dict {"w": int, "h": int, "px": list} where px is a flat RGBA u16 list,
+// length = w*h*4. Each u16 is in range 0..65535.
+// On any error returns {"w": 0, "h": 0, "px": []}.
+fn ff_decode(b) -> dict
+    let empty_px = []
+    let fail = {"w": 0, "h": 0, "px": empty_px}
+    let blen = bytes_len(b)
+    // Must have at least the 16-byte header
+    if blen < 16
+        return fail
+    // Validate magic: "farbfeld" = 102,97,114,98,102,101,108,100
+    if bytes_get(b, 0) != 102
+        return fail
+    if bytes_get(b, 1) != 97
+        return fail
+    if bytes_get(b, 2) != 114
+        return fail
+    if bytes_get(b, 3) != 98
+        return fail
+    if bytes_get(b, 4) != 102
+        return fail
+    if bytes_get(b, 5) != 101
+        return fail
+    if bytes_get(b, 6) != 108
+        return fail
+    if bytes_get(b, 7) != 100
+        return fail
+    // Read width and height (u32 BE)
+    let w = _ff_u32be(b, 8)
+    let h = _ff_u32be(b, 12)
+    // Sanity: zero-dimension image
+    if w == 0
+        return fail
+    if h == 0
+        return fail
+    // Verify sufficient pixel data
+    let npix = w * h
+    let needed = 16 + npix * 8
+    if blen < needed
+        return fail
+    // Read pixel data: each pixel is 8 bytes (R,G,B,A each u16 BE)
+    let px = []
+    let pi = 0
+    while pi < npix
+        let off = 16 + pi * 8
+        let rv = _ff_u16be(b, off)
+        let gv = _ff_u16be(b, off + 2)
+        let bv = _ff_u16be(b, off + 4)
+        let av = _ff_u16be(b, off + 6)
+        px.push(rv)
+        px.push(gv)
+        px.push(bv)
+        px.push(av)
+        pi = pi + 1
+    let result = {"w": w, "h": h, "px": px}
+    result

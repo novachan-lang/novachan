@@ -1,0 +1,209 @@
+// ============================================================================
+// NOVA Standard Library — std/media/ico
+// ============================================================================
+// ICO container codec — build and parse Windows .ico files.
+//
+// FORMAT OVERVIEW (all multi-byte fields LITTLE-ENDIAN)
+//
+//   ICONDIR (6 bytes at offset 0):
+//     offset 0: u16 reserved = 0
+//     offset 2: u16 type     = 1  (icon; 2 = cursor)
+//     offset 4: u16 count    = number of images
+//
+//   ICONDIRENTRY (16 bytes each, immediately after ICONDIR):
+//     @0   u8  width    (0 means 256)
+//     @1   u8  height   (0 means 256)
+//     @2   u8  ncolors  = 0  (0 = more than 256 or true-color)
+//     @3   u8  reserved = 0
+//     @4   u16 planes   = 1
+//     @6   u16 bitcount (bits per pixel: 1, 4, 8, 24, 32, …)
+//     @8   u32 bytesize (byte length of the image data blob)
+//     @12  u32 offset   (byte offset from start of file to image data blob)
+//
+//   IMAGE DATA BLOBS:
+//     Concatenated after all directory entries.
+//     First blob offset = 6 + 16 * count.
+//
+// PUBLIC API
+//   ico_build(entries) -> bytes
+//     Build a complete ICO file from a list of entry dicts.
+//     Each entry dict must have keys:
+//       "w"        : int — image width  (0..255; 0 = 256)
+//       "h"        : int — image height (0..255; 0 = 256)
+//       "bitcount" : int — bits per pixel (e.g. 32, 24, 8)
+//       "data"     : bytes — raw image blob (PNG or BMP DIB bytes)
+//     Returns bytes(0) if entries list is empty.
+//
+//   ico_parse(b) -> list
+//     Parse an ICO file and return a list of entry dicts.
+//     Each dict has keys:
+//       "w"      : int — width  (byte value; 0 = 256)
+//       "h"      : int — height (byte value; 0 = 256)
+//       "size"   : int — byte length of image blob
+//       "offset" : int — file offset of image blob
+//     Returns [] on invalid input (bad magic, truncated header).
+//
+// KNOWN-ANSWER FACTS (1-entry ICO, w=16 h=16 bitcount=32 data=bytes(40))
+//   count = 1  → first_blob_offset = 6 + 16*1 = 22
+//   ICONDIR bytes: 0,0, 1,0, 1,0
+//   ICONDIRENTRY at file offset 6:
+//     byte 6  (w)         = 16
+//     byte 7  (h)         = 16
+//     byte 8  (ncolors)   = 0
+//     byte 9  (reserved)  = 0
+//     bytes10-11 (planes) = 1, 0
+//     bytes12-13 (bpc)    = 32, 0   → u16 = 32
+//     bytes14-17 (size)   = 40, 0,0,0 → u32 = 40
+//     bytes18-21 (offset) = 22, 0,0,0 → u32 = 22
+//   Total file size = 22 + 40 = 62
+//
+// IMPLEMENTATION NOTES
+//   • All multi-byte fields are LITTLE-ENDIAN.
+//   • NOVA >> is arithmetic shift — always mask: (v>>k)&0xFF.
+//   • bytes_append returns a NEW bytes — always reassign.
+//   • Reserved words (match, loop, type, …) never used as variable names.
+//   • Single-exit style throughout to avoid NOVA early-return mistag.
+//   • Private helpers prefixed _ico_ to avoid link collisions.
+//   • LEAF module — imports nothing.
+// ============================================================================
+
+// ── Private: append a little-endian u16 to a bytes buffer ────────────────────
+fn _ico_put_u16le(b, v)
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out
+
+// ── Private: append a little-endian u32 to a bytes buffer ────────────────────
+fn _ico_put_u32le(b, v)
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out
+
+// ── Private: read a little-endian u16 from bytes b at offset i ───────────────
+// Returns 0 if out of range.
+fn _ico_get_u16le(b, i)
+    let blen = bytes_len(b)
+    let result = 0
+    if i + 1 < blen
+        let lo = bytes_get(b, i)
+        let hi = bytes_get(b, i + 1)
+        result = lo | (hi * 256)
+    result
+
+// ── Private: read a little-endian u32 from bytes b at offset i ───────────────
+// Returns 0 if out of range.
+fn _ico_get_u32le(b, i)
+    let blen = bytes_len(b)
+    let result = 0
+    if i + 3 < blen
+        let b0 = bytes_get(b, i)
+        let b1 = bytes_get(b, i + 1)
+        let b2 = bytes_get(b, i + 2)
+        let b3 = bytes_get(b, i + 3)
+        result = b0 | (b1 * 256) | (b2 * 65536) | (b3 * 16777216)
+    result
+
+// ── ico_build ─────────────────────────────────────────────────────────────────
+// Build a complete ICO file from a list of entry dicts.
+// Each dict: {"w": int, "h": int, "bitcount": int, "data": bytes}
+// Returns bytes(0) if entries is empty.
+fn ico_build(entries) -> bytes
+    let out = bytes(0)
+    let count = len(entries)
+    if count > 0
+        // Byte offset to first image blob = ICONDIR(6) + ICONDIRENTRY(16)*count
+        let blob_base = 6 + 16 * count
+        // ── ICONDIR (6 bytes) ──────────────────────────────────────────────
+        // u16 reserved = 0
+        out = _ico_put_u16le(out, 0)
+        // u16 type = 1 (icon)
+        out = _ico_put_u16le(out, 1)
+        // u16 count
+        out = _ico_put_u16le(out, count)
+        // ── ICONDIRENTRY array ─────────────────────────────────────────────
+        // Compute running offset for each blob.
+        let ei = 0
+        let cur_offset = blob_base
+        while ei < count
+            let entry = entries[ei]
+            let ew = entry["w"]
+            let eh = entry["h"]
+            let ebc = entry["bitcount"]
+            let edata = entry["data"]
+            let esize = bytes_len(edata)
+            // @0 u8 width
+            out = bytes_append(out, ew & 0xFF)
+            // @1 u8 height
+            out = bytes_append(out, eh & 0xFF)
+            // @2 u8 ncolors = 0
+            out = bytes_append(out, 0)
+            // @3 u8 reserved = 0
+            out = bytes_append(out, 0)
+            // @4 u16 planes = 1 (LE)
+            out = _ico_put_u16le(out, 1)
+            // @6 u16 bitcount (LE)
+            out = _ico_put_u16le(out, ebc)
+            // @8 u32 bytesize (LE)
+            out = _ico_put_u32le(out, esize)
+            // @12 u32 offset (LE)
+            out = _ico_put_u32le(out, cur_offset)
+            cur_offset = cur_offset + esize
+            ei = ei + 1
+        // ── Image data blobs (concatenated) ───────────────────────────────
+        let bi = 0
+        while bi < count
+            let bentry = entries[bi]
+            let bdata = bentry["data"]
+            out = bytes_concat(out, bdata)
+            bi = bi + 1
+    out
+
+// ── ico_parse ─────────────────────────────────────────────────────────────────
+// Parse an ICO bytes value. Returns list of dicts:
+//   [{"w": int, "h": int, "size": int, "offset": int}, ...]
+// Returns [] on invalid input (bad magic, truncated data).
+fn ico_parse(b) -> list
+    let empty = []
+    let result = empty
+    let blen = bytes_len(b)
+    let ok = 1
+    // Need at least 6 bytes for ICONDIR
+    if blen < 6
+        ok = 0
+    if ok == 1
+        // u16@0 reserved must be 0
+        let reserved = _ico_get_u16le(b, 0)
+        if reserved != 0
+            ok = 0
+    if ok == 1
+        // u16@2 type must be 1 (icon) or 2 (cursor) — accept both
+        let itype = _ico_get_u16le(b, 2)
+        if itype != 1
+            if itype != 2
+                ok = 0
+    if ok == 1
+        let count = _ico_get_u16le(b, 4)
+        // Need at least 6 + count*16 bytes for all directory entries
+        let dir_end = 6 + count * 16
+        if blen < dir_end
+            ok = 0
+        if ok == 1
+            let entries = []
+            let ei = 0
+            while ei < count
+                let entry_off = 6 + ei * 16
+                // bounds check: entry_off + 15 must be within file
+                if entry_off + 15 < blen
+                    let ew = bytes_get(b, entry_off)
+                    let eh = bytes_get(b, entry_off + 1)
+                    let esize = _ico_get_u32le(b, entry_off + 8)
+                    let eoffset = _ico_get_u32le(b, entry_off + 12)
+                    let edict = {"w": ew, "h": eh, "size": esize, "offset": eoffset}
+                    entries.push(edict)
+                ei = ei + 1
+            result = entries
+    result

@@ -1,0 +1,254 @@
+// KAT test for std/media/qoi
+// Known-answer tests covering:
+//   (a) Header magic bytes 'q','o','i','f' and dimensions
+//   (b) 3-identical-pixel encode contains a RUN byte in [0xC0..0xFD]
+//   (c) Full round-trip: qoi_decode(qoi_encode(...)) == input for w=2,h=2,ch=3
+//   (d) RGBA channels round-trip
+//   (e) All six decoder ops: RGB, RGBA, INDEX, DIFF, LUMA, RUN
+//   (f) Malformed input decode returns zero/empty
+import std/media/qoi
+
+fn cki(label, got, want)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn main()
+    // ── KAT 1: Header magic ──────────────────────────────────────────────────
+    // Encode a 1x1 RGB image; check magic bytes 0-3 = 'q','o','i','f'
+    let px1 = [100, 150, 200]
+    let enc1 = qoi_encode(1, 1, 3, px1)
+    cki("magic0", bytes_get(enc1, 0), 0x71)
+    cki("magic1", bytes_get(enc1, 1), 0x6F)
+    cki("magic2", bytes_get(enc1, 2), 0x69)
+    cki("magic3", bytes_get(enc1, 3), 0x66)
+
+    // ── KAT 2: Header dimensions (BE u32) ───────────────────────────────────
+    // 2x3 image; width bytes 4-7, height bytes 8-11
+    let px23 = [1,2,3, 4,5,6, 7,8,9, 10,11,12, 13,14,15, 16,17,18]
+    let enc23 = qoi_encode(2, 3, 3, px23)
+    let w_be = (bytes_get(enc23, 4) * 16777216) + (bytes_get(enc23, 5) * 65536) + (bytes_get(enc23, 6) * 256) + bytes_get(enc23, 7)
+    let h_be = (bytes_get(enc23, 8) * 16777216) + (bytes_get(enc23, 9) * 65536) + (bytes_get(enc23, 10) * 256) + bytes_get(enc23, 11)
+    cki("hdr_width", w_be, 2)
+    cki("hdr_height", h_be, 3)
+    cki("hdr_channels", bytes_get(enc23, 12), 3)
+    cki("hdr_colorspace", bytes_get(enc23, 13), 0)
+
+    // ── KAT 3: Minimum size = 14 (header) + 8 (end marker) ─────────────────
+    // A 1x1 pixel that differs from prev=(0,0,0,255) encodes as RGB op (4 bytes) or DIFF/LUMA
+    // Total >= 22 bytes always
+    let blen1 = bytes_len(enc1)
+    if blen1 < 22
+        print("FAIL min_size: got=" + str(blen1) + " want>=22")
+        exit(1)
+
+    // ── KAT 4: End marker — last 8 bytes must be 0,0,0,0,0,0,0,1 ───────────
+    let blen23 = bytes_len(enc23)
+    cki("end0", bytes_get(enc23, blen23 - 8), 0)
+    cki("end1", bytes_get(enc23, blen23 - 7), 0)
+    cki("end2", bytes_get(enc23, blen23 - 6), 0)
+    cki("end3", bytes_get(enc23, blen23 - 5), 0)
+    cki("end4", bytes_get(enc23, blen23 - 4), 0)
+    cki("end5", bytes_get(enc23, blen23 - 3), 0)
+    cki("end6", bytes_get(enc23, blen23 - 2), 0)
+    cki("end7", bytes_get(enc23, blen23 - 1), 1)
+
+    // ── KAT 5: RUN encoding — 3 identical pixels must produce a RUN byte ────
+    // For channels=3 image with 3 identical pixels (r=50,g=60,b=70):
+    //   pixel 0: prev=(0,0,0,255), differs → RGB op: 0xFE,50,60,70  (updates prev)
+    //   pixel 1: same as prev → run accumulates
+    //   pixel 2: same as prev → run=2, end of image → flush: 0xC0|(2-1)=0xC1
+    // Body bytes (between header and end marker):
+    //   byte 14 = 0xFE (RGB tag)
+    //   byte 15 = 50 (r)
+    //   byte 16 = 60 (g)
+    //   byte 17 = 70 (b)
+    //   byte 18 = 0xC1 (RUN, length=2)
+    // Total = 14 + 5 + 8 = 27 bytes
+    let px3same = [50, 60, 70, 50, 60, 70, 50, 60, 70]
+    let enc3same = qoi_encode(1, 3, 3, px3same)
+    cki("run_total_len", bytes_len(enc3same), 27)
+    cki("run_rgb_tag", bytes_get(enc3same, 14), 0xFE)
+    cki("run_rgb_r", bytes_get(enc3same, 15), 50)
+    cki("run_rgb_g", bytes_get(enc3same, 16), 60)
+    cki("run_rgb_b", bytes_get(enc3same, 17), 70)
+    // The run byte must be in [0xC0..0xFD]: here 0xC1
+    let run_byte = bytes_get(enc3same, 18)
+    if run_byte < 0xC0
+        print("FAIL run_byte_lo: got=" + str(run_byte) + " want>=0xC0")
+        exit(1)
+    if run_byte > 0xFD
+        print("FAIL run_byte_hi: got=" + str(run_byte) + " want<=0xFD")
+        exit(1)
+    cki("run_byte_exact", run_byte, 0xC1)
+
+    // ── KAT 6: PRIMARY GATE — full round-trip w=2,h=2,ch=3 ─────────────────
+    // px=[10,20,30, 10,20,30, 40,50,60, 0,0,0]
+    // Pixel 0: prev=(0,0,0,255), dr=10,dg=20,db=30. DIFF/LUMA?
+    //   dg=20 in [-32,31], dr-dg=10-20=-10 NOT in [-8,7]. LUMA fails.
+    //   dr=10 NOT in [-2,1]. DIFF fails. → RGB: 0xFE,10,20,30
+    // Pixel 1: same as pixel 0 (10,20,30,255) = prev → run=1
+    // Pixel 2: (40,50,60,255). Flush run=1 → 0xC0. dg=30, dr-dg=30-30=0, db-dg=30-30=0 → LUMA: 0xBE,0x88
+    // Pixel 3: (0,0,0,255). prev=(40,50,60,255). No DIFF/LUMA (dr=-40). No index match. → RGB: 0xFE,0,0,0
+    // Body: 0xFE,10,20,30, 0xC0, 0xBE,0x88, 0xFE,0,0,0  = 11 bytes
+    // Total = 14 + 11 + 8 = 33 bytes
+    let rt_px = [10, 20, 30, 10, 20, 30, 40, 50, 60, 0, 0, 0]
+    let rt_enc = qoi_encode(2, 2, 3, rt_px)
+    cki("rt_enc_len", bytes_len(rt_enc), 33)
+    // Verify header
+    cki("rt_hdr_w", (bytes_get(rt_enc, 4) * 16777216) + (bytes_get(rt_enc, 5) * 65536) + (bytes_get(rt_enc, 6) * 256) + bytes_get(rt_enc, 7), 2)
+    cki("rt_hdr_h", (bytes_get(rt_enc, 8) * 16777216) + (bytes_get(rt_enc, 9) * 65536) + (bytes_get(rt_enc, 10) * 256) + bytes_get(rt_enc, 11), 2)
+    // Verify body bytes
+    cki("rt_b14", bytes_get(rt_enc, 14), 0xFE)
+    cki("rt_b15", bytes_get(rt_enc, 15), 10)
+    cki("rt_b16", bytes_get(rt_enc, 16), 20)
+    cki("rt_b17", bytes_get(rt_enc, 17), 30)
+    cki("rt_b18", bytes_get(rt_enc, 18), 0xC0)
+    cki("rt_b19", bytes_get(rt_enc, 19), 0xBE)
+    cki("rt_b20", bytes_get(rt_enc, 20), 0x88)
+    cki("rt_b21", bytes_get(rt_enc, 21), 0xFE)
+    cki("rt_b22", bytes_get(rt_enc, 22), 0)
+    cki("rt_b23", bytes_get(rt_enc, 23), 0)
+    cki("rt_b24", bytes_get(rt_enc, 24), 0)
+    // Now decode and verify round-trip
+    let rt_dec = qoi_decode(rt_enc)
+    cki("rt_dec_w", rt_dec["w"], 2)
+    cki("rt_dec_h", rt_dec["h"], 2)
+    cki("rt_dec_ch", rt_dec["channels"], 3)
+    let rt_out = rt_dec["px"]
+    cki("rt_px_len", len(rt_out), 12)
+    cki("rt_p0_r", rt_out[0], 10)
+    cki("rt_p0_g", rt_out[1], 20)
+    cki("rt_p0_b", rt_out[2], 30)
+    cki("rt_p1_r", rt_out[3], 10)
+    cki("rt_p1_g", rt_out[4], 20)
+    cki("rt_p1_b", rt_out[5], 30)
+    cki("rt_p2_r", rt_out[6], 40)
+    cki("rt_p2_g", rt_out[7], 50)
+    cki("rt_p2_b", rt_out[8], 60)
+    cki("rt_p3_r", rt_out[9], 0)
+    cki("rt_p3_g", rt_out[10], 0)
+    cki("rt_p3_b", rt_out[11], 0)
+
+    // ── KAT 7: RGBA channels round-trip ─────────────────────────────────────
+    // 2 RGBA pixels: (10,20,30,255) and (10,20,30,128) — alpha differs on pixel 1
+    // pixel 0: prev=(0,0,0,255), alpha unchanged, dr=10,dg=20,db=30 → RGB
+    // pixel 1: alpha changes 255→128 → RGBA
+    let rgba_px = [10, 20, 30, 255, 10, 20, 30, 128]
+    let rgba_enc = qoi_encode(2, 1, 4, rgba_px)
+    let rgba_dec = qoi_decode(rgba_enc)
+    cki("rgba_w", rgba_dec["w"], 2)
+    cki("rgba_h", rgba_dec["h"], 1)
+    cki("rgba_ch", rgba_dec["channels"], 4)
+    let rgba_out = rgba_dec["px"]
+    cki("rgba_px_len", len(rgba_out), 8)
+    cki("rgba_p0_r", rgba_out[0], 10)
+    cki("rgba_p0_g", rgba_out[1], 20)
+    cki("rgba_p0_b", rgba_out[2], 30)
+    cki("rgba_p0_a", rgba_out[3], 255)
+    cki("rgba_p1_r", rgba_out[4], 10)
+    cki("rgba_p1_g", rgba_out[5], 20)
+    cki("rgba_p1_b", rgba_out[6], 30)
+    cki("rgba_p1_a", rgba_out[7], 128)
+
+    // ── KAT 8: INDEX op — second occurrence of a pixel hits index ───────────
+    // 3 pixels: A, B, A — pixel 2 should hit INDEX for pixel A
+    // A=(10,20,30), B=(50,60,70), A=(10,20,30)
+    // pixel 0: RGB for A → stored in idx[hash(10,20,30,255)]
+    // pixel 1: RGB for B (differs enough from A, no DIFF/LUMA) → stored in idx[hash(50,60,70,255)]
+    // pixel 2: same as A(10,20,30,255)? prev is B. Not run. INDEX check hits.
+    // hash(10,20,30,255) = (30+100+210+2805)%64 = 3145%64
+    // 3145/64 = 49 remainder 9. So hash=9, INDEX op = 0x00|9 = 0x09
+    let idx_px = [10, 20, 30, 50, 60, 70, 10, 20, 30]
+    let idx_enc = qoi_encode(3, 1, 3, idx_px)
+    let idx_dec = qoi_decode(idx_enc)
+    let idx_out = idx_dec["px"]
+    cki("idx_px_len", len(idx_out), 9)
+    cki("idx_p2_r", idx_out[6], 10)
+    cki("idx_p2_g", idx_out[7], 20)
+    cki("idx_p2_b", idx_out[8], 30)
+
+    // ── KAT 9: DIFF op — small delta encodes in 1 byte ──────────────────────
+    // Start with pixel (100,100,100,255), then (101,101,101,255)
+    // prev=(0,0,0,255) → (100,100,100,255): dr=100 too big → RGB
+    // Then prev=(100,100,100,255) → (101,101,101,255): dr=dg=db=1, in [-2,1] → DIFF
+    // DIFF byte = 0x40 | ((1+2)<<4) | ((1+2)<<2) | (1+2) = 0x40|0x30|0x0C|0x03 = 0x7F
+    let diff_px = [100, 100, 100, 101, 101, 101]
+    let diff_enc = qoi_encode(2, 1, 3, diff_px)
+    let diff_dec = qoi_decode(diff_enc)
+    let diff_out = diff_dec["px"]
+    cki("diff_p1_r", diff_out[3], 101)
+    cki("diff_p1_g", diff_out[4], 101)
+    cki("diff_p1_b", diff_out[5], 101)
+    // Verify DIFF byte exists in body: pixel 1 op should be 0x7F at offset 18 (after 14 hdr + 4 RGB bytes)
+    cki("diff_byte", bytes_get(diff_enc, 18), 0x7F)
+
+    // ── KAT 10: LUMA op — medium delta encodes in 2 bytes ───────────────────
+    // From (40,50,60,255) to (70,80,90,255): dg=30, dr-dg=30-30=0, db-dg=30-30=0
+    // First pixel from prev=(0,0,0,255): RGB 0xFE,40,50,60
+    // Second pixel LUMA: 0x80|(30+32)=0xBE, ((0+8)<<4)|(0+8)=0x88
+    let luma_px = [40, 50, 60, 70, 80, 90]
+    let luma_enc = qoi_encode(2, 1, 3, luma_px)
+    // body: 0xFE,40,50,60 (4 bytes), 0xBE,0x88 (2 bytes). Total=14+6+8=28
+    cki("luma_enc_len", bytes_len(luma_enc), 28)
+    cki("luma_b18", bytes_get(luma_enc, 18), 0xBE)
+    cki("luma_b19", bytes_get(luma_enc, 19), 0x88)
+    let luma_dec = qoi_decode(luma_enc)
+    let luma_out = luma_dec["px"]
+    cki("luma_p1_r", luma_out[3], 70)
+    cki("luma_p1_g", luma_out[4], 80)
+    cki("luma_p1_b", luma_out[5], 90)
+
+    // ── KAT 11: Malformed input — too short → empty result ──────────────────
+    let bad_short = bytes(5)
+    let bad_dec = qoi_decode(bad_short)
+    cki("bad_short_w", bad_dec["w"], 0)
+    cki("bad_short_h", bad_dec["h"], 0)
+    cki("bad_short_ch", bad_dec["channels"], 0)
+
+    // ── KAT 12: Wrong magic → empty result ──────────────────────────────────
+    let bad_magic = bytes(0)
+    bad_magic = bytes_append(bad_magic, 0x50)
+    bad_magic = bytes_append(bad_magic, 0x4E)
+    bad_magic = bytes_append(bad_magic, 0x47)
+    bad_magic = bytes_append(bad_magic, 0x0D)
+    let bm_i = 0
+    while bm_i < 18
+        bad_magic = bytes_append(bad_magic, 0)
+        bm_i = bm_i + 1
+    let bad_m_dec = qoi_decode(bad_magic)
+    cki("bad_magic_w", bad_m_dec["w"], 0)
+
+    // ── KAT 13: 1x1 round-trip (single pixel, no RUN) ───────────────────────
+    let px_1x1 = [200, 100, 50]
+    let enc_1x1 = qoi_encode(1, 1, 3, px_1x1)
+    let dec_1x1 = qoi_decode(enc_1x1)
+    cki("1x1_w", dec_1x1["w"], 1)
+    cki("1x1_h", dec_1x1["h"], 1)
+    let out_1x1 = dec_1x1["px"]
+    cki("1x1_r", out_1x1[0], 200)
+    cki("1x1_g", out_1x1[1], 100)
+    cki("1x1_b", out_1x1[2], 50)
+
+    // ── KAT 14: Max run of 62 pixels ─────────────────────────────────────────
+    // 63 identical pixels: first → RGB, then 62 run (emits 0xFF=run of 62), no residual
+    // Actually: pixel 0 = RGB; pixels 1-62 = run=62 (flush: 0xC0|61=0xFD); pixel 63-? none
+    // Wait: 63 total pixels = pixel 0 RGB, then pixels 1..62 = 62 pixels = run=62 → flush 0xFD
+    // Body: 0xFE,r,g,b (4 bytes) + 0xFD (1 byte) = 5 bytes. Total = 14+5+8=27
+    let run62_px = []
+    let ri = 0
+    while ri < 63
+        run62_px.push(77)
+        run62_px.push(88)
+        run62_px.push(99)
+        ri = ri + 1
+    let run62_enc = qoi_encode(63, 1, 3, run62_px)
+    cki("run62_len", bytes_len(run62_enc), 27)
+    cki("run62_run_byte", bytes_get(run62_enc, 18), 0xFD)
+    let run62_dec = qoi_decode(run62_enc)
+    let run62_out = run62_dec["px"]
+    cki("run62_px_len", len(run62_out), 189)
+    cki("run62_p0_r", run62_out[0], 77)
+    cki("run62_p62_r", run62_out[186], 77)
+
+    print("PASS _qoi_test")

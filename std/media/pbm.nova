@@ -1,0 +1,334 @@
+// ============================================================================
+// NOVA Standard Library — std/media/pbm
+// ============================================================================
+// Netpbm PBM (Portable Bit Map) — 1-bit black-and-white image codec.
+//
+// Two formats supported:
+//   P4 (binary): compact bit-packed binary format.
+//     Header: "P4\n<w> <h>\n" followed by bit-packed rows, MSB first.
+//     Each row is ceil(w/8) bytes. Pixels past column w in last byte are
+//     zero (padding). 1=black, 0=white.
+//
+//   P1 (ASCII/plain): human-readable text format.
+//     Header: "P1\n<w> <h>\n" followed by rows of '0'/'1' chars separated by
+//     spaces, one row per line. 1=black, 0=white.
+//
+// PUBLIC API:
+//   pbm_p4_encode(w, h, px) -> bytes
+//     Encode a flat pixel list (length w*h, values 0 or 1) to P4 binary bytes.
+//     Rows are bit-packed MSB first, padded to full bytes per row.
+//     Returns bytes(0) if w<=0 or h<=0 or len(px) < w*h.
+//
+//   pbm_p4_decode(b) -> dict
+//     Decode P4 binary bytes. Returns dict with keys:
+//       "w" -> int width, "h" -> int height, "px" -> list of 0/1 ints.
+//     Returns {"w":0,"h":0,"px":[]} on any error (bad magic, truncated data).
+//
+//   pbm_p1_encode(w, h, px) -> string
+//     Encode a flat pixel list to P1 ASCII text. Returns "" on bad args.
+//
+//   pbm_p1_decode(s) -> dict
+//     Decode P1 ASCII text. Returns dict with same keys as pbm_p4_decode.
+//     Returns {"w":0,"h":0,"px":[]} on any error.
+//
+// px convention: flat list, row-major, index = row*w + col.
+// Values must be 0 or 1. The encoder treats any non-zero as 1 (black).
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers prefixed _pbm_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Return 1 if character c is ASCII whitespace (space, tab, newline, cr).
+fn _pbm_is_ws(c) -> int
+    if c == " "
+        return 1
+    if c == "\t"
+        return 1
+    if c == "\n"
+        return 1
+    if c == "\r"
+        return 1
+    return 0
+
+// Skip whitespace and '#'-comments in string s starting at i.
+// Returns new offset past all whitespace and comment lines.
+fn _pbm_skip_ws_comments(s, i) -> int
+    let slen = len(s)
+    let go = 1
+    while go == 1
+        // skip any whitespace chars
+        while i < slen and _pbm_is_ws(s[i]) == 1
+            i = i + 1
+        // if comment, skip to end of line
+        if i < slen and s[i] == "#"
+            i = i + 1
+            while i < slen and s[i] != "\n"
+                i = i + 1
+            // skip the newline itself
+            if i < slen
+                i = i + 1
+        else
+            let go = 0
+    return i
+
+// Parse a non-negative decimal integer from string s at offset i.
+// Returns 2-list [value, next_offset].
+fn _pbm_parse_int(s, i) -> list
+    let slen = len(s)
+    let val = 0
+    while i < slen and ord(s[i]) >= 48 and ord(s[i]) <= 57
+        val = val * 10 + (ord(s[i]) - 48)
+        i = i + 1
+    let result = []
+    result.push(val)
+    result.push(i)
+    return result
+
+// Skip whitespace bytes (space=32, tab=9, newline=10, cr=13) in bytes b.
+fn _pbm_skip_ws_bytes(b, i) -> int
+    let blen = bytes_len(b)
+    let running = 1
+    while running == 1
+        if i >= blen
+            let running = 0
+        else
+            let v = bytes_get(b, i)
+            if v == 32
+                i = i + 1
+            else
+                if v == 9
+                    i = i + 1
+                else
+                    if v == 10
+                        i = i + 1
+                    else
+                        if v == 13
+                            i = i + 1
+                        else
+                            let running = 0
+    return i
+
+// Parse a non-negative decimal integer from bytes b at offset i.
+// Returns 2-list [value, next_offset].
+fn _pbm_parse_int_bytes(b, i) -> list
+    let blen = bytes_len(b)
+    let val = 0
+    let running = 1
+    while running == 1
+        if i >= blen
+            let running = 0
+        else
+            let v = bytes_get(b, i)
+            if v >= 48 and v <= 57
+                val = val * 10 + (v - 48)
+                i = i + 1
+            else
+                let running = 0
+    let result = []
+    result.push(val)
+    result.push(i)
+    return result
+
+// Advance past exactly one whitespace byte (handles \r\n or \n or \r or space).
+// Required by PBM spec: exactly one whitespace char separates header from raster.
+fn _pbm_skip_newline_bytes(b, i) -> int
+    let blen = bytes_len(b)
+    if i >= blen
+        return i
+    let v = bytes_get(b, i)
+    if v == 13
+        i = i + 1
+        if i < blen and bytes_get(b, i) == 10
+            i = i + 1
+    else
+        if v == 10
+            i = i + 1
+        else
+            if v == 32
+                i = i + 1
+    return i
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// Encode w*h pixels (flat list, 0=white, 1=black) to P4 binary PBM bytes.
+// Row stride = ceil(w/8) bytes; pixels past column w in last byte are zero.
+fn pbm_p4_encode(w, h, px) -> bytes
+    if w <= 0
+        return bytes(0)
+    if h <= 0
+        return bytes(0)
+    let need = w * h
+    if len(px) < need
+        return bytes(0)
+    // Build header: "P4\n<w> <h>\n"
+    let hdr = "P4\n" + str(w) + " " + str(h) + "\n"
+    let out = str_to_bytes(hdr)
+    // Bytes per row = ceil(w/8)
+    let row_bytes = (w + 7) / 8
+    let row = 0
+    while row < h
+        let byte_idx = 0
+        while byte_idx < row_bytes
+            // Pack up to 8 pixels into one byte, MSB first.
+            // Pixel at column (byte_idx*8 + k) maps to bit (7-k).
+            let bval = 0
+            let bit = 7
+            while bit >= 0
+                let pixel_col = byte_idx * 8 + (7 - bit)
+                if pixel_col < w
+                    let pv = px[row * w + pixel_col]
+                    if pv != 0
+                        let bval = bval | (1 << bit)
+                bit = bit - 1
+            let out = bytes_append(out, bval)
+            byte_idx = byte_idx + 1
+        row = row + 1
+    return out
+
+// Decode P4 binary PBM bytes. Returns {"w":w,"h":h,"px":pixels} or error dict.
+fn pbm_p4_decode(b) -> dict
+    let err = {"w": 0, "h": 0, "px": []}
+    let blen = bytes_len(b)
+    if blen < 4
+        return err
+    // Check magic "P4": 'P'=80, '4'=52
+    if bytes_get(b, 0) != 80
+        return err
+    if bytes_get(b, 1) != 52
+        return err
+    // Skip whitespace after magic, parse width
+    let i = _pbm_skip_ws_bytes(b, 2)
+    let wr = _pbm_parse_int_bytes(b, i)
+    let w = wr[0]
+    i = wr[1]
+    if w <= 0
+        return err
+    // Skip whitespace, parse height
+    i = _pbm_skip_ws_bytes(b, i)
+    let hr = _pbm_parse_int_bytes(b, i)
+    let h = hr[0]
+    i = hr[1]
+    if h <= 0
+        return err
+    // Skip exactly one whitespace byte (required by spec after last header value)
+    i = _pbm_skip_newline_bytes(b, i)
+    // Validate raster size
+    let row_bytes = (w + 7) / 8
+    let total_bytes = row_bytes * h
+    if i + total_bytes > blen
+        return err
+    // Decode pixels: for each row, for each byte, unpack 8 bits MSB first.
+    // Unrolled to avoid nested while-push scoping issues.
+    let px = []
+    let row = 0
+    while row < h
+        let byte_idx = 0
+        while byte_idx < row_bytes
+            let bv = bytes_get(b, i)
+            i = i + 1
+            // Unpack 8 bit positions, MSB (bit7) first, skipping padding columns.
+            let cbase = byte_idx * 8
+            if cbase + 0 < w
+                px.push((bv >> 7) & 1)
+            if cbase + 1 < w
+                px.push((bv >> 6) & 1)
+            if cbase + 2 < w
+                px.push((bv >> 5) & 1)
+            if cbase + 3 < w
+                px.push((bv >> 4) & 1)
+            if cbase + 4 < w
+                px.push((bv >> 3) & 1)
+            if cbase + 5 < w
+                px.push((bv >> 2) & 1)
+            if cbase + 6 < w
+                px.push((bv >> 1) & 1)
+            if cbase + 7 < w
+                px.push(bv & 1)
+            byte_idx = byte_idx + 1
+        row = row + 1
+    return {"w": w, "h": h, "px": px}
+
+// Encode w*h pixels to P1 ASCII PBM string.
+fn pbm_p1_encode(w, h, px) -> string
+    if w <= 0
+        return ""
+    if h <= 0
+        return ""
+    let need = w * h
+    if len(px) < need
+        return ""
+    let out = "P1\n" + str(w) + " " + str(h) + "\n"
+    let row = 0
+    while row < h
+        let row_str = ""
+        let col = 0
+        while col < w
+            let pv = px[row * w + col]
+            if col == 0
+                if pv != 0
+                    row_str = row_str + "1"
+                else
+                    row_str = row_str + "0"
+            else
+                if pv != 0
+                    row_str = row_str + " 1"
+                else
+                    row_str = row_str + " 0"
+            col = col + 1
+        out = out + row_str + "\n"
+        row = row + 1
+    return out
+
+// Decode P1 ASCII PBM string. Returns {"w":w,"h":h,"px":pixels} or error dict.
+fn pbm_p1_decode(s) -> dict
+    let err = {"w": 0, "h": 0, "px": []}
+    let slen = len(s)
+    if slen < 4
+        return err
+    // Check magic "P1"
+    if s[0] != "P"
+        return err
+    if s[1] != "1"
+        return err
+    let i = 2
+    // Skip whitespace/comments, parse width
+    i = _pbm_skip_ws_comments(s, i)
+    let wr = _pbm_parse_int(s, i)
+    let w = wr[0]
+    i = wr[1]
+    if w <= 0
+        return err
+    // Skip whitespace/comments, parse height
+    i = _pbm_skip_ws_comments(s, i)
+    let hr = _pbm_parse_int(s, i)
+    let h = hr[0]
+    i = hr[1]
+    if h <= 0
+        return err
+    // Skip whitespace/comments before raster data
+    i = _pbm_skip_ws_comments(s, i)
+    // Read w*h pixel values (0 or 1) separated by whitespace
+    let px = []
+    let total = w * h
+    let count = 0
+    while count < total
+        i = _pbm_skip_ws_comments(s, i)
+        if i >= slen
+            return err
+        let ch = s[i]
+        if ch == "0"
+            px.push(0)
+            count = count + 1
+            i = i + 1
+        else
+            if ch == "1"
+                px.push(1)
+                count = count + 1
+                i = i + 1
+            else
+                // unexpected character — malformed
+                return err
+    return {"w": w, "h": h, "px": px}

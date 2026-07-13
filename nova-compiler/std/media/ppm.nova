@@ -1,0 +1,236 @@
+// ============================================================================
+// NOVA Standard Library — std/media/ppm
+// ============================================================================
+// Netpbm PPM (Portable Pixmap) color image codec.
+//
+// Supports both binary (P6) and ASCII (P3) variants of the PPM format.
+// PPM stores w*h*3 raw bytes (R,G,B) in row-major, top-down order.
+//
+// PUBLIC API:
+//   ppm_p6_encode(w, h, px) -> bytes      encode pixels to P6 binary PPM
+//   ppm_p6_decode(b)        -> dict       decode P6 bytes; keys: "w","h","px"
+//   ppm_p3_encode(w, h, px) -> string     encode pixels to P3 ASCII PPM
+//   ppm_p3_decode(s)        -> dict       decode P3 string; keys: "w","h","px"
+//
+// px = flat list of ints, length w*h*3, order: R0,G0,B0,R1,G1,B1,...
+// Pixel values must be 0..255.  maxval=255 is the only supported value.
+//
+// On malformed input (bad magic, truncated data, maxval != 255), decode
+// functions return an empty dict {}.
+//
+// P6 BINARY FORMAT:
+//   Header (ASCII):  "P6\n<w> <h>\n255\n"
+//   Pixel data:      w*h*3 raw bytes, R G B per pixel, row-major top-down.
+//
+// P3 ASCII FORMAT:
+//   Header (text):   "P3\n<w> <h>\n255\n"
+//   Pixel data:      decimal R G B values, whitespace-separated.
+//   (PPM spec allows comments with '#'; we strip them on decode.)
+//
+// IMPLEMENTATION NOTES:
+//   • All private helpers prefixed _ppm_ to avoid link collisions.
+//   • bytes_append returns a NEW bytes — always reassign.
+//   • >> is arithmetic in NOVA — always mask: (v >> k) & 0xFF.
+//   • P6 header built with str_to_bytes (header is pure ASCII, no 0x00).
+//   • P3 is entirely text — string arithmetic throughout.
+//   • Bounds-check every bytes_get: verify i < bytes_len(b) before access.
+//   • In _ppm_parse_int_b: use `break` to exit at the non-digit byte;
+//     `i = blen` as a break substitute corrupts the returned position.
+//   • push(list, val) and list.push(val) are MUTABLE in-place push.
+//     The reassigning form `list = push(list, expr)` mis-compiles in the
+//     type-checker when expr is computed (e.g. bytes_get(b, pos+i) or a
+//     string accumulated in a loop). Use the mutable forms throughout.
+//   • LEAF module — imports nothing.
+// ============================================================================
+
+// ── Private: skip whitespace (and #-comment lines) in a bytes buffer ────────
+// Returns index of first non-whitespace, non-comment byte at or after pos.
+// Whitespace: space(32) tab(9) CR(13) LF(10).
+// Comment: '#'(35) starts a comment running to end-of-line (LF).
+fn _ppm_skip_ws_b(b, pos, blen) -> int
+    let i = pos
+    while i < blen
+        let c = bytes_get(b, i)
+        if c == 32 or c == 9 or c == 13 or c == 10
+            i = i + 1
+        else
+            if c == 35
+                // '#' comment — skip to end of line
+                i = i + 1
+                while i < blen and bytes_get(b, i) != 10
+                    i = i + 1
+            else
+                return i
+    return i
+
+// ── Private: parse a non-negative decimal integer from bytes buffer ──────────
+// Returns [value, new_pos] where new_pos points at the first non-digit byte.
+// If no digit found at pos, returns [-1, pos].
+// Uses `break` to exit at the non-digit position (not `i = blen`).
+fn _ppm_parse_int_b(b, pos, blen) -> list
+    let i = pos
+    let v = 0
+    let found = 0
+    while i < blen
+        let c = bytes_get(b, i)
+        if c >= 48 and c <= 57
+            v = v * 10 + c - 48
+            i = i + 1
+            found = 1
+        else
+            break
+    if found == 0
+        let r = [-1, pos]
+        return r
+    let r = [v, i]
+    return r
+
+// ── ppm_p6_encode ───────────────────────────────────────────────────────────
+// Encode a flat RGB pixel list (length w*h*3) into a P6 binary PPM bytes value.
+// Header is "P6\n<w> <h>\n255\n" (ASCII), followed by raw R,G,B bytes.
+fn ppm_p6_encode(w, h, px) -> bytes
+    // Build ASCII header as string then convert to bytes (header has no 0x00).
+    let hdr = "P6\n" + str(w) + " " + str(h) + "\n255\n"
+    let out = str_to_bytes(hdr)
+    // Append raw pixel bytes (w*h*3 total).
+    let npix = w * h * 3
+    let i = 0
+    while i < npix
+        out = bytes_append(out, px[i] & 0xFF)
+        i = i + 1
+    out
+
+// ── ppm_p6_decode ───────────────────────────────────────────────────────────
+// Decode a P6 binary PPM bytes value.
+// Returns dict {"w": int, "h": int, "px": list} on success,
+// or empty dict {} on malformed input (bad magic, maxval != 255, truncated).
+fn ppm_p6_decode(b) -> dict
+    let empty = {}
+    let blen = bytes_len(b)
+    // Minimum: "P6\n1 1\n255\n" (11 bytes) + 3 pixel bytes = 14
+    if blen < 14
+        return empty
+    // Validate magic: 'P'(80) '6'(54)
+    if bytes_get(b, 0) != 80 or bytes_get(b, 1) != 54
+        return empty
+    // Skip past magic and whitespace to find width
+    let pos = _ppm_skip_ws_b(b, 2, blen)
+    // Parse width
+    let wr = _ppm_parse_int_b(b, pos, blen)
+    if wr[0] <= 0
+        return empty
+    let w = wr[0]
+    pos = wr[1]
+    // Skip whitespace, parse height
+    pos = _ppm_skip_ws_b(b, pos, blen)
+    let hr = _ppm_parse_int_b(b, pos, blen)
+    if hr[0] <= 0
+        return empty
+    let h = hr[0]
+    pos = hr[1]
+    // Skip whitespace, parse maxval (must be 255 for 8-bit)
+    pos = _ppm_skip_ws_b(b, pos, blen)
+    let mr = _ppm_parse_int_b(b, pos, blen)
+    if mr[0] != 255
+        return empty
+    pos = mr[1]
+    // After maxval: exactly one whitespace byte before pixel data (PPM spec §3)
+    if pos >= blen
+        return empty
+    pos = pos + 1
+    // Verify sufficient pixel data
+    let npix = w * h * 3
+    if blen - pos < npix
+        return empty
+    // Read raw pixel bytes into list (mutable push — no reassignment).
+    let px = []
+    let i = 0
+    while i < npix
+        push(px, bytes_get(b, pos + i))
+        i = i + 1
+    let result = {"w": w, "h": h, "px": px}
+    return result
+
+// ── ppm_p3_encode ───────────────────────────────────────────────────────────
+// Encode a flat RGB pixel list (length w*h*3) into a P3 ASCII PPM string.
+// Output: "P3\n<w> <h>\n255\n" then one line "R G B\n" per pixel.
+fn ppm_p3_encode(w, h, px) -> string
+    let out = "P3\n" + str(w) + " " + str(h) + "\n255\n"
+    let npix = w * h
+    let i = 0
+    while i < npix
+        let base = i * 3
+        let rv = px[base]
+        let gv = px[base + 1]
+        let bv = px[base + 2]
+        out = out + str(rv) + " " + str(gv) + " " + str(bv) + "\n"
+        i = i + 1
+    out
+
+// ── Private: tokenize a P3 string ────────────────────────────────────────────
+// Splits on whitespace; strips '#' comment lines.
+// Returns a list of non-empty string tokens (magic, w, h, maxval, pixel values).
+// Uses list.push(tok) mutable form — the reassigning `list = push(list, tok)`
+// mis-compiles when tok is a string built up in a loop inside the module.
+fn _ppm_tokenize_p3(s) -> list
+    let tokens = []
+    let slen = len(s)
+    let i = 0
+    let tok = ""
+    while i < slen
+        let c = char_at(s, i)
+        let bv = ord(c)
+        if bv == 32 or bv == 9 or bv == 13 or bv == 10
+            // whitespace: flush current token
+            if len(tok) > 0
+                tokens.push(tok)
+                tok = ""
+            i = i + 1
+        else if bv == 35
+            // '#' comment: flush token, skip to end of line
+            if len(tok) > 0
+                tokens.push(tok)
+                tok = ""
+            i = i + 1
+            while i < slen and ord(char_at(s, i)) != 10
+                i = i + 1
+        else
+            tok = tok + c
+            i = i + 1
+    // flush final token
+    if len(tok) > 0
+        tokens.push(tok)
+    tokens
+
+// ── ppm_p3_decode ───────────────────────────────────────────────────────────
+// Decode a P3 ASCII PPM string.
+// Returns dict {"w": int, "h": int, "px": list} on success,
+// or empty dict {} on malformed input (bad magic, maxval != 255, insufficient data).
+fn ppm_p3_decode(s) -> dict
+    let empty = {}
+    let tokens = _ppm_tokenize_p3(s)
+    let ntok = len(tokens)
+    // Need at least: magic + w + h + maxval = 4 header tokens
+    if ntok < 4
+        return empty
+    // Validate magic token
+    if tokens[0] != "P3"
+        return empty
+    // Parse header fields
+    let w = int(tokens[1])
+    let h = int(tokens[2])
+    let maxval = int(tokens[3])
+    if w <= 0 or h <= 0 or maxval != 255
+        return empty
+    // Need w*h*3 pixel value tokens after the 4 header tokens
+    let npix3 = w * h * 3
+    if ntok < 4 + npix3
+        return empty
+    // Build pixel list (mutable push form)
+    let px = []
+    let i = 0
+    while i < npix3
+        push(px, int(tokens[4 + i]))
+        i = i + 1
+    let result = {"w": w, "h": h, "px": px}
+    return result

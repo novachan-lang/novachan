@@ -1,0 +1,228 @@
+// ============================================================================
+// NOVA Standard Library — std/media/wav
+// ============================================================================
+// WAV PCM (16-bit, little-endian) audio codec — encode and decode WAVE files.
+//
+// FORMAT OVERVIEW
+//   A WAV file is a RIFF container with a single 'WAVE' payload.
+//   All multi-byte integers are LITTLE-ENDIAN (except the 4-char chunk IDs).
+//
+//   Offset  0: 'RIFF'          (4 bytes, chunk ID)
+//   Offset  4: u32 chunksize   = 36 + datasize  (total file size - 8)
+//   Offset  8: 'WAVE'          (4 bytes, form type)
+//
+//   Offset 12: 'fmt '          (4 bytes, format sub-chunk ID)
+//   Offset 16: u32 fmtsize     = 16  (PCM format sub-chunk data size)
+//   Offset 20: u16 audiofmt    = 1   (PCM = linear quantization)
+//   Offset 22: u16 channels    (1 = mono, 2 = stereo, etc.)
+//   Offset 24: u32 samplerate  (samples per second, e.g. 44100, 8000)
+//   Offset 28: u32 byterate    = samplerate * channels * 2
+//   Offset 32: u16 blockalign  = channels * 2
+//   Offset 34: u16 bitspersmpl = 16
+//
+//   Offset 36: 'data'          (4 bytes, data sub-chunk ID)
+//   Offset 40: u32 datasize    = numsamples * channels * 2
+//   Offset 44: <sample data>   (signed 16-bit LE, channel-interleaved)
+//
+// SAMPLE ENCODING (signed 16-bit little-endian)
+//   Encode: m = v & 0xFFFF;  low = m & 0xFF;  high = (m >> 8) & 0xFF
+//   Decode: u = lo | (hi << 8);  if u >= 32768: u = u - 65536
+//
+// PUBLIC API
+//   wav_encode(samplerate, channels, samples) -> bytes
+//     Encode PCM audio to a WAV bytes value.
+//     samples is a flat list of signed ints (channel-interleaved, -32768..32767).
+//     Returns bytes(0) on invalid input (channels<=0, samplerate<=0).
+//
+//   wav_decode(b) -> dict
+//     Decode a WAV bytes value.
+//     Returns dict {"samplerate": int, "channels": int, "bits": int,
+//                   "samples": list} where samples is a flat signed-int list.
+//     Returns empty dict {} on malformed/invalid input.
+// ============================================================================
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+// Append a u32 little-endian (4 bytes) to bytes b.
+fn _wav_u32le(b, v)
+    let out = bytes_append(b, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out
+
+// Append a u16 little-endian (2 bytes) to bytes b.
+fn _wav_u16le(b, v)
+    let out = bytes_append(b, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out
+
+// Read a u32 little-endian from bytes b at position pos.
+fn _wav_rd_u32le(b, pos)
+    let b0 = bytes_get(b, pos)
+    let b1 = bytes_get(b, pos + 1)
+    let b2 = bytes_get(b, pos + 2)
+    let b3 = bytes_get(b, pos + 3)
+    b0 | (b1 * 256) | (b2 * 65536) | (b3 * 16777216)
+
+// Read a u16 little-endian from bytes b at position pos.
+fn _wav_rd_u16le(b, pos)
+    let b0 = bytes_get(b, pos)
+    let b1 = bytes_get(b, pos + 1)
+    b0 | (b1 * 256)
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// wav_encode(samplerate, channels, samples) -> bytes
+//   Encode a flat list of signed 16-bit PCM samples into a WAV file.
+//   samples are channel-interleaved; length must be a multiple of channels.
+//   Returns bytes(0) if inputs are invalid.
+fn wav_encode(samplerate, channels, samples)
+    let result = bytes(0)
+    if samplerate <= 0
+        result
+    else if channels <= 0
+        result
+    else
+        let numsamples = len(samples)
+        let datasize = numsamples * 2
+        let chunksize = 36 + datasize
+        let byterate = samplerate * channels * 2
+        let blockalign = channels * 2
+
+        // RIFF header
+        let hdr = bytes(0)
+        hdr = bytes_append_str(hdr, "RIFF")
+        hdr = _wav_u32le(hdr, chunksize)
+        hdr = bytes_append_str(hdr, "WAVE")
+
+        // fmt sub-chunk
+        hdr = bytes_append_str(hdr, "fmt ")
+        hdr = _wav_u32le(hdr, 16)
+        hdr = _wav_u16le(hdr, 1)
+        hdr = _wav_u16le(hdr, channels)
+        hdr = _wav_u32le(hdr, samplerate)
+        hdr = _wav_u32le(hdr, byterate)
+        hdr = _wav_u16le(hdr, blockalign)
+        hdr = _wav_u16le(hdr, 16)
+
+        // data sub-chunk header
+        hdr = bytes_append_str(hdr, "data")
+        hdr = _wav_u32le(hdr, datasize)
+
+        // sample data: signed 16-bit LE
+        let i = 0
+        while i < numsamples
+            let v = samples[i]
+            let m = v & 0xFFFF
+            hdr = bytes_append(hdr, m & 0xFF)
+            hdr = bytes_append(hdr, (m >> 8) & 0xFF)
+            i = i + 1
+
+        hdr
+
+// wav_decode(b) -> dict
+//   Decode a WAV file from bytes.
+//   Returns dict with keys: "samplerate", "channels", "bits", "samples".
+//   Returns {} on invalid/malformed input.
+fn wav_decode(b)
+    let empty = {}
+    let blen = bytes_len(b)
+
+    // Minimum WAV file = 44 bytes (header only, no samples)
+    if blen < 44
+        empty
+    else
+        // Validate RIFF magic at offset 0
+        let r0 = bytes_get(b, 0)
+        let r1 = bytes_get(b, 1)
+        let r2 = bytes_get(b, 2)
+        let r3 = bytes_get(b, 3)
+        if r0 != 82
+            empty
+        else if r1 != 73
+            empty
+        else if r2 != 70
+            empty
+        else if r3 != 70
+            empty
+        else
+            // Validate WAVE form type at offset 8
+            let w0 = bytes_get(b, 8)
+            let w1 = bytes_get(b, 9)
+            let w2 = bytes_get(b, 10)
+            let w3 = bytes_get(b, 11)
+            if w0 != 87
+                empty
+            else if w1 != 65
+                empty
+            else if w2 != 86
+                empty
+            else if w3 != 69
+                empty
+            else
+                // Validate fmt  sub-chunk ID at offset 12
+                let f0 = bytes_get(b, 12)
+                let f1 = bytes_get(b, 13)
+                let f2 = bytes_get(b, 14)
+                let f3 = bytes_get(b, 15)
+                if f0 != 102
+                    empty
+                else if f1 != 109
+                    empty
+                else if f2 != 116
+                    empty
+                else if f3 != 32
+                    empty
+                else
+                    // Read fmt sub-chunk fields
+                    let audiofmt = _wav_rd_u16le(b, 20)
+                    let channels = _wav_rd_u16le(b, 22)
+                    let samplerate = _wav_rd_u32le(b, 24)
+                    let bits = _wav_rd_u16le(b, 34)
+
+                    // Validate PCM format
+                    if audiofmt != 1
+                        empty
+                    else if bits != 16
+                        empty
+                    else
+                        // Validate data sub-chunk ID at offset 36
+                        let d0 = bytes_get(b, 36)
+                        let d1 = bytes_get(b, 37)
+                        let d2 = bytes_get(b, 38)
+                        let d3 = bytes_get(b, 39)
+                        if d0 != 100
+                            empty
+                        else if d1 != 97
+                            empty
+                        else if d2 != 116
+                            empty
+                        else if d3 != 97
+                            empty
+                        else
+                            let datasize = _wav_rd_u32le(b, 40)
+                            let numsamples = datasize / 2
+                            let sampstart = 44
+                            let sampend = sampstart + datasize
+
+                            // Bounds-check: ensure we have enough bytes
+                            if sampend > blen
+                                empty
+                            else
+                                let smplist = []
+                                let si = sampstart
+                                let sc = 0
+                                while sc < numsamples
+                                    let lo = bytes_get(b, si)
+                                    let hi = bytes_get(b, si + 1)
+                                    let u = lo | (hi * 256)
+                                    let sv = u
+                                    if u >= 32768
+                                        sv = u - 65536
+                                    push(smplist, sv)
+                                    si = si + 2
+                                    sc = sc + 1
+
+                                let res = {"samplerate": samplerate, "channels": channels, "bits": bits, "samples": smplist}
+                                res

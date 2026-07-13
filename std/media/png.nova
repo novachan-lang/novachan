@@ -1,0 +1,281 @@
+// ============================================================================
+// NOVA Standard Library — std/media/png
+// ============================================================================
+// PNG chunk-level codec (no pixel decompression).
+//
+// FORMAT OVERVIEW
+//   A PNG file consists of:
+//
+//   1. SIGNATURE (8 bytes)
+//        137, 80, 78, 71, 13, 10, 26, 10
+//        (hex: 89 50 4E 47 0D 0A 1A 0A)
+//
+//   2. Zero or more CHUNKS, each:
+//        u32 BE   — length of data field (NOT including type or CRC)
+//        4 bytes  — chunk type (ASCII letters, e.g. "IHDR", "IDAT", "IEND")
+//        N bytes  — chunk data (N == length)
+//        u32 BE   — CRC32 computed over type ++ data bytes (NOT length field)
+//
+//   3. IHDR CHUNK DATA (13 bytes, always first chunk after signature)
+//        u32 BE   — image width
+//        u32 BE   — image height
+//        u8       — bit depth (1, 2, 4, 8, or 16 depending on color type)
+//        u8       — color type (0=greyscale, 2=RGB, 3=indexed, 4=grey+alpha, 6=RGBA)
+//        u8       — compression method (always 0 = deflate/inflate)
+//        u8       — filter method (always 0 = adaptive filtering)
+//        u8       — interlace method (0=none, 1=Adam7)
+//
+// CRC32 ALGORITHM (ISO-HDLC polynomial, same as PNG spec)
+//   init crc = 0xFFFFFFFF
+//   for each byte b:
+//     crc = crc XOR b
+//     repeat 8 times:
+//       if (crc & 1) then crc = (crc >> 1) XOR 0xEDB88320
+//       else              crc = crc >> 1
+//     mask crc with & 0xFFFFFFFF after each bit step
+//   final result = (crc XOR 0xFFFFFFFF) & 0xFFFFFFFF
+//
+// PUBLIC API
+//   crc32(b) -> int
+//     Compute CRC32 (ISO-HDLC) over a bytes value. Returns an unsigned 32-bit
+//     integer. Standard vector: crc32(str_to_bytes("123456789")) == 0xCBF43926.
+//
+//   png_signature() -> bytes
+//     Return the 8-byte PNG file signature.
+//
+//   png_ihdr(w, h, bitdepth, colortype) -> bytes
+//     Return the 13-byte IHDR data block for an image of the given dimensions,
+//     bit depth, and color type. Compression, filter, and interlace are all 0.
+//
+//   png_write_chunk(type_str, data_bytes) -> bytes
+//     Build a complete PNG chunk: u32BE(len(data)) ++ type(4 bytes) ++ data ++ u32BE(crc).
+//     type_str must be exactly 4 ASCII characters. Returns the full chunk bytes.
+//
+//   png_read_chunks(b) -> list
+//     Parse a PNG bytes value. Skips the 8-byte signature, then reads chunks
+//     until the data is exhausted. Returns a list of dicts, each:
+//       {"type": str, "data": bytes}
+//     Returns an empty list on any error (bad signature, truncation, etc.).
+//
+// PRIVATE HELPERS
+//   All helpers prefixed _png_ to avoid link collisions.
+//
+// LEAF — imports nothing.
+// ============================================================================
+
+// ── Private: append a big-endian u32 (4 bytes) to bytes out ─────────────────
+fn _png_put_u32be(out, v) -> bytes
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// ── Private: read a big-endian u32 from bytes b at offset i ──────────────────
+// Bounds-checked; returns 0 if out of range.
+fn _png_get_u32be(b, i) -> int
+    let blen = bytes_len(b)
+    let result = 0
+    if i + 3 < blen
+        let b0 = bytes_get(b, i)
+        let b1 = bytes_get(b, i + 1)
+        let b2 = bytes_get(b, i + 2)
+        let b3 = bytes_get(b, i + 3)
+        result = (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+    result
+
+// ── Private: read a big-endian u32 from bytes b at offset i (inclusive) ──────
+// Uses <= so i+3 can equal blen-1 (i.e. i+3 is last valid index).
+fn _png_get_u32be_safe(b, i) -> int
+    let blen = bytes_len(b)
+    let result = 0
+    if i + 3 <= blen - 1
+        let b0 = bytes_get(b, i)
+        let b1 = bytes_get(b, i + 1)
+        let b2 = bytes_get(b, i + 2)
+        let b3 = bytes_get(b, i + 3)
+        result = (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+    result
+
+// ── crc32 ────────────────────────────────────────────────────────────────────
+// CRC32 (ISO-HDLC, PNG polynomial 0xEDB88320) over a bytes value.
+// Standard vector: crc32(str_to_bytes("123456789")) == 0xCBF43926.
+fn crc32(b) -> int
+    let crc = 0xFFFFFFFF
+    let blen = bytes_len(b)
+    let i = 0
+    while i < blen
+        let bv = bytes_get(b, i)
+        crc = (crc & 0xFFFFFFFF) ^ bv
+        let bit = 0
+        while bit < 8
+            let lsb = crc & 1
+            crc = (crc >> 1) & 0x7FFFFFFF
+            if lsb == 1
+                crc = (crc ^ 0xEDB88320) & 0xFFFFFFFF
+            bit = bit + 1
+        i = i + 1
+    (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+// ── png_signature ─────────────────────────────────────────────────────────────
+// Return the 8-byte PNG file signature: 137,80,78,71,13,10,26,10.
+fn png_signature() -> bytes
+    let out = bytes(0)
+    out = bytes_append(out, 137)
+    out = bytes_append(out, 80)
+    out = bytes_append(out, 78)
+    out = bytes_append(out, 71)
+    out = bytes_append(out, 13)
+    out = bytes_append(out, 10)
+    out = bytes_append(out, 26)
+    out = bytes_append(out, 10)
+    out
+
+// ── png_ihdr ──────────────────────────────────────────────────────────────────
+// Build the 13-byte IHDR data block.
+//   w, h      — image dimensions (u32 BE each)
+//   bitdepth  — bit depth per channel (u8)
+//   colortype — PNG color type (u8)
+//   compression, filter, interlace — all fixed at 0.
+fn png_ihdr(w, h, bitdepth, colortype) -> bytes
+    let out = bytes(0)
+    out = _png_put_u32be(out, w)
+    out = _png_put_u32be(out, h)
+    out = bytes_append(out, bitdepth & 0xFF)
+    out = bytes_append(out, colortype & 0xFF)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, 0)
+    out
+
+// ── png_write_chunk ───────────────────────────────────────────────────────────
+// Build a complete PNG chunk from a 4-character type string and data bytes.
+// Layout: u32BE(data_len) ++ type_bytes(4) ++ data ++ u32BE(crc_over_type_data).
+// type_str must be exactly 4 ASCII characters; extra chars are ignored, short
+// strings are padded with spaces (0x20) to 4 bytes.
+fn png_write_chunk(type_str, data_bytes) -> bytes
+    // Build the 4-byte type field from the type string.
+    let tlen = len(type_str)
+    let t0 = 32
+    let t1 = 32
+    let t2 = 32
+    let t3 = 32
+    if tlen > 0
+        t0 = _png_char_at(type_str, 0)
+    if tlen > 1
+        t1 = _png_char_at(type_str, 1)
+    if tlen > 2
+        t2 = _png_char_at(type_str, 2)
+    if tlen > 3
+        t3 = _png_char_at(type_str, 3)
+    // Compute data length.
+    let dlen = bytes_len(data_bytes)
+    // Build type ++ data for CRC computation.
+    let crc_input = bytes(0)
+    crc_input = bytes_append(crc_input, t0)
+    crc_input = bytes_append(crc_input, t1)
+    crc_input = bytes_append(crc_input, t2)
+    crc_input = bytes_append(crc_input, t3)
+    crc_input = bytes_concat(crc_input, data_bytes)
+    let crc_val = crc32(crc_input)
+    // Build the full chunk.
+    let out = bytes(0)
+    out = _png_put_u32be(out, dlen)
+    out = bytes_append(out, t0)
+    out = bytes_append(out, t1)
+    out = bytes_append(out, t2)
+    out = bytes_append(out, t3)
+    out = bytes_concat(out, data_bytes)
+    out = _png_put_u32be(out, crc_val)
+    out
+
+// ── Private: get ASCII code of character at position pos in string s ─────────
+// Returns 32 (space) if pos is out of range.
+fn _png_char_at(s, pos) -> int
+    let result = 32
+    let sb = str_to_bytes(s)
+    let sblen = bytes_len(sb)
+    if pos < sblen
+        result = bytes_get(sb, pos)
+    result
+
+// ── png_read_chunks ───────────────────────────────────────────────────────────
+// Parse all chunks from a PNG bytes value.
+// Validates the 8-byte signature, then reads chunks in sequence.
+// Returns a list of dicts {"type": str, "data": bytes}.
+// Returns [] on any error (bad sig, truncation, malformed length).
+fn png_read_chunks(b) -> list
+    let empty = []
+    let blen = bytes_len(b)
+    // Need at least 8 bytes for the signature.
+    let ok = 1
+    if blen < 8
+        ok = 0
+    if ok == 1
+        // Verify signature bytes: 137,80,78,71,13,10,26,10
+        if bytes_get(b, 0) != 137
+            ok = 0
+        if bytes_get(b, 1) != 80
+            ok = 0
+        if bytes_get(b, 2) != 78
+            ok = 0
+        if bytes_get(b, 3) != 71
+            ok = 0
+        if bytes_get(b, 4) != 13
+            ok = 0
+        if bytes_get(b, 5) != 10
+            ok = 0
+        if bytes_get(b, 6) != 26
+            ok = 0
+        if bytes_get(b, 7) != 10
+            ok = 0
+    let result = empty
+    if ok == 1
+        let chunks = []
+        let pos = 8
+        let running = 1
+        while running == 1
+            // Need at least 12 bytes: 4 (length) + 4 (type) + 0 (data) + 4 (crc)
+            if pos + 12 > blen
+                running = 0
+            if running == 1
+                // Read data length (u32 BE).
+                let dlen = _png_get_u32be_safe(b, pos)
+                pos = pos + 4
+                // Read type (4 bytes -> string).
+                if pos + 4 > blen
+                    running = 0
+                if running == 1
+                    let c0 = bytes_get(b, pos)
+                    let c1 = bytes_get(b, pos + 1)
+                    let c2 = bytes_get(b, pos + 2)
+                    let c3 = bytes_get(b, pos + 3)
+                    pos = pos + 4
+                    // Read data bytes (dlen bytes).
+                    if pos + dlen > blen
+                        running = 0
+                    if running == 1
+                        let chunk_data = bytes_slice(b, pos, pos + dlen)
+                        pos = pos + dlen
+                        // Skip CRC (4 bytes).
+                        if pos + 4 > blen
+                            running = 0
+                        if running == 1
+                            pos = pos + 4
+                            // Build type string from 4 bytes.
+                            let type_bytes = bytes(0)
+                            type_bytes = bytes_append(type_bytes, c0)
+                            type_bytes = bytes_append(type_bytes, c1)
+                            type_bytes = bytes_append(type_bytes, c2)
+                            type_bytes = bytes_append(type_bytes, c3)
+                            let type_str = bytes_to_str(type_bytes)
+                            let chunk = {"type": type_str, "data": chunk_data}
+                            chunks.push(chunk)
+                            // Stop after IEND.
+                            if type_str == "IEND"
+                                running = 0
+                            // Stop if no more data.
+                            if pos >= blen
+                                running = 0
+        result = chunks
+    result
