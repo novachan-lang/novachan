@@ -1,0 +1,135 @@
+// std/hash/crc64.nova — CRC-64 checksums: ECMA-182 and XZ (CRC-64/GO-ECMA) variants.
+//
+// Two public functions:
+//   h_crc64_ecma(b: any) -> int
+//       CRC-64/ECMA-182 (ECMA-182 annex B, used in DLT tape drives, SCSI).
+//       Polynomial : 0x42F0E1EBA9EA3693 (normal / MSB-first / unreflected form)
+//       Init       : 0
+//       Reflect in : no  (bytes fed MSB-first)
+//       Reflect out: no
+//       XorOut     : 0
+//       Check value: h_crc64_ecma(str_to_bytes("123456789")) == 0x6C40DF5F0B497347
+//
+//   h_crc64_xz(b: any) -> int
+//       CRC-64/XZ (also called CRC-64/GO-ECMA), used in the .xz container format.
+//       Polynomial : 0xC96C5795D7870F42 (reversed/reflected form of ECMA poly)
+//       Init       : 0xFFFFFFFFFFFFFFFF
+//       Reflect in : yes  (implicit via reflected polynomial, LSB-first)
+//       Reflect out: yes  (implicit)
+//       XorOut     : 0xFFFFFFFFFFFFFFFF
+//       Check value: h_crc64_xz(str_to_bytes("123456789")) == 0x995DC9BBDF1939FA
+//
+// IMPLEMENTATION STRATEGY — 256-entry lookup table built on first call:
+//   Each variant builds its own 256-entry table using 8 LFSR iterations per byte.
+//   ECMA-182: MSB-first (Galois, normal-poly form) — shift register left.
+//   XZ       : LSB-first (Galois, reflected-poly form) — shift register right.
+//
+// NOVA 64-BIT HAZARDS:
+//   • NOVA i64 wraps on + and * mod 2^64 — correct for hash arithmetic.
+//   • '>>' is ARITHMETIC (sign-extending in NOVA). For any 64-bit value with
+//     bit 63 potentially set, ALWAYS use _shr64(x, n) defined below.
+//   • Large hex literals whose bit 63 is set (>= 0x8000000000000000) will
+//     be rejected by the compiler — build them from two 32-bit halves:
+//       const = (hi32 << 32) | lo32
+//   • XorOut for XZ is 0xFFFFFFFFFFFFFFFF which is -1 in i64 — using XOR
+//     with -1 flips all bits, which is exactly what we need. Safe.
+//   • The table stores i64 values which may be negative. That is fine:
+//     XOR and the shift helpers work correctly on the raw bit pattern.
+//
+// CANONICAL KAT VECTORS:
+//   h_crc64_ecma(str_to_bytes("123456789")) == 0x6C40DF5F0B497347  (7800480153909949255 as i64)
+//   h_crc64_xz  (str_to_bytes("123456789")) == 0x995DC9BBDF1939FA  (-7395533204333446662 as i64)
+//   h_crc64_ecma(str_to_bytes(""))          == 0
+//
+// Constants: split into two 32-bit halves to avoid compiler rejection of large literals.
+//   ECMA poly: 0x42F0E1EBA9EA3693 = (0x42F0E1EB << 32) | 0xA9EA3693
+//   XZ   poly: 0xC96C5795D7870F42 = (0xC96C5795 << 32) | 0xD7870F42
+
+// _shr64 — logical (unsigned) right shift for 64-bit values.
+// NOVA '>>' is arithmetic (sign-extends); this masks out the sign-extended bits.
+fn _shr64(x, n)
+    if n == 0
+        return x
+    if n >= 64
+        return 0
+    let mask = (1 << (64 - n)) - 1
+    return (x >> n) & mask
+
+// _crc64_make_table_ecma — 256-entry table for CRC-64/ECMA-182.
+// MSB-first (normal polynomial form, shift left).
+// Poly: 0x42F0E1EBA9EA3693
+fn _crc64_make_table_ecma()
+    let poly = (0x42F0E1EB << 32) | 0xA9EA3693
+    let t = []
+    let i = 0
+    while i < 256
+        // Load byte into top 8 bits of 64-bit register (MSB-first CRC).
+        let c = i << 56
+        let j = 0
+        while j < 8
+            // Test MSB: if bit 63 is set, c is negative in i64.
+            // c < 0 is equivalent to testing bit 63.
+            if c < 0
+                c = (c << 1) ^ poly
+            else
+                c = c << 1
+            j = j + 1
+        push(t, c)
+        i = i + 1
+    return t
+
+// _crc64_make_table_xz — 256-entry table for CRC-64/XZ (reflected).
+// LSB-first (reflected polynomial form, shift right).
+// Reflected poly: 0xC96C5795D7870F42
+fn _crc64_make_table_xz()
+    let rpoly = (0xC96C5795 << 32) | 0xD7870F42
+    let t = []
+    let i = 0
+    while i < 256
+        let c = i
+        let j = 0
+        while j < 8
+            // Test LSB.
+            let lsb = c & 1
+            c = _shr64(c, 1)
+            if lsb == 1
+                c = c ^ rpoly
+            j = j + 1
+        push(t, c)
+        i = i + 1
+    return t
+
+// h_crc64_ecma — CRC-64/ECMA-182 of a NOVA bytes value.
+// Returns a 64-bit value as i64 (may be negative for values >= 2^63).
+// KAT: h_crc64_ecma(str_to_bytes("123456789")) == 0x6C40DF5F0B497347
+fn h_crc64_ecma(b)
+    let t = _crc64_make_table_ecma()
+    let crc = 0
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let byte = bytes_get(b, i)
+        // Extract top byte of crc (bits 63..56) — use _shr64 for logical shift.
+        let top = _shr64(crc, 56) & 0xFF
+        let idx = top ^ byte
+        crc = (crc << 8) ^ t[idx]
+        i = i + 1
+    return crc
+
+// h_crc64_xz — CRC-64/XZ (GO-ECMA) of a NOVA bytes value.
+// Returns a 64-bit value as i64 (will be negative for values >= 2^63).
+// KAT: h_crc64_xz(str_to_bytes("123456789")) == 0x995DC9BBDF1939FA
+fn h_crc64_xz(b)
+    let t = _crc64_make_table_xz()
+    // Init = 0xFFFFFFFFFFFFFFFF — in i64 this is -1, XOR with -1 = flip all bits.
+    let init = (0xFFFFFFFF << 32) | 0xFFFFFFFF
+    let crc = init
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let byte = bytes_get(b, i)
+        let idx = (crc ^ byte) & 0xFF
+        crc = _shr64(crc, 8) ^ t[idx]
+        i = i + 1
+    // Final XOR with 0xFFFFFFFFFFFFFFFF = flip all bits = XOR with -1.
+    return crc ^ init

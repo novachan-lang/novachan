@@ -1,0 +1,85 @@
+// std/hash/crc32c.nova — CRC-32C / Castagnoli checksum (iSCSI, SCTP, Btrfs, SSE4.2).
+//
+// This is DISTINCT from std/hash/crc32 (IEEE / zip / zlib polynomial).
+//
+// Polynomial : 0x1EDC6F41 — reflected form 0x82F63B78 (used here: LSB-first)
+// Init       : 0xFFFFFFFF
+// Reflect in : yes (implicit — reflected polynomial handles it)
+// Reflect out: yes (implicit)
+// Final XOR  : 0xFFFFFFFF
+//
+// Algorithm: 256-entry table-driven Galois LFSR (reflected variant).
+// The table is built once per call inside _crc32c_make_table().
+//
+// NOVA-specific hazards:
+//   • '>>' is ARITHMETIC (sign-extending).  After right-shifting a value
+//     whose bit 31 is set, the result is negative.  We mask with
+//     & 0x7FFFFFFF before the shift to clear bit 31 first, then the result
+//     is always non-negative, and we XOR the polynomial when lsb was 1.
+//   • The 32-bit accumulator 'crc' can have bit 31 set (= negative i64
+//     if treated as signed).  All right-shifts on 'crc' must be preceded
+//     by '& 0xFFFFFFFF' to guarantee a logical shift — we do this via
+//     a dedicated _crc32c_shr helper.
+//   • Multi-line list literals do NOT compile; table built with while+push.
+//   • No '&&'/'||': use 'and'/'or'.
+//   • All private helpers use '_crc32c_' prefix to avoid link collisions.
+//
+// Canonical KAT vectors (iSCSI CRC specification / RFC 3720 Appendix B):
+//   h_crc32c(str_to_bytes("123456789"))                                    == 0xE3069283
+//   h_crc32c(bytes(0))                                                     == 0x00000000
+//   h_crc32c(str_to_bytes("The quick brown fox jumps over the lazy dog")) == 0x22620404
+//
+// Verified independently with Python crcmod and the bit-by-bit reference:
+//   import struct
+//   def crc32c(d):
+//       POLY=0x82F63B78; crc=0xFFFFFFFF
+//       for b in d: crc^=b; [crc:=(crc>>1)^POLY if crc&1 else crc>>1 for _ in range(8)]
+//       return crc^0xFFFFFFFF
+
+// _crc32c_shr — logical right-shift of a 32-bit accumulator stored in i64.
+// Masks to 32 bits first so the arithmetic shift never sign-extends.
+fn _crc32c_shr(x, n)
+    return (x & 0xFFFFFFFF) >> n
+
+// _crc32c_make_table — build the 256-entry CRC-32C lookup table.
+// Uses the reflected polynomial 0x82F63B78.
+// Each entry t[i] is the CRC-32C of a single byte with value i.
+fn _crc32c_make_table() -> list
+    let t = []
+    let i = 0
+    while i < 256
+        let c = i
+        let j = 0
+        while j < 8
+            let lsb = c & 1
+            // Shift right: mask first to guarantee logical shift on bit 31.
+            c = _crc32c_shr(c, 1)
+            if lsb == 1
+                c = c ^ 0x82F63B78
+            j = j + 1
+        t.push(c)
+        i = i + 1
+    t
+
+// h_crc32c — CRC-32C (Castagnoli) of a NOVA bytes value.
+// Returns a 32-bit unsigned value in range [0, 4294967295] as an int.
+// Input: b — a bytes value (use str_to_bytes(s) to hash a string).
+//
+// Algorithm:
+//   crc = 0xFFFFFFFF
+//   for each byte:
+//       idx = (crc XOR byte) & 0xFF        — low 8 bits pick table row
+//       crc = table[idx] XOR (crc >> 8)    — fold in remaining 24 bits
+//   return crc XOR 0xFFFFFFFF
+fn h_crc32c(b) -> int
+    let t = _crc32c_make_table()
+    let crc = 0xFFFFFFFF
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let bv = bytes_get(b, i)
+        let idx = (crc ^ bv) & 0xFF
+        let shifted = _crc32c_shr(crc, 8)
+        crc = t[idx] ^ shifted
+        i = i + 1
+    (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
