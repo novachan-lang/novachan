@@ -1,0 +1,138 @@
+// ============================================================================
+// NOVA Standard Library — std/net/tcphdr
+// ============================================================================
+// RFC 793 §3.1 — 20-byte TCP header codec (big-endian wire format, no options).
+//
+// Wire layout (20 bytes, all multi-byte fields big-endian):
+//   Bytes  0-1  : src_port   (u16)
+//   Bytes  2-3  : dst_port   (u16)
+//   Bytes  4-7  : seq        (u32) — sequence number
+//   Bytes  8-11 : ack        (u32) — acknowledgement number
+//   Byte  12    : (data_offset << 4) | reserved_high
+//                   data_offset = header length in 32-bit words (min 5 = 20 bytes)
+//   Byte  13    : flags — bit0 FIN, bit1 SYN, bit2 RST, bit3 PSH,
+//                          bit4 ACK, bit5 URG, bit6 ECE, bit7 CWR
+//   Bytes 14-15 : window     (u16) — receive window size
+//   Bytes 16-17 : checksum   (u16) — ones-complement checksum
+//   Bytes 18-19 : urgent_ptr (u16) — urgent pointer
+//
+// PUBLIC API:
+//   tcp_encode(h: dict) -> bytes
+//     h keys: "src_port","dst_port","seq","ack","data_offset","flags",
+//             "window","checksum","urgent"
+//     Missing keys default to 0.  Returns 20-byte big-endian wire encoding.
+//
+//   tcp_decode(b: bytes) -> dict
+//     Decodes 20 bytes from b starting at offset 0.
+//     Returns {"src_port","dst_port","seq","ack","data_offset","flags",
+//               "window","checksum","urgent"} on success.
+//     Returns {} on short/malformed input (fewer than 20 bytes or
+//     data_offset < 5).
+//
+//   tcp_flag_syn(h: dict) -> bool   — true if SYN bit set in h["flags"]
+//   tcp_flag_ack(h: dict) -> bool   — true if ACK bit set in h["flags"]
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Read a big-endian u16 from b at position i (caller ensures bounds).
+fn _tc_r16(b: bytes, i: int) -> int
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Read a big-endian u32 from b at position i (caller ensures bounds).
+fn _tc_r32(b: bytes, i: int) -> int
+    let hi = (bytes_get(b, i) << 24) | (bytes_get(b, i + 1) << 16)
+    let lo = (bytes_get(b, i + 2) << 8) | bytes_get(b, i + 3)
+    (hi | lo) & 0xFFFFFFFF
+
+// Append a big-endian u16 to out; return new bytes.
+fn _tc_w16(out: bytes, v: int) -> bytes
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append a big-endian u32 to out; return new bytes.
+fn _tc_w32(out: bytes, v: int) -> bytes
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Read an integer field from a dict; default to 0 if key absent.
+fn _tc_get(h: dict, key: string) -> int
+    if contains(h, key)
+        return h[key]
+    0
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// tcp_encode: dict -> 20-byte big-endian TCP header wire bytes.
+//
+// Example:
+//   tcp_encode({"src_port":0x1F90,"dst_port":0x0050,"seq":0x12345678,
+//               "data_offset":5,"flags":0x02,"window":0x7210})
+//   => 20 bytes; u16@0==0x1F90; u16@2==0x50; u32@4==0x12345678
+//      byte12==0x50 (5<<4); byte13==0x02
+fn tcp_encode(h: dict) -> bytes
+    let src  = _tc_get(h, "src_port")
+    let dst  = _tc_get(h, "dst_port")
+    let seq  = _tc_get(h, "seq")
+    let ack  = _tc_get(h, "ack")
+    let doff = _tc_get(h, "data_offset")
+    let flgs = _tc_get(h, "flags")
+    let win  = _tc_get(h, "window")
+    let csum = _tc_get(h, "checksum")
+    let urg  = _tc_get(h, "urgent")
+    let byte12 = ((doff & 0xF) << 4)
+    let out = bytes(0)
+    out = _tc_w16(out, src & 0xFFFF)
+    out = _tc_w16(out, dst & 0xFFFF)
+    out = _tc_w32(out, seq & 0xFFFFFFFF)
+    out = _tc_w32(out, ack & 0xFFFFFFFF)
+    out = bytes_append(out, byte12 & 0xFF)
+    out = bytes_append(out, flgs & 0xFF)
+    out = _tc_w16(out, win & 0xFFFF)
+    out = _tc_w16(out, csum & 0xFFFF)
+    out = _tc_w16(out, urg & 0xFFFF)
+    out
+
+// tcp_decode: bytes -> dict
+//
+// Decodes the first 20 bytes of b as a TCP header.
+// Returns an empty dict {} on any bounds or validity error.
+//
+// Result dict keys:
+//   "src_port","dst_port","seq","ack","data_offset","flags",
+//   "window","checksum","urgent"
+fn tcp_decode(b: bytes) -> dict
+    let empty = {}
+    if bytes_len(b) < 20
+        return empty
+    let src  = _tc_r16(b, 0)
+    let dst  = _tc_r16(b, 2)
+    let seq  = _tc_r32(b, 4)
+    let ack  = _tc_r32(b, 8)
+    let b12  = bytes_get(b, 12)
+    let b13  = bytes_get(b, 13)
+    let doff = (b12 >> 4) & 0xF
+    let win  = _tc_r16(b, 14)
+    let csum = _tc_r16(b, 16)
+    let urg  = _tc_r16(b, 18)
+    if doff < 5
+        return empty
+    {"src_port": src, "dst_port": dst, "seq": seq, "ack": ack, "data_offset": doff, "flags": b13, "window": win, "checksum": csum, "urgent": urg}
+
+// tcp_flag_syn: dict -> bool
+// Returns true when the SYN bit (bit 1) is set in h["flags"].
+fn tcp_flag_syn(h: dict) -> bool
+    let f = _tc_get(h, "flags")
+    (f & 0x02) != 0
+
+// tcp_flag_ack: dict -> bool
+// Returns true when the ACK bit (bit 4) is set in h["flags"].
+fn tcp_flag_ack(h: dict) -> bool
+    let f = _tc_get(h, "flags")
+    (f & 0x10) != 0

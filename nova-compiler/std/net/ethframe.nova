@@ -1,0 +1,177 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ethframe
+// ============================================================================
+// Ethernet II frame header (14 bytes) + optional 802.1Q VLAN tag (18 bytes).
+//
+// Wire layout — Ethernet II (no VLAN, 14 bytes):
+//   Bytes  0- 5 : dst_mac (6 bytes, big-endian OUI first)
+//   Bytes  6-11 : src_mac (6 bytes)
+//   Bytes 12-13 : ethertype (u16, big-endian)
+//
+// Wire layout — 802.1Q tagged (18 bytes):
+//   Bytes  0- 5 : dst_mac  (6 bytes)
+//   Bytes  6-11 : src_mac  (6 bytes)
+//   Bytes 12-13 : TPID     0x8100  (u16, identifies VLAN tag present)
+//   Bytes 14-15 : TCI      (u16, big-endian): bits 15-13=pcp, bit12=dei, bits11-0=vid
+//   Bytes 16-17 : ethertype (u16, the real EtherType of the payload)
+//
+// PUBLIC API:
+//   eth_encode(dst, src, ethertype) -> bytes
+//     Encode a plain Ethernet II header. dst and src must each be 6 bytes.
+//     ethertype is u16. Returns 14 bytes or empty bytes on bad input.
+//
+//   eth_encode_vlan(dst, src, vid, ethertype) -> bytes
+//     Encode an 802.1Q tagged Ethernet header with vid (0..4094), pcp=0, dei=0.
+//     Returns 18 bytes or empty bytes on bad input.
+//
+//   eth_decode(b) -> dict
+//     Decode an Ethernet II or 802.1Q frame header from b.
+//     Returns dict with keys:
+//       "dst"       -> bytes (6)
+//       "src"       -> bytes (6)
+//       "ethertype" -> int (u16)
+//       "vlan"      -> int  (-1 if no tag; 0..4094 if 802.1Q tagged)
+//     Returns {} on malformed/short input.
+//
+// DESIGN NOTES:
+//   * All multi-byte fields are encoded big-endian (network byte order).
+//   * 802.1Q detection: ethertype field at bytes 12-13 == 0x8100 (TPID).
+//   * pcp and dei are decoded but not exposed — vid is the primary consumer field.
+//   * Private helpers prefixed _eth_.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Write a big-endian u16 value v into bytes out; return new bytes.
+fn _eth_write_u16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Read a big-endian u16 from bytes b at offset i.
+// Caller must ensure bytes_len(b) >= i+2.
+fn _eth_read_u16(b, i)
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Append all bytes of src_bytes (length n) into dst_bytes starting at src offset.
+// Returns new dst_bytes. Used to copy 6-byte MAC fields.
+fn _eth_copy6(dst_bytes, src_bytes, src_off)
+    dst_bytes = bytes_append(dst_bytes, bytes_get(src_bytes, src_off))
+    dst_bytes = bytes_append(dst_bytes, bytes_get(src_bytes, src_off + 1))
+    dst_bytes = bytes_append(dst_bytes, bytes_get(src_bytes, src_off + 2))
+    dst_bytes = bytes_append(dst_bytes, bytes_get(src_bytes, src_off + 3))
+    dst_bytes = bytes_append(dst_bytes, bytes_get(src_bytes, src_off + 4))
+    dst_bytes = bytes_append(dst_bytes, bytes_get(src_bytes, src_off + 5))
+    dst_bytes
+
+// Extract a 6-byte MAC from bytes b at offset off.
+// Caller must ensure bytes_len(b) >= off+6.
+fn _eth_extract6(b, off)
+    let m = bytes(0)
+    m = bytes_append(m, bytes_get(b, off))
+    m = bytes_append(m, bytes_get(b, off + 1))
+    m = bytes_append(m, bytes_get(b, off + 2))
+    m = bytes_append(m, bytes_get(b, off + 3))
+    m = bytes_append(m, bytes_get(b, off + 4))
+    m = bytes_append(m, bytes_get(b, off + 5))
+    m
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// eth_encode: encode a plain Ethernet II frame header (14 bytes).
+//
+//   dst       : 6-byte destination MAC address bytes
+//   src       : 6-byte source MAC address bytes
+//   ethertype : u16 EtherType (e.g. 0x0800=IPv4, 0x0806=ARP, 0x86DD=IPv6)
+//
+// Returns 14 bytes on success; empty bytes if dst or src are not 6 bytes.
+//
+// Example:
+//   let dst = bytes(6)  // all zeros = broadcast-like placeholder
+//   let src = bytes(6)
+//   bytes_set(src, 5, 1)
+//   let frame_hdr = eth_encode(dst, src, 0x0800)
+//   // -> 14 bytes: FF FF FF FF FF FF 00 00 00 00 00 01 08 00
+fn eth_encode(dst, src, ethertype)
+    let empty = bytes(0)
+    if bytes_len(dst) != 6
+        return empty
+    if bytes_len(src) != 6
+        return empty
+    let out = bytes(0)
+    out = _eth_copy6(out, dst, 0)
+    out = _eth_copy6(out, src, 0)
+    out = _eth_write_u16(out, ethertype & 0xFFFF)
+    out
+
+// eth_encode_vlan: encode an 802.1Q tagged Ethernet frame header (18 bytes).
+//
+//   dst       : 6-byte destination MAC address bytes
+//   src       : 6-byte source MAC address bytes
+//   vid       : VLAN ID, 0..4094 (pcp=0, dei=0 implied)
+//   ethertype : u16 EtherType of the encapsulated payload
+//
+// Returns 18 bytes on success; empty bytes if dst/src are not 6 bytes or
+// vid is out of range.
+//
+// Wire encoding:
+//   [dst 6B][src 6B][TPID 0x8100 u16][TCI u16: vid in low 12 bits][ethertype u16]
+//
+// Example:
+//   let hdr18 = eth_encode_vlan(dst, src, 100, 0x0800)
+//   // bytes 12-13 = 81 00  (TPID)
+//   // bytes 14-15 = 00 64  (TCI, vid=100)
+//   // bytes 16-17 = 08 00  (EtherType IPv4)
+fn eth_encode_vlan(dst, src, vid, ethertype)
+    let empty = bytes(0)
+    if bytes_len(dst) != 6
+        return empty
+    if bytes_len(src) != 6
+        return empty
+    if vid < 0
+        return empty
+    if vid > 4094
+        return empty
+    let out = bytes(0)
+    out = _eth_copy6(out, dst, 0)
+    out = _eth_copy6(out, src, 0)
+    out = _eth_write_u16(out, 0x8100)
+    out = _eth_write_u16(out, vid & 0x0FFF)
+    out = _eth_write_u16(out, ethertype & 0xFFFF)
+    out
+
+// eth_decode: decode an Ethernet II or 802.1Q frame header.
+//
+//   b : bytes containing a frame starting at offset 0.
+//       At least 14 bytes required for plain Ethernet II.
+//       At least 18 bytes required if TPID (0x8100) is present at offset 12.
+//
+// Returns dict:
+//   "dst"       -> bytes(6) destination MAC
+//   "src"       -> bytes(6) source MAC
+//   "ethertype" -> int  u16 EtherType of the payload
+//   "vlan"      -> int  VLAN ID 0..4094 if 802.1Q tag present; -1 otherwise
+//
+// Returns {} on any malformed/short input (never crashes).
+//
+// Example:
+//   let d = eth_decode(frame_bytes)
+//   print(str(d["ethertype"]))   // 2048 for IPv4
+//   print(str(d["vlan"]))        // -1 if untagged
+fn eth_decode(b)
+    let empty = {}
+    if bytes_len(b) < 14
+        return empty
+    let dst = _eth_extract6(b, 0)
+    let src = _eth_extract6(b, 6)
+    let tpid = _eth_read_u16(b, 12)
+    if tpid == 0x8100
+        if bytes_len(b) < 18
+            return empty
+        let tci = _eth_read_u16(b, 14)
+        let vid = tci & 0x0FFF
+        let etype = _eth_read_u16(b, 16)
+        return {"dst": dst, "src": src, "ethertype": etype, "vlan": vid}
+    {"dst": dst, "src": src, "ethertype": tpid, "vlan": -1}

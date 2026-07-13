@@ -1,0 +1,131 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ipv6hdr
+// ============================================================================
+// RFC 8200 — 40-byte IPv6 fixed header codec (big-endian wire format).
+//
+// Wire layout (40 bytes, all multi-byte fields big-endian):
+//   Bytes 0-3  : first word — version(4)|traffic_class(8)|flow_label(20)
+//                  byte0 = (version<<4)|(tc>>4)
+//                  byte1 = ((tc&0xF)<<4)|((flow_label>>16)&0xF)
+//                  byte2 = (flow_label>>8)&0xFF
+//                  byte3 = flow_label&0xFF
+//   Bytes 4-5  : payload_length (u16 BE) — size of payload in bytes
+//   Byte  6    : next_header (u8) — identifies type of next header
+//   Byte  7    : hop_limit (u8) — decremented by each forwarding node
+//   Bytes 8-23 : source address (16 bytes)
+//   Bytes 24-39: destination address (16 bytes)
+//
+// PUBLIC API:
+//   ipv6_encode(h: dict) -> bytes
+//     h keys: "version"(int,default 6), "traffic_class"(int,default 0),
+//             "flow_label"(int,default 0), "payload_length"(int,default 0),
+//             "next_header"(int,default 0), "hop_limit"(int,default 0),
+//             "src"(bytes,16), "dst"(bytes,16)
+//     Missing/short addr fields use zero-padded 16-byte blocks.
+//     Returns 40-byte big-endian wire encoding.
+//
+//   ipv6_decode(b: bytes) -> dict
+//     Decodes 40 bytes starting at offset 0 from b.
+//     Returns parsed dict on success (same keys as above; src/dst as bytes(16)).
+//     Returns {} if fewer than 40 bytes available (bounds-safe, never crashes).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Append a big-endian u16 to out; return new bytes.
+fn _ih_write_u16(out: bytes, v: int) -> bytes
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Read a big-endian u16 from bytes b at position i (caller ensures bounds).
+fn _ih_read_u16(b: bytes, i: int) -> int
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Read an integer field from a dict; default to 0 if key absent.
+fn _ih_get(h: dict, key: string) -> int
+    if contains(h, key)
+        return h[key]
+    0
+
+// Copy up to 16 bytes from src_b into out starting at offset out_off.
+// If src_b has fewer than 16 bytes, remaining positions stay zero.
+fn _ih_copy16(out: bytes, src_b: bytes, out_off: int) -> bytes
+    let src_len = bytes_len(src_b)
+    let i = 0
+    while i < 16
+        if i < src_len
+            bytes_set(out, out_off + i, bytes_get(src_b, i))
+        i = i + 1
+    out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ipv6_encode: dict -> 40-byte big-endian IPv6 fixed header wire bytes.
+//
+// The first 4 bytes pack version(4 bits), traffic_class(8 bits),
+// and flow_label(20 bits) as one big-endian word:
+//   byte0 = (version<<4) | (tc>>4)
+//   byte1 = ((tc&0xF)<<4) | ((flow_label>>16)&0xF)
+//   byte2 = (flow_label>>8)&0xFF
+//   byte3 = flow_label&0xFF
+//
+// Example:
+//   ipv6_encode({"version":6,"payload_length":20,"next_header":6,"hop_limit":64,"src":bytes(16),"dst":bytes(16)})
+//   => 40 bytes; byte0=0x60 (version 6, tc=0); u16@4=20; byte6=6; byte7=64
+fn ipv6_encode(h: dict) -> bytes
+    let version       = _ih_get(h, "version")
+    let traffic_class = _ih_get(h, "traffic_class")
+    let flow_label    = _ih_get(h, "flow_label")
+    let payload_len   = _ih_get(h, "payload_length")
+    let next_hdr      = _ih_get(h, "next_header")
+    let hop_limit     = _ih_get(h, "hop_limit")
+    let b0 = ((version & 0xF) << 4) | ((traffic_class >> 4) & 0xF)
+    let b1 = ((traffic_class & 0xF) << 4) | ((flow_label >> 16) & 0xF)
+    let b2 = (flow_label >> 8) & 0xFF
+    let b3 = flow_label & 0xFF
+    let out = bytes(40)
+    bytes_set(out, 0, b0)
+    bytes_set(out, 1, b1)
+    bytes_set(out, 2, b2)
+    bytes_set(out, 3, b3)
+    bytes_set(out, 4, (payload_len >> 8) & 0xFF)
+    bytes_set(out, 5, payload_len & 0xFF)
+    bytes_set(out, 6, next_hdr & 0xFF)
+    bytes_set(out, 7, hop_limit & 0xFF)
+    if contains(h, "src")
+        out = _ih_copy16(out, h["src"], 8)
+    if contains(h, "dst")
+        out = _ih_copy16(out, h["dst"], 24)
+    out
+
+// ipv6_decode: bytes -> dict
+//
+// Decodes a 40-byte IPv6 fixed header from b starting at offset 0.
+// Returns {} if bytes_len(b) < 40 (bounds-safe; never crashes).
+//
+// Returned dict keys:
+//   "version", "traffic_class", "flow_label", "payload_length",
+//   "next_header", "hop_limit", "src" (bytes, 16), "dst" (bytes, 16)
+//
+// Example:
+//   let h = ipv6_decode(wire_bytes)
+//   print(str(h["hop_limit"]))
+fn ipv6_decode(b: bytes) -> dict
+    if bytes_len(b) < 40
+        return {}
+    let b0 = bytes_get(b, 0)
+    let b1 = bytes_get(b, 1)
+    let b2 = bytes_get(b, 2)
+    let b3 = bytes_get(b, 3)
+    let version       = (b0 >> 4) & 0xF
+    let traffic_class = ((b0 & 0xF) << 4) | ((b1 >> 4) & 0xF)
+    let flow_label    = (((b1 & 0xF) << 16) | (b2 << 8) | b3) & 0xFFFFF
+    let payload_len   = _ih_read_u16(b, 4)
+    let next_hdr      = bytes_get(b, 6)
+    let hop_limit     = bytes_get(b, 7)
+    let src           = bytes_slice(b, 8, 24)
+    let dst           = bytes_slice(b, 24, 40)
+    {"version": version, "traffic_class": traffic_class, "flow_label": flow_label, "payload_length": payload_len, "next_header": next_hdr, "hop_limit": hop_limit, "src": src, "dst": dst}

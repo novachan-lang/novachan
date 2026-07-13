@@ -1,0 +1,168 @@
+// ============================================================================
+// NOVA Standard Library — std/net/pseudohdr
+// ============================================================================
+// TCP/UDP checksum pseudo-headers — RFC 793 (TCP) and RFC 768 (UDP).
+//
+// The "pseudo-header" is a synthetic byte sequence that summarises IP-layer
+// fields (addresses, protocol, upper-layer length) so that the TCP/UDP
+// checksum covers them without actually encoding them in the L4 header.
+//
+// IPv4 pseudo-header (RFC 793 §3.1, 12 bytes, big-endian):
+//   Bytes  0-3  : source address       (u32 BE)
+//   Bytes  4-7  : destination address  (u32 BE)
+//   Byte   8    : zero                 (u8, always 0)
+//   Byte   9    : protocol             (u8, e.g. 6=TCP, 17=UDP)
+//   Bytes 10-11 : upper-layer length   (u16 BE, TCP/UDP segment length)
+//
+// IPv6 pseudo-header (RFC 8200 §8.1, 40 bytes, big-endian):
+//   Bytes  0-15 : source address       (16 bytes)
+//   Bytes 16-31 : destination address  (16 bytes)
+//   Bytes 32-35 : upper-layer length   (u32 BE)
+//   Bytes 36-38 : zeros                (3 bytes, always 0)
+//   Byte  39    : next header          (u8, e.g. 6=TCP, 17=UDP)
+//
+// PUBLIC API:
+//   pseudo4(src, dst, protocol, length) -> bytes(12)
+//     Build the IPv4 pseudo-header.
+//     src, dst    : u32 IP addresses (host order, big-endian on wire).
+//     protocol    : u8 IP protocol number (6=TCP, 17=UDP, …).
+//     length      : u16 upper-layer segment length in bytes.
+//
+//   pseudo6(src_bytes, dst_bytes, next_header, length) -> bytes(40)
+//     Build the IPv6 pseudo-header.
+//     src_bytes, dst_bytes : 16-byte IPv6 addresses.
+//     next_header          : u8 next-header protocol number.
+//     length               : u32 upper-layer packet length.
+//     If src_bytes / dst_bytes are shorter than 16 bytes the remainder is
+//     zero-padded.  If longer, only the first 16 bytes are used (bounds-safe).
+//
+//   l4_checksum(pseudo, l4_bytes) -> int
+//     Compute the RFC 1071 ones-complement checksum over the concatenation
+//     pseudo ++ l4_bytes and return the folded 16-bit result.
+//     This is the value to embed in the TCP/UDP checksum field.
+//     To verify an existing L4 header: call l4_checksum with the header
+//     in place; the result must be 0x0000 (ones-complement sum = 0xFFFF
+//     gives ~0xFFFF = 0x0000 after masking).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Append a big-endian u32 to out; return new bytes.
+fn _ph_w32(out, v)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append a big-endian u16 to out; return new bytes.
+fn _ph_w16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Copy exactly 16 bytes from src_b (zero-pad if shorter) into dst_b at
+// position off; return dst_b.
+fn _ph_copy16(dst_b, src_b, off)
+    let src_len = bytes_len(src_b)
+    let i = 0
+    while i < 16
+        if i < src_len
+            bytes_set(dst_b, off + i, bytes_get(src_b, i))
+        i = i + 1
+    dst_b
+
+// RFC 1071 ones-complement 16-bit checksum over bytes b.
+// Returns a value in [0, 0xFFFF].
+fn _ph_checksum(b)
+    let acc = 0
+    let i = 0
+    let n = bytes_len(b)
+    while i + 1 < n
+        acc = acc + ((bytes_get(b, i) << 8) | bytes_get(b, i + 1))
+        i = i + 2
+    if i < n
+        acc = acc + (bytes_get(b, i) << 8)
+    while (acc >> 16) != 0
+        acc = (acc & 0xFFFF) + (acc >> 16)
+    (~acc) & 0xFFFF
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// pseudo4(src, dst, protocol, length) -> bytes(12)
+//
+// Builds the 12-byte IPv4 TCP/UDP pseudo-header (RFC 793 §3.1).
+// Wire layout:
+//   bytes  0-3 : src  (u32 BE)
+//   bytes  4-7 : dst  (u32 BE)
+//   byte   8   : 0x00
+//   byte   9   : protocol (u8)
+//   bytes 10-11: length (u16 BE)
+//
+// Example:
+//   pseudo4(0xC0A80001, 0xC0A800C7, 6, 20)
+//   => 12 bytes: C0 A8 00 01  C0 A8 00 C7  00 06  00 14
+fn pseudo4(src, dst, protocol, length)
+    let out = bytes(0)
+    out = _ph_w32(out, src & 0xFFFFFFFF)
+    out = _ph_w32(out, dst & 0xFFFFFFFF)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, protocol & 0xFF)
+    out = _ph_w16(out, length & 0xFFFF)
+    out
+
+// pseudo6(src_bytes, dst_bytes, next_header, length) -> bytes(40)
+//
+// Builds the 40-byte IPv6 TCP/UDP pseudo-header (RFC 8200 §8.1).
+// Wire layout:
+//   bytes  0-15 : src  (16 bytes, zero-padded if shorter)
+//   bytes 16-31 : dst  (16 bytes, zero-padded if shorter)
+//   bytes 32-35 : upper-layer length (u32 BE)
+//   bytes 36-38 : 0x00 0x00 0x00
+//   byte  39    : next_header (u8)
+//
+// Example:
+//   pseudo6(src16, dst16, 6, 20)
+//   => 40 bytes; bytes 32-35 = 00 00 00 14; byte 39 = 06
+fn pseudo6(src_bytes, dst_bytes, next_header, length)
+    let out = bytes(40)
+    out = _ph_copy16(out, src_bytes, 0)
+    out = _ph_copy16(out, dst_bytes, 16)
+    bytes_set(out, 32, (length >> 24) & 0xFF)
+    bytes_set(out, 33, (length >> 16) & 0xFF)
+    bytes_set(out, 34, (length >> 8) & 0xFF)
+    bytes_set(out, 35, length & 0xFF)
+    bytes_set(out, 36, 0)
+    bytes_set(out, 37, 0)
+    bytes_set(out, 38, 0)
+    bytes_set(out, 39, next_header & 0xFF)
+    out
+
+// l4_checksum(pseudo, l4_bytes) -> int
+//
+// Computes the RFC 1071 ones-complement 16-bit checksum over the byte
+// sequence  pseudo ++ l4_bytes  and returns the folded 16-bit result.
+//
+// Usage:
+//   1. Build the pseudo-header with pseudo4() or pseudo6().
+//   2. Zero the TCP/UDP checksum field in your L4 header bytes.
+//   3. csum = l4_checksum(pseudo, l4_header_and_payload)
+//   4. Write csum into the checksum field.
+//
+// Verification:
+//   Call l4_checksum again with the checksum field FILLED IN.
+//   The result must be 0x0000 for a valid segment.
+//   (ones-complement sum of all words = 0xFFFF → complement = 0x0000)
+//
+// Example:
+//   let p = pseudo4(0xC0A80001, 0xC0A800C7, 6, 20)
+//   let tcp = bytes(20)   // zeroed 20-byte TCP header
+//   let csum = l4_checksum(p, tcp)
+//   bytes_set(tcp, 16, (csum >> 8) & 0xFF)
+//   bytes_set(tcp, 17, csum & 0xFF)
+//   // verify: l4_checksum(p, tcp) == 0
+fn l4_checksum(pseudo, l4_bytes)
+    let combined = bytes_concat(pseudo, l4_bytes)
+    _ph_checksum(combined)

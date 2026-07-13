@@ -1,0 +1,169 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ntppkt
+// ============================================================================
+// RFC 5905 — NTP v4 packet codec (48 bytes, big-endian wire format).
+//
+// Wire layout (48 bytes fixed):
+//   Byte  0    : flags     — (li<<6)|(vn<<3)|mode   (LI=bits7-6, VN=bits5-3, Mode=bits2-0)
+//   Byte  1    : stratum   (u8)
+//   Byte  2    : poll      (i8, signed interval exponent, stored raw)
+//   Byte  3    : precision (i8, signed clock precision exponent, stored raw)
+//   Bytes 4-7  : root_delay       (u32 BE, NTP short format)
+//   Bytes 8-11 : root_dispersion  (u32 BE, NTP short format)
+//   Bytes 12-15: reference_id     (u32 BE)
+//   Bytes 16-23: reference timestamp  (u64 = two u32: seconds, fraction)
+//   Bytes 24-31: origin timestamp     (u64 = two u32: seconds, fraction)
+//   Bytes 32-39: receive timestamp    (u64 = two u32: seconds, fraction)
+//   Bytes 40-47: transmit timestamp   (u64 = two u32: seconds, fraction)
+//
+// PUBLIC API:
+//   ntp_encode(h: dict) -> bytes   (48 bytes)
+//     Keys: "li","vn","mode","stratum","poll","precision",
+//           "root_delay","root_dispersion","reference_id",
+//           "ref_sec","ref_frac","org_sec","org_frac",
+//           "rx_sec","rx_frac","tx_sec","tx_frac"
+//     Missing keys default to 0. tx_sec/tx_frac are placed at bytes 40-47.
+//
+//   ntp_decode(b: bytes) -> dict
+//     Decodes a 48-byte NTP packet. Returns {} if bytes_len(b) < 48.
+//     Returned keys: "li","vn","mode","stratum","poll","precision",
+//                    "root_delay","root_dispersion","reference_id",
+//                    "ref_sec","ref_frac","org_sec","org_frac",
+//                    "rx_sec","rx_frac","tx_sec","tx_frac"
+//
+// NOTE: 64-bit NTP timestamps are handled as TWO u32 halves (seconds,
+// fraction) so they fit in NOVA's native integer model without overflow.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Append a big-endian u16 to bytes out; return new bytes.
+fn _ntp_write_u16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append a big-endian u32 to bytes out; return new bytes.
+fn _ntp_write_u32(out, v)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Read a big-endian u32 from bytes b at offset i.
+// Caller MUST ensure bytes_len(b) >= i+4.
+fn _ntp_read_u32(b, i)
+    let a0 = bytes_get(b, i)
+    let a1 = bytes_get(b, i + 1)
+    let a2 = bytes_get(b, i + 2)
+    let a3 = bytes_get(b, i + 3)
+    ((a0 << 24) | (a1 << 16) | (a2 << 8) | a3) & 0xFFFFFFFF
+
+// Read an integer field from dict h at key; return 0 if absent.
+fn _ntp_get(h, key)
+    if contains(h, key)
+        return h[key]
+    0
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ntp_encode(h) -> bytes
+//
+// Encodes an NTP v4 packet (48 bytes, all fields big-endian).
+//
+// Field layout in h:
+//   "li"               : 0-3  (2 bits, Leap Indicator)
+//   "vn"               : 0-7  (3 bits, Version Number; typically 4)
+//   "mode"             : 0-7  (3 bits; 3=client, 4=server, 5=broadcast)
+//   "stratum"          : u8   (0=unspec, 1=primary, 2-15=secondary)
+//   "poll"             : u8   (log2 seconds between polls, stored raw)
+//   "precision"        : u8   (log2 clock precision, stored raw; 0xEC = -20)
+//   "root_delay"       : u32  (NTP short format root path delay)
+//   "root_dispersion"  : u32  (NTP short format root dispersion)
+//   "reference_id"     : u32  (4-byte refid: stratum 1 uses ASCII code)
+//   "ref_sec"/"ref_frac"  : u32 pair — reference timestamp
+//   "org_sec"/"org_frac"  : u32 pair — origin timestamp
+//   "rx_sec"/"rx_frac"    : u32 pair — receive timestamp
+//   "tx_sec"/"tx_frac"    : u32 pair — transmit timestamp
+//
+// Returns exactly 48 bytes in NTP wire format.
+fn ntp_encode(h)
+    let li   = _ntp_get(h, "li")
+    let vn   = _ntp_get(h, "vn")
+    let mode = _ntp_get(h, "mode")
+    let flags = ((li & 0x3) << 6) | ((vn & 0x7) << 3) | (mode & 0x7)
+    let stratum   = _ntp_get(h, "stratum")
+    let poll      = _ntp_get(h, "poll")
+    let precision = _ntp_get(h, "precision")
+    let root_delay       = _ntp_get(h, "root_delay")
+    let root_dispersion  = _ntp_get(h, "root_dispersion")
+    let reference_id     = _ntp_get(h, "reference_id")
+    let ref_sec  = _ntp_get(h, "ref_sec")
+    let ref_frac = _ntp_get(h, "ref_frac")
+    let org_sec  = _ntp_get(h, "org_sec")
+    let org_frac = _ntp_get(h, "org_frac")
+    let rx_sec   = _ntp_get(h, "rx_sec")
+    let rx_frac  = _ntp_get(h, "rx_frac")
+    let tx_sec   = _ntp_get(h, "tx_sec")
+    let tx_frac  = _ntp_get(h, "tx_frac")
+    let out = bytes(0)
+    out = bytes_append(out, flags & 0xFF)
+    out = bytes_append(out, stratum & 0xFF)
+    out = bytes_append(out, poll & 0xFF)
+    out = bytes_append(out, precision & 0xFF)
+    out = _ntp_write_u32(out, root_delay & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, root_dispersion & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, reference_id & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, ref_sec & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, ref_frac & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, org_sec & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, org_frac & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, rx_sec & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, rx_frac & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, tx_sec & 0xFFFFFFFF)
+    out = _ntp_write_u32(out, tx_frac & 0xFFFFFFFF)
+    out
+
+// ntp_decode(b) -> dict
+//
+// Decodes a 48-byte NTP packet from bytes b.
+// Returns a dict with keys:
+//   "li","vn","mode"          : extracted from byte 0
+//   "stratum"                 : byte 1
+//   "poll"                    : byte 2 (raw; interpret as signed if needed)
+//   "precision"               : byte 3 (raw; interpret as signed if needed)
+//   "root_delay"              : u32, bytes 4-7
+//   "root_dispersion"         : u32, bytes 8-11
+//   "reference_id"            : u32, bytes 12-15
+//   "ref_sec","ref_frac"      : u32 pair, bytes 16-23
+//   "org_sec","org_frac"      : u32 pair, bytes 24-31
+//   "rx_sec","rx_frac"        : u32 pair, bytes 32-39
+//   "tx_sec","tx_frac"        : u32 pair, bytes 40-47
+//
+// Returns {} if bytes_len(b) < 48 (bounds-safe; never crashes on short input).
+fn ntp_decode(b)
+    let empty = {}
+    if bytes_len(b) < 48
+        return empty
+    let flags    = bytes_get(b, 0)
+    let li       = (flags >> 6) & 0x3
+    let vn       = (flags >> 3) & 0x7
+    let mode     = flags & 0x7
+    let stratum   = bytes_get(b, 1)
+    let poll      = bytes_get(b, 2)
+    let precision = bytes_get(b, 3)
+    let root_delay      = _ntp_read_u32(b, 4)
+    let root_dispersion = _ntp_read_u32(b, 8)
+    let reference_id    = _ntp_read_u32(b, 12)
+    let ref_sec  = _ntp_read_u32(b, 16)
+    let ref_frac = _ntp_read_u32(b, 20)
+    let org_sec  = _ntp_read_u32(b, 24)
+    let org_frac = _ntp_read_u32(b, 28)
+    let rx_sec   = _ntp_read_u32(b, 32)
+    let rx_frac  = _ntp_read_u32(b, 36)
+    let tx_sec   = _ntp_read_u32(b, 40)
+    let tx_frac  = _ntp_read_u32(b, 44)
+    {"li": li, "vn": vn, "mode": mode, "stratum": stratum, "poll": poll, "precision": precision, "root_delay": root_delay, "root_dispersion": root_dispersion, "reference_id": reference_id, "ref_sec": ref_sec, "ref_frac": ref_frac, "org_sec": org_sec, "org_frac": org_frac, "rx_sec": rx_sec, "rx_frac": rx_frac, "tx_sec": tx_sec, "tx_frac": tx_frac}

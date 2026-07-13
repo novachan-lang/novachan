@@ -1,0 +1,172 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ipv4hdr
+// ============================================================================
+// RFC 791 — 20-byte IPv4 header codec (no options), big-endian wire format.
+//
+// Wire layout (20 bytes, all multi-byte fields big-endian):
+//   Byte  0    : version(4b) | IHL(4b)   — normally 0x45 (v4, 5*4=20 bytes)
+//   Byte  1    : TOS / DSCP+ECN
+//   Bytes 2-3  : Total Length (u16)       — including header+data
+//   Bytes 4-5  : Identification (u16)
+//   Bytes 6-7  : Flags(3b) | Fragment Offset(13b)
+//                  flags: bit2=Reserved, bit1=DF(Don't Fragment), bit0=MF(More Fragments)
+//                  packed as (flags<<13)|frag_offset
+//   Byte  8    : TTL
+//   Byte  9    : Protocol (6=TCP,17=UDP,1=ICMP,…)
+//   Bytes 10-11: Header Checksum (u16)    — RFC 1071 ones-complement
+//   Bytes 12-15: Source IP address (u32)
+//   Bytes 16-19: Destination IP address (u32)
+//
+// PUBLIC API:
+//   ipv4_encode(h: dict) -> bytes
+//     h keys (all int): "version","ihl","tos","total_length","id",
+//                       "flags","frag_offset","ttl","protocol","src","dst"
+//     Missing keys default to 0. Returns 20-byte wire encoding with checksum computed.
+//
+//   ipv4_decode(b: bytes) -> dict
+//     Decodes 20-byte IPv4 header from start of b.
+//     Returns dict with all fields (incl "checksum" as stored in wire).
+//     Returns {} on short/malformed input.
+//
+//   ipv4_src_str(h: dict) -> string
+//     Returns dotted-decimal notation of h["src"], e.g. "192.168.0.1".
+//     Returns "" if key missing.
+//
+//   ipv4_dst_str(h: dict) -> string
+//     Returns dotted-decimal notation of h["dst"], e.g. "192.168.0.199".
+//     Returns "" if key missing.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Read a field from dict, defaulting to 0 if absent.
+fn _iv4_get(h, key)
+    if contains(h, key)
+        return h[key]
+    0
+
+// Read big-endian u16 from bytes b at offset i. Caller ensures i+1 < bytes_len(b).
+fn _iv4_r16(b, i)
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Read big-endian u32 from bytes b at offset i. Caller ensures i+3 < bytes_len(b).
+fn _iv4_r32(b, i)
+    let a = bytes_get(b, i)
+    let c = bytes_get(b, i + 1)
+    let d = bytes_get(b, i + 2)
+    let e = bytes_get(b, i + 3)
+    ((a << 24) | (c << 16) | (d << 8) | e) & 0xFFFFFFFF
+
+// Append big-endian u16 to accumulator; return new bytes.
+fn _iv4_w16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append big-endian u32 to accumulator; return new bytes.
+fn _iv4_w32(out, v)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// RFC 1071 ones-complement checksum over bytes b.
+// Canonical vector: 20-byte IPv4 header (checksum field zeroed) -> 0xB861.
+fn _iv4_checksum(b)
+    let sum = 0
+    let i = 0
+    let n = bytes_len(b)
+    while i + 1 < n
+        sum = sum + ((bytes_get(b, i) << 8) | bytes_get(b, i + 1))
+        i = i + 2
+    if i < n
+        sum = sum + (bytes_get(b, i) << 8)
+    while (sum >> 16) != 0
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    (~sum) & 0xFFFF
+
+// Convert a u32 IP address to dotted-decimal string.
+fn _iv4_dotted(addr)
+    let a = (addr >> 24) & 0xFF
+    let b = (addr >> 16) & 0xFF
+    let c = (addr >> 8) & 0xFF
+    let d = addr & 0xFF
+    str(a) + "." + str(b) + "." + str(c) + "." + str(d)
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ipv4_encode: dict -> 20-byte big-endian IPv4 header bytes (checksum computed).
+//
+// Example:
+//   ipv4_encode({"version":4,"ihl":5,"tos":0,"total_length":0x73,"id":0,
+//                "flags":2,"frag_offset":0,"ttl":64,"protocol":17,
+//                "src":0xC0A80001,"dst":0xC0A800C7})
+//   => 20 bytes: 45 00 00 73 00 00 40 00 40 11 B8 61 C0 A8 00 01 C0 A8 00 C7
+fn ipv4_encode(h)
+    let ver   = _iv4_get(h, "version")
+    let ihl   = _iv4_get(h, "ihl")
+    let tos   = _iv4_get(h, "tos")
+    let tlen  = _iv4_get(h, "total_length")
+    let id    = _iv4_get(h, "id")
+    let flags = _iv4_get(h, "flags")
+    let foff  = _iv4_get(h, "frag_offset")
+    let ttl   = _iv4_get(h, "ttl")
+    let proto = _iv4_get(h, "protocol")
+    let src   = _iv4_get(h, "src")
+    let dst   = _iv4_get(h, "dst")
+    let verihl = ((ver & 0xF) << 4) | (ihl & 0xF)
+    let flagsfoff = ((flags & 0x7) << 13) | (foff & 0x1FFF)
+    let out = bytes(0)
+    out = bytes_append(out, verihl & 0xFF)
+    out = bytes_append(out, tos & 0xFF)
+    out = _iv4_w16(out, tlen & 0xFFFF)
+    out = _iv4_w16(out, id & 0xFFFF)
+    out = _iv4_w16(out, flagsfoff & 0xFFFF)
+    out = bytes_append(out, ttl & 0xFF)
+    out = bytes_append(out, proto & 0xFF)
+    out = _iv4_w16(out, 0)
+    out = _iv4_w32(out, src & 0xFFFFFFFF)
+    out = _iv4_w32(out, dst & 0xFFFFFFFF)
+    let csum = _iv4_checksum(out)
+    bytes_set(out, 10, (csum >> 8) & 0xFF)
+    bytes_set(out, 11, csum & 0xFF)
+    out
+
+// ipv4_decode: bytes -> dict with all IPv4 header fields.
+//
+// Decodes the first 20 bytes of b as a fixed IPv4 header (no options).
+// Returns dict with keys:
+//   "version","ihl","tos","total_length","id","flags","frag_offset",
+//   "ttl","protocol","checksum","src","dst"
+// Returns {} on short input (< 20 bytes).
+fn ipv4_decode(b)
+    if bytes_len(b) < 20
+        return {}
+    let verihl  = bytes_get(b, 0)
+    let ver     = (verihl >> 4) & 0xF
+    let ihl     = verihl & 0xF
+    let tos     = bytes_get(b, 1)
+    let tlen    = _iv4_r16(b, 2)
+    let id      = _iv4_r16(b, 4)
+    let flagsfoff = _iv4_r16(b, 6)
+    let flags   = (flagsfoff >> 13) & 0x7
+    let foff    = flagsfoff & 0x1FFF
+    let ttl     = bytes_get(b, 8)
+    let proto   = bytes_get(b, 9)
+    let csum    = _iv4_r16(b, 10)
+    let src     = _iv4_r32(b, 12)
+    let dst     = _iv4_r32(b, 16)
+    {"version": ver, "ihl": ihl, "tos": tos, "total_length": tlen, "id": id, "flags": flags, "frag_offset": foff, "ttl": ttl, "protocol": proto, "checksum": csum, "src": src, "dst": dst}
+
+// ipv4_src_str: dict -> dotted-decimal source IP string.
+// Returns "0.0.0.0" if "src" key is absent (defaults to 0).
+fn ipv4_src_str(h)
+    _iv4_dotted(_iv4_get(h, "src"))
+
+// ipv4_dst_str: dict -> dotted-decimal destination IP string.
+// Returns "0.0.0.0" if "dst" key is absent (defaults to 0).
+fn ipv4_dst_str(h)
+    _iv4_dotted(_iv4_get(h, "dst"))

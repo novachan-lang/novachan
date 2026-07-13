@@ -1,0 +1,166 @@
+// ============================================================================
+// NOVA Standard Library — std/net/arppkt
+// ============================================================================
+// RFC 826 — 28-byte ARP packet codec for IPv4-over-Ethernet (big-endian).
+//
+// Wire layout (28 bytes, all multi-byte fields big-endian):
+//   Bytes  0-1  : htype (u16) — hardware type; 1 = Ethernet
+//   Bytes  2-3  : ptype (u16) — protocol type; 0x0800 = IPv4
+//   Byte   4    : hlen  (u8)  — hardware address length; 6 for MAC
+//   Byte   5    : plen  (u8)  — protocol address length; 4 for IPv4
+//   Bytes  6-7  : oper  (u16) — operation; 1 = REQUEST, 2 = REPLY
+//   Bytes  8-13 : sha   (bytes[6]) — sender hardware address (MAC)
+//   Bytes 14-17 : spa   (u32)      — sender protocol address (IPv4)
+//   Bytes 18-23 : tha   (bytes[6]) — target hardware address (MAC)
+//   Bytes 24-27 : tpa   (u32)      — target protocol address (IPv4)
+//
+// PUBLIC API:
+//   arp_encode(h: dict) -> bytes
+//     h keys:
+//       "oper" (int)    — 1=REQUEST, 2=REPLY (default 1)
+//       "sha"  (bytes)  — sender MAC 6 bytes (default 6 zero bytes)
+//       "spa"  (int)    — sender IPv4 as u32 (default 0)
+//       "tha"  (bytes)  — target MAC 6 bytes (default 6 zero bytes)
+//       "tpa"  (int)    — target IPv4 as u32 (default 0)
+//     htype=1, ptype=0x0800, hlen=6, plen=4 are always fixed per RFC 826.
+//     Returns exactly 28 bytes in big-endian wire format.
+//
+//   arp_decode(b: bytes) -> dict
+//     Decodes 28-byte ARP packet from b.
+//     Returns dict with keys: "htype","ptype","hlen","plen","oper","sha","spa","tha","tpa"
+//     Returns {} if bytes_len(b) < 28 (bounds-safe; never crashes).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Read a field from dict, defaulting to 0 if absent.
+fn _arp_get(h, key)
+    if contains(h, key)
+        return h[key]
+    0
+
+// Read big-endian u16 from bytes b at offset i. Caller ensures i+1 < bytes_len(b).
+fn _arp_r16(b, i)
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Read big-endian u32 from bytes b at offset i. Caller ensures i+3 < bytes_len(b).
+fn _arp_r32(b, i)
+    let a = bytes_get(b, i)
+    let c = bytes_get(b, i + 1)
+    let d = bytes_get(b, i + 2)
+    let e = bytes_get(b, i + 3)
+    ((a << 24) | (c << 16) | (d << 8) | e) & 0xFFFFFFFF
+
+// Append big-endian u16 value v to bytes out; return new bytes.
+fn _arp_w16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append big-endian u32 value v to bytes out; return new bytes.
+fn _arp_w32(out, v)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append exactly 6 bytes of a MAC address from mac_bytes to out.
+// mac_bytes must be exactly 6 bytes (caller's responsibility).
+// Unrolled for clarity and to avoid nested-if-in-while NOVA parse complexity.
+fn _arp_w_mac(out, mac_bytes)
+    out = bytes_append(out, bytes_get(mac_bytes, 0))
+    out = bytes_append(out, bytes_get(mac_bytes, 1))
+    out = bytes_append(out, bytes_get(mac_bytes, 2))
+    out = bytes_append(out, bytes_get(mac_bytes, 3))
+    out = bytes_append(out, bytes_get(mac_bytes, 4))
+    out = bytes_append(out, bytes_get(mac_bytes, 5))
+    out
+
+// Read 6-byte hardware address (MAC) from bytes b at offset i into a new bytes value.
+// Caller ensures i+5 < bytes_len(b).
+fn _arp_r_mac(b, i)
+    let mac = bytes(0)
+    mac = bytes_append(mac, bytes_get(b, i))
+    mac = bytes_append(mac, bytes_get(b, i + 1))
+    mac = bytes_append(mac, bytes_get(b, i + 2))
+    mac = bytes_append(mac, bytes_get(b, i + 3))
+    mac = bytes_append(mac, bytes_get(b, i + 4))
+    mac = bytes_append(mac, bytes_get(b, i + 5))
+    mac
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// arp_encode: dict -> 28-byte big-endian ARP wire packet.
+//
+// Fixed fields (per RFC 826 for IPv4-over-Ethernet):
+//   htype = 1      (Ethernet)
+//   ptype = 0x0800 (IPv4)
+//   hlen  = 6      (6-byte MAC)
+//   plen  = 4      (4-byte IPv4)
+//
+// Variable fields from dict h:
+//   "oper" (int)   — 1=ARP REQUEST, 2=ARP REPLY. Defaults to 1.
+//   "sha"  (bytes) — sender MAC, exactly 6 bytes. Defaults to 6 zero bytes.
+//   "spa"  (int)   — sender IPv4 u32. Defaults to 0.
+//   "tha"  (bytes) — target MAC, exactly 6 bytes. Defaults to 6 zero bytes.
+//   "tpa"  (int)   — target IPv4 u32. Defaults to 0.
+//
+// Example (ARP Request — who has 192.168.0.199?):
+//   let sha = bytes(6)
+//   bytes_set(sha, 0, 0xDE); bytes_set(sha, 1, 0xAD)
+//   bytes_set(sha, 2, 0xBE); bytes_set(sha, 3, 0xEF)
+//   bytes_set(sha, 4, 0x00); bytes_set(sha, 5, 0x01)
+//   arp_encode({"oper":1,"sha":sha,"spa":0xC0A80001,"tha":bytes(6),"tpa":0xC0A800C7})
+//   => 28 bytes: 00 01 08 00 06 04 00 01 DE AD BE EF 00 01 C0 A8 00 01 00 00 00 00 00 00 C0 A8 00 C7
+fn arp_encode(h)
+    let oper = _arp_get(h, "oper")
+    let spa  = _arp_get(h, "spa")
+    let tpa  = _arp_get(h, "tpa")
+    let sha  = bytes(6)
+    let tha  = bytes(6)
+    if contains(h, "sha")
+        sha = h["sha"]
+    if contains(h, "tha")
+        tha = h["tha"]
+    let out = bytes(0)
+    out = _arp_w16(out, 1)
+    out = _arp_w16(out, 0x0800)
+    out = bytes_append(out, 6)
+    out = bytes_append(out, 4)
+    out = _arp_w16(out, oper & 0xFFFF)
+    out = _arp_w_mac(out, sha)
+    out = _arp_w32(out, spa & 0xFFFFFFFF)
+    out = _arp_w_mac(out, tha)
+    out = _arp_w32(out, tpa & 0xFFFFFFFF)
+    out
+
+// arp_decode: bytes -> dict with all ARP packet fields.
+//
+// Decodes exactly the first 28 bytes of b as an ARP packet.
+// Returns dict with keys:
+//   "htype" (int)   — hardware type (1 = Ethernet)
+//   "ptype" (int)   — protocol type (0x0800 = IPv4)
+//   "hlen"  (int)   — hardware address length (6)
+//   "plen"  (int)   — protocol address length (4)
+//   "oper"  (int)   — operation (1=REQUEST, 2=REPLY)
+//   "sha"   (bytes) — sender hardware address (MAC), 6 bytes
+//   "spa"   (int)   — sender protocol address (IPv4 u32)
+//   "tha"   (bytes) — target hardware address (MAC), 6 bytes
+//   "tpa"   (int)   — target protocol address (IPv4 u32)
+// Returns {} if bytes_len(b) < 28 (never crashes on short input).
+fn arp_decode(b)
+    if bytes_len(b) < 28
+        return {}
+    let htype = _arp_r16(b, 0)
+    let ptype = _arp_r16(b, 2)
+    let hlen  = bytes_get(b, 4)
+    let plen  = bytes_get(b, 5)
+    let oper  = _arp_r16(b, 6)
+    let sha   = _arp_r_mac(b, 8)
+    let spa   = _arp_r32(b, 14)
+    let tha   = _arp_r_mac(b, 18)
+    let tpa   = _arp_r32(b, 24)
+    {"htype": htype, "ptype": ptype, "hlen": hlen, "plen": plen, "oper": oper, "sha": sha, "spa": spa, "tha": tha, "tpa": tpa}

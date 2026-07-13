@@ -1,0 +1,126 @@
+// ============================================================================
+// NOVA Standard Library — std/net/icmpecho
+// ============================================================================
+// RFC 792 — ICMP echo request / echo reply codec (big-endian wire format).
+//
+// Wire layout (8-byte fixed header + variable payload):
+//   Byte  0    : type      (u8)  — 8 = echo request, 0 = echo reply
+//   Byte  1    : code      (u8)  — always 0 for echo
+//   Bytes 2-3  : checksum  (u16) — RFC 1071 ones-complement over whole message
+//   Bytes 4-5  : id        (u16) — identifier (set by sender, echoed back)
+//   Bytes 6-7  : seq       (u16) — sequence number
+//   Bytes 8..  : payload   (bytes) — arbitrary data (echoed back)
+//
+// PUBLIC API:
+//   icmp_echo_encode(type, id, seq, payload) -> bytes
+//     Builds the full ICMP echo message and inserts the correct checksum.
+//     type:    8 for request, 0 for reply (any u8 accepted)
+//     id:      u16 identifier
+//     seq:     u16 sequence number
+//     payload: bytes — appended verbatim after the 8-byte header
+//
+//   icmp_echo_decode(b) -> dict
+//     Decodes an ICMP echo message from b (starts at byte 0).
+//     Returns {"type","code","checksum","id","seq","payload"} on success.
+//     Returns {} if bytes_len(b) < 8 (bounds-safe; never crashes).
+//     The "payload" value is a bytes slice of the data after byte 8.
+//
+// CHECKSUM:
+//   Computed over the entire message (header + payload) with the checksum
+//   field zeroed, per RFC 792.  inet_checksum over the complete encoded
+//   message (with checksum embedded) equals 0 for a valid packet.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Read a big-endian u16 from bytes b at position i.
+// Caller MUST ensure bytes_len(b) >= i+2.
+fn _ice_read_u16(b, i)
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Append a big-endian u16 value v to bytes out; return new bytes.
+fn _ice_write_u16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// RFC 1071 internet checksum over all bytes in b.
+// Returns the 16-bit ones-complement checksum.
+fn _ice_checksum(b)
+    let acc = 0
+    let i = 0
+    let n = bytes_len(b)
+    while i + 1 < n
+        acc = acc + ((bytes_get(b, i) << 8) | bytes_get(b, i + 1))
+        i = i + 2
+    if i < n
+        acc = acc + (bytes_get(b, i) << 8)
+    while (acc >> 16) != 0
+        acc = (acc & 0xFFFF) + ((acc >> 16) & 0xFFFF)
+    return (~acc) & 0xFFFF
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// icmp_echo_encode(type, id, seq, payload) -> bytes
+//
+// Encodes a complete ICMP echo request or reply message.
+// The checksum field is computed over the entire message (header+payload)
+// with the checksum bytes zeroed, then inserted at bytes 2-3, per RFC 792.
+//
+// Parameters:
+//   type    : 8 = echo request, 0 = echo reply
+//   id      : u16 identifier (use e.g. PID & 0xFFFF)
+//   seq     : u16 sequence number (increments per ping)
+//   payload : bytes — data to echo back (may be bytes(0) for empty)
+//
+// Returns: (8 + bytes_len(payload)) bytes, checksum valid.
+//
+// Example:
+//   icmp_echo_encode(8, 0x1234, 1, str_to_bytes("hello"))
+//   => 13 bytes, type=8, id=0x1234, seq=1, checksum valid
+fn icmp_echo_encode(icmp_type, id, seq, payload)
+    let out = bytes(0)
+    out = bytes_append(out, icmp_type & 0xFF)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, 0)
+    out = _ice_write_u16(out, id & 0xFFFF)
+    out = _ice_write_u16(out, seq & 0xFFFF)
+    out = bytes_concat(out, payload)
+    let cks = _ice_checksum(out)
+    bytes_set(out, 2, (cks >> 8) & 0xFF)
+    bytes_set(out, 3, cks & 0xFF)
+    out
+
+// icmp_echo_decode(b) -> dict
+//
+// Decodes bytes b as an ICMP echo message (header starts at byte 0).
+// Returns a dict with keys:
+//   "type"     : int (8=request, 0=reply)
+//   "code"     : int (should be 0)
+//   "checksum" : int (u16 as stored in wire bytes 2-3)
+//   "id"       : int (u16, bytes 4-5)
+//   "seq"      : int (u16, bytes 6-7)
+//   "payload"  : bytes (bytes 8 onward; bytes(0) if no payload)
+//
+// Returns {} if bytes_len(b) < 8 (bounds-safe; never crashes on short input).
+//
+// Example:
+//   let msg = icmp_echo_decode(wire_bytes)
+//   print(str(msg["type"]))   // 8 for request
+fn icmp_echo_decode(b)
+    let empty = {}
+    if bytes_len(b) < 8
+        return empty
+    let icmp_type = bytes_get(b, 0)
+    let code = bytes_get(b, 1)
+    let cks = _ice_read_u16(b, 2)
+    let id = _ice_read_u16(b, 4)
+    let seq = _ice_read_u16(b, 6)
+    let n = bytes_len(b)
+    let payload = bytes(0)
+    if n > 8
+        payload = bytes_slice(b, 8, n)
+    {"type": icmp_type, "code": code, "checksum": cks, "id": id, "seq": seq, "payload": payload}
