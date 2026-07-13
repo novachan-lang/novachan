@@ -1,0 +1,202 @@
+// std/hash/xxh64.nova — xxHash64: fast 64-bit non-cryptographic hash (seedable).
+//
+// Reference: https://github.com/Cyan4973/xxHash/blob/dev/doc/xxhash_spec.md
+//
+// Algorithm overview:
+//   For inputs >= 32 bytes: four 64-bit accumulators are processed in 32-byte
+//   stripes.  After the stripe loop the lanes are merged, then the tail (< 32 bytes)
+//   is consumed.  For inputs < 32 bytes a simplified single-accumulator path is used.
+//   Both paths finish with the same length-mix and finalisation avalanche.
+//
+// Prime constants — all > 2^63, so we build each from two 32-bit halves:
+//   P1 = 0x9E3779B185EBCA87   P2 = 0xC2B2AE3D27D4EB4F
+//   P3 = 0x165667B19E3779F9   P4 = 0x85EBCA77C2B2AE63
+//   P5 = 0x27D4EB2F165667C5
+//
+// Public API:
+//   h_xxh64(b, seed) -> int
+//       Return the xxHash64 of the bytes value b with the given seed.
+//       The result is a signed i64; its 64-bit pattern is the correct xxHash64.
+//       For display, use xxh64_hex(h) to get a 16-char uppercase hex string.
+//
+// KAT vectors (from the official xxHash reference implementation):
+//   h_xxh64(bytes(0),  0) = 0xEF46DB3751D8E999
+//   h_xxh64(str_to_bytes("abc"), 0) = 0x44BC2CF5AD770999
+//
+// NOVA 64-bit arithmetic notes:
+//   >> is ARITHMETIC (sign-extends) — use _shr64() for logical right-shift.
+//   i64 * wraps mod 2^64 naturally — no masking needed after multiply.
+//   XOR ^ and | on negative i64 work correctly at the bit level.
+
+// ---------------------------------------------------------------------------
+// Internal: logical right-shift for 64-bit values.
+// ---------------------------------------------------------------------------
+fn _shr64(x, n)
+    let mask = (1 << (64 - n)) - 1
+    return (x >> n) & mask
+
+// ---------------------------------------------------------------------------
+// Internal: 64-bit left-rotate.
+// ---------------------------------------------------------------------------
+fn _rotl64(x, r)
+    let rr = r & 63
+    if rr == 0
+        return x
+    return (x << rr) | _shr64(x, 64 - rr)
+
+// ---------------------------------------------------------------------------
+// Internal: prime constants (each > 2^63, built from 32-bit halves).
+// ---------------------------------------------------------------------------
+fn _xxh_p1()
+    return (0x9E3779B1 << 32) | 0x85EBCA87
+
+fn _xxh_p2()
+    return (0xC2B2AE3D << 32) | 0x27D4EB4F
+
+fn _xxh_p3()
+    return (0x165667B1 << 32) | 0x9E3779F9
+
+fn _xxh_p4()
+    return (0x85EBCA77 << 32) | 0xC2B2AE63
+
+fn _xxh_p5()
+    return (0x27D4EB2F << 32) | 0x165667C5
+
+// ---------------------------------------------------------------------------
+// Internal: read a little-endian 64-bit integer from bytes b at offset off.
+// Bounds-checked: if off+7 >= bytes_len(b) this should not be called.
+// ---------------------------------------------------------------------------
+fn _xxh_read64(b, off)
+    let b0 = bytes_get(b, off)
+    let b1 = bytes_get(b, off + 1)
+    let b2 = bytes_get(b, off + 2)
+    let b3 = bytes_get(b, off + 3)
+    let b4 = bytes_get(b, off + 4)
+    let b5 = bytes_get(b, off + 5)
+    let b6 = bytes_get(b, off + 6)
+    let b7 = bytes_get(b, off + 7)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+
+// ---------------------------------------------------------------------------
+// Internal: read a little-endian 32-bit integer from bytes b at offset off.
+// ---------------------------------------------------------------------------
+fn _xxh_read32(b, off)
+    let b0 = bytes_get(b, off)
+    let b1 = bytes_get(b, off + 1)
+    let b2 = bytes_get(b, off + 2)
+    let b3 = bytes_get(b, off + 3)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+// ---------------------------------------------------------------------------
+// Internal: one round of the xxHash64 mixing function.
+//   acc = rotl64(acc + (input * P2), 31) * P1
+// ---------------------------------------------------------------------------
+fn _xxh_round(acc, input)
+    let p1 = _xxh_p1()
+    let p2 = _xxh_p2()
+    let v = acc + (input * p2)
+    return _rotl64(v, 31) * p1
+
+// ---------------------------------------------------------------------------
+// Internal: merge one lane value into the running accumulator.
+//   h = (h XOR round(0, lane)) * P1 + P4
+// ---------------------------------------------------------------------------
+fn _xxh_merge_acc(h, lane)
+    let p1 = _xxh_p1()
+    let p4 = _xxh_p4()
+    let mixed = _xxh_round(0, lane)
+    return (h ^ mixed) * p1 + p4
+
+// ---------------------------------------------------------------------------
+// Internal: final avalanche mix (applied to the hash value h).
+// ---------------------------------------------------------------------------
+fn _xxh_avalanche(h)
+    let p2 = _xxh_p2()
+    let p3 = _xxh_p3()
+    let h1 = h ^ _shr64(h, 33)
+    let h2 = h1 * p2
+    let h3 = h2 ^ _shr64(h2, 29)
+    let h4 = h3 * p3
+    let h5 = h4 ^ _shr64(h4, 32)
+    return h5
+
+// ---------------------------------------------------------------------------
+// Public: h_xxh64(b, seed) -> int
+//   Compute the xxHash64 of bytes value b with the given integer seed.
+// ---------------------------------------------------------------------------
+fn h_xxh64(b, seed)
+    let p1 = _xxh_p1()
+    let p2 = _xxh_p2()
+    let p3 = _xxh_p3()
+    let p5 = _xxh_p5()
+    let n = bytes_len(b)
+    let h = 0
+
+    if n >= 32
+        // Initialise four accumulators.
+        let v1 = seed + p1 + p2
+        let v2 = seed + p2
+        let v3 = seed
+        let v4 = seed - p1
+
+        // Process 32-byte stripes.
+        let pos = 0
+        while pos <= n - 32
+            v1 = _xxh_round(v1, _xxh_read64(b, pos))
+            v2 = _xxh_round(v2, _xxh_read64(b, pos + 8))
+            v3 = _xxh_round(v3, _xxh_read64(b, pos + 16))
+            v4 = _xxh_round(v4, _xxh_read64(b, pos + 24))
+            pos = pos + 32
+
+        // Merge the four lanes into h.
+        let hm = _rotl64(v1, 1) + _rotl64(v2, 7) + _rotl64(v3, 12) + _rotl64(v4, 18)
+        hm = _xxh_merge_acc(hm, v1)
+        hm = _xxh_merge_acc(hm, v2)
+        hm = _xxh_merge_acc(hm, v3)
+        hm = _xxh_merge_acc(hm, v4)
+        h = hm
+    else
+        // Short input: use a simple seed-based initial value.
+        h = seed + p5
+
+    // Mix in the total length.
+    h = h + n
+
+    // Consume the tail: 8 bytes at a time.
+    let tail = 0
+    if n >= 32
+        tail = (n / 32) * 32
+    let i = tail
+    let p4 = _xxh_p4()
+    while i <= n - 8
+        let k = _xxh_read64(b, i)
+        let km = _xxh_round(0, k)
+        h = _rotl64(h ^ km, 27) * p1 + p4
+        i = i + 8
+
+    // Consume the tail: 4 bytes at a time.
+    while i <= n - 4
+        let k4 = _xxh_read32(b, i)
+        h = _rotl64(h ^ (k4 * p1), 23) * p2 + p3
+        i = i + 4
+
+    // Consume remaining single bytes.
+    while i < n
+        let kb = bytes_get(b, i)
+        h = _rotl64(h ^ (kb * p5), 11) * p1
+        i = i + 1
+
+    return _xxh_avalanche(h)
+
+// ---------------------------------------------------------------------------
+// Utility: convert a 64-bit hash (signed i64) to a 16-char uppercase hex string.
+// ---------------------------------------------------------------------------
+fn xxh64_hex(h)
+    let digits = "0123456789ABCDEF"
+    let result = ""
+    let shift = 60
+    while shift >= 0
+        let nibble = _shr64(h, shift) & 0xF
+        result = result + char_at(digits, nibble)
+        shift = shift - 4
+    return result

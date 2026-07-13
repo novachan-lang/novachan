@@ -1,0 +1,214 @@
+// std/hash/murmur3_128.nova — MurmurHash3 x64 128-bit (seedable).
+//
+// Reference: Austin Appleby, MurmurHash3 (public domain)
+//   https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
+//   Function: MurmurHash3_x64_128
+//
+// Algorithm overview:
+//   • Constants c1=0x87C37B91114253D5, c2=0x4CF5AD432745937F
+//     (built from 32-bit halves because bit-63-set literals are rejected)
+//   • Process input in 16-byte blocks; each block contributes k1 (lo 8 bytes)
+//     and k2 (hi 8 bytes) mixed with c1/c2 into h1/h2.
+//   • Tail: remaining 1-15 bytes mixed into k1/k2 by length.
+//   • Finalize: h1 ^= len; h2 ^= len; h1 += h2; h2 += h1;
+//     h1 = fmix64(h1); h2 = fmix64(h2); h1 += h2; h2 += h1.
+//
+// NOVA 64-bit arithmetic notes:
+//   • i64 + and * WRAP mod 2^64 — no masking needed after add/mul.
+//   • >> is ARITHMETIC (sign-extends) — use _shr64() for logical shift.
+//   • Hex literals with bit 63 set are rejected; build as (hi<<32)|lo.
+//   • _rotl64/_shr64 helpers inline below (not imported).
+//
+// Public API:
+//   h_murmur3_128(b: bytes, seed: int) -> list [h1, h2]
+//     Returns the 128-bit hash as a list of two i64 values (signed).
+//     For hex display use murmur3_128_hex(h1) / murmur3_128_hex(h2).
+//
+// KAT anchors (SMHasher verified):
+//   h_murmur3_128(bytes(0), 0)  == [0, 0]   (fmix64(0)==0 by construction)
+//   h_murmur3_128(bytes(0), 1)  != [0, 0]   (seed propagates)
+//   Two distinct non-empty inputs give distinct results (collision smoke-test).
+//   Result is deterministic: same input+seed always gives same [h1,h2].
+
+// ---------------------------------------------------------------------------
+// Internal: logical right-shift for 64-bit values.
+// NOVA >> is arithmetic — we must mask sign-extension bits.
+// ---------------------------------------------------------------------------
+fn _shr64(x, n)
+    let mask = (1 << (64 - n)) - 1
+    return (x >> n) & mask
+
+// ---------------------------------------------------------------------------
+// Internal: rotate-left 64-bit.
+// ---------------------------------------------------------------------------
+fn _rotl64(x, r)
+    let rr = r & 63
+    if rr == 0
+        return x
+    return (x << rr) | _shr64(x, 64 - rr)
+
+// ---------------------------------------------------------------------------
+// Internal: MurmurHash3 fmix64 finalizer.
+// Mixes entropy from all bits into all bits ("avalanche").
+// fmix64(0) == 0 by construction (all multiplications by 0 yield 0).
+// Constants (bit-63-set; built from 32-bit halves):
+//   0xFF51AFD7ED558CCD = (0xFF51AFD7 << 32) | 0xED558CCD
+//   0xC4CEB9FE1A85EC53 = (0xC4CEB9FE << 32) | 0x1A85EC53
+// ---------------------------------------------------------------------------
+fn _fmix64(h)
+    let m1 = (0xFF51AFD7 << 32) | 0xED558CCD
+    let m2 = (0xC4CEB9FE << 32) | 0x1A85EC53
+    h = h ^ _shr64(h, 33)
+    h = h * m1
+    h = h ^ _shr64(h, 33)
+    h = h * m2
+    h = h ^ _shr64(h, 33)
+    return h
+
+// ---------------------------------------------------------------------------
+// Internal: read 8 bytes from bytes b starting at offset off, little-endian.
+// Bounds: caller must guarantee off+7 < bytes_len(b).
+// ---------------------------------------------------------------------------
+fn _read64_le(b, off)
+    let v0 = bytes_get(b, off)
+    let v1 = bytes_get(b, off + 1)
+    let v2 = bytes_get(b, off + 2)
+    let v3 = bytes_get(b, off + 3)
+    let v4 = bytes_get(b, off + 4)
+    let v5 = bytes_get(b, off + 5)
+    let v6 = bytes_get(b, off + 6)
+    let v7 = bytes_get(b, off + 7)
+    return v0 | (v1 << 8) | (v2 << 16) | (v3 << 24) | (v4 << 32) | (v5 << 40) | (v6 << 48) | (v7 << 56)
+
+// ---------------------------------------------------------------------------
+// h_murmur3_128 — MurmurHash3 x64 128-bit.
+//
+// Parameters:
+//   b    — bytes value to hash
+//   seed — 64-bit seed (use 0 for canonical/unseeded hashing)
+//
+// Returns: list [h1, h2] where h1 is the low 64 bits, h2 is the high 64 bits.
+//   Both are signed i64 (same bit pattern as the unsigned result).
+// ---------------------------------------------------------------------------
+fn h_murmur3_128(b, seed)
+    // Constants (built from 32-bit halves to avoid rejected bit-63-set literals)
+    let c1 = (0x87C37B91 << 32) | 0x114253D5
+    let c2 = (0x4CF5AD43 << 32) | 0x2745937F
+
+    let n = bytes_len(b)
+    let h1 = seed
+    let h2 = seed
+
+    // ------------------------------------------------------------------
+    // Body: process 16-byte blocks
+    // ------------------------------------------------------------------
+    let nblocks = n / 16
+    let block = 0
+    while block < nblocks
+        let off = block * 16
+        let k1 = _read64_le(b, off)
+        let k2 = _read64_le(b, off + 8)
+
+        // Mix k1 into h1
+        k1 = k1 * c1
+        k1 = _rotl64(k1, 31)
+        k1 = k1 * c2
+        h1 = h1 ^ k1
+
+        h1 = _rotl64(h1, 27)
+        h1 = h1 + h2
+        h1 = h1 * 5 + 0x52DCE729
+
+        // Mix k2 into h2
+        k2 = k2 * c2
+        k2 = _rotl64(k2, 33)
+        k2 = k2 * c1
+        h2 = h2 ^ k2
+
+        h2 = _rotl64(h2, 31)
+        h2 = h2 + h1
+        h2 = h2 * 5 + 0x38495AB5
+
+        block = block + 1
+
+    // ------------------------------------------------------------------
+    // Tail: remaining 1-15 bytes
+    // ------------------------------------------------------------------
+    let tail_off = nblocks * 16
+    let tail = n - tail_off
+    let k1t = 0
+    let k2t = 0
+
+    if tail >= 15
+        k2t = k2t ^ (bytes_get(b, tail_off + 14) << 48)
+    if tail >= 14
+        k2t = k2t ^ (bytes_get(b, tail_off + 13) << 40)
+    if tail >= 13
+        k2t = k2t ^ (bytes_get(b, tail_off + 12) << 32)
+    if tail >= 12
+        k2t = k2t ^ (bytes_get(b, tail_off + 11) << 24)
+    if tail >= 11
+        k2t = k2t ^ (bytes_get(b, tail_off + 10) << 16)
+    if tail >= 10
+        k2t = k2t ^ (bytes_get(b, tail_off + 9) << 8)
+    if tail >= 9
+        k2t = k2t ^ bytes_get(b, tail_off + 8)
+        k2t = k2t * c2
+        k2t = _rotl64(k2t, 33)
+        k2t = k2t * c1
+        h2 = h2 ^ k2t
+
+    if tail >= 8
+        k1t = k1t ^ (bytes_get(b, tail_off + 7) << 56)
+    if tail >= 7
+        k1t = k1t ^ (bytes_get(b, tail_off + 6) << 48)
+    if tail >= 6
+        k1t = k1t ^ (bytes_get(b, tail_off + 5) << 40)
+    if tail >= 5
+        k1t = k1t ^ (bytes_get(b, tail_off + 4) << 32)
+    if tail >= 4
+        k1t = k1t ^ (bytes_get(b, tail_off + 3) << 24)
+    if tail >= 3
+        k1t = k1t ^ (bytes_get(b, tail_off + 2) << 16)
+    if tail >= 2
+        k1t = k1t ^ (bytes_get(b, tail_off + 1) << 8)
+    if tail >= 1
+        k1t = k1t ^ bytes_get(b, tail_off)
+        k1t = k1t * c1
+        k1t = _rotl64(k1t, 31)
+        k1t = k1t * c2
+        h1 = h1 ^ k1t
+
+    // ------------------------------------------------------------------
+    // Finalization
+    // ------------------------------------------------------------------
+    h1 = h1 ^ n
+    h2 = h2 ^ n
+
+    h1 = h1 + h2
+    h2 = h2 + h1
+
+    h1 = _fmix64(h1)
+    h2 = _fmix64(h2)
+
+    h1 = h1 + h2
+    h2 = h2 + h1
+
+    let result = []
+    push(result, h1)
+    push(result, h2)
+    return result
+
+// ---------------------------------------------------------------------------
+// Utility: convert a 64-bit signed i64 hash value to a 16-character
+// uppercase hex string.  Use this when str() would show a negative decimal.
+// ---------------------------------------------------------------------------
+fn murmur3_128_hex(h)
+    let digits = "0123456789ABCDEF"
+    let result = ""
+    let shift = 60
+    while shift >= 0
+        let nibble = _shr64(h, shift) & 0xF
+        result = result + char_at(digits, nibble)
+        shift = shift - 4
+    return result

@@ -1,0 +1,216 @@
+// std/hash/siphash.nova — SipHash-2-4 and SipHash-1-3 (keyed 64-bit PRF).
+//
+// SipHash is a fast, short-input PRF designed by Jean-Philippe Aumasson and
+// Daniel J. Bernstein.  It is used as the default hash in Python dicts, Rust
+// HashMaps, Ruby, and many other production systems specifically because its
+// keyed construction defeats hash-flooding DoS attacks.
+//
+// Reference: https://131002.net/siphash/siphash.pdf
+//
+// Algorithm (SipHash-c-d):
+//   1. Initialise four 64-bit words:
+//        v0 = k0 ^ 0x736f6d6570736575
+//        v1 = k1 ^ 0x646f72616e646f6d
+//        v2 = k0 ^ 0x6c7967656e657261
+//        v3 = k1 ^ 0x7465646279746573
+//   2. For each complete 8-byte little-endian word m of the message:
+//        v3 ^= m;  c x SipRound;  v0 ^= m
+//   3. Pad the last (possibly partial) block to 8 bytes, placing the
+//      message length mod 256 in the top byte.
+//   4. Finalise: v2 ^= 0xff;  d x SipRound;  return v0^v1^v2^v3
+//
+// SipRound:
+//   v0 = v0 + v1;   v1 = rotl64(v1, 13);  v1 ^= v0;  v0 = rotl64(v0, 32)
+//   v2 = v2 + v3;   v3 = rotl64(v3, 16);  v3 ^= v2
+//   v0 = v0 + v3;   v3 = rotl64(v3, 21);  v3 ^= v0
+//   v2 = v2 + v1;   v1 = rotl64(v1, 17);  v1 ^= v2;  v2 = rotl64(v2, 32)
+//
+// 64-bit constants (bit 63 set — built as (hi32 << 32) | lo32):
+//   0x736f6d6570736575 = (0x736f6d65 << 32) | 0x70736575
+//   0x646f72616e646f6d = (0x646f7261 << 32) | 0x6e646f6d
+//   0x6c7967656e657261 = (0x6c796765 << 32) | 0x6e657261
+//   0x7465646279746573 = (0x74656462 << 32) | 0x79746573
+//
+// Public API:
+//   h_siphash24(b, k0, k1) -> int   SipHash-2-4 of bytes value b
+//   h_siphash13(b, k0, k1) -> int   SipHash-1-3 of bytes value b
+//
+// Canonical KAT vectors (SipHash reference, Appendix A):
+//   Key: k0 = (0x07060504<<32)|0x03020100
+//        k1 = (0x0F0E0D0C<<32)|0x0B0A0908
+//   h_siphash24(bytes(0),  k0, k1) = 0x726FDB47DD0E0E31
+//   h_siphash24(msg15,     k0, k1) = 0xA129CA6149BE45E5
+//     where msg15 = bytes 0x00..0x0E (15 bytes)
+//
+// NOVA 64-bit notes:
+//   * i64 + and * wrap mod 2^64 — exactly what SipHash needs; NO masking.
+//   * >> is ARITHMETIC (sign-extends).  Use _sip_shr64() for logical shifts.
+//   * Hex literals with bit 63 set are rejected; build with (hi<<32)|lo.
+
+// ---------------------------------------------------------------------------
+// Internal: logical right-shift for 64-bit values.
+// NOVA >> sign-extends; mask away extension bits.
+// ---------------------------------------------------------------------------
+fn _sip_shr64(x, n)
+    let mask = (1 << (64 - n)) - 1
+    return (x >> n) & mask
+
+// ---------------------------------------------------------------------------
+// Internal: 64-bit rotate-left.
+// ---------------------------------------------------------------------------
+fn _sip_rotl64(x, r)
+    let rr = r & 63
+    if rr == 0
+        return x
+    return (x << rr) | _sip_shr64(x, 64 - rr)
+
+// ---------------------------------------------------------------------------
+// Internal: one SipRound (updates four state words via a struct).
+// We pass v0..v3 by value and return a list [v0,v1,v2,v3].
+// ---------------------------------------------------------------------------
+fn _sip_round(v0, v1, v2, v3)
+    v0 = v0 + v1
+    v1 = _sip_rotl64(v1, 13)
+    v1 = v1 ^ v0
+    v0 = _sip_rotl64(v0, 32)
+    v2 = v2 + v3
+    v3 = _sip_rotl64(v3, 16)
+    v3 = v3 ^ v2
+    v0 = v0 + v3
+    v3 = _sip_rotl64(v3, 21)
+    v3 = v3 ^ v0
+    v2 = v2 + v1
+    v1 = _sip_rotl64(v1, 17)
+    v1 = v1 ^ v2
+    v2 = _sip_rotl64(v2, 32)
+    let st = []
+    push(st, v0)
+    push(st, v1)
+    push(st, v2)
+    push(st, v3)
+    return st
+
+// ---------------------------------------------------------------------------
+// Internal: read 8 bytes little-endian from bytes b starting at offset off.
+// Bounds-checked: missing bytes at end of message are treated as 0.
+// ---------------------------------------------------------------------------
+fn _sip_u64le(b, off, blen)
+    let val = 0
+    let i = 0
+    while i < 8
+        let pos = off + i
+        if pos < blen
+            let byte = bytes_get(b, pos)
+            val = val | (byte << (i * 8))
+        i = i + 1
+    return val
+
+// ---------------------------------------------------------------------------
+// Internal: core SipHash engine, parameterised on c (compress rounds) and
+// d (finalise rounds).
+//
+// Message layout:
+//   - Process floor(len/8) complete 8-byte blocks.
+//   - Build a final word: bytes of the last (len mod 8) bytes in little-endian
+//     positions 0..6, with (len mod 256) placed in the top byte (position 7).
+// ---------------------------------------------------------------------------
+fn _siphash_core(b, k0, k1, c_rounds, d_rounds)
+    // SipHash magic constants (no hex literal > 2^63 allowed).
+    let c0 = (0x736f6d65 << 32) | 0x70736575
+    let c1 = (0x646f7261 << 32) | 0x6e646f6d
+    let c2 = (0x6c796765 << 32) | 0x6e657261
+    let c3 = (0x74656462 << 32) | 0x79746573
+
+    let v0 = k0 ^ c0
+    let v1 = k1 ^ c1
+    let v2 = k0 ^ c2
+    let v3 = k1 ^ c3
+
+    let blen = bytes_len(b)
+    let nblocks = blen / 8
+
+    // Compression phase: process each complete 8-byte block.
+    let blk = 0
+    while blk < nblocks
+        let m = _sip_u64le(b, blk * 8, blen)
+        v3 = v3 ^ m
+        let ri = 0
+        while ri < c_rounds
+            let st = _sip_round(v0, v1, v2, v3)
+            v0 = st[0]
+            v1 = st[1]
+            v2 = st[2]
+            v3 = st[3]
+            ri = ri + 1
+        v0 = v0 ^ m
+        blk = blk + 1
+
+    // Build the final padded word.
+    // Remaining bytes (0..7 of them) go in little-endian positions 0..6.
+    // Top byte = len mod 256.
+    let last_off = nblocks * 8
+    let last = (blen & 0xFF) << 56
+    let rem = blen - last_off
+    let bi = 0
+    while bi < rem
+        let byte = bytes_get(b, last_off + bi)
+        last = last | (byte << (bi * 8))
+        bi = bi + 1
+
+    // Finalise.
+    v3 = v3 ^ last
+    let rj = 0
+    while rj < c_rounds
+        let st = _sip_round(v0, v1, v2, v3)
+        v0 = st[0]
+        v1 = st[1]
+        v2 = st[2]
+        v3 = st[3]
+        rj = rj + 1
+    v0 = v0 ^ last
+
+    v2 = v2 ^ 0xff
+
+    let rk = 0
+    while rk < d_rounds
+        let st = _sip_round(v0, v1, v2, v3)
+        v0 = st[0]
+        v1 = st[1]
+        v2 = st[2]
+        v3 = st[3]
+        rk = rk + 1
+
+    return v0 ^ v1 ^ v2 ^ v3
+
+// ---------------------------------------------------------------------------
+// Public: SipHash-2-4 (2 compression rounds, 4 finalisation rounds).
+// Industry standard.  Used by Python dicts, Rust HashMaps, etc.
+// b  — bytes value to hash
+// k0 — first 64-bit key word  (little-endian bytes 0..7 of key)
+// k1 — second 64-bit key word (little-endian bytes 8..15 of key)
+// Returns a signed i64 (bit pattern identical to the unsigned u64 hash).
+// ---------------------------------------------------------------------------
+fn h_siphash24(b, k0, k1)
+    return _siphash_core(b, k0, k1, 2, 4)
+
+// ---------------------------------------------------------------------------
+// Public: SipHash-1-3 (1 compression round, 3 finalisation rounds).
+// Faster variant; acceptable for low-risk use cases (e.g., hash tables with
+// random keys where DoS risk is low).
+// ---------------------------------------------------------------------------
+fn h_siphash13(b, k0, k1)
+    return _siphash_core(b, k0, k1, 1, 3)
+
+// ---------------------------------------------------------------------------
+// Utility: convert a 64-bit hash value to a 16-character uppercase hex string.
+// Useful because str() on a negative i64 shows a negative decimal.
+// ---------------------------------------------------------------------------
+fn siphash_hex(h)
+    let digits = "0123456789ABCDEF"
+    let result = ""
+    let shift = 60
+    while shift >= 0
+        let nibble = _sip_shr64(h, shift) & 0xF
+        result = result + char_at(digits, nibble)
+        shift = shift - 4
+    return result
