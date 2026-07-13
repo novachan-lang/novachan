@@ -1,0 +1,328 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/huffman
+// ============================================================================
+// Huffman coding: entropy-based prefix coding that assigns shorter bit-strings
+// to more-frequent characters, achieving lossless compression.
+//
+// ALGORITHM:
+//   1. Count character frequencies in the input string.
+//   2. Build a min-heap of leaf nodes (one per distinct char).
+//      Tie-break: (freq asc, then char-ord asc for leaves, then insert order
+//      for internal nodes). This makes the code assignment deterministic.
+//   3. Repeatedly extract two minimum nodes and combine into an internal node
+//      whose frequency is the sum, until one node remains (the tree root).
+//   4. Traverse the tree: going left appends "0", going right appends "1".
+//   5. Each leaf's accumulated path is its Huffman code (a bitstring string
+//      composed of '0' and '1' chars, e.g. "010").
+//
+// SPECIAL CASES:
+//   empty string → empty codes dict, encode returns ["", {}], decode returns "".
+//   single distinct char → assign code "0" so round-trip works.
+//
+// NODE REPRESENTATION (pool-based to avoid recursive dict nesting):
+//   Nodes live in a list (the "pool").  Each node is a dict with keys:
+//     "freq"    int   — frequency / combined frequency
+//     "tb"      int   — tiebreak: char-ord for leaves, counter for internals
+//     "leaf"    int   — 1 = leaf node, 0 = internal node
+//     "ch"      str   — the character (leaf only, "" for internal)
+//     "left"    int   — pool index of left child (-1 for leaf)
+//     "right"   int   — pool index of right child (-1 for leaf)
+//
+// HEAP REPRESENTATION:
+//   A list of pool-indices forming a min-heap ordered by (freq asc, tb asc).
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   No right-shifts used in this module; not applicable.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _hf_ to avoid link collisions when this
+//   module is compiled alongside other std modules.
+//
+// PUBLIC API:
+//   hf_build_codes(s)        -> dict   char -> bitstring (e.g. "a" -> "10")
+//   hf_encode(s)             -> list   [bitstring, codesDict]
+//   hf_decode(bits, codes)   -> string
+//   hf_encoded_bits(s)       -> int    total bits for the encoded payload
+
+// ── Heap helpers (min-heap of pool indices, ordered by (freq, tb)) ───────────
+
+// _hf_node_lt: return 1 if pool[a] < pool[b] in the (freq, tb) order.
+fn _hf_node_lt(pool, a, b) -> int
+    let na = pool[a]
+    let nb = pool[b]
+    let fa = na["freq"]
+    let fb = nb["freq"]
+    if fa < fb
+        return 1
+    if fa > fb
+        return 0
+    let ta = na["tb"]
+    let tb = nb["tb"]
+    if ta < tb
+        return 1
+    return 0
+
+// _hf_heap_swap: swap heap[i] and heap[j].
+fn _hf_heap_swap(heap, i, j)
+    let tmp = heap[i]
+    heap[i] = heap[j]
+    heap[j] = tmp
+
+// _hf_sift_up: restore heap property upward from index i.
+fn _hf_sift_up(pool, heap, i)
+    let done = 0
+    while i > 0 and done == 0
+        let parent = (i - 1) / 2
+        if _hf_node_lt(pool, heap[i], heap[parent]) == 1
+            _hf_heap_swap(heap, i, parent)
+            i = parent
+        else
+            done = 1
+
+// _hf_sift_down: restore heap property downward from index i.
+fn _hf_sift_down(pool, heap, i, n)
+    let done = 0
+    while done == 0
+        let smallest = i
+        let left = 2 * i + 1
+        let right = 2 * i + 2
+        if left < n
+            if _hf_node_lt(pool, heap[left], heap[smallest]) == 1
+                smallest = left
+        if right < n
+            if _hf_node_lt(pool, heap[right], heap[smallest]) == 1
+                smallest = right
+        if smallest == i
+            done = 1
+        else
+            _hf_heap_swap(heap, i, smallest)
+            i = smallest
+
+// _hf_heap_push: insert pool-index idx into heap (sifts up).
+fn _hf_heap_push(pool, heap, idx)
+    heap.push(idx)
+    _hf_sift_up(pool, heap, len(heap) - 1)
+
+// _hf_heap_pop: remove and return the minimum pool-index from heap.
+fn _hf_heap_pop(pool, heap) -> int
+    let n = len(heap)
+    let top = heap[0]
+    if n == 1
+        heap.pop()
+        return top
+    let last = heap.pop()
+    heap[0] = last
+    _hf_sift_down(pool, heap, 0, len(heap))
+    return top
+
+// ── Tree building ─────────────────────────────────────────────────────────────
+
+// _hf_count_freqs: count character frequencies in s.
+// Returns a dict: char -> count (int).
+fn _hf_count_freqs(s) -> any
+    let freqs = {}
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = s[i]
+        if contains(freqs, c)
+            freqs[c] = freqs[c] + 1
+        else
+            freqs[c] = 1
+        i = i + 1
+    return freqs
+
+// _hf_build_tree: build a Huffman tree from the frequency dict.
+// Returns [pool, root_index] where pool is the node list and root_index
+// is the pool index of the root node, or -1 if the input was empty.
+// tb_counter starts at 1000 (leaves use char-ord, internals use 1000+n).
+fn _hf_build_tree(freqs) -> any
+    let pool = []
+    let heap = []
+    // Build leaf nodes sorted by char for deterministic tie-breaking.
+    // We collect chars into a list, then sort them by ord value.
+    let char_list = keys(freqs)
+    // Sort char_list by ord value (insertion sort — list may be small).
+    let nc = len(char_list)
+    let si = 1
+    while si < nc
+        let key_c = char_list[si]
+        let key_ord = ord(key_c)
+        let sj = si - 1
+        let sdone = 0
+        while sj >= 0 and sdone == 0
+            if ord(char_list[sj]) > key_ord
+                char_list[sj + 1] = char_list[sj]
+                sj = sj - 1
+            else
+                sdone = 1
+        char_list[sj + 1] = key_c
+        si = si + 1
+    // Insert leaf nodes into pool and heap in sorted char order.
+    let ci = 0
+    while ci < nc
+        let c = char_list[ci]
+        let node = {}
+        node["freq"] = freqs[c]
+        node["tb"] = ord(c)
+        node["leaf"] = 1
+        node["ch"] = c
+        node["left"] = -1
+        node["right"] = -1
+        let pidx = len(pool)
+        pool.push(node)
+        _hf_heap_push(pool, heap, pidx)
+        ci = ci + 1
+    // Edge case: empty input.
+    if len(heap) == 0
+        return [-1, pool]
+    // Edge case: single distinct char — return the leaf as root directly.
+    if len(heap) == 1
+        let root = _hf_heap_pop(pool, heap)
+        return [root, pool]
+    // Merge until one node remains.
+    let tb_counter = 1000
+    while len(heap) > 1
+        let left_idx = _hf_heap_pop(pool, heap)
+        let right_idx = _hf_heap_pop(pool, heap)
+        let left_node = pool[left_idx]
+        let right_node = pool[right_idx]
+        let combined = {}
+        combined["freq"] = left_node["freq"] + right_node["freq"]
+        combined["tb"] = tb_counter
+        combined["leaf"] = 0
+        combined["ch"] = ""
+        combined["left"] = left_idx
+        combined["right"] = right_idx
+        let new_idx = len(pool)
+        pool.push(combined)
+        _hf_heap_push(pool, heap, new_idx)
+        tb_counter = tb_counter + 1
+    let root_idx = _hf_heap_pop(pool, heap)
+    return [root_idx, pool]
+
+// ── Code traversal ────────────────────────────────────────────────────────────
+
+// _hf_traverse: DFS traversal of the tree to assign codes.
+// Stores results in the codes dict (char -> bitstring).
+// Uses an explicit stack (list of [node_idx, prefix_string] pairs) to avoid
+// recursion (NOVA has no tail-call guarantee on deep trees).
+//
+// Stack entry layout: a list [node_idx, prefix_string].
+fn _hf_traverse(pool, root_idx, codes)
+    // Push [root_idx, ""] onto the stack.
+    let stack = []
+    let entry0 = [root_idx, ""]
+    stack.push(entry0)
+    while len(stack) > 0
+        let top = stack.pop()
+        let nidx = top[0]
+        let prefix = top[1]
+        let node = pool[nidx]
+        if node["leaf"] == 1
+            // Leaf node: assign the accumulated prefix as its code.
+            // Single-char edge case: if prefix is "", assign "0".
+            if len(prefix) == 0
+                codes[node["ch"]] = "0"
+            else
+                codes[node["ch"]] = prefix
+        else
+            // Internal node: push right child (will be popped second = explored
+            // after left, since stack is LIFO) then left child.
+            let right_idx = node["right"]
+            let left_idx = node["left"]
+            let right_entry = [right_idx, prefix + "1"]
+            let left_entry = [left_idx, prefix + "0"]
+            stack.push(right_entry)
+            stack.push(left_entry)
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// hf_build_codes: build the Huffman code table for string s.
+// Returns a dict mapping each distinct character to its bitstring code.
+// The codes are prefix-free and deterministic: most-frequent chars get
+// the shortest codes; ties broken by char-ord (lower ord = shorter or same).
+// Empty input returns an empty dict.
+fn hf_build_codes(s) -> any
+    let codes = {}
+    let n = len(s)
+    if n == 0
+        return codes
+    let freqs = _hf_count_freqs(s)
+    let result = _hf_build_tree(freqs)
+    let root_idx = result[0]
+    let pool = result[1]
+    if root_idx == -1
+        return codes
+    _hf_traverse(pool, root_idx, codes)
+    return codes
+
+// hf_encode: encode string s using Huffman coding.
+// Returns a list: [bitstring, codesDict]
+//   bitstring — the concatenated bit-codes of every character in s
+//   codesDict — the code table (same as hf_build_codes(s)) for decode
+// Empty input returns ["", {}].
+fn hf_encode(s) -> any
+    let codes = hf_build_codes(s)
+    let bits = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = s[i]
+        bits = bits + codes[c]
+        i = i + 1
+    let out = [bits, codes]
+    return out
+
+// hf_decode: decode a Huffman bitstring back to the original string.
+// codes is the dict returned by hf_encode (char -> bitstring).
+// Builds a reverse map (bitstring -> char) then greedily matches prefixes.
+// Returns the decoded string, or "" if bits/codes is empty.
+fn hf_decode(bits, codes) -> string
+    let nb = len(bits)
+    if nb == 0
+        return ""
+    // Build reverse map: bitstring -> char.
+    let rev = {}
+    let char_keys = keys(codes)
+    let nk = len(char_keys)
+    let ki = 0
+    while ki < nk
+        let ch = char_keys[ki]
+        let code = codes[ch]
+        rev[code] = ch
+        ki = ki + 1
+    // Greedy prefix scan.
+    let out = ""
+    let pos = 0
+    while pos < nb
+        let prefix = ""
+        let found = 0
+        let j = pos
+        while j < nb and found == 0
+            prefix = prefix + bits[j]
+            j = j + 1
+            if contains(rev, prefix)
+                out = out + rev[prefix]
+                pos = j
+                found = 1
+        if found == 0
+            // Malformed bitstring — consume remaining bits to avoid infinite loop.
+            pos = nb
+    return out
+
+// hf_encoded_bits: return the total number of bits needed to Huffman-encode s.
+// Equivalent to len((hf_encode(s))[0]) but avoids building the full bitstring.
+// Empty input returns 0.
+fn hf_encoded_bits(s) -> int
+    let n = len(s)
+    if n == 0
+        return 0
+    let codes = hf_build_codes(s)
+    let total = 0
+    let i = 0
+    while i < n
+        let c = s[i]
+        total = total + len(codes[c])
+        i = i + 1
+    return total

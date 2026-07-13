@@ -1,0 +1,279 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/bwt
+// ============================================================================
+// Burrows-Wheeler Transform (BWT).
+//
+// The BWT is a reversible string permutation that clusters similar characters
+// together, making the output highly amenable to subsequent compression (e.g.
+// move-to-front + RLE + entropy coding as in bzip2).
+//
+// Algorithm overview — FORWARD:
+//   1. Form n cyclic rotations of the n-character input string.
+//   2. Sort rotation START-INDICES lexicographically (avoids O(n^2) string
+//      allocation; rotation at index r is s[r], s[r+1], ..., s[r+n-1] mod n).
+//   3. The LAST column of the sorted rotation matrix is the BWT output.
+//      For a rotation starting at index r, the last column character is
+//      s[(r + n - 1) mod n].
+//   4. The PRIMARY INDEX is the row whose rotation starts at offset 0 (i.e.
+//      the row that corresponds to the original string itself).
+//
+// Algorithm overview — INVERSE:
+//   Given last column L and primaryIndex:
+//   1. Sort L to obtain first column F.
+//   2. Build the LF-mapping: LF[i] = j means the i-th row's last char L[i]
+//      maps to row j in the sorted matrix.  Concretely, for each char c, the
+//      k-th occurrence of c in L maps to the k-th occurrence of c in F.
+//   3. Reconstruct: start at row = primaryIndex; collect L[row], follow
+//      LF[row] to get the next row; repeat n times.  Reverse collected chars.
+//
+// EOF-sentinel variant (bwt_transform_eof):
+//   Append chr(1) as a unique lexicographic sentinel that sorts before all
+//   printable ASCII.  Returns the full last column (length = len(s) + 1).
+//
+// PUBLIC API:
+//   bwt_transform(s: string) -> list
+//     Returns [transformedString, primaryIndex].
+//     transformedString is the BWT last-column permutation of s.
+//     primaryIndex (int) is the row corresponding to the original string.
+//     Empty string returns ["", 0].
+//
+//   bwt_inverse(transformed: string, primaryIndex: int) -> string
+//     Invert the BWT.  Returns the original string.  Empty string returns "".
+//
+//   bwt_transform_eof(s: string) -> string
+//     Append chr(1) sentinel, run BWT, return the last column
+//     (length = len(s) + 1, containing exactly one chr(1)).
+//
+// COMPLEXITY:
+//   Forward: O(n^2 log n) — insertion sort with O(n) rotation comparisons.
+//   Inverse: O(n) — LF-mapping construction and walk.
+//   Space:   O(n) — sorted index list built by insertion; strings not cloned.
+//
+// IMPLEMENTATION NOTE — list element assignment corruption:
+//   NOVA's RC machinery can mis-tag values stored via list[i]=v then retrieved
+//   and passed into arithmetic functions.  All sorting here uses a BUILD-NEW
+//   approach (push only, no index assignment) to guarantee correct int tags on
+//   all elements at all call sites.
+//
+// PRIVATE helpers are prefixed _bwt_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _bwt_pmod: non-negative modulo: returns x mod m for x >= 0.
+fn _bwt_pmod(xv, mv) -> int
+    xv - (xv / mv) * mv
+
+// _bwt_rcmp: returns 1 if cyclic rotation starting at index ra is
+// lexicographically strictly less than the rotation starting at rb in string sv
+// of length nv.  Returns 0 otherwise (including ties, which cannot occur when
+// the input contains a unique EOF sentinel).
+fn _bwt_rcmp(sv, nv, ra, rb) -> int
+    let ci = 0
+    let cres = 0
+    let cdone = 0
+    while ci < nv and cdone == 0
+        let cpa = _bwt_pmod(ra + ci, nv)
+        let cpb = _bwt_pmod(rb + ci, nv)
+        let cca = sv[cpa]
+        let ccb = sv[cpb]
+        if cca < ccb
+            cres = 1
+            cdone = 1
+        else
+            if cca > ccb
+                cdone = 1
+            else
+                ci = ci + 1
+    cres
+
+// _bwt_sortidx: stable insertion sort of rotation indices.
+// Builds a NEW sorted list (push only) to avoid the NOVA list-index-assignment
+// RC-tag corruption bug.  Each step rebuilds the sorted slice from scratch,
+// inserting the new element at the correct position.
+// Complexity: O(n^2) steps * O(n) comparisons = O(n^3) worst case.
+// Suitable for n < 500.
+fn _bwt_sortidx(sv, nv, src) -> list
+    let ssorted = []
+    let ssi = 0
+    while ssi < nv
+        let sskey = src[ssi]
+        // Find insertion position: first index in ssorted where sskey < existing
+        let sspos = len(ssorted)
+        let ssj = 0
+        let ssdone = 0
+        while ssj < len(ssorted) and ssdone == 0
+            let ssexist = ssorted[ssj]
+            if _bwt_rcmp(sv, nv, sskey, ssexist) == 1
+                sspos = ssj
+                ssdone = 1
+            else
+                ssj = ssj + 1
+        // Rebuild sorted list with sskey inserted at sspos
+        let ssnew = []
+        let ssk = 0
+        while ssk < sspos
+            push(ssnew, ssorted[ssk])
+            ssk = ssk + 1
+        push(ssnew, sskey)
+        let ssk2 = sspos
+        while ssk2 < len(ssorted)
+            push(ssnew, ssorted[ssk2])
+            ssk2 = ssk2 + 1
+        ssorted = ssnew
+        ssi = ssi + 1
+    ssorted
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// bwt_transform: compute the Burrows-Wheeler Transform of string s.
+//
+// Returns a two-element list [transformedString, primaryIndex].
+//   transformedString — last column of sorted BWT rotation matrix;
+//                       a permutation of the characters of s.
+//   primaryIndex      — 0-based row in sorted matrix whose rotation == s;
+//                       required argument for bwt_inverse.
+//
+// Hand-trace for "banana" (n=6):
+//   Rotations (rot[r] = string starting at r):
+//     r=0: banana  r=1: ananab  r=2: nanaba
+//     r=3: anaban  r=4: nabana  r=5: abanan
+//   Sorted order: abanan(5) anaban(3) ananab(1) banana(0) nabana(4) nanaba(2)
+//   Last chars (pos = (r+5)%6):
+//     r=5 -> pos=4 -> s[4]='n'
+//     r=3 -> pos=2 -> s[2]='n'
+//     r=1 -> pos=0 -> s[0]='b'
+//     r=0 -> pos=5 -> s[5]='a'
+//     r=4 -> pos=3 -> s[3]='a'
+//     r=2 -> pos=1 -> s[1]='a'
+//   Transformed = "nnbaaa", primaryIndex = 3 (row where r=0)
+//
+// Examples:
+//   bwt_transform("")         == ["", 0]
+//   bwt_transform("a")        == ["a", 0]
+//   bwt_transform("banana")   == ["nnbaaa", 3]
+fn bwt_transform(s) -> list
+    let tn = len(s)
+    if tn == 0
+        let ter = ["", 0]
+        return ter
+    // Build index list [0, 1, ..., tn-1] using push only
+    let tsrc = []
+    let tk = 0
+    while tk < tn
+        push(tsrc, tk)
+        tk = tk + 1
+    // Sort indices by cyclic-rotation lexicographic order (push-only sort)
+    let tidxs = _bwt_sortidx(s, tn, tsrc)
+    // Extract last column and locate primary index (row where rotation starts at 0)
+    let ttransformed = ""
+    let tprimary = 0
+    let ti = 0
+    while ti < tn
+        let trot = tidxs[ti]
+        let tlp = _bwt_pmod(trot + tn - 1, tn)
+        ttransformed = ttransformed + s[tlp]
+        if trot == 0
+            tprimary = ti
+        ti = ti + 1
+    let tres = [ttransformed, tprimary]
+    tres
+
+// bwt_inverse: reconstruct the original string from BWT last column + primary index.
+//
+// Parameters:
+//   transformed  — last-column string produced by bwt_transform.
+//   primaryIndex — integer row index produced by bwt_transform.
+//
+// Returns the original string before bwt_transform was applied.
+//
+// LF-mapping:
+//   L = transformed; F = sort(L).
+//   For each position i, LF[i] = (start offset of L[i] in F) + (rank of i-th L[i]
+//   among all occurrences of L[i] in L[0..i]).
+//   Walk: row <- LF[row], collecting L[row] each step, starting at primaryIndex.
+//   The collected characters are in REVERSE order; reverse to recover original.
+//
+// Examples:
+//   bwt_inverse("", 0)       == ""
+//   bwt_inverse("a", 0)      == "a"
+//   bwt_inverse("nnbaaa", 3) == "banana"
+fn bwt_inverse(transformed, primaryIndex) -> string
+    let ivn = len(transformed)
+    if ivn == 0
+        return ""
+    // Build L as list of single-char strings
+    let ivL = []
+    let ivi = 0
+    while ivi < ivn
+        push(ivL, transformed[ivi])
+        ivi = ivi + 1
+    // Count character frequencies in L (= frequencies in F, since F = sort(L))
+    let ivfreq = {}
+    let ivi2 = 0
+    while ivi2 < ivn
+        let ivc2 = ivL[ivi2]
+        if contains(ivfreq, ivc2)
+            ivfreq[ivc2] = ivfreq[ivc2] + 1
+        else
+            ivfreq[ivc2] = 1
+        ivi2 = ivi2 + 1
+    // Compute cumulative starting offset in F for each character (sorted unique chars)
+    let ivkeys = keys(ivfreq)
+    ivkeys = sort(ivkeys)
+    let ivfstart = {}
+    let ivcumul = 0
+    let ivki = 0
+    while ivki < len(ivkeys)
+        let ivck = ivkeys[ivki]
+        ivfstart[ivck] = ivcumul
+        ivcumul = ivcumul + ivfreq[ivck]
+        ivki = ivki + 1
+    // Build LF array: scan L left-to-right
+    // LF[i] = ivfstart[L[i]] + (# of L[i] seen in L[0..i-1])
+    let ivseen = {}
+    let ivLF = []
+    let ivi3 = 0
+    while ivi3 < ivn
+        let ivc3 = ivL[ivi3]
+        let ivrank = 0
+        if contains(ivseen, ivc3)
+            ivrank = ivseen[ivc3]
+        ivseen[ivc3] = ivrank + 1
+        push(ivLF, ivfstart[ivc3] + ivrank)
+        ivi3 = ivi3 + 1
+    // Walk ivn steps from primaryIndex, collecting L[row] each step.
+    // Characters collected in reverse order (last char first).
+    let ivchars = []
+    let ivrow = primaryIndex
+    let ivstep = 0
+    while ivstep < ivn
+        push(ivchars, ivL[ivrow])
+        ivrow = ivLF[ivrow]
+        ivstep = ivstep + 1
+    // Reverse ivchars to produce original string
+    let ivout = ""
+    let ivri = ivn - 1
+    while ivri >= 0
+        ivout = ivout + ivchars[ivri]
+        ivri = ivri - 1
+    ivout
+
+// bwt_transform_eof: BWT with unique EOF sentinel chr(1).
+//
+// Appends chr(1) (byte value 1, guaranteed less than any printable ASCII)
+// to s, then runs the standard BWT.  Returns the last column of the sorted
+// rotation matrix (length = len(s) + 1).
+//
+// The chr(1) sentinel ensures every rotation is lexicographically unique,
+// and appears exactly once in the output at a position that implicitly
+// encodes the original string's row (as in bzip2's BWT stage).
+//
+// Example: bwt_transform_eof("banana") returns a 7-char string that is a
+// permutation of chr(123)+"banana" (same chars, different order).
+// Note: chr(1) is used, not chr(123); the comment uses chr(1) meaning byte=1.
+fn bwt_transform_eof(s) -> string
+    let eofa = s + chr(1)
+    let eofr = bwt_transform(eofa)
+    eofr[0]

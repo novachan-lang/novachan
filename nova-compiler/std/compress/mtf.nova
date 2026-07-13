@@ -1,0 +1,201 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/mtf
+// ============================================================================
+// Move-to-Front (MTF) transform.
+//
+// MTF is a lossless, reversible transform (not a compressor by itself) that
+// converts strings with locally-repeated symbols into sequences of small
+// integers.  It is a preprocessing step used in BWT-based compressors such as
+// bzip2 (MTF stage between BWT and Huffman coding).
+//
+// HOW IT WORKS:
+//   Maintain an ordered alphabet.  The default alphabet is the 256 byte values
+//   1-255 followed by 0 — or rather, simply all 256 byte ordinal values stored
+//   as INTEGERS in a list, so that NOVA's NUL-string-truncation hazard (bytes
+//   0x00 silently terminate strings) does not apply.
+//   For each input character:
+//     1. Compute k = ord(c).
+//     2. Find the current position of k in the integer alphabet list.
+//     3. Emit that position.
+//     4. Move k to the front (position 0) of the list.
+//   Locally-repeated characters always produce index 0 (or small indices),
+//   which compresses well.
+//
+// IMPLEMENTATION NOTE — NUL-TRUNCATION AVOIDANCE:
+//   NOVA strings are C-string-shaped: a 0x00 byte inside a string silently
+//   truncates (reference_nova_string_nul_truncation).  The default alphabet
+//   contains chr(0), which would corrupt a string-based alphabet.  We store
+//   the working alphabet as a LIST OF INTEGERS (ordinal values), avoiding this
+//   hazard entirely.  The list is reconstructed fresh per encode/decode call.
+//
+// PUBLIC API:
+//   mtf_encode(s) -> list of int
+//     Encode string `s` using the default 256-symbol alphabet (byte values
+//     0-255 in order: position k initially holds ordinal k).
+//     Returns a list of integer indices, one per character of `s`.
+//
+//   mtf_decode(indices) -> string
+//     Invert mtf_encode: reconstruct the original string from a list of
+//     integer indices produced by mtf_encode.
+//
+//   mtf_encode_alpha(s, alphabet) -> list of int
+//     Encode `s` using a custom alphabet given as a string.  Every character
+//     of `s` MUST appear in `alphabet` (first occurrence is used).
+//     Returns indices in 0..len(alphabet)-1.
+//
+// INVARIANTS:
+//   mtf_decode(mtf_encode(s)) == s  for all strings s (even those with \x00
+//   bytes — though NOVA strings themselves cannot represent \x00 mid-string,
+//   so the effective domain is strings over bytes 1-255).
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers prefixed _mtf_ to prevent link-time collisions with
+//   other std modules compiled into the same binary.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private: build the default 256-element integer alphabet list ──────────────
+
+// _mtf_default_alpha: return a list of 256 integers [0, 1, 2, ..., 255].
+// Position k holds ordinal value k initially; this matches chr(k) at index k.
+// Stored as integers (not a string) to avoid NUL-truncation for ordinal 0.
+fn _mtf_default_alpha() -> list
+    let alpha = []
+    let i = 0
+    while i < 256
+        push(alpha, i)
+        i = i + 1
+    alpha
+
+// ── Private: find position of ordinal `code` in integer list `alpha` ──────────
+
+// _mtf_find_ord: linear scan for the integer `code` in `alpha`.
+// Returns the index of the first match, or -1 if not found.
+fn _mtf_find_ord(alpha, code) -> int
+    let n = len(alpha)
+    let i = 0
+    let found = -1
+    while i < n
+        let v = alpha[i]
+        if v == code
+            if found == -1
+                found = i
+        i = i + 1
+    found
+
+// ── Private: move element at position `pos` to front of list `alpha` ──────────
+
+// _mtf_move_front_list: rebuild the integer-list alphabet with alpha[pos]
+// moved to position 0 and all elements before it shifted right by one.
+// Returns a NEW list (pure functional update); the original is not mutated.
+fn _mtf_move_front_list(alpha, pos) -> list
+    let n = len(alpha)
+    let moved = alpha[pos]
+    let out = []
+    push(out, moved)
+    let i = 0
+    while i < n
+        if i != pos
+            push(out, alpha[i])
+        i = i + 1
+    out
+
+// ── Private: build a custom integer-alphabet list from a string ───────────────
+
+// _mtf_alpha_from_str: convert a string `alphabet` into a list of ordinals.
+// E.g. "abc" -> [97, 98, 99].
+fn _mtf_alpha_from_str(alphabet) -> list
+    let n = len(alphabet)
+    let out = []
+    let i = 0
+    while i < n
+        push(out, ord(alphabet[i]))
+        i = i + 1
+    out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// mtf_encode(s) -> list of int
+//
+// Apply the Move-to-Front transform to string `s` using the default 256-symbol
+// alphabet (ordinal k at position k initially, i.e. chr(0) at 0 .. chr(255)
+// at 255).
+//
+// For each character c in `s`:
+//   1. k = ord(c)
+//   2. pos = current position of k in the working alphabet (integer list)
+//   3. Append pos to the result list
+//   4. Move k to position 0
+//
+// Known-answer examples (from hand-trace):
+//   mtf_encode("aaaa")   -> [97, 0, 0, 0]
+//   mtf_encode("a")      -> [97]
+//   mtf_encode("zzzz")   -> [122, 0, 0, 0]
+fn mtf_encode(s) -> list
+    let alpha = _mtf_default_alpha()
+    let out = []
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = s[i]
+        let code = ord(c)
+        let pos = _mtf_find_ord(alpha, code)
+        push(out, pos)
+        alpha = _mtf_move_front_list(alpha, pos)
+        i = i + 1
+    out
+
+// mtf_decode(indices) -> string
+//
+// Invert mtf_encode.  Given a list of integer indices produced by mtf_encode,
+// reconstruct the original string using the default 256-symbol alphabet.
+//
+// For each index pos in `indices`:
+//   1. c = chr(alpha[pos])  — the character at that position
+//   2. Append c to the result
+//   3. Move alpha[pos] to position 0
+//
+// Round-trip guarantee:
+//   mtf_decode(mtf_encode(s)) == s  for all valid strings s.
+fn mtf_decode(indices) -> string
+    let alpha = _mtf_default_alpha()
+    let out = ""
+    let n = len(indices)
+    let i = 0
+    while i < n
+        let pos = indices[i]
+        let code = alpha[pos]
+        out = out + chr(code)
+        alpha = _mtf_move_front_list(alpha, pos)
+        i = i + 1
+    out
+
+// mtf_encode_alpha(s, alphabet) -> list of int
+//
+// Apply the Move-to-Front transform to string `s` using a custom alphabet
+// given as a string.  The alphabet must contain every character of `s`.
+//
+// Useful for restricted symbol sets:
+//   Text:   alphabet = "abcdefghijklmnopqrstuvwxyz"   (26 symbols)
+//   DNA:    alphabet = "ACGT"
+//   Digits: alphabet = "0123456789"
+//
+// Produces a list of integer indices in 0..len(alphabet)-1.
+//
+// Example:
+//   mtf_encode_alpha("aab", "abc") -> [0, 0, 1]
+//     'a' at position 0 in "abc"; still at 0 after move; 'b' at position 1.
+fn mtf_encode_alpha(s, alphabet) -> list
+    let alpha = _mtf_alpha_from_str(alphabet)
+    let out = []
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = s[i]
+        let code = ord(c)
+        let pos = _mtf_find_ord(alpha, code)
+        push(out, pos)
+        alpha = _mtf_move_front_list(alpha, pos)
+        i = i + 1
+    out

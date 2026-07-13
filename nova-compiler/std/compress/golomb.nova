@@ -1,0 +1,350 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/golomb
+// ============================================================================
+// Golomb-Rice coding of non-negative integers.
+//
+// Golomb coding is an entropy-coding scheme optimal for geometrically
+// distributed (i.e. exponentially decaying) non-negative integers.
+// Rice coding is the special case where the Golomb parameter m is a power
+// of two (m = 2^k), which lets quotient and remainder be extracted by
+// fast bit operations.
+//
+// ENCODING (Rice with parameter k):
+//   For integer n >= 0:
+//     q = n >> k              (quotient, how many full 2^k fit in n)
+//     r = n & ((1<<k) - 1)   (remainder, the low k bits of n)
+//   Bitstring = unary(q) ++ k-bit(r)
+//   where unary(q) = q ones followed by a single zero: e.g. unary(3)="1110"
+//   and k-bit(r) is r in MSB-first binary padded to exactly k bits.
+//
+// ENCODING (Golomb with arbitrary parameter m):
+//   b = ceil(log2(m))   (number of bits for the shorter codes)
+//   cutoff = (1 << b) - m
+//   q = n / m           (integer division)
+//   r = n mod m
+//   Unary of q, then:
+//     if r < cutoff: emit (b-1) bits of r in MSB-first binary
+//     else:          emit b bits of (r + cutoff) in MSB-first binary
+//   When m is a power of two this degenerates to Rice coding.
+//
+// DECODING:
+//   Read q ones until the stop zero; then read k (or b) bits as remainder.
+//
+// PUBLIC API:
+//   glm_rice_encode(n, k) -> string
+//     Encode non-negative integer n with Rice parameter k.
+//     Returns a bitstring (characters '0' and '1').
+//     k must be >= 0. k=0 produces pure unary (no remainder bits).
+//
+//   glm_rice_decode(bits, k) -> list
+//     Decode one Rice-coded value from bitstring bits starting at bit 0.
+//     Returns [value, next_bit_pos] where next_bit_pos is the index after
+//     the last consumed bit. Malformed input (bitstring ends mid-code)
+//     returns [-1, len(bits)].
+//
+//   glm_golomb_encode(n, m) -> string
+//     Encode n with Golomb parameter m (arbitrary positive integer).
+//     When m is a power of two, equivalent to glm_rice_encode with k=log2(m).
+//
+//   glm_golomb_decode(bits, m) -> list
+//     Decode one Golomb-coded value. Returns [value, next_bit_pos].
+//
+//   glm_encode_list(xs, k) -> string
+//     Concatenate Rice encodings of every integer in list xs.
+//
+//   glm_decode_list(bits, k, count) -> list
+//     Decode exactly count Rice-coded values from bits.
+//     Returns a list of count integers.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers use prefix _glm_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _glm_int_to_bits: convert integer v to an n-bit MSB-first binary string.
+// v must fit in n bits (0 <= v < 2^n). n=0 returns "".
+fn _glm_int_to_bits(v, n) -> string
+    if n == 0
+        return ""
+    let out = ""
+    let i = n - 1
+    while i >= 0
+        let bit = (v >> i) & 1
+        if bit == 1
+            out = out + "1"
+        else
+            out = out + "0"
+        i = i - 1
+    out
+
+// _glm_unary: produce the unary code for q: q ones followed by a zero.
+// unary(0)="0", unary(1)="10", unary(2)="110", unary(3)="1110", etc.
+fn _glm_unary(q) -> string
+    let out = ""
+    let i = 0
+    while i < q
+        let dummy = 0
+        out = out + "1"
+        i = i + 1
+    out = out + "0"
+    out
+
+// _glm_read_unary: read a unary-coded value from bitstring bits at position pos.
+// Returns [q, next_pos] where q is the count of leading ones before the stop zero.
+// If no zero is found before end-of-string returns [-1, len(bits)] (malformed).
+fn _glm_read_unary(bits, pos) -> list
+    let blen = len(bits)
+    let q = 0
+    let cur = pos
+    let found = 0
+    while cur < blen and found == 0
+        let dummy = 0
+        if bits[cur] == "1"
+            q = q + 1
+            cur = cur + 1
+        else
+            cur = cur + 1
+            found = 1
+    let result = []
+    if found == 0
+        result.push(-1)
+        result.push(blen)
+    else
+        result.push(q)
+        result.push(cur)
+    result
+
+// _glm_read_bits: read n bits from bitstring bits at position pos as an integer.
+// MSB first. Returns [value, next_pos].
+// If fewer than n bits remain, returns [-1, len(bits)] (malformed).
+fn _glm_read_bits(bits, pos, n) -> list
+    let blen = len(bits)
+    let result = []
+    if n == 0
+        result.push(0)
+        result.push(pos)
+        return result
+    if pos + n > blen
+        result.push(-1)
+        result.push(blen)
+        return result
+    let v = 0
+    let i = 0
+    while i < n
+        let dummy = 0
+        if bits[pos + i] == "1"
+            v = v * 2 + 1
+        else
+            v = v * 2
+        i = i + 1
+    result.push(v)
+    result.push(pos + n)
+    result
+
+// _glm_ceil_log2: smallest integer b such that 2^b >= m.
+// Requires m >= 1. Returns 0 for m=1.
+fn _glm_ceil_log2(m) -> int
+    if m <= 1
+        return 0
+    let b = 0
+    let p = 1
+    let done = 0
+    while done == 0
+        let dummy = 0
+        if p >= m
+            done = 1
+        else
+            b = b + 1
+            p = p * 2
+    b
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// glm_rice_encode: encode non-negative integer n with Rice parameter k.
+//
+// k = 0: pure unary encoding (no remainder bits).
+// k > 0: quotient in unary + k-bit remainder in MSB-first binary.
+//
+// Examples (k=2):
+//   n=0  -> q=0, r=0  -> "0"  + "00" -> "000"
+//   n=1  -> q=0, r=1  -> "0"  + "01" -> "001"
+//   n=4  -> q=1, r=0  -> "10" + "00" -> "1000"
+//   n=5  -> q=1, r=1  -> "10" + "01" -> "1001"
+//   n=8  -> q=2, r=0  -> "110"+ "00" -> "11000"
+//   n=10 -> q=2, r=2  -> "110"+ "10" -> "11010"
+fn glm_rice_encode(n, k) -> string
+    let q = n >> k
+    let mask = (1 << k) - 1
+    let r = n & mask
+    let unary_part = _glm_unary(q)
+    let rem_part = _glm_int_to_bits(r, k)
+    unary_part + rem_part
+
+// glm_rice_decode: decode one Rice-coded value from bitstring bits at position 0.
+//
+// Returns [value, next_bit_pos].
+// next_bit_pos is the index immediately after the last consumed bit, suitable
+// for chaining decodes (pass it as start to the next call if needed — see
+// glm_decode_list for multi-value decoding from an offset).
+//
+// On malformed input (truncated bitstring) returns [-1, len(bits)].
+fn glm_rice_decode(bits, k) -> list
+    let unary_result = _glm_read_unary(bits, 0)
+    let q = unary_result[0]
+    let pos = unary_result[1]
+    if q == -1
+        let bad = []
+        bad.push(-1)
+        bad.push(pos)
+        return bad
+    let rem_result = _glm_read_bits(bits, pos, k)
+    let r = rem_result[0]
+    let next_pos = rem_result[1]
+    if r == -1
+        let bad2 = []
+        bad2.push(-1)
+        bad2.push(next_pos)
+        return bad2
+    let value = (q << k) + r
+    let out = []
+    out.push(value)
+    out.push(next_pos)
+    out
+
+// glm_golomb_encode: encode n with arbitrary Golomb parameter m.
+//
+// Golomb coding generalises Rice to non-power-of-two m.
+// When m is a power of two (m = 2^k) the output is identical to
+// glm_rice_encode(n, log2(m)).
+//
+// The "shortened binary" representation for the remainder avoids wasting
+// the codes that would exceed m-1:
+//   b     = ceil(log2(m))
+//   cutoff= 2^b - m          (codes 0..cutoff-1 use b-1 bits)
+//   if r < cutoff:  emit (b-1)-bit binary of r
+//   else:           emit b-bit binary of (r + cutoff)
+//
+// Examples (m=3, so b=2, cutoff=1):
+//   n=0 -> q=0, r=0 -> r<1  -> "0"+"0"  -> "00"
+//   n=1 -> q=0, r=1 -> r>=1 -> "0"+"10" -> "010"
+//   n=2 -> q=0, r=2 -> r>=1 -> "0"+"11" -> "011"
+//   n=3 -> q=1, r=0 -> r<1  -> "10"+"0" -> "100"
+fn glm_golomb_encode(n, m) -> string
+    let q = n / m
+    let r = n - q * m
+    let unary_part = _glm_unary(q)
+    let b = _glm_ceil_log2(m)
+    let cutoff = (1 << b) - m
+    let rem_part = ""
+    if r < cutoff
+        rem_part = _glm_int_to_bits(r, b - 1)
+    else
+        rem_part = _glm_int_to_bits(r + cutoff, b)
+    unary_part + rem_part
+
+// glm_golomb_decode: decode one Golomb-coded value from bitstring bits at position 0.
+//
+// Returns [value, next_bit_pos]. On malformed input returns [-1, len(bits)].
+fn glm_golomb_decode(bits, m) -> list
+    let b = _glm_ceil_log2(m)
+    let cutoff = (1 << b) - m
+    let unary_result = _glm_read_unary(bits, 0)
+    let q = unary_result[0]
+    let pos = unary_result[1]
+    if q == -1
+        let bad = []
+        bad.push(-1)
+        bad.push(pos)
+        return bad
+    // Read b-1 bits first to decide which branch.
+    let short_result = _glm_read_bits(bits, pos, b - 1)
+    let short_val = short_result[0]
+    let short_pos = short_result[1]
+    if short_val == -1
+        let bad2 = []
+        bad2.push(-1)
+        bad2.push(short_pos)
+        return bad2
+    let r = 0
+    let next_pos = 0
+    if short_val < cutoff
+        r = short_val
+        next_pos = short_pos
+    else
+        // Read one more bit to form b-bit code.
+        if short_pos >= len(bits)
+            let bad3 = []
+            bad3.push(-1)
+            bad3.push(short_pos)
+            return bad3
+        let extra_bit = 0
+        if bits[short_pos] == "1"
+            extra_bit = 1
+        let full_val = short_val * 2 + extra_bit
+        r = full_val - cutoff
+        next_pos = short_pos + 1
+    let value = q * m + r
+    let out = []
+    out.push(value)
+    out.push(next_pos)
+    out
+
+// glm_encode_list: Rice-encode every integer in list xs with parameter k.
+//
+// The resulting bitstrings are concatenated into one long bitstring.
+// To recover the original integers, call glm_decode_list with the same k
+// and count=len(xs).
+//
+// Example:
+//   glm_encode_list([1, 2, 3], 2)
+//   = glm_rice_encode(1,2) ++ glm_rice_encode(2,2) ++ glm_rice_encode(3,2)
+//   = "001" ++ "010" ++ "011"
+//   = "001010011"
+fn glm_encode_list(xs, k) -> string
+    let out = ""
+    let n = len(xs)
+    let i = 0
+    while i < n
+        let dummy = 0
+        out = out + glm_rice_encode(xs[i], k)
+        i = i + 1
+    out
+
+// glm_decode_list: decode exactly count Rice-coded values from bitstring bits.
+//
+// Decodes values sequentially from the start of bits, advancing the position
+// after each value. Returns a list of count integers.
+// If the bitstring is malformed (too short), the remaining values in the
+// returned list will be -1.
+//
+// Example:
+//   glm_decode_list("001010011", 2, 3) -> [1, 2, 3]
+fn glm_decode_list(bits, k, count) -> list
+    let blen = len(bits)
+    let out = []
+    let pos = 0
+    let i = 0
+    while i < count
+        let dummy = 0
+        // Read unary from current position.
+        let unary_result = _glm_read_unary(bits, pos)
+        let q = unary_result[0]
+        let pos2 = unary_result[1]
+        if q == -1
+            out.push(-1)
+            pos = blen
+        else
+            let rem_result = _glm_read_bits(bits, pos2, k)
+            let r = rem_result[0]
+            let pos3 = rem_result[1]
+            if r == -1
+                out.push(-1)
+                pos = blen
+            else
+                let value = (q << k) + r
+                out.push(value)
+                pos = pos3
+        i = i + 1
+    out

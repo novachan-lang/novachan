@@ -1,0 +1,327 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/elias
+// ============================================================================
+// Elias universal codes for positive integers.
+//
+// Elias codes are entropy-coding schemes for positive integers that require
+// NO prior knowledge of the distribution — they are "universal" codes. Unlike
+// Huffman or Golomb codes that need a known distribution parameter, Elias
+// codes can encode any positive integer with near-optimal bit length for any
+// monotone decreasing distribution.
+//
+// ELIAS GAMMA CODING (n >= 1):
+//   Let k = floor(log2(n))          (k zeros will be emitted as prefix)
+//   Bitstring = k zeros ++ n in binary (k+1 bits, MSB always 1)
+//
+//   Examples:
+//     n=1  -> k=0, binary(1)="1"      -> "1"       (1 bit)
+//     n=2  -> k=1, binary(2)="10"     -> "010"     (3 bits)
+//     n=3  -> k=1, binary(3)="11"     -> "011"     (3 bits)
+//     n=4  -> k=2, binary(4)="100"    -> "00100"   (5 bits)
+//     n=5  -> k=2, binary(5)="101"    -> "00101"   (5 bits)
+//     n=9  -> k=3, binary(9)="1001"   -> "0001001" (7 bits)
+//
+//   Bit length = 2*floor(log2(n)) + 1.
+//   Optimal for a distribution where P(n) ~ 1/n^2.
+//
+// ELIAS DELTA CODING (n >= 1):
+//   Let k = floor(log2(n))
+//   Gamma-encode (k+1), then emit the low k bits of n (the MSB is implicit).
+//
+//   Examples:
+//     n=1  -> k=0, gamma(1)="1",    0 low bits -> "1"
+//     n=2  -> k=1, gamma(2)="010",  low 1 bit="0" -> "0100"
+//     n=3  -> k=1, gamma(2)="010",  low 1 bit="1" -> "0101"
+//     n=4  -> k=2, gamma(3)="011",  low 2 bits="00" -> "01100"
+//     n=5  -> k=2, gamma(3)="011",  low 2 bits="01" -> "01101"
+//     n=9  -> k=3, gamma(4)="00100",low 3 bits="001" -> "00100001"
+//
+//   Delta is more efficient than gamma for n >= 9 (saves bits for large n).
+//   Optimal for a distribution where P(n) ~ 1/(n * log2(n)^2).
+//
+// DECODING (gamma):
+//   1. Count leading zeros → that count is k.
+//   2. Read the next k+1 bits (including the "1" that terminated the zeros).
+//   3. The value n is those k+1 bits interpreted as binary.
+//
+// DECODING (delta):
+//   1. Gamma-decode to get (k+1). Let that value be m, so k = m - 1.
+//   2. If k = 0 the value is 1 (no remainder bits). Done.
+//   3. Otherwise read k more bits (the low k bits of n).
+//   4. n = (1 << k) | low_k_bits.
+//
+// PUBLIC API:
+//   el_gamma_encode(n) -> string
+//     Elias gamma code for n >= 1. Returns a bitstring ('0'/'1' chars).
+//     Crashes (returns "") for n < 1.
+//
+//   el_gamma_decode(bits) -> list
+//     Decode one gamma value from bits starting at position 0.
+//     Returns [value, next_pos]. Malformed input returns [-1, len(bits)].
+//
+//   el_delta_encode(n) -> string
+//     Elias delta code for n >= 1.
+//
+//   el_delta_decode(bits) -> list
+//     Decode one delta value from bits starting at position 0.
+//     Returns [value, next_pos].
+//
+//   el_encode_list(xs) -> string
+//     Gamma-encode a list of positive integers, concatenating all bitstrings.
+//
+//   el_decode_list(bits, count) -> list
+//     Gamma-decode exactly count values from bits.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers use prefix _el_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _el_floor_log2: return floor(log2(n)) for n >= 1.
+// n=1 -> 0, n=2 -> 1, n=3 -> 1, n=4 -> 2, n=5 -> 2, ...
+fn _el_floor_log2(n) -> int
+    let k = 0
+    let v = n
+    while v > 1
+        let dummy = 0
+        v = v / 2
+        k = k + 1
+    k
+
+// _el_int_to_bits: convert integer v to an nbits-wide MSB-first binary string.
+// v must fit in nbits (0 <= v < 2^nbits). nbits=0 returns "".
+fn _el_int_to_bits(v, nbits) -> string
+    if nbits == 0
+        return ""
+    let out = ""
+    let i = nbits - 1
+    while i >= 0
+        let bit = (v >> i) & 1
+        if bit == 1
+            out = out + "1"
+        else
+            out = out + "0"
+        i = i - 1
+    out
+
+// _el_count_leading_zeros: count '0' chars at the start of bits from position pos.
+// Returns [count, new_pos] where new_pos points past the last leading zero.
+fn _el_count_leading_zeros(bits, pos) -> list
+    let blen = len(bits)
+    let count = 0
+    let cur = pos
+    let done = 0
+    while cur < blen and done == 0
+        let dummy = 0
+        if bits[cur] == "0"
+            count = count + 1
+            cur = cur + 1
+        else
+            done = 1
+    let result = []
+    result.push(count)
+    result.push(cur)
+    result
+
+// _el_read_bits: read nbits bits from bitstring bits at position pos as an integer.
+// MSB first. Returns [value, next_pos].
+// If fewer than nbits bits remain, returns [-1, len(bits)] (malformed).
+fn _el_read_bits(bits, pos, nbits) -> list
+    let blen = len(bits)
+    let result = []
+    if nbits == 0
+        result.push(0)
+        result.push(pos)
+        return result
+    if pos + nbits > blen
+        result.push(-1)
+        result.push(blen)
+        return result
+    let v = 0
+    let i = 0
+    while i < nbits
+        let dummy = 0
+        if bits[pos + i] == "1"
+            v = v * 2 + 1
+        else
+            v = v * 2
+        i = i + 1
+    result.push(v)
+    result.push(pos + nbits)
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// el_gamma_encode: encode positive integer n using Elias gamma coding.
+//
+// n >= 1 required.
+// Bit length = 2*k+1 where k = floor(log2(n)).
+//
+// Examples:
+//   el_gamma_encode(1) -> "1"
+//   el_gamma_encode(2) -> "010"
+//   el_gamma_encode(5) -> "00101"
+//   el_gamma_encode(9) -> "0001001"
+fn el_gamma_encode(n) -> string
+    if n < 1
+        return ""
+    let k = _el_floor_log2(n)
+    // k leading zeros
+    let out = ""
+    let i = 0
+    while i < k
+        let dummy = 0
+        out = out + "0"
+        i = i + 1
+    // then n in binary (k+1 bits)
+    out = out + _el_int_to_bits(n, k + 1)
+    out
+
+// el_gamma_decode: decode one gamma-coded value from bitstring bits (starting at 0).
+//
+// Returns [value, next_pos]. next_pos is the index immediately past the last
+// consumed bit, suitable for sequential decoding of multiple concatenated codes.
+//
+// On malformed input (bitstring ends before the code is complete) returns
+// [-1, len(bits)].
+//
+// Decoding algorithm:
+//   1. Count leading zeros → k.
+//   2. Read next k+1 bits as integer → that IS n.
+//   3. If the (k+1)-bit read fails (truncated), return error.
+fn el_gamma_decode(bits) -> list
+    let blen = len(bits)
+    let lz = _el_count_leading_zeros(bits, 0)
+    let k = lz[0]
+    let pos = lz[1]
+    // Must read k+1 bits starting at pos (the '1' bit and k bits after it)
+    let rb = _el_read_bits(bits, pos, k + 1)
+    let value = rb[0]
+    let next_pos = rb[1]
+    let result = []
+    if value == -1
+        result.push(-1)
+        result.push(blen)
+    else
+        result.push(value)
+        result.push(next_pos)
+    result
+
+// el_delta_encode: encode positive integer n using Elias delta coding.
+//
+// n >= 1 required. Delta is more bit-efficient than gamma for n >= 9.
+//
+// Algorithm:
+//   k = floor(log2(n))
+//   gamma_encode(k+1) ++ low k bits of n
+//
+// Examples:
+//   el_delta_encode(1) -> "1"       (k=0, gamma(1)="1", no low bits)
+//   el_delta_encode(2) -> "0100"    (k=1, gamma(2)="010", low 1 bit of 2=0)
+//   el_delta_encode(5) -> "01101"   (k=2, gamma(3)="011", low 2 bits of 5=01)
+//   el_delta_encode(9) -> "00100001" (k=3, gamma(4)="00100", low 3 bits of 9=001)
+fn el_delta_encode(n) -> string
+    if n < 1
+        return ""
+    let k = _el_floor_log2(n)
+    // Gamma-encode (k+1)
+    let head = el_gamma_encode(k + 1)
+    // Emit low k bits of n (the MSB = 1 is implicit, not stored)
+    let low_mask = (1 << k) - 1
+    let low_bits = n & low_mask
+    let tail = _el_int_to_bits(low_bits, k)
+    head + tail
+
+// el_delta_decode: decode one delta-coded value from bitstring bits (starting at 0).
+//
+// Returns [value, next_pos]. On malformed input returns [-1, len(bits)].
+//
+// Decoding algorithm:
+//   1. Gamma-decode to get m = (k+1). So k = m - 1.
+//   2. If k = 0: value = 1, done.
+//   3. Read k more bits as the low k bits of n.
+//   4. n = (1 << k) | low_k_bits.
+fn el_delta_decode(bits) -> list
+    let blen = len(bits)
+    // Step 1: gamma-decode to get (k+1)
+    let gr = el_gamma_decode(bits)
+    let m = gr[0]
+    let pos = gr[1]
+    let result = []
+    if m == -1
+        result.push(-1)
+        result.push(blen)
+        return result
+    let k = m - 1
+    if k == 0
+        // n = 1
+        result.push(1)
+        result.push(pos)
+        return result
+    // Step 3: read k low bits
+    let rb = _el_read_bits(bits, pos, k)
+    let low_bits = rb[0]
+    let next_pos = rb[1]
+    if low_bits == -1
+        result.push(-1)
+        result.push(blen)
+        return result
+    let value = (1 << k) | low_bits
+    result.push(value)
+    result.push(next_pos)
+    result
+
+// el_encode_list: gamma-encode a list of positive integers into one bitstring.
+//
+// The bitstrings for each element are concatenated directly (Elias gamma is
+// a self-delimiting code — no separator needed). To recover the list, call
+// el_decode_list with the same count.
+//
+// Example:
+//   el_encode_list([1, 2, 3])
+//   = el_gamma_encode(1) ++ el_gamma_encode(2) ++ el_gamma_encode(3)
+//   = "1" ++ "010" ++ "011"
+//   = "1010011"
+fn el_encode_list(xs) -> string
+    let out = ""
+    let n = len(xs)
+    let i = 0
+    while i < n
+        let dummy = 0
+        out = out + el_gamma_encode(xs[i])
+        i = i + 1
+    out
+
+// el_decode_list: gamma-decode exactly count values from bitstring bits.
+//
+// Decodes sequentially from position 0, advancing after each value.
+// Returns a list of count integers.
+// Malformed or truncated input returns -1 for remaining values.
+//
+// Example:
+//   el_decode_list("1010011", 3) -> [1, 2, 3]
+fn el_decode_list(bits, count) -> list
+    let blen = len(bits)
+    let out = []
+    let pos = 0
+    let i = 0
+    while i < count
+        let dummy = 0
+        // Count leading zeros from current position
+        let lz = _el_count_leading_zeros(bits, pos)
+        let k = lz[0]
+        let lz_end = lz[1]
+        // Read k+1 bits
+        let rb = _el_read_bits(bits, lz_end, k + 1)
+        let value = rb[0]
+        let next_pos = rb[1]
+        if value == -1
+            out.push(-1)
+            pos = blen
+        else
+            out.push(value)
+            pos = next_pos
+        i = i + 1
+    out

@@ -1,0 +1,270 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/shannon
+// ============================================================================
+// Shannon-Fano coding: a top-down prefix-free entropy coder.
+//
+// ALGORITHM:
+//   1. Count character frequencies in the input string.
+//   2. Sort the distinct characters by frequency descending (ties broken by
+//      ascending char-ord for determinism).
+//   3. Recursively split the sorted list at the point that minimises the
+//      absolute difference of cumulative frequencies between the two halves
+//      (the classic Shannon-Fano partition).
+//   4. Characters in the left half get prefix "0", right half get prefix "1";
+//      recurse until each group has exactly one character.
+//   5. Each character's final accumulated prefix is its Shannon-Fano code.
+//
+// PROPERTIES:
+//   • Prefix-free: every code is a leaf in the binary partition tree.
+//   • Deterministic: sort order is fully specified; tests are reproducible.
+//   • Competitive with Huffman on non-skewed distributions; Huffman is
+//     optimal in general.  Shannon-Fano is retained here for its historical
+//     importance and as a complement to std/compress/huffman.
+//
+// SPECIAL CASES:
+//   empty string      → empty codes dict; encode returns ["", {}]; decode "".
+//   single distinct   → assign code "0" so round-trip works.
+//   two distinct      → two single-bit codes "0"/"1".
+//
+// REPRESENTATION (pool-based, avoids recursive dict nesting):
+//   A "work item" during the recursive build is described by:
+//     start  int  — first index in the sorted symbol array (inclusive)
+//     end    int  — last  index in the sorted symbol array (inclusive)
+//     prefix str  — bitstring accumulated so far for this sub-group
+//   A stack of [start, end, prefix] lists drives iterative recursion.
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA: not used in this module.
+// BRACES IN STRINGS INTERPOLATE: use chr(123)/chr(125).
+//
+// PUBLIC API:
+//   shf_build_codes(s)          -> dict   char -> bitstring
+//   shf_encode(s)               -> list   [bitstring, codesDict]
+//   shf_decode(bits, codes)     -> string
+//   shf_entropy(s)              -> float  Shannon entropy in bits/symbol
+//
+// PREFIX: shf_  (all private helpers _shf_)
+// ============================================================================
+
+// ── Frequency counting ────────────────────────────────────────────────────────
+
+// _shf_count_freqs: count character frequencies in s.
+// Returns dict: char -> int count.
+fn _shf_count_freqs(s) -> any
+    let freqs = {}
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = s[i]
+        if contains(freqs, c)
+            freqs[c] = freqs[c] + 1
+        else
+            freqs[c] = 1
+        i = i + 1
+    return freqs
+
+// ── Sorting helpers ───────────────────────────────────────────────────────────
+
+// _shf_sort_syms: sort a list of [char, freq] pairs by (freq DESC, ord ASC).
+// Uses insertion sort — symbol alphabet is typically small.
+// Returns the sorted list in place (also returns it).
+fn _shf_sort_syms(syms) -> any
+    let n = len(syms)
+    let i = 1
+    while i < n
+        let key_pair = syms[i]
+        let key_freq = key_pair[1]
+        let key_ord = ord(key_pair[0])
+        let j = i - 1
+        let done = 0
+        while j >= 0 and done == 0
+            let cmp_pair = syms[j]
+            let cmp_freq = cmp_pair[1]
+            let cmp_ord = ord(cmp_pair[0])
+            // Move syms[j] right if it should come AFTER key:
+            // syms[j] comes after key if  freq < key_freq
+            //                          or freq == key_freq and ord > key_ord
+            let should_move = 0
+            if cmp_freq < key_freq
+                should_move = 1
+            if cmp_freq == key_freq
+                if cmp_ord > key_ord
+                    should_move = 1
+            if should_move == 1
+                syms[j + 1] = syms[j]
+                j = j - 1
+            else
+                done = 1
+        syms[j + 1] = key_pair
+        i = i + 1
+    return syms
+
+// ── Shannon-Fano partition ────────────────────────────────────────────────────
+
+// _shf_find_split: given syms[start..end] (already sorted DESC by freq),
+// return the split index s such that |sum(freqs[start..s]) - sum(freqs[s+1..end])|
+// is minimised.  The left group is [start..s], the right group [s+1..end].
+// Precondition: end > start (at least 2 elements).
+fn _shf_find_split(syms, start, end) -> int
+    // Compute total frequency of the sub-group.
+    let total = 0
+    let k = start
+    while k <= end
+        total = total + syms[k][1]
+        k = k + 1
+    // Walk left-to-right accumulating left_sum; split when adding the next
+    // element would make left_sum cross or reach half of total.
+    let left_sum = 0
+    let best_split = start
+    let best_diff = total + 1
+    let ki = start
+    while ki < end
+        left_sum = left_sum + syms[ki][1]
+        let right_sum = total - left_sum
+        let diff = left_sum - right_sum
+        if diff < 0
+            diff = right_sum - left_sum
+        if diff < best_diff
+            best_diff = diff
+            best_split = ki
+        ki = ki + 1
+    return best_split
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// shf_build_codes: build the Shannon-Fano code table for string s.
+// Returns a dict mapping each distinct character to its bitstring code.
+// The codes are prefix-free by construction (recursive partition).
+// Empty input returns an empty dict.
+fn shf_build_codes(s) -> any
+    let codes = {}
+    let n = len(s)
+    if n == 0
+        return codes
+    // Count frequencies.
+    let freqs = _shf_count_freqs(s)
+    // Build [char, freq] list.
+    let char_keys = keys(freqs)
+    let nk = len(char_keys)
+    let syms = []
+    let ki = 0
+    while ki < nk
+        let c = char_keys[ki]
+        let pair = [c, freqs[c]]
+        syms.push(pair)
+        ki = ki + 1
+    // Sort descending by freq, then ascending by ord for ties.
+    _shf_sort_syms(syms)
+    // Edge case: single distinct character.
+    if nk == 1
+        codes[syms[0][0]] = "0"
+        return codes
+    // Iterative Shannon-Fano using an explicit stack.
+    // Each stack entry is a list [start, end, prefix].
+    let stack = []
+    let init_entry = [0, nk - 1, ""]
+    stack.push(init_entry)
+    while len(stack) > 0
+        let entry = stack.pop()
+        let start = entry[0]
+        let end = entry[1]
+        let prefix = entry[2]
+        if start == end
+            // Single symbol in this group — assign its accumulated prefix.
+            if len(prefix) == 0
+                codes[syms[start][0]] = "0"
+            else
+                codes[syms[start][0]] = prefix
+        else
+            // Split into left [start..split] and right [split+1..end].
+            let split = _shf_find_split(syms, start, end)
+            let right_entry = [split + 1, end, prefix + "1"]
+            let left_entry = [start, split, prefix + "0"]
+            // Push right first so left is processed first (LIFO).
+            stack.push(right_entry)
+            stack.push(left_entry)
+    return codes
+
+// shf_encode: encode string s using Shannon-Fano coding.
+// Returns a list [bitstring, codesDict]:
+//   bitstring — the concatenated bit-codes of every character in s
+//   codesDict — the code table (same as shf_build_codes(s))
+// Empty input returns ["", {}].
+fn shf_encode(s) -> any
+    let codes = shf_build_codes(s)
+    let bits = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = s[i]
+        bits = bits + codes[c]
+        i = i + 1
+    let out = [bits, codes]
+    return out
+
+// shf_decode: decode a Shannon-Fano bitstring back to the original string.
+// codes is the dict returned by shf_encode (char -> bitstring).
+// Builds a reverse map (bitstring -> char) then greedily matches prefixes.
+// Returns the decoded string, or "" if bits/codes is empty.
+fn shf_decode(bits, codes) -> string
+    let nb = len(bits)
+    if nb == 0
+        return ""
+    // Build reverse map: bitstring -> char.
+    let rev = {}
+    let char_keys = keys(codes)
+    let nk = len(char_keys)
+    let ki = 0
+    while ki < nk
+        let ch = char_keys[ki]
+        let code = codes[ch]
+        rev[code] = ch
+        ki = ki + 1
+    // Greedy prefix scan.
+    let out = ""
+    let pos = 0
+    while pos < nb
+        let prefix = ""
+        let found = 0
+        let j = pos
+        while j < nb and found == 0
+            prefix = prefix + bits[j]
+            j = j + 1
+            if contains(rev, prefix)
+                out = out + rev[prefix]
+                pos = j
+                found = 1
+        if found == 0
+            // Malformed bitstring: skip to end to avoid infinite loop.
+            pos = nb
+    return out
+
+// shf_entropy: compute the Shannon entropy of string s in bits/symbol.
+// H = -sum_over_distinct_chars( p(c) * log2(p(c)) )
+// where p(c) = freq(c) / total_chars.
+// Special cases:
+//   empty string    → 0.0
+//   single distinct → 0.0 (no information; only one possible symbol)
+// Uses log(x)/log(2.0) for log base 2 (log is the native natural log).
+fn shf_entropy(s) -> float
+    let n = len(s)
+    if n == 0
+        return 0.0
+    // Count frequencies.
+    let freqs = _shf_count_freqs(s)
+    let char_keys = keys(freqs)
+    let nk = len(char_keys)
+    if nk == 1
+        return 0.0
+    // H = -sum p_i * log2(p_i)
+    let ln2 = log(2.0)
+    let h = 0.0
+    let total = n * 1.0
+    let ki = 0
+    while ki < nk
+        let c = char_keys[ki]
+        let p = freqs[c] * 1.0 / total
+        // log2(p) = log(p) / log(2)
+        let contrib = p * log(p) / ln2
+        h = h - contrib
+        ki = ki + 1
+    return h

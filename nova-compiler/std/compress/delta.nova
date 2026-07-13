@@ -1,0 +1,189 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/delta
+// ============================================================================
+// Delta encoding (also called delta compression or differencing) for integer
+// lists and strings. Delta encoding stores the first value followed by the
+// successive differences between adjacent values. It is highly effective for
+// monotone or slowly-changing sequences — sorted index lists, timestamps,
+// sensor readings — where the deltas are small even when the values are large.
+//
+// PUBLIC API:
+//   dlt_encode(xs) -> list
+//     Delta-encode an integer list. Returns [xs[0], xs[1]-xs[0], xs[2]-xs[1],
+//     ...]. Empty list -> []. Deltas can be negative.
+//
+//   dlt_decode(deltas) -> list
+//     Reconstruct the original integer list from deltas. Inverse of dlt_encode.
+//     dlt_decode(dlt_encode(xs)) == xs for all integer lists xs.
+//
+//   dlt_encode_zigzag(xs) -> list
+//     Delta-encode xs, then map every delta d to a non-negative integer via the
+//     zigzag bijection: 0->0, -1->1, 1->2, -2->3, 2->4, ...
+//     Formula: if d >= 0 then 2*d else 2*(-d) - 1.
+//     All output values are >= 0, making the list safe for unsigned encodings.
+//
+//   dlt_decode_zigzag(zz) -> list
+//     Inverse of dlt_encode_zigzag. Decodes zigzag values back to signed deltas
+//     then reconstructs the original list.
+//     dlt_decode_zigzag(dlt_encode_zigzag(xs)) == xs for all integer lists xs.
+//
+//   dlt_encode_bytes(s) -> list
+//     Byte-level delta encoding of a string. Each character's ordinal value is
+//     delta-encoded against the previous character. Returns the first ordinal
+//     followed by the successive signed differences. Useful as a pre-processing
+//     step before entropy coding of text or binary data.
+//
+// ALGORITHM:
+//   All functions are O(n) single-pass. No allocation beyond the output list.
+//   Zigzag maps signed integers to non-negatives via an interleaving bijection
+//   originally popularised by Protocol Buffers for varint encoding.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _dlt_ to avoid link collisions when other
+//   std modules are compiled into the same binary.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Zigzag-encode a single signed integer d to a non-negative integer.
+// Bijection: 0->0, -1->1, 1->2, -2->3, 2->4, ...
+// Formula: non-negatives map to even, negatives map to odd.
+fn _dlt_zz_enc(d) -> int
+    if d >= 0
+        return d * 2
+    return (-d) * 2 - 1
+
+// Zigzag-decode a single non-negative integer z back to a signed integer.
+// Inverse of _dlt_zz_enc. Even z -> positive; odd z -> negative.
+// Formula: if z % 2 == 0 then z/2 else -(z/2) - 1.
+fn _dlt_zz_dec(z) -> int
+    if z % 2 == 0
+        return z / 2
+    return -(z / 2) - 1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// dlt_encode: convert an integer list to its delta representation.
+//
+// The first element is stored unchanged (the "base" value). Every subsequent
+// element is replaced by the signed difference from its predecessor.
+//
+// Examples:
+//   dlt_encode([])             -> []
+//   dlt_encode([5])            -> [5]
+//   dlt_encode([10,12,15,11])  -> [10, 2, 3, -4]
+//   dlt_encode([100,90,80])    -> [100, -10, -10]
+fn dlt_encode(xs) -> list
+    let n = len(xs)
+    let out = []
+    if n == 0
+        return out
+    let prev = xs[0]
+    out.push(prev)
+    let i = 1
+    while i < n
+        let cur = xs[i]
+        out.push(cur - prev)
+        prev = cur
+        i = i + 1
+    out
+
+// dlt_decode: reconstruct an integer list from its delta representation.
+//
+// Inverse of dlt_encode. The first element is the base value; each subsequent
+// delta is accumulated to recover the original values.
+//
+// dlt_decode(dlt_encode(xs)) == xs for all integer lists xs.
+//
+// Examples:
+//   dlt_decode([])             -> []
+//   dlt_decode([5])            -> [5]
+//   dlt_decode([10, 2, 3, -4]) -> [10, 12, 15, 11]
+//   dlt_decode([100,-10,-10])  -> [100, 90, 80]
+fn dlt_decode(deltas) -> list
+    let n = len(deltas)
+    let out = []
+    if n == 0
+        return out
+    let acc = deltas[0]
+    out.push(acc)
+    let i = 1
+    while i < n
+        let d = deltas[i]
+        acc = acc + d
+        out.push(acc)
+        i = i + 1
+    out
+
+// dlt_encode_zigzag: delta-encode then zigzag-map to non-negatives.
+//
+// Applies dlt_encode first, then maps each resulting delta through the zigzag
+// bijection so that all output values are >= 0. This is useful before varint
+// or base-128 encoding where negative values would require sign extension.
+//
+// The first element (the base value) is also zigzag-encoded so the full output
+// is uniformly non-negative.
+//
+// Examples:
+//   dlt_encode_zigzag([])         -> []
+//   dlt_encode_zigzag([10,12,9])  -> [20, 4, 5]  (base=10->20; +2->4; -3->5)
+fn dlt_encode_zigzag(xs) -> list
+    let deltas = dlt_encode(xs)
+    let n = len(deltas)
+    let out = []
+    let i = 0
+    while i < n
+        let d = deltas[i]
+        out.push(_dlt_zz_enc(d))
+        i = i + 1
+    out
+
+// dlt_decode_zigzag: inverse of dlt_encode_zigzag.
+//
+// Zigzag-decodes each value back to a signed delta, then applies dlt_decode
+// to reconstruct the original integer list.
+//
+// dlt_decode_zigzag(dlt_encode_zigzag(xs)) == xs for all integer lists xs.
+//
+// Examples:
+//   dlt_decode_zigzag([])         -> []
+//   dlt_decode_zigzag([20, 4, 5]) -> [10, 12, 9]
+fn dlt_decode_zigzag(zz) -> list
+    let n = len(zz)
+    let deltas = []
+    let i = 0
+    while i < n
+        let z = zz[i]
+        deltas.push(_dlt_zz_dec(z))
+        i = i + 1
+    dlt_decode(deltas)
+
+// dlt_encode_bytes: byte-level delta encoding of a string.
+//
+// Each character is treated as its ordinal value (0..255). The first character's
+// ordinal is stored as the base; subsequent values are stored as signed deltas
+// from the previous ordinal. Useful as a preprocessing step before entropy
+// coding of text or structured binary data where adjacent bytes tend to be close.
+//
+// Returns a list of integers. The first element is always in [0,255]; subsequent
+// elements are signed and may range widely depending on the input.
+//
+// Examples:
+//   dlt_encode_bytes("")     -> []
+//   dlt_encode_bytes("ABC")  -> [65, 1, 1]   (A=65, B=66, C=67)
+//   dlt_encode_bytes("azz")  -> [97, 25, 0]  (a=97, z=122)
+fn dlt_encode_bytes(s) -> list
+    let n = len(s)
+    let out = []
+    if n == 0
+        return out
+    let prev = ord(s[0])
+    out.push(prev)
+    let i = 1
+    while i < n
+        let cur = ord(s[i])
+        out.push(cur - prev)
+        prev = cur
+        i = i + 1
+    out
