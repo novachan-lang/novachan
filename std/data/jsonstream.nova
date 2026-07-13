@@ -1,0 +1,383 @@
+// ============================================================================
+// NOVA Standard Library -- std/data/jsonstream
+// ============================================================================
+// JSON tokenizer / SAX-style event stream.
+//
+// Produces a flat list of token dicts from a JSON string without building
+// any parse tree.  Useful for streaming validators, linters, and reformatters.
+//
+// PUBLIC API
+//   js_tokens(json)        -> list  list of token dicts {"t":kind, "v":value}
+//   js_token_count(json)   -> int   number of tokens
+//   js_kinds(json)         -> list  list of kind strings only
+//
+// Token kinds ("t" field):
+//   "lbrace"    "rbrace"    "lbracket"  "rbracket"
+//   "colon"     "comma"
+//   "string"    "number"    "true"      "false"     "null"
+//
+// "v" field holds the literal value string for "string" and "number" tokens;
+// for all other kinds "v" is "".
+//
+// chr(34)=double-quote  chr(92)=backslash
+//
+// EXAMPLES
+//   js_kinds("[1,2]")  -> ["lbracket","number","comma","number","rbracket"]
+//   js_token_count("{}") -> 2
+//   let t = js_tokens("[42]")  t[1]["t"] == "number"  t[1]["v"] == "42"
+//
+// IMPLEMENTATION NOTES
+//   All private helpers prefixed _js_ to avoid symbol collisions.
+//   Mutable cursor threaded as dict {"pos": int}.
+//   Single-exit style throughout (avoids NOVA early-return mistag bug).
+//   LEAF module -- imports nothing.
+//   chr(34)=" chr(92)=\ chr(47)=/
+// ============================================================================
+
+// ---- character helpers ----
+
+// _js_is_ws: 1 if ASCII code o is JSON whitespace (space/tab/CR/LF).
+fn _js_is_ws(o)
+    let r = 0
+    if o == 32
+        r = 1
+    if r == 0
+        if o == 9
+            r = 1
+    if r == 0
+        if o == 10
+            r = 1
+    if r == 0
+        if o == 13
+            r = 1
+    return r
+
+// _js_is_digit: 1 if o is '0'-'9' (48-57).
+fn _js_is_digit(o)
+    let r = 0
+    if o >= 48
+        if o <= 57
+            r = 1
+    return r
+
+// ---- whitespace skip ----
+
+// _js_skip_ws: advance cur["pos"] past all JSON whitespace.
+fn _js_skip_ws(s, n, cur)
+    let go = 1
+    while go == 1
+        let p = cur["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if _js_is_ws(o) == 1
+                cur["pos"] = p + 1
+            else
+                go = 0
+
+// ---- string literal scan ----
+
+// _js_esc_char: map a post-backslash char code to the actual character.
+// 110='n'->LF  116='t'->TAB  114='r'->CR  else passthrough.
+fn _js_esc_char(eo, ech)
+    let result = ech
+    if eo == 110
+        result = chr(10)
+    if eo == 116
+        result = chr(9)
+    if eo == 114
+        result = chr(13)
+    return result
+
+// _js_scan_string: cur["pos"] is just AFTER the opening '"'.
+// Advances past the closing '"' and returns the CONTENT between the quotes.
+// Handles \" and \\ escapes; other \X are passed through as-is.
+fn _js_scan_string(s, n, cur)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = cur["pos"]
+        if p >= n
+            go = 0
+        else
+            let ch = char_at(s, p)
+            let o = ord(ch)
+            if o == 34
+                // closing double-quote -- consume and stop
+                cur["pos"] = p + 1
+                go = 0
+            else
+                if o == 92
+                    // backslash escape -- consume two chars
+                    let q = p + 1
+                    cur["pos"] = q + 1
+                    if q < n
+                        let ech = char_at(s, q)
+                        let eo = ord(ech)
+                        let ec = _js_esc_char(eo, ech)
+                        buf = buf + ec
+                else
+                    // ordinary character
+                    cur["pos"] = p + 1
+                    buf = buf + ch
+    return buf
+
+// ---- number literal scan ----
+
+// _js_scan_number: cur["pos"] is ON the first char of the number.
+// Advances past all number chars and returns the literal string.
+// Handles optional leading '-', digits, '.', 'e'/'E', '+'/'-' exponent.
+fn _js_scan_number(s, n, cur)
+    let buf = ""
+    let p = cur["pos"]
+    // optional leading minus
+    if p < n
+        let fc = ord(char_at(s, p))
+        if fc == 45
+            buf = buf + "-"
+            cur["pos"] = p + 1
+    // digits before optional decimal point
+    let go = 1
+    while go == 1
+        let q = cur["pos"]
+        if q >= n
+            go = 0
+        else
+            let o = ord(char_at(s, q))
+            if _js_is_digit(o) == 1
+                buf = buf + char_at(s, q)
+                cur["pos"] = q + 1
+            else
+                go = 0
+    // optional '.' followed by digits
+    let q2 = cur["pos"]
+    if q2 < n
+        let od = ord(char_at(s, q2))
+        if od == 46
+            buf = buf + "."
+            cur["pos"] = q2 + 1
+            let go2 = 1
+            while go2 == 1
+                let r = cur["pos"]
+                if r >= n
+                    go2 = 0
+                else
+                    let o2 = ord(char_at(s, r))
+                    if _js_is_digit(o2) == 1
+                        buf = buf + char_at(s, r)
+                        cur["pos"] = r + 1
+                    else
+                        go2 = 0
+    // optional 'e'/'E' exponent
+    let q3 = cur["pos"]
+    if q3 < n
+        let oe = ord(char_at(s, q3))
+        let is_e = 0
+        if oe == 101
+            is_e = 1
+        if oe == 69
+            is_e = 1
+        if is_e == 1
+            buf = buf + char_at(s, q3)
+            cur["pos"] = q3 + 1
+            // optional sign
+            let q4 = cur["pos"]
+            if q4 < n
+                let os = ord(char_at(s, q4))
+                let is_sign = 0
+                if os == 43
+                    is_sign = 1
+                if os == 45
+                    is_sign = 1
+                if is_sign == 1
+                    buf = buf + char_at(s, q4)
+                    cur["pos"] = q4 + 1
+            // exponent digits
+            let go3 = 1
+            while go3 == 1
+                let r2 = cur["pos"]
+                if r2 >= n
+                    go3 = 0
+                else
+                    let o3 = ord(char_at(s, r2))
+                    if _js_is_digit(o3) == 1
+                        buf = buf + char_at(s, r2)
+                        cur["pos"] = r2 + 1
+                    else
+                        go3 = 0
+    return buf
+
+// ---- keyword match helper ----
+
+// _js_match_kw: starting at cur["pos"], try to consume exactly the string kw.
+// Returns 1 if matched and advances cur["pos"]; 0 otherwise (no advance).
+fn _js_match_kw(s, n, cur, kw)
+    let klen = len(kw)
+    let p = cur["pos"]
+    let result = 0
+    if p + klen <= n
+        let tail = slice(s, p, p + klen)
+        if tail == kw
+            cur["pos"] = p + klen
+            result = 1
+    return result
+
+// ---- main tokenizer ----
+
+// _js_tokenize_all: tokenize s into toks list; cur is {"pos":0}.
+// Each while iteration processes ONE character position (may be ws or a token).
+fn _js_tokenize_all(s, n, cur, toks)
+    let go = 1
+    while go == 1
+        let p = cur["pos"]
+        if p >= n
+            go = 0
+        else
+            let ch = char_at(s, p)
+            let o = ord(ch)
+            // skip whitespace: space(32) tab(9) LF(10) CR(13)
+            let is_ws = _js_is_ws(o)
+            if is_ws == 1
+                cur["pos"] = p + 1
+            else
+                let done = 0
+                // '{' lbrace
+                if done == 0
+                    if o == 123
+                        cur["pos"] = p + 1
+                        let tok = {}
+                        tok["t"] = "lbrace"
+                        tok["v"] = ""
+                        toks.push(tok)
+                        done = 1
+                // '}' rbrace
+                if done == 0
+                    if o == 125
+                        cur["pos"] = p + 1
+                        let tok = {}
+                        tok["t"] = "rbrace"
+                        tok["v"] = ""
+                        toks.push(tok)
+                        done = 1
+                // '[' lbracket
+                if done == 0
+                    if o == 91
+                        cur["pos"] = p + 1
+                        let tok = {}
+                        tok["t"] = "lbracket"
+                        tok["v"] = ""
+                        toks.push(tok)
+                        done = 1
+                // ']' rbracket
+                if done == 0
+                    if o == 93
+                        cur["pos"] = p + 1
+                        let tok = {}
+                        tok["t"] = "rbracket"
+                        tok["v"] = ""
+                        toks.push(tok)
+                        done = 1
+                // ':' colon
+                if done == 0
+                    if o == 58
+                        cur["pos"] = p + 1
+                        let tok = {}
+                        tok["t"] = "colon"
+                        tok["v"] = ""
+                        toks.push(tok)
+                        done = 1
+                // ',' comma
+                if done == 0
+                    if o == 44
+                        cur["pos"] = p + 1
+                        let tok = {}
+                        tok["t"] = "comma"
+                        tok["v"] = ""
+                        toks.push(tok)
+                        done = 1
+                // '"' string (34)
+                if done == 0
+                    if o == 34
+                        cur["pos"] = p + 1
+                        let sv = _js_scan_string(s, n, cur)
+                        let tok = {}
+                        tok["t"] = "string"
+                        tok["v"] = sv
+                        toks.push(tok)
+                        done = 1
+                // number: '-'(45) or digit
+                if done == 0
+                    let is_num = 0
+                    if o == 45
+                        is_num = 1
+                    if _js_is_digit(o) == 1
+                        is_num = 1
+                    if is_num == 1
+                        let nv = _js_scan_number(s, n, cur)
+                        let tok = {}
+                        tok["t"] = "number"
+                        tok["v"] = nv
+                        toks.push(tok)
+                        done = 1
+                // 't' -> "true"
+                if done == 0
+                    if o == 116
+                        let matched = _js_match_kw(s, n, cur, "true")
+                        if matched == 1
+                            let tok = {}
+                            tok["t"] = "true"
+                            tok["v"] = ""
+                            toks.push(tok)
+                            done = 1
+                // 'f' -> "false"
+                if done == 0
+                    if o == 102
+                        let matched = _js_match_kw(s, n, cur, "false")
+                        if matched == 1
+                            let tok = {}
+                            tok["t"] = "false"
+                            tok["v"] = ""
+                            toks.push(tok)
+                            done = 1
+                // 'n' -> "null"
+                if done == 0
+                    if o == 110
+                        let matched = _js_match_kw(s, n, cur, "null")
+                        if matched == 1
+                            let tok = {}
+                            tok["t"] = "null"
+                            tok["v"] = ""
+                            toks.push(tok)
+                            done = 1
+                // unknown: skip to avoid infinite loop
+                if done == 0
+                    cur["pos"] = p + 1
+
+// ---- public API ----
+
+// js_tokens: tokenize json string; return list of {"t":kind, "v":value} dicts.
+fn js_tokens(json)
+    let n = len(json)
+    let cur = {}
+    cur["pos"] = 0
+    let toks = []
+    _js_tokenize_all(json, n, cur, toks)
+    return toks
+
+// js_token_count: return the number of tokens in json.
+fn js_token_count(json)
+    let toks = js_tokens(json)
+    return len(toks)
+
+// js_kinds: return list of just the "t" kind strings in order.
+fn js_kinds(json)
+    let toks = js_tokens(json)
+    let kinds = []
+    let i = 0
+    let m = len(toks)
+    while i < m
+        let tok = toks[i]
+        kinds.push(tok["t"])
+        i = i + 1
+    return kinds

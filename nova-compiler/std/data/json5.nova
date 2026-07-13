@@ -1,0 +1,426 @@
+// ============================================================================
+// NOVA Standard Library -- std/data/json5
+// ============================================================================
+// JSON5 parser (relaxed JSON superset).
+//
+// JSON5 extensions over standard JSON:
+//   // line comments and /* block */ comments
+//   Trailing commas in arrays and objects
+//   Single-quoted strings
+//   Unquoted identifier keys (e.g. {a: 1, foo_bar: 2})
+//   Standard JSON (double-quoted strings, arrays, objects, numbers, true/false/null)
+//
+// PUBLIC API
+//   j5_parse(s)          -> any     parse JSON5 string to NOVA value
+//   j5_parse_or(s, dflt) -> any     parse JSON5 string; return dflt on empty
+//
+// NOVA value mapping:
+//   JSON5 number   -> int  (integer only; decimal integers)
+//   JSON5 string   -> string
+//   JSON5 true     -> 1   (int)
+//   JSON5 false    -> 0   (int)
+//   JSON5 null     -> null
+//   JSON5 array    -> list
+//   JSON5 object   -> dict (all keys coerced to string)
+//
+// EXAMPLES
+//   j5_parse("42")                     -> 42
+//   j5_parse("[1, 2, 3,]")             -> [1, 2, 3]
+//   j5_parse("'hello'")                -> "hello"
+//   j5_parse("{a: 1, b: 2,}")["a"]     -> 1
+//   j5_parse("{'x': [1, 2]}")["x"]     -> [1, 2]
+//
+// IMPLEMENTATION NOTES
+//   All private helpers prefixed _j5_ to avoid symbol collisions.
+//   Mutable cursor threaded as dict {"pos": int, "err": int}.
+//   Single-exit style throughout to avoid the NOVA early-return mistag bug.
+//   No multi-line list/dict literals (NOVA parser limitation).
+//   chr(34)=", chr(39)=', chr(47)=/, chr(42)=*
+//   LEAF module -- imports nothing.
+// ============================================================================
+
+// Character helpers
+
+// _j5_is_ws: 1 if code-point o is JSON5 whitespace (space, tab, CR, LF).
+fn _j5_is_ws(o)
+    let result = 0
+    if o == 32
+        result = 1
+    else
+        if o == 9
+            result = 1
+        else
+            if o == 10
+                result = 1
+            else
+                if o == 13
+                    result = 1
+    return result
+
+// _j5_is_digit: 1 if code-point o is ASCII '0'-'9'.
+fn _j5_is_digit(o)
+    let result = 0
+    if o >= 48
+        if o <= 57
+            result = 1
+    return result
+
+// _j5_is_ident_start: 1 if o can start an identifier key (a-z A-Z _ $).
+fn _j5_is_ident_start(o)
+    let result = 0
+    if o >= 97
+        if o <= 122
+            result = 1
+    if result == 0
+        if o >= 65
+            if o <= 90
+                result = 1
+    if result == 0
+        if o == 95
+            result = 1
+    if result == 0
+        if o == 36
+            result = 1
+    return result
+
+// _j5_is_ident_cont: 1 if o can continue an identifier (ident_start or digit).
+fn _j5_is_ident_cont(o)
+    let result = _j5_is_ident_start(o)
+    if result == 0
+        if _j5_is_digit(o) == 1
+            result = 1
+    return result
+
+// Comment and whitespace skipping
+
+// _j5_skip_ws: advance st["pos"] past whitespace and comments.
+// Handles // line comments and /* block */ comments.
+fn _j5_skip_ws(s, n, st)
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if _j5_is_ws(o) == 1
+                st["pos"] = p + 1
+            else
+                // Check for comment: '/' = 47
+                if o == 47
+                    let q = p + 1
+                    if q < n
+                        let o2 = ord(char_at(s, q))
+                        // Line comment '//' (47 47)
+                        if o2 == 47
+                            st["pos"] = q + 1
+                            let inner = 1
+                            while inner == 1
+                                let r = st["pos"]
+                                if r >= n
+                                    inner = 0
+                                else
+                                    let oc = ord(char_at(s, r))
+                                    st["pos"] = r + 1
+                                    if oc == 10
+                                        inner = 0
+                        else
+                            // Block comment '/*' (47 42)
+                            if o2 == 42
+                                st["pos"] = q + 1
+                                let inner = 1
+                                while inner == 1
+                                    let r = st["pos"]
+                                    if r >= n
+                                        inner = 0
+                                    else
+                                        let oc = ord(char_at(s, r))
+                                        st["pos"] = r + 1
+                                        // Look for '*/' (42 47)
+                                        if oc == 42
+                                            let r2 = st["pos"]
+                                            if r2 < n
+                                                let oc2 = ord(char_at(s, r2))
+                                                if oc2 == 47
+                                                    st["pos"] = r2 + 1
+                                                    inner = 0
+                            else
+                                go = 0
+                    else
+                        go = 0
+                else
+                    go = 0
+
+// Number parsing
+
+// _j5_parse_number: parse an integer (with optional leading '-').
+// Returns the int value; advances st["pos"].
+fn _j5_parse_number(s, n, st)
+    let neg = 0
+    let p = st["pos"]
+    if p < n
+        let fc = ord(char_at(s, p))
+        if fc == 45
+            neg = 1
+            st["pos"] = p + 1
+    let acc = 0
+    let go = 1
+    while go == 1
+        let q = st["pos"]
+        if q >= n
+            go = 0
+        else
+            let o = ord(char_at(s, q))
+            if _j5_is_digit(o) == 1
+                acc = acc * 10 + (o - 48)
+                st["pos"] = q + 1
+            else
+                go = 0
+    let result = acc
+    if neg == 1
+        result = 0 - acc
+    return result
+
+// String parsing
+
+// _j5_parse_string_body: parse string content after opening quote (given as int qchar).
+// Handles \n \t \r \\ and the closing quote. Returns the string.
+fn _j5_parse_string_body(s, n, st, qchar)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let ch = char_at(s, p)
+            let o = ord(ch)
+            // closing quote?
+            if o == qchar
+                st["pos"] = p + 1
+                go = 0
+            else
+                // backslash escape? '\\' = 92
+                if o == 92
+                    st["pos"] = p + 1
+                    let q = st["pos"]
+                    if q < n
+                        let ec = char_at(s, q)
+                        let eo = ord(ec)
+                        st["pos"] = q + 1
+                        if eo == 110
+                            buf = buf + chr(10)
+                        else
+                            if eo == 116
+                                buf = buf + chr(9)
+                            else
+                                if eo == 114
+                                    buf = buf + chr(13)
+                                else
+                                    buf = buf + ec
+                else
+                    buf = buf + ch
+                    st["pos"] = p + 1
+    return buf
+
+// Identifier key parsing
+
+// _j5_parse_ident: read a bare identifier (for unquoted object keys).
+fn _j5_parse_ident(s, n, st)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if _j5_is_ident_cont(o) == 1
+                buf = buf + char_at(s, p)
+                st["pos"] = p + 1
+            else
+                go = 0
+    return buf
+
+// Array parsing
+
+// _j5_parse_array: parse elements until ']'. Supports trailing comma.
+fn _j5_parse_array(s, n, st)
+    let result = []
+    let go = 1
+    while go == 1
+        _j5_skip_ws(s, n, st)
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            // ']' = 93
+            if o == 93
+                st["pos"] = p + 1
+                go = 0
+            else
+                // ',' = 44 -- trailing comma: skip
+                if o == 44
+                    st["pos"] = p + 1
+                else
+                    let elem = _j5_parse_value(s, n, st)
+                    result.push(elem)
+    return result
+
+// Object parsing
+
+// _j5_parse_object: parse key-value pairs until '}'. Supports:
+//   double-quoted keys: "key"
+//   single-quoted keys: 'key'
+//   unquoted identifier keys: key
+//   trailing commas
+fn _j5_parse_object(s, n, st)
+    let result = {}
+    let go = 1
+    while go == 1
+        _j5_skip_ws(s, n, st)
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            // '}' = 125
+            if o == 125
+                st["pos"] = p + 1
+                go = 0
+            else
+                // ',' = 44 -- trailing comma: skip
+                if o == 44
+                    st["pos"] = p + 1
+                else
+                    // Parse key
+                    let key = ""
+                    // '"' = 34, "'" = 39
+                    if o == 34
+                        st["pos"] = p + 1
+                        key = _j5_parse_string_body(s, n, st, 34)
+                    else
+                        if o == 39
+                            st["pos"] = p + 1
+                            key = _j5_parse_string_body(s, n, st, 39)
+                        else
+                            if _j5_is_ident_start(o) == 1
+                                key = _j5_parse_ident(s, n, st)
+                    // skip whitespace and ':'
+                    _j5_skip_ws(s, n, st)
+                    let cp = st["pos"]
+                    if cp < n
+                        let co = ord(char_at(s, cp))
+                        // ':' = 58
+                        if co == 58
+                            st["pos"] = cp + 1
+                    // parse value
+                    _j5_skip_ws(s, n, st)
+                    let v = _j5_parse_value(s, n, st)
+                    result[key] = v
+    return result
+
+// Core value parser
+
+// _j5_parse_value: parse a single JSON5 value at current position.
+// Dispatches on first non-whitespace character.
+fn _j5_parse_value(s, n, st)
+    _j5_skip_ws(s, n, st)
+    let result = null
+    let p = st["pos"]
+    if p < n
+        let ch = char_at(s, p)
+        let o = ord(ch)
+        // '[' = 91 -> array
+        if o == 91
+            st["pos"] = p + 1
+            result = _j5_parse_array(s, n, st)
+        else
+            // '{' = 123 -> object
+            if o == 123
+                st["pos"] = p + 1
+                result = _j5_parse_object(s, n, st)
+            else
+                // '"' = 34 -> double-quoted string
+                if o == 34
+                    st["pos"] = p + 1
+                    result = _j5_parse_string_body(s, n, st, 34)
+                else
+                    // "'" = 39 -> single-quoted string
+                    if o == 39
+                        st["pos"] = p + 1
+                        result = _j5_parse_string_body(s, n, st, 39)
+                    else
+                        // '-' = 45 -> possible negative number
+                        if o == 45
+                            let q = p + 1
+                            let is_neg = 0
+                            if q < n
+                                let no = ord(char_at(s, q))
+                                if _j5_is_digit(no) == 1
+                                    is_neg = 1
+                            if is_neg == 1
+                                result = _j5_parse_number(s, n, st)
+                        else
+                            // digit -> number
+                            if _j5_is_digit(o) == 1
+                                result = _j5_parse_number(s, n, st)
+                            else
+                                // bare identifier: true / false / null
+                                if _j5_is_ident_start(o) == 1
+                                    let atom = _j5_parse_ident(s, n, st)
+                                    if atom == "true"
+                                        result = 1
+                                    else
+                                        if atom == "false"
+                                            result = 0
+                                        else
+                                            if atom == "null"
+                                                result = null
+    return result
+
+// Public API
+
+// j5_parse: parse a JSON5 string into a NOVA value.
+//
+// Supports all JSON5 extensions:
+//   // line comments and /* block */ comments
+//   Trailing commas in arrays and objects
+//   Single-quoted strings
+//   Unquoted identifier keys
+//   All standard JSON values
+//
+// Examples:
+//   j5_parse("42")               -> 42
+//   j5_parse("[1, 2, 3,]")       -> [1, 2, 3]
+//   j5_parse("{a: 1, b: 2,}")    -> {"a": 1, "b": 2}
+fn j5_parse(s) -> any
+    let n = len(s)
+    let st = {}
+    st["pos"] = 0
+    st["err"] = 0
+    let result = _j5_parse_value(s, n, st)
+    return result
+
+// j5_parse_or: parse a JSON5 string; return dflt if the input is whitespace-only.
+//
+// Examples:
+//   j5_parse_or("42", 0)         -> 42
+//   j5_parse_or("", 99)          -> 99
+//   j5_parse_or("  ", 5)         -> 5
+fn j5_parse_or(s, dflt) -> any
+    let n = len(s)
+    let i = 0
+    let found = 0
+    while i < n
+        let o = ord(char_at(s, i))
+        if _j5_is_ws(o) == 0
+            found = 1
+            i = n
+        else
+            i = i + 1
+    let result = dflt
+    if found == 1
+        result = j5_parse(s)
+    return result

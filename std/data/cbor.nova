@@ -1,0 +1,322 @@
+// ============================================================================
+// NOVA Standard Library — std/data/cbor
+// ============================================================================
+// CBOR (Concise Binary Object Representation, RFC 8949) encode and decode.
+//
+// CBOR is the IETF binary data-interchange format: self-describing, compact,
+// no schema required.  It is the wire format for COSE, CWT, WebAuthn/FIDO2
+// attestation, CoAP, and many IoT/constrained-device protocols.
+//
+// PUBLIC API
+//   cb_encode(v)           -> bytes   encode a NOVA value to CBOR bytes
+//   cb_decode(b)           -> any     decode the first CBOR item from bytes b
+//   cb_decode_at(b, pos)   -> list    [decoded_value, next_pos] (random-access)
+//
+// SUPPORTED CBOR MAJOR TYPES
+//   Major 0  — unsigned integer (0..2^64-1); inline 0-23, 1-byte 24, 2-byte 25,
+//              4-byte 26.
+//   Major 1  — negative integer; argument n encodes -(n+1).
+//   Major 3  — text string; UTF-8 assumed (one code-unit per NOVA char).
+//   Major 4  — array; each element recursively encoded/decoded.
+//   Major 5  — map (encode only); NOVA dict -> CBOR map.
+//   Major 7  — simple values: false (0xf4), true (0xf5), null (0xf6).
+//
+// NOVA TYPE NOTE
+//   type_of(true) == "int" (booleans are unboxed ints in NOVA).  cb_encode
+//   therefore treats plain ints as CBOR unsigned/negative integers.  Use
+//   cb_encode_bool / cb_encode_null for the explicit major-7 simple values.
+//
+//   Decoded CBOR unsigned integers become NOVA ints; negative integers become
+//   negative NOVA ints; text strings become NOVA strings; arrays become NOVA
+//   lists; simple false/true/null become int 0 / int 1 / null.
+//
+// IMPLEMENTATION NOTES
+//   - LEAF module — imports nothing.
+//   - All private helpers prefixed _cb_ to avoid link collisions.
+//   - bytes_append(b, n) returns a NEW bytes handle — always reassign.
+//   - Single-exit style throughout (avoids the NOVA early-return mistag bug).
+//   - No multi-line list/dict literals (NOVA parser limitation).
+//   - Brace characters via chr(123)/chr(125) to avoid string interpolation.
+// ============================================================================
+
+// ── Private: encode a CBOR "head" (major type + argument) ────────────────────
+
+// _cb_head: emit the minimal CBOR head for major type `mt` and unsigned
+// argument `n`.  The 5 widths are: inline (0-23), 1 byte (24-255),
+// 2 bytes (256-65535), 4 bytes (256^2-1), 8 bytes (2^32+).
+// Returns a bytes value.
+fn _cb_head(mt: int, n: int) -> any
+    let prefix = mt * 32
+    let out = bytes(0)
+    if n < 24
+        out = bytes_append(out, prefix + n)
+    else
+        if n < 256
+            out = bytes_append(out, prefix + 24)
+            out = bytes_append(out, n & 255)
+        else
+            if n < 65536
+                out = bytes_append(out, prefix + 25)
+                out = bytes_append(out, (n >> 8) & 255)
+                out = bytes_append(out, n & 255)
+            else
+                if n < 4294967296
+                    out = bytes_append(out, prefix + 26)
+                    out = bytes_append(out, (n >> 24) & 255)
+                    out = bytes_append(out, (n >> 16) & 255)
+                    out = bytes_append(out, (n >> 8) & 255)
+                    out = bytes_append(out, n & 255)
+                else
+                    out = bytes_append(out, prefix + 27)
+                    out = bytes_append(out, (n >> 56) & 255)
+                    out = bytes_append(out, (n >> 48) & 255)
+                    out = bytes_append(out, (n >> 40) & 255)
+                    out = bytes_append(out, (n >> 32) & 255)
+                    out = bytes_append(out, (n >> 24) & 255)
+                    out = bytes_append(out, (n >> 16) & 255)
+                    out = bytes_append(out, (n >> 8) & 255)
+                    out = bytes_append(out, n & 255)
+    return out
+
+// _cb_concat: concatenate bytes b1 and b2 into a new bytes.
+fn _cb_concat(b1: any, b2: any) -> any
+    return bytes_concat(b1, b2)
+
+// ── Private: encode helpers by type ──────────────────────────────────────────
+
+// _cb_enc_int: encode a NOVA int as CBOR integer (major 0 or major 1).
+fn _cb_enc_int(v: int) -> any
+    let result = bytes(0)
+    if v >= 0
+        result = _cb_head(0, v)
+    else
+        result = _cb_head(1, 0 - 1 - v)
+    return result
+
+// _cb_enc_str: encode a NOVA string as CBOR text string (major 3).
+// One code unit per character (ASCII/UTF-8 safe for single-byte code points).
+fn _cb_enc_str(s: string) -> any
+    let n = len(s)
+    let out = _cb_head(3, n)
+    let i = 0
+    while i < n
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    return out
+
+// _cb_enc_list: encode a NOVA list as CBOR array (major 4).
+// Each element is recursively encoded.
+fn _cb_enc_list(arr: any) -> any
+    let n = len(arr)
+    let out = _cb_head(4, n)
+    let i = 0
+    while i < n
+        let elem_enc = cb_encode(arr[i])
+        out = bytes_concat(out, elem_enc)
+        i = i + 1
+    return out
+
+// _cb_enc_dict: encode a NOVA dict as CBOR map (major 5).
+// Keys are assumed to be strings; values are recursively encoded.
+fn _cb_enc_dict(d: any) -> any
+    let ks = keys(d)
+    let n = len(ks)
+    let out = _cb_head(5, n)
+    let i = 0
+    while i < n
+        let k = ks[i]
+        let key_enc = _cb_enc_str(k)
+        let val_enc = cb_encode(d[k])
+        out = bytes_concat(out, key_enc)
+        out = bytes_concat(out, val_enc)
+        i = i + 1
+    return out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// cb_encode: encode any NOVA value to CBOR bytes.
+//
+//   int     -> CBOR unsigned int (major 0) or negative int (major 1)
+//   string  -> CBOR text string (major 3)
+//   list    -> CBOR array (major 4), elements recursively encoded
+//   dict    -> CBOR map (major 5), string keys + recursively encoded values
+//   other   -> CBOR null (0xf6) as a safe fallback
+//
+// Examples:
+//   cb_encode(1)         -> bytes with content [0x01]
+//   cb_encode(100)       -> bytes with content [0x18, 0x64]
+//   cb_encode(1000)      -> bytes with content [0x19, 0x03, 0xe8]
+//   cb_encode("a")       -> bytes with content [0x61, 0x61]
+//   cb_encode([1,2,3])   -> bytes with content [0x83, 0x01, 0x02, 0x03]
+fn cb_encode(v) -> any
+    let t = type_of(v)
+    let result = bytes(0)
+    if t == "string"
+        result = _cb_enc_str(v)
+    else
+        if t == "list"
+            result = _cb_enc_list(v)
+        else
+            if t == "dict"
+                result = _cb_enc_dict(v)
+            else
+                // int (including bool=0/1): encode as CBOR integer
+                // For CBOR null/true/false use cb_encode_null / cb_encode_bool.
+                result = _cb_enc_int(v)
+    return result
+
+// cb_encode_bool: encode a NOVA bool as CBOR simple value (major 7).
+//   true  -> 0xf5
+//   false -> 0xf4
+// This is separate from cb_encode because type_of(true) == "int" in NOVA.
+fn cb_encode_bool(b: int) -> any
+    let out = bytes(0)
+    if b == 1
+        out = bytes_append(out, 245)
+    else
+        out = bytes_append(out, 244)
+    return out
+
+// cb_encode_null: encode CBOR null (0xf6).
+fn cb_encode_null() -> any
+    let out = bytes(0)
+    out = bytes_append(out, 246)
+    return out
+
+// ── Private: decode helpers ───────────────────────────────────────────────────
+
+// _cb_read_uint: read a big-endian unsigned integer from `n` bytes at position
+// `pos` in bytes value `b`.  Returns the integer value.
+fn _cb_read_uint(b: any, pos: int, n: int) -> int
+    let v = 0
+    let i = 0
+    while i < n
+        v = v * 256 + bytes_get(b, pos + i)
+        i = i + 1
+    return v
+
+// _cb_decode_item: decode one CBOR item starting at byte position `pos` in
+// bytes value `b`.  Returns a two-element NOVA list: [decoded_value, next_pos].
+//
+// This is the core recursive decoder.  It handles:
+//   Major 0  — unsigned int
+//   Major 1  — negative int
+//   Major 3  — text string
+//   Major 4  — array (recursive)
+//   Major 7  — simple: false(20)/true(21)/null(22) in info field
+fn _cb_decode_item(b: any, pos: int) -> list
+    let initial = bytes_get(b, pos)
+    let major = (initial >> 5) & 7
+    let info = initial & 31
+    let cur = pos + 1
+    let result = []
+
+    // Determine the argument value and advance cur past any additional bytes.
+    let arg = 0
+    let done_arg = 0
+    if info < 24
+        arg = info
+        done_arg = 1
+    else
+        if done_arg == 0
+            if info == 24
+                arg = bytes_get(b, cur)
+                cur = cur + 1
+                done_arg = 1
+    if done_arg == 0
+        if info == 25
+            arg = _cb_read_uint(b, cur, 2)
+            cur = cur + 2
+            done_arg = 1
+    if done_arg == 0
+        if info == 26
+            arg = _cb_read_uint(b, cur, 4)
+            cur = cur + 4
+            done_arg = 1
+    if done_arg == 0
+        if info == 27
+            arg = _cb_read_uint(b, cur, 8)
+            cur = cur + 8
+            done_arg = 1
+
+    // Decode by major type.
+    let val = null
+    let done_val = 0
+
+    if major == 0
+        val = arg
+        done_val = 1
+    if done_val == 0
+        if major == 1
+            val = 0 - 1 - arg
+            done_val = 1
+    if done_val == 0
+        if major == 3
+            let s = ""
+            let si = 0
+            while si < arg
+                s = s + chr(bytes_get(b, cur + si))
+                si = si + 1
+            cur = cur + arg
+            val = s
+            done_val = 1
+    if done_val == 0
+        if major == 4
+            let arr = []
+            let ai = 0
+            while ai < arg
+                let sub = _cb_decode_item(b, cur)
+                arr.push(sub[0])
+                cur = sub[1]
+                ai = ai + 1
+            val = arr
+            done_val = 1
+    if done_val == 0
+        if major == 5
+            let d = {}
+            let mi = 0
+            while mi < arg
+                let ksub = _cb_decode_item(b, cur)
+                cur = ksub[1]
+                let vsub = _cb_decode_item(b, cur)
+                cur = vsub[1]
+                d[ksub[0]] = vsub[0]
+                mi = mi + 1
+            val = d
+            done_val = 1
+    if done_val == 0
+        if major == 7
+            // Simple values: info 20=false, 21=true, 22=null
+            if info == 20
+                val = 0
+                done_val = 1
+            else
+                if info == 21
+                    val = 1
+                    done_val = 1
+                else
+                    val = null
+                    done_val = 1
+
+    result.push(val)
+    result.push(cur)
+    return result
+
+// cb_decode_at: decode one CBOR item starting at byte offset `pos` in `b`.
+// Returns a two-element list: [decoded_value, next_position].
+//
+// Examples:
+//   cb_decode_at(cb_encode(42), 0)  -> [42, 1]
+//   cb_decode_at(cb_encode("hi"), 0) -> ["hi", 4]
+fn cb_decode_at(b: any, pos: int) -> list
+    return _cb_decode_item(b, pos)
+
+// cb_decode: decode the first CBOR item from bytes `b` and return its value.
+//
+// Examples:
+//   cb_decode(cb_encode(42))         -> 42
+//   cb_decode(cb_encode("hello"))    -> "hello"
+//   cb_decode(cb_encode([1,2,3]))    -> [1, 2, 3]
+fn cb_decode(b: any) -> any
+    let pair = _cb_decode_item(b, 0)
+    return pair[0]

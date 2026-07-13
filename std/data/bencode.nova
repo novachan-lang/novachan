@@ -1,0 +1,300 @@
+// ============================================================================
+// NOVA Standard Library — std/data/bencode
+// ============================================================================
+// Bencode encoder / decoder (BitTorrent .torrent format, BEP-0003).
+//
+// Bencode grammar:
+//   integer  ->  "i" <decimal> "e"          e.g. i42e, i-7e, i0e
+//   string   ->  <len> ":" <bytes>          e.g. 4:spam
+//   list     ->  "l" <items...> "e"         e.g. li1ei2ee
+//   dict     ->  "d" <key value pairs> "e"  e.g. d3:fooi1ee  (keys sorted)
+//
+// NOVA representation:
+//   bencode integer -> int
+//   bencode string  -> string
+//   bencode list    -> NOVA list
+//   bencode dict    -> NOVA dict (string keys)
+//
+// PUBLIC API
+//   bnc_encode(v)         -> string   encode any NOVA value to bencode string
+//   bnc_decode(s)         -> any      decode a bencode string to NOVA value
+//   bnc_decode_at(s, pos) -> list     [value, nextpos]  (useful for streaming)
+//
+// EXAMPLES
+//   bnc_encode(42)           -> "i42e"
+//   bnc_encode(0)            -> "i0e"
+//   bnc_encode(-7)           -> "i-7e"
+//   bnc_encode("spam")       -> "4:spam"
+//   bnc_encode([1, 2])       -> "li1ei2ee"
+//   bnc_encode([])           -> "le"
+//   bnc_decode("i42e")       -> 42
+//   bnc_decode("4:spam")     -> "spam"
+//   bnc_decode("li1ei2ee")   -> [1, 2]
+//   bnc_decode_at("i5e", 0)  -> [5, 4]
+//
+// IMPLEMENTATION NOTES
+//   • All private helpers prefixed _bnc_ to avoid link collisions.
+//   • Cursor state threaded as dict {"pos": int} — idiomatic NOVA pattern.
+//   • Single-exit style throughout to avoid the NOVA early-return mistag bug.
+//   • No multi-line list/dict literals in module body (NOVA parser limitation).
+//   • chr(58)=':', chr(101)='e', chr(100)='d', chr(108)='l', chr(105)='i'.
+//   • Dict keys must be strings (BEP-0003); they are sorted before encoding.
+//   • LEAF module — imports nothing.
+// ============================================================================
+
+// ── Private: integer-to-string without str() sign issues ─────────────────────
+
+// _bnc_abs: absolute value of an integer.
+fn _bnc_abs(n)
+    let result = n
+    if n < 0
+        result = 0 - n
+    return result
+
+// _bnc_int_to_str: convert integer n to its decimal string representation.
+// Handles zero and negative values correctly.
+fn _bnc_int_to_str(n)
+    let result = ""
+    if n == 0
+        result = "0"
+    else
+        let neg = 0
+        let v = n
+        if v < 0
+            neg = 1
+            v = 0 - v
+        let digits = ""
+        let go = 1
+        while go == 1
+            let d = v % 10
+            let ch = chr(48 + d)
+            digits = ch + digits
+            v = v / 10
+            if v == 0
+                go = 0
+        if neg == 1
+            result = "-" + digits
+        else
+            result = digits
+    return result
+
+// _bnc_str_to_int: parse a decimal integer string (no leading zeros, may start
+// with '-') to an int value.  Reads exactly the digits present, no bounds check.
+fn _bnc_str_to_int(s, start, stop)
+    let result = 0
+    let neg = 0
+    let i = start
+    if i < stop
+        let ch = char_at(s, i)
+        if ch == "-"
+            neg = 1
+            i = i + 1
+    let go = 1
+    while go == 1
+        if i >= stop
+            go = 0
+        else
+            let o = ord(char_at(s, i))
+            if o < 48
+                go = 0
+            else
+                if o > 57
+                    go = 0
+                else
+                    result = result * 10 + (o - 48)
+                    i = i + 1
+    if neg == 1
+        result = 0 - result
+    return result
+
+// ── Private: sort a list of strings (insertion sort — keys short, lists small)─
+
+fn _bnc_sort_keys(ks)
+    let n = len(ks)
+    let i = 1
+    while i < n
+        let key = ks[i]
+        let j = i - 1
+        let done = 0
+        while done == 0
+            if j < 0
+                done = 1
+            else
+                let cmp_key = ks[j]
+                if cmp_key > key
+                    ks[j + 1] = cmp_key
+                    j = j - 1
+                else
+                    done = 1
+        ks[j + 1] = key
+        i = i + 1
+    return ks
+
+// ── Public: bnc_encode ────────────────────────────────────────────────────────
+
+// bnc_encode: encode a NOVA value to a bencode string.
+//
+// Integers   -> "i<n>e"
+// Strings    -> "<len>:<data>"
+// Lists      -> "l<items>e"
+// Dicts      -> "d<sorted-key-value-pairs>e"
+//
+// Examples:
+//   bnc_encode(42)       -> "i42e"
+//   bnc_encode("spam")   -> "4:spam"
+//   bnc_encode([1, 2])   -> "li1ei2ee"
+//   bnc_encode({})       -> "de"
+fn bnc_encode(v) -> string
+    let result = ""
+    let t = type_of(v)
+    if t == "int"
+        result = "i" + _bnc_int_to_str(v) + "e"
+    else
+        if t == "string"
+            let slen = _bnc_int_to_str(len(v))
+            result = slen + ":" + v
+        else
+            if t == "list"
+                let n = len(v)
+                let body = ""
+                let i = 0
+                while i < n
+                    let elem_str = bnc_encode(v[i])
+                    body = body + elem_str
+                    i = i + 1
+                result = "l" + body + "e"
+            else
+                // dict
+                let ks = keys(v)
+                let sorted = _bnc_sort_keys(ks)
+                let nk = len(sorted)
+                let body = ""
+                let i = 0
+                while i < nk
+                    let k = sorted[i]
+                    let kenc = _bnc_int_to_str(len(k)) + ":" + k
+                    let venc = bnc_encode(v[k])
+                    body = body + kenc + venc
+                    i = i + 1
+                result = "d" + body + "e"
+    return result
+
+// ── Private: recursive decoder ────────────────────────────────────────────────
+
+// _bnc_decode_val: decode ONE bencode value starting at st["pos"].
+// Advances st["pos"] past the consumed bytes.
+// Returns the decoded value (int, string, list, or dict).
+fn _bnc_decode_val(s, n, st)
+    let result = null
+    let p = st["pos"]
+    if p < n
+        let ch = char_at(s, p)
+        let o = ord(ch)
+        if o == 105
+            // 'i' — integer: read until 'e' (101)
+            let start = p + 1
+            let end_pos = start
+            let go = 1
+            while go == 1
+                if end_pos >= n
+                    go = 0
+                else
+                    let co = ord(char_at(s, end_pos))
+                    if co == 101
+                        go = 0
+                    else
+                        end_pos = end_pos + 1
+            result = _bnc_str_to_int(s, start, end_pos)
+            st["pos"] = end_pos + 1
+        else
+            if o == 108
+                // 'l' — list: decode items until 'e' (101)
+                st["pos"] = p + 1
+                let items = []
+                let go2 = 1
+                while go2 == 1
+                    let pp = st["pos"]
+                    if pp >= n
+                        go2 = 0
+                    else
+                        let cc = ord(char_at(s, pp))
+                        if cc == 101
+                            st["pos"] = pp + 1
+                            go2 = 0
+                        else
+                            let elem = _bnc_decode_val(s, n, st)
+                            items.push(elem)
+                result = items
+            else
+                if o == 100
+                    // 'd' — dict: decode key/value pairs until 'e' (101)
+                    st["pos"] = p + 1
+                    let d = {}
+                    let go3 = 1
+                    while go3 == 1
+                        let pp = st["pos"]
+                        if pp >= n
+                            go3 = 0
+                        else
+                            let cc = ord(char_at(s, pp))
+                            if cc == 101
+                                st["pos"] = pp + 1
+                                go3 = 0
+                            else
+                                let k = _bnc_decode_val(s, n, st)
+                                let val = _bnc_decode_val(s, n, st)
+                                d[k] = val
+                    result = d
+                else
+                    // digit: string length prefix
+                    if o >= 48
+                        if o <= 57
+                            // read length digits until ':'  (58)
+                            let len_start = p
+                            let colon = p
+                            let go4 = 1
+                            while go4 == 1
+                                if colon >= n
+                                    go4 = 0
+                                else
+                                    let co = ord(char_at(s, colon))
+                                    if co == 58
+                                        go4 = 0
+                                    else
+                                        colon = colon + 1
+                            let slen = _bnc_str_to_int(s, len_start, colon)
+                            let data_start = colon + 1
+                            result = slice(s, data_start, data_start + slen)
+                            st["pos"] = data_start + slen
+    return result
+
+// ── Public: bnc_decode_at ─────────────────────────────────────────────────────
+
+// bnc_decode_at: decode ONE bencode value starting at byte position pos in s.
+// Returns a two-element list [value, nextpos].
+//
+// Examples:
+//   bnc_decode_at("i42e", 0)   -> [42, 4]
+//   bnc_decode_at("4:spam", 0) -> ["spam", 6]
+fn bnc_decode_at(s, pos) -> list
+    let n = len(s)
+    let st = {}
+    st["pos"] = pos
+    let v = _bnc_decode_val(s, n, st)
+    let out = []
+    out.push(v)
+    out.push(st["pos"])
+    return out
+
+// ── Public: bnc_decode ────────────────────────────────────────────────────────
+
+// bnc_decode: decode a complete bencode string to a NOVA value.
+//
+// Examples:
+//   bnc_decode("i42e")       -> 42
+//   bnc_decode("4:spam")     -> "spam"
+//   bnc_decode("li1ei2ee")   -> [1, 2]
+//   bnc_decode("de")         -> {}
+fn bnc_decode(s) -> any
+    let pair = bnc_decode_at(s, 0)
+    return pair[0]

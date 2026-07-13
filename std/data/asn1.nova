@@ -1,0 +1,181 @@
+// ============================================================================
+// NOVA Standard Library — std/data/asn1
+// ============================================================================
+// ASN.1 Distinguished Encoding Rules (DER) — minimal encoder/decoder for the
+// three core types used in cryptographic protocols (X.509, PKCS, TLS records):
+//   INTEGER      (tag 0x02)
+//   OCTET STRING (tag 0x04)
+//   SEQUENCE     (tag 0x30)
+//
+// PUBLIC API:
+//   asn_encode_int(n) -> bytes
+//     DER-encode n (non-negative integer) as a TLV bytes value.
+//     Tag = 0x02.  Content = minimal big-endian two's-complement encoding
+//     (a leading 0x00 is prepended whenever the high bit of the most-
+//     significant content byte is 1, to distinguish positive from negative).
+//     asn_encode_int(0) -> [0x02, 0x01, 0x00]
+//     asn_encode_int(42) -> [0x02, 0x01, 0x2a]
+//     asn_encode_int(256) -> [0x02, 0x02, 0x01, 0x00]
+//
+//   asn_encode_octetstring(b) -> bytes
+//     DER-encode a bytes value as OCTET STRING.
+//     Tag = 0x04.  Length = bytes_len(b).  Content = b verbatim.
+//
+//   asn_encode_sequence(items) -> bytes
+//     DER-encode a list of already-encoded DER bytes values as a SEQUENCE.
+//     Tag = 0x30.  Content = concatenation of all items.
+//     Length field uses DER short form (1 byte) for total <= 127 bytes,
+//     and long form (0x81/0x82 prefix) for larger payloads.
+//
+//   asn_tag(b) -> int
+//     Return the tag byte (first byte) of a DER TLV value.
+//
+//   asn_length(b) -> int
+//     Return the decoded content length from a DER TLV value starting at
+//     byte index 1.  Handles short form (< 0x80) and long form
+//     (0x81 = 1 additional length byte, 0x82 = 2 additional length bytes).
+//
+// PRIVATE helpers:
+//   _asn_bytes(s) -> bytes   — convert a string to bytes via str_to_bytes
+//   _asn_uint_bytes(n) -> bytes  — minimal big-endian byte encoding of n > 0
+//   _asn_tlv(tag, content) -> bytes  — prepend tag + DER-length to content
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing.
+//   - Pure functional style: every fn returns bytes, no mutation of inputs.
+//   - bytes_append returns a NEW bytes (must reassign); used as accumulator.
+//   - bytes_concat joins two bytes values into a new one.
+//   - Only non-negative integers are supported (n >= 0); the two's-complement
+//     leading-zero rule only fires for positive values with high bit set.
+//   - DER length encoding: short form for 0-127; long form for 128-65535.
+//   - Single-exit style throughout (NOVA return-null mistag avoidance).
+//
+// KAT vectors (RFC 5280 / X.690 verified):
+//   asn_encode_int(0)   == [2, 1, 0]
+//   asn_encode_int(42)  == [2, 1, 42]
+//   asn_encode_int(256) == [2, 2, 1, 0]
+//   asn_encode_octetstring(_asn_bytes("AB")) == [4, 2, 65, 66]
+//   asn_tag(asn_encode_int(5)) == 2
+//   asn_length(asn_encode_octetstring(_asn_bytes("ABC"))) == 3
+//   asn_encode_sequence([asn_encode_int(1), asn_encode_int(2)])
+//     == [48, 6, 2, 1, 1, 2, 1, 2]
+// ============================================================================
+
+// _asn_bytes: convert string to bytes (convenience wrapper).
+fn _asn_bytes(s: string) -> any
+    str_to_bytes(s)
+
+// _asn_uint_bytes: minimal big-endian encoding of a positive integer n.
+//
+// Extracts bytes from most significant to least significant by working
+// through 256-based place values.  Builds the result in big-endian order
+// by prepending each new byte.  Returns exactly the fewest bytes needed.
+//
+// Precondition: n > 0.
+fn _asn_uint_bytes(n: int) -> any
+    // Build bytes from LSB to MSB into a temporary list, then reverse.
+    let limbs = []
+    let remaining = n
+    let done = 0
+    while done == 0
+        let b = remaining % 256
+        limbs.push(b)
+        remaining = remaining / 256
+        if remaining == 0
+            done = 1
+    // limbs is LSB-first; reverse into big-endian bytes.
+    let count = len(limbs)
+    let out = bytes(0)
+    let i = count - 1
+    while i >= 0
+        out = bytes_append(out, limbs[i])
+        i = i - 1
+    out
+
+// _asn_tlv: wrap content bytes with tag byte and DER-encoded length.
+//
+// DER length encoding (X.690 §8.1.3):
+//   0..127  — short form: single byte equal to the length.
+//   128..255 — long form, 1 byte: 0x81 followed by the length byte.
+//   256..65535 — long form, 2 bytes: 0x82 followed by high byte then low byte.
+//
+// Returns: tag || length_encoding || content
+fn _asn_tlv(tag: int, content: any) -> any
+    let clen = bytes_len(content)
+    let out = bytes(0)
+    out = bytes_append(out, tag)
+    if clen < 128
+        out = bytes_append(out, clen)
+    else
+        if clen < 256
+            out = bytes_append(out, 129)
+            out = bytes_append(out, clen)
+        else
+            let hi = clen / 256
+            let lo = clen % 256
+            out = bytes_append(out, 130)
+            out = bytes_append(out, hi)
+            out = bytes_append(out, lo)
+    out = bytes_concat(out, content)
+    out
+
+// asn_encode_int: DER-encode a non-negative integer.
+//
+// Content encoding (X.690 §8.3):
+//   - n == 0: content is a single 0x00 byte.
+//   - n > 0:  minimal big-endian bytes.  If the MSB of the first content
+//     byte is 1 (value >= 128), a 0x00 pad byte is prepended to signal
+//     that this is a non-negative value (two's-complement requirement).
+fn asn_encode_int(n: int) -> any
+    let content = bytes(0)
+    if n == 0
+        content = bytes_append(content, 0)
+    else
+        let raw = _asn_uint_bytes(n)
+        let msb = bytes_get(raw, 0)
+        if msb >= 128
+            content = bytes_append(content, 0)
+            content = bytes_concat(content, raw)
+        else
+            content = raw
+    _asn_tlv(2, content)
+
+// asn_encode_octetstring: DER-encode a bytes value as OCTET STRING (tag 0x04).
+fn asn_encode_octetstring(b: any) -> any
+    _asn_tlv(4, b)
+
+// asn_encode_sequence: DER-encode a list of DER-encoded items as SEQUENCE (tag 0x30).
+//
+// items: list of bytes values (each already a complete DER TLV).
+// Concatenates all items, then wraps with tag 0x30 and total length.
+fn asn_encode_sequence(items: list) -> any
+    let body = bytes(0)
+    let n = len(items)
+    let i = 0
+    while i < n
+        body = bytes_concat(body, items[i])
+        i = i + 1
+    _asn_tlv(48, body)
+
+// asn_tag: return the tag byte (byte 0) of a DER TLV value.
+fn asn_tag(b: any) -> int
+    bytes_get(b, 0)
+
+// asn_length: decode the content length from a DER TLV value.
+//
+// Reads the length field starting at byte index 1 (immediately after the tag).
+// Handles:
+//   Short form (byte < 0x80): length = that byte.
+//   Long form 0x81: length = next byte.
+//   Long form 0x82: length = (next byte << 8) | byte after that.
+fn asn_length(b: any) -> int
+    let first = bytes_get(b, 1)
+    let result = first
+    if first == 129
+        result = bytes_get(b, 2)
+    else
+        if first == 130
+            let hi = bytes_get(b, 2)
+            let lo = bytes_get(b, 3)
+            result = hi * 256 + lo
+    result

@@ -1,0 +1,212 @@
+// ============================================================================
+// NOVA Standard Library — std/data/xmlpath
+// ============================================================================
+// Minimal XPath-like query over an XML string using simple slash paths.
+// No predicates, no axes, no wildcards — just element-name traversal.
+//
+// PATH SYNTAX:
+//   - Segments are separated by "/" (slash).
+//   - Each segment is a literal element tag name.
+//   - The first segment must match the root element's tag.
+//   - Subsequent segments descend into direct children only.
+//   - Example: "root/section/item"  "a/b/c"  "r/i"
+//
+// HOW IT WORKS:
+//   xml_parse (from std/text/xml) produces a dict node tree where each node
+//   has {"tag": string, "attrs": dict, "children": list<node>, "text": string}.
+//   xp_ functions split the path into segments, verify the first segment
+//   matches the root tag, then walk each subsequent segment collecting direct
+//   children whose tag matches. The final level's text content is returned.
+//
+// DESIGN RATIONALE:
+//   Rather than re-parsing the XML for each query (O(n) per query), we parse
+//   once with xml_parse and traverse the tree. We build the tree transiently
+//   inside each public function — the caller pays one parse per call. For
+//   multi-query use cases this is slightly redundant, but keeps the public
+//   API to four functions with no session object, which matches the NOVA
+//   principle of "no ceremony for simple cases."
+//
+// GOTCHA — single-exit rule:
+//   NOVA's `return null` + `return <any>` in the same function can mistag the
+//   return value (see reference_nova_return_null_mistag). All private helpers
+//   that may return null use a single-exit `let result = null` pattern.
+//
+// PREFIX: xp_ (all public); _xp_ (all private).
+// IMPORTS: std/text/xml
+// ============================================================================
+
+import std/text/xml
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _xp_split_path: split a slash-separated path string into a list of segment
+// strings. "/" separator is ASCII 47. Empty segments (leading/trailing slash,
+// or "//") produce an empty-string segment which will fail to match any tag
+// and cause a safe early return. We never use slice() on lists (string-only).
+fn _xp_split_path(path: string) -> list
+    let out = []
+    let n = len(path)
+    let i = 0
+    let seg = ""
+    while i < n
+        let c = char_at(path, i)
+        if c == "/"
+            push(out, seg)
+            seg = ""
+        else
+            seg = seg + c
+        i = i + 1
+    push(out, seg)
+    out
+
+// _xp_node_tag: return the tag string of a dict node, or "" if not a valid
+// node. Null-safe. Used to check the first path segment against the root tag.
+fn _xp_node_tag(node) -> string
+    let result = ""
+    if node == null
+        result = ""
+    else
+        if type_of(node) != "dict"
+            result = ""
+        else
+            if contains(node, "tag")
+                result = node["tag"]
+    result
+
+// _xp_node_children: return the children list of a dict node, or [] if the
+// node has no "children" key or is not a valid node. Null-safe.
+fn _xp_node_children(node) -> list
+    let result = []
+    if node == null
+        result = []
+    else
+        if type_of(node) != "dict"
+            result = []
+        else
+            if contains(node, "children")
+                result = node["children"]
+    result
+
+// _xp_node_text: return the direct "text" content of a node (NOT recursive —
+// we want leaf text only; xml_text would also include descendant text which is
+// wrong for paths that stop at an intermediate element). Empty string if absent.
+fn _xp_node_text(node) -> string
+    let result = ""
+    if node == null
+        result = ""
+    else
+        if type_of(node) != "dict"
+            result = ""
+        else
+            if contains(node, "text")
+                result = node["text"]
+    result
+
+// _xp_walk: given a list of current-level nodes and a list of path segments
+// starting from index `seg_i`, collect all nodes at the final segment level.
+// Returns a list of matching nodes (not their text — that is done by callers).
+//
+// Algorithm: for each segment after the root (which is already matched),
+// expand the current frontier to all direct children whose tag matches the
+// segment. After consuming all segments the frontier IS the result set.
+fn _xp_walk(segs: list, seg_i: int, current: list) -> list
+    let result = []
+    let nseg = len(segs)
+    let frontier = current
+    let si = seg_i
+    let done = 0
+    while done == 0
+        if si >= nseg
+            // all segments consumed — frontier is the final match set
+            let k = 0
+            while k < len(frontier)
+                push(result, frontier[k])
+                k = k + 1
+            done = 1
+        else
+            let tag = segs[si]
+            let next = []
+            let fi = 0
+            while fi < len(frontier)
+                let kids = _xp_node_children(frontier[fi])
+                let ki = 0
+                while ki < len(kids)
+                    let child = kids[ki]
+                    if _xp_node_tag(child) == tag
+                        push(next, child)
+                    ki = ki + 1
+                fi = fi + 1
+            frontier = next
+            si = si + 1
+    result
+
+// _xp_resolve: parse xml, split path, validate root tag, then walk.
+// Returns a list of matching nodes (possibly empty on any mismatch).
+fn _xp_resolve(xml: string, path: string) -> list
+    let result = []
+    if len(path) == 0
+        result = []
+    else
+        let root = xml_parse(xml)
+        let segs = _xp_split_path(path)
+        if len(segs) == 0
+            result = []
+        else
+            let first = segs[0]
+            let root_tag = _xp_node_tag(root)
+            if root_tag != first
+                result = []
+            else
+                // root matches; walk remaining segments starting from index 1
+                let start = []
+                push(start, root)
+                result = _xp_walk(segs, 1, start)
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// xp_first: text content of the FIRST element matching the slash path, or ""
+// if no element matches. For leaf text this is the direct "text" field of the
+// node (the element's own text content, not its descendants' text). If you need
+// recursive text, call xml_text on the result — but for simple leaf elements
+// (the 95%+ case) the direct text IS the full content.
+//
+// KAT vectors:
+//   xp_first("<a><b>hi</b></a>", "a/b")  == "hi"
+//   xp_first("<a><b>1</b><b>2</b></a>", "a/b") == "1"
+//   xp_first("<a><b><c>deep</c></b></a>", "a/b/c") == "deep"
+fn xp_first(xml: string, path: string) -> string
+    let nodes = _xp_resolve(xml, path)
+    let result = ""
+    if len(nodes) > 0
+        result = _xp_node_text(nodes[0])
+    result
+
+// xp_all: text content of ALL elements matching the slash path, in document
+// order. Returns [] if no elements match.
+//
+// KAT vectors:
+//   xp_all("<a><b>1</b><b>2</b></a>", "a/b") == ["1","2"]
+fn xp_all(xml: string, path: string) -> list
+    let nodes = _xp_resolve(xml, path)
+    let result = []
+    let i = 0
+    while i < len(nodes)
+        push(result, _xp_node_text(nodes[i]))
+        i = i + 1
+    result
+
+// xp_count: number of elements matching the slash path. 0 if none.
+//
+// KAT vectors:
+//   xp_count("<r><i>x</i><i>y</i><i>z</i></r>", "r/i") == 3
+fn xp_count(xml: string, path: string) -> int
+    len(_xp_resolve(xml, path))
+
+// xp_exists: true iff at least one element matches the slash path.
+//
+// KAT vectors:
+//   xp_exists("<a><b>x</b></a>", "a/b") == true
+//   xp_exists("<a><b>x</b></a>", "a/c") == false
+fn xp_exists(xml: string, path: string) -> bool
+    len(_xp_resolve(xml, path)) > 0
