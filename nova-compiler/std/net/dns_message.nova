@@ -1,0 +1,271 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns_message
+// ============================================================================
+// Full DNS message encoder/decoder (RFC 1035 §4).
+//
+// A DNS message = header (12 bytes) + question section + answer section +
+// authority section + additional section.  All sections are optional (counts
+// in the header drive decoding).
+//
+// PUBLIC API:
+//
+//   dns_message_encode(msg: dict) -> bytes
+//     Build a complete DNS message wire representation from a structured dict.
+//     msg keys:
+//       "header"     dict  — same keys as dns_header_encode (id, qr, opcode,
+//                            aa, tc, rd, ra, rcode).  qdcount/ancount/nscount/
+//                            arcount are COMPUTED from the section lists —
+//                            any caller-supplied counts are IGNORED.
+//       "questions"  list  — list of dicts {"name", "type", "class"}
+//       "answers"    list  — list of dicts {"name","type","class","ttl","rdata"}
+//       "authority"  list  — (optional) authority RRs, same shape as answers
+//       "additional" list  — (optional) additional RRs, same shape as answers
+//     Returns bytes(0) on encoding error (malformed name, etc.).
+//
+//   dns_message_decode(b: bytes) -> dict
+//     Parse a DNS message from its full wire bytes.
+//     Returns dict with keys: "header", "questions", "answers",
+//                             "authority", "additional".
+//     "header"     dict  — keys: id, qr, opcode, aa, tc, rd, ra, rcode,
+//                                qdcount, ancount, nscount, arcount.
+//     "questions"  list  — list of dicts {"name","type","class"}
+//     "answers"    list  — list of dicts {"name","type","class","ttl","rdlength","rdata"}
+//     "authority"  list  — authority RRs (same shape as answers)
+//     "additional" list  — additional RRs (same shape as answers)
+//     On malformed/truncated input the decoded header counts and section lists
+//     reflect however much was successfully parsed; partially decoded messages
+//     return what could be read without crashing.
+//
+// DESIGN NOTES:
+//   * dns_question_decode and dns_rr_decode each accept the FULL message bytes
+//     and a cursor position.  This is critical: it allows pointer decompression
+//     (RFC 1035 §4.1.4) in names to reference offsets anywhere in the message.
+//   * We encode questions and RRs WITHOUT compression (uncompressed is always
+//     valid; compression is an optional optimisation that adds codec complexity).
+//   * Counts in the output header are authoritative — they drive the decoder.
+//     Encoders always set counts from the actual list lengths (never trust
+//     caller-supplied counts).
+//   * WAVE 2 — imports: std/net/dns_header, std/net/dns_question, std/net/dns_rr
+// ============================================================================
+
+import std/net/dns_header
+import std/net/dns_question
+import std/net/dns_rr
+
+// ── Private: safe int field from a dict (default 0) ─────────────────────────
+
+fn _dm_get_int(d: dict, key: string) -> int
+    if contains(d, key)
+        return d[key]
+    0
+
+// ── Private: encode one RR from a dict ───────────────────────────────────────
+// rdata must be bytes; missing fields default to zero/empty.
+
+fn _dm_encode_rr(rr: dict) -> bytes
+    let rr_type  = _dm_get_int(rr, "type")
+    let rr_class = _dm_get_int(rr, "class")
+    let rr_ttl   = _dm_get_int(rr, "ttl")
+    let name_s = ""
+    if contains(rr, "name")
+        name_s = rr["name"]
+    let rdata = bytes(0)
+    if contains(rr, "rdata")
+        rdata = rr["rdata"]
+    dns_rr_encode(name_s, rr_type, rr_class, rr_ttl, rdata)
+
+// ── Private: encode a list of RRs, concatenating wire bytes ─────────────────
+
+fn _dm_encode_rr_list(rrs: list) -> bytes
+    let out = bytes(0)
+    let i = 0
+    let n = len(rrs)
+    while i < n
+        let encoded = _dm_encode_rr(rrs[i])
+        out = bytes_concat(out, encoded)
+        i = i + 1
+    out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// dns_message_encode: dict -> bytes
+//
+// Builds a full DNS message wire representation.
+// The header counts (qdcount/ancount/nscount/arcount) are computed from the
+// actual section list lengths — any counts in msg["header"] are ignored.
+//
+// Example (query):
+//   let q = {"name": "example.com", "type": 1, "class": 1}
+//   let msg = {"header": {"id": 0x1234, "rd": 1}, "questions": [q], "answers": []}
+//   let wire = dns_message_encode(msg)
+//   // wire is 29 bytes: 12-byte header + 17-byte question
+fn dns_message_encode(msg: dict) -> bytes
+    // ── Determine section lists (default to empty) ────────────────────────────
+    let questions  = []
+    let answers    = []
+    let authority  = []
+    let additional = []
+    if contains(msg, "questions")
+        questions = msg["questions"]
+    if contains(msg, "answers")
+        answers = msg["answers"]
+    if contains(msg, "authority")
+        authority = msg["authority"]
+    if contains(msg, "additional")
+        additional = msg["additional"]
+
+    // ── Compute counts from actual list lengths ───────────────────────────────
+    let qdcount = len(questions)
+    let ancount = len(answers)
+    let nscount = len(authority)
+    let arcount = len(additional)
+
+    // ── Build header dict: carry caller fields, override counts ───────────────
+    let hdr_in = {}
+    if contains(msg, "header")
+        hdr_in = msg["header"]
+
+    let hid     = _dm_get_int(hdr_in, "id")
+    let hqr     = _dm_get_int(hdr_in, "qr")
+    let hopcode = _dm_get_int(hdr_in, "opcode")
+    let haa     = _dm_get_int(hdr_in, "aa")
+    let htc     = _dm_get_int(hdr_in, "tc")
+    let hrd     = _dm_get_int(hdr_in, "rd")
+    let hra     = _dm_get_int(hdr_in, "ra")
+    let hrcode  = _dm_get_int(hdr_in, "rcode")
+
+    let hdr_d = {"id": hid, "qr": hqr, "opcode": hopcode, "aa": haa, "tc": htc, "rd": hrd, "ra": hra, "rcode": hrcode, "qdcount": qdcount, "ancount": ancount, "nscount": nscount, "arcount": arcount}
+    let out = dns_header_encode(hdr_d)
+
+    // ── Encode questions ──────────────────────────────────────────────────────
+    let qi = 0
+    while qi < qdcount
+        let q = questions[qi]
+        let qname = ""
+        if contains(q, "name")
+            qname = q["name"]
+        let qtype  = _dm_get_int(q, "type")
+        let qclass = _dm_get_int(q, "class")
+        let qenc = dns_question_encode(qname, qtype, qclass)
+        out = bytes_concat(out, qenc)
+        qi = qi + 1
+
+    // ── Encode answer, authority, additional RRs ──────────────────────────────
+    out = bytes_concat(out, _dm_encode_rr_list(answers))
+    out = bytes_concat(out, _dm_encode_rr_list(authority))
+    out = bytes_concat(out, _dm_encode_rr_list(additional))
+
+    out
+
+// dns_message_decode: bytes -> dict
+//
+// Parses a full DNS message from wire bytes.
+// Returns a dict: {"header": dict, "questions": list, "answers": list,
+//                  "authority": list, "additional": list}
+// On truncated/malformed input, returns as much as could be decoded safely.
+//
+// Example (round-trip):
+//   let d = dns_message_decode(dns_message_encode(msg))
+//   // d["header"]["id"] == msg["header"]["id"]
+fn dns_message_decode(b: bytes) -> dict
+    let mlen = bytes_len(b)
+    let empty_hdr = {}
+    let no_q  = []
+    let no_an = []
+    let no_au = []
+    let no_ad = []
+    let bare = {"header": empty_hdr, "questions": no_q, "answers": no_an, "authority": no_au, "additional": no_ad}
+
+    // ── Decode header ─────────────────────────────────────────────────────────
+    if mlen < 12
+        return bare
+
+    let hdr_res = dns_header_decode(b, 0)
+    let hdr = hdr_res[0]
+    let pos = hdr_res[1]
+
+    // Guard: if decode failed (empty dict returned), bail
+    if not contains(hdr, "id")
+        return bare
+
+    let qdcount = _dm_get_int(hdr, "qdcount")
+    let ancount = _dm_get_int(hdr, "ancount")
+    let nscount = _dm_get_int(hdr, "nscount")
+    let arcount = _dm_get_int(hdr, "arcount")
+
+    // ── Decode questions ──────────────────────────────────────────────────────
+    // Use .push() (method style) so the list accepts any-typed dicts from
+    // dns_question_decode which returns a list whose element[0] is typed as any.
+    let questions = []
+    let qi = 0
+    let ok = 1
+    while qi < qdcount and ok == 1
+        if pos >= mlen
+            ok = 0
+        else
+            let qr = dns_question_decode(b, pos)
+            let qrec = qr[0]
+            let qnxt = qr[1]
+            if qnxt <= pos
+                ok = 0
+            else
+                questions.push(qrec)
+                pos = qnxt
+                qi = qi + 1
+
+    // ── Decode answers ────────────────────────────────────────────────────────
+    let answers = []
+    let ai = 0
+    ok = 1
+    while ai < ancount and ok == 1
+        if pos >= mlen
+            ok = 0
+        else
+            let arr = dns_rr_decode(b, pos)
+            let arec = arr[0]
+            let anxt = arr[1]
+            if anxt <= pos
+                ok = 0
+            else
+                answers.push(arec)
+                pos = anxt
+                ai = ai + 1
+
+    // ── Decode authority ──────────────────────────────────────────────────────
+    let authority = []
+    let ni = 0
+    ok = 1
+    while ni < nscount and ok == 1
+        if pos >= mlen
+            ok = 0
+        else
+            let arr = dns_rr_decode(b, pos)
+            let arec = arr[0]
+            let anxt = arr[1]
+            if anxt <= pos
+                ok = 0
+            else
+                authority.push(arec)
+                pos = anxt
+                ni = ni + 1
+
+    // ── Decode additional ─────────────────────────────────────────────────────
+    let additional = []
+    let ari = 0
+    ok = 1
+    while ari < arcount and ok == 1
+        if pos >= mlen
+            ok = 0
+        else
+            let arr = dns_rr_decode(b, pos)
+            let arec = arr[0]
+            let anxt = arr[1]
+            if anxt <= pos
+                ok = 0
+            else
+                additional.push(arec)
+                pos = anxt
+                ari = ari + 1
+
+    // ── Return fully-decoded message ──────────────────────────────────────────
+    {"header": hdr, "questions": questions, "answers": answers, "authority": authority, "additional": additional}

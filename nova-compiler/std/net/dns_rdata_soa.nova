@@ -1,0 +1,231 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns_rdata_soa
+// ============================================================================
+// DNS SOA (Start of Authority) RDATA codec, RFC 1035 §3.3.13.
+//
+// SOA RDATA wire format:
+//   MNAME   (domain name, wire format, possibly compressed in message)
+//   RNAME   (domain name, wire format, possibly compressed in message)
+//   SERIAL  (u32, big-endian)
+//   REFRESH (u32, big-endian)
+//   RETRY   (u32, big-endian)
+//   EXPIRE  (u32, big-endian)
+//   MINIMUM (u32, big-endian)
+//
+// PUBLIC API:
+//   dns_soa_encode(mname, rname, serial, refresh, retry, expire, minimum) -> bytes
+//     Encode a full SOA RDATA as wire bytes (uncompressed names).
+//     Returns empty bytes on any malformed name (label >63, empty label).
+//
+//   dns_soa_decode(msg, pos) -> list
+//     Decode SOA RDATA from msg starting at byte offset pos.
+//     Returns a two-element list: [dict, next_pos]
+//     dict keys: "mname","rname","serial","refresh","retry","expire","minimum"
+//     On any malformed/truncated input returns [{}, pos].
+//
+// DESIGN NOTES:
+//   - LEAF module — imports NOTHING (Wave 1; name codec is inlined).
+//   - All private helpers are prefixed _soa_ to avoid symbol collisions.
+//   - All byte reads are bounds-checked (i < bytes_len).
+//   - On any malformed input the public functions return a safe empty result.
+//   - Binary wire data uses the bytes type exclusively.
+//   - Compression pointers in decode are followed (capped at 128 jumps).
+//   - Encode uses uncompressed labels (always valid per RFC 1035).
+//
+// KAT VECTORS:
+//   dns_soa_encode("ns.example.com","root.example.com",
+//                  2024010101, 7200, 3600, 1209600, 3600)
+//   After names: five u32 big-endian bytes for those five values.
+//   Round-trip: decode(encode) yields identical names and all five u32 values.
+// ============================================================================
+
+// ── Private: name encode (inline, uncompressed) ──────────────────────────────
+
+// Encode one dot-separated domain name to DNS wire format (uncompressed).
+// Returns empty bytes on any invalid label (empty or >63 chars).
+fn _soa_name_encode(name: string) -> bytes
+    let out = bytes(0)
+    if len(name) == 0
+        out = bytes_append(out, 0)
+        return out
+    let parts = split(name, ".")
+    let i = 0
+    while i < len(parts)
+        let lbl = parts[i]
+        let n = len(lbl)
+        if n == 0 or n > 63
+            return bytes(0)
+        out = bytes_append(out, n)
+        let j = 0
+        while j < n
+            out = bytes_append(out, ord(char_at(lbl, j)))
+            j = j + 1
+        i = i + 1
+    out = bytes_append(out, 0)
+    out
+
+// ── Private: name decode (inline, follows compression pointers) ──────────────
+
+// Decode a DNS name from msg starting at byte offset pos.
+// Returns [name_string, next_pos] or ["", pos] on any error.
+// Follows compression pointers; caps at 128 jumps to prevent infinite loops.
+fn _soa_name_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let name = ""
+    let cur = pos
+    let jumps = 0
+    let jumped = false
+    let final_pos = pos
+    let running = true
+    while running
+        if cur >= mlen
+            return ["", pos]
+        let b0 = bytes_get(msg, cur)
+        if (b0 & 0xC0) == 0xC0
+            if cur + 1 >= mlen
+                return ["", pos]
+            let b1 = bytes_get(msg, cur + 1)
+            let offset = ((b0 & 0x3F) << 8) | b1
+            if jumped == false
+                final_pos = cur + 2
+            jumped = true
+            jumps = jumps + 1
+            if jumps > 128
+                return ["", pos]
+            cur = offset
+        else
+            let ln = b0 & 0xFF
+            if ln == 0
+                if jumped == false
+                    final_pos = cur + 1
+                running = false
+            else
+                if ln > 63
+                    return ["", pos]
+                if cur + 1 + ln > mlen
+                    return ["", pos]
+                let lend = cur + 1 + ln
+                let lbl = ""
+                let k = cur + 1
+                while k < lend
+                    lbl = lbl + chr(bytes_get(msg, k))
+                    k = k + 1
+                if len(name) == 0
+                    name = lbl
+                else
+                    name = name + "." + lbl
+                cur = lend
+    [name, final_pos]
+
+// ── Private: big-endian u32 emit ────────────────────────────────────────────
+
+// Append a 32-bit unsigned integer in big-endian order to out.
+fn _soa_emit_u32(out: bytes, v: int) -> bytes
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// ── Private: big-endian u32 read ────────────────────────────────────────────
+
+// Read a 32-bit unsigned integer in big-endian order from msg at pos.
+// Returns -1 if there are fewer than 4 bytes available.
+fn _soa_read_u32(msg: bytes, pos: int) -> int
+    let mlen = bytes_len(msg)
+    if pos + 4 > mlen
+        return -1
+    let b0 = bytes_get(msg, pos)
+    let b1 = bytes_get(msg, pos + 1)
+    let b2 = bytes_get(msg, pos + 2)
+    let b3 = bytes_get(msg, pos + 3)
+    ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & 0xFFFFFFFF
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// dns_soa_encode: encode a full SOA RDATA to wire bytes.
+//
+// mname   - primary name server domain name (e.g. "ns.example.com")
+// rname   - responsible mailbox domain name (e.g. "root.example.com")
+// serial  - zone serial number (u32)
+// refresh - refresh interval in seconds (u32)
+// retry   - retry interval in seconds (u32)
+// expire  - expire limit in seconds (u32)
+// minimum - minimum TTL (u32)
+//
+// Returns empty bytes if either name has an invalid label (>63 chars or empty).
+// All u32 values are emitted big-endian.
+//
+// Example:
+//   dns_soa_encode("ns.example.com","root.example.com",2024010101,7200,3600,1209600,3600)
+//   -> name_wire_bytes ++ name_wire_bytes ++ 20 bytes of five u32s
+fn dns_soa_encode(mname: string, rname: string, serial: int, refresh: int, retry: int, expire: int, minimum: int) -> bytes
+    let out = bytes(0)
+    let mn = _soa_name_encode(mname)
+    if bytes_len(mn) == 0
+        return out
+    let rn = _soa_name_encode(rname)
+    if bytes_len(rn) == 0
+        return out
+    out = bytes_concat(out, mn)
+    out = bytes_concat(out, rn)
+    out = _soa_emit_u32(out, serial)
+    out = _soa_emit_u32(out, refresh)
+    out = _soa_emit_u32(out, retry)
+    out = _soa_emit_u32(out, expire)
+    out = _soa_emit_u32(out, minimum)
+    out
+
+// dns_soa_decode: decode SOA RDATA from msg starting at byte offset pos.
+//
+// msg - the complete DNS message buffer (needed for compression pointer resolution)
+// pos - byte offset in msg where SOA RDATA begins
+//
+// Returns a two-element list: [dict, next_pos]
+//   dict keys: "mname","rname","serial","refresh","retry","expire","minimum"
+//   On any malformed/truncated input returns [{}, pos].
+//
+// Example:
+//   let result = dns_soa_decode(wire_msg, 12)
+//   let soa = result[0]
+//   let serial = soa["serial"]
+fn dns_soa_decode(msg: bytes, pos: int) -> list
+    let empty = {}
+    let mlen = bytes_len(msg)
+    if pos >= mlen
+        return [empty, pos]
+    let mn_result = _soa_name_decode(msg, pos)
+    let mname = mn_result[0]
+    let pos2 = mn_result[1]
+    if len(mname) == 0 and pos2 == pos
+        return [empty, pos]
+    if pos2 >= mlen and pos2 != pos
+        let chk2 = bytes_get(msg, pos)
+        if chk2 != 0
+            return [empty, pos]
+    let rn_result = _soa_name_decode(msg, pos2)
+    let rname = rn_result[0]
+    let pos3 = rn_result[1]
+    if len(rname) == 0 and pos3 == pos2
+        let chk3 = bytes_get(msg, pos2)
+        if chk3 != 0
+            return [empty, pos]
+    if pos3 + 20 > mlen
+        return [empty, pos]
+    let serial = _soa_read_u32(msg, pos3)
+    if serial < 0
+        return [empty, pos]
+    let refresh = _soa_read_u32(msg, pos3 + 4)
+    if refresh < 0
+        return [empty, pos]
+    let retry = _soa_read_u32(msg, pos3 + 8)
+    if retry < 0
+        return [empty, pos]
+    let expire = _soa_read_u32(msg, pos3 + 12)
+    if expire < 0
+        return [empty, pos]
+    let minimum = _soa_read_u32(msg, pos3 + 16)
+    if minimum < 0
+        return [empty, pos]
+    let rec = {"mname": mname, "rname": rname, "serial": serial, "refresh": refresh, "retry": retry, "expire": expire, "minimum": minimum}
+    [rec, pos3 + 20]

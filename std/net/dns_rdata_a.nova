@@ -1,0 +1,340 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns_rdata_a
+// ============================================================================
+// DNS RDATA encoders/decoders for A (IPv4) and AAAA (IPv6) record types.
+// RFC 1035 §3.4.1 (A) and RFC 3596 §2.2 (AAAA).
+//
+// PUBLIC API:
+//   dns_a_encode(ip4: string) -> bytes(4)
+//     Encode a dotted-quad IPv4 string to 4 wire bytes.
+//     Returns 4 zero bytes on any malformed input (never crashes).
+//
+//   dns_a_decode(b: bytes) -> string
+//     Decode 4 wire bytes to a dotted-quad string.
+//     Returns "" if bytes length != 4.
+//
+//   dns_aaaa_encode(ip6: string) -> bytes(16)
+//     Encode an IPv6 address string to 16 wire bytes.
+//     Handles "::" zero-compression and full 8-group form.
+//     Returns 16 zero bytes on any malformed input (never crashes).
+//
+//   dns_aaaa_decode(b: bytes) -> string
+//     Decode 16 wire bytes to a canonical IPv6 string.
+//     Returns "" if bytes length != 16.
+//     Output: canonical RFC 5952 form (first longest run of >=2 zero groups
+//     compressed to "::"; leading zeros stripped per group).
+//
+// DESIGN NOTES:
+//   - LEAF module — imports NOTHING.
+//   - All private helpers are prefixed _da_ to avoid symbol collisions.
+//   - Binary wire data uses the bytes type exclusively.
+//   - IPv6 parsing inlined here (no sibling imports in Wave 1).
+//   - All byte-reads are bounds-checked.
+//   - On any parse error, returns a safe zero-filled result.
+//
+// KAT vectors:
+//   dns_a_encode("1.2.3.4")         -> bytes [1,2,3,4]
+//   dns_a_decode([1,2,3,4])         -> "1.2.3.4"
+//   dns_a_encode("192.168.0.255")   -> bytes [192,168,0,255]
+//   dns_aaaa_encode("::1")          -> 16 bytes, all 0 except byte[15]=1
+//   dns_aaaa_encode("2001:db8::1")  -> byte[0]=0x20, byte[1]=0x01, byte[15]=1
+//   dns_aaaa_decode(dns_aaaa_encode("::1")) byte[15] == 1 (round-trip)
+// ============================================================================
+
+// ── Private: IPv4 helpers ─────────────────────────────────────────────────────
+
+// Returns true iff s is non-empty ASCII decimal digits only.
+fn _da_digits_only(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    while i < len(s)
+        let b = ord(char_at(s, i))
+        if b < 48 or b > 57
+            return false
+        i = i + 1
+    true
+
+// Parse a single octet string into 0..255, or -1 on error.
+fn _da_parse_octet(s: string) -> int
+    if _da_digits_only(s) == false
+        return -1
+    let v = parse_int(s)
+    if v < 0 or v > 255
+        return -1
+    v
+
+// ── Private: IPv6 helpers ─────────────────────────────────────────────────────
+
+// Value of one hex character; returns -1 for non-hex.
+fn _da_hex_val(c: string) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 97 and b <= 102
+        return b - 87
+    if b >= 65 and b <= 70
+        return b - 55
+    -1
+
+// Parse a single hex group (1-4 hex chars) -> 0..65535, or -1 on error.
+fn _da_parse_group(s: string) -> int
+    let n = len(s)
+    if n == 0 or n > 4
+        return -1
+    let v = 0
+    let i = 0
+    while i < n
+        let d = _da_hex_val(char_at(s, i))
+        if d < 0
+            return -1
+        v = v * 16 + d
+        i = i + 1
+    v
+
+// Split a possibly-empty colon-separated string into group strings.
+fn _da_split_half(s: string) -> list
+    if len(s) == 0
+        return []
+    split(s, ":")
+
+// Parse a list of group strings to a list of ints; returns [] on any error.
+fn _da_parse_half(parts: list) -> list
+    let result = []
+    let i = 0
+    while i < len(parts)
+        let g = _da_parse_group(parts[i])
+        if g < 0
+            return []
+        result.push(g)
+        i = i + 1
+    result
+
+// Count non-overlapping occurrences of sub in s.
+fn _da_count_str(s: string, sub: string) -> int
+    let count = 0
+    let pos = 0
+    let slen = len(s)
+    let sublen = len(sub)
+    while pos <= slen - sublen
+        let chunk = slice(s, pos, pos + sublen)
+        if chunk == sub
+            count = count + 1
+            pos = pos + sublen
+        else
+            pos = pos + 1
+    count
+
+// Parse an IPv6 string into a list of 8 ints (each 0..65535). Returns [] on error.
+fn _da_ip6_parse(s: string) -> list
+    if len(s) == 0
+        return []
+    if _da_count_str(s, ":::") > 0
+        return []
+    let dc = _da_count_str(s, "::")
+    if dc > 1
+        return []
+    if dc == 1
+        let dpos = find(s, "::")
+        let left_str = slice(s, 0, dpos)
+        let right_str = slice(s, dpos + 2, len(s))
+        let left_parts = _da_split_half(left_str)
+        let left_groups = _da_parse_half(left_parts)
+        if len(left_str) > 0 and len(left_groups) != len(left_parts)
+            return []
+        if len(left_str) > 0 and len(left_parts) == 0
+            return []
+        let right_parts = _da_split_half(right_str)
+        let right_groups = _da_parse_half(right_parts)
+        if len(right_str) > 0 and len(right_groups) != len(right_parts)
+            return []
+        if len(right_str) > 0 and len(right_parts) == 0
+            return []
+        let total = len(left_groups) + len(right_groups)
+        if total > 7
+            return []
+        let zeros_needed = 8 - total
+        let result = []
+        let i = 0
+        while i < len(left_groups)
+            result.push(left_groups[i])
+            i = i + 1
+        let z = 0
+        while z < zeros_needed
+            result.push(0)
+            z = z + 1
+        let j = 0
+        while j < len(right_groups)
+            result.push(right_groups[j])
+            j = j + 1
+        return result
+    if char_at(s, 0) == ":"
+        return []
+    if char_at(s, len(s) - 1) == ":"
+        return []
+    let parts = split(s, ":")
+    if len(parts) != 8
+        return []
+    let result = []
+    let i = 0
+    while i < 8
+        let g = _da_parse_group(parts[i])
+        if g < 0
+            return []
+        result.push(g)
+        i = i + 1
+    result
+
+// Zero-pad a string to exactly 4 characters by prepending "0"s.
+fn _da_pad4(s: string) -> string
+    let n = len(s)
+    if n >= 4
+        return s
+    if n == 3
+        return "0" + s
+    if n == 2
+        return "00" + s
+    if n == 1
+        return "000" + s
+    "0000"
+
+// Format a list of 8 ints as canonical IPv6 string (RFC 5952).
+// Compresses the first longest run of >=2 zero groups to "::".
+fn _da_ip6_format(groups: list) -> string
+    let bs = -1
+    let bl = 0
+    let cs = -1
+    let cl = 0
+    let i = 0
+    while i < 8
+        if groups[i] == 0
+            if cs < 0
+                cs = i
+                cl = 1
+            else
+                cl = cl + 1
+        else
+            if cl > bl
+                bs = cs
+                bl = cl
+            cs = -1
+            cl = 0
+        i = i + 1
+    if cl > bl
+        bs = cs
+        bl = cl
+    if bl < 2
+        bs = -1
+        bl = 0
+    if bs < 0
+        let out = ""
+        let k = 0
+        while k < 8
+            if k == 0
+                out = hex(groups[k])
+            else
+                out = out + ":" + hex(groups[k])
+            k = k + 1
+        return out
+    if bs == 0 and bl == 8
+        return "::"
+    let left = ""
+    let lk = 0
+    while lk < bs
+        if lk == 0
+            left = hex(groups[lk])
+        else
+            left = left + ":" + hex(groups[lk])
+        lk = lk + 1
+    let right = ""
+    let rk = bs + bl
+    let rfirst = true
+    while rk < 8
+        if rfirst
+            right = hex(groups[rk])
+            rfirst = false
+        else
+            right = right + ":" + hex(groups[rk])
+        rk = rk + 1
+    if bs == 0
+        return "::" + right
+    if bs + bl == 8
+        return left + "::"
+    left + "::" + right
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// dns_a_encode: dotted-quad IPv4 string -> 4 wire bytes (RFC 1035 §3.4.1).
+// Returns 4 zero bytes on any malformed input (never crashes).
+//
+// "1.2.3.4"       -> bytes [1, 2, 3, 4]
+// "192.168.0.255" -> bytes [192, 168, 0, 255]
+// "0.0.0.0"       -> bytes [0, 0, 0, 0]
+// "256.1.1.1"     -> bytes [0, 0, 0, 0]  (error → safe zero result)
+fn dns_a_encode(ip4: string) -> any
+    let out = bytes(4)
+    let parts = split(ip4, ".")
+    if len(parts) != 4
+        return out
+    let a = _da_parse_octet(parts[0])
+    let b = _da_parse_octet(parts[1])
+    let c = _da_parse_octet(parts[2])
+    let d = _da_parse_octet(parts[3])
+    if a < 0 or b < 0 or c < 0 or d < 0
+        return out
+    bytes_set(out, 0, a)
+    bytes_set(out, 1, b)
+    bytes_set(out, 2, c)
+    bytes_set(out, 3, d)
+    out
+
+// dns_a_decode: 4 wire bytes -> dotted-quad string.
+// Returns "" if bytes_len(b) != 4.
+//
+// bytes [1, 2, 3, 4]     -> "1.2.3.4"
+// bytes [192, 168, 0, 1] -> "192.168.0.1"
+fn dns_a_decode(b: any) -> string
+    if bytes_len(b) != 4
+        return ""
+    let a = bytes_get(b, 0)
+    let bv = bytes_get(b, 1)
+    let c = bytes_get(b, 2)
+    let d = bytes_get(b, 3)
+    str(a) + "." + str(bv) + "." + str(c) + "." + str(d)
+
+// dns_aaaa_encode: IPv6 string -> 16 wire bytes (RFC 3596 §2.2).
+// Handles "::" compression and full 8-group form.
+// Returns 16 zero bytes on any malformed input (never crashes).
+//
+// "::1"           -> [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1]
+// "2001:db8::1"   -> [0x20,0x01,0x0d,0xb8, 0,0,0,0, 0,0,0,0, 0,0,0,1]
+fn dns_aaaa_encode(ip6: string) -> any
+    let out = bytes(16)
+    let groups = _da_ip6_parse(ip6)
+    if len(groups) != 8
+        return out
+    let i = 0
+    while i < 8
+        let g = groups[i]
+        let hi = (g >> 8) & 0xFF
+        let lo = g & 0xFF
+        bytes_set(out, i * 2, hi)
+        bytes_set(out, i * 2 + 1, lo)
+        i = i + 1
+    out
+
+// dns_aaaa_decode: 16 wire bytes -> canonical IPv6 string (RFC 5952).
+// Returns "" if bytes_len(b) != 16.
+//
+// [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1] -> "::1"
+fn dns_aaaa_decode(b: any) -> string
+    if bytes_len(b) != 16
+        return ""
+    let groups = []
+    let i = 0
+    while i < 8
+        let hi = bytes_get(b, i * 2)
+        let lo = bytes_get(b, i * 2 + 1)
+        groups.push((hi * 256 + lo) & 0xFFFF)
+        i = i + 1
+    _da_ip6_format(groups)

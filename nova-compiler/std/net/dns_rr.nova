@@ -1,0 +1,199 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns_rr
+// ============================================================================
+// Generic DNS resource record encoder/decoder (RFC 1035).
+// Wire format: NAME + TYPE u16 + CLASS u16 + TTL u32 + RDLENGTH u16 + RDATA.
+// All multi-byte fields are big-endian.
+//
+// PUBLIC API:
+//   dns_rr_encode(name, rtype, rclass, ttl, rdata) -> bytes
+//     Encode a single DNS resource record to wire format.
+//     name    : string — dot-separated DNS name e.g. "example.com"
+//     rtype   : int    — RR type (A=1, NS=2, CNAME=5, ...)
+//     rclass  : int    — RR class (IN=1)
+//     ttl     : int    — time to live (u32, signed-64-bit in NOVA, masked to 32 bits)
+//     rdata   : bytes  — raw RDATA (RDLENGTH derived from bytes_len(rdata))
+//     Returns complete wire-format bytes for one RR.
+//
+//   dns_rr_decode(msg, pos) -> list
+//     Decode one DNS resource record from msg starting at byte offset pos.
+//     Returns a 2-element list: [dict, next_pos]
+//       dict keys: "name" (string), "type" (int), "class" (int),
+//                  "ttl" (int), "rdlength" (int), "rdata" (bytes)
+//       next_pos: int offset immediately after this RR in msg.
+//     On malformed input returns [{}, pos] (empty dict, original pos).
+//
+// NAME CODEC (private, inlined):
+//   _rr_name_encode(name) -> bytes
+//     Encodes a dot-label name to wire format (uncompressed).
+//     "example.com" -> \x07example\x03com\x00
+//     Empty label and root "." both produce a single 0x00 byte.
+//
+//   _rr_name_decode(msg, pos) -> list [name_str, next_pos]
+//     Decodes a possibly-compressed name from msg at pos.
+//     Follows pointer chains (capped at 128 hops to prevent loops).
+//     Returns ["", pos] on malformed input.
+//
+// GOTCHAS:
+//   * >> is arithmetic in NOVA; always mask results with & 0xFF / & 0xFFFF / & 0xFFFFFFFF.
+//   * TTL is a u32 on the wire; NOVA ints are signed 64-bit — mask with & 0xFFFFFFFF.
+//   * RDATA is bytes (binary-safe); never use strings for wire data.
+//
+// LEAF — imports NOTHING.
+
+// ── Private: name encoder ────────────────────────────────────────────────────
+
+// Encode a dot-separated name to DNS wire format (uncompressed).
+// Each label: 1 length byte (1..63) then that many ASCII bytes.
+// Terminated by 0x00. "example.com" -> 7 'example' 3 'com' 0.
+fn _rr_name_encode(name: string) -> bytes
+    let out = bytes(0)
+    // Handle empty name or bare "." (root)
+    if len(name) == 0 or name == "."
+        out = bytes_append(out, 0)
+        return out
+    // Split on dots manually: walk the string, emit each label
+    let start = 0
+    let i = 0
+    let n = len(name)
+    while i <= n
+        let at_end = i == n
+        let at_dot = 0
+        if i < n
+            if char_at(name, i) == "."
+                at_dot = 1
+        if at_end == 1 or at_dot == 1
+            let label_len = i - start
+            if label_len > 0 and label_len <= 63
+                out = bytes_append(out, label_len)
+                let j = start
+                while j < i
+                    out = bytes_append(out, ord(char_at(name, j)))
+                    j = j + 1
+            start = i + 1
+        i = i + 1
+    // terminating zero
+    out = bytes_append(out, 0)
+    return out
+
+// ── Private: name decoder ────────────────────────────────────────────────────
+
+// Decode a DNS name (possibly compressed) from msg starting at pos.
+// Returns a 2-element list: [name_string, next_pos_in_msg].
+// "next_pos" advances past only the bytes directly consumed at the top level
+// (pointer = 2 bytes; uncompressed = all label bytes + terminator).
+// Returns ["", pos] on any malformed/out-of-bounds input.
+fn _rr_name_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let result = ""
+    let cur = pos
+    let hops = 0
+    let advanced = 0   // 1 once we have our "next_pos" from the top-level stream
+    let next_pos = pos
+    while 1 == 1
+        if cur < 0 or cur >= mlen
+            return ["", pos]
+        let b0 = bytes_get(msg, cur)
+        // Compression pointer: top 2 bits = 11
+        if (b0 & 0xC0) == 0xC0
+            if cur + 1 >= mlen
+                return ["", pos]
+            let b1 = bytes_get(msg, cur + 1)
+            let offset = ((b0 & 0x3F) << 8) | b1
+            // Record next_pos as the byte after these 2 pointer bytes (top-level only)
+            if advanced == 0
+                next_pos = cur + 2
+                advanced = 1
+            cur = offset
+            hops = hops + 1
+            if hops > 128
+                return ["", pos]
+        else
+            // Label or terminator
+            let llen = b0 & 0x3F
+            if llen == 0
+                // Terminator
+                if advanced == 0
+                    next_pos = cur + 1
+                    advanced = 1
+                return [result, next_pos]
+            // Read label bytes
+            if cur + 1 + llen > mlen
+                return ["", pos]
+            if len(result) > 0
+                result = result + "."
+            let j = 0
+            while j < llen
+                result = result + char_at(bytes_to_str(bytes_slice(msg, cur + 1 + j, cur + 2 + j)), 0)
+                j = j + 1
+            cur = cur + 1 + llen
+    return ["", pos]
+
+// ── Private: label char extraction helper ───────────────────────────────────
+
+// Extract one ASCII character from a bytes buffer at position p.
+fn _rr_byte_char(msg: bytes, p: int) -> string
+    let v = bytes_get(msg, p)
+    return bytes_to_str(bytes_slice(msg, p, p + 1))
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// Encode one DNS resource record to wire format.
+fn dns_rr_encode(name: string, rtype: int, rclass: int, ttl: int, rdata: bytes) -> bytes
+    let out = bytes(0)
+    // NAME (uncompressed wire format)
+    let name_bytes = _rr_name_encode(name)
+    out = bytes_concat(out, name_bytes)
+    // TYPE (u16 big-endian)
+    out = bytes_append(out, (rtype >> 8) & 0xFF)
+    out = bytes_append(out, rtype & 0xFF)
+    // CLASS (u16 big-endian)
+    out = bytes_append(out, (rclass >> 8) & 0xFF)
+    out = bytes_append(out, rclass & 0xFF)
+    // TTL (u32 big-endian) — mask to 32 bits
+    let t = ttl & 0xFFFFFFFF
+    out = bytes_append(out, (t >> 24) & 0xFF)
+    out = bytes_append(out, (t >> 16) & 0xFF)
+    out = bytes_append(out, (t >> 8) & 0xFF)
+    out = bytes_append(out, t & 0xFF)
+    // RDLENGTH (u16 big-endian)
+    let rdlen = bytes_len(rdata)
+    out = bytes_append(out, (rdlen >> 8) & 0xFF)
+    out = bytes_append(out, rdlen & 0xFF)
+    // RDATA
+    out = bytes_concat(out, rdata)
+    return out
+
+// Decode one DNS resource record from msg at byte offset pos.
+// Returns a 2-element list: [dict, next_pos].
+// On malformed input: [{}, pos].
+fn dns_rr_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let empty = {}
+    // Decode NAME
+    let name_res = _rr_name_decode(msg, pos)
+    let rr_name = name_res[0]
+    let cur = name_res[1]
+    // Need at least 10 more bytes: TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
+    if cur + 10 > mlen
+        return [empty, pos]
+    // TYPE u16
+    let rtype = (bytes_get(msg, cur) << 8) | bytes_get(msg, cur + 1)
+    cur = cur + 2
+    // CLASS u16
+    let rclass = (bytes_get(msg, cur) << 8) | bytes_get(msg, cur + 1)
+    cur = cur + 2
+    // TTL u32 — combine 4 bytes, mask to avoid sign issues
+    let ttl = ((bytes_get(msg, cur) << 24) | (bytes_get(msg, cur + 1) << 16) | (bytes_get(msg, cur + 2) << 8) | bytes_get(msg, cur + 3)) & 0xFFFFFFFF
+    cur = cur + 4
+    // RDLENGTH u16
+    let rdlen = (bytes_get(msg, cur) << 8) | bytes_get(msg, cur + 1)
+    cur = cur + 2
+    // Bounds-check RDATA
+    if cur + rdlen > mlen
+        return [empty, pos]
+    // RDATA slice
+    let rdata = bytes_slice(msg, cur, cur + rdlen)
+    cur = cur + rdlen
+    let rec = {"name": rr_name, "type": rtype, "class": rclass, "ttl": ttl, "rdlength": rdlen, "rdata": rdata}
+    return [rec, cur]

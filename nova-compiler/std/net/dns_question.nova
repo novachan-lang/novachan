@@ -1,0 +1,164 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns_question
+// ============================================================================
+// DNS Question section codec (RFC 1035 §4.1.2).
+//
+// PUBLIC API:
+//   dns_question_encode(qname: string, qtype: int, qclass: int) -> bytes
+//     Encode one DNS Question record: QNAME labels + QTYPE u16 BE + QCLASS u16 BE.
+//     QNAME uses uncompressed wire format: each label = 1-byte length + ASCII bytes,
+//     terminated by a 0x00 byte.  An empty or root name encodes as just 0x00.
+//     Returns empty bytes on malformed input (label > 63 chars, empty interior label).
+//
+//   dns_question_decode(msg: bytes, pos: int) -> list [dict, next_pos]
+//     Decode one DNS Question record starting at byte offset pos inside msg.
+//     Returns a list of two elements:
+//       [0] dict{"name": string, "type": int, "class": int}
+//       [1] int  next byte offset after the question record
+//     On malformed input (out-of-bounds read, bad label length, pointer loop) returns
+//     [{"name":"","type":0,"class":0}, pos].
+//
+// DESIGN NOTES:
+//   * Pointer decompression (RFC 1035 §4.1.4): top 2 bits == 11 marks a pointer.
+//     Offset = ((b0 & 0x3F) << 8) | b1.  We follow pointers but cap hops at 128
+//     to prevent infinite-loop DoS on adversarial input.
+//   * We do NOT emit compression pointers (uncompressed is always valid per RFC 1035).
+//   * All private helpers are prefixed _dq_ to avoid symbol collisions when multiple
+//     std modules are compiled into the same binary.
+//   * LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private: name encoder ─────────────────────────────────────────────────────
+
+// Encode a dotted-label hostname to DNS wire format.
+// "example.com" -> \x07example\x03com\x00  (13 bytes)
+// Trailing dot is accepted and stripped ("example.com." is canonical).
+// Returns bytes(0) on error (empty interior label, label > 63 chars).
+fn _dq_name_encode(name: string) -> bytes
+    let out = bytes(0)
+    let n = len(name)
+    if n == 0 or name == "."
+        out = bytes_append(out, 0)
+        return out
+    // Strip optional trailing dot
+    let work = name
+    if char_at(name, n - 1) == "."
+        work = slice(name, 0, n - 1)
+    let parts = split(work, ".")
+    let pi = 0
+    while pi < len(parts)
+        let label = parts[pi]
+        let llen = len(label)
+        if llen == 0 or llen > 63
+            return bytes(0)
+        out = bytes_append(out, llen)
+        let ci = 0
+        while ci < llen
+            out = bytes_append(out, ord(char_at(label, ci)))
+            ci = ci + 1
+        pi = pi + 1
+    out = bytes_append(out, 0)
+    return out
+
+// ── Private: name decoder ─────────────────────────────────────────────────────
+
+// Maximum pointer-follow hops to guard against malformed / hostile input.
+let _dq_MAX_JUMPS = 128
+
+// Decode a DNS name starting at byte offset pos inside msg.
+// Follows RFC 1035 §4.1.4 compression pointers.
+// Returns [name_string, next_pos] where next_pos is the offset in the *original*
+// stream immediately after the name (past the 2 pointer bytes if a pointer was hit).
+// On any error returns ["", pos] where the returned pos equals the input pos —
+// callers distinguish error from a legitimate root name ("") by checking next_pos > pos.
+fn _dq_name_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let name = ""
+    let cur = pos
+    let jumped = false
+    let next_pos = pos
+    let jumps = 0
+    let done = false
+    while not done
+        if cur >= mlen
+            return ["", pos]
+        let b0 = bytes_get(msg, cur)
+        if (b0 & 0xC0) == 0xC0
+            // Compression pointer
+            if cur + 1 >= mlen
+                return ["", pos]
+            let b1 = bytes_get(msg, cur + 1)
+            if not jumped
+                next_pos = cur + 2
+            jumped = true
+            jumps = jumps + 1
+            if jumps > _dq_MAX_JUMPS
+                return ["", pos]
+            cur = ((b0 & 0x3F) << 8) | b1
+        else
+            let llen = b0 & 0xFF
+            if llen == 0
+                // Terminating zero label
+                cur = cur + 1
+                if not jumped
+                    next_pos = cur
+                done = true
+            else
+                if (b0 & 0xC0) != 0
+                    // Reserved: top bits 01 or 10 are not valid
+                    return ["", pos]
+                cur = cur + 1
+                if cur + llen > mlen
+                    return ["", pos]
+                // Build label string byte by byte using chr()
+                let label = ""
+                let li = 0
+                while li < llen
+                    label = label + chr(bytes_get(msg, cur + li))
+                    li = li + 1
+                if len(name) > 0
+                    name = name + "."
+                name = name + label
+                cur = cur + llen
+    return [name, next_pos]
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// Encode one DNS Question record to wire bytes.
+//   qname  — dotted name, e.g. "example.com" or "example.com."
+//   qtype  — QTYPE value (A=1, NS=2, CNAME=5, MX=15, AAAA=28, SRV=33, ANY=255)
+//   qclass — QCLASS value (IN=1, ANY=255)
+// Returns the wire bytes, or bytes(0) on encoding error.
+fn dns_question_encode(qname: string, qtype: int, qclass: int) -> bytes
+    let out = _dq_name_encode(qname)
+    if bytes_len(out) == 0
+        return bytes(0)
+    // QTYPE big-endian u16
+    out = bytes_append(out, (qtype >> 8) & 0xFF)
+    out = bytes_append(out, qtype & 0xFF)
+    // QCLASS big-endian u16
+    out = bytes_append(out, (qclass >> 8) & 0xFF)
+    out = bytes_append(out, qclass & 0xFF)
+    return out
+
+// Decode one DNS Question record from msg starting at byte offset pos.
+// Returns [dict{"name","type","class"}, next_pos].
+// On error returns [{"name":"","type":0,"class":0}, pos].
+fn dns_question_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let err_rec = {"name": "", "type": 0, "class": 0}
+    // Decode QNAME
+    let nr = _dq_name_decode(msg, pos)
+    let dname = nr[0]
+    let after_name = nr[1]
+    // Distinguish decode error (next_pos == pos AND name == "") from root zone decode
+    // Root zone: name == "" AND next_pos == pos + 1 (consumed the 0x00 byte)
+    if dname == "" and after_name == pos
+        return [err_rec, pos]
+    // Need 4 bytes for QTYPE + QCLASS
+    if after_name + 4 > mlen
+        return [err_rec, pos]
+    let qt = (bytes_get(msg, after_name) << 8) | bytes_get(msg, after_name + 1)
+    let qc = (bytes_get(msg, after_name + 2) << 8) | bytes_get(msg, after_name + 3)
+    let rec = {"name": dname, "type": qt, "class": qc}
+    return [rec, after_name + 4]

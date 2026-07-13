@@ -1,0 +1,187 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns_rdata_srv
+// ============================================================================
+// DNS SRV RDATA codec (RFC 2782).
+//
+// SRV RDATA wire format (all multi-byte fields big-endian):
+//   PRIORITY  u16  — 0..65535; lower = more preferred
+//   WEIGHT    u16  — 0..65535; relative weight among equal-priority targets
+//   PORT      u16  — TCP/UDP port for the service
+//   TARGET    name — DNS name (RFC 1035 uncompressed wire format)
+//
+// PUBLIC API:
+//   dns_srv_encode(priority, weight, port, target) -> bytes
+//     Encode SRV RDATA to wire bytes.
+//     priority, weight, port are integers clamped to 0..65535.
+//     target is a dot-separated domain name string.
+//     Returns the RDATA bytes (6 header bytes + encoded name).
+//
+//   dns_srv_decode(msg, pos) -> list
+//     Decode SRV RDATA from msg starting at byte offset pos.
+//     msg is a bytes value holding the full DNS message (for pointer resolution).
+//     Returns [dict{"priority","weight","port","target"}, next_pos].
+//     On any malformed input returns [dict{"priority":0,"weight":0,"port":0,"target":""}, pos].
+//
+// INLINE name codec (private, no sibling imports — Wave 1 rule):
+//   _srv_name_encode(name) -> bytes
+//   _srv_name_decode(msg, pos) -> [name_str, next_pos]
+//
+// KAT VECTORS:
+//   dns_srv_encode(10, 20, 5060, "sip.example.com")
+//     bytes[0..5] = 00 0A 00 14 13 C4  (priority=10, weight=20, port=5060=0x13C4)
+//     followed by encoded name bytes for "sip.example.com"
+//   Round-trip decode recovers priority=10, weight=20, port=5060, target="sip.example.com"
+//
+// DESIGN NOTES:
+//   - LEAF module — imports NOTHING.
+//   - All private helpers prefixed _srv_ to avoid symbol collisions.
+//   - All byte reads are bounds-checked (i < bytes_len).
+//   - On malformed input, decode returns safe zero/empty result rather than crashing.
+//   - BINARY wire data uses the bytes type exclusively (never string+chr for 0x00 bytes).
+// ============================================================================
+
+// ── Private: name encoder (RFC 1035 uncompressed wire format) ─────────────
+
+// _srv_name_encode: encode a dot-separated DNS name to wire bytes.
+// "sip.example.com" -> [3,'s','i','p', 7,'e','x','a','m','p','l','e', 3,'c','o','m', 0]
+// Empty name (root) -> [0].
+// Any label > 63 bytes -> returns bytes(0) (invalid label, safe empty result).
+fn _srv_name_encode(name: string) -> bytes
+    let out = bytes(0)
+    if len(name) == 0
+        out = bytes_append(out, 0)
+        return out
+    let parts = split(name, ".")
+    let i = 0
+    while i < len(parts)
+        let lbl = parts[i]
+        let n = len(lbl)
+        if n == 0 or n > 63
+            return bytes(0)
+        out = bytes_append(out, n)
+        let j = 0
+        while j < n
+            out = bytes_append(out, ord(char_at(lbl, j)))
+            j = j + 1
+        i = i + 1
+    out = bytes_append(out, 0)
+    out
+
+// _srv_name_decode: decode a DNS name from msg starting at byte offset pos.
+// Follows compression pointers (top 2 bits = 0b11).
+// Caps pointer-following at 128 jumps to prevent infinite loops.
+// Returns [name_string, next_pos].
+// On any error (out-of-bounds, bad label length, too many jumps) returns ["", pos].
+fn _srv_name_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let name = ""
+    let cur = pos
+    let jumps = 0
+    let jumped = false
+    let final_pos = pos
+    let done = false
+    while done == false
+        if cur >= mlen
+            return ["", pos]
+        let b0 = bytes_get(msg, cur)
+        if (b0 & 0xC0) == 0xC0
+            // Compression pointer
+            if cur + 1 >= mlen
+                return ["", pos]
+            let b1 = bytes_get(msg, cur + 1)
+            let offset = ((b0 & 0x3F) << 8) | b1
+            if jumped == false
+                final_pos = cur + 2
+            jumped = true
+            jumps = jumps + 1
+            if jumps > 128
+                return ["", pos]
+            cur = offset
+        else
+            let ln = b0 & 0xFF
+            if ln == 0
+                // Root / end of name
+                if jumped == false
+                    final_pos = cur + 1
+                done = true
+            else
+                if ln > 63
+                    return ["", pos]
+                if cur + 1 + ln > mlen
+                    return ["", pos]
+                let lend = cur + 1 + ln
+                let lbl = ""
+                let i = cur + 1
+                while i < lend
+                    lbl = lbl + chr(bytes_get(msg, i))
+                    i = i + 1
+                if len(name) == 0
+                    name = lbl
+                else
+                    name = name + "." + lbl
+                cur = lend
+    [name, final_pos]
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// dns_srv_encode: encode SRV RDATA to wire bytes (RFC 2782).
+//
+// Wire layout:
+//   bytes 0-1: PRIORITY (u16 big-endian)
+//   bytes 2-3: WEIGHT   (u16 big-endian)
+//   bytes 4-5: PORT     (u16 big-endian)
+//   bytes 6+:  TARGET   (DNS name, uncompressed wire format)
+//
+// priority, weight, port are masked to 0..65535 (& 0xFFFF).
+// target must be a dot-separated ASCII domain name string.
+//
+// Example:
+//   dns_srv_encode(10, 20, 5060, "sip.example.com")
+//   -> bytes [0x00,0x0A, 0x00,0x14, 0x13,0xC4, 3,'s','i','p', 7,'e',..., 3,'c','o','m', 0]
+fn dns_srv_encode(priority: int, weight: int, port: int, target: string) -> bytes
+    let out = bytes(0)
+    let prio = priority & 0xFFFF
+    let wt = weight & 0xFFFF
+    let pt = port & 0xFFFF
+    // PRIORITY
+    out = bytes_append(out, (prio >> 8) & 0xFF)
+    out = bytes_append(out, prio & 0xFF)
+    // WEIGHT
+    out = bytes_append(out, (wt >> 8) & 0xFF)
+    out = bytes_append(out, wt & 0xFF)
+    // PORT
+    out = bytes_append(out, (pt >> 8) & 0xFF)
+    out = bytes_append(out, pt & 0xFF)
+    // TARGET name
+    let name_bytes = _srv_name_encode(target)
+    out = bytes_concat(out, name_bytes)
+    out
+
+// dns_srv_decode: decode SRV RDATA from msg starting at byte offset pos.
+//
+// msg: the full DNS message bytes (needed for pointer resolution in TARGET name).
+// pos: byte offset into msg where the SRV RDATA begins.
+//
+// Returns a two-element list: [record_dict, next_pos]
+//   record_dict has keys: "priority", "weight", "port", "target"
+//   next_pos is the byte offset just past the decoded RDATA.
+//
+// On any malformed input returns:
+//   [{"priority":0, "weight":0, "port":0, "target":""}, pos]
+//
+// Example:
+//   dns_srv_decode(encoded_msg, 0) -> [{"priority":10,"weight":20,"port":5060,"target":"sip.example.com"}, 23]
+fn dns_srv_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let zero = {"priority": 0, "weight": 0, "port": 0, "target": ""}
+    // Need at least 6 bytes for priority + weight + port
+    if pos + 6 > mlen
+        return [zero, pos]
+    let priority = (bytes_get(msg, pos) << 8) | bytes_get(msg, pos + 1)
+    let weight = (bytes_get(msg, pos + 2) << 8) | bytes_get(msg, pos + 3)
+    let port = (bytes_get(msg, pos + 4) << 8) | bytes_get(msg, pos + 5)
+    let name_result = _srv_name_decode(msg, pos + 6)
+    let target = name_result[0]
+    let next_pos = name_result[1]
+    let rec = {"priority": priority, "weight": weight, "port": port, "target": target}
+    [rec, next_pos]

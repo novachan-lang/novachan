@@ -1,0 +1,251 @@
+// KAT for std/net/dns_query — high-level DNS query/response helpers with EDNS0.
+//
+// Vector (a): dns_build_query("example.com", 1, 0x1234) -> exact byte check
+//   Total = 40 bytes:
+//     Header  [0..11]:  id=0x1234, flags=0x0100(RD=1), qdcount=1, ancount=0, nscount=0, arcount=1
+//     Question [12..28]: \x07example\x03com\x00 (13 bytes) + type=1 u16 + class=1 u16 (4 bytes)
+//     OPT RR  [29..39]: 0x00 (root) + type=41 u16 + class=4096 u16 + ttl=0 u32 + rdlen=0 u16
+//
+// Vector (b): Decode the query bytes -> verify header and question fields via
+//             the inline helpers exposed through dns_parse_response (using a response).
+//
+// Vector (c): Round-trip via dns_parse_response on a hand-built minimal DNS response:
+//   Response = header(id=0xABCD,QR=1,RD=1,RA=1,qdcount=1,ancount=1,arcount=0)
+//            + question(example.com/A/IN)
+//            + answer(example.com, A=1, IN=1, TTL=300, rdata=[1,2,3,4])
+//   -> dns_parse_response(resp) => {id=0xABCD, rcode=0, answers=[{type=1,...}]}
+//
+import std/net/dns_query
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL dns_query " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL dns_query " + label + ": got='" + got + "' want='" + want + "'")
+        exit(1)
+
+fn main()
+    // =========================================================================
+    // Vector (a): exact byte-level check of dns_build_query("example.com",1,0x1234)
+    // =========================================================================
+    let qb = dns_build_query("example.com", 1, 0x1234)
+    // Total wire length = 12 (header) + 13 (name) + 4 (type+class) + 11 (OPT RR) = 40
+    cki("build_len", bytes_len(qb), 40)
+
+    // --- Header bytes ---
+    // ID = 0x1234
+    cki("hdr_id_hi",  bytes_get(qb,  0), 0x12)
+    cki("hdr_id_lo",  bytes_get(qb,  1), 0x34)
+    // FLAGS = 0x0100 (RD=1)
+    cki("hdr_fl_hi",  bytes_get(qb,  2), 0x01)
+    cki("hdr_fl_lo",  bytes_get(qb,  3), 0x00)
+    // QDCOUNT = 1
+    cki("hdr_qd_hi",  bytes_get(qb,  4), 0x00)
+    cki("hdr_qd_lo",  bytes_get(qb,  5), 0x01)
+    // ANCOUNT = 0
+    cki("hdr_an_hi",  bytes_get(qb,  6), 0x00)
+    cki("hdr_an_lo",  bytes_get(qb,  7), 0x00)
+    // NSCOUNT = 0
+    cki("hdr_ns_hi",  bytes_get(qb,  8), 0x00)
+    cki("hdr_ns_lo",  bytes_get(qb,  9), 0x00)
+    // ARCOUNT = 1
+    cki("hdr_ar_hi",  bytes_get(qb, 10), 0x00)
+    cki("hdr_ar_lo",  bytes_get(qb, 11), 0x01)
+
+    // --- Question NAME: \x07example\x03com\x00 ---
+    cki("qname_b0",   bytes_get(qb, 12), 7)     // len("example")
+    cki("qname_b1",   bytes_get(qb, 13), 101)   // 'e'
+    cki("qname_b2",   bytes_get(qb, 14), 120)   // 'x'
+    cki("qname_b3",   bytes_get(qb, 15), 97)    // 'a'
+    cki("qname_b4",   bytes_get(qb, 16), 109)   // 'm'
+    cki("qname_b5",   bytes_get(qb, 17), 112)   // 'p'
+    cki("qname_b6",   bytes_get(qb, 18), 108)   // 'l'
+    cki("qname_b7",   bytes_get(qb, 19), 101)   // 'e'
+    cki("qname_b8",   bytes_get(qb, 20), 3)     // len("com")
+    cki("qname_b9",   bytes_get(qb, 21), 99)    // 'c'
+    cki("qname_b10",  bytes_get(qb, 22), 111)   // 'o'
+    cki("qname_b11",  bytes_get(qb, 23), 109)   // 'm'
+    cki("qname_b12",  bytes_get(qb, 24), 0)     // terminator
+
+    // --- Question TYPE = A = 1, CLASS = IN = 1 ---
+    cki("qtype_hi",   bytes_get(qb, 25), 0x00)
+    cki("qtype_lo",   bytes_get(qb, 26), 0x01)
+    cki("qclass_hi",  bytes_get(qb, 27), 0x00)
+    cki("qclass_lo",  bytes_get(qb, 28), 0x01)
+
+    // --- OPT RR: root name 0x00, TYPE=41 u16, CLASS=4096 u16, TTL=0 u32, RDLEN=0 u16 ---
+    cki("opt_name",     bytes_get(qb, 29), 0x00)     // root name
+    cki("opt_type_hi",  bytes_get(qb, 30), 0x00)
+    cki("opt_type_lo",  bytes_get(qb, 31), 41)       // TYPE=OPT=41
+    // CLASS = 4096 = 0x1000
+    cki("opt_cls_hi",   bytes_get(qb, 32), 0x10)
+    cki("opt_cls_lo",   bytes_get(qb, 33), 0x00)
+    // TTL = 0 (extended RCODE and flags, all zero)
+    cki("opt_ttl_b0",   bytes_get(qb, 34), 0x00)
+    cki("opt_ttl_b1",   bytes_get(qb, 35), 0x00)
+    cki("opt_ttl_b2",   bytes_get(qb, 36), 0x00)
+    cki("opt_ttl_b3",   bytes_get(qb, 37), 0x00)
+    // RDLENGTH = 0
+    cki("opt_rdlen_hi", bytes_get(qb, 38), 0x00)
+    cki("opt_rdlen_lo", bytes_get(qb, 39), 0x00)
+
+    // =========================================================================
+    // Vector (b): verify query header fields extracted via u16 reads
+    // =========================================================================
+    let hdr_id     = (bytes_get(qb, 0) << 8) | bytes_get(qb, 1)
+    let hdr_flags  = (bytes_get(qb, 2) << 8) | bytes_get(qb, 3)
+    let hdr_qd     = (bytes_get(qb, 4) << 8) | bytes_get(qb, 5)
+    let hdr_ar     = (bytes_get(qb, 10) << 8) | bytes_get(qb, 11)
+    let hdr_rd     = (hdr_flags >> 8) & 1
+    let opt_type_u16 = (bytes_get(qb, 30) << 8) | bytes_get(qb, 31)
+    cki("q_id",       hdr_id, 0x1234)
+    cki("q_rd",       hdr_rd, 1)
+    cki("q_qdcount",  hdr_qd, 1)
+    cki("q_arcount",  hdr_ar, 1)
+    cki("q_opt_type", opt_type_u16, 41)
+
+    // =========================================================================
+    // Vector (c): Round-trip dns_parse_response on a hand-built DNS response
+    //
+    // Build a minimal DNS response:
+    //   Header: id=0xABCD, QR=1, RD=1, RA=1, qdcount=1, ancount=1, arcount=0
+    //     flags = (1<<15)|(1<<8)|(1<<7) = 0x8180
+    //   Question: example.com / A=1 / IN=1  (17 bytes)
+    //   Answer:   example.com / A=1 / IN=1 / TTL=300 / rdata=[1,2,3,4]
+    //     name: 13 bytes + type(2)+class(2)+ttl(4)+rdlen(2)+rdata(4) = 27 bytes
+    // =========================================================================
+
+    // --- Build response header ---
+    let resp = bytes(0)
+    // ID = 0xABCD
+    resp = bytes_append(resp, 0xAB)
+    resp = bytes_append(resp, 0xCD)
+    // FLAGS = 0x8180 (QR=1, RD=1, RA=1)
+    resp = bytes_append(resp, 0x81)
+    resp = bytes_append(resp, 0x80)
+    // QDCOUNT = 1
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // ANCOUNT = 1
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // NSCOUNT = 0
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x00)
+    // ARCOUNT = 0
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x00)
+
+    // --- Question: example.com / A / IN ---
+    // QNAME \x07example\x03com\x00
+    resp = bytes_append(resp, 7)
+    resp = bytes_append(resp, 101)
+    resp = bytes_append(resp, 120)
+    resp = bytes_append(resp, 97)
+    resp = bytes_append(resp, 109)
+    resp = bytes_append(resp, 112)
+    resp = bytes_append(resp, 108)
+    resp = bytes_append(resp, 101)
+    resp = bytes_append(resp, 3)
+    resp = bytes_append(resp, 99)
+    resp = bytes_append(resp, 111)
+    resp = bytes_append(resp, 109)
+    resp = bytes_append(resp, 0)
+    // QTYPE = 1 (A)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // QCLASS = 1 (IN)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+
+    // --- Answer RR: example.com A IN TTL=300 rdata=[1,2,3,4] ---
+    // NAME \x07example\x03com\x00 (same as question, uncompressed)
+    resp = bytes_append(resp, 7)
+    resp = bytes_append(resp, 101)
+    resp = bytes_append(resp, 120)
+    resp = bytes_append(resp, 97)
+    resp = bytes_append(resp, 109)
+    resp = bytes_append(resp, 112)
+    resp = bytes_append(resp, 108)
+    resp = bytes_append(resp, 101)
+    resp = bytes_append(resp, 3)
+    resp = bytes_append(resp, 99)
+    resp = bytes_append(resp, 111)
+    resp = bytes_append(resp, 109)
+    resp = bytes_append(resp, 0)
+    // TYPE = 1 (A)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // CLASS = 1 (IN)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // TTL = 300 = 0x0000012C
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    resp = bytes_append(resp, 0x2C)
+    // RDLENGTH = 4
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x04)
+    // RDATA = [1, 2, 3, 4] (IPv4: 0.0.0.0 placeholder)
+    resp = bytes_append(resp, 1)
+    resp = bytes_append(resp, 2)
+    resp = bytes_append(resp, 3)
+    resp = bytes_append(resp, 4)
+
+    // Expected total: 12 + 17 + 27 = 56 bytes
+    cki("resp_len", bytes_len(resp), 56)
+
+    // --- Parse the response ---
+    let parsed = dns_parse_response(resp)
+
+    cki("resp_id",    parsed["id"],    0xABCD)
+    cki("resp_rcode", parsed["rcode"], 0)
+
+    let ans = parsed["answers"]
+    cki("ans_count", len(ans), 1)
+
+    let a0 = ans[0]
+    cki("a0_type",     a0["type"],     1)
+    cki("a0_class",    a0["class"],    1)
+    cki("a0_ttl",      a0["ttl"],      300)
+    cki("a0_rdlength", a0["rdlength"], 4)
+    cks("a0_name",     a0["name"],     "example.com")
+
+    // Verify rdata bytes
+    let rd = a0["rdata"]
+    cki("a0_rd_len", bytes_len(rd), 4)
+    cki("a0_rd_0",   bytes_get(rd, 0), 1)
+    cki("a0_rd_1",   bytes_get(rd, 1), 2)
+    cki("a0_rd_2",   bytes_get(rd, 2), 3)
+    cki("a0_rd_3",   bytes_get(rd, 3), 4)
+
+    // --- Also test dns_answers shorthand ---
+    let ans2 = dns_answers(resp)
+    cki("dns_answers_len", len(ans2), 1)
+    let a1 = ans2[0]
+    cki("dns_answers_a0_type", a1["type"], 1)
+
+    // =========================================================================
+    // Vector (d): malformed input safety
+    // =========================================================================
+    // Empty bytes -> returns safe default
+    let safe1 = dns_parse_response(bytes(0))
+    cki("malformed_id",    safe1["id"],    0)
+    cki("malformed_rcode", safe1["rcode"], 0)
+    let safe_ans = safe1["answers"]
+    cki("malformed_ans_len", len(safe_ans), 0)
+
+    // Only 6 bytes (too short for 12-byte header) -> safe default
+    let short_buf = bytes(6)
+    let safe2 = dns_parse_response(short_buf)
+    cki("short_id", safe2["id"], 0)
+
+    // dns_build_query with invalid label (empty label via "a..b") -> returns bytes(0)
+    let bad_q = dns_build_query("a..b", 1, 1)
+    cki("bad_query_len", bytes_len(bad_q), 0)
+
+    print("PASS _dns_query_test")

@@ -1,0 +1,180 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns_rdata_mx
+// ============================================================================
+// DNS RDATA codec for MX (preference + exchange name) and single-name types:
+// NS (type 2), CNAME (type 5), PTR (type 12). RFC 1035 §3.3.
+//
+// PUBLIC API:
+//   dns_mx_encode(pref: int, exchange: string) -> bytes
+//     Encode an MX rdata: u16 preference (big-endian) + uncompressed NAME.
+//     dns_mx_encode(10, "mail.example.com")
+//       -> [0x00, 0x0A, 4,'m','a','i','l', 7,'e',..., 3,'c','o','m', 0]
+//     Returns empty bytes on any invalid input (label >63 chars, etc.).
+//
+//   dns_mx_decode(msg: bytes, pos: int, rdlength: int) -> list
+//     Decode MX rdata starting at msg[pos] for rdlength bytes.
+//     Returns [{"pref": <int>, "exchange": <string>}, next_pos].
+//     Follows compression pointers in msg. On malformed input returns
+//     [{"pref": 0, "exchange": ""}, pos].
+//
+//   dns_name_rdata_encode(name: string) -> bytes
+//     Encode a single NAME rdata (NS/CNAME/PTR): uncompressed wire NAME.
+//     dns_name_rdata_encode("ns1.example.com")
+//       -> [3,'n','s','1', 7,'e',..., 3,'c','o','m', 0]
+//     Returns empty bytes on any invalid input.
+//
+//   dns_name_rdata_decode(msg: bytes, pos: int) -> list
+//     Decode a single NAME rdata from msg[pos].
+//     Returns [name_string, next_pos].
+//     Follows compression pointers. On malformed input returns ["", pos].
+//
+// DESIGN NOTES:
+//   - LEAF module — imports NOTHING (Wave 1 self-contained).
+//   - Inline private name codec: _mx_name_encode / _mx_name_decode.
+//   - Private helpers prefixed _mx_ to avoid symbol collisions.
+//   - All byte-reads are bounds-checked (i < bytes_len(buf)).
+//   - BINARY wire data uses the bytes type exclusively.
+//   - On any parse/encode error: safe empty/zero result, never crash.
+//
+// KAT vectors:
+//   dns_mx_encode(10, "mail.example.com")
+//     -> bytes_len == 20; byte[0]==0, byte[1]==10
+//   dns_mx_decode round-trip: pref==10, exchange=="mail.example.com"
+//   dns_name_rdata_encode("ns1.example.com") -> bytes_len == 17
+//   dns_name_rdata_decode round-trip: "ns1.example.com"
+// ============================================================================
+
+// ── Private: inline name encoder ─────────────────────────────────────────────
+
+// Encode a dot-separated domain name to uncompressed DNS wire format.
+// Returns empty bytes on any invalid label (empty, or >63 chars).
+// Empty name string -> single 0x00 (root).
+fn _mx_name_encode(name: string) -> bytes
+    let out = bytes(0)
+    if len(name) == 0
+        out = bytes_append(out, 0)
+        return out
+    let parts = split(name, ".")
+    let i = 0
+    while i < len(parts)
+        let lbl = parts[i]
+        let n = len(lbl)
+        if n == 0 or n > 63
+            return bytes(0)
+        out = bytes_append(out, n)
+        let j = 0
+        while j < n
+            out = bytes_append(out, ord(char_at(lbl, j)))
+            j = j + 1
+        i = i + 1
+    out = bytes_append(out, 0)
+    out
+
+// ── Private: inline name decoder ─────────────────────────────────────────────
+
+// Decode a DNS name from msg starting at byte offset pos.
+// Returns [name_string, next_pos].
+// Follows compression pointers (top 2 bits == 0b11); caps at 128 jumps.
+// On any malformed input returns ["", pos].
+fn _mx_name_decode(msg: bytes, pos: int) -> list
+    let mlen = bytes_len(msg)
+    let name = ""
+    let cur = pos
+    let jumps = 0
+    let jumped = false
+    let final_pos = pos
+    while true
+        if cur >= mlen
+            return ["", pos]
+        let b0 = bytes_get(msg, cur)
+        if (b0 & 0xC0) == 0xC0
+            if cur + 1 >= mlen
+                return ["", pos]
+            let b1 = bytes_get(msg, cur + 1)
+            let offset = ((b0 & 0x3F) << 8) | b1
+            if jumped == false
+                final_pos = cur + 2
+            jumped = true
+            jumps = jumps + 1
+            if jumps > 128
+                return ["", pos]
+            cur = offset
+        else
+            let ln = b0 & 0xFF
+            if ln == 0
+                if jumped == false
+                    final_pos = cur + 1
+                return [name, final_pos]
+            if ln > 63
+                return ["", pos]
+            if cur + 1 + ln > mlen
+                return ["", pos]
+            let lend = cur + 1 + ln
+            let lbl = ""
+            let i = cur + 1
+            while i < lend
+                lbl = lbl + chr(bytes_get(msg, i))
+                i = i + 1
+            if len(name) == 0
+                name = lbl
+            else
+                name = name + "." + lbl
+            cur = lend
+    ["", pos]
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// dns_mx_encode: encode MX rdata (RFC 1035 §3.3.9).
+// Wire format: u16 preference (big-endian) + uncompressed EXCHANGE name.
+//
+// dns_mx_encode(10, "mail.example.com")
+//   -> [0x00, 0x0A, 4, 'm', 'a', 'i', 'l', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+//        3, 'c', 'o', 'm', 0]   (20 bytes total)
+// Returns empty bytes on invalid name input.
+fn dns_mx_encode(pref: int, exchange: string) -> bytes
+    let out = bytes(0)
+    out = bytes_append(out, (pref >> 8) & 0xFF)
+    out = bytes_append(out, pref & 0xFF)
+    let name_bytes = _mx_name_encode(exchange)
+    if bytes_len(name_bytes) == 0 and len(exchange) > 0
+        return bytes(0)
+    out = bytes_concat(out, name_bytes)
+    out
+
+// dns_mx_decode: decode MX rdata from msg[pos] spanning rdlength bytes.
+// Returns [{"pref": <int>, "exchange": <string>}, next_pos].
+// Follows compression pointers within msg. On malformed input:
+//   [{"pref": 0, "exchange": ""}, pos].
+fn dns_mx_decode(msg: bytes, pos: int, rdlength: int) -> list
+    let mlen = bytes_len(msg)
+    let empty = {"pref": 0, "exchange": ""}
+    if rdlength < 3
+        return [empty, pos]
+    if pos + rdlength > mlen
+        return [empty, pos]
+    if pos + 1 >= mlen
+        return [empty, pos]
+    let hi = bytes_get(msg, pos)
+    let lo = bytes_get(msg, pos + 1)
+    let pref = (hi << 8) | lo
+    let name_pos = pos + 2
+    let nd = _mx_name_decode(msg, name_pos)
+    let exchange = nd[0]
+    let next_pos = nd[1]
+    let rec = {"pref": pref, "exchange": exchange}
+    [rec, next_pos]
+
+// dns_name_rdata_encode: encode a single-name rdata (NS/CNAME/PTR).
+// Wire format: uncompressed NAME only (no other fields).
+//
+// dns_name_rdata_encode("ns1.example.com")
+//   -> [3,'n','s','1', 7,'e','x','a','m','p','l','e', 3,'c','o','m', 0]  (17 bytes)
+// Returns empty bytes on invalid name input.
+fn dns_name_rdata_encode(name: string) -> bytes
+    _mx_name_encode(name)
+
+// dns_name_rdata_decode: decode a single-name rdata from msg[pos].
+// Returns [name_string, next_pos].
+// Follows compression pointers. On malformed input returns ["", pos].
+fn dns_name_rdata_decode(msg: bytes, pos: int) -> list
+    _mx_name_decode(msg, pos)
