@@ -4710,6 +4710,17 @@ int64_t nova_rt_type_of(int64_t val) {
         case NOVA_MEM_STRUCT:   return (int64_t)(uintptr_t)"struct";
         case NOVA_MEM_ITER:     return (int64_t)(uintptr_t)"iter";
         case NOVA_MEM_BYTES:    return (int64_t)(uintptr_t)"bytes";  /* consistent with nova_rt_type_name */
+        case NOVA_MEM_BOX: {
+            /* Any-boxed scalar (float/bool/null widened to Any and read back from a dict/list/
+               any-slot). The box carries its kind, so return the TRUE type instead of "int" —
+               raw i64 slots are indistinguishable, but a boxed value is not. This completes the
+               compile-time type_of fold (which handles statically-typed values). */
+            NovaBox* bx = (NovaBox*)ptr;
+            if (bx->kind == NOVA_BOX_FLOAT) return (int64_t)(uintptr_t)"float";
+            if (bx->kind == NOVA_BOX_BOOL)  return (int64_t)(uintptr_t)"bool";
+            if (bx->kind == NOVA_BOX_NULL)  return (int64_t)(uintptr_t)"null";
+            return (int64_t)(uintptr_t)"int";
+        }
         default:
             if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr))
                 return (int64_t)(uintptr_t)"string";
