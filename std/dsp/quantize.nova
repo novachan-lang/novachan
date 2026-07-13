@@ -1,0 +1,180 @@
+// std/dsp/quantize.nova -- Quantization and companding utilities. LEAF -- imports NOTHING.
+//
+// All list-based functions consume float lists and produce new float lists.
+// Signals are represented as float lists.
+//
+// Public API (prefix qz_)
+//   qz_uniform(xs, levels, lo, hi) -> list   Quantize each value to nearest
+//                                             of 'levels' evenly-spaced levels
+//                                             in [lo, hi].
+//   qz_round_to(xs, step)          -> list   Round each element to the nearest
+//                                             integer multiple of step.
+//   qz_mu_law_encode(x, mu)        -> float  Mu-law compander encode; x in [-1,1].
+//   qz_mu_law_decode(y, mu)        -> float  Mu-law compander decode.
+//   qz_snr(original, quantized)    -> float  Signal-to-noise ratio in dB.
+//
+// FLOAT HAZARDS obeyed throughout:
+//   - List element reads are 'any'; multiply by 1.0 to force float before math.
+//   - abs(float) returns int in NOVA; use if/else for float absolute value.
+//   - Integer division truncates; always use float denominators.
+//   - Float vs int compare is UNSOUND; coerce with *1.0.
+//   - Bind sqrt/log/pow results and composite float exprs to named lets.
+//   - NO single-line if; always use block body.
+
+// _qz_fabs -- float absolute value (abs(float) returns int in NOVA).
+fn _qz_fabs(x: float) -> float
+    if x < 0.0
+        let r = 0.0 - x
+        return r
+    x
+
+// _qz_fround -- round a float to the nearest integer value (as float).
+// int(x + 0.5) gives round-half-up for positive; adequate for quantization.
+fn _qz_fround(x: float) -> float
+    let shifted = x + 0.5
+    let iv = int(shifted)
+    let result = iv * 1.0
+    result
+
+// qz_uniform -- Uniform scalar quantization.
+// Quantizes each element of xs to the nearest of 'levels' evenly-spaced
+// reconstruction levels within [lo, hi].
+//
+// The 'levels' reconstruction points are:
+//   L[k] = lo + k * (hi - lo) / (levels - 1)   for k = 0, 1, ..., levels-1
+//
+// When levels == 1, every input maps to lo.
+// The input is clamped to [lo, hi] before finding the nearest level.
+fn qz_uniform(xs: list, levels: int, lo: float, hi: float) -> list
+    let result = []
+    let n = len(xs)
+    if n == 0
+        return result
+    if levels <= 1
+        let i = 0
+        while i < n
+            result.push(lo)
+            i = i + 1
+        return result
+    let lf = levels * 1.0
+    let span = hi - lo
+    let step = span / (lf - 1.0)
+    let i = 0
+    while i < n
+        let v = xs[i] * 1.0
+        // Clamp to [lo, hi]
+        if v < lo
+            v = lo
+        if v > hi
+            v = hi
+        // Find nearest level index: (v - lo) / step, round to nearest int
+        let raw = (v - lo) / step
+        let iv = int(raw + 0.5)
+        // Clamp index to [0, levels-1]
+        if iv < 0
+            iv = 0
+        if iv > levels - 1
+            iv = levels - 1
+        let ivf = iv * 1.0
+        let quantized = lo + ivf * step
+        result.push(quantized)
+        i = i + 1
+    result
+
+// qz_round_to -- Round each element to the nearest multiple of step.
+// output[i] = round(xs[i] / step) * step
+// If step <= 0, the input list is returned unchanged (copy).
+fn qz_round_to(xs: list, step: float) -> list
+    let result = []
+    let n = len(xs)
+    if n == 0
+        return result
+    let eps = 0.000001
+    let abs_step = step
+    if step < 0.0
+        abs_step = 0.0 - step
+    if abs_step < eps
+        // step too small, copy input unchanged
+        let i = 0
+        while i < n
+            let v = xs[i] * 1.0
+            result.push(v)
+            i = i + 1
+        return result
+    let i = 0
+    while i < n
+        let v = xs[i] * 1.0
+        let raw = v / step
+        let iv = int(raw + 0.5)
+        let ivf = iv * 1.0
+        let quantized = ivf * step
+        result.push(quantized)
+        i = i + 1
+    result
+
+// qz_mu_law_encode -- Mu-law compander encode.
+// Standard ITU G.711 mu-law compression formula:
+//   y = sign(x) * log(1 + mu * |x|) / log(1 + mu)
+// x must be in [-1.0, 1.0]; mu is typically 255.0 (North American standard).
+// Returns 0.0 for x == 0.0.
+fn qz_mu_law_encode(x: float, mu: float) -> float
+    let ax = _qz_fabs(x)
+    let mu1 = 1.0 + mu
+    let denom = log(mu1)
+    let numer = log(1.0 + mu * ax)
+    let mag = numer / denom
+    // Apply sign of x
+    if x < 0.0
+        let r = 0.0 - mag
+        return r
+    mag
+
+// qz_mu_law_decode -- Mu-law compander decode (inverse of qz_mu_law_encode).
+// Standard ITU G.711 mu-law expansion formula:
+//   x = sign(y) * (1/mu) * ((1 + mu)^|y| - 1)
+// y must be in [-1.0, 1.0]; mu must match the encoding mu.
+fn qz_mu_law_decode(y: float, mu: float) -> float
+    let ay = _qz_fabs(y)
+    let mu1 = 1.0 + mu
+    let p = pow(mu1, ay)
+    let mag = (p - 1.0) / mu
+    // Apply sign of y
+    if y < 0.0
+        let r = 0.0 - mag
+        return r
+    mag
+
+// qz_snr -- Signal-to-noise ratio of quantization in dB.
+// SNR = 10 * log10(signal_power / noise_power)
+// signal_power = mean(original[i]^2)
+// noise_power  = mean((original[i] - quantized[i])^2)
+// Returns 999.0 (very large) when noise power == 0 (perfect quantization).
+// Returns 0.0 for empty lists.
+fn qz_snr(original: list, quantized: list) -> float
+    let n = len(original)
+    if n == 0
+        let z = 0.0
+        return z
+    let sig_pow = 0.0
+    let noise_pow = 0.0
+    let i = 0
+    while i < n
+        let ov = original[i] * 1.0
+        let qv = quantized[i] * 1.0
+        let err = ov - qv
+        sig_pow = sig_pow + ov * ov
+        noise_pow = noise_pow + err * err
+        i = i + 1
+    let nf = n * 1.0
+    let sp = sig_pow / nf
+    let np = noise_pow / nf
+    // Avoid log(0): if noise is zero, SNR is infinite -> return large sentinel
+    let tiny = 0.000000001
+    if np < tiny
+        let big = 999.0
+        return big
+    // log10(x) = log(x) / log(10)
+    let log10 = log(10.0)
+    let ratio = sp / np
+    let snr_val = 10.0 * log(ratio) / log10
+    snr_val
