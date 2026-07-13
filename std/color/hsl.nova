@@ -1,0 +1,250 @@
+// std/color/hsl.nova — RGB <-> HSL color space conversions.
+//
+// FLOAT HAZARDS obeyed throughout:
+//   * bare multi-term float return -> every intermediate bound to a named let.
+//   * abs(float) returns int -> use (if x<0.0 then 0.0-x else x) for float abs.
+//   * '/' two ints = INTEGER division -> floats used for all real division.
+//   * float-vs-int compare unsound -> coerce *1.0 where needed.
+//   * Single-exit pattern on every fn to avoid uninit-slot Heisenbug.
+//   * NO multi-line list literals; build lists with push.
+//
+// Colors are [r, g, b] int lists (channels 0..255).
+// HSL is returned / accepted as [h, s, l] int lists:
+//   h in [0..360], s in [0..100], l in [0..100].
+//
+// API:
+//   hsl_from_rgb(c)          -> list [h, s, l]  RGB->HSL  (ints, rounded)
+//   hsl_to_rgb(h, s, l)      -> list [r, g, b]  HSL->RGB  (ints, rounded)
+//   hsl_rotate_hue(c, deg)   -> list [r, g, b]  rotate hue of an RGB colour
+
+// ── internal helpers ──────────────────────────────────────────────────────────
+
+// Clamp int to [0, 255]
+fn _hsl_clamp255(v: int) -> int
+    let result = v
+    if v < 0
+        result = 0
+    if v > 255
+        result = 255
+    result
+
+// Float abs
+fn _hsl_fabs(x: float) -> float
+    let result = x
+    if x < 0.0
+        result = 0.0 - x
+    result
+
+// Float modulo: a mod m, result in [0, m).  Works for positive m.
+fn _hsl_fmod(a: float, m: float) -> float
+    let q = a / m
+    let qi = float_to_int(q)
+    let qf = qi * 1.0
+    let sub = qf * m
+    let rem = a - sub
+    let result = rem
+    if rem < 0.0
+        let adj = rem + m
+        result = adj
+    result
+
+// Round a float to the nearest int (non-negative inputs).
+fn _hsl_round(x: float) -> int
+    let r = float_to_int(x + 0.5)
+    r
+
+// ── hsl_from_rgb ─────────────────────────────────────────────────────────────
+// Convert [r,g,b] (0..255 ints) -> [h,s,l] (h 0..360, s/l 0..100, rounded).
+fn hsl_from_rgb(c: list) -> list
+    let ri = c[0]
+    let gi = c[1]
+    let bi = c[2]
+    // Normalize to [0.0, 1.0]
+    let rf = ri * 1.0
+    let gf = gi * 1.0
+    let bf = bi * 1.0
+    let r = rf / 255.0
+    let g = gf / 255.0
+    let b = bf / 255.0
+
+    // Max and min of channels
+    let cmax = r
+    if g > cmax
+        cmax = g
+    if b > cmax
+        cmax = b
+    let cmin = r
+    if g < cmin
+        cmin = g
+    if b < cmin
+        cmin = b
+
+    let delta = cmax - cmin
+
+    // Lightness
+    let lf = (cmax + cmin) / 2.0
+
+    // Saturation
+    let sf = 0.0
+    let denom = _hsl_fabs(2.0 * lf - 1.0)
+    let one_minus = 1.0 - denom
+    if delta > 0.0001
+        let s_raw = delta / one_minus
+        sf = s_raw
+
+    // Hue (raw float, degrees)
+    let hf = 0.0
+    if delta > 0.0001
+        // Determine which channel is max — compare with epsilon 0.0001
+        let diff_rc = cmax - r
+        let diff_gc = cmax - g
+        let diff_bc = cmax - b
+        let abs_diff_rc = _hsl_fabs(diff_rc)
+        let abs_diff_gc = _hsl_fabs(diff_gc)
+        let abs_diff_bc = _hsl_fabs(diff_bc)
+        if abs_diff_rc < 0.0001
+            // Red is max: h = 60 * ((g - b) / delta mod 6)
+            let seg = (g - b) / delta
+            let seg_mod = _hsl_fmod(seg, 6.0)
+            let h_raw = 60.0 * seg_mod
+            hf = h_raw
+        if abs_diff_gc < 0.0001
+            if abs_diff_rc >= 0.0001
+                // Green is max: h = 60 * ((b - r) / delta + 2)
+                let seg2 = (b - r) / delta
+                let h_raw2 = 60.0 * (seg2 + 2.0)
+                hf = h_raw2
+        if abs_diff_bc < 0.0001
+            if abs_diff_rc >= 0.0001
+                if abs_diff_gc >= 0.0001
+                    // Blue is max: h = 60 * ((r - g) / delta + 4)
+                    let seg3 = (r - g) / delta
+                    let h_raw3 = 60.0 * (seg3 + 4.0)
+                    hf = h_raw3
+
+    // Normalise hue to [0, 360)
+    let hf2 = _hsl_fmod(hf, 360.0)
+
+    // Round to ints
+    let h_out = _hsl_round(hf2)
+    let s_out = _hsl_round(sf * 100.0)
+    let l_out = _hsl_round(lf * 100.0)
+
+    // Clamp h to [0,360], s/l to [0,100]
+    if h_out > 360
+        h_out = 360
+    if h_out < 0
+        h_out = 0
+    if s_out > 100
+        s_out = 100
+    if s_out < 0
+        s_out = 0
+    if l_out > 100
+        l_out = 100
+    if l_out < 0
+        l_out = 0
+
+    let out = []
+    out.push(h_out)
+    out.push(s_out)
+    out.push(l_out)
+    out
+
+// ── hsl_to_rgb ────────────────────────────────────────────────────────────────
+// Convert h (0..360 int), s (0..100 int), l (0..100 int) -> [r,g,b] (0..255).
+fn hsl_to_rgb(h: int, s: int, l: int) -> list
+    // Normalise inputs to [0.0, 1.0]
+    let hf = h * 1.0
+    let sf = s * 1.0
+    let lf = l * 1.0
+    let hue = hf / 360.0
+    let sat = sf / 100.0
+    let lit = lf / 100.0
+
+    // Achromatic shortcut
+    let r_out = 0
+    let g_out = 0
+    let b_out = 0
+    if sat < 0.0001
+        let mono = float_to_int(lit * 255.0 + 0.5)
+        let mono_c = _hsl_clamp255(mono)
+        r_out = mono_c
+        g_out = mono_c
+        b_out = mono_c
+    if sat >= 0.0001
+        // C = (1 - |2l - 1|) * s
+        let two_l = 2.0 * lit
+        let abs_2l1 = _hsl_fabs(two_l - 1.0)
+        let one_m = 1.0 - abs_2l1
+        let C = one_m * sat
+        let m = lit - C / 2.0
+
+        // sector: which 60-degree slice
+        let h_deg = hue * 360.0
+        let sector_f = h_deg / 60.0
+        let sector_mod = _hsl_fmod(sector_f, 2.0)
+        let abs_sm1 = _hsl_fabs(sector_mod - 1.0)
+        let X = C * (1.0 - abs_sm1)
+
+        let r1 = 0.0
+        let g1 = 0.0
+        let b1 = 0.0
+
+        let sec_i = float_to_int(sector_f)
+        if sec_i == 0
+            r1 = C
+            g1 = X
+        if sec_i == 1
+            r1 = X
+            g1 = C
+        if sec_i == 2
+            g1 = C
+            b1 = X
+        if sec_i == 3
+            g1 = X
+            b1 = C
+        if sec_i == 4
+            r1 = X
+            b1 = C
+        if sec_i == 5
+            r1 = C
+            b1 = X
+        // sec_i==6 can occur for h=360 -> same as sec_i==0
+        if sec_i == 6
+            r1 = C
+            g1 = X
+
+        let rn = (r1 + m) * 255.0
+        let gn = (g1 + m) * 255.0
+        let bn = (b1 + m) * 255.0
+        let ri = float_to_int(rn + 0.5)
+        let gi = float_to_int(gn + 0.5)
+        let bi = float_to_int(bn + 0.5)
+        r_out = _hsl_clamp255(ri)
+        g_out = _hsl_clamp255(gi)
+        b_out = _hsl_clamp255(bi)
+
+    let out = []
+    out.push(r_out)
+    out.push(g_out)
+    out.push(b_out)
+    out
+
+// ── hsl_rotate_hue ───────────────────────────────────────────────────────────
+// Rotate the hue of an RGB colour [r,g,b] by deg degrees, return new [r,g,b].
+fn hsl_rotate_hue(c: list, deg: int) -> list
+    let hsl = hsl_from_rgb(c)
+    let h = hsl[0]
+    let s = hsl[1]
+    let l = hsl[2]
+    let new_h_raw = h + deg
+    // Normalise to [0, 360)
+    let new_h = new_h_raw
+    if new_h >= 360
+        let sub1 = new_h - 360
+        new_h = sub1
+    if new_h < 0
+        let add1 = new_h + 360
+        new_h = add1
+    let result = hsl_to_rgb(new_h, s, l)
+    result

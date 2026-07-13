@@ -1,0 +1,280 @@
+// std/color/lab.nova — CIE L*a*b* color science (via CIE XYZ D65).
+//
+// PREFIX: lab_
+//
+// FLOAT HAZARDS obeyed throughout:
+//   * All intermediate float expressions bound to named lets (uninit-slot bug).
+//   * Float abs via if/else — abs() returns int in NOVA.
+//   * Integer division avoided — always use float literals.
+//   * float-vs-int compare coerced with *1.0 where needed.
+//   * pow/sqrt results always bound to a let before use.
+//   * Single-exit pattern on every fn.
+//
+// CIE XYZ D65 white point (IEC 61966-2-1):
+//   Xn = 95.047,  Yn = 100.000,  Zn = 108.883
+//
+// sRGB -> linear (gamma expand, piecewise):
+//   if v/255 <= 0.04045: lin = v/255 / 12.92
+//   else:                lin = ((v/255 + 0.055) / 1.055) ^ 2.4
+//
+// Linear RGB -> XYZ (D65, scaled 0..100):
+//   X =  0.4124564*R + 0.3575761*G + 0.1804375*B   (* 100)
+//   Y =  0.2126729*R + 0.7151522*G + 0.0721750*B   (* 100)
+//   Z =  0.0193339*R + 0.1191920*G + 0.9503041*B   (* 100)
+//
+// XYZ -> Lab (CIE 1976):
+//   f(t) = t^(1/3)                   if t > (6/29)^3 = 0.008856...
+//          (29/6)^2 * t / 3 + 4/29  otherwise
+//   L* = 116 * f(Y/Yn) - 16
+//   a* = 500 * (f(X/Xn) - f(Y/Yn))
+//   b* = 200 * (f(Y/Yn) - f(Z/Zn))
+//
+// Lab -> XYZ -> linear RGB -> sRGB (inverse path).
+//
+// API:
+//   lab_from_rgb(c)           -> list [L, a, b] floats  (L in 0..100)
+//   lab_to_rgb(L, a, b)       -> list [r, g, b] ints    (0..255)
+//   lab_delta_e(c1, c2)       -> float  CIE76 delta-E between two sRGB colors
+
+// ---------------------------------------------------------------------------
+// Private: sRGB gamma-expansion (channel 0-255 int -> linear float 0..1).
+// ---------------------------------------------------------------------------
+fn _lab_expand(channel: int) -> float
+    let v = channel * 1.0
+    let v255 = v / 255.0
+    let thresh = 0.04045
+    let result = 0.0
+    if v255 <= thresh
+        let lin = v255 / 12.92
+        result = lin
+    else
+        let inner = v255 + 0.055
+        let denom = inner / 1.055
+        let ex = 2.4
+        let lin = pow(denom, ex)
+        result = lin
+    result
+
+// ---------------------------------------------------------------------------
+// Private: sRGB gamma-compression (linear float 0..1 -> encoded float 0..1).
+// ---------------------------------------------------------------------------
+fn _lab_compress(lin: float) -> float
+    let thresh = 0.0031308
+    let result = 0.0
+    if lin <= thresh
+        let enc = lin * 12.92
+        result = enc
+    else
+        let ex = 0.41666666666666667
+        let powered = pow(lin, ex)
+        let scaled = powered * 1.055
+        let enc = scaled - 0.055
+        result = enc
+    result
+
+// ---------------------------------------------------------------------------
+// Private: clamp float to [lo, hi].
+// ---------------------------------------------------------------------------
+fn _lab_clampf(v: float, lo: float, hi: float) -> float
+    let result = v
+    if v < lo
+        result = lo
+    if v > hi
+        result = hi
+    result
+
+// ---------------------------------------------------------------------------
+// Private: clamp int to [0, 255].
+// ---------------------------------------------------------------------------
+fn _lab_clampi(v: int) -> int
+    let result = v
+    if v < 0
+        result = 0
+    if v > 255
+        result = 255
+    result
+
+// ---------------------------------------------------------------------------
+// Private: CIE Lab f() function.
+//   f(t) = t^(1/3)                        if t > 0.008856
+//          841.0/108.0 * t + 4.0/29.0     otherwise
+// (841/108 = (29/6)^2 / 3; 4/29 exactly)
+// ---------------------------------------------------------------------------
+fn _lab_f(t: float) -> float
+    let thresh = 0.008856
+    let result = 0.0
+    if t > thresh
+        let ex = 0.3333333333333333
+        let cbrt = pow(t, ex)
+        result = cbrt
+    else
+        let a = 841.0
+        let b = 108.0
+        let coeff = a / b
+        let offset = 4.0 / 29.0
+        let lin = coeff * t
+        let val = lin + offset
+        result = val
+    result
+
+// ---------------------------------------------------------------------------
+// Private: inverse f() — Lab f^-1 used when converting Lab back to XYZ.
+//   finv(t) = t^3        if t > 6/29
+//             (t - 4/29) * 108/841  otherwise
+// ---------------------------------------------------------------------------
+fn _lab_finv(t: float) -> float
+    let thresh = 0.2068965517241379
+    let result = 0.0
+    if t > thresh
+        let cubed = t * t
+        let cubed2 = cubed * t
+        result = cubed2
+    else
+        let offset = 4.0 / 29.0
+        let a = 108.0
+        let b = 841.0
+        let coeff = a / b
+        let diff = t - offset
+        let val = coeff * diff
+        result = val
+    result
+
+// ---------------------------------------------------------------------------
+// Convert sRGB [r,g,b] int list to CIE L*a*b* list [L, a*, b*] floats.
+// L is in 0..100; a* and b* are roughly -128..+127.
+// ---------------------------------------------------------------------------
+fn lab_from_rgb(c: list) -> list
+    // 1. Expand sRGB channels to linear light
+    let ri = c[0]
+    let gi = c[1]
+    let bi = c[2]
+    let rl = _lab_expand(ri)
+    let gl = _lab_expand(gi)
+    let bl = _lab_expand(bi)
+    // 2. Linear RGB -> XYZ D65 (scaled 0..100)
+    let x0 = 0.4124564 * rl
+    let x1 = 0.3575761 * gl
+    let x2 = 0.1804375 * bl
+    let xsum = x0 + x1
+    let xval = xsum + x2
+    let X = xval * 100.0
+    let y0 = 0.2126729 * rl
+    let y1 = 0.7151522 * gl
+    let y2 = 0.0721750 * bl
+    let ysum = y0 + y1
+    let yval = ysum + y2
+    let Y = yval * 100.0
+    let z0 = 0.0193339 * rl
+    let z1 = 0.1191920 * gl
+    let z2 = 0.9503041 * bl
+    let zsum = z0 + z1
+    let zval = zsum + z2
+    let Z = zval * 100.0
+    // 3. Normalize by D65 white point
+    let Xn = 95.047
+    let Yn = 100.000
+    let Zn = 108.883
+    let xr = X / Xn
+    let yr = Y / Yn
+    let zr = Z / Zn
+    // 4. Apply f()
+    let fx = _lab_f(xr)
+    let fy = _lab_f(yr)
+    let fz = _lab_f(zr)
+    // 5. Compute L*, a*, b*
+    let L = 116.0 * fy
+    let Lstar = L - 16.0
+    let diff_xy = fx - fy
+    let astar = 500.0 * diff_xy
+    let diff_yz = fy - fz
+    let bstar = 200.0 * diff_yz
+    let result = [Lstar, astar, bstar]
+    result
+
+// ---------------------------------------------------------------------------
+// Convert CIE L*a*b* floats back to sRGB [r,g,b] int list (0..255).
+// ---------------------------------------------------------------------------
+fn lab_to_rgb(L: float, a: float, b: float) -> list
+    // 1. Lab -> normalized XYZ
+    let Lshift = L + 16.0
+    let fy = Lshift / 116.0
+    let dax = a / 500.0
+    let dbz = b / 200.0
+    let fx = fy + dax
+    let fz = fy - dbz
+    // 2. Apply finv()
+    let xr = _lab_finv(fx)
+    let yr = _lab_finv(fy)
+    let zr = _lab_finv(fz)
+    // 3. Denormalize by D65 white point (gives XYZ scaled 0..100)
+    let Xn = 95.047
+    let Yn = 100.000
+    let Zn = 108.883
+    let X = xr * Xn
+    let Y = yr * Yn
+    let Z = zr * Zn
+    // 4. XYZ -> linear RGB (D65 inverse matrix, input/output in 0..100/0..1 domains)
+    let xs = X / 100.0
+    let ys = Y / 100.0
+    let zs = Z / 100.0
+    let r0 = 3.2404542 * xs
+    let r1 = 1.5371385 * ys
+    let r2 = 0.4985314 * zs
+    let rl_raw = r0 - r1
+    let rl_raw2 = rl_raw - r2
+    let g0 = 0.9692660 * xs
+    let g1 = 1.8760108 * ys
+    let g2 = 0.0415560 * zs
+    let gl_raw = g1 - g0
+    let gl_raw2 = gl_raw + g2
+    let b0 = 0.0556434 * xs
+    let b1 = 0.2040259 * ys
+    let b2 = 1.0572252 * zs
+    let bl_raw = b0 - b1
+    let bl_raw2 = bl_raw + b2
+    // 5. Clamp linear to [0,1]
+    let rl = _lab_clampf(rl_raw2, 0.0, 1.0)
+    let gl = _lab_clampf(gl_raw2, 0.0, 1.0)
+    let bl2 = _lab_clampf(bl_raw2, 0.0, 1.0)
+    // 6. Gamma-compress and scale to 0..255
+    let rc = _lab_compress(rl)
+    let gc = _lab_compress(gl)
+    let bc = _lab_compress(bl2)
+    let rscale = rc * 255.0
+    let gscale = gc * 255.0
+    let bscale = bc * 255.0
+    let rhalf = rscale + 0.5
+    let ghalf = gscale + 0.5
+    let bhalf = bscale + 0.5
+    let ri = float_to_int(rhalf)
+    let gi = float_to_int(ghalf)
+    let bi = float_to_int(bhalf)
+    let ric = _lab_clampi(ri)
+    let gic = _lab_clampi(gi)
+    let bic = _lab_clampi(bi)
+    let result = [ric, gic, bic]
+    result
+
+// ---------------------------------------------------------------------------
+// CIE76 delta-E: Euclidean distance in L*a*b* space between two sRGB colors.
+// delta-E = sqrt((L1-L2)^2 + (a1-a2)^2 + (b1-b2)^2)
+// ---------------------------------------------------------------------------
+fn lab_delta_e(c1: list, c2: list) -> float
+    let lab1 = lab_from_rgb(c1)
+    let lab2 = lab_from_rgb(c2)
+    let L1 = lab1[0]
+    let a1 = lab1[1]
+    let b1 = lab1[2]
+    let L2 = lab2[0]
+    let a2 = lab2[1]
+    let b2 = lab2[2]
+    let dL = L1 - L2
+    let da = a1 - a2
+    let db = b1 - b2
+    let dL2 = dL * dL
+    let da2 = da * da
+    let db2 = db * db
+    let sum = dL2 + da2
+    let sum2 = sum + db2
+    let de = sqrt(sum2)
+    de
