@@ -1,0 +1,319 @@
+// ============================================================================
+// NOVA Standard Library — std/parsing/template.nova
+//
+// String template engine.
+//   {{var}}                   -- substitute variable from ctx dict
+//   {{#if cond}}...{{/if}}    -- conditional block (truthy: non-zero int or non-empty string)
+//   {{#each xs}}...{{.}}...{{/each}} -- iterate over a list; {{.}} = current item
+//
+// ctx maps names -> string | int | list.
+// Missing variable -> empty string "".
+//
+// Implementation note: NOVA string literals cannot contain literal { or }.
+// All brace characters are constructed via chr(123)={  chr(125)=}
+//
+// Public API:
+//   render(tmpl: string, ctx: dict) -> string
+//   render_vars(tmpl: string) -> list   (ordered, deduplicated variable names)
+// ============================================================================
+
+// _OB / _CB: single open/close brace characters built once.
+fn _ob()
+    return chr(123)
+
+fn _cb()
+    return chr(125)
+
+// ---------------------------------------------------------------------------
+// PRIVATE: scan for the end of a tag body starting at position 'start'.
+// We've already consumed the opening {{ (so 'start' points just after them).
+// Returns the index of the first char of the closing }} (i.e. the first '}'),
+// or -1 if not found.
+// ---------------------------------------------------------------------------
+fn _tag_end(s, start, slen)
+    let cb = chr(125)
+    let i = start
+    while i < slen - 1
+        let c1 = slice(s, i, i + 1)
+        let c2 = slice(s, i + 1, i + 2)
+        if c1 == cb
+            if c2 == cb
+                return i
+        i = i + 1
+    return -1
+
+// ---------------------------------------------------------------------------
+// PRIVATE: trim leading/trailing ASCII spaces.
+// ---------------------------------------------------------------------------
+fn _trim(s)
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = slice(s, i, i + 1)
+        if c == " "
+            i = i + 1
+        else
+            let j = n - 1
+            while j > i
+                let d = slice(s, j, j + 1)
+                if d == " "
+                    j = j - 1
+                else
+                    return slice(s, i, j + 1)
+            return slice(s, i, i + 1)
+    return ""
+
+// ---------------------------------------------------------------------------
+// PRIVATE: resolve ctx[name] to string; missing -> ""
+// ---------------------------------------------------------------------------
+fn _ctx_str(ctx, name)
+    if contains(ctx, name)
+        let v = ctx[name]
+        return str(v)
+    return ""
+
+// ---------------------------------------------------------------------------
+// PRIVATE: is ctx[name] truthy?
+//   int 0 -> false; non-zero int -> true
+//   empty string -> false; non-empty string -> true
+//   missing -> false
+// ---------------------------------------------------------------------------
+fn _ctx_truthy(ctx, name)
+    if contains(ctx, name) == 0
+        return 0
+    let v = ctx[name]
+    let vs = str(v)
+    if vs == "0"
+        return 0
+    if vs == ""
+        return 0
+    return 1
+
+// ---------------------------------------------------------------------------
+// PRIVATE: find closing {{/block_tag}} starting from 'start'.
+// Returns position of the opening {{ of the closing tag, or -1.
+// Handles nesting by tracking depth.
+// block_tag: "if" or "each"
+// ---------------------------------------------------------------------------
+fn _find_close(s, start, slen, block_tag)
+    let ob = chr(123)
+    let cb = chr(125)
+    let open_kw = "#" + block_tag
+    let close_kw = "/" + block_tag
+    let ok_len = len(open_kw)
+    let ck_len = len(close_kw)
+    let depth = 1
+    let i = start
+    while i < slen - 1
+        let c1 = slice(s, i, i + 1)
+        let c2 = slice(s, i + 1, i + 2)
+        if c1 == ob
+            if c2 == ob
+                let te = _tag_end(s, i + 2, slen)
+                if te >= 0
+                    let body = _trim(slice(s, i + 2, te))
+                    let blen = len(body)
+                    if blen >= ok_len
+                        let pfx = slice(body, 0, ok_len)
+                        if pfx == open_kw
+                            depth = depth + 1
+                    if blen >= ck_len
+                        let pfx2 = slice(body, 0, ck_len)
+                        if pfx2 == close_kw
+                            depth = depth - 1
+                            if depth == 0
+                                return i
+                    i = te + 2
+                else
+                    i = i + 1
+            else
+                i = i + 1
+        else
+            i = i + 1
+    return -1
+
+// ---------------------------------------------------------------------------
+// PRIVATE: render each-body for a list of scalar items.
+// {{.}} in body is replaced with each item's string value.
+// ---------------------------------------------------------------------------
+fn _render_each(body, items, ctx)
+    let out = ""
+    let n = len(items)
+    let k = 0
+    while k < n
+        let item = items[k]
+        let item_str = str(item)
+        // Build a copy of ctx with "." = item_str
+        let sub_ctx = {}
+        let ctx_keys = keys(ctx)
+        let ki = 0
+        while ki < len(ctx_keys)
+            let kn = ctx_keys[ki]
+            sub_ctx[kn] = ctx[kn]
+            ki = ki + 1
+        sub_ctx["."] = item_str
+        let rendered = render(body, sub_ctx)
+        out = out + rendered
+        k = k + 1
+    return out
+
+// ---------------------------------------------------------------------------
+// render(tmpl, ctx) -> string
+//
+// Single-pass renderer scanning for {{ ... }} tags:
+//   {{name}}                 variable substitution
+//   {{#if name}}...{{/if}}   conditional block
+//   {{#each name}}...{{/each}} iteration over list
+// ---------------------------------------------------------------------------
+fn render(tmpl, ctx)
+    let n = len(tmpl)
+    let ob = chr(123)
+    let cb = chr(125)
+    let out = ""
+    let i = 0
+    while i < n
+        if i + 1 < n
+            let c1 = slice(tmpl, i, i + 1)
+            let c2 = slice(tmpl, i + 1, i + 2)
+            if c1 == ob
+                if c2 == ob
+                    let te = _tag_end(tmpl, i + 2, n)
+                    if te < 0
+                        out = out + c1
+                        i = i + 1
+                    else
+                        let body = _trim(slice(tmpl, i + 2, te))
+                        let tag_end_pos = te + 2
+                        let blen = len(body)
+                        if blen == 0
+                            i = tag_end_pos
+                        else
+                            let b0 = slice(body, 0, 1)
+                            if b0 == "#"
+                                // Block tag
+                                if blen >= 3
+                                    let btag = slice(body, 1, 3)
+                                    if btag == "if"
+                                        let cond_name = _trim(slice(body, 3, blen))
+                                        let close_pos = _find_close(tmpl, tag_end_pos, n, "if")
+                                        if close_pos < 0
+                                            i = tag_end_pos
+                                        else
+                                            let inner = slice(tmpl, tag_end_pos, close_pos)
+                                            let close_te = _tag_end(tmpl, close_pos + 2, n)
+                                            let after = close_pos
+                                            if close_te >= 0
+                                                after = close_te + 2
+                                            else
+                                                after = close_pos + 7
+                                            let truthy = _ctx_truthy(ctx, cond_name)
+                                            if truthy == 1
+                                                out = out + render(inner, ctx)
+                                            i = after
+                                    else
+                                        if blen >= 5
+                                            let btag2 = slice(body, 1, 5)
+                                            if btag2 == "each"
+                                                let list_name = _trim(slice(body, 5, blen))
+                                                let close_pos2 = _find_close(tmpl, tag_end_pos, n, "each")
+                                                if close_pos2 < 0
+                                                    i = tag_end_pos
+                                                else
+                                                    let inner2 = slice(tmpl, tag_end_pos, close_pos2)
+                                                    let close_te2 = _tag_end(tmpl, close_pos2 + 2, n)
+                                                    let after2 = close_pos2
+                                                    if close_te2 >= 0
+                                                        after2 = close_te2 + 2
+                                                    else
+                                                        after2 = close_pos2 + 9
+                                                    if contains(ctx, list_name)
+                                                        let items = ctx[list_name]
+                                                        out = out + _render_each(inner2, items, ctx)
+                                                    i = after2
+                                            else
+                                                i = tag_end_pos
+                                        else
+                                            i = tag_end_pos
+                                else
+                                    i = tag_end_pos
+                            else
+                                if b0 == "/"
+                                    // Stray closing tag -- skip
+                                    i = tag_end_pos
+                                else
+                                    // Variable substitution
+                                    out = out + _ctx_str(ctx, body)
+                                    i = tag_end_pos
+                else
+                    out = out + c1
+                    i = i + 1
+            else
+                out = out + slice(tmpl, i, i + 1)
+                i = i + 1
+        else
+            out = out + slice(tmpl, i, i + 1)
+            i = i + 1
+    return out
+
+// ---------------------------------------------------------------------------
+// render_vars(tmpl) -> list
+//
+// Returns ordered, deduplicated list of variable/block names referenced in tmpl.
+// Block tags (#if name, #each name) contribute the name. {{.}} is included.
+// ---------------------------------------------------------------------------
+fn render_vars(tmpl)
+    let n = len(tmpl)
+    let ob = chr(123)
+    let cb = chr(125)
+    let seen = {}
+    let result = []
+    let i = 0
+    while i < n
+        if i + 1 < n
+            let c1 = slice(tmpl, i, i + 1)
+            let c2 = slice(tmpl, i + 1, i + 2)
+            if c1 == ob
+                if c2 == ob
+                    let te = _tag_end(tmpl, i + 2, n)
+                    if te < 0
+                        i = i + 1
+                    else
+                        let body = _trim(slice(tmpl, i + 2, te))
+                        let blen = len(body)
+                        let tag_end_pos = te + 2
+                        if blen > 0
+                            let b0 = slice(body, 0, 1)
+                            if b0 == "#"
+                                if blen >= 3
+                                    let btag = slice(body, 1, 3)
+                                    if btag == "if"
+                                        let vname = _trim(slice(body, 3, blen))
+                                        if len(vname) > 0
+                                            if contains(seen, vname) == 0
+                                                seen[vname] = 1
+                                                push(result, vname)
+                                    else
+                                        if blen >= 5
+                                            let btag2 = slice(body, 1, 5)
+                                            if btag2 == "each"
+                                                let vname2 = _trim(slice(body, 5, blen))
+                                                if len(vname2) > 0
+                                                    if contains(seen, vname2) == 0
+                                                        seen[vname2] = 1
+                                                        push(result, vname2)
+                            else
+                                if b0 == "/"
+                                    let _skip = 0
+                                    _skip = _skip + 0
+                                else
+                                    if contains(seen, body) == 0
+                                        seen[body] = 1
+                                        push(result, body)
+                        i = tag_end_pos
+                else
+                    i = i + 1
+            else
+                i = i + 1
+        else
+            i = i + 1
+    return result
