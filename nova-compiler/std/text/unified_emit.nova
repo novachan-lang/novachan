@@ -1,0 +1,372 @@
+// ============================================================================
+// NOVA Standard Library — std/text/unified_emit
+// ============================================================================
+// Emit unified-diff text from two lists of lines (standard unified format).
+//
+// Public API:
+//   unified_emit(a_lines, b_lines, context) -> string
+//       Computes the LCS-based line diff of a_lines and b_lines, then formats
+//       the result as a unified diff string (no file headers).
+//       - context : number of unchanged lines to show around each hunk (>=0).
+//       - Returns "" if the inputs are identical (no hunks).
+//       - Hunk header format: "@@ -l,s +l,s @@" (1-based, inclusive of
+//         context).
+//       - Lines prefixed: "-" deleted, "+" inserted, " " context.
+//
+//   unified_emit_named(a_lines, b_lines, aname, bname, context) -> string
+//       Same as unified_emit but prepends two header lines:
+//           "--- aname"
+//           "+++ bname"
+//       followed by the hunk output.
+//
+// Edit-script format (shared across diff modules):
+//   An edit script is a list of 2-element lists [tag, line] where tag is:
+//     "="  keep (common to both a and b)
+//     "-"  delete (present in a, removed from b)
+//     "+"  insert (present in b, added)
+//
+// Algorithm:
+//   1. Build LCS DP table for a_lines / b_lines.
+//   2. Backtrack to produce an edit script as a list of [tag, text] pairs.
+//   3. Walk the script to find changed regions, expand by context lines,
+//      merge overlapping/adjacent hunks, and emit each hunk with its header.
+//
+// Edge cases:
+//   Both empty     -> ""
+//   Identical      -> ""
+//   a empty        -> single hunk with all "+" lines
+//   b empty        -> single hunk with all "-" lines
+// ============================================================================
+
+// ── Private: LCS DP table ────────────────────────────────────────────────────
+
+// _ue_lcs_dp: build the full (m+1)*(n+1) LCS DP table for two lists of strings.
+// Returns a flat list (row-major, row=a-index 0..m, col=b-index 0..n).
+// dp[i*(n+1)+j] = LCS length of a[0..i-1] and b[0..j-1].
+fn _ue_lcs_dp(a, b)
+    let m = len(a)
+    let n = len(b)
+    let sz = (m + 1) * (n + 1)
+    let dp = []
+    let fill = 0
+    while fill < sz
+        dp.push(0)
+        fill = fill + 1
+    let i = 1
+    while i <= m
+        let j = 1
+        while j <= n
+            let idx = i * (n + 1) + j
+            if a[i - 1] == b[j - 1]
+                dp[idx] = dp[(i - 1) * (n + 1) + (j - 1)] + 1
+            else
+                let from_top  = dp[(i - 1) * (n + 1) + j]
+                let from_left = dp[i * (n + 1) + (j - 1)]
+                if from_top >= from_left
+                    dp[idx] = from_top
+                else
+                    dp[idx] = from_left
+            j = j + 1
+        i = i + 1
+    dp
+
+// ── Private: build edit script ───────────────────────────────────────────────
+
+// _ue_edit_script: backtrack the LCS DP table and return an edit script as a
+// list of 2-element lists [tag, text]:
+//   "="  line present in both (keep)
+//   "-"  line in a only (delete)
+//   "+"  line in b only (insert)
+// Deletes precede inserts within a hunk (backtrack prefers insert, then
+// reverse to get forward order where deletes come first).
+fn _ue_edit_script(a, b)
+    let m = len(a)
+    let n = len(b)
+
+    // All inserts.
+    if m == 0
+        let out = []
+        let j = 0
+        while j < n
+            let op = []
+            op.push("+")
+            op.push(b[j])
+            out.push(op)
+            j = j + 1
+        return out
+
+    // All deletes.
+    if n == 0
+        let out2 = []
+        let i = 0
+        while i < m
+            let op2 = []
+            op2.push("-")
+            op2.push(a[i])
+            out2.push(op2)
+            i = i + 1
+        return out2
+
+    let dp = _ue_lcs_dp(a, b)
+
+    // Backtrack from (m,n) to (0,0) collecting ops in reverse.
+    let rev = []
+    let ci = m
+    let cj = n
+    while ci > 0 or cj > 0
+        if ci > 0 and cj > 0 and a[ci - 1] == b[cj - 1]
+            let op3 = []
+            op3.push("=")
+            op3.push(a[ci - 1])
+            rev.push(op3)
+            ci = ci - 1
+            cj = cj - 1
+        else
+            let score_top  = 0
+            let score_left = 0
+            if ci > 0
+                score_top = dp[(ci - 1) * (n + 1) + cj]
+            if cj > 0
+                score_left = dp[ci * (n + 1) + (cj - 1)]
+            if cj == 0 or (ci > 0 and score_top > score_left)
+                let op4 = []
+                op4.push("-")
+                op4.push(a[ci - 1])
+                rev.push(op4)
+                ci = ci - 1
+            else
+                let op5 = []
+                op5.push("+")
+                op5.push(b[cj - 1])
+                rev.push(op5)
+                cj = cj - 1
+
+    // Reverse to get forward order.
+    let result = []
+    let ri = len(rev) - 1
+    while ri >= 0
+        result.push(rev[ri])
+        ri = ri - 1
+    result
+
+// ── Private: int-to-string ────────────────────────────────────────────────────
+
+// _ue_itos: convert a non-negative integer to its decimal string representation.
+fn _ue_itos(n)
+    if n == 0
+        return "0"
+    let s = ""
+    let v = n
+    while v > 0
+        let digit = v - (v / 10) * 10
+        let ch = ""
+        if digit == 0
+            ch = "0"
+        else
+            if digit == 1
+                ch = "1"
+            else
+                if digit == 2
+                    ch = "2"
+                else
+                    if digit == 3
+                        ch = "3"
+                    else
+                        if digit == 4
+                            ch = "4"
+                        else
+                            if digit == 5
+                                ch = "5"
+                            else
+                                if digit == 6
+                                    ch = "6"
+                                else
+                                    if digit == 7
+                                        ch = "7"
+                                    else
+                                        if digit == 8
+                                            ch = "8"
+                                        else
+                                            ch = "9"
+        s = ch + s
+        v = v / 10
+    s
+
+// ── Private: hunk collection helpers ─────────────────────────────────────────
+
+// _ue_has_change: returns 1 if any op in script[lo..hi-1] is "-" or "+".
+fn _ue_has_change(script, lo, hi)
+    let i = lo
+    while i < hi
+        let tag = script[i][0]
+        if tag == "-" or tag == "+"
+            return 1
+        i = i + 1
+    return 0
+
+// ── Private: format one hunk ─────────────────────────────────────────────────
+
+// _ue_format_hunk: given the edit script and a hunk's op-index range [lo, hi),
+// compute the hunk header and body lines. Returns a single string (lines joined
+// by chr(10), no trailing newline).
+//
+// a_start_1: 1-based a-line number of the first op in this hunk range.
+// b_start_1: 1-based b-line number of the first op in this hunk range.
+fn _ue_format_hunk(script, lo, hi, a_start_1, b_start_1)
+    // Count lines consumed from a and lines produced toward b in [lo, hi).
+    let a_count = 0
+    let b_count = 0
+    let i = lo
+    while i < hi
+        let tag = script[i][0]
+        if tag == "=" or tag == "-"
+            a_count = a_count + 1
+        if tag == "=" or tag == "+"
+            b_count = b_count + 1
+        i = i + 1
+
+    // Build header: "@@ -<a_start>,<a_count> +<b_start>,<b_count> @@"
+    let hdr = "@@ -" + _ue_itos(a_start_1) + "," + _ue_itos(a_count) + " +" + _ue_itos(b_start_1) + "," + _ue_itos(b_count) + " @@"
+
+    // Build body lines.
+    let out = hdr
+    let j = lo
+    while j < hi
+        let tag2 = script[j][0]
+        let line = script[j][1]
+        if tag2 == "="
+            out = out + chr(10) + " " + line
+        else
+            if tag2 == "-"
+                out = out + chr(10) + "-" + line
+            else
+                out = out + chr(10) + "+" + line
+        j = j + 1
+    out
+
+// ── Private: compute hunk ranges ─────────────────────────────────────────────
+
+// _ue_compute_hunks: walk the edit script and produce a list of hunk boundaries.
+// Each element is a 4-element list [lo, hi, a_start_1, b_start_1] where
+// lo/hi are op-script indices and a_start_1/b_start_1 are 1-based line
+// numbers in a and b of op at index lo.
+//
+// Algorithm:
+//   For each "changed" op (-/+), the hunk spans:
+//     [max(0, change_idx - context) .. min(nops, last_change_in_run + 1 + context)]
+//   Adjacent/overlapping candidate windows are merged.
+fn _ue_compute_hunks(script, context)
+    let nops = len(script)
+    if nops == 0
+        return []
+
+    // Step 1: find indices of all changed ops (-/+).
+    let changes = []
+    let i = 0
+    while i < nops
+        let tag = script[i][0]
+        if tag == "-" or tag == "+"
+            changes.push(i)
+        i = i + 1
+    if len(changes) == 0
+        return []
+
+    // Step 2: group changes into hunk candidate windows.
+    // Each window is [win_lo, win_hi) in op-script index space.
+    // We merge windows that overlap or are adjacent.
+    let win_lo = changes[0] - context
+    if win_lo < 0
+        win_lo = 0
+    let win_hi = changes[0] + 1 + context
+    if win_hi > nops
+        win_hi = nops
+
+    let hunk_windows = []
+    let ci = 1
+    while ci < len(changes)
+        let c = changes[ci]
+        let clo = c - context
+        if clo < 0
+            clo = 0
+        let chi = c + 1 + context
+        if chi > nops
+            chi = nops
+        // Merge if overlapping or adjacent.
+        if clo <= win_hi
+            if chi > win_hi
+                win_hi = chi
+        else
+            // Flush current window.
+            let w = []
+            w.push(win_lo)
+            w.push(win_hi)
+            hunk_windows.push(w)
+            win_lo = clo
+            win_hi = chi
+        ci = ci + 1
+    // Flush last window.
+    let wlast = []
+    wlast.push(win_lo)
+    wlast.push(win_hi)
+    hunk_windows.push(wlast)
+
+    // Step 3: for each window, compute a_start_1 and b_start_1 by scanning
+    // the script from 0 to win_lo, counting a-consumed and b-produced lines.
+    let result = []
+    let wi = 0
+    while wi < len(hunk_windows)
+        let w2 = hunk_windows[wi]
+        let wlo = w2[0]
+        let whi = w2[1]
+        let a_before = 0
+        let b_before = 0
+        let k = 0
+        while k < wlo
+            let tag2 = script[k][0]
+            if tag2 == "=" or tag2 == "-"
+                a_before = a_before + 1
+            if tag2 == "=" or tag2 == "+"
+                b_before = b_before + 1
+            k = k + 1
+        let hunk = []
+        hunk.push(wlo)
+        hunk.push(whi)
+        hunk.push(a_before + 1)
+        hunk.push(b_before + 1)
+        result.push(hunk)
+        wi = wi + 1
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// unified_emit: produce a unified diff string from two line lists.
+// context = number of unchanged context lines around each hunk.
+// Returns "" if the inputs are identical.
+fn unified_emit(a_lines, b_lines, context)
+    let script = _ue_edit_script(a_lines, b_lines)
+    let hunks  = _ue_compute_hunks(script, context)
+    if len(hunks) == 0
+        return ""
+    let out = ""
+    let hi = 0
+    while hi < len(hunks)
+        let h = hunks[hi]
+        let hunk_str = _ue_format_hunk(script, h[0], h[1], h[2], h[3])
+        if hi == 0
+            out = hunk_str
+        else
+            out = out + chr(10) + hunk_str
+        hi = hi + 1
+    out
+
+// unified_emit_named: same as unified_emit, with "--- aname" / "+++ bname" headers.
+fn unified_emit_named(a_lines, b_lines, aname, bname, context)
+    let body = unified_emit(a_lines, b_lines, context)
+    let header = "--- " + aname + chr(10) + "+++ " + bname
+    if body == ""
+        return header
+    header + chr(10) + body
+
+// ============================================================================
+fn main()
+    print("std/text/unified_emit loaded")

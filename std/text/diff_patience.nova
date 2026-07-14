@@ -1,0 +1,318 @@
+// ============================================================================
+// NOVA Standard Library — std/text/diff_patience
+// ============================================================================
+// Patience diff: anchors on lines unique in both sequences, recurses between
+// anchors, falls back to LCS diff for gap segments with no unique lines.
+//
+// Public API:
+//   patience_diff(a_lines, b_lines) -> script
+//       a_lines, b_lines: lists of strings (already split by caller, or use
+//       the built-in _pd_split helper by passing a single string).
+//       Returns a list of 2-element lists [tag, line] where tag is one of:
+//         "="  keep  (line in both)
+//         "-"  delete (line in a only)
+//         "+"  insert (line in b only)
+//
+//   patience_apply(a_lines, script) -> list
+//       Reconstruct b_lines from a_lines and a script produced by patience_diff.
+//       "=" and "-" ops consume a-lines in order.
+//       "=" and "+" ops emit output lines.
+//
+// Algorithm (per Bram Cohen's patience diff):
+//   1. Collect lines that appear EXACTLY once in a-slice AND exactly once in
+//      b-slice — these are "unique anchors."
+//   2. Find the Longest Common Subsequence (LCS) of the unique anchors,
+//      respecting position order — these become the stable pivot points.
+//   3. Between consecutive anchors, recurse on the sub-slices.
+//   4. Gaps with no unique anchors (or empty slices) fall back to the classic
+//      LCS diff on ALL lines in the sub-slice.
+//
+// Edge cases:
+//   patience_diff([], [])       -> []
+//   patience_diff([], ["x"])    -> [["+" , "x"]]
+//   patience_diff(["x"], [])    -> [["-", "x"]]
+//   patience_diff(xs, xs)       -> all "=" ops
+// ============================================================================
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+// _pd_make: produce a 2-element op list.
+fn _pd_make(tag, line)
+    let op = []
+    op.push(tag)
+    op.push(line)
+    op
+
+// _pd_op_tag: get tag from op.
+fn _pd_op_tag(op)
+    op[0]
+
+// _pd_op_line: get line from op.
+fn _pd_op_line(op)
+    op[1]
+
+// _pd_append_all: append all elements of src into dst (mutates dst).
+fn _pd_append_all(dst, src)
+    let i = 0
+    while i < len(src)
+        dst.push(src[i])
+        i = i + 1
+
+// ── Classic LCS diff (fallback for gap segments) ──────────────────────────────
+
+// _pd_lcs_dp: full LCS DP table for slices a[a0..a1) vs b[b0..b1).
+// Returns flat list of (rows+1)*(cols+1) ints, row-major.
+fn _pd_lcs_dp(a, a0, a1, b, b0, b1)
+    let rows = a1 - a0
+    let cols = b1 - b0
+    let sz = (rows + 1) * (cols + 1)
+    let dp = []
+    let fill = 0
+    while fill < sz
+        dp.push(0)
+        fill = fill + 1
+    let i = 1
+    while i <= rows
+        let j = 1
+        while j <= cols
+            let idx = i * (cols + 1) + j
+            if a[a0 + i - 1] == b[b0 + j - 1]
+                let diag = dp[(i - 1) * (cols + 1) + (j - 1)] + 1
+                dp[idx] = diag
+            else
+                let from_top  = dp[(i - 1) * (cols + 1) + j]
+                let from_left = dp[i * (cols + 1) + (j - 1)]
+                if from_top >= from_left
+                    dp[idx] = from_top
+                else
+                    dp[idx] = from_left
+            j = j + 1
+        i = i + 1
+    dp
+
+// _pd_lcs_diff: produce edit-script ops for a[a0..a1) vs b[b0..b1) via LCS.
+// Appends to dst (mutates).
+fn _pd_lcs_diff(a, a0, a1, b, b0, b1, dst)
+    let rows = a1 - a0
+    let cols = b1 - b0
+
+    if rows == 0 and cols == 0
+        return 0
+
+    if rows == 0
+        let j = b0
+        while j < b1
+            dst.push(_pd_make("+", b[j]))
+            j = j + 1
+        return 0
+
+    if cols == 0
+        let i = a0
+        while i < a1
+            dst.push(_pd_make("-", a[i]))
+            i = i + 1
+        return 0
+
+    let dp = _pd_lcs_dp(a, a0, a1, b, b0, b1)
+
+    // Backtrack collecting in reverse then flip.
+    let rev = []
+    let ci = rows
+    let cj = cols
+    while ci > 0 or cj > 0
+        if ci > 0 and cj > 0 and a[a0 + ci - 1] == b[b0 + cj - 1]
+            rev.push(_pd_make("=", a[a0 + ci - 1]))
+            ci = ci - 1
+            cj = cj - 1
+        else
+            let score_top  = 0
+            let score_left = 0
+            if ci > 0
+                score_top = dp[(ci - 1) * (cols + 1) + cj]
+            if cj > 0
+                score_left = dp[ci * (cols + 1) + (cj - 1)]
+            if cj == 0 or (ci > 0 and score_top > score_left)
+                rev.push(_pd_make("-", a[a0 + ci - 1]))
+                ci = ci - 1
+            else
+                rev.push(_pd_make("+", b[b0 + cj - 1]))
+                cj = cj - 1
+
+    // Reverse rev into dst.
+    let ri = len(rev) - 1
+    while ri >= 0
+        dst.push(rev[ri])
+        ri = ri - 1
+    0
+
+// ── Unique-anchor finding ─────────────────────────────────────────────────────
+
+// _pd_count_in_slice: count occurrences of line in list[lo..hi).
+fn _pd_count_in_slice(lst, lo, hi, line)
+    let cnt = 0
+    let i = lo
+    while i < hi
+        if lst[i] == line
+            cnt = cnt + 1
+        i = i + 1
+    cnt
+
+// _pd_first_pos_in_slice: return first index of line in list[lo..hi), or -1.
+fn _pd_first_pos_in_slice(lst, lo, hi, line)
+    let i = lo
+    while i < hi
+        if lst[i] == line
+            return i
+        i = i + 1
+    return -1
+
+// _pd_unique_anchors: find lines that appear exactly once in a[a0..a1) AND
+// exactly once in b[b0..b1). Returns a list of [ai, bi] pairs in a-order.
+fn _pd_unique_anchors(a, a0, a1, b, b0, b1)
+    let anchors = []
+    let i = a0
+    while i < a1
+        let line = a[i]
+        // Must appear exactly once in a-slice.
+        let ca = _pd_count_in_slice(a, a0, a1, line)
+        if ca == 1
+            // Must appear exactly once in b-slice.
+            let cb = _pd_count_in_slice(b, b0, b1, line)
+            if cb == 1
+                let bpos = _pd_first_pos_in_slice(b, b0, b1, line)
+                let pair = []
+                pair.push(i)
+                pair.push(bpos)
+                anchors.push(pair)
+        i = i + 1
+    anchors
+
+// ── LCS of anchor pairs (patience sort / LCS on bi-values) ───────────────────
+
+// _pd_anchor_lcs: given a list of [ai, bi] pairs (already in ai order),
+// find the LCS by bi values (patience sort / standard DP on bi sequence).
+// Returns the subsequence of pairs that forms the LCS.
+fn _pd_anchor_lcs(pairs)
+    let n = len(pairs)
+    if n == 0
+        return []
+
+    // Standard O(n^2) LCS DP on bi values (n is small — unique lines).
+    let dp = []
+    let pred = []
+    let k = 0
+    while k < n
+        dp.push(1)
+        pred.push(-1)
+        k = k + 1
+
+    let i = 1
+    while i < n
+        let bi = pairs[i][1]
+        let j = 0
+        while j < i
+            let bj = pairs[j][1]
+            if bj < bi
+                let cand = dp[j] + 1
+                if cand > dp[i]
+                    dp[i] = cand
+                    pred[i] = j
+            j = j + 1
+        i = i + 1
+
+    // Find index with max dp value.
+    let best = 0
+    let bi2 = 1
+    while bi2 < n
+        if dp[bi2] > dp[best]
+            best = bi2
+        bi2 = bi2 + 1
+
+    // Reconstruct path.
+    let path = []
+    let cur = best
+    while cur != -1
+        path.push(cur)
+        cur = pred[cur]
+
+    // Reverse path to get forward order.
+    let result = []
+    let pi = len(path) - 1
+    while pi >= 0
+        result.push(pairs[path[pi]])
+        pi = pi - 1
+    result
+
+// ── Core patience diff (recursive) ───────────────────────────────────────────
+
+// _pd_core: produce ops for a[a0..a1) vs b[b0..b1) via patience diff.
+// Appends to dst (mutates).
+fn _pd_core(a, a0, a1, b, b0, b1, dst)
+    if a0 == a1 and b0 == b1
+        return 0
+
+    // Find unique anchors.
+    let raw_anchors = _pd_unique_anchors(a, a0, a1, b, b0, b1)
+
+    // Compute LCS of those anchors by b-position.
+    let pivots = _pd_anchor_lcs(raw_anchors)
+
+    if len(pivots) == 0
+        // No unique anchors — fall back to classic LCS diff.
+        _pd_lcs_diff(a, a0, a1, b, b0, b1, dst)
+        return 0
+
+    // Recurse between consecutive pivots.
+    let prev_ai = a0
+    let prev_bi = b0
+    let pi = 0
+    while pi < len(pivots)
+        let pivot = pivots[pi]
+        let cur_ai = pivot[0]
+        let cur_bi = pivot[1]
+        // Recurse on the gap before this pivot.
+        _pd_core(a, prev_ai, cur_ai, b, prev_bi, cur_bi, dst)
+        // Emit the pivot itself as "=".
+        dst.push(_pd_make("=", a[cur_ai]))
+        prev_ai = cur_ai + 1
+        prev_bi = cur_bi + 1
+        pi = pi + 1
+
+    // Recurse on the tail after the last pivot.
+    _pd_core(a, prev_ai, a1, b, prev_bi, b1, dst)
+    0
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// patience_diff: compute a patience diff between two lists of strings.
+// Returns a list of [tag, line] ops using tags "=", "-", "+".
+fn patience_diff(a_lines, b_lines)
+    let dst = []
+    let m = len(a_lines)
+    let n = len(b_lines)
+    _pd_core(a_lines, 0, m, b_lines, 0, n, dst)
+    dst
+
+// patience_apply: reconstruct b_lines from a_lines and a patience diff script.
+// "=" and "-" ops advance through a; "=" and "+" ops emit to output.
+fn patience_apply(a_lines, script)
+    let out = []
+    let ai = 0
+    let si = 0
+    while si < len(script)
+        let op = script[si]
+        let tag = op[0]
+        if tag == "="
+            out.push(a_lines[ai])
+            ai = ai + 1
+        else
+            if tag == "-"
+                ai = ai + 1
+            else
+                out.push(op[1])
+        si = si + 1
+    out
+
+// ============================================================================
+fn main()
+    print("std/text/diff_patience loaded")

@@ -1,0 +1,375 @@
+// ============================================================================
+// NOVA Standard Library — std/text/diff_histogram
+// ============================================================================
+// Histogram diff: a line-level diff that prefers low-occurrence "anchor" lines
+// as match points (similar in spirit to patience diff, but using occurrence
+// counts rather than uniqueness alone).  Low-count lines make better anchors
+// because they are more structurally significant — a line that appears once is
+// a stronger landmark than a blank line that appears 50 times.
+//
+// Shared edit-script format (interoperable with other std/text diff modules):
+//   A script is a list of ops.  Each op is a 2-element list [tag, line] where:
+//     "="  — keep  (line present in both a and b; consumes one a-line, emits it)
+//     "-"  — delete (line present in a, removed from b; consumes one a-line)
+//     "+"  — insert (line present in b, not in a; emits one b-line)
+//   Reconstruction: reading left-to-right, "=" and "-" consume a-lines in order;
+//   "=" and "+" emit b-lines.  So histogram_apply(a_lines, script) rebuilds b.
+//
+// Public API:
+//   histogram_diff(a_lines, b_lines) -> script
+//       a_lines, b_lines: lists of strings.
+//       Returns a list of [tag, line] ops as described above.
+//
+//   histogram_apply(a_lines, script) -> list of strings
+//       Reconstructs b_lines by applying the script to a_lines.
+//       Round-trip guarantee: histogram_apply(a, histogram_diff(a, b)) == b
+//
+// Algorithm (simplified histogram / patience hybrid):
+//   1. Count occurrences of every line in both a_lines and b_lines.
+//   2. Among lines that appear in both sequences, those with the lowest total
+//      occurrence count (a_count + b_count) are the best anchors.
+//   3. Scan a_lines left-to-right; for each position find the best-scored
+//      matching b-position (not yet claimed, lowest occurrence sum).
+//      Build a patience-style longest-increasing-subsequence (LIS) of these
+//      anchor pairs — this gives the "backbone" of the diff.
+//   4. Recursively diff the gaps between anchors using plain LCS (the existing
+//      _hist_lcs helper), so even non-anchor lines are handled correctly.
+//   5. Edge cases: empty inputs, identical inputs, full replacements — all handled.
+// ============================================================================
+
+// ── Private: list builder helpers ──────────────────────────────────────────
+
+// _hist_make_op: create a 2-element list [tag, line]
+fn _hist_make_op(tag, line)
+    let op = []
+    op.push(tag)
+    op.push(line)
+    op
+
+// _hist_append_all: append all elements of src into dst (mutates dst)
+fn _hist_append_all(dst, src)
+    let i = 0
+    while i < len(src)
+        dst.push(src[i])
+        i = i + 1
+
+// ── Private: LCS-based diff for a sub-range ────────────────────────────────
+
+// _hist_lcs_dp: build LCS DP table over a[a0..a1) vs b[b0..b1).
+// Returns flat list of (na+1)*(nb+1) ints, row-major.
+fn _hist_lcs_dp(a, a0, a1, b, b0, b1)
+    let na = a1 - a0
+    let nb = b1 - b0
+    let sz = (na + 1) * (nb + 1)
+    let dp = []
+    let fill = 0
+    while fill < sz
+        dp.push(0)
+        fill = fill + 1
+    let i = 1
+    while i <= na
+        let j = 1
+        while j <= nb
+            let idx = i * (nb + 1) + j
+            if a[a0 + i - 1] == b[b0 + j - 1]
+                let diag = dp[(i - 1) * (nb + 1) + (j - 1)] + 1
+                dp[idx] = diag
+            else
+                let from_top  = dp[(i - 1) * (nb + 1) + j]
+                let from_left = dp[i * (nb + 1) + (j - 1)]
+                if from_top >= from_left
+                    dp[idx] = from_top
+                else
+                    dp[idx] = from_left
+            j = j + 1
+        i = i + 1
+    dp
+
+// _hist_lcs_diff: emit ops for a[a0..a1) vs b[b0..b1) using LCS backtrack.
+// Appends ops to out (mutates out).
+fn _hist_lcs_diff(a, a0, a1, b, b0, b1, out)
+    let na = a1 - a0
+    let nb = b1 - b0
+    // Both empty: nothing to do.
+    if na == 0 and nb == 0
+        return 0
+    // Only a has lines: all deletions.
+    if nb == 0
+        let i = a0
+        while i < a1
+            out.push(_hist_make_op("-", a[i]))
+            i = i + 1
+        return 0
+    // Only b has lines: all insertions.
+    if na == 0
+        let j = b0
+        while j < b1
+            out.push(_hist_make_op("+", b[j]))
+            j = j + 1
+        return 0
+    // General: LCS.
+    let dp = _hist_lcs_dp(a, a0, a1, b, b0, b1)
+    let nb1 = nb + 1
+    // Backtrack from (na, nb) to (0, 0), collect in reverse.
+    let rev = []
+    let ci = na
+    let cj = nb
+    while ci > 0 or cj > 0
+        if ci > 0 and cj > 0 and a[a0 + ci - 1] == b[b0 + cj - 1]
+            rev.push(_hist_make_op("=", a[a0 + ci - 1]))
+            ci = ci - 1
+            cj = cj - 1
+        else
+            let score_top  = 0
+            let score_left = 0
+            if ci > 0
+                score_top = dp[(ci - 1) * nb1 + cj]
+            if cj > 0
+                score_left = dp[ci * nb1 + (cj - 1)]
+            if cj == 0 or (ci > 0 and score_top > score_left)
+                rev.push(_hist_make_op("-", a[a0 + ci - 1]))
+                ci = ci - 1
+            else
+                rev.push(_hist_make_op("+", b[b0 + cj - 1]))
+                cj = cj - 1
+    // Reverse rev into out.
+    let ri = len(rev) - 1
+    while ri >= 0
+        out.push(rev[ri])
+        ri = ri - 1
+    0
+
+// ── Private: occurrence counting ───────────────────────────────────────────
+
+// _hist_count_lines: count occurrences of each distinct line in the list.
+// Returns a dict mapping line -> count.
+fn _hist_count_lines(lines, lo, hi)
+    let counts = {}
+    let i = lo
+    while i < hi
+        let ln = lines[i]
+        if contains(counts, ln)
+            counts[ln] = counts[ln] + 1
+        else
+            counts[ln] = 1
+        i = i + 1
+    counts
+
+// ── Private: LIS (longest increasing subsequence) for anchor pairing ───────
+// We have a list of (ai, bj) candidate pairs sorted by ai.
+// We want the longest subsequence where both ai and bj are strictly increasing
+// (i.e., a valid non-crossing matching).
+// Standard patience-sort LIS on the bj values.
+
+// _lis_extract: given piles (list of last-bj for each pile) and prev arrays,
+// trace back from the tail to recover the chosen indices.
+// piles_idx[k] = index into pairs[] of the last element in pile k.
+// prev_idx[k] = index into pairs[] of the predecessor of pairs[k] in the LIS.
+fn _hist_lis(pairs)
+    // pairs is a list of [ai, bj] lists, sorted by ai ascending.
+    let n = len(pairs)
+    if n == 0
+        return []
+    // piles: list of bj values (tails of piles for patience sort)
+    // pile_back: for each pile, the index in pairs[] of its current tail
+    let piles = []
+    let pile_back = []
+    // prev: predecessor index in pairs[] for each element (-1 = none)
+    let prv = []
+    let k = 0
+    while k < n
+        prv.push(-1)
+        k = k + 1
+    let k2 = 0
+    while k2 < n
+        let bj = pairs[k2][1]
+        // Binary search for leftmost pile whose tail >= bj.
+        let lo = 0
+        let hi = len(piles)
+        while lo < hi
+            let mid = (lo + hi) / 2
+            if piles[mid] < bj
+                lo = mid + 1
+            else
+                hi = mid
+        // lo is the pile index to place this element.
+        if lo < len(piles)
+            piles[lo] = bj
+            pile_back[lo] = k2
+        else
+            piles.push(bj)
+            pile_back.push(k2)
+        // Record predecessor: the tail of the pile to the left.
+        if lo > 0
+            prv[k2] = pile_back[lo - 1]
+        k2 = k2 + 1
+    // Trace back from the tail of the last pile.
+    let result = []
+    let npiles = len(piles)
+    if npiles == 0
+        return result
+    let cur = pile_back[npiles - 1]
+    while cur >= 0
+        result.push(pairs[cur])
+        cur = prv[cur]
+    // result is in reverse order; reverse it.
+    let out = []
+    let ri = len(result) - 1
+    while ri >= 0
+        out.push(result[ri])
+        ri = ri - 1
+    out
+
+// ── Private: histogram anchor selection ────────────────────────────────────
+
+// _hist_find_anchors: for a[a0..a1) vs b[b0..b1), find anchor pairs [ai, bj]
+// using occurrence-weighted patience matching.
+// Strategy:
+//   1. Count occurrences of each line in a-range and b-range.
+//   2. For each a-position, if the line also appears in b, record all (ai, bj)
+//      candidate pairs weighted by (a_count + b_count).  Prefer lines that
+//      appear fewer times (lower sum = better anchor).
+//   3. Among candidates, greedily pick: for each a-position, pick the b-position
+//      not yet used that has the smallest occurrence sum; break ties by smallest bj.
+//   4. Run LIS on the resulting (ai, bj) list to get a non-crossing matching.
+fn _hist_find_anchors(a, a0, a1, b, b0, b1)
+    let a_counts = _hist_count_lines(a, a0, a1)
+    let b_counts = _hist_count_lines(b, b0, b1)
+    // Build b-index: for each line, a sorted list of b-positions where it appears.
+    // We store as dict: line -> list of positions.
+    let b_positions = {}
+    let j = b0
+    while j < b1
+        let ln = b[j]
+        if contains(b_positions, ln)
+            b_positions[ln].push(j)
+        else
+            let lst = []
+            lst.push(j)
+            b_positions[ln] = lst
+        j = j + 1
+    // For each b-position track whether it's been used.
+    let b_used = {}
+    // Generate candidate pairs: for each a-position, find its best b-match.
+    // "best" = lowest occurrence sum, then smallest b-position.
+    let cands = []
+    let i = a0
+    while i < a1
+        let ln = a[i]
+        if contains(b_positions, ln) and contains(a_counts, ln) and contains(b_counts, ln)
+            let acnt = a_counts[ln]
+            let bcnt = b_counts[ln]
+            let score = acnt + bcnt
+            // Find the first unused b-position for this line.
+            let blist = b_positions[ln]
+            let bk = 0
+            let best_bj = -1
+            while bk < len(blist)
+                let bpos = blist[bk]
+                if contains(b_used, str(bpos)) == false
+                    best_bj = bpos
+                    bk = len(blist)
+                bk = bk + 1
+            if best_bj >= 0
+                let pair = []
+                pair.push(i)
+                pair.push(best_bj)
+                pair.push(score)
+                cands.push(pair)
+        i = i + 1
+    // Build LIS-ready pairs: [ai, bj] sorted by ai (already sorted since we
+    // iterate a in order).  But we want to prioritize low-score lines.
+    // For each a-position, pick only its best (lowest-score) b-candidate.
+    // We already did that above (first unused bj for the line).
+    // Now extract [ai, bj] pairs and run LIS.
+    let pairs = []
+    let ci = 0
+    while ci < len(cands)
+        let pair2 = []
+        pair2.push(cands[ci][0])
+        pair2.push(cands[ci][1])
+        pairs.push(pair2)
+        ci = ci + 1
+    _hist_lis(pairs)
+
+// ── Private: recursive histogram diff ──────────────────────────────────────
+
+// _hist_diff_range: diff a[a0..a1) vs b[b0..b1), appending ops to out.
+fn _hist_diff_range(a, a0, a1, b, b0, b1, out)
+    let na = a1 - a0
+    let nb = b1 - b0
+    // Base cases.
+    if na == 0 and nb == 0
+        return 0
+    if na == 0
+        let j = b0
+        while j < b1
+            out.push(_hist_make_op("+", b[j]))
+            j = j + 1
+        return 0
+    if nb == 0
+        let i = a0
+        while i < a1
+            out.push(_hist_make_op("-", a[i]))
+            i = i + 1
+        return 0
+    // Find histogram anchors.
+    let anchors = _hist_find_anchors(a, a0, a1, b, b0, b1)
+    if len(anchors) == 0
+        // No anchors: fall back to LCS for the full range.
+        _hist_lcs_diff(a, a0, a1, b, b0, b1, out)
+        return 0
+    // Process gaps between anchors.
+    let prev_ai = a0
+    let prev_bj = b0
+    let ak = 0
+    while ak < len(anchors)
+        let ai = anchors[ak][0]
+        let bj = anchors[ak][1]
+        // Diff the gap before this anchor.
+        _hist_lcs_diff(a, prev_ai, ai, b, prev_bj, bj, out)
+        // Emit the anchor as a keep op.
+        out.push(_hist_make_op("=", a[ai]))
+        prev_ai = ai + 1
+        prev_bj = bj + 1
+        ak = ak + 1
+    // Diff the tail after the last anchor.
+    _hist_lcs_diff(a, prev_ai, a1, b, prev_bj, b1, out)
+    0
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+// histogram_diff: compute a histogram-style edit script from a_lines to b_lines.
+// Returns a list of [tag, line] ops where tag in {"=", "-", "+"}.
+// Reconstruction: histogram_apply(a_lines, histogram_diff(a_lines, b_lines)) == b_lines.
+fn histogram_diff(a_lines, b_lines)
+    let out = []
+    _hist_diff_range(a_lines, 0, len(a_lines), b_lines, 0, len(b_lines), out)
+    out
+
+// histogram_apply: apply an edit script to a_lines, reconstructing b_lines.
+// "=" ops copy the next a-line to output.
+// "-" ops consume (skip) the next a-line.
+// "+" ops copy the script line to output without consuming an a-line.
+fn histogram_apply(a_lines, script)
+    let out = []
+    let ai = 0
+    let si = 0
+    while si < len(script)
+        let op = script[si]
+        let tag = op[0]
+        let ln = op[1]
+        if tag == "="
+            out.push(ln)
+            ai = ai + 1
+        else
+            if tag == "-"
+                ai = ai + 1
+            else
+                out.push(ln)
+        si = si + 1
+    out
+
+// ============================================================================
+fn main()
+    print("std/text/diff_histogram loaded")

@@ -1,0 +1,179 @@
+// ============================================================================
+// NOVA Standard Library — std/text/diff_char
+// ============================================================================
+// Character-level diff + patch using the shared edit-script format.
+//
+// Public API:
+//   diff_chars(a_str, b_str) -> list
+//       Returns an edit script: a list of 2-element [tag, char] ops where:
+//         "="  — character present in both a and b (keep)
+//         "-"  — character present in a, removed in b (delete)
+//         "+"  — character present in b, added (insert)
+//       Ops appear in merged order. Within a hunk, deletes precede inserts.
+//
+//   chars_apply(a_str, script) -> string
+//       Reconstructs b from a by replaying the edit script:
+//         "=" and "-" consume characters from a_str in order.
+//         "=" and "+" emit characters to the output.
+//       Returns the reconstructed target string.
+//
+// Algorithm:
+//   LCS (Longest Common Subsequence) DP on characters, O(m*n) time and space.
+//   Backtrack from dp[m][n] prefers INSERT on a tie so that in forward order
+//   deletes come before inserts within a hunk.
+//
+// Edge cases:
+//   diff_chars("", "")   -> []
+//   diff_chars("", "x")  -> [["+" , "x"]]
+//   diff_chars("x", "")  -> [["-", "x"]]
+//   diff_chars("abc","abc") -> [["=","a"],["=","b"],["=","c"]]
+// ============================================================================
+
+// ── Private: LCS DP table ───────────────────────────────────────────────────
+
+// _dc_lcs_dp builds the full LCS DP table for two character arrays.
+// a_chars and b_chars are lists of single-character strings.
+// Returns a flat list of (m+1)*(n+1) ints, row-major.
+// dp[i*(n+1)+j] = LCS length of a_chars[0..i-1] vs b_chars[0..j-1].
+fn _dc_lcs_dp(a_chars, b_chars)
+    let m = len(a_chars)
+    let n = len(b_chars)
+    let sz = (m + 1) * (n + 1)
+    // Initialise all cells to zero.
+    let dp = []
+    let fill = 0
+    while fill < sz
+        dp.push(0)
+        fill = fill + 1
+    // Fill row by row.
+    let i = 1
+    while i <= m
+        let j = 1
+        while j <= n
+            let idx = i * (n + 1) + j
+            if a_chars[i - 1] == b_chars[j - 1]
+                let diag = dp[(i - 1) * (n + 1) + (j - 1)] + 1
+                dp[idx] = diag
+            else
+                let from_top  = dp[(i - 1) * (n + 1) + j]
+                let from_left = dp[i * (n + 1) + (j - 1)]
+                if from_top >= from_left
+                    dp[idx] = from_top
+                else
+                    dp[idx] = from_left
+            j = j + 1
+        i = i + 1
+    dp
+
+// _dc_explode: split a string into a list of single-character strings.
+fn _dc_explode(s)
+    let result = []
+    let n = len(s)
+    let i = 0
+    while i < n
+        result.push(slice(s, i, i + 1))
+        i = i + 1
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// diff_chars compares a_str and b_str character by character and returns an
+// edit script as a list of [tag, char] 2-element lists.
+// Tags: "=" (keep), "-" (delete from a), "+" (insert from b).
+fn diff_chars(a_str, b_str)
+    let a_chars = _dc_explode(a_str)
+    let b_chars = _dc_explode(b_str)
+    let m = len(a_chars)
+    let n = len(b_chars)
+
+    // Edge case: both empty.
+    if m == 0 and n == 0
+        return []
+
+    // Edge case: a is empty — all characters in b are insertions.
+    if m == 0
+        let out = []
+        let j = 0
+        while j < n
+            let op = ["+", b_chars[j]]
+            out.push(op)
+            j = j + 1
+        return out
+
+    // Edge case: b is empty — all characters in a are deletions.
+    if n == 0
+        let out = []
+        let i = 0
+        while i < m
+            let op = ["-", a_chars[i]]
+            out.push(op)
+            i = i + 1
+        return out
+
+    // General case: LCS DP + backtrack.
+    let dp = _dc_lcs_dp(a_chars, b_chars)
+
+    // Backtrack from dp[m][n] to (0,0) collecting ops in REVERSE order.
+    // Prefer INSERT (left step / decrement cj) on a tie so that in the
+    // forward edit script deletes appear before inserts within a hunk.
+    let rev = []
+    let ci = m
+    let cj = n
+    while ci > 0 or cj > 0
+        if ci > 0 and cj > 0 and a_chars[ci - 1] == b_chars[cj - 1]
+            // Common character — diagonal step.
+            let op = ["=", a_chars[ci - 1]]
+            rev.push(op)
+            ci = ci - 1
+            cj = cj - 1
+        else
+            let score_top  = 0
+            let score_left = 0
+            if ci > 0
+                score_top = dp[(ci - 1) * (n + 1) + cj]
+            if cj > 0
+                score_left = dp[ci * (n + 1) + (cj - 1)]
+            // Prefer delete (up) only when it gives strictly better LCS score,
+            // or when cj is exhausted.  Otherwise prefer insert (left).
+            if cj == 0 or (ci > 0 and score_top > score_left)
+                // Delete a_chars[ci-1].
+                let op = ["-", a_chars[ci - 1]]
+                rev.push(op)
+                ci = ci - 1
+            else
+                // Insert b_chars[cj-1].
+                let op = ["+", b_chars[cj - 1]]
+                rev.push(op)
+                cj = cj - 1
+
+    // Reverse rev to produce the forward edit script.
+    let result = []
+    let ri = len(rev) - 1
+    while ri >= 0
+        result.push(rev[ri])
+        ri = ri - 1
+    result
+
+// chars_apply replays an edit script produced by diff_chars against a_str,
+// reconstructing the target string b.
+// "=" and "-" ops consume the next character of a_str.
+// "=" and "+" ops emit the op's character to the output.
+fn chars_apply(a_str, script)
+    let out = ""
+    let ns = len(script)
+    let si = 0
+    while si < ns
+        let op = script[si]
+        let tag = op[0]
+        let ch  = op[1]
+        if tag == "="
+            out = out + ch
+        else
+            if tag == "+"
+                out = out + ch
+        si = si + 1
+    out
+
+// ============================================================================
+fn main()
+    print("std/text/diff_char loaded")
