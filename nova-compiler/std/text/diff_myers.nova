@@ -1,0 +1,301 @@
+// ============================================================================
+// NOVA Standard Library — std/text/diff_myers
+// ============================================================================
+// Myers O(ND) line diff producing the shared [tag, line] edit-script format.
+//
+// Shared edit-script format (interoperable with other std/text diff modules):
+//   A script is a list of ops.  Each op is a 2-element list [tag, line] where:
+//     "="  — keep   (line present in both a and b; consumes one a-line, emits it)
+//     "-"  — delete (line present in a, removed; consumes one a-line)
+//     "+"  — insert (line present in b, not in a; emits one b-line)
+//   Reconstruction: read left-to-right; "=" and "-" consume a-lines in order;
+//   "=" and "+" emit b-lines.  So diff_apply(a_lines, diff_lines(a,b)) == b_lines.
+//
+// Public API:
+//   diff_lines(a_lines, b_lines) -> script
+//   diff_apply(a_lines, script) -> list of strings (reconstructs b_lines)
+//   diff_text(a_str, b_str) -> script (split on newline first)
+//
+// Algorithm: Myers O(ND).
+//   We use an iterative approach with explicit path snapshotting.
+//   offset = m + n + 1 so diagonal k in [-(m+n)..(m+n)] maps to index k+offset >= 0.
+//   For each d (edit distance), we snapshot the v array.
+//   Then backtrack from (m,n) through the snapshots to recover the path.
+// ============================================================================
+
+// ── Private: op constructor ───────────────────────────────────────────────────
+
+fn _my_make_op(tag, line)
+    let op = []
+    op.push(tag)
+    op.push(line)
+    op
+
+// ── Private: Myers forward search with snapshots ─────────────────────────────
+
+// _my_new_v: allocate zero-filled list of size sz
+fn _my_new_v(sz)
+    let v = []
+    let i = 0
+    while i < sz
+        v.push(0)
+        i = i + 1
+    v
+
+// _my_copy_v: shallow copy a list
+fn _my_copy_v(src)
+    let dst = []
+    let i = 0
+    while i < len(src)
+        dst.push(src[i])
+        i = i + 1
+    dst
+
+// _my_search: Myers forward search from (0,0) to (m,n).
+// Returns [edit_d, snaps] where snaps[d] is the v-snapshot after processing depth d.
+// v[k + offset] = furthest reachable x on diagonal k after d edits.
+// offset = m + n + 1.
+fn _my_search(a, b, m, n)
+    let max_d = m + n
+    let offset = max_d + 1
+    let vsz = 2 * max_d + 3
+    let v = _my_new_v(vsz)
+    // Standard Myers init: v[1+offset] means diagonal 1, x=0 (starting point).
+    v[1 + offset] = 0
+    let snaps = []
+    let d = 0
+    while d <= max_d
+        let k = 0 - d
+        while k <= d
+            // Compute x: choose to come from k-1 (insert) or k+1 (delete).
+            let x = 0
+            let from_delete = 0
+            if k == 0 - d
+                // Leftmost diagonal: must come from k+1 (delete: x unchanged, diag k = (k+1)-1).
+                from_delete = 1
+                x = v[k + 1 + offset]
+            else
+                if k == d
+                    // Rightmost diagonal: must come from k-1 (insert: x+1 from k-1).
+                    from_delete = 0
+                    x = v[k - 1 + offset] + 1
+                else
+                    let vk_minus = v[k - 1 + offset]
+                    let vk_plus  = v[k + 1 + offset]
+                    if vk_plus > vk_minus
+                        // delete: take from k+1, x stays same
+                        from_delete = 1
+                        x = vk_plus
+                    else
+                        // insert: take from k-1, x increments
+                        from_delete = 0
+                        x = vk_minus + 1
+            // Advance along matching diagonal (snake).
+            let y = x - k
+            while x < m and y < n and a[x] == b[y]
+                x = x + 1
+                y = y + 1
+            v[k + offset] = x
+            // Check if we've reached (m,n).
+            if x >= m and y >= n
+                let snap = _my_copy_v(v)
+                snaps.push(snap)
+                let result = []
+                result.push(d)
+                result.push(snaps)
+                return result
+            k = k + 2
+        // Save snapshot at end of depth d.
+        let snap2 = _my_copy_v(v)
+        snaps.push(snap2)
+        d = d + 1
+    // Fallback (should not reach).
+    let fb = []
+    fb.push(max_d)
+    fb.push(snaps)
+    fb
+
+// ── Private: backtrack to recover edit path ───────────────────────────────────
+
+// _my_backtrack: given search result, reconstruct the edit script.
+// Walks from (m,n) back to (0,0), emitting ops in reverse, then reverses.
+fn _my_backtrack(a, b, m, n, sr)
+    let edit_d = sr[0]
+    let snaps  = sr[1]
+    let max_d = m + n
+    let offset = max_d + 1
+    let x = m
+    let y = n
+    let rev = []
+    let d = edit_d
+    while d > 0
+        // The snapshot at index d-1 is the v BEFORE this round's moves.
+        // (snaps[0] = after d=0; snaps[d-1] = after d=d-1 but that is the state
+        //  used as INPUT to round d.  We need the v that was in effect AT THE START
+        //  of round d, which is the v after d-1 iterations = snaps[d-1].)
+        let prev_v = snaps[d - 1]
+        let k = x - y
+        // Determine whether the edit at depth d on diagonal k was delete or insert.
+        let from_delete = 0
+        if k == 0 - d
+            from_delete = 1
+        else
+            if k == d
+                from_delete = 0
+            else
+                let vk_minus = prev_v[k - 1 + offset]
+                let vk_plus  = prev_v[k + 1 + offset]
+                if vk_plus > vk_minus
+                    from_delete = 1
+                else
+                    from_delete = 0
+        // Determine the position BEFORE the snake for this step.
+        // If delete: came from diagonal k+1 at d-1 via delete (x unchanged, diag k = (k+1)-1 ... wait.
+        // delete step: x++ in a, y unchanged => diagonal k = x-y increases by 1.
+        // So delete: current diagonal k, came from k-1 at prev level? No.
+        // Standard Myers convention:
+        //   delete step: move down in edit graph (consume a[x]), x increases, y stays.
+        //     diagonal k = x - y increases by 1.
+        //     So after delete, we're on k. Before delete, we were on k-1.
+        //     x_before = x - 1, y_before = y. x_before = v[k-1] at d-1 level, y_before = x_before - (k-1).
+        //     After delete: x = x_before + 1, still same y. k = (x_before+1) - y = (x_before - y) + 1 = (k-1) + 1 = k. Yes.
+        //   insert step: move right in edit graph (consume b[y]), y increases, x stays.
+        //     diagonal k = x - y decreases by 1.
+        //     So after insert, we're on k. Before insert, we were on k+1.
+        //     x_before = x, y_before = y - 1. x_before = v[k+1] at d-1 level, y_before = x - (k+1).
+        //     After insert: y = y_before + 1, still same x. k = x - y_before - 1 = (k+1) - 1 = k. Yes.
+        // But wait: my from_delete logic uses: from_delete=1 means "came from k+1 (x unchanged)".
+        // That contradicts the above. Let me re-examine the FORWARD phase:
+        //   In the forward phase, when from_delete=1: x = v[k+1+offset] (no increment).
+        //   This means: the new x on diagonal k equals the old x from diagonal k+1.
+        //   If x_new = x_old (from k+1), and new diagonal is k, and old diagonal was k+1:
+        //     k = x - y => y = x - k. Old: y_old = x_old - (k+1) = x_new - k - 1 = y_new - 1.
+        //     So y increased by 1: this is an INSERT step (consume b). Diagonal decreased from k+1 to k.
+        //   When from_delete=0: x = v[k-1+offset] + 1 (x incremented).
+        //     Old diagonal k-1, x_old = x_new - 1, y_old = x_old - (k-1) = x_new - 1 - k + 1 = x_new - k = y_new.
+        //     x increased by 1, y stayed: this is a DELETE step (consume a). Diagonal increased from k-1 to k.
+        // So: from_delete=1 in forward => actually INSERT; from_delete=0 => actually DELETE. The naming was backwards!
+        // Let me fix: rename from_delete properly in backtrack.
+        //   from_delete=1 (came from k+1, x same) => INSERT b[y_before] where y_before = y - 1.
+        //   from_delete=0 (came from k-1, x was x-1) => DELETE a[x_before] where x_before = x - 1.
+        // First: find the x at the START of the snake for this depth d on diagonal k.
+        // The snake ran from some (x_snake_start, y_snake_start) to (x, y).
+        // At the current (x, y), x_snake_start = ... we know x_snake_start - k = y_snake_start.
+        // After the edit move but before the snake: (x_after_edit, y_after_edit).
+        //   If insert (from_delete=1): x_after_edit = prev_v[k+1+offset], y_after_edit = x_after_edit - k.
+        //   If delete (from_delete=0): x_after_edit = prev_v[k-1+offset] + 1, y_after_edit = x_after_edit - k.
+        let x_edit = 0
+        let y_edit = 0
+        if from_delete == 1
+            // INSERT: came from k+1, x unchanged.
+            x_edit = prev_v[k + 1 + offset]
+            y_edit = x_edit - k
+        else
+            // DELETE: came from k-1, x incremented.
+            x_edit = prev_v[k - 1 + offset] + 1
+            y_edit = x_edit - k
+        // Emit snake matches going backward: from (x-1,y-1) down to (x_edit, y_edit).
+        let xs = x - 1
+        while xs >= x_edit
+            rev.push(_my_make_op("=", a[xs]))
+            xs = xs - 1
+        // Emit the single edit.
+        if from_delete == 1
+            // INSERT: b[y_edit - 1] was inserted.
+            rev.push(_my_make_op("+", b[y_edit - 1]))
+        else
+            // DELETE: a[x_edit - 1] was deleted.
+            rev.push(_my_make_op("-", a[x_edit - 1]))
+        // Move cursor back to before the edit.
+        if from_delete == 1
+            x = x_edit
+            y = y_edit - 1
+        else
+            x = x_edit - 1
+            y = y_edit
+        d = d - 1
+    // Remaining snake at d=0: from (0,0) to (x,y) which should be (0,0) already,
+    // but emit any remaining equal lines at the start.
+    let xs2 = x - 1
+    while xs2 >= 0
+        rev.push(_my_make_op("=", a[xs2]))
+        xs2 = xs2 - 1
+    // Reverse rev into forward-order result.
+    let result = []
+    let ri = len(rev) - 1
+    while ri >= 0
+        result.push(rev[ri])
+        ri = ri - 1
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// diff_lines: compute Myers O(ND) edit script from a_lines to b_lines.
+fn diff_lines(a_lines, b_lines)
+    let m = len(a_lines)
+    let n = len(b_lines)
+    if m == 0 and n == 0
+        return []
+    if m == 0
+        let out = []
+        let j = 0
+        while j < n
+            out.push(_my_make_op("+", b_lines[j]))
+            j = j + 1
+        return out
+    if n == 0
+        let out = []
+        let i = 0
+        while i < m
+            out.push(_my_make_op("-", a_lines[i]))
+            i = i + 1
+        return out
+    let sr = _my_search(a_lines, b_lines, m, n)
+    _my_backtrack(a_lines, b_lines, m, n, sr)
+
+// diff_apply: apply an edit script to a_lines, reconstructing b_lines.
+fn diff_apply(a_lines, script)
+    let out = []
+    let ai = 0
+    let si = 0
+    while si < len(script)
+        let op = script[si]
+        let tag = op[0]
+        let ln  = op[1]
+        if tag == "="
+            out.push(ln)
+            ai = ai + 1
+        else
+            if tag == "-"
+                ai = ai + 1
+            else
+                out.push(ln)
+        si = si + 1
+    out
+
+// diff_text: split a_str and b_str on chr(10) then compute diff_lines.
+fn diff_text(a_str, b_str)
+    let a_lines = _my_split(a_str)
+    let b_lines = _my_split(b_str)
+    diff_lines(a_lines, b_lines)
+
+// _my_split: split text on chr(10) into a list of lines.
+fn _my_split(text)
+    let result = []
+    if len(text) == 0
+        return result
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n
+        if text[i] == chr(10)
+            result.push(slice(text, start, i))
+            start = i + 1
+        i = i + 1
+    if start <= n
+        result.push(slice(text, start, n))
+    result
+
+// ============================================================================
+fn main()
+    print("std/text/diff_myers loaded")

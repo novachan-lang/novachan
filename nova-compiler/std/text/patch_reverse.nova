@@ -1,0 +1,280 @@
+// ============================================================================
+// NOVA Standard Library — std/text/patch_reverse
+// ============================================================================
+// Reverse a unified patch: swap +/- lines, swap ---/+++ headers, and
+// recalculate @@ hunk-range line numbers so the reversed patch applies cleanly.
+//
+// Public API:
+//   reverse_script(script) -> script
+//       Given an edit-script (list of [tag, line] pairs, tag in "=","-","+"),
+//       return a new script with "+" and "-" swapped; "=" ops are kept as-is.
+//       Returns a NEW list — the input is not mutated.
+//
+//   patch_reverse(diff_text) -> string
+//       Reverses a unified-diff string:
+//         - "--- <path>" and "+++ <path>" header lines are swapped.
+//         - Lines starting with "-" become "+", "+" lines become "-".
+//         - Lines starting with " " (context) are kept unchanged.
+//         - "@@ -l,s +l,s @@" headers are recalculated: new header swaps the
+//           -l,s and +l,s sides so the reversed patch applies correctly.
+//       Empty input returns "".
+//
+// Edit-script format (shared across diff modules):
+//   A script is a list of 2-element lists [tag, line] where tag is:
+//     "="  keep (common to both a and b)
+//     "-"  delete (present in a, removed from b)
+//     "+"  insert (present in b, added)
+//   patch_apply(a_lines, script) rebuilds b_lines:
+//     "=" and "-" consume a-lines; "=" and "+" emit b-lines.
+//
+// Edge cases handled:
+//   empty script           -> []
+//   script with only "="   -> identical copy (tags unchanged)
+//   empty diff_text        -> ""
+//   diff with file headers -> --- and +++ lines are swapped
+//   diff with no hunks     -> headers (if any) still swapped, empty body
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _pr_split_lines: split text on chr(10) into a list of strings.
+fn _pr_split_lines(text)
+    let result = []
+    if len(text) == 0
+        return result
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n
+        if text[i] == chr(10)
+            result.push(slice(text, start, i))
+            start = i + 1
+        i = i + 1
+    result.push(slice(text, start, n))
+    result
+
+// _pr_join_lines: join a list of strings with chr(10).
+fn _pr_join_lines(lines)
+    if len(lines) == 0
+        return ""
+    let out = lines[0]
+    let i = 1
+    while i < len(lines)
+        out = out + chr(10) + lines[i]
+        i = i + 1
+    out
+
+// _pr_starts_with: 1 if s starts with prefix, else 0.
+fn _pr_starts_with(s, prefix)
+    let plen = len(prefix)
+    if len(s) < plen
+        return 0
+    if slice(s, 0, plen) == prefix
+        return 1
+    return 0
+
+// _pr_itos: non-negative integer to decimal string.
+fn _pr_itos(n)
+    if n == 0
+        return "0"
+    let s = ""
+    let v = n
+    while v > 0
+        let digit = v - (v / 10) * 10
+        let ch = "0"
+        if digit == 1
+            ch = "1"
+        else
+            if digit == 2
+                ch = "2"
+            else
+                if digit == 3
+                    ch = "3"
+                else
+                    if digit == 4
+                        ch = "4"
+                    else
+                        if digit == 5
+                            ch = "5"
+                        else
+                            if digit == 6
+                                ch = "6"
+                            else
+                                if digit == 7
+                                    ch = "7"
+                                else
+                                    if digit == 8
+                                        ch = "8"
+                                    else
+                                        if digit == 9
+                                            ch = "9"
+        s = ch + s
+        v = v / 10
+    s
+
+// _pr_char_digit: return digit value 0-9 if c is a digit char, else -1.
+fn _pr_char_digit(c)
+    if c == "0"
+        return 0
+    if c == "1"
+        return 1
+    if c == "2"
+        return 2
+    if c == "3"
+        return 3
+    if c == "4"
+        return 4
+    if c == "5"
+        return 5
+    if c == "6"
+        return 6
+    if c == "7"
+        return 7
+    if c == "8"
+        return 8
+    if c == "9"
+        return 9
+    return -1
+
+// _pr_parse_int: parse a non-negative decimal integer starting at start_pos in s.
+// Returns a 2-element list [value, new_pos] where new_pos is the index just
+// past the last digit consumed (i.e. the first non-digit character).
+fn _pr_parse_int(s, start_pos)
+    let v = 0
+    let pos = start_pos
+    let n = len(s)
+    let running = 1
+    while pos < n and running == 1
+        let dv = _pr_char_digit(s[pos])
+        if dv == -1
+            running = 0
+        else
+            v = v * 10 + dv
+            pos = pos + 1
+    let res = []
+    res.push(v)
+    res.push(pos)
+    res
+
+// _pr_parse_hunk_header: parse "@@ -a_start,a_count +b_start,b_count @@"
+// Returns list [a_start, a_count, b_start, b_count].
+fn _pr_parse_hunk_header(hdr)
+    let n = len(hdr)
+    // Skip "@@ -"
+    let pos = 4
+    let r1 = _pr_parse_int(hdr, pos)
+    let a_start = r1[0]
+    pos = r1[1]
+    // skip ','
+    if pos < n and hdr[pos] == ","
+        pos = pos + 1
+    let r2 = _pr_parse_int(hdr, pos)
+    let a_count = r2[0]
+    pos = r2[1]
+    // skip " +"
+    while pos < n and hdr[pos] != "+"
+        pos = pos + 1
+    pos = pos + 1
+    let r3 = _pr_parse_int(hdr, pos)
+    let b_start = r3[0]
+    pos = r3[1]
+    // skip ','
+    if pos < n and hdr[pos] == ","
+        pos = pos + 1
+    let r4 = _pr_parse_int(hdr, pos)
+    let b_count = r4[0]
+    let result = []
+    result.push(a_start)
+    result.push(a_count)
+    result.push(b_start)
+    result.push(b_count)
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// reverse_script: swap "+" and "-" tags in an edit script; "=" is kept.
+// Returns a NEW list (input not mutated).
+fn reverse_script(script)
+    let out = []
+    let i = 0
+    while i < len(script)
+        let op = script[i]
+        let tag = op[0]
+        let line = op[1]
+        let new_op = []
+        if tag == "+"
+            new_op.push("-")
+            new_op.push(line)
+        else
+            if tag == "-"
+                new_op.push("+")
+                new_op.push(line)
+            else
+                new_op.push("=")
+                new_op.push(line)
+        out.push(new_op)
+        i = i + 1
+    out
+
+// patch_reverse: reverse a unified diff text.
+// Returns the reversed diff as a string, or "" for empty input.
+fn patch_reverse(diff_text)
+    if len(diff_text) == 0
+        return ""
+    let lines = _pr_split_lines(diff_text)
+    let n = len(lines)
+    let out = []
+    let i = 0
+    while i < n
+        let line = lines[i]
+        // File header pair: "--- X" followed by "+++ Y"
+        if _pr_starts_with(line, "--- ")
+            let minus_rest = slice(line, 4, len(line))
+            let plus_rest = ""
+            if i + 1 < n and _pr_starts_with(lines[i + 1], "+++ ")
+                plus_rest = slice(lines[i + 1], 4, len(lines[i + 1]))
+                out.push("--- " + plus_rest)
+                out.push("+++ " + minus_rest)
+                i = i + 2
+            else
+                // Lone "--- " line (malformed but handle gracefully).
+                out.push(line)
+                i = i + 1
+        else
+            // Hunk header?
+            if _pr_starts_with(line, "@@ -")
+                let nums = _pr_parse_hunk_header(line)
+                let old_a_start = nums[0]
+                let old_a_count = nums[1]
+                let old_b_start = nums[2]
+                let old_b_count = nums[3]
+                // Reversed header: new -side was old +side, new +side was old -side.
+                let new_hdr = "@@ -" + _pr_itos(old_b_start) + "," + _pr_itos(old_b_count) + " +" + _pr_itos(old_a_start) + "," + _pr_itos(old_a_count) + " @@"
+                out.push(new_hdr)
+                i = i + 1
+                // Process body lines until next @@ or end.
+                let body_done = 0
+                while i < n and body_done == 0
+                    let bl = lines[i]
+                    if _pr_starts_with(bl, "@@ -") or _pr_starts_with(bl, "--- ")
+                        body_done = 1
+                    else
+                        if _pr_starts_with(bl, "-")
+                            out.push("+" + slice(bl, 1, len(bl)))
+                            i = i + 1
+                        else
+                            if _pr_starts_with(bl, "+")
+                                out.push("-" + slice(bl, 1, len(bl)))
+                                i = i + 1
+                            else
+                                out.push(bl)
+                                i = i + 1
+            else
+                // Any other line (e.g., a lone context line or trailing content).
+                out.push(line)
+                i = i + 1
+    _pr_join_lines(out)
+
+// ============================================================================
+fn main()
+    print("std/text/patch_reverse loaded")

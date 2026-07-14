@@ -1,0 +1,332 @@
+// ============================================================================
+// NOVA Standard Library — std/text/diff3_merge
+// ============================================================================
+// Three-way text merge, operating on lists of strings (one line = one element).
+//
+// Public API:
+//   diff3_merge(base, mine, theirs) -> dict
+//       base, mine, theirs: lists of strings.
+//       Returns a dict with two keys:
+//         "merged"   : list of strings — the merged result.
+//         "conflict" : int — 1 if at least one conflict region was found, 0 otherwise.
+//       Non-conflicting changes from either side are applied cleanly.
+//       Conflicting regions are included in "merged" surrounded by conflict markers.
+//
+//   diff3_clean(base, mine, theirs) -> list
+//       Convenience: same algorithm, returns only the merged list.
+//
+// Algorithm:
+//   The key insight: a three-way merge is defined over RANGES of the base.
+//   We compute an LCS alignment of (base, mine) and (base, theirs) to find
+//   which base lines are "stable" (kept by both sides) and which are in
+//   "change regions".  Stable base lines act as anchors; between any two
+//   consecutive anchors is an independent chunk that can be classified as:
+//     - both sides unchanged      -> emit base lines
+//     - only mine changed         -> emit mine's lines
+//     - only theirs changed       -> emit theirs' lines
+//     - both changed identically  -> emit the change (no conflict)
+//     - both changed differently  -> emit conflict block with markers
+//
+// The merge alignment is built by constructing a 3-way LCS (base, mine, theirs)
+// via two nested 2-way LCS passes.  For each "= in both diffs" position we have
+// a stable base line; everything else is a change chunk.
+// ============================================================================
+
+// ── Private: LCS DP ──────────────────────────────────────────────────────────
+
+fn _d3_lcs_dp(a, b)
+    let m = len(a)
+    let n = len(b)
+    let sz = (m + 1) * (n + 1)
+    let dp = []
+    let fi = 0
+    while fi < sz
+        dp.push(0)
+        fi = fi + 1
+    let i = 1
+    while i <= m
+        let j = 1
+        while j <= n
+            let idx = i * (n + 1) + j
+            if a[i - 1] == b[j - 1]
+                dp[idx] = dp[(i - 1) * (n + 1) + (j - 1)] + 1
+            else
+                let ft = dp[(i - 1) * (n + 1) + j]
+                let fl = dp[i * (n + 1) + (j - 1)]
+                if ft >= fl
+                    dp[idx] = ft
+                else
+                    dp[idx] = fl
+            j = j + 1
+        i = i + 1
+    dp
+
+// ── Private: diff (base -> side), returns list of [tag, line] ops ────────────
+// tag: "=" keep (base line survives), "-" delete (base line removed),
+//      "+" insert (new line from side, not in base).
+// Order: deletions precede insertions (LCS backtrack: prefer delete over insert).
+
+fn _d3_diff(a, b)
+    let m = len(a)
+    let n = len(b)
+    if m == 0 and n == 0
+        return []
+    if m == 0
+        let out = []
+        let j = 0
+        while j < n
+            let op = []
+            op.push("+")
+            op.push(b[j])
+            out.push(op)
+            j = j + 1
+        return out
+    if n == 0
+        let out = []
+        let i = 0
+        while i < m
+            let op = []
+            op.push("-")
+            op.push(a[i])
+            out.push(op)
+            i = i + 1
+        return out
+    let dp = _d3_lcs_dp(a, b)
+    let rev = []
+    let ci = m
+    let cj = n
+    while ci > 0 or cj > 0
+        if ci > 0 and cj > 0 and a[ci - 1] == b[cj - 1]
+            let op = []
+            op.push("=")
+            op.push(a[ci - 1])
+            rev.push(op)
+            ci = ci - 1
+            cj = cj - 1
+        else
+            let score_top  = 0
+            let score_left = 0
+            if ci > 0
+                score_top = dp[(ci - 1) * (n + 1) + cj]
+            if cj > 0
+                score_left = dp[ci * (n + 1) + (cj - 1)]
+            if cj == 0 or (ci > 0 and score_top > score_left)
+                let op = []
+                op.push("-")
+                op.push(a[ci - 1])
+                rev.push(op)
+                ci = ci - 1
+            else
+                let op = []
+                op.push("+")
+                op.push(b[cj - 1])
+                rev.push(op)
+                cj = cj - 1
+    let result = []
+    let ri = len(rev) - 1
+    while ri >= 0
+        result.push(rev[ri])
+        ri = ri - 1
+    result
+
+// ── Private: list equality ────────────────────────────────────────────────────
+
+fn _d3_list_eq(a, b)
+    if len(a) != len(b)
+        return 0
+    let i = 0
+    while i < len(a)
+        if a[i] != b[i]
+            return 0
+        i = i + 1
+    return 1
+
+// ── Private: append all elements of src to dst ───────────────────────────────
+
+fn _d3_append_all(dst, src)
+    let i = 0
+    while i < len(src)
+        dst.push(src[i])
+        i = i + 1
+
+// ── Private: build "base-indexed" segment table ───────────────────────────────
+//
+// Given an edit script (list of [tag,line] ops) and base_count (len of base),
+// build a list of base_count+1 segment dicts.
+//
+// Segment layout: each slot i (0..base_count-1) corresponds to base[i].
+//   "kept" : 1 if "=" (base line preserved by this side), 0 if "-" (deleted).
+//   "post" : list of lines inserted by "+" ops appearing AFTER this base-consuming
+//            op and BEFORE the next base-consuming op (or end of script).
+// Slot base_count (sentinel):
+//   "kept" : -1
+//   "post" : list of lines inserted by "+" ops appearing BEFORE the first
+//            base-consuming op (i.e., leading inserts) — stored here temporarily;
+//            the merge phase reads "lead" from segs[base_count]["post"].
+//
+// Storage strategy:
+//   We do a TWO-pass scan:
+//   Pass 1 — collect leading inserts (before first base-consuming op) into lead[].
+//   Pass 2 — for each base-consuming op collect its trailing inserts into post[].
+//
+// This means: for base["a","b","c"] -> mine["a","B","c"]
+//   ops: ["=","a"], ["-","b"], ["+","B"], ["=","c"]
+//   segs[0]: kept=1, post=[]
+//   segs[1]: kept=0, post=["B"]
+//   segs[2]: kept=1, post=[]
+//   segs[3]: kept=-1, post=[]  (no leading inserts)
+//
+// The merge then emits: for slot i, "what mine produces" =
+//   (if kept==1: [base[i]] else []) + post
+
+fn _d3_parse_segments(ops, base_count)
+    // Initialize result list.
+    let segs = []
+    let si = 0
+    while si <= base_count
+        let seg = {}
+        seg["kept"] = 1
+        seg["post"] = []
+        segs.push(seg)
+        si = si + 1
+    segs[base_count]["kept"] = -1
+
+    let nops = len(ops)
+    let oi = 0
+    let base_i = 0
+    let in_leading = 1
+    let lead = []
+
+    while oi < nops
+        let tag = ops[oi][0]
+        let line = ops[oi][1]
+        if tag == "+"
+            if in_leading == 1
+                lead.push(line)
+            else
+                // Post-insert for the previous base-consuming op (base_i-1).
+                segs[base_i - 1]["post"].push(line)
+        else
+            // "=" or "-" — base-consuming
+            in_leading = 0
+            if tag == "="
+                segs[base_i]["kept"] = 1
+            else
+                segs[base_i]["kept"] = 0
+            base_i = base_i + 1
+        oi = oi + 1
+
+    // Store leading inserts in segs[base_count]["post"] for the merge phase.
+    segs[base_count]["post"] = lead
+    segs
+
+// ── Private: core merge ───────────────────────────────────────────────────────
+
+// _d3_emit_chunk: merge one chunk (a mine_out and their_out lists) into out.
+// mine_untouched/their_untouched: 1 if the side made no change to this chunk.
+// Updates out and returns conflict count (0 or 1).
+fn _d3_emit_chunk(out, mine_out, their_out, mine_untouched, their_untouched)
+    if _d3_list_eq(mine_out, their_out) == 1
+        // Both agree -> emit either.
+        _d3_append_all(out, mine_out)
+        return 0
+    if mine_untouched == 1
+        // Only theirs changed -> apply theirs.
+        _d3_append_all(out, their_out)
+        return 0
+    if their_untouched == 1
+        // Only mine changed -> apply mine.
+        _d3_append_all(out, mine_out)
+        return 0
+    // Both changed differently -> conflict block.
+    out.push("<<<<<<<")
+    _d3_append_all(out, mine_out)
+    out.push("=======")
+    _d3_append_all(out, their_out)
+    out.push(">>>>>>>")
+    return 1
+
+fn _d3_merge_segs(base, m_segs, t_segs)
+    let nb = len(base)
+    let out = []
+    let conflict = 0
+
+    // Handle leading inserts (stored in segs[nb]["post"] by _d3_parse_segments).
+    // These are lines inserted before any base line.
+    let m_lead = m_segs[nb]["post"]
+    let t_lead = t_segs[nb]["post"]
+    let m_lead_untouched = 0
+    if len(m_lead) == 0
+        m_lead_untouched = 1
+    let t_lead_untouched = 0
+    if len(t_lead) == 0
+        t_lead_untouched = 1
+    if len(m_lead) > 0 or len(t_lead) > 0
+        let c = _d3_emit_chunk(out, m_lead, t_lead, m_lead_untouched, t_lead_untouched)
+        if c == 1
+            conflict = 1
+
+    // Process each base line.
+    let i = 0
+    while i < nb
+        let ms = m_segs[i]
+        let ts = t_segs[i]
+        let m_kept = ms["kept"]
+        let t_kept = ts["kept"]
+        let m_post = ms["post"]
+        let t_post = ts["post"]
+
+        // What does mine produce for base[i]?
+        //   If kept: [base[i]] + post
+        //   If deleted: [] + post
+        let mine_out = []
+        if m_kept == 1
+            mine_out.push(base[i])
+        _d3_append_all(mine_out, m_post)
+
+        // What does theirs produce for base[i]?
+        let their_out = []
+        if t_kept == 1
+            their_out.push(base[i])
+        _d3_append_all(their_out, t_post)
+
+        // Base (unchanged) produces just [base[i]].
+        // mine_untouched: kept AND no post inserts.
+        let mine_untouched = 0
+        if m_kept == 1 and len(m_post) == 0
+            mine_untouched = 1
+        let their_untouched = 0
+        if t_kept == 1 and len(t_post) == 0
+            their_untouched = 1
+
+        let c = _d3_emit_chunk(out, mine_out, their_out, mine_untouched, their_untouched)
+        if c == 1
+            conflict = 1
+
+        i = i + 1
+
+    let res = {}
+    res["merged"] = out
+    res["conflict"] = conflict
+    res
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// diff3_merge: three-way merge of base, mine, theirs (all lists of strings).
+// Returns dict: {"merged": list, "conflict": int (1=has conflicts, 0=clean)}.
+fn diff3_merge(base, mine, theirs)
+    let nb = len(base)
+    let m_ops = _d3_diff(base, mine)
+    let t_ops = _d3_diff(base, theirs)
+    let m_segs = _d3_parse_segments(m_ops, nb)
+    let t_segs = _d3_parse_segments(t_ops, nb)
+    _d3_merge_segs(base, m_segs, t_segs)
+
+// diff3_clean: same as diff3_merge but returns just the merged list.
+fn diff3_clean(base, mine, theirs)
+    let r = diff3_merge(base, mine, theirs)
+    r["merged"]
+
+// ============================================================================
+fn main()
+    print("std/text/diff3_merge loaded")
