@@ -1,0 +1,308 @@
+// std/parsing/pratt -- Generic Pratt (precedence-climbing) expression parser.
+// LEAF module -- imports NOTHING.
+//
+// Parses arithmetic expressions containing integers, binary operators, unary
+// minus, and parentheses.  Produces a dict-based AST, then evaluates it.
+//
+// AST node shapes (all nodes carry every key so dict-access is always safe):
+//   Number:  {"kind":"num",   "val":<int>, "op":"",  "msg":""}
+//   Binary:  {"kind":"binop", "op":<str>,  "val":0,  "msg":"",
+//              "left":<node>, "right":<node>}
+//   Unary:   {"kind":"unop",  "op":<str>,  "val":0,  "msg":"",
+//              "operand":<node>}
+//   Error:   {"kind":"err",   "op":"",     "val":0,  "msg":<str>}
+//
+// Public API:
+//   pratt_parse(expr: string) -> dict
+//       Tokenise and parse expr, return root AST node.
+//       On empty or malformed input returns an "err" node (does NOT crash).
+//
+//   pratt_eval(ast: dict) -> int
+//       Walk the AST and return the integer result.  Error nodes evaluate to 0.
+//
+//   pratt_calc(expr: string) -> int
+//       Convenience: pratt_eval(pratt_parse(expr)).
+//
+// Operator binding powers:
+//   +  -  : lbp=10  rbp=10   (left-associative)
+//   *  /  : lbp=20  rbp=20   (left-associative)
+//   ^     : lbp=40  rbp=39   (right-associative -- lower rbp causes right-fold)
+//   unary-: nud rbp=35       (binds tighter than +/* but LOOSER than ^)
+//
+// Convention: -2^2 == -(2^2) == -4   (unary minus has lower power than ^)
+// All functions in a NOVA file are mutually visible -- no forward declarations needed.
+
+// ── private char helpers ──────────────────────────────────────────────────────
+
+fn _prt_is_digit(ch: string) -> int
+    let o = ord(ch)
+    if o >= 48
+        if o <= 57
+            return 1
+    0
+
+fn _prt_is_space(ch: string) -> int
+    let o = ord(ch)
+    if o == 32
+        return 1
+    if o == 9
+        return 1
+    if o == 10
+        return 1
+    if o == 13
+        return 1
+    0
+
+// ── private tokeniser ─────────────────────────────────────────────────────────
+// Each token dict: k=kind, v=int value (for num), s=string value (for op/parens).
+// Kinds: "num" "op" "lp" "rp" "eof".
+
+fn _prt_make_tok(k: string, v: int, s: string) -> dict
+    let t = {}
+    t["k"] = k
+    t["v"] = v
+    t["s"] = s
+    t
+
+fn _prt_tokenise(expr: string) -> list
+    let toks = []
+    let n = len(expr)
+    let i = 0
+    while i < n
+        let ch = slice(expr, i, i + 1)
+        if _prt_is_space(ch) == 1
+            i = i + 1
+        else
+            if _prt_is_digit(ch) == 1
+                // scan full digit run to find end position
+                let end = i + 1
+                let still = 1
+                while still == 1
+                    if end >= n
+                        still = 0
+                    else
+                        let nc = slice(expr, end, end + 1)
+                        if _prt_is_digit(nc) == 1
+                            end = end + 1
+                        else
+                            still = 0
+                // accumulate integer value
+                let num_val = 0
+                let j = i
+                while j < end
+                    let dc = slice(expr, j, j + 1)
+                    num_val = num_val * 10 + ord(dc) - 48
+                    j = j + 1
+                push(toks, _prt_make_tok("num", num_val, ""))
+                i = end
+            else
+                if ch == "("
+                    push(toks, _prt_make_tok("lp", 0, "("))
+                    i = i + 1
+                else
+                    if ch == ")"
+                        push(toks, _prt_make_tok("rp", 0, ")"))
+                        i = i + 1
+                    else
+                        // check if known operator
+                        let is_op = 0
+                        if ch == "+"
+                            is_op = 1
+                        if ch == "-"
+                            is_op = 1
+                        if ch == "*"
+                            is_op = 1
+                        if ch == "/"
+                            is_op = 1
+                        if ch == "^"
+                            is_op = 1
+                        if is_op == 1
+                            push(toks, _prt_make_tok("op", 0, ch))
+                        i = i + 1
+    push(toks, _prt_make_tok("eof", 0, ""))
+    toks
+
+// ── parser state helpers ──────────────────────────────────────────────────────
+
+fn _prt_peek(st: dict) -> dict
+    let toks = st["toks"]
+    toks[st["pos"]]
+
+fn _prt_consume(st: dict) -> dict
+    let p = st["pos"]
+    let toks = st["toks"]
+    let tok = toks[p]
+    st["pos"] = p + 1
+    tok
+
+// ── binding power tables ──────────────────────────────────────────────────────
+
+fn _prt_lbp(op: string) -> int
+    if op == "+"
+        return 10
+    if op == "-"
+        return 10
+    if op == "*"
+        return 20
+    if op == "/"
+        return 20
+    if op == "^"
+        return 40
+    0
+
+fn _prt_rbp_infix(op: string) -> int
+    if op == "+"
+        return 10
+    if op == "-"
+        return 10
+    if op == "*"
+        return 20
+    if op == "/"
+        return 20
+    if op == "^"
+        return 39
+    0
+
+// ── error node factory ────────────────────────────────────────────────────────
+
+fn _prt_err_node(msg: string) -> dict
+    let nd = {}
+    nd["kind"] = "err"
+    nd["op"] = ""
+    nd["val"] = 0
+    nd["msg"] = msg
+    nd
+
+// ── core Pratt: nud, led, parse_expr (mutually visible) ──────────────────────
+
+// _prt_nud: null denotation -- what to do when tok appears at "prefix" position.
+fn _prt_nud(st: dict, tok: dict) -> dict
+    let k = tok["k"]
+    if k == "num"
+        let nd = {}
+        nd["kind"] = "num"
+        nd["val"] = tok["v"]
+        nd["op"] = ""
+        nd["msg"] = ""
+        return nd
+    if k == "lp"
+        // grouped sub-expression: parse inner then consume ')'
+        let inner = _prt_parse_expr(st, 0)
+        let nx = _prt_peek(st)
+        if nx["k"] == "rp"
+            let _d = _prt_consume(st)
+            let _dk = _d["s"]
+        return inner
+    if k == "op"
+        if tok["s"] == "-"
+            // unary minus: power 35 -- tighter than +/- (10) and */ (20),
+            // but LOOSER than ^ (40), so -2^2 = -(2^2) = -4.
+            let operand = _prt_parse_expr(st, 35)
+            let nd = {}
+            nd["kind"] = "unop"
+            nd["op"] = "-"
+            nd["val"] = 0
+            nd["msg"] = ""
+            nd["operand"] = operand
+            return nd
+    _prt_err_node("unexpected token in nud")
+
+// _prt_led: left denotation -- what to do when op appears at "infix" position.
+fn _prt_led(st: dict, op: string, left: dict) -> dict
+    let rbp = _prt_rbp_infix(op)
+    let right = _prt_parse_expr(st, rbp)
+    let nd = {}
+    nd["kind"] = "binop"
+    nd["op"] = op
+    nd["val"] = 0
+    nd["msg"] = ""
+    nd["left"] = left
+    nd["right"] = right
+    nd
+
+// _prt_parse_expr: main Pratt loop.
+fn _prt_parse_expr(st: dict, min_bp: int) -> dict
+    let cur = _prt_consume(st)
+    let left = _prt_nud(st, cur)
+    let going = 1
+    while going == 1
+        let nx = _prt_peek(st)
+        let nk = nx["k"]
+        if nk == "eof"
+            going = 0
+        else
+            if nk == "rp"
+                going = 0
+            else
+                if nk == "op"
+                    let op = nx["s"]
+                    let lbp = _prt_lbp(op)
+                    if lbp <= min_bp
+                        going = 0
+                    else
+                        let _adv = _prt_consume(st)
+                        let _as = _adv["s"]
+                        left = _prt_led(st, op, left)
+                else
+                    going = 0
+    left
+
+// ── integer exponentiation by squaring ───────────────────────────────────────
+
+fn _prt_ipow(base: int, exp: int) -> int
+    if exp < 0
+        return 0
+    let result = 1
+    let b = base
+    let e = exp
+    while e > 0
+        let odd = e - (e / 2) * 2
+        if odd == 1
+            result = result * b
+        b = b * b
+        e = e / 2
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+fn pratt_parse(expr: string) -> dict
+    if len(expr) == 0
+        return _prt_err_node("empty input")
+    let toks = _prt_tokenise(expr)
+    let st = {}
+    st["toks"] = toks
+    st["pos"] = 0
+    _prt_parse_expr(st, 0)
+
+fn pratt_eval(ast: dict) -> int
+    let k = ast["kind"]
+    if k == "num"
+        return ast["val"]
+    if k == "err"
+        return 0
+    if k == "binop"
+        let lv = pratt_eval(ast["left"])
+        let rv = pratt_eval(ast["right"])
+        let op = ast["op"]
+        if op == "+"
+            return lv + rv
+        if op == "-"
+            return lv - rv
+        if op == "*"
+            return lv * rv
+        if op == "/"
+            if rv == 0
+                return 0
+            return lv / rv
+        if op == "^"
+            return _prt_ipow(lv, rv)
+        return 0
+    if k == "unop"
+        let op = ast["op"]
+        if op == "-"
+            return 0 - pratt_eval(ast["operand"])
+        return 0
+    0
+
+fn pratt_calc(expr: string) -> int
+    pratt_eval(pratt_parse(expr))

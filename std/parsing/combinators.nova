@@ -1,0 +1,344 @@
+// ============================================================================
+// NOVA Standard Library — std/parsing/combinators.nova
+// Parser combinators over strings.
+//
+// A parser is a dict with a "tag" field describing the combinator kind.
+// Run any parser with pc_run(parser, s) or _pc_run(parser, s, pos) internally.
+// Every parse returns a 3-element list: [ok, value, next_pos]
+//   ok       : 1 (success) or 0 (failure)
+//   value    : parsed value on success, 0 on failure
+//   next_pos : position after consumed input on success, original pos on failure
+//
+// Public API:
+//   pc_char(c)                   -- match single character c exactly
+//   pc_str(s)                    -- match exact string s
+//   pc_digit()                   -- match one digit 0-9, return as string
+//   pc_int()                     -- match integer (optional leading '-'), return int
+//   pc_seq(parsers)              -- match all parsers in order; value = list of values
+//   pc_alt(parsers)              -- try each parser left-to-right; first success wins
+//   pc_many(p)                   -- match p zero or more times; value = list
+//   pc_sepby(p, sep)             -- p (sep p)* ; value = list (empty list on zero matches)
+//   pc_between(open, p, close)   -- match literal open, run p, match literal close; value = p's value
+//   pc_map(p, fn)                -- on p's success apply fn(value); value = fn result
+//   pc_run(parser, s)            -- run parser on entire string s from pos 0; returns [ok, value, end_pos]
+// ============================================================================
+
+// --- Internal helpers -------------------------------------------------------
+
+fn _pc_is_digit(ch)
+    let o = ord(ch)
+    if o >= 48
+        if o <= 57
+            return 1
+    return 0
+
+fn _pc_parse_int_at(s, pos)
+    // Returns [ok, int_value, next_pos]. Handles optional leading '-'.
+    let slen = len(s)
+    let cur = pos
+    let neg = 0
+    if cur < slen
+        if slice(s, cur, cur+1) == "-"
+            neg = 1
+            cur = cur + 1
+    // Need at least one digit
+    if cur >= slen
+        let fail = []
+        push(fail, 0)
+        push(fail, 0)
+        push(fail, pos)
+        return fail
+    let ch0 = slice(s, cur, cur+1)
+    if _pc_is_digit(ch0) == false
+        let fail = []
+        push(fail, 0)
+        push(fail, 0)
+        push(fail, pos)
+        return fail
+    // Consume digits, accumulate value
+    let acc = 0
+    let going = 1
+    while going == 1
+        if cur >= slen
+            going = 0
+        else
+            let ch = slice(s, cur, cur+1)
+            if _pc_is_digit(ch) == false
+                going = 0
+            else
+                acc = acc * 10 + (ord(ch) - 48)
+                cur = cur + 1
+    let val = acc
+    if neg == 1
+        val = 0 - acc
+    let ok = []
+    push(ok, 1)
+    push(ok, val)
+    push(ok, cur)
+    ok
+
+// Core interpreter: _pc_run(parser, s, pos) -> [ok, value, next_pos]
+fn _pc_run(parser, s, pos)
+    let tag = parser["tag"]
+    let slen = len(s)
+    if tag == "char"
+        let c = parser["c"]
+        if pos < slen
+            if slice(s, pos, pos+1) == c
+                let r = []
+                push(r, 1)
+                push(r, c)
+                push(r, pos+1)
+                return r
+        let r = []
+        push(r, 0)
+        push(r, 0)
+        push(r, pos)
+        return r
+    if tag == "str"
+        let sv = parser["s"]
+        let svlen = len(sv)
+        if pos + svlen <= slen
+            if slice(s, pos, pos+svlen) == sv
+                let r = []
+                push(r, 1)
+                push(r, sv)
+                push(r, pos+svlen)
+                return r
+        let r = []
+        push(r, 0)
+        push(r, 0)
+        push(r, pos)
+        return r
+    if tag == "digit"
+        if pos < slen
+            let ch = slice(s, pos, pos+1)
+            if _pc_is_digit(ch) == 1
+                let r = []
+                push(r, 1)
+                push(r, ch)
+                push(r, pos+1)
+                return r
+        let r = []
+        push(r, 0)
+        push(r, 0)
+        push(r, pos)
+        return r
+    if tag == "int"
+        return _pc_parse_int_at(s, pos)
+    if tag == "seq"
+        let ps = parser["ps"]
+        let vals = []
+        let cur = pos
+        let i = 0
+        let n = len(ps)
+        let failed = 0
+        while i < n
+            let sub = ps[i]
+            let res = _pc_run(sub, s, cur)
+            if res[0] == 0
+                failed = 1
+                i = n
+            else
+                push(vals, res[1])
+                cur = res[2]
+                i = i + 1
+        if failed == 1
+            let r = []
+            push(r, 0)
+            push(r, 0)
+            push(r, pos)
+            return r
+        let r = []
+        push(r, 1)
+        push(r, vals)
+        push(r, cur)
+        return r
+    if tag == "alt"
+        let ps = parser["ps"]
+        let n = len(ps)
+        let i = 0
+        while i < n
+            let sub = ps[i]
+            let res = _pc_run(sub, s, pos)
+            if res[0] == 1
+                return res
+            i = i + 1
+        let r = []
+        push(r, 0)
+        push(r, 0)
+        push(r, pos)
+        return r
+    if tag == "many"
+        let p = parser["p"]
+        let vals = []
+        let cur = pos
+        let going = 1
+        while going == 1
+            let res = _pc_run(p, s, cur)
+            if res[0] == 0
+                going = 0
+            else
+                push(vals, res[1])
+                let nxt = res[2]
+                if nxt == cur
+                    going = 0
+                else
+                    cur = nxt
+        let r = []
+        push(r, 1)
+        push(r, vals)
+        push(r, cur)
+        return r
+    if tag == "sepby"
+        let p = parser["p"]
+        let sep = parser["sep"]
+        let vals = []
+        let cur = pos
+        // Try first item
+        let first = _pc_run(p, s, cur)
+        if first[0] == 0
+            let r = []
+            push(r, 1)
+            push(r, vals)
+            push(r, pos)
+            return r
+        push(vals, first[1])
+        cur = first[2]
+        // Repeatedly try sep + item
+        let going = 1
+        while going == 1
+            let sres = _pc_run(sep, s, cur)
+            if sres[0] == 0
+                going = 0
+            else
+                let pres = _pc_run(p, s, sres[2])
+                if pres[0] == 0
+                    going = 0
+                else
+                    push(vals, pres[1])
+                    cur = pres[2]
+        let r = []
+        push(r, 1)
+        push(r, vals)
+        push(r, cur)
+        return r
+    if tag == "between"
+        let opn = parser["open"]
+        let p = parser["p"]
+        let cls = parser["close"]
+        let r1 = _pc_run(opn, s, pos)
+        if r1[0] == 0
+            let r = []
+            push(r, 0)
+            push(r, 0)
+            push(r, pos)
+            return r
+        let r2 = _pc_run(p, s, r1[2])
+        if r2[0] == 0
+            let r = []
+            push(r, 0)
+            push(r, 0)
+            push(r, pos)
+            return r
+        let r3 = _pc_run(cls, s, r2[2])
+        if r3[0] == 0
+            let r = []
+            push(r, 0)
+            push(r, 0)
+            push(r, pos)
+            return r
+        let r = []
+        push(r, 1)
+        push(r, r2[1])
+        push(r, r3[2])
+        return r
+    if tag == "map"
+        let p = parser["p"]
+        let f = parser["fn"]
+        let res = _pc_run(p, s, pos)
+        if res[0] == 0
+            return res
+        let mapped = f(res[1])
+        let r = []
+        push(r, 1)
+        push(r, mapped)
+        push(r, res[2])
+        return r
+    // Unknown tag — fail gracefully
+    let r = []
+    push(r, 0)
+    push(r, 0)
+    push(r, pos)
+    r
+
+// --- Public constructors ----------------------------------------------------
+
+fn pc_char(c)
+    let p = {}
+    p["tag"] = "char"
+    p["c"] = c
+    p
+
+fn pc_str(s)
+    let p = {}
+    p["tag"] = "str"
+    p["s"] = s
+    p
+
+fn pc_digit()
+    let p = {}
+    p["tag"] = "digit"
+    p
+
+fn pc_int()
+    let p = {}
+    p["tag"] = "int"
+    p
+
+fn pc_seq(parsers)
+    let p = {}
+    p["tag"] = "seq"
+    p["ps"] = parsers
+    p
+
+fn pc_alt(parsers)
+    let p = {}
+    p["tag"] = "alt"
+    p["ps"] = parsers
+    p
+
+fn pc_many(parser)
+    let p = {}
+    p["tag"] = "many"
+    p["p"] = parser
+    p
+
+fn pc_sepby(parser, sep)
+    let p = {}
+    p["tag"] = "sepby"
+    p["p"] = parser
+    p["sep"] = sep
+    p
+
+fn pc_between(open_str, parser, close_str)
+    let op = pc_str(open_str)
+    let cl = pc_str(close_str)
+    let p = {}
+    p["tag"] = "between"
+    p["open"] = op
+    p["p"] = parser
+    p["close"] = cl
+    p
+
+fn pc_map(parser, f)
+    let p = {}
+    p["tag"] = "map"
+    p["p"] = parser
+    p["fn"] = f
+    p
+
+// --- Public run entry point -------------------------------------------------
+
+fn pc_run(parser, s)
+    _pc_run(parser, s, 0)

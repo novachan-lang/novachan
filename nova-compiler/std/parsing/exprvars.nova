@@ -1,0 +1,346 @@
+// ============================================================================
+// NOVA Standard Library — std/parsing/exprvars
+// ============================================================================
+// Integer expression evaluator with named VARIABLES and built-in FUNCTIONS.
+//
+// Supports the full arithmetic grammar:
+//   expr   = term   (('+' | '-') term)*
+//   term   = unary  (('*' | '/' | '%') unary)*
+//   unary  = '-' unary | primary
+//   primary = NUMBER | IDENT | IDENT '(' expr ',' expr ')' | '(' expr ')'
+//
+// Built-in functions: max(a,b)  min(a,b)  abs(x)  pow(base,exp)
+//
+// PUBLIC API:
+//   ev_eval(expr, vars) -> int
+//     Evaluate an arithmetic expression string.
+//     vars: dict mapping variable name (string) -> int value.
+//     Unknown variables evaluate to 0 (safe, not a crash).
+//     Malformed expressions return 0 (safe, not a crash).
+//
+//   ev_vars(expr) -> list
+//     Return the list of all variable names referenced in the expression
+//     (identifiers that are NOT built-in function names).
+//     Each name appears at most once.  Order is left-to-right first-occurrence.
+//
+// SINGLE-EXIT RULE:
+//   Every function uses let result = ... pattern to avoid the NOVA
+//   return-null / return-value mistag bug.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Tokenizer ────────────────────────────────────────────────────────────────
+// Token kinds: "NUM" "ID" "OP" "EOF"
+// Token dict fields: kind (string), val_s (string), val_i (int)
+
+// Return 1 if ch (1-char string) is a digit (ASCII 48–57).
+fn _ev_is_digit(ch) -> int
+    let c = ord(ch)
+    let result = 0
+    if c >= 48
+        if c <= 57
+            result = 1
+    result
+
+// Return 1 if ch is a letter (A-Z, a-z) or underscore (95).
+fn _ev_is_alpha(ch) -> int
+    let c = ord(ch)
+    let result = 0
+    if c == 95
+        result = 1
+    else if c >= 65
+        if c <= 90
+            result = 1
+        else if c >= 97
+            if c <= 122
+                result = 1
+    result
+
+// Return 1 if ch is a letter, digit, or underscore.
+fn _ev_is_alnum(ch) -> int
+    let result = _ev_is_alpha(ch)
+    if result == 0
+        result = _ev_is_digit(ch)
+    result
+
+// Tokenize expression string into a list of token dicts.
+// Token: {"kind": "NUM"|"ID"|"OP"|"EOF", "val_s": lexeme, "val_i": int_value}
+fn _ev_tokenize(expr) -> list
+    let tokens = []
+    let n = len(expr)
+    let i = 0
+    while i < n
+        let ch = slice(expr, i, i+1)
+        // Skip whitespace
+        let co = ord(ch)
+        if co == 32 or co == 9 or co == 10 or co == 13
+            i = i + 1
+        else if _ev_is_digit(ch) == 1
+            // Read maximal digit run -> NUM
+            let start = i
+            while i < n and _ev_is_digit(slice(expr, i, i+1)) == 1
+                i = i + 1
+            let lexeme = slice(expr, start, i)
+            let tok = {}
+            tok["kind"] = "NUM"
+            tok["val_s"] = lexeme
+            tok["val_i"] = int(lexeme)
+            push(tokens, tok)
+        else if _ev_is_alpha(ch) == 1
+            // Read maximal alnum run -> ID
+            let start = i
+            while i < n and _ev_is_alnum(slice(expr, i, i+1)) == 1
+                i = i + 1
+            let lexeme = slice(expr, start, i)
+            let tok = {}
+            tok["kind"] = "ID"
+            tok["val_s"] = lexeme
+            tok["val_i"] = 0
+            push(tokens, tok)
+        else
+            // Single-char operator / delimiter -> OP
+            let tok = {}
+            tok["kind"] = "OP"
+            tok["val_s"] = ch
+            tok["val_i"] = 0
+            push(tokens, tok)
+            i = i + 1
+    // Append EOF sentinel
+    let eof = {}
+    eof["kind"] = "EOF"
+    eof["val_s"] = ""
+    eof["val_i"] = 0
+    push(tokens, eof)
+    tokens
+
+// ── Parse state ──────────────────────────────────────────────────────────────
+// State dict: {"tokens": list, "pos": int, "vars": dict, "err": int}
+
+fn _ev_peek(st) -> dict
+    let toks = st["tokens"]
+    let p = st["pos"]
+    toks[p]
+
+fn _ev_consume(st)
+    let p = st["pos"]
+    let toks = st["tokens"]
+    if p + 1 < len(toks)
+        st["pos"] = p + 1
+
+fn _ev_peek_kind(st) -> string
+    let tok = _ev_peek(st)
+    tok["kind"]
+
+fn _ev_peek_val(st) -> string
+    let tok = _ev_peek(st)
+    tok["val_s"]
+
+// ── Built-in function table ───────────────────────────────────────────────────
+
+fn _ev_is_builtin(name) -> int
+    let result = 0
+    if name == "max"
+        result = 1
+    else if name == "min"
+        result = 1
+    else if name == "abs"
+        result = 1
+    else if name == "pow"
+        result = 1
+    result
+
+fn _ev_call_builtin(name, a, b) -> int
+    let result = 0
+    if name == "max"
+        if a >= b
+            result = a
+        else
+            result = b
+    else if name == "min"
+        if a <= b
+            result = a
+        else
+            result = b
+    else if name == "abs"
+        if a >= 0
+            result = a
+        else
+            result = 0 - a
+    else if name == "pow"
+        // Integer exponentiation by squaring; b=exponent, a=base
+        // abs(b) to handle b<0 safely (returns 0 for negative exponents).
+        let base = a
+        let exp = b
+        if exp < 0
+            exp = 0
+        result = 1
+        while exp > 0
+            if exp - (exp / 2) * 2 == 1
+                result = result * base
+            base = base * base
+            exp = exp / 2
+    result
+
+// ── Forward declarations via dispatch index ───────────────────────────────────
+// NOVA has no mutual recursion across top-level fns defined later in file.
+// Strategy: write the recursive-descent parser as a single re-entrant fn
+// that dispatches on a "level" int (0=expr, 1=term, 2=unary, 3=primary).
+// This avoids needing forward references entirely.
+
+// _ev_parse(st, level) -> int
+//   level 0: expr   (additive)
+//   level 1: term   (multiplicative)
+//   level 2: unary  (unary minus)
+//   level 3: primary (atom)
+fn _ev_parse(st, level) -> int
+    let result = 0
+    if level == 3
+        // PRIMARY
+        let kind = _ev_peek_kind(st)
+        let vs = _ev_peek_val(st)
+        if kind == "NUM"
+            let tok = _ev_peek(st)
+            result = tok["val_i"]
+            _ev_consume(st)
+        else if kind == "ID"
+            _ev_consume(st)
+            // Check: is next token '(' ? -> function call
+            if _ev_peek_kind(st) == "OP"
+                if _ev_peek_val(st) == "("
+                    _ev_consume(st)   // consume '('
+                    let arg1 = _ev_parse(st, 0)
+                    // Expect ',' or ')'
+                    if _ev_peek_kind(st) == "OP"
+                        if _ev_peek_val(st) == ","
+                            _ev_consume(st)
+                    let arg2 = _ev_parse(st, 0)
+                    // Expect ')'
+                    if _ev_peek_kind(st) == "OP"
+                        if _ev_peek_val(st) == ")"
+                            _ev_consume(st)
+                    result = _ev_call_builtin(vs, arg1, arg2)
+                else
+                    // ID not followed by '(' -> variable lookup
+                    let vars = st["vars"]
+                    if contains(vars, vs) == 1
+                        result = vars[vs]
+                    else
+                        result = 0
+            else
+                // ID followed by non-OP -> variable lookup
+                let vars = st["vars"]
+                if contains(vars, vs) == 1
+                    result = vars[vs]
+                else
+                    result = 0
+        else if kind == "OP"
+            if vs == "("
+                _ev_consume(st)
+                result = _ev_parse(st, 0)
+                if _ev_peek_kind(st) == "OP"
+                    if _ev_peek_val(st) == ")"
+                        _ev_consume(st)
+            else
+                // Unknown / unmatched token: return 0, don't consume
+                result = 0
+        else
+            result = 0
+    else if level == 2
+        // UNARY: handle leading '-'
+        if _ev_peek_kind(st) == "OP"
+            if _ev_peek_val(st) == "-"
+                _ev_consume(st)
+                result = 0 - _ev_parse(st, 2)
+            else
+                result = _ev_parse(st, 3)
+        else
+            result = _ev_parse(st, 3)
+    else if level == 1
+        // TERM: multiplicative (* / %)
+        result = _ev_parse(st, 2)
+        let go = 1
+        while go == 1
+            if _ev_peek_kind(st) == "OP"
+                let op = _ev_peek_val(st)
+                if op == "*"
+                    _ev_consume(st)
+                    let rhs = _ev_parse(st, 2)
+                    result = result * rhs
+                else if op == "/"
+                    _ev_consume(st)
+                    let rhs = _ev_parse(st, 2)
+                    if rhs == 0
+                        result = 0
+                    else
+                        result = result / rhs
+                else if op == "%"
+                    _ev_consume(st)
+                    let rhs = _ev_parse(st, 2)
+                    if rhs == 0
+                        result = 0
+                    else
+                        result = result - (result / rhs) * rhs
+                else
+                    go = 0
+            else
+                go = 0
+    else
+        // level == 0: EXPR: additive (+ -)
+        result = _ev_parse(st, 1)
+        let go = 1
+        while go == 1
+            if _ev_peek_kind(st) == "OP"
+                let op = _ev_peek_val(st)
+                if op == "+"
+                    _ev_consume(st)
+                    let rhs = _ev_parse(st, 1)
+                    result = result + rhs
+                else if op == "-"
+                    _ev_consume(st)
+                    let rhs = _ev_parse(st, 1)
+                    result = result - rhs
+                else
+                    go = 0
+            else
+                go = 0
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ev_eval(expr, vars) -> int
+//   Evaluate an integer arithmetic expression with variable substitution.
+//   vars: dict of {name -> int}.
+//   Returns 0 on empty input or any parse error.
+fn ev_eval(expr, vars) -> int
+    let result = 0
+    if len(expr) > 0
+        let toks = _ev_tokenize(expr)
+        let st = {}
+        st["tokens"] = toks
+        st["pos"] = 0
+        st["vars"] = vars
+        st["err"] = 0
+        result = _ev_parse(st, 0)
+    result
+
+// ev_vars(expr) -> list
+//   Return a de-duplicated list of variable names (non-builtin identifiers)
+//   referenced in the expression, in left-to-right first-occurrence order.
+fn ev_vars(expr) -> list
+    let result = []
+    if len(expr) > 0
+        let toks = _ev_tokenize(expr)
+        let seen = {}
+        let i = 0
+        let n = len(toks)
+        while i < n
+            let tok = toks[i]
+            if tok["kind"] == "ID"
+                let nm = tok["val_s"]
+                if _ev_is_builtin(nm) == 0
+                    if contains(seen, nm) == 0
+                        seen[nm] = 1
+                        push(result, nm)
+            i = i + 1
+    result

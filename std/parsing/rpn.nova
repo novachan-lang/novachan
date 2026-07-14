@@ -1,0 +1,289 @@
+// ============================================================================
+// NOVA Standard Library — std/parsing/rpn
+// ============================================================================
+// Reverse Polish Notation: evaluate postfix expressions and convert infix
+// expressions to postfix (Shunting-Yard algorithm).
+//
+// PUBLIC API:
+//   rpn_eval(rpn_str: string) -> int
+//     Evaluate a space-separated RPN/postfix expression string.
+//     Supported operators: + - * / ^ (exponentiation)
+//     Integer division truncates toward zero.
+//     Returns 0 on empty input or any parse/stack error.
+//
+//   rpn_eval_list(tokens: list) -> int
+//     Evaluate RPN from a list of token strings.
+//     Same semantics as rpn_eval.
+//
+//   to_rpn(infix: string) -> string
+//     Convert a (possibly parenthesised) infix expression to a
+//     space-separated postfix (RPN) string using the Shunting-Yard algorithm.
+//     Handles: integers, +, -, *, /, ^, and parentheses.
+//     ^ is right-associative with highest binary precedence (4).
+//     +/- have precedence 2; * / have precedence 3.
+//     Returns "" on empty input; strips excess spaces gracefully.
+//
+// DESIGN NOTES:
+//   - Stacks are simulated with NOVA lists using list.push(x)/list.pop() idiom.
+//   - All helpers are _rpn_ prefixed to avoid symbol collisions.
+//   - Single-exit pattern used in multi-return-path functions.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// Operator precedence: 0 = not an operator.
+fn _rpn_prec(op: string) -> int
+    let p = 0
+    if op == "+"
+        p = 2
+    if op == "-"
+        p = 2
+    if op == "*"
+        p = 3
+    if op == "/"
+        p = 3
+    if op == "^"
+        p = 4
+    p
+
+// True (1) iff op is right-associative (only ^ in our operator set).
+fn _rpn_is_right_assoc(op: string) -> int
+    let r = 0
+    if op == "^"
+        r = 1
+    r
+
+// Integer power: base^exp for exp >= 0. Returns 0 for negative exp.
+fn _rpn_ipow(base: int, exp: int) -> int
+    let result = 1
+    let e = exp
+    if e < 0
+        result = 0
+    else
+        while e > 0
+            result = result * base
+            e = e - 1
+    result
+
+// Check whether a token string is a valid decimal integer (optional leading '-',
+// then one or more digits). Returns 1 if valid, 0 otherwise.
+fn _rpn_is_int_tok(tok: string) -> int
+    let n = len(tok)
+    let ok = 0
+    if n > 0
+        let start = 0
+        if slice(tok, 0, 1) == "-"
+            start = 1
+        if start < n
+            ok = 1
+            let i = start
+            while i < n and ok == 1
+                let c = ord(slice(tok, i, i+1))
+                if c < 48 or c > 57
+                    ok = 0
+                i = i + 1
+    ok
+
+// Parse a decimal integer string; assumes _rpn_is_int_tok returned 1.
+// Handles optional leading '-' for negative numbers.
+fn _rpn_parse_int(tok: string) -> int
+    let n = len(tok)
+    let neg = 0
+    let start = 0
+    if slice(tok, 0, 1) == "-"
+        neg = 1
+        start = 1
+    let val = 0
+    let i = start
+    while i < n
+        let c = ord(slice(tok, i, i+1))
+        val = val * 10 + (c - 48)
+        i = i + 1
+    let result = val
+    if neg == 1
+        result = 0 - val
+    result
+
+// Tokenize a string on whitespace — returns a list of non-empty string tokens.
+fn _rpn_split(s: string) -> list
+    let n = len(s)
+    let result = []
+    let cur = ""
+    let i = 0
+    while i < n
+        let b = ord(slice(s, i, i+1))
+        if b == 32 or b == 9 or b == 10 or b == 13
+            if len(cur) > 0
+                result.push(cur)
+                cur = ""
+        else
+            cur = cur + slice(s, i, i+1)
+        i = i + 1
+    if len(cur) > 0
+        result.push(cur)
+    result
+
+// Tokenize an infix expression: digits run into number tokens;
+// operators and parentheses become individual single-char tokens.
+fn _rpn_tokenize_infix(s: string) -> list
+    let n = len(s)
+    let result = []
+    let cur = ""
+    let i = 0
+    while i < n
+        let ch = slice(s, i, i+1)
+        let b = ord(ch)
+        if b >= 48 and b <= 57
+            // Digit: accumulate into current number token.
+            cur = cur + ch
+        else
+            // Flush accumulated number first.
+            if len(cur) > 0
+                result.push(cur)
+                cur = ""
+            // Whitespace: skip; anything else is an operator or parenthesis.
+            let is_ws = 0
+            if b == 32 or b == 9 or b == 10 or b == 13
+                is_ws = 1
+            if is_ws == 0
+                result.push(ch)
+        i = i + 1
+    // Flush trailing number.
+    if len(cur) > 0
+        result.push(cur)
+    result
+
+// Apply one binary operation. Returns 0 on unknown op or divide-by-zero.
+fn _rpn_apply(op: string, a: int, b: int) -> int
+    let result = 0
+    if op == "+"
+        result = a + b
+    if op == "-"
+        result = a - b
+    if op == "*"
+        result = a * b
+    if op == "/"
+        if b != 0
+            result = a / b
+    if op == "^"
+        result = _rpn_ipow(a, b)
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// rpn_eval_list: evaluate RPN from an already-split list of token strings.
+// Returns 0 on empty input or any stack underflow / bad token.
+fn rpn_eval_list(tokens: list) -> int
+    let n = len(tokens)
+    let result = 0
+    if n > 0
+        let stk = []
+        let i = 0
+        let ok = 1
+        while i < n and ok == 1
+            let tok = tokens[i]
+            let prec = _rpn_prec(tok)
+            if prec > 0
+                // It's an operator — need two operands on stack.
+                let slen = len(stk)
+                if slen < 2
+                    ok = 0
+                else
+                    let b = stk.pop()
+                    let a = stk.pop()
+                    let val = _rpn_apply(tok, a, b)
+                    stk.push(val)
+            else
+                // It's a number token — validate before parsing.
+                if _rpn_is_int_tok(tok) == 1
+                    let v = _rpn_parse_int(tok)
+                    stk.push(v)
+                else
+                    ok = 0
+            i = i + 1
+        if ok == 1
+            if len(stk) == 1
+                result = stk[0]
+    result
+
+// rpn_eval: evaluate a space-separated RPN string.
+// Returns 0 on empty input, bad token, or stack underflow.
+fn rpn_eval(rpn_str: string) -> int
+    let tokens = _rpn_split(rpn_str)
+    rpn_eval_list(tokens)
+
+// to_rpn: convert an infix expression string to space-separated RPN string.
+// Uses the Shunting-Yard algorithm (Dijkstra).
+//
+// Operator precedence and associativity:
+//   + -  precedence 2, left-associative
+//   * /  precedence 3, left-associative
+//   ^    precedence 4, right-associative
+//
+// Returns "" on empty input.
+fn to_rpn(infix: string) -> string
+    let tokens = _rpn_tokenize_infix(infix)
+    let ntok = len(tokens)
+    let result = ""
+    if ntok > 0
+        let out = []
+        let ops = []
+        let i = 0
+        while i < ntok
+            let tok = tokens[i]
+            let prec = _rpn_prec(tok)
+            if prec > 0
+                // tok is an operator. Pop operators from the ops stack to output
+                // while the top has strictly higher precedence, or equal precedence
+                // and tok is left-associative (not right-assoc).
+                let done = 0
+                while len(ops) > 0 and done == 0
+                    let top = ops[len(ops) - 1]
+                    let top_prec = _rpn_prec(top)
+                    if top == "("
+                        done = 1
+                    else
+                        let pop_it = 0
+                        if top_prec > prec
+                            pop_it = 1
+                        if top_prec == prec and _rpn_is_right_assoc(tok) == 0
+                            pop_it = 1
+                        if pop_it == 1
+                            ops.pop()
+                            out.push(top)
+                        else
+                            done = 1
+                ops.push(tok)
+            else
+                if tok == "("
+                    ops.push(tok)
+                else
+                    if tok == ")"
+                        // Pop until matching "(" found; discard the "(".
+                        let found = 0
+                        while len(ops) > 0 and found == 0
+                            let top = ops.pop()
+                            if top == "("
+                                found = 1
+                            else
+                                out.push(top)
+                    else
+                        // Number token — push directly to output.
+                        out.push(tok)
+            i = i + 1
+        // Drain remaining operators to output.
+        while len(ops) > 0
+            let top = ops.pop()
+            if top != "("
+                out.push(top)
+        // Build space-separated output string.
+        let j = 0
+        while j < len(out)
+            if j == 0
+                result = out[j]
+            else
+                result = result + " " + out[j]
+            j = j + 1
+    result

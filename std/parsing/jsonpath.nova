@@ -1,0 +1,415 @@
+// ============================================================================
+// NOVA Standard Library — std/parsing/jsonpath
+// ============================================================================
+// JSONPath query engine over nested dict/list values.
+//
+// SUPPORTED SYNTAX:
+//   $         — root selector
+//   .key      — child key
+//   ['key']   — bracket child key (single-quoted)
+//   [n]       — index (negative = from end)
+//   [*]       — all children wildcard
+//   ..*       — recursive wildcard (all descendants)
+//   ..key     — recursive descent then child key
+//   *         — wildcard (all children, bare)
+//
+// TOKEN STREAM (produced by _jp_lex):
+//   {k:"root"}  {k:"dot"}  {k:"dotdot"}  {k:"key",v:<s>}
+//   {k:"idx",v:<int>}  {k:"star"}  {k:"end"}
+//
+// EVALUATION:
+//   _jp_eval(nodes, toks, ti) applies toks[ti..] to the current node-set.
+//   dotdot collects ALL descendants, then applies remaining tokens.
+//
+// PUBLIC API:
+//   jp_query(value, path) -> list   all matches in document order
+//   jp_first(value, path) -> any    first match or null
+//
+// NOVA CONSTRAINTS:
+//   - No multi-line list/dict literals; single-exit; no reserved words as vars.
+//   - slice(s,i,i+1) for char access; type_of() for runtime dispatch.
+//   - All private helpers prefixed _jp_ .
+//   - LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn _jp_is_digit(ch)
+    let o = ord(ch)
+    let r = 0
+    if o >= 48
+        if o <= 57
+            r = 1
+    return r
+
+fn _jp_is_alpha(ch)
+    let o = ord(ch)
+    let r = 0
+    if o >= 65
+        if o <= 90
+            r = 1
+    if r == 0
+        if o >= 97
+            if o <= 122
+                r = 1
+    if r == 0
+        if o == 95
+            r = 1
+    return r
+
+fn _jp_is_alnum(ch)
+    let r = _jp_is_alpha(ch)
+    if r == 0
+        r = _jp_is_digit(ch)
+    return r
+
+// Parse integer (optional '-') at pos in s. Returns [val, next_pos, got_digit].
+fn _jp_parse_int(s, pos)
+    let n = len(s)
+    let cur = pos
+    let neg = 0
+    let out = []
+    if cur < n
+        if slice(s, cur, cur+1) == "-"
+            neg = 1
+            cur = cur + 1
+    let v = 0
+    let got = 0
+    let going2 = 1
+    while cur < n and going2 == 1
+        let ch = slice(s, cur, cur+1)
+        if _jp_is_digit(ch) == 1
+            v = v * 10 + (ord(ch) - 48)
+            cur = cur + 1
+            got = 1
+        else
+            going2 = 0
+    if neg == 1
+        v = 0 - v
+    push(out, v)
+    push(out, cur)
+    push(out, got)
+    return out
+
+// Parse a bare identifier (alnum + underscore + hyphen) at pos. Returns [ident, next_pos].
+fn _jp_parse_ident(s, pos)
+    let n = len(s)
+    let cur = pos
+    let acc = ""
+    let out = []
+    let going = 1
+    while cur < n and going == 1
+        let ch = slice(s, cur, cur+1)
+        let good = _jp_is_alnum(ch)
+        if good == 0
+            if ch == "-"
+                good = 1
+        if good == 1
+            acc = acc + ch
+            cur = cur + 1
+        else
+            going = 0
+    push(out, acc)
+    push(out, cur)
+    return out
+
+// Make a token dict.
+fn _jp_mk(k, v)
+    let t = {}
+    t["k"] = k
+    t["v"] = v
+    return t
+
+// ── Lexer ────────────────────────────────────────────────────────────────────
+
+fn _jp_lex(path)
+    let toks = []
+    let n = len(path)
+    let i = 0
+    while i < n
+        let ch = slice(path, i, i+1)
+        if ch == "$"
+            push(toks, _jp_mk("root", "$"))
+            i = i + 1
+        else if ch == "."
+            if i+1 < n
+                let ch2 = slice(path, i+1, i+2)
+                if ch2 == "."
+                    // ".." — dotdot; next token handles key/star
+                    push(toks, _jp_mk("dotdot", ".."))
+                    i = i + 2
+                else
+                    // single dot — push dot then parse next (key or star)
+                    push(toks, _jp_mk("dot", "."))
+                    i = i + 1
+            else
+                push(toks, _jp_mk("dot", "."))
+                i = i + 1
+        else if ch == "["
+            i = i + 1
+            if i < n
+                let ch2 = slice(path, i, i+1)
+                if ch2 == "*"
+                    push(toks, _jp_mk("star", "*"))
+                    i = i + 1
+                    if i < n
+                        if slice(path, i, i+1) == "]"
+                            i = i + 1
+                else if ch2 == "'"
+                    i = i + 1
+                    let acc = ""
+                    let going = 1
+                    while i < n and going == 1
+                        let kch = slice(path, i, i+1)
+                        if kch == "'"
+                            going = 0
+                        else
+                            acc = acc + kch
+                            i = i + 1
+                    if i < n
+                        i = i + 1
+                    if i < n
+                        if slice(path, i, i+1) == "]"
+                            i = i + 1
+                    push(toks, _jp_mk("key", acc))
+                else
+                    let pret = _jp_parse_int(path, i)
+                    let iv = pret[0]
+                    let ni = pret[1]
+                    let got = pret[2]
+                    if got == 1
+                        i = ni
+                        if i < n
+                            if slice(path, i, i+1) == "]"
+                                i = i + 1
+                        let idxd = {}
+                        idxd["k"] = "idx"
+                        idxd["v"] = iv
+                        push(toks, idxd)
+                    else
+                        let going3 = 1
+                        while i < n and going3 == 1
+                            if slice(path, i, i+1) == "]"
+                                going3 = 0
+                                i = i + 1
+                            else
+                                i = i + 1
+        else if ch == "*"
+            push(toks, _jp_mk("star", "*"))
+            i = i + 1
+        else if _jp_is_alpha(ch) == 1
+            let iret = _jp_parse_ident(path, i)
+            let kname = iret[0]
+            let ni2 = iret[1]
+            if len(kname) > 0
+                push(toks, _jp_mk("key", kname))
+            i = ni2
+        else
+            i = i + 1
+    push(toks, _jp_mk("end", ""))
+    return toks
+
+// ── Value-tree traversal helpers ─────────────────────────────────────────────
+
+// Collect node + all descendants (pre-order DFS) into acc list.
+fn _jp_descend_all(node, acc)
+    push(acc, node)
+    let kind = type_of(node)
+    if kind == "list"
+        let sz = len(node)
+        let i = 0
+        while i < sz
+            _jp_descend_all(node[i], acc)
+            i = i + 1
+    else if kind == "dict"
+        let ks = keys(node)
+        let sz = len(ks)
+        let i = 0
+        while i < sz
+            _jp_descend_all(node[ks[i]], acc)
+            i = i + 1
+    return 0
+
+// Collect values at KEY from node and all descendants into acc (DFS).
+fn _jp_descend_key(node, kname, acc)
+    let kind = type_of(node)
+    if kind == "dict"
+        if contains(node, kname) == 1
+            push(acc, node[kname])
+        let ks = keys(node)
+        let sz = len(ks)
+        let i = 0
+        while i < sz
+            _jp_descend_key(node[ks[i]], kname, acc)
+            i = i + 1
+    else if kind == "list"
+        let sz = len(node)
+        let i = 0
+        while i < sz
+            _jp_descend_key(node[i], kname, acc)
+            i = i + 1
+    return 0
+
+// Apply one step-token to a single node; return list of matches.
+fn _jp_step(node, tok)
+    let result = []
+    let tk = tok["k"]
+    if tk == "key"
+        let kname = tok["v"]
+        if type_of(node) == "dict"
+            if contains(node, kname) == 1
+                push(result, node[kname])
+    else if tk == "idx"
+        let idx = tok["v"]
+        if type_of(node) == "list"
+            let sz = len(node)
+            let real = idx
+            if idx < 0
+                real = sz + idx
+            if real >= 0
+                if real < sz
+                    push(result, node[real])
+    else if tk == "star"
+        let kind = type_of(node)
+        if kind == "list"
+            let sz = len(node)
+            let i = 0
+            while i < sz
+                push(result, node[i])
+                i = i + 1
+        else if kind == "dict"
+            let ks = keys(node)
+            let sz = len(ks)
+            let i = 0
+            while i < sz
+                push(result, node[ks[i]])
+                i = i + 1
+    return result
+
+// ── Evaluator ────────────────────────────────────────────────────────────────
+
+// _jp_eval: apply toks[ti..] to node-set `nodes`, collect results.
+fn _jp_eval(nodes, toks, ti)
+    let ntoks = len(toks)
+    let result = []
+    if ti >= ntoks
+        let i = 0
+        while i < len(nodes)
+            push(result, nodes[i])
+            i = i + 1
+        return result
+    let tok = toks[ti]
+    let tk = tok["k"]
+    if tk == "end"
+        let i = 0
+        while i < len(nodes)
+            push(result, nodes[i])
+            i = i + 1
+        return result
+    if tk == "root"
+        result = _jp_eval(nodes, toks, ti+1)
+    else if tk == "dot"
+        // dot is a separator — skip it, process next token
+        result = _jp_eval(nodes, toks, ti+1)
+    else if tk == "key"
+        let next_nodes = []
+        let ni = 0
+        while ni < len(nodes)
+            let sub = _jp_step(nodes[ni], tok)
+            let si = 0
+            while si < len(sub)
+                push(next_nodes, sub[si])
+                si = si + 1
+            ni = ni + 1
+        result = _jp_eval(next_nodes, toks, ti+1)
+    else if tk == "idx"
+        let next_nodes = []
+        let ni = 0
+        while ni < len(nodes)
+            let sub = _jp_step(nodes[ni], tok)
+            let si = 0
+            while si < len(sub)
+                push(next_nodes, sub[si])
+                si = si + 1
+            ni = ni + 1
+        result = _jp_eval(next_nodes, toks, ti+1)
+    else if tk == "star"
+        let next_nodes = []
+        let ni = 0
+        while ni < len(nodes)
+            let sub = _jp_step(nodes[ni], tok)
+            let si = 0
+            while si < len(sub)
+                push(next_nodes, sub[si])
+                si = si + 1
+            ni = ni + 1
+        result = _jp_eval(next_nodes, toks, ti+1)
+    else if tk == "dotdot"
+        // Peek at next token — if it's a key, do recursive descent for that key.
+        // Otherwise, collect all descendants and continue.
+        let next_ti = ti + 1
+        if next_ti < ntoks
+            let next_tok = toks[next_ti]
+            let ntk = next_tok["k"]
+            if ntk == "key"
+                let kname = next_tok["v"]
+                let desc_matches = []
+                let ni = 0
+                while ni < len(nodes)
+                    _jp_descend_key(nodes[ni], kname, desc_matches)
+                    ni = ni + 1
+                result = _jp_eval(desc_matches, toks, next_ti+1)
+            else if ntk == "star"
+                // ..*  — collect all descendants then apply star (i.e., all children of descendants)
+                // Per JSONPath semantics, ..* collects ALL descendants of all nodes.
+                let all_desc = []
+                let ni = 0
+                while ni < len(nodes)
+                    _jp_descend_all(nodes[ni], all_desc)
+                    ni = ni + 1
+                result = _jp_eval(all_desc, toks, next_ti+1)
+            else
+                // dotdot then something else — collect all descendants, continue
+                let all_desc = []
+                let ni = 0
+                while ni < len(nodes)
+                    _jp_descend_all(nodes[ni], all_desc)
+                    ni = ni + 1
+                result = _jp_eval(all_desc, toks, next_ti)
+        else
+            // dotdot at end — collect all descendants
+            let all_desc = []
+            let ni = 0
+            while ni < len(nodes)
+                _jp_descend_all(nodes[ni], all_desc)
+                ni = ni + 1
+            result = all_desc
+    return result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// jp_query: run a JSONPath expression against value.
+// Returns list of all matching values in document order.
+// Returns [] on empty/malformed path or no match.
+fn jp_query(value, path)
+    let result = []
+    if len(path) == 0
+        return result
+    let toks = _jp_lex(path)
+    let start = 0
+    if len(toks) > 0
+        let first = toks[0]
+        if first["k"] == "root"
+            start = 1
+    let roots = []
+    push(roots, value)
+    result = _jp_eval(roots, toks, start)
+    return result
+
+// jp_first: return first match or null.
+fn jp_first(value, path)
+    let matches = jp_query(value, path)
+    let result = null
+    if len(matches) > 0
+        result = matches[0]
+    return result
