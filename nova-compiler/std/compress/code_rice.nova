@@ -1,0 +1,262 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/code_rice
+// ============================================================================
+// Rice coding for non-negative integers (Golomb coding with m = 2^k).
+//
+// Rice coding is a special case of Golomb coding where the parameter m is a
+// power of two: m = 2^k.  Because m is a power of two, the remainder field
+// is always exactly k bits (no truncated-binary complexity), making the codec
+// extremely simple and fast.
+//
+// Rice codes are used in FLAC (audio), JPEG-LS (image), CCSDS telemetry
+// compression, and many embedded lossless codecs.
+//
+// ENCODING (n >= 0, k >= 0):
+//   q = n >> k              (integer quotient: how many full blocks of 2^k)
+//   r = n & ((1<<k) - 1)   (remainder: low k bits of n)
+//   bitstream = unary(q) ++ binary(r, k bits)
+//
+//   UNARY PART — quotient q:
+//     q one-bits followed by a single zero stop-bit.
+//     unary(0) = [0]
+//     unary(1) = [1, 0]
+//     unary(2) = [1, 1, 0]
+//     Total bits = q + 1.
+//
+//   BINARY PART — remainder r in exactly k bits (MSB-first):
+//     When k=0: zero bits are emitted (the unary part alone encodes n=q).
+//     When k=1: 1 bit.
+//     When k=2: 2 bits.
+//     Total bits = k.
+//
+//   Total code length = q + 1 + k.
+//
+// DECODING:
+//   1. Read unary: count consecutive 1-bits until the 0 stop bit → q.
+//   2. Read k bits as integer (MSB-first) → r.
+//   3. n = (q << k) + r.
+//
+// BIT REPRESENTATION:
+//   A bitstream is a LIST of ints, each element 0 or 1, MSB-first in the
+//   order written.  This keeps codecs independent and composable.
+//   encode(n, k)         -> bit-list
+//   decode(bits, pos, k) -> [value, next_pos]
+//
+// EXAMPLES (k=2):
+//   rice_encode(0,  2) = [0,0,0]        q=0 unary=[0]     rem=[0,0]
+//   rice_encode(1,  2) = [0,0,1]        q=0 unary=[0]     rem=[0,1]
+//   rice_encode(4,  2) = [1,0,0,0]      q=1 unary=[1,0]   rem=[0,0]
+//   rice_encode(5,  2) = [1,0,0,1]      q=1 unary=[1,0]   rem=[0,1]
+//   rice_encode(10, 2) = [1,1,0,1,0]    q=2 unary=[1,1,0] rem=[1,0]
+//
+// EXAMPLES (k=0):
+//   rice_encode(0,  0) = [0]            q=0 unary=[0]     (no rem bits)
+//   rice_encode(3,  0) = [1,1,1,0]      q=3 unary=[1,1,1,0]
+//
+// PUBLIC API:
+//   rice_encode(n, k) -> list
+//     Encode non-negative integer n with Rice parameter k (k >= 0).
+//     Returns a list of 0/1 ints.
+//
+//   rice_decode(bits, pos, k) -> list
+//     Decode one Rice-coded value from list bits starting at position pos.
+//     Returns [decoded_value, next_pos].
+//     On malformed (truncated) input returns [-1, len(bits)].
+//
+//   rice_encode_seq(ns, k) -> list
+//     Encode a list of non-negative integers into one concatenated bitstream.
+//
+//   rice_decode_seq(bits, pos, k, count) -> list
+//     Decode exactly count values from bits starting at pos.
+//     Returns a list of count decoded integers.
+//
+//   pack_bits(bit_list) -> list
+//     Pack a list of 0/1 bits into bytes (ints 0..255), 8 bits per byte,
+//     MSB-first within each byte, zero-padding the last byte if needed.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers use prefix _cr_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _cr_push_bits: append the low nbits of value v (MSB-first) to list out.
+// nbits=0 is a no-op.
+fn _cr_push_bits(out, v, nbits)
+    if nbits == 0
+        return null
+    let i = nbits - 1
+    while i >= 0
+        let bit = (v >> i) & 1
+        push(out, bit)
+        i = i - 1
+    null
+
+// _cr_read_unary: read quotient unary code from bits at position pos.
+// Counts leading 1-bits until the 0 stop-bit.
+// Returns [q, next_pos]. On truncated stream: [-1, len(bits)].
+fn _cr_read_unary(bits, pos) -> list
+    let blen = len(bits)
+    let q = 0
+    let cur = pos
+    let found = 0
+    while cur < blen and found == 0
+        if bits[cur] == 1
+            q = q + 1
+            cur = cur + 1
+        else
+            cur = cur + 1
+            found = 1
+    let result = []
+    if found == 0
+        push(result, -1)
+        push(result, blen)
+    else
+        push(result, q)
+        push(result, cur)
+    result
+
+// _cr_read_nbits: read nbits bits from bits at position pos (MSB-first).
+// Returns [value, next_pos]. On truncated stream: [-1, len(bits)].
+// nbits=0 returns [0, pos].
+fn _cr_read_nbits(bits, pos, nbits) -> list
+    let blen = len(bits)
+    let result = []
+    if nbits == 0
+        push(result, 0)
+        push(result, pos)
+        return result
+    if pos + nbits > blen
+        push(result, -1)
+        push(result, blen)
+        return result
+    let v = 0
+    let i = 0
+    while i < nbits
+        v = v * 2 + bits[pos + i]
+        i = i + 1
+    push(result, v)
+    push(result, pos + nbits)
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// rice_encode: encode non-negative integer n with Rice parameter k.
+//
+// Algorithm:
+//   q = n >> k          (quotient)
+//   r = n & mask        (remainder; mask = (1<<k)-1)
+//   emit q ones, then 0, then k bits of r MSB-first.
+//
+// Examples (k=2):
+//   rice_encode(0,  2) -> [0, 0, 0]
+//   rice_encode(5,  2) -> [1, 0, 0, 1]
+//   rice_encode(10, 2) -> [1, 1, 0, 1, 0]
+fn rice_encode(n, k) -> list
+    let q = n >> k
+    let mask = (1 << k) - 1
+    let r = n & mask
+    let out = []
+    // Unary: q ones then stop 0
+    let i = 0
+    while i < q
+        push(out, 1)
+        i = i + 1
+    push(out, 0)
+    // Remainder: k bits of r, MSB-first
+    _cr_push_bits(out, r, k)
+    out
+
+// rice_decode: decode one Rice-coded value from bits starting at pos.
+//
+// Algorithm:
+//   1. Read unary (count 1s until 0) -> q
+//   2. Read k bits -> r
+//   3. n = (q << k) | r
+//
+// Returns [decoded_value, next_pos].
+// On malformed (truncated) input: returns [-1, len(bits)].
+fn rice_decode(bits, pos, k) -> list
+    let blen = len(bits)
+    // Step 1: read unary quotient
+    let ur = _cr_read_unary(bits, pos)
+    let q = ur[0]
+    let pos2 = ur[1]
+    if q == -1
+        let bad = []
+        push(bad, -1)
+        push(bad, blen)
+        return bad
+    // Step 2: read k remainder bits
+    let rr = _cr_read_nbits(bits, pos2, k)
+    let r = rr[0]
+    let pos3 = rr[1]
+    if r == -1
+        let bad2 = []
+        push(bad2, -1)
+        push(bad2, blen)
+        return bad2
+    // Step 3: reconstruct n
+    let value = (q << k) + r
+    let out = []
+    push(out, value)
+    push(out, pos3)
+    out
+
+// rice_encode_seq: encode a list of non-negative integers into one bitstream.
+//
+// Encodes each element with rice_encode(n, k) and concatenates bit lists.
+// Decode with rice_decode_seq using the same k and element count.
+fn rice_encode_seq(ns, k) -> list
+    let out = []
+    let n = len(ns)
+    let i = 0
+    while i < n
+        let bits = rice_encode(ns[i], k)
+        let blen = len(bits)
+        let j = 0
+        while j < blen
+            push(out, bits[j])
+            j = j + 1
+        i = i + 1
+    out
+
+// rice_decode_seq: decode exactly count Rice-coded values from bits at pos.
+//
+// Returns a list of count decoded integers.
+// On malformed input, remaining values are -1.
+fn rice_decode_seq(bits, pos, k, count) -> list
+    let out = []
+    let cur = pos
+    let i = 0
+    while i < count
+        let dr = rice_decode(bits, cur, k)
+        push(out, dr[0])
+        cur = dr[1]
+        i = i + 1
+    out
+
+// pack_bits: pack a list of 0/1 bits into a list of byte values (0..255).
+//
+// 8 bits per byte, MSB-first within each byte.
+// The last byte is zero-padded if len(bit_list) is not a multiple of 8.
+//
+// Example:
+//   pack_bits([1,0,1,1,0,0,1,0]) -> [178]
+//   pack_bits([1,0,1])           -> [160]
+fn pack_bits(bit_list) -> list
+    let n = len(bit_list)
+    let out = []
+    let i = 0
+    while i < n
+        let byte_val = 0
+        let j = 0
+        while j < 8
+            byte_val = byte_val * 2
+            if i + j < n
+                byte_val = byte_val + bit_list[i + j]
+            j = j + 1
+        push(out, byte_val)
+        i = i + 8
+    out

@@ -1,0 +1,295 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/code_golomb
+// ============================================================================
+// Golomb coding for non-negative integers, using a list-of-ints bitstream.
+//
+// Golomb coding (Golomb 1966) is optimal for geometrically distributed
+// non-negative integers. For a fixed parameter m, every n >= 0 is coded as:
+//   q = n / m          (integer quotient)
+//   r = n mod m        (remainder)
+//   bitstream = unary(q) ++ truncated_binary(r, m)
+//
+// UNARY CODE FOR q:
+//   q ones followed by a single zero.
+//   unary(0) = [0]
+//   unary(1) = [1, 0]
+//   unary(2) = [1, 1, 0]
+//
+// TRUNCATED BINARY FOR r OVER m:
+//   Let b = ceil(log2(m))   (number of bits in the long codes)
+//   Let cutoff = 2^b - m    (number of values that need only b-1 bits)
+//   if r < cutoff:  emit (b-1) bits of r in MSB-first binary
+//   else:           emit b bits of (r + cutoff) in MSB-first binary
+//   When m = 1: b=0, cutoff=0, no remainder bits are emitted (q determines n).
+//   When m is a power of two: cutoff=0, all remainders use b bits (Rice coding).
+//
+// DECODING:
+//   1. Read unary: count ones until the stop zero; that count is q.
+//   2. Read b-1 bits → short_val.
+//   3. If short_val < cutoff: r = short_val (done, consumed b-1 bits).
+//      Else: read one more bit, full_val = short_val*2 + bit; r = full_val - cutoff.
+//   Special case m=1: b=0 so no remainder bits; r=0 always.
+//
+// BIT REPRESENTATION:
+//   A bitstream is a list of ints where each element is 0 or 1, MSB-first.
+//   This keeps codecs independent and composable.
+//
+// PUBLIC API:
+//   golomb_encode(n, m) -> list
+//     Encode non-negative integer n with Golomb parameter m (m >= 1).
+//     Returns a list of 0/1 ints.
+//
+//   golomb_decode(bits, pos, m) -> list
+//     Decode one Golomb-coded value from list bits starting at position pos.
+//     Returns [decoded_value, next_pos].
+//     On malformed input (truncated stream) returns [-1, len(bits)].
+//
+//   golomb_encode_seq(ns, m) -> list
+//     Encode a sequence of non-negative integers into one concatenated bitstream.
+//
+//   golomb_decode_seq(bits, pos, m, count) -> list
+//     Decode exactly count values from bits starting at pos.
+//     Returns a list of count decoded integers.
+//
+//   pack_bits(bit_list) -> list
+//     Pack a list of 0/1 bits into bytes (ints 0..255), 8 bits per byte,
+//     MSB-first within each byte, zero-padding the last byte if needed.
+//     Returns a list of byte values.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers use prefix _cg_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _cg_ceil_log2: smallest b such that 2^b >= m.
+// m=1 -> 0, m=2 -> 1, m=3 -> 2, m=4 -> 2, m=5 -> 3, m=8 -> 3.
+fn _cg_ceil_log2(m) -> int
+    if m <= 1
+        return 0
+    let b = 0
+    let p = 1
+    let done = 0
+    while done == 0
+        if p >= m
+            done = 1
+        else
+            b = b + 1
+            p = p * 2
+    b
+
+// _cg_push_bits: append the low nbits of value v (MSB-first) to list out.
+// nbits=0: no-op. v must fit in nbits bits.
+fn _cg_push_bits(out, v, nbits)
+    if nbits == 0
+        return null
+    let i = nbits - 1
+    while i >= 0
+        let bit = (v >> i) & 1
+        push(out, bit)
+        i = i - 1
+    null
+
+// _cg_read_unary: read unary code from bits at position pos.
+// Counts leading 1s until a 0 stop bit.
+// Returns [q, next_pos]. On truncated stream: [-1, len(bits)].
+fn _cg_read_unary(bits, pos) -> list
+    let blen = len(bits)
+    let q = 0
+    let cur = pos
+    let found = 0
+    while cur < blen and found == 0
+        if bits[cur] == 1
+            q = q + 1
+            cur = cur + 1
+        else
+            cur = cur + 1
+            found = 1
+    let result = []
+    if found == 0
+        push(result, -1)
+        push(result, blen)
+    else
+        push(result, q)
+        push(result, cur)
+    result
+
+// _cg_read_nbits: read nbits bits from bits at position pos as an integer (MSB-first).
+// Returns [value, next_pos]. On truncated stream: [-1, len(bits)].
+// nbits=0 returns [0, pos].
+fn _cg_read_nbits(bits, pos, nbits) -> list
+    let blen = len(bits)
+    let result = []
+    if nbits == 0
+        push(result, 0)
+        push(result, pos)
+        return result
+    if pos + nbits > blen
+        push(result, -1)
+        push(result, blen)
+        return result
+    let v = 0
+    let i = 0
+    while i < nbits
+        v = v * 2 + bits[pos + i]
+        i = i + 1
+    push(result, v)
+    push(result, pos + nbits)
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// golomb_encode: encode non-negative integer n with Golomb parameter m (m >= 1).
+//
+// Returns a list of 0/1 ints (MSB-first bitstream).
+//
+// Examples (m=4, b=2, cutoff=0):
+//   golomb_encode(0, 4) -> [0, 0, 0]          q=0 r=0 unary=[0] rem=[0,0]
+//   golomb_encode(5, 4) -> [1, 0, 0, 1]       q=1 r=1 unary=[1,0] rem=[0,1]
+//
+// Examples (m=3, b=2, cutoff=1):
+//   golomb_encode(0, 3) -> [0, 0]             q=0 r=0 r<1 1-bit:"0"
+//   golomb_encode(1, 3) -> [0, 1, 0]          q=0 r=1 r>=1 2-bit:r+1=2="10"
+//   golomb_encode(2, 3) -> [0, 1, 1]          q=0 r=2 r>=1 2-bit:r+1=3="11"
+//   golomb_encode(3, 3) -> [1, 0, 0]          q=1 r=0 r<1 1-bit:"0"
+fn golomb_encode(n, m) -> list
+    let q = n / m
+    let r = n - q * m
+    let out = []
+    // Unary part: q ones then a zero
+    let i = 0
+    while i < q
+        push(out, 1)
+        i = i + 1
+    push(out, 0)
+    // Truncated binary part for r over m
+    let b = _cg_ceil_log2(m)
+    let cutoff = (1 << b) - m
+    // Special case: m=1 means b=0, cutoff=0, no remainder bits
+    if b == 0
+        return out
+    if r < cutoff
+        _cg_push_bits(out, r, b - 1)
+    else
+        _cg_push_bits(out, r + cutoff, b)
+    out
+
+// golomb_decode: decode one Golomb-coded value from bits starting at pos.
+//
+// Returns [decoded_value, next_pos].
+// On malformed (truncated) input returns [-1, len(bits)].
+//
+// Algorithm:
+//   1. Read unary from pos -> [q, pos2]
+//   2. Compute b = ceil_log2(m), cutoff = 2^b - m
+//   3. If b == 0: r=0, done.
+//   4. Read b-1 bits -> short_val
+//   5. If short_val < cutoff: r = short_val
+//      Else: read 1 more bit; r = (short_val*2 + bit) - cutoff
+//   6. return [q*m + r, next_pos]
+fn golomb_decode(bits, pos, m) -> list
+    let blen = len(bits)
+    let ur = _cg_read_unary(bits, pos)
+    let q = ur[0]
+    let pos2 = ur[1]
+    let bad = []
+    if q == -1
+        push(bad, -1)
+        push(bad, blen)
+        return bad
+    let b = _cg_ceil_log2(m)
+    let cutoff = (1 << b) - m
+    // m=1 special case: no remainder bits
+    if b == 0
+        let res0 = []
+        push(res0, q * m)
+        push(res0, pos2)
+        return res0
+    // Read b-1 bits
+    let sr = _cg_read_nbits(bits, pos2, b - 1)
+    let short_val = sr[0]
+    let short_pos = sr[1]
+    if short_val == -1
+        let bad2 = []
+        push(bad2, -1)
+        push(bad2, blen)
+        return bad2
+    let r = 0
+    let next_pos = 0
+    if short_val < cutoff
+        r = short_val
+        next_pos = short_pos
+    else
+        // Read one more bit to form b-bit code
+        if short_pos >= blen
+            let bad3 = []
+            push(bad3, -1)
+            push(bad3, blen)
+            return bad3
+        let extra = bits[short_pos]
+        let full_val = short_val * 2 + extra
+        r = full_val - cutoff
+        next_pos = short_pos + 1
+    let value = q * m + r
+    let out = []
+    push(out, value)
+    push(out, next_pos)
+    out
+
+// golomb_encode_seq: encode a sequence of non-negative integers into one bitstream.
+//
+// All values are Golomb-encoded with parameter m and their bit lists are
+// concatenated. Decode with golomb_decode_seq using the same m and count.
+fn golomb_encode_seq(ns, m) -> list
+    let out = []
+    let n = len(ns)
+    let i = 0
+    while i < n
+        let bits = golomb_encode(ns[i], m)
+        let blen = len(bits)
+        let j = 0
+        while j < blen
+            push(out, bits[j])
+            j = j + 1
+        i = i + 1
+    out
+
+// golomb_decode_seq: decode exactly count Golomb-coded values from bits starting at pos.
+//
+// Returns a list of count decoded integers.
+// On malformed input, remaining values are -1.
+fn golomb_decode_seq(bits, pos, m, count) -> list
+    let out = []
+    let cur = pos
+    let i = 0
+    while i < count
+        let dr = golomb_decode(bits, cur, m)
+        push(out, dr[0])
+        cur = dr[1]
+        i = i + 1
+    out
+
+// pack_bits: pack a list of 0/1 bits into a list of byte values (0..255).
+//
+// 8 bits per byte, MSB-first within each byte.
+// The last byte is zero-padded if len(bit_list) is not a multiple of 8.
+//
+// Example:
+//   pack_bits([1,0,1,1,0,0,1,0]) -> [178]   (binary 10110010 = 0xB2)
+//   pack_bits([1,0,1])           -> [160]   (binary 10100000 padded)
+fn pack_bits(bit_list) -> list
+    let n = len(bit_list)
+    let out = []
+    let i = 0
+    while i < n
+        let byte_val = 0
+        let j = 0
+        while j < 8
+            byte_val = byte_val * 2
+            if i + j < n
+                byte_val = byte_val + bit_list[i + j]
+            j = j + 1
+        push(out, byte_val)
+        i = i + 8
+    out

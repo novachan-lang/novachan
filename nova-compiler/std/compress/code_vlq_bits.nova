@@ -1,0 +1,201 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/code_vlq_bits
+// ============================================================================
+// Bit-level VLQ / variable-bit varint.
+//
+// ENCODING SCHEME:
+//   Split n (>= 0) into groups of w data bits, big-endian order (most
+//   significant group first).  Each group is preceded by a single continuation
+//   bit:  1 = more groups follow,  0 = this is the last group.
+//
+//   So each group occupies (1 + w) bits in the output stream:
+//     [cont_bit, data_bit_{w-1}, ..., data_bit_0]
+//
+//   The number of groups is ceil(bit_length(n) / w), minimum 1 (n=0 uses 1
+//   group of all-zero data bits).
+//
+// EXAMPLE (w=3):
+//   n=0  ->  1 group, value=0: cont=0, bits=000 -> [0,0,0,0]
+//   n=7  ->  1 group, value=7: cont=0, bits=111 -> [0,1,1,1]
+//   n=8  ->  8 = 0b001_000, 2 groups (w=3): g0=001, g1=000
+//            emit g0 first with cont=1: [1,0,0,1]
+//            emit g1 last  with cont=0: [0,0,0,0]
+//            full: [1,0,0,1, 0,0,0,0]
+//
+// DECODING:
+//   Read (1+w) bits at a time.  First bit is continuation flag.  Accumulate
+//   data bits (big-endian) until continuation=0.
+//
+// SPECIAL CASE — vlqb_encode_bytes(n):
+//   w=7: each chunk is 8 bits on the wire (1 cont + 7 data), exactly the
+//   LEB128 encoding reinterpreted as a bit stream in MSB-first order.
+//
+// BIT REPRESENTATION:
+//   Bitstream = list of ints, each 0 or 1, MSB-first in the written order.
+//   encode -> list of 0/1 ints.
+//   decode(bits, pos, w) -> [value, next_pos].
+//
+// PUBLIC API:
+//   vlqb_encode(n, w) -> list
+//     Encode non-negative integer n with w-bit data groups.
+//     Returns [] for n < 0 or w < 1.
+//
+//   vlqb_decode(bits, pos, w) -> list
+//     Decode one VLQ value from bit-list 'bits' starting at index pos.
+//     Returns [value, next_pos].
+//     Returns [-1, pos] on truncated or invalid input.
+//
+//   vlqb_encode_bytes(n) -> list
+//     Encode n using w=7 (1-cont-bit + 7-data-bits per group), returned as a
+//     raw bit list.  Round-trips with vlqb_decode(bits, 0, 7).
+//
+//   vlqb_pack_bits(bit_list) -> list
+//     Pack a list of 0/1 ints into byte values (0..255), 8 bits per byte,
+//     MSB-first.  Zero-pads the last byte.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers use prefix _cvb_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _cvb_num_groups: how many w-bit groups are needed to represent n?
+// Always at least 1 (for n=0).
+fn _cvb_num_groups(n, w) -> int
+    if n == 0
+        return 1
+    // Count how many w-bit chunks fit into n.
+    // We need ceil(bit_length(n) / w).
+    // bit_length(n) = floor(log2(n)) + 1.
+    // We compute this iteratively to avoid floating point.
+    let groups = 0
+    let v = n
+    while v > 0
+        let _u = 0
+        v = v >> w
+        groups = groups + 1
+    groups
+
+// _cvb_group_value: extract the g-th group (0 = most significant) of w-bit chunks.
+// total_groups is the total number of groups for this value.
+fn _cvb_group_value(n, w, g, total_groups) -> int
+    // shift right by (total_groups - 1 - g) * w bits
+    let shift = (total_groups - 1 - g) * w
+    let mask = (1 << w) - 1
+    (n >> shift) & mask
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// vlqb_encode: encode non-negative integer n using w-bit data groups.
+//
+// Each group is emitted as (1 + w) bits:
+//   [continuation_bit, data_bit_{w-1}, ..., data_bit_0]
+// continuation_bit = 1 for all groups except the last (= 0).
+// Groups are emitted MSB-first (most significant group first).
+//
+// Returns [] for n < 0 or w < 1.
+fn vlqb_encode(n, w) -> list
+    let out = []
+    if n < 0
+        return out
+    if w < 1
+        return out
+    let total = _cvb_num_groups(n, w)
+    let mask = (1 << w) - 1
+    let g = 0
+    while g < total
+        let _u = 0
+        // continuation bit: 1 if not last group, 0 if last
+        let cont = 0
+        if g < total - 1
+            cont = 1
+        push(out, cont)
+        // extract the g-th group value (big-endian: g=0 is MSB group)
+        let shift = (total - 1 - g) * w
+        let gval = (n >> shift) & mask
+        // emit w bits of gval, MSB first
+        let bit_i = w - 1
+        while bit_i >= 0
+            let _u2 = 0
+            push(out, (gval >> bit_i) & 1)
+            bit_i = bit_i - 1
+        g = g + 1
+    out
+
+// vlqb_decode: decode one VLQ value from bit-list 'bits' starting at pos.
+//
+// Reads groups of (1+w) bits.  First bit of each group is the continuation
+// flag.  Accumulates data bits (big-endian) until continuation=0.
+//
+// Returns [value, next_pos].
+// Returns [-1, pos] on truncated/invalid input.
+fn vlqb_decode(bits, pos, w) -> list
+    let blen = len(bits)
+    let result = []
+    if w < 1
+        push(result, -1)
+        push(result, pos)
+        return result
+    let group_bits = 1 + w
+    let v = 0
+    let cur = pos
+    let running = 1
+    while running == 1
+        let _u = 0
+        // need at least (1+w) bits
+        if cur + group_bits > blen
+            // truncated
+            let r2 = []
+            push(r2, -1)
+            push(r2, pos)
+            return r2
+        // read continuation bit
+        let cont = bits[cur]
+        cur = cur + 1
+        // read w data bits, MSB first
+        let bit_i = 0
+        while bit_i < w
+            let _u2 = 0
+            v = v * 2 + bits[cur]
+            cur = cur + 1
+            bit_i = bit_i + 1
+        if cont == 0
+            running = 0
+    push(result, v)
+    push(result, cur)
+    result
+
+// vlqb_encode_bytes: encode n using w=7 (LEB128-style 8-bit groups as bit list).
+//
+// Each group on the wire = [cont_bit, 7 data bits] = 8 bits.
+// This is the big-endian VLQ variant used in some binary formats.
+//
+// Returns a list of 0/1 ints (multiple of 8 bits).
+fn vlqb_encode_bytes(n) -> list
+    vlqb_encode(n, 7)
+
+// vlqb_pack_bits: pack a list of 0/1 ints into byte values (0..255).
+//
+// Groups the bit list into chunks of 8, building one byte per chunk (MSB=bit[0]).
+// The last chunk is zero-padded to 8 bits if necessary.
+//
+// Returns a list of integers in [0..255].
+fn vlqb_pack_bits(bit_list) -> list
+    let out = []
+    let n = len(bit_list)
+    let i = 0
+    while i < n
+        let _u = 0
+        let byte_val = 0
+        let j = 0
+        while j < 8
+            let _u2 = 0
+            let bit = 0
+            if i + j < n
+                bit = bit_list[i + j]
+            byte_val = byte_val * 2 + bit
+            j = j + 1
+        push(out, byte_val)
+        i = i + 8
+    out

@@ -1,0 +1,266 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/code_exp_golomb
+// ============================================================================
+// Exponential-Golomb (Exp-Golomb) universal code of order k for n >= 0.
+// Used in H.264 / H.265 for coding syntax elements (ue, se, etc.).
+//
+// ORDER-0 (k=0) ENCODING:
+//   Let x = n + 1.
+//   Let L = bitlength(x) - 1   (i.e. floor(log2(x)) = floor(log2(n+1))).
+//   Emit L zero bits (the prefix/unary part), then x in binary (L+1 bits, MSB-first).
+//
+//   The total codeword length = 2*L + 1 bits.
+//
+//   Examples (order 0):
+//     n=0  -> x=1,  L=0: 0 zeros,  binary(1, 1 bit)=[1]         -> [1]
+//     n=1  -> x=2,  L=1: 1 zero,   binary(2, 2 bits)=[1,0]      -> [0,1,0]
+//     n=2  -> x=3,  L=1: 1 zero,   binary(3, 2 bits)=[1,1]      -> [0,1,1]
+//     n=3  -> x=4,  L=2: 2 zeros,  binary(4, 3 bits)=[1,0,0]    -> [0,0,1,0,0]
+//     n=4  -> x=5,  L=2: 2 zeros,  binary(5, 3 bits)=[1,0,1]    -> [0,0,1,0,1]
+//     n=6  -> x=7,  L=2: 2 zeros,  binary(7, 3 bits)=[1,1,1]    -> [0,0,1,1,1]
+//     n=7  -> x=8,  L=3: 3 zeros,  binary(8, 4 bits)=[1,0,0,0]  -> [0,0,0,1,0,0,0]
+//
+// ORDER-k (k > 0) ENCODING:
+//   Split n into a high part and k low bits:
+//     hi  = n >> k          (n / 2^k, integer division)
+//     lo  = n & ((1<<k)-1)  (the k least-significant bits of n)
+//   Encode hi with order-0 exp-golomb; append lo in binary (k bits, MSB-first).
+//   Total bits = expgolomb_encode(hi, 0) ++ k-bit binary(lo).
+//
+//   Example k=1:
+//     n=0  -> hi=0, lo=0: [1]       ++ [0]     = [1,0]
+//     n=1  -> hi=0, lo=1: [1]       ++ [1]     = [1,1]
+//     n=2  -> hi=1, lo=0: [0,1,0]   ++ [0]     = [0,1,0,0]
+//     n=3  -> hi=1, lo=1: [0,1,0]   ++ [1]     = [0,1,0,1]
+//
+// ORDER-0 DECODING:
+//   1. Count consecutive leading 0-bits from pos -> L.
+//   2. Read the next L+1 bits as integer x (MSB-first; the first is always 1).
+//   3. n = x - 1.
+//   4. next_pos = pos + 2*L + 1.
+//
+// ORDER-k DECODING:
+//   1. Decode order-0 to get hi and its next_pos.
+//   2. Read k more bits as integer lo (MSB-first).
+//   3. n = (hi << k) | lo.
+//   4. next_pos = order0_next_pos + k.
+//
+// BIT REPRESENTATION (shared convention for std/compress):
+//   A bitstream is a list of ints, each 0 or 1, MSB-first in the order written.
+//   encode(n, k) -> list ; decode(bits, pos, k) -> [value, next_pos].
+//
+// PUBLIC API:
+//   expgolomb_encode(n, k) -> list
+//     Encode non-negative integer n using exp-golomb order k (k >= 0, n >= 0).
+//     Returns a list of 0/1 ints (MSB-first bitstream).
+//
+//   expgolomb_decode(bits, pos, k) -> list
+//     Decode one exp-golomb-order-k value from bit-list 'bits' at offset pos.
+//     Returns [decoded_n, next_pos].
+//     Returns [-1, len(bits)] on truncated/malformed input.
+//
+//   expgolomb_encode_seq(ns, k) -> list
+//     Encode a sequence of non-negative integers into one concatenated bitstream.
+//
+//   expgolomb_decode_seq(bits, pos, k, count) -> list
+//     Decode exactly count values from bits starting at pos.
+//     Returns a list of count decoded integers.
+//
+//   expgolomb_pack_bits(bit_list) -> list
+//     Pack a list of 0/1 bits into bytes (ints 0..255), 8 bits per byte,
+//     MSB-first within each byte, zero-padding the last byte if needed.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers use prefix _ceg2_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _ceg2_bitlen: return number of bits needed to represent v (v >= 1).
+// bitlen(1)=1, bitlen(2)=2, bitlen(3)=2, bitlen(4)=3, bitlen(7)=3, bitlen(8)=4.
+fn _ceg2_bitlen(v) -> int
+    let bits = 0
+    let x = v
+    while x > 0
+        bits = bits + 1
+        x = x / 2
+    bits
+
+// _ceg2_push_bits: append the low nbits of value v (MSB-first) to list out.
+// nbits=0: no-op.
+fn _ceg2_push_bits(out, v, nbits)
+    if nbits == 0
+        return null
+    let i = nbits - 1
+    while i >= 0
+        let bit = (v >> i) & 1
+        push(out, bit)
+        i = i - 1
+    null
+
+// _ceg2_read_nbits: read nbits bits from bits starting at pos as MSB-first integer.
+// Returns [value, next_pos]. nbits=0 returns [0, pos].
+// On truncated stream returns [-1, len(bits)].
+fn _ceg2_read_nbits(bits, pos, nbits) -> list
+    let blen = len(bits)
+    let result = []
+    if nbits == 0
+        push(result, 0)
+        push(result, pos)
+        return result
+    if pos + nbits > blen
+        push(result, -1)
+        push(result, blen)
+        return result
+    let v = 0
+    let i = 0
+    while i < nbits
+        v = v * 2 + bits[pos + i]
+        i = i + 1
+    push(result, v)
+    push(result, pos + nbits)
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// expgolomb_encode: encode non-negative integer n with exp-golomb order k.
+//
+// k=0: x=n+1, L=bitlength(x)-1, emit L zeros then x in binary (L+1 bits).
+// k>0: encode (n>>k) with order-0, then append the low k bits of n.
+//
+// Returns a list of 0/1 ints.
+//
+// Complexity: O(log n) time and space.
+fn expgolomb_encode(n, k) -> list
+    let out = []
+    // High part: encode (n >> k) with order-0.
+    let hi = n
+    if k > 0
+        hi = n >> k
+    // Order-0 encode of hi:
+    let x = hi + 1
+    let L = _ceg2_bitlen(x) - 1
+    // Emit L leading zeros
+    let i = 0
+    while i < L
+        push(out, 0)
+        i = i + 1
+    // Emit x in binary (L+1 bits, MSB-first)
+    _ceg2_push_bits(out, x, L + 1)
+    // Append low k bits of n (if k > 0)
+    if k > 0
+        let lo = n - (hi << k)
+        _ceg2_push_bits(out, lo, k)
+    out
+
+// expgolomb_decode: decode one exp-golomb-order-k value from bits at pos.
+//
+// Order-0 decode:
+//   1. Count consecutive 0-bits from pos -> L.
+//   2. Read L+1 bits as integer x (MSB-first).
+//   3. hi = x - 1.
+// Order-k decode:
+//   4. Read k more bits as integer lo.
+//   5. n = (hi << k) | lo.
+//
+// Returns [n, next_pos].
+// Returns [-1, len(bits)] on truncated/malformed input.
+fn expgolomb_decode(bits, pos, k) -> list
+    let blen = len(bits)
+    let bad = []
+    // Step 1: count leading zeros from pos -> L
+    let L = 0
+    let cur = pos
+    while cur < blen and bits[cur] == 0
+        L = L + 1
+        cur = cur + 1
+    // cur now points to the first 1 bit (the MSB of x)
+    // We need L+1 more bits starting at cur.
+    if cur + L + 1 > blen
+        push(bad, -1)
+        push(bad, blen)
+        return bad
+    // Step 2: read L+1 bits as x
+    let xr = _ceg2_read_nbits(bits, cur, L + 1)
+    let x = xr[0]
+    let pos2 = xr[1]
+    if x == -1
+        push(bad, -1)
+        push(bad, blen)
+        return bad
+    let hi = x - 1
+    // Step 3: if k=0, done
+    let result = []
+    if k == 0
+        push(result, hi)
+        push(result, pos2)
+        return result
+    // Step 4: read k bits as lo
+    let lr = _ceg2_read_nbits(bits, pos2, k)
+    let lo = lr[0]
+    let pos3 = lr[1]
+    if lo == -1
+        push(bad, -1)
+        push(bad, blen)
+        return bad
+    // Step 5: reconstruct n = (hi << k) | lo
+    let n = (hi << k) + lo
+    push(result, n)
+    push(result, pos3)
+    result
+
+// expgolomb_encode_seq: encode a sequence of non-negative integers (order k).
+//
+// All values are exp-golomb encoded and the bit lists are concatenated.
+// Decode with expgolomb_decode_seq using the same k and count.
+fn expgolomb_encode_seq(ns, k) -> list
+    let out = []
+    let cnt = len(ns)
+    let i = 0
+    while i < cnt
+        let bits = expgolomb_encode(ns[i], k)
+        let blen = len(bits)
+        let j = 0
+        while j < blen
+            push(out, bits[j])
+            j = j + 1
+        i = i + 1
+    out
+
+// expgolomb_decode_seq: decode exactly count exp-golomb-order-k values from bits.
+//
+// Returns a list of count decoded integers. On malformed input remaining values are -1.
+fn expgolomb_decode_seq(bits, pos, k, count) -> list
+    let out = []
+    let cur = pos
+    let i = 0
+    while i < count
+        let dr = expgolomb_decode(bits, cur, k)
+        push(out, dr[0])
+        cur = dr[1]
+        i = i + 1
+    out
+
+// expgolomb_pack_bits: pack a list of 0/1 bits into byte values (0..255).
+//
+// Groups into chunks of 8 bits, MSB-first within each byte.
+// The last byte is zero-padded if len(bit_list) is not a multiple of 8.
+//
+// Example:
+//   expgolomb_pack_bits([1,0,1,1,0,0,1,0]) -> [178]
+fn expgolomb_pack_bits(bit_list) -> list
+    let n = len(bit_list)
+    let out = []
+    let i = 0
+    while i < n
+        let byte_val = 0
+        let j = 0
+        while j < 8
+            byte_val = byte_val * 2
+            if i + j < n
+                byte_val = byte_val + bit_list[i + j]
+            j = j + 1
+        push(out, byte_val)
+        i = i + 8
+    out

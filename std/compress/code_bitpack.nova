@@ -1,0 +1,231 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/code_bitpack
+// ============================================================================
+// Fixed-width bit packing and bitstream helpers.
+//
+// This module provides the low-level fixed-width layer used by codecs that
+// pack integers at sub-byte granularity: Huffman, arithmetic coding, DEFLATE
+// literal/length/distance codes, and user-defined binary formats.
+//
+// BIT REPRESENTATION (shared convention for all std/compress codecs):
+//   A bitstream is a LIST of ints, each 0 or 1, in MSB-first order.
+//   bits_from_int(v, w) -> list of w ints, MSB first (bit w-1 .. bit 0).
+//   int_from_bits(bits, pos, w) -> [value, next_pos].
+//   This representation is independent of any byte layout and easy to KAT.
+//
+// BYTE PACKING:
+//   pack_bits(bit_list) -> list of ints [0..255], one per 8-bit group, MSB-first.
+//   The last group is zero-padded if len(bit_list) is not a multiple of 8.
+//   unpack_bits(byte_list, nbits) -> list of nbits 0/1 ints extracted MSB-first.
+//
+// PUBLIC API:
+//   bits_from_int(value, width) -> list
+//     Extract the low 'width' bits of value as a list of 0/1 ints, MSB-first.
+//     width=0 returns []. Negative widths return [].
+//
+//   int_from_bits(bits, pos, width) -> list [value, next_pos]
+//     Read 'width' bits from bit-list 'bits' starting at index pos.
+//     Returns [integer_value, pos+width]. If bits are exhausted, missing bits
+//     are treated as 0 (safe underflow, consistent with bitwriter convention).
+//
+//   pack_bits(bit_list) -> list
+//     Pack a list of 0/1 ints into byte values (0..255), MSB-first in each byte.
+//     Returns a list of integers, one per 8-bit group. Last group zero-padded.
+//
+//   unpack_bits(byte_list, nbits) -> list
+//     Unpack the first nbits bits from byte_list (MSB-first from each byte).
+//     Returns a list of 0/1 ints of length min(nbits, 8*len(byte_list)).
+//
+//   bitpack_seq(values, width) -> list
+//     Pack a list of integers, each encoded in exactly 'width' bits (MSB-first),
+//     into a single concatenated bit-list.
+//
+// EXAMPLES:
+//   bits_from_int(5, 4)   -> [0, 1, 0, 1]
+//   bits_from_int(255, 8) -> [1, 1, 1, 1, 1, 1, 1, 1]
+//   int_from_bits([0,1,0,1], 0, 4) -> [5, 4]
+//   pack_bits([1,0,0,0,0,0,0,1])   -> list, byte[0] == 0x81 == 129
+//   bitpack_seq([1,2,3], 2)        -> [0,1,1,0,1,1]
+//
+// INVARIANTS:
+//   bits_from_int(v, w) always returns a list of exactly w elements (each 0 or 1).
+//   int_from_bits(bits_from_int(v, w), 0, w) == [v & ((1<<w)-1), w].
+//   pack_bits(unpack_bits(pack_bits(bl), len(bl))) == pack_bits(bl) when
+//     len(bl) is a multiple of 8.
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers prefixed _cbp_ to avoid link collisions.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _cbp_pow2: compute 2^exp for exp >= 0.
+// Used to avoid relying on left-shift operator for bit extraction.
+fn _cbp_pow2(exp) -> int
+    let result = 1
+    let i = 0
+    while i < exp
+        let _u = 0
+        result = result * 2
+        i = i + 1
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// bits_from_int: extract the low 'width' bits of value as a MSB-first bit-list.
+//
+// value: any non-negative integer (only the low 'width' bits are used).
+// width: number of bits to extract. 0 returns [].
+//
+// The output list has exactly 'width' elements, each 0 or 1.
+// Bit at index 0 is the most significant (bit position width-1);
+// bit at index width-1 is the least significant (bit position 0).
+//
+// Examples:
+//   bits_from_int(5, 4)   -> [0, 1, 0, 1]   (0101 in 4 bits)
+//   bits_from_int(255, 8) -> [1, 1, 1, 1, 1, 1, 1, 1]
+//   bits_from_int(0, 4)   -> [0, 0, 0, 0]
+//   bits_from_int(7, 3)   -> [1, 1, 1]
+fn bits_from_int(value, width) -> list
+    let out = []
+    if width <= 0
+        return out
+    // Walk from MSB (position width-1) down to LSB (position 0)
+    let i = width - 1
+    while i >= 0
+        let _u = 0
+        let bit = (value >> i) & 1
+        push(out, bit)
+        i = i - 1
+    out
+
+// int_from_bits: read 'width' bits from bit-list 'bits' starting at index pos.
+//
+// Interprets the bits MSB-first: the first bit read (at bits[pos]) is the
+// most significant bit of the returned integer.
+//
+// Returns a 2-element list [value, next_pos] where next_pos = pos + width.
+// If fewer than width bits remain (pos + width > len(bits)), the missing
+// positions are treated as 0 (safe underflow).
+//
+// Examples:
+//   int_from_bits([0,1,0,1], 0, 4) -> [5, 4]
+//   int_from_bits([1,1,1,1,1,1,1,1], 0, 8) -> [255, 8]
+//   int_from_bits([0,1,0,1], 2, 2) -> [1, 4]   // reads bits[2]=0, bits[3]=1 -> 01 = 1
+fn int_from_bits(bits, pos, width) -> list
+    let result = []
+    let blen = len(bits)
+    let value = 0
+    let i = 0
+    while i < width
+        let _u = 0
+        let cur = pos + i
+        let bit = 0
+        if cur < blen
+            bit = bits[cur]
+        value = value * 2 + bit
+        i = i + 1
+    push(result, value)
+    push(result, pos + width)
+    result
+
+// pack_bits: pack a list of 0/1 ints into byte values (0..255), MSB-first.
+//
+// Groups the bit list into consecutive chunks of 8. Each chunk becomes one byte,
+// with the first bit of the chunk as the most-significant bit of that byte.
+// The final chunk is zero-padded on the right if len(bit_list) % 8 != 0.
+//
+// Returns a list of integers in [0..255], one integer per 8-bit group.
+// Empty input returns [].
+//
+// Examples:
+//   pack_bits([1,0,0,0,0,0,0,1]) -> [129]           // 0x81
+//   pack_bits([1,0,1,1,0,0,1,0, 1,1]) -> [178, 192] // 10110010, 11000000
+//   pack_bits([])                -> []
+fn pack_bits(bit_list) -> list
+    let out = []
+    let n = len(bit_list)
+    if n == 0
+        return out
+    let i = 0
+    while i < n
+        let _u = 0
+        let byte_val = 0
+        let j = 0
+        while j < 8
+            let _u2 = 0
+            byte_val = byte_val * 2
+            if i + j < n
+                byte_val = byte_val + bit_list[i + j]
+            j = j + 1
+        push(out, byte_val)
+        i = i + 8
+    out
+
+// unpack_bits: extract the first nbits bits from byte_list, MSB-first per byte.
+//
+// byte_list: a list of integers in [0..255] (as produced by pack_bits).
+// nbits:     the number of bits to extract. Clamped to 8*len(byte_list).
+//
+// Returns a list of 0/1 ints of length min(nbits, 8*len(byte_list)).
+//
+// The MSB of each byte becomes the earliest bit in the output list.
+//
+// Examples:
+//   unpack_bits([129], 8)    -> [1, 0, 0, 0, 0, 0, 0, 1]  // 0x81
+//   unpack_bits([178], 8)    -> [1, 0, 1, 1, 0, 0, 1, 0]  // 0xB2
+//   unpack_bits([129], 4)    -> [1, 0, 0, 0]               // top 4 bits of 0x81
+fn unpack_bits(byte_list, nbits) -> list
+    let out = []
+    let nb = len(byte_list)
+    let max_bits = nb * 8
+    let total = nbits
+    if total > max_bits
+        total = max_bits
+    let extracted = 0
+    let bi = 0
+    while bi < nb and extracted < total
+        let _u = 0
+        let byte_val = byte_list[bi]
+        // extract bits from MSB (bit 7) down to LSB (bit 0)
+        let shift = 7
+        while shift >= 0 and extracted < total
+            let _u2 = 0
+            let bit = (byte_val >> shift) & 1
+            push(out, bit)
+            extracted = extracted + 1
+            shift = shift - 1
+        bi = bi + 1
+    out
+
+// bitpack_seq: pack a list of integers, each in exactly 'width' bits, MSB-first.
+//
+// values: list of non-negative integers, each encoded with bits_from_int(v, width).
+// width:  number of bits per element. Must be >= 0.
+//
+// The result is the concatenation of bits_from_int(values[0], width),
+// bits_from_int(values[1], width), ..., bits_from_int(values[N-1], width).
+//
+// Returns a flat list of 0/1 ints.
+//
+// Examples:
+//   bitpack_seq([1, 2, 3], 2) -> [0,1, 1,0, 1,1]  // 01 10 11
+//   bitpack_seq([5], 4)        -> [0, 1, 0, 1]
+//   bitpack_seq([], 8)         -> []
+fn bitpack_seq(values, width) -> list
+    let out = []
+    let n = len(values)
+    let i = 0
+    while i < n
+        let _u = 0
+        let v = values[i]
+        let bits = bits_from_int(v, width)
+        let blen = len(bits)
+        let j = 0
+        while j < blen
+            let _u2 = 0
+            push(out, bits[j])
+            j = j + 1
+        i = i + 1
+    out
