@@ -1,0 +1,308 @@
+// ============================================================================
+// NOVA Standard Library — std/net/beanstalkd
+// ============================================================================
+// beanstalkd text protocol codec — command BUILDER and reply PARSER.
+// No live sockets; pure text codec (message formatting only).
+//
+// Protocol overview (beanstalkd protocol.txt):
+//   Commands are sent by clients, replies come from the server.
+//   Most command lines end with CRLF (CR LF = 0x0D 0x0A).
+//   Some commands carry a body: "<cmd>\r\n<data>\r\n".
+//   Replies are either single-line or have a body header + data + CRLF.
+//
+// PUBLIC API — BUILDERS:
+//   bean_put(pri, delay, ttr, data)  -> string
+//     Build a "put" command.  data is the job body (plain text).
+//     Wire: "put <pri> <delay> <ttr> <bytes>\r\n<data>\r\n"
+//     <bytes> = len(data) in bytes.
+//
+//   bean_reserve()                   -> string
+//     Build a "reserve" command.  Wire: "reserve\r\n"
+//
+//   bean_delete(id)                  -> string
+//     Build a "delete" command.  Wire: "delete <id>\r\n"
+//
+//   bean_use(tube)                   -> string
+//     Build a "use" command.  Wire: "use <tube>\r\n"
+//
+// PUBLIC API — PARSER:
+//   bean_parse_reply(text)           -> dict
+//     Parse a server reply.  Returns a dict with keys:
+//       "status"  — reply keyword, e.g. "INSERTED", "RESERVED", "NOT_FOUND",
+//                   "DELETED", "USING", "BURIED", "EXPECTED_CRLF", etc.
+//                   Empty string if text is empty/malformed.
+//       "id"      — (optional) integer job id if present in the reply.
+//                   Stored as int 0 if absent.
+//       "bytes"   — (optional) body byte-count from the reply header (int).
+//                   0 if absent.
+//       "data"    — (optional) job body string for RESERVED/peeked replies.
+//                   Empty string if absent.
+//     Known single-line replies with an id field:
+//       "INSERTED <id>"         — after put
+//       "BURIED <id>"           — after put, server buried the job
+//       "USING <tube>"          — after use (id field holds tube name as string)
+//     Known two-line replies (header + body):
+//       "RESERVED <id> <bytes>" — after reserve, body follows
+//       "FOUND <id> <bytes>"    — after peek, body follows
+//     Known status-only replies (no extra fields):
+//       NOT_FOUND, DELETED, RELEASED, TIMED_OUT, DEADLINE_SOON,
+//       NOT_IGNORED, EXPECTED_CRLF, JOB_TOO_BIG, DRAINING, OUT_OF_MEMORY,
+//       INTERNAL_ERROR, BAD_FORMAT, UNKNOWN_COMMAND
+//
+// DESIGN NOTES:
+//   * CRLF = chr(13) + chr(10) throughout; never rely on backslash escapes.
+//   * bean_parse_reply strips trailing CRLF from each logical line before
+//     splitting on spaces, so it works with or without trailing CRLF on
+//     the last line.
+//   * All private helpers are prefixed _bn_ to avoid symbol collisions.
+//   * Missing dict keys return int 0 in NOVA — callers must use contains()
+//     before reading optional string fields they need as strings.
+//   * LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _bn_crlf: return the CRLF separator string.
+fn _bn_crlf() -> string
+    chr(13) + chr(10)
+
+// _bn_find_char: scan s from start, return index of first occurrence of ch,
+// or -1 if not found.
+fn _bn_find_char(s: string, ch: string, start: int) -> int
+    let n = len(s)
+    let i = start
+    while i < n
+        if char_at(s, i) == ch
+            return i
+        i = i + 1
+    -1
+
+// _bn_rtrim_crlf: remove trailing CR and LF characters from s.
+fn _bn_rtrim_crlf(s: string) -> string
+    let cr = chr(13)
+    let lf = chr(10)
+    let stop = len(s)
+    let going = 1
+    while stop > 0 and going == 1
+        let c = char_at(s, stop - 1)
+        if c == cr or c == lf
+            stop = stop - 1
+        else
+            going = 0
+    slice(s, 0, stop)
+
+// _bn_parse_int: parse a non-negative integer from s[start..end).
+// Returns 0 on empty / non-digit input.
+fn _bn_parse_int(s: string, start_pos: int, end_pos: int) -> int
+    let i = start_pos
+    let result = 0
+    while i < end_pos
+        let c = ord(char_at(s, i))
+        if c >= 48 and c <= 57
+            result = result * 10 + (c - 48)
+        i = i + 1
+    result
+
+// _bn_next_token: return the substring of s between start (inclusive) and the
+// next space or end of string (exclusive).  Returns "" if start >= len(s).
+fn _bn_next_token(s: string, start: int) -> string
+    let n = len(s)
+    if start >= n
+        return ""
+    let sp = _bn_find_char(s, " ", start)
+    if sp < 0
+        return slice(s, start, n)
+    slice(s, start, sp)
+
+// _bn_empty_reply: return a reply dict with all fields at their zero/empty values.
+fn _bn_empty_reply() -> dict
+    let d = {}
+    d["status"] = ""
+    d["id"] = 0
+    d["bytes"] = 0
+    d["data"] = ""
+    d
+
+// ── Public: BUILDERS ─────────────────────────────────────────────────────────
+
+// bean_put: build a "put" command with the given parameters.
+//
+// Parameters:
+//   pri   — job priority (uint32, 0 = most urgent)
+//   delay — seconds to delay before becoming ready (int >= 0)
+//   ttr   — time-to-run in seconds (int >= 1)
+//   data  — job body string; byte-count is derived from len(data)
+//
+// Wire format: "put <pri> <delay> <ttr> <bytes>\r\n<data>\r\n"
+//
+// Example:
+//   bean_put(1, 0, 60, "hello")
+//   -> "put 1 0 60 5\r\nhello\r\n"
+fn bean_put(pri: int, delay: int, ttr: int, data: string) -> string
+    let crlf = _bn_crlf()
+    let byte_count = len(data)
+    "put " + str(pri) + " " + str(delay) + " " + str(ttr) + " " + str(byte_count) + crlf + data + crlf
+
+// bean_reserve: build a "reserve" command.
+//
+// Wire format: "reserve\r\n"
+//
+// Example:
+//   bean_reserve()  ->  "reserve\r\n"
+fn bean_reserve() -> string
+    "reserve" + _bn_crlf()
+
+// bean_delete: build a "delete" command for the given job id.
+//
+// Wire format: "delete <id>\r\n"
+//
+// Example:
+//   bean_delete(42)  ->  "delete 42\r\n"
+fn bean_delete(id: int) -> string
+    "delete " + str(id) + _bn_crlf()
+
+// bean_use: build a "use" command to select the active tube.
+//
+// Wire format: "use <tube>\r\n"
+//
+// Example:
+//   bean_use("default")  ->  "use default\r\n"
+fn bean_use(tube: string) -> string
+    "use " + tube + _bn_crlf()
+
+// ── Public: PARSER ───────────────────────────────────────────────────────────
+
+// bean_parse_reply: parse a beanstalkd server reply into a structured dict.
+//
+// Input may be:
+//   (a) A single-line reply (with or without trailing CRLF):
+//         "INSERTED 42\r\n"
+//         "NOT_FOUND\r\n"
+//         "USING default\r\n"
+//         "BURIED 7\r\n"
+//   (b) A two-line reply (header line + data line):
+//         "RESERVED 5 3\r\nabc\r\n"
+//         "FOUND 12 5\r\nhello\r\n"
+//
+// Returns a dict (see module header for field descriptions).
+//
+// Parsing strategy:
+//   1. Split on first CRLF to get the header line.
+//   2. Parse status word (first token of header).
+//   3. For RESERVED/FOUND: parse <id> and <bytes>, extract data after CRLF.
+//   4. For INSERTED/BURIED: parse <id>.
+//   5. For USING: store tube name in "id" field as int 0 (no numeric id here;
+//      caller reads "tube" key — we also store it as "tube" string).
+//   6. Status-only replies: no extra fields.
+//
+// Edge cases handled:
+//   * Trailing CRLF on header line stripped before tokenising.
+//   * Missing/malformed numeric fields parse as 0.
+//   * data body trimmed of its trailing CRLF.
+//   * Empty or zero-length input returns empty reply dict.
+fn bean_parse_reply(text: string) -> dict
+    let d = _bn_empty_reply()
+    let n = len(text)
+    if n == 0
+        return d
+
+    let crlf = _bn_crlf()
+    let cr = chr(13)
+    let lf = chr(10)
+
+    // ── Step 1: find end of header line ────────────────────────────────────
+    // Look for CR (which is always followed by LF in CRLF).
+    let cr_pos = _bn_find_char(text, cr, 0)
+    let header = ""
+    let after_header = n
+    if cr_pos >= 0
+        header = slice(text, 0, cr_pos)
+        // skip CRLF (2 chars)
+        after_header = cr_pos + 2
+    else
+        // No CRLF — treat the whole string as the header line.
+        header = _bn_rtrim_crlf(text)
+        after_header = n
+
+    let hlen = len(header)
+    if hlen == 0
+        return d
+
+    // ── Step 2: extract status word (first space-delimited token) ───────────
+    let sp1 = _bn_find_char(header, " ", 0)
+    let status = ""
+    if sp1 < 0
+        status = header
+    else
+        status = slice(header, 0, sp1)
+
+    d["status"] = status
+
+    // ── Step 3: dispatch on status to extract optional fields ───────────────
+
+    if status == "INSERTED"
+        // "INSERTED <id>"
+        if sp1 >= 0
+            let tok = _bn_next_token(header, sp1 + 1)
+            d["id"] = _bn_parse_int(tok, 0, len(tok))
+
+    if status == "BURIED"
+        // "BURIED <id>"  (buried by put when priority triggers it)
+        if sp1 >= 0
+            let tok2 = _bn_next_token(header, sp1 + 1)
+            d["id"] = _bn_parse_int(tok2, 0, len(tok2))
+
+    if status == "USING"
+        // "USING <tube>"  — tube name stored in "tube" key (string)
+        if sp1 >= 0
+            let tube_name = _bn_next_token(header, sp1 + 1)
+            d["tube"] = tube_name
+
+    if status == "RESERVED"
+        // "RESERVED <id> <bytes>\r\n<data>\r\n"
+        if sp1 >= 0
+            let tok3 = _bn_next_token(header, sp1 + 1)
+            d["id"] = _bn_parse_int(tok3, 0, len(tok3))
+            let sp2 = _bn_find_char(header, " ", sp1 + 1)
+            if sp2 >= 0
+                let btok = _bn_next_token(header, sp2 + 1)
+                d["bytes"] = _bn_parse_int(btok, 0, len(btok))
+        // Extract data body: text[after_header .. after_header + byte_count]
+        let bcount = d["bytes"]
+        if bcount > 0 and after_header + bcount <= n
+            d["data"] = slice(text, after_header, after_header + bcount)
+        else
+            if after_header < n
+                // No explicit byte count or mismatch — take up to trailing CRLF.
+                let data_end = _bn_find_char(text, cr, after_header)
+                if data_end >= 0
+                    d["data"] = slice(text, after_header, data_end)
+                else
+                    d["data"] = slice(text, after_header, n)
+
+    if status == "FOUND"
+        // "FOUND <id> <bytes>\r\n<data>\r\n"
+        if sp1 >= 0
+            let tok4 = _bn_next_token(header, sp1 + 1)
+            d["id"] = _bn_parse_int(tok4, 0, len(tok4))
+            let sp3 = _bn_find_char(header, " ", sp1 + 1)
+            if sp3 >= 0
+                let btok2 = _bn_next_token(header, sp3 + 1)
+                d["bytes"] = _bn_parse_int(btok2, 0, len(btok2))
+        let bcount2 = d["bytes"]
+        if bcount2 > 0 and after_header + bcount2 <= n
+            d["data"] = slice(text, after_header, after_header + bcount2)
+        else
+            if after_header < n
+                let data_end2 = _bn_find_char(text, cr, after_header)
+                if data_end2 >= 0
+                    d["data"] = slice(text, after_header, data_end2)
+                else
+                    d["data"] = slice(text, after_header, n)
+
+    // Status-only replies (NOT_FOUND, DELETED, RELEASED, TIMED_OUT,
+    // DEADLINE_SOON, NOT_IGNORED, EXPECTED_CRLF, JOB_TOO_BIG, DRAINING,
+    // OUT_OF_MEMORY, INTERNAL_ERROR, BAD_FORMAT, UNKNOWN_COMMAND)
+    // need no extra parsing — status is already set.
+
+    d

@@ -1,0 +1,209 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ftp_reply
+// ============================================================================
+// FTP reply + command codec (RFC 959), TEXT protocol.
+//
+// PUBLIC API:
+//   ftp_reply_parse(text: string) -> dict
+//     Parse a complete FTP reply (single-line or multi-line) into:
+//       "code"     : int   — the 3-digit reply code
+//       "lines"    : list  — text lines (strings), one per continuation line
+//                           plus the final line text (code stripped)
+//       "complete" : int   — 1 if reply is complete (ends with "code SP …"),
+//                           0 if still expecting more lines
+//     Single-line: "230 Login successful"
+//       → code=230, lines=["Login successful"], complete=1
+//     Multi-line: "211-Features:\r\n STARTTLS\r\n211 End"
+//       → code=211, lines=["Features:", " STARTTLS", "End"], complete=1
+//     Incomplete / malformed (code not parseable): code=0, lines=[], complete=0
+//
+//   ftp_reply_build(code: int, lines: list) -> string
+//     Build a well-formed FTP reply string.
+//     Single line  (len(lines)==1): "code SP text CRLF"
+//     Multi-line   (len(lines)>1):  "code-text[0] CRLF" +
+//                                   intermediate lines as-is + CRLF +
+//                                   "code SP text[last] CRLF"
+//     Empty lines list: treated as one empty line → "code  CRLF".
+//
+//   ftp_command(verb: string, arg: string) -> string
+//     Build an FTP command line.
+//     If arg is non-empty: "VERB SP arg CRLF"
+//     If arg is empty:     "VERB CRLF"
+//
+// DESIGN NOTES:
+//   * CRLF = chr(13)+chr(10).  We recognise bare LF as well when stripping.
+//   * Multi-line reply: first line has "code-" (hyphen after code), subsequent
+//     lines are continuations, last line has "code " (space after code).
+//   * Intermediate continuation lines that happen to start with the same code
+//     followed by a space are still continuations (RFC 959 §4.2 rule: only the
+//     first line determines the expected terminator).
+//   * Missing-key from dict returns int 0 — guard with contains().
+//   * Private helpers prefixed _ftp_.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _ftp_crlf: return CRLF string
+fn _ftp_crlf() -> string
+    chr(13) + chr(10)
+
+// _ftp_is_digit: 1 if c is ASCII digit
+fn _ftp_is_digit(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return 1
+    0
+
+// _ftp_parse_code: parse 3-digit code at start of line, return int or -1
+fn _ftp_parse_code(line: string) -> int
+    let n = len(line)
+    if n < 3
+        return -1
+    let c0 = slice(line, 0, 1)
+    let c1 = slice(line, 1, 2)
+    let c2 = slice(line, 2, 3)
+    if _ftp_is_digit(c0) == 0 or _ftp_is_digit(c1) == 0 or _ftp_is_digit(c2) == 0
+        return -1
+    let d0 = ord(c0) - 48
+    let d1 = ord(c1) - 48
+    let d2 = ord(c2) - 48
+    d0 * 100 + d1 * 10 + d2
+
+// _ftp_strip_crlf: strip trailing CR and/or LF from a line string
+fn _ftp_strip_crlf(s: string) -> string
+    let n = len(s)
+    let end = n
+    if end > 0 and ord(slice(s, end - 1, end)) == 10
+        end = end - 1
+    if end > 0 and ord(slice(s, end - 1, end)) == 13
+        end = end - 1
+    slice(s, 0, end)
+
+// _ftp_split_lines: split text on LF (keeping bare-CR lines intact),
+// returns list of raw lines (with possible trailing CR stripped later).
+// We split on LF only; each entry may still have a trailing CR.
+fn _ftp_split_lines(text: string) -> list
+    let result = []
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n
+        if slice(text, i, i + 1) == chr(10)
+            push(result, slice(text, start, i + 1))
+            start = i + 1
+        i = i + 1
+    if start < n
+        push(result, slice(text, start, n))
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// ftp_reply_parse: parse a complete (or partial) FTP reply block.
+fn ftp_reply_parse(text: string) -> dict
+    let out = {}
+    out["code"] = 0
+    out["lines"] = []
+    out["complete"] = 0
+
+    let raw_lines = _ftp_split_lines(text)
+    let nlines = len(raw_lines)
+    if nlines == 0
+        return out
+
+    // strip CRLF from each raw line
+    let lines = []
+    let li = 0
+    while li < nlines
+        push(lines, _ftp_strip_crlf(raw_lines[li]))
+        li = li + 1
+
+    // parse code from first line
+    let first = lines[0]
+    let code = _ftp_parse_code(first)
+    if code < 100
+        return out
+
+    out["code"] = code
+    let text_lines = []
+
+    // Determine if single-line or multi-line
+    // Single-line: 4th char is space or line ends after code
+    let flen = len(first)
+    let is_multi = 0
+    if flen >= 4
+        let sep = slice(first, 3, 4)
+        if sep == "-"
+            is_multi = 1
+
+    if is_multi == 0
+        // Single-line reply
+        if flen > 4
+            push(text_lines, slice(first, 4, flen))
+        else
+            push(text_lines, "")
+        out["lines"] = text_lines
+        out["complete"] = 1
+        return out
+
+    // Multi-line: first line text is after "code-"
+    if flen > 4
+        push(text_lines, slice(first, 4, flen))
+    else
+        push(text_lines, "")
+
+    // Walk subsequent lines; look for terminator "code SP"
+    let code_prefix = str(code) + " "
+    let ci = 1
+    let complete = 0
+    while ci < nlines
+        let ln = lines[ci]
+        let llen = len(ln)
+        // Check if this is the terminating line: starts with "code " (4 chars)
+        if llen >= 4 and slice(ln, 0, 4) == code_prefix
+            // terminator line
+            if llen > 4
+                push(text_lines, slice(ln, 4, llen))
+            else
+                push(text_lines, "")
+            complete = 1
+            ci = nlines
+        else
+            // continuation line — emit as-is
+            push(text_lines, ln)
+            ci = ci + 1
+
+    out["lines"] = text_lines
+    out["complete"] = complete
+    out
+
+// ftp_reply_build: build a well-formed FTP reply string from code + lines list.
+fn ftp_reply_build(code: int, lines: list) -> string
+    let crlf = _ftp_crlf()
+    let cs = str(code)
+    let nlines = len(lines)
+
+    if nlines <= 1
+        // Single-line (or empty)
+        let text = ""
+        if nlines == 1
+            text = lines[0]
+        return cs + " " + text + crlf
+
+    // Multi-line: first line uses hyphen
+    let out = cs + "-" + lines[0] + crlf
+    let i = 1
+    while i < nlines - 1
+        out = out + lines[i] + crlf
+        i = i + 1
+    // last line uses space
+    out = out + cs + " " + lines[nlines - 1] + crlf
+    out
+
+// ftp_command: build an FTP command line "VERB [SP arg] CRLF".
+fn ftp_command(verb: string, arg: string) -> string
+    let crlf = _ftp_crlf()
+    if len(arg) == 0
+        return verb + crlf
+    verb + " " + arg + crlf

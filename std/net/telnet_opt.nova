@@ -1,0 +1,318 @@
+// ============================================================================
+// NOVA Standard Library — std/net/telnet_opt
+// ============================================================================
+// Telnet option negotiation codec (RFC 854 / RFC 855).
+//
+// Binary-safe: uses the BYTES type throughout — Telnet streams may carry
+// NUL bytes in subnegotiation data, which would truncate a NOVA string.
+//
+// Telnet special bytes:
+//   IAC  = 255  — Interpret As Command prefix
+//   SE   = 240  — End of subnegotiation parameters
+//   SB   = 250  — Start of subnegotiation parameters
+//   WILL = 251  — Option negotiation: sender will use option
+//   WONT = 252  — Option negotiation: sender won't use option
+//   DO   = 253  — Option negotiation: please use option
+//   DONT = 254  — Option negotiation: please don't use option
+//
+// Byte-stuffing: IAC IAC in the data stream means a literal 0xFF byte.
+// All other IAC sequences are commands or subnegotiations.
+//
+// PUBLIC API:
+//   telnet_will(opt)       -> bytes   [255, 251, opt]
+//   telnet_wont(opt)       -> bytes   [255, 252, opt]
+//   telnet_do(opt)         -> bytes   [255, 253, opt]
+//   telnet_dont(opt)       -> bytes   [255, 254, opt]
+//   telnet_sub(opt, data)  -> bytes   IAC SB opt <data-escaped> IAC SE
+//   telnet_parse(b)        -> list    list of dicts: negotiations {"cmd","opt"} or data {"data"}
+//   telnet_strip(b)        -> bytes   data bytes only, IAC IAC -> 0xFF un-escaped
+//
+// DESIGN NOTES:
+//   * The builder functions never escape the opt byte (opts are 0-255; none
+//     should equal 255 in practice, but the caller controls this).
+//   * telnet_sub escapes any 255 bytes in the user data as IAC IAC before
+//     inserting them into the subnegotiation block (RFC 854 §5).
+//   * telnet_parse accumulates plain bytes between command sequences into
+//     {"data": <bytes>} chunks.  Adjacent plain bytes are coalesced into a
+//     single chunk for efficiency.
+//   * All private helpers are prefixed _to_ to avoid symbol collisions.
+//   * LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private byte constants (via functions — NOVA has no module-level consts) ─
+
+fn _to_iac() -> int
+    255
+
+fn _to_sb() -> int
+    250
+
+fn _to_se() -> int
+    240
+
+fn _to_will() -> int
+    251
+
+fn _to_wont() -> int
+    252
+
+fn _to_do() -> int
+    253
+
+fn _to_dont() -> int
+    254
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _to_3byte: build a 3-byte command frame [IAC, cmd, opt]
+fn _to_3byte(cmd: int, opt: int) -> bytes
+    let b = bytes(0)
+    b = bytes_append(b, 255)
+    b = bytes_append(b, cmd)
+    b = bytes_append(b, opt)
+    b
+
+// _to_escape: escape any 0xFF bytes in data as IAC IAC (255 255).
+// Returns a new bytes value safe for embedding in subnegotiation blocks.
+fn _to_escape(data: bytes) -> bytes
+    let n = bytes_len(data)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        let bv = bytes_get(data, i)
+        out = bytes_append(out, bv)
+        if bv == 255
+            out = bytes_append(out, 255)
+        i = i + 1
+    out
+
+// _to_make_err_chunk: make an error data dict (parse error passthrough as empty data)
+fn _to_make_data_chunk(d: bytes) -> dict
+    let entry = {}
+    entry["data"] = d
+    entry
+
+// _to_make_neg: make a negotiation dict with cmd and opt fields
+fn _to_make_neg(cmd: int, opt: int) -> dict
+    let entry = {}
+    entry["cmd"] = cmd
+    entry["opt"] = opt
+    entry
+
+// ── Public API: builders ──────────────────────────────────────────────────────
+
+// telnet_will — build IAC WILL <opt> (3 bytes)
+// Signals that the sender wants to begin using the given option.
+fn telnet_will(opt: int) -> bytes
+    _to_3byte(251, opt)
+
+// telnet_wont — build IAC WONT <opt> (3 bytes)
+// Signals that the sender refuses to use the given option.
+fn telnet_wont(opt: int) -> bytes
+    _to_3byte(252, opt)
+
+// telnet_do — build IAC DO <opt> (3 bytes)
+// Requests the receiver to use the given option.
+fn telnet_do(opt: int) -> bytes
+    _to_3byte(253, opt)
+
+// telnet_dont — build IAC DONT <opt> (3 bytes)
+// Requests the receiver to stop using the given option.
+fn telnet_dont(opt: int) -> bytes
+    _to_3byte(254, opt)
+
+// telnet_sub — build a subnegotiation frame: IAC SB <opt> <escaped-data> IAC SE
+// data: raw payload bytes (any 0xFF bytes are automatically escaped as IAC IAC)
+// opt: option code (0-254 in practice; must not be 255)
+fn telnet_sub(opt: int, data: bytes) -> bytes
+    let out = bytes(0)
+    out = bytes_append(out, 255)
+    out = bytes_append(out, 250)
+    out = bytes_append(out, opt)
+    let esc = _to_escape(data)
+    out = bytes_concat(out, esc)
+    out = bytes_append(out, 255)
+    out = bytes_append(out, 240)
+    out
+
+// ── Public API: parser ────────────────────────────────────────────────────────
+
+// telnet_parse — parse a telnet byte stream into a list of event dicts.
+//
+// The returned list contains dicts of two shapes:
+//   Negotiation: {"cmd": <int>, "opt": <int>}
+//     cmd is one of: 251=WILL, 252=WONT, 253=DO, 254=DONT
+//     opt is the option byte.
+//   Subnegotiation: {"cmd": 250, "opt": <int>, "data": <bytes>}
+//     data is the raw payload between SB and SE, with IAC IAC un-escaped to 0xFF.
+//   Data chunk:  {"data": <bytes>}
+//     Plain data bytes (IAC IAC pairs are un-escaped to single 0xFF bytes).
+//
+// Truncated or malformed IAC sequences at end-of-buffer are silently
+// accumulated as raw data chunks (fail-safe: pass through unknown bytes).
+//
+// b: bytes — the raw telnet byte stream
+fn telnet_parse(b: bytes) -> list
+    let n = bytes_len(b)
+    let result = []
+    let plain = bytes(0)
+    let i = 0
+    while i < n
+        let bv = bytes_get(b, i)
+        if bv == 255
+            // IAC: check next byte
+            if i + 1 >= n
+                // Truncated IAC at end — treat as raw byte (fail-safe)
+                plain = bytes_append(plain, 255)
+                i = i + 1
+            if i + 1 < n
+                let cmd = bytes_get(b, i + 1)
+                // IAC IAC — literal 0xFF byte in data stream
+                if cmd == 255
+                    plain = bytes_append(plain, 255)
+                    i = i + 2
+                // IAC SE (240) alone — malformed, treat as raw
+                if cmd == 240
+                    plain = bytes_append(plain, 255)
+                    plain = bytes_append(plain, 240)
+                    i = i + 2
+                // IAC WILL/WONT/DO/DONT — 3-byte negotiation command
+                if cmd == 251 or cmd == 252 or cmd == 253 or cmd == 254
+                    if i + 2 >= n
+                        // Truncated negotiation — pass remaining as raw
+                        plain = bytes_append(plain, 255)
+                        plain = bytes_append(plain, cmd)
+                        i = i + 2
+                    if i + 2 < n
+                        let opt = bytes_get(b, i + 2)
+                        // Flush any accumulated plain data before emitting negotiation
+                        if bytes_len(plain) > 0
+                            let chunk = _to_make_data_chunk(plain)
+                            push(result, chunk)
+                            plain = bytes(0)
+                        let neg = _to_make_neg(cmd, opt)
+                        push(result, neg)
+                        i = i + 3
+                // IAC SB (250) — subnegotiation block
+                if cmd == 250
+                    if i + 2 >= n
+                        // Truncated SB — treat as raw
+                        plain = bytes_append(plain, 255)
+                        plain = bytes_append(plain, 250)
+                        i = i + 2
+                    if i + 2 < n
+                        let opt = bytes_get(b, i + 2)
+                        // Scan for IAC SE (255, 240) to find end of subnegotiation
+                        let j = i + 3
+                        let sb_data = bytes(0)
+                        let found_se = 0
+                        let end_pos = i + 3
+                        while j < n and found_se == 0
+                            let jv = bytes_get(b, j)
+                            if jv == 255 and j + 1 < n
+                                let jv2 = bytes_get(b, j + 1)
+                                if jv2 == 240
+                                    // IAC SE found — end of subneg
+                                    found_se = 1
+                                    end_pos = j + 2
+                                if jv2 == 255
+                                    // IAC IAC in subneg data — un-escape to 0xFF
+                                    sb_data = bytes_append(sb_data, 255)
+                                    j = j + 2
+                                if jv2 != 240 and jv2 != 255
+                                    // Other IAC in subneg — include raw bytes
+                                    sb_data = bytes_append(sb_data, 255)
+                                    sb_data = bytes_append(sb_data, jv2)
+                                    j = j + 2
+                            if jv != 255
+                                sb_data = bytes_append(sb_data, jv)
+                                j = j + 1
+                        if found_se == 0
+                            // Truncated subnegotiation — flush as raw bytes
+                            plain = bytes_append(plain, 255)
+                            plain = bytes_append(plain, 250)
+                            plain = bytes_append(plain, opt)
+                            plain = bytes_concat(plain, sb_data)
+                            i = j
+                        if found_se == 1
+                            // Flush plain data before subneg dict
+                            if bytes_len(plain) > 0
+                                let chunk = _to_make_data_chunk(plain)
+                                push(result, chunk)
+                                plain = bytes(0)
+                            let sub_dict = {}
+                            sub_dict["cmd"] = 250
+                            sub_dict["opt"] = opt
+                            sub_dict["data"] = sb_data
+                            push(result, sub_dict)
+                            i = end_pos
+                // Unknown IAC command (not 240/250/251/252/253/254/255)
+                if cmd != 240 and cmd != 250 and cmd != 251 and cmd != 252 and cmd != 253 and cmd != 254 and cmd != 255
+                    // Pass through as raw bytes (unknown command)
+                    plain = bytes_append(plain, 255)
+                    plain = bytes_append(plain, cmd)
+                    i = i + 2
+        if bv != 255
+            // Plain data byte
+            plain = bytes_append(plain, bv)
+            i = i + 1
+    // Flush remaining plain data
+    if bytes_len(plain) > 0
+        let final_chunk = _to_make_data_chunk(plain)
+        push(result, final_chunk)
+    result
+
+// telnet_strip — extract data bytes from a telnet stream, stripping all
+// IAC command sequences and un-escaping IAC IAC -> 0xFF.
+//
+// This is equivalent to collecting all {"data"} chunks from telnet_parse
+// but without allocating intermediate dicts.
+//
+// b: bytes — the raw telnet byte stream
+// Returns: bytes — data content only
+fn telnet_strip(b: bytes) -> bytes
+    let n = bytes_len(b)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        let bv = bytes_get(b, i)
+        if bv == 255
+            if i + 1 >= n
+                // Truncated IAC — include as raw (fail-safe)
+                out = bytes_append(out, 255)
+                i = i + 1
+            if i + 1 < n
+                let cmd = bytes_get(b, i + 1)
+                // IAC IAC — un-escape to literal 0xFF
+                if cmd == 255
+                    out = bytes_append(out, 255)
+                    i = i + 2
+                // IAC WILL/WONT/DO/DONT — skip 3 bytes
+                if cmd == 251 or cmd == 252 or cmd == 253 or cmd == 254
+                    i = i + 3
+                // IAC SE — malformed standalone, skip 2 bytes
+                if cmd == 240
+                    i = i + 2
+                // IAC SB — skip entire subnegotiation up through IAC SE
+                if cmd == 250
+                    let j = i + 2
+                    let done = 0
+                    while j < n and done == 0
+                        let jv = bytes_get(b, j)
+                        if jv == 255 and j + 1 < n
+                            let jv2 = bytes_get(b, j + 1)
+                            if jv2 == 240
+                                done = 1
+                                j = j + 2
+                            if jv2 != 240
+                                j = j + 2
+                        if jv != 255
+                            j = j + 1
+                    i = j
+                // Unknown IAC command — skip 2 bytes
+                if cmd != 240 and cmd != 250 and cmd != 251 and cmd != 252 and cmd != 253 and cmd != 254 and cmd != 255
+                    i = i + 2
+        if bv != 255
+            out = bytes_append(out, bv)
+            i = i + 1
+    out

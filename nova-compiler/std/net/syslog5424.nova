@@ -1,0 +1,432 @@
+// ============================================================================
+// NOVA Standard Library — std/net/syslog5424
+// ============================================================================
+// Syslog RFC 5424 message parser and builder (TEXT protocol, no sockets).
+//
+// Wire format (simplified):
+//   <PRI>VERSION SP TIMESTAMP SP HOSTNAME SP APP-NAME SP PROCID SP MSGID SP
+//   STRUCTURED-DATA SP MSG
+//
+// PRI     = "<" (facility * 8 + severity) ">"   (facility 0..23, severity 0..7)
+// NILVALUE = "-" (used when a field is absent)
+// SP       = ASCII space (0x20)
+//
+// PUBLIC API:
+//   syslog5424_parse(line: string) -> dict
+//     Parse an RFC-5424 syslog line.  Returns a dict with keys:
+//       "pri"       -> int   : raw priority value (facility*8+severity)
+//       "facility"  -> int   : facility (pri >> 3)
+//       "severity"  -> int   : severity (pri & 7)
+//       "version"   -> int   : version field (usually 1)
+//       "timestamp" -> string: TIMESTAMP field (or "-" if nilvalue)
+//       "hostname"  -> string: HOSTNAME field  (or "-" if nilvalue)
+//       "appname"   -> string: APP-NAME field  (or "-" if nilvalue)
+//       "procid"    -> string: PROCID field    (or "-" if nilvalue)
+//       "msgid"     -> string: MSGID field     (or "-" if nilvalue)
+//       "sd"        -> string: STRUCTURED-DATA (or "-" if nilvalue)
+//       "msg"       -> string: MSG field       (or "" if absent)
+//     On malformed input the dict has "pri" == -1.
+//
+//   syslog5424_build(fields: dict) -> string
+//     Build an RFC-5424 syslog line from the same dict shape.
+//     Uses "pri" to reconstruct "<PRI>", falls back to pri_make(facility,severity).
+//     Any missing key falls back to NILVALUE ("-"), except "msg" which defaults "".
+//
+//   pri_split(pri: int) -> list   -- [facility, severity]
+//   pri_make(facility: int, severity: int) -> int
+//
+// DESIGN NOTES:
+//   * All private helpers are prefixed _sl_ to avoid symbol collisions.
+//   * The MSG field is optional; if the line ends after STRUCTURED-DATA we
+//     return msg=="".  If present it is separated by one SP from SD.
+//   * STRUCTURED-DATA: if the field starts with "[" we grab until a matching
+//     depth-0 "]" end to handle a single SD element opaquely.  Otherwise we
+//     treat it as "-" (nilvalue) or a bare token.  We do NOT fully parse SD
+//     elements; the module stores SD as a raw string to preserve round-trips.
+//   * chr(13)+chr(10) / chr(10) line endings are stripped from input so the
+//     caller can pass lines read directly from a stream.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _sl_sp: ASCII space character.
+fn _sl_sp() -> string
+    chr(32)
+
+// _sl_nilvalue: RFC 5424 NILVALUE token.
+fn _sl_nilvalue() -> string
+    "-"
+
+// _sl_is_digit: true if ch is '0'..'9'.
+fn _sl_is_digit(ch: string) -> int
+    let o = ord(ch)
+    if o >= 48 and o <= 57
+        return 1
+    0
+
+// _sl_parse_int: parse decimal integer starting at pos in s.
+// Returns [value, new_pos].  On error returns [-1, pos].
+fn _sl_parse_int(s: string, pos: int) -> list
+    let n = len(s)
+    let v = 0
+    let i = pos
+    let found = 0
+    let stop = pos
+    let going = 1
+    while i < n and going == 1
+        let ch = slice(s, i, i + 1)
+        if _sl_is_digit(ch) == 1
+            v = v * 10 + ord(ch) - 48
+            i = i + 1
+            stop = i
+            found = 1
+        else
+            going = 0
+    let res = []
+    if found == 0
+        res.push(-1)
+        res.push(pos)
+    else
+        res.push(v)
+        res.push(stop)
+    res
+
+// _sl_skip_sp: skip exactly one space at pos; return new pos or -1 on failure.
+fn _sl_skip_sp(s: string, pos: int) -> int
+    if pos >= len(s)
+        return -1
+    if slice(s, pos, pos + 1) == _sl_sp()
+        return pos + 1
+    -1
+
+// _sl_find_sp: return index of next space at or after pos, or len(s) if none.
+fn _sl_find_sp(s: string, pos: int) -> int
+    let n = len(s)
+    let i = pos
+    while i < n
+        if slice(s, i, i + 1) == _sl_sp()
+            return i
+        i = i + 1
+    n
+
+// _sl_read_token: read non-space token starting at pos.
+// Returns [token_string, new_pos].
+fn _sl_read_token(s: string, pos: int) -> list
+    let n = len(s)
+    let end = _sl_find_sp(s, pos)
+    let tok = slice(s, pos, end)
+    let res = []
+    res.push(tok)
+    res.push(end)
+    res
+
+// _sl_strip_crlf: remove trailing CR and/or LF from s.
+fn _sl_strip_crlf(s: string) -> string
+    let n = len(s)
+    let done = 0
+    while n > 0 and done == 0
+        let last = ord(slice(s, n - 1, n))
+        if last == 10 or last == 13
+            n = n - 1
+        else
+            done = 1
+    slice(s, 0, n)
+
+// _sl_read_sd: read STRUCTURED-DATA field starting at pos.
+// SD is either "-" (nilvalue) or one-or-more "[...]" elements.
+// Handles bracket-balanced SD elements; stores SD as opaque string.
+// Returns [sd_string, new_pos].
+fn _sl_read_sd(s: string, pos: int) -> list
+    let n = len(s)
+    let res = []
+    if pos >= n
+        res.push("-")
+        res.push(pos)
+        return res
+    let ch = slice(s, pos, pos + 1)
+    if ch != "["
+        // Nilvalue "-" or unknown token; read until space
+        let tok_res = _sl_read_token(s, pos)
+        res.push(tok_res[0])
+        res.push(tok_res[1])
+        return res
+    // Bracket-balanced scan for one or more SD elements "[...][...]"
+    let depth = 0
+    let i = pos
+    let end_pos = pos
+    let scanning = 1
+    while i < n and scanning == 1
+        let c = slice(s, i, i + 1)
+        if c == "["
+            depth = depth + 1
+            i = i + 1
+        else
+            if c == "]"
+                depth = depth - 1
+                i = i + 1
+                if depth == 0
+                    end_pos = i
+                    // Check if another "[" immediately follows
+                    if i < n and slice(s, i, i + 1) == "["
+                        // Continue scanning next SD element
+                        i = i
+                    else
+                        scanning = 0
+            else
+                i = i + 1
+    // If depth never hit 0 (malformed), end at current i
+    if end_pos == pos
+        end_pos = i
+    let sd = slice(s, pos, end_pos)
+    res.push(sd)
+    res.push(end_pos)
+    res
+
+// _sl_int_from_dict(d, key): read int from dict, defaulting to 0 if missing.
+fn _sl_int_from_dict(d: dict, key: string) -> int
+    if not contains(d, key)
+        return 0
+    let v = d[key]
+    if type_of(v) == "int"
+        return v
+    0
+
+// _sl_str_from_dict(d, key, def): read string from dict, defaulting to def.
+fn _sl_str_from_dict(d: dict, key: string, def: string) -> string
+    if not contains(d, key)
+        return def
+    let v = d[key]
+    if type_of(v) == "string"
+        return v
+    if type_of(v) == "int"
+        return str(v)
+    def
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// pri_make: compute PRI value from facility and severity.
+//   facility: 0..23  (KERN=0, USER=1, MAIL=2, DAEMON=3, AUTH=4, ...)
+//   severity: 0..7   (EMERG=0, ALERT=1, CRIT=2, ERR=3, WARN=4, NOTICE=5, INFO=6, DEBUG=7)
+// Returns facility*8 + severity.
+fn pri_make(facility: int, severity: int) -> int
+    facility * 8 + severity
+
+// pri_split: split a PRI value into [facility, severity].
+// Returns a 2-element list: [facility, severity].
+fn pri_split(pri: int) -> list
+    let fac = pri / 8
+    let sev = pri - fac * 8
+    let res = []
+    res.push(fac)
+    res.push(sev)
+    res
+
+// syslog5424_parse: parse an RFC-5424 syslog line.
+//
+// Format: <PRI>VERSION SP TIMESTAMP SP HOSTNAME SP APP-NAME SP PROCID SP MSGID SP SD [SP MSG]
+//
+// Returns dict with keys:
+//   pri, facility, severity, version, timestamp, hostname, appname, procid, msgid, sd, msg
+// On malformed input: dict has "pri" == -1 and other fields empty.
+//
+// KAT example:
+//   syslog5424_parse("<34>1 2003-10-11T22:14:15.003Z mymachine su - ID47 - BOM'su root' failed")
+//   -> pri=34, facility=4, severity=2, version=1, hostname="mymachine", appname="su",
+//      procid="-", msgid="ID47", sd="-", msg="BOM'su root' failed"
+fn syslog5424_parse(line: string) -> dict
+    let result = {}
+    result["pri"] = -1
+    result["facility"] = 0
+    result["severity"] = 0
+    result["version"] = 0
+    result["timestamp"] = ""
+    result["hostname"] = ""
+    result["appname"] = ""
+    result["procid"] = ""
+    result["msgid"] = ""
+    result["sd"] = ""
+    result["msg"] = ""
+
+    // Strip trailing CR/LF
+    let s = _sl_strip_crlf(line)
+    let n = len(s)
+    let pos = 0
+
+    // Expect '<'
+    if pos >= n
+        return result
+    if slice(s, pos, pos + 1) != "<"
+        return result
+    pos = pos + 1
+
+    // Parse PRI digits
+    let pri_res = _sl_parse_int(s, pos)
+    let pri = pri_res[0]
+    pos = pri_res[1]
+    if pri < 0
+        return result
+
+    // Expect '>'
+    if pos >= n
+        return result
+    if slice(s, pos, pos + 1) != ">"
+        return result
+    pos = pos + 1
+
+    // Parse VERSION (integer)
+    let ver_res = _sl_parse_int(s, pos)
+    let version = ver_res[0]
+    pos = ver_res[1]
+    if version < 0
+        return result
+
+    // SP
+    let p2 = _sl_skip_sp(s, pos)
+    if p2 < 0
+        return result
+    pos = p2
+
+    // TIMESTAMP token
+    let ts_res = _sl_read_token(s, pos)
+    let timestamp = ts_res[0]
+    pos = ts_res[1]
+
+    // SP
+    let p3 = _sl_skip_sp(s, pos)
+    if p3 < 0
+        return result
+    pos = p3
+
+    // HOSTNAME token
+    let hn_res = _sl_read_token(s, pos)
+    let hostname = hn_res[0]
+    pos = hn_res[1]
+
+    // SP
+    let p4 = _sl_skip_sp(s, pos)
+    if p4 < 0
+        return result
+    pos = p4
+
+    // APP-NAME token
+    let an_res = _sl_read_token(s, pos)
+    let appname = an_res[0]
+    pos = an_res[1]
+
+    // SP
+    let p5 = _sl_skip_sp(s, pos)
+    if p5 < 0
+        return result
+    pos = p5
+
+    // PROCID token
+    let pid_res = _sl_read_token(s, pos)
+    let procid = pid_res[0]
+    pos = pid_res[1]
+
+    // SP
+    let p6 = _sl_skip_sp(s, pos)
+    if p6 < 0
+        return result
+    pos = p6
+
+    // MSGID token
+    let mid_res = _sl_read_token(s, pos)
+    let msgid = mid_res[0]
+    pos = mid_res[1]
+
+    // SP
+    let p7 = _sl_skip_sp(s, pos)
+    if p7 < 0
+        return result
+    pos = p7
+
+    // STRUCTURED-DATA
+    let sd_res = _sl_read_sd(s, pos)
+    let sd = sd_res[0]
+    pos = sd_res[1]
+
+    // Optional MSG (SP then remainder of line)
+    let msg = ""
+    let p8 = _sl_skip_sp(s, pos)
+    if p8 >= 0 and p8 <= n
+        msg = slice(s, p8, n)
+
+    // Populate result
+    let split_res = pri_split(pri)
+    result["pri"] = pri
+    result["facility"] = split_res[0]
+    result["severity"] = split_res[1]
+    result["version"] = version
+    result["timestamp"] = timestamp
+    result["hostname"] = hostname
+    result["appname"] = appname
+    result["procid"] = procid
+    result["msgid"] = msgid
+    result["sd"] = sd
+    result["msg"] = msg
+    result
+
+// syslog5424_build: build an RFC-5424 syslog line from a fields dict.
+//
+// The dict should have the same keys as returned by syslog5424_parse.
+// Missing fields default to NILVALUE ("-"), except "msg" which defaults to "".
+//
+// If "pri" is present and >= 0 it is used directly.
+// Otherwise pri_make(facility, severity) is used.
+//
+// Example:
+//   let f = {}
+//   f["pri"] = 34
+//   f["version"] = 1
+//   f["timestamp"] = "2003-10-11T22:14:15.003Z"
+//   f["hostname"] = "mymachine"
+//   f["appname"] = "su"
+//   f["procid"] = "-"
+//   f["msgid"] = "ID47"
+//   f["sd"] = "-"
+//   f["msg"] = "BOM'su root' failed"
+//   syslog5424_build(f)
+//   -> "<34>1 2003-10-11T22:14:15.003Z mymachine su - ID47 - BOM'su root' failed"
+fn syslog5424_build(fields: dict) -> string
+    let sp = _sl_sp()
+    let nil = _sl_nilvalue()
+
+    // Determine PRI
+    let pri = -1
+    if contains(fields, "pri")
+        let pv = fields["pri"]
+        if type_of(pv) == "int"
+            pri = pv
+    if pri < 0
+        let fac = _sl_int_from_dict(fields, "facility")
+        let sev = _sl_int_from_dict(fields, "severity")
+        pri = pri_make(fac, sev)
+
+    // VERSION
+    let ver = _sl_int_from_dict(fields, "version")
+    if ver == 0
+        ver = 1
+
+    // String fields — default to NILVALUE
+    let timestamp = _sl_str_from_dict(fields, "timestamp", nil)
+    let hostname  = _sl_str_from_dict(fields, "hostname",  nil)
+    let appname   = _sl_str_from_dict(fields, "appname",   nil)
+    let procid    = _sl_str_from_dict(fields, "procid",    nil)
+    let msgid     = _sl_str_from_dict(fields, "msgid",     nil)
+    let sd        = _sl_str_from_dict(fields, "sd",        nil)
+    let msg       = _sl_str_from_dict(fields, "msg",       "")
+
+    // Build
+    let result = "<" + str(pri) + ">" + str(ver)
+    result = result + sp + timestamp
+    result = result + sp + hostname
+    result = result + sp + appname
+    result = result + sp + procid
+    result = result + sp + msgid
+    result = result + sp + sd
+    if len(msg) > 0
+        result = result + sp + msg
+    result

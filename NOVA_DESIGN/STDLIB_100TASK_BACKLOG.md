@@ -34,6 +34,33 @@ every task below was dup-checked absent. Ordered LOW-RISK / high-value first.
 | 18 | std/random/ PRNG engines (mt19937/pcg32/splitmix64/xoshiro256/xoshiro128/lcg/well512/lfsr/wyrand/jsf64/sfc64/lehmer) | 12 | eaf30328 |
 | 19 | std/cipher/ classical (playfair/bifid/foursquare/twosquare/hill/columnar/affine/autokey/beaufort/polybius/scytale/adfgx) | 12 | *(building wjixcsuh9)* |
 
+## GAP-MAP #2 BACKLOG (2026-07-16, grep-verified over 240-module tree) — tasks 21-50, LOW-risk first
+**LOW risk (int/string/bytes, deterministic/round-trip KATs) — build first:**
+- std/net/lineproto: resp2 resp3 irc syslog5424 syslog3164 ftp_reply beanstalkd memcache_text telnet_opt gopher whois_parse smtp_line
+- std/bits/bits64: rotl rotr reverse next_pow2 is_pow2 set/clear/test/toggle_bit lowest/highest_set popcount clz/ctz
+- std/bits/bitfield: mask extract extract_signed insert test clear_field replace pack2/3 unpack2/3 field_range
+- std/bits/morton3d: encode decode x/y/z parent children neighbors distance (z-order curves)
+- std/devtool/semver: parse compare valid bump range_caret/tilde/hyphen satisfies max_satisfying sort diff coerce
+- std/devtool/gitignore: parse_line compile_pat match_path negation anchor double_star dir_only load match_list layer_merge explain from_string
+- std/music/theory: interval scale chord mode keysig circlefifths tuning_equal/just/cents rhythm arpeggio progression
+- std/functional/combinators: curry2/3 partial1/2 flip once juxt always complement converge evolve memoize_n
+- std/functional/result: res_ok/err/is_ok/is_err/map/flat_map/map_err/unwrap_or/and_then/or_else opt_from/map
+- std/compress/univcodes: elias_omega fibonacci_code unary exp_golomb truncated_binary start_step_stop comma interleaved_elias abs_binary byte_aligned_huff bitpack frame_of_reference
+- std/net/binproto: mqtt_fixed mqtt_connect mqtt_publish mqtt_sub mqtt5_props coap_msg coap_opt coap_block stomp_frame stomp_build stomp_heartbeat pop3_reply  (LOW-MED)
+- std/data/subtitles: srt_parse/build/shift vtt_parse/build/shift sub_timecode/merge/split/filter/reindex/roundtrip
+- std/data/feeds: rss_parse atom_parse opml_parse/build m3u_parse/build pls_parse/build po_parse/build feed_item feed_roundtrip  (LOW-MED)
+- std/game/cards: card deck deal hand_sort hand_classify hand_compare showdown blackjack cribbage war bridge_suit solitaire
+- std/game/maze: grid recursive_backtracker kruskals prims aldous_broder wilsons sidewinder binary_tree eller hunt_kill solve_bfs solve_astar
+- std/text/bbcode: lex parse strip to_html to_text validate color quote list url code (+nest)
+- std/math/tseries: rolling_mean/var/std/min/max diff pct_change seasonal_naive trend_linear anomaly_zscore/iqr kat  (LOW-MED)
+- std/sync/coordination: barrier phaser promise event_flag rwlock once_cell mailbox broadcast work_queue timeout_chan select_first gate  (LOW-MED; respect process/channel model)
+
+**MED risk (float / complex / data tables) — build after:**
+- std/compress/adaptive (adaptive-huffman/LZSS/LZ78/BWT-pipeline), std/physics/mechanics, std/physics/waves_em,
+  std/chem/formulas, std/geo/spherical, std/geo/projection (float+atan2 CARE), std/audio/synth, std/devtool/uuid_ext
+  (needs md5/sha1), std/text/markdown, std/text/wikifmt, std/data/geodata, std/numeric/spline, std/numeric/polyregress,
+  std/game/rating (elo/glicko). NOTE geo/physics float gotchas: coerce int*1.0, bind sub-exprs to float lets.
+
 ## RHYTHM NOTE (2026-07-14): run DEPTH-1 (one 12-agent fleet at a time). Depth-2 (24 agents) drained the account
 ## session cap twice. One fleet at a time is the sustainable pace. **18 full tasks committed clean (216 modules).**
 ## New categories added this campaign: std/media, std/parsing, std/term, std/cipher. Saturated (grep first):

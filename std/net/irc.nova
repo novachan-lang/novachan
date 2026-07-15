@@ -1,0 +1,217 @@
+// ============================================================================
+// NOVA Standard Library — std/net/irc
+// ============================================================================
+// IRC message codec — RFC 1459 / RFC 2812, text-only (no live sockets).
+//
+// PUBLIC API:
+//   irc_parse(line: string) -> dict
+//     Parse one IRC line (with or without trailing CRLF) into a dict:
+//       "prefix"   -> string  (empty if absent; the part after ":" before SP)
+//       "command"  -> string  (returned as-is, not uppercased)
+//       "params"   -> list    (middle parameters, each a string)
+//       "trailing" -> string  (the ":..." final token; "" if absent)
+//     Malformed/empty input: returns the dict with empty/zero values.
+//
+//   irc_build(msg: dict) -> string
+//     Build an IRC line from a msg dict of the same shape as irc_parse output.
+//     Rules:
+//       If msg["prefix"] non-empty  ->  ":" + prefix + " " prepended.
+//       command emitted as-is.
+//       Each element of params emitted as " " + param.
+//       If msg["trailing"] non-empty -> " :" + trailing appended.
+//     Returns "" if command is absent/empty.
+//
+//   irc_is_numeric(command: string) -> int
+//     Returns 1 if command is exactly 3 ASCII digit characters (e.g. "001",
+//     "433"), 0 otherwise.  RFC 2812 numeric replies are always 3 digits.
+//
+// DESIGN NOTES:
+//   * "params" holds middle params only — NOT the trailing (":...") token.
+//   * A line with only trailing (e.g. "PING :server1") has params=[].
+//   * Middle params stop at the first " :" token per RFC 1459 §2.3.1.
+//   * Trailing CRLF is stripped automatically so raw server lines work.
+//   * All private helpers prefixed _irc_ to avoid symbol collisions.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _irc_is_digit: 1 if c is '0'..'9'.
+fn _irc_is_digit(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return 1
+    0
+
+// _irc_find_space: return index of first ' ' at or after start, or n if none.
+fn _irc_find_space(s: string, start: int, n: int) -> int
+    let i = start
+    while i < n
+        if char_at(s, i) == " "
+            return i
+        i = i + 1
+    n
+
+// _irc_skip_spaces: advance i past any ' ' characters.
+fn _irc_skip_spaces(s: string, i: int, n: int) -> int
+    let j = i
+    while j < n and char_at(s, j) == " "
+        j = j + 1
+    j
+
+// _irc_rtrim_crlf: remove trailing CR (13) and LF (10) chars from s.
+fn _irc_rtrim_crlf(s: string) -> string
+    let n = len(s)
+    let stop = n
+    let cr = chr(13)
+    let lf = chr(10)
+    let going = 1
+    while stop > 0 and going == 1
+        let c = char_at(s, stop - 1)
+        if c == cr or c == lf
+            stop = stop - 1
+        else
+            going = 0
+    slice(s, 0, stop)
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// irc_parse: parse one IRC protocol line into a structured dict.
+//
+// Grammar (simplified from RFC 1459 §2.3.1):
+//   message  = [":" prefix SP] command [*(SP middle)] [SP ":" trailing]
+//
+// Examples:
+//   irc_parse(":nick!user@host PRIVMSG #chan :Hello world")
+//     -> { "prefix":"nick!user@host", "command":"PRIVMSG",
+//          "params":["#chan"], "trailing":"Hello world" }
+//   irc_parse("PING :server1")
+//     -> { "prefix":"", "command":"PING", "params":[], "trailing":"server1" }
+//   irc_parse("JOIN #a,#b")
+//     -> { "prefix":"", "command":"JOIN", "params":["#a,#b"], "trailing":"" }
+//   irc_parse("001 nick :Welcome")
+//     -> { "prefix":"", "command":"001", "params":["nick"], "trailing":"Welcome" }
+fn irc_parse(line: string) -> dict
+    let result = {}
+    let plist = []
+    result["prefix"] = ""
+    result["command"] = ""
+    result["params"] = plist
+    result["trailing"] = ""
+
+    // Strip trailing CR/LF so raw server lines work unchanged.
+    let s = _irc_rtrim_crlf(line)
+    let n = len(s)
+    if n == 0
+        return result
+
+    let i = 0
+
+    // 1. Optional prefix — present when line starts with ':'
+    if char_at(s, 0) == ":"
+        let sp = _irc_find_space(s, 1, n)
+        result["prefix"] = slice(s, 1, sp)
+        i = _irc_skip_spaces(s, sp, n)
+
+    if i >= n
+        return result
+
+    // 2. Command — up to next space or end of line
+    let cmd_end = _irc_find_space(s, i, n)
+    result["command"] = slice(s, i, cmd_end)
+    i = _irc_skip_spaces(s, cmd_end, n)
+
+    // 3. Params — zero or more middle params, then optional ":trailing"
+    let going = 1
+    while i < n and going == 1
+        if char_at(s, i) == ":"
+            // trailing token: everything after the ':'
+            result["trailing"] = slice(s, i + 1, n)
+            going = 0
+        else
+            // middle param: up to next space
+            let pe = _irc_find_space(s, i, n)
+            let param = slice(s, i, pe)
+            if len(param) > 0
+                push(plist, param)
+            i = _irc_skip_spaces(s, pe, n)
+
+    result["params"] = plist
+    result
+
+// irc_build: build an IRC protocol line from a structured dict.
+//
+// The dict must have the same shape as irc_parse output:
+//   "prefix"   -> string (may be "" or absent)
+//   "command"  -> string (required; returns "" if missing/empty)
+//   "params"   -> list   (may be [] or absent)
+//   "trailing" -> string (may be "" or absent)
+//
+// Examples:
+//   irc_build({"prefix":"nick!user@host","command":"PRIVMSG",
+//              "params":["#chan"],"trailing":"Hello world"})
+//     -> ":nick!user@host PRIVMSG #chan :Hello world"
+//   irc_build({"prefix":"","command":"PING","params":[],"trailing":"server1"})
+//     -> "PING :server1"
+//   irc_build({"prefix":"","command":"JOIN","params":["#a,#b"],"trailing":""})
+//     -> "JOIN #a,#b"
+fn irc_build(msg: dict) -> string
+    // Extract fields safely; missing dict key returns int 0, so use contains.
+    let prefix = ""
+    if contains(msg, "prefix")
+        prefix = str(msg["prefix"])
+
+    let command = ""
+    if contains(msg, "command")
+        command = str(msg["command"])
+
+    if len(command) == 0
+        return ""
+
+    let trailing = ""
+    if contains(msg, "trailing")
+        trailing = str(msg["trailing"])
+
+    // Build the output string.
+    let out = ""
+    if len(prefix) > 0
+        out = ":" + prefix + " "
+
+    out = out + command
+
+    // Append middle params (if present).
+    if contains(msg, "params")
+        let params = msg["params"]
+        let pi = 0
+        while pi < len(params)
+            out = out + " " + str(params[pi])
+            pi = pi + 1
+
+    // Append trailing.
+    if len(trailing) > 0
+        out = out + " :" + trailing
+
+    out
+
+// irc_is_numeric: returns 1 if command is exactly 3 ASCII digit characters.
+//
+// RFC 2812 §2.4: server numeric replies are 3-digit codes (e.g. 001, 433, 372).
+//
+// Examples:
+//   irc_is_numeric("001")     -> 1
+//   irc_is_numeric("433")     -> 1
+//   irc_is_numeric("PRIVMSG") -> 0
+//   irc_is_numeric("01")      -> 0
+//   irc_is_numeric("0001")    -> 0
+//   irc_is_numeric("")        -> 0
+fn irc_is_numeric(command: string) -> int
+    if len(command) != 3
+        return 0
+    if _irc_is_digit(char_at(command, 0)) == 0
+        return 0
+    if _irc_is_digit(char_at(command, 1)) == 0
+        return 0
+    if _irc_is_digit(char_at(command, 2)) == 0
+        return 0
+    1

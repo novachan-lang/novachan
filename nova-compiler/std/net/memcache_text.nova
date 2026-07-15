@@ -1,0 +1,293 @@
+// ============================================================================
+// NOVA Standard Library — std/net/memcache_text
+// ============================================================================
+// Memcached ASCII (text) protocol codec — no live sockets; pure
+// message builders and reply parsers.
+//
+// Reference: https://github.com/memcached/memcached/blob/master/doc/protocol.txt
+//
+// PUBLIC API:
+//
+//   mc_set(key: string, flags: int, exptime: int, data: string) -> string
+//     Build a "set" command:
+//       "set <key> <flags> <exptime> <bytes>" CRLF <data> CRLF
+//     <bytes> is computed as len(data).
+//
+//   mc_get(keys: list) -> string
+//     Build a "get" command for one or more keys:
+//       "get <key1> <key2> ..." CRLF
+//     Returns "" if keys list is empty.
+//
+//   mc_delete(key: string) -> string
+//     Build a "delete" command:
+//       "delete <key>" CRLF
+//
+//   mc_incr(key: string, n: int) -> string
+//     Build an "incr" command:
+//       "incr <key> <n>" CRLF
+//
+//   mc_decr(key: string, n: int) -> string
+//     Build a "decr" command:
+//       "decr <key> <n>" CRLF
+//
+//   mc_parse_value(text: string) -> dict
+//     Parse a server VALUE response block (one VALUE + END):
+//       "VALUE <key> <flags> <bytes>" CRLF <data> CRLF "END" CRLF
+//     Returns dict with:
+//       "key"   -> string  (the key)
+//       "flags" -> int     (the flags field)
+//       "data"  -> string  (the data block; only len(bytes) bytes are captured)
+//     On malformed input returns dict with key="", flags=0, data="".
+//
+//   mc_parse_reply(text: string) -> string
+//     Parse a simple server reply (first word/line).
+//     Strips trailing CRLF/LF, returns the first line as-is.
+//     Recognises (but does not restrict to): STORED, NOT_STORED, EXISTS,
+//     NOT_FOUND, DELETED, ERROR, VALUE, END, TOUCHED, OK.
+//     Returns "" on empty input.
+//
+// DESIGN NOTES:
+//   * CRLF = chr(13)+chr(10).
+//   * TEXT protocol only — data values must not contain embedded NUL bytes
+//     if used in NOVA strings (NUL truncates NOVA strings).  For binary
+//     values use a bytes-based layer on top.
+//   * Private helpers are _mc_ prefixed.
+//   * Missing dict key returns int 0 — guard with contains() where needed.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _mc_crlf: return CRLF string built from chr() to avoid escape-sequence risk.
+fn _mc_crlf() -> string
+    chr(13) + chr(10)
+
+// _mc_is_digit: 1 if c (single char string) is ASCII '0'..'9'.
+fn _mc_is_digit(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return 1
+    0
+
+// _mc_parse_int: parse a non-negative decimal integer from s[start..end).
+// Returns -1 on any non-digit or empty span.
+fn _mc_parse_int(s: string, start: int, end: int) -> int
+    if start >= end
+        return -1
+    let val = 0
+    let i = start
+    while i < end
+        let c = slice(s, i, i + 1)
+        if _mc_is_digit(c) == 0
+            return -1
+        val = val * 10 + (ord(c) - 48)
+        i = i + 1
+    val
+
+// _mc_find_char: return index of first occurrence of ch in s[start..n), or n.
+fn _mc_find_char(s: string, ch: string, start: int, n: int) -> int
+    let i = start
+    while i < n
+        if slice(s, i, i + 1) == ch
+            return i
+        i = i + 1
+    n
+
+// _mc_find_sp: return index of first ' ' in s[start..n), or n.
+fn _mc_find_sp(s: string, start: int, n: int) -> int
+    _mc_find_char(s, " ", start, n)
+
+// _mc_find_lf: return index of first LF (chr(10)) in s[start..n), or n.
+fn _mc_find_lf(s: string, start: int, n: int) -> int
+    _mc_find_char(s, chr(10), start, n)
+
+// _mc_line_end: return index just past the end of the current line (past LF),
+// given that the LF is at lf_pos.  Safe: if lf_pos >= n returns n.
+fn _mc_line_end(lf_pos: int, n: int) -> int
+    if lf_pos >= n
+        return n
+    lf_pos + 1
+
+// _mc_line_text: extract the non-CRLF content of s[start..lf_pos).
+// Strips a trailing CR before LF if present.
+fn _mc_line_text(s: string, start: int, lf_pos: int) -> string
+    let end = lf_pos
+    if end > start and slice(s, end - 1, end) == chr(13)
+        end = end - 1
+    if end <= start
+        return ""
+    slice(s, start, end)
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// mc_set: build a memcached "set" storage command.
+//
+// Protocol:
+//   set <key> <flags> <exptime> <bytes>\r\n
+//   <datablock>\r\n
+//
+// Example:
+//   mc_set("foo", 0, 0, "bar")
+//     -> "set foo 0 0 3\r\nbar\r\n"
+fn mc_set(key: string, flags: int, exptime: int, data: string) -> string
+    let crlf = _mc_crlf()
+    let nbytes = len(data)
+    "set " + key + " " + str(flags) + " " + str(exptime) + " " + str(nbytes) + crlf + data + crlf
+
+// mc_get: build a memcached "get" retrieval command for one or more keys.
+//
+// Protocol:
+//   get <key1> [<key2> ...]\r\n
+//
+// Returns "" if keys list is empty (no keys = invalid command).
+//
+// Examples:
+//   mc_get(["foo"])           -> "get foo\r\n"
+//   mc_get(["foo", "baz"])   -> "get foo baz\r\n"
+//   mc_get([])               -> ""
+fn mc_get(keys: list) -> string
+    let nkeys = len(keys)
+    if nkeys == 0
+        return ""
+    let crlf = _mc_crlf()
+    let out = "get"
+    let i = 0
+    while i < nkeys
+        out = out + " " + str(keys[i])
+        i = i + 1
+    out + crlf
+
+// mc_delete: build a memcached "delete" command.
+//
+// Protocol:
+//   delete <key>\r\n
+//
+// Example:
+//   mc_delete("foo")  -> "delete foo\r\n"
+fn mc_delete(key: string) -> string
+    let crlf = _mc_crlf()
+    "delete " + key + crlf
+
+// mc_incr: build a memcached "incr" command.
+//
+// Protocol:
+//   incr <key> <value>\r\n
+//
+// Example:
+//   mc_incr("n", 5)  -> "incr n 5\r\n"
+fn mc_incr(key: string, n: int) -> string
+    let crlf = _mc_crlf()
+    "incr " + key + " " + str(n) + crlf
+
+// mc_decr: build a memcached "decr" command.
+//
+// Protocol:
+//   decr <key> <value>\r\n
+//
+// Example:
+//   mc_decr("n", 3)  -> "decr n 3\r\n"
+fn mc_decr(key: string, n: int) -> string
+    let crlf = _mc_crlf()
+    "decr " + key + " " + str(n) + crlf
+
+// mc_parse_value: parse a server VALUE response block into a dict.
+//
+// Expected input format (per memcached protocol):
+//   VALUE <key> <flags> <bytes>\r\n
+//   <datablock>\r\n
+//   END\r\n
+//
+// The <bytes> field is used as the authoritative byte count for data
+// extraction, so the data block is sliced exactly that many bytes.
+//
+// Returns dict:
+//   "key"   -> string
+//   "flags" -> int
+//   "data"  -> string
+//
+// On any parse error returns key="", flags=0, data="".
+//
+// Examples:
+//   mc_parse_value("VALUE foo 0 3\r\nbar\r\nEND\r\n")
+//     -> {"key":"foo", "flags":0, "data":"bar"}
+//   mc_parse_value("VALUE mykey 7 5\r\nhello\r\nEND\r\n")
+//     -> {"key":"mykey", "flags":7, "data":"hello"}
+fn mc_parse_value(text: string) -> dict
+    let out = {}
+    out["key"] = ""
+    out["flags"] = 0
+    out["data"] = ""
+
+    let n = len(text)
+    if n == 0
+        return out
+
+    // ── Line 1: "VALUE <key> <flags> <bytes>" ──────────────────────────────
+    let lf0 = _mc_find_lf(text, 0, n)
+    let header = _mc_line_text(text, 0, lf0)
+    let hlen = len(header)
+
+    // Must start with "VALUE "
+    if hlen < 7
+        return out
+    if slice(header, 0, 6) != "VALUE "
+        return out
+
+    // Parse key: from pos 6 to next space
+    let key_start = 6
+    let key_end = _mc_find_sp(header, key_start, hlen)
+    if key_end >= hlen
+        return out
+    let key = slice(header, key_start, key_end)
+    if len(key) == 0
+        return out
+
+    // Parse flags: next token
+    let flags_start = key_end + 1
+    let flags_end = _mc_find_sp(header, flags_start, hlen)
+    if flags_end >= hlen
+        return out
+    let flags = _mc_parse_int(header, flags_start, flags_end)
+    if flags < 0
+        return out
+
+    // Parse bytes: final token
+    let bytes_start = flags_end + 1
+    let bytes_end = _mc_find_sp(header, bytes_start, hlen)
+    // bytes_end may equal hlen if no trailing space (normal case)
+    let nbytes = _mc_parse_int(header, bytes_start, bytes_end)
+    if nbytes < 0
+        return out
+
+    // ── Data block: starts immediately after the header LF ─────────────────
+    let data_start = _mc_line_end(lf0, n)
+    // Clamp to available data
+    let data_end = data_start + nbytes
+    if data_end > n
+        data_end = n
+    let data = slice(text, data_start, data_end)
+
+    out["key"] = key
+    out["flags"] = flags
+    out["data"] = data
+    out
+
+// mc_parse_reply: parse a simple server reply line.
+//
+// Strips leading/trailing CRLF/LF and returns the first line's text.
+// This covers: STORED, NOT_STORED, EXISTS, NOT_FOUND, DELETED,
+//              ERROR, CLIENT_ERROR, SERVER_ERROR, VALUE, END, TOUCHED, OK,
+//              and numeric increment/decrement responses.
+//
+// Examples:
+//   mc_parse_reply("STORED\r\n")     -> "STORED"
+//   mc_parse_reply("NOT_FOUND\r\n")  -> "NOT_FOUND"
+//   mc_parse_reply("END\r\n")        -> "END"
+//   mc_parse_reply("")               -> ""
+fn mc_parse_reply(text: string) -> string
+    let n = len(text)
+    if n == 0
+        return ""
+    let lf = _mc_find_lf(text, 0, n)
+    _mc_line_text(text, 0, lf)

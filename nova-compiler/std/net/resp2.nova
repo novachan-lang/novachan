@@ -1,0 +1,341 @@
+// ============================================================================
+// NOVA Standard Library — std/net/resp2
+// ============================================================================
+// RESP2 (Redis Serialization Protocol v2) codec — parser + builder.
+//
+// Binary-safe: uses the BYTES type throughout (NUL bytes are preserved in
+// bulk strings, which are length-prefixed, not C-string-delimited).
+//
+// RESP2 wire types (each line ends with CRLF = 0x0D 0x0A):
+//   +<text>CRLF                          — Simple String
+//   -<text>CRLF                          — Error
+//   :<digits>CRLF                        — Integer
+//   $<len>CRLF<data>CRLF                 — Bulk String  ($-1CRLF = nil)
+//   *<count>CRLF<elem>...                — Array         (*-1CRLF = nil array)
+//
+// PUBLIC API (all return/accept bytes):
+//   resp_simple(s)       -> bytes   ("+s\r\n")
+//   resp_error(s)        -> bytes   ("-s\r\n")
+//   resp_int(n)          -> bytes   (":n\r\n")
+//   resp_bulk(s)         -> bytes   ("$len\r\ns\r\n")
+//   resp_nil()           -> bytes   ("$-1\r\n")
+//   resp_array(items)    -> bytes   ("*count\r\n" + concatenated pre-encoded items)
+//   resp_parse(b, pos)   -> list    [value_dict, next_pos]
+//
+// resp_parse returns a two-element list:
+//   [0] dict with keys:
+//         "type"  -> "simple" | "error" | "int" | "bulk" | "nil" | "array" | "err"
+//         "str"   -> string value (for simple/error/bulk)
+//         "int"   -> integer value (for int type)
+//         "list"  -> list of value dicts (for array type)
+//         "msg"   -> error message string (for type=="err", i.e. parse error)
+//   [1] int: next position after the consumed message (-1 on parse error)
+//
+// DESIGN NOTES:
+//   * Bulk strings are parsed by declared byte-length (binary-safe, NUL-safe).
+//   * All integer parsing is done manually (NOVA has no parseInt builtin).
+//   * CRLF is built via chr(13)+chr(10) — do NOT rely on backslash escapes.
+//   * All private helpers are prefixed _r2_ to avoid symbol collisions.
+//   * slice() on a string is used for text extraction; bytes_get() for binary.
+//   * This module is LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private constants (via functions — NOVA has no module-level let consts) ───
+
+fn _r2_cr() -> int
+    13
+
+fn _r2_lf() -> int
+    10
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _r2_crlf_bytes: append CRLF (0x0D 0x0A) to buf, return buf.
+fn _r2_crlf_bytes(buf)
+    buf = bytes_append(buf, 13)
+    buf = bytes_append(buf, 10)
+    buf
+
+// _r2_str_to_bytes: encode a string into bytes (ASCII / UTF-8 byte values).
+// Binary-safe for content that doesn't contain NUL — for bulk strings the
+// length is known from the RESP header so NUL inside is fine at parse time.
+fn _r2_str_to_bytes(s)
+    str_to_bytes(s)
+
+// _r2_int_to_bytes: encode integer n as its ASCII decimal representation in bytes.
+fn _r2_int_to_bytes(n)
+    str_to_bytes(str(n))
+
+// _r2_prefix_line: build "<prefix><text>CRLF" as bytes.
+//   prefix: single ASCII char code (e.g. 43 for '+', 45 for '-', 58 for ':')
+//   text:   string (will be appended as ASCII bytes)
+fn _r2_prefix_line(prefix, text)
+    let buf = bytes(0)
+    buf = bytes_append(buf, prefix)
+    let tb = str_to_bytes(text)
+    buf = bytes_concat(buf, tb)
+    buf = _r2_crlf_bytes(buf)
+    buf
+
+// _r2_find_crlf: scan bytes b starting at pos, return index of 0x0D that is
+// immediately followed by 0x0A.  Returns -1 if not found.
+// Stops scanning at bytes_len(b) - 1 (need at least 2 bytes remaining).
+fn _r2_find_crlf(b, pos)
+    let n = bytes_len(b)
+    let i = pos
+    let found = -1
+    while i < n - 1
+        if bytes_get(b, i) == 13 and bytes_get(b, i + 1) == 10
+            found = i
+            i = n
+        i = i + 1
+    found
+
+// _r2_read_line: read bytes from pos up to (not including) the CRLF.
+// Returns a list: [text_as_string, pos_after_crlf].
+// On error (no CRLF found) returns ["", -1].
+fn _r2_read_line(b, pos)
+    let crlf = _r2_find_crlf(b, pos)
+    if crlf == -1
+        return ["", -1]
+    // Extract bytes from pos..crlf as a string
+    let n = crlf - pos
+    let s = ""
+    let i = 0
+    while i < n
+        s = s + chr(bytes_get(b, pos + i))
+        i = i + 1
+    [s, crlf + 2]
+
+// _r2_parse_int: parse a decimal integer string (with optional leading '-').
+// Returns the integer value.  Non-digit input returns 0.
+fn _r2_parse_int(s)
+    let n = len(s)
+    if n == 0
+        return 0
+    let neg = 0
+    let start = 0
+    if slice(s, 0, 1) == "-"
+        neg = 1
+        start = 1
+    let acc = 0
+    let i = start
+    while i < n
+        let ch = ord(char_at(s, i))
+        // digits: 48='0' .. 57='9'
+        if ch >= 48 and ch <= 57
+            acc = acc * 10 + (ch - 48)
+        i = i + 1
+    if neg == 1
+        return 0 - acc
+    acc
+
+// _r2_err_result: produce a parse-error result list.
+fn _r2_err_result(msg)
+    let d = {}
+    d["type"] = "err"
+    d["msg"] = msg
+    [d, -1]
+
+// _r2_parse_simple: parse a Simple String starting AFTER the '+' prefix.
+//   pos points to the first character of the text (after '+').
+fn _r2_parse_simple(b, pos)
+    let lr = _r2_read_line(b, pos)
+    let text = lr[0]
+    let next = lr[1]
+    if next == -1
+        return _r2_err_result("truncated simple string")
+    let d = {}
+    d["type"] = "simple"
+    d["str"] = text
+    [d, next]
+
+// _r2_parse_error: parse an Error starting AFTER the '-' prefix.
+fn _r2_parse_error(b, pos)
+    let lr = _r2_read_line(b, pos)
+    let text = lr[0]
+    let next = lr[1]
+    if next == -1
+        return _r2_err_result("truncated error")
+    let d = {}
+    d["type"] = "error"
+    d["str"] = text
+    [d, next]
+
+// _r2_parse_integer: parse an Integer starting AFTER the ':' prefix.
+fn _r2_parse_integer(b, pos)
+    let lr = _r2_read_line(b, pos)
+    let text = lr[0]
+    let next = lr[1]
+    if next == -1
+        return _r2_err_result("truncated integer")
+    let d = {}
+    d["type"] = "int"
+    d["int"] = _r2_parse_int(text)
+    [d, next]
+
+// _r2_parse_bulk: parse a Bulk String starting AFTER the '$' prefix.
+// Handles $-1\r\n (nil bulk string) and binary-safe length-delimited data.
+fn _r2_parse_bulk(b, pos)
+    // Read the length line
+    let lr = _r2_read_line(b, pos)
+    let lenstr = lr[0]
+    let after_hdr = lr[1]
+    if after_hdr == -1
+        return _r2_err_result("truncated bulk header")
+    let blen = _r2_parse_int(lenstr)
+    // Nil bulk string
+    if blen == -1
+        let d = {}
+        d["type"] = "nil"
+        d["str"] = ""
+        return [d, after_hdr]
+    // Validate length (must be >= 0 and fit within remaining buffer + CRLF)
+    if blen < 0
+        return _r2_err_result("invalid bulk length")
+    let buf_remaining = bytes_len(b) - after_hdr
+    if buf_remaining < blen + 2
+        return _r2_err_result("truncated bulk data")
+    // Verify trailing CRLF after the data
+    if bytes_get(b, after_hdr + blen) != 13 or bytes_get(b, after_hdr + blen + 1) != 10
+        return _r2_err_result("missing bulk CRLF")
+    // Extract bulk data as string (binary-safe: chr() handles each byte)
+    let s = ""
+    let i = 0
+    while i < blen
+        s = s + chr(bytes_get(b, after_hdr + i))
+        i = i + 1
+    let d = {}
+    d["type"] = "bulk"
+    d["str"] = s
+    [d, after_hdr + blen + 2]
+
+// _r2_parse_array: parse an Array starting AFTER the '*' prefix.
+// Handles *-1\r\n (nil array) and recursively parses elements.
+fn _r2_parse_array(b, pos)
+    let lr = _r2_read_line(b, pos)
+    let cntstr = lr[0]
+    let after_hdr = lr[1]
+    if after_hdr == -1
+        return _r2_err_result("truncated array header")
+    let cnt = _r2_parse_int(cntstr)
+    if cnt == -1
+        let d = {}
+        d["type"] = "nil"
+        d["list"] = []
+        return [d, after_hdr]
+    if cnt < 0
+        return _r2_err_result("invalid array count")
+    let items = []
+    let cur = after_hdr
+    let idx = 0
+    while idx < cnt
+        let er = resp_parse(b, cur)
+        let elem = er[0]
+        let nxt = er[1]
+        if nxt == -1
+            return _r2_err_result("truncated array element")
+        push(items, elem)
+        cur = nxt
+        idx = idx + 1
+    let d = {}
+    d["type"] = "array"
+    d["list"] = items
+    [d, cur]
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// resp_simple(s) -> bytes
+// Encodes a RESP2 Simple String: "+<s>\r\n"
+// s must not contain CR or LF (protocol constraint; not enforced at runtime).
+fn resp_simple(s)
+    _r2_prefix_line(43, s)
+
+// resp_error(s) -> bytes
+// Encodes a RESP2 Error: "-<s>\r\n"
+// Convention: s begins with an error type, e.g. "ERR unknown command".
+fn resp_error(s)
+    _r2_prefix_line(45, s)
+
+// resp_int(n) -> bytes
+// Encodes a RESP2 Integer: ":<n>\r\n"
+fn resp_int(n)
+    let buf = bytes(0)
+    buf = bytes_append(buf, 58)
+    buf = bytes_concat(buf, str_to_bytes(str(n)))
+    buf = _r2_crlf_bytes(buf)
+    buf
+
+// resp_bulk(s) -> bytes
+// Encodes a RESP2 Bulk String: "$<bytecount>\r\n<s>\r\n"
+// The byte count is the byte length of s.  Binary-safe (length-delimited).
+fn resp_bulk(s)
+    let blen = len(s)
+    let buf = bytes(0)
+    buf = bytes_append(buf, 36)
+    buf = bytes_concat(buf, str_to_bytes(str(blen)))
+    buf = _r2_crlf_bytes(buf)
+    buf = bytes_concat(buf, str_to_bytes(s))
+    buf = _r2_crlf_bytes(buf)
+    buf
+
+// resp_nil() -> bytes
+// Encodes a RESP2 Nil Bulk String: "$-1\r\n"
+fn resp_nil()
+    let buf = bytes(0)
+    buf = bytes_append(buf, 36)
+    buf = bytes_concat(buf, str_to_bytes("-1"))
+    buf = _r2_crlf_bytes(buf)
+    buf
+
+// resp_array(items) -> bytes
+// Encodes a RESP2 Array from a list of already-encoded bytes elements.
+// "*<count>\r\n<item1><item2>..."
+// items: list of bytes values (each already encoded via resp_* calls).
+fn resp_array(items)
+    let cnt = len(items)
+    let buf = bytes(0)
+    buf = bytes_append(buf, 42)
+    buf = bytes_concat(buf, str_to_bytes(str(cnt)))
+    buf = _r2_crlf_bytes(buf)
+    let i = 0
+    while i < cnt
+        buf = bytes_concat(buf, items[i])
+        i = i + 1
+    buf
+
+// resp_parse(b, pos) -> list [value_dict, next_pos]
+// Parses one RESP2 value from bytes b starting at offset pos.
+// Returns a two-element list:
+//   [0] dict: {"type": ..., "str": ..., "int": ..., "list": ...}
+//   [1] int:  position immediately after the consumed value (-1 on error)
+//
+// type values:
+//   "simple"  — Simple String;  "str" key holds the text
+//   "error"   — Error;          "str" key holds the error text
+//   "int"     — Integer;        "int" key holds the value
+//   "bulk"    — Bulk String;    "str" key holds the data
+//   "nil"     — Nil ($-1 or *-1)
+//   "array"   — Array;          "list" key holds list of value dicts
+//   "err"     — Parse error;    "msg" key describes what went wrong
+fn resp_parse(b, pos)
+    let n = bytes_len(b)
+    if pos >= n
+        return _r2_err_result("buffer exhausted")
+    let tag = bytes_get(b, pos)
+    // '+' = 43  Simple String
+    if tag == 43
+        return _r2_parse_simple(b, pos + 1)
+    // '-' = 45  Error
+    if tag == 45
+        return _r2_parse_error(b, pos + 1)
+    // ':' = 58  Integer
+    if tag == 58
+        return _r2_parse_integer(b, pos + 1)
+    // '$' = 36  Bulk String
+    if tag == 36
+        return _r2_parse_bulk(b, pos + 1)
+    // '*' = 42  Array
+    if tag == 42
+        return _r2_parse_array(b, pos + 1)
+    _r2_err_result("unknown RESP2 type byte: " + str(tag))

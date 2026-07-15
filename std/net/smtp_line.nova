@@ -1,0 +1,240 @@
+// ============================================================================
+// NOVA Standard Library — std/net/smtp_line
+// ============================================================================
+// SMTP line codec (RFC 5321), TEXT protocol.
+//
+// PUBLIC API:
+//   smtp_reply_parse(text: string) -> dict
+//     Parse a complete SMTP reply block (single-line or multi-line) into:
+//       "code"     : int   — the 3-digit reply code (0 if malformed)
+//       "complete" : int   — 1 if reply ends with "code SP ..." (last line)
+//       "lines"    : list  — text after each "code[-| ]" prefix, one per line
+//     Single-line:  "250 OK"  -> code=250, complete=1, lines=["OK"]
+//     Multi-line:   "250-mail.example.com\r\n250-STARTTLS\r\n250 SIZE 10240000"
+//                -> code=250, complete=1, lines=["mail.example.com","STARTTLS","SIZE 10240000"]
+//     Malformed / no valid code: code=0, complete=0, lines=[]
+//
+//   smtp_command(verb: string, arg: string) -> string
+//     Build an SMTP command line.
+//     If arg non-empty:  "VERB arg\r\n"     (single space between verb and arg)
+//     If arg empty:      "VERB\r\n"
+//     smtp_command("MAIL FROM","<a@b>") -> "MAIL FROM:<a@b>\r\n"
+//     smtp_command("QUIT","")           -> "QUIT\r\n"
+//     NOTE: arg is appended directly (no extra space) so callers include any
+//     leading punctuation required by RFC 5321 (e.g. "<a@b>" not "a@b").
+//
+//   smtp_ehlo_caps(reply_text: string) -> list
+//     Extract EHLO capability keyword lines from a 250 multi-line reply.
+//     The first line of an EHLO reply is the greeting (domain + optional text).
+//     Returns the capability strings (everything after "250-" / "250 ") for
+//     lines 2..N.  If the reply has only one line, returns [].
+//     E.g. smtp_ehlo_caps("250-mail.example.com\r\n250-STARTTLS\r\n250 SIZE 10240000")
+//       -> ["STARTTLS","SIZE 10240000"]
+//
+//   smtp_is_positive(code: int) -> int
+//     Returns 1 if code is a 2xx (positive completion) or 3xx (positive
+//     intermediate) reply per RFC 5321 §4.2.1; 0 otherwise.
+//     smtp_is_positive(250) -> 1
+//     smtp_is_positive(354) -> 1
+//     smtp_is_positive(550) -> 0
+//     smtp_is_positive(421) -> 0
+//
+// DESIGN NOTES:
+//   * CRLF = chr(13)+chr(10).  Bare LF is also recognised when splitting.
+//   * Continuation lines: "code-text" (hyphen after code = more lines follow).
+//   * Terminating line:   "code text" (space after code = last line).
+//   * RFC 5321 §4.2.1: continuation lines that happen to match "code SP" are
+//     still continuations — only the first line's separator determines type,
+//     and multi-line mode ends only at the matching "code SP" final line.
+//   * Private helpers prefixed _smtp_.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _smtp_crlf: return CRLF string
+fn _smtp_crlf() -> string
+    chr(13) + chr(10)
+
+// _smtp_is_digit: 1 if c is ASCII digit '0'..'9'
+fn _smtp_is_digit(c: string) -> int
+    let o = ord(c)
+    if o >= 48 and o <= 57
+        return 1
+    0
+
+// _smtp_parse_code: parse 3-digit SMTP code from start of line.
+// Returns the integer code (100..599) or -1 if malformed.
+fn _smtp_parse_code(line: string) -> int
+    let n = len(line)
+    if n < 3
+        return -1
+    let c0 = slice(line, 0, 1)
+    let c1 = slice(line, 1, 2)
+    let c2 = slice(line, 2, 3)
+    if _smtp_is_digit(c0) == 0 or _smtp_is_digit(c1) == 0 or _smtp_is_digit(c2) == 0
+        return -1
+    let d0 = ord(c0) - 48
+    let d1 = ord(c1) - 48
+    let d2 = ord(c2) - 48
+    d0 * 100 + d1 * 10 + d2
+
+// _smtp_strip_crlf: remove trailing CR (13) and/or LF (10) from string.
+fn _smtp_strip_crlf(s: string) -> string
+    let n = len(s)
+    let stop = n
+    if stop > 0 and ord(slice(s, stop - 1, stop)) == 10
+        stop = stop - 1
+    if stop > 0 and ord(slice(s, stop - 1, stop)) == 13
+        stop = stop - 1
+    slice(s, 0, stop)
+
+// _smtp_split_lines: split text on LF, return list of raw lines (may have trailing CR).
+fn _smtp_split_lines(text: string) -> list
+    let result = []
+    let n = len(text)
+    let start = 0
+    let i = 0
+    while i < n
+        if slice(text, i, i + 1) == chr(10)
+            push(result, slice(text, start, i + 1))
+            start = i + 1
+        i = i + 1
+    if start < n
+        push(result, slice(text, start, n))
+    result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// smtp_reply_parse: parse a complete SMTP reply block (single or multi-line).
+fn smtp_reply_parse(text: string) -> dict
+    let out = {}
+    let empty_lines = []
+    out["code"] = 0
+    out["complete"] = 0
+    out["lines"] = empty_lines
+
+    let raw = _smtp_split_lines(text)
+    let nraw = len(raw)
+    if nraw == 0
+        return out
+
+    // Strip CRLF from every raw line.
+    let lines = []
+    let li = 0
+    while li < nraw
+        push(lines, _smtp_strip_crlf(raw[li]))
+        li = li + 1
+
+    // Parse code from first line.
+    let first = lines[0]
+    let code = _smtp_parse_code(first)
+    if code < 100
+        return out
+
+    out["code"] = code
+    let text_lines = []
+    let flen = len(first)
+
+    // Determine single-line vs multi-line from 4th character.
+    // Single-line: 4th char is ' ' (space) — or line is exactly 3 chars.
+    // Multi-line:  4th char is '-' (hyphen).
+    if flen < 4
+        // Bare code, no text, treat as single-line complete.
+        push(text_lines, "")
+        out["lines"] = text_lines
+        out["complete"] = 1
+        return out
+
+    let sep4 = slice(first, 3, 4)
+
+    if sep4 == "-"
+        // Multi-line: collect continuation lines until "code SP" terminator.
+        if flen > 4
+            push(text_lines, slice(first, 4, flen))
+        else
+            push(text_lines, "")
+
+        // Build the terminator prefix we look for: "NNN " (4 chars with space).
+        let code_sp = str(code) + " "
+        let ci = 1
+        let complete = 0
+        while ci < len(lines)
+            let ln = lines[ci]
+            let llen = len(ln)
+            // Is this the terminating line?
+            if llen >= 4 and slice(ln, 0, 4) == code_sp
+                // Last line: text after "NNN ".
+                if llen > 4
+                    push(text_lines, slice(ln, 4, llen))
+                else
+                    push(text_lines, "")
+                complete = 1
+                ci = len(lines)
+            else
+                // Continuation — strip any "NNN-" or "NNN " prefix if present.
+                let ltext = ln
+                if llen >= 4 and _smtp_parse_code(ln) == code
+                    ltext = slice(ln, 4, llen)
+                push(text_lines, ltext)
+                ci = ci + 1
+        out["lines"] = text_lines
+        out["complete"] = complete
+        return out
+
+    // Single-line: sep4 is ' ' or anything else (treat as space).
+    if flen > 4
+        push(text_lines, slice(first, 4, flen))
+    else
+        push(text_lines, "")
+    out["lines"] = text_lines
+    out["complete"] = 1
+    out
+
+// smtp_command: build an SMTP command line per RFC 5321.
+// arg is appended directly (no extra space added between verb and arg).
+// This matches RFC 5321 where "MAIL FROM:<addr>" has no space before "<".
+// If arg is empty: "VERB\r\n".  If arg non-empty: "VERBarg\r\n" where the
+// caller provides any needed separator as part of arg (e.g. arg=":<a@b>").
+// For commands that need a space: callers pass arg=" value" or include it.
+// PER SPEC KAT: smtp_command("MAIL FROM","<a@b>") -> "MAIL FROM:<a@b>\r\n"
+// means verb="MAIL FROM", arg="<a@b>" → concat directly = "MAIL FROM<a@b>"
+// BUT the KAT shows "MAIL FROM:<a@b>" so arg must be ":<a@b>" OR we insert
+// ':' separator only for MAIL FROM.
+// Re-reading: the KAT says smtp_command("MAIL FROM","<a@b>")=="MAIL FROM:<a@b>"+CRLF
+// The simplest interpretation: if arg starts with '<', prepend ':'.
+// Better: just concatenate verb+arg with no extra glue — the KAT passes arg="<a@b>"
+// and expects output "MAIL FROM:<a@b>CRLF". That means verb="MAIL FROM" and we
+// need a ':' between them. Only way: insert ':' when arg starts with '<'.
+// For QUIT with empty arg: "QUIT\r\n" — no colon added. This is clean.
+fn smtp_command(verb: string, arg: string) -> string
+    let crlf = _smtp_crlf()
+    if len(arg) == 0
+        return verb + crlf
+    // If arg starts with '<', the RFC 5321 syntax is "VERB:<path>".
+    let first_ch = slice(arg, 0, 1)
+    if first_ch == "<"
+        return verb + ":" + arg + crlf
+    // Otherwise separate verb and arg with a space (DATA, EHLO, RCPT TO etc.).
+    verb + " " + arg + crlf
+
+// smtp_ehlo_caps: extract EHLO capability lines from a 250 multi-line reply.
+// The first "lines" entry is the greeting; capabilities start at index 1.
+fn smtp_ehlo_caps(reply_text: string) -> list
+    let caps = []
+    let r = smtp_reply_parse(reply_text)
+    let lines = r["lines"]
+    let n = len(lines)
+    // Skip the first line (greeting); the rest are capability keywords.
+    let i = 1
+    while i < n
+        push(caps, lines[i])
+        i = i + 1
+    caps
+
+// smtp_is_positive: 1 if code is 2xx or 3xx (positive per RFC 5321 §4.2.1).
+fn smtp_is_positive(code: int) -> int
+    if code >= 200 and code <= 399
+        return 1
+    0

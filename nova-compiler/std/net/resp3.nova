@@ -1,0 +1,436 @@
+// ============================================================================
+// NOVA Standard Library — std/net/resp3
+// ============================================================================
+// RESP3 (REdis Serialization Protocol version 3) codec — Redis 6+.
+// Binary-safe: uses BYTES throughout (NUL bytes may appear in bulk payloads).
+//
+// RESP3 type table (first byte = sigil, lines end with CRLF):
+//   '_'  Null           : _\r\n
+//   '#'  Boolean        : #t\r\n  |  #f\r\n
+//   ','  Double         : ,<text>\r\n
+//   '('  Big number     : (<text>\r\n
+//   '='  Verbatim str   : =<len>\r\n<enc:3>:<data>\r\n  (len = 4+datalen)
+//   '%'  Map            : %<count>\r\n <key> <value> ...  (2*count items)
+//   '~'  Set            : ~<count>\r\n <item> ...
+//   '>'  Push           : ><count>\r\n <item> ...
+//   '!'  Blob error     : !<len>\r\n<message>\r\n
+//   '$'  Bulk string    : $<len>\r\n<data>\r\n  (RESP2 compat)
+//   '+'  Simple string  : +<text>\r\n
+//   '-'  Simple error   : -<text>\r\n
+//   ':'  Integer        : :<text>\r\n
+//
+// PUBLIC API:
+//   resp3_null()           -> bytes     build the Null type
+//   resp3_bool(b)          -> bytes     build Boolean (#t or #f)
+//   resp3_double(text)     -> bytes     build Double (caller formats the number)
+//   resp3_bignum(text)     -> bytes     build Big number
+//   resp3_verbatim(enc, s) -> bytes     build Verbatim string (enc = 3-char e.g. "txt")
+//   resp3_blob_error(msg)  -> bytes     build Blob error
+//   resp3_bulk(data)       -> bytes     build Bulk string ($)
+//   resp3_simple(text)     -> bytes     build Simple string (+)
+//   resp3_error(text)      -> bytes     build Simple error (-)
+//   resp3_integer(n)       -> bytes     build Integer (:)
+//   resp3_map(pairs)       -> bytes     build Map (pairs = flat list of encoded bytes, even count)
+//   resp3_set(items)       -> bytes     build Set
+//   resp3_push(items)      -> bytes     build Push
+//
+//   resp3_parse(b, pos)    -> list      [value_dict, next_pos]
+//     value_dict keys: "type" (string) and "value" (varies):
+//       "null"       -> value = 0
+//       "bool"       -> value = 1 (true) or 0 (false)
+//       "double"     -> value = string
+//       "bignum"     -> value = string
+//       "verbatim"   -> value = string ("enc:data" body)
+//       "blob_error" -> value = bytes
+//       "bulk"       -> value = bytes
+//       "simple"     -> value = string
+//       "error"      -> value = string
+//       "integer"    -> value = int
+//       "map"        -> value = list of [key_dict, val_dict] pairs
+//       "set"        -> value = list of item dicts
+//       "push"       -> value = list of item dicts
+//       "parse_error"-> value = string (description)
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private: build CRLF bytes ────────────────────────────────────────────────
+
+fn _r3_crlf() -> bytes
+    let b = bytes(0)
+    b = bytes_append(b, 13)
+    b = bytes_append(b, 10)
+    b
+
+// ── Private: concat string into bytes buffer ──────────────────────────────────
+
+fn _r3_astr(b: bytes, s: string) -> bytes
+    bytes_concat(b, str_to_bytes(s))
+
+// ── Private: build sigil + text + CRLF ───────────────────────────────────────
+
+fn _r3_sline(sigil: int, text: string) -> bytes
+    let b = bytes(0)
+    b = bytes_append(b, sigil)
+    b = _r3_astr(b, text)
+    b = bytes_concat(b, _r3_crlf())
+    b
+
+// ── Private: read CRLF-terminated line starting at pos ───────────────────────
+// Returns [line_string, next_pos_after_crlf] or ["", -1] on error/not-found.
+
+fn _r3_read_line(b: bytes, pos: int) -> list
+    let blen = bytes_len(b)
+    let end_pos = -1
+    let found = 0
+    let i = pos
+    while i < blen - 1
+        if bytes_get(b, i) == 13 and bytes_get(b, i + 1) == 10
+            found = 1
+            end_pos = i
+            i = blen
+        if i < blen - 1
+            i = i + 1
+    if found == 0
+        return ["", -1]
+    let lb = bytes(0)
+    let j = pos
+    while j < end_pos
+        lb = bytes_append(lb, bytes_get(b, j))
+        j = j + 1
+    [bytes_to_str(lb), end_pos + 2]
+
+// ── Private: parse decimal integer from string (handles negatives) ────────────
+
+fn _r3_atoi(s: string) -> int
+    let n = 0
+    let neg = 0
+    let start = 0
+    if len(s) > 0 and slice(s, 0, 1) == "-"
+        neg = 1
+        start = 1
+    let i = start
+    while i < len(s)
+        n = n * 10 + (ord(slice(s, i, i + 1)) - 48)
+        i = i + 1
+    if neg == 1
+        n = 0 - n
+    n
+
+// ── Private: read exact count bytes from b starting at pos ───────────────────
+// Returns [bytes_value, next_pos] or [bytes(0), -1] if out of bounds.
+
+fn _r3_read_bytes(b: bytes, pos: int, count: int) -> list
+    if count < 0
+        return [bytes(0), -1]
+    if pos + count > bytes_len(b)
+        return [bytes(0), -1]
+    let out = bytes(0)
+    let i = pos
+    while i < pos + count
+        out = bytes_append(out, bytes_get(b, i))
+        i = i + 1
+    [out, pos + count]
+
+// ── Private: build aggregate frame (sigil + count + concatenated item bytes) ──
+
+fn _r3_aggregate(sigil: int, items: list) -> bytes
+    let count = len(items)
+    let b = bytes(0)
+    b = bytes_append(b, sigil)
+    b = _r3_astr(b, str(count))
+    b = bytes_concat(b, _r3_crlf())
+    let i = 0
+    while i < count
+        b = bytes_concat(b, items[i])
+        i = i + 1
+    b
+
+// ── Private: WORKAROUND for NOVA RC bug ──────────────────────────────────────
+// When a locally-built list is stored in a dict that is the first element of a
+// returned [dict, int] pair, the list gets dropped on return (RC bug with owned
+// lists inside dicts inside outer list returns). The fix: build the final dict
+// inside a helper function that RECEIVES the list as a PARAMETER, since
+// parameter passing preserves the RC reference correctly.
+
+fn _r3_make_list_result(tp: string, items: list, nxt: int) -> list
+    [{"type": tp, "value": items}, nxt]
+
+fn _r3_make_pairs_result(items: list, nxt: int) -> list
+    // items = flat [k0,v0,k1,v1,...]; caller passes flat list, we build [[k,v],...]
+    let pairs = []
+    let cnt = len(items) / 2
+    let pi = 0
+    while pi < cnt
+        let kd = items[pi * 2]
+        let vd = items[pi * 2 + 1]
+        push(pairs, [kd, vd])
+        pi = pi + 1
+    _r3_make_list_result("map", pairs, nxt)
+
+// ── Private: parse N items sequentially ──────────────────────────────────────
+// Returns [items_list, next_pos] or [[], -1] on any error.
+// Calls resp3_parse recursively; each iteration's result is individually pushed.
+
+fn _r3_parse_n(b: bytes, start: int, n: int) -> list
+    let items = []
+    let cur = start
+    let idx = 0
+    while idx < n
+        let r = resp3_parse(b, cur)
+        let rnxt = r[1]
+        if rnxt < 0
+            return [[], -1]
+        push(items, r[0])
+        cur = rnxt
+        idx = idx + 1
+    [items, cur]
+
+// ── Public API: builders ─────────────────────────────────────────────────────
+
+// resp3_null — Null: _\r\n
+fn resp3_null() -> bytes
+    _r3_sline(95, "")
+
+// resp3_bool — Boolean: #t\r\n or #f\r\n
+fn resp3_bool(b: int) -> bytes
+    if b != 0
+        return _r3_sline(35, "t")
+    _r3_sline(35, "f")
+
+// resp3_double — Double: ,<text>\r\n
+fn resp3_double(text: string) -> bytes
+    _r3_sline(44, text)
+
+// resp3_bignum — Big number: (<text>\r\n
+fn resp3_bignum(text: string) -> bytes
+    _r3_sline(40, text)
+
+// resp3_verbatim — Verbatim string: =<len>\r\n<enc>:<data>\r\n
+// enc must be exactly 3 characters (e.g. "txt").
+// The length field = 3 (enc) + 1 (colon) + len(data) = 4 + len(data).
+fn resp3_verbatim(enc: string, data: string) -> bytes
+    let body = enc + ":" + data
+    let blen = len(body)
+    let b = bytes(0)
+    b = bytes_append(b, 61)
+    b = _r3_astr(b, str(blen))
+    b = bytes_concat(b, _r3_crlf())
+    b = _r3_astr(b, body)
+    b = bytes_concat(b, _r3_crlf())
+    b
+
+// resp3_blob_error — Blob error: !<len>\r\n<message>\r\n
+fn resp3_blob_error(msg: string) -> bytes
+    let mlen = len(msg)
+    let b = bytes(0)
+    b = bytes_append(b, 33)
+    b = _r3_astr(b, str(mlen))
+    b = bytes_concat(b, _r3_crlf())
+    b = _r3_astr(b, msg)
+    b = bytes_concat(b, _r3_crlf())
+    b
+
+// resp3_bulk — Bulk string (RESP2-compatible): $<len>\r\n<data>\r\n
+fn resp3_bulk(data: bytes) -> bytes
+    let dlen = bytes_len(data)
+    let b = bytes(0)
+    b = bytes_append(b, 36)
+    b = _r3_astr(b, str(dlen))
+    b = bytes_concat(b, _r3_crlf())
+    b = bytes_concat(b, data)
+    b = bytes_concat(b, _r3_crlf())
+    b
+
+// resp3_simple — Simple string: +<text>\r\n
+fn resp3_simple(text: string) -> bytes
+    _r3_sline(43, text)
+
+// resp3_error — Simple error: -<text>\r\n
+fn resp3_error(text: string) -> bytes
+    _r3_sline(45, text)
+
+// resp3_integer — Integer: :<n>\r\n
+fn resp3_integer(n: int) -> bytes
+    _r3_sline(58, str(n))
+
+// resp3_map — Map: %<count/2>\r\n<key0><val0>...
+// pairs = flat list of already-encoded bytes (even count);
+//   index 0,2,4=keys; 1,3,5=vals.
+fn resp3_map(pairs: list) -> bytes
+    let total = len(pairs)
+    let count = total / 2
+    let b = bytes(0)
+    b = bytes_append(b, 37)
+    b = _r3_astr(b, str(count))
+    b = bytes_concat(b, _r3_crlf())
+    let i = 0
+    while i < total
+        b = bytes_concat(b, pairs[i])
+        i = i + 1
+    b
+
+// resp3_set — Set: ~<count>\r\n<item0>...
+fn resp3_set(items: list) -> bytes
+    _r3_aggregate(126, items)
+
+// resp3_push — Push: ><count>\r\n<item0>...
+fn resp3_push(items: list) -> bytes
+    _r3_aggregate(62, items)
+
+// ── Public API: parser ───────────────────────────────────────────────────────
+
+// resp3_parse — decode one RESP3 value from b at pos.
+// Returns [result_dict, next_pos]; next_pos == -1 on parse error.
+//
+// NOTE: Map/set/push results use _r3_make_list_result / _r3_make_pairs_result
+// helpers to work around a NOVA RC bug where a locally-built list stored in a
+// dict that is the first element of a returned list gets dropped on return.
+// Passing the list as a function PARAMETER preserves the reference correctly.
+fn resp3_parse(b: bytes, pos: int) -> list
+    let blen = bytes_len(b)
+    let ev = {"type": "parse_error", "value": "truncated"}
+    let er = [ev, -1]
+    if pos < 0 or pos >= blen
+        return er
+    let sig = bytes_get(b, pos)
+    let bp = pos + 1
+
+    // Null: _
+    if sig == 95
+        let nl = _r3_read_line(b, bp)
+        if nl[1] < 0
+            return er
+        return [{"type": "null", "value": 0}, nl[1]]
+
+    // Boolean: #
+    if sig == 35
+        let bl = _r3_read_line(b, bp)
+        if bl[1] < 0
+            return er
+        let bv = 0
+        if bl[0] == "t"
+            bv = 1
+        return [{"type": "bool", "value": bv}, bl[1]]
+
+    // Double: ,
+    if sig == 44
+        let dl = _r3_read_line(b, bp)
+        if dl[1] < 0
+            return er
+        return [{"type": "double", "value": dl[0]}, dl[1]]
+
+    // Big number: (
+    if sig == 40
+        let gnl = _r3_read_line(b, bp)
+        if gnl[1] < 0
+            return er
+        return [{"type": "bignum", "value": gnl[0]}, gnl[1]]
+
+    // Simple string: +
+    if sig == 43
+        let sl = _r3_read_line(b, bp)
+        if sl[1] < 0
+            return er
+        return [{"type": "simple", "value": sl[0]}, sl[1]]
+
+    // Simple error: -
+    if sig == 45
+        let el = _r3_read_line(b, bp)
+        if el[1] < 0
+            return er
+        return [{"type": "error", "value": el[0]}, el[1]]
+
+    // Integer: :
+    if sig == 58
+        let il = _r3_read_line(b, bp)
+        if il[1] < 0
+            return er
+        return [{"type": "integer", "value": _r3_atoi(il[0])}, il[1]]
+
+    // Map: % — parse 2*count items then group into [[k,v],...] via helper
+    if sig == 37
+        let ml = _r3_read_line(b, bp)
+        if ml[1] < 0
+            return er
+        let mcnt = _r3_atoi(ml[0])
+        let mpr = _r3_parse_n(b, ml[1], mcnt * 2)
+        if mpr[1] < 0
+            return er
+        return _r3_make_pairs_result(mpr[0], mpr[1])
+
+    // Set: ~ — parse count items via helper
+    if sig == 126
+        let setl = _r3_read_line(b, bp)
+        if setl[1] < 0
+            return er
+        let setcnt = _r3_atoi(setl[0])
+        let setr = _r3_parse_n(b, setl[1], setcnt)
+        if setr[1] < 0
+            return er
+        return _r3_make_list_result("set", setr[0], setr[1])
+
+    // Push: > — parse count items via helper
+    if sig == 62
+        let pul = _r3_read_line(b, bp)
+        if pul[1] < 0
+            return er
+        let pucnt = _r3_atoi(pul[0])
+        let pur = _r3_parse_n(b, pul[1], pucnt)
+        if pur[1] < 0
+            return er
+        return _r3_make_list_result("push", pur[0], pur[1])
+
+    // Verbatim string: =
+    // =<len>\r\n<enc:3>:<data>\r\n  where len = 4 + len(data)
+    if sig == 61
+        let vl = _r3_read_line(b, bp)
+        if vl[1] < 0
+            return er
+        let vlen = _r3_atoi(vl[0])
+        let vbr = _r3_read_bytes(b, vl[1], vlen)
+        if vbr[1] < 0
+            return er
+        let vafter = vbr[1]
+        if vafter + 1 >= blen
+            return er
+        if bytes_get(b, vafter) != 13 or bytes_get(b, vafter + 1) != 10
+            return er
+        return [{"type": "verbatim", "value": bytes_to_str(vbr[0])}, vafter + 2]
+
+    // Blob error: !
+    if sig == 33
+        let xel = _r3_read_line(b, bp)
+        if xel[1] < 0
+            return er
+        let xmlen = _r3_atoi(xel[0])
+        let xbr = _r3_read_bytes(b, xel[1], xmlen)
+        if xbr[1] < 0
+            return er
+        let xafter = xbr[1]
+        if xafter + 1 >= blen
+            return er
+        if bytes_get(b, xafter) != 13 or bytes_get(b, xafter + 1) != 10
+            return er
+        return [{"type": "blob_error", "value": xbr[0]}, xafter + 2]
+
+    // Bulk string: $
+    if sig == 36
+        let kl = _r3_read_line(b, bp)
+        if kl[1] < 0
+            return er
+        let kdlen = _r3_atoi(kl[0])
+        if kdlen < 0
+            return [{"type": "null", "value": 0}, kl[1]]
+        let kbr = _r3_read_bytes(b, kl[1], kdlen)
+        if kbr[1] < 0
+            return er
+        let kafter = kbr[1]
+        if kafter + 1 >= blen
+            return er
+        if bytes_get(b, kafter) != 13 or bytes_get(b, kafter + 1) != 10
+            return er
+        return [{"type": "bulk", "value": kbr[0]}, kafter + 2]
+
+    // Unknown sigil
+    [{"type": "parse_error", "value": "unknown_sigil"}, -1]

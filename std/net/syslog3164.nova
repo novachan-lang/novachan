@@ -1,0 +1,210 @@
+// ============================================================================
+// NOVA Standard Library — std/net/syslog3164
+// ============================================================================
+// RFC 3164 (BSD syslog) message PARSER and BUILDER (no sockets; text codec).
+//
+// PUBLIC API:
+//   syslog3164_parse(line: string) -> dict
+//     Parse a syslog RFC3164 message into a dict with keys:
+//       "pri"       — PRI value as int-string, e.g. "34"
+//       "facility"  — facility number as int-string (pri >> 3), e.g. "4"
+//       "severity"  — severity level as int-string (pri & 7), e.g. "2"
+//       "timestamp" — "Mmm DD HH:MM:SS" (15 chars), e.g. "Oct 11 22:14:15"
+//       "hostname"  — hostname token, e.g. "mymachine"
+//       "tag"       — program tag (up to first ':' or '['), e.g. "su"
+//       "content"   — message body after "tag: ", e.g. "'su root' failed"
+//     Returns dict with empty strings on parse error.
+//
+//   syslog3164_build(fields: dict) -> string
+//     Assemble a syslog line from a dict.  Expects the same keys as above.
+//     "pri" (numeric string) is used to build the <PRI> prefix.
+//     Output format: <PRI>TIMESTAMP HOSTNAME TAG: CONTENT
+//
+// RFC 3164 BNF (simplified):
+//   SYSLOG-MSG = "<" PRIVAL ">" TIMESTAMP SP HOSTNAME SP TAG MSG
+//   TIMESTAMP  = MONTH SP DAY SP TIME    (15 chars including spaces)
+//   TAG        = 1..32 PRINTUSASCII chars ending at ':' or '['
+//   MSG        = CONTENT
+//
+// DESIGN NOTES:
+//   * All private helpers are prefixed _sl_ to avoid symbol collisions.
+//   * Missing dict keys return int 0 in NOVA; we always write string values.
+//   * char_at(s, i) returns a 1-char string; compare with string literals.
+//   * slice(s, start, end) — end is EXCLUSIVE.
+//   * SP = " " = chr(32).
+//   * CRLF not used in syslog (LF is conventional; body is raw content).
+//
+// LEAF — imports NOTHING.
+
+// ── Private: find next occurrence of a single-char needle ────────────────────
+
+fn _sl_index_of(s: string, needle: string, from_pos: int) -> int
+    let n = len(s)
+    let i = from_pos
+    while i < n
+        if char_at(s, i) == needle
+            return i
+        i = i + 1
+    -1
+
+// ── Private: parse integer from substring s[start..end) ──────────────────────
+
+fn _sl_parse_int(s: string, start_pos: int, end_pos: int) -> int
+    let i = start_pos
+    let result = 0
+    while i < end_pos
+        let c = ord(char_at(s, i))
+        // digits 0-9 are ASCII 48-57
+        if c >= 48 and c <= 57
+            result = result * 10 + (c - 48)
+        i = i + 1
+    result
+
+// ── Private: return a blank result dict (all fields empty string) ─────────────
+
+fn _sl_empty() -> dict
+    let d = {}
+    d["pri"] = ""
+    d["facility"] = ""
+    d["severity"] = ""
+    d["timestamp"] = ""
+    d["hostname"] = ""
+    d["tag"] = ""
+    d["content"] = ""
+    d
+
+// ── Public: parse a syslog RFC3164 line ──────────────────────────────────────
+//
+// Grammar:
+//   <PRI>TIMESTAMP SP HOSTNAME SP TAG[: ][CONTENT]
+//
+// Step 1: consume "<PRI>" — find '>' after leading '<'.
+// Step 2: consume TIMESTAMP — exactly 15 chars ("Mmm DD HH:MM:SS").
+// Step 3: expect SP.
+// Step 4: consume HOSTNAME — next token up to SP.
+// Step 5: consume SP.
+// Step 6: consume TAG — up to first ':' or '['.
+// Step 7: skip ": " separator if present.
+// Step 8: rest is CONTENT.
+//
+// On any structural error, return empty dict.
+
+fn syslog3164_parse(line: string) -> dict
+    let n = len(line)
+
+    // ── Step 1: parse <PRI> ──────────────────────────────────────────────────
+    // Must start with '<'
+    if n < 4
+        return _sl_empty()
+    if char_at(line, 0) != "<"
+        return _sl_empty()
+
+    // Find closing '>'
+    let close_angle = _sl_index_of(line, ">", 1)
+    if close_angle < 0
+        return _sl_empty()
+    // PRI must be 1-3 digits (1..191 valid but we accept any non-negative)
+    let pri_digits = close_angle - 1
+    if pri_digits < 1 or pri_digits > 3
+        return _sl_empty()
+
+    let pri = _sl_parse_int(line, 1, close_angle)
+    let facility = pri / 8
+    let severity = pri - (facility * 8)
+
+    // pos now points just after '>'
+    let pos = close_angle + 1
+
+    // ── Step 2: parse TIMESTAMP (15 chars "Mmm DD HH:MM:SS") ───────────────
+    // Minimum remaining: 15 (timestamp) + 1 (SP) + 1 (hostname) = 17 chars
+    if (n - pos) < 17
+        return _sl_empty()
+
+    let timestamp = slice(line, pos, pos + 15)
+    pos = pos + 15
+
+    // ── Step 3: expect SP ────────────────────────────────────────────────────
+    if char_at(line, pos) != " "
+        return _sl_empty()
+    pos = pos + 1
+
+    // ── Step 4: parse HOSTNAME (token up to next SP) ─────────────────────────
+    let sp_after_host = _sl_index_of(line, " ", pos)
+    if sp_after_host < 0
+        return _sl_empty()
+    if sp_after_host == pos
+        return _sl_empty()
+    let hostname = slice(line, pos, sp_after_host)
+    pos = sp_after_host + 1
+
+    // ── Step 5: parse TAG (up to first ':' or '[') ───────────────────────────
+    // Scan forward finding which terminator appears first.
+    let colon_pos = _sl_index_of(line, ":", pos)
+    let bracket_pos = _sl_index_of(line, "[", pos)
+
+    // Determine the tag-end position (whichever terminator is first)
+    let tag_end = -1
+    if colon_pos >= 0 and bracket_pos >= 0
+        if colon_pos < bracket_pos
+            tag_end = colon_pos
+        else
+            tag_end = bracket_pos
+    else
+        if colon_pos >= 0
+            tag_end = colon_pos
+        else
+            if bracket_pos >= 0
+                tag_end = bracket_pos
+
+    // If no terminator found, tag = rest of string, content = ""
+    let tag = ""
+    let content = ""
+    if tag_end < 0
+        tag = slice(line, pos, n)
+        content = ""
+    else
+        tag = slice(line, pos, tag_end)
+        // After ':', skip ": " or just ":"
+        let after_tag = tag_end + 1
+        if after_tag < n and char_at(line, after_tag) == " "
+            after_tag = after_tag + 1
+        content = slice(line, after_tag, n)
+
+    let d = {}
+    d["pri"] = str(pri)
+    d["facility"] = str(facility)
+    d["severity"] = str(severity)
+    d["timestamp"] = timestamp
+    d["hostname"] = hostname
+    d["tag"] = tag
+    d["content"] = content
+    d
+
+// ── Public: build a syslog RFC3164 line ──────────────────────────────────────
+//
+// Output: "<PRI>TIMESTAMP HOSTNAME TAG: CONTENT"
+// Reads "pri", "timestamp", "hostname", "tag", "content" from fields dict.
+// Missing keys produce empty strings.
+
+fn syslog3164_build(fields: dict) -> string
+    let pri_str = ""
+    if contains(fields, "pri")
+        pri_str = fields["pri"]
+
+    let timestamp = ""
+    if contains(fields, "timestamp")
+        timestamp = fields["timestamp"]
+
+    let hostname = ""
+    if contains(fields, "hostname")
+        hostname = fields["hostname"]
+
+    let tag_str = ""
+    if contains(fields, "tag")
+        tag_str = fields["tag"]
+
+    let content_str = ""
+    if contains(fields, "content")
+        content_str = fields["content"]
+
+    "<" + pri_str + ">" + timestamp + " " + hostname + " " + tag_str + ": " + content_str

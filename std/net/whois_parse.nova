@@ -1,0 +1,337 @@
+// ============================================================================
+// NOVA Standard Library — std/net/whois_parse
+// ============================================================================
+// WHOIS response parser, TEXT protocol (RFC 3912).
+//
+// PUBLIC API:
+//   whois_parse(text: string) -> dict
+//     Parse a WHOIS response and return a dict mapping field names (lower-cased)
+//     to their last value.  Continuation lines (lines starting with whitespace)
+//     are folded into the preceding field with a single space.  Comment lines
+//     that start with "%" or "#" are ignored.  Blank lines separate sections
+//     but all fields across all sections are merged into one dict (repeated
+//     fields keep the last value).
+//
+//   whois_field(text: string, name: string) -> string
+//     Convenience wrapper: parse text, return the value for the given field
+//     name (case-insensitive key comparison).  Returns "" if absent.
+//
+//   whois_all(text: string, name: string) -> list
+//     Return a list of ALL values for a repeated field (case-insensitive).
+//     Useful for "Name Server", "Registrar", etc. that appear multiple times.
+//
+//   whois_sections(text: string) -> list
+//     Split the WHOIS text into blocks separated by one or more blank lines.
+//     Returns a list of strings, each string being the raw text of one block
+//     (blank lines themselves are not included; each block has its own comment
+//     lines and field lines preserved verbatim).
+//
+// DESIGN NOTES:
+//   * Field names are stored lower-cased (after stripping leading/trailing
+//     whitespace) so lookup is always case-insensitive.
+//   * "Field: value" — colon is the canonical separator; the part before the
+//     first colon is the key, the part after (trimmed) is the value.
+//   * Continuation folding: a line that starts with a space or TAB character
+//     is considered a continuation of the previous field's value.  The newline
+//     + leading whitespace are replaced with a single space.
+//   * whois_all stores ALL (key, value) pairs in insertion order in an internal
+//     list; each element is a 2-element list [key, value].
+//   * Lines that contain no colon and are not comment/blank are kept as-is
+//     under a synthetic key equal to the full trimmed line if it is non-empty
+//     (many WHOIS servers emit free-text lines).
+//   * LF = chr(10).  CRLF is normalised to LF by stripping CR before the LF.
+//   * Private helpers are prefixed _wp_.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _wp_lf: the line-feed character.
+fn _wp_lf() -> string
+    chr(10)
+
+// _wp_cr: the carriage-return character.
+fn _wp_cr() -> string
+    chr(13)
+
+// _wp_sp: a space character.
+fn _wp_sp() -> string
+    " "
+
+// _wp_tab: a tab character.
+fn _wp_tab() -> string
+    chr(9)
+
+// _wp_to_lower: convert a single ASCII character to lower-case.
+fn _wp_to_lower_c(c: string) -> string
+    let o = ord(c)
+    if o >= 65 and o <= 90
+        return chr(o + 32)
+    c
+
+// _wp_to_lower: return s with every ASCII uppercase letter replaced by lowercase.
+fn _wp_to_lower(s: string) -> string
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n
+        out = out + _wp_to_lower_c(slice(s, i, i + 1))
+        i = i + 1
+    out
+
+// _wp_ltrim: remove leading spaces and tabs.
+fn _wp_ltrim(s: string) -> string
+    let n = len(s)
+    let i = 0
+    while i < n
+        let c = slice(s, i, i + 1)
+        if c == _wp_sp() or c == _wp_tab()
+            i = i + 1
+        else
+            return slice(s, i, n)
+    ""
+
+// _wp_rtrim: remove trailing spaces and tabs.
+fn _wp_rtrim(s: string) -> string
+    let n = len(s)
+    let end = n
+    while end > 0
+        let c = slice(s, end - 1, end)
+        if c == _wp_sp() or c == _wp_tab()
+            end = end - 1
+        else
+            return slice(s, 0, end)
+    ""
+
+// _wp_trim: remove leading and trailing spaces/tabs.
+fn _wp_trim(s: string) -> string
+    _wp_ltrim(_wp_rtrim(s))
+
+// _wp_is_blank: 1 if line is empty or all whitespace.
+fn _wp_is_blank(s: string) -> int
+    let t = _wp_trim(s)
+    if len(t) == 0
+        return 1
+    0
+
+// _wp_is_comment: 1 if trimmed line starts with '%' or '#'.
+fn _wp_is_comment(s: string) -> int
+    let t = _wp_ltrim(s)
+    if len(t) == 0
+        return 0
+    let c = slice(t, 0, 1)
+    if c == "%" or c == "#"
+        return 1
+    0
+
+// _wp_is_continuation: 1 if line starts with a space or tab (before any
+// content), indicating it folds into the previous field value.
+fn _wp_is_continuation(s: string) -> int
+    if len(s) == 0
+        return 0
+    let c = slice(s, 0, 1)
+    if c == _wp_sp() or c == _wp_tab()
+        return 1
+    0
+
+// _wp_index_colon: return index of first ':' in s, or -1 if none.
+fn _wp_index_colon(s: string) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if slice(s, i, i + 1) == ":"
+            return i
+        i = i + 1
+    -1
+
+// _wp_normalise: replace CRLF -> LF in the text so we can split on LF only.
+fn _wp_normalise(text: string) -> string
+    let n = len(text)
+    let out = ""
+    let cr = _wp_cr()
+    let lf = _wp_lf()
+    let i = 0
+    while i < n
+        let c = slice(text, i, i + 1)
+        if c == cr
+            // absorb CR; the following LF (if any) will be kept naturally
+            i = i + 1
+        else
+            out = out + c
+            i = i + 1
+    out
+
+// _wp_split_lines: split normalised text on LF, return list of strings
+// (without the LF character).
+fn _wp_split_lines(text: string) -> list
+    let result = []
+    let n = len(text)
+    let start = 0
+    let lf = _wp_lf()
+    let i = 0
+    while i < n
+        if slice(text, i, i + 1) == lf
+            push(result, slice(text, start, i))
+            start = i + 1
+        i = i + 1
+    if start <= n
+        let tail = slice(text, start, n)
+        push(result, tail)
+    result
+
+// ── Core parse routine ───────────────────────────────────────────────────────
+//
+// _wp_parse_core: parse a WHOIS text into two parallel data structures:
+//   out_dict  — dict: lower-case field name -> last value (for whois_parse)
+//   out_pairs — list of 2-elem lists [[key, value], ...] for whois_all
+//
+// Returns out_pairs; caller also has out_dict mutated in place.
+//
+// Algorithm:
+//   1. Normalise CRLF -> LF.
+//   2. Split into lines.
+//   3. For each line:
+//      a. Skip comment lines (% / #).
+//      b. Continuation line (starts with SP/TAB): fold into last field value.
+//      c. Blank line: reset last-field context (next non-blank is a new field).
+//      d. "Field: value" line: extract key/value, store.
+//      e. Line with no colon: store under key = trimmed line itself (free-text).
+
+fn _wp_parse_core(text: string, out_dict: dict, out_pairs: list) -> int
+    let norm = _wp_normalise(text)
+    let lines = _wp_split_lines(norm)
+    let nlines = len(lines)
+    let last_key = ""
+    let last_val = ""
+    let have_field = 0
+    let i = 0
+    while i < nlines
+        let raw = lines[i]
+        // (a) Skip comment lines
+        if _wp_is_comment(raw) == 1
+            i = i + 1
+        else
+            if _wp_is_blank(raw) == 1
+                // (c) Blank line: flush any pending field and reset context
+                if have_field == 1
+                    let pair = []
+                    push(pair, last_key)
+                    push(pair, last_val)
+                    push(out_pairs, pair)
+                    out_dict[last_key] = last_val
+                    have_field = 0
+                    last_key = ""
+                    last_val = ""
+                i = i + 1
+            else
+                if _wp_is_continuation(raw) == 1
+                    // (b) Continuation: fold into previous value
+                    if have_field == 1
+                        let extra = _wp_trim(raw)
+                        if len(extra) > 0
+                            last_val = last_val + " " + extra
+                    i = i + 1
+                else
+                    // (d)/(e) regular line — flush previous field first
+                    if have_field == 1
+                        let pair2 = []
+                        push(pair2, last_key)
+                        push(pair2, last_val)
+                        push(out_pairs, pair2)
+                        out_dict[last_key] = last_val
+                        have_field = 0
+                        last_key = ""
+                        last_val = ""
+                    // now parse current line
+                    let ci = _wp_index_colon(raw)
+                    if ci < 0
+                        // (e) free-text line — key is the trimmed line, value ""
+                        let fkey = _wp_to_lower(_wp_trim(raw))
+                        if len(fkey) > 0
+                            last_key = fkey
+                            last_val = ""
+                            have_field = 1
+                    else
+                        // (d) "Field: value"
+                        let raw_key = _wp_trim(slice(raw, 0, ci))
+                        let raw_val = _wp_trim(slice(raw, ci + 1, len(raw)))
+                        let key = _wp_to_lower(raw_key)
+                        if len(key) > 0
+                            last_key = key
+                            last_val = raw_val
+                            have_field = 1
+                    i = i + 1
+    // flush last pending field at EOF
+    if have_field == 1
+        let pair3 = []
+        push(pair3, last_key)
+        push(pair3, last_val)
+        push(out_pairs, pair3)
+        out_dict[last_key] = last_val
+    0
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// whois_parse: parse WHOIS text, return dict of field->last_value (keys lowercased).
+fn whois_parse(text: string) -> dict
+    let out_dict = {}
+    let out_pairs = []
+    _wp_parse_core(text, out_dict, out_pairs)
+    out_dict
+
+// whois_field: return the value of a named field (case-insensitive), "" if absent.
+fn whois_field(text: string, name: string) -> string
+    let d = whois_parse(text)
+    let key = _wp_to_lower(_wp_trim(name))
+    if contains(d, key)
+        return str(d[key])
+    ""
+
+// whois_all: return list of ALL values for a repeated field (case-insensitive).
+fn whois_all(text: string, name: string) -> list
+    let out_dict = {}
+    let out_pairs = []
+    _wp_parse_core(text, out_dict, out_pairs)
+    let key = _wp_to_lower(_wp_trim(name))
+    let result = []
+    let i = 0
+    while i < len(out_pairs)
+        let pair = out_pairs[i]
+        if pair[0] == key
+            push(result, str(pair[1]))
+        i = i + 1
+    result
+
+// whois_sections: split WHOIS text into blocks divided by blank lines.
+// Returns a list of strings, each the raw text of one non-blank block.
+// Comment-only blocks are still included; blank lines are NOT included.
+fn whois_sections(text: string) -> list
+    let norm = _wp_normalise(text)
+    let lines = _wp_split_lines(norm)
+    let nlines = len(lines)
+    let sections = []
+    let current = ""
+    let in_section = 0
+    let lf = _wp_lf()
+    let i = 0
+    while i < nlines
+        let raw = lines[i]
+        if _wp_is_blank(raw) == 1
+            // blank line ends current section
+            if in_section == 1
+                push(sections, current)
+                current = ""
+                in_section = 0
+        else
+            // non-blank line — append to current section
+            if in_section == 0
+                current = raw
+                in_section = 1
+            else
+                current = current + lf + raw
+        i = i + 1
+    // flush last section if text does not end with a blank line
+    if in_section == 1
+        push(sections, current)
+    sections

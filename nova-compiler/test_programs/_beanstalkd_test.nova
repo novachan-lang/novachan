@@ -1,0 +1,144 @@
+// ============================================================================
+// KAT — std/net/beanstalkd
+// ============================================================================
+// Known-answer test for the beanstalkd text protocol codec.
+// Verifies:
+//   1. bean_put      — round-trip format + correct CRLF placement
+//   2. bean_reserve  — single command line
+//   3. bean_delete   — command with numeric id
+//   4. bean_use      — command with tube name
+//   5. bean_parse_reply "INSERTED <id>" — single-line with id
+//   6. bean_parse_reply "RESERVED <id> <bytes>" + body — two-line with data
+//   7. bean_parse_reply "NOT_FOUND" — status-only reply
+//   8. bean_parse_reply "DELETED"   — status-only reply
+//   9. bean_parse_reply "USING default" — tube reply
+//  10. bean_parse_reply "BURIED 7"  — buried with id
+//  11. Malformed input safety (empty string)
+// ============================================================================
+
+import std/net/beanstalkd
+
+fn _fail(label: string, got: string, want: string)
+    print("FAIL beanstalkd " + label + ": got=" + got + " want=" + want)
+    exit(1)
+
+fn _fail_int(label: string, got: int, want: int)
+    print("FAIL beanstalkd " + label + ": got=" + str(got) + " want=" + str(want))
+    exit(1)
+
+fn main()
+    let crlf = chr(13) + chr(10)
+
+    // ── 1. bean_put ────────────────────────────────────────────────────────────
+    // bean_put(1, 0, 60, "hello") == "put 1 0 60 5\r\nhello\r\n"
+    let want_put = "put 1 0 60 5" + crlf + "hello" + crlf
+    let got_put = bean_put(1, 0, 60, "hello")
+    if got_put != want_put
+        _fail("bean_put", got_put, want_put)
+
+    // Verify byte count matches data length
+    let want_put2 = "put 0 5 120 3" + crlf + "abc" + crlf
+    let got_put2 = bean_put(0, 5, 120, "abc")
+    if got_put2 != want_put2
+        _fail("bean_put_2", got_put2, want_put2)
+
+    // Empty data body (0 bytes)
+    let want_put3 = "put 10 0 30 0" + crlf + "" + crlf
+    let got_put3 = bean_put(10, 0, 30, "")
+    if got_put3 != want_put3
+        _fail("bean_put_empty", got_put3, want_put3)
+
+    // ── 2. bean_reserve ────────────────────────────────────────────────────────
+    // bean_reserve() == "reserve\r\n"
+    let want_res = "reserve" + crlf
+    let got_res = bean_reserve()
+    if got_res != want_res
+        _fail("bean_reserve", got_res, want_res)
+
+    // ── 3. bean_delete ─────────────────────────────────────────────────────────
+    // bean_delete(42) == "delete 42\r\n"
+    let want_del = "delete 42" + crlf
+    let got_del = bean_delete(42)
+    if got_del != want_del
+        _fail("bean_delete", got_del, want_del)
+
+    // ── 4. bean_use ────────────────────────────────────────────────────────────
+    // bean_use("myqueue") == "use myqueue\r\n"
+    let want_use = "use myqueue" + crlf
+    let got_use = bean_use("myqueue")
+    if got_use != want_use
+        _fail("bean_use", got_use, want_use)
+
+    // ── 5. bean_parse_reply "INSERTED 42\r\n" ──────────────────────────────────
+    let r1 = bean_parse_reply("INSERTED 42" + crlf)
+    if r1["status"] != "INSERTED"
+        _fail("parse_inserted_status", str(r1["status"]), "INSERTED")
+    if r1["id"] != 42
+        _fail_int("parse_inserted_id", r1["id"], 42)
+
+    // ── 6. bean_parse_reply "RESERVED 5 3\r\nabc\r\n" ─────────────────────────
+    let r2 = bean_parse_reply("RESERVED 5 3" + crlf + "abc" + crlf)
+    if r2["status"] != "RESERVED"
+        _fail("parse_reserved_status", str(r2["status"]), "RESERVED")
+    if r2["id"] != 5
+        _fail_int("parse_reserved_id", r2["id"], 5)
+    if r2["bytes"] != 3
+        _fail_int("parse_reserved_bytes", r2["bytes"], 3)
+    if r2["data"] != "abc"
+        _fail("parse_reserved_data", str(r2["data"]), "abc")
+
+    // ── 7. bean_parse_reply "NOT_FOUND\r\n" ────────────────────────────────────
+    let r3 = bean_parse_reply("NOT_FOUND" + crlf)
+    if r3["status"] != "NOT_FOUND"
+        _fail("parse_not_found", str(r3["status"]), "NOT_FOUND")
+    // id and bytes should be 0 (zero) for status-only
+    if r3["id"] != 0
+        _fail_int("parse_not_found_id", r3["id"], 0)
+
+    // ── 8. bean_parse_reply "DELETED\r\n" ──────────────────────────────────────
+    let r4 = bean_parse_reply("DELETED" + crlf)
+    if r4["status"] != "DELETED"
+        _fail("parse_deleted", str(r4["status"]), "DELETED")
+
+    // ── 9. bean_parse_reply "USING default\r\n" ────────────────────────────────
+    let r5 = bean_parse_reply("USING default" + crlf)
+    if r5["status"] != "USING"
+        _fail("parse_using_status", str(r5["status"]), "USING")
+    if not contains(r5, "tube")
+        _fail("parse_using_tube_missing", "no tube key", "default")
+    if r5["tube"] != "default"
+        _fail("parse_using_tube", str(r5["tube"]), "default")
+
+    // ── 10. bean_parse_reply "BURIED 7\r\n" ────────────────────────────────────
+    let r6 = bean_parse_reply("BURIED 7" + crlf)
+    if r6["status"] != "BURIED"
+        _fail("parse_buried_status", str(r6["status"]), "BURIED")
+    if r6["id"] != 7
+        _fail_int("parse_buried_id", r6["id"], 7)
+
+    // ── 11. Malformed / safety ─────────────────────────────────────────────────
+    // Empty string — should return empty-status dict, not crash.
+    let r7 = bean_parse_reply("")
+    if r7["status"] != ""
+        _fail("parse_empty_status", str(r7["status"]), "")
+
+    // Status-only, no CRLF (bare line) — still should parse.
+    let r8 = bean_parse_reply("NOT_FOUND")
+    if r8["status"] != "NOT_FOUND"
+        _fail("parse_no_crlf", str(r8["status"]), "NOT_FOUND")
+
+    // RESERVED with longer body to confirm slice correctness.
+    let r9 = bean_parse_reply("RESERVED 99 5" + crlf + "world" + crlf)
+    if r9["status"] != "RESERVED"
+        _fail("parse_res2_status", str(r9["status"]), "RESERVED")
+    if r9["id"] != 99
+        _fail_int("parse_res2_id", r9["id"], 99)
+    if r9["data"] != "world"
+        _fail("parse_res2_data", str(r9["data"]), "world")
+
+    // TIMED_OUT — status-only, common reply
+    let r10 = bean_parse_reply("TIMED_OUT" + crlf)
+    if r10["status"] != "TIMED_OUT"
+        _fail("parse_timed_out", str(r10["status"]), "TIMED_OUT")
+
+    print("PASS _beanstalkd_test")
