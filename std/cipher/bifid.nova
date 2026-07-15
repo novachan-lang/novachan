@@ -1,0 +1,264 @@
+// ============================================================================
+// NOVA Standard Library — std/cipher/bifid
+// ============================================================================
+// Bifid cipher: a Polybius-fractionation transposition cipher invented by
+// Félix Delastelle (1901).  It combines a 5×5 Polybius square substitution
+// with a row/column "fractionation" step that mixes positional information.
+//
+// ALGORITHM OVERVIEW (per-chunk of length n):
+//   1. Normalise: uppercase, drop non-letters, J→I.
+//   2. For each plaintext letter, record its (row, col) in the 5×5 square.
+//   3. Write all rows followed by all cols: combined = [r0,r1,...,c0,c1,...]
+//   4. Read the combined sequence as CONSECUTIVE PAIRS: (combined[0], combined[1]),
+//      (combined[2], combined[3]), ...
+//   5. Each pair is a new (row, col) → look up the ciphertext letter in the square.
+//   Decrypt reverses step 4/5: each ct letter gives (r, c); lay out interleaved as
+//   [r0,c0, r1,c1, ...], then split into first-half (pt_rows) / second-half (pt_cols)
+//   and look up pt[j] = sq[pt_rows[j], pt_cols[j]].
+//
+// I/J HANDLING:
+//   The 5×5 square has 25 cells.  Standard practice merges I and J: J in
+//   plaintext/ciphertext input is treated as I before processing.
+//   Encryption output never contains J.
+//
+// INPUT NORMALISATION:
+//   All inputs are uppercased, non-letter characters are silently dropped,
+//   and J is mapped to I before processing.
+//
+// PERIOD:
+//   bifid_encrypt / bifid_decrypt use period = full message length (the entire
+//   message is fractionated as one block).
+//   bifid_encrypt_period / bifid_decrypt_period split the message into chunks
+//   of at most `period` characters, each fractionated independently.
+//   Period <= 0 is treated as full-message fractionation.
+//
+// KEY SQUARE CONSTRUCTION:
+//   1. Uppercase the key, drop non-letters, replace J→I, deduplicate (keep
+//      first occurrence of each letter).
+//   2. Append A-Z (skipping J and letters already seen) until 25 letters placed.
+//   Empty key "" → standard ABCDEFGHIKLMNOPQRSTUVWXYZ square.
+//
+// PUBLIC API:
+//   bifid_encrypt(pt, key) -> string
+//   bifid_decrypt(ct, key) -> string
+//   bifid_encrypt_period(pt, key, period) -> string
+//   bifid_decrypt_period(ct, key, period) -> string
+//
+// KNOWN TEST VECTOR:
+//   key = "BGWKZQPNDSIOAXEFCLUMTHYVR" (Wikipedia Bifid cipher article)
+//   bifid_encrypt("FLEEATONCE", key) == "UAEOLWRINS"
+//   bifid_decrypt("UAEOLWRINS", key) == "FLEEATONCE"
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private: square helpers ───────────────────────────────────────────────────
+
+// Build the 25-letter Polybius square from a key string.
+// Returns a list of 25 single-character strings (uppercase, no J).
+fn _bfd_build_square(key) -> list
+    let seen = {}
+    let sq = []
+    let ki = 0
+    let kn = len(key)
+    while ki < kn
+        let b = ord(key[ki])
+        if b >= 97 and b <= 122
+            b = b - 32
+        if b >= 65 and b <= 90
+            if b == 74
+                b = 73
+            let s = chr(b)
+            if not contains(seen, s)
+                seen[s] = 1
+                push(sq, s)
+        ki = ki + 1
+    // Fill remaining with A-Z (skip J=74)
+    let fill = 65
+    while fill <= 90
+        if fill != 74
+            let s = chr(fill)
+            if not contains(seen, s)
+                seen[s] = 1
+                push(sq, s)
+        fill = fill + 1
+    sq
+
+// Build a reverse lookup dict: letter -> 0-based index in the square.
+fn _bfd_build_index(sq) -> dict
+    let idx = {}
+    let i = 0
+    while i < 25
+        idx[sq[i]] = i
+        i = i + 1
+    idx
+
+// Normalise: uppercase, drop non-letters, J→I.
+fn _bfd_normalise(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(s[i])
+        if b >= 97 and b <= 122
+            b = b - 32
+        if b >= 65 and b <= 90
+            if b == 74
+                b = 73
+            out = out + chr(b)
+        i = i + 1
+    out
+
+// Encrypt one chunk (already normalised, no J).
+// Correct Bifid algorithm:
+//   combined = [r0, r1, ..., r_{n-1},  c0, c1, ..., c_{n-1}]
+//   ct[j] = sq[ combined[2j] * 5 + combined[2j+1] ]
+fn _bfd_enc_chunk(chunk, sq, idx) -> string
+    let n = len(chunk)
+    if n == 0
+        return ""
+    // Build rows list then cols list
+    let rows = []
+    let cols = []
+    let i = 0
+    while i < n
+        let pos = idx[chunk[i]]
+        push(rows, pos / 5)
+        push(cols, pos - (pos / 5) * 5)
+        i = i + 1
+    // Concatenate into combined = rows ++ cols
+    // Then read consecutive pairs to produce ciphertext
+    // combined has length 2n; ct[j] = sq[ combined[2j]*5 + combined[2j+1] ]
+    // combined[2j]   = rows[j]   for j < n/2... wait: combined is rows then cols,
+    // so combined[k] = rows[k] for k in [0,n) and combined[k] = cols[k-n] for k in [n,2n).
+    // Pairs: (combined[0], combined[1]) = (rows[0], rows[1])
+    //        (combined[2], combined[3]) = (rows[2], rows[3]) ...
+    //        (combined[n], combined[n+1]) = (cols[0], cols[1]) ...  if n is even
+    // But for n=10 (FLEEATONCE):
+    //   combined = [r0..r9, c0..c9] length 20
+    //   pairs: (r0,r1),(r2,r3),(r4,r5),(r6,r7),(r8,r9),(c0,c1),(c2,c3),(c4,c5),(c6,c7),(c8,c9)
+    //   = 10 pairs -> 10 output chars
+    let out = ""
+    // Build the combined as a list for indexing
+    let comb = []
+    i = 0
+    while i < n
+        push(comb, rows[i])
+        i = i + 1
+    i = 0
+    while i < n
+        push(comb, cols[i])
+        i = i + 1
+    // Read consecutive pairs
+    let j = 0
+    let tn = n + n
+    while j < tn
+        let r2 = comb[j]
+        let c2 = comb[j + 1]
+        out = out + sq[r2 * 5 + c2]
+        j = j + 2
+    out
+
+// Decrypt one chunk (already normalised, no J).
+// Reverse of encrypt:
+//   For each ct letter, get its (row, col) in the square.
+//   These are laid out interleaved as: [r0,c0, r1,c1, r2,c2, ...]  (2n values)
+//   Split first n values as pt_rows, second n values as pt_cols.
+//   pt[j] = sq[ pt_rows[j]*5 + pt_cols[j] ]
+fn _bfd_dec_chunk(chunk, sq, idx) -> string
+    let n = len(chunk)
+    if n == 0
+        return ""
+    // Build interleaved: dec_combined[2j]=row_of_ct[j], dec_combined[2j+1]=col_of_ct[j]
+    let dec_comb = []
+    let i = 0
+    while i < n
+        let pos = idx[chunk[i]]
+        push(dec_comb, pos / 5)
+        push(dec_comb, pos - (pos / 5) * 5)
+        i = i + 1
+    // Split: pt_rows = dec_comb[0..n-1], pt_cols = dec_comb[n..2n-1]
+    let out = ""
+    let j = 0
+    while j < n
+        let r2 = dec_comb[j]
+        let c2 = dec_comb[j + n]
+        out = out + sq[r2 * 5 + c2]
+        j = j + 1
+    out
+
+// Process normalised string in chunks of `period` (psize<=0 = full message).
+fn _bfd_process_periods(norm, sq, idx, psize, encrypt) -> string
+    let n = len(norm)
+    if n == 0
+        return ""
+    let out = ""
+    let start = 0
+    let chunk_size = psize
+    if chunk_size <= 0
+        chunk_size = n
+    while start < n
+        let end = start + chunk_size
+        if end > n
+            end = n
+        let chunk = slice(norm, start, end)
+        if encrypt == 1
+            out = out + _bfd_enc_chunk(chunk, sq, idx)
+        if encrypt == 0
+            out = out + _bfd_dec_chunk(chunk, sq, idx)
+        start = end
+    out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// bifid_encrypt: encrypt plaintext using the Bifid cipher (full-message period).
+//
+// Input is normalised: uppercased, non-letters dropped, J treated as I.
+// The key builds a 5×5 Polybius square (see header for construction rules).
+//
+// Examples:
+//   bifid_encrypt("FLEEATONCE", "BGWKZQPNDSIOAXEFCLUMTHYVR") == "UAEOLWRINS"
+//   bifid_encrypt("", "KEY") == ""
+fn bifid_encrypt(pt, key) -> string
+    let sq = _bfd_build_square(key)
+    let idx = _bfd_build_index(sq)
+    let norm = _bfd_normalise(pt)
+    _bfd_process_periods(norm, sq, idx, 0, 1)
+
+// bifid_decrypt: decrypt ciphertext using the Bifid cipher (full-message period).
+//
+// Inverse of bifid_encrypt:
+//   bifid_decrypt(bifid_encrypt(pt, key), key) == _bfd_normalise(pt)
+//
+// Examples:
+//   bifid_decrypt("UAEOLWRINS", "BGWKZQPNDSIOAXEFCLUMTHYVR") == "FLEEATONCE"
+fn bifid_decrypt(ct, key) -> string
+    let sq = _bfd_build_square(key)
+    let idx = _bfd_build_index(sq)
+    let norm = _bfd_normalise(ct)
+    _bfd_process_periods(norm, sq, idx, 0, 0)
+
+// bifid_encrypt_period: encrypt with a fixed fractionation period.
+//
+// The message is split into blocks of `period` letters; each block is
+// independently fractionated.  Period <= 0 falls back to full-message mode.
+//
+// Examples:
+//   bifid_encrypt_period("FLEEATONCE", "BGWKZQPNDSIOAXEFCLUMTHYVR", 5)
+fn bifid_encrypt_period(pt, key, period) -> string
+    let sq = _bfd_build_square(key)
+    let idx = _bfd_build_index(sq)
+    let norm = _bfd_normalise(pt)
+    _bfd_process_periods(norm, sq, idx, period, 1)
+
+// bifid_decrypt_period: decrypt with the same fixed fractionation period.
+//
+// Must use the SAME period as encryption or the output will be garbage.
+//
+// Examples:
+//   bifid_decrypt_period(bifid_encrypt_period(pt, key, 5), key, 5) == normalise(pt)
+fn bifid_decrypt_period(ct, key, period) -> string
+    let sq = _bfd_build_square(key)
+    let idx = _bfd_build_index(sq)
+    let norm = _bfd_normalise(ct)
+    _bfd_process_periods(norm, sq, idx, period, 0)

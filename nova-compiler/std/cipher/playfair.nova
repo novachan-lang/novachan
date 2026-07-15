@@ -1,0 +1,306 @@
+// ============================================================================
+// NOVA Standard Library — std/cipher/playfair
+// ============================================================================
+// Playfair digraph cipher.
+//
+// Builds a 5×5 key square from a keyword (I and J are merged → treated as I).
+// Plaintext is normalised (uppercase, non-letters removed, J→I), split into
+// digraphs, with 'X' inserted between doubled letters in a pair and appended
+// if the final group has only one letter.  Each digraph is then encrypted by
+// one of three rectangle rules.
+//
+// I/J handling: J is always converted to I both in the key and the plaintext
+// before any processing.  The square therefore contains 25 distinct letters
+// (A-Z minus J).  When decrypting, no reverse conversion is applied — the
+// caller receives I where I/J appeared in the original, which is the standard
+// Playfair convention.
+//
+// PUBLIC API (prefix pf_):
+//   playfair_square(key: string) -> list
+//     Build and return the 25-character key square as a flat list of strings,
+//     row-major (index = row*5 + col).
+//
+//   playfair_encrypt(pt: string, key: string) -> string
+//     Encrypt plaintext `pt` with the Playfair cipher keyed by `key`.
+//     Output is uppercase letters only.
+//
+//   playfair_decrypt(ct: string, key: string) -> string
+//     Decrypt ciphertext `ct` with the Playfair cipher keyed by `key`.
+//     Output is uppercase letters only.
+//
+// KAT (published vector):
+//   playfair_encrypt("HIDETHEGOLDINTHETREESTUMP", "PLAYFAIREXAMPLE")
+//     == "BMODZBXDNABEKUDMUIXMMOUVIF"
+//
+// ROUND-TRIP:
+//   For a plaintext with no consecutive doubled letters and even length,
+//   playfair_decrypt(playfair_encrypt(pt, key), key) == pt
+//   (No X was inserted so no ambiguity arises.)
+//
+// ALGORITHM COMPLEXITY: O(n) encrypt/decrypt; O(1) square construction (always 25).
+//
+// IMPLEMENTATION NOTES:
+//   - Pure NOVA, no imports.
+//   - All string indexing via slice(s,i,i+1).
+//   - Modular arithmetic uses (x % 5 + 5) % 5 to stay non-negative.
+//   - Private helpers are prefixed _pf_ to avoid symbol collisions.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _pf_norm_char: return the canonical uppercase form of a single character
+// (as a 1-char string), or "" if it is not a letter.
+// J is converted to I (I/J merge for the 5x5 square).
+fn _pf_norm_char(c) -> string
+    let b = ord(c)
+    // Convert lowercase to uppercase
+    if b >= 97 and b <= 122
+        b = b - 32
+    // Drop non-letters
+    if b < 65
+        return ""
+    if b > 90
+        return ""
+    // Merge J -> I
+    if b == 74
+        return "I"
+    chr(b)
+
+// _pf_norm_string: uppercase, strip non-letters, convert J->I.
+fn _pf_norm_string(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let nc = _pf_norm_char(slice(s, i, i+1))
+        if nc != ""
+            out = out + nc
+        i = i + 1
+    out
+
+// _pf_build_square_list: build the 25-char key square as a list.
+// Unique letters from the normalised key, then remaining A-Z \ {J}.
+fn _pf_build_square_list(key) -> list
+    // Track which letters (A-Z except J) have been added.
+    // Use a dict: str(ord) -> 1 if used.
+    let used = {}
+    let sq = []
+    // First pass: key letters
+    let nk = _pf_norm_string(key)
+    let ki = 0
+    let klen = len(nk)
+    while ki < klen
+        let ch = slice(nk, ki, ki+1)
+        let code = str(ord(ch))
+        if contains(used, code) == 0
+            used[code] = 1
+            let dummy = push(sq, ch)
+        ki = ki + 1
+    // Second pass: remaining alphabet A-Z minus J(74)
+    let ai = 0
+    while ai < 26
+        let code = 65 + ai
+        // Skip J (74)
+        if code != 74
+            let cstr = str(code)
+            if contains(used, cstr) == 0
+                used[cstr] = 1
+                let dummy2 = push(sq, chr(code))
+        ai = ai + 1
+    sq
+
+// _pf_find_pos: find row and col of letter `ch` in the square.
+// Returns a 2-element list [row, col].
+// Assumes ch is already normalised (uppercase, J->I).
+fn _pf_find_pos(sq, ch) -> list
+    let row = 0
+    let col = 0
+    let i = 0
+    while i < 25
+        if sq[i] == ch
+            row = i / 5
+            col = i - row * 5
+        i = i + 1
+    let result = []
+    let d1 = push(result, row)
+    let d2 = push(result, col)
+    result
+
+// _pf_prepare_digraphs: split normalised plaintext into digraphs,
+// inserting X between doubled letters and padding a lone trailing letter.
+// Returns a list of 2-char strings (each digraph).
+fn _pf_prepare_digraphs(norm_pt) -> list
+    let pairs = []
+    let i = 0
+    let n = len(norm_pt)
+    while i < n
+        let a = slice(norm_pt, i, i+1)
+        // Check if there is a second letter
+        if i + 1 >= n
+            // Trailing single: pad with X
+            let dummy = push(pairs, a + "X")
+            i = i + 1
+        else
+            let b = slice(norm_pt, i+1, i+2)
+            if a == b
+                // Doubled: insert X filler after a
+                let dummy2 = push(pairs, a + "X")
+                i = i + 1
+            else
+                let dummy3 = push(pairs, a + b)
+                i = i + 2
+    pairs
+
+// _pf_enc_digraph: encrypt one digraph [a, b] using the key square.
+// Returns the 2-char encrypted digraph string.
+fn _pf_enc_digraph(sq, a, b) -> string
+    let pa = _pf_find_pos(sq, a)
+    let pb = _pf_find_pos(sq, b)
+    let ra = pa[0]
+    let ca = pa[1]
+    let rb = pb[0]
+    let cb = pb[1]
+    let out_a = ""
+    let out_b = ""
+    if ra == rb
+        // Same row: shift right (wrap mod 5)
+        let new_ca = (ca + 1) - ((ca + 1) / 5) * 5
+        let new_cb = (cb + 1) - ((cb + 1) / 5) * 5
+        out_a = sq[ra * 5 + new_ca]
+        out_b = sq[rb * 5 + new_cb]
+    else
+        if ca == cb
+            // Same column: shift down (wrap mod 5)
+            let new_ra = (ra + 1) - ((ra + 1) / 5) * 5
+            let new_rb = (rb + 1) - ((rb + 1) / 5) * 5
+            out_a = sq[new_ra * 5 + ca]
+            out_b = sq[new_rb * 5 + cb]
+        else
+            // Rectangle: swap columns
+            out_a = sq[ra * 5 + cb]
+            out_b = sq[rb * 5 + ca]
+    out_a + out_b
+
+// _pf_dec_digraph: decrypt one digraph [a, b] using the key square.
+// Same row: shift LEFT; same col: shift UP; rectangle: swap columns.
+fn _pf_dec_digraph(sq, a, b) -> string
+    let pa = _pf_find_pos(sq, a)
+    let pb = _pf_find_pos(sq, b)
+    let ra = pa[0]
+    let ca = pa[1]
+    let rb = pb[0]
+    let cb = pb[1]
+    let out_a = ""
+    let out_b = ""
+    if ra == rb
+        // Same row: shift left (wrap mod 5)
+        let new_ca = (ca - 1 + 5) - ((ca - 1 + 5) / 5) * 5
+        let new_cb = (cb - 1 + 5) - ((cb - 1 + 5) / 5) * 5
+        out_a = sq[ra * 5 + new_ca]
+        out_b = sq[rb * 5 + new_cb]
+    else
+        if ca == cb
+            // Same column: shift up (wrap mod 5)
+            let new_ra = (ra - 1 + 5) - ((ra - 1 + 5) / 5) * 5
+            let new_rb = (rb - 1 + 5) - ((rb - 1 + 5) / 5) * 5
+            out_a = sq[new_ra * 5 + ca]
+            out_b = sq[new_rb * 5 + cb]
+        else
+            // Rectangle: swap columns
+            out_a = sq[ra * 5 + cb]
+            out_b = sq[rb * 5 + ca]
+    out_a + out_b
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// playfair_square: build and return the 25-character key square as a flat list.
+//
+// The square is a 5×5 grid of the 25-letter alphabet (I/J merged) arranged by:
+//   1. Unique letters from `key` (normalised: uppercase, J->I, non-letters removed).
+//   2. Remaining A-Z letters (excluding J) in alphabetical order.
+//
+// The list is row-major: index = row*5 + col.
+//
+// Example:
+//   playfair_square("PLAYFAIREXAMPLE") ->
+//     ["P","L","A","Y","F","I","R","E","X","M","B","C","D","G","H",
+//      "K","N","O","Q","S","T","U","V","W","Z"]
+fn playfair_square(key) -> list
+    _pf_build_square_list(key)
+
+// playfair_encrypt: encrypt plaintext `pt` with Playfair cipher keyed by `key`.
+//
+// Processing steps:
+//   1. Normalise pt: uppercase, strip non-letters, convert J->I.
+//   2. Split into digraphs, inserting X between doubled pairs and at trailing odd letter.
+//   3. For each digraph apply the rectangle rule.
+//
+// Returns uppercase letters only (no spaces or punctuation).
+//
+// Edge cases:
+//   - Empty pt: returns "".
+//   - Single letter: padded with X, encrypted as a digraph.
+//
+// Example:
+//   playfair_encrypt("HIDETHEGOLDINTHETREESTUMP", "PLAYFAIREXAMPLE")
+//     == "BMODZBXDNABEKUDMUIXMMOUVIF"
+fn playfair_encrypt(pt, key) -> string
+    if len(pt) == 0
+        return ""
+    let sq = _pf_build_square_list(key)
+    let norm = _pf_norm_string(pt)
+    if len(norm) == 0
+        return ""
+    let pairs = _pf_prepare_digraphs(norm)
+    let out = ""
+    let i = 0
+    let np = len(pairs)
+    while i < np
+        let pair = pairs[i]
+        let a = slice(pair, 0, 1)
+        let b = slice(pair, 1, 2)
+        out = out + _pf_enc_digraph(sq, a, b)
+        i = i + 1
+    out
+
+// playfair_decrypt: decrypt ciphertext `ct` with Playfair cipher keyed by `key`.
+//
+// The ciphertext must consist of uppercase letters only (as produced by
+// playfair_encrypt). Each pair of letters is decrypted using the inverse rules:
+//   - Same row: shift left (wrap).
+//   - Same column: shift up (wrap).
+//   - Rectangle: swap columns.
+//
+// Note: X-padding inserted during encryption is NOT automatically stripped
+// because it would be ambiguous (X could be a legitimate plaintext letter).
+// The caller must strip trailing/internal X fillers if needed.
+//
+// Round-trip guarantee: for a plaintext with no consecutive identical letters
+// and even normalised length, playfair_decrypt(playfair_encrypt(pt,key),key) == pt.
+//
+// Example:
+//   playfair_decrypt("BMODZBXDNABEKUDMUIXMMOUVIF", "PLAYFAIREXAMPLE")
+//     == "HIDETHEGOLDINTHETREXESTUMP"  (X padding visible)
+fn playfair_decrypt(ct, key) -> string
+    if len(ct) == 0
+        return ""
+    let sq = _pf_build_square_list(key)
+    // Normalise ciphertext: uppercase, non-letters stripped, J->I
+    let norm = _pf_norm_string(ct)
+    if len(norm) == 0
+        return ""
+    let out = ""
+    let i = 0
+    let n = len(norm)
+    while i + 1 < n
+        let a = slice(norm, i, i+1)
+        let b = slice(norm, i+1, i+2)
+        out = out + _pf_dec_digraph(sq, a, b)
+        i = i + 2
+    // If odd length (malformed ciphertext), decrypt last char paired with X
+    if i < n
+        let a = slice(norm, i, i+1)
+        out = out + _pf_dec_digraph(sq, a, "X")
+    out

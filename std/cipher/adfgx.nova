@@ -1,0 +1,363 @@
+// ============================================================================
+// NOVA Standard Library — std/cipher/adfgx
+// ============================================================================
+// ADFGX cipher — a field cipher used by the German Army in WWI (1918).
+// It combines a 5×5 Polybius square substitution (fractionation) with a
+// columnar transposition, producing ciphertext that uses only the letters
+// A, D, F, G, X (chosen because they are distinct in Morse code).
+//
+// ALGORITHM:
+//   ENCRYPT:
+//     1. Build a 5×5 Polybius square keyed by key1 (J→I, 25 letters).
+//        Rows and columns are labelled with the sequence A,D,F,G,X.
+//     2. Normalise plaintext: uppercase, drop non-letters, J→I.
+//     3. Fractionation: each plaintext letter → its (row,col) in the square,
+//        then emit row_label + col_label (2 chars from {A,D,F,G,X}).
+//     4. Columnar transposition: write the fractionated string row-by-row
+//        under key2; read columns in alphabetical rank order (ties by
+//        position). No padding — last row may be shorter than the others.
+//
+//   DECRYPT:
+//     1. Build the same square and column order.
+//     2. Undo columnar transposition: reconstruct the fractionated string.
+//     3. Undo fractionation: each 2-char pair → Polybius square lookup → letter.
+//
+// I/J HANDLING:
+//   J is mapped to I in both the square construction and plaintext normalisation.
+//   Encrypt output never contains J.  On decrypt J in ciphertext is treated as I
+//   during fractionation (also not expected in valid ADFGX ciphertext).
+//
+// KEY1 SQUARE CONSTRUCTION:
+//   Uppercase key1, drop non-letters, replace J→I, deduplicate (keep first
+//   occurrence of each letter), then append A–Z (skipping J and already-seen
+//   letters) until 25 letters fill the 5×5 grid.
+//   Empty key1 → standard ABCDEFGHIKLMNOPQRSTUVWXYZ square.
+//
+// KEY2 COLUMNAR TRANSPOSITION:
+//   Column ranks follow the same rule as std/cipher/columnar: rank of position i
+//   = count of positions j where key2[j] < key2[i], plus count of j < i where
+//   key2[j] == key2[i] (stable alphabetical ordering, ties broken by position).
+//   No padding character is added to the grid — the transposition is exact-length.
+//
+// PUBLIC API:
+//   adfgx_square(key1)                      -> list  (25 strings, the square)
+//   adfgx_encrypt(pt, key1, key2)           -> string
+//   adfgx_decrypt(ct, key1, key2)           -> string
+//
+// ROUND-TRIP GUARANTEE:
+//   adfgx_decrypt(adfgx_encrypt(pt, key1, key2), key1, key2)
+//       == adfgx_normalise(pt)
+//   where adfgx_normalise uppercases, drops non-letters, and maps J→I.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// ADFGX row/column label sequence (indices 0..4 → A,D,F,G,X).
+fn _ax_label(i) -> string
+    if i == 0
+        return "A"
+    if i == 1
+        return "D"
+    if i == 2
+        return "F"
+    if i == 3
+        return "G"
+    return "X"
+
+// Reverse: given a label character, return its index 0..4, or -1 if invalid.
+fn _ax_label_idx(ch) -> int
+    if ch == "A"
+        return 0
+    if ch == "D"
+        return 1
+    if ch == "F"
+        return 2
+    if ch == "G"
+        return 3
+    if ch == "X"
+        return 4
+    return -1
+
+// Build the 25-letter Polybius square from key1.
+// Returns a flat list of 25 single-character strings (row-major, no J).
+fn _ax_build_square(key1) -> list
+    let seen = {}
+    let sq = []
+    let ki = 0
+    let kn = len(key1)
+    while ki < kn
+        let b = ord(key1[ki])
+        if b >= 97
+            if b <= 122
+                b = b - 32
+        if b >= 65
+            if b <= 90
+                if b == 74
+                    b = 73
+                let s = chr(b)
+                if not contains(seen, s)
+                    seen[s] = 1
+                    push(sq, s)
+        ki = ki + 1
+    // Fill remaining with A-Z, skip J=74
+    let fill = 65
+    while fill <= 90
+        if fill != 74
+            let s = chr(fill)
+            if not contains(seen, s)
+                seen[s] = 1
+                push(sq, s)
+        fill = fill + 1
+    sq
+
+// Build reverse lookup dict: letter -> 0-based flat index in the square.
+fn _ax_build_index(sq) -> dict
+    let idx = {}
+    let i = 0
+    while i < 25
+        idx[sq[i]] = i
+        i = i + 1
+    idx
+
+// Normalise plaintext: uppercase, drop non-letters, J→I.
+fn _ax_normalise(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(s[i])
+        if b >= 97
+            if b <= 122
+                b = b - 32
+        if b >= 65
+            if b <= 90
+                if b == 74
+                    b = 73
+                out = out + chr(b)
+        i = i + 1
+    out
+
+// Compute column ranks for key2 (stable alpha order, ties broken by position).
+// rank[i] = number of positions j where key2[j] < key2[i]
+//           + number of positions j < i where key2[j] == key2[i]
+fn _ax_col_order(kw) -> list
+    let ncols = len(kw)
+    let ranks = []
+    let i = 0
+    while i < ncols
+        let ci = ord(slice(kw, i, i + 1))
+        let rank = 0
+        let j = 0
+        while j < ncols
+            let cj = ord(slice(kw, j, j + 1))
+            if cj < ci
+                rank = rank + 1
+            else
+                if cj == ci
+                    if j < i
+                        rank = rank + 1
+            j = j + 1
+        push(ranks, rank)
+        i = i + 1
+    ranks
+
+// Invert rank array: read_col[rank] = original column index.
+fn _ax_invert_ranks(ranks, ncols) -> list
+    let read_col = []
+    let tmp = 0
+    while tmp < ncols
+        push(read_col, 0)
+        tmp = tmp + 1
+    let ci = 0
+    while ci < ncols
+        let rk = ranks[ci]
+        read_col[rk] = ci
+        ci = ci + 1
+    read_col
+
+// Columnar transposition ENCRYPT of string frac using key2 (no padding).
+// Writes frac row-by-row under the keyword grid, reads columns in rank order.
+fn _ax_col_enc(frac, kw) -> string
+    let ncols = len(kw)
+    if ncols == 0
+        return frac
+    let flen = len(frac)
+    if flen == 0
+        return ""
+    let nrows = (flen + ncols - 1) / ncols
+    let ranks = _ax_col_order(kw)
+    let read_col = _ax_invert_ranks(ranks, ncols)
+    // Read columns in rank order 0..ncols-1
+    let out = ""
+    let rk = 0
+    while rk < ncols
+        let col = read_col[rk]
+        let row = 0
+        while row < nrows
+            let pos = row * ncols + col
+            if pos < flen
+                out = out + slice(frac, pos, pos + 1)
+            row = row + 1
+        rk = rk + 1
+    out
+
+// Columnar transposition DECRYPT: undo the transposition to recover frac string.
+// The fractionated length flen is known (len(ct) must equal len(fractionated)).
+//
+// Column length rule (no padding): in the grid with nrows rows and ncols cols,
+// the last row is only partially filled.  Column at original index `col` is
+// "long" (nrows rows) when col < extra, and "short" (nrows-1 rows) otherwise.
+// extra = flen % ncols; when extra==0 every column has exactly nrows rows.
+fn _ax_col_dec(ct, kw) -> string
+    let ncols = len(kw)
+    if ncols == 0
+        return ct
+    let flen = len(ct)
+    if flen == 0
+        return ""
+    let nrows = (flen + ncols - 1) / ncols
+    // extra = how many columns (by original column index) carry a full nrows rows.
+    // Columns 0..extra-1 are long (nrows rows); columns extra..ncols-1 are short
+    // (nrows-1 rows).  When flen is exactly divisible, extra=0 means all are full.
+    let extra = flen - (nrows - 1) * ncols
+    if extra == ncols
+        extra = 0
+    let ranks = _ax_col_order(kw)
+    let read_col = _ax_invert_ranks(ranks, ncols)
+    // Allocate flat grid (nrows * ncols) filled with empty strings
+    let grid = []
+    let gi = 0
+    while gi < nrows * ncols
+        push(grid, "")
+        gi = gi + 1
+    // Fill each column from ct in rank order.
+    // Column length depends on ORIGINAL column index, not rank.
+    let pos = 0
+    let rk = 0
+    while rk < ncols
+        let col = read_col[rk]
+        // Determine length: col < extra => nrows; otherwise nrows-1 (when extra>0)
+        let col_len = nrows
+        if extra > 0
+            if col >= extra
+                col_len = nrows - 1
+        let row = 0
+        while row < col_len
+            grid[row * ncols + col] = slice(ct, pos, pos + 1)
+            pos = pos + 1
+            row = row + 1
+        rk = rk + 1
+    // Read grid row by row (skip empty cells in the partial last row)
+    let out = ""
+    let r = 0
+    while r < nrows
+        let c = 0
+        while c < ncols
+            let cell = grid[r * ncols + c]
+            if cell != ""
+                out = out + cell
+            c = c + 1
+        r = r + 1
+    out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// adfgx_square(key1) -> list of 25 single-char strings (the Polybius square).
+// Row-major order: square[r*5+c] = the letter at row r, column c.
+// Row and column labels are A,D,F,G,X (index 0..4 respectively).
+// J is mapped to I; no J appears in the output.
+//
+// Examples:
+//   adfgx_square("") -> ["A","B","C","D","E","F","G","H","I","K",
+//                         "L","M","N","O","P","Q","R","S","T","U",
+//                         "V","W","X","Y","Z"]
+fn adfgx_square(key1) -> list
+    _ax_build_square(key1)
+
+// adfgx_encrypt(pt, key1, key2) -> ciphertext using only letters A,D,F,G,X.
+//
+// Step 1 — Fractionation: each plaintext letter is replaced by the 2-char pair
+//   (row_label, col_label) from the Polybius square keyed by key1.
+// Step 2 — Columnar transposition of the fractionated string using key2.
+//
+// Input normalisation: uppercase, drop non-letters, J→I.
+// Empty plaintext or single-letter keys are handled gracefully.
+//
+// Examples:
+//   adfgx_encrypt("ATTACK", "PHQGMEAYLNOFDXKRCVSZWBUTI", "PRIVACY")
+//   adfgx_decrypt(adfgx_encrypt(pt, key1, key2), key1, key2) == normalise(pt)
+fn adfgx_encrypt(pt, key1, key2) -> string
+    let sq = _ax_build_square(key1)
+    let idx = _ax_build_index(sq)
+    let norm = _ax_normalise(pt)
+    let nlen = len(norm)
+    if nlen == 0
+        return ""
+    // Step 1: fractionation
+    let frac = ""
+    let i = 0
+    while i < nlen
+        let ch = norm[i]
+        let pos = idx[ch]
+        let row = pos / 5
+        let col = pos - row * 5
+        frac = frac + _ax_label(row) + _ax_label(col)
+        i = i + 1
+    // Step 2: columnar transposition
+    let kw = _ax_normalise(key2)
+    if len(kw) == 0
+        return frac
+    _ax_col_enc(frac, kw)
+
+// adfgx_decrypt(ct, key1, key2) -> plaintext string (uppercase, no J).
+//
+// Reverses adfgx_encrypt:
+//   Step 1 — Undo columnar transposition using key2 to recover fractionated string.
+//   Step 2 — Undo fractionation: each 2-char pair → Polybius square lookup.
+//
+// Ciphertext must contain only A,D,F,G,X (other characters are dropped during
+// normalisation before transposition; invalid ADFGX chars in the fractionated
+// stream cause that pair to be skipped).
+// The ciphertext length must be even for correct recovery.
+//
+// Examples:
+//   adfgx_decrypt(adfgx_encrypt(pt, key1, key2), key1, key2) == normalise(pt)
+fn adfgx_decrypt(ct, key1, key2) -> string
+    let sq = _ax_build_square(key1)
+    let idx = _ax_build_index(sq)
+    // Filter ct to ADFGX letters only (normalise first to uppercase)
+    let uc = _ax_normalise(ct)
+    let uclen = len(uc)
+    let ct_clean = ""
+    let ci = 0
+    while ci < uclen
+        let ch = uc[ci]
+        let li = _ax_label_idx(ch)
+        if li >= 0
+            ct_clean = ct_clean + ch
+        ci = ci + 1
+    if len(ct_clean) == 0
+        return ""
+    // Step 1: undo columnar transposition
+    let kw = _ax_normalise(key2)
+    let frac = ""
+    if len(kw) == 0
+        frac = ct_clean
+    else
+        frac = _ax_col_dec(ct_clean, kw)
+    // Step 2: undo fractionation — consume 2 chars at a time
+    let out = ""
+    let flen = len(frac)
+    let fi = 0
+    while fi + 1 < flen
+        let r_ch = frac[fi]
+        let c_ch = frac[fi + 1]
+        let ri = _ax_label_idx(r_ch)
+        let cli = _ax_label_idx(c_ch)
+        if ri >= 0
+            if cli >= 0
+                out = out + sq[ri * 5 + cli]
+        fi = fi + 2
+    out

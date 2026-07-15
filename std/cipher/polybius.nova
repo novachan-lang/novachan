@@ -1,0 +1,234 @@
+// ============================================================================
+// NOVA Standard Library — std/cipher/polybius
+// ============================================================================
+// Polybius square cipher.
+//
+// The Polybius square maps each letter to a pair of digits (row, col), each
+// in the range 1..5, encoding a 5×5 grid that fits the 25-letter alphabet
+// (26 letters with I and J merged into I).
+//
+// ALGORITHM:
+//   Encrypt: each letter -> two-digit coordinate string "RC" (row then col,
+//            each 1-based, so A->(1,1)->"11", Z->(5,5)->"55").
+//   Decrypt: consume digit pairs, map each pair (R,C) back to the square letter.
+//
+// I/J HANDLING:
+//   The 5×5 square holds 25 entries.  J is merged with I (both map to the I
+//   position).  Encryption output never contains J.  When decrypting, the
+//   output always uses I where I or J appeared in the original plaintext.
+//   Callers who need to distinguish I from J must apply context heuristics
+//   outside this module — this is standard Polybius convention.
+//
+// SQUARE LAYOUT (plain key "" → A-Z in order, J omitted):
+//   Positions are row-major, 0-based internally; rows/cols are reported
+//   1-based in the digit output.
+//
+//   Row 1:  A B C D E   (indices  0- 4)
+//   Row 2:  F G H I K   (indices  5- 9)
+//   Row 3:  L M N O P   (indices 10-14)
+//   Row 4:  Q R S T U   (indices 15-19)
+//   Row 5:  V W X Y Z   (indices 20-24)
+//
+//   Examples (plain square):
+//     A → row 1, col 1 → "11"
+//     H → row 2, col 3 → "23"
+//     E → row 1, col 5 → "15"
+//     L → row 3, col 1 → "31"
+//     O → row 3, col 4 → "34"
+//
+//   KNOWN TEST VECTOR:
+//     polybius_encrypt("HELLO", "") == "2315313134"
+//       H=23, E=15, L=31, L=31, O=34
+//
+// KEYED SQUARE:
+//   1. Uppercase the key, drop non-letters, replace J→I, deduplicate (first
+//      occurrence wins).
+//   2. Append A-Z (skipping J and any letters already seen) until 25 letters.
+//   Empty key "" → standard plain square (A B C D E / F G H I K / …).
+//
+// INPUT NORMALISATION:
+//   Uppercase, non-letters dropped, J→I before processing.
+//
+// PUBLIC API:
+//   polybius_square(key) -> list         — 25-char key square as flat list
+//   polybius_encrypt(pt, key) -> string  — letters to digit pairs
+//   polybius_decrypt(digits, key) -> string — digit pairs back to letters
+//
+// COMPLEXITY: O(n) encrypt/decrypt, O(1) square (always exactly 25 entries).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Build the 25-letter Polybius square from `key`.
+// Returns a flat list of 25 single-character strings, row-major.
+fn _pb_build_square(key) -> list
+    let seen = {}
+    let sq = []
+    // First pass: unique letters from key (normalised)
+    let ki = 0
+    let kn = len(key)
+    while ki < kn
+        let b = ord(slice(key, ki, ki+1))
+        // lowercase -> uppercase
+        if b >= 97 and b <= 122
+            b = b - 32
+        if b >= 65 and b <= 90
+            // J(74) -> I(73)
+            if b == 74
+                b = 73
+            let s = chr(b)
+            if not contains(seen, s)
+                seen[s] = 1
+                push(sq, s)
+        ki = ki + 1
+    // Second pass: fill remaining A-Z (skip J=74)
+    let fill = 65
+    while fill <= 90
+        if fill != 74
+            let s = chr(fill)
+            if not contains(seen, s)
+                seen[s] = 1
+                push(sq, s)
+        fill = fill + 1
+    sq
+
+// Build reverse index dict: letter -> 0-based position in square.
+fn _pb_build_index(sq) -> dict
+    let idx = {}
+    let i = 0
+    while i < 25
+        idx[sq[i]] = i
+        i = i + 1
+    idx
+
+// Normalise a string: uppercase, drop non-letters, J->I.
+fn _pb_normalise(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(slice(s, i, i+1))
+        if b >= 97 and b <= 122
+            b = b - 32
+        if b >= 65 and b <= 90
+            if b == 74
+                b = 73
+            out = out + chr(b)
+        i = i + 1
+    out
+
+// Convert a 0-based square index to a two-digit string "RC" (1-based row, col).
+// row = pos / 5,  col = pos % 5  (both 0-based).
+// Output digit = (row+1) and (col+1) as single-char strings.
+fn _pb_pos_to_digits(pos) -> string
+    let row = pos / 5
+    let col = pos - row * 5
+    str(row + 1) + str(col + 1)
+
+// Convert a 1-based row digit and 1-based col digit to a 0-based square index.
+fn _pb_digits_to_pos(r, c) -> int
+    (r - 1) * 5 + (c - 1)
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// polybius_square: build and return the 25-character Polybius key square.
+//
+// The square is a 5×5 grid of the 25-letter alphabet (I/J merged, J omitted)
+// arranged by:
+//   1. Unique letters from `key` (uppercased, J→I, non-letters dropped).
+//   2. Remaining A-Z letters (excluding J) in alphabetical order.
+//
+// The list is row-major: element at index i occupies row (i/5 + 1), col (i%5 + 1).
+//
+// Plain square (key == ""):
+//   ["A","B","C","D","E","F","G","H","I","K","L","M","N","O","P",
+//    "Q","R","S","T","U","V","W","X","Y","Z"]
+//
+// Example:
+//   polybius_square("KEYWORD") ->
+//     ["K","E","Y","W","O","R","D","A","B","C","F","G","H","I","L",
+//      "M","N","P","Q","S","T","U","V","X","Z"]
+fn polybius_square(key) -> list
+    _pb_build_square(key)
+
+// polybius_encrypt: encrypt plaintext `pt` using the Polybius square keyed by `key`.
+//
+// Each letter in the normalised plaintext is mapped to its two-digit (row,col)
+// coordinate in the 5×5 square.  Digits are 1-based (1..5).
+//
+// Input normalisation: uppercase, non-letters dropped, J treated as I.
+// Empty input returns "".
+//
+// KNOWN VECTOR (plain square, key=""):
+//   polybius_encrypt("HELLO", "") == "2315313134"
+//     H -> (2,3) -> "23"
+//     E -> (1,5) -> "15"
+//     L -> (3,1) -> "31"
+//     L -> (3,1) -> "31"
+//     O -> (3,4) -> "34"
+//
+// Example (keyed):
+//   polybius_encrypt("NOVA", "KEYWORD") — N is at position sq.indexOf("N")
+fn polybius_encrypt(pt, key) -> string
+    if len(pt) == 0
+        return ""
+    let sq = _pb_build_square(key)
+    let idx = _pb_build_index(sq)
+    let norm = _pb_normalise(pt)
+    let n = len(norm)
+    if n == 0
+        return ""
+    let out = ""
+    let i = 0
+    while i < n
+        let ch = slice(norm, i, i+1)
+        let pos = idx[ch]
+        out = out + _pb_pos_to_digits(pos)
+        i = i + 1
+    out
+
+// polybius_decrypt: decrypt a digit string back to plaintext letters.
+//
+// The input must be an even-length string of digit characters '1'..'5'
+// (as produced by polybius_encrypt).  Any character outside '1'..'5' is
+// silently ignored, allowing whitespace-separated groups if desired.
+//
+// Each consecutive pair of valid digits (R, C) is looked up in the 5×5 square
+// at row R (1-based), col C (1-based).
+//
+// Empty input returns "".
+// Odd number of valid digits: the trailing unpaired digit is silently ignored.
+//
+// Round-trip: polybius_decrypt(polybius_encrypt(pt, key), key) == _pb_normalise(pt)
+//
+// Example:
+//   polybius_decrypt("2315313134", "") == "HELLO"
+fn polybius_decrypt(digits, key) -> string
+    if len(digits) == 0
+        return ""
+    let sq = _pb_build_square(key)
+    // Collect only valid digit chars '1'..'5' (ord 49..53)
+    let valid = ""
+    let i = 0
+    let n = len(digits)
+    while i < n
+        let b = ord(slice(digits, i, i+1))
+        if b >= 49 and b <= 53
+            valid = valid + slice(digits, i, i+1)
+        i = i + 1
+    let vn = len(valid)
+    if vn == 0
+        return ""
+    let out = ""
+    let j = 0
+    while j + 1 < vn
+        let rd = ord(slice(valid, j, j+1)) - 48
+        let cd = ord(slice(valid, j+1, j+2)) - 48
+        let pos = _pb_digits_to_pos(rd, cd)
+        // Guard against out-of-range (invalid digit pair like "16")
+        if pos >= 0 and pos < 25
+            out = out + sq[pos]
+        j = j + 2
+    out

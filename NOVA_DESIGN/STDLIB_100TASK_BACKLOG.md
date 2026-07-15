@@ -20,7 +20,27 @@ every task below was dup-checked absent. Ordered LOW-RISK / high-value first.
 | 5 | std/validation/ | 12 | e2c38ad7 |
 | 6 | std/dsp/ | 12 | 0d8b9765 |
 | 7 | std/testing/ | 12 | ec43eec6 |
-| 8 | std/media/ (image+audio codecs: ppm pgm pbm pam bmp tga qoi farbfeld png xpm ico wav) | 12 | *(building wx7niq4xo)* |
+| 8 | std/media/ (image+audio codecs: ppm pgm pbm pam bmp tga qoi farbfeld png xpm ico wav) | 12 | df3d1d7b |
+| 9 | std/net/dns (RFC 1035 message codec: name-compression/header/question/rr/rdata-a/txt/mx/soa/srv/message/query-EDNS0) | 12 | 1fb6637f |
+| 10 | std/time/ depth (isoweek/period/strftime/strptime/holiday-easter/businessday/pduration/age/quarter/daycount/weeknum/reltime) | 12 | cbde0113 |
+| 11 | std/net/ inetproto (ipv4/ipv6/tcp/tcpopts/udp/icmp/arp/eth/pseudo/ntp/dhcp + inet checksum) | 12 | 77aad8da |
+| 12 | std/data/asn1 (DER/BER: tag/length/int/bool/null/oid/octetstring/bitstring/string/time/seq/parse) | 12 | a3e31a17 |
+| 13 | std/collections/ heaps (daryheap/skewheap/heapsort/indexedpq/minmaxheap/intervalheap/leftistheap/binomialheap/weakheap/heapselect/kwaymerge/radixheap) | 12 | 08e09122 |
+| 14 | std/hash/ breadth (crc8/crc16/crc32c/crc64/fnv64 + xxh32/xxh64/murmur3_32/murmur3_128/siphash/hashcombine/classichash) | 12 | fcdb35ff + bc239644 |
+| 15 | std/parsing/ toolkit (calc/exprvars/rpn/pratt/peg/combinators/tokenizer/glob/jsonpath/wildcard/template/numparse) | 12 | 45f2353a + e9736b3d |
+| 16 | std/text/ diff+patch (diff_lcs/diff_char/diff_patience/diff_histogram/diff_myers/unified_emit/unified_parse/patch_apply/patch_reverse/diff3_merge/conflict_format/patch_stats) | 12 | bd3e8542 + 53e08098 |
+
+| 17 | std/term/ ANSI (color16/color256/style/cursor/screen/strip/box/progress/spinner/hyperlink/columns/gradient) | 12 | 3dbac697 |
+| 18 | std/random/ PRNG engines (mt19937/pcg32/splitmix64/xoshiro256/xoshiro128/lcg/well512/lfsr/wyrand/jsf64/sfc64/lehmer) | 12 | eaf30328 |
+| 19 | std/cipher/ classical (playfair/bifid/foursquare/twosquare/hill/columnar/affine/autokey/beaufort/polybius/scytale/adfgx) | 12 | *(building wjixcsuh9)* |
+
+## RHYTHM NOTE (2026-07-14): run DEPTH-1 (one 12-agent fleet at a time). Depth-2 (24 agents) drained the account
+## session cap twice. One fleet at a time is the sustainable pace. **18 full tasks committed clean (216 modules).**
+## New categories added this campaign: std/media, std/parsing, std/term, std/cipher. Saturated (grep first):
+## collections, math, text, numeric, data, encoding, fmt-area, random-sampling.
+
+*(History: weekly limit hit 2026-07-13 mid-task-14 → owner switched accounts → resumed, 7 hash modules re-ran from
+cache, no work lost. Then depth-2 hit this session cap.)*
 
 ## BACKLOG (grep-verified, ordered low-risk-first)
 | # | Task | Risk | Value | Modules |
