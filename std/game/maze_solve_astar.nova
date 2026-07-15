@@ -1,0 +1,226 @@
+// std/game/maze_solve_astar.nova -- A* maze solver with Manhattan-distance heuristic.
+//
+// Finds the shortest path between two cells in a maze represented as an
+// adjacency list (the shared std/game/maze_* convention).
+//
+// Grid convention:
+//   w x h grid; cell index c = row*w + col.
+//   row = c/w,  col = c%w
+//   links[c] = list of cells reachable from c by an open passage (bidirectional).
+//
+// Public API:
+//   manhattan(a, b, w)                   -> int  Manhattan distance between cells a and b
+//   solve_astar(links, w, h, start, end) -> list  path of cell indices ([] if unreachable)
+//   astar_cost(links, w, h, start, end)  -> int  path edge-count (-1 if unreachable)
+//
+// A* details:
+//   g = exact cost from start (edge weight = 1 per passage).
+//   h = Manhattan distance heuristic (admissible and consistent on grid mazes).
+//   f = g + h.
+//   Priority queue = binary min-heap on f; ties broken by g (prefer lower g = closer).
+//   Closed set prevents re-expansion.  Re-insertions with stale g are skipped on pop.
+
+// ── Manhattan distance ────────────────────────────────────────────────────────
+
+// manhattan: grid Manhattan distance between cells a and b given grid width w.
+// |row_a - row_b| + |col_a - col_b|
+fn manhattan(a, b, w)
+    let row_a = a / w
+    let col_a = a % w
+    let row_b = b / w
+    let col_b = b % w
+    let dr = row_a - row_b
+    let dc = col_a - col_b
+    if dr < 0
+        dr = 0 - dr
+    if dc < 0
+        dc = 0 - dc
+    return dr + dc
+
+// ── Min-heap on [f, g, cell] triples ─────────────────────────────────────────
+// Binary min-heap stored as a flat list.
+// Entry format: [f, g, cell].  Ordered by f ascending (ties: lower g preferred).
+// Children of node i: left = 2*i+1, right = 2*i+2.  Parent of i: (i-1)/2.
+
+// _hp_less: return 1 if heap[i] < heap[j] in priority order (min-f; tie: min-g).
+fn _hp_less(heap, i, j)
+    let ei = heap[i]
+    let ej = heap[j]
+    let fi = ei[0]
+    let fj = ej[0]
+    if fi < fj
+        return 1
+    if fi > fj
+        return 0
+    // tie on f: prefer lower g (closer to start = better tie-break for A*)
+    let gi = ei[1]
+    let gj = ej[1]
+    if gi < gj
+        return 1
+    return 0
+
+// _hp_swap: swap entries at positions i and j in heap.
+fn _hp_swap(heap, i, j)
+    let tmp = heap[i]
+    heap[i] = heap[j]
+    heap[j] = tmp
+
+// _hp_sift_up: restore heap property by sifting node at idx upward.
+fn _hp_sift_up(heap, idx)
+    let pos = idx
+    let going = 1
+    while pos > 0 and going == 1
+        let par = (pos - 1) / 2
+        let cmp = _hp_less(heap, pos, par)
+        if cmp == 1
+            _hp_swap(heap, pos, par)
+            pos = par
+        if cmp == 0
+            going = 0
+
+// _hp_sift_down: restore heap property by sifting node at pos downward.
+fn _hp_sift_down(heap, pos, hsz)
+    let cur = pos
+    let going = 1
+    while going == 1
+        let left = cur * 2 + 1
+        let right = cur * 2 + 2
+        let smallest = cur
+        if left < hsz
+            if _hp_less(heap, left, smallest) == 1
+                smallest = left
+        if right < hsz
+            if _hp_less(heap, right, smallest) == 1
+                smallest = right
+        let swapped = 0
+        if smallest != cur
+            _hp_swap(heap, cur, smallest)
+            cur = smallest
+            swapped = 1
+        if swapped == 0
+            going = 0
+
+// _heap_push: insert entry [f, g, cell] into heap and restore heap order.
+fn _heap_push(heap, f, g, cell)
+    let entry = [f, g, cell]
+    push(heap, entry)
+    let idx = len(heap) - 1
+    _hp_sift_up(heap, idx)
+
+// _heap_pop: remove and return the minimum [f, g, cell] entry.
+// Precondition: len(heap) > 0.
+fn _heap_pop(heap)
+    let sz = len(heap)
+    let top = heap[0]
+    let last_idx = sz - 1
+    if last_idx == 0
+        // Only one element: pop it and return.
+        pop(heap)
+        return top
+    // Move last element to root, shrink list, then sift down.
+    heap[0] = heap[last_idx]
+    pop(heap)
+    _hp_sift_down(heap, 0, last_idx)
+    return top
+
+// ── A* solver ────────────────────────────────────────────────────────────────
+
+// solve_astar: find shortest path from start to end in the given maze.
+// links: adjacency list (list of w*h lists).
+// w, h: grid dimensions.
+// Returns list of cell indices start..end (inclusive).
+// Returns [] if end is unreachable from start.
+fn solve_astar(links, w, h, start, end)
+    let total = w * h
+
+    // g_score[c]: best known cost from start to c.  -1 means unvisited.
+    let g_score = []
+    let gi = 0
+    while gi < total
+        push(g_score, -1)
+        gi = gi + 1
+    g_score[start] = 0
+
+    // parent[c]: predecessor cell on best known path to c.  -1 means none.
+    let parent = []
+    let pi = 0
+    while pi < total
+        push(parent, -1)
+        pi = pi + 1
+
+    // closed[c]: 1 if c has been permanently settled (popped with optimal g).
+    let closed = []
+    let ki = 0
+    while ki < total
+        push(closed, 0)
+        ki = ki + 1
+
+    // Open set: min-heap of [f, g, cell].
+    let heap = []
+    let h0 = manhattan(start, end, w)
+    _heap_push(heap, h0, 0, start)
+
+    // Each cell settled at most once, so at most total pops are meaningful.
+    // Guard against stale entries inflating iteration count.
+    let expanded = 0
+    let max_expand = total + 1
+
+    while len(heap) > 0 and expanded < max_expand
+        let entry = _heap_pop(heap)
+        let cur_g = entry[1]
+        let cur = entry[2]
+
+        // Skip stale entries: a better path to cur was already settled.
+        if closed[cur] == 0
+            closed[cur] = 1
+            expanded = expanded + 1
+
+            if cur == end
+                // Reconstruct path: walk parent pointers from end back to start.
+                let path = []
+                let pc = end
+                let walk = 0
+                let max_walk = total + 1
+                while pc != -1 and walk < max_walk
+                    push(path, pc)
+                    pc = parent[pc]
+                    walk = walk + 1
+                // path is end..start; reverse it to get start..end.
+                let plen = len(path)
+                let rev = []
+                let ri = plen - 1
+                while ri >= 0
+                    push(rev, path[ri])
+                    ri = ri - 1
+                return rev
+
+            // Relax neighbors.
+            let nbrs = links[cur]
+            let nlen = len(nbrs)
+            let ni = 0
+            while ni < nlen
+                let nb = nbrs[ni]
+                if closed[nb] == 0
+                    let new_g = cur_g + 1
+                    let old_g = g_score[nb]
+                    if old_g == -1 or new_g < old_g
+                        g_score[nb] = new_g
+                        parent[nb] = cur
+                        let h_nb = manhattan(nb, end, w)
+                        let f_nb = new_g + h_nb
+                        _heap_push(heap, f_nb, new_g, nb)
+                ni = ni + 1
+
+    // end not reached.
+    return []
+
+// ── Cost wrapper ─────────────────────────────────────────────────────────────
+
+// astar_cost: return number of edges on shortest path (path length - 1).
+// Returns -1 if end is unreachable from start.
+fn astar_cost(links, w, h, start, end)
+    let path = solve_astar(links, w, h, start, end)
+    let plen = len(path)
+    if plen == 0
+        return -1
+    return plen - 1

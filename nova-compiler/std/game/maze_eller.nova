@@ -1,0 +1,252 @@
+// std/game/maze_eller.nova -- Eller's algorithm maze generator.
+//
+// Generates a PERFECT maze (spanning tree) on a w x h grid using Eller's
+// algorithm, which processes the grid one row at a time:
+//
+//   1. Assign each cell in the first row its own unique set ID.
+//   2. For each non-final row:
+//        a. Randomly merge adjacent cells (carve east passage) if they belong
+//           to different sets -- this merges their sets.
+//        b. For each set present in the current row, randomly select ONE OR MORE
+//           cells to carve a south (down) passage. Every set MUST have at least
+//           one south passage to remain connected.
+//        c. Cells in the next row that received a south passage inherit the
+//           set of their northern neighbor. Cells that did NOT receive a south
+//           passage get fresh, unique set IDs.
+//   3. For the final row: merge every pair of adjacent cells that are in
+//      different sets (no south passages needed).
+//
+// This produces a spanning tree (w*h-1 edges, fully connected) deterministically
+// given a seed.
+//
+// Grid convention (shared across std/game/maze_* modules):
+//   cell index c = row*w + col, for c in 0..w*h-1
+//   row = c/w,  col = c%w
+//   neighbors: up=c-w, down=c+w, left=c-1, right=c+1 (with bounds checks)
+//
+// Adjacency list (links):
+//   links = list of w*h lists; links[c] = cells connected to c by open passages.
+//   Passages are bidirectional.
+//
+// Public API:
+//   gen(w, h, seed) -> list   complete adjacency-list for a perfect maze
+
+// ── Seeded LCG (Knuth/Park-Miller, 31-bit output) ──────────────────────────
+
+fn _mz_rng(state: int) -> int
+    (state * 1103515245 + 12345) & 0x7FFFFFFF
+
+fn _mz_randint(state: int, n: int) -> list
+    let ns = _mz_rng(state)
+    let v = ns % n
+    [ns, v]
+
+// ── Set-ID management ──────────────────────────────────────────────────────
+//
+// row_sets[col] = set-ID for cell at that column in the current row.
+// next_id is a monotonically increasing counter for fresh set IDs.
+// We do NOT use union-find: instead we track set membership by a flat set-ID
+// per cell, and when merging we relabel ALL cells in one set to the other.
+// This is O(w) per merge, fine for row-by-row Eller's (w cells per row).
+
+// _relabel: in row_sets, replace every occurrence of old_id with new_id.
+fn _relabel(row_sets: list, old_id: int, new_id: int)
+    let n = len(row_sets)
+    let i = 0
+    while i < n
+        if row_sets[i] == old_id
+            row_sets[i] = new_id
+        i = i + 1
+
+// ── Collect cells by set for south-passage selection ──────────────────────
+//
+// _sets_in_row: returns a list of unique set IDs present in row_sets.
+fn _sets_in_row(row_sets: list) -> list
+    let w = len(row_sets)
+    // Use a seen-dict pattern: flat list of [id, seen] pairs is too slow for
+    // large w. Instead scan for each unique id linearly -- w is typically small
+    // (maze cols usually < 100).
+    let result = []
+    let i = 0
+    while i < w
+        let sid = row_sets[i]
+        // check if already in result
+        let found = 0
+        let j = 0
+        while j < len(result)
+            if result[j] == sid
+                found = 1
+            j = j + 1
+        if found == 0
+            push(result, sid)
+        i = i + 1
+    result
+
+// _cells_with_set: returns list of column indices in row_sets whose set == sid.
+fn _cells_with_set(row_sets: list, sid: int) -> list
+    let w = len(row_sets)
+    let result = []
+    let i = 0
+    while i < w
+        if row_sets[i] == sid
+            push(result, i)
+        i = i + 1
+    result
+
+// ── Fisher-Yates shuffle of an int list (in-place) ────────────────────────
+// Returns new RNG state.
+fn _shuffle(lst: list, state: int) -> int
+    let n = len(lst)
+    let s = state
+    let i = n - 1
+    while i > 0
+        let rr = _mz_randint(s, i + 1)
+        s = rr[0]
+        let j = rr[1]
+        let tmp = lst[i]
+        lst[i] = lst[j]
+        lst[j] = tmp
+        i = i - 1
+    s
+
+// ── gen: main public entry point ──────────────────────────────────────────
+//
+// gen: generate a perfect maze using Eller's algorithm.
+// Returns links: a list of w*h lists where links[c] = list of neighbor cells.
+
+fn gen(w: int, h: int, seed: int) -> list
+    let total = w * h
+
+    // Build adjacency list: total empty lists
+    let links = []
+    let ci = 0
+    while ci < total
+        let empty = []
+        push(links, empty)
+        ci = ci + 1
+
+    // next_id: the next fresh set ID to assign. Start at w so row-0 IDs are 0..w-1.
+    let next_id = w
+
+    // row_sets[col] = set ID of the cell at (current_row, col).
+    // Initialize row 0: each cell gets its own set ID (0..w-1).
+    let row_sets = []
+    let ii = 0
+    while ii < w
+        push(row_sets, ii)
+        ii = ii + 1
+
+    let state = seed
+
+    // Process each row
+    let row = 0
+    while row < h
+        let is_last = 0
+        if row == h - 1
+            is_last = 1
+
+        // ── Step A: randomly merge adjacent cells (east passages) ──────────
+        // For each adjacent pair (col, col+1): if different sets, randomly
+        // decide to merge (carve east). On the final row, ALWAYS merge if
+        // different sets (to fully connect remaining disconnected sets).
+        let col = 0
+        while col < w - 1
+            let sid_l = row_sets[col]
+            let sid_r = row_sets[col + 1]
+            if sid_l != sid_r
+                // Decide whether to merge
+                let do_merge = 0
+                if is_last == 1
+                    do_merge = 1
+                else
+                    let rr = _mz_randint(state, 2)
+                    state = rr[0]
+                    do_merge = rr[1]   // 0 or 1; 1 = merge
+
+                if do_merge == 1
+                    // Carve east passage between (row,col) and (row,col+1)
+                    let ca = row * w + col
+                    let cb = row * w + col + 1
+                    push(links[ca], cb)
+                    push(links[cb], ca)
+                    // Relabel all cells with sid_r to sid_l
+                    _relabel(row_sets, sid_r, sid_l)
+            col = col + 1
+
+        // ── Step B: carve south passages (skip on final row) ───────────────
+        if is_last == 0
+            // For each set in this row, choose at least one cell to carve south.
+            // Strategy: shuffle the cells in the set, then pick a random count
+            // in 1..len(cells). This ensures at least one, and randomly more.
+            let sets = _sets_in_row(row_sets)
+            let ns = len(sets)
+            let si = 0
+            while si < ns
+                let sid = sets[si]
+                let cells = _cells_with_set(row_sets, sid)
+                let nc = len(cells)
+
+                // Shuffle cells for random selection order
+                state = _shuffle(cells, state)
+
+                // Pick how many south passages: random 1..nc
+                let rr2 = _mz_randint(state, nc)
+                state = rr2[0]
+                let count = rr2[1] + 1   // 1..nc
+
+                // Carve south from the first 'count' cells (after shuffle)
+                let ki = 0
+                while ki < count
+                    let c_col = cells[ki]
+                    let c_cur = row * w + c_col
+                    let c_dn = c_cur + w
+                    push(links[c_cur], c_dn)
+                    push(links[c_dn], c_cur)
+                    ki = ki + 1
+
+                si = si + 1
+
+            // ── Step C: build next row's set assignments ───────────────────
+            // Cells that received a south passage: inherit parent set.
+            // Cells that did NOT: get a fresh set ID.
+            let new_row_sets = []
+            let ci2 = 0
+            while ci2 < w
+                push(new_row_sets, 0)
+                ci2 = ci2 + 1
+
+            // Mark which columns got a south passage this row
+            // We look at links of row cells -- if links[row*w+col] contains row*w+col+w then south carved.
+            let col2 = 0
+            while col2 < w
+                let c_cur = row * w + col2
+                let c_dn = c_cur + w
+                // Check if c_dn is in links[c_cur]
+                let nb = links[c_cur]
+                let nlen = len(nb)
+                let found_south = 0
+                let ni = 0
+                while ni < nlen
+                    if nb[ni] == c_dn
+                        found_south = 1
+                    ni = ni + 1
+
+                if found_south == 1
+                    // Inherit parent set
+                    new_row_sets[col2] = row_sets[col2]
+                else
+                    // Fresh set ID
+                    new_row_sets[col2] = next_id
+                    next_id = next_id + 1
+
+                col2 = col2 + 1
+
+            // Replace row_sets with new_row_sets
+            let col3 = 0
+            while col3 < w
+                row_sets[col3] = new_row_sets[col3]
+                col3 = col3 + 1
+
+        row = row + 1
+
+    links
