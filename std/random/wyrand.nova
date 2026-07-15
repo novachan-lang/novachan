@@ -1,0 +1,114 @@
+// std/random/wyrand -- wyrand 64-bit PRNG (Wang Yi, 2019).
+//
+// wyrand is a high-quality, extremely fast 64-bit generator whose only state
+// is a single 64-bit counter.  Each call:
+//   1. state += C1          (C1 = 0xA0761D6478BD642F, Fibonacci-derived)
+//   2. mix = wymum(state, state XOR C2)   (C2 = 0xE7037ED1A0B428DB)
+//   3. output = mix.hi XOR mix.lo
+//
+// wymum(a, b) returns the full 128-bit product of a*b as [hi, lo].
+// Since NOVA lacks 128-bit arithmetic we implement it with 32-bit limbs.
+//
+// NOVA arithmetic notes:
+//   * i64 + and * wrap mod 2^64 -- correct for PRNG counter arithmetic.
+//   * >> is arithmetic (sign-extending); _wy_shr64 applies a logical mask.
+//   * Constants > 2^63 are built from two 32-bit halves.
+//   * wy_next returns the raw 64-bit word (may be negative as signed i64).
+//   * wy_next_range masks to 63 bits before modulo for non-negative results.
+//
+// Public API:
+//   wy_seed(seed)          -> dict   create state dict {"s": seed}
+//   wy_next(rng)           -> int    advance state in-place, return 64-bit output
+//   wy_next_range(rng, n)  -> int    uniform in [0, n)
+//
+// Private helpers: _wy_ prefix.
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+// _wy_shr64: logical right shift for i64 (NOVA >> is arithmetic).
+fn _wy_shr64(x, n)
+    let mask = (1 << (64 - n)) - 1
+    return (x >> n) & mask
+
+// _wy_c1: increment constant 0xA0761D6478BD642F.
+fn _wy_c1()
+    return (0xA0761D64 << 32) | 0x78BD642F
+
+// _wy_c2: mix constant 0xE7037ED1A0B428DB.
+fn _wy_c2()
+    return (0xE7037ED1 << 32) | 0xA0B428DB
+
+// _wy_m63: 2^63 - 1 mask for stripping the sign bit.
+fn _wy_m63()
+    return 9223372036854775807
+
+// wy_wymum(a, b) -> list [hi, lo]
+// Computes the full 128-bit unsigned product of a and b via 32-bit limbs.
+// Exposed as a public function so the KAT can verify correctness independently.
+// All intermediate values are constructed to stay within safe signed i64 range:
+//   - a_lo, a_hi, b_lo, b_hi are each in [0, 2^32-1] (after _wy_shr64 / &mask32)
+//   - ll, lh, hl, hh are products of two such values: < 2^64 (no signed overflow
+//     for the multiplication itself; result may appear negative as signed i64 but
+//     the bit pattern is correct for unsigned accumulation via wrapping arithmetic)
+//   - mid_lo_sum = lh_lo + hl_lo: each < 2^32, sum < 2^33 -- no signed overflow
+//   - mid_hi_sum = lh_hi + hl_hi + mid_c: < 3*2^32 < 2^34 -- no signed overflow
+//   - lo_carry_raw = ll_hi + mid_lo: each < 2^32, sum < 2^33 -- no signed overflow
+fn wy_wymum(a, b)
+    let mask32 = 0xFFFFFFFF
+    let a_lo = a & mask32
+    let a_hi = _wy_shr64(a, 32)
+    let b_lo = b & mask32
+    let b_hi = _wy_shr64(b, 32)
+    let ll = a_lo * b_lo
+    let lh = a_lo * b_hi
+    let hl = a_hi * b_lo
+    let hh = a_hi * b_hi
+    let lh_lo = lh & mask32
+    let lh_hi = _wy_shr64(lh, 32)
+    let hl_lo = hl & mask32
+    let hl_hi = _wy_shr64(hl, 32)
+    let mid_lo_sum = lh_lo + hl_lo
+    let mid_lo = mid_lo_sum & mask32
+    let mid_c = _wy_shr64(mid_lo_sum, 32)
+    let mid_hi_sum = lh_hi + hl_hi + mid_c
+    let ll_lo = ll & mask32
+    let ll_hi = _wy_shr64(ll, 32)
+    let lo_carry_raw = ll_hi + mid_lo
+    let lo_carry = _wy_shr64(lo_carry_raw, 32)
+    let lo_mid = lo_carry_raw & mask32
+    let lo = (lo_mid << 32) | ll_lo
+    let hi = hh + mid_hi_sum + lo_carry
+    let out = []
+    push(out, hi)
+    push(out, lo)
+    return out
+
+// ── wy_seed ──────────────────────────────────────────────────────────────────
+// Create a new wyrand state dict seeded with `seed`.
+// Any integer is a valid seed; wyrand handles all 64-bit states correctly.
+fn wy_seed(seed)
+    let st = {}
+    st["s"] = seed
+    return st
+
+// ── wy_next ───────────────────────────────────────────────────────────────────
+// Advance state in-place; return the next raw 64-bit output word.
+// The returned value may be negative (bit 63 set) as a signed i64.
+fn wy_next(rng)
+    let c1 = _wy_c1()
+    let c2 = _wy_c2()
+    let s = rng["s"] + c1
+    rng["s"] = s
+    let b = s ^ c2
+    let t = wy_wymum(s, b)
+    return t[0] ^ t[1]
+
+// ── wy_next_range ─────────────────────────────────────────────────────────────
+// Return a uniformly distributed int in [0, n).
+// The raw 64-bit output is masked to 63 bits before modulo to ensure the
+// result is always non-negative regardless of the raw word's sign bit.
+fn wy_next_range(rng, n)
+    let raw = wy_next(rng)
+    let m63 = _wy_m63()
+    let pos = raw & m63
+    return pos % n

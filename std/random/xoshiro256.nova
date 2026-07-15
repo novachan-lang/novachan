@@ -1,0 +1,123 @@
+// std/random/xoshiro256 -- xoshiro256** PRNG (64-bit, 4x64 state).
+//
+// Algorithm: xoshiro256** by Blackman & Vigna (2019)
+//   result = rotl64(s1 * 5, 7) * 9
+//   t      = s1 << 17
+//   s2    ^= s0
+//   s3    ^= s1
+//   s1    ^= s2
+//   s0    ^= s3
+//   s2    ^= t
+//   s3     = rotl64(s3, 45)
+//   return result
+//
+// Seeding: the 4 state words are initialised via 4 consecutive SplitMix64
+// steps starting from the caller's seed.  This is the standard recommended
+// seeding method for the xoshiro256 family (Blackman & Vigna, prng.di.unimi.it).
+// The first state word after seeding equals the first SplitMix64 output.
+//
+// State lives in a dict: keys "s0".."s3", all signed i64 (bit-63 may be set).
+//
+// NOVA 64-BIT ARITHMETIC NOTES:
+//   * i64 + and * wrap mod 2^64 -- exactly correct for PRNG arithmetic.
+//   * >> is arithmetic (sign-extending); _xo256_shr64 applies a logical mask.
+//   * Constants > 2^63 are built from 32-bit halves via zero-arg fns to stay
+//     within i64 literal range.
+//   * xo256_next returns the raw 64-bit scrambled word (may be negative).
+//   * xo256_next_range masks to 63 bits before modulo to guarantee >= 0.
+//
+// Public API:
+//   xo256_seed(seed_int)         -> dict  create generator state dict
+//   xo256_next(rng)              -> int   advance state in-place; raw 64-bit output
+//   xo256_next_range(rng, n)     -> int   uniform in [0, n)
+
+// ── private: logical right-shift helper ──────────────────────────────────────
+// NOVA >> is arithmetic; mask clears sign-extended high bits for logical shift.
+fn _xo256_shr64(x, n)
+    let mask = (1 << (64 - n)) - 1
+    return (x >> n) & mask
+
+// ── private: 64-bit rotate-left ──────────────────────────────────────────────
+fn _xo256_rotl64(x, r)
+    let rr = r & 63
+    if rr == 0
+        return x
+    return (x << rr) | _xo256_shr64(x, 64 - rr)
+
+// ── private: SplitMix64 constants (built from 32-bit halves) ─────────────────
+// C1 = 0x9E3779B97F4A7C15  (Fibonacci hashing increment)
+fn _xo256_sm_c1()
+    return (0x9E3779B9 << 32) | 0x7F4A7C15
+
+// C2 = 0xBF58476D1CE4E5B9  (first mix multiplier)
+fn _xo256_sm_c2()
+    return (0xBF58476D << 32) | 0x1CE4E5B9
+
+// C3 = 0x94D049BB133111EB  (second mix multiplier)
+fn _xo256_sm_c3()
+    return (0x94D049BB << 32) | 0x133111EB
+
+// ── private: one SplitMix64 step ─────────────────────────────────────────────
+// Advances sm_state["s"] in-place and returns the output word.
+// Used only by xo256_seed to expand the seed into 4 independent state words.
+fn _xo256_sm_step(sm_state)
+    let c1 = _xo256_sm_c1()
+    let c2 = _xo256_sm_c2()
+    let c3 = _xo256_sm_c3()
+    let s = sm_state["s"] + c1
+    sm_state["s"] = s
+    let z = s
+    let z2 = (z ^ _xo256_shr64(z, 30)) * c2
+    let z3 = (z2 ^ _xo256_shr64(z2, 27)) * c3
+    return z3 ^ _xo256_shr64(z3, 31)
+
+// ── xo256_seed ───────────────────────────────────────────────────────────────
+// Create a new xoshiro256** state dict, seeded deterministically from seed_int.
+// seed=0 is valid; the SplitMix64 seeding handles all-zero without degenerating.
+// After seeding, rng["s0"] equals the first SplitMix64 output from seed_int.
+fn xo256_seed(seed_int)
+    let sm = {}
+    sm["s"] = seed_int
+    let w0 = _xo256_sm_step(sm)
+    let w1 = _xo256_sm_step(sm)
+    let w2 = _xo256_sm_step(sm)
+    let w3 = _xo256_sm_step(sm)
+    let rng = {}
+    rng["s0"] = w0
+    rng["s1"] = w1
+    rng["s2"] = w2
+    rng["s3"] = w3
+    return rng
+
+// ── xo256_next ───────────────────────────────────────────────────────────────
+// Advance the generator in-place and return the next raw 64-bit output.
+// The scrambler is "**": result = rotl64(s1*5, 7) * 9.
+// The returned value is a full 64-bit word; bit 63 may be set (appears negative).
+fn xo256_next(rng)
+    let s0 = rng["s0"]
+    let s1 = rng["s1"]
+    let s2 = rng["s2"]
+    let s3 = rng["s3"]
+    let result = _xo256_rotl64(s1 * 5, 7) * 9
+    let t = s1 << 17
+    let ns2 = s2 ^ s0
+    let ns3 = s3 ^ s1
+    let ns1 = s1 ^ ns2
+    let ns0 = s0 ^ ns3
+    let ns2b = ns2 ^ t
+    let ns3b = _xo256_rotl64(ns3, 45)
+    rng["s0"] = ns0
+    rng["s1"] = ns1
+    rng["s2"] = ns2b
+    rng["s3"] = ns3b
+    return result
+
+// ── xo256_next_range ─────────────────────────────────────────────────────────
+// Return a uniformly distributed int in [0, n).
+// The raw 64-bit word is masked to 63 bits (clearing sign) before modulo so
+// the result is always non-negative regardless of the raw word's sign bit.
+fn xo256_next_range(rng, n)
+    let raw = xo256_next(rng)
+    let m63 = 9223372036854775807
+    let pos = raw & m63
+    return pos % n
