@@ -1,0 +1,196 @@
+// ============================================================================
+// NOVA Standard Library — std/midi/running_status
+// ============================================================================
+// Running-Status stream encode/decode (MIDI 1.0 spec, section 2.1).
+//
+// RUNNING STATUS RULE
+//   When consecutive channel messages share the same status byte, the status
+//   byte may be omitted from the second and subsequent messages.  The receiver
+//   implies the status from the last seen status byte ("running status").
+//
+//   Participating message types: 0x80..0xEF (channel voice + channel mode).
+//   System messages (0xF0..0xFF) cancel running status.
+//
+// DATA-BYTE COUNT PER STATUS TYPE (nibble = status >> 4)
+//   0x8 NoteOff        2 data bytes
+//   0x9 NoteOn         2 data bytes
+//   0xA PolyAT         2 data bytes
+//   0xB CC             2 data bytes
+//   0xC ProgramChange  1 data byte
+//   0xD ChanAT         1 data byte
+//   0xE PitchBend      2 data bytes
+//
+// PUBLIC API
+//   rs_encode(messages) -> list
+//     messages: list of byte-lists (each a full MIDI message incl. status byte).
+//     Returns a flat byte list with running-status compression applied:
+//     if a message's status byte equals the previous emitted status, that
+//     status byte is omitted from the output.
+//
+//   rs_decode(bytes_list) -> list
+//     bytes_list: a flat list of ints (a running-status compressed stream).
+//     Returns a list of byte-lists, each being a full message with status
+//     byte restored.
+//
+// SAFETY
+//   rs_encode: skips any message with an empty byte list (no-op).
+//   rs_decode: ignores orphaned data bytes with no prior status; skips malformed.
+//   All data bytes are validated as 0..127 on decode (high-bit-clear check).
+//
+// SYMBOL PREFIX: _rs_ for all private helpers.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _rs_data_count: return the number of data bytes expected for a status byte.
+// status_byte must be 0x80..0xEF; system messages (0xF0..) return 0.
+fn _rs_data_count(status_byte) -> int
+    let nibble = (status_byte >> 4) & 0xF
+    let count = 0
+    if nibble == 8
+        count = 2
+    else if nibble == 9
+        count = 2
+    else if nibble == 10
+        count = 2
+    else if nibble == 11
+        count = 2
+    else if nibble == 12
+        count = 1
+    else if nibble == 13
+        count = 1
+    else if nibble == 14
+        count = 2
+    count
+
+// _rs_is_status: return 1 if byte has high bit set (>= 0x80), 0 otherwise.
+fn _rs_is_status(b) -> int
+    let result = 0
+    if b >= 128
+        result = 1
+    result
+
+// _rs_is_channel_status: return 1 if byte is a channel message status (0x80..0xEF).
+// System messages 0xF0..0xFF do NOT participate in running status.
+fn _rs_is_channel_status(b) -> int
+    let result = 0
+    if b >= 128 and b <= 239
+        result = 1
+    result
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// rs_encode: apply running-status compression to a list of full MIDI messages.
+//
+// Each element of `messages` is a list of ints representing one MIDI message
+// (status byte followed by data bytes).  When the status byte of a message
+// equals the last emitted status byte AND that status is a channel message,
+// the status byte is omitted from the output.
+//
+// Returns a flat byte list representing the compressed stream.
+fn rs_encode(messages) -> list
+    let out = []
+    let last_status = 0
+    let nmsg = len(messages)
+    let mi = 0
+    while mi < nmsg
+        let msg = messages[mi]
+        let mlen = len(msg)
+        if mlen > 0
+            let sb = msg[0]
+            // Determine if we can use running status for this message.
+            let use_rs = 0
+            if _rs_is_channel_status(sb) == 1 and sb == last_status
+                use_rs = 1
+            // Emit: omit status if running-status applies, else emit all.
+            let start = 0
+            if use_rs == 1
+                start = 1
+            else
+                // New or different status — emit it and update last_status.
+                if _rs_is_channel_status(sb) == 1
+                    last_status = sb
+                else
+                    // System message cancels running status.
+                    last_status = 0
+            let bi = start
+            while bi < mlen
+                push(out, msg[bi])
+                bi = bi + 1
+        mi = mi + 1
+    out
+
+// rs_decode: expand a running-status compressed byte stream into full messages.
+//
+// Scans bytes_list left to right:
+//   - A byte >= 0x80 is a new status byte.
+//     * If it is a channel status (0x80..0xEF): update running status,
+//       begin accumulating data bytes for this message.
+//     * If it is a system message (0xF0..0xFF): cancel running status,
+//       and emit it as a 1-byte message immediately (no data expansion here).
+//   - A byte < 0x80 (data byte):
+//     * If we have a running status, it belongs to a new instance of that
+//       message type.  Collect the expected number of data bytes.
+//     * If we have no running status, this is an orphaned data byte — skip it.
+//
+// Returns a list of byte-lists (each a fully-restored MIDI message).
+fn rs_decode(bytes_list) -> list
+    let out = []
+    let nb = len(bytes_list)
+    let last_status = 0
+    let i = 0
+    while i < nb
+        let b = bytes_list[i] & 0xFF
+        if _rs_is_status(b) == 1
+            // Status byte.
+            if _rs_is_channel_status(b) == 1
+                // Channel message: update running status, then read data bytes.
+                last_status = b
+                let needed = _rs_data_count(b)
+                let msg = []
+                push(msg, b)
+                i = i + 1
+                let di = 0
+                while di < needed and i < nb
+                    let db = bytes_list[i] & 0xFF
+                    // Data bytes must have high bit clear (0..127).
+                    if _rs_is_status(db) == 1
+                        // Premature status: stop collecting data for this message.
+                        di = needed
+                    else
+                        push(msg, db)
+                        i = i + 1
+                        di = di + 1
+                push(out, msg)
+            else
+                // System message (0xF0..0xFF): cancels running status.
+                last_status = 0
+                let smsg = []
+                push(smsg, b)
+                push(out, smsg)
+                i = i + 1
+        else
+            // Data byte: use running status if available.
+            if last_status == 0
+                // No running status — orphaned data byte, skip.
+                i = i + 1
+            else
+                // Start a new instance of the running-status message.
+                let needed = _rs_data_count(last_status)
+                let msg = []
+                push(msg, last_status)
+                push(msg, b)
+                i = i + 1
+                let di = 1
+                while di < needed and i < nb
+                    let db = bytes_list[i] & 0xFF
+                    if _rs_is_status(db) == 1
+                        // Premature status: stop.
+                        di = needed
+                    else
+                        push(msg, db)
+                        i = i + 1
+                        di = di + 1
+                push(out, msg)
+    out

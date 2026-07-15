@@ -1,0 +1,147 @@
+// ============================================================================
+// NOVA Standard Library — std/midi/vlq
+// ============================================================================
+// Variable-Length Quantity (VLQ) encoding — MIDI delta-time / meta length.
+//
+// SPECIFICATION
+//   VLQ encodes a non-negative integer using 7 bits per byte in BIG-ENDIAN
+//   order (most-significant group first).  The high bit (0x80) is SET on
+//   every byte EXCEPT the last, which has the high bit CLEAR.
+//
+//   This is the opposite bit-order to LEB128 (std/encoding/varint), which
+//   is little-endian.  VLQ is the standard used in Standard MIDI Files (SMF)
+//   for delta-time and meta-event length fields.
+//
+//   Examples:
+//     0       -> [0x00]
+//     0x7F    -> [0x7F]
+//     0x80    -> [0x81, 0x00]    (two bytes: 1|0x80, 0)
+//     0x2000  -> [0xC0, 0x00]    (8192: 0x40|0x80, 0x00)
+//     0x1FFFFF-> [0xFF, 0xFF, 0x7F]  (max 3-byte VLQ = 2097151)
+//
+// ENCODING ALGORITHM
+//   1. Peel 7-bit groups from LSB to MSB into a temp list (groups[0]=LSB-group).
+//   2. Output them in REVERSE order (MSB first), adding 0x80 to all but the
+//      last (= groups[0]).
+//   Step 2 emits len(groups) bytes, big-endian.
+//
+//   Special case: n == 0 → emit [0x00] directly (loop would produce nothing).
+//
+// DECODING ALGORITHM
+//   For each byte b in the stream (starting at pos):
+//     value = (value << 7) | (b & 0x7F)
+//     if (b & 0x80) == 0: stop (last byte)
+//   Returns [value, next_pos].
+//
+// BOUNDS SAFETY
+//   vlq_decode stops at end-of-list (i >= len(buf)) even if the stream is
+//   not terminated; in that case it returns whatever value was accumulated.
+//   vlq_encode returns [0] for n == 0 and [] (via guard) for n < 0.
+//   Data bytes are validated as 0..127 on decode via the (b & 0x7F) mask —
+//   the continuation bit is always stripped regardless.
+//
+// PUBLIC API
+//   vlq_encode(n)          -> list   byte list for non-negative integer n
+//   vlq_decode(buf, pos)   -> list   [value, next_pos]; buf is a list of ints
+//   vlq_len(n)             -> int    number of bytes vlq_encode(n) produces
+//
+// All private helpers are prefixed _vlq_ to avoid cross-module collisions.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _vlq_reverse: reverse a list in-place by swapping from both ends.
+// Returns the count (for convenience); list is mutated.
+fn _vlq_reverse(lst) -> int
+    let n = len(lst)
+    let i = 0
+    let j = n - 1
+    while i < j
+        let tmp = lst[i]
+        lst[i] = lst[j]
+        lst[j] = tmp
+        i = i + 1
+        j = j - 1
+    n
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// vlq_encode: encode a non-negative integer as a VLQ byte list.
+//
+// Returns [0x00] for n == 0 (special-cased to avoid empty-output from loop).
+// Returns [] for n < 0 (invalid input guard; callers should not pass negatives).
+//
+// The loop collects 7-bit groups LSB-first into `groups`, then reverses them
+// so the MSB group is output first.  All groups except the last (= groups[0]
+// before reversal, = groups[last] after reversal) receive the continuation
+// bit 0x80.
+fn vlq_encode(n) -> list
+    let result = []
+    if n < 0
+        return result
+    if n == 0
+        push(result, 0)
+        return result
+    let groups = []
+    let v = n
+    while v > 0
+        push(groups, v & 0x7F)
+        v = (v >> 7) & 0x00FFFFFFFFFFFFFF
+    // groups[0] = LSB group (last byte of VLQ, no continuation bit)
+    // groups[len-1] = MSB group (first byte of VLQ, has continuation bit)
+    // Reverse so MSB-group is at index 0 for output.
+    _vlq_reverse(groups)
+    // Emit: all bytes except the last get 0x80; last byte is plain.
+    let gc = len(groups)
+    let i = 0
+    while i < gc
+        if i < gc - 1
+            push(result, groups[i] | 0x80)
+        else
+            push(result, groups[i])
+        i = i + 1
+    result
+
+// vlq_decode: decode a VLQ integer from buf (list of ints) starting at pos.
+//
+// Reads bytes until a byte with high bit CLEAR is found (or end of buf).
+// Returns [decoded_value, next_pos].
+//
+// BOUNDS SAFETY: if pos >= len(buf), returns [0, pos] immediately.
+// Malformed input (stream ends without a terminating byte) returns the
+// partial accumulation with next_pos == len(buf).
+fn vlq_decode(buf, pos) -> list
+    let result = [0, pos]
+    let nb = len(buf)
+    if pos >= nb
+        return result
+    let value = 0
+    let i = pos
+    let going = 1
+    while going == 1 and i < nb
+        let b = buf[i] & 0xFF
+        value = (value << 7) | (b & 0x7F)
+        i = i + 1
+        if (b & 0x80) == 0
+            going = 0
+    result[0] = value
+    result[1] = i
+    result
+
+// vlq_len: return the number of bytes vlq_encode(n) would produce.
+//
+// n == 0 -> 1 (always at least one byte).
+// n < 0  -> 0 (guard; invalid input).
+// Otherwise count 7-bit groups by shifting right 7 until zero.
+fn vlq_len(n) -> int
+    if n < 0
+        return 0
+    if n == 0
+        return 1
+    let count = 0
+    let v = n
+    while v > 0
+        count = count + 1
+        v = (v >> 7) & 0x00FFFFFFFFFFFFFF
+    count

@@ -1,0 +1,280 @@
+// ============================================================================
+// NOVA Standard Library — std/midi/meta
+// ============================================================================
+// MIDI Standard File (SMF) meta-event encoder/decoder.
+//
+// Meta events have the form: 0xFF <type> <vlq-length> <data...>
+// All multi-byte fields in SMF are BIG-ENDIAN.
+//
+// PUBLIC API
+//   meta_end_of_track()                     -> list   [0xFF,0x2F,0x00]
+//   meta_tempo(us_per_quarter)              -> list   [0xFF,0x51,0x03,b2,b1,b0]
+//   meta_track_name(name)                   -> list   [0xFF,0x03,len,bytes...]
+//   meta_time_sig(num,den,clocks,n32)       -> list   [0xFF,0x58,0x04,...]
+//   meta_key_sig(sharps,is_minor)           -> list   [0xFF,0x59,0x02,sf,mi]
+//   meta_text(text)                         -> list   [0xFF,0x01,len,bytes...]
+//   meta_marker(text)                       -> list   [0xFF,0x06,len,bytes...]
+//   meta_decode(bytes_list, pos)            -> list   [dict, next_pos]
+//
+// NOTES
+//   den in meta_time_sig is encoded as log2(den): 4->2, 8->3, 2->1, etc.
+//   sharps in meta_key_sig: positive=sharps, negative=flats (stored as signed byte).
+//   meta_decode returns a two-element list: [info_dict, next_pos_int].
+//   On malformed input meta_decode returns [{}, original_pos].
+// ============================================================================
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+// Append a fixed-length big-endian u24 (3 bytes) to list out.
+fn _meta_u24be(out, v)
+    push(out, (v >> 16) & 0xFF)
+    push(out, (v >> 8) & 0xFF)
+    push(out, v & 0xFF)
+
+// Encode a string as a list of byte ints (ASCII/Latin-1).
+fn _meta_str_bytes(s)
+    let result = []
+    let i = 0
+    let n = len(s)
+    loop
+        if i >= n
+            break
+        push(result, ord(slice(s, i, i + 1)))
+        i = i + 1
+    result
+
+// Encode a VLQ (variable-length quantity) for SMF length fields.
+// Returns a list of bytes (1..4 bytes for values 0..0x0FFFFFFF).
+fn _meta_vlq(v)
+    let result = []
+    if v < 128
+        push(result, v & 0x7F)
+    else if v < 16384
+        push(result, ((v >> 7) & 0x7F) | 0x80)
+        push(result, v & 0x7F)
+    else if v < 2097152
+        push(result, ((v >> 14) & 0x7F) | 0x80)
+        push(result, ((v >> 7) & 0x7F) | 0x80)
+        push(result, v & 0x7F)
+    else
+        push(result, ((v >> 21) & 0x7F) | 0x80)
+        push(result, ((v >> 14) & 0x7F) | 0x80)
+        push(result, ((v >> 7) & 0x7F) | 0x80)
+        push(result, v & 0x7F)
+    result
+
+// Build a meta event list from type byte and data list.
+fn _meta_event(typ, data)
+    let out = []
+    push(out, 0xFF)
+    push(out, typ)
+    let dlen = len(data)
+    let vlq = _meta_vlq(dlen)
+    let vi = 0
+    loop
+        if vi >= len(vlq)
+            break
+        push(out, vlq[vi])
+        vi = vi + 1
+    let di = 0
+    loop
+        if di >= dlen
+            break
+        push(out, data[di])
+        di = di + 1
+    out
+
+// Decode a VLQ at position pos in byte list bl.
+// Returns [value, next_pos]. Returns [-1, pos] on error.
+fn _meta_vlq_decode(bl, pos)
+    let n = len(bl)
+    let result = []
+    let val = 0
+    let cur = pos
+    let done = false
+    loop
+        if done
+            break
+        if cur >= n
+            push(result, -1)
+            push(result, pos)
+            done = true
+        else
+            let b = bl[cur]
+            cur = cur + 1
+            val = (val * 128) | (b & 0x7F)
+            if (b & 0x80) == 0
+                push(result, val)
+                push(result, cur)
+                done = true
+            else if cur - pos > 4
+                push(result, -1)
+                push(result, pos)
+                done = true
+    result
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// meta_end_of_track() -> list
+// Encodes FF 2F 00
+fn meta_end_of_track()
+    let data = []
+    _meta_event(0x2F, data)
+
+// meta_tempo(us_per_quarter) -> list
+// Encodes FF 51 03 <u24be of microseconds per quarter note>
+// Standard tempo 120 BPM = 500000 us = 0x07A120
+fn meta_tempo(us_per_quarter)
+    let data = []
+    push(data, (us_per_quarter >> 16) & 0xFF)
+    push(data, (us_per_quarter >> 8) & 0xFF)
+    push(data, us_per_quarter & 0xFF)
+    _meta_event(0x51, data)
+
+// meta_track_name(name) -> list
+// Encodes FF 03 <len> <ascii bytes>
+fn meta_track_name(name)
+    let data = _meta_str_bytes(name)
+    _meta_event(0x03, data)
+
+// meta_time_sig(num, den, clocks, n32) -> list
+// Encodes FF 58 04 <num> <log2(den)> <clocks> <n32>
+// den is the denominator as a power of 2: 4->2, 8->3, 2->1, 1->0
+// clocks = MIDI clocks per metronome click (typically 24)
+// n32 = number of 32nd notes per MIDI quarter note (typically 8)
+fn meta_time_sig(num, den, clocks, n32)
+    let log2den = 0
+    let tmp = den
+    loop
+        if tmp <= 1
+            break
+        tmp = tmp / 2
+        log2den = log2den + 1
+    let data = []
+    push(data, num & 0xFF)
+    push(data, log2den & 0xFF)
+    push(data, clocks & 0xFF)
+    push(data, n32 & 0xFF)
+    _meta_event(0x58, data)
+
+// meta_key_sig(sharps, is_minor) -> list
+// Encodes FF 59 02 <sf> <mi>
+// sharps: -7..7 (negative=flats, positive=sharps, 0=C major/A minor)
+// is_minor: false=major, true=minor
+// sf stored as signed byte: negative stored as 256+sharps (e.g. -1 -> 255)
+fn meta_key_sig(sharps, is_minor)
+    let sf = sharps & 0xFF
+    let mi = 0
+    if is_minor
+        mi = 1
+    let data = []
+    push(data, sf)
+    push(data, mi)
+    _meta_event(0x59, data)
+
+// meta_text(text) -> list
+// Encodes FF 01 <len> <ascii bytes>
+fn meta_text(text)
+    let data = _meta_str_bytes(text)
+    _meta_event(0x01, data)
+
+// meta_marker(text) -> list
+// Encodes FF 06 <len> <ascii bytes>
+fn meta_marker(text)
+    let data = _meta_str_bytes(text)
+    _meta_event(0x06, data)
+
+// meta_decode(bytes_list, pos) -> list [dict, next_pos]
+// Decodes one meta event from bytes_list starting at pos.
+// bytes_list must have: bytes_list[pos]=0xFF, bytes_list[pos+1]=type, then VLQ length, then data.
+// Returns a two-element list: [info_dict, next_pos].
+// info_dict keys: "type" (int), "raw" (list of data bytes), plus type-specific keys.
+// On error returns [{}, pos].
+fn meta_decode(bytes_list, pos)
+    let result = []
+    let n = len(bytes_list)
+    let bad = {}
+    let fail = []
+    push(fail, bad)
+    push(fail, pos)
+    if pos + 2 > n
+        push(result, bad)
+        push(result, pos)
+        result = fail
+    else if bytes_list[pos] != 0xFF
+        result = fail
+    else
+        let typ = bytes_list[pos + 1]
+        let vlq_res = _meta_vlq_decode(bytes_list, pos + 2)
+        let dlen = vlq_res[0]
+        let data_start = vlq_res[1]
+        if dlen < 0
+            result = fail
+        else if data_start + dlen > n
+            result = fail
+        else
+            let raw = []
+            let ri = data_start
+            loop
+                if ri >= data_start + dlen
+                    break
+                push(raw, bytes_list[ri])
+                ri = ri + 1
+            let info = {}
+            info["type"] = typ
+            info["raw"] = raw
+            if typ == 0x51
+                if dlen == 3
+                    let us = (raw[0] * 65536) | (raw[1] * 256) | raw[2]
+                    info["us_per_quarter"] = us
+            else if typ == 0x58
+                if dlen == 4
+                    info["numerator"] = raw[0]
+                    let pw = raw[1]
+                    let dv = 1
+                    let pi = 0
+                    loop
+                        if pi >= pw
+                            break
+                        dv = dv * 2
+                        pi = pi + 1
+                    info["denominator"] = dv
+                    info["clocks"] = raw[2]
+                    info["n32"] = raw[3]
+            else if typ == 0x59
+                if dlen == 2
+                    let sf = raw[0]
+                    if sf >= 128
+                        sf = sf - 256
+                    info["sharps"] = sf
+                    info["is_minor"] = raw[1]
+            else if typ == 0x03
+                let nm = ""
+                let si = 0
+                loop
+                    if si >= dlen
+                        break
+                    nm = nm + chr(raw[si])
+                    si = si + 1
+                info["name"] = nm
+            else if typ == 0x01
+                let tx = ""
+                let si = 0
+                loop
+                    if si >= dlen
+                        break
+                    tx = tx + chr(raw[si])
+                    si = si + 1
+                info["text"] = tx
+            else if typ == 0x06
+                let mk = ""
+                let si = 0
+                loop
+                    if si >= dlen
+                        break
+                    mk = mk + chr(raw[si])
+                    si = si + 1
+                info["marker"] = mk
+            push(result, info)
+            push(result, data_start + dlen)
+    result

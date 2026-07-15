@@ -1,0 +1,200 @@
+// ============================================================================
+// NOVA Standard Library — std/midi/smf
+// ============================================================================
+// Standard MIDI File (SMF) chunk structure encoder/decoder (MIDI 1.0 / SMF).
+//
+// SMF FILE STRUCTURE
+//   An SMF file consists of chunks.  Each chunk has the form:
+//     <4 ASCII bytes: type tag> <u32 BE: length in bytes> <data bytes>
+//
+//   The HEADER chunk (MThd) is always first:
+//     "MThd"                 — 4 bytes, ASCII [77,84,104,100]
+//     0x00000006             — u32 BE, always 6 for MIDI 1.0
+//     format (u16 BE)        — 0=single track, 1=multi sync, 2=multi async
+//     ntrk   (u16 BE)        — number of track chunks following
+//     division (u16 BE)      — timing: if bit15=0 → ticks/quarter-note
+//                              if bit15=1 → SMPTE (negative fps | ticks/frame)
+//
+//   TRACK chunks (MTrk) follow the header:
+//     "MTrk"                 — 4 bytes, ASCII [77,84,114,107]
+//     <u32 BE: length>       — byte length of the event data
+//     <event bytes>          — VLQ delta-time + event data
+//
+// BYTE ORDER
+//   All multi-byte integer fields (length, format, ntracks, division) are
+//   BIG-ENDIAN as required by the SMF spec.
+//
+// VALIDATION
+//   smf_parse_header: returns {"format":-1,"ntracks":0,"division":0} on
+//   malformed input (too short or missing "MThd" magic).
+//   smf_chunk_type: returns "?" on buffers shorter than 4 bytes.
+//
+// PUBLIC API
+//   smf_header(format, ntracks, division)   -> list   14-byte MThd chunk
+//   smf_track(event_bytes_list)             -> list   MTrk chunk with length
+//   smf_parse_header(bytes_list)            -> dict   {format, ntracks, division}
+//   smf_chunk_type(bytes_list)              -> string 4-char type tag or "?"
+//
+// Private helpers are prefixed _smf_ to avoid cross-module collisions.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Append a big-endian u16 (2 bytes) to lst.
+fn _smf_push_u16(lst, v) -> int
+    let hi = (v >> 8) & 0xFF
+    let lo = v & 0xFF
+    push(lst, hi)
+    push(lst, lo)
+    0
+
+// Append a big-endian u32 (4 bytes) to lst.
+fn _smf_push_u32(lst, v) -> int
+    let b3 = (v >> 24) & 0xFF
+    let b2 = (v >> 16) & 0xFF
+    let b1 = (v >> 8) & 0xFF
+    let b0 = v & 0xFF
+    push(lst, b3)
+    push(lst, b2)
+    push(lst, b1)
+    push(lst, b0)
+    0
+
+// Read a big-endian u16 from bytes_list at offset pos.
+// Returns 0 if there are fewer than 2 bytes from pos.
+fn _smf_read_u16(bytes_list, pos) -> int
+    let n = len(bytes_list)
+    if pos + 1 >= n
+        return 0
+    let hi = bytes_list[pos] & 0xFF
+    let lo = bytes_list[pos + 1] & 0xFF
+    (hi << 8) | lo
+
+// Read a big-endian u32 from bytes_list at offset pos.
+// Returns 0 if there are fewer than 4 bytes from pos.
+fn _smf_read_u32(bytes_list, pos) -> int
+    let n = len(bytes_list)
+    if pos + 3 >= n
+        return 0
+    let b3 = bytes_list[pos] & 0xFF
+    let b2 = bytes_list[pos + 1] & 0xFF
+    let b1 = bytes_list[pos + 2] & 0xFF
+    let b0 = bytes_list[pos + 3] & 0xFF
+    (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+// Check that bytes_list[pos..pos+4] matches the 4 ASCII code points in tag_a..tag_d.
+// Returns 1 if equal, 0 otherwise.  Bounds-safe.
+fn _smf_tag_eq(bytes_list, pos, ta, tb, tc, td) -> int
+    let n = len(bytes_list)
+    if pos + 3 >= n
+        return 0
+    if bytes_list[pos] != ta
+        return 0
+    if bytes_list[pos + 1] != tb
+        return 0
+    if bytes_list[pos + 2] != tc
+        return 0
+    if bytes_list[pos + 3] != td
+        return 0
+    1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// smf_header(format, ntracks, division) -> list
+//
+// Builds a complete MThd header chunk (14 bytes):
+//   "MThd" [77,84,104,100] + u32(6) + u16(format) + u16(ntracks) + u16(division)
+//
+// format:   0 = single-track, 1 = multi-track synchronous, 2 = multi-track async
+// ntracks:  number of MTrk chunks that follow in the file
+// division: timing resolution; if bit15 clear = ticks per quarter-note (e.g. 480)
+fn smf_header(format, ntracks, division) -> list
+    let out = []
+    // "MThd" tag — ASCII [77, 84, 104, 100]
+    push(out, 77)
+    push(out, 84)
+    push(out, 104)
+    push(out, 100)
+    // Chunk length: always 6 for MIDI 1.0 headers
+    _smf_push_u32(out, 6)
+    // format (u16 BE)
+    _smf_push_u16(out, format)
+    // ntracks (u16 BE)
+    _smf_push_u16(out, ntracks)
+    // division (u16 BE)
+    _smf_push_u16(out, division)
+    out
+
+// smf_track(event_bytes_list) -> list
+//
+// Wraps raw event bytes with an MTrk chunk header:
+//   "MTrk" [77,84,114,107] + u32(len(event_bytes_list)) + event_bytes_list
+//
+// event_bytes_list: pre-encoded track events (VLQ delta-time + event data).
+// The caller is responsible for encoding events correctly before calling this.
+fn smf_track(event_bytes_list) -> list
+    let out = []
+    // "MTrk" tag — ASCII [77, 84, 114, 107]
+    push(out, 77)
+    push(out, 84)
+    push(out, 114)
+    push(out, 107)
+    // Chunk length: u32 BE of the event data length
+    let ev_len = len(event_bytes_list)
+    _smf_push_u32(out, ev_len)
+    // Append event bytes
+    let i = 0
+    while i < ev_len
+        push(out, event_bytes_list[i])
+        i = i + 1
+    out
+
+// smf_parse_header(bytes_list) -> dict
+//
+// Parses an MThd chunk (must start at offset 0) and returns:
+//   {"format": int, "ntracks": int, "division": int}
+//
+// Returns {"format":-1,"ntracks":0,"division":0} on error:
+//   - buffer shorter than 14 bytes (minimum MThd size)
+//   - magic bytes [0..3] are not "MThd"
+//
+// Reads format from offset 8, ntracks from 10, division from 12.
+fn smf_parse_header(bytes_list) -> dict
+    let result = {}
+    let n = len(bytes_list)
+    // Minimum: 4 (tag) + 4 (length) + 2 (format) + 2 (ntracks) + 2 (division) = 14
+    if n < 14
+        result["format"] = -1
+        result["ntracks"] = 0
+        result["division"] = 0
+        return result
+    // Verify "MThd" magic: [77, 84, 104, 100]
+    if _smf_tag_eq(bytes_list, 0, 77, 84, 104, 100) == 0
+        result["format"] = -1
+        result["ntracks"] = 0
+        result["division"] = 0
+        return result
+    // Parse the three u16 fields at offsets 8, 10, 12
+    result["format"] = _smf_read_u16(bytes_list, 8)
+    result["ntracks"] = _smf_read_u16(bytes_list, 10)
+    result["division"] = _smf_read_u16(bytes_list, 12)
+    result
+
+// smf_chunk_type(bytes_list) -> string
+//
+// Reads the 4-byte ASCII type tag from the start of a chunk byte list.
+// Returns a 4-character string such as "MThd" or "MTrk".
+// Returns "?" if the buffer is shorter than 4 bytes.
+//
+// Converts each byte to its ASCII character via chr().
+fn smf_chunk_type(bytes_list) -> string
+    let n = len(bytes_list)
+    if n < 4
+        return "?"
+    let s = ""
+    s = s + chr(bytes_list[0] & 0xFF)
+    s = s + chr(bytes_list[1] & 0xFF)
+    s = s + chr(bytes_list[2] & 0xFF)
+    s = s + chr(bytes_list[3] & 0xFF)
+    s
