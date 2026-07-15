@@ -1,0 +1,297 @@
+// std/game/handscore -- Poker hand strength as a comparable integer.
+// LEAF -- imports NOTHING.
+//
+// Card convention (shared across std/game/):
+//   A card is a 2-element list [rank, suit].
+//   rank 2..14 (11=J, 12=Q, 13=K, 14=A high). suit 0..3 (0=C,1=D,2=H,3=S).
+//
+// Public API:
+//   poker_score(cards: list) -> int
+//     Returns an integer encoding the strength of a 5-card poker hand.
+//     Higher integer means stronger hand. Cards may arrive in any order.
+//     Encoding: category * BASE^5 + tiebreak ranks (descending) packed in base-15.
+//     BASE = 15 (ranks fit in 0..14; with 5 slots: 15^5 = 759375 per category step).
+//
+//   category_rank(name: str) -> int
+//     Returns the category ordinal (0=high_card .. 9=royal_flush) for the given name.
+//     Valid names: "high_card", "pair", "two_pair", "three_of_a_kind",
+//                  "straight", "flush", "full_house", "four_of_a_kind",
+//                  "straight_flush", "royal_flush".
+//     Unknown name returns -1.
+//
+// Score encoding (category in slot 5, tiebreaks in slots 4..0):
+//   score = cat*B5 + r0*B4 + r1*B3 + r2*B2 + r3*B + r4
+//   where B=15, Bk = 15^k, and tiebreaks are ordered so a better hand always wins.
+//
+// Tiebreak ordering by category:
+//   royal_flush (9):       single combination; tiebreak all 0
+//   straight_flush (8):    highest card descending (5 ranks packed descending)
+//   four_of_a_kind (7):    quad rank, then kicker
+//   full_house (6):        triple rank, then pair rank
+//   flush (5):             5 ranks sorted descending
+//   straight (4):          highest card (wheel A=low=5-high encodes as 5)
+//   three_of_a_kind (3):   triple rank, then 2 kickers descending
+//   two_pair (2):          higher pair rank, lower pair rank, kicker
+//   pair (1):              pair rank, then 3 kickers descending
+//   high_card (0):         5 ranks sorted descending
+
+// ── private helpers ────────────────────────────────────────────────────────
+
+// _hs_b1..5 — powers of base 15 used for score packing.
+// We define them as functions to avoid module-level let (which doesn't export).
+fn _hs_b1() -> int
+    15
+
+fn _hs_b2() -> int
+    225
+
+fn _hs_b3() -> int
+    3375
+
+fn _hs_b4() -> int
+    50625
+
+fn _hs_b5() -> int
+    759375
+
+// _hs_pack5(r0,r1,r2,r3,r4) — pack 5 tiebreak ranks into one integer.
+// r0 is most significant (primary tiebreaker).
+fn _hs_pack5(r0, r1, r2, r3, r4) -> int
+    r0 * _hs_b4() + r1 * _hs_b3() + r2 * _hs_b2() + r3 * _hs_b1() + r4
+
+// _hs_score(cat, r0, r1, r2, r3, r4) — full score: category + packed tiebreaks.
+fn _hs_score(cat, r0, r1, r2, r3, r4) -> int
+    cat * _hs_b5() + _hs_pack5(r0, r1, r2, r3, r4)
+
+// _hs_rank(card) — extract rank (int) from a card [rank, suit].
+fn _hs_rank(card) -> int
+    card[0]
+
+// _hs_suit(card) — extract suit (int) from a card [rank, suit].
+fn _hs_suit(card) -> int
+    card[1]
+
+// _hs_sort5(r0,r1,r2,r3,r4) — insertion-sort 5 ranks descending; return as list.
+fn _hs_sort5(r0, r1, r2, r3, r4) -> list
+    let a = []
+    push(a, r0)
+    push(a, r1)
+    push(a, r2)
+    push(a, r3)
+    push(a, r4)
+    // insertion sort descending (n=5, fully unrolled via while loops)
+    let i = 1
+    while i < 5
+        let key = a[i]
+        let j = i - 1
+        while j >= 0 and a[j] < key
+            a[j + 1] = a[j]
+            j = j - 1
+        a[j + 1] = key
+        i = i + 1
+    a
+
+// _hs_is_flush(cards) -> 1 if all 5 cards share the same suit, else 0.
+fn _hs_is_flush(cards) -> int
+    let s = _hs_suit(cards[0])
+    if _hs_suit(cards[1]) != s
+        return 0
+    if _hs_suit(cards[2]) != s
+        return 0
+    if _hs_suit(cards[3]) != s
+        return 0
+    if _hs_suit(cards[4]) != s
+        return 0
+    1
+
+// _hs_is_straight(sorted_ranks) -> 1 if the 5 ranks form a straight, else 0.
+// sorted_ranks must be descending (output of _hs_sort5).
+// Also detects wheel: A-2-3-4-5 (ranks 14,2,3,4,5 -> sorted 14,5,4,3,2).
+fn _hs_is_straight(sr) -> int
+    // Normal straight: each rank is exactly 1 less than previous.
+    let r0 = sr[0]
+    let r1 = sr[1]
+    let r2 = sr[2]
+    let r3 = sr[3]
+    let r4 = sr[4]
+    if r1 == r0 - 1 and r2 == r0 - 2 and r3 == r0 - 3 and r4 == r0 - 4
+        return 1
+    // Wheel: A-2-3-4-5. Sorted desc: 14,5,4,3,2.
+    if r0 == 14 and r1 == 5 and r2 == 4 and r3 == 3 and r4 == 2
+        return 1
+    0
+
+// _hs_straight_high(sorted_ranks) -> the effective high card for the straight.
+// For wheel (A-2-3-4-5), effective high = 5 (not 14).
+fn _hs_straight_high(sr) -> int
+    let r0 = sr[0]
+    let r1 = sr[1]
+    let r2 = sr[2]
+    let r3 = sr[3]
+    let r4 = sr[4]
+    // Wheel check
+    if r0 == 14 and r1 == 5 and r2 == 4 and r3 == 3 and r4 == 2
+        return 5
+    r0
+
+// _hs_freq_dict — build rank-frequency dict keyed by str(rank).
+// Returns a dict {"2":c,"3":c,...,"14":c} for present ranks.
+fn _hs_freq_dict(cards) -> dict
+    let d = {}
+    let i = 0
+    while i < len(cards)
+        let r = str(_hs_rank(cards[i]))
+        if contains(d, r)
+            d[r] = d[r] + 1
+        else
+            d[r] = 1
+        i = i + 1
+    d
+
+// _hs_group_ranks(cards) -> [fours, threes, pairs, singles]
+// Each is a list of ranks with that frequency, sorted descending.
+// Used for four-of-a-kind, full house, three-of-a-kind, two-pair, pair detection.
+fn _hs_group_ranks(cards) -> list
+    let d = _hs_freq_dict(cards)
+    let fours = []
+    let threes = []
+    let pairs = []
+    let singles = []
+    // Iterate ranks 14 down to 2 so sublists come out descending automatically.
+    let r = 14
+    while r >= 2
+        let k = str(r)
+        if contains(d, k)
+            let c = d[k]
+            if c == 4
+                push(fours, r)
+            else
+                if c == 3
+                    push(threes, r)
+                else
+                    if c == 2
+                        push(pairs, r)
+                    else
+                        push(singles, r)
+        r = r - 1
+    let result = []
+    push(result, fours)
+    push(result, threes)
+    push(result, pairs)
+    push(result, singles)
+    result
+
+// ── Public API ─────────────────────────────────────────────────────────────
+
+// category_rank(name) -> int (0..9), or -1 if unknown.
+fn category_rank(name) -> int
+    if name == "royal_flush"
+        return 9
+    if name == "straight_flush"
+        return 8
+    if name == "four_of_a_kind"
+        return 7
+    if name == "full_house"
+        return 6
+    if name == "flush"
+        return 5
+    if name == "straight"
+        return 4
+    if name == "three_of_a_kind"
+        return 3
+    if name == "two_pair"
+        return 2
+    if name == "pair"
+        return 1
+    if name == "high_card"
+        return 0
+    -1
+
+// poker_score(cards) -> int strength of a 5-card poker hand.
+// Higher integer = stronger hand. Fully comparable across all categories.
+fn poker_score(cards) -> int
+    let r0 = _hs_rank(cards[0])
+    let r1 = _hs_rank(cards[1])
+    let r2 = _hs_rank(cards[2])
+    let r3 = _hs_rank(cards[3])
+    let r4 = _hs_rank(cards[4])
+    let sr = _hs_sort5(r0, r1, r2, r3, r4)
+
+    let is_fl = _hs_is_flush(cards)
+    let is_st = _hs_is_straight(sr)
+
+    // Straight flush / royal flush
+    if is_fl == 1 and is_st == 1
+        let hi = _hs_straight_high(sr)
+        if hi == 14
+            // Royal flush: A-K-Q-J-T same suit
+            return _hs_score(9, 0, 0, 0, 0, 0)
+        // Straight flush
+        return _hs_score(8, hi, 0, 0, 0, 0)
+
+    // Group-based categories
+    let groups = _hs_group_ranks(cards)
+    let fours = groups[0]
+    let threes = groups[1]
+    let pairs = groups[2]
+    let singles = groups[3]
+
+    // Four of a kind
+    if len(fours) == 1
+        let q = fours[0]
+        let kicker = 0
+        if len(singles) >= 1
+            kicker = singles[0]
+        return _hs_score(7, q, kicker, 0, 0, 0)
+
+    // Full house
+    if len(threes) == 1 and len(pairs) >= 1
+        let trip = threes[0]
+        let pr = pairs[0]
+        return _hs_score(6, trip, pr, 0, 0, 0)
+
+    // Flush
+    if is_fl == 1
+        return _hs_score(5, sr[0], sr[1], sr[2], sr[3], sr[4])
+
+    // Straight
+    if is_st == 1
+        let hi = _hs_straight_high(sr)
+        return _hs_score(4, hi, 0, 0, 0, 0)
+
+    // Three of a kind
+    if len(threes) == 1
+        let trip = threes[0]
+        let k0 = 0
+        let k1 = 0
+        if len(singles) >= 1
+            k0 = singles[0]
+        if len(singles) >= 2
+            k1 = singles[1]
+        return _hs_score(3, trip, k0, k1, 0, 0)
+
+    // Two pair
+    if len(pairs) == 2
+        let ph = pairs[0]
+        let pl = pairs[1]
+        let kicker = 0
+        if len(singles) >= 1
+            kicker = singles[0]
+        return _hs_score(2, ph, pl, kicker, 0, 0)
+
+    // One pair
+    if len(pairs) == 1
+        let pr = pairs[0]
+        let k0 = 0
+        let k1 = 0
+        let k2 = 0
+        if len(singles) >= 1
+            k0 = singles[0]
+        if len(singles) >= 2
+            k1 = singles[1]
+        if len(singles) >= 3
+            k2 = singles[2]
+        return _hs_score(1, pr, k0, k1, k2, 0)
+
+    // High card
+    _hs_score(0, sr[0], sr[1], sr[2], sr[3], sr[4])
