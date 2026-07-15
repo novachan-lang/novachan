@@ -1,0 +1,339 @@
+// ============================================================================
+// NOVA Standard Library — std/music/chord
+// ============================================================================
+// Chord construction and identification from root MIDI note numbers.
+//
+// PITCH CLASS CONVENTION
+//   pitch class = MIDI note % 12   (C=0, C#=1, D=2, D#=3, E=4, F=5,
+//                                   F#=6, G=7, G#=8, A=9, A#=10, B=11)
+//   All arithmetic is integer-only; no floats used.
+//
+// SUPPORTED QUALITIES AND THEIR SEMITONE STACKS FROM ROOT
+//   major  [0,4,7]       minor  [0,3,7]
+//   dim    [0,3,6]       aug    [0,4,8]
+//   sus2   [0,2,7]       sus4   [0,5,7]
+//   maj7   [0,4,7,11]    min7   [0,3,7,10]
+//   dom7   [0,4,7,10]    dim7   [0,3,6,9]
+//   maj6   [0,4,7,9]     min6   [0,3,7,9]
+//
+// PUBLIC API
+//   chord_notes(root, quality) -> list  MIDI note numbers in root position
+//   chord_intervals(quality)   -> list  semitone intervals from root
+//   chord_invert(notes, n)     -> list  nth inversion (0=root, 1=1st, ...)
+//   identify_chord(notes)      -> str   quality name, or "unknown"
+//
+// NOTES
+//   chord_invert: each inversion raises the lowest note by one octave (12
+//   semitones), cycling the bass through each chord tone.  For inversion N,
+//   the function applies one inversion step N times.
+//   identify_chord: converts every note to its pitch class, de-duplicates,
+//   and tests all rotations of the resulting interval vector against every
+//   known quality.  The root is the lowest pitch class in the matching
+//   rotation.  On no match, returns "unknown".
+// ============================================================================
+
+// ── private: interval vectors ─────────────────────────────────────────────────
+
+// _chord_intervals_for(quality) -> list | null
+//   Return the semitone interval list for the named quality, or null.
+fn _chord_intervals_for(quality)
+    let result = null
+    if quality == "major"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 4)
+        push(ivs, 7)
+        result = ivs
+    else if quality == "minor"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 3)
+        push(ivs, 7)
+        result = ivs
+    else if quality == "dim"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 3)
+        push(ivs, 6)
+        result = ivs
+    else if quality == "aug"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 4)
+        push(ivs, 8)
+        result = ivs
+    else if quality == "sus2"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 2)
+        push(ivs, 7)
+        result = ivs
+    else if quality == "sus4"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 5)
+        push(ivs, 7)
+        result = ivs
+    else if quality == "maj7"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 4)
+        push(ivs, 7)
+        push(ivs, 11)
+        result = ivs
+    else if quality == "min7"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 3)
+        push(ivs, 7)
+        push(ivs, 10)
+        result = ivs
+    else if quality == "dom7"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 4)
+        push(ivs, 7)
+        push(ivs, 10)
+        result = ivs
+    else if quality == "dim7"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 3)
+        push(ivs, 6)
+        push(ivs, 9)
+        result = ivs
+    else if quality == "maj6"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 4)
+        push(ivs, 7)
+        push(ivs, 9)
+        result = ivs
+    else if quality == "min6"
+        let ivs = []
+        push(ivs, 0)
+        push(ivs, 3)
+        push(ivs, 7)
+        push(ivs, 9)
+        result = ivs
+    result
+
+// _chord_quality_names() -> list of strings
+//   Return all supported quality names in priority order (larger chords first
+//   so 4-note chords are identified before 3-note subsets could match).
+fn _chord_quality_names()
+    let names = []
+    push(names, "maj7")
+    push(names, "min7")
+    push(names, "dom7")
+    push(names, "dim7")
+    push(names, "maj6")
+    push(names, "min6")
+    push(names, "major")
+    push(names, "minor")
+    push(names, "dim")
+    push(names, "aug")
+    push(names, "sus2")
+    push(names, "sus4")
+    names
+
+// ── private: insertion sort on a list (ascending) ────────────────────────────
+
+fn _sort_list(lst)
+    let n = len(lst)
+    let i = 1
+    while i < n
+        let key = lst[i]
+        // Scan leftward to find insertion position; shift elements right.
+        let ins = i
+        let j = i - 1
+        let go = 1
+        while go == 1
+            if j < 0
+                go = 0
+            else
+                let v = lst[j]
+                if v > key
+                    lst[j + 1] = v
+                    ins = j
+                    j = j - 1
+                else
+                    go = 0
+        lst[ins] = key
+        i = i + 1
+    lst
+
+// ── private: pitch-class helpers ─────────────────────────────────────────────
+
+// _pitchclass(n) -> int
+//   Convert MIDI note n to pitch class 0..11 without importing midi/note
+//   (avoids import coupling; simple arithmetic).
+fn _pitchclass(n)
+    let pc = n - (n / 12) * 12
+    pc
+
+// _pcs_from_notes(notes) -> sorted list of unique pitch classes
+fn _pcs_from_notes(notes)
+    let pcs = []
+    let i = 0
+    let nlen = len(notes)
+    while i < nlen
+        let pc = _pitchclass(notes[i])
+        // Check if already present.
+        let found = 0
+        let j = 0
+        while j < len(pcs)
+            if pcs[j] == pc
+                found = 1
+            j = j + 1
+        if found == 0
+            push(pcs, pc)
+        i = i + 1
+    _sort_list(pcs)
+
+// _intervals_from_root(pcs, root_idx) -> list of semitone intervals mod 12
+//   pcs is sorted; root_idx selects which pc is the root.
+//   All other pcs are expressed as positive semitones above the root.
+fn _intervals_from_root(pcs, root_idx)
+    let root = pcs[root_idx]
+    let n = len(pcs)
+    let ivs = []
+    let i = 0
+    while i < n
+        let diff = pcs[i] - root
+        if diff < 0
+            diff = diff + 12
+        push(ivs, diff)
+        i = i + 1
+    _sort_list(ivs)
+
+// _lists_equal(a, b) -> int (1=equal, 0=not)
+fn _lists_equal(a, b)
+    let na = len(a)
+    let nb = len(b)
+    let eq = 1
+    if na != nb
+        eq = 0
+    else
+        let i = 0
+        while i < na
+            if a[i] != b[i]
+                eq = 0
+            i = i + 1
+    eq
+
+// ── public API ────────────────────────────────────────────────────────────────
+
+// chord_intervals(quality) -> list
+//   Return the semitone interval list for a named chord quality.
+//   Returns an empty list if the quality is not recognised.
+fn chord_intervals(quality)
+    let ivs = _chord_intervals_for(quality)
+    if ivs == null
+        let empty = []
+        empty
+    else
+        ivs
+
+// chord_notes(root, quality) -> list
+//   Return the MIDI note numbers for a chord built on root (MIDI note number)
+//   with the given quality.  Returns an empty list for unknown qualities.
+fn chord_notes(root, quality)
+    let ivs = _chord_intervals_for(quality)
+    let result = []
+    if ivs != null
+        let i = 0
+        let n = len(ivs)
+        while i < n
+            push(result, root + ivs[i])
+            i = i + 1
+    result
+
+// chord_invert(notes, inversion) -> list
+//   Return the nth inversion of notes (a list of MIDI note numbers).
+//   Each inversion step takes the lowest note and raises it by one octave
+//   (12 semitones), appending it to the end.  The root-position chord is
+//   inversion 0.  Works on any number of notes.
+fn chord_invert(notes, inversion)
+    // Copy input list.
+    let result = []
+    let i = 0
+    let nlen = len(notes)
+    while i < nlen
+        push(result, notes[i])
+        i = i + 1
+    // Apply inversion steps.
+    let step = 0
+    while step < inversion
+        // Find index of minimum note.
+        let min_val = result[0]
+        let min_idx = 0
+        let j = 1
+        while j < len(result)
+            if result[j] < min_val
+                min_val = result[j]
+                min_idx = j
+            j = j + 1
+        // Raise that note by one octave.
+        let raised = min_val + 12
+        // Remove it from its current position by rebuilding without it.
+        let next = []
+        let k = 0
+        while k < len(result)
+            if k != min_idx
+                push(next, result[k])
+            k = k + 1
+        push(next, raised)
+        result = next
+        step = step + 1
+    result
+
+// identify_chord(notes) -> str
+//   Given a list of MIDI note numbers, identify the chord quality.
+//   Converts to pitch classes, de-duplicates, then tests every rotation
+//   (one per pitch class as potential root) against all known qualities.
+//   Returns the quality name (e.g. "major"), or "unknown" if not matched.
+//   Priority: 4-note chords checked before 3-note chords to avoid false
+//   positives (dim7 before dim, etc.).
+fn identify_chord(notes)
+    let pcs = _pcs_from_notes(notes)
+    let npc = len(pcs)
+    let qualities = _chord_quality_names()
+    let nq = len(qualities)
+    let found = "unknown"
+    let done = 0
+    // Pass 1: try root = pcs[0] only (lowest pitch class).
+    // This resolves ambiguous pairs like sus2/sus4 by preferring the
+    // lowest-note interpretation before trying other rotations.
+    let qi0 = 0
+    while qi0 < nq
+        if done == 0
+            let quality = qualities[qi0]
+            let target = _chord_intervals_for(quality)
+            if target != null
+                let tlen = len(target)
+                if npc == tlen
+                    let ivs0 = _intervals_from_root(pcs, 0)
+                    if _lists_equal(ivs0, target) == 1
+                        found = quality
+                        done = 1
+        qi0 = qi0 + 1
+    // Pass 2: try all other rotations (handles inverted chords).
+    let qi = 0
+    while qi < nq
+        if done == 0
+            let quality = qualities[qi]
+            let target = _chord_intervals_for(quality)
+            if target != null
+                let tlen = len(target)
+                if npc == tlen
+                    let ri = 1
+                    while ri < npc
+                        if done == 0
+                            let ivs = _intervals_from_root(pcs, ri)
+                            if _lists_equal(ivs, target) == 1
+                                found = quality
+                                done = 1
+                        ri = ri + 1
+        qi = qi + 1
+    found
