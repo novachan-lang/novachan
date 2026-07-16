@@ -1,0 +1,366 @@
+// ============================================================================
+// NOVA Standard Library — std/text/nlp_eval
+// ============================================================================
+// Evaluation metrics for MT, summarization, and ASR:
+//   BLEU, ROUGE-N, ROUGE-L, WER, CER, token F1, Levenshtein distance.
+//
+// Public API:
+//   ev_tokens(s)                -> list   whitespace-delimited tokens
+//   ev_ngrams(tokens,n)         -> list   n-grams as joined strings
+//   ev_precision_n(cand,ref,n)  -> float  clipped n-gram precision
+//   ev_brevity_penalty(cl,rl)   -> float  BP = 1 if cl>=rl else exp(1-rl/cl)
+//   ev_bleu(cand,ref)           -> float  BLEU-4
+//   ev_bleu_n(cand,ref,maxn)    -> float  BLEU up to maxn-grams
+//   ev_rouge_n(cand,ref,n)      -> float  n-gram recall over reference
+//   ev_rouge_l(cand,ref)        -> float  LCS-based F-measure
+//   ev_wer(ref,hyp)             -> float  word error rate
+//   ev_cer(ref,hyp)             -> float  character error rate
+//   ev_edit_distance(a,b)       -> int    Levenshtein over token lists
+//   ev_f1_tokens(cand,ref)      -> float  token-overlap F1
+// ============================================================================
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+// _ev_min3(a,b,c) returns the minimum of three ints.
+fn _ev_min3(a, b, c) -> int
+    let m = a
+    if b < m
+        m = b
+    if c < m
+        m = c
+    m
+
+// _ev_abs_f(x) absolute value for float.
+fn _ev_abs_f(x) -> float
+    if x < 0.0
+        return 0.0 - x
+    x
+
+// _ev_count_in_list counts occurrences of item in lst (string comparison).
+fn _ev_count_in_list(lst, item) -> int
+    let n = len(lst)
+    let cnt = 0
+    let i = 0
+    while i < n
+        if lst[i] == item
+            cnt = cnt + 1
+        i = i + 1
+    cnt
+
+// _ev_freq builds a frequency dict for a list of string items.
+fn _ev_freq(lst) -> any
+    let d = {}
+    let n = len(lst)
+    let i = 0
+    while i < n
+        let w = lst[i]
+        if contains(d, w)
+            d[w] = d[w] + 1
+        else
+            d[w] = 1
+        i = i + 1
+    d
+
+// _ev_join joins a sublist of `tokens` from index start for count items with " ".
+fn _ev_join(tokens, start, count) -> string
+    let r = ""
+    let i = 0
+    while i < count
+        if i > 0
+            r = r + " "
+        r = r + tokens[start + i]
+        i = i + 1
+    r
+
+// _ev_lcs_len computes the length of the longest common subsequence of two lists.
+// Uses O(m*n) DP stored in a flat list (row-major, (n+1) columns).
+fn _ev_lcs_len(a, b) -> int
+    let m = len(a)
+    let nb = len(b)
+    if m == 0 or nb == 0
+        return 0
+    // Allocate (m+1)*(nb+1) flat DP table initialised to 0
+    let cols = nb + 1
+    let total = (m + 1) * cols
+    let dp = []
+    let init = 0
+    while init < total
+        push(dp, 0)
+        init = init + 1
+    // Fill DP table
+    let i = 1
+    while i <= m
+        let j = 1
+        while j <= nb
+            let idx = i * cols + j
+            if a[i - 1] == b[j - 1]
+                dp[idx] = dp[(i - 1) * cols + (j - 1)] + 1
+            else
+                let up = dp[(i - 1) * cols + j]
+                let left = dp[i * cols + (j - 1)]
+                if up > left
+                    dp[idx] = up
+                else
+                    dp[idx] = left
+            j = j + 1
+        i = i + 1
+    dp[m * cols + nb]
+
+// _ev_chars splits string s into a list of single-character strings.
+fn _ev_chars(s) -> any
+    let result = []
+    let n = len(s)
+    let i = 0
+    while i < n
+        push(result, slice(s, i, i + 1))
+        i = i + 1
+    result
+
+// _ev_edit_int_list computes Levenshtein over a list of strings using two-row DP.
+fn _ev_edit_int_list(a, b) -> int
+    let m = len(a)
+    let nb = len(b)
+    if m == 0
+        return nb
+    if nb == 0
+        return m
+    // prev row: distance from empty a-prefix to each b-prefix
+    let prev = []
+    let i = 0
+    while i <= nb
+        push(prev, i)
+        i = i + 1
+    i = 1
+    while i <= m
+        let curr = []
+        push(curr, i)
+        let j = 1
+        while j <= nb
+            let cost = 1
+            if a[i - 1] == b[j - 1]
+                cost = 0
+            let del_cost = prev[j] + 1
+            let ins_cost = curr[j - 1] + 1
+            let sub_cost = prev[j - 1] + cost
+            push(curr, _ev_min3(del_cost, ins_cost, sub_cost))
+            j = j + 1
+        prev = curr
+        i = i + 1
+    prev[nb]
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// ev_tokens splits string s on whitespace, returning a list of non-empty tokens.
+fn ev_tokens(s) -> any
+    let result = []
+    let n = len(s)
+    let i = 0
+    let start = 0
+    let in_tok = false
+    while i < n
+        let o = ord(slice(s, i, i + 1))
+        let is_ws = false
+        if o == 32 or o == 9 or o == 10 or o == 13
+            is_ws = true
+        if is_ws
+            if in_tok
+                push(result, slice(s, start, i))
+                in_tok = false
+        else
+            if not in_tok
+                start = i
+                in_tok = true
+        i = i + 1
+    if in_tok
+        push(result, slice(s, start, n))
+    result
+
+// ev_ngrams returns a list of n-gram strings (tokens joined by spaces).
+fn ev_ngrams(tokens, n) -> any
+    let result = []
+    let tlen = len(tokens)
+    if n < 1 or tlen < n
+        return result
+    let i = 0
+    while i <= tlen - n
+        push(result, _ev_join(tokens, i, n))
+        i = i + 1
+    result
+
+// ev_precision_n computes clipped n-gram precision of cand vs ref.
+// cand and ref are whitespace strings (will be tokenised internally).
+fn ev_precision_n(cand, ref, n) -> float
+    let ctoks = ev_tokens(cand)
+    let rtoks = ev_tokens(ref)
+    let cgrams = ev_ngrams(ctoks, n)
+    let rgrams = ev_ngrams(rtoks, n)
+    let clen = len(cgrams)
+    if clen == 0
+        return 0.0
+    let rfreq = _ev_freq(rgrams)
+    // Clipped count: for each cand gram, clip matches to ref freq
+    let cfreq = _ev_freq(cgrams)
+    let ckeys = keys(cfreq)
+    let nk = len(ckeys)
+    let matches = 0
+    let i = 0
+    while i < nk
+        let g = ckeys[i]
+        let cf = cfreq[g]
+        let rf = 0
+        if contains(rfreq, g)
+            rf = rfreq[g]
+        let clipped = cf
+        if rf < clipped
+            clipped = rf
+        matches = matches + clipped
+        i = i + 1
+    let r = matches * 1.0 / (clen * 1.0)
+    r
+
+// ev_brevity_penalty returns BP = 1.0 if cand_len >= ref_len else exp(1 - ref/cand).
+fn ev_brevity_penalty(cand_len, ref_len) -> float
+    if cand_len <= 0
+        return 0.0
+    if cand_len >= ref_len
+        return 1.0
+    let exponent = 1.0 - (ref_len * 1.0 / (cand_len * 1.0))
+    let r = pow(2.718281828459045, exponent)
+    r
+
+// ev_bleu_n computes BLEU with precision from 1..maxn grams and brevity penalty.
+// Uses geometric mean of precisions; if any precision is 0, returns 0.0.
+fn ev_bleu_n(cand, ref, maxn) -> float
+    let ctoks = ev_tokens(cand)
+    let rtoks = ev_tokens(ref)
+    let clen = len(ctoks)
+    let rlen = len(rtoks)
+    if clen == 0 or rlen == 0
+        return 0.0
+    let bp = ev_brevity_penalty(clen, rlen)
+    // Geometric mean via sum of logs
+    let log_sum = 0.0
+    let n = 1
+    while n <= maxn
+        let p = ev_precision_n(cand, ref, n)
+        if p <= 0.0
+            return 0.0
+        log_sum = log_sum + log(p)
+        n = n + 1
+    let avg_log = log_sum / (maxn * 1.0)
+    let r = bp * pow(2.718281828459045, avg_log)
+    r
+
+// ev_bleu computes BLEU-4.
+fn ev_bleu(cand, ref) -> float
+    let r = ev_bleu_n(cand, ref, 4)
+    r
+
+// ev_rouge_n computes n-gram recall of cand vs ref (ref is the gold standard).
+// ROUGE-N = matched_ngrams_in_ref / total_ngrams_in_ref.
+fn ev_rouge_n(cand, ref, n) -> float
+    let ctoks = ev_tokens(cand)
+    let rtoks = ev_tokens(ref)
+    let rgrams = ev_ngrams(rtoks, n)
+    let rlen = len(rgrams)
+    if rlen == 0
+        return 0.0
+    let cgrams = ev_ngrams(ctoks, n)
+    let rfreq = _ev_freq(rgrams)
+    let cfreq = _ev_freq(cgrams)
+    let matches = 0
+    let rkeys = keys(rfreq)
+    let nk = len(rkeys)
+    let i = 0
+    while i < nk
+        let g = rkeys[i]
+        let rf = rfreq[g]
+        let cf = 0
+        if contains(cfreq, g)
+            cf = cfreq[g]
+        let clipped = rf
+        if cf < clipped
+            clipped = cf
+        matches = matches + clipped
+        i = i + 1
+    let r = matches * 1.0 / (rlen * 1.0)
+    r
+
+// ev_rouge_l computes LCS-based F-measure between cand and ref.
+fn ev_rouge_l(cand, ref) -> float
+    let ctoks = ev_tokens(cand)
+    let rtoks = ev_tokens(ref)
+    let clen = len(ctoks)
+    let rlen = len(rtoks)
+    if clen == 0 or rlen == 0
+        return 0.0
+    let lcs = _ev_lcs_len(ctoks, rtoks)
+    let lcs_f = lcs * 1.0
+    let prec = lcs_f / (clen * 1.0)
+    let rec = lcs_f / (rlen * 1.0)
+    if prec + rec == 0.0
+        return 0.0
+    let r = 2.0 * prec * rec / (prec + rec)
+    r
+
+// ev_edit_distance computes Levenshtein distance between two token lists.
+fn ev_edit_distance(a, b) -> int
+    _ev_edit_int_list(a, b)
+
+// ev_wer computes word error rate: edit_distance(ref_words, hyp_words) / len(ref_words).
+// ref and hyp are space-separated strings.
+fn ev_wer(ref, hyp) -> float
+    let rtoks = ev_tokens(ref)
+    let htoks = ev_tokens(hyp)
+    let rlen = len(rtoks)
+    if rlen == 0
+        return 0.0
+    let dist = _ev_edit_int_list(rtoks, htoks)
+    let r = dist * 1.0 / (rlen * 1.0)
+    r
+
+// ev_cer computes character error rate: edit_distance(ref_chars, hyp_chars) / len(ref).
+fn ev_cer(ref, hyp) -> float
+    let rchars = _ev_chars(ref)
+    let hchars = _ev_chars(hyp)
+    let rlen = len(rchars)
+    if rlen == 0
+        return 0.0
+    let dist = _ev_edit_int_list(rchars, hchars)
+    let r = dist * 1.0 / (rlen * 1.0)
+    r
+
+// ev_f1_tokens computes token-overlap F1 between cand and ref (unordered bag).
+fn ev_f1_tokens(cand, ref) -> float
+    let ctoks = ev_tokens(cand)
+    let rtoks = ev_tokens(ref)
+    let clen = len(ctoks)
+    let rlen = len(rtoks)
+    if clen == 0 or rlen == 0
+        return 0.0
+    let cfreq = _ev_freq(ctoks)
+    let rfreq = _ev_freq(rtoks)
+    let matches = 0
+    let ckeys = keys(cfreq)
+    let nk = len(ckeys)
+    let i = 0
+    while i < nk
+        let w = ckeys[i]
+        let cf = cfreq[w]
+        let rf = 0
+        if contains(rfreq, w)
+            rf = rfreq[w]
+        let clipped = cf
+        if rf < clipped
+            clipped = rf
+        matches = matches + clipped
+        i = i + 1
+    if matches == 0
+        return 0.0
+    let prec = matches * 1.0 / (clen * 1.0)
+    let rec = matches * 1.0 / (rlen * 1.0)
+    let r = 2.0 * prec * rec / (prec + rec)
+    r
+
+fn main()
+    print("std/text/nlp_eval loaded")

@@ -1,0 +1,248 @@
+// ============================================================================
+// NOVA Standard Library — std/text/ngram_lm
+// ============================================================================
+// N-gram language model with Laplace (add-k) smoothing.
+//
+// Model dict structure:
+//   "n"              -> int   order of the model
+//   "vocab_size"     -> int   number of distinct tokens seen in training
+//   "counts"         -> dict  context_key -> dict(next_word -> count)
+//   "context_totals" -> dict  context_key -> int total for that context
+//
+// Context key for bigram (n=2): the single preceding word.
+// Context key for unigram (n=1): "" (empty string).
+// Context key for trigram (n=3): "w1 w2" (space-joined history of n-1 words).
+//
+// Public API:
+//   lm_ngrams(tokens,n)                -> list    n-grams as lists of strings
+//   lm_train(corpus_tokens,n)          -> dict    the model dict
+//   lm_count(model,context,word)       -> int     raw count
+//   lm_prob_mle(model,context,word)    -> float   MLE probability
+//   lm_prob_laplace(model,context,word,k) -> float  add-k probability
+//   lm_sentence_logprob(model,tokens,k)  -> float  sum log(laplace prob) per word
+//   lm_perplexity(model,tokens,k)      -> float   exp(-logprob / num_words)
+//   lm_vocab_size(model)               -> int
+//   lm_unseen_prob(model,context,word,k) -> float  (same as laplace; for clarity)
+//   lm_most_likely_next(model,context) -> string  arg-max word by raw count
+//   lm_context_total(model,context)    -> int     total count for context
+//   lm_add_k_default()                 -> float   returns 1.0
+// ============================================================================
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+// _lm_build_vocab returns a dict of all distinct tokens -> 1.
+fn _lm_build_vocab(tokens) -> any
+    let d = {}
+    let n = len(tokens)
+    let i = 0
+    while i < n
+        let w = tokens[i]
+        if not contains(d, w)
+            d[w] = 1
+        i = i + 1
+    d
+
+// _lm_max_word_by_count returns the word with the highest count in an inner dict.
+fn _lm_max_word_by_count(inner) -> string
+    let ws = keys(inner)
+    let nw = len(ws)
+    if nw == 0
+        return ""
+    let best = ws[0]
+    let best_v = inner[ws[0]]
+    let i = 1
+    while i < nw
+        let v = inner[ws[i]]
+        if v > best_v
+            best_v = v
+            best = ws[i]
+        i = i + 1
+    best
+
+// _lm_context_key builds the context key for position i in a token list.
+// For n-gram model, context is the (n-1) words preceding position i.
+// Returns "" for unigram models (n==1).
+fn _lm_context_key(tokens, i, n) -> string
+    if n <= 1
+        return ""
+    let ctx = ""
+    let start = i - (n - 1)
+    if start < 0
+        start = 0
+    let j = start
+    while j < i
+        if j > start
+            ctx = ctx + " "
+        ctx = ctx + tokens[j]
+        j = j + 1
+    ctx
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// lm_ngrams returns a list of n-grams; each n-gram is itself a list of strings.
+fn lm_ngrams(tokens, n) -> any
+    let result = []
+    let tlen = len(tokens)
+    if n < 1 or tlen < n
+        return result
+    let i = 0
+    while i <= tlen - n
+        let gram = []
+        let j = 0
+        while j < n
+            push(gram, tokens[i + j])
+            j = j + 1
+        push(result, gram)
+        i = i + 1
+    result
+
+// lm_train trains an n-gram language model on corpus_tokens.
+// Returns the model dict described in the module header.
+fn lm_train(corpus_tokens, n) -> any
+    let model = {}
+    model["n"] = n
+    let vocab = _lm_build_vocab(corpus_tokens)
+    let vocab_keys = keys(vocab)
+    model["vocab_size"] = len(vocab_keys)
+    let counts = {}
+    let ctx_totals = {}
+    let tlen = len(corpus_tokens)
+    let i = n - 1
+    while i < tlen
+        let ctx = _lm_context_key(corpus_tokens, i, n)
+        let word = corpus_tokens[i]
+        if not contains(counts, ctx)
+            let inner = {}
+            counts[ctx] = inner
+        let inner_now = counts[ctx]
+        if contains(inner_now, word)
+            inner_now[word] = inner_now[word] + 1
+        else
+            inner_now[word] = 1
+        if contains(ctx_totals, ctx)
+            ctx_totals[ctx] = ctx_totals[ctx] + 1
+        else
+            ctx_totals[ctx] = 1
+        i = i + 1
+    model["counts"] = counts
+    model["context_totals"] = ctx_totals
+    model
+
+// lm_count returns the raw count of (context, word) in the model.
+fn lm_count(model, context, word) -> int
+    let counts = model["counts"]
+    if not contains(counts, context)
+        return 0
+    let inner = counts[context]
+    if not contains(inner, word)
+        return 0
+    inner[word]
+
+// lm_context_total returns the total count for the given context.
+fn lm_context_total(model, context) -> int
+    let ctx_totals = model["context_totals"]
+    if not contains(ctx_totals, context)
+        return 0
+    ctx_totals[context]
+
+// lm_vocab_size returns the vocabulary size of the model.
+fn lm_vocab_size(model) -> int
+    model["vocab_size"]
+
+// lm_prob_mle computes the MLE probability P(word | context).
+// Returns 0.0 if context has never been seen.
+fn lm_prob_mle(model, context, word) -> float
+    let total = lm_context_total(model, context)
+    if total == 0
+        return 0.0
+    let cnt = lm_count(model, context, word)
+    let r = cnt * 1.0 / (total * 1.0)
+    r
+
+// lm_prob_laplace computes add-k smoothed probability P(word | context).
+// P = (count + k) / (context_total + k * vocab_size).
+fn lm_prob_laplace(model, context, word, k) -> float
+    let cnt = lm_count(model, context, word)
+    let total = lm_context_total(model, context)
+    let vs = lm_vocab_size(model)
+    let num = cnt * 1.0 + k
+    let den = total * 1.0 + k * (vs * 1.0)
+    if den == 0.0
+        return 0.0
+    let r = num / den
+    r
+
+// lm_unseen_prob is an alias for lm_prob_laplace (unseen word same formula).
+fn lm_unseen_prob(model, context, word, k) -> float
+    let r = lm_prob_laplace(model, context, word, k)
+    r
+
+// lm_most_likely_next returns the most probable next word given a context
+// (by raw count in the model, no smoothing).  Returns "" if context unseen.
+fn lm_most_likely_next(model, context) -> string
+    let counts = model["counts"]
+    if not contains(counts, context)
+        return ""
+    let inner = counts[context]
+    _lm_max_word_by_count(inner)
+
+// lm_add_k_default returns the default add-k smoothing constant (1.0).
+fn lm_add_k_default() -> float
+    1.0
+
+// lm_sentence_logprob computes sum of log(P_laplace(word_i | context_i)) over
+// all words in tokens from position n-1 onward (where context exists).
+// NOTE: reads model["n"] and uses it as loop bound; context is built inline
+// to avoid a known compiler issue with private-fn calls inside while loops
+// when model["n"] (any-typed dict value) is the loop variable.
+fn lm_sentence_logprob(model, tokens, k) -> float
+    let tlen = len(tokens)
+    let logsum = 0.0
+    // Materialise order as a genuine local int by counting up from model["n"]
+    let n_stored = model["n"]
+    let order = 0
+    let oc = 0
+    while oc < n_stored
+        order = order + 1
+        oc = oc + 1
+    let i = order - 1
+    while i < tlen
+        // Build context inline: join tokens[i-(order-1)..i-1] with spaces
+        let ctx = ""
+        if order >= 2
+            let si = i - (order - 1)
+            if si < 0
+                si = 0
+            let jj = si
+            while jj < i
+                if jj > si
+                    ctx = ctx + " "
+                ctx = ctx + tokens[jj]
+                jj = jj + 1
+        let word = tokens[i]
+        let p = lm_prob_laplace(model, ctx, word, k)
+        if p > 0.0
+            logsum = logsum + log(p)
+        i = i + 1
+    logsum
+
+// lm_perplexity computes per-word perplexity of tokens under the model.
+// PP = exp(-logprob / num_words).
+fn lm_perplexity(model, tokens, k) -> float
+    let tlen = len(tokens)
+    let n_stored = model["n"]
+    let order = 0
+    let oc = 0
+    while oc < n_stored
+        order = order + 1
+        oc = oc + 1
+    let num_words = tlen - order + 1
+    if num_words <= 0
+        return 0.0
+    let lp = lm_sentence_logprob(model, tokens, k)
+    let avg = 0.0 - lp / (num_words * 1.0)
+    let r = pow(2.718281828459045, avg)
+    r
+
+fn main()
+    print("std/text/ngram_lm loaded")

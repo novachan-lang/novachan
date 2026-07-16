@@ -1,0 +1,468 @@
+// ============================================================================
+// NOVA Standard Library — std/text/textrank
+// ============================================================================
+// TextRank: graph-based keyword and sentence extraction via iterative PageRank.
+// Works over a co-occurrence graph for words, or a sentence-similarity graph
+// for extractive summarisation.
+//
+// Public API:
+//   tr_build_graph(tokens, window)      -> any   word co-occurrence graph
+//   tr_pagerank(graph, damping, iters)  -> any   dict word->score
+//   tr_keywords(text, topk)            -> any   top-k words by PageRank
+//   tr_sentence_graph(sentences)       -> any   sentence similarity graph
+//   tr_summarize(text, n)              -> any   top-n sentences (original order)
+//   tr_rank_words(text)                -> any   dict word->score
+//   tr_top_word(text)                  -> string word with highest PageRank
+//   tr_edge_weight(graph, a, b)        -> float  weight of edge a-b
+//   tr_neighbors(graph, word)          -> any   list of neighbor words
+//   tr_node_count(graph)               -> int   number of distinct words
+//   tr_normalize_scores(scores)        -> any   dict word->score in [0,1]
+// ============================================================================
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+// _tr_lower_char: lowercase a single ASCII char.
+fn _tr_lower_char(c) -> string
+    let o = ord(c)
+    if o >= 65 and o <= 90
+        return chr(o + 32)
+    c
+
+// _tr_lower: lowercase an ASCII string.
+fn _tr_lower(s) -> string
+    let n = len(s)
+    let result = ""
+    let i = 0
+    while i < n
+        result = result + _tr_lower_char(slice(s, i, i + 1))
+        i = i + 1
+    result
+
+// _tr_is_alpha: true if char code is a-z or A-Z.
+fn _tr_is_alpha(o) -> bool
+    if o >= 65 and o <= 90
+        return true
+    if o >= 97 and o <= 122
+        return true
+    false
+
+// _tr_tokenize: split text into lowercased alpha tokens.
+fn _tr_tokenize(text) -> any
+    let n = len(text)
+    let result = []
+    let i = 0
+    let start = 0
+    let in_word = false
+    while i < n
+        let o = ord(slice(text, i, i + 1))
+        if _tr_is_alpha(o)
+            if in_word == false
+                start = i
+                in_word = true
+        else
+            if in_word
+                push(result, _tr_lower(slice(text, start, i)))
+                in_word = false
+        i = i + 1
+    if in_word
+        push(result, _tr_lower(slice(text, start, n)))
+    result
+
+// _tr_is_ws_code: true if char code is ASCII whitespace.
+fn _tr_is_ws_code(o) -> bool
+    if o == 32 then return true
+    if o == 9  then return true
+    if o == 10 then return true
+    if o == 13 then return true
+    false
+
+// _tr_trim_left: index of first non-whitespace char in s, or len(s) if all space.
+fn _tr_trim_left(s) -> int
+    let n = len(s)
+    let i = 0
+    let found = false
+    while i < n and found == false
+        let o = ord(slice(s, i, i + 1))
+        if _tr_is_ws_code(o)
+            i = i + 1
+        else
+            found = true
+    i
+
+// _tr_trim_right: index one past last non-whitespace char, or 0 if all space.
+fn _tr_trim_right(s) -> int
+    let n = len(s)
+    let i = n - 1
+    let found = false
+    while i >= 0 and found == false
+        let o = ord(slice(s, i, i + 1))
+        if _tr_is_ws_code(o)
+            i = i - 1
+        else
+            found = true
+    i + 1
+
+// _tr_push_trimmed: trim piece and push to sents if non-empty.
+fn _tr_push_trimmed(sents, piece)
+    let ls = _tr_trim_left(piece)
+    let re = _tr_trim_right(piece)
+    if re > ls
+        push(sents, slice(piece, ls, re))
+
+// _tr_split_sentences: split text on '.', '!', '?' into trimmed sentences.
+fn _tr_split_sentences(text) -> any
+    let n = len(text)
+    let sents = []
+    let start = 0
+    let i = 0
+    while i < n
+        let o = ord(slice(text, i, i + 1))
+        if o == 46 or o == 33 or o == 63
+            let piece = slice(text, start, i + 1)
+            _tr_push_trimmed(sents, piece)
+            start = i + 1
+        i = i + 1
+    if start < n
+        let piece = slice(text, start, n)
+        _tr_push_trimmed(sents, piece)
+    sents
+
+// _tr_add_edge: add (or accumulate) a directed edge in the graph with given weight.
+// graph[a][b] += weight; we store as a flat dict with key "a|b".
+// Because NOVA dicts require string keys, we encode edges as "word_a__SEP__word_b".
+fn _tr_add_edge(graph, a, b, weight)
+    if contains(graph, a) == 0
+        graph[a] = {}
+    let neighbors = graph[a]
+    if contains(neighbors, b)
+        let old = neighbors[b]
+        neighbors[b] = old + weight
+    else
+        neighbors[b] = weight
+
+// _tr_abs_float: absolute value for float.
+fn _tr_abs_float(x) -> float
+    if x < 0.0
+        return 0.0 - x
+    x
+
+// _tr_max_float: max of two floats.
+fn _tr_max_float(a, b) -> float
+    if a > b
+        return a
+    b
+
+// _tr_sent_words: extract the set of unique words (as a dict) from a sentence.
+fn _tr_sent_words(sentence) -> any
+    let tokens = _tr_tokenize(sentence)
+    let ws = {}
+    let n = len(tokens)
+    let i = 0
+    while i < n
+        let t = tokens[i]
+        ws[t] = 1
+        i = i + 1
+    ws
+
+// _tr_shared_count: count words shared between two word-sets (dicts).
+fn _tr_shared_count(ws1, ws2) -> int
+    let ks = keys(ws1)
+    let n = len(ks)
+    let cnt = 0
+    let i = 0
+    while i < n
+        let w = ks[i]
+        if contains(ws2, w)
+            cnt = cnt + 1
+        i = i + 1
+    cnt
+
+// _tr_sent_sim: similarity between two sentences = shared_words / log(len1)+log(len2).
+// Returns 0.0 if either sentence is empty or denominator is zero.
+fn _tr_sent_sim(s1, s2) -> float
+    let ws1 = _tr_sent_words(s1)
+    let ws2 = _tr_sent_words(s2)
+    let n1 = len(keys(ws1))
+    let n2 = len(keys(ws2))
+    if n1 == 0 or n2 == 0
+        return 0.0
+    let shared = _tr_shared_count(ws1, ws2) * 1.0
+    if shared <= 0.0
+        return 0.0
+    let l1 = log(n1 * 1.0 + 1.0)
+    let l2 = log(n2 * 1.0 + 1.0)
+    let denom = l1 + l2
+    if denom <= 0.0
+        return 0.0
+    let result = shared / denom
+    result
+
+// _tr_sort_desc_pairs: insertion sort [{w,s}] descending by score.
+// Uses a 'done' flag to break inner loop without corrupting j.
+fn _tr_sort_desc_pairs(items) -> any
+    let n = len(items)
+    let i = 1
+    while i < n
+        let cur = items[i]
+        let cs = cur["s"]
+        let j = i - 1
+        let pos = i
+        let done = false
+        while j >= 0 and done == false
+            let prev = items[j]
+            let ps = prev["s"]
+            if ps < cs
+                items[j + 1] = prev
+                pos = j
+                j = j - 1
+            else
+                done = true
+        items[pos] = cur
+        i = i + 1
+    items
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// tr_build_graph builds a word co-occurrence graph from a token list.
+// Within each window of size 'window', every pair of distinct tokens
+// gets an undirected edge with weight 1 (accumulated for repeated co-occurrences).
+fn tr_build_graph(tokens, window) -> any
+    let graph = {}
+    let n = len(tokens)
+    let i = 0
+    while i < n
+        let a = tokens[i]
+        let j = i + 1
+        let limit = i + window
+        if n < limit
+            limit = n
+        while j < limit
+            let b = tokens[j]
+            if a != b
+                _tr_add_edge(graph, a, b, 1.0)
+                _tr_add_edge(graph, b, a, 1.0)
+            j = j + 1
+        i = i + 1
+    graph
+
+// tr_pagerank runs iterative PageRank on the graph.
+// Initialise every node to 1.0, iterate 'iters' times.
+// score[v] = (1-d) + d * sum_{u in in-neighbors}(score[u] / out_degree[u])
+// Because the graph is undirected, in-neighbors == out-neighbors.
+fn tr_pagerank(graph, damping, iters) -> any
+    let nodes = keys(graph)
+    let n = len(nodes)
+    if n == 0
+        return {}
+    // initialise scores
+    let scores = {}
+    let i = 0
+    while i < n
+        scores[nodes[i]] = 1.0
+        i = i + 1
+    // iterate
+    let iter = 0
+    while iter < iters
+        let new_scores = {}
+        let ni = 0
+        while ni < n
+            let v = nodes[ni]
+            let neighbors = graph[v]
+            let nb_keys = keys(neighbors)
+            let nb_n = len(nb_keys)
+            let contrib = 0.0
+            let ki = 0
+            while ki < nb_n
+                let u = nb_keys[ki]
+                let u_score = scores[u]
+                let u_neighbors = graph[u]
+                let u_deg = len(keys(u_neighbors))
+                if u_deg > 0
+                    contrib = contrib + u_score / (u_deg * 1.0)
+                ki = ki + 1
+            let ns = (1.0 - damping) + damping * contrib
+            new_scores[v] = ns
+            ni = ni + 1
+        // copy new_scores back to scores
+        let si = 0
+        while si < n
+            let v = nodes[si]
+            scores[v] = new_scores[v]
+            si = si + 1
+        iter = iter + 1
+    scores
+
+// tr_keywords returns the top-k words from text ranked by TextRank PageRank.
+fn tr_keywords(text, topk) -> any
+    let tokens = _tr_tokenize(text)
+    let graph = tr_build_graph(tokens, 4)
+    let scores = tr_pagerank(graph, 0.85, 20)
+    let ks = keys(scores)
+    let n = len(ks)
+    // build sorted pairs
+    let pairs = []
+    let i = 0
+    while i < n
+        let w = ks[i]
+        let entry = {}
+        entry["w"] = w
+        entry["s"] = scores[w]
+        push(pairs, entry)
+        i = i + 1
+    let sorted = _tr_sort_desc_pairs(pairs)
+    let limit = topk
+    if n < limit
+        limit = n
+    let result = []
+    let j = 0
+    while j < limit
+        push(result, sorted[j]["w"])
+        j = j + 1
+    result
+
+// tr_sentence_graph builds a sentence similarity graph.
+// Nodes are sentence indices (as string keys "0","1",...).
+// Edge weight = _tr_sent_sim(s_i, s_j) for each pair i != j.
+fn tr_sentence_graph(sentences) -> any
+    let n = len(sentences)
+    let graph = {}
+    let i = 0
+    while i < n
+        let ki = str(i)
+        if contains(graph, ki) == 0
+            graph[ki] = {}
+        let j = 0
+        while j < n
+            if i != j
+                let kj = str(j)
+                let sim = _tr_sent_sim(sentences[i], sentences[j])
+                if sim > 0.0
+                    let neighbors = graph[ki]
+                    neighbors[kj] = sim
+            j = j + 1
+        i = i + 1
+    graph
+
+// tr_summarize returns the top-n sentences from text by sentence PageRank,
+// returned in their original order within the text.
+fn tr_summarize(text, n) -> any
+    let sentences = _tr_split_sentences(text)
+    let ns = len(sentences)
+    if ns == 0
+        return []
+    let sgraph = tr_sentence_graph(sentences)
+    let scores = tr_pagerank(sgraph, 0.85, 20)
+    // collect (index, score) pairs
+    let pairs = []
+    let i = 0
+    while i < ns
+        let ki = str(i)
+        let sc = 0.0
+        if contains(scores, ki)
+            sc = scores[ki]
+        let entry = {}
+        entry["w"] = ki
+        entry["s"] = sc
+        push(pairs, entry)
+        i = i + 1
+    let sorted = _tr_sort_desc_pairs(pairs)
+    // pick top-n indices and sort them back to original order
+    let limit = n
+    if ns < limit
+        limit = ns
+    let selected = {}
+    let j = 0
+    while j < limit
+        let idx_str = sorted[j]["w"]
+        selected[idx_str] = 1
+        j = j + 1
+    // return in original order
+    let result = []
+    let k = 0
+    while k < ns
+        let ks = str(k)
+        if contains(selected, ks)
+            push(result, sentences[k])
+        k = k + 1
+    result
+
+// tr_rank_words returns a dict word->PageRank score for all words in text.
+fn tr_rank_words(text) -> any
+    let tokens = _tr_tokenize(text)
+    let graph = tr_build_graph(tokens, 4)
+    let scores = tr_pagerank(graph, 0.85, 20)
+    scores
+
+// tr_top_word returns the word with the highest PageRank score in text.
+// Returns "" if text has no words.
+fn tr_top_word(text) -> string
+    let scores = tr_rank_words(text)
+    let ks = keys(scores)
+    let n = len(ks)
+    if n == 0
+        return ""
+    let best_word = ks[0]
+    let best_score = scores[ks[0]]
+    let i = 1
+    while i < n
+        let w = ks[i]
+        let s = scores[w]
+        if s > best_score
+            best_score = s
+            best_word = w
+        i = i + 1
+    best_word
+
+// tr_edge_weight returns the weight of edge (a -> b) in the graph.
+// Returns 0.0 if either node or the edge is absent.
+fn tr_edge_weight(graph, a, b) -> float
+    if contains(graph, a) == 0
+        return 0.0
+    let neighbors = graph[a]
+    if contains(neighbors, b) == 0
+        return 0.0
+    let w = neighbors[b]
+    w
+
+// tr_neighbors returns the list of neighbor words for word in graph.
+// Returns [] if word is absent.
+fn tr_neighbors(graph, word) -> any
+    if contains(graph, word) == 0
+        return []
+    let neighbors = graph[word]
+    keys(neighbors)
+
+// tr_node_count returns the number of distinct nodes in the graph.
+fn tr_node_count(graph) -> int
+    len(keys(graph))
+
+// tr_normalize_scores normalises a score dict so the max score becomes 1.0.
+// Returns an empty dict if all scores are 0.0.
+fn tr_normalize_scores(scores) -> any
+    let ks = keys(scores)
+    let n = len(ks)
+    if n == 0
+        return {}
+    let mx = scores[ks[0]]
+    let i = 1
+    while i < n
+        let s = scores[ks[i]]
+        if s > mx
+            mx = s
+        i = i + 1
+    let result = {}
+    if mx <= 0.0
+        let j = 0
+        while j < n
+            result[ks[j]] = 0.0
+            j = j + 1
+        return result
+    let j = 0
+    while j < n
+        let w = ks[j]
+        result[w] = scores[w] / mx
+        j = j + 1
+    result
+
+fn main()
+    print("std/text/textrank loaded")
