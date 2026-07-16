@@ -10,7 +10,10 @@ KAT tests in `nova-compiler/test_programs/_<mod>_test.nova`; add to `_orphan_cov
 12 domain surveyors vs JDK/Python/Go/Rust). std/ is very mature (math 72, text 65, collections 48…) —
 every task below was dup-checked absent. Ordered LOW-RISK / high-value first.
 
-## DONE (certified both-mode, tasks 1–7; task 8 in flight)
+## DONE (per-module KAT-gated at build; final both-mode arc deferred to campaign end — see rhythm)
+## Campaign at **47 tasks committed** (2026-07-16). Strategic note: owner directed libraries are CONTINUOUS/
+## open-ended — build high-value ones, then SHIFT to the NOVA_MASTER_PLAN (language ceilings + frameworks).
+## Pivot underway after the last high-value general libraries (crypto batteries).
 | # | Task | Modules | Commit |
 |---|---|---|---|
 | 1 | std/compress/ | 12 | cdac0a6b |
@@ -32,7 +35,35 @@ every task below was dup-checked absent. Ordered LOW-RISK / high-value first.
 
 | 17 | std/term/ ANSI (color16/color256/style/cursor/screen/strip/box/progress/spinner/hyperlink/columns/gradient) | 12 | 3dbac697 |
 | 18 | std/random/ PRNG engines (mt19937/pcg32/splitmix64/xoshiro256/xoshiro128/lcg/well512/lfsr/wyrand/jsf64/sfc64/lehmer) | 12 | eaf30328 |
-| 19 | std/cipher/ classical (playfair/bifid/foursquare/twosquare/hill/columnar/affine/autokey/beaufort/polybius/scytale/adfgx) | 12 | *(building wjixcsuh9)* |
+| 19 | std/cipher/ classical (playfair/bifid/foursquare/twosquare/hill/columnar/affine/autokey/beaufort/polybius/scytale/adfgx) | 12 | 998728fe |
+| 20 | std/midi/ MIDI protocol + SMF | 12 | 58f607f8 |
+| 21 | std/net/lineproto application-protocol codecs | 12 | 3a1a0ab1 |
+| 22 | std/compress/univcodes universal integer codes | 12 | 03674ade |
+| 23 | std/music/theory music-theory | 12 | f5ddcf6b |
+| 24 | std/game/cards card-game | 12 | 41e2806e |
+| 25 | std/game/maze maze algorithms | 12 | 87e1db74 |
+| 26 | std/data/subtitles SRT/WebVTT | 12 | c755af8e |
+| 27 | std/net/binproto MQTT/CoAP/STOMP/POP3 | 12 | 5e63a90a |
+| 28 | std/data/feeds feed + playlist formats | 12 | ccf6d953 |
+| 29 | std/compress/adaptive dictionary+transform coders | 12 | 3c80d921 |
+| 30 | std/physics/mechanics | 12 | 5d8f8ae3 |
+| 31 | std/chem/formulas | 12 | 13cf1f55 |
+| 32 | std/physics/waves_em waves/optics/thermo/EM | 12 | c9bdb5fa |
+| 33 | std/geo/spherical | 12 | 377c5a60 |
+| 34 | std/audio/synth | 12 | e8fd1504 |
+| 35 | std/math/tseries time-series analysis | 12 | 0c549e06 |
+| 36 | std/numeric/scientific numerical methods | 12 | 0e892a74 |
+| 37 | std/game/rating rating + tournament | 12 | bc1127f3 |
+| 38 | std/text/markdown Markdown->HTML renderer | 12 | 9673815c |
+| 39 | std/data/geodata geo-format codecs | 12 | 86805af5 |
+| 40 | std/game/puzzle puzzle solvers | 12 | 1fcd2220 |
+| 41 | std/image image-processing | 12 | 54d7670a |
+| 42 | std/calendar calendar-system | 12 | a4d802e7 |
+| 43 | std/barcode barcode-symbology | 12 | 18eb418e |
+| 44 | std/finance advanced finance | 12 | ab784b9d |
+| 45 | std/numeric/distributions probability distributions | 12 | 7892247e |
+| 46 | std/os pure path/binary/byte utilities | 12 | 2fc466b2 |
+| 47 | binary file-format parsers — os/{elf_header,pe_coff,macho,tar_ustar,ar_archive,cpio} compress/{zip_read,gzip_member} data/{wasm_hdr,java_class,pdf_xref} media/id3 | 12 | *(this commit)* |
 
 ## GAP-MAP #2 BACKLOG (2026-07-16, grep-verified over 240-module tree) — tasks 21-50, LOW-risk first
 **LOW risk (int/string/bytes, deterministic/round-trip KATs) — build first:**

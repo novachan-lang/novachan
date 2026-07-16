@@ -1,0 +1,176 @@
+// std/os/ar_archive -- Unix ar archive parser (common/GNU variant).
+//
+// An ar archive starts with an 8-byte global magic "!<arch>\n", followed by a
+// sequence of 60-byte entry headers, each immediately followed by the file data
+// for that entry, 2-byte aligned (a pad byte is appended when data size is odd).
+//
+// Entry header layout (all fields ASCII, space-padded on the right):
+//   Offset  Len  Field
+//      0    16   name   (GNU variant: ends with '/')
+//     16    12   mtime  (decimal)
+//     28     6   uid    (decimal)
+//     34     6   gid    (decimal)
+//     40     8   mode   (OCTAL)
+//     48    10   size   (decimal)
+//     58     2   end-magic: 0x60 0x0A
+//
+// PUBLIC API (prefix ar_):
+//   ar_magic_check(buf)           -> bool
+//   ar_first_entry_pos(buf)       -> int    (always 8)
+//   ar_entry_name(buf, pos)       -> string (16 bytes, trailing spaces and '/' trimmed)
+//   ar_entry_mtime(buf, pos)      -> int    (decimal parse)
+//   ar_entry_uid(buf, pos)        -> int    (decimal parse)
+//   ar_entry_gid(buf, pos)        -> int    (decimal parse)
+//   ar_entry_mode(buf, pos)       -> int    (octal parse)
+//   ar_entry_size(buf, pos)       -> int    (decimal parse)
+//   ar_entry_magic_check(buf,pos) -> bool   (bytes at pos+58,pos+59 == 0x60,0x0A)
+//   ar_entry_data_offset(buf,pos) -> int    (pos+60)
+//   ar_next_entry_pos(buf, pos)   -> int    (pos+60+size, +1 if size is odd)
+//   ar_entry_count(buf)           -> int    (walk from pos 8 to end)
+//
+// LEAF module -- no cross-module imports.
+
+// _ar_dec: parse ASCII decimal integer from buf at offset p for n bytes.
+// Stops at NUL (0) or space (32) or field end. Returns accumulated value.
+fn _ar_dec(b: any, p: int, n: int) -> int
+    let acc = 0
+    let i = 0
+    while i < n
+        let c = b[p + i]
+        if c == 0 or c == 32
+            i = n
+        else
+            acc = acc * 10 + (c - 48)
+            i = i + 1
+    return acc
+
+// _ar_oct: parse ASCII octal integer from buf at offset p for n bytes.
+// Stops at NUL (0) or space (32). Returns accumulated value.
+fn _ar_oct(b: any, p: int, n: int) -> int
+    let acc = 0
+    let i = 0
+    while i < n
+        let c = b[p + i]
+        if c == 0 or c == 32
+            i = n
+        else
+            acc = acc * 8 + (c - 48)
+            i = i + 1
+    return acc
+
+// _ar_name_raw: read 16 bytes at pos as a string, trimming trailing spaces and '/'.
+fn _ar_name_raw(b: any, p: int) -> string
+    let s = ""
+    let i = 0
+    while i < 16
+        let c = b[p + i]
+        if c == 0
+            i = 16
+        else
+            s = s + chr(c)
+            i = i + 1
+    let n = len(s)
+    let trimmed = ""
+    let done = 0
+    while done == 0
+        let nn = len(s)
+        if nn == 0
+            done = 1
+        else
+            let last = slice(s, nn - 1, nn)
+            if last == " " or last == "/"
+                s = slice(s, 0, nn - 1)
+            else
+                done = 1
+    return s
+
+// ar_magic_check: verify the 8-byte global ar magic "!<arch>\n" at offset 0.
+fn ar_magic_check(b: any) -> bool
+    if len(b) < 8
+        return false
+    if b[0] != 33
+        return false
+    if b[1] != 60
+        return false
+    if b[2] != 97
+        return false
+    if b[3] != 114
+        return false
+    if b[4] != 99
+        return false
+    if b[5] != 104
+        return false
+    if b[6] != 62
+        return false
+    if b[7] != 10
+        return false
+    return true
+
+// ar_first_entry_pos: returns the byte offset of the first entry header (always 8).
+fn ar_first_entry_pos(b: any) -> int
+    return 8
+
+// ar_entry_name: read the 16-byte name field at pos, trimming trailing spaces and '/'.
+fn ar_entry_name(b: any, pos: int) -> string
+    return _ar_name_raw(b, pos)
+
+// ar_entry_mtime: parse the 12-byte decimal mtime field at pos+16.
+fn ar_entry_mtime(b: any, pos: int) -> int
+    return _ar_dec(b, pos + 16, 12)
+
+// ar_entry_uid: parse the 6-byte decimal uid field at pos+28.
+fn ar_entry_uid(b: any, pos: int) -> int
+    return _ar_dec(b, pos + 28, 6)
+
+// ar_entry_gid: parse the 6-byte decimal gid field at pos+34.
+fn ar_entry_gid(b: any, pos: int) -> int
+    return _ar_dec(b, pos + 34, 6)
+
+// ar_entry_mode: parse the 8-byte OCTAL mode field at pos+40.
+fn ar_entry_mode(b: any, pos: int) -> int
+    return _ar_oct(b, pos + 40, 8)
+
+// ar_entry_size: parse the 10-byte decimal size field at pos+48.
+fn ar_entry_size(b: any, pos: int) -> int
+    return _ar_dec(b, pos + 48, 10)
+
+// ar_entry_magic_check: verify the 2-byte end-magic at pos+58 (0x60=96, 0x0A=10).
+fn ar_entry_magic_check(b: any, pos: int) -> bool
+    if len(b) < pos + 60
+        return false
+    if b[pos + 58] != 96
+        return false
+    if b[pos + 59] != 10
+        return false
+    return true
+
+// ar_entry_data_offset: byte offset of the first data byte (always pos+60).
+fn ar_entry_data_offset(b: any, pos: int) -> int
+    return pos + 60
+
+// ar_next_entry_pos: byte offset of the next entry header.
+// Data starts at pos+60, is `size` bytes long; if size is odd, one pad byte follows.
+fn ar_next_entry_pos(b: any, pos: int) -> int
+    let sz = ar_entry_size(b, pos)
+    let next = pos + 60 + sz
+    if sz % 2 != 0
+        next = next + 1
+    return next
+
+// ar_entry_count: count valid entry headers by walking from pos 8 to end of buffer.
+fn ar_entry_count(b: any) -> int
+    let total = len(b)
+    let pos = 8
+    let count = 0
+    let go = 1
+    while go == 1
+        if pos + 60 > total
+            go = 0
+        else
+            let sz = ar_entry_size(b, pos)
+            count = count + 1
+            let next = pos + 60 + sz
+            if sz % 2 != 0
+                next = next + 1
+            pos = next
+    return count

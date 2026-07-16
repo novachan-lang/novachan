@@ -1,0 +1,159 @@
+import std/data/wasm_hdr
+
+// cki: integer equality check
+fn cki(label, got, want)
+    if got != want
+        print("FAIL wasm_hdr " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+// cks: string equality check
+fn cks(label, got, want)
+    if got != want
+        print("FAIL wasm_hdr " + label + ": got=" + got + " want=" + want)
+        exit(1)
+
+// ckb: bool equality check
+fn ckb(label, got, want)
+    let g = 0
+    let w = 0
+    if got
+        g = 1
+    if want
+        w = 1
+    if g != w
+        print("FAIL wasm_hdr " + label + ": got=" + str(g) + " want=" + str(w))
+        exit(1)
+
+// _build_wasm_buf: build a minimal wasm module with one Type section (id=1, size=5).
+// Layout (14 bytes):
+//   [0..3]  magic: 0, 97, 115, 109
+//   [4..7]  version: 1, 0, 0, 0
+//   [8]     section id: 1 (Type)
+//   [9]     section size LEB128: 5 (single byte, < 128)
+//   [10..14] content: 5 zero bytes
+fn _build_wasm_buf() -> any
+    let buf = []
+    // magic \0asm = 0, 97, 115, 109
+    push(buf, 0)
+    push(buf, 97)
+    push(buf, 115)
+    push(buf, 109)
+    // version = 1 as u32le = 1, 0, 0, 0
+    push(buf, 1)
+    push(buf, 0)
+    push(buf, 0)
+    push(buf, 0)
+    // section id = 1 (Type)
+    push(buf, 1)
+    // section size = 5 (single-byte LEB128, value < 128 so high bit is 0)
+    push(buf, 5)
+    // 5 content bytes
+    push(buf, 0)
+    push(buf, 0)
+    push(buf, 0)
+    push(buf, 0)
+    push(buf, 0)
+    return buf
+
+fn main()
+    // ── KAT A: LEB128 decode ────────────────────────────────────────────────────
+    // 624485 = 0xE5,0x8E,0x26 = [229,142,38]
+    let leb3 = []
+    push(leb3, 229)
+    push(leb3, 142)
+    push(leb3, 38)
+    let r3 = wasm_leb128_u(leb3, 0)
+    cki("leb128_624485_value", r3["value"], 624485)
+    cki("leb128_624485_next", r3["next"], 3)
+
+    // 128 = [128, 1]
+    let leb2 = []
+    push(leb2, 128)
+    push(leb2, 1)
+    let r2 = wasm_leb128_u(leb2, 0)
+    cki("leb128_128_value", r2["value"], 128)
+    cki("leb128_128_next", r2["next"], 2)
+
+    // 8 = [8]
+    let leb1 = []
+    push(leb1, 8)
+    let r1 = wasm_leb128_u(leb1, 0)
+    cki("leb128_8_value", r1["value"], 8)
+    cki("leb128_8_next", r1["next"], 1)
+
+    // ── KAT B: module header ─────────────────────────────────────────────────────
+    let buf = _build_wasm_buf()
+    cki("buf_len", len(buf), 15)
+
+    ckb("magic_check", wasm_magic_check(buf), true)
+    cki("version", wasm_version(buf), 1)
+    ckb("is_valid", wasm_is_valid(buf), true)
+
+    // ── KAT C: first section ─────────────────────────────────────────────────────
+    cki("first_section_pos", wasm_first_section_pos(buf), 8)
+    cki("section_id", wasm_section_id(buf, 8), 1)
+    cki("section_size", wasm_section_size(buf, 8), 5)
+    cki("section_content_pos", wasm_section_content_pos(buf, 8), 10)
+
+    // next section pos = content_pos + size = 10 + 5 = 15 (past end)
+    cki("next_section_pos", wasm_next_section_pos(buf, 8), 15)
+
+    // ── KAT D: section name ──────────────────────────────────────────────────────
+    cks("section_name_1", wasm_section_name(1), "Type")
+    cks("section_name_0", wasm_section_name(0), "Custom")
+    cks("section_name_2", wasm_section_name(2), "Import")
+    cks("section_name_3", wasm_section_name(3), "Function")
+    cks("section_name_10", wasm_section_name(10), "Code")
+    cks("section_name_11", wasm_section_name(11), "Data")
+    cks("section_name_12", wasm_section_name(12), "DataCount")
+
+    // ── KAT E: section enumeration ──────────────────────────────────────────────
+    cki("count_sections", wasm_count_sections(buf), 1)
+    ckb("has_section_1", wasm_has_section(buf, 1), true)
+    ckb("has_section_2", wasm_has_section(buf, 2), false)
+    ckb("has_section_0", wasm_has_section(buf, 0), false)
+
+    // ── KAT F: negative cases ────────────────────────────────────────────────────
+    let empty = []
+    ckb("empty_magic", wasm_magic_check(empty), false)
+    ckb("empty_valid", wasm_is_valid(empty), false)
+
+    // bad magic
+    let badmag = []
+    push(badmag, 1)
+    push(badmag, 2)
+    push(badmag, 3)
+    push(badmag, 4)
+    ckb("bad_magic", wasm_magic_check(badmag), false)
+
+    // ── KAT G: multi-byte LEB128 for section size ────────────────────────────────
+    // Build a module with a section whose size is 300 (requires 2 LEB128 bytes).
+    // 300 = 0x12C. LEB128: 300 & 0x7F = 0x2C = 44, remainder = 300 >> 7 = 2.
+    // So bytes: 44 | 0x80 = 172 (continue), 2 (stop). Value = 44 + 2*128 = 300.
+    let buf2 = []
+    push(buf2, 0)
+    push(buf2, 97)
+    push(buf2, 115)
+    push(buf2, 109)
+    push(buf2, 1)
+    push(buf2, 0)
+    push(buf2, 0)
+    push(buf2, 0)
+    // section id=7 (Export)
+    push(buf2, 7)
+    // size = 300 as 2-byte LEB128: 172, 2
+    push(buf2, 172)
+    push(buf2, 2)
+    // 300 content bytes (all zero)
+    let ci = 0
+    while ci < 300
+        push(buf2, 0)
+        ci = ci + 1
+    cki("leb128_section_size_300", wasm_section_size(buf2, 8), 300)
+    cki("section_content_pos_2byte_leb", wasm_section_content_pos(buf2, 8), 11)
+    cki("next_section_2byte_leb", wasm_next_section_pos(buf2, 8), 311)
+    cki("count_sections_2", wasm_count_sections(buf2), 1)
+    ckb("has_export", wasm_has_section(buf2, 7), true)
+    ckb("no_type_in_buf2", wasm_has_section(buf2, 1), false)
+
+    print("PASS _wasm_hdr_test")

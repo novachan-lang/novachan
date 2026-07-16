@@ -1,0 +1,187 @@
+// std/data/wasm_hdr -- WebAssembly module header, section, and LEB128 parser.
+//
+// WebAssembly binary module layout:
+//   [0..3]  magic: 0x00 0x61 0x73 0x6D  ("\0asm")
+//   [4..7]  version: u32le = 1          (bytes 1,0,0,0)
+//   [8..]   sections, each:
+//             1 byte   section id
+//             LEB128   byte-length of content
+//             N bytes  content
+//
+// Section ids:
+//   0=Custom  1=Type    2=Import  3=Function  4=Table   5=Memory
+//   6=Global  7=Export  8=Start   9=Element  10=Code   11=Data  12=DataCount
+//
+// PUBLIC API (prefix wasm_):
+//   wasm_magic_check(buf)            -> bool
+//   wasm_version(buf)                -> int       (u32le at offset 4)
+//   wasm_leb128_u(buf, pos)          -> any       dict {"value":int,"next":int}
+//   wasm_first_section_pos(buf)      -> int       (always 8)
+//   wasm_section_id(buf, pos)        -> int       (byte at pos)
+//   wasm_section_size(buf, pos)      -> int       (LEB128 value after the id byte)
+//   wasm_section_content_pos(buf,pos)-> int       (byte offset after the LEB128 length)
+//   wasm_next_section_pos(buf, pos)  -> int       (content_pos + size)
+//   wasm_section_name(id)            -> string    (human-readable name for id 0..12)
+//   wasm_count_sections(buf)         -> int       (walk all sections from offset 8)
+//   wasm_has_section(buf, id)        -> bool      (true if any section has that id)
+//   wasm_is_valid(buf)               -> bool      (magic ok AND version == 1)
+//
+// LEAF module -- no cross-module imports.
+
+// _wasm_u32le: read a 4-byte little-endian unsigned integer from buf at offset pos.
+fn _wasm_u32le(b: any, pos: int) -> int
+    return b[pos] + b[pos + 1] * 256 + b[pos + 2] * 65536 + b[pos + 3] * 16777216
+
+// wasm_magic_check: verify the 4-byte WebAssembly magic at offset 0.
+// Magic is 0x00 0x61 0x73 0x6D (bytes 0, 97, 115, 109).
+fn wasm_magic_check(b: any) -> bool
+    if len(b) < 4
+        return false
+    if b[0] != 0
+        return false
+    if b[1] != 97
+        return false
+    if b[2] != 115
+        return false
+    if b[3] != 109
+        return false
+    return true
+
+// wasm_version: read the u32le version field at offset 4. Should be 1 for valid modules.
+fn wasm_version(b: any) -> int
+    if len(b) < 8
+        return 0
+    return _wasm_u32le(b, 4)
+
+// wasm_leb128_u: decode an unsigned LEB128 integer starting at buf[pos].
+// Returns a dict with keys "value" (decoded integer) and "next" (position after last byte).
+// Caps shift at 56 bits (8 7-bit groups) to avoid shifting by >= 64.
+fn wasm_leb128_u(b: any, pos: int) -> any
+    let total = len(b)
+    let result = 0
+    let shift = 0
+    let cur = pos
+    let go = 1
+    while go == 1
+        if cur >= total
+            go = 0
+        else
+            let byt = b[cur]
+            cur = cur + 1
+            let low7 = byt & 0x7F
+            if shift < 56
+                result = result + low7 * (1 << shift)
+            shift = shift + 7
+            if (byt & 0x80) == 0
+                go = 0
+    let d = {}
+    d["value"] = result
+    d["next"] = cur
+    return d
+
+// wasm_first_section_pos: returns 8 (the fixed offset of the first section).
+fn wasm_first_section_pos(b: any) -> int
+    return 8
+
+// wasm_section_id: return the section id byte at the given section position.
+fn wasm_section_id(b: any, pos: int) -> int
+    if pos >= len(b)
+        return 0
+    return b[pos]
+
+// wasm_section_size: return the LEB128-encoded byte-length of the section content.
+// The LEB128 is located right after the 1-byte section id.
+fn wasm_section_size(b: any, pos: int) -> int
+    let r = wasm_leb128_u(b, pos + 1)
+    return r["value"]
+
+// wasm_section_content_pos: return the byte offset of the first content byte.
+// This is the position right after the LEB128 length field.
+fn wasm_section_content_pos(b: any, pos: int) -> int
+    let r = wasm_leb128_u(b, pos + 1)
+    return r["next"]
+
+// wasm_next_section_pos: return the byte offset of the next section header.
+fn wasm_next_section_pos(b: any, pos: int) -> int
+    let r = wasm_leb128_u(b, pos + 1)
+    let sz = r["value"]
+    let cp = r["next"]
+    return cp + sz
+
+// wasm_section_name: return the human-readable name for a section id (0..12).
+fn wasm_section_name(id: int) -> string
+    if id == 0
+        return "Custom"
+    if id == 1
+        return "Type"
+    if id == 2
+        return "Import"
+    if id == 3
+        return "Function"
+    if id == 4
+        return "Table"
+    if id == 5
+        return "Memory"
+    if id == 6
+        return "Global"
+    if id == 7
+        return "Export"
+    if id == 8
+        return "Start"
+    if id == 9
+        return "Element"
+    if id == 10
+        return "Code"
+    if id == 11
+        return "Data"
+    if id == 12
+        return "DataCount"
+    return "Unknown"
+
+// wasm_count_sections: count all sections by walking from offset 8 to end of buffer.
+fn wasm_count_sections(b: any) -> int
+    let total = len(b)
+    let pos = 8
+    let count = 0
+    let go = 1
+    while go == 1
+        if pos >= total
+            go = 0
+        else
+            let nxt = wasm_next_section_pos(b, pos)
+            if nxt <= pos
+                go = 0
+            else
+                count = count + 1
+                pos = nxt
+    return count
+
+// wasm_has_section: return true if any section in the module has the given id.
+fn wasm_has_section(b: any, id: int) -> bool
+    let total = len(b)
+    let pos = 8
+    let found = false
+    let go = 1
+    while go == 1
+        if pos >= total
+            go = 0
+        else
+            let sid = wasm_section_id(b, pos)
+            if sid == id
+                found = true
+                go = 0
+            else
+                let nxt = wasm_next_section_pos(b, pos)
+                if nxt <= pos
+                    go = 0
+                else
+                    pos = nxt
+    return found
+
+// wasm_is_valid: true if magic is correct and version is 1.
+fn wasm_is_valid(b: any) -> bool
+    if not wasm_magic_check(b)
+        return false
+    if wasm_version(b) != 1
+        return false
+    return true

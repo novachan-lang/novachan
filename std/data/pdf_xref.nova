@@ -1,0 +1,209 @@
+// std/data/pdf_xref -- PDF header/trailer/startxref locator (ASCII scanning).
+//
+// Parses the structure markers of a PDF file stored as a list-of-ints buffer.
+// Each element is one byte (0..255). The module does NOT decompress or interpret
+// PDF streams; it only reads the top-level structural fields.
+//
+// PDF STRUCTURE (simplified):
+//   Byte 0..4  '%PDF-' = 37,80,68,70,45
+//   Next 3..5  version digits e.g. '1', '.', '7'
+//   Optional 2nd line '%' followed by >=4 bytes with high-bit set (binary marker)
+//   Body: objects in '<n> <gen> obj ... endobj' form
+//   Optional 'trailer' keyword before xref trailer dict
+//   'startxref' keyword, whitespace, decimal integer (byte offset of xref table)
+//   '%%EOF'
+//
+// PUBLIC API (prefix pdf_):
+//   pdf_magic_check(buf)      -> bool   first 5 bytes are '%PDF-'
+//   pdf_version(buf)          -> string 3-char version string e.g. '1.7'
+//   pdf_version_major(buf)    -> int    major digit (e.g. 1)
+//   pdf_version_minor(buf)    -> int    minor digit (e.g. 7)
+//   pdf_has_eof(buf)          -> bool   buffer contains '%%EOF'
+//   pdf_find_startxref(buf)   -> int    index of 'startxref' keyword, -1 if absent
+//   pdf_xref_offset(buf)      -> int    integer after 'startxref', -1 if absent
+//   pdf_count_obj(buf)        -> int    count of ' obj' subsequences (rough object count)
+//   pdf_find_trailer(buf)     -> int    index of 'trailer' keyword, -1 if absent
+//   pdf_is_valid(buf)         -> bool   magic ok and has %%EOF
+//   pdf_is_linearized(buf)    -> bool   buffer contains '/Linearized'
+//   pdf_binary_marker(buf)    -> bool   2nd line starts with '%' then a byte >= 128
+//
+// LEAF module -- imports nothing.
+
+// _pdf_find: search for a sub-sequence pattern (list of ints) in buf starting at fromPos.
+// Returns the index of the first match, or -1 if not found.
+fn _pdf_find(buf: any, pat: any, fromPos: int) -> int
+    let n = len(buf)
+    let m = len(pat)
+    if m == 0
+        return fromPos
+    let limit = n - m
+    let i = fromPos
+    let found = -1
+    while i <= limit and found == -1
+        let ok = 1
+        let j = 0
+        while j < m and ok == 1
+            if buf[i+j] != pat[j]
+                ok = 0
+            j = j + 1
+        if ok == 1
+            found = i
+        i = i + 1
+    return found
+
+// _pdf_read_int_after: starting at pos in buf, skip whitespace (9,10,13,32) then
+// read ASCII decimal digits and return the integer value. Returns -1 if no digits found.
+fn _pdf_read_int_after(buf: any, pos: int) -> int
+    let n = len(buf)
+    let i = pos
+    while i < n and (buf[i] == 9 or buf[i] == 10 or buf[i] == 13 or buf[i] == 32)
+        i = i + 1
+    if i >= n
+        return -1
+    if buf[i] < 48 or buf[i] > 57
+        return -1
+    let acc = 0
+    while i < n and buf[i] >= 48 and buf[i] <= 57
+        acc = acc * 10 + (buf[i] - 48)
+        i = i + 1
+    return acc
+
+// pdf_magic_check: return true if the first 5 bytes are '%PDF-' (37,80,68,70,45).
+fn pdf_magic_check(buf: any) -> bool
+    if len(buf) < 5
+        return false
+    if buf[0] != 37
+        return false
+    if buf[1] != 80
+        return false
+    if buf[2] != 68
+        return false
+    if buf[3] != 70
+        return false
+    if buf[4] != 45
+        return false
+    return true
+
+// pdf_version: return the 3-character version string starting at offset 5 (e.g. '1.7').
+fn pdf_version(buf: any) -> string
+    if len(buf) < 8
+        return "0.0"
+    return chr(buf[5]) + chr(buf[6]) + chr(buf[7])
+
+// pdf_version_major: return the major version digit (byte at offset 5, ASCII digit).
+fn pdf_version_major(buf: any) -> int
+    if len(buf) < 6
+        return 0
+    return buf[5] - 48
+
+// pdf_version_minor: return the minor version digit (byte at offset 7, ASCII digit).
+fn pdf_version_minor(buf: any) -> int
+    if len(buf) < 8
+        return 0
+    return buf[7] - 48
+
+// pdf_has_eof: return true if '%%EOF' (37,37,69,79,70) appears anywhere in buf.
+fn pdf_has_eof(buf: any) -> bool
+    let pat = []
+    push(pat, 37)
+    push(pat, 37)
+    push(pat, 69)
+    push(pat, 79)
+    push(pat, 70)
+    let pos = _pdf_find(buf, pat, 0)
+    return pos >= 0
+
+// pdf_find_startxref: return the index of the 'startxref' keyword, or -1.
+fn pdf_find_startxref(buf: any) -> int
+    let pat = []
+    push(pat, 115)
+    push(pat, 116)
+    push(pat, 97)
+    push(pat, 114)
+    push(pat, 116)
+    push(pat, 120)
+    push(pat, 114)
+    push(pat, 101)
+    push(pat, 102)
+    return _pdf_find(buf, pat, 0)
+
+// pdf_xref_offset: return the decimal integer following 'startxref', or -1 if absent.
+fn pdf_xref_offset(buf: any) -> int
+    let sx = pdf_find_startxref(buf)
+    if sx < 0
+        return -1
+    return _pdf_read_int_after(buf, sx + 9)
+
+// pdf_count_obj: count occurrences of ' obj' (32,111,98,106) as a rough object count.
+fn pdf_count_obj(buf: any) -> int
+    let pat = []
+    push(pat, 32)
+    push(pat, 111)
+    push(pat, 98)
+    push(pat, 106)
+    let count = 0
+    let pos = 0
+    let go = 1
+    while go == 1
+        let found = _pdf_find(buf, pat, pos)
+        if found < 0
+            go = 0
+        else
+            count = count + 1
+            pos = found + 4
+    return count
+
+// pdf_find_trailer: return the index of the 'trailer' keyword (116,114,97,105,108,101,114), or -1.
+fn pdf_find_trailer(buf: any) -> int
+    let pat = []
+    push(pat, 116)
+    push(pat, 114)
+    push(pat, 97)
+    push(pat, 105)
+    push(pat, 108)
+    push(pat, 101)
+    push(pat, 114)
+    return _pdf_find(buf, pat, 0)
+
+// pdf_is_valid: return true if magic check passes and %%EOF is present.
+fn pdf_is_valid(buf: any) -> bool
+    if not pdf_magic_check(buf)
+        return false
+    return pdf_has_eof(buf)
+
+// pdf_is_linearized: return true if '/Linearized' appears in the buffer.
+fn pdf_is_linearized(buf: any) -> bool
+    let pat = []
+    push(pat, 47)
+    push(pat, 76)
+    push(pat, 105)
+    push(pat, 110)
+    push(pat, 101)
+    push(pat, 97)
+    push(pat, 114)
+    push(pat, 105)
+    push(pat, 122)
+    push(pat, 101)
+    push(pat, 100)
+    let pos = _pdf_find(buf, pat, 0)
+    return pos >= 0
+
+// pdf_binary_marker: return true if the 2nd line starts with '%' (37) then a byte >= 128.
+// The 2nd line starts after the first newline (10 or 13) in the buffer.
+fn pdf_binary_marker(buf: any) -> bool
+    let n = len(buf)
+    let i = 0
+    while i < n and buf[i] != 10 and buf[i] != 13
+        i = i + 1
+    if i >= n
+        return false
+    i = i + 1
+    if i < n and buf[i] == 13
+        i = i + 1
+    if i >= n
+        return false
+    if buf[i] != 37
+        return false
+    if i + 1 >= n
+        return false
+    return buf[i+1] >= 128
