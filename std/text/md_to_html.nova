@@ -1,0 +1,266 @@
+// ============================================================================
+// NOVA Standard Library — std/text/md_to_html
+// ============================================================================
+// Full Markdown-to-HTML document renderer. Self-contained: no sibling imports.
+//
+// Public API:
+//   md_to_html(markdown) -> string
+//       Convert a Markdown string to HTML. The input is split into blocks on
+//       blank lines. Each block is dispatched by its first characters:
+//         # / ## / ### ...  -> <h1> .. <h6>
+//         --- (alone)       -> <hr>
+//         - or * (list)     -> <ul><li>...</li>...</ul>
+//         > (blockquote)    -> <blockquote>...</blockquote>
+//         else              -> <p>...</p>  (with inline emphasis applied)
+//       Inline emphasis within text blocks:
+//         **text**          -> <strong>text</strong>
+//         *text*            -> <em>text</em>
+//         `text`            -> <code>text</code>
+//       Blocks are joined by chr(10) in the output.
+//
+// Examples:
+//   md_to_html("# Title") == "<h1>Title</h1>"
+//   md_to_html("# T"+chr(10)+chr(10)+"Hello **world**")
+//     == "<h1>T</h1>"+chr(10)+"<p>Hello <strong>world</strong></p>"
+//   md_to_html("- a"+chr(10)+"- b")
+//     == "<ul><li>a</li><li>b</li></ul>"
+//
+// LEAF — imports NOTHING.
+
+// ── private: string helpers ──────────────────────────────────────────────────
+
+// Trim leading and trailing spaces from s.
+fn _md_trim(s: string) -> string
+    let n = len(s)
+    let start = 0
+    while start < n and slice(s, start, start+1) == " "
+        start = start + 1
+    let end = n
+    while end > start and slice(s, end-1, end) == " "
+        end = end - 1
+    slice(s, start, end)
+
+// Return true if s is blank (empty or only spaces/tabs).
+fn _md_is_blank(s: string) -> bool
+    let n = len(s)
+    let i = 0
+    while i < n
+        let ch = slice(s, i, i+1)
+        if ch != " " and ch != chr(9)
+            return false
+        i = i + 1
+    true
+
+// Check if s starts with prefix.
+fn _md_starts_with(s: string, prefix: string) -> bool
+    let plen = len(prefix)
+    if len(s) < plen
+        return false
+    slice(s, 0, plen) == prefix
+
+// ── private: inline emphasis rendering ──────────────────────────────────────
+// Process inline markup: **bold**, *italic*, `code`.
+// We scan character-by-character using a simple state machine. Since NOVA
+// doesn't have regex, we use a forward-scan approach: look for a delimiter,
+// find the closing delimiter, emit the wrapped content.
+
+// Find the next occurrence of delim in s starting at position pos.
+// Returns -1 if not found.
+fn _md_find_from(s: string, delim: string, pos: int) -> int
+    let slen = len(s)
+    let dlen = len(delim)
+    let i = pos
+    while i <= slen - dlen
+        if slice(s, i, i+dlen) == delim
+            return i
+        i = i + 1
+    -1
+
+// Apply inline emphasis to text s. Handles **, *, ` in one pass.
+// Strategy: scan left-to-right; on each delimiter, try to find closing
+// match. If found, wrap and continue after the closing delimiter.
+// ** must be checked before * to avoid consuming the first * of **.
+fn _md_inline(s: string) -> string
+    let out = ""
+    let pos = 0
+    let n = len(s)
+    while pos < n
+        // try ** (bold) first
+        if pos + 1 < n and slice(s, pos, pos+2) == "**"
+            let close = _md_find_from(s, "**", pos+2)
+            if close > pos + 1
+                let inner = slice(s, pos+2, close)
+                out = out + "<strong>" + inner + "</strong>"
+                pos = close + 2
+            else
+                // no closing **, emit literally
+                out = out + slice(s, pos, pos+1)
+                pos = pos + 1
+        else
+            // try * (italic) — but only if it's a single star (not **)
+            if slice(s, pos, pos+1) == "*"
+                let close = _md_find_from(s, "*", pos+1)
+                if close > pos
+                    let inner = slice(s, pos+1, close)
+                    out = out + "<em>" + inner + "</em>"
+                    pos = close + 1
+                else
+                    out = out + "*"
+                    pos = pos + 1
+            else
+                // try backtick (code)
+                if slice(s, pos, pos+1) == chr(96)
+                    let close = _md_find_from(s, chr(96), pos+1)
+                    if close > pos
+                        let inner = slice(s, pos+1, close)
+                        out = out + "<code>" + inner + "</code>"
+                        pos = close + 1
+                    else
+                        out = out + chr(96)
+                        pos = pos + 1
+                else
+                    // plain char
+                    out = out + slice(s, pos, pos+1)
+                    pos = pos + 1
+    out
+
+// ── private: block renderers ─────────────────────────────────────────────────
+
+// Render a heading block. First line must start with one or more #.
+fn _md_render_heading(block: string) -> string
+    // count leading # characters on the first line
+    let first_line = block
+    let nl_pos = _md_find_from(block, chr(10), 0)
+    if nl_pos >= 0
+        first_line = slice(block, 0, nl_pos)
+    let level = 0
+    let i = 0
+    let n = len(first_line)
+    while i < n and slice(first_line, i, i+1) == "#"
+        level = level + 1
+        i = i + 1
+    if level > 6
+        level = 6
+    let content = _md_trim(slice(first_line, level, n))
+    let tag = "h" + str(level)
+    "<" + tag + ">" + content + "</" + tag + ">"
+
+// Render a blockquote block. Strip leading "> " from each line.
+fn _md_render_blockquote(block: string) -> string
+    let lines = split(block, chr(10))
+    let inner = ""
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        if _md_starts_with(line, "> ")
+            line = slice(line, 2, len(line))
+        else
+            if _md_starts_with(line, ">")
+                line = slice(line, 1, len(line))
+        if i > 0
+            inner = inner + chr(10)
+        inner = inner + _md_inline(line)
+        i = i + 1
+    "<blockquote>" + inner + "</blockquote>"
+
+// Render a list block (lines starting with "- " or "* ").
+fn _md_render_list(block: string) -> string
+    let lines = split(block, chr(10))
+    let out = "<ul>"
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        if not _md_is_blank(line)
+            let content = ""
+            if _md_starts_with(line, "- ")
+                content = _md_inline(slice(line, 2, len(line)))
+            else
+                if _md_starts_with(line, "* ")
+                    content = _md_inline(slice(line, 2, len(line)))
+                else
+                    content = _md_inline(line)
+            out = out + "<li>" + content + "</li>"
+        i = i + 1
+    out + "</ul>"
+
+// Render a paragraph block (inline emphasis applied).
+fn _md_render_paragraph(block: string) -> string
+    // collapse internal newlines to space for a clean paragraph
+    let lines = split(block, chr(10))
+    let text = ""
+    let i = 0
+    while i < len(lines)
+        if i > 0 and not _md_is_blank(lines[i])
+            text = text + " "
+        if not _md_is_blank(lines[i])
+            text = text + lines[i]
+        i = i + 1
+    "<p>" + _md_inline(_md_trim(text)) + "</p>"
+
+// ── private: split input into blocks on blank lines ──────────────────────────
+
+fn _md_split_blocks(markdown: string) -> list
+    let lines = split(markdown, chr(10))
+    let blocks = []
+    let cur = ""
+    let i = 0
+    while i < len(lines)
+        let line = lines[i]
+        if _md_is_blank(line)
+            if len(cur) > 0
+                push(blocks, cur)
+                cur = ""
+        else
+            if len(cur) == 0
+                cur = line
+            else
+                cur = cur + chr(10) + line
+        i = i + 1
+    if len(cur) > 0
+        push(blocks, cur)
+    blocks
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// md_to_html(markdown) -> string
+// Convert Markdown to HTML. Blocks joined by chr(10).
+fn md_to_html(markdown: string) -> string
+    let blocks = _md_split_blocks(markdown)
+    let out = ""
+    let i = 0
+    let n = len(blocks)
+    while i < n
+        let block = blocks[i]
+        let rendered = ""
+        // dispatch on first char(s) of block
+        // Check for hr FIRST (--- is all dashes, no spaces, single line)
+        let trimmed_block = _md_trim(block)
+        let is_hr = false
+        if len(trimmed_block) >= 3 and slice(trimmed_block, 0, 3) == "---"
+            let hr_check = true
+            let jj = 0
+            while jj < len(trimmed_block)
+                if slice(trimmed_block, jj, jj+1) != "-"
+                    hr_check = false
+                jj = jj + 1
+            if hr_check
+                is_hr = true
+        if is_hr
+            rendered = "<hr>"
+        else
+            let first = slice(block, 0, 1)
+            if first == "#"
+                rendered = _md_render_heading(block)
+            else
+                if first == ">"
+                    rendered = _md_render_blockquote(block)
+                else
+                    if _md_starts_with(block, "- ") or _md_starts_with(block, "* ")
+                        rendered = _md_render_list(block)
+                    else
+                        rendered = _md_render_paragraph(block)
+        if i > 0
+            out = out + chr(10)
+        out = out + rendered
+        i = i + 1
+    out
