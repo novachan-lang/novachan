@@ -1,0 +1,165 @@
+// std/image/img_dither.nova — Dithering algorithms for grayscale images.
+// LEAF — imports NOTHING.
+//
+// Image model: flat list of ints 0..255, row-major order.
+// Output: list of ints where every element is exactly 0 or 255.
+//
+// Public API:
+//   img_dither_fs(px, w, h) -> list
+//       Floyd-Steinberg error-diffusion dithering to 1-bit (0 or 255).
+//       Error is diffused to right, lower-left, lower, lower-right neighbours
+//       with weights 7/16, 3/16, 5/16, 1/16.
+//   img_dither_ordered(px, w, h) -> list
+//       4x4 Bayer-matrix ordered dither to 1-bit (0 or 255).
+//       Threshold matrix maps each pixel against a spatially-varying threshold.
+//
+// FLOAT HAZARDS obeyed:
+//   * abs(float) returns i64 — use if/else for float abs.
+//   * No bare multi-term float return — bind to named lets.
+//   * Float/int compare unsound — use *1.0 coercion where mixing types.
+
+// _dth_clampf — clamp float v to [lo, hi].
+fn _dth_clampf(v: float, lo: float, hi: float) -> float
+    let r = v
+    if v < lo
+        r = lo
+    if v > hi
+        r = hi
+    r
+
+// img_dither_fs — Floyd-Steinberg error-diffusion dither.
+// Works on a copy of the pixel list (converted to float for error propagation).
+// Error diffusion weights:
+//          *  7/16
+//   3/16  5/16  1/16
+fn img_dither_fs(px: list, w: int, h: int) -> list
+    let n = w * h
+    // Build a float working copy of the pixel buffer.
+    let buf = []
+    let ii = 0
+    while ii < n
+        let fv = px[ii] * 1.0
+        buf.push(fv)
+        ii = ii + 1
+    let out = []
+    let row = 0
+    while row < h
+        let col = 0
+        while col < w
+            let idx = row * w + col
+            let oldv = buf[idx]
+            // Quantise to nearest 1-bit level.
+            let newv = 0.0
+            if oldv >= 128.0
+                newv = 255.0
+            // Store quantised output.
+            let ov = float_to_int(newv)
+            out.push(ov)
+            // Compute and diffuse error.
+            let err = oldv - newv
+            // Right neighbour (7/16).
+            if col + 1 < w
+                let ri = idx + 1
+                let rv = buf[ri]
+                let rv2 = rv + err * 7.0 / 16.0
+                buf[ri] = rv2
+            // Lower-left (3/16).
+            if row + 1 < h
+                if col - 1 >= 0
+                    let lli = (row + 1) * w + (col - 1)
+                    let llv = buf[lli]
+                    let llv2 = llv + err * 3.0 / 16.0
+                    buf[lli] = llv2
+            // Lower (5/16).
+            if row + 1 < h
+                let di = (row + 1) * w + col
+                let dv = buf[di]
+                let dv2 = dv + err * 5.0 / 16.0
+                buf[di] = dv2
+            // Lower-right (1/16).
+            if row + 1 < h
+                if col + 1 < w
+                    let dri = (row + 1) * w + (col + 1)
+                    let drv = buf[dri]
+                    let drv2 = drv + err * 1.0 / 16.0
+                    buf[dri] = drv2
+            col = col + 1
+        row = row + 1
+    out
+
+// _dth_bayer_threshold — return the Bayer 4x4 threshold (0..255 scale) for position (row, col).
+// Standard 4x4 Bayer index matrix (0-based, scaled to 0..255):
+//  [ 0,  8,  2, 10]     -> thresholds: [ 16, 144,  48, 176]
+//  [12,  4, 14,  6]     ->             [208,  80, 240, 112]
+//  [ 3, 11,  1,  9]     ->             [ 64, 192,  32, 160]
+//  [15,  7, 13,  5]     ->             [256, 128, 224,  96]  (256 -> capped 255)
+// Formula: threshold = (bayer_index + 0.5) / 16.0 * 255  (rounds to nearest integer)
+// We store the 16 threshold values as a flat list indexed by (row%4)*4 + col%4.
+fn _dth_bayer_threshold(row: int, col: int) -> int
+    let r4 = row - (row / 4) * 4
+    let c4 = col - (col / 4) * 4
+    let bi = r4 * 4 + c4
+    // Bayer 4x4 index values in row-major order:
+    // [0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5]
+    // Threshold = floor((index + 0.5) / 16 * 255 + 0.5) but we use exact integer mapping.
+    // Precomputed: each = round((index+0.5)/16*255)
+    //   0->8, 1->24, 2->40, 3->56, 4->72, 5->88, 6->104, 7->120,
+    //   8->136, 9->152, 10->168, 11->184, 12->200, 13->216, 14->232, 15->248
+    // Map bi to bayer index then to threshold.
+    let bayer_idx = 0
+    if bi == 0
+        bayer_idx = 0
+    if bi == 1
+        bayer_idx = 8
+    if bi == 2
+        bayer_idx = 2
+    if bi == 3
+        bayer_idx = 10
+    if bi == 4
+        bayer_idx = 12
+    if bi == 5
+        bayer_idx = 4
+    if bi == 6
+        bayer_idx = 14
+    if bi == 7
+        bayer_idx = 6
+    if bi == 8
+        bayer_idx = 3
+    if bi == 9
+        bayer_idx = 11
+    if bi == 10
+        bayer_idx = 1
+    if bi == 11
+        bayer_idx = 9
+    if bi == 12
+        bayer_idx = 15
+    if bi == 13
+        bayer_idx = 7
+    if bi == 14
+        bayer_idx = 13
+    if bi == 15
+        bayer_idx = 5
+    // threshold = round((bayer_idx + 0.5) / 16.0 * 255)
+    let bf = bayer_idx * 1.0
+    let tf = (bf + 0.5) / 16.0 * 255.0
+    let thresh = float_to_int(tf + 0.5)
+    thresh
+
+// img_dither_ordered — 4x4 Bayer ordered dither to 1-bit.
+// Each pixel is compared against the spatially-varying Bayer threshold.
+// If pixel >= threshold: output 255, else output 0.
+fn img_dither_ordered(px: list, w: int, h: int) -> list
+    let out = []
+    let row = 0
+    while row < h
+        let col = 0
+        while col < w
+            let pv = px[row * w + col]
+            let thresh = _dth_bayer_threshold(row, col)
+            let result = 0
+            if pv >= thresh
+                result = 255
+            out.push(result)
+            col = col + 1
+        row = row + 1
+    out
