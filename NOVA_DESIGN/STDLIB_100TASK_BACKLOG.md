@@ -65,7 +65,8 @@ every task below was dup-checked absent. Ordered LOW-RISK / high-value first.
 | 46 | std/os pure path/binary/byte utilities | 12 | 2fc466b2 |
 | 47 | binary file-format parsers — os/{elf_header,pe_coff,macho,tar_ustar,ar_archive,cpio} compress/{zip_read,gzip_member} data/{wasm_hdr,java_class,pdf_xref} media/id3 | 12 | 2cf8cc74 |
 | 48 | std/crypto/ batteries (cryptanalysis merkle commitment securetok otp pwentropy blockpad randomtest) — round-trip KATs | 8 | 0d660ddc |
-| 49 | std/text/ NLP+search (bm25 keyword textrank collocation nlp_eval ngram_lm stopwords langdetect sentiment readability2 summarize spellcorrect) — **INDEPENDENT ADVERSARIAL AUDIT gate added**: 3 KAT-passing modules REJECTED (summarize+spellcorrect silent-sort-corruption, langdetect dead trigram) → FIXED + re-verified with >3-elem probes | 12 | *(this commit)* |
+| 49 | std/text/ NLP+search (bm25 keyword textrank collocation nlp_eval ngram_lm stopwords langdetect sentiment readability2 summarize spellcorrect) — **INDEPENDENT ADVERSARIAL AUDIT gate added**: 3 KAT-passing modules REJECTED (summarize+spellcorrect silent-sort-corruption, langdetect dead trigram) → FIXED + re-verified with >3-elem probes | 12 | 5c4de071 |
+| 50 | std/bio/ bioinformatics (seq codon kmer orf fastx restriction protein align motif phylo population seqstats) — audit: 5 clean + 5 fixed (fastx OOB-read, population hw_chi NaN, seqstats empty-MW, restriction palindrome biology, align REAL NW/SW traceback); re-verified with own probes | 12 | *(this commit)* |
 
 ## GAP-MAP #2 BACKLOG (2026-07-16, grep-verified over 240-module tree) — tasks 21-50, LOW-risk first
 **LOW risk (int/string/bytes, deterministic/round-trip KATs) — build first:**

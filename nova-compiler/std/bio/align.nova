@@ -1,0 +1,394 @@
+// std/bio/align.nova — Pairwise sequence alignment algorithms.
+//
+// Implements Needleman-Wunsch (global) and Smith-Waterman (local) alignment
+// using flat 1D DP matrices: index = i*(nb+1)+j for row i, col j.
+// Also provides edit distance (Levenshtein), identity/similarity metrics.
+//
+// FLAT-LIST DP: use a single list indexed row*(cols)+col to avoid the
+// list-of-lists assignment footgun.
+//
+// NOTE: parameter named 'mat' is the match score (avoid 'match' — reserved).
+//
+// Public API:
+//   nw_score(a,b,mat,mismatch,gap) -> int  NW global alignment score
+//   nw_global(a,b,mat,mismatch,gap) -> any dict {score,aligned_a,aligned_b}
+//   sw_score(a,b,mat,mismatch,gap) -> int  SW local max score
+//   sw_local(a,b,mat,mismatch,gap) -> any dict {score,aligned_a,aligned_b}
+//   align_identity(a,b) -> float  fraction matching positions (equal-length)
+//   align_similarity(a,b) -> float  same as align_identity (unweighted)
+//   hamming_similarity(a,b) -> float  1 - hamming_distance/len
+//   edit_distance(a,b) -> int  Levenshtein distance
+//   nw_default(a,b) -> int  NW with mat=1, mismatch=-1, gap=-1
+//   sw_default(a,b) -> int  SW with mat=1, mismatch=-1, gap=-1
+//   pct_identity(a,b) -> float  percent identity 0..100
+
+// Max of two integers.
+fn _max2(x, y) -> int
+    if x >= y
+        return x
+    return y
+
+// Max of three integers.
+fn _max3(x, y, z) -> int
+    if x >= y
+        if x >= z
+            return x
+        return z
+    if y >= z
+        return y
+    return z
+
+// Max of four integers (floor-at-zero for SW).
+fn _max4(a, b, c, d) -> int
+    let m1 = _max2(a, b)
+    let m2 = _max2(c, d)
+    return _max2(m1, m2)
+
+// _align_sc: score for aligning character ca vs cb.
+// Returns mat on exact match, mismatch otherwise.
+// Uses return-in-if to avoid the NOVA if-body-assignment codegen bug.
+fn _align_sc(ca, cb, mat, mismatch) -> int
+    if ca == cb
+        return mat
+    return mismatch
+
+// Needleman-Wunsch global alignment score using a flat DP matrix.
+fn nw_score(a, b, mat, mismatch, gap) -> int
+    let na = len(a)
+    let nb = len(b)
+    let cols = nb + 1
+    let total = (na + 1) * cols
+    let dp = []
+    let fi = 0
+    while fi < total
+        push(dp, 0)
+        fi = fi + 1
+    let ci = 0
+    while ci <= na
+        dp[ci * cols] = ci * gap
+        ci = ci + 1
+    let cj = 0
+    while cj <= nb
+        dp[cj] = cj * gap
+        cj = cj + 1
+    let i = 1
+    while i <= na
+        let j = 1
+        while j <= nb
+            let ca = slice(a, i - 1, i)
+            let cb = slice(b, j - 1, j)
+            let sc = _align_sc(ca, cb, mat, mismatch)
+            let diag = dp[(i - 1) * cols + (j - 1)] + sc
+            let up   = dp[(i - 1) * cols + j] + gap
+            let left = dp[i * cols + (j - 1)] + gap
+            dp[i * cols + j] = _max3(diag, up, left)
+            j = j + 1
+        i = i + 1
+    return dp[na * cols + nb]
+
+// _rev_str: reverse a string character by character.
+fn _rev_str(s) -> string
+    let n = len(s)
+    let result = ""
+    let i = n - 1
+    while i >= 0
+        let ch = slice(s, i, i + 1)
+        result = result + ch
+        i = i - 1
+    return result
+
+// Needleman-Wunsch global alignment with real traceback.
+// Returns dict {score, aligned_a, aligned_b} with gapped alignment strings.
+fn nw_global(a, b, mat, mismatch, gap) -> any
+    let na = len(a)
+    let nb = len(b)
+    let cols = nb + 1
+    let total = (na + 1) * cols
+    // fill DP matrix (same logic as nw_score)
+    let dp = []
+    let fi = 0
+    while fi < total
+        push(dp, 0)
+        fi = fi + 1
+    let ci = 0
+    while ci <= na
+        dp[ci * cols] = ci * gap
+        ci = ci + 1
+    let cj = 0
+    while cj <= nb
+        dp[cj] = cj * gap
+        cj = cj + 1
+    let i = 1
+    while i <= na
+        let j = 1
+        while j <= nb
+            let ca = slice(a, i - 1, i)
+            let cb = slice(b, j - 1, j)
+            let sc = _align_sc(ca, cb, mat, mismatch)
+            let diag = dp[(i - 1) * cols + (j - 1)] + sc
+            let up   = dp[(i - 1) * cols + j] + gap
+            let left = dp[i * cols + (j - 1)] + gap
+            dp[i * cols + j] = _max3(diag, up, left)
+            j = j + 1
+        i = i + 1
+    let score = dp[na * cols + nb]
+    // traceback from (na, nb) to (0, 0)
+    let rev_a = ""
+    let rev_b = ""
+    let ti = na
+    let tj = nb
+    while ti > 0 or tj > 0
+        if ti > 0 and tj > 0
+            let ca = slice(a, ti - 1, ti)
+            let cb = slice(b, tj - 1, tj)
+            let sc = _align_sc(ca, cb, mat, mismatch)
+            let diag_val = dp[(ti - 1) * cols + (tj - 1)] + sc
+            let cell_val = dp[ti * cols + tj]
+            if cell_val == diag_val
+                rev_a = rev_a + ca
+                rev_b = rev_b + cb
+                ti = ti - 1
+                tj = tj - 1
+            else
+                let up_val = dp[(ti - 1) * cols + tj] + gap
+                if cell_val == up_val
+                    rev_a = rev_a + ca
+                    rev_b = rev_b + "-"
+                    ti = ti - 1
+                else
+                    let cb2 = slice(b, tj - 1, tj)
+                    rev_a = rev_a + "-"
+                    rev_b = rev_b + cb2
+                    tj = tj - 1
+        else
+            if ti > 0
+                let ca = slice(a, ti - 1, ti)
+                rev_a = rev_a + ca
+                rev_b = rev_b + "-"
+                ti = ti - 1
+            else
+                let cb = slice(b, tj - 1, tj)
+                rev_a = rev_a + "-"
+                rev_b = rev_b + cb
+                tj = tj - 1
+    let aligned_a = _rev_str(rev_a)
+    let aligned_b = _rev_str(rev_b)
+    let res = {}
+    res["score"] = score
+    res["aligned_a"] = aligned_a
+    res["aligned_b"] = aligned_b
+    return res
+
+// Smith-Waterman local alignment score (max cell value in DP matrix).
+fn sw_score(a, b, mat, mismatch, gap) -> int
+    let na = len(a)
+    let nb = len(b)
+    let cols = nb + 1
+    let total = (na + 1) * cols
+    let dp = []
+    let fi = 0
+    while fi < total
+        push(dp, 0)
+        fi = fi + 1
+    let best = 0
+    let i = 1
+    while i <= na
+        let j = 1
+        while j <= nb
+            let ca = slice(a, i - 1, i)
+            let cb = slice(b, j - 1, j)
+            let sc = _align_sc(ca, cb, mat, mismatch)
+            let diag = dp[(i - 1) * cols + (j - 1)] + sc
+            let up   = dp[(i - 1) * cols + j] + gap
+            let left = dp[i * cols + (j - 1)] + gap
+            let cell = _max4(0, diag, up, left)
+            dp[i * cols + j] = cell
+            if cell > best
+                best = cell
+            j = j + 1
+        i = i + 1
+    return best
+
+// Smith-Waterman local alignment with real traceback.
+// Returns dict {score, aligned_a, aligned_b} with the locally aligned substrings.
+// Traceback starts from the max-scoring cell and stops when a cell value reaches 0.
+fn sw_local(a, b, mat, mismatch, gap) -> any
+    let na = len(a)
+    let nb = len(b)
+    let cols = nb + 1
+    let total = (na + 1) * cols
+    // fill DP matrix (same logic as sw_score), tracking max cell location
+    let dp = []
+    let fi = 0
+    while fi < total
+        push(dp, 0)
+        fi = fi + 1
+    let best = 0
+    let best_i = 0
+    let best_j = 0
+    let i = 1
+    while i <= na
+        let j = 1
+        while j <= nb
+            let ca = slice(a, i - 1, i)
+            let cb = slice(b, j - 1, j)
+            let sc = _align_sc(ca, cb, mat, mismatch)
+            let diag = dp[(i - 1) * cols + (j - 1)] + sc
+            let up   = dp[(i - 1) * cols + j] + gap
+            let left = dp[i * cols + (j - 1)] + gap
+            let cell = _max4(0, diag, up, left)
+            dp[i * cols + j] = cell
+            if cell > best
+                best = cell
+                best_i = i
+                best_j = j
+            j = j + 1
+        i = i + 1
+    // traceback from (best_i, best_j), stopping when cell == 0
+    let rev_a = ""
+    let rev_b = ""
+    let ti = best_i
+    let tj = best_j
+    let done = false
+    while not done
+        if ti == 0 or tj == 0
+            done = true
+        else
+            let cell_val = dp[ti * cols + tj]
+            if cell_val == 0
+                done = true
+            else
+                let ca = slice(a, ti - 1, ti)
+                let cb = slice(b, tj - 1, tj)
+                let sc = _align_sc(ca, cb, mat, mismatch)
+                let diag_val = dp[(ti - 1) * cols + (tj - 1)] + sc
+                if cell_val == diag_val
+                    rev_a = rev_a + ca
+                    rev_b = rev_b + cb
+                    ti = ti - 1
+                    tj = tj - 1
+                else
+                    let up_val = dp[(ti - 1) * cols + tj] + gap
+                    if cell_val == up_val
+                        rev_a = rev_a + ca
+                        rev_b = rev_b + "-"
+                        ti = ti - 1
+                    else
+                        let cb2 = slice(b, tj - 1, tj)
+                        rev_a = rev_a + "-"
+                        rev_b = rev_b + cb2
+                        tj = tj - 1
+    let aligned_a = _rev_str(rev_a)
+    let aligned_b = _rev_str(rev_b)
+    let res = {}
+    res["score"] = best
+    res["aligned_a"] = aligned_a
+    res["aligned_b"] = aligned_b
+    return res
+
+// Fraction of identical positions in two equal-length aligned sequences.
+// Returns 0.0 if sequences are empty or of different lengths.
+fn align_identity(a, b) -> float
+    let na = len(a)
+    let nb = len(b)
+    if na == 0
+        let z = 0.0
+        return z
+    if na != nb
+        let z = 0.0
+        return z
+    let matches = 0
+    let i = 0
+    while i < na
+        let ca = slice(a, i, i + 1)
+        let cb = slice(b, i, i + 1)
+        if ca == cb
+            matches = matches + 1
+        i = i + 1
+    let mf = matches * 1.0
+    let nf = na * 1.0
+    let idfrac = mf / nf
+    return idfrac
+
+// Percent identity as a float 0..100 for two aligned equal-length strings.
+fn pct_identity(a, b) -> float
+    let idfrac = align_identity(a, b)
+    let pct = idfrac * 100.0
+    return pct
+
+// Hamming similarity: 1 - (hamming distance / length). Requires equal length.
+fn hamming_similarity(a, b) -> float
+    let na = len(a)
+    let nb = len(b)
+    if na == 0
+        let z = 0.0
+        return z
+    if na != nb
+        let z = 0.0
+        return z
+    let diff = 0
+    let i = 0
+    while i < na
+        let ca = slice(a, i, i + 1)
+        let cb = slice(b, i, i + 1)
+        if ca != cb
+            diff = diff + 1
+        i = i + 1
+    let df = diff * 1.0
+    let nf = na * 1.0
+    let hsim = 1.0 - df / nf
+    return hsim
+
+// Levenshtein edit distance between two strings (flat DP matrix).
+fn edit_distance(a, b) -> int
+    let na = len(a)
+    let nb = len(b)
+    let cols = nb + 1
+    let total = (na + 1) * cols
+    let dp = []
+    let fi = 0
+    while fi < total
+        push(dp, 0)
+        fi = fi + 1
+    let ci = 0
+    while ci <= na
+        dp[ci * cols] = ci
+        ci = ci + 1
+    let cj = 0
+    while cj <= nb
+        dp[cj] = cj
+        cj = cj + 1
+    let i = 1
+    while i <= na
+        let j = 1
+        while j <= nb
+            let ca = slice(a, i - 1, i)
+            let cb = slice(b, j - 1, j)
+            if ca == cb
+                dp[i * cols + j] = dp[(i - 1) * cols + (j - 1)]
+            else
+                let sub = dp[(i - 1) * cols + (j - 1)] + 1
+                let del = dp[(i - 1) * cols + j] + 1
+                let ins = dp[i * cols + (j - 1)] + 1
+                let mn = sub
+                if del < mn
+                    mn = del
+                if ins < mn
+                    mn = ins
+                dp[i * cols + j] = mn
+            j = j + 1
+        i = i + 1
+    return dp[na * cols + nb]
+
+// NW global alignment with standard scores (mat=1, mismatch=-1, gap=-1).
+fn nw_default(a, b) -> int
+    return nw_score(a, b, 1, 0 - 1, 0 - 1)
+
+// SW local alignment with standard scores (mat=1, mismatch=-1, gap=-1).
+fn sw_default(a, b) -> int
+    return sw_score(a, b, 1, 0 - 1, 0 - 1)
+
+// align_similarity: fraction of matching positions (same as align_identity).
+fn align_similarity(a, b) -> float
+    let r = align_identity(a, b)
+    return r

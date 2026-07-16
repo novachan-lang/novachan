@@ -1,0 +1,274 @@
+// std/bio/fastx.nova — FASTA and FASTQ parsing and formatting.
+// LEAF — imports NOTHING.
+//
+// FASTA format:
+//   >id_line
+//   sequence (may span multiple lines; concatenated)
+//   (records separated by next '>' line)
+//
+// FASTQ format:
+//   @id_line
+//   sequence
+//   + (ignored)
+//   quality string (same length as sequence)
+//
+// Line splitting: we split on newline (chr(10)) only.  Carriage returns
+// (chr(13)) at end-of-line are stripped.  Multi-line sequences are
+// concatenated without spaces.
+//
+// FLOAT HAZARDS obeyed:
+//   * All intermediate floats bound to named lets.
+//   * Abs of float: if x<0.0 then 0.0-x else x.
+//
+// API:
+//   fasta_parse(text)            -> any  list of {id, seq}
+//   fasta_format(records,width)  -> string  '>id\n<wrapped seq>\n' per record
+//   fasta_count(text)            -> int
+//   fasta_ids(text)              -> any  list of id strings
+//   fasta_get(text,id)           -> string  seq for first matching id, "" if not found
+//   fasta_total_length(text)     -> int  sum of all sequence lengths
+//   fastq_parse(text)            -> any  list of {id, seq, qual}
+//   fastq_format(records)        -> string  '@id\nseq\n+\nqual\n' per record
+//   fastq_phred_to_q(ch)         -> int  Phred+33: ord(ch)-33
+//   fastq_q_to_phred(q)          -> string  chr(q+33)
+//   fastq_avg_quality(qual)      -> float  mean Phred score of qual string
+//   fastq_min_quality(qual)      -> int  minimum Phred score
+//   fastq_count(text)            -> int  number of FASTQ records
+
+// _split_lines: split a string on newline (chr(10)), stripping trailing CR.
+fn _split_lines(text) -> any
+    let lines = []
+    let n = len(text)
+    let start = 0
+    let i = 0
+    let nl = chr(10)
+    let cr = chr(13)
+    while i < n
+        let ch = slice(text, i, i + 1)
+        if ch == nl
+            let line = slice(text, start, i)
+            // strip trailing CR
+            let ll = len(line)
+            if ll > 0
+                let last = slice(line, ll - 1, ll)
+                if last == cr
+                    line = slice(line, 0, ll - 1)
+            push(lines, line)
+            start = i + 1
+        i = i + 1
+    // last segment (no trailing newline)
+    if start < n
+        let line = slice(text, start, n)
+        let ll = len(line)
+        if ll > 0
+            let last = slice(line, ll - 1, ll)
+            if last == cr
+                line = slice(line, 0, ll - 1)
+        push(lines, line)
+    return lines
+
+// fasta_parse: parse FASTA text into a list of {id, seq} dicts.
+fn fasta_parse(text) -> any
+    let records = []
+    let lines = _split_lines(text)
+    let n = len(lines)
+    let cur_id = ""
+    let cur_seq = ""
+    let in_record = false
+    let i = 0
+    while i < n
+        let line = lines[i]
+        let ll = len(line)
+        if ll > 0
+            let first = slice(line, 0, 1)
+            if first == ">"
+                if in_record
+                    let rec = {}
+                    rec["id"] = cur_id
+                    rec["seq"] = cur_seq
+                    push(records, rec)
+                cur_id = slice(line, 1, ll)
+                cur_seq = ""
+                in_record = true
+            else
+                if in_record
+                    cur_seq = cur_seq + line
+        i = i + 1
+    if in_record
+        let rec = {}
+        rec["id"] = cur_id
+        rec["seq"] = cur_seq
+        push(records, rec)
+    return records
+
+// _wrap_seq: wrap a sequence string to at most width chars per line.
+fn _wrap_seq(seq, width) -> string
+    let result = ""
+    let n = len(seq)
+    let i = 0
+    let nl = chr(10)
+    while i < n
+        let end = i + width
+        if end > n
+            end = n
+        let chunk = slice(seq, i, end)
+        result = result + chunk + nl
+        i = end
+    return result
+
+// fasta_format: format a list of {id, seq} dicts to FASTA text.
+// Each sequence is wrapped at width characters per line.
+fn fasta_format(records, width) -> string
+    let result = ""
+    let n = len(records)
+    let i = 0
+    let nl = chr(10)
+    while i < n
+        let rec = records[i]
+        let rid = rec["id"]
+        let seq = rec["seq"]
+        result = result + ">" + rid + nl
+        result = result + _wrap_seq(seq, width)
+        i = i + 1
+    return result
+
+// fasta_count: number of records in FASTA text.
+fn fasta_count(text) -> int
+    let records = fasta_parse(text)
+    let c = len(records)
+    return c
+
+// fasta_ids: list of record IDs from FASTA text.
+fn fasta_ids(text) -> any
+    let records = fasta_parse(text)
+    let ids = []
+    let i = 0
+    let n = len(records)
+    while i < n
+        let rec = records[i]
+        push(ids, rec["id"])
+        i = i + 1
+    return ids
+
+// fasta_get: return the sequence of the first record matching the given id,
+// or "" if not found.
+fn fasta_get(text, id) -> string
+    let records = fasta_parse(text)
+    let i = 0
+    let n = len(records)
+    while i < n
+        let rec = records[i]
+        if rec["id"] == id
+            let s = rec["seq"]
+            return s
+        i = i + 1
+    return ""
+
+// fasta_total_length: sum of all sequence lengths in FASTA text.
+fn fasta_total_length(text) -> int
+    let records = fasta_parse(text)
+    let total = 0
+    let i = 0
+    let n = len(records)
+    while i < n
+        let rec = records[i]
+        let s = rec["seq"]
+        total = total + len(s)
+        i = i + 1
+    return total
+
+// fastq_parse: parse FASTQ text into a list of {id, seq, qual} dicts.
+// Format: @id / seq / + / qual, four lines per record.
+// A group is only emitted when ALL FOUR lines (i, i+1, i+2, i+3) exist
+// (i.e. i+3 <= n-1, equivalently i+3 < n).  Truncated trailing groups
+// (fewer than 4 remaining lines) are silently skipped — never emitted
+// with integer 0 as qual.
+fn fastq_parse(text) -> any
+    let records = []
+    let lines = _split_lines(text)
+    let n = len(lines)
+    let i = 0
+    while i + 3 < n
+        let id_line = lines[i]
+        let seq_line = lines[i + 1]
+        let plus_line = lines[i + 2]
+        let qual_line = lines[i + 3]
+        let id_len = len(id_line)
+        if id_len > 0
+            let first = slice(id_line, 0, 1)
+            if first == "@"
+                let rec = {}
+                rec["id"] = slice(id_line, 1, id_len)
+                rec["seq"] = seq_line
+                rec["qual"] = qual_line
+                push(records, rec)
+        i = i + 4
+    return records
+
+// fastq_format: format a list of {id, seq, qual} dicts to FASTQ text.
+fn fastq_format(records) -> string
+    let result = ""
+    let n = len(records)
+    let i = 0
+    let nl = chr(10)
+    while i < n
+        let rec = records[i]
+        let rid = rec["id"]
+        let seq = rec["seq"]
+        let qual = rec["qual"]
+        result = result + "@" + rid + nl + seq + nl + "+" + nl + qual + nl
+        i = i + 1
+    return result
+
+// fastq_phred_to_q: convert a Phred+33 character to integer quality score.
+// q = ord(ch) - 33
+fn fastq_phred_to_q(ch) -> int
+    let o = ord(ch)
+    let q = o - 33
+    return q
+
+// fastq_q_to_phred: convert an integer quality score to Phred+33 character.
+// ch = chr(q + 33)
+fn fastq_q_to_phred(q) -> string
+    let o = q + 33
+    let ch = chr(o)
+    return ch
+
+// fastq_avg_quality: mean Phred quality of a quality string.
+fn fastq_avg_quality(qual) -> float
+    let n = len(qual)
+    if n == 0
+        return 0.0
+    let total = 0
+    let i = 0
+    while i < n
+        let ch = slice(qual, i, i + 1)
+        let q = fastq_phred_to_q(ch)
+        total = total + q
+        i = i + 1
+    let tf = total * 1.0
+    let nf = n * 1.0
+    let avg = tf / nf
+    return avg
+
+// fastq_min_quality: minimum Phred quality score in a quality string.
+fn fastq_min_quality(qual) -> int
+    let n = len(qual)
+    if n == 0
+        return 0
+    let first = slice(qual, 0, 1)
+    let minq = fastq_phred_to_q(first)
+    let i = 1
+    while i < n
+        let ch = slice(qual, i, i + 1)
+        let q = fastq_phred_to_q(ch)
+        if q < minq
+            minq = q
+        i = i + 1
+    return minq
+
+// fastq_count: number of FASTQ records in text.
+fn fastq_count(text) -> int
+    let records = fastq_parse(text)
+    let c = len(records)
+    return c

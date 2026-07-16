@@ -1,0 +1,436 @@
+// std/bio/motif.nova — Sequence motif finding and position weight matrices.
+//
+// Works with DNA/RNA sequences (uppercase A,C,G,T,U) and IUPAC ambiguity codes.
+// All helpers are private (underscore prefix).
+//
+// IUPAC codes supported:
+//   R=A/G, Y=C/T, N=any, W=A/T, S=C/G, K=G/T, M=A/C
+//   B=C/G/T, D=A/G/T, H=A/C/T, V=A/C/G
+//   (exact bases A,C,G,T,U always match themselves)
+//
+// Public API:
+//   motif_find_exact(seq,motif)        -> any   list of start positions (overlapping)
+//   motif_count(seq,motif)             -> int   count of overlapping occurrences
+//   iupac_match(base,code)             -> bool  does base satisfy IUPAC code?
+//   motif_find_iupac(seq,pattern)      -> any   positions where IUPAC pattern matches
+//   motif_consensus(seqs)              -> string most-frequent base per column
+//   motif_pwm_counts(seqs)             -> any   per-column dict base->count
+//   motif_pwm_freq(seqs)               -> any   per-column dict base->frequency
+//   motif_score(seqs,candidate)        -> float log-likelihood-ish score
+//   motif_information(seqs)            -> float total information content (bits)
+//   motif_column_entropy(seqs,col)     -> float Shannon entropy for column col
+//   motif_gc(motif)                    -> float GC fraction in motif string
+//   motif_reverse_complement(motif)    -> string reverse complement of DNA motif
+
+// ---------------------------------------------------------------------------
+// PRIVATE HELPERS
+// ---------------------------------------------------------------------------
+
+// Complement of a DNA base (handles IUPAC codes too).
+fn _complement(b) -> string
+    if b == "A"
+        return "T"
+    if b == "T"
+        return "A"
+    if b == "G"
+        return "C"
+    if b == "C"
+        return "G"
+    if b == "U"
+        return "A"
+    if b == "R"
+        return "Y"
+    if b == "Y"
+        return "R"
+    if b == "S"
+        return "S"
+    if b == "W"
+        return "W"
+    if b == "K"
+        return "M"
+    if b == "M"
+        return "K"
+    if b == "B"
+        return "V"
+    if b == "V"
+        return "B"
+    if b == "D"
+        return "H"
+    if b == "H"
+        return "D"
+    if b == "N"
+        return "N"
+    return b
+
+// Natural log approximation to avoid dependency (uses builtin log).
+// log(x) in NOVA is the natural logarithm.
+
+// log base 2 of x.
+fn _log2(x) -> float
+    let ln2 = 0.6931471805599453
+    let lx = log(x)
+    let result = lx / ln2
+    return result
+
+// ---------------------------------------------------------------------------
+// PUBLIC: EXACT MOTIF FINDING
+// ---------------------------------------------------------------------------
+
+// Find all (overlapping) start positions where motif occurs in seq.
+fn motif_find_exact(seq, motif) -> any
+    let positions = []
+    let sn = len(seq)
+    let mn = len(motif)
+    if mn == 0
+        return positions
+    if sn < mn
+        return positions
+    let i = 0
+    while i <= sn - mn
+        let match_ok = true
+        let j = 0
+        while j < mn
+            let sb = slice(seq, i + j, i + j + 1)
+            let mb = slice(motif, j, j + 1)
+            if sb != mb
+                match_ok = false
+                j = mn
+            else
+                j = j + 1
+        if match_ok
+            push(positions, i)
+        i = i + 1
+    return positions
+
+// Count overlapping occurrences of motif in seq.
+fn motif_count(seq, motif) -> int
+    let positions = motif_find_exact(seq, motif)
+    return len(positions)
+
+// ---------------------------------------------------------------------------
+// PUBLIC: IUPAC MATCHING
+// ---------------------------------------------------------------------------
+
+// Returns true if base (A,C,G,T,U) matches IUPAC ambiguity code.
+fn iupac_match(base, code) -> bool
+    // Exact match always works.
+    if base == code
+        return true
+    // N matches anything.
+    if code == "N"
+        return true
+    // R = A or G
+    if code == "R"
+        if base == "A"
+            return true
+        if base == "G"
+            return true
+        return false
+    // Y = C or T
+    if code == "Y"
+        if base == "C"
+            return true
+        if base == "T"
+            return true
+        return false
+    // W = A or T
+    if code == "W"
+        if base == "A"
+            return true
+        if base == "T"
+            return true
+        return false
+    // S = C or G
+    if code == "S"
+        if base == "C"
+            return true
+        if base == "G"
+            return true
+        return false
+    // K = G or T
+    if code == "K"
+        if base == "G"
+            return true
+        if base == "T"
+            return true
+        return false
+    // M = A or C
+    if code == "M"
+        if base == "A"
+            return true
+        if base == "C"
+            return true
+        return false
+    // B = C or G or T (not A)
+    if code == "B"
+        if base == "C"
+            return true
+        if base == "G"
+            return true
+        if base == "T"
+            return true
+        return false
+    // D = A or G or T (not C)
+    if code == "D"
+        if base == "A"
+            return true
+        if base == "G"
+            return true
+        if base == "T"
+            return true
+        return false
+    // H = A or C or T (not G)
+    if code == "H"
+        if base == "A"
+            return true
+        if base == "C"
+            return true
+        if base == "T"
+            return true
+        return false
+    // V = A or C or G (not T)
+    if code == "V"
+        if base == "A"
+            return true
+        if base == "C"
+            return true
+        if base == "G"
+            return true
+        return false
+    return false
+
+// Find all positions where IUPAC pattern matches in seq (overlapping).
+fn motif_find_iupac(seq, pattern) -> any
+    let positions = []
+    let sn = len(seq)
+    let pn = len(pattern)
+    if pn == 0
+        return positions
+    if sn < pn
+        return positions
+    let i = 0
+    while i <= sn - pn
+        let match_ok = true
+        let j = 0
+        while j < pn
+            let sb = slice(seq, i + j, i + j + 1)
+            let pb = slice(pattern, j, j + 1)
+            let ok = iupac_match(sb, pb)
+            if not ok
+                match_ok = false
+                j = pn
+            else
+                j = j + 1
+        if match_ok
+            push(positions, i)
+        i = i + 1
+    return positions
+
+// ---------------------------------------------------------------------------
+// PRIVATE: PWM helper — collect per-column base counts for a list of seqs.
+// seqs must be equal-length strings.
+// Returns a list of dicts (one dict per column), each dict: base -> count.
+// ---------------------------------------------------------------------------
+fn _pwm_raw(seqs) -> any
+    let n = len(seqs)
+    if n == 0
+        let empty = []
+        return empty
+    let width = len(seqs[0])
+    // Build a list of empty dicts, one per column.
+    let result = []
+    let c2 = 0
+    while c2 < width
+        let dd = {}
+        push(result, dd)
+        c2 = c2 + 1
+    // Tally each sequence.
+    let si = 0
+    while si < n
+        let seq = seqs[si]
+        let j = 0
+        while j < width
+            let b = slice(seq, j, j + 1)
+            let d2 = result[j]
+            if contains(d2, b)
+                let old = d2[b]
+                d2[b] = old + 1
+            else
+                d2[b] = 1
+            j = j + 1
+        si = si + 1
+    return result
+
+// ---------------------------------------------------------------------------
+// PUBLIC: CONSENSUS / PWM
+// ---------------------------------------------------------------------------
+
+// Most frequent base at each column position of equal-length sequences.
+// Ties broken by whichever base comes first alphabetically in iteration order.
+fn motif_consensus(seqs) -> string
+    let raw = _pwm_raw(seqs)
+    let width = len(raw)
+    let cons = ""
+    let col = 0
+    while col < width
+        let d = raw[col]
+        let ks = keys(d)
+        let best_base = "N"
+        let best_cnt = 0
+        let ki = 0
+        while ki < len(ks)
+            let b = ks[ki]
+            let cnt = d[b]
+            if cnt > best_cnt
+                best_cnt = cnt
+                best_base = b
+            ki = ki + 1
+        cons = cons + best_base
+        col = col + 1
+    return cons
+
+// Per-column base counts: returns list of dicts (one per column).
+fn motif_pwm_counts(seqs) -> any
+    return _pwm_raw(seqs)
+
+// Per-column base frequencies: same structure as counts but divided by n.
+fn motif_pwm_freq(seqs) -> any
+    let raw = _pwm_raw(seqs)
+    let n = len(seqs)
+    if n == 0
+        return raw
+    let width = len(raw)
+    let freq_result = []
+    let col = 0
+    while col < width
+        let d = raw[col]
+        let fd = {}
+        let ks = keys(d)
+        let ki = 0
+        while ki < len(ks)
+            let b = ks[ki]
+            let cnt = d[b]
+            let nf = n * 1.0
+            let cntf = cnt * 1.0
+            let f = cntf / nf
+            fd[b] = f
+            ki = ki + 1
+        push(freq_result, fd)
+        col = col + 1
+    return freq_result
+
+// Sum of log-frequencies of the candidate's bases across all columns.
+// Uses pseudocount of 0.01 to avoid log(0). Higher = more likely.
+fn _motif_col_freq(fd, b) -> float
+    if contains(fd, b)
+        let fv = fd[b]
+        return fv
+    return 0.01
+
+fn _motif_clamp(f) -> float
+    if f < 0.01
+        return 0.01
+    return f
+
+fn motif_score(seqs, candidate) -> float
+    let freqs = motif_pwm_freq(seqs)
+    let width = len(freqs)
+    let cn = len(candidate)
+    let score = 0.0
+    let col = 0
+    while col < width and col < cn
+        let b = slice(candidate, col, col + 1)
+        let fd = freqs[col]
+        let raw_f = _motif_col_freq(fd, b)
+        let f = _motif_clamp(raw_f)
+        let lf = log(f)
+        score = score + lf
+        col = col + 1
+    return score
+
+// Shannon entropy contribution for one prob value (0 if p==0).
+fn _entropy_contrib(p) -> float
+    if p > 0.0
+        let lp = _log2(p)
+        let contrib = p * lp
+        return contrib
+    return 0.0
+
+// Shannon entropy of one column (bits). H = -sum(p * log2(p)).
+fn motif_column_entropy(seqs, col) -> float
+    let n = len(seqs)
+    if n == 0
+        let z = 0.0
+        return z
+    let raw = _pwm_raw(seqs)
+    let width = len(raw)
+    if col >= width
+        let z = 0.0
+        return z
+    let d = raw[col]
+    let ks = keys(d)
+    let h = 0.0
+    let nf = n * 1.0
+    let ki = 0
+    while ki < len(ks)
+        let b = ks[ki]
+        let cnt = d[b]
+        let cntf = cnt * 1.0
+        let p = cntf / nf
+        let contrib = _entropy_contrib(p)
+        h = h - contrib
+        ki = ki + 1
+    return h
+
+// Total information content in bits: sum over columns of (2 - entropy).
+// For DNA alphabet max entropy = 2 bits (log2(4) = 2).
+fn motif_information(seqs) -> float
+    let n = len(seqs)
+    if n == 0
+        let z = 0.0
+        return z
+    let width = len(seqs[0])
+    let total = 0.0
+    let col = 0
+    while col < width
+        let h = motif_column_entropy(seqs, col)
+        let ic = 2.0 - h
+        total = total + ic
+        col = col + 1
+    return total
+
+// ---------------------------------------------------------------------------
+// PUBLIC: GC CONTENT AND REVERSE COMPLEMENT
+// ---------------------------------------------------------------------------
+
+// GC fraction of a motif/sequence string.
+fn motif_gc(motif) -> float
+    let n = len(motif)
+    if n == 0
+        let z = 0.0
+        return z
+    let gc = 0
+    let i = 0
+    while i < n
+        let b = slice(motif, i, i + 1)
+        if b == "G"
+            gc = gc + 1
+        if b == "C"
+            gc = gc + 1
+        i = i + 1
+    let gcf = gc * 1.0
+    let nf = n * 1.0
+    let result = gcf / nf
+    return result
+
+// Reverse complement of a DNA motif (5' -> 3').
+fn motif_reverse_complement(motif) -> string
+    let n = len(motif)
+    let rc = ""
+    let i = n - 1
+    while i >= 0
+        let b = slice(motif, i, i + 1)
+        let cb = _complement(b)
+        rc = rc + cb
+        i = i - 1
+    return rc

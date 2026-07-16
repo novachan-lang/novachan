@@ -1,0 +1,312 @@
+// std/bio/phylo.nova — Phylogenetic distances, UPGMA clustering, and Newick output.
+// LEAF — imports NOTHING.
+//
+// Sequences are plain uppercase-letter strings (DNA alphabet A,C,G,T).
+//
+// Public API:
+//   hamming(a,b)              -> int    count of differing positions
+//   p_distance(a,b)           -> float  fraction of differing sites (0..1)
+//   is_transition(x,y)        -> bool   A<->G or C<->T
+//   transitions(a,b)          -> int    number of transition differences
+//   transversions(a,b)        -> int    number of transversion differences
+//   jukes_cantor(a,b)         -> float  JC69 corrected distance
+//   kimura2p(a,b)             -> float  K80 corrected distance (approx)
+//   dist_matrix(seqs)         -> any    flat list n*n pairwise p_distances
+//   upgma(seqs)               -> any    list of merge-step dicts {a,b,height}
+//   newick_leaf(name)         -> string  just the label
+//   newick_join(left,right,d) -> string  "(left:d,right:d)"
+//   tree_to_newick(steps,names)-> string  full Newick string from UPGMA result
+
+// _min_len: private helper — minimum of two ints.
+fn _min_len(a, b) -> int
+    if a < b
+        return a
+    return b
+
+// _abs_float: private helper — absolute value of float.
+fn _abs_float(x) -> float
+    if x < 0.0
+        return 0.0 - x
+    return x
+
+// hamming: count positions where a and b differ (up to shorter length).
+fn hamming(a, b) -> int
+    let n = _min_len(len(a), len(b))
+    let count = 0
+    let i = 0
+    while i < n
+        let ca = slice(a, i, i+1)
+        let cb = slice(b, i, i+1)
+        if ca != cb
+            count = count + 1
+        i = i + 1
+    return count
+
+// p_distance: fraction of sites that differ (hamming / length).
+fn p_distance(a, b) -> float
+    let n = _min_len(len(a), len(b))
+    if n == 0
+        return 0.0
+    let h = hamming(a, b)
+    let hf = h * 1.0
+    let nf = n * 1.0
+    let d = hf / nf
+    return d
+
+// is_transition: true if the pair is a purine<->purine (A<->G) or pyrimidine<->pyrimidine (C<->T).
+fn is_transition(x, y) -> bool
+    if x == y
+        return false
+    if x == "A" and y == "G"
+        return true
+    if x == "G" and y == "A"
+        return true
+    if x == "C" and y == "T"
+        return true
+    if x == "T" and y == "C"
+        return true
+    return false
+
+// transitions: count transition differences between equal-length sequences.
+fn transitions(a, b) -> int
+    let n = _min_len(len(a), len(b))
+    let count = 0
+    let i = 0
+    while i < n
+        let ca = slice(a, i, i+1)
+        let cb = slice(b, i, i+1)
+        let ti = is_transition(ca, cb)
+        if ti
+            count = count + 1
+        i = i + 1
+    return count
+
+// transversions: count transversion differences (differ but not transitions).
+fn transversions(a, b) -> int
+    let n = _min_len(len(a), len(b))
+    let count = 0
+    let i = 0
+    while i < n
+        let ca = slice(a, i, i+1)
+        let cb = slice(b, i, i+1)
+        if ca != cb
+            let ti = is_transition(ca, cb)
+            if not ti
+                count = count + 1
+        i = i + 1
+    return count
+
+// jukes_cantor: JC69 correction: d = -0.75 * ln(1 - (4/3)*p).
+// Returns 10.0 when p >= 0.75 (correction is undefined).
+fn jukes_cantor(a, b) -> float
+    let p = p_distance(a, b)
+    let limit = 0.75
+    if p >= limit
+        return 10.0
+    let factor = 4.0 / 3.0
+    let inner = 1.0 - factor * p
+    let lv = log(inner)
+    let neg3q = 0.0 - 0.75
+    let d = neg3q * lv
+    return d
+
+// kimura2p: K80 two-parameter model using transition/transversion fractions.
+// d = -0.5*ln((1-2P-Q)(1-2Q)^0.5) where P=ti fraction, Q=tv fraction.
+// Returns 10.0 when correction is undefined (argument to log <=0).
+fn kimura2p(a, b) -> float
+    let n = _min_len(len(a), len(b))
+    if n == 0
+        return 0.0
+    let nf = n * 1.0
+    let ti = transitions(a, b)
+    let tv = transversions(a, b)
+    let P = (ti * 1.0) / nf
+    let Q = (tv * 1.0) / nf
+    let w1 = 1.0 - 2.0*P - Q
+    let w2 = 1.0 - 2.0*Q
+    if w1 <= 0.0 or w2 <= 0.0
+        return 10.0
+    let lw2 = log(w2)
+    let half_lw2 = 0.5 * lw2
+    let lw1 = log(w1)
+    let inner = lw1 + half_lw2
+    let neg_half = 0.0 - 0.5
+    let d = neg_half * inner
+    return d
+
+// dist_matrix: n*n flat list of pairwise p_distances (symmetric, 0 on diagonal).
+fn dist_matrix(seqs) -> any
+    let n = len(seqs)
+    let mat = []
+    let i = 0
+    while i < n
+        let j = 0
+        while j < n
+            let d = p_distance(seqs[i], seqs[j])
+            push(mat, d)
+            j = j + 1
+        i = i + 1
+    return mat
+
+// _find_min_pair: private — finds indices (i,j) with i<j of minimum in the distance matrix.
+// Returns a flat 2-element list [i, j].
+fn _find_min_pair(mat, n) -> any
+    let best_i = 0
+    let best_j = 1
+    let best_d = mat[0*n+1]
+    let i = 0
+    while i < n
+        let j = i + 1
+        while j < n
+            let d = mat[i*n+j]
+            if d < best_d
+                best_d = d
+                best_i = i
+                best_j = j
+            j = j + 1
+        i = i + 1
+    let pair = []
+    push(pair, best_i)
+    push(pair, best_j)
+    return pair
+
+// upgma: simple UPGMA clustering on list of sequences.
+// Returns list of step dicts; each dict has string keys "a","b","height".
+// "a" and "b" are integer cluster indices (as strings via str()), "height" is float.
+fn upgma(seqs) -> any
+    let n = len(seqs)
+    let mat = dist_matrix(seqs)
+    // cluster sizes: each starts as 1
+    let sizes = []
+    let active = []
+    let i = 0
+    while i < n
+        push(sizes, 1)
+        push(active, i)
+        i = i + 1
+    let steps = []
+    let next_id = n
+    // We need a mutable distance matrix; use a dict keyed by "i,j"
+    let dists = {}
+    i = 0
+    while i < n
+        let j = 0
+        while j < n
+            let key = str(i) + "," + str(j)
+            dists[key] = mat[i*n+j]
+            j = j + 1
+        i = i + 1
+    // cluster sizes by id
+    let csizes = {}
+    i = 0
+    while i < n
+        csizes[str(i)] = 1
+        i = i + 1
+    // active cluster set as list
+    let active_ids = []
+    i = 0
+    while i < n
+        push(active_ids, i)
+        i = i + 1
+    let nactive = n
+    while nactive > 1
+        // find minimum distance among active pairs
+        let best_a = active_ids[0]
+        let best_b = active_ids[1]
+        let best_key = str(best_a) + "," + str(best_b)
+        let best_d = dists[best_key]
+        let ai = 0
+        while ai < nactive
+            let aj = ai + 1
+            while aj < nactive
+                let ca = active_ids[ai]
+                let cb = active_ids[aj]
+                let ck = str(ca) + "," + str(cb)
+                let cd = dists[ck]
+                if cd < best_d
+                    best_d = cd
+                    best_a = ca
+                    best_b = cb
+                aj = aj + 1
+            ai = ai + 1
+        // record the merge step
+        let height = best_d / 2.0
+        let step = {}
+        step["a"] = str(best_a)
+        step["b"] = str(best_b)
+        step["height"] = height
+        push(steps, step)
+        // create new cluster id
+        let new_id = next_id
+        next_id = next_id + 1
+        let sa = csizes[str(best_a)]
+        let sb = csizes[str(best_b)]
+        let new_size = sa + sb
+        csizes[str(new_id)] = new_size
+        // compute distances from new cluster to all other active clusters
+        let saf = sa * 1.0
+        let sbf = sb * 1.0
+        let sab = saf + sbf
+        let ti = 0
+        while ti < nactive
+            let other = active_ids[ti]
+            if other != best_a and other != best_b
+                let key_ao = str(best_a) + "," + str(other)
+                let key_bo = str(best_b) + "," + str(other)
+                let dao = dists[key_ao]
+                let dbo = dists[key_bo]
+                let new_d = (saf * dao + sbf * dbo) / sab
+                let key_no = str(new_id) + "," + str(other)
+                let key_on = str(other) + "," + str(new_id)
+                dists[key_no] = new_d
+                dists[key_on] = new_d
+            ti = ti + 1
+        dists[str(new_id) + "," + str(new_id)] = 0.0
+        // remove best_a and best_b from active, add new_id
+        let new_active = []
+        let ti2 = 0
+        while ti2 < nactive
+            let other = active_ids[ti2]
+            if other != best_a and other != best_b
+                push(new_active, other)
+            ti2 = ti2 + 1
+        push(new_active, new_id)
+        active_ids = new_active
+        nactive = len(active_ids)
+    return steps
+
+// newick_leaf: returns the sequence name as a Newick leaf label.
+fn newick_leaf(name) -> string
+    return name
+
+// newick_join: combines two subtrees into a Newick internal node string.
+fn newick_join(left, right, dist) -> string
+    let ds = str(dist)
+    let result = "(" + left + ":" + ds + "," + right + ":" + ds + ")"
+    return result
+
+// tree_to_newick: converts UPGMA merge steps back to a Newick string.
+// names is the original list of sequence labels.
+fn tree_to_newick(steps, names) -> string
+    let labels = {}
+    let ni = 0
+    while ni < len(names)
+        labels[str(ni)] = names[ni]
+        ni = ni + 1
+    let si = 0
+    let nsteps = len(steps)
+    let next_id = len(names)
+    while si < nsteps
+        let step = steps[si]
+        let a_id = step["a"]
+        let b_id = step["b"]
+        let height = step["height"]
+        let left_label = labels[a_id]
+        let right_label = labels[b_id]
+        let combined = newick_join(left_label, right_label, height)
+        labels[str(next_id)] = combined
+        next_id = next_id + 1
+        si = si + 1
+    let last_id = next_id - 1
+    let result = labels[str(last_id)]
+    return result
