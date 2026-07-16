@@ -1,0 +1,200 @@
+// std/crypto/merkle -- Merkle hash tree (RFC-6962 style), using a private 63-bit hash.
+// Provides: leaf/node hashing, tree building, inclusion proofs, proof verification, single-leaf update.
+// Domain separation: leaf=0x00 tag, internal node=0x01 tag (RFC-6962 convention).
+// Odd-width levels: the last node is DUPLICATED (Bitcoin-style) to pair with itself.
+// LEAF -- imports nothing.
+
+// PRIVATE: 63-bit hash function over a byte-list or string (positive, no overflow-to-negative).
+// h = 1125899906842597; for each byte b: h = (h*131 + b) & 0x7FFFFFFFFFFFFFFF.
+fn _h63(data: any) -> int
+    let h = 1125899906842597
+    let i = 0
+    let n = len(data)
+    while i < n
+        let b = 0
+        let c = data[i]
+        if type_of(c) == "string"
+            b = ord(c)
+        else
+            b = c
+        h = (h * 131 + b) & 0x7FFFFFFFFFFFFFFF
+        i = i + 1
+    h
+
+// PRIVATE: convert a 63-bit int to 8 bytes little-endian (shifts 0,8,16,...,56 all in 0..63).
+fn _int_to_bytes(v: int) -> any
+    let out = []
+    let shift = 0
+    while shift < 64
+        let byte = (v >> shift) & 255
+        push(out, byte)
+        shift = shift + 8
+    out
+
+// PRIVATE: convert a string to a byte-list using ord() per character.
+fn _str_to_bytes(s: string) -> any
+    let out = []
+    let i = 0
+    while i < len(s)
+        push(out, ord(char_at(s, i)))
+        i = i + 1
+    out
+
+// PRIVATE: build a byte-list from a tag byte followed by data (data may be string or byte-list).
+fn _tag_bytes(tag: int, data: any) -> any
+    let out = []
+    push(out, tag)
+    let n = len(data)
+    let i = 0
+    while i < n
+        let c = data[i]
+        if type_of(c) == "string"
+            push(out, ord(c))
+        else
+            push(out, c)
+        i = i + 1
+    out
+
+// Leaf hash: _h63 of [0x00] ++ data bytes. Accepts string or byte-list as data.
+fn mt_leaf_hash(data: any) -> int
+    let tagged = _tag_bytes(0, data)
+    _h63(tagged)
+
+// Internal node hash: _h63 of [0x01] ++ left_hash_bytes ++ right_hash_bytes.
+// Each 63-bit hash is serialized as 8 bytes via >>0,8,...,56 (no shift >=64).
+fn mt_node_hash(left: int, right: int) -> int
+    let buf = []
+    push(buf, 1)
+    let lb = _int_to_bytes(left)
+    let i = 0
+    while i < 8
+        push(buf, lb[i])
+        i = i + 1
+    let rb = _int_to_bytes(right)
+    let j = 0
+    while j < 8
+        push(buf, rb[j])
+        j = j + 1
+    _h63(buf)
+
+// Tree depth (number of levels above leaves): ceil(log2(n)) computed by doubling loop.
+// mt_depth(1)==0, mt_depth(2)==1, mt_depth(4)==2, mt_depth(5)==3.
+fn mt_depth(n: int) -> int
+    if n <= 1
+        return 0
+    let d = 0
+    let p = 1
+    while p < n
+        p = p * 2
+        d = d + 1
+    d
+
+// PRIVATE: build one level up from a list of hashes (duplicating last if odd count).
+fn _mt_next_level(level: any) -> any
+    let out = []
+    let n = len(level)
+    let i = 0
+    while i < n
+        let left = level[i]
+        let right = 0
+        if i + 1 < n
+            right = level[i + 1]
+        else
+            right = level[i]
+        push(out, mt_node_hash(left, right))
+        i = i + 2
+    out
+
+// Compute the Merkle root for a list of leaf data items (strings or byte-lists).
+// A single leaf's root is its leaf hash. An empty list returns 0.
+fn mt_root(leaves: any) -> int
+    let n = len(leaves)
+    if n == 0
+        return 0
+    let level = []
+    let i = 0
+    while i < n
+        push(level, mt_leaf_hash(leaves[i]))
+        i = i + 1
+    while len(level) > 1
+        level = _mt_next_level(level)
+    level[0]
+
+// Build the full tree: returns a list of levels, each level a list of hashes.
+// levels[0] = leaf hashes, levels[last] = [root].
+fn mt_build(leaves: any) -> any
+    let n = len(leaves)
+    let levels = []
+    if n == 0
+        return levels
+    let leaf_level = []
+    let i = 0
+    while i < n
+        push(leaf_level, mt_leaf_hash(leaves[i]))
+        i = i + 1
+    push(levels, leaf_level)
+    let cur = leaf_level
+    while len(cur) > 1
+        cur = _mt_next_level(cur)
+        push(levels, cur)
+    levels
+
+// Inclusion proof for leaf at `index` in `leaves`: list of {"hash":siblinghash,"right":bool} dicts,
+// from leaf level up toward root. "right":true means the sibling is on the RIGHT of the current node.
+fn mt_proof(leaves: any, index: int) -> any
+    let levels = mt_build(leaves)
+    let proof = []
+    let idx = index
+    let lv = 0
+    while lv < len(levels) - 1
+        let level = levels[lv]
+        let sibling = 0
+        let is_right = false
+        let m = idx % 2
+        if m == 0
+            // current node is left child; sibling is right
+            if idx + 1 < len(level)
+                sibling = level[idx + 1]
+            else
+                sibling = level[idx]
+            is_right = true
+        else
+            // current node is right child; sibling is left
+            sibling = level[idx - 1]
+            is_right = false
+        let step = {}
+        step["hash"] = sibling
+        step["right"] = is_right
+        push(proof, step)
+        idx = idx / 2
+        lv = lv + 1
+    proof
+
+// Verify an inclusion proof: recompute root from leaf_data + proof and compare to expected root.
+fn mt_verify(leaf_data: any, index: int, proof: any, root: int) -> bool
+    let cur = mt_leaf_hash(leaf_data)
+    let idx = index
+    let i = 0
+    while i < len(proof)
+        let step = proof[i]
+        let sibling = step["hash"]
+        let is_right = step["right"]
+        if is_right
+            cur = mt_node_hash(cur, sibling)
+        else
+            cur = mt_node_hash(sibling, cur)
+        idx = idx / 2
+        i = i + 1
+    cur == root
+
+// Recompute root after replacing leaves[index] with newdata (does not mutate the input list).
+fn mt_update(leaves: any, index: int, newdata: any) -> int
+    let new_leaves = []
+    let i = 0
+    while i < len(leaves)
+        if i == index
+            push(new_leaves, newdata)
+        else
+            push(new_leaves, leaves[i])
+        i = i + 1
+    mt_root(new_leaves)
