@@ -1,43 +1,172 @@
 // ============================================================================
 // NOVA Standard Library — std/numeric/polyfit
 // ============================================================================
-// Least-squares linear fitting and Pearson correlation for float lists.
+// Least-squares polynomial fitting via normal equations + Gaussian elimination.
 //
-// Public API (prefix pf_):
-//   pf_linear(xs, ys)        -> list   [slope, intercept] of best-fit line
-//   pf_correlation(xs, ys)   -> float  Pearson r correlation coefficient
-//   pf_predict(coeffs, x)    -> float  slope*x + intercept
+// Public API:
+//   polyfit(xs, ys, degree) -> list   coefficients LOWEST-order first (len=degree+1)
+//   pf_linear(xs, ys)       -> list   [intercept, slope]  (convenience; degree=1)
+//   pf_correlation(xs, ys)  -> float  Pearson r
+//   pf_predict(coeffs, x)   -> float  evaluate at x (Horner's method)
 //
-// Algorithm (simple linear regression via normal equations):
-//   Given n data points (xs[i], ys[i]):
-//     sx  = sum(xs),   sy  = sum(ys)
-//     sxx = sum(xs[i]^2),  sxy = sum(xs[i]*ys[i])
-//     syy = sum(ys[i]^2)
-//     denom = n*sxx - sx*sx
-//     slope     = (n*sxy - sx*sy) / denom
-//     intercept = (sy - slope*sx) / n
-//   Pearson r = (n*sxy - sx*sy) / sqrt((n*sxx - sx^2) * (n*syy - sy^2))
+// Algorithm:
+//   Build the (degree+1) x (degree+1) normal equations  A^T A c = A^T y,
+//   then solve the square system by Gaussian elimination with partial pivoting.
+//   The resulting coefficients are ordered lowest power first:
+//     p(x) = coeffs[0] + coeffs[1]*x + coeffs[2]*x^2 + ...
 //
-// All private helpers are prefixed _pf_ to avoid namespace collisions.
+// All private helpers prefixed _pf_ to avoid namespace collisions.
 // ============================================================================
 
 // _pf_tof — coerce any numeric value to float
 fn _pf_tof(x) -> float
     return x * 1.0
 
-// _pf_sqrt — Newton-Raphson square root (native sqrt exists as builtin)
-// We use the native sqrt directly via the name sqrt.
-
-// _pf_fabs — float absolute value (native abs() returns int, so we roll our own)
+// _pf_fabs — float absolute value
 fn _pf_fabs(v) -> float
-    let r = v
+    let r = v * 1.0
     if v < 0.0
         r = 0.0 - v
     return r
 
-// _pf_sums — compute sx, sy, sxx, sxy, syy in one pass.
-// Returns a dict with keys "sx","sy","sxx","sxy","syy","n".
-fn _pf_sums(xs, ys) -> dict
+// _pf_pow_int — x raised to non-negative integer power p
+fn _pf_pow_int(x, p) -> float
+    let result = 1.0
+    let i = 0
+    let xf = x * 1.0
+    while i < p
+        result = result * xf
+        i = i + 1
+    return result
+
+// _pf_mat_get / _pf_mat_set — row-major access to a flat list of size (sz x sz)
+fn _pf_mat_get(mat, row, col, sz) -> float
+    let idx = row * sz + col
+    return mat[idx] * 1.0
+
+fn _pf_mat_set(mat, row, col, sz, val)
+    let idx = row * sz + col
+    mat[idx] = val
+
+// _pf_gauss — solve A x = b in place (A is flat row-major list, b is list).
+// Returns solution list of length n, or all-zeros on singular.
+fn _pf_gauss(A, b, n) -> list
+    // Forward elimination with partial pivoting
+    let pivot_row = 0
+    while pivot_row < n
+        // Find max in column pivot_row at or below pivot_row
+        let max_val = _pf_fabs(_pf_mat_get(A, pivot_row, pivot_row, n))
+        let max_row = pivot_row
+        let scan = pivot_row + 1
+        while scan < n
+            let cand = _pf_fabs(_pf_mat_get(A, scan, pivot_row, n))
+            if cand > max_val
+                max_val = cand
+                max_row = scan
+            scan = scan + 1
+        // Swap rows max_row <-> pivot_row in A and b
+        if max_row != pivot_row
+            let col = 0
+            while col < n
+                let tmp_a = _pf_mat_get(A, pivot_row, col, n)
+                _pf_mat_set(A, pivot_row, col, n, _pf_mat_get(A, max_row, col, n))
+                _pf_mat_set(A, max_row, col, n, tmp_a)
+                col = col + 1
+            let tmp_b = b[pivot_row] * 1.0
+            b[pivot_row] = b[max_row] * 1.0
+            b[max_row] = tmp_b
+        // Eliminate column
+        let piv_val = _pf_mat_get(A, pivot_row, pivot_row, n)
+        if _pf_fabs(piv_val) > 0.0000000001
+            let elim = pivot_row + 1
+            while elim < n
+                let factor = _pf_mat_get(A, elim, pivot_row, n) / piv_val
+                let col2 = pivot_row
+                while col2 < n
+                    let new_val = _pf_mat_get(A, elim, col2, n) - factor * _pf_mat_get(A, pivot_row, col2, n)
+                    _pf_mat_set(A, elim, col2, n, new_val)
+                    col2 = col2 + 1
+                b[elim] = b[elim] * 1.0 - factor * b[pivot_row] * 1.0
+                elim = elim + 1
+        pivot_row = pivot_row + 1
+    // Back substitution
+    let x = []
+    let xi = 0
+    while xi < n
+        push(x, 0.0)
+        xi = xi + 1
+    let row = n - 1
+    while row >= 0
+        let rhs = b[row] * 1.0
+        let col3 = row + 1
+        while col3 < n
+            rhs = rhs - _pf_mat_get(A, row, col3, n) * x[col3] * 1.0
+            col3 = col3 + 1
+        let diag = _pf_mat_get(A, row, row, n)
+        if _pf_fabs(diag) > 0.0000000001
+            x[row] = rhs / diag
+        else
+            x[row] = 0.0
+        row = row - 1
+    return x
+
+// polyfit — least-squares polynomial fit of given degree.
+// xs, ys: equal-length float lists of data points.
+// degree: non-negative integer (0 = constant fit, 1 = linear, 2 = quadratic, ...).
+// Returns list of coefficients, lowest power first, length = degree+1.
+fn polyfit(xs, ys, degree) -> list
+    let np = len(xs)
+    let nc = degree + 1
+    // Build normal equations: AtA (nc x nc flat) and Atb (nc)
+    let AtA = []
+    let Atb = []
+    let fill = 0
+    while fill < nc * nc
+        push(AtA, 0.0)
+        fill = fill + 1
+    let fillb = 0
+    while fillb < nc
+        push(Atb, 0.0)
+        fillb = fillb + 1
+    // Accumulate
+    let i = 0
+    while i < np
+        let xi = xs[i] * 1.0
+        let yi = ys[i] * 1.0
+        let row = 0
+        while row < nc
+            let xr = _pf_pow_int(xi, row)
+            let b_old = Atb[row] * 1.0
+            Atb[row] = b_old + xr * yi
+            let col = 0
+            while col < nc
+                let xc = _pf_pow_int(xi, col)
+                let old_val = _pf_mat_get(AtA, row, col, nc)
+                _pf_mat_set(AtA, row, col, nc, old_val + xr * xc)
+                col = col + 1
+            row = row + 1
+        i = i + 1
+    return _pf_gauss(AtA, Atb, nc)
+
+// pf_linear — convenience wrapper for degree-1 polyfit.
+// Returns [intercept, slope] to match OLS convention.
+fn pf_linear(xs, ys) -> list
+    return polyfit(xs, ys, 1)
+
+// pf_predict — Horner evaluation of polynomial at x.
+// coeffs: lowest-power first (same layout as polyfit output).
+fn pf_predict(coeffs, x) -> float
+    let n = len(coeffs)
+    let xf = x * 1.0
+    let result = coeffs[n - 1] * 1.0
+    let i = n - 2
+    while i >= 0
+        result = result * xf + coeffs[i] * 1.0
+        i = i - 1
+    return result
+
+// pf_correlation — Pearson r between xs and ys.
+fn pf_correlation(xs, ys) -> float
     let n = len(xs)
     let sx = 0.0
     let sy = 0.0
@@ -46,79 +175,24 @@ fn _pf_sums(xs, ys) -> dict
     let syy = 0.0
     let i = 0
     while i < n
-        let xi = _pf_tof(xs[i])
-        let yi = _pf_tof(ys[i])
+        let xi = xs[i] * 1.0
+        let yi = ys[i] * 1.0
         sx = sx + xi
         sy = sy + yi
         sxx = sxx + xi * xi
         sxy = sxy + xi * yi
         syy = syy + yi * yi
         i = i + 1
-    let d = {}
-    d["sx"] = sx
-    d["sy"] = sy
-    d["sxx"] = sxx
-    d["sxy"] = sxy
-    d["syy"] = syy
-    d["n"] = n * 1.0
-    return d
-
-// pf_linear — compute [slope, intercept] for the best-fit line through (xs, ys).
-// Uses ordinary least squares (OLS):
-//   denom = n*sxx - sx^2
-//   slope = (n*sxy - sx*sy) / denom
-//   intercept = (sy - slope*sx) / n
-// If denom == 0 (all x-values identical), slope = 0, intercept = mean(ys).
-fn pf_linear(xs, ys) -> list
-    let s = _pf_sums(xs, ys)
-    let n = s["n"] * 1.0
-    let sx = s["sx"] * 1.0
-    let sy = s["sy"] * 1.0
-    let sxx = s["sxx"] * 1.0
-    let sxy = s["sxy"] * 1.0
-    let denom = n * sxx - sx * sx
-    let slope = 0.0
-    let intercept = 0.0
-    if _pf_fabs(denom) < 0.0000000001
-        let intercept = sy / n
-    if _pf_fabs(denom) >= 0.0000000001
-        let slp = (n * sxy - sx * sy) / denom
-        let icp = (sy - slp * sx) / n
-        slope = slp
-        intercept = icp
-    let result = [slope, intercept]
-    return result
-
-// pf_correlation — Pearson r correlation coefficient.
-// r = (n*sxy - sx*sy) / sqrt((n*sxx - sx^2) * (n*syy - sy^2))
-// Returns 0.0 if either variance is zero.
-fn pf_correlation(xs, ys) -> float
-    let s = _pf_sums(xs, ys)
-    let n = s["n"] * 1.0
-    let sx = s["sx"] * 1.0
-    let sy = s["sy"] * 1.0
-    let sxx = s["sxx"] * 1.0
-    let sxy = s["sxy"] * 1.0
-    let syy = s["syy"] * 1.0
-    let num = n * sxy - sx * sy
-    let varx = n * sxx - sx * sx
-    let vary = n * syy - sy * sy
+    let nf = n * 1.0
+    let num = nf * sxy - sx * sy
+    let varx = nf * sxx - sx * sx
+    let vary = nf * syy - sy * sy
     let prod = varx * vary
     if prod < 0.0000000001
         return 0.0
     let denom = sqrt(prod)
     let r = num / denom
     return r
-
-// pf_predict — evaluate the linear model at a single point x.
-// coeffs is [slope, intercept] (output of pf_linear).
-// Returns slope * x + intercept.
-fn pf_predict(coeffs, x) -> float
-    let slope = _pf_tof(coeffs[0])
-    let intercept = _pf_tof(coeffs[1])
-    let xf = _pf_tof(x)
-    let y = slope * xf + intercept
-    return y
 
 fn main()
     print("polyfit module OK")
