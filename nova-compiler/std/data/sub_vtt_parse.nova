@@ -1,0 +1,226 @@
+// ============================================================================
+// NOVA Standard Library — std/data/sub_vtt_parse
+// ============================================================================
+// WebVTT subtitle parser.
+//
+// PUBLIC API:
+//   vtt_parse(text) -> list
+//     Parse a WebVTT document into a list of cue dicts.
+//     Each cue: {"index":int,"start":ms_int,"end":ms_int,"text":string}
+//     Skips the "WEBVTT" header line and any NOTE blocks.
+//     Normalises CRLF to LF before processing.
+//     Blank lines separate cue blocks.
+//
+//   vtt_has_header(text) -> bool (1/0)
+//     Returns 1 if the text begins with "WEBVTT", 0 otherwise.
+//
+// TIMECODE FORMAT: "HH:MM:SS.mmm"  (dot separator)
+//   ms = h*3600000 + m*60000 + s*1000 + mmm
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing.
+//   - Inline timecode helper (_vtt_tc_to_ms).
+//   - Single-exit style to avoid NOVA return-null mistag.
+//   - No module-level constants (would truncate).
+//   - No multi-line list/dict literals.
+//   - Uses 'and'/'or'/'not' (not &&/||/!).
+// ============================================================================
+
+// ── Private: CRLF normalisation ──────────────────────────────────────────────
+
+fn _vtt_strip_cr(line) -> string
+    let n = len(line)
+    let result = line
+    if n > 0
+        if ord(line[n - 1]) == 13
+            result = slice(line, 0, n - 1)
+    result
+
+// ── Private: timecode "HH:MM:SS.mmm" -> milliseconds ────────────────────────
+// Splits on ':' and '.' to extract h, m, s, ms.
+
+fn _vtt_tc_to_ms(tc) -> int
+    // tc = "HH:MM:SS.mmm"
+    // Find first ':' -> hours
+    let i = 0
+    let n = len(tc)
+    let h = 0
+    let m = 0
+    let s = 0
+    let ms = 0
+    // parse hours (up to first ':')
+    let colon1 = 0
+    let k = 0
+    while k < n
+        if ord(tc[k]) == 58
+            colon1 = k
+            k = n
+        k = k + 1
+    let hstr = slice(tc, 0, colon1)
+    h = int(hstr)
+    // parse minutes (from colon1+1 to next ':')
+    let colon2 = 0
+    k = colon1 + 1
+    while k < n
+        if ord(tc[k]) == 58
+            colon2 = k
+            k = n
+        k = k + 1
+    let mstr = slice(tc, colon1 + 1, colon2)
+    m = int(mstr)
+    // parse seconds (from colon2+1 to '.')
+    let dot1 = 0
+    k = colon2 + 1
+    while k < n
+        if ord(tc[k]) == 46
+            dot1 = k
+            k = n
+        k = k + 1
+    let sstr = slice(tc, colon2 + 1, dot1)
+    s = int(sstr)
+    // parse milliseconds (after '.')
+    let msstr = slice(tc, dot1 + 1, n)
+    ms = int(msstr)
+    h * 3600000 + m * 60000 + s * 1000 + ms
+
+// ── Private: check if a line is a timecode arrow line "... --> ..." ──────────
+
+fn _vtt_is_timing(line) -> int
+    // Look for " --> " in the line
+    let n = len(line)
+    let found = 0
+    let i = 0
+    while i < n - 4
+        if slice(line, i, i + 5) == " --> "
+            found = 1
+            i = n
+        i = i + 1
+    found
+
+// ── Private: parse one timing line into start/end ms via a 2-element list ───
+// Returns [start_ms, end_ms].
+
+fn _vtt_parse_timing(line) -> list
+    // Find " --> "
+    let n = len(line)
+    let arrow = 0
+    let i = 0
+    while i < n - 4
+        if slice(line, i, i + 5) == " --> "
+            arrow = i
+            i = n
+        i = i + 1
+    let start_tc = slice(line, 0, arrow)
+    // end timecode starts after " --> " (5 chars); may have trailing style info
+    // take only up to first space after end timecode (or end of string)
+    let end_start = arrow + 5
+    let end_end = n
+    let j = end_start
+    while j < n
+        if ord(line[j]) == 32
+            end_end = j
+            j = n
+        j = j + 1
+    let end_tc = slice(line, end_start, end_end)
+    let sms = _vtt_tc_to_ms(start_tc)
+    let ems = _vtt_tc_to_ms(end_tc)
+    let r = [sms, ems]
+    r
+
+// ── Public: vtt_has_header ────────────────────────────────────────────────────
+
+fn vtt_has_header(text) -> int
+    let result = 0
+    if len(text) >= 6
+        if slice(text, 0, 6) == "WEBVTT"
+            result = 1
+    result
+
+// ── Public: vtt_parse ────────────────────────────────────────────────────────
+
+fn vtt_parse(text) -> list
+    let cues = []
+    let nl = chr(10)
+    // Normalise CRLF: remove all chr(13)
+    let clean = ""
+    let tlen = len(text)
+    let ci = 0
+    while ci < tlen
+        let ch = text[ci]
+        if ord(ch) != 13
+            clean = clean + ch
+        ci = ci + 1
+    // Split into lines
+    let lines = split(clean, nl)
+    let nlines = len(lines)
+    let idx = 0
+    // Skip header line(s) until first blank line
+    while idx < nlines
+        let l = lines[idx]
+        if len(l) == 0
+            idx = idx + 1
+            // break
+            idx = nlines + 1
+        idx = idx + 1
+    // idx now points to first line after the blank that follows the header
+    // Correct: after the while we've incremented once extra; walk cue blocks
+    // Reset to use a proper state machine
+    let cue_idx = 0
+    let state = 0
+    // state 0: looking for timing line (or "NOTE" to skip)
+    // state 1: collecting text lines for current cue
+    let cur_start = 0
+    let cur_end = 0
+    let cur_text = ""
+    let in_note = 0
+    let li = 0
+    // Find blank line after header first
+    let header_done = 0
+    while li < nlines
+        let line = lines[li]
+        if header_done == 0
+            if len(line) == 0
+                header_done = 1
+        else
+            if in_note == 1
+                if len(line) == 0
+                    in_note = 0
+            else
+                if state == 0
+                    if len(line) >= 4
+                        if slice(line, 0, 4) == "NOTE"
+                            in_note = 1
+                    if _vtt_is_timing(line) == 1
+                        let times = _vtt_parse_timing(line)
+                        cur_start = times[0]
+                        cur_end = times[1]
+                        cur_text = ""
+                        state = 1
+                else
+                    // state == 1: collecting text
+                    if len(line) == 0
+                        // blank line ends cue
+                        cue_idx = cue_idx + 1
+                        let cue = {}
+                        cue["index"] = cue_idx
+                        cue["start"] = cur_start
+                        cue["end"] = cur_end
+                        cue["text"] = cur_text
+                        cues.push(cue)
+                        state = 0
+                    else
+                        if len(cur_text) == 0
+                            cur_text = line
+                        else
+                            cur_text = cur_text + nl + line
+        li = li + 1
+    // Flush last cue if file doesn't end with blank line
+    if state == 1
+        cue_idx = cue_idx + 1
+        let last_cue = {}
+        last_cue["index"] = cue_idx
+        last_cue["start"] = cur_start
+        last_cue["end"] = cur_end
+        last_cue["text"] = cur_text
+        cues.push(last_cue)
+    cues

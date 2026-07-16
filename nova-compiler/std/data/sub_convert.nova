@@ -1,0 +1,354 @@
+// ============================================================================
+// NOVA Standard Library — std/data/sub_convert
+// ============================================================================
+// Subtitle format conversion: SRT <-> VTT, plus format detection.
+//
+// PUBLIC API:
+//   detect_format(text) -> string
+//     Returns "vtt" if text starts with "WEBVTT", "srt" if the first
+//     non-blank line looks like a cue number followed by a timecode,
+//     "unknown" otherwise.
+//
+//   srt_to_vtt(srt) -> string
+//     Convert an SRT document to a WebVTT document string.
+//     SRT timecode "HH:MM:SS,mmm" -> VTT "HH:MM:SS.mmm".
+//
+//   vtt_to_srt(vtt) -> string
+//     Convert a WebVTT document to an SRT document string.
+//     VTT timecode "HH:MM:SS.mmm" -> SRT "HH:MM:SS,mmm".
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing; INLINE all parsers and builders.
+//   - SRT cue shape: {"index":int,"start":ms,"end":ms,"text":string}
+//   - VTT cue shape: same
+//   - Timecode difference: SRT uses comma, VTT uses dot.
+//   - CRLF normalised on input.
+//   - No module-level constants.
+//   - No multi-line list/dict literals.
+// ============================================================================
+
+// ── Private: zero-pad helpers ────────────────────────────────────────────────
+
+fn _sc_pad2(n) -> string
+    let s = str(n)
+    let result = s
+    if len(s) < 2
+        result = "0" + s
+    result
+
+fn _sc_pad3(n) -> string
+    let s = str(n)
+    let result = s
+    if len(s) == 1
+        result = "00" + s
+    if len(s) == 2
+        result = "0" + s
+    result
+
+// ── Private: ms -> timecode with configurable separator ──────────────────────
+// sep: "." for VTT, "," for SRT
+
+fn _sc_ms_to_tc(ms: int, sep: string) -> string
+    let h = ms / 3600000
+    let rem1 = ms - h * 3600000
+    let m = rem1 / 60000
+    let rem2 = rem1 - m * 60000
+    let s = rem2 / 1000
+    let mspart = rem2 - s * 1000
+    _sc_pad2(h) + ":" + _sc_pad2(m) + ":" + _sc_pad2(s) + sep + _sc_pad3(mspart)
+
+// ── Private: timecode -> ms; sep is "." or "," ───────────────────────────────
+
+fn _sc_tc_to_ms(tc: string) -> int
+    // Works for both "HH:MM:SS.mmm" and "HH:MM:SS,mmm"
+    let n = len(tc)
+    // Find first ':'
+    let colon1 = 0
+    let k = 0
+    while k < n
+        if ord(tc[k]) == 58
+            colon1 = k
+            k = n
+        k = k + 1
+    // Find second ':'
+    let colon2 = 0
+    k = colon1 + 1
+    while k < n
+        if ord(tc[k]) == 58
+            colon2 = k
+            k = n
+        k = k + 1
+    // Find separator ('.' == 46 or ',' == 44)
+    let dot1 = 0
+    k = colon2 + 1
+    while k < n
+        let c = ord(tc[k])
+        if c == 46 or c == 44
+            dot1 = k
+            k = n
+        k = k + 1
+    let h = int(slice(tc, 0, colon1))
+    let m = int(slice(tc, colon1 + 1, colon2))
+    let s = int(slice(tc, colon2 + 1, dot1))
+    let ms = int(slice(tc, dot1 + 1, n))
+    h * 3600000 + m * 60000 + s * 1000 + ms
+
+// ── Private: check if line contains " --> " ──────────────────────────────────
+
+fn _sc_is_timing(line: string) -> int
+    let n = len(line)
+    let found = 0
+    let i = 0
+    while i <= n - 5
+        if slice(line, i, i + 5) == " --> "
+            found = 1
+            i = n
+        i = i + 1
+    found
+
+// ── Private: parse timing line -> [start_ms, end_ms] ─────────────────────────
+
+fn _sc_parse_timing(line: string) -> list
+    let n = len(line)
+    let arrow = 0
+    let i = 0
+    while i <= n - 5
+        if slice(line, i, i + 5) == " --> "
+            arrow = i
+            i = n
+        i = i + 1
+    let start_tc = slice(line, 0, arrow)
+    let end_start = arrow + 5
+    // VTT may have style info after end timecode; stop at first space
+    let end_end = n
+    let j = end_start
+    while j < n
+        if ord(line[j]) == 32
+            end_end = j
+            j = n
+        j = j + 1
+    let end_tc = slice(line, end_start, end_end)
+    let sms = _sc_tc_to_ms(start_tc)
+    let ems = _sc_tc_to_ms(end_tc)
+    let r = [sms, ems]
+    r
+
+// ── Private: inline SRT parser ───────────────────────────────────────────────
+// SRT format: blank-line-separated blocks.
+// Each block: optional cue number line, timing line, text lines.
+
+fn _sc_parse_srt(text: string) -> list
+    let cues = []
+    let nl = chr(10)
+    // Normalise CRLF
+    let clean = ""
+    let tlen = len(text)
+    let ci = 0
+    while ci < tlen
+        let ch = text[ci]
+        if ord(ch) != 13
+            clean = clean + ch
+        ci = ci + 1
+    let lines = split(clean, nl)
+    let nlines = len(lines)
+    let state = 0
+    // 0=awaiting timing or cue-num, 1=collecting text
+    let cur_start = 0
+    let cur_end = 0
+    let cur_text = ""
+    let cue_idx = 0
+    let li = 0
+    while li < nlines
+        let line = lines[li]
+        if state == 0
+            if len(line) > 0
+                if _sc_is_timing(line) == 1
+                    let times = _sc_parse_timing(line)
+                    cur_start = times[0]
+                    cur_end = times[1]
+                    cur_text = ""
+                    state = 1
+                // else: cue number line or garbage — skip
+        else
+            if len(line) == 0
+                cue_idx = cue_idx + 1
+                let cue = {}
+                cue["index"] = cue_idx
+                cue["start"] = cur_start
+                cue["end"] = cur_end
+                cue["text"] = cur_text
+                cues.push(cue)
+                state = 0
+            else
+                if len(cur_text) == 0
+                    cur_text = line
+                else
+                    cur_text = cur_text + nl + line
+        li = li + 1
+    // Flush last cue
+    if state == 1
+        cue_idx = cue_idx + 1
+        let last_cue = {}
+        last_cue["index"] = cue_idx
+        last_cue["start"] = cur_start
+        last_cue["end"] = cur_end
+        last_cue["text"] = cur_text
+        cues.push(last_cue)
+    cues
+
+// ── Private: inline VTT parser ───────────────────────────────────────────────
+
+fn _sc_parse_vtt(text: string) -> list
+    let cues = []
+    let nl = chr(10)
+    // Normalise CRLF
+    let clean = ""
+    let tlen = len(text)
+    let ci = 0
+    while ci < tlen
+        let ch = text[ci]
+        if ord(ch) != 13
+            clean = clean + ch
+        ci = ci + 1
+    let lines = split(clean, nl)
+    let nlines = len(lines)
+    let state = 0
+    let cur_start = 0
+    let cur_end = 0
+    let cur_text = ""
+    let cue_idx = 0
+    let in_note = 0
+    let header_done = 0
+    let li = 0
+    while li < nlines
+        let line = lines[li]
+        if header_done == 0
+            if len(line) == 0
+                header_done = 1
+        else
+            if in_note == 1
+                if len(line) == 0
+                    in_note = 0
+            else
+                if state == 0
+                    if len(line) >= 4
+                        if slice(line, 0, 4) == "NOTE"
+                            in_note = 1
+                    if _sc_is_timing(line) == 1
+                        let times = _sc_parse_timing(line)
+                        cur_start = times[0]
+                        cur_end = times[1]
+                        cur_text = ""
+                        state = 1
+                else
+                    if len(line) == 0
+                        cue_idx = cue_idx + 1
+                        let cue = {}
+                        cue["index"] = cue_idx
+                        cue["start"] = cur_start
+                        cue["end"] = cur_end
+                        cue["text"] = cur_text
+                        cues.push(cue)
+                        state = 0
+                    else
+                        if len(cur_text) == 0
+                            cur_text = line
+                        else
+                            cur_text = cur_text + nl + line
+        li = li + 1
+    if state == 1
+        cue_idx = cue_idx + 1
+        let last_cue = {}
+        last_cue["index"] = cue_idx
+        last_cue["start"] = cur_start
+        last_cue["end"] = cur_end
+        last_cue["text"] = cur_text
+        cues.push(last_cue)
+    cues
+
+// ── Private: SRT builder from cue list ───────────────────────────────────────
+
+fn _sc_build_srt(cues: list) -> string
+    let nl = chr(10)
+    let result = ""
+    let n = len(cues)
+    let i = 0
+    while i < n
+        let cue = cues[i]
+        let idx = cue["index"]
+        let start_ms = cue["start"]
+        let end_ms = cue["end"]
+        let txt = cue["text"]
+        let timing = _sc_ms_to_tc(start_ms, ",") + " --> " + _sc_ms_to_tc(end_ms, ",")
+        let block = str(idx) + nl + timing + nl + txt + nl
+        if i == 0
+            result = block
+        else
+            result = result + nl + block
+        i = i + 1
+    result
+
+// ── Private: VTT builder from cue list ───────────────────────────────────────
+
+fn _sc_build_vtt(cues: list) -> string
+    let nl = chr(10)
+    let result = "WEBVTT" + nl + nl
+    let n = len(cues)
+    let i = 0
+    while i < n
+        let cue = cues[i]
+        let idx = cue["index"]
+        let start_ms = cue["start"]
+        let end_ms = cue["end"]
+        let txt = cue["text"]
+        let timing = _sc_ms_to_tc(start_ms, ".") + " --> " + _sc_ms_to_tc(end_ms, ".")
+        let block = str(idx) + nl + timing + nl + txt + nl
+        result = result + block
+        if i < n - 1
+            result = result + nl
+        i = i + 1
+    result
+
+// ── Public: detect_format ────────────────────────────────────────────────────
+
+fn detect_format(text: string) -> string
+    let result = "unknown"
+    // Check for VTT: starts with "WEBVTT"
+    if len(text) >= 6
+        if slice(text, 0, 6) == "WEBVTT"
+            result = "vtt"
+    if result == "unknown"
+        // Check for SRT: find first non-blank line, look for a timing arrow
+        // on one of the first 3 lines
+        let nl = chr(10)
+        let lines = split(text, nl)
+        let nlines = len(lines)
+        let checked = 0
+        let li = 0
+        while li < nlines and checked < 5
+            let line = lines[li]
+            // Strip CR
+            let llen = len(line)
+            let stripped = line
+            if llen > 0
+                if ord(line[llen - 1]) == 13
+                    stripped = slice(line, 0, llen - 1)
+            if len(stripped) > 0
+                if _sc_is_timing(stripped) == 1
+                    result = "srt"
+                    li = nlines
+                checked = checked + 1
+            li = li + 1
+    result
+
+// ── Public: srt_to_vtt ───────────────────────────────────────────────────────
+
+fn srt_to_vtt(srt: string) -> string
+    let cues = _sc_parse_srt(srt)
+    _sc_build_vtt(cues)
+
+// ── Public: vtt_to_srt ───────────────────────────────────────────────────────
+
+fn vtt_to_srt(vtt: string) -> string
+    let cues = _sc_parse_vtt(vtt)
+    _sc_build_srt(cues)
