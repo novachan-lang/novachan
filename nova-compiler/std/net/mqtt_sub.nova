@@ -1,0 +1,237 @@
+// ============================================================================
+// NOVA Standard Library — std/net/mqtt_sub
+// ============================================================================
+// MQTT 3.1.1 SUBSCRIBE / UNSUBSCRIBE packet codec (OASIS MQTT v3.1.1).
+//
+// Wire representation: byte-list = a LIST of ints 0..255.
+//
+// SUBSCRIBE (packet type 0x82):
+//   Fixed header:  0x82, remaining-length varint
+//   Variable header: u16 packet-id
+//   Payload: one or more (u16-len topic-filter) + qos-byte
+//
+// UNSUBSCRIBE (packet type 0xA2):
+//   Fixed header:  0xA2, remaining-length varint
+//   Variable header: u16 packet-id
+//   Payload: one or more u16-len topic-filter (NO qos byte)
+//
+// SUBACK (packet type 0x90) — decode only:
+//   Fixed header:  0x90, remaining-length varint
+//   Variable header: u16 packet-id
+//   Payload: one return-code byte per filter (0x00, 0x01, 0x02 = granted max QoS; 0x80 = failure)
+//
+// PUBLIC API:
+//   mqtt_subscribe(packet_id: int, filters: list) -> list
+//     filters = list of [topic_filter_string, qos_int] pairs
+//     Returns the complete SUBSCRIBE packet as a byte-list.
+//
+//   mqtt_subscribe_decode(pkt: list) -> dict
+//     Decode a SUBSCRIBE packet byte-list into:
+//       "packet_id" : int
+//       "filters"   : list of [topic_string, qos_int] pairs
+//     Returns {} on malformed input.
+//
+//   mqtt_unsubscribe(packet_id: int, topics: list) -> list
+//     topics = list of topic-filter strings
+//     Returns the complete UNSUBSCRIBE packet as a byte-list.
+//
+// PRIVATE helpers prefixed _mqs_.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Varint encoder (MQTT remaining-length, little-endian base-128) ────────────
+
+// Encode a varint (up to 4 bytes) and append to out list.
+fn _mqs_enc_varint(out, v)
+    let done = 0
+    while done == 0
+        let enc_byte = v & 0x7F
+        v = v >> 7
+        if v > 0
+            enc_byte = enc_byte | 0x80
+        push(out, enc_byte)
+        if v == 0
+            done = 1
+    out
+
+// ── u16 big-endian helpers ────────────────────────────────────────────────────
+
+fn _mqs_push_u16(out, v)
+    push(out, (v >> 8) & 0xFF)
+    push(out, v & 0xFF)
+    out
+
+// ── UTF-8 string encoder (u16 length prefix + bytes) ─────────────────────────
+
+fn _mqs_push_str(out, s)
+    let n = len(s)
+    out = _mqs_push_u16(out, n)
+    let i = 0
+    while i < n
+        push(out, ord(slice(s, i, i + 1)))
+        i = i + 1
+    out
+
+// ── Varint decoder: returns [value, next_pos] ─────────────────────────────────
+
+fn _mqs_dec_varint(pkt, pos)
+    let value = 0
+    let shift = 0
+    let more = 1
+    while more == 1 and pos < len(pkt)
+        let b = pkt[pos]
+        pos = pos + 1
+        value = value | ((b & 0x7F) << shift)
+        shift = shift + 7
+        if (b & 0x80) == 0
+            more = 0
+    let result = []
+    push(result, value)
+    push(result, pos)
+    result
+
+// ── Read big-endian u16 from pkt at pos ──────────────────────────────────────
+
+fn _mqs_r16(pkt, pos)
+    ((pkt[pos] << 8) | pkt[pos + 1]) & 0xFFFF
+
+// ── Read length-prefixed UTF-8 string from pkt at pos ────────────────────────
+// Returns [string, next_pos]
+
+fn _mqs_read_str(pkt, pos)
+    let pkt_len = len(pkt)
+    if pos + 1 >= pkt_len
+        let fail = []
+        push(fail, "")
+        push(fail, pos)
+        return fail
+    let slen = _mqs_r16(pkt, pos)
+    pos = pos + 2
+    let s = ""
+    let i = 0
+    while i < slen and pos < pkt_len
+        s = s + chr(pkt[pos])
+        pos = pos + 1
+        i = i + 1
+    let result = []
+    push(result, s)
+    push(result, pos)
+    result
+
+// ============================================================================
+// PUBLIC: mqtt_subscribe
+// ============================================================================
+
+fn mqtt_subscribe(packet_id, filters)
+    // Build payload first to know remaining-length
+    let payload = []
+
+    // Variable header: u16 packet-id
+    payload = _mqs_push_u16(payload, packet_id)
+
+    // Payload: each filter = u16-len topic + qos byte
+    let fi = 0
+    let flen = len(filters)
+    while fi < flen
+        let entry = filters[fi]
+        let topic = entry[0]
+        let qos = entry[1]
+        payload = _mqs_push_str(payload, topic)
+        push(payload, qos & 0x03)
+        fi = fi + 1
+
+    // Fixed header: 0x82 + varint remaining length
+    let rem_len = len(payload)
+    let out = []
+    push(out, 0x82)
+    out = _mqs_enc_varint(out, rem_len)
+
+    // Append payload
+    let pi = 0
+    while pi < rem_len
+        push(out, payload[pi])
+        pi = pi + 1
+    out
+
+// ============================================================================
+// PUBLIC: mqtt_subscribe_decode
+// ============================================================================
+
+fn mqtt_subscribe_decode(pkt)
+    let result = {}
+    let pkt_len = len(pkt)
+    if pkt_len < 4
+        return result
+
+    // Check fixed header byte
+    let fh = pkt[0]
+    if fh != 0x82
+        return result
+
+    // Decode remaining length varint
+    let vr = _mqs_dec_varint(pkt, 1)
+    let rem_len = vr[0]
+    let pos = vr[1]
+
+    if pos + rem_len > pkt_len
+        return result
+
+    // Variable header: packet-id u16
+    if pos + 1 >= pkt_len
+        return result
+    let pid = _mqs_r16(pkt, pos)
+    pos = pos + 2
+
+    result["packet_id"] = pid
+
+    // Payload: filters
+    let filter_list = []
+    let end_pos = pos + rem_len - 2
+    while pos < end_pos
+        let sr = _mqs_read_str(pkt, pos)
+        let topic = sr[0]
+        pos = sr[1]
+        if pos >= pkt_len
+            // truncated
+            let bad = {}
+            return bad
+        let qos = pkt[pos] & 0x03
+        pos = pos + 1
+        let pair = []
+        push(pair, topic)
+        push(pair, qos)
+        push(filter_list, pair)
+    result["filters"] = filter_list
+    result
+
+// ============================================================================
+// PUBLIC: mqtt_unsubscribe
+// ============================================================================
+
+fn mqtt_unsubscribe(packet_id, topics)
+    // Build payload
+    let payload = []
+
+    // Variable header: u16 packet-id
+    payload = _mqs_push_u16(payload, packet_id)
+
+    // Payload: each topic = u16-len string only (no qos byte)
+    let ti = 0
+    let tlen = len(topics)
+    while ti < tlen
+        let topic = topics[ti]
+        payload = _mqs_push_str(payload, topic)
+        ti = ti + 1
+
+    // Fixed header: 0xA2 + varint remaining length
+    let rem_len = len(payload)
+    let out = []
+    push(out, 0xA2)
+    out = _mqs_enc_varint(out, rem_len)
+
+    // Append payload
+    let pi = 0
+    while pi < rem_len
+        push(out, payload[pi])
+        pi = pi + 1
+    out

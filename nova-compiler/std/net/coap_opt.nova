@@ -1,0 +1,184 @@
+// ============================================================================
+// NOVA Standard Library — std/net/coap_opt
+// ============================================================================
+// RFC 7252 §3.1 — CoAP option delta+length encoding/decoding.
+//
+// CoAP options use a compact Type-Length-Value encoding where each option
+// header byte encodes a delta (relative option number) and value length.
+// Extended bytes handle delta or length values >= 13.
+//
+// Option header byte:  (delta_nibble << 4) | len_nibble
+//   delta_nibble / len_nibble encoding:
+//     0..12:  value is the nibble itself
+//     13:     value = next_byte + 13        (one extra byte follows)
+//     14:     value = (next_u16_BE) + 269   (two extra bytes follow)
+//     15:     payload marker (0xFF), not an option
+//
+// PUBLIC API:
+//   coap_opt_encode(options) -> list of int (byte-list)
+//     options: list of [number, value_bytes] pairs, sorted by number.
+//     value_bytes is a list of ints 0..255.
+//     Encodes all options with delta encoding relative to the previous
+//     option number (starting from 0).
+//     Returns the byte-list of all encoded options concatenated.
+//
+//   coap_opt_decode(bl, pos, start_num) -> [list_of_[number, value_bytes], next_pos]
+//     bl:        byte-list to decode from
+//     pos:       starting byte offset in bl
+//     start_num: option number to start delta decoding from (usually 0)
+//     Returns a 2-element list:
+//       [0] = list of [number, value_bytes] (each value_bytes = list of ints)
+//       [1] = next position after all decoded options
+//     Stops at end-of-buffer or payload marker (0xFF).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Encode a delta or length nibble into the byte stream.
+// If val < 13: nibble = val, no extra bytes.
+// If val < 269 (13..268): nibble = 13, extra byte = val-13.
+// If val >= 269: nibble = 14, extra u16-BE = val-269.
+// Appends the extra bytes to extra_out list and returns the nibble.
+fn _co_enc_nibble(val, extra_out)
+    if val < 13
+        return val
+    if val < 269
+        push(extra_out, (val - 13) & 0xFF)
+        return 13
+    let ev = val - 269
+    push(extra_out, (ev >> 8) & 0xFF)
+    push(extra_out, ev & 0xFF)
+    14
+
+// Decode a nibble from a byte-list.
+// nibble: the 4-bit value from the option byte (0..15)
+// bl: the byte-list
+// pos: current read position (after the option byte)
+// base: for delta nibbles: the accumulated option number (not used here directly)
+// Returns [decoded_value, new_pos].
+fn _co_dec_nibble(nibble, bl, pos)
+    if nibble < 13
+        return [nibble, pos]
+    if nibble == 13
+        if pos < len(bl)
+            let v = bl[pos] + 13
+            return [v, pos + 1]
+        return [0, pos]
+    // nibble == 14: two extra bytes
+    if pos + 1 < len(bl)
+        let hi = bl[pos]
+        let lo = bl[pos + 1]
+        let v = ((hi << 8) | lo) + 269
+        return [v, pos + 2]
+    [0, pos]
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// coap_opt_encode: encode a sorted list of [number, value_bytes] pairs.
+//
+// options is a list of 2-element lists: [[num0, bytes0], [num1, bytes1], ...]
+// Options MUST be sorted by number (ascending) — caller responsibility.
+// Encodes delta from the previous option number, starting at 0.
+//
+// Extended encoding:
+//   delta < 13: single nibble
+//   13 <= delta < 269: nibble=13, one extra byte (delta-13)
+//   delta >= 269: nibble=14, two extra bytes (delta-269 big-endian)
+//   Same for length.
+//
+// Example:
+//   coap_opt_encode([[11, [ord("a"),ord("b"),ord("c")]]])
+//   delta=11 (from 0), len=3:
+//   header byte = (11<<4)|3 = 0xB3
+//   => [0xB3, 97, 98, 99]
+fn coap_opt_encode(options)
+    let out = []
+    let prev_num = 0
+    let i = 0
+    let n = len(options)
+    while i < n
+        let opt = options[i]
+        let num = opt[0]
+        let val = opt[1]
+        let vlen = len(val)
+        let delta = num - prev_num
+        // Build extended bytes for delta and length separately
+        let dext = []
+        let lext = []
+        let dn = _co_enc_nibble(delta, dext)
+        let ln = _co_enc_nibble(vlen, lext)
+        let hdr = ((dn & 0xF) << 4) | (ln & 0xF)
+        push(out, hdr)
+        // Append delta extension bytes
+        let di = 0
+        while di < len(dext)
+            push(out, dext[di])
+            di = di + 1
+        // Append length extension bytes
+        let li = 0
+        while li < len(lext)
+            push(out, lext[li])
+            li = li + 1
+        // Append value bytes
+        let vi = 0
+        while vi < vlen
+            push(out, val[vi] & 0xFF)
+            vi = vi + 1
+        prev_num = num
+        i = i + 1
+    out
+
+// coap_opt_decode: decode options from byte-list starting at pos.
+//
+// Parameters:
+//   bl:        byte-list
+//   pos:       starting offset
+//   start_num: accumulated option number offset (usually 0)
+//
+// Returns [options_list, next_pos] where options_list is a list of
+// [number, value_bytes] pairs, and next_pos is the position after
+// all decoded options (at payload marker or end of buffer).
+//
+// Stops at:
+//   - End of buffer (pos >= len(bl))
+//   - Payload marker byte 0xFF
+//
+// Example:
+//   coap_opt_decode([0xB3, 97, 98, 99], 0, 0)
+//   => [[[11, [97, 98, 99]]], 4]
+fn coap_opt_decode(bl, pos, start_num)
+    let opts = []
+    let cur_num = start_num
+    let blen = len(bl)
+    let running = 1
+    while running == 1
+        if pos >= blen
+            running = 0
+        if running == 1
+            let hdr = bl[pos]
+            if hdr == 0xFF
+                running = 0
+            if running == 1
+                pos = pos + 1
+                let dn = (hdr >> 4) & 0xF
+                let ln = hdr & 0xF
+                let dr = _co_dec_nibble(dn, bl, pos)
+                let delta = dr[0]
+                pos = dr[1]
+                let lr = _co_dec_nibble(ln, bl, pos)
+                let vlen = lr[0]
+                pos = lr[1]
+                cur_num = cur_num + delta
+                // Read value bytes
+                let vbytes = []
+                let vi = 0
+                while vi < vlen
+                    if pos < blen
+                        push(vbytes, bl[pos] & 0xFF)
+                        pos = pos + 1
+                    vi = vi + 1
+                let opt_entry = [cur_num, vbytes]
+                push(opts, opt_entry)
+    [opts, pos]

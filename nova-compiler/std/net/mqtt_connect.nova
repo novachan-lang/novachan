@@ -1,0 +1,175 @@
+// ============================================================================
+// NOVA Standard Library — std/net/mqtt_connect
+// ============================================================================
+// MQTT 3.1.1 — CONNECT packet codec (byte-list wire format).
+//
+// CONNECT packet structure:
+//   Fixed header:    byte0 = 0x10 (type=1, flags=0), remlen varint
+//   Variable header: [0x00, 0x04, 'M','Q','T','T']  — protocol name (u16-len + "MQTT")
+//                    [0x04]                           — protocol level (4 = MQTT 3.1.1)
+//                    [connect_flags]                  — bit1=clean_session
+//                    [keepalive_hi, keepalive_lo]     — keepalive u16 big-endian
+//   Payload:         [len_hi, len_lo, ...client_id_bytes...]
+//
+// connect_flags byte: bit7=username, bit6=password, bit5=will_retain,
+//                     bits4-3=will_qos, bit2=will_flag, bit1=clean_session,
+//                     bit0=reserved(0).
+// This module encodes only clean_session (bit 1 = 0x02).
+//
+// PUBLIC API:
+//   mqtt_connect(client_id: string, keepalive: int, clean_session: int) -> list
+//     Build a complete CONNECT packet as a byte-list.
+//     clean_session: 1=true (sets bit1 in connect flags), 0=false.
+//     Returns full MQTT CONNECT packet including fixed header.
+//
+//   mqtt_connect_decode(packet: list) -> dict
+//     Decode a CONNECT packet byte-list (starting from byte 0 = fixed header).
+//     Returns dict with keys:
+//       "client_id"  : string — client identifier
+//       "keepalive"  : int    — keepalive seconds
+//       "clean"      : int    — 1 if clean_session bit set, 0 otherwise
+//     Returns {} on malformed input (too short, wrong protocol name, etc.).
+//
+// LEAF — imports NOTHING; uses mqtt_fixed functions copied inline for self-containment.
+// DEPENDS ON std/net/mqtt_fixed for remlen encoding.
+// ============================================================================
+
+import std/net/mqtt_fixed
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Append a big-endian u16 to list out (mutates out).
+fn _mc_push_u16(out: list, v: int)
+    push(out, (v >> 8) & 0xFF)
+    push(out, v & 0xFF)
+
+// Append string s as u16-length-prefixed bytes to list out (mutates out).
+fn _mc_push_str(out: list, s: string)
+    let slen = len(s)
+    _mc_push_u16(out, slen)
+    let i = 0
+    while i < slen
+        push(out, ord(slice(s, i, i + 1)))
+        i = i + 1
+
+// Read big-endian u16 from byte-list blist at position pos.
+// Returns -1 if out of bounds.
+fn _mc_read_u16(blist: list, pos: int) -> int
+    let total = len(blist)
+    if pos + 1 >= total
+        return -1
+    let hi = blist[pos]
+    let lo = blist[pos + 1]
+    (hi << 8) | lo
+
+// Read exactly count bytes from blist at pos as a string.
+// Returns "" if out of bounds.
+fn _mc_read_str_raw(blist: list, pos: int, count: int) -> string
+    let total = len(blist)
+    if pos + count > total
+        return ""
+    let s = ""
+    let i = 0
+    while i < count
+        s = s + chr(blist[pos + i])
+        i = i + 1
+    s
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+// mqtt_connect: build a CONNECT packet.
+fn mqtt_connect(client_id: string, keepalive: int, clean_session: int) -> list
+    // Build variable header + payload first to compute remaining length.
+    let var_payload = []
+
+    // Protocol name: u16(4) + "MQTT"
+    _mc_push_u16(var_payload, 4)
+    push(var_payload, ord("M"))
+    push(var_payload, ord("Q"))
+    push(var_payload, ord("T"))
+    push(var_payload, ord("T"))
+
+    // Protocol level: 4 (MQTT 3.1.1)
+    push(var_payload, 4)
+
+    // Connect flags: bit1 = clean_session
+    let flags = 0
+    if clean_session == 1
+        flags = 2
+    push(var_payload, flags)
+
+    // Keepalive: u16 big-endian
+    _mc_push_u16(var_payload, keepalive)
+
+    // Payload: client_id with u16-length prefix
+    _mc_push_str(var_payload, client_id)
+
+    // Build fixed header: type=1 (CONNECT), flags=0, remlen=len(var_payload)
+    let remlen = len(var_payload)
+    let out = mqtt_fixed_header(1, 0, remlen)
+
+    // Append variable header + payload
+    let i = 0
+    let n = len(var_payload)
+    while i < n
+        push(out, var_payload[i])
+        i = i + 1
+    out
+
+// mqtt_connect_decode: decode a CONNECT packet byte-list.
+// Returns dict {client_id, keepalive, clean} or {} on error.
+fn mqtt_connect_decode(packet: list) -> dict
+    let total = len(packet)
+    if total < 2
+        return {}
+
+    // Skip fixed header: byte0 + remaining length varint
+    let dec = mqtt_remlen_decode(packet, 1)
+    if dec[0] < 0
+        return {}
+    let var_start = dec[1]
+
+    // Need at least 10 bytes of variable header after fixed header.
+    // [0,4,'M','Q','T','T', proto_level, connect_flags, ka_hi, ka_lo]
+    if var_start + 10 > total
+        return {}
+
+    // Verify protocol name length = 4
+    let proto_len = _mc_read_u16(packet, var_start)
+    if proto_len != 4
+        return {}
+
+    // Verify "MQTT"
+    let proto_name = _mc_read_str_raw(packet, var_start + 2, 4)
+    if proto_name != "MQTT"
+        return {}
+
+    // Protocol level (byte at var_start+6) — we accept any value
+    let proto_level = packet[var_start + 6]
+    let dummy_pl = proto_level
+
+    // Connect flags
+    let connect_flags = packet[var_start + 7]
+    let clean = 0
+    if (connect_flags & 2) != 0
+        clean = 1
+
+    // Keepalive
+    let keepalive = _mc_read_u16(packet, var_start + 8)
+    if keepalive < 0
+        return {}
+
+    // Payload: client_id with u16-length prefix starts at var_start+10
+    let cid_pos = var_start + 10
+    let cid_len = _mc_read_u16(packet, cid_pos)
+    if cid_len < 0
+        return {}
+    if cid_pos + 2 + cid_len > total
+        return {}
+    let client_id = _mc_read_str_raw(packet, cid_pos + 2, cid_len)
+
+    let result = {}
+    result["client_id"] = client_id
+    result["keepalive"] = keepalive
+    result["clean"] = clean
+    result

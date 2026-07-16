@@ -1,0 +1,237 @@
+// ============================================================================
+// NOVA Standard Library — std/net/pop3_reply
+// ============================================================================
+// POP3 (RFC 1939) reply parser, command builder, and STAT response parser.
+//
+// POP3 is a TEXT protocol.  Lines are terminated by CRLF (chr(13)+chr(10)).
+// No NUL bytes appear, so plain NOVA strings are safe to use throughout.
+//
+// REPLY TYPES:
+//   Single-line:  "+OK <text>" or "-ERR <text>" (with or without CRLF)
+//   Multi-line:   "+OK ...\r\nline1\r\n...\r\n.\r\n"
+//                 — the multi-line body ends with a line containing only ".".
+//                 — a data line beginning with "." is dot-stuffed (extra "."
+//                   prefix); to de-stuff, strip the leading dot.
+//
+// PUBLIC API:
+//   pop3_reply_parse(text: string) -> dict
+//     Parse a POP3 reply (single or multi-line) into:
+//       "ok"    : int  — 1 if "+OK", 0 if "-ERR" or malformed
+//       "text"  : string — the status text after "+OK" / "-ERR" (first line)
+//       "lines" : list  — body lines for multi-line replies (dot-unstuffed),
+//                         empty list for single-line replies
+//     Multi-line detection: input contains a line "." (a terminator).
+//
+//   pop3_command(verb: string, arg: string) -> string
+//     Build a POP3 command line: "VERB arg\r\n" (with arg) or "VERB\r\n"
+//     CRLF = chr(13)+chr(10).
+//
+//   pop3_stat_parse(text: string) -> list
+//     Parse the text portion of a "+OK N octets" STAT reply.
+//     Returns [count, size] as integers.
+//     Input is the full "+OK N SIZE" reply string or just "N SIZE".
+//     Returns [0, 0] on malformed input.
+//
+// PRIVATE helpers prefixed _pop3_.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private: CRLF constant ────────────────────────────────────────────────────
+
+fn _pop3_crlf()
+    chr(13) + chr(10)
+
+// ── Private: split a string on CRLF into a list of line strings ───────────────
+
+fn _pop3_split_lines(s)
+    let lines = []
+    let n = len(s)
+    let start = 0
+    let i = 0
+    while i < n
+        let c = slice(s, i, i + 1)
+        if c == chr(13)
+            // Check for LF after CR
+            let line = slice(s, start, i)
+            push(lines, line)
+            if i + 1 < n and slice(s, i + 1, i + 2) == chr(10)
+                i = i + 2
+            else
+                i = i + 1
+            start = i
+        else if c == chr(10)
+            // bare LF
+            let line = slice(s, start, i)
+            push(lines, line)
+            i = i + 1
+            start = i
+        else
+            i = i + 1
+    // Remaining text after last line break
+    if start < n
+        let last = slice(s, start, n)
+        push(lines, last)
+    lines
+
+// ── Private: strip a leading "." from a dot-stuffed line ─────────────────────
+
+fn _pop3_undot(line)
+    if len(line) > 0 and slice(line, 0, 1) == "."
+        return slice(line, 1, len(line))
+    line
+
+// ── Private: parse an integer from a string (skipping leading spaces) ─────────
+
+fn _pop3_parse_int(s)
+    let n = len(s)
+    let i = 0
+    // skip leading spaces
+    while i < n and slice(s, i, i + 1) == " "
+        i = i + 1
+    // check optional minus
+    let neg = 0
+    if i < n and slice(s, i, i + 1) == "-"
+        neg = 1
+        i = i + 1
+    let v = 0
+    let found = 0
+    while i < n
+        let ch = slice(s, i, i + 1)
+        let o = ord(ch)
+        if o >= 48 and o <= 57
+            v = v * 10 + (o - 48)
+            found = 1
+            i = i + 1
+        else
+            // stop at non-digit
+            i = n
+    if found == 0
+        return 0
+    if neg == 1
+        return 0 - v
+    v
+
+// ============================================================================
+// PUBLIC: pop3_reply_parse
+// ============================================================================
+
+fn pop3_reply_parse(text)
+    let result = {}
+    result["ok"] = 0
+    result["text"] = ""
+    result["lines"] = []
+
+    let n = len(text)
+    if n == 0
+        return result
+
+    // Split into lines
+    let raw_lines = _pop3_split_lines(text)
+    let line_count = len(raw_lines)
+    if line_count == 0
+        return result
+
+    let first = raw_lines[0]
+    let first_n = len(first)
+
+    // Determine ok/err from the first 3 chars
+    if first_n >= 3 and slice(first, 0, 3) == "+OK"
+        result["ok"] = 1
+        // Status text is everything after "+OK" (strip leading space if present)
+        if first_n > 3
+            let rest = slice(first, 3, first_n)
+            // strip leading space
+            if len(rest) > 0 and slice(rest, 0, 1) == " "
+                rest = slice(rest, 1, len(rest))
+            result["text"] = rest
+        else
+            result["text"] = ""
+    else if first_n >= 4 and slice(first, 0, 4) == "-ERR"
+        result["ok"] = 0
+        if first_n > 4
+            let rest = slice(first, 4, first_n)
+            if len(rest) > 0 and slice(rest, 0, 1) == " "
+                rest = slice(rest, 1, len(rest))
+            result["text"] = rest
+        else
+            result["text"] = ""
+    else
+        // Malformed — not a valid POP3 reply
+        return result
+
+    // Collect body lines (everything after first line, up to but not including ".")
+    let body = []
+    let li = 1
+    while li < line_count
+        let line = raw_lines[li]
+        if line == "."
+            // Terminator line — stop
+            li = line_count
+        else
+            // Dot-unstuff: if line starts with ".", strip one "."
+            push(body, _pop3_undot(line))
+            li = li + 1
+    result["lines"] = body
+    result
+
+// ============================================================================
+// PUBLIC: pop3_command
+// ============================================================================
+
+fn pop3_command(verb, arg)
+    let crlf = _pop3_crlf()
+    if len(arg) > 0
+        return verb + " " + arg + crlf
+    verb + crlf
+
+// ============================================================================
+// PUBLIC: pop3_stat_parse
+// ============================================================================
+
+fn pop3_stat_parse(text)
+    // Strip "+OK " prefix if present
+    let s = text
+    let sn = len(s)
+    if sn >= 4 and slice(s, 0, 3) == "+OK"
+        s = slice(s, 3, sn)
+        sn = len(s)
+        if sn > 0 and slice(s, 0, 1) == " "
+            s = slice(s, 1, sn)
+            sn = len(s)
+
+    // Parse first integer (count)
+    let i = 0
+    while i < sn and slice(s, i, i + 1) == " "
+        i = i + 1
+    let count = 0
+    while i < sn
+        let ch = slice(s, i, i + 1)
+        let o = ord(ch)
+        if o >= 48 and o <= 57
+            count = count * 10 + (o - 48)
+            i = i + 1
+        else
+            i = sn
+
+    // Skip whitespace between count and size
+    let rest = ""
+    let j = 0
+    while j < sn and slice(s, j, j + 1) != " "
+        j = j + 1
+    while j < sn and slice(s, j, j + 1) == " "
+        j = j + 1
+    // Parse second integer (size)
+    let sz = 0
+    while j < sn
+        let ch = slice(s, j, j + 1)
+        let o = ord(ch)
+        if o >= 48 and o <= 57
+            sz = sz * 10 + (o - 48)
+            j = j + 1
+        else
+            j = sn
+
+    let result = []
+    push(result, count)
+    push(result, sz)
+    result

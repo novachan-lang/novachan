@@ -1,0 +1,169 @@
+// ============================================================================
+// NOVA Standard Library — std/net/mqtt_publish
+// ============================================================================
+// MQTT 3.1.1 — PUBLISH packet codec (byte-list wire format).
+//
+// PUBLISH packet structure:
+//   Fixed header:
+//     byte0 = (3 << 4) | flags
+//       flags bits: bit3=DUP, bits2-1=QoS, bit0=RETAIN
+//       For simple publish (no dup, no retain): flags = (qos << 1) & 0x06
+//     remlen varint = len(variable header + payload)
+//
+//   Variable header:
+//     [len_hi, len_lo, ...topic_bytes...]  — u16-len-prefixed topic
+//     [pkt_id_hi, pkt_id_lo]              — ONLY if qos > 0
+//
+//   Payload:
+//     [...payload_bytes...]  — raw byte-list (ints 0..255)
+//
+// QoS values: 0=at-most-once, 1=at-least-once, 2=exactly-once.
+// For QoS=0, packet_id is omitted from the wire (ignored in call, 0 returned in decode).
+//
+// PUBLIC API:
+//   mqtt_publish(topic: string, payload_bytes: list, qos: int, packet_id: int) -> list
+//     Build a complete PUBLISH packet as a byte-list.
+//     payload_bytes: list of ints 0..255.
+//     qos: 0, 1, or 2.
+//     packet_id: used only when qos > 0 (any u16 0..65535).
+//     DUP and RETAIN flags are always 0 in this encoder (simple publish).
+//
+//   mqtt_publish_decode(packet: list) -> dict
+//     Decode a PUBLISH packet byte-list (from byte 0 = fixed header byte0).
+//     Returns dict with keys:
+//       "topic"     : string — topic string
+//       "payload"   : list   — payload as list of ints 0..255
+//       "qos"       : int    — QoS level (0, 1, or 2)
+//       "packet_id" : int    — packet identifier (0 for qos=0)
+//     Returns {} on malformed input.
+//
+// LEAF — imports std/net/mqtt_fixed for fixed-header encoding.
+// ============================================================================
+
+import std/net/mqtt_fixed
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Append a big-endian u16 to list out (mutates out).
+fn _mp_push_u16(out: list, v: int)
+    push(out, (v >> 8) & 0xFF)
+    push(out, v & 0xFF)
+
+// Append string s as u16-length-prefixed bytes to list out (mutates out).
+fn _mp_push_str(out: list, s: string)
+    let slen = len(s)
+    _mp_push_u16(out, slen)
+    let i = 0
+    while i < slen
+        push(out, ord(slice(s, i, i + 1)))
+        i = i + 1
+
+// Read big-endian u16 from byte-list blist at position pos.
+// Returns -1 if out of bounds.
+fn _mp_read_u16(blist: list, pos: int) -> int
+    let total = len(blist)
+    if pos + 1 >= total
+        return -1
+    let hi = blist[pos]
+    let lo = blist[pos + 1]
+    (hi << 8) | lo
+
+// Read exactly count bytes from blist at pos as a string.
+// Returns "" if out of bounds.
+fn _mp_read_str_n(blist: list, pos: int, count: int) -> string
+    let total = len(blist)
+    if pos + count > total
+        return ""
+    let s = ""
+    let i = 0
+    while i < count
+        s = s + chr(blist[pos + i])
+        i = i + 1
+    s
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+// mqtt_publish: build a PUBLISH packet.
+// DUP=0, RETAIN=0; QoS encoded in flags bits 2-1.
+fn mqtt_publish(topic: string, payload_bytes: list, qos: int, packet_id: int) -> list
+    // Build variable header + payload.
+    let var_payload = []
+
+    // Topic: u16-len-prefixed
+    _mp_push_str(var_payload, topic)
+
+    // Packet identifier (only for qos > 0)
+    if qos > 0
+        _mp_push_u16(var_payload, packet_id)
+
+    // Payload bytes
+    let plen = len(payload_bytes)
+    let i = 0
+    while i < plen
+        push(var_payload, payload_bytes[i])
+        i = i + 1
+
+    // Fixed header: type=3 (PUBLISH), flags=(qos<<1)&0x06
+    let flags = (qos << 1) & 0x06
+    let remlen = len(var_payload)
+    let out = mqtt_fixed_header(3, flags, remlen)
+
+    // Append variable header + payload
+    let j = 0
+    let n = len(var_payload)
+    while j < n
+        push(out, var_payload[j])
+        j = j + 1
+    out
+
+// mqtt_publish_decode: decode a PUBLISH packet byte-list.
+// Returns dict {topic, payload, qos, packet_id} or {} on error.
+fn mqtt_publish_decode(packet: list) -> dict
+    let total = len(packet)
+    if total < 2
+        return {}
+
+    // byte0: decode type and flags
+    let byte0 = packet[0]
+    let pkt_type = (byte0 >> 4) & 0x0F
+    if pkt_type != 3
+        return {}
+    let flags = byte0 & 0x0F
+    let qos = (flags >> 1) & 0x03
+
+    // Decode remaining length varint starting at byte 1
+    let dec = mqtt_remlen_decode(packet, 1)
+    if dec[0] < 0
+        return {}
+    let var_start = dec[1]
+
+    // Read topic length and topic string
+    let topic_len = _mp_read_u16(packet, var_start)
+    if topic_len < 0
+        return {}
+    if var_start + 2 + topic_len > total
+        return {}
+    let topic = _mp_read_str_n(packet, var_start + 2, topic_len)
+    let pos = var_start + 2 + topic_len
+
+    // Packet identifier (only if qos > 0)
+    let packet_id = 0
+    if qos > 0
+        let pid = _mp_read_u16(packet, pos)
+        if pid < 0
+            return {}
+        packet_id = pid
+        pos = pos + 2
+
+    // Remaining bytes = payload
+    let payload = []
+    while pos < total
+        push(payload, packet[pos])
+        pos = pos + 1
+
+    let result = {}
+    result["topic"] = topic
+    result["payload"] = payload
+    result["qos"] = qos
+    result["packet_id"] = packet_id
+    result
