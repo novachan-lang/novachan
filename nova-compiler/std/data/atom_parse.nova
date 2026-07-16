@@ -1,0 +1,162 @@
+// ============================================================================
+// NOVA Standard Library — std/data/atom_parse
+// ============================================================================
+// Parse Atom 1.0 XML feeds into structured dicts.
+//
+// PUBLIC API:
+//   atom_parse(xml) -> dict
+//     Parse an Atom 1.0 XML string.  Returns a dict with keys:
+//       "title"   — feed title string
+//       "entries" — list of entry dicts, each with:
+//                     "title"   — entry title
+//                     "link"    — href attribute of <link href="..."/>
+//                     "id"      — entry id
+//                     "updated" — entry updated timestamp
+//
+// DESIGN NOTES:
+//   - LEAF module — imports nothing.
+//   - String-search XML parsing: find "<tag>" / "</tag>" for element text;
+//     find 'attr="' then read to '"' for attributes (e.g. link/@href).
+//   - Self-closing <link href="x"/> has no closing tag; we find the href
+//     attribute within the <link .../> or <link ...> tag span.
+//   - No namespace awareness; works on raw text.
+//   - Single-exit style throughout.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// Find the index of needle in haystack starting at pos.
+// Returns -1 if not found.
+fn _at_index_of(haystack, needle, pos) -> int
+    let hn = len(haystack)
+    let nn = len(needle)
+    let result = -1
+    let i = pos
+    let done = 0
+    while i <= hn - nn and done == 0
+        let matched = 1
+        let j = 0
+        while j < nn and matched == 1
+            if char_at(haystack, i + j) != char_at(needle, j)
+                matched = 0
+            j = j + 1
+        if matched == 1
+            result = i
+            done = 1
+        i = i + 1
+    result
+
+// Extract the text content of the FIRST occurrence of <tag>...</tag>
+// starting at pos.  Returns "" if not found.
+fn _at_extract_tag(xml, tag, pos) -> string
+    let open_tag = "<" + tag + ">"
+    let close_tag = "</" + tag + ">"
+    let result = ""
+    let start = _at_index_of(xml, open_tag, pos)
+    if start >= 0
+        let content_start = start + len(open_tag)
+        let end_pos = _at_index_of(xml, close_tag, content_start)
+        if end_pos >= 0
+            result = slice(xml, content_start, end_pos)
+    result
+
+// Extract an attribute value from a tag span.
+// Finds 'attr_name="' and reads until the closing '"'.
+// tag_span is the text of the full tag (e.g. <link href="x" rel="self"/>).
+// Returns "" if attribute not found.
+fn _at_extract_attr(tag_span, attr_name) -> string
+    let needle = attr_name + chr(61) + chr(34)
+    let result = ""
+    let pos = _at_index_of(tag_span, needle, 0)
+    if pos >= 0
+        let val_start = pos + len(needle)
+        let end_pos = _at_index_of(tag_span, chr(34), val_start)
+        if end_pos >= 0
+            result = slice(tag_span, val_start, end_pos)
+    result
+
+// Extract the href from the FIRST <link .../> or <link ...> tag in xml
+// starting at pos.  Atom uses self-closing <link href="x"/> for entry links.
+// We find the opening '<link' and the closing '>' to get the tag span,
+// then read the href attribute from that span.
+fn _at_extract_link_href(xml, pos) -> string
+    let result = ""
+    let link_open = "<link"
+    let tag_start = _at_index_of(xml, link_open, pos)
+    if tag_start >= 0
+        // Find the end of this tag (closing >).
+        let tag_end = _at_index_of(xml, ">", tag_start)
+        if tag_end >= 0
+            let tag_span = slice(xml, tag_start, tag_end + 1)
+            result = _at_extract_attr(tag_span, "href")
+    result
+
+// Extract all <entry>...</entry> blocks from the feed XML.
+// Returns a list of raw inner-XML strings.
+fn _at_extract_entries(feed_xml) -> list
+    let entries = []
+    let pos = 0
+    let open_tag = "<entry>"
+    let close_tag = "</entry>"
+    let done = 0
+    while done == 0
+        let start = _at_index_of(feed_xml, open_tag, pos)
+        if start < 0
+            done = 1
+        else
+            let content_start = start + len(open_tag)
+            let end_pos = _at_index_of(feed_xml, close_tag, content_start)
+            if end_pos < 0
+                done = 1
+            else
+                let block = slice(feed_xml, content_start, end_pos)
+                entries.push(block)
+                pos = end_pos + len(close_tag)
+    entries
+
+// Parse one <entry> block (inner XML) into a dict.
+fn _at_parse_entry(entry_xml) -> dict
+    let d = {}
+    d["title"]   = _at_extract_tag(entry_xml, "title", 0)
+    d["id"]      = _at_extract_tag(entry_xml, "id", 0)
+    d["updated"] = _at_extract_tag(entry_xml, "updated", 0)
+    // Link: Atom uses <link href="..."/> (self-closing).
+    d["link"] = _at_extract_link_href(entry_xml, 0)
+    d
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// atom_parse: parse an Atom 1.0 XML string into a structured dict.
+fn atom_parse(xml) -> dict
+    let result = {}
+    result["title"]   = ""
+    result["entries"] = []
+
+    // Find <feed>...</feed> (or treat whole document as feed content).
+    let feed_open = "<feed>"
+    let feed_close = "</feed>"
+    let feed_xml = xml
+    let feed_start = _at_index_of(xml, feed_open, 0)
+    if feed_start >= 0
+        let feed_content_start = feed_start + len(feed_open)
+        let feed_end = _at_index_of(xml, feed_close, feed_content_start)
+        if feed_end >= 0
+            feed_xml = slice(xml, feed_content_start, feed_end)
+        else
+            feed_xml = slice(xml, feed_content_start, len(xml))
+
+    // Extract feed-level title (first <title> before any <entry>).
+    result["title"] = _at_extract_tag(feed_xml, "title", 0)
+
+    // Extract all entries.
+    let raw_entries = _at_extract_entries(feed_xml)
+    let n = len(raw_entries)
+    let i = 0
+    let entries_list = []
+    while i < n
+        let entry_dict = _at_parse_entry(raw_entries[i])
+        entries_list.push(entry_dict)
+        i = i + 1
+    result["entries"] = entries_list
+
+    result

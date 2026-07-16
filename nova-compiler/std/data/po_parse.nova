@@ -1,0 +1,262 @@
+// ============================================================================
+// NOVA Standard Library — std/data/po_parse
+// ============================================================================
+// GNU gettext PO (Portable Object) file parser.
+//
+// PO format overview:
+//   • Entries separated by one or more blank lines.
+//   • Within an entry:
+//       # comment line          -> collected into comments list (text after "# ")
+//       #, flag line            -> treated as comment (full line after #)
+//       #. extracted comment    -> treated as comment
+//       msgid "text"            -> message ID (may span multiple quoted lines)
+//       msgstr "text"           -> translated string (may span multiple quoted lines)
+//   • Multi-line values: consecutive double-quoted lines are concatenated.
+//   • The first entry (msgid "") is the file header with metadata in msgstr.
+//   • Escape sequences inside quoted strings: \" -> ", \n -> newline, \t -> tab,
+//     \\ -> backslash.
+//
+// PUBLIC API
+//   po_parse(text) -> list
+//       Returns a list of dicts, each with:
+//         "msgid"    : string
+//         "msgstr"   : string
+//         "comments" : list of strings (one per # comment line, text only)
+//
+// EXAMPLES
+//   po_parse("msgid \"hello\"\nmsgstr \"bonjour\"\n")
+//   // => [{msgid:"hello", msgstr:"bonjour", comments:[]}]
+//
+// IMPLEMENTATION NOTES
+//   • Private helpers prefixed _po_ to avoid link collisions.
+//   • Single-exit style throughout (NOVA early-return mistag bug avoidance).
+//   • No multi-line list/dict literals (NOVA parser limitation).
+//   • chr(10)=LF, chr(34)='"', chr(92)=backslash.
+//   • LEAF module — imports nothing.
+// ============================================================================
+
+// ── Private: get one line from text at pos ────────────────────────────────────
+
+fn _po_get_line(s, pos)
+    let slen = len(s)
+    let end_pos = pos
+    let go = 1
+    while go == 1
+        if end_pos >= slen
+            go = 0
+        else
+            if char_at(s, end_pos) == chr(10)
+                go = 0
+            else
+                end_pos = end_pos + 1
+    let line = slice(s, pos, end_pos)
+    // Strip trailing CR
+    let llen = len(line)
+    if llen > 0
+        if char_at(line, llen - 1) == chr(13)
+            line = slice(line, 0, llen - 1)
+    let newpos = end_pos
+    if end_pos < slen
+        newpos = end_pos + 1
+    let r = []
+    push(r, line)
+    push(r, newpos)
+    return r
+
+// ── Private: unescape a PO quoted string (content only, no surrounding quotes) ─
+
+fn _po_unescape(s)
+    let n = len(s)
+    let result = ""
+    let i = 0
+    let bslash = chr(92)
+    while i < n
+        let ch = char_at(s, i)
+        if ch == bslash and i + 1 < n
+            let next = char_at(s, i + 1)
+            if next == chr(34)
+                result = result + chr(34)
+                i = i + 2
+            else
+                if next == bslash
+                    result = result + bslash
+                    i = i + 2
+                else
+                    if next == "n"
+                        result = result + chr(10)
+                        i = i + 2
+                    else
+                        if next == "t"
+                            result = result + chr(9)
+                            i = i + 2
+                        else
+                            result = result + ch
+                            i = i + 1
+        else
+            result = result + ch
+            i = i + 1
+    return result
+
+// ── Private: if line starts with prefix, return the rest; else return null ────
+
+fn _po_strip_prefix(line, prefix)
+    let plen = len(prefix)
+    let result = null
+    if len(line) >= plen
+        if slice(line, 0, plen) == prefix
+            result = slice(line, plen, len(line))
+    return result
+
+// ── Private: extract quoted content from a msgid/msgstr value line.
+// The line after stripping the keyword looks like: "content" (possibly empty "")
+// Returns the unescaped content, or null if not a quoted line.
+
+fn _po_extract_quoted(s)
+    let slen = len(s)
+    let result = null
+    // Find first '"'
+    let start = -1
+    let i = 0
+    let go = 1
+    while go == 1
+        if i >= slen
+            go = 0
+        else
+            if char_at(s, i) == chr(34)
+                start = i
+                go = 0
+            else
+                i = i + 1
+    if start >= 0
+        // Find matching closing '"' scanning from start+1, respecting backslash escapes
+        let j = start + 1
+        let bslash = chr(92)
+        let end_q = -1
+        let go2 = 1
+        while go2 == 1
+            if j >= slen
+                go2 = 0
+            else
+                let ch = char_at(s, j)
+                if ch == bslash
+                    j = j + 2
+                else
+                    if ch == chr(34)
+                        end_q = j
+                        go2 = 0
+                    else
+                        j = j + 1
+        if end_q > start
+            result = _po_unescape(slice(s, start + 1, end_q))
+    return result
+
+// ── Public: po_parse ─────────────────────────────────────────────────────────
+
+// po_parse: parse a PO file text into a list of entry dicts.
+fn po_parse(text)
+    let result = []
+    let slen = len(text)
+    let pos = 0
+
+    // We accumulate lines into an in-progress entry and flush when we see a blank
+    let cur_comments = []
+    let cur_msgid = null
+    let cur_msgstr = null
+    // mode: 0=none, 1=in msgid, 2=in msgstr
+    let cur_mode = 0
+    // Whether we are currently accumulating an entry
+    let in_entry = 0
+
+    let go = 1
+    while go == 1
+        let is_eof = 0
+        let line = ""
+        if pos >= slen
+            is_eof = 1
+            go = 0
+        else
+            let lr = _po_get_line(text, pos)
+            line = lr[0]
+            pos = lr[1]
+
+        // Determine if blank (after potential CR strip)
+        let llen = len(line)
+        let is_blank = 0
+        if llen == 0
+            is_blank = 1
+
+        if is_blank == 1 or is_eof == 1
+            // Flush current entry if any field was set
+            if in_entry == 1
+                let entry = {}
+                let mid = ""
+                if cur_msgid != null
+                    mid = cur_msgid
+                entry["msgid"] = mid
+                let mstr = ""
+                if cur_msgstr != null
+                    mstr = cur_msgstr
+                entry["msgstr"] = mstr
+                entry["comments"] = cur_comments
+                push(result, entry)
+                // Reset state
+                cur_comments = []
+                cur_msgid = null
+                cur_msgstr = null
+                cur_mode = 0
+                in_entry = 0
+        else
+            // Non-blank line — classify it
+            let first = char_at(line, 0)
+            if first == "#"
+                // Comment line — strip "# " or "#, " or "#." etc.
+                // We capture the text after the first character sequence
+                let comment_text = ""
+                if llen >= 2
+                    let second = char_at(line, 1)
+                    if second == " "
+                        // "# comment" -> capture from position 2
+                        comment_text = slice(line, 2, llen)
+                    else
+                        // "#," "#." "#:" "#|" etc. -> capture from position 1
+                        comment_text = slice(line, 1, llen)
+                push(cur_comments, comment_text)
+                in_entry = 1
+            else
+                // Try msgid
+                let after_msgid = _po_strip_prefix(line, "msgid ")
+                let after_msgstr = _po_strip_prefix(line, "msgstr ")
+                if after_msgid != null
+                    let content = _po_extract_quoted(after_msgid)
+                    if content != null
+                        cur_msgid = content
+                    else
+                        cur_msgid = ""
+                    cur_mode = 1
+                    in_entry = 1
+                else
+                    if after_msgstr != null
+                        let content = _po_extract_quoted(after_msgstr)
+                        if content != null
+                            cur_msgstr = content
+                        else
+                            cur_msgstr = ""
+                        cur_mode = 2
+                        in_entry = 1
+                    else
+                        // Check if it's a continuation quoted line (starts with '"')
+                        if first == chr(34)
+                            let content = _po_extract_quoted(line)
+                            if content != null
+                                if cur_mode == 1
+                                    if cur_msgid == null
+                                        cur_msgid = content
+                                    else
+                                        cur_msgid = cur_msgid + content
+                                else
+                                    if cur_mode == 2
+                                        if cur_msgstr == null
+                                            cur_msgstr = content
+                                        else
+                                            cur_msgstr = cur_msgstr + content
+    return result
