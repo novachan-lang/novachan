@@ -1,0 +1,226 @@
+// ============================================================================
+// NOVA Standard Library — std/data/geojson_parse
+// ============================================================================
+// Parse GeoJSON geometry objects by string search.
+//
+// PUBLIC API
+//   geojson_parse(json) -> dict
+//     Returns {"type": string, "coordinates": list}
+//     type is e.g. "Point", "LineString", "Polygon"
+//     coordinates is a nested float list:
+//       Point       -> [lon, lat]           (2-element flat list of floats)
+//       LineString  -> [[lon,lat], ...]     (list of 2-element lists)
+//       Polygon     -> [[[lon,lat], ...]]   (list of rings, each a list of positions)
+//
+// DESIGN NOTES
+//   - LEAF module — imports nothing.
+//   - String-search JSON parsing: find "key":" or "key":[ patterns.
+//   - Floats parsed with parse_float builtin.
+//   - Single-exit style throughout.
+//   - chr(34)='"', chr(91)='[', chr(93)=']', chr(44)=',', chr(58)=':'
+// ============================================================================
+
+// ── Private: index_of ────────────────────────────────────────────────────────
+
+fn _gp_index_of(s, needle, pos) -> int
+    let sn = len(s)
+    let nn = len(needle)
+    let result = -1
+    let i = pos
+    let done = 0
+    while i <= sn - nn and done == 0
+        let matched = 1
+        let j = 0
+        while j < nn and matched == 1
+            if char_at(s, i + j) != char_at(needle, j)
+                matched = 0
+            j = j + 1
+        if matched == 1
+            result = i
+            done = 1
+        i = i + 1
+    result
+
+// ── Private: skip whitespace ─────────────────────────────────────────────────
+
+fn _gp_skip_ws(s, pos) -> int
+    let n = len(s)
+    let i = pos
+    let done = 0
+    while i < n and done == 0
+        let c = char_at(s, i)
+        if c == " " or c == "\t" or c == "\n" or c == "\r"
+            i = i + 1
+        else
+            done = 1
+    i
+
+// ── Private: extract string value after "key": ───────────────────────────────
+// Finds "key":" then reads until next unescaped '"'.
+fn _gp_extract_str(json, key) -> string
+    let needle = chr(34) + key + chr(34) + ":" + chr(34)
+    let result = ""
+    let pos = _gp_index_of(json, needle, 0)
+    if pos >= 0
+        let val_start = pos + len(needle)
+        let end_pos = _gp_index_of(json, chr(34), val_start)
+        if end_pos >= 0
+            result = slice(json, val_start, end_pos)
+    result
+
+// ── Private: find coordinates bracket after "coordinates": ───────────────────
+// Returns the index of the '[' that starts the coordinates value.
+fn _gp_coord_bracket_start(json) -> int
+    let needle = chr(34) + "coordinates" + chr(34) + ":"
+    let result = -1
+    let pos = _gp_index_of(json, needle, 0)
+    if pos >= 0
+        let after_colon = pos + len(needle)
+        let ws_end = _gp_skip_ws(json, after_colon)
+        if ws_end < len(json)
+            if char_at(json, ws_end) == "["
+                result = ws_end
+    result
+
+// ── Private: parse a number token starting at pos ────────────────────────────
+// Reads digits, '.', '-', 'e', 'E', '+' until a non-number character.
+// Returns a list [float_value_as_string, next_pos].
+fn _gp_read_number(s, pos) -> list
+    let n = len(s)
+    let i = pos
+    let done = 0
+    while i < n and done == 0
+        let c = char_at(s, i)
+        if c == "-" or c == "+" or c == "." or c == "e" or c == "E"
+            i = i + 1
+        else if c >= "0" and c <= "9"
+            i = i + 1
+        else
+            done = 1
+    let tok = slice(s, pos, i)
+    let out = []
+    push(out, tok)
+    push(out, i)
+    out
+
+// ── Private: parse a flat array of numbers [n, n, ...] ───────────────────────
+// Returns list of floats.
+fn _gp_parse_float_array(s, open_pos) -> list
+    let result = []
+    let n = len(s)
+    // open_pos points at '['; start after it
+    let i = open_pos + 1
+    let done = 0
+    while done == 0 and i < n
+        let c = char_at(s, i)
+        if c == "]"
+            done = 1
+        else if c == " " or c == "\t" or c == "\n" or c == "\r" or c == ","
+            i = i + 1
+        else if c == "-" or (c >= "0" and c <= "9")
+            let pair = _gp_read_number(s, i)
+            let tok = pair[0]
+            let next = pair[1]
+            let fv = parse_float(tok)
+            push(result, fv)
+            i = next
+        else
+            i = i + 1
+    result
+
+// ── Private: find matching close bracket ─────────────────────────────────────
+// Starting at open_pos (which is '['), scan forward counting nesting.
+// Returns the index of the matching ']'.
+fn _gp_find_close(s, open_pos) -> int
+    let n = len(s)
+    let depth = 0
+    let i = open_pos
+    let result = -1
+    let done = 0
+    while i < n and done == 0
+        let c = char_at(s, i)
+        if c == "["
+            depth = depth + 1
+        else if c == "]"
+            depth = depth - 1
+            if depth == 0
+                result = i
+                done = 1
+        i = i + 1
+    result
+
+// ── Private: parse array-of-float-arrays [[n,n],[n,n],...] ───────────────────
+// Returns list of lists of floats.
+fn _gp_parse_pos_array(s, open_pos) -> list
+    let result = []
+    let n = len(s)
+    let i = open_pos + 1
+    let done = 0
+    while done == 0 and i < n
+        let c = char_at(s, i)
+        if c == "]"
+            done = 1
+        else if c == "["
+            // find close bracket for this sub-array
+            let close = _gp_find_close(s, i)
+            if close >= 0
+                let sub = _gp_parse_float_array(s, i)
+                push(result, sub)
+                i = close + 1
+            else
+                done = 1
+        else
+            i = i + 1
+    result
+
+// ── Private: parse array-of-rings [[[n,n],...]] ──────────────────────────────
+// Returns list of lists-of-lists of floats (one level deeper).
+fn _gp_parse_ring_array(s, open_pos) -> list
+    let result = []
+    let n = len(s)
+    let i = open_pos + 1
+    let done = 0
+    while done == 0 and i < n
+        let c = char_at(s, i)
+        if c == "]"
+            done = 1
+        else if c == "["
+            // find close bracket for this ring
+            let close = _gp_find_close(s, i)
+            if close >= 0
+                let ring_s = slice(s, i, close + 1)
+                let ring = _gp_parse_pos_array(ring_s, 0)
+                push(result, ring)
+                i = close + 1
+            else
+                done = 1
+        else
+            i = i + 1
+    result
+
+// ── Public: geojson_parse ─────────────────────────────────────────────────────
+
+fn geojson_parse(json) -> dict
+    let result = {}
+    let geom_type = _gp_extract_str(json, "type")
+    result["type"] = geom_type
+
+    // Find start of coordinates value
+    let coord_start = _gp_coord_bracket_start(json)
+    let coords = []
+    if coord_start >= 0
+        if geom_type == "Point"
+            // coordinates: [lon, lat]
+            coords = _gp_parse_float_array(json, coord_start)
+        else if geom_type == "LineString"
+            // coordinates: [[lon,lat],[lon,lat],...]
+            coords = _gp_parse_pos_array(json, coord_start)
+        else if geom_type == "Polygon"
+            // coordinates: [[[lon,lat],...]]
+            coords = _gp_parse_ring_array(json, coord_start)
+        else
+            // Unknown type: try flat float array as best effort
+            coords = _gp_parse_float_array(json, coord_start)
+
+    result["coordinates"] = coords
+    result
