@@ -1,0 +1,435 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/adaptive_huffman
+// ============================================================================
+// Adaptive Huffman Coding — byte-level input, bit-list output.
+//
+// ALGORITHM — Simple Adaptive / Semi-static Huffman:
+//   Encoder and decoder maintain identical frequency tables that are updated
+//   after each symbol is processed. This keeps them in perfect sync without
+//   any out-of-band communication.
+//
+//   For each input byte b:
+//     1. If b has been seen before: encode with current Huffman code for b.
+//        The code is derived by building a canonical Huffman tree from current
+//        frequencies (push-only; no tree mutation).
+//     2. If b is NEW (first occurrence): emit an 8-bit literal escape
+//        (all 8 bits of b) preceded by a single 1-bit escape flag. A 0-bit
+//        escape flag means "use the current Huffman codebook."
+//     3. After emitting bits for b: increment freq[b] and rebuild codebook.
+//
+//   Decoder mirrors exactly: maintain same freq table, rebuild same codebook
+//   after each symbol, read escape flag to decide whether to read 8 literal
+//   bits or decode one Huffman code.
+//
+//   ESCAPE FLAG ENCODING (2-phase per symbol):
+//     Phase A — if freq[b] == 0 (new symbol):
+//       emit bit 1 (escape), then emit 8 bits of b (big-endian)
+//     Phase B — if freq[b] > 0 (known symbol):
+//       emit bit 0 (Huffman follows), then emit Huffman code for b
+//
+//   After emitting: freq[b] += 1; rebuild codebook from freq.
+//
+// HUFFMAN CODEBOOK CONSTRUCTION (used by both encoder and decoder):
+//   1. Sort known symbols by frequency (ascending), then by symbol value
+//      (ascending) for ties — produces a deterministic, canonical ordering.
+//   2. Assign code lengths using a simple min-heap / package-merge simplified:
+//      use the Huffman algorithm with a sorted list and two queues.
+//      Since we rebuild on every symbol and inputs are small in typical use,
+//      O(k log k) per symbol is acceptable.
+//   3. Build canonical codes from lengths.
+//
+// PUBLIC API:
+//   ahuff_compress(bytes) -> list
+//     Compress a byte-list (list of ints 0-255) to a bit-list (list of 0/1).
+//     Empty input returns [].
+//
+//   ahuff_decompress(bits) -> list
+//     Decompress a bit-list back to the original byte-list.
+//     Round-trip: ahuff_decompress(ahuff_compress(bytes)) == bytes.
+//
+// CORRECTNESS: round-trip is guaranteed because encoder and decoder maintain
+// identical state at every step (same freq table, same codebook rebuild).
+//
+// COMPLEXITY: O(n * k * log k) where n = input length, k = distinct symbols
+// seen so far. Suitable for KAT on short-to-medium inputs (< 1000 bytes).
+//
+// SYMBOL COLLISION GUARD: all private helpers prefixed _ahuf_.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private: Huffman codebook builder ────────────────────────────────────────
+
+// _ahuf_int_to_bits: convert integer `v` to a big-endian bit-list of `nbits` bits.
+fn _ahuf_int_to_bits(v, nbits) -> list
+    let out = []
+    let i = nbits - 1
+    while i >= 0
+        let bit = 0
+        // extract bit i: shift right by i, then AND 1
+        let shifted = v
+        let j = 0
+        while j < i
+            shifted = shifted / 2
+            j = j + 1
+        bit = shifted - (shifted / 2) * 2
+        push(out, bit)
+        i = i - 1
+    out
+
+// _ahuf_bits_to_int: convert a big-endian bit-list to an integer.
+fn _ahuf_bits_to_int(bits, start, nbits) -> int
+    let v = 0
+    let i = 0
+    while i < nbits
+        v = v * 2 + bits[start + i]
+        i = i + 1
+    v
+
+// _ahuf_build_codebook: build Huffman codes for symbols in `sym_list`
+// with corresponding frequencies in `freq_list`.
+// Returns a dict: str(symbol) -> bit-list (list of 0/1 ints).
+// Uses a simple iterative Huffman algorithm with sorted arrays.
+// For 1 known symbol: assign code [0].
+fn _ahuf_build_codebook(sym_list, freq_list) -> dict
+    let k = len(sym_list)
+    let cb = {}
+    if k == 0
+        return cb
+    if k == 1
+        // Single symbol: code = [0]
+        let single_code = [0]
+        cb[str(sym_list[0])] = single_code
+        return cb
+    // Build Huffman tree using a node list.
+    // Each node: [weight, left_child_idx, right_child_idx, symbol]
+    // leaf: left_child_idx = -1, right_child_idx = -1
+    // internal: symbol = -1
+    //
+    // We use two arrays (two-queue approach):
+    //   queue1 = initial sorted leaves (sorted ascending by weight)
+    //   queue2 = internal nodes produced by merging (always increasing weight)
+    // At each step: pick two smallest from front of either queue, merge.
+    //
+    // Represent nodes as a list of lists; track in separate parallel arrays
+    // for NOVA compatibility.
+    let node_w = []
+    let node_left = []
+    let node_right = []
+    let node_sym = []
+    // Sort leaves by (freq, symbol) ascending for deterministic ordering
+    // Simple insertion sort on (freq, sym) pairs
+    let sorted_sym = []
+    let sorted_freq = []
+    let si = 0
+    while si < k
+        let fs = freq_list[si]
+        let ss = sym_list[si]
+        // Find insertion position: (fs, ss) < (sorted_freq[j], sorted_sym[j])
+        let pos = len(sorted_sym)
+        let sj = 0
+        let sdone = 0
+        while sj < len(sorted_sym) and sdone == 0
+            let ef = sorted_freq[sj]
+            let es = sorted_sym[sj]
+            if fs < ef
+                pos = sj
+                sdone = 1
+            else
+                if fs == ef and ss < es
+                    pos = sj
+                    sdone = 1
+                else
+                    sj = sj + 1
+        // Rebuild sorted lists with insertion at pos
+        let new_sym = []
+        let new_freq = []
+        let sk = 0
+        while sk < pos
+            push(new_sym, sorted_sym[sk])
+            push(new_freq, sorted_freq[sk])
+            sk = sk + 1
+        push(new_sym, ss)
+        push(new_freq, fs)
+        let sk2 = pos
+        while sk2 < len(sorted_sym)
+            push(new_sym, sorted_sym[sk2])
+            push(new_freq, sorted_freq[sk2])
+            sk2 = sk2 + 1
+        sorted_sym = new_sym
+        sorted_freq = new_freq
+        si = si + 1
+    // Create leaf nodes
+    let leaf_i = 0
+    while leaf_i < k
+        push(node_w, sorted_freq[leaf_i])
+        push(node_left, -1)
+        push(node_right, -1)
+        push(node_sym, sorted_sym[leaf_i])
+        leaf_i = leaf_i + 1
+    // Two-queue Huffman: q1 = deque over leaves [0..k-1], q2 = internal nodes
+    let q1_head = 0
+    let q2_head = 0
+    let q2_nodes = []
+    // Total merges needed = k - 1
+    let merges = k - 1
+    let m = 0
+    while m < merges
+        // Pick two smallest
+        // Helper: pick min from front of q1 and q2
+        // First minimum
+        let min1_idx = -1
+        let min1_from_q2 = 0
+        let q1_avail = q1_head < k
+        let q2_avail = q2_head < len(q2_nodes)
+        if q1_avail == 1 and q2_avail == 0
+            min1_idx = q1_head
+            min1_from_q2 = 0
+            q1_head = q1_head + 1
+        else
+            if q1_avail == 0 and q2_avail == 1
+                min1_idx = q2_nodes[q2_head]
+                min1_from_q2 = 1
+                q2_head = q2_head + 1
+            else
+                // Both available — pick smaller weight
+                let w1 = node_w[q1_head]
+                let w2 = node_w[q2_nodes[q2_head]]
+                if w1 <= w2
+                    min1_idx = q1_head
+                    min1_from_q2 = 0
+                    q1_head = q1_head + 1
+                else
+                    min1_idx = q2_nodes[q2_head]
+                    min1_from_q2 = 1
+                    q2_head = q2_head + 1
+        // Second minimum
+        let min2_idx = -1
+        let q1_avail2 = q1_head < k
+        let q2_avail2 = q2_head < len(q2_nodes)
+        if q1_avail2 == 1 and q2_avail2 == 0
+            min2_idx = q1_head
+            q1_head = q1_head + 1
+        else
+            if q1_avail2 == 0 and q2_avail2 == 1
+                min2_idx = q2_nodes[q2_head]
+                q2_head = q2_head + 1
+            else
+                let w1b = node_w[q1_head]
+                let w2b = node_w[q2_nodes[q2_head]]
+                if w1b <= w2b
+                    min2_idx = q1_head
+                    q1_head = q1_head + 1
+                else
+                    min2_idx = q2_nodes[q2_head]
+                    q2_head = q2_head + 1
+        // Create new internal node
+        let new_w = node_w[min1_idx] + node_w[min2_idx]
+        let new_node_idx = len(node_w)
+        push(node_w, new_w)
+        push(node_left, min1_idx)
+        push(node_right, min2_idx)
+        push(node_sym, -1)
+        push(q2_nodes, new_node_idx)
+        m = m + 1
+    // Tree root is the last node created
+    let root = len(node_w) - 1
+    // Walk the tree to assign codes (iterative DFS using a stack)
+    // Stack entries: [node_idx, current_code_bits]
+    // We represent the stack as parallel lists for NOVA compatibility
+    let stk_idx = []
+    let stk_bits = []
+    let empty_bits = []
+    push(stk_idx, root)
+    push(stk_bits, empty_bits)
+    while len(stk_idx) > 0
+        // Pop from stack
+        let top_i = len(stk_idx) - 1
+        let cur_node = stk_idx[top_i]
+        let cur_bits = stk_bits[top_i]
+        // Rebuild stack without top (push-only)
+        let new_stk_idx = []
+        let new_stk_bits = []
+        let si2 = 0
+        while si2 < top_i
+            push(new_stk_idx, stk_idx[si2])
+            push(new_stk_bits, stk_bits[si2])
+            si2 = si2 + 1
+        stk_idx = new_stk_idx
+        stk_bits = new_stk_bits
+        let cur_left = node_left[cur_node]
+        let cur_right = node_right[cur_node]
+        if cur_left == -1
+            // Leaf node: assign code
+            let sym = node_sym[cur_node]
+            cb[str(sym)] = cur_bits
+        else
+            // Internal node: push children with extended bit paths
+            // Left child gets bit 0, right child gets bit 1
+            let bits_left = []
+            let bci = 0
+            while bci < len(cur_bits)
+                push(bits_left, cur_bits[bci])
+                bci = bci + 1
+            push(bits_left, 0)
+            let bits_right = []
+            let bcj = 0
+            while bcj < len(cur_bits)
+                push(bits_right, cur_bits[bcj])
+                bcj = bcj + 1
+            push(bits_right, 1)
+            push(stk_idx, cur_left)
+            push(stk_bits, bits_left)
+            push(stk_idx, cur_right)
+            push(stk_bits, bits_right)
+    cb
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ahuff_compress(bytes) -> list
+//
+// Compress a byte-list to a bit-list using adaptive Huffman coding.
+//
+// Encoding protocol per byte b:
+//   - If b is new (freq == 0): emit bit 1 (escape), then 8 bits of b.
+//   - If b is known (freq > 0): emit bit 0, then Huffman code for b.
+//   After each byte: freq[b] += 1; rebuild codebook.
+//
+// Returns a list of 0/1 integers (bit-list).
+fn ahuff_compress(bytes) -> list
+    let n = len(bytes)
+    let bits = []
+    if n == 0
+        return bits
+    // Frequency table: str(byte_value) -> count
+    let freq = {}
+    // Known symbol list (for codebook construction)
+    let known_syms = []
+    let i = 0
+    while i < n
+        let b = bytes[i]
+        let bk = str(b)
+        if contains(freq, bk)
+            // Known symbol: emit 0-flag then Huffman code
+            push(bits, 0)
+            // Build codebook from current frequencies
+            let fsym = []
+            let ffrq = []
+            let ki = 0
+            while ki < len(known_syms)
+                let ks = known_syms[ki]
+                push(fsym, ks)
+                push(ffrq, freq[str(ks)])
+                ki = ki + 1
+            let cb = _ahuf_build_codebook(fsym, ffrq)
+            // Emit Huffman code for b
+            let code = cb[bk]
+            let ci = 0
+            while ci < len(code)
+                push(bits, code[ci])
+                ci = ci + 1
+            // Update frequency
+            freq[bk] = freq[bk] + 1
+        else
+            // New symbol: emit 1-flag then 8 literal bits
+            push(bits, 1)
+            let lbits = _ahuf_int_to_bits(b, 8)
+            let li = 0
+            while li < 8
+                push(bits, lbits[li])
+                li = li + 1
+            // Register new symbol
+            freq[bk] = 1
+            push(known_syms, b)
+        i = i + 1
+    bits
+
+// ahuff_decompress(bits) -> list
+//
+// Decompress a bit-list produced by ahuff_compress back to the original byte-list.
+//
+// Decoding protocol:
+//   - Read 1 bit:
+//     - If 1 (escape): read next 8 bits as new literal byte b.
+//     - If 0 (Huffman): read bits one at a time, walking the Huffman tree
+//       until a leaf is reached; that leaf's symbol is b.
+//   After each decoded byte: freq[b] += 1; rebuild codebook.
+//
+// Returns a list of ints 0-255.
+fn ahuff_decompress(bits) -> list
+    let nbits = len(bits)
+    let out = []
+    if nbits == 0
+        return out
+    let freq = {}
+    let known_syms = []
+    let pos = 0
+    while pos < nbits
+        // Read escape flag
+        let flag = bits[pos]
+        pos = pos + 1
+        if flag == 1
+            // Escape: read 8 literal bits
+            if pos + 8 > nbits
+                // Truncated — stop
+                let done_flag = 1
+                pos = nbits
+            else
+                let b = _ahuf_bits_to_int(bits, pos, 8)
+                pos = pos + 8
+                push(out, b)
+                let bk = str(b)
+                freq[bk] = 1
+                push(known_syms, b)
+        else
+            // Huffman: build current codebook and decode one symbol
+            let fsym = []
+            let ffrq = []
+            let ki = 0
+            while ki < len(known_syms)
+                let ks = known_syms[ki]
+                push(fsym, ks)
+                push(ffrq, freq[str(ks)])
+                ki = ki + 1
+            let cb = _ahuf_build_codebook(fsym, ffrq)
+            // Build reverse map: bit-string -> symbol
+            // Read bits until we match a code
+            let cur_code = []
+            let decoded = -1
+            let max_search = 32
+            let search_done = 0
+            while search_done == 0
+                if pos >= nbits
+                    search_done = 1
+                else
+                    push(cur_code, bits[pos])
+                    pos = pos + 1
+                    // Build bit-string key
+                    let bitstr = ""
+                    let bsi = 0
+                    while bsi < len(cur_code)
+                        bitstr = bitstr + str(cur_code[bsi])
+                        bsi = bsi + 1
+                    // Search codebook for matching code
+                    let cki2 = 0
+                    while cki2 < len(known_syms)
+                        let ks2 = known_syms[cki2]
+                        let ks2k = str(ks2)
+                        if contains(cb, ks2k)
+                            let scode = cb[ks2k]
+                            // Build bit-string for this code
+                            let scode_str = ""
+                            let sci = 0
+                            while sci < len(scode)
+                                scode_str = scode_str + str(scode[sci])
+                                sci = sci + 1
+                            if scode_str == bitstr
+                                decoded = ks2
+                                search_done = 1
+                        cki2 = cki2 + 1
+                    if len(cur_code) >= max_search
+                        search_done = 1
+            if decoded >= 0
+                push(out, decoded)
+                let bkd = str(decoded)
+                freq[bkd] = freq[bkd] + 1
+    out

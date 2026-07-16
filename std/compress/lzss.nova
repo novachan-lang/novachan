@@ -1,0 +1,193 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/lzss
+// ============================================================================
+// LZSS (Lempel-Ziv-Storer-Szymanski) sliding-window compression.
+//
+// PUBLIC API:
+//   lzss_compress(bytes: list) -> list
+//       Compress a byte-list (ints 0..255) using LZSS.
+//       Returns a byte-list encoding of flag bits + literals/back-refs.
+//
+//   lzss_decompress(bytes: list) -> list
+//       Decompress output of lzss_compress back to original byte-list.
+//
+// ENCODING FORMAT:
+//   Output is a stream of "flag groups". Each group begins with one byte
+//   (the "flag byte") whose bits (MSB first) indicate what follows:
+//     bit = 0 -> next byte in output stream is a literal
+//     bit = 1 -> next 2 bytes encode a back-reference (offset, length)
+//               offset  = high 4 bits of byte0 | byte1  (12-bit, 1-based)
+//               length  = low  4 bits of byte0          (+MIN_MATCH = 3..18)
+//   The group packs up to 8 items (literals or references) per flag byte.
+//   Remaining bits in the last group's flag byte are 0 (treated as literals
+//   with byte value 0 that are never emitted beyond the data boundary —
+//   the decompressor stops when it has reproduced all data).
+//
+// PARAMETERS:
+//   WINDOW  = 4096  (12-bit offset, max history distance)
+//   LOOKAHEAD = 18  (4-bit length field + MIN_MATCH)
+//   MIN_MATCH = 3   (minimum length to emit a back-reference)
+//
+// COMPLEXITY: O(n * WINDOW) compress, O(n) decompress.
+//
+// PRIVATE SYMBOLS: prefixed _lzss_ to avoid link collisions.
+// LEAF — imports NOTHING.
+
+// ── Constants (via functions, since no module-level lets across imports) ─────
+
+fn _lzss_window()    -> int  4096
+fn _lzss_lookahead() -> int  18
+fn _lzss_minmatch()  -> int  3
+
+// ── Private: find best match ─────────────────────────────────────────────────
+//
+// Search the sliding window for the longest match at position pos.
+// Returns [best_offset, best_length]:
+//   best_offset >= 1 means a match was found starting best_offset bytes back.
+//   best_length >= MIN_MATCH is required to use the match.
+//   Returns [0, 0] if no usable match.
+//
+fn _lzss_find_match(bytes, pos, n) -> list
+    let win = _lzss_window()
+    let la  = _lzss_lookahead()
+    let mm  = _lzss_minmatch()
+    let best_off = 0
+    let best_len = 0
+    let max_la = n - pos
+    if max_la > la
+        max_la = la
+    let search_start = pos - win
+    if search_start < 0
+        search_start = 0
+    let cand = search_start
+    while cand < pos
+        let mlen = 0
+        let running = 1
+        while running == 1 and mlen < max_la
+            let si = cand + mlen
+            let pi = pos + mlen
+            // si may wrap into the lookahead — LZSS allows overlapping copies
+            // but both positions must be within [0, n).
+            if pi >= n
+                running = 0
+            else
+                let b_cand = bytes[si]
+                let b_pos  = bytes[pi]
+                if b_cand != b_pos
+                    running = 0
+                else
+                    mlen = mlen + 1
+        if mlen > best_len and mlen >= mm
+            best_len = mlen
+            best_off = pos - cand
+        cand = cand + 1
+    let res = []
+    push(res, best_off)
+    push(res, best_len)
+    res
+
+// ── lzss_compress ─────────────────────────────────────────────────────────────
+
+fn lzss_compress(bytes) -> list
+    let n   = len(bytes)
+    let out = []
+    let pos = 0
+    while pos < n
+        // We process up to 8 items per flag group.
+        let flag_idx = len(out)
+        push(out, 0)           // placeholder for flag byte
+        let flag  = 0
+        let items = 0
+        while items < 8 and pos < n
+            let mr  = _lzss_find_match(bytes, pos, n)
+            let moff = mr[0]
+            let mlen = mr[1]
+            if moff > 0 and mlen >= _lzss_minmatch()
+                // Back-reference: set bit (MSB first = bit 7 - items)
+                let bit = 128
+                let shift = 7 - items
+                // Compute bit = 1 << shift manually (NOVA >> is arithmetic)
+                let si = 0
+                while si < shift
+                    bit = bit * 2
+                    si = si + 1
+                // bit = 128 << (7-items): re-derive correctly
+                // Actually: bit starts at 128, shift left means multiply by 2
+                // but shift=7-items: for items=0 bit=128, items=1 bit=64, etc.
+                // Let me recompute: we need (1 << (7-items))
+                let bv = 1
+                let bsh = 7 - items
+                let bi = 0
+                while bi < bsh
+                    bv = bv * 2
+                    bi = bi + 1
+                flag = flag + bv
+                // Encode: byte0 = (moff >> 8) << 4 | (mlen - _lzss_minmatch())
+                //         byte1 = moff & 0xFF
+                let length_field = mlen - _lzss_minmatch()
+                let off_hi = (moff / 256) * 16
+                let byte0 = off_hi + length_field
+                let byte1 = moff - (moff / 256) * 256
+                push(out, byte0)
+                push(out, byte1)
+                pos = pos + mlen
+            else
+                // Literal: bit = 0 (already 0)
+                push(out, bytes[pos])
+                pos = pos + 1
+            items = items + 1
+        // Write flag byte back
+        out[flag_idx] = flag
+    out
+
+// ── lzss_decompress ───────────────────────────────────────────────────────────
+
+fn lzss_decompress(bytes) -> list
+    let n   = len(bytes)
+    let out = []
+    let pos = 0
+    while pos < n
+        let flag = bytes[pos]
+        pos = pos + 1
+        let bit_idx = 0
+        while bit_idx < 8 and pos < n
+            // Extract bit (7-bit_idx): use shift = 7 - bit_idx
+            let shift = 7 - bit_idx
+            let bv = 1
+            let bi = 0
+            while bi < shift
+                bv = bv * 2
+                bi = bi + 1
+            // Mask with bv to test if that bit is set
+            let flag_masked = flag - (flag / (bv * 2)) * (bv * 2)
+            let is_ref = 0
+            if flag_masked >= bv
+                is_ref = 1
+            if is_ref == 1
+                // Back-reference: read 2 bytes
+                if pos + 1 >= n
+                    // Truncated stream — stop
+                    bit_idx = 8
+                else
+                    let byte0 = bytes[pos]
+                    let byte1 = bytes[pos + 1]
+                    pos = pos + 2
+                    // Decode offset and length
+                    let off_hi = byte0 / 16
+                    let length_field = byte0 - off_hi * 16
+                    let moff = off_hi * 256 + byte1
+                    let mlen = length_field + _lzss_minmatch()
+                    // Copy mlen bytes from (current_output_len - moff)
+                    let outlen = len(out)
+                    let cp_start = outlen - moff
+                    let ci = 0
+                    while ci < mlen
+                        push(out, out[cp_start + ci])
+                        ci = ci + 1
+                    bit_idx = bit_idx + 1
+            else
+                // Literal
+                push(out, bytes[pos])
+                pos = pos + 1
+                bit_idx = bit_idx + 1
+    out

@@ -1,0 +1,161 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/lz77_lazy
+// ============================================================================
+// LZ77 with lazy matching (Ziv & Lempel 1977, lazy variant).
+//
+// LAZY MATCHING:
+//   Standard (greedy) LZ77 takes the first longest match at position i and
+//   immediately emits it. Lazy matching defers the decision: before emitting
+//   a match of length L at position i, it checks whether position i+1 can
+//   find a longer match (length L+1 or more). If yes, it emits position i as
+//   a literal instead and takes the better match at i+1. This can be iterated
+//   but here we use one-step lookahead (the most common practical variant,
+//   used in zlib/deflate at compression levels 1-5).
+//
+//   KEY PROPERTY: lazy matching always produces a valid round-trip. It may
+//   produce different token streams than greedy LZ77 but decompress identically.
+//
+// TOKEN FORMAT:
+//   The token list is a flat list of ints with a simple tagged encoding:
+//
+//   A LITERAL token is:  [0, byte_value]   — offset=0 means literal
+//   A MATCH token is:    [offset, length]  — offset >= 1, length >= 2
+//
+//   Tokens are stored as consecutive pairs/pairs in a flat list.
+//   Since offset==0 unambiguously marks a literal and offset>=1 marks a match,
+//   no additional tagging is required.
+//
+//   We use a flat list (list of 2-element lists) for clarity, consistent with
+//   the existing std/compress/lz77 module's style.
+//
+// PUBLIC API:
+//   lz77l_compress(bytes, window) -> list of tokens
+//     Compress a byte-list using lazy LZ77 with the given window size.
+//     Each token is a 2-element list: [0, byte] or [offset, length].
+//
+//   lz77l_decompress(tokens) -> list
+//     Reconstruct the original byte-list from a token list.
+//     lz77l_decompress(lz77l_compress(bytes, w)) == bytes for all inputs.
+//
+//   lz77l_compress_default(bytes) -> list of tokens
+//     Shorthand for lz77l_compress(bytes, 255).
+//
+// ALGORITHM DETAILS:
+//   1. Find best match at pos i within window.
+//   2. If match length < 2 (MIN_MATCH): emit literal, advance 1.
+//   3. Else: find best match at pos i+1.
+//      a. If match at i+1 is strictly longer: emit literal at i, continue
+//         (next iteration will emit the longer match at i+1).
+//      b. Else: emit match at i, advance by match length.
+//   MIN_MATCH = 2 (a match must be at least 2 bytes to be profitable vs
+//   a 2-element literal token).
+//
+// SYMBOL COLLISION GUARD:
+//   All internal helpers use _lz77l_ prefix.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _lz77l_find_match: scan window backwards from pos, return [best_off, best_len].
+// Returns [0, 0] if no match of length >= 1 found.
+// offset is the distance back from pos (>= 1).
+fn _lz77l_find_match(bytes, pos, blen, window) -> list
+    let best_off = 0
+    let best_len = 0
+    let max_la = blen - pos
+    let search_start = pos - window
+    if search_start < 0
+        search_start = 0
+    let cand = search_start
+    while cand < pos
+        let mlen = 0
+        let running = 1
+        while running == 1 and mlen < max_la
+            let si = cand + mlen
+            let pi = pos + mlen
+            if bytes[si] != bytes[pi]
+                running = 0
+            else
+                mlen = mlen + 1
+        if mlen > best_len
+            best_len = mlen
+            best_off = pos - cand
+        cand = cand + 1
+    [best_off, best_len]
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// lz77l_compress: lazy LZ77 compress a byte-list.
+//
+// Returns a list of tokens; each token is [0, byte] (literal) or
+// [offset, length] (back-reference, offset >= 1, length >= 2).
+fn lz77l_compress(bytes, window) -> list
+    let tokens = []
+    let blen = len(bytes)
+    if blen == 0
+        return tokens
+    let pos = 0
+    while pos < blen
+        // Find best match at current position.
+        let mr = _lz77l_find_match(bytes, pos, blen, window)
+        let moff = mr[0]
+        let mlen = mr[1]
+        if mlen < 2
+            // No useful match: emit literal.
+            let tok = [0, bytes[pos]]
+            push(tokens, tok)
+            pos = pos + 1
+        else
+            // Potential match of length mlen at offset moff.
+            // Lazy: check if i+1 has a longer match.
+            let next_pos = pos + 1
+            let lazy_off = 0
+            let lazy_len = 0
+            if next_pos < blen
+                let lr = _lz77l_find_match(bytes, next_pos, blen, window)
+                lazy_off = lr[0]
+                lazy_len = lr[1]
+            if lazy_len > mlen
+                // Better match one position ahead: emit current pos as literal
+                // and let the next iteration take the longer match.
+                let tok2 = [0, bytes[pos]]
+                push(tokens, tok2)
+                pos = pos + 1
+            else
+                // Current match wins (or tie): emit back-reference.
+                let tok3 = [moff, mlen]
+                push(tokens, tok3)
+                pos = pos + mlen
+    tokens
+
+// lz77l_decompress: reconstruct byte-list from lazy-LZ77 token list.
+//
+// Literal token [0, byte]: emit byte.
+// Match token  [off, len]: copy len bytes from (current_len - off).
+// Note: overlapping copies are valid (e.g. offset=1, len=4 from "a" → "aaaa").
+fn lz77l_decompress(tokens) -> list
+    let out = []
+    let ti = 0
+    let tlen = len(tokens)
+    while ti < tlen
+        let tok = tokens[ti]
+        let toff = tok[0]
+        let tval = tok[1]
+        if toff == 0
+            // Literal: tval is the byte.
+            push(out, tval)
+        else
+            // Back-reference: copy tval bytes from position (outlen - toff).
+            let outlen = len(out)
+            let cp_start = outlen - toff
+            let ci = 0
+            while ci < tval
+                push(out, out[cp_start + ci])
+                ci = ci + 1
+        ti = ti + 1
+    out
+
+// lz77l_compress_default: lazy LZ77 with default window size of 255.
+fn lz77l_compress_default(bytes) -> list
+    lz77l_compress(bytes, 255)

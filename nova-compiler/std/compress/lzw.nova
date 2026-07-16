@@ -1,169 +1,175 @@
 // ============================================================================
 // NOVA Standard Library — std/compress/lzw
 // ============================================================================
-// LZW (Lempel-Ziv-Welch) compression.
+// LZW (Lempel-Ziv-Welch) compression on byte-lists.
 //
 // PUBLIC API:
-//   lzw_compress(s: string) -> list       compress to list of int codes
-//                                          (initial dict = single bytes 0..255)
-//   lzw_decompress(codes: list) -> string  decompress list of int codes
-//   lzw_compress_ascii(s: string) -> list  same as lzw_compress (ASCII alias)
+//   lzw_compress(bytes: list) -> list
+//       Compress a byte-list (ints 0..255) to a list of integer codes.
+//       Initial dictionary: 256 single-byte entries (code b -> byte b).
+//
+//   lzw_decompress(codes: list) -> list
+//       Decompress a list of LZW codes back to the original byte-list.
+//       Handles the KwKwK edge case (code == next_code not yet in dict).
 //
 // ALGORITHM (classic LZW, Welch 1984):
 //   COMPRESS:
-//     Initialise dict with 256 single-byte entries: byte b -> code b.
-//     Walk input: find the longest string W already in the dict.
-//     When the next character C would extend W beyond the dict:
-//       emit code(W), add W+C to dict with next available code, set W = C.
-//     After the loop emit code(W).
+//     Init dict: single byte b -> code b, for b in 0..255. next_code = 256.
+//     Walk bytes: maintain current phrase W (as a dict key).
+//     If W + [b] is in dict: extend W.
+//     Else: emit code(W), add W+[b] with next_code++, reset W = [b].
+//     After loop: emit code(W).
 //
 //   DECOMPRESS:
-//     Initialise dict with 256 single-byte entries: code b -> string(byte b).
-//     For each code:
-//       Look up the entry. If not yet in dict (the KwKwK edge case),
-//       the entry is prev_string + prev_string[0].
-//       Add prev_string + entry[0] to dict with next available code.
-//       Emit the entry.
+//     Init dict: code b -> [b] for b in 0..255. next_code = 256.
+//     prev = decode first code and emit it.
+//     For each subsequent code:
+//       If code is in dict: entry = dict[code].
+//       Else (KwKwK): entry = prev + [prev[0]].
+//       Emit entry.
+//       Add prev + [entry[0]] to dict with next_code++.
+//       prev = entry.
 //
-// NUL-SAFETY:
-//   NOVA strings are C-string shaped: a 0x00 byte truncates the string at
-//   that point (reference_nova_string_nul_truncation). LZW's initial dict
-//   includes byte 0x00, which would produce a NUL key — fatal for dict
-//   lookups. We therefore maintain a SECONDARY ESCAPED representation for
-//   dict keys:
-//     Each byte b in the original sequence is encoded as the two-char pair
-//     chr(1) + chr(b). No key ever contains a raw chr(0). The compress
-//     encoding dict maps escaped_key -> int code; the decompress dict maps
-//     int code -> raw string (the raw string is only ever emitted or
-//     concatenated to build output — it is never used as a key, so NUL
-//     bytes in the output string are harmless for the round-trip of
-//     ASCII/Latin-1 inputs that don't contain chr(0) in their content).
+// DICT KEY ENCODING:
+//   The encoding dict maps phrase -> int code.
+//   Phrases are byte-lists; we encode them as decimal-comma strings
+//   (e.g. [65,66] -> "65,66") to avoid NUL-byte issues in NOVA dict keys.
+//   The decode dict maps int code (as a string key) -> byte-list.
 //
-//   For all-ASCII inputs (the dominant use-case) no byte is 0x00, so the
-//   raw output from lzw_decompress is a valid NOVA string with no
-//   truncation. The escape encoding only protects dict keys.
+// EDGE CASE (KwKwK):
+//   When the decompressor encounters a code that equals next_code (not yet
+//   in the dict), the phrase is prev + [prev[0]]. This happens when the
+//   compressor emits code(W) for a phrase W that is also the NEXT phrase
+//   being added. Classic example: "ababab" -> codes for "a","b","ab","aba"
+//   where the cScSc pattern triggers this case.
 //
-// COMPLEXITY: O(n) compress, O(n) decompress (hash dict lookups = O(1) avg).
+// COMPLEXITY: O(n) compress and decompress (hash dict lookups O(1) average).
 //
-// Private helpers prefixed _lzw_ to avoid link collisions.
-//
+// PRIVATE SYMBOLS: prefixed _lzw_ to avoid link collisions.
 // LEAF — imports NOTHING.
 
-// ── Key encoding helpers ─────────────────────────────────────────────────────
-//
-// _lzw_encode_key: turn a raw byte string into a NUL-safe escaped key.
-//   Each character c in s contributes chr(1) + c to the key.
-//   This means every key character is in range 1..255; no chr(0) appears.
-//
-fn _lzw_encode_key(s) -> string
-    let n = len(s)
-    let k = ""
-    let i = 0
-    while i < n
-        k = k + chr(1) + s[i]
+// ── Private: encode a phrase (byte-list, first phrase_len bytes) as dict key ─
+
+fn _lzw_phrase_key(phrase, phrase_len) -> string
+    if phrase_len == 0
+        return ""
+    let k = str(phrase[0])
+    let i = 1
+    while i < phrase_len
+        k = k + "," + str(phrase[i])
         i = i + 1
     k
 
-// _lzw_key_append: extend an existing escaped key by one raw character c.
-//   Equivalent to _lzw_encode_key(raw_s + c) but avoids re-encoding the
-//   already-escaped prefix.
-//
-fn _lzw_key_append(escaped_key, c) -> string
-    escaped_key + chr(1) + c
+// Extend an existing phrase key by one byte.
+fn _lzw_key_extend(key, b) -> string
+    if len(key) == 0
+        return str(b)
+    key + "," + str(b)
 
-// ── lzw_compress ─────────────────────────────────────────────────────────────
-//
-// Compress string s using LZW with a 256-entry initial dictionary.
-// Returns a list of integer codes.
-//
-// EMPTY INPUT: returns [].
-// SINGLE BYTE: returns [ord(s[0])].
-//
-fn lzw_compress(s) -> list
-    let n = len(s)
+// ── lzw_compress ──────────────────────────────────────────────────────────────
+
+fn lzw_compress(bytes) -> list
+    let n    = len(bytes)
     let codes = []
     if n == 0
         return codes
-    // Initialise encode dict: escaped_key(chr(b)) -> b, for b in 0..255.
+    // Init encode dict: single-byte phrases.
     let enc = {}
-    let b = 0
-    while b < 256
-        let raw_b = chr(b)
-        let k = _lzw_encode_key(raw_b)
-        enc[k] = b
-        b = b + 1
-    // next available code
+    let b0 = 0
+    while b0 < 256
+        let k = str(b0)
+        enc[k] = b0
+        b0 = b0 + 1
     let next_code = 256
-    // current match sequence (raw) and its escaped key
-    let w_raw = s[0]
-    let w_key = _lzw_encode_key(w_raw)
+    // Current phrase key and its code.
+    let w_key  = str(bytes[0])
+    let w_code = bytes[0]
     let i = 1
     while i < n
-        let c = s[i]
-        let wc_key = _lzw_key_append(w_key, c)
+        let b     = bytes[i]
+        let wc_key = _lzw_key_extend(w_key, b)
         if contains(enc, wc_key)
-            // extend match
-            w_raw = w_raw + c
-            w_key = wc_key
+            // Extend the current phrase.
+            w_key  = wc_key
+            w_code = enc[wc_key]
         else
-            // emit code for current match
-            push(codes, enc[w_key])
-            // add new dict entry for w_raw + c
+            // Emit code for current phrase.
+            push(codes, w_code)
+            // Add new phrase to dict.
             enc[wc_key] = next_code
             next_code = next_code + 1
-            // reset to single char
-            w_raw = c
-            w_key = _lzw_encode_key(c)
+            // Reset to single-byte phrase.
+            w_key  = str(b)
+            w_code = b
         i = i + 1
-    // emit code for the final match
-    push(codes, enc[w_key])
+    // Emit the final phrase.
+    push(codes, w_code)
     codes
 
-// ── lzw_decompress ───────────────────────────────────────────────────────────
-//
-// Decompress a list of LZW integer codes back to the original string.
-// Assumes the codes were produced by lzw_compress (256-entry initial dict).
-//
-// EMPTY INPUT: returns "".
-// KwKwK EDGE CASE: handled — when a code equals next_code (not yet in dict),
-//   the entry is prev_string + prev_string[0].
-//
-fn lzw_decompress(codes) -> string
-    let nc = len(codes)
+// ── lzw_decompress ────────────────────────────────────────────────────────────
+
+fn lzw_decompress(codes) -> list
+    let nc  = len(codes)
+    let out = []
     if nc == 0
-        return ""
-    // Initialise decode dict: b -> chr(b), for b in 0..255.
+        return out
+    // Init decode dict: code b -> [b] for b in 0..255.
+    // We store as dec[str(code)] = byte-list.
     let dec = {}
-    let b = 0
-    while b < 256
-        dec[str(b)] = chr(b)
-        b = b + 1
+    let b0 = 0
+    while b0 < 256
+        let phrase = []
+        push(phrase, b0)
+        dec[str(b0)] = phrase
+        b0 = b0 + 1
     let next_code = 256
-    // Process first code
-    let first = codes[0]
-    let out = dec[str(first)]
-    let prev = out
+    // Process first code.
+    let first    = codes[0]
+    let prev     = dec[str(first)]
+    // Emit first phrase.
+    let fi = 0
+    let prev_len = len(prev)
+    while fi < prev_len
+        push(out, prev[fi])
+        fi = fi + 1
     let i = 1
     while i < nc
-        let code = codes[i]
-        let entry = ""
-        if contains(dec, str(code))
-            entry = dec[str(code)]
+        let code  = codes[i]
+        let entry = []
+        let code_key = str(code)
+        if contains(dec, code_key)
+            // Normal case: code is already in dict.
+            let src = dec[code_key]
+            let si = 0
+            let src_len = len(src)
+            while si < src_len
+                push(entry, src[si])
+                si = si + 1
         else
-            // KwKwK: code == next_code, entry = prev + prev[0]
-            entry = prev + prev[0]
-        out = out + entry
-        // Add prev + entry[0] to dict
-        dec[str(next_code)] = prev + entry[0]
+            // KwKwK edge case: code == next_code (not in dict yet).
+            // Entry = prev + [prev[0]].
+            let plen = len(prev)
+            let pi = 0
+            while pi < plen
+                push(entry, prev[pi])
+                pi = pi + 1
+            push(entry, prev[0])
+        // Emit entry.
+        let ei = 0
+        let elen = len(entry)
+        while ei < elen
+            push(out, entry[ei])
+            ei = ei + 1
+        // Add prev + [entry[0]] to dict.
+        let new_phrase = []
+        let npi = 0
+        let nplen = len(prev)
+        while npi < nplen
+            push(new_phrase, prev[npi])
+            npi = npi + 1
+        push(new_phrase, entry[0])
+        dec[str(next_code)] = new_phrase
         next_code = next_code + 1
         prev = entry
         i = i + 1
     out
-
-// ── lzw_compress_ascii ────────────────────────────────────────────────────────
-//
-// ASCII alias for lzw_compress. Identical algorithm and initial dict.
-// Provided as a named variant for callers that want to document intent.
-//
-fn lzw_compress_ascii(s) -> list
-    lzw_compress(s)

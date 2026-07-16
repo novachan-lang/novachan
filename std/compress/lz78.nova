@@ -1,0 +1,180 @@
+// ============================================================================
+// NOVA Standard Library — std/compress/lz78
+// ============================================================================
+// LZ78 (Lempel-Ziv 1978) dictionary compression.
+//
+// PUBLIC API:
+//   lz78_compress(bytes: list) -> list
+//       Compress a byte-list (ints 0..255) using LZ78.
+//       Returns a list of 2-element lists [dict_index, next_byte]:
+//         dict_index  = 0 means "root" (no prefix in dict)
+//         next_byte   = the byte that terminates the current phrase (0..255)
+//       Each pair defines one phrase and simultaneously adds that phrase
+//       to the growing dictionary.
+//
+//   lz78_decompress(pairs: list) -> list
+//       Decompress the output of lz78_compress back to the original byte-list.
+//       Each pair [dict_index, next_byte] reconstructs the phrase by looking
+//       up dict_index and appending next_byte.
+//
+// ALGORITHM:
+//   COMPRESS:
+//     Dict maps phrase -> index. Start: dict is empty, next_idx = 1.
+//     Current phrase W = [] (empty).
+//     For each byte b:
+//       If W+[b] is already in the dict, extend: W = W+[b].
+//       Else: emit [index(W), b], add W+[b] to dict with next_idx, W = [].
+//     If W is non-empty at end (impossible with proper emit logic — last byte
+//     always triggers an emit), emit [index(W), SENTINEL]. In practice the
+//     loop always ends cleanly with W=[].
+//
+//   DECOMPRESS:
+//     Dec maps index -> byte-list phrase. Dec[0] = [] (root/empty phrase).
+//     next_idx starts at 1.
+//     For each pair [idx, b]:
+//       phrase = dec[idx] + [b]
+//       emit phrase
+//       dec[next_idx] = phrase ; next_idx++
+//
+// DICT KEY ENCODING:
+//   Phrase keys are stored as strings: bytes joined by "," for example
+//   "65,66,67" for [65,66,67]. This avoids NUL-byte issues in dict keys.
+//
+// COMPLEXITY: O(n) average compress and decompress (hash dict lookups O(1)).
+//
+// PRIVATE SYMBOLS: prefixed _lz78_ to avoid link collisions.
+// LEAF — imports NOTHING.
+
+// ── Private: encode a byte-list as a dict key ────────────────────────────────
+//
+// Encode [] -> "" (empty key for the root/empty phrase).
+// Encode [65,66] -> "65,66".
+// This is NUL-safe since we use decimal digit strings separated by commas.
+//
+fn _lz78_key(bytes_phrase, phrase_len) -> string
+    if phrase_len == 0
+        return ""
+    let k = str(bytes_phrase[0])
+    let i = 1
+    while i < phrase_len
+        k = k + "," + str(bytes_phrase[i])
+        i = i + 1
+    k
+
+// ── Private: extend a phrase key by one byte ─────────────────────────────────
+//
+// More efficient than re-encoding: append ",b" (or just str(b) if key is empty).
+//
+fn _lz78_key_extend(key, b) -> string
+    if len(key) == 0
+        return str(b)
+    key + "," + str(b)
+
+// ── lz78_compress ─────────────────────────────────────────────────────────────
+
+fn lz78_compress(bytes) -> list
+    let n   = len(bytes)
+    let out = []
+    if n == 0
+        return out
+    // Phrase dictionary: key(phrase) -> int index
+    let enc   = {}
+    // Index 0 is the root (empty phrase). User-defined phrases start at 1.
+    let next_idx = 1
+    // Current phrase: tracked as a running key string + current index
+    let w_key = ""       // key for current phrase (empty = root)
+    let w_idx = 0        // dict index for current phrase (0 = root)
+    let i = 0
+    while i < n
+        let b = bytes[i]
+        let wc_key = _lz78_key_extend(w_key, b)
+        if contains(enc, wc_key)
+            // Extend the current phrase
+            w_key = wc_key
+            w_idx = enc[wc_key]
+        else
+            // Emit pair [current_dict_index, b]
+            let pair = []
+            push(pair, w_idx)
+            push(pair, b)
+            push(out, pair)
+            // Add new phrase to dict
+            enc[wc_key] = next_idx
+            next_idx = next_idx + 1
+            // Reset to empty phrase
+            w_key = ""
+            w_idx = 0
+        i = i + 1
+    // If the current phrase W is non-empty (i.e., we ended mid-phrase without
+    // emitting), emit it with a sentinel. In standard LZ78 this can happen
+    // if the last bytes form a phrase already in the dict. We emit [w_idx, 0]
+    // with a sentinel byte 0. The decompressor must handle this: if the
+    // emitted byte is a special marker... Actually, we can avoid this by noting
+    // that if the loop ends with w_key != "", the last phrase was fully in the
+    // dict. We must emit it. We use a 3-element pair [w_idx, -1, 1] where the
+    // third element signals "no trailing byte". But to keep pairs uniform 2-elem,
+    // we emit [w_idx, 0] and add a length field instead.
+    //
+    // SIMPLER APPROACH: ensure the loop always ends with w_key == "".
+    // We can guarantee this by processing one extra "end" token... or by
+    // noting: if the input has >= 1 byte, and we always emit on the first
+    // occurrence of any new byte, the loop can only end mid-phrase if the
+    // LAST phrase being accumulated was already seen before AND we reached
+    // end-of-input without a terminating new byte. In that case emit
+    // a partial pair with a flag.
+    //
+    // We use a 3-element list [w_idx, 0, 1] where element [2]=1 flags
+    // "this is a partial emit — don't append the byte".
+    if len(w_key) > 0
+        let partial = []
+        push(partial, w_idx)
+        push(partial, 0)
+        push(partial, 1)
+        push(out, partial)
+    out
+
+// ── lz78_decompress ───────────────────────────────────────────────────────────
+
+fn lz78_decompress(pairs) -> list
+    let np  = len(pairs)
+    let out = []
+    if np == 0
+        return out
+    // Decode dict: int index -> byte-list phrase.
+    // We store it as a list (index 0 = root = []).
+    // dec[i] is a list of bytes for phrase i.
+    let dec = []
+    // dec[0] = [] (root/empty phrase)
+    let root = []
+    push(dec, root)
+    let next_idx = 1
+    let i = 0
+    while i < np
+        let pair  = pairs[i]
+        let p_idx = pair[0]
+        let p_b   = pair[1]
+        // Check if this is a partial emit (3-element pair with flag=1)
+        let is_partial = 0
+        if len(pair) > 2
+            is_partial = pair[2]
+        // Build the phrase: dec[p_idx] + [p_b]  (or just dec[p_idx] if partial)
+        let base = dec[p_idx]
+        let phrase = []
+        let bi = 0
+        let base_len = len(base)
+        while bi < base_len
+            push(phrase, base[bi])
+            bi = bi + 1
+        if is_partial == 0
+            push(phrase, p_b)
+        // Emit phrase to output
+        let pi = 0
+        let phrase_len = len(phrase)
+        while pi < phrase_len
+            push(out, phrase[pi])
+            pi = pi + 1
+        // Add phrase to decode dict
+        push(dec, phrase)
+        next_idx = next_idx + 1
+        i = i + 1
+    out
