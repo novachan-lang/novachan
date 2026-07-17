@@ -1,0 +1,548 @@
+// ============================================================================
+// NOVA Standard Library — std/phonetic/phonetic_compare
+// ============================================================================
+// Cross-algorithm name comparison utilities.
+//
+// Provides self-contained mini-implementations of several phonetic and
+// string-similarity algorithms for comparing name strings.
+//
+// Public API:
+//   pc_soundex(name)           -> string  Soundex code (letter+3 digits)
+//   pc_metaphone_lite(name)    -> string  simplified Metaphone code
+//   pc_same_soundex(a,b)       -> bool(int)  1 if Soundex codes are equal
+//   pc_edit_distance(a,b)      -> int     Levenshtein edit distance
+//   pc_jaro(a,b)               -> float   Jaro similarity [0..1]
+//   pc_jaro_winkler(a,b)       -> float   Jaro-Winkler similarity [0..1]
+//   pc_common_prefix_len(a,b)  -> int     length of shared prefix (capped at 4)
+//   pc_similarity(a,b)         -> float   combined name-similarity score [0..1]
+//   pc_match(a,b,threshold)    -> bool(int) 1 if pc_similarity >= threshold
+//
+// LEAF — imports nothing; all helpers prefixed pc_.
+// ============================================================================
+
+// ── Internal helpers ─────────────────────────────────────────────────────────
+
+// pc_upper_char returns the uppercase form of one ASCII character.
+fn pc_upper_char(c) -> string
+    let o = ord(c)
+    let r = c
+    if o >= 97 and o <= 122
+        r = chr(o - 32)
+    r
+
+// pc_is_letter returns 1 if c is an ASCII letter.
+fn pc_is_letter(c) -> int
+    let o = ord(c)
+    let r = 0
+    if (o >= 65 and o <= 90) or (o >= 97 and o <= 122)
+        r = 1
+    r
+
+// pc_is_vowel returns 1 if the uppercase character c is A, E, I, O, or U.
+fn pc_is_vowel(c) -> int
+    let r = 0
+    if c == "A" or c == "E" or c == "I" or c == "O" or c == "U"
+        r = 1
+    r
+
+// pc_to_upper strips non-letters and uppercases the string.
+fn pc_to_upper(s) -> string
+    let n = len(s)
+    let out = ""
+    let i = 0
+    while i < n
+        let c = char_at(s, i)
+        if pc_is_letter(c) == 1
+            out = out + pc_upper_char(c)
+        i = i + 1
+    out
+
+// ── pc_soundex ───────────────────────────────────────────────────────────────
+
+// _pc_sx_code returns the Soundex digit for an uppercase letter (0 = ignored).
+fn _pc_sx_code(c) -> int
+    let r = 0
+    if c == "B" or c == "F" or c == "P" or c == "V"
+        r = 1
+    else if c == "C" or c == "G" or c == "J" or c == "K" or c == "Q" or c == "S" or c == "X" or c == "Z"
+        r = 2
+    else if c == "D" or c == "T"
+        r = 3
+    else if c == "L"
+        r = 4
+    else if c == "M" or c == "N"
+        r = 5
+    else if c == "R"
+        r = 6
+    r
+
+// pc_soundex computes the American Soundex code for a name.
+// Returns letter + 3 digits.  Empty/blank input returns "0000".
+// H and W are transparent (do not break a same-code run).
+// Vowels (A,E,I,O,U,Y) reset prev_code so adjacent same-coded consonants count.
+fn pc_soundex(name) -> string
+    let s = pc_to_upper(name)
+    let n = len(s)
+    let result = "0000"
+    if n > 0
+        let first = char_at(s, 0)
+        let first_code = _pc_sx_code(first)
+        let digits = ""
+        let prev_code = first_code
+        let i = 1
+        while i < n and len(digits) < 3
+            let c = char_at(s, i)
+            let is_hw = 0
+            if c == "H" or c == "W"
+                is_hw = 1
+            if is_hw == 0
+                let code = _pc_sx_code(c)
+                if code == 0
+                    // Vowel/Y: reset so next same-coded consonant IS counted.
+                    prev_code = 0
+                else if code != prev_code
+                    digits = digits + str(code)
+                    prev_code = code
+            i = i + 1
+        // Pad to exactly 3 digits.
+        let dlen = len(digits)
+        if dlen < 3
+            let pad = 3 - dlen
+            if pad == 3
+                digits = digits + "000"
+            else if pad == 2
+                digits = digits + "00"
+            else
+                digits = digits + "0"
+        result = first + slice(digits, 0, 3)
+    result
+
+// pc_same_soundex returns 1 if a and b share the same Soundex code.
+fn pc_same_soundex(a, b) -> int
+    let r = 0
+    if pc_soundex(a) == pc_soundex(b)
+        r = 1
+    r
+
+// ── pc_metaphone_lite ────────────────────────────────────────────────────────
+
+// pc_metaphone_lite computes a simplified Metaphone code for a name.
+// Rules applied (subset of Metaphone, Philips 1990):
+//   - Uppercase and strip non-letters.
+//   - Drop initial silent pairs: AE, GN, KN, PN, WR -> drop first letter.
+//   - Initial vowel kept; remaining vowels dropped.
+//   - B -> B (but silent after M at end of word).
+//   - C -> S before E/I/Y; CK -> K; else -> K.
+//   - D -> J before GE/GY/GI; else -> T.
+//   - F -> F.
+//   - G -> silent before H (non-initial); silent before N/NED end; GH -> K (non-initial); GN -> N; else -> K.
+//   - H -> keep if before vowel and not after vowel or certain letters.
+//   - J -> J (treated as Y initially, simplified to J here).
+//   - K -> K (silent after C).
+//   - L -> L.
+//   - M -> M.
+//   - N -> N.
+//   - PH -> F; else P -> P.
+//   - Q -> K.
+//   - R -> R.
+//   - S -> SH before H/IO/IA; else S.
+//   - T -> SH before IA/IO; TH -> 0 (we use T here for simplicity); else T.
+//   - V -> F.
+//   - W -> keep only before vowel.
+//   - X -> KS.
+//   - Y -> keep only before vowel.
+//   - Z -> S.
+// Collapse adjacent duplicates.
+fn pc_metaphone_lite(name) -> string
+    let s = pc_to_upper(name)
+    let n = len(s)
+    if n == 0
+        return ""
+
+    // Drop initial silent pairs.
+    let start = 0
+    if n >= 2
+        let p2 = slice(s, 0, 2)
+        if p2 == "AE" or p2 == "GN" or p2 == "KN" or p2 == "PN" or p2 == "WR"
+            start = 1
+
+    let out = ""
+    let prev_out = ""
+    let i = start
+    while i < n
+        let c = char_at(s, i)
+        let next_c = ""
+        if i + 1 < n
+            next_c = char_at(s, i + 1)
+        let next2 = ""
+        if i + 2 < n
+            next2 = char_at(s, i + 2)
+        let prev_s = ""
+        if i > 0
+            prev_s = char_at(s, i - 1)
+
+        // Initial vowel -> keep as-is; other vowels -> drop.
+        if pc_is_vowel(c) == 1
+            if i == start
+                let emit = c
+                if emit != prev_out
+                    out = out + emit
+                    prev_out = emit
+            i = i + 1
+        else if c == "B"
+            // Silent after M at end.
+            let silent_b = 0
+            if prev_s == "M" and i + 1 == n
+                silent_b = 1
+            if silent_b == 0
+                if "B" != prev_out
+                    out = out + "B"
+                    prev_out = "B"
+            i = i + 1
+        else if c == "C"
+            if next_c == "K"
+                if "K" != prev_out
+                    out = out + "K"
+                    prev_out = "K"
+                i = i + 2
+            else if next_c == "E" or next_c == "I" or next_c == "Y"
+                if "S" != prev_out
+                    out = out + "S"
+                    prev_out = "S"
+                i = i + 1
+            else
+                if "K" != prev_out
+                    out = out + "K"
+                    prev_out = "K"
+                i = i + 1
+        else if c == "D"
+            if next_c == "G" and (next2 == "E" or next2 == "I" or next2 == "Y")
+                if "J" != prev_out
+                    out = out + "J"
+                    prev_out = "J"
+                i = i + 2
+            else
+                if "T" != prev_out
+                    out = out + "T"
+                    prev_out = "T"
+                i = i + 1
+        else if c == "F"
+            if "F" != prev_out
+                out = out + "F"
+                prev_out = "F"
+            i = i + 1
+        else if c == "G"
+            if next_c == "H" and i > 0
+                // GH silent or -> K in some positions; simplified: -> K if not at start
+                if pc_is_vowel(prev_s) == 0
+                    if "K" != prev_out
+                        out = out + "K"
+                        prev_out = "K"
+                i = i + 2
+            else if next_c == "N"
+                // GN or GNED at end -> silent G
+                i = i + 1
+            else if prev_s == "G"
+                // Already handled as part of prev G
+                i = i + 1
+            else
+                if "K" != prev_out
+                    out = out + "K"
+                    prev_out = "K"
+                i = i + 1
+        else if c == "H"
+            // Keep H if followed by a vowel and not preceded by a vowel/AEIOU.
+            if next_c != "" and pc_is_vowel(next_c) == 1 and pc_is_vowel(prev_s) == 0
+                if "H" != prev_out
+                    out = out + "H"
+                    prev_out = "H"
+            i = i + 1
+        else if c == "J"
+            if "J" != prev_out
+                out = out + "J"
+                prev_out = "J"
+            i = i + 1
+        else if c == "K"
+            if prev_s != "C"
+                if "K" != prev_out
+                    out = out + "K"
+                    prev_out = "K"
+            i = i + 1
+        else if c == "L"
+            if "L" != prev_out
+                out = out + "L"
+                prev_out = "L"
+            i = i + 1
+        else if c == "M"
+            if "M" != prev_out
+                out = out + "M"
+                prev_out = "M"
+            i = i + 1
+        else if c == "N"
+            if "N" != prev_out
+                out = out + "N"
+                prev_out = "N"
+            i = i + 1
+        else if c == "P"
+            if next_c == "H"
+                if "F" != prev_out
+                    out = out + "F"
+                    prev_out = "F"
+                i = i + 2
+            else
+                if "P" != prev_out
+                    out = out + "P"
+                    prev_out = "P"
+                i = i + 1
+        else if c == "Q"
+            if "K" != prev_out
+                out = out + "K"
+                prev_out = "K"
+            i = i + 1
+        else if c == "R"
+            if "R" != prev_out
+                out = out + "R"
+                prev_out = "R"
+            i = i + 1
+        else if c == "S"
+            if next_c == "H" or (next_c == "I" and (next2 == "A" or next2 == "O"))
+                if "X" != prev_out
+                    out = out + "X"
+                    prev_out = "X"
+                i = i + 1
+            else
+                if "S" != prev_out
+                    out = out + "S"
+                    prev_out = "S"
+                i = i + 1
+        else if c == "T"
+            if next_c == "H"
+                if "T" != prev_out
+                    out = out + "T"
+                    prev_out = "T"
+                i = i + 2
+            else if next_c == "I" and (next2 == "A" or next2 == "O")
+                if "X" != prev_out
+                    out = out + "X"
+                    prev_out = "X"
+                i = i + 1
+            else
+                if "T" != prev_out
+                    out = out + "T"
+                    prev_out = "T"
+                i = i + 1
+        else if c == "V"
+            if "F" != prev_out
+                out = out + "F"
+                prev_out = "F"
+            i = i + 1
+        else if c == "W"
+            // Keep W only before vowel.
+            if next_c != "" and pc_is_vowel(next_c) == 1
+                if "W" != prev_out
+                    out = out + "W"
+                    prev_out = "W"
+            i = i + 1
+        else if c == "X"
+            if "K" != prev_out
+                out = out + "K"
+                prev_out = "K"
+            if "S" != prev_out
+                out = out + "S"
+                prev_out = "S"
+            i = i + 1
+        else if c == "Y"
+            // Keep Y only before vowel.
+            if next_c != "" and pc_is_vowel(next_c) == 1
+                if "Y" != prev_out
+                    out = out + "Y"
+                    prev_out = "Y"
+            i = i + 1
+        else if c == "Z"
+            if "S" != prev_out
+                out = out + "S"
+                prev_out = "S"
+            i = i + 1
+        else
+            i = i + 1
+
+    out
+
+// ── pc_edit_distance ─────────────────────────────────────────────────────────
+
+// pc_edit_distance returns the Levenshtein edit distance between a and b.
+// Two rolling-row DP: O(min(m,n)) space.
+fn pc_edit_distance(a, b) -> int
+    let m = len(a)
+    let n = len(b)
+    if m == 0
+        return n
+    if n == 0
+        return m
+    // prev[j] = cost to transform "" into b[0..j-1].
+    let prev = []
+    let j = 0
+    while j <= n
+        prev = prev + [j]
+        j = j + 1
+    let i = 1
+    while i <= m
+        let curr = [i]
+        let ca = ord(a[i - 1])
+        let k = 1
+        while k <= n
+            let cb = ord(b[k - 1])
+            let sub_cost = 1
+            if ca == cb
+                sub_cost = 0
+            let del_v = prev[k] + 1
+            let ins_v = curr[k - 1] + 1
+            let rep_v = prev[k - 1] + sub_cost
+            let best = del_v
+            if ins_v < best
+                best = ins_v
+            if rep_v < best
+                best = rep_v
+            curr = curr + [best]
+            k = k + 1
+        prev = curr
+        i = i + 1
+    prev[n]
+
+// ── pc_jaro ──────────────────────────────────────────────────────────────────
+
+// pc_jaro returns the Jaro similarity between strings a and b in [0.0, 1.0].
+// Both empty -> 1.0.  One empty -> 0.0.
+// Match window = max(floor(max(|a|,|b|)/2)-1, 0).
+// Jaro = (m/|a| + m/|b| + (m - t/2)/m) / 3 where m=matches, t=transpositions.
+fn pc_jaro(a, b) -> float
+    let l1 = len(a)
+    let l2 = len(b)
+    if l1 == 0 and l2 == 0
+        return 1.0
+    if l1 == 0 or l2 == 0
+        return 0.0
+    let mx = l1
+    if l2 > mx
+        mx = l2
+    let window = mx / 2 - 1
+    if window < 0
+        window = 0
+    // Matched flags for positions in a and b.
+    let s1m = []
+    let s2m = []
+    let ii = 0
+    while ii < l1
+        s1m.push(0)
+        ii = ii + 1
+    ii = 0
+    while ii < l2
+        s2m.push(0)
+        ii = ii + 1
+    // Count matches.
+    let m = 0
+    ii = 0
+    while ii < l1
+        let lo = ii - window
+        if lo < 0
+            lo = 0
+        let hi = ii + window + 1
+        if hi > l2
+            hi = l2
+        let jj = lo
+        let found = 0
+        while jj < hi and found == 0
+            if s2m[jj] == 0 and ord(a[ii]) == ord(b[jj])
+                s1m[ii] = 1
+                s2m[jj] = 1
+                m = m + 1
+                found = 1
+            jj = jj + 1
+        ii = ii + 1
+    if m == 0
+        return 0.0
+    // Count transpositions.
+    let t = 0
+    let kk = 0
+    ii = 0
+    while ii < l1
+        if s1m[ii] == 1
+            while s2m[kk] == 0
+                kk = kk + 1
+            if ord(a[ii]) != ord(b[kk])
+                t = t + 1
+            kk = kk + 1
+        ii = ii + 1
+    // Compute Jaro — bind all sub-expressions to avoid float-return bug.
+    let mf = m * 1.0
+    let l1f = l1 * 1.0
+    let l2f = l2 * 1.0
+    let half_t = (t / 2) * 1.0
+    let p1 = mf / l1f
+    let p2 = mf / l2f
+    let p3 = (mf - half_t) / mf
+    let result = (p1 + p2 + p3) / 3.0
+    result
+
+// ── pc_common_prefix_len ─────────────────────────────────────────────────────
+
+// pc_common_prefix_len returns the length of the common prefix of a and b,
+// capped at 4 (the Winkler limit).
+fn pc_common_prefix_len(a, b) -> int
+    let la = len(a)
+    let lb = len(b)
+    let limit = 4
+    if la < limit
+        limit = la
+    if lb < limit
+        limit = lb
+    let count = 0
+    let i = 0
+    while i < limit and ord(a[i]) == ord(b[i])
+        count = count + 1
+        i = i + 1
+    count
+
+// ── pc_jaro_winkler ──────────────────────────────────────────────────────────
+
+// pc_jaro_winkler returns the Jaro-Winkler similarity between a and b.
+// Adds a prefix bonus on top of Jaro when jaro > 0.7.
+// l = min(common-prefix-length, 4), p = 0.1:
+//   winkler = jaro + l * p * (1 - jaro)
+fn pc_jaro_winkler(a, b) -> float
+    let jaro = pc_jaro(a, b)
+    let result = jaro
+    if jaro > 0.7
+        let pl = pc_common_prefix_len(a, b)
+        let plf = pl * 1.0
+        let bonus = plf * 0.1 * (1.0 - jaro)
+        result = jaro + bonus
+    result
+
+// ── pc_similarity ────────────────────────────────────────────────────────────
+
+// pc_similarity returns a combined name-similarity score in [0.0, 1.0].
+// Score = Jaro-Winkler + Soundex bonus (0.05 if same Soundex), capped at 1.0.
+// This gives a slight boost to names that are phonetically equivalent.
+fn pc_similarity(a, b) -> float
+    let jw = pc_jaro_winkler(a, b)
+    let bonus = 0.0
+    if pc_same_soundex(a, b) == 1
+        bonus = 0.05
+    let combined = jw + bonus
+    if combined > 1.0
+        combined = 1.0
+    combined
+
+// ── pc_match ─────────────────────────────────────────────────────────────────
+
+// pc_match returns 1 if pc_similarity(a, b) >= threshold, else 0.
+fn pc_match(a, b, threshold) -> int
+    let sim = pc_similarity(a, b)
+    let r = 0
+    if sim >= threshold
+        r = 1
+    r
+
+fn main()
+    print("std/phonetic/phonetic_compare loaded")

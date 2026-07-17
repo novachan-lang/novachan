@@ -1,0 +1,188 @@
+// std/phonetic/phonex -- Phonex phonetic encoding (improved Soundex by Lait & Randell 1996).
+// Phonex extends Soundex with preprocessing rules that handle silent letters,
+// leading clusters (KN, PH, WR, AE), and trailing S removal.
+// Self-contained: imports nothing. All helpers are module-private.
+//
+// Public API:
+//   px_encode(name: string) -> string
+//     Full Phonex code: preprocess then Soundex-encode. Returns letter+3-digit string.
+//     Empty input returns "0000".
+//
+//   px_preprocess(name: string) -> string
+//     Phonex preprocessing only (uppercase, strip non-alpha, trailing-S removal,
+//     leading cluster normalization: KN->N, PH->F, AE->E, WR->R, leading-H removal).
+//
+//   px_first(name: string) -> string
+//     Return the leading letter of the preprocessed name (after px_preprocess).
+//
+//   px_digit(ch: string, prev: int) -> int
+//     Return the Phonex code digit for uppercase character ch.
+//     Returns -1 if the digit equals prev (for deduplication by caller),
+//     or 0 for silent letters (A,E,I,O,U,H,W,Y).
+//
+// Digit table (identical to American Soundex):
+//   0: A E I O U H W Y   (silent / separators)
+//   1: B F P V
+//   2: C G J K Q S X Z
+//   3: D T
+//   4: L
+//   5: M N
+//   6: R
+
+// PRIVATE: uppercase a single ASCII character.
+fn _px_uc(c: string) -> string
+    let o = ord(c)
+    let r = c
+    if o >= 97 and o <= 122
+        r = chr(o - 32)
+    r
+
+// PRIVATE: test if character is ASCII alphabetic.
+fn _px_is_alpha(c: string) -> int
+    let o = ord(c)
+    let r = 0
+    if o >= 65 and o <= 90
+        r = 1
+    if o >= 97 and o <= 122
+        r = 1
+    r
+
+// PRIVATE: return the Phonex digit for a single uppercase character.
+// 0=silent, 1=BFPV, 2=CGJKQSXZ, 3=DT, 4=L, 5=MN, 6=R.
+fn _px_code(c: string) -> int
+    let r = 0
+    if c == "B" or c == "F" or c == "P" or c == "V"
+        r = 1
+    else if c == "C" or c == "G" or c == "J" or c == "K" or c == "Q" or c == "S" or c == "X" or c == "Z"
+        r = 2
+    else if c == "D" or c == "T"
+        r = 3
+    else if c == "L"
+        r = 4
+    else if c == "M" or c == "N"
+        r = 5
+    else if c == "R"
+        r = 6
+    r
+
+// px_digit: return the Phonex digit for uppercase character ch, given the
+// previous emitted digit `prev` (for caller-side deduplication).
+//   - Silent letters (A,E,I,O,U,H,W,Y) always return 0, even when prev is 0.
+//   - A non-zero code equal to prev returns -1 (signals "duplicate, skip").
+//   - Otherwise returns the raw code (1-6).
+fn px_digit(ch: string, prev: int) -> int
+    let code = _px_code(ch)
+    if code == 0
+        return 0
+    if code == prev
+        return -1
+    code
+
+// px_preprocess: normalize name for Phonex encoding.
+// Steps (in order):
+//   1. Uppercase and strip all non-alpha characters.
+//   2. If ends with 'S' and length > 1, remove trailing S.
+//   3. Apply leading-cluster substitutions:
+//      PH -> F  (at start of name)
+//      KN -> N  (at start of name)
+//      AE -> E  (at start of name -- silent AE)
+//      WR -> R  (at start of name)
+//      WH -> W  (at start: WH is pronounced W)
+//   4. If starts with H, remove it (H is silent at word start).
+//   5. Result is the processed string.
+fn px_preprocess(name: string) -> string
+    // Step 1: uppercase and keep only alpha.
+    let n = len(name)
+    let s = ""
+    let i = 0
+    while i < n
+        let c = slice(name, i, i + 1)
+        if _px_is_alpha(c) == 1
+            s = s + _px_uc(c)
+        i = i + 1
+    // Step 2: remove trailing S if length > 1.
+    let slen = len(s)
+    if slen > 1
+        if slice(s, slen - 1, slen) == "S"
+            s = slice(s, 0, slen - 1)
+    slen = len(s)
+    if slen == 0
+        return ""
+    // Step 3: leading cluster substitutions (check 2-char prefix).
+    if slen >= 2
+        let pre2 = slice(s, 0, 2)
+        if pre2 == "PH"
+            s = "F" + slice(s, 2, slen)
+        else if pre2 == "KN"
+            s = slice(s, 1, slen)
+        else if pre2 == "AE"
+            s = slice(s, 1, slen)
+        else if pre2 == "WR"
+            s = slice(s, 1, slen)
+        else if pre2 == "WH"
+            s = "W" + slice(s, 2, slen)
+    // Step 4: if starts with H, remove it.
+    slen = len(s)
+    if slen > 0
+        if slice(s, 0, 1) == "H"
+            s = slice(s, 1, slen)
+    s
+
+// px_first: return the leading letter of the preprocessed name.
+fn px_first(name: string) -> string
+    let p = px_preprocess(name)
+    if len(p) == 0
+        return ""
+    slice(p, 0, 1)
+
+// px_encode: compute the Phonex code for a name.
+// Returns a string of the form Letter+3digits (e.g. "R163").
+// Returns "0000" for empty or all-non-alpha input.
+//
+// Algorithm:
+//   1. px_preprocess(name) -> processed string.
+//   2. First char is the leading letter (saved, uppercased).
+//   3. Scan remaining characters:
+//      - Skip H and W (transparent separators that don't reset same-code run).
+//        Actually in Phonex, H and W ARE treated as code-0 separators (reset run).
+//      - Vowels (A,E,I,O,U) also reset the run (allow same-code consonants to be counted).
+//      - Collapse adjacent same-code non-zero digits.
+//      - Emit digits until 3 are collected.
+//   4. Pad with '0's to reach exactly 3 digit characters.
+//   5. Return leading_letter + 3digits.
+fn px_encode(name: string) -> string
+    let p = px_preprocess(name)
+    let plen = len(p)
+    if plen == 0
+        return "0000"
+    // The first char is the letter prefix.
+    let first = slice(p, 0, 1)
+    // The code of the first char (used to prevent same-code at start from being re-emitted).
+    let first_code = _px_code(first)
+    // Build digit string.
+    let digits = ""
+    // prev_code starts as the first letter's code so adjacent same-code is suppressed.
+    let prev_code = first_code
+    let j = 1
+    while j < plen and len(digits) < 3
+        let c = slice(p, j, j + 1)
+        let code = _px_code(c)
+        if code == 0
+            // Silent letter (vowel, H, W, Y): resets same-code run.
+            // After a silent letter, the next consonant is allowed even if same code.
+            prev_code = 0
+        else if code != prev_code
+            digits = digits + str(code)
+            prev_code = code
+        // else: same code as previous non-silent consonant -> collapse (skip).
+        j = j + 1
+    // Pad to exactly 3 digits.
+    let dlen = len(digits)
+    if dlen < 3
+        if dlen == 0
+            digits = "000"
+        else if dlen == 1
+            digits = digits + "00"
+        else
+            digits = digits + "0"
+    first + digits
