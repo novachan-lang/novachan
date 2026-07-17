@@ -1,0 +1,361 @@
+// std/matrix/matqr.nova — QR decomposition via modified Gram-Schmidt.
+// Representation: matrix = dict {r, c, d} where d is a flat row-major list of floats.
+// Element (i,j) = d[i*c + j].  All helpers prefixed mqr_ to avoid global collisions.
+// LEAF — imports NOTHING.
+//
+// Public API:
+//   mqr_decompose(m)             -> dict {Q, R}  A = Q*R
+//   mqr_q(qr)                   -> dict          extract Q
+//   mqr_r(qr)                   -> dict          extract R
+//   mqr_verify(m, tol)          -> bool          Q*R == A within tol
+//   mqr_is_orthogonal(q, tol)   -> bool          Q^T*Q == I within tol
+//   mqr_reconstruct(qr)         -> dict          compute Q*R
+//   mqr_solve(m, b)             -> list          least-squares solve via QR
+//   mqr_gram_schmidt(vectors)   -> list          orthonormalize a set of column vectors
+
+// ── flat-matrix helpers ────────────────────────────────────────────────────────
+
+// mqr_make: build a matrix dict from dimensions and a flat float list.
+fn mqr_make(r: int, c: int, data: list) -> dict
+    let m = {}
+    m["r"] = r
+    m["c"] = c
+    m["d"] = data
+    m
+
+// mqr_get: read element (i,j) from flat matrix.
+fn mqr_get(m: dict, i: int, j: int) -> float
+    let cols = m["c"]
+    let d = m["d"]
+    let idx = i * cols + j
+    d[idx] * 1.0
+
+// mqr_set: write element (i,j) = v.
+fn mqr_set(m: dict, i: int, j: int, v: float)
+    let cols = m["c"]
+    let d = m["d"]
+    let idx = i * cols + j
+    d[idx] = v
+
+// mqr_zeros: make an r x c zero matrix.
+fn mqr_zeros(r: int, c: int) -> dict
+    let data = []
+    let total = r * c
+    let k = 0
+    while k < total
+        push(data, 0.0)
+        k = k + 1
+    mqr_make(r, c, data)
+
+// mqr_identity: make an n x n identity matrix.
+fn mqr_identity(n: int) -> dict
+    let data = []
+    let total = n * n
+    let k = 0
+    while k < total
+        push(data, 0.0)
+        k = k + 1
+    let m = mqr_make(n, n, data)
+    let i = 0
+    while i < n
+        mqr_set(m, i, i, 1.0)
+        i = i + 1
+    m
+
+// mqr_matmul: multiply two flat matrices (r1 x k) * (k x c2) -> (r1 x c2).
+fn mqr_matmul(a: dict, b: dict) -> dict
+    let r1 = a["r"]
+    let k = a["c"]
+    let c2 = b["c"]
+    let out = mqr_zeros(r1, c2)
+    let i = 0
+    while i < r1
+        let j = 0
+        while j < c2
+            let s = 0.0
+            let p = 0
+            while p < k
+                let av = mqr_get(a, i, p)
+                let bv = mqr_get(b, p, j)
+                s = s + av * bv
+                p = p + 1
+            mqr_set(out, i, j, s)
+            j = j + 1
+        i = i + 1
+    out
+
+// mqr_transpose: transpose a flat matrix (r x c -> c x r).
+fn mqr_transpose(m: dict) -> dict
+    let r = m["r"]
+    let c = m["c"]
+    let out = mqr_zeros(c, r)
+    let i = 0
+    while i < r
+        let j = 0
+        while j < c
+            let v = mqr_get(m, i, j)
+            mqr_set(out, j, i, v)
+            j = j + 1
+        i = i + 1
+    out
+
+// ── column vector helpers ──────────────────────────────────────────────────────
+
+// Extract column j of matrix m as a plain list of floats.
+fn _mqr_get_col(m: dict, j: int) -> list
+    let r = m["r"]
+    let col = []
+    let i = 0
+    while i < r
+        let v = mqr_get(m, i, j)
+        push(col, v)
+        i = i + 1
+    col
+
+// Dot product of two lists of floats.
+fn _mqr_dot(a: list, b: list) -> float
+    let n = len(a)
+    let s = 0.0
+    let i = 0
+    while i < n
+        let ai = a[i] * 1.0
+        let bi = b[i] * 1.0
+        s = s + ai * bi
+        i = i + 1
+    s
+
+// Scale a list of floats by scalar k.
+fn _mqr_scale(v: list, k: float) -> list
+    let n = len(v)
+    let out = []
+    let i = 0
+    while i < n
+        let val = v[i] * 1.0 * k
+        push(out, val)
+        i = i + 1
+    out
+
+// Subtract list b from list a element-wise.
+fn _mqr_vsub(a: list, b: list) -> list
+    let n = len(a)
+    let out = []
+    let i = 0
+    while i < n
+        let val = a[i] * 1.0 - b[i] * 1.0
+        push(out, val)
+        i = i + 1
+    out
+
+// Norm of a list (Euclidean).
+fn _mqr_norm(v: list) -> float
+    let d = _mqr_dot(v, v)
+    let r = sqrt(d)
+    r
+
+// ── QR decomposition ──────────────────────────────────────────────────────────
+
+// mqr_decompose: modified Gram-Schmidt QR decomposition.
+// Returns dict {Q, R} where A = Q*R, Q has orthonormal columns, R is upper-triangular.
+// Works for m x n matrices (m >= n). Q is m x n, R is n x n.
+fn mqr_decompose(m: dict) -> dict
+    let rows = m["r"]
+    let cols = m["c"]
+    // Build a list of column vectors from m.
+    let vecs = []
+    let j = 0
+    while j < cols
+        let col = _mqr_get_col(m, j)
+        push(vecs, col)
+        j = j + 1
+    // Modified Gram-Schmidt: produce orthonormal Q columns and R entries.
+    let Q = mqr_zeros(rows, cols)
+    let R = mqr_zeros(cols, cols)
+    let k = 0
+    while k < cols
+        // vecs[k] has been orthogonalized against all previous Q columns so far.
+        let vk = vecs[k]
+        let nk = _mqr_norm(vk)
+        // R[k][k] = norm.
+        mqr_set(R, k, k, nk)
+        // Normalize vk to get Q column k.
+        let qk = []
+        if nk < 0.0000001
+            // Degenerate column: fill with zeros.
+            let qi = 0
+            while qi < rows
+                push(qk, 0.0)
+                qi = qi + 1
+        else
+            let inv_nk = 1.0 / nk
+            qk = _mqr_scale(vk, inv_nk)
+        // Store Q column k.
+        let qi2 = 0
+        while qi2 < rows
+            let val = qk[qi2] * 1.0
+            mqr_set(Q, qi2, k, val)
+            qi2 = qi2 + 1
+        // Project out qk from all remaining columns.
+        let j2 = k + 1
+        while j2 < cols
+            let vj = vecs[j2]
+            let proj = _mqr_dot(qk, vj)
+            // R[k][j2] = proj.
+            mqr_set(R, k, j2, proj)
+            // vecs[j2] = vj - proj * qk.
+            let scaled = _mqr_scale(qk, proj)
+            let new_vj = _mqr_vsub(vj, scaled)
+            vecs[j2] = new_vj
+            j2 = j2 + 1
+        k = k + 1
+    let result = {}
+    result["Q"] = Q
+    result["R"] = R
+    result
+
+// mqr_q: extract Q from decompose result.
+fn mqr_q(qr: dict) -> dict
+    qr["Q"]
+
+// mqr_r: extract R from decompose result.
+fn mqr_r(qr: dict) -> dict
+    qr["R"]
+
+// mqr_reconstruct: compute Q*R.
+fn mqr_reconstruct(qr: dict) -> dict
+    let Q = qr["Q"]
+    let R = qr["R"]
+    mqr_matmul(Q, R)
+
+// mqr_verify: check that Q*R == A within tolerance tol.
+fn mqr_verify(m: dict, tol: float) -> bool
+    let qr = mqr_decompose(m)
+    let rec = mqr_reconstruct(qr)
+    let rows = m["r"]
+    let cols = m["c"]
+    let ok = true
+    let i = 0
+    while i < rows
+        let j = 0
+        while j < cols
+            let a = mqr_get(m, i, j)
+            let b = mqr_get(rec, i, j)
+            let diff = a - b
+            if diff < 0.0
+                diff = 0.0 - diff
+            if diff > tol
+                ok = false
+            j = j + 1
+        i = i + 1
+    ok
+
+// mqr_is_orthogonal: check that Q^T * Q == I within tolerance tol.
+fn mqr_is_orthogonal(q: dict, tol: float) -> bool
+    let qt = mqr_transpose(q)
+    let qtq = mqr_matmul(qt, q)
+    let n = qtq["r"]
+    let ok = true
+    let i = 0
+    while i < n
+        let j = 0
+        while j < n
+            let v = mqr_get(qtq, i, j)
+            let want = 0.0
+            if i == j
+                want = 1.0
+            let diff = v - want
+            if diff < 0.0
+                diff = 0.0 - diff
+            if diff > tol
+                ok = false
+            j = j + 1
+        i = i + 1
+    ok
+
+// mqr_solve: solve m*x = b (or least-squares if overdetermined) via QR.
+// For square non-singular: exact solution. For overdetermined: least-squares.
+// Uses back-substitution on R^T*R*x = R^T*Q^T*b via R (assuming square).
+fn mqr_solve(m: dict, b: list) -> list
+    let qr = mqr_decompose(m)
+    let Q = qr["Q"]
+    let R = qr["R"]
+    let rows = Q["r"]
+    let cols = Q["c"]
+    // Compute Q^T * b.
+    let qt = mqr_transpose(Q)
+    let qtb = []
+    let i = 0
+    while i < cols
+        let s = 0.0
+        let j = 0
+        while j < rows
+            let qv = mqr_get(qt, i, j)
+            let bv = b[j] * 1.0
+            s = s + qv * bv
+            j = j + 1
+        push(qtb, s)
+        i = i + 1
+    // Back-substitution: R * x = qtb.
+    let n = cols
+    let x = []
+    let xi = 0
+    while xi < n
+        push(x, 0.0)
+        xi = xi + 1
+    let bk = n - 1
+    while bk >= 0
+        let s2 = qtb[bk] * 1.0
+        let j2 = bk + 1
+        while j2 < n
+            let rv = mqr_get(R, bk, j2)
+            let xv = x[j2] * 1.0
+            s2 = s2 - rv * xv
+            j2 = j2 + 1
+        let diag = mqr_get(R, bk, bk)
+        if diag == 0.0
+            x[bk] = 0.0
+        else
+            x[bk] = s2 / diag
+        bk = bk - 1
+    x
+
+// mqr_gram_schmidt: orthonormalize a list of column vectors (each a list of floats).
+// Returns a list of orthonormal vectors. Linearly dependent vectors become zero vectors.
+fn mqr_gram_schmidt(vectors: list) -> list
+    let m = len(vectors)
+    if m == 0
+        return vectors
+    let n = len(vectors[0])
+    let out = []
+    let k = 0
+    while k < m
+        let vk = vectors[k]
+        // Copy vk.
+        let uk = []
+        let ci = 0
+        while ci < n
+            let val = vk[ci] * 1.0
+            push(uk, val)
+            ci = ci + 1
+        // Subtract projections onto already-computed orthonormal vectors.
+        let j = 0
+        while j < k
+            let qj = out[j]
+            let proj = _mqr_dot(qj, uk)
+            let scaled = _mqr_scale(qj, proj)
+            uk = _mqr_vsub(uk, scaled)
+            j = j + 1
+        // Normalize.
+        let nk = _mqr_norm(uk)
+        if nk < 0.0000001
+            let zero = []
+            let zi = 0
+            while zi < n
+                push(zero, 0.0)
+                zi = zi + 1
+            push(out, zero)
+        else
+            let inv = 1.0 / nk
+            let qk = _mqr_scale(uk, inv)
+            push(out, qk)
+        k = k + 1
+    out
