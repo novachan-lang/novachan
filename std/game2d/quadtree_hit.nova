@@ -1,0 +1,359 @@
+// std/game2d/quadtree_hit.nova
+// Point quadtree spatial index with AABB region and per-node capacity.
+// Nodes are dicts with keys: x,y,w,h (region), capacity(int), points(list of [id,px,py]),
+// divided(0/1), nw/ne/sw/se (child nodes or 0).
+// Box format: [x, y, w, h] (top-left + extent), all floats.
+// Private helpers use the _qt_ prefix.
+// All float sub-expressions bound to named lets (uninit-float-slot safety).
+// NO trig, NO higher-order functions.
+//
+// Public API (PREFIX qt_):
+//   qt_new(x,y,w,h,capacity)         -> any  create a quadtree node
+//   qt_insert(tree, id, px, py)       -> any  insert point; subdivide when over capacity
+//   qt_query_rect(tree, box)          -> any  ids in box [x,y,w,h]
+//   qt_query_circle(tree, cx,cy,r)   -> any  ids within radius r of (cx,cy)
+//   qt_count(tree)                    -> int  total number of points
+//   qt_all(tree)                      -> any  list of all [id,px,py] entries
+//   qt_contains_point(tree, px, py)  -> bool  is (px,py) within this node's region?
+//   qt_subdivide(tree)                -> any  manually subdivide the node
+//   qt_depth(tree)                    -> int  depth of deepest leaf
+
+// _qt_in_region: true if point (px,py) lies within region [rx,ry,rw,rh].
+// Region is closed on min edges, open on max edges (half-open) — standard for quadtrees.
+// Exception: root catches boundary exactly on max because of finite world.
+// For simplicity we use closed intervals [rx, rx+rw] x [ry, ry+rh].
+fn _qt_in_region(px: float, py: float, rx: float, ry: float, rw: float, rh: float) -> bool
+    let rxmax = rx + rw
+    let rymax = ry + rh
+    let ok = false
+    if px >= rx
+        if px <= rxmax
+            if py >= ry
+                if py <= rymax
+                    ok = true
+    ok
+
+// _qt_rect_overlaps: true if box [bx,by,bw,bh] overlaps region [rx,ry,rw,rh].
+// Uses AABB overlap test: not (a_max < b_min or b_max < a_min) on each axis.
+fn _qt_rect_overlaps(bx: float, by: float, bw: float, bh: float, rx: float, ry: float, rw: float, rh: float) -> bool
+    let bxmax = bx + bw
+    let bymax = by + bh
+    let rxmax = rx + rw
+    let rymax = ry + rh
+    let ok = false
+    if bxmax >= rx
+        if rxmax >= bx
+            if bymax >= ry
+                if rymax >= by
+                    ok = true
+    ok
+
+// _qt_circle_overlaps_region: conservative check — does a circle (cx,cy,r) potentially
+// overlap region [rx,ry,rw,rh]? Clamps center to region and checks distance^2.
+fn _qt_circle_overlaps_region(cx: float, cy: float, r: float, rx: float, ry: float, rw: float, rh: float) -> bool
+    let rxmax = rx + rw
+    let rymax = ry + rh
+    // clamp cx to [rx, rxmax]
+    let clampx = cx
+    if clampx < rx
+        clampx = rx
+    if clampx > rxmax
+        clampx = rxmax
+    // clamp cy to [ry, rymax]
+    let clampy = cy
+    if clampy < ry
+        clampy = ry
+    if clampy > rymax
+        clampy = rymax
+    let dx = cx - clampx
+    let dy = cy - clampy
+    let dsq = dx * dx + dy * dy
+    let rsq = r * r
+    let ok = dsq <= rsq
+    ok
+
+// qt_new: create a new quadtree node over region [x,y,w,h] with given capacity.
+fn qt_new(x: float, y: float, w: float, h: float, capacity: int) -> any
+    let node = {}
+    node["x"] = x
+    node["y"] = y
+    node["w"] = w
+    node["h"] = h
+    node["capacity"] = capacity
+    let pts = []
+    node["points"] = pts
+    node["divided"] = 0
+    node["nw"] = 0
+    node["ne"] = 0
+    node["sw"] = 0
+    node["se"] = 0
+    node
+
+// qt_contains_point: true if point (px,py) is within this node's region.
+fn qt_contains_point(tree: any, px: float, py: float) -> bool
+    let rx = tree["x"]
+    let ry = tree["y"]
+    let rw = tree["w"]
+    let rh = tree["h"]
+    let result = _qt_in_region(px, py, rx, ry, rw, rh)
+    result
+
+// qt_subdivide: split this node into four equal child quadrants.
+// Each child covers half the width and half the height.
+fn qt_subdivide(tree: any) -> any
+    let rx = tree["x"]
+    let ry = tree["y"]
+    let rw = tree["w"]
+    let rh = tree["h"]
+    let cap = tree["capacity"]
+    let hw = rw / 2.0
+    let hh = rh / 2.0
+    let midx = rx + hw
+    let midy = ry + hh
+    // NW: top-left quadrant [rx, ry, hw, hh]
+    let nw = qt_new(rx, ry, hw, hh, cap)
+    // NE: top-right quadrant [midx, ry, hw, hh]
+    let ne = qt_new(midx, ry, hw, hh, cap)
+    // SW: bottom-left quadrant [rx, midy, hw, hh]
+    let sw = qt_new(rx, midy, hw, hh, cap)
+    // SE: bottom-right quadrant [midx, midy, hw, hh]
+    let se = qt_new(midx, midy, hw, hh, cap)
+    tree["nw"] = nw
+    tree["ne"] = ne
+    tree["sw"] = sw
+    tree["se"] = se
+    tree["divided"] = 1
+    tree
+
+// _qt_insert_into_child: try to insert a point into whichever child contains it.
+// Returns 1 if inserted, 0 if point not in any child (degenerate).
+fn _qt_insert_into_child(tree: any, id: any, px: float, py: float) -> int
+    let nw = tree["nw"]
+    let ne = tree["ne"]
+    let sw = tree["sw"]
+    let se = tree["se"]
+    let done = 0
+    // Try NW
+    if done == 0
+        let nwx = nw["x"]
+        let nwy = nw["y"]
+        let nww = nw["w"]
+        let nwh = nw["h"]
+        if _qt_in_region(px, py, nwx, nwy, nww, nwh)
+            qt_insert(nw, id, px, py)
+            done = 1
+    // Try NE
+    if done == 0
+        let nex = ne["x"]
+        let ney = ne["y"]
+        let new = ne["w"]
+        let neh = ne["h"]
+        if _qt_in_region(px, py, nex, ney, new, neh)
+            qt_insert(ne, id, px, py)
+            done = 1
+    // Try SW
+    if done == 0
+        let swx = sw["x"]
+        let swy = sw["y"]
+        let sww = sw["w"]
+        let swh = sw["h"]
+        if _qt_in_region(px, py, swx, swy, sww, swh)
+            qt_insert(sw, id, px, py)
+            done = 1
+    // Try SE
+    if done == 0
+        let sex = se["x"]
+        let sey = se["y"]
+        let sew = se["w"]
+        let seh = se["h"]
+        if _qt_in_region(px, py, sex, sey, sew, seh)
+            qt_insert(se, id, px, py)
+            done = 1
+    done
+
+// qt_insert: insert point (px,py) with id into the quadtree.
+// If at capacity and not yet divided, subdivides first.
+// Returns the tree (mutated in place).
+fn qt_insert(tree: any, id: any, px: float, py: float) -> any
+    let rx = tree["x"]
+    let ry = tree["y"]
+    let rw = tree["w"]
+    let rh = tree["h"]
+    // Reject points outside this node's region
+    if not _qt_in_region(px, py, rx, ry, rw, rh)
+        return tree
+    let divided = tree["divided"]
+    if divided == 1
+        // Already subdivided — delegate to child
+        _qt_insert_into_child(tree, id, px, py)
+        return tree
+    // Not subdivided — check capacity
+    let pts = tree["points"]
+    let cap = tree["capacity"]
+    if len(pts) < cap
+        // Room left — store here
+        let entry = []
+        push(entry, id)
+        push(entry, px)
+        push(entry, py)
+        push(pts, entry)
+        return tree
+    // At capacity — subdivide and reinsert existing points + new point
+    qt_subdivide(tree)
+    // Reinsert existing points into children
+    let n = len(pts)
+    let i = 0
+    while i < n
+        let e = pts[i]
+        let eid = e[0]
+        let epx = e[1]
+        let epy = e[2]
+        _qt_insert_into_child(tree, eid, epx, epy)
+        i = i + 1
+    // Clear points from this internal node
+    let empty_pts = []
+    tree["points"] = empty_pts
+    // Insert the new point
+    _qt_insert_into_child(tree, id, px, py)
+    tree
+
+// qt_query_rect: return list of ids whose insertion point lies in box [bx,by,bw,bh].
+fn qt_query_rect(tree: any, box: any) -> any
+    let bx = box[0]
+    let by = box[1]
+    let bw = box[2]
+    let bh = box[3]
+    let bxf = bx * 1.0
+    let byf = by * 1.0
+    let bwf = bw * 1.0
+    let bhf = bh * 1.0
+    let result = []
+    _qt_collect_rect(tree, bxf, byf, bwf, bhf, result)
+    result
+
+// _qt_collect_rect: recursive helper that appends matching ids to out.
+fn _qt_collect_rect(tree: any, bx: float, by: float, bw: float, bh: float, out: list) -> any
+    let rx = tree["x"]
+    let ry = tree["y"]
+    let rw = tree["w"]
+    let rh = tree["h"]
+    // Prune if region does not overlap query box
+    if not _qt_rect_overlaps(bx, by, bw, bh, rx, ry, rw, rh)
+        return 0
+    let divided = tree["divided"]
+    if divided == 0
+        // Leaf — check each stored point
+        let pts = tree["points"]
+        let n = len(pts)
+        let i = 0
+        while i < n
+            let e = pts[i]
+            let epx = e[1]
+            let epy = e[2]
+            let bxmax = bx + bw
+            let bymax = by + bh
+            if epx >= bx
+                if epx <= bxmax
+                    if epy >= by
+                        if epy <= bymax
+                            push(out, e[0])
+            i = i + 1
+        return 0
+    // Internal — recurse into children
+    _qt_collect_rect(tree["nw"], bx, by, bw, bh, out)
+    _qt_collect_rect(tree["ne"], bx, by, bw, bh, out)
+    _qt_collect_rect(tree["sw"], bx, by, bw, bh, out)
+    _qt_collect_rect(tree["se"], bx, by, bw, bh, out)
+    0
+
+// qt_query_circle: return list of ids within radius r of (cx, cy).
+fn qt_query_circle(tree: any, cx: float, cy: float, r: float) -> any
+    let result = []
+    _qt_collect_circle(tree, cx, cy, r, result)
+    result
+
+// _qt_collect_circle: recursive helper for circle queries.
+fn _qt_collect_circle(tree: any, cx: float, cy: float, r: float, out: list) -> any
+    let rx = tree["x"]
+    let ry = tree["y"]
+    let rw = tree["w"]
+    let rh = tree["h"]
+    if not _qt_circle_overlaps_region(cx, cy, r, rx, ry, rw, rh)
+        return 0
+    let divided = tree["divided"]
+    if divided == 0
+        let pts = tree["points"]
+        let n = len(pts)
+        let rsq = r * r
+        let i = 0
+        while i < n
+            let e = pts[i]
+            let epx = e[1]
+            let epy = e[2]
+            let dx = epx - cx
+            let dy = epy - cy
+            let dsq = dx * dx + dy * dy
+            if dsq <= rsq
+                push(out, e[0])
+            i = i + 1
+        return 0
+    _qt_collect_circle(tree["nw"], cx, cy, r, out)
+    _qt_collect_circle(tree["ne"], cx, cy, r, out)
+    _qt_collect_circle(tree["sw"], cx, cy, r, out)
+    _qt_collect_circle(tree["se"], cx, cy, r, out)
+    0
+
+// qt_count: total number of points stored in the tree.
+fn qt_count(tree: any) -> int
+    let divided = tree["divided"]
+    if divided == 0
+        let pts = tree["points"]
+        let n = len(pts)
+        return n
+    let c = qt_count(tree["nw"])
+    c = c + qt_count(tree["ne"])
+    c = c + qt_count(tree["sw"])
+    c = c + qt_count(tree["se"])
+    c
+
+// qt_all: return list of all [id, px, py] entries in the tree.
+fn qt_all(tree: any) -> any
+    let result = []
+    _qt_collect_all(tree, result)
+    result
+
+// _qt_collect_all: recursive helper that appends all entries to out.
+fn _qt_collect_all(tree: any, out: list) -> any
+    let divided = tree["divided"]
+    if divided == 0
+        let pts = tree["points"]
+        let n = len(pts)
+        let i = 0
+        while i < n
+            push(out, pts[i])
+            i = i + 1
+        return 0
+    _qt_collect_all(tree["nw"], out)
+    _qt_collect_all(tree["ne"], out)
+    _qt_collect_all(tree["sw"], out)
+    _qt_collect_all(tree["se"], out)
+    0
+
+// qt_depth: depth of the deepest leaf (leaf = 1, each subdivision adds 1).
+fn qt_depth(tree: any) -> int
+    let divided = tree["divided"]
+    if divided == 0
+        return 1
+    let d1 = qt_depth(tree["nw"])
+    let d2 = qt_depth(tree["ne"])
+    let d3 = qt_depth(tree["sw"])
+    let d4 = qt_depth(tree["se"])
+    let dmax = d1
+    if d2 > dmax
+        dmax = d2
+    if d3 > dmax
+        dmax = d3
+    if d4 > dmax
+        dmax = d4
+    let result = dmax + 1
+    result

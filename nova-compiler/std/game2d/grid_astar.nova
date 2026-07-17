@@ -1,0 +1,371 @@
+// std/game2d/grid_astar.nova — A* pathfinding on a 2D integer grid.
+//
+// Grid representation: dict {w, h, cells} where cells is a flat row-major list
+// of ints; 0 = walkable, 1 = wall.  Cell (cx,cy) -> cells[cy*w+cx].
+//
+// A* heuristic: Manhattan (4-dir) or Chebyshev/octile (8-dir).
+// Priority queue: binary min-heap on [f, g, cell_index].
+// Tie-break: lower g (closer to start) wins; gives deterministic paths.
+// No trigonometry; no higher-order functions.
+//
+// Public API (prefix ga_):
+//   ga_new(w,h)                          -> any   all-walkable grid
+//   ga_set_wall(grid,x,y)                -> any   mark (x,y) as wall
+//   ga_is_wall(grid,x,y)                 -> bool
+//   ga_find_path(grid,sx,sy,gx,gy,diag)  -> any   list of [x,y] from start to goal, or []
+//   ga_path_length(path)                 -> int
+//   ga_manhattan(x1,y1,x2,y2)            -> int
+//   ga_octile(x1,y1,x2,y2)              -> float  Chebyshev / octile distance
+//   ga_neighbors(grid,x,y,diagonal)      -> any   list of walkable [x,y] neighbors
+//   ga_reachable(grid,sx,sy,gx,gy)       -> bool
+
+// ── Integer helpers ────────────────────────────────────────────────────────────
+
+// _ga_iabs: integer absolute value.
+fn _ga_iabs(x)
+    if x < 0
+        return 0 - x
+    return x
+
+// _ga_imin: integer minimum.
+fn _ga_imin(a, b)
+    if a < b
+        return a
+    return b
+
+// _ga_imax: integer maximum.
+fn _ga_imax(a, b)
+    if a > b
+        return a
+    return b
+
+// ── Grid construction ──────────────────────────────────────────────────────────
+
+// ga_new: create a new w×h grid with all cells walkable (0).
+fn ga_new(w, h)
+    let cells = []
+    let total = w * h
+    let i = 0
+    while i < total
+        push(cells, 0)
+        i = i + 1
+    let g = {}
+    g["w"] = w
+    g["h"] = h
+    g["cells"] = cells
+    return g
+
+// ga_set_wall: mark cell (x,y) as a wall (value=1). Returns the grid.
+fn ga_set_wall(grid, x, y)
+    let w = grid["w"]
+    let cells = grid["cells"]
+    let idx = y * w + x
+    cells[idx] = 1
+    return grid
+
+// ga_is_wall: true if cell (x,y) is a wall or out of bounds.
+fn ga_is_wall(grid, x, y)
+    let w = grid["w"]
+    let h = grid["h"]
+    if x < 0 or x >= w or y < 0 or y >= h
+        return true
+    let cells = grid["cells"]
+    let idx = y * w + x
+    let v = cells[idx]
+    return v == 1
+
+// ── Heuristics ─────────────────────────────────────────────────────────────────
+
+// ga_manhattan: Manhattan distance between (x1,y1) and (x2,y2).
+fn ga_manhattan(x1, y1, x2, y2)
+    let dx = _ga_iabs(x2 - x1)
+    let dy = _ga_iabs(y2 - y1)
+    return dx + dy
+
+// ga_octile: Chebyshev/octile distance for 8-directional movement.
+// = max(|dx|,|dy|) + (sqrt(2)-1)*min(|dx|,|dy|)  ~ max + 0.4142*min
+// Bind every float sub-expression to a let to avoid uninit-float-slot bug.
+fn ga_octile(x1, y1, x2, y2)
+    let dx = _ga_iabs(x2 - x1)
+    let dy = _ga_iabs(y2 - y1)
+    let mn = _ga_imin(dx, dy)
+    let mx = _ga_imax(dx, dy)
+    let mnf = mn * 1.0
+    let mxf = mx * 1.0
+    let diag_cost = mnf * 0.41421356
+    let result = mxf + diag_cost
+    return result
+
+// ── Neighbor enumeration ───────────────────────────────────────────────────────
+
+// ga_neighbors: return list of walkable [x,y] neighbors of (x,y).
+// If diagonal==true 8 directions; otherwise 4 cardinal directions only.
+fn ga_neighbors(grid, x, y, diagonal)
+    let result = []
+    // Cardinal directions: N S E W
+    let dxs4 = [0, 0, 1, -1]
+    let dys4 = [-1, 1, 0, 0]
+    let i = 0
+    while i < 4
+        let nx = x + dxs4[i]
+        let ny = y + dys4[i]
+        let wall = ga_is_wall(grid, nx, ny)
+        if not wall
+            let cell = []
+            push(cell, nx)
+            push(cell, ny)
+            push(result, cell)
+        i = i + 1
+    if diagonal == true
+        // Diagonal directions
+        let dxs8 = [-1, 1, -1, 1]
+        let dys8 = [-1, -1, 1, 1]
+        let j = 0
+        while j < 4
+            let nx = x + dxs8[j]
+            let ny = y + dys8[j]
+            let wall = ga_is_wall(grid, nx, ny)
+            if not wall
+                let cell = []
+                push(cell, nx)
+                push(cell, ny)
+                push(result, cell)
+            j = j + 1
+    return result
+
+// ── Min-heap for open set ─────────────────────────────────────────────────────
+// Entry: [f, g, ci] where ci = y*w+x.
+// Priority: lower f wins; on tie lower g wins.
+
+// _ga_hp_less: 1 if heap[i] < heap[j] in priority order.
+fn _ga_hp_less(heap, i, j)
+    let ei = heap[i]
+    let ej = heap[j]
+    let fi = ei[0]
+    let fj = ej[0]
+    if fi < fj
+        return 1
+    if fi > fj
+        return 0
+    let gi = ei[1]
+    let gj = ej[1]
+    if gi < gj
+        return 1
+    return 0
+
+// _ga_hp_swap: swap heap entries at i and j.
+fn _ga_hp_swap(heap, i, j)
+    let tmp = heap[i]
+    heap[i] = heap[j]
+    heap[j] = tmp
+
+// _ga_hp_sift_up: bubble entry at idx up to restore heap order.
+fn _ga_hp_sift_up(heap, idx)
+    let pos = idx
+    let going = 1
+    while pos > 0 and going == 1
+        let par = (pos - 1) / 2
+        let cmp = _ga_hp_less(heap, pos, par)
+        if cmp == 1
+            _ga_hp_swap(heap, pos, par)
+            pos = par
+        if cmp == 0
+            going = 0
+
+// _ga_hp_sift_down: push entry at pos down to restore heap order.
+fn _ga_hp_sift_down(heap, pos, hsz)
+    let cur = pos
+    let going = 1
+    while going == 1
+        let left = cur * 2 + 1
+        let right = cur * 2 + 2
+        let smallest = cur
+        if left < hsz
+            if _ga_hp_less(heap, left, smallest) == 1
+                smallest = left
+        if right < hsz
+            if _ga_hp_less(heap, right, smallest) == 1
+                smallest = right
+        let swapped = 0
+        if smallest != cur
+            _ga_hp_swap(heap, cur, smallest)
+            cur = smallest
+            swapped = 1
+        if swapped == 0
+            going = 0
+
+// _ga_heap_push: insert [f,g,ci] and restore heap property.
+fn _ga_heap_push(heap, f, g, ci)
+    let entry = [f, g, ci]
+    push(heap, entry)
+    let idx = len(heap) - 1
+    _ga_hp_sift_up(heap, idx)
+
+// _ga_heap_pop: remove and return minimum [f,g,ci] entry.
+fn _ga_heap_pop(heap)
+    let sz = len(heap)
+    let top = heap[0]
+    let last_idx = sz - 1
+    if last_idx == 0
+        pop(heap)
+        return top
+    heap[0] = heap[last_idx]
+    pop(heap)
+    _ga_hp_sift_down(heap, 0, last_idx)
+    return top
+
+// ── A* core ───────────────────────────────────────────────────────────────────
+
+// ga_find_path: find shortest path from (sx,sy) to (gx,gy).
+// diagonal: false => 4-dir + Manhattan heuristic; true => 8-dir + octile heuristic.
+// Returns list of [x,y] cells from start to goal (inclusive), or [] if no path.
+fn ga_find_path(grid, sx, sy, gx, gy, diagonal)
+    let w = grid["w"]
+    let h = grid["h"]
+    let total = w * h
+
+    // Early-exit: goal is a wall.
+    let gwall = ga_is_wall(grid, gx, gy)
+    if gwall
+        return []
+    // Early-exit: start is a wall.
+    let swall = ga_is_wall(grid, sx, sy)
+    if swall
+        return []
+
+    let start_ci = sy * w + sx
+    let goal_ci = gy * w + gx
+
+    // g_score[ci]: best known cost from start; -1 = unvisited.
+    let g_score = []
+    let ii = 0
+    while ii < total
+        push(g_score, -1)
+        ii = ii + 1
+    g_score[start_ci] = 0
+
+    // parent_x, parent_y: predecessor coords for each cell; -1 = none.
+    let parent_x = []
+    let parent_y = []
+    let pi = 0
+    while pi < total
+        push(parent_x, -1)
+        push(parent_y, -1)
+        pi = pi + 1
+
+    // closed[ci]: 1 if permanently settled.
+    let closed = []
+    let ki = 0
+    while ki < total
+        push(closed, 0)
+        ki = ki + 1
+
+    // Open heap.
+    let heap = []
+    let h0 = 0
+    if diagonal == true
+        let h0f = ga_octile(sx, sy, gx, gy)
+        // Scale octile by 1000 and truncate to int for integer heap comparisons.
+        let h0s = h0f * 1000.0
+        h0 = float_to_int(h0s)
+    if diagonal != true
+        h0 = ga_manhattan(sx, sy, gx, gy)
+    _ga_heap_push(heap, h0, 0, start_ci)
+
+    let expanded = 0
+    let max_expand = total + 1
+
+    while len(heap) > 0 and expanded < max_expand
+        let entry = _ga_heap_pop(heap)
+        let cur_f = entry[0]
+        let cur_g = entry[1]
+        let cur_ci = entry[2]
+
+        if closed[cur_ci] == 1
+            // stale entry; skip
+            let dummy = 0
+        if closed[cur_ci] == 0
+            closed[cur_ci] = 1
+            expanded = expanded + 1
+
+            if cur_ci == goal_ci
+                // Reconstruct path by walking parent pointers.
+                let path = []
+                let cx = gx
+                let cy = gy
+                let walk = 0
+                let max_walk = total + 1
+                let done = 0
+                while done == 0 and walk < max_walk
+                    let node = []
+                    push(node, cx)
+                    push(node, cy)
+                    push(path, node)
+                    let pci = cy * w + cx
+                    let npx = parent_x[pci]
+                    let npy = parent_y[pci]
+                    if npx == -1
+                        done = 1
+                    if done == 0
+                        cx = npx
+                        cy = npy
+                    walk = walk + 1
+                // Reverse path (currently goal..start).
+                let plen = len(path)
+                let rev = []
+                let ri = plen - 1
+                while ri >= 0
+                    push(rev, path[ri])
+                    ri = ri - 1
+                return rev
+
+            // Get current x,y from cell index.
+            let cur_y = cur_ci / w
+            let cur_x = cur_ci - cur_y * w
+
+            // Expand neighbors.
+            let nbrs = ga_neighbors(grid, cur_x, cur_y, diagonal)
+            let nlen = len(nbrs)
+            let ni = 0
+            while ni < nlen
+                let nb = nbrs[ni]
+                let nx = nb[0]
+                let ny = nb[1]
+                let nb_ci = ny * w + nx
+                if closed[nb_ci] == 0
+                    // Cost: 1 for cardinal, use 1414 (=sqrt(2)*1000 scaled) for diagonal
+                    let step_cost = 1
+                    if diagonal == true
+                        let ddx = _ga_iabs(nx - cur_x)
+                        let ddy = _ga_iabs(ny - cur_y)
+                        if ddx == 1 and ddy == 1
+                            step_cost = 1414
+                        if ddx == 0 or ddy == 0
+                            step_cost = 1000
+                    let new_g = cur_g + step_cost
+                    let old_g = g_score[nb_ci]
+                    if old_g == -1 or new_g < old_g
+                        g_score[nb_ci] = new_g
+                        parent_x[nb_ci] = cur_x
+                        parent_y[nb_ci] = cur_y
+                        let nb_h = 0
+                        if diagonal == true
+                            let nb_hf = ga_octile(nx, ny, gx, gy)
+                            let nb_hs = nb_hf * 1000.0
+                            nb_h = float_to_int(nb_hs)
+                        if diagonal != true
+                            nb_h = ga_manhattan(nx, ny, gx, gy)
+                        let nb_f = new_g + nb_h
+                        _ga_heap_push(heap, nb_f, new_g, nb_ci)
+                ni = ni + 1
+
+    return []
+
+// ga_path_length: number of cells in a path (cells visited, including start+end).
+fn ga_path_length(path)
+    return len(path)
+
+// ga_reachable: true if there is a path from (sx,sy) to (gx,gy).
+fn ga_reachable(grid, sx, sy, gx, gy)
+    let path = ga_find_path(grid, sx, sy, gx, gy, false)
+    return len(path) > 0

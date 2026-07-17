@@ -1,0 +1,415 @@
+// std/game2d/raycast2d.nova — 2D ray casting utilities.
+//
+// Ray: origin (ox,oy) + unit-or-unnormalised direction (dx,dy).
+// AABB: [x,y,w,h] (top-left x,y; width w; height h).  Right=x+w, Bottom=y+h.
+// Segment: (x1,y1)-(x2,y2).
+// Grid: dict {w,h,cells} (as in grid_astar).
+//
+// Intersection math uses slab method (AABB) and parametric form (circle/segment).
+// No trig (sqrt only). All float sub-expressions bound to lets.
+//
+// Public API (prefix rc2_):
+//   rc2_normalize(dx,dy)               -> any   [nx,ny] unit vector
+//   rc2_point_at(ox,oy,dx,dy,t)        -> any   [px,py] = origin + t*dir
+//   rc2_reflect(dx,dy,nx,ny)           -> any   reflected direction
+//   rc2_ray_aabb(ox,oy,dx,dy,box)      -> any   {hit,t,px,py,nx,ny}
+//   rc2_ray_circle(ox,oy,dx,dy,cx,cy,r)-> any   {hit,t,px,py}
+//   rc2_ray_segment(ox,oy,dx,dy,x1,y1,x2,y2) -> any {hit,t,px,py}
+//   rc2_dda_grid(ox,oy,dx,dy,grid,max_steps)  -> any first solid [cx,cy] or []
+
+// ── Float helpers ──────────────────────────────────────────────────────────────
+
+// _rc2_fabs: float absolute value (avoid abs() which returns int).
+fn _rc2_fabs(x)
+    if x < 0.0
+        return 0.0 - x
+    return x
+
+// _rc2_fmin: float minimum.
+fn _rc2_fmin(a, b)
+    if a < b
+        return a
+    return b
+
+// _rc2_fmax: float maximum.
+fn _rc2_fmax(a, b)
+    if a > b
+        return a
+    return b
+
+// ── Public utilities ───────────────────────────────────────────────────────────
+
+// rc2_normalize: return unit vector [nx,ny] for direction (dx,dy).
+// If direction is zero-length, returns [0.0,0.0] (degenerate).
+// Binds all float sub-expressions to named lets per float-codegen safety rule.
+fn rc2_normalize(dx, dy)
+    let fdx = dx * 1.0
+    let fdy = dy * 1.0
+    let len2 = fdx * fdx + fdy * fdy
+    let result = []
+    if len2 <= 0.0
+        push(result, 0.0)
+        push(result, 0.0)
+        return result
+    let L = sqrt(len2)
+    let nx = fdx / L
+    let ny = fdy / L
+    push(result, nx)
+    push(result, ny)
+    return result
+
+// rc2_point_at: evaluate point along ray at parameter t.
+// Returns [ox + t*dx, oy + t*dy].
+fn rc2_point_at(ox, oy, dx, dy, t)
+    let fox = ox * 1.0
+    let foy = oy * 1.0
+    let fdx = dx * 1.0
+    let fdy = dy * 1.0
+    let ft = t * 1.0
+    let px = fox + ft * fdx
+    let py = foy + ft * fdy
+    let result = []
+    push(result, px)
+    push(result, py)
+    return result
+
+// rc2_reflect: reflect direction (dx,dy) off surface with outward normal (nx,ny).
+// Reflected = d - 2*(d·n)*n  (works for any normal, including non-unit normals
+// only if n is already a unit vector; callers pass axis-aligned normals like [0,1]).
+fn rc2_reflect(dx, dy, nx, ny)
+    let fdx = dx * 1.0
+    let fdy = dy * 1.0
+    let fnx = nx * 1.0
+    let fny = ny * 1.0
+    let dot = fdx * fnx + fdy * fny
+    let two_dot = 2.0 * dot
+    let rx = fdx - two_dot * fnx
+    let ry = fdy - two_dot * fny
+    let result = []
+    push(result, rx)
+    push(result, ry)
+    return result
+
+// ── Ray–AABB intersection (slab method) ───────────────────────────────────────
+
+// rc2_ray_aabb: intersect ray (ox,oy)+(t*dx,t*dy) against AABB box=[bx,by,bw,bh].
+// Returns dict {hit, t, px, py, nx, ny}.
+// hit=true  t=entry parameter  px,py=hit point  nx,ny=surface normal at hit.
+// t must be >= 0 (behind-ray miss).  Open overlap: t must be in valid slab.
+// Normal is computed from which slab face was entered.
+fn rc2_ray_aabb(ox, oy, dx, dy, box)
+    let fox = ox * 1.0
+    let foy = oy * 1.0
+    let fdx = dx * 1.0
+    let fdy = dy * 1.0
+    let bx = box[0] * 1.0
+    let by = box[1] * 1.0
+    let bw = box[2] * 1.0
+    let bh = box[3] * 1.0
+    let bx2 = bx + bw
+    let by2 = by + bh
+
+    // Slab intersections for X axis.
+    let tmin = 0.0 - 1.0e18
+    let tmax = 1.0e18
+    let nx_hit = 0.0
+    let ny_hit = 0.0
+    let inv_dx = 0.0
+    if _rc2_fabs(fdx) > 1.0e-10
+        inv_dx = 1.0 / fdx
+        let tx1 = (bx - fox) * inv_dx
+        let tx2 = (bx2 - fox) * inv_dx
+        let txlo = _rc2_fmin(tx1, tx2)
+        let txhi = _rc2_fmax(tx1, tx2)
+        if txlo > tmin
+            tmin = txlo
+            // Normal: face we entered (opposite of ray direction sign).
+            if fdx > 0.0
+                nx_hit = -1.0
+                ny_hit = 0.0
+            if fdx < 0.0
+                nx_hit = 1.0
+                ny_hit = 0.0
+        tmax = _rc2_fmin(tmax, txhi)
+    if _rc2_fabs(fdx) <= 1.0e-10
+        // Ray is parallel to X slabs.
+        if fox < bx or fox > bx2
+            // Origin outside slabs — no hit.
+            let res = {}
+            res["hit"] = false
+            res["t"] = 0.0
+            res["px"] = 0.0
+            res["py"] = 0.0
+            res["nx"] = 0.0
+            res["ny"] = 0.0
+            return res
+
+    // Slab intersections for Y axis.
+    if _rc2_fabs(fdy) > 1.0e-10
+        let inv_dy = 1.0 / fdy
+        let ty1 = (by - foy) * inv_dy
+        let ty2 = (by2 - foy) * inv_dy
+        let tylo = _rc2_fmin(ty1, ty2)
+        let tyhi = _rc2_fmax(ty1, ty2)
+        if tylo > tmin
+            tmin = tylo
+            if fdy > 0.0
+                nx_hit = 0.0
+                ny_hit = -1.0
+            if fdy < 0.0
+                nx_hit = 0.0
+                ny_hit = 1.0
+        tmax = _rc2_fmin(tmax, tyhi)
+    if _rc2_fabs(fdy) <= 1.0e-10
+        if foy < by or foy > by2
+            let res = {}
+            res["hit"] = false
+            res["t"] = 0.0
+            res["px"] = 0.0
+            res["py"] = 0.0
+            res["nx"] = 0.0
+            res["ny"] = 0.0
+            return res
+
+    let hit = tmin <= tmax and tmax > 0.0
+    let t_use = tmin
+    if tmin < 0.0
+        t_use = 0.0
+        hit = tmax > 0.0
+    // If tmin < 0, origin is inside the box — treat as miss for typical games.
+    // (For this module: hit only if ray travels INTO the box from outside.)
+    if tmin < 0.0
+        hit = false
+
+    let res2 = {}
+    if hit
+        let px = fox + t_use * fdx
+        let py = foy + t_use * fdy
+        res2["hit"] = true
+        res2["t"] = t_use
+        res2["px"] = px
+        res2["py"] = py
+        res2["nx"] = nx_hit
+        res2["ny"] = ny_hit
+        return res2
+    res2["hit"] = false
+    res2["t"] = 0.0
+    res2["px"] = 0.0
+    res2["py"] = 0.0
+    res2["nx"] = 0.0
+    res2["ny"] = 0.0
+    return res2
+
+// ── Ray–Circle intersection ────────────────────────────────────────────────────
+
+// rc2_ray_circle: intersect ray (ox,oy)+(t*dx,t*dy) against circle (cx,cy,r).
+// Returns dict {hit, t, px, py}.
+// Uses quadratic formula on |P(t) - C|^2 = r^2.
+// Only returns the nearest positive-t intersection.
+fn rc2_ray_circle(ox, oy, dx, dy, cx, cy, r)
+    let fox = ox * 1.0
+    let foy = oy * 1.0
+    let fdx = dx * 1.0
+    let fdy = dy * 1.0
+    let fcx = cx * 1.0
+    let fcy = cy * 1.0
+    let fr = r * 1.0
+
+    // Vector from circle center to ray origin.
+    let ocx = fox - fcx
+    let ocy = foy - fcy
+
+    // Quadratic coefficients: a*t^2 + b*t + c = 0
+    let a = fdx * fdx + fdy * fdy
+    let b = 2.0 * (ocx * fdx + ocy * fdy)
+    let c = ocx * ocx + ocy * ocy - fr * fr
+    let disc = b * b - 4.0 * a * c
+
+    let res = {}
+    if disc < 0.0
+        res["hit"] = false
+        res["t"] = 0.0
+        res["px"] = 0.0
+        res["py"] = 0.0
+        return res
+
+    let sqrt_disc = sqrt(disc)
+    let two_a = 2.0 * a
+    let t1 = (0.0 - b - sqrt_disc) / two_a
+    let t2 = (0.0 - b + sqrt_disc) / two_a
+
+    // Select nearest positive t.
+    let t_hit = 0.0
+    let found = false
+    if t1 > 0.0
+        t_hit = t1
+        found = true
+    if not found and t2 > 0.0
+        t_hit = t2
+        found = true
+
+    if not found
+        res["hit"] = false
+        res["t"] = 0.0
+        res["px"] = 0.0
+        res["py"] = 0.0
+        return res
+
+    let px = fox + t_hit * fdx
+    let py = foy + t_hit * fdy
+    res["hit"] = true
+    res["t"] = t_hit
+    res["px"] = px
+    res["py"] = py
+    return res
+
+// ── Ray–Segment intersection ───────────────────────────────────────────────────
+
+// rc2_ray_segment: intersect ray (ox,oy)+(t*dx,t*dy) against segment (x1,y1)-(x2,y2).
+// Returns dict {hit, t, px, py}.
+// Uses parametric form: P(t) = O + t*D and Q(s) = A + s*(B-A), solve P=Q.
+// Valid intersection: t > 0 and 0 <= s <= 1.
+fn rc2_ray_segment(ox, oy, dx, dy, x1, y1, x2, y2)
+    let fox = ox * 1.0
+    let foy = oy * 1.0
+    let fdx = dx * 1.0
+    let fdy = dy * 1.0
+    let fx1 = x1 * 1.0
+    let fy1 = y1 * 1.0
+    let fx2 = x2 * 1.0
+    let fy2 = y2 * 1.0
+
+    // Segment direction.
+    let segx = fx2 - fx1
+    let segy = fy2 - fy1
+
+    // Cross product of ray direction and segment direction.
+    let denom = fdx * segy - fdy * segx
+
+    let res = {}
+    // Parallel if denom ~= 0.
+    if _rc2_fabs(denom) < 1.0e-10
+        res["hit"] = false
+        res["t"] = 0.0
+        res["px"] = 0.0
+        res["py"] = 0.0
+        return res
+
+    // Vector from ray origin to segment start.
+    let diffx = fx1 - fox
+    let diffy = fy1 - foy
+
+    // t (ray parameter) and s (segment parameter).
+    let t_hit = (diffx * segy - diffy * segx) / denom
+    let s_hit = (diffx * fdy - diffy * fdx) / denom
+
+    if t_hit < 0.0 or s_hit < 0.0 or s_hit > 1.0
+        res["hit"] = false
+        res["t"] = 0.0
+        res["px"] = 0.0
+        res["py"] = 0.0
+        return res
+
+    let px = fox + t_hit * fdx
+    let py = foy + t_hit * fdy
+    res["hit"] = true
+    res["t"] = t_hit
+    res["px"] = px
+    res["py"] = py
+    return res
+
+// ── DDA grid traversal ─────────────────────────────────────────────────────────
+
+// rc2_dda_grid: step through grid cells along the ray (DDA algorithm).
+// Starts at the cell containing (ox,oy) and steps up to max_steps cells.
+// Returns [cx,cy] of the first solid cell (tile != 0), or [] if none hit.
+// grid: {w,h,cells} with optional "tilesize" key (defaults to 1 if absent).
+fn rc2_dda_grid(ox, oy, dx, dy, grid, max_steps)
+    let w = grid["w"]
+    let h = grid["h"]
+    let cells = grid["cells"]
+
+    // Tile size: default 1 if key absent.
+    let ts = 1
+    let has_ts = contains(grid, "tilesize")
+    if has_ts == 1
+        ts = grid["tilesize"]
+    let fts = ts * 1.0
+
+    let fdx = dx * 1.0
+    let fdy = dy * 1.0
+
+    // Initial tile cell via floor(world / tilesize).
+    let fox = ox * 1.0
+    let foy = oy * 1.0
+    let cx_f = fox / fts
+    let cy_f = foy / fts
+    let cx = floor(cx_f)
+    let cy = floor(cy_f)
+
+    // Step direction per axis (+1 or -1).
+    let step_x = 1
+    if fdx < 0.0
+        step_x = -1
+    let step_y = 1
+    if fdy < 0.0
+        step_y = -1
+
+    // dt: t-distance to traverse one full tile on each axis.
+    let dt_x = 1.0e18
+    if _rc2_fabs(fdx) > 1.0e-10
+        let abs_dx = _rc2_fabs(fdx)
+        dt_x = fts / abs_dx
+
+    let dt_y = 1.0e18
+    if _rc2_fabs(fdy) > 1.0e-10
+        let abs_dy = _rc2_fabs(fdy)
+        dt_y = fts / abs_dy
+
+    // tm: t to the next cell boundary on each axis (infinity when direction=0).
+    let tm_x = 1.0e18
+    if fdx > 0.0
+        let cxf = cx * 1.0
+        let cell_right = (cxf + 1.0) * fts
+        tm_x = (cell_right - fox) / fdx
+    if fdx < 0.0
+        let cxf2 = cx * 1.0
+        let cell_left = cxf2 * fts
+        let neg_fdx = 0.0 - fdx
+        tm_x = (fox - cell_left) / neg_fdx
+
+    let tm_y = 1.0e18
+    if fdy > 0.0
+        let cyf = cy * 1.0
+        let cell_bottom = (cyf + 1.0) * fts
+        tm_y = (cell_bottom - foy) / fdy
+    if fdy < 0.0
+        let cyf2 = cy * 1.0
+        let cell_top = cyf2 * fts
+        let neg_fdy = 0.0 - fdy
+        tm_y = (foy - cell_top) / neg_fdy
+
+    let step = 0
+    while step <= max_steps
+        // Check current cell for solid.
+        if cx >= 0 and cx < w and cy >= 0 and cy < h
+            let ci = cy * w + cx
+            let cv = cells[ci]
+            if cv != 0
+                let result = []
+                push(result, cx)
+                push(result, cy)
+                return result
+        // Advance to next cell boundary — exactly one axis per iteration.
+        if step < max_steps
+            let stepped = 0
+            if tm_x < tm_y and stepped == 0
+                tm_x = tm_x + dt_x
+                cx = cx + step_x
+                stepped = 1
+            if stepped == 0
+                tm_y = tm_y + dt_y
+                cy = cy + step_y
+        step = step + 1
+
+    return []

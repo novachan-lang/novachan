@@ -1,0 +1,254 @@
+// std/game2d/sweep_test.nova
+// Swept AABB continuous collision detection.
+// Box format: [x, y, w, h] (top-left x,y + width,height), all floats.
+// All float sub-expressions bound to named lets (uninit-float-slot safety).
+// No trig, no higher-order functions. abs(float) via if/else.
+//
+// Public API (PREFIX sw_):
+//   sw_slab(o, d, lo, hi)               -> any  [t_near, t_far] for one slab
+//   sw_broadphase_box(box, vx, vy)      -> any  swept AABB covering entire motion
+//   sw_ray_aabb(ox,oy, dx,dy, box)      -> any  {hit, tmin, tmax}
+//   sw_aabb(box, vx,vy, target)         -> any  {hit, t, nx, ny}
+//   sw_time_of_impact(box,vx,vy,target) -> float  t in [0,1] or 1.0 if no hit
+//   sw_resolve(box, vx,vy, target)      -> any  safe end position [ex, ey]
+//   sw_will_collide(box,vx,vy,target)   -> bool  true if hit before t=1
+
+// _sw_fabs: float absolute value via if/else (abs() builtin returns int).
+fn _sw_fabs(v: float) -> float
+    let r = v
+    if v < 0.0
+        r = 0.0 - v
+    r
+
+// _sw_fmin: float minimum of two values.
+fn _sw_fmin(a: float, b: float) -> float
+    let r = a
+    if b < a
+        r = b
+    r
+
+// _sw_fmax: float maximum of two values.
+fn _sw_fmax(a: float, b: float) -> float
+    let r = a
+    if b > a
+        r = b
+    r
+
+// _sw_fclamp: clamp float v to [lo, hi].
+fn _sw_fclamp(v: float, lo: float, hi: float) -> float
+    let r = v
+    if r < lo
+        r = lo
+    if r > hi
+        r = hi
+    r
+
+// sw_slab: compute [t_near, t_far] for one axis slab.
+// o = position of the moving box's min edge on this axis (relative to target).
+// d = velocity component on this axis.
+// lo, hi = target slab extent on this axis.
+// If d == 0 (parallel):
+//   - if o is inside [lo,hi]: always in slab -> (-big, +big)
+//   - if o is outside [lo,hi]: never enters slab -> (+big, -big) [tmin > tmax = miss]
+fn sw_slab(o: float, d: float, lo: float, hi: float) -> any
+    let result = []
+    // Use a large sentinel instead of true infinity
+    let big = 1.0e30
+    let neg_big = 0.0 - big
+    // epsilon: 1e-10 = 0.0000000001 (avoid negative-exponent scientific notation)
+    let eps = 0.0000000001
+    let dabs = _sw_fabs(d)
+    if dabs < eps
+        // Parallel: check if origin is inside the slab
+        if o >= lo
+            if o <= hi
+                // Inside slab: no constraint (always overlapping on this axis)
+                push(result, neg_big)
+                push(result, big)
+                return result
+        // Outside slab: can never enter -> miss sentinel (tmin > tmax)
+        push(result, big)
+        push(result, neg_big)
+        return result
+    let t1 = (lo - o) / d
+    let t2 = (hi - o) / d
+    let tn = _sw_fmin(t1, t2)
+    let tf = _sw_fmax(t1, t2)
+    push(result, tn)
+    push(result, tf)
+    result
+
+// sw_broadphase_box: the swept AABB covering the entire motion of box with velocity (vx,vy).
+// Returns [min_x, min_y, width, height] covering both start and end positions.
+fn sw_broadphase_box(box: any, vx: float, vy: float) -> any
+    let bx = box[0]
+    let by = box[1]
+    let bw = box[2]
+    let bh = box[3]
+    let bxf = bx * 1.0
+    let byf = by * 1.0
+    let bwf = bw * 1.0
+    let bhf = bh * 1.0
+    // end position of the box
+    let ex = bxf + vx
+    let ey = byf + vy
+    // swept min/max on each axis
+    let minx = _sw_fmin(bxf, ex)
+    let miny = _sw_fmin(byf, ey)
+    let maxx = _sw_fmax(bxf + bwf, ex + bwf)
+    let maxy = _sw_fmax(byf + bhf, ey + bhf)
+    let sw = maxx - minx
+    let sh = maxy - miny
+    let result = []
+    push(result, minx)
+    push(result, miny)
+    push(result, sw)
+    push(result, sh)
+    result
+
+// sw_ray_aabb: ray vs AABB test using the slab method.
+// Ray origin (ox,oy), direction (dx,dy). Box = [x,y,w,h].
+// Returns dict {hit(bool), tmin(float), tmax(float)}.
+// tmin is the entry time along the ray; hit = tmin <= tmax and tmax >= 0.
+fn sw_ray_aabb(ox: float, oy: float, dx: float, dy: float, box: any) -> any
+    let bx = box[0]
+    let by = box[1]
+    let bw = box[2]
+    let bh = box[3]
+    let bxf = bx * 1.0
+    let byf = by * 1.0
+    let bwf = bw * 1.0
+    let bhf = bh * 1.0
+    // X slab: [bxf, bxf+bwf]
+    let xs = sw_slab(ox, dx, bxf, bxf + bwf)
+    let xtn = xs[0]
+    let xtf = xs[1]
+    // Y slab: [byf, byf+bhf]
+    let ys = sw_slab(oy, dy, byf, byf + bhf)
+    let ytn = ys[0]
+    let ytf = ys[1]
+    // Intersection of slabs
+    let tmin = _sw_fmax(xtn, ytn)
+    let tmax = _sw_fmin(xtf, ytf)
+    let hit = false
+    if tmin <= tmax
+        if tmax >= 0.0
+            hit = true
+    let r = {}
+    r["hit"] = hit
+    r["tmin"] = tmin
+    r["tmax"] = tmax
+    r
+
+// sw_aabb: swept AABB vs static AABB collision.
+// box = moving AABB [x,y,w,h], velocity (vx,vy).
+// target = static AABB [x,y,w,h].
+// Returns dict {hit(bool), t(float 0..1), nx(float), ny(float)}.
+//   t = time of impact (fraction of velocity applied at contact).
+//   nx, ny = surface normal at contact (points away from target toward box).
+// Uses Minkowski sum: expand target by box's half-extents, then cast a ray
+// from box's center. Equivalently: subtract box dimensions from target and
+// ray-cast from box's min corner.
+fn sw_aabb(box: any, vx: float, vy: float, target: any) -> any
+    let bx = box[0]
+    let by = box[1]
+    let bw = box[2]
+    let bh = box[3]
+    let bxf = bx * 1.0
+    let byf = by * 1.0
+    let bwf = bw * 1.0
+    let bhf = bh * 1.0
+
+    let tx = target[0]
+    let ty = target[1]
+    let tw = target[2]
+    let th = target[3]
+    let txf = tx * 1.0
+    let tyf = ty * 1.0
+    let twf = tw * 1.0
+    let thf = th * 1.0
+
+    // Minkowski-expanded target (target grown by box dimensions)
+    let etx = txf - bwf
+    let ety = tyf - bhf
+    let etw = twf + bwf
+    let eth = thf + bhf
+
+    // Ray from box's min corner with velocity (vx, vy)
+    let xs = sw_slab(bxf, vx, etx, etx + etw)
+    let xtn = xs[0]
+    let xtf = xs[1]
+    let ys = sw_slab(byf, vy, ety, ety + eth)
+    let ytn = ys[0]
+    let ytf = ys[1]
+
+    let tmin = _sw_fmax(xtn, ytn)
+    let tmax = _sw_fmin(xtf, ytf)
+
+    let no_hit = {}
+    no_hit["hit"] = false
+    no_hit["t"] = 1.0
+    no_hit["nx"] = 0.0
+    no_hit["ny"] = 0.0
+
+    // No hit if slabs don't intersect or entry is past t=1 or exit is behind origin
+    if tmin > tmax
+        return no_hit
+    if tmin >= 1.0
+        return no_hit
+    if tmax <= 0.0
+        return no_hit
+
+    // Clamp t to [0, 1)
+    let t = _sw_fclamp(tmin, 0.0, 1.0)
+
+    // Determine surface normal from which axis caused the collision
+    let nx = 0.0
+    let ny = 0.0
+    if xtn > ytn
+        // X axis is the limiting slab
+        if vx < 0.0
+            nx = 1.0
+        else
+            nx = 0.0 - 1.0
+    else
+        // Y axis is the limiting slab
+        if vy < 0.0
+            ny = 1.0
+        else
+            ny = 0.0 - 1.0
+
+    let r = {}
+    r["hit"] = true
+    r["t"] = t
+    r["nx"] = nx
+    r["ny"] = ny
+    r
+
+// sw_time_of_impact: return t in [0,1] of first contact, or 1.0 if no collision.
+fn sw_time_of_impact(box: any, vx: float, vy: float, target: any) -> float
+    let col = sw_aabb(box, vx, vy, target)
+    let t = col["t"]
+    t
+
+// sw_will_collide: true if the moving box hits the target within [0,1] time.
+fn sw_will_collide(box: any, vx: float, vy: float, target: any) -> bool
+    let col = sw_aabb(box, vx, vy, target)
+    let h = col["hit"]
+    h
+
+// sw_resolve: safe end position just before impact (or full displacement if no hit).
+// Returns [ex, ey] = box position at time t (fraction of velocity up to contact).
+fn sw_resolve(box: any, vx: float, vy: float, target: any) -> any
+    let bx = box[0]
+    let by = box[1]
+    let bxf = bx * 1.0
+    let byf = by * 1.0
+    let col = sw_aabb(box, vx, vy, target)
+    let t = col["t"]
+    let ex = bxf + vx * t
+    let ey = byf + vy * t
+    let result = []
+    push(result, ex)
+    push(result, ey)
+    result
