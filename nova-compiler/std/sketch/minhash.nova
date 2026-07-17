@@ -1,0 +1,185 @@
+// std/sketch/minhash.nova — MinHash for Jaccard similarity estimation.
+//
+// MinHash estimates the Jaccard similarity of two sets (token collections)
+// without materialising the full sets. For num_hashes hash functions, each
+// hash is evaluated over every token in the set; the minimum value becomes
+// one element of the signature. Jaccard similarity is estimated as the
+// fraction of signature positions where sig_a[i] == sig_b[i].
+//
+// Hash construction: each of the num_hashes hash functions is a distinct
+// perturbation of the base 63-bit hash:
+//   h_i(token) = (base_hash(token) * mults[i] + adds[i]) & MASK63
+// where mults[i] and adds[i] are deterministic per-function constants.
+// This gives each hash function an independent ordering over tokens, so
+// different tokens win the minimum at different positions.
+//
+// Both base hashes are strictly positive (63-bit mask guarantees sign-bit=0).
+//
+// State dict fields:
+//   "num_hashes" — int, number of hash functions
+//   "mults"      — list of int, per-function multipliers
+//   "adds"       — list of int, per-function additive offsets
+
+// ---------------------------------------------------------------------------
+// Private: 63-bit base hash. Seed 1125899906842597, multiplier 1000003.
+// Using a large multiplier ensures good avalanche even for short strings.
+// ---------------------------------------------------------------------------
+fn _mh_h63(s)
+    let h = 1125899906842597
+    let n = len(s)
+    let i = 0
+    let mask = 0x7FFFFFFFFFFFFFFF
+    while i < n
+        let c = ord(char_at(s, i))
+        h = (h * 1000003 + c) & mask
+        i = i + 1
+    return h
+
+// ---------------------------------------------------------------------------
+// Private: generate the i-th multiplier constant (must be large and odd).
+// Using a linear recurrence: mult[0]=6364136223846793,
+//   mult[i] = (mult[i-1] * 2862933555777941 + 1) & MASK63.
+// This gives a full-period LCG — all values distinct and well-distributed.
+// ---------------------------------------------------------------------------
+fn _mh_make_mults(n)
+    let mults = []
+    let mask = 0x7FFFFFFFFFFFFFFF
+    let v = 6364136223846793
+    let i = 0
+    while i < n
+        push(mults, v | 1)
+        v = (v * 2862933555777941 + 1) & mask
+        i = i + 1
+    return mults
+
+// ---------------------------------------------------------------------------
+// Private: generate the i-th additive offset (distinct per function).
+// Using a different recurrence: add[0]=1442695040888963407 & MASK63,
+//   add[i] = (add[i-1] * 6364136223846793 + 1442695040888963) & MASK63.
+// ---------------------------------------------------------------------------
+fn _mh_make_adds(n)
+    let adds = []
+    let mask = 0x7FFFFFFFFFFFFFFF
+    let v = (1442695040888963407 & mask)
+    let i = 0
+    while i < n
+        push(adds, v)
+        v = (v * 6364136223846793 + 1442695040888963) & mask
+        i = i + 1
+    return adds
+
+// ---------------------------------------------------------------------------
+// Create a new MinHash state with `num_hashes` hash functions.
+// Seeds are computed deterministically from the hash-function index.
+// ---------------------------------------------------------------------------
+fn mh_new(num_hashes)
+    let state = {}
+    state["num_hashes"] = num_hashes
+    state["mults"] = _mh_make_mults(num_hashes)
+    state["adds"] = _mh_make_adds(num_hashes)
+    return state
+
+// ---------------------------------------------------------------------------
+// Hash a single token with the i-th hash function.
+// h_i(token) = (base_hash(token) * mults[i] + adds[i]) & MASK63.
+// This needs access to state to retrieve mults/adds. For standalone use,
+// provide the index and rely on the public API through mh_signature/state.
+// This function computes the hash for position i using a direct formula
+// so it is usable without state:
+//   ha = _mh_h63(token), then permute by (ha * perm_mult(i) + perm_add(i)) & MASK63.
+// ---------------------------------------------------------------------------
+fn mh_hash_i(token, i)
+    let mask = 0x7FFFFFFFFFFFFFFF
+    let ha = _mh_h63(token)
+    // Per-index permutation constants (same recurrence as _mh_make_mults/adds
+    // but computed inline by stepping the LCG i times).
+    let mult = 6364136223846793
+    let add = 1442695040888963407 & mask
+    let j = 0
+    while j < i
+        mult = (mult * 2862933555777941 + 1) & mask
+        add = (add * 6364136223846793 + 1442695040888963) & mask
+        j = j + 1
+    let hv = (ha * (mult | 1) + add) & mask
+    return hv
+
+// ---------------------------------------------------------------------------
+// Compute the MinHash signature for a list of tokens.
+// Returns a list of length num_hashes; element i is the minimum of
+// h_i(token) over all tokens in the set.
+// Empty token list: signature is all-max (0x7FFFFFFFFFFFFFFF).
+// ---------------------------------------------------------------------------
+fn mh_signature(state, tokens)
+    let num_hashes = state["num_hashes"]
+    let mults = state["mults"]
+    let adds = state["adds"]
+    let mask = 0x7FFFFFFFFFFFFFFF
+    // Initialise signature to max value.
+    let sig = []
+    let i = 0
+    while i < num_hashes
+        push(sig, mask)
+        i = i + 1
+    // For each token, update each hash-function's minimum.
+    let t = 0
+    let nt = len(tokens)
+    while t < nt
+        let tok = tokens[t]
+        let ha = _mh_h63(tok)
+        let j = 0
+        while j < num_hashes
+            let hv = (ha * mults[j] + adds[j]) & mask
+            if hv < sig[j]
+                sig[j] = hv
+            j = j + 1
+        t = t + 1
+    return sig
+
+// ---------------------------------------------------------------------------
+// Estimate Jaccard similarity from two pre-computed signatures.
+// Returns fraction in [0.0, 1.0] of positions where sig_a[i] == sig_b[i].
+// ---------------------------------------------------------------------------
+fn mh_jaccard(sig_a, sig_b)
+    let n = len(sig_a)
+    if n == 0
+        return 0.0
+    let matches = 0
+    let i = 0
+    while i < n
+        if sig_a[i] == sig_b[i]
+            matches = matches + 1
+        i = i + 1
+    return matches * 1.0 / (n * 1.0)
+
+// ---------------------------------------------------------------------------
+// Convenience: compute both signatures and return the Jaccard estimate.
+// ---------------------------------------------------------------------------
+fn mh_similarity(state, tokens_a, tokens_b)
+    let sig_a = mh_signature(state, tokens_a)
+    let sig_b = mh_signature(state, tokens_b)
+    let j = mh_jaccard(sig_a, sig_b)
+    return j
+
+// ---------------------------------------------------------------------------
+// Merge two signatures into the union-MinHash (element-wise minimum).
+// Represents the union of the two sets.
+// ---------------------------------------------------------------------------
+fn mh_merge_sig(a, b)
+    let n = len(a)
+    let result = []
+    let i = 0
+    while i < n
+        let av = a[i]
+        let bv = b[i]
+        if av < bv
+            push(result, av)
+        else
+            push(result, bv)
+        i = i + 1
+    return result
+
+// ---------------------------------------------------------------------------
+// Return the number of hash functions in the state.
+// ---------------------------------------------------------------------------
+fn mh_num_hashes(state)
+    return state["num_hashes"]

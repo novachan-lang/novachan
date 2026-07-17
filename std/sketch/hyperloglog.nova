@@ -1,0 +1,198 @@
+// std/sketch/hyperloglog.nova — HyperLogLog cardinality estimator.
+//
+// Algorithm: Flajolet et al. 2007 "HyperLogLog: the analysis of a near-optimal
+// cardinality estimation algorithm."
+//
+// State dict keys:
+//   "p"  -> precision (int) in 4..16; number of registers = 2^p
+//   "m"  -> 2^p  (int)
+//   "r"  -> list of m ints, each holding the max rank seen for that register
+//
+// Hash: 63-bit h63 with seed 1125899906842597 multiplier 131.
+// The top p bits select the register; the remaining (63-p) bits provide the rank.
+// rank = leading-zeros-of-remaining + 1  (uses hll_leading_zeros helper).
+//
+// Estimate = alpha_m * m^2 / sum_j(2^-reg[j])
+//   alpha_m: m=16 -> 0.673; m=32 -> 0.697; m=64 -> 0.709; m>=128 -> 0.7213/(1+1.079/m)
+//
+// LEAF — imports nothing.  All helpers prefixed _hll_.
+
+// _hll_h63: deterministic 63-bit hash of a string (always positive).
+// Uses a polynomial roll with finalizer mixing for good bit distribution.
+// The finalizer (xor-shift mixing) ensures that similar strings like
+// "item0"/"item1" land in different high-bit positions, critical for HLL.
+fn _hll_h63(s) -> int
+    let h = 1125899906842597
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = ord(char_at(s, i))
+        h = (h * 131 + c) & 0x7FFFFFFFFFFFFFFF
+        i = i + 1
+    // Finalizer: xor-shift mixing to scatter low-bit differences into high bits.
+    // Uses shifts of 30 and 27 (safe for 63-bit: never >=64).
+    h = h ^ (h >> 30)
+    h = (h * 3885245554176576) & 0x7FFFFFFFFFFFFFFF
+    h = h ^ (h >> 27)
+    h = (h * 2022805297946304) & 0x7FFFFFFFFFFFFFFF
+    h = h ^ (h >> 31)
+    h
+
+// hll_leading_zeros: count leading zeros of the low `bits` bits of x, then +1 = rank.
+// Scans from the MSB of the `bits`-wide window downward.
+// Returns bits+1 when x (masked) == 0 (all zeros → rank = bits+1).
+fn hll_leading_zeros(x, bits) -> int
+    let mask = 0
+    let k = 0
+    while k < bits
+        mask = (mask << 1) | 1
+        k = k + 1
+    let val = x & mask
+    if val == 0
+        return bits + 1
+    let count = 0
+    let probe = 1 << (bits - 1)
+    let remain = bits
+    while remain > 0
+        let bit = val & probe
+        if bit != 0
+            return count + 1
+        count = count + 1
+        probe = probe >> 1
+        remain = remain - 1
+    bits + 1
+
+// hll_register_index: extract top p bits of h as the register index.
+fn hll_register_index(h, p) -> int
+    (h >> (63 - p)) & ((1 << p) - 1)
+
+// hll_rank: count leading zeros of the lower (63-p) bits of h, +1.
+fn hll_rank(h, p) -> int
+    let bits = 63 - p
+    let mask = 0
+    let k = 0
+    while k < bits
+        mask = (mask << 1) | 1
+        k = k + 1
+    let val = h & mask
+    hll_leading_zeros(val, bits)
+
+// _hll_alpha: bias-correction constant for m registers.
+fn _hll_alpha(m) -> float
+    if m == 16
+        return 0.673
+    if m == 32
+        return 0.697
+    if m == 64
+        return 0.709
+    let fm = m * 1.0
+    let a = 0.7213 / (1.0 + 1.079 / fm)
+    a
+
+// _hll_pow2neg: compute 2^(-v) as a float = 1.0 / 2^v.
+fn _hll_pow2neg(v) -> float
+    let result = 1.0
+    let k = 0
+    while k < v
+        result = result / 2.0
+        k = k + 1
+    result
+
+// hll_new: create a new HyperLogLog state with 2^p registers (p in 4..16).
+fn hll_new(p) -> any
+    let m = 1 << p
+    let regs = []
+    let i = 0
+    while i < m
+        push(regs, 0)
+        i = i + 1
+    let state = {}
+    state["p"] = p
+    state["m"] = m
+    state["r"] = regs
+    state
+
+// hll_add: add item (string) to the HLL state; returns updated state.
+fn hll_add(state, item) -> any
+    let h = _hll_h63(item)
+    let p = state["p"]
+    let idx = hll_register_index(h, p)
+    let rk = hll_rank(h, p)
+    let regs = state["r"]
+    let cur = regs[idx]
+    if rk > cur
+        regs[idx] = rk
+    state["r"] = regs
+    state
+
+// hll_count: estimate distinct items (HLL with small-range correction).
+// Small-range correction (Flajolet 2007 §4): if raw_E <= 2.5*m and V > 0
+//   use linear counting: m * ln(m/V)  where V = number of zero registers.
+fn hll_count(state) -> int
+    let p = state["p"]
+    let m = state["m"]
+    let regs = state["r"]
+    let alpha = _hll_alpha(m)
+    let fm = m * 1.0
+    let sum = 0.0
+    let zeros = 0
+    let i = 0
+    while i < m
+        let v = regs[i]
+        let pw = _hll_pow2neg(v)
+        sum = sum + pw
+        if v == 0
+            zeros = zeros + 1
+        i = i + 1
+    let raw = alpha * fm * fm / sum
+    // Small-range correction: if estimate <= 2.5*m and there are empty registers,
+    // use linear counting estimate instead (more accurate for sparse data).
+    let threshold = 2.5 * fm
+    if raw <= threshold and zeros > 0
+        let fz = zeros * 1.0
+        let ratio = fm / fz
+        let ln_val = log(ratio)
+        let lc_raw = fm * ln_val
+        let lc_est = lc_raw + 0.5
+        let k2 = 0
+        while k2 * 1.0 + 1.0 <= lc_est
+            k2 = k2 + 1
+        return k2
+    let est = raw + 0.5
+    let k = 0
+    while k * 1.0 + 1.0 <= est
+        k = k + 1
+    k
+
+// hll_merge: register-wise max of two HLL states (must have same p).
+fn hll_merge(a, b) -> any
+    let m = a["m"]
+    let ra = a["r"]
+    let rb = b["r"]
+    let out = []
+    let i = 0
+    while i < m
+        let va = ra[i]
+        let vb = rb[i]
+        if va > vb
+            push(out, va)
+        else
+            push(out, vb)
+        i = i + 1
+    let state = {}
+    state["p"] = a["p"]
+    state["m"] = m
+    state["r"] = out
+    state
+
+// hll_registers_used: count non-zero registers.
+fn hll_registers_used(state) -> int
+    let regs = state["r"]
+    let m = state["m"]
+    let count = 0
+    let i = 0
+    while i < m
+        if regs[i] != 0
+            count = count + 1
+        i = i + 1
+    count

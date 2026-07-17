@@ -1,0 +1,182 @@
+// std/sketch/distinctcount.nova — Linear Counting + Flajolet-Martin cardinality.
+//
+// Two independent algorithms for approximate distinct counting:
+//
+//  Linear Counting (Whang et al. 1990):
+//    State: a bitmap of m bits (list of 0/1).  Set bit h63(item) mod m.
+//    Estimate: -m * ln(empty/m) where empty = number of zero bits.
+//    When all bits are set (empty==0) return m (floor estimate).
+//
+//  Flajolet-Martin (1985):
+//    State: a single int bitmap.  For each item, compute trailing zeros of h63.
+//    Set bit at that position.  Estimate: 2^R / 0.77351 where R = lowest unset bit.
+//
+// Both algorithms are DETERMINISTIC for the same input sequence.
+// LEAF — imports nothing.  All helpers prefixed _dc_.
+
+// _dc_h63: 63-bit hash of a string (seed 1125899906842597, multiplier 131).
+fn _dc_h63(s) -> int
+    let h = 1125899906842597
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = ord(char_at(s, i))
+        h = (h * 131 + c) & 0x7FFFFFFFFFFFFFFF
+        i = i + 1
+    h
+
+// _dc_h63b: second independent 63-bit hash (seed 2654435761, multiplier 2246822519).
+fn _dc_h63b(s) -> int
+    let h = 2654435761
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = ord(char_at(s, i))
+        h = (h * 2246822519 + c) & 0x7FFFFFFFFFFFFFFF
+        i = i + 1
+    h
+
+// fm_trailing_zeros: count trailing zero bits of x (position of lowest set bit).
+// fm_trailing_zeros(0) returns a large sentinel (62) — all 62 usable bits are zero.
+// fm_trailing_zeros(1) == 0  (bit 0 is set)
+// fm_trailing_zeros(8) == 3  (8 = 0b1000, three trailing zeros)
+fn fm_trailing_zeros(x) -> int
+    if x == 0
+        return 62
+    let count = 0
+    let val = x
+    let lsb = val & 1
+    while lsb == 0
+        count = count + 1
+        val = val >> 1
+        lsb = val & 1
+    count
+
+// lc_new: create a Linear Counting state with m-bit bitmap (m should be a power of 2).
+fn lc_new(m) -> any
+    let bits = []
+    let i = 0
+    while i < m
+        push(bits, 0)
+        i = i + 1
+    let state = {}
+    state["m"] = m
+    state["b"] = bits
+    state
+
+// lc_add: set the bit at position h63(item) mod m in the bitmap.
+fn lc_add(state, item) -> any
+    let m = state["m"]
+    let h = _dc_h63(item)
+    let pos = h % m
+    let bits = state["b"]
+    bits[pos] = 1
+    state["b"] = bits
+    state
+
+// lc_zeros: count the number of zero bits in the bitmap.
+fn lc_zeros(state) -> int
+    let bits = state["b"]
+    let m = state["m"]
+    let count = 0
+    let i = 0
+    while i < m
+        if bits[i] == 0
+            count = count + 1
+        i = i + 1
+    count
+
+// lc_load: fraction of bits that are set (load factor = 1 - empty/m).
+fn lc_load(state) -> float
+    let m = state["m"]
+    let z = lc_zeros(state)
+    let fm = m * 1.0
+    let fz = z * 1.0
+    (fm - fz) / fm
+
+// lc_count: Linear Counting estimate = -m * log(empty/m).
+// If empty == 0 (bitmap full) return m as a floor.
+fn lc_count(state) -> int
+    let m = state["m"]
+    let empty = lc_zeros(state)
+    if empty == 0
+        return m
+    let fm = m * 1.0
+    let fe = empty * 1.0
+    let ratio = fe / fm
+    let ln_ratio = log(ratio)
+    let raw = 0.0 - fm * ln_ratio
+    let est = raw + 0.5
+    let k = 0
+    while k * 1.0 + 1.0 <= est
+        k = k + 1
+    k
+
+// lc_merge: union of two Linear Counting states (bitwise OR of bitmaps).
+// States must have the same m.
+fn lc_merge(a, b) -> any
+    let m = a["m"]
+    let ba = a["b"]
+    let bb = b["b"]
+    let out = []
+    let i = 0
+    while i < m
+        if ba[i] == 1 or bb[i] == 1
+            push(out, 1)
+        else
+            push(out, 0)
+        i = i + 1
+    let state = {}
+    state["m"] = m
+    state["b"] = out
+    state
+
+// fm_new: create a Flajolet-Martin state (single int bitmap).
+fn fm_new() -> any
+    let state = {}
+    state["bm"] = 0
+    state
+
+// fm_add: set bit at trailing-zeros position of h63(item) in the bitmap.
+fn fm_add(state, item) -> any
+    let h = _dc_h63(item)
+    let tz = fm_trailing_zeros(h)
+    if tz < 62
+        let bit = 1 << tz
+        state["bm"] = state["bm"] | bit
+    state
+
+// fm_estimate: estimate distinct count = 2^R / 0.77351 where R = lowest unset bit.
+// R is capped at 30 to avoid overflow in the 2^R computation.
+fn fm_estimate(state) -> int
+    let bm = state["bm"]
+    // Find R = index of the lowest unset bit (0-based).
+    // Scan bit positions 0..61; stop when we find an unset bit.
+    let r = 0
+    let found = 0
+    let scan = 0
+    while scan < 62 and found == 0
+        let bitmask = 1 << scan
+        let bit = bm & bitmask
+        if bit == 0
+            r = scan
+            found = 1
+        scan = scan + 1
+    // If all 62 bits are set, cap R at 30 (avoids overflow).
+    if found == 0
+        r = 30
+    // Cap R at 30 to avoid overflow: 2^30 ~ 1e9 which is manageable.
+    if r > 30
+        r = 30
+    // Compute 2^r / 0.77351 → round to int.
+    let pw = 1.0
+    let ki = 0
+    while ki < r
+        pw = pw * 2.0
+        ki = ki + 1
+    let raw = pw / 0.77351
+    let raw_int = raw + 0.5
+    let k = 0
+    while k * 1.0 + 1.0 <= raw_int
+        k = k + 1
+    k

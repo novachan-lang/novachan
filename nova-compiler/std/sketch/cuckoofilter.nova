@@ -1,0 +1,199 @@
+// cuckoofilter — Cuckoo filter: membership with deletion support.
+//
+// Representation (dict):
+//   "nb"      — number of buckets
+//   "bs"      — bucket size (slots per bucket)
+//   "buckets" — flat list of nb*bs int slots; 0 = empty, >0 = fingerprint
+//   "count"   — number of occupied slots
+//
+// Two candidate buckets per item: i1 = h63(item) % nb,
+//   i2 = i1 XOR (_cf_fp_hash(fp) % nb)  (alternate-index trick).
+// Fingerprint: low 8 bits of _h63(item), forced nonzero.
+// Insertion uses cuckoo eviction: cap MAX_KICKS=100 to bound worst case.
+//
+// Cuckoo filters have NO false negatives: after cf_add returns true,
+// cf_contains always returns true. False positives are possible but rare.
+
+// 63-bit primary hash (seed=1125899906842597, mult=131).
+fn _cf_h63(s: string) -> int
+    let h = 1125899906842597
+    let i = 0
+    let n = len(s)
+    while i < n
+        h = (h * 131 + ord(char_at(s, i))) & 0x7FFFFFFFFFFFFFFF
+        i = i + 1
+    return h
+
+// Secondary hash used to derive the alternate bucket index from a fingerprint.
+fn _cf_fp_hash(fp: int) -> int
+    let h = fp * 2654435761
+    let hv = h & 0x7FFFFFFFFFFFFFFF
+    return hv
+
+// Compute the non-zero fingerprint (low 8 bits of h63, forced >= 1).
+fn cf_fingerprint(item: string) -> int
+    let raw = _cf_h63(item) & 0xFF
+    if raw == 0
+        return 1
+    return raw
+
+// Return the first candidate bucket index for item.
+fn cf_i1(item: string, nbuckets: int) -> int
+    return _cf_h63(item) % nbuckets
+
+// Return the alternate bucket index given i1 and fingerprint.
+fn cf_i2(i1: int, fp: int, nbuckets: int) -> int
+    let alt = i1 ^ (_cf_fp_hash(fp) % nbuckets)
+    if alt < 0
+        let fix = alt + nbuckets
+        return fix
+    return alt
+
+// Create a new Cuckoo filter with num_buckets buckets and bucket_size slots each.
+fn cf_new(num_buckets: int, bucket_size: int) -> any
+    let slots = []
+    let total = num_buckets * bucket_size
+    let i = 0
+    while i < total
+        push(slots, 0)
+        i = i + 1
+    let state = {}
+    state["nb"] = num_buckets
+    state["bs"] = bucket_size
+    state["buckets"] = slots
+    state["count"] = 0
+    return state
+
+// Return the slot index for bucket b, slot s.
+fn _cf_slot(b: int, bs: int, s: int) -> int
+    return b * bs + s
+
+// Try to insert fingerprint fp into bucket b. Returns 1 on success, 0 if full.
+fn _cf_bucket_insert(slots: any, b: int, bs: int, fp: int) -> int
+    let s = 0
+    while s < bs
+        let idx = b * bs + s
+        if slots[idx] == 0
+            slots[idx] = fp
+            return 1
+        s = s + 1
+    return 0
+
+// Check if fingerprint fp is in bucket b. Returns 1 if found, 0 otherwise.
+fn _cf_bucket_has(slots: any, b: int, bs: int, fp: int) -> int
+    let s = 0
+    while s < bs
+        let idx = b * bs + s
+        if slots[idx] == fp
+            return 1
+        s = s + 1
+    return 0
+
+// Remove one occurrence of fingerprint fp from bucket b. Returns 1 on success.
+fn _cf_bucket_remove(slots: any, b: int, bs: int, fp: int) -> int
+    let s = 0
+    while s < bs
+        let idx = b * bs + s
+        if slots[idx] == fp
+            slots[idx] = 0
+            return 1
+        s = s + 1
+    return 0
+
+// Evict and return the fingerprint from the first occupied slot in bucket b.
+// Slot is set to 0. Returns 0 if bucket is empty (should not happen during kicks).
+fn _cf_bucket_evict(slots: any, b: int, bs: int) -> int
+    let s = 0
+    while s < bs
+        let idx = b * bs + s
+        let v = slots[idx]
+        if v != 0
+            slots[idx] = 0
+            return v
+        s = s + 1
+    return 0
+
+// Insert item into the filter. Returns true on success, false if filter is full.
+fn cf_add(state: any, item: string) -> bool
+    let nb = state["nb"]
+    let bs = state["bs"]
+    let slots = state["buckets"]
+    let fp = cf_fingerprint(item)
+    let b1 = cf_i1(item, nb)
+    let b2 = cf_i2(b1, fp, nb)
+    // Try primary bucket first
+    let ok1 = _cf_bucket_insert(slots, b1, bs, fp)
+    if ok1 == 1
+        state["count"] = state["count"] + 1
+        return true
+    // Try alternate bucket
+    let ok2 = _cf_bucket_insert(slots, b2, bs, fp)
+    if ok2 == 1
+        state["count"] = state["count"] + 1
+        return true
+    // Both full: cuckoo-kick from b2
+    let cur_b = b2
+    let cur_fp = fp
+    let kicks = 0
+    let max_kicks = 100
+    while kicks < max_kicks
+        let evicted = _cf_bucket_evict(slots, cur_b, bs)
+        slots[cur_b * bs] = cur_fp
+        cur_fp = evicted
+        let alt_b = cf_i2(cur_b, cur_fp, nb)
+        cur_b = alt_b
+        let tried = _cf_bucket_insert(slots, cur_b, bs, cur_fp)
+        if tried == 1
+            state["count"] = state["count"] + 1
+            return true
+        kicks = kicks + 1
+    return false
+
+// Check whether item might be in the filter (no false negatives guaranteed).
+fn cf_contains(state: any, item: string) -> bool
+    let nb = state["nb"]
+    let bs = state["bs"]
+    let slots = state["buckets"]
+    let fp = cf_fingerprint(item)
+    let b1 = cf_i1(item, nb)
+    let b2 = cf_i2(b1, fp, nb)
+    let f1 = _cf_bucket_has(slots, b1, bs, fp)
+    if f1 == 1
+        return true
+    let f2 = _cf_bucket_has(slots, b2, bs, fp)
+    if f2 == 1
+        return true
+    return false
+
+// Delete item from the filter. Returns true if found and removed.
+fn cf_delete(state: any, item: string) -> bool
+    let nb = state["nb"]
+    let bs = state["bs"]
+    let slots = state["buckets"]
+    let fp = cf_fingerprint(item)
+    let b1 = cf_i1(item, nb)
+    let b2 = cf_i2(b1, fp, nb)
+    let d1 = _cf_bucket_remove(slots, b1, bs, fp)
+    if d1 == 1
+        state["count"] = state["count"] - 1
+        return true
+    let d2 = _cf_bucket_remove(slots, b2, bs, fp)
+    if d2 == 1
+        state["count"] = state["count"] - 1
+        return true
+    return false
+
+// Return the number of items currently stored in the filter.
+fn cf_count(state: any) -> int
+    return state["count"]
+
+// Return the load factor (occupied slots / total slots) as a float.
+fn cf_load_factor(state: any) -> float
+    let nb = state["nb"]
+    let bs = state["bs"]
+    let cnt = state["count"]
+    let total = nb * bs
+    if total == 0
+        return 0.0
+    let lf = cnt * 1.0 / total
+    return lf
