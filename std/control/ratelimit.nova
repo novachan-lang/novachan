@@ -1,0 +1,198 @@
+// std/control/ratelimit.nova -- Nonlinear signal-shaping primitives for control systems.
+// LEAF -- imports NOTHING.
+//
+// Saturation, deadband, rate-limiting, hysteresis (Schmitt trigger), backlash, and quantization.
+// All stateful elements use flat lists as mutable state; mutated in place like forge_pid.
+//
+// Public API:
+//   sat_clamp(x,lo,hi)          -> float  hard clamp to [lo,hi]
+//   sat_apply(x,limit)          -> float  symmetric clamp to [-limit,+limit]
+//   deadband(x,width)           -> float  zero inside +/-width/2, else shifted
+//   deadband_centered(x,lo,hi)  -> float  zero inside [lo,hi], else pass-through
+//   rl_new(max_rate,dt)         -> list   rate-limiter state [max_rate, dt, value]
+//   rl_step(state,target)       -> float  limit change to max_rate*dt per step
+//   rl_reset(state,value)       -> list   reset state output to value
+//   hysteresis_new(lo,hi)       -> list   Schmitt trigger state [lo,hi,output_float]
+//   hysteresis_step(state,x)    -> bool   Schmitt: true above hi, false below lo, hold between
+//   backlash_new(width)         -> list   backlash state [width,last_output,last_input]
+//   backlash_step(state,x)      -> float  backlash (gear slop) model
+//   quantizer(x,step)           -> float  round to nearest quantization step
+//   quantizer_floor(x,step)     -> float  floor to quantization step
+
+// _rl_fabs -- float absolute value (abs() builtin returns int in NOVA).
+fn _rl_fabs(x)
+    if x < 0.0
+        let r = 0.0 - x
+        return r
+    let v = x * 1.0
+    return v
+
+// sat_clamp -- hard clamp x to the interval [lo, hi].
+// Returns lo if x < lo, hi if x > hi, else x unchanged.
+fn sat_clamp(x, lo, hi)
+    let xf = x * 1.0
+    let lof = lo * 1.0
+    let hif = hi * 1.0
+    if xf < lof
+        return lof
+    if xf > hif
+        return hif
+    return xf
+
+// sat_apply -- symmetric saturation: clamp x to [-limit, +limit].
+// limit must be >= 0. Equivalent to sat_clamp(x, -limit, limit).
+fn sat_apply(x, limit)
+    let xf = x * 1.0
+    let lf = limit * 1.0
+    let neg_limit = 0.0 - lf
+    if xf < neg_limit
+        return neg_limit
+    if xf > lf
+        return lf
+    return xf
+
+// deadband -- zero inside the symmetric band [-width/2, +width/2], else shift toward zero.
+// Values inside the band return 0.0. Values outside are shifted by half-width,
+// preserving continuity at the band edge. width must be >= 0.
+fn deadband(x, width)
+    let xf = x * 1.0
+    let half = width / 2.0
+    let neg_half = 0.0 - half
+    if xf > half
+        let v = xf - half
+        return v
+    if xf < neg_half
+        let v = xf + half
+        return v
+    return 0.0
+
+// deadband_centered -- zero inside [lo, hi]; pass-through outside (no shift).
+// Useful when the dead zone bounds are asymmetric or provided at runtime.
+fn deadband_centered(x, lo, hi)
+    let xf = x * 1.0
+    let lof = lo * 1.0
+    let hif = hi * 1.0
+    if xf >= lof and xf <= hif
+        return 0.0
+    return xf
+
+// rl_new -- create a rate-limiter state: [max_rate, dt, current_value].
+// max_rate: maximum change per unit time. dt: timestep in seconds.
+// current_value initialised to 0.0.
+fn rl_new(max_rate, dt)
+    let s = [max_rate * 1.0, dt * 1.0, 0.0]
+    return s
+
+// rl_step -- advance rate limiter toward target; returns new output value.
+// Output can change at most max_rate*dt per call. Updates state in place.
+fn rl_step(state, target)
+    let max_rate = state[0] * 1.0
+    let dt = state[1] * 1.0
+    let current = state[2] * 1.0
+    let max_delta = max_rate * dt
+    let tgt = target * 1.0
+    let diff = tgt - current
+    let adiff = _rl_fabs(diff)
+    let output = 0.0
+    if adiff <= max_delta
+        output = tgt
+    else
+        if diff > 0.0
+            output = current + max_delta
+        else
+            output = current - max_delta
+    state[2] = output
+    return output
+
+// rl_reset -- reset the rate-limiter current value to the given value.
+// Returns the modified state (same list, mutated in place).
+fn rl_reset(state, value)
+    state[2] = value * 1.0
+    return state
+
+// hysteresis_new -- create Schmitt-trigger state: [lo_threshold, hi_threshold, out_float].
+// out_float starts at 0.0 (false). Requires lo < hi for correct hysteresis behaviour.
+fn hysteresis_new(lo, hi)
+    let s = [lo * 1.0, hi * 1.0, 0.0]
+    return s
+
+// hysteresis_step -- Schmitt trigger: output goes true when x >= hi, false when x <= lo.
+// Holds its previous output when x is strictly between lo and hi.
+fn hysteresis_step(state, x)
+    let lo = state[0] * 1.0
+    let hi = state[1] * 1.0
+    let xf = x * 1.0
+    if xf >= hi
+        state[2] = 1.0
+        return true
+    if xf <= lo
+        state[2] = 0.0
+        return false
+    let cur = state[2] * 1.0
+    let was_on = cur > 0.5
+    return was_on
+
+// backlash_new -- create backlash (gear slop) state: [width, last_output, last_input].
+// Backlash models the dead zone in mechanical drive trains where direction reversal
+// produces no output movement until the full gap has been traversed.
+fn backlash_new(width)
+    let s = [width * 1.0, 0.0, 0.0]
+    return s
+
+// backlash_step -- advance backlash model with new input x; returns current output.
+// Output only moves when the input has moved more than half-width past the last
+// direction-reversal point.
+fn backlash_step(state, x)
+    let width = state[0] * 1.0
+    let last_out = state[1] * 1.0
+    let last_in = state[2] * 1.0
+    let half = width / 2.0
+    let xf = x * 1.0
+    let diff = xf - last_in
+    let new_out = last_out
+    if diff > 0.0
+        let upper = last_out + half
+        if xf > upper
+            new_out = xf - half
+    else
+        if diff < 0.0
+            let lower = last_out - half
+            if xf < lower
+                new_out = xf + half
+    state[1] = new_out
+    state[2] = xf
+    return new_out
+
+// _floor_f -- floor toward -infinity (NOVA int() truncates toward zero, which is
+// WRONG for negatives; this corrects it so quantization works for negative inputs).
+fn _floor_f(v) -> int
+    let t = int(v)
+    let tf = t * 1.0
+    if v < tf
+        return t - 1
+    return t
+
+// quantizer -- round x to the nearest multiple of step (correct for negatives).
+// quantizer(2.3, 0.5) == 2.5; quantizer(2.1, 0.5) == 2.0; quantizer(-0.7, 1.0) == -1.0.
+// step must be > 0.
+fn quantizer(x, step)
+    let sf = step * 1.0
+    let xf = x * 1.0
+    let ratio = xf / sf
+    let shifted = ratio + 0.5
+    let iv = _floor_f(shifted)
+    let ivf = iv * 1.0
+    let result = ivf * sf
+    return result
+
+// quantizer_floor -- floor x to the nearest lower multiple of step.
+// quantizer_floor(2.3, 0.5) == 2.0; quantizer_floor(2.5, 0.5) == 2.5.
+// step must be > 0.
+fn quantizer_floor(x, step)
+    let sf = step * 1.0
+    let xf = x * 1.0
+    let ratio = xf / sf
+    let iv = _floor_f(ratio)
+    let ivf = iv * 1.0
+    let result = ivf * sf
+    return result

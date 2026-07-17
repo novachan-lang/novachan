@@ -1,0 +1,211 @@
+// std/control/motionprofile.nova -- Trapezoidal and S-curve motion profiles for robotics.
+// LEAF -- imports NOTHING.
+//
+// A trapezoidal profile has three phases:
+//   1. Acceleration: 0 .. t_accel  (ramp from 0 to vmax at constant acceleration amax)
+//   2. Cruise:       t_accel .. t_accel+t_cruise  (constant velocity vmax)
+//   3. Deceleration: t_accel+t_cruise .. total  (ramp from vmax to 0)
+// A triangular profile occurs when the distance is too short to reach vmax.
+//
+// Profile dict keys: "distance","vmax","amax","t_accel","t_cruise","t_total","v_peak"
+//
+// Public API:
+//   mp_trapezoid(distance,vmax,amax)        -> any    build profile dict
+//   mp_duration(profile)                    -> float  total time
+//   mp_position(profile,t)                  -> float  position at t
+//   mp_velocity(profile,t)                  -> float  velocity at t
+//   mp_acceleration(profile,t)              -> float  acceleration at t
+//   mp_is_triangular(distance,vmax,amax)    -> bool   true if never reaches vmax
+//   mp_peak_velocity(profile)               -> float  actual peak velocity
+//   mp_accel_time(profile)                  -> float  acceleration phase duration
+//   mp_cruise_time(profile)                 -> float  cruise phase duration
+//   mp_scurve_duration(d,vmax,amax,jmax)    -> float  approximate S-curve total time
+//   mp_position_normalized(profile,t)       -> float  position as fraction 0..1
+//   mp_reverse(profile,t)                   -> float  position traversed in reverse
+//   mp_total_distance(profile)              -> float  total distance
+
+// _abs_f -- float absolute value.
+fn _abs_f(x: float) -> float
+    if x < 0.0
+        return 0.0 - x
+    x
+
+// _sqrt_f -- square root (delegates to builtin).
+fn _sqrt_f(x: float) -> float
+    sqrt(x)
+
+// mp_trapezoid -- Build a trapezoidal (or triangular) motion profile.
+// If distance < vmax^2/amax, it is triangular: peak velocity = sqrt(amax*distance).
+fn mp_trapezoid(distance: float, vmax: float, amax: float) -> any
+    let d = _abs_f(distance)
+    let vm = _abs_f(vmax)
+    let am = _abs_f(amax)
+    let p = {}
+    p["distance"] = d
+    p["vmax"] = vm
+    p["amax"] = am
+    // Degenerate guard: zero (or negative) vmax/amax would divide by zero.
+    if am <= 0.0 or vm <= 0.0
+        p["v_peak"] = 0.0
+        p["t_accel"] = 0.0
+        p["t_cruise"] = 0.0
+        p["t_total"] = 0.0
+        return p
+    // minimum distance to reach vmax: d_min = vmax^2 / amax
+    let d_min = vm * vm / am
+    let v_peak = 0.0
+    let t_accel = 0.0
+    let t_cruise = 0.0
+    let t_total = 0.0
+    if d < d_min
+        // triangular: never reaches vmax
+        let sq = _sqrt_f(am * d)
+        v_peak = sq
+        t_accel = v_peak / am
+        t_cruise = 0.0
+        t_total = 2.0 * t_accel
+    else
+        v_peak = vm
+        t_accel = vm / am
+        let d_cruise = d - d_min
+        t_cruise = d_cruise / vm
+        t_total = 2.0 * t_accel + t_cruise
+    p["v_peak"] = v_peak
+    p["t_accel"] = t_accel
+    p["t_cruise"] = t_cruise
+    p["t_total"] = t_total
+    p
+
+// mp_duration -- Total profile duration.
+fn mp_duration(profile: any) -> float
+    profile["t_total"] * 1.0
+
+// mp_position -- Position at time t along the profile.
+fn mp_position(profile: any, t: float) -> float
+    let d = profile["distance"] * 1.0
+    let am = profile["amax"] * 1.0
+    let vp = profile["v_peak"] * 1.0
+    let ta = profile["t_accel"] * 1.0
+    let tc2 = profile["t_cruise"] * 1.0
+    let tt = profile["t_total"] * 1.0
+    if t <= 0.0
+        return 0.0
+    if t >= tt
+        return d
+    if t <= ta
+        // acceleration phase: s = 0.5*a*t^2
+        let pos = 0.5 * am * t * t
+        return pos
+    let t_dec_start = ta + tc2
+    if t <= t_dec_start
+        // cruise phase
+        let d_accel = 0.5 * am * ta * ta
+        let pos = d_accel + vp * (t - ta)
+        return pos
+    // deceleration phase
+    let d_accel = 0.5 * am * ta * ta
+    let d_cruise = vp * tc2
+    let t_dec = t - t_dec_start
+    let pos = d_accel + d_cruise + vp * t_dec - 0.5 * am * t_dec * t_dec
+    pos
+
+// mp_velocity -- Velocity at time t.
+fn mp_velocity(profile: any, t: float) -> float
+    let am = profile["amax"] * 1.0
+    let vp = profile["v_peak"] * 1.0
+    let ta = profile["t_accel"] * 1.0
+    let tc2 = profile["t_cruise"] * 1.0
+    let tt = profile["t_total"] * 1.0
+    if t <= 0.0
+        return 0.0
+    if t >= tt
+        return 0.0
+    if t <= ta
+        return am * t
+    let t_dec_start = ta + tc2
+    if t <= t_dec_start
+        return vp
+    let t_dec = t - t_dec_start
+    let vel = vp - am * t_dec
+    vel
+
+// mp_acceleration -- Signed acceleration at time t (+amax, 0, or -amax).
+fn mp_acceleration(profile: any, t: float) -> float
+    let am = profile["amax"] * 1.0
+    let ta = profile["t_accel"] * 1.0
+    let tc2 = profile["t_cruise"] * 1.0
+    let tt = profile["t_total"] * 1.0
+    if t <= 0.0
+        return 0.0
+    if t >= tt
+        return 0.0
+    if t < ta
+        return am
+    let t_dec_start = ta + tc2
+    if t <= t_dec_start
+        return 0.0
+    0.0 - am
+
+// mp_is_triangular -- True if distance is too short to ever reach vmax.
+fn mp_is_triangular(distance: float, vmax: float, amax: float) -> bool
+    let d = _abs_f(distance)
+    let vm = _abs_f(vmax)
+    let am = _abs_f(amax)
+    let d_min = vm * vm / am
+    d < d_min
+
+// mp_peak_velocity -- Actual peak velocity achieved in this profile.
+fn mp_peak_velocity(profile: any) -> float
+    profile["v_peak"] * 1.0
+
+// mp_accel_time -- Duration of the acceleration phase.
+fn mp_accel_time(profile: any) -> float
+    profile["t_accel"] * 1.0
+
+// mp_cruise_time -- Duration of the cruise (constant velocity) phase.
+fn mp_cruise_time(profile: any) -> float
+    profile["t_cruise"] * 1.0
+
+// mp_scurve_duration -- Approximate total time for an S-curve profile with jerk limit jmax.
+// Uses the jerk-limited trapezoidal formula; this is an APPROXIMATION (tends to over-estimate
+// vs the exact d/vmax + vmax/amax + amax/jmax bound), not an exact bound.
+// t_j = min(sqrt(vmax/jmax), amax/jmax); t_a = vmax/amax; t_total = 2*t_j + 2*t_a + d/vmax.
+fn mp_scurve_duration(distance: float, vmax: float, amax: float, jmax: float) -> float
+    let d = _abs_f(distance)
+    let vm = _abs_f(vmax)
+    let am = _abs_f(amax)
+    let jm = _abs_f(jmax)
+    // Degenerate guard: zero vmax/amax/jmax would divide by zero.
+    if vm <= 0.0 or am <= 0.0 or jm <= 0.0
+        return 0.0
+    let t_j_a = _sqrt_f(vm / jm)
+    let t_j_b = am / jm
+    let t_j = 0.0
+    if t_j_a < t_j_b
+        t_j = t_j_a
+    else
+        t_j = t_j_b
+    let t_a = vm / am
+    let t_cruise = d / vm
+    let total = 2.0 * t_j + 2.0 * t_a + t_cruise
+    total
+
+// mp_position_normalized -- Position as a fraction in [0,1] of total distance.
+fn mp_position_normalized(profile: any, t: float) -> float
+    let d = profile["distance"] * 1.0
+    if d <= 0.0
+        return 0.0
+    let pos = mp_position(profile, t)
+    let frac = pos / d
+    frac
+
+// mp_reverse -- Position when traversing the profile in reverse (total - position).
+fn mp_reverse(profile: any, t: float) -> float
+    let d = profile["distance"] * 1.0
+    let pos = mp_position(profile, t)
+    let rev = d - pos
+    rev
+
+// mp_total_distance -- Total distance covered by this profile.
+fn mp_total_distance(profile: any) -> float
+    profile["distance"] * 1.0

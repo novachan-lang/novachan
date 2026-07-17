@@ -1,0 +1,183 @@
+// std/control/lqr.nova -- Scalar/1-D pole placement and LQR gain helpers.
+// LEAF -- imports NOTHING.
+//
+// Provides analytical solutions for 1-D (scalar) continuous-time LQR,
+// pole placement, closed-loop analysis, and second-order system characterisation.
+// All functions are pure (no mutable state).
+//
+// Public API:
+//   lqr_scalar_gain(a,b,q,r)        -> float  1-D continuous LQR gain via scalar Riccati
+//   place_pole_1d(a,b,desired_pole) -> float  gain k such that a - b*k == desired_pole
+//   closed_loop_pole_1d(a,b,k)      -> float  a - b*k
+//   is_controllable_1d(a,b)         -> bool   b != 0
+//   settling_from_pole(pole,dt)     -> float  approximate settling time from a real pole
+//   damping_from_poles(p1,p2)       -> float  damping ratio for a conjugate pair
+//   natural_freq(p1,p2)             -> float  natural frequency from conjugate pair
+//   overshoot_from_damping(zeta)    -> float  exp(-pi*zeta/sqrt(1-zeta^2)); 0 for zeta>=1
+//   pole_from_settling(ts)          -> float  approximate real pole: -4/ts
+//   gain_margin_hint(a,b,k)         -> float  gain headroom: reciprocal of closed-loop gain
+//   lqr_cost_1d(a,b,k,q,r)         -> float  LQR infinite-horizon cost estimate J = (q + r*k^2) / (-2*(a-b*k))
+//   stable_1d(a,b,k)               -> bool   closed-loop pole < 0 (continuous-time)
+
+// _lqr_fabs -- float absolute value (abs() builtin returns int in NOVA).
+fn _lqr_fabs(x)
+    if x < 0.0
+        let r = 0.0 - x
+        return r
+    let v = x * 1.0
+    return v
+
+// _lqr_pi -- pi constant.
+fn _lqr_pi()
+    return 3.141592653589793
+
+// lqr_scalar_gain -- 1-D continuous-time LQR gain via the scalar algebraic Riccati equation.
+// The ARE for x_dot = a*x + b*u, cost = integral(q*x^2 + r*u^2):
+//   a*P + P*a - P*b*(1/r)*b*P + q = 0  =>  P = (a + sqrt(a^2 + b^2*q/r)) * r / b^2
+// Optimal gain k = (b/r)*P = (a + sqrt(a^2 + b^2*q/r)) / b.
+// Caller must ensure b != 0 and r > 0.
+fn lqr_scalar_gain(a, b, q, r)
+    let af = a * 1.0
+    let bf = b * 1.0
+    let qf = q * 1.0
+    let rf = r * 1.0
+    let a2 = af * af
+    let b2qr = bf * bf * qf / rf
+    let disc = a2 + b2qr
+    let sq = sqrt(disc)
+    let numer = af + sq
+    let k = numer / bf
+    return k
+
+// place_pole_1d -- compute gain k such that closed-loop pole a - b*k == desired_pole.
+// k = (a - desired_pole) / b. Caller must ensure b != 0.
+fn place_pole_1d(a, b, desired_pole)
+    let af = a * 1.0
+    let bf = b * 1.0
+    let dpf = desired_pole * 1.0
+    let k = (af - dpf) / bf
+    return k
+
+// closed_loop_pole_1d -- compute the closed-loop pole: a - b*k.
+fn closed_loop_pole_1d(a, b, k)
+    let af = a * 1.0
+    let bf = b * 1.0
+    let kf = k * 1.0
+    let pole = af - bf * kf
+    return pole
+
+// is_controllable_1d -- a 1-D system x_dot = a*x + b*u is controllable iff b != 0.
+fn is_controllable_1d(a, b)
+    let bf = b * 1.0
+    let tiny = 0.0000001
+    let ab = _lqr_fabs(bf)
+    return ab > tiny
+
+// settling_from_pole -- approximate settling time from a stable real pole.
+// For a continuous system e^(pole*t), the 2% settling criterion gives ts = -4/pole.
+// Returns 0.0 for pole >= 0 (unstable or marginally stable).
+fn settling_from_pole(pole, dt)
+    let pf = pole * 1.0
+    if pf >= 0.0
+        return 0.0
+    let ts = (0.0 - 4.0) / pf
+    return ts
+
+// damping_from_poles -- damping ratio zeta for a 2nd-order conjugate pair.
+// Given poles p1 = -zeta*wn + j*wd, p2 = -zeta*wn - j*wd,
+// the real part is -zeta*wn and the natural frequency wn = sqrt(real^2 + imag^2).
+// For real poles p1, p2 (both negative), treat as critically/overdamped:
+//   zeta = -p1/wn where wn = sqrt(p1*p2) when p1,p2 have same sign.
+// For general use, caller provides real parts as p1 and p2 (imaginary parts as signed float).
+// This helper assumes p1 = sigma (real part, negative) and p2 = omega_d (imaginary part magnitude).
+// zeta = sigma / sqrt(sigma^2 + omega_d^2) = |real| / wn.
+fn damping_from_poles(p1, p2)
+    let sigma = _lqr_fabs(p1 * 1.0)
+    let omegad = _lqr_fabs(p2 * 1.0)
+    let wn2 = sigma * sigma + omegad * omegad
+    let wn = sqrt(wn2)
+    let tiny = 0.0000001
+    if wn < tiny
+        return 1.0
+    let zeta = sigma / wn
+    return zeta
+
+// natural_freq -- natural frequency from a conjugate pair (sigma, omega_d).
+// wn = sqrt(sigma^2 + omega_d^2); p1 = real-part magnitude, p2 = imaginary-part magnitude.
+fn natural_freq(p1, p2)
+    let s = p1 * 1.0
+    let o = p2 * 1.0
+    let wn2 = s * s + o * o
+    let wn = sqrt(wn2)
+    return wn
+
+// overshoot_from_damping -- percent overshoot from damping ratio zeta.
+// For underdamped (zeta < 1): OS = exp(-pi*zeta / sqrt(1 - zeta^2)).
+// For critically damped or overdamped (zeta >= 1): returns 0.0.
+// For zeta == 0 (undamped): returns 1.0 (100% overshoot).
+fn overshoot_from_damping(zeta)
+    let z = zeta * 1.0
+    if z >= 1.0
+        return 0.0
+    let pi = _lqr_pi()
+    let z2 = z * z
+    let denom_sq = 1.0 - z2
+    let denom = sqrt(denom_sq)
+    let exponent = (0.0 - pi * z) / denom
+    let os = exp(exponent)
+    return os
+
+// pole_from_settling -- approximate real dominant pole from desired settling time ts.
+// Inverse of settling criterion: pole = -4 / ts (2% criterion).
+// Returns 0.0 for ts <= 0 to avoid division by zero.
+fn pole_from_settling(ts)
+    let tsf = ts * 1.0
+    let tiny = 0.0000001
+    if tsf < tiny
+        return 0.0
+    let pole = (0.0 - 4.0) / tsf
+    return pole
+
+// gain_margin_hint -- rough gain margin: how much gain can increase before instability.
+// For a 1-D system this is: 1 / |closed_loop_pole| (reciprocal of pole magnitude).
+// Returns 999.0 if pole is near zero (very stable).
+fn gain_margin_hint(a, b, k)
+    let af = a * 1.0
+    let bf = b * 1.0
+    let kf = k * 1.0
+    let pole = af - bf * kf
+    let apole = _lqr_fabs(pole)
+    let tiny = 0.0000001
+    if apole < tiny
+        return 999.0
+    let gm = 1.0 / apole
+    return gm
+
+// lqr_cost_1d -- LQR infinite-horizon cost estimate for 1-D system.
+// Under optimal control u = -k*x, the closed-loop system is x_dot = (a - b*k)*x.
+// The LQR cost J = integral_0^inf (q*x^2 + r*(k*x)^2) dt.
+// For stable CL pole cl = a-b*k < 0, and x(t)=x0*exp(cl*t),
+//   J = (q + r*k^2) * x0^2 / (-2*cl).
+// Normalised to x0=1: J = (q + r*k^2) / (-2*(a-b*k)).
+// Returns 999999.0 if closed-loop is not stable.
+fn lqr_cost_1d(a, b, k, q, r)
+    let af = a * 1.0
+    let bf = b * 1.0
+    let kf = k * 1.0
+    let qf = q * 1.0
+    let rf = r * 1.0
+    let cl = af - bf * kf
+    if cl >= 0.0
+        return 999999.0
+    let numer = qf + rf * kf * kf
+    let denom = (0.0 - 2.0) * cl
+    let cost = numer / denom
+    return cost
+
+// stable_1d -- true iff the closed-loop continuous-time pole a - b*k is strictly negative.
+fn stable_1d(a, b, k)
+    let af = a * 1.0
+    let bf = b * 1.0
+    let kf = k * 1.0
+    let pole = af - bf * kf
+    return pole < 0.0
