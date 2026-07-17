@@ -1,0 +1,108 @@
+// std/coding/crc_param.nova — Fully parameterized bitwise CRC engine.
+//
+// Implements a generic CRC algorithm following the Rocksoft Model:
+//   Width  : CRC register width in bits (8, 16, or 32 supported here)
+//   Poly   : Generator polynomial (normal/MSB-first representation)
+//   Init   : Initial CRC register value
+//   RefIn  : Reflect each input byte before processing (bool as 0/1)
+//   RefOut : Reflect the final CRC register before XorOut (bool as 0/1)
+//   XorOut : Value XOR'd with the final CRC before returning
+//
+// The core engine processes one byte at a time using bit-by-bit iteration
+// (no lookup table), making it easy to verify and parameterize.
+//
+// Verified check values for "123456789" (bytes 49..57):
+//   CRC-8/SMBUS           : 0xF4   (244)
+//   CRC-16/CCITT-FALSE    : 0x29B1 (10673)
+//   CRC-16/MODBUS         : 0x4B37 (19255)
+//   CRC-32/ISO-HDLC       : 0xCBF43926 (3421780262)
+//
+// NOVA hazards in this file:
+//   - '>>' is ARITHMETIC (sign-extending). Mask with & 0x7FFFFFFF after
+//     right-shifting 32-bit values that may have bit 31 set.
+//   - Bitwise-vs-== footgun: split all (expr & MASK) into a let before ==.
+//   - No multi-line list literals. Build byte lists with push in a while loop.
+//
+// SELF-CONTAINED — imports NOTHING.
+// All private helpers are prefixed _cp_ to avoid global symbol collisions.
+
+// _cp_mask — build a width-bit all-ones mask (up to 32 bits).
+fn _cp_mask(width) -> int
+    if width >= 32
+        return 0xFFFFFFFF
+    (1 << width) - 1
+
+// cp_reflect — bit-reverse the low `bits` bits of v.
+// Example: cp_reflect(0x01, 8) == 0x80; cp_reflect(0xB1, 8) == 0x8D.
+fn cp_reflect(v, bits) -> int
+    let result = 0
+    let i = 0
+    while i < bits
+        let shifted = v >> i
+        let lsb = shifted & 1
+        result = result | (lsb << (bits - 1 - i))
+        i = i + 1
+    result
+
+// _cp_reflect_byte — reflect a single byte (8 bits).
+fn _cp_reflect_byte(b) -> int
+    cp_reflect(b & 0xFF, 8)
+
+// cp_crc — fully parameterized bitwise CRC over a list of byte values (0..255).
+// width  : CRC width in bits (8, 16, or 32)
+// poly   : generator polynomial (normal form, MSB first)
+// init   : initial register value
+// refin  : 1 to reflect each input byte, 0 otherwise
+// refout : 1 to reflect the output CRC, 0 otherwise
+// xorout : final XOR mask
+fn cp_crc(data_bytes, width, poly, init, refin, refout, xorout) -> int
+    let mask = _cp_mask(width)
+    let crc = init & mask
+    let top_bit = 1 << (width - 1)
+    let n = len(data_bytes)
+    let i = 0
+    while i < n
+        let raw_byte = data_bytes[i] & 0xFF
+        let byte = raw_byte
+        if refin == 1
+            byte = _cp_reflect_byte(raw_byte)
+        // XOR byte into the top of the CRC register
+        crc = crc ^ (byte << (width - 8))
+        crc = crc & mask
+        let j = 0
+        while j < 8
+            let topset = crc & top_bit
+            crc = (crc << 1) & mask
+            if topset != 0
+                crc = crc ^ poly
+            j = j + 1
+        i = i + 1
+    if refout == 1
+        crc = cp_reflect(crc, width)
+    (crc ^ xorout) & mask
+
+// cp_crc8 — CRC-8/SMBUS: poly=0x07, init=0, no reflection, no xorout.
+// Check value for "123456789": 0xF4 (244).
+fn cp_crc8(data) -> int
+    cp_crc(data, 8, 0x07, 0x00, 0, 0, 0x00)
+
+// cp_crc16_ccitt_false — CRC-16/CCITT-FALSE: poly=0x1021, init=0xFFFF, no reflect.
+// Check value for "123456789": 0x29B1 (10673).
+fn cp_crc16_ccitt_false(data) -> int
+    cp_crc(data, 16, 0x1021, 0xFFFF, 0, 0, 0x0000)
+
+// cp_crc16_modbus — CRC-16/MODBUS: poly=0x8005, init=0xFFFF, refin+refout, no xorout.
+// Check value for "123456789": 0x4B37 (19255).
+fn cp_crc16_modbus(data) -> int
+    cp_crc(data, 16, 0x8005, 0xFFFF, 1, 1, 0x0000)
+
+// cp_crc32 — CRC-32/ISO-HDLC: poly=0x04C11DB7, init=0xFFFFFFFF, refin+refout, xorout=0xFFFFFFFF.
+// Check value for "123456789": 0xCBF43926 (3421780262).
+fn cp_crc32(data) -> int
+    cp_crc(data, 32, 0x04C11DB7, 0xFFFFFFFF, 1, 1, 0xFFFFFFFF)
+
+// cp_crc_check — compute a CRC and compare to an expected value.
+// Returns true iff the computed CRC matches expected.
+fn cp_crc_check(data, width, poly, init, refin, refout, xorout, expected) -> bool
+    let result = cp_crc(data, width, poly, init, refin, refout, xorout)
+    result == expected

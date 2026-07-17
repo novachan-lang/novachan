@@ -1,0 +1,198 @@
+// ============================================================================
+// NOVA Standard Library — std/coding/parity2d
+// ============================================================================
+// Two-dimensional parity (2D parity / product code): arrange data bits in a
+// rows x cols grid, add one even-parity bit per row, one per column, and one
+// corner parity bit.  Detects all 1-, 2-, and 3-bit errors; CORRECTS single-
+// bit errors by intersecting the failing row and column.
+//
+// CODEWORD LAYOUT (flat list of ints, each 0 or 1):
+//   [data_0, data_1, ..., data_{rows*cols-1},        -- data block
+//    rp_0, rp_1, ..., rp_{rows-1},                   -- row parities
+//    cp_0, cp_1, ..., cp_{cols-1},                   -- col parities
+//    corner]                                         -- corner parity bit
+//   Total length = rows*cols + rows + cols + 1
+//
+// Row parity rp_r = XOR of data[r*cols .. r*cols+cols-1]  (even parity)
+// Col parity cp_c = XOR of data[c], data[cols+c], ..., data[(rows-1)*cols+c]
+// Corner     = XOR of all row parities = XOR of all col parities
+//
+// SYNDROME: for each row r, syndrome_row[r] = XOR of data row r + rp_r.
+//   A non-zero syndrome_row[r] flags row r.  Similarly for cols.
+//   Single-bit error at (r,c) is corrected by flipping that position.
+//
+// SYMBOLS: all public fns prefixed p2_
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// list_eq: true iff two int lists have same length and contents.
+fn _p2_list_eq(a, b) -> bool
+    let la = len(a)
+    let lb = len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if a[i] != b[i]
+            return 0
+        i = i + 1
+    1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// p2_row_parity: compute even parity (XOR) of row r in `grid` (a flat data list).
+// grid is stored row-major: element (r,c) = grid[r*cols + c].
+fn p2_row_parity(grid, r, cols) -> int
+    let p = 0
+    let c = 0
+    while c < cols
+        p = p ^ (grid[r * cols + c] & 1)
+        c = c + 1
+    p
+
+// p2_col_parity: compute even parity (XOR) of column c in `grid`.
+fn p2_col_parity(grid, c, rows, cols) -> int
+    let p = 0
+    let r = 0
+    while r < rows
+        p = p ^ (grid[r * cols + c] & 1)
+        r = r + 1
+    p
+
+// p2_encode: encode a flat list of rows*cols data bits as a 2D-parity codeword.
+// Returns a flat list: [data..., row_parities..., col_parities..., corner].
+fn p2_encode(bits, rows, cols) -> any
+    let out = []
+    // Copy data bits
+    let nd = rows * cols
+    let i = 0
+    while i < nd
+        push(out, bits[i] & 1)
+        i = i + 1
+    // Append row parities
+    let r = 0
+    while r < rows
+        push(out, p2_row_parity(bits, r, cols))
+        r = r + 1
+    // Append col parities
+    let c = 0
+    while c < cols
+        push(out, p2_col_parity(bits, c, rows, cols))
+        c = c + 1
+    // Corner parity = XOR of all row parities (= XOR of all data bits)
+    let corner = 0
+    let k = 0
+    while k < nd
+        corner = corner ^ (bits[k] & 1)
+        k = k + 1
+    push(out, corner)
+    out
+
+// p2_syndrome: compute row and column syndromes for a received codeword.
+// Returns a dict with keys "row_syn" (list) and "col_syn" (list).
+// Syndrome for row r = XOR of received data row r with received row parity rp_r.
+// A non-zero syndrome indicates an error in that row/col.
+fn p2_syndrome(code, rows, cols) -> any
+    let nd = rows * cols
+    // row syndromes
+    let row_syn = []
+    let r = 0
+    while r < rows
+        let s = code[nd + r]  // received row parity
+        let c = 0
+        while c < cols
+            s = s ^ (code[r * cols + c] & 1)
+            c = c + 1
+        push(row_syn, s & 1)
+        r = r + 1
+    // col syndromes
+    let col_syn = []
+    let cc = 0
+    while cc < cols
+        let s2 = code[nd + rows + cc]  // received col parity
+        let rr = 0
+        while rr < rows
+            s2 = s2 ^ (code[rr * cols + cc] & 1)
+            rr = rr + 1
+        push(col_syn, s2 & 1)
+        cc = cc + 1
+    let res = {}
+    res["row_syn"] = row_syn
+    res["col_syn"] = col_syn
+    res
+
+// p2_check: true (1) iff no error is detected in the codeword.
+// All row parities and all col parities must compute to 0.
+fn p2_check(code, rows, cols) -> bool
+    let syn = p2_syndrome(code, rows, cols)
+    let rs = syn["row_syn"]
+    let cs = syn["col_syn"]
+    let r = 0
+    while r < rows
+        if rs[r] != 0
+            return 0
+        r = r + 1
+    let c = 0
+    while c < cols
+        if cs[c] != 0
+            return 0
+        c = c + 1
+    1
+
+// p2_find_error: locate a single-bit error by intersecting failing row and col.
+// Returns [error_row, error_col] if exactly one row and one col syndrome are
+// non-zero (= single data-bit error), or [-1, -1] if no error or uncorrectable.
+fn p2_find_error(code, rows, cols) -> any
+    let syn = p2_syndrome(code, rows, cols)
+    let rs = syn["row_syn"]
+    let cs = syn["col_syn"]
+    // Count failing rows and cols
+    let err_r = 0 - 1
+    let n_row_err = 0
+    let r = 0
+    while r < rows
+        if rs[r] != 0
+            n_row_err = n_row_err + 1
+            err_r = r
+        r = r + 1
+    let err_c = 0 - 1
+    let n_col_err = 0
+    let c = 0
+    while c < cols
+        if cs[c] != 0
+            n_col_err = n_col_err + 1
+            err_c = c
+        c = c + 1
+    // Single data-bit error: exactly one failing row AND one failing col
+    if n_row_err == 1 and n_col_err == 1
+        let out = []
+        push(out, err_r)
+        push(out, err_c)
+        return out
+    // No error or parity-bit error or multi-bit error: return sentinel
+    let out2 = []
+    push(out2, 0 - 1)
+    push(out2, 0 - 1)
+    out2
+
+// p2_decode: recover the original rows*cols data bits from a codeword,
+// correcting a single-bit error if present.
+// Returns the corrected data bits (list of rows*cols ints, 0 or 1).
+fn p2_decode(code, rows, cols) -> any
+    let nd = rows * cols
+    // Copy data portion into mutable list
+    let data = []
+    let i = 0
+    while i < nd
+        push(data, code[i] & 1)
+        i = i + 1
+    // Find and fix single error
+    let loc = p2_find_error(code, rows, cols)
+    let er = loc[0]
+    let ec = loc[1]
+    if er >= 0 and ec >= 0
+        let pos = er * cols + ec
+        data[pos] = (data[pos] ^ 1) & 1
+    data
