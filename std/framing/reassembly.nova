@@ -1,0 +1,189 @@
+// ============================================================================
+// NOVA Standard Library — std/framing/reassembly
+// ============================================================================
+// Stateful stream frame reassembler.
+//
+// Accumulates incoming bytes and emits complete frames as they become
+// available. Two concrete reassembly strategies are provided:
+//
+//   1. Delimiter-based: frames end at a specific sentinel byte.
+//   2. Length-prefix (u16be): frames begin with a 2-byte big-endian
+//      length field, followed by exactly that many payload bytes.
+//
+// PUBLIC API:
+//   reasm_new_delim(delim)          -> dict  create delimiter-based state
+//   reasm_feed_delim(state, chunk)  -> list  feed bytes; returns complete frames
+//   reasm_new_lenprefix()           -> dict  create u16be length-prefix state
+//   reasm_feed_lenprefix(state, chunk) -> list  feed bytes; returns complete frames
+//   reasm_pending(state)            -> int   bytes still buffered
+//   reasm_reset(state)              -> dict  clear buffer (returns state)
+//   reasm_feed_byte_delim(state, b) -> list  feed one byte; delimiter-based
+//   reasm_has_frame_delim(state)    -> bool  true if delimiter present in buffer
+//   reasm_buffer(state)             -> list  current buffer contents (copy)
+//
+// State dict keys:
+//   "_buf"   : list  — accumulated byte buffer
+//   "_delim" : int   — delimiter byte (delim-based reassembler)
+//   "_mode"  : int   — 0 = delimiter, 1 = length-prefix
+//
+// All private helpers use prefix _reasm_.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _reasm_list_eq: byte-wise equality of two int lists.
+fn _reasm_list_eq(a: list, b: list) -> bool
+    let na = len(a)
+    let nb = len(b)
+    if na != nb
+        return false
+    let i = 0
+    while i < na
+        if a[i] != b[i]
+            return false
+        i = i + 1
+    true
+
+// _reasm_buf_get: read current buffer from state.
+fn _reasm_buf_get(state: dict) -> list
+    state["_buf"]
+
+// _reasm_buf_set: replace buffer in state.
+fn _reasm_buf_set(state: dict, buf: list)
+    state["_buf"] = buf
+
+// _reasm_append_chunk: append chunk bytes to existing buffer.
+fn _reasm_append_chunk(buf: list, chunk: list)
+    let n = len(chunk)
+    let i = 0
+    while i < n
+        push(buf, chunk[i])
+        i = i + 1
+
+// _reasm_copy_range: copy buf[from..to) into a new list.
+fn _reasm_copy_range(buf: list, from: int, to: int) -> list
+    let out = []
+    let i = from
+    while i < to
+        push(out, buf[i])
+        i = i + 1
+    out
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// reasm_new_delim: create a delimiter-based reassembler.
+// Frames are complete when the delimiter byte is encountered.
+// The delimiter is NOT included in the emitted frame.
+fn reasm_new_delim(delim: int) -> dict
+    let state = {}
+    let buf = []
+    state["_buf"] = buf
+    state["_delim"] = delim
+    state["_mode"] = 0
+    state
+
+// reasm_feed_delim: append chunk to buffer, emit all complete frames.
+// A frame is complete when the delimiter byte is found.
+// The delimiter byte is consumed but NOT included in the frame payload.
+fn reasm_feed_delim(state: dict, chunk: list) -> list
+    let buf = _reasm_buf_get(state)
+    _reasm_append_chunk(buf, chunk)
+    let delim = state["_delim"]
+    let frames = []
+    let scanning = 1
+    while scanning == 1
+        let n = len(buf)
+        let found = -1
+        let i = 0
+        while i < n
+            if buf[i] == delim
+                if found == -1
+                    found = i
+            i = i + 1
+        if found == -1
+            scanning = 0
+        else
+            // Emit frame = buf[0..found)
+            let frame = _reasm_copy_range(buf, 0, found)
+            push(frames, frame)
+            // Remaining = buf[found+1..)
+            let remaining = _reasm_copy_range(buf, found + 1, n)
+            _reasm_buf_set(state, remaining)
+            buf = remaining
+    frames
+
+// reasm_new_lenprefix: create a u16be length-prefix reassembler.
+// Each frame is: 2 bytes big-endian length N, followed by N payload bytes.
+fn reasm_new_lenprefix() -> dict
+    let state = {}
+    let buf = []
+    state["_buf"] = buf
+    state["_delim"] = 0
+    state["_mode"] = 1
+    state
+
+// reasm_feed_lenprefix: append chunk to buffer, emit all complete u16be frames.
+// Emits the payload (not including the 2-byte length header).
+fn reasm_feed_lenprefix(state: dict, chunk: list) -> list
+    let buf = _reasm_buf_get(state)
+    _reasm_append_chunk(buf, chunk)
+    let frames = []
+    let scanning = 1
+    while scanning == 1
+        let n = len(buf)
+        if n < 2
+            scanning = 0
+        else
+            let hi = buf[0]
+            let lo = buf[1]
+            let hi_shifted = hi * 256
+            let frame_len = hi_shifted + lo
+            let total = frame_len + 2
+            if n < total
+                scanning = 0
+            else
+                // Emit payload buf[2..2+frame_len)
+                let frame = _reasm_copy_range(buf, 2, total)
+                push(frames, frame)
+                // Keep remainder
+                let remaining = _reasm_copy_range(buf, total, n)
+                _reasm_buf_set(state, remaining)
+                buf = remaining
+    frames
+
+// reasm_pending: number of bytes currently buffered (not yet emitted).
+fn reasm_pending(state: dict) -> int
+    let buf = _reasm_buf_get(state)
+    len(buf)
+
+// reasm_reset: clear the buffer in state. Returns state.
+fn reasm_reset(state: dict) -> dict
+    let empty = []
+    state["_buf"] = empty
+    state
+
+// reasm_feed_byte_delim: feed a single byte to a delimiter-based reassembler.
+// Returns a list of complete frames (normally empty or one frame).
+fn reasm_feed_byte_delim(state: dict, b: int) -> list
+    let chunk = []
+    push(chunk, b)
+    reasm_feed_delim(state, chunk)
+
+// reasm_has_frame_delim: true if the buffer contains at least one delimiter byte.
+fn reasm_has_frame_delim(state: dict) -> bool
+    let buf = _reasm_buf_get(state)
+    let delim = state["_delim"]
+    let n = len(buf)
+    let i = 0
+    while i < n
+        if buf[i] == delim
+            return true
+        i = i + 1
+    false
+
+// reasm_buffer: return a copy of the current buffer contents.
+fn reasm_buffer(state: dict) -> list
+    let buf = _reasm_buf_get(state)
+    let n = len(buf)
+    _reasm_copy_range(buf, 0, n)

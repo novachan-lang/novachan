@@ -1,0 +1,164 @@
+// std/framing/kiss.nova
+// KISS TNC (Keep It Simple, Stupid) framing — amateur radio AX.25/APRS.
+// RFC reference: KISS specification Phil Karn KA9Q 1987; KISS over TCP extensions.
+//
+// KISS wraps a data packet in FEND (0xC0) delimiters.  Any 0xC0 or 0xDB that
+// appears in the payload is escaped to avoid being confused with a frame marker.
+// The byte immediately after the opening FEND is the command byte:
+//   bits 7-4 = port number (0..15)
+//   bits 3-0 = command code (0=data, 1-5=hardware params, 15=return-to-host)
+//
+// CONSTANTS:
+//   FEND  = 0xC0 (192) — frame delimiter
+//   FESC  = 0xDB (219) — escape character
+//   TFEND = 0xDC (220) — escaped FEND (follows FESC)
+//   TFESC = 0xDD (221) — escaped FESC (follows FESC)
+//
+// PUBLIC API:
+//   kiss_escape(data)              -> list  escape FEND/FESC in payload bytes
+//   kiss_unescape(data)            -> list  reverse of kiss_escape
+//   kiss_frame(port, cmd, data)    -> list  build a complete KISS frame
+//   kiss_deframe(frame)            -> dict  {port, cmd, data} parse a frame
+//   kiss_frame_data(data)          -> list  convenience: port=0 cmd=0 frame
+//   kiss_command_byte(port, cmd)   -> int   encode port+cmd into command byte
+//   kiss_get_data(frame)           -> list  extract payload from a KISS frame
+//
+// SELF-CONTAINED: imports nothing.  All helpers prefixed _kiss_.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn _kiss_fend() -> int
+    192
+
+fn _kiss_fesc() -> int
+    219
+
+fn _kiss_tfend() -> int
+    220
+
+fn _kiss_tfesc() -> int
+    221
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// kiss_command_byte: encode port (0..15) and command (0..15) into a single byte.
+// bits 7-4 = port, bits 3-0 = cmd.
+fn kiss_command_byte(port, cmd) -> int
+    let p = port & 0x0F
+    let c = cmd & 0x0F
+    (p << 4) | c
+
+// kiss_escape: replace every 0xC0 with [0xDB, 0xDC] and every 0xDB with [0xDB, 0xDD].
+// All other bytes pass through unchanged.
+fn kiss_escape(data) -> any
+    let out = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        let b = data[i] & 0xFF
+        if b == _kiss_fend()
+            push(out, _kiss_fesc())
+            push(out, _kiss_tfend())
+        else
+            if b == _kiss_fesc()
+                push(out, _kiss_fesc())
+                push(out, _kiss_tfesc())
+            else
+                push(out, b)
+        i = i + 1
+    out
+
+// kiss_unescape: reverse kiss_escape.  FESC TFEND -> FEND; FESC TFESC -> FESC.
+// A bare FESC at end of stream is dropped.  Any invalid escape sequence passes
+// the second byte through unchanged.
+fn kiss_unescape(data) -> any
+    let out = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        let b = data[i] & 0xFF
+        if b == _kiss_fesc()
+            if i + 1 < n
+                let nb = data[i + 1] & 0xFF
+                if nb == _kiss_tfend()
+                    push(out, _kiss_fend())
+                else
+                    if nb == _kiss_tfesc()
+                        push(out, _kiss_fesc())
+                    else
+                        push(out, nb)
+                i = i + 2
+            else
+                i = i + 1
+        else
+            push(out, b)
+            i = i + 1
+    out
+
+// kiss_frame: build a complete KISS frame.
+// Wire format: FEND | cmd_byte | kiss_escape(data) | FEND
+fn kiss_frame(port, cmd, data) -> any
+    let out = []
+    push(out, _kiss_fend())
+    push(out, kiss_command_byte(port, cmd))
+    let escaped = kiss_escape(data)
+    let ne = len(escaped)
+    let i = 0
+    while i < ne
+        push(out, escaped[i])
+        i = i + 1
+    push(out, _kiss_fend())
+    out
+
+// kiss_deframe: parse a complete KISS frame into {port, cmd, data}.
+// Strips leading/trailing FEND bytes, reads the command byte, unescapes the rest.
+// Returns {port:0, cmd:0, data:[]} on malformed or empty input (never crashes).
+fn kiss_deframe(frame) -> any
+    let port = 0
+    let cmd = 0
+    let data = []
+    let n = len(frame)
+    if n == 0
+        let r = {}
+        r["port"] = port
+        r["cmd"] = cmd
+        r["data"] = data
+        return r
+    let start = 0
+    // skip leading FEND(s)
+    while start < n and (frame[start] & 0xFF) == _kiss_fend()
+        start = start + 1
+    // must have at least the command byte
+    if start >= n
+        let r = {}
+        r["port"] = port
+        r["cmd"] = cmd
+        r["data"] = data
+        return r
+    // command byte
+    let cbyte = frame[start] & 0xFF
+    port = (cbyte >> 4) & 0x0F
+    cmd = cbyte & 0x0F
+    start = start + 1
+    // collect payload bytes up to next FEND
+    let payload = []
+    let j = start
+    while j < n and (frame[j] & 0xFF) != _kiss_fend()
+        push(payload, frame[j] & 0xFF)
+        j = j + 1
+    data = kiss_unescape(payload)
+    let r = {}
+    r["port"] = port
+    r["cmd"] = cmd
+    r["data"] = data
+    r
+
+// kiss_frame_data: convenience wrapper — port=0, cmd=0 (DATA frame).
+fn kiss_frame_data(data) -> any
+    kiss_frame(0, 0, data)
+
+// kiss_get_data: extract the payload bytes from an already-framed KISS packet.
+// Equivalent to kiss_deframe(frame)['data'].
+fn kiss_get_data(frame) -> any
+    let dec = kiss_deframe(frame)
+    dec["data"]

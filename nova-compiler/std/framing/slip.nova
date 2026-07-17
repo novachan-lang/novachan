@@ -1,0 +1,192 @@
+// ============================================================================
+// NOVA Standard Library — std/framing/slip
+// ============================================================================
+// SLIP — Serial Line IP (RFC 1055) byte-framing protocol.
+//
+// SLIP frames a packet by surrounding it with END bytes (0xC0 = 192) and
+// escaping any END or ESC bytes that appear in the payload:
+//
+//   END  (0xC0) in payload -> ESC ESC_END  (0xDB 0xDC)
+//   ESC  (0xDB) in payload -> ESC ESC_ESC  (0xDB 0xDD)
+//
+// The frame format is:  END | escaped-body | END
+//
+// RFC 1055 also permits an optional leading END to flush garbage, but this
+// implementation follows the strict form (exactly two ENDs per frame).
+//
+// PUBLIC API:
+//   slip_escape(data)    -> list   escape body only (no surrounding ENDs)
+//   slip_unescape(data)  -> list   reverse of slip_escape
+//   slip_frame(data)     -> list   END + escaped body + END
+//   slip_deframe(frame)  -> list   strip END bytes, unescape
+//   slip_split(stream)   -> list   list-of-lists, split on END delimiter
+//   slip_encode(data)    -> list   alias for slip_frame
+//   slip_decode(frame)   -> list   alias for slip_deframe
+//
+// BUFFER CONVENTION: all buffers are list-of-int, each element 0..255.
+//
+// SYMBOL COLLISION GUARD: all private helpers prefixed _slip_.
+// LEAF — imports NOTHING.
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+fn _slip_END() -> int
+    192
+
+fn _slip_ESC() -> int
+    219
+
+fn _slip_ESC_END() -> int
+    220
+
+fn _slip_ESC_ESC() -> int
+    221
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Compare two lists of ints element-by-element.
+fn _slip_list_eq(a, b) -> int
+    let la = len(a)
+    let lb = len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if a[i] != b[i]
+            return 0
+        i = i + 1
+    1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// slip_escape: escape 0xC0 and 0xDB in payload; no surrounding END bytes.
+//
+// 0xC0 (END) -> 0xDB 0xDC (ESC ESC_END)
+// 0xDB (ESC) -> 0xDB 0xDD (ESC ESC_ESC)
+// All other bytes pass through unchanged.
+fn slip_escape(data) -> list
+    let out = []
+    let n = len(data)
+    let END = _slip_END()
+    let ESC = _slip_ESC()
+    let ESC_END = _slip_ESC_END()
+    let ESC_ESC = _slip_ESC_ESC()
+    let i = 0
+    while i < n
+        let b = data[i] & 0xFF
+        if b == END
+            push(out, ESC)
+            push(out, ESC_END)
+        else
+            if b == ESC
+                push(out, ESC)
+                push(out, ESC_ESC)
+            else
+                push(out, b)
+        i = i + 1
+    out
+
+// slip_unescape: reverse of slip_escape; removes ESC sequences.
+//
+// 0xDB 0xDC -> 0xC0
+// 0xDB 0xDD -> 0xDB
+// Malformed trailing ESC (no following byte) is silently dropped.
+fn slip_unescape(data) -> list
+    let out = []
+    let n = len(data)
+    let ESC = _slip_ESC()
+    let ESC_END = _slip_ESC_END()
+    let ESC_ESC = _slip_ESC_ESC()
+    let i = 0
+    while i < n
+        let b = data[i] & 0xFF
+        if b == ESC
+            if i + 1 < n
+                let nb = data[i + 1] & 0xFF
+                if nb == ESC_END
+                    push(out, _slip_END())
+                else
+                    if nb == ESC_ESC
+                        push(out, ESC)
+                    else
+                        // Unknown escape: pass both bytes through (lenient).
+                        push(out, b)
+                        push(out, nb)
+                i = i + 2
+            else
+                // Trailing ESC: drop it.
+                i = i + 1
+        else
+            push(out, b)
+            i = i + 1
+    out
+
+// slip_frame: build a complete SLIP frame: END + escaped body + END.
+//
+// Output always starts and ends with END (0xC0 = 192).
+fn slip_frame(data) -> list
+    let out = []
+    let END = _slip_END()
+    push(out, END)
+    let body = slip_escape(data)
+    let bn = len(body)
+    let i = 0
+    while i < bn
+        push(out, body[i])
+        i = i + 1
+    push(out, END)
+    out
+
+// slip_deframe: strip leading/trailing END bytes and unescape.
+//
+// Tolerates multiple leading/trailing END bytes (flush packets).
+// Returns [] on empty or all-END input.
+fn slip_deframe(frame) -> list
+    let n = len(frame)
+    let END = _slip_END()
+    // Strip leading ENDs.
+    let start = 0
+    while start < n and (frame[start] & 0xFF) == END
+        start = start + 1
+    // Strip trailing ENDs.
+    let stop = n
+    while stop > start and (frame[stop - 1] & 0xFF) == END
+        stop = stop - 1
+    // Extract body [start..stop).
+    let body = []
+    let i = start
+    while i < stop
+        push(body, frame[i] & 0xFF)
+        i = i + 1
+    slip_unescape(body)
+
+// slip_split: split a raw byte stream on END (0xC0) delimiter bytes.
+//
+// Returns a list of lists, one per frame (empty segments between consecutive
+// ENDs are included as empty lists). The END bytes themselves are not included
+// in any sub-list.
+fn slip_split(stream) -> list
+    let frames = []
+    let current = []
+    let n = len(stream)
+    let END = _slip_END()
+    let i = 0
+    while i < n
+        let b = stream[i] & 0xFF
+        if b == END
+            push(frames, current)
+            current = []
+        else
+            push(current, b)
+        i = i + 1
+    // Push whatever is left (may be empty if stream ends with END).
+    push(frames, current)
+    frames
+
+// slip_encode: alias for slip_frame (complete SLIP frame with END delimiters).
+fn slip_encode(data) -> list
+    slip_frame(data)
+
+// slip_decode: alias for slip_deframe (strip ENDs and unescape).
+fn slip_decode(frame) -> list
+    slip_deframe(frame)

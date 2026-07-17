@@ -1,0 +1,194 @@
+// ============================================================================
+// NOVA Standard Library — std/framing/crc_frame
+// ============================================================================
+// CRC-trailer framing: frame a byte list by appending a CRC checksum trailer.
+//
+// Supports two CRC widths:
+//   CRC-16/CCITT-FALSE  (16-bit): poly=0x1021, init=0xFFFF, no reflect, no xorout.
+//   CRC-32              (32-bit): poly=0xEDB88320 reflected, init=0xFFFFFFFF, xorout=0xFFFFFFFF.
+//
+// A buffer is a LIST OF INTS, each 0..255.
+//
+// PUBLIC API:
+//   cf_crc16(data)          -> int   CRC-16/CCITT-FALSE over the list.
+//   cf_crc16_update(crc, b) -> int   Incremental CRC-16 update.
+//   cf_frame16(data)        -> list  data + 2-byte big-endian CRC16.
+//   cf_verify16(frame)      -> int   1 if CRC matches, 0 otherwise.
+//   cf_deframe16(frame)     -> dict  {data: list, crc_ok: int}.
+//   cf_strip_crc16(frame)   -> list  data without the 2-byte CRC trailer.
+//   cf_crc32(data)          -> int   Standard CRC-32 over the list.
+//   cf_crc32_update(crc, b) -> int   Incremental CRC-32 update.
+//   cf_frame32(data)        -> list  data + 4-byte big-endian CRC32.
+//   cf_verify32(frame)      -> int   1 if CRC32 matches, 0 otherwise.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── CRC-16/CCITT-FALSE ────────────────────────────────────────────────────────
+// poly = 0x1021 (unreflected), init = 0xFFFF, no input/output reflection,
+// no final XOR.  The check value for "123456789" is 0x29B1 (10673).
+
+// _cf_crc16_poly: CRC-16/CCITT-FALSE polynomial.
+fn _cf_crc16_poly() -> int
+    0x1021
+
+// cf_crc16_update: update a CRC-16/CCITT-FALSE with one byte.
+// crc = 16-bit running CRC; b = next byte (0..255).
+fn cf_crc16_update(crc: int, b: int) -> int
+    let c = crc ^ ((b & 0xFF) << 8)
+    let i = 0
+    while i < 8
+        let top = c & 0x8000
+        c = (c << 1) & 0xFFFF
+        if top != 0
+            c = c ^ _cf_crc16_poly()
+        i = i + 1
+    c & 0xFFFF
+
+// cf_crc16: compute CRC-16/CCITT-FALSE over a byte list.
+// Returns a 16-bit integer.
+fn cf_crc16(data: list) -> int
+    let crc = 0xFFFF
+    let n = len(data)
+    let i = 0
+    while i < n
+        crc = cf_crc16_update(crc, data[i])
+        i = i + 1
+    crc
+
+// ── CRC-16 framing ────────────────────────────────────────────────────────────
+
+// cf_frame16: append a 2-byte big-endian CRC-16 trailer to data.
+// Returns a new list of len(data)+2 bytes.
+fn cf_frame16(data: list) -> list
+    let crc = cf_crc16(data)
+    let out = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        push(out, data[i])
+        i = i + 1
+    push(out, (crc >> 8) & 0xFF)
+    push(out, crc & 0xFF)
+    out
+
+// cf_strip_crc16: return a copy of frame with the last 2 bytes removed.
+// Returns empty list if frame has fewer than 2 bytes.
+fn cf_strip_crc16(frame: list) -> list
+    let n = len(frame)
+    if n < 2
+        return []
+    let out = []
+    let i = 0
+    while i < n - 2
+        push(out, frame[i])
+        i = i + 1
+    out
+
+// cf_verify16: return 1 if the last 2 bytes of frame are the correct CRC-16
+// for the preceding bytes; 0 otherwise.  Returns 0 for frames < 2 bytes.
+fn cf_verify16(frame: list) -> int
+    let n = len(frame)
+    if n < 2
+        return 0
+    let data = cf_strip_crc16(frame)
+    let crc_got = cf_crc16(data)
+    let crc_lo = frame[n - 1] & 0xFF
+    let crc_hi = frame[n - 2] & 0xFF
+    let crc_want = ((crc_hi << 8) | crc_lo) & 0xFFFF
+    if crc_got == crc_want
+        return 1
+    0
+
+// cf_deframe16: decode a CRC-16 framed buffer.
+// Returns dict {data: list, crc_ok: int}.
+fn cf_deframe16(frame: list) -> dict
+    let n = len(frame)
+    if n < 2
+        return {"data": [], "crc_ok": 0}
+    let data = cf_strip_crc16(frame)
+    let ok = cf_verify16(frame)
+    {"data": data, "crc_ok": ok}
+
+// ── CRC-32 ────────────────────────────────────────────────────────────────────
+// Reflected algorithm: poly=0xEDB88320, init=0xFFFFFFFF, xorout=0xFFFFFFFF.
+// Process bits LSB-first.  Check value for "123456789" = 0xCBF43926.
+
+// _cf_crc32_one: compute the CRC-32 table entry for byte index v.
+// Reflected poly = 0xEDB88320.
+fn _cf_crc32_one(v: int) -> int
+    let c = v & 0xFF
+    let i = 0
+    while i < 8
+        let bit = c & 1
+        c = (c >> 1) & 0x7FFFFFFF
+        if bit == 1
+            c = c ^ 0xEDB88320
+        c = c & 0xFFFFFFFF
+        i = i + 1
+    c & 0xFFFFFFFF
+
+// cf_crc32_update: update a running CRC-32 with one byte.
+// crc = 32-bit running value; b = next byte.
+fn cf_crc32_update(crc: int, b: int) -> int
+    let idx = (crc ^ (b & 0xFF)) & 0xFF
+    let tval = _cf_crc32_one(idx)
+    let shifted = (crc >> 8) & 0x00FFFFFF
+    (shifted ^ tval) & 0xFFFFFFFF
+
+// cf_crc32: compute the standard CRC-32 over a byte list.
+// Init = 0xFFFFFFFF, final XOR = 0xFFFFFFFF (complement).
+fn cf_crc32(data: list) -> int
+    let crc = 0xFFFFFFFF
+    let n = len(data)
+    let i = 0
+    while i < n
+        crc = cf_crc32_update(crc, data[i])
+        i = i + 1
+    (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+// ── CRC-32 framing ───────────────────────────────────────────────────────────
+
+// cf_frame32: append a 4-byte big-endian CRC-32 trailer to data.
+fn cf_frame32(data: list) -> list
+    let crc = cf_crc32(data)
+    let out = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        push(out, data[i])
+        i = i + 1
+    push(out, (crc >> 24) & 0xFF)
+    push(out, (crc >> 16) & 0xFF)
+    push(out, (crc >> 8) & 0xFF)
+    push(out, crc & 0xFF)
+    out
+
+// _cf_strip_crc32: return frame bytes without the last 4 bytes.
+fn _cf_strip_crc32(frame: list) -> list
+    let n = len(frame)
+    if n < 4
+        return []
+    let out = []
+    let i = 0
+    while i < n - 4
+        push(out, frame[i])
+        i = i + 1
+    out
+
+// cf_verify32: return 1 if the last 4 bytes of frame are the correct CRC-32
+// for the preceding bytes; 0 otherwise.
+fn cf_verify32(frame: list) -> int
+    let n = len(frame)
+    if n < 4
+        return 0
+    let data = _cf_strip_crc32(frame)
+    let crc_got = cf_crc32(data)
+    let b3 = frame[n - 4] & 0xFF
+    let b2 = frame[n - 3] & 0xFF
+    let b1 = frame[n - 2] & 0xFF
+    let b0 = frame[n - 1] & 0xFF
+    let crc_want = ((b3 << 24) | (b2 << 16) | (b1 << 8) | b0) & 0xFFFFFFFF
+    if crc_got == crc_want
+        return 1
+    0

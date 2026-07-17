@@ -1,0 +1,146 @@
+// ============================================================================
+// NOVA Standard Library — std/framing/cobs
+// ============================================================================
+// Consistent Overhead Byte Stuffing (COBS) — eliminates 0x00 from payloads.
+//
+// COBS (Cheshire/Baker 1999) encodes an arbitrary byte sequence so that the
+// output contains NO 0x00 bytes. This makes 0x00 usable as a reliable frame
+// delimiter at the transport layer. Overhead is at most ceil(n/254)+1 bytes.
+//
+// ALGORITHM SUMMARY:
+//   The payload is split into blocks of up to 254 non-zero bytes separated by
+//   zero bytes. Each block is preceded by a code byte:
+//     code = distance to the next 0x00 byte (or to the end of the data).
+//   If a block reaches 254 bytes with no zero, code = 255 (0xFF) and the block
+//   is emitted WITHOUT inserting an implicit zero — encoding resumes for the
+//   next block.
+//
+// CANONICAL VECTORS (from the COBS paper):
+//   []                         -> [0x01]
+//   [0x00]                     -> [0x01,0x01]
+//   [0x00,0x00]                -> [0x01,0x01,0x01]
+//   [0x11,0x22,0x00,0x33]      -> [0x03,0x11,0x22,0x02,0x33]
+//   [0x11,0x22,0x33,0x44]      -> [0x05,0x11,0x22,0x33,0x44]
+//   [0x11,0x00,0x00,0x00]      -> [0x02,0x11,0x01,0x01,0x01]
+//
+// PUBLIC API:
+//   cobs_encode(data)        -> list  COBS-encoded; no 0x00 in output
+//   cobs_decode(data)        -> list  inverse of cobs_encode
+//   cobs_max_overhead(n)     -> int   ceil(n/254)+1 worst-case encoded length
+//   cobs_is_valid(encoded)   -> bool  true if no 0x00 bytes present
+//
+// BUFFER CONVENTION: all buffers are list-of-int, each element 0..255.
+//
+// SYMBOL COLLISION GUARD: all private helpers prefixed _cobs_.
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Compare two lists of ints for equality.
+fn _cobs_list_eq(a, b) -> int
+    let la = len(a)
+    let lb = len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if a[i] != b[i]
+            return 0
+        i = i + 1
+    1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// cobs_encode: COBS-encode a byte list; output contains no 0x00 byte.
+//
+// Empty input produces [0x01] (one code byte, code=1 meaning "no data before
+// the next implicit zero"). This is the canonical COBS encoding of [].
+//
+// Algorithm:
+//   Maintain a write cursor for the code byte and a block byte counter.
+//   Walk input left-to-right:
+//     - Non-zero byte: append to output, increment block counter.
+//       If block counter reaches 254, flush: write code=255 at reserved slot,
+//       reserve a new code slot, reset counter.
+//     - Zero byte: flush current block (write code=counter+1 at reserved slot),
+//       reserve a new code slot, reset counter.
+//   After the loop, write final code at the last reserved slot.
+fn cobs_encode(data) -> list
+    let out = []
+    let n = len(data)
+    // Reserve first code slot (index 0).
+    push(out, 0)
+    let code_pos = 0
+    let count = 0
+    let i = 0
+    while i < n
+        let b = data[i] & 0xFF
+        if b == 0
+            // Flush block: write code = count+1 at code_pos.
+            out[code_pos] = count + 1
+            // Reserve next code slot.
+            push(out, 0)
+            code_pos = len(out) - 1
+            count = 0
+        else
+            push(out, b)
+            count = count + 1
+            if count == 254
+                // Block of 254 non-zero bytes: code = 255 (0xFF), no implicit zero.
+                out[code_pos] = 255
+                push(out, 0)
+                code_pos = len(out) - 1
+                count = 0
+        i = i + 1
+    // Write final code byte.
+    out[code_pos] = count + 1
+    out
+
+// cobs_decode: decode a COBS-encoded byte list back to the original payload.
+//
+// Reads the code byte, copies (code-1) bytes literally, then inserts a 0x00
+// unless code == 255 (no implicit zero for max-length blocks) or we are at the
+// end of the encoded data.  Returns [] on empty input (safe).
+fn cobs_decode(data) -> list
+    let out = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        let code = data[i] & 0xFF
+        i = i + 1
+        // Copy (code - 1) non-zero bytes.
+        let j = 0
+        while j < code - 1 and i < n
+            push(out, data[i] & 0xFF)
+            i = i + 1
+            j = j + 1
+        // Insert implicit zero unless:
+        //   (a) code was 255 (max block, zero suppressed), or
+        //   (b) we have consumed all bytes (trailing zero omitted per spec).
+        if code != 255 and i < n
+            push(out, 0)
+    out
+
+// cobs_max_overhead: worst-case encoded length for n payload bytes.
+//
+// Overhead formula: ceil(n/254) code bytes + 1 for the very first code byte.
+// A payload of 0 bytes needs exactly 1 byte (the single code byte 0x01).
+fn cobs_max_overhead(n) -> int
+    if n == 0
+        return 1
+    // ceil(n/254) + 1
+    let blocks = (n + 253) / 254
+    blocks + 1
+
+// cobs_is_valid: return true (1) if the encoded list contains no 0x00 byte.
+//
+// A valid COBS frame must have no zeros in the encoded body (0x00 is the
+// out-of-band frame delimiter at the transport layer).
+fn cobs_is_valid(encoded) -> int
+    let n = len(encoded)
+    let i = 0
+    while i < n
+        if (encoded[i] & 0xFF) == 0
+            return 0
+        i = i + 1
+    1

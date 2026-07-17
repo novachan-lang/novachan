@@ -1,0 +1,196 @@
+// std/framing/lenprefix.nova
+// Length-prefixed framing — the simplest reliable stream framing protocol.
+// A length prefix encodes the byte count of the following payload.  No escaping
+// needed; the receiver reads exactly N bytes after the prefix.
+//
+// PUBLIC API:
+//   lp_frame_u8(data)           -> list  1-byte prefix (payload <=255 bytes)
+//   lp_frame_u16be(data)        -> list  2-byte big-endian prefix
+//   lp_frame_u16le(data)        -> list  2-byte little-endian prefix
+//   lp_frame_u32be(data)        -> list  4-byte big-endian prefix
+//   lp_deframe_u8(buf,pos)      -> dict  {data, next}  read u8-prefixed frame
+//   lp_deframe_u16be(buf,pos)   -> dict  {data, next}  read u16be-prefixed frame
+//   lp_deframe_u32be(buf,pos)   -> dict  {data, next}  read u32be-prefixed frame
+//   lp_read_len_u16be(buf,pos)  -> int   peek at the u16be length field only
+//   lp_split_u16be(stream)      -> list  extract all u16be-prefixed payloads
+//   lp_frame_count_u16be(stream)-> int   count complete u16be-prefixed frames
+//
+// SELF-CONTAINED: imports nothing.  All helpers prefixed _lp_.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Copy a slice of buf[start..start+count) into a new list.
+fn _lp_slice(buf, start, count) -> any
+    let out = []
+    let i = 0
+    while i < count
+        push(out, buf[start + i] & 0xFF)
+        i = i + 1
+    out
+
+// Append all bytes of src into dst.
+fn _lp_append_all(dst, src)
+    let n = len(src)
+    let i = 0
+    while i < n
+        push(dst, src[i] & 0xFF)
+        i = i + 1
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// lp_frame_u8: prepend a single byte encoding the payload length (0..255).
+// Data longer than 255 bytes is silently truncated to 255 via mask.
+fn lp_frame_u8(data) -> any
+    let n = len(data)
+    let out = []
+    push(out, n & 0xFF)
+    _lp_append_all(out, data)
+    out
+
+// lp_frame_u16be: prepend a 2-byte big-endian payload length.
+fn lp_frame_u16be(data) -> any
+    let n = len(data)
+    let out = []
+    push(out, (n >> 8) & 0xFF)
+    push(out, n & 0xFF)
+    _lp_append_all(out, data)
+    out
+
+// lp_frame_u16le: prepend a 2-byte little-endian payload length.
+fn lp_frame_u16le(data) -> any
+    let n = len(data)
+    let out = []
+    push(out, n & 0xFF)
+    push(out, (n >> 8) & 0xFF)
+    _lp_append_all(out, data)
+    out
+
+// lp_frame_u32be: prepend a 4-byte big-endian payload length.
+fn lp_frame_u32be(data) -> any
+    let n = len(data)
+    let out = []
+    push(out, (n >> 24) & 0xFF)
+    push(out, (n >> 16) & 0xFF)
+    push(out, (n >> 8) & 0xFF)
+    push(out, n & 0xFF)
+    _lp_append_all(out, data)
+    out
+
+// lp_deframe_u8: read a u8-prefixed frame from buf at byte offset pos.
+// Returns {data: list, next: int} where next is the offset after this frame.
+// Returns {data: [], next: pos} on truncated input (never crashes).
+fn lp_deframe_u8(buf, pos) -> any
+    let total = len(buf)
+    let r = {}
+    let empty = []
+    if pos >= total
+        r["data"] = empty
+        r["next"] = pos
+        return r
+    let plen = buf[pos] & 0xFF
+    let start = pos + 1
+    if start + plen > total
+        r["data"] = empty
+        r["next"] = pos
+        return r
+    r["data"] = _lp_slice(buf, start, plen)
+    r["next"] = start + plen
+    r
+
+// lp_deframe_u16be: read a u16be-prefixed frame from buf at byte offset pos.
+// Returns {data: list, next: int}; returns {data: [], next: pos} on truncation.
+fn lp_deframe_u16be(buf, pos) -> any
+    let total = len(buf)
+    let r = {}
+    let empty = []
+    if pos + 2 > total
+        r["data"] = empty
+        r["next"] = pos
+        return r
+    let hi = buf[pos] & 0xFF
+    let lo = buf[pos + 1] & 0xFF
+    let plen = (hi << 8) | lo
+    let start = pos + 2
+    if start + plen > total
+        r["data"] = empty
+        r["next"] = pos
+        return r
+    r["data"] = _lp_slice(buf, start, plen)
+    r["next"] = start + plen
+    r
+
+// lp_deframe_u32be: read a u32be-prefixed frame from buf at byte offset pos.
+// Returns {data: list, next: int}; returns {data: [], next: pos} on truncation.
+fn lp_deframe_u32be(buf, pos) -> any
+    let total = len(buf)
+    let r = {}
+    let empty = []
+    if pos + 4 > total
+        r["data"] = empty
+        r["next"] = pos
+        return r
+    let b0 = buf[pos] & 0xFF
+    let b1 = buf[pos + 1] & 0xFF
+    let b2 = buf[pos + 2] & 0xFF
+    let b3 = buf[pos + 3] & 0xFF
+    let plen = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    let start = pos + 4
+    if start + plen > total
+        r["data"] = empty
+        r["next"] = pos
+        return r
+    r["data"] = _lp_slice(buf, start, plen)
+    r["next"] = start + plen
+    r
+
+// lp_read_len_u16be: read the u16be length field at pos without consuming it.
+// Returns -1 if fewer than 2 bytes remain.
+fn lp_read_len_u16be(buf, pos) -> int
+    let total = len(buf)
+    if pos + 2 > total
+        return -1
+    let hi = buf[pos] & 0xFF
+    let lo = buf[pos + 1] & 0xFF
+    (hi << 8) | lo
+
+// lp_split_u16be: parse a stream of concatenated u16be-prefixed frames.
+// Returns a list of payload byte-lists.
+fn lp_split_u16be(stream) -> any
+    let frames = []
+    let pos = 0
+    let total = len(stream)
+    while pos < total
+        if pos + 2 > total
+            pos = total
+        else
+            let hi = stream[pos] & 0xFF
+            let lo = stream[pos + 1] & 0xFF
+            let plen = (hi << 8) | lo
+            let start = pos + 2
+            if start + plen > total
+                pos = total
+            else
+                let payload = _lp_slice(stream, start, plen)
+                push(frames, payload)
+                pos = start + plen
+    frames
+
+// lp_frame_count_u16be: count how many complete u16be-prefixed frames exist in stream.
+fn lp_frame_count_u16be(stream) -> int
+    let count = 0
+    let pos = 0
+    let total = len(stream)
+    while pos < total
+        if pos + 2 > total
+            pos = total
+        else
+            let hi = stream[pos] & 0xFF
+            let lo = stream[pos + 1] & 0xFF
+            let plen = (hi << 8) | lo
+            let start = pos + 2
+            if start + plen > total
+                pos = total
+            else
+                count = count + 1
+                pos = start + plen
+    count

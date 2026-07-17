@@ -1,0 +1,199 @@
+// ============================================================================
+// NOVA Standard Library — std/framing/ppp_frame
+// ============================================================================
+// PPP async HDLC framing per RFC 1662.
+//
+// Wire format (async PPP):
+//   FLAG (0x7E) | stuffed_payload | FLAG (0x7E)
+//
+// where stuffed_payload = byte-stuffed(data || fcs_le[0] || fcs_le[1]).
+//
+// Stuffing rules (ACCM-minimal: only 0x7E and 0x7D escaped):
+//   0x7E -> 0x7D 0x5E
+//   0x7D -> 0x7D 0x5D
+//
+// FCS-16 = CRC-16 with reflected polynomial 0x8408 (= poly 0x1021 reflected),
+// init 0xFFFF, final XOR 0xFFFF (complement).  This is the standard PPP FCS-16
+// from RFC 1662 Appendix B.
+//
+// A buffer is a LIST OF INTS, each 0..255.
+//
+// PUBLIC API:
+//   ppp_fcs16(data)             -> int   FCS-16 over the list (init 0xFFFF, complement).
+//   ppp_fcs16_update(fcs, byte) -> int   Incremental FCS update.
+//   ppp_stuff(data)             -> list  Byte-stuff: 0x7E->0x7D,0x5E; 0x7D->0x7D,0x5D.
+//   ppp_unstuff(data)           -> list  Reverse stuffing.
+//   ppp_frame(data)             -> list  FLAG + stuffed(data + fcs) + FLAG.
+//   ppp_deframe(frame)          -> dict  Unstuff, strip FLAGs, verify FCS.
+//                                        Returns {data: list, fcs_ok: bool-int}.
+//   ppp_fcs_bytes(data)         -> list  2 FCS bytes (little-endian, complemented).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── FCS-16 table (RFC 1662 Appendix B style) ─────────────────────────────────
+
+// _ppp_fcs_one: compute the FCS table value for byte index v.
+// poly = 0x8408 (reflected 0x1021).
+fn _ppp_fcs_one(v: int) -> int
+    let b = v
+    let i = 0
+    while i < 8
+        let t = b & 1
+        if t == 1
+            b = (b >> 1) ^ 0x8408
+        else
+            b = b >> 1
+        i = i + 1
+    b & 0xFFFF
+
+// ppp_fcs16_update: update running FCS with one byte.
+// fcs  = current FCS (16-bit), byte = 0..255.
+// Returns new 16-bit FCS.
+fn ppp_fcs16_update(fcs: int, byte: int) -> int
+    let idx = (fcs ^ byte) & 0xFF
+    let tval = _ppp_fcs_one(idx)
+    let shifted = (fcs >> 8) & 0xFF
+    (shifted ^ tval) & 0xFFFF
+
+// ppp_fcs16: compute the complete PPP FCS-16 over a byte list.
+// Init = 0xFFFF, final complement = XOR 0xFFFF.
+fn ppp_fcs16(data: list) -> int
+    let fcs = 0xFFFF
+    let n = len(data)
+    let i = 0
+    while i < n
+        fcs = ppp_fcs16_update(fcs, data[i])
+        i = i + 1
+    fcs ^ 0xFFFF
+
+// ppp_fcs_bytes: return the 2 FCS bytes little-endian (complemented).
+// These are the bytes appended to the data before stuffing+framing.
+fn ppp_fcs_bytes(data: list) -> list
+    let fcs = ppp_fcs16(data)
+    let out = []
+    push(out, fcs & 0xFF)
+    push(out, (fcs >> 8) & 0xFF)
+    out
+
+// ── Byte stuffing ─────────────────────────────────────────────────────────────
+
+// ppp_stuff: byte-stuff a list for PPP async HDLC.
+// 0x7E -> 0x7D, 0x5E
+// 0x7D -> 0x7D, 0x5D
+// Only these two bytes are escaped (minimal ACCM for correctness).
+fn ppp_stuff(data: list) -> list
+    let out = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        let b = data[i]
+        if b == 0x7E
+            push(out, 0x7D)
+            push(out, 0x5E)
+        else
+            if b == 0x7D
+                push(out, 0x7D)
+                push(out, 0x5D)
+            else
+                push(out, b)
+        i = i + 1
+    out
+
+// ppp_unstuff: reverse PPP byte stuffing.
+// 0x7D,X -> X XOR 0x20.
+// Trailing ESC without following byte is dropped (malformed; safe).
+fn ppp_unstuff(data: list) -> list
+    let out = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        let b = data[i]
+        if b == 0x7D
+            if i + 1 < n
+                let nb = data[i + 1]
+                push(out, nb ^ 0x20)
+                i = i + 2
+            else
+                i = i + 1
+        else
+            push(out, b)
+            i = i + 1
+    out
+
+// ── Framing ───────────────────────────────────────────────────────────────────
+
+// ppp_frame: encode a PPP frame.
+// Result: FLAG(0x7E) || ppp_stuff(data || fcs_lo || fcs_hi) || FLAG(0x7E).
+fn ppp_frame(data: list) -> list
+    let fb = ppp_fcs_bytes(data)
+    let payload = []
+    let n = len(data)
+    let i = 0
+    while i < n
+        push(payload, data[i])
+        i = i + 1
+    push(payload, fb[0])
+    push(payload, fb[1])
+    let stuffed = ppp_stuff(payload)
+    let out = []
+    push(out, 0x7E)
+    let j = 0
+    while j < len(stuffed)
+        push(out, stuffed[j])
+        j = j + 1
+    push(out, 0x7E)
+    out
+
+// _ppp_strip_flags: strip leading and trailing FLAG bytes from a buffer.
+// Returns the inner content (without flags).
+fn _ppp_strip_flags(frame: list) -> list
+    let n = len(frame)
+    let start = 0
+    let stop = n
+    if n > 0
+        if frame[0] == 0x7E
+            start = 1
+    if stop > start
+        if frame[stop - 1] == 0x7E
+            stop = stop - 1
+    let out = []
+    let i = start
+    while i < stop
+        push(out, frame[i])
+        i = i + 1
+    out
+
+// _ppp_fcs_good: the "good FCS" constant per RFC 1662.
+// When you compute ppp_fcs16(data || fcs_bytes), a valid frame returns 0xF0B8.
+fn _ppp_fcs_good() -> int
+    0xF0B8
+
+// ppp_deframe: decode a PPP frame.
+// Strips FLAG bytes, unstuffs, verifies FCS, returns {data: list, fcs_ok: int}.
+// fcs_ok is 1 if the FCS passes, 0 otherwise.
+// On malformed input (< 2 bytes after stripping/unstuffing), returns empty data + fcs_ok=0.
+fn ppp_deframe(frame: list) -> dict
+    let inner = _ppp_strip_flags(frame)
+    let unstuffed = ppp_unstuff(inner)
+    let un = len(unstuffed)
+    if un < 2
+        return {"data": [], "fcs_ok": 0}
+    // verify FCS: feed ALL unstuffed bytes (data + 2 FCS bytes) through the
+    // incremental updater with init=0xFFFF; a valid frame leaves 0xF0B8
+    // (the RFC 1662 "good FCS" residual — no final XOR during verification).
+    let fcs = 0xFFFF
+    let i = 0
+    while i < un
+        fcs = ppp_fcs16_update(fcs, unstuffed[i])
+        i = i + 1
+    let fcs_ok = 0
+    if fcs == _ppp_fcs_good()
+        fcs_ok = 1
+    // strip the 2-byte FCS trailer to get data
+    let data = []
+    let j = 0
+    while j < un - 2
+        push(data, unstuffed[j])
+        j = j + 1
+    {"data": data, "fcs_ok": fcs_ok}

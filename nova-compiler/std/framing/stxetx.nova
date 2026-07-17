@@ -1,0 +1,226 @@
+// ============================================================================
+// NOVA Standard Library — std/framing/stxetx
+// ============================================================================
+// STX/ETX framing, common in POS terminals and industrial serial protocols.
+//
+// Constants:
+//   STX = 0x02  Start-of-Text  (frame opener)
+//   ETX = 0x03  End-of-Text    (frame closer)
+//   DLE = 0x10  Data Link Escape (used for byte-stuffing)
+//
+// PUBLIC API:
+//   sx_frame(data)          -> list  STX + data + ETX
+//   sx_frame_lrc(data)      -> list  STX + data + ETX + LRC
+//   sx_lrc(data)            -> int   XOR of all bytes in data
+//   sx_deframe(frame)       -> list  strip STX/ETX -> inner data
+//   sx_deframe_lrc(frame)   -> dict  {data: list, lrc_ok: bool}
+//   sx_dle_stuff(data)      -> list  DLE-escape STX/ETX/DLE bytes
+//   sx_dle_unstuff(data)    -> list  invert DLE-escaping
+//   sx_frame_dle(data)      -> list  STX + dle_stuffed(data) + ETX
+//   sx_deframe_dle(frame)   -> dict  {data: list, ok: bool}
+//   sx_is_framed(buf)       -> bool  true if buf starts with STX and ends with ETX
+//
+// LRC: XOR of all data bytes (not STX/ETX). For an empty payload the LRC is 0.
+// DLE stuffing: a byte B in {STX, ETX, DLE} in the payload is replaced by DLE, B.
+// All private helpers use prefix _sx_.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+// _sx_stx: STX byte value (0x02)
+fn _sx_stx() -> int
+    2
+
+// _sx_etx: ETX byte value (0x03)
+fn _sx_etx() -> int
+    3
+
+// _sx_dle: DLE byte value (0x10)
+fn _sx_dle() -> int
+    16
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _sx_list_eq: byte-wise equality of two int lists.
+fn _sx_list_eq(a: list, b: list) -> bool
+    let na = len(a)
+    let nb = len(b)
+    if na != nb
+        return false
+    let i = 0
+    while i < na
+        if a[i] != b[i]
+            return false
+        i = i + 1
+    true
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// sx_lrc: XOR of all bytes in data. Empty data -> 0.
+fn sx_lrc(data: list) -> int
+    let n = len(data)
+    let acc = 0
+    let i = 0
+    while i < n
+        let v = data[i]
+        acc = acc ^ v
+        i = i + 1
+    acc
+
+// sx_frame: wrap data with STX/ETX delimiters.
+fn sx_frame(data: list) -> list
+    let out = []
+    push(out, _sx_stx())
+    let n = len(data)
+    let i = 0
+    while i < n
+        push(out, data[i])
+        i = i + 1
+    push(out, _sx_etx())
+    out
+
+// sx_frame_lrc: STX + data + ETX + LRC checksum byte.
+fn sx_frame_lrc(data: list) -> list
+    let lrc = sx_lrc(data)
+    let out = []
+    push(out, _sx_stx())
+    let n = len(data)
+    let i = 0
+    while i < n
+        push(out, data[i])
+        i = i + 1
+    push(out, _sx_etx())
+    push(out, lrc)
+    out
+
+// sx_deframe: strip leading STX and trailing ETX, return inner bytes.
+// If the buffer doesn't begin with STX or end with ETX, return empty list.
+fn sx_deframe(frame: list) -> list
+    let n = len(frame)
+    if n < 2
+        return []
+    if frame[0] != _sx_stx()
+        return []
+    if frame[n - 1] != _sx_etx()
+        return []
+    let out = []
+    let i = 1
+    while i < n - 1
+        push(out, frame[i])
+        i = i + 1
+    out
+
+// sx_deframe_lrc: parse STX + data + ETX + LRC frame.
+// Returns dict {data: list, lrc_ok: bool}.
+fn sx_deframe_lrc(frame: list) -> dict
+    let result = {}
+    let empty = []
+    result["data"] = empty
+    result["lrc_ok"] = false
+    let n = len(frame)
+    // Need at least STX + ETX + LRC = 3 bytes
+    if n < 3
+        return result
+    if frame[0] != _sx_stx()
+        return result
+    if frame[n - 2] != _sx_etx()
+        return result
+    let data = []
+    let i = 1
+    while i < n - 2
+        push(data, frame[i])
+        i = i + 1
+    let expected_lrc = sx_lrc(data)
+    let actual_lrc = frame[n - 1]
+    let ok = false
+    if expected_lrc == actual_lrc
+        ok = true
+    result["data"] = data
+    result["lrc_ok"] = ok
+    result
+
+// sx_dle_stuff: DLE-escape any STX, ETX, or DLE byte in the payload.
+// Each such byte B is replaced by DLE, B.
+fn sx_dle_stuff(data: list) -> list
+    let out = []
+    let stx = _sx_stx()
+    let etx = _sx_etx()
+    let dle = _sx_dle()
+    let n = len(data)
+    let i = 0
+    while i < n
+        let b = data[i]
+        if b == stx or b == etx or b == dle
+            push(out, dle)
+        push(out, b)
+        i = i + 1
+    out
+
+// sx_dle_unstuff: invert DLE-escaping. DLE followed by X yields X.
+// A trailing DLE with no following byte is dropped (malformed).
+fn sx_dle_unstuff(data: list) -> list
+    let out = []
+    let dle = _sx_dle()
+    let n = len(data)
+    let i = 0
+    while i < n
+        let b = data[i]
+        if b == dle
+            i = i + 1
+            if i < n
+                push(out, data[i])
+        else
+            push(out, b)
+        i = i + 1
+    out
+
+// sx_frame_dle: STX + dle_stuffed(data) + ETX.
+fn sx_frame_dle(data: list) -> list
+    let stuffed = sx_dle_stuff(data)
+    let out = []
+    push(out, _sx_stx())
+    let n = len(stuffed)
+    let i = 0
+    while i < n
+        push(out, stuffed[i])
+        i = i + 1
+    push(out, _sx_etx())
+    out
+
+// sx_deframe_dle: strip STX/ETX and un-DLE-stuff the inner payload.
+// Returns dict {data: list, ok: bool}. ok=false on malformed input.
+fn sx_deframe_dle(frame: list) -> dict
+    let result = {}
+    let empty = []
+    result["data"] = empty
+    result["ok"] = false
+    let n = len(frame)
+    if n < 2
+        return result
+    if frame[0] != _sx_stx()
+        return result
+    if frame[n - 1] != _sx_etx()
+        return result
+    // Collect the inner bytes (between STX and ETX)
+    let inner = []
+    let i = 1
+    while i < n - 1
+        push(inner, frame[i])
+        i = i + 1
+    let data = sx_dle_unstuff(inner)
+    result["data"] = data
+    result["ok"] = true
+    result
+
+// sx_is_framed: true if buf starts with STX and ends with ETX.
+fn sx_is_framed(buf: list) -> bool
+    let n = len(buf)
+    if n < 2
+        return false
+    if buf[0] != _sx_stx()
+        return false
+    if buf[n - 1] != _sx_etx()
+        return false
+    true
