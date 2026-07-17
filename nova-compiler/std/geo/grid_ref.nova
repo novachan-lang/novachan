@@ -1,0 +1,299 @@
+// std/geo/grid_ref.nova — OSGB-style alphanumeric grid reference encoding.
+//
+// DOCUMENTED CONVENTION (self-contained; OSGB-style but with a local S-origin):
+//
+//   ALPHABET: A-Z excluding I => "ABCDEFGHJKLMNOPQRSTUVWXYZ" (25 letters).
+//
+//   Both the major (500km squares) and minor (100km squares) sub-grids use
+//   this alphabet arranged in a 5x5 matrix, TOP-TO-BOTTOM, LEFT-TO-RIGHT
+//   (row 0 = north/top, row 4 = south/bottom; col 0 = west/left):
+//
+//     Row 0 (local_N=4 * unit): A  B  C  D  E
+//     Row 1 (local_N=3 * unit): F  G  H  J  K
+//     Row 2 (local_N=2 * unit): L  M  N  O  P
+//     Row 3 (local_N=1 * unit): Q  R  S  T  U  <- U: col=4, N_idx=1
+//     Row 4 (local_N=0 * unit): V  W  X  Y  Z
+//
+//   Letter -> (col, N_idx): col = position in row (0..4), N_idx = 4 - row_from_top
+//   Letter <- (col, N_idx): row_from_top = 4 - N_idx, slot = row_from_top*5 + col
+//
+//   MINOR letter (second char of 2-letter prefix):
+//     - encodes the 100km square within its 500km major square
+//     - minor_E = col, minor_N = N_idx  (0..4, in 100km units)
+//     -> gr_letters_to_offset('SU') = [col(U)=4, N_idx(U)=1] = [4, 1]  ✓
+//
+//   MAJOR letter (first char of 2-letter prefix):
+//     - encodes the 500km square in the absolute grid
+//     - major_E_100km = col * 5, major_N_100km = N_idx * 5
+//     -> S (col=2, N_idx=1) => major base = (10*100km, 5*100km) = (1000km, 500km)
+//
+//   ABSOLUTE COORDINATE SYSTEM (easting/northing in metres):
+//     - The letters together encode the 100km square:
+//         abs_e100 = major_col*5 + minor_col
+//         abs_n100 = major_N_idx*5 + minor_N_idx
+//     - The digit part encodes the sub-100km position.
+//
+//   GRID REFERENCE FORMAT:  <2-letter prefix><E_sub><N_sub>
+//     - Letters: encode the 100km square (100000m grid)
+//     - E_sub / N_sub: zero-padded `digits`-figure integers
+//         scale = 10^(5 - digits)   (digits=5 -> 1m; digits=3 -> 100m)
+//         E_sub = (easting % 100000) / scale
+//         decoded_easting = abs_e100 * 100000 + E_sub * scale
+//
+//   gr_letters_to_offset returns [minor_col, minor_N_idx] = LOCAL offset of the
+//   MINOR letter within its 500km major square (E and N in 100km units).
+//   This is a local-to-the-major-square value, not the absolute grid coordinate.
+//
+//   EXAMPLE:
+//     gr_encode(432000, 145000, 3):
+//       abs_e100=4, abs_n100=1 -> letters 'VU' (major V=(col=0,N=0), minor U=(col=4,N=1))
+//       sub_E=32000m, digits=3 -> scale=100 -> 32000/100=320 -> '320'
+//       sub_N=45000m -> 45000/100=450 -> '450'
+//       result: 'VU320450'
+//     gr_letters_to_offset('SU') = [4, 1]  (minor 'U' local offset: col=4, N_idx=1)
+//
+// Symbol prefix: gr_ (public), _grr_ (private).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// _grr_alpha: the 25-character grid alphabet (A-Z excluding I).
+fn _grr_alpha() -> string
+    "ABCDEFGHJKLMNOPQRSTUVWXYZ"
+
+// _grr_letter_col_n: returns [col, N_idx] for letter c in the 5x5 grid.
+// col = column (0=west), N_idx = 4 - row_from_top (0=south row, 4=north row).
+// Returns [-1, -1] for letters not in the alphabet (including I).
+fn _grr_letter_col_n(c) -> any
+    let alpha = _grr_alpha()
+    let n = len(alpha)
+    let i = 0
+    let found = -1
+    while i < n
+        if alpha[i] == c
+            found = i
+            i = n
+        i = i + 1
+    let result = []
+    if found < 0
+        push(result, -1)
+        push(result, -1)
+        return result
+    let col = found - (found / 5) * 5
+    let row_from_top = found / 5
+    let n_idx = 4 - row_from_top
+    push(result, col)
+    push(result, n_idx)
+    result
+
+// _grr_letter_at: letter at (col, n_idx) in the 5x5 grid (n_idx: 0=south, 4=north).
+fn _grr_letter_at(col, n_idx) -> string
+    let alpha = _grr_alpha()
+    let row_from_top = 4 - n_idx
+    alpha[row_from_top * 5 + col]
+
+// _grr_in_alpha: true if character c is in the 25-letter grid alphabet.
+fn _grr_in_alpha(c) -> bool
+    let pos = _grr_letter_col_n(c)
+    let col = pos[0] * 1
+    col >= 0
+
+// _grr_pow10: 10^n for n in 0..7.
+fn _grr_pow10(n) -> int
+    let result = 1
+    let i = 0
+    while i < n
+        result = result * 10
+        i = i + 1
+    result
+
+// _grr_pad_int: format integer as zero-padded string of exactly `width` digits.
+fn _grr_pad_int(val, width) -> string
+    let s = str(val)
+    let slen = len(s)
+    let pad = ""
+    let needed = width - slen
+    let i = 0
+    while i < needed
+        pad = pad + "0"
+        i = i + 1
+    pad + s
+
+// _grr_is_digit_str: true if all characters of s are ASCII digits and s is non-empty.
+fn _grr_is_digit_str(s) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let i = 0
+    let ok = 1
+    while i < n
+        let b = ord(s[i])
+        if b < 48 or b > 57
+            ok = 0
+        i = i + 1
+    ok == 1
+
+// gr_letters_to_offset: returns [minor_col, minor_N_idx] = the LOCAL 100km offset
+// of the MINOR letter (second char) within its 500km major square.
+//   minor_E_100km = col   (0..4: west to east within major square)
+//   minor_N_100km = N_idx (0..4: south to north within major square)
+// => gr_letters_to_offset('SU') = [4, 1]  (U is col=4, N_idx=1)
+// The major letter is parsed (uppercased) but does not contribute to the returned offset.
+fn gr_letters_to_offset(letters) -> any
+    let uc = gr_normalize(letters)
+    let minor_c = uc[1]
+    let pos = _grr_letter_col_n(minor_c)
+    let result = []
+    push(result, pos[0] * 1)
+    push(result, pos[1] * 1)
+    result
+
+// gr_offset_to_letters: given absolute 100km grid indices (e100, n100) where
+//   e100 = easting/100000  (integer),  n100 = northing/100000  (integer),
+// returns the 2-letter prefix for that 100km square.
+//   major_col = e100 / 5,  major_N_idx = n100 / 5
+//   minor_col = e100 % 5,  minor_N_idx = n100 % 5
+fn gr_offset_to_letters(e100, n100) -> string
+    let major_col = e100 / 5
+    let major_n_idx = n100 / 5
+    let minor_col = e100 - major_col * 5
+    let minor_n_idx = n100 - major_n_idx * 5
+    let major_letter = _grr_letter_at(major_col, major_n_idx)
+    let minor_letter = _grr_letter_at(minor_col, minor_n_idx)
+    major_letter + minor_letter
+
+// gr_encode: encode (easting, northing) in metres to a grid reference string.
+//   digits: significant figures per axis in the sub-100km position (1..5).
+//   digits=5 -> 1m resolution; digits=3 -> 100m resolution.
+//   scale = 10^(5 - digits)
+//   sub_E = (easting % 100000) / scale  (integer, 0..10^digits - 1)
+fn gr_encode(easting, northing, digits) -> string
+    let e100 = easting / 100000
+    let n100 = northing / 100000
+    let letters = gr_offset_to_letters(e100, n100)
+    let scale = _grr_pow10(5 - digits)
+    let e_sub = (easting - e100 * 100000) / scale
+    let n_sub = (northing - n100 * 100000) / scale
+    let e_str = _grr_pad_int(e_sub, digits)
+    let n_str = _grr_pad_int(n_sub, digits)
+    letters + e_str + n_str
+
+// gr_decode: decode a grid reference string to [easting, northing] in metres.
+//   Letters -> 100km absolute index; digit strings -> sub-100km offset.
+// Returns [-1, -1] on invalid input.
+fn gr_decode(gridref) -> any
+    let uc = gr_normalize(gridref)
+    let n = len(uc)
+    if n < 4
+        let err = []
+        push(err, -1)
+        push(err, -1)
+        return err
+    let major_c = uc[0]
+    let minor_c = uc[1]
+    let mj = _grr_letter_col_n(major_c)
+    let mn = _grr_letter_col_n(minor_c)
+    let mj_col = mj[0] * 1
+    let mn_col = mn[0] * 1
+    if mj_col < 0 or mn_col < 0
+        let err = []
+        push(err, -1)
+        push(err, -1)
+        return err
+    let mj_nidx = mj[1] * 1
+    let mn_nidx = mn[1] * 1
+    let e100 = mj_col * 5 + mn_col
+    let n100 = mj_nidx * 5 + mn_nidx
+    let rest = n - 2
+    let digits = rest / 2
+    let e_str = ""
+    let n_str = ""
+    let i = 2
+    let mid = 2 + digits
+    while i < mid
+        e_str = e_str + uc[i]
+        i = i + 1
+    while i < n
+        n_str = n_str + uc[i]
+        i = i + 1
+    let scale = _grr_pow10(5 - digits)
+    let e_sub = int(e_str) * scale
+    let n_sub = int(n_str) * scale
+    let easting = e100 * 100000 + e_sub
+    let northing = n100 * 100000 + n_sub
+    let result = []
+    push(result, easting)
+    push(result, northing)
+    result
+
+// gr_is_valid: true if gridref is syntactically valid.
+// Checks: >= 4 chars, first 2 are valid grid letters (not I), rest are even-count digits.
+fn gr_is_valid(gridref) -> bool
+    let uc = gr_normalize(gridref)
+    let n = len(uc)
+    if n < 4
+        return false
+    let major_c = uc[0]
+    let minor_c = uc[1]
+    if not _grr_in_alpha(major_c)
+        return false
+    if not _grr_in_alpha(minor_c)
+        return false
+    let rest = n - 2
+    if rest < 2
+        return false
+    let rem2 = rest - (rest / 2) * 2
+    if rem2 != 0
+        return false
+    let digit_part = ""
+    let i = 2
+    while i < n
+        digit_part = digit_part + uc[i]
+        i = i + 1
+    _grr_is_digit_str(digit_part)
+
+// gr_precision_m: resolution in metres for `digits` figures per axis.
+//   digits=5 -> 1m, digits=4 -> 10m, digits=3 -> 100m, digits=2 -> 1000m.
+fn gr_precision_m(digits) -> int
+    _grr_pow10(5 - digits)
+
+// gr_normalize: uppercase and strip spaces from a grid reference.
+fn gr_normalize(gridref) -> string
+    let n = len(gridref)
+    let result = ""
+    let i = 0
+    while i < n
+        let c = gridref[i]
+        let b = ord(c)
+        if b >= 97 and b <= 122
+            result = result + chr(b - 32)
+        else
+            if b != 32
+                result = result + c
+        i = i + 1
+    result
+
+// gr_split: split a grid reference into [letters, easting_digits, northing_digits].
+fn gr_split(gridref) -> any
+    let uc = gr_normalize(gridref)
+    let n = len(uc)
+    let letters = ""
+    if n >= 1
+        letters = letters + uc[0]
+    if n >= 2
+        letters = letters + uc[1]
+    let rest = n - 2
+    let digits = rest / 2
+    let e_str = ""
+    let n_str = ""
+    let i = 2
+    let mid = 2 + digits
+    while i < mid
+        e_str = e_str + uc[i]
+        i = i + 1
+    while i < n
+        n_str = n_str + uc[i]
+        i = i + 1
+    let result = []
+    push(result, letters)
+    push(result, e_str)
+    push(result, n_str)
+    result

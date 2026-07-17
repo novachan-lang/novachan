@@ -1,0 +1,267 @@
+// std/geo/pluscode.nova — Open Location Code (Plus Codes) encode/decode.
+//
+// OLC encodes a location as a hierarchical base-20 grid code.
+// ALPHABET: '23456789CFGHJMPQRVWX' (20 chars, indices 0-19).
+//
+// ENCODING: normalize lat to [0,180) via lat+90, lon to [0,360) via lon+180.
+// Extract base-20 digits pair-by-pair (lat digit, lon digit), coarsest first.
+// Each step: digit = floor(val / 20), then val = (val - digit*20) * 20.
+// The cell sizes at each pair level:
+//   pair 0: 20°, pair 1: 1°, pair 2: 0.05°, pair 3: 0.0025°, pair 4: 0.000125°
+// Insert '+' after the 8th digit (4 pairs = 8 chars).
+// For codelen < 8, pad remaining digit slots to 8 with '0' before the '+'.
+//
+// DECODING (fixed cell-size accumulation, NOT range-narrowing):
+//   lat_norm = d0*20 + d1*1 + d2*0.05 + d3*0.0025 + d4*0.000125
+//   lon_norm = d0*20 + d1*1 + d2*0.05 + d3*0.0025 + d4*0.000125
+//   (same cell sizes for both axes; '0' padding contributes zero to sum)
+//
+// Symbol prefix: olc_ (public), _olc_ (private).
+
+// _olc_alpha: the 20-character OLC alphabet.
+fn _olc_alpha() -> string
+    "23456789CFGHJMPQRVWX"
+
+// olc_char_value: return the index (0-19) of a character in the OLC alphabet,
+// or -1 if not present.
+fn olc_char_value(ch) -> int
+    let b = ord(ch)
+    // '2'=50 .. '9'=57 maps to 0..7
+    if b >= 50 and b <= 57
+        return b - 50
+    // 'C'=67->8, 'F'=70->9, 'G'=71->10, 'H'=72->11, 'J'=74->12
+    // 'M'=77->13, 'P'=80->14, 'Q'=81->15, 'R'=82->16, 'V'=86->17
+    // 'W'=87->18, 'X'=88->19
+    if b == 67
+        return 8
+    if b == 70
+        return 9
+    if b == 71
+        return 10
+    if b == 72
+        return 11
+    if b == 74
+        return 12
+    if b == 77
+        return 13
+    if b == 80
+        return 14
+    if b == 81
+        return 15
+    if b == 82
+        return 16
+    if b == 86
+        return 17
+    if b == 87
+        return 18
+    if b == 88
+        return 19
+    0 - 1
+
+// olc_digit: return the OLC alphabet character for index v (0-19).
+fn olc_digit(v) -> string
+    let alpha = _olc_alpha()
+    if v >= 0 and v <= 19
+        return alpha[v]
+    "?"
+
+// olc_is_valid: return true if code is a syntactically valid OLC code.
+// Valid: must contain exactly one '+' at position <= 8, at an even position.
+// All non-'+' non-'0' chars must be in the OLC alphabet.
+fn olc_is_valid(code) -> bool
+    let n = len(code)
+    if n < 2
+        return false
+    // find '+' position
+    let plus_pos = 0 - 1
+    let i = 0
+    while i < n
+        let c = code[i]
+        if c == "+"
+            if plus_pos >= 0
+                return false
+            plus_pos = i
+        i = i + 1
+    // '+' must exist and be at position <= 8
+    if plus_pos < 0
+        return false
+    if plus_pos > 8
+        return false
+    // every non-'+' char must be valid OLC digit or '0' (padding)
+    let j = 0
+    while j < n
+        let ch = code[j]
+        if ch != "+"
+            if ch == "0"
+                // valid padding — do nothing
+                let _z = 0
+            else
+                let v = olc_char_value(ch)
+                if v < 0
+                    return false
+        j = j + 1
+    true
+
+// _olc_extract_pairs: extract base-20 digit pairs from lat_norm, lon_norm.
+// Returns a list of [lat_d, lon_d] pairs (npairs many).
+// Cell sizes: pair 0=20, pair 1=1, pair 2=0.05, etc.
+fn _olc_extract_pairs(lat_n, lon_n, npairs) -> list
+    let pairs = []
+    let lat_v = lat_n * 1.0
+    let lon_v = lon_n * 1.0
+    let p = 0
+    while p < npairs
+        let lat_d = int(lat_v / 20.0)
+        if lat_d > 19
+            lat_d = 19
+        if lat_d < 0
+            lat_d = 0
+        let lon_d = int(lon_v / 20.0)
+        if lon_d > 19
+            lon_d = 19
+        if lon_d < 0
+            lon_d = 0
+        let lat_rem = lat_v - lat_d * 20.0
+        let lon_rem = lon_v - lon_d * 20.0
+        lat_v = lat_rem * 20.0
+        lon_v = lon_rem * 20.0
+        let pair = []
+        pair.push(lat_d)
+        pair.push(lon_d)
+        pairs.push(pair)
+        p = p + 1
+    pairs
+
+// olc_encode: encode (lat, lon) as an OLC code of the given codelen.
+// codelen must be even (2, 4, 6, 8, 10, 12, ...).
+// '+' is inserted after position 8; codes shorter than 8 digits are
+// padded with '0' up to 8 digits before the '+'.
+// lat is clamped to [-90, 90], lon is clamped to [-180, 180).
+fn olc_encode(lat, lon, codelen) -> string
+    let lat_f = lat * 1.0
+    let lon_f = lon * 1.0
+    // clamp to valid range
+    if lat_f >= 90.0
+        lat_f = 89.9999999
+    if lat_f < 0.0 - 90.0
+        lat_f = 0.0 - 90.0
+    if lon_f >= 180.0
+        lon_f = 179.9999999
+    if lon_f < 0.0 - 180.0
+        lon_f = 0.0 - 180.0
+    let lat_norm = lat_f + 90.0
+    let lon_norm = lon_f + 180.0
+    // determine real pairs from codelen (max 5 for codelen=10)
+    let npairs_real = codelen / 2
+    if npairs_real > 5
+        npairs_real = 5
+    if npairs_real < 1
+        npairs_real = 1
+    // extract digit pairs
+    let pairs = _olc_extract_pairs(lat_norm, lon_norm, npairs_real)
+    let alpha = _olc_alpha()
+    // build the digit string (interleaved: lat, lon, lat, lon, ...)
+    let digits = ""
+    let k = 0
+    while k < npairs_real
+        let pr = pairs[k]
+        let ld = pr[0]
+        let lond = pr[1]
+        digits = digits + alpha[ld]
+        digits = digits + alpha[lond]
+        k = k + 1
+    // pad to at least 8 digits with '0'
+    while len(digits) < 8
+        digits = digits + "0"
+    // insert '+' after position 8
+    let prefix = slice(digits, 0, 8)
+    let suffix = slice(digits, 8, len(digits))
+    prefix + "+" + suffix
+
+// _olc_cell_size: return the cell size in normalized coords for pair index k.
+// pair 0: 20.0, pair 1: 1.0, pair 2: 0.05, pair 3: 0.0025, pair 4: 0.000125
+fn _olc_cell_size(k) -> float
+    if k == 0
+        return 20.0
+    if k == 1
+        return 1.0
+    if k == 2
+        return 0.05
+    if k == 3
+        return 0.0025
+    0.000125
+
+// olc_decode: decode an OLC code string to a dict with lat_lo, lat_hi, lon_lo, lon_hi,
+// lat_center, lon_center (all in decimal degrees).
+// Uses fixed cell-size accumulation: lat_norm = sum(d_k * cell_k).
+fn olc_decode(code) -> any
+    let n = len(code)
+    // collect digits in order, skipping '+'
+    // even positions (0,2,4,...) = lat digits; odd = lon digits
+    let lat_norm_lo = 0.0
+    let lon_norm_lo = 0.0
+    let di = 0
+    let i = 0
+    let last_pair = 0
+    while i < n
+        let ch = code[i]
+        if ch != "+"
+            let v = 0
+            if ch == "0"
+                v = 0
+            else
+                let cv = olc_char_value(ch)
+                if cv >= 0
+                    v = cv
+            let pair_idx = di / 2
+            let cs = _olc_cell_size(pair_idx)
+            let cv_f = v * 1.0
+            let contrib = cv_f * cs
+            // even di = lat digit, odd di = lon digit
+            let islon = di - (di / 2) * 2
+            if islon == 0
+                lat_norm_lo = lat_norm_lo + contrib
+                last_pair = pair_idx
+            else
+                lon_norm_lo = lon_norm_lo + contrib
+            di = di + 1
+        i = i + 1
+    // cell size of the finest pair
+    let finest_cell = _olc_cell_size(last_pair)
+    let lat_norm_hi = lat_norm_lo + finest_cell
+    let lon_norm_hi = lon_norm_lo + finest_cell
+    // convert to degrees
+    let lat_lo_deg = lat_norm_lo - 90.0
+    let lat_hi_deg = lat_norm_hi - 90.0
+    let lon_lo_deg = lon_norm_lo - 180.0
+    let lon_hi_deg = lon_norm_hi - 180.0
+    let lat_sum = lat_lo_deg + lat_hi_deg
+    let lat_c = lat_sum / 2.0
+    let lon_sum = lon_lo_deg + lon_hi_deg
+    let lon_c = lon_sum / 2.0
+    let result = {}
+    result["lat_lo"] = lat_lo_deg
+    result["lat_hi"] = lat_hi_deg
+    result["lon_lo"] = lon_lo_deg
+    result["lon_hi"] = lon_hi_deg
+    result["lat_center"] = lat_c
+    result["lon_center"] = lon_c
+    result
+
+// olc_code_area: return the approximate cell size in degrees latitude
+// for a given OLC code string (based on the number of real digit pairs).
+// Counts non-'+' non-'0' characters to determine real precision.
+fn olc_code_area(code) -> float
+    let n = len(code)
+    let digit_count = 0
+    let i = 0
+    while i < n
+        let ch = code[i]
+        if ch != "+" and ch != "0"
+            digit_count = digit_count + 1
+        i = i + 1
+    let npairs = digit_count / 2
+    // cell size for lat at pair level npairs-1
+    if npairs <= 0
+        return 20.0
+    _olc_cell_size(npairs - 1)

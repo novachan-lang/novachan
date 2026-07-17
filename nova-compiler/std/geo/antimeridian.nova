@@ -1,0 +1,155 @@
+// std/geo/antimeridian.nova — Antimeridian crossing and longitude normalization.
+//
+// The antimeridian is the 180°/-180° longitude line. Bboxes that cross it have
+// min_lon > max_lon by convention (wrap-around). Algorithms here handle that.
+//
+// FLOAT RULES obeyed:
+//   - Float literals have a decimal point.
+//   - Float results from list reads multiplied by 1.0 before arithmetic.
+//   - No multi-term float expression returned bare.
+//   - abs via if/else (not abs() which returns i64).
+//
+// Symbol collision guard: all private helpers prefixed _am_.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// _am_fabs: absolute value of a float.
+fn _am_fabs(x) -> float
+    let r = x
+    if x < 0.0
+        r = 0.0 - x
+    r
+
+// am_normalize_lon: wrap a longitude value into the range [-180, 180].
+// Values exactly at 180.0 stay 180.0 (not -180.0).
+// Uses modular arithmetic without trig: shift by 180, mod 360, shift back.
+fn am_normalize_lon(lon) -> float
+    let x = lon * 1.0
+    // Fast path: already in range
+    if x >= 0.0 - 180.0 and x <= 180.0
+        return x
+    // Shift to [0, 360) range relative to -180
+    // Compute how many full 360-degree cycles to subtract
+    let shifted = x + 180.0
+    // We need shifted mod 360 in [0, 360)
+    let cycles = int(shifted / 360.0)
+    let rem = shifted - cycles * 360.0
+    // Handle negative remainder from truncation-toward-zero
+    if rem < 0.0
+        rem = rem + 360.0
+    // Now rem is in [0, 360); shift back to [-180, 180)
+    let result = rem - 180.0
+    // Edge: if result == -180.0 we keep it (or normalize to 180.0; keep -180.0 per convention)
+    result
+
+// am_normalize_lat: clamp latitude to [-90, 90].
+fn am_normalize_lat(lat) -> float
+    let x = lat * 1.0
+    if x > 90.0
+        return 90.0
+    if x < 0.0 - 90.0
+        return 0.0 - 90.0
+    x
+
+// am_crosses: true if the shorter arc between lon1 and lon2 crosses the antimeridian.
+// This is true when |lon1 - lon2| > 180 (i.e., going the "short way" crosses ±180).
+fn am_crosses(lon1, lon2) -> bool
+    let a = lon1 * 1.0
+    let b = lon2 * 1.0
+    let diff = a - b
+    let adiff = _am_fabs(diff)
+    if adiff > 180.0
+        return true
+    false
+
+// am_lon_distance: shortest angular distance between two longitudes, in [0, 180].
+// This is the absolute value of the shorter arc.
+fn am_lon_distance(lon1, lon2) -> float
+    let a = lon1 * 1.0
+    let b = lon2 * 1.0
+    let diff = a - b
+    let adiff = _am_fabs(diff)
+    // If adiff > 180, the short way is 360 - adiff
+    if adiff > 180.0
+        let result = 360.0 - adiff
+        return result
+    adiff
+
+// am_midpoint_lon: midpoint longitude accounting for antimeridian wrap.
+// If the shorter arc between lon1 and lon2 crosses ±180, wrap the midpoint accordingly.
+fn am_midpoint_lon(lon1, lon2) -> float
+    let a = lon1 * 1.0
+    let b = lon2 * 1.0
+    let diff = a - b
+    let adiff = _am_fabs(diff)
+    if adiff > 180.0
+        // Shorter arc crosses antimeridian: unwrap b
+        let b_unwrapped = b
+        if b < a
+            b_unwrapped = b + 360.0
+        else
+            b_unwrapped = b - 360.0
+        let raw_mid = (a + b_unwrapped) / 2.0
+        return am_normalize_lon(raw_mid)
+    let mid = (a + b) / 2.0
+    mid
+
+// am_split_bbox: split a bbox that crosses the antimeridian into two bboxes.
+// Input: [min_lat, min_lon, max_lat, max_lon].
+// A bbox crosses the antimeridian when min_lon > max_lon.
+// Returns a list of one or two bboxes.
+// If no crossing, returns a list containing the original bbox.
+// If crossing, returns two bboxes: one from min_lon to 180, one from -180 to max_lon.
+fn am_split_bbox(bbox) -> any
+    let mn_lat = bbox[0] * 1.0
+    let mn_lon = bbox[1] * 1.0
+    let mx_lat = bbox[2] * 1.0
+    let mx_lon = bbox[3] * 1.0
+    let out = []
+    if mn_lon <= mx_lon
+        // No crossing — return original as single-element list
+        let b = []
+        b.push(mn_lat)
+        b.push(mn_lon)
+        b.push(mx_lat)
+        b.push(mx_lon)
+        out.push(b)
+        return out
+    // Crosses antimeridian: split into two
+    // West part: [mn_lat, mn_lon, mx_lat, 180.0]
+    let west = []
+    west.push(mn_lat)
+    west.push(mn_lon)
+    west.push(mx_lat)
+    west.push(180.0)
+    // East part: [mn_lat, -180.0, mx_lat, mx_lon]
+    let east = []
+    east.push(mn_lat)
+    east.push(0.0 - 180.0)
+    east.push(mx_lat)
+    east.push(mx_lon)
+    out.push(west)
+    out.push(east)
+    out
+
+// am_unwrap: make a sequence of longitudes continuous by removing antimeridian jumps.
+// Given a list of longitudes, shifts subsequent values by ±360 to minimize jumps > 180.
+// Returns a new list of "unwrapped" longitudes (may exceed [-180,180]).
+fn am_unwrap(lons) -> any
+    let n = len(lons)
+    let out = []
+    if n == 0
+        return out
+    let prev = lons[0] * 1.0
+    out.push(prev)
+    let i = 1
+    while i < n
+        let cur = lons[i] * 1.0
+        let diff = cur - prev
+        if diff > 180.0
+            cur = cur - 360.0
+        if diff < 0.0 - 180.0
+            cur = cur + 360.0
+        out.push(cur)
+        prev = cur
+        i = i + 1
+    out

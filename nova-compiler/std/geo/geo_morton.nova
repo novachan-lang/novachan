@@ -1,0 +1,191 @@
+// std/geo/geo_morton.nova — Morton / Z-order interleaving of quantized lat/lon.
+//
+// Morton codes spatially interleave lat and lon bits so that nearby coordinates
+// have similar codes. Convention: lon occupies even bit positions (0,2,4,...),
+// lat occupies odd bit positions (1,3,5,...).
+//
+// All arithmetic is 64-bit integer.  Maximum bits per coordinate = 30
+// (60-bit Morton code, safe in NOVA's signed i64).
+//
+// Prefix: gm_
+// ─────────────────────────────────────────────────────────────────────────────
+
+// _gm_floor: floor for floats (toward -infinity).
+fn _gm_floor(x) -> float
+    let xi = int(x)
+    let xf = xi * 1.0
+    if xf > x
+        return xf - 1.0
+    xf
+
+// _gm_pow2: 2^n as float, for quantization scale (n <= 30).
+fn _gm_pow2f(n) -> float
+    let r = 1.0
+    let i = 0
+    while i < n
+        r = r * 2.0
+        i = i + 1
+    r
+
+// _gm_pow2i: 2^n as int (n <= 62).
+fn _gm_pow2i(n) -> int
+    let r = 1
+    let i = 0
+    while i < n
+        r = r * 2
+        i = i + 1
+    r
+
+// gm_spread_bits: insert a zero between every pair of bits in x.
+// spread(0b1011) = 0b01000101 etc.
+// Done bit-by-bit so no large constants are needed.
+fn gm_spread_bits(x) -> int
+    let result = 0
+    let i = 0
+    while i < 32
+        let bit = (x >> i) & 1
+        if bit != 0
+            result = result | _gm_pow2i(i * 2)
+        i = i + 1
+    result
+
+// _gm_compact_bits: inverse of spread_bits — extract every other bit (even positions).
+fn _gm_compact_bits(x) -> int
+    let result = 0
+    let i = 0
+    while i < 32
+        let pos = i * 2
+        let bit = (x >> pos) & 1
+        if bit != 0
+            result = result | _gm_pow2i(i)
+        i = i + 1
+    result
+
+// gm_interleave: interleave qlat (odd bits) and qlon (even bits) into a Morton code.
+// bits = number of bits per coordinate (used for range info; interleave is still correct).
+fn gm_interleave(qlat, qlon, bits) -> int
+    let spread_lon = gm_spread_bits(qlon)
+    let spread_lat = gm_spread_bits(qlat)
+    // lon in even positions (0,2,4,...), lat in odd (1,3,5,...).
+    spread_lon | (spread_lat * 2)
+
+// gm_deinterleave: split a Morton code back into [qlat, qlon].
+fn gm_deinterleave(code, bits) -> any
+    let qlon = _gm_compact_bits(code)
+    let qlat = _gm_compact_bits(code >> 1)
+    let out = []
+    push(out, qlat)
+    push(out, qlon)
+    out
+
+// gm_quantize: map lat/lon to integer grid coordinates in [0, 2^bits).
+//   lat range [-90, 90] -> [0, 2^bits)
+//   lon range [-180, 180) -> [0, 2^bits)
+fn gm_quantize(lat, lon, bits) -> any
+    let cells = _gm_pow2f(bits)
+    // Normalize lat from [-90,90] to [0,1).
+    let lat_f = lat * 1.0
+    let lon_f = lon * 1.0
+    let lat_norm = (lat_f + 90.0) / 180.0
+    let lon_norm = (lon_f + 180.0) / 360.0
+    // Clamp to [0.0, 1.0) to prevent overflow at exact boundary.
+    if lat_norm >= 1.0
+        lat_norm = 1.0 - 0.000001
+    if lon_norm >= 1.0
+        lon_norm = 1.0 - 0.000001
+    if lat_norm < 0.0
+        lat_norm = 0.0
+    if lon_norm < 0.0
+        lon_norm = 0.0
+    let qlat = int(_gm_floor(lat_norm * cells))
+    let qlon = int(_gm_floor(lon_norm * cells))
+    let out = []
+    push(out, qlat)
+    push(out, qlon)
+    out
+
+// gm_encode: quantize lat/lon then interleave into a Morton code.
+fn gm_encode(lat, lon, bits) -> int
+    let q = gm_quantize(lat, lon, bits)
+    let qlat = q[0]
+    let qlon = q[1]
+    gm_interleave(qlat, qlon, bits)
+
+// gm_decode: convert a Morton code back to [lat, lon] cell centers.
+fn gm_decode(code, bits) -> any
+    let dq = gm_deinterleave(code, bits)
+    let qlat = dq[0]
+    let qlon = dq[1]
+    let cells = _gm_pow2f(bits)
+    let cells_i = _gm_pow2i(bits)
+    // Cell center: (q + 0.5) / cells * range + min
+    let qlat_f = qlat * 1.0
+    let qlon_f = qlon * 1.0
+    let lat = (qlat_f + 0.5) / cells * 180.0 - 90.0
+    let lon = (qlon_f + 0.5) / cells * 360.0 - 180.0
+    let out = []
+    push(out, lat)
+    push(out, lon)
+    out
+
+// gm_cell_size: return [dlat, dlon] — the lat/lon extent of one cell.
+fn gm_cell_size(bits) -> any
+    let cells = _gm_pow2f(bits)
+    let dlat = 180.0 / cells
+    let dlon = 360.0 / cells
+    let out = []
+    push(out, dlat)
+    push(out, dlon)
+    out
+
+// gm_neighbors: return a list of 8 Morton codes adjacent to `code` (at given bits).
+// Decodes to (qlat,qlon), then computes the 8 neighbors, clips to valid range, re-encodes.
+fn gm_neighbors(code, bits) -> any
+    let dq = gm_deinterleave(code, bits)
+    let qlat = dq[0]
+    let qlon = dq[1]
+    let maxv = _gm_pow2i(bits) - 1
+    let out = []
+    let dlat = 0 - 1
+    while dlat <= 1
+        let dlon = 0 - 1
+        while dlon <= 1
+            if dlat != 0 or dlon != 0
+                let nlat = qlat + dlat
+                let nlon = qlon + dlon
+                if nlat < 0
+                    nlat = 0
+                if nlat > maxv
+                    nlat = maxv
+                if nlon < 0
+                    nlon = 0
+                if nlon > maxv
+                    nlon = maxv
+                push(out, gm_interleave(nlat, nlon, bits))
+            dlon = dlon + 1
+        dlat = dlat + 1
+    out
+
+// gm_common_prefix: count how many HIGH bits two Morton codes share.
+// Returns the number of leading bits that are identical.
+// Uses 60-bit comparison (30 bits per coord = 60 Morton bits).
+fn gm_common_prefix(a, b) -> int
+    let diff = a ^ b
+    let count = 0
+    let i = 59
+    while i >= 0
+        let bit = (diff >> i) & 1
+        if bit != 0
+            return count
+        count = count + 1
+        i = i - 1
+    count
+
+// gm_z_order_compare: compare two Morton codes for Z-order sort.
+//   Returns -1 if a < b, 0 if equal, 1 if a > b.
+fn gm_z_order_compare(a, b) -> int
+    if a < b
+        return 0 - 1
+    if a > b
+        return 1
+    0
