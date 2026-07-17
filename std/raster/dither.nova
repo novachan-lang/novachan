@@ -1,0 +1,255 @@
+// std/raster/dither.nova — Ordered (Bayer) and error-diffusion (Floyd-Steinberg) dithering.
+// LEAF — imports NOTHING.
+//
+// SURFACE MODEL: dict with keys "w" (int), "h" (int), "px" (flat row-major list).
+// Grayscale values are ints 0..255.
+//
+// Public API:
+//   dt_bayer_matrix(n)               -> any  n x n Bayer threshold matrix (n=2 or 4)
+//   dt_bayer_value(n,x,y)            -> int  Bayer matrix entry at (x,y) for size n
+//   dt_threshold(value,x,y,mx,msize,levels) -> int  ordered-dither one pixel
+//   dt_quantize(value,levels)        -> int  nearest quantization level 0..255
+//   dt_nearest_level(value,levels)   -> int  nearest of `levels` evenly-spaced levels
+//   dt_ordered(gray_surface,matrix_n,levels) -> any  ordered-dither a whole surface
+//   dt_floyd_steinberg(gray_surface,levels)  -> any  FS error-diffusion dither
+
+// _dt_abs_int: integer abs helper (abs() on float returns i64, unsafe for ints here).
+fn _dt_abs_int(v)
+    let r = v
+    if v < 0
+        r = 0 - v
+    r
+
+// _dt_new_surface: create a surface filled with fill_val.
+fn _dt_new_surface(w, h, fill_val)
+    let s = {}
+    s["w"] = w
+    s["h"] = h
+    let px = []
+    let total = w * h
+    let i = 0
+    while i < total
+        px.push(fill_val)
+        i = i + 1
+    s["px"] = px
+    s
+
+// _dt_bayer2: flat row-major 2x2 Bayer index matrix [0,2,3,1].
+// This is the standard recursive Bayer matrix of order 2.
+fn _dt_bayer2()
+    let m = []
+    m.push(0)
+    m.push(2)
+    m.push(3)
+    m.push(1)
+    m
+
+// _dt_bayer4: flat row-major 4x4 Bayer index matrix (standard).
+// Constructed recursively: B4 = 4*B2 tiled with offsets.
+// Row-major values: [0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5]
+fn _dt_bayer4()
+    let m = []
+    m.push(0)
+    m.push(8)
+    m.push(2)
+    m.push(10)
+    m.push(12)
+    m.push(4)
+    m.push(14)
+    m.push(6)
+    m.push(3)
+    m.push(11)
+    m.push(1)
+    m.push(9)
+    m.push(15)
+    m.push(7)
+    m.push(13)
+    m.push(5)
+    m
+
+// dt_bayer_matrix: return the n x n Bayer index matrix as a flat row-major list.
+// n must be 2 or 4; values are 0..n*n-1.
+fn dt_bayer_matrix(n)
+    let r = []
+    if n == 2
+        r = _dt_bayer2()
+    if n == 4
+        r = _dt_bayer4()
+    r
+
+// dt_bayer_value: return the Bayer index at position (x,y) for matrix size n.
+fn dt_bayer_value(n, x, y)
+    let xmod = x - (x / n) * n
+    let ymod = y - (y / n) * n
+    let m = dt_bayer_matrix(n)
+    let idx = ymod * n + xmod
+    m[idx]
+
+// dt_quantize: snap value (0..255) to nearest of `levels` equally-spaced levels.
+// With 2 levels: 0 and 255. With 3 levels: 0, 128, 255. Etc.
+fn dt_quantize(value, levels)
+    if levels <= 1
+        return 0
+    // Step between levels: 255 / (levels - 1)
+    // Round to nearest level index.
+    let step = 255 / (levels - 1)
+    let best_i = 0
+    let best_dist = 256
+    let i = 0
+    while i < levels
+        let lv = i * step
+        if i == levels - 1
+            lv = 255
+        let d = value - lv
+        if d < 0
+            d = 0 - d
+        if d < best_dist
+            best_dist = d
+            best_i = i
+        i = i + 1
+    let result = best_i * step
+    if best_i == levels - 1
+        result = 255
+    result
+
+// dt_nearest_level: return the nearest of `levels` evenly-spaced levels 0..255.
+// Same as dt_quantize but returns the level VALUE not index.
+fn dt_nearest_level(value, levels)
+    dt_quantize(value, levels)
+
+// dt_threshold: ordered-dither a single grayscale pixel.
+// matrix mx is a flat list of Bayer indices (0..msize*msize-1).
+// The threshold for (x,y) = (mx[y%msize * msize + x%msize] + 0.5) / (msize*msize) * 255.
+// We use integer approximation: threshold_int = (bayer_idx * 255) / (msize*msize).
+// Then we quantize to `levels` using the ordered dither rule.
+fn dt_threshold(value, x, y, mx, msize, levels)
+    let xmod = x - (x / msize) * msize
+    let ymod = y - (y / msize) * msize
+    let bi = ymod * msize + xmod
+    let bayer_idx = mx[bi]
+    let mat_size = msize * msize
+    // Compute normalized Bayer threshold scaled to 0..255.
+    // thresh = (bayer_idx + 0.5) * 255 / mat_size approximated as integer.
+    // We use: thresh = (2 * bayer_idx + 1) * 255 / (2 * mat_size)
+    let thresh = (2 * bayer_idx + 1) * 255 / (2 * mat_size)
+    // Determine which quantization level to pick.
+    // For `levels` levels, the palette values are 0, 255/(levels-1), ..., 255.
+    // The input is value; use threshold to bias the quantization.
+    // Ordered dither rule: rescale value to [0, mat_size), compare to bayer_idx.
+    if levels <= 1
+        return 0
+    let step = 255 / (levels - 1)
+    // Compute the lower quantization level for this value.
+    let q_idx = value / step
+    if q_idx >= levels - 1
+        q_idx = levels - 2
+    let q_lo = q_idx * step
+    let q_hi = q_idx + 1
+    if q_hi > levels - 1
+        q_hi = levels - 1
+    let q_hi_val = q_hi * step
+    if q_hi == levels - 1
+        q_hi_val = 255
+    // Fractional position within [q_lo, q_hi_val].
+    let range = q_hi_val - q_lo
+    if range <= 0
+        return q_lo
+    // frac / range > thresh / 255 => pick high level
+    let frac = value - q_lo
+    let lhs = frac * 255
+    let rhs = thresh * range
+    if lhs > rhs
+        return q_hi_val
+    return q_lo
+
+// dt_ordered: apply ordered Bayer dithering to a grayscale surface.
+// matrix_n: size of Bayer matrix (2 or 4). levels: number of quantization levels.
+fn dt_ordered(gray_surface, matrix_n, levels)
+    let w = gray_surface["w"]
+    let h = gray_surface["h"]
+    let px = gray_surface["px"]
+    let mx = dt_bayer_matrix(matrix_n)
+    let out = _dt_new_surface(w, h, 0)
+    let opx = out["px"]
+    let y = 0
+    while y < h
+        let x = 0
+        while x < w
+            let v = px[y * w + x]
+            let dv = dt_threshold(v, x, y, mx, matrix_n, levels)
+            opx[y * w + x] = dv
+            x = x + 1
+        y = y + 1
+    out
+
+// dt_floyd_steinberg: error-diffusion dithering on a grayscale surface.
+// Returns a new surface quantized to `levels` levels.
+// Error diffusion weights: right=7/16, lower-left=3/16, lower=5/16, lower-right=1/16.
+// Uses float arithmetic for error accumulation.
+fn dt_floyd_steinberg(gray_surface, levels)
+    let w = gray_surface["w"]
+    let h = gray_surface["h"]
+    let px = gray_surface["px"]
+    let total = w * h
+    // Build float working buffer.
+    let buf = []
+    let ii = 0
+    while ii < total
+        let fv = px[ii] * 1.0
+        buf.push(fv)
+        ii = ii + 1
+    let out = _dt_new_surface(w, h, 0)
+    let opx = out["px"]
+    let row = 0
+    while row < h
+        let col = 0
+        while col < w
+            let idx = row * w + col
+            let oldv_f = buf[idx]
+            let oldv = float_to_int(oldv_f)
+            // Clamp to 0..255.
+            if oldv < 0
+                oldv = 0
+            if oldv > 255
+                oldv = 255
+            let newv = dt_quantize(oldv, levels)
+            opx[idx] = newv
+            // Compute error.
+            let err_f = oldv_f - newv * 1.0
+            // Right (7/16).
+            if col + 1 < w
+                let ri = idx + 1
+                let rv = buf[ri]
+                let add = err_f * 7.0
+                let add2 = add / 16.0
+                let rv2 = rv + add2
+                buf[ri] = rv2
+            // Lower-left (3/16).
+            if row + 1 < h
+                if col - 1 >= 0
+                    let lli = (row + 1) * w + (col - 1)
+                    let llv = buf[lli]
+                    let add = err_f * 3.0
+                    let add2 = add / 16.0
+                    let llv2 = llv + add2
+                    buf[lli] = llv2
+            // Lower (5/16).
+            if row + 1 < h
+                let di = (row + 1) * w + col
+                let dv = buf[di]
+                let add = err_f * 5.0
+                let add2 = add / 16.0
+                let dv2 = dv + add2
+                buf[di] = dv2
+            // Lower-right (1/16).
+            if row + 1 < h
+                if col + 1 < w
+                    let dri = (row + 1) * w + (col + 1)
+                    let drv = buf[dri]
+                    let add = err_f * 1.0
+                    let add2 = add / 16.0
+                    let drv2 = drv + add2
+                    buf[dri] = drv2
+            col = col + 1
+        row = row + 1
+    out
