@@ -1,0 +1,309 @@
+// ============================================================================
+// NOVA Standard Library -- std/semver/semver_satisfies.nova
+// SemVer 2.0.0 range satisfaction.
+// Range = '||'-separated groups (OR); each group = space-separated comparators
+// (AND). Comparators: '>=', '>', '<', '<=', '=' or bare version (treated as =).
+// LEAF -- imports NOTHING.
+//
+// Public API (prefix: svs_)
+//   svs_satisfies(version, range) -> bool
+//   svs_any(version, range)       -> bool   (alias for svs_satisfies)
+//   svs_max_satisfying(versions, range) -> string
+// ============================================================================
+
+// ── internal: ASCII helpers ──────────────────────────────────────────────────
+
+// True iff the 1-char string c is an ASCII digit ('0'..'9').
+fn _svs_is_digit(c: string) -> bool
+    let b = ord(c)
+    if b < 48
+        return false
+    if b > 57
+        return false
+    true
+
+// True iff every character in s is an ASCII digit AND s is non-empty.
+fn _svs_all_digits(s: string) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let i = 0
+    let ok = 1
+    while i < n
+        if not _svs_is_digit(slice(s, i, i + 1))
+            ok = 0
+        i = i + 1
+    ok == 1
+
+// Parse a non-negative decimal integer; 0 on empty/non-digit input.
+fn _svs_atoi(s: string) -> int
+    let n = len(s)
+    let v = 0
+    let i = 0
+    while i < n
+        let b = ord(slice(s, i, i + 1))
+        if b >= 48
+            if b <= 57
+                v = v * 10 + (b - 48)
+        i = i + 1
+    v
+
+// Strip leading and trailing ASCII spaces from s.
+fn _svs_trim(s: string) -> string
+    let n = len(s)
+    // find first non-space
+    let start = 0
+    let found = 0
+    let i = 0
+    while i < n
+        if found == 0
+            if slice(s, i, i + 1) != " "
+                start = i
+                found = 1
+        i = i + 1
+    if found == 0
+        return ""
+    // find last non-space (scan from end)
+    let end_pos = n
+    let j = n - 1
+    let done = 0
+    while j >= start
+        if done == 0
+            if slice(s, j, j + 1) != " "
+                end_pos = j + 1
+                done = 1
+        j = j - 1
+    slice(s, start, end_pos)
+
+// ── internal: semver parse ────────────────────────────────────────────────────
+
+// Parse a semver string into [major, minor, patch, prerelease, build].
+// Strips a leading 'v' or '='. Missing minor/patch default to 0.
+fn _svs_parse(s: string) -> list
+    let src = s
+    // strip leading 'v' or '='
+    if len(src) > 0
+        let fc = slice(src, 0, 1)
+        if fc == "v"
+            src = slice(src, 1, len(src))
+        else
+            if fc == "="
+                src = slice(src, 1, len(src))
+    // strip build metadata after '+'
+    let build = ""
+    let plus = find(src, "+")
+    if plus >= 0
+        build = slice(src, plus + 1, len(src))
+        src = slice(src, 0, plus)
+    // split off prerelease after '-'
+    let pre = ""
+    let dash = find(src, "-")
+    if dash >= 0
+        pre = slice(src, dash + 1, len(src))
+        src = slice(src, 0, dash)
+    // split numeric core on '.'
+    let parts = split(src, ".")
+    let major = 0
+    let minor = 0
+    let patch = 0
+    if len(parts) >= 1
+        major = _svs_atoi(parts[0])
+    if len(parts) >= 2
+        minor = _svs_atoi(parts[1])
+    if len(parts) >= 3
+        patch = _svs_atoi(parts[2])
+    let result = []
+    push(result, major)
+    push(result, minor)
+    push(result, patch)
+    push(result, pre)
+    push(result, build)
+    result
+
+// ── internal: prerelease comparison ──────────────────────────────────────────
+
+// Compare two single prerelease identifiers per SemVer §11.4.
+// Numeric identifiers sort lower than alphanumeric ones.
+fn _svs_cmp_pr_id(a: string, b: string) -> int
+    let a_num = _svs_all_digits(a)
+    let b_num = _svs_all_digits(b)
+    if a_num and b_num
+        let av = _svs_atoi(a)
+        let bv = _svs_atoi(b)
+        if av < bv
+            return -1
+        if av > bv
+            return 1
+        return 0
+    // numeric < alphanumeric
+    if a_num and not b_num
+        return -1
+    if not a_num and b_num
+        return 1
+    // both alphanumeric: ASCII lexicographic
+    if a < b
+        return -1
+    if a > b
+        return 1
+    0
+
+// Compare prerelease strings a and b per SemVer §11.3-11.4.
+// '' = no prerelease (higher than any with prerelease).
+fn _svs_cmp_pre(a: string, b: string) -> int
+    if a == "" and b == ""
+        return 0
+    if a != "" and b == ""
+        return -1
+    if a == "" and b != ""
+        return 1
+    let pa = split(a, ".")
+    let pb = split(b, ".")
+    let la = len(pa)
+    let lb = len(pb)
+    let min_len = la
+    if lb < la
+        min_len = lb
+    let i = 0
+    while i < min_len
+        let c = _svs_cmp_pr_id(pa[i], pb[i])
+        if c != 0
+            return c
+        i = i + 1
+    // more identifiers = higher precedence (§11.4.4)
+    if la < lb
+        return -1
+    if la > lb
+        return 1
+    0
+
+// ── internal: full version comparison ────────────────────────────────────────
+
+// Compare two parsed version lists per SemVer §11. Build metadata ignored.
+// Returns -1, 0, or 1.
+fn _svs_cmp(a: list, b: list) -> int
+    let amaj = a[0]
+    let bmaj = b[0]
+    if amaj < bmaj
+        return -1
+    if amaj > bmaj
+        return 1
+    let amin = a[1]
+    let bmin = b[1]
+    if amin < bmin
+        return -1
+    if amin > bmin
+        return 1
+    let apat = a[2]
+    let bpat = b[2]
+    if apat < bpat
+        return -1
+    if apat > bpat
+        return 1
+    let ap = a[3]
+    let bp = b[3]
+    _svs_cmp_pre(ap, bp)
+
+// Compare two raw version strings. Returns -1, 0, or 1.
+fn _svs_cmp_str(a: string, b: string) -> int
+    _svs_cmp(_svs_parse(a), _svs_parse(b))
+
+// ── internal: single comparator check ────────────────────────────────────────
+
+// Check whether version string v satisfies one comparator such as '>=1.2.3'.
+// Bare version string (no operator) is treated as equality.
+fn _svs_match_one(v: string, comp: string) -> bool
+    let c = _svs_trim(comp)
+    if len(c) == 0
+        return true
+    let op = ""
+    let ver_str = c
+    if len(c) >= 2
+        let p2 = slice(c, 0, 2)
+        if p2 == ">="
+            op = ">="
+            ver_str = slice(c, 2, len(c))
+        else
+            if p2 == "<="
+                op = "<="
+                ver_str = slice(c, 2, len(c))
+    if op == ""
+        let p1 = slice(c, 0, 1)
+        if p1 == ">"
+            op = ">"
+            ver_str = slice(c, 1, len(c))
+        else
+            if p1 == "<"
+                op = "<"
+                ver_str = slice(c, 1, len(c))
+            else
+                if p1 == "="
+                    op = "="
+                    ver_str = slice(c, 1, len(c))
+    if op == ""
+        op = "="
+    let ver_trimmed = _svs_trim(ver_str)
+    let cmp = _svs_cmp_str(v, ver_trimmed)
+    if op == "="
+        return cmp == 0
+    if op == ">="
+        return cmp >= 0
+    if op == "<="
+        return cmp <= 0
+    if op == ">"
+        return cmp > 0
+    if op == "<"
+        return cmp < 0
+    false
+
+// ── internal: AND group ───────────────────────────────────────────────────────
+
+// Check if version satisfies all space-separated comparators in one OR group.
+fn _svs_match_group(v: string, group: string) -> bool
+    let parts = split(group, " ")
+    let n = len(parts)
+    let i = 0
+    let ok = 1
+    while i < n
+        let comp = _svs_trim(parts[i])
+        if len(comp) > 0
+            if not _svs_match_one(v, comp)
+                ok = 0
+        i = i + 1
+    ok == 1
+
+// ── public API ───────────────────────────────────────────────────────────────
+
+// svs_satisfies -- true iff version satisfies the range expression.
+// Range is OR of '||'-separated groups, each group is AND of comparators.
+fn svs_satisfies(version: string, range: string) -> bool
+    let groups = split(range, "||")
+    let n = len(groups)
+    let i = 0
+    while i < n
+        let g = _svs_trim(groups[i])
+        if len(g) > 0
+            if _svs_match_group(version, g)
+                return true
+        i = i + 1
+    false
+
+// svs_any -- alias for svs_satisfies.
+fn svs_any(version: string, range: string) -> bool
+    svs_satisfies(version, range)
+
+// svs_max_satisfying -- highest-precedence version that satisfies range, or ''.
+fn svs_max_satisfying(versions: list, range: string) -> string
+    let best = ""
+    let have = 0
+    let i = 0
+    while i < len(versions)
+        let v = versions[i]
+        if svs_satisfies(v, range)
+            if have == 0
+                best = v
+                have = 1
+            else
+                if _svs_cmp_str(v, best) > 0
+                    best = v
+        i = i + 1
+    best
