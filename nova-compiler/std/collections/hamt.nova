@@ -1,0 +1,305 @@
+// ============================================================================
+// forge_hamt -- persistent (immutable) hash map via a REAL Hash Array Mapped Trie.
+//
+// A node is either:
+//   INTERNAL ("kind"="node"): up to 32 slots keyed "0".."31", each -> child node.
+//   LEAF     ("kind"="leaf"): a "hash" (the FULL key hash) + a collision chain
+//                             "pairs" of [key,val]. A leaf holds >1 pair ONLY when
+//                             all its keys share the SAME full hash.
+//
+// Insert into a slot already holding a LEAF with a DIFFERENT full hash: build a new
+// INTERNAL node and push BOTH the existing leaf and the new key down, indexing each
+// by its hash slice at the next level (recurse -- they may collide several levels
+// deep, keep splitting). Only chain when the full hashes are identical.
+//
+// Path-copy persistence: set/del return a NEW map; shared nodes are never mutated.
+// ============================================================================
+
+// FNV-1a-style 32-bit string hash, bounded < 2^31 (deterministic).
+fn _hamt_hash(s: string) -> int
+    let h = 2166136261
+    let i = 0
+    while i < len(s)
+        h = (h * 16777619 + ord(char_at(s, i))) % 2147483647
+        i = i + 1
+    h
+
+// 32^level via repeated multiply (avoids <<; level small: 0..~6 for 2^31 hashes).
+fn _hamt_pow32(level: int) -> int
+    let p = 1
+    let i = 0
+    while i < level
+        p = p * 32
+        i = i + 1
+    p
+
+// A 5-bit trie slot index (0..31) for `hash` at trie depth `level`.
+fn _hamt_slot(hash: int, level: int) -> int
+    let shifted = hash / _hamt_pow32(level)
+    shifted % 32
+
+// Fresh empty internal node (slots "0".."31" -> child node; absent = empty).
+fn _hamt_node() -> dict
+    let n = {}
+    n["kind"] = "node"
+    n
+
+// A leaf holding a single [key,val] pair for a given full hash.
+fn _hamt_leaf1(hash: int, key: string, val) -> dict
+    let n = {}
+    n["kind"] = "leaf"
+    n["hash"] = hash
+    let pairs = []
+    push(pairs, _hamt_pair(key, val))
+    n["pairs"] = pairs
+    n
+
+// Build a [key, val] pair list.
+fn _hamt_pair(key: string, val) -> list
+    let p = []
+    push(p, key)
+    push(p, val)
+    p
+
+// Shallow copy of an internal node dict (path-copy: copies THIS node's own entries
+// so the original is never mutated; untouched children are shared by reference).
+fn _hamt_copy(node: dict) -> dict
+    let c = {}
+    for k in keys(node)
+        c[k] = node[k]
+    c
+
+// Deep copy of a leaf: also copies the pairs LIST so appending to / rebuilding the
+// copy does not mutate the shared original's list.
+fn _hamt_copy_leaf(leaf: dict) -> dict
+    let c = {}
+    c["kind"] = "leaf"
+    c["hash"] = leaf["hash"]
+    let old = leaf["pairs"]
+    let np = []
+    let i = 0
+    while i < len(old)
+        push(np, old[i])
+        i = i + 1
+    c["pairs"] = np
+    c
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// A new empty persistent map: wrapper dict { root: node, n: 0 }.
+fn hamt_new() -> dict
+    let m = {}
+    m["root"] = _hamt_node()
+    m["n"] = 0
+    m
+
+// Given two leaves (existing + a fresh single-pair one) whose FULL hashes DIFFER,
+// build an INTERNAL node that holds both, splitting by their hash slice at `level`.
+// Recurses while the two keep landing in the same slot (deeper collisions).
+fn _hamt_split(leaf_a: dict, leaf_b: dict, level: int) -> dict
+    let ha = leaf_a["hash"]
+    let hb = leaf_b["hash"]
+    let sa = _hamt_slot(ha, level)
+    let sb = _hamt_slot(hb, level)
+    let node = _hamt_node()
+    if sa == sb
+        // still collide at this level -> one child internal node, recurse deeper
+        node[str(sa)] = _hamt_split(leaf_a, leaf_b, level + 1)
+    else
+        node[str(sa)] = leaf_a
+        node[str(sb)] = leaf_b
+    node
+
+// Recursively insert (key,val) with full `hash` into `node` at `level`. Returns a
+// NEW node (path-copied); `node` is never mutated. `added` is a 1-element out-param:
+// added[0] = 1 if this was a fresh key, 0 if it replaced an existing value.
+fn _hamt_ins(node: dict, hash: int, level: int, key: string, val, added: list) -> dict
+    if node["kind"] == "leaf"
+        return _hamt_ins_at_leaf(node, hash, level, key, val, added)
+    // internal node: descend into the slot for this level's hash slice
+    let slot = str(_hamt_slot(hash, level))
+    let copy = _hamt_copy(node)
+    if contains(node, slot)
+        let child = node[slot]
+        copy[slot] = _hamt_ins(child, hash, level + 1, key, val, added)
+    else
+        // empty slot -> place a fresh single-pair leaf here
+        copy[slot] = _hamt_leaf1(hash, key, val)
+        added[0] = 1
+    copy
+
+// Insert into (or beside) an existing LEAF encountered at `level`.
+//   - Same full hash: it's a genuine hash collision -> replace-or-append in the chain.
+//   - Different full hash: split into an internal node pushing both down (recurse).
+fn _hamt_ins_at_leaf(leaf: dict, hash: int, level: int, key: string, val, added: list) -> dict
+    if leaf["hash"] == hash
+        // same full hash bucket: replace an existing key's value or append a new pair
+        let c = _hamt_copy_leaf(leaf)
+        let pairs = c["pairs"]
+        let i = 0
+        while i < len(pairs)
+            let pr = pairs[i]
+            if pr[0] == key
+                pairs[i] = _hamt_pair(key, val)
+                return c
+            i = i + 1
+        push(pairs, _hamt_pair(key, val))
+        added[0] = 1
+        return c
+    // different full hash: branch. Build a fresh single-pair leaf for the new key and
+    // split it against the existing leaf, indexing both by their slice at THIS level.
+    added[0] = 1
+    let fresh = _hamt_leaf1(hash, key, val)
+    _hamt_split(leaf, fresh, level)
+
+// Persistent set: returns a NEW map; the input map (and every node it shares) is
+// unchanged. O(log32 n) path-copy.
+fn hamt_set(m: dict, key: string, val) -> dict
+    let hash = _hamt_hash(key)
+    let added = []
+    push(added, 0)
+    let new_root = _hamt_ins(m["root"], hash, 0, key, val, added)
+    let nm = {}
+    nm["root"] = new_root
+    nm["n"] = m["n"] + added[0]
+    nm
+
+// Walk the 5-bit slices down to the leaf and return the value, or null if absent.
+fn hamt_get(m: dict, key: string) -> any
+    let hash = _hamt_hash(key)
+    let node = m["root"]
+    let level = 0
+    while node["kind"] == "node"
+        let slot = str(_hamt_slot(hash, level))
+        if contains(node, slot) == false
+            return null
+        node = node[slot]
+        level = level + 1
+    // leaf: scan its collision chain
+    let pairs = node["pairs"]
+    let i = 0
+    while i < len(pairs)
+        let pr = pairs[i]
+        if pr[0] == key
+            return pr[1]
+        i = i + 1
+    null
+
+// Membership test.
+fn hamt_has(m: dict, key: string) -> bool
+    let hash = _hamt_hash(key)
+    let node = m["root"]
+    let level = 0
+    while node["kind"] == "node"
+        let slot = str(_hamt_slot(hash, level))
+        if contains(node, slot) == false
+            return false
+        node = node[slot]
+        level = level + 1
+    let pairs = node["pairs"]
+    let i = 0
+    while i < len(pairs)
+        let pr = pairs[i]
+        if pr[0] == key
+            return true
+        i = i + 1
+    false
+
+// Recursively delete `key` (full `hash`) from `node`. Returns a NEW node
+// (path-copied). removed[0] = 1 if a pair was actually removed.
+fn _hamt_del(node: dict, hash: int, level: int, key: string, removed: list) -> dict
+    if node["kind"] == "leaf"
+        return _hamt_del_leaf(node, key, removed)
+    let slot = str(_hamt_slot(hash, level))
+    if contains(node, slot) == false
+        return node
+    let child = node[slot]
+    let new_child = _hamt_del(child, hash, level + 1, key, removed)
+    let copy = _hamt_copy(node)
+    if _hamt_is_empty(new_child)
+        // prune the now-empty subtree
+        let pruned = {}
+        for k in keys(copy)
+            if k != slot
+                pruned[k] = copy[k]
+        return pruned
+    copy[slot] = new_child
+    copy
+
+// Delete from a leaf's collision chain (deep-copied for persistence).
+fn _hamt_del_leaf(leaf: dict, key: string, removed: list) -> dict
+    let c = _hamt_copy_leaf(leaf)
+    let old = c["pairs"]
+    let np = []
+    let i = 0
+    while i < len(old)
+        let pr = old[i]
+        if pr[0] == key
+            removed[0] = 1
+        else
+            push(np, pr)
+        i = i + 1
+    c["pairs"] = np
+    c
+
+// Is this node effectively empty (a leaf with no pairs, or a node with no slots)?
+fn _hamt_is_empty(node: dict) -> bool
+    if node["kind"] == "leaf"
+        return len(node["pairs"]) == 0
+    // internal node: empty if it has no numeric slot keys (only "kind")
+    for k in keys(node)
+        if k != "kind"
+            return false
+    true
+
+// Persistent delete: returns a NEW map; input unchanged.
+fn hamt_del(m: dict, key: string) -> dict
+    let hash = _hamt_hash(key)
+    let removed = []
+    push(removed, 0)
+    let new_root = _hamt_del(m["root"], hash, 0, key, removed)
+    let nm = {}
+    nm["root"] = new_root
+    nm["n"] = m["n"] - removed[0]
+    nm
+
+// Number of entries (O(1); maintained at the wrapper).
+fn hamt_len(m: dict) -> int
+    m["n"]
+
+// Collect all keys (O(n) traversal). Order is unspecified.
+fn hamt_keys(m: dict) -> list
+    let out = []
+    _hamt_collect(m["root"], out)
+    out
+
+fn _hamt_collect(node: dict, out: list)
+    if node["kind"] == "leaf"
+        let pairs = node["pairs"]
+        let i = 0
+        while i < len(pairs)
+            let pr = pairs[i]
+            push(out, pr[0])
+            i = i + 1
+        return
+    for k in keys(node)
+        if k != "kind"
+            _hamt_collect(node[k], out)
+
+// Maximum leaf depth in the trie (root internal node = depth 0; a leaf directly in
+// the root's slot = depth 1; deeper = 2, 3, ...). Used to PROVE the trie branches.
+fn hamt_maxdepth(m: dict) -> int
+    _hamt_depth(m["root"], 0)
+
+fn _hamt_depth(node: dict, level: int) -> int
+    if node["kind"] == "leaf"
+        return level
+    let best = level
+    for k in keys(node)
+        if k != "kind"
+            let d = _hamt_depth(node[k], level + 1)
+            if d > best
+                best = d
+    best
