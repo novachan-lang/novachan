@@ -1,0 +1,225 @@
+// ============================================================================
+// NOVA Standard Library — std/httphdr/http_accept
+// ============================================================================
+// Parses the HTTP Accept header value per RFC 7231 §5.3.2.
+//
+// PUBLIC API:
+//   hac_parse(s: string) -> list
+//     Parse an Accept header value into a list of [media_range, q_x1000]
+//     pairs sorted by q descending (ties preserve input order).
+//     q_x1000 is the quality value multiplied by 1000 (default 1000).
+//     Example: "text/html;q=0.9, application/json"
+//       -> [["application/json",1000],["text/html",900]]
+//
+//   hac_best(s: string, offered: list) -> string
+//     Return the offered media type the client most prefers, or '' if none
+//     acceptable (q=0 means explicitly not acceptable).
+//     Range matching: exact, type/*, or */* all match.
+//
+//   hac_accepts(s: string, type: string) -> bool
+//     Return true if the client accepts the given media type (q > 0).
+//
+// DESIGN:
+//   * Case-insensitive media type and parameter name comparison.
+//   * q parameter stripped; bare media range returned without q.
+//   * Stable sort: ties in q preserve input order (index-based sort).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _hac_trim: strip leading and trailing ASCII spaces from a string.
+fn _hac_trim(s: string) -> string
+    let n = len(s)
+    let start = 0
+    while start < n and char_at(s, start) == " "
+        start = start + 1
+    let stop = n - 1
+    while stop >= start and char_at(s, stop) == " "
+        stop = stop - 1
+    if start > stop
+        return ""
+    slice(s, start, stop + 1)
+
+// _hac_lower: convert ASCII uppercase letters to lowercase.
+fn _hac_lower(s: string) -> string
+    let n = len(s)
+    let result = ""
+    let i = 0
+    while i < n
+        let c = char_at(s, i)
+        let o = ord(c)
+        if o >= 65 and o <= 90
+            result = result + chr(o + 32)
+        else
+            result = result + c
+        i = i + 1
+    result
+
+// _hac_starts_with: return 1 if s starts with prefix.
+fn _hac_starts_with(s: string, prefix: string) -> int
+    let sn = len(s)
+    let pn = len(prefix)
+    if pn > sn
+        return 0
+    if slice(s, 0, pn) == prefix
+        return 1
+    0
+
+// _hac_index_of_char: return index of first occurrence of ch in s, or -1.
+fn _hac_index_of_char(s: string, ch: string) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if char_at(s, i) == ch
+            return i
+        i = i + 1
+    -1
+
+// _hac_parse_q: parse q_x1000 from a single param string like "q=0.9".
+// Returns 1000 if not a q param; returns the q*1000 value if it is.
+fn _hac_parse_q(param: string) -> int
+    let p = _hac_trim(param)
+    let pl = _hac_lower(p)
+    if not _hac_starts_with(pl, "q=") == 1
+        return -1
+    let vs = _hac_trim(slice(p, 2, len(p)))
+    let vn = len(vs)
+    if vn == 0
+        return -1
+    // Parse up to 4 significant chars: integer part, dot, up to 3 decimal digits.
+    let int_part = 0
+    let frac_part = 0
+    let frac_digits = 0
+    let i = 0
+    let in_frac = 0
+    while i < vn
+        let c = char_at(vs, i)
+        if c == "."
+            in_frac = 1
+        else
+            let d = ord(c) - 48
+            if d >= 0 and d <= 9
+                if in_frac == 0
+                    int_part = int_part * 10 + d
+                else
+                    if frac_digits < 3
+                        frac_part = frac_part * 10 + d
+                        frac_digits = frac_digits + 1
+        i = i + 1
+    // Normalise frac to 3 decimal places
+    while frac_digits < 3
+        frac_part = frac_part * 10
+        frac_digits = frac_digits + 1
+    int_part * 1000 + frac_part
+
+// _hac_parse_entry: parse one "media-range[;params]" token.
+// Returns [media_range_lower, q_x1000].
+// The returned media_range has the q param stripped and is lowercased.
+fn _hac_parse_entry(token: string) -> list
+    let parts = split(token, ";")
+    let media = _hac_lower(_hac_trim(parts[0]))
+    let q = 1000
+    let i = 1
+    while i < len(parts)
+        let qv = _hac_parse_q(parts[i])
+        if qv >= 0
+            q = qv
+        i = i + 1
+    let pair = []
+    push(pair, media)
+    push(pair, q)
+    pair
+
+// _hac_match: return 1 if media type `mtype` matches range `range`.
+// Both should already be lowercased.
+fn _hac_match(mtype: string, range: string) -> int
+    if range == "*/*"
+        return 1
+    if range == mtype
+        return 1
+    // Check type/* wildcard: if range ends with "/*"
+    let rn = len(range)
+    if rn >= 2
+        let suffix = slice(range, rn - 2, rn)
+        if suffix == "/*"
+            // Extract the type part of range (before "/")
+            let slash_r = _hac_index_of_char(range, "/")
+            if slash_r >= 0
+                let range_type = slice(range, 0, slash_r)
+                // Extract the type part of mtype
+                let slash_m = _hac_index_of_char(mtype, "/")
+                if slash_m >= 0
+                    let mt = slice(mtype, 0, slash_m)
+                    if mt == range_type
+                        return 1
+    0
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// hac_parse: parse Accept header value into [media_range, q_x1000] pairs sorted by q descending.
+fn hac_parse(s: string) -> list
+    if len(s) == 0
+        return []
+    let tokens = split(s, ",")
+    let entries = []
+    let i = 0
+    while i < len(tokens)
+        let entry = _hac_parse_entry(tokens[i])
+        push(entries, entry)
+        i = i + 1
+    // Insertion sort descending by q (stable — preserves input order for equal q).
+    let n = len(entries)
+    let j = 1
+    while j < n
+        let key = entries[j]
+        let kq = key[1]
+        let k = j - 1
+        while k >= 0 and entries[k][1] < kq
+            entries[k + 1] = entries[k]
+            k = k - 1
+        entries[k + 1] = key
+        j = j + 1
+    entries
+
+// hac_best: return the offered media type the client most prefers, or '' if none acceptable.
+fn hac_best(s: string, offered: list) -> string
+    let parsed = hac_parse(s)
+    let pn = len(parsed)
+    let on = len(offered)
+    // Walk parsed entries in order (highest q first).
+    // For each entry, check all offered types for a match.
+    let i = 0
+    while i < pn
+        let entry = parsed[i]
+        let range = entry[0]
+        let q = entry[1]
+        if q > 0
+            let j = 0
+            while j < on
+                let mt = _hac_lower(offered[j])
+                if _hac_match(mt, range) == 1
+                    return offered[j]
+                j = j + 1
+        i = i + 1
+    ""
+
+// hac_accepts: return true if the Accept header permits the given media type (q > 0).
+fn hac_accepts(s: string, mtype: string) -> bool
+    if len(s) == 0
+        return false
+    let parsed = hac_parse(s)
+    let mtl = _hac_lower(mtype)
+    let i = 0
+    while i < len(parsed)
+        let entry = parsed[i]
+        let range = entry[0]
+        let q = entry[1]
+        if _hac_match(mtl, range) == 1
+            if q > 0
+                return true
+            else
+                return false
+        i = i + 1
+    false

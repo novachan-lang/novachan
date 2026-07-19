@@ -1,0 +1,230 @@
+// ============================================================================
+// NOVA Standard Library — std/httphdr/http_range
+// ============================================================================
+// Parses HTTP Range header values per RFC 7233.
+//
+// PUBLIC API:
+//   hrg_parse(s: string) -> list
+//     Parse a Range header value into a list of [start, end] integer pairs.
+//     Only "bytes=" ranges are supported.  end=-1 means open-ended ("N-").
+//     start=-1 means suffix range ("-N"), where N bytes from the end.
+//     Returns [] on invalid or non-bytes input.
+//     Example: "bytes=0-499"       -> [[0, 499]]
+//     Example: "bytes=500-"        -> [[500, -1]]
+//     Example: "bytes=-500"        -> [[-1, 500]]
+//     Example: "bytes=0-0,-1"      -> [[0, 0], [-1, 1]]
+//
+//   hrg_resolve(s: string, total: int) -> list
+//     Resolve parsed ranges against a resource of `total` bytes.
+//     Returns a list of absolute inclusive [start, end] pairs.
+//     Suffix ranges "-N" become [total-N, total-1].
+//     Open-ended ranges "N-" become [N, total-1].
+//     Ranges that fall outside [0, total-1] are dropped.
+//     Returns [] if no valid ranges or input is invalid.
+//
+//   hrg_is_valid(s: string) -> bool
+//     Return true if the Range header begins with "bytes=".
+//
+//   hrg_is_satisfiable(s: string, total: int) -> bool
+//     Return true if at least one range overlaps [0, total-1].
+//
+// DESIGN:
+//   * RFC 7233 §2.1: only "bytes" range unit is widely supported.
+//   * Suffix ranges: "-N" means the last N bytes: resolves to [total-N, total-1].
+//   * Integer parsing: we parse digit-by-digit, treating empty as the sentinel.
+//   * Overlapping/unsatisfied ranges are not merged (RFC 7233 §4.1 allows servers
+//     to choose; here we faithfully return all valid resolved pairs).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _hrg_trim: strip leading and trailing ASCII spaces from a string.
+fn _hrg_trim(s: string) -> string
+    let n = len(s)
+    let start = 0
+    while start < n and char_at(s, start) == " "
+        start = start + 1
+    let stop = n - 1
+    while stop >= start and char_at(s, stop) == " "
+        stop = stop - 1
+    if start > stop
+        return ""
+    slice(s, start, stop + 1)
+
+// _hrg_lower: convert ASCII uppercase letters to lowercase.
+fn _hrg_lower(s: string) -> string
+    let n = len(s)
+    let result = ""
+    let i = 0
+    while i < n
+        let c = char_at(s, i)
+        let o = ord(c)
+        if o >= 65 and o <= 90
+            result = result + chr(o + 32)
+        else
+            result = result + c
+        i = i + 1
+    result
+
+// _hrg_starts_with: return 1 if s starts with prefix (case-sensitive).
+fn _hrg_starts_with(s: string, prefix: string) -> int
+    let sn = len(s)
+    let pn = len(prefix)
+    if pn > sn
+        return 0
+    if slice(s, 0, pn) == prefix
+        return 1
+    0
+
+// _hrg_parse_int: parse a non-negative integer from string s.
+// Returns -2 on empty string (sentinel for "absent").
+// Returns -3 on parse error (non-digit char encountered — shouldn't happen after split).
+fn _hrg_parse_int(s: string) -> int
+    let n = len(s)
+    if n == 0
+        return -2
+    let result = 0
+    let i = 0
+    while i < n
+        let d = ord(char_at(s, i)) - 48
+        if d < 0 or d > 9
+            return -3
+        result = result * 10 + d
+        i = i + 1
+    result
+
+// _hrg_index_of_char: return index of first occurrence of ch in s, or -1.
+fn _hrg_index_of_char(s: string, ch: string) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if char_at(s, i) == ch
+            return i
+        i = i + 1
+    -1
+
+// _hrg_parse_one: parse a single range spec "N-M", "N-", or "-N".
+// Returns a 2-element list [start, end] where:
+//   start >= 0 and end >= 0  -> normal range
+//   start >= 0 and end == -1 -> open-ended "N-"
+//   start == -1 and end >= 0 -> suffix "-N"
+// Returns [] on parse error.
+fn _hrg_parse_one(spec: string) -> list
+    let s = _hrg_trim(spec)
+    let n = len(s)
+    if n == 0
+        return []
+    let dash = _hrg_index_of_char(s, "-")
+    if dash < 0
+        return []
+    let lhs = slice(s, 0, dash)
+    let rhs = slice(s, dash + 1, n)
+    let lv = _hrg_parse_int(lhs)
+    let rv = _hrg_parse_int(rhs)
+    // lv == -3 or rv == -3 means parse error
+    if lv == -3 or rv == -3
+        return []
+    let pair = []
+    if lv == -2
+        // suffix range: "-N"
+        if rv < 0
+            return []
+        push(pair, -1)
+        push(pair, rv)
+    else
+        // normal or open-ended
+        if rv == -2
+            // open-ended: "N-"
+            push(pair, lv)
+            push(pair, -1)
+        else
+            // both present: "N-M"
+            if lv > rv
+                return []
+            push(pair, lv)
+            push(pair, rv)
+    pair
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// hrg_is_valid: return true if the Range header begins with "bytes=".
+fn hrg_is_valid(s: string) -> bool
+    let t = _hrg_trim(s)
+    let tl = _hrg_lower(t)
+    if _hrg_starts_with(tl, "bytes=") == 1
+        return true
+    false
+
+// hrg_parse: parse Range header value into [start, end] pairs.
+fn hrg_parse(s: string) -> list
+    let result = []
+    if not hrg_is_valid(s)
+        return result
+    let t = _hrg_trim(s)
+    // Strip "bytes=" prefix (6 chars)
+    let body = slice(t, 6, len(t))
+    let specs = split(body, ",")
+    let i = 0
+    while i < len(specs)
+        let pair = _hrg_parse_one(specs[i])
+        if len(pair) == 2
+            push(result, pair)
+        i = i + 1
+    result
+
+// hrg_resolve: resolve Range header ranges against a resource of `total` bytes.
+fn hrg_resolve(s: string, total: int) -> list
+    let result = []
+    if total <= 0
+        return result
+    let parsed = hrg_parse(s)
+    let last = total - 1
+    let i = 0
+    while i < len(parsed)
+        let pair = parsed[i]
+        let ps = pair[0]
+        let pe = pair[1]
+        if ps == -1
+            // suffix range "-N": last N bytes
+            let suffix_n = pe
+            if suffix_n <= 0
+                i = i + 1
+            else
+                let abs_start = total - suffix_n
+                if abs_start < 0
+                    abs_start = 0
+                let rp = []
+                push(rp, abs_start)
+                push(rp, last)
+                push(result, rp)
+                i = i + 1
+        else
+            if pe == -1
+                // open-ended "N-"
+                if ps <= last
+                    let rp = []
+                    push(rp, ps)
+                    push(rp, last)
+                    push(result, rp)
+                i = i + 1
+            else
+                // normal "N-M"
+                if ps <= last
+                    let abs_end = pe
+                    if abs_end > last
+                        abs_end = last
+                    let rp = []
+                    push(rp, ps)
+                    push(rp, abs_end)
+                    push(result, rp)
+                i = i + 1
+    result
+
+// hrg_is_satisfiable: return true if at least one range overlaps [0, total-1].
+fn hrg_is_satisfiable(s: string, total: int) -> bool
+    let resolved = hrg_resolve(s, total)
+    if len(resolved) > 0
+        return true
+    false
