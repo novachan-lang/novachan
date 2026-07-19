@@ -1,0 +1,224 @@
+// std/graph/two_sat.nova — 2-SAT solver via implication graph + Kosaraju SCC.
+//
+// Variables: x0 .. x_{num_vars-1}.
+// Literal encoding: variable k as TRUE  = 2*k,  as FALSE = 2*k+1.
+// Clause format: each clause is a 4-int list [avar, aneg, bvar, bneg].
+//   Means: (x[avar] if aneg==0 else NOT x[avar]) OR (x[bvar] if bneg==0 else NOT x[bvar]).
+//
+// Public API:
+//   ts_solvable(num_vars, clauses) -> bool
+//   ts_assignment(num_vars, clauses) -> list of 0/1 per variable, or [] if unsat
+//
+// Algorithm: implication graph + Kosaraju two-pass SCC.
+//   A clause (a OR b) adds implications: NOT a => b, NOT b => a.
+//   The problem is UNSAT iff some variable x has x and NOT x in the same SCC.
+//   If SAT, the assignment is: x=1 iff SCC(x) comes after SCC(NOT x) in Kosaraju order
+//   (later finish-order = earlier in topological order of condensation).
+//
+// Stack pop uses a logical size counter (stk_sz -= 1) instead of slice,
+// avoiding a NOVA runtime bug where slice(list, 0, n-1) returns empty.
+//
+// Module-private prefix: _ts_
+
+// _ts_neg: return the literal for the negation of literal lit.
+fn _ts_neg(lit)
+    if lit % 2 == 0
+        return lit + 1
+    return lit - 1
+
+// _ts_build_graph: build the implication graph and its transpose as adjacency lists.
+// Each node = one literal (0..2*num_vars-1).
+// Returns [graph, graph_t] where each is a list of lists of ints.
+fn _ts_build_graph(num_vars, clauses)
+    let sz = 2 * num_vars
+    let g  = []
+    let gt = []
+    let i = 0
+    while i < sz
+        g.push([])
+        gt.push([])
+        i = i + 1
+    let ci = 0
+    while ci < len(clauses)
+        let cl  = clauses[ci]
+        let av  = cl[0]
+        let an  = cl[1]
+        let bv  = cl[2]
+        let bn  = cl[3]
+        // literal for a: 2*av + an, for b: 2*bv + bn
+        let la = 2 * av + an
+        let lb = 2 * bv + bn
+        let nla = _ts_neg(la)
+        let nlb = _ts_neg(lb)
+        // implication: NOT a => b
+        let row1 = g[nla]
+        row1.push(lb)
+        g[nla] = row1
+        let tr1 = gt[lb]
+        tr1.push(nla)
+        gt[lb] = tr1
+        // implication: NOT b => a
+        let row2 = g[nlb]
+        row2.push(la)
+        g[nlb] = row2
+        let tr2 = gt[la]
+        tr2.push(nlb)
+        gt[la] = tr2
+        ci = ci + 1
+    let result = []
+    result.push(g)
+    result.push(gt)
+    return result
+
+// _ts_dfs1: iterative post-order DFS on graph g from start.
+// visited: list of n ints (0=unvisited).
+// order: list that accumulates finish-order (append on node finish).
+// Uses parallel stacks stk_u (nodes) and stk_ni (neighbor indices) with
+// a logical size counter to avoid slice-on-list bugs.
+fn _ts_dfs1(g, start, visited, order)
+    let stk_u  = []
+    let stk_ni = []
+    stk_u.push(start)
+    stk_ni.push(0)
+    let stk_sz = 1
+    visited[start] = 1
+    let done = 0
+    while done == 0
+        if stk_sz == 0
+            done = 1
+        else
+            let top = stk_sz - 1
+            let u   = stk_u[top]
+            let ni  = stk_ni[top]
+            let nbrs = g[u]
+            if ni >= len(nbrs)
+                // finished u — pop and record in order
+                stk_sz = stk_sz - 1
+                order.push(u)
+            else
+                stk_ni[top] = ni + 1
+                let v = nbrs[ni]
+                if visited[v] == 0
+                    visited[v] = 1
+                    stk_u.push(v)
+                    stk_ni.push(0)
+                    stk_sz = stk_sz + 1
+
+// _ts_dfs2: iterative DFS on transposed graph gt from start.
+// Assigns all reachable unassigned nodes to component comp_id.
+// comp: list of sz ints (-1 = unassigned).
+// Uses a logical stack size counter to avoid slice-on-list bugs.
+fn _ts_dfs2(gt, start, comp, comp_id)
+    let stk    = []
+    let stk_ni = []
+    stk.push(start)
+    stk_ni.push(0)
+    let stk_sz = 1
+    comp[start] = comp_id
+    let done = 0
+    while done == 0
+        if stk_sz == 0
+            done = 1
+        else
+            let top  = stk_sz - 1
+            let u    = stk[top]
+            let ni   = stk_ni[top]
+            let nbrs = gt[u]
+            if ni >= len(nbrs)
+                stk_sz = stk_sz - 1
+            else
+                stk_ni[top] = ni + 1
+                let v = nbrs[ni]
+                if comp[v] == -1
+                    comp[v] = comp_id
+                    stk.push(v)
+                    stk_ni.push(0)
+                    stk_sz = stk_sz + 1
+
+// _ts_kosaraju: run Kosaraju to compute SCC ids for all 2*num_vars literals.
+// Returns comp list of length 2*num_vars; comp[lit] = SCC id.
+// SCC ids are assigned in REVERSE finish order (first finished = highest id),
+// meaning higher id = earlier in topological order of condensation.
+fn _ts_kosaraju(g, gt, sz)
+    let visited = []
+    let i = 0
+    while i < sz
+        visited.push(0)
+        i = i + 1
+    let order = []
+    let j = 0
+    while j < sz
+        if visited[j] == 0
+            _ts_dfs1(g, j, visited, order)
+        j = j + 1
+    // Second pass on transposed graph in reverse finish order
+    let comp = []
+    let k = 0
+    while k < sz
+        comp.push(-1)
+        k = k + 1
+    let comp_id = 0
+    let oi = len(order) - 1
+    while oi >= 0
+        let v = order[oi]
+        if comp[v] == -1
+            _ts_dfs2(gt, v, comp, comp_id)
+            comp_id = comp_id + 1
+        oi = oi - 1
+    return comp
+
+// _ts_core: solve 2-SAT. Returns [is_sat, comp] where comp is the SCC array.
+fn _ts_core(num_vars, clauses)
+    let grp = _ts_build_graph(num_vars, clauses)
+    let g   = grp[0]
+    let gt  = grp[1]
+    let sz  = 2 * num_vars
+    let comp = _ts_kosaraju(g, gt, sz)
+    // check: for each variable k, comp[2k] != comp[2k+1]
+    let sat = 1
+    let k = 0
+    while k < num_vars
+        let lit_t = 2 * k
+        let lit_f = 2 * k + 1
+        if comp[lit_t] == comp[lit_f]
+            sat = 0
+        k = k + 1
+    let result = []
+    result.push(sat)
+    result.push(comp)
+    return result
+
+// ts_solvable: returns true iff the 2-SAT instance is satisfiable.
+fn ts_solvable(num_vars, clauses)
+    if num_vars == 0
+        return true
+    let core = _ts_core(num_vars, clauses)
+    let sat = core[0]
+    if sat == 1
+        return true
+    return false
+
+// ts_assignment: returns a satisfying assignment (list of 0/1 per variable),
+// or [] if unsatisfiable.
+// Assignment rule: x[k] = 1 iff comp[2k] > comp[2k+1]
+// (In Kosaraju reverse-finish order, higher comp_id = topologically EARLIER;
+//  the FALSE literal must be processed AFTER TRUE for x=1 to be consistent.)
+fn ts_assignment(num_vars, clauses)
+    if num_vars == 0
+        return []
+    let core = _ts_core(num_vars, clauses)
+    let sat  = core[0]
+    if sat == 0
+        return []
+    let comp = core[1]
+    let asgn = []
+    let k = 0
+    while k < num_vars
+        let cT = comp[2 * k]
+        let cF = comp[2 * k + 1]
+        if cT > cF
+            asgn.push(1)
+        else
+            asgn.push(0)
+        k = k + 1
+    return asgn
