@@ -1,0 +1,256 @@
+// std/grammar/grammar_derive — Bounded general CFG derivation and recognition.
+//
+// Same grammar representation as grammar_follow/grammar_ll1.
+// PRODUCTION = [lhs, rhs] where rhs is a list of symbol strings.
+// NONTERMINAL = single uppercase letter A..Z.
+// TERMINAL = any symbol that is NOT a single uppercase letter.
+//
+// Public API:
+//   grdv_recognize(prods, start, tokens) -> int
+//       1 iff tokens is derivable from start (bounded BFS sentential-form expansion).
+//   grdv_generate(prods, start, max_len) -> list of strings
+//       All terminal strings of length <= max_len derivable from start,
+//       each represented as space-joined tokens, sorted + deduped.
+//   grdv_derivable(prods, start, tokens) -> int
+//       Alias for grdv_recognize (convenience wrapper).
+//
+// Algorithm: BFS over sentential forms (sequences of symbols).
+//   At each step, expand the LEFTMOST nonterminal by every applicable production.
+//   Prune any form whose length exceeds the target length.
+//   Mark visited sentential forms (encoded as "~~"-joined string) to avoid loops.
+//
+// IMPORTANT: The symbol separator used internally is "~~". Grammar symbols must
+// not contain "~~". For typical grammars (terminals like +, *, id, (, )) this holds.
+
+// _grdv_is_nt: true iff symbol is a single uppercase letter A..Z.
+fn _grdv_is_nt(sym)
+    if len(sym) != 1
+        return 0
+    let c = sym[0]
+    if c >= "A" and c <= "Z"
+        return 1
+    return 0
+
+// _grdv_encode: encode a sentential form (list of symbols) as a string for dedup.
+fn _grdv_encode(form)
+    let n = len(form)
+    if n == 0
+        return ""
+    let s = form[0]
+    let i = 1
+    while i < n
+        s = s + "~~" + form[i]
+        i = i + 1
+    return s
+
+// _grdv_form_eq: check if sentential form equals a token list.
+fn _grdv_form_eq(form, tokens)
+    let n = len(form)
+    if n != len(tokens)
+        return 0
+    let i = 0
+    while i < n
+        if form[i] != tokens[i]
+            return 0
+        i = i + 1
+    return 1
+
+// _grdv_is_terminal_form: true iff form contains no nonterminals.
+fn _grdv_is_terminal_form(form)
+    let i = 0
+    let n = len(form)
+    while i < n
+        if _grdv_is_nt(form[i]) == 1
+            return 0
+        i = i + 1
+    return 1
+
+// _grdv_set_contains: membership in a sorted list set.
+fn _grdv_set_contains(s, v)
+    let i = 0
+    let n = len(s)
+    while i < n
+        if s[i] == v
+            return 1
+        i = i + 1
+    return 0
+
+// _grdv_set_insert: insert v into a sorted list set; return 1 if changed.
+fn _grdv_set_insert(s, v)
+    if _grdv_set_contains(s, v) == 1
+        return 0
+    let n = len(s)
+    let i = 0
+    while i < n
+        if v < s[i]
+            let newl = []
+            let j = 0
+            while j < i
+                newl.push(s[j])
+                j = j + 1
+            newl.push(v)
+            while j < n
+                newl.push(s[j])
+                j = j + 1
+            let k = 0
+            while k < len(newl)
+                if k < n
+                    s[k] = newl[k]
+                else
+                    s.push(newl[k])
+                k = k + 1
+            return 1
+        i = i + 1
+    s.push(v)
+    return 1
+
+// _grdv_count_terminals: count terminal symbols in a sentential form.
+fn _grdv_count_terminals(form)
+    let cnt = 0
+    let i = 0
+    let n = len(form)
+    while i < n
+        if _grdv_is_nt(form[i]) == 0
+            cnt = cnt + 1
+        i = i + 1
+    return cnt
+
+// _grdv_expand: expand the leftmost nonterminal in form by all applicable productions.
+// Returns a list of new sentential forms (each is a list of symbols).
+// Prunes forms where the count of terminal symbols already exceeds max_len,
+// since those can never derive a terminal string of length <= max_len.
+fn _grdv_expand(form, prods, max_len)
+    let results = []
+    // Find leftmost nonterminal
+    let flen = len(form)
+    let left_nt_pos = -1
+    let i = 0
+    while i < flen
+        if _grdv_is_nt(form[i]) == 1
+            if left_nt_pos == -1
+                left_nt_pos = i
+        i = i + 1
+    if left_nt_pos == -1
+        return results
+    let nt = form[left_nt_pos]
+    // For each production whose lhs == nt
+    let pi = 0
+    let pn = len(prods)
+    while pi < pn
+        let prod = prods[pi]
+        let lhs = prod[0]
+        if lhs == nt
+            let rhs = prods[pi][1]
+            // Build new form: form[0..left_nt_pos-1] ++ rhs ++ form[left_nt_pos+1..]
+            let newform = []
+            let j = 0
+            while j < left_nt_pos
+                newform.push(form[j])
+                j = j + 1
+            let r = 0
+            let rlen = len(rhs)
+            while r < rlen
+                newform.push(rhs[r])
+                r = r + 1
+            let jj = left_nt_pos + 1
+            while jj < flen
+                newform.push(form[jj])
+                jj = jj + 1
+            // Prune: skip if terminal count already exceeds max_len
+            // (nonterminals can still derive epsilon so we only count terminals)
+            let term_cnt = _grdv_count_terminals(newform)
+            if term_cnt <= max_len
+                results.push(newform)
+        pi = pi + 1
+    return results
+
+// grdv_recognize: return 1 iff tokens is derivable from start.
+// Uses bounded BFS: expands the leftmost nonterminal, prunes forms where terminal
+// symbol count already exceeds len(tokens) (they can never match the target).
+// Visited set prevents revisiting the same sentential form.
+fn grdv_recognize(prods, start, tokens)
+    let target_len = len(tokens)
+    // Bound = max number of terminals we tolerate in an intermediate form
+    let bound = target_len
+    // BFS queue: list of sentential forms
+    let queue = []
+    let init_form = []
+    init_form.push(start)
+    queue.push(init_form)
+    let visited = {}
+    let enc0 = _grdv_encode(init_form)
+    visited[enc0] = 1
+    let qpos = 0
+    while qpos < len(queue)
+        let form = queue[qpos]
+        qpos = qpos + 1
+        // Check if this form is all terminals and matches tokens
+        if _grdv_is_terminal_form(form) == 1
+            if _grdv_form_eq(form, tokens) == 1
+                return 1
+        else
+            // Expand leftmost nonterminal
+            let expanded = _grdv_expand(form, prods, bound)
+            let ei = 0
+            let en = len(expanded)
+            while ei < en
+                let newf = expanded[ei]
+                let enc = _grdv_encode(newf)
+                if not contains(visited, enc)
+                    visited[enc] = 1
+                    queue.push(newf)
+                ei = ei + 1
+    return 0
+
+// _grdv_join: join a list of strings with spaces into one string.
+fn _grdv_join(toks)
+    let n = len(toks)
+    if n == 0
+        return ""
+    let s = toks[0]
+    let i = 1
+    while i < n
+        s = s + " " + toks[i]
+        i = i + 1
+    return s
+
+// grdv_generate: return all terminal strings of length <= max_len derivable from start.
+// Each string is space-joined terminals; result is sorted + deduped.
+// Uses BFS with bound max_len; stops expanding forms longer than max_len.
+fn grdv_generate(prods, start, max_len)
+    let results = []
+    let bound = max_len
+    if bound < 0
+        let bound = 0
+    // BFS
+    let queue = []
+    let init_form = []
+    init_form.push(start)
+    queue.push(init_form)
+    let visited = {}
+    let enc0 = _grdv_encode(init_form)
+    visited[enc0] = 1
+    let qpos = 0
+    while qpos < len(queue)
+        let form = queue[qpos]
+        qpos = qpos + 1
+        if _grdv_is_terminal_form(form) == 1
+            if len(form) <= max_len
+                let s = _grdv_join(form)
+                _grdv_set_insert(results, s)
+        else
+            let expanded = _grdv_expand(form, prods, bound)
+            let ei = 0
+            let en = len(expanded)
+            while ei < en
+                let newf = expanded[ei]
+                let enc = _grdv_encode(newf)
+                if not contains(visited, enc)
+                    visited[enc] = 1
+                    queue.push(newf)
+                ei = ei + 1
+    return results
+
+// grdv_derivable: check whether token list is derivable (alias for grdv_recognize).
+fn grdv_derivable(prods, start, tokens)
+    return grdv_recognize(prods, start, tokens)

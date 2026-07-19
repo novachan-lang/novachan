@@ -1,0 +1,434 @@
+// ============================================================================
+// NOVA Standard Library — std/grammar/grammar_earley
+// ============================================================================
+// Earley recognizer / parse-count for arbitrary CFGs (including left-recursive
+// and ambiguous grammars).
+//
+// Grammar convention:
+//   A nonterminal is a string whose first char is A-Z.
+//   A terminal is anything else.
+//   Productions: [lhs, rhs] where rhs is a list of symbol strings ([] = epsilon).
+//   Grammar = list of productions.
+//
+// An Earley item is encoded as the string  "ruleIdx|dot|origin"
+//   ruleIdx = index into prods (int)
+//   dot     = position in rhs (0 = before first symbol)
+//   origin  = chart-set index where this item was first created
+//
+// Chart[k] = sorted list of item-strings for position k (0..n).
+// Chart[0] seeds from start predictions; Chart[n] is checked for acceptance.
+//
+// Public API (prefix gre_):
+//   gre_recognize(prods, start, tokens)            -> bool(int)
+//   gre_parse_count(prods, start, tokens)          -> int  (number of leftmost derivations)
+//   gre_is_ambiguous_upto(prods, start, max_len)   -> bool(int)
+//
+// parse_count is bounded: if more than 1000 partial combinations are accumulated
+// the count saturates at 1001 (signals ambiguity without full enumeration).
+//
+// is_ambiguous_upto generates all strings over the grammar's terminals up to
+// length max_len and returns true if any has parse_count > 1.
+//
+// Self-contained: imports nothing.
+// ============================================================================
+
+// ── Symbol / item helpers ─────────────────────────────────────────────────────
+
+// _gre_is_nt: true iff sym starts with A-Z.
+fn _gre_is_nt(sym) -> int
+    if len(sym) == 0
+        return 0
+    let c = slice(sym, 0, 1)
+    let ok = 0
+    if c == "A" or c == "B" or c == "C" or c == "D" or c == "E"
+        ok = 1
+    if c == "F" or c == "G" or c == "H" or c == "I" or c == "J"
+        ok = 1
+    if c == "K" or c == "L" or c == "M" or c == "N" or c == "O"
+        ok = 1
+    if c == "P" or c == "Q" or c == "R" or c == "S" or c == "T"
+        ok = 1
+    if c == "U" or c == "V" or c == "W" or c == "X" or c == "Y"
+        ok = 1
+    if c == "Z"
+        ok = 1
+    return ok
+
+// _gre_lst_has: linear search for string in list.
+fn _gre_lst_has(lst, s) -> int
+    let i = 0
+    while i < len(lst)
+        if lst[i] == s
+            return 1
+        i = i + 1
+    return 0
+
+// _gre_lst_add: add s to lst only if absent.
+fn _gre_lst_add(lst, s)
+    if _gre_lst_has(lst, s) == 0
+        push(lst, s)
+
+// _gre_encode_item: encode ruleIdx, dot, origin as a single string.
+fn _gre_encode_item(ruleIdx, dot, origin) -> string
+    return str(ruleIdx) + "|" + str(dot) + "|" + str(origin)
+
+// _gre_decode_field: extract field 0/1/2 from encoded item string "a|b|c".
+fn _gre_decode_field(item, field) -> int
+    // Find positions of '|' chars
+    let n = len(item)
+    let pipe1 = -1
+    let pipe2 = -1
+    let i = 0
+    while i < n
+        let ch = slice(item, i, i + 1)
+        if ch == "|"
+            if pipe1 == -1
+                pipe1 = i
+            else
+                if pipe2 == -1
+                    pipe2 = i
+        i = i + 1
+    let s = ""
+    if field == 0
+        s = slice(item, 0, pipe1)
+    if field == 1
+        s = slice(item, pipe1 + 1, pipe2)
+    if field == 2
+        s = slice(item, pipe2 + 1, n)
+    // Convert s to int
+    let neg = 0
+    let start = 0
+    if len(s) > 0
+        if slice(s, 0, 1) == "-"
+            neg = 1
+            start = 1
+    let val = 0
+    let j = start
+    while j < len(s)
+        let d = slice(s, j, j + 1)
+        let dv = 0
+        if d == "0"
+            dv = 0
+        if d == "1"
+            dv = 1
+        if d == "2"
+            dv = 2
+        if d == "3"
+            dv = 3
+        if d == "4"
+            dv = 4
+        if d == "5"
+            dv = 5
+        if d == "6"
+            dv = 6
+        if d == "7"
+            dv = 7
+        if d == "8"
+            dv = 8
+        if d == "9"
+            dv = 9
+        val = val * 10 + dv
+        j = j + 1
+    if neg == 1
+        val = 0 - val
+    return val
+
+// ── Core Earley chart builder ─────────────────────────────────────────────────
+
+// _gre_build_chart: run the Earley algorithm and return the chart (list of item-lists).
+// Chart has n+1 entries (positions 0..n).
+fn _gre_build_chart(prods, start, tokens) -> list
+    let n = len(tokens)
+    // Initialise chart: (n+1) empty item-lists
+    let chart = []
+    let ci = 0
+    while ci <= n
+        let s = []
+        push(chart, s)
+        ci = ci + 1
+    // Seed Chart[0]: all productions for start symbol
+    let pi = 0
+    while pi < len(prods)
+        let p = prods[pi]
+        if p[0] == start
+            let item = _gre_encode_item(pi, 0, 0)
+            _gre_lst_add(chart[0], item)
+        pi = pi + 1
+    // Process each chart position
+    let k = 0
+    while k <= n
+        let pos = 0
+        while pos < len(chart[k])
+            let it = chart[k][pos]
+            let ri = _gre_decode_field(it, 0)
+            let dot = _gre_decode_field(it, 1)
+            let orig = _gre_decode_field(it, 2)
+            let rhs = prods[ri][1]
+            let rlen = len(rhs)
+            if dot == rlen
+                // COMPLETE: item is fully matched (dot at end of rhs)
+                let comp_lhs = prods[ri][0]
+                // Find all items in chart[orig] with dot pointing at comp_lhs
+                let ji = 0
+                while ji < len(chart[orig])
+                    let jt = chart[orig][ji]
+                    let jri = _gre_decode_field(jt, 0)
+                    let jdot = _gre_decode_field(jt, 1)
+                    let jorig = _gre_decode_field(jt, 2)
+                    let jrhs = prods[jri][1]
+                    let jrlen = len(jrhs)
+                    if jdot < jrlen
+                        if jrhs[jdot] == comp_lhs
+                            let new_item = _gre_encode_item(jri, jdot + 1, jorig)
+                            _gre_lst_add(chart[k], new_item)
+                    ji = ji + 1
+            else
+                let next_sym = rhs[dot]
+                if _gre_is_nt(next_sym) == 1
+                    // PREDICT: add all productions for next_sym at position k
+                    let pj = 0
+                    while pj < len(prods)
+                        if prods[pj][0] == next_sym
+                            let new_item = _gre_encode_item(pj, 0, k)
+                            _gre_lst_add(chart[k], new_item)
+                        pj = pj + 1
+                else
+                    // SCAN: if next_sym == tokens[k], advance to chart[k+1]
+                    if k < n
+                        if tokens[k] == next_sym
+                            let new_item = _gre_encode_item(ri, dot + 1, orig)
+                            _gre_lst_add(chart[k + 1], new_item)
+            pos = pos + 1
+        k = k + 1
+    return chart
+
+// gre_recognize: true iff tokens is in the language of (prods, start).
+// An item (start -> rhs •, 0) in Chart[n] means acceptance.
+fn gre_recognize(prods, start, tokens) -> int
+    let n = len(tokens)
+    let chart = _gre_build_chart(prods, start, tokens)
+    // Check chart[n] for a complete start item with origin 0
+    let i = 0
+    while i < len(chart[n])
+        let it = chart[n][i]
+        let ri = _gre_decode_field(it, 0)
+        let dot = _gre_decode_field(it, 1)
+        let orig = _gre_decode_field(it, 2)
+        if orig == 0
+            if prods[ri][0] == start
+                if dot == len(prods[ri][1])
+                    return 1
+        i = i + 1
+    return 0
+
+// ── Parse counting via chart DP ───────────────────────────────────────────────
+//
+// We count derivations bottom-up after building the chart.
+// count[(A, i, j)] = number of parse trees for nonterminal A spanning tokens[i..j-1].
+// Stored in a dict keyed by "A|i|j".
+// For terminals: count[(a, i, i+1)] = 1 if tokens[i]==a, else 0.
+// For nonterminals: count[(A, i, j)] = sum over all rules A->X1..Xk and
+//   all ways to split [i,j] into k contiguous sub-spans where each Xi derives its span.
+//
+// This is O(n^3 * |G|) with memoization — feasible for the small grammars in KATs.
+// Saturation cap at 1001 to prevent overflow on highly ambiguous grammars.
+
+fn _gre_ckey(sym, i, j) -> string
+    return sym + "|" + str(i) + "|" + str(j)
+
+// _gre_cnt_rhs: count ways to derive rhs[dot..] over tokens[i..j-1].
+// Uses a memo dict (passed by reference as a list containing one dict).
+fn _gre_cnt_rhs(prods, rhs, dot, i, j, memo_box, tokens) -> int
+    let rlen = len(rhs)
+    // Base: dot reached end of rhs
+    if dot == rlen
+        if i == j
+            return 1
+        else
+            return 0
+    // Only one symbol left: must span exactly [i,j-1] i.e. length 1
+    let sym = rhs[dot]
+    let memo = memo_box[0]
+    if _gre_is_nt(sym) == 1
+        // Try all split points m in [i+1 .. j-(rlen-dot-1)]
+        // (each remaining symbol needs at least 1 token, except nullable — simplified here:
+        //  we allow m=i when we also allow empty derivations via the chart)
+        // Actually to handle epsilons correctly we allow m from i to j
+        let total = 0
+        let m = i
+        while m <= j
+            // Count for sym spanning [i,m]
+            let sym_key = _gre_ckey(sym, i, m)
+            let sym_cnt = 0
+            if contains(memo, sym_key)
+                sym_cnt = memo[sym_key]
+            // Count for remaining rhs[dot+1..] spanning [m,j]
+            let rest_cnt = _gre_cnt_rhs(prods, rhs, dot + 1, m, j, memo_box, tokens)
+            let contrib = sym_cnt * rest_cnt
+            total = total + contrib
+            if total > 1001
+                total = 1001
+            m = m + 1
+        return total
+    else
+        // Terminal: must consume exactly one token at position i
+        if dot == rlen - 1
+            // Last symbol: must match tokens[i] and i+1 == j
+            if i + 1 == j
+                if i < len(tokens)
+                    if tokens[i] == sym
+                        return 1
+            return 0
+        else
+            // Not last: consume one token at i, continue with rest over [i+1..j]
+            if i < len(tokens)
+                if tokens[i] == sym
+                    return _gre_cnt_rhs(prods, rhs, dot + 1, i + 1, j, memo_box, tokens)
+            return 0
+
+// _gre_fill_counts: fill memo for all nonterminals and spans using chart information.
+// Only fills (A,i,j) that are reachable (i.e., A->*... spans [i,j] in the chart).
+fn _gre_fill_counts(prods, tokens, chart, memo_box)
+    let n = len(tokens)
+    // We iterate over all (i,j) pairs with i<=j, j from 0..n
+    // For each pair, check which nonterminals appear completed in chart[j] with origin i
+    // For each such (A, i, j): count = sum over rules A->rhs of count_rhs(rhs, i, j)
+    // Fill in order of increasing span length
+    let length = 0
+    while length <= n
+        let si = 0
+        while si <= n - length
+            let ej = si + length
+            // Find completed nonterminals for span [si, ej]
+            // A completed item (A->rhs•, si) in chart[ej] means A spans [si, ej]
+            // But we also need to count the actual ways
+            // Collect the nonterminals to evaluate at this span
+            let nts_here = []
+            let ci = 0
+            while ci < len(chart[ej])
+                let it = chart[ej][ci]
+                let ri = _gre_decode_field(it, 0)
+                let dot = _gre_decode_field(it, 1)
+                let orig = _gre_decode_field(it, 2)
+                if orig == si
+                    let rhs = prods[ri][1]
+                    if dot == len(rhs)
+                        let lhs = prods[ri][0]
+                        _gre_lst_add(nts_here, lhs)
+                ci = ci + 1
+            // For each nonterminal A in nts_here, compute count(A, si, ej)
+            let ni = 0
+            while ni < len(nts_here)
+                let A = nts_here[ni]
+                let key = _gre_ckey(A, si, ej)
+                let memo = memo_box[0]
+                if contains(memo, key) == 0
+                    // Sum over all rules for A
+                    let total = 0
+                    let pi = 0
+                    while pi < len(prods)
+                        let p = prods[pi]
+                        if p[0] == A
+                            let rhs = p[1]
+                            let cnt = _gre_cnt_rhs(prods, rhs, 0, si, ej, memo_box, tokens)
+                            total = total + cnt
+                            if total > 1001
+                                total = 1001
+                        pi = pi + 1
+                    let memo2 = memo_box[0]
+                    memo2[key] = total
+                ni = ni + 1
+            si = si + 1
+        length = length + 1
+
+// gre_parse_count: count distinct parse trees for (prods, start, tokens).
+// Returns 0 if not recognized, or the number of parse trees (capped at 1001).
+fn gre_parse_count(prods, start, tokens) -> int
+    let n = len(tokens)
+    let chart = _gre_build_chart(prods, start, tokens)
+    // Check recognition first
+    let recognized = 0
+    let ci = 0
+    while ci < len(chart[n])
+        let it = chart[n][ci]
+        let ri = _gre_decode_field(it, 0)
+        let dot = _gre_decode_field(it, 1)
+        let orig = _gre_decode_field(it, 2)
+        if orig == 0
+            if prods[ri][0] == start
+                if dot == len(prods[ri][1])
+                    recognized = 1
+        ci = ci + 1
+    if recognized == 0
+        return 0
+    // Fill memo
+    let memo_dict = {}
+    let memo_box = [memo_dict]
+    _gre_fill_counts(prods, tokens, chart, memo_box)
+    // Return count(start, 0, n)
+    let key = _gre_ckey(start, 0, n)
+    let memo = memo_box[0]
+    if contains(memo, key)
+        return memo[key]
+    return 0
+
+// ── Ambiguity detection ───────────────────────────────────────────────────────
+
+// _gre_collect_terminals: collect all terminal symbols from grammar.
+fn _gre_collect_terminals(prods) -> list
+    let terms = []
+    let i = 0
+    while i < len(prods)
+        let rhs = prods[i][1]
+        let j = 0
+        while j < len(rhs)
+            let sym = rhs[j]
+            if _gre_is_nt(sym) == 0
+                _gre_lst_add(terms, sym)
+            j = j + 1
+        i = i + 1
+    return terms
+
+// _gre_gen_strings: generate all token lists over terminals up to max_len.
+// BFS; returns list of token-lists.
+fn _gre_gen_strings(terms, max_len) -> list
+    let result = []
+    let empty = []
+    push(result, empty)
+    if max_len == 0
+        return result
+    let queue = []
+    let e2 = []
+    push(queue, e2)
+    let qi = 0
+    while qi < len(queue)
+        let cur = queue[qi]
+        if len(cur) < max_len
+            let ti = 0
+            while ti < len(terms)
+                let new_toks = []
+                let ci = 0
+                while ci < len(cur)
+                    push(new_toks, cur[ci])
+                    ci = ci + 1
+                push(new_toks, terms[ti])
+                push(result, new_toks)
+                push(queue, new_toks)
+                ti = ti + 1
+        qi = qi + 1
+    return result
+
+// gre_is_ambiguous_upto: true iff some string of length <= max_len has > 1 parse.
+fn gre_is_ambiguous_upto(prods, start, max_len) -> int
+    let terms = _gre_collect_terminals(prods)
+    if len(terms) == 0
+        return 0
+    let all_strs = _gre_gen_strings(terms, max_len)
+    let i = 0
+    while i < len(all_strs)
+        let toks = all_strs[i]
+        let cnt = gre_parse_count(prods, start, toks)
+        if cnt > 1
+            return 1
+        i = i + 1
+    return 0

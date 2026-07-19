@@ -1,0 +1,705 @@
+// std/grammar/grammar_elim.nova — Grammar cleanup / transformation passes.
+//
+// A SYMBOL is a string.  NONTERMINAL iff it is a single uppercase letter A..Z.
+// A PRODUCTION is a 2-element list [lhs, rhs] where rhs is a list of symbols.
+// A GRAMMAR is a list of productions.
+// EPSILON = rhs == [].
+//
+// Public API (prefix grel_):
+//   grel_remove_epsilon(prods, start) -> prods  eliminate epsilon productions
+//   grel_remove_units(prods)          -> prods  eliminate unit productions A->B
+//   grel_remove_useless(prods, start) -> prods  drop non-generating then unreachable
+//   grel_eliminate_left_recursion(prods) -> prods  immediate LR: A->Aa|b => A->bA', A'->aA'|eps
+//   grel_left_factor(prods)           -> prods  left-factor shared prefixes
+//
+// Internal helpers: prefix _grel_
+
+// _grel_is_nt: true iff sym is a single uppercase letter (nonterminal).
+fn _grel_is_nt(sym) -> bool
+    if len(sym) != 1
+        return false
+    let c = sym[0]
+    if c >= "A" and c <= "Z"
+        return true
+    return false
+
+// _grel_str_in: true iff val is in the list.
+fn _grel_str_in(lst, val) -> bool
+    let i = 0
+    while i < len(lst)
+        if lst[i] == val
+            return true
+        i = i + 1
+    return false
+
+// _grel_prod_eq: true iff two productions [lhs1,rhs1] and [lhs2,rhs2] are equal.
+fn _grel_prod_eq(p1, p2) -> bool
+    if p1[0] != p2[0]
+        return false
+    let r1 = p1[1]
+    let r2 = p2[1]
+    if len(r1) != len(r2)
+        return false
+    let i = 0
+    while i < len(r1)
+        if r1[i] != r2[i]
+            return false
+        i = i + 1
+    return true
+
+// _grel_has_prod: true iff prods already contains prod p.
+fn _grel_has_prod(prods, p) -> bool
+    let i = 0
+    while i < len(prods)
+        if _grel_prod_eq(prods[i], p)
+            return true
+        i = i + 1
+    return false
+
+// _grel_rhs_list_eq: true iff two rhs lists are equal.
+fn _grel_rhs_list_eq(r1, r2) -> bool
+    if len(r1) != len(r2)
+        return false
+    let i = 0
+    while i < len(r1)
+        if r1[i] != r2[i]
+            return false
+        i = i + 1
+    return true
+
+// _grel_nullable_set: compute the set of nullable nonterminals (fixpoint).
+// Returns a list of nonterminal strings.
+fn _grel_nullable_set(prods) -> list
+    let nullable = []
+    let changed = true
+    while changed
+        changed = false
+        let i = 0
+        while i < len(prods)
+            let prod = prods[i]
+            let lhs = prod[0]
+            let rhs = prod[1]
+            if not _grel_str_in(nullable, lhs)
+                // epsilon production
+                if len(rhs) == 0
+                    nullable.push(lhs)
+                    changed = true
+                else
+                    // all symbols nullable?
+                    let all_null = true
+                    let j = 0
+                    while j < len(rhs)
+                        let sym = rhs[j]
+                        if _grel_is_nt(sym)
+                            if not _grel_str_in(nullable, sym)
+                                all_null = false
+                        else
+                            all_null = false
+                        j = j + 1
+                    if all_null
+                        nullable.push(lhs)
+                        changed = true
+            i = i + 1
+    return nullable
+
+// _grel_powerset_rhs: generate all subsets of rhs obtained by optionally removing
+// each nullable symbol, then collect into a list of rhs variants.
+// Returns a list of rhs-lists (each is a list of strings).
+fn _grel_powerset_rhs(rhs, nullable) -> list
+    // We build variants by iterating over each symbol and branching.
+    // Start with one variant: empty.
+    let variants = []
+    let empty_v = []
+    variants.push(empty_v)
+    let i = 0
+    while i < len(rhs)
+        let sym = rhs[i]
+        let is_null = false
+        if _grel_is_nt(sym)
+            if _grel_str_in(nullable, sym)
+                is_null = true
+        // For each current variant, produce: variant+[sym] always.
+        // If sym is nullable: also keep variant as-is (sym omitted).
+        let new_variants = []
+        let j = 0
+        while j < len(variants)
+            let v = variants[j]
+            // variant with sym included
+            let v_with = []
+            let k = 0
+            while k < len(v)
+                v_with.push(v[k])
+                k = k + 1
+            v_with.push(sym)
+            new_variants.push(v_with)
+            // variant with sym omitted (only if nullable)
+            if is_null
+                let v_without = []
+                let m = 0
+                while m < len(v)
+                    v_without.push(v[m])
+                    m = m + 1
+                new_variants.push(v_without)
+            j = j + 1
+        variants = new_variants
+        i = i + 1
+    return variants
+
+// grel_remove_epsilon: eliminate epsilon productions preserving the language.
+// For the start symbol S, if S is nullable we keep S -> epsilon.
+// All other epsilon productions are eliminated by expanding nullable positions.
+fn grel_remove_epsilon(prods, start) -> list
+    let nullable = _grel_nullable_set(prods)
+    let result = []
+    // Expand each production.
+    let i = 0
+    while i < len(prods)
+        let prod = prods[i]
+        let lhs = prod[0]
+        let rhs = prod[1]
+        if len(rhs) == 0
+            // Original epsilon: skip (we re-add for start if needed)
+            i = i + 1
+            continue
+        // Generate all subsets of rhs with nullable symbols optionally removed.
+        let variants = _grel_powerset_rhs(rhs, nullable)
+        let j = 0
+        while j < len(variants)
+            let v = variants[j]
+            // Only add non-empty variants (we handle start epsilon separately).
+            if len(v) > 0
+                let np = [lhs, v]
+                if not _grel_has_prod(result, np)
+                    result.push(np)
+            j = j + 1
+        i = i + 1
+    // If start was nullable, add start -> epsilon.
+    if _grel_str_in(nullable, start)
+        let eps_p = [start, []]
+        if not _grel_has_prod(result, eps_p)
+            result.push(eps_p)
+    return result
+
+// _grel_unit_closure: given a nonterminal A, find all nonterminals reachable
+// via unit productions A->B->C->... Returns a list of nonterminal strings.
+fn _grel_unit_closure(prods, nt) -> list
+    let reached = []
+    reached.push(nt)
+    let worklist = []
+    worklist.push(nt)
+    let wi = 0
+    while wi < len(worklist)
+        let cur = worklist[wi]
+        wi = wi + 1
+        let i = 0
+        while i < len(prods)
+            let prod = prods[i]
+            let lhs = prod[0]
+            let rhs = prod[1]
+            if lhs == cur
+                if len(rhs) == 1
+                    let sym = rhs[0]
+                    if _grel_is_nt(sym)
+                        if not _grel_str_in(reached, sym)
+                            reached.push(sym)
+                            worklist.push(sym)
+            i = i + 1
+    return reached
+
+// grel_remove_units: eliminate unit productions A->B.
+// Replace each unit chain A->B->...->C with A's non-unit productions of C.
+fn grel_remove_units(prods) -> list
+    // Collect all nonterminals.
+    let nts = []
+    let i = 0
+    while i < len(prods)
+        let lhs = prods[i][0]
+        if not _grel_str_in(nts, lhs)
+            nts.push(lhs)
+        i = i + 1
+    // For each NT, add all non-unit productions reachable via unit chains.
+    let result = []
+    let ni = 0
+    while ni < len(nts)
+        let nt = nts[ni]
+        let closure = _grel_unit_closure(prods, nt)
+        // For each member of closure, add its non-unit productions as A's.
+        let ci = 0
+        while ci < len(closure)
+            let member = closure[ci]
+            let pi = 0
+            while pi < len(prods)
+                let prod = prods[pi]
+                let lhs = prod[0]
+                let rhs = prod[1]
+                if lhs == member
+                    // is it a unit production? skip
+                    let is_unit = false
+                    if len(rhs) == 1
+                        if _grel_is_nt(rhs[0])
+                            is_unit = true
+                    if not is_unit
+                        let np = [nt, rhs]
+                        if not _grel_has_prod(result, np)
+                            result.push(np)
+                pi = pi + 1
+            ci = ci + 1
+        ni = ni + 1
+    return result
+
+// _grel_generating: compute generating nonterminals (can derive a terminal string).
+fn _grel_generating(prods) -> list
+    let gen = []
+    let changed = true
+    while changed
+        changed = false
+        let i = 0
+        while i < len(prods)
+            let prod = prods[i]
+            let lhs = prod[0]
+            let rhs = prod[1]
+            if not _grel_str_in(gen, lhs)
+                // A production generates if every NT in rhs already generates.
+                let ok = true
+                let j = 0
+                while j < len(rhs)
+                    let sym = rhs[j]
+                    if _grel_is_nt(sym)
+                        if not _grel_str_in(gen, sym)
+                            ok = false
+                    j = j + 1
+                if ok
+                    gen.push(lhs)
+                    changed = true
+            i = i + 1
+    return gen
+
+// _grel_reachable: compute NTs reachable from start via any production.
+fn _grel_reachable(prods, start) -> list
+    let reached = []
+    reached.push(start)
+    let worklist = []
+    worklist.push(start)
+    let wi = 0
+    while wi < len(worklist)
+        let cur = worklist[wi]
+        wi = wi + 1
+        let i = 0
+        while i < len(prods)
+            let prod = prods[i]
+            let lhs = prod[0]
+            let rhs = prod[1]
+            if lhs == cur
+                let j = 0
+                while j < len(rhs)
+                    let sym = rhs[j]
+                    if _grel_is_nt(sym)
+                        if not _grel_str_in(reached, sym)
+                            reached.push(sym)
+                            worklist.push(sym)
+                    j = j + 1
+            i = i + 1
+    return reached
+
+// grel_remove_useless: drop non-generating then unreachable symbols/productions.
+fn grel_remove_useless(prods, start) -> list
+    // Step 1: drop productions that use non-generating NTs.
+    let gen = _grel_generating(prods)
+    let step1 = []
+    let i = 0
+    while i < len(prods)
+        let prod = prods[i]
+        let lhs = prod[0]
+        let rhs = prod[1]
+        // lhs must generate (be in gen)
+        if _grel_str_in(gen, lhs)
+            let ok = true
+            let j = 0
+            while j < len(rhs)
+                let sym = rhs[j]
+                if _grel_is_nt(sym)
+                    if not _grel_str_in(gen, sym)
+                        ok = false
+                j = j + 1
+            if ok
+                step1.push(prod)
+        i = i + 1
+    // Step 2: drop productions with unreachable NTs.
+    let reach = _grel_reachable(step1, start)
+    let result = []
+    let ri = 0
+    while ri < len(step1)
+        let prod = step1[ri]
+        let lhs = prod[0]
+        if _grel_str_in(reach, lhs)
+            result.push(prod)
+        ri = ri + 1
+    return result
+
+// _grel_fresh_name: generate a fresh nonterminal name A' given base A.
+// Tries A1, A2, ... until no production already has that as lhs.
+fn _grel_fresh_name(prods, base) -> str
+    let idx = 1
+    while true
+        let candidate = base + str(idx)
+        let found = false
+        let i = 0
+        while i < len(prods)
+            if prods[i][0] == candidate
+                found = true
+            i = i + 1
+        if not found
+            return candidate
+        idx = idx + 1
+    return base + "X"
+
+// _grel_lhs_prods: return all productions for a given lhs.
+fn _grel_lhs_prods(prods, lhs) -> list
+    let result = []
+    let i = 0
+    while i < len(prods)
+        if prods[i][0] == lhs
+            result.push(prods[i])
+        i = i + 1
+    return result
+
+// grel_eliminate_left_recursion: eliminate immediate left recursion for each NT.
+// A -> A alpha | beta  becomes  A -> beta A'  (for each beta),  A' -> alpha A' | epsilon.
+// Only handles immediate left recursion (not indirect).
+fn grel_eliminate_left_recursion(prods) -> list
+    // Collect all distinct LHS nonterminals in order.
+    let nts = []
+    let i = 0
+    while i < len(prods)
+        let lhs = prods[i][0]
+        if not _grel_str_in(nts, lhs)
+            nts.push(lhs)
+        i = i + 1
+    let result = []
+    // Build result from all prods first, then we will replace LR NTs.
+    // We process NTs one at a time.
+    // For each NT A, split its productions into LR (A -> A alpha) and non-LR (A -> beta).
+    let ni = 0
+    while ni < len(nts)
+        let nt = nts[ni]
+        let lr_alphas = []
+        let non_lr = []
+        let pi = 0
+        while pi < len(prods)
+            let prod = prods[pi]
+            if prod[0] == nt
+                let rhs = prod[1]
+                if len(rhs) > 0
+                    if rhs[0] == nt
+                        // left-recursive: alpha = rhs[1:]
+                        let alpha = []
+                        let j = 1
+                        while j < len(rhs)
+                            alpha.push(rhs[j])
+                            j = j + 1
+                        lr_alphas.push(alpha)
+                    else
+                        non_lr.push(rhs)
+                else
+                    // epsilon production: treat as non-lr
+                    non_lr.push(rhs)
+            pi = pi + 1
+        if len(lr_alphas) == 0
+            // No immediate LR; keep productions as-is.
+            let qi = 0
+            while qi < len(prods)
+                if prods[qi][0] == nt
+                    result.push(prods[qi])
+                qi = qi + 1
+        else
+            // Generate fresh name A' (check against result so far + prods).
+            let all_so_far = []
+            let ri = 0
+            while ri < len(result)
+                all_so_far.push(result[ri])
+                ri = ri + 1
+            let pi2 = 0
+            while pi2 < len(prods)
+                all_so_far.push(prods[pi2])
+                pi2 = pi2 + 1
+            let prime = _grel_fresh_name(all_so_far, nt)
+            // A -> beta A'  for each non-LR beta.
+            let bi = 0
+            while bi < len(non_lr)
+                let beta = non_lr[bi]
+                let new_rhs = []
+                let k = 0
+                while k < len(beta)
+                    new_rhs.push(beta[k])
+                    k = k + 1
+                new_rhs.push(prime)
+                result.push([nt, new_rhs])
+                bi = bi + 1
+            // A' -> alpha A'  for each LR alpha.
+            let ai = 0
+            while ai < len(lr_alphas)
+                let alpha = lr_alphas[ai]
+                let new_rhs2 = []
+                let k2 = 0
+                while k2 < len(alpha)
+                    new_rhs2.push(alpha[k2])
+                    k2 = k2 + 1
+                new_rhs2.push(prime)
+                result.push([prime, new_rhs2])
+                ai = ai + 1
+            // A' -> epsilon.
+            result.push([prime, []])
+        ni = ni + 1
+    return result
+
+// _grel_common_prefix_len: length of common prefix between two rhs lists.
+fn _grel_common_prefix_len(r1, r2) -> int
+    let n = len(r1)
+    if len(r2) < n
+        n = len(r2)
+    let i = 0
+    while i < n
+        if r1[i] != r2[i]
+            return i
+        i = i + 1
+    return n
+
+// grel_left_factor: left-factor all productions sharing a common prefix under the same LHS.
+// A -> alpha beta | alpha gamma  becomes  A -> alpha A'  A' -> beta | gamma.
+// Iterates until no more factoring is possible.
+fn grel_left_factor(prods) -> list
+    let current = []
+    let i = 0
+    while i < len(prods)
+        current.push(prods[i])
+        i = i + 1
+    let changed = true
+    while changed
+        changed = false
+        // Collect all distinct LHS.
+        let nts = []
+        let pi = 0
+        while pi < len(current)
+            let lhs = current[pi][0]
+            if not _grel_str_in(nts, lhs)
+                nts.push(lhs)
+            pi = pi + 1
+        // For each NT, find the longest common prefix among any two of its productions.
+        let new_prods = []
+        let ni = 0
+        while ni < len(nts)
+            let nt = nts[ni]
+            // Get this NT's productions (rhs only).
+            let nt_rhss = []
+            let qi = 0
+            while qi < len(current)
+                if current[qi][0] == nt
+                    nt_rhss.push(current[qi][1])
+                qi = qi + 1
+            // Find the longest common prefix among any pair.
+            let best_len = 0
+            let ai = 0
+            while ai < len(nt_rhss)
+                let bi = ai + 1
+                while bi < len(nt_rhss)
+                    let cp = _grel_common_prefix_len(nt_rhss[ai], nt_rhss[bi])
+                    if cp > best_len
+                        best_len = cp
+                    bi = bi + 1
+                ai = ai + 1
+            if best_len == 0
+                // No factoring needed; keep all productions.
+                let ri = 0
+                while ri < len(nt_rhss)
+                    new_prods.push([nt, nt_rhss[ri]])
+                    ri = ri + 1
+            else
+                // Split: productions that share the prefix vs those that don't.
+                // Use the first rhs with length >= best_len as the canonical prefix.
+                let prefix = []
+                let pi3 = 0
+                while pi3 < len(nt_rhss)
+                    if len(nt_rhss[pi3]) >= best_len
+                        let k = 0
+                        while k < best_len
+                            prefix.push(nt_rhss[pi3][k])
+                            k = k + 1
+                        pi3 = len(nt_rhss)
+                    else
+                        pi3 = pi3 + 1
+                // Separate into "matches prefix" and "does not match prefix".
+                let factored_tails = []
+                let others = []
+                let ri = 0
+                while ri < len(nt_rhss)
+                    let rhs = nt_rhss[ri]
+                    let cp2 = _grel_common_prefix_len(rhs, prefix)
+                    if cp2 >= best_len
+                        // tail = rhs[best_len:]
+                        let tail = []
+                        let k = best_len
+                        while k < len(rhs)
+                            tail.push(rhs[k])
+                            k = k + 1
+                        factored_tails.push(tail)
+                    else
+                        others.push(rhs)
+                    ri = ri + 1
+                // Generate fresh name for the new NT.
+                let new_rhs_a = []
+                let k2 = 0
+                while k2 < len(prefix)
+                    new_rhs_a.push(prefix[k2])
+                    k2 = k2 + 1
+                // Need fresh name using current + new_prods so far.
+                let all_ctx = []
+                let ci = 0
+                while ci < len(current)
+                    all_ctx.push(current[ci])
+                    ci = ci + 1
+                let ci2 = 0
+                while ci2 < len(new_prods)
+                    all_ctx.push(new_prods[ci2])
+                    ci2 = ci2 + 1
+                let prime = _grel_fresh_name(all_ctx, nt)
+                new_rhs_a.push(prime)
+                new_prods.push([nt, new_rhs_a])
+                // Add prime -> tail for each factored tail.
+                let fi = 0
+                while fi < len(factored_tails)
+                    new_prods.push([prime, factored_tails[fi]])
+                    fi = fi + 1
+                // Keep non-matching productions unchanged.
+                let oi = 0
+                while oi < len(others)
+                    new_prods.push([nt, others[oi]])
+                    oi = oi + 1
+                changed = true
+            ni = ni + 1
+        current = new_prods
+    return current
+
+// ---- Bounded recognizer (for KAT equivalence checks) -------------------------
+// Uses a BFS-style derivation up to max_steps: expand one NT at a time.
+// Returns true iff the token-list `tokens` can be derived from `start` in `prods`.
+
+// _grel_lhs_set: collect all LHS symbols from prods into a dict (for NT detection).
+fn _grel_lhs_set(prods) -> dict
+    let d = {}
+    let i = 0
+    while i < len(prods)
+        let lhs = prods[i][0]
+        d[lhs] = 1
+        i = i + 1
+    return d
+
+// _grel_all_terminal_ctx: true iff every symbol in syms is NOT an LHS in lhs_dict.
+fn _grel_all_terminal_ctx(syms, lhs_dict) -> bool
+    let i = 0
+    while i < len(syms)
+        if contains(lhs_dict, syms[i])
+            return false
+        i = i + 1
+    return true
+
+// _grel_all_terminal: true iff every symbol in the list is a terminal.
+fn _grel_all_terminal(syms) -> bool
+    let i = 0
+    while i < len(syms)
+        if _grel_is_nt(syms[i])
+            return false
+        i = i + 1
+    return true
+
+// _grel_syms_eq: true iff two string lists are equal.
+fn _grel_syms_eq(a, b) -> bool
+    if len(a) != len(b)
+        return false
+    let i = 0
+    while i < len(a)
+        if a[i] != b[i]
+            return false
+        i = i + 1
+    return true
+
+// _grel_sentential_in: true iff a sentential form (string list) is already in a list.
+fn _grel_sentential_in(lst, s) -> bool
+    let i = 0
+    while i < len(lst)
+        if _grel_syms_eq(lst[i], s)
+            return true
+        i = i + 1
+    return false
+
+// grel_recognizes: bounded recognizer — true iff tokens can be derived from start
+// within max_steps derivation steps.
+// Uses the grammar's own LHS set to identify nonterminals (handles primes like "E1").
+fn grel_recognizes(prods, start, tokens, max_steps) -> bool
+    // Build LHS dict for NT identification.
+    let lhs_dict = _grel_lhs_set(prods)
+    // BFS over sentential forms.
+    let seed = []
+    seed.push(start)
+    let frontier = []
+    frontier.push(seed)
+    let seen = []
+    seen.push(seed)
+    let step = 0
+    while step < max_steps
+        let next = []
+        let fi = 0
+        while fi < len(frontier)
+            let sf = frontier[fi]
+            // Find first NT position (using grammar LHS set).
+            let nt_pos = -1
+            let k = 0
+            while k < len(sf)
+                if contains(lhs_dict, sf[k])
+                    if nt_pos == -1
+                        nt_pos = k
+                k = k + 1
+            if nt_pos == -1
+                // All terminals — check if matches tokens.
+                if _grel_syms_eq(sf, tokens)
+                    return true
+            else
+                // Expand the NT at nt_pos with each matching production.
+                let nt = sf[nt_pos]
+                let pi = 0
+                while pi < len(prods)
+                    let prod = prods[pi]
+                    if prod[0] == nt
+                        let rhs = prod[1]
+                        // Build new sentential form: sf[0:nt_pos] + rhs + sf[nt_pos+1:]
+                        let new_sf = []
+                        let j = 0
+                        while j < nt_pos
+                            new_sf.push(sf[j])
+                            j = j + 1
+                        let m = 0
+                        while m < len(rhs)
+                            new_sf.push(rhs[m])
+                            m = m + 1
+                        let n = nt_pos + 1
+                        while n < len(sf)
+                            new_sf.push(sf[n])
+                            n = n + 1
+                        // Prune: only add if not seen and len <= target + (max NTs in sf)
+                        // We allow a bit of slack for intermediate expansions.
+                        if not _grel_sentential_in(seen, new_sf)
+                            if len(new_sf) <= len(tokens) + 4
+                                seen.push(new_sf)
+                                next.push(new_sf)
+                    pi = pi + 1
+            fi = fi + 1
+        frontier = next
+        step = step + 1
+    // Final check of frontier.
+    let fi2 = 0
+    while fi2 < len(frontier)
+        let sf = frontier[fi2]
+        if _grel_all_terminal_ctx(sf, lhs_dict)
+            if _grel_syms_eq(sf, tokens)
+                return true
+        fi2 = fi2 + 1
+    return false

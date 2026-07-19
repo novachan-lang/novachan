@@ -1,0 +1,294 @@
+// std/grammar/grammar_props.nova — Grammar classification and property testing.
+//
+// A SYMBOL is a string.  NONTERMINAL iff it is a single uppercase letter A..Z.
+// A PRODUCTION is [lhs, rhs] where rhs is a list of symbols.
+// A GRAMMAR is a list of productions.
+// FIRST/FOLLOW sets use "" for epsilon, "$" for end-of-input.
+//
+// Public API (prefix grp_):
+//   grp_is_cnf(prods)                  -> bool  Chomsky Normal Form
+//   grp_is_epsilon_free(prods, start)   -> bool  no epsilon except possibly start
+//   grp_is_gnf(prods)                  -> bool  Greibach Normal Form
+//   grp_chomsky_type(prods)            -> int   3=regular 2=context-free
+//   grp_symbol_counts(prods)           -> list  [num_nonterminals, num_terminals]
+//   grp_is_ambiguous_upto(prods, start, max_len) -> bool  bounded ambiguity check
+//
+// Internal helpers: prefix _grp_
+
+// _grp_is_nt: true iff sym is a single uppercase letter A..Z.
+fn _grp_is_nt(sym) -> bool
+    if len(sym) != 1
+        return false
+    let c = sym[0]
+    if c >= "A" and c <= "Z"
+        return true
+    return false
+
+// _grp_str_in: true iff val is in list.
+fn _grp_str_in(lst, val) -> bool
+    let i = 0
+    while i < len(lst)
+        if lst[i] == val
+            return true
+        i = i + 1
+    return false
+
+// grp_is_cnf: true iff every production is A->BC (two NTs) or A->a (one terminal).
+// Strict CNF: no epsilon productions allowed.
+fn grp_is_cnf(prods) -> bool
+    let i = 0
+    while i < len(prods)
+        let rhs = prods[i][1]
+        let n = len(rhs)
+        if n == 2
+            if not _grp_is_nt(rhs[0])
+                return false
+            if not _grp_is_nt(rhs[1])
+                return false
+        else
+            if n == 1
+                if _grp_is_nt(rhs[0])
+                    return false
+            else
+                return false
+        i = i + 1
+    return true
+
+// grp_is_epsilon_free: true iff no production A->[] exists, except possibly A->[] where A==start.
+fn grp_is_epsilon_free(prods, start) -> bool
+    let i = 0
+    while i < len(prods)
+        let lhs = prods[i][0]
+        let rhs = prods[i][1]
+        if len(rhs) == 0
+            if lhs != start
+                return false
+        i = i + 1
+    return true
+
+// grp_is_gnf: true iff every production rhs starts with exactly one terminal,
+// followed by zero or more nonterminals.  Epsilon productions are not GNF.
+fn grp_is_gnf(prods) -> bool
+    let i = 0
+    while i < len(prods)
+        let rhs = prods[i][1]
+        let n = len(rhs)
+        if n == 0
+            return false
+        if _grp_is_nt(rhs[0])
+            return false
+        let j = 1
+        while j < n
+            if not _grp_is_nt(rhs[j])
+                return false
+            j = j + 1
+        i = i + 1
+    return true
+
+// _grp_is_right_linear: every rhs = terminals* [NT] (NT optional, at end only).
+fn _grp_is_right_linear(prods) -> bool
+    let i = 0
+    while i < len(prods)
+        let rhs = prods[i][1]
+        let n = len(rhs)
+        let j = 0
+        while j < n
+            let sym = rhs[j]
+            if _grp_is_nt(sym)
+                if j != n - 1
+                    return false
+            j = j + 1
+        i = i + 1
+    return true
+
+// _grp_is_left_linear: every rhs = [NT] terminals* (NT optional, at start only).
+fn _grp_is_left_linear(prods) -> bool
+    let i = 0
+    while i < len(prods)
+        let rhs = prods[i][1]
+        let n = len(rhs)
+        let j = 0
+        while j < n
+            let sym = rhs[j]
+            if _grp_is_nt(sym)
+                if j != 0
+                    return false
+            j = j + 1
+        i = i + 1
+    return true
+
+// grp_chomsky_type: return 3 if the grammar is regular (right- or left-linear), else 2 (CF).
+fn grp_chomsky_type(prods) -> int
+    if _grp_is_right_linear(prods)
+        return 3
+    if _grp_is_left_linear(prods)
+        return 3
+    return 2
+
+// grp_symbol_counts: return [num_distinct_nonterminals, num_distinct_terminals].
+fn grp_symbol_counts(prods) -> list
+    let nts = {}
+    let terms = {}
+    let i = 0
+    while i < len(prods)
+        let lhs = prods[i][0]
+        nts[lhs] = 1
+        let rhs = prods[i][1]
+        let j = 0
+        while j < len(rhs)
+            let sym = rhs[j]
+            if _grp_is_nt(sym)
+                nts[sym] = 1
+            else
+                terms[sym] = 1
+            j = j + 1
+        i = i + 1
+    let nt_list = keys(nts)
+    let t_list = keys(terms)
+    let result = []
+    result.push(len(nt_list))
+    result.push(len(t_list))
+    return result
+
+// ---- Parse-tree counter (for ambiguity detection) ----------------------------
+//
+// We use a chart-based DP.  For each (nt, i, j) we count the number of distinct
+// parse trees deriving token_list[i..j) from nt, capped at 2.
+//
+// cnt[nt:i:j] is computed bottom-up by span length.
+// For each production nt -> sym0 sym1 ... symK, we sum over all partitions
+// i == p0 <= p1 <= ... <= pK == j  of ways to derive each segment.
+//
+// This is correct because we iterate span from 0 upward, ensuring all
+// sub-problems are solved before they are needed.
+
+// _grp_mk_cnt_key: build a lookup key for the count table.
+fn _grp_mk_cnt_key(nt, i, j) -> str
+    return nt + ":" + str(i) + ":" + str(j)
+
+// _grp_count_rhs_ways: count ways to match rhs[sym_pos:] against token_list[left:right].
+// cnt is the finished (for shorter spans) derivation count table.
+// Returns count capped at 2.
+fn _grp_count_rhs_ways(rhs, sym_pos, left, right, token_list, cnt) -> int
+    if sym_pos == len(rhs)
+        if left == right
+            return 1
+        return 0
+    let sym = rhs[sym_pos]
+    if not _grp_is_nt(sym)
+        // Terminal: must match exactly at position left.
+        if left >= right
+            return 0
+        if token_list[left] != sym
+            return 0
+        return _grp_count_rhs_ways(rhs, sym_pos + 1, left + 1, right, token_list, cnt)
+    // Nonterminal: try all split points k in [left, right].
+    let total = 0
+    let k = left
+    while k <= right
+        let nt_key = _grp_mk_cnt_key(sym, left, k)
+        let nt_ways = 0
+        if contains(cnt, nt_key)
+            nt_ways = cnt[nt_key]
+        if nt_ways > 0
+            let rest_ways = _grp_count_rhs_ways(rhs, sym_pos + 1, k, right, token_list, cnt)
+            let product = nt_ways * rest_ways
+            if product > 2
+                product = 2
+            total = total + product
+            if total > 2
+                total = 2
+        k = k + 1
+    return total
+
+// _grp_earley_count: count parse trees for token_list from start using prods.
+// Returns 0 (not in language), 1 (unique parse), or 2 (ambiguous, capped).
+fn _grp_earley_count(prods, start, token_list) -> int
+    let n = len(token_list)
+    let cnt = {}
+    // Fill bottom-up by span length.
+    let span = 0
+    while span <= n
+        let i = 0
+        while i <= n - span
+            let j = i + span
+            let pi = 0
+            while pi < len(prods)
+                let prod = prods[pi]
+                let lhs = prod[0]
+                let rhs = prod[1]
+                let ways = _grp_count_rhs_ways(rhs, 0, i, j, token_list, cnt)
+                if ways > 0
+                    let key = _grp_mk_cnt_key(lhs, i, j)
+                    if contains(cnt, key)
+                        let old = cnt[key]
+                        let new_v = old + ways
+                        if new_v > 2
+                            new_v = 2
+                        cnt[key] = new_v
+                    else
+                        cnt[key] = ways
+                pi = pi + 1
+            i = i + 1
+        span = span + 1
+    let res_key = _grp_mk_cnt_key(start, 0, n)
+    if contains(cnt, res_key)
+        return cnt[res_key]
+    return 0
+
+// _grp_gen_strings_of_len: generate all token lists of length exactly k from terminals.
+fn _grp_gen_strings_of_len(terminals, k) -> list
+    if k == 0
+        let result = []
+        let empty = []
+        result.push(empty)
+        return result
+    let shorter = _grp_gen_strings_of_len(terminals, k - 1)
+    let result = []
+    let si = 0
+    while si < len(shorter)
+        let prefix = shorter[si]
+        let ti = 0
+        while ti < len(terminals)
+            let new_str = []
+            let pi = 0
+            while pi < len(prefix)
+                new_str.push(prefix[pi])
+                pi = pi + 1
+            new_str.push(terminals[ti])
+            result.push(new_str)
+            ti = ti + 1
+        si = si + 1
+    return result
+
+// _grp_collect_terminals: collect distinct terminal symbols from grammar.
+fn _grp_collect_terminals(prods) -> list
+    let terms = {}
+    let i = 0
+    while i < len(prods)
+        let rhs = prods[i][1]
+        let j = 0
+        while j < len(rhs)
+            let sym = rhs[j]
+            if not _grp_is_nt(sym)
+                terms[sym] = 1
+            j = j + 1
+        i = i + 1
+    return keys(terms)
+
+// grp_is_ambiguous_upto: check for ambiguity on all strings of length 0..max_len.
+// Returns true if any string of length <= max_len has >= 2 distinct parse trees.
+fn grp_is_ambiguous_upto(prods, start, max_len) -> bool
+    let terminals = _grp_collect_terminals(prods)
+    let k = 0
+    while k <= max_len
+        let strings = _grp_gen_strings_of_len(terminals, k)
+        let si = 0
+        while si < len(strings)
+            let s = strings[si]
+            let c = _grp_earley_count(prods, start, s)
+            if c >= 2
+                return true
+            si = si + 1
+        k = k + 1
+    return false
