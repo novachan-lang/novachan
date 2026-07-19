@@ -1,0 +1,212 @@
+// std/uuid/uuid_shortid.nova — compact base-62 encoding of a 128-bit UUID.
+//
+// A UUID (16 bytes = 128-bit integer) is encoded as a base-62 string using the
+// alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+// (digits → upper → lower).  The 128-bit value is treated as a big-endian
+// unsigned integer; base-62 digits are collected via carry-based division over
+// the 16-byte array (no 128-bit integer type needed).  Decoding reconstructs
+// the 16-byte array via carry-based multiply-add, then formats as canonical UUID.
+//
+// The nil UUID encodes as "0"; all-0xFF encodes to a 22-char string.
+// ROUND-TRIP is exact: ush_decode(ush_encode(u)) == u for any valid UUID u.
+//
+// All functions are DETERMINISTIC (no RNG / clock).
+// All private helpers carry the _ush_ prefix to avoid link collisions.
+//
+// Public API (prefix ush_):
+//   ush_encode(uuid_str) -> str   (base-62 encoding of the 128-bit UUID value)
+//   ush_decode(short)    -> str   (decode back to canonical UUID string)
+//
+// NOVA-specific hazards noted inline:
+//   - '>>' is arithmetic; we only right-shift small positive values here, safe.
+//   - No multi-line list/dict literals; build with while + push.
+//   - 'and' / 'or' / 'not' (not &&/||/!).
+//   - List index assignment xs[i] = v is supported.
+
+// ── Alphabet helpers ─────────────────────────────────────────────────────────
+
+// _ush_alpha — 62-char base-62 alphabet: 0-9 A-Z a-z (indices 0..61).
+fn _ush_alpha() -> str
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// _ush_alpha_char — base-62 digit char for index v (0..61).
+fn _ush_alpha_char(v: int) -> str
+    let alpha = _ush_alpha()
+    alpha[v]
+
+// _ush_alpha_val — numeric value (0..61) of a base-62 char, or -1 if invalid.
+fn _ush_alpha_val(c: str) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 65 and b <= 90
+        return b - 65 + 10
+    if b >= 97 and b <= 122
+        return b - 97 + 36
+    -1
+
+// ── Hex / nibble helpers (needed to parse/emit UUID strings) ─────────────────
+
+// _ush_hex_alpha — 16-char lowercase hex alphabet.
+fn _ush_hex_alpha() -> str
+    "0123456789abcdef"
+
+// _ush_hex_char_val — value of a hex char (upper or lower), or -1 on error.
+fn _ush_hex_char_val(c: str) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 97 and b <= 102
+        return b - 87
+    if b >= 65 and b <= 70
+        return b - 55
+    -1
+
+// _ush_nibble_char — hex char for nibble v (0..15).
+fn _ush_nibble_char(v: int) -> str
+    let ha = _ush_hex_alpha()
+    ha[v]
+
+// _ush_byte_hex — 2-char lowercase hex for byte b (0..255).
+fn _ush_byte_hex(b: int) -> str
+    let hi = b / 16
+    let lo = b - hi * 16
+    _ush_nibble_char(hi) + _ush_nibble_char(lo)
+
+// ── UUID parse / emit helpers ─────────────────────────────────────────────────
+
+// _ush_uuid_to_bytes — parse canonical or hex32 UUID to list of 16 ints (0-255).
+// Returns [] on malformed input.
+fn _ush_uuid_to_bytes(uuid_str: str) -> list
+    let n = len(uuid_str)
+    let h = ""
+    if n == 36
+        let i = 0
+        while i < 36
+            if i != 8 and i != 13 and i != 18 and i != 23
+                h = h + uuid_str[i]
+            i = i + 1
+    if n == 32
+        h = uuid_str
+    if len(h) != 32
+        return []
+    let result = []
+    let i = 0
+    while i < 16
+        let hv = _ush_hex_char_val(h[i * 2])
+        let lv = _ush_hex_char_val(h[i * 2 + 1])
+        if hv < 0 or lv < 0
+            return []
+        push(result, hv * 16 + lv)
+        i = i + 1
+    result
+
+// _ush_bytes_to_canonical — convert list of 16 ints (0-255) to canonical UUID string.
+fn _ush_bytes_to_canonical(bs: list) -> str
+    if len(bs) != 16
+        return ""
+    let out = ""
+    let i = 0
+    while i < 16
+        out = out + _ush_byte_hex(bs[i])
+        if i == 3 or i == 5 or i == 7 or i == 9
+            out = out + "-"
+        i = i + 1
+    out
+
+// ── Big-integer helpers ───────────────────────────────────────────────────────
+// The 16-byte array represents a 128-bit big-endian unsigned integer.
+// We perform repeated division by 62 (carry pass) and multiply-add by 62 (decode).
+
+// _ush_all_zero — 1 if all 16 entries in work list are 0, else 0.
+fn _ush_all_zero(work: list) -> int
+    let i = 0
+    while i < 16
+        if work[i] != 0
+            return 0
+        i = i + 1
+    1
+
+// _ush_div62_pass — divide the 16-byte big-endian integer in work by 62 in-place.
+// Returns the remainder (0..61).  work is mutated via index-assignment.
+fn _ush_div62_pass(work: list) -> int
+    let carry = 0
+    let i = 0
+    while i < 16
+        let val = carry * 256 + work[i]
+        let q = val / 62
+        carry = val - q * 62
+        work[i] = q
+        i = i + 1
+    carry
+
+// _ush_mul62_add_pass — multiply the 16-byte big-endian integer in work by 62, then add v.
+// Overflow beyond 128 bits is silently truncated (irrelevant for valid UUID inputs).
+// work is mutated via index-assignment.
+fn _ush_mul62_add_pass(work: list, v: int)
+    let carry = v
+    let i = 15
+    while i >= 0
+        let val = work[i] * 62 + carry
+        work[i] = val & 255
+        carry = (val >> 8) & 255
+        i = i - 1
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// ush_encode — encode a UUID string as a compact base-62 string.
+// The 128-bit UUID value is divided by 62 repeatedly; digits collected LSB-first
+// then reversed.  The nil UUID encodes as "0".
+// Returns "" on malformed input.
+fn ush_encode(uuid_str: str) -> str
+    let bs = _ush_uuid_to_bytes(uuid_str)
+    if len(bs) != 16
+        return ""
+    // Work on a mutable copy.
+    let work = []
+    let ci = 0
+    while ci < 16
+        push(work, bs[ci])
+        ci = ci + 1
+    // Collect digits LSB-first via repeated div-62.
+    let digits = ""
+    let running = 1
+    while running == 1
+        let rem = _ush_div62_pass(work)
+        digits = digits + _ush_alpha_char(rem)
+        if _ush_all_zero(work) == 1
+            running = 0
+    // Reverse digits string.
+    let result = ""
+    let ri = len(digits) - 1
+    while ri >= 0
+        result = result + digits[ri]
+        ri = ri - 1
+    result
+
+// ush_decode — decode a base-62 string back to a canonical UUID string.
+// Returns "00000000-0000-0000-0000-000000000000" for "0".
+// Returns "" on malformed input (invalid base-62 characters).
+fn ush_decode(short: str) -> str
+    let n = len(short)
+    if n == 0
+        return ""
+    // Initialise 16-byte work buffer to zero.
+    let work = []
+    let wi = 0
+    while wi < 16
+        push(work, 0)
+        wi = wi + 1
+    // Process each character: multiply-add into work.
+    let si = 0
+    let bad = 0
+    while si < n
+        let v = _ush_alpha_val(short[si])
+        if v < 0
+            bad = 1
+        if bad == 0
+            _ush_mul62_add_pass(work, v)
+        si = si + 1
+    if bad == 1
+        return ""
+    _ush_bytes_to_canonical(work)

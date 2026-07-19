@@ -1,0 +1,145 @@
+// std/uuid/uuid_version.nova — Extract version and variant from a UUID string.
+//
+// Per RFC 4122 / RFC 9562:
+//   Version = high nibble of byte 6 (the 4 bits M in 'xxxxxxxx-xxxx-Mxxx-xxxx-xxxxxxxxxxxx').
+//   Variant = top bits of byte 8 (the bits N in 'xxxxxxxx-xxxx-xxxx-Nxxx-xxxxxxxxxxxx'):
+//     0xxx  (top bit 0)       -> NCS backward compatibility
+//     10xx  (top two bits 10) -> RFC 4122 / IETF variant  (standard UUIDs v1-v8)
+//     110x  (top three = 110) -> Microsoft backward compatibility (COM/DCOM GUIDs)
+//     111x  (top three = 111) -> Reserved for future definition
+//
+// SELF-CONTAINED — imports NOTHING.
+// All private helpers are prefixed _uve_ to avoid symbol collisions.
+//
+// PUBLIC API:
+//   uve_version(uuid_str: str) -> int     0..15 (high nibble of byte 6); -1 on invalid
+//   uve_variant(uuid_str: str) -> str     'NCS'|'RFC4122'|'Microsoft'|'Reserved'|''
+//   uve_is_version(uuid_str: str, v: int) -> bool
+//
+// ARITHMETIC NOTE:
+//   >> is arithmetic (sign-extending) in NOVA. Byte values 0..255 are always
+//   positive so arithmetic right-shift is identical to logical right-shift for
+//   values <= 127; for 128..255 we mask with & 0xFF after any shift to be safe.
+
+// ── Private: hex char to nibble ──────────────────────────────────────────────
+
+// Map a hex character (0-9 a-f A-F) to its nibble value 0..15. Returns -1 on error.
+fn _uve_hex_val(c: str) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 97 and b <= 102
+        return b - 97 + 10
+    if b >= 65 and b <= 70
+        return b - 65 + 10
+    -1
+
+// ── Private: validate UUID string length + structure ─────────────────────────
+
+// Return true iff s is a 36-char 8-4-4-4-12 UUID string (hyphens at 8,13,18,23).
+fn _uve_is_canonical(s: str) -> bool
+    if len(s) != 36
+        return false
+    if s[8] != "-"
+        return false
+    if s[13] != "-"
+        return false
+    if s[18] != "-"
+        return false
+    if s[23] != "-"
+        return false
+    true
+
+// ── Private: extract a byte value from a UUID string at hex-pair index ────────
+//
+// UUID string layout (36 chars):
+//   pos 0-7   = bytes 0-3   (time_low, 4 bytes -> 8 hex chars)
+//   pos 8     = '-'
+//   pos 9-12  = bytes 4-5   (time_mid, 2 bytes -> 4 hex chars)
+//   pos 13    = '-'
+//   pos 14-17 = bytes 6-7   (time_hi_and_version, 2 bytes -> 4 hex chars)
+//   pos 18    = '-'
+//   pos 19-22 = bytes 8-9   (clk_seq_hi_res + clk_seq_low, 2 bytes -> 4 hex chars)
+//   pos 23    = '-'
+//   pos 24-35 = bytes 10-15 (node, 6 bytes -> 12 hex chars)
+//
+// Byte index -> string start position:
+//   byte 0  -> pos 0   (0*2=0, no hyphens before)
+//   byte 1  -> pos 2
+//   byte 2  -> pos 4
+//   byte 3  -> pos 6
+//   byte 4  -> pos 9   (after hyphen at 8)
+//   byte 5  -> pos 11
+//   byte 6  -> pos 14  (after hyphen at 13)
+//   byte 7  -> pos 16
+//   byte 8  -> pos 19  (after hyphen at 18)
+//   byte 9  -> pos 21
+//   byte 10 -> pos 24  (after hyphen at 23)
+//   bytes 11-15 -> pos 26,28,30,32,34
+//
+// We compute the string position from the byte index:
+//   For byte i, the position in the hex string (0-based ignoring hyphens) is i*2.
+//   Hyphens are inserted after hex positions 8,12,16,20 (i.e., after bytes 4,6,8,10).
+//   Number of hyphens before byte i:
+//     i < 4  -> 0
+//     i < 6  -> 1
+//     i < 8  -> 2
+//     i < 10 -> 3
+//     else   -> 4
+
+fn _uve_byte_at(s: str, idx: int) -> int
+    let hex_pos = idx * 2
+    let hyphens = 0
+    if idx >= 4
+        hyphens = 1
+    if idx >= 6
+        hyphens = 2
+    if idx >= 8
+        hyphens = 3
+    if idx >= 10
+        hyphens = 4
+    let str_pos = hex_pos + hyphens
+    let hi = _uve_hex_val(s[str_pos])
+    let lo = _uve_hex_val(s[str_pos + 1])
+    if hi == -1 or lo == -1
+        return -1
+    (hi * 16 + lo) & 0xFF
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// uve_version: return the version number (0..15) encoded in the high nibble of
+// byte 6 of the UUID. Returns -1 on invalid input.
+fn uve_version(uuid_str: str) -> int
+    if not _uve_is_canonical(uuid_str)
+        return -1
+    let b6 = _uve_byte_at(uuid_str, 6)
+    if b6 == -1
+        return -1
+    (b6 >> 4) & 0x0F
+
+// uve_variant: return the variant name encoded in the top bits of byte 8.
+// 'NCS'       — bit 7 is 0 (top bit = 0)
+// 'RFC4122'   — bits 7-6 are 10
+// 'Microsoft' — bits 7-5 are 110
+// 'Reserved'  — bits 7-5 are 111
+// ''          — invalid UUID string
+fn uve_variant(uuid_str: str) -> str
+    if not _uve_is_canonical(uuid_str)
+        return ""
+    let b8 = _uve_byte_at(uuid_str, 8)
+    if b8 == -1
+        return ""
+    // top 3 bits determine variant (b8 is 0..255, so >> is safe after mask)
+    let top3 = (b8 >> 5) & 0x07
+    // top3: 0xx->NCS (top3 0..3), 10x->RFC4122 (top3 4,5), 110->Microsoft(top3=6), 111->Reserved(top3=7)
+    if top3 <= 3
+        return "NCS"
+    if top3 <= 5
+        return "RFC4122"
+    if top3 == 6
+        return "Microsoft"
+    "Reserved"
+
+// uve_is_version: return true iff the UUID's version field equals v.
+fn uve_is_version(uuid_str: str, v: int) -> bool
+    uve_version(uuid_str) == v
