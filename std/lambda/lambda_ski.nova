@@ -1,0 +1,226 @@
+// std/lambda/lambda_ski — SKI combinator calculus over de Bruijn lambda terms.
+//
+// Term representation (de Bruijn):
+//   ["var", k]    — variable with de Bruijn index k (int, 0 = innermost binder)
+//   ["lam", body] — lambda abstraction; body is a term
+//   ["app", f, a] — application of f to a
+//
+// All public functions are prefixed lsk_.
+
+// Build a ["var",k] term.
+fn lsk_var(k) -> list
+    let t = []
+    push(t, "var")
+    push(t, k)
+    return t
+
+// Build a ["lam",body] term.
+fn lsk_lam(body) -> list
+    let t = []
+    push(t, "lam")
+    push(t, body)
+    return t
+
+// Build a ["app",f,a] term.
+fn lsk_app(f, a) -> list
+    let t = []
+    push(t, "app")
+    push(t, f)
+    push(t, a)
+    return t
+
+// Shift: add d to every free variable index >= c in term t.
+fn lsk_shift(d, c, t) -> list
+    let tag = t[0]
+    if tag == "var"
+        let k = t[1]
+        if k >= c
+            return lsk_var(k + d)
+        return lsk_var(k)
+    if tag == "lam"
+        return lsk_lam(lsk_shift(d, c + 1, t[1]))
+    // app
+    return lsk_app(lsk_shift(d, c, t[1]), lsk_shift(d, c, t[2]))
+
+// Subst: substitute term s for variable index j in term t.
+fn lsk_subst(j, s, t) -> list
+    let tag = t[0]
+    if tag == "var"
+        let k = t[1]
+        if k == j
+            return s
+        return lsk_var(k)
+    if tag == "lam"
+        return lsk_lam(lsk_subst(j + 1, lsk_shift(1, 0, s), t[1]))
+    // app
+    return lsk_app(lsk_subst(j, s, t[1]), lsk_subst(j, s, t[2]))
+
+// Beta-contract a redex ["app",["lam",body],arg].
+fn lsk_beta(body, arg) -> list
+    return lsk_shift(-1, 0, lsk_subst(0, lsk_shift(1, 0, arg), body))
+
+// Single normal-order (leftmost-outermost) beta step.
+// Returns [new_term, did_step] where did_step=1 if a redex was contracted, 0 if already normal.
+fn lsk_step1(t) -> list
+    let tag = t[0]
+    if tag == "var"
+        let r = []
+        push(r, t)
+        push(r, 0)
+        return r
+    if tag == "lam"
+        let inner = lsk_step1(t[1])
+        let nbody = inner[0]
+        let ds = inner[1]
+        let r = []
+        push(r, lsk_lam(nbody))
+        push(r, ds)
+        return r
+    // app: check for beta redex first (leftmost-outermost)
+    let f = t[1]
+    let a = t[2]
+    if f[0] == "lam"
+        let contracted = lsk_beta(f[1], a)
+        let r = []
+        push(r, contracted)
+        push(r, 1)
+        return r
+    // try to step in f
+    let fr = lsk_step1(f)
+    let nf = fr[0]
+    let dsf = fr[1]
+    if dsf == 1
+        let r = []
+        push(r, lsk_app(nf, a))
+        push(r, 1)
+        return r
+    // try to step in a
+    let ar = lsk_step1(a)
+    let na = ar[0]
+    let dsa = ar[1]
+    let r2 = []
+    push(r2, lsk_app(f, na))
+    push(r2, dsa)
+    return r2
+
+// Normalize t using normal-order reduction, bounded by max steps.
+// Calls lsk_step1 repeatedly until normal form or max steps consumed.
+fn lsk_reduce(t, max) -> list
+    let steps = 0
+    let cur = t
+    let going = 1
+    while going == 1 and steps < max
+        let res = lsk_step1(cur)
+        let nt = res[0]
+        let ds = res[1]
+        if ds == 0
+            going = 0
+        else
+            cur = nt
+            steps = steps + 1
+    return cur
+
+// --- The SKI combinators as lambda terms (de Bruijn) ---
+// I = lambda x. x  =  ["lam",["var",0]]
+fn lsk_I() -> list
+    return lsk_lam(lsk_var(0))
+
+// K = lambda x y. x  =  ["lam",["lam",["var",1]]]
+fn lsk_K() -> list
+    return lsk_lam(lsk_lam(lsk_var(1)))
+
+// S = lambda x y z. x z (y z)
+// de Bruijn: lam lam lam app(app(var2, var0), app(var1, var0))
+fn lsk_S() -> list
+    let xz = lsk_app(lsk_var(2), lsk_var(0))
+    let yz = lsk_app(lsk_var(1), lsk_var(0))
+    let body = lsk_app(xz, yz)
+    return lsk_lam(lsk_lam(lsk_lam(body)))
+
+// Structural equality of two terms.
+fn lsk_term_eq(a, b) -> int
+    let ta = a[0]
+    let tb = b[0]
+    if ta != tb
+        return 0
+    if ta == "var"
+        if a[1] == b[1]
+            return 1
+        return 0
+    if ta == "lam"
+        return lsk_term_eq(a[1], b[1])
+    // app
+    if lsk_term_eq(a[1], b[1]) == 0
+        return 0
+    return lsk_term_eq(a[2], b[2])
+
+// --- Bracket abstraction: compile a closed lambda term to S/K/I applications ---
+// lsk_abstract(t) returns an equivalent term built ONLY from the lsk_S()/lsk_K()/
+// lsk_I() lambda-terms and applications (plus any free variables in t, unchanged).
+//
+// Correct algorithm (the key is order + opacity):
+//   compile(["var",k])   = ["var",k]
+//   compile(["app",f,a]) = ["app", compile(f), compile(a)]
+//   compile(["lam",b])   = bracket(compile(b))     -- compile the body FIRST (removing
+//                                                      inner lambdas), THEN remove binder 0
+//   bracket removes de Bruijn variable 0 from a LAMBDA-FREE term:
+//   bracket(["var",0])   = I
+//   bracket(["var",k])   = K (var k-1)             -- k>0: var passes, index drops by 1
+//   bracket(atom S/K/I)  = K atom                  -- a constant (no var 0)
+//   bracket(["app",f,a]) = S (bracket f) (bracket a)
+// During compile/bracket the combinators are OPAQUE ATOMS ["I"]/["K"]/["S"] so they are
+// never re-processed as lambdas; lsk_expand replaces them with their lambda definitions
+// at the very end.  (Verified: compile(K)=S(K K)I, the standard result.)
+
+// Combinator atoms (opaque during abstraction).
+fn lsk_atom(name) -> list
+    let t = []
+    push(t, name)
+    return t
+
+// lsk_expand: replace ["I"]/["K"]/["S"] atoms by their lambda-term definitions.
+fn lsk_expand(t) -> list
+    let tag = t[0]
+    if tag == "I"
+        return lsk_I()
+    if tag == "K"
+        return lsk_K()
+    if tag == "S"
+        return lsk_S()
+    if tag == "var"
+        return t
+    if tag == "lam"
+        return lsk_lam(lsk_expand(t[1]))
+    // app
+    return lsk_app(lsk_expand(t[1]), lsk_expand(t[2]))
+
+// lsk_bracket: remove de Bruijn variable 0 from a lambda-free combinator term.
+fn lsk_bracket(t) -> list
+    let tag = t[0]
+    if tag == "var"
+        let k = t[1]
+        if k == 0
+            return lsk_atom("I")
+        // k > 0: variable refers past the removed binder; pass it through as K (var k-1).
+        return lsk_app(lsk_atom("K"), lsk_var(k - 1))
+    if tag == "app"
+        return lsk_app(lsk_app(lsk_atom("S"), lsk_bracket(t[1])), lsk_bracket(t[2]))
+    // an S/K/I atom (a constant not mentioning var 0): K atom.
+    return lsk_app(lsk_atom("K"), t)
+
+// lsk_compile: convert a lambda term to atom-combinator form (lambda-free).
+fn lsk_compile(t) -> list
+    let tag = t[0]
+    if tag == "var"
+        return t
+    if tag == "app"
+        return lsk_app(lsk_compile(t[1]), lsk_compile(t[2]))
+    if tag == "lam"
+        // Compile the body first (removes inner lambdas), then remove this binder.
+        return lsk_bracket(lsk_compile(t[1]))
+    // already an atom
+    return t
+
+// lsk_abstract(t): bracket-abstract a lambda term into S/K/I form (as lambda terms).
+fn lsk_abstract(t) -> list
+    return lsk_expand(lsk_compile(t))
