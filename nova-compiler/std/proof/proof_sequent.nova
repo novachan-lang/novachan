@@ -1,0 +1,484 @@
+// std/proof/proof_sequent.nova — Propositional sequent calculus (LK).
+// LEAF — imports NOTHING.
+//
+// Formula tags: ["var",name], ["not",f], ["and",a,b], ["or",a,b], ["imp",a,b], ["bot"], ["top"].
+// Sequent: [gamma, delta]  (gamma = antecedent list, delta = succedent list of formulas).
+// Derivation: ["seq", ruleName, sequent, ...premiseDerivations...]
+//   Rules: "ax","andL","andR","orL","orR","impL","impR","notL","notR","weakL","weakR"
+// Public API:
+//   pseq_check(deriv)        -> bool  verify the derivation is well-formed
+//   pseq_endsequent(deriv)   -> list  return the sequent at the root of deriv
+
+// _pseq_fmteq — syntactic equality of two formula trees (tagged lists).
+fn _pseq_fmteq(a, b) -> bool
+    if type_of(a) != type_of(b)
+        return false
+    if type_of(a) == "string"
+        return a == b
+    if type_of(a) == "int"
+        return a == b
+    if type_of(a) != "list"
+        return false
+    if len(a) != len(b)
+        return false
+    let n = len(a)
+    let i = 0
+    while i < n
+        if not _pseq_fmteq(a[i], b[i])
+            return false
+        i = i + 1
+    true
+
+// _pseq_in_list — true iff formula f appears in formula list flist (syntactic equality).
+fn _pseq_in_list(f, flist) -> bool
+    let n = len(flist)
+    let i = 0
+    while i < n
+        if _pseq_fmteq(f, flist[i])
+            return true
+        i = i + 1
+    false
+
+// _pseq_share — true iff gamma and delta share at least one formula (used for "ax" rule).
+fn _pseq_share(gamma, delta) -> bool
+    let n = len(gamma)
+    let i = 0
+    while i < n
+        if _pseq_in_list(gamma[i], delta)
+            return true
+        i = i + 1
+    false
+
+// _pseq_copy_list — shallow copy a formula list.
+fn _pseq_copy_list(src) -> list
+    let dst = []
+    let i = 0
+    let n = len(src)
+    while i < n
+        push(dst, src[i])
+        i = i + 1
+    dst
+
+// _pseq_list_without — return flist with the first occurrence of f removed.
+fn _pseq_list_without(flist, f) -> list
+    let out = []
+    let removed = 0
+    let n = len(flist)
+    let i = 0
+    while i < n
+        if removed == 0 and _pseq_fmteq(flist[i], f)
+            removed = 1
+        else
+            push(out, flist[i])
+        i = i + 1
+    out
+
+// _pseq_seq_gamma — extract gamma (antecedent) from a sequent [gamma, delta].
+fn _pseq_seq_gamma(seq) -> list
+    seq[0]
+
+// _pseq_seq_delta — extract delta (succedent) from a sequent [gamma, delta].
+fn _pseq_seq_delta(seq) -> list
+    seq[1]
+
+// _pseq_fmttag — return the tag string of a formula (first element if list, else "bad").
+fn _pseq_fmttag(f) -> string
+    if type_of(f) != "list"
+        return "bad"
+    if len(f) == 0
+        return "bad"
+    if type_of(f[0]) != "string"
+        return "bad"
+    f[0]
+
+// _pseq_fmtsub1 — second element of formula (sub-formula 1).
+fn _pseq_fmtsub1(f) -> any
+    f[1]
+
+// _pseq_fmtsub2 — third element of formula (sub-formula 2, for binary connectives).
+fn _pseq_fmtsub2(f) -> any
+    f[2]
+
+// _pseq_lists_eq — check two formula lists have the same formulas (set-like: each of a in b and b in a).
+// For LK rule checking we need structural matching so we use list containment in both directions.
+fn _pseq_lists_subset(small, big) -> bool
+    let n = len(small)
+    let i = 0
+    while i < n
+        if not _pseq_in_list(small[i], big)
+            return false
+        i = i + 1
+    true
+
+// _pseq_lists_eq — both subsets of each other (multiset equality up to duplicates).
+fn _pseq_lists_eq(a, b) -> bool
+    if len(a) != len(b)
+        return false
+    _pseq_lists_subset(a, b)
+
+// _pseq_check_ax — "ax": sequent [gamma, delta] is an axiom iff gamma and delta share a formula.
+fn _pseq_check_ax(seq) -> bool
+    let g = _pseq_seq_gamma(seq)
+    let d = _pseq_seq_delta(seq)
+    _pseq_share(g, d)
+
+// _pseq_check_weakL — "weakL": one premise. Premise gamma' |- delta where gamma' = gamma \ {A}.
+// Conclusion: gamma |- delta (gamma has one extra formula vs premise).
+// We check: premise.delta == seq.delta AND seq.gamma has one formula not in premise.gamma.
+fn _pseq_check_weakL(seq, prem) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let pg = _pseq_seq_gamma(prem)
+    let pd = _pseq_seq_delta(prem)
+    if not _pseq_lists_eq(cd, pd)
+        return false
+    // pg must be a subset of cg and |cg| = |pg| + 1
+    if len(cg) != len(pg) + 1
+        return false
+    _pseq_lists_subset(pg, cg)
+
+// _pseq_check_weakR — "weakR": one premise. Premise gamma |- delta' where delta' = delta \ {A}.
+fn _pseq_check_weakR(seq, prem) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let pg = _pseq_seq_gamma(prem)
+    let pd = _pseq_seq_delta(prem)
+    if not _pseq_lists_eq(cg, pg)
+        return false
+    if len(cd) != len(pd) + 1
+        return false
+    _pseq_lists_subset(pd, cd)
+
+// _pseq_check_notL — "notL": premise is gamma |- delta+{A}. Conclusion: gamma+{~A} |- delta.
+// ~A moves from conclusion gamma to premise delta as A.
+fn _pseq_check_notL(seq, prem) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let pg = _pseq_seq_gamma(prem)
+    let pd = _pseq_seq_delta(prem)
+    // Find the not-formula ~A in cg; then check pg = cg-{~A} and pd = cd+{A}
+    let n = len(cg)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cg[i]
+        if _pseq_fmttag(cf) == "not"
+            let sub = _pseq_fmtsub1(cf)
+            // premise gamma = conclusion gamma - {~A}
+            let exp_pg = _pseq_list_without(cg, cf)
+            if _pseq_lists_eq(exp_pg, pg)
+                // premise delta = conclusion delta + {A=sub}
+                let exp_pd = _pseq_copy_list(cd)
+                push(exp_pd, sub)
+                if _pseq_lists_eq(exp_pd, pd)
+                    found = 1
+        i = i + 1
+    found == 1
+
+// _pseq_check_notR — "notR": premise is gamma+{A} |- delta. Conclusion: gamma |- delta+{~A}.
+// A moves from premise gamma to conclusion delta as ~A.
+fn _pseq_check_notR(seq, prem) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let pg = _pseq_seq_gamma(prem)
+    let pd = _pseq_seq_delta(prem)
+    // Find the not-formula ~A in cd; then check pg = cg+{A} and pd = cd-{~A}
+    let n = len(cd)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cd[i]
+        if _pseq_fmttag(cf) == "not"
+            let sub = _pseq_fmtsub1(cf)
+            // premise gamma = conclusion gamma + {sub (= A)}
+            let exp_pg = _pseq_copy_list(cg)
+            push(exp_pg, sub)
+            if _pseq_lists_eq(exp_pg, pg)
+                // premise delta = conclusion delta - {~A}
+                let exp_pd = _pseq_list_without(cd, cf)
+                if _pseq_lists_eq(exp_pd, pd)
+                    found = 1
+        i = i + 1
+    found == 1
+
+// _pseq_check_andL — "andL": premise is gamma, A, B |- delta. Conclusion: gamma, {A^B} |- delta.
+fn _pseq_check_andL(seq, prem) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let pg = _pseq_seq_gamma(prem)
+    let pd = _pseq_seq_delta(prem)
+    if not _pseq_lists_eq(cd, pd)
+        return false
+    // Find and-formula in cg
+    let n = len(cg)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cg[i]
+        if _pseq_fmttag(cf) == "and"
+            let a = _pseq_fmtsub1(cf)
+            let b = _pseq_fmtsub2(cf)
+            // pg should be (cg \ {A^B}) union {A, B}
+            let cg_no_and = _pseq_list_without(cg, cf)
+            let expected_pg = _pseq_copy_list(cg_no_and)
+            push(expected_pg, a)
+            push(expected_pg, b)
+            if _pseq_lists_eq(expected_pg, pg)
+                found = 1
+        i = i + 1
+    found == 1
+
+// _pseq_check_andR — "andR": two premises: gamma |- delta, {A} and gamma |- delta, {B}.
+// Conclusion: gamma |- delta, {A^B}.
+fn _pseq_check_andR(seq, prem1, prem2) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let p1g = _pseq_seq_gamma(prem1)
+    let p1d = _pseq_seq_delta(prem1)
+    let p2g = _pseq_seq_gamma(prem2)
+    let p2d = _pseq_seq_delta(prem2)
+    if not _pseq_lists_eq(cg, p1g)
+        return false
+    if not _pseq_lists_eq(cg, p2g)
+        return false
+    // Find and-formula in cd
+    let n = len(cd)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cd[i]
+        if _pseq_fmttag(cf) == "and"
+            let a = _pseq_fmtsub1(cf)
+            let b = _pseq_fmtsub2(cf)
+            let cd_no_and = _pseq_list_without(cd, cf)
+            // p1d = cd_no_and + {a}, p2d = cd_no_and + {b}
+            let exp1 = _pseq_copy_list(cd_no_and)
+            push(exp1, a)
+            let exp2 = _pseq_copy_list(cd_no_and)
+            push(exp2, b)
+            if _pseq_lists_eq(exp1, p1d) and _pseq_lists_eq(exp2, p2d)
+                found = 1
+        i = i + 1
+    found == 1
+
+// _pseq_check_orL — "orL": two premises: gamma, A |- delta and gamma, B |- delta.
+// Conclusion: gamma, {A|B} |- delta.
+fn _pseq_check_orL(seq, prem1, prem2) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let p1g = _pseq_seq_gamma(prem1)
+    let p1d = _pseq_seq_delta(prem1)
+    let p2g = _pseq_seq_gamma(prem2)
+    let p2d = _pseq_seq_delta(prem2)
+    if not _pseq_lists_eq(cd, p1d)
+        return false
+    if not _pseq_lists_eq(cd, p2d)
+        return false
+    // Find or-formula in cg
+    let n = len(cg)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cg[i]
+        if _pseq_fmttag(cf) == "or"
+            let a = _pseq_fmtsub1(cf)
+            let b = _pseq_fmtsub2(cf)
+            let cg_no_or = _pseq_list_without(cg, cf)
+            let exp1 = _pseq_copy_list(cg_no_or)
+            push(exp1, a)
+            let exp2 = _pseq_copy_list(cg_no_or)
+            push(exp2, b)
+            if _pseq_lists_eq(exp1, p1g) and _pseq_lists_eq(exp2, p2g)
+                found = 1
+        i = i + 1
+    found == 1
+
+// _pseq_check_orR — "orR": one premise: gamma |- delta, A, B. Conclusion: gamma |- delta, {A|B}.
+fn _pseq_check_orR(seq, prem) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let pg = _pseq_seq_gamma(prem)
+    let pd = _pseq_seq_delta(prem)
+    if not _pseq_lists_eq(cg, pg)
+        return false
+    // Find or-formula in cd
+    let n = len(cd)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cd[i]
+        if _pseq_fmttag(cf) == "or"
+            let a = _pseq_fmtsub1(cf)
+            let b = _pseq_fmtsub2(cf)
+            let cd_no_or = _pseq_list_without(cd, cf)
+            let expected_pd = _pseq_copy_list(cd_no_or)
+            push(expected_pd, a)
+            push(expected_pd, b)
+            if _pseq_lists_eq(expected_pd, pd)
+                found = 1
+        i = i + 1
+    found == 1
+
+// _pseq_check_impL — "impL": two premises: gamma |- delta, A and gamma, B |- delta.
+// Conclusion: gamma, {A->B} |- delta.
+fn _pseq_check_impL(seq, prem1, prem2) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let p1g = _pseq_seq_gamma(prem1)
+    let p1d = _pseq_seq_delta(prem1)
+    let p2g = _pseq_seq_gamma(prem2)
+    let p2d = _pseq_seq_delta(prem2)
+    // Find imp-formula in cg
+    let n = len(cg)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cg[i]
+        if _pseq_fmttag(cf) == "imp"
+            let a = _pseq_fmtsub1(cf)
+            let b = _pseq_fmtsub2(cf)
+            let cg_no_imp = _pseq_list_without(cg, cf)
+            // prem1: cg_no_imp |- cd + {a}
+            let exp1d = _pseq_copy_list(cd)
+            push(exp1d, a)
+            // prem2: cg_no_imp + {b} |- cd
+            let exp2g = _pseq_copy_list(cg_no_imp)
+            push(exp2g, b)
+            if _pseq_lists_eq(cg_no_imp, p1g) and _pseq_lists_eq(exp1d, p1d)
+                if _pseq_lists_eq(exp2g, p2g) and _pseq_lists_eq(cd, p2d)
+                    found = 1
+        i = i + 1
+    found == 1
+
+// _pseq_check_impR — "impR": one premise: gamma, A |- delta, B. Conclusion: gamma |- delta, {A->B}.
+fn _pseq_check_impR(seq, prem) -> bool
+    let cg = _pseq_seq_gamma(seq)
+    let cd = _pseq_seq_delta(seq)
+    let pg = _pseq_seq_gamma(prem)
+    let pd = _pseq_seq_delta(prem)
+    // Find imp-formula in cd
+    let n = len(cd)
+    let found = 0
+    let i = 0
+    while i < n
+        let cf = cd[i]
+        if _pseq_fmttag(cf) == "imp"
+            let a = _pseq_fmtsub1(cf)
+            let b = _pseq_fmtsub2(cf)
+            let cd_no_imp = _pseq_list_without(cd, cf)
+            // premise: cg + {a} |- cd_no_imp + {b}
+            let exp_pg = _pseq_copy_list(cg)
+            push(exp_pg, a)
+            let exp_pd = _pseq_copy_list(cd_no_imp)
+            push(exp_pd, b)
+            if _pseq_lists_eq(exp_pg, pg) and _pseq_lists_eq(exp_pd, pd)
+                found = 1
+        i = i + 1
+    found == 1
+
+// pseq_endsequent — return the sequent (second element, index 2) from the root derivation node.
+fn pseq_endsequent(deriv) -> list
+    deriv[2]
+
+// pseq_check — verify a derivation is well-formed according to LK rules.
+// Returns true iff every rule application is schema-correct and premises' sequents match.
+fn pseq_check(deriv) -> bool
+    if type_of(deriv) != "list"
+        return false
+    if len(deriv) < 3
+        return false
+    if _pseq_fmttag(deriv) != "seq"
+        return false
+    let rule = deriv[1]
+    let seq = deriv[2]
+    // Validate seq is a 2-element list
+    if type_of(seq) != "list"
+        return false
+    if len(seq) != 2
+        return false
+    // Count premise sub-derivations (elements 3, 4, ...)
+    let nprem = len(deriv) - 3
+    if rule == "ax"
+        if nprem != 0
+            return false
+        return _pseq_check_ax(seq)
+    if rule == "weakL"
+        if nprem != 1
+            return false
+        let p0 = deriv[3]
+        if not pseq_check(p0)
+            return false
+        return _pseq_check_weakL(seq, pseq_endsequent(p0))
+    if rule == "weakR"
+        if nprem != 1
+            return false
+        let p0 = deriv[3]
+        if not pseq_check(p0)
+            return false
+        return _pseq_check_weakR(seq, pseq_endsequent(p0))
+    if rule == "notL"
+        if nprem != 1
+            return false
+        let p0 = deriv[3]
+        if not pseq_check(p0)
+            return false
+        return _pseq_check_notL(seq, pseq_endsequent(p0))
+    if rule == "notR"
+        if nprem != 1
+            return false
+        let p0 = deriv[3]
+        if not pseq_check(p0)
+            return false
+        return _pseq_check_notR(seq, pseq_endsequent(p0))
+    if rule == "andL"
+        if nprem != 1
+            return false
+        let p0 = deriv[3]
+        if not pseq_check(p0)
+            return false
+        return _pseq_check_andL(seq, pseq_endsequent(p0))
+    if rule == "andR"
+        if nprem != 2
+            return false
+        let p0 = deriv[3]
+        let p1 = deriv[4]
+        if not pseq_check(p0)
+            return false
+        if not pseq_check(p1)
+            return false
+        return _pseq_check_andR(seq, pseq_endsequent(p0), pseq_endsequent(p1))
+    if rule == "orL"
+        if nprem != 2
+            return false
+        let p0 = deriv[3]
+        let p1 = deriv[4]
+        if not pseq_check(p0)
+            return false
+        if not pseq_check(p1)
+            return false
+        return _pseq_check_orL(seq, pseq_endsequent(p0), pseq_endsequent(p1))
+    if rule == "orR"
+        if nprem != 1
+            return false
+        let p0 = deriv[3]
+        if not pseq_check(p0)
+            return false
+        return _pseq_check_orR(seq, pseq_endsequent(p0))
+    if rule == "impL"
+        if nprem != 2
+            return false
+        let p0 = deriv[3]
+        let p1 = deriv[4]
+        if not pseq_check(p0)
+            return false
+        if not pseq_check(p1)
+            return false
+        return _pseq_check_impL(seq, pseq_endsequent(p0), pseq_endsequent(p1))
+    if rule == "impR"
+        if nprem != 1
+            return false
+        let p0 = deriv[3]
+        if not pseq_check(p0)
+            return false
+        return _pseq_check_impR(seq, pseq_endsequent(p0))
+    false

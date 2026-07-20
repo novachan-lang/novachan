@@ -1,0 +1,227 @@
+// std/proof/proof_fitch.nova — Fitch-style natural deduction (flat, scoped).
+// LEAF — imports NOTHING.
+//
+// A PROOF is a list of LINES. Each line: [depth, formula, just]
+//   depth: int >= 0  (0 = top level)
+//   formula: tagged formula list (["var",n], ["not",f], ["and",a,b], ["or",a,b],
+//            ["imp",a,b], ["bot"], ["top"])
+//   just: one of:
+//     "premise"               — given premise at depth 0
+//     "assume"                — opens a subproof (depth increases from here)
+//     ["mp",  i, j]           — modus ponens: line i = A->B, line j = A => this line = B
+//     ["andi", i, j]          — and-intro: line i = A, line j = B => A/\B
+//     ["ande1", i]            — and-elim-left:  line i = A/\B => A
+//     ["ande2", i]            — and-elim-right: line i = A/\B => B
+//     ["reit", i]             — reiteration: line i accessible => copy formula
+//     ["impi", s, e]          — imp-intro: subproof from line s (assume) to line e
+//                               concludes imp(formula[s], formula[e]) at depth = depth[s]-1
+//
+// pfit_check(lines) -> bool          verify scoping + each justification
+// pfit_conclusion(lines) -> any      formula of the last depth-0 line, or "FAIL"
+
+// _pfit_formula_eq — deep structural equality of two formula lists
+fn _pfit_formula_eq(a, b) -> bool
+    if len(a) != len(b)
+        return false
+    if a[0] != b[0]
+        return false
+    let tag = a[0]
+    if tag == "bot"
+        return true
+    if tag == "top"
+        return true
+    if tag == "var"
+        return a[1] == b[1]
+    if tag == "not"
+        return _pfit_formula_eq(a[1], b[1])
+    if tag == "and"
+        if not _pfit_formula_eq(a[1], b[1])
+            return false
+        return _pfit_formula_eq(a[2], b[2])
+    if tag == "or"
+        if not _pfit_formula_eq(a[1], b[1])
+            return false
+        return _pfit_formula_eq(a[2], b[2])
+    if tag == "imp"
+        if not _pfit_formula_eq(a[1], b[1])
+            return false
+        return _pfit_formula_eq(a[2], b[2])
+    false
+
+// _pfit_accessible — true iff line at index ref_idx is accessible from line at cur_idx.
+// Accessibility: line ref_idx is accessible from cur_idx iff:
+//   1. ref_idx < cur_idx (earlier line)
+//   2. ref_idx is not inside a closed subproof
+//      (a subproof opened at some line s with depth d is closed before cur_idx if there
+//       exists a line between s and cur_idx whose depth is <= d-1 and the subproof has ended)
+// Simpler invariant: line j is accessible from line i (j < i) iff depth[j] <= depth[i]
+// AND there is no line k with j < k < i where depth[k] < depth[j]
+// (i.e., depth never drops below depth[j] between j and i — the scope was not exited then re-entered)
+fn _pfit_accessible(lines, ref_idx, cur_idx) -> bool
+    if ref_idx >= cur_idx
+        return false
+    let ref_depth = lines[ref_idx][0]
+    let cur_depth = lines[cur_idx][0]
+    if ref_depth > cur_depth
+        return false
+    // Check that no line between ref_idx and cur_idx has depth strictly less than ref_depth
+    // (which would mean the scope containing ref_idx was closed before cur_idx)
+    let k = ref_idx + 1
+    while k < cur_idx
+        if lines[k][0] < ref_depth
+            return false
+        k = k + 1
+    true
+
+// _pfit_check_just — check the justification for line at index i
+// Returns true iff the justification is valid.
+fn _pfit_check_just(lines, idx) -> bool
+    let line = lines[idx]
+    let depth = line[0]
+    let formula = line[1]
+    let just = line[2]
+    // "premise" — must be at depth 0
+    if just == "premise"
+        return depth == 0
+    // "assume" — opens a subproof; depth > 0 (or 0 at top, but typically > 0)
+    if just == "assume"
+        return true
+    // just is a list; check it is indeed a list
+    if just == "FAIL"
+        return false
+    let jlen = len(just)
+    if jlen < 1
+        return false
+    let jrule = just[0]
+    // ["mp", i, j] — modus ponens
+    if jrule == "mp"
+        if jlen < 3
+            return false
+        let ri = just[1]
+        let rj = just[2]
+        if not _pfit_accessible(lines, ri, idx)
+            return false
+        if not _pfit_accessible(lines, rj, idx)
+            return false
+        let fi = lines[ri][1]
+        let fj = lines[rj][1]
+        if len(fi) < 1
+            return false
+        if fi[0] != "imp"
+            return false
+        if not _pfit_formula_eq(fi[1], fj)
+            return false
+        return _pfit_formula_eq(fi[2], formula)
+    // ["andi", i, j] — and-introduction
+    if jrule == "andi"
+        if jlen < 3
+            return false
+        let ri = just[1]
+        let rj = just[2]
+        if not _pfit_accessible(lines, ri, idx)
+            return false
+        if not _pfit_accessible(lines, rj, idx)
+            return false
+        if len(formula) < 1
+            return false
+        if formula[0] != "and"
+            return false
+        if not _pfit_formula_eq(lines[ri][1], formula[1])
+            return false
+        return _pfit_formula_eq(lines[rj][1], formula[2])
+    // ["ande1", i] — and-elim-left
+    if jrule == "ande1"
+        if jlen < 2
+            return false
+        let ri = just[1]
+        if not _pfit_accessible(lines, ri, idx)
+            return false
+        let fi = lines[ri][1]
+        if len(fi) < 1
+            return false
+        if fi[0] != "and"
+            return false
+        return _pfit_formula_eq(fi[1], formula)
+    // ["ande2", i] — and-elim-right
+    if jrule == "ande2"
+        if jlen < 2
+            return false
+        let ri = just[1]
+        if not _pfit_accessible(lines, ri, idx)
+            return false
+        let fi = lines[ri][1]
+        if len(fi) < 1
+            return false
+        if fi[0] != "and"
+            return false
+        return _pfit_formula_eq(fi[2], formula)
+    // ["reit", i] — reiteration
+    if jrule == "reit"
+        if jlen < 2
+            return false
+        let ri = just[1]
+        if not _pfit_accessible(lines, ri, idx)
+            return false
+        return _pfit_formula_eq(lines[ri][1], formula)
+    // ["impi", s, e] — imp-introduction
+    if jrule == "impi"
+        if jlen < 3
+            return false
+        let s = just[1]
+        let e = just[2]
+        if s < 0
+            return false
+        if e < 0
+            return false
+        if s >= idx
+            return false
+        if e >= idx
+            return false
+        if e < s
+            return false
+        // line s must be "assume"
+        if lines[s][2] != "assume"
+            return false
+        // depth of assume line must be depth+1
+        if lines[s][0] != depth + 1
+            return false
+        // depth of end line must also be depth+1
+        if lines[e][0] != depth + 1
+            return false
+        // the subproof [s..e] must be contiguous at depth+1 with no depth <= depth in between
+        let k = s
+        while k <= e
+            if lines[k][0] < depth + 1
+                return false
+            k = k + 1
+        // formula must be imp(assume_formula, end_formula)
+        if len(formula) < 1
+            return false
+        if formula[0] != "imp"
+            return false
+        if not _pfit_formula_eq(lines[s][1], formula[1])
+            return false
+        return _pfit_formula_eq(lines[e][1], formula[2])
+    false
+
+// pfit_check — verify the entire Fitch proof; returns true iff all lines are valid
+fn pfit_check(lines) -> bool
+    let n = len(lines)
+    let i = 0
+    while i < n
+        if not _pfit_check_just(lines, i)
+            return false
+        i = i + 1
+    true
+
+// pfit_conclusion — formula of the last depth-0 line in the proof, or "FAIL"
+fn pfit_conclusion(lines) -> any
+    let n = len(lines)
+    if n == 0
+        return "FAIL"
+    let i = n - 1
+    while i >= 0
+        if lines[i][0] == 0
+            return lines[i][1]
+        i = i - 1
+    "FAIL"
