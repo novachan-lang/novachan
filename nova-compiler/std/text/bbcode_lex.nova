@@ -1,0 +1,182 @@
+// ============================================================================
+// NOVA Standard Library — std/text/bbcode_lex
+// ============================================================================
+// Tokenizer for BBCode markup: [b]bold[/b], [url=http://x]link[/url], [*] ...
+//
+// Public API:
+//   blex_tokenize(input: string) -> list          Scan `input` into a flat token stream.
+//   blex_token_tag(tok: list)   -> string          "text" | "open" | "close"
+//   blex_token_value(tok: list) -> string          text content, or the tag name
+//   blex_token_attr(tok: list)  -> string          "[tag=attr]" value, else ""
+//
+// Token shapes (each token is itself a tagged list -- always read through the
+// tag-checked accessors above, never blindly by position, from outside this file):
+//   ["text", content]          a literal run of non-tag source text
+//   ["open", tagname, attr]    "[tagname]" (attr=="") or "[tagname=attr]"
+//   ["close", tagname]         "[/tagname]"
+//
+// Grammar recognized for a tag body between '[' and ']':
+//   open  := NAME ('=' ATTR)?
+//   close := '/' NAME
+//   NAME  := one or more of [A-Za-z0-9_*]     (case is PRESERVED; '*' covers
+//            BBCode's bare list-item shorthand "[*]")
+//   ATTR  := every byte up to the closing ']' -- so a URL's own "=" inside a
+//            query string is NOT re-split; only the FIRST '=' after NAME
+//            divides the tag name from its attribute.
+//
+// Malformed brackets never crash and are never silently dropped: a '[' that
+// does not open a well-formed tag (no matching ']', an empty NAME, or a stray
+// byte between NAME and '='/']') degrades to a single '[' of literal text and
+// the scan resumes one byte later -- this matches how real forum posts (full
+// of stray brackets, smileys like "[:" etc.) are actually written.
+//
+// Tag-name CASE is preserved verbatim in tokens ("[B]" -> open tag "B").
+// Case-INSENSITIVE matching of open/close pairs (the BBCode convention: [B]
+// text [/b] is valid) is the PARSER's job (std/text/bbcode_parse), not the
+// lexer's -- the lexer stays a faithful, lossless scan of the source, which
+// keeps it reusable by anything that wants exact source fidelity (e.g. a
+// future bbcode "normalize case" pass) without re-scanning.
+//
+// LEAF module: imports nothing.
+// ============================================================================
+
+// PRIVATE: true if c is a legal BBCode tag-name byte: A-Z a-z 0-9 _ *
+fn _blex_is_name_char(c: string) -> bool
+    if c == ""
+        return false
+    if c >= "a" and c <= "z"
+        return true
+    if c >= "A" and c <= "Z"
+        return true
+    if c >= "0" and c <= "9"
+        return true
+    if c == "_" or c == "*"
+        return true
+    false
+
+// PRIVATE: index of the next occurrence of single-byte `ch` in `s` at/after
+// `start`, or -1 if none. (the builtin find() always searches from byte 0,
+// so this tiny scan is what gives us a "from position" search.)
+fn _blex_find_from(s: string, ch: string, start: int) -> int
+    let n = len(s)
+    let i = start
+    let result = -1
+    while i < n and result == -1
+        if char_at(s, i) == ch
+            result = i
+        i = i + 1
+    result
+
+// PRIVATE: build a ["text", content] token.
+fn _blex_text_tok(content: string) -> list
+    let t = []
+    push(t, "text")
+    push(t, content)
+    t
+
+// PRIVATE: build an ["open", tagname, attr] token.
+fn _blex_open_tok(name: string, attr: string) -> list
+    let t = []
+    push(t, "open")
+    push(t, name)
+    push(t, attr)
+    t
+
+// PRIVATE: build a ["close", tagname] token.
+fn _blex_close_tok(name: string) -> list
+    let t = []
+    push(t, "close")
+    push(t, name)
+    t
+
+// PUBLIC: the token's kind -- "text" | "open" | "close".
+fn blex_token_tag(tok: list) -> string
+    tok[0]
+
+// PUBLIC: the token's primary value -- text content for a "text" token, the
+// tag name for an "open"/"close" token.
+fn blex_token_value(tok: list) -> string
+    tok[1]
+
+// PUBLIC: the "[tag=attr]" value of an "open" token; "" for every other
+// token, including an open tag written with no "=attr" at all.
+fn blex_token_attr(tok: list) -> string
+    if len(tok) >= 3
+        return tok[2]
+    ""
+
+// PRIVATE: attempt to lex one tag body starting at input[i] == '['.
+// Returns {"ok": bool, "close": bool, "name": string, "attr": string,
+// "next": int}. "next" is always the index to resume scanning from -- when
+// ok is false it is simply i+1 (the '[' becomes one byte of literal text).
+fn _blex_try_tag(input: string, i: int, n: int) -> dict
+    let r = {}
+    r["ok"] = false
+    r["close"] = false
+    r["name"] = ""
+    r["attr"] = ""
+    r["next"] = i + 1
+    let j = i + 1
+    let is_close = false
+    if j < n and char_at(input, j) == "/"
+        is_close = true
+        j = j + 1
+    let name_start = j
+    while j < n and _blex_is_name_char(char_at(input, j))
+        j = j + 1
+    let name = slice(input, name_start, j)
+    if name == "" or j >= n
+        return r
+    let c = char_at(input, j)
+    if is_close
+        if c == "]"
+            r["ok"] = true
+            r["close"] = true
+            r["name"] = name
+            r["next"] = j + 1
+        return r
+    if c == "]"
+        r["ok"] = true
+        r["name"] = name
+        r["attr"] = ""
+        r["next"] = j + 1
+        return r
+    if c == "="
+        let close_pos = _blex_find_from(input, "]", j + 1)
+        if close_pos < 0
+            return r
+        r["ok"] = true
+        r["name"] = name
+        r["attr"] = slice(input, j + 1, close_pos)
+        r["next"] = close_pos + 1
+        return r
+    r
+
+// PUBLIC: tokenize a full BBCode source string into a flat token list.
+fn blex_tokenize(input: string) -> list
+    let toks = []
+    let n = len(input)
+    let i = 0
+    let text_start = -1
+    while i < n
+        let c = char_at(input, i)
+        if c == "["
+            if text_start >= 0
+                push(toks, _blex_text_tok(slice(input, text_start, i)))
+                text_start = -1
+            let r = _blex_try_tag(input, i, n)
+            if r["ok"]
+                if r["close"]
+                    push(toks, _blex_close_tok(r["name"]))
+                else
+                    push(toks, _blex_open_tok(r["name"], r["attr"]))
+            else
+                text_start = i
+            i = r["next"]
+        else
+            if text_start < 0
+                text_start = i
+            i = i + 1
+    if text_start >= 0
+        push(toks, _blex_text_tok(slice(input, text_start, n)))
+    toks

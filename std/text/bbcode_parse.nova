@@ -1,0 +1,169 @@
+// ============================================================================
+// NOVA Standard Library — std/text/bbcode_parse
+// ============================================================================
+// Build an AST from a std/text/bbcode_lex token stream.
+//
+// Public API:
+//   bpar_parse(tokens: list) -> list      Parse a token list into a list of
+//                                         top-level AST nodes.
+//
+// AST node shapes (each node is itself a tagged list, exactly mirroring the
+// token shapes it was built from):
+//   ["text", content]                    a run of literal text
+//   ["tag", name, attr, children]        a matched [name]...[/name] (or
+//                                         [name=attr]...[/name=attr]) pair;
+//                                         children is a list of AST nodes
+//
+// Matching algorithm (single left-to-right pass over the tokens, one explicit
+// stack of "open frames" -- no recursion, so parse depth is never bounded by
+// the native call stack):
+//   - a "text" token appends a text node to whatever is currently the
+//     innermost open frame's children (or the top-level result list, if the
+//     stack is empty)
+//   - an "open" token pushes a new frame {name, attr, children, raw}, where
+//     `raw` is the reconstructed literal bracket text ("[name]" or
+//     "[name=attr]"), kept only in case this frame turns out to never close
+//   - a "close" token for name X searches the stack top-down (CASE-
+//     INSENSITIVE -- BBCode's own convention: [B]..[/b] is a valid pair) for
+//     a frame whose name matches:
+//       * no match anywhere on the stack -> the close token itself is a
+//         stray; it is emitted as literal text ("[/x]") and the stack is
+//         untouched
+//       * a match at depth d -> every frame ABOVE d is "misnested": it
+//         never really closed, so it is UNWOUND -- its own `raw` open text
+//         becomes a text node and its accumulated children are spliced,
+//         in order, into its parent frame (or the result list) -- then the
+//         matched frame at depth d is popped and turned into a proper
+//         ["tag", name, attr, children] node
+//   - any frame still open when the token stream ends (an open tag that is
+//     NEVER closed) is unwound the same way: its opening bracket becomes
+//     literal text and its children are promoted to its parent's level
+//
+// This is deliberately closer to how browsers recover from misnested HTML
+// than to "reject on first error": a single stray or missing tag degrades
+// gracefully to text instead of swallowing (or corrupting the nesting of)
+// everything that follows it, which is essential for markup harvested from
+// real, imperfectly-typed forum posts.
+//
+// IMPORTS: std/text/bbcode_lex (token accessors only -- this module never
+// reaches into a token by raw index).
+// ============================================================================
+
+import std/text/bbcode_lex
+
+// ── private: ASCII-only lowercasing, used ONLY for open/close tag matching ──
+
+fn _bpar_lower_char(c: string) -> string
+    if c >= "A" and c <= "Z"
+        return chr(ord(c) + 32)
+    c
+
+fn _bpar_lower(s: string) -> string
+    let out = ""
+    let n = len(s)
+    let i = 0
+    while i < n
+        out = out + _bpar_lower_char(char_at(s, i))
+        i = i + 1
+    out
+
+// ── private: AST node constructors ───────────────────────────────────────────
+
+fn _bpar_text_node(content: string) -> list
+    let node = []
+    push(node, "text")
+    push(node, content)
+    node
+
+fn _bpar_tag_node(name: string, attr: string, children: list) -> list
+    let node = []
+    push(node, "tag")
+    push(node, name)
+    push(node, attr)
+    push(node, children)
+    node
+
+// ── private: stack helpers ───────────────────────────────────────────────────
+
+// The list a newly-produced node should be appended to right now: the
+// innermost open frame's children, or the top-level `result` list if no
+// frame is open. Lists are reference values in NOVA, so callers that push
+// onto the returned list are mutating the real frame/result storage.
+fn _bpar_target(stack: list, result: list) -> list
+    let depth = len(stack)
+    if depth == 0
+        return result
+    let top = stack[depth - 1]
+    top["children"]
+
+// Search the stack top-down for an open frame named (case-insensitively)
+// `name_lc`. Returns its stack index, or -1 if no frame matches.
+fn _bpar_find_open_depth(stack: list, name_lc: string) -> int
+    let idx = len(stack) - 1
+    let found = -1
+    while idx >= 0 and found == -1
+        let frame = stack[idx]
+        if _bpar_lower(frame["name"]) == name_lc
+            found = idx
+        idx = idx - 1
+    found
+
+// Pop the top frame off `stack` and unwind it: its own opening bracket
+// becomes a literal text node, followed by its accumulated children (in
+// original order), spliced into whatever is now the new top of `stack` (or
+// `result`, once the stack empties). Shared by "stray/misnested close" and
+// "never closed by end of input".
+fn _bpar_unwind_flatten(stack: list, result: list)
+    let bad = pop(stack)
+    let target = _bpar_target(stack, result)
+    push(target, _bpar_text_node(bad["raw"]))
+    let kids = bad["children"]
+    let ki = 0
+    while ki < len(kids)
+        push(target, kids[ki])
+        ki = ki + 1
+
+// ── public: parse ─────────────────────────────────────────────────────────────
+
+fn bpar_parse(tokens: list) -> list
+    let result = []
+    let stack = []
+    let n = len(tokens)
+    let i = 0
+    while i < n
+        let tok = tokens[i]
+        let kind = blex_token_tag(tok)
+        if kind == "text"
+            let target = _bpar_target(stack, result)
+            push(target, _bpar_text_node(blex_token_value(tok)))
+        else
+            if kind == "open"
+                let frame = {}
+                frame["name"] = blex_token_value(tok)
+                frame["attr"] = blex_token_attr(tok)
+                frame["children"] = []
+                let raw = "[" + frame["name"]
+                if frame["attr"] != ""
+                    raw = raw + "=" + frame["attr"]
+                raw = raw + "]"
+                frame["raw"] = raw
+                push(stack, frame)
+            else
+                // "close"
+                let cname = blex_token_value(tok)
+                let cname_lc = _bpar_lower(cname)
+                let dpos = _bpar_find_open_depth(stack, cname_lc)
+                if dpos < 0
+                    let target2 = _bpar_target(stack, result)
+                    push(target2, _bpar_text_node("[/" + cname + "]"))
+                else
+                    while len(stack) - 1 > dpos
+                        _bpar_unwind_flatten(stack, result)
+                    let good = pop(stack)
+                    let node = _bpar_tag_node(good["name"], good["attr"], good["children"])
+                    let final_target = _bpar_target(stack, result)
+                    push(final_target, node)
+        i = i + 1
+    while len(stack) > 0
+        _bpar_unwind_flatten(stack, result)
+    result
