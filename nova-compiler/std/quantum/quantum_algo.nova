@@ -1,0 +1,166 @@
+// std/quantum/quantum_algo.nova — textbook quantum algorithms: Deutsch, Deutsch-Jozsa, Bernstein-Vazirani.
+// Imports std/quantum/quantum_state, std/quantum/quantum_gate1, std/quantum/quantum_measure.
+//
+// Representation (matches quantum_state.nova):
+//   COMPLEX number = 2-element list of floats [re, im].
+//   n-QUBIT STATE  = flat list of 2^n complex amplitudes, big-endian (qubit 0 = MSB).
+//   f(x) TABLE     = `fvals`, a list of 2^n ints (0/1), one per basis index x — the oracle
+//                    function table for a Boolean function f: {0,1}^n -> {0,1}.
+//
+// Algorithm (phase-kickback, no ancilla — works purely on the n-qubit query register):
+//   1. |0^n>.  2. H on every qubit -> uniform superposition.  3. PHASE ORACLE: amp[x] *= (-1)^f(x).
+//   4. H on every qubit again.  5. measure. For a constant f the amplitude returns EXACTLY to
+//   |0^n> (P=1); for a balanced f, P(|0^n>) is EXACTLY 0 (Walsh-Hadamard character orthogonality:
+//   sum_x (-1)^f(x) (-1)^{y.x} == 0 for y=0 whenever exactly half the (-1)^f(x) are +1 and half -1).
+//   Bernstein-Vazirani is the special case f(x) = parity(s & x) — a function that is linear in x,
+//   hence constant (s=0) or balanced (s!=0) — for which the SAME orthogonality identity collapses
+//   the final state to EXACTLY |s> with probability 1, for every hidden string s.
+//
+// Public API (prefix qal_):
+//   qal_is_constant(fvals)         -> int   1 if every element of fvals is equal, else 0
+//   qal_is_balanced(fvals)         -> int   1 if exactly half of fvals are 1 (len must be even), else 0
+//   qal_parity(a)                  -> int   popcount(a) mod 2, for a non-negative int a
+//   qal_deutsch(f0, f1)            -> int   Deutsch on f(0)=f0, f(1)=f1: 0=CONSTANT, 1=BALANCED
+//   qal_deutsch_jozsa(fvals)       -> int   Deutsch-Jozsa (fvals promised constant or balanced):
+//                                            0=CONSTANT, 1=BALANCED
+//   qal_bernstein_vazirani(s, n)   -> int   recovers hidden n-bit string s (0..2^n-1); result == s
+//
+// Internal (prefix _qal_):
+//   _qal_log2(dim)                  -> int   n such that 2^n == dim, found by doubling from 1
+//   _qal_apply_h_all(state, n)      -> list  apply Hadamard to every one of the n qubits
+//   _qal_phase_oracle(state, fvals) -> list  amp[x] *= -1 wherever fvals[x]==1 (mutates + returns state)
+
+import std/quantum/quantum_state
+import std/quantum/quantum_gate1
+import std/quantum/quantum_measure
+
+// ── internal helpers ────────────────────────────────────────────────────────
+
+// _qal_log2 — n such that 2^n == dim, found by doubling from 1 (dim is assumed
+// a power of 2, as guaranteed by an fvals table of length 2^n).
+fn _qal_log2(dim: int) -> int
+    let n = 0
+    let p = 1
+    while p < dim
+        p = p * 2
+        n = n + 1
+    n
+
+// _qal_apply_h_all — apply the Hadamard gate to every one of the n qubits of
+// `state`, in qubit order 0..n-1. Shared by every algorithm below so the
+// "H on every wire" step is written exactly once.
+fn _qal_apply_h_all(state: list, n: int) -> list
+    let out = state
+    let q = 0
+    while q < n
+        out = qg1_apply_h(out, q)
+        q = q + 1
+    out
+
+// _qal_phase_oracle — the phase-kickback oracle shared by Deutsch,
+// Deutsch-Jozsa and Bernstein-Vazirani: for every basis index x with
+// fvals[x]==1, multiply amp[x] by -1 (leave fvals[x]==0 amplitudes alone).
+// Mutates `state` in place (via qst_set_amp) and also returns it.
+fn _qal_phase_oracle(state: list, fvals: list) -> list
+    let dim = len(fvals)
+    let i = 0
+    while i < dim
+        if fvals[i] == 1
+            let a = qst_amp(state, i)
+            let flipped = qst_cscale(a, -1.0)
+            qst_set_amp(state, i, flipped)
+        i = i + 1
+    state
+
+// ── function-table predicates ───────────────────────────────────────────────
+
+// qal_is_constant — 1 if every element of fvals equals fvals[0], else 0.
+fn qal_is_constant(fvals: list) -> int
+    let n = len(fvals)
+    let first = fvals[0]
+    let i = 1
+    let ok = 1
+    while i < n
+        if fvals[i] != first
+            ok = 0
+        i = i + 1
+    ok
+
+// qal_is_balanced — 1 if exactly half of fvals are 1, else 0. Precondition:
+// len(fvals) is even (as guaranteed by an oracle table of length 2^n, n>=1).
+fn qal_is_balanced(fvals: list) -> int
+    let n = len(fvals)
+    let ones = 0
+    let i = 0
+    while i < n
+        if fvals[i] == 1
+            ones = ones + 1
+        i = i + 1
+    let half = n / 2
+    if ones == half
+        return 1
+    0
+
+// qal_parity — popcount(a) mod 2 for a non-negative int a, via a while loop
+// shifting right one bit at a time.
+fn qal_parity(a: int) -> int
+    let x = a
+    let p = 0
+    while x > 0
+        let bit = x & 1
+        p = p ^ bit
+        x = x >> 1
+    p
+
+// ── public algorithms ───────────────────────────────────────────────────────
+
+// qal_deutsch — Deutsch's algorithm on a 1-bit function f(0)=f0, f(1)=f1
+// (each 0/1). Runs the n=1 phase-kickback circuit and returns 0 if f is
+// CONSTANT (f0==f1), 1 if BALANCED (f0!=f1).
+fn qal_deutsch(f0: int, f1: int) -> int
+    let fvals = []
+    push(fvals, f0)
+    push(fvals, f1)
+    let state = qst_zero(1)
+    state = _qal_apply_h_all(state, 1)
+    state = _qal_phase_oracle(state, fvals)
+    state = _qal_apply_h_all(state, 1)
+    let p0 = qst_prob_x1000(state, 0)
+    if p0 == 1000
+        return 0
+    1
+
+// qal_deutsch_jozsa — Deutsch-Jozsa on an n-qubit oracle table fvals (length
+// 2^n), promised to be either constant or balanced. Runs the phase-kickback
+// circuit and returns 0 if P(|0^n>) rounds to 1000 (CONSTANT), else 1
+// (BALANCED, where P(|0^n>) is exactly 0).
+fn qal_deutsch_jozsa(fvals: list) -> int
+    let dim = len(fvals)
+    let n = _qal_log2(dim)
+    let state = qst_zero(n)
+    state = _qal_apply_h_all(state, n)
+    state = _qal_phase_oracle(state, fvals)
+    state = _qal_apply_h_all(state, n)
+    let p0 = qst_prob_x1000(state, 0)
+    if p0 == 1000
+        return 0
+    1
+
+// qal_bernstein_vazirani — recovers a hidden n-bit string s (0..2^n-1) given
+// black-box access to f(x) = parity(s & x). Builds the oracle table, runs the
+// phase-kickback circuit, and returns qms_most_likely(state), which is
+// exactly s with probability 1 (Walsh-Hadamard orthogonality).
+fn qal_bernstein_vazirani(s: int, n: int) -> int
+    let state = qst_zero(n)
+    let dim = qst_dim(state)
+    let fvals = []
+    let x = 0
+    while x < dim
+        let a = s & x
+        let f = qal_parity(a)
+        push(fvals, f)
+        x = x + 1
+    state = _qal_apply_h_all(state, n)
+    state = _qal_phase_oracle(state, fvals)
+    state = _qal_apply_h_all(state, n)
+    qms_most_likely(state)
