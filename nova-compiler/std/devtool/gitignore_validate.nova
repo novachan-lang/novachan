@@ -1,0 +1,145 @@
+// std/devtool/gitignore_validate.nova — lint .gitignore file text (or a single pattern) for
+// common real-world mistakes: patterns that match nothing useful, silently-stripped trailing
+// whitespace, accidental duplicates, negations that reference a pattern that was never added,
+// and a couple of other "this is probably not what you meant" shapes. Self-contained: imports
+// nothing.
+//
+// Every check reports a SEVERITY of "error" (the pattern is provably useless/broken) or
+// "warning" (probably a mistake, but might be intentional). See giv_check_pattern's doc
+// comment for the checks that apply to a single pattern in isolation, and giv_validate's for
+// the additional whole-file (duplicate / negation-history) checks.
+//
+// LIMITATIONS (documented, not silent): duplicate/negation-history checks compare exact
+// trimmed pattern TEXT only — no semantic equivalence ("build/" and "build" are treated as
+// different patterns, and a "!build/" negation is only linked to a prior literal "build/"
+// line, not "build"). The "#-that-isn't-really-a-comment" and escaped-character checks are
+// intentionally out of scope (this format has no escaped-"#" support to detect against).
+//
+// PREFIX: giv_
+//
+// Public API:
+//   giv_validate(text)        -> list    lint a whole .gitignore file's text; each issue is
+//                                          [line_num: int, severity: string, message: string]
+//   giv_check_pattern(pat)    -> list    lint ONE pattern string, context-free; each issue is
+//                                          [severity: string, message: string]
+//   giv_has_errors(issues)    -> int     1 if any issue in `issues` has severity "error"
+//   giv_format_issues(issues) -> string  human-readable multi-line report, one line per issue
+
+// _giv_pair(sev, msg) -> list : builds a [severity, message] issue pair.
+fn _giv_pair(sev: string, msg: string) -> list
+    let out = []
+    push(out, sev)
+    push(out, msg)
+    return out
+
+// _giv_prepend_line(line_num, pair) -> list : [severity, message] -> [line_num, severity, message].
+fn _giv_prepend_line(line_num: int, pair: list) -> list
+    let out = []
+    push(out, line_num)
+    push(out, pair[0])
+    push(out, pair[1])
+    return out
+
+// giv_check_pattern(pattern) -> list
+// Validates ONE pattern string with no file context (so it can't detect duplicates or
+// dangling negations — see giv_validate for those). Checks:
+//   ERROR   pattern is exactly "/" (after trimming)  -- matches nothing useful
+//   WARNING pattern is exactly "*" (after trimming)  -- ignores everything; can be correct at
+//                                                        the repo root, but we can't tell
+//                                                        context from a single pattern
+//   WARNING pattern has trailing whitespace          -- git silently strips it, so the
+//                                                        effective pattern differs from what
+//                                                        is shown in the file
+//   WARNING pattern contains a backslash              -- likely a Windows-path mistake
+//                                                        (gitignore always uses "/")
+// Returns a list of [severity, message] pairs, possibly empty.
+fn giv_check_pattern(pattern: string) -> list
+    let issues = []
+    let t = trim(pattern)
+    if t == "/"
+        push(issues, _giv_pair("error", "pattern is just \"/\" -- matches nothing useful"))
+    if t == "*"
+        push(issues, _giv_pair("warning", "pattern is bare \"*\" -- ignores everything; make sure this is intentional"))
+    let pn = len(pattern)
+    if pn > 0
+        let last = slice(pattern, pn - 1, pn)
+        if last == " " or last == "\t"
+            push(issues, _giv_pair("warning", "trailing whitespace -- git silently strips it, so the effective pattern differs from what is shown"))
+    if find(pattern, "\\") != -1
+        push(issues, _giv_pair("warning", "contains a backslash -- possible Windows-style path mistake (gitignore always uses forward slashes)"))
+    return issues
+
+// giv_validate(text) -> list
+// Lints a whole .gitignore file's text, line by line (1-based line numbers). Blank lines and
+// "#comment" lines are separators, not patterns, and are skipped entirely (not checked, and
+// not recorded into the duplicate/negation history). For every remaining pattern line:
+//   - every giv_check_pattern issue is reported at that line
+//   - WARNING duplicate pattern -- the exact same trimmed pattern text already appeared on an
+//     earlier line (this doubles as the "unreachable pattern" check: an exact duplicate can
+//     never do anything an earlier identical line didn't already do)
+//   - WARNING a "!negated" pattern whose body never appeared as a plain pattern earlier in
+//     the file (negating something that was never ignored has no effect)
+// A trailing "\r" (CRLF line endings) is stripped from every line before it is checked.
+fn giv_validate(text: string) -> list
+    let issues = []
+    let lines = split(text, "\n")
+    let seen = {}
+    let added = {}
+    let n = len(lines)
+    let i = 0
+    while i < n
+        let line_num = i + 1
+        let raw = lines[i]
+        let rn = len(raw)
+        if rn > 0 and slice(raw, rn - 1, rn) == "\r"
+            raw = slice(raw, 0, rn - 1)
+        let t = trim(raw)
+        if len(t) > 0 and slice(t, 0, 1) != "#"
+            let checks = giv_check_pattern(raw)
+            let ci = 0
+            let cn = len(checks)
+            while ci < cn
+                push(issues, _giv_prepend_line(line_num, checks[ci]))
+                ci = ci + 1
+            if contains(seen, t) == 1
+                let dup_msg = "duplicate pattern -- same as line " + str(seen[t]) + "; unreachable, already covered by an earlier identical pattern"
+                push(issues, _giv_prepend_line(line_num, _giv_pair("warning", dup_msg)))
+            else
+                seen[t] = line_num
+            let negated = 0
+            let body = t
+            if slice(t, 0, 1) == "!"
+                negated = 1
+                body = slice(t, 1, len(t))
+            if negated == 1
+                if contains(added, body) == 0
+                    let neg_msg = "negates pattern \"" + body + "\" that was never previously added in this file"
+                    push(issues, _giv_prepend_line(line_num, _giv_pair("warning", neg_msg)))
+            else
+                added[t] = 1
+        i = i + 1
+    return issues
+
+// giv_has_errors(issues) -> int : 1 if any issue in `issues` has severity "error".
+fn giv_has_errors(issues: list) -> int
+    let n = len(issues)
+    let i = 0
+    while i < n
+        if issues[i][1] == "error"
+            return 1
+        i = i + 1
+    return 0
+
+// giv_format_issues(issues) -> string : human-readable multi-line report, one line per issue.
+fn giv_format_issues(issues: list) -> string
+    let n = len(issues)
+    if n == 0
+        return "No issues found."
+    let lines = []
+    push(lines, str(n) + " issue(s) found:")
+    let i = 0
+    while i < n
+        let issue = issues[i]
+        push(lines, "  line " + str(issue[0]) + " [" + issue[1] + "] " + issue[2])
+        i = i + 1
+    return join(lines, "\n")

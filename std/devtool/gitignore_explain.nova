@@ -1,0 +1,296 @@
+// std/devtool/gitignore_explain — human-readable explanations for .gitignore pattern
+// matching decisions: WHY a given path is or isn't ignored, a full per-line trace, a
+// pattern-list summary, and detection of directly-conflicting pattern/negation pairs.
+// Self-contained: imports nothing (owns its own matcher — see LIMITATIONS below and
+// std/devtool/gitignore_layer for a fuller matcher with "**" + character-class support).
+//
+// `patterns` is a flat list of raw .gitignore-style lines, ONE PER LIST INDEX, and the
+// 1-based list index IS the reported "line number" (index 0 -> line 1). Blank lines and
+// "#comment" lines occupy a line number but are never a matching candidate.
+//
+// PUBLIC API:
+//   gie_explain(patterns, path, is_dir) -> string  human-readable reason path is/isn't
+//                                                    ignored, citing the deciding line
+//   gie_trace(patterns, path, is_dir)   -> list    per-pattern-line trace: list of
+//                                                    [pattern, line_num, status] where
+//                                                    status in {"match","no-match","negate"}
+//                                                    (comment/blank lines are omitted)
+//   gie_summary(patterns)               -> string  "<n> patterns (<i> ignore, <n> negate,
+//                                                    <c> comments)" — blank lines excluded
+//                                                    from every count
+//   gie_conflicts(patterns)             -> list    [pattern_body, ignore_line, negate_line]
+//                                                    for every body that appears BOTH plain
+//                                                    and "!"-negated somewhere in `patterns`
+//                                                    (first occurrence of each side is cited)
+//
+// MATCHING SEMANTICS (same documented subset as std/devtool/gitignore_negate — chosen to
+// cover the overwhelming majority of real-world .gitignore lines):
+//   - a pattern containing "/" (other than a single trailing directory marker) is ANCHORED:
+//     matched segment-by-segment against the full path, equal segment counts required
+//   - a pattern with no "/" (other than an optional trailing one) is UNANCHORED: matches if
+//     ANY single path segment (including the basename) matches it
+//   - "*" matches any run of characters except "/" (never crosses a segment); "?" matches
+//     exactly one character
+//   - a trailing "/" makes a pattern directory-only: it can only match when is_dir == 1
+//
+// LIMITATIONS (documented, not silent): no "**" (globstar) support and no "[...]" character
+// classes — see std/devtool/gitignore_star and std/devtool/gitignore_layer for those. Every
+// negation is evaluated independently (git's "cannot re-include under an excluded parent
+// directory" corner case is not modeled, matching the rest of this module family).
+
+// ---------------------------------------------------------------------------
+// private matcher (mirrors gitignore_negate's matcher; this module owns its own copy —
+// leaf module, no imports)
+// ---------------------------------------------------------------------------
+
+// _gie_split_slash(s) -> list : split s on "/" into path segments.
+fn _gie_split_slash(s: string) -> list
+    let out = []
+    let n = len(s)
+    let cur = ""
+    let i = 0
+    while i < n
+        let ch = slice(s, i, i + 1)
+        if ch == "/"
+            push(out, cur)
+            cur = ""
+        else
+            cur = cur + ch
+        i = i + 1
+    push(out, cur)
+    return out
+
+// _gie_glob(s, si, p, pi) -> int (1/0) : minimal recursive glob for one path segment.
+// "*" matches any run of characters (including empty); "?" matches exactly one character.
+fn _gie_glob(s: string, si: int, p: string, pi: int) -> int
+    let sn = len(s)
+    let pn = len(p)
+    if pi == pn and si == sn
+        return 1
+    if pi == pn
+        return 0
+    let pc = slice(p, pi, pi + 1)
+    if pc == "*"
+        let npi = pi + 1
+        while npi < pn and slice(p, npi, npi + 1) == "*"
+            npi = npi + 1
+        if _gie_glob(s, si, p, npi) == 1
+            return 1
+        if si < sn
+            return _gie_glob(s, si + 1, p, pi)
+        return 0
+    if si >= sn
+        return 0
+    if pc == "?"
+        return _gie_glob(s, si + 1, p, pi + 1)
+    if pc == slice(s, si, si + 1)
+        return _gie_glob(s, si + 1, p, pi + 1)
+    return 0
+
+// _gie_has_slash(s) -> int
+fn _gie_has_slash(s: string) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if slice(s, i, i + 1) == "/"
+            return 1
+        i = i + 1
+    return 0
+
+// _gie_match_segments(pattern, path) -> int : anchored match, equal segment counts required.
+fn _gie_match_segments(pattern: string, path: string) -> int
+    let pseg = _gie_split_slash(pattern)
+    let sseg = _gie_split_slash(path)
+    let pn = len(pseg)
+    if pn != len(sseg)
+        return 0
+    let i = 0
+    while i < pn
+        if _gie_glob(sseg[i], 0, pseg[i], 0) == 0
+            return 0
+        i = i + 1
+    return 1
+
+// _gie_match_any_segment(pattern, path) -> int : unanchored match against any one segment.
+fn _gie_match_any_segment(pattern: string, path: string) -> int
+    let sseg = _gie_split_slash(path)
+    let n = len(sseg)
+    let i = 0
+    while i < n
+        if _gie_glob(sseg[i], 0, pattern, 0) == 1
+            return 1
+        i = i + 1
+    return 0
+
+// _gie_pattern_matches(body, path, is_dir) -> int : does the (already un-negated) pattern
+// body match path? A trailing "/" directory marker is stripped and used to gate on is_dir.
+fn _gie_pattern_matches(body: string, path: string, is_dir: int) -> int
+    let pat = body
+    let dir_only = 0
+    let pn = len(pat)
+    if pn > 0 and slice(pat, pn - 1, pn) == "/"
+        dir_only = 1
+        pat = slice(pat, 0, pn - 1)
+    if dir_only == 1 and is_dir == 0
+        return 0
+    if len(pat) == 0
+        return 0
+    if _gie_has_slash(pat) == 1
+        let p2 = pat
+        if slice(p2, 0, 1) == "/"
+            p2 = slice(p2, 1, len(p2))
+        return _gie_match_segments(p2, path)
+    return _gie_match_any_segment(pat, path)
+
+// ---------------------------------------------------------------------------
+// line classification helpers (all take an already-trimmed line)
+// ---------------------------------------------------------------------------
+
+// _gie_is_blank(t) -> int : 1 if t (already trimmed) is empty.
+fn _gie_is_blank(t: string) -> int
+    if len(t) == 0
+        return 1
+    return 0
+
+// _gie_is_comment(t) -> int : t is already trimmed and non-blank.
+fn _gie_is_comment(t: string) -> int
+    if slice(t, 0, 1) == "#"
+        return 1
+    return 0
+
+// _gie_is_negated(t) -> int : t is already trimmed, non-blank, non-comment.
+fn _gie_is_negated(t: string) -> int
+    if slice(t, 0, 1) == "!"
+        return 1
+    return 0
+
+// _gie_index_of(items, target) -> int : first index of target in items, or -1.
+fn _gie_index_of(items: list, target: string) -> int
+    let n = len(items)
+    let i = 0
+    while i < n
+        if items[i] == target
+            return i
+        i = i + 1
+    return -1
+
+// ---------------------------------------------------------------------------
+// public API
+// ---------------------------------------------------------------------------
+
+// gie_explain(patterns, path, is_dir) -> string
+// Walks `patterns` top to bottom; the LAST matching (applicable) line decides the outcome,
+// exactly like real git. Reports which line and pattern decided it, or that nothing matched.
+fn gie_explain(patterns: list, path: string, is_dir: int) -> string
+    let had_match = 0
+    let last_negated = 0
+    let last_text = ""
+    let last_line = 0
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        let t = trim(patterns[i])
+        if _gie_is_blank(t) == 0
+            if _gie_is_comment(t) == 0
+                let negated = _gie_is_negated(t)
+                let body = t
+                if negated == 1
+                    body = slice(t, 1, len(t))
+                if _gie_pattern_matches(body, path, is_dir) == 1
+                    had_match = 1
+                    last_negated = negated
+                    last_text = t
+                    last_line = i + 1
+        i = i + 1
+    if had_match == 0
+        return "not ignored (no matching pattern)"
+    if last_negated == 1
+        return "negated by '" + last_text + "' (line " + str(last_line) + ")"
+    return "ignored by pattern '" + last_text + "' (line " + str(last_line) + ")"
+
+// gie_trace(patterns, path, is_dir) -> list
+// Full per-pattern-line trace: [pattern_text, line_num, status] for every non-blank,
+// non-comment line, in file order. status is "match" (an ignoring pattern matched),
+// "negate" (a "!"-pattern matched, i.e. actively un-ignores), or "no-match".
+fn gie_trace(patterns: list, path: string, is_dir: int) -> list
+    let out = []
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        let t = trim(patterns[i])
+        if _gie_is_blank(t) == 0
+            if _gie_is_comment(t) == 0
+                let negated = _gie_is_negated(t)
+                let body = t
+                if negated == 1
+                    body = slice(t, 1, len(t))
+                let status = "no-match"
+                if _gie_pattern_matches(body, path, is_dir) == 1
+                    if negated == 1
+                        status = "negate"
+                    else
+                        status = "match"
+                push(out, [t, i + 1, status])
+        i = i + 1
+    return out
+
+// gie_summary(patterns) -> string
+// "<total> patterns (<ignore> ignore, <negate> negate, <comments> comments)". Blank lines
+// are not patterns and are excluded from every count (including the total).
+fn gie_summary(patterns: list) -> string
+    let ignore_count = 0
+    let negate_count = 0
+    let comment_count = 0
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        let t = trim(patterns[i])
+        if _gie_is_blank(t) == 0
+            if _gie_is_comment(t) == 1
+                comment_count = comment_count + 1
+            else
+                if _gie_is_negated(t) == 1
+                    negate_count = negate_count + 1
+                else
+                    ignore_count = ignore_count + 1
+        i = i + 1
+    let total = ignore_count + negate_count + comment_count
+    return str(total) + " patterns (" + str(ignore_count) + " ignore, " + str(negate_count) + " negate, " + str(comment_count) + " comments)"
+
+// gie_conflicts(patterns) -> list
+// Finds every pattern body that appears BOTH as a plain (ignore) line and as a "!"-negated
+// line somewhere in `patterns` — a direct, almost-certainly-unintentional contradiction
+// (e.g. both "*.log" and "!*.log" present). Returns one [body, ignore_line, negate_line]
+// triple per conflicting body (the first occurrence of each side is cited), in the order
+// the ignore side first appears.
+fn gie_conflicts(patterns: list) -> list
+    let ignore_bodies = []
+    let ignore_lines = []
+    let negate_bodies = []
+    let negate_lines = []
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        let t = trim(patterns[i])
+        if _gie_is_blank(t) == 0
+            if _gie_is_comment(t) == 0
+                if _gie_is_negated(t) == 1
+                    let body = slice(t, 1, len(t))
+                    if _gie_index_of(negate_bodies, body) == -1
+                        push(negate_bodies, body)
+                        push(negate_lines, i + 1)
+                else
+                    if _gie_index_of(ignore_bodies, t) == -1
+                        push(ignore_bodies, t)
+                        push(ignore_lines, i + 1)
+        i = i + 1
+    let out = []
+    let j = 0
+    let m = len(ignore_bodies)
+    while j < m
+        let body = ignore_bodies[j]
+        let k = _gie_index_of(negate_bodies, body)
+        if k != -1
+            push(out, [body, ignore_lines[j], negate_lines[k]])
+        j = j + 1
+    return out

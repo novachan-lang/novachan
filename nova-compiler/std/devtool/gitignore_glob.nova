@@ -1,0 +1,197 @@
+// std/devtool/gitignore_glob — pure glob pattern matching for .gitignore
+// patterns, single-segment and multi-segment.
+//
+// WHAT: implements the glob syntax .gitignore patterns use within a single
+// "/"-delimited segment — "*" (any run of characters, including empty),
+// "?" (exactly one character), and bracket character classes "[abc]"
+// (one-of), "[a-z]" (range, inclusive on both ends by character code), and
+// their negated forms "[!abc]" / "[^abc]". A "*" or "?" never crosses a "/"
+// boundary; multi-segment matching (gig_match_path / gig_match_basename)
+// always splits on "/" first and matches each segment independently with
+// the single-segment matcher. (See std/devtool/gitignore_star for the
+// separate "**" globstar syntax, which this module does not implement.)
+//
+// LEAF module: imports nothing (self-contained).
+//
+// PREFIX: gig_
+//
+// Public API:
+//   gig_match(pattern, text)          -> int   single-segment glob match
+//   gig_match_path(pattern, path)     -> int   full "/"-anchored match:
+//                                                both split on "/", segment
+//                                                counts must be equal, each
+//                                                segment matched via
+//                                                gig_match
+//   gig_match_basename(pattern, path) -> int   unanchored: pattern must
+//                                                match at least one "/"-
+//                                                separated segment of path
+//   gig_char_class(ch, class_str, ci) -> list  matches one character `ch`
+//                                                against the bracket
+//                                                expression found in
+//                                                class_str starting at
+//                                                index ci (the index right
+//                                                after the opening "[").
+//                                                Returns
+//                                                [matched: int, next_index: int]
+//                                                where next_index is the
+//                                                index just past the
+//                                                matching closing "]"
+//                                                (ready to resume pattern
+//                                                scanning from there).
+//
+// LIMITATIONS: no escaping inside a bracket class (a literal "]" as the
+// first class member, e.g. "[]abc]", IS supported, but "\]" is not — a
+// backslash inside a class is just an ordinary literal character). A
+// malformed class with no closing "]" never matches (safe, does not crash).
+// gig_match is a single-segment matcher: "*" and "?" match any character
+// including "/"; for path matching where "*" must not cross "/" boundaries,
+// use gig_match_path or gig_match_basename, which pre-split on "/".
+
+// _gig_split_slash(s) -> list
+// Splits s on "/" into path segments (private helper; this module owns its
+// own copy since it may not import other std modules).
+fn _gig_split_slash(s) -> list
+    let out = []
+    let n = len(s)
+    let cur = ""
+    let i = 0
+    while i < n
+        let ch = slice(s, i, i + 1)
+        if ch == "/"
+            push(out, cur)
+            cur = ""
+        else
+            cur = cur + ch
+        i = i + 1
+    push(out, cur)
+    return out
+
+// gig_char_class(ch, class_str, ci) -> list
+// Parses the bracket expression in `class_str` starting at index `ci`
+// (the character right after the opening "["), decides whether `ch`
+// matches it, and returns [matched: int, next_index: int]. An optional
+// leading "!" or "^" negates the whole class. Members are either a single
+// literal character or an inclusive "a-z"-style range (compared by
+// character code via ord()). A "]" is treated as the closing delimiter
+// UNLESS it is the very first class member (immediately after "[" or after
+// a leading negation marker), matching the common glob convention that
+// lets "]" itself be a class member.
+fn gig_char_class(ch, class_str, ci) -> list
+    let n = len(class_str)
+    let i = ci
+    let negate = 0
+    if i < n
+        let c0 = slice(class_str, i, i + 1)
+        if c0 == "!" or c0 == "^"
+            negate = 1
+            i = i + 1
+    let matched = 0
+    let is_first = 1
+    while i < n
+        let c = slice(class_str, i, i + 1)
+        if c == "]" and is_first == 0
+            break
+        if i + 2 < n and slice(class_str, i + 1, i + 2) == "-" and slice(class_str, i + 2, i + 3) != "]"
+            let lo = c
+            let hi = slice(class_str, i + 2, i + 3)
+            if ord(ch) >= ord(lo) and ord(ch) <= ord(hi)
+                matched = 1
+            i = i + 3
+        else
+            if ch == c
+                matched = 1
+            i = i + 1
+        is_first = 0
+    let next_index = i
+    let found_close = 0
+    if next_index < n
+        if slice(class_str, next_index, next_index + 1) == "]"
+            found_close = 1
+            next_index = next_index + 1
+    let result_matched = 0
+    if found_close == 1
+        result_matched = matched
+        if negate == 1
+            if matched == 1
+                result_matched = 0
+            else
+                result_matched = 1
+    let out = []
+    push(out, result_matched)
+    push(out, next_index)
+    return out
+
+// _gig_core(s, si, p, pi) -> int (1/0)
+// Recursive single-segment glob matcher: "*" matches any run of characters
+// (including empty, via collapsing consecutive stars and backtracking one
+// character of `s` at a time), "?" matches exactly one character, "["
+// starts a bracket class handled by gig_char_class, everything else must
+// match `s` literally.
+fn _gig_core(s, si, p, pi) -> int
+    let sn = len(s)
+    let pn = len(p)
+    if pi == pn and si == sn
+        return 1
+    if pi == pn
+        return 0
+    let pc = slice(p, pi, pi + 1)
+    if pc == "*"
+        let npi = pi + 1
+        while npi < pn and slice(p, npi, npi + 1) == "*"
+            npi = npi + 1
+        if _gig_core(s, si, p, npi) == 1
+            return 1
+        if si < sn
+            return _gig_core(s, si + 1, p, pi)
+        return 0
+    if si >= sn
+        return 0
+    if pc == "?"
+        return _gig_core(s, si + 1, p, pi + 1)
+    if pc == "["
+        let cls = gig_char_class(slice(s, si, si + 1), p, pi + 1)
+        if cls[0] == 1
+            return _gig_core(s, si + 1, p, cls[1])
+        return 0
+    if pc == slice(s, si, si + 1)
+        return _gig_core(s, si + 1, p, pi + 1)
+    return 0
+
+// gig_match(pattern, text) -> int
+// Matches a single glob pattern (no "/" splitting) against text. Supports
+// "*", "?", and bracket classes — see module header. Returns 1 on a full
+// match, 0 otherwise.
+fn gig_match(pattern, text) -> int
+    return _gig_core(text, 0, pattern, 0)
+
+// gig_match_path(pattern, path) -> int
+// Matches a "/"-containing pattern against a full path: both are split on
+// "/" and must have the same number of segments; each segment pair is
+// matched independently via gig_match. Segment-count mismatch is always a
+// non-match (0), even if a "*" segment could conceivably absorb more).
+fn gig_match_path(pattern, path) -> int
+    let pseg = _gig_split_slash(pattern)
+    let tseg = _gig_split_slash(path)
+    let n = len(pseg)
+    if n != len(tseg)
+        return 0
+    let i = 0
+    while i < n
+        if gig_match(pseg[i], tseg[i]) == 0
+            return 0
+        i = i + 1
+    return 1
+
+// gig_match_basename(pattern, path) -> int
+// Unanchored match: `pattern` (itself containing no "/") is tested against
+// every "/"-separated segment of `path` in turn; a match on ANY segment
+// (not just the final basename) counts as a match.
+fn gig_match_basename(pattern, path) -> int
+    let tseg = _gig_split_slash(path)
+    let n = len(tseg)
+    let i = 0
+    while i < n
+        if gig_match(pattern, tseg[i]) == 1
+            return 1
+        i = i + 1
+    return 0

@@ -1,0 +1,284 @@
+// std/devtool/gitignore_match.nova — unified .gitignore pattern matching engine: combines
+// anchored/unanchored, directory-only, negation, and "**" globstar matching into ONE entry
+// point (gim_test), plus a pattern classifier and list-level filter/index helpers built on
+// top of it. Self-contained: imports nothing (owns its own glob/split/doublestar matchers,
+// like every other module in this family — see gitignore_star / gitignore_layer / etc. for
+// the same algorithms under a different prefix).
+//
+// MATCHING SEMANTICS (see gim_test's doc comment for the exact algorithm):
+//   - a "!" prefix is stripped before matching; gim_test reports whether the PATTERN BODY
+//     matches — callers decide what a match MEANS (ignore vs un-ignore) using the negation
+//     flag from gim_classify (gim_filter/gim_matching_patterns already do this for a list)
+//   - a trailing "/" makes a pattern directory-only: it can only match when is_dir == 1
+//   - a pattern whose body contains "/" (anywhere) is ANCHORED: it must match the full
+//     relative path, segment by segment
+//   - a pattern whose body contains no "/" is UNANCHORED: it matches if it matches ANY
+//     contiguous run of path segments (equivalently: as if "**/" were prepended)
+//   - within one segment: "*" = any run of characters (never crosses "/"), "?" = exactly one
+//     character, "[abc]"/"[a-z]" = character class, "[!abc]"/"[^abc]" = negated class
+//   - "**" as a WHOLE segment (not "a**b") is the globstar marker: zero or more whole path
+//     segments EXCEPT when it is the pattern's LAST segment ("foo/**"), which requires one
+//     or more remaining segments ("matches everything inside" — "foo/**" never matches "foo"
+//     itself; see _gim_segs_match's doc comment)
+//
+// PREFIX: gim_
+//
+// Public API:
+//   gim_test(pattern, path, is_dir)               -> int   1 if pattern matches path
+//   gim_classify(pattern)                         -> list  [body, negated, dir_only, anchored]
+//   gim_filter(patterns, path, is_dir)            -> int   1=ignored, 0=not (last-match-wins)
+//   gim_matching_patterns(patterns, path, is_dir) -> list  indices of every pattern that
+//                                                            matches (both plain and negated)
+
+// ---------------------------------------------------------------------------
+// single-segment glob matcher: "*", "?", "[...]" character classes (no "/")
+// ---------------------------------------------------------------------------
+
+// _gim_bracket(ch, p, pi) -> list [matched:int, next_pi:int]
+// Matches `ch` against a "[...]" class in `p` starting right after the "[" at pi. Supports
+// "!"/"^" negation and "a-z" ranges. A malformed class (no closing "]") never matches.
+fn _gim_bracket(ch: string, p: string, pi: int) -> list
+    let pn = len(p)
+    let negate = 0
+    let start = pi
+    if start < pn
+        let fc = slice(p, start, start + 1)
+        if fc == "!" or fc == "^"
+            negate = 1
+            start = start + 1
+    let end = start
+    let found = 0
+    let scan = start
+    while scan < pn and found == 0
+        if slice(p, scan, scan + 1) == "]"
+            end = scan
+            found = 1
+        else
+            scan = scan + 1
+    if found == 0
+        return [0, pi]
+    let matched = 0
+    let ci = start
+    while ci < end and matched == 0
+        let is_range = 0
+        if ci + 2 < end and slice(p, ci + 1, ci + 2) == "-"
+            is_range = 1
+        if is_range == 1
+            let lo = slice(p, ci, ci + 1)
+            let hi = slice(p, ci + 2, ci + 3)
+            let o = ord(ch)
+            if o >= ord(lo) and o <= ord(hi)
+                matched = 1
+            ci = ci + 3
+        else
+            if slice(p, ci, ci + 1) == ch
+                matched = 1
+            ci = ci + 1
+    if negate == 1
+        if matched == 1
+            matched = 0
+        else
+            matched = 1
+    return [matched, end + 1]
+
+// _gim_seg_core(s, si, p, pi) -> int (1/0)
+// Whole-string match of pattern p[pi..] against segment s[si..]: "*" (any run, incl. empty,
+// consecutive stars collapsed), "?" (exactly one char), "[...]" (character class via
+// _gim_bracket), everything else literal.
+fn _gim_seg_core(s: string, si: int, p: string, pi: int) -> int
+    let sn = len(s)
+    let pn = len(p)
+    if pi == pn
+        if si == sn
+            return 1
+        return 0
+    let pc = slice(p, pi, pi + 1)
+    if pc == "*"
+        let npi = pi + 1
+        while npi < pn and slice(p, npi, npi + 1) == "*"
+            npi = npi + 1
+        if _gim_seg_core(s, si, p, npi) == 1
+            return 1
+        if si < sn
+            return _gim_seg_core(s, si + 1, p, pi)
+        return 0
+    if si >= sn
+        return 0
+    let sc = slice(s, si, si + 1)
+    if pc == "?"
+        return _gim_seg_core(s, si + 1, p, pi + 1)
+    if pc == "["
+        let br = _gim_bracket(sc, p, pi + 1)
+        if br[0] == 1
+            return _gim_seg_core(s, si + 1, p, br[1])
+        return 0
+    if pc == sc
+        return _gim_seg_core(s, si + 1, p, pi + 1)
+    return 0
+
+// _gim_seg_match(s, p) -> int : does whole segment s fully match whole pattern-segment p?
+fn _gim_seg_match(s: string, p: string) -> int
+    return _gim_seg_core(s, 0, p, 0)
+
+// _gim_split_slash(s) -> list : splits s on "/" into path/pattern segments (private helper;
+// this module owns its own copy since it may not import other std modules).
+fn _gim_split_slash(s: string) -> list
+    let out = []
+    let n = len(s)
+    let cur = ""
+    let i = 0
+    while i < n
+        let ch = slice(s, i, i + 1)
+        if ch == "/"
+            push(out, cur)
+            cur = ""
+        else
+            cur = cur + ch
+        i = i + 1
+    push(out, cur)
+    return out
+
+// ---------------------------------------------------------------------------
+// segment-list matcher (handles "**" as a whole segment — the globstar marker)
+// ---------------------------------------------------------------------------
+
+// _gim_segs_match(pseg, pi, pn, tseg, ti, tn) -> int (1/0)
+// Does pseg[pi..pn) match tseg[ti..tn) EXACTLY, consuming every target segment in the range?
+// A pattern segment that is literally "**" is the globstar marker, matching the two relevant
+// documented placements from the gitignore spec (git-scm.com/docs/gitignore):
+//   - a TRAILING "**" (the LAST pattern segment, e.g. "foo/**") matches everything INSIDE:
+//     one or more remaining target segments, never zero — "foo/**" matches "foo/a" and
+//     "foo/a/b" but NOT "foo" itself.
+//   - a leading or middle "**" (e.g. "**/foo", "a/**/b") matches zero or more whole target
+//     segments (tried by backtracking: first consume none, then one, then two, ...).
+// Every other pattern segment must glob-match exactly one target segment (_gim_seg_match).
+fn _gim_segs_match(pseg: list, pi: int, pn: int, tseg: list, ti: int, tn: int) -> int
+    if pi == pn
+        if ti == tn
+            return 1
+        return 0
+    let cur = pseg[pi]
+    if cur == "**"
+        let is_trailing = 0
+        if pi + 1 == pn
+            is_trailing = 1
+        if is_trailing == 1
+            if ti >= tn
+                return 0
+            return 1
+        if _gim_segs_match(pseg, pi + 1, pn, tseg, ti, tn) == 1
+            return 1
+        if ti < tn
+            return _gim_segs_match(pseg, pi, pn, tseg, ti + 1, tn)
+        return 0
+    if ti >= tn
+        return 0
+    if _gim_seg_match(tseg[ti], cur) == 1
+        return _gim_segs_match(pseg, pi + 1, pn, tseg, ti + 1, tn)
+    return 0
+
+// _gim_match_body(body, anchored, path) -> int
+// Shared matcher used by both gim_test and the list-level helpers below: `body` is a pattern
+// body with negation "!" and the directory-only trailing "/" ALREADY stripped (as returned by
+// gim_classify — that gating happens in the caller, before this is reached). Splits body and
+// path on "/". An ANCHORED body must match the path's full segment list; an UNANCHORED body
+// (no "/") is matched as if "**/" were prepended, i.e. against any contiguous run of path
+// segments.
+fn _gim_match_body(body: string, anchored: int, path: string) -> int
+    let b = body
+    if len(b) > 0 and slice(b, 0, 1) == "/"
+        b = slice(b, 1, len(b))
+    let pseg = _gim_split_slash(b)
+    let tseg = _gim_split_slash(path)
+    if anchored == 1
+        return _gim_segs_match(pseg, 0, len(pseg), tseg, 0, len(tseg))
+    let upseg = []
+    push(upseg, "**")
+    let i = 0
+    let n = len(pseg)
+    while i < n
+        push(upseg, pseg[i])
+        i = i + 1
+    return _gim_segs_match(upseg, 0, len(upseg), tseg, 0, len(tseg))
+
+// ---------------------------------------------------------------------------
+// public API
+// ---------------------------------------------------------------------------
+
+// gim_classify(pattern) -> list
+// Classifies a single raw .gitignore pattern string: strips a leading "!" (-> negated) and
+// one trailing "/" (-> dir_only), then checks whether "/" remains anywhere in what's left
+// (-> anchored). Returns [body, negated, dir_only, anchored]. `body` may still have a leading
+// "/" — that is only stripped inside the matcher, per the gitignore spec's separate
+// "anchoring detection" vs. "path stripping" steps.
+fn gim_classify(pattern: string) -> list
+    let negated = 0
+    let body = pattern
+    if len(body) > 0 and slice(body, 0, 1) == "!"
+        negated = 1
+        body = slice(body, 1, len(body))
+    let dir_only = 0
+    let bn = len(body)
+    if bn > 0 and slice(body, bn - 1, bn) == "/"
+        dir_only = 1
+        body = slice(body, 0, bn - 1)
+    let anchored = 0
+    if find(body, "/") != -1
+        anchored = 1
+    let out = []
+    push(out, body)
+    push(out, negated)
+    push(out, dir_only)
+    push(out, anchored)
+    return out
+
+// gim_test(pattern, path, is_dir) -> int
+// Does ONE raw .gitignore pattern string match `path`? Handles: "!" prefix (stripped —
+// caller decides ignore-vs-negate via gim_classify/gim_filter), trailing "/" (directory-
+// only — fails immediately if is_dir == 0), "/" in body (anchored vs unanchored), "*"/"?"
+// glob, "[abc]"/"[a-z]"/"[!abc]" character classes, and "**" globstar (as a whole segment).
+// Returns 1 if pattern matches path, 0 otherwise.
+fn gim_test(pattern: string, path: string, is_dir: int) -> int
+    let cls = gim_classify(pattern)
+    let body = cls[0]
+    let dir_only = cls[2]
+    let anchored = cls[3]
+    if dir_only == 1 and is_dir == 0
+        return 0
+    if len(body) == 0
+        return 0
+    return _gim_match_body(body, anchored, path)
+
+// gim_filter(patterns, path, is_dir) -> int
+// Applies a list of raw pattern strings (as they'd appear in a .gitignore file, in file
+// order) using git's "last matching rule wins" semantics: a plain pattern that matches sets
+// ignored=1, a "!negated" pattern that matches sets ignored=0. Returns the final state:
+// 1 = ignored, 0 = not ignored.
+fn gim_filter(patterns: list, path: string, is_dir: int) -> int
+    let ignored = 0
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        let p = patterns[i]
+        if gim_test(p, path, is_dir) == 1
+            let cls = gim_classify(p)
+            if cls[1] == 1
+                ignored = 0
+            else
+                ignored = 1
+        i = i + 1
+    return ignored
+
+// gim_matching_patterns(patterns, path, is_dir) -> list
+// Returns the list of indices (into `patterns`) of every pattern that matches `path` — both
+// plain (would-ignore) and negated (would-un-ignore) matches are included; call gim_classify
+// on the pattern at each index to tell which is which.
+fn gim_matching_patterns(patterns: list, path: string, is_dir: int) -> list
+    let out = []
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        if gim_test(patterns[i], path, is_dir) == 1
+            push(out, i)
+        i = i + 1
+    return out

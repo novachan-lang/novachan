@@ -1,0 +1,195 @@
+// std/devtool/gitignore_negate — .gitignore negation pattern handling.
+//
+// WHAT: gitignore lines that begin with "!" negate (un-ignore) a previously
+// ignored path. Applying a list of gitignore rules in order, the LAST rule
+// that matches a given path decides whether it is ignored (negated => not
+// ignored, plain => ignored). This module implements that evaluation plus
+// small helpers for detecting/stripping the "!" prefix and for splitting a
+// raw rule list into its ignore/negate halves.
+//
+// Matching model (this module owns its own tiny matcher — leaf module, no
+// imports): a pattern containing "/" (anywhere) is ANCHORED — it must match
+// the full path, segment-by-segment (segment counts must be equal; a single
+// "*"/"?" does not cross a "/" boundary — see std/devtool/gitignore_star for
+// "**" handling). A pattern with no "/" (other than a possible trailing "/"
+// directory marker) is UNANCHORED — it matches if any single path segment
+// (i.e. any path component, including the basename) matches it. A trailing
+// "/" marks a directory-only pattern: it can only match when is_dir == 1.
+//
+// PREFIX: gin_
+//
+// Public API:
+//   gin_is_negated(line)              -> int     1 if line starts with "!"
+//   gin_strip_negation(line)          -> string  line with a leading "!" removed
+//   gin_apply(patterns, path, is_dir) -> int     1=ignored, 0=not-ignored (last match wins)
+//                                                 patterns: list of [pattern_str, is_negated_int]
+//   gin_split_rules(patterns)         -> list    [ignore_list, negate_list] (raw strings;
+//                                                 negate_list has "!" already stripped)
+
+// gin_is_negated(line) -> int
+// 1 if line starts with "!" (a gitignore negation rule), 0 otherwise.
+fn gin_is_negated(line) -> int
+    if len(line) == 0
+        return 0
+    if slice(line, 0, 1) == "!"
+        return 1
+    return 0
+
+// gin_strip_negation(line) -> string
+// Removes a single leading "!" if present; otherwise returns line unchanged.
+fn gin_strip_negation(line) -> string
+    if gin_is_negated(line) == 1
+        return slice(line, 1, len(line))
+    return line
+
+// gin_split_rules(patterns) -> list
+// Splits a list of raw pattern strings (some possibly "!"-prefixed) into
+// [ignore_list, negate_list]. ignore_list holds the plain (non-negated)
+// pattern strings unchanged; negate_list holds the negated ones with their
+// leading "!" stripped. Order within each list is preserved.
+fn gin_split_rules(patterns) -> list
+    let ignore_list = []
+    let negate_list = []
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        let p = patterns[i]
+        if gin_is_negated(p) == 1
+            push(negate_list, gin_strip_negation(p))
+        else
+            push(ignore_list, p)
+        i = i + 1
+    let result = []
+    push(result, ignore_list)
+    push(result, negate_list)
+    return result
+
+// _gin_split_slash(s) -> list
+// Splits s on "/" into path segments (private helper; this module owns its
+// own copy since it may not import other std modules).
+fn _gin_split_slash(s) -> list
+    let out = []
+    let n = len(s)
+    let cur = ""
+    let i = 0
+    while i < n
+        let ch = slice(s, i, i + 1)
+        if ch == "/"
+            push(out, cur)
+            cur = ""
+        else
+            cur = cur + ch
+        i = i + 1
+    push(out, cur)
+    return out
+
+// _gin_glob(s, si, p, pi) -> int (1/0)
+// Minimal recursive glob matcher for a single path segment: "*" matches any
+// run of characters (including empty), "?" matches exactly one character,
+// everything else matches literally.
+fn _gin_glob(s, si, p, pi) -> int
+    let sn = len(s)
+    let pn = len(p)
+    if pi == pn and si == sn
+        return 1
+    if pi == pn
+        return 0
+    let pc = slice(p, pi, pi + 1)
+    if pc == "*"
+        let npi = pi + 1
+        while npi < pn and slice(p, npi, npi + 1) == "*"
+            npi = npi + 1
+        if _gin_glob(s, si, p, npi) == 1
+            return 1
+        if si < sn
+            return _gin_glob(s, si + 1, p, pi)
+        return 0
+    if si >= sn
+        return 0
+    if pc == "?"
+        return _gin_glob(s, si + 1, p, pi + 1)
+    if pc == slice(s, si, si + 1)
+        return _gin_glob(s, si + 1, p, pi + 1)
+    return 0
+
+// _gin_match_segments(pattern, path) -> int
+// Anchored match: pattern and path must have the same number of "/"-
+// separated segments, each matching via _gin_glob.
+fn _gin_match_segments(pattern, path) -> int
+    let pseg = _gin_split_slash(pattern)
+    let sseg = _gin_split_slash(path)
+    let pn = len(pseg)
+    if pn != len(sseg)
+        return 0
+    let i = 0
+    while i < pn
+        if _gin_glob(sseg[i], 0, pseg[i], 0) == 0
+            return 0
+        i = i + 1
+    return 1
+
+// _gin_match_any_segment(pattern, path) -> int
+// Unanchored match: pattern must match at least one "/"-separated segment
+// of path (this covers matching the basename, or any intermediate directory
+// name, anywhere in the path).
+fn _gin_match_any_segment(pattern, path) -> int
+    let sseg = _gin_split_slash(path)
+    let n = len(sseg)
+    let i = 0
+    while i < n
+        if _gin_glob(sseg[i], 0, pattern, 0) == 1
+            return 1
+        i = i + 1
+    return 0
+
+// _gin_has_slash(s) -> int
+fn _gin_has_slash(s) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        if slice(s, i, i + 1) == "/"
+            return 1
+        i = i + 1
+    return 0
+
+// _gin_pattern_matches(pattern, path, is_dir) -> int
+// Decides whether a single (already un-negated) pattern string matches path.
+fn _gin_pattern_matches(pattern, path, is_dir) -> int
+    let pat = pattern
+    let dir_only = 0
+    let pn = len(pat)
+    if pn > 0 and slice(pat, pn - 1, pn) == "/"
+        dir_only = 1
+        pat = slice(pat, 0, pn - 1)
+    if dir_only == 1 and is_dir == 0
+        return 0
+    if len(pat) == 0
+        return 0
+    if _gin_has_slash(pat) == 1
+        let p2 = pat
+        if slice(p2, 0, 1) == "/"
+            p2 = slice(p2, 1, len(p2))
+        return _gin_match_segments(p2, path)
+    return _gin_match_any_segment(pat, path)
+
+// gin_apply(patterns, path, is_dir) -> int
+// patterns: list of [pattern_str, is_negated_int] pairs, in file order.
+// Applies gitignore's "last matching rule wins" semantics: walk the rules in
+// order, and whenever one matches, set the running ignored/not-ignored state
+// (negated rule => un-ignore, plain rule => ignore). Returns the final state:
+// 1 = ignored, 0 = not ignored.
+fn gin_apply(patterns, path, is_dir) -> int
+    let ignored = 0
+    let n = len(patterns)
+    let i = 0
+    while i < n
+        let rule = patterns[i]
+        let pat = rule[0]
+        let neg = rule[1]
+        if _gin_pattern_matches(pat, path, is_dir) == 1
+            if neg == 1
+                ignored = 0
+            else
+                ignored = 1
+        i = i + 1
+    return ignored

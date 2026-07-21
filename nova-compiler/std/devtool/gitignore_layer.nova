@@ -1,0 +1,358 @@
+// std/devtool/gitignore_layer.nova — layered .gitignore merging for nested directories,
+// the way git itself resolves ignore status: every .gitignore from the repo root down to
+// the target's own directory applies, and a pattern in a DEEPER .gitignore overrides one
+// in a SHALLOWER .gitignore (including un-ignoring via "!negation"). Self-contained:
+// imports nothing (duplicates a private wildcard matcher — see LIMITATIONS).
+//
+// A "layer" is a 2-element list: [dir_path: string, patterns: list<string>], one entry per
+// .gitignore file, `dir_path` being the directory (relative to repo root, "" for the root
+// itself) that file lives in and whose contents its patterns are relative to.
+//
+// PUBLIC API:
+//   gil_create_layer(dir_path, patterns)   -> list  build one layer record
+//   gil_merge(layers)                      -> list  layers reordered root -> leaf (stable
+//                                                     by original relative order at equal depth)
+//   gil_is_ignored(layers, filepath, is_dir) -> int  1 if filepath is ignored under all layers
+//   gil_applicable_layers(layers, filepath)  -> list layers whose dir_path is a (segment-wise)
+//                                                     prefix of filepath
+//
+// MATCHING SEMANTICS (subset of the gitignore spec, chosen to cover real-world .gitignore
+// files):
+//   - blank lines and "#comment" lines are skipped
+//   - "!pattern" negates: if it is the LAST matching line (across ALL applicable layers, in
+//     root->leaf then top->bottom order) the path is NOT ignored
+//   - a trailing "/" makes a pattern directory-only (see gitignore_dir for the same rule)
+//   - a pattern containing "/" anywhere but the very end is ANCHORED to its layer's
+//     directory; a pattern with no "/" (other than an optional trailing one) matches at any
+//     depth under its layer's directory
+//   - "*" matches any run of characters except "/"; "?" matches exactly one character except
+//     "/"; "[abc]"/"[a-z]"/"[!a-z]" are character classes; "**" as a whole path segment
+//     matches zero or more whole segments
+//   - matching an intermediate ancestor directory of `filepath` (e.g. pattern "build"
+//     matching a "build/" ancestor of "build/out/x.o") ignores everything below it, exactly
+//     like a real ignored directory is never descended into
+//
+// LIMITATIONS (documented, not silent):
+//   - git's rule that a file cannot be re-included by "!" if one of its PARENT directories
+//     is itself excluded is not modeled — every negation is evaluated independently. This
+//     matches the common case (negating within the same directory) but differs from git in
+//     the "un-ignore a file under an ignored directory" corner case.
+//   - "\ " escapes (escaped trailing space, escaped leading "#" or "!") are not interpreted.
+//   - backslashes in filepath/dir_path are normalized to "/" for Windows-friendliness.
+
+// ---------------------------------------------------------------------------
+// path helpers
+// ---------------------------------------------------------------------------
+
+// _gil_norm_slashes(s) -> string : backslashes -> forward slashes.
+fn _gil_norm_slashes(s: string) -> string
+    return replace(s, "\\", "/")
+
+// _gil_split_path(s) -> list : split on "/", dropping empty and "." segments.
+fn _gil_split_path(s: string) -> list
+    let raw = split(s, "/")
+    let out = []
+    let i = 0
+    let n = len(raw)
+    while i < n
+        let seg = raw[i]
+        if seg != ""
+            if seg != "."
+                push(out, seg)
+        i = i + 1
+    return out
+
+// _gil_pat_segs(s) -> list : split a (already leading-slash-stripped) pattern body on "/",
+// dropping only empty segments (a "." pattern segment is a literal, not a no-op).
+fn _gil_pat_segs(s: string) -> list
+    let raw = split(s, "/")
+    let out = []
+    let i = 0
+    let n = len(raw)
+    while i < n
+        if raw[i] != ""
+            push(out, raw[i])
+        i = i + 1
+    return out
+
+// _gil_norm_dir(d) -> string : canonical layer directory key ("" for repo root).
+fn _gil_norm_dir(d: string) -> string
+    let segs = _gil_split_path(_gil_norm_slashes(d))
+    return join(segs, "/")
+
+// ---------------------------------------------------------------------------
+// character-class / single-segment wildcard matcher (*, ?, [..]) — no "/" involved
+// ---------------------------------------------------------------------------
+
+// _gil_bracket(ch, p, pi) -> list [matched:int, next_pi:int]
+// Matches `ch` against a "[...]" class in `p` starting right after the "[" at pi.
+fn _gil_bracket(ch: string, p: string, pi: int) -> list
+    let pn = len(p)
+    let negate = 0
+    let start = pi
+    if start < pn
+        let fc = slice(p, start, start + 1)
+        if fc == "!"
+            negate = 1
+            start = start + 1
+        else
+            if fc == "^"
+                negate = 1
+                start = start + 1
+    let end = start
+    let found = 0
+    let scan = start
+    while scan < pn and found == 0
+        let sc = slice(p, scan, scan + 1)
+        if sc == "]"
+            end = scan
+            found = 1
+        else
+            scan = scan + 1
+    if found == 0
+        return [0, pi]
+    let matched = 0
+    let ci = start
+    while ci < end and matched == 0
+        let is_range = 0
+        if ci + 2 < end
+            if slice(p, ci + 1, ci + 2) == "-"
+                is_range = 1
+        if is_range == 1
+            let lo = slice(p, ci, ci + 1)
+            let hi = slice(p, ci + 2, ci + 3)
+            let o = ord(ch)
+            if o >= ord(lo)
+                if o <= ord(hi)
+                    matched = 1
+            ci = ci + 3
+        else
+            if slice(p, ci, ci + 1) == ch
+                matched = 1
+            ci = ci + 1
+    if negate == 1
+        if matched == 1
+            matched = 0
+        else
+            matched = 1
+    return [matched, end + 1]
+
+// _gil_core(s, si, p, pi) -> int : does p[pi..] match s[si..] fully (whole-string match)?
+fn _gil_core(s: string, si: int, p: string, pi: int) -> int
+    let sn = len(s)
+    let pn = len(p)
+    if pi == pn
+        if si == sn
+            return 1
+        return 0
+    let pc = slice(p, pi, pi + 1)
+    if pc == "*"
+        if _gil_core(s, si, p, pi + 1) == 1
+            return 1
+        if si < sn
+            return _gil_core(s, si + 1, p, pi)
+        return 0
+    if si >= sn
+        return 0
+    let sc = slice(s, si, si + 1)
+    if pc == "?"
+        return _gil_core(s, si + 1, p, pi + 1)
+    if pc == "["
+        let br = _gil_bracket(sc, p, pi + 1)
+        if br[0] == 1
+            return _gil_core(s, si + 1, p, br[1])
+        return 0
+    if pc == sc
+        return _gil_core(s, si + 1, p, pi + 1)
+    return 0
+
+// _gil_seg_eq(s, p) -> int : one path segment against one pattern segment.
+fn _gil_seg_eq(s: string, p: string) -> int
+    return _gil_core(s, 0, p, 0)
+
+// ---------------------------------------------------------------------------
+// segment-list matcher (handles "**" as a whole segment)
+// ---------------------------------------------------------------------------
+
+// _gil_segs_match(pseg, pi, pn, tseg, ti, tn) -> int
+// Does pseg[pi..pn) match tseg[ti..tn) exactly (consuming every target segment in range)?
+fn _gil_segs_match(pseg: list, pi: int, pn: int, tseg: list, ti: int, tn: int) -> int
+    if pi == pn
+        if ti == tn
+            return 1
+        return 0
+    let cur = pseg[pi]
+    if cur == "**"
+        if _gil_segs_match(pseg, pi + 1, pn, tseg, ti, tn) == 1
+            return 1
+        if ti < tn
+            return _gil_segs_match(pseg, pi, pn, tseg, ti + 1, tn)
+        return 0
+    if ti >= tn
+        return 0
+    if _gil_seg_eq(tseg[ti], cur) == 1
+        return _gil_segs_match(pseg, pi + 1, pn, tseg, ti + 1, tn)
+    return 0
+
+// _gil_try_from(pseg, pn, tseg, start, total, dir_only, is_dir) -> int
+// Tries pseg against every window tseg[start..end) for end in (start, total]. A window that
+// reaches `total` is a match on the final path component (dir_only gated by is_dir); a
+// window that ends before `total` is a match on an ANCESTOR directory of the target, which
+// always counts (ancestors are directories by construction) regardless of dir_only/is_dir.
+fn _gil_try_from(pseg: list, pn: int, tseg: list, start: int, total: int, dir_only: int, is_dir: int) -> int
+    let end = start + 1
+    let matched = 0
+    while end <= total and matched == 0
+        if _gil_segs_match(pseg, 0, pn, tseg, start, end) == 1
+            if end == total
+                if dir_only == 0
+                    matched = 1
+                else
+                    if is_dir == 1
+                        matched = 1
+            else
+                matched = 1
+        end = end + 1
+    return matched
+
+// _gil_pattern_matches(pseg, anchored, dir_only, tseg, is_dir) -> int
+// Top-level: for an anchored pattern only start=0 is tried; otherwise every start position
+// (equivalent to git's implicit "**/" prefix on a slash-free pattern).
+fn _gil_pattern_matches(pseg: list, anchored: int, dir_only: int, tseg: list, is_dir: int) -> int
+    let total = len(tseg)
+    let pn = len(pseg)
+    if total == 0
+        return 0
+    if anchored == 1
+        return _gil_try_from(pseg, pn, tseg, 0, total, dir_only, is_dir)
+    let start = 0
+    let matched = 0
+    while start < total and matched == 0
+        if _gil_try_from(pseg, pn, tseg, start, total, dir_only, is_dir) == 1
+            matched = 1
+        start = start + 1
+    return matched
+
+// ---------------------------------------------------------------------------
+// public API
+// ---------------------------------------------------------------------------
+
+// gil_create_layer(dir_path, patterns) -> list
+// Builds a layer record [normalized_dir_path, patterns].
+fn gil_create_layer(dir_path: string, patterns: list) -> list
+    return [_gil_norm_dir(dir_path), patterns]
+
+// _gil_depth(lyr) -> int : number of path segments in a layer's directory (0 = repo root).
+fn _gil_depth(lyr: list) -> int
+    return len(_gil_split_path(lyr[0]))
+
+// gil_merge(layers) -> list
+// Returns `layers` reordered so shallower directories come first (root -> leaf). Stable:
+// layers at the same depth keep their original relative order.
+fn gil_merge(layers: list) -> list
+    let out = []
+    let n = len(layers)
+    let i = 0
+    while i < n
+        let lyr = layers[i]
+        let d = _gil_depth(lyr)
+        let result = []
+        let inserted = 0
+        let j = 0
+        let m = len(out)
+        while j < m
+            let existing = out[j]
+            if inserted == 0
+                if d < _gil_depth(existing)
+                    push(result, lyr)
+                    inserted = 1
+            push(result, existing)
+            j = j + 1
+        if inserted == 0
+            push(result, lyr)
+        out = result
+        i = i + 1
+    return out
+
+// _gil_is_prefix(dir_segs, path_segs) -> int : is dir_segs a segment-wise prefix of path_segs?
+fn _gil_is_prefix(dir_segs: list, path_segs: list) -> int
+    let dn = len(dir_segs)
+    let pn = len(path_segs)
+    if dn > pn
+        return 0
+    let i = 0
+    while i < dn
+        if dir_segs[i] != path_segs[i]
+            return 0
+        i = i + 1
+    return 1
+
+// gil_applicable_layers(layers, filepath) -> list
+// Layers whose directory is a prefix of `filepath` (the root layer, dir_path == "", always
+// applies). Relative order of the input `layers` is preserved.
+fn gil_applicable_layers(layers: list, filepath: string) -> list
+    let path_segs = _gil_split_path(_gil_norm_slashes(filepath))
+    let out = []
+    let i = 0
+    let n = len(layers)
+    while i < n
+        let lyr = layers[i]
+        let dir_segs = _gil_split_path(lyr[0])
+        if _gil_is_prefix(dir_segs, path_segs) == 1
+            push(out, lyr)
+        i = i + 1
+    return out
+
+// gil_is_ignored(layers, filepath, is_dir) -> int
+// 1 if `filepath` is ignored once every applicable layer's patterns are applied in
+// root -> leaf, top -> bottom order (last matching line wins; "!" un-ignores).
+fn gil_is_ignored(layers: list, filepath: string, is_dir: int) -> int
+    let norm_path = _gil_norm_slashes(filepath)
+    let path_segs = _gil_split_path(norm_path)
+    let ordered = gil_merge(layers)
+    let applicable = gil_applicable_layers(ordered, norm_path)
+    let ignored = 0
+    let li = 0
+    let ln = len(applicable)
+    while li < ln
+        let lyr = applicable[li]
+        let dir_segs = _gil_split_path(lyr[0])
+        let rel_segs = []
+        let k = len(dir_segs)
+        while k < len(path_segs)
+            push(rel_segs, path_segs[k])
+            k = k + 1
+        if len(rel_segs) > 0
+            let patterns = lyr[1]
+            let pi = 0
+            let pn = len(patterns)
+            while pi < pn
+                let t = trim(patterns[pi])
+                if len(t) > 0
+                    if slice(t, 0, 1) != "#"
+                        let negate = 0
+                        let body = t
+                        if slice(body, 0, 1) == "!"
+                            negate = 1
+                            body = slice(body, 1, len(body))
+                        let dir_only = 0
+                        if len(body) > 0
+                            if slice(body, len(body) - 1, len(body)) == "/"
+                                dir_only = 1
+                                body = slice(body, 0, len(body) - 1)
+                        let anchored = 0
+                        if find(body, "/") != -1
+                            anchored = 1
+                        let body2 = body
+                        if len(body2) > 0
+                            if slice(body2, 0, 1) == "/"
+                                body2 = slice(body2, 1, len(body2))
+                        let pseg = _gil_pat_segs(body2)
+                        if _gil_pattern_matches(pseg, anchored, dir_only, rel_segs, is_dir) == 1
+                            if negate == 1
+                                ignored = 0
+                            else
+                                ignored = 1
+                pi = pi + 1
+        li = li + 1
+    return ignored
