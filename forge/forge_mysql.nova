@@ -337,9 +337,24 @@ fn mysql_query(conn, sql: string) -> any
     ok(rows)
 
 // ---- prepared statements (binary protocol) ----------------------------------------------------------
+// PRIVATE: left-pad an int to at least 2 / exactly 6 digits (temporal formatting).
+fn _my_z2(n: int) -> string
+    let s = str(n)
+    if len(s) < 2
+        return "0" + s
+    s
+
+fn _my_z6(n: int) -> string
+    let s = str(n)
+    while len(s) < 6
+        s = "0" + s
+    s
+
 // Decode ONE binary-protocol value at `off` for column type `t` -> [string, next_off]. Integers ->
-// decimal string; string/decimal/blob/json -> lenenc string; float/double + date/time are advanced
-// correctly but not yet decoded (return "" -- v1 gap). _my_u is unsigned (fine for ids/counts).
+// decimal string; string/decimal/blob/json -> lenenc string; DATE/DATETIME/TIMESTAMP/TIME decode to
+// ISO strings (below). FLOAT(4)/DOUBLE(5) still return "" -- exact IEEE-754 reinterpret needs an
+// f64_from_bits builtin (tracked follow-on); manual reconstruction hits NOVA int/float-coercion gaps.
+// _my_u is unsigned (fine for ids/counts).
 fn _my_bin_val(b, off: int, t: int) -> any
     if t == 1
         return [str(_my_u(b, off, 1)), off + 1]
@@ -353,8 +368,53 @@ fn _my_bin_val(b, off: int, t: int) -> any
         return ["", off + 4]
     if t == 5
         return ["", off + 8]
+    // binary DATE(10)/DATETIME(12)/TIMESTAMP(7): a length byte then that many payload bytes (0/4/7/11).
+    // 4 = date only; 7 = + time; 11 = + microseconds. year is 2-byte LE, the rest single bytes.
+    if t == 10 or t == 12 or t == 7
+        let dlen = _my_u(b, off, 1)
+        let dp = off + 1
+        if dlen == 0
+            return ["0000-00-00", dp]
+        let yr = _my_u(b, dp, 2)
+        let mo = _my_u(b, dp + 2, 1)
+        let dy = _my_u(b, dp + 3, 1)
+        let dstr = str(yr) + "-" + _my_z2(mo) + "-" + _my_z2(dy)
+        if dlen == 4
+            return [dstr, dp + 4]
+        let hh = _my_u(b, dp + 4, 1)
+        let mi = _my_u(b, dp + 5, 1)
+        let se = _my_u(b, dp + 6, 1)
+        let tstr = dstr + " " + _my_z2(hh) + ":" + _my_z2(mi) + ":" + _my_z2(se)
+        if dlen == 7
+            return [tstr, dp + 7]
+        let dus = _my_u(b, dp + 7, 4)
+        return [tstr + "." + _my_z6(dus), dp + 11]
+    // binary TIME(11): length byte then sign(1) days(4 LE) hour(1) min(1) sec(1) [micros(4 LE)] (0/8/12).
+    // MySQL TIME can exceed 24h (up to 838:59:59), so total hours = days*24 + hour (may be >2 digits).
+    if t == 11
+        let tlen = _my_u(b, off, 1)
+        let tp = off + 1
+        if tlen == 0
+            return ["00:00:00", tp]
+        let neg = _my_u(b, tp, 1)
+        let days = _my_u(b, tp + 1, 4)
+        let th = _my_u(b, tp + 5, 1)
+        let tmi = _my_u(b, tp + 6, 1)
+        let tse = _my_u(b, tp + 7, 1)
+        let sign = ""
+        if neg == 1
+            sign = "-"
+        let base = sign + _my_z2(days * 24 + th) + ":" + _my_z2(tmi) + ":" + _my_z2(tse)
+        if tlen == 8
+            return [base, tp + 8]
+        let tus = _my_u(b, tp + 8, 4)
+        return [base + "." + _my_z6(tus), tp + 12]
     let sres = _my_lenenc_str(b, off)
     [sres[0], sres[1]]
+
+// Public seam over _my_bin_val for offline testing: decode one binary-protocol value -> [str, next_off].
+fn mysql_bin_val(b, off: int, t: int) -> any
+    _my_bin_val(b, off, t)
 
 // Read num_def column-definition packets -> [names, types, leftover_buf], then consume the trailing EOF.
 fn _my_read_coldefs(sock: int, buf, n: int) -> any
