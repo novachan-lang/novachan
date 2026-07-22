@@ -63,7 +63,7 @@ Legend: **[rt]** runtime · **[cc]** compiler · **[fg]** Forge/lib · **[std]**
 |---|---|---|---|---|
 | 32 | L11 module-symbol namespacing (`@mod__fn` mangling) — DO FIRST; hard link-error wall; prereq for L1 + registry | [lang] | M | |
 | 33 | ✅ **DONE 2026-07-22** — L12 multi-line collection literals (`[...]`/`{...}` newline-as-whitespace, list + dict) | [lang] | S | reconverged + both-mode arc 2694/0/33 |
-| 34 | L13 keyword-as-variable diagnostic (clean E-code for `let match = …`) | [lang] | S | pure parser |
+| 34 | ✅ **DONE 2026-07-22** — L13 keyword-as-variable diagnostic (rejects hard keywords {match,loop,type,unsafe}; contextual like `matches` stay usable) | [lang] | S | reconverged + negative-reject gate + arc 2695/0/33 |
 | 35 | L6 enforced immutability (`let` vs `let mut`, shallow; warn-then-error migration) | [lang] | M | correctness + alias analysis |
 | 36 | L7 sized/unsigned numerics + f32 (suffix literals; HM-integrated; checked narrowing; flat arrays) | [lang] | M | folds `1<<64` guard; unblocks L5/embedded/wire/GPU |
 | 37 | L8 custom index/iterator/call operators (structural `index`/`iter`+`next`/`call`) | [lang] | M | unblocks Cortex/Pulse |

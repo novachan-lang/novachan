@@ -49,6 +49,7 @@ Test-ShouldReject "_negty_notfn.nova"      "type mismatch"
 Test-ShouldReject "_negty_nofield.nova"    "has no field"
 Test-ShouldReject "_negty_fieldtype.nova"  "type mismatch"
 Test-ShouldReject "_negty_exhaustive.nova" "non-exhaustive"
+Test-ShouldReject "_negty_keyword.nova"    "reserved keyword"
 Test-ShouldReject "_negty_traitconf.nova"  "does not fully implement"
 
 # Previously-orphaned negative tests reclaimed from the *_test.nova sweep (CORE_GAP 7.3): real programs
