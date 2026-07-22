@@ -4,58 +4,85 @@
 // the socket glue just pumps bytes until one full reply is buffered. Redis is NOVA's caching / session-store /
 // rate-limit / pub-sub backend. Commands: get/set/del/exists/incr/expire/ping + a generic redis_command.
 //
-// Uses tcp_connect/tcp_send/tcp_recv/tcp_close builtins. NO module imports.
+// BINARY-SAFE END-TO-END. Redis values are arbitrary byte strings (they routinely hold images, protobuf,
+// msgpack sessions -- data with embedded 0x00). This driver therefore carries VALUES as the `bytes` type on
+// BOTH directions: resp_encode builds the wire with bytes ops and sends via tcp_send_bytes; resp_parse returns
+// bulk values as `bytes` (via bytes_slice, length-delimited). The earlier string-based version truncated any
+// value at the first 0x00 (NOVA strings are C-string-delimited) AND desynced framing when a reply chunk held a
+// 0x00 -- silent data corruption. Text convenience wrappers (redis_get/redis_set) still take/return `string`
+// for the common UTF-8 case; the *_bytes variants are the binary-safe primitives.
+//
+// Uses tcp_connect/tcp_send_bytes/tcp_recv_bytes/tcp_close builtins. NO module imports.
 
-// Encode a command (list of string args) as a RESP array of bulk strings.
-fn resp_encode(args: list) -> string
-    let crlf = chr(13) + chr(10)
-    let out = "*" + str(len(args)) + crlf
+// PRIVATE: CRLF as a string (0x0D 0x0A). Built via chr() -- never rely on backslash escapes.
+fn _redis_crlf() -> string
+    chr(13) + chr(10)
+
+// Encode a command (list of `bytes` args) as a RESP array of bulk strings -> the wire as `bytes`.
+// Every arg is bytes so binary values survive intact. Headers ("*N", "$len") are ASCII (0x00-free).
+fn resp_encode(args: list) -> any
+    let out = bytes(0)
+    out = bytes_append_str(out, "*" + str(len(args)) + _redis_crlf())
     let i = 0
     while i < len(args)
-        let a = str(args[i])
-        out = out + "$" + str(len(a)) + crlf + a + crlf
+        let a = args[i]
+        out = bytes_append_str(out, "$" + str(bytes_len(a)) + _redis_crlf())
+        out = bytes_concat(out, a)
+        out = bytes_append_str(out, _redis_crlf())
         i = i + 1
     out
 
-// PRIVATE: index of the CRLF pair at/after `from`, or -1 if none complete yet.
-fn _resp_find_crlf(buf: string, from: int) -> int
-    let n = len(buf)
+// PRIVATE: index of the CRLF pair at/after `from` in bytes `b`, or -1 if none complete yet.
+fn _resp_find_crlf(b, from: int) -> int
+    let n = bytes_len(b)
     let i = from
+    let found = -1
     while i + 1 < n
-        if char_at(buf, i) == chr(13) and char_at(buf, i + 1) == chr(10)
-            return i
+        if bytes_get(b, i) == 13 and bytes_get(b, i + 1) == 10
+            found = i
+            i = n
         i = i + 1
-    -1
+    found
 
-// Parse ONE RESP reply from `buf` at `off`. Returns [kind, value, next_off]:
+// PRIVATE: extract bytes [from, upto) of `b` as an ASCII string. Used ONLY for RESP headers and simple/
+// error lines, which are protocol-guaranteed 0x00-free -- never for bulk data (that stays `bytes`).
+fn _resp_line_str(b, from: int, upto: int) -> string
+    let s = ""
+    let i = from
+    while i < upto
+        s = s + chr(bytes_get(b, i))
+        i = i + 1
+    s
+
+// Parse ONE RESP reply from bytes `buf` at `off`. Returns [kind, value, next_off]:
 //   kind = "str"|"int"|"bulk"|"nil"|"array"|"err"|"incomplete"
-//   value = string (str/err/bulk), int (int), list (array), "" (nil/incomplete)
+//   value = string (str/err) | int (int) | bytes (bulk) | list (array) | "" (nil/incomplete)
 //   next_off = index just past this reply (== off when incomplete, so the caller reads more bytes).
-fn resp_parse(buf: string, off: int) -> list
-    let n = len(buf)
+fn resp_parse(buf, off: int) -> list
+    let n = bytes_len(buf)
     if off >= n
         return ["incomplete", "", off]
-    let t = char_at(buf, off)
+    let t = bytes_get(buf, off)
     let eol = _resp_find_crlf(buf, off + 1)
     if eol < 0
         return ["incomplete", "", off]
-    let line = slice(buf, off + 1, eol)
+    let line = _resp_line_str(buf, off + 1, eol)
     let after = eol + 2
-    if t == "+"
+    if t == 43
         return ["str", line, after]
-    if t == "-"
+    if t == 45
         return ["err", line, after]
-    if t == ":"
+    if t == 58
         return ["int", parse_int(line), after]
-    if t == "$"
+    if t == 36
         let blen = parse_int(line)
         if blen < 0
             return ["nil", "", after]
         let bend = after + blen
         if bend + 2 > n
             return ["incomplete", "", off]
-        return ["bulk", slice(buf, after, bend), bend + 2]
-    if t == "*"
+        return ["bulk", bytes_slice(buf, after, bend), bend + 2]
+    if t == 42
         let count = parse_int(line)
         if count < 0
             return ["nil", "", after]
@@ -77,46 +104,68 @@ fn resp_parse(buf: string, off: int) -> list
 fn redis_connect(host: string, port: int) -> Result<int>
     tcp_connect(host, port)
 
-// Send a command (list of args) and read exactly one full reply -> [kind, value]. Pumps tcp_recv until
-// resp_parse reports a complete reply. A closed connection mid-reply -> ["err","connection closed"].
+// Send a command (list of `bytes` args) and read exactly one full reply -> [kind, value]. Pumps
+// tcp_recv_bytes until resp_parse reports a complete reply. Closed connection mid-reply -> ["err",...].
 fn redis_command(sock: int, args: list) -> list
-    tcp_send(sock, resp_encode(args))
-    let buf = ""
+    tcp_send_bytes(sock, resp_encode(args))
+    let buf = bytes(0)
     let parsed = resp_parse(buf, 0)
     while parsed[0] == "incomplete"
-        let chunk = tcp_recv(sock)
-        if len(chunk) == 0
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
             return ["err", "connection closed"]
-        buf = buf + chunk
+        buf = bytes_concat(buf, chunk)
         parsed = resp_parse(buf, 0)
     [parsed[0], parsed[1]]
 
-// SET key value -> true on +OK.
+// PRIVATE: build a command arg list (all `bytes`) from a command name + string args.
+fn _redis_args(parts: list) -> list
+    let out = []
+    let i = 0
+    while i < len(parts)
+        push(out, str_to_bytes(parts[i]))
+        i = i + 1
+    out
+
+// SET key value (text) -> true on +OK. For binary values use redis_set_bytes.
 fn redis_set(sock: int, key: string, value: string) -> bool
-    let r = redis_command(sock, ["SET", key, value])
+    let r = redis_command(sock, _redis_args(["SET", key, value]))
     r[0] == "str" and r[1] == "OK"
 
-// GET key -> [found, value] (found=false for a missing key so "" the value is unambiguous).
+// SET key value (binary-safe) -> true on +OK. `value` is `bytes` (may contain 0x00).
+fn redis_set_bytes(sock: int, key: string, value) -> bool
+    let r = redis_command(sock, [str_to_bytes("SET"), str_to_bytes(key), value])
+    r[0] == "str" and r[1] == "OK"
+
+// GET key -> [found, value] as a text string (found=false for a missing key). Binary values TRUNCATE at
+// the first 0x00 on the bytes->string conversion -- use redis_get_bytes for binary payloads.
 fn redis_get(sock: int, key: string) -> list
-    let r = redis_command(sock, ["GET", key])
+    let r = redis_command(sock, _redis_args(["GET", key]))
     if r[0] == "nil"
         return [false, ""]
+    [true, bytes_to_str(r[1])]
+
+// GET key -> [found, value] as `bytes` (binary-safe; preserves embedded 0x00).
+fn redis_get_bytes(sock: int, key: string) -> list
+    let r = redis_command(sock, _redis_args(["GET", key]))
+    if r[0] == "nil"
+        return [false, bytes(0)]
     [true, r[1]]
 
 fn redis_del(sock: int, key: string) -> int
-    (redis_command(sock, ["DEL", key]))[1]
+    (redis_command(sock, _redis_args(["DEL", key])))[1]
 
 fn redis_exists(sock: int, key: string) -> bool
-    (redis_command(sock, ["EXISTS", key]))[1] == 1
+    (redis_command(sock, _redis_args(["EXISTS", key])))[1] == 1
 
 fn redis_incr(sock: int, key: string) -> int
-    (redis_command(sock, ["INCR", key]))[1]
+    (redis_command(sock, _redis_args(["INCR", key])))[1]
 
 fn redis_expire(sock: int, key: string, seconds: int) -> int
-    (redis_command(sock, ["EXPIRE", key, str(seconds)]))[1]
+    (redis_command(sock, _redis_args(["EXPIRE", key, str(seconds)])))[1]
 
 fn redis_ping(sock: int) -> bool
-    (redis_command(sock, ["PING"]))[0] == "str"
+    (redis_command(sock, _redis_args(["PING"])))[0] == "str"
 
 fn redis_close(sock: int)
     tcp_close(sock)
