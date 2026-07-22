@@ -38,7 +38,7 @@ Legend: **[rt]** runtime · **[cc]** compiler · **[fg]** Forge/lib · **[std]**
 | 14 | D2 BigDecimal — **✅ EXISTS+GATED** (`std/numeric/decimal` tracked + `_decimal_test` in manifest; verify completeness) | [fg] | L | after #13 |
 | 15 | Argon2id password hashing — **✅ DONE** (`std/crypto/argon2id` tracked + `_argon2id_test` gated) | [fg] | M | best-practice storage |
 | 16 | S2 HTTP-client redirects/cookies/proxy — **EXISTS-UNGATED** (`forge/forge_http_client` tracked, no gated test; needs a live/mock-server KAT) | [fg] | M | attended (network test) |
-| 17 | S3 sync primitives — **EXISTS-UNGATED** (`std/sync/mutex` tracked, no gated test; needs a concurrency KAT) | [rt] | M | attended (concurrency test) |
+| 17 | S3 sync primitives — **✅ DONE** (`std/sync/mutex`+`semaphore` tracked; `_sync_test` gated single-threaded; added `_syncmutex_test` verifying mutual exclusion under N=1 AND N=4 contention) | [rt] | M | |
 | 18 | S5 file perms/symlinks (chmod/umask/symlink/readlink) — **MISSING** (needs runtime C) | [rt] | M | attended (runtime) |
 | 19 | S6 unix domain sockets — genuinely MISSING (runtime; Win AF_UNIX+netpoller caveat) | [rt] | M | |
 | 20 | D9 binary pack/unpack — **✅ DONE** (`std/encoding/pack` tracked + `_pack_test` gated) | [std] | M | |

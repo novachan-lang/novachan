@@ -1,0 +1,108 @@
+// KAT for std/sync/mutex (channel-token lock). Deterministic, hangs-or-fails loudly on defect.
+//
+// Existing coverage this test does NOT duplicate:
+//   _sync_test.nova            — single-threaded try_lock state machine for mutex + semaphore.
+//   showcase_concurrency_test.nova — spawned-task contention for std/sync/SEMAPHORE (peak<=2).
+// This test adds the one thing neither covers: spawned-task mutual-exclusion for the MUTEX
+// itself (peak concurrency inside a lock()/unlock()-guarded section must never exceed 1).
+import std/sync/mutex
+
+// worker: R rounds of "lock -> bump/record peak in a shared gauge -> widen the window with a
+// busy-spin (so real overlap would actually be observed under NOVA_CARRIERS>1) -> unbump ->
+// unlock". state_ch is a CHANNEL -> shared by identity across spawned tasks (the only way to
+// share mutable state across processes in NOVA's isolation model); m is likewise a channel
+// under the hood (mutex_new() = channel_bounded(1) + token). Signals done at the end.
+fn worker(id, m, state_ch, done_ch, R)
+    let r = 0
+    while r < R
+        lock(m)
+        let st = recv(state_ch)
+        st["cur"] = st["cur"] + 1
+        if st["cur"] > st["max"]
+            st["max"] = st["cur"]
+        send(state_ch, st)
+        // widen the critical-section window so a broken mutex would show overlap
+        let spin = 0
+        while spin < 500
+            spin = spin + 1
+        let st2 = recv(state_ch)
+        st2["cur"] = st2["cur"] - 1
+        st2["total"] = st2["total"] + 1
+        send(state_ch, st2)
+        unlock(m)
+        r = r + 1
+    send(done_ch, id)
+
+fn main()
+    // ---- Part 1: single-threaded API/state-machine sanity (fast fail before spawning) ----
+    let m0 = mutex_new()
+    if try_lock(m0) != 1
+        print("FAIL fresh mutex: try_lock should acquire")
+        exit(1)
+    if try_lock(m0) != 0
+        print("FAIL held mutex: try_lock should fail while held")
+        exit(1)
+    unlock(m0)
+    if try_lock(m0) != 1
+        print("FAIL released mutex: try_lock should re-acquire after unlock")
+        exit(1)
+    unlock(m0)
+
+    // repeated lock/unlock cycles must never leak or corrupt the token
+    let cyc = 0
+    while cyc < 5
+        lock(m0)
+        unlock(m0)
+        cyc = cyc + 1
+    if try_lock(m0) != 1
+        print("FAIL mutex after 5 lock/unlock cycles: try_lock should still acquire")
+        exit(1)
+    unlock(m0)
+
+    // blocking lock()/unlock() round-trip (not just try_lock) must also leave it acquirable
+    lock(m0)
+    unlock(m0)
+    if try_lock(m0) != 1
+        print("FAIL mutex after lock()/unlock(): try_lock should acquire")
+        exit(1)
+    unlock(m0)
+
+    // ---- Part 2: mutual exclusion under real spawned-task contention ----
+    let N = 8
+    let R = 200
+    let m = mutex_new()
+    let state_ch = channel_bounded(1)
+    let st0 = {}
+    st0["cur"] = 0
+    st0["max"] = 0
+    st0["total"] = 0
+    send(state_ch, st0)
+    let done_ch = channel()
+
+    let s = 0
+    while s < N
+        spawn worker(s, m, state_ch, done_ch, R)
+        s = s + 1
+
+    // join: wait for all N workers
+    let d = 0
+    while d < N
+        recv(done_ch)
+        d = d + 1
+
+    let stf = recv(state_ch)
+    if stf["max"] > 1
+        print("FAIL mutex mutual exclusion violated: peak concurrency " + str(stf["max"]) + " > 1")
+        exit(1)
+    if stf["max"] < 1
+        print("FAIL mutex critical section never entered (peak == 0)")
+        exit(1)
+    if stf["cur"] != 0
+        print("FAIL mutex balance: gauge ended at " + str(stf["cur"]) + " (lock/unlock imbalance)")
+        exit(1)
+    if stf["total"] != N * R
+        print("FAIL mutex entry count: got " + str(stf["total"]) + " want " + str(N * R) + " (lost or duplicated grant)")
+        exit(1)
+
+    print("mutex_workers=" + str(N) + " rounds_each=" + str(R) + " total_entries=" + str(stf["total"]) + " peak_concurrency=" + str(stf["max"]) + " (must be 1)")
+    print("PASS _syncmutex_test")
