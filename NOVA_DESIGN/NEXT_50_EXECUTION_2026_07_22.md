@@ -47,6 +47,12 @@ Legend: **[rt]** runtime · **[cc]** compiler · **[fg]** Forge/lib · **[std]**
 | 23 | D1 IANA timezones — **MISSING** (no tz module; XL tz-database import) | [fg] | XL | attended (XL data) |
 
 ## BLOCK D — Phase 2: ecosystem connective tissue (each reuses the compiler's TiState)
+*Reconciliation signals (2026-07-22, need per-feature verification before ticking):* LSP shell + 14
+features EXIST (memory `project_lsp_improvements` v0.4.0) — BUT §3.2 gap #9 flags hover/completion as a
+regex text-scan not inferer-backed, so T-LSP the *quality* item may still be open (VERIFY which is current).
+`nova_pkg.nova` (transitive resolver) EXISTS but CLI-wiring unverified (plan: "unwired"). `nova` CLI has
+bench/check/cov/debug/eval/fmt/lint/lsp/repl/test/wasm subcommands; **no `doc` subcommand** → T-Doc likely
+open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Install/T-REPL: unverified.
 | # | Task | Area | Effort | Notes |
 |---|---|---|---|---|
 | 24 | T-ABI enforcement — do first; resolver/registry need it | [tool] | S | |
