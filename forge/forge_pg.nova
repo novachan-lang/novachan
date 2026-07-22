@@ -455,9 +455,32 @@ fn _pg_execute_msg() -> any
 
 // Run a parameterized query. `params` = a list of string values bound to $1,$2,... (text format; NULL
 // params are not yet supported -- a tracked limitation). Returns ok(list of name-keyed row dicts) or err.
-// Sends Parse/Bind/Describe/Execute/Sync as one batch, then reads to ReadyForQuery (Sync's error recovery
-// guarantees a 'Z' even on error).
-fn pg_query_params(conn, sql: string, params: list) -> any
+// PRIVATE: read a NUL-terminated ASCII C-string from bytes `b` at `off`. Command tags are ASCII
+// (0x00-free until the terminator), so chr()-building is safe here.
+fn _pg_cstr(b, off: int) -> string
+    let s = ""
+    let i = off
+    let n = bytes_len(b)
+    while i < n and bytes_get(b, i) != 0
+        s = s + chr(bytes_get(b, i))
+        i = i + 1
+    s
+
+// affected-row count from a CommandComplete tag (libpq's PQcmdTuples). Postgres tags: "INSERT <oid>
+// <rows>", "UPDATE <rows>", "DELETE <rows>", "SELECT <rows>", "MOVE <n>", "FETCH <n>", "COPY <n>"; the
+// count is always the LAST space-separated token. DDL tags ("CREATE TABLE", "BEGIN") have no count -> the
+// last token is non-numeric -> parse_int -> 0 (DDL affects 0 rows).
+fn pg_cmd_affected(tag: string) -> int
+    let parts = split(tag, " ")
+    if len(parts) == 0
+        return 0
+    parse_int(parts[len(parts) - 1])
+
+// PRIVATE: run the extended-query batch (Parse/Bind/Describe/Execute/Sync), reading to ReadyForQuery
+// (Sync's error recovery guarantees a 'Z' even on error). Returns [had_err, errmsg, rows, affected].
+// affected comes from the CommandComplete ('C'=67) command tag; msg carries the 5-byte header so the
+// tag string starts at offset 5 (same convention as _pg_parse_error / pg_parse_data_row).
+fn _pg_run_batch(conn, sql: string, params: list) -> list
     _pg_send(conn, _pg_parse_msg(sql))
     _pg_send(conn, _pg_bind_msg(params))
     _pg_send(conn, _pg_describe_portal_msg())
@@ -469,6 +492,7 @@ fn pg_query_params(conn, sql: string, params: list) -> any
     let done = 0
     let errmsg = ""
     let had_err = 0
+    let affected = 0
     while done == 0
         let m = _pg_recv_msg(conn, buf)
         let tag = m[0]
@@ -487,14 +511,29 @@ fn pg_query_params(conn, sql: string, params: list) -> any
                     row[names[i]] = vals[i]
                 i = i + 1
             push(rows, row)
+        else if tag == 67
+            affected = pg_cmd_affected(_pg_cstr(msg, 5))
         else if tag == 69
             errmsg = _pg_parse_error(msg)
             had_err = 1
         else if tag == 90
             done = 1
-    if had_err == 1
-        return err("pg: " + errmsg)
-    ok(rows)
+    [had_err, errmsg, rows, affected]
+
+// Parameterized (injection-safe) query -> ok(list of name-keyed row dicts) or err.
+fn pg_query_params(conn, sql: string, params: list) -> any
+    let r = _pg_run_batch(conn, sql, params)
+    if r[0] == 1
+        return err("pg: " + r[1])
+    ok(r[2])
+
+// Like pg_query_params but for INSERT/UPDATE/DELETE/DDL: returns ok(affected_row_count) parsed from the
+// CommandComplete tag (0 for DDL / no-count statements). Reads to ReadyForQuery like the query path.
+fn pg_exec_params(conn, sql: string, params: list) -> any
+    let r = _pg_run_batch(conn, sql, params)
+    if r[0] == 1
+        return err("pg: " + r[1])
+    ok(r[3])
 
 // ── connection POOL + transactions (parallel to forge_db pool_*/with_tx) ─────────────────────────────
 // A pool is a channel of authenticated connections; acquire = recv (parks until one frees), release = send.
@@ -537,6 +576,13 @@ fn pg_query(pool, sql: string) -> any
 fn pg_query_params_pool(pool, sql: string, params: list) -> any
     let conn = recv(pool)
     let r = pg_query_params(conn, sql, params)
+    send(pool, conn)
+    r
+
+// Pooled exec for INSERT/UPDATE/DELETE/DDL: acquire -> pg_exec_params -> release. Returns ok(affected).
+fn pg_exec_params_pool(pool, sql: string, params: list) -> any
+    let conn = recv(pool)
+    let r = pg_exec_params(conn, sql, params)
     send(pool, conn)
     r
 
