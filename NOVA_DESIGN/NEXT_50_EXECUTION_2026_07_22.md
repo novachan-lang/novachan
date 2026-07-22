@@ -62,7 +62,7 @@ Legend: **[rt]** runtime · **[cc]** compiler · **[fg]** Forge/lib · **[std]**
 | # | Task | Area | Effort | Notes / blocking |
 |---|---|---|---|---|
 | 32 | L11 module-symbol namespacing (`@mod__fn` mangling) — DO FIRST; hard link-error wall; prereq for L1 + registry | [lang] | M | |
-| 33 | L12 multi-line collection literals (`[...]`/`{...}` newline-as-whitespace) | [lang] | S | pure parser |
+| 33 | ✅ **DONE 2026-07-22** — L12 multi-line collection literals (`[...]`/`{...}` newline-as-whitespace, list + dict) | [lang] | S | reconverged + both-mode arc 2694/0/33 |
 | 34 | L13 keyword-as-variable diagnostic (clean E-code for `let match = …`) | [lang] | S | pure parser |
 | 35 | L6 enforced immutability (`let` vs `let mut`, shallow; warn-then-error migration) | [lang] | M | correctness + alias analysis |
 | 36 | L7 sized/unsigned numerics + f32 (suffix literals; HM-integrated; checked narrowing; flat arrays) | [lang] | M | folds `1<<64` guard; unblocks L5/embedded/wire/GPU |

@@ -1131,7 +1131,10 @@ as a typed surface over the existing `weak_create`/`weak_deref` builtins.
 class-only; C++'s rule-of-5 boilerplate explosion.
 *Unlocks:* RAII for FFI/file/socket/GPU/DB handles; caches with weak refs (no RC cycles); observers.
 
-**L12 / L13 — Multi-line collection literals + keyword-as-variable diagnostic.** [lang] **S each.**
+**L12 ✅ DONE (2026-07-22) / L13 — Multi-line collection literals + keyword-as-variable diagnostic.** [lang] **S each.**
+*L12 DONE:* `skip_nl` at in-bracket boundaries (open / after-element / after-comma / before-close) in the
+list `[...]` AND dict/set `{...}` literal parsers — never after the closing bracket, so statement-terminating
+newlines are untouched. gen5==gen6 reconverged + both-mode arc 2694/0/33 + L12 probe gated. L13 still OPEN.
 *NOVA way:* treat newlines as whitespace inside `[...]`/`{...}` (as already done inside `(...)`); check `let`
 binding names against the keyword set and emit a clean E-code. Pure parser fixes, zero semantic change.
 *Drawback avoided:* none — these are NOVA-only artifacts (no other language has them).
@@ -1544,7 +1547,7 @@ gap is open.**
 ### PHASE 3 — The declarative multiplier (language ceilings that turn Forge + all 8 siblings declarative).
 
 - **[lang]** L11 module namespacing (M) — do first (hard link-error wall; prerequisite for L1).
-- **[lang]** L12 + L13 (S each) — parser gotchas, do anytime.
+- **[lang]** L12 ✅ DONE (2026-07-22) + L13 (S each) — parser gotchas, do anytime.
 - **[lang]** L6 enforced immutability (M) — gradual migration; correctness + concurrency + optimization lever.
 - **[lang]** L7 sized numerics + f32 (M) — unblocks embedded/wire/GPU + L5; folds in the `1<<64` guard.
 - **[lang]** L8 custom operators (M) — library ergonomics; unblocks Cortex/Pulse indexing.
