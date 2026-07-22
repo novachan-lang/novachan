@@ -71,7 +71,7 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 | 33 | ✅ **DONE 2026-07-22** — L12 multi-line collection literals (`[...]`/`{...}` newline-as-whitespace, list + dict) | [lang] | S | reconverged + both-mode arc 2694/0/33 |
 | 34 | ✅ **DONE 2026-07-22** — L13 keyword-as-variable diagnostic (rejects hard keywords {match,loop,type,unsafe}; contextual like `matches` stay usable) | [lang] | S | reconverged + negative-reject gate + arc 2695/0/33 |
 | 35 | L6 enforced immutability (`let` vs `let mut`, shallow; warn-then-error migration) | [lang] | M | correctness + alias analysis |
-| 36 | L7 sized/unsigned numerics + f32 (suffix literals; HM-integrated; checked narrowing; flat arrays) | [lang] | M | folds `1<<64` guard; unblocks L5/embedded/wire/GPU |
+| 36 | L7 sized/unsigned numerics + f32 — 🔄 **inc1 DONE 2026-07-22** (suffix literals + range-check, soundness-safe); inc2+ OPEN (HM width-propagation, wrapping arithmetic, flat arrays) | [lang] | M | unblocks L5/embedded/wire/GPU |
 | 37 | L8 custom index/iterator/call operators (structural `index`/`iter`+`next`/`call`) | [lang] | M | unblocks Cortex/Pulse |
 | 38 | L3 variance (inferred, surfaced only in errors) | [lang] | L | after trait-conformance (done); prereq L4 |
 | 39 | L1a annotations + built-in codegen hooks (Phase-1, 80% — `@route`/`@service`/`@Entity`/`@test`) | [lang] | L | after L11; **THE #1 lever** |

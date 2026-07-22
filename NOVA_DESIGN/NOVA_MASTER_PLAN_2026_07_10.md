@@ -1056,7 +1056,13 @@ complexity.
 *Unlocks:* user-authored codegen, compile-time-checked DSLs (SQL/regex/format strings), conditional
 compilation without a preprocessor, and erasing the compiler's own ~700 hand-built `Expr(`/`Stmt(` sites.
 
-**L7 — Sized/unsigned numerics + f32.** [lang] **M.**
+**L7 — Sized/unsigned numerics + f32.** [lang] **M.** — 🔄 IN PROGRESS (2026-07-22).
+*Increment 1 DONE:* sized-numeric literal suffixes (`255u8`/`1000u16`/`42i32`/`100u64`/`1.5f32`/`7i8` +
+usize/isize) lex correctly and the small widths are RANGE-CHECKED (`300u8` → clean E-code, not a footgun).
+Kept additive + soundness-safe: type kind stays int/float, only lexer+parser touched, `unify` untouched.
+Reconverged + negative-reject gate + arc 2697/0/33. *Increment 2+ (OPEN):* propagate sized types through
+the HM inferrer (as a width tag, not a new kind), wrapping arithmetic at width in codegen, flat-buffer
+sized-array storage, checked narrowing `u32(x)`/wrapping `u32!(x)`. That's the soundness-touching part.
 *NOVA way:* `let x = 42` stays i64 (zero ceremony for 95%); sized types via suffix literals (`255u8`,
 `1.5f32`) or annotation. Internal `Int(width, signed)` + `Float(32/64)` participate in HM inference.
 Implicit widening (`u8 + u32 → u32`), explicit *checked* narrowing (`u32(x)` panics on overflow; `u32!(x)`

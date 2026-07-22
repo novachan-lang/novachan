@@ -235,6 +235,46 @@ fn _dedent_block(body: string) -> string
         j = j + 1
     return out
 
+// L7: detect a sized-numeric suffix at source[pos..] (u8/u16/u32/u64/i8/i16/i32/i64/
+// f32/f64/usize/isize). Returns the matched suffix, or "" if none. Only matches when the
+// character AFTER the suffix is not an identifier char, so `255u8` is a suffix but
+// `255u8x` / `255i32foo` are not (the trailing chars lex as a separate identifier, which
+// keeps existing tokenisation of e.g. `5in` / `5items` unchanged).
+fn _lex_num_suffix(source: string, pos: int, length: int) -> string
+    let cands = ["usize", "isize", "u16", "u32", "u64", "i16", "i32", "i64", "u8", "i8", "f32", "f64"]
+    let ci = 0
+    let found = ""
+    while ci < len(cands) and found == ""
+        let c = cands[ci]
+        let cl = len(c)
+        if pos + cl <= length and slice(source, pos, pos + cl) == c
+            let after_ok = true
+            if pos + cl < length
+                let nc = source[pos + cl]
+                if is_alpha(nc) or is_digit(nc) or nc == "_"
+                    after_ok = false
+            if after_ok
+                found = c
+        ci = ci + 1
+    found
+
+// L7: max value permitted for a sized-int suffix (-1 = no range check: value only needs
+// to fit i64, already enforced by the lexer). Increment 1 range-checks the small widths.
+fn _num_suffix_max(suffix: string) -> int
+    if suffix == "u8"
+        return 255
+    if suffix == "u16"
+        return 65535
+    if suffix == "u32"
+        return 4294967295
+    if suffix == "i8"
+        return 127
+    if suffix == "i16"
+        return 32767
+    if suffix == "i32"
+        return 2147483647
+    return 0 - 1
+
 fn tokenize(source: string) -> list
     tokenize_file(source, "")
 
@@ -470,11 +510,31 @@ fn tokenize_file(source: string, filename: string) -> list
                     is_float = false
                     pos = pos - 1
                     col = col - 1
+                // L7: optional sized-numeric suffix (u8/u16/u32/u64/i8/i16/i32/i64/f32/f64,
+                // usize/isize). Recognized ONLY when it directly follows the digits and is
+                // not part of a longer identifier (e.g. `255u8` but not `255uu`/`3xyz`).
+                // The suffix is carried on the token value as "<num>#<suffix>"; the parser
+                // splits it back out into a type annotation on the literal. Purely additive:
+                // no existing literal has a suffix, so tokenisation of current code is unchanged.
+                let _numsuffix = _lex_num_suffix(source, pos, length)
+                if _numsuffix != ""
+                    // consume the suffix chars
+                    let _sfi = 0
+                    while _sfi < len(_numsuffix)
+                        pos = pos + 1
+                        col = col + 1
+                        _sfi = _sfi + 1
+                    if slice(_numsuffix, 0, 1) == "f"
+                        is_float = true
+                    num = num + "#" + _numsuffix
                 if is_float
                     push(tokens, Token("FLOAT", num, line, start_col))
                 else
-                    if not int_fits_i64(num)
-                        lex_error_file("E0012", "integer literal '" + num + "' is too large for i64", filename, line, start_col, "i64 max is 9223372036854775807 (19 digits); use a smaller value")
+                    let _digits = num
+                    if find(num, "#") != -1
+                        _digits = slice(num, 0, find(num, "#"))
+                    if not int_fits_i64(_digits)
+                        lex_error_file("E0012", "integer literal '" + _digits + "' is too large for i64", filename, line, start_col, "i64 max is 9223372036854775807 (19 digits); use a smaller value")
                     push(tokens, Token("INT", num, line, start_col))
         else if ch == "\"" and pos + 2 < length and source[pos + 1] == "\"" and source[pos + 2] == "\""
             let start_col = col
@@ -1209,9 +1269,26 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
     let val = tv(tokens, pos)
 
     if kind == "INT"
-        ParseResult(Expr("int", val, int(val), [], [], ln), pos + 1)
+        // L7 increment 1: split an optional sized suffix ("255#u8") off the digits and
+        // range-check the small widths. The value is produced as a normal i64 literal
+        // (full sized-type propagation + wrapping arithmetic is increment 2); a sized
+        // literal that overflows its width is a clean parse error rather than a footgun.
+        let _digits = val
+        let _hash = find(val, "#")
+        if _hash != 0 - 1
+            _digits = slice(val, 0, _hash)
+            let _suf = slice(val, _hash + 1, len(val))
+            let _mx = _num_suffix_max(_suf)
+            if _mx >= 0 and int(_digits) > _mx
+                let _rc = syntax_error(tokens, pos, "integer literal '" + _digits + _suf + "' is out of range for " + _suf + " (max " + str(_mx) + ")", pe)
+                return ParseResult(Expr("int", "0", 0, [], [], ln), _rc)
+        ParseResult(Expr("int", _digits, int(_digits), [], [], ln), pos + 1)
     else if kind == "FLOAT"
-        ParseResult(Expr("float", val, 0, [], [], ln), pos + 1)
+        let _fdigits = val
+        let _fhash = find(val, "#")
+        if _fhash != 0 - 1
+            _fdigits = slice(val, 0, _fhash)
+        ParseResult(Expr("float", _fdigits, 0, [], [], ln), pos + 1)
     else if kind == "STR"
         ParseResult(Expr("str", val, 0, [], [], ln), pos + 1)
     else if kind == "RAW_STR"
