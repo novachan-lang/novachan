@@ -989,7 +989,7 @@ file:line-grounded backlog. These are NOT stale ledger claims; every one has evi
 | 5 | Windows TLS *server* is a hard stub | Forge-core | High | L | `nova_rt_tls_listen/accept` return 0. TLS server only on Linux/macOS. The dev is on Windows. |
 | 6 | gRPC-from-types (`service` marquee) not built | Forge-core | High | XL | Depends on interfaces + `chan T` returns. gRPC today = manual string-path register. |
 | 7 | `orm_exec` returns wrong affected-row count for PG/MySQL | Forge-lib | High | M | PG/MySQL branches `return ok(0)`; no CommandComplete/OK-packet parse. |
-| 8 | base32/TOTP + PG DataRow + Redis RESP NUL-truncate on 0x00 | Forge-lib+Runtime | High | M | ~7.5% of random secrets give a wrong OTP; BYTEA/binary DB values corrupt. |
+| 8 🔄 | base32/TOTP + PG DataRow + Redis RESP NUL-truncate on 0x00 | Forge-lib+Runtime | High | M | **base32/TOTP ✅ `7c6f6c99`** (`base32_decode_bytes`; fixed ~7.5%-wrong-OTP). **Redis ✅ `9266fa52`** (forge_redis bytes-based end-to-end; KAT NORMAL+FULLRC). **PG-DataRow N/A** (all-TEXT result fmt → PG emits no raw 0x00; the real PG-DataRow gap is NULL-vs-"" — see appendix, separate). TRACKED: `std/net/resp2` bulk-str same truncation (no binary consumer today). |
 | 9 | LSP hover/completion is a regex text-scan, not the inferer | Toolchain | High | L | Hover shows `x : variable`, not `x : int`. The inferer already runs for diagnostics; wiring job. |
 | 10 | Package manager: no transitive solver/semver/lockfile in the CLI path | Toolchain | High | L | A full resolver EXISTS in `nova_pkg.nova` but is UNWIRED. |
 | 11 | No preemption (cooperative-only); CPU-bound task starves; OTP can't kill | Concurrency | High | XL | Blocks soft-realtime + true Erlang-parity supervision (zombies survive restart). |

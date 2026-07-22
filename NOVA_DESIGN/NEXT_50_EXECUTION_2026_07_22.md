@@ -28,7 +28,7 @@ Legend: **[rt]** runtime · **[cc]** compiler · **[fg]** Forge/lib · **[std]**
 | 8 | ALPN on TLS accept path — enables h2/gRPC over TLS + browser HTTP/2 | [fg] | L | `grep -i alpn` = 0 today |
 | 9 | Windows TLS *server* — SChannel server handshake (`nova_rt_tls_listen/accept` are stubs) | [rt/fg] | L | HTTPS on the dev's own OS |
 | 10 | Linux FD_SETSIZE ≥1024 → `poll`/`epoll` netpoller (CVE-class stack corruption at high concurrency) | [rt] | M | |
-| 11 | DB fidelity — `orm_exec` affected-rows (PG CommandComplete / MySQL OK-packet) + base32/TOTP/PG-DataRow/Redis NUL-safety (byte-based end-to-end) | [fg/rt] | M | ~7.5% OTPs wrong today; binary DB values corrupt |
+| 11 | DB fidelity — 🔄 NUL-safety MOSTLY DONE: **base32/TOTP ✅** (`7c6f6c99`: `base32_decode_bytes`; fixed ~7.5%-wrong-OTP). **Redis ✅** (`9266fa52`: forge_redis rewritten bytes-based end-to-end — `tcp_send_bytes`/`tcp_recv_bytes` + bulk-as-`bytes` via `bytes_slice` + text/`_bytes` API split; KAT `_redis_binsafe_test` NORMAL+FULLRC green). **PG-DataRow N/A** (forge_pg uses all-TEXT result format — PG never emits raw 0x00 in text values; changing to bytes would regress). REMAIN: `orm_exec` affected-rows (PG CommandComplete / MySQL OK-packet). TRACKED: `std/net/resp2._r2_parse_bulk` has same bulk-str `chr()` truncation (framing safe, value corrupt) — API-changing (`d["str"]`→bytes), no binary consumer today. | [fg/rt] | M | orm_exec affected-rows still open |
 
 ## BLOCK C — Phase 1: stdlib correctness-edge (self-contained; daily value)
 | # | Task | Area | Effort | Notes |
