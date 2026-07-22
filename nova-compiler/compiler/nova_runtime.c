@@ -9884,6 +9884,18 @@ int64_t nova_rt_to_int(int64_t val) {
     return val;
 }
 
+/* L7: sized-integer conversions. Convert to int (via nova_rt_to_int) then narrow to the
+   target width with defined wrapping. Unsigned masks to the low bits; signed sign-extends
+   from the width's top bit. Return a raw i64 (like nova_rt_to_int). */
+int64_t nova_rt_to_u8(int64_t val)  { return nova_rt_to_int(val) & 0xFFLL; }
+int64_t nova_rt_to_u16(int64_t val) { return nova_rt_to_int(val) & 0xFFFFLL; }
+int64_t nova_rt_to_u32(int64_t val) { return nova_rt_to_int(val) & 0xFFFFFFFFLL; }
+int64_t nova_rt_to_u64(int64_t val) { return nova_rt_to_int(val); }
+int64_t nova_rt_to_i8(int64_t val)  { return (int64_t)(int8_t)(nova_rt_to_int(val) & 0xFFLL); }
+int64_t nova_rt_to_i16(int64_t val) { return (int64_t)(int16_t)(nova_rt_to_int(val) & 0xFFFFLL); }
+int64_t nova_rt_to_i32(int64_t val) { return (int64_t)(int32_t)(nova_rt_to_int(val) & 0xFFFFFFFFLL); }
+int64_t nova_rt_to_i64(int64_t val) { return nova_rt_to_int(val); }
+
 int64_t nova_rt_to_float(int64_t val) {
     if (val == 0) return f2i(0.0);
     /* An Any-typed float/bool arrives BOXED (json_decode, generic containers); unbox

@@ -1060,7 +1060,11 @@ compilation without a preprocessor, and erasing the compiler's own ~700 hand-bui
 *Increment 1 DONE:* sized-numeric literal suffixes (`255u8`/`1000u16`/`42i32`/`100u64`/`1.5f32`/`7i8` +
 usize/isize) lex correctly and the small widths are RANGE-CHECKED (`300u8` → clean E-code, not a footgun).
 Kept additive + soundness-safe: type kind stays int/float, only lexer+parser touched, `unify` untouched.
-Reconverged + negative-reject gate + arc 2697/0/33. *Increment 2+ (OPEN):* propagate sized types through
+Reconverged + negative-reject gate + arc 2697/0/33.
+*Increment 2 DONE:* sized-int conversion builtins u8()/u16()/u32()/u64()/i8()/i16()/i32()/i64() with defined
+wrapping + sign-extension (u8(300)==44, i8(200)==-56) — the wire-codec/byte-packing capability. 4 sites
+(runtime + resolve_runtime_fn + inferrer registry T->int + declares); still soundness-safe (returns int).
+Reconverged + arc 2698/0/33. *Increment 3 (OPEN):* propagate sized types through
 the HM inferrer (as a width tag, not a new kind), wrapping arithmetic at width in codegen, flat-buffer
 sized-array storage, checked narrowing `u32(x)`/wrapping `u32!(x)`. That's the soundness-touching part.
 *NOVA way:* `let x = 42` stays i64 (zero ceremony for 95%); sized types via suffix literals (`255u8`,
