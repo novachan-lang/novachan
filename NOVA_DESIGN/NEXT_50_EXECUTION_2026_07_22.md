@@ -33,18 +33,18 @@ Legend: **[rt]** runtime · **[cc]** compiler · **[fg]** Forge/lib · **[std]**
 ## BLOCK C — Phase 1: stdlib correctness-edge (self-contained; daily value)
 | # | Task | Area | Effort | Notes |
 |---|---|---|---|---|
-| 12 | S1 signal handling (SIGINT/SIGTERM/SIGHUP graceful shutdown) — deploy/container blocker | [std] | M | |
+| 12 | S1 signal handling (SIGINT/SIGTERM/SIGHUP graceful shutdown) — **MISSING** (only `std/os/signalname` = names, not handlers; needs runtime C) — deploy/container blocker | [rt] | M | attended (runtime) |
 | 13 | D4 signed bignum — **✅ EXISTS+GATED** (`std/numeric/bignum` tracked; verify signed-completeness) | [fg] | M | finance/crypto base |
 | 14 | D2 BigDecimal — **✅ EXISTS+GATED** (`std/numeric/decimal` tracked + `_decimal_test` in manifest; verify completeness) | [fg] | L | after #13 |
 | 15 | Argon2id password hashing — **✅ DONE** (`std/crypto/argon2id` tracked + `_argon2id_test` gated) | [fg] | M | best-practice storage |
-| 16 | S2 HTTP-client redirects/cookies/proxy | [fg] | M | |
-| 17 | S3 sync primitives (mutex/condvar/barrier at runtime layer) | [rt] | M | |
-| 18 | S5 file perms/symlinks (chmod/umask/symlink/readlink) | [std] | M | |
+| 16 | S2 HTTP-client redirects/cookies/proxy — **EXISTS-UNGATED** (`forge/forge_http_client` tracked, no gated test; needs a live/mock-server KAT) | [fg] | M | attended (network test) |
+| 17 | S3 sync primitives — **EXISTS-UNGATED** (`std/sync/mutex` tracked, no gated test; needs a concurrency KAT) | [rt] | M | attended (concurrency test) |
+| 18 | S5 file perms/symlinks (chmod/umask/symlink/readlink) — **MISSING** (needs runtime C) | [rt] | M | attended (runtime) |
 | 19 | S6 unix domain sockets — genuinely MISSING (runtime; Win AF_UNIX+netpoller caveat) | [rt] | M | |
 | 20 | D9 binary pack/unpack — **✅ DONE** (`std/encoding/pack` tracked + `_pack_test` gated) | [std] | M | |
 | 21 | D6 casefold + graphemes (Unicode) — partial (`std/text/casefold`, `graphemex` now gated) | [fg] | L | also gives `str_eq_canon` |
 | 22 | D5 XML parser — **✅ DONE** (`std/text/xml` tracked + `_xmlparse_test` gated; added complementary `_xml_test` for node-shape/whitespace/null-safety) | [fg] | L | |
-| 23 | D1 IANA timezones | [fg] | XL | tz database |
+| 23 | D1 IANA timezones — **MISSING** (no tz module; XL tz-database import) | [fg] | XL | attended (XL data) |
 
 ## BLOCK D — Phase 2: ecosystem connective tissue (each reuses the compiler's TiState)
 | # | Task | Area | Effort | Notes |
