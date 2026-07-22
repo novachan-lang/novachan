@@ -14178,6 +14178,24 @@ int64_t nova_rt_float_bits(int64_t str_val) {
     return bits;
 }
 
+/* float_from_bits: reinterpret a raw 64-bit IEEE-754 double bit pattern as a NOVA float.
+   The scalar float ABI already carries a double AS its i64 bit pattern (see nova_from_double),
+   so this is the identity at runtime — the reinterpret is realized by the caller-side float
+   return-type tagging. Companion to float_bits (string -> bits). The binary-float decode
+   primitive that std/encoding/pack + the DB drivers' binary protocol need. */
+int64_t nova_rt_float_from_bits(int64_t bits) {
+    return bits;
+}
+
+/* f32_from_bits: reinterpret a raw 32-bit IEEE-754 single (low 32 bits of `bits`) and widen to a
+   NOVA double. Real work: bit-reinterpret to float, then float->double, then double->bits. */
+int64_t nova_rt_f32_from_bits(int64_t bits) {
+    uint32_t u = (uint32_t)bits;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return nova_from_double((double)f);
+}
+
 int64_t nova_rt_index_set(int64_t obj, int64_t index, int64_t value) {
     void* ptr = (void*)(uintptr_t)obj;
     NovaMemTag tag = nova_mem_find_tag(ptr);
