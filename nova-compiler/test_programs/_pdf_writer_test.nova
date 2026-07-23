@@ -1,0 +1,117 @@
+import std/encoding/pdf
+
+// cks: assert string equality, exit(1) on mismatch.
+fn cks(label, got, want)
+    if got != want
+        print("FAIL pdf " + label + ": got=" + got + " want=" + want)
+        exit(1)
+
+// cki: assert integer equality, exit(1) on mismatch.
+fn cki(label, got, want)
+    if got != want
+        print("FAIL pdf " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+// ckt: assert a condition is true, exit(1) on failure.
+fn ckt(label, cond)
+    if cond == 0
+        print("FAIL pdf " + label)
+        exit(1)
+
+fn main()
+    let b = pdf_page("Hello, NOVA! (test)")
+    let s = bytes_to_str(b)
+    let slen = len(s)
+
+    // ── Structural KATs from the spec ────────────────────────────────────────
+    ckt("starts_with_header", starts_with(s, "%PDF-1.4"))
+    ckt("has_catalog", contains(s, "/Type /Catalog"))
+    ckt("has_page", contains(s, "/Type /Page"))
+    ckt("has_xref_kw", contains(s, "xref"))
+    ckt("has_trailer_kw", contains(s, "trailer"))
+    ckt("ends_with_eof", ends_with(s, "%%EOF"))
+
+    // ── Re-parse the xref table for real (a verifier will re-parse it) ──────
+    // Locate the standalone "xref" keyword (NOT the "xref" suffix inside
+    // "startxref") by requiring a preceding newline.
+    let xref_marker = find(s, "\nxref\n")
+    ckt("xref_marker_found", xref_marker >= 0)
+    let xref_off_actual = xref_marker + 1
+
+    // "0 6" header line must follow immediately: "xref\n0 6\n" (5 + 4 = 9 bytes).
+    let header_line = slice(s, xref_off_actual + 5, xref_off_actual + 8)
+    cks("xref_header_line", header_line, "0 6")
+    // Declared object count (from "0 6": start obj# 0, count 6 entries).
+    let declared_count = 6
+
+    // Parse the startxref value.
+    let sx_marker = find(s, "startxref\n")
+    ckt("startxref_kw_found", sx_marker >= 0)
+    let sx_val_start = sx_marker + 10
+    let eof_marker = find(s, "\n%%EOF")
+    ckt("eof_marker_found", eof_marker >= 0)
+    let sx_digits = slice(s, sx_val_start, eof_marker)
+    let sx_val = parse_int(sx_digits)
+    cki("startxref_matches_actual_offset", sx_val, xref_off_actual)
+
+    // Count the actual 20-byte xref entry lines between the header and "trailer".
+    let entries_start = xref_off_actual + 9
+    let trailer_marker = find(s, "trailer\n")
+    ckt("trailer_kw_found", trailer_marker >= 0)
+    let entry_bytes = trailer_marker - entries_start
+    cki("xref_entries_bytesize_multiple_of_20", entry_bytes - (entry_bytes / 20) * 20, 0)
+    let actual_entry_count = entry_bytes / 20
+    cki("xref_object_count_matches_header", actual_entry_count, declared_count)
+
+    // Entry 0 must be the free-list head.
+    let e0 = slice(s, entries_start, entries_start + 20)
+    cks("xref_entry0_is_free", e0, "0000000000 65535 f \n")
+
+    // Entries 1..5 must each be a valid 10-digit offset that points EXACTLY
+    // at "<N> 0 obj" for object N in the file (real re-parse, not just format).
+    let j = 1
+    while j <= 5
+        let entry_off = entries_start + j * 20
+        let off_digits = slice(s, entry_off, entry_off + 10)
+        let gen_field = slice(s, entry_off + 11, entry_off + 16)
+        let type_field = slice(s, entry_off + 17, entry_off + 18)
+        cks("xref_entry_gen_" + str(j), gen_field, "00000")
+        cks("xref_entry_type_" + str(j), type_field, "n")
+        let off_val = parse_int(off_digits)
+        let expect_hdr = str(j) + " 0 obj"
+        let actual_hdr = slice(s, off_val, off_val + len(expect_hdr))
+        cks("xref_entry_points_to_obj_" + str(j), actual_hdr, expect_hdr)
+        j = j + 1
+
+    // Object 3 (the Page) must reference object 5 as its /Contents and carry
+    // the Font resource dict.
+    ckt("page_has_contents_ref", contains(s, "/Contents 5 0 R"))
+    ckt("page_has_font_ref", contains(s, "/BaseFont /Helvetica"))
+
+    // The content stream must actually contain the (escaped) text we asked for,
+    // wrapped in the BT ... Tj ... ET drawing operators.
+    ckt("stream_has_BT", contains(s, "BT /F1 24 Tf"))
+    ckt("stream_has_escaped_text", contains(s, "Hello, NOVA! \\(test\\)"))
+    ckt("stream_has_Tj_ET", contains(s, ") Tj ET"))
+
+    // File must be non-trivially sized and end exactly at "%%EOF" (no trailing
+    // garbage after it).
+    ckt("nonzero_length", slen > 200)
+    let tail5 = slice(s, slen - 5, slen)
+    cks("last_five_bytes_are_EOF_marker", tail5, "%%EOF")
+
+    // ── Escaping edge case: text containing '(' ')' '\' must round-trip safely
+    // through the xref re-parse (it must not corrupt object boundaries).
+    let b2 = pdf_page("a\\b(c)d")
+    let s2 = bytes_to_str(b2)
+    ckt("escaped_backslash", contains(s2, "a\\\\b\\(c\\)d"))
+    ckt("escaped_still_starts_header", starts_with(s2, "%PDF-1.4"))
+    ckt("escaped_still_ends_eof", ends_with(s2, "%%EOF"))
+    let sx2_marker = find(s2, "startxref\n")
+    let sx2_val_start = sx2_marker + 10
+    let eof2_marker = find(s2, "\n%%EOF")
+    let sx2_val = parse_int(slice(s2, sx2_val_start, eof2_marker))
+    let xref2_marker = find(s2, "\nxref\n") + 1
+    cki("escaped_startxref_matches", sx2_val, xref2_marker)
+
+    print("PASS _pdf_writer_test")

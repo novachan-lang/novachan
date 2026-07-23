@@ -1,0 +1,206 @@
+// forge_mqtt -- MQTT 3.1.1 (OASIS, protocol level 4) client packet codec over raw TCP, mirroring the
+// socket-driver shape of forge_mysql/forge_pg. Reuses std/net/mqtt_fixed + mqtt_connect + mqtt_publish +
+// mqtt_sub for CONNECT/PUBLISH/SUBSCRIBE encode (and PUBLISH decode), and adds here: CONNACK/SUBACK/
+// PINGRESP decode, PINGREQ/DISCONNECT encode, list<int>-byte-list <-> NovaBytes wire conversion, and a
+// TCP transport layer (open/publish/subscribe/ping/close) that frames packets by first reading the fixed
+// header byte then the remaining-length varint (1..4 bytes) before pulling the rest off the wire.
+import std/net/mqtt_fixed
+import std/net/mqtt_connect
+import std/net/mqtt_publish
+import std/net/mqtt_sub
+
+// ── MQTT control packet types used here (byte0 bits 7..4) ──────────────────────────────────────────
+// CONNECT=1 CONNACK=2 PUBLISH=3 SUBSCRIBE=8 SUBACK=9 PINGREQ=12 PINGRESP=13 DISCONNECT=14
+
+// ── byte-list <-> NovaBytes wire conversions (codecs above speak list<int>; the socket speaks bytes) ──
+
+fn _mq_list_to_bytes(lst: list) -> any
+    let b = bytes(0)
+    let i = 0
+    let n = len(lst)
+    while i < n
+        b = bytes_append(b, lst[i])
+        i = i + 1
+    b
+
+fn _mq_bytes_to_list(b) -> list
+    let out = []
+    let i = 0
+    let n = bytes_len(b)
+    while i < n
+        push(out, bytes_get(b, i))
+        i = i + 1
+    out
+
+// ── Additional packet codecs (PINGREQ/DISCONNECT encode; CONNACK/SUBACK/PINGRESP decode) ───────────
+
+// mqtt_pingreq: PINGREQ has no variable header or payload -- fixed header only (0xC0, 0x00).
+fn mqtt_pingreq() -> list
+    mqtt_fixed_header(12, 0, 0)
+
+// mqtt_disconnect: DISCONNECT has no variable header or payload -- fixed header only (0xE0, 0x00).
+fn mqtt_disconnect() -> list
+    mqtt_fixed_header(14, 0, 0)
+
+// mqtt_connack_decode: decode a CONNACK packet (server -> client, byte0 = 0x20).
+// Variable header = [connack_flags, return_code]; bit0 of connack_flags = session_present.
+// Returns {} on malformed input.
+fn mqtt_connack_decode(packet: list) -> dict
+    let total = len(packet)
+    if total < 2
+        return {}
+    let pkt_type = (packet[0] >> 4) & 0x0F
+    if pkt_type != 2
+        return {}
+    let dec = mqtt_remlen_decode(packet, 1)
+    if dec[0] < 0
+        return {}
+    let var_start = dec[1]
+    if var_start + 2 > total
+        return {}
+    let result = {}
+    result["session_present"] = packet[var_start] & 0x01
+    result["return_code"] = packet[var_start + 1]
+    result
+
+// mqtt_suback_decode: decode a SUBACK packet (server -> client, byte0 = 0x90).
+// Variable header = u16 packet-id; payload = one return-code byte per requested filter.
+// Returns {} on malformed input.
+fn mqtt_suback_decode(packet: list) -> dict
+    let total = len(packet)
+    if total < 4
+        return {}
+    let pkt_type = (packet[0] >> 4) & 0x0F
+    if pkt_type != 9
+        return {}
+    let dec = mqtt_remlen_decode(packet, 1)
+    if dec[0] < 0
+        return {}
+    let remlen = dec[0]
+    let var_start = dec[1]
+    if var_start + 2 > total
+        return {}
+    let end_pos = var_start + remlen
+    if end_pos > total
+        return {}
+    let packet_id = (packet[var_start] << 8) | packet[var_start + 1]
+    let codes = []
+    let pos = var_start + 2
+    while pos < end_pos
+        push(codes, packet[pos])
+        pos = pos + 1
+    let result = {}
+    result["packet_id"] = packet_id
+    result["return_codes"] = codes
+    result
+
+// mqtt_pingresp_decode: PINGRESP (server -> client, byte0 = 0xD0) has no payload.
+// Returns 1 if packet is a well-formed PINGRESP, 0 otherwise.
+fn mqtt_pingresp_decode(packet: list) -> int
+    let total = len(packet)
+    if total < 1
+        return 0
+    let pkt_type = (packet[0] >> 4) & 0x0F
+    if pkt_type != 13
+        return 0
+    1
+
+// ── TCP transport ────────────────────────────────────────────────────────────────────────────────
+
+// _mq_recv_at_least: fill buf from sock until it holds >= need bytes, or the peer closes (short buf).
+fn _mq_recv_at_least(sock: int, buf, need: int) -> any
+    while bytes_len(buf) < need
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return buf
+        buf = bytes_concat(buf, chunk)
+    buf
+
+// _mq_read_packet: read exactly one MQTT packet off sock, buffering with carried-over `buf`.
+// Frames by reading byte0, then the remaining-length varint one byte at a time (stopping at the
+// first byte whose continuation bit 0x80 is clear, capped at 4 varint bytes per the MQTT 3.1.1
+// max Remaining Length of 268435455), then pulling `remlen` more bytes for the packet body.
+// Returns [packet_as_list, leftover_buf]. packet is [] on short read / EOF / malformed varint.
+fn _mq_read_packet(sock: int, buf) -> any
+    buf = _mq_recv_at_least(sock, buf, 2)
+    if bytes_len(buf) < 2
+        return [[], buf]
+    let have = 0
+    let scanning = 1
+    while scanning == 1
+        have = have + 1
+        buf = _mq_recv_at_least(sock, buf, 1 + have)
+        if bytes_len(buf) < 1 + have
+            return [[], buf]
+        if (bytes_get(buf, have) & 0x80) == 0
+            scanning = 0
+        else
+            if have >= 4
+                return [[], buf]
+    let header_list = _mq_bytes_to_list(bytes_slice(buf, 0, 1 + have))
+    let dec = mqtt_remlen_decode(header_list, 1)
+    if dec[0] < 0
+        return [[], buf]
+    let remlen = dec[0]
+    let var_start = dec[1]
+    let total = var_start + remlen
+    buf = _mq_recv_at_least(sock, buf, total)
+    if bytes_len(buf) < total
+        return [[], buf]
+    let packet = _mq_bytes_to_list(bytes_slice(buf, 0, total))
+    [packet, bytes_slice(buf, total, bytes_len(buf))]
+
+// mqtt_open: TCP-connect to host:port, send CONNECT, and wait for CONNACK.
+// Returns ok([sock, leftover_buf]) on CONNACK return_code==0, or err(message).
+fn mqtt_open(host: string, port: int, client_id: string, keepalive: int, clean_session: int) -> any
+    let sock = tcp_connect(host, port)
+    if sock < 0
+        return err("mqtt: cannot connect to " + host + ":" + str(port))
+    tcp_send_bytes(sock, _mq_list_to_bytes(mqtt_connect(client_id, keepalive, clean_session)))
+    let rd = _mq_read_packet(sock, bytes(0))
+    let resp = rd[0]
+    if len(resp) == 0
+        tcp_close(sock)
+        return err("mqtt: no CONNACK received")
+    let ca = mqtt_connack_decode(resp)
+    if len(ca) == 0
+        tcp_close(sock)
+        return err("mqtt: malformed CONNACK")
+    if ca["return_code"] != 0
+        tcp_close(sock)
+        return err("mqtt: CONNECT refused, return_code=" + str(ca["return_code"]))
+    ok([sock, rd[1]])
+
+// mqtt_send_publish: fire-and-forget QoS0 PUBLISH (no ack expected on the wire).
+fn mqtt_send_publish(sock: int, topic: string, payload_bytes: list)
+    tcp_send_bytes(sock, _mq_list_to_bytes(mqtt_publish(topic, payload_bytes, 0, 0)))
+
+// mqtt_send_subscribe: send SUBSCRIBE and wait for the matching SUBACK.
+// filters = list of [topic_string, qos_int] pairs. Returns ok([suback_dict, leftover_buf]) or err(message).
+fn mqtt_send_subscribe(sock: int, buf, packet_id: int, filters: list) -> any
+    tcp_send_bytes(sock, _mq_list_to_bytes(mqtt_subscribe(packet_id, filters)))
+    let rd = _mq_read_packet(sock, buf)
+    let resp = rd[0]
+    if len(resp) == 0
+        return err("mqtt: no SUBACK received")
+    let sa = mqtt_suback_decode(resp)
+    if len(sa) == 0
+        return err("mqtt: malformed SUBACK")
+    ok([sa, rd[1]])
+
+// mqtt_send_ping: send PINGREQ and wait for PINGRESP (keepalive heartbeat).
+// Returns ok(leftover_buf) or err(message).
+fn mqtt_send_ping(sock: int, buf) -> any
+    tcp_send_bytes(sock, _mq_list_to_bytes(mqtt_pingreq()))
+    let rd = _mq_read_packet(sock, buf)
+    let resp = rd[0]
+    if len(resp) == 0
+        return err("mqtt: no PINGRESP received")
+    if mqtt_pingresp_decode(resp) == 0
+        return err("mqtt: expected PINGRESP")
+    ok(rd[1])
+
+// mqtt_close: send a graceful DISCONNECT then close the socket.
+fn mqtt_close(sock: int)
+    tcp_send_bytes(sock, _mq_list_to_bytes(mqtt_disconnect()))
+    tcp_close(sock)
