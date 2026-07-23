@@ -3948,32 +3948,60 @@ fn inject_memo(stmts: list) -> list
 // The @test annotation is left on the fn (harmless -- unrecognized annotations are erased downstream).
 // NOTE: single-module scope for now -- with @test fns across multiple modules the generated runner name
 // would collide (the L11 symbol-namespacing item); a single test module is the supported Phase-1 shape.
-fn inject_tests(stmts: list) -> list
+fn inject_tests(stmts: list, pe: list) -> list
     let test_names = []
+    let test_lines = []
+    let _seen = {}
     for s in stmts
         match s
             Stmt(tag, name, ret_expr, body, params, fn_else, anns, sline) =>
-                if tag == "fn"
+                // Skip compiler-generated split impls: inject_ensures/inject_memo copy the wrapper's
+                // annotations (incl. @test) onto <name>__ens_impl/__memo_impl, so collecting those would
+                // double-count the test AND run its body twice. Collect each USER fn AT MOST ONCE (via
+                // _seen) so a fn carrying two @test annotations doesn't get counted twice either.
+                if tag == "fn" and not ends_with(name, "__ens_impl") and not ends_with(name, "__memo_impl")
                     for a in anns
                         match a
                             Expr(at, av, an2, ac, af, al) =>
-                                if at == "ann" and av == "test"
+                                if at == "ann" and av == "test" and not contains(_seen, name)
+                                    _seen[name] = 1
+                                    // Enforce the @test contract at COMPILE TIME: `fn name() -> bool`
+                                    // (true = pass). NOVA's uniform i64 lowering means a void/int return
+                                    // would otherwise slip through the generated `if name()` and silently
+                                    // report a passing test as failed (void->0) or invert it (int); so
+                                    // reject a non-bool return, or any parameters (the runner calls with
+                                    // no args), with a clear diagnostic rather than a silent wrong tally.
+                                    let _rt_ok = false
+                                    match ret_expr
+                                        Expr(_rtt, _rtv, _rtn, _rtc, _rtf, _rtl) =>
+                                            if _rtt == "rettype" and _rtv == "bool"
+                                                _rt_ok = true
+                                    if not _rt_ok
+                                        push(pe, "error[E1301]: @test function '" + name + "' must return bool (declare `fn " + name + "() -> bool`, true = pass) [line " + str(sline) + "]")
+                                    else if len(params) != 0
+                                        push(pe, "error[E1302]: @test function '" + name + "' must take no parameters (it is called with no arguments) [line " + str(sline) + "]")
                                     push(test_names, name)
+                                    push(test_lines, sline)
     if len(test_names) == 0
         return stmts
     let ln = 0
     let rbody = []
     // let __t_pass = 0
     push(rbody, Stmt("assign", "__t_pass", Expr("int", "0", 0, [], [], ln), [], [], [], [], ln))
-    for tn in test_names
+    let _ti = 0
+    while _ti < len(test_names)
+        let tn = test_names[_ti]
+        let tln = test_lines[_ti]
         // if <tn>()
         //     __t_pass = __t_pass + 1
-        let callc = Expr("call", tn, 0, [], [], ln)
+        // (the return type is verified bool above, so a bare truthiness test is exact).
+        let callc = Expr("call", tn, 0, [], [], tln)
         // int literal: the NUMERIC value lives in the 3rd Expr field (num), not the string value slot.
         let inc_val = Expr("binop", "+", 0, [Expr("ident", "__t_pass", 0, [], [], ln), Expr("int", "1", 1, [], [], ln)], [], ln)
         // reassignment: value in expr slot, target Expr in the annotations slot (see inject_memo store)
         let inc = Stmt("assign", "", inc_val, [], [], [], [Expr("ident", "__t_pass", 0, [], [], ln)], ln)
         push(rbody, Stmt("if", "", callc, [inc], [], [], [], ln))
+        _ti = _ti + 1
     // print(str(__t_pass) + "/" + "<N>" + " tests passed")
     let pass_str = Expr("call", "str", 0, [Expr("ident", "__t_pass", 0, [], [], ln)], [], ln)
     let m1 = Expr("binop", "+", 0, [pass_str, Expr("str", "/", 0, [], [], ln)], [], ln)
@@ -3997,14 +4025,18 @@ fn inject_tests(stmts: list) -> list
 //   let a = app(); a = __nova_register_routes(a); serve_app(a, 8080)
 // The generated get/post calls resolve to Forge's public API, so a routed program imports forge (routing
 // IS a Forge feature). Single-module scope (multi-module runner-name collision is the L11 item).
-fn inject_routes(stmts: list) -> list
+fn inject_routes(stmts: list, pe: list) -> list
     let r_methods = []
     let r_paths = []
     let r_handlers = []
     for s in stmts
         match s
             Stmt(tag, name, ret_expr, body, params, fn_else, anns, sline) =>
-                if tag == "fn"
+                // Skip compiler-generated split impls: inject_ensures/inject_memo copy the wrapper's
+                // route annotation onto <name>__ens_impl/__memo_impl too. Registering that raw impl
+                // ahead of the wrapper (first-match-wins dispatch) would silently BYPASS the ensures
+                // postcondition / memo cache on exactly the HTTP path. Register only the wrapper.
+                if tag == "fn" and not ends_with(name, "__ens_impl") and not ends_with(name, "__memo_impl")
                     for an in anns
                         match an
                             Expr(at, av, an2, ac, af, al) =>
@@ -4016,6 +4048,11 @@ fn inject_routes(stmts: list) -> list
                                                     push(r_methods, av)
                                                     push(r_paths, pv)
                                                     push(r_handlers, name)
+                                else if at == "ann" and (av == "get" or av == "post" or av == "put" or av == "delete" or av == "patch")
+                                    // A routing annotation with NO path parses to a bare `ann` and would
+                                    // otherwise be silently dropped -- the handler compiles but no route
+                                    // is registered (a 404 with zero feedback). Reject it with guidance.
+                                    push(pe, "error[E1310]: routing annotation @" + av + " on '" + name + "' requires a string path, e.g. @" + av + "(\"/path\") [line " + str(sline) + "]")
     if len(r_methods) == 0
         return stmts
     let ln = 0
@@ -4218,7 +4255,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    inline_module_consts(expand_derives(inject_routes(inject_tests(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts)))))))))
+    inline_module_consts(expand_derives(inject_routes(inject_tests(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts))))), pe), pe)))
 
 // Module-level `let X = <scalar literal>` constant propagation. Module lets are NOT true
 // shared globals in either backend (each fn that references one gets its own zero-init'd copy,
@@ -9493,11 +9530,12 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                                             if la_et == "call" and la_ev == "orm_fetch" and len(la_ec) >= 1
                                                 // ZERO-SQL, ZERO-TABLE read: `let xs: list<Todo> = orm_fetch(db)` derives the
                                                 // whole query from the target type T -- table name = T, columns via the struct.
-                                                // -> Todo__from_dict_list(orm_all(db, "SELECT * FROM Todo", [])). The struct is
-                                                // the entire contract; the developer writes no table name and no SQL.
-                                                let _of_sql = Expr("str", "SELECT * FROM " + fj_le, 0, [], [], la_el)
-                                                let _of_params = Expr("list", "", 0, [], [], la_el)
-                                                let _of_call = Expr("call", "orm_all", 0, [la_ec[0], _of_sql, _of_params], [], la_el)
+                                                // -> Todo__from_dict_list(orm_fetch_all(db, "Todo")). The table identifier is
+                                                // DIALECT-QUOTED at runtime inside orm_fetch_all (_orm_qident on db[1]) so a
+                                                // reserved-word type name (Order/Group/User/...) is legal SQL, not a silent [].
+                                                // The struct is the entire contract; the developer writes no table name, no SQL.
+                                                let _of_tbl = Expr("str", fj_le, 0, [], [], la_el)
+                                                let _of_call = Expr("call", "orm_fetch_all", 0, [la_ec[0], _of_tbl], [], la_el)
                                                 eff_expr = Expr("call", fj_le + "__from_dict_list", 0, [_of_call], [], la_el)
                                                 fj_list_elem = fj_le
                                             else if la_et == "call" and (la_ev == "db_all" or la_ev == "orm_all" or la_ev == "orm_where")

@@ -277,11 +277,24 @@ fn orm_exec(db, sql: string, params) -> any
         return forge_mysql.mysql_query_params(h, sql, params)
     err("orm: unknown db kind")
 
+// Quote a SQL IDENTIFIER (table or column) for the active dialect so reserved words (Order, Group, User,
+// Select, Table, Index, ...) -- and the zero-annotation, type-derived table/column names -- are always
+// legal SQL rather than a syntax error that silently swallows into an empty result / lost write. MySQL
+// quotes with backticks; SQLite and PostgreSQL (and the default) use ANSI double quotes. NOVA struct and
+// field names are lexer-validated identifiers (letters, digits, underscore), so they cannot contain the
+// quote character -- no escaping is required; we simply wrap every identifier. NOTE: in PostgreSQL a
+// quoted identifier is case-SENSITIVE; every struct-driven builder here quotes the SAME type_name-derived
+// string, so create/insert/update/delete/fetch stay mutually consistent.
+fn _orm_qident(kind: string, name: string) -> string
+    if kind == "mysql"
+        return "`" + name + "`"
+    "\"" + name + "\""
+
 // ---- inbuilt query functions ------------------------------------------------------------------------
 
 // COUNT rows, optional WHERE (pass "" for none). orm_count(db, "users", "age > ?", [18]).
 fn orm_count(db, table: string, where: string, params) -> int
-    let sql = "SELECT count(*) AS n FROM " + table
+    let sql = "SELECT count(*) AS n FROM " + _orm_qident(db[1], table)
     if len(where) > 0
         sql = sql + " WHERE " + where
     let rows = orm_all(db, sql, params)
@@ -295,7 +308,7 @@ fn orm_exists(db, table: string, where: string, params) -> bool
 
 // MIN/MAX/SUM/AVG aggregate over a column (returns the text value, "" if no rows). The caller coerces.
 fn orm_agg(db, fn_name: string, col: string, table: string, where: string, params) -> string
-    let sql = "SELECT " + fn_name + "(" + col + ") AS a FROM " + table
+    let sql = "SELECT " + fn_name + "(" + col + ") AS a FROM " + _orm_qident(db[1], table)
     if len(where) > 0
         sql = sql + " WHERE " + where
     let rows = orm_all(db, sql, params)
@@ -309,6 +322,7 @@ fn orm_agg(db, fn_name: string, col: string, table: string, where: string, param
 // runs INSERT INTO <table> (cols) VALUES (?,..). Portable across drivers. Set the id field explicitly (for
 // an auto/serial key, use orm_exec with custom SQL). Returns ok(affected) / err(msg).
 fn orm_insert(db, table: string, row) -> any
+    let kind = db[1]
     let names = field_names(row)
     let cols = ""
     let placeholders = ""
@@ -325,18 +339,19 @@ fn orm_insert(db, table: string, row) -> any
                 skip = 1
         if skip == 0
             if len(params) == 0
-                cols = nm
+                cols = _orm_qident(kind, nm)
                 placeholders = "?"
             else
-                cols = cols + ", " + nm
+                cols = cols + ", " + _orm_qident(kind, nm)
                 placeholders = placeholders + ", ?"
             push(params, field_get(row, nm))
         i = i + 1
-    orm_exec(db, "INSERT INTO " + table + " (" + cols + ") VALUES (" + placeholders + ")", params)
+    orm_exec(db, "INSERT INTO " + _orm_qident(kind, table) + " (" + cols + ") VALUES (" + placeholders + ")", params)
 
 // UPDATE a struct by its `id` field: SET every non-id column WHERE id = the struct's id. The struct MUST
 // have an id field. Returns ok(affected) (driver-reported where available) / err(msg).
 fn orm_update(db, table: string, row) -> any
+    let kind = db[1]
     let names = field_names(row)
     let setclause = ""
     let params = []
@@ -348,17 +363,17 @@ fn orm_update(db, table: string, row) -> any
             idval = field_get(row, nm)
         else
             if len(params) == 0
-                setclause = nm + " = ?"
+                setclause = _orm_qident(kind, nm) + " = ?"
             else
-                setclause = setclause + ", " + nm + " = ?"
+                setclause = setclause + ", " + _orm_qident(kind, nm) + " = ?"
             push(params, field_get(row, nm))
         i = i + 1
     push(params, idval)
-    orm_exec(db, "UPDATE " + table + " SET " + setclause + " WHERE id = ?", params)
+    orm_exec(db, "UPDATE " + _orm_qident(kind, table) + " SET " + setclause + " WHERE id = ?", params)
 
 // DELETE by id. Returns ok(affected) / err(msg).
 fn orm_delete(db, table: string, id) -> any
-    orm_exec(db, "DELETE FROM " + table + " WHERE id = ?", [id])
+    orm_exec(db, "DELETE FROM " + _orm_qident(db[1], table) + " WHERE id = ?", [id])
 
 // ── Zero-annotation, zero-table-name persistence: the struct's TYPE *is* the table ───────────────────
 // No @Entity, no @Table, no @Column, no table-name strings, no SQL. type_name(row) derives the table name;
@@ -374,14 +389,22 @@ fn orm_delete(db, table: string, id) -> any
 //   orm_save(db, Todo(0, "ship it", false))
 //   let todos: list<Todo> = orm_all(db, "SELECT * FROM Todo", [])   // typed reads (zero-SQL reads = TODO)
 
-// orm_fetch(db): ZERO-SQL, ZERO-TABLE typed read. Use ONLY in a typed let:
+// orm_fetch(db): ZERO-SQL, ZERO-TABLE typed read. VALID ONLY as the RHS of a typed list-of-struct let:
 //   let todos: list<Todo> = orm_fetch(db)
-// The compiler derives `SELECT * FROM Todo` from the target type T (table = T, columns via the struct) and
-// yields real list<Todo>. The struct is the entire contract -- no table name, no SQL. Called without a
-// typed-let target the derivation cannot fire, so this fallback returns [] (the type is what carries the
-// table -- there is nothing to fetch without it).
+// The compiler rewrites that to `Todo__from_dict_list(orm_fetch_all(db, "Todo"))` -- table = T, columns via
+// the struct, identifier dialect-quoted. The struct is the entire contract -- no table name, no SQL.
+// LIMITATION (Phase-1): in ANY other context (bare `orm_fetch(db)`, an untyped `let x = orm_fetch(db)`, or a
+// non-`list<Struct>` target) the type-directed rewrite cannot fire and this fallback returns [] -- the type
+// is what carries the table, so there is nothing to fetch without it. Use `orm_fetch_all(db, table)` (below)
+// or `orm_all` for a runtime-table read. (A compile diagnostic for the misuse is a tracked follow-up.)
 fn orm_fetch(db) -> list
     []
+
+// Runtime-table typed-read source: build a dialect-QUOTED `SELECT * FROM <table>` and return the untyped
+// rows. This is the target of the orm_fetch compiler rewrite (so reserved-word type names are legal SQL),
+// and is also usable directly: `let xs: list<Todo> = orm_fetch_all(db, "Todo")` when the table is dynamic.
+fn orm_fetch_all(db, table: string) -> list
+    orm_all(db, "SELECT * FROM " + _orm_qident(db[1], table), [])
 
 // Create the struct-type's table if it doesn't already exist (columns + SQL types derived from the fields).
 fn orm_ensure(db, sample) -> any
@@ -391,12 +414,18 @@ fn orm_ensure(db, sample) -> any
 fn orm_save(db, row) -> any
     orm_insert(db, type_name(row), row)
 
-// Update a struct (matched by its id field) in its own type's table.
+// Update a struct (matched by its id field) in its own type's table. A struct with no `id` field cannot be
+// addressed by primary key, so refuse it with a clear error instead of building `WHERE id=?` against a
+// non-existent column (which would silently affect the wrong rows or error opaquely at the driver).
 fn orm_modify(db, row) -> any
+    if not contains(field_names(row), "id")
+        return err("orm_modify: struct '" + type_name(row) + "' has no 'id' field")
     orm_update(db, type_name(row), row)
 
-// Delete a struct (by its id field) from its own type's table.
+// Delete a struct (by its id field) from its own type's table. Same id-field requirement as orm_modify.
 fn orm_remove(db, row) -> any
+    if not contains(field_names(row), "id")
+        return err("orm_remove: struct '" + type_name(row) + "' has no 'id' field")
     orm_delete(db, type_name(row), field_get(row, "id"))
 
 // ---- fluent query builder (NOVA's answer to JPA Criteria: zero annotations, transparent SQL) --------
@@ -485,10 +514,10 @@ fn OrmQuery.run(db) -> list
 // Relations need no special API or annotations: has-many = orm_where on the child's FK column;
 // belongs-to = orm_get on the parent table by the FK value. Both are ONE typed call, no SQL ceremony.
 fn orm_get(db, table: string, id) -> any
-    orm_one(db, "SELECT * FROM " + table + " WHERE id = ?", [id])
+    orm_one(db, "SELECT * FROM " + _orm_qident(db[1], table) + " WHERE id = ?", [id])
 
 fn orm_where(db, table: string, cond: string, params) -> list
-    orm_all(db, "SELECT * FROM " + table + " WHERE " + cond, params)
+    orm_all(db, "SELECT * FROM " + _orm_qident(db[1], table) + " WHERE " + cond, params)
 
 // ---- migrations: schema generated from a struct (JPA's ddl-auto, zero annotations) ------------------
 // orm_create_table(db, "users", User(0,"",0,false)) reflects a sample struct's field names + types and
@@ -518,13 +547,15 @@ fn orm_create_table(db, table: string, sample) -> any
     let cols = ""
     let i = 0
     while i < len(names)
-        let coldef = names[i] + " " + _orm_sql_type(types[i], kind, names[i])
+        // quote the column identifier (keyword-safe); _orm_sql_type still sees the RAW name so its
+        // `col == "id"` PRIMARY-KEY check is unaffected.
+        let coldef = _orm_qident(kind, names[i]) + " " + _orm_sql_type(types[i], kind, names[i])
         if i == 0
             cols = coldef
         else
             cols = cols + ", " + coldef
         i = i + 1
-    orm_exec(db, "CREATE TABLE IF NOT EXISTS " + table + " (" + cols + ")", [])
+    orm_exec(db, "CREATE TABLE IF NOT EXISTS " + _orm_qident(kind, table) + " (" + cols + ")", [])
 
 fn orm_drop_table(db, table: string) -> any
-    orm_exec(db, "DROP TABLE IF EXISTS " + table, [])
+    orm_exec(db, "DROP TABLE IF EXISTS " + _orm_qident(db[1], table), [])

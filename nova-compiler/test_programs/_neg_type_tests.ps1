@@ -60,6 +60,12 @@ Test-ShouldReject "trait_unknown_test.nova"       "unknown trait"
 Test-ShouldReject "ffi_unsafe_required_test.nova" "requires an enclosing 'unsafe'"
 Test-ShouldReject "multi_error_test.nova"         "expected"
 
+# L1 declarative-multiplier contract diagnostics (audit fixes): @test must be `() -> bool`; a routing
+# annotation must carry a string path. Wrong programs MUST be rejected, not silently mis-run.
+Test-ShouldReject "_atest_voidneg2.nova"    "must return bool"
+Test-ShouldReject "_atest_paramneg.nova"    "must take no parameters"
+Test-ShouldReject "_aroute_nopath_neg.nova" "requires a string path"
+
 # Batch-1 Wave-A soundness negatives (LOCK-3 trait signature conformance + enum payload typing).
 Test-ShouldReject "_trait_sig_bad_ret_test.nova"   "incompatible method signature"
 Test-ShouldReject "_trait_sig_bad_param_test.nova" "incompatible method signature"
