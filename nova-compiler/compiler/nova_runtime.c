@@ -2989,6 +2989,15 @@ int64_t nova_rt_for_iter_init(int64_t obj) {
             nova_rt_list_append(result, (int64_t)b->data[i]);
         return result;
     }
+    if (tag == NOVA_MEM_STRUCT) {
+        /* L8: a struct reached the for-loop iterator init -> `for x in obj` could not be statically
+           dispatched to <Struct>__iter (unresolved receiver type, e.g. an unannotated param used only via
+           `for`, or a wrong-arity/absent iter method). len_any would return 0 and the loop would run zero
+           times over a real collection -- a silent wrong answer. Panic loudly instead (matches the
+           index-get/set dynamic-path guards); the compiler rewrites every RESOLVED `for x in struct` to
+           `for x in struct.iter()` (a list), so a struct only reaches here in the unresolvable/malformed case. */
+        nova_panic("for-in over a struct whose type is not statically known, or which has no `iter(self) -> list` method: define iter and make the receiver's type resolvable (annotate the parameter if it is inferred only from `for` usage)");
+    }
     if (tag == NOVA_MEM_LIST) nova_list_deopt(obj);  /* S4.2: for-in runs the boxed path in v1 */
     return obj;
 }
@@ -3022,6 +3031,12 @@ int64_t nova_rt_for_kv_init(int64_t obj) {
             nova_rt_list_append(bresult, pair);
         }
         return bresult;
+    }
+    if (tag == NOVA_MEM_STRUCT) {
+        /* L8 / memory-safety: casting a struct pointer to NovaList below would read a struct field as
+           `size` and overread `data[i]` up to it (a wild heap read). A struct reaches here only when
+           `for k,v in obj` did not statically dispatch to <Struct>__iter. Panic loudly. */
+        nova_panic("for k,v over a struct whose type is not statically known, or which has no `iter(self) -> list` method: define iter and make the receiver's type resolvable (annotate the parameter if needed)");
     }
     NovaList* l = (NovaList*)ptr;
     int64_t result = nova_rt_list_create();
@@ -14141,6 +14156,14 @@ int64_t nova_rt_index_get(int64_t obj, int64_t index) {
     if (tag == NOVA_MEM_BYTES) {
         return nova_rt_bytes_get(obj, index);  /* size-bounded; else str_char_at would strlen the struct (wild read) */
     }
+    if (tag == NOVA_MEM_STRUCT) {
+        /* L8: a struct reached the dynamic index path -> the compiler could not statically resolve its
+           type to dispatch `obj[i]` to <Struct>__index (e.g. an unannotated parameter used only via []).
+           Silently returning 0 would be a wrong answer; panic loudly instead so the developer annotates
+           the receiver's type or defines the method. (Bare ints / boxed floats have a different tag and
+           still fall through to the graceful 0 below.) */
+        nova_panic("index [] on a struct whose type is not statically known: define an `index` method and make the receiver's type resolvable (annotate the parameter if it is inferred only from `[]` usage)");
+    }
     /* SOUNDNESS: only a genuine string may reach str_char_at. A non-container value (bare int/float/bool --
        e.g. json_decode("5") then m["k"], or a malformed network message indexed as msg["type"]) would
        otherwise be dereferenced as a char* -> wild read / segfault. Return 0 (null) for a non-indexable
@@ -14208,6 +14231,12 @@ int64_t nova_rt_index_set(int64_t obj, int64_t index, int64_t value) {
     if (tag == NOVA_MEM_BYTES) {
         nova_rt_bytes_set(obj, index, value);  /* else silent no-op = data loss on any-typed bytes */
         return 0;
+    }
+    if (tag == NOVA_MEM_STRUCT) {
+        /* L8: a struct reached the dynamic index-set path -> `obj[i] = v` could not be statically
+           dispatched to <Struct>__index_set (unresolved receiver type, or the struct defines `index`
+           but not `index_set`). Silently discarding the write is data loss; panic loudly instead. */
+        nova_panic("index assignment obj[i]=v on a struct whose type is not statically known, or which has no `index_set` method: define `index_set` and make the receiver's type resolvable (annotate the parameter if needed)");
     }
     return 0;
 }

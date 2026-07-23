@@ -72,7 +72,7 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 | 34 | ✅ **DONE 2026-07-22** — L13 keyword-as-variable diagnostic (rejects hard keywords {match,loop,type,unsafe}; contextual like `matches` stay usable) | [lang] | S | reconverged + negative-reject gate + arc 2695/0/33 |
 | 35 | L6 enforced immutability (`let` vs `let mut`, shallow; warn-then-error migration) | [lang] | M | correctness + alias analysis |
 | 36 | L7 sized/unsigned numerics + f32 — 🔄 **inc1+inc2 DONE 2026-07-22** (suffix literals + range-check; conversion builtins u8()..i64() wrapping/sign-extend); inc3 OPEN (HM width-propagation + wrapping arithmetic + flat arrays) | [lang] | M | unblocks L5/embedded/wire/GPU |
-| 37 | L8 custom index/iterator/call operators (structural `index`/`iter`+`next`/`call`) | [lang] | M | unblocks Cortex/Pulse |
+| 37 | 🔄 **index+iter DONE 2026-07-24** (`49f28f4f`..L8) — `obj[i]` / `obj[i]=v` / `for x in obj` dispatch to a struct's `index`/`index_set`/`iter` methods, ZERO annotations; + nested custom-index return-type resolution + arity-gate + LOUD-PANIC (not silent-wrong) on an unresolved struct at all 4 dynamic sites (also closed a pre-existing `for_kv` struct→NovaList wild read). 2-round independent adversarial verify (caught 4 silent-wrong + 1 CVE-class); reconverged 2722/0/34 both modes. `call`-overload = backlog. | [lang] | M | unblocks Cortex/Pulse |
 | 38 | L3 variance (inferred, surfaced only in errors) | [lang] | L | after trait-conformance (done); prereq L4 |
 | 39 | L1a annotations + built-in codegen hooks (Phase-1, 80% — `@route`/`@service`/`@Entity`/`@test`) | [lang] | L | after L11; **THE #1 lever** |
 | 40 | L2a comptime-fn-returning-values (Phase-1) — the substrate under L1 | [lang] | M | |

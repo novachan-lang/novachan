@@ -8031,6 +8031,37 @@ fn ir_resolve_unary_overload(b: IrBuilder, op: string, operand_expr: Expr) -> st
         return candidate
     ""
 
+// Structural operator dispatch (L8): if the receiver expression's static type is a USER struct that
+// defines a method named `method`, return the mangled `<Struct>__<method>` so the caller can dispatch
+// `obj[i]` -> Struct__index, `obj[i]=v` -> Struct__index_set, `for x in obj` -> Struct__iter, and
+// `obj(args)` -> Struct__call. Built-in containers (list/dict/string) are never in ir_sdefs, so they
+// keep their native indexing/iteration -- overloading applies only to the developer's own types, with
+// zero annotations (define the method and the operator just works -- the NOVA "derive from structure" way).
+fn ir_resolve_method_overload(b: IrBuilder, recv_expr: Expr, method: string) -> string
+    let recv = ir_expr_struct_type(b, recv_expr)
+    if recv == ""
+        return ""
+    if not contains(b.ir_sdefs, recv)
+        return ""
+    let candidate = recv + "__" + method
+    if not list_contains(b.ir_fnames, candidate)
+        return ""
+    // Arity must match the dispatch site (self is param 0): index(self,i)=2, index_set(self,i,v)=3,
+    // iter(self)=1. A method of the wrong arity must NOT be dispatched -- emitting a call with the
+    // wrong argument count is ABI-fragile "works by accident" IR; skip it so the site falls through
+    // to the runtime, which panics loudly (a clear error) rather than silently miscompiling.
+    let _need = 0
+    if method == "index"
+        _need = 2
+    else if method == "index_set"
+        _need = 3
+    else if method == "iter"
+        _need = 1
+    if _need > 0 and contains(b.ir_fn_arity, candidate)
+        if b.ir_fn_arity[candidate] != _need
+            return ""
+    candidate
+
 fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
     match expr
         Expr(tag, value, num, children, fields, eline) =>
@@ -8727,6 +8758,14 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                     ir_emit_inst(b, "const_int", dest, ir_type_int(), [], "0", 0)
                     return dest
             else if tag == "index"
+                // L8: obj[i] on a user struct with an `index` method -> Struct__index(obj, i).
+                let idx_ovl = ir_resolve_method_overload(b, children[0], "index")
+                if idx_ovl != ""
+                    let iobj = ir_lower_expr(b, children[0])
+                    let iidx = ir_lower_expr(b, children[1])
+                    let idest = ir_fresh_reg(b)
+                    ir_emit_side(b, "call", idest, ir_type_any(), [iobj, iidx], idx_ovl, 0)
+                    return idest
                 let obj = ir_lower_expr(b, children[0])
                 let idx = ir_lower_expr(b, children[1])
                 let dest = ir_fresh_reg(b)
@@ -9222,6 +9261,16 @@ fn ir_expr_struct_type(b: IrBuilder, expr: Expr) -> string
                 let _idx_elem = ir_list_elem_struct(b, ec[0])
                 if contains(b.ir_sdefs, _idx_elem)
                     return _idx_elem
+                // L8 custom index: the receiver is a struct with an `index` method -> the index result's
+                // static type is that method's declared return type. Lets `grid[i][j]` (nested custom
+                // index) dispatch and `grid[i].floatField` unbox correctly (else the float reads as raw bits).
+                let _idx_recv = ir_expr_struct_type(b, ec[0])
+                if _idx_recv != "" and contains(b.ir_sdefs, _idx_recv)
+                    let _idx_m = _idx_recv + "__index"
+                    if contains(b.ir_fn_returns, _idx_m)
+                        let _idx_rt = b.ir_fn_returns[_idx_m]
+                        if contains(b.ir_sdefs, _idx_rt) or _is_builtin_type_name(_idx_rt)
+                            return _idx_rt
             if et == "binop" and len(ec) >= 2
                 let bin_lt = ir_expr_struct_type(b, ec[0])
                 if bin_lt != ""
@@ -9713,6 +9762,11 @@ fn ir_lower_stmt(b: IrBuilder, stmt: Stmt)
                 b.ir_loop_hdr = save_hdr
                 b.ir_loop_exit = save_exit
             else if tag == "for"
+                // L8: `for x in obj` where obj is a USER struct with an `iter` method -> iterate the list
+                // returned by Struct__iter(obj). The list then flows through the normal iteration path.
+                let _iter_ovl = ir_resolve_method_overload(b, expr, "iter")
+                if _iter_ovl != ""
+                    expr = Expr("call", _iter_ovl, 0, [expr], [], b.ir_cur_line)
                 // Type the loop var from the iterable's element struct type (when iterating a known
                 // list-of-struct), so `for p in xs: p.floatField` reads the float correctly -- else the
                 // loop var is `any` and a float field reads as raw bits. Generators / unknown / non-struct
@@ -10361,9 +10415,17 @@ fn ir_lower_assign_target(b: IrBuilder, target: Expr, val_reg: string)
                 ir_emit_inst(b, "slot_store", "", ir_type_void(), [val_reg], value, 0)
                 b.ir_locals[value] = 1
             else if tag == "index"
-                let target_r = ir_lower_expr(b, children[0])
-                let idx_r = ir_lower_expr(b, children[1])
-                ir_emit_side(b, "index_set", "", ir_type_void(), [target_r, idx_r, val_reg], "", 0)
+                // L8: obj[i] = v on a user struct with an `index_set` method -> Struct__index_set(obj, i, v).
+                let iset_ovl = ir_resolve_method_overload(b, children[0], "index_set")
+                if iset_ovl != ""
+                    let sobj = ir_lower_expr(b, children[0])
+                    let sidx = ir_lower_expr(b, children[1])
+                    let sdest = ir_fresh_reg(b)
+                    ir_emit_side(b, "call", sdest, ir_type_any(), [sobj, sidx, val_reg], iset_ovl, 0)
+                else
+                    let target_r = ir_lower_expr(b, children[0])
+                    let idx_r = ir_lower_expr(b, children[1])
+                    ir_emit_side(b, "index_set", "", ir_type_void(), [target_r, idx_r, val_reg], "", 0)
             else if tag == "member"
                 let target_r = ir_lower_expr(b, children[0])
                 let mstype = ""
