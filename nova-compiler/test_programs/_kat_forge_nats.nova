@@ -1,0 +1,106 @@
+// KAT: forge_nats -- NATS text-protocol codec (encode + parse), byte-exact
+// known-answer vectors from the NATS protocol reference.
+import forge_nats
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn _expect_str(label: string, got: string, want: string)
+    if got != want
+        _fail(label + ": got " + got + " want " + want)
+
+fn _expect_int(label: string, got: int, want: int)
+    if got != want
+        _fail(label + ": got " + str(got) + " want " + str(want))
+
+fn main()
+    // ── Builders — byte-exact ────────────────────────────────────────────
+    _expect_str("PUB no-reply", bytes_to_str(nats_pub("foo", str_to_bytes("hello"))), "PUB foo 5\r\nhello\r\n")
+    _expect_str("PUB with-reply", bytes_to_str(nats_pub_reply("foo", "reply.1", str_to_bytes("hi"))), "PUB foo reply.1 2\r\nhi\r\n")
+    _expect_str("SUB no-queue", bytes_to_str(nats_sub("bar", 1)), "SUB bar 1\r\n")
+    _expect_str("SUB queue", bytes_to_str(nats_sub_queue("bar", "workers", 2)), "SUB bar workers 2\r\n")
+    _expect_str("UNSUB", bytes_to_str(nats_unsub(5)), "UNSUB 5\r\n")
+    _expect_str("UNSUB max", bytes_to_str(nats_unsub_max(5, 10)), "UNSUB 5 10\r\n")
+    _expect_str("PING", bytes_to_str(nats_ping()), "PING\r\n")
+    _expect_str("PONG", bytes_to_str(nats_pong()), "PONG\r\n")
+    _expect_str("CONNECT", bytes_to_str(nats_connect("nova-nats")), "CONNECT \{\"verbose\":false,\"pedantic\":false,\"name\":\"nova-nats\"\}\r\n")
+
+    // ── Parser — INFO ────────────────────────────────────────────────────
+    let info_in = str_to_bytes("INFO \{\"server_id\":\"NB1\",\"version\":\"2.10.0\"\}\r\n")
+    let info_r = nats_parse_line(info_in, 0)
+    let info_op = info_r[0]
+    _expect_str("INFO op", info_op["op"], "INFO")
+    _expect_str("INFO json", info_op["info"], "\{\"server_id\":\"NB1\",\"version\":\"2.10.0\"\}")
+    _expect_int("INFO next_pos", info_r[1], bytes_len(info_in))
+
+    // ── Parser — MSG (no reply-to), the spec KAT vector ────────────────
+    let msg_in = str_to_bytes("MSG foo 9 5\r\nhello\r\n")
+    let msg_r = nats_parse_line(msg_in, 0)
+    let msg_op = msg_r[0]
+    _expect_str("MSG op", msg_op["op"], "MSG")
+    _expect_str("MSG subject", msg_op["subject"], "foo")
+    _expect_int("MSG sid", msg_op["sid"], 9)
+    _expect_int("MSG len", msg_op["len"], 5)
+    _expect_str("MSG reply (absent)", msg_op["reply"], "")
+    _expect_str("MSG payload", bytes_to_str(msg_op["payload"]), "hello")
+    _expect_int("MSG next_pos", msg_r[1], bytes_len(msg_in))
+
+    // ── Parser — MSG with reply-to ──────────────────────────────────────
+    let msgr_in = str_to_bytes("MSG foo 9 reply.1 5\r\nhello\r\n")
+    let msgr_r = nats_parse_line(msgr_in, 0)
+    let msgr_op = msgr_r[0]
+    _expect_str("MSG(reply) op", msgr_op["op"], "MSG")
+    _expect_str("MSG(reply) subject", msgr_op["subject"], "foo")
+    _expect_int("MSG(reply) sid", msgr_op["sid"], 9)
+    _expect_str("MSG(reply) reply", msgr_op["reply"], "reply.1")
+    _expect_int("MSG(reply) len", msgr_op["len"], 5)
+    _expect_str("MSG(reply) payload", bytes_to_str(msgr_op["payload"]), "hello")
+    _expect_int("MSG(reply) next_pos", msgr_r[1], bytes_len(msgr_in))
+
+    // ── Parser — MSG with a binary payload containing a NUL byte ────────
+    // (proves the codec is binary-safe, not string/CRLF-scanning the body)
+    let bin_payload = bytes(0)
+    bin_payload = bytes_append(bin_payload, 65)
+    bin_payload = bytes_append(bin_payload, 0)
+    bin_payload = bytes_append(bin_payload, 66)
+    let bin_in = bytes_concat(str_to_bytes("MSG baz 3 3\r\n"), bin_payload)
+    bin_in = bytes_concat(bin_in, str_to_bytes("\r\n"))
+    let bin_r = nats_parse_line(bin_in, 0)
+    let bin_op = bin_r[0]
+    _expect_str("MSG(bin) op", bin_op["op"], "MSG")
+    _expect_int("MSG(bin) len", bin_op["len"], 3)
+    _expect_int("MSG(bin) payload[0]", bytes_get(bin_op["payload"], 0), 65)
+    _expect_int("MSG(bin) payload[1]", bytes_get(bin_op["payload"], 1), 0)
+    _expect_int("MSG(bin) payload[2]", bytes_get(bin_op["payload"], 2), 66)
+    _expect_int("MSG(bin) next_pos", bin_r[1], bytes_len(bin_in))
+
+    // ── Parser — PING / PONG / +OK / -ERR ───────────────────────────────
+    let ping_r = nats_parse_line(str_to_bytes("PING\r\n"), 0)
+    _expect_str("PING op", ping_r[0]["op"], "PING")
+    let pong_r = nats_parse_line(str_to_bytes("PONG\r\n"), 0)
+    _expect_str("PONG op", pong_r[0]["op"], "PONG")
+    let ok_r = nats_parse_line(str_to_bytes("+OK\r\n"), 0)
+    _expect_str("OK op", ok_r[0]["op"], "OK")
+    let err_r = nats_parse_line(str_to_bytes("-ERR 'Unknown Protocol Operation'\r\n"), 0)
+    _expect_str("ERR op", err_r[0]["op"], "ERR")
+    _expect_str("ERR msg", err_r[0]["msg"], "'Unknown Protocol Operation'")
+
+    // ── Parser — incomplete buffers must report next_pos == -1 ─────────
+    let no_crlf = str_to_bytes("MSG foo 9 5")
+    let incomplete_hdr = nats_parse_line(no_crlf, 0)
+    _expect_int("incomplete header next_pos", incomplete_hdr[1], 0 - 1)
+
+    let short_payload = str_to_bytes("MSG foo 9 5\r\nhel")
+    let incomplete_body = nats_parse_line(short_payload, 0)
+    _expect_int("incomplete payload next_pos", incomplete_body[1], 0 - 1)
+
+    // ── Parser — two units back to back, resumable via next_pos ────────
+    let two_in = str_to_bytes("MSG foo 9 5\r\nhello\r\nPING\r\n")
+    let first_r = nats_parse_line(two_in, 0)
+    _expect_str("two-unit first op", first_r[0]["op"], "MSG")
+    let second_r = nats_parse_line(two_in, first_r[1])
+    _expect_str("two-unit second op", second_r[0]["op"], "PING")
+    _expect_int("two-unit second next_pos", second_r[1], bytes_len(two_in))
+
+    print("PASS forge_nats")

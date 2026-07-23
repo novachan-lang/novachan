@@ -57,6 +57,17 @@
 //       {"type": str, "data": bytes}
 //     Returns an empty list on any error (bad signature, truncation, etc.).
 //
+//   png_encode_rgb(width, height, rgb_bytes) -> bytes
+//     Encode a raw truecolor (RGB, 8-bit) image into a full PNG file.
+//     rgb_bytes must be exactly width*height*3 bytes (row-major, no padding).
+//     Emits: signature, IHDR (bitdepth=8, colortype=2), IDAT (zlib-wrapped
+//     DEFLATE of the filtered scanlines — filter byte 0x00 "None" prefixed
+//     to every row), IEND. No deflate/zlib helper exists in std/compress yet
+//     that operates on raw 'bytes', so this uses RFC 1951 §3.2.4 STORED
+//     (uncompressed) deflate blocks — valid, spec-compliant DEFLATE data,
+//     just without compression. Returns bytes(0) if rgb_bytes is the wrong
+//     length.
+//
 // PRIVATE HELPERS
 //   All helpers prefixed _png_ to avoid link collisions.
 //
@@ -265,4 +276,112 @@ fn png_read_chunks(b) -> list
                             if pos >= blen
                                 running = 0
         result = chunks
+    result
+
+// ── Private: Adler-32 (RFC 1950 §8.2) over a bytes value ─────────────────────
+// h_adler32 in std/hash/adler32.nova only takes a NUL-terminated str, which
+// truncates on 0x00 — unsafe for raw pixel/scanline data. This variant reads
+// the bytes value directly.
+fn _png_adler32_bytes(b) -> int
+    let mod_adler = 65521
+    let a = 1
+    let s = 0
+    let blen = bytes_len(b)
+    let i = 0
+    while i < blen
+        let v = bytes_get(b, i)
+        a = (a + v) % mod_adler
+        s = (s + a) % mod_adler
+        i = i + 1
+    ((s << 16) | a) & 0xFFFFFFFF
+
+// ── Private: append a big-endian u16 (2 bytes) to bytes out ──────────────────
+fn _png_put_u16be(out, v) -> bytes
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// ── Private: append a little-endian u16 (2 bytes) to bytes out ───────────────
+fn _png_put_u16le(out, v) -> bytes
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out
+
+// ── Private: wrap one RFC 1951 §3.2.4 STORED deflate block ───────────────────
+// header byte: BFINAL (bit0) | BTYPE=00 (bits1-2) | zero padding to byte
+// boundary (bits3-7) — since stored blocks always start byte-aligned, this
+// collapses to a single byte: 1 if final, 0 otherwise.
+// Followed by LEN (u16 LE), NLEN = one's complement of LEN (u16 LE), then the
+// raw chunk bytes verbatim. chunk must be <= 65535 bytes.
+fn _png_deflate_stored_block(out, chunk, is_final) -> bytes
+    let header = 0
+    if is_final == 1
+        header = 1
+    out = bytes_append(out, header)
+    let clen = bytes_len(chunk)
+    out = _png_put_u16le(out, clen)
+    let nlen = (~clen) & 0xFFFF
+    out = _png_put_u16le(out, nlen)
+    out = bytes_concat(out, chunk)
+    out
+
+// ── Private: RFC 1950 zlib-wrap raw data using STORED deflate blocks ─────────
+// CMF=0x78 (CM=8 deflate, CINFO=7 -> 32K window), FLG=0x01 (FCHECK makes
+// (CMF*256+FLG) % 31 == 0, FLEVEL=0 fastest, FDICT=0) — the standard header
+// pair for "no compression" zlib streams. Body = one or more STORED deflate
+// blocks (max 65535 bytes of payload each, split as needed), trailer =
+// Adler-32 of the raw uncompressed data (u32 BE), per RFC 1950 §2.2.
+fn _png_zlib_wrap_stored(data) -> bytes
+    let out = bytes(0)
+    out = bytes_append(out, 0x78)
+    out = bytes_append(out, 0x01)
+    let dlen = bytes_len(data)
+    let max_block = 65535
+    let pos = 0
+    // Emit at least one block even for empty input, so the stream is valid.
+    let running = 1
+    while running == 1
+        let remaining = dlen - pos
+        let take = remaining
+        if take > max_block
+            take = max_block
+        let is_final = 0
+        if remaining <= max_block
+            is_final = 1
+        let chunk = bytes_slice(data, pos, pos + take)
+        out = _png_deflate_stored_block(out, chunk, is_final)
+        pos = pos + take
+        if is_final == 1
+            running = 0
+    let adler = _png_adler32_bytes(data)
+    out = _png_put_u32be(out, adler)
+    out
+
+// ── png_encode_rgb ────────────────────────────────────────────────────────────
+// Encode a raw 8-bit truecolor (RGB) image into a complete PNG file.
+//   width, height — image dimensions in pixels
+//   rgb_bytes     — row-major RGB pixel data, exactly width*height*3 bytes
+// Returns the full PNG file bytes: signature ++ IHDR ++ IDAT ++ IEND.
+// Returns bytes(0) if rgb_bytes is not exactly width*height*3 bytes long.
+fn png_encode_rgb(width, height, rgb_bytes) -> bytes
+    let expected_len = width * height * 3
+    let result = bytes(0)
+    if bytes_len(rgb_bytes) == expected_len
+        // Filter every scanline with filter type 0 ("None"): prefix each row
+        // with a single 0x00 byte, then the row's raw RGB bytes, unmodified.
+        let row_stride = width * 3
+        let raw = bytes(0)
+        let y = 0
+        while y < height
+            raw = bytes_append(raw, 0)
+            let row_start = y * row_stride
+            let row = bytes_slice(rgb_bytes, row_start, row_start + row_stride)
+            raw = bytes_concat(raw, row)
+            y = y + 1
+        let idat_data = _png_zlib_wrap_stored(raw)
+        let out = png_signature()
+        out = bytes_concat(out, png_write_chunk("IHDR", png_ihdr(width, height, 8, 2)))
+        out = bytes_concat(out, png_write_chunk("IDAT", idat_data))
+        out = bytes_concat(out, png_write_chunk("IEND", bytes(0)))
+        result = out
     result

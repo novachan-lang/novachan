@@ -1,0 +1,338 @@
+// ============================================================================
+// forge_nats -- NATS text-protocol client
+// ============================================================================
+// Pure-NOVA NATS client speaking the NATS text protocol over raw TCP (no
+// libnats), mirroring forge_mysql's raw-socket driver shape: hand-rolled
+// framing + a thin live-socket wrapper on top of a fully unit-testable codec.
+//
+// Protocol (NATS text protocol -- https://docs.nats.io/reference/reference-protocols/nats-protocol):
+//   CLIENT -> SERVER:
+//     CONNECT {json}\r\n                          -- announce client options
+//     PUB <subject> [reply-to] <#bytes>\r\n<payload>\r\n
+//     SUB <subject> [queue-group] <sid>\r\n        -- subscribe; sid chosen by client
+//     UNSUB <sid> [max-msgs]\r\n                   -- unsubscribe (optionally after N more msgs)
+//     PING\r\n / PONG\r\n                          -- heartbeat
+//   SERVER -> CLIENT:
+//     INFO {json}\r\n                              -- server info, first line after connect
+//     MSG <subject> <sid> [reply-to] <#bytes>\r\n<payload>\r\n
+//     PING\r\n / PONG\r\n / +OK\r\n / -ERR <msg>\r\n
+//
+// PUBLIC API -- BUILDERS (all return bytes; binary-safe, never build wire
+// bytes through chr()+string concatenation -- see
+// reference_nova_string_nul_truncation.md):
+//   nats_connect(name)                          -> bytes
+//   nats_pub(subject, payload)                  -> bytes
+//   nats_pub_reply(subject, reply_to, payload)  -> bytes
+//   nats_sub(subject, sid)                      -> bytes
+//   nats_sub_queue(subject, queue, sid)         -> bytes
+//   nats_unsub(sid)                             -> bytes
+//   nats_unsub_max(sid, max_msgs)               -> bytes
+//   nats_ping()                                 -> bytes
+//   nats_pong()                                 -> bytes
+//
+// PUBLIC API -- PARSER (operates on an accumulating recv buffer, resumable):
+//   nats_parse_line(b, pos) -> [op_dict, next_pos]
+//     Parses ONE server protocol unit (a control line, or a control line +
+//     its payload for MSG) starting at pos. next_pos == -1 means buf does
+//     not yet hold a complete unit -- caller must recv more bytes and retry
+//     nats_parse_line with the SAME pos.
+//     op_dict keys: "op" ("INFO"|"MSG"|"PING"|"PONG"|"OK"|"ERR"|""),
+//       "info" (INFO json text), "subject"/"sid"/"reply"/"len"/"payload" (MSG),
+//       "msg" (ERR text). Fields not relevant to the op are at their zero value.
+//
+// PUBLIC API -- LIVE CLIENT (thin wrapper over the codec above, mirrors
+// forge_mysql's mysql_connect shape; returns a Result via ok()/err()):
+//   nats_open(host, port, name) -> Result<dict>   dict = {"sock","buf","info"}
+//   nats_publish(conn, subject, payload)                  -> int (0 ok)
+//   nats_publish_reply(conn, subject, reply_to, payload)  -> int (0 ok)
+//   nats_subscribe(conn, subject, sid)                    -> int (0 ok)
+//   nats_subscribe_queue(conn, subject, queue, sid)       -> int (0 ok)
+//   nats_unsubscribe(conn, sid)                           -> int (0 ok)
+//   nats_next_msg(conn) -> op_dict   -- blocks until a non-PING unit arrives;
+//     transparently answers server PINGs with PONG and keeps consuming.
+//   nats_close(conn)
+//
+// DESIGN NOTES:
+//   * CRLF = bytes 13,10 throughout (never backslash escapes), same
+//     precedent as std/net/resp2.nova.
+//   * Payloads are always `bytes` (never string) so a NUL byte in a message
+//     body survives -- NOVA strings are C-strings and NUL-truncate.
+//   * PUB/SUB/MSG header tokens never contain spaces or CRLF per the NATS
+//     spec, so splitting the (text) header line on the space byte is safe.
+//   * All private helpers are prefixed _nt_ to avoid symbol collisions.
+//   * The codec (nats_pub/nats_sub/.../nats_parse_line) needs no socket and
+//     is what the KAT exercises byte-exact; nats_open/... needs a live
+//     NATS server and is a thin wrapper reusing that codec.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// _nt_crlf_bytes: append CRLF (0x0D 0x0A) to buf, return buf.
+fn _nt_crlf_bytes(buf)
+    buf = bytes_append(buf, 13)
+    buf = bytes_append(buf, 10)
+    buf
+
+// _nt_find_crlf: scan bytes b starting at pos, return index of the 0x0D that
+// is immediately followed by 0x0A. Returns -1 if not found.
+fn _nt_find_crlf(b, pos: int) -> int
+    let n = bytes_len(b)
+    let i = pos
+    let found = 0 - 1
+    while i < n - 1
+        if bytes_get(b, i) == 13 and bytes_get(b, i + 1) == 10
+            found = i
+            i = n
+        i = i + 1
+    found
+
+// _nt_range_to_str: decode bytes b[start..end) as a text string (protocol
+// control lines are always ASCII).
+fn _nt_range_to_str(b, start: int, end: int) -> string
+    let s = ""
+    let i = start
+    while i < end
+        s = s + chr(bytes_get(b, i))
+        i = i + 1
+    s
+
+// _nt_parse_uint: parse a non-negative decimal integer from a token string.
+// Non-digit input contributes 0 (matches std/net/beanstalkd's _bn_parse_int).
+fn _nt_parse_uint(s: string) -> int
+    let n = len(s)
+    let i = 0
+    let acc = 0
+    while i < n
+        let c = ord(char_at(s, i))
+        if c >= 48 and c <= 57
+            acc = acc * 10 + (c - 48)
+        i = i + 1
+    acc
+
+// _nt_empty_op: an op_dict with every field at its zero/empty value.
+fn _nt_empty_op() -> dict
+    let d = {}
+    d["op"] = ""
+    d["info"] = ""
+    d["subject"] = ""
+    d["sid"] = 0
+    d["reply"] = ""
+    d["len"] = 0
+    d["payload"] = bytes(0)
+    d["msg"] = ""
+    d
+
+// _nt_parse_msg: parse a "MSG ..." header line (already CRLF-stripped) plus
+// its trailing payload out of b. after_line = offset of the byte right after
+// the header's CRLF. Returns [op_dict, next_pos] -- next_pos == -1 if the
+// payload isn't fully buffered yet (caller retries from the ORIGINAL pos).
+fn _nt_parse_msg(b, line: string, after_line: int) -> any
+    let tokens = split(line, " ")
+    let ntok = len(tokens)
+    if ntok != 4 and ntok != 5
+        return [_nt_empty_op(), after_line]
+    let d = _nt_empty_op()
+    d["op"] = "MSG"
+    d["subject"] = tokens[1]
+    d["sid"] = _nt_parse_uint(tokens[2])
+    let plen = 0
+    if ntok == 4
+        d["reply"] = ""
+        plen = _nt_parse_uint(tokens[3])
+    else
+        d["reply"] = tokens[3]
+        plen = _nt_parse_uint(tokens[4])
+    d["len"] = plen
+    let need = after_line + plen + 2
+    if bytes_len(b) < need
+        return [_nt_empty_op(), 0 - 1]
+    d["payload"] = bytes_slice(b, after_line, after_line + plen)
+    [d, need]
+
+// ── Public: BUILDERS ─────────────────────────────────────────────────────────
+
+// nats_connect: build a CONNECT command announcing the client.
+// Wire: CONNECT {"verbose":false,"pedantic":false,"name":<name>}\r\n
+fn nats_connect(name: string) -> any
+    let opts = {}
+    opts["verbose"] = false
+    opts["pedantic"] = false
+    opts["name"] = name
+    let buf = str_to_bytes("CONNECT " + json_stringify(opts))
+    _nt_crlf_bytes(buf)
+
+// nats_pub: build a PUB command with no reply-to subject.
+// Wire: "PUB <subject> <#bytes>\r\n<payload>\r\n"
+// Example: nats_pub("foo", str_to_bytes("hello")) -> "PUB foo 5\r\nhello\r\n"
+fn nats_pub(subject: string, payload) -> any
+    let buf = str_to_bytes("PUB " + subject + " " + str(bytes_len(payload)))
+    buf = _nt_crlf_bytes(buf)
+    buf = bytes_concat(buf, payload)
+    _nt_crlf_bytes(buf)
+
+// nats_pub_reply: build a PUB command carrying a reply-to subject.
+// Wire: "PUB <subject> <reply-to> <#bytes>\r\n<payload>\r\n"
+fn nats_pub_reply(subject: string, reply_to: string, payload) -> any
+    let buf = str_to_bytes("PUB " + subject + " " + reply_to + " " + str(bytes_len(payload)))
+    buf = _nt_crlf_bytes(buf)
+    buf = bytes_concat(buf, payload)
+    _nt_crlf_bytes(buf)
+
+// nats_sub: build a SUB command (no queue group).
+// Wire: "SUB <subject> <sid>\r\n"
+// Example: nats_sub("bar", 1) -> "SUB bar 1\r\n"
+fn nats_sub(subject: string, sid: int) -> any
+    _nt_crlf_bytes(str_to_bytes("SUB " + subject + " " + str(sid)))
+
+// nats_sub_queue: build a SUB command joining a queue group (work-sharing).
+// Wire: "SUB <subject> <queue> <sid>\r\n"
+fn nats_sub_queue(subject: string, queue: string, sid: int) -> any
+    _nt_crlf_bytes(str_to_bytes("SUB " + subject + " " + queue + " " + str(sid)))
+
+// nats_unsub: build an UNSUB command (unsubscribe immediately).
+// Wire: "UNSUB <sid>\r\n"
+fn nats_unsub(sid: int) -> any
+    _nt_crlf_bytes(str_to_bytes("UNSUB " + str(sid)))
+
+// nats_unsub_max: build an UNSUB command that auto-unsubscribes after
+// max_msgs more messages. Wire: "UNSUB <sid> <max_msgs>\r\n"
+fn nats_unsub_max(sid: int, max_msgs: int) -> any
+    _nt_crlf_bytes(str_to_bytes("UNSUB " + str(sid) + " " + str(max_msgs)))
+
+// nats_ping / nats_pong: heartbeat lines.
+fn nats_ping() -> any
+    _nt_crlf_bytes(str_to_bytes("PING"))
+
+fn nats_pong() -> any
+    _nt_crlf_bytes(str_to_bytes("PONG"))
+
+// ── Public: PARSER ───────────────────────────────────────────────────────────
+
+// nats_parse_line: parse ONE server protocol unit starting at pos in b.
+// See module header for the [op_dict, next_pos] contract.
+fn nats_parse_line(b, pos: int) -> any
+    let crlf = _nt_find_crlf(b, pos)
+    if crlf == 0 - 1
+        return [_nt_empty_op(), 0 - 1]
+    let line = _nt_range_to_str(b, pos, crlf)
+    let after_line = crlf + 2
+    if len(line) >= 5 and slice(line, 0, 5) == "INFO "
+        let d = _nt_empty_op()
+        d["op"] = "INFO"
+        d["info"] = slice(line, 5, len(line))
+        return [d, after_line]
+    if len(line) >= 4 and slice(line, 0, 4) == "MSG "
+        return _nt_parse_msg(b, line, after_line)
+    if line == "PING"
+        let d = _nt_empty_op()
+        d["op"] = "PING"
+        return [d, after_line]
+    if line == "PONG"
+        let d = _nt_empty_op()
+        d["op"] = "PONG"
+        return [d, after_line]
+    if line == "+OK"
+        let d = _nt_empty_op()
+        d["op"] = "OK"
+        return [d, after_line]
+    if len(line) >= 5 and slice(line, 0, 5) == "-ERR "
+        let d = _nt_empty_op()
+        d["op"] = "ERR"
+        d["msg"] = slice(line, 5, len(line))
+        return [d, after_line]
+    [_nt_empty_op(), after_line]
+
+// ── Live client (thin wrapper over the codec above) ─────────────────────────
+
+// _nt_read_unit: recv from sock into buf until nats_parse_line(buf, 0)
+// yields a complete unit; returns [op_dict, leftover_buf]. On a closed
+// socket (0-byte recv) before a unit completes, returns an empty op with
+// whatever was buffered.
+fn _nt_read_unit(sock: int, buf) -> any
+    let result = nats_parse_line(buf, 0)
+    while result[1] == 0 - 1
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return [_nt_empty_op(), buf]
+        buf = bytes_concat(buf, chunk)
+        result = nats_parse_line(buf, 0)
+    [result[0], bytes_slice(buf, result[1], bytes_len(buf))]
+
+// nats_open: connect, read the server's INFO greeting, send CONNECT + PING,
+// wait for the PONG. Returns ok(conn) or err(message).
+fn nats_open(host: string, port: int, name: string) -> any
+    let sock = tcp_connect(host, port)
+    if sock < 0
+        return err("nats: cannot connect to " + host + ":" + str(port))
+    let buf = bytes(0)
+    let greet = _nt_read_unit(sock, buf)
+    buf = greet[1]
+    let info_op = greet[0]
+    if info_op["op"] != "INFO"
+        tcp_close(sock)
+        return err("nats: expected INFO greeting, got op=" + info_op["op"])
+    tcp_send_bytes(sock, nats_connect(name))
+    tcp_send_bytes(sock, nats_ping())
+    let pong_ok = 0
+    let tries = 0
+    while pong_ok == 0 and tries < 10
+        let r = _nt_read_unit(sock, buf)
+        buf = r[1]
+        let op = r[0]
+        if op["op"] == "PONG"
+            pong_ok = 1
+        else if op["op"] == "ERR"
+            tcp_close(sock)
+            return err("nats: " + op["msg"])
+        tries = tries + 1
+    if pong_ok == 0
+        tcp_close(sock)
+        return err("nats: no PONG after CONNECT")
+    let conn = {}
+    conn["sock"] = sock
+    conn["buf"] = buf
+    conn["info"] = info_op["info"]
+    ok(conn)
+
+// nats_publish / nats_publish_reply: send PUB over an open connection.
+fn nats_publish(conn, subject: string, payload) -> int
+    tcp_send_bytes(conn["sock"], nats_pub(subject, payload))
+    0
+
+fn nats_publish_reply(conn, subject: string, reply_to: string, payload) -> int
+    tcp_send_bytes(conn["sock"], nats_pub_reply(subject, reply_to, payload))
+    0
+
+// nats_subscribe / nats_subscribe_queue: send SUB over an open connection.
+fn nats_subscribe(conn, subject: string, sid: int) -> int
+    tcp_send_bytes(conn["sock"], nats_sub(subject, sid))
+    0
+
+fn nats_subscribe_queue(conn, subject: string, queue: string, sid: int) -> int
+    tcp_send_bytes(conn["sock"], nats_sub_queue(subject, queue, sid))
+    0
+
+// nats_unsubscribe: send UNSUB over an open connection.
+fn nats_unsubscribe(conn, sid: int) -> int
+    tcp_send_bytes(conn["sock"], nats_unsub(sid))
+    0
+
+// nats_next_msg: block until the next non-PING unit arrives, transparently
+// answering server PINGs with PONG along the way. Mutates conn["buf"].
+fn nats_next_msg(conn) -> any
+    let looking = 1
+    let result = _nt_empty_op()
+    while looking == 1
+        let r = _nt_read_unit(conn["sock"], conn["buf"])
+        conn["buf"] = r[1]
+        let op = r[0]
+        if op["op"] == "PING"
+            tcp_send_bytes(conn["sock"], nats_pong())
+        else
+            result = op
+            looking = 0
+    result
+
+// nats_close: close the underlying socket.
+fn nats_close(conn)
+    tcp_close(conn["sock"])

@@ -1,0 +1,166 @@
+// KAT for std/media/png png_encode_rgb (PNG RGB encoder, RFC 2083).
+import std/media/png
+
+fn fail(msg: str)
+    print("FAIL " + msg)
+    exit(1)
+
+// ── Test 1: 1x1 red pixel image ───────────────────────────────────────────
+let px = bytes(0)
+px = bytes_append(px, 255)   // R
+px = bytes_append(px, 0)     // G
+px = bytes_append(px, 0)     // B
+
+let png = png_encode_rgb(1, 1, px)
+
+if bytes_len(png) < 8
+    fail("output too short for signature")
+
+// output[0..8) must equal the PNG signature: 89 50 4E 47 0D 0A 1A 0A
+let sig = [137, 80, 78, 71, 13, 10, 26, 10]
+let i = 0
+while i < 8
+    if bytes_get(png, i) != sig[i]
+        fail("signature byte " + str(i) + " mismatch: got " + str(bytes_get(png, i)))
+    i = i + 1
+
+// Parse chunks and validate IHDR content + independently-recomputed CRC.
+let chunks = png_read_chunks(png)
+if len(chunks) < 3
+    fail("expected at least 3 chunks (IHDR, IDAT, IEND), got " + str(len(chunks)))
+
+let ihdr_chunk = chunks[0]
+if ihdr_chunk["type"] != "IHDR"
+    fail("first chunk is not IHDR: " + ihdr_chunk["type"])
+
+let ihdr_data = ihdr_chunk["data"]
+if bytes_len(ihdr_data) != 13
+    fail("IHDR data length != 13: " + str(bytes_len(ihdr_data)))
+
+// width (u32 BE) == 1
+let w = (bytes_get(ihdr_data, 0) * 16777216) + (bytes_get(ihdr_data, 1) * 65536) + (bytes_get(ihdr_data, 2) * 256) + bytes_get(ihdr_data, 3)
+if w != 1
+    fail("IHDR width != 1: " + str(w))
+
+// height (u32 BE) == 1
+let h = (bytes_get(ihdr_data, 4) * 16777216) + (bytes_get(ihdr_data, 5) * 65536) + (bytes_get(ihdr_data, 6) * 256) + bytes_get(ihdr_data, 7)
+if h != 1
+    fail("IHDR height != 1: " + str(h))
+
+let bitdepth = bytes_get(ihdr_data, 8)
+if bitdepth != 8
+    fail("IHDR bit depth != 8: " + str(bitdepth))
+
+let colortype = bytes_get(ihdr_data, 9)
+if colortype != 2
+    fail("IHDR color type != 2 (truecolor): " + str(colortype))
+
+if bytes_get(ihdr_data, 10) != 0
+    fail("IHDR compression method != 0")
+if bytes_get(ihdr_data, 11) != 0
+    fail("IHDR filter method != 0")
+if bytes_get(ihdr_data, 12) != 0
+    fail("IHDR interlace method != 0")
+
+// Independently recompute the IHDR chunk's CRC-32 (over "IHDR" ++ data) and
+// compare it against the CRC-32 stored in the file, read directly from the
+// raw output bytes (not via png_read_chunks, so this is a true independent
+// check of the encoder's CRC field).
+// IHDR chunk starts at offset 8: [len:4][type:4][data:13][crc:4]
+let type_and_data = bytes(0)
+type_and_data = bytes_append(type_and_data, 73)   // 'I'
+type_and_data = bytes_append(type_and_data, 72)   // 'H'
+type_and_data = bytes_append(type_and_data, 68)   // 'D'
+type_and_data = bytes_append(type_and_data, 82)   // 'R'
+type_and_data = bytes_concat(type_and_data, ihdr_data)
+let expected_crc = crc32(type_and_data)
+
+let crc_off = 8 + 4 + 4 + 13
+let stored_crc = (bytes_get(png, crc_off) * 16777216) + (bytes_get(png, crc_off + 1) * 65536) + (bytes_get(png, crc_off + 2) * 256) + bytes_get(png, crc_off + 3)
+if stored_crc != expected_crc
+    fail("IHDR CRC mismatch: stored=" + str(stored_crc) + " expected=" + str(expected_crc))
+
+// IDAT chunk present with non-empty compressed data.
+let idat_chunk = chunks[1]
+if idat_chunk["type"] != "IDAT"
+    fail("second chunk is not IDAT: " + idat_chunk["type"])
+if bytes_len(idat_chunk["data"]) < 1
+    fail("IDAT data is empty")
+
+// Round-trip: manually unwrap the STORED-deflate zlib stream and verify the
+// recovered raw scanline == filter-byte(0) ++ original RGB bytes.
+let idat = idat_chunk["data"]
+if bytes_get(idat, 0) != 0x78
+    fail("zlib CMF byte != 0x78: " + str(bytes_get(idat, 0)))
+// header byte of first (and only, for this tiny image) stored block at
+// offset 2: bit0=BFINAL must be 1 (only one block for 4 bytes of data).
+if bytes_get(idat, 2) != 1
+    fail("deflate stored-block header != 1 (final): " + str(bytes_get(idat, 2)))
+let stored_len = bytes_get(idat, 3) + (bytes_get(idat, 4) * 256)
+if stored_len != 4
+    fail("stored block LEN != 4 (1 filter byte + 3 rgb bytes): " + str(stored_len))
+let stored_nlen = bytes_get(idat, 5) + (bytes_get(idat, 6) * 256)
+if stored_nlen != (65535 - 4)
+    fail("stored block NLEN != one's complement of LEN: " + str(stored_nlen))
+// recovered raw data starts at offset 7
+if bytes_get(idat, 7) != 0
+    fail("scanline filter byte != 0 (None)")
+if bytes_get(idat, 8) != 255
+    fail("recovered R byte != 255: " + str(bytes_get(idat, 8)))
+if bytes_get(idat, 9) != 0
+    fail("recovered G byte != 0: " + str(bytes_get(idat, 9)))
+if bytes_get(idat, 10) != 0
+    fail("recovered B byte != 0: " + str(bytes_get(idat, 10)))
+
+// Last chunk must be IEND, with correct type and CRC.
+let iend_chunk = chunks[len(chunks) - 1]
+if iend_chunk["type"] != "IEND"
+    fail("last chunk is not IEND: " + iend_chunk["type"])
+
+// File must end with the exact 12-byte IEND chunk: 00000000 49454E44 AE426082
+let flen = bytes_len(png)
+let tail = bytes_slice(png, flen - 12, flen)
+let expected_iend = [0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]
+let j = 0
+while j < 12
+    if bytes_get(tail, j) != expected_iend[j]
+        fail("IEND tail byte " + str(j) + " mismatch: got " + str(bytes_get(tail, j)) + " want " + str(expected_iend[j]))
+    j = j + 1
+
+// ── Test 2: 2x2 image (exercises multi-row scanline filtering) ───────────
+let px2 = bytes(0)
+// row 0: green, blue
+px2 = bytes_append(px2, 0)
+px2 = bytes_append(px2, 255)
+px2 = bytes_append(px2, 0)
+px2 = bytes_append(px2, 0)
+px2 = bytes_append(px2, 0)
+px2 = bytes_append(px2, 255)
+// row 1: white, black
+px2 = bytes_append(px2, 255)
+px2 = bytes_append(px2, 255)
+px2 = bytes_append(px2, 255)
+px2 = bytes_append(px2, 0)
+px2 = bytes_append(px2, 0)
+px2 = bytes_append(px2, 0)
+
+let png2 = png_encode_rgb(2, 2, px2)
+let chunks2 = png_read_chunks(png2)
+if len(chunks2) < 3
+    fail("2x2: expected at least 3 chunks")
+let ihdr2 = chunks2[0]["data"]
+let w2 = (bytes_get(ihdr2, 0) * 16777216) + (bytes_get(ihdr2, 1) * 65536) + (bytes_get(ihdr2, 2) * 256) + bytes_get(ihdr2, 3)
+let h2 = (bytes_get(ihdr2, 4) * 16777216) + (bytes_get(ihdr2, 5) * 65536) + (bytes_get(ihdr2, 6) * 256) + bytes_get(ihdr2, 7)
+if w2 != 2
+    fail("2x2: IHDR width != 2: " + str(w2))
+if h2 != 2
+    fail("2x2: IHDR height != 2: " + str(h2))
+
+// Reject mismatched-length pixel buffer.
+let bad = bytes(0)
+bad = bytes_append(bad, 1)
+let png_bad = png_encode_rgb(2, 2, bad)
+if bytes_len(png_bad) != 0
+    fail("expected bytes(0) for mismatched-length rgb_bytes")
+
+print("PASS png_encode")

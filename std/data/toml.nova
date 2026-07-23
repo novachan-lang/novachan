@@ -1,0 +1,583 @@
+// ============================================================================
+// NOVA Standard Library — std/data/toml
+// ============================================================================
+// TOML v1.0 document PARSER. Parses TOML source text into a nested NOVA dict.
+//
+// PUBLIC API
+//   toml_parse(text: string) -> dict
+//     Parse a whole TOML document into a nested dict.
+//   toml_get(config: dict, path: string) -> any
+//     Dotted-path lookup ("database.port") into a parsed dict; "" if any
+//     segment along the path is missing or not a dict.
+//
+// SUPPORTED SURFACE (TOML v1.0)
+//   - bare key = value                      title = "NOVA"
+//   - dotted keys                           a.b.c = 1        (implicit tables)
+//   - basic strings "..." with escapes      \n \t \" \\ \r   (unknown escape:
+//                                            backslash dropped, char kept literal)
+//   - literal strings '...'                 no escape processing
+//   - integers                              42, -7, 1_000 (underscores stripped)
+//   - floats                                3.14, -0.5, 1e10, 6.02_214e23
+//   - booleans                              true / false
+//   - arrays                                [1, 2, 3]  — MAY span multiple
+//                                            lines and contain '#' comments
+//                                            inside the brackets; trailing
+//                                            comma allowed (beyond the single-
+//                                            line form the spec calls for)
+//   - [table] headers                       nested dict at that dotted path
+//   - [[array.of.tables]] headers           list-of-dicts; each occurrence
+//                                            appends a new dict and becomes
+//                                            the target for subsequent keys /
+//                                            subtable headers (so a following
+//                                            `[fruits.physical]` after
+//                                            `[[fruits]]` correctly nests into
+//                                            the LAST appended element — this
+//                                            is standard TOML v1.0 behaviour)
+//   - comments                              # to end of line (not honoured
+//                                            inside a quoted string)
+//
+// KNOWN SUBSET LIMITS (documented, not silently wrong):
+//   - No triple-quoted multi-line strings (""" / ''').
+//   - No inline tables ({ k = v }) as a value.
+//   - No hex/octal/binary integers (0x.., 0o.., 0b..), no inf/nan.
+//   - No RFC-3339 datetime type — a bareword that doesn't parse as a plain
+//     int/float is returned verbatim as its raw string (safe fallback, never
+//     a crash).
+//   - Quoted keys ("a b" = 1) ARE supported as a bonus (reuses the same
+//     string-body parser) even though the task spec only requires bare keys.
+//
+// NOVA TYPING NOTE: `type_of(true) == "int"` (documented language gotcha —
+// booleans and integers share scalar representation), but `x == true` /
+// `x == false` comparisons on a bool-boxed value still evaluate correctly;
+// verified empirically for the exact shape used here (single `let result`
+// of inferred `any` type, reassigned across branches, one final `return`).
+//
+// DESIGN NOTES
+//   - Mutable cursor threaded as dict {"pos": int} (same convention as
+//     std/data/json5.nova and std/data/edn.nova).
+//   - Single-exit style throughout (avoid the NOVA early-return mistag bug).
+//   - No multi-line list/dict literals in module body (NOVA parser limit).
+//   - All private helpers prefixed `_tm_` to avoid symbol collisions.
+//   - LEAF module — imports nothing.
+//
+// KAT vectors (see nova-compiler/test_programs/_toml_test.nova):
+//   toml_parse('title = "NOVA"\n[db]\nport = 5432\nenabled = true\n
+//               tags = ["x","y"]\n[[srv]]\nip = "10.0.0.1"\n[[srv]]\n
+//               ip = "10.0.0.2"')
+//     -> result["title"] == "NOVA"
+//     -> result["db"]["port"] == 5432
+//     -> result["db"]["enabled"] == true
+//     -> result["db"]["tags"][1] == "y"
+//     -> len(result["srv"]) == 2
+//     -> result["srv"][1]["ip"] == "10.0.0.2"
+// ============================================================================
+
+// ── Character classification ─────────────────────────────────────────────────
+
+// _tm_is_hspace: 1 if code-point o is horizontal whitespace (space, tab).
+fn _tm_is_hspace(o)
+    let result = 0
+    if o == 32
+        result = 1
+    else
+        if o == 9
+            result = 1
+    return result
+
+// _tm_is_nl: 1 if code-point o is a newline component (LF or CR).
+fn _tm_is_nl(o)
+    let result = 0
+    if o == 10
+        result = 1
+    else
+        if o == 13
+            result = 1
+    return result
+
+// _tm_is_digit: 1 if code-point o is ASCII '0'-'9'.
+fn _tm_is_digit(o)
+    let result = 0
+    if o >= 48
+        if o <= 57
+            result = 1
+    return result
+
+// _tm_is_bare_key_char: 1 if o is valid in a bare TOML key (A-Z a-z 0-9 _ -).
+fn _tm_is_bare_key_char(o)
+    let result = 0
+    if o >= 65
+        if o <= 90
+            result = 1
+    if result == 0
+        if o >= 97
+            if o <= 122
+                result = 1
+    if result == 0
+        if _tm_is_digit(o) == 1
+            result = 1
+    if result == 0
+        if o == 95
+            result = 1
+    if result == 0
+        if o == 45
+            result = 1
+    return result
+
+// ── Skipping: whitespace, newlines, comments ─────────────────────────────────
+
+// _tm_skip_h: advance st["pos"] past horizontal whitespace only (does not
+// cross a newline — used mid-line, where a value stops at end of line).
+fn _tm_skip_h(s, n, st)
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            if _tm_is_hspace(ord(char_at(s, p))) == 1
+                st["pos"] = p + 1
+            else
+                go = 0
+
+// _tm_skip_to_eol: advance st["pos"] to just before the next '\n' (or EOF).
+// Used to discard a '#' comment; does not consume the newline itself.
+fn _tm_skip_to_eol(s, n, st)
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            if ord(char_at(s, p)) == 10
+                go = 0
+            else
+                st["pos"] = p + 1
+
+// _tm_skip_ws_nl_comments: advance st["pos"] past any mix of whitespace,
+// newlines, and '#' line comments. Used between top-level statements and
+// (since arrays may span multiple lines) between array elements.
+fn _tm_skip_ws_nl_comments(s, n, st)
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if _tm_is_hspace(o) == 1
+                st["pos"] = p + 1
+            else
+                if _tm_is_nl(o) == 1
+                    st["pos"] = p + 1
+                else
+                    if o == 35
+                        _tm_skip_to_eol(s, n, st)
+                    else
+                        go = 0
+
+// ── String bodies ─────────────────────────────────────────────────────────────
+
+// _tm_parse_basic_string: parse a double-quoted string body (pos must be just
+// AFTER the opening '"'). Handles \n \t \" \\ \r; any other escaped char is
+// kept literal (backslash dropped). Stops at the closing '"' or EOF.
+fn _tm_parse_basic_string(s, n, st)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if o == 34
+                st["pos"] = p + 1
+                go = 0
+            else
+                if o == 92
+                    st["pos"] = p + 1
+                    let q = st["pos"]
+                    if q < n
+                        let ec = char_at(s, q)
+                        let eo = ord(ec)
+                        st["pos"] = q + 1
+                        if eo == 110
+                            buf = buf + chr(10)
+                        else
+                            if eo == 116
+                                buf = buf + chr(9)
+                            else
+                                if eo == 34
+                                    buf = buf + chr(34)
+                                else
+                                    if eo == 92
+                                        buf = buf + chr(92)
+                                    else
+                                        if eo == 114
+                                            buf = buf + chr(13)
+                                        else
+                                            buf = buf + ec
+                else
+                    buf = buf + char_at(s, p)
+                    st["pos"] = p + 1
+    return buf
+
+// _tm_parse_literal_string: parse a single-quoted string body (pos must be
+// just AFTER the opening "'"). No escape processing (TOML literal-string
+// semantics). Stops at the closing "'" or EOF.
+fn _tm_parse_literal_string(s, n, st)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            if ord(char_at(s, p)) == 39
+                st["pos"] = p + 1
+                go = 0
+            else
+                buf = buf + char_at(s, p)
+                st["pos"] = p + 1
+    return buf
+
+// ── Bare tokens / scalar classification ──────────────────────────────────────
+
+// _tm_read_bare_key: read a run of bare-key characters.
+fn _tm_read_bare_key(s, n, st)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if _tm_is_bare_key_char(o) == 1
+                buf = buf + char_at(s, p)
+                st["pos"] = p + 1
+            else
+                go = 0
+    return buf
+
+// _tm_read_bare_token: read a value-position bareword — stops at horizontal
+// whitespace, newline, ',', ']', '}', '#', or EOF. Used for numbers/booleans.
+fn _tm_read_bare_token(s, n, st)
+    let buf = ""
+    let go = 1
+    while go == 1
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            let stop = 0
+            if _tm_is_hspace(o) == 1
+                stop = 1
+            else
+                if _tm_is_nl(o) == 1
+                    stop = 1
+                else
+                    if o == 44
+                        stop = 1
+                    else
+                        if o == 93
+                            stop = 1
+                        else
+                            if o == 125
+                                stop = 1
+                            else
+                                if o == 35
+                                    stop = 1
+            if stop == 1
+                go = 0
+            else
+                buf = buf + char_at(s, p)
+                st["pos"] = p + 1
+    return buf
+
+// _tm_strip_underscores: remove '_' digit-group separators from a token.
+fn _tm_strip_underscores(tok)
+    let out = ""
+    let n = len(tok)
+    let i = 0
+    while i < n
+        let c = char_at(tok, i)
+        if c != "_"
+            out = out + c
+        i = i + 1
+    return out
+
+// _tm_is_numeric: 1 if cleaned (underscore-stripped) token is a plain decimal
+// integer or float literal: optional leading sign, digits, optional single
+// '.', optional single exponent ('e'/'E', optional sign, digits).
+fn _tm_is_numeric(tok)
+    let n = len(tok)
+    let result = 0
+    if n > 0
+        let i = 0
+        if char_at(tok, 0) == "-"
+            i = 1
+        else
+            if char_at(tok, 0) == "+"
+                i = 1
+        if i < n
+            let digits_seen = 0
+            let dot_seen = 0
+            let exp_seen = 0
+            let ok = 1
+            while i < n
+                let c = char_at(tok, i)
+                if _tm_is_digit(ord(c)) == 1
+                    digits_seen = 1
+                    i = i + 1
+                else
+                    if c == "." and dot_seen == 0 and exp_seen == 0
+                        dot_seen = 1
+                        i = i + 1
+                    else
+                        if (c == "e" or c == "E") and exp_seen == 0 and digits_seen == 1
+                            exp_seen = 1
+                            i = i + 1
+                            if i < n
+                                if char_at(tok, i) == "+" or char_at(tok, i) == "-"
+                                    i = i + 1
+                        else
+                            ok = 0
+                            i = n
+            if ok == 1 and digits_seen == 1
+                result = 1
+    return result
+
+// _tm_classify_scalar: classify a bareword read in value position into
+// bool / int / float / raw string (fallback for anything out of scope, e.g.
+// a datetime literal — never crashes).
+fn _tm_classify_scalar(tok)
+    let result = null
+    if tok == "true"
+        result = true
+    else
+        if tok == "false"
+            result = false
+        else
+            let cleaned = _tm_strip_underscores(tok)
+            if _tm_is_numeric(cleaned) == 1
+                if find(cleaned, ".") >= 0 or find(cleaned, "e") >= 0 or find(cleaned, "E") >= 0
+                    result = parse_float(cleaned)
+                else
+                    result = parse_int(cleaned)
+            else
+                result = tok
+    return result
+
+// ── Values (strings, arrays, scalars) ────────────────────────────────────────
+
+// _tm_parse_array: parse array elements after the opening '[' (pos just
+// after it) until the closing ']'. Tolerant of newlines, '#' comments, and a
+// trailing comma inside the brackets (beyond the single-line array form the
+// task spec calls for — cheap and low-risk to support).
+fn _tm_parse_array(s, n, st)
+    let result = []
+    let go = 1
+    while go == 1
+        _tm_skip_ws_nl_comments(s, n, st)
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(s, p))
+            if o == 93
+                st["pos"] = p + 1
+                go = 0
+            else
+                if o == 44
+                    st["pos"] = p + 1
+                else
+                    let v = _tm_parse_value(s, n, st)
+                    push(result, v)
+    return result
+
+// _tm_parse_value: parse a single TOML value at the current cursor position.
+// Dispatches on the first non-horizontal-whitespace character.
+fn _tm_parse_value(s, n, st)
+    _tm_skip_h(s, n, st)
+    let result = null
+    let p = st["pos"]
+    if p < n
+        let o = ord(char_at(s, p))
+        if o == 34
+            st["pos"] = p + 1
+            result = _tm_parse_basic_string(s, n, st)
+        else
+            if o == 39
+                st["pos"] = p + 1
+                result = _tm_parse_literal_string(s, n, st)
+            else
+                if o == 91
+                    st["pos"] = p + 1
+                    result = _tm_parse_array(s, n, st)
+                else
+                    let tok = _tm_read_bare_token(s, n, st)
+                    result = _tm_classify_scalar(tok)
+    return result
+
+// ── Key paths (dotted keys, table header names) ──────────────────────────────
+
+// _tm_read_key_path: read a dotted key path ("a.b.c") into a list of segment
+// strings. A segment may be a bare key, a double-quoted string, or a
+// single-quoted (literal) string.
+fn _tm_read_key_path(s, n, st)
+    let segs = []
+    let go = 1
+    while go == 1
+        _tm_skip_h(s, n, st)
+        let p = st["pos"]
+        let seg = ""
+        if p < n
+            let o = ord(char_at(s, p))
+            if o == 34
+                st["pos"] = p + 1
+                seg = _tm_parse_basic_string(s, n, st)
+            else
+                if o == 39
+                    st["pos"] = p + 1
+                    seg = _tm_parse_literal_string(s, n, st)
+                else
+                    seg = _tm_read_bare_key(s, n, st)
+        push(segs, seg)
+        _tm_skip_h(s, n, st)
+        let q = st["pos"]
+        if q < n and ord(char_at(s, q)) == 46
+            st["pos"] = q + 1
+        else
+            go = 0
+    return segs
+
+// ── Tree navigation / assignment ─────────────────────────────────────────────
+
+// _tm_nav: resolve dict `node`'s child `key` as the dict to descend into for
+// an intermediate path segment. If the child doesn't exist, creates an empty
+// dict there. If the child is a list (an array-of-tables, from `[[x]]`),
+// descends into its LAST element — this is what makes `[fruits.physical]`
+// correctly attach to the most recently appended `[[fruits]]` entry.
+fn _tm_nav(node, key)
+    let result = {}
+    if contains(node, key)
+        let v = node[key]
+        if type_of(v) == "dict"
+            result = v
+        else
+            if type_of(v) == "list"
+                let ln = len(v)
+                if ln > 0
+                    result = v[ln - 1]
+                else
+                    let d = {}
+                    push(v, d)
+                    result = d
+            else
+                // Name collision with a scalar (invalid TOML) — defensively
+                // replace with a fresh table rather than crash.
+                let d = {}
+                node[key] = d
+                result = d
+    else
+        let d = {}
+        node[key] = d
+        result = d
+    return result
+
+// _tm_assign: assign `value` at dotted path `segs` starting from dict `root`,
+// creating any missing intermediate tables.
+fn _tm_assign(root, segs, value)
+    let parent = root
+    let n = len(segs)
+    let i = 0
+    while i < n - 1
+        parent = _tm_nav(parent, segs[i])
+        i = i + 1
+    parent[segs[n - 1]] = value
+
+// _tm_open_table: process a `[table]` or `[[array.of.tables]]` header whose
+// dotted segments are `segs`. Returns the dict that subsequent key = value
+// lines / nested headers should target.
+fn _tm_open_table(root, segs, is_array)
+    let parent = root
+    let n = len(segs)
+    let i = 0
+    while i < n - 1
+        parent = _tm_nav(parent, segs[i])
+        i = i + 1
+    let last = segs[n - 1]
+    let current = {}
+    if is_array == 1
+        let arr = []
+        if contains(parent, last) and type_of(parent[last]) == "list"
+            arr = parent[last]
+        else
+            parent[last] = arr
+        let newd = {}
+        push(arr, newd)
+        current = newd
+    else
+        current = _tm_nav(parent, last)
+    return current
+
+// ── Top-level document parser ────────────────────────────────────────────────
+
+// toml_parse: parse a whole TOML document into a nested dict. Top-level keys
+// (before any `[table]` header) go directly into the result; keys after a
+// `[table]`/`[[array]]` header go into that (possibly nested) table.
+fn toml_parse(text: string) -> dict
+    let result = {}
+    let current = result
+    let n = len(text)
+    let st = {}
+    st["pos"] = 0
+    let go = 1
+    while go == 1
+        _tm_skip_ws_nl_comments(text, n, st)
+        let p = st["pos"]
+        if p >= n
+            go = 0
+        else
+            let o = ord(char_at(text, p))
+            if o == 91
+                st["pos"] = p + 1
+                let is_array = 0
+                if st["pos"] < n and ord(char_at(text, st["pos"])) == 91
+                    is_array = 1
+                    st["pos"] = st["pos"] + 1
+                let segs = _tm_read_key_path(text, n, st)
+                _tm_skip_h(text, n, st)
+                if st["pos"] < n and ord(char_at(text, st["pos"])) == 93
+                    st["pos"] = st["pos"] + 1
+                if is_array == 1
+                    if st["pos"] < n and ord(char_at(text, st["pos"])) == 93
+                        st["pos"] = st["pos"] + 1
+                current = _tm_open_table(result, segs, is_array)
+            else
+                let segs2 = _tm_read_key_path(text, n, st)
+                _tm_skip_h(text, n, st)
+                if st["pos"] < n and ord(char_at(text, st["pos"])) == 61
+                    st["pos"] = st["pos"] + 1
+                _tm_skip_h(text, n, st)
+                let val = _tm_parse_value(text, n, st)
+                _tm_assign(current, segs2, val)
+    return result
+
+// toml_get: dotted-path lookup ("database.port") into a parsed dict; "" if
+// any segment along the path is missing or not a dict.
+fn toml_get(config: dict, path: string) -> any
+    let segs = split(path, ".")
+    let node = config
+    let result = ""
+    let ok = 1
+    for seg in segs
+        if ok == 1
+            if type_of(node) == "dict" and contains(node, seg)
+                node = node[seg]
+            else
+                ok = 0
+    if ok == 1
+        result = node
+    return result

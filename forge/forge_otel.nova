@@ -1,0 +1,122 @@
+// forge_otel — OpenTelemetry OTLP/HTTP (JSON) trace-export PAYLOAD BUILDER (D7r.3/obs canonical home
+// for the OTLP protobuf-JSON mapping). Pure payload construction, no I/O -- forge_http_client's
+// otlp_export rides this over the outbound HTTP client to POST <endpoint>/v1/traces.
+//
+// Builds the ExportTraceServiceRequest JSON:
+//   resourceSpans[].resource.attributes[]
+//   resourceSpans[].scopeSpans[].scope.name
+//   resourceSpans[].scopeSpans[].spans[] = {traceId, spanId, name, kind, startTimeUnixNano,
+//     endTimeUnixNano, attributes[], status:{code[,message]}}
+//
+// Per proto3-JSON mapping rules: int64/fixed64 fields (nanosecond timestamps, integer attribute
+// values) serialize as JSON STRINGS -- a JSON number can only carry 53 bits of integer precision
+// exactly, and a nanosecond epoch timestamp needs the full 64. Doubles stay native JSON numbers
+// (IEEE-754 double round-trips through a JSON number losslessly; no string-wrapping rule applies to
+// them). Enums (kind, status code) are plain JSON numbers per the proto3 default int-enum mapping.
+//
+// SpanKind:   0=UNSPECIFIED 1=INTERNAL 2=SERVER 3=CLIENT 4=PRODUCER 5=CONSUMER
+// StatusCode: 0=UNSET 1=OK 2=ERROR
+
+// otel_attr_value(v) -> the OTLP AnyValue wrapper for one attribute value.
+//   string -> {"stringValue": v}
+//   float  -> {"doubleValue": v}          (native JSON number)
+//   else   -> {"intValue": str(v)}        (JSON STRING per the int64 rule above)
+// NOVA's `any` cannot distinguish bool from int at runtime (type_of(true) == "int" -- a known
+// language limitation, see reference_nova_string_nul_truncation.md family of gotchas), so a bool
+// attribute value is carried as an intValue "0"/"1" rather than a proper boolValue. Documented
+// limitation, not a silent bug: fix requires a language-level bool tag, tracked separately.
+fn otel_attr_value(v) -> dict
+    let t = type_of(v)
+    let val = {}
+    if t == "string"
+        val["stringValue"] = v
+    else if t == "float"
+        val["doubleValue"] = v
+    else
+        val["intValue"] = str(v)
+    val
+
+// otel_attributes(attrs) -> OTLP KeyValue list [{"key":k,"value":{...}}, ...] in the dict's
+// insertion order. NOVA dicts are dense/insertion-ordered (NovaDict.keys is "dense entries in
+// insertion order" in nova_runtime.c), so attribute order in the emitted JSON is deterministic and
+// matches the order the caller built the attributes dict in.
+fn otel_attributes(attrs: dict) -> list
+    let out = []
+    for k in keys(attrs)
+        let kv = {}
+        kv["key"] = k
+        kv["value"] = otel_attr_value(attrs[k])
+        push(out, kv)
+    out
+
+// otel_status(status) -> the OTLP Status object {"code":N[,"message":"..."]}. Both fields are
+// optional in the input dict; "code" defaults to 0 (UNSET). Every optional read is guarded with
+// contains() -- a missing dict key returns int 0 in NOVA, so reading status["code"] unguarded when
+// the caller omitted it would silently and correctly default to UNSET by accident, but reading
+// status["message"] unguarded when omitted would inject an unwanted "message":0 field. Guard both.
+fn otel_status(status: dict) -> dict
+    let code = 0
+    if contains(status, "code")
+        code = status["code"]
+    let out = {}
+    out["code"] = code
+    if contains(status, "message")
+        out["message"] = status["message"]
+    out
+
+// otel_span(span) -> one OTLP `spans[]` entry. Required fields: trace_id (16-byte/32-hex-char
+// string), span_id (8-byte/16-hex-char string), name, start_ns, end_ns (nanosecond epoch ints,
+// widened to JSON strings per the int64 rule). Optional, each defaulted and contains()-guarded:
+// kind (default 2/SERVER), attributes (default {} -> emits "attributes":[]), status (default
+// {"code":0} -> UNSET).
+fn otel_span(span: dict) -> dict
+    let kind = 2
+    if contains(span, "kind")
+        kind = span["kind"]
+    let attrs = {}
+    if contains(span, "attributes")
+        attrs = span["attributes"]
+    let status = {}
+    if contains(span, "status")
+        status = span["status"]
+    let o = {}
+    o["traceId"] = span["trace_id"]
+    o["spanId"] = span["span_id"]
+    o["name"] = span["name"]
+    o["kind"] = kind
+    o["startTimeUnixNano"] = str(span["start_ns"])
+    o["endTimeUnixNano"] = str(span["end_ns"])
+    o["attributes"] = otel_attributes(attrs)
+    o["status"] = otel_status(status)
+    o
+
+// otel_export_request(spans, resource_attrs, scope_name) -> the full OTLP/HTTP JSON body as a
+// string, ready to POST as the body of <endpoint>/v1/traces:
+//   {"resourceSpans":[{"resource":{"attributes":[...]},
+//     "scopeSpans":[{"scope":{"name":scope_name},"spans":[otel_span(...), ...]}]}]}
+// Pass {} / "" explicitly for resource_attrs / scope_name if the exporter has none -- NOVA parses
+// `= default` param syntax but does not fill it in at call sites that omit the argument (verified:
+// omitting an arg here is a hard arity-mismatch compile error, not a default-value substitution), so
+// this module does not rely on that syntax. An empty resource-attribute list and an empty scope name
+// are both valid OTLP (a collector treats "" as "no instrumentation scope name given", not an
+// error). All spans share the one resource + one scope, matching the common single-process,
+// single-tracer exporter shape; multi-resource/multi-scope batching is a tracked follow-up.
+fn otel_export_request(spans: list, resource_attrs: dict, scope_name: string) -> string
+    let out = []
+    let i = 0
+    while i < len(spans)
+        push(out, otel_span(spans[i]))
+        i = i + 1
+    let scope = {}
+    scope["name"] = scope_name
+    let scope_span = {}
+    scope_span["scope"] = scope
+    scope_span["spans"] = out
+    let resource = {}
+    resource["attributes"] = otel_attributes(resource_attrs)
+    let rs = {}
+    rs["resource"] = resource
+    rs["scopeSpans"] = [scope_span]
+    let root = {}
+    root["resourceSpans"] = [rs]
+    json_stringify(root)
