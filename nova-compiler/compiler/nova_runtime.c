@@ -19141,7 +19141,67 @@ typedef struct {
     char  enc[32768];   /* received-but-undecrypted ciphertext */
     int   enc_len;
     char  host[256];
+    unsigned char alpn_offer[128]; /* pre-built SEC_APPLICATION_PROTOCOLS blob (empty => no ALPN) */
+    int   alpn_offer_len;
+    char  alpn[64];     /* negotiated ALPN protocol id ("" if none) */
+    int   alpn_len;
 } NovaTlsConn;
+
+/* ── ALPN over SChannel ─────────────────────────────────────────────────────────
+   The SDK constants/struct for ALPN (Win 8.1+) may be absent in older headers, so
+   define them defensively (values are ABI-stable). We hand-build the offer blob and
+   hand-lay-out the query result, depending on no SDK ALPN typedefs. */
+#ifndef SECBUFFER_APPLICATION_PROTOCOLS
+#define SECBUFFER_APPLICATION_PROTOCOLS 18
+#endif
+#ifndef SECPKG_ATTR_APPLICATION_PROTOCOL
+#define SECPKG_ATTR_APPLICATION_PROTOCOL 35
+#endif
+/* SecApplicationProtocolNegotiationExt_ALPN = 2; NegotiationStatus_Success = 1 */
+#define NOVA_ALPN_EXT_ALPN 2
+#define NOVA_ALPN_STATUS_SUCCESS 1
+
+/* Result layout QueryContextAttributes writes for SECPKG_ATTR_APPLICATION_PROTOCOL. */
+typedef struct {
+    int  ProtoNegoStatus;   /* enum, 4 bytes */
+    int  ProtoNegoExt;      /* enum, 4 bytes */
+    unsigned char ProtocolIdSize;
+    unsigned char ProtocolId[255];
+} NovaAlpnResult;
+
+/* Build a SEC_APPLICATION_PROTOCOLS blob for a comma-separated proto list ("h2,http/1.1").
+   Wire/struct layout (packed, natural alignment matches): ProtocolListsSize(u32 LE) +
+   ProtoNegoExt(u32 LE=2) + ProtocolListSize(u16 LE) + ProtocolList([len u8][bytes]...).
+   Returns bytes written to out (<=outcap), or 0 on error/overflow. */
+static int nova_tls_build_alpn(const char* csv, unsigned char* out, int outcap) {
+    unsigned char plist[110]; int pl = 0;
+    const char* p = csv;
+    if (!csv || !*csv) return 0;
+    while (*p) {
+        const char* comma = strchr(p, ',');
+        int seg = comma ? (int)(comma - p) : (int)strlen(p);
+        if (seg <= 0 || seg > 255) return 0;
+        if (pl + 1 + seg > (int)sizeof(plist)) return 0;
+        plist[pl++] = (unsigned char)seg;
+        memcpy(plist + pl, p, (size_t)seg); pl += seg;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    if (pl == 0) return 0;
+    int listsSize = 4 + 2 + pl;    /* ProtoNegoExt(4) + ProtocolListSize(2) + list */
+    int total = 4 + listsSize;     /* + ProtocolListsSize(4) */
+    if (total > outcap) return 0;
+    int o = 0;
+    out[o++] = (unsigned char)(listsSize & 0xFF);
+    out[o++] = (unsigned char)((listsSize >> 8) & 0xFF);
+    out[o++] = (unsigned char)((listsSize >> 16) & 0xFF);
+    out[o++] = (unsigned char)((listsSize >> 24) & 0xFF);
+    out[o++] = (unsigned char)NOVA_ALPN_EXT_ALPN; out[o++] = 0; out[o++] = 0; out[o++] = 0;
+    out[o++] = (unsigned char)(pl & 0xFF);
+    out[o++] = (unsigned char)((pl >> 8) & 0xFF);
+    memcpy(out + o, plist, (size_t)pl); o += pl;
+    return o;
+}
 
 static int nova_tls_send_all_sock(NOVA_SOCKET s, const char* p, int n) {
     int sent = 0;
@@ -19157,10 +19217,17 @@ static int nova_tls_handshake(NovaTlsConn* c) {
     DWORD outFlags = 0;
     SecBuffer  outBuf; SecBufferDesc outDesc;
 
-    /* 1) generate ClientHello */
+    /* 1) generate ClientHello (optionally offering ALPN protocols via a SECBUFFER_APPLICATION_PROTOCOLS
+          input buffer -- SChannel embeds the ALPN extension into the ClientHello). */
     outBuf.pvBuffer = NULL; outBuf.BufferType = SECBUFFER_TOKEN; outBuf.cbBuffer = 0;
     outDesc.ulVersion = SECBUFFER_VERSION; outDesc.cBuffers = 1; outDesc.pBuffers = &outBuf;
-    ss = InitializeSecurityContextA(&c->cred, NULL, c->host, flags, 0, 0, NULL, 0,
+    SecBuffer alpnBuf; SecBufferDesc alpnDesc; SecBufferDesc* pAlpn = NULL;
+    if (c->alpn_offer_len > 0) {
+        alpnBuf.pvBuffer = c->alpn_offer; alpnBuf.cbBuffer = (DWORD)c->alpn_offer_len; alpnBuf.BufferType = SECBUFFER_APPLICATION_PROTOCOLS;
+        alpnDesc.ulVersion = SECBUFFER_VERSION; alpnDesc.cBuffers = 1; alpnDesc.pBuffers = &alpnBuf;
+        pAlpn = &alpnDesc;
+    }
+    ss = InitializeSecurityContextA(&c->cred, NULL, c->host, flags, 0, 0, pAlpn, 0,
                                     &c->ctxt, &outDesc, &outFlags, NULL);
     if (ss != SEC_I_CONTINUE_NEEDED) return 0;
     if (outBuf.cbBuffer && outBuf.pvBuffer) {
@@ -19206,6 +19273,15 @@ static int nova_tls_handshake(NovaTlsConn* c) {
     }
 
     if (QueryContextAttributesA(&c->ctxt, SECPKG_ATTR_STREAM_SIZES, &c->sizes) != SEC_E_OK) return 0;
+    /* Record the negotiated ALPN protocol (if we offered one and the server selected one). */
+    if (c->alpn_offer_len > 0) {
+        NovaAlpnResult ap; memset(&ap, 0, sizeof(ap));
+        if (QueryContextAttributesA(&c->ctxt, SECPKG_ATTR_APPLICATION_PROTOCOL, &ap) == SEC_E_OK
+            && ap.ProtoNegoStatus == NOVA_ALPN_STATUS_SUCCESS && ap.ProtocolIdSize > 0) {
+            int n = ap.ProtocolIdSize; if (n > (int)sizeof(c->alpn) - 1) n = (int)sizeof(c->alpn) - 1;
+            memcpy(c->alpn, ap.ProtocolId, (size_t)n); c->alpn[n] = 0; c->alpn_len = n;
+        }
+    }
     c->handshook = 1;
     return 1;
 }
@@ -19236,6 +19312,45 @@ int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) {
         return 0;
     }
     return (int64_t)(uintptr_t)c;
+}
+
+/* nova_rt_tls_connect_alpn: like tls_connect but offers ALPN protocols (comma-separated, e.g.
+   "h2,http/1.1"). Query the negotiated protocol with nova_rt_tls_alpn. A malformed offer falls
+   back to a plain (no-ALPN) handshake. This is the enabling primitive for h2/gRPC over TLS. */
+int64_t nova_rt_tls_connect_alpn(int64_t host_val, int64_t port_val, int64_t protos_val) {
+    const char* host = (const char*)(uintptr_t)host_val;
+    const char* protos = (const char*)(uintptr_t)protos_val;
+    if (!host) return 0;
+    int64_t tcp = nova_rt_tcp_connect(host_val, port_val);
+    if (tcp <= 0) return 0;
+    NovaTlsConn* c = (NovaTlsConn*)calloc(1, sizeof(NovaTlsConn));
+    if (!c) { nova_rt_tcp_close(tcp); return 0; }
+    c->sock = (NOVA_SOCKET)tcp;
+    strncpy(c->host, host, sizeof(c->host) - 1);
+    if (protos && *protos)
+        c->alpn_offer_len = nova_tls_build_alpn(protos, c->alpn_offer, (int)sizeof(c->alpn_offer));
+
+    SCHANNEL_CRED sc; memset(&sc, 0, sizeof(sc));
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_AUTO_CRED_VALIDATION;
+    TimeStamp ts;
+    SECURITY_STATUS ss = AcquireCredentialsHandleA(NULL, (SEC_CHAR*)UNISP_NAME_A, SECPKG_CRED_OUTBOUND,
+                                                   NULL, &sc, NULL, NULL, &c->cred, &ts);
+    if (ss != SEC_E_OK) { nova_rt_tcp_close(tcp); free(c); return 0; }
+    if (!nova_tls_handshake(c)) {
+        FreeCredentialsHandle(&c->cred);
+        nova_rt_tcp_close(tcp);
+        free(c);
+        return 0;
+    }
+    return (int64_t)(uintptr_t)c;
+}
+
+/* nova_rt_tls_alpn: the ALPN protocol negotiated on this TLS handle ("" if none / not offered). */
+int64_t nova_rt_tls_alpn(int64_t handle) {
+    NovaTlsConn* c = (NovaTlsConn*)(uintptr_t)handle;
+    if (!c) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    return (int64_t)(uintptr_t)nova_fat_str_create(c->alpn, c->alpn_len);
 }
 
 /* Server-side TLS requires a certificate; not yet implemented (honest stub). */
@@ -19528,6 +19643,50 @@ int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) {
     return (int64_t)(uintptr_t)C;
 }
 
+/* nova_rt_tls_connect_alpn (OpenSSL): like tls_connect but offers ALPN protocols (comma-separated,
+   e.g. "h2,http/1.1"). OpenSSL wants the bare wire list ([len][bytes]...); query with nova_rt_tls_alpn. */
+int64_t nova_rt_tls_connect_alpn(int64_t host_val, int64_t port_val, int64_t protos_val) {
+    nova_ssl_init_once();
+    const char* protos = (const char*)(uintptr_t)protos_val;
+    int64_t fd = nova_rt_tcp_connect(host_val, port_val);
+    if ((int)fd < 0) { nova_set_error("tls_connect_alpn: tcp connect failed"); return 0; }
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect_alpn: SSL_CTX_new failed"); return 0; }
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) { SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); return 0; }
+    SSL_set_fd(ssl, (int)fd);
+    const char* host = (const char*)(uintptr_t)host_val;
+    if (host) SSL_set_tlsext_host_name(ssl, host);
+    if (protos && *protos) {
+        unsigned char wire[110]; int wl = 0; int ok = 1; const char* p = protos;
+        while (*p) {
+            const char* comma = strchr(p, ',');
+            int seg = comma ? (int)(comma - p) : (int)strlen(p);
+            if (seg <= 0 || seg > 255 || wl + 1 + seg > (int)sizeof(wire)) { ok = 0; break; }
+            wire[wl++] = (unsigned char)seg;
+            memcpy(wire + wl, p, (size_t)seg); wl += seg;
+            if (!comma) break;
+            p = comma + 1;
+        }
+        if (ok && wl > 0) SSL_set_alpn_protos(ssl, wire, (unsigned int)wl); /* returns 0 on success (OpenSSL quirk) */
+    }
+    if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); nova_set_error("tls_connect_alpn: handshake failed"); return 0; }
+    NovaTls* C = (NovaTls*)calloc(1, sizeof(NovaTls));
+    if (!C) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); return 0; }
+    C->fd = (int)fd; C->ssl = ssl; C->ctx = ctx; C->own_ctx = 1;
+    return (int64_t)(uintptr_t)C;
+}
+
+/* nova_rt_tls_alpn (OpenSSL): the negotiated ALPN protocol ("" if none). */
+int64_t nova_rt_tls_alpn(int64_t handle) {
+    NovaTls* C = (NovaTls*)(uintptr_t)handle;
+    if (!C || !C->ssl) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    const unsigned char* data = NULL; unsigned int len = 0;
+    SSL_get0_alpn_selected(C->ssl, &data, &len);
+    if (!data || len == 0) return (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    return (int64_t)(uintptr_t)nova_fat_str_create((const char*)data, (int)len);
+}
+
 int64_t nova_rt_tls_send(int64_t handle, int64_t data_val) {
     NovaTls* C = (NovaTls*)(uintptr_t)handle;
     const char* d = (const char*)(uintptr_t)data_val;
@@ -19619,6 +19778,8 @@ int64_t nova_rt_tls_upgrade(int64_t sock_val, int64_t host_val, int64_t verify_v
 #else
 /* Non-Windows without OpenSSL: TLS unavailable (build with -DNOVA_HAVE_OPENSSL). */
 int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) { (void)host_val;(void)port_val; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
+int64_t nova_rt_tls_connect_alpn(int64_t a, int64_t b, int64_t c) { (void)a;(void)b;(void)c; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
+int64_t nova_rt_tls_alpn(int64_t a) { (void)a; return nova_rt_create_string((void*)""); }
 int64_t nova_rt_tls_listen(int64_t a, int64_t b, int64_t c) { (void)a;(void)b;(void)c; nova_set_error("tls: needs the OpenSSL build (-DNOVA_HAVE_OPENSSL)"); return 0; }
 int64_t nova_rt_tls_accept(int64_t a) { (void)a; return 0; }
 int64_t nova_rt_tls_send(int64_t a, int64_t b) { (void)a;(void)b; return 0; }
