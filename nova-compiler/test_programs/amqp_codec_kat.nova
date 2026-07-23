@@ -1,0 +1,114 @@
+// KAT: forge_amqp -- byte-exact protocol header, a Channel.Open frame, short/long-string encoders,
+// and a method-frame encode/parse round-trip.
+import forge_amqp
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn main()
+    // 1) protocol header: "AMQP" 0x00 0x00 0x09 0x01 (8 bytes)
+    let hdr = amqp_protocol_header()
+    if bytes_len(hdr) != 8
+        _fail("protocol header length, got " + str(bytes_len(hdr)))
+    if bytes_get(hdr, 0) != 65 or bytes_get(hdr, 1) != 77 or bytes_get(hdr, 2) != 81 or bytes_get(hdr, 3) != 80
+        _fail("protocol header 'AMQP' bytes")
+    if bytes_get(hdr, 4) != 0 or bytes_get(hdr, 5) != 0 or bytes_get(hdr, 6) != 9 or bytes_get(hdr, 7) != 1
+        _fail("protocol header version bytes")
+
+    // 2) Channel.Open frame: type=1, channel=1, class=20, method=10, reserved-1 empty shortstr.
+    //    payload = [00 14][00 0A][00] (5 bytes) -> frame = 1,00,01,00,00,00,05,00,14,00,0A,00,CE (13 bytes)
+    let chopen = amqp_method_frame(1, 20, 10, amqp_channel_open())
+    if bytes_len(chopen) != 13
+        _fail("Channel.Open frame length, got " + str(bytes_len(chopen)))
+    let expect = [1, 0, 1, 0, 0, 0, 5, 0, 20, 0, 10, 0, 206]
+    let i = 0
+    while i < 13
+        if bytes_get(chopen, i) != expect[i]
+            _fail("Channel.Open frame byte " + str(i) + " expected " + str(expect[i]) + " got " + str(bytes_get(chopen, i)))
+        i = i + 1
+
+    // 3a) short-string encoder: u8-len prefix + bytes, e.g. "AB" -> [2, 'A', 'B']
+    let ss = amqp_shortstr("AB")
+    if bytes_len(ss) != 3
+        _fail("shortstr length, got " + str(bytes_len(ss)))
+    if bytes_get(ss, 0) != 2 or bytes_get(ss, 1) != 65 or bytes_get(ss, 2) != 66
+        _fail("shortstr bytes")
+    let ssd = amqp_shortstr_decode(ss, 0)
+    if ssd[0] != "AB" or ssd[1] != 3
+        _fail("shortstr_decode round-trip")
+
+    // 3b) long-string encoder: u32-len prefix (BE) + bytes, e.g. "AB" -> [0,0,0,2, 'A','B']
+    let ls = amqp_longstr("AB")
+    if bytes_len(ls) != 6
+        _fail("longstr length, got " + str(bytes_len(ls)))
+    if bytes_get(ls, 0) != 0 or bytes_get(ls, 1) != 0 or bytes_get(ls, 2) != 0 or bytes_get(ls, 3) != 2
+        _fail("longstr length-prefix bytes")
+    if bytes_get(ls, 4) != 65 or bytes_get(ls, 5) != 66
+        _fail("longstr payload bytes")
+    let lsd = amqp_longstr_decode(ls, 0)
+    if lsd[0] != "AB" or lsd[1] != 6
+        _fail("longstr_decode round-trip")
+
+    // empty shortstr / longstr edge case (used by several encoders above -- must be exactly the prefix, no data)
+    if bytes_len(amqp_shortstr("")) != 1 or bytes_get(amqp_shortstr(""), 0) != 0
+        _fail("empty shortstr encoding")
+    if bytes_len(amqp_longstr("")) != 4
+        _fail("empty longstr encoding")
+
+    // 4) frame round-trip: encode a Basic.Publish method frame on channel 3, parse it back.
+    let args = amqp_basic_publish("myexch", "myqueue")
+    let frame = amqp_method_frame(3, 60, 40, args)
+    let pf = amqp_parse_frame(frame)
+    if len(pf) == 0
+        _fail("parse_frame returned empty on well-formed frame")
+    if pf[0] != 1
+        _fail("round-trip type, expected 1 (METHOD) got " + str(pf[0]))
+    if pf[1] != 3
+        _fail("round-trip channel, expected 3 got " + str(pf[1]))
+    if pf[2] != 60
+        _fail("round-trip class, expected 60 (Basic) got " + str(pf[2]))
+    if pf[3] != 40
+        _fail("round-trip method, expected 40 (Publish) got " + str(pf[3]))
+    if bytes_len(pf[4]) != bytes_len(args)
+        _fail("round-trip args length mismatch")
+    let exd = amqp_shortstr_decode(pf[4], 2)
+    if exd[0] != "myexch"
+        _fail("round-trip args content (exchange), got " + exd[0])
+
+    // frame-end corruption must be rejected
+    let bad = bytes_slice(frame, 0, bytes_len(frame) - 1)
+    bad = bytes_append(bad, 0)
+    if len(amqp_parse_frame(bad)) != 0
+        _fail("parse_frame accepted a frame with a corrupted frame-end marker")
+
+    // content-header + body frame shape (type=2 / type=3), used by amqp_publish_frames
+    let body = str_to_bytes("hello")
+    let hf = amqp_content_header_frame(2, 60, bytes_len(body))
+    let hpf = amqp_parse_frame(hf)
+    if hpf[0] != 2
+        _fail("content-header frame type, got " + str(hpf[0]))
+    let bf = amqp_body_frame(2, body)
+    let bpf = amqp_parse_frame(bf)
+    if bpf[0] != 3 or bytes_to_str(bpf[4]) != "hello"
+        _fail("body frame round-trip")
+
+    // Basic.Deliver decode against a hand-built args buffer.
+    let dargs = amqp_shortstr("ctag1")
+    let dtag = bytes(0)
+    let zi = 0
+    while zi < 7
+        dtag = bytes_append(dtag, 0)
+        zi = zi + 1
+    dtag = bytes_append(dtag, 42)
+    dargs = bytes_concat(dargs, dtag)
+    dargs = bytes_append(dargs, 1)
+    dargs = bytes_concat(dargs, amqp_shortstr("ex1"))
+    dargs = bytes_concat(dargs, amqp_shortstr("rk1"))
+    let dd = amqp_basic_deliver_decode(dargs)
+    if dd["consumer_tag"] != "ctag1" or dd["delivery_tag"] != 42 or dd["redelivered"] != 1 or dd["exchange"] != "ex1" or dd["routing_key"] != "rk1"
+        _fail("Basic.Deliver decode")
+
+    print("PASS forge_amqp")
+
+main()

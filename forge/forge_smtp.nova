@@ -1,0 +1,267 @@
+// forge_smtp -- an SMTP client (RFC 5321) over TCP, on the same tcp_*/tls_* runtime seam as the
+// Postgres/MySQL/Redis drivers. Command construction and reply parsing are PURE (delegated to
+// std/net/smtp_line, KAT-verified byte-exact); this file adds the socket glue (connect, read a full
+// reply block off the wire, STARTTLS upgrade, AUTH LOGIN, and a top-level smtp_send_mail transaction)
+// plus the forge-level command builders that take a plain address/hostname (not a pre-bracketed one --
+// std/net/smtp_line.smtp_command is address-syntax-agnostic; this file owns the RFC 5321 "<addr>"
+// wrapping for MAIL FROM / RCPT TO so callers never have to remember the angle brackets).
+//
+// Transport-agnostic reply loop: after STARTTLS the connection is TLS from that point on, so every
+// socket op here is guarded by a `use_tls` flag (0 = plaintext tcp_*, 1 = tls_* on the upgraded handle).
+//
+// AUTH LOGIN wire shape (RFC 4954): client sends "AUTH LOGIN\r\n", server replies "334 <b64 prompt>",
+// client sends base64(username)+CRLF, server replies "334 <b64 prompt>", client sends
+// base64(password)+CRLF, server replies 235 on success.
+
+import std/net/smtp_line
+import std/encoding/base64
+
+extern fn nova_rt_tls_upgrade(sock: int, host: string, verify: int) -> int
+
+// ── Pure command builders (byte-exact, RFC 5321) ────────────────────────────────
+
+// smtp_cmd_ehlo: "EHLO <hostname>\r\n"
+fn smtp_cmd_ehlo(hostname: string) -> string
+    smtp_command("EHLO", hostname)
+
+// smtp_cmd_helo: "HELO <hostname>\r\n" (legacy fallback when EHLO is rejected)
+fn smtp_cmd_helo(hostname: string) -> string
+    smtp_command("HELO", hostname)
+
+// smtp_cmd_mail_from: "MAIL FROM:<addr>\r\n" -- addr is the bare mailbox, brackets added here.
+fn smtp_cmd_mail_from(addr: string) -> string
+    smtp_command("MAIL FROM", "<" + addr + ">")
+
+// smtp_cmd_rcpt_to: "RCPT TO:<addr>\r\n" -- addr is the bare mailbox, brackets added here.
+fn smtp_cmd_rcpt_to(addr: string) -> string
+    smtp_command("RCPT TO", "<" + addr + ">")
+
+// smtp_cmd_data: "DATA\r\n" -- announces the message body follows.
+fn smtp_cmd_data() -> string
+    smtp_command("DATA", "")
+
+// smtp_cmd_dot: ".\r\n" -- the end-of-data marker (a lone dot on its own line).
+fn smtp_cmd_dot() -> string
+    smtp_command(".", "")
+
+// smtp_cmd_quit: "QUIT\r\n"
+fn smtp_cmd_quit() -> string
+    smtp_command("QUIT", "")
+
+// smtp_dot_stuff: RFC 5321 section 4.5.2 transparency (dot-stuffing) for the DATA phase body.
+// Any line of the message that begins with '.' has an extra '.' prepended, so the receiving
+// SMTP server can never mistake a body line for the "\r\n.\r\n" end-of-data marker. A line is
+// "begins the data" at offset 0 of `data`, and after every LF (line terminator boundary) --
+// CRLF structure is otherwise preserved byte-for-byte, only the leading dot (if any) is doubled.
+// smtp_dot_stuff(".")     -> ".."
+// smtp_dot_stuff("..x")   -> "...x"
+// smtp_dot_stuff("a\r\n.\r\nb") -> "a\r\n..\r\nb"
+fn smtp_dot_stuff(data: string) -> string
+    let n = len(data)
+    if n == 0
+        return data
+    let out = ""
+    let at_line_start = 1
+    let i = 0
+    while i < n
+        let ch = slice(data, i, i + 1)
+        if at_line_start == 1 and ch == "."
+            out = out + "."
+        out = out + ch
+        if ch == chr(10)
+            at_line_start = 1
+        else
+            at_line_start = 0
+        i = i + 1
+    out
+
+// smtp_cmd_starttls: "STARTTLS\r\n" (RFC 3207)
+fn smtp_cmd_starttls() -> string
+    smtp_command("STARTTLS", "")
+
+// smtp_cmd_auth_login: "AUTH LOGIN\r\n" (RFC 4954)
+fn smtp_cmd_auth_login() -> string
+    smtp_command("AUTH LOGIN", "")
+
+// smtp_cmd_rset: "RSET\r\n" -- aborts the current mail transaction.
+fn smtp_cmd_rset() -> string
+    smtp_command("RSET", "")
+
+// smtp_auth_b64_line: base64-encode `value` and append CRLF -- the wire shape for both the AUTH LOGIN
+// username line and the password line (RFC 4954 sends each credential as its own base64 blob).
+fn smtp_auth_b64_line(value: string) -> string
+    b64_encode(str_to_bytes(value)) + chr(13) + chr(10)
+
+// ── Pure reply parsing (re-exported for forge callers) ──────────────────────────
+
+// smtp_parse_reply: parse a complete SMTP reply block. Returns dict{code:int, lines:list, complete:int}.
+// See std/net/smtp_line.smtp_reply_parse for the full multi-line/single-line contract.
+fn smtp_parse_reply(text: string) -> dict
+    smtp_reply_parse(text)
+
+// smtp_reply_ok: 1 if `reply` (a parsed dict from smtp_parse_reply) is complete AND its code is a
+// positive (2xx/3xx) reply per RFC 5321 -- the standard "did the server accept this" check.
+fn smtp_reply_ok(reply: dict) -> int
+    if reply["complete"] == 0
+        return 0
+    smtp_is_positive(reply["code"])
+
+// ── Transport-agnostic socket glue ───────────────────────────────────────────────
+
+// _smtp_recv_chunk: read one chunk from the wire, tcp or tls depending on `use_tls`.
+fn _smtp_recv_chunk(handle: int, use_tls: int) -> string
+    if use_tls == 1
+        return tls_recv(handle, 4096)
+    tcp_recv(handle)
+
+// _smtp_send_line: write `data` to the wire, tcp or tls depending on `use_tls`. Returns bytes sent.
+fn _smtp_send_line(handle: int, use_tls: int, data: string) -> int
+    if use_tls == 1
+        return tls_send(handle, data)
+    tcp_send(handle, data)
+
+// _smtp_read_reply: read from the socket, accumulating chunks, until a complete SMTP reply block
+// (per smtp_reply_parse) has arrived, or the peer closes the connection. Returns the parsed dict;
+// on a premature close mid-reply, "complete" stays 0 so callers can detect the truncation.
+fn _smtp_read_reply(handle: int, use_tls: int) -> dict
+    let buf = ""
+    let done = 0
+    let out = smtp_parse_reply("")
+    while done == 0
+        let chunk = _smtp_recv_chunk(handle, use_tls)
+        if len(chunk) == 0
+            done = 1
+        else
+            buf = buf + chunk
+            let parsed = smtp_parse_reply(buf)
+            if parsed["complete"] == 1
+                out = parsed
+                done = 1
+            else
+                out = parsed
+    out
+
+// ── High-level session ───────────────────────────────────────────────────────────
+
+// smtp_send_mail: full send transaction -- connect, greeting, EHLO, optional STARTTLS+re-EHLO,
+// optional AUTH LOGIN, MAIL FROM, RCPT TO (one or more), DATA, body + dot, QUIT. `to_list` is a list
+// of recipient addresses (bare mailboxes, no brackets). `use_starttls`=1 upgrades the connection after
+// EHLO if the server advertises STARTTLS. `auth_user`/`auth_pass` empty strings skip AUTH LOGIN.
+// Returns ok(1) on a fully accepted transaction, err(message) on the first rejected/failed step.
+fn smtp_send_mail(host: string, port: int, helo_host: string, from_addr: string, to_list: list, data: string, use_starttls: int, auth_user: string, auth_pass: string) -> Result<int>
+    let sock = tcp_connect(host, port)
+    if sock <= 0
+        return err("smtp: connect failed to " + host + ":" + str(port))
+
+    let use_tls = 0
+    let handle = sock
+
+    let greet = _smtp_read_reply(handle, use_tls)
+    if smtp_reply_ok(greet) == 0
+        tcp_close(sock)
+        return err("smtp: bad greeting")
+
+    _smtp_send_line(handle, use_tls, smtp_cmd_ehlo(helo_host))
+    let ehlo1 = _smtp_read_reply(handle, use_tls)
+    if smtp_reply_ok(ehlo1) == 0
+        tcp_close(sock)
+        return err("smtp: EHLO rejected")
+
+    if use_starttls == 1
+        let caps = smtp_ehlo_caps_from(ehlo1)
+        let has_tls = _smtp_caps_has(caps, "STARTTLS")
+        if has_tls == 1
+            _smtp_send_line(handle, use_tls, smtp_cmd_starttls())
+            let tls_reply = _smtp_read_reply(handle, use_tls)
+            if smtp_reply_ok(tls_reply) == 0
+                tcp_close(sock)
+                return err("smtp: STARTTLS rejected")
+            let tlsh = unsafe nova_rt_tls_upgrade(sock, host, 1)
+            if tlsh <= 0
+                tcp_close(sock)
+                return err("smtp: TLS handshake failed")
+            handle = tlsh
+            use_tls = 1
+            _smtp_send_line(handle, use_tls, smtp_cmd_ehlo(helo_host))
+            let ehlo2 = _smtp_read_reply(handle, use_tls)
+            if smtp_reply_ok(ehlo2) == 0
+                tls_close(handle)
+                return err("smtp: post-STARTTLS EHLO rejected")
+
+    if len(auth_user) > 0
+        _smtp_send_line(handle, use_tls, smtp_cmd_auth_login())
+        let auth1 = _smtp_read_reply(handle, use_tls)
+        if smtp_reply_ok(auth1) == 0
+            _smtp_close(sock, handle, use_tls)
+            return err("smtp: AUTH LOGIN rejected")
+        _smtp_send_line(handle, use_tls, smtp_auth_b64_line(auth_user))
+        let auth2 = _smtp_read_reply(handle, use_tls)
+        if smtp_reply_ok(auth2) == 0
+            _smtp_close(sock, handle, use_tls)
+            return err("smtp: AUTH username rejected")
+        _smtp_send_line(handle, use_tls, smtp_auth_b64_line(auth_pass))
+        let auth3 = _smtp_read_reply(handle, use_tls)
+        if smtp_reply_ok(auth3) == 0
+            _smtp_close(sock, handle, use_tls)
+            return err("smtp: AUTH password rejected")
+
+    _smtp_send_line(handle, use_tls, smtp_cmd_mail_from(from_addr))
+    let mail_reply = _smtp_read_reply(handle, use_tls)
+    if smtp_reply_ok(mail_reply) == 0
+        _smtp_close(sock, handle, use_tls)
+        return err("smtp: MAIL FROM rejected")
+
+    let ti = 0
+    while ti < len(to_list)
+        _smtp_send_line(handle, use_tls, smtp_cmd_rcpt_to(to_list[ti]))
+        let rcpt_reply = _smtp_read_reply(handle, use_tls)
+        if smtp_reply_ok(rcpt_reply) == 0
+            _smtp_close(sock, handle, use_tls)
+            return err("smtp: RCPT TO rejected for " + to_list[ti])
+        ti = ti + 1
+
+    _smtp_send_line(handle, use_tls, smtp_cmd_data())
+    let data_reply = _smtp_read_reply(handle, use_tls)
+    if smtp_reply_ok(data_reply) == 0
+        _smtp_close(sock, handle, use_tls)
+        return err("smtp: DATA rejected")
+
+    _smtp_send_line(handle, use_tls, smtp_dot_stuff(data))
+    _smtp_send_line(handle, use_tls, smtp_cmd_dot())
+    let sent_reply = _smtp_read_reply(handle, use_tls)
+    if smtp_reply_ok(sent_reply) == 0
+        _smtp_close(sock, handle, use_tls)
+        return err("smtp: message rejected")
+
+    _smtp_send_line(handle, use_tls, smtp_cmd_quit())
+    _smtp_read_reply(handle, use_tls)
+    _smtp_close(sock, handle, use_tls)
+    ok(1)
+
+// smtp_ehlo_caps_from: extract EHLO capability keyword lines from an already-parsed EHLO reply dict.
+fn smtp_ehlo_caps_from(reply: dict) -> list
+    let caps = []
+    let lines = reply["lines"]
+    let i = 1
+    while i < len(lines)
+        push(caps, lines[i])
+        i = i + 1
+    caps
+
+// _smtp_caps_has: 1 if any capability line starts with `keyword` (case-sensitive, per RFC 5321 EHLO
+// keywords which are always uppercase ASCII).
+fn _smtp_caps_has(caps: list, keyword: string) -> int
+    let i = 0
+    let found = 0
+    while i < len(caps)
+        if starts_with(caps[i], keyword)
+            found = 1
+        i = i + 1
+    found
+
+// _smtp_close: close the underlying transport, whichever layer is active.
+fn _smtp_close(sock: int, handle: int, use_tls: int)
+    if use_tls == 1
+        tls_close(handle)
+    else
+        tcp_close(sock)

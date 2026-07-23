@@ -8,13 +8,13 @@ import forge_awssigv4
 fn s3_host(bucket: string, region: string) -> string
     bucket + ".s3." + region + ".amazonaws.com"
 
-// Build a fully-signed S3 request. amz_date = "YYYYMMDDTHHMMSSZ", date_stamp = "YYYYMMDD" (same instant).
-// `key` is the object key WITHOUT a leading slash (simple keys; URL-encode path segments for keys with spaces
-// or reserved chars before calling). Returns a dict: method/url/host/authorization/x-amz-date/x-amz-content-sha256.
-fn s3_request(access_key: string, secret: string, region: string, bucket: string, key: string, method: string, body: string, amz_date: string, date_stamp: string) -> dict
+// PRIVATE: shared canonical-request/signing core, parameterized on an already-computed payload_hash
+// (hex SHA-256, binary-safe or not depending on how the caller derived it). Both the string-body path
+// (s3_request) and the bytes-body path (s3_request_bytes) funnel through here so the signing logic --
+// including the "exactly one blank line before SIGNED_HEADERS" invariant -- exists in exactly one place.
+fn _s3_request_core(access_key: string, secret: string, region: string, bucket: string, key: string, method: string, payload_hash: string, amz_date: string, date_stamp: string) -> dict
     let host = s3_host(bucket, region)
     let uri = "/" + key
-    let payload_hash = sigv4_payload_hash(body)
     let nl = chr(10)
     let canonical_headers = "host:" + host + nl + "x-amz-content-sha256:" + payload_hash + nl + "x-amz-date:" + amz_date + nl
     let signed_headers = "host;x-amz-content-sha256;x-amz-date"
@@ -31,11 +31,34 @@ fn s3_request(access_key: string, secret: string, region: string, bucket: string
     out["x-amz-content-sha256"] = payload_hash
     out
 
+// Build a fully-signed S3 request. amz_date = "YYYYMMDDTHHMMSSZ", date_stamp = "YYYYMMDD" (same instant).
+// `key` is the object key WITHOUT a leading slash (simple keys; URL-encode path segments for keys with spaces
+// or reserved chars before calling). Returns a dict: method/url/host/authorization/x-amz-date/x-amz-content-sha256.
+// STRING body path -- NOVA's `string` NUL-truncates, so `body` must be NUL-free (text/JSON payloads only).
+// For arbitrary binary object content (images, archives, any upload that may contain 0x00) use
+// s3_request_bytes / s3_put_bytes instead, or the payload is silently truncated before it is hashed AND
+// signed -- the uploaded object would then be corrupted with no error raised anywhere in this path.
+fn s3_request(access_key: string, secret: string, region: string, bucket: string, key: string, method: string, body: string, amz_date: string, date_stamp: string) -> dict
+    _s3_request_core(access_key, secret, region, bucket, key, method, sigv4_payload_hash(body), amz_date, date_stamp)
+
+// BINARY-SAFE variant of s3_request: `body` is a `bytes` value, hashed via sigv4_payload_hash_bytes
+// (raw SHA-256 over body's actual byte content, embedded 0x00 included). Use this for any object whose
+// content is not guaranteed NUL-free -- the signed x-amz-content-sha256 will match the true payload.
+fn s3_request_bytes(access_key: string, secret: string, region: string, bucket: string, key: string, method: string, body: bytes, amz_date: string, date_stamp: string) -> dict
+    _s3_request_core(access_key, secret, region, bucket, key, method, sigv4_payload_hash_bytes(body), amz_date, date_stamp)
+
 fn s3_get(access_key: string, secret: string, region: string, bucket: string, key: string, amz_date: string, date_stamp: string) -> dict
     s3_request(access_key, secret, region, bucket, key, "GET", "", amz_date, date_stamp)
 
+// STRING body -- see s3_request's warning: NUL-unsafe, text/JSON payloads only. For binary object
+// content (images, archives, anything that may contain a 0x00 byte) use s3_put_bytes instead.
 fn s3_put(access_key: string, secret: string, region: string, bucket: string, key: string, body: string, amz_date: string, date_stamp: string) -> dict
     s3_request(access_key, secret, region, bucket, key, "PUT", body, amz_date, date_stamp)
+
+// BINARY-SAFE PUT: `body` is a `bytes` value, hashed/signed over its true byte content (embedded 0x00
+// included). This is the correct API for uploading arbitrary binary objects to S3.
+fn s3_put_bytes(access_key: string, secret: string, region: string, bucket: string, key: string, body: bytes, amz_date: string, date_stamp: string) -> dict
+    s3_request_bytes(access_key, secret, region, bucket, key, "PUT", body, amz_date, date_stamp)
 
 fn s3_delete(access_key: string, secret: string, region: string, bucket: string, key: string, amz_date: string, date_stamp: string) -> dict
     s3_request(access_key, secret, region, bucket, key, "DELETE", "", amz_date, date_stamp)

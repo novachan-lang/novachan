@@ -1,0 +1,105 @@
+// KAT for forge_awssigv4 + forge_s3 -- AWS Signature Version 4 signing, checked against:
+//  (a) the OFFICIAL AWS documentation SigV4 worked example (GET Object, examplebucket/test.txt,
+//      access key AKIAIOSFODNN7EXAMPLE / secret wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY,
+//      region us-east-1, service s3, date 20130524T000000Z, Range: bytes=0-9), and
+//  (b) an independently-computed oracle (Python hashlib/hmac, stdlib SHA-256/HMAC-SHA256 --
+//      not NOVA code) for the exact canonical form forge_s3.s3_get/s3_put emit.
+// A wrong signature = every S3 request 403s, so every value here is hard-asserted byte-for-byte.
+import forge_awssigv4
+import forge_s3
+import forge_crypto
+
+fn main()
+    let access_key = "AKIAIOSFODNN7EXAMPLE"
+    let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    let region = "us-east-1"
+    let service = "s3"
+    let amz_date = "20130524T000000Z"
+    let date_stamp = "20130524"
+    let nl = chr(10)
+
+    // --- Part A: official AWS docs "GET Object" example (examplebucket, test.txt, Range: bytes=0-9) ---
+    let empty_hash = sigv4_payload_hash("")
+    if empty_hash != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        print("FAIL empty-body payload hash: " + empty_hash)
+        exit(1)
+
+    let host_a = "examplebucket.s3.amazonaws.com"
+    let canonical_headers_a = "host:" + host_a + nl + "range:bytes=0-9" + nl + "x-amz-content-sha256:" + empty_hash + nl + "x-amz-date:" + amz_date + nl
+    let signed_headers_a = "host;range;x-amz-content-sha256;x-amz-date"
+    let creq_a = sigv4_canonical_request("GET", "/test.txt", "", canonical_headers_a, signed_headers_a, empty_hash)
+
+    let scope_a = sigv4_scope(date_stamp, region, service)
+    if scope_a != "20130524/us-east-1/s3/aws4_request"
+        print("FAIL scope: " + scope_a)
+        exit(1)
+
+    let sts_a = sigv4_string_to_sign(amz_date, scope_a, creq_a)
+    // AWS docs: Hash(CanonicalRequest) = 7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972
+    let expected_sts_a = "AWS4-HMAC-SHA256" + nl + amz_date + nl + scope_a + nl + "7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972"
+    if sts_a != expected_sts_a
+        print("FAIL string-to-sign (official vector) mismatch")
+        print("  got: " + sts_a)
+        print("  want:" + expected_sts_a)
+        exit(1)
+
+    let signing_key_a = sigv4_signing_key(secret, date_stamp, region, service)
+    let signing_key_hex_a = hex_of(signing_key_a)
+    if signing_key_hex_a != "dbb893acc010964918f1fd433add87c70e8b0db6be30c1fbeafefa5ec6ba8378"
+        print("FAIL signing key hex: " + signing_key_hex_a)
+        exit(1)
+
+    let sig_a = sigv4_signature(secret, date_stamp, region, service, sts_a)
+    // Independently recomputed oracle (Python hmac/hashlib) for the official AWS worked example.
+    let expected_sig_a = "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+    if sig_a != expected_sig_a
+        print("FAIL signature (official vector): " + sig_a)
+        print("  want: " + expected_sig_a)
+        exit(1)
+
+    let auth_a = sigv4_auth_header(access_key, scope_a, signed_headers_a, sig_a)
+    let expected_auth_a = "AWS4-HMAC-SHA256 Credential=" + access_key + "/" + scope_a + ", SignedHeaders=" + signed_headers_a + ", Signature=" + expected_sig_a
+    if auth_a != expected_auth_a
+        print("FAIL authorization header (official vector): " + auth_a)
+        exit(1)
+
+    // --- Part B: forge_s3.s3_get / s3_put header builders, cross-checked against an independent
+    // Python oracle for the exact virtual-hosted-style canonical form forge_s3 emits (no Range). ---
+    let bucket = "examplebucket"
+    let key = "test.txt"
+
+    let get_req = s3_get(access_key, secret, region, bucket, key, amz_date, date_stamp)
+    if get_req["method"] != "GET"
+        print("FAIL s3_get method")
+        exit(1)
+    if get_req["host"] != "examplebucket.s3.us-east-1.amazonaws.com"
+        print("FAIL s3_get host: " + get_req["host"])
+        exit(1)
+    if get_req["url"] != "https://examplebucket.s3.us-east-1.amazonaws.com/test.txt"
+        print("FAIL s3_get url: " + get_req["url"])
+        exit(1)
+    if get_req["x-amz-content-sha256"] != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        print("FAIL s3_get payload hash: " + get_req["x-amz-content-sha256"])
+        exit(1)
+    let expected_get_auth = "AWS4-HMAC-SHA256 Credential=" + access_key + "/" + scope_a + ", SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=2e46714501b0d9bc603dc14b792d5c58689e101d7de843b268d12fa638eb4bda"
+    if get_req["authorization"] != expected_get_auth
+        print("FAIL s3_get authorization")
+        print("  got: " + get_req["authorization"])
+        print("  want:" + expected_get_auth)
+        exit(1)
+
+    let put_req = s3_put(access_key, secret, region, bucket, key, "hello nova s3", amz_date, date_stamp)
+    if put_req["method"] != "PUT"
+        print("FAIL s3_put method")
+        exit(1)
+    if put_req["x-amz-content-sha256"] != "99102b51c6a82732b2b91d6d4a5e7e74a473faa8fa781f2bcfc66742dae63cd7"
+        print("FAIL s3_put payload hash: " + put_req["x-amz-content-sha256"])
+        exit(1)
+    let expected_put_auth = "AWS4-HMAC-SHA256 Credential=" + access_key + "/" + scope_a + ", SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=f757706863486eddafd1cf769fc0c018625459eccd081ac1e47ee58a8ff83866"
+    if put_req["authorization"] != expected_put_auth
+        print("FAIL s3_put authorization")
+        print("  got: " + put_req["authorization"])
+        print("  want:" + expected_put_auth)
+        exit(1)
+
+    print("PASS forge_awssigv4+forge_s3")

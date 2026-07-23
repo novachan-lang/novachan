@@ -1,0 +1,373 @@
+// forge_amqp -- an AMQP 0-9-1 (RabbitMQ) client PROTOCOL CODEC over raw TCP, mirroring the socket-driver
+// shape of forge_mqtt/forge_mysql/forge_pg. Wire = protocol header "AMQP\0\0\x09\x01" (8 bytes), then
+// frames: [type:u8][channel:u16 BE][size:u32 BE][payload][0xCE frame-end]. Frame types: METHOD=1,
+// HEADER=2, BODY=3, HEARTBEAT=8. A METHOD frame payload = class-id(u16 BE) + method-id(u16 BE) + args.
+// Args use two AMQP string encodings (short-string = u8-len prefix, max 255; long-string = u32-len
+// prefix) plus a field-table (u32 byte-length prefix, opaque contents -- we only ever emit EMPTY tables
+// and only ever need to SKIP non-empty ones on parse, so the length prefix alone is sufficient; we never
+// need to decode individual typed field-value entries).
+//
+// Covers: Connection.StartOk/TuneOk/Open encode, Connection.Start/Tune/OpenOk parse; Channel.Open
+// encode, Channel.OpenOk parse; Queue.Declare encode; Basic.Publish encode (+ content-header frame +
+// body frame); Basic.Deliver parse. Plus a TCP transport (amqp_open handshake / amqp_close) built on
+// tcp_connect/tcp_send_bytes/tcp_recv_bytes/tcp_close, framed like forge_mqtt's _mq_read_packet.
+//
+// SASL PLAIN auth response is NUL-delimited ("\0user\0pass") -- built via `bytes`, never a NOVA string
+// (NOVA strings are C-strings and NUL-truncate; see reference_nova_string_nul_truncation).
+
+// ── AMQP class ids: Connection=10 Channel=20 Exchange=40 Queue=50 Basic=60 ─────────────────────────
+// ── method ids used here: Start=10 StartOk=11 Tune=30 TuneOk=31 Open=40 OpenOk=41 (Connection) ─────
+// ──                       Open=10 OpenOk=11 (Channel) ── Declare=10 (Queue) ────────────────────────
+// ──                       Publish=40 Deliver=60 (Basic) ────────────────────────────────────────────
+
+// ── big-endian integer helpers (AMQP is big-endian on the wire, like PG/MySQL binary protocols) ────
+
+fn _amqp_be16(n: int) -> any
+    let b = bytes(0)
+    b = bytes_append(b, (n / 256) % 256)
+    b = bytes_append(b, n % 256)
+    b
+
+fn _amqp_be32(n: int) -> any
+    let b = bytes(0)
+    b = bytes_append(b, (n / 16777216) % 256)
+    b = bytes_append(b, (n / 65536) % 256)
+    b = bytes_append(b, (n / 256) % 256)
+    b = bytes_append(b, n % 256)
+    b
+
+fn _amqp_be64(n: int) -> any
+    let b = _amqp_be32(n / 4294967296)
+    bytes_concat(b, _amqp_be32(n % 4294967296))
+
+fn _amqp_rd_be16(b, off: int) -> int
+    (bytes_get(b, off) * 256) + bytes_get(b, off + 1)
+
+fn _amqp_rd_be32(b, off: int) -> int
+    (bytes_get(b, off) * 16777216) + (bytes_get(b, off + 1) * 65536) + (bytes_get(b, off + 2) * 256) + bytes_get(b, off + 3)
+
+fn _amqp_rd_be64(b, off: int) -> int
+    (_amqp_rd_be32(b, off) * 4294967296) + _amqp_rd_be32(b, off + 4)
+
+// ── short-string (u8-len prefix, max 255 bytes) / long-string (u32-len prefix) encoders+decoders ───
+
+// amqp_shortstr: AMQP short-string encoding (u8-len prefix, domain max 255 bytes). The emitted 1-byte
+// prefix MUST always equal the number of payload bytes actually appended -- for an input whose UTF-8
+// encoding exceeds 255 bytes we CLAMP the payload to the first 255 bytes (rather than silently wrapping
+// the prefix via `% 256`, which would desync every frame that follows on the wire).
+fn amqp_shortstr(s: string) -> any
+    let sb = str_to_bytes(s)
+    let n = bytes_len(sb)
+    if n > 255
+        sb = bytes_slice(sb, 0, 255)
+        n = 255
+    let b = bytes(0)
+    b = bytes_append(b, n)
+    bytes_concat(b, sb)
+
+fn amqp_longstr(s: string) -> any
+    let sb = str_to_bytes(s)
+    bytes_concat(_amqp_be32(bytes_len(sb)), sb)
+
+// amqp_longstr_bytes: long-string encoder over a `bytes` payload (NUL-safe -- used for the SASL PLAIN
+// response, which embeds literal NUL delimiters that a NOVA `string` cannot carry).
+fn amqp_longstr_bytes(b) -> any
+    bytes_concat(_amqp_be32(bytes_len(b)), b)
+
+// amqp_shortstr_decode / amqp_longstr_decode: return [string, next_offset].
+fn amqp_shortstr_decode(b, off: int) -> any
+    let n = bytes_get(b, off)
+    let s = bytes_to_str(bytes_slice(b, off + 1, off + 1 + n))
+    let r = []
+    push(r, s)
+    push(r, off + 1 + n)
+    r
+
+fn amqp_longstr_decode(b, off: int) -> any
+    let n = _amqp_rd_be32(b, off)
+    let s = bytes_to_str(bytes_slice(b, off + 4, off + 4 + n))
+    let r = []
+    push(r, s)
+    push(r, off + 4 + n)
+    r
+
+// ── field-table: on the wire it is [u32 byte-length][that many bytes of typed name/value pairs]. We
+// only ever emit an EMPTY table (valid for every method used here) and only ever need to skip a
+// non-empty one while parsing Connection.Start -- the length prefix alone lets us do both without
+// decoding the AMQP typed-value grammar.
+
+fn amqp_empty_table() -> any
+    _amqp_be32(0)
+
+// amqp_table_skip: given a field-table starting at `off`, return the offset just past it.
+fn amqp_table_skip(b, off: int) -> int
+    off + 4 + _amqp_rd_be32(b, off)
+
+// ── frame + method-frame construction ────────────────────────────────────────────────────────────
+
+// _amqp_frame: wrap a payload into a full frame: type + channel(BE16) + size(BE32) + payload + 0xCE.
+fn _amqp_frame(ftype: int, channel: int, payload) -> any
+    let f = bytes(0)
+    f = bytes_append(f, ftype)
+    f = bytes_concat(f, _amqp_be16(channel))
+    f = bytes_concat(f, _amqp_be32(bytes_len(payload)))
+    f = bytes_concat(f, payload)
+    bytes_append(f, 0xCE)
+
+fn amqp_method_frame(channel: int, class_id: int, method_id: int, args) -> any
+    let p = _amqp_be16(class_id)
+    p = bytes_concat(p, _amqp_be16(method_id))
+    p = bytes_concat(p, args)
+    _amqp_frame(1, channel, p)
+
+fn amqp_content_header_frame(channel: int, class_id: int, body_size: int) -> any
+    let p = _amqp_be16(class_id)
+    p = bytes_concat(p, _amqp_be16(0))
+    p = bytes_concat(p, _amqp_be64(body_size))
+    p = bytes_concat(p, _amqp_be16(0))
+    _amqp_frame(2, channel, p)
+
+fn amqp_body_frame(channel: int, body) -> any
+    _amqp_frame(3, channel, body)
+
+// amqp_protocol_header: the 8-byte AMQP 0-9-1 protocol header sent once, before any frame.
+fn amqp_protocol_header() -> any
+    let b = bytes(0)
+    b = bytes_append_str(b, "AMQP")
+    b = bytes_append(b, 0)
+    b = bytes_append(b, 0)
+    b = bytes_append(b, 9)
+    b = bytes_append(b, 1)
+    b
+
+// amqp_parse_frame: parse one complete raw frame's bytes (starting at the type byte, frame-end
+// INCLUDED) into [type, channel, class_id, method_id, args]. For METHOD frames class_id/method_id are
+// the real ids and `args` is the payload with the class/method header stripped off; for HEADER/BODY/
+// HEARTBEAT frames class_id=method_id=0 and `args` is the raw frame payload. Returns [] if the buffer
+// is short or the frame-end marker is not 0xCE (malformed frame).
+fn amqp_parse_frame(f) -> any
+    let total = bytes_len(f)
+    if total < 8
+        return []
+    let ftype = bytes_get(f, 0)
+    let channel = _amqp_rd_be16(f, 1)
+    let size = _amqp_rd_be32(f, 3)
+    if total < 7 + size + 1
+        return []
+    if bytes_get(f, 7 + size) != 0xCE
+        return []
+    let payload = bytes_slice(f, 7, 7 + size)
+    let r = []
+    if ftype == 1
+        let class_id = _amqp_rd_be16(payload, 0)
+        let method_id = _amqp_rd_be16(payload, 2)
+        push(r, ftype)
+        push(r, channel)
+        push(r, class_id)
+        push(r, method_id)
+        push(r, bytes_slice(payload, 4, size))
+        return r
+    push(r, ftype)
+    push(r, channel)
+    push(r, 0)
+    push(r, 0)
+    push(r, payload)
+    r
+
+// ── Connection class (id 10) ─────────────────────────────────────────────────────────────────────
+
+// amqp_connection_start_decode: Connection.Start (server->client) args ->
+// {version_major, version_minor, mechanisms, locales}. server-properties field-table is skipped.
+fn amqp_connection_start_decode(args) -> dict
+    let version_major = bytes_get(args, 0)
+    let version_minor = bytes_get(args, 1)
+    let pos = amqp_table_skip(args, 2)
+    let m = amqp_longstr_decode(args, pos)
+    pos = m[1]
+    let l = amqp_longstr_decode(args, pos)
+    let result = {}
+    result["version_major"] = version_major
+    result["version_minor"] = version_minor
+    result["mechanisms"] = m[0]
+    result["locales"] = l[0]
+    result
+
+// amqp_connection_startok: Connection.StartOk (client->server) args. client-properties = empty table,
+// mechanism = "PLAIN", response = SASL PLAIN "\0user\0pass" (bytes, NUL-safe), locale = "en_US".
+fn amqp_connection_startok(username: string, password: string) -> any
+    let args = amqp_empty_table()
+    args = bytes_concat(args, amqp_shortstr("PLAIN"))
+    let resp = bytes(0)
+    resp = bytes_append(resp, 0)
+    resp = bytes_append_str(resp, username)
+    resp = bytes_append(resp, 0)
+    resp = bytes_append_str(resp, password)
+    args = bytes_concat(args, amqp_longstr_bytes(resp))
+    bytes_concat(args, amqp_shortstr("en_US"))
+
+// amqp_connection_tune_decode: Connection.Tune (server->client) args -> {channel_max, frame_max, heartbeat}.
+fn amqp_connection_tune_decode(args) -> dict
+    let result = {}
+    result["channel_max"] = _amqp_rd_be16(args, 0)
+    result["frame_max"] = _amqp_rd_be32(args, 2)
+    result["heartbeat"] = _amqp_rd_be16(args, 6)
+    result
+
+// amqp_connection_tuneok: Connection.TuneOk (client->server) args.
+fn amqp_connection_tuneok(channel_max: int, frame_max: int, heartbeat: int) -> any
+    let args = _amqp_be16(channel_max)
+    args = bytes_concat(args, _amqp_be32(frame_max))
+    bytes_concat(args, _amqp_be16(heartbeat))
+
+// amqp_connection_open: Connection.Open (client->server) args -- virtual-host + two reserved fields
+// (empty shortstr `capabilities`, zero `insist` bit packed into one octet).
+fn amqp_connection_open(vhost: string) -> any
+    let args = amqp_shortstr(vhost)
+    args = bytes_concat(args, amqp_shortstr(""))
+    bytes_append(args, 0)
+
+// amqp_connection_openok_decode: Connection.OpenOk (server->client) has one reserved shortstr
+// (deprecated known-hosts) and nothing else meaningful; returns 1 if well-formed, 0 otherwise.
+fn amqp_connection_openok_decode(args) -> int
+    if bytes_len(args) < 1
+        return 0
+    1
+
+// ── Channel class (id 20) ────────────────────────────────────────────────────────────────────────
+
+// amqp_channel_open: Channel.Open (client->server) args -- one reserved empty shortstr (out-of-band).
+fn amqp_channel_open() -> any
+    amqp_shortstr("")
+
+// amqp_channel_openok_decode: Channel.OpenOk (server->client) has one reserved longstr (channel-id);
+// returns 1 if well-formed, 0 otherwise.
+fn amqp_channel_openok_decode(args) -> int
+    if bytes_len(args) < 4
+        return 0
+    1
+
+// ── Queue class (id 50) ──────────────────────────────────────────────────────────────────────────
+
+// amqp_queue_declare: Queue.Declare (client->server) args -- ticket=0, queue name, durable/exclusive/
+// auto-delete flags packed into one bits octet (passive and no-wait are always 0), empty arguments table.
+fn amqp_queue_declare(queue: string, durable: int, exclusive: int, auto_delete: int) -> any
+    let args = _amqp_be16(0)
+    args = bytes_concat(args, amqp_shortstr(queue))
+    let bits = 0
+    if durable == 1
+        bits = bits | 0x02
+    if exclusive == 1
+        bits = bits | 0x04
+    if auto_delete == 1
+        bits = bits | 0x08
+    args = bytes_concat(args, bytes_append(bytes(0), bits))
+    bytes_concat(args, amqp_empty_table())
+
+// ── Basic class (id 60) ──────────────────────────────────────────────────────────────────────────
+
+// amqp_basic_publish: Basic.Publish (client->server) method args -- ticket=0, exchange, routing-key,
+// mandatory/immediate bits (always 0 here). Must be followed on the wire by a content-header frame
+// (amqp_content_header_frame) and one or more body frames (amqp_body_frame) -- see amqp_publish_frames.
+fn amqp_basic_publish(exchange: string, routing_key: string) -> any
+    let args = _amqp_be16(0)
+    args = bytes_concat(args, amqp_shortstr(exchange))
+    args = bytes_concat(args, amqp_shortstr(routing_key))
+    bytes_append(args, 0)
+
+// amqp_publish_frames: encode a full Basic.Publish as three concatenated frames (method + content-header
+// + body), ready for one tcp_send_bytes call. `body` is the message payload as `bytes`.
+fn amqp_publish_frames(channel: int, exchange: string, routing_key: string, body) -> any
+    let f1 = amqp_method_frame(channel, 60, 40, amqp_basic_publish(exchange, routing_key))
+    let f2 = amqp_content_header_frame(channel, 60, bytes_len(body))
+    let f3 = amqp_body_frame(channel, body)
+    bytes_concat(bytes_concat(f1, f2), f3)
+
+// amqp_basic_deliver_decode: Basic.Deliver (server->client) args ->
+// {consumer_tag, delivery_tag, redelivered, exchange, routing_key}.
+fn amqp_basic_deliver_decode(args) -> dict
+    let ct = amqp_shortstr_decode(args, 0)
+    let pos = ct[1]
+    let delivery_tag = _amqp_rd_be64(args, pos)
+    pos = pos + 8
+    let redelivered = bytes_get(args, pos) & 0x01
+    pos = pos + 1
+    let ex = amqp_shortstr_decode(args, pos)
+    pos = ex[1]
+    let rk = amqp_shortstr_decode(args, pos)
+    let result = {}
+    result["consumer_tag"] = ct[0]
+    result["delivery_tag"] = delivery_tag
+    result["redelivered"] = redelivered
+    result["exchange"] = ex[0]
+    result["routing_key"] = rk[0]
+    result
+
+// ── TCP transport (framing like forge_mqtt's _mq_read_packet) ──────────────────────────────────────
+
+fn _amqp_recv_at_least(sock: int, buf, need: int) -> any
+    while bytes_len(buf) < need
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return buf
+        buf = bytes_concat(buf, chunk)
+    buf
+
+// _amqp_read_frame: read exactly one frame off sock, buffering with carried-over `buf`.
+// Returns [frame_bytes, leftover_buf]; frame_bytes is empty (len 0) on short read / EOF.
+fn _amqp_read_frame(sock: int, buf) -> any
+    buf = _amqp_recv_at_least(sock, buf, 7)
+    if bytes_len(buf) < 7
+        return [bytes(0), buf]
+    let size = _amqp_rd_be32(buf, 3)
+    let total = 7 + size + 1
+    buf = _amqp_recv_at_least(sock, buf, total)
+    if bytes_len(buf) < total
+        return [bytes(0), buf]
+    let frame = bytes_slice(buf, 0, total)
+    [frame, bytes_slice(buf, total, bytes_len(buf))]
+
+// amqp_open: TCP-connect to host:port and run the connection handshake (protocol header ->
+// Connection.Start -> StartOk -> Tune -> TuneOk -> Open -> OpenOk). Returns ok([sock, leftover_buf])
+// or err(message).
+fn amqp_open(host: string, port: int, vhost: string, username: string, password: string) -> any
+    let sock = tcp_connect(host, port)
+    if sock < 0
+        return err("amqp: cannot connect to " + host + ":" + str(port))
+    tcp_send_bytes(sock, amqp_protocol_header())
+    let buf = bytes(0)
+    let rd = _amqp_read_frame(sock, buf)
+    buf = rd[1]
+    if bytes_len(rd[0]) == 0
+        tcp_close(sock)
+        return err("amqp: no Connection.Start received")
+    let pf = amqp_parse_frame(rd[0])
+    if len(pf) == 0 or pf[2] != 10 or pf[3] != 10
+        tcp_close(sock)
+        return err("amqp: expected Connection.Start")
+    tcp_send_bytes(sock, amqp_method_frame(0, 10, 11, amqp_connection_startok(username, password)))
+    rd = _amqp_read_frame(sock, buf)
+    buf = rd[1]
+    if bytes_len(rd[0]) == 0
+        tcp_close(sock)
+        return err("amqp: no Connection.Tune received")
+    pf = amqp_parse_frame(rd[0])
+    if len(pf) == 0 or pf[2] != 10 or pf[3] != 30
+        tcp_close(sock)
+        return err("amqp: expected Connection.Tune")
+    let tune = amqp_connection_tune_decode(pf[4])
+    tcp_send_bytes(sock, amqp_method_frame(0, 10, 31, amqp_connection_tuneok(tune["channel_max"], tune["frame_max"], 0)))
+    tcp_send_bytes(sock, amqp_method_frame(0, 10, 40, amqp_connection_open(vhost)))
+    rd = _amqp_read_frame(sock, buf)
+    buf = rd[1]
+    if bytes_len(rd[0]) == 0
+        tcp_close(sock)
+        return err("amqp: no Connection.OpenOk received")
+    pf = amqp_parse_frame(rd[0])
+    if len(pf) == 0 or pf[2] != 10 or pf[3] != 41
+        tcp_close(sock)
+        return err("amqp: expected Connection.OpenOk")
+    ok([sock, buf])
+
+// amqp_close: close the TCP socket (no graceful Connection.Close/CloseOk round-trip -- v1 scope).
+fn amqp_close(sock: int)
+    tcp_close(sock)

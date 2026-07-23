@@ -1,0 +1,71 @@
+// KAT: forge_amqp -- amqp_shortstr() bounds check on the AMQP short-string 255-byte domain limit.
+// Regression for the defect where a >255-byte input made the emitted 1-byte length prefix wrap via
+// `len % 256` while the FULL (unclamped) payload was still appended -- prefix != actual appended byte
+// count -> frame desync/corruption for every frame that follows on the wire.
+//
+// Required behavior: the payload is CLAMPED to at most 255 bytes, and the emitted prefix always equals
+// the number of bytes actually appended (self-consistent, no desync), for inputs at, just under, and
+// well over the boundary.
+import forge_amqp
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+// build a string of exactly `n` copies of `ch`
+fn _rep(ch: string, n: int) -> string
+    let s = ""
+    let i = 0
+    while i < n
+        s = s + ch
+        i = i + 1
+    s
+
+fn main()
+    // exactly at the boundary (255 bytes) -- must pass through unclamped: prefix == 255, payload == 255 'x's.
+    let s255 = _rep("x", 255)
+    let ss255 = amqp_shortstr(s255)
+    if bytes_len(ss255) != 256
+        _fail("255-byte input: total encoded length, expected 256 got " + str(bytes_len(ss255)))
+    if bytes_get(ss255, 0) != 255
+        _fail("255-byte input: prefix, expected 255 got " + str(bytes_get(ss255, 0)))
+
+    // one byte OVER the boundary (256 bytes) -- this is the exact case that produced `len % 256 == 0`
+    // (a WRONG zero-length prefix) while still appending all 256 payload bytes under the old code.
+    let s256 = _rep("y", 256)
+    let ss256 = amqp_shortstr(s256)
+    let prefix256 = bytes_get(ss256, 0)
+    let appended256 = bytes_len(ss256) - 1
+    if prefix256 != appended256
+        _fail("256-byte input: prefix (" + str(prefix256) + ") != actual appended bytes (" + str(appended256) + ") -- frame desync")
+    if prefix256 != 255
+        _fail("256-byte input: expected clamp to 255, got prefix " + str(prefix256))
+    if bytes_len(ss256) != 256
+        _fail("256-byte input: expected total encoded length 256 (1 prefix + 255 clamped payload), got " + str(bytes_len(ss256)))
+
+    // well over the boundary (300 bytes) -- same self-consistency check, larger margin.
+    let s300 = _rep("z", 300)
+    let ss300 = amqp_shortstr(s300)
+    let prefix300 = bytes_get(ss300, 0)
+    let appended300 = bytes_len(ss300) - 1
+    if prefix300 != appended300
+        _fail("300-byte input: prefix (" + str(prefix300) + ") != actual appended bytes (" + str(appended300) + ") -- frame desync")
+    if prefix300 != 255
+        _fail("300-byte input: expected clamp to 255, got prefix " + str(prefix300))
+    // verify the clamped payload content is the first 255 bytes of the original ('z' x 255), not garbage.
+    let decoded300 = amqp_shortstr_decode(ss300, 0)
+    if decoded300[0] != _rep("z", 255)
+        _fail("300-byte input: clamped payload content mismatch")
+    if decoded300[1] != 256
+        _fail("300-byte input: decode next-offset, expected 256 got " + str(decoded300[1]))
+
+    // a shortstr immediately following a clamped one must decode cleanly at the correct offset --
+    // this is the actual "no desync" property: downstream frame parsing stays aligned.
+    let combined = bytes_concat(ss256, amqp_shortstr("tail"))
+    let tail = amqp_shortstr_decode(combined, bytes_len(ss256))
+    if tail[0] != "tail"
+        _fail("post-clamp alignment: expected 'tail' got '" + tail[0] + "' -- downstream frame desynced")
+
+    print("PASS amqp_shortstr_overflow")
+
+main()
