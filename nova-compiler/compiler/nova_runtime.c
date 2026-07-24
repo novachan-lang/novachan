@@ -4618,8 +4618,18 @@ int64_t nova_rt_eq(int64_t a, int64_t b) {
     NovaMemTag tb = nova_mem_find_tag(pb);
     if (ta == NOVA_MEM_RAW || ta == NOVA_MEM_FAT_STR ||
         ((uint64_t)a > 0x10000 && ta == (NovaMemTag)-1 && nova_is_readable_str(pa))) {
-        if ((uint64_t)b < 0x10000) return 0;
-        return (strcmp((const char*)pa, (const char*)pb) == 0) ? 1 : 0;
+        /* SOUNDNESS: b must ALSO be a readable string before strcmp. The old guard
+           `(uint64_t)b < 0x10000` only rejected SMALL ints — a LARGE int operand
+           (e.g. a packed 8-char magic like 0x504C495354424F4F) clears that floor and
+           was then dereferenced as char* by strcmp -> wild read / process crash on
+           purely caller-supplied data (any str==large-int). A string never equals a
+           non-string, so any non-string b is not-equal. Mirrors the a-side test and
+           the BYTES/LIST/DICT branches, which already check BOTH operands' tags. */
+        if (tb == NOVA_MEM_RAW || tb == NOVA_MEM_FAT_STR ||
+            ((uint64_t)b > 0x10000 && tb == (NovaMemTag)-1 && nova_is_readable_str(pb))) {
+            return (strcmp((const char*)pa, (const char*)pb) == 0) ? 1 : 0;
+        }
+        return 0;
     }
     if (ta == NOVA_MEM_BYTES && tb == NOVA_MEM_BYTES) {
         NovaBytes* ba = (NovaBytes*)(uintptr_t)a;
