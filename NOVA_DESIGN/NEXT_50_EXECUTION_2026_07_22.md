@@ -40,6 +40,18 @@ runtime soundness bug: **nova_rt_eq string branch `strcmp`s a large-int operand 
 (CVE-class; exact one-branch fix recorded in memory `project-20day-sprint-execution-model`) — batch into the
 next reconverge with the `if cond then <stmt>` one-line sugar.
 
+**★★★ COMPILER + HIGH-LEVEL CORE (2026-07-24 cont.):** `f3f22b56` nova_rt_eq str-vs-large-int crash fix
+(CVE-class, reconverged); `00dc85bb` one-line `if cond then <stmt>` sugar; **`3d63b8b1` THE #1 HIGH-LEVEL
+FIX — bare `Result`/`Option` annotation is now a POLYMORPHIC SUM (was `nt_struct`), so reusable
+Result/generic library helpers finally compose across call sites** (reconverged gen5==gen6, both-mode 2762/0).
+This turned NOVA's high-level toolkit from SHALLOW (worked one-shot, broke when factored into a library — why
+the stdlib was low-level) into DEEP. First high-level std/core built on it: `78c1abdd` std/core/seq, `0e0ee4b3`
+std/core/dict, `3d63b8b1` std/core/result (combinators), `3fa854b6` std/core/list — generics + closures +
+Result, KAT-gated. **CAPABILITY AUDIT** (memory `project-highlevel-capability-gap`): generics(`fn <T>`)/HOF/
+Result/ADTs/traits-in-fn all PROVEN. REMAINING GAPS (deferred, need care): Option runtime dispatch crashes;
+trait ≥2-types-at-top-level (from_json_safe synth); module-level non-scalar shared state (XL true-globals,
+one shortcut reverted for a concurrency race); L11 #32.
+
 ---
 
 ## BLOCK A — Wave B: RC completeness (memory-SAFE leaks; production bar) — do FIRST with Wave C
