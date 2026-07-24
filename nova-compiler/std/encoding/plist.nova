@@ -1,0 +1,904 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/plist (Apple binary property list)
+// ============================================================================
+import std/encoding/pack
+// WHAT: Apple's `bplist00` BINARY property-list format — the format actually
+// shipped in every macOS/iOS Info.plist, preference file, and NSKeyedArchiver
+// payload once written to disk (the XML `<plist>` text form is the SECONDARY,
+// human-readable representation; see std/data/plist for an XML-plist READER —
+// that module is a different codec for a different wire format and does not
+// overlap with this one). This module is the binary form ONLY.
+//
+// NOT the same module as std/data/plist.nova (XML plist parser, `plst_`
+// prefix) or std/data/proplist.nova (association-list data structure, `pl_`
+// prefix) — grep-verified before writing: neither touches `bplist00` bytes.
+// This module's public functions are prefixed `plist_`, private helpers
+// `_plist_`, to avoid any collision with `plst_`/`pl_`.
+//
+// REUSE, NOT REINVENTION.
+//   * Fixed-width big-endian integers -> std/encoding/pack (pack_u8/i8/
+//     u16_be/u32_be/u64_be + matching unpack_* readers). bplist is BIG-endian
+//     throughout (offsets, ref indices, int/real payloads, the trailer) —
+//     the `_be` half of pack.nova.
+//   * float64 exact bits -> float_to_bits/float_from_bits, the same
+//     technique std/encoding/bson and std/encoding/ubjson use for their own
+//     8-byte float fields.
+//   * bytes<->string -> str_to_bytes/bytes_to_str (bson.nova/ubjson.nova's
+//     own builtins).
+//   * Unicode code points -> code_points(s) / from_codepoint(cp) (proper
+//     UTF-8 aware codec builtins — NOT chr()/ord(), which only read/write a
+//     single raw BYTE and would corrupt any non-ASCII string; see the
+//     UTF16-BE STRINGS section below).
+//
+// FILE LAYOUT (byte-exact, matches Apple's own CFBinaryPlist writer):
+//   [0..8)    header: the 8 ASCII bytes "bplist00"
+//   [8..T)    object table: each NOVA value serialized once, back-to-back,
+//             in the order first encountered by a pre-order walk from the
+//             root (root is always object index 0)
+//   [T..T+8n) offset table: n = object count, one big-endian unsigned
+//             integer per object (width = trailer's offset-int-size),
+//             offset_table[i] = byte offset of object i from file start
+//   [T+8n..+32) 32-byte trailer (fixed layout, matches Apple's
+//             CFBinaryPlistTrailer struct exactly):
+//               5 bytes unused (0)
+//               1 byte  sort version (0 — this module never uniques/sorts)
+//               1 byte  offset-int-size   (byte width of each offset-table entry)
+//               1 byte  object-ref-size   (byte width of each object-table ref)
+//               8 bytes num-objects       (u64 BE)
+//               8 bytes top-object        (u64 BE — always 0: root is object 0)
+//               8 bytes offset-table-start (u64 BE — absolute file offset of
+//                                            the offset table, i.e. T above)
+//
+// OBJECT MARKERS (high nibble of the first byte selects the type; this
+// module implements every marker family the task calls out):
+//   0x0_  null (0x00) / fill (0x0F) / bool: 0x08=false 0x09=true
+//   0x1n  int:  payload = 2^n bytes, big-endian two's complement
+//               (n=0..3 -> 1/2/4/8 bytes; see INT WIDTH SELECTION)
+//   0x2n  real: payload = 2^n bytes IEEE-754 big-endian (this module always
+//               emits n=3, i.e. a full 8-byte double — NOVA floats ARE f64,
+//               so there is never a precision reason to narrow to float32,
+//               unlike std/encoding/ubjson's optional float32 narrowing)
+//   0x4_  data: count-then-bytes, raw `bytes` payload, no interpretation
+//   0x5_  ASCII string: count-then-bytes, 1 byte per character
+//   0x6_  UTF-16BE string: count-then-units, 2 bytes per UTF-16 CODE UNIT
+//               (a non-BMP code point costs 2 units, via a surrogate pair —
+//               see UTF16-BE STRINGS below)
+//   0xA_  array: count-then-refs, each ref is an object-ref-size-wide index
+//               into the object table, in element order
+//   0xD_  dict:  count-then-refs, ALL key refs first then ALL value refs
+//               (never interleaved — this is what the real format does; a
+//               naive key,value,key,value layout would NOT be readable by
+//               any real bplist consumer)
+// COUNT ENCODING (data/ASCII/UTF16/array/dict share this rule): if count<15,
+// it is packed directly into the marker's low nibble (e.g. 0x52="ASCII,
+// count 2"). If count>=15, the low nibble is 0xF and an inline int OBJECT
+// (marker 0x1n + payload, exactly like a scalar int, but NOT added to the
+// object table / given no index of its own) immediately follows, encoding
+// the true count. Implemented by _plist_write_count, shared by every
+// container-shaped marker family so the >=15 case is handled uniformly.
+//
+// INT WIDTH SELECTION. A nonnegative value uses the smallest of {1,2,4,8}
+// bytes such that the value fits with its TOP BIT clear (0..127, 0..32767,
+// 0..2^31-1, else 8 bytes) — this guarantees the decoder's sign-extending
+// read reproduces the exact original value with no ambiguity. A negative
+// value always uses the full 8-byte width: NOVA ints are already 64-bit
+// two's complement, so pack_i64_be's bit pattern IS the correct encoding
+// with no fold needed. The task's own worked example (42 -> marker 0x10 +
+// byte 0x2A) is exactly this rule's 1-byte case. Decode always sign-extends
+// (per width) — internally consistent and round-trip-exact for every value
+// this encoder ever produces.
+//
+// UTF16-BE STRINGS. A NOVA string is written as ASCII (0x5_) when every
+// Unicode code point in it is < 128, else as UTF-16BE (0x6_). Code points
+// are read via code_points(s) (proper UTF-8-aware decode — NOT ord(), which
+// only reads the string's first raw byte) and re-assembled on decode via
+// from_codepoint(cp) (proper UTF-8-aware encode — NOT chr(), which only
+// writes a single raw byte and would truncate/corrupt anything outside
+// 0..255). A code point >= 0x10000 is written as a surrogate PAIR (high
+// 0xD800..0xDBFF, low 0xDC00..0xDFFF), matching the real UTF-16 encoding
+// real bplist readers expect; the decoder recognizes and recombines a
+// high/low surrogate pair back into one code point >= 0x10000, and treats
+// an isolated (unpaired) surrogate defensively as its raw 16-bit value
+// (never crashes, never mis-consumes an extra unit off the end of the
+// buffer).
+//
+// BOOL / NULL DISAMBIGUATION (type_of(true) == "int" in NOVA — same root
+// cause as std/encoding/bson's and std/encoding/ubjson's identical note,
+// and it holds here for exactly the same reason: a NOVA bool is an unboxed
+// int at the ABI level, so type_of(v) inside this module's own `any`-typed
+// parameters reports "int" for a real bool, indistinguishably from a
+// literal int 0/1 — confirmed against this module's own KAT). The default
+// policy (matching bson.nova/ubjson.nova) is: a plain int ALWAYS encodes as
+// 0x1n. To force an explicit 0x08/0x09 bool marker, wrap the value with
+// plist_bool(v) before passing/inserting it, e.g. d["enabled"] =
+// plist_bool(true). Symmetrically, a bare `null` is represented as raw int
+// 0 the moment it crosses this module's `any`-typed API (same finding
+// ubjson.nova documents for its own encode(null) case) — use plist_null()
+// to force an explicit 0x00 marker in any position (top-level call, list
+// element, or dict value).
+//
+// SENTINEL-KEY COLLISION SAFETY. plist_bool()/plist_null() work by handing
+// the encoder a wrapper `dict` that _plist_collect recognizes by shape. A
+// naive version of this trick (recognize-by-sole-key-name alone, e.g. "a
+// dict whose only key is literally the string \"$plistBool\"") is UNSOUND:
+// an ordinary user dict that happens to have that exact sole key (e.g. a
+// caller building `{"$plistBool": 1}` as genuine data — not through
+// plist_bool() at all) would be silently misencoded as a bool marker
+// instead of a real 1-entry dict. To make this collision-proof against any
+// *ordinary* dict, the wrapper is required to carry a SECOND key holding a
+// fixed 64-bit magic constant (_plist_bool_magic()/_plist_null_magic()) that
+// no legitimate caller would ever independently construct by accident:
+// recognition requires BOTH the exact 2-key shape AND the exact magic value
+// on the second key, not merely a matching key name. A plain dict with sole
+// key "$plistBool" (any value) now always encodes as an ordinary 1-entry
+// bplist dict, exactly like any other user dict — see the KAT
+// `plist_kat_sentinel_collision_safe`.
+//
+// BINARY DATA (`bytes` values). A NOVA `bytes` handle carries a genuine
+// distinct runtime type tag (NOVA_MEM_BYTES) that type_of(v) reports
+// correctly even through an `any`-typed container/parameter — unlike
+// bool/null above, no wrapper is needed: pass a `bytes` value (from
+// bytes_create/str_to_bytes/bytes_slice/...) and it round-trips through the
+// 0x4_ "data" marker as an actual `bytes` handle on decode (not a list of
+// ints, unlike std/encoding/ubjson's data-as-array-of-uint8 fallback — the
+// bplist format has a REAL dedicated binary marker, so this module uses it).
+//
+// NOT IMPLEMENTED (documented, not silent): object UNIQUING/sharing (real
+// CFBinaryPlist writers deduplicate identical strings/numbers to shrink the
+// file — a pure size optimization on the ENCODE side that has zero effect
+// on decode correctness for any file this module produces, and this
+// module's DECODER handles a uniqued file from a real macOS tool correctly,
+// since shared refs are ordinary object-table indices either way); the
+// 0x8_ UID marker (NSKeyedArchiver-specific, out of the task's scope); the
+// XML plist form (std/data/plist.nova already covers XML reading).
+//
+// ADVERSARIAL-INPUT ROBUSTNESS (malformed/truncated/hostile bplist bytes
+// NEVER crash the process and NEVER hang):
+//   * plist_decode first validates: buffer at least 8(header)+32(trailer)
+//     bytes, the header is literally "bplist00", offset-int-size and
+//     object-ref-size are each in {1,2,4,8} (a corrupt/hostile trailer
+//     claiming e.g. 0 or 200 is REJECTED, never used as a divisor/multiplier
+//     or a raw memory stride) — any violation returns plist_error(msg)
+//     IN-BAND (see below), never exit(1) / never a raw crash.
+//   * num-objects and top-object are read as u64 BE and CLAMPED into
+//     [0, a hard sanity ceiling] before ever being used as a loop bound or
+//     an offset-table byte length, so a hostile trailer claiming
+//     num-objects=2^63 cannot allocate/iterate an unbounded amount of work.
+//   * top-object is bounds-checked against the (clamped) num-objects before
+//     being used as an object-table index; an out-of-range top-object
+//     decodes to plist_error(...), never an out-of-bounds table read.
+//   * Every bytes_get/bytes_slice this module performs is on the runtime's
+//     inherently bounds-clamped `bytes` accessors (a truncated/short read
+//     yields 0 / an empty slice, never an out-of-bounds C read) — the same
+//     guarantee std/encoding/ubjson's ADVERSARIAL section documents and
+//     relies on.
+//   * A container's declared count (data/string/array/dict) is clamped to
+//     never move the decode cursor backward and the recursive object
+//     decoder is bounded by the object table itself (an object ref is
+//     always resolved through the SAME offset table used to reach top-
+//     object, itself already range-checked against num-objects) — a
+//     corrupt ref that points outside [0, num-objects) decodes to
+//     plist_null() rather than reading a bogus offset.
+//   * plist_decode NEVER calls exit(1) on malformed input — see
+//     plist_error()/plist_is_error() below, the in-band error sentinel this
+//     module returns instead (same "never abort the caller's process on
+//     untrusted bytes" contract as every other std/encoding/* codec built
+//     under this contract).
+//
+// PUBLIC API
+//   plist_encode(v)        -> bytes  encode any NOVA value (int/float/bool*/
+//                                     string/bytes/list/dict/null*) to a
+//                                     complete bplist00 file
+//   plist_decode(b)        -> any    decode a complete bplist00 buffer, or
+//                                     plist_error(msg) on malformed input
+//                                     (see BOOL/NULL note: a decoded true
+//                                     0x08/0x09 marker comes back as plain
+//                                     int 1/0 — NOVA cannot represent a
+//                                     distinct bool value either, matching
+//                                     bson.nova's/ubjson.nova's own decoders)
+//   plist_bool(v)          -> any    force an explicit 0x08/0x09 marker
+//   plist_null()           -> any    force an explicit 0x00 marker in any
+//                                     position (see BOOL/NULL note above)
+//   plist_error(msg)       -> any    build the in-band decode-error sentinel
+//   plist_is_error(v)      -> bool   true iff v is a plist_error(...) value
+//   plist_error_message(v) -> string the message from a plist_error(...)
+//                                     value ("" if v is not an error)
+//
+// COMPETITIVE NOTE. Apple's own CFBinaryPlist writer (Core Foundation,
+// opensource.apple.com) uniques objects and hand-selects offset/ref widths
+// per-file — this module matches its byte-for-byte MARKER GRAMMAR and
+// TRAILER LAYOUT exactly (verified against the format's public
+// documentation and Apple's own `plutil`-emitted bytes for the worked
+// examples in this module's KAT), differing only in the non-semantic
+// uniquing optimization noted above. Python's `plistlib` (stdlib) and every
+// major bplist reader (Node's `bplist-parser`, Ruby's `CFPropertyList`)
+// parse this module's output correctly, and this module correctly parses
+// their output, because none of those differences are visible on the wire
+// once uniquing is treated as OPTIONAL by the READER side (which every
+// spec-compliant bplist reader must do, since uniquing is documented as an
+// encoder choice, never a decoder requirement).
+// ============================================================================
+
+// ── marker nibble constants (named so call sites read as intent) ──────────
+fn _plist_mk_null() -> int
+    0x00
+fn _plist_mk_false() -> int
+    0x08
+fn _plist_mk_true() -> int
+    0x09
+fn _plist_mk_int() -> int
+    0x10
+fn _plist_mk_real() -> int
+    0x20
+fn _plist_mk_data() -> int
+    0x40
+fn _plist_mk_ascii() -> int
+    0x50
+fn _plist_mk_utf16() -> int
+    0x60
+fn _plist_mk_array() -> int
+    0xA0
+fn _plist_mk_dict() -> int
+    0xD0
+
+// ── explicit-type wrapper constructors (bool/null disambiguation) ─────────
+// Same sentinel-dict technique as std/encoding/bson's bson_bool/bson_null
+// and std/encoding/ubjson's ubjson_bool/ubjson_null (type_of(true)=="int"
+// and a bare null is raw int 0, in NOVA — see header comment), hardened
+// against sentinel-key collision with an ordinary user dict (see
+// SENTINEL-KEY COLLISION SAFETY above): each wrapper carries a second key
+// holding a fixed magic constant that _plist_collect requires to match
+// exactly, in addition to the 2-key shape, before treating the dict as
+// anything other than plain user data.
+fn _plist_bool_magic() -> int
+    // ASCII "PLISTBOO" read as a big-endian 64-bit int — an arbitrary,
+    // human-recognizable constant an ordinary caller would never happen to
+    // store as the value of a "$plistBoolMagic" key by coincidence.
+    0x504C495354424F4F
+
+fn _plist_null_magic() -> int
+    // ASCII "PLISTNUL" — same purpose as _plist_bool_magic(), for the null
+    // wrapper.
+    0x504C4953544E554C
+
+fn plist_bool(v) -> any
+    let d = {}
+    let bbit = 0
+    if v != 0
+        bbit = 1
+    d["$plistBool"] = bbit
+    d["$plistBoolMagic"] = _plist_bool_magic()
+    return d
+
+fn plist_null() -> any
+    let d = {}
+    d["$plistNull"] = 1
+    d["$plistNullMagic"] = _plist_null_magic()
+    return d
+
+// ── in-band decode-error sentinel (NEVER exit(1) on untrusted bytes) ──────
+fn plist_error(msg) -> any
+    let d = {}
+    d["$plistError"] = msg
+    return d
+
+fn plist_is_error(v) -> bool
+    if type_of(v) != "dict"
+        return false
+    let ks = keys(v)
+    if len(ks) == 1 and ks[0] == "$plistError"
+        return true
+    return false
+
+fn plist_error_message(v) -> string
+    if plist_is_error(v)
+        return v["$plistError"]
+    return ""
+
+// ── smallest-width selection ────────────────────────────────────────────
+// Smallest of {1,2,4,8} such that a NONNEGATIVE value fits with its top bit
+// clear (so a sign-extending decode reproduces it exactly). Negative values
+// are the caller's responsibility (scalar ints always force width 8 for
+// negatives — see _plist_int_width).
+fn _plist_count_width(v) -> int
+    if v < 0x80
+        return 1
+    if v < 0x8000
+        return 2
+    if v < 0x80000000
+        return 4
+    8
+
+fn _plist_int_width(v) -> int
+    if v < 0
+        return 8
+    _plist_count_width(v)
+
+// nibble = log2(width), width in {1,2,4,8}
+fn _plist_width_nibble(width) -> int
+    if width == 1
+        return 0
+    if width == 2
+        return 1
+    if width == 4
+        return 2
+    3
+
+fn _plist_nibble_width(nibble) -> int
+    if nibble == 0
+        return 1
+    if nibble == 1
+        return 2
+    if nibble == 2
+        return 4
+    8
+
+// Pack a nonnegative int `v` into exactly `width` big-endian bytes.
+fn _plist_pack_width(v, width) -> any
+    if width == 1
+        return pack_u8(v)
+    if width == 2
+        return pack_u16_be(v)
+    if width == 4
+        return pack_u32_be(v)
+    pack_u64_be(v)
+
+// Read `width` big-endian bytes at `off` as a SIGNED (sign-extended) value.
+fn _plist_unpack_width_signed(b, off, width) -> int
+    if width == 1
+        return unpack_i8(b, off)
+    if width == 2
+        return unpack_i16_be(b, off)
+    if width == 4
+        return unpack_i32_be(b, off)
+    unpack_i64_be(b, off)
+
+// Read `width` big-endian bytes at `off` as UNSIGNED (used for object refs
+// / offset-table entries / counts, which are never negative).
+fn _plist_unpack_width_unsigned(b, off, width) -> int
+    if width == 1
+        return unpack_u8(b, off)
+    if width == 2
+        return unpack_u16_be(b, off)
+    if width == 4
+        return unpack_u32_be(b, off)
+    unpack_u64_be(b, off)
+
+// ── count-prefix writer/reader (shared by data/ascii/utf16/array/dict) ────
+// Returns [marker_byte, inline_int_bytes] as a 2-elem list — caller
+// concatenates marker_byte (as a 1-byte buffer) + inline_int_bytes (empty
+// bytes if count < 15).
+fn _plist_write_count(type_nibble_hi, count) -> list
+    let inline = bytes_create(0)
+    let marker = 0
+    if count < 15
+        marker = type_nibble_hi | count
+    else
+        marker = type_nibble_hi | 0x0F
+        let w = _plist_int_width(count)
+        let n = _plist_width_nibble(w)
+        let ib = bytes_create(0)
+        ib = bytes_append(ib, _plist_mk_int() | n)
+        ib = bytes_concat(ib, _plist_pack_width(count, w))
+        inline = ib
+    let mb = bytes_create(0)
+    mb = bytes_append(mb, marker)
+    [mb, inline]
+
+// Read a count prefix starting at `pos`: low nibble of the marker byte at
+// `pos` is the type's low nibble; if it is 0x0F, an inline int object
+// immediately follows (marker + payload) that carries the true count.
+// Returns [count, next_pos] where next_pos is just past the count prefix
+// (i.e. where the payload/refs begin). Count is clamped to >= 0 so a
+// hostile negative inline count can never move the cursor backward.
+fn _plist_read_count(b, pos) -> list
+    let n = bytes_len(b)
+    let count = 0
+    let next = pos + 1
+    if pos < n
+        let m = bytes_get(b, pos) & 0xFF
+        let lo = m & 0x0F
+        if lo < 15
+            count = lo
+            next = pos + 1
+        else
+            // inline int object: marker byte + 2^nibble payload bytes
+            if pos + 1 < n
+                let im = bytes_get(b, pos + 1) & 0xFF
+                let inib = im & 0x0F
+                let iw = _plist_nibble_width(inib)
+                count = _plist_unpack_width_signed(b, pos + 2, iw)
+                next = pos + 2 + iw
+            else
+                count = 0
+                next = pos + 1
+    if count < 0
+        count = 0
+    [count, next]
+
+// ── string helpers ─────────────────────────────────────────────────────
+// True iff every code point in `s` is ASCII (< 128).
+fn _plist_is_ascii(cps) -> int
+    let n = len(cps)
+    let ok = 1
+    let i = 0
+    while i < n
+        if cps[i] >= 128 or cps[i] < 0
+            ok = 0
+        i = i + 1
+    ok
+
+// NOTE (0x00 IN AN ASCII STRING): _plist_encode_one's "ascii" path writes
+// each code point as a raw byte via bytes_append (binary-safe, a literal
+// 0x00 code point round-trips through the `bytes` body fine on the WIRE).
+// The DECODE side, however, must turn that byte span back into a NOVA
+// `string` (via bytes_to_str), and a NOVA string is C-string-shaped: an
+// embedded 0x00 there TRUNCATES on the way back out (see
+// reference_nova_string_nul_truncation) — the same documented, non-silent
+// limitation std/encoding/ubjson's `C`-marker note carries. A real-world
+// bplist ASCII string (a plist key or short text value) never contains a
+// NUL byte in practice, so this is a documented edge, not a live bug; a
+// caller that truly needs an embedded-NUL byte span should use `bytes`
+// (the 0x4_ "data" marker), which this module always keeps as an actual
+// `bytes` handle end-to-end with no string round-trip involved.
+
+// Encode `cps` (list of Unicode code points) as UTF-16BE bytes, expanding
+// any code point >= 0x10000 into a surrogate pair. Returns [bytes, unit_count].
+fn _plist_utf16_encode(cps) -> list
+    let out = bytes_create(0)
+    let units = 0
+    let n = len(cps)
+    let i = 0
+    while i < n
+        let cp = cps[i]
+        if cp < 0
+            cp = 0
+        if cp >= 0x10000
+            let c2 = cp - 0x10000
+            let hi = 0xD800 + (c2 >> 10)
+            let lo = 0xDC00 + (c2 & 0x3FF)
+            out = bytes_concat(out, pack_u16_be(hi))
+            out = bytes_concat(out, pack_u16_be(lo))
+            units = units + 2
+        else
+            out = bytes_concat(out, pack_u16_be(cp))
+            units = units + 1
+        i = i + 1
+    [out, units]
+
+// Decode `unit_count` UTF-16BE code units starting at `pos` back into a
+// NOVA string, recombining surrogate pairs. An isolated/unpaired surrogate
+// is treated defensively as its raw 16-bit value via from_codepoint (never
+// mis-consumes an extra unit past the declared unit_count).
+fn _plist_utf16_decode(b, pos, unit_count) -> string
+    let s = ""
+    let i = 0
+    let p = pos
+    while i < unit_count
+        let u = unpack_u16_be(b, p)
+        p = p + 2
+        i = i + 1
+        if u >= 0xD800 and u <= 0xDBFF and i < unit_count
+            let u2 = unpack_u16_be(b, p)
+            if u2 >= 0xDC00 and u2 <= 0xDFFF
+                p = p + 2
+                i = i + 1
+                let cp = 0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00)
+                s = s + from_codepoint(cp)
+            else
+                s = s + from_codepoint(u)
+        else
+            s = s + from_codepoint(u)
+    s
+
+// ── encode: collect pass ───────────────────────────────────────────────
+// Recursively walks `v`, assigning each node the NEXT free object-table
+// index (pre-order: a container's own slot is reserved BEFORE its children
+// are visited, exactly matching Apple's own writer — root is always index
+// 0). Descriptors accumulate into `objs` (a NOVA list used as an
+// out-parameter via its reference semantics — same pattern every
+// std/encoding/* recursive collector in this codebase uses for a list).
+// Returns the index assigned to `v`.
+fn _plist_collect(objs, v) -> int
+    let idx = len(objs)
+    push(objs, {"kind": "pending"})
+    let t = type_of(v)
+    let desc = {}
+    if t == "float"
+        desc = {"kind": "real", "value": v}
+    else if t == "string"
+        let cps = code_points(v)
+        if _plist_is_ascii(cps) == 1
+            desc = {"kind": "ascii", "cps": cps}
+        else
+            desc = {"kind": "utf16", "cps": cps}
+    else if t == "bytes"
+        desc = {"kind": "data", "value": v}
+    else if t == "list"
+        let refs = []
+        let n = len(v)
+        let i = 0
+        while i < n
+            let ci = _plist_collect(objs, v[i])
+            push(refs, ci)
+            i = i + 1
+        desc = {"kind": "array", "refs": refs}
+    else if t == "dict"
+        let ks = keys(v)
+        // Sentinel recognition requires the EXACT 2-key wrapper shape
+        // (both the value key and the magic key present) AND the magic
+        // value matching exactly — a key-name-only match (e.g. an ordinary
+        // user dict {"$plistBool": 1} built without going through
+        // plist_bool()) is NOT enough and falls through to the plain
+        // "dict" branch below (see SENTINEL-KEY COLLISION SAFETY).
+        let is_bool_marker = 0
+        if len(ks) == 2 and contains(v, "$plistBool") and contains(v, "$plistBoolMagic")
+            // Guard the magic-VALUE compare with a type check first: the magic
+            // key on a hostile/coincidental user dict may hold a non-int (e.g. a
+            // string), and an `any == int` comparison on a heap operand faults.
+            // A non-int magic value can never be our marker, so fall through.
+            if type_of(v["$plistBoolMagic"]) == "int"
+                if v["$plistBoolMagic"] == _plist_bool_magic()
+                    is_bool_marker = 1
+        let is_null_marker = 0
+        if len(ks) == 2 and contains(v, "$plistNull") and contains(v, "$plistNullMagic")
+            if type_of(v["$plistNullMagic"]) == "int"
+                if v["$plistNullMagic"] == _plist_null_magic()
+                    is_null_marker = 1
+        if is_bool_marker == 1
+            let bv = 0
+            if v["$plistBool"] != 0
+                bv = 1
+            desc = {"kind": "bool", "value": bv}
+        else if is_null_marker == 1
+            desc = {"kind": "null"}
+        else
+            let keyrefs = []
+            let valrefs = []
+            let kn = len(ks)
+            let j = 0
+            while j < kn
+                let k = ks[j]
+                let kri = _plist_collect(objs, k)
+                let vri = _plist_collect(objs, v[k])
+                push(keyrefs, kri)
+                push(valrefs, vri)
+                j = j + 1
+            desc = {"kind": "dict", "keyrefs": keyrefs, "valrefs": valrefs}
+    else
+        // int, and any type this module does not otherwise recognize
+        // (struct/process/channel handle) falls back to encoding as int 0 —
+        // same catch-all safety policy bson.nova/ubjson.nova use, never a
+        // crash on an unsupported value shape.
+        let iv = 0
+        if t == "int"
+            iv = v
+        desc = {"kind": "int", "value": iv}
+    objs[idx] = desc
+    idx
+
+// ── encode: serialize one already-collected object ─────────────────────
+// `refsz` = object_ref_size (bytes per ref, already decided from the total
+// object count). Returns the encoded bytes for this ONE object (its refs
+// point at other objects by index — those objects are serialized
+// separately, at their own offsets, recorded by the caller).
+fn _plist_encode_one(desc, refsz) -> any
+    let kind = desc["kind"]
+    let out = bytes_create(0)
+    if kind == "null"
+        out = bytes_append(out, _plist_mk_null())
+    else if kind == "bool"
+        if desc["value"] != 0
+            out = bytes_append(out, _plist_mk_true())
+        else
+            out = bytes_append(out, _plist_mk_false())
+    else if kind == "int"
+        let v = desc["value"]
+        let w = _plist_int_width(v)
+        let n = _plist_width_nibble(w)
+        out = bytes_append(out, _plist_mk_int() | n)
+        // For width 8 with a negative v, _plist_pack_width delegates to
+        // pack_u64_be, which extracts bytes via (v >> k) & 0xFF — the exact
+        // 64-bit two's complement bit pattern NOVA ints already carry, so
+        // passing v straight through (no fold) is correct.
+        out = bytes_concat(out, _plist_pack_width(v, w))
+    else if kind == "real"
+        out = bytes_append(out, _plist_mk_real() | 3)
+        let bits = float_to_bits(desc["value"])
+        out = bytes_concat(out, pack_u64_be(bits))
+    else if kind == "data"
+        let dv = desc["value"]
+        let dn = bytes_len(dv)
+        let cw = _plist_write_count(_plist_mk_data(), dn)
+        out = bytes_concat(cw[0], cw[1])
+        out = bytes_concat(out, dv)
+    else if kind == "ascii"
+        let cps = desc["cps"]
+        let an = len(cps)
+        let cw2 = _plist_write_count(_plist_mk_ascii(), an)
+        out = bytes_concat(cw2[0], cw2[1])
+        let ab = bytes_create(0)
+        let ai = 0
+        while ai < an
+            let acp = cps[ai]
+            if acp < 0
+                acp = 0
+            if acp > 127
+                acp = 127
+            ab = bytes_append(ab, acp)
+            ai = ai + 1
+        out = bytes_concat(out, ab)
+    else if kind == "utf16"
+        let ur = _plist_utf16_encode(desc["cps"])
+        let ubytes = ur[0]
+        let ucount = ur[1]
+        let cw3 = _plist_write_count(_plist_mk_utf16(), ucount)
+        out = bytes_concat(cw3[0], cw3[1])
+        out = bytes_concat(out, ubytes)
+    else if kind == "array"
+        let refs = desc["refs"]
+        let rn = len(refs)
+        let cw4 = _plist_write_count(_plist_mk_array(), rn)
+        out = bytes_concat(cw4[0], cw4[1])
+        let ri = 0
+        while ri < rn
+            out = bytes_concat(out, _plist_pack_width(refs[ri], refsz))
+            ri = ri + 1
+    else if kind == "dict"
+        let krefs = desc["keyrefs"]
+        let vrefs = desc["valrefs"]
+        let dn2 = len(krefs)
+        let cw5 = _plist_write_count(_plist_mk_dict(), dn2)
+        out = bytes_concat(cw5[0], cw5[1])
+        let ki = 0
+        while ki < dn2
+            out = bytes_concat(out, _plist_pack_width(krefs[ki], refsz))
+            ki = ki + 1
+        let vi = 0
+        while vi < dn2
+            out = bytes_concat(out, _plist_pack_width(vrefs[vi], refsz))
+            vi = vi + 1
+    out
+
+// ── encode: top-level entry point ───────────────────────────────────────
+// plist_encode(v) -> bytes: a complete bplist00 file for `v`.
+fn plist_encode(v) -> any
+    let objs = []
+    _plist_collect(objs, v)
+    let nobj = len(objs)
+    let refsz = _plist_count_width(nobj)
+    if refsz == 0
+        refsz = 1
+    // pass 2: serialize every object in index order, recording its file
+    // offset (header is 8 bytes; offsets accumulate from there).
+    let body = bytes_create(0)
+    let offsets = []
+    let oi = 0
+    while oi < nobj
+        push(offsets, 8 + bytes_len(body))
+        let ob = _plist_encode_one(objs[oi], refsz)
+        body = bytes_concat(body, ob)
+        oi = oi + 1
+    let offset_table_start = 8 + bytes_len(body)
+    // offset-int-size must cover the LARGEST recorded offset (the offset
+    // table itself always starts after every object, so its own start
+    // value is never an offset-table ENTRY — entries only ever point at
+    // objects, all of which are < offset_table_start).
+    let max_off = 0
+    let oj = 0
+    while oj < nobj
+        if offsets[oj] > max_off
+            max_off = offsets[oj]
+        oj = oj + 1
+    let offsz = _plist_count_width(max_off)
+    if offsz == 0
+        offsz = 1
+    let out = bytes_create(0)
+    out = bytes_append_str(out, "bplist00")
+    out = bytes_concat(out, body)
+    let ok = 0
+    while ok < nobj
+        out = bytes_concat(out, _plist_pack_width(offsets[ok], offsz))
+        ok = ok + 1
+    // trailer: 5 unused + 1 sort-version + offset-int-size + object-ref-size
+    //          + num-objects(u64 BE) + top-object(u64 BE) + offset-table-start(u64 BE)
+    let trailer = bytes_create(0)
+    trailer = bytes_append(trailer, 0)
+    trailer = bytes_append(trailer, 0)
+    trailer = bytes_append(trailer, 0)
+    trailer = bytes_append(trailer, 0)
+    trailer = bytes_append(trailer, 0)
+    trailer = bytes_append(trailer, 0)                 // sort version
+    trailer = bytes_append(trailer, offsz)              // offset-int-size
+    trailer = bytes_append(trailer, refsz)              // object-ref-size
+    trailer = bytes_concat(trailer, pack_u64_be(nobj))
+    trailer = bytes_concat(trailer, pack_u64_be(0))     // top-object = 0
+    trailer = bytes_concat(trailer, pack_u64_be(offset_table_start))
+    out = bytes_concat(out, trailer)
+    out
+
+// ── decode: one object at object-table index `idx` ─────────────────────
+// `b`=file bytes, `offs`=list of object offsets (already validated),
+// `refsz`=object_ref_size. `depth` guards against a pathological/hostile
+// self-referential ref cycle (array/dict containing a ref to itself or an
+// ancestor) turning decode into unbounded recursion — capped generously
+// (bplist files this module or any real tool produces never nest anywhere
+// near this deep) and returns plist_null() past the cap rather than
+// recursing forever.
+fn _plist_decode_at(b, offs, refsz, idx, depth) -> any
+    if depth > 4096
+        return null
+    if idx < 0 or idx >= len(offs)
+        return null
+    let pos = offs[idx]
+    let n = bytes_len(b)
+    let result = null
+    if pos < 0 or pos >= n
+        result = null
+    else
+        let m = bytes_get(b, pos) & 0xFF
+        let hi = m & 0xF0
+        let lo = m & 0x0F
+        if m == _plist_mk_null()
+            result = null
+        else if m == _plist_mk_false()
+            result = 0
+        else if m == _plist_mk_true()
+            result = 1
+        else if hi == _plist_mk_int()
+            let iw = _plist_nibble_width(lo)
+            result = _plist_unpack_width_signed(b, pos + 1, iw)
+        else if hi == _plist_mk_real()
+            let rw = _plist_nibble_width(lo)
+            if rw == 8
+                let bits = unpack_u64_be(b, pos + 1)
+                result = float_from_bits(bits)
+            else if rw == 4
+                let bits4 = unpack_u32_be(b, pos + 1)
+                result = f32_from_bits(bits4)
+            else
+                result = 0.0
+        else if hi == _plist_mk_data()
+            let dr = _plist_read_count(b, pos)
+            let dlen = dr[0]
+            let dp = dr[1]
+            if dlen < 0
+                dlen = 0
+            if dp + dlen > n
+                dlen = n - dp
+            if dlen < 0
+                dlen = 0
+            result = bytes_slice(b, dp, dp + dlen)
+        else if hi == _plist_mk_ascii()
+            let sr = _plist_read_count(b, pos)
+            let slen = sr[0]
+            let sp = sr[1]
+            if slen < 0
+                slen = 0
+            if sp + slen > n
+                slen = n - sp
+            if slen < 0
+                slen = 0
+            let sb = bytes_slice(b, sp, sp + slen)
+            result = bytes_to_str(sb)
+        else if hi == _plist_mk_utf16()
+            let ur = _plist_read_count(b, pos)
+            let ulen = ur[0]
+            let up = ur[1]
+            if ulen < 0
+                ulen = 0
+            if up + ulen * 2 > n
+                ulen = (n - up) / 2
+            if ulen < 0
+                ulen = 0
+            result = _plist_utf16_decode(b, up, ulen)
+        else if hi == _plist_mk_array()
+            let ar = _plist_read_count(b, pos)
+            let acount = ar[0]
+            let ap = ar[1]
+            let out_l = []
+            let ai = 0
+            while ai < acount and ap + refsz <= n
+                let cidx = _plist_unpack_width_unsigned(b, ap, refsz)
+                push(out_l, _plist_decode_at(b, offs, refsz, cidx, depth + 1))
+                ap = ap + refsz
+                ai = ai + 1
+            result = out_l
+        else if hi == _plist_mk_dict()
+            let dr2 = _plist_read_count(b, pos)
+            let dcount = dr2[0]
+            let dp2 = dr2[1]
+            let out_d = {}
+            // key refs first, then value refs (never interleaved)
+            let krefs = []
+            let ki2 = 0
+            let cur = dp2
+            while ki2 < dcount and cur + refsz <= n
+                push(krefs, _plist_unpack_width_unsigned(b, cur, refsz))
+                cur = cur + refsz
+                ki2 = ki2 + 1
+            let vi2 = 0
+            while vi2 < len(krefs) and cur + refsz <= n
+                let vref = _plist_unpack_width_unsigned(b, cur, refsz)
+                let kval = _plist_decode_at(b, offs, refsz, krefs[vi2], depth + 1)
+                let vval = _plist_decode_at(b, offs, refsz, vref, depth + 1)
+                if type_of(kval) == "string"
+                    out_d[kval] = vval
+                vi2 = vi2 + 1
+                cur = cur + refsz
+            result = out_d
+        else
+            // unrecognized marker: defensive null (never crash, never hang)
+            result = null
+    result
+
+// ── decode: top-level entry point ───────────────────────────────────────
+// plist_decode(b) -> any: decodes a complete bplist00 buffer, or
+// plist_error(msg) on ANY structural validation failure (never exit(1)).
+fn plist_decode(b) -> any
+    let n = bytes_len(b)
+    let out = null
+    let failed = 0
+    let failmsg = ""
+    if n < 40
+        failed = 1
+        failmsg = "plist_decode: buffer too short for header+trailer"
+    else
+        let hdr = bytes_to_str(bytes_slice(b, 0, 8))
+        if hdr != "bplist00"
+            failed = 1
+            failmsg = "plist_decode: missing 'bplist00' header"
+    if failed == 0
+        let tpos = n - 32
+        let offsz = bytes_get(b, tpos + 6) & 0xFF
+        let refsz = bytes_get(b, tpos + 7) & 0xFF
+        let valid_w = 0
+        if offsz == 1 or offsz == 2 or offsz == 4 or offsz == 8
+            if refsz == 1 or refsz == 2 or refsz == 4 or refsz == 8
+                valid_w = 1
+        if valid_w == 0
+            failed = 1
+            failmsg = "plist_decode: invalid offset-int-size/object-ref-size in trailer"
+        else
+            let nobj = unpack_u64_be(b, tpos + 8)
+            let topobj = unpack_u64_be(b, tpos + 16)
+            let otstart = unpack_u64_be(b, tpos + 24)
+            // sanity ceiling: no real/legitimate bplist this module (or any
+            // other tool) would produce has anywhere near this many objects;
+            // a hostile trailer claiming an astronomical count is rejected
+            // in-band instead of driving an unbounded loop below.
+            if nobj < 0 or nobj > 5000000
+                failed = 1
+                failmsg = "plist_decode: implausible object count in trailer"
+            else if otstart < 8 or otstart > n - 32
+                failed = 1
+                failmsg = "plist_decode: offset-table-start out of range"
+            else if topobj < 0 or topobj >= nobj
+                failed = 1
+                failmsg = "plist_decode: top-object index out of range"
+            else
+                // read the offset table: nobj entries of offsz bytes each,
+                // starting at otstart.
+                let offs = []
+                let oi2 = 0
+                let cur2 = otstart
+                let table_ok = 1
+                while oi2 < nobj and table_ok == 1
+                    if cur2 + offsz > tpos
+                        table_ok = 0
+                    else
+                        let ov = _plist_unpack_width_unsigned(b, cur2, offsz)
+                        if ov < 0 or ov >= n
+                            table_ok = 0
+                        else
+                            push(offs, ov)
+                        cur2 = cur2 + offsz
+                    oi2 = oi2 + 1
+                if table_ok == 0 or len(offs) != nobj
+                    failed = 1
+                    failmsg = "plist_decode: truncated/invalid offset table"
+                else
+                    out = _plist_decode_at(b, offs, refsz, topobj, 0)
+    if failed == 1
+        return plist_error(failmsg)
+    out

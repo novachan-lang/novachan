@@ -1,0 +1,242 @@
+// INDEPENDENT adversarial re-verification probe for the just-applied fix to
+// std/encoding/plist.nova's _plist_collect sentinel-magic guard. Written
+// from scratch against the module's own header comment (SENTINEL-KEY
+// COLLISION SAFETY) and the live source at ~line 535-547, NOT copied from
+// bplistkat.nova's new assertions or the pre-existing plistsentinelprobe.nova
+// / plistadvprobe.nova probes — this probe re-derives its own expectations
+// and re-checks the fix independently rather than trusting prior probes.
+//
+// THE FIX under test: a `type_of(v["$plistBoolMagic"]) == "int"` guard
+// (and the mirror for "$plistNullMagic") now sits BEFORE the magic-VALUE
+// `==` comparison in _plist_collect's dict branch, so a non-int magic value
+// never reaches an `any == int` comparison on a heap operand (which
+// previously crashed with an access violation).
+//
+// Attack surface exercised (per task spec):
+//   1) magic value = STRING "PLISTBOO"/"PLISTNUL" — no crash, real 2-entry
+//      dict, round-trips with both keys+values intact.
+//   2) magic value = LIST, DICT, FLOAT — none may crash, all fall through
+//      to a real dict.
+//   3) bare 1-key {"$plistBool":1} — still a real 1-entry dict (not a bool
+//      marker) — MEDIUM collision regression check.
+//   4) wrong-INT magic (12345) — still a real 2-entry dict.
+//   5) legitimate plist_bool(true)/plist_bool(false)/plist_null() round-trip
+//      as bool/null, top-level, nested in an array, nested in a dict value.
+//   6) nested collision-shaped dict inside an array and inside another dict
+//      — no crash, preserved as a real dict, siblings intact.
+import std/encoding/plist
+
+fn eq_i(name: string, got: int, want: int)
+    if got != want
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("ok " + name)
+
+fn eq_s(name: string, got: string, want: string)
+    if got != want
+        print("FAIL " + name + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("ok " + name)
+
+fn marker_family(b) -> int
+    bytes_get(b, 8) & 0xF0
+
+fn main()
+    // ── 1) magic value = STRING, for BOTH bool and null sentinel keys ──────
+    let sb = {}
+    sb["$plistBool"] = 1
+    sb["$plistBoolMagic"] = "PLISTBOO"
+    let esb = plist_encode(sb)
+    eq_i("1a bool/string-magic: no crash, marker family is dict", marker_family(esb), 0xD0)
+    let dsb = plist_decode(esb)
+    eq_s("1a bool/string-magic: decode type is dict", type_of(dsb), "dict")
+    eq_i("1a bool/string-magic: key count = 2", len(keys(dsb)), 2)
+    eq_i("1a bool/string-magic: $plistBool value preserved", dsb["$plistBool"], 1)
+    eq_s("1a bool/string-magic: $plistBoolMagic value preserved", dsb["$plistBoolMagic"], "PLISTBOO")
+
+    let sn = {}
+    sn["$plistNull"] = 1
+    sn["$plistNullMagic"] = "PLISTNUL"
+    let esn = plist_encode(sn)
+    eq_i("1b null/string-magic: no crash, marker family is dict", marker_family(esn), 0xD0)
+    let dsn = plist_decode(esn)
+    eq_s("1b null/string-magic: decode type is dict", type_of(dsn), "dict")
+    eq_i("1b null/string-magic: key count = 2", len(keys(dsn)), 2)
+    eq_i("1b null/string-magic: $plistNull value preserved", dsn["$plistNull"], 1)
+    eq_s("1b null/string-magic: $plistNullMagic value preserved", dsn["$plistNullMagic"], "PLISTNUL")
+
+    // empty string magic value too (edge of "string" type)
+    let sbe = {}
+    sbe["$plistBool"] = 0
+    sbe["$plistBoolMagic"] = ""
+    let dsbe = plist_decode(plist_encode(sbe))
+    eq_s("1c bool/empty-string-magic: decode type is dict", type_of(dsbe), "dict")
+    eq_i("1c bool/empty-string-magic: key count = 2", len(keys(dsbe)), 2)
+
+    // ── 2) magic value = LIST, DICT, FLOAT (bool key) ──────────────────────
+    let lb = {}
+    lb["$plistBool"] = 1
+    lb["$plistBoolMagic"] = [1, 2, 3]
+    let elb = plist_encode(lb)
+    eq_i("2a bool/list-magic: no crash, marker family is dict", marker_family(elb), 0xD0)
+    let dlb = plist_decode(elb)
+    eq_s("2a bool/list-magic: decode type is dict", type_of(dlb), "dict")
+    eq_i("2a bool/list-magic: key count = 2", len(keys(dlb)), 2)
+    let dlbm = dlb["$plistBoolMagic"]
+    eq_s("2a bool/list-magic: magic value type preserved as list", type_of(dlbm), "list")
+    eq_i("2a bool/list-magic: magic value length preserved", len(dlbm), 3)
+
+    let db = {}
+    db["$plistBool"] = 1
+    let innerd = {}
+    innerd["nested"] = 7
+    db["$plistBoolMagic"] = innerd
+    let edb = plist_encode(db)
+    eq_i("2b bool/dict-magic: no crash, marker family is dict", marker_family(edb), 0xD0)
+    let ddb = plist_decode(edb)
+    eq_s("2b bool/dict-magic: decode type is dict", type_of(ddb), "dict")
+    eq_i("2b bool/dict-magic: key count = 2", len(keys(ddb)), 2)
+    eq_s("2b bool/dict-magic: magic value type preserved as dict", type_of(ddb["$plistBoolMagic"]), "dict")
+    eq_i("2b bool/dict-magic: magic value nested field preserved", ddb["$plistBoolMagic"]["nested"], 7)
+
+    let fb = {}
+    fb["$plistBool"] = 1
+    fb["$plistBoolMagic"] = 3.5
+    let efb = plist_encode(fb)
+    eq_i("2c bool/float-magic: no crash, marker family is dict", marker_family(efb), 0xD0)
+    let dfb = plist_decode(efb)
+    eq_s("2c bool/float-magic: decode type is dict", type_of(dfb), "dict")
+    eq_i("2c bool/float-magic: key count = 2", len(keys(dfb)), 2)
+    eq_s("2c bool/float-magic: magic value type preserved as float", type_of(dfb["$plistBoolMagic"]), "float")
+
+    // same three non-int magic types on the NULL sentinel too
+    let ln = {}
+    ln["$plistNull"] = 1
+    ln["$plistNullMagic"] = [9, 8]
+    let dln = plist_decode(plist_encode(ln))
+    eq_s("2d null/list-magic: decode type is dict", type_of(dln), "dict")
+    eq_i("2d null/list-magic: key count = 2", len(keys(dln)), 2)
+
+    let dn = {}
+    dn["$plistNull"] = 1
+    let innerd2 = {}
+    innerd2["z"] = 1
+    dn["$plistNullMagic"] = innerd2
+    let ddn = plist_decode(plist_encode(dn))
+    eq_s("2e null/dict-magic: decode type is dict", type_of(ddn), "dict")
+    eq_i("2e null/dict-magic: key count = 2", len(keys(ddn)), 2)
+
+    let fn2 = {}
+    fn2["$plistNull"] = 1
+    fn2["$plistNullMagic"] = 9.25
+    let dfn = plist_decode(plist_encode(fn2))
+    eq_s("2f null/float-magic: decode type is dict", type_of(dfn), "dict")
+    eq_i("2f null/float-magic: key count = 2", len(keys(dfn)), 2)
+
+    // ── 3) bare 1-key {"$plistBool":1} — MEDIUM collision, still a real
+    // 1-entry dict, not a bool marker ───────────────────────────────────────
+    let bare = {}
+    bare["$plistBool"] = 1
+    let ebare = plist_encode(bare)
+    eq_i("3 bare 1-key bool: marker family is dict", marker_family(ebare), 0xD0)
+    let dbare = plist_decode(ebare)
+    eq_s("3 bare 1-key bool: decode type is dict", type_of(dbare), "dict")
+    eq_i("3 bare 1-key bool: key count = 1", len(keys(dbare)), 1)
+    eq_i("3 bare 1-key bool: value preserved", dbare["$plistBool"], 1)
+
+    let bareN = {}
+    bareN["$plistNull"] = 1
+    let ebareN = plist_encode(bareN)
+    eq_i("3n bare 1-key null: marker family is dict", marker_family(ebareN), 0xD0)
+    let dbareN = plist_decode(ebareN)
+    eq_s("3n bare 1-key null: decode type is dict", type_of(dbareN), "dict")
+    eq_i("3n bare 1-key null: key count = 1", len(keys(dbareN)), 1)
+
+    // ── 4) wrong-INT magic value — still a real 2-entry dict ───────────────
+    let wi = {}
+    wi["$plistBool"] = 1
+    wi["$plistBoolMagic"] = 12345
+    let dwi = plist_decode(plist_encode(wi))
+    eq_s("4 wrong-int-magic bool: decode type is dict", type_of(dwi), "dict")
+    eq_i("4 wrong-int-magic bool: key count = 2", len(keys(dwi)), 2)
+    eq_i("4 wrong-int-magic bool: magic value preserved", dwi["$plistBoolMagic"], 12345)
+
+    let win = {}
+    win["$plistNull"] = 1
+    win["$plistNullMagic"] = 12345
+    let dwin = plist_decode(plist_encode(win))
+    eq_s("4n wrong-int-magic null: decode type is dict", type_of(dwin), "dict")
+    eq_i("4n wrong-int-magic null: key count = 2", len(keys(dwin)), 2)
+
+    // ── 5) legitimate mechanism still works: top-level, nested in array,
+    // nested in dict value ──────────────────────────────────────────────────
+    let etrue = plist_encode(plist_bool(true))
+    eq_i("5a plist_bool(true) top-level: marker family 0x00", marker_family(etrue), 0x00)
+    eq_i("5a plist_bool(true) top-level: marker byte 0x09", bytes_get(etrue, 8) & 0xFF, 0x09)
+    eq_i("5a plist_bool(true) top-level: roundtrip = 1", plist_decode(etrue), 1)
+
+    let efalse = plist_encode(plist_bool(false))
+    eq_i("5b plist_bool(false) top-level: marker byte 0x08", bytes_get(efalse, 8) & 0xFF, 0x08)
+    eq_i("5b plist_bool(false) top-level: roundtrip = 0", plist_decode(efalse), 0)
+
+    // NOTE: NOVA has no distinct null runtime type — _plist_decode_at
+    // returns the language's raw `null`, which is int 0 at the type_of()
+    // level (same root cause the module's own header comment documents for
+    // bool: "type_of(true) == 'int' in NOVA"). So the decoded value's
+    // type_of() is "int", not "null" — verified pre-existing/independent of
+    // this fix by cross-checking plist.nova's _plist_decode_at (`if m ==
+    // _plist_mk_null() result = null`) and by bplistkat.nova only ever
+    // asserting the MARKER BYTE for null, never type_of() on the decoded
+    // value. Assert what the module actually contracts: marker byte + int 0.
+    let enull = plist_encode(plist_null())
+    eq_i("5c plist_null() top-level: marker byte 0x00", bytes_get(enull, 8) & 0xFF, 0x00)
+    eq_i("5c plist_null() top-level: decode value is int 0", plist_decode(enull), 0)
+
+    let arr = [plist_bool(true), plist_bool(false), plist_null(), 99]
+    let darr = plist_decode(plist_encode(arr))
+    eq_s("5d nested-in-array: decode type is list", type_of(darr), "list")
+    eq_i("5d nested-in-array: length = 4", len(darr), 4)
+    eq_i("5d nested-in-array[0] bool true -> 1", darr[0], 1)
+    eq_i("5d nested-in-array[1] bool false -> 0", darr[1], 0)
+    eq_i("5d nested-in-array[2] null -> int 0", darr[2], 0)
+    eq_i("5d nested-in-array[3] plain int survives", darr[3], 99)
+
+    let nd = {}
+    nd["on"] = plist_bool(true)
+    nd["off"] = plist_bool(false)
+    nd["gone"] = plist_null()
+    nd["plain"] = 5
+    let dnd = plist_decode(plist_encode(nd))
+    eq_s("5e nested-in-dict: decode type is dict", type_of(dnd), "dict")
+    eq_i("5e nested-in-dict['on'] bool true -> 1", dnd["on"], 1)
+    eq_i("5e nested-in-dict['off'] bool false -> 0", dnd["off"], 0)
+    eq_i("5e nested-in-dict['gone'] null -> int 0", dnd["gone"], 0)
+    eq_i("5e nested-in-dict['plain'] plain int survives", dnd["plain"], 5)
+
+    // ── 6) nested collision-shaped dict (string-magic, the crashing case)
+    // inside an array and inside another dict — no crash, preserved as a
+    // real dict, siblings intact ────────────────────────────────────────────
+    let collideElem = {}
+    collideElem["$plistBool"] = 1
+    collideElem["$plistBoolMagic"] = "PLISTBOO"
+    let hostArr = ["before", collideElem, "after"]
+    let dHostArr = plist_decode(plist_encode(hostArr))
+    eq_s("6a array-nested string-magic collision: element decodes as dict", type_of(dHostArr[1]), "dict")
+    eq_i("6a array-nested string-magic collision: key count = 2", len(keys(dHostArr[1])), 2)
+    eq_s("6a array sibling before survives", dHostArr[0], "before")
+    eq_s("6a array sibling after survives", dHostArr[2], "after")
+
+    let collideVal = {}
+    collideVal["$plistNull"] = 1
+    collideVal["$plistNullMagic"] = [1, 2, 3]
+    let hostDict = {}
+    hostDict["a"] = "x"
+    hostDict["colliding"] = collideVal
+    hostDict["z"] = "y"
+    let dHostDict = plist_decode(plist_encode(hostDict))
+    eq_s("6b dict-nested list-magic collision: value decodes as dict", type_of(dHostDict["colliding"]), "dict")
+    eq_i("6b dict-nested list-magic collision: key count = 2", len(keys(dHostDict["colliding"])), 2)
+    eq_s("6b dict sibling 'a' survives", dHostDict["a"], "x")
+    eq_s("6b dict sibling 'z' survives", dHostDict["z"], "y")
+
+    print("PASS plistmagicguardprobe")
