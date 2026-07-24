@@ -1,0 +1,323 @@
+// KAT: forge_kafka -- Apache Kafka wire-protocol codec. Byte-exact ApiVersions request; BE int16/32/64
+// encode+decode incl. negative round-trip; nullable-string/bytes; request/response size-frame round-trip;
+// Produce/Fetch request encode verified by manually walking the produced bytes with the public BE/string
+// primitives; hand-built Produce/Fetch response bytes decoded back to structured results (incl. a
+// deliberately truncated trailing FetchResponse record, which must be silently dropped, not error out).
+import forge_kafka
+import std/hash/crc32
+
+fn main()
+    // ---- BE codecs, incl. negative round-trip ----------------------------------------------------
+    let e16 = kf_be16(1)
+    if bytes_len(e16) != 2 or bytes_get(e16, 0) != 0 or bytes_get(e16, 1) != 1
+        print("FAIL: kf_be16(1)")
+        exit(1)
+    let e16b = kf_be16(256)
+    if bytes_get(e16b, 0) != 1 or bytes_get(e16b, 1) != 0
+        print("FAIL: kf_be16(256)")
+        exit(1)
+    let e16n = kf_be16(0 - 1)
+    if bytes_get(e16n, 0) != 255 or bytes_get(e16n, 1) != 255
+        print("FAIL: kf_be16(-1) should be 0xFFFF")
+        exit(1)
+    if kf_rd_i16(e16n, 0) != 0 - 1
+        print("FAIL: kf_rd_i16 round-trip of -1")
+        exit(1)
+
+    let e32n = kf_be32(0 - 1)
+    if bytes_get(e32n, 0) != 255 or bytes_get(e32n, 1) != 255 or bytes_get(e32n, 2) != 255 or bytes_get(e32n, 3) != 255
+        print("FAIL: kf_be32(-1) should be 0xFFFFFFFF")
+        exit(1)
+    if kf_rd_i32(e32n, 0) != 0 - 1
+        print("FAIL: kf_rd_i32 round-trip of -1")
+        exit(1)
+    if kf_rd_i32(kf_be32(0 - 12345), 0) != 0 - 12345
+        print("FAIL: kf_be32/kf_rd_i32 round-trip of -12345")
+        exit(1)
+    if kf_rd_i32(kf_be32(70000), 0) != 70000
+        print("FAIL: kf_be32/kf_rd_i32 round-trip of 70000 (exceeds i16 range)")
+        exit(1)
+
+    let e64n = kf_be64(0 - 1)
+    let i = 0
+    while i < 8
+        if bytes_get(e64n, i) != 255
+            print("FAIL: kf_be64(-1) should be all 0xFF")
+            exit(1)
+        i = i + 1
+    if kf_rd_i64(e64n, 0) != 0 - 1
+        print("FAIL: kf_rd_i64 round-trip of -1")
+        exit(1)
+    if kf_rd_i64(kf_be64(1234567890123), 0) != 1234567890123
+        print("FAIL: kf_be64/kf_rd_i64 round-trip of a large positive")
+        exit(1)
+    if kf_rd_i64(kf_be64(0 - 9876543210), 0) != 0 - 9876543210
+        print("FAIL: kf_be64/kf_rd_i64 round-trip of a large negative")
+        exit(1)
+
+    // ---- ApiVersions (api_key 18) request header, correlation_id 7, client_id "c" -> byte-exact -----
+    let hdr = kf_request_header(18, 0, 7, "c")
+    let frame = kf_frame_request(hdr, bytes(0))
+    let expected = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 7, 0, 1, 99]
+    if bytes_len(frame) != len(expected)
+        print("FAIL: ApiVersions frame length, got " + str(bytes_len(frame)))
+        exit(1)
+    let k = 0
+    while k < len(expected)
+        if bytes_get(frame, k) != expected[k]
+            print("FAIL: ApiVersions frame byte " + str(k) + " expected " + str(expected[k]) + " got " + str(bytes_get(frame, k)))
+            exit(1)
+        k = k + 1
+
+    // ---- nullable string ---------------------------------------------------------------------------
+    let ns = kf_wr_nullable_string(null)
+    if bytes_len(ns) != 2 or bytes_get(ns, 0) != 255 or bytes_get(ns, 1) != 255
+        print("FAIL: kf_wr_nullable_string(null) should be 0xFFFF")
+        exit(1)
+    let nsr = kf_rd_nullable_string(ns, 0)
+    if nsr[0] != null or nsr[1] != 2
+        print("FAIL: kf_rd_nullable_string round-trip of null")
+        exit(1)
+    let s2 = kf_wr_nullable_string("hi")
+    let sr2 = kf_rd_nullable_string(s2, 0)
+    if sr2[0] != "hi" or sr2[1] != 4
+        print("FAIL: kf_wr/rd_nullable_string round-trip of \"hi\"")
+        exit(1)
+
+    // ---- nullable bytes ------------------------------------------------------------------------------
+    let nb = kf_wr_nullable_bytes(null)
+    if bytes_len(nb) != 4 or bytes_get(nb, 0) != 255 or bytes_get(nb, 1) != 255 or bytes_get(nb, 2) != 255 or bytes_get(nb, 3) != 255
+        print("FAIL: kf_wr_nullable_bytes(null) should be 0xFFFFFFFF")
+        exit(1)
+    let nbr = kf_rd_bytes(nb, 0)
+    if nbr[0] != null or nbr[1] != 4
+        print("FAIL: kf_rd_bytes round-trip of null")
+        exit(1)
+    let bstr = kf_wr_nullable_bytes("xy")
+    let bstrr = kf_rd_bytes(bstr, 0)
+    if bytes_to_str(bstrr[0]) != "xy" or bstrr[1] != 6
+        print("FAIL: kf_wr/rd_nullable_bytes round-trip of \"xy\"")
+        exit(1)
+
+    // ---- request/response size-frame round-trip -------------------------------------------------------
+    let hdr2 = kf_request_header(3, 5, 42, "abc")
+    let frame2 = kf_frame_request(hdr2, bytes(0))
+    let sz = kf_frame_size(frame2)
+    if sz != bytes_len(frame2) - 4
+        print("FAIL: kf_frame_size should equal frame length - 4")
+        exit(1)
+    let parsed = kf_parse_request_header(frame2, 4)
+    if parsed[0] != 3 or parsed[1] != 5 or parsed[2] != 42 or parsed[3] != "abc"
+        print("FAIL: kf_parse_request_header round-trip, got api_key=" + str(parsed[0]) + " version=" + str(parsed[1]) + " correlation=" + str(parsed[2]) + " client_id=" + str(parsed[3]))
+        exit(1)
+
+    // ---- Produce request encode, verified by manually walking the bytes back with public primitives ---
+    let messages = [["k1", "v1"]]
+    let partitions = [[0, messages]]
+    let topics = [["mytopic", partitions]]
+    let preq = kf_produce_request(1, 1000, topics)
+    if kf_rd_i16(preq, 0) != 1 or kf_rd_i32(preq, 2) != 1000 or kf_rd_i32(preq, 6) != 1
+        print("FAIL: produce request acks/timeout/topic-count header")
+        exit(1)
+    let p = 10
+    let tn = kf_rd_string(preq, p)
+    if tn[0] != "mytopic"
+        print("FAIL: produce request topic name")
+        exit(1)
+    p = tn[1]
+    if kf_rd_i32(preq, p) != 1
+        print("FAIL: produce request partition count")
+        exit(1)
+    p = p + 4
+    let partition = kf_rd_i32(preq, p)
+    p = p + 4
+    let msize = kf_rd_i32(preq, p)
+    p = p + 4
+    if partition != 0
+        print("FAIL: produce request partition id")
+        exit(1)
+    let moff = kf_rd_i64(preq, p)
+    let msz = kf_rd_i32(preq, p + 8)
+    let mstart = p + 12
+    let crc = kf_rd_u32(preq, mstart)
+    let magic = bytes_get(preq, mstart + 4)
+    let attrs = bytes_get(preq, mstart + 5)
+    let kr = kf_rd_bytes(preq, mstart + 6)
+    let vr = kf_rd_bytes(preq, kr[1])
+    if moff != 0 or magic != 0 or attrs != 0
+        print("FAIL: produce request message offset/magic/attributes")
+        exit(1)
+    if bytes_to_str(kr[0]) != "k1" or bytes_to_str(vr[0]) != "v1"
+        print("FAIL: produce request message key/value, got " + bytes_to_str(kr[0]) + "/" + bytes_to_str(vr[0]))
+        exit(1)
+    let recomputed = bytes(0)
+    recomputed = bytes_append(recomputed, 0)
+    recomputed = bytes_append(recomputed, 0)
+    recomputed = bytes_concat(recomputed, kf_wr_nullable_bytes("k1"))
+    recomputed = bytes_concat(recomputed, kf_wr_nullable_bytes("v1"))
+    let expected_crc = h_crc32_bytes(recomputed)
+    if crc != expected_crc
+        print("FAIL: produce request message CRC32, got " + str(crc) + " expected " + str(expected_crc))
+        exit(1)
+    if msz != 4 + bytes_len(recomputed) or msize != 12 + msz
+        print("FAIL: produce request message/message-set size fields")
+        exit(1)
+
+    // ---- Fetch request encode, verified the same way ----------------------------------------------------
+    let fparts = [[2, 500, 65536]]
+    let ftopics = [["ftopic", fparts]]
+    let freq = kf_fetch_request(0 - 1, 5000, 1, ftopics)
+    if kf_rd_i32(freq, 0) != 0 - 1 or kf_rd_i32(freq, 4) != 5000 or kf_rd_i32(freq, 8) != 1 or kf_rd_i32(freq, 12) != 1
+        print("FAIL: fetch request replica_id/max_wait/min_bytes/topic-count header")
+        exit(1)
+    let fp = 16
+    let ftn = kf_rd_string(freq, fp)
+    if ftn[0] != "ftopic"
+        print("FAIL: fetch request topic name")
+        exit(1)
+    fp = ftn[1]
+    if kf_rd_i32(freq, fp) != 1
+        print("FAIL: fetch request partition count")
+        exit(1)
+    fp = fp + 4
+    let fpid = kf_rd_i32(freq, fp)
+    fp = fp + 4
+    let ffo = kf_rd_i64(freq, fp)
+    fp = fp + 8
+    let fmb = kf_rd_i32(freq, fp)
+    if fpid != 2 or ffo != 500 or fmb != 65536
+        print("FAIL: fetch request partition/fetch-offset/max-bytes")
+        exit(1)
+
+    // ---- hand-built ProduceResponse parse -----------------------------------------------------------
+    let pr = bytes(0)
+    pr = bytes_concat(pr, kf_be32(1))
+    pr = bytes_concat(pr, kf_wr_string("t1"))
+    pr = bytes_concat(pr, kf_be32(1))
+    pr = bytes_concat(pr, kf_be32(0))
+    pr = bytes_concat(pr, kf_be16(0))
+    pr = bytes_concat(pr, kf_be64(100))
+    let parsedpr = kf_parse_produce_response(pr, 0)
+    let ptopics = parsedpr[0]
+    if len(ptopics) != 1 or ptopics[0][0] != "t1"
+        print("FAIL: produce response topic parse")
+        exit(1)
+    let pprs = ptopics[0][1]
+    if len(pprs) != 1 or pprs[0][0] != 0 or pprs[0][1] != 0 or pprs[0][2] != 100
+        print("FAIL: produce response partition parse, got " + str(pprs[0][0]) + "/" + str(pprs[0][1]) + "/" + str(pprs[0][2]))
+        exit(1)
+    if parsedpr[1] != bytes_len(pr)
+        print("FAIL: produce response next_off should consume the whole buffer")
+        exit(1)
+
+    // ---- hand-built FetchResponse: one full message + one deliberately truncated trailing record -----
+    let mbody = bytes(0)
+    mbody = bytes_append(mbody, 0)
+    mbody = bytes_append(mbody, 0)
+    mbody = bytes_concat(mbody, kf_wr_nullable_bytes("k2"))
+    mbody = bytes_concat(mbody, kf_wr_nullable_bytes("v2"))
+    let mcrc = h_crc32_bytes(mbody)
+    let fullmsg = bytes_concat(kf_be32(mcrc), mbody)
+    let mset = bytes(0)
+    mset = bytes_concat(mset, kf_be64(0))
+    mset = bytes_concat(mset, kf_be32(bytes_len(fullmsg)))
+    mset = bytes_concat(mset, fullmsg)
+    // truncated trailing entry: declares a MessageSize far larger than what actually follows (a broker may
+    // cut a FetchResponse mid-record to respect MaxBytes -- this must be silently dropped, not an error).
+    mset = bytes_concat(mset, kf_be64(1))
+    mset = bytes_concat(mset, kf_be32(9999))
+
+    let fr = bytes(0)
+    fr = bytes_concat(fr, kf_be32(1))
+    fr = bytes_concat(fr, kf_wr_string("ft"))
+    fr = bytes_concat(fr, kf_be32(1))
+    fr = bytes_concat(fr, kf_be32(0))
+    fr = bytes_concat(fr, kf_be16(0))
+    fr = bytes_concat(fr, kf_be64(1))
+    fr = bytes_concat(fr, kf_be32(bytes_len(mset)))
+    fr = bytes_concat(fr, mset)
+
+    let parsedfr = kf_parse_fetch_response(fr, 0)
+    let ftopics2 = parsedfr[0]
+    if len(ftopics2) != 1 or ftopics2[0][0] != "ft"
+        print("FAIL: fetch response topic parse")
+        exit(1)
+    let fprs = ftopics2[0][1]
+    if len(fprs) != 1
+        print("FAIL: fetch response partition-response count")
+        exit(1)
+    let entry = fprs[0]
+    if entry[0] != 0 or entry[1] != 0 or entry[2] != 1
+        print("FAIL: fetch response partition/error-code/high-watermark, got " + str(entry[0]) + "/" + str(entry[1]) + "/" + str(entry[2]))
+        exit(1)
+    let fmsgs = entry[3]
+    if len(fmsgs) != 1
+        print("FAIL: fetch response should drop the truncated trailing record, got " + str(len(fmsgs)) + " messages")
+        exit(1)
+    // Fetch-decoded key/value are raw `bytes` now (binary-safe, not UTF-8-decoded) -- bytes_to_str them for
+    // this ASCII-text comparison.
+    if fmsgs[0][0] != 0 or bytes_to_str(fmsgs[0][1]) != "k2" or bytes_to_str(fmsgs[0][2]) != "v2"
+        print("FAIL: fetch response message offset/key/value, got " + str(fmsgs[0][0]) + "/" + bytes_to_str(fmsgs[0][1]) + "/" + bytes_to_str(fmsgs[0][2]))
+        exit(1)
+    if parsedfr[1] != bytes_len(fr)
+        print("FAIL: fetch response next_off should consume the whole buffer")
+        exit(1)
+
+    // ---- Fetch response record VALUE containing an embedded 0x00 byte must survive decode UNTRUNCATED ---
+    // (regression for the bug where kf_rd_nullable_bytes_str's bytes_to_str call NUL-truncated binary
+    // payloads on the Fetch decode path). Build the value as raw `bytes` directly -- 5 bytes "ab\x00cd" --
+    // so the write side never round-trips through a NUL-truncating string conversion either.
+    let nulval = bytes(0)
+    nulval = bytes_append(nulval, 97)   // 'a'
+    nulval = bytes_append(nulval, 98)   // 'b'
+    nulval = bytes_append(nulval, 0)    // embedded NUL
+    nulval = bytes_append(nulval, 99)   // 'c'
+    nulval = bytes_append(nulval, 100)  // 'd'
+    let nulkey = bytes(0)
+    nulkey = bytes_append(nulkey, 107)  // 'k'
+    nulkey = bytes_append(nulkey, 0)    // embedded NUL
+    nulkey = bytes_append(nulkey, 122)  // 'z'
+
+    let nulmbody = bytes(0)
+    nulmbody = bytes_append(nulmbody, 0)
+    nulmbody = bytes_append(nulmbody, 0)
+    nulmbody = bytes_concat(nulmbody, kf_wr_nullable_bytes(nulkey))
+    nulmbody = bytes_concat(nulmbody, kf_wr_nullable_bytes(nulval))
+    let nulcrc = h_crc32_bytes(nulmbody)
+    let nulfullmsg = bytes_concat(kf_be32(nulcrc), nulmbody)
+    let nulmset = bytes(0)
+    nulmset = bytes_concat(nulmset, kf_be64(0))
+    nulmset = bytes_concat(nulmset, kf_be32(bytes_len(nulfullmsg)))
+    nulmset = bytes_concat(nulmset, nulfullmsg)
+
+    let nulfr = bytes(0)
+    nulfr = bytes_concat(nulfr, kf_be32(1))
+    nulfr = bytes_concat(nulfr, kf_wr_string("nt"))
+    nulfr = bytes_concat(nulfr, kf_be32(1))
+    nulfr = bytes_concat(nulfr, kf_be32(0))
+    nulfr = bytes_concat(nulfr, kf_be16(0))
+    nulfr = bytes_concat(nulfr, kf_be64(1))
+    nulfr = bytes_concat(nulfr, kf_be32(bytes_len(nulmset)))
+    nulfr = bytes_concat(nulfr, nulmset)
+
+    let nulparsed = kf_parse_fetch_response(nulfr, 0)
+    let nulmsgs = nulparsed[0][0][1][0][3]
+    if len(nulmsgs) != 1
+        print("FAIL: NUL-payload fetch response should decode exactly 1 message, got " + str(len(nulmsgs)))
+        exit(1)
+    let gotkey = nulmsgs[0][1]
+    let gotval = nulmsgs[0][2]
+    if len(gotkey) != 3
+        print("FAIL: NUL-payload fetch response key TRUNCATED at embedded NUL, expected length 3 got " + str(len(gotkey)))
+        exit(1)
+    if len(gotval) != 5
+        print("FAIL: NUL-payload fetch response value TRUNCATED at embedded NUL, expected length 5 got " + str(len(gotval)))
+        exit(1)
+    if bytes_get(gotkey, 0) != 107 or bytes_get(gotkey, 1) != 0 or bytes_get(gotkey, 2) != 122
+        print("FAIL: NUL-payload fetch response key bytes mismatch after the embedded NUL")
+        exit(1)
+    if bytes_get(gotval, 0) != 97 or bytes_get(gotval, 1) != 98 or bytes_get(gotval, 2) != 0 or bytes_get(gotval, 3) != 99 or bytes_get(gotval, 4) != 100
+        print("FAIL: NUL-payload fetch response value bytes mismatch after the embedded NUL")
+        exit(1)
+
+    print("PASS forge_kafka (BE codecs, ApiVersions byte-exact header, nullable string/bytes, size-frame round-trip, Produce/Fetch request+response encode/parse incl truncated-record handling, Fetch-decoded key/value binary-safe across embedded NUL)")

@@ -1,0 +1,258 @@
+// ============================================================================
+// NOVA Standard Library — std/data/ini
+// ============================================================================
+// INI config file parser and writer.
+//
+// INI has no formal standard; this module implements the common denominator
+// used across Windows .ini, Python configparser, PHP php.ini, git config,
+// and systemd unit files, PLUS the ':' key/value separator (Python
+// configparser / Java .properties style):
+//
+//   - Sections:   [SectionName]        — a line whose first non-ws char is '['
+//   - Entries:    key = value          — first '=' OR ':' splits key/value
+//                 key : value
+//   - Comments:   ; ... to end of line
+//                 # ... to end of line
+//                 (comments may follow a value on the same line: "quote
+//                 tracking" means a ';' or '#' INSIDE a "..." quoted value
+//                 does not start a comment)
+//   - Blank lines are ignored.
+//   - Keys appearing before any [section] header land in the default
+//     section, keyed by "" in the returned dict.
+//   - Leading/trailing whitespace around keys and values is trimmed.
+//   - A value wrapped in double quotes ("...") has the quotes stripped;
+//     the inner text (including any leading/trailing spaces the quotes
+//     were protecting) is kept verbatim.
+//
+// PUBLIC API:
+//   ini_parse(text: string) -> dict
+//     Returns dict { section_name -> dict { key -> value } }, all strings.
+//     Pre-header keys live under section "". Duplicate keys within a
+//     section: last definition wins.
+//
+//   ini_write(d: dict) -> string
+//     Serializes a parsed-shape dict back to INI text. The default section
+//     ("") is emitted first with no [header]. Named sections follow, each
+//     preceded by a [name] header line. A value is auto-quoted (wrapped in
+//     "...") when writing it unquoted would corrupt a round-trip — i.e. it
+//     is empty, or contains a space, ';', or '#'. This makes
+//     ini_parse(ini_write(d)) reproduce d's values exactly.
+//
+// IMPLEMENTATION NOTES — NOVA GOTCHAS:
+//   - dict keys are ALWAYS strings; section names are strings.
+//   - Multi-line list/dict literals are ILLEGAL — dicts are built incrementally.
+//   - chr(10) = LF, chr(13) = CR, chr(9) = TAB, chr(34) = '"'.
+//   - contains(dict, key) MUST precede every dict lookup.
+//   - '{'/'}' in string literals INTERPOLATE — this module avoids them,
+//     using chr(91)/chr(93) for '[' / ']' where needed.
+//   - No unroll: all scans are real while-loops over string length.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+// _ini_is_ws: true for space (32) or tab (9).
+fn _ini_is_ws(c) -> int
+    let b = ord(c)
+    if b == 32 or b == 9
+        return 1
+    return 0
+
+// _ini_trim: remove leading and trailing whitespace (space/tab) from s.
+fn _ini_trim(s) -> string
+    let n = len(s)
+    let st = 0
+    while st < n and _ini_is_ws(char_at(s, st)) == 1
+        st = st + 1
+    let en = n
+    while en > st and _ini_is_ws(char_at(s, en - 1)) == 1
+        en = en - 1
+    if st == 0 and en == n
+        return s
+    slice(s, st, en)
+
+// _ini_strip_comment: truncate a line at the first ';' or '#' that is NOT
+// inside a "..." quoted span. Quote-state is tracked left to right; an odd
+// number of quote chars before the comment marker means we are "inside" a
+// quote span and the marker is left alone.
+fn _ini_strip_comment(line) -> string
+    let n = len(line)
+    let i = 0
+    let in_quote = 0
+    while i < n
+        let b = ord(char_at(line, i))
+        if b == 34
+            if in_quote == 1
+                in_quote = 0
+            else
+                in_quote = 1
+        else if in_quote == 0 and (b == 59 or b == 35)
+            return slice(line, 0, i)
+        i = i + 1
+    line
+
+// _ini_index_of_sep: index of the first '=' (61) or ':' (58) in s, else -1.
+fn _ini_index_of_sep(s) -> int
+    let n = len(s)
+    let i = 0
+    while i < n
+        let b = ord(char_at(s, i))
+        if b == 61 or b == 58
+            return i
+        i = i + 1
+    return -1
+
+// _ini_unquote: strip a single pair of surrounding double quotes, if present.
+fn _ini_unquote(s) -> string
+    let n = len(s)
+    if n >= 2 and ord(char_at(s, 0)) == 34 and ord(char_at(s, n - 1)) == 34
+        return slice(s, 1, n - 1)
+    s
+
+// _ini_needs_quote: true if writing v unquoted would not round-trip cleanly
+// (empty value, contains a space/tab, ';', or '#', or has leading/trailing
+// whitespace of any kind — the parser trims unquoted values, so any value
+// whose first or last byte is a space or tab MUST be quoted or that
+// whitespace is silently lost on ini_parse).
+fn _ini_needs_quote(v) -> int
+    let n = len(v)
+    if n == 0
+        return 1
+    let first = ord(char_at(v, 0))
+    let last = ord(char_at(v, n - 1))
+    if first == 32 or first == 9 or last == 32 or last == 9
+        return 1
+    let i = 0
+    while i < n
+        let b = ord(char_at(v, i))
+        if b == 32 or b == 9 or b == 59 or b == 35
+            return 1
+        i = i + 1
+    return 0
+
+// _ini_write_value: quote v if needed for a lossless round-trip.
+fn _ini_write_value(v) -> string
+    if _ini_needs_quote(v) == 1
+        chr(34) + v + chr(34)
+    else
+        v
+
+// _ini_ensure_section: ensure parsed[sec] exists as an inner dict.
+fn _ini_ensure_section(parsed, sec)
+    if contains(parsed, sec) == 0
+        let empty = {}
+        parsed[sec] = empty
+
+// _ini_set_key: set key->val inside the inner dict for section sec.
+// Assumes _ini_ensure_section(parsed, sec) was already called.
+fn _ini_set_key(parsed, sec, key, val)
+    let inner = parsed[sec]
+    inner[key] = val
+    parsed[sec] = inner
+
+// _ini_split_lines: split text into lines, handling LF, CRLF, and lone CR.
+// Returned lines do NOT include the line terminator.
+fn _ini_split_lines(text) -> list
+    let lines = []
+    let n = len(text)
+    let i = 0
+    let cur = ""
+    while i < n
+        let b = ord(char_at(text, i))
+        if b == 10
+            lines.push(cur)
+            cur = ""
+        else if b == 13
+            lines.push(cur)
+            cur = ""
+            if i + 1 < n and ord(char_at(text, i + 1)) == 10
+                i = i + 1
+        else
+            cur = cur + char_at(text, i)
+        i = i + 1
+    if len(cur) > 0
+        lines.push(cur)
+    lines
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ini_parse: parse INI-format text into a nested dict of
+// section-name -> (key -> value), both strings. Pre-header keys are
+// stored under section "".
+fn ini_parse(text) -> any
+    let parsed = {}
+    let cur_sec = ""
+    let lines = _ini_split_lines(text)
+    let li = 0
+    let nl = len(lines)
+    while li < nl
+        let raw = lines[li]
+        li = li + 1
+        let no_comment = _ini_strip_comment(raw)
+        let line = _ini_trim(no_comment)
+        if len(line) == 0
+            // blank or comment-only line — skip
+        else
+            let c0 = ord(char_at(line, 0))
+            if c0 == 91
+                // '[' — section header; find matching ']' (93)
+                let sn = len(line)
+                let rbracket = -1
+                let si = 1
+                while si < sn
+                    if ord(char_at(line, si)) == 93
+                        rbracket = si
+                        si = sn
+                    si = si + 1
+                let sec_name = ""
+                if rbracket == -1
+                    sec_name = _ini_trim(slice(line, 1, sn))
+                else
+                    sec_name = _ini_trim(slice(line, 1, rbracket))
+                cur_sec = sec_name
+                _ini_ensure_section(parsed, cur_sec)
+            else
+                let sep = _ini_index_of_sep(line)
+                if sep >= 0
+                    let key = _ini_trim(slice(line, 0, sep))
+                    let raw_val = _ini_trim(slice(line, sep + 1, len(line)))
+                    let val = _ini_unquote(raw_val)
+                    if len(key) > 0
+                        _ini_ensure_section(parsed, cur_sec)
+                        _ini_set_key(parsed, cur_sec, key, val)
+    parsed
+
+// ini_write: serialize a parsed-shape dict (section -> key -> value) back
+// to INI text. Default section "" (if present) is emitted first with no
+// header. Values are auto-quoted where needed for a lossless round-trip.
+fn ini_write(d) -> string
+    let nl = chr(10)
+    let out = ""
+    let first_block = 1
+    if contains(d, "") == 1
+        let inner = d[""]
+        let dk = keys(inner)
+        let di = 0
+        while di < len(dk)
+            let k = dk[di]
+            out = out + k + "=" + _ini_write_value(inner[k]) + nl
+            di = di + 1
+        first_block = 0
+    let all_secs = keys(d)
+    let si = 0
+    while si < len(all_secs)
+        let sec = all_secs[si]
+        si = si + 1
+        if sec != ""
+            if first_block == 0
+                out = out + nl
+            first_block = 0
+            out = out + chr(91) + sec + chr(93) + nl
+            let inner = d[sec]
+            let sk = keys(inner)
+            let ki = 0
+            while ki < len(sk)
+                let k = sk[ki]
+                out = out + k + "=" + _ini_write_value(inner[k]) + nl
+                ki = ki + 1
+    out

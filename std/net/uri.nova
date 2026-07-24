@@ -1,0 +1,367 @@
+// ============================================================================
+// NOVA Standard Library — std/net/uri
+// ============================================================================
+// RFC 3986 Uniform Resource Identifier parsing and building.
+//
+// Distinct from std/net/url (which has no userinfo component and is a
+// pragmatic http(s)-flavoured parser). This module implements the full
+// RFC 3986 generic syntax:
+//
+//   URI = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
+//   hier-part = "//" authority path-abempty / path-absolute / path-rootless
+//   authority = [ userinfo "@" ] host [ ":" port ]
+//
+// It handles the three RFC 3986 URI shapes that a real crawler/HTTP-client
+// must not crash on:
+//   1. absolute URI       "https://user:pw@ex.com:8443/a/b?x=1&y=2#frag"
+//   2. scheme-relative     "//ex.com/a/b"           (network-path reference)
+//   3. path-only           "/a/b?x=1"               (relative-path reference)
+//
+// PUBLIC API:
+//   uri_parse(s: string) -> dict
+//     Parse into a dict with keys "scheme","userinfo","host","port","path",
+//     "query","fragment" — all strings, "" when the component is absent.
+//     Also sets "authority_present" to "1" when the source had a "//"
+//     authority marker (even an entirely empty one, e.g. "file:///x") and
+//     "" otherwise — see uri_build for why this matters for round-tripping.
+//     Values are left percent-ENCODED as they appeared in the source string
+//     (matching std/net/url's convention); use uri_decode_component /
+//     query_parse to decode.
+//
+//   uri_build(parts: dict) -> string
+//     Reassemble a dict (as returned by uri_parse) back into a URI string.
+//     Missing keys are treated as "". Authority delimiters ("//", userinfo
+//     "@", port ":") are only emitted when the corresponding component is
+//     non-empty.
+//
+//   uri_encode_component(s: string) -> string
+//     Percent-encode an arbitrary string component (RFC 3986 unreserved
+//     characters pass through; everything else, including non-ASCII bytes
+//     of a UTF-8 string, becomes %XX). Thin string-level wrapper over
+//     std/encoding/percent's bytes-based percent_encode.
+//
+//   uri_decode_component(s: string) -> string
+//     Percent-decode a string component back to its literal text. Thin
+//     string-level wrapper over std/encoding/percent's percent_decode.
+//     NOTE: like percent_decode, this is strict RFC 3986 — '+' decodes to
+//     literal '+', NOT space. (application/x-www-form-urlencoded '+'-as-
+//     space handling lives in std/net/querystring's qs_parse/qs_build.)
+//
+//   query_parse(q: string) -> dict
+//     Parse a URI query component ("k1=v1&k2=v2", with or without a leading
+//     '?') into a dict of percent-DECODED string keys/values. Duplicate
+//     keys: last value wins. A key with no '=' gets value "". Empty pairs
+//     (from "&&" or a trailing '&') are skipped.
+//
+// DESIGN NOTES:
+//   * All private helpers are prefixed _uri_ to avoid symbol collisions.
+//   * dict keys are strings; a missing key returns int 0, not "" — every
+//     reader here guards with contains() before reading a string value.
+//   * '/' between two ints is integer division in NOVA; unused here but
+//     noted since sibling modules rely on it.
+//   * slice(s, start, end) — end is EXCLUSIVE. char_at(s, i) returns a
+//     single-char string. split() splits on an exact substring.
+//   * IPv6 host literals like "[::1]:8443" are recognised: the ':' inside
+//     the brackets is not mistaken for the host:port separator.
+//
+// LEAF — imports only std/encoding/percent (also a leaf).
+
+import std/encoding/percent
+
+// ── Private: scanning helpers ──────────────────────────────────────────────
+
+// _uri_index_of: first index of a single-char needle at/after from_pos, or -1.
+fn _uri_index_of(s: string, needle: string, from_pos: int) -> int
+    let n = len(s)
+    let i = from_pos
+    while i < n
+        if char_at(s, i) == needle
+            return i
+        i = i + 1
+    -1
+
+// _uri_index_of_any: first index (at/after from_pos) of any of three
+// single-char needles, or -1 if none occur.
+fn _uri_index_of_any(s: string, n1: string, n2: string, n3: string, from_pos: int) -> int
+    let n = len(s)
+    let i = from_pos
+    while i < n
+        let c = char_at(s, i)
+        if c == n1 or c == n2 or c == n3
+            return i
+        i = i + 1
+    -1
+
+// _uri_last_index_of: last index of a single-char needle within [from_pos, n), or -1.
+fn _uri_last_index_of(s: string, needle: string, from_pos: int) -> int
+    let n = len(s)
+    let found = -1
+    let i = from_pos
+    while i < n
+        if char_at(s, i) == needle
+            found = i
+        i = i + 1
+    found
+
+// ── Private: authority = [userinfo "@"] host [":" port] ───────────────────
+
+// _uri_parse_authority: fill d["userinfo"], d["host"], d["port"] from an
+// authority substring (already stripped of the leading "//" and any
+// trailing "/","?","#"). IPv6 literals "[::1]:port" keep their brackets in
+// "host" and are not misread for a host:port colon.
+fn _uri_parse_authority(auth: string, d: dict)
+    d["userinfo"] = ""
+    d["host"] = ""
+    d["port"] = ""
+    let n = len(auth)
+    if n == 0
+        return
+
+    // userinfo: text before the LAST '@' (userinfo itself may contain no
+    // '@'; RFC 3986 forbids raw '@' in userinfo so the last '@' is also the
+    // only '@', but scanning for the last one is the more defensive choice).
+    let at_pos = _uri_last_index_of(auth, "@", 0)
+    let host_port = auth
+    if at_pos >= 0
+        d["userinfo"] = slice(auth, 0, at_pos)
+        host_port = slice(auth, at_pos + 1, n)
+
+    let hn = len(host_port)
+    if hn == 0
+        return
+
+    if char_at(host_port, 0) == "["
+        // IPv6 literal: find the matching ']', then look for ':' after it.
+        let close_bracket = _uri_index_of(host_port, "]", 1)
+        if close_bracket < 0
+            // Malformed — treat the whole remainder as the host.
+            d["host"] = host_port
+            return
+        let after = close_bracket + 1
+        if after < hn and char_at(host_port, after) == ":"
+            d["host"] = slice(host_port, 0, after)
+            d["port"] = slice(host_port, after + 1, hn)
+        else
+            d["host"] = host_port
+        return
+
+    // Regular host: split on the LAST ':' (a bare host has none).
+    let colon = _uri_last_index_of(host_port, ":", 0)
+    if colon < 0
+        d["host"] = host_port
+    else
+        d["host"] = slice(host_port, 0, colon)
+        d["port"] = slice(host_port, colon + 1, hn)
+
+// ── Public API ───────────────────────────────────────────────────────────
+
+// uri_parse: parse a URI string into its RFC 3986 components.
+//
+// Examples:
+//   uri_parse("https://user:pw@ex.com:8443/a/b?x=1&y=2#frag")
+//     -> {"scheme":"https","userinfo":"user:pw","host":"ex.com","port":"8443",
+//         "path":"/a/b","query":"x=1&y=2","fragment":"frag"}
+//   uri_parse("//ex.com/a/b")                          // scheme-relative
+//     -> {"scheme":"","userinfo":"","host":"ex.com","port":"",
+//         "path":"/a/b","query":"","fragment":""}
+//   uri_parse("/a/b?x=1")                              // path-only
+//     -> {"scheme":"","userinfo":"","host":"","port":"",
+//         "path":"/a/b","query":"x=1","fragment":""}
+fn uri_parse(s: string) -> dict
+    let d = {}
+    d["scheme"] = ""
+    d["userinfo"] = ""
+    d["host"] = ""
+    d["port"] = ""
+    d["path"] = ""
+    d["query"] = ""
+    d["fragment"] = ""
+    // "1" iff an authority component was present in the source (even when
+    // it is entirely empty, e.g. the "///" of "file:///etc/hosts" or a
+    // bare "//" scheme-relative prefix). uri_build uses this to know
+    // whether to re-emit the "//" delimiter even when host/userinfo/port
+    // are all "". Absent/"" means no authority was present.
+    d["authority_present"] = ""
+
+    let total = len(s)
+    let pos = 0
+
+    // Step 1: scheme — text before the first ':' that occurs strictly
+    // before any of '/','?','#'. A scheme-relative ("//host/...") or
+    // path-only ("/a/b") reference has no scheme.
+    let first_special = _uri_index_of_any(s, "/", "?", "#", 0)
+    let colon_pos = _uri_index_of(s, ":", 0)
+    if colon_pos > 0 and (first_special < 0 or colon_pos < first_special)
+        d["scheme"] = slice(s, 0, colon_pos)
+        pos = colon_pos + 1
+
+    // Step 2: authority — present iff what follows starts with "//".
+    if pos + 1 < total and char_at(s, pos) == "/" and char_at(s, pos + 1) == "/"
+        pos = pos + 2
+        d["authority_present"] = "1"
+        let auth_end = _uri_index_of_any(s, "/", "?", "#", pos)
+        if auth_end < 0
+            let auth = slice(s, pos, total)
+            _uri_parse_authority(auth, d)
+            return d
+        let auth = slice(s, pos, auth_end)
+        _uri_parse_authority(auth, d)
+        pos = auth_end
+    else
+        d["userinfo"] = ""
+        d["host"] = ""
+        d["port"] = ""
+        d["authority_present"] = ""
+
+    // Step 3: fragment — everything after the first '#' at/after pos.
+    let hash_pos = _uri_index_of(s, "#", pos)
+    let path_query_end = total
+    if hash_pos >= 0
+        d["fragment"] = slice(s, hash_pos + 1, total)
+        path_query_end = hash_pos
+
+    // Step 4: query — between the first '?' at/after pos and path_query_end.
+    let qmark_pos = _uri_index_of(s, "?", pos)
+    let path_end = path_query_end
+    if qmark_pos >= 0 and qmark_pos < path_query_end
+        d["query"] = slice(s, qmark_pos + 1, path_query_end)
+        path_end = qmark_pos
+
+    // Step 5: path — whatever remains between pos and path_end.
+    d["path"] = slice(s, pos, path_end)
+
+    d
+
+// uri_build: reassemble a URI from its component dict. Missing keys are
+// treated as "". The "//" authority marker, userinfo "@" and port ":" are
+// emitted when the corresponding component is non-empty, OR when
+// parts["authority_present"] == "1" — the latter lets an authority that is
+// present but entirely empty (e.g. "file:///etc/hosts", where host is "")
+// round-trip through uri_parse -> uri_build unchanged.
+//
+// Examples:
+//   uri_build({"scheme":"https","userinfo":"user:pw","host":"ex.com",
+//              "port":"8443","path":"/a/b","query":"x=1&y=2","fragment":"frag"})
+//     -> "https://user:pw@ex.com:8443/a/b?x=1&y=2#frag"
+//   uri_build({"host":"ex.com","path":"/a/b"})
+//     -> "//ex.com/a/b"
+//   uri_build({"path":"/a/b","query":"x=1"})
+//     -> "/a/b?x=1"
+//   uri_build({"scheme":"file","authority_present":"1","path":"/etc/hosts"})
+//     -> "file:///etc/hosts"
+fn uri_build(parts: dict) -> string
+    let result = ""
+
+    let scheme = ""
+    if contains(parts, "scheme")
+        scheme = parts["scheme"]
+    if len(scheme) > 0
+        result = result + scheme + ":"
+
+    let userinfo = ""
+    if contains(parts, "userinfo")
+        userinfo = parts["userinfo"]
+    let host = ""
+    if contains(parts, "host")
+        host = parts["host"]
+    let port = ""
+    if contains(parts, "port")
+        port = parts["port"]
+    let authority_present = false
+    if contains(parts, "authority_present") and parts["authority_present"] == "1"
+        authority_present = true
+
+    if len(host) > 0 or len(userinfo) > 0 or authority_present
+        result = result + "//"
+        if len(userinfo) > 0
+            result = result + userinfo + "@"
+        result = result + host
+        if len(port) > 0
+            result = result + ":" + port
+
+    let path = ""
+    if contains(parts, "path")
+        path = parts["path"]
+    result = result + path
+
+    let query = ""
+    if contains(parts, "query")
+        query = parts["query"]
+    if len(query) > 0
+        result = result + "?" + query
+
+    let fragment = ""
+    if contains(parts, "fragment")
+        fragment = parts["fragment"]
+    if len(fragment) > 0
+        result = result + "#" + fragment
+
+    result
+
+// uri_encode_component: percent-encode a string for use as one URI
+// component (a path segment, a query key/value, userinfo, etc).
+// RFC 3986 unreserved characters (A-Za-z0-9-._~) pass through unchanged;
+// every other byte — including each byte of a multi-byte UTF-8 sequence —
+// becomes "%XX".
+//
+// Examples:
+//   uri_encode_component("/ ")   -> "%2F%20"
+//   uri_encode_component("a b")  -> "a%20b"
+fn uri_encode_component(s: string) -> string
+    let data = bytes_append_str(bytes(0), s)
+    percent_encode(data)
+
+// uri_decode_component: percent-decode a URI component back to literal
+// text. Strict RFC 3986: '+' decodes to literal '+', never a space.
+//
+// Examples:
+//   uri_decode_component("%2F%20") -> "/ "
+//   uri_decode_component("a%20b")  -> "a b"
+fn uri_decode_component(s: string) -> string
+    let data = percent_decode(s)
+    bytes_to_str(data)
+
+// ── query_parse ──────────────────────────────────────────────────────────
+
+// _uri_split_pair: split "key=value" on the FIRST '=' only.
+// Returns [key, value]; if no '=' is present, returns [s, ""].
+fn _uri_split_pair(s: string) -> list
+    let eq = _uri_index_of(s, "=", 0)
+    let result = []
+    if eq < 0
+        result.push(s)
+        result.push("")
+    else
+        result.push(slice(s, 0, eq))
+        result.push(slice(s, eq + 1, len(s)))
+    result
+
+// query_parse: parse a URI query component into a dict of percent-decoded
+// string keys/values. A leading '?' is stripped if present. Duplicate
+// keys: last value wins. A key with no '=' gets value "". Empty pairs
+// (from "&&" or a trailing/leading '&') are skipped, never crash.
+//
+// Examples:
+//   query_parse("x=1&y=2")        -> {"x":"1","y":"2"}
+//   query_parse("?x=1&y=2")       -> {"x":"1","y":"2"}   (leading '?' stripped)
+//   query_parse("q=a%20b")        -> {"q":"a b"}
+//   query_parse("flag")           -> {"flag":""}
+//   query_parse("")               -> {}
+fn query_parse(q: string) -> dict
+    let src = q
+    if len(src) > 0 and char_at(src, 0) == "?"
+        src = slice(src, 1, len(src))
+    let result = {}
+    if len(src) == 0
+        return result
+    let parts = split(src, "&")
+    let i = 0
+    while i < len(parts)
+        let raw = parts[i]
+        if len(raw) > 0
+            let pair = _uri_split_pair(raw)
+            let k = uri_decode_component(pair[0])
+            let v = uri_decode_component(pair[1])
+            result[k] = v
+        i = i + 1
+    result
