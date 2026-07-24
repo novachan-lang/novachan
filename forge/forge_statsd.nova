@@ -1,0 +1,191 @@
+// forge_statsd -- StatsD / DogStatsD client: metric-line formatter + UDP transport.
+// Wire format: name:value|type[|@rate][|#tag1:v1,tag2:v2]
+//   type: c=counter, g=gauge, ms=timer, h=histogram, s=set
+//   |@rate   -- sampling rate, 0<rate<=1, OMITTED when rate==1.0 (the wire default)
+//   |#k:v,.. -- DogStatsD tag extension, OMITTED when the tag list is empty
+// Gauge delta: StatsD gauges use a LEADING-SIGN convention to mean "add to the current
+// value" instead of "set to this value" (https://github.com/statsd/statsd/blob/master/docs/metric_types.md).
+// A bare positive number ("10") is an ABSOLUTE set; only an explicit "+10" or "-10" is a
+// delta. statsd_format_gauge_delta always emits the sign (even for positive deltas) so the
+// wire line is unambiguous -- statsd_format_gauge never does, since an absolute set must not
+// be mistaken for a delta.
+//
+// REUSE: transport is the existing udp_bind/udp_send primitives (nova_rt_udp_*) and the
+// generic tcp_close (a bare socket-fd close, works for any AF_INET socket) -- no new socket
+// plumbing. No existing statsd/metrics-wire-format module found in std/ or forge/ (forge_obs
+// is an in-process RED-metrics actor, a different concern -- not a wire-protocol client).
+//
+// SECURITY: the StatsD grammar has NO escape syntax, so any structural byte in an
+// attacker-influenced metric name or tag key/value (newline, CR, '|', ':', ',', NUL) is
+// STRIPPED before being placed on the wire -- a raw newline would let one metric_observe()
+// call inject a second, attacker-chosen metric line into the UDP datagram; '|'/':'/',' would
+// let it forge a fake |@rate, |#tag section, or extra tag pair. Every value/rate is formatted
+// by this module from a NUMBER (str()), never from attacker-controlled text, so only the name
+// and tag key/values need scrubbing.
+//
+// LEAF: imports nothing (no forge core dependency -- stays usable from a bare NOVA program).
+
+// ── sanitization ────────────────────────────────────────────────────────────────────────────
+// Strip every StatsD/DogStatsD grammar-structural byte from a name or tag token: newline, CR,
+// '|' (section separator), ':' (name/value and tag k:v separator), ',' (tag-list separator),
+// NUL. Stripping (not rejecting) keeps a single bad call from crashing a hot metrics path --
+// the caller gets a valid, merely-renamed metric instead of a thrown error or a corrupted
+// multi-line datagram.
+fn _statsd_clean(s: string) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let ch = char_at(s, i)
+        if ch != chr(10) and ch != chr(13) and ch != "|" and ch != ":" and ch != "," and ch != chr(0)
+            out = out + ch
+        i = i + 1
+    out
+
+// ── numeric formatting ──────────────────────────────────────────────────────────────────────
+// Format any numeric-ish value (int, float, or a bool -- type_of(bool)=="int" so str() already
+// gives "1"/"0") the same way for every metric type.
+fn _statsd_fmt_num(value: any) -> string
+    str(value)
+
+// Gauge-delta formatting: always carries an explicit sign. A negative number already starts
+// with '-' via str(); a non-negative one gets '+' prefixed. Checked on the FORMATTED STRING's
+// first byte (not a numeric comparison) so it works identically for int and float deltas
+// without tripping the float-vs-int-literal comparison unsoundness.
+fn _statsd_fmt_signed(value: any) -> string
+    let numstr = _statsd_fmt_num(value)
+    let out = numstr
+    if len(numstr) == 0 or char_at(numstr, 0) != "-"
+        out = "+" + numstr
+    out
+
+// Clamp a sample rate into the valid (0,1] wire range. >1 collapses to 1.0 (no sampling,
+// field omitted downstream); <=0 collapses to a tiny epsilon rather than the meaningless/
+// divide-by-zero-on-the-server "@0".
+// COERCION: `rate * 1.0` forces a genuine float value before any comparison. `rate` is
+// declared `float`, but a caller that passes an int LITERAL (e.g. `rate=1`) hits the
+// project-known float-var-vs-int-literal comparison unsoundness -- `r > 1.0` / `r < 0.0001`
+// can silently mis-evaluate against a slot that still holds int bits. Multiplying by 1.0
+// re-materializes a real float, so this function is safe for both int-literal and float
+// callers.
+fn _statsd_clamp_rate(rate: float) -> float
+    let r = rate * 1.0
+    if r > 1.0
+        r = 1.0
+    if r < 0.0001
+        r = 0.0001
+    r
+
+// ── tags ─────────────────────────────────────────────────────────────────────────────────────
+// tags is a LIST of [key, value] string pairs (NOT a dict) so wire order is exactly the
+// caller's order -- dict key-iteration order is not a guarantee this module wants to depend
+// on. Empty-key pairs (post-sanitization) are dropped rather than emitting a bare ":value".
+fn _statsd_tags_str(tags: any) -> string
+    let out = ""
+    let i = 0
+    let n = len(tags)
+    while i < n
+        let pair = tags[i]
+        let k = _statsd_clean(pair[0])
+        let v = _statsd_clean(pair[1])
+        if len(k) > 0
+            if len(out) > 0
+                out = out + ","
+            out = out + k + ":" + v
+        i = i + 1
+    out
+
+// ── line builder ─────────────────────────────────────────────────────────────────────────────
+// COERCION (defense-in-depth, see _statsd_clamp_rate above): this is the single choke point
+// every formatter routes rate through, so re-coerce with `rate * 1.0` here too -- an int
+// literal 1 and a float 1.0 must both mean "no sampling, omit |@rate", never a wrongly
+// included/omitted suffix from comparing against unconverted int bits.
+fn _statsd_line(name: string, valuestr: string, mtype: string, rate: float, tags: any) -> string
+    let n = _statsd_clean(name)
+    let line = n + ":" + valuestr + "|" + mtype
+    let r = rate * 1.0
+    if r < 1.0
+        line = line + "|@" + _statsd_fmt_num(r)
+    let tagstr = _statsd_tags_str(tags)
+    if len(tagstr) > 0
+        line = line + "|#" + tagstr
+    line
+
+// ── pure formatters (no I/O; reusable standalone, and what the KAT checks byte-exact) ─────────
+
+fn statsd_format_counter(name: string, value: any, rate: float, tags: any) -> string
+    _statsd_line(name, _statsd_fmt_num(value), "c", _statsd_clamp_rate(rate), tags)
+
+// GUARD: an absolute gauge SET of a negative value is not expressible on the StatsD wire --
+// every real server treats a line whose value starts with '-' as a relative DECREMENT
+// (leading-sign convention, see module header), never an absolute set. Rather than silently
+// emit a line that means the opposite of what the caller asked for, clamp the negative
+// magnitude to "0" (consistent with this module's stripping-not-throwing philosophy for a
+// hot metrics path) and point callers who actually want a decrement at
+// statsd_format_gauge_delta, which emits an explicit, unambiguous signed delta.
+// Checked on the FORMATTED STRING's first byte (same trick as _statsd_fmt_signed) so it
+// works identically for int and float values without hitting the float-vs-int-literal
+// comparison unsoundness.
+fn statsd_format_gauge(name: string, value: any, tags: any) -> string
+    let numstr = _statsd_fmt_num(value)
+    let safe = numstr
+    if len(numstr) > 0 and char_at(numstr, 0) == "-"
+        safe = "0"
+    _statsd_line(name, safe, "g", 1.0, tags)
+
+// Signed delta ("+N"/"-N") -- adds to the gauge's current value on the server, per the StatsD
+// wire convention, instead of setting it.
+fn statsd_format_gauge_delta(name: string, delta: any, tags: any) -> string
+    _statsd_line(name, _statsd_fmt_signed(delta), "g", 1.0, tags)
+
+fn statsd_format_timer(name: string, ms: any, rate: float, tags: any) -> string
+    _statsd_line(name, _statsd_fmt_num(ms), "ms", _statsd_clamp_rate(rate), tags)
+
+fn statsd_format_histogram(name: string, value: any, rate: float, tags: any) -> string
+    _statsd_line(name, _statsd_fmt_num(value), "h", _statsd_clamp_rate(rate), tags)
+
+fn statsd_format_set(name: string, value: any, tags: any) -> string
+    _statsd_line(name, _statsd_fmt_num(value), "s", 1.0, tags)
+
+// ── UDP transport ────────────────────────────────────────────────────────────────────────────
+// Bind an ephemeral local UDP socket (port 0 -> OS-assigned) that will send datagrams to
+// host:port. REUSE of udp_bind/udp_send -- no new socket plumbing. If the platform can't
+// create a socket (offline/sandboxed test env, or udp_bind failing for any reason) sock is
+// negative and every send call below becomes a safe no-op returning -1; the formatter
+// functions above still work standalone in that case.
+fn statsd_client(host: string, port: int) -> any
+    let c = {}
+    c["host"] = host
+    c["port"] = port
+    c["sock"] = udp_bind(0)
+    c
+
+// Close the client's local socket. Safe to call on a formatter-only (sock<0) client.
+fn statsd_close(c: any) -> int
+    if c["sock"] >= 0
+        tcp_close(c["sock"])
+    0
+
+fn _statsd_send(c: any, line: string) -> int
+    let result = -1
+    if c["sock"] >= 0
+        result = udp_send(c["sock"], c["host"], c["port"], line)
+    result
+
+fn statsd_counter(c: any, name: string, value: any, rate: float, tags: any) -> int
+    _statsd_send(c, statsd_format_counter(name, value, rate, tags))
+
+fn statsd_gauge(c: any, name: string, value: any, tags: any) -> int
+    _statsd_send(c, statsd_format_gauge(name, value, tags))
+
+fn statsd_gauge_delta(c: any, name: string, delta: any, tags: any) -> int
+    _statsd_send(c, statsd_format_gauge_delta(name, delta, tags))
+
+fn statsd_timer(c: any, name: string, ms: any, rate: float, tags: any) -> int
+    _statsd_send(c, statsd_format_timer(name, ms, rate, tags))
+
+fn statsd_histogram(c: any, name: string, value: any, rate: float, tags: any) -> int
+    _statsd_send(c, statsd_format_histogram(name, value, rate, tags))
+
+fn statsd_set(c: any, name: string, value: any, tags: any) -> int
+    _statsd_send(c, statsd_format_set(name, value, tags))

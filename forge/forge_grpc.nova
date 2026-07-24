@@ -1,5 +1,10 @@
 // forge_grpc — gRPC wire-framing + routing layer for the Forge web framework.
-// LEAF module: imports NOTHING. Payload bytes are opaque (pair with forge_protobuf for encode/decode).
+// Imports ONLY std/net/http2 (frame header + HPACK integer/static-table primitives,
+// reused for the CLIENT section below — see "unary CLIENT" heading). The original
+// server-side framing/dispatch API (grpc_frame/grpc_deframe/grpc_dispatch/...) is
+// list<int>-based and UNCHANGED — forge_grpc_h2 depends on it, do not remove it.
+// The new CLIENT API is `bytes`-native (binary-safe end-to-end) and pairs with
+// std/encoding/protobuf for the message payload (opaque bytes to this module).
 //
 // gRPC wire framing (5-byte prefix per message):
 //   byte 0   : compressed-flag (0 = uncompressed, 1 = compressed)
@@ -21,6 +26,8 @@
 //   grpc_deframe([0,0,0,0,3,1,2,3], 0) -> [[1,2,3], 8, 0]
 //   grpc_path_service("/echo.Echo/Say") -> "echo.Echo"
 //   grpc_path_method("/echo.Echo/Say")  -> "Say"
+
+import std/net/http2 as h2w
 
 // ── framing ───────────────────────────────────────────────────────────────────
 
@@ -285,3 +292,381 @@ fn grpc_response_error(status: int, message: string) -> dict
     e["status"] = status
     e["message"] = message
     e
+
+// ════════════════════════════════════════════════════════════════════════════
+// ── unary CLIENT (bytes-native, HTTP/2 wire) ────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// A gRPC unary call over HTTP/2 (RFC 7540) is, on the wire, exactly:
+//   HEADERS frame  (END_HEADERS)    -- :method POST, :path, :scheme, :authority,
+//                                       content-type application/grpc+proto, te trailers
+//   DATA frame     (END_STREAM)     -- the ONE length-prefixed gRPC message (unary
+//                                       request body is exactly one message)
+//   ... server replies with its own HEADERS(:status 200)/DATA/HEADERS(trailers) ...
+//   HEADERS frame  (END_STREAM)     -- the TRAILERS: grpc-status + grpc-message
+//                                       (gRPC status is NEVER on the :status line —
+//                                       :status is always 200 if headers were sent
+//                                       at all; the REAL result is in trailers)
+//
+// This section builds/parses that wire sequence using std/net/http2's frame-header
+// codec + HPACK integer/static-table primitives (h2_frame_header_encode/decode,
+// h2_hpack_int_encode/decode, h2_static_name/value/lookup) — this module adds the
+// missing piece std/net/http2 deliberately does NOT provide: full HPACK header-BLOCK
+// encode/decode (a sequence of header fields), built on top of those primitives.
+// Every byte here uses NOVA's native `bytes` type (never a plain int list) so a
+// 0x00 byte anywhere in a header value or message payload is never mistaken for a
+// C-string terminator (see BINARY SAFETY note below).
+//
+// SCOPE: pure encode/parse functions — no socket I/O. Pair with tcp_connect /
+// tls_connect_alpn("h2") (see project_client_alpn_tls memory) for the actual
+// transport; grpc_client_request()/grpc_client_parse_response() are exactly the
+// bytes written to / read from that connection for one stream.
+//
+// HPACK LIMITATION (documented, not a soundness hole): no dynamic table is
+// maintained. Every header this client EMITS is self-contained (literal-without-
+// indexing, optionally with an indexed NAME from the 61-entry static table) so
+// it never depends on prior state. grpc_hpack_decode_headers() correctly decodes
+// indexed fields and BOTH indexed-name and literal-name literals (covering what
+// every major gRPC server implementation emits for a first/only request on a
+// connection); it does not decode Huffman-coded strings (H=1) or resolve a
+// dynamic-table reference from an EARLIER response on the same connection —
+// acceptable for a single-shot unary call, tracked as a known gap for a future
+// persistent-connection HPACK dynamic-table implementation.
+//
+// BINARY SAFETY: message payloads and header VALUES are `bytes`/`string` end-to-end;
+// grpc_deframe_bytes never calls bytes_to_str on the raw protobuf payload (only
+// header text goes through bytes_to_str/str_to_bytes, where UTF-8 text is expected
+// per RFC 7540 §8.1.2 — binary payloads never do).
+//
+// Verified by reasoning:
+//   grpc_frame_bytes(str_to_bytes("hello")) -> bytes[0,0,0,0,5,'h','e','l','l','o']
+//   grpc_frame_bytes(bytes(0))              -> bytes[0,0,0,0,0]               (empty message)
+//   grpc_deframe_bytes(grpc_frame_bytes(m), 0) -> [m, 5+len(m), 0]            (round-trip)
+//   grpc_client_pseudo_headers(...) contains [":method","POST"] and
+//     ["content-type","application/grpc+proto"]
+//   grpc_client_request(...) -> HEADERS frame + DATA frame wire bytes
+//   grpc_client_parse_response(trailers-only reply with grpc-status "0") -> status=0
+
+// ── length-prefixed message framing (bytes-native) ─────────────────────────────
+
+// grpc_frame_bytes(payload) -> bytes
+// Wrap a raw protobuf message in the 5-byte gRPC length-prefix frame:
+//   byte 0    : compressed-flag (0 = uncompressed — this client never compresses)
+//   bytes 1-4 : unsigned 32-bit BIG-ENDIAN length of payload
+//   bytes 5.. : payload, verbatim
+// Vector: grpc_frame_bytes(bytes of [1,2,3]) -> bytes[0,0,0,0,3,1,2,3]
+// Vector: grpc_frame_bytes(bytes(0))         -> bytes[0,0,0,0,0]          (empty message)
+fn grpc_frame_bytes(payload: bytes) -> bytes
+    let n = bytes_len(payload)
+    let out = bytes(0)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, (n >> 24) & 0xFF)
+    out = bytes_append(out, (n >> 16) & 0xFF)
+    out = bytes_append(out, (n >> 8) & 0xFF)
+    out = bytes_append(out, n & 0xFF)
+    out = bytes_concat(out, payload)
+    out
+
+// grpc_deframe_bytes(buf, off) -> list
+// Read ONE framed gRPC message from `buf` (bytes) starting at `off`.
+// Returns [payload: bytes, next_off: int, flag: int].
+// BOUNDS-CHECKED: `buf` is attacker/network-controlled. Fewer than 5 header bytes
+// remaining, OR a declared length that runs past the end of `buf` (a lying or
+// truncated frame), returns the malformed sentinel [bytes(0), off, -1] instead of
+// reading out of bounds — mirrors grpc_deframe()'s contract exactly, bytes-native.
+// Vector: grpc_deframe_bytes(bytes[0,0,0,0,3,1,2,3], 0) -> [bytes[1,2,3], 8, 0]
+fn grpc_deframe_bytes(buf: bytes, off: int) -> list
+    let n = bytes_len(buf)
+    if off < 0 or off + 5 > n
+        return [bytes(0), off, -1]
+    let flag = bytes_get(buf, off)
+    let length = (bytes_get(buf, off + 1) << 24) | (bytes_get(buf, off + 2) << 16) | (bytes_get(buf, off + 3) << 8) | bytes_get(buf, off + 4)
+    if off + 5 + length > n
+        return [bytes(0), off, -1]
+    let payload = bytes_slice(buf, off + 5, off + 5 + length)
+    [payload, off + 5 + length, flag]
+
+// ── HPACK header-block codec (built on std/net/http2's int/static-table primitives) ──
+
+// _grpc_hpack_encode_string(s) -> bytes
+// RFC 7541 §5.2 string literal, Huffman NOT used (H=0 — the top bit of the 7-bit
+// length prefix is always clear from h2_hpack_int_encode(_, 7)). Correctness over
+// wire compactness: this client controls the encoder, so plain octets are always
+// unambiguous and require no Huffman table.
+fn _grpc_hpack_encode_string(s: string) -> bytes
+    let raw = str_to_bytes(s)
+    let out = h2w.h2_hpack_int_encode(bytes_len(raw), 7)
+    bytes_concat(out, raw)
+
+// _grpc_hpack_decode_string(buf, pos) -> list [value: string, next_pos: int]
+// Inverse of _grpc_hpack_encode_string. Does NOT decode Huffman-coded strings
+// (H=1) — see module-level HPACK LIMITATION note; bounds-safe: a truncated
+// length prefix or a declared length running past the end of buf returns
+// ["", -1] — a NEGATIVE sentinel next_pos, the same failure convention
+// h2_hpack_int_decode uses for its value slot. -1 can never be a valid
+// next_pos (positions are >= 0), so callers MUST check `result[1] < 0` and
+// stop scanning rather than treat the empty string as a real header.
+fn _grpc_hpack_decode_string(buf: bytes, pos: int) -> list
+    if pos < 0 or pos >= bytes_len(buf)
+        return ["", -1]
+    let r = h2w.h2_hpack_int_decode(buf, pos, 7)
+    let slen = r[0]
+    let p = r[1]
+    if slen < 0 or p + slen > bytes_len(buf)
+        return ["", -1]
+    let sb = bytes_slice(buf, p, p + slen)
+    [bytes_to_str(sb), p + slen]
+
+// _grpc_hpack_encode_header(name, value) -> bytes
+// One header field as "Literal Header Field without Indexing" (RFC 7541 §6.2.2):
+// opcode nibble 0000, then EITHER a static-table name index (if `name` is one of
+// the 61 static entries — h2_static_lookup) or index 0 + a literal name, followed
+// by the literal value. Always self-contained (never depends on / mutates a
+// dynamic table), which is why decode doesn't need one either.
+fn _grpc_hpack_encode_header(name: string, value: string) -> bytes
+    let idx = h2w.h2_static_lookup(name, value)
+    let aidx = idx
+    if aidx < 0
+        aidx = 0 - aidx
+    let out = bytes(0)
+    if aidx > 0
+        let ib = h2w.h2_hpack_int_encode(aidx, 4)
+        out = bytes_concat(out, ib)
+        out = bytes_concat(out, _grpc_hpack_encode_string(value))
+    else
+        out = bytes_append(out, 0)
+        out = bytes_concat(out, _grpc_hpack_encode_string(name))
+        out = bytes_concat(out, _grpc_hpack_encode_string(value))
+    out
+
+// grpc_hpack_encode_headers(headers) -> bytes
+// Encode a full header block: `headers` is a list of [name, value] string pairs,
+// in wire order (pseudo-headers MUST come first per RFC 7540 §8.1.2.1 — callers
+// building the list themselves are responsible for that order; grpc_client_pseudo_headers
+// already produces it correctly).
+fn grpc_hpack_encode_headers(headers: list) -> bytes
+    let out = bytes(0)
+    let i = 0
+    while i < len(headers)
+        out = bytes_concat(out, _grpc_hpack_encode_header(headers[i][0], headers[i][1]))
+        i = i + 1
+    out
+
+// grpc_hpack_decode_headers(buf, pos) -> list of [name, value]
+// Decode a header block starting at `pos`. Handles the representations a gRPC
+// peer emits on a fresh connection: Indexed Header Field (RFC 7541 §6.1), Literal
+// with Incremental Indexing (§6.2.1) and Literal without Indexing / Never Indexed
+// (§6.2.2/§6.2.3) — the latter two both use indexed-or-literal NAME + literal
+// VALUE and share this decoder's indexed/literal-name branch. Dynamic Table Size
+// Update (§6.3) entries are consumed and ignored (this client tracks no dynamic
+// table). Bounds-safe throughout: any malformed/truncated int or string decode
+// stops the loop IMMEDIATELY and returns only the headers already decoded —
+// it never fabricates a header from a failed decode. h2_hpack_int_decode signals
+// failure via a negative VALUE (result[0] < 0); _grpc_hpack_decode_string signals
+// failure via a negative NEXT_POS (result[1] < 0) since its value slot is a
+// string, not an int. Both sentinels are checked at every call site — including
+// the NAME string decode and the VALUE string decode separately, since a literal
+// header field decodes name and value as two independent string reads and either
+// one can be the one that's truncated.
+fn grpc_hpack_decode_headers(buf: bytes, pos: int) -> list
+    let out = []
+    let n = bytes_len(buf)
+    let i = pos
+    let stop = false
+    while i < n and stop == false
+        let b0 = bytes_get(buf, i)
+        if (b0 & 0x80) != 0
+            let r = h2w.h2_hpack_int_decode(buf, i, 7)
+            if r[0] < 0
+                stop = true
+            else
+                push(out, [h2w.h2_static_name(r[0]), h2w.h2_static_value(r[0])])
+                i = r[1]
+        else if (b0 & 0x40) != 0
+            let r2 = h2w.h2_hpack_int_decode(buf, i, 6)
+            if r2[0] < 0
+                stop = true
+            else
+                let name2 = ""
+                let p2 = r2[1]
+                if r2[0] == 0
+                    let sr2 = _grpc_hpack_decode_string(buf, p2)
+                    if sr2[1] < 0
+                        stop = true
+                    else
+                        name2 = sr2[0]
+                        p2 = sr2[1]
+                else
+                    name2 = h2w.h2_static_name(r2[0])
+                if stop == false
+                    let vr2 = _grpc_hpack_decode_string(buf, p2)
+                    if vr2[1] < 0
+                        stop = true
+                    else
+                        push(out, [name2, vr2[0]])
+                        i = vr2[1]
+        else if (b0 & 0x20) != 0
+            let r3 = h2w.h2_hpack_int_decode(buf, i, 5)
+            if r3[0] < 0
+                stop = true
+            else
+                i = r3[1]
+        else
+            let r4 = h2w.h2_hpack_int_decode(buf, i, 4)
+            if r4[0] < 0
+                stop = true
+            else
+                let name4 = ""
+                let p4 = r4[1]
+                if r4[0] == 0
+                    let sr4 = _grpc_hpack_decode_string(buf, p4)
+                    if sr4[1] < 0
+                        stop = true
+                    else
+                        name4 = sr4[0]
+                        p4 = sr4[1]
+                else
+                    name4 = h2w.h2_static_name(r4[0])
+                if stop == false
+                    let vr4 = _grpc_hpack_decode_string(buf, p4)
+                    if vr4[1] < 0
+                        stop = true
+                    else
+                        push(out, [name4, vr4[0]])
+                        i = vr4[1]
+    out
+
+// ── request HEADERS pseudo-header set ───────────────────────────────────────────
+
+// grpc_client_path(service, method) -> string
+// Build the gRPC :path from a fully-qualified service name and a method name.
+// Example: grpc_client_path("echo.Echo", "Say") -> "/echo.Echo/Say"
+fn grpc_client_path(service: string, method: string) -> string
+    "/" + service + "/" + method
+
+// grpc_client_pseudo_headers(authority, scheme, service, method) -> list
+// Build the full HEADERS field list for a gRPC unary request, in RFC 7540
+// §8.1.2.1-compliant order (all pseudo-headers before regular headers):
+//   :method    = POST                             (gRPC is always POST)
+//   :scheme    = scheme (caller passes "https", or "http" for cleartext h2c)
+//   :path      = /package.Service/Method
+//   :authority = authority (host[:port])
+//   content-type = application/grpc+proto
+//   te           = trailers   (REQUIRED — signals intermediaries must not buffer
+//                               the response, since the RPC result rides in
+//                               trailers written only after the body completes)
+// Vector: grpc_client_pseudo_headers("example.com","https","echo.Echo","Say")
+//   contains [":method","POST"] and ["content-type","application/grpc+proto"]
+fn grpc_client_pseudo_headers(authority: string, scheme: string, service: string, method: string) -> list
+    let h = []
+    push(h, [":method", "POST"])
+    push(h, [":scheme", scheme])
+    push(h, [":path", grpc_client_path(service, method)])
+    push(h, [":authority", authority])
+    push(h, ["content-type", grpc_content_type()])
+    push(h, ["te", "trailers"])
+    h
+
+// ── frame-type / flag constants (RFC 7540 §11.2 / §6.2 / §6.1) ─────────────────
+
+// _grpc_h2_headers_type() -> int   HEADERS frame type = 1
+fn _grpc_h2_headers_type() -> int
+    h2w.h2_frame_type_num("HEADERS")
+
+// _grpc_h2_data_type() -> int   DATA frame type = 0
+fn _grpc_h2_data_type() -> int
+    h2w.h2_frame_type_num("DATA")
+
+// _grpc_h2_end_stream() -> int   END_STREAM flag bit (0x1, DATA/HEADERS)
+fn _grpc_h2_end_stream() -> int
+    0x1
+
+// _grpc_h2_end_headers() -> int   END_HEADERS flag bit (0x4, HEADERS)
+fn _grpc_h2_end_headers() -> int
+    0x4
+
+// ── full unary request/response wire assembly ───────────────────────────────────
+
+// grpc_client_request(stream_id, authority, scheme, service, method, message) -> bytes
+// Build the complete wire bytes for a unary gRPC request on `stream_id`:
+//   HEADERS frame (END_HEADERS only — DATA carries the body, not END_STREAM yet)
+//   DATA frame    (END_STREAM — the length-prefixed gRPC message; unary request
+//                  body is exactly ONE message, so the DATA frame always closes
+//                  the client's side of the stream)
+// This is exactly what a client writes to the h2 connection for one call, after
+// the connection preface + SETTINGS handshake (out of scope here — see the h2c
+// serve-loop shape in forge_grpc_h2 / forge_h2_server for that transport wiring).
+fn grpc_client_request(stream_id: int, authority: string, scheme: string, service: string, method: string, message: bytes) -> bytes
+    let headers = grpc_client_pseudo_headers(authority, scheme, service, method)
+    let hblock = grpc_hpack_encode_headers(headers)
+    let hframe_hdr = h2w.h2_frame_header_encode(bytes_len(hblock), _grpc_h2_headers_type(), _grpc_h2_end_headers(), stream_id)
+    let framed_msg = grpc_frame_bytes(message)
+    let dframe_hdr = h2w.h2_frame_header_encode(bytes_len(framed_msg), _grpc_h2_data_type(), _grpc_h2_end_stream(), stream_id)
+    let out = bytes_concat(hframe_hdr, hblock)
+    out = bytes_concat(out, dframe_hdr)
+    out = bytes_concat(out, framed_msg)
+    out
+
+// grpc_client_parse_response(buf) -> dict
+// Parse a full unary gRPC response wire sequence — one or more HEADERS/DATA/HEADERS
+// frames concatenated as read off the h2 connection for ONE stream (a real client
+// would demux by stream_id first; this function assumes `buf` already contains
+// only this stream's frames, matching what grpc_client_request produces for the
+// request side).
+//   {"status": int, "message": string, "data": bytes}
+// "status" defaults to -1 (sentinel: no grpc-status trailer was seen at all — an
+// incomplete/malformed response — never confuse with 0=OK per checklist item 7).
+// "data" accumulates every DATA frame's payload verbatim (still gRPC-length-
+// prefixed — pass to grpc_client_response_message() or grpc_deframe_bytes()
+// directly to reach the raw protobuf response bytes).
+// Bounds-safe: h2_frame_header_decode returns an empty dict on truncation, which
+// stops the scan; a declared frame length running past the end of `buf` also
+// stops the scan rather than reading out of bounds.
+fn grpc_client_parse_response(buf: bytes) -> dict
+    let n = bytes_len(buf)
+    let pos = 0
+    let status = 0 - 1
+    let message = ""
+    let raw_data = bytes(0)
+    let stop = false
+    while pos + 9 <= n and stop == false
+        let fh = h2w.h2_frame_header_decode(buf, pos)
+        let hdr = fh[0]
+        if len(keys(hdr)) == 0
+            stop = true
+        else
+            let flen = hdr["length"]
+            let ftype = hdr["type"]
+            let body_start = pos + 9
+            let body_end = body_start + flen
+            if body_end > n
+                stop = true
+            else
+                if ftype == _grpc_h2_data_type()
+                    raw_data = bytes_concat(raw_data, bytes_slice(buf, body_start, body_end))
+                else if ftype == _grpc_h2_headers_type()
+                    let hs = grpc_hpack_decode_headers(buf, body_start)
+                    let j = 0
+                    while j < len(hs)
+                        if hs[j][0] == "grpc-status"
+                            status = parse_int(hs[j][1])
+                        else if hs[j][0] == "grpc-message"
+                            message = hs[j][1]
+                        j = j + 1
+                pos = body_end
+    let res = {}
+    res["status"] = status
+    res["message"] = message
+    res["data"] = raw_data
+    res
+
+// grpc_client_response_message(res) -> bytes
+// Deframe the accumulated DATA payload from grpc_client_parse_response() down to
+// the raw protobuf response message bytes (strips the 5-byte gRPC prefix).
+// Returns bytes(0) if the DATA payload is missing or malformed (see
+// grpc_deframe_bytes's bounds-checked contract) — never crashes on an
+// incomplete/empty response.
+fn grpc_client_response_message(res: dict) -> bytes
+    let d = grpc_deframe_bytes(res["data"], 0)
+    if d[2] == -1
+        return bytes(0)
+    d[0]

@@ -1,0 +1,87 @@
+// KAT: forge_statsd line formatter -- byte-exact wire lines + injection/edge-case hardening.
+import forge_statsd
+
+fn main()
+    // Required byte-exact vectors.
+    assert_eq(statsd_format_counter("page.views", 1, 1.0, []), "page.views:1|c")
+    assert_eq(statsd_format_counter("page.views", 5, 0.1, []), "page.views:5|c|@0.1")
+    assert_eq(statsd_format_gauge("fuel", 0.5, []), "fuel:0.5|g")
+    assert_eq(statsd_format_gauge_delta("fuel", -10, []), "fuel:-10|g")
+    assert_eq(statsd_format_timer("resp", 250, 1.0, []), "resp:250|ms")
+    assert_eq(statsd_format_set("users", 42, []), "users:42|s")
+    assert_eq(statsd_format_counter("page.views", 1, 1.0, [["env", "prod"], ["host", "a"]]), "page.views:1|c|#env:prod,host:a")
+
+    // Gauge delta: positive deltas ALSO carry an explicit sign (the whole point of "signed
+    // delta" support -- a bare "10" would be an ABSOLUTE set on the wire, not a delta).
+    assert_eq(statsd_format_gauge_delta("fuel", 10, []), "fuel:+10|g")
+    assert_eq(statsd_format_gauge_delta("fuel", 0, []), "fuel:+0|g")
+
+    // Histogram, and a float value through the generic numeric formatter.
+    assert_eq(statsd_format_histogram("size", 128, 1.0, []), "size:128|h")
+    assert_eq(statsd_format_histogram("latency", 12.5, 0.5, []), "latency:12.5|h|@0.5")
+
+    // ── injection hardening: newline/pipe/colon/comma in name AND in tag k/v ─────────────────
+    // A raw newline in the name must not survive (it would let one call inject a second line
+    // into the UDP datagram); a raw '|' must not survive (it would forge a fake |@rate/|#tag
+    // section); ':' and ',' must not survive out of a tag key/value (they'd forge tag-grammar
+    // structure). Everything else in the string is preserved, just concatenated back together
+    // (this module strips, it doesn't reject/throw).
+    let evil_name = "bad" + chr(10) + "name" + "|" + "x"
+    let evil_line = statsd_format_counter(evil_name, 1, 1.0, [["k" + "|" + "1", "v" + chr(13) + "2,3:4"]])
+    assert_eq(evil_line, "badnamex:1|c|#k1:v234")
+    assert_eq(find(evil_line, chr(10)), -1)
+    assert_eq(find(evil_line, chr(13)), -1)
+    // Exactly the two structural pipes we emitted ourselves (type sep + tag sep) survive --
+    // none injected from attacker content.
+    let pipes = split(evil_line, "|")
+    assert_eq(len(pipes), 3)
+
+    // ── empty/missing ────────────────────────────────────────────────────────────────────────
+    assert_eq(statsd_format_counter("", 1, 1.0, []), ":1|c")
+    assert_eq(statsd_format_gauge("g", 1, []), "g:1|g")
+
+    // ── boundary clamps on rate ──────────────────────────────────────────────────────────────
+    assert_eq(statsd_format_counter("x", 1, 2.0, []), "x:1|c")
+    assert_eq(statsd_format_counter("x", 1, 0.0, []), "x:1|c|@0.0001")
+    assert_eq(statsd_format_counter("x", 1, -5.0, []), "x:1|c|@0.0001")
+
+    // ── rate coercion: int literal vs float, and negative-gauge guard ───────────────────────
+    // An int LITERAL rate of 1 must mean exactly the same thing as a float 1.0 -- no |@ suffix.
+    assert_eq(statsd_format_counter("x", 1, 1, []), "x:1|c")
+    // A genuinely sub-1.0 float rate still emits the |@ suffix correctly.
+    assert_eq(statsd_format_counter("x", 1, 0.1, []), "x:1|c|@0.1")
+    // A negative absolute gauge set is unrepresentable on the wire (leading '-' means DELTA to
+    // every real StatsD server) -- it must be clamped, never emitted as a bare "-N" line.
+    assert_eq(statsd_format_gauge("fuel", -5, []), "fuel:0|g")
+    // The unambiguous way to decrement is the dedicated delta formatter.
+    assert_eq(statsd_format_gauge_delta("fuel", -5, []), "fuel:-5|g")
+
+    // ── width boundaries (32-bit signed/unsigned edges) ─────────────────────────────────────
+    assert_eq(statsd_format_counter("big", 2147483647, 1.0, []), "big:2147483647|c")
+    assert_eq(statsd_format_counter("big", 2147483648, 1.0, []), "big:2147483648|c")
+    assert_eq(statsd_format_counter("big", 4294967296, 1.0, []), "big:4294967296|c")
+
+    // ── null/0 + bool/int dispatch (type_of(bool)=="int"; no `!= null` traps) ────────────────
+    assert_eq(statsd_format_set("flag", true, []), "flag:1|s")
+    assert_eq(statsd_format_set("flag", false, []), "flag:0|s")
+
+    // ── client: formatter-only mode must never crash even if the socket bind failed ─────────
+    let c = statsd_client("127.0.0.1", 8125)
+    let n = statsd_counter(c, "page.views", 1, 1.0, [])
+    assert_eq(n >= -1, true)
+    statsd_close(c)
+
+    // ── live loopback send/recv: prove the UDP path actually puts the exact formatted line
+    // on the wire (skipped gracefully if this sandbox can't open a UDP socket at all).
+    let srv = udp_bind(18962)
+    if srv >= 0
+        let c2 = statsd_client("127.0.0.1", 18962)
+        if c2["sock"] >= 0
+            let sent = statsd_gauge(c2, "fuel", 0.5, [])
+            assert_eq(sent, len("fuel:0.5|g"))
+            let got = udp_recv(srv)
+            assert_eq(got, "fuel:0.5|g")
+        statsd_close(c2)
+        tcp_close(srv)
+
+    print("statsd kat passed")

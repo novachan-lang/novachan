@@ -1,0 +1,526 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/avro
+// ============================================================================
+// Apache Avro BINARY encoding (avro.apache.org/docs/current/specification/,
+// section "Binary Encoding"). Avro's binary format carries NO field names,
+// NO type tags, and NO self-description on the wire — every byte's meaning
+// comes from a schema the reader and writer already agree on out-of-band.
+// This module implements the wire-level primitive/complex encoders/decoders;
+// the CALLER supplies the schema shape by choosing which functions to call
+// in which order (exactly like std/encoding/protobuf's field-by-field API).
+//
+// REUSE (do not duplicate elsewhere in NOVA — extend these two modules
+// instead of hand-rolling zigzag/varint math again):
+//   std/encoding/varint   -> vi_encode(u) / vi_decode(buf,pos)   unsigned LEB128
+//   std/bits/zigzag       -> zz_encode(n) / zz_decode(u)          signed<->unsigned
+//   std/encoding/pack     -> pack_u32_le/unpack_u32_le,
+//                             pack_u64_le/unpack_u64_le            fixed-width LE
+// Avro's "long"/"int" wire format IS `vi_encode(zz_encode(n))` — the exact
+// idiom std/encoding/protobuf already uses for its sint32/sint64 fields.
+//
+// PRIMITIVE TYPES (Avro spec ⇒ this module)
+//   null     0 bytes                          av_encode_null / av_decode_null
+//   boolean  1 byte, 0x00 or 0x01              av_encode_boolean / av_decode_boolean
+//   int      zigzag + LEB128 varint            av_encode_int / av_decode_int
+//   long     zigzag + LEB128 varint (SAME wire format as int — Avro does not
+//            distinguish int/long on the wire, only in the schema)
+//                                               av_encode_long / av_decode_long
+//   float    4 bytes, little-endian IEEE-754 single
+//                                               av_encode_float / av_decode_float
+//   double   8 bytes, little-endian IEEE-754 double
+//                                               av_encode_double / av_decode_double
+//   bytes    long length, then that many raw bytes (BINARY SAFE — 0x00 is
+//            ordinary data, never touches a NOVA string)
+//                                               av_encode_bytes / av_decode_bytes
+//   string   long length, then that many UTF-8 bytes
+//                                               av_encode_string / av_decode_string
+//
+// COMPLEX TYPES
+//   array    a series of blocks: long block-count, then that many items,
+//            repeated, terminated by a block whose count is 0. A NEGATIVE
+//            count means "the following |count| items, but first read a long
+//            byte-size for the block" (lets a reader skip the block without
+//            decoding each item) — av_decode_array accepts blocks written
+//            either way; av_encode_array always emits the simple non-negative
+//            single-block form (item_count>0 then a 0 terminator), which is
+//            what the reference Avro encoders emit by default.
+//                                               av_encode_array(items, enc)
+//                                               av_decode_array(buf, pos, dec)
+//   map      identical block structure to array, but each item is a
+//            (string key, value) pair. Represented here as a LIST of
+//            [key, value] 2-element lists (NOT a NOVA dict) so item order is
+//            always exactly what the caller wrote — dict iteration order is
+//            not a guarantee this module relies on.
+//                                               av_encode_map(pairs, enc)
+//                                               av_decode_map(buf, pos, dec)
+//   record   fields concatenated in schema-declared order, nothing else on
+//            the wire (no names, no count, no delimiters).
+//                                               av_encode_record(field_bytes_list)
+//                                               av_decode_record(buf, pos, decoder_fns)
+//   union    a long branch index (0-based, into the schema's union type
+//            list), followed by the value encoded per that branch's type.
+//                                               av_encode_union(branch_index, value_bytes)
+//                                               av_decode_union(buf, pos, decoder_fns)
+//
+// `enc`/`dec`/`decoder_fns` are plain NOVA functions passed by name, e.g.
+// av_decode_array(buf, 0, av_decode_long) — the same first-class-function
+// style already proven by std/functional/fmap (fm_map(dbl, xs)) and
+// std/parsing/combinators.
+//
+// FLOAT BIT-EXACTNESS.
+//   NOVA floats are always f64. Avro's "double" needs the exact f64 bit
+//   pattern, which float_to_bits/float_from_bits already provide (SAFE, no
+//   raw memory) — used exactly like std/encoding/bson's double field.
+//   Avro's "float" needs the f64 value NARROWED to a real 32-bit IEEE-754
+//   single. There is no safe `f32_to_bits` builtin (only the widening
+//   `f32_from_bits` exists), so av_encode_float uses the sanctioned
+//   raw-memory primitives (alloc_raw/ptr_write_f32/ptr_read_u32/free_raw,
+//   inside an explicit `unsafe` block) to obtain the true narrowed bit
+//   pattern — the same technique C uses via `float f = (float)d; memcpy(...)`.
+//   Decoding a float needs no unsafe: f32_from_bits(bits) safely widens.
+//
+// NULL/BOOL/INT SOUNDNESS (see reference_nova_return_null_mistag /
+// reference gotchas — a bare `null` inside a list silently becomes int 0).
+//   av_decode_null NEVER puts a real `null` into its result list; it returns
+//   `[0, pos]` where 0 is a documented SENTINEL (Avro's null type carries no
+//   data anyway, so there is no real value to lose). av_encode_boolean/
+//   av_decode_boolean use plain 0/1 ints throughout (type_of(true)=="int" in
+//   NOVA, so bool and int are already the same representation here).
+//
+// DEFENSIVE DECODING (every *_decode_* function is safe on truncated/
+// adversarial input — never reads out of bounds, never spins forever):
+//   * bytes/string length is clamped to [0, bytes remaining] exactly like
+//     std/encoding/protobuf's pb_read_len_delim.
+//   * boolean/float/double clamp their fixed-width read to the buffer end
+//     and return a zero value with next_pos == bytes_len(buf) if truncated.
+//   * array/map block loops carry a stale-position guard: if an item
+//     decoder fails to advance `pos` (e.g. buffer exhausted mid-block, or a
+//     huge attacker-declared block count with no bytes left to back it),
+//     the loop stops instead of spinning through the declared count.
+//   * union branch index is clamped into [0, len(decoder_fns)) before
+//     dispatch so a corrupt/out-of-range branch index can never index out
+//     of bounds into the decoder list.
+//
+// IMPLEMENTATION NOTES
+//   * All private helpers are prefixed _av_ to avoid link collisions.
+//   * bytes_concat/bytes_slice/bytes_append each return a NEW bytes handle —
+//     always reassign, never assume in-place mutation.
+//   * Single-exit style throughout to avoid the NOVA early-return mistag bug.
+//   * No multi-line list/dict literals (NOVA parser limitation).
+// ============================================================================
+
+import std/encoding/varint
+import std/bits/zigzag
+import std/encoding/pack
+
+// ── null ─────────────────────────────────────────────────────────────────────
+
+// av_encode_null: Avro null is 0 bytes on the wire.
+fn av_encode_null() -> any
+    bytes_create(0)
+
+// av_decode_null: consumes no bytes. Returns [0, pos] — 0 is a documented
+// sentinel (Avro null carries no data), NOT a real null (see module header).
+fn av_decode_null(buf: any, pos: int) -> list
+    [0, pos]
+
+// ── boolean ──────────────────────────────────────────────────────────────────
+
+// av_encode_boolean: 1 byte, 0x00 (false) or 0x01 (true). Accepts any
+// int/bool-shaped value; anything nonzero encodes as true.
+fn av_encode_boolean(b) -> any
+    let out = bytes_create(1)
+    let v = 0
+    if b != 0
+        v = 1
+    bytes_set(out, 0, v)
+    out
+
+// av_decode_boolean: returns [0|1, next_pos]. Truncated input (pos at/past
+// the buffer end) safely returns [0, bytes_len(buf)] rather than reading OOB.
+fn av_decode_boolean(buf: any, pos: int) -> list
+    let n = bytes_len(buf)
+    if pos >= n
+        return [0, n]
+    let raw = bytes_get(buf, pos) & 0xFF
+    let v = 0
+    if raw != 0
+        v = 1
+    [v, pos + 1]
+
+// ── int / long (identical wire format: zigzag + unsigned LEB128) ──────────────
+//
+// FULL 64-BIT RANGE HAZARD (why this is NOT just `vi_encode(zz_encode(n))`).
+//   zz_encode(n) = (n<<1) ^ (n>>63) is bit-for-bit correct for the ENTIRE i64
+//   domain — the zigzag CODE it produces is logically unsigned (0..2^64-1),
+//   and the only way NOVA can store a code >= 2^63 in an int64 is as a
+//   bit-identical value that NOVA's own `>= 0` check reports as negative
+//   (two's complement: bit 63 set means "negative" to every signed compare/
+//   divide, regardless of what the bits are meant to represent). That
+//   happens for every |n| >= 2^62 — roughly HALF of the 64-bit signed range,
+//   not a rare corner case. Two consumers of that code assume it fits in
+//   [0, 2^63): vi_encode (which does `if n<0: return empty-bytes`, then
+//   compares `v>=128` and right-shifts — all signed-magnitude operations)
+//   and zz_decode (which divides `u/2` and reads `u&1` — division of a
+//   negative-stored u computes the wrong, signed, quotient). Both silently
+//   produce garbage instead of failing loudly.
+//   FIX: exactly the technique std/encoding/protobuf uses for its raw
+//   (non-zigzag) int64 negative-varint case (_pb_logical_shr64 /
+//   _pb_encode_varint64_neg) — kept here as a local private copy because
+//   NOVA's `_`-prefix module privacy means protobuf's helpers are not
+//   importable. Whenever the zigzag code is negative-AS-STORED (u < 0, i.e.
+//   bit 63 set — true unsigned code >= 2^63), encode/decode its raw 64-bit
+//   pattern directly via logical-shift emulation instead of routing it
+//   through signed-magnitude arithmetic. See _av_logical_shr64,
+//   _av_encode_varint64_full, _av_zz_decode_full below.
+
+// _av_logical_shr64: emulate an UNSIGNED (zero-fill) 64-bit right shift of a
+// full 64-bit two's-complement value `n` by `k` bits (1 <= k <= 63), using
+// only NOVA's arithmetic (sign-extending) `>>`. Same technique as
+// std/encoding/protobuf's _pb_logical_shr64 — NOVA's `>>` sign-extends, so we
+// correct by masking to the (64-k) bits that a true logical shift would
+// leave meaningful (the top k bits, wrongly filled with 1s by the arithmetic
+// shift, are cleared by the mask; the remaining bits are bit-identical
+// between logical and arithmetic shift). (1 << (64-k)) is always well-formed
+// here since 1 <= 64-k <= 63, avoiding the documented 1<<64 hazard.
+fn _av_logical_shr64(n: int, k: int) -> int
+    let shifted = n >> k
+    let keep_bits = 64 - k
+    let mask = (1 << keep_bits) - 1
+    shifted & mask
+
+// _av_encode_varint64_full: encode the raw 64-bit two's-complement bit
+// pattern of `u` — which is CURRENTLY STORED as a negative NOVA int (bit 63
+// set) — as the canonical 10-byte unsigned base-128 varint of that pattern.
+// `u` is not semantically "a negative number" here; it is an Avro zigzag
+// CODE, always logically in [0, 2^64-1] — for codes >= 2^63 the only way to
+// hold that unsigned value in an int64 is this bit-identical negative
+// representation. Byte 10 (the final group) always holds exactly bit 63 of
+// the pattern, which by precondition (u < 0) is always 1 — so it is always
+// the literal byte 0x01 with no continuation bit (same invariant protobuf's
+// _pb_encode_varint64_neg relies on for its own negative-n case).
+// Precondition: u < 0.
+fn _av_encode_varint64_full(u: int) -> any
+    let out = bytes_create(0)
+    out = bytes_append(out, (u & 0x7F) | 0x80)
+    let i = 1
+    while i < 9
+        let grp = _av_logical_shr64(u, 7 * i)
+        out = bytes_append(out, (grp & 0x7F) | 0x80)
+        i = i + 1
+    bytes_append(out, 1)
+
+// _av_zz_decode_full: ZigZag-decode a code `u` back to a signed int, correct
+// for the FULL unsigned 64-bit domain of u (0..2^64-1) — including codes
+// >= 2^63, which NOVA stores as a negative int64 bit pattern (see
+// _av_encode_varint64_full above). Uses the classic bit-trick
+// `n = (u >>> 1) ^ -(u & 1)` with a LOGICAL right shift
+// (_av_logical_shr64) rather than std/bits/zigzag's zz_decode, whose
+// `u/2` integer-division formula is only valid while u is stored
+// non-negative — dividing a negative-stored u computes the wrong, signed,
+// quotient instead of halving the true unsigned magnitude. This formula is
+// correct for EVERY u (the k=1 logical shift matches a plain arithmetic
+// shift whenever u >= 0 anyway), so it fully replaces zz_decode for this
+// module's use, not just as a >=2^63 special case.
+fn _av_zz_decode_full(u: int) -> int
+    let shifted = _av_logical_shr64(u, 1)
+    let sign_mask = 0
+    if (u & 1) == 1
+        sign_mask = 0 - 1
+    shifted ^ sign_mask
+
+// av_encode_long: zigzag-map n to a non-negative code (zz_encode, from
+// std/bits/zigzag), then unsigned-LEB128 it. Matches the Avro spec's worked
+// examples exactly: 0->00, -1->01, 1->02, -2->03, 2->04, 63->7E, 64->8001.
+// Correct across the FULL i64 range (see block comment above) — codes whose
+// true unsigned value is >= 2^63 (u < 0 as stored) route through the
+// full-range 10-byte encoder instead of vi_encode, which only accepts a
+// non-negative-stored input.
+fn av_encode_long(n: int) -> any
+    let u = zz_encode(n)
+    let out = bytes_create(0)
+    if u < 0
+        out = _av_encode_varint64_full(u)
+    else
+        out = vi_encode(u)
+    out
+
+// av_decode_long: inverse of av_encode_long. Returns [value, next_pos].
+// vi_decode already stops safely (returns pos unchanged) if pos is at/past
+// the buffer end, so this inherits that truncation safety with no extra
+// work; it also already reconstructs the full 64-bit pattern correctly via
+// OR + left-shift (including the `1 << 63` final bit — only `1 << 64` itself
+// is broken, per reference_nova_shift64_broken), so no decode-side change is
+// needed there. The zigzag-UNmapping step uses _av_zz_decode_full (not
+// zz_decode) so a full-range code (u < 0 as stored) is unmapped correctly
+// too — see _av_zz_decode_full above.
+fn av_decode_long(buf: any, pos: int) -> list
+    let r = vi_decode(buf, pos)
+    [_av_zz_decode_full(r[0]), r[1]]
+
+// av_encode_int / av_decode_int: Avro's "int" schema type uses the exact
+// same binary encoding as "long" (only the schema-level range differs) —
+// thin aliases so callers can name the schema type they mean.
+fn av_encode_int(n: int) -> any
+    av_encode_long(n)
+
+fn av_decode_int(buf: any, pos: int) -> list
+    av_decode_long(buf, pos)
+
+// ── float (32-bit LE IEEE-754 single) ──────────────────────────────────────────
+
+// av_encode_float: narrows the f64 `v` to a true 32-bit IEEE-754 bit pattern
+// via the raw-memory primitives (there is no safe f32_to_bits builtin), then
+// emits it little-endian via std/encoding/pack's pack_u32_le.
+fn av_encode_float(v: float) -> any
+    let bits = 0
+    unsafe
+        let p = alloc_raw(4)
+        ptr_write_f32(p, v)
+        bits = ptr_read_u32(p)
+        free_raw(p)
+    pack_u32_le(bits)
+
+// av_decode_float: reads 4 LE bytes as an unsigned 32-bit int (pack module),
+// then safely widens to f64 via f32_from_bits (no unsafe needed for decode).
+// Truncated input clamps to buffer end and returns 0.0.
+fn av_decode_float(buf: any, pos: int) -> list
+    let n = bytes_len(buf)
+    if pos + 4 > n
+        return [0.0, n]
+    let bits = unpack_u32_le(buf, pos)
+    [f32_from_bits(bits), pos + 4]
+
+// ── double (64-bit LE IEEE-754 double) ─────────────────────────────────────────
+
+// av_encode_double: float_to_bits gives the exact f64 bit pattern (safe,
+// same technique as std/encoding/bson's double field); pack_u64_le lays it
+// down little-endian.
+fn av_encode_double(v: float) -> any
+    pack_u64_le(float_to_bits(v))
+
+// av_decode_double: inverse. Truncated input clamps to buffer end, 0.0.
+fn av_decode_double(buf: any, pos: int) -> list
+    let n = bytes_len(buf)
+    if pos + 8 > n
+        return [0.0, n]
+    let bits = unpack_u64_le(buf, pos)
+    [float_from_bits(bits), pos + 8]
+
+// ── bytes (long length + raw payload, BINARY SAFE) ─────────────────────────────
+
+// av_encode_bytes: long length prefix (byte count), then the raw bytes
+// unchanged. `b` must be a NOVA `bytes` value — never routed through a
+// NOVA string, so 0x00 bytes anywhere in the payload survive intact.
+fn av_encode_bytes(b: any) -> any
+    let out = av_encode_long(bytes_len(b))
+    bytes_concat(out, b)
+
+// av_decode_bytes: reads the declared length, then clamps it to what's
+// actually available (same pattern as std/encoding/protobuf's
+// pb_read_len_delim) so a corrupt/oversized length can never read past the
+// buffer end or produce a negative-width slice. Returns [bytes, next_pos].
+fn av_decode_bytes(buf: any, pos: int) -> list
+    let lr = av_decode_long(buf, pos)
+    let declared_len = lr[0]
+    let data_start = lr[1]
+    let total = bytes_len(buf)
+    let avail = total - data_start
+    if avail < 0
+        avail = 0
+    let take = declared_len
+    if take < 0
+        take = 0
+    if take > avail
+        take = avail
+    let payload = bytes_slice(buf, data_start, data_start + take)
+    [payload, data_start + take]
+
+// ── string (long length + UTF-8 payload) ────────────────────────────────────────
+
+// av_encode_string: UTF-8-encodes `s` (str_to_bytes) then delegates to
+// av_encode_bytes for the length-prefixed wire form.
+fn av_encode_string(s: string) -> any
+    av_encode_bytes(str_to_bytes(s))
+
+// av_decode_string: inverse of av_encode_string. Returns [string, next_pos].
+fn av_decode_string(buf: any, pos: int) -> list
+    let r = av_decode_bytes(buf, pos)
+    [bytes_to_str(r[0]), r[1]]
+
+// ── array (block-encoded) ───────────────────────────────────────────────────────
+
+// av_encode_array: emits ONE block (long item-count, then each item encoded
+// via `enc`), then the 0-count terminator. An empty array is just the
+// terminator alone (single 0x00 byte). `enc` is any fn(item) -> bytes.
+fn av_encode_array(items, enc) -> any
+    let out = bytes_create(0)
+    let n = len(items)
+    if n > 0
+        out = bytes_concat(out, av_encode_long(n))
+        let i = 0
+        while i < n
+            out = bytes_concat(out, enc(items[i]))
+            i = i + 1
+    bytes_concat(out, av_encode_long(0))
+
+// av_decode_array: reads blocks until a 0-count terminator. Accepts both the
+// simple positive-count form this module writes AND the negative-count form
+// (|count| items preceded by a byte-size long, present so a reader COULD
+// skip without decoding — this decoder always decodes, but still consumes
+// those bytes correctly). `dec` is any fn(buf,pos) -> [value, next_pos].
+// Defensive: if `dec` fails to advance pos (truncated stream / a huge
+// attacker-declared count with nothing left to back it), the loop stops
+// rather than spinning through the declared count.
+fn av_decode_array(buf: any, pos: int, dec) -> list
+    let items = []
+    let p = pos
+    let going = 1
+    while going == 1
+        let cr = av_decode_long(buf, p)
+        let count = cr[0]
+        p = cr[1]
+        if count == 0
+            going = 0
+        else
+            let actual = count
+            if count < 0
+                actual = 0 - count
+                let sz = av_decode_long(buf, p)
+                p = sz[1]
+            let j = 0
+            let going2 = 1
+            while going2 == 1 and j < actual
+                let ir = dec(buf, p)
+                let p2 = ir[1]
+                if p2 <= p
+                    // No forward progress: the stream is truncated/corrupt and
+                    // there is no real item here — stop WITHOUT recording a
+                    // phantom entry, rather than spinning through `actual`.
+                    going2 = 0
+                    going = 0
+                else
+                    push(items, ir[0])
+                    p = p2
+                j = j + 1
+    [items, p]
+
+// ── map (block-encoded key/value pairs) ─────────────────────────────────────────
+
+// av_encode_map: same block structure as av_encode_array, but each item is a
+// (string key, value) pair. `pairs` is a list of [key, value] 2-element
+// lists — order preserved EXACTLY as given (never routed through a NOVA
+// dict, whose iteration order this module does not rely on). `enc` is any
+// fn(value) -> bytes.
+fn av_encode_map(pairs, enc) -> any
+    let out = bytes_create(0)
+    let n = len(pairs)
+    if n > 0
+        out = bytes_concat(out, av_encode_long(n))
+        let i = 0
+        while i < n
+            let kv = pairs[i]
+            out = bytes_concat(out, av_encode_string(kv[0]))
+            out = bytes_concat(out, enc(kv[1]))
+            i = i + 1
+    bytes_concat(out, av_encode_long(0))
+
+// av_decode_map: inverse of av_encode_map. Returns [pairs, next_pos] where
+// pairs is a list of [key, value] 2-element lists. Same negative-count-block
+// tolerance and stale-position guard as av_decode_array (see its comment).
+fn av_decode_map(buf: any, pos: int, dec) -> list
+    let pairs = []
+    let p = pos
+    let going = 1
+    while going == 1
+        let cr = av_decode_long(buf, p)
+        let count = cr[0]
+        p = cr[1]
+        if count == 0
+            going = 0
+        else
+            let actual = count
+            if count < 0
+                actual = 0 - count
+                let sz = av_decode_long(buf, p)
+                p = sz[1]
+            let j = 0
+            let going2 = 1
+            while going2 == 1 and j < actual
+                let kr = av_decode_string(buf, p)
+                let kp = kr[1]
+                if kp <= p
+                    going2 = 0
+                    going = 0
+                else
+                    p = kp
+                    let vr = dec(buf, p)
+                    let vp = vr[1]
+                    if vp <= p
+                        // Value truncated after a valid key: no real pair here —
+                        // stop WITHOUT recording a phantom entry.
+                        going2 = 0
+                        going = 0
+                    else
+                        let pair = [kr[0], vr[0]]
+                        push(pairs, pair)
+                        p = vp
+                j = j + 1
+    [pairs, p]
+
+// ── record (fields concatenated in schema order) ────────────────────────────────
+
+// av_encode_record: concatenates already-encoded field byte chunks in the
+// exact order given — no names, no count, no delimiters on the wire (that's
+// what makes Avro records schema-dependent rather than self-describing).
+fn av_encode_record(fields) -> any
+    let out = bytes_create(0)
+    let i = 0
+    while i < len(fields)
+        out = bytes_concat(out, fields[i])
+        i = i + 1
+    out
+
+// av_decode_record: applies each fn(buf,pos)->[value,next_pos] in
+// `decoder_fns`, in order, threading `pos` through. Returns
+// [values_list, next_pos]. The caller supplies exactly as many decoders as
+// the record schema has fields, each matching that field's type.
+fn av_decode_record(buf: any, pos: int, decoder_fns) -> list
+    let vals = []
+    let p = pos
+    let i = 0
+    while i < len(decoder_fns)
+        let d = decoder_fns[i]
+        let r = d(buf, p)
+        push(vals, r[0])
+        p = r[1]
+        i = i + 1
+    [vals, p]
+
+// ── union (branch index + value) ────────────────────────────────────────────────
+
+// av_encode_union: a long branch index (0-based position in the schema's
+// union type list), followed by `value_bytes` — the value ALREADY encoded
+// with whichever encoder matches that branch's type (bytes_create(0) for a
+// null branch).
+fn av_encode_union(branch_index: int, value_bytes: any) -> any
+    bytes_concat(av_encode_long(branch_index), value_bytes)
+
+// av_decode_union: reads the branch index, clamps it into
+// [0, len(decoder_fns)) so a corrupt/out-of-range index can never index out
+// of bounds, then dispatches to that branch's decoder. Returns
+// [branch_index, value, next_pos] — branch_index is the RAW decoded index
+// (before clamping) so the caller can detect an out-of-range branch if it
+// matters to them.
+fn av_decode_union(buf: any, pos: int, decoder_fns) -> list
+    let br = av_decode_long(buf, pos)
+    let idx = br[0]
+    let p = br[1]
+    let safe_idx = idx
+    if safe_idx < 0
+        safe_idx = 0
+    if safe_idx >= len(decoder_fns)
+        safe_idx = 0
+    let d = decoder_fns[safe_idx]
+    let vr = d(buf, p)
+    [idx, vr[0], vr[1]]

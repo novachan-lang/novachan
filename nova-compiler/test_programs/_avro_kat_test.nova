@@ -1,0 +1,413 @@
+// KAT test for std/encoding/avro — Apache Avro binary encoding.
+// Known-answer vectors hand-computed against the Avro spec's worked zigzag
+// examples plus IEEE-754 bit patterns for well-known float/double values.
+import std/encoding/avro
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn _at_bytes_eq(a, b) -> int
+    let la = bytes_len(a)
+    let lb = bytes_len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if bytes_get(a, i) != bytes_get(b, i)
+            return 0
+        i = i + 1
+    1
+
+fn _at_make_bytes(lst) -> any
+    let buf = bytes_create(0)
+    let i = 0
+    while i < len(lst)
+        buf = bytes_append(buf, lst[i])
+        i = i + 1
+    buf
+
+fn ckb(label, got, want_list) -> int
+    let want = _at_make_bytes(want_list)
+    if _at_bytes_eq(got, want) == 0
+        print("FAIL " + label + ": got len=" + str(bytes_len(got)) + " want len=" + str(len(want_list)))
+        exit(1)
+    0
+
+fn cki(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+fn cks(label: string, got: string, want: string) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        exit(1)
+    0
+
+fn ckf(label: string, got: float, want: float) -> int
+    let diff = got - want
+    let adiff = 0.0
+    if diff < 0.0
+        adiff = 0.0 - diff
+    else
+        adiff = diff
+    if adiff > 0.0000001
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+// ── null ─────────────────────────────────────────────────────────────────────
+
+fn test_null()
+    let enc = av_encode_null()
+    cki("null.len", bytes_len(enc), 0)
+    let dr = av_decode_null(enc, 0)
+    cki("null.decode.sentinel", dr[0], 0)
+    cki("null.decode.pos", dr[1], 0)
+
+// ── boolean ──────────────────────────────────────────────────────────────────
+
+fn test_boolean()
+    ckb("bool.true", av_encode_boolean(1), [0x01])
+    ckb("bool.false", av_encode_boolean(0), [0x00])
+    let dt = av_decode_boolean(av_encode_boolean(1), 0)
+    cki("bool.true.decode.val", dt[0], 1)
+    cki("bool.true.decode.pos", dt[1], 1)
+    let df = av_decode_boolean(av_encode_boolean(0), 0)
+    cki("bool.false.decode.val", df[0], 0)
+    // truncated input: pos at buffer end must not read OOB
+    let empty = bytes_create(0)
+    let dtrunc = av_decode_boolean(empty, 0)
+    cki("bool.truncated.val", dtrunc[0], 0)
+    cki("bool.truncated.pos", dtrunc[1], 0)
+
+// ── long / int (zigzag varint) — the spec's own worked examples ────────────────
+
+fn test_zigzag_long()
+    ckb("long(0)", av_encode_long(0), [0x00])
+    ckb("long(-1)", av_encode_long(-1), [0x01])
+    ckb("long(1)", av_encode_long(1), [0x02])
+    ckb("long(-2)", av_encode_long(-2), [0x03])
+    ckb("long(2)", av_encode_long(2), [0x04])
+    ckb("long(63)", av_encode_long(63), [0x7E])
+    ckb("long(64)", av_encode_long(64), [0x80, 0x01])
+    // boundary just below/above the 1-byte/2-byte LEB128 cutoff, negative side
+    ckb("long(-64)", av_encode_long(-64), [0x7F])
+    ckb("long(-65)", av_encode_long(-65), [0x81, 0x01])
+
+    // round trips
+    let vals = [0, -1, 1, -2, 2, 63, 64, -64, -65, 1000000, -1000000]
+    let i = 0
+    while i < len(vals)
+        let n = vals[i]
+        let enc = av_encode_long(n)
+        let dr = av_decode_long(enc, 0)
+        cki("long.roundtrip[" + str(i) + "].val", dr[0], n)
+        cki("long.roundtrip[" + str(i) + "].pos", dr[1], bytes_len(enc))
+        i = i + 1
+
+    // int is a thin alias for long — same wire format
+    ckb("int(64)", av_encode_int(64), [0x80, 0x01])
+    let di = av_decode_int(av_encode_int(-65), 0)
+    cki("int.roundtrip", di[0], -65)
+
+// ── long / int — FULL i64 RANGE fix (2026-07-24: zigzag+varint used to
+// silently corrupt any |n| >= 2^62, since the zigzag code overflows into a
+// negative-stored int64 and both vi_encode and zz_decode assumed
+// non-negative-stored input). Proves the fix is byte-exact AND round-trips
+// at the boundary and at the true 64-bit extremes. ─────────────────────────
+
+fn test_zigzag_long_fullrange_fix()
+    // classic small vectors, re-asserted here for regression-locality with
+    // the new boundary cases below
+    ckb("fr.long(0)", av_encode_long(0), [0x00])
+    ckb("fr.long(-1)", av_encode_long(-1), [0x01])
+    ckb("fr.long(1)", av_encode_long(1), [0x02])
+    ckb("fr.long(63)", av_encode_long(63), [0x7E])
+    ckb("fr.long(64)", av_encode_long(64), [0x80, 0x01])
+
+    // 2^62 - 1: last value whose zigzag code (2*n) is still < 2^63, i.e. the
+    // LAST value the old buggy path happened to get right — must still work.
+    let n_below = 4611686018427387903
+    let enc_below = av_encode_long(n_below)
+    let dr_below = av_decode_long(enc_below, 0)
+    cki("fr.long(2^62-1).roundtrip", dr_below[0], n_below)
+    cki("fr.long(2^62-1).pos", dr_below[1], bytes_len(enc_below))
+
+    // 2^62: FIRST value whose zigzag code (2*n = 2^63) overflows into a
+    // negative-stored int64 -- the exact defect boundary. Byte-exact:
+    // zigzag(2^62) = 2^63 (bit pattern 1000...0), which as a 10-byte
+    // unsigned varint is nine 0x80 continuation bytes (all-zero payload)
+    // followed by the fixed terminal 0x01 (bit 63).
+    let n_pow62 = 4611686018427387904
+    let enc_pow62 = av_encode_long(n_pow62)
+    ckb("fr.long(2^62).bytes", enc_pow62, [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01])
+    let dr_pow62 = av_decode_long(enc_pow62, 0)
+    cki("fr.long(2^62).roundtrip", dr_pow62[0], n_pow62)
+    cki("fr.long(2^62).pos", dr_pow62[1], 10)
+
+    // Avro long max: 2^63 - 1 = 9223372036854775807. zigzag = -2 (as stored),
+    // true unsigned code 0xFFFFFFFFFFFFFFFE -> byte-exact FE FF*8 01.
+    let n_max = 9223372036854775807
+    let enc_max = av_encode_long(n_max)
+    ckb("fr.long(max).bytes", enc_max, [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+    let dr_max = av_decode_long(enc_max, 0)
+    cki("fr.long(max).roundtrip", dr_max[0], n_max)
+    cki("fr.long(max).pos", dr_max[1], 10)
+
+    // -2^62: negative-side mirror of the 2^62 boundary.
+    let n_neg62 = 0 - 4611686018427387904
+    let enc_neg62 = av_encode_long(n_neg62)
+    let dr_neg62 = av_decode_long(enc_neg62, 0)
+    cki("fr.long(-2^62).roundtrip", dr_neg62[0], n_neg62)
+    cki("fr.long(-2^62).pos", dr_neg62[1], bytes_len(enc_neg62))
+
+    // Avro long min: -2^63 = -9223372036854775808. zigzag = -1 (as stored),
+    // true unsigned code 0xFFFFFFFFFFFFFFFF -> byte-exact FF*9 01 (the
+    // classic "all continuation bytes" worst case).
+    let n_min = (0 - 9223372036854775807) - 1
+    let enc_min = av_encode_long(n_min)
+    ckb("fr.long(min).bytes", enc_min, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+    let dr_min = av_decode_long(enc_min, 0)
+    cki("fr.long(min).roundtrip", dr_min[0], n_min)
+    cki("fr.long(min).pos", dr_min[1], 10)
+
+    // int alias must inherit the same fix (thin wrapper over av_encode_long)
+    let di_max = av_decode_int(av_encode_int(n_max), 0)
+    cki("fr.int(max).roundtrip", di_max[0], n_max)
+
+    // sweep every power-of-two boundary either side of 2^62 plus a few
+    // odd/adjacent offsets, to catch an off-by-one in the u<0 dispatch
+    let sweep = [4611686018427387903, 4611686018427387904, 4611686018427387905, 6917529027641081855, 6917529027641081856, 9223372036854775806, 9223372036854775807]
+    let si = 0
+    while si < len(sweep)
+        let sv = sweep[si]
+        let se = av_encode_long(sv)
+        let sd = av_decode_long(se, 0)
+        cki("fr.sweep[" + str(si) + "].roundtrip", sd[0], sv)
+        cki("fr.sweep[" + str(si) + "].pos", sd[1], bytes_len(se))
+        si = si + 1
+    let sweep_neg = [0 - 4611686018427387904, 0 - 4611686018427387905, 0 - 6917529027641081856, 0 - 9223372036854775807, (0 - 9223372036854775807) - 1]
+    let sj = 0
+    while sj < len(sweep_neg)
+        let sv2 = sweep_neg[sj]
+        let se2 = av_encode_long(sv2)
+        let sd2 = av_decode_long(se2, 0)
+        cki("fr.sweepneg[" + str(sj) + "].roundtrip", sd2[0], sv2)
+        cki("fr.sweepneg[" + str(sj) + "].pos", sd2[1], bytes_len(se2))
+        sj = sj + 1
+
+// ── string — spec worked example: "foo" -> 06 66 6F 6F ──────────────────────────
+
+fn test_string()
+    ckb("string(foo)", av_encode_string("foo"), [0x06, 0x66, 0x6F, 0x6F])
+    let dr = av_decode_string(av_encode_string("foo"), 0)
+    cks("string.roundtrip.val", dr[0], "foo")
+    cki("string.roundtrip.pos", dr[1], 4)
+
+    // empty string: just the zero-length prefix, no payload bytes
+    ckb("string(empty)", av_encode_string(""), [0x00])
+    let de = av_decode_string(av_encode_string(""), 0)
+    cks("string.empty.roundtrip", de[0], "")
+    cki("string.empty.pos", de[1], 1)
+
+    // whitespace-only and max-ish width value round trip
+    let ws = "   "
+    let dws = av_decode_string(av_encode_string(ws), 0)
+    cks("string.whitespace.roundtrip", dws[0], ws)
+
+// ── bytes — binary safety (0x00 inside the payload must survive) ───────────────
+
+fn test_bytes()
+    let payload = _at_make_bytes([0x00, 0xFF, 0x01, 0x00, 0x7F])
+    let enc = av_encode_bytes(payload)
+    // long length prefix for 5 bytes: zigzag(5)=10=0x0A, then raw payload
+    ckb("bytes.encoded", enc, [0x0A, 0x00, 0xFF, 0x01, 0x00, 0x7F])
+    let dr = av_decode_bytes(enc, 0)
+    let rt = dr[0]
+    cki("bytes.roundtrip.len", bytes_len(rt), 5)
+    cki("bytes.roundtrip.pos", dr[1], 6)
+    if _at_bytes_eq(rt, payload) == 0
+        print("FAIL bytes.roundtrip.content")
+        exit(1)
+
+    // empty bytes value round trip
+    let eb = bytes_create(0)
+    let de = av_decode_bytes(av_encode_bytes(eb), 0)
+    cki("bytes.empty.roundtrip.len", bytes_len(de[0]), 0)
+
+    // truncated/corrupt length prefix must clamp, never read OOB: declare a
+    // length of 100 but only supply 2 bytes of actual payload.
+    let corrupt = _at_make_bytes([0xC8, 0x01, 0xAA, 0xBB])
+    // 0xC8,0x01 decodes as unsigned LEB128 200 -> zigzag decode -> 100
+    let dc = av_decode_bytes(corrupt, 0)
+    cki("bytes.corrupt.clamped_len", bytes_len(dc[0]), 2)
+    cki("bytes.corrupt.pos", dc[1], 4)
+
+// ── float (32-bit LE) — 1.5 has an exact, well-known bit pattern 0x3FC00000 ─────
+
+fn test_float()
+    ckb("float(1.5)", av_encode_float(1.5), [0x00, 0x00, 0xC0, 0x3F])
+    let dr = av_decode_float(av_encode_float(1.5), 0)
+    ckf("float.roundtrip.val", dr[0], 1.5)
+    cki("float.roundtrip.pos", dr[1], 4)
+
+    ckb("float(0.0)", av_encode_float(0.0), [0x00, 0x00, 0x00, 0x00])
+    ckb("float(-1.0)", av_encode_float(0.0 - 1.0), [0x00, 0x00, 0x80, 0xBF])
+
+    // truncated input clamps to buffer end, returns 0.0
+    let short = _at_make_bytes([0x00, 0x00])
+    let dtrunc = av_decode_float(short, 0)
+    ckf("float.truncated.val", dtrunc[0], 0.0)
+    cki("float.truncated.pos", dtrunc[1], 2)
+
+// ── double (64-bit LE) via float_to_bits — 1.0 has an exact bit pattern ─────────
+
+fn test_double()
+    ckb("double(1.0)", av_encode_double(1.0), [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F])
+    let dr = av_decode_double(av_encode_double(1.0), 0)
+    ckf("double.roundtrip.val", dr[0], 1.0)
+    cki("double.roundtrip.pos", dr[1], 8)
+
+    let pi_val = 3.14159265358979
+    let dpi = av_decode_double(av_encode_double(pi_val), 0)
+    ckf("double.pi.roundtrip", dpi[0], pi_val)
+
+    let neg = 0.0 - 2.5
+    let dneg = av_decode_double(av_encode_double(neg), 0)
+    ckf("double.negative.roundtrip", dneg[0], neg)
+
+// ── array (block-encoded) — spec example shape: array of 3 longs ───────────────
+
+fn test_array()
+    let items = [1, 2, 3]
+    let enc = av_encode_array(items, av_encode_long)
+    // block count=3 -> zigzag(3)=6=0x06; items 1,2,3 -> 02,04,06; terminator 00
+    ckb("array([1,2,3])", enc, [0x06, 0x02, 0x04, 0x06, 0x00])
+    let dr = av_decode_array(enc, 0, av_decode_long)
+    let got = dr[0]
+    cki("array.roundtrip.len", len(got), 3)
+    cki("array.roundtrip[0]", got[0], 1)
+    cki("array.roundtrip[1]", got[1], 2)
+    cki("array.roundtrip[2]", got[2], 3)
+    cki("array.roundtrip.pos", dr[1], bytes_len(enc))
+
+    // empty array: just the 0-count terminator
+    let ee = av_encode_array([], av_encode_long)
+    ckb("array(empty)", ee, [0x00])
+    let de = av_decode_array(ee, 0, av_decode_long)
+    cki("array.empty.roundtrip.len", len(de[0]), 0)
+
+    // array of strings (exercises a non-fixed-width item encoder)
+    let strs = ["foo", "", "ab"]
+    let se = av_encode_array(strs, av_encode_string)
+    let sd = av_decode_array(se, 0, av_decode_string)
+    cki("array.strings.len", len(sd[0]), 3)
+    cks("array.strings[0]", sd[0][0], "foo")
+    cks("array.strings[1]", sd[0][1], "")
+    cks("array.strings[2]", sd[0][2], "ab")
+
+    // negative-count block (with byte-size long) tolerance: hand-built stream
+    // -2 items (count=-2 -> zigzag 3 -> 0x03), block byte-size=4 (zigzag 8 ->
+    // 0x08, value unused/ignored by the decoder), then longs 10 and 20
+    // (zigzag 20->0x14, zigzag 40->0x28), terminator 0x00.
+    let neg_block = _at_make_bytes([0x03, 0x08, 0x14, 0x28, 0x00])
+    let nd = av_decode_array(neg_block, 0, av_decode_long)
+    cki("array.negblock.len", len(nd[0]), 2)
+    cki("array.negblock[0]", nd[0][0], 10)
+    cki("array.negblock[1]", nd[0][1], 20)
+    cki("array.negblock.pos", nd[1], 5)
+
+    // truncated stream: declared count=5 but only one item's worth of bytes
+    // follow, then the buffer ends. Must NOT hang and must NOT fabricate
+    // phantom entries past what the bytes actually support.
+    let trunc = _at_make_bytes([0x0A, 0x0E])
+    let td = av_decode_array(trunc, 0, av_decode_long)
+    cki("array.truncated.len", len(td[0]), 1)
+    cki("array.truncated[0]", td[0][0], 7)
+
+// ── map (block-encoded key/value pairs) ─────────────────────────────────────────
+
+fn test_map()
+    let pairs = []
+    push(pairs, ["a", 1])
+    push(pairs, ["bb", 2])
+    let enc = av_encode_map(pairs, av_encode_long)
+    let dr = av_decode_map(enc, 0, av_decode_long)
+    let got = dr[0]
+    cki("map.roundtrip.len", len(got), 2)
+    cks("map.roundtrip[0].key", got[0][0], "a")
+    cki("map.roundtrip[0].val", got[0][1], 1)
+    cks("map.roundtrip[1].key", got[1][0], "bb")
+    cki("map.roundtrip[1].val", got[1][1], 2)
+    cki("map.roundtrip.pos", dr[1], bytes_len(enc))
+
+    // empty map
+    let ee = av_encode_map([], av_encode_long)
+    ckb("map(empty)", ee, [0x00])
+    let de = av_decode_map(ee, 0, av_decode_long)
+    cki("map.empty.roundtrip.len", len(de[0]), 0)
+
+// ── record (fields concatenated in schema order) ────────────────────────────────
+
+fn test_record()
+    let fields = []
+    push(fields, av_encode_boolean(1))
+    push(fields, av_encode_long(42))
+    push(fields, av_encode_string("hi"))
+    let enc = av_encode_record(fields)
+
+    let decoders = []
+    push(decoders, av_decode_boolean)
+    push(decoders, av_decode_long)
+    push(decoders, av_decode_string)
+    let dr = av_decode_record(enc, 0, decoders)
+    let vals = dr[0]
+    cki("record.roundtrip.len", len(vals), 3)
+    cki("record.roundtrip[0].bool", vals[0], 1)
+    cki("record.roundtrip[1].long", vals[1], 42)
+    cks("record.roundtrip[2].string", vals[2], "hi")
+    cki("record.roundtrip.pos", dr[1], bytes_len(enc))
+
+// ── union (branch index + value) ────────────────────────────────────────────────
+
+fn test_union()
+    // union of [null, long]: branch 1 (long) carrying value 42
+    let enc = av_encode_union(1, av_encode_long(42))
+    let decoders = []
+    push(decoders, av_decode_null)
+    push(decoders, av_decode_long)
+    let dr = av_decode_union(enc, 0, decoders)
+    cki("union.branch1.idx", dr[0], 1)
+    cki("union.branch1.val", dr[1], 42)
+    cki("union.branch1.pos", dr[2], bytes_len(enc))
+
+    // branch 0 (null)
+    let enc0 = av_encode_union(0, av_encode_null())
+    let dr0 = av_decode_union(enc0, 0, decoders)
+    cki("union.branch0.idx", dr0[0], 0)
+    cki("union.branch0.val", dr0[1], 0)
+
+    // out-of-range branch index (corrupt data) must clamp, not crash
+    let bad = av_encode_union(5, av_encode_long(9))
+    let drb = av_decode_union(bad, 0, decoders)
+    cki("union.outofrange.idx", drb[0], 5)
+    // clamped dispatch used decoder[0] (av_decode_null) — must not crash
+    cki("union.outofrange.pos_at_least_index_len", drb[2] >= 1, 1)
+
+fn main()
+    test_null()
+    test_boolean()
+    test_zigzag_long()
+    test_zigzag_long_fullrange_fix()
+    test_string()
+    test_bytes()
+    test_float()
+    test_double()
+    test_array()
+    test_map()
+    test_record()
+    test_union()
+    print("PASS _avro_kat_test")
+
+main()

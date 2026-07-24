@@ -1,0 +1,366 @@
+// KAT: forge_grpc unary CLIENT (bytes-native HTTP/2 wire) -- reuses std/net/http2
+// (frame header + HPACK int/static-table primitives) and std/encoding/protobuf
+// (message payload). Covers: length-prefixed framing (incl. empty message + a
+// width-boundary 256-byte payload), HEADERS pseudo-header set construction, the
+// HPACK header-block codec this module adds on top of std/net/http2 (indexed
+// field, literal-with-incremental-indexing, literal-without-indexing, dynamic
+// table size update skip, and a >127-byte string crossing the HPACK int prefix
+// boundary), full request wire assembly, response/trailer parsing (OK and
+// non-OK status), and a full protobuf encode -> frame -> request -> parse ->
+// deframe -> protobuf decode round trip.
+import forge_grpc
+import std/encoding/protobuf
+import std/net/http2
+
+fn mkb(xs: list) -> bytes
+    let out = bytes(0)
+    let i = 0
+    while i < len(xs)
+        out = bytes_append(out, xs[i])
+        i = i + 1
+    out
+
+fn beq(b: bytes, xs: list) -> bool
+    if bytes_len(b) != len(xs)
+        return false
+    let i = 0
+    let ok = true
+    while i < len(xs)
+        if bytes_get(b, i) != xs[i]
+            ok = false
+        i = i + 1
+    ok
+
+fn headers_contains(hs: list, name: string, value: string) -> bool
+    let i = 0
+    let found = false
+    while i < len(hs)
+        if hs[i][0] == name and hs[i][1] == value
+            found = true
+        i = i + 1
+    found
+
+fn main()
+    // ── 1. grpc_frame_bytes: exact 5-byte payload -> 00 00 00 00 05 + payload ──
+    let p5 = mkb([0xDE, 0xAD, 0xBE, 0xEF, 0x01])
+    let f5 = grpc_frame_bytes(p5)
+    if beq(f5, [0, 0, 0, 0, 5, 0xDE, 0xAD, 0xBE, 0xEF, 0x01]) == false
+        print("FAIL frame_bytes 5-byte payload")
+        exit(1)
+
+    // ── 2. grpc_frame_bytes: empty (0-length) message -> 00 00 00 00 00 ────────
+    let f0 = grpc_frame_bytes(bytes(0))
+    if beq(f0, [0, 0, 0, 0, 0]) == false
+        print("FAIL frame_bytes empty payload")
+        exit(1)
+
+    // ── 3. grpc_deframe_bytes: round trip of #1 ─────────────────────────────────
+    let d5 = grpc_deframe_bytes(f5, 0)
+    if beq(d5[0], [0xDE, 0xAD, 0xBE, 0xEF, 0x01]) == false
+        print("FAIL deframe_bytes payload mismatch")
+        exit(1)
+    if d5[1] != 10
+        print("FAIL deframe_bytes next_off: got " + str(d5[1]) + " want 10")
+        exit(1)
+    if d5[2] != 0
+        print("FAIL deframe_bytes flag: got " + str(d5[2]) + " want 0")
+        exit(1)
+
+    // round trip of empty message
+    let d0 = grpc_deframe_bytes(f0, 0)
+    if bytes_len(d0[0]) != 0
+        print("FAIL deframe_bytes empty payload not empty")
+        exit(1)
+    if d0[1] != 5
+        print("FAIL deframe_bytes empty next_off: got " + str(d0[1]) + " want 5")
+        exit(1)
+
+    // ── 4. deframe_bytes: bounds safety -- too short for even the 5-byte header ──
+    let short = mkb([0, 0, 0])
+    let dshort = grpc_deframe_bytes(short, 0)
+    if dshort[2] != -1
+        print("FAIL deframe_bytes should flag malformed on <5 bytes")
+        exit(1)
+    if bytes_len(dshort[0]) != 0
+        print("FAIL deframe_bytes malformed payload should be empty")
+        exit(1)
+
+    // ── 5. deframe_bytes: declared length runs past end of buf (lying frame) ────
+    let lying = mkb([0, 0, 0, 0, 100, 1, 2, 3])
+    let dlying = grpc_deframe_bytes(lying, 0)
+    if dlying[2] != -1
+        print("FAIL deframe_bytes should flag malformed on OOB declared length")
+        exit(1)
+
+    // ── 6. width boundary: 256-byte payload (length field crosses 0x00FF->0x0100) ──
+    let big = bytes(256)
+    let fbig = grpc_frame_bytes(big)
+    if bytes_len(fbig) != 261
+        print("FAIL frame_bytes 256-byte total length: got " + str(bytes_len(fbig)) + " want 261")
+        exit(1)
+    if bytes_get(fbig, 1) != 0 or bytes_get(fbig, 2) != 0 or bytes_get(fbig, 3) != 1 or bytes_get(fbig, 4) != 0
+        print("FAIL frame_bytes 256 big-endian length bytes wrong")
+        exit(1)
+    let dbig = grpc_deframe_bytes(fbig, 0)
+    if bytes_len(dbig[0]) != 256
+        print("FAIL deframe_bytes 256-byte round trip length")
+        exit(1)
+
+    // ── 7. request HEADERS pseudo-header set ────────────────────────────────────
+    let hdrs = grpc_client_pseudo_headers("example.com", "https", "echo.Echo", "Say")
+    if headers_contains(hdrs, ":method", "POST") == false
+        print("FAIL pseudo-headers missing :method POST")
+        exit(1)
+    if headers_contains(hdrs, ":scheme", "https") == false
+        print("FAIL pseudo-headers missing :scheme https")
+        exit(1)
+    if headers_contains(hdrs, ":path", "/echo.Echo/Say") == false
+        print("FAIL pseudo-headers missing :path")
+        exit(1)
+    if headers_contains(hdrs, ":authority", "example.com") == false
+        print("FAIL pseudo-headers missing :authority")
+        exit(1)
+    if headers_contains(hdrs, "content-type", "application/grpc+proto") == false
+        print("FAIL pseudo-headers missing content-type application/grpc+proto")
+        exit(1)
+    if headers_contains(hdrs, "te", "trailers") == false
+        print("FAIL pseudo-headers missing te trailers")
+        exit(1)
+    if len(hdrs) != 6
+        print("FAIL pseudo-headers count: got " + str(len(hdrs)) + " want 6")
+        exit(1)
+
+    // ── 8. HPACK header-block codec: round trip the pseudo-header set ──────────
+    let hblock = grpc_hpack_encode_headers(hdrs)
+    let hdec = grpc_hpack_decode_headers(hblock, 0)
+    if len(hdec) != 6
+        print("FAIL hpack round trip count: got " + str(len(hdec)) + " want 6")
+        exit(1)
+    if headers_contains(hdec, ":method", "POST") == false
+        print("FAIL hpack round trip missing :method POST")
+        exit(1)
+    if headers_contains(hdec, "content-type", "application/grpc+proto") == false
+        print("FAIL hpack round trip missing content-type")
+        exit(1)
+
+    // ── 9. HPACK string-length width boundary: value >127 bytes (crosses the ──
+    //      7-bit prefix continuation boundary in RFC 7541 5.2 int encoding) ─────
+    let longval = ""
+    let li = 0
+    while li < 130
+        longval = longval + "x"
+        li = li + 1
+    let longhdrs = []
+    push(longhdrs, ["x-long", longval])
+    let lblock = grpc_hpack_encode_headers(longhdrs)
+    let ldec = grpc_hpack_decode_headers(lblock, 0)
+    if len(ldec) != 1
+        print("FAIL long-header decode count")
+        exit(1)
+    if ldec[0][0] != "x-long" or len(ldec[0][1]) != 130
+        print("FAIL long-header round trip: name=" + ldec[0][0] + " valuelen=" + str(len(ldec[0][1])))
+        exit(1)
+    if ldec[0][1] != longval
+        print("FAIL long-header value content mismatch")
+        exit(1)
+
+    // ── 10. HPACK decode: manual Indexed Header Field (RFC 7541 6.1) ───────────
+    //       0x82 = 1000_0010 -> indexed, index 2 = (":method","GET")
+    let idxfield = mkb([0x82])
+    let idxdec = grpc_hpack_decode_headers(idxfield, 0)
+    if len(idxdec) != 1 or idxdec[0][0] != ":method" or idxdec[0][1] != "GET"
+        print("FAIL indexed-field decode")
+        exit(1)
+
+    // ── 11. HPACK decode: Literal with Incremental Indexing, new name (6.2.1) ──
+    //       0x40 + string("x-custom") + string("val")
+    let lit_inc = bytes(0)
+    lit_inc = bytes_append(lit_inc, 0x40)
+    lit_inc = bytes_concat(lit_inc, mkb([8, 0x78, 0x2D, 0x63, 0x75, 0x73, 0x74, 0x6F, 0x6D]))
+    lit_inc = bytes_concat(lit_inc, mkb([3, 0x76, 0x61, 0x6C]))
+    let lit_dec = grpc_hpack_decode_headers(lit_inc, 0)
+    if len(lit_dec) != 1 or lit_dec[0][0] != "x-custom" or lit_dec[0][1] != "val"
+        print("FAIL literal-incremental-indexing decode: " + str(lit_dec))
+        exit(1)
+
+    // ── 12. HPACK decode: Dynamic Table Size Update (6.3) is consumed + skipped ──
+    //       0x20 (5-bit prefix, value 0 fits in-line) then a real literal header
+    // literal-without-indexing new-name header "a" -> "b" (0x00 + string("a") + string("b"))
+    let ab = bytes(0)
+    ab = bytes_append(ab, 0x00)
+    ab = bytes_concat(ab, mkb([1, 0x61]))
+    ab = bytes_concat(ab, mkb([1, 0x62]))
+    let dtsu = bytes_concat(mkb([0x20]), ab)
+    let dtsu_dec = grpc_hpack_decode_headers(dtsu, 0)
+    if len(dtsu_dec) != 1 or dtsu_dec[0][0] != "a" or dtsu_dec[0][1] != "b"
+        print("FAIL dynamic-table-size-update skip: " + str(dtsu_dec))
+        exit(1)
+
+    // ── 13. grpc_client_request: full wire assembly, structural check ──────────
+    let msg = str_to_bytes("hello")
+    let req = grpc_client_request(1, "example.com", "https", "echo.Echo", "Say", msg)
+    // HEADERS frame header at pos 0
+    let hf = h2_frame_header_decode(req, 0)
+    let hf_hdr = hf[0]
+    if hf_hdr["type"] != 1
+        print("FAIL request HEADERS frame type: got " + str(hf_hdr["type"]))
+        exit(1)
+    if (hf_hdr["flags"] & 0x4) == 0
+        print("FAIL request HEADERS frame missing END_HEADERS flag")
+        exit(1)
+    if hf_hdr["stream_id"] != 1
+        print("FAIL request HEADERS stream_id: got " + str(hf_hdr["stream_id"]))
+        exit(1)
+    let hlen = hf_hdr["length"]
+    // DATA frame header immediately after the HEADERS payload
+    let dpos = 9 + hlen
+    let df = h2_frame_header_decode(req, dpos)
+    let df_hdr = df[0]
+    if df_hdr["type"] != 0
+        print("FAIL request DATA frame type: got " + str(df_hdr["type"]))
+        exit(1)
+    if (df_hdr["flags"] & 0x1) == 0
+        print("FAIL request DATA frame missing END_STREAM flag")
+        exit(1)
+    let dlen = df_hdr["length"]
+    let body = bytes_slice(req, dpos + 9, dpos + 9 + dlen)
+    if beq(body, [0, 0, 0, 0, 5, 0x68, 0x65, 0x6C, 0x6C, 0x6F]) == false
+        print("FAIL request DATA body not the length-prefixed message")
+        exit(1)
+    // decode the HEADERS payload itself and check the pseudo-headers survived the wire
+    let reqhdrs = grpc_hpack_decode_headers(req, 9)
+    if headers_contains(reqhdrs, ":path", "/echo.Echo/Say") == false
+        print("FAIL request wire HEADERS missing :path")
+        exit(1)
+    if headers_contains(reqhdrs, "content-type", "application/grpc+proto") == false
+        print("FAIL request wire HEADERS missing content-type")
+        exit(1)
+
+    // ── 14. full round trip via std/encoding/protobuf: encode -> frame -> ──────
+    //       request -> extract -> deframe -> protobuf decode
+    let pbmsg = pb_encode_string_field(2, "ping")
+    let req2 = grpc_client_request(7, "svc.local", "https", "chat.Chat", "Send", pbmsg)
+    let hf2 = h2_frame_header_decode(req2, 0)
+    let hlen2 = hf2[0]["length"]
+    let dpos2 = 9 + hlen2
+    let df2 = h2_frame_header_decode(req2, dpos2)
+    let dlen2 = df2[0]["length"]
+    let framed2 = bytes_slice(req2, dpos2 + 9, dpos2 + 9 + dlen2)
+    let unframed2 = grpc_deframe_bytes(framed2, 0)
+    if unframed2[2] != 0
+        print("FAIL round trip deframe flag")
+        exit(1)
+    let decoded2 = pb_decode_string_field(unframed2[0], 0)
+    if decoded2[0] != 2 or decoded2[1] != "ping"
+        print("FAIL protobuf round trip: " + str(decoded2))
+        exit(1)
+
+    // ── 15. grpc_client_parse_response: OK status, DATA body deframes correctly ──
+    let reply_msg = str_to_bytes("world")
+    let reply_headers = []
+    push(reply_headers, [":status", "200"])
+    push(reply_headers, ["content-type", "application/grpc+proto"])
+    let rh_block = grpc_hpack_encode_headers(reply_headers)
+    let rh_frame_hdr = h2_frame_header_encode(bytes_len(rh_block), 1, 0x4, 1)
+    let reply_framed = grpc_frame_bytes(reply_msg)
+    let rd_frame_hdr = h2_frame_header_encode(bytes_len(reply_framed), 0, 0, 1)
+    let trailers = []
+    push(trailers, ["grpc-status", "0"])
+    push(trailers, ["grpc-message", ""])
+    let tr_block = grpc_hpack_encode_headers(trailers)
+    let tr_frame_hdr = h2_frame_header_encode(bytes_len(tr_block), 1, 0x5, 1)
+    let resp = bytes_concat(rh_frame_hdr, rh_block)
+    resp = bytes_concat(resp, rd_frame_hdr)
+    resp = bytes_concat(resp, reply_framed)
+    resp = bytes_concat(resp, tr_frame_hdr)
+    resp = bytes_concat(resp, tr_block)
+    let parsed = grpc_client_parse_response(resp)
+    if parsed["status"] != 0
+        print("FAIL parse_response OK status: got " + str(parsed["status"]))
+        exit(1)
+    if parsed["message"] != ""
+        print("FAIL parse_response OK message: got '" + parsed["message"] + "'")
+        exit(1)
+    let out_msg = grpc_client_response_message(parsed)
+    if beq(out_msg, [0x77, 0x6F, 0x72, 0x6C, 0x64]) == false
+        print("FAIL parse_response DATA payload mismatch")
+        exit(1)
+
+    // ── 16. grpc_client_parse_response: non-OK status + message ────────────────
+    let trailers2 = []
+    push(trailers2, ["grpc-status", "5"])
+    push(trailers2, ["grpc-message", "not found"])
+    let tr2_block = grpc_hpack_encode_headers(trailers2)
+    let tr2_frame_hdr = h2_frame_header_encode(bytes_len(tr2_block), 1, 0x5, 1)
+    let resp2 = bytes_concat(tr2_frame_hdr, tr2_block)
+    let parsed2 = grpc_client_parse_response(resp2)
+    if parsed2["status"] != 5
+        print("FAIL parse_response NOT_FOUND status: got " + str(parsed2["status"]))
+        exit(1)
+    if parsed2["message"] != "not found"
+        print("FAIL parse_response NOT_FOUND message: got '" + parsed2["message"] + "'")
+        exit(1)
+
+    // ── 17. grpc_client_parse_response: malformed/incomplete response (no crash) ──
+    let parsed3 = grpc_client_parse_response(mkb([0, 0, 0]))
+    if parsed3["status"] != -1
+        print("FAIL parse_response malformed should stay at sentinel -1: got " + str(parsed3["status"]))
+        exit(1)
+    let parsed_empty = grpc_client_parse_response(bytes(0))
+    if parsed_empty["status"] != -1
+        print("FAIL parse_response empty buf should stay at sentinel -1")
+        exit(1)
+
+    // ── 18. grpc_client_response_message: malformed data -> bytes(0), no crash ──
+    let bad_res = {}
+    bad_res["data"] = mkb([0, 0, 0])
+    let bad_msg = grpc_client_response_message(bad_res)
+    if bytes_len(bad_msg) != 0
+        print("FAIL response_message on malformed data should be empty")
+        exit(1)
+
+    // ── 19. SECURITY: truncated literal-NAME string must NOT fabricate a header ──
+    //       0x00 (literal without indexing, new name) + name-length prefix
+    //       claiming 5 bytes but only 2 bytes follow before the buffer ends.
+    //       Before the fix: _grpc_hpack_decode_string returned ["", pos] (pos
+    //       UNCHANGED) on this truncation, so grpc_hpack_decode_headers pushed a
+    //       spoofed ["", ""] header and then kept scanning the leftover name
+    //       bytes as fresh HPACK opcodes -- fabricating entries from attacker
+    //       (or MITM h2c) garbage. After the fix, next_pos is a negative
+    //       sentinel (-1), the decoder detects it immediately and stops with
+    //       ZERO headers decoded.
+    let trunc_name = bytes(0)
+    trunc_name = bytes_append(trunc_name, 0x00)
+    trunc_name = bytes_concat(trunc_name, mkb([5, 0x61, 0x62]))
+    let trunc_name_dec = grpc_hpack_decode_headers(trunc_name, 0)
+    if len(trunc_name_dec) != 0
+        print("FAIL truncated-name decode fabricated headers: " + str(trunc_name_dec))
+        exit(1)
+
+    // ── 20. SECURITY: truncated literal-VALUE string must also stop the scan ──
+    //       0x00 + valid name "ab" + value-length prefix claiming 9 bytes but
+    //       only 1 byte follows. The NAME decodes fine; it's the VALUE decode
+    //       that fails -- must still yield zero fabricated headers (proves both
+    //       call sites -- name AND value -- are checked, not just the first).
+    let trunc_val = bytes(0)
+    trunc_val = bytes_append(trunc_val, 0x00)
+    trunc_val = bytes_concat(trunc_val, mkb([2, 0x61, 0x62]))
+    trunc_val = bytes_concat(trunc_val, mkb([9, 0x63]))
+    let trunc_val_dec = grpc_hpack_decode_headers(trunc_val, 0)
+    if len(trunc_val_dec) != 0
+        print("FAIL truncated-value decode fabricated headers: " + str(trunc_val_dec))
+        exit(1)
+
+    // ── 21. a valid header AFTER a would-be-truncated one still decodes fine ──
+    //       (sanity: the fix only stops on genuine truncation, not on every
+    //       header after the first -- prove a normal 2-header block round trips)
+    let two = []
+    push(two, ["a", "b"])
+    push(two, ["c", "d"])
+    let two_block = grpc_hpack_encode_headers(two)
+    let two_dec = grpc_hpack_decode_headers(two_block, 0)
+    if len(two_dec) != 2 or two_dec[0][0] != "a" or two_dec[1][0] != "c"
+        print("FAIL sanity two-header decode broken by fix: " + str(two_dec))
+        exit(1)
+
+    print("PASS forge_grpc_client_kat")
