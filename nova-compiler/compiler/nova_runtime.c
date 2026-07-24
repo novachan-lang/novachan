@@ -14210,6 +14210,17 @@ int64_t nova_rt_float_from_bits(int64_t bits) {
     return bits;
 }
 
+/* float_to_bits: the EXACT inverse of float_from_bits -- take a NOVA float value (boxed in an any/list/dict
+   context, or a raw scalar) and return its raw 64-bit IEEE-754 pattern. Unlike float_bits(str(v)) (which
+   round-trips through a lossy %.15g decimal), this is bit-exact. Needed to serialize a float64 to the wire
+   (msgpack/CBOR float64, binary pack) without precision loss. nova_elem_to_double handles the boxed case. */
+int64_t nova_rt_float_to_bits(int64_t val) {
+    double d = nova_elem_to_double(val);
+    int64_t bits;
+    memcpy(&bits, &d, sizeof(bits));
+    return bits;
+}
+
 /* f32_from_bits: reinterpret a raw 32-bit IEEE-754 single (low 32 bits of `bits`) and widen to a
    NOVA double. Real work: bit-reinterpret to float, then float->double, then double->bits. */
 int64_t nova_rt_f32_from_bits(int64_t bits) {
