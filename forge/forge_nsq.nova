@@ -1,0 +1,269 @@
+// forge_nsq -- pure-NOVA NSQ (nsq.io) messaging client wire-protocol codec over raw TCP, mirroring the
+// socket-driver shape of forge_kafka/forge_mqtt/forge_redis. Reuses std/encoding/pack for all big-endian
+// integer framing (pack_u32_be/unpack_u32_be/unpack_i32_be/unpack_i64_be/unpack_u16_be) rather than
+// re-inventing byte-shift math.
+//
+// PROTOCOL SHAPE (https://nsq.io/clients/tcp_protocol_spec.html):
+//   1. On connect, the client sends the 4-byte magic "  V2" (two spaces + "V2") exactly once, before
+//      anything else.
+//   2. After that, commands are LINE-BASED ASCII: a command name + space-separated text params + "\n".
+//      Two commands carry an additional binary body, prefixed by its own 4-byte big-endian length:
+//        IDENTIFY\n            + int32 body-size + JSON body
+//        PUB <topic>\n         + int32 body-size + raw message bytes
+//        MPUB <topic>\n        + int32 total-size + int32 num-msgs + { int32 size + body } per message
+//        AUTH\n                + int32 body-size + raw secret bytes
+//      The rest are pure text lines: SUB <topic> <channel>\n, RDY <count>\n, FIN <id>\n,
+//      REQ <id> <timeout_ms>\n, TOUCH <id>\n, NOP\n, CLS\n.
+//   3. Every server->client Frame is: int32 size (of frame_type + data), int32 frame_type
+//      (0=response, 1=error, 2=message), then `size - 4` bytes of data.
+//      A MESSAGE frame's data is: int64 timestamp(ns) + int16 attempts + 16-byte message-id + body.
+//
+// THE NOVA WAY -- binary-safe bytes throughout. Message bodies and PUB/MPUB payloads are arbitrary binary
+// (they may contain 0x00), so this module NEVER routes them through bytes_to_str -- see
+// reference_nova_string_nul_truncation. The one exception is the 16-byte message id: the NSQ spec
+// guarantees it is always printable ASCII (nsqd's own id generator), and callers need it as TEXT anyway
+// to build FIN/REQ/TOUCH command lines, so decoding it with bytes_to_str is both safe and necessary.
+//
+// INJECTION HARDENING. Topic, channel and message-id are spliced directly into a "\n"-terminated text
+// line (e.g. "SUB <topic> <channel>\n"). An attacker-controlled topic/channel/id containing "\n", "\r",
+// a space or a tab could inject a bogus delimiter or a second command line into the stream. Every
+// command builder that accepts a name/id runs it through `nsq_valid_token` first and refuses (does not
+// silently truncate or escape) anything that isn't a single clean token -- see `_nsq_check_token`. This
+// is caller/user-supplied input (e.g. a topic derived from a web request), so rejection is IN-BAND: the
+// builder returns an empty `bytes()` sentinel, never `exit(1)` -- a library must not be able to kill its
+// entire hosting process just because one caller-supplied string had a stray space or newline in it.
+import std/encoding/pack
+
+// ── frame-type constants (server -> client) ─────────────────────────────────────────────────────────
+fn nsq_frame_response() -> int
+    0
+
+fn nsq_frame_error() -> int
+    1
+
+fn nsq_frame_message() -> int
+    2
+
+// ── the one-time post-connect handshake magic ───────────────────────────────────────────────────────
+fn nsq_magic() -> any
+    str_to_bytes("  V2")
+
+// ── token validation (topic / channel / message-id) ─────────────────────────────────────────────────
+// A valid token is non-empty and contains none of the characters that have meaning in the line-based
+// wire format: "\n"/"\r" (line terminators -- an embedded one injects a second command), " "/"\t"
+// (the SUB/REQ param delimiter -- an embedded one silently reshapes the command's argument count).
+fn nsq_valid_token(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        if c == "\n" or c == "\r" or c == " " or c == "\t"
+            return false
+        i = i + 1
+    true
+
+// Enforced version used by every command builder below: prints a diagnostic and returns false for a
+// corrupt/injectable token, rather than silently emitting a malformed/dangerous frame. Returns true when
+// `s` is a clean token. NEVER exit(1) here -- `s` is caller/user-supplied input, and a library must never
+// terminate the whole hosting process over bad input; each command builder below returns an empty
+// `bytes()` sentinel to its own caller when this returns false, so the failure stays in-band and local.
+fn _nsq_check_token(s: string, what: string) -> bool
+    if not nsq_valid_token(s)
+        print("forge_nsq: invalid " + what + " (empty, or contains whitespace/control chars): " + s)
+        return false
+    true
+
+// ── length-prefixed body helper (shared by IDENTIFY / PUB / AUTH) ──────────────────────────────────
+// `body` may be given as a NOVA string (UTF-8-encoded here) or as raw `bytes` (used as-is, binary-safe).
+fn _nsq_as_bytes(body) -> any
+    if type_of(body) == "string"
+        return str_to_bytes(body)
+    body
+
+fn _nsq_lp_body(head: string, body) -> any
+    let bb = _nsq_as_bytes(body)
+    let out = str_to_bytes(head)
+    out = bytes_concat(out, pack_u32_be(bytes_len(bb)))
+    bytes_concat(out, bb)
+
+// ── command builders (client -> server), each returns raw `bytes` ready for tcp_send_bytes ────────────
+
+// IDENTIFY\n + int32 size + JSON body. `props` is a dict of client identification fields
+// (e.g. {"client_id": "...", "hostname": "...", "feature_negotiation": true}) -- JSON-encoded via the
+// native json_encode builtin (no hand-rolled JSON here).
+fn nsq_cmd_identify(props) -> any
+    _nsq_lp_body("IDENTIFY\n", json_encode(props))
+
+// AUTH\n + int32 size + raw secret bytes.
+fn nsq_cmd_auth(secret) -> any
+    _nsq_lp_body("AUTH\n", secret)
+
+// SUB <topic> <channel>\n -- returns an empty `bytes()` sentinel (never exits the process) if topic or
+// channel fails injection validation; caller should check `bytes_len(result) == 0` before sending.
+fn nsq_cmd_sub(topic: string, channel: string) -> any
+    if not _nsq_check_token(topic, "topic")
+        return bytes(0)
+    if not _nsq_check_token(channel, "channel")
+        return bytes(0)
+    str_to_bytes("SUB " + topic + " " + channel + "\n")
+
+// PUB <topic>\n + int32 size + raw message bytes. `body` may be string or bytes; binary-safe either way
+// (an embedded 0x00 in a `bytes` body passes through untouched -- it is never treated as a terminator).
+// Returns an empty `bytes()` sentinel (never exits the process) if `topic` fails injection validation.
+fn nsq_cmd_pub(topic: string, body) -> any
+    if not _nsq_check_token(topic, "topic")
+        return bytes(0)
+    _nsq_lp_body("PUB " + topic + "\n", body)
+
+// MPUB <topic>\n + int32 total-size + int32 num-msgs + { int32 size + body } per message.
+// `bodies` = list of message bodies (each string or bytes). Returns an empty `bytes()` sentinel (never
+// exits the process) if `topic` fails injection validation.
+fn nsq_cmd_mpub(topic: string, bodies: list) -> any
+    if not _nsq_check_token(topic, "topic")
+        return bytes(0)
+    let inner = pack_u32_be(len(bodies))
+    let i = 0
+    let n = len(bodies)
+    while i < n
+        let mb = _nsq_as_bytes(bodies[i])
+        inner = bytes_concat(inner, pack_u32_be(bytes_len(mb)))
+        inner = bytes_concat(inner, mb)
+        i = i + 1
+    let head = str_to_bytes("MPUB " + topic + "\n")
+    head = bytes_concat(head, pack_u32_be(bytes_len(inner)))
+    bytes_concat(head, inner)
+
+// RDY <count>\n -- negative counts are clamped to 0 (there is no such thing as a negative ready-state;
+// silently sending a malformed negative would either be rejected by nsqd or misparsed).
+fn nsq_cmd_rdy(count: int) -> any
+    let n = count
+    if n < 0
+        n = 0
+    str_to_bytes("RDY " + str(n) + "\n")
+
+// FIN <message-id>\n -- acknowledges successful processing of a message. Returns an empty `bytes()`
+// sentinel (never exits the process) if `id` fails injection validation.
+fn nsq_cmd_fin(id: string) -> any
+    if not _nsq_check_token(id, "message id")
+        return bytes(0)
+    str_to_bytes("FIN " + id + "\n")
+
+// REQ <message-id> <timeout_ms>\n -- re-queues a message for redelivery after timeout_ms (clamped >= 0).
+// Returns an empty `bytes()` sentinel (never exits the process) if `id` fails injection validation.
+fn nsq_cmd_req(id: string, timeout_ms: int) -> any
+    if not _nsq_check_token(id, "message id")
+        return bytes(0)
+    let t = timeout_ms
+    if t < 0
+        t = 0
+    str_to_bytes("REQ " + id + " " + str(t) + "\n")
+
+// TOUCH <message-id>\n -- resets a message's processing timeout without finishing/requeueing it. Returns
+// an empty `bytes()` sentinel (never exits the process) if `id` fails injection validation.
+fn nsq_cmd_touch(id: string) -> any
+    if not _nsq_check_token(id, "message id")
+        return bytes(0)
+    str_to_bytes("TOUCH " + id + "\n")
+
+// NOP\n -- no-op, sent in reply to a "_heartbeat_" response frame to keep the connection alive.
+fn nsq_cmd_nop() -> any
+    str_to_bytes("NOP\n")
+
+// CLS\n -- graceful close: server drains in-flight messages then closes the connection.
+fn nsq_cmd_cls() -> any
+    str_to_bytes("CLS\n")
+
+// ── server -> client frame parsing ──────────────────────────────────────────────────────────────────
+
+// Parse ONE complete frame that starts at `off` within `buf` (buf[off..] must already contain the full
+// frame: int32 size + int32 frame_type + `size-4` bytes data). -> [frame_type, data:bytes, next_off].
+// Pure/offline -- does no I/O, so it is independently testable without a live socket.
+fn nsq_parse_frame(buf, off: int) -> any
+    let size = unpack_u32_be(buf, off)
+    let ftype = unpack_i32_be(buf, off + 4)
+    let dstart = off + 8
+    let dend = off + 4 + size
+    let data = bytes_slice(buf, dstart, dend)
+    [ftype, data, dend]
+
+// Parse a MESSAGE frame's data (the `data` returned by nsq_parse_frame when frame_type ==
+// nsq_frame_message()) -> [timestamp_ns, attempts, message_id: string, body: bytes]. `body` stays raw
+// `bytes` end-to-end -- NSQ message bodies are arbitrary application payloads and may contain 0x00; only
+// the 16-byte id (guaranteed printable ASCII by the NSQ spec) is decoded to a NOVA string, because
+// FIN/REQ/TOUCH need it as text. A frame shorter than the fixed 26-byte header is malformed/truncated;
+// returned as a sentinel (timestamp -1, empty id, empty body) rather than crashing on an out-of-range
+// bytes_slice.
+fn nsq_parse_message(data) -> any
+    if bytes_len(data) < 26
+        return [0 - 1, 0, "", bytes_create(0)]
+    let ts = unpack_i64_be(data, 0)
+    let attempts = unpack_u16_be(data, 8)
+    let id_bytes = bytes_slice(data, 10, 26)
+    let id_str = bytes_to_str(id_bytes)
+    let body = bytes_slice(data, 26, bytes_len(data))
+    [ts, attempts, id_str, body]
+
+// A response frame's data decoded as text (response frames are always short ASCII: "OK", "CLOSE_WAIT",
+// or the heartbeat token below -- never binary application data).
+fn nsq_response_text(data) -> string
+    bytes_to_str(data)
+
+// An error frame's data decoded as text (e.g. "E_BAD_TOPIC ...", "E_INVALID ...").
+fn nsq_error_text(data) -> string
+    bytes_to_str(data)
+
+// True iff this is the response frame nsqd sends periodically to keep the connection alive; the correct
+// client reaction is to reply with nsq_cmd_nop().
+fn nsq_is_heartbeat(frame_type: int, data) -> bool
+    if frame_type != nsq_frame_response()
+        return false
+    nsq_response_text(data) == "_heartbeat_"
+
+// ── TCP transport ───────────────────────────────────────────────────────────────────────────────────
+
+// Sanity cap on a claimed frame size before buffering it. NSQ frames are ordinarily well under a
+// megabyte; without a cap, a malicious or buggy peer could send a huge size field (up to 2^32-1, since
+// the wire field is unsigned) and force this client to grow an unbounded buffer waiting for bytes that
+// may never arrive -- a memory-exhaustion / hang DoS. 100 MiB comfortably covers real MPUB batches.
+fn _nsq_max_frame_size() -> int
+    104857600
+
+fn nsq_connect(host: string, port: int) -> int
+    let sock = tcp_connect(host, port)
+    tcp_send_bytes(sock, nsq_magic())
+    sock
+
+fn nsq_close(sock: int)
+    tcp_close(sock)
+
+fn nsq_send(sock: int, cmd)
+    tcp_send_bytes(sock, cmd)
+
+fn _nsq_recv_at_least(sock: int, buf, need: int) -> any
+    while bytes_len(buf) < need
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return buf
+        buf = bytes_concat(buf, chunk)
+    buf
+
+// Read exactly one full frame off `sock`, using/refilling `buf` as a carry-over receive buffer (pass the
+// leftover from the previous call back in as `buf`, same shape as forge_kafka's kf_recv_response).
+// -> [frame_type, data:bytes, leftover_buf]. frame_type -1 = short read, connection closed, or a
+// malformed/oversized size field (see _nsq_max_frame_size) -- never a crash.
+fn nsq_recv_frame(sock: int, buf) -> any
+    buf = _nsq_recv_at_least(sock, buf, 4)
+    if bytes_len(buf) < 4
+        return [0 - 1, bytes_create(0), buf]
+    let size = unpack_u32_be(buf, 0)
+    if size < 4 or size > _nsq_max_frame_size()
+        return [0 - 1, bytes_create(0), buf]
+    let total = 4 + size
+    buf = _nsq_recv_at_least(sock, buf, total)
+    if bytes_len(buf) < total
+        return [0 - 1, bytes_create(0), buf]
+    let parsed = nsq_parse_frame(buf, 0)
+    let leftover = bytes_slice(buf, total, bytes_len(buf))
+    [parsed[0], parsed[1], leftover]

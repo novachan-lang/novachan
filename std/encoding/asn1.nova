@@ -1,0 +1,398 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/asn1
+// ============================================================================
+// ASN.1 DER (Distinguished Encoding Rules, ITU-T X.690) TLV codec.
+//
+// WHAT. Every ASN.1 value on the wire is Tag-Length-Value:
+//   tag byte(s) | length (short or long form) | value bytes
+// DER is the CANONICAL subset of BER used by X.509 certs, PKCS keys, CMS/
+// PKCS7, Kerberos, SNMP and LDAP: every value has exactly ONE valid encoding
+// (no indefinite lengths, minimal length form, minimal two's-complement
+// INTEGERs). That determinism is why DER — not BER — is what signatures are
+// computed over.
+//
+// LENGTH ENCODING (X.690 §8.1.3).
+//   Short form: 0..127            -> one byte, value == the length itself.
+//   Long form:  128..2^1008-1     -> first byte = 0x80 | n  (n = number of
+//                                    following length bytes, n in 1..127),
+//                                    then n bytes = length, big-endian,
+//                                    MINIMAL (no leading 0x00 byte — DER
+//                                    forbids a long form that fits in short
+//                                    form, and forbids a redundant leading
+//                                    zero byte in the length itself).
+//   Indefinite (0x80 alone, BER-only, closed by two 0x00 bytes) is NOT valid
+//   DER and is rejected here — a DER parser must reject anything that isn't
+//   the unique canonical encoding.
+//
+// TYPES IMPLEMENTED (universal, primitive unless noted):
+//   BOOLEAN        0x01   content = one byte, 0xFF (true) or 0x00 (false).
+//                         DER requires 0xFF for true (BER allows any nonzero
+//                         byte for true; we only ever EMIT 0xFF, but DECODE
+//                         leniently treats any nonzero byte as true so a
+//                         valid BER producer's output still round-trips
+//                         through us as a reader).
+//   INTEGER        0x02   minimal two's-complement, big-endian. Zero is one
+//                         byte 0x00. A value needs a leading 0x00 pad byte
+//                         iff its natural minimal big-endian form's high bit
+//                         is already 1 (else it would misread as negative).
+//   NULL           0x05   content = zero bytes, always.
+//   OCTET STRING   0x04   content = the raw bytes, binary-safe (0x00 is
+//                         ordinary content, never a terminator — see
+//                         BINARY 0x00 note below).
+//   OBJECT IDENTIFIER 0x06  first byte = 40*arc1 + arc2 (arc1 in {0,1,2};
+//                         if arc1 in {0,1} then arc2 < 40), each remaining
+//                         arc is a base-128 value, MSB-first digit groups,
+//                         every byte except the last of a group has its
+//                         top bit (0x80) set as a continuation marker
+//                         (identical shape to std/encoding/varint's LEB128
+//                         but big-endian group order and no zigzag).
+//   UTF8String     0x0C   content = UTF-8 bytes of the string, as-is.
+//   SEQUENCE       0x30   (0x20 constructed | 0x10 universal-tag 16) —
+//                         content = the concatenated DER encodings of its
+//                         members, in order.
+//
+// REUSE. Byte-buffer primitives (bytes_create/get/set/slice/concat/
+// append_str/to_str) are NOVA runtime builtins, the same ones std/encoding/
+// pack and std/encoding/protobuf build on — not reimplemented here. The
+// base-128 OID digit-group shape parallels std/encoding/varint's LEB128 but
+// is BIG-endian-grouped (ASN.1 spec) vs varint's little-endian, and uses a
+// different continuation-bit placement, so it is NOT the same encoding and
+// is implemented directly (see _asn1_oid_component / OID decode loop).
+//
+// BINARY 0x00. OCTET STRING content is `bytes`, never converted through a
+// NOVA `string` (which is a C-string internally and truncates at 0x00 — see
+// reference_nova_string_nul_truncation). Only UTF8String — whose content is
+// genuinely textual — round-trips through `string`.
+//
+// GENERIC TLV LAYER (spec primitive everything else composes from):
+//   asn1_encode_length(n)                -> bytes   DER length encoding of n
+//   asn1_decode_length(buf, pos)         -> list [len, next_pos]  (-1 = reject)
+//   asn1_write_tlv(tag, content: bytes)  -> bytes   tag + DER-length + content
+//   asn1_read_tlv(buf, pos)              -> list [tag, content: bytes, next_pos]
+//
+// TAG CONSTANTS (zero-arg functions — NOVA's module system exports `fn`,
+// not top-level `let`, across an import boundary):
+//   asn1_tag_boolean() asn1_tag_integer() asn1_tag_null()
+//   asn1_tag_octet_string() asn1_tag_oid() asn1_tag_utf8_string()
+//   asn1_tag_sequence()
+//
+// TYPED API (encode+decode pairs, each a thin wrapper over the TLV layer):
+//   asn1_encode_boolean(v: bool)            / asn1_decode_boolean(buf,pos)      -> [bool, next]
+//   asn1_encode_integer(n: int)             / asn1_decode_integer(buf,pos)      -> [int, next]
+//   asn1_encode_null()                      / asn1_decode_null(buf,pos)         -> next_pos
+//   asn1_encode_octet_string(b: bytes)      / asn1_decode_octet_string(buf,pos) -> [bytes, next]
+//   asn1_encode_oid(dotted: string)          / asn1_decode_oid(buf,pos)          -> [string, next]
+//   asn1_encode_utf8_string(s: string)      / asn1_decode_utf8_string(buf,pos)  -> [string, next]
+//   asn1_encode_sequence(elems: list<bytes>) / asn1_decode_sequence(buf,pos)     -> [content: bytes, next]
+//   asn1_sequence_elements(content: bytes)  -> list<bytes>  (splits a decoded
+//     SEQUENCE's content into its member TLV byte-spans, each independently
+//     decodable via the typed decoders above — this is how a caller walks
+//     "SEQUENCE of N elements" without re-deriving TLV boundaries by hand).
+//
+// DER STRICTNESS ON DECODE. asn1_decode_length rejects the BER indefinite
+// form and any long-form length whose byte count exceeds 8 (would overflow
+// a NOVA int64 anyway). It does NOT re-verify that an incoming buffer used
+// minimal length/INTEGER form (a full DER *validator* is a separate, larger
+// concern than a *codec*); this module always EMITS minimal/canonical DER,
+// which is the byte-exact contract the KAT below checks.
+
+// ── tag constants ────────────────────────────────────────────────────────
+fn asn1_tag_boolean() -> int
+    0x01
+fn asn1_tag_integer() -> int
+    0x02
+fn asn1_tag_octet_string() -> int
+    0x04
+fn asn1_tag_null() -> int
+    0x05
+fn asn1_tag_oid() -> int
+    0x06
+fn asn1_tag_utf8_string() -> int
+    0x0C
+fn asn1_tag_sequence() -> int
+    0x30
+
+// ── length encoding (DER: minimal form, short 0..127 / long-form else) ────
+fn asn1_encode_length(n) -> any
+    if n < 0
+        print("asn1_encode_length: negative length " + str(n))
+        return bytes_create(0)
+    if n <= 127
+        let b = bytes_create(1)
+        bytes_set(b, 0, n)
+        return b
+    let nb = _asn1_len_nbytes(n)
+    let out = bytes_create(1 + nb)
+    bytes_set(out, 0, 0x80 | nb)
+    let i = 0
+    while i < nb
+        let shift = (nb - 1 - i) * 8
+        bytes_set(out, 1 + i, (n >> shift) & 0xFF)
+        i = i + 1
+    return out
+
+// number of minimal big-endian bytes needed to hold n (n > 127 on entry)
+fn _asn1_len_nbytes(n) -> int
+    let count = 0
+    let v = n
+    while v > 0
+        count = count + 1
+        v = v >> 8
+    return count
+
+// DER length decode. Returns [-1, pos] (reject) on indefinite-length (BER
+// only, not valid DER) or a length byte count too large for int64.
+fn asn1_decode_length(buf, pos) -> list
+    let b0 = bytes_get(buf, pos) & 0xFF
+    if b0 <= 127
+        return [b0, pos + 1]
+    let nb = b0 & 0x7F
+    if nb == 0
+        print("asn1_decode_length: indefinite length is BER-only, not valid DER")
+        return [-1, pos + 1]
+    if nb > 8
+        print("asn1_decode_length: length field too wide (" + str(nb) + " bytes)")
+        return [-1, pos + 1]
+    let val = 0
+    let i = 0
+    while i < nb
+        val = (val << 8) | (bytes_get(buf, pos + 1 + i) & 0xFF)
+        i = i + 1
+    return [val, pos + 1 + nb]
+
+// ── generic TLV layer ──────────────────────────────────────────────────────
+fn asn1_write_tlv(tag, content) -> any
+    let tagb = bytes_create(1)
+    bytes_set(tagb, 0, tag & 0xFF)
+    let lenb = asn1_encode_length(bytes_len(content))
+    let out = bytes_concat(tagb, lenb)
+    return bytes_concat(out, content)
+
+fn asn1_read_tlv(buf, pos) -> list
+    let tag = bytes_get(buf, pos) & 0xFF
+    let lr = asn1_decode_length(buf, pos + 1)
+    let clen = lr[0]
+    let cstart = lr[1]
+    if clen < 0
+        return [tag, bytes_create(0), cstart]
+    let content = bytes_slice(buf, cstart, cstart + clen)
+    return [tag, content, cstart + clen]
+
+// ── BOOLEAN ─────────────────────────────────────────────────────────────
+fn asn1_encode_boolean(v) -> any
+    let content = bytes_create(1)
+    if v
+        bytes_set(content, 0, 0xFF)
+    else
+        bytes_set(content, 0, 0x00)
+    return asn1_write_tlv(asn1_tag_boolean(), content)
+
+fn asn1_decode_boolean(buf, pos) -> list
+    let r = asn1_read_tlv(buf, pos)
+    let tag = r[0]
+    let content = r[1]
+    let next = r[2]
+    if tag != asn1_tag_boolean()
+        print("asn1_decode_boolean: unexpected tag 0x" + hex(tag))
+    let bv = false
+    if bytes_len(content) > 0
+        let b0 = bytes_get(content, 0) & 0xFF
+        if b0 != 0
+            bv = true
+    return [bv, next]
+
+// ── INTEGER (minimal two's-complement, big-endian) ─────────────────────
+// Trims a full-width big-endian two's-complement buffer down to DER-minimal
+// form: strip a leading 0x00 while the next byte's high bit is already 0
+// (redundant positive padding), or a leading 0xFF while the next byte's
+// high bit is already 1 (redundant negative padding). Stops at 1 byte.
+fn _asn1_der_trim(b) -> any
+    let cur = b
+    while bytes_len(cur) > 1
+        let b0 = bytes_get(cur, 0) & 0xFF
+        let b1 = bytes_get(cur, 1) & 0xFF
+        let strip = false
+        if b0 == 0x00 and (b1 & 0x80) == 0
+            strip = true
+        if b0 == 0xFF and (b1 & 0x80) != 0
+            strip = true
+        if strip == false
+            break
+        cur = bytes_slice(cur, 1, bytes_len(cur))
+    return cur
+
+fn asn1_encode_integer(n) -> any
+    let full = bytes_create(8)
+    bytes_set(full, 0, (n >> 56) & 0xFF)
+    bytes_set(full, 1, (n >> 48) & 0xFF)
+    bytes_set(full, 2, (n >> 40) & 0xFF)
+    bytes_set(full, 3, (n >> 32) & 0xFF)
+    bytes_set(full, 4, (n >> 24) & 0xFF)
+    bytes_set(full, 5, (n >> 16) & 0xFF)
+    bytes_set(full, 6, (n >> 8) & 0xFF)
+    bytes_set(full, 7, n & 0xFF)
+    let content = _asn1_der_trim(full)
+    return asn1_write_tlv(asn1_tag_integer(), content)
+
+fn asn1_decode_integer(buf, pos) -> list
+    let r = asn1_read_tlv(buf, pos)
+    let tag = r[0]
+    let content = r[1]
+    let next = r[2]
+    if tag != asn1_tag_integer()
+        print("asn1_decode_integer: unexpected tag 0x" + hex(tag))
+    let clen = bytes_len(content)
+    if clen == 0
+        return [0, next]
+    let b0 = bytes_get(content, 0) & 0xFF
+    let val = 0
+    if (b0 & 0x80) != 0
+        val = -1
+    let i = 0
+    while i < clen
+        let byte = bytes_get(content, i) & 0xFF
+        val = (val << 8) | byte
+        i = i + 1
+    return [val, next]
+
+// ── NULL ────────────────────────────────────────────────────────────────
+fn asn1_encode_null() -> any
+    return asn1_write_tlv(asn1_tag_null(), bytes_create(0))
+
+fn asn1_decode_null(buf, pos) -> int
+    let r = asn1_read_tlv(buf, pos)
+    if r[0] != asn1_tag_null()
+        print("asn1_decode_null: unexpected tag 0x" + hex(r[0]))
+    if bytes_len(r[1]) != 0
+        print("asn1_decode_null: NULL must have zero-length content")
+    return r[2]
+
+// ── OCTET STRING (binary-safe: content is `bytes`, never `string`) ───────
+fn asn1_encode_octet_string(b) -> any
+    return asn1_write_tlv(asn1_tag_octet_string(), b)
+
+fn asn1_decode_octet_string(buf, pos) -> list
+    let r = asn1_read_tlv(buf, pos)
+    if r[0] != asn1_tag_octet_string()
+        print("asn1_decode_octet_string: unexpected tag 0x" + hex(r[0]))
+    return [r[1], r[2]]
+
+// ── UTF8String ──────────────────────────────────────────────────────────
+fn asn1_encode_utf8_string(s) -> any
+    let content = bytes_create(0)
+    content = bytes_append_str(content, s)
+    return asn1_write_tlv(asn1_tag_utf8_string(), content)
+
+fn asn1_decode_utf8_string(buf, pos) -> list
+    let r = asn1_read_tlv(buf, pos)
+    if r[0] != asn1_tag_utf8_string()
+        print("asn1_decode_utf8_string: unexpected tag 0x" + hex(r[0]))
+    return [bytes_to_str(r[1]), r[2]]
+
+// ── OBJECT IDENTIFIER ──────────────────────────────────────────────────
+// One arc, base-128, MSB-first digit group, continuation bit (0x80) set on
+// every byte of the group except the last.
+fn _asn1_oid_component(n) -> any
+    if n <= 0
+        let z = bytes_create(1)
+        bytes_set(z, 0, 0)
+        return z
+    let digits = []
+    let v = n
+    while v > 0
+        push(digits, v & 0x7F)
+        v = v >> 7
+    let nb = len(digits)
+    let out = bytes_create(nb)
+    let i = 0
+    while i < nb
+        let digit = digits[nb - 1 - i]
+        let byte = digit
+        if i < nb - 1
+            byte = byte | 0x80
+        bytes_set(out, i, byte)
+        i = i + 1
+    return out
+
+fn asn1_encode_oid(dotted) -> any
+    let parts = split(dotted, ".")
+    if len(parts) < 2
+        print("asn1_encode_oid: OID needs at least 2 arcs, got '" + dotted + "'")
+        return asn1_write_tlv(asn1_tag_oid(), bytes_create(0))
+    let arc1 = parse_int(parts[0])
+    let arc2 = parse_int(parts[1])
+    let content = _asn1_oid_component(arc1 * 40 + arc2)
+    let i = 2
+    while i < len(parts)
+        let comp = _asn1_oid_component(parse_int(parts[i]))
+        content = bytes_concat(content, comp)
+        i = i + 1
+    return asn1_write_tlv(asn1_tag_oid(), content)
+
+fn asn1_decode_oid(buf, pos) -> list
+    let r = asn1_read_tlv(buf, pos)
+    let tag = r[0]
+    let content = r[1]
+    let next = r[2]
+    if tag != asn1_tag_oid()
+        print("asn1_decode_oid: unexpected tag 0x" + hex(tag))
+    let clen = bytes_len(content)
+    if clen == 0
+        return ["", next]
+    // The FIRST identifier is itself base-128 chained exactly like every
+    // subsequent arc (X.690 8.19.4) -- it is NOT always a single byte.
+    // combined = 40*arc1 + arc2 can exceed 127 whenever arc1==2 and
+    // arc2>=48 (e.g. OID 2.999 -> combined 1079 -> DER bytes 88 37), so it
+    // must be decoded with the same continuation-bit loop used below,
+    // THEN split back into arc1/arc2.
+    let combined = 0
+    let i = 0
+    while i < clen
+        let byte = bytes_get(content, i) & 0xFF
+        combined = (combined << 7) | (byte & 0x7F)
+        i = i + 1
+        if (byte & 0x80) == 0
+            break
+    let arc1 = combined / 40
+    if arc1 > 2
+        arc1 = 2
+    let arc2 = combined - 40 * arc1
+    let result = str(arc1) + "." + str(arc2)
+    let val = 0
+    while i < clen
+        let byte = bytes_get(content, i) & 0xFF
+        val = (val << 7) | (byte & 0x7F)
+        if (byte & 0x80) == 0
+            result = result + "." + str(val)
+            val = 0
+        i = i + 1
+    return [result, next]
+
+// ── SEQUENCE ────────────────────────────────────────────────────────────
+fn asn1_encode_sequence(elements) -> any
+    let content = bytes_create(0)
+    let i = 0
+    while i < len(elements)
+        content = bytes_concat(content, elements[i])
+        i = i + 1
+    return asn1_write_tlv(asn1_tag_sequence(), content)
+
+fn asn1_decode_sequence(buf, pos) -> list
+    let r = asn1_read_tlv(buf, pos)
+    if r[0] != asn1_tag_sequence()
+        print("asn1_decode_sequence: unexpected tag 0x" + hex(r[0]))
+    return [r[1], r[2]]
+
+// Splits a decoded SEQUENCE's content into its member TLV byte-spans (each
+// span still has its own tag+length+value, ready for a typed decoder).
+fn asn1_sequence_elements(content) -> list
+    let out = []
+    let pos = 0
+    let clen = bytes_len(content)
+    while pos < clen
+        let start = pos
+        let r = asn1_read_tlv(content, pos)
+        let next = r[2]
+        push(out, bytes_slice(content, start, next))
+        pos = next
+    return out

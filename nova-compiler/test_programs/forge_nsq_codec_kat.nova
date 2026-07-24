@@ -1,0 +1,201 @@
+// KAT for forge/forge_nsq.nova — NSQ TCP protocol codec: magic, IDENTIFY/PUB/SUB/RDY/FIN/REQ/NOP command
+// byte-exactness (incl. binary-safe embedded 0x00 in a PUB body), and server MESSAGE-frame parsing
+// (timestamp/attempts/16-byte id/body, also with an embedded 0x00 in the body).
+
+import forge_nsq as nsq
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn bytes_eq(a: any, b: any) -> bool
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return false
+    let i = 0
+    let ok = true
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            ok = false
+        i = i + 1
+    ok
+
+fn bytes_from_ints(ints: list) -> any
+    let out = bytes(0)
+    let i = 0
+    while i < len(ints)
+        out = bytes_append(out, ints[i])
+        i = i + 1
+    out
+
+fn main()
+    // ── 1. magic ──────────────────────────────────────────────────────────────────────────────────
+    let magic = nsq.nsq_magic()
+    check("magic_len_4", bytes_len(magic) == 4)
+    let expect_magic = bytes_from_ints([0x20, 0x20, 0x56, 0x32])
+    check("magic_byte_exact", bytes_eq(magic, expect_magic))
+
+    // ── 2. RDY 1 -> "RDY 1\n" ────────────────────────────────────────────────────────────────────
+    let rdy1 = nsq.nsq_cmd_rdy(1)
+    check("rdy1_byte_exact", bytes_eq(rdy1, str_to_bytes("RDY 1\n")))
+    // negative count clamps to 0
+    let rdy_neg = nsq.nsq_cmd_rdy(0 - 5)
+    check("rdy_neg_clamps_0", bytes_eq(rdy_neg, str_to_bytes("RDY 0\n")))
+    // boundary count
+    let rdy_big = nsq.nsq_cmd_rdy(2500)
+    check("rdy_big_byte_exact", bytes_eq(rdy_big, str_to_bytes("RDY 2500\n")))
+
+    // ── 3. SUB "t" "ch" -> "SUB t ch\n" ──────────────────────────────────────────────────────────
+    let sub = nsq.nsq_cmd_sub("t", "ch")
+    check("sub_byte_exact", bytes_eq(sub, str_to_bytes("SUB t ch\n")))
+    let sub2 = nsq.nsq_cmd_sub("orders", "email-notify")
+    check("sub2_byte_exact", bytes_eq(sub2, str_to_bytes("SUB orders email-notify\n")))
+
+    // ── 4. NOP\n / CLS\n / TOUCH / FIN / REQ ────────────────────────────────────────────────────
+    check("nop_byte_exact", bytes_eq(nsq.nsq_cmd_nop(), str_to_bytes("NOP\n")))
+    check("cls_byte_exact", bytes_eq(nsq.nsq_cmd_cls(), str_to_bytes("CLS\n")))
+    check("fin_byte_exact", bytes_eq(nsq.nsq_cmd_fin("abc123XYZ0000001"), str_to_bytes("FIN abc123XYZ0000001\n")))
+    check("touch_byte_exact", bytes_eq(nsq.nsq_cmd_touch("abc123XYZ0000001"), str_to_bytes("TOUCH abc123XYZ0000001\n")))
+    let req = nsq.nsq_cmd_req("abc123XYZ0000001", 60000)
+    check("req_byte_exact", bytes_eq(req, str_to_bytes("REQ abc123XYZ0000001 60000\n")))
+    // negative timeout clamps to 0
+    let req_neg = nsq.nsq_cmd_req("id1", 0 - 100)
+    check("req_neg_clamps_0", bytes_eq(req_neg, str_to_bytes("REQ id1 0\n")))
+
+    // ── 5. PUB "topic" of a body containing an embedded 0x00 -> binary-safe round trip ─────────────
+    // body = "ab" + 0x00 + "cd" (5 bytes)
+    let body = bytes_from_ints([0x61, 0x62, 0x00, 0x63, 0x64])
+    let pub = nsq.nsq_cmd_pub("topic", body)
+    // expect: "PUB topic\n" (10 bytes) + BE32 len=5 (00 00 00 05) + body (5 bytes) = 19 bytes total
+    check("pub_total_len_19", bytes_len(pub) == 19)
+    let expect_pub_head = str_to_bytes("PUB topic\n")
+    check("pub_head_byte_exact", bytes_eq(bytes_slice(pub, 0, 10), expect_pub_head))
+    let expect_len_field = bytes_from_ints([0x00, 0x00, 0x00, 0x05])
+    check("pub_len_field_be32", bytes_eq(bytes_slice(pub, 10, 14), expect_len_field))
+    check("pub_body_incl_nul", bytes_eq(bytes_slice(pub, 14, 19), body))
+    check("pub_embedded_nul_preserved", bytes_get(pub, 16) == 0)
+
+    // empty PUB body (edge: 0-length message)
+    // "PUB t\n" is 6 bytes ("P","U","B"," ","t","\n"), + 4-byte BE32(0) length field = 10 bytes total,
+    // no body bytes follow.
+    let pub_empty = nsq.nsq_cmd_pub("t", bytes(0))
+    check("pub_empty_correct_len", bytes_len(pub_empty) == 10)
+    check("pub_empty_len_field_zero", bytes_get(pub_empty, 9) == 0)
+
+    // PUB body given as a plain string (convenience path) round-trips as UTF-8 bytes.
+    // "PUB t2\n" is 7 bytes, + 4-byte BE32(5) length field + 5-byte body "hello" = 16 bytes total.
+    let pub_str = nsq.nsq_cmd_pub("t2", "hello")
+    check("pub_str_total_len", bytes_len(pub_str) == 16)
+    check("pub_str_head", bytes_eq(bytes_slice(pub_str, 0, 7), str_to_bytes("PUB t2\n")))
+    check("pub_str_len_field", bytes_get(pub_str, 10) == 5)
+    check("pub_str_body", bytes_eq(bytes_slice(pub_str, 11, 16), str_to_bytes("hello")))
+
+    // ── 6. IDENTIFY\n + BE32 len + JSON body ─────────────────────────────────────────────────────
+    let ident = nsq.nsq_cmd_identify({"client_id": "novaclient", "feature_negotiation": true})
+    check("identify_head", bytes_eq(bytes_slice(ident, 0, 9), str_to_bytes("IDENTIFY\n")))
+    // sanity: the 4-byte BE32 length field at offset 9 equals the JSON body length that follows
+    let jbody = bytes_slice(ident, 13, bytes_len(ident))
+    let declared_len = (bytes_get(ident, 9) << 24) | (bytes_get(ident, 10) << 16) | (bytes_get(ident, 11) << 8) | bytes_get(ident, 12)
+    check("identify_len_field_matches_body", declared_len == bytes_len(jbody))
+    check("identify_json_has_client_id", find(bytes_to_str(jbody), "novaclient") >= 0)
+
+    // ── 7. AUTH\n + BE32 len + secret bytes (binary-safe) ────────────────────────────────────────
+    let auth = nsq.nsq_cmd_auth(bytes_from_ints([0xDE, 0xAD, 0x00, 0xBE]))
+    check("auth_head", bytes_eq(bytes_slice(auth, 0, 5), str_to_bytes("AUTH\n")))
+    check("auth_len_field", bytes_get(auth, 8) == 4)
+    check("auth_secret_bytes", bytes_eq(bytes_slice(auth, 9, 13), bytes_from_ints([0xDE, 0xAD, 0x00, 0xBE])))
+
+    // ── 8. MPUB "t" [body1, body2] ────────────────────────────────────────────────────────────────
+    let mpub = nsq.nsq_cmd_mpub("t", ["ab", "c"])
+    // "MPUB t\n" (7) + BE32 total-inner-size + inner{ BE32 num=2 + BE32 len=2 "ab" + BE32 len=1 "c" }
+    check("mpub_head", bytes_eq(bytes_slice(mpub, 0, 7), str_to_bytes("MPUB t\n")))
+    let inner_size = (bytes_get(mpub, 7) << 24) | (bytes_get(mpub, 8) << 16) | (bytes_get(mpub, 9) << 8) | bytes_get(mpub, 10)
+    check("mpub_inner_size", inner_size == bytes_len(mpub) - 11)
+    let num_msgs = (bytes_get(mpub, 11) << 24) | (bytes_get(mpub, 12) << 16) | (bytes_get(mpub, 13) << 8) | bytes_get(mpub, 14)
+    check("mpub_num_msgs_2", num_msgs == 2)
+
+    // ── 9. injection hardening: whitespace/newline in topic/channel/id rejected by validator ───────
+    check("valid_token_ok", nsq.nsq_valid_token("good_topic-1") == true)
+    check("valid_token_rejects_newline", nsq.nsq_valid_token("evil\ntopic") == false)
+    check("valid_token_rejects_cr", nsq.nsq_valid_token("evil\rtopic") == false)
+    check("valid_token_rejects_space", nsq.nsq_valid_token("evil topic") == false)
+    check("valid_token_rejects_tab", nsq.nsq_valid_token("evil\ttopic") == false)
+    check("valid_token_rejects_empty", nsq.nsq_valid_token("") == false)
+
+    // ── 10. server MESSAGE frame parse: timestamp/attempts/16-byte id/body incl. embedded 0x00 ─────
+    // Build a synthetic full frame: BE32 size, BE32 type=2, then data = BE64 ts + BE16 attempts +
+    // 16-byte id "0123456789abcdef" + body("xy" + 0x00 + "z", 4 bytes).
+    let ts = 1234567890123456789
+    let attempts = 3
+    let msg_id = "0123456789abcdef"     // exactly 16 ASCII bytes
+    let msg_body = bytes_from_ints([0x78, 0x79, 0x00, 0x7A])   // "xy" 0x00 "z"
+
+    let ts_bytes = bytes_from_ints([
+        (ts >> 56) & 0xFF, (ts >> 48) & 0xFF, (ts >> 40) & 0xFF, (ts >> 32) & 0xFF,
+        (ts >> 24) & 0xFF, (ts >> 16) & 0xFF, (ts >> 8) & 0xFF, ts & 0xFF])
+    let attempts_bytes = bytes_from_ints([(attempts >> 8) & 0xFF, attempts & 0xFF])
+    let id_bytes = str_to_bytes(msg_id)
+    let data = bytes_concat(bytes_concat(bytes_concat(ts_bytes, attempts_bytes), id_bytes), msg_body)
+    let frame_type_field = bytes_from_ints([0, 0, 0, 2])
+    let inner = bytes_concat(frame_type_field, data)
+    let size_field = bytes_from_ints([
+        (bytes_len(inner) >> 24) & 0xFF, (bytes_len(inner) >> 16) & 0xFF,
+        (bytes_len(inner) >> 8) & 0xFF, bytes_len(inner) & 0xFF])
+    let full_frame = bytes_concat(size_field, inner)
+
+    let parsed = nsq.nsq_parse_frame(full_frame, 0)
+    let ftype = parsed[0]
+    let fdata = parsed[1]
+    let next_off = parsed[2]
+    check("frame_type_message", ftype == 2)
+    check("frame_next_off_eq_total_len", next_off == bytes_len(full_frame))
+
+    let msg = nsq.nsq_parse_message(fdata)
+    check("msg_timestamp_exact", msg[0] == ts)
+    check("msg_attempts_exact", msg[1] == 3)
+    check("msg_id_exact", msg[2] == msg_id)
+    check("msg_body_len_4", bytes_len(msg[3]) == 4)
+    check("msg_body_byte_exact", bytes_eq(msg[3], msg_body))
+    check("msg_body_embedded_nul_preserved", bytes_get(msg[3], 2) == 0)
+
+    // ── 11. response / error frame text + heartbeat detection ───────────────────────────────────
+    let resp_data = str_to_bytes("OK")
+    check("response_text_ok", nsq.nsq_response_text(resp_data) == "OK")
+    let hb_data = str_to_bytes("_heartbeat_")
+    check("is_heartbeat_true", nsq.nsq_is_heartbeat(nsq.nsq_frame_response(), hb_data) == true)
+    check("is_heartbeat_false_wrong_type", nsq.nsq_is_heartbeat(nsq.nsq_frame_message(), hb_data) == false)
+    check("is_heartbeat_false_wrong_text", nsq.nsq_is_heartbeat(nsq.nsq_frame_response(), resp_data) == false)
+    let err_data = str_to_bytes("E_BAD_TOPIC SUB error")
+    check("error_text_exact", nsq.nsq_error_text(err_data) == "E_BAD_TOPIC SUB error")
+
+    // ── 12. malformed/truncated MESSAGE data (< 26 bytes) doesn't crash -> sentinel ──────────────
+    let short_data = bytes_from_ints([1, 2, 3])
+    let short_msg = nsq.nsq_parse_message(short_data)
+    check("short_msg_sentinel_ts", short_msg[0] == 0 - 1)
+    check("short_msg_sentinel_id_empty", short_msg[2] == "")
+    check("short_msg_sentinel_body_empty", bytes_len(short_msg[3]) == 0)
+
+    // ── 13. int width boundaries: attempts 255/256, timestamp near i64 max stays exact ────────────
+    let attempts_255 = 255
+    let attempts_255_bytes = bytes_from_ints([(attempts_255 >> 8) & 0xFF, attempts_255 & 0xFF])
+    let data255 = bytes_concat(bytes_concat(bytes_concat(ts_bytes, attempts_255_bytes), id_bytes), msg_body)
+    let msg255 = nsq.nsq_parse_message(data255)
+    check("attempts_255_exact", msg255[1] == 255)
+
+    let attempts_256 = 256
+    let attempts_256_bytes = bytes_from_ints([(attempts_256 >> 8) & 0xFF, attempts_256 & 0xFF])
+    let data256 = bytes_concat(bytes_concat(bytes_concat(ts_bytes, attempts_256_bytes), id_bytes), msg_body)
+    let msg256 = nsq.nsq_parse_message(data256)
+    check("attempts_256_exact", msg256[1] == 256)
+
+    // ── summary ──
+    if FAILS[0] == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))
