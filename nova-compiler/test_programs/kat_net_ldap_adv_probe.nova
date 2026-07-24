@@ -1,0 +1,155 @@
+// INDEPENDENT ADVERSARIAL PROBE for std/net/ldap.nova
+// Attacks: field-level ASN.1 tag confusion (grammar violation not caught by
+// tag-agnostic parsing), long-form length edge cases (nb>8, nb missing bytes,
+// high-bit 8-byte length), exact-boundary content length (cend==buflen vs
+// cend==buflen+1), trailing garbage after a valid message, and negative
+// messageID. Default-adversarial: assume every one of these can break the
+// module until proven otherwise.
+
+import std/net/ldap
+import std/encoding/asn1
+import std/encoding/hex
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn main()
+    // ── A. Field-level tag confusion: version field wrong tag ──────────────
+    // Build a BindRequest by hand where the `version` field (should be
+    // INTEGER tag 0x02) is instead tagged as OCTET STRING (0x04) with the
+    // SAME single byte content (0x03). Per RFC 4511 grammar this message is
+    // malformed (version MUST be INTEGER) and a spec-conformant decoder
+    // should reject it. Does ldap_decode_bind_request validate the tag?
+    let bad_version_tlv = asn1_write_tlv(0x04, bytes_from_hex_local("03"))
+    let dn_tlv = asn1_encode_octet_string(_str_to_bytes("cn=x"))
+    let auth_tlv = asn1_write_tlv(0x80, _str_to_bytes("pw"))
+    let inner = bytes_concat(bad_version_tlv, dn_tlv)
+    inner = bytes_concat(inner, auth_tlv)
+    let bindop = asn1_write_tlv(0x60, inner)
+    let msgid_tlv = asn1_encode_integer(1)
+    let msgcontent = bytes_concat(msgid_tlv, bindop)
+    let msg = asn1_write_tlv(0x30, msgcontent)
+    let d = ldap_decode_bind_request(msg)
+    check("wrong_tag_version_field_rejected", d["ok"] == false)
+
+    // ── B. Field-level tag confusion: messageID field wrong tag (SEQUENCE
+    // instead of INTEGER) ───────────────────────────────────────────────────
+    let fake_msgid = asn1_write_tlv(0x30, bytes_from_hex_local("020101"))  // nested SEQUENCE, not INTEGER
+    let version_tlv2 = asn1_encode_integer(3)
+    let dn_tlv2 = asn1_encode_octet_string(_str_to_bytes("cn=x"))
+    let auth_tlv2 = asn1_write_tlv(0x80, _str_to_bytes("pw"))
+    let inner2 = bytes_concat(version_tlv2, dn_tlv2)
+    inner2 = bytes_concat(inner2, auth_tlv2)
+    let bindop2 = asn1_write_tlv(0x60, inner2)
+    let msgcontent2 = bytes_concat(fake_msgid, bindop2)
+    let msg2 = asn1_write_tlv(0x30, msgcontent2)
+    let d2 = ldap_decode_bind_request(msg2)
+    check("wrong_tag_messageid_field_rejected", d2["ok"] == false)
+
+    // ── C. Field-level tag confusion: resultCode wrong tag (OCTET STRING
+    // instead of ENUMERATED) in BindResponse ────────────────────────────────
+    let bad_rc_tlv = asn1_write_tlv(0x04, bytes_from_hex_local("00"))
+    let mdn_tlv = asn1_encode_octet_string(_str_to_bytes(""))
+    let diag_tlv = asn1_encode_octet_string(_str_to_bytes(""))
+    let inner3 = bytes_concat(bad_rc_tlv, mdn_tlv)
+    inner3 = bytes_concat(inner3, diag_tlv)
+    let respop = asn1_write_tlv(0x61, inner3)
+    let msgid3 = asn1_encode_integer(1)
+    let msgcontent3 = bytes_concat(msgid3, respop)
+    let msg3 = asn1_write_tlv(0x30, msgcontent3)
+    let d3 = ldap_decode_bind_response(msg3)
+    check("wrong_tag_resultcode_field_rejected", d3["ok"] == false)
+
+    // ── D. Long-form length nb=9 (b0=0x89) -- exceeds int64-safe 8-byte cap,
+    // must be rejected by asn1_decode_length (nb>8), propagated as ok=false ─
+    let nb9 = bytes_create(12)
+    bytes_set(nb9, 0, 0x30)
+    bytes_set(nb9, 1, 0x89)
+    let ii = 0
+    while ii < 9
+        bytes_set(nb9, 2 + ii, 0x00)
+        ii = ii + 1
+    let dnb9 = ldap_decode_bind_request(nb9)
+    check("longform_nb9_rejected", dnb9["ok"] == false)
+
+    // ── E. Long-form length with missing trailing length bytes (declares
+    // nb=4 but buffer ends right after b0) -- bytes_get returns 0 for OOB
+    // (runtime-level bounds check), so no crash/over-read; result must still
+    // be rejected once _ldap_safe_tlv compares against the real buflen ──────
+    let short_len = bytes_create(2)
+    bytes_set(short_len, 0, 0x30)
+    bytes_set(short_len, 1, 0x84)   // says "4 length bytes follow" but none do
+    let dshort = ldap_decode_bind_request(short_len)
+    check("longform_missing_lenbytes_rejected", dshort["ok"] == false)
+    check("longform_missing_lenbytes_no_crash", true)
+
+    // ── F. 8-byte long-form length with the top bit set (value would be
+    // negative if read as signed int64) -- must be rejected (clen<0 path) ──
+    let huge = bytes_create(10)
+    bytes_set(huge, 0, 0x30)
+    bytes_set(huge, 1, 0x88)  // 8 length bytes follow
+    bytes_set(huge, 2, 0xFF)
+    bytes_set(huge, 3, 0xFF)
+    bytes_set(huge, 4, 0xFF)
+    bytes_set(huge, 5, 0xFF)
+    bytes_set(huge, 6, 0xFF)
+    bytes_set(huge, 7, 0xFF)
+    bytes_set(huge, 8, 0xFF)
+    bytes_set(huge, 9, 0xFF)
+    let dhuge = ldap_decode_bind_request(huge)
+    check("huge_negative_length_rejected", dhuge["ok"] == false)
+
+    // ── G. Exact-boundary content length: cend == buflen must succeed;
+    // cend == buflen+1 (declared 1 byte past the real end) must fail ───────
+    let goodreq = ldap_encode_bind_request(1, 3, "cn=a", "pw")
+    let exact = bytes_slice(goodreq, 0, bytes_len(goodreq))
+    let dexact = ldap_decode_bind_request(exact)
+    check("exact_boundary_accepted", dexact["ok"] == true)
+
+    let one_short = bytes_slice(goodreq, 0, bytes_len(goodreq) - 1)
+    let dshort2 = ldap_decode_bind_request(one_short)
+    check("one_byte_short_rejected", dshort2["ok"] == false)
+
+    // ── H. Trailing garbage after a complete, valid message is tolerated
+    // (BER framing: the outer SEQUENCE's own declared length bounds the
+    // message; extra bytes belong to whatever comes next on the wire and
+    // must not corrupt this decode) ─────────────────────────────────────────
+    let with_garbage = bytes_concat(goodreq, bytes_from_hex_local("DEADBEEF"))
+    let dgarbage = ldap_decode_bind_request(with_garbage)
+    check("trailing_garbage_still_ok", dgarbage["ok"] == true)
+    check("trailing_garbage_fields_correct", dgarbage["dn"] == "cn=a" and dgarbage["password"] == "pw")
+
+    // ── I. Negative messageID round-trips without crashing (RFC disallows
+    // negative in practice, but codec must not crash/misbehave catastrophically) ─
+    let negid_msg = ldap_encode_unbind_request(-5)
+    let dnegid = ldap_decode_unbind_request(negid_msg)
+    check("negative_messageid_no_crash", true)
+    check("negative_messageid_roundtrip", dnegid["message_id"] == -5)
+
+    // ── J. Zero-length outer buffer with only a tag byte matching 0x30 but
+    // len byte declaring long-form nb=0x7F (127 length bytes, way more than
+    // int64 can index) -- must reject, not attempt huge read ──────────────
+    let nb127 = bytes_create(2)
+    bytes_set(nb127, 0, 0x30)
+    bytes_set(nb127, 1, 0xFF)  // 0x80 | 0x7F -> nb = 127
+    let dnb127 = ldap_decode_bind_request(nb127)
+    check("nb127_rejected", dnb127["ok"] == false)
+
+    if FAILS[0] == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))
+
+fn _str_to_bytes(s) -> any
+    let b = bytes_create(0)
+    b = bytes_append_str(b, s)
+    return b
+
+fn bytes_from_hex_local(h: string) -> any
+    return hex_decode(h)

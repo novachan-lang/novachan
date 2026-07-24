@@ -1,0 +1,147 @@
+// INDEPENDENT adversarial re-verification of the bson_null() sentinel-collision
+// fix in std/encoding/bson.nova. Written FRESH (not copied from bsonkat.nova's
+// KAT 9) to attack the exact defect from first principles against the BSON
+// spec (bsonspec.org): 0x0A null carries NO value bytes; 0x03 embedded
+// document carries a real nested BSON document.
+//
+// Fail-fast style: every check exits(1) immediately with a labeled message on
+// failure. No shared-list/dict counter is used for the verdict (that pattern
+// does not reliably propagate mutations out of a NOVA `fn` closure) — the
+// process exit code IS the verdict. Reaching the final print with exit 0 is
+// the only way this KAT passes.
+import std/encoding/bson
+
+fn fail(label: string, detail: string)
+    print("FAIL " + label + ": " + detail)
+    exit(1)
+
+fn ok(label: string)
+    print("PASS " + label)
+
+fn main()
+    // ── 1. Genuine bson_null() still encodes as a TRUE 0x0A null ───────────
+    // Spec: element = type_byte(0x0A) + cstring(key) + <no value bytes>.
+    // Document {"v": bson_null()} -> total_len(i32) + [0x0A]['v'][0x00] + 0x00
+    let d1 = {}
+    d1["v"] = bson_null()
+    let e1 = bson_encode(d1)
+    // Expected byte layout: total(4) + type(1)=0x0A + 'v'(1) + NUL(1) + doc-terminator(1) = 4+1+1+1+1 = 8
+    if bytes_len(e1) != 8
+        fail("genuine_null_len", "got " + str(bytes_len(e1)) + " want 8")
+    if bytes_get(e1, 4) != 0x0A
+        fail("genuine_null_typebyte", "got " + str(bytes_get(e1, 4)) + " want 0x0A(10)")
+    if bytes_get(e1, 5) != 118
+        fail("genuine_null_key_char", "got " + str(bytes_get(e1, 5)) + " want 118 ('v')")
+    if bytes_get(e1, 6) != 0
+        fail("genuine_null_key_nul", "got " + str(bytes_get(e1, 6)) + " want 0")
+    if bytes_get(e1, 7) != 0
+        fail("genuine_null_doc_terminator", "got " + str(bytes_get(e1, 7)) + " want 0")
+    let dec1 = bson_decode(e1)
+    if dec1["v"] != null
+        fail("genuine_null_decode", "expected null, got non-null")
+    ok("genuine_null_byte_exact_and_roundtrip")
+
+    // ── 2. THE DEFECT: an ordinary user dict whose SOLE key is literally
+    // "$bsonNull" (built WITHOUT bson_null(), so it lacks the magic second
+    // key) must be treated as REAL DATA -> a 1-entry embedded document
+    // (type byte 0x03), never misencoded as null (0x0A). ───────────────────
+    let evil1 = {}
+    evil1["$bsonNull"] = 1
+    let d2 = {}
+    d2["v"] = evil1
+    let e2 = bson_encode(d2)
+    if bytes_get(e2, 4) != 0x03
+        fail("collision_sole_key_typebyte", "got " + str(bytes_get(e2, 4)) + " want 0x03(3) — MISENCODED AS NULL")
+    let dec2 = bson_decode(e2)
+    if type_of(dec2["v"]) != "dict"
+        fail("collision_sole_key_decoded_type", "got " + type_of(dec2["v"]) + " want dict")
+    if dec2["v"]["$bsonNull"] != 1
+        fail("collision_sole_key_field_value", "got " + str(dec2["v"]["$bsonNull"]) + " want 1")
+    ok("collision_sole_key_treated_as_real_document")
+
+    // ── 3. Right key NAMES (both "$bsonNull" and "$bsonNullMagic") but a
+    // magic value that does NOT match the fixed constant -> must still fall
+    // through to 0x03, not null. ─────────────────────────────────────────────
+    let evil2 = {}
+    evil2["$bsonNull"] = 1
+    evil2["$bsonNullMagic"] = 999
+    let d3 = {}
+    d3["v"] = evil2
+    let e3 = bson_encode(d3)
+    if bytes_get(e3, 4) != 0x03
+        fail("collision_wrong_magic_typebyte", "got " + str(bytes_get(e3, 4)) + " want 0x03(3)")
+    let dec3 = bson_decode(e3)
+    if dec3["v"]["$bsonNullMagic"] != 999
+        fail("collision_wrong_magic_roundtrip", "got " + str(dec3["v"]["$bsonNullMagic"]) + " want 999")
+    ok("collision_wrong_magic_value_treated_as_real_document")
+
+    // ── 4. Right key names, magic key holds a NON-INT (string) value ->
+    // must not crash (type-guard before equality compare) and must still
+    // fall through to 0x03. ─────────────────────────────────────────────────
+    let evil3 = {}
+    evil3["$bsonNull"] = 1
+    evil3["$bsonNullMagic"] = "BSONNULL"
+    let d4 = {}
+    d4["v"] = evil3
+    let e4 = bson_encode(d4)
+    if bytes_get(e4, 4) != 0x03
+        fail("collision_nonint_magic_typebyte", "got " + str(bytes_get(e4, 4)) + " want 0x03(3)")
+    let dec4 = bson_decode(e4)
+    if dec4["v"]["$bsonNullMagic"] != "BSONNULL"
+        fail("collision_nonint_magic_roundtrip", "expected string field to survive round-trip")
+    ok("collision_nonint_magic_no_crash_real_document")
+
+    // ── 5. THREE-key dict that includes the exact marker pair PLUS an extra
+    // field -> len(ks)==2 check rejects it -> must fall through to 0x03
+    // (a genuine bson_null() sentinel is exactly 2 keys, never 3). ─────────
+    let evil4 = {}
+    evil4["$bsonNull"] = 1
+    evil4["$bsonNullMagic"] = 0x42534F4E4E554C4C
+    evil4["extra"] = 7
+    let d5 = {}
+    d5["v"] = evil4
+    let e5 = bson_encode(d5)
+    if bytes_get(e5, 4) != 0x03
+        fail("collision_extra_field_typebyte", "got " + str(bytes_get(e5, 4)) + " want 0x03(3)")
+    let dec5 = bson_decode(e5)
+    if dec5["v"]["extra"] != 7
+        fail("collision_extra_field_roundtrip", "extra field lost")
+    ok("collision_three_keys_with_exact_magic_still_real_document")
+
+    // ── 6. Sanity: the exact magic value alone is not published/derivable
+    // from anywhere else in the public API in a way that trivially collides
+    // by accident — re-derive it independently from the ASCII spec
+    // ("BSONNULL" big-endian) and confirm a dict using THAT exact 2-key
+    // shape (i.e. reconstructing bson_null()'s own output by hand) DOES
+    // legitimately decode as null — proving the marker recognition logic
+    // itself (not just its negative cases) is correct. ─────────────────────
+    let handbuilt = {}
+    handbuilt["$bsonNull"] = 1
+    handbuilt["$bsonNullMagic"] = 0x42534F4E4E554C4C
+    let d6 = {}
+    d6["v"] = handbuilt
+    let e6 = bson_encode(d6)
+    if bytes_get(e6, 4) != 0x0A
+        fail("handbuilt_exact_marker_typebyte", "got " + str(bytes_get(e6, 4)) + " want 0x0A(10)")
+    let dec6 = bson_decode(e6)
+    if dec6["v"] != null
+        fail("handbuilt_exact_marker_decode", "expected null")
+    ok("handbuilt_exact_2key_magic_shape_correctly_recognized_as_null")
+
+    // ── 7. Top-level (not nested) collision dict as the WHOLE document
+    // itself: bson_encode({"$bsonNull":1}) directly. ───────────────────────
+    let toplevel = {}
+    toplevel["$bsonNull"] = 1
+    let e7 = bson_encode(toplevel)
+    // top-level doc has 1 field of type 0x03? No — top-level dict IS the
+    // document itself; its field "$bsonNull" -> int 1 -> encodes as int32.
+    // This checks bson_encode's OWN dispatch doesn't special-case the key
+    // name at the top level either (it shouldn't; the sentinel check only
+    // applies to dict-typed VALUES, and top-level int fields are unaffected
+    // regardless — included as a boundary sanity check, not a defect probe).
+    let dec7 = bson_decode(e7)
+    if dec7["$bsonNull"] != 1
+        fail("toplevel_boundary_sanity", "got " + str(dec7["$bsonNull"]))
+    ok("toplevel_boundary_sanity")
+
+    print("bson_null_indep_verify KAT: ALL PASS")

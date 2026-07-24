@@ -1,0 +1,142 @@
+// INDEPENDENT adversarial re-verification probe for std/encoding/ubjson's
+// sentinel-collision fix (ubjson_bool()/ubjson_null() 2-key + magic-value
+// hardening). Written FRESH, not copied from the fixer's own KAT, and does
+// NOT use the shared-list FAILS-counter pattern -- each check prints its own
+// ok/FAIL line and the pass/fail verdict is threaded explicitly through a
+// local int returned to main(), so "ALL PASS" cannot print while a real
+// check failed.
+import std/encoding/ubjson
+
+fn _hex(b) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let v = bytes_get(b, i)
+        out = out + char_at(digs, (v >> 4) & 15) + char_at(digs, v & 15)
+        i = i + 1
+    return out
+
+fn chk_s(name: string, got: string, want: string, fails: int) -> int
+    let f = fails
+    if got != want
+        print("FAIL " + name + ": got '" + got + "' want '" + want + "'")
+        f = f + 1
+    else
+        print("ok " + name)
+    return f
+
+fn chk_i(name: string, got: int, want: int, fails: int) -> int
+    let f = fails
+    if got != want
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        f = f + 1
+    else
+        print("ok " + name)
+    return f
+
+fn main()
+    let fails = 0
+
+    // -- 1. Genuine sentinel calls still byte-exact --------------------
+    fails = chk_s("legit ubjson_bool(true) -> T", _hex(ubjson_encode(ubjson_bool(true))), "54", fails)
+    fails = chk_s("legit ubjson_bool(false) -> F", _hex(ubjson_encode(ubjson_bool(false))), "46", fails)
+    fails = chk_s("legit ubjson_null() -> Z", _hex(ubjson_encode(ubjson_null())), "5a", fails)
+
+    // -- 2. Bare name-only collision: a genuine user dict whose SOLE key is
+    // exactly the reserved wrapper key name (no magic key at all) must
+    // round-trip as a real 1-entry UBJSON object, never a T/F/Z marker.
+    let bare1 = {}
+    bare1["$ubjsonBool"] = 99
+    let encBare1 = ubjson_encode(bare1)
+    fails = chk_s("bare $ubjsonBool dict -> object marker \{", _hex(bytes_slice(encBare1, 0, 1)), "7b", fails)
+    let rtBare1 = ubjson_decode(encBare1)
+    fails = chk_s("bare $ubjsonBool dict decodes as dict", type_of(rtBare1), "dict", fails)
+    fails = chk_i("bare $ubjsonBool value preserved (99)", rtBare1["$ubjsonBool"], 99, fails)
+    fails = chk_i("bare $ubjsonBool dict has exactly 1 key", len(keys(rtBare1)), 1, fails)
+
+    let bare2 = {}
+    bare2["$ubjsonNull"] = 13
+    let encBare2 = ubjson_encode(bare2)
+    fails = chk_s("bare $ubjsonNull dict -> object marker \{", _hex(bytes_slice(encBare2, 0, 1)), "7b", fails)
+    let rtBare2 = ubjson_decode(encBare2)
+    fails = chk_s("bare $ubjsonNull dict decodes as dict", type_of(rtBare2), "dict", fails)
+    fails = chk_i("bare $ubjsonNull value preserved (13)", rtBare2["$ubjsonNull"], 13, fails)
+    fails = chk_i("bare $ubjsonNull dict has exactly 1 key", len(keys(rtBare2)), 1, fails)
+
+    // -- 3. Right 2-key SHAPE, but the magic value is off by exactly 1 --
+    // adversary who knows the key names but not the exact constant.
+    let offbyone = {}
+    offbyone["$ubjsonBool"] = 1
+    offbyone["$ubjsonBoolMagic"] = 0x55424A53424F4F4D  // magic + 1
+    let encOff = ubjson_encode(offbyone)
+    fails = chk_s("off-by-one magic stays object", _hex(bytes_slice(encOff, 0, 1)), "7b", fails)
+    let rtOff = ubjson_decode(encOff)
+    fails = chk_i("off-by-one magic dict key count = 2", len(keys(rtOff)), 2, fails)
+
+    // -- 4. Right key NAMES, magic key present but holding a LIST (not even
+    // a string) -- must not crash on the any==int comparison and must fall
+    // through to a real object.
+    let listMagic = {}
+    listMagic["$ubjsonBool"] = 1
+    listMagic["$ubjsonBoolMagic"] = [1, 2, 3]
+    let encListMagic = ubjson_encode(listMagic)
+    fails = chk_s("list-typed magic stays object, no crash", _hex(bytes_slice(encListMagic, 0, 1)), "7b", fails)
+    let rtListMagic = ubjson_decode(encListMagic)
+    fails = chk_i("list-typed magic dict key count = 2", len(keys(rtListMagic)), 2, fails)
+
+    // -- 5. Exact correct 2-key SHAPE + exact correct magic INT value, but
+    // the primary "$ubjsonBool" value itself is a STRING (not int) -- an
+    // adversary who has read the source and knows the exact magic constant
+    // but supplies a malformed value key. Must not crash comparing a string
+    // against 0 in the `v["$ubjsonBool"] != 0` marker-value check.
+    let valTypeMismatch = {}
+    valTypeMismatch["$ubjsonBool"] = "not-an-int"
+    valTypeMismatch["$ubjsonBoolMagic"] = 0x55424A53424F4F4C
+    let encValMismatch = ubjson_encode(valTypeMismatch)
+    // Whatever the module decides here (treat as bool marker with some
+    // coercion, or fall through to object), the ONLY safe outcome is that
+    // it does not crash the process. We print the concrete first byte to
+    // pin down actual behavior for the record.
+    print("val-type-mismatch first byte = " + _hex(bytes_slice(encValMismatch, 0, 1)))
+    let rtValMismatch = ubjson_decode(encValMismatch)
+    print("val-type-mismatch decode type_of = " + type_of(rtValMismatch))
+
+    // -- 6. Exact correct 2-key null shape + exact correct magic, sibling
+    // data around it (nested), plus a bare collision sibling in the SAME
+    // object -- both must resolve independently and correctly.
+    let hostObj = {}
+    hostObj["before"] = "x"
+    hostObj["realNull"] = ubjson_null()
+    hostObj["fakeNullByName"] = bare2
+    hostObj["realBool"] = ubjson_bool(false)
+    hostObj["after"] = "y"
+    let encHost = ubjson_encode(hostObj)
+    let rtHost = ubjson_decode(encHost)
+    fails = chk_s("host: before survives", rtHost["before"], "x", fails)
+    fails = chk_i("host: realNull decodes to null/0", rtHost["realNull"], 0, fails)
+    fails = chk_s("host: fakeNullByName decodes as dict (not null)", type_of(rtHost["fakeNullByName"]), "dict", fails)
+    fails = chk_i("host: fakeNullByName preserved value", rtHost["fakeNullByName"]["$ubjsonNull"], 13, fails)
+    fails = chk_i("host: realBool(false) decodes to 0", rtHost["realBool"], 0, fails)
+    fails = chk_s("host: after survives", rtHost["after"], "y", fails)
+    fails = chk_i("host: exactly 5 top keys", len(keys(rtHost)), 5, fails)
+
+    // -- 7. Sentinel key present but with a THIRD extra key (3-key dict,
+    // not the required 2-key shape) -- must fall through to object even
+    // with correct magic value, since shape check requires len(ks)==2.
+    let threeKey = {}
+    threeKey["$ubjsonBool"] = 1
+    threeKey["$ubjsonBoolMagic"] = 0x55424A53424F4F4C
+    threeKey["extra"] = "z"
+    let encThree = ubjson_encode(threeKey)
+    fails = chk_s("3-key dict (correct magic + extra key) stays object", _hex(bytes_slice(encThree, 0, 1)), "7b", fails)
+    let rtThree = ubjson_decode(encThree)
+    fails = chk_i("3-key dict roundtrip key count = 3", len(keys(rtThree)), 3, fails)
+    fails = chk_s("3-key dict extra field preserved", rtThree["extra"], "z", fails)
+
+    if fails == 0
+        print("adv_ubjson_sentinel_v2 ALL PASS (fails=0)")
+    else
+        print("adv_ubjson_sentinel_v2 FAILURES=" + str(fails))
+        exit(1)

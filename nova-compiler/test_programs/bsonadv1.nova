@@ -1,0 +1,167 @@
+// ADVERSARIAL probe for std/encoding/bson — independent re-derivation.
+// Attacks: byte-exact double encoding (not just round-trip), binary safety
+// with embedded 0x00, string vs binary boundary, array boundary >=10 elems,
+// deeply nested struct, negative int64 boundary, defensive-copy of decode
+// output, re-encode determinism.
+import std/encoding/bson
+
+fn ckb(label: string, b: any, expected: list)
+    let blen = bytes_len(b)
+    let elen = len(expected)
+    if blen != elen
+        print("FAIL " + label + "_len: got " + str(blen) + " want " + str(elen))
+        exit(1)
+    let i = 0
+    while i < elen
+        let got = bytes_get(b, i)
+        let want = expected[i]
+        if got != want
+            print("FAIL " + label + "_b" + str(i) + ": got " + str(got) + " want " + str(want))
+            exit(1)
+        i = i + 1
+    print("PASS " + label + "_bytes")
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn main()
+    // ── 1: byte-exact double encoding, RE-DERIVED from IEEE-754 by hand ────
+    // 1.0 = 0x3FF0000000000000 -> LE bytes 00 00 00 00 00 00 F0 3F
+    let d1 = {}
+    d1["v"] = 1.0
+    let e1 = bson_encode(d1)
+    // layout: len(4) 01 'v'(1) 00(1) then 8 double bytes then 00 term
+    let expect1 = [0x10, 0x00, 0x00, 0x00, 0x01, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x00]
+    ckb("double_1_0", e1, expect1)
+
+    // -2.0 = 0xC000000000000000 -> LE bytes 00 00 00 00 00 00 00 C0
+    let d2 = {}
+    d2["v"] = 0.0 - 2.0
+    let e2 = bson_encode(d2)
+    let expect2 = [0x10, 0x00, 0x00, 0x00, 0x01, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00]
+    ckb("double_neg2_0", e2, expect2)
+
+    // 0.0 -> all zero mantissa/exp/sign
+    let d3 = {}
+    d3["v"] = 0.0
+    let e3 = bson_encode(d3)
+    let expect3 = [0x10, 0x00, 0x00, 0x00, 0x01, 0x76, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    ckb("double_zero", e3, expect3)
+
+    // ── 2: BINARY SAFETY — embedded 0x00 byte in the binary(0x05) payload ──
+    let bin = bytes_create(5)
+    bytes_set(bin, 0, 0xAA)
+    bytes_set(bin, 1, 0x00)
+    bytes_set(bin, 2, 0xFF)
+    bytes_set(bin, 3, 0x00)
+    bytes_set(bin, 4, 0x01)
+    let db = {}
+    db["blob"] = bin
+    let eb = bson_encode(db)
+    let decb = bson_decode(eb)
+    let outb = decb["blob"]
+    cki("bin_nul_len", bytes_len(outb), 5)
+    cki("bin_nul_0", bytes_get(outb, 0), 0xAA)
+    cki("bin_nul_1", bytes_get(outb, 1), 0x00)
+    cki("bin_nul_2", bytes_get(outb, 2), 0xFF)
+    cki("bin_nul_3", bytes_get(outb, 3), 0x00)
+    cki("bin_nul_4", bytes_get(outb, 4), 0x01)
+
+    // ── 3: array with >= 10 elements — multi-digit decimal keys "10","11" ──
+    let big_arr = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    let da = {}
+    da["arr"] = big_arr
+    let ea = bson_encode(da)
+    let deca = bson_decode(ea)
+    let outa = deca["arr"]
+    cki("arr13_len", len(outa), 13)
+    let i = 0
+    let arr_ok = 1
+    while i < 13
+        if outa[i] != i
+            arr_ok = 0
+        i = i + 1
+    cki("arr13_order", arr_ok, 1)
+
+    // ── 4: deeply nested document (3 levels) ────────────────────────────────
+    let lvl3 = {}
+    lvl3["z"] = 99
+    let lvl2 = {}
+    lvl2["inner"] = lvl3
+    lvl2["w"] = 7
+    let lvl1 = {}
+    lvl1["mid"] = lvl2
+    let en = bson_encode(lvl1)
+    let dn = bson_decode(en)
+    cki("nested3_z", dn["mid"]["inner"]["z"], 99)
+    cki("nested3_w", dn["mid"]["w"], 7)
+
+    // ── 5: negative int64 boundary (just below int32 min) round trip ───────
+    let dneg = {}
+    dneg["v"] = 0 - 2147483649
+    let eneg = bson_encode(dneg)
+    cki("neg_int64_type_byte", bytes_get(eneg, 4), 0x12)
+    let decneg = bson_decode(eneg)
+    cki("neg_int64_rt", decneg["v"], 0 - 2147483649)
+
+    // very large negative (near int64 min-ish, safely representable)
+    let dneg2 = {}
+    dneg2["v"] = 0 - 9223372036854775000
+    let eneg2 = bson_encode(dneg2)
+    let decneg2 = bson_decode(eneg2)
+    cki("neg_int64_huge_rt", decneg2["v"], 0 - 9223372036854775000)
+
+    // ── 6: defensive copy — mutating decoded structures must not corrupt
+    // a second independent decode of the same source bytes ─────────────────
+    let dcopy = {}
+    dcopy["list"] = [1, 2, 3]
+    let ecopy = bson_encode(dcopy)
+    let dec_a = bson_decode(ecopy)
+    let dec_b = bson_decode(ecopy)
+    dec_a["list"].push(999)
+    dec_a["list"][0] = 777
+    cki("defensive_copy_b_len", len(dec_b["list"]), 3)
+    cki("defensive_copy_b_0", dec_b["list"][0], 1)
+
+    // mutate an encoded byte buffer's DECODED bytes-field, verify it does not
+    // alias the source document (bytes_set on decoded blob shouldn't corrupt
+    // a re-decode of the same wire bytes)
+    let bin2 = bytes_create(2)
+    bytes_set(bin2, 0, 0x11)
+    bytes_set(bin2, 1, 0x22)
+    let dblob = {}
+    dblob["b"] = bin2
+    let eblob = bson_encode(dblob)
+    let decblob_a = bson_decode(eblob)
+    let decblob_b = bson_decode(eblob)
+    bytes_set(decblob_a["b"], 0, 0xFF)
+    cki("defensive_copy_blob_b0", bytes_get(decblob_b["b"], 0), 0x11)
+
+    // ── 7: re-encode determinism / round-trip stability for multi-field doc
+    let dm = {}
+    dm["a"] = 1
+    dm["b"] = "two"
+    dm["c"] = 3.0
+    let em1 = bson_encode(dm)
+    let decm = bson_decode(em1)
+    let em2 = bson_encode(decm)
+    cki("reencode_len_stable", bytes_len(em2), bytes_len(em1))
+    let i2 = 0
+    let bytes_match = 1
+    let n2 = bytes_len(em1)
+    while i2 < n2
+        if bytes_get(em1, i2) != bytes_get(em2, i2)
+            bytes_match = 0
+        i2 = i2 + 1
+    cki("reencode_bytes_stable", bytes_match, 1)
+
+    print("bson ADVERSARIAL: ALL PASS")

@@ -1,0 +1,467 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ldap
+// ============================================================================
+// LDAP v3 (RFC 4511) protocol codec, built ON TOP OF std/encoding/asn1's BER/
+// DER TLV layer — this module does NOT reimplement tag/length/value framing;
+// it only knows the LDAP-specific ASN.1 GRAMMAR (which tags nest inside which
+// SEQUENCEs) and drives asn1's generic TLV reader/writer through it.
+//
+// WHY BER, NOT DER, ON DECODE. LDAP is defined over BER (X.690), not its DER
+// subset: a conforming LDAP peer may legally send a long-form length even
+// where a short form would fit (BER permits it; only DER forbids it). This
+// module ENCODES DER-minimal (asn1_encode_length always picks the shortest
+// valid form — DER-minimal is a valid BER encoding, so our wire output is
+// accepted by every LDAP peer), but DECODES full BER: std/encoding/asn1's
+// asn1_decode_length already accepts arbitrary long-form byte counts (1..8)
+// without requiring minimality, so no extra work is needed there. What IS
+// LDAP-specific is defending against a length field that is well-formed BER
+// but LIES about the buffer it's embedded in (declares more content than
+// actually follows) — see _ldap_safe_tlv below, the hardening asn1's generic
+// reader does not itself provide.
+//
+// GRAMMAR (RFC 4511 §4.1, §4.2, §4.3):
+//   LDAPMessage ::= SEQUENCE {            -- tag 0x30 (universal, constructed)
+//        messageID  MessageID,            -- INTEGER, tag 0x02
+//        protocolOp CHOICE { ... } }      -- APPLICATION-tagged, see below
+//
+//   BindRequest ::= [APPLICATION 0] SEQUENCE {   -- tag 0x60 (constructed)
+//        version        INTEGER (1..127),        -- tag 0x02
+//        name           LDAPDN (OCTET STRING),    -- tag 0x04
+//        authentication CHOICE {
+//             simple [0] OCTET STRING, ... } }     -- tag 0x80 (context, primitive)
+//   Only `simple` authentication is implemented (SASL [3]/0xA3 is recognized
+//   on decode as "unsupported", never silently misparsed as simple).
+//
+//   BindResponse ::= [APPLICATION 1] SEQUENCE {   -- tag 0x61 (constructed)
+//        resultCode        ENUMERATED { ... },     -- tag 0x0A
+//        matchedDN         LDAPDN (OCTET STRING),  -- tag 0x04
+//        diagnosticMessage LDAPString (OCTET STRING) }  -- tag 0x04
+//   (serverSaslCreds [7] is not encoded/decoded — out of scope here.)
+//
+//   UnbindRequest ::= [APPLICATION 2] NULL         -- tag 0x42 (primitive, empty)
+//
+// REUSE. asn1_write_tlv/asn1_read_tlv/asn1_decode_length/asn1_encode_length
+// (the actual TLV+BER-length engine) and asn1_encode_integer/
+// asn1_encode_octet_string/asn1_tag_sequence are used AS-IS from
+// std/encoding/asn1 — not reimplemented. ENUMERATED has no typed helper in
+// asn1 (only INTEGER does), but ENUMERATED's content encoding is IDENTICAL
+// to INTEGER's (X.690 §8.4 defers to §8.3): we call asn1_encode_integer(n)
+// then overwrite just the tag byte (offset 0) from 0x02 to 0x0A with
+// bytes_set — this reuses asn1's minimal-two's-complement trim algorithm
+// exactly instead of re-deriving it.
+//
+// SAFETY MODEL (untrusted-network input). std/encoding/asn1's TLV reader
+// bounds-checks every individual byte access (bytes_get/bytes_slice never
+// read past a buffer's allocated size — see nova_runtime.c), so a malformed
+// LDAP message can never crash the process. But byte-safety alone is not
+// PROTOCOL safety: a length field can be individually in-bounds-per-access
+// yet still LIE (declare more content than actually remains in the buffer),
+// which — if not additionally checked — lets a short/truncated buffer read
+// as if it were a complete, valid message (a truncation MUST be visible as a
+// decode failure, not silently accepted with wrong/short data; this is also
+// how a hostile "declare a huge OCTET STRING but supply no bytes" framing
+// attack is neutralized: it fails cleanly instead of being trusted).
+// _ldap_safe_tlv is the single choke point that adds this check: after
+// asn1_decode_length returns [declared_len, content_start], it independently
+// verifies content_start + declared_len does not exceed bytes_len(buf)
+// (with an overflow-safe compare — declared_len can be up to 2^64-1 per BER
+// long-form, so content_start + declared_len can wrap an int64) BEFORE
+// trusting the slice. Every decode entry point in this module routes through
+// it exclusively; none call asn1_read_tlv directly on untrusted input.
+//
+// TYPE-CONFUSION SAFETY. Length-lie safety alone is not GRAMMAR safety: a
+// structurally in-bounds field can still carry the WRONG tag (e.g. a
+// resultCode sent as OCTET STRING 0x04 instead of ENUMERATED 0x0A) — a
+// classic BER/DER type-confusion. Every structural field in the grammar
+// above (messageID, version, name/DN, resultCode, matchedDN,
+// diagnosticMessage — not just the two CHOICE points: protocolOp's
+// [APPLICATION n] tag and the auth CHOICE tag) is read through
+// _ldap_safe_tlv_tag, which additionally rejects (ok=false) any tag that
+// does not match the grammar-mandated tag for that field. This is what
+// makes "ok is false on ANY malformed input" (see PUBLIC API below) hold
+// for the FULL grammar, not just the two dispatch points.
+//
+// BINARY-SAFE FIELDS. LDAPDN/LDAPString/password are OCTET STRING, which per
+// X.690 is binary content — NUL (0x00) is ordinary data, not a terminator.
+// NOVA `string` is C-string-backed and truncates at NUL (see
+// reference_nova_string_nul_truncation), so every decoded field is returned
+// BOTH ways: `dn`/`password`/`matched_dn`/`diagnostic_message` (string, for
+// ergonomic use — the overwhelming majority of real DNs/passwords/messages
+// are NUL-free text) AND `dn_bytes`/`password_bytes`/`matched_dn_bytes`/
+// `diagnostic_message_bytes` (bytes, exact, safe for a NUL-containing or
+// otherwise binary credential). The string encode functions
+// (ldap_encode_bind_request/ldap_encode_bind_response) accept NOVA `string`
+// for ergonomics (matching how a caller actually writes a DN literal); for a
+// value that itself may carry embedded NUL/binary, use the `_bytes` encode
+// variants instead.
+//
+// PUBLIC API:
+//   Tag constants:
+//     ldap_tag_message() ldap_tag_bind_request() ldap_tag_bind_response()
+//     ldap_tag_unbind_request() ldap_tag_simple_auth() ldap_tag_enumerated()
+//   Result-code constants (RFC 4511 §4.1.9, the common subset):
+//     ldap_result_success() ldap_result_operations_error()
+//     ldap_result_protocol_error() ldap_result_auth_method_not_supported()
+//     ldap_result_no_such_object() ldap_result_invalid_credentials()
+//     ldap_result_insufficient_access() ldap_result_busy() ldap_result_unavailable()
+//   Encode (-> bytes, a complete LDAPMessage ready to write to a socket):
+//     ldap_encode_bind_request(message_id: int, version: int, dn: string, password: string) -> bytes
+//     ldap_encode_bind_request_bytes(message_id: int, version: int, dn: bytes, password: bytes) -> bytes
+//     ldap_encode_bind_response(message_id: int, result_code: int, matched_dn: string, diagnostic_message: string) -> bytes
+//     ldap_encode_unbind_request(message_id: int) -> bytes
+//   Decode (-> dict; ALWAYS returns in-band, NEVER exits/aborts on bad input;
+//     "ok": bool signals success, "error": string carries the reason on failure):
+//     ldap_peek_op_tag(buf: bytes) -> int   -- protocolOp tag, or -1 if malformed
+//                                              (0x60/0x61/0x42/... — dispatch on this)
+//     ldap_decode_bind_request(buf: bytes) -> dict
+//     ldap_decode_bind_response(buf: bytes) -> dict
+//     ldap_decode_unbind_request(buf: bytes) -> dict
+// ============================================================================
+
+import std/encoding/asn1
+
+// ── tag constants ──────────────────────────────────────────────────────────
+fn ldap_tag_message() -> int
+    asn1_tag_sequence()
+fn ldap_tag_bind_request() -> int
+    0x60
+fn ldap_tag_bind_response() -> int
+    0x61
+fn ldap_tag_unbind_request() -> int
+    0x42
+fn ldap_tag_simple_auth() -> int
+    0x80
+fn ldap_tag_enumerated() -> int
+    0x0A
+
+// ── result-code constants (RFC 4511 §4.1.9, common subset) ─────────────────
+fn ldap_result_success() -> int
+    0
+fn ldap_result_operations_error() -> int
+    1
+fn ldap_result_protocol_error() -> int
+    2
+fn ldap_result_auth_method_not_supported() -> int
+    7
+fn ldap_result_no_such_object() -> int
+    32
+fn ldap_result_invalid_credentials() -> int
+    49
+fn ldap_result_insufficient_access() -> int
+    50
+fn ldap_result_busy() -> int
+    51
+fn ldap_result_unavailable() -> int
+    52
+
+// ── private: string -> bytes (binary-safe, no NUL truncation on the WAY IN;
+// bytes_append_str copies s's declared length, not strlen — see std/encoding/
+// asn1's own OCTET STRING helpers, whose exact pattern this mirrors) ───────
+fn _ldap_str_to_bytes(s) -> any
+    let b = bytes_create(0)
+    b = bytes_append_str(b, s)
+    return b
+
+// ── private: bounds-checked TLV read. Wraps asn1_read_tlv/asn1_decode_length
+// with an EXTRA check they do not perform themselves: that the declared
+// content length actually fits inside the remaining buffer (protects against
+// a truncated buffer or a hostile over-long length field being silently
+// accepted as if valid — see module header SAFETY MODEL). Returns
+// [tag: int, content: bytes, next_pos: int, ok: bool]. On any failure, ok is
+// false and next_pos is a best-effort position (never used by callers when
+// ok is false — every call site checks ok before proceeding). ─────────────
+fn _ldap_safe_tlv(buf, pos) -> list
+    let buflen = bytes_len(buf)
+    if pos < 0 or pos >= buflen
+        return [-1, bytes_create(0), pos, false]
+    let tag = bytes_get(buf, pos) & 0xFF
+    let lpos = pos + 1
+    if lpos >= buflen
+        return [tag, bytes_create(0), lpos, false]
+    let lr = asn1_decode_length(buf, lpos)
+    let clen = lr[0]
+    let cstart = lr[1]
+    if clen < 0
+        return [tag, bytes_create(0), cstart, false]
+    if cstart < 0 or cstart > buflen
+        return [tag, bytes_create(0), cstart, false]
+    let cend = cstart + clen
+    // cend < cstart catches int64 wraparound from a huge BER long-form
+    // length (up to 8 bytes -> up to 2^64-1, which overflows a signed i64).
+    if cend < cstart or cend > buflen
+        return [tag, bytes_create(0), cstart, false]
+    let content = bytes_slice(buf, cstart, cend)
+    if bytes_len(content) != clen
+        return [tag, content, cend, false]
+    return [tag, content, cend, true]
+
+// ── private: bounds-checked TLV read WITH a mandatory tag check. Wraps
+// _ldap_safe_tlv with the additional BER/DER type-confusion defense the
+// module doc contract requires ("ok is false on ANY malformed input"):
+// EVERY structural field's tag byte must be verified against the tag its
+// ASN.1 grammar mandates (messageID/version = INTEGER 0x02, DN/matchedDN/
+// diagnosticMessage = OCTET STRING 0x04, resultCode = ENUMERATED 0x0A) --
+// not just the two CHOICE points (protocolOp APPLICATION tag, auth CHOICE
+// tag), which is all the pre-fix decoder checked. A wrongly-tagged field
+// is a grammar-malformed message and must decode ok=false, never be
+// silently accepted with mis-typed content. Returns the same
+// [tag, content, next_pos, ok] shape as _ldap_safe_tlv; ok is false on
+// EITHER a structural failure (truncation/length-lie, from _ldap_safe_tlv)
+// OR a tag mismatch (detected here). USED BY: messageID/version/DN in
+// ldap_decode_bind_request; messageID/resultCode/matchedDN/diagnosticMessage
+// in ldap_decode_bind_response; messageID in ldap_decode_unbind_request. ──
+fn _ldap_safe_tlv_tag(buf, pos, expected_tag) -> list
+    let r = _ldap_safe_tlv(buf, pos)
+    if r[3] == false
+        return r
+    if r[0] != expected_tag
+        return [r[0], r[1], r[2], false]
+    return r
+
+// ── private: minimal two's-complement content -> int. Mirrors
+// asn1_decode_integer's content-parsing exactly (INTEGER and ENUMERATED
+// share the identical content encoding per X.690 §8.4), kept local so
+// ENUMERATED (tag 0x0A) can reuse it without asn1_decode_integer's
+// tag-mismatch warning print firing on every clean BindResponse decode. ───
+fn _ldap_int_from_content(content) -> int
+    let clen = bytes_len(content)
+    if clen == 0
+        return 0
+    let b0 = bytes_get(content, 0) & 0xFF
+    let val = 0
+    if (b0 & 0x80) != 0
+        val = -1
+    let i = 0
+    while i < clen
+        let byte = bytes_get(content, i) & 0xFF
+        val = (val << 8) | byte
+        i = i + 1
+    return val
+
+// ── encode ──────────────────────────────────────────────────────────────
+// ldap_encode_bind_request: simple-auth BindRequest, string DN/password.
+fn ldap_encode_bind_request(message_id, version, dn, password) -> any
+    return ldap_encode_bind_request_bytes(message_id, version, _ldap_str_to_bytes(dn), _ldap_str_to_bytes(password))
+
+// Binary-safe variant: dn/password are `bytes` (use when either may contain
+// NUL or is otherwise not NUL-free UTF-8 text).
+fn ldap_encode_bind_request_bytes(message_id, version, dn, password) -> any
+    let version_tlv = asn1_encode_integer(version)
+    let name_tlv = asn1_encode_octet_string(dn)
+    let auth_tlv = asn1_write_tlv(ldap_tag_simple_auth(), password)
+    let content = bytes_concat(version_tlv, name_tlv)
+    content = bytes_concat(content, auth_tlv)
+    let bindreq = asn1_write_tlv(ldap_tag_bind_request(), content)
+    let msgid_tlv = asn1_encode_integer(message_id)
+    let msg_content = bytes_concat(msgid_tlv, bindreq)
+    return asn1_write_tlv(ldap_tag_message(), msg_content)
+
+// ldap_encode_bind_response: resultCode + matchedDN + diagnosticMessage.
+fn ldap_encode_bind_response(message_id, result_code, matched_dn, diagnostic_message) -> any
+    let rc_tlv = asn1_encode_integer(result_code)
+    // ENUMERATED shares INTEGER's content encoding exactly (X.690 §8.4) --
+    // reuse asn1_encode_integer's trim, just retag the TLV's tag byte.
+    bytes_set(rc_tlv, 0, ldap_tag_enumerated())
+    let mdn_tlv = asn1_encode_octet_string(_ldap_str_to_bytes(matched_dn))
+    let diag_tlv = asn1_encode_octet_string(_ldap_str_to_bytes(diagnostic_message))
+    let content = bytes_concat(rc_tlv, mdn_tlv)
+    content = bytes_concat(content, diag_tlv)
+    let bindresp = asn1_write_tlv(ldap_tag_bind_response(), content)
+    let msgid_tlv = asn1_encode_integer(message_id)
+    let msg_content = bytes_concat(msgid_tlv, bindresp)
+    return asn1_write_tlv(ldap_tag_message(), msg_content)
+
+// ldap_encode_unbind_request: [APPLICATION 2] NULL, empty content.
+fn ldap_encode_unbind_request(message_id) -> any
+    let unbindreq = asn1_write_tlv(ldap_tag_unbind_request(), bytes_create(0))
+    let msgid_tlv = asn1_encode_integer(message_id)
+    let msg_content = bytes_concat(msgid_tlv, unbindreq)
+    return asn1_write_tlv(ldap_tag_message(), msg_content)
+
+// ── decode ──────────────────────────────────────────────────────────────
+
+// ldap_peek_op_tag: read just enough of an LDAPMessage to learn the
+// protocolOp's tag byte (e.g. 0x60/0x61/0x42), so a caller can dispatch to
+// the right typed decoder. Returns -1 on ANY malformed input (never crashes,
+// never raises -- an in-band sentinel).
+fn ldap_peek_op_tag(buf) -> int
+    let outer = _ldap_safe_tlv(buf, 0)
+    if outer[3] == false
+        return -1
+    if outer[0] != ldap_tag_message()
+        return -1
+    let content = outer[1]
+    let midr = _ldap_safe_tlv(content, 0)
+    if midr[3] == false
+        return -1
+    let opr = _ldap_safe_tlv(content, midr[2])
+    if opr[3] == false
+        return -1
+    return opr[0]
+
+// ldap_decode_bind_request: parses a full LDAPMessage wrapping a BindRequest.
+// Returns a dict; "ok" is false (with "error" set) on ANY malformed or
+// truncated input, or when authentication is not `simple` -- this function
+// never aborts the process on bad input.
+fn ldap_decode_bind_request(buf) -> dict
+    let result = {}
+    result["ok"] = false
+    result["message_id"] = 0
+    result["version"] = 0
+    result["dn"] = ""
+    result["dn_bytes"] = bytes_create(0)
+    result["password"] = ""
+    result["password_bytes"] = bytes_create(0)
+    result["error"] = ""
+
+    let outer = _ldap_safe_tlv(buf, 0)
+    if outer[3] == false
+        result["error"] = "malformed LDAPMessage: truncated or invalid outer TLV"
+        return result
+    if outer[0] != ldap_tag_message()
+        result["error"] = "not a SEQUENCE (outer tag 0x" + hex(outer[0]) + ")"
+        return result
+    let content = outer[1]
+
+    let midr = _ldap_safe_tlv_tag(content, 0, asn1_tag_integer())
+    if midr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged messageID (want INTEGER 0x02, got 0x" + hex(midr[0]) + ")"
+        return result
+    let message_id = _ldap_int_from_content(midr[1])
+    result["message_id"] = message_id
+
+    let opr = _ldap_safe_tlv(content, midr[2])
+    if opr[3] == false
+        result["error"] = "malformed or truncated protocolOp"
+        return result
+    if opr[0] != ldap_tag_bind_request()
+        result["error"] = "not a BindRequest (protocolOp tag 0x" + hex(opr[0]) + ")"
+        return result
+    let op_content = opr[1]
+
+    let vr = _ldap_safe_tlv_tag(op_content, 0, asn1_tag_integer())
+    if vr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged version (want INTEGER 0x02, got 0x" + hex(vr[0]) + ")"
+        return result
+    let version = _ldap_int_from_content(vr[1])
+    result["version"] = version
+
+    let nr = _ldap_safe_tlv_tag(op_content, vr[2], asn1_tag_octet_string())
+    if nr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged name/bind DN (want OCTET STRING 0x04, got 0x" + hex(nr[0]) + ")"
+        return result
+    result["dn_bytes"] = nr[1]
+    result["dn"] = bytes_to_str(nr[1])
+
+    let ar = _ldap_safe_tlv(op_content, nr[2])
+    if ar[3] == false
+        result["error"] = "malformed or truncated authentication"
+        return result
+    if ar[0] != ldap_tag_simple_auth()
+        result["error"] = "unsupported authentication choice (tag 0x" + hex(ar[0]) + "); only simple [0] is supported"
+        return result
+    result["password_bytes"] = ar[1]
+    result["password"] = bytes_to_str(ar[1])
+
+    result["ok"] = true
+    return result
+
+// ldap_decode_bind_response: parses a full LDAPMessage wrapping a
+// BindResponse (resultCode + matchedDN + diagnosticMessage).
+fn ldap_decode_bind_response(buf) -> dict
+    let result = {}
+    result["ok"] = false
+    result["message_id"] = 0
+    result["result_code"] = -1
+    result["matched_dn"] = ""
+    result["matched_dn_bytes"] = bytes_create(0)
+    result["diagnostic_message"] = ""
+    result["diagnostic_message_bytes"] = bytes_create(0)
+    result["error"] = ""
+
+    let outer = _ldap_safe_tlv(buf, 0)
+    if outer[3] == false
+        result["error"] = "malformed LDAPMessage: truncated or invalid outer TLV"
+        return result
+    if outer[0] != ldap_tag_message()
+        result["error"] = "not a SEQUENCE (outer tag 0x" + hex(outer[0]) + ")"
+        return result
+    let content = outer[1]
+
+    let midr = _ldap_safe_tlv_tag(content, 0, asn1_tag_integer())
+    if midr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged messageID (want INTEGER 0x02, got 0x" + hex(midr[0]) + ")"
+        return result
+    let message_id = _ldap_int_from_content(midr[1])
+    result["message_id"] = message_id
+
+    let opr = _ldap_safe_tlv(content, midr[2])
+    if opr[3] == false
+        result["error"] = "malformed or truncated protocolOp"
+        return result
+    if opr[0] != ldap_tag_bind_response()
+        result["error"] = "not a BindResponse (protocolOp tag 0x" + hex(opr[0]) + ")"
+        return result
+    let op_content = opr[1]
+
+    let rcr = _ldap_safe_tlv_tag(op_content, 0, ldap_tag_enumerated())
+    if rcr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged resultCode (want ENUMERATED 0x0A, got 0x" + hex(rcr[0]) + ")"
+        return result
+    let result_code = _ldap_int_from_content(rcr[1])
+    result["result_code"] = result_code
+
+    let mdr = _ldap_safe_tlv_tag(op_content, rcr[2], asn1_tag_octet_string())
+    if mdr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged matchedDN (want OCTET STRING 0x04, got 0x" + hex(mdr[0]) + ")"
+        return result
+    result["matched_dn_bytes"] = mdr[1]
+    result["matched_dn"] = bytes_to_str(mdr[1])
+
+    let dgr = _ldap_safe_tlv_tag(op_content, mdr[2], asn1_tag_octet_string())
+    if dgr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged diagnosticMessage (want OCTET STRING 0x04, got 0x" + hex(dgr[0]) + ")"
+        return result
+    result["diagnostic_message_bytes"] = dgr[1]
+    result["diagnostic_message"] = bytes_to_str(dgr[1])
+
+    result["ok"] = true
+    return result
+
+// ldap_decode_unbind_request: parses a full LDAPMessage wrapping an
+// UnbindRequest ([APPLICATION 2] NULL — must have empty content).
+fn ldap_decode_unbind_request(buf) -> dict
+    let result = {}
+    result["ok"] = false
+    result["message_id"] = 0
+    result["error"] = ""
+
+    let outer = _ldap_safe_tlv(buf, 0)
+    if outer[3] == false
+        result["error"] = "malformed LDAPMessage: truncated or invalid outer TLV"
+        return result
+    if outer[0] != ldap_tag_message()
+        result["error"] = "not a SEQUENCE (outer tag 0x" + hex(outer[0]) + ")"
+        return result
+    let content = outer[1]
+
+    let midr = _ldap_safe_tlv_tag(content, 0, asn1_tag_integer())
+    if midr[3] == false
+        result["error"] = "malformed, truncated, or wrongly-tagged messageID (want INTEGER 0x02, got 0x" + hex(midr[0]) + ")"
+        return result
+    let message_id = _ldap_int_from_content(midr[1])
+    result["message_id"] = message_id
+
+    let opr = _ldap_safe_tlv(content, midr[2])
+    if opr[3] == false
+        result["error"] = "malformed or truncated protocolOp"
+        return result
+    if opr[0] != ldap_tag_unbind_request()
+        result["error"] = "not an UnbindRequest (protocolOp tag 0x" + hex(opr[0]) + ")"
+        return result
+    if bytes_len(opr[1]) != 0
+        result["error"] = "UnbindRequest must have empty (NULL) content"
+        return result
+
+    result["ok"] = true
+    return result

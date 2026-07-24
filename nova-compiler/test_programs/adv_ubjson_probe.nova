@@ -1,0 +1,185 @@
+// Independent adversarial verification probe for std/encoding/ubjson.
+// Re-derives spec vectors from scratch and attacks edge cases NOT covered
+// (or under-covered) by the builder's own KAT.
+import std/encoding/ubjson
+import std/encoding/pack
+
+fn _hex(b) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let v = bytes_get(b, i)
+        out = out + char_at(digs, (v >> 4) & 15) + char_at(digs, v & 15)
+        i = i + 1
+    return out
+
+fn eq_s(name: string, got: string, want: string)
+    if got != want
+        print("FAIL " + name + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("ok " + name)
+
+fn eq_i(name: string, got: int, want: int)
+    if got != want
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("ok " + name)
+
+fn eq_f(name: string, got: float, want: float)
+    let d = got - want
+    if d < 0.0
+        d = 0.0 - d
+    if d > 0.0000001
+        print("FAIL " + name + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("ok " + name)
+
+fn main()
+    // ── 1. Independent re-derivation of a few spec vectors, cross-checked
+    //      against pack.nova directly (not trusting ubjson.nova's own math). ──
+    eq_s("re-derive null Z", _hex(ubjson_encode(ubjson_null())), "5a")
+    eq_s("re-derive true T", _hex(ubjson_encode(ubjson_bool(true))), "54")
+    eq_s("re-derive int 1", _hex(ubjson_encode(1)), "69" + _hex(pack_i8(1)))
+    eq_s("re-derive 255", _hex(ubjson_encode(255)), "55" + _hex(pack_u8(255)))
+    eq_s("re-derive 256", _hex(ubjson_encode(256)), "49" + _hex(pack_i16_be(256)))
+    eq_s("re-derive -2147483649", _hex(ubjson_encode(0 - 2147483649)), "4c" + _hex(pack_i64_be(0 - 2147483649)))
+
+    // ── 2. length-prefix marker selection at HIGHER boundaries than the
+    //      builder's KAT tested (only tested len=130 -> U). Test the
+    //      U->I boundary (len 255 vs 256) and I->l boundary (len 32767 vs
+    //      32768) for STRING VALUES. ──
+    let s255 = _mk_str(255)
+    let s256 = _mk_str(256)
+    eq_s("string len255 -> U length marker", _hex(bytes_slice(ubjson_encode(s255), 1, 2)), "55")
+    eq_s("string len256 -> I length marker", _hex(bytes_slice(ubjson_encode(s256), 1, 2)), "49")
+    eq_s("string len255 roundtrip", ubjson_decode(ubjson_encode(s255)), s255)
+    eq_s("string len256 roundtrip", ubjson_decode(ubjson_encode(s256)), s256)
+
+    let s32767 = _mk_str(32767)
+    let s32768 = _mk_str(32768)
+    eq_s("string len32767 -> I length marker", _hex(bytes_slice(ubjson_encode(s32767), 1, 2)), "49")
+    eq_s("string len32768 -> l length marker", _hex(bytes_slice(ubjson_encode(s32768), 1, 2)), "6c")
+    eq_s("string len32768 roundtrip", ubjson_decode(ubjson_encode(s32768)), s32768)
+
+    // ── 3. object KEY length also uses the smallest marker (not just
+    //      string VALUE length) -- builder's KAT only tested key len=1. ──
+    let bigkeyd = {}
+    let bigkey = _mk_str(200)                 // 200 -> U marker for key length
+    bigkeyd[bigkey] = 42
+    let rtbk = ubjson_decode(ubjson_encode(bigkeyd))
+    eq_i("200-char object key roundtrips", rtbk[bigkey], 42)
+
+    // ── 4. hostile: NEGATIVE length prefix on an OBJECT KEY (not just a
+    //      string value -- the builder's KAT only exercised the negative-
+    //      length clamp on a string VALUE position). ──
+    let hostilekey = bytes_create(4)
+    bytes_set(hostilekey, 0, 0x7b)            // '{'
+    bytes_set(hostilekey, 1, 0x69)            // 'i'
+    bytes_set(hostilekey, 2, 0xff)            // -1 as i8 (hostile key length)
+    bytes_set(hostilekey, 3, 0x7d)            // '}'
+    let dhostkey = ubjson_decode(hostilekey)  // must not crash/hang
+    eq_i("hostile negative object-key length clamps, terminates", len(keys(dhostkey)), 1)
+
+    // ── 5. hostile: a huge POSITIVE length claim far exceeding the actual
+    //      buffer (not clamped by the >=0 check, must rely on bytes_slice's
+    //      own bounds clamp to avoid OOB read / crash). ──
+    let hugelen = bytes_create(6)
+    bytes_set(hugelen, 0, 0x53)               // 'S'
+    bytes_set(hugelen, 1, 0x6c)               // 'l' (int32 length marker)
+    bytes_set(hugelen, 2, 0x7f)               // length = 0x7FFFFFFF (huge)
+    bytes_set(hugelen, 3, 0xff)
+    bytes_set(hugelen, 4, 0xff)
+    bytes_set(hugelen, 5, 0xff)
+    let dhuge = ubjson_decode(hugelen)        // must not crash
+    print("ok huge positive length claim did not crash (got len " + str(len(dhuge)) + ")")
+
+    // ── 6. hostile: type-confusion -- the "length" slot of a string is
+    //      itself a nested STRING marker instead of a numeric marker. This
+    //      is genuinely malformed (a real encoder never does this) but a
+    //      decoder must not crash/hang on it. ──
+    let confused = bytes_create(5)
+    bytes_set(confused, 0, 0x53)              // outer 'S'
+    bytes_set(confused, 1, 0x53)              // "length" slot holds another 'S'...
+    bytes_set(confused, 2, 0x69)              // ...whose own length is i8
+    bytes_set(confused, 3, 0x01)              // = 1
+    bytes_set(confused, 4, 0x41)              // 'A'
+    let dconf = ubjson_decode(confused)       // must not crash/hang
+    print("ok type-confused length slot did not crash (val=" + str(dconf) + ")")
+
+    // ── 7. truncated mid-key (object with a key marker but the stream ends
+    //      before the key bytes are complete) -- must terminate, not hang. ──
+    let trunckey = bytes_create(3)
+    bytes_set(trunckey, 0, 0x7b)              // '{'
+    bytes_set(trunckey, 1, 0x69)              // 'i'
+    bytes_set(trunckey, 2, 0x05)              // key length = 5, but 0 bytes follow
+    let dtk = ubjson_decode(trunckey)
+    print("ok truncated mid-key did not hang (keys=" + str(len(keys(dtk))) + ")")
+
+    // ── 8. deep nesting round trip (5 levels) ───────────────────────────
+    let l0 = [1]
+    let l1 = [l0, 2]
+    let l2 = [l1, 3]
+    let l3 = [l2, 4]
+    let l4 = [l3, 5]
+    let rtdeep = ubjson_decode(ubjson_encode(l4))
+    eq_i("deep nest level0 innermost", rtdeep[0][0][0][0][0], 1)
+    eq_i("deep nest level4 tag", rtdeep[1], 5)
+
+    // ── 9. bytes value round-trips ALL 256 byte values (0x00..0xFF) ─────
+    let allb = bytes_create(256)
+    let bi = 0
+    while bi < 256
+        bytes_set(allb, bi, bi)
+        bi = bi + 1
+    let rtall = ubjson_decode(ubjson_encode(allb))
+    eq_i("all-256-bytes roundtrip length", len(rtall), 256)
+    let bok = 1
+    let bj = 0
+    while bj < 256
+        if rtall[bj] != bj
+            bok = 0
+        bj = bj + 1
+    eq_i("all-256-bytes roundtrip values exact", bok, 1)
+
+    // ── 10. UTF-8 4-byte codepoint (emoji) round trip ────────────────────
+    eq_s("emoji utf8 roundtrip", ubjson_decode(ubjson_encode("hi 😀 bye")), "hi 😀 bye")
+
+    // ── 11. very large float64 (needs D, no float32 available range) ────
+    eq_f("float64 1e300 roundtrip", ubjson_decode(ubjson_encode(1.0e300)), 1.0e300)
+    eq_s("float64 1e300 marker is D", _hex(bytes_slice(ubjson_encode(1.0e300), 0, 1)), "44")
+
+    // ── 12. newline / control chars in an object key (injection-style) ──
+    let ctrld = {}
+    ctrld["line1\nline2\ttab"] = 7
+    let rtctrl = ubjson_decode(ubjson_encode(ctrld))
+    eq_i("control-char key roundtrips intact", rtctrl["line1\nline2\ttab"], 7)
+    eq_i("control-char key object has exactly 1 key", len(keys(rtctrl)), 1)
+
+    // ── 13. object/array marker BYTES embedded in a bytes(binary) value ──
+    let binmk = bytes_create(4)
+    bytes_set(binmk, 0, 0x7b)                 // '{'
+    bytes_set(binmk, 1, 0x7d)                 // '}'
+    bytes_set(binmk, 2, 0x5b)                 // '['
+    bytes_set(binmk, 3, 0x5d)                 // ']'
+    let rtbinmk = ubjson_decode(ubjson_encode(binmk))
+    eq_i("bytes value containing raw \{\}[] len", len(rtbinmk), 4)
+    eq_i("bytes[0]==0x7b intact", rtbinmk[0], 0x7b)
+    eq_i("bytes[3]==0x5d intact", rtbinmk[3], 0x5d)
+
+    // ── 14. empty buffer / single stray close-marker robustness ─────────
+    let stray = bytes_create(1)
+    bytes_set(stray, 0, 0x7d)                 // lone '}' with nothing else
+    let dstray = ubjson_decode(stray)
+    print("ok lone close-marker byte did not crash (val=" + str(dstray) + ")")
+
+    print("adv_ubjson_probe passed")
+
+fn _mk_str(n) -> string
+    let out = ""
+    let i = 0
+    while i < n
+        out = out + "a"
+        i = i + 1
+    out

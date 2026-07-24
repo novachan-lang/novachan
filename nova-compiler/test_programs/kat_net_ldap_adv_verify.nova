@@ -1,0 +1,191 @@
+// INDEPENDENT adversarial re-verification probe for std/net/ldap.nova's
+// per-field ASN.1 tag-confusion fix (_ldap_safe_tlv_tag).
+//
+// Deliberately does NOT reuse the shared-list FAILS[0]+=1 counter pattern
+// (unreliable propagation to module scope in NOVA). Instead, check() returns
+// 1/0 and main() threads a local `fails` variable through every call site —
+// the sound pattern documented in feedback/memory.
+//
+// Attacks fields the original fixer's kat_net_ldap.nova regression case 14
+// did NOT independently cover: version (BindRequest), matchedDN and
+// diagnosticMessage (BindResponse), and messageID on UnbindRequest — plus
+// re-derives the byte-exact BindRequest encode vector from RFC 4511 §4.2
+// independently to confirm the encode path is untouched.
+
+import std/net/ldap
+import std/encoding/asn1
+import std/encoding/hex
+
+fn check(name: string, cond: bool) -> int
+    if cond
+        print("PASS " + name)
+        return 0
+    print("FAIL " + name)
+    return 1
+
+fn bytes_from_hex(h: string) -> any
+    return hex_decode(h)
+
+// Build a syntactically well-formed LDAPMessage wrapping a BindRequest,
+// with each of {messageID, version, dn, auth} independently swappable so a
+// single field can be mis-tagged while the rest of the grammar stays valid.
+fn build_bindreq_msg(mid_tlv, version_tlv, dn_tlv, auth_tlv) -> any
+    let op_content = bytes_concat(version_tlv, dn_tlv)
+    op_content = bytes_concat(op_content, auth_tlv)
+    let op_tlv = asn1_write_tlv(ldap_tag_bind_request(), op_content)
+    let msg_content = bytes_concat(mid_tlv, op_tlv)
+    return asn1_write_tlv(asn1_tag_sequence(), msg_content)
+
+fn build_bindresp_msg(mid_tlv, rc_tlv, mdn_tlv, diag_tlv) -> any
+    let op_content = bytes_concat(rc_tlv, mdn_tlv)
+    op_content = bytes_concat(op_content, diag_tlv)
+    let op_tlv = asn1_write_tlv(ldap_tag_bind_response(), op_content)
+    let msg_content = bytes_concat(mid_tlv, op_tlv)
+    return asn1_write_tlv(asn1_tag_sequence(), msg_content)
+
+fn build_unbind_msg(mid_tlv) -> any
+    let op_tlv = asn1_write_tlv(ldap_tag_unbind_request(), bytes_create(0))
+    let msg_content = bytes_concat(mid_tlv, op_tlv)
+    return asn1_write_tlv(asn1_tag_sequence(), msg_content)
+
+fn main()
+    let fails = 0
+
+    // ── 0. Byte-exact BindRequest encode, re-derived independently from
+    // RFC 4511 §4.2 (not copy-pasted from the fixer's KAT) -- confirms the
+    // encode path was genuinely untouched by the decoder hardening.
+    // messageID=1, version=3, dn="cn=admin,dc=example,dc=com" (26 bytes),
+    // simple password "secret" (6 bytes).
+    //   name OCTET STRING: tag(1)+len(1)+26      = 28
+    //   auth [0] primitive: tag(1)+len(1)+6      = 8
+    //   version INTEGER: tag(1)+len(1)+1         = 3
+    //   BindRequest content = 3+28+8             = 39  -> len byte 0x27
+    //   BindRequest TLV = tag(1)+len(1)+39        = 41
+    //   messageID INTEGER: tag(1)+len(1)+1        = 3
+    //   outer content = 3+41                      = 44 -> len byte 0x2c
+    //   outer TLV total = tag(1)+len(1)+44        = 46
+    let bindreq = ldap_encode_bind_request(1, 3, "cn=admin,dc=example,dc=com", "secret")
+    fails = fails + check("adv_bindreq_total_len_46", bytes_len(bindreq) == 46)
+    fails = fails + check("adv_outer_tag_0x30", bytes_get(bindreq, 0) == 0x30)
+    fails = fails + check("adv_outer_len_0x2c", bytes_get(bindreq, 1) == 0x2c)
+    fails = fails + check("adv_msgid_tag_0x02", bytes_get(bindreq, 2) == 0x02)
+    fails = fails + check("adv_msgid_len_1", bytes_get(bindreq, 3) == 0x01)
+    fails = fails + check("adv_msgid_val_1", bytes_get(bindreq, 4) == 0x01)
+    fails = fails + check("adv_bindreq_app_tag_0x60", bytes_get(bindreq, 5) == 0x60)
+    fails = fails + check("adv_bindreq_len_0x27", bytes_get(bindreq, 6) == 0x27)
+    fails = fails + check("adv_version_tag_0x02", bytes_get(bindreq, 7) == 0x02)
+    fails = fails + check("adv_version_val_3", bytes_get(bindreq, 9) == 0x03)
+    fails = fails + check("adv_dn_tag_0x04", bytes_get(bindreq, 10) == 0x04)
+    fails = fails + check("adv_dn_len_0x1a", bytes_get(bindreq, 11) == 0x1a)
+    // dn bytes start at offset 12, 26 bytes long -> auth tag at 12+26=38
+    fails = fails + check("adv_auth_tag_0x80_at_38", bytes_get(bindreq, 38) == 0x80)
+    fails = fails + check("adv_auth_len_6_at_39", bytes_get(bindreq, 39) == 0x06)
+    fails = fails + check("adv_auth_password_hex", hex_encode(bytes_slice(bindreq, 40, 46)) == hex_encode(_ldap_encode_ascii_secret()))
+    // round-trips
+    let dr0 = ldap_decode_bind_request(bindreq)
+    fails = fails + check("adv_roundtrip_ok", dr0["ok"] == true)
+    fails = fails + check("adv_roundtrip_dn", dr0["dn"] == "cn=admin,dc=example,dc=com")
+    fails = fails + check("adv_roundtrip_pw", dr0["password"] == "secret")
+
+    // ── 1. version mis-tagged: OCTET STRING (0x04) instead of INTEGER (0x02).
+    // NOT covered by the fixer's own regression case 14 (which tested
+    // messageID, DN, resultCode -- but not version specifically).
+    let mid_ok = asn1_encode_integer(11)
+    let version_wrong = asn1_write_tlv(asn1_tag_octet_string(), bytes_from_hex("03"))
+    let dn_ok = asn1_encode_octet_string(bytes_from_hex(""))
+    let auth_ok = asn1_write_tlv(ldap_tag_simple_auth(), bytes_from_hex(""))
+    let version_mistag_msg = build_bindreq_msg(mid_ok, version_wrong, dn_ok, auth_ok)
+    let dver = ldap_decode_bind_request(version_mistag_msg)
+    fails = fails + check("adv_version_mistag_rejected", dver["ok"] == false)
+    fails = fails + check("adv_version_mistag_has_error", dver["error"] != "")
+
+    // control: same message but version correctly tagged -> ok=true.
+    let version_right = asn1_encode_integer(3)
+    let version_control_msg = build_bindreq_msg(mid_ok, version_right, dn_ok, auth_ok)
+    let dverok = ldap_decode_bind_request(version_control_msg)
+    fails = fails + check("adv_version_control_ok_true", dverok["ok"] == true)
+    fails = fails + check("adv_version_control_val_3", dverok["version"] == 3)
+
+    // ── 2. matchedDN mis-tagged: INTEGER (0x02) instead of OCTET STRING (0x04).
+    // NOT covered by fixer's regression case 14 (only resultCode was tested
+    // for BindResponse fields).
+    let mid_resp_ok = asn1_encode_integer(12)
+    let rc_ok = asn1_encode_integer(0)
+    bytes_set(rc_ok, 0, ldap_tag_enumerated())
+    let mdn_wrong = asn1_write_tlv(asn1_tag_integer(), bytes_from_hex("00"))
+    let diag_ok = asn1_encode_octet_string(bytes_from_hex(""))
+    let mdn_mistag_msg = build_bindresp_msg(mid_resp_ok, rc_ok, mdn_wrong, diag_ok)
+    let dmdn = ldap_decode_bind_response(mdn_mistag_msg)
+    fails = fails + check("adv_matcheddn_mistag_rejected", dmdn["ok"] == false)
+    fails = fails + check("adv_matcheddn_mistag_has_error", dmdn["error"] != "")
+
+    // ── 3. diagnosticMessage mis-tagged: INTEGER (0x02) instead of
+    // OCTET STRING (0x04). NOT covered by fixer's regression case 14.
+    let mdn_ok = asn1_encode_octet_string(bytes_from_hex(""))
+    let diag_wrong = asn1_write_tlv(asn1_tag_integer(), bytes_from_hex("00"))
+    let diag_mistag_msg = build_bindresp_msg(mid_resp_ok, rc_ok, mdn_ok, diag_wrong)
+    let ddiag = ldap_decode_bind_response(diag_mistag_msg)
+    fails = fails + check("adv_diagmsg_mistag_rejected", ddiag["ok"] == false)
+    fails = fails + check("adv_diagmsg_mistag_has_error", ddiag["error"] != "")
+
+    // control: fully correct BindResponse still ok=true.
+    let bindresp_control_msg = build_bindresp_msg(mid_resp_ok, rc_ok, mdn_ok, diag_ok)
+    let dcontrolresp = ldap_decode_bind_response(bindresp_control_msg)
+    fails = fails + check("adv_bindresp_control_ok_true", dcontrolresp["ok"] == true)
+    fails = fails + check("adv_bindresp_control_msgid_12", dcontrolresp["message_id"] == 12)
+
+    // ── 4. resultCode re-verified independently (fixer covered this, but
+    // re-derive from scratch to be sure): resultCode mis-tagged as BOOLEAN
+    // (0x01) instead of ENUMERATED (0x0A) -- a different wrong tag than the
+    // fixer's OCTET STRING case, to rule out the check being a hard-coded
+    // "reject 0x04" special case rather than a genuine expected-tag compare.
+    let rc_wrong_bool = asn1_write_tlv(asn1_tag_boolean(), bytes_from_hex("00"))
+    let rc_mistag_msg2 = build_bindresp_msg(mid_resp_ok, rc_wrong_bool, mdn_ok, diag_ok)
+    let drc2 = ldap_decode_bind_response(rc_mistag_msg2)
+    fails = fails + check("adv_resultcode_mistag_boolean_rejected", drc2["ok"] == false)
+
+    // ── 5. messageID mis-tagged on UnbindRequest specifically (fixer's
+    // regression case 14 only tested messageID mistagging on BindRequest;
+    // UnbindRequest's separate decode function has its own independent
+    // _ldap_safe_tlv_tag call site per the module -- must verify that one too).
+    let mid_wrong_unbind = asn1_write_tlv(asn1_tag_boolean(), bytes_from_hex("01"))
+    let unbind_mistag_msg = build_unbind_msg(mid_wrong_unbind)
+    let dun_mistag = ldap_decode_unbind_request(unbind_mistag_msg)
+    fails = fails + check("adv_unbind_msgid_mistag_rejected", dun_mistag["ok"] == false)
+    fails = fails + check("adv_unbind_msgid_mistag_has_error", dun_mistag["error"] != "")
+
+    // control: correctly-tagged UnbindRequest still ok=true.
+    let mid_right_unbind = asn1_encode_integer(13)
+    let unbind_control_msg = build_unbind_msg(mid_right_unbind)
+    let dun_control = ldap_decode_unbind_request(unbind_control_msg)
+    fails = fails + check("adv_unbind_control_ok_true", dun_control["ok"] == true)
+    fails = fails + check("adv_unbind_control_msgid_13", dun_control["message_id"] == 13)
+
+    // ── 6. DN mis-tagged as BOOLEAN (0x01) rather than the fixer's INTEGER
+    // (0x02) case -- again to rule out a hard-coded special-case check.
+    let dn_wrong_bool = asn1_write_tlv(asn1_tag_boolean(), bytes_from_hex("00"))
+    let dn_mistag_msg2 = build_bindreq_msg(mid_ok, version_right, dn_wrong_bool, auth_ok)
+    let ddn2 = ldap_decode_bind_request(dn_mistag_msg2)
+    fails = fails + check("adv_dn_mistag_boolean_rejected", ddn2["ok"] == false)
+
+    // ── 7. messageID mis-tagged as SEQUENCE (0x30) on BindRequest -- a
+    // constructed-vs-primitive mismatch, different from the fixer's
+    // OCTET-STRING case, to further rule out a narrow special-case fix.
+    let mid_wrong_seq = asn1_write_tlv(asn1_tag_sequence(), bytes_from_hex(""))
+    let mid_mistag_msg2 = build_bindreq_msg(mid_wrong_seq, version_right, dn_ok, auth_ok)
+    let dmid2 = ldap_decode_bind_request(mid_mistag_msg2)
+    fails = fails + check("adv_msgid_mistag_sequence_rejected", dmid2["ok"] == false)
+
+    // ── 8. Sanity: this whole probe must run to completion without the
+    // process aborting -- explicit still-alive sentinel after ~10 reject cases.
+    fails = fails + check("adv_still_alive", true)
+
+    if fails == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(fails))
+
+fn _ldap_encode_ascii_secret() -> any
+    let b = bytes_create(0)
+    b = bytes_append_str(b, "secret")
+    return b
