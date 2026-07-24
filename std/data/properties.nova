@@ -1,0 +1,377 @@
+// ============================================================================
+// NOVA Standard Library — std/data/properties
+// ============================================================================
+// Java .properties file parser and writer (java.util.Properties#load /
+// #store text format, plain-key-value form — no XML variant).
+//
+// FORMAT SUPPORTED:
+//   - Separators: 'key=value', 'key:value', and 'key value' (whitespace-only
+//     separator — the FIRST unescaped '=', ':', or run of whitespace after
+//     the key ends the key; at most one '=' or ':' is then consumed as the
+//     explicit separator, with surrounding whitespace skipped).
+//   - Comments: a line whose first non-whitespace character is '#' or '!'
+//     runs to end of line and is ignored. Comment lines are NOT eligible
+//     for continuation-joining (checked before continuation processing).
+//   - Blank lines (empty after trimming leading whitespace) are ignored.
+//   - Line continuation: a natural (physical) line ending in an ODD number
+//     of trailing backslashes continues onto the next physical line — the
+//     final backslash is the continuation marker (dropped), and the next
+//     line's LEADING whitespace (space/tab/formfeed) is trimmed before it
+//     is appended. Joining repeats until a physical line has an EVEN
+//     trailing-backslash count (0 included) or input runs out.
+//   - Escapes recognized in both key and value: \n \t \r \f \\ \= \: \(sp)
+//     and \uXXXX (exactly 4 hex digits -> one UTF-8-encoded BMP code
+//     point). Any other \X decodes to the literal character X (matches
+//     java.util.Properties, which silently drops the backslash).
+//   - Leading whitespace of the FIRST physical line of a logical line is
+//     trimmed before key parsing begins (so indented "  key=val" parses
+//     the same as "key=val"); trailing whitespace of a value is NEVER
+//     trimmed — it is significant and preserved verbatim.
+//
+// PUBLIC API:
+//   props_parse(text: string) -> dict
+//     Parse .properties text into a string->string dict. Last key wins on
+//     duplicate keys (matches java.util.Properties / LinkedHashMap#put).
+//
+//   props_write(d: dict) -> string
+//     Serialize a dict back to .properties text, one 'key=value' line per
+//     entry (LF-terminated), escaping whatever is necessary so that
+//     props_parse(props_write(d)) == d for every string key/value NovA can
+//     represent (see ESCAPING RULES below).
+//
+// ESCAPING RULES (props_write) — the minimum needed for a lossless
+// round-trip through props_parse, not a byte-for-byte mirror of any other
+// implementation's output:
+//   KEY   : \\ \n \r \t \f are backslash-escaped; every space is escaped
+//           as "\ " (any unescaped space would end the key early); '='
+//           and ':' are escaped (would truncate the key as a separator);
+//           if the key's FIRST character is '#' or '!' it is escaped so
+//           the emitted line is not mistaken for a comment on re-parse.
+//   VALUE : \\ \n \r \t \f are backslash-escaped; ONLY the value's very
+//           first character, if it is a space/tab/formfeed, is escaped
+//           (props_parse eats a run of separator whitespace immediately
+//           after the key — escaping just the first byte breaks that run
+//           so the rest of the leading run, and all interior/trailing
+//           whitespace, survives untouched; nothing else in the value
+//           needs escaping since props_parse copies the remainder of the
+//           line verbatim once past the separator).
+//   \uXXXX is never emitted by props_write — raw UTF-8 bytes for
+//   non-ASCII values round-trip fine because props_parse only treats a
+//   literal backslash specially; any byte >= 0x80 is passed through
+//   unchanged in both directions.
+//
+// KNOWN LIMITATION: a code-point-U+0000 escape (or any path that decodes to
+// byte value zero) embeds a NUL into the result string, which NOVA's
+// C-string-backed string operations (len/slice/etc. on non-fat strings)
+// may truncate at -- a pre-existing NOVA string limitation, not specific
+// to this module. Real .properties files essentially never contain that.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers — whitespace / hex ─────────────────────────────────────
+
+// _propsd_is_ws: true for space (32), tab (9), or form feed (12) — the three
+// whitespace bytes java.util.Properties treats as key/value separators.
+fn _propsd_is_ws(b) -> int
+    if b == 32 or b == 9 or b == 12
+        return 1
+    return 0
+
+// _propsd_ltrim: strip leading space/tab/formfeed from s.
+fn _propsd_ltrim(s) -> string
+    let n = len(s)
+    let i = 0
+    while i < n and _propsd_is_ws(ord(char_at(s, i))) == 1
+        i = i + 1
+    if i == 0
+        return s
+    slice(s, i, n)
+
+// _propsd_hex_val: hex digit value of char c, or -1 if not a hex digit.
+fn _propsd_hex_val(c) -> int
+    let b = ord(c)
+    if b >= 48 and b <= 57
+        return b - 48
+    if b >= 97 and b <= 102
+        return b - 97 + 10
+    if b >= 65 and b <= 70
+        return b - 65 + 10
+    -1
+
+// _propsd_cp_to_utf8: encode a Unicode code point (0..0xFFFF — the full
+// range a 4-hex-digit \uXXXX escape can express) as UTF-8 bytes packed
+// into a NOVA string via chr() (one raw byte per chr() call, matching this
+// codebase's established convention — see std/data/asn1_string.nova).
+fn _propsd_cp_to_utf8(cp) -> string
+    let c = cp
+    if c < 0
+        c = 0
+    if c <= 127
+        return chr(c)
+    if c <= 2047
+        let b0 = 192 + c / 64
+        let b1 = 128 + c % 64
+        return chr(b0) + chr(b1)
+    // 2048..65535 -> 3-byte form
+    let b0 = 224 + c / 4096
+    let b1 = 128 + (c / 64) % 64
+    let b2 = 128 + c % 64
+    chr(b0) + chr(b1) + chr(b2)
+
+// _propsd_split_lines: split text into physical lines on LF/CRLF/CR, same
+// convention as std/data/ini.nova's _ini_split_lines. Returned lines do
+// NOT include the terminator.
+fn _propsd_split_lines(text) -> list
+    let lines = []
+    let n = len(text)
+    let i = 0
+    let cur = ""
+    while i < n
+        let b = ord(char_at(text, i))
+        if b == 10
+            lines.push(cur)
+            cur = ""
+        else if b == 13
+            lines.push(cur)
+            cur = ""
+            if i + 1 < n and ord(char_at(text, i + 1)) == 10
+                i = i + 1
+        else
+            cur = cur + char_at(text, i)
+        i = i + 1
+    if len(cur) > 0
+        lines.push(cur)
+    lines
+
+// _propsd_trailing_backslashes: count consecutive '\' (92) bytes at the
+// end of s. Used to detect line continuation (odd count = continues).
+fn _propsd_trailing_backslashes(s) -> int
+    let n = len(s)
+    let i = n - 1
+    let count = 0
+    while i >= 0 and ord(char_at(s, i)) == 92
+        count = count + 1
+        i = i - 1
+    count
+
+// _propsd_decode_escape: decode ONE escape sequence in `line` whose
+// backslash is at index (pos - 1); `pos` is the index of the character
+// immediately following that backslash. Returns [decoded: string,
+// consumed: int] where `consumed` is how many characters AFTER the
+// backslash were consumed (the caller advances i by 1 + consumed).
+//
+// Boundary case: pos >= len(line) means the backslash was the very last
+// byte of the line with nothing following (can only happen for an EVEN
+// trailing-backslash tail, since odd tails are already absorbed by
+// continuation-joining) — treated defensively as a literal backslash.
+fn _propsd_decode_escape(line, pos) -> any
+    let n = len(line)
+    if pos >= n
+        return ["\\", 0]
+    let c = char_at(line, pos)
+    let b = ord(c)
+    if b == 110
+        return [chr(10), 1]
+    if b == 116
+        return [chr(9), 1]
+    if b == 114
+        return [chr(13), 1]
+    if b == 102
+        return [chr(12), 1]
+    if b == 92
+        return [chr(92), 1]
+    if b == 61
+        return ["=", 1]
+    if b == 58
+        return [":", 1]
+    if b == 32
+        return [" ", 1]
+    if b == 117
+        // \uXXXX — consume up to 4 valid hex digits (defensive: fewer is
+        // accepted rather than crashing, per NOVA edge-case policy).
+        let hex = ""
+        let j = pos + 1
+        let cnt = 0
+        while cnt < 4 and j < n and _propsd_hex_val(char_at(line, j)) >= 0
+            hex = hex + char_at(line, j)
+            j = j + 1
+            cnt = cnt + 1
+        let cp = 0
+        let hi = len(hex)
+        let hj = 0
+        while hj < hi
+            cp = cp * 16 + _propsd_hex_val(char_at(hex, hj))
+            hj = hj + 1
+        [_propsd_cp_to_utf8(cp), 1 + cnt]
+    else
+        // unrecognized escape -> literal character, backslash dropped
+        // (matches java.util.Properties behavior).
+        [c, 1]
+
+// _propsd_parse_kv: parse ONE fully-joined logical line (leading
+// whitespace of its first physical line already trimmed by the caller,
+// comment/blank already ruled out) into [key: string, value: string].
+//
+// Algorithm (mirrors java.util.Properties#loadConvert / LineReader):
+//   Phase 1 — scan the key, decoding escapes as we go; an UNESCAPED
+//             whitespace byte or an UNESCAPED '=' / ':' ends the key
+//             (the ending byte itself is NOT consumed here).
+//   Phase 2 — skip any run of whitespace immediately after the key.
+//   Phase 3 — skip at most ONE '=' or ':' separator, then skip any run
+//             of whitespace after it.
+//   Phase 4 — the rest of the line is the value, decoded for escapes;
+//             nothing is trimmed (trailing/interior whitespace in a
+//             value is significant and preserved verbatim).
+fn _propsd_parse_kv(line) -> any
+    let n = len(line)
+    let i = 0
+    let key = ""
+    let key_ended = 0
+    while i < n and key_ended == 0
+        let c = char_at(line, i)
+        let b = ord(c)
+        if b == 92
+            let dec = _propsd_decode_escape(line, i + 1)
+            key = key + dec[0]
+            i = i + 1 + dec[1]
+        else if _propsd_is_ws(b) == 1
+            key_ended = 1
+        else if b == 61 or b == 58
+            key_ended = 1
+        else
+            key = key + c
+            i = i + 1
+    // Phase 2: skip whitespace after the key.
+    while i < n and _propsd_is_ws(ord(char_at(line, i))) == 1
+        i = i + 1
+    // Phase 3: skip one explicit separator, then whitespace after it.
+    if i < n
+        let sb = ord(char_at(line, i))
+        if sb == 61 or sb == 58
+            i = i + 1
+            while i < n and _propsd_is_ws(ord(char_at(line, i))) == 1
+                i = i + 1
+    // Phase 4: the remainder is the value, with escapes decoded.
+    let val = ""
+    while i < n
+        let c = char_at(line, i)
+        let b = ord(c)
+        if b == 92
+            let dec = _propsd_decode_escape(line, i + 1)
+            val = val + dec[0]
+            i = i + 1 + dec[1]
+        else
+            val = val + c
+            i = i + 1
+    [key, val]
+
+// ── Public API ───────────────────────────────────────────────────────────
+
+// props_parse: parse Java .properties text into a string->string dict.
+fn props_parse(text) -> dict
+    let result = {}
+    let phys = _propsd_split_lines(text)
+    let n = len(phys)
+    let i = 0
+    while i < n
+        let raw = phys[i]
+        i = i + 1
+        let trimmed = _propsd_ltrim(raw)
+        if len(trimmed) == 0
+            // blank line -> skip
+        else
+            let fc = ord(char_at(trimmed, 0))
+            if fc == 35 or fc == 33
+                // '#' or '!' -> comment line, skip (never continuation-joined)
+            else
+                // begin a logical line — join continuations
+                let cur = trimmed
+                let tb = _propsd_trailing_backslashes(cur)
+                while tb % 2 == 1 and i < n
+                    cur = slice(cur, 0, len(cur) - 1)
+                    let nxt = _propsd_ltrim(phys[i])
+                    i = i + 1
+                    cur = cur + nxt
+                    tb = _propsd_trailing_backslashes(cur)
+                let kv = _propsd_parse_kv(cur)
+                result[kv[0]] = kv[1]
+    result
+
+// _propsw_escape_value: escape a value string for lossless round-tripping
+// through props_parse — see ESCAPING RULES in the module header.
+fn _propsw_escape_value(v) -> string
+    let n = len(v)
+    let out = ""
+    let i = 0
+    while i < n
+        let b = ord(char_at(v, i))
+        if i == 0 and _propsd_is_ws(b) == 1
+            if b == 32
+                out = out + "\\ "
+            else if b == 9
+                out = out + "\\t"
+            else
+                out = out + "\\f"
+        else if b == 92
+            out = out + "\\\\"
+        else if b == 10
+            out = out + "\\n"
+        else if b == 13
+            out = out + "\\r"
+        else if b == 9
+            out = out + "\\t"
+        else if b == 12
+            out = out + "\\f"
+        else
+            out = out + char_at(v, i)
+        i = i + 1
+    out
+
+// _propsw_escape_key: escape a key string for lossless round-tripping
+// through props_parse — see ESCAPING RULES in the module header.
+fn _propsw_escape_key(k) -> string
+    let n = len(k)
+    let out = ""
+    let i = 0
+    while i < n
+        let b = ord(char_at(k, i))
+        if i == 0 and (b == 35 or b == 33)
+            out = out + "\\" + char_at(k, i)
+        else if b == 92
+            out = out + "\\\\"
+        else if b == 32
+            out = out + "\\ "
+        else if b == 61
+            out = out + "\\="
+        else if b == 58
+            out = out + "\\:"
+        else if b == 10
+            out = out + "\\n"
+        else if b == 13
+            out = out + "\\r"
+        else if b == 9
+            out = out + "\\t"
+        else if b == 12
+            out = out + "\\f"
+        else
+            out = out + char_at(k, i)
+        i = i + 1
+    out
+
+// props_write: serialize a string->string dict into .properties text —
+// one "key=value\n" line per entry. props_parse(props_write(d)) == d for
+// every key/value NOVA strings can hold (modulo the documented U+0000
+// limitation).
+fn props_write(d) -> string
+    let out = ""
+    let nl = chr(10)
+    let ks = keys(d)
+    let n = len(ks)
+    let i = 0
+    while i < n
+        let k = ks[i]
+        let v = d[k]
+        out = out + _propsw_escape_key(k) + "=" + _propsw_escape_value(v) + nl
+        i = i + 1
+    out

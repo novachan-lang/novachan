@@ -1,0 +1,393 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/protobuf
+// ============================================================================
+// Protocol Buffers (proto3) wire-format codec.
+//
+// This module implements the CORE WIRE FORMAT that every .proto message
+// ultimately compiles down to — it does not parse .proto schemas or generate
+// message structs. Given a field number + wire type + payload, it produces
+// exactly the bytes protoc would produce, and can parse them back.
+//
+// WIRE FORMAT (from the protobuf spec, developers.google.com/protocol-buffers
+// /docs/encoding):
+//
+//   Every field on the wire is:  tag (varint) + payload
+//   tag = (field_number << 3) | wire_type
+//
+//   Wire types:
+//     0  VARINT   int32, int64, uint32, uint64, sint32, sint64, bool, enum
+//     1  I64      fixed64, sfixed64, double                     (8 raw bytes, LE)
+//     2  LEN      string, bytes, embedded message, packed repeated (length-prefixed)
+//     5  I32      fixed32, sfixed32, float                      (4 raw bytes, LE)
+//
+// VARINT (base-128, LSB group first, MSB-continuation-bit per byte) and
+// ZIGZAG (signed <-> unsigned remapping so small negatives stay small) are
+// NOT reimplemented here — they already exist and are reused directly:
+//   std/encoding/varint  -> vi_encode / vi_decode   (unsigned LEB128)
+//   std/bits/zigzag      -> zz_encode / zz_decode   (sint32/sint64 mapping)
+// This module is the protobuf-specific layer ON TOP of those primitives:
+// tags, wire types, field framing, and fixed-width little-endian ints.
+//
+// PUBLIC API
+//   Wire-type constants (zero-arg functions — NOVA's module system only
+//   exports `fn`, not top-level `let`, across an import boundary, so these
+//   are functions rather than bare constants):
+//     pb_wire_varint() = 0   pb_wire_i64() = 1   pb_wire_len() = 2   pb_wire_i32() = 5
+//
+//   Tag:
+//     pb_make_tag(num, wiretype)      -> int    (num<<3)|wiretype
+//     pb_encode_tag(num, wiretype)    -> bytes  varint-encoded tag
+//     pb_read_tag(buf, pos)           -> list   [field_num, wiretype, next_pos]
+//
+//   Generic field framing (the spec-required primitive):
+//     pb_encode_field(num, wiretype, payload: bytes) -> bytes
+//       VARINT/I64/I32: emits tag + payload AS-IS (payload is already the
+//                       correctly-shaped content: varint bytes, or exactly
+//                       8/4 raw bytes).
+//       LEN:            emits tag + varint(len(payload)) + payload — the
+//                       length prefix is computed automatically, matching
+//                       how every LEN-typed field is framed on the wire.
+//
+//   Raw decode primitives (spec-required):
+//     pb_read_varint(buf, pos)        -> list  [value, next_pos]  (alias of vi_decode)
+//     pb_read_len_delim(buf, pos)     -> list  [payload_bytes, next_pos]
+//
+//   Typed field convenience (encode+decode), each a thin wrapper over the
+//   primitives above so there is exactly ONE place that owns wire framing:
+//     pb_encode_varint_field(num, n)      / pb_decode_varint_field(buf,pos)   -- uint32/uint64/bool/enum, n>=0
+//     pb_encode_sint_field(num, n)        / pb_decode_sint_field(buf,pos)     -- sint32/sint64 (zigzag), any n
+//     pb_encode_int_field(num, n)         / pb_decode_int_field(buf,pos)      -- int32/int64 (raw two's-complement), any n
+//     pb_encode_bytes_field(num, b)       / pb_decode_bytes_field(buf,pos)    -- bytes (binary-safe)
+//     pb_encode_string_field(num, s)      / pb_decode_string_field(buf,pos)   -- string (UTF-8/ASCII)
+//     pb_encode_fixed32_field(num, n)     / pb_decode_fixed32_field(buf,pos)  -- fixed32 (unsigned), little-endian
+//                                          / pb_decode_sfixed32_field(buf,pos) -- sfixed32 (signed), same wire bytes
+//     pb_encode_fixed64_field(num, n)     / pb_decode_fixed64_field(buf,pos)  -- fixed64/sfixed64, little-endian
+//                                             (64-bit needs no separate signed variant: it exactly fills a NOVA
+//                                             int64, so the raw reassembled bit pattern IS the correct sfixed64
+//                                             value already — see pb_decode_fixed64_field's own note)
+//
+// THE int32/int64 NEGATIVE-VARINT QUIRK
+//   proto3's plain `int32`/`int64` (NOT sint32/sint64) encode negative values
+//   by sign-extending to a full 64-bit two's-complement pattern and emitting
+//   THAT as an unsigned base-128 varint — which is always exactly 10 bytes
+//   (e.g. int64 -1 = FF FF FF FF FF FF FF FF FF 01). vi_encode cannot do this
+//   (it only accepts n>=0). We implement the 64-bit case directly using
+//   NOVA's arithmetic (sign-extending) `>>`, masking off the sign-extended
+//   bits after each shift to emulate a LOGICAL right shift on the fixed
+//   64-bit pattern — see _pb_logical_shr64. This is the standard trick for
+//   emulating unsigned shift with only a signed shift operator.
+//   DECODE side needs no special casing: vi_decode already reconstructs the
+//   full 64-bit two's-complement bit pattern via OR + left-shift (including
+//   1<<63 for the final bit, which NOVA's shift handles correctly per
+//   reference_nova_shift64_broken — only 1<<64 itself is broken, 1..63 are
+//   fine), so a plain vi_decode/pb_read_varint already returns the correct
+//   signed NOVA int for negative int32/int64 fields.
+//
+// BINARY SAFETY
+//   All payload/field APIs operate on the `bytes` type end-to-end. String
+//   fields go through str_to_bytes/bytes_to_str at the boundary; embedded
+//   NUL bytes inside a `bytes` field are never touched by C-string logic.
+//
+// DEFENSIVE DECODING
+//   pb_read_len_delim clamps the declared length to what is actually present
+//   in the buffer (never reads out of bounds, never produces a negative
+//   remaining length) — a truncated/malformed length prefix degrades to a
+//   truncated payload instead of an out-of-bounds read.
+//
+// SYMBOL COLLISION GUARD: all private helpers are prefixed _pb_.
+//
+// Depends on: std/encoding/varint (vi_encode/vi_decode), std/bits/zigzag
+// (zz_encode/zz_decode). No other dependencies.
+// ============================================================================
+
+import std/encoding/varint
+import std/bits/zigzag
+
+// ── Wire-type constants ──────────────────────────────────────────────────────
+
+// Wire-type constants, as zero-arg functions (see PUBLIC API note above for
+// why: cross-module import only exports `fn`, top-level `let` stays private
+// to its defining module).
+fn pb_wire_varint() -> int
+    0
+
+fn pb_wire_i64() -> int
+    1
+
+fn pb_wire_len() -> int
+    2
+
+fn pb_wire_i32() -> int
+    5
+
+// ── Tag helpers ───────────────────────────────────────────────────────────────
+
+// pb_make_tag: combine a field number and wire type into the raw tag integer.
+//   tag = (field_number << 3) | wire_type
+// Example: pb_make_tag(1, pb_wire_len()) == 0x0A (field 1, wire type 2).
+fn pb_make_tag(num: int, wiretype: int) -> int
+    (num << 3) | (wiretype & 7)
+
+// pb_encode_tag: varint-encode the tag for (num, wiretype).
+fn pb_encode_tag(num: int, wiretype: int) -> any
+    vi_encode(pb_make_tag(num, wiretype))
+
+// pb_read_tag: decode a tag varint at `pos`. Returns [field_num, wiretype, next_pos].
+// Safe on a truncated buffer: vi_decode returns [0,pos] unread, so this
+// returns [0, 0, pos] rather than crashing.
+fn pb_read_tag(buf: any, pos: int) -> list
+    let r = vi_decode(buf, pos)
+    let t = r[0]
+    let num = t >> 3
+    let wt = t & 7
+    [num, wt, r[1]]
+
+// ── Generic field framing (the spec-required primitive) ─────────────────────
+
+// pb_encode_field: emit tag(num, wiretype) followed by `payload`, framing it
+// correctly for the wire type.
+//   VARINT (0) / I64 (1) / I32 (5): payload is emitted verbatim — it must
+//     already be shaped correctly (a varint's bytes, or exactly 8/4 raw
+//     little-endian bytes) by the caller.
+//   LEN (2): a varint length prefix (len(payload)) is inserted automatically
+//     before the payload — this is what makes a field "length-delimited".
+//
+// Example (matches the protobuf spec's own worked example):
+//   pb_encode_field(2, pb_wire_len(), str_to_bytes("testing"))
+//     -> bytes [0x12, 0x07, 't','e','s','t','i','n','g']
+fn pb_encode_field(num: int, wiretype: int, payload: any) -> any
+    let out = pb_encode_tag(num, wiretype)
+    if wiretype == pb_wire_len()
+        out = bytes_concat(out, vi_encode(bytes_len(payload)))
+    out = bytes_concat(out, payload)
+    out
+
+// ── Raw decode primitives (spec-required) ────────────────────────────────────
+
+// pb_read_varint: decode an unsigned/raw varint at `pos`. Returns [value, next_pos].
+// Thin alias over vi_decode — kept as a named protobuf-layer entry point so
+// callers of THIS module never need to know about std/encoding/varint.
+fn pb_read_varint(buf: any, pos: int) -> list
+    vi_decode(buf, pos)
+
+// pb_read_len_delim: decode a length-delimited (LEN, wire type 2) field body
+// at `pos` (pos points at the length varint, NOT at the tag).
+// Returns [payload_bytes, next_pos].
+//
+// Defensive: the declared length is clamped to [0, bytes_len(buf) - data_start]
+// so a corrupt/truncated length prefix can never read past the buffer end or
+// produce a negative slice width.
+fn pb_read_len_delim(buf: any, pos: int) -> list
+    let lr = vi_decode(buf, pos)
+    let declared_len = lr[0]
+    let data_start = lr[1]
+    let total = bytes_len(buf)
+    let avail = total - data_start
+    if avail < 0
+        avail = 0
+    let take = declared_len
+    if take < 0
+        take = 0
+    if take > avail
+        take = avail
+    let payload = bytes_slice(buf, data_start, data_start + take)
+    [payload, data_start + take]
+
+// ── VARINT-typed fields: uint32/uint64/bool/enum (n must be >= 0) ───────────
+
+// pb_encode_varint_field: encode field `num` as an unsigned VARINT of `n`.
+// Precondition: n >= 0 (uint32/uint64/bool/enum semantics).
+fn pb_encode_varint_field(num: int, n: int) -> any
+    pb_encode_field(num, pb_wire_varint(), vi_encode(n))
+
+// pb_decode_varint_field: read tag+value at `pos` (pos points at the TAG).
+// Returns [field_num, value, next_pos]. Caller should have already verified
+// wire type == pb_wire_varint() via pb_read_tag if parsing a mixed message.
+fn pb_decode_varint_field(buf: any, pos: int) -> list
+    let tg = pb_read_tag(buf, pos)
+    let vr = vi_decode(buf, tg[2])
+    [tg[0], vr[0], vr[1]]
+
+// ── sint32/sint64: zigzag-mapped signed VARINT ───────────────────────────────
+
+// pb_encode_sint_field: encode field `num` as a zigzag-mapped signed VARINT.
+// Small negative values (e.g. -1) stay small on the wire (1 byte), unlike
+// plain int32/int64 which balloon negative values to 10 bytes.
+fn pb_encode_sint_field(num: int, n: int) -> any
+    pb_encode_field(num, pb_wire_varint(), vi_encode(zz_encode(n)))
+
+// pb_decode_sint_field: read tag + zigzag-decoded value at `pos`.
+// Returns [field_num, value, next_pos].
+fn pb_decode_sint_field(buf: any, pos: int) -> list
+    let tg = pb_read_tag(buf, pos)
+    let vr = vi_decode(buf, tg[2])
+    [tg[0], zz_decode(vr[0]), vr[1]]
+
+// ── int32/int64: raw (non-zigzag) signed VARINT ──────────────────────────────
+// See module header "THE int32/int64 NEGATIVE-VARINT QUIRK" for why negative
+// values need a dedicated 10-byte encoder instead of reusing vi_encode.
+
+// _pb_logical_shr64: emulate an UNSIGNED (zero-fill) 64-bit right shift of a
+// full 64-bit two's-complement value `n` by `k` bits (1 <= k <= 63), using
+// only NOVA's arithmetic (sign-extending) `>>`.
+//
+// NOVA's `>>` sign-extends, so shifting a negative n right fills the top k
+// bits with 1s instead of 0s. We correct this by masking to the (64-k) bits
+// that ARE meaningful after a true logical shift — the top k bits (which
+// arithmetic shift incorrectly set to 1) are cleared by the mask, and the
+// remaining (64-k) bits are bit-identical between logical and arithmetic
+// shift (both just move bits right). (1 << (64-k)) is always well-formed
+// here since 1 <= 64-k <= 63, avoiding the documented 1<<64 hazard.
+fn _pb_logical_shr64(n: int, k: int) -> int
+    let shifted = n >> k
+    let keep_bits = 64 - k
+    let mask = (1 << keep_bits) - 1
+    shifted & mask
+
+// _pb_encode_varint64_neg: encode a NEGATIVE int64 `n` as the canonical
+// protobuf 10-byte raw varint (its full 64-bit two's-complement pattern,
+// base-128 LSB-group-first). Byte 10 (the final group) always holds exactly
+// bit 63 of the pattern, which is 1 for every negative n — so it is always
+// the literal byte 0x01 with no continuation bit.
+fn _pb_encode_varint64_neg(n: int) -> any
+    let out = bytes(0)
+    out = bytes_append(out, (n & 0x7F) | 0x80)
+    let i = 1
+    while i < 9
+        let grp = _pb_logical_shr64(n, 7 * i)
+        out = bytes_append(out, (grp & 0x7F) | 0x80)
+        i = i + 1
+    out = bytes_append(out, 1)
+    out
+
+// pb_encode_int_field: encode field `num` as a raw (non-zigzag) VARINT of
+// `n` — proto3 `int32`/`int64` semantics. Non-negative values are identical
+// to pb_encode_varint_field; negative values expand to the spec-mandated
+// 10-byte two's-complement varint.
+fn pb_encode_int_field(num: int, n: int) -> any
+    let body = bytes(0)
+    if n >= 0
+        body = vi_encode(n)
+    else
+        body = _pb_encode_varint64_neg(n)
+    pb_encode_field(num, pb_wire_varint(), body)
+
+// pb_decode_int_field: read tag + raw-varint value at `pos`. Returns
+// [field_num, value, next_pos]. No zigzag applied — vi_decode already
+// reconstructs the correct signed 64-bit value for a 10-byte negative
+// encoding via its own left-shifts (including the 1<<63 final bit).
+fn pb_decode_int_field(buf: any, pos: int) -> list
+    let tg = pb_read_tag(buf, pos)
+    let vr = vi_decode(buf, tg[2])
+    [tg[0], vr[0], vr[1]]
+
+// ── LEN-typed fields: bytes / string ─────────────────────────────────────────
+
+// pb_encode_bytes_field: encode field `num` as a length-delimited `bytes` value.
+// Binary-safe — embedded 0x00 bytes pass through untouched.
+fn pb_encode_bytes_field(num: int, b: any) -> any
+    pb_encode_field(num, pb_wire_len(), b)
+
+// pb_decode_bytes_field: read tag + length-delimited bytes at `pos`.
+// Returns [field_num, bytes_value, next_pos].
+fn pb_decode_bytes_field(buf: any, pos: int) -> list
+    let tg = pb_read_tag(buf, pos)
+    let lr = pb_read_len_delim(buf, tg[2])
+    [tg[0], lr[0], lr[1]]
+
+// pb_encode_string_field: encode field `num` as a length-delimited string.
+// NOT binary-safe by construction (goes through str_to_bytes) — use
+// pb_encode_bytes_field for arbitrary binary payloads.
+fn pb_encode_string_field(num: int, s: string) -> any
+    pb_encode_field(num, pb_wire_len(), str_to_bytes(s))
+
+// pb_decode_string_field: read tag + length-delimited string at `pos`.
+// Returns [field_num, string_value, next_pos].
+fn pb_decode_string_field(buf: any, pos: int) -> list
+    let tg = pb_read_tag(buf, pos)
+    let lr = pb_read_len_delim(buf, tg[2])
+    [tg[0], bytes_to_str(lr[0]), lr[1]]
+
+// ── I32-typed fields: fixed32 / sfixed32 (4 raw little-endian bytes) ────────
+
+// pb_encode_fixed32_field: encode field `num` as 4 raw little-endian bytes
+// of the low 32 bits of `n`. Works unchanged for BOTH fixed32 (unsigned) and
+// sfixed32 (signed) — only the low 32 bits of n's two's-complement pattern
+// are ever serialized, which is bit-for-bit the correct wire representation
+// either way; the two field types differ only in how the DECODER reinterprets
+// those same 4 bytes (see pb_decode_fixed32_field vs pb_decode_sfixed32_field).
+fn pb_encode_fixed32_field(num: int, n: int) -> any
+    let body = bytes(0)
+    body = bytes_append(body, n & 0xFF)
+    body = bytes_append(body, (n >> 8) & 0xFF)
+    body = bytes_append(body, (n >> 16) & 0xFF)
+    body = bytes_append(body, (n >> 24) & 0xFF)
+    pb_encode_field(num, pb_wire_i32(), body)
+
+// pb_decode_fixed32_field: read tag + 4 little-endian bytes at `pos`,
+// reassembled as an UNSIGNED value in [0, 2^32-1] — the `fixed32` field-type
+// interpretation. For `sfixed32` (signed) use pb_decode_sfixed32_field.
+// Returns [field_num, value, next_pos]. Safe on a truncated buffer: missing
+// trailing bytes read as 0 rather than indexing out of bounds.
+fn pb_decode_fixed32_field(buf: any, pos: int) -> list
+    let tg = pb_read_tag(buf, pos)
+    let start = tg[2]
+    let total = bytes_len(buf)
+    let b0 = 0
+    let b1 = 0
+    let b2 = 0
+    let b3 = 0
+    if start + 0 < total
+        b0 = bytes_get(buf, start + 0) & 0xFF
+    if start + 1 < total
+        b1 = bytes_get(buf, start + 1) & 0xFF
+    if start + 2 < total
+        b2 = bytes_get(buf, start + 2) & 0xFF
+    if start + 3 < total
+        b3 = bytes_get(buf, start + 3) & 0xFF
+    let value = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    [tg[0], value, start + 4]
+
+// pb_decode_sfixed32_field: read tag + 4 little-endian bytes at `pos`,
+// reassembled as a SIGNED value in [-2^31, 2^31-1] — the `sfixed32` field-type
+// interpretation. Same wire bytes as pb_decode_fixed32_field, reinterpreted
+// via zz_sign_extend (std/bits/zigzag) so bit 31 correctly becomes the sign
+// bit of the resulting NOVA int64.
+// Returns [field_num, value, next_pos].
+fn pb_decode_sfixed32_field(buf: any, pos: int) -> list
+    let raw = pb_decode_fixed32_field(buf, pos)
+    [raw[0], zz_sign_extend(raw[1], 32), raw[2]]
+
+// ── I64-typed fields: fixed64 / sfixed64 (8 raw little-endian bytes) ────────
+
+// pb_encode_fixed64_field: encode field `num` as 8 raw little-endian bytes of `n`.
+fn pb_encode_fixed64_field(num: int, n: int) -> any
+    let body = bytes(0)
+    body = bytes_append(body, n & 0xFF)
+    body = bytes_append(body, (n >> 8) & 0xFF)
+    body = bytes_append(body, (n >> 16) & 0xFF)
+    body = bytes_append(body, (n >> 24) & 0xFF)
+    body = bytes_append(body, (n >> 32) & 0xFF)
+    body = bytes_append(body, (n >> 40) & 0xFF)
+    body = bytes_append(body, (n >> 48) & 0xFF)
+    body = bytes_append(body, (n >> 56) & 0xFF)
+    pb_encode_field(num, pb_wire_i64(), body)
+
+// pb_decode_fixed64_field: read tag + 8 little-endian bytes at `pos`.
+// Returns [field_num, value, next_pos]. Safe on a truncated buffer (missing
+// trailing bytes read as 0). The final OR of byte7<<56 can legitimately set
+// the sign bit of the result (matches sfixed64 / raw fixed64 reinterpreted
+// as NOVA's signed int64), which is correct two's-complement behaviour, not
+// an overflow bug.
+fn pb_decode_fixed64_field(buf: any, pos: int) -> list
+    let tg = pb_read_tag(buf, pos)
+    let start = tg[2]
+    let total = bytes_len(buf)
+    let value = 0
+    let i = 0
+    while i < 8
+        if start + i < total
+            let bv = bytes_get(buf, start + i) & 0xFF
+            value = value | (bv << (8 * i))
+        i = i + 1
+    [tg[0], value, start + 8]

@@ -1,0 +1,348 @@
+// ============================================================================
+// NOVA Standard Library — std/net/http2
+// ============================================================================
+// HTTP/2 (RFC 7540) frame layer + minimal HPACK (RFC 7541) integer/static-table
+// codec. Wire-exact, byte-oriented (uses `bytes`, never `string`, for frame
+// payloads — binary safety for arbitrary header/data content).
+//
+// FRAME HEADER (RFC 7540 §4.1) — 9 octets, all multi-byte fields big-endian:
+//   Bytes 0-2 : Length   (24-bit unsigned) — length of the frame payload
+//   Byte  3   : Type     (8-bit)  — frame type (see FRAME TYPES below)
+//   Byte  4   : Flags    (8-bit)  — type-specific flags
+//   Bytes 5-8 : R(1) + Stream Identifier (31-bit) — R is reserved, must be 0
+//               on send and MUST be ignored on receipt (RFC 7540 §4.1).
+//
+// FRAME TYPES (RFC 7540 §11.2 registry):
+//   DATA=0, HEADERS=1, PRIORITY=2, RST_STREAM=3, SETTINGS=4, PUSH_PROMISE=5,
+//   PING=6, GOAWAY=7, WINDOW_UPDATE=8, CONTINUATION=9
+//
+// CONNECTION PREFACE (RFC 7540 §3.5):
+//   The client sends a fixed 24-octet sequence before any frames, to which
+//   the server MAY respond with a SETTINGS frame:
+//     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+//
+// HPACK (RFC 7541):
+//   §5.1 Integer representation with an N-bit prefix (used for indices,
+//   string lengths, table-size updates, etc.)
+//   Appendix A: the 61-entry static table shared by every HTTP/2 endpoint.
+//
+// PUBLIC API:
+//   h2_preface() -> bytes
+//     The 24-byte client connection preface (constant, RFC 7540 §3.5).
+//
+//   h2_preface_check(b: bytes) -> bool
+//     True iff b starts with exactly the connection preface bytes.
+//
+//   h2_frame_header_encode(length: int, ftype: int, flags: int, stream_id: int) -> bytes
+//     Encode a 9-byte frame header. length clamped to 24 bits, stream_id
+//     clamped to 31 bits (reserved bit forced to 0) — both via masking so
+//     out-of-range input never corrupts adjacent fields.
+//
+//   h2_frame_header_decode(b: bytes, pos: int) -> list
+//     Decode a 9-byte frame header from b at pos.
+//     Returns [{"length","type","flags","reserved","stream_id"}, pos+9].
+//     Returns [{}, pos] if fewer than 9 bytes remain (bounds-safe, pos<0 too).
+//
+//   h2_frame_type_name(num: int) -> string / h2_frame_type_num(name: string) -> int
+//     Frame-type mnemonic <-> number. "" / -1 on unknown.
+//
+//   h2_hpack_int_encode(value: int, prefix_bits: int) -> bytes
+//     RFC 7541 §5.1 integer representation. prefix_bits in 1..8. The leading
+//     (8 - prefix_bits) bits of the first byte are always 0 — callers that
+//     need to OR in representation-type flag bits do so on the returned
+//     first byte (bytes_set(out, 0, bytes_get(out,0) | flag_bits)).
+//     value must be >= 0 (negative clamped to 0 defensively).
+//
+//   h2_hpack_int_decode(b: bytes, pos: int, prefix_bits: int) -> list
+//     Inverse of h2_hpack_int_encode. Masks the first byte to prefix_bits
+//     (ignoring any representation-type flag bits set above the prefix), so
+//     it works directly on real header-block-fragment bytes.
+//     Returns [value, next_pos]. Returns [-1, pos] on truncation/overflow
+//     (bounds-safe: pos<0, pos>=len, and a hard cap on continuation bytes to
+//     reject unbounded/malicious varints).
+//
+//   h2_static_name(index: int) -> string
+//   h2_static_value(index: int) -> string
+//     RFC 7541 Appendix A static table (1-based index, 1..61).
+//     Returns "" for index out of range [1,61].
+//
+//   h2_static_lookup(name: string, value: string) -> int
+//     Full match (name AND value equal) -> that 1-based index.
+//     Name-only match (any entry with that name) -> that index, negated
+//     (caller sends the value literally). 0 if the name isn't in the table.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Connection preface ──────────────────────────────────────────────────────
+
+// h2_preface: the fixed 24-byte HTTP/2 client connection preface.
+fn h2_preface() -> bytes
+    let cr = chr(13)
+    let lf = chr(10)
+    let s = "PRI * HTTP/2.0" + cr + lf + cr + lf + "SM" + cr + lf + cr + lf
+    str_to_bytes(s)
+
+// h2_preface_check: true iff b starts with the exact connection-preface bytes.
+// Bounds-safe: b shorter than 24 bytes -> false (never reads out of range).
+fn h2_preface_check(b: bytes) -> bool
+    let want = h2_preface()
+    let wlen = bytes_len(want)
+    if bytes_len(b) < wlen
+        return false
+    let i = 0
+    let ok = true
+    while i < wlen
+        if bytes_get(b, i) != bytes_get(want, i)
+            ok = false
+        i = i + 1
+    ok
+
+// ── Frame header (RFC 7540 §4.1) ────────────────────────────────────────────
+
+// h2_frame_header_encode: build the 9-byte frame header.
+// length is masked to 24 bits; stream_id is masked to 31 bits (the reserved
+// bit is always sent as 0, per RFC 7540 §4.1).
+fn h2_frame_header_encode(length: int, ftype: int, flags: int, stream_id: int) -> bytes
+    let out = bytes(0)
+    let len_c = length & 0xFFFFFF
+    out = bytes_append(out, (len_c >> 16) & 0xFF)
+    out = bytes_append(out, (len_c >> 8) & 0xFF)
+    out = bytes_append(out, len_c & 0xFF)
+    out = bytes_append(out, ftype & 0xFF)
+    out = bytes_append(out, flags & 0xFF)
+    let sid = stream_id & 0x7FFFFFFF
+    out = bytes_append(out, (sid >> 24) & 0xFF)
+    out = bytes_append(out, (sid >> 16) & 0xFF)
+    out = bytes_append(out, (sid >> 8) & 0xFF)
+    out = bytes_append(out, sid & 0xFF)
+    out
+
+// h2_frame_header_decode: decode a 9-byte frame header from b at pos.
+// Returns [{"length","type","flags","reserved","stream_id"}, pos+9] on
+// success, or [{}, pos] if pos is negative or fewer than 9 bytes remain.
+fn h2_frame_header_decode(b: bytes, pos: int) -> list
+    if pos < 0 or pos + 9 > bytes_len(b)
+        return [{}, pos]
+    let length = (bytes_get(b, pos) << 16) | (bytes_get(b, pos + 1) << 8) | bytes_get(b, pos + 2)
+    let ftype = bytes_get(b, pos + 3)
+    let flags = bytes_get(b, pos + 4)
+    let b5 = bytes_get(b, pos + 5)
+    let reserved = (b5 >> 7) & 1
+    let stream_id = ((b5 & 0x7F) << 24) | (bytes_get(b, pos + 6) << 16) | (bytes_get(b, pos + 7) << 8) | bytes_get(b, pos + 8)
+    let hdr = {"length": length & 0xFFFFFF, "type": ftype & 0xFF, "flags": flags & 0xFF, "reserved": reserved, "stream_id": stream_id}
+    [hdr, pos + 9]
+
+// h2_frame_type_name: frame-type number -> mnemonic (RFC 7540 §11.2). "" if unknown.
+fn h2_frame_type_name(num: int) -> string
+    if num == 0 then return "DATA"
+    if num == 1 then return "HEADERS"
+    if num == 2 then return "PRIORITY"
+    if num == 3 then return "RST_STREAM"
+    if num == 4 then return "SETTINGS"
+    if num == 5 then return "PUSH_PROMISE"
+    if num == 6 then return "PING"
+    if num == 7 then return "GOAWAY"
+    if num == 8 then return "WINDOW_UPDATE"
+    if num == 9 then return "CONTINUATION"
+    return ""
+
+// h2_frame_type_num: frame-type mnemonic -> number. -1 if unknown.
+fn h2_frame_type_num(name: string) -> int
+    if name == "DATA" then return 0
+    if name == "HEADERS" then return 1
+    if name == "PRIORITY" then return 2
+    if name == "RST_STREAM" then return 3
+    if name == "SETTINGS" then return 4
+    if name == "PUSH_PROMISE" then return 5
+    if name == "PING" then return 6
+    if name == "GOAWAY" then return 7
+    if name == "WINDOW_UPDATE" then return 8
+    if name == "CONTINUATION" then return 9
+    return -1
+
+// ── HPACK integer representation (RFC 7541 §5.1) ────────────────────────────
+
+// h2_hpack_int_encode: RFC 7541 §5.1 integer encoding with an N-bit prefix.
+// prefix_bits clamped to [1,8]; value clamped to >=0 defensively.
+// The returned first byte always has its top (8-prefix_bits) bits clear —
+// callers needing representation-type flag bits OR them in separately.
+fn h2_hpack_int_encode(value: int, prefix_bits: int) -> bytes
+    let pb = prefix_bits
+    if pb < 1
+        pb = 1
+    if pb > 8
+        pb = 8
+    let v0 = value
+    if v0 < 0
+        v0 = 0
+    let max_prefix = (1 << pb) - 1
+    let out = bytes(0)
+    if v0 < max_prefix
+        out = bytes_append(out, v0 & 0xFF)
+        return out
+    out = bytes_append(out, max_prefix & 0xFF)
+    let v = v0 - max_prefix
+    let done = 0
+    while done == 0
+        if v >= 128
+            let cont_b = (v % 128) + 128
+            out = bytes_append(out, cont_b & 0xFF)
+            v = v / 128
+        else
+            out = bytes_append(out, v & 0xFF)
+            done = 1
+    out
+
+// h2_hpack_int_decode: inverse of h2_hpack_int_encode. Masks the first byte
+// to prefix_bits (so it works directly on a real header-block byte whose
+// upper bits carry representation-type flags). Returns [value, next_pos].
+// Returns [-1, pos] on: pos out of bounds, truncated continuation, or more
+// than 10 continuation bytes (defensive cap against malformed/hostile input
+// — 10 bytes covers values far beyond any real HTTP/2 use and still leaves
+// headroom before 64-bit overflow of the accumulator).
+fn h2_hpack_int_decode(b: bytes, pos: int, prefix_bits: int) -> list
+    if pos < 0 or pos >= bytes_len(b)
+        return [-1, pos]
+    let pb = prefix_bits
+    if pb < 1
+        pb = 1
+    if pb > 8
+        pb = 8
+    let max_prefix = (1 << pb) - 1
+    let first = bytes_get(b, pos) & max_prefix
+    if first < max_prefix
+        return [first, pos + 1]
+    let value = max_prefix
+    let m = 0
+    let i = pos + 1
+    let cont = 1
+    let bad = 0
+    while cont == 1
+        if bad == 0
+            if i - pos > 10
+                bad = 1
+                cont = 0
+            else if i >= bytes_len(b)
+                bad = 1
+                cont = 0
+            else
+                let byte = bytes_get(b, i)
+                value = value + (byte & 0x7F) * (1 << m)
+                m = m + 7
+                i = i + 1
+                if (byte & 0x80) == 0
+                    cont = 0
+    if bad == 1
+        return [-1, pos]
+    [value, i]
+
+// ── HPACK static table (RFC 7541 Appendix A) — 1-based index, 1..61 ─────────
+
+// h2_static_name: static-table entry name for a 1-based index. "" if out of range.
+fn h2_static_name(index: int) -> string
+    if index == 1 then return ":authority"
+    if index == 2 then return ":method"
+    if index == 3 then return ":method"
+    if index == 4 then return ":path"
+    if index == 5 then return ":path"
+    if index == 6 then return ":scheme"
+    if index == 7 then return ":scheme"
+    if index == 8 then return ":status"
+    if index == 9 then return ":status"
+    if index == 10 then return ":status"
+    if index == 11 then return ":status"
+    if index == 12 then return ":status"
+    if index == 13 then return ":status"
+    if index == 14 then return ":status"
+    if index == 15 then return "accept-charset"
+    if index == 16 then return "accept-encoding"
+    if index == 17 then return "accept-language"
+    if index == 18 then return "accept-ranges"
+    if index == 19 then return "accept"
+    if index == 20 then return "access-control-allow-origin"
+    if index == 21 then return "age"
+    if index == 22 then return "allow"
+    if index == 23 then return "authorization"
+    if index == 24 then return "cache-control"
+    if index == 25 then return "content-disposition"
+    if index == 26 then return "content-encoding"
+    if index == 27 then return "content-language"
+    if index == 28 then return "content-length"
+    if index == 29 then return "content-location"
+    if index == 30 then return "content-range"
+    if index == 31 then return "content-type"
+    if index == 32 then return "cookie"
+    if index == 33 then return "date"
+    if index == 34 then return "etag"
+    if index == 35 then return "expect"
+    if index == 36 then return "expires"
+    if index == 37 then return "from"
+    if index == 38 then return "host"
+    if index == 39 then return "if-match"
+    if index == 40 then return "if-modified-since"
+    if index == 41 then return "if-none-match"
+    if index == 42 then return "if-range"
+    if index == 43 then return "if-unmodified-since"
+    if index == 44 then return "last-modified"
+    if index == 45 then return "link"
+    if index == 46 then return "location"
+    if index == 47 then return "max-forwards"
+    if index == 48 then return "proxy-authenticate"
+    if index == 49 then return "proxy-authorization"
+    if index == 50 then return "range"
+    if index == 51 then return "referer"
+    if index == 52 then return "refresh"
+    if index == 53 then return "retry-after"
+    if index == 54 then return "server"
+    if index == 55 then return "set-cookie"
+    if index == 56 then return "strict-transport-security"
+    if index == 57 then return "transfer-encoding"
+    if index == 58 then return "user-agent"
+    if index == 59 then return "vary"
+    if index == 60 then return "via"
+    if index == 61 then return "www-authenticate"
+    return ""
+
+// h2_static_value: static-table entry predefined value for a 1-based index.
+// "" both for out-of-range AND for entries that have no predefined value
+// (e.g. index 1 ":authority") — use h2_static_name to distinguish "no such
+// index" from "index exists but carries no fixed value".
+fn h2_static_value(index: int) -> string
+    if index == 2 then return "GET"
+    if index == 3 then return "POST"
+    if index == 4 then return "/"
+    if index == 5 then return "/index.html"
+    if index == 6 then return "http"
+    if index == 7 then return "https"
+    if index == 8 then return "200"
+    if index == 9 then return "204"
+    if index == 10 then return "206"
+    if index == 11 then return "304"
+    if index == 12 then return "400"
+    if index == 13 then return "404"
+    if index == 14 then return "500"
+    if index == 16 then return "gzip, deflate"
+    return ""
+
+// h2_static_lookup: find a static-table index for (name, value).
+// Exact (name AND value) match -> that index (positive).
+// Name-only match (value differs or has no predefined value) -> the index
+// of the first entry with that name, negated, so callers can distinguish
+// "send indexed name, literal value" from "fully indexed" with one int.
+// 0 if the name doesn't appear in the table at all.
+fn h2_static_lookup(name: string, value: string) -> int
+    let i = 1
+    let name_hit = 0
+    while i <= 61
+        let n = h2_static_name(i)
+        if n == name
+            if name_hit == 0
+                name_hit = i
+            let v = h2_static_value(i)
+            if v == value
+                return i
+        i = i + 1
+    if name_hit > 0
+        return 0 - name_hit
+    0

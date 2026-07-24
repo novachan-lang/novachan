@@ -1,0 +1,300 @@
+// KAT test for std/encoding/protobuf (proto3 wire-format codec).
+// Known-answer vectors hand-computed against the protobuf encoding spec:
+// developers.google.com/protocol-buffers/docs/encoding
+import std/encoding/protobuf
+import std/encoding/varint
+import std/bits/zigzag
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn _pt_bytes_eq(a, b) -> int
+    let la = bytes_len(a)
+    let lb = bytes_len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if bytes_get(a, i) != bytes_get(b, i)
+            return 0
+        i = i + 1
+    1
+
+fn _pt_make_bytes(lst) -> any
+    let buf = bytes(0)
+    let i = 0
+    while i < len(lst)
+        buf = bytes_append(buf, lst[i])
+        i = i + 1
+    buf
+
+fn ckb(label, got, want_list) -> int
+    let want = _pt_make_bytes(want_list)
+    if _pt_bytes_eq(got, want) == 0
+        print("FAIL " + label + ": got len=" + str(bytes_len(got)) + " want len=" + str(bytes_len(want)))
+        exit(1)
+    0
+
+fn cki(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+fn cks(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        exit(1)
+    0
+
+// ── KAT 1: varint spec vectors (reused from std/encoding/varint) ────────────
+// 1 -> 0x01 ; 300 -> 0xAC 0x02 ; 0 -> 0x00 ; 127 -> 0x7F ; 128 -> 0x80 0x01
+fn test_varint_vectors() -> int
+    ckb("varint(1)",   vi_encode(1),   [0x01])
+    ckb("varint(300)", vi_encode(300), [0xAC, 0x02])
+    ckb("varint(0)",   vi_encode(0),   [0x00])
+    ckb("varint(127)", vi_encode(127), [0x7F])
+    ckb("varint(128)", vi_encode(128), [0x80, 0x01])
+
+// ── KAT 2: zigzag spec vectors (reused from std/bits/zigzag) ────────────────
+// zigzag(-1) == 1 ; zigzag(1) == 2
+fn test_zigzag_vectors() -> int
+    cki("zigzag(-1)", zz_encode(-1), 1)
+    cki("zigzag(1)",  zz_encode(1),  2)
+    cki("zigzag(0)",  zz_encode(0),  0)
+    cki("unzigzag(1)", zz_decode(1), -1)
+    cki("unzigzag(2)", zz_decode(2), 1)
+
+// ── KAT 3: tag for field 1, wire type 2 (LEN) == 0x0A ────────────────────────
+fn test_tag_field1_len() -> int
+    cki("pb_make_tag(1,LEN)", pb_make_tag(1, pb_wire_len()), 0x0A)
+    ckb("pb_encode_tag(1,LEN)", pb_encode_tag(1, pb_wire_len()), [0x0A])
+
+// ── KAT 4: length-delimited field 2 = "testing" -> 12 07 "testing" ──────────
+// This is the protobuf spec's own worked example.
+fn test_field2_testing() -> int
+    let enc = pb_encode_field(2, pb_wire_len(), str_to_bytes("testing"))
+    ckb("field2=testing", enc, [0x12, 0x07, 116, 101, 115, 116, 105, 110, 103])
+    // pb_encode_string_field must produce byte-identical output.
+    let enc2 = pb_encode_string_field(2, "testing")
+    ckb("string_field2=testing", enc2, [0x12, 0x07, 116, 101, 115, 116, 105, 110, 103])
+
+// ── KAT 5: decode round-trip of the "testing" field ──────────────────────────
+fn test_field2_decode_roundtrip() -> int
+    let enc = pb_encode_string_field(2, "testing")
+    let dec = pb_decode_string_field(enc, 0)
+    cki("decode field2 num", dec[0], 2)
+    cks("decode field2 value", dec[1], "testing")
+    cki("decode field2 next_pos", dec[2], 9)
+
+// ── KAT 6: pb_read_tag / pb_read_varint / pb_read_len_delim directly ─────────
+fn test_raw_primitives() -> int
+    let enc = pb_encode_field(2, pb_wire_len(), str_to_bytes("testing"))
+    let tg = pb_read_tag(enc, 0)
+    cki("read_tag num", tg[0], 2)
+    cki("read_tag wiretype", tg[1], pb_wire_len())
+    cki("read_tag next_pos", tg[2], 1)
+    let ld = pb_read_len_delim(enc, tg[2])
+    cks("read_len_delim value", bytes_to_str(ld[0]), "testing")
+    cki("read_len_delim next_pos", ld[1], 9)
+    // pb_read_varint is a direct alias of vi_decode over a raw varint stream.
+    let vbuf = vi_encode(300)
+    let vr = pb_read_varint(vbuf, 0)
+    cki("read_varint value", vr[0], 300)
+    cki("read_varint next_pos", vr[1], 2)
+
+// ── KAT 7: varint field encode/decode round-trip (uint32/uint64/bool/enum) ──
+fn test_varint_field_roundtrip() -> int
+    let enc = pb_encode_varint_field(5, 300)
+    ckb("varint_field(5,300) tag", bytes_slice(enc, 0, 1), [0x28])
+    let dec = pb_decode_varint_field(enc, 0)
+    cki("varint_field num", dec[0], 5)
+    cki("varint_field value", dec[1], 300)
+    // Zero and one-byte boundary values.
+    let e0 = pb_decode_varint_field(pb_encode_varint_field(1, 0), 0)
+    cki("varint_field(1,0)", e0[1], 0)
+    let e127 = pb_decode_varint_field(pb_encode_varint_field(1, 127), 0)
+    cki("varint_field(1,127)", e127[1], 127)
+
+// ── KAT 8: sint field (zigzag) round-trip incl. negatives ───────────────────
+fn test_sint_field_roundtrip() -> int
+    let vals = [-1, 1, 0, -2, 2, -12345, 12345, -1000000000, 1000000000]
+    let i = 0
+    while i < len(vals)
+        let n = vals[i]
+        let enc = pb_encode_sint_field(7, n)
+        let dec = pb_decode_sint_field(enc, 0)
+        cki("sint_field num", dec[0], 7)
+        cki("sint_field roundtrip " + str(n), dec[1], n)
+        i = i + 1
+    // -1 must be the SMALL zigzag encoding (2 bytes: tag+1 payload byte),
+    // not the 10-byte raw two's-complement form.
+    let encNeg1 = pb_encode_sint_field(1, -1)
+    cki("sint(-1) byte count", bytes_len(encNeg1), 2)
+
+// ── KAT 9: int field (raw, non-zigzag) round-trip incl. negatives ───────────
+// Negative values must be the spec-mandated 10-byte two's-complement varint.
+fn test_int_field_roundtrip() -> int
+    let vals = [-1, 1, 0, -2, 2, -12345, 12345, 127, 128, 16383, 16384]
+    let i = 0
+    while i < len(vals)
+        let n = vals[i]
+        let enc = pb_encode_int_field(3, n)
+        let dec = pb_decode_int_field(enc, 0)
+        cki("int_field num", dec[0], 3)
+        cki("int_field roundtrip " + str(n), dec[1], n)
+        i = i + 1
+    // int64(-1) canonical wire bytes: tag(0x18) + FF*9 + 01 (10-byte varint).
+    let encNeg1 = pb_encode_int_field(3, -1)
+    ckb("int(-1) wire bytes", encNeg1, [0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+    // int64(-2) canonical wire bytes: tag + FE FF FF FF FF FF FF FF FF 01.
+    let encNeg2 = pb_encode_int_field(3, -2)
+    ckb("int(-2) wire bytes", encNeg2, [0x18, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+
+// ── KAT 10: fixed32 (unsigned) round-trip incl. width boundaries ─────────────
+fn test_fixed32_roundtrip() -> int
+    let vals = [0, 1, 255, 256, 65535, 65536, 2147483647, 4294967295]
+    let i = 0
+    while i < len(vals)
+        let n = vals[i]
+        let enc = pb_encode_fixed32_field(9, n)
+        cki("fixed32 byte len", bytes_len(enc), 5)
+        let dec = pb_decode_fixed32_field(enc, 0)
+        cki("fixed32 num", dec[0], 9)
+        cki("fixed32 roundtrip " + str(n), dec[1], n)
+        i = i + 1
+    // Known byte layout: fixed32(1) little-endian = 01 00 00 00.
+    let enc1 = pb_encode_fixed32_field(9, 1)
+    ckb("fixed32(1) bytes", enc1, [0x4D, 0x01, 0x00, 0x00, 0x00])
+    // 4294967295 (0xFFFFFFFF) is the top of the unsigned 32-bit range —
+    // wire bytes must be all-FF, decoded back as the unsigned value (not -1).
+    let encMax = pb_encode_fixed32_field(9, 4294967295)
+    ckb("fixed32(0xFFFFFFFF) bytes", encMax, [0x4D, 0xFF, 0xFF, 0xFF, 0xFF])
+
+// ── KAT 10b: sfixed32 (signed) round-trip incl. negatives ────────────────────
+// Same wire encoder (pb_encode_fixed32_field) as fixed32 — only the DECODE
+// interpretation differs (sign-extended low 32 bits vs unsigned).
+fn test_sfixed32_roundtrip() -> int
+    let vals = [0, 1, -1, 127, -128, 2147483647, -2147483648, -12345]
+    let i = 0
+    while i < len(vals)
+        let n = vals[i]
+        let enc = pb_encode_fixed32_field(9, n)
+        let dec = pb_decode_sfixed32_field(enc, 0)
+        cki("sfixed32 num", dec[0], 9)
+        cki("sfixed32 roundtrip " + str(n), dec[1], n)
+        i = i + 1
+    // sfixed32(-1) wire bytes: FF FF FF FF (same as fixed32(0xFFFFFFFF)).
+    let encNeg1 = pb_encode_fixed32_field(9, -1)
+    ckb("sfixed32(-1) bytes", encNeg1, [0x4D, 0xFF, 0xFF, 0xFF, 0xFF])
+    cki("sfixed32(-1) decode", pb_decode_sfixed32_field(encNeg1, 0)[1], -1)
+
+// ── KAT 11: fixed64 round-trip incl. width boundaries ────────────────────────
+fn test_fixed64_roundtrip() -> int
+    let vals = [0, 1, 4294967295, 4294967296, 9223372036854775807, -1]
+    let i = 0
+    while i < len(vals)
+        let n = vals[i]
+        let enc = pb_encode_fixed64_field(11, n)
+        cki("fixed64 byte len", bytes_len(enc), 9)
+        let dec = pb_decode_fixed64_field(enc, 0)
+        cki("fixed64 num", dec[0], 11)
+        cki("fixed64 roundtrip " + str(n), dec[1], n)
+        i = i + 1
+    // Known byte layout: fixed64(1) little-endian = 01 00 00 00 00 00 00 00.
+    let enc1 = pb_encode_fixed64_field(11, 1)
+    ckb("fixed64(1) bytes", enc1, [0x59, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+// ── KAT 12: empty length-delimited field round-trips ─────────────────────────
+fn test_empty_field() -> int
+    let enc = pb_encode_string_field(4, "")
+    ckb("empty string field bytes", enc, [0x22, 0x00])
+    let dec = pb_decode_string_field(enc, 0)
+    cks("empty string decode", dec[1], "")
+    cki("empty string next_pos", dec[2], 2)
+    let encb = pb_encode_bytes_field(4, bytes(0))
+    ckb("empty bytes field bytes", encb, [0x22, 0x00])
+
+// ── KAT 13: binary-safe bytes field with embedded NUL ────────────────────────
+fn test_binary_safe_nul() -> int
+    let raw = bytes(0)
+    raw = bytes_append(raw, 0x41)
+    raw = bytes_append(raw, 0x00)
+    raw = bytes_append(raw, 0x42)
+    let enc = pb_encode_bytes_field(6, raw)
+    ckb("nul-safe field bytes", enc, [0x32, 0x03, 0x41, 0x00, 0x42])
+    let dec = pb_decode_bytes_field(enc, 0)
+    cki("nul-safe decode len", bytes_len(dec[1]), 3)
+    cki("nul-safe decode[1]", bytes_get(dec[1], 1), 0x00)
+    cki("nul-safe decode[2]", bytes_get(dec[1], 2), 0x42)
+
+// ── KAT 14: defensive clamp — declared length exceeds available bytes ───────
+// A malformed/truncated length prefix must never read out of bounds; the
+// payload is clamped to what is actually present, and next_pos never exceeds
+// the buffer length.
+fn test_defensive_clamp() -> int
+    let buf = bytes(0)
+    buf = bytes_append(buf, 0x64)  // varint length = 100 (way more than available)
+    buf = bytes_append(buf, 0x41)
+    buf = bytes_append(buf, 0x42)
+    let r = pb_read_len_delim(buf, 0)
+    cki("clamp payload len", bytes_len(r[0]), 2)
+    cki("clamp next_pos", r[1], 3)
+    // Reading a tag exactly at the end of the buffer must not crash.
+    let tg = pb_read_tag(buf, 3)
+    cki("tag at EOF field_num", tg[0], 0)
+    cki("tag at EOF next_pos", tg[2], 3)
+
+// ── KAT 15: multi-field message parse loop (realistic usage) ─────────────────
+// Build a message with 3 fields of different wire types and parse it back
+// sequentially, mirroring how a real protobuf decoder walks a message.
+fn test_multi_field_message() -> int
+    let msg = bytes(0)
+    msg = bytes_concat(msg, pb_encode_varint_field(1, 42))
+    msg = bytes_concat(msg, pb_encode_string_field(2, "hello"))
+    msg = bytes_concat(msg, pb_encode_sint_field(3, -7))
+
+    let pos = 0
+    let total = bytes_len(msg)
+
+    let tg1 = pb_read_tag(msg, pos)
+    cki("msg field1 num", tg1[0], 1)
+    cki("msg field1 wiretype", tg1[1], pb_wire_varint())
+    let v1 = pb_read_varint(msg, tg1[2])
+    cki("msg field1 value", v1[0], 42)
+    pos = v1[1]
+
+    let tg2 = pb_read_tag(msg, pos)
+    cki("msg field2 num", tg2[0], 2)
+    cki("msg field2 wiretype", tg2[1], pb_wire_len())
+    let v2 = pb_read_len_delim(msg, tg2[2])
+    cks("msg field2 value", bytes_to_str(v2[0]), "hello")
+    pos = v2[1]
+
+    let tg3 = pb_read_tag(msg, pos)
+    cki("msg field3 num", tg3[0], 3)
+    cki("msg field3 wiretype", tg3[1], pb_wire_varint())
+    let v3raw = pb_read_varint(msg, tg3[2])
+    cki("msg field3 value", zz_decode(v3raw[0]), -7)
+    pos = v3raw[1]
+
+    cki("msg fully consumed", pos, total)
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+fn main() -> int
+    test_varint_vectors()
+    test_zigzag_vectors()
+    test_tag_field1_len()
+    test_field2_testing()
+    test_field2_decode_roundtrip()
+    test_raw_primitives()
+    test_varint_field_roundtrip()
+    test_sint_field_roundtrip()
+    test_int_field_roundtrip()
+    test_fixed32_roundtrip()
+    test_fixed64_roundtrip()
+    test_empty_field()
+    test_binary_safe_nul()
+    test_defensive_clamp()
+    test_multi_field_message()
+    print("_pbwire_kat passed")
+    0

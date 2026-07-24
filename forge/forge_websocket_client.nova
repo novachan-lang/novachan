@@ -1,0 +1,132 @@
+// forge_websocket_client -- RFC 6455 WebSocket CLIENT: opening handshake, frame codec, and a
+// convenience live-connection API, exposed as its OWN importable module (`import forge_websocket_client`)
+// for a caller who wants a WS client without depending on the whole framework surface.
+//
+// forge.nova already ships an OPERATIONAL client (ws_connect / ws_client_send / ws_client_recv /
+// ws_client_close) built on a codec (ws_encode_frame / ws_try_decode / ws_compute_accept /
+// ws_sha1_bytes / ws_b64_bytes) SHARED with the server side (ws / ws_room). This module does NOT
+// reimplement that codec -- duplicating SHA-1 / base64 / frame-parsing would be a maintenance and
+// correctness hazard (two copies drifting apart is exactly how client/server handshake mismatches
+// happen in the wild). Instead it imports forge and:
+//   1. gives each RFC 6455 5.7 wire example its OWN individually-testable entry point (the request
+//      string, the accept predicate, an explicit-mask frame encoder) -- forge.ws_connect bundles all
+//      of this opaquely behind one live TCP round-trip, which cannot be KAT-tested byte-for-byte
+//      without a real socket.
+//   2. re-exposes the live client under wsc_* names so a caller only needs this one import.
+//
+// Opening handshake (RFC 6455 4.1): GET <path> HTTP/1.1 + Host + Upgrade: websocket +
+// Connection: Upgrade + Sec-WebSocket-Key: base64(16 CSPRNG bytes) + Sec-WebSocket-Version: 13.
+// Accept check (4.2.2): Sec-WebSocket-Accept == base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")).
+// Frame codec (5.2): byte0 = FIN<<7 | opcode; byte1 = MASK<<7 | len7 (0..125 inline, 126 -> 2 more
+// bytes big-endian, 127 -> 8 more bytes big-endian, MSB must be 0); a masked frame (every client->server
+// frame MUST be masked per 5.1/5.3) then carries a 4-byte key and the payload XORed with it cyclically.
+//
+// import forge
+
+import forge
+
+// ── handshake ────────────────────────────────────────────────────────────────────────────────────
+
+// wsc_generate_key() -> string
+// 16 CSPRNG bytes, base64-encoded -> a fresh Sec-WebSocket-Key (RFC 6455 4.1). Exposed standalone
+// (forge.nova keeps its equivalent private) so a caller/KAT can inspect and replay the exact key
+// used in a handshake instead of only observing the opaque result of a live connect.
+fn wsc_generate_key() -> string
+    let kb = secure_bytes(16)
+    let klist = []
+    let i = 0
+    while i < 16
+        push(klist, bytes_get(kb, i))
+        i = i + 1
+    ws_b64_bytes(klist)
+
+// wsc_generate_mask() -> list
+// A fresh 4-byte client masking key. RFC 6455 5.3: every frame a client sends MUST be masked with
+// an unpredictable key -- reusing a fixed key would let an on-path observer XOR it out trivially.
+fn wsc_generate_mask() -> list
+    let mb = secure_bytes(4)
+    [bytes_get(mb, 0), bytes_get(mb, 1), bytes_get(mb, 2), bytes_get(mb, 3)]
+
+// wsc_build_request(host, path, key) -> string
+// The literal opening-handshake HTTP request text (GET + Upgrade: websocket + Connection: Upgrade +
+// Sec-WebSocket-Key + Sec-WebSocket-Version: 13), broken out standalone so it can be asserted
+// byte-for-byte without opening a real socket. An empty `path` is normalized to "/" (an empty
+// request-target is not valid HTTP and every real server would reject it).
+fn wsc_build_request(host: string, path: string, key: string) -> string
+    let p = path
+    if len(p) == 0
+        p = "/"
+    "GET " + p + " HTTP/1.1\r\nHost: " + host + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
+
+// wsc_expected_accept(key) -> string
+// The Sec-WebSocket-Accept value the SERVER's 101 response must echo back for `key`
+// (base64(sha1(key + RFC6455 GUID))) -- delegates to forge.ws_compute_accept, the SAME function
+// forge's own server uses, so a client built from this module and forge's own server never drift.
+fn wsc_expected_accept(key: string) -> string
+    ws_compute_accept(key)
+
+// wsc_verify_accept(key, accept_header_value) -> bool
+// True iff the server's Sec-WebSocket-Accept header value is the one this key demands. A caller
+// doing a manual (non-forge-server) handshake calls this before trusting the 101 response.
+fn wsc_verify_accept(key: string, accept_header_value: string) -> bool
+    accept_header_value == wsc_expected_accept(key)
+
+// ── frame codec (thin, byte-exact wrappers over forge's shared ws_encode_frame / ws_try_decode) ──
+
+// wsc_encode_text(payload) -> any
+// A MASKED client text frame (opcode 1) carrying `payload`, masked with a FRESH random key
+// (RFC 6455 5.1: a client MUST mask every frame it sends). Returns the wire bytes.
+fn wsc_encode_text(payload: string) -> any
+    ws_encode_frame(1, 1, str_to_bytes(payload), wsc_generate_mask())
+
+// wsc_encode_text_masked(payload, mask) -> any
+// Same as wsc_encode_text but with an EXPLICIT 4-byte mask, for reproducing an exact wire vector
+// (e.g. the RFC 6455 5.7 masked "Hello" example) or for testing round-trips deterministically.
+fn wsc_encode_text_masked(payload: string, mask: list) -> any
+    ws_encode_frame(1, 1, str_to_bytes(payload), mask)
+
+// wsc_encode_binary_masked(payload, mask) -> any
+// A masked binary frame (opcode 2) -- `payload` is already `bytes` (no UTF-8 assumption, so this is
+// the safe path for arbitrary binary content, including embedded 0x00).
+fn wsc_encode_binary_masked(payload, mask: list) -> any
+    ws_encode_frame(1, 2, payload, mask)
+
+// wsc_ping_masked(payload, mask) -> any / wsc_pong_masked(payload, mask) -> any
+// Masked control frames (opcode 9 ping / 10 pong); `payload` <= 125 bytes per RFC 6455 5.5.
+fn wsc_ping_masked(payload, mask: list) -> any
+    ws_encode_frame(1, 9, payload, mask)
+
+fn wsc_pong_masked(payload, mask: list) -> any
+    ws_encode_frame(1, 10, payload, mask)
+
+// wsc_close_frame_masked(mask) -> any
+// A masked Close frame (opcode 8, empty payload) with an explicit mask.
+fn wsc_close_frame_masked(mask: list) -> any
+    ws_encode_frame(1, 8, bytes(0), mask)
+
+// wsc_decode(buf) -> WsFrame
+// Decode ONE frame starting at byte 0 of `buf`. status 0 = incomplete (need more bytes), negative =
+// protocol error (magnitude is the WS close code), 1 = a full frame in .fin / .opcode / .payload /
+// .consumed. Works on unmasked server frames AND masked client frames (unmasks them in place using
+// the embedded key) -- the same parser this module's frames round-trip through in the KAT below.
+fn wsc_decode(buf) -> WsFrame
+    ws_try_decode(buf, 0)
+
+// ── live connection (thin re-export of forge's client under this module's own naming) ──────────
+
+// wsc_connect(url) -> Result<any>: dial ws://host[:port]/path, perform the opening handshake,
+// verify the 101 + Sec-WebSocket-Accept. Delegates to forge.ws_connect (identical codec to above).
+fn wsc_connect(url: string) -> Result<any>
+    ws_connect(url)
+
+// wsc_send(c, msg) -> int : send a masked text frame on an open connection from wsc_connect.
+fn wsc_send(c, msg: string) -> int
+    ws_client_send(c, msg)
+
+// wsc_recv(c) -> Result<string> : read + decode one server frame (text).
+fn wsc_recv(c) -> Result<string>
+    ws_client_recv(c)
+
+// wsc_close(c) : send a masked Close frame, then close the socket.
+fn wsc_close(c)
+    ws_client_close(c)

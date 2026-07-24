@@ -1,0 +1,354 @@
+import std/net/http2
+
+fn main()
+    // ── KAT 1: connection preface — exact 24 bytes, RFC 7540 §3.5 ───────────
+    let pre = h2_preface()
+    let plen = bytes_len(pre)
+    if plen != 24
+        print("FAIL preface length: got " + str(plen) + " want 24")
+        exit(1)
+    // "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" byte-exact
+    let want_bytes = [0x50, 0x52, 0x49, 0x20, 0x2A, 0x20, 0x48, 0x54, 0x54, 0x50, 0x2F, 0x32, 0x2E, 0x30, 0x0D, 0x0A, 0x0D, 0x0A, 0x53, 0x4D, 0x0D, 0x0A, 0x0D, 0x0A]
+    let i = 0
+    while i < 24
+        let got = bytes_get(pre, i)
+        let want = want_bytes[i]
+        if got != want
+            print("FAIL preface byte " + str(i) + ": got " + str(got) + " want " + str(want))
+            exit(1)
+        i = i + 1
+
+    if h2_preface_check(pre) != true
+        print("FAIL preface_check on exact preface")
+        exit(1)
+
+    let short_pre = bytes_slice(pre, 0, 10)
+    if h2_preface_check(short_pre) != false
+        print("FAIL preface_check on short input should be false")
+        exit(1)
+
+    let bad_pre = bytes(24)
+    if h2_preface_check(bad_pre) != false
+        print("FAIL preface_check on zero bytes should be false")
+        exit(1)
+
+    // ── KAT 2: SETTINGS frame header — len=6, type=4, flags=0, stream=0 ─────
+    // One SETTINGS param (id=u16, value=u32 -> 6 bytes payload), on the
+    // connection stream (0), no flags.
+    let sh = h2_frame_header_encode(6, 4, 0, 0)
+    let sh_len = bytes_len(sh)
+    if sh_len != 9
+        print("FAIL settings header length: got " + str(sh_len) + " want 9")
+        exit(1)
+    // Expected: 00 00 06 04 00 00 00 00 00
+    let sh_want = [0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]
+    let j = 0
+    while j < 9
+        let g = bytes_get(sh, j)
+        let w = sh_want[j]
+        if g != w
+            print("FAIL settings header byte " + str(j) + ": got " + str(g) + " want " + str(w))
+            exit(1)
+        j = j + 1
+
+    // Round-trip decode
+    let sh_dec = h2_frame_header_decode(sh, 0)
+    let sh_hdr = sh_dec[0]
+    let sh_next = sh_dec[1]
+    if sh_next != 9
+        print("FAIL settings decode next pos: got " + str(sh_next) + " want 9")
+        exit(1)
+    if sh_hdr["length"] != 6
+        print("FAIL settings decode length: got " + str(sh_hdr["length"]) + " want 6")
+        exit(1)
+    if sh_hdr["type"] != 4
+        print("FAIL settings decode type: got " + str(sh_hdr["type"]) + " want 4")
+        exit(1)
+    if sh_hdr["flags"] != 0
+        print("FAIL settings decode flags: got " + str(sh_hdr["flags"]) + " want 0")
+        exit(1)
+    if sh_hdr["stream_id"] != 0
+        print("FAIL settings decode stream_id: got " + str(sh_hdr["stream_id"]) + " want 0")
+        exit(1)
+    if sh_hdr["reserved"] != 0
+        print("FAIL settings decode reserved: got " + str(sh_hdr["reserved"]) + " want 0")
+        exit(1)
+    if h2_frame_type_name(sh_hdr["type"]) != "SETTINGS"
+        print("FAIL settings type name: got " + h2_frame_type_name(sh_hdr["type"]))
+        exit(1)
+
+    // ── KAT 3: DATA frame header — stream 1, len 5 ───────────────────────────
+    let dh = h2_frame_header_encode(5, 0, 0, 1)
+    // Expected: 00 00 05 00 00 00 00 00 01
+    let dh_want = [0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+    let k = 0
+    while k < 9
+        let g2 = bytes_get(dh, k)
+        let w2 = dh_want[k]
+        if g2 != w2
+            print("FAIL data header byte " + str(k) + ": got " + str(g2) + " want " + str(w2))
+            exit(1)
+        k = k + 1
+
+    let dh_dec = h2_frame_header_decode(dh, 0)
+    let dh_hdr = dh_dec[0]
+    if dh_hdr["length"] != 5
+        print("FAIL data decode length: got " + str(dh_hdr["length"]) + " want 5")
+        exit(1)
+    if dh_hdr["stream_id"] != 1
+        print("FAIL data decode stream_id: got " + str(dh_hdr["stream_id"]) + " want 1")
+        exit(1)
+    if h2_frame_type_name(dh_hdr["type"]) != "DATA"
+        print("FAIL data type name: got " + h2_frame_type_name(dh_hdr["type"]))
+        exit(1)
+    if h2_frame_type_num("DATA") != 0
+        print("FAIL frame_type_num DATA")
+        exit(1)
+    if h2_frame_type_num("GOAWAY") != 7
+        print("FAIL frame_type_num GOAWAY")
+        exit(1)
+    if h2_frame_type_num("WINDOW_UPDATE") != 8
+        print("FAIL frame_type_num WINDOW_UPDATE")
+        exit(1)
+    if h2_frame_type_num("PING") != 6
+        print("FAIL frame_type_num PING")
+        exit(1)
+    if h2_frame_type_num("NOPE") != -1
+        print("FAIL frame_type_num unknown should be -1")
+        exit(1)
+
+    // ── KAT 4: reserved bit is forced to 0 even if caller sets it ───────────
+    let rh = h2_frame_header_encode(0, 8, 0, 0 - 2147483648)
+    let rh_dec = h2_frame_header_decode(rh, 0)
+    let rh_hdr = rh_dec[0]
+    if rh_hdr["reserved"] != 0
+        print("FAIL reserved bit not forced to 0")
+        exit(1)
+
+    // ── KAT 5: frame header decode bounds safety ─────────────────────────────
+    let short_frame = bytes(8)
+    let short_dec = h2_frame_header_decode(short_frame, 0)
+    let short_hdr = short_dec[0]
+    let short_keys = keys(short_hdr)
+    if len(short_keys) != 0
+        print("FAIL short frame decode should return empty dict")
+        exit(1)
+    if short_dec[1] != 0
+        print("FAIL short frame decode should return original pos")
+        exit(1)
+
+    let neg_dec = h2_frame_header_decode(sh, 0 - 1)
+    if len(keys(neg_dec[0])) != 0
+        print("FAIL negative pos decode should return empty dict")
+        exit(1)
+
+    // 24-bit length boundary: max value 0xFFFFFF must not corrupt type/flags/stream
+    let maxlen_h = h2_frame_header_encode(0xFFFFFF, 1, 0xFF, 0x7FFFFFFF)
+    let maxlen_dec = h2_frame_header_decode(maxlen_h, 0)
+    let maxlen_hdr = maxlen_dec[0]
+    if maxlen_hdr["length"] != 0xFFFFFF
+        print("FAIL maxlen length: got " + str(maxlen_hdr["length"]))
+        exit(1)
+    if maxlen_hdr["stream_id"] != 0x7FFFFFFF
+        print("FAIL maxlen stream_id: got " + str(maxlen_hdr["stream_id"]))
+        exit(1)
+    if maxlen_hdr["flags"] != 0xFF
+        print("FAIL maxlen flags: got " + str(maxlen_hdr["flags"]))
+        exit(1)
+
+    // ── KAT 6: HPACK integer 10 in a 5-bit prefix == 0x0A ────────────────────
+    let e10 = h2_hpack_int_encode(10, 5)
+    if bytes_len(e10) != 1
+        print("FAIL hpack 10 encode length: got " + str(bytes_len(e10)))
+        exit(1)
+    if bytes_get(e10, 0) != 0x0A
+        print("FAIL hpack 10 encode byte0: got " + str(bytes_get(e10, 0)) + " want 10")
+        exit(1)
+
+    let d10 = h2_hpack_int_decode(e10, 0, 5)
+    if d10[0] != 10
+        print("FAIL hpack 10 decode value: got " + str(d10[0]))
+        exit(1)
+    if d10[1] != 1
+        print("FAIL hpack 10 decode next pos: got " + str(d10[1]))
+        exit(1)
+
+    // ── KAT 7: HPACK integer 1337 in a 5-bit prefix == 0x1F 0x9A 0x0A ────────
+    let e1337 = h2_hpack_int_encode(1337, 5)
+    if bytes_len(e1337) != 3
+        print("FAIL hpack 1337 encode length: got " + str(bytes_len(e1337)))
+        exit(1)
+    if bytes_get(e1337, 0) != 0x1F
+        print("FAIL hpack 1337 encode byte0: got " + str(bytes_get(e1337, 0)) + " want 31")
+        exit(1)
+    if bytes_get(e1337, 1) != 0x9A
+        print("FAIL hpack 1337 encode byte1: got " + str(bytes_get(e1337, 1)) + " want 154")
+        exit(1)
+    if bytes_get(e1337, 2) != 0x0A
+        print("FAIL hpack 1337 encode byte2: got " + str(bytes_get(e1337, 2)) + " want 10")
+        exit(1)
+
+    let d1337 = h2_hpack_int_decode(e1337, 0, 5)
+    if d1337[0] != 1337
+        print("FAIL hpack 1337 decode value: got " + str(d1337[0]))
+        exit(1)
+    if d1337[1] != 3
+        print("FAIL hpack 1337 decode next pos: got " + str(d1337[1]))
+        exit(1)
+
+    // Decode with garbage flag bits set above the 5-bit prefix (real header
+    // block fragments carry representation-type bits there) — must be masked off.
+    let e1337_flagged = bytes(3)
+    bytes_set(e1337_flagged, 0, bytes_get(e1337, 0) | 0x80)
+    bytes_set(e1337_flagged, 1, bytes_get(e1337, 1))
+    bytes_set(e1337_flagged, 2, bytes_get(e1337, 2))
+    let d1337f = h2_hpack_int_decode(e1337_flagged, 0, 5)
+    if d1337f[0] != 1337
+        print("FAIL hpack 1337 decode with flag bits: got " + str(d1337f[0]))
+        exit(1)
+
+    // ── KAT 8: HPACK integer width boundaries ────────────────────────────────
+    // 5-bit prefix max_prefix=31. value=30 -> single byte 0x1E (below boundary).
+    let e30 = h2_hpack_int_encode(30, 5)
+    if bytes_len(e30) != 1 or bytes_get(e30, 0) != 0x1E
+        print("FAIL hpack 30/5bit: len=" + str(bytes_len(e30)) + " b0=" + str(bytes_get(e30, 0)))
+        exit(1)
+    // value=31 (== max_prefix exactly) -> 2 bytes: 0x1F 0x00 (continuation needed).
+    let e31 = h2_hpack_int_encode(31, 5)
+    if bytes_len(e31) != 2 or bytes_get(e31, 0) != 0x1F or bytes_get(e31, 1) != 0x00
+        print("FAIL hpack 31/5bit boundary")
+        exit(1)
+    let d31 = h2_hpack_int_decode(e31, 0, 5)
+    if d31[0] != 31
+        print("FAIL hpack 31/5bit decode: got " + str(d31[0]))
+        exit(1)
+
+    // 8-bit prefix (no representation flag bits at all): value 127/128/255/256.
+    let e127 = h2_hpack_int_encode(127, 8)
+    if bytes_len(e127) != 1 or bytes_get(e127, 0) != 127
+        print("FAIL hpack 127/8bit")
+        exit(1)
+    let e128 = h2_hpack_int_encode(128, 8)
+    let d128 = h2_hpack_int_decode(e128, 0, 8)
+    if d128[0] != 128
+        print("FAIL hpack 128/8bit roundtrip: got " + str(d128[0]))
+        exit(1)
+    let e255 = h2_hpack_int_encode(255, 8)
+    let d255 = h2_hpack_int_decode(e255, 0, 8)
+    if d255[0] != 255
+        print("FAIL hpack 255/8bit roundtrip: got " + str(d255[0]))
+        exit(1)
+    let e256 = h2_hpack_int_encode(256, 8)
+    let d256 = h2_hpack_int_decode(e256, 0, 8)
+    if d256[0] != 256
+        print("FAIL hpack 256/8bit roundtrip: got " + str(d256[0]))
+        exit(1)
+
+    // value=0 in any prefix width -> single byte 0x00.
+    let e0 = h2_hpack_int_encode(0, 5)
+    if bytes_len(e0) != 1 or bytes_get(e0, 0) != 0
+        print("FAIL hpack 0/5bit")
+        exit(1)
+
+    // negative value clamps defensively to 0.
+    let eneg = h2_hpack_int_encode(0 - 5, 5)
+    if bytes_len(eneg) != 1 or bytes_get(eneg, 0) != 0
+        print("FAIL hpack negative clamp: got len=" + str(bytes_len(eneg)))
+        exit(1)
+
+    // A large value (e.g. table-size-update-scale int) round-trips.
+    let ebig = h2_hpack_int_encode(1000000, 7)
+    let dbig = h2_hpack_int_decode(ebig, 0, 7)
+    if dbig[0] != 1000000
+        print("FAIL hpack big roundtrip: got " + str(dbig[0]))
+        exit(1)
+
+    // ── KAT 9: HPACK integer decode bounds/truncation safety ────────────────
+    // Truncated multi-byte int: first byte says "more bytes follow" but buffer ends.
+    let trunc = bytes(1)
+    bytes_set(trunc, 0, 0x1F)
+    let dtrunc = h2_hpack_int_decode(trunc, 0, 5)
+    if dtrunc[0] != -1
+        print("FAIL hpack truncated decode should be -1: got " + str(dtrunc[0]))
+        exit(1)
+
+    let dneg = h2_hpack_int_decode(e10, 0 - 1, 5)
+    if dneg[0] != -1
+        print("FAIL hpack negative pos decode should be -1")
+        exit(1)
+
+    let dover = h2_hpack_int_decode(e10, 5, 5)
+    if dover[0] != -1
+        print("FAIL hpack pos-past-end decode should be -1")
+        exit(1)
+
+    // Runaway continuation bytes (all 0x80..0xFF, never terminates) capped, not looped forever.
+    let runaway = bytes(20)
+    let ri = 0
+    while ri < 20
+        bytes_set(runaway, ri, 0xFF)
+        ri = ri + 1
+    let drun = h2_hpack_int_decode(runaway, 0, 5)
+    if drun[0] != -1
+        print("FAIL hpack runaway continuation should be capped to -1: got " + str(drun[0]))
+        exit(1)
+
+    // ── KAT 10: HPACK static table (RFC 7541 Appendix A) ─────────────────────
+    // index 2 -> :method GET
+    if h2_static_name(2) != ":method"
+        print("FAIL static_name(2): got " + h2_static_name(2))
+        exit(1)
+    if h2_static_value(2) != "GET"
+        print("FAIL static_value(2): got " + h2_static_value(2))
+        exit(1)
+    // index 4 -> :path /
+    if h2_static_name(4) != ":path"
+        print("FAIL static_name(4): got " + h2_static_name(4))
+        exit(1)
+    if h2_static_value(4) != "/"
+        print("FAIL static_value(4): got " + h2_static_value(4))
+        exit(1)
+    // index 1 -> :authority (no predefined value)
+    if h2_static_name(1) != ":authority"
+        print("FAIL static_name(1): got " + h2_static_name(1))
+        exit(1)
+    if h2_static_value(1) != ""
+        print("FAIL static_value(1) should be empty: got " + h2_static_value(1))
+        exit(1)
+    // index 8 -> :status 200
+    if h2_static_name(8) != ":status" or h2_static_value(8) != "200"
+        print("FAIL static index 8")
+        exit(1)
+    // index 61 -> www-authenticate (last entry)
+    if h2_static_name(61) != "www-authenticate"
+        print("FAIL static_name(61): got " + h2_static_name(61))
+        exit(1)
+    // out-of-range: 0, 62, negative
+    if h2_static_name(0) != "" or h2_static_name(62) != "" or h2_static_name(0 - 1) != ""
+        print("FAIL static_name out-of-range should be empty")
+        exit(1)
+    if h2_static_value(0) != "" or h2_static_value(62) != ""
+        print("FAIL static_value out-of-range should be empty")
+        exit(1)
+
+    // ── KAT 11: static-table lookup ───────────────────────────────────────────
+    if h2_static_lookup(":method", "GET") != 2
+        print("FAIL static_lookup :method GET: got " + str(h2_static_lookup(":method", "GET")))
+        exit(1)
+    if h2_static_lookup(":method", "POST") != 3
+        print("FAIL static_lookup :method POST: got " + str(h2_static_lookup(":method", "POST")))
+        exit(1)
+    // :method with a value not in the table -> negative of the first :method index
+    if h2_static_lookup(":method", "PATCH") != 0 - 2
+        print("FAIL static_lookup :method PATCH: got " + str(h2_static_lookup(":method", "PATCH")))
+        exit(1)
+    // name not present at all -> 0
+    if h2_static_lookup("x-custom-header", "whatever") != 0
+        print("FAIL static_lookup unknown name should be 0: got " + str(h2_static_lookup("x-custom-header", "whatever")))
+        exit(1)
+    // :authority has no predefined value -> name-only match, negative index 1
+    if h2_static_lookup(":authority", "example.com") != 0 - 1
+        print("FAIL static_lookup :authority: got " + str(h2_static_lookup(":authority", "example.com")))
+        exit(1)
+
+    print("PASS _h2frame_test")

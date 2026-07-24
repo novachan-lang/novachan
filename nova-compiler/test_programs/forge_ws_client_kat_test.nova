@@ -1,0 +1,228 @@
+// forge_ws_client_kat_test -- KNOWN-ANSWER TEST for forge_websocket_client (RFC 6455 WebSocket
+// CLIENT). Verifies byte-exact wire vectors straight from the RFC (section 5.7's two canonical
+// frame examples + section 1.3's Sec-WebSocket-Accept example), plus the payload-length boundary
+// encodings (125/126/127, and the 16-bit->64-bit transition at 65535/65536), round-trips, empty
+// payloads, and defensive-copy/no-shared-state checks on the mask/key generators. No live socket.
+import forge
+import forge_websocket_client
+
+// _check(name, cond) -> int : prints ok/FAIL and returns 1 on failure, 0 on pass (accumulated by the
+// caller into a local counter -- kept a plain return value rather than a mutated module-level global,
+// since NOVA function calls should not depend on cross-function mutation of top-level `let` bindings).
+fn _check(name: string, cond: bool) -> int
+    if not cond
+        print("FAIL: " + name)
+        return 1
+    print("ok: " + name)
+    0
+
+// --- helpers -------------------------------------------------------------------------------------
+
+fn _bytes_from_ints(vals: list) -> any
+    let out = bytes(0)
+    let i = 0
+    while i < len(vals)
+        out = bytes_append(out, vals[i])
+        i = i + 1
+    out
+
+fn _bytes_eq(a, b) -> bool
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return false
+    let i = 0
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            return false
+        i = i + 1
+    true
+
+// n bytes all equal to `fill` (0..255)
+fn _bytes_repeat(fill: int, n: int) -> any
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, fill)
+        i = i + 1
+    out
+
+// deterministic pseudo-random-ish byte pattern (no PRNG dependency) for round-trip fuzzing
+fn _bytes_pattern(n: int) -> any
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        out = bytes_append(out, (i * 37 + 11) & 255)
+        i = i + 1
+    out
+
+fn main()
+    let FAIL = 0
+    // ══ 1. RFC 6455 5.7 example 1: unmasked "Hello" text frame ═══════════════════════════════════
+    // "A single-frame unmasked text message" -> 0x81 0x05 0x48 0x65 0x6c 0x6c 0x6f
+    let unmasked = forge.ws_encode_frame(1, 1, str_to_bytes("Hello"), [])
+    let want_unmasked = _bytes_from_ints([129, 5, 72, 101, 108, 108, 111])
+    FAIL = FAIL + _check("RFC 5.7 ex1: unmasked Hello frame byte-exact", _bytes_eq(unmasked, want_unmasked))
+    FAIL = FAIL + _check("RFC 5.7 ex1: unmasked frame length == 7", bytes_len(unmasked) == 7)
+
+    // ══ 2. RFC 6455 5.7 example 2: masked "Hello" text frame, key 37 fa 21 3d ════════════════════
+    // -> 0x81 0x85 0x37 0xfa 0x21 0x3d 0x7f 0x9f 0x4d 0x51 0x58
+    let key2 = [55, 250, 33, 61]
+    let masked = forge_websocket_client.wsc_encode_text_masked("Hello", key2)
+    let want_masked = _bytes_from_ints([129, 133, 55, 250, 33, 61, 127, 159, 77, 81, 88])
+    FAIL = FAIL + _check("RFC 5.7 ex2: masked Hello frame byte-exact", _bytes_eq(masked, want_masked))
+    FAIL = FAIL + _check("RFC 5.7 ex2: masked frame length == 11", bytes_len(masked) == 11)
+
+    // decode it back: fin/opcode/consumed/payload must round-trip to plaintext "Hello"
+    let dec2 = forge_websocket_client.wsc_decode(masked)
+    FAIL = FAIL + _check("decode masked Hello: status == 1 (complete)", dec2.status == 1)
+    FAIL = FAIL + _check("decode masked Hello: fin == 1", dec2.fin == 1)
+    FAIL = FAIL + _check("decode masked Hello: opcode == 1 (text)", dec2.opcode == 1)
+    FAIL = FAIL + _check("decode masked Hello: consumed == 11", dec2.consumed == 11)
+    FAIL = FAIL + _check("decode masked Hello: payload == \"Hello\"", bytes_to_str(dec2.payload) == "Hello")
+
+    // ══ 3. Sec-WebSocket-Accept: RFC 6455 1.3 canonical example ═══════════════════════════════════
+    let rfc_key = "dGhlIHNhbXBsZSBub25jZQ=="
+    let rfc_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    FAIL = FAIL + _check("Sec-WebSocket-Accept RFC example byte-exact", forge_websocket_client.wsc_expected_accept(rfc_key) == rfc_accept)
+    FAIL = FAIL + _check("wsc_verify_accept true on correct accept", forge_websocket_client.wsc_verify_accept(rfc_key, rfc_accept))
+    FAIL = FAIL + _check("wsc_verify_accept false on wrong accept", not forge_websocket_client.wsc_verify_accept(rfc_key, "not-the-right-value="))
+    FAIL = FAIL + _check("wsc_verify_accept false on empty accept", not forge_websocket_client.wsc_verify_accept(rfc_key, ""))
+
+    // ══ 4. Opening handshake request text, byte-exact ═════════════════════════════════════════════
+    let req = forge_websocket_client.wsc_build_request("example.com", "/chat", rfc_key)
+    let want_req = "GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + rfc_key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    FAIL = FAIL + _check("handshake request text byte-exact", req == want_req)
+    // empty/missing path component must not crash and must normalize to "/"
+    let req_empty_path = forge_websocket_client.wsc_build_request("example.com", "", rfc_key)
+    FAIL = FAIL + _check("empty path normalizes to /", find(req_empty_path, "GET / HTTP/1.1") == 0)
+
+    // ══ 5. Payload-length boundaries: 125 (7-bit inline), 126 and 127 (16-bit extended) ═══════════
+    // len 125: byte1 = 0x80|125 = 0xFD (253), NO length-extension bytes -> header(2)+mask(4)+125
+    let p125 = _bytes_repeat(65, 125)
+    let f125 = forge.ws_encode_frame(1, 2, p125, [1, 2, 3, 4])
+    FAIL = FAIL + _check("len=125: total frame size == 2+4+125", bytes_len(f125) == 131)
+    FAIL = FAIL + _check("len=125: byte1 == 0xFD (mask bit + inline 125)", bytes_get(f125, 1) == 253)
+    let d125 = forge_websocket_client.wsc_decode(f125)
+    FAIL = FAIL + _check("len=125: decodes complete, consumed==131", d125.status == 1 and d125.consumed == 131)
+    FAIL = FAIL + _check("len=125: payload round-trips", _bytes_eq(d125.payload, p125))
+
+    // len 126: byte1 = 0x80|126 = 0xFE (254), 2 extension bytes = 0x00 0x7E -> header(4)+mask(4)+126
+    let p126 = _bytes_repeat(66, 126)
+    let f126 = forge.ws_encode_frame(1, 2, p126, [5, 6, 7, 8])
+    FAIL = FAIL + _check("len=126: total frame size == 4+4+126", bytes_len(f126) == 134)
+    FAIL = FAIL + _check("len=126: byte1 == 0xFE (mask bit + 16-bit marker)", bytes_get(f126, 1) == 254)
+    FAIL = FAIL + _check("len=126: extended length bytes == 00 7E", bytes_get(f126, 2) == 0 and bytes_get(f126, 3) == 126)
+    let d126 = forge_websocket_client.wsc_decode(f126)
+    FAIL = FAIL + _check("len=126: decodes complete, consumed==134", d126.status == 1 and d126.consumed == 134)
+    FAIL = FAIL + _check("len=126: payload round-trips", _bytes_eq(d126.payload, p126))
+
+    // len 127: byte1 == 0xFE still (marker is 126, not literal length), extension = 0x00 0x7F -> 4+4+127
+    let p127 = _bytes_repeat(67, 127)
+    let f127 = forge.ws_encode_frame(1, 2, p127, [9, 10, 11, 12])
+    FAIL = FAIL + _check("len=127: total frame size == 4+4+127", bytes_len(f127) == 135)
+    FAIL = FAIL + _check("len=127: byte1 == 0xFE (16-bit marker, NOT literal 127)", bytes_get(f127, 1) == 254)
+    FAIL = FAIL + _check("len=127: extended length bytes == 00 7F", bytes_get(f127, 2) == 0 and bytes_get(f127, 3) == 127)
+    let d127 = forge_websocket_client.wsc_decode(f127)
+    FAIL = FAIL + _check("len=127: decodes complete, consumed==135", d127.status == 1 and d127.consumed == 135)
+    FAIL = FAIL + _check("len=127: payload round-trips", _bytes_eq(d127.payload, p127))
+
+    // ══ 6. 16-bit -> 64-bit length-field transition: 65535 / 65536 ════════════════════════════════
+    let p65535 = _bytes_pattern(65535)
+    let f65535 = forge.ws_encode_frame(1, 2, p65535, [13, 14, 15, 16])
+    FAIL = FAIL + _check("len=65535: byte1 == 0xFE (still 16-bit marker)", bytes_get(f65535, 1) == 254)
+    FAIL = FAIL + _check("len=65535: extended length bytes == FF FF", bytes_get(f65535, 2) == 255 and bytes_get(f65535, 3) == 255)
+    let d65535 = forge_websocket_client.wsc_decode(f65535)
+    FAIL = FAIL + _check("len=65535: round-trips (16-bit boundary)", d65535.status == 1 and _bytes_eq(d65535.payload, p65535))
+
+    let p65536 = _bytes_pattern(65536)
+    let f65536 = forge.ws_encode_frame(1, 2, p65536, [17, 18, 19, 20])
+    FAIL = FAIL + _check("len=65536: byte1 == 0xFF (64-bit marker, mask bit + 127)", bytes_get(f65536, 1) == 255)
+    // 8-byte big-endian length = 0x0000000000010000
+    FAIL = FAIL + _check("len=65536: 64-bit length bytes are big-endian 0x10000", bytes_get(f65536, 2) == 0 and bytes_get(f65536, 3) == 0 and bytes_get(f65536, 4) == 0 and bytes_get(f65536, 5) == 0 and bytes_get(f65536, 6) == 0 and bytes_get(f65536, 7) == 1 and bytes_get(f65536, 8) == 0 and bytes_get(f65536, 9) == 0)
+    let d65536 = forge_websocket_client.wsc_decode(f65536)
+    FAIL = FAIL + _check("len=65536: round-trips (64-bit boundary)", d65536.status == 1 and _bytes_eq(d65536.payload, p65536))
+
+    // ══ 7. Empty payload frame: parse must not crash on an empty/absent payload component ═════════
+    let fempty = forge_websocket_client.wsc_encode_text_masked("", [21, 22, 23, 24])
+    FAIL = FAIL + _check("empty payload: total frame size == 2+4+0", bytes_len(fempty) == 6)
+    let dempty = forge_websocket_client.wsc_decode(fempty)
+    FAIL = FAIL + _check("empty payload: decodes complete", dempty.status == 1 and dempty.consumed == 6)
+    FAIL = FAIL + _check("empty payload: payload is zero-length", bytes_len(dempty.payload) == 0)
+    FAIL = FAIL + _check("empty payload: text round-trips to \"\"", bytes_to_str(dempty.payload) == "")
+
+    // ══ 8. Incomplete-buffer handling: must ask for more, never crash on a truncated frame ═════════
+    let full = forge_websocket_client.wsc_encode_text_masked("partial-frame-body", [1, 2, 3, 4])
+    let truncated1 = bytes_slice(full, 0, 1)
+    FAIL = FAIL + _check("1-byte buffer: status 0 (need more)", forge_websocket_client.wsc_decode(truncated1).status == 0)
+    let truncated_mid = bytes_slice(full, 0, bytes_len(full) - 1)
+    FAIL = FAIL + _check("truncated-by-1 buffer: status 0 (need more)", forge_websocket_client.wsc_decode(truncated_mid).status == 0)
+    FAIL = FAIL + _check("zero-length buffer: status 0 (need more)", forge_websocket_client.wsc_decode(bytes(0)).status == 0)
+
+    // ══ 9. Binary safety: embedded 0x00 bytes survive mask/unmask untouched ═══════════════════════
+    let binpayload = _bytes_from_ints([0, 1, 0, 255, 0, 128, 0])
+    let fbin = forge_websocket_client.wsc_encode_binary_masked(binpayload, [200, 201, 202, 203])
+    let dbin = forge_websocket_client.wsc_decode(fbin)
+    FAIL = FAIL + _check("binary payload with embedded NUL round-trips exactly", _bytes_eq(dbin.payload, binpayload))
+    FAIL = FAIL + _check("binary frame opcode == 2", dbin.opcode == 2)
+
+    // ══ 10. Generic round-trip: decode(encode(x)) == x for a handful of masks/lengths ═════════════
+    let sizes = [0, 1, 2, 13, 60, 200, 1000]
+    let si = 0
+    while si < len(sizes)
+        let n = sizes[si]
+        let payload = _bytes_pattern(n)
+        let mk = [(n + 3) & 255, (n + 7) & 255, (n + 11) & 255, (n + 19) & 255]
+        let fr = forge.ws_encode_frame(1, 2, payload, mk)
+        let d = forge_websocket_client.wsc_decode(fr)
+        FAIL = FAIL + _check("round-trip size " + str(n), d.status == 1 and _bytes_eq(d.payload, payload))
+        si = si + 1
+
+    // ══ 11. Handshake key/mask generators: correct shape + no shared mutable state (defensive copy) ═
+    let k1 = forge_websocket_client.wsc_generate_key()
+    let k2 = forge_websocket_client.wsc_generate_key()
+    FAIL = FAIL + _check("generated key length == 24 (base64 of 16 bytes)", len(k1) == 24)
+    FAIL = FAIL + _check("two generated keys differ (CSPRNG, not fixed)", k1 != k2)
+
+    let m1 = forge_websocket_client.wsc_generate_mask()
+    let m2 = forge_websocket_client.wsc_generate_mask()
+    FAIL = FAIL + _check("generated mask has 4 elements", len(m1) == 4)
+    // mutate the returned mask in place -- must NOT affect a subsequently generated mask (no shared
+    // internal state / live reference leaking out of the generator)
+    m1[0] = 999999
+    let m3 = forge_websocket_client.wsc_generate_mask()
+    FAIL = FAIL + _check("mutating a returned mask does not corrupt future generations", m3[0] != 999999)
+    FAIL = FAIL + _check("m2 is a normal 4-byte mask (each byte 0..255)", m2[0] >= 0 and m2[0] <= 255 and m2[1] >= 0 and m2[1] <= 255 and m2[2] >= 0 and m2[2] <= 255 and m2[3] >= 0 and m2[3] <= 255)
+
+    // wsc_encode_text uses a fresh random mask each call -> two calls on the same plaintext must NOT
+    // produce identical wire bytes (mask must vary), but MUST decode back to the same plaintext.
+    let auto1 = forge_websocket_client.wsc_encode_text("same-message")
+    let auto2 = forge_websocket_client.wsc_encode_text("same-message")
+    FAIL = FAIL + _check("wsc_encode_text: two calls use different random masks (wire bytes differ)", not _bytes_eq(auto1, auto2))
+    let dauto1 = forge_websocket_client.wsc_decode(auto1)
+    let dauto2 = forge_websocket_client.wsc_decode(auto2)
+    FAIL = FAIL + _check("wsc_encode_text: both decode back to the same plaintext", bytes_to_str(dauto1.payload) == "same-message" and bytes_to_str(dauto2.payload) == "same-message")
+
+    // ══ 12. Control frames: ping/pong/close, masked, <=125 bytes, never fragmented ═════════════════
+    let cmask = [30, 40, 50, 60]
+    let ping = forge_websocket_client.wsc_ping_masked(str_to_bytes("ping-body"), cmask)
+    let dping = forge_websocket_client.wsc_decode(ping)
+    FAIL = FAIL + _check("ping frame: opcode == 9", dping.opcode == 9)
+    FAIL = FAIL + _check("ping frame: fin == 1 (never fragmented)", dping.fin == 1)
+    FAIL = FAIL + _check("ping frame: payload round-trips", bytes_to_str(dping.payload) == "ping-body")
+
+    let pong = forge_websocket_client.wsc_pong_masked(str_to_bytes("pong-body"), cmask)
+    let dpong = forge_websocket_client.wsc_decode(pong)
+    FAIL = FAIL + _check("pong frame: opcode == 10", dpong.opcode == 10)
+    FAIL = FAIL + _check("pong frame: payload round-trips", bytes_to_str(dpong.payload) == "pong-body")
+
+    let closef = forge_websocket_client.wsc_close_frame_masked(cmask)
+    let dclose = forge_websocket_client.wsc_decode(closef)
+    FAIL = FAIL + _check("close frame: opcode == 8", dclose.opcode == 8)
+    FAIL = FAIL + _check("close frame: empty payload", bytes_len(dclose.payload) == 0)
+    FAIL = FAIL + _check("close frame: total size == 2+4+0 == 6", bytes_len(closef) == 6)
+
+    if FAIL == 0
+        print("PASS")
+    else
+        print("FAILCOUNT " + str(FAIL))
