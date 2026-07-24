@@ -1,0 +1,283 @@
+// forge_influxdb -- an InfluxDB line-protocol FORMATTER: renders points (measurement + tags +
+// fields + optional timestamp) to the wire text InfluxDB's HTTP write API (and Telegraf) consume.
+// Pure string formatter, no HTTP/socket wiring of its own -- pairs naturally with a client module
+// (e.g. forge_http) that actually POSTs the rendered lines to /api/v2/write or /write.
+// LEAF -- imports nothing.
+//
+// LINE FORMAT (InfluxDB line-protocol spec):
+//   measurement[,tag_key=tag_value...] field_key=field_value[,field_key=field_value...] [timestamp]
+//
+// ESCAPING RULES (spec table):
+//   measurement            : escape comma, space              (equals sign is NOT special here)
+//   tag key / tag value    : escape comma, equals sign, space
+//   field key              : escape comma, equals sign, space   (identical rule to tag key/value)
+//   field STRING value     : wrap in double quotes; escape backslash and double quote
+// Plus a defensive extension beyond the bare spec: this module ALSO escapes an embedded newline
+// (LF, 0x0A) or carriage return (CR, 0x0D) -- in measurement, tag keys/values, field keys, AND
+// quoted string field values -- as the two-character sequences `\n` / `\r`. The line protocol is
+// newline-delimited (one point per line), so a RAW embedded newline in any component would silently
+// start a second line/point -- an injection: attacker-controlled tag data could smuggle an extra,
+// attacker-chosen point into the write stream. The official spec is silent on this because
+// well-formed callers never emit one, but a formatter that blindly interpolates caller strings
+// cannot assume good behavior. Same defensive reasoning as forge_prometheus.nova's
+// prom_escape_label, which escapes newline in Prometheus label values for the identical reason.
+//
+// FIELD VALUE TYPES (dispatched via type_of(v), same technique as std/encoding/bson.nova's
+// _bs_type_and_value dispatcher):
+//   int    -> bare digits + trailing `i` (line protocol's integer marker), e.g. 5 -> "5i"
+//   float  -> bare digits, NO type suffix and NO forced ".0": 82.0 -> "82" (str(82.0) is "82.0" in
+//             NOVA; the trailing ".0" is stripped so the canonical InfluxDB docs example
+//             `temp=82 1465839830100400200` reproduces byte-exact -- see _infl_fmt_float)
+//   string -> double-quoted, with backslash/quote/newline escaping (_infl_escape_field_string)
+//   other  -> (see BOOL/INT AMBIGUITY below, and the safe fallback at the end of this section)
+//
+// THE BOOL/INT AMBIGUITY (fundamental NOVA limitation, not a module bug -- IDENTICAL to
+// std/encoding/bson.nova's documented limitation). `type_of(true) == "int"` once a bool value has
+// passed through an `any`-typed dict -- NOVA booleans are unboxed ints, indistinguishable from a
+// plain int once boxed into `fields[key]`. A generic formatter therefore cannot tell "the caller
+// wrote true" from "the caller wrote the int 1". A plain field value that started life as a NOVA
+// bool is rendered as an int field (`flag=1i`) by default. To force InfluxDB's real boolean literal
+// (`t`/`f`, unquoted, no suffix), wrap the value with influx_bool(v) before inserting it:
+//   let fields = {}
+//   fields["ok"] = influx_bool(true)
+// This uses the same reserved-single-key wrapper-dict technique as bson.nova's bson_bool
+// ({"$bsonBool": 0|1}) -- here {"$influxBool": 0|1}. A real field that happens to be a single-key
+// dict literally named "$influxBool" would collide with this; that tradeoff is accepted and
+// documented, exactly as bson.nova accepts the equivalent collision for "$bsonBool". Any OTHER
+// unsupported field-value shape (a plain dict that is not this wrapper, a list, bytes, a struct)
+// falls back to a double-quoted, fully-escaped `str(v)` rendering -- never raw-interpolated -- so a
+// caller mistake can never corrupt the line's structure, only produce a semantically-odd string
+// field (documented safe fallback, same spirit as bson.nova's "other -> null" fallback).
+//
+// TAG ORDERING: tags are sorted by key (lexicographic, via the `sort` builtin) before rendering.
+// InfluxDB's own docs recommend sorted tags for best write performance (the server's series index
+// can skip a per-write re-sort), and sorting also makes this module's output deterministic
+// regardless of the input dict's hash/insertion iteration order (`keys()` order is not guaranteed
+// stable across builds -- see forge_prometheus.nova's header comment for the same concern). Field
+// keys are ALSO sorted for the same determinism reason, even though the wire format does not
+// require it (field order is not semantically meaningful to InfluxDB).
+//
+// TIMESTAMP: passed as an explicit `int` (nanoseconds since epoch, InfluxDB's default write
+// precision) via influx_line(); influx_line_notime() omits the timestamp segment entirely (a valid
+// line -- InfluxDB stamps server-arrival time when no timestamp is given). A nullable timestamp
+// parameter is deliberately NOT offered: `null` passed through an `any`-typed parameter also
+// collapses to int 0 in NOVA (same root cause as the bool ambiguity above) and could not be
+// distinguished from a genuine caller intent of "epoch 0" -- two explicit functions are safer than
+// one function with an ambiguous sentinel.
+//
+// EMPTY / MISSING:
+//   tags == {}    -> the ",tag=..." segment is omitted entirely (bare `measurement field=val`,
+//                    valid per spec -- tags are optional).
+//   fields == {}  -> renders a syntactically-shaped but semantically INVALID line (every InfluxDB
+//                    point needs >= 1 field); this module is a pure formatter, not a validator, so
+//                    it does not crash on this -- it is documented caller error, same policy as
+//                    bson.nova's malformed-input handling being confined to its DECODE path only.
+//   measurement == "" -> renders with an empty measurement segment; also caller error, not crashed.
+//
+// KNOWN LIMITATION -- extreme floats: NOVA's str() renders very large/small floats in scientific
+// notation (e.g. str(1.0e21) == "1e+21"), which _infl_fmt_float passes through unchanged (it only
+// strips a literal trailing ".0"). Whether every InfluxDB server build accepts exponent notation
+// for a float field is not something this module verifies; ordinary-magnitude floats (the
+// overwhelming common case for metrics) always render as plain decimals. This mirrors bson.nova's
+// documented STRING NUL LIMITATION in spirit: a known, accepted NOVA/runtime-level boundary, not a
+// bug in this module's logic.
+//
+// IMPLEMENTATION NOTES
+//   * LEAF module -- imports nothing.
+//   * All private helpers prefixed _infl_ to avoid link collisions.
+//   * Escaping uses a single left-to-right character scan per string (never a sequence of global
+//     replaces) -- an escape sequence produced for one input character is never re-scanned and
+//     double-escaped by a later rule (same reasoning as forge_prometheus.nova's prom_escape_label).
+//   * Single-exit style (a trailing expression, reassigning one `let`) throughout to avoid the NOVA
+//     early-return mistag bug and to match this codebase's preferred single-`let` style.
+//   * No multi-line list/dict literals (NOVA parser limitation).
+// ============================================================================
+
+// ── escaping (spec rules + the newline/CR injection guard documented above) ───────────────────────
+
+// Measurement escaping: comma, space -> backslash-escaped. Equals sign is NOT special in a
+// measurement name (per spec) so it passes through unescaped.
+fn _infl_escape_measurement(s: string) -> string
+    let bs = chr(92)
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = char_at(s, i)
+        let o = ord(c)
+        if o == 44
+            out = out + bs + ","
+        else if o == 32
+            out = out + bs + " "
+        else if o == 10
+            out = out + bs + "n"
+        else if o == 13
+            out = out + bs + "r"
+        else
+            out = out + c
+        i = i + 1
+    out
+
+// Tag key / tag value / field key escaping (identical rule per spec): comma, equals sign, space
+// -> backslash-escaped. Reused for field keys below (_infl_render_fields) since the spec gives
+// field keys the exact same escape set as tag keys/values.
+fn _infl_escape_tag(s: string) -> string
+    let bs = chr(92)
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = char_at(s, i)
+        let o = ord(c)
+        if o == 44
+            out = out + bs + ","
+        else if o == 61
+            out = out + bs + "="
+        else if o == 32
+            out = out + bs + " "
+        else if o == 10
+            out = out + bs + "n"
+        else if o == 13
+            out = out + bs + "r"
+        else
+            out = out + c
+        i = i + 1
+    out
+
+// Quoted string field-value escaping: backslash -> \\, double-quote -> \" (spec rule), plus the
+// newline/CR injection guard documented at the top of this file. The surrounding double quotes are
+// added by the caller (_infl_fmt_field_value), not here -- this function only escapes the content.
+fn _infl_escape_field_string(s: string) -> string
+    let bs = chr(92)
+    let q = chr(34)
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = char_at(s, i)
+        let o = ord(c)
+        if o == 92
+            out = out + bs + bs
+        else if o == 34
+            out = out + bs + q
+        else if o == 10
+            out = out + bs + "n"
+        else if o == 13
+            out = out + bs + "r"
+        else
+            out = out + c
+        i = i + 1
+    out
+
+// ── numeric / bool field-value formatting ──────────────────────────────────────────────────────────
+
+// Bare float rendering: str(v) always yields a single trailing ".0" for an integral NOVA float
+// (verified: str(82.0) == "82.0", str(-5.0) == "-5.0", never extra trailing zeros, never forced
+// ".0" on a non-integral value) -- strip that suffix so 82.0 -> "82", matching InfluxDB's own docs
+// example. A non-integral float (e.g. 82.5) is left exactly as str() renders it.
+fn _infl_fmt_float(v: float) -> string
+    let s = str(v)
+    let out = s
+    if ends_with(s, ".0")
+        out = slice(s, 0, len(s) - 2)
+    out
+
+// influx_bool(v): wrap a real NOVA bool so a field renders as InfluxDB's `t`/`f` boolean literal
+// instead of the default int-field fallback (see THE BOOL/INT AMBIGUITY above for why this wrapper
+// is necessary at all). `v` is typed `bool` directly (not `any`), so the value is never boxed
+// through a generic container before this function reads it -- the ambiguity only exists once a
+// bool has been placed into an `any`-typed dict slot, which is exactly what this wrapper avoids by
+// encoding the true/false decision as an explicit int (1/0) under a reserved key instead.
+fn influx_bool(v: bool) -> dict
+    let iv = 0
+    if v
+        iv = 1
+    let out = {}
+    out["$influxBool"] = iv
+    out
+
+// Dispatch a single field value to its line-protocol text (see FIELD VALUE TYPES above).
+fn _infl_fmt_field_value(v: any) -> string
+    let t = type_of(v)
+    let out = ""
+    if t == "int"
+        out = str(v) + "i"
+    else if t == "float"
+        out = _infl_fmt_float(v)
+    else if t == "string"
+        out = chr(34) + _infl_escape_field_string(v) + chr(34)
+    else if t == "dict"
+        let ks = keys(v)
+        if len(ks) == 1 and ks[0] == "$influxBool"
+            let bv = v["$influxBool"]
+            if bv != 0
+                out = "t"
+            else
+                out = "f"
+        else
+            out = chr(34) + _infl_escape_field_string(str(v)) + chr(34)
+    else
+        out = chr(34) + _infl_escape_field_string(str(v)) + chr(34)
+    out
+
+// ── tag-set / field-set rendering (sorted, see TAG ORDERING above) ────────────────────────────────
+
+// Renders ",k1=v1,k2=v2,..." (sorted by key), or "" for an empty tag set (tags are optional --
+// the caller's " " + fields segment follows directly after the bare measurement in that case).
+// Tag VALUES are coerced through str(v) before escaping so a caller who passes a non-string tag
+// value (e.g. an int) still renders sensibly -- InfluxDB tag values are always text on the wire.
+fn _infl_render_tags(tags: dict) -> string
+    let ks = sort(keys(tags))
+    let out = ""
+    let i = 0
+    while i < len(ks)
+        let k = ks[i]
+        out = out + "," + _infl_escape_tag(k) + "=" + _infl_escape_tag(str(tags[k]))
+        i = i + 1
+    out
+
+// Renders "k1=v1,k2=v2,..." (sorted by key, no leading/trailing separator). Field keys use the
+// same escape rule as tag keys/values (_infl_escape_tag -- see spec table above).
+fn _infl_render_fields(fields: dict) -> string
+    let ks = sort(keys(fields))
+    let out = ""
+    let i = 0
+    while i < len(ks)
+        let k = ks[i]
+        if i > 0
+            out = out + ","
+        out = out + _infl_escape_tag(k) + "=" + _infl_fmt_field_value(fields[k])
+        i = i + 1
+    out
+
+// ── public API ──────────────────────────────────────────────────────────────────────────────────
+
+// Render one line-protocol point WITH an explicit timestamp (nanoseconds since epoch).
+//   influx_line("weather", {"location": "us-west"}, {"temp": 82.0}, 1465839830100400200)
+//     -> "weather,location=us-west temp=82 1465839830100400200"
+fn influx_line(measurement: string, tags: dict, fields: dict, timestamp: int) -> string
+    _infl_escape_measurement(measurement) + _infl_render_tags(tags) + " " + _infl_render_fields(fields) + " " + str(timestamp)
+
+// Render one line-protocol point WITHOUT a timestamp (InfluxDB stamps server-arrival time).
+fn influx_line_notime(measurement: string, tags: dict, fields: dict) -> string
+    _infl_escape_measurement(measurement) + _infl_render_tags(tags) + " " + _infl_render_fields(fields)
+
+// Render a batch of points to a newline-joined line-protocol document (one HTTP write body).
+// Each point is a dict with keys "measurement" (string), "tags" (dict), "fields" (dict), and
+// OPTIONALLY "timestamp" (int) -- a point dict missing the "timestamp" key renders via
+// influx_line_notime (checked with `contains`, never a `!= null` comparison -- see the NULL/0
+// gotcha documented across this codebase: a bare 0 timestamp must never be silently treated as
+// "missing"). Empty `points` returns "".
+fn influx_lines(points: list) -> string
+    let out = ""
+    let i = 0
+    while i < len(points)
+        let p = points[i]
+        let line = ""
+        if contains(p, "timestamp")
+            line = influx_line(p["measurement"], p["tags"], p["fields"], p["timestamp"])
+        else
+            line = influx_line_notime(p["measurement"], p["tags"], p["fields"])
+        out = out + line + "\n"
+        i = i + 1
+    out

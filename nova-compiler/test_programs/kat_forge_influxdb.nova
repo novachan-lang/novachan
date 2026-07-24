@@ -1,0 +1,171 @@
+// KAT: forge_influxdb -- InfluxDB line-protocol formatter. Byte-exact checks against the spec
+// example, measurement/tag escaping (comma+space), string-field quote/backslash escaping, int
+// field `i` suffix, bool wrapper, newline-injection defense, sorting, and the edge-case checklist
+// (empty tags/fields, boundary int widths, notime variant, batch join).
+import forge_influxdb
+
+fn main()
+    let fails = 0
+
+    // 1. Canonical InfluxDB docs example -- byte-exact.
+    let l1 = influx_line("weather", {"location": "us-west"}, {"temp": 82.0}, 1465839830100400200)
+    if l1 != "weather,location=us-west temp=82 1465839830100400200"
+        print("FAIL 1: " + l1)
+        fails = fails + 1
+
+    // 2. Measurement with a space + tag key with a space + tag value with commas -- all escaped.
+    let l2 = influx_line("my measurement", {"my tag": "value,with,commas"}, {"count": 5}, 100)
+    if l2 != "my\\ measurement,my\\ tag=value\\,with\\,commas count=5i 100"
+        print("FAIL 2: " + l2)
+        fails = fails + 1
+
+    // 3. Tag key/value containing an equals sign -- escaped (equals is special in tags, NOT in
+    //    measurement).
+    let l3 = influx_line("m=x", {"a=b": "c=d"}, {"n": 1}, 5)
+    if l3 != "m=x,a\\=b=c\\=d n=1i 5"
+        print("FAIL 3: " + l3)
+        fails = fails + 1
+
+    // 4. String field value with an embedded double-quote and a backslash -- both escaped and the
+    //    whole value double-quoted.
+    let q = chr(34)
+    let bs = chr(92)
+    let raw = "she said " + q + "hi" + q + " " + bs + "path"
+    let l4 = influx_line_notime("log", {}, {"msg": raw})
+    let want4 = "log msg=" + q + "she said " + bs + q + "hi" + bs + q + " " + bs + bs + "path" + q
+    if l4 != want4
+        print("FAIL 4: " + l4)
+        print("want 4: " + want4)
+        fails = fails + 1
+
+    // 5. Int field boundary widths: 127/128, 255/256, 2^31-1, 2^31, 2^32, negative, i64 extremes.
+    let f5 = {}
+    f5["a"] = 127
+    f5["b"] = 128
+    f5["c"] = 255
+    f5["d"] = 256
+    f5["e"] = 2147483647
+    f5["f"] = 2147483648
+    f5["g"] = 4294967296
+    f5["h"] = -1
+    f5["i"] = 9223372036854775807
+    let l5 = influx_line_notime("ints", {}, f5)
+    let want5 = "ints a=127i,b=128i,c=255i,d=256i,e=2147483647i,f=2147483648i,g=4294967296i,h=-1i,i=9223372036854775807i"
+    if l5 != want5
+        print("FAIL 5: " + l5)
+        print("want 5: " + want5)
+        fails = fails + 1
+
+    // 6. Bool wrapper -> t/f; a plain int 0/1 in a fields dict is NOT auto-detected as bool
+    //    (documented NOVA any/bool ambiguity) -- it renders as an int field instead.
+    let f6 = {}
+    f6["ok"] = influx_bool(true)
+    f6["bad"] = influx_bool(false)
+    f6["raw_one"] = 1
+    let l6 = influx_line_notime("flags", {}, f6)
+    let want6 = "flags bad=f,ok=t,raw_one=1i"
+    if l6 != want6
+        print("FAIL 6: " + l6)
+        print("want 6: " + want6)
+        fails = fails + 1
+
+    // 7. Injection: a newline (and CR) embedded in a tag value cannot start a second line/point --
+    //    it must be backslash-escaped, and the rendered line must contain NO raw newline byte.
+    let nl = chr(10)
+    let cr = chr(13)
+    let evil = "west" + nl + "malicious,measurement field=666i" + cr + "x"
+    let l7 = influx_line("weather", {"location": evil}, {"temp": 1}, 9)
+    let want7 = "weather,location=west\\nmalicious\\,measurement\\ field\\=666i\\rx temp=1i 9"
+    if l7 != want7
+        print("FAIL 7a: " + l7)
+        print("want 7a: " + want7)
+        fails = fails + 1
+    if contains(l7, nl)
+        print("FAIL 7b: raw newline leaked into rendered line")
+        fails = fails + 1
+    if contains(l7, cr)
+        print("FAIL 7c: raw CR leaked into rendered line")
+        fails = fails + 1
+
+    // 8. Injection in a string FIELD value too.
+    let l8 = influx_line_notime("log", {}, {"msg": "a" + nl + "b"})
+    if contains(l8, nl)
+        print("FAIL 8: raw newline leaked into a quoted string field")
+        fails = fails + 1
+    let want8 = "log msg=" + q + "a\\nb" + q
+    if l8 != want8
+        print("FAIL 8b: " + l8)
+        fails = fails + 1
+
+    // 9. Tags SHOULD be sorted by key regardless of insertion/dict order.
+    let t9 = {}
+    t9["zeta"] = "z"
+    t9["alpha"] = "a"
+    t9["mid"] = "m"
+    let l9 = influx_line_notime("srt", t9, {"n": 1})
+    let want9 = "srt,alpha=a,mid=m,zeta=z n=1i"
+    if l9 != want9
+        print("FAIL 9: " + l9)
+        fails = fails + 1
+
+    // 10. Empty tags -> no tag segment at all (bare "measurement field=val").
+    let l10 = influx_line_notime("bare", {}, {"n": 1})
+    if l10 != "bare n=1i"
+        print("FAIL 10: " + l10)
+        fails = fails + 1
+
+    // 11. Non-integral float passes through str() unchanged (no ".0" stripped when there IS a
+    //     fractional part), negative integral float strips correctly.
+    let f11 = {}
+    f11["a"] = 82.5
+    f11["b"] = -5.0
+    f11["c"] = 0.0
+    let l11 = influx_line_notime("floats", {}, f11)
+    let want11 = "floats a=82.5,b=-5,c=0"
+    if l11 != want11
+        print("FAIL 11: " + l11)
+        print("want 11: " + want11)
+        fails = fails + 1
+
+    // 12. Multi-field line with fields sorted by key for determinism.
+    let f12 = {}
+    f12["z"] = 1
+    f12["a"] = 2
+    let l12 = influx_line_notime("multi", {}, f12)
+    if l12 != "multi a=2i,z=1i"
+        print("FAIL 12: " + l12)
+        fails = fails + 1
+
+    // 13. Batch rendering via influx_lines: mixed timestamped + notime points, newline-joined.
+    let p1 = {}
+    p1["measurement"] = "weather"
+    p1["tags"] = {"location": "us-west"}
+    p1["fields"] = {"temp": 82.0}
+    p1["timestamp"] = 1465839830100400200
+    let p2 = {}
+    p2["measurement"] = "bare"
+    p2["tags"] = {}
+    p2["fields"] = {"n": 1}
+    let batch = influx_lines([p1, p2])
+    let want13 = "weather,location=us-west temp=82 1465839830100400200\nbare n=1i\n"
+    if batch != want13
+        print("FAIL 13: " + batch)
+        print("want 13: " + want13)
+        fails = fails + 1
+
+    // 14. A timestamp of exactly 0 must render as "0", never be mistaken for "missing" (guards
+    //     the `contains()` vs `!= null` gotcha in influx_lines).
+    let p14 = {}
+    p14["measurement"] = "z"
+    p14["tags"] = {}
+    p14["fields"] = {"n": 1}
+    p14["timestamp"] = 0
+    let l14 = influx_lines([p14])
+    if l14 != "z n=1i 0\n"
+        print("FAIL 14: " + l14)
+        fails = fails + 1
+
+    if fails == 0
+        print("PASS")
+    else
+        print("FAILS: " + str(fails))

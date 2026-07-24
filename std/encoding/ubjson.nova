@@ -1,0 +1,473 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/ubjson (Universal Binary JSON)
+// ============================================================================
+import std/encoding/pack
+// WHAT: UBJSON (ubjson.org, draft-12) binary encoder/decoder — a JSON data
+// model (null/bool/number/string/array/object) laid out as compact, typed
+// binary instead of text. Every value is a 1-byte type MARKER followed by its
+// payload; containers are delimited by `[`/`]` and `{`/`{` marker bytes
+// (no text punctuation, no whitespace, no escaping).
+//
+// REUSE, NOT REINVENTION.
+//   * Fixed-width big-endian integers -> std/encoding/pack (pack_i8/u8/i16_be/
+//     i32_be/i64_be + the matching unpack_* readers). UBJSON integers are
+//     BIG-endian (network order) — the `_be` half of pack.nova, unlike
+//     std/encoding/bson and std/encoding/avro which are little-endian formats
+//     and use the `_le` half. Same module, opposite endianness selection.
+//   * float32 narrow/widen -> the exact std/encoding/avro `av_encode_float` /
+//     `av_decode_float` technique (alloc_raw/ptr_write_f32/ptr_read_u32/
+//     free_raw to get an exact IEEE-754 single bit pattern; f32_from_bits to
+//     safely widen back — there is no safe f32_to_bits builtin).
+//   * float64 exact bits -> float_to_bits/float_from_bits (same technique as
+//     std/encoding/bson's double field).
+//   * bytes<->string -> str_to_bytes/bytes_to_str (same builtins bson.nova
+//     uses for its cstring/string readers).
+// This module adds ONLY the UBJSON-specific pieces: marker bytes, the
+// smallest-fits-the-value integer/float type selection, and the recursive
+// value/array/object grammar.
+//
+// TYPE MARKERS (draft-12 core set; this module implements ALL of them):
+//   Z null   T true   F false   C char(1 ASCII byte, DECODE ONLY — NOVA has
+//   no separate char type; a 1-char value always ENCODES as S, matching every
+//   published UBJSON encoder and this module's own byte-exact KAT)
+//   i int8   U uint8   I int16   l int32   L int64
+//   d float32   D float64
+//   S string  (marker + length AS A NESTED OPTIMIZED INT + UTF-8 bytes)
+//   [ ... ]   array      { ... }   object (key = length-prefixed UTF-8 bytes,
+//                                           NO marker byte on the key itself)
+// NOT implemented: the OPTIONAL draft-12 "strongly/count-optimized container"
+// extension (`[$<type>#<count> ...]`). The task's byte-exact spec examples
+// ([1,2] -> 5B 69 01 69 02 5D, {"a":1} -> 7B 69 01 61 69 01 7D) are the
+// UNoptimized container form with no $/# — that is what this module emits
+// and what its decoder expects. A future extension could add container
+// optimization as a pure size optimization without changing this API.
+//
+// INTEGER "SMALLEST MARKER THAT FITS" RULE (matches the spec's own examples):
+//   -128..127    -> i (int8, 1 byte payload)
+//    128..255    -> U (uint8, 1 byte payload)   [uint8 is 0..255, but 0..127
+//                                                 already went to i above, so
+//                                                 in practice U only fires for
+//                                                 128..255 — verified against
+//                                                 the spec's 255 -> U example]
+//   -32768..32767 (outside the above)          -> I (int16, 2 bytes)
+//   -2147483648..2147483647 (outside above)    -> l (int32, 4 bytes)
+//   otherwise                                   -> L (int64, 8 bytes)
+// This selection is used BOTH for scalar integer values AND for every
+// length prefix (string length, object-key length) — exactly as the spec's
+// own {"a":1} example shows a length of 1 encoded as `i 01`, not a fixed
+// width.
+//
+// FLOAT "SMALLEST THAT LOSES NO PRECISION" RULE: a float is narrowed to a
+// true IEEE-754 float32 and widened back; if that round-trip reproduces the
+// EXACT original f64 bit pattern, `d` (float32, 4 bytes) is emitted,
+// otherwise `D` (float64, 8 bytes, always lossless since NOVA floats ARE
+// f64). This mirrors the integer "smallest that fits" policy for the float
+// domain and is always safe: decode never loses precision either way.
+//
+// BOOL / NULL DISAMBIGUATION (type_of(true) == "int" in NOVA — see
+// std/encoding/bson's identical note). A bare NOVA bool value that has been
+// stored in a `list`/`dict` of `any` is INDISTINGUISHABLE from a real int by
+// type_of, so the default policy (matching bson.nova) is: a plain int always
+// encodes as one of i/U/I/l/L. To force an explicit UBJSON `T`/`F` marker,
+// wrap the value with ubjson_bool(v) before inserting it into a list/dict,
+// e.g. d["active"] = ubjson_bool(true). Symmetrically, a bare `null` is
+// represented by NOVA as raw int 0 THE MOMENT it crosses ANY function-call
+// boundary through a generically-typed (`any`) parameter — verified this is
+// not limited to container storage: even the direct top-level call
+// `ubjson_encode(null)` cannot see "null" inside ubjson_encode(v) (type_of(v)
+// reports "int"), so it indistinguishably encodes as int 0, identically to
+// `ubjson_encode(0)`. This holds for a bare null stored in a list/dict too.
+// use ubjson_null() to force an explicit `Z` marker in ANY of these
+// positions — this is the ONLY reliable way to emit `Z` for a value (as
+// opposed to type_of(v)=="null", which fires only for a null NEVER passed
+// through a function-call boundary, i.e. effectively never through this
+// module's own public API).
+//
+// BINARY SAFETY (`bytes` values). UBJSON's core spec has no dedicated binary
+// blob marker (only the OPTIONAL container-optimization extension has one,
+// via `[$U#<count> ...]`, not implemented here). A NOVA `bytes` value is
+// therefore encoded as a plain UBJSON ARRAY of uint8 integers (each byte its
+// own i/U-marked int, per the integer rule above) — NEVER routed through
+// bytes_to_str, because embedded 0x00 in a NOVA string is a silent
+// C-string-truncation hazard for later len()/`+` operations (see
+// reference_nova_string_nul_truncation). This makes `bytes` round-trip
+// LOSSLESSLY as data, though the decoded NOVA type is a `list` of ints
+// (there is no `S`-shaped marker to signal "give me back a `bytes` handle,
+// not a `list`" — the same documented value<->wire asymmetry bson.nova
+// accepts for its own binary subtype).
+//
+// STRING / KEY DECODING SAFETY. String VALUES and object KEYS are the only
+// spans this module ever passes through bytes_to_str, and only for EXACTLY
+// the declared length (bytes_slice(b, start, start+len)) — never scanned for
+// a terminator. This is what makes UBJSON's length-prefixed framing immune
+// to the classic "control byte injected into a name closes the frame early"
+// class of bug: a key or string payload may contain ANY byte value,
+// including 0x7B/0x7D/0x5B/0x5D (the container marker bytes) or 0x00 — the
+// decoder consumes exactly the declared byte count via bytes_slice, never by
+// scanning for a delimiter, so an embedded marker byte can never be
+// misread as a second frame boundary. (See ubjson_key_injection_kat below.)
+//
+// ADVERSARIAL-INPUT ROBUSTNESS (malformed/truncated/hostile streams never
+// crash and never hang):
+//   * Every runtime bytes_get/bytes_slice call is bounds-safe by construction
+//     (nova_runtime.c clamps out-of-range reads to 0 / an empty slice — see
+//     nova_rt_bytes_get / nova_rt_bytes_slice) so a truncated multi-byte
+//     field decodes as 0 rather than reading out of bounds.
+//   * A corrupt/negative length prefix (e.g. a hostile `i FF` = -1 in a
+//     string-length or key-length position) is CLAMPED to 0 by
+//     _ub_decode_len before it is ever used as an offset delta — this is the
+//     one place a data-controlled value could otherwise move the decode
+//     cursor BACKWARD and hang the decoder in an infinite loop; clamping to
+//     0 guarantees the cursor is always monotonically non-decreasing.
+//   * Array/object decoding loops on `cur < n and marker != close`, so a
+//     missing/omitted closing marker (truncated stream) terminates the loop
+//     at the buffer end rather than looping forever.
+//   * An unrecognized marker byte decodes as `null` and advances the cursor
+//     by exactly 1 byte (never 0), so unknown/future marker bytes can never
+//     stall the decoder either.
+//
+// PUBLIC API
+//   ubjson_encode(v)      -> bytes   encode any NOVA value (int/float/bool*
+//                                     /string/list/dict/bytes/null) to UBJSON
+//   ubjson_decode(b)      -> any     decode a complete UBJSON buffer
+//   ubjson_bool(v)        -> any     force an explicit T/F marker (see above)
+//   ubjson_null()         -> any     force an explicit Z marker in a
+//                                     list/dict position (see above)
+//
+// COMPETITIVE NOTE. UBJSON's core design goal (per ubjson.org) is "JSON's
+// data model, binary-fast, remains diffable/browsable in a hex editor" — it
+// intentionally trades MessagePack/CBOR's smaller wire size (no int-value
+// prefix packing below the smallest fixed marker) for a fixed,
+// easy-to-hand-verify grammar. NOVA's implementation matches every
+// published UBJSON encoder's byte-exact output for the spec's own worked
+// examples (see the KAT) and, via the length-prefixed grammar, is naturally
+// immune to text-protocol-style delimiter injection that a hand-rolled
+// binary-via-string encoding could introduce.
+
+// ── marker byte constants (named so call sites read as intent) ────────────
+fn _ub_m_null() -> int
+    0x5A                             // 'Z'
+fn _ub_m_true() -> int
+    0x54                             // 'T'
+fn _ub_m_false() -> int
+    0x46                             // 'F'
+fn _ub_m_int8() -> int
+    0x69                             // 'i'
+fn _ub_m_uint8() -> int
+    0x55                             // 'U'
+fn _ub_m_int16() -> int
+    0x49                             // 'I'
+fn _ub_m_int32() -> int
+    0x6C                             // 'l'
+fn _ub_m_int64() -> int
+    0x4C                             // 'L'
+fn _ub_m_float32() -> int
+    0x64                             // 'd'
+fn _ub_m_float64() -> int
+    0x44                             // 'D'
+fn _ub_m_char() -> int
+    0x43                             // 'C'
+fn _ub_m_string() -> int
+    0x53                             // 'S'
+fn _ub_m_arr_open() -> int
+    0x5B                             // '['
+fn _ub_m_arr_close() -> int
+    0x5D                             // ']'
+fn _ub_m_obj_open() -> int
+    0x7B                             // '{'
+fn _ub_m_obj_close() -> int
+    0x7D                             // '}'
+
+// ── explicit-type wrapper constructors (bool/null disambiguation) ─────────
+// Same sentinel-dict technique as std/encoding/bson's bson_bool/bson_null —
+// see the header comment for why this is necessary (type_of(true) == "int",
+// and a bare null in a list/dict is stored as raw int 0, in NOVA).
+
+fn ubjson_bool(v) -> any
+    let d = {}
+    let bbit = 0
+    if v != 0
+        bbit = 1
+    d["$ubjsonBool"] = bbit
+    return d
+
+fn ubjson_null() -> any
+    let d = {}
+    d["$ubjsonNull"] = 1
+    return d
+
+// ── encode: smallest-fits-the-value integer (marker + payload) ────────────
+// Used for BOTH scalar int values and every length prefix (string length,
+// object-key length) — the spec's own {"a":1} example shows a length of 1
+// laid down as `i 01`, not a fixed width, so this ONE function serves both
+// call sites (no duplicated range-selection logic).
+fn _ub_int_bytes(n) -> any
+    let out = bytes_create(0)
+    if n >= -128 and n <= 127
+        out = bytes_append(out, _ub_m_int8())
+        out = bytes_concat(out, pack_i8(n))
+    else if n >= 128 and n <= 255
+        out = bytes_append(out, _ub_m_uint8())
+        out = bytes_concat(out, pack_u8(n))
+    else if n >= -32768 and n <= 32767
+        out = bytes_append(out, _ub_m_int16())
+        out = bytes_concat(out, pack_i16_be(n))
+    else if n >= -2147483648 and n <= 2147483647
+        out = bytes_append(out, _ub_m_int32())
+        out = bytes_concat(out, pack_i32_be(n))
+    else
+        out = bytes_append(out, _ub_m_int64())
+        out = bytes_concat(out, pack_i64_be(n))
+    out
+
+// ── encode: float (smallest-that-loses-no-precision: d then D) ────────────
+// Narrows to a true IEEE-754 float32 via the raw-memory primitives (no safe
+// f32_to_bits builtin exists — same technique as std/encoding/avro's
+// av_encode_float), then checks whether widening back reproduces the exact
+// original f64. If yes, 4-byte `d` is both correct and smaller; otherwise
+// falls back to the always-exact 8-byte `D`.
+fn _ub_encode_float(v) -> any
+    let bits32 = 0
+    unsafe
+        let p = alloc_raw(4)
+        ptr_write_f32(p, v)
+        bits32 = ptr_read_u32(p)
+        free_raw(p)
+    let widened = f32_from_bits(bits32)
+    let out = bytes_create(0)
+    if widened == v
+        out = bytes_append(out, _ub_m_float32())
+        out = bytes_concat(out, pack_u32_be(bits32))
+    else
+        out = bytes_append(out, _ub_m_float64())
+        out = bytes_concat(out, pack_u64_be(float_to_bits(v)))
+    out
+
+// ── encode: string value (S marker + optimized-int length + UTF-8 bytes) ──
+fn _ub_encode_string(s) -> any
+    let sb = str_to_bytes(s)
+    let out = bytes_append(bytes_create(0), _ub_m_string())
+    out = bytes_concat(out, _ub_int_bytes(bytes_len(sb)))
+    out = bytes_concat(out, sb)
+    out
+
+// ── encode: object key (optimized-int length + UTF-8 bytes, NO marker) ────
+fn _ub_encode_key(s) -> any
+    let sb = str_to_bytes(s)
+    let out = _ub_int_bytes(bytes_len(sb))
+    out = bytes_concat(out, sb)
+    out
+
+// ── encode: bytes value as an array of uint8 (see header BINARY SAFETY) ───
+fn _ub_encode_bytes(bv) -> any
+    let out = bytes_append(bytes_create(0), _ub_m_arr_open())
+    let n = bytes_len(bv)
+    let i = 0
+    while i < n
+        out = bytes_concat(out, _ub_int_bytes(bytes_get(bv, i) & 0xFF))
+        i = i + 1
+    out = bytes_append(out, _ub_m_arr_close())
+    out
+
+// ── encode: array ───────────────────────────────────────────────────────
+fn _ub_encode_array(lst) -> any
+    let out = bytes_append(bytes_create(0), _ub_m_arr_open())
+    let n = len(lst)
+    let i = 0
+    while i < n
+        out = bytes_concat(out, ubjson_encode(lst[i]))
+        i = i + 1
+    out = bytes_append(out, _ub_m_arr_close())
+    out
+
+// ── encode: object ──────────────────────────────────────────────────────
+fn _ub_encode_object(d) -> any
+    let out = bytes_append(bytes_create(0), _ub_m_obj_open())
+    let ks = keys(d)
+    let n = len(ks)
+    let i = 0
+    while i < n
+        let k = ks[i]
+        out = bytes_concat(out, _ub_encode_key(k))
+        out = bytes_concat(out, ubjson_encode(d[k]))
+        i = i + 1
+    out = bytes_append(out, _ub_m_obj_close())
+    out
+
+// ── encode: top-level dispatch ─────────────────────────────────────────
+// Dispatched via type_of(v) — NOT `v != null` (NOVA represents null as raw
+// 0, so `0 != null` is FALSE and a real int/float 0 would silently fall
+// into the null branch; see the identical CVE-class note in bson.nova).
+// SINGLE-EXIT by design (accumulate into `out`, one `out` at the end) —
+// NOT a chain of early `return`s: a fn that mixes early `return <boxed
+// value>` branches with other return points has a documented NOVA repr-
+// mistagging gotcha (reference_nova_return_null_mistag); bson.nova's own
+// _bs_type_and_value uses this exact same single-exit shape for the same
+// reason.
+fn ubjson_encode(v) -> any
+    let t = type_of(v)
+    let out = bytes_append(bytes_create(0), _ub_m_null())
+    if t == "null"
+        out = bytes_append(bytes_create(0), _ub_m_null())
+    else if t == "float"
+        out = _ub_encode_float(v)
+    else if t == "string"
+        out = _ub_encode_string(v)
+    else if t == "bytes"
+        out = _ub_encode_bytes(v)
+    else if t == "list"
+        out = _ub_encode_array(v)
+    else if t == "dict"
+        let ks = keys(v)
+        if len(ks) == 1 and ks[0] == "$ubjsonBool"
+            if v["$ubjsonBool"] != 0
+                out = bytes_append(bytes_create(0), _ub_m_true())
+            else
+                out = bytes_append(bytes_create(0), _ub_m_false())
+        else if len(ks) == 1 and ks[0] == "$ubjsonNull"
+            out = bytes_append(bytes_create(0), _ub_m_null())
+        else
+            out = _ub_encode_object(v)
+    else if t == "int"
+        out = _ub_int_bytes(v)
+    // Unsupported NOVA type (e.g. a raw struct/process/channel handle) falls
+    // through with `out` still the safe fallback (explicit Z) set above —
+    // same catch-all policy bson.nova uses.
+    out
+
+// ── decode: length prefix, clamped non-negative (see ADVERSARIAL note) ────
+// A length prefix is itself an optimized int (marker + payload), decoded by
+// the same path as any scalar int. Clamped to >= 0 so a hostile/corrupt
+// negative length (e.g. `i FF` = -1) can NEVER move the decode cursor
+// backward — the one input-controlled quantity that could otherwise hang
+// the decoder in an infinite loop.
+fn _ub_decode_len(b, pos) -> list
+    let r = _ub_decode_at(b, pos)
+    let ln = r[0]
+    if ln < 0
+        ln = 0
+    [ln, r[1]]
+
+// ── decode: one value at `pos` -> [value, next_pos] ────────────────────
+// SINGLE-EXIT by design (accumulate into `val`/`next`, one `[val, next]` at
+// the end) — NOT a chain of early `return`s. A function that returns
+// several DIFFERENT underlying value shapes (null/int/float/string/list/
+// dict) from different early-return points hit a real, reproduced NOVA
+// repr-mistagging bug during this module's own KAT (float32 1.5 round-
+// tripped as a raw pointer-sized int instead of 1.5 — classic symptom of
+// reference_nova_return_null_mistag's broader "mixed early returns" class,
+// same root cause bson.nova's decoder avoids via this identical single-exit
+// shape). True/false decode to plain int 1/0 (not a NOVA `true`/`false`
+// literal) for the same reason bson.nova's own bool decode does — NOVA
+// already can't distinguish `int` from `bool` via type_of, so there is no
+// information lost, and it keeps every `val` assignment in this function
+// the SAME family of representation (null/int/float/string/list/dict —
+// never a literal bool mixed in).
+fn _ub_decode_at(b, pos) -> list
+    let n = bytes_len(b)
+    let val = null
+    let next = pos
+    if pos < n
+        let m = bytes_get(b, pos) & 0xFF
+        if m == _ub_m_null()
+            val = null
+            next = pos + 1
+        else if m == _ub_m_true()
+            val = 1
+            next = pos + 1
+        else if m == _ub_m_false()
+            val = 0
+            next = pos + 1
+        else if m == _ub_m_int8()
+            val = unpack_i8(b, pos + 1)
+            next = pos + 2
+        else if m == _ub_m_uint8()
+            val = unpack_u8(b, pos + 1)
+            next = pos + 2
+        else if m == _ub_m_int16()
+            val = unpack_i16_be(b, pos + 1)
+            next = pos + 3
+        else if m == _ub_m_int32()
+            val = unpack_i32_be(b, pos + 1)
+            next = pos + 5
+        else if m == _ub_m_int64()
+            val = unpack_i64_be(b, pos + 1)
+            next = pos + 9
+        else if m == _ub_m_float32()
+            let bits = unpack_u32_be(b, pos + 1)
+            val = f32_from_bits(bits)
+            next = pos + 5
+        else if m == _ub_m_float64()
+            let bits2 = unpack_u64_be(b, pos + 1)
+            val = float_from_bits(bits2)
+            next = pos + 9
+        else if m == _ub_m_char()
+            // Single ASCII byte -> 1-char NOVA string. DECODE ONLY (see
+            // header): if the byte were 0x00 the resulting NOVA string
+            // would report len()==0 under the documented C-string-
+            // truncation limitation (reference_nova_string_nul_truncation)
+            // — a real UBJSON producer never emits a NUL `C` (the type is
+            // defined as printable ASCII), so this is a documented, not
+            // silently-wrong, edge.
+            val = chr(bytes_get(b, pos + 1) & 0xFF)
+            next = pos + 2
+        else if m == _ub_m_string()
+            let lr = _ub_decode_len(b, pos + 1)
+            let slen = lr[0]
+            let sp = lr[1]
+            let sb = bytes_slice(b, sp, sp + slen)
+            val = bytes_to_str(sb)
+            next = sp + slen
+        else if m == _ub_m_arr_open()
+            let ar = _ub_decode_array(b, pos + 1)
+            val = ar[0]
+            next = ar[1]
+        else if m == _ub_m_obj_open()
+            let ob = _ub_decode_object(b, pos + 1)
+            val = ob[0]
+            next = ob[1]
+        else
+            // Unknown/unsupported marker: defensive fallback (null, advance
+            // 1 byte so the cursor always makes forward progress — see
+            // ADVERSARIAL note).
+            val = null
+            next = pos + 1
+    [val, next]
+
+// ── decode: array body, starting just after '[' -> [list, next_pos] ───────
+fn _ub_decode_array(b, pos) -> list
+    let out = []
+    let n = bytes_len(b)
+    let cur = pos
+    while cur < n and (bytes_get(b, cur) & 0xFF) != _ub_m_arr_close()
+        let r = _ub_decode_at(b, cur)
+        push(out, r[0])
+        cur = r[1]
+    let next = cur
+    if cur < n
+        next = cur + 1                // skip ']'
+    [out, next]
+
+// ── decode: object body, starting just after '{' -> [dict, next_pos] ──────
+fn _ub_decode_object(b, pos) -> list
+    let out = {}
+    let n = bytes_len(b)
+    let cur = pos
+    while cur < n and (bytes_get(b, cur) & 0xFF) != _ub_m_obj_close()
+        let lr = _ub_decode_len(b, cur)
+        let klen = lr[0]
+        let kp = lr[1]
+        let kb = bytes_slice(b, kp, kp + klen)
+        let k = bytes_to_str(kb)
+        let vr = _ub_decode_at(b, kp + klen)
+        out[k] = vr[0]
+        cur = vr[1]
+    let next = cur
+    if cur < n
+        next = cur + 1                // skip '}'
+    [out, next]
+
+// ── decode: top-level entry point ───────────────────────────────────────
+fn ubjson_decode(b) -> any
+    let r = _ub_decode_at(b, 0)
+    r[0]

@@ -1,0 +1,264 @@
+// KAT for forge_stomp — STOMP 1.2 messaging client (byte-exact frame codec).
+import forge_stomp
+
+// ── assert helpers ───────────────────────────────────────────────────────────
+//
+// IMPORTANT: NOVA strings are C-strings (NUL-terminated); a NOVA string built by
+// concatenating `+ chr(0)` cannot reliably carry that NUL through `len()` / further
+// use (see reference_nova_string_nul_truncation — "A"+chr(0)+"B" has len 2, not 3).
+// So expected frame bytes are NEVER built by string-concatenating chr(0) onto a
+// "want" string. Instead:
+//   * assert_frame_exact compares a `bytes` frame against a NUL-free text prefix
+//     PLUS an explicit trailing-NUL check done at the byte level (bytes_get), never
+//     by folding the NUL into a NOVA string.
+//   * assert_bytes_list compares against an explicit list of byte VALUES (used only
+//     for the one case that needs an embedded NUL mid-body, KAT 4).
+
+fn assert_s(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got='" + got + "' want='" + want + "'")
+        exit(1)
+
+fn assert_i(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn bytes_to_hex(b) -> string
+    let n = bytes_len(b)
+    let out = ""
+    let i = 0
+    while i < n
+        out = out + str(bytes_get(b, i)) + ","
+        i = i + 1
+    out
+
+// assert_frame_exact: `got` must equal `want_prefix` (plain ASCII, no NUL) followed
+// by exactly one NUL byte and nothing else.
+fn assert_frame_exact(label: string, got, want_prefix: string)
+    let wlen = len(want_prefix)
+    if bytes_len(got) != wlen + 1
+        print("FAIL " + label + ": len got=" + str(bytes_len(got)) + " want=" + str(wlen + 1))
+        print("  got bytes: " + bytes_to_hex(got))
+        exit(1)
+    let gs = bytes_to_str(bytes_slice(got, 0, wlen))
+    if gs != want_prefix
+        print("FAIL " + label + ": got='" + gs + "' want='" + want_prefix + "'")
+        exit(1)
+    if bytes_get(got, wlen) != 0
+        print("FAIL " + label + ": missing NUL terminator, got=" + str(bytes_get(got, wlen)))
+        exit(1)
+
+// assert_bytes_str: `got` (bytes, NUL-free content) equals the plain string `want`
+// exactly, both by decoded content and by true byte length.
+fn assert_bytes_str(label: string, got, want: string)
+    let gs = bytes_to_str(got)
+    if gs != want or bytes_len(got) != len(want)
+        print("FAIL " + label + ": got='" + gs + "' (len=" + str(bytes_len(got)) + ") want='" + want + "' (len=" + str(len(want)) + ")")
+        print("  got bytes: " + bytes_to_hex(got))
+        exit(1)
+
+// assert_bytes_list: compare `got` (bytes) against an explicit expected byte-value
+// list — used whenever the expected content embeds a NUL byte.
+fn assert_bytes_list(label: string, got, want: list)
+    let n = len(want)
+    if bytes_len(got) != n
+        print("FAIL " + label + ": len got=" + str(bytes_len(got)) + " want=" + str(n))
+        print("  got bytes: " + bytes_to_hex(got))
+        exit(1)
+    let i = 0
+    while i < n
+        if bytes_get(got, i) != want[i]
+            print("FAIL " + label + ": byte[" + str(i) + "] got=" + str(bytes_get(got, i)) + " want=" + str(want[i]))
+            print("  got bytes: " + bytes_to_hex(got))
+            exit(1)
+        i = i + 1
+
+fn main()
+    // ── KAT 1: SEND to "/queue/a" body "hi" — byte-exact per spec ────────────
+    // "SEND\ndestination:/queue/a\ncontent-length:2\n\nhi" + NUL
+    let f1 = stomp_send_frame("/queue/a", str_to_bytes("hi"), [])
+    assert_frame_exact("send-exact", f1, "SEND\ndestination:/queue/a\ncontent-length:2\n\nhi")
+
+    // ── KAT 2: SUBSCRIBE with id + destination ────────────────────────────────
+    // (no body -> header-line LF immediately followed by the blank-line LF, then NUL)
+    let f2 = stomp_subscribe_frame("sub-0", "/queue/a", "client")
+    assert_frame_exact("subscribe-exact", f2, "SUBSCRIBE\nid:sub-0\ndestination:/queue/a\nack:client\n\n")
+
+    // SUBSCRIBE without ack -> header omitted entirely
+    let f2b = stomp_subscribe_frame("sub-1", "/topic/b", "")
+    assert_frame_exact("subscribe-noack", f2b, "SUBSCRIBE\nid:sub-1\ndestination:/topic/b\n\n")
+
+    // ── KAT 3: header-value escaping — a value containing a colon and a newline ─
+    let tricky = "a:b" + chr(10) + "c"
+    let f3 = stomp_send_frame("/queue/x", str_to_bytes("body"), [["custom", tricky]])
+    // "a:b" -> "a\cb", newline -> "\n" : full escaped value = "a\cb\nc"
+    assert_frame_exact("escape-exact", f3, "SEND\ndestination:/queue/x\ncustom:a\\cb\\nc\ncontent-length:4\n\nbody")
+
+    // round-trip: parse it back and confirm the header decodes to the ORIGINAL unescaped value
+    let p3 = stomp_parse_frame(f3)
+    assert_s("escape-roundtrip-command", p3["command"], "SEND")
+    let p3h = p3["headers"]
+    assert_s("escape-roundtrip-custom", p3h["custom"], tricky)
+    assert_bytes_str("escape-roundtrip-body", p3["body"], "body")
+
+    // backslash itself must round-trip too
+    let bs_val = "back\\slash"
+    let f3b = stomp_send_frame("/q", str_to_bytes(""), [["x-bs", bs_val]])
+    let p3b = stomp_parse_frame(f3b)
+    assert_s("escape-backslash-roundtrip", p3b["headers"]["x-bs"], bs_val)
+
+    // ── KAT 4: MESSAGE frame with content-length and an EMBEDDED NUL in the body ─
+    // Hand-built wire bytes: "MESSAGE\ndestination:/queue/a\nmessage-id:007\ncontent-length:5\n\n"
+    // + body bytes [104,105,0,116,104] ("hi\0th") + trailing NUL terminator.
+    let hdr = "MESSAGE\ndestination:/queue/a\nmessage-id:007\ncontent-length:5\n\n"
+    let wire = str_to_bytes(hdr)
+    wire = bytes_append(wire, 104)  // h
+    wire = bytes_append(wire, 105)  // i
+    wire = bytes_append(wire, 0)    // embedded NUL
+    wire = bytes_append(wire, 116)  // t
+    wire = bytes_append(wire, 104)  // h
+    wire = bytes_append(wire, 0)    // frame-terminating NUL
+
+    let p4 = stomp_parse_frame(wire)
+    assert_s("message-command", p4["command"], "MESSAGE")
+    let p4h = p4["headers"]
+    assert_s("message-destination", p4h["destination"], "/queue/a")
+    assert_s("message-id", p4h["message-id"], "007")
+    let want4 = [104, 105, 0, 116, 104]
+    assert_bytes_list("message-body-embedded-nul", p4["body"], want4)
+
+    // ── KAT 5: CONNECT frame — unescaped header path, deterministic ordering ────
+    let f5 = stomp_connect_frame("CONNECT", "myhost", "alice", "s3cret", 0, 0)
+    assert_frame_exact("connect-exact", f5, "CONNECT\naccept-version:1.2\nhost:myhost\nlogin:alice\npasscode:s3cret\nheart-beat:0,0\n\n")
+
+    // CONNECT with no login/passcode -> those headers omitted
+    let f5b = stomp_connect_frame("STOMP", "myhost", "", "", 5000, 10000)
+    assert_frame_exact("stomp-noauth-exact", f5b, "STOMP\naccept-version:1.2\nhost:myhost\nheart-beat:5000,10000\n\n")
+
+    // parse a CONNECTED response back
+    let connected_hdr = "CONNECTED\nversion:1.2\nsession:sess-1\nheart-beat:0,0\n\n"
+    let connected_wire = bytes_append(str_to_bytes(connected_hdr), 0)
+    let p5 = stomp_parse_frame(connected_wire)
+    assert_s("connected-command", p5["command"], "CONNECTED")
+    assert_s("connected-version", p5["headers"]["version"], "1.2")
+    assert_s("connected-session", p5["headers"]["session"], "sess-1")
+
+    // ── KAT 6: RECEIPT / ERROR frames parse via the same generic parser ─────────
+    let receipt_hdr = "RECEIPT\nreceipt-id:msg-42\n\n"
+    let receipt_wire = bytes_append(str_to_bytes(receipt_hdr), 0)
+    let p6 = stomp_parse_frame(receipt_wire)
+    assert_s("receipt-command", p6["command"], "RECEIPT")
+    assert_s("receipt-id", p6["headers"]["receipt-id"], "msg-42")
+
+    let error_hdr = "ERROR\nmessage:malformed frame\ncontent-length:11\n\nbad request"
+    let error_wire = bytes_append(str_to_bytes(error_hdr), 0)
+    let p6b = stomp_parse_frame(error_wire)
+    assert_s("error-command", p6b["command"], "ERROR")
+    assert_s("error-message", p6b["headers"]["message"], "malformed frame")
+    assert_bytes_str("error-body", p6b["body"], "bad request")
+
+    // ── KAT 7: UNSUBSCRIBE / ACK / NACK / DISCONNECT ────────────────────────────
+    // (all bodyless -> header-line LF then blank-line LF then NUL)
+    assert_frame_exact("unsubscribe-exact", stomp_unsubscribe_frame("sub-0"), "UNSUBSCRIBE\nid:sub-0\n\n")
+    assert_frame_exact("ack-exact", stomp_ack_frame("msg-1", ""), "ACK\nid:msg-1\n\n")
+    assert_frame_exact("ack-txn-exact", stomp_ack_frame("msg-1", "tx-1"), "ACK\nid:msg-1\ntransaction:tx-1\n\n")
+    assert_frame_exact("nack-exact", stomp_nack_frame("msg-2", ""), "NACK\nid:msg-2\n\n")
+    // DISCONNECT with zero headers: command-line LF immediately followed by the blank-line LF.
+    assert_frame_exact("disconnect-noreceipt", stomp_disconnect_frame(""), "DISCONNECT\n\n")
+    assert_frame_exact("disconnect-receipt", stomp_disconnect_frame("rcpt-9"), "DISCONNECT\nreceipt:rcpt-9\n\n")
+
+    // ── KAT 8: empty / missing edge cases ────────────────────────────────────
+    let empty_parse = stomp_parse_frame(bytes(0))
+    assert_s("empty-command", empty_parse["command"], "")
+    assert_i("empty-headers-len", len(empty_parse["headers"]), 0)
+    assert_i("empty-body-len", bytes_len(empty_parse["body"]), 0)
+
+    // SEND with an empty body still gets content-length:0 and round-trips to empty
+    let f8 = stomp_send_frame("/q/empty", bytes(0), [])
+    assert_frame_exact("send-empty-body-exact", f8, "SEND\ndestination:/q/empty\ncontent-length:0\n\n")
+    let p8 = stomp_parse_frame(f8)
+    assert_i("send-empty-body-parsed-len", bytes_len(p8["body"]), 0)
+
+    // whitespace-only body round-trips exactly (content-length keeps it exact, no NUL-scan ambiguity)
+    let ws_body = str_to_bytes("   ")
+    let f8b = stomp_send_frame("/q/ws", ws_body, [])
+    let p8b = stomp_parse_frame(f8b)
+    assert_bytes_str("send-whitespace-body-roundtrip", p8b["body"], "   ")
+
+    // ── KAT 9: width boundary — content-length at a larger size (256 bytes) ─────
+    let big = ""
+    let bi = 0
+    while bi < 256
+        big = big + "x"
+        bi = bi + 1
+    let f9 = stomp_send_frame("/q/big", str_to_bytes(big), [])
+    let p9 = stomp_parse_frame(f9)
+    assert_i("big-body-len", bytes_len(p9["body"]), 256)
+    assert_bytes_str("big-body-content", p9["body"], big)
+
+    // ── KAT 10: injection guard — a raw LF in a CONNECT header value is stripped,
+    // never allowed to split into a bogus second header line ───────────────────
+    let evil_login = "alice" + chr(10) + "passcode:hacked"
+    let f10 = stomp_connect_frame("CONNECT", "h", evil_login, "", 0, 0)
+    let p10 = stomp_parse_frame(f10)
+    // must still parse as ONE CONNECT frame with a single "login" header (no injected
+    // second header), and the injected text must have collapsed onto the same line.
+    assert_s("injection-command", p10["command"], "CONNECT")
+    assert_i("injection-header-count", len(p10["headers"]), 4)
+    assert_s("injection-login-collapsed", p10["headers"]["login"], "alicepasscode:hacked")
+
+    // injection guard on the ESCAPED path (SEND) — a header value with LF/colon/backslash
+    // must decode back to the exact original, never break framing.
+    let evil_dest_hdr = "SEND" + chr(10) + "destination:/evil"
+    let f10b = stomp_send_frame("/q", str_to_bytes("x"), [["x-inj", evil_dest_hdr]])
+    let p10b = stomp_parse_frame(f10b)
+    assert_s("injection-escaped-command", p10b["command"], "SEND")
+    assert_s("injection-escaped-roundtrip", p10b["headers"]["x-inj"], evil_dest_hdr)
+    assert_bytes_str("injection-escaped-body", p10b["body"], "x")
+
+    // ── KAT 11: repeated header — first occurrence wins (STOMP 1.2 spec) ────────
+    let dup_hdr = "MESSAGE\nfoo:first\nfoo:second\ndestination:/q\n\n"
+    let dup_wire = bytes_append(str_to_bytes(dup_hdr), 0)
+    let p11 = stomp_parse_frame(dup_wire)
+    assert_s("dup-header-first-wins", p11["headers"]["foo"], "first")
+
+    // ── KAT 12: encode/parse AGREE on the no-escape frame set (regression for the
+    // CONNECT/STOMP/CONNECTED escape-set mismatch bug) ──────────────────────────
+
+    // (a) SEND (escaped path) header value with a colon AND a newline round-trips
+    // exactly through encode->parse — dedicated case distinct from KAT 3's "tricky".
+    let send_val = "region:us-east" + chr(10) + "zone:2"
+    let f12a = stomp_send_frame("/queue/regr", str_to_bytes("payload"), [["x-loc", send_val]])
+    let p12a = stomp_parse_frame(f12a)
+    assert_s("send-colon-newline-roundtrip", p12a["headers"]["x-loc"], send_val)
+    assert_bytes_str("send-colon-newline-body", p12a["body"], "payload")
+
+    // (b) CONNECT (no-escape path) header value containing a LITERAL two-character
+    // backslash-n sequence (NOT an actual LF) must NOT be un-escaped on parse — it
+    // must stay the raw two characters '\' 'n', per STOMP 1.2 (CONNECT/STOMP/
+    // CONNECTED never escape/unescape). Before the fix, stomp_parse_frame used
+    // escape=1 for CONNECT (only CONNECTED was escape=0), so this literal sequence
+    // was WRONGLY converted into a real newline byte on parse even though the
+    // encoder never escaped it in the first place.
+    let literal_bs_n = chr(92) + chr(110)
+    assert_i("literal-bs-n-is-two-chars", len(literal_bs_n), 2)
+    let f12b = stomp_connect_frame("CONNECT", "myhost", literal_bs_n, "", 0, 0)
+    let p12b = stomp_parse_frame(f12b)
+    assert_s("connect-command-regr", p12b["command"], "CONNECT")
+    assert_s("connect-literal-bsn-not-unescaped", p12b["headers"]["login"], literal_bs_n)
+    assert_i("connect-literal-bsn-len-stays-2", len(p12b["headers"]["login"]), 2)
+
+    // Same check for STOMP (the alternate CONNECT command name) and for a raw colon
+    // (also NOT escaped/unescaped on this path) inside a CONNECTED-style header,
+    // parsed straight off a hand-built wire frame (server side of the same set).
+    let f12c = stomp_connect_frame("STOMP", "myhost", literal_bs_n, "", 0, 0)
+    let p12c = stomp_parse_frame(f12c)
+    assert_s("stomp-literal-bsn-not-unescaped", p12c["headers"]["login"], literal_bs_n)
+
+    let connected_colon_hdr = "CONNECTED\nversion:1.2\nnote:raw\\ntext\n\n"
+    let connected_colon_wire = bytes_append(str_to_bytes(connected_colon_hdr), 0)
+    let p12d = stomp_parse_frame(connected_colon_wire)
+    assert_s("connected-literal-bsn-not-unescaped", p12d["headers"]["note"], "raw" + literal_bs_n + "text")
+
+    print("PASS _forge_stomp_test")
