@@ -1,0 +1,315 @@
+// forge_cassandra — Apache Cassandra CQL native-protocol v4 codec (wire framing +
+// core CQL primitive types), over raw TCP. Binary-safe (`bytes`-native, never NOVA
+// `string` for wire bytes) and big-endian throughout, matching the framing style of
+// std/net/http2 and std/net/dns_header.
+//
+// Imports ONLY std/encoding/pack (fixed-width BE integer pack/unpack — reused rather
+// than hand-rolling shift/mask arithmetic a third time in this codebase).
+//
+// FRAME HEADER (CQL native protocol v4, §2.2 of the spec) — 9 octets:
+//   byte  0    : version   — 0x04 request, 0x84 (0x04|0x80) response
+//   byte  1    : flags     — compression/tracing/custom-payload/warning bits
+//   bytes 2-3  : stream id — signed 16-bit BE (client-chosen correlation id;
+//                negative stream ids are reserved for server-initiated EVENT
+//                frames on protocol versions < 4; kept signed here for fidelity)
+//   byte  4    : opcode
+//   bytes 5-8  : length    — unsigned 32-bit BE, byte length of the body that follows
+//
+// OPCODES (subset used by this module; full registry is larger):
+//   ERROR=0x00 STARTUP=0x01 READY=0x02 OPTIONS=0x05 QUERY=0x07 RESULT=0x08
+//
+// CQL PRIMITIVE TYPES (§3 of the spec) implemented here:
+//   [string]     : [short] n, then n bytes UTF-8            (length is BYTE count)
+//   [long string]: [int] n,   then n bytes UTF-8
+//   [string map] : [short] count, then count * ([string] key, [string] value)
+//   [bytes]      : [int] n, then n bytes (n == -1 means null; NOT bit-length-clamped
+//                  like [short bytes] — full 32-bit signed per spec)
+//
+// WHY [string]/[long string] measure length in `str_to_bytes(s)` bytes and not
+// `len(s)` chars: CQL string length is a byte count (it's UTF-8 on the wire), and
+// NOVA `len()` on a `string` counts characters. For the ASCII option/query text this
+// module targets they coincide, but keying off the byte count is the only correct
+// choice for non-ASCII text and is what this module does everywhere.
+//
+// BINARY SAFETY: [string]/[string map] are CQL's own *text* types (protocol option
+// names, CQL query text) — they are decoded with bytes_to_str, which is the correct
+// operation for a field the spec defines as UTF-8 text. True opaque/binary payloads
+// (bound query parameter values, result-row cell data) use CQL's [bytes] type, which
+// this module keeps as `bytes` end-to-end (cql_bytes_encode/cql_bytes_decode) and
+// NEVER routes through bytes_to_str — that is the binary-safe path for 0x00-laden
+// payloads such as blobs, counters, or UUIDs.
+//
+// INJECTION SAFETY: every CQL primitive here is LENGTH-PREFIXED, not delimiter- or
+// terminator-based. A control character (or a literal copy of another frame's bytes)
+// embedded inside a [string]/[string map] key or value cannot forge a second frame or
+// truncate parsing early — the reader always advances by the declared length, never by
+// scanning for a sentinel byte. This is a structural property of the wire format, not
+// an ad hoc filter.
+//
+// PUBLIC API:
+//   cql_frame_header_encode(version, flags, stream, opcode, length) -> bytes   (9 bytes)
+//   cql_frame_header_decode(b, pos) -> list   [{"version","flags","stream","opcode","length"}, next_pos]
+//     Bounds-safe: returns [{}, pos] if pos<0 or fewer than 9 bytes remain.
+//
+//   cql_string_encode(s) -> bytes / cql_string_decode(b, pos) -> list [string, next_pos]
+//   cql_long_string_encode(s) -> bytes / cql_long_string_decode(b, pos) -> list [string, next_pos]
+//   cql_string_map_encode(m: dict) -> bytes / cql_string_map_decode(b, pos) -> list [dict, next_pos]
+//   cql_bytes_encode(payload: bytes) -> bytes / cql_bytes_encode_null() -> bytes
+//   cql_bytes_decode(b, pos) -> list  [payload_bytes, next_pos, is_null(0/1)]
+//     All decoders are bounds-safe: on truncation/malformed input they return the
+//     zero value ("" / {} / empty bytes) with next_pos == pos unchanged, so a caller
+//     can detect failure by comparing returned pos to the pos it passed in.
+//
+//   cql_startup_body(options: dict) -> bytes         (just the [string map])
+//   cql_startup_frame(stream, options: dict) -> bytes  (full STARTUP frame, header+body)
+//   cql_query_body(query: string, consistency: int) -> bytes
+//     [long string query][short consistency][byte flags=0x00] (no bound values, v4 no-values form)
+//   cql_query_frame(stream, query: string, consistency: int) -> bytes  (full QUERY frame)
+//   cql_options_frame(stream) -> bytes                (empty-body OPTIONS frame)
+//
+//   cql_opcode_name(op: int) -> string / cql_opcode_num(name: string) -> int
+//   cql_consistency_name(c: int) -> string / cql_consistency_num(name: string) -> int
+//
+// LEAF w.r.t. protocol logic — imports only std/encoding/pack for BE int helpers.
+
+import std/encoding/pack as pk
+
+// ── frame header (9 bytes) ──────────────────────────────────────────────────
+
+// cql_frame_header_encode: build the 9-byte CQL native-protocol frame header.
+// version/flags/opcode masked to 8 bits; stream masked to 16 bits (two's-complement,
+// so a negative stream id round-trips correctly); length masked to 32 bits.
+fn cql_frame_header_encode(version: int, flags: int, stream: int, opcode: int, length: int) -> bytes
+    let out = pk.pack_u8(version & 0xFF)
+    out = bytes_concat(out, pk.pack_u8(flags & 0xFF))
+    out = bytes_concat(out, pk.pack_u16_be(stream & 0xFFFF))
+    out = bytes_concat(out, pk.pack_u8(opcode & 0xFF))
+    out = bytes_concat(out, pk.pack_u32_be(length & 0xFFFFFFFF))
+    out
+
+// cql_frame_header_decode: decode a 9-byte frame header from b at pos.
+// Returns [{"version","flags","stream","opcode","length"}, pos+9] on success, or
+// [{}, pos] if pos is negative or fewer than 9 bytes remain (bounds-safe — b is
+// attacker-controlled network input).
+fn cql_frame_header_decode(b: bytes, pos: int) -> list
+    if pos < 0 or pos + 9 > bytes_len(b)
+        return [{}, pos]
+    let version = pk.unpack_u8(b, pos)
+    let flags = pk.unpack_u8(b, pos + 1)
+    let stream = pk.unpack_i16_be(b, pos + 2)
+    let opcode = pk.unpack_u8(b, pos + 4)
+    let length = pk.unpack_u32_be(b, pos + 5)
+    let hdr = {"version": version, "flags": flags, "stream": stream, "opcode": opcode, "length": length}
+    [hdr, pos + 9]
+
+// ── [string] : [short] byte-length + UTF-8 bytes ────────────────────────────
+
+fn cql_string_encode(s: string) -> bytes
+    let sb = str_to_bytes(s)
+    let n = bytes_len(sb)
+    bytes_concat(pk.pack_u16_be(n & 0xFFFF), sb)
+
+// cql_string_decode: bounds-safe. Returns ["", pos] unchanged on truncation
+// (declared length prefix present but fewer than n bytes remain, or fewer than
+// 2 header bytes remain).
+fn cql_string_decode(b: bytes, pos: int) -> list
+    if pos < 0 or pos + 2 > bytes_len(b)
+        return ["", pos]
+    let n = pk.unpack_u16_be(b, pos)
+    if pos + 2 + n > bytes_len(b)
+        return ["", pos]
+    let sb = bytes_slice(b, pos + 2, pos + 2 + n)
+    [bytes_to_str(sb), pos + 2 + n]
+
+// ── [long string] : [int] byte-length + UTF-8 bytes ─────────────────────────
+
+fn cql_long_string_encode(s: string) -> bytes
+    let sb = str_to_bytes(s)
+    let n = bytes_len(sb)
+    bytes_concat(pk.pack_u32_be(n & 0xFFFFFFFF), sb)
+
+fn cql_long_string_decode(b: bytes, pos: int) -> list
+    if pos < 0 or pos + 4 > bytes_len(b)
+        return ["", pos]
+    let n = pk.unpack_u32_be(b, pos)
+    if pos + 4 + n > bytes_len(b)
+        return ["", pos]
+    let sb = bytes_slice(b, pos + 4, pos + 4 + n)
+    [bytes_to_str(sb), pos + 4 + n]
+
+// ── [string map] : [short] count + count * ([string] key, [string] value) ───
+
+// cql_string_map_encode: iteration order follows keys(m) — the caller controls
+// determinism by controlling insertion order (matches this codebase's existing
+// [string map]-shaped encoders, e.g. std/net/httpheaders).
+fn cql_string_map_encode(m: dict) -> bytes
+    let ks = keys(m)
+    let n = len(ks)
+    let out = pk.pack_u16_be(n & 0xFFFF)
+    let i = 0
+    while i < n
+        let k = ks[i]
+        out = bytes_concat(out, cql_string_encode(k))
+        out = bytes_concat(out, cql_string_encode(m[k]))
+        i = i + 1
+    out
+
+// cql_string_map_decode: bounds-safe. Stops and returns [{}, pos] unchanged as
+// soon as either a key or a value fails to decode (truncated input) — never
+// returns a partially-populated map, so callers get an unambiguous success/fail
+// signal from comparing the returned pos to the pos they passed in.
+fn cql_string_map_decode(b: bytes, pos: int) -> list
+    if pos < 0 or pos + 2 > bytes_len(b)
+        return [{}, pos]
+    let count = pk.unpack_u16_be(b, pos)
+    let cur = pos + 2
+    let out = {}
+    let i = 0
+    let ok = 1
+    while i < count and ok == 1
+        let kr = cql_string_decode(b, cur)
+        let kpos = kr[1]
+        if kpos == cur
+            ok = 0
+        else
+            let k = kr[0]
+            cur = kpos
+            let vr = cql_string_decode(b, cur)
+            let vpos = vr[1]
+            if vpos == cur
+                ok = 0
+            else
+                out[k] = vr[0]
+                cur = vpos
+        i = i + 1
+    if ok == 0
+        return [{}, pos]
+    [out, cur]
+
+// ── [bytes] : [int] n + n bytes (n == -1 means null) ────────────────────────
+
+fn cql_bytes_encode(payload: bytes) -> bytes
+    let n = bytes_len(payload)
+    bytes_concat(pk.pack_i32_be(n), payload)
+
+fn cql_bytes_encode_null() -> bytes
+    pk.pack_i32_be(-1)
+
+// cql_bytes_decode: returns [payload_bytes, next_pos, is_null]. is_null==1 iff the
+// length prefix was exactly -1 (CQL's null-bytes sentinel) — payload_bytes is an
+// empty `bytes` in that case, never a null/undefined value. Any other negative
+// length, or a positive length that overruns the buffer, is treated as malformed
+// and reported the same way string/map decoders report failure: next_pos == pos
+// unchanged, is_null == 0.
+fn cql_bytes_decode(b: bytes, pos: int) -> list
+    if pos < 0 or pos + 4 > bytes_len(b)
+        return [bytes_create(0), pos, 0]
+    let n = pk.unpack_i32_be(b, pos)
+    if n == -1
+        return [bytes_create(0), pos + 4, 1]
+    if n < 0 or pos + 4 + n > bytes_len(b)
+        return [bytes_create(0), pos, 0]
+    let payload = bytes_slice(b, pos + 4, pos + 4 + n)
+    [payload, pos + 4 + n, 0]
+
+// ── STARTUP (opcode 0x01) ────────────────────────────────────────────────────
+
+fn cql_startup_body(options: dict) -> bytes
+    cql_string_map_encode(options)
+
+// cql_startup_frame: full request frame (version=0x04, flags=0x00, given stream,
+// opcode STARTUP). `options` typically {"CQL_VERSION": "3.0.0"} and optionally
+// "COMPRESSION".
+fn cql_startup_frame(stream: int, options: dict) -> bytes
+    let body = cql_startup_body(options)
+    let hdr = cql_frame_header_encode(0x04, 0x00, stream, 0x01, bytes_len(body))
+    bytes_concat(hdr, body)
+
+// ── QUERY (opcode 0x07) ──────────────────────────────────────────────────────
+
+// cql_query_body: [long string query][short consistency][byte flags]. flags is
+// always 0x00 here (no bound values, no paging, no serial consistency, no
+// default-timestamp, no names-for-values) — the simplest legal v4 QUERY body.
+fn cql_query_body(query: string, consistency: int) -> bytes
+    let qb = cql_long_string_encode(query)
+    let cb = pk.pack_u16_be(consistency & 0xFFFF)
+    let fb = pk.pack_u8(0)
+    bytes_concat(bytes_concat(qb, cb), fb)
+
+fn cql_query_frame(stream: int, query: string, consistency: int) -> bytes
+    let body = cql_query_body(query, consistency)
+    let hdr = cql_frame_header_encode(0x04, 0x00, stream, 0x07, bytes_len(body))
+    bytes_concat(hdr, body)
+
+// ── OPTIONS (opcode 0x05) — empty body ───────────────────────────────────────
+
+fn cql_options_frame(stream: int) -> bytes
+    cql_frame_header_encode(0x04, 0x00, stream, 0x05, 0)
+
+// ── opcode / consistency name<->number tables ────────────────────────────────
+
+fn cql_opcode_name(op: int) -> string
+    if op == 0x00 then return "ERROR"
+    if op == 0x01 then return "STARTUP"
+    if op == 0x02 then return "READY"
+    if op == 0x03 then return "AUTHENTICATE"
+    if op == 0x05 then return "OPTIONS"
+    if op == 0x06 then return "SUPPORTED"
+    if op == 0x07 then return "QUERY"
+    if op == 0x08 then return "RESULT"
+    if op == 0x09 then return "PREPARE"
+    if op == 0x0A then return "EXECUTE"
+    if op == 0x0B then return "REGISTER"
+    if op == 0x0C then return "EVENT"
+    if op == 0x0D then return "BATCH"
+    if op == 0x0E then return "AUTH_CHALLENGE"
+    if op == 0x0F then return "AUTH_RESPONSE"
+    if op == 0x10 then return "AUTH_SUCCESS"
+    return ""
+
+fn cql_opcode_num(name: string) -> int
+    if name == "ERROR" then return 0x00
+    if name == "STARTUP" then return 0x01
+    if name == "READY" then return 0x02
+    if name == "AUTHENTICATE" then return 0x03
+    if name == "OPTIONS" then return 0x05
+    if name == "SUPPORTED" then return 0x06
+    if name == "QUERY" then return 0x07
+    if name == "RESULT" then return 0x08
+    if name == "PREPARE" then return 0x09
+    if name == "EXECUTE" then return 0x0A
+    if name == "REGISTER" then return 0x0B
+    if name == "EVENT" then return 0x0C
+    if name == "BATCH" then return 0x0D
+    if name == "AUTH_CHALLENGE" then return 0x0E
+    if name == "AUTH_RESPONSE" then return 0x0F
+    if name == "AUTH_SUCCESS" then return 0x10
+    return -1
+
+fn cql_consistency_name(c: int) -> string
+    if c == 0x0000 then return "ANY"
+    if c == 0x0001 then return "ONE"
+    if c == 0x0002 then return "TWO"
+    if c == 0x0003 then return "THREE"
+    if c == 0x0004 then return "QUORUM"
+    if c == 0x0005 then return "ALL"
+    if c == 0x0006 then return "LOCAL_QUORUM"
+    if c == 0x0007 then return "EACH_QUORUM"
+    if c == 0x0008 then return "SERIAL"
+    if c == 0x0009 then return "LOCAL_SERIAL"
+    if c == 0x000A then return "LOCAL_ONE"
+    return ""
+
+fn cql_consistency_num(name: string) -> int
+    if name == "ANY" then return 0x0000
+    if name == "ONE" then return 0x0001
+    if name == "TWO" then return 0x0002
+    if name == "THREE" then return 0x0003
+    if name == "QUORUM" then return 0x0004
+    if name == "ALL" then return 0x0005
+    if name == "LOCAL_QUORUM" then return 0x0006
+    if name == "EACH_QUORUM" then return 0x0007
+    if name == "SERIAL" then return 0x0008
+    if name == "LOCAL_SERIAL" then return 0x0009
+    if name == "LOCAL_ONE" then return 0x000A
+    return -1

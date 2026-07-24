@@ -1,0 +1,511 @@
+// forge_etcd — etcd v3 KV client (etcdserverpb.KV service) over gRPC.
+//
+// REUSES, does not reimplement:
+//   forge_grpc          — gRPC wire framing (grpc_frame_bytes/grpc_deframe_bytes),
+//                          HPACK header-block codec, and the full unary CLIENT
+//                          wire assembly (grpc_client_request / grpc_client_parse_response
+//                          / grpc_client_response_message). This module builds ONLY the
+//                          etcdserverpb protobuf messages; forge_grpc owns every byte of
+//                          HTTP/2 framing, HPACK, and gRPC length-prefixing around them.
+//   std/encoding/protobuf — proto3 wire-format codec (tags, LEN/VARINT/I64/I32 field
+//                          framing). This module supplies ONLY the etcdserverpb field
+//                          numbers/types; the actual varint/zigzag/length-delimited byte
+//                          shaping is 100% pb_* calls.
+//
+// SCOPE: pure encode/decode — no socket I/O (same contract as forge_grpc's client
+// section). Pair with tcp_connect / tls_connect_alpn("h2") for the real transport;
+// this module produces exactly the request bytes to write and consumes exactly the
+// response bytes to read for one etcdserverpb.KV RPC.
+//
+// MESSAGES IMPLEMENTED (etcdserverpb.proto / mvccpb.proto field numbers, exact):
+//   PutRequest         { bytes key=1; bytes value=2; int64 lease=3; }
+//   RangeRequest       { bytes key=1; bytes range_end=2; int64 limit=3; }
+//   DeleteRangeRequest { bytes key=1; bytes range_end=2; }
+//   ResponseHeader     { uint64 cluster_id=1; uint64 member_id=2; int64 revision=3; uint64 raft_term=4; }
+//   mvccpb.KeyValue    { bytes key=1; int64 create_revision=2; int64 mod_revision=3;
+//                        int64 version=4; bytes value=5; int64 lease=6; }
+//   PutResponse        { ResponseHeader header=1; KeyValue prev_kv=2; }
+//   RangeResponse      { ResponseHeader header=1; repeated KeyValue kvs=2; bool more=3; int64 count=4; }
+//   DeleteRangeResponse{ ResponseHeader header=1; int64 deleted=2; repeated KeyValue prev_kvs=3; }
+//
+// PROTO3 DEFAULT-VALUE OMISSION: fields at their zero value (0 / empty bytes / false)
+// are OMITTED from the wire, matching what protoc-generated code emits — e.g.
+// etcd_put_message(key,value,0) (no lease) encodes ONLY field 1 + field 2.
+//
+// BINARY SAFETY: every key/value is `bytes`, never `string` — a key or value
+// containing an embedded 0x00 round-trips exactly (see KAT). Never call
+// bytes_to_str on a key/value; callers who know their data is UTF-8 text do
+// that conversion themselves.
+//
+// PREFIX RANGES: etcd's "get by prefix" convention is range_end = the lexically
+// next key after incrementing the last byte that isn't already 0xFF (dropping
+// any trailing 0xFF bytes first) — an EMPTY range_end after that means "no
+// upper bound" (all keys >= the all-0xFF prefix). etcd_range_end_prefix()
+// implements exactly this, so etcd_range_message(key, etcd_range_end_prefix(key), 0)
+// is a standard "list everything under this prefix" call.
+//
+// SYMBOL COLLISION GUARD: all private helpers are prefixed _etcd_.
+//
+// Depends on: forge_grpc (as h2g), std/encoding/protobuf (as pb).
+//
+// Verified by reasoning (see KAT test_programs/forge_etcd_kat.nova for the executed form):
+//   etcd_put_message(bytes_of("foo"), bytes_of("bar"), 0)
+//     -> bytes[0x0A,0x03,'f','o','o', 0x12,0x03,'b','a','r']            (10 bytes, lease OMITTED)
+//   h2g.grpc_frame_bytes(that) -> bytes[0,0,0,0,10, <the 10 bytes above>]  (15 bytes)
+//   a synthetic RangeResponse with one KeyValue{key="foo",value="bar"} and count=1
+//     decodes to kvs=[{key:"foo" as bytes, value:"bar" as bytes, ...}], count=1
+//   a key with an embedded 0x00 byte round-trips byte-for-byte through
+//     etcd_put_message -> _etcd_decode_kv-style field extraction
+// ============================================================================
+
+import forge_grpc as h2g
+import std/encoding/protobuf as pb
+
+// ── field numbers (named, not magic, for every message this module touches) ──
+
+fn _etcd_f_key() -> int
+    1
+fn _etcd_f_value() -> int
+    2
+fn _etcd_f_lease() -> int
+    3
+fn _etcd_f_range_end() -> int
+    2
+fn _etcd_f_limit() -> int
+    3
+fn _etcd_f_kv_create_rev() -> int
+    2
+fn _etcd_f_kv_mod_rev() -> int
+    3
+fn _etcd_f_kv_version() -> int
+    4
+fn _etcd_f_kv_value() -> int
+    5
+fn _etcd_f_kv_lease() -> int
+    6
+fn _etcd_f_header() -> int
+    1
+fn _etcd_f_range_kvs() -> int
+    2
+fn _etcd_f_range_more() -> int
+    3
+fn _etcd_f_range_count() -> int
+    4
+fn _etcd_f_put_prev_kv() -> int
+    2
+fn _etcd_f_del_deleted() -> int
+    2
+fn _etcd_f_del_prev_kvs() -> int
+    3
+fn _etcd_f_hdr_cluster_id() -> int
+    1
+fn _etcd_f_hdr_member_id() -> int
+    2
+fn _etcd_f_hdr_revision() -> int
+    3
+fn _etcd_f_hdr_raft_term() -> int
+    4
+
+// ── service identity ────────────────────────────────────────────────────────
+
+// etcd_service_name() -> string
+// Fully-qualified gRPC service name for etcd's KV service.
+fn etcd_service_name() -> string
+    "etcdserverpb.KV"
+
+// etcd_method_put() / etcd_method_range() / etcd_method_delete_range() -> string
+// The three unary method names this module implements.
+fn etcd_method_put() -> string
+    "Put"
+fn etcd_method_range() -> string
+    "Range"
+fn etcd_method_delete_range() -> string
+    "DeleteRange"
+
+// ── small bytes helper (test/caller convenience — NOT binary-safe by itself) ──
+
+// etcd_bytes_of(s) -> bytes
+// Convenience wrapper around str_to_bytes for building a `bytes` key/value from
+// an ordinary (no-embedded-NUL) string literal. For binary data with an
+// embedded 0x00, build the `bytes` value directly with bytes_append — a NOVA
+// string is a C-string and would truncate at the first 0x00 (see module
+// std/encoding/protobuf's BINARY SAFETY note); this helper is for the common
+// text-key case only.
+fn etcd_bytes_of(s: string) -> any
+    str_to_bytes(s)
+
+// ── prefix-range helper ─────────────────────────────────────────────────────
+
+// etcd_range_end_prefix(key) -> bytes
+// Compute the etcd "prefix scan" range_end for `key`: increment the last byte
+// of `key` that is not 0xFF, dropping every trailing 0xFF byte first. If every
+// byte of `key` is 0xFF (or `key` is empty), returns bytes(0) — the etcd
+// convention for "no upper bound" (matches the official etcd client's
+// GetPrefixRangeEnd behavior).
+// Example: key="foo" (0x66,0x6F,0x6F) -> range_end="fop" (0x66,0x6F,0x70)
+fn etcd_range_end_prefix(key: any) -> any
+    let n = bytes_len(key)
+    let cut = n
+    let stop = false
+    while cut > 0 and stop == false
+        if bytes_get(key, cut - 1) == 0xFF
+            cut = cut - 1
+        else
+            stop = true
+    if cut == 0
+        return bytes(0)
+    let out = bytes_slice(key, 0, cut)
+    let last = bytes_get(out, cut - 1) + 1
+    let head = bytes_slice(out, 0, cut - 1)
+    bytes_append(head, last)
+
+// ── request message encoders (proto3 wire bytes, opaque payload for gRPC) ───
+
+// etcd_put_message(key, value, lease) -> bytes
+// Encode a PutRequest. `lease` OMITTED from the wire when 0 (proto3 default).
+// Vector: etcd_put_message(bytes_of("foo"), bytes_of("bar"), 0)
+//   -> [0x0A,0x03,'f','o','o', 0x12,0x03,'b','a','r']
+fn etcd_put_message(key: any, value: any, lease: int) -> any
+    let out = pb.pb_encode_bytes_field(_etcd_f_key(), key)
+    out = bytes_concat(out, pb.pb_encode_bytes_field(_etcd_f_value(), value))
+    if lease != 0
+        out = bytes_concat(out, pb.pb_encode_int_field(_etcd_f_lease(), lease))
+    out
+
+// etcd_range_message(key, range_end, limit) -> bytes
+// Encode a RangeRequest. `range_end` OMITTED when empty (exact-key get);
+// `limit` OMITTED when 0 (no limit).
+fn etcd_range_message(key: any, range_end: any, limit: int) -> any
+    let out = pb.pb_encode_bytes_field(_etcd_f_key(), key)
+    if bytes_len(range_end) > 0
+        out = bytes_concat(out, pb.pb_encode_bytes_field(_etcd_f_range_end(), range_end))
+    if limit != 0
+        out = bytes_concat(out, pb.pb_encode_int_field(_etcd_f_limit(), limit))
+    out
+
+// etcd_delete_range_message(key, range_end) -> bytes
+// Encode a DeleteRangeRequest. `range_end` OMITTED when empty (delete exactly one key).
+fn etcd_delete_range_message(key: any, range_end: any) -> any
+    let out = pb.pb_encode_bytes_field(_etcd_f_key(), key)
+    if bytes_len(range_end) > 0
+        out = bytes_concat(out, pb.pb_encode_bytes_field(_etcd_f_range_end(), range_end))
+    out
+
+// ── framed message (5-byte gRPC prefix + protobuf payload) ─────────────────
+// Thin pass-through to forge_grpc — kept here so a caller building a raw h2
+// DATA frame body never needs to import forge_grpc directly for this module's
+// three RPCs.
+
+fn etcd_put_framed(key: any, value: any, lease: int) -> any
+    h2g.grpc_frame_bytes(etcd_put_message(key, value, lease))
+
+fn etcd_range_framed(key: any, range_end: any, limit: int) -> any
+    h2g.grpc_frame_bytes(etcd_range_message(key, range_end, limit))
+
+fn etcd_delete_range_framed(key: any, range_end: any) -> any
+    h2g.grpc_frame_bytes(etcd_delete_range_message(key, range_end))
+
+// ── full unary HTTP/2 wire request (HEADERS + DATA) ─────────────────────────
+// Thin pass-through to h2g.grpc_client_request targeting the KV service.
+
+fn etcd_put_request(stream_id: int, authority: string, scheme: string, key: any, value: any, lease: int) -> any
+    h2g.grpc_client_request(stream_id, authority, scheme, etcd_service_name(), etcd_method_put(), etcd_put_message(key, value, lease))
+
+fn etcd_range_request(stream_id: int, authority: string, scheme: string, key: any, range_end: any, limit: int) -> any
+    h2g.grpc_client_request(stream_id, authority, scheme, etcd_service_name(), etcd_method_range(), etcd_range_message(key, range_end, limit))
+
+fn etcd_delete_range_request(stream_id: int, authority: string, scheme: string, key: any, range_end: any) -> any
+    h2g.grpc_client_request(stream_id, authority, scheme, etcd_service_name(), etcd_method_delete_range(), etcd_delete_range_message(key, range_end))
+
+// ── ResponseHeader decode (shared by all three response decoders) ──────────
+
+// _etcd_decode_header(buf) -> dict
+// Decode a ResponseHeader message body. Defaults to all-zero fields so a
+// missing/empty header never crashes a caller that reads header["revision"].
+// BOUNDS-SAFE: stops the scan (instead of looping or reading OOB) the moment
+// a tag fails to advance the position — protects against a malformed/attacker
+// buffer with a truncated or non-advancing varint.
+fn _etcd_decode_header(buf: any) -> dict
+    let out = {}
+    out["cluster_id"] = 0
+    out["member_id"] = 0
+    out["revision"] = 0
+    out["raft_term"] = 0
+    let n = bytes_len(buf)
+    let pos = 0
+    let stop = false
+    while pos < n and stop == false
+        let tg = pb.pb_read_tag(buf, pos)
+        if tg[2] <= pos
+            stop = true
+        else
+            let num = tg[0]
+            let wt = tg[1]
+            let p2 = tg[2]
+            if wt == pb.pb_wire_varint()
+                let vr = pb.pb_read_varint(buf, p2)
+                if vr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_hdr_cluster_id()
+                        out["cluster_id"] = vr[0]
+                    else if num == _etcd_f_hdr_member_id()
+                        out["member_id"] = vr[0]
+                    else if num == _etcd_f_hdr_revision()
+                        out["revision"] = vr[0]
+                    else if num == _etcd_f_hdr_raft_term()
+                        out["raft_term"] = vr[0]
+                    pos = vr[1]
+            else if wt == pb.pb_wire_len()
+                let lr = pb.pb_read_len_delim(buf, p2)
+                pos = lr[1]
+                if pos <= p2
+                    stop = true
+            else if wt == pb.pb_wire_i64()
+                pos = p2 + 8
+            else if wt == pb.pb_wire_i32()
+                pos = p2 + 4
+            else
+                stop = true
+    out
+
+// ── KeyValue decode ──────────────────────────────────────────────────────────
+
+// _etcd_decode_kv(buf) -> dict
+// Decode an embedded mvccpb.KeyValue message body.
+// Keys: "key","value" (both `bytes`, binary-safe — NEVER converted to string),
+//       "create_revision","mod_revision","version","lease" (all int, default 0).
+// BOUNDS-SAFE: same non-advancing-position guard as _etcd_decode_header —
+// a truncated/malformed embedded message degrades to partial fields rather
+// than looping forever or reading out of bounds (pb_* primitives are already
+// bounds-clamped; this loop additionally refuses to spin on zero advance).
+fn _etcd_decode_kv(buf: any) -> dict
+    let out = {}
+    out["key"] = bytes(0)
+    out["value"] = bytes(0)
+    out["create_revision"] = 0
+    out["mod_revision"] = 0
+    out["version"] = 0
+    out["lease"] = 0
+    let n = bytes_len(buf)
+    let pos = 0
+    let stop = false
+    while pos < n and stop == false
+        let tg = pb.pb_read_tag(buf, pos)
+        if tg[2] <= pos
+            stop = true
+        else
+            let num = tg[0]
+            let wt = tg[1]
+            let p2 = tg[2]
+            if wt == pb.pb_wire_len()
+                let lr = pb.pb_read_len_delim(buf, p2)
+                if lr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_key()
+                        out["key"] = lr[0]
+                    else if num == _etcd_f_kv_value()
+                        out["value"] = lr[0]
+                    pos = lr[1]
+            else if wt == pb.pb_wire_varint()
+                let vr = pb.pb_read_varint(buf, p2)
+                if vr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_kv_create_rev()
+                        out["create_revision"] = vr[0]
+                    else if num == _etcd_f_kv_mod_rev()
+                        out["mod_revision"] = vr[0]
+                    else if num == _etcd_f_kv_version()
+                        out["version"] = vr[0]
+                    else if num == _etcd_f_kv_lease()
+                        out["lease"] = vr[0]
+                    pos = vr[1]
+            else if wt == pb.pb_wire_i64()
+                pos = p2 + 8
+            else if wt == pb.pb_wire_i32()
+                pos = p2 + 4
+            else
+                stop = true
+    out
+
+// ── response message decoders ───────────────────────────────────────────────
+
+// etcd_decode_put_response(buf) -> dict
+// Decode a PutResponse message body.
+// Keys: "header" (dict, see _etcd_decode_header), "has_prev_kv" (bool — proto3
+// gives no other way to distinguish "absent" from "present but all-zero" for
+// an embedded message, so this flag is the authoritative presence signal per
+// the module's checklist rule against `!= null` on an int/bytes sentinel),
+// "prev_kv" (dict, only meaningful when has_prev_kv is true).
+fn etcd_decode_put_response(buf: any) -> dict
+    let out = {}
+    out["header"] = _etcd_decode_header(bytes(0))
+    out["has_prev_kv"] = false
+    out["prev_kv"] = _etcd_decode_kv(bytes(0))
+    let n = bytes_len(buf)
+    let pos = 0
+    let stop = false
+    while pos < n and stop == false
+        let tg = pb.pb_read_tag(buf, pos)
+        if tg[2] <= pos
+            stop = true
+        else
+            let num = tg[0]
+            let wt = tg[1]
+            let p2 = tg[2]
+            if wt == pb.pb_wire_len()
+                let lr = pb.pb_read_len_delim(buf, p2)
+                if lr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_header()
+                        out["header"] = _etcd_decode_header(lr[0])
+                    else if num == _etcd_f_put_prev_kv()
+                        out["has_prev_kv"] = true
+                        out["prev_kv"] = _etcd_decode_kv(lr[0])
+                    pos = lr[1]
+            else if wt == pb.pb_wire_varint()
+                let vr = pb.pb_read_varint(buf, p2)
+                if vr[1] <= p2
+                    stop = true
+                else
+                    pos = vr[1]
+            else if wt == pb.pb_wire_i64()
+                pos = p2 + 8
+            else if wt == pb.pb_wire_i32()
+                pos = p2 + 4
+            else
+                stop = true
+    out
+
+// etcd_decode_range_response(buf) -> dict
+// Decode a RangeResponse message body.
+// Keys: "header" (dict), "kvs" (list of dict, each shaped like _etcd_decode_kv's
+// return), "more" (bool), "count" (int).
+// Vector (see KAT): a RangeResponse with kvs=[{key:"foo",value:"bar"}], count=1
+// decodes to out["kvs"][0]["key"]==bytes("foo"), out["count"]==1.
+fn etcd_decode_range_response(buf: any) -> dict
+    let out = {}
+    out["header"] = _etcd_decode_header(bytes(0))
+    out["kvs"] = []
+    out["more"] = false
+    out["count"] = 0
+    let n = bytes_len(buf)
+    let pos = 0
+    let stop = false
+    while pos < n and stop == false
+        let tg = pb.pb_read_tag(buf, pos)
+        if tg[2] <= pos
+            stop = true
+        else
+            let num = tg[0]
+            let wt = tg[1]
+            let p2 = tg[2]
+            if wt == pb.pb_wire_len()
+                let lr = pb.pb_read_len_delim(buf, p2)
+                if lr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_header()
+                        out["header"] = _etcd_decode_header(lr[0])
+                    else if num == _etcd_f_range_kvs()
+                        push(out["kvs"], _etcd_decode_kv(lr[0]))
+                    pos = lr[1]
+            else if wt == pb.pb_wire_varint()
+                let vr = pb.pb_read_varint(buf, p2)
+                if vr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_range_more()
+                        out["more"] = vr[0] != 0
+                    else if num == _etcd_f_range_count()
+                        out["count"] = vr[0]
+                    pos = vr[1]
+            else if wt == pb.pb_wire_i64()
+                pos = p2 + 8
+            else if wt == pb.pb_wire_i32()
+                pos = p2 + 4
+            else
+                stop = true
+    out
+
+// etcd_decode_delete_range_response(buf) -> dict
+// Decode a DeleteRangeResponse message body.
+// Keys: "header" (dict), "deleted" (int, count of keys removed), "prev_kvs" (list of dict).
+fn etcd_decode_delete_range_response(buf: any) -> dict
+    let out = {}
+    out["header"] = _etcd_decode_header(bytes(0))
+    out["deleted"] = 0
+    out["prev_kvs"] = []
+    let n = bytes_len(buf)
+    let pos = 0
+    let stop = false
+    while pos < n and stop == false
+        let tg = pb.pb_read_tag(buf, pos)
+        if tg[2] <= pos
+            stop = true
+        else
+            let num = tg[0]
+            let wt = tg[1]
+            let p2 = tg[2]
+            if wt == pb.pb_wire_len()
+                let lr = pb.pb_read_len_delim(buf, p2)
+                if lr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_header()
+                        out["header"] = _etcd_decode_header(lr[0])
+                    else if num == _etcd_f_del_prev_kvs()
+                        push(out["prev_kvs"], _etcd_decode_kv(lr[0]))
+                    pos = lr[1]
+            else if wt == pb.pb_wire_varint()
+                let vr = pb.pb_read_varint(buf, p2)
+                if vr[1] <= p2
+                    stop = true
+                else
+                    if num == _etcd_f_del_deleted()
+                        out["deleted"] = vr[0]
+                    pos = vr[1]
+            else if wt == pb.pb_wire_i64()
+                pos = p2 + 8
+            else if wt == pb.pb_wire_i32()
+                pos = p2 + 4
+            else
+                stop = true
+    out
+
+// ── full unary response parse (h2 wire bytes -> decoded etcd response dict) ──
+// Each wraps h2g.grpc_client_parse_response + h2g.grpc_client_response_message
+// (strip gRPC 5-byte frame) + the matching etcd_decode_*_response above, and
+// carries the gRPC status/message through so a caller never has to touch
+// forge_grpc directly for these three RPCs.
+//   "status"  : int    (0 = OK; -1 = no grpc-status trailer seen at all — see
+//                       forge_grpc.grpc_client_parse_response's sentinel note)
+//   "message" : string (human-readable; empty on success)
+// plus every key etcd_decode_*_response produces.
+
+fn etcd_parse_put_response(wire: any) -> dict
+    let res = h2g.grpc_client_parse_response(wire)
+    let msg = h2g.grpc_client_response_message(res)
+    let out = etcd_decode_put_response(msg)
+    out["status"] = res["status"]
+    out["message"] = res["message"]
+    out
+
+fn etcd_parse_range_response(wire: any) -> dict
+    let res = h2g.grpc_client_parse_response(wire)
+    let msg = h2g.grpc_client_response_message(res)
+    let out = etcd_decode_range_response(msg)
+    out["status"] = res["status"]
+    out["message"] = res["message"]
+    out
+
+fn etcd_parse_delete_range_response(wire: any) -> dict
+    let res = h2g.grpc_client_parse_response(wire)
+    let msg = h2g.grpc_client_response_message(res)
+    let out = etcd_decode_delete_range_response(msg)
+    out["status"] = res["status"]
+    out["message"] = res["message"]
+    out

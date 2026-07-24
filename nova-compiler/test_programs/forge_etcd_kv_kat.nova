@@ -1,0 +1,173 @@
+// KAT for forge/forge_etcd.nova — etcd v3 KV client (PutRequest/RangeRequest/
+// DeleteRangeRequest encode, gRPC framing via forge_grpc, RangeResponse decode,
+// binary-safe embedded-0x00 key round-trip).
+
+import forge_etcd as etcd
+import forge_grpc as h2g
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn bytes_eq(a: any, b: any) -> bool
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return false
+    let i = 0
+    let ok = true
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            ok = false
+        i = i + 1
+    ok
+
+fn bytes_from_ints(ints: list) -> any
+    let out = bytes(0)
+    let i = 0
+    while i < len(ints)
+        out = bytes_append(out, ints[i])
+        i = i + 1
+    out
+
+fn main()
+    // ── 1. PutRequest byte-exact: key="foo" value="bar", lease=0 (omitted) ──
+    let key_foo = etcd.etcd_bytes_of("foo")
+    let val_bar = etcd.etcd_bytes_of("bar")
+    let put_msg = etcd.etcd_put_message(key_foo, val_bar, 0)
+    let expect_put = bytes_from_ints([0x0A, 0x03, 0x66, 0x6F, 0x6F, 0x12, 0x03, 0x62, 0x61, 0x72])
+    check("put_message_byte_exact", bytes_eq(put_msg, expect_put))
+    check("put_message_len_10", bytes_len(put_msg) == 10)
+
+    // lease != 0 -> field 3 present (varint wiretype tag = (3<<3)|0 = 0x18)
+    let put_msg_lease = etcd.etcd_put_message(key_foo, val_bar, 5)
+    check("put_message_lease_present", bytes_len(put_msg_lease) == 12)
+    check("put_message_lease_tag", bytes_get(put_msg_lease, 10) == 0x18)
+    check("put_message_lease_val", bytes_get(put_msg_lease, 11) == 5)
+
+    // ── 2. gRPC-framed message: 00 00 00 00 0A <10 bytes> ──
+    let framed = etcd.etcd_put_framed(key_foo, val_bar, 0)
+    check("framed_len_15", bytes_len(framed) == 15)
+    check("framed_prefix_00", bytes_get(framed, 0) == 0)
+    check("framed_prefix_00b", bytes_get(framed, 1) == 0)
+    check("framed_prefix_00c", bytes_get(framed, 2) == 0)
+    check("framed_prefix_00d", bytes_get(framed, 3) == 0)
+    check("framed_len_byte", bytes_get(framed, 4) == 10)
+    let framed_payload = bytes_slice(framed, 5, 15)
+    check("framed_payload_matches_msg", bytes_eq(framed_payload, put_msg))
+    // Cross-check against forge_grpc directly (no reimplementation divergence).
+    let direct_frame = h2g.grpc_frame_bytes(put_msg)
+    check("framed_matches_grpc_frame_bytes", bytes_eq(framed, direct_frame))
+
+    // ── 3. RangeRequest encode: exact key (range_end omitted), and prefix scan ──
+    let range_msg_exact = etcd.etcd_range_message(key_foo, bytes(0), 0)
+    check("range_exact_omits_range_end", bytes_eq(range_msg_exact, bytes_from_ints([0x0A, 0x03, 0x66, 0x6F, 0x6F])))
+
+    let prefix_end = etcd.etcd_range_end_prefix(key_foo)
+    // "foo" -> increment last byte 'o'(0x6F) -> 'p'(0x70): "fop"
+    check("range_end_prefix_fop", bytes_eq(prefix_end, bytes_from_ints([0x66, 0x6F, 0x70])))
+    let range_msg_prefix = etcd.etcd_range_message(key_foo, prefix_end, 0)
+    check("range_prefix_len", bytes_len(range_msg_prefix) == 10)
+
+    // prefix of all-0xFF bytes -> empty range_end (no upper bound)
+    let all_ff = bytes_from_ints([0xFF, 0xFF])
+    let ff_prefix_end = etcd.etcd_range_end_prefix(all_ff)
+    check("range_end_prefix_allff_empty", bytes_len(ff_prefix_end) == 0)
+    // empty key -> empty range_end too
+    let empty_prefix_end = etcd.etcd_range_end_prefix(bytes(0))
+    check("range_end_prefix_empty_key", bytes_len(empty_prefix_end) == 0)
+
+    // ── 4. DeleteRangeRequest encode ──
+    let del_msg = etcd.etcd_delete_range_message(key_foo, bytes(0))
+    check("delete_range_exact", bytes_eq(del_msg, bytes_from_ints([0x0A, 0x03, 0x66, 0x6F, 0x6F])))
+    let del_msg_range = etcd.etcd_delete_range_message(key_foo, prefix_end)
+    check("delete_range_with_end_len", bytes_len(del_msg_range) == 10)
+
+    // ── 5. RangeResponse decode: synthetic message with one KeyValue + count ──
+    // KeyValue{key="foo",value="bar"}: field1 key(len3) + field5 value(len3)
+    //   tag1=0x0A len=3 "foo" ; tag5=(5<<3)|2=0x2A len=3 "bar"
+    let kv_bytes = bytes_from_ints([0x0A, 0x03, 0x66, 0x6F, 0x6F, 0x2A, 0x03, 0x62, 0x61, 0x72])
+    check("kv_bytes_len_10", bytes_len(kv_bytes) == 10)
+    // RangeResponse: field2 kvs (len-delim, tag=(2<<3)|2=0x12, len=10) + field4 count (tag=(4<<3)|0=0x20, val=1)
+    let range_resp_bytes = bytes_from_ints([0x12, 0x0A])
+    range_resp_bytes = bytes_concat(range_resp_bytes, kv_bytes)
+    range_resp_bytes = bytes_concat(range_resp_bytes, bytes_from_ints([0x20, 0x01]))
+    check("range_resp_len_14", bytes_len(range_resp_bytes) == 14)
+
+    let decoded = etcd.etcd_decode_range_response(range_resp_bytes)
+    check("range_resp_count_1", decoded["count"] == 1)
+    check("range_resp_more_false", decoded["more"] == false)
+    let kvs = decoded["kvs"]
+    check("range_resp_kvs_len_1", len(kvs) == 1)
+    if len(kvs) == 1
+        let kv0 = kvs[0]
+        check("range_resp_kv_key_foo", bytes_eq(kv0["key"], key_foo))
+        check("range_resp_kv_value_bar", bytes_eq(kv0["value"], val_bar))
+        check("range_resp_kv_create_rev_default_0", kv0["create_revision"] == 0)
+
+    // ── 6. Round-trip: full unary wire message (message -> gRPC frame -> deframe -> decode) ──
+    let put_wire_payload = bytes_slice(framed, 5, bytes_len(framed))
+    check("wire_payload_roundtrip", bytes_eq(put_wire_payload, put_msg))
+    let deframed = h2g.grpc_deframe_bytes(framed, 0)
+    check("deframe_ok_flag", deframed[2] == 0)
+    check("deframe_payload_matches", bytes_eq(deframed[0], put_msg))
+
+    // ── 7. BINARY SAFETY: key with an embedded 0x00 byte survives encode+decode ──
+    let bin_key = bytes_from_ints([0x66, 0x00, 0x6F])  // "f\0o"
+    let bin_val = bytes_from_ints([0x62, 0x61, 0x72])  // "bar"
+    let bin_put = etcd.etcd_put_message(bin_key, bin_val, 0)
+    // field1 tag=0x0A len=3 <f 00 o> ; field2 tag=0x12 len=3 "bar"
+    let expect_bin_put = bytes_from_ints([0x0A, 0x03, 0x66, 0x00, 0x6F, 0x12, 0x03, 0x62, 0x61, 0x72])
+    check("binary_key_nul_encode_exact", bytes_eq(bin_put, expect_bin_put))
+    check("binary_key_nul_len_preserved", bytes_len(bin_put) == 10)
+    // Decode it back out by wrapping it as a fake KeyValue (field1=key,field5=value) to exercise
+    // the SAME decode path used for RangeResponse kvs, proving the 0x00 is never truncated.
+    let bin_kv_bytes = bytes_from_ints([0x0A, 0x03, 0x66, 0x00, 0x6F, 0x2A, 0x03, 0x62, 0x61, 0x72])
+    let bin_kv_resp = bytes_from_ints([0x12, 0x0A])
+    bin_kv_resp = bytes_concat(bin_kv_resp, bin_kv_bytes)
+    let bin_decoded = etcd.etcd_decode_range_response(bin_kv_resp)
+    let bin_kvs = bin_decoded["kvs"]
+    check("binary_key_nul_kvs_len_1", len(bin_kvs) == 1)
+    if len(bin_kvs) == 1
+        check("binary_key_nul_roundtrip", bytes_eq(bin_kvs[0]["key"], bin_key))
+        check("binary_key_nul_key_len_3", bytes_len(bin_kvs[0]["key"]) == 3)
+        check("binary_key_nul_middle_byte_zero", bytes_get(bin_kvs[0]["key"], 1) == 0)
+
+    // ── 8. Empty / missing field edge cases ──
+    let empty_range_resp = etcd.etcd_decode_range_response(bytes(0))
+    check("empty_range_resp_kvs_empty", len(empty_range_resp["kvs"]) == 0)
+    check("empty_range_resp_count_0", empty_range_resp["count"] == 0)
+
+    let empty_put_resp = etcd.etcd_decode_put_response(bytes(0))
+    check("empty_put_resp_has_prev_kv_false", empty_put_resp["has_prev_kv"] == false)
+
+    // PutResponse with prev_kv present (field2, embedded KeyValue{key="foo",value="bar"})
+    let put_resp_bytes = bytes_from_ints([0x12, 0x0A])
+    put_resp_bytes = bytes_concat(put_resp_bytes, kv_bytes)
+    let put_resp_decoded = etcd.etcd_decode_put_response(put_resp_bytes)
+    check("put_resp_has_prev_kv_true", put_resp_decoded["has_prev_kv"] == true)
+    check("put_resp_prev_kv_key", bytes_eq(put_resp_decoded["prev_kv"]["key"], key_foo))
+
+    // DeleteRangeResponse: field2 deleted=1
+    let del_resp_bytes = bytes_from_ints([0x10, 0x01])
+    let del_resp_decoded = etcd.etcd_decode_delete_range_response(del_resp_bytes)
+    check("del_resp_deleted_1", del_resp_decoded["deleted"] == 1)
+    check("del_resp_prev_kvs_empty", len(del_resp_decoded["prev_kvs"]) == 0)
+
+    // ── 9. WIDTH BOUNDARY: lease at i64-ish large value round-trips through the wire ──
+    let big_lease_msg = etcd.etcd_put_message(key_foo, val_bar, 300)
+    // 300 needs 2 varint bytes (300 = 0b1_0010_1100 -> AC 02)
+    check("lease_300_len", bytes_len(big_lease_msg) == 13)
+    check("lease_300_byte0", bytes_get(big_lease_msg, 11) == 0xAC)
+    check("lease_300_byte1", bytes_get(big_lease_msg, 12) == 0x02)
+
+    // ── summary ──
+    if FAILS[0] == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))

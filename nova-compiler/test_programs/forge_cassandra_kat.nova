@@ -1,0 +1,285 @@
+// KAT — forge_cassandra: CQL native-protocol v4 codec.
+// Byte-exact vectors hand-computed against RFC-style CQL native protocol v4 spec.
+
+import forge_cassandra as cq
+import std/encoding/pack as pk
+
+fn _fail(msg: string)
+    print("FAIL: " + msg)
+
+fn _hex(b: bytes) -> string
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let v = bytes_get(b, i) & 0xFF
+        let hidig = v / 16
+        let lodig = v % 16
+        out = out + _hexdig(hidig) + _hexdig(lodig)
+        i = i + 1
+    out
+
+fn _hexdig(d: int) -> string
+    let digs = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+    digs[d]
+
+fn main()
+    let ok = 1
+
+    // ── 1. STARTUP frame, byte-exact ────────────────────────────────────────
+    // header: version=0x04 flags=0x00 stream=0x0000 opcode=0x01(STARTUP) length=0x00000016(22)
+    // body:   string-map count=1, key="CQL_VERSION"(11), value="3.0.0"(5)
+    //         2(count) + (2+11) + (2+5) = 22 bytes
+    let startup = cq.cql_startup_frame(0, {"CQL_VERSION": "3.0.0"})
+    let want_startup = "0400000001000000160001000b43514c5f56455253494f4e0005332e302e30"
+    let got_startup = _hex(startup)
+    if got_startup != want_startup
+        ok = 0
+        _fail("startup frame bytes: got " + got_startup + " want " + want_startup)
+    if bytes_len(startup) != 31
+        ok = 0
+        _fail("startup frame length != 31, got " + str(bytes_len(startup)))
+
+    // ── 2. QUERY frame for "SELECT * FROM t" with consistency ONE, byte-exact ─
+    // header: version=0x04 flags=0x00 stream=0x0001 opcode=0x07(QUERY) length=0x00000016(22)
+    // body:   long-string len=15 "SELECT * FROM t" + consistency short 0x0001 + flags byte 0x00
+    //         4 + 15 + 2 + 1 = 22 bytes
+    let query = cq.cql_query_frame(1, "SELECT * FROM t", cq.cql_consistency_num("ONE"))
+    let want_query = "0400000107000000160000000f53454c454354202a2046524f4d2074000100"
+    let got_query = _hex(query)
+    if got_query != want_query
+        ok = 0
+        _fail("query frame bytes: got " + got_query + " want " + want_query)
+    if bytes_len(query) != 31
+        ok = 0
+        _fail("query frame length != 31, got " + str(bytes_len(query)))
+    if cq.cql_consistency_num("ONE") != 1
+        ok = 0
+        _fail("consistency ONE != 1")
+    if cq.cql_consistency_name(1) != "ONE"
+        ok = 0
+        _fail("consistency name(1) != ONE")
+
+    // ── 3. [string] encoder round-trip + byte-exact, incl. empty string ──────
+    let s1 = cq.cql_string_encode("abc")
+    if _hex(s1) != "0003616263"
+        ok = 0
+        _fail("string encode 'abc': " + _hex(s1))
+    let s1d = cq.cql_string_decode(s1, 0)
+    if s1d[0] != "abc" or s1d[1] != 5
+        ok = 0
+        _fail("string decode 'abc' round-trip failed")
+
+    let s_empty = cq.cql_string_encode("")
+    if _hex(s_empty) != "0000"
+        ok = 0
+        _fail("string encode '' : " + _hex(s_empty))
+    let s_empty_d = cq.cql_string_decode(s_empty, 0)
+    if s_empty_d[0] != "" or s_empty_d[1] != 2
+        ok = 0
+        _fail("string decode '' round-trip failed")
+
+    // truncated buffer: declares length 5 but only 2 bytes follow -> decode fails,
+    // pos returned unchanged
+    let trunc = bytes_concat(pk.pack_u16_be(5), str_to_bytes("ab"))
+    let trunc_d = cq.cql_string_decode(trunc, 0)
+    if trunc_d[1] != 0 or trunc_d[0] != ""
+        ok = 0
+        _fail("truncated string decode should fail with pos unchanged")
+
+    // width boundary: a 300-byte string crosses the 255/256 byte boundary in the
+    // 2-byte length prefix
+    let big_s = ""
+    let bi = 0
+    while bi < 300
+        big_s = big_s + "x"
+        bi = bi + 1
+    let big_enc = cq.cql_string_encode(big_s)
+    if bytes_len(big_enc) != 302
+        ok = 0
+        _fail("300-byte string encode length wrong: " + str(bytes_len(big_enc)))
+    let big_dec = cq.cql_string_decode(big_enc, 0)
+    if big_dec[0] != big_s or big_dec[1] != 302
+        ok = 0
+        _fail("300-byte string round-trip failed")
+
+    // ── 4. [long string] round-trip + byte-exact ──────────────────────────────
+    let ls1 = cq.cql_long_string_encode("hi")
+    if _hex(ls1) != "000000026869"
+        ok = 0
+        _fail("long string encode 'hi': " + _hex(ls1))
+    let ls1d = cq.cql_long_string_decode(ls1, 0)
+    if ls1d[0] != "hi" or ls1d[1] != 6
+        ok = 0
+        _fail("long string decode 'hi' round-trip failed")
+
+    let ls_empty = cq.cql_long_string_encode("")
+    let ls_empty_d = cq.cql_long_string_decode(ls_empty, 0)
+    if ls_empty_d[0] != "" or ls_empty_d[1] != 4
+        ok = 0
+        _fail("long string '' round-trip failed")
+
+    // ── 5. [string map] round-trip, incl. multi-entry + empty map ────────────
+    let m = {"CQL_VERSION": "3.0.0"}
+    let menc = cq.cql_string_map_encode(m)
+    if _hex(menc) != "0001000b43514c5f56455253494f4e0005332e302e30"
+        ok = 0
+        _fail("string map encode: " + _hex(menc))
+    let mdec = cq.cql_string_map_decode(menc, 0)
+    if mdec[0]["CQL_VERSION"] != "3.0.0" or mdec[1] != bytes_len(menc)
+        ok = 0
+        _fail("string map decode round-trip failed")
+
+    let m2 = {"CQL_VERSION": "3.0.0", "COMPRESSION": "lz4"}
+    let m2enc = cq.cql_string_map_encode(m2)
+    let m2dec = cq.cql_string_map_decode(m2enc, 0)
+    if m2dec[0]["CQL_VERSION"] != "3.0.0" or m2dec[0]["COMPRESSION"] != "lz4" or m2dec[1] != bytes_len(m2enc)
+        ok = 0
+        _fail("2-entry string map round-trip failed")
+
+    let m_empty = {}
+    let m_empty_enc = cq.cql_string_map_encode(m_empty)
+    if _hex(m_empty_enc) != "0000"
+        ok = 0
+        _fail("empty string map encode: " + _hex(m_empty_enc))
+    let m_empty_dec = cq.cql_string_map_decode(m_empty_enc, 0)
+    if m_empty_dec[1] != 2
+        ok = 0
+        _fail("empty string map decode failed")
+
+    // malformed map: declares count=2 but only one entry present -> whole decode fails
+    let bad_map = bytes_concat(pk.pack_u16_be(2), cq.cql_string_encode("k1"))
+    let bad_map2 = bytes_concat(bad_map, cq.cql_string_encode("v1"))
+    let bad_dec = cq.cql_string_map_decode(bad_map2, 0)
+    if bad_dec[1] != 0
+        ok = 0
+        _fail("truncated string map should fail with pos unchanged")
+
+    // ── 6. [bytes] round-trip incl. null, empty, and binary 0x00 payload ─────
+    let payload = bytes_create(3)
+    bytes_set(payload, 0, 0xDE)
+    bytes_set(payload, 1, 0x00)
+    bytes_set(payload, 2, 0xAD)
+    let benc = cq.cql_bytes_encode(payload)
+    if _hex(benc) != "00000003de00ad"
+        ok = 0
+        _fail("bytes encode: " + _hex(benc))
+    let bdec = cq.cql_bytes_decode(benc, 0)
+    if bytes_len(bdec[0]) != 3 or bytes_get(bdec[0], 1) != 0x00 or bdec[2] != 0
+        ok = 0
+        _fail("bytes decode (with embedded 0x00) round-trip failed")
+
+    let bnull = cq.cql_bytes_encode_null()
+    if _hex(bnull) != "ffffffff"
+        ok = 0
+        _fail("null bytes encode: " + _hex(bnull))
+    let bnull_dec = cq.cql_bytes_decode(bnull, 0)
+    if bnull_dec[2] != 1 or bytes_len(bnull_dec[0]) != 0 or bnull_dec[1] != 4
+        ok = 0
+        _fail("null bytes decode failed")
+
+    let bempty = cq.cql_bytes_encode(bytes_create(0))
+    if _hex(bempty) != "00000000"
+        ok = 0
+        _fail("empty bytes encode: " + _hex(bempty))
+    // injection safety: a CRLF + NUL embedded inside a string-map VALUE must not
+    // truncate parsing early or let the attacker forge a second key/value pair —
+    // the reader always advances by the declared [short] length, never by
+    // scanning for a delimiter. Follow this entry with a second, legitimate
+    // entry and confirm both survive untouched.
+    let cr = chr(13)
+    let lf = chr(10)
+    let evil_val = "line1" + cr + lf + "STARTUP" + cr + lf + "line3"
+    let inj_map = {"OPTION_A": evil_val, "OPTION_B": "safe"}
+    let inj_enc = cq.cql_string_map_encode(inj_map)
+    let inj_dec = cq.cql_string_map_decode(inj_enc, 0)
+    if inj_dec[0]["OPTION_A"] != evil_val
+        ok = 0
+        _fail("injection-safety: CRLF-laden map value corrupted on round-trip")
+    if inj_dec[0]["OPTION_B"] != "safe"
+        ok = 0
+        _fail("injection-safety: sibling map entry corrupted by neighboring control chars")
+    if inj_dec[1] != bytes_len(inj_enc)
+        ok = 0
+        _fail("injection-safety: decode did not consume the full declared map length")
+
+    let bempty_dec = cq.cql_bytes_decode(bempty, 0)
+    if bytes_len(bempty_dec[0]) != 0 or bempty_dec[2] != 0 or bempty_dec[1] != 4
+        ok = 0
+        _fail("empty bytes decode failed")
+
+    // ── 7. frame header encode/decode round-trip across representative values ─
+    let hcases_v = [0x04, 0x84, 0x00, 0xFF]
+    let hcases_f = [0x00, 0x01, 0x08, 0xFF]
+    let hcases_s = [0, 1, 32767, -1]
+    let hcases_o = [0x01, 0x07, 0x08, 0x00]
+    let hcases_l = [0, 22, 256, 65536]
+    let hi = 0
+    while hi < 4
+        let hb = cq.cql_frame_header_encode(hcases_v[hi], hcases_f[hi], hcases_s[hi], hcases_o[hi], hcases_l[hi])
+        if bytes_len(hb) != 9
+            ok = 0
+            _fail("frame header encode not 9 bytes at case " + str(hi))
+        let hd = cq.cql_frame_header_decode(hb, 0)
+        let h = hd[0]
+        if (h["version"] & 0xFF) != (hcases_v[hi] & 0xFF)
+            ok = 0
+            _fail("frame header version round-trip mismatch at case " + str(hi))
+        if (h["flags"] & 0xFF) != (hcases_f[hi] & 0xFF)
+            ok = 0
+            _fail("frame header flags round-trip mismatch at case " + str(hi))
+        if h["stream"] != hcases_s[hi]
+            ok = 0
+            _fail("frame header stream round-trip mismatch at case " + str(hi) + " got " + str(h["stream"]))
+        if (h["opcode"] & 0xFF) != (hcases_o[hi] & 0xFF)
+            ok = 0
+            _fail("frame header opcode round-trip mismatch at case " + str(hi))
+        if h["length"] != hcases_l[hi]
+            ok = 0
+            _fail("frame header length round-trip mismatch at case " + str(hi))
+        if hd[1] != 9
+            ok = 0
+            _fail("frame header decode next_pos != 9 at case " + str(hi))
+        hi = hi + 1
+
+    // header decode bounds safety: too-short buffer
+    let short_buf = bytes_create(4)
+    let short_dec = cq.cql_frame_header_decode(short_buf, 0)
+    if len(keys(short_dec[0])) != 0 or short_dec[1] != 0
+        ok = 0
+        _fail("frame header decode on short buffer should fail cleanly")
+    let neg_dec = cq.cql_frame_header_decode(short_buf, -1)
+    if len(keys(neg_dec[0])) != 0 or neg_dec[1] != -1
+        ok = 0
+        _fail("frame header decode with negative pos should fail cleanly")
+
+    // ── 8. opcode name<->num table round-trip ─────────────────────────────────
+    if cq.cql_opcode_name(0x01) != "STARTUP" or cq.cql_opcode_num("STARTUP") != 0x01
+        ok = 0
+        _fail("opcode STARTUP round-trip failed")
+    if cq.cql_opcode_name(0x08) != "RESULT" or cq.cql_opcode_num("RESULT") != 0x08
+        ok = 0
+        _fail("opcode RESULT round-trip failed")
+    if cq.cql_opcode_name(0x00) != "ERROR" or cq.cql_opcode_num("ERROR") != 0x00
+        ok = 0
+        _fail("opcode ERROR round-trip failed")
+    if cq.cql_opcode_name(99) != ""
+        ok = 0
+        _fail("unknown opcode name should be empty")
+    if cq.cql_opcode_num("NOT_A_REAL_OP") != -1
+        ok = 0
+        _fail("unknown opcode name lookup should be -1")
+
+    // ── 9. OPTIONS frame (empty body), byte-exact ─────────────────────────────
+    let opts = cq.cql_options_frame(5)
+    if _hex(opts) != "040000050500000000"
+        ok = 0
+        _fail("options frame bytes: " + _hex(opts))
+    if bytes_len(opts) != 9
+        ok = 0
+        _fail("options frame length != 9")
+
+    if ok == 1
+        print("PASS")
+    else
+        print("DONE-WITH-FAILURES")
