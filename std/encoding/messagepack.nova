@@ -1,0 +1,773 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/messagepack (MessagePack, msgpack.org)
+// ============================================================================
+// WHAT: MessagePack binary serialization — a JSON data model (nil/bool/int/
+// float/string/binary/array/map) laid out as compact, mostly-self-describing
+// binary. Every value starts with a 1-byte FORMAT byte; small values (small
+// ints, short strings, short arrays/maps) pack their length/value directly
+// into that byte (the "fix*" formats) so common data needs no extra bytes at
+// all — this is msgpack's headline advantage over CBOR/BSON/UBJSON for
+// small-payload wire size.
+//
+// REUSE, NOT REINVENTION.
+//   * Fixed-width big-endian integers -> std/encoding/pack (pack_u8/i8/
+//     u16_be/i16_be/u32_be/i32_be/u64_be/i64_be + the matching unpack_*
+//     readers). MessagePack multi-byte fields are ALWAYS big-endian (network
+//     order) — same `_be` half of pack.nova that std/encoding/ubjson uses.
+//   * float64 exact bits -> float_to_bits/float_from_bits (same technique as
+//     std/encoding/bson's double field and std/encoding/ubjson's `D` format).
+//   * float32 DECODE -> f32_from_bits (safe widen, no unsafe block needed).
+//     Encode always emits float64 (0xcb) — NOVA floats ARE f64, so float64 is
+//     always the exact, lossless representation; there is no precision to
+//     gain by narrowing on encode (unlike std/encoding/ubjson, which DOES
+//     narrow when lossless, because UBJSON's `d`/`D` choice is a documented
+//     size optimization for THAT format — msgpack's spec makes no such
+//     recommendation and always-float64 keeps this encoder's behavior simple
+//     and trivially correct).
+//   * bytes<->string -> str_to_bytes/bytes_to_str (same builtins bson.nova
+//     and ubjson.nova use for their string readers/writers).
+//   * 2-key magic-value sentinel dicts for nil/bool/error, TYPE_OF-GUARDED —
+//     the exact "crash-safe pattern" std/encoding/plist.nova (_plist_null_
+//     magic/_plist_bool_magic) and std/encoding/bson.nova (_bs_null_magic)
+//     already established: a sentinel is recognized only when the wrapper
+//     dict has EXACTLY the 2 expected keys AND the magic key's value is
+//     type-guarded (type_of == "int" before the equality compare, so a
+//     hostile/coincidental non-int magic value can never fault the compare)
+//     AND matches the fixed magic constant exactly. An ordinary user dict
+//     that merely happens to use one of these key NAMES (but lacks the
+//     matching magic value) always falls through to the plain map path.
+//
+// FORMAT TABLE (this module implements ALL of these; see msgpack.org spec):
+//   0x00-0x7f  positive fixint (value = byte itself)
+//   0xe0-0xff  negative fixint (value = byte - 256, i.e. -32..-1)
+//   0x80-0x8f  fixmap   (n = byte & 0x0f, n < 16)
+//   0x90-0x9f  fixarray (n = byte & 0x0f, n < 16)
+//   0xa0-0xbf  fixstr   (len = byte & 0x1f, len < 32)
+//   0xc0       nil
+//   0xc2/0xc3  false/true
+//   0xc4/c5/c6 bin8/16/32   (1/2/4-byte BE length prefix, raw bytes payload)
+//   0xca       float32 (4-byte BE IEEE-754 single — DECODE only; see above)
+//   0xcb       float64 (8-byte BE IEEE-754 double)
+//   0xcc-0xcf  uint8/16/32/64 (BE)
+//   0xd0-0xd3  int8/16/32/64  (BE, two's complement)
+//   0xd9/da/db str8/16/32   (1/2/4-byte BE length prefix, UTF-8 bytes payload)
+//   0xdc/dd    array16/32  (2/4-byte BE element count)
+//   0xde/df    map16/32    (2/4-byte BE pair count)
+// NOT implemented: ext8/16/32 (0xc7-0xc9), fixext1/2/4/8/16 (0xd4-0xd8) — the
+// msgpack "extension type" family for application-defined binary tags. Not
+// requested by this module's spec and there is no NOVA value shape that
+// naturally maps to "an application-defined type tag + opaque bytes" without
+// inventing new API surface; decoding one yields an in-band error sentinel
+// (see ERROR HANDLING) rather than misreading it as something else.
+//
+// INTEGER "SMALLEST FORMAT THAT FITS" RULE, split by sign (matches the
+// msgpack reference encoders and this module's own byte-exact KAT):
+//   0..127            -> positive fixint (1 byte, no payload)
+//   128..255          -> uint8  (0xcc + 1 byte)
+//   256..65535        -> uint16 (0xcd + 2 bytes BE)
+//   65536..4294967295 -> uint32 (0xce + 4 bytes BE)
+//   > 4294967295       -> uint64 (0xcf + 8 bytes BE)   [NOVA ints top out at
+//                          i64::MAX ~9.22e18, comfortably inside uint64's
+//                          unsigned range, so this branch never overflows]
+//   -32..-1            -> negative fixint (1 byte: 0xe0 | (v & 0x1f))
+//   -128..-33          -> int8  (0xd0 + 1 byte)
+//   -32768..-129       -> int16 (0xd1 + 2 bytes BE)
+//   -2147483648..-32769 -> int32 (0xd2 + 4 bytes BE)
+//   < -2147483648       -> int64 (0xd3 + 8 bytes BE)   [covers i64::MIN]
+// This positive-uses-uint-family / negative-uses-int-family split (rather
+// than choosing purely by magnitude regardless of sign) is what every
+// mainstream msgpack encoder does and is what reproduces this module's own
+// spec vectors byte-for-byte: 128 -> 0xcc 0x80, 256 -> 0xcd 0x01 0x00.
+//
+// UINT64 TOP-BIT LIMITATION (documented, not a bug): a msgpack producer from
+// ANOTHER language may legally emit uint64 (0xcf) values with the top bit set
+// (up to 2^64-1). NOVA's `int` is signed 64-bit two's complement and cannot
+// represent that magnitude — decode reproduces the exact 64-bit BIT PATTERN
+// (same "no fold needed" reasoning std/encoding/pack.nova documents for its
+// own unpack_i64_be/unpack_u64_be), which for such a value surfaces as a
+// negative NOVA int rather than raising an error. This module's OWN encoder
+// never produces such a value (a NOVA source int can never exceed i64::MAX),
+// so this only affects decoding a value from a foreign producer whose
+// original number exceeds NOVA's representable range — an inherent language
+// limitation, not something this module can paper over without lying about
+// the value.
+//
+// NIL / BOOL / ERROR SENTINELS (encode-time forcing + decode-time in-band
+// errors). Since type_of(true) == "int" in NOVA, and a bare `null` value
+// degrades to raw int 0 the moment it crosses ANY function-call boundary
+// through an `any`-typed parameter (verified: msgpack_encode(v) sees
+// type_of(v) == "int" even for a literal `null`/`true`/`false` argument —
+// identical to the documented std/encoding/ubjson finding for its own
+// ubjson_encode(null)) — a generic encoder cannot tell "the caller wrote
+// true" from "the caller wrote 1", nor "the caller wrote null" from "the
+// caller wrote 0". The DEFAULT policy (matching this codebase's bson/ubjson
+// modules) is therefore: a plain NOVA int always encodes as one of the
+// fixint/uint*/int* formats — so msgpack_encode(0) and (by the same
+// call-boundary erasure) msgpack_encode(null) BOTH produce fixint 0x00, and
+// msgpack_encode(1)/msgpack_encode(true) both produce fixint 0x01. To force
+// an explicit nil (0xc0) or true/false (0xc3/0xc2), wrap the value with
+// msgpack_nil() / msgpack_bool(v) before passing it to msgpack_encode (or
+// inserting it into a list/dict that will be encoded) — e.g.:
+//   let d = {}
+//   d["deleted"] = msgpack_nil()
+//   d["active"]  = msgpack_bool(true)
+// DECODE never needs a sentinel to PRODUCE nil/bool — a wire 0xc0 decodes to
+// NOVA `null` directly (same call-boundary caveat then applies symmetrically
+// to whatever the CALLER does with that returned null, exactly as documented
+// for bson_decode/ubjson_decode's own null mapping — a NOVA-wide limitation,
+// not specific to this module) and 0xc2/0xc3 decode to plain int 0/1 (there
+// is no information lost versus a true bool literal, since NOVA can't
+// distinguish the two anyway).
+//
+// A malformed/truncated/hostile buffer NEVER crashes and NEVER calls exit():
+// every decode path that reads a declared length validates
+// `pos + declared_len <= bytes_len(buffer)` BEFORE slicing/reading any
+// payload byte, and on failure returns msgpack_error(...) — a 2-key
+// magic-value sentinel dict recognized by msgpack_is_error(v) — as the
+// decoded VALUE, in-band, exactly like a real decoded value would be
+// returned. This is a deliberate departure from std/encoding/bson's
+// print+exit(1)-on-malformed-input convention: this module's contract is
+// "malformed input is decoded to an in-band error value, never a process
+// exit" (matches std/encoding/ubjson's fully-defensive, non-exiting decode
+// style). A container (array/map) that hits an error while decoding one of
+// its elements/keys/values immediately stops iterating further elements and
+// propagates that SAME error value upward as its own result, rather than
+// silently reading whatever garbage the runtime's bounds-clamped bytes_get
+// would otherwise hand back for a would-be corrupted cursor position — this
+// is what makes "a str8 whose declared length overruns the buffer is
+// rejected in-band" hold true even nested inside an array/map, not just at
+// the top level.
+//
+// PUBLIC API
+//   msgpack_encode(v)            -> bytes  encode any NOVA value to MsgPack
+//   msgpack_decode(b)            -> any    decode a complete MsgPack buffer
+//                                            (returns msgpack_error(...) on
+//                                            malformed/truncated input — see
+//                                            msgpack_is_error)
+//   msgpack_decode_at(b, pos)    -> list   [value, next_pos]; streaming /
+//                                            recursive primitive
+//   msgpack_nil()                -> any    force an explicit nil (0xc0)
+//   msgpack_bool(v)               -> any    force an explicit true/false
+//                                            (0xc3/0xc2)
+//   msgpack_error(msg)           -> any    build an in-band decode-error
+//                                            sentinel (used internally; public
+//                                            so callers can construct/compare)
+//   msgpack_is_error(v)           -> int    1 iff v is exactly a
+//                                            msgpack_error(...) sentinel
+//
+// MAP KEY LIMITATION (documented). MessagePack maps may legally use ANY
+// msgpack value as a key (int, bool, array, ...). NOVA dicts only support
+// string keys. Decode therefore stringifies a non-string key via str(key)
+// (e.g. a wire integer key 7 becomes the NOVA dict key "7") — the same
+// numeric-string-key convention std/encoding/bson.nova uses for its array
+// index keys. This is a real, accepted asymmetry versus the wire format, not
+// a bug: a foreign producer using non-string map keys will round-trip its
+// VALUES correctly but its keys become their string representation.
+//
+// STRING NUL LIMITATION (documented, matches reference_nova_string_nul_
+// truncation, and identical to std/encoding/bson's own note): a decoded
+// msgpack string value is only passed through bytes_to_str for EXACTLY its
+// declared byte length — never scanned for a terminator — but NOVA's
+// `string` type is still C-string-shaped internally, so a string payload
+// containing an embedded 0x00 byte truncates at that byte once represented
+// as a NOVA string. Binary data with embedded 0x00 MUST use bin8/16/32 (NOVA
+// `bytes`), never str8/16/32 — this module encodes NOVA `bytes` values as
+// bin*, never str*, specifically to keep that path binary-safe end to end.
+//
+// IMPLEMENTATION NOTES
+//   * All private helpers prefixed _mp_ to avoid link collisions.
+//   * bytes_append/bytes_concat/bytes_slice each return a NEW bytes handle —
+//     always reassign, never assume in-place mutation (same convention as
+//     every other codec module in this directory).
+//   * Every function that assembles a value of potentially different NOVA
+//     shapes (int/string/list/dict/bytes/float/error-dict) across different
+//     branches uses SINGLE-EXIT style — one accumulator variable reassigned
+//     per branch, one trailing return — never a chain of early `return`s
+//     with different underlying shapes. This is the exact discipline
+//     std/encoding/bson.nova and std/encoding/ubjson.nova already use to
+//     avoid a documented NOVA repr-mistagging bug
+//     (reference_nova_return_null_mistag) that a mixed-early-return decoder
+//     in this same codebase's stdlib fleet actually reproduced once
+//     (a float32 value came back as a raw pointer-sized int).
+//   * A note on std/data/msgpack.nova: an EARLIER, narrower msgpack module
+//     already exists at that path (mp_encode/mp_decode, fixint/uint*/fixstr/
+//     str8/fixarray/fixmap/nil/bool only — no negative int8/16/32/64, no
+//     bin*, no float32/float64, no str16/32, no array16/32, no map16/32, no
+//     bounds-checked decode). This module (std/encoding/messagepack,
+//     msgpack_encode/msgpack_decode) is the complete, spec-conformant
+//     implementation covering every format byte the msgpack spec defines
+//     (bar the ext* family, see above) plus hardened, non-crashing decode.
+//     It intentionally uses a distinct function-name prefix (msgpack_* vs
+//     mp_*) so both modules can coexist without a link collision; callers
+//     wanting full-spec coverage should import std/encoding/messagepack.
+// ============================================================================
+import std/encoding/pack
+
+// ── magic constants for 2-key sentinel dicts (nil / bool / error) ─────────
+// Each spells an 8-ASCII-char tag read as one big-endian 64-bit int, all
+// starting with 'M' (0x4D < 0x80) so every constant is guaranteed to fit as
+// a POSITIVE NOVA int64 literal — same technique as std/encoding/bson.nova's
+// _bs_null_magic() / std/encoding/plist.nova's _plist_null_magic().
+fn _mp_nil_magic() -> int
+    0x4D5347504B4E494C               // "MSGPKNIL"
+
+fn _mp_bool_magic() -> int
+    0x4D5347504B424F4C               // "MSGPKBOL"
+
+fn _mp_err_magic() -> int
+    0x4D5347504B455252               // "MSGPKERR"
+
+// msgpack_nil(): force an explicit wire nil (0xc0) on encode. See header for
+// why a bare `null` cannot reliably reach msgpack_encode as `null` at all.
+fn msgpack_nil() -> any
+    let d = {}
+    d["$mpNil"] = 1
+    d["$mpNilMagic"] = _mp_nil_magic()
+    d
+
+// msgpack_bool(v): force an explicit wire true/false (0xc3/0xc2) on encode.
+fn msgpack_bool(v) -> any
+    let bbit = 0
+    if v != 0
+        bbit = 1
+    let d = {}
+    d["$mpBool"] = bbit
+    d["$mpBoolMagic"] = _mp_bool_magic()
+    d
+
+// msgpack_error(msg): an in-band decode-error sentinel. Never raised as an
+// exception, never exit()s the process — just an ordinary NOVA value the
+// caller can test with msgpack_is_error(v).
+fn msgpack_error(msg) -> any
+    let d = {}
+    d["$mpErr"] = msg
+    d["$mpErrMagic"] = _mp_err_magic()
+    d
+
+// msgpack_is_error(v): true iff `v` is EXACTLY a msgpack_error(...) sentinel
+// — dict with exactly 2 keys, both magic-named, magic VALUE type-guarded
+// (never faults on a hostile non-int magic value) and matching exactly.
+fn msgpack_is_error(v) -> int
+    let result = 0
+    if type_of(v) == "dict"
+        let ks = keys(v)
+        if len(ks) == 2 and contains(v, "$mpErr") and contains(v, "$mpErrMagic")
+            if type_of(v["$mpErrMagic"]) == "int"
+                if v["$mpErrMagic"] == _mp_err_magic()
+                    result = 1
+    result
+
+// _mp_is_nil_marker / _mp_is_bool_marker: same 2-key + type-guarded-magic
+// recognition, for encode-time sentinel dispatch.
+fn _mp_is_nil_marker(v) -> int
+    let result = 0
+    if type_of(v) == "dict"
+        let ks = keys(v)
+        if len(ks) == 2 and contains(v, "$mpNil") and contains(v, "$mpNilMagic")
+            if type_of(v["$mpNilMagic"]) == "int"
+                if v["$mpNilMagic"] == _mp_nil_magic()
+                    result = 1
+    result
+
+fn _mp_is_bool_marker(v) -> int
+    let result = 0
+    if type_of(v) == "dict"
+        let ks = keys(v)
+        if len(ks) == 2 and contains(v, "$mpBool") and contains(v, "$mpBoolMagic")
+            if type_of(v["$mpBoolMagic"]) == "int"
+                if v["$mpBoolMagic"] == _mp_bool_magic()
+                    result = 1
+    result
+
+// ── encode: integer (smallest format that fits, split by sign) ───────────
+fn _mp_encode_int(v) -> any
+    let out = bytes_create(0)
+    if v >= 0
+        if v <= 127
+            out = bytes_append(out, v)                     // positive fixint
+        else if v <= 255
+            out = bytes_append(out, 0xcc)
+            out = bytes_concat(out, pack_u8(v))
+        else if v <= 65535
+            out = bytes_append(out, 0xcd)
+            out = bytes_concat(out, pack_u16_be(v))
+        else if v <= 4294967295
+            out = bytes_append(out, 0xce)
+            out = bytes_concat(out, pack_u32_be(v))
+        else
+            out = bytes_append(out, 0xcf)
+            out = bytes_concat(out, pack_u64_be(v))
+    else
+        if v >= -32
+            out = bytes_append(out, 0xe0 | (v & 0x1f))     // negative fixint
+        else if v >= -128
+            out = bytes_append(out, 0xd0)
+            out = bytes_concat(out, pack_i8(v))
+        else if v >= -32768
+            out = bytes_append(out, 0xd1)
+            out = bytes_concat(out, pack_i16_be(v))
+        else if v >= -2147483648
+            out = bytes_append(out, 0xd2)
+            out = bytes_concat(out, pack_i32_be(v))
+        else
+            out = bytes_append(out, 0xd3)
+            out = bytes_concat(out, pack_i64_be(v))
+    out
+
+// ── encode: float (always float64 — see header for why no narrowing) ──────
+fn _mp_encode_float(v) -> any
+    let out = bytes_append(bytes_create(0), 0xcb)
+    bytes_concat(out, pack_u64_be(float_to_bits(v)))
+
+// ── encode: string (fixstr / str8 / str16 / str32 by UTF-8 BYTE length) ───
+// Uses bytes_len(str_to_bytes(v)), NOT len(v) (char count) — a multi-byte
+// UTF-8 string has more encoded bytes than characters; the wire length MUST
+// be the byte count or decode would slice the wrong span.
+fn _mp_encode_str(v) -> any
+    let sb = str_to_bytes(v)
+    let slen = bytes_len(sb)
+    let out = bytes_create(0)
+    if slen <= 31
+        out = bytes_append(out, 0xa0 | slen)
+    else if slen <= 255
+        out = bytes_append(out, 0xd9)
+        out = bytes_concat(out, pack_u8(slen))
+    else if slen <= 65535
+        out = bytes_append(out, 0xda)
+        out = bytes_concat(out, pack_u16_be(slen))
+    else
+        out = bytes_append(out, 0xdb)
+        out = bytes_concat(out, pack_u32_be(slen))
+    bytes_concat(out, sb)
+
+// ── encode: binary / bytes (bin8 / bin16 / bin32 — no fix* variant exists
+// in the spec, bin8 is already the smallest, covers len 0 too) ────────────
+fn _mp_encode_bin(v) -> any
+    let blen = bytes_len(v)
+    let out = bytes_create(0)
+    if blen <= 255
+        out = bytes_append(out, 0xc4)
+        out = bytes_concat(out, pack_u8(blen))
+    else if blen <= 65535
+        out = bytes_append(out, 0xc5)
+        out = bytes_concat(out, pack_u16_be(blen))
+    else
+        out = bytes_append(out, 0xc6)
+        out = bytes_concat(out, pack_u32_be(blen))
+    bytes_concat(out, v)
+
+// ── append helper: bulk-append the bytes of `piece` onto `out` in O(len(piece))
+// AMORTIZED time. `bytes_append` grows `out` by doubling (same amortized-
+// doubling technique bytes_append_str uses for strings — see nova_runtime.c),
+// so looping bytes_append one BYTE at a time here still costs O(total bytes
+// appended) overall, never O(out's current size) per call. This replaces the
+// `out = bytes_concat(out, piece)` pattern used in a per-element encode loop:
+// bytes_concat allocates a FRESH buffer and memcpy's out's ENTIRE existing
+// content on every single call, so calling it once per array element (or
+// twice per map pair) makes total copy volume O(n^2) in the element count —
+// confirmed to take 17.7s encoding a 200k-element array and to hang (>60s)
+// on a 65536-key map. Reading `piece` byte-by-byte via bytes_get (rather than
+// converting it through bytes_to_str/bytes_append_str) keeps this binary-safe
+// for arbitrary payload bytes, including embedded 0x00 — required since
+// `piece` may be a nested container's own encoded bytes, a float64 payload,
+// or anything else msgpack_encode can produce.
+fn _mp_append_bytes(out, piece) -> any
+    let m = bytes_len(piece)
+    let j = 0
+    while j < m
+        out = bytes_append(out, bytes_get(piece, j))
+        j = j + 1
+    out
+
+// ── encode: array (fixarray / array16 / array32) ───────────────────────────
+// O(n) total: each element's encoded bytes are appended via _mp_append_bytes
+// (amortized doubling), never via a per-element full-buffer bytes_concat —
+// see _mp_append_bytes header for why that matters. Nested arrays/maps are
+// automatically covered too: a nested container is just one element here,
+// and it built ITS OWN `out` the same O(n) way when msgpack_encode recursed
+// into it.
+fn _mp_encode_array(lst) -> any
+    let n = len(lst)
+    let out = bytes_create(0)
+    if n <= 15
+        out = bytes_append(out, 0x90 | n)
+    else if n <= 65535
+        out = bytes_append(out, 0xdc)
+        out = _mp_append_bytes(out, pack_u16_be(n))
+    else
+        out = bytes_append(out, 0xdd)
+        out = _mp_append_bytes(out, pack_u32_be(n))
+    let i = 0
+    while i < n
+        out = _mp_append_bytes(out, msgpack_encode(lst[i]))
+        i = i + 1
+    out
+
+// ── encode: map (fixmap / map16 / map32) — keys() order, all keys strings ─
+// Same O(n) discipline as _mp_encode_array (see its header) — the key AND
+// value pieces are each appended via _mp_append_bytes, never bytes_concat,
+// so a large map no longer re-copies its entire accumulated output on every
+// key and every value.
+fn _mp_encode_map(d) -> any
+    let ks = keys(d)
+    let n = len(ks)
+    let out = bytes_create(0)
+    if n <= 15
+        out = bytes_append(out, 0x80 | n)
+    else if n <= 65535
+        out = bytes_append(out, 0xde)
+        out = _mp_append_bytes(out, pack_u16_be(n))
+    else
+        out = bytes_append(out, 0xdf)
+        out = _mp_append_bytes(out, pack_u32_be(n))
+    let i = 0
+    while i < n
+        let k = ks[i]
+        out = _mp_append_bytes(out, _mp_encode_str(k))
+        out = _mp_append_bytes(out, msgpack_encode(d[k]))
+        i = i + 1
+    out
+
+// ── encode: top-level dispatch ─────────────────────────────────────────────
+// Dispatched via type_of(v) — NOT `v != null` (NOVA represents null as raw
+// 0, so `0 != null` is FALSE and a real int/float 0 would silently fall into
+// the nil branch; see the identical CVE-class note in bson.nova/ubjson.nova).
+// SINGLE-EXIT: one `out` accumulator, one trailing return.
+fn msgpack_encode(v) -> any
+    let t = type_of(v)
+    let out = bytes_append(bytes_create(0), 0xc0)          // default: nil
+    if t == "null"
+        out = bytes_append(bytes_create(0), 0xc0)
+    else if t == "float"
+        out = _mp_encode_float(v)
+    else if t == "string"
+        out = _mp_encode_str(v)
+    else if t == "bytes"
+        out = _mp_encode_bin(v)
+    else if t == "list"
+        out = _mp_encode_array(v)
+    else if t == "dict"
+        if _mp_is_nil_marker(v) == 1
+            out = bytes_append(bytes_create(0), 0xc0)
+        else if _mp_is_bool_marker(v) == 1
+            if v["$mpBool"] != 0
+                out = bytes_append(bytes_create(0), 0xc3)
+            else
+                out = bytes_append(bytes_create(0), 0xc2)
+        else
+            out = _mp_encode_map(v)
+    else if t == "int"
+        out = _mp_encode_int(v)
+    // Any other/unsupported NOVA type (struct/process/channel handle) keeps
+    // the safe nil fallback set above — same catch-all policy bson.nova and
+    // ubjson.nova use.
+    out
+
+// ── decode: bounds helper — true iff [pos, pos+want) is fully inside b ────
+fn _mp_fits(b, pos, want) -> int
+    let n = bytes_len(b)
+    let result = 1
+    if pos < 0
+        result = 0
+    else if want < 0
+        result = 0
+    else if pos + want > n
+        result = 0
+    result
+
+// ── decode: length-prefix readers, bounds-checked. Return [-1, pos] on a
+// truncated prefix (impossible legitimate value for an unsigned read, so -1
+// safely doubles as an in-band failure flag for these plain-int helpers). ──
+fn _mp_read_len8(b, pos) -> list
+    let ln = -1
+    let next = pos
+    if _mp_fits(b, pos, 1) == 1
+        ln = unpack_u8(b, pos)
+        next = pos + 1
+    [ln, next]
+
+fn _mp_read_len16(b, pos) -> list
+    let ln = -1
+    let next = pos
+    if _mp_fits(b, pos, 2) == 1
+        ln = unpack_u16_be(b, pos)
+        next = pos + 2
+    [ln, next]
+
+fn _mp_read_len32(b, pos) -> list
+    let ln = -1
+    let next = pos
+    if _mp_fits(b, pos, 4) == 1
+        ln = unpack_u32_be(b, pos)
+        next = pos + 4
+    [ln, next]
+
+// ── decode: raw binary / string payload readers, bounds-checked ───────────
+fn _mp_read_bin(b, pos, blen) -> list
+    let val = msgpack_error("truncated binary payload")
+    let next = bytes_len(b)
+    if _mp_fits(b, pos, blen) == 1
+        val = bytes_slice(b, pos, pos + blen)
+        next = pos + blen
+    [val, next]
+
+fn _mp_read_str(b, pos, slen) -> list
+    let val = msgpack_error("truncated string payload")
+    let next = bytes_len(b)
+    if _mp_fits(b, pos, slen) == 1
+        let sub = bytes_slice(b, pos, pos + slen)
+        val = bytes_to_str(sub)
+        next = pos + slen
+    [val, next]
+
+// ── decode: array body of `count` elements starting at `pos` ──────────────
+// Stops and propagates immediately on the first element that decodes to an
+// error sentinel — never keeps looping over a corrupted cursor position.
+fn _mp_decode_array_body(b, pos, count) -> list
+    let out = []
+    let cur = pos
+    let i = 0
+    let err = null
+    let has_err = 0
+    while i < count and has_err == 0
+        let r = msgpack_decode_at(b, cur)
+        let val = r[0]
+        cur = r[1]
+        if msgpack_is_error(val) == 1
+            err = val
+            has_err = 1
+        else
+            push(out, val)
+        i = i + 1
+    let result_val = out
+    if has_err == 1
+        result_val = err
+    [result_val, cur]
+
+// ── decode: map body of `count` key/value pairs starting at `pos` ─────────
+// A non-string wire key is stringified via str(key) — see MAP KEY
+// LIMITATION in the header. Propagates on the first key OR value that
+// decodes to an error sentinel, same discipline as the array body above.
+fn _mp_decode_map_body(b, pos, count) -> list
+    let out = {}
+    let cur = pos
+    let i = 0
+    let err = null
+    let has_err = 0
+    while i < count and has_err == 0
+        let kr = msgpack_decode_at(b, cur)
+        let kval = kr[0]
+        cur = kr[1]
+        if msgpack_is_error(kval) == 1
+            err = kval
+            has_err = 1
+        else
+            let vr = msgpack_decode_at(b, cur)
+            let vval = vr[0]
+            cur = vr[1]
+            if msgpack_is_error(vval) == 1
+                err = vval
+                has_err = 1
+            else
+                let kstr = kval
+                if type_of(kval) != "string"
+                    kstr = str(kval)
+                out[kstr] = vval
+        i = i + 1
+    let result_val = out
+    if has_err == 1
+        result_val = err
+    [result_val, cur]
+
+// ── decode: one value at `pos` -> [value, next_pos] ────────────────────────
+// SINGLE-EXIT (accumulate into val/next, one trailing [val, next]) — see
+// IMPLEMENTATION NOTES for why this shape is mandatory here (val legitimately
+// takes on every different NOVA value shape across branches).
+fn msgpack_decode_at(b, pos) -> list
+    let n = bytes_len(b)
+    let val = msgpack_error("unexpected end of buffer")
+    let next = n
+    if pos >= 0 and pos < n
+        let byte0 = bytes_get(b, pos) & 0xFF
+        let cur = pos + 1
+        if byte0 <= 0x7f
+            val = byte0
+            next = cur
+        else if byte0 >= 0xe0
+            val = byte0 - 256
+            next = cur
+        else if byte0 >= 0x80 and byte0 <= 0x8f
+            let r = _mp_decode_map_body(b, cur, byte0 - 0x80)
+            val = r[0]
+            next = r[1]
+        else if byte0 >= 0x90 and byte0 <= 0x9f
+            let r = _mp_decode_array_body(b, cur, byte0 - 0x90)
+            val = r[0]
+            next = r[1]
+        else if byte0 >= 0xa0 and byte0 <= 0xbf
+            let r = _mp_read_str(b, cur, byte0 - 0xa0)
+            val = r[0]
+            next = r[1]
+        else if byte0 == 0xc0
+            val = null
+            next = cur
+        else if byte0 == 0xc2
+            val = 0
+            next = cur
+        else if byte0 == 0xc3
+            val = 1
+            next = cur
+        else if byte0 == 0xc4
+            let lr = _mp_read_len8(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated bin8 length")
+            else
+                let r = _mp_read_bin(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xc5
+            let lr = _mp_read_len16(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated bin16 length")
+            else
+                let r = _mp_read_bin(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xc6
+            let lr = _mp_read_len32(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated bin32 length")
+            else
+                let r = _mp_read_bin(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xca
+            if _mp_fits(b, cur, 4) == 0
+                val = msgpack_error("truncated float32")
+            else
+                val = f32_from_bits(unpack_u32_be(b, cur))
+                next = cur + 4
+        else if byte0 == 0xcb
+            if _mp_fits(b, cur, 8) == 0
+                val = msgpack_error("truncated float64")
+            else
+                val = float_from_bits(unpack_u64_be(b, cur))
+                next = cur + 8
+        else if byte0 == 0xcc
+            if _mp_fits(b, cur, 1) == 0
+                val = msgpack_error("truncated uint8")
+            else
+                val = unpack_u8(b, cur)
+                next = cur + 1
+        else if byte0 == 0xcd
+            if _mp_fits(b, cur, 2) == 0
+                val = msgpack_error("truncated uint16")
+            else
+                val = unpack_u16_be(b, cur)
+                next = cur + 2
+        else if byte0 == 0xce
+            if _mp_fits(b, cur, 4) == 0
+                val = msgpack_error("truncated uint32")
+            else
+                val = unpack_u32_be(b, cur)
+                next = cur + 4
+        else if byte0 == 0xcf
+            if _mp_fits(b, cur, 8) == 0
+                val = msgpack_error("truncated uint64")
+            else
+                val = unpack_u64_be(b, cur)
+                next = cur + 8
+        else if byte0 == 0xd0
+            if _mp_fits(b, cur, 1) == 0
+                val = msgpack_error("truncated int8")
+            else
+                val = unpack_i8(b, cur)
+                next = cur + 1
+        else if byte0 == 0xd1
+            if _mp_fits(b, cur, 2) == 0
+                val = msgpack_error("truncated int16")
+            else
+                val = unpack_i16_be(b, cur)
+                next = cur + 2
+        else if byte0 == 0xd2
+            if _mp_fits(b, cur, 4) == 0
+                val = msgpack_error("truncated int32")
+            else
+                val = unpack_i32_be(b, cur)
+                next = cur + 4
+        else if byte0 == 0xd3
+            if _mp_fits(b, cur, 8) == 0
+                val = msgpack_error("truncated int64")
+            else
+                val = unpack_i64_be(b, cur)
+                next = cur + 8
+        else if byte0 == 0xd9
+            let lr = _mp_read_len8(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated str8 length")
+            else
+                let r = _mp_read_str(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xda
+            let lr = _mp_read_len16(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated str16 length")
+            else
+                let r = _mp_read_str(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xdb
+            let lr = _mp_read_len32(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated str32 length")
+            else
+                let r = _mp_read_str(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xdc
+            let lr = _mp_read_len16(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated array16 length")
+            else
+                let r = _mp_decode_array_body(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xdd
+            let lr = _mp_read_len32(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated array32 length")
+            else
+                let r = _mp_decode_array_body(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xde
+            let lr = _mp_read_len16(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated map16 length")
+            else
+                let r = _mp_decode_map_body(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else if byte0 == 0xdf
+            let lr = _mp_read_len32(b, cur)
+            if lr[0] < 0
+                val = msgpack_error("truncated map32 length")
+            else
+                let r = _mp_decode_map_body(b, lr[1], lr[0])
+                val = r[0]
+                next = r[1]
+        else
+            // 0xc1 (unused), 0xc7-0xc9 (ext8/16/32), 0xd4-0xd8 (fixext*):
+            // not implemented (see header) — in-band error, forward progress
+            // by exactly 1 byte, never a crash or a hang.
+            val = msgpack_error("unsupported or reserved format byte")
+            next = cur
+    [val, next]
+
+// msgpack_decode: decode a single complete top-level MsgPack value from `b`
+// (offset 0). Returns the decoded value, or msgpack_error(...) in-band on
+// malformed/truncated input — never exits, never crashes.
+fn msgpack_decode(b) -> any
+    let r = msgpack_decode_at(b, 0)
+    r[0]

@@ -1,0 +1,113 @@
+// KAT for std/encoding/rlp — proves the overflow-sentinel fix.
+//
+// Prior defect: a declared long-form length near 2^63-1 (which passes the
+// "slen2 < 0" top-bit guard, since 0x7fffffffffffffff has its top bit
+// clear) fed directly into start+declared_length. That addition WRAPS in
+// int64 arithmetic, so next_pos came back as an arbitrary large-negative
+// wrapped value instead of the documented -1 sentinel.
+//
+// Fix: the overrun check now computes the available remainder
+// (bytes_len(buf) - start, always safe since start <= bytes_len(buf) was
+// already established) and compares the declared length against THAT,
+// so the overflowing addition is never formed. This KAT asserts next_pos
+// is EXACTLY -1 (not merely negative) for both the long-string and
+// long-list forms, and re-confirms the canonical spec vectors still
+// round-trip cleanly (the fix must not break valid input).
+//
+// KAT INTEGRITY: pass/total threaded explicitly through every check call
+// as a returned [pass, total] list.
+import std/encoding/rlp
+import std/encoding/hex
+
+fn ck_int(label: string, got: int, want: int, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got == want
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        return [pass, total]
+
+fn ck_str(label: string, got: string, want: string, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got == want
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        return [pass, total]
+
+fn main()
+    let state = [0, 0]
+
+    // ── EXACT-SENTINEL: long-string declared length = 0x7fffffffffffffff ──
+    // 0xbf = long string, len-of-len = 8, length bytes = 7f ff ff ff ff ff ff ff.
+    // start = pos+1+8 = 9. Un-fixed: start+slen wraps to a huge negative
+    // number, NOT -1. Fixed: rejected via remainder-comparison, next_pos
+    // must be EXACTLY -1.
+    let atk1 = hex_decode("bf7fffffffffffffff")
+    let r1 = rlp_decode(atk1, 0)
+    state = ck_int("overflow_long_string_next_is_exactly_neg1", r1[1], -1, state)
+    state = ck_int("overflow_long_string_no_overread", bytes_len(r1[0]), 0, state)
+
+    // ── EXACT-SENTINEL: long-list declared length = 0x7fffffffffffffff ────
+    let atk2 = hex_decode("ff7fffffffffffffff")
+    let r2 = rlp_decode(atk2, 0)
+    state = ck_int("overflow_long_list_next_is_exactly_neg1", r2[1], -1, state)
+
+    // ── nested: parent list wrapping the overflow-crafted long-string child
+    // must also propagate to exactly -1 (not a wrapped garbage value) ──────
+    let atk3 = hex_decode("c9bf7fffffffffffffff")
+    let r3 = rlp_decode(atk3, 0)
+    state = ck_int("overflow_nested_child_propagates_exactly_neg1", r3[1], -1, state)
+
+    // ── a length that just barely does NOT fit the remaining buffer (small
+    // numbers, no wraparound involved) must also land on exactly -1, proving
+    // the remainder-based check didn't regress the ordinary overrun path.
+    // len-of-len=1 (no leading-zero ambiguity), declared length = 0xff =
+    // 255, but only 2 payload bytes actually follow -> ordinary overrun,
+    // no wraparound involved at all. ──
+    let atk4 = hex_decode("b8ff0102")
+    let r4 = rlp_decode(atk4, 0)
+    state = ck_int("ordinary_overrun_still_exactly_neg1", r4[1], -1, state)
+
+    // ── canonical spec vectors must still round-trip after the fix ────────
+    state = ck_str("str_dog_still_ok", hex_encode(rlp_encode("dog")), "83646f67", state)
+    state = ck_str("list_cat_dog_still_ok", hex_encode(rlp_encode(["cat", "dog"])), "c88363617483646f67", state)
+
+    let bytes56 = bytes_create(56)
+    let i = 0
+    while i < 56
+        bytes_set(bytes56, i, 0x61)
+        i = i + 1
+    let enc56 = rlp_encode(bytes56)
+    let dr56 = rlp_decode(enc56, 0)
+    state = ck_str("str_56_long_form_still_roundtrips", hex_encode(dr56[0]), hex_encode(bytes56), state)
+    state = ck_int("str_56_long_form_next_still_correct", dr56[1], bytes_len(enc56), state)
+
+    let enc55 = rlp_encode(bytes_create(55))
+    let dr55 = rlp_decode(enc55, 0)
+    state = ck_int("str_55_short_form_next_still_correct", dr55[1], bytes_len(enc55), state)
+
+    // ── non-canonical long-form length (0xb8 0x00: length 0, which should
+    // have used the short form) is now rejected as non-canonical -> -1 ────
+    let noncanon = hex_decode("b800")
+    let rnc = rlp_decode(noncanon, 0)
+    state = ck_int("noncanonical_long_string_rejected", rnc[1], -1, state)
+
+    // ── non-canonical leading-zero length-of-length byte is rejected ──────
+    let leadzero = hex_decode("b900050102")
+    let rlz = rlp_decode(leadzero, 0)
+    state = ck_int("leading_zero_lenoflen_rejected", rlz[1], -1, state)
+
+    // ── final trailer ───────────────────────────────────────────────────
+    let pass = state[0]
+    let total = state[1]
+    print("RESULT " + str(pass) + "/" + str(total))
+    if pass == total
+        print("PASS")
+    else
+        print("FAIL")
+        exit(1)

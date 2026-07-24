@@ -1,0 +1,208 @@
+// INDEPENDENT ADVERSARIAL VERIFICATION probe for std/encoding/messagepack.
+// Fail-fast idiom (exit(1) per failed check) — no shared-counter trailer.
+import std/encoding/messagepack
+
+fn ckb(label: string, b: any, expected: list)
+    let blen = bytes_len(b)
+    let elen = len(expected)
+    if blen != elen
+        print("FAIL " + label + "_len: got " + str(blen) + " want " + str(elen))
+        exit(1)
+    let i = 0
+    while i < elen
+        let got = bytes_get(b, i)
+        let want = expected[i]
+        if got != want
+            print("FAIL " + label + "_b" + str(i) + ": got " + str(got) + " want " + str(want))
+            exit(1)
+        i = i + 1
+    print("PASS " + label + "_bytes")
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn ckerr(label: string, got: any)
+    if msgpack_is_error(got) != 1
+        print("FAIL " + label + ": expected an msgpack_error() sentinel")
+        exit(1)
+    print("PASS " + label)
+
+fn cknotcrash(label: string)
+    print("PASS " + label + "_no_crash")
+
+fn main()
+    print("PROGRESS start")
+    // ── (1) full-byte re-derivation of i64 extremes (not just format byte) ──
+    // i64::MAX = 0x7FFFFFFFFFFFFFFF -> uint64 0xcf + 7f ff ff ff ff ff ff ff
+    let emax = msgpack_encode(9223372036854775807)
+    ckb("i64max_full_bytes", emax, [0xcf, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+    // i64::MIN = -9223372036854775808 = 0x8000000000000000 -> int64 0xd3 + 80 00 00 00 00 00 00 00
+    let emin = msgpack_encode(0 - 9223372036854775807 - 1)
+    ckb("i64min_full_bytes", emin, [0xd3, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+    // uint32 boundary full bytes: 65536 -> 0xce 00 01 00 00
+    let e65536 = msgpack_encode(65536)
+    ckb("u32_65536_full_bytes", e65536, [0xce, 0x00, 0x01, 0x00, 0x00])
+    // and 4294967295 (uint32 max) -> 0xce ff ff ff ff
+    let eu32max = msgpack_encode(4294967295)
+    ckb("u32max_full_bytes", eu32max, [0xce, 0xff, 0xff, 0xff, 0xff])
+    // and 4294967296 (first uint64) -> 0xcf 00 00 00 01 00 00 00 00
+    let eu64first = msgpack_encode(4294967296)
+    ckb("u64first_full_bytes", eu64first, [0xcf, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00])
+
+    // ── (2) negative fixint interior spot-check (not just -1/-32 endpoints) ──
+    cki("neg16_byte0", bytes_get(msgpack_encode(0 - 16), 0), 0xf0)
+    cki("neg16_rt", msgpack_decode(msgpack_encode(0 - 16)), 0 - 16)
+
+    print("PROGRESS section2_done")
+    // ── (3) array16/array32 boundary at 65535/65536 (real threshold, not just
+    // the fixarray/array16 boundary at 15/16 the original KAT covered) ──────
+    let a65535 = []
+    let ai = 0
+    while ai < 65535
+        push(a65535, 0)
+        ai = ai + 1
+    let ea65535 = msgpack_encode(a65535)
+    cki("arr65535_is_array16", bytes_get(ea65535, 0), 0xdc)
+    cki("arr65535_len_byte1", bytes_get(ea65535, 1), 0xff)
+    cki("arr65535_len_byte2", bytes_get(ea65535, 2), 0xff)
+    print("PROGRESS arr65535_done")
+
+    let a65536 = []
+    ai = 0
+    while ai < 65536
+        push(a65536, 0)
+        ai = ai + 1
+    let ea65536 = msgpack_encode(a65536)
+    cki("arr65536_is_array32", bytes_get(ea65536, 0), 0xdd)
+    cki("arr65536_len_byte1", bytes_get(ea65536, 1), 0x00)
+    cki("arr65536_len_byte2", bytes_get(ea65536, 2), 0x01)
+    cki("arr65536_len_byte3", bytes_get(ea65536, 3), 0x00)
+    cki("arr65536_len_byte4", bytes_get(ea65536, 4), 0x00)
+    print("PROGRESS arr65536_encoded")
+    let deca65536 = msgpack_decode(ea65536)
+    cki("arr65536_rt_len", len(deca65536), 65536)
+    print("PROGRESS arr65536_done")
+
+    // ── (4) map16/map32 boundary at 65535/65536 ─────────────────────────────
+    let m65536 = {}
+    let mi = 0
+    while mi < 65536
+        m65536["k" + str(mi)] = 1
+        mi = mi + 1
+    print("PROGRESS map65536_built")
+    let em65536 = msgpack_encode(m65536)
+    cki("map65536_is_map32", bytes_get(em65536, 0), 0xdf)
+    print("PROGRESS map65536_done")
+
+    // ── (5) hostile sentinel-collision: 2 keys, correct NAMES, WRONG magic
+    // value (must fall through to plain map, never misfire as nil) ─────────
+    let hostile1 = {}
+    hostile1["$mpNil"] = 1
+    hostile1["$mpNilMagic"] = 42
+    let ehostile1 = msgpack_encode(hostile1)
+    cki("hostile_wrong_magic_is_map", bytes_get(ehostile1, 0), 0x82)
+
+    // hostile: 2 keys correct names, magic value is a STRING not int (the
+    // documented "type-guarded" claim — verify it actually holds, no crash)
+    let hostile2 = {}
+    hostile2["$mpNil"] = 1
+    hostile2["$mpNilMagic"] = "not-an-int"
+    let ehostile2 = msgpack_encode(hostile2)
+    cki("hostile_string_magic_is_map", bytes_get(ehostile2, 0), 0x82)
+    cknotcrash("hostile_string_magic")
+
+    // same probe against msgpack_is_error's own type guard
+    let hostile3 = {}
+    hostile3["$mpErr"] = "x"
+    hostile3["$mpErrMagic"] = "not-an-int"
+    cki("hostile_err_string_magic_not_error", msgpack_is_error(hostile3), 0)
+
+    // ── (6) reserved/ext format bytes beyond 0xc1 (0xc7 ext8, 0xd4 fixext1)
+    // must decode to in-band error, never crash ─────────────────────────────
+    let bext8 = bytes_create(1)
+    bytes_set(bext8, 0, 0xc7)
+    ckerr("ext8_unsupported", msgpack_decode(bext8))
+
+    let bfixext1 = bytes_create(1)
+    bytes_set(bfixext1, 0, 0xd4)
+    ckerr("fixext1_unsupported", msgpack_decode(bfixext1))
+
+    // ── (7) uint64 top-bit-set decode: documented limitation — must NOT
+    // crash/hang; produces SOME int (folds to negative NOVA int) ───────────
+    let btop = bytes_create(9)
+    bytes_set(btop, 0, 0xcf)
+    bytes_set(btop, 1, 0xff)
+    bytes_set(btop, 2, 0xff)
+    bytes_set(btop, 3, 0xff)
+    bytes_set(btop, 4, 0xff)
+    bytes_set(btop, 5, 0xff)
+    bytes_set(btop, 6, 0xff)
+    bytes_set(btop, 7, 0xff)
+    bytes_set(btop, 8, 0xff)
+    let dtop = msgpack_decode(btop)
+    cki("uint64_topbit_is_negative_one", dtop, 0 - 1)
+    cknotcrash("uint64_topbit")
+
+    // ── (8) non-string map key decode: wire int key 7 -> NOVA dict key "7" ──
+    // hand-built: fixmap n=1, key=fixint 7, value=fixstr "x"
+    let bintkey = bytes_create(4)
+    bytes_set(bintkey, 0, 0x81)
+    bytes_set(bintkey, 1, 0x07)
+    bytes_set(bintkey, 2, 0xa1)
+    bytes_set(bintkey, 3, 0x78)
+    let dintkey = msgpack_decode(bintkey)
+    cks("intkey_stringified", dintkey["7"], "x")
+
+    // ── (9) bare `null` literal passed straight to msgpack_encode: verify it
+    // does not crash and (per documented call-boundary erasure) matches
+    // plain int 0's encoding — this exact case was NOT exercised by the
+    // original KAT (only msgpack_nil() was tested for the 0xc0 path) ───────
+    let enull = msgpack_encode(null)
+    cknotcrash("bare_null_encode")
+    ckb("bare_null_matches_int0", enull, [0x00])
+
+    // ── (10) injection: bin16 declared length overruns buffer ──────────────
+    let bad_bin16 = bytes_create(3)
+    bytes_set(bad_bin16, 0, 0xc5)
+    bytes_set(bad_bin16, 1, 0xff)
+    bytes_set(bad_bin16, 2, 0xff)
+    ckerr("bin16_length_overrun", msgpack_decode(bad_bin16))
+
+    // ── (11) injection: map32 truncated 4-byte length prefix (only 2 of 4
+    // present) ───────────────────────────────────────────────────────────
+    let bad_map32len = bytes_create(3)
+    bytes_set(bad_map32len, 0, 0xdf)
+    bytes_set(bad_map32len, 1, 0x00)
+    bytes_set(bad_map32len, 2, 0x00)
+    ckerr("map32_truncated_length_prefix", msgpack_decode(bad_map32len))
+
+    // ── (12) injection: array32 declaring a length prefix that itself reads
+    // past end (prefix bytes present but count value huge + zero payload) ──
+    let bad_arr32 = bytes_create(5)
+    bytes_set(bad_arr32, 0, 0xdd)
+    bytes_set(bad_arr32, 1, 0x7f)
+    bytes_set(bad_arr32, 2, 0xff)
+    bytes_set(bad_arr32, 3, 0xff)
+    bytes_set(bad_arr32, 4, 0xff)
+    ckerr("array32_huge_count_no_payload", msgpack_decode(bad_arr32))
+
+    // ── (13) empty-string / empty-bin / empty-array / empty-map ALL still
+    // round-trip through the general dispatch (defense against an
+    // off-by-one at the "0" boundary specifically, re-derived independently
+    // rather than trusting the author's own empty-case tests) ─────────────
+    cki("empty_str_fmtbyte", bytes_get(msgpack_encode(""), 0), 0xa0)
+    cki("empty_arr_fmtbyte", bytes_get(msgpack_encode([]), 0), 0x90)
+    let emptymap = {}
+    cki("empty_map_fmtbyte", bytes_get(msgpack_encode(emptymap), 0), 0x80)
+
+    print("messagepack ADVERSARIAL KAT: ALL PASS")

@@ -1,0 +1,352 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/rlp
+// ============================================================================
+// Ethereum RLP (Recursive Length Prefix) codec — Ethereum Yellow Paper,
+// Appendix B ("Recursive Length Prefix").
+//
+// WHAT. RLP encodes exactly two kinds of structure, recursively:
+//   - a byte string (arbitrary binary data)
+//   - a list of RLP items (each item itself either a byte string or a list)
+// There is no other type at the RLP layer — integers, addresses, hashes and
+// everything else in Ethereum's wire/state formats are byte strings with an
+// application-level convention layered on top (see INTEGER CONVENTION below).
+//
+// STRING ENCODING RULE (Appendix B, R_b):
+//   len==1 and byte in [0x00,0x7f]  -> the byte itself (no prefix at all)
+//   len in [0,55]                   -> (0x80+len) . bytes
+//   len > 55                        -> (0xb7+len(BE(len))) . BE(len) . bytes
+//   where BE(n) is the MINIMAL big-endian encoding of n (no leading 0x00).
+//
+// LIST ENCODING RULE (Appendix B, R_l), payload = concatenation of the RLP
+// encodings of the list's items, in order:
+//   len(payload) in [0,55]  -> (0xc0+len(payload)) . payload
+//   len(payload) > 55       -> (0xf7+len(BE(len(payload)))) . BE(len(payload)) . payload
+//
+// INTEGER CONVENTION (Yellow Paper Appendix B, "positive RLP integers"):
+//   A non-negative integer is RLP-encoded as the byte-string of its MINIMAL
+//   big-endian two's-complement-free representation, with ZERO represented
+//   as the EMPTY byte string (not a single 0x00 byte). This is why the KAT
+//   below distinguishes "the raw byte 0x00" (-> 0x00, single-byte string
+//   rule) from "the integer 0" (-> 0x80, empty-string rule): they are
+//   different RLP *items* even though both ultimately touch the byte 0x00 —
+//   one has the byte 0x00 as its 1-byte PAYLOAD, the other has zero payload
+//   bytes at all. Getting this distinction wrong is the single most common
+//   Ethereum RLP implementation bug (mirrors leading-zero bugs elsewhere).
+//
+// GENERIC "any" VALUE MODEL. Since RLP has exactly two shapes, callers pass/
+// receive NOVA `any` values dispatched via type_of():
+//   type_of(v) == "bytes"  -> encoded as a byte string directly (binary-safe)
+//   type_of(v) == "string" -> UTF-8 bytes of the string, encoded as above
+//   type_of(v) == "int"    -> encoded via the INTEGER CONVENTION above
+//                             (NOTE: type_of(true)/type_of(false) == "int" in
+//                             NOVA, so booleans fall through to this branch —
+//                             true encodes as integer 1, false as integer 0)
+//   type_of(v) == "list"   -> each element rlp_encode()'d recursively, then
+//                             wrapped as an RLP list
+//   anything else           -> logged and encoded as an empty byte string
+//                             (never a crash / never exit(1) on bad input)
+// Decoding always yields either `bytes` (leaf item) or `list` (of `any`,
+// recursively) — decode does not know which application-level convention
+// (raw bytes vs. integer) a leaf item represents; use rlp_decode_uint() to
+// reinterpret a decoded byte-string as an unsigned integer when the caller
+// knows that's the intended convention.
+//
+// REUSE. Byte-buffer primitives (bytes_create/get/set/len/concat/slice/
+// str_to_bytes) are NOVA runtime builtins — the same ones std/encoding/asn1,
+// pack and varint build on, not reimplemented here. The minimal-big-endian
+// byte-count helper mirrors std/encoding/asn1's `_asn1_len_nbytes` /
+// `_asn1_der_trim` shape (same idea: "how many bytes to hold n, no leading
+// zero"), but RLP's length-of-length prefix arithmetic (0xb7/0xf7 bases) is
+// specific to Appendix B and is not the same encoding as DER's 0x80|n long
+// form, so it is implemented directly here rather than calling asn1.
+//
+// BINARY 0x00. All byte-string payloads are `bytes`, never routed through a
+// NOVA `string` (which is a C-string internally and truncates at 0x00 — see
+// reference_nova_string_nul_truncation). Only the "string" branch of
+// rlp_encode(), whose input IS genuinely textual, touches `string` at all
+// (via str_to_bytes, which is binary-safe on the way IN).
+//
+// BOUNDS / STRICTNESS ON DECODE. rlp_decode() never reads past the buffer:
+// every declared length (short or long form, string or list) is checked
+// against the remaining buffer size BEFORE any slice/read, and a length
+// field that would overrun the buffer is rejected IN-BAND — it returns a
+// next_pos of -1 (see ERROR SENTINEL) rather than crashing or over-reading.
+// A long-form length-of-length field wider than 8 bytes, or one whose value
+// decodes to a negative int64 (i.e. would require >= 2^63, which can never
+// be a legitimate in-memory buffer length), is likewise rejected. Critically,
+// the overrun check NEVER computes start+declared_length directly (that sum
+// can wrap around in int64 arithmetic for a declared length near 2^63-1,
+// turning next_pos into an arbitrary large-negative value instead of the
+// documented -1 sentinel) — it instead computes the available remainder
+// (bytes_len(buf) - start, which is always safe/non-negative because start
+// was already bounds-checked <= bytes_len(buf)) and compares the declared
+// length against THAT, only forming start+declared_length once it is known
+// to fit. Long-form lengths are also required to be CANONICAL per Ethereum
+// RLP: a declared length <= 55 (which should have used the short form) or a
+// length-of-length field with a non-canonical leading zero byte (e.g.
+// 0xb8 0x00) is rejected the same way, not silently accepted.
+//
+// ERROR SENTINEL. Every decode function that can fail returns next_pos ==
+// -1 to signal rejection (paired with a safe default value — empty bytes or
+// a partially-built list). Callers should check `next_pos >= 0` (or call
+// rlp_decode_ok(next_pos)) before trusting the returned value. This module
+// NEVER calls exit()/panics on malformed input — malformed RLP is data, not
+// a compiler bug, and must be handled in-band like any other I/O error.
+//
+// GENERIC TLV-STYLE LAYER (primitives everything else composes from):
+//   rlp_encode_bytes(b: bytes)          -> bytes   R_b applied to raw bytes
+//   rlp_wrap_list(payload: bytes)       -> bytes   R_l prefix over pre-built payload
+//   rlp_encode_list(items: list<bytes>) -> bytes   concatenate items + wrap
+//   rlp_decode(buf, pos)                -> list [value: any, next_pos: int]
+//   rlp_decode_ok(next_pos: int)        -> bool    next_pos >= 0
+//
+// GENERIC + INTEGER CONVENIENCE:
+//   rlp_encode(v: any)                  -> bytes   dispatch on type_of(v)
+//   rlp_decode_uint(b: bytes)           -> int      reinterpret bytes as BE uint
+//                                                    (-1 sentinel if > 8 bytes)
+//
+// LEAF — imports NOTHING.
+
+// ── minimal big-endian byte-count helper ───────────────────────────────────
+// Minimal big-endian bytes of a POSITIVE integer n (no leading zero byte).
+// Used both for the INTEGER CONVENTION (encoding a value as its RLP byte
+// string) and for encoding a "length of the length" in the long forms —
+// both are literally the same operation ("minimal BE bytes of a positive
+// int"), so one helper serves both call sites.
+//
+// Precondition: n > 0.  (n == 0 is handled by callers as a special case —
+// the integer convention maps 0 to the EMPTY byte string, not to this
+// function; a long-form prefix is only ever chosen when n > 55 > 0.)
+fn _rlp_min_be_bytes(n) -> any
+    let nb = 0
+    let v = n
+    while v > 0
+        nb = nb + 1
+        v = v >> 8
+    let out = bytes_create(nb)
+    let i = 0
+    while i < nb
+        let shift = (nb - 1 - i) * 8
+        bytes_set(out, i, (n >> shift) & 0xFF)
+        i = i + 1
+    return out
+
+// Reads `count` bytes at buf[start..start+count) as a big-endian unsigned
+// integer. Caller MUST have already bounds-checked start+count <= buf len
+// and count <= 8 (count > 8 cannot fit int64 without ambiguity/overflow).
+fn _rlp_read_be(buf, start, count) -> int
+    let val = 0
+    let i = 0
+    while i < count
+        val = (val << 8) | (bytes_get(buf, start + i) & 0xFF)
+        i = i + 1
+    return val
+
+// ── error-sentinel helper ───────────────────────────────────────────────────
+fn rlp_decode_ok(next_pos) -> bool
+    next_pos >= 0
+
+// ── STRING encoding (R_b) ──────────────────────────────────────────────────
+fn rlp_encode_bytes(b) -> any
+    let n = bytes_len(b)
+    if n == 1
+        let only = bytes_get(b, 0) & 0xFF
+        if only <= 0x7F
+            return b
+    if n <= 55
+        let prefix = bytes_create(1)
+        bytes_set(prefix, 0, 0x80 + n)
+        return bytes_concat(prefix, b)
+    let lenb = _rlp_min_be_bytes(n)
+    let prefix2 = bytes_create(1)
+    bytes_set(prefix2, 0, 0xB7 + bytes_len(lenb))
+    let head = bytes_concat(prefix2, lenb)
+    return bytes_concat(head, b)
+
+// ── LIST encoding (R_l) ─────────────────────────────────────────────────────
+// payload must already be the concatenation of each item's own RLP encoding.
+fn rlp_wrap_list(payload) -> any
+    let n = bytes_len(payload)
+    if n <= 55
+        let prefix = bytes_create(1)
+        bytes_set(prefix, 0, 0xC0 + n)
+        return bytes_concat(prefix, payload)
+    let lenb = _rlp_min_be_bytes(n)
+    let prefix2 = bytes_create(1)
+    bytes_set(prefix2, 0, 0xF7 + bytes_len(lenb))
+    let head = bytes_concat(prefix2, lenb)
+    return bytes_concat(head, payload)
+
+// items: list of already-RLP-encoded item byte strings (each produced by
+// rlp_encode_bytes / rlp_encode_list / rlp_encode). Concatenates them into
+// the list payload, then applies the list length prefix.
+fn rlp_encode_list(items) -> any
+    let payload = bytes_create(0)
+    let i = 0
+    let n = len(items)
+    while i < n
+        payload = bytes_concat(payload, items[i])
+        i = i + 1
+    return rlp_wrap_list(payload)
+
+// ── INTEGER CONVENTION ──────────────────────────────────────────────────────
+// 0 -> empty byte string; n > 0 -> minimal big-endian bytes (no leading 0).
+fn _rlp_int_to_bytes(n) -> any
+    if n <= 0
+        return bytes_create(0)
+    return _rlp_min_be_bytes(n)
+
+// Reinterpret a decoded RLP byte-string as an unsigned big-endian integer
+// (the inverse of the INTEGER CONVENTION above). Empty bytes -> 0.
+// A byte string longer than 8 bytes cannot be represented in an int64
+// without ambiguity/overflow, so it is rejected in-band (-1 sentinel)
+// rather than silently truncating or wrapping. Note: an 8-byte string
+// whose top bit is set decodes to a negative int64 (inherent two's-
+// complement i64 boundary, same limitation documented across every other
+// fixed-width-int module in this stdlib).
+fn rlp_decode_uint(b) -> int
+    let n = bytes_len(b)
+    if n == 0
+        return 0
+    if n > 8
+        print("rlp_decode_uint: byte string too long for int64 (" + str(n) + " bytes)")
+        return -1
+    return _rlp_read_be(b, 0, n)
+
+// ── generic recursive encode ────────────────────────────────────────────────
+fn rlp_encode(v) -> any
+    let t = type_of(v)
+    if t == "bytes"
+        return rlp_encode_bytes(v)
+    if t == "string"
+        return rlp_encode_bytes(str_to_bytes(v))
+    if t == "int"
+        if v < 0
+            print("rlp_encode: RLP has no native negative-integer convention, encoding " + str(v) + " as 0")
+            return rlp_encode_bytes(bytes_create(0))
+        return rlp_encode_bytes(_rlp_int_to_bytes(v))
+    if t == "list"
+        let items = []
+        let i = 0
+        let n = len(v)
+        while i < n
+            push(items, rlp_encode(v[i]))
+            i = i + 1
+        return rlp_encode_list(items)
+    print("rlp_encode: unsupported value type '" + t + "', encoding as empty byte string")
+    return rlp_encode_bytes(bytes_create(0))
+
+// ── generic recursive decode ────────────────────────────────────────────────
+// Decodes the list payload spanning buf[start,end) into a `list<any>` by
+// repeatedly decoding one item at a time until the span is exactly
+// consumed. Returns [items, end] on success, [partial_items, -1] if any
+// nested item is malformed or its declared length would run past `end`
+// (which, since `end` was itself already bounds-checked against the whole
+// buffer by the caller, also transitively guards against over-reading the
+// buffer itself).
+fn _rlp_decode_list_items(buf, start, end) -> list
+    let items = []
+    let pos = start
+    while pos < end
+        let r = rlp_decode(buf, pos)
+        let val = r[0]
+        let next = r[1]
+        if next < 0 or next > end
+            print("rlp_decode: malformed/overrunning nested list item")
+            return [items, -1]
+        push(items, val)
+        pos = next
+    return [items, end]
+
+// rlp_decode: decode ONE RLP item (byte string or list, recursively) from
+// buf starting at pos. Returns [value: any, next_pos: int]. On any
+// malformed input or declared-length-overruns-buffer condition, returns
+// [safe_default, -1] — see ERROR SENTINEL in the module header.
+fn rlp_decode(buf, pos) -> list
+    let blen = bytes_len(buf)
+    if pos < 0 or pos >= blen
+        return [bytes_create(0), -1]
+    let b0 = bytes_get(buf, pos) & 0xFF
+
+    // single byte, itself (0x00..0x7f)
+    if b0 <= 0x7F
+        let content = bytes_create(1)
+        bytes_set(content, 0, b0)
+        return [content, pos + 1]
+
+    // short string: 0x80..0xb7 -> length 0..55
+    if b0 <= 0xB7
+        let slen = b0 - 0x80
+        let start = pos + 1
+        let end = start + slen
+        if end > blen
+            print("rlp_decode: short string length overruns buffer")
+            return [bytes_create(0), -1]
+        return [bytes_slice(buf, start, end), end]
+
+    // long string: 0xb8..0xbf -> next (b0-0xb7) bytes are BE length
+    if b0 <= 0xBF
+        let lol = b0 - 0xB7
+        let len_start = pos + 1
+        let len_end = len_start + lol
+        if lol > 8 or len_end > blen
+            print("rlp_decode: long string length-of-length invalid or overruns buffer")
+            return [bytes_create(0), -1]
+        if lol > 1 and (bytes_get(buf, len_start) & 0xFF) == 0
+            print("rlp_decode: long string length-of-length has non-canonical leading zero byte")
+            return [bytes_create(0), -1]
+        let slen2 = _rlp_read_be(buf, len_start, lol)
+        if slen2 < 0
+            print("rlp_decode: long string declared length too large (>= 2^63)")
+            return [bytes_create(0), -1]
+        if slen2 <= 55
+            print("rlp_decode: long string uses non-canonical long form for length <= 55")
+            return [bytes_create(0), -1]
+        let start2 = len_end
+        // Never compute start2+slen2 directly — that can wrap for a
+        // declared length near 2^63-1. Compute the available remainder
+        // first (safe: start2 <= blen was already established above) and
+        // compare against slen2 instead.
+        let avail2 = blen - start2
+        if slen2 > avail2
+            print("rlp_decode: long string length overruns buffer")
+            return [bytes_create(0), -1]
+        let end2 = start2 + slen2
+        return [bytes_slice(buf, start2, end2), end2]
+
+    // short list: 0xc0..0xf7 -> payload length 0..55
+    if b0 <= 0xF7
+        let plen = b0 - 0xC0
+        let pstart = pos + 1
+        let pend = pstart + plen
+        if pend > blen
+            print("rlp_decode: short list length overruns buffer")
+            return [bytes_create(0), -1]
+        return _rlp_decode_list_items(buf, pstart, pend)
+
+    // long list: 0xf8..0xff -> next (b0-0xf7) bytes are BE payload length
+    let lol2 = b0 - 0xF7
+    let len_start3 = pos + 1
+    let len_end3 = len_start3 + lol2
+    if lol2 > 8 or len_end3 > blen
+        print("rlp_decode: long list length-of-length invalid or overruns buffer")
+        return [bytes_create(0), -1]
+    if lol2 > 1 and (bytes_get(buf, len_start3) & 0xFF) == 0
+        print("rlp_decode: long list length-of-length has non-canonical leading zero byte")
+        return [bytes_create(0), -1]
+    let plen2 = _rlp_read_be(buf, len_start3, lol2)
+    if plen2 < 0
+        print("rlp_decode: long list declared length too large (>= 2^63)")
+        return [bytes_create(0), -1]
+    if plen2 <= 55
+        print("rlp_decode: long list uses non-canonical long form for length <= 55")
+        return [bytes_create(0), -1]
+    let pstart2 = len_end3
+    // Same overflow-safe check as the long-string branch: compare against
+    // the available remainder instead of adding pstart2+plen2 directly.
+    let avail3 = blen - pstart2
+    if plen2 > avail3
+        print("rlp_decode: long list length overruns buffer")
+        return [bytes_create(0), -1]
+    let pend2 = pstart2 + plen2
+    return _rlp_decode_list_items(buf, pstart2, pend2)

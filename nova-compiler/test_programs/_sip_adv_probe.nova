@@ -1,0 +1,316 @@
+// INDEPENDENT ADVERSARIAL PROBE for std/net/sip
+// Does NOT use a shared-list counter; each check prints its own ok/FAIL line
+// and increments a locally-threaded pass count that is returned from main
+// via a final printed summary derived from that count (KAT integrity rule).
+import std/net/sip
+
+fn _str_bytes(s: string) -> bytes
+    let b = bytes_create(0)
+    b = bytes_append_str(b, s)
+    b
+
+fn _b2i(b: bool) -> int
+    if b
+        return 1
+    0
+
+fn main()
+    let crlf = chr(13) + chr(10)
+    let total = 0
+    let fails = 0
+
+    // ── 1. Re-derive REGISTER byte-exact independently, byte by byte ───────
+    total = total + 1
+    let reg_headers = [
+        ["Via", "SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds"],
+        ["Max-Forwards", "70"],
+        ["To", "Bob <sip:bob@biloxi.com>"],
+        ["From", "Bob <sip:bob@biloxi.com>;tag=456248"],
+        ["Call-ID", "843817637684230@998sundhcv23"],
+        ["CSeq", "1826 REGISTER"],
+        ["Contact", "<sip:bob@192.0.2.4>"],
+        ["Expires", "7200"],
+        ["Content-Length", "0"]]
+    let reg = sip_build_request("REGISTER", "sip:registrar.biloxi.com", reg_headers, bytes_create(0))
+    // hand-build expected bytes byte by byte using chr(13)/chr(10) explicitly
+    let CR = chr(13)
+    let LF = chr(10)
+    let expect = "REGISTER sip:registrar.biloxi.com SIP/2.0" + CR + LF
+    expect = expect + "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds" + CR + LF
+    expect = expect + "Max-Forwards: 70" + CR + LF
+    expect = expect + "To: Bob <sip:bob@biloxi.com>" + CR + LF
+    expect = expect + "From: Bob <sip:bob@biloxi.com>;tag=456248" + CR + LF
+    expect = expect + "Call-ID: 843817637684230@998sundhcv23" + CR + LF
+    expect = expect + "CSeq: 1826 REGISTER" + CR + LF
+    expect = expect + "Contact: <sip:bob@192.0.2.4>" + CR + LF
+    expect = expect + "Expires: 7200" + CR + LF
+    expect = expect + "Content-Length: 0" + CR + LF
+    expect = expect + CR + LF
+    let got_str = bytes_to_str(reg["bytes"])
+    if got_str == expect and bytes_len(reg["bytes"]) == len(expect)
+        print("ok 1 register_byte_exact")
+    else
+        print("FAIL 1 register_byte_exact got_len=" + str(bytes_len(reg["bytes"])) + " want_len=" + str(len(expect)))
+        fails = fails + 1
+
+    // byte-by-byte scan for CR=13 LF=10 at every line end (defend against a
+    // codec that "looks right" as a string compare but emits wrong raw bytes)
+    total = total + 1
+    let rb = reg["bytes"]
+    let n = bytes_len(rb)
+    let crlf_ok = 1
+    let k = 0
+    while k < n
+        if bytes_get(rb, k) == 13
+            if k + 1 >= n or bytes_get(rb, k + 1) != 10
+                crlf_ok = 0
+        k = k + 1
+    if crlf_ok == 1
+        print("ok 2 every_cr_followed_by_lf")
+    else
+        print("FAIL 2 every_cr_followed_by_lf (bare CR not followed by LF found)")
+        fails = fails + 1
+
+    // ── 2. Status/CSeq/port digit-width boundaries ──────────────────────────
+    total = total + 1
+    let s99 = sip_build_response(99, "Too Low", [], bytes_create(0))
+    let s100 = sip_build_response(100, "Trying", [], bytes_create(0))
+    let s699 = sip_build_response(699, "Edge", [], bytes_create(0))
+    let s700 = sip_build_response(700, "Too High", [], bytes_create(0))
+    if s99["ok"] == 0 and s100["ok"] == 1 and s699["ok"] == 1 and s700["ok"] == 0
+        print("ok 3 status_boundary_99_100_699_700")
+    else
+        print("FAIL 3 status_boundary_99_100_699_700 got=" + str(s99["ok"]) + "," + str(s100["ok"]) + "," + str(s699["ok"]) + "," + str(s700["ok"]))
+        fails = fails + 1
+
+    total = total + 1
+    // 18-digit Content-Length (max accepted width) vs 19-digit (rejected,
+    // even though still < i64 max) — documented conservative behavior.
+    let d18 = "999999999999999999"   // 18 nines
+    let d19 = "1000000000000000000" // 19 digits, 10^18, still < i64 max but rejected by design
+    let msg18 = "SIP/2.0 200 OK" + crlf + "Content-Length: " + d18 + crlf + crlf
+    let msg19 = "SIP/2.0 200 OK" + crlf + "Content-Length: " + d19 + crlf + crlf
+    let p18 = sip_parse(_str_bytes(msg18))
+    let p19 = sip_parse(_str_bytes(msg19))
+    if p18["ok"] == 1 and p18["content_length_header"] == 999999999999999999 and p19["ok"] == 1 and p19["content_length_header"] == -1
+        print("ok 4 content_length_18_vs_19_digit_boundary")
+    else
+        print("FAIL 4 content_length_18_vs_19_digit_boundary got18=" + str(p18["content_length_header"]) + " got19=" + str(p19["content_length_header"]))
+        fails = fails + 1
+
+    // ── 3. Content-Length EXACT boundary match (off-by-one both directions) ─
+    total = total + 1
+    let exact_text = "SIP/2.0 200 OK" + crlf + "Content-Length: 5" + crlf + crlf + "12345"
+    let pexact = sip_parse(_str_bytes(exact_text))
+    let over_text = "SIP/2.0 200 OK" + crlf + "Content-Length: 6" + crlf + crlf + "12345"
+    let pover = sip_parse(_str_bytes(over_text))
+    let under_text2 = "SIP/2.0 200 OK" + crlf + "Content-Length: 4" + crlf + crlf + "12345"
+    let punder = sip_parse(_str_bytes(under_text2))
+    if _b2i(pexact["content_length_match"]) == 1 and pexact["content_length_body"] == 5 and bytes_to_str(pexact["body"]) == "12345" and _b2i(pover["content_length_match"]) == 0 and pover["content_length_body"] == 5 and _b2i(punder["content_length_match"]) == 0 and punder["content_length_body"] == 4 and bytes_to_str(punder["body"]) == "1234"
+        print("ok 5 content_length_off_by_one_both_directions")
+    else
+        print("FAIL 5 content_length_off_by_one_both_directions")
+        fails = fails + 1
+
+    // ── 4. Content-Length declared negative-looking / garbage -> absent ────
+    total = total + 1
+    let neg_text = "SIP/2.0 200 OK" + crlf + "Content-Length: -5" + crlf + crlf + "abc"
+    let pneg = sip_parse(_str_bytes(neg_text))
+    let garbage_text = "SIP/2.0 200 OK" + crlf + "Content-Length: abc" + crlf + crlf + "xyz"
+    let pgarb = sip_parse(_str_bytes(garbage_text))
+    if pneg["ok"] == 1 and pneg["content_length_header"] == -1 and bytes_to_str(pneg["body"]) == "abc" and pgarb["ok"] == 1 and pgarb["content_length_header"] == -1 and bytes_to_str(pgarb["body"]) == "xyz"
+        print("ok 6 content_length_negative_and_garbage_treated_absent")
+    else
+        print("FAIL 6 content_length_negative_and_garbage_treated_absent got_neg_cl=" + str(pneg["content_length_header"]) + " got_garb_cl=" + str(pgarb["content_length_header"]))
+        fails = fails + 1
+
+    // ── 5. Header-line-without-colon rejected in-band (no crash/exit) ──────
+    total = total + 1
+    let nocolon = "SIP/2.0 200 OK" + crlf + "ThisHasNoColon" + crlf + crlf
+    let pnc = sip_parse(_str_bytes(nocolon))
+    if pnc["ok"] == 0 and len(pnc["headers"]) == 0
+        print("ok 7 header_no_colon_rejected")
+    else
+        print("FAIL 7 header_no_colon_rejected")
+        fails = fails + 1
+
+    // ── 6. CRLF-injection defense: value / name / reason / method ──────────
+    total = total + 1
+    let evilv = "safe" + crlf + "Injected-Header: pwn"
+    let bi1 = sip_build_request("INVITE", "sip:x@y.com", [["X-T", evilv]], bytes_create(0))
+    let bi2 = sip_build_response(200, "OK", [[("X" + crlf + "Y"), "z"]], bytes_create(0))
+    let bi3 = sip_build_response(200, ("OK" + crlf + "Evil: 1"), [], bytes_create(0))
+    let bi4 = sip_build_request(("INVITE" + crlf + "Evil: 1"), "sip:x@y.com", [], bytes_create(0))
+    if bi1["ok"] == 0 and bytes_len(bi1["bytes"]) == 0 and bi2["ok"] == 0 and bi3["ok"] == 0 and bi4["ok"] == 0
+        print("ok 8 crlf_injection_all_vectors_rejected")
+    else
+        print("FAIL 8 crlf_injection_all_vectors_rejected got=" + str(bi1["ok"]) + "," + str(bi2["ok"]) + "," + str(bi3["ok"]) + "," + str(bi4["ok"]))
+        fails = fails + 1
+
+    // CR-only (no LF) and LF-only (no CR) injection attempts, independently
+    total = total + 1
+    let evil_cr_only = "safe" + CR + "Bad: x"
+    let evil_lf_only = "safe" + LF + "Bad: x"
+    let bicr = sip_build_request("INVITE", "sip:x@y.com", [["X-T", evil_cr_only]], bytes_create(0))
+    let bilf = sip_build_request("INVITE", "sip:x@y.com", [["X-T", evil_lf_only]], bytes_create(0))
+    if bicr["ok"] == 0 and bilf["ok"] == 0
+        print("ok 9 crlf_injection_cr_only_and_lf_only_rejected")
+    else
+        print("FAIL 9 crlf_injection_cr_only_and_lf_only_rejected got=" + str(bicr["ok"]) + "," + str(bilf["ok"]))
+        fails = fails + 1
+
+    // ── 7. Binary 0x00/0xFF body preserved exactly, Content-Length matches ─
+    total = total + 1
+    let bin_body = bytes_create(0)
+    bin_body = bytes_append(bin_body, 0x00)
+    bin_body = bytes_append(bin_body, 0xFF)
+    bin_body = bytes_append(bin_body, 0x0D)  // raw CR byte INSIDE body (legal — body is opaque binary)
+    bin_body = bytes_append(bin_body, 0x0A)  // raw LF byte INSIDE body
+    bin_body = bytes_append(bin_body, 0x41)  // 'A'
+    let bin_headers = [["Content-Length", "5"]]
+    let bin_msg = sip_build_response(200, "OK", bin_headers, bin_body)
+    let pbin = sip_parse(bin_msg["bytes"])
+    if pbin["ok"] == 1 and bytes_len(pbin["body"]) == 5 and bytes_get(pbin["body"], 0) == 0x00 and bytes_get(pbin["body"], 1) == 0xFF and bytes_get(pbin["body"], 2) == 0x0D and bytes_get(pbin["body"], 3) == 0x0A and bytes_get(pbin["body"], 4) == 0x41 and _b2i(pbin["content_length_match"]) == 1
+        print("ok 10 binary_body_with_embedded_crlf_bytes_preserved")
+    else
+        print("FAIL 10 binary_body_with_embedded_crlf_bytes_preserved cl_match=" + str(_b2i(pbin["content_length_match"])) + " len=" + str(bytes_len(pbin["body"])))
+        fails = fails + 1
+
+    // ── 8. Empty message / no separator / blank-only -> rejected, no crash ─
+    total = total + 1
+    let e1 = sip_parse(bytes_create(0))
+    let e2 = sip_parse(_str_bytes("no separator here"))
+    let e3 = sip_parse(_str_bytes(crlf + crlf))
+    if e1["ok"] == 0 and e2["ok"] == 0 and e3["ok"] == 0
+        print("ok 11 empty_nosep_blankonly_all_rejected")
+    else
+        print("FAIL 11 empty_nosep_blankonly_all_rejected")
+        fails = fails + 1
+
+    // ── 9. Empty headers list build (minimal valid message) ────────────────
+    total = total + 1
+    let minimal = sip_build_request("OPTIONS", "sip:x@y.com", [], bytes_create(0))
+    let pmin = sip_parse(minimal["bytes"])
+    if minimal["ok"] == 1 and pmin["ok"] == 1 and len(pmin["headers"]) == 0 and pmin["method"] == "OPTIONS"
+        print("ok 12 empty_headers_list_roundtrip")
+    else
+        print("FAIL 12 empty_headers_list_roundtrip")
+        fails = fails + 1
+
+    // ── 10. Max-width: a very large header value round-trips exactly ───────
+    total = total + 1
+    let big = ""
+    let bi = 0
+    while bi < 500
+        big = big + "x"
+        bi = bi + 1
+    let bigmsg = sip_build_request("INVITE", "sip:x@y.com", [["X-Big", big]], bytes_create(0))
+    let pbig = sip_parse(bigmsg["bytes"])
+    let gotbig = sip_header_get(pbig["headers"], "X-Big")
+    if bigmsg["ok"] == 1 and pbig["ok"] == 1 and len(gotbig) == 500 and gotbig == big
+        print("ok 13 large_header_value_roundtrip_500_bytes")
+    else
+        print("FAIL 13 large_header_value_roundtrip_500_bytes got_len=" + str(len(gotbig)))
+        fails = fails + 1
+
+    // ── 11. FIXED: method/URI containing a raw SPACE is now rejected in-band
+    // by the builder (was previously accepted, producing wire bytes that
+    // would corrupt request-line framing / fail to re-parse identically).
+    // The branches below still accept either "rejected" or "round-trips
+    // exactly" as safe outcomes; with the fix, rejection is the one that
+    // actually fires, deterministically.
+    total = total + 1
+    let space_uri = sip_build_request("INVITE", "sip:x y@z.com", [], bytes_create(0))
+    let pspace = sip_parse(space_uri["bytes"])
+    // If the builder had rejected this (ok==0) that would be the SAFEST
+    // behavior. If it built successfully AND round-trips the URI exactly,
+    // that's also fine. The FAILURE mode we're hunting is: build succeeds
+    // (ok==1) but parse-back yields a DIFFERENT/WRONG uri silently.
+    if space_uri["ok"] == 0
+        print("ok 14 space_in_uri_rejected_by_builder (safe)")
+    else
+        if pspace["ok"] == 1 and pspace["uri"] == "sip:x y@z.com"
+            print("ok 14 space_in_uri_roundtrips_exactly")
+        else
+            print("FAIL 14 space_in_uri_SILENTLY_CORRUPTS_FRAMING build_ok=" + str(space_uri["ok"]) + " parse_ok=" + str(pspace["ok"]) + " got_uri=[" + pspace["uri"] + "]")
+            fails = fails + 1
+
+    total = total + 1
+    let space_method = sip_build_request("IN VITE", "sip:x@y.com", [], bytes_create(0))
+    let pspacem = sip_parse(space_method["bytes"])
+    if space_method["ok"] == 0
+        print("ok 15 space_in_method_rejected_by_builder (safe)")
+    else
+        if pspacem["ok"] == 1 and pspacem["method"] == "IN VITE"
+            print("ok 15 space_in_method_roundtrips_exactly")
+        else
+            print("FAIL 15 space_in_method_SILENTLY_CORRUPTS_FRAMING build_ok=" + str(space_method["ok"]) + " parse_ok=" + str(pspacem["ok"]) + " got_method=[" + pspacem["method"] + "]")
+            fails = fails + 1
+
+    // ── 12. FIXED: bare LF-LF embedded INSIDE what would otherwise be
+    // interior header-block content (not via this module's builder —
+    // simulating a raw attacker byte stream), sitting BEFORE the message's
+    // real CRLFCRLF terminator. Previously the separator scanner treated
+    // ANY bare LFLF as the terminator (even mid-header-block), silently
+    // SWALLOWING every header placed after the injected blank line into the
+    // body. Now: since this buffer contains a real CR byte elsewhere (the
+    // genuine CRLFCRLF terminator later on), the bare LFLF is no longer
+    // treated as a terminator at all — the header block correctly extends
+    // all the way to the real CRLFCRLF, so BOTH X-Foo and Content-Length
+    // are captured as real headers (nothing lost/hidden), and the
+    // Content-Length/body-length mismatch (999 declared vs 3 actual bytes
+    // after the true terminator) is correctly FLAGGED via
+    // content_length_match=false rather than over-reading or crashing.
+    total = total + 1
+    let smuggle = "SIP/2.0 200 OK" + LF + "X-Foo: bar" + LF + LF + "Content-Length: 999" + CR + LF + CR + LF + "END"
+    let psmug = sip_parse(_str_bytes(smuggle))
+    let cl999 = sip_header_get_int(psmug["headers"], "Content-Length")
+    let xfoo999 = sip_header_get(psmug["headers"], "X-Foo")
+    if psmug["ok"] == 1 and len(psmug["headers"]) == 2 and cl999 == 999 and xfoo999 == "bar" and _b2i(psmug["content_length_match"]) == 0 and bytes_to_str(psmug["body"]) == "END"
+        print("ok 16 bare_lflf_before_real_terminator_no_header_swallowed_mismatch_flagged")
+    else
+        print("FAIL 16 bare_lflf_before_real_terminator_no_header_swallowed_mismatch_flagged parsed_ok=" + str(psmug["ok"]) + " headers=" + str(len(psmug["headers"])) + " cl=" + str(cl999) + " match=" + str(_b2i(psmug["content_length_match"])) + " body=[" + bytes_to_str(psmug["body"]) + "]")
+        fails = fails + 1
+
+    // ── 13. Compact header round-trip incl case-insensitivity mixed case ───
+    total = total + 1
+    let mixed = "REGISTER sip:e.com SIP/2.0" + crlf + "vIA: SIP/2.0/UDP h.example.com;branch=z1" + crlf + "F: <sip:a@e.com>" + crlf + crlf
+    let pmix = sip_parse(_str_bytes(mixed))
+    if pmix["ok"] == 1 and sip_header_get(pmix["headers"], "via") == "SIP/2.0/UDP h.example.com;branch=z1" and sip_header_get(pmix["headers"], "From") == "<sip:a@e.com>"
+        print("ok 17 mixed_case_compact_and_full_headers_match")
+    else
+        print("FAIL 17 mixed_case_compact_and_full_headers_match")
+        fails = fails + 1
+
+    // ── 14. CSeq / Via malformed inputs never crash ─────────────────────────
+    total = total + 1
+    let cbad1 = sip_parse_cseq("")
+    let cbad2 = sip_parse_cseq("REGISTER")
+    let cbad3 = sip_parse_cseq("18a26 REGISTER")
+    let vbad1 = sip_parse_via("")
+    let vbad2 = sip_parse_via("SIP/2.0 host-no-transport")
+    let vbad3 = sip_parse_via("SIP/2.0/UDP")
+    if cbad1["ok"] == 0 and cbad2["ok"] == 0 and cbad3["ok"] == 0 and vbad1["ok"] == 0 and vbad2["ok"] == 0 and vbad3["ok"] == 0
+        print("ok 18 cseq_via_malformed_all_rejected_no_crash")
+    else
+        print("FAIL 18 cseq_via_malformed_all_rejected_no_crash got=" + str(cbad1["ok"]) + "," + str(cbad2["ok"]) + "," + str(cbad3["ok"]) + "," + str(vbad1["ok"]) + "," + str(vbad2["ok"]) + "," + str(vbad3["ok"]))
+        fails = fails + 1
+
+    // ── 15. Duplicate Content-Length headers (classic smuggling vector):
+    // does the codec pick a single, DETERMINISTIC value rather than
+    // averaging/concatenating/crashing?
+    total = total + 1
+    let dupcl = "SIP/2.0 200 OK" + crlf + "Content-Length: 3" + crlf + "Content-Length: 999" + crlf + crlf + "abc"
+    let pdup = sip_parse(_str_bytes(dupcl))
+    if pdup["ok"] == 1 and pdup["content_length_header"] == 3 and bytes_to_str(pdup["body"]) == "abc"
+        print("ok 19 duplicate_content_length_uses_first_deterministically")
+    else
+        print("FAIL 19 duplicate_content_length_uses_first_deterministically got_cl=" + str(pdup["content_length_header"]) + " got_body=[" + bytes_to_str(pdup["body"]) + "]")
+        fails = fails + 1
+
+    // ── Summary (locally-threaded count, not a shared/global list counter) ─
+    print("TOTAL=" + str(total) + " FAILS=" + str(fails))
+    if fails == 0
+        print("PASS _sip_adv_probe")
+    else
+        print("FAIL _sip_adv_probe")

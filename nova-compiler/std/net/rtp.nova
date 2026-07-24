@@ -1,0 +1,268 @@
+// ============================================================================
+// NOVA Standard Library — std/net/rtp
+// ============================================================================
+// RFC 3550 — RTP (Real-time Transport Protocol) packet codec.
+// Pairs with std/net/stun for WebRTC media transport.
+//
+// Wire layout (12-byte fixed header, big-endian, followed by optional CSRC
+// list, optional extension, payload, and optional padding):
+//
+//   Byte 0 : V(2) | P(1) | X(1) | CC(4)
+//              V  = version (RFC 3550 => 2)
+//              P  = padding flag (1 = packet has padding octets at the end)
+//              X  = extension flag (1 = header extension present)
+//              CC = CSRC count (number of 4-byte CSRC identifiers)
+//   Byte 1 : M(1) | PT(7)
+//              M  = marker bit (payload-type-specific significance)
+//              PT = payload type (7 bits)
+//   Bytes 2-3   : sequence number   (u16 BE)
+//   Bytes 4-7   : timestamp         (u32 BE)
+//   Bytes 8-11  : SSRC              (u32 BE)
+//   Bytes 12+   : CC * 4-byte CSRC identifiers (u32 BE each)
+//   [if X==1]   : 4-byte extension header (profile u16 BE, length u16 BE
+//                 in 32-bit words NOT counting this 4-byte header),
+//                 followed by length*4 bytes of extension data.
+//   ...         : payload
+//   [if P==1]   : N padding octets; the LAST octet holds N (the total pad
+//                 count including itself). N in 1..255.
+//
+// PUBLIC API:
+//   rtp_encode(h: dict) -> bytes
+//     Keys (all optional, sensible defaults):
+//       "version"     : int, default 2
+//       "marker"      : 0/1, default 0
+//       "pt"          : int 0-127, default 0 (payload type)
+//       "seq"         : int 0-65535, default 0
+//       "timestamp"   : int u32, default 0
+//       "ssrc"        : int u32, default 0
+//       "csrc"        : list of up to 15 u32 CSRC identifiers, default []
+//       "ext_profile" : int u16, default 0 (used only if "ext_data" present)
+//       "ext_data"    : bytes — presence of this key turns on the extension
+//                       bit (X=1). Data is zero-padded up to a 4-byte
+//                       boundary (RFC 3550 extension length is in 32-bit
+//                       words); the padding is invisible on decode via the
+//                       length-word round trip only when the caller already
+//                       supplies 4-byte-aligned data — callers needing exact
+//                       round trip should pre-align ext_data themselves.
+//       "payload"     : bytes, default empty
+//       "pad"         : int 0-255, default 0. If > 0, appends that many
+//                       padding octets (last octet = the count) and sets P=1.
+//     Returns the encoded wire bytes.
+//
+//   rtp_decode(b: bytes) -> dict
+//     Decodes an RTP packet. Bounds-checked against the DECLARED lengths
+//     (CSRC count, extension length, padding count) AND the actual buffer
+//     length — any field that claims more data than the buffer holds
+//     causes an in-band {} error return, never an out-of-bounds read.
+//     Returns {} on any malformed/truncated input (including b shorter
+//     than the fixed 12-byte header).
+//     On success returns:
+//       "version", "padding", "extension", "marker", "pt", "seq",
+//       "timestamp", "ssrc", "csrc" (list of ints), "ext" (0/1),
+//       "ext_profile", "ext_data" (bytes, empty if ext==0),
+//       "pad" (padding octet count stripped; 0 if none), "payload" (bytes,
+//       padding already stripped).
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Read an integer field from dict h at key; return dflt if absent.
+fn _rtp_get(h, key, dflt)
+    if contains(h, key)
+        return h[key]
+    dflt
+
+// Append a big-endian u16 to bytes out; return new bytes.
+fn _rtp_w16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append a big-endian u32 to bytes out; return new bytes.
+fn _rtp_w32(out, v)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Read a big-endian u16 from bytes b at offset i.
+// Caller MUST ensure bytes_len(b) >= i+2.
+fn _rtp_r16(b, i)
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Read a big-endian u32 from bytes b at offset i.
+// Caller MUST ensure bytes_len(b) >= i+4.
+fn _rtp_r32(b, i)
+    let a0 = bytes_get(b, i)
+    let a1 = bytes_get(b, i + 1)
+    let a2 = bytes_get(b, i + 2)
+    let a3 = bytes_get(b, i + 3)
+    ((a0 << 24) | (a1 << 16) | (a2 << 8) | a3) & 0xFFFFFFFF
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// rtp_encode(h) -> bytes — see module header for key documentation.
+fn rtp_encode(h)
+    let version   = _rtp_get(h, "version", 2)
+    let marker    = _rtp_get(h, "marker", 0)
+    let pt        = _rtp_get(h, "pt", 0)
+    let seq       = _rtp_get(h, "seq", 0)
+    let timestamp = _rtp_get(h, "timestamp", 0)
+    let ssrc      = _rtp_get(h, "ssrc", 0)
+    let payload   = _rtp_get(h, "payload", bytes(0))
+    let pad       = _rtp_get(h, "pad", 0)
+
+    let csrc = []
+    if contains(h, "csrc")
+        csrc = h["csrc"]
+    let csrc_n = len(csrc)
+    // Clamp: CC field is only 4 bits wide — never emit/read past 15 entries.
+    if csrc_n > 15
+        csrc_n = 15
+    if csrc_n < 0
+        csrc_n = 0
+
+    let has_ext = contains(h, "ext_data")
+    let ext_profile = _rtp_get(h, "ext_profile", 0)
+    let ext_data = bytes(0)
+    if has_ext
+        ext_data = h["ext_data"]
+
+    let pad_n = pad
+    if pad_n < 0
+        pad_n = 0
+    if pad_n > 255
+        pad_n = 255
+
+    let pad_flag = 0
+    if pad_n > 0
+        pad_flag = 1
+    let ext_flag = 0
+    if has_ext
+        ext_flag = 1
+
+    let byte0 = ((version & 0x3) << 6) | ((pad_flag & 0x1) << 5) | ((ext_flag & 0x1) << 4) | (csrc_n & 0xF)
+    let byte1 = ((marker & 0x1) << 7) | (pt & 0x7F)
+
+    let out = bytes(0)
+    out = bytes_append(out, byte0 & 0xFF)
+    out = bytes_append(out, byte1 & 0xFF)
+    out = _rtp_w16(out, seq & 0xFFFF)
+    out = _rtp_w32(out, timestamp & 0xFFFFFFFF)
+    out = _rtp_w32(out, ssrc & 0xFFFFFFFF)
+
+    let i = 0
+    while i < csrc_n
+        out = _rtp_w32(out, csrc[i] & 0xFFFFFFFF)
+        i = i + 1
+
+    if has_ext
+        // RFC 3550 extension length is a count of 32-bit words; zero-pad
+        // ext_data up to a 4-byte boundary so the length field is exact.
+        let edn = bytes_len(ext_data)
+        let rem = edn % 4
+        // Defensive copy: NOVA bytes are reference-semantic, so aliasing
+        // ext_data here and then bytes_append-ing to pad it would mutate
+        // the CALLER's original buffer in place. rtp_encode must be pure
+        // w.r.t. its inputs.
+        let padded_ext = bytes_slice(ext_data, 0, edn)
+        if rem != 0
+            let padn = 4 - rem
+            let j = 0
+            while j < padn
+                padded_ext = bytes_append(padded_ext, 0)
+                j = j + 1
+        let ext_words = bytes_len(padded_ext) / 4
+        out = _rtp_w16(out, ext_profile & 0xFFFF)
+        out = _rtp_w16(out, ext_words & 0xFFFF)
+        out = bytes_concat(out, padded_ext)
+
+    out = bytes_concat(out, payload)
+
+    if pad_n > 0
+        let k = 0
+        while k < pad_n - 1
+            out = bytes_append(out, 0)
+            k = k + 1
+        out = bytes_append(out, pad_n & 0xFF)
+
+    out
+
+// rtp_decode(b) -> dict — see module header for key documentation.
+// Returns {} on any malformed/truncated/oversized-length input; never
+// reads past bytes_len(b).
+fn rtp_decode(b)
+    let empty = {}
+    let n = bytes_len(b)
+    if n < 12
+        return empty
+
+    let byte0 = bytes_get(b, 0)
+    let version  = (byte0 >> 6) & 0x3
+    let pad_flag = (byte0 >> 5) & 0x1
+    let ext_flag = (byte0 >> 4) & 0x1
+    let csrc_n   = byte0 & 0xF
+
+    let byte1  = bytes_get(b, 1)
+    let marker = (byte1 >> 7) & 0x1
+    let pt     = byte1 & 0x7F
+
+    let seq       = _rtp_r16(b, 2)
+    let timestamp = _rtp_r32(b, 4)
+    let ssrc      = _rtp_r32(b, 8)
+
+    let offset = 12
+    let csrc_need = offset + csrc_n * 4
+    if n < csrc_need
+        return empty
+
+    let csrc = []
+    let i = 0
+    while i < csrc_n
+        csrc.push(_rtp_r32(b, offset))
+        offset = offset + 4
+        i = i + 1
+
+    let has_ext = 0
+    let ext_profile = 0
+    let ext_data = bytes(0)
+    if ext_flag == 1
+        if n < offset + 4
+            return empty
+        ext_profile = _rtp_r16(b, offset)
+        let ext_words = _rtp_r16(b, offset + 2)
+        offset = offset + 4
+        let ext_len = ext_words * 4
+        // Injection guard: a declared extension length that overruns the
+        // buffer is rejected in-band rather than over-read.
+        if n < offset + ext_len
+            return empty
+        ext_data = bytes_slice(b, offset, offset + ext_len)
+        offset = offset + ext_len
+        has_ext = 1
+
+    let pad_count = 0
+    let payload_end = n
+    if pad_flag == 1
+        // Need at least one octet left for the pad-count byte itself.
+        if n <= offset
+            return empty
+        pad_count = bytes_get(b, n - 1)
+        // Injection guard: a pad count of 0 is invalid (RFC 3550 requires
+        // the count to include itself, so it is always >= 1), and a pad
+        // count larger than the remaining payload region is rejected
+        // in-band rather than producing a negative-length slice.
+        if pad_count == 0
+            return empty
+        if pad_count > (n - offset)
+            return empty
+        payload_end = n - pad_count
+
+    let payload = bytes(0)
+    if payload_end > offset
+        payload = bytes_slice(b, offset, payload_end)
+
+    {"version": version, "padding": pad_flag, "extension": ext_flag, "marker": marker, "pt": pt, "seq": seq, "timestamp": timestamp, "ssrc": ssrc, "csrc": csrc, "ext": has_ext, "ext_profile": ext_profile, "ext_data": ext_data, "pad": pad_count, "payload": payload}

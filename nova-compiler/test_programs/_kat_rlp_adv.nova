@@ -1,0 +1,139 @@
+// Independent adversarial probe for std/encoding/rlp.nova
+// Attacks: integer-overflow length fields, canonical-form leniency,
+// negative-integer fallback, rlp_decode_uint width limits, negative pos,
+// binary-NUL-safe list items, and a stress round-trip.
+import std/encoding/rlp
+import std/encoding/hex
+
+fn ck_int(label: string, got: int, want: int, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got == want
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        return [pass, total]
+
+fn ck_bool(label: string, got: bool, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=false want=true")
+        return [pass, total]
+
+fn ck_str(label: string, got: string, want: string, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got == want
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        return [pass, total]
+
+fn main()
+    let state = [0, 0]
+
+    // ── ATTACK 1: integer-overflow length field (long string) ─────────────
+    // 0xbf = long string, len-of-len = 8. Length bytes = 0x7fffffffffffffff
+    // (just under 2^63, so the "slen2<0" top-bit guard does NOT catch it).
+    // start2 = pos+1+8 = 9. end2 = start2+slen2 overflows int64 and wraps
+    // negative. MUST NOT crash / MUST NOT over-read; MUST be rejected
+    // in-band (next_pos < 0), even if not literally == -1.
+    let atk1 = hex_decode("bf7fffffffffffffff")
+    let r1 = rlp_decode(atk1, 0)
+    let next1 = r1[1]
+    state = ck_bool("overflow_long_string_rejected_lt0", next1 < 0, state)
+    state = ck_bool("overflow_long_string_no_overread", bytes_len(r1[0]) <= bytes_len(atk1), state)
+
+    // ── ATTACK 2: integer-overflow length field (long list) ────────────────
+    let atk2 = hex_decode("ff7fffffffffffffff")
+    let r2 = rlp_decode(atk2, 0)
+    let next2 = r2[1]
+    state = ck_bool("overflow_long_list_rejected_lt0", next2 < 0, state)
+
+    // ── ATTACK 3: length-of-length = 8 with top bit set -> must reject (>=2^63) ─
+    let atk3 = hex_decode("bfffffffffffffffff")
+    let r3 = rlp_decode(atk3, 0)
+    state = ck_bool("topbit_length_rejected", r3[1] < 0, state)
+
+    // ── ATTACK 4: nested list containing an overflow-crafted child MUST
+    // propagate rejection to the parent (not silently succeed with garbage) ──
+    // outer: c0-prefixed short list wrapping the malformed long-string atk1.
+    // payload len = 9 (bf + 8 length bytes), <=55 so short-list prefix c9.
+    let atk4 = hex_decode("c9bf7fffffffffffffff")
+    let r4 = rlp_decode(atk4, 0)
+    state = ck_bool("nested_overflow_child_rejected", r4[1] < 0, state)
+
+    // ── ATTACK 5: negative pos ──────────────────────────────────────────────
+    let buf5 = hex_decode("80")
+    let r5 = rlp_decode(buf5, -1)
+    state = ck_bool("negative_pos_rejected", r5[1] < 0, state)
+
+    // ── ATTACK 6: rlp_decode_uint on a 9-byte string (too wide for int64) ──
+    let nine = hex_decode("010203040506070809")
+    state = ck_int("decode_uint_9bytes_rejected", rlp_decode_uint(nine), -1, state)
+
+    // rlp_decode_uint on exactly 8 bytes with top bit set -> negative i64
+    // (documented boundary limitation, not a crash) -- just confirm no crash
+    // and a deterministic (even if negative) result.
+    let eight_topbit = hex_decode("ff00000000000001")
+    let ru = rlp_decode_uint(eight_topbit)
+    state = ck_bool("decode_uint_8byte_topbit_no_crash", ru == ru, state)
+
+    // ── ATTACK 7: negative-integer encode fallback (never crash, in-band) ──
+    state = ck_str("negative_int_fallback", hex_encode(rlp_encode(0 - 5)), "80", state)
+
+    // ── ATTACK 8: canonical-form leniency probe (non-minimal long-string
+    // form for an empty payload: 0xb8 0x00). Not explicitly mandated by the
+    // task spec, but record actual behavior for the record (informational,
+    // not scored as fail/pass against a required outcome beyond no-crash).
+    let noncanon = hex_decode("b800")
+    let rnc = rlp_decode(noncanon, 0)
+    state = ck_bool("noncanonical_long_string_no_crash", rnc[1] == rnc[1], state)
+    print("info noncanonical_long_string_next_pos=" + str(rnc[1]) + " (2=accepted-non-canonical, -1=rejected)")
+
+    // ── ATTACK 9: binary NUL inside a list item round-trips (binary-safe) ──
+    let nulb = bytes_create(3)
+    bytes_set(nulb, 0, 0x41)
+    bytes_set(nulb, 1, 0x00)
+    bytes_set(nulb, 2, 0x42)
+    let encNul = rlp_encode([nulb, nulb])
+    let drNul = rlp_decode(encNul, 0)
+    state = ck_int("nul_item0_len", bytes_len(drNul[0][0]), 3, state)
+    state = ck_bool("nul_item0_byte1_is_zero", bytes_get(drNul[0][0], 1) == 0, state)
+    state = ck_str("nul_item_hex_roundtrip", hex_encode(drNul[0][1]), hex_encode(nulb), state)
+
+    // ── ATTACK 10: declared short-list length exactly at buffer edge (valid) ─
+    // c2 8180 -> list of one item, item = int 128 encoded as 8180 (2 bytes),
+    // list payload len = 2, prefix c0+2=c2. Must decode cleanly, not reject.
+    let edgebuf = hex_decode("c28180")
+    let redge = rlp_decode(edgebuf, 0)
+    state = ck_bool("edge_valid_short_list_accepted", redge[1] >= 0, state)
+    state = ck_int("edge_valid_short_list_next", redge[1], bytes_len(edgebuf), state)
+
+    // ── ATTACK 11: stress round-trip of a moderately deep/wide structure ───
+    let wide = []
+    let i = 0
+    while i < 200
+        push(wide, i)
+        i = i + 1
+    let encWide = rlp_encode(wide)
+    let drWide = rlp_decode(encWide, 0)
+    state = ck_int("wide_roundtrip_count", len(drWide[0]), 200, state)
+    state = ck_int("wide_roundtrip_next", drWide[1], bytes_len(encWide), state)
+    state = ck_int("wide_roundtrip_val_199", rlp_decode_uint(drWide[0][199]), 199, state)
+
+    // ── trailer ──────────────────────────────────────────────────────────
+    let pass = state[0]
+    let total = state[1]
+    print("RESULT " + str(pass) + "/" + str(total))
+    if pass == total
+        print("PASS")
+    else
+        print("FAIL")
+        exit(1)

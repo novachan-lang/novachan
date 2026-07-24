@@ -1,0 +1,711 @@
+// ============================================================================
+// NOVA Standard Library — std/net/sip
+// ============================================================================
+// SIP (RFC 3261) message codec — SIP is a text protocol structurally similar
+// to HTTP/1.1: a start line, CRLF-separated headers, a blank CRLF line, then
+// an optional body (typically an SDP payload, treated as opaque binary here).
+//
+// Request  : "METHOD Request-URI SIP/2.0" CRLF
+// Response : "SIP/2.0 status-code Reason-Phrase" CRLF
+//
+// WHY NOT std/net/httpheaders (hh_parse/hh_build)? SIP headers differ from
+// HTTP in three ways that a dict-based (one-value-per-key) representation
+// cannot express: (1) headers routinely repeat with SIGNIFICANT ORDER (the
+// Via chain records the request's proxy path — order IS the routing history,
+// duplicates are the norm, not an error); (2) SIP defines single-letter
+// COMPACT FORMS for common header names (v/f/t/i/m/l, RFC 3261 §7.3.3, §20
+// Table 2) that must be normalised for lookup but preserved as written on
+// the wire; (3) a header line with no ':' or a header value carrying a raw
+// CR/LF must be REJECTED (protocol/security requirement), where hh_parse
+// silently skips the former and has no defense against the latter. This
+// module therefore represents headers as an ORDER-PRESERVING, DUPLICATE-
+// PRESERVING list of [name, value] string pairs, not a dict.
+//
+// PUBLIC API:
+//   sip_build_request(method, uri, headers, body: bytes) -> dict
+//   sip_build_response(status: int, reason, headers, body: bytes) -> dict
+//     headers: list of [name: string, value: string] pairs, emitted in the
+//     order given (so callers control Via ordering / duplicate headers).
+//     Returns {"ok":1,"error":"","bytes":<bytes>} on success, or
+//     {"ok":0,"error":<reason>,"bytes":bytes_create(0)} on invalid input —
+//     NEVER exits, NEVER crashes. Rejected in-band: empty method or URI;
+//     out-of-range status code (100-699); CR/LF-bearing reason phrase;
+//     any header name/value containing a raw CR or LF byte (CRLF-injection
+//     defense — a malicious value could otherwise forge a second header
+//     line or an early blank-line/body boundary when the bytes hit the
+//     wire). No header value is ever "escaped" — it is rejected outright,
+//     which is the only injection-proof answer for a line-oriented format.
+//     METHOD is additionally required to be a valid RFC3261 token (no
+//     SPACE, no CTL byte, no separator char — "()<>@,;:\"/[]?={}" — RFC3261
+//     §25.1); Request-URI is required to contain no raw SPACE, CR or LF.
+//     Without this, a method/URI carrying a raw space would still produce
+//     ok=1 wire bytes, but those bytes would fail to re-parse as the same
+//     method/URI (a framing-ambiguous "successful" build) — now rejected
+//     up front instead of emitted.
+//
+//   sip_parse(msg: bytes) -> dict
+//     Parses a full request OR response (auto-detected). Every read is
+//     bounds-checked against the ACTUAL buffer length — a truncated buffer,
+//     a missing header/body separator, a header line with no ':', or a
+//     Via/CSeq that fails its own sub-parse are all rejected IN-BAND via
+//     {"ok":0,"error":<reason>, ...safe zeroed fields...}; this function
+//     NEVER crashes and NEVER exits(1) regardless of input.
+//     On success returns:
+//       "ok":1, "error":""
+//       "is_request": bool, "method","uri" (request) | "status","reason" (response)
+//       "headers": list of [name,value] pairs, ORIGINAL order and casing preserved
+//       "body": bytes — the body, binary-safe (NUL-safe; never converted to
+//               a NOVA string, so it can carry arbitrary binary SDP/media)
+//       "content_length_header": int  — the parsed Content-Length value, or
+//               -1 if absent / not a valid non-negative decimal
+//       "content_length_body": int    — the ACTUAL number of bytes captured
+//               into "body" (bounded to the smaller of the declared length
+//               and what the buffer actually has — a hostile or truncated
+//               length field can never cause an over-read)
+//       "content_length_match": bool  — true only when content_length_header
+//               is present AND equals the full number of bytes remaining in
+//               the buffer after the header block (i.e. the declared length
+//               exactly accounts for the buffer — no truncation, no trailing
+//               garbage / pipelined data). A mismatch is FLAGGED, not fatal.
+//
+//   sip_header_get(headers, name) -> string        (first match, "" if absent)
+//   sip_header_get_all(headers, name) -> list       (every matching value, in order)
+//   sip_header_has(headers, name) -> bool
+//   sip_header_get_int(headers, name) -> int        (-1 if absent/invalid)
+//     All four are case-insensitive AND compact-form aware: "Via", "via",
+//     and "v" all match each other (RFC 3261 §7.3.3 / §20 Table 2).
+//
+//   sip_canonical_header_name(name) -> string
+//     Normalises a header name (any case, compact or full) to its canonical
+//     mixed-case form ("v" -> "Via", "call-id" -> "Call-ID"...). An unknown
+//     name is returned UNCHANGED (we never invent casing we don't know).
+//
+//   sip_parse_cseq(value: string) -> dict
+//     "<number> <METHOD>" -> {"ok":1,"number":int,"method":string,"error":""}
+//     or {"ok":0,"error":<reason>,"number":-1,"method":""} if malformed.
+//   sip_build_cseq(number: int, method: string) -> string
+//
+//   sip_parse_via(value: string) -> dict
+//     "SIP/2.0/<transport> host[:port][;params...]" ->
+//     {"ok":1,"error":"","transport":string,"host":string,"port":int (-1 if
+//      absent),"branch":string ("" if absent),"params":dict} — every other
+//     ";key=value" / bare ";flag" parameter lands in "params" (lower-cased
+//     keys), "branch" is additionally surfaced as its own field since it is
+//     the value virtually every caller wants. IPv6 sent-by ("[::1]:5060")
+//     is recognised (bracket-aware; the port split never misfires on the
+//     colons inside the address). Malformed input -> {"ok":0,"error":...}.
+//   sip_build_via(transport, host, branch) -> string
+//
+// DESIGN / SAFETY NOTES:
+//   * Header BLOCK text (start line + header lines) is read via bytes_to_str
+//     after being sliced out with bytes_slice — this is safe because valid
+//     SIP header text is ASCII with no embedded NUL. The BODY is never
+//     stringified: it is sliced directly out of the original `bytes` value
+//     and stays binary-safe end to end (handles arbitrary/binary SDP).
+//   * bytes_append_str (used by the two builders) copies the string's
+//     DECLARED length, not its C-strlen — see std/net/ldap's own note,
+//     mirroring std/encoding/asn1's OCTET STRING helpers — so header text
+//     built by this module round-trips exactly even at length boundaries.
+//   * The header/body separator is located by scanning the raw wire bytes
+//     for CRLFCRLF (13,10,13,10, the RFC-correct separator). A bare LFLF
+//     (10,10, tolerated the way std/net/httpheaders tolerates bare LF line
+//     endings) is accepted ONLY when the buffer contains NO CR byte
+//     anywhere — a pure bare-LF sender. The moment the buffer contains even
+//     one CR byte, only a real CRLFCRLF counts; a lone "\n\n" occurring
+//     earlier in a CRLF-framed message is never treated as the terminator.
+//     This closes a header-smuggling hole where a hostile "\n\n" planted
+//     inside interior header-block content could truncate the header block
+//     early and silently swallow every header that followed into the body.
+//     Every byte access in that scan is pre-bounds-checked (`i + 4 <= n` /
+//     `i + 2 <= n`) before it happens.
+//   * Header continuation (RFC 3261 references RFC 2822 folding: a line
+//     starting with SP/HTAB continues the previous header's value) is
+//     supported. A continuation line with no preceding header is rejected
+//     in-band, not treated as a bogus header.
+//   * A decimal field (Content-Length / CSeq number / status / Via port) is
+//     parsed by a private, digit-only, NON-crashing atoi that REJECTS (does
+//     not wrap/overflow-silently-accept) any string longer than 18 digits —
+//     an i64 can hold at most ~19 digits, so an attacker-supplied
+//     "Content-Length: 99999999999999999999" cannot wrap into a small
+//     positive number and slip past the length check; it is simply treated
+//     as absent/invalid instead.
+//   * Symbol collision guard: all private helpers are prefixed `_sip_`.
+//
+// LEAF — imports NOTHING (every operation is a NOVA builtin: bytes_*,
+// split/trim/lower/find/starts_with/char_at/ord/chr/slice/push/contains).
+// ============================================================================
+
+// ── Private: CRLF ───────────────────────────────────────────────────────────
+
+fn _sip_crlf() -> string
+    chr(13) + chr(10)
+
+// ── Private: does s contain a raw CR or LF byte? (CRLF-injection guard) ────
+
+fn _sip_has_crlf(s: string) -> bool
+    if find(s, chr(13)) >= 0
+        return true
+    if find(s, chr(10)) >= 0
+        return true
+    false
+
+// ── Private: strip exactly one trailing CR (13), if present ────────────────
+
+fn _sip_strip_cr(s: string) -> string
+    let n = len(s)
+    if n == 0
+        return s
+    if ord(char_at(s, n - 1)) == 13
+        return slice(s, 0, n - 1)
+    s
+
+// ── Private: digit-only, non-crashing, overflow-safe atoi ──────────────────
+// Returns -1 for empty, non-digit, or overlong (>18 digit) input — never
+// wraps a hostile huge digit string into a small/negative i64.
+
+fn _sip_atoi(s: string) -> int
+    let n = len(s)
+    if n == 0
+        return -1
+    if n > 18
+        return -1
+    let i = 0
+    let v = 0
+    while i < n
+        let c = ord(char_at(s, i))
+        if c < 48 or c > 57
+            return -1
+        v = v * 10 + (c - 48)
+        i = i + 1
+    v
+
+// ── Private: index of the LAST occurrence of single-char c in s, or -1 ─────
+// (used for Via "host:port" splitting — `find` only gives the FIRST match)
+
+fn _sip_rfind_char(s: string, c: string) -> int
+    let i = len(s) - 1
+    while i >= 0
+        if char_at(s, i) == c
+            return i
+        i = i - 1
+    -1
+
+// ── Private: is byte value `c` an RFC2616/3261-style "separator" char? ─────
+// ( ) < > @ , ; : \ " / [ ] ? = { }  — SP and CTL are checked separately by
+// the caller. Used to validate the SIP request-line METHOD token.
+
+fn _sip_is_separator_byte(c: int) -> bool
+    if c == 40 or c == 41    // ( )
+        return true
+    if c == 60 or c == 62    // < >
+        return true
+    if c == 64                // @
+        return true
+    if c == 44 or c == 59 or c == 58   // , ; :
+        return true
+    if c == 92 or c == 34    // \ "
+        return true
+    if c == 47                // /
+        return true
+    if c == 91 or c == 93    // [ ]
+        return true
+    if c == 63 or c == 61    // ? =
+        return true
+    if c == 123 or c == 125  // { }
+        return true
+    false
+
+// ── Private: is `s` a valid RFC3261 "token" — no SPACE, no CTL (0-31/127),
+// no separator char? This is the request-line METHOD grammar. An empty
+// string is NOT a valid token.
+
+fn _sip_is_token(s: string) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let i = 0
+    while i < n
+        let c = ord(char_at(s, i))
+        if c == 32
+            return false
+        if c < 32 or c == 127
+            return false
+        if _sip_is_separator_byte(c)
+            return false
+        i = i + 1
+    true
+
+// ── Private: does s contain a raw SPACE byte (0x20)? ───────────────────────
+// (Request-URIs legitimately contain most separator chars — ':' '/' '@'
+// ';' '?' '=' etc. — so the URI check is narrower than the METHOD token
+// check: reject only SPACE/CR/LF, per RFC3261 Request-Line grammar where
+// SP is the field delimiter and CR/LF terminate the line.)
+
+fn _sip_has_space(s: string) -> bool
+    find(s, " ") >= 0
+
+// ── Private: lower-cased, compact-form-expanded MATCH KEY for a header name
+// (internal only — used to compare header names case-insensitively) ────────
+
+fn _sip_match_key(name: string) -> string
+    let lo = lower(trim(name))
+    if len(lo) == 1
+        if lo == "v"
+            return "via"
+        if lo == "f"
+            return "from"
+        if lo == "t"
+            return "to"
+        if lo == "i"
+            return "call-id"
+        if lo == "m"
+            return "contact"
+        if lo == "l"
+            return "content-length"
+        if lo == "c"
+            return "content-type"
+        if lo == "e"
+            return "content-encoding"
+        if lo == "k"
+            return "supported"
+        if lo == "s"
+            return "subject"
+        return lo
+    lo
+
+// ── Public: canonical display name for a header (compact or full, any case) ─
+//
+// Examples:
+//   sip_canonical_header_name("v")        -> "Via"
+//   sip_canonical_header_name("CALL-ID")  -> "Call-ID"
+//   sip_canonical_header_name("X-Custom") -> "X-Custom"   (unknown: passthrough)
+fn sip_canonical_header_name(name: string) -> string
+    let key = _sip_match_key(name)
+    if key == "via"
+        return "Via"
+    if key == "from"
+        return "From"
+    if key == "to"
+        return "To"
+    if key == "call-id"
+        return "Call-ID"
+    if key == "cseq"
+        return "CSeq"
+    if key == "contact"
+        return "Contact"
+    if key == "max-forwards"
+        return "Max-Forwards"
+    if key == "content-length"
+        return "Content-Length"
+    if key == "content-type"
+        return "Content-Type"
+    if key == "content-encoding"
+        return "Content-Encoding"
+    if key == "supported"
+        return "Supported"
+    if key == "subject"
+        return "Subject"
+    name
+
+// ── Public: header lookup (case-insensitive, compact-form aware) ───────────
+
+// sip_header_get_all: every value stored under `name` (case/compact-insensitive),
+// in the order the headers appeared. Empty list if none.
+fn sip_header_get_all(headers: list, name: string) -> list
+    let key = _sip_match_key(name)
+    let out = []
+    let i = 0
+    let n = len(headers)
+    while i < n
+        let pair = headers[i]
+        if _sip_match_key(pair[0]) == key
+            push(out, pair[1])
+        i = i + 1
+    out
+
+// sip_header_get: the FIRST value stored under `name`, or "" if absent.
+fn sip_header_get(headers: list, name: string) -> string
+    let all = sip_header_get_all(headers, name)
+    if len(all) == 0
+        return ""
+    all[0]
+
+// sip_header_has: true if `name` (any case/compact form) appears at least once.
+fn sip_header_has(headers: list, name: string) -> bool
+    len(sip_header_get_all(headers, name)) > 0
+
+// sip_header_get_int: the first value under `name`, parsed as a non-negative
+// decimal integer. -1 if absent, empty, or not a valid integer.
+fn sip_header_get_int(headers: list, name: string) -> int
+    let v = trim(sip_header_get(headers, name))
+    if len(v) == 0
+        return -1
+    _sip_atoi(v)
+
+// ── Private: validate + serialize a headers list to wire bytes ─────────────
+// Returns {"ok":1,"error":"","bytes":<bytes>} or
+//         {"ok":0,"error":<reason>,"bytes":bytes_create(0)}.
+fn _sip_headers_bytes(headers: list) -> dict
+    let out = bytes_create(0)
+    let crlf = _sip_crlf()
+    let i = 0
+    let n = len(headers)
+    while i < n
+        let pair = headers[i]
+        let name = pair[0]
+        let value = pair[1]
+        if len(trim(name)) == 0
+            return {"ok": 0, "error": "empty header name", "bytes": bytes_create(0)}
+        if _sip_has_crlf(name)
+            return {"ok": 0, "error": "header name contains CR/LF (injection rejected)", "bytes": bytes_create(0)}
+        if _sip_has_crlf(value)
+            return {"ok": 0, "error": "header value contains CR/LF (injection rejected)", "bytes": bytes_create(0)}
+        out = bytes_append_str(out, name)
+        out = bytes_append_str(out, ": ")
+        out = bytes_append_str(out, value)
+        out = bytes_append_str(out, crlf)
+        i = i + 1
+    {"ok": 1, "error": "", "bytes": out}
+
+// ── Public: build a SIP request ─────────────────────────────────────────────
+//
+// Examples:
+//   sip_build_request("REGISTER", "sip:registrar.biloxi.com",
+//     [["Via","SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds"],
+//      ["Max-Forwards","70"], ["Content-Length","0"]], bytes_create(0))
+//     -> {"ok":1,"error":"","bytes": <"REGISTER sip:registrar.biloxi.com SIP/2.0\r\n...">}
+//
+//   sip_build_request("", "sip:x", [], bytes_create(0))
+//     -> {"ok":0,"error":"empty method","bytes":<empty>}
+fn sip_build_request(method: string, uri: string, headers: list, body: bytes) -> dict
+    if len(trim(method)) == 0
+        return {"ok": 0, "error": "empty method", "bytes": bytes_create(0)}
+    if not _sip_is_token(method)
+        return {"ok": 0, "error": "method is not a valid RFC3261 token (no SPACE/CTL/separator bytes allowed — injection rejected)", "bytes": bytes_create(0)}
+    if len(trim(uri)) == 0
+        return {"ok": 0, "error": "empty request-uri", "bytes": bytes_create(0)}
+    if _sip_has_crlf(uri)
+        return {"ok": 0, "error": "request-uri contains CR/LF (injection rejected)", "bytes": bytes_create(0)}
+    if _sip_has_space(uri)
+        return {"ok": 0, "error": "request-uri contains a raw SPACE (injection rejected)", "bytes": bytes_create(0)}
+    let hb = _sip_headers_bytes(headers)
+    if hb["ok"] == 0
+        return {"ok": 0, "error": hb["error"], "bytes": bytes_create(0)}
+    let out = bytes_create(0)
+    out = bytes_append_str(out, method)
+    out = bytes_append_str(out, " ")
+    out = bytes_append_str(out, uri)
+    out = bytes_append_str(out, " SIP/2.0")
+    out = bytes_append_str(out, _sip_crlf())
+    out = bytes_concat(out, hb["bytes"])
+    out = bytes_append_str(out, _sip_crlf())
+    out = bytes_concat(out, body)
+    {"ok": 1, "error": "", "bytes": out}
+
+// ── Public: build a SIP response ────────────────────────────────────────────
+//
+// Examples:
+//   sip_build_response(200, "OK", [["Content-Length","0"]], bytes_create(0))
+//     -> {"ok":1,"error":"","bytes":<"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n">}
+//
+//   sip_build_response(99, "Bad", [], bytes_create(0))
+//     -> {"ok":0,"error":"status code out of range (100-699)","bytes":<empty>}
+fn sip_build_response(status: int, reason: string, headers: list, body: bytes) -> dict
+    if status < 100 or status > 699
+        return {"ok": 0, "error": "status code out of range (100-699)", "bytes": bytes_create(0)}
+    if _sip_has_crlf(reason)
+        return {"ok": 0, "error": "reason phrase contains CR/LF (injection rejected)", "bytes": bytes_create(0)}
+    let hb = _sip_headers_bytes(headers)
+    if hb["ok"] == 0
+        return {"ok": 0, "error": hb["error"], "bytes": bytes_create(0)}
+    let out = bytes_create(0)
+    out = bytes_append_str(out, "SIP/2.0 ")
+    out = bytes_append_str(out, str(status))
+    out = bytes_append_str(out, " ")
+    out = bytes_append_str(out, reason)
+    out = bytes_append_str(out, _sip_crlf())
+    out = bytes_concat(out, hb["bytes"])
+    out = bytes_append_str(out, _sip_crlf())
+    out = bytes_concat(out, body)
+    {"ok": 1, "error": "", "bytes": out}
+
+// ── Private: locate the header/body separator in raw wire bytes. Returns
+// [pos, sep_len] or [-1, 0] if absent. Every byte access is pre-bounds-
+// checked against the buffer length.
+//
+// SECURITY: a bare LFLF (10,10) is ONLY accepted as the terminator when the
+// buffer contains NO CR (13) byte ANYWHERE — i.e. the sender uses a pure
+// bare-LF line-ending convention throughout (legitimate interop case). The
+// instant the buffer contains even one CR byte (meaning at least part of the
+// message uses proper CRLF framing, the RFC3261-mandated convention), the
+// ONLY valid terminator is a real CRLFCRLF. This closes a header/body
+// smuggling hole: without this rule, an attacker could plant a bare "\n\n"
+// EARLIER inside what should be interior header-block content (before the
+// message's real CRLFCRLF terminator) and have the scanner stop there,
+// silently truncating the header block and losing every header that
+// followed. Requiring CRLF whenever CR is present anywhere means a lone LF
+// occurring inside a CRLF-framed message is always treated as ordinary line
+// data for the terminator search, never as a truncating boundary.
+fn _sip_find_separator(b: bytes) -> list
+    let n = bytes_len(b)
+    let has_cr = false
+    let ci = 0
+    while ci < n
+        if bytes_get(b, ci) == 13
+            has_cr = true
+        ci = ci + 1
+
+    let i = 0
+    while i < n
+        if i + 4 <= n
+            if bytes_get(b, i) == 13 and bytes_get(b, i + 1) == 10 and bytes_get(b, i + 2) == 13 and bytes_get(b, i + 3) == 10
+                return [i, 4]
+        if not has_cr
+            if i + 2 <= n
+                if bytes_get(b, i) == 10 and bytes_get(b, i + 1) == 10
+                    return [i, 2]
+        i = i + 1
+    [-1, 0]
+
+// ── Private: parse header lines (raw_lines[1:], raw_lines[0] is the start
+// line) into an order/duplicate-preserving list of [name,value] pairs, with
+// RFC 2822-style folding (a line starting with SP/HTAB continues the
+// previous header's value). A line with no ':' — or a continuation with no
+// preceding header — is rejected in-band.
+fn _sip_parse_header_lines(raw_lines: list) -> dict
+    let names = []
+    let values = []
+    let i = 1
+    let n = len(raw_lines)
+    while i < n
+        let stripped = _sip_strip_cr(raw_lines[i])
+        if len(stripped) > 0
+            let first_ch = char_at(stripped, 0)
+            if first_ch == " " or first_ch == chr(9)
+                if len(names) == 0
+                    return {"ok": 0, "error": "header continuation line with no preceding header", "headers": []}
+                let folded = trim(stripped)
+                let last_idx = len(values) - 1
+                values[last_idx] = values[last_idx] + " " + folded
+            else
+                let colon = find(stripped, ":")
+                if colon < 0
+                    return {"ok": 0, "error": "malformed header line (no colon): " + stripped, "headers": []}
+                let name = trim(slice(stripped, 0, colon))
+                let value = trim(slice(stripped, colon + 1, len(stripped)))
+                if len(name) == 0
+                    return {"ok": 0, "error": "empty header name", "headers": []}
+                push(names, name)
+                push(values, value)
+        i = i + 1
+    let headers = []
+    let j = 0
+    while j < len(names)
+        push(headers, [names[j], values[j]])
+        j = j + 1
+    {"ok": 1, "error": "", "headers": headers}
+
+// ── Private: the safe "reject" dict returned by sip_parse on any failure ───
+
+fn _sip_parse_fail(error_msg: string) -> dict
+    {"ok": 0, "error": error_msg, "is_request": false, "method": "", "uri": "",
+     "status": 0, "reason": "", "headers": [], "body": bytes_create(0),
+     "content_length_header": -1, "content_length_body": 0, "content_length_match": false}
+
+// ── Public: parse a full SIP message (request or response, auto-detected) ──
+//
+// Examples:
+//   sip_parse(<"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n">)
+//     -> {"ok":1,"is_request":false,"status":200,"reason":"OK", ...}
+//
+//   sip_parse(<"INVITE sip:bob@biloxi.com SIP/2.0\r\n...\r\n\r\n">)
+//     -> {"ok":1,"is_request":true,"method":"INVITE","uri":"sip:bob@biloxi.com", ...}
+//
+//   sip_parse(bytes_create(0))                    -> {"ok":0,"error":"..."}
+//   sip_parse(<"garbage with no separator">)       -> {"ok":0,"error":"..."}
+//   sip_parse(<"X SIP/2.0\r\nBadLine\r\n\r\n">)     -> {"ok":0,"error":"malformed header line (no colon): BadLine"}
+fn sip_parse(msg: bytes) -> dict
+    let blen = bytes_len(msg)
+    let sep = _sip_find_separator(msg)
+    let sep_pos = sep[0]
+    let sep_len = sep[1]
+    if sep_pos < 0
+        return _sip_parse_fail("missing header/body terminator (CRLFCRLF or LFLF)")
+
+    let header_bytes = bytes_slice(msg, 0, sep_pos)
+    let header_text = bytes_to_str(header_bytes)
+    let raw_lines = split(header_text, chr(10))
+    if len(raw_lines) == 0
+        return _sip_parse_fail("empty message")
+    let start_line = _sip_strip_cr(raw_lines[0])
+    if len(trim(start_line)) == 0
+        return _sip_parse_fail("empty start line")
+
+    let hp = _sip_parse_header_lines(raw_lines)
+    if hp["ok"] == 0
+        return _sip_parse_fail(hp["error"])
+    let headers = hp["headers"]
+
+    let body_start = sep_pos + sep_len
+    let available = blen - body_start
+    if available < 0
+        available = 0
+    let cl = sip_header_get_int(headers, "Content-Length")
+    let body_len = available
+    if cl >= 0 and cl < body_len
+        body_len = cl
+    let body = bytes_slice(msg, body_start, body_start + body_len)
+    let cl_match = false
+    if cl >= 0 and cl == available
+        cl_match = true
+
+    if starts_with(start_line, "SIP/2.0")
+        // Status line: "SIP/2.0" SP status-code [SP Reason-Phrase]
+        let rest = trim(slice(start_line, len("SIP/2.0"), len(start_line)))
+        let sp = find(rest, " ")
+        let status_str = rest
+        let reason = ""
+        if sp >= 0
+            status_str = slice(rest, 0, sp)
+            reason = trim(slice(rest, sp + 1, len(rest)))
+        let status = _sip_atoi(trim(status_str))
+        if status < 100 or status > 699
+            return _sip_parse_fail("invalid or missing status code in status line")
+        return {"ok": 1, "error": "", "is_request": false, "method": "", "uri": "",
+                "status": status, "reason": reason, "headers": headers, "body": body,
+                "content_length_header": cl, "content_length_body": body_len, "content_length_match": cl_match}
+
+    // Request line: METHOD SP Request-URI SP "SIP/2.0"
+    let sp1 = find(start_line, " ")
+    if sp1 < 0
+        return _sip_parse_fail("malformed request line (expected METHOD Request-URI SIP/2.0)")
+    let method = slice(start_line, 0, sp1)
+    let rest1 = slice(start_line, sp1 + 1, len(start_line))
+    let sp2 = find(rest1, " ")
+    if sp2 < 0
+        return _sip_parse_fail("malformed request line (missing SIP version)")
+    let uri = slice(rest1, 0, sp2)
+    let version = trim(slice(rest1, sp2 + 1, len(rest1)))
+    if len(method) == 0
+        return _sip_parse_fail("empty method in request line")
+    if len(uri) == 0
+        return _sip_parse_fail("empty request-uri in request line")
+    if version != "SIP/2.0"
+        return _sip_parse_fail("unsupported/missing SIP version in request line")
+    {"ok": 1, "error": "", "is_request": true, "method": method, "uri": uri,
+     "status": 0, "reason": "", "headers": headers, "body": body,
+     "content_length_header": cl, "content_length_body": body_len, "content_length_match": cl_match}
+
+// ── Public: CSeq (RFC 3261 §20.16) ──────────────────────────────────────────
+//
+// Examples:
+//   sip_parse_cseq("314159 INVITE") -> {"ok":1,"number":314159,"method":"INVITE","error":""}
+//   sip_parse_cseq("bad")           -> {"ok":0,"error":"malformed CSeq (missing space)","number":-1,"method":""}
+//   sip_build_cseq(1826, "REGISTER") -> "1826 REGISTER"
+fn sip_parse_cseq(value: string) -> dict
+    let v = trim(value)
+    let sp = find(v, " ")
+    if sp < 0
+        return {"ok": 0, "error": "malformed CSeq (missing space)", "number": -1, "method": ""}
+    let num_str = trim(slice(v, 0, sp))
+    let method = trim(slice(v, sp + 1, len(v)))
+    let num = _sip_atoi(num_str)
+    if num < 0
+        return {"ok": 0, "error": "invalid CSeq number", "number": -1, "method": ""}
+    if len(method) == 0
+        return {"ok": 0, "error": "missing CSeq method", "number": -1, "method": ""}
+    {"ok": 1, "error": "", "number": num, "method": method}
+
+fn sip_build_cseq(number: int, method: string) -> string
+    str(number) + " " + method
+
+// ── Public: Via (RFC 3261 §20.42) ───────────────────────────────────────────
+//
+// Examples:
+//   sip_parse_via("SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds")
+//     -> {"ok":1,"transport":"UDP","host":"pc33.atlanta.com","port":-1,
+//         "branch":"z9hG4bK776asdhds","params":{"branch":"z9hG4bK776asdhds"}}
+//
+//   sip_parse_via("SIP/2.0/TCP [::1]:5060;branch=z9hG4bK1;rport")
+//     -> {"ok":1,"transport":"TCP","host":"[::1]","port":5060,
+//         "branch":"z9hG4bK1","params":{"branch":"z9hG4bK1","rport":""}}
+//
+//   sip_parse_via("garbage") -> {"ok":0,"error":"malformed Via (missing sent-by)",...}
+//
+//   sip_build_via("UDP", "pc33.atlanta.com", "z9hG4bK776asdhds")
+//     -> "SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK776asdhds"
+fn sip_parse_via(value: string) -> dict
+    let v = trim(value)
+    let fail_transport = ""
+    let fail_host = ""
+    if len(v) == 0
+        return {"ok": 0, "error": "empty Via value", "transport": fail_transport, "host": fail_host, "port": -1, "branch": "", "params": {}}
+    let sp = find(v, " ")
+    if sp < 0
+        return {"ok": 0, "error": "malformed Via (missing sent-by)", "transport": fail_transport, "host": fail_host, "port": -1, "branch": "", "params": {}}
+    let proto = slice(v, 0, sp)
+    let restv = trim(slice(v, sp + 1, len(v)))
+    let parts = split(proto, "/")
+    if len(parts) != 3
+        return {"ok": 0, "error": "malformed Via protocol", "transport": fail_transport, "host": fail_host, "port": -1, "branch": "", "params": {}}
+    if parts[0] != "SIP" or parts[1] != "2.0"
+        return {"ok": 0, "error": "unsupported Via protocol", "transport": fail_transport, "host": fail_host, "port": -1, "branch": "", "params": {}}
+    let transport = parts[2]
+    if len(transport) == 0
+        return {"ok": 0, "error": "empty Via transport", "transport": fail_transport, "host": fail_host, "port": -1, "branch": "", "params": {}}
+
+    let semi = find(restv, ";")
+    let sent_by = restv
+    let paramstr = ""
+    if semi >= 0
+        sent_by = trim(slice(restv, 0, semi))
+        paramstr = slice(restv, semi + 1, len(restv))
+    if len(sent_by) == 0
+        return {"ok": 0, "error": "empty Via sent-by", "transport": fail_transport, "host": fail_host, "port": -1, "branch": "", "params": {}}
+
+    let host = sent_by
+    let port = -1
+    if char_at(sent_by, 0) == "["
+        let rb = find(sent_by, "]")
+        if rb >= 0
+            host = slice(sent_by, 0, rb + 1)
+            let after = slice(sent_by, rb + 1, len(sent_by))
+            if len(after) > 0 and char_at(after, 0) == ":"
+                let p = _sip_atoi(slice(after, 1, len(after)))
+                if p >= 0
+                    port = p
+    else
+        let lc = _sip_rfind_char(sent_by, ":")
+        if lc >= 0
+            let p2 = _sip_atoi(slice(sent_by, lc + 1, len(sent_by)))
+            if p2 >= 0
+                host = slice(sent_by, 0, lc)
+                port = p2
+
+    let params = {}
+    if len(paramstr) > 0
+        let toks = split(paramstr, ";")
+        let pi = 0
+        while pi < len(toks)
+            let tok = trim(toks[pi])
+            if len(tok) > 0
+                let eq = find(tok, "=")
+                if eq >= 0
+                    let pk = lower(trim(slice(tok, 0, eq)))
+                    let pv = trim(slice(tok, eq + 1, len(tok)))
+                    if len(pk) > 0
+                        params[pk] = pv
+                else
+                    let pk2 = lower(tok)
+                    params[pk2] = ""
+            pi = pi + 1
+    let branch = ""
+    if contains(params, "branch")
+        branch = params["branch"]
+    {"ok": 1, "error": "", "transport": transport, "host": host, "port": port, "branch": branch, "params": params}
+
+fn sip_build_via(transport: string, host: string, branch: string) -> string
+    let base = "SIP/2.0/" + transport + " " + host
+    if len(branch) > 0
+        return base + ";branch=" + branch
+    base

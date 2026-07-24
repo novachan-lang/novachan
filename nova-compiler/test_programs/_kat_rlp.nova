@@ -1,0 +1,203 @@
+// KAT test for std/encoding/rlp — Ethereum RLP codec (Yellow Paper Appx B).
+// Byte-exact vectors from the spec, plus width-boundary, round-trip, nested-
+// list and malformed-input (in-band reject, no over-read) coverage.
+//
+// KAT INTEGRITY: pass/total is threaded explicitly through every check call
+// as a returned [pass, total] list (never a captured/shared counter list
+// mutated in place from inside a helper — that pattern has been observed to
+// silently fail to propagate to the module binding).
+import std/encoding/rlp
+import std/encoding/hex
+
+// ── threaded check helpers: state = [pass, total] ──────────────────────────
+
+fn ck_str(label: string, got: string, want: string, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got == want
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        return [pass, total]
+
+fn ck_int(label: string, got: int, want: int, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got == want
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        return [pass, total]
+
+fn ck_bool(label: string, got: bool, state: list) -> list
+    let pass = state[0]
+    let total = state[1] + 1
+    if got
+        print("ok " + label)
+        return [pass + 1, total]
+    else
+        print("FAIL " + label + ": got=false want=true")
+        return [pass, total]
+
+// ── local test-only helpers ─────────────────────────────────────────────────
+
+fn _tst_repeat_byte(b: int, n: int) -> any
+    let out = bytes_create(n)
+    let i = 0
+    while i < n
+        bytes_set(out, i, b)
+        i = i + 1
+    return out
+
+fn _tst_repeat_hex(pair: string, n: int) -> string
+    let s = ""
+    let i = 0
+    while i < n
+        s = s + pair
+        i = i + 1
+    return s
+
+// Recursively compares two RLP `any` trees (bytes leaves / list nodes).
+fn _tst_any_eq(a: any, b: any) -> bool
+    let ta = type_of(a)
+    let tb = type_of(b)
+    if ta != tb
+        return false
+    if ta == "bytes"
+        return hex_encode(a) == hex_encode(b)
+    if ta == "list"
+        let na = len(a)
+        let nb = len(b)
+        if na != nb
+            return false
+        let i = 0
+        while i < na
+            if _tst_any_eq(a[i], b[i]) == false
+                return false
+            i = i + 1
+        return true
+    return false
+
+fn main()
+    let state = [0, 0]
+
+    // ── byte-exact vectors straight from the Ethereum spec ─────────────────
+    state = ck_str("str_empty", hex_encode(rlp_encode(bytes_create(0))), "80", state)
+
+    let raw00 = bytes_create(1)
+    bytes_set(raw00, 0, 0x00)
+    state = ck_str("raw_byte_0x00", hex_encode(rlp_encode(raw00)), "00", state)
+
+    state = ck_str("int_zero", hex_encode(rlp_encode(0)), "80", state)
+    // The critical distinction: raw single byte 0x00 (-> "00") vs the RLP
+    // integer convention's zero (-> "80", the EMPTY byte string) must differ.
+    state = ck_bool("raw00_differs_from_int_zero", hex_encode(rlp_encode(raw00)) != hex_encode(rlp_encode(0)), state)
+
+    state = ck_str("str_dog", hex_encode(rlp_encode("dog")), "83646f67", state)
+    state = ck_str("list_cat_dog", hex_encode(rlp_encode(["cat", "dog"])), "c88363617483646f67", state)
+    state = ck_str("list_empty", hex_encode(rlp_encode([])), "c0", state)
+    state = ck_str("int_1024", hex_encode(rlp_encode(1024)), "820400", state)
+
+    // ── 55/56-byte long-form boundary (spec: <=55 short, >55 long) ─────────
+    let bytes55 = _tst_repeat_byte(0x61, 55)
+    let want55 = "b7" + _tst_repeat_hex("61", 55)
+    state = ck_str("str_55_short_form", hex_encode(rlp_encode(bytes55)), want55, state)
+
+    let bytes56 = _tst_repeat_byte(0x61, 56)
+    let want56 = "b838" + _tst_repeat_hex("61", 56)
+    state = ck_str("str_56_long_form", hex_encode(rlp_encode(bytes56)), want56, state)
+
+    // ── integer width boundaries (127/128, 255/256, 2^16, 2^31, 2^32, i64max) ─
+    state = ck_str("int_127", hex_encode(rlp_encode(127)), "7f", state)
+    state = ck_str("int_128", hex_encode(rlp_encode(128)), "8180", state)
+    state = ck_str("int_255", hex_encode(rlp_encode(255)), "81ff", state)
+    state = ck_str("int_256", hex_encode(rlp_encode(256)), "820100", state)
+    state = ck_str("int_65536", hex_encode(rlp_encode(65536)), "83010000", state)
+    state = ck_str("int_2p31", hex_encode(rlp_encode(2147483648)), "8480000000", state)
+    state = ck_str("int_2p32", hex_encode(rlp_encode(4294967296)), "850100000000", state)
+    state = ck_str("int_i64max", hex_encode(rlp_encode(9223372036854775807)), "887fffffffffffffff", state)
+
+    // ── boolean dispatch (type_of(true)/type_of(false) == "int" in NOVA) ───
+    state = ck_str("bool_true_as_int", hex_encode(rlp_encode(true)), "01", state)
+    state = ck_str("bool_false_as_int", hex_encode(rlp_encode(false)), "80", state)
+
+    // ── round-trip: decode(encode(x)) == x, including empty and max-width ──
+    let encEmpty = rlp_encode(bytes_create(0))
+    let drEmpty = rlp_decode(encEmpty, 0)
+    state = ck_int("str_empty_roundtrip_len", bytes_len(drEmpty[0]), 0, state)
+    state = ck_int("str_empty_roundtrip_next", drEmpty[1], bytes_len(encEmpty), state)
+
+    let encList0 = rlp_encode([])
+    let drList0 = rlp_decode(encList0, 0)
+    state = ck_int("list_empty_roundtrip_len", len(drList0[0]), 0, state)
+    state = ck_int("list_empty_roundtrip_next", drList0[1], bytes_len(encList0), state)
+
+    let enc55 = rlp_encode(bytes55)
+    let dr55 = rlp_decode(enc55, 0)
+    state = ck_str("str_55_roundtrip_bytes", hex_encode(dr55[0]), hex_encode(bytes55), state)
+    state = ck_int("str_55_roundtrip_next", dr55[1], bytes_len(enc55), state)
+
+    let enc56 = rlp_encode(bytes56)
+    let dr56 = rlp_decode(enc56, 0)
+    state = ck_str("str_56_roundtrip_bytes", hex_encode(dr56[0]), hex_encode(bytes56), state)
+    state = ck_int("str_56_roundtrip_next", dr56[1], bytes_len(enc56), state)
+
+    let encCatDog = rlp_encode(["cat", "dog"])
+    let drCatDog = rlp_decode(encCatDog, 0)
+    state = ck_int("list_catdog_count", len(drCatDog[0]), 2, state)
+    state = ck_str("list_catdog_item0", hex_encode(drCatDog[0][0]), "636174", state)
+    state = ck_str("list_catdog_item1", hex_encode(drCatDog[0][1]), "646f67", state)
+    state = ck_int("list_catdog_next", drCatDog[1], bytes_len(encCatDog), state)
+
+    // integer round-trip via rlp_decode_uint (the inverse of the convention)
+    state = ck_int("int_rt_0", rlp_decode_uint(rlp_decode(rlp_encode(0), 0)[0]), 0, state)
+    state = ck_int("int_rt_127", rlp_decode_uint(rlp_decode(rlp_encode(127), 0)[0]), 127, state)
+    state = ck_int("int_rt_128", rlp_decode_uint(rlp_decode(rlp_encode(128), 0)[0]), 128, state)
+    state = ck_int("int_rt_1024", rlp_decode_uint(rlp_decode(rlp_encode(1024), 0)[0]), 1024, state)
+    state = ck_int("int_rt_2p32", rlp_decode_uint(rlp_decode(rlp_encode(4294967296), 0)[0]), 4294967296, state)
+    state = ck_int("int_rt_i64max", rlp_decode_uint(rlp_decode(rlp_encode(9223372036854775807), 0)[0]), 9223372036854775807, state)
+
+    // ── nested-list round-trip: [ [], [[]], [ [], [[]] ] ] ──────────────────
+    let nested = [[], [[]], [[], [[]]]]
+    let encNested = rlp_encode(nested)
+    let drNested = rlp_decode(encNested, 0)
+    state = ck_int("nested_roundtrip_next", drNested[1], bytes_len(encNested), state)
+    state = ck_bool("nested_roundtrip_structure", _tst_any_eq(drNested[0], nested), state)
+
+    // ── malformed input: declared length overruns buffer -> reject in-band ─
+    let bad1 = hex_decode("830102")
+    state = ck_int("reject_short_string_overrun", rlp_decode(bad1, 0)[1], -1, state)
+
+    let bad2 = hex_decode("c5")
+    state = ck_int("reject_short_list_overrun", rlp_decode(bad2, 0)[1], -1, state)
+
+    let bad3 = hex_decode("b8")
+    state = ck_int("reject_long_string_lenoflen_overrun", rlp_decode(bad3, 0)[1], -1, state)
+
+    let bad4 = hex_decode("b900050102")
+    state = ck_int("reject_long_string_payload_overrun", rlp_decode(bad4, 0)[1], -1, state)
+
+    let bad5 = hex_decode("f9")
+    state = ck_int("reject_long_list_lenoflen_overrun", rlp_decode(bad5, 0)[1], -1, state)
+
+    let bad6 = hex_decode("f900050102")
+    state = ck_int("reject_long_list_payload_overrun", rlp_decode(bad6, 0)[1], -1, state)
+
+    // empty / missing buffer, and pos past end -- no crash, in-band reject
+    let bad7 = hex_decode("")
+    state = ck_int("reject_empty_buffer", rlp_decode(bad7, 0)[1], -1, state)
+
+    let bad8 = hex_decode("80")
+    state = ck_int("reject_pos_out_of_range", rlp_decode(bad8, 5)[1], -1, state)
+
+    // ── final trailer ────────────────────────────────────────────────────
+    let pass = state[0]
+    let total = state[1]
+    print("RESULT " + str(pass) + "/" + str(total))
+    if pass == total
+        print("PASS")
+    else
+        print("FAIL")
+        exit(1)
