@@ -1,0 +1,259 @@
+// KAT — forge_memcached: Memcached text-protocol wrappers (key validation) +
+// binary-protocol (24-byte header) framing/parsing.
+// Vectors hand-computed against the memcached protocol.txt / protocol-binary.txt spec.
+
+import forge_memcached as fm
+import std/encoding/pack as pk
+
+fn _fail(label: string, msg: string)
+    print("FAIL " + label + ": " + msg)
+    exit(1)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        _fail(label, "got='" + got + "' want='" + want + "'")
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        _fail(label, "got=" + str(got) + " want=" + str(want))
+
+fn _hexdig(d: int) -> string
+    let digs = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+    digs[d]
+
+fn _hex(b: any) -> string
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let v = bytes_get(b, i) & 0xFF
+        out = out + _hexdig(v / 16) + _hexdig(v % 16)
+        i = i + 1
+    out
+
+// _bytes_eq: byte-exact comparison (embedded 0x00 safe -- never routes
+// through a NOVA string, which would truncate at NUL).
+fn _bytes_eq(a: any, b: any) -> int
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return 0
+    let i = 0
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            return 0
+        i = i + 1
+    1
+
+fn ckb(label: string, got: any, want: any)
+    if _bytes_eq(got, want) == 0
+        _fail(label, "got hex=" + _hex(got) + " want hex=" + _hex(want))
+
+fn main()
+    let crlf = chr(13) + chr(10)
+
+    // ── 1. TEXT: mcx_set byte-exact ("set foo 0 0 3\r\nbar\r\n") ────────────
+    let s1 = fm.mcx_set("foo", 0, 0, "bar")
+    cki("set-ok", s1["ok"], 1)
+    cks("set-cmd", s1["cmd"], "set foo 0 0 3" + crlf + "bar" + crlf)
+    cks("set-error-empty", s1["error"], "")
+
+    // ── 2. TEXT: mcx_get byte-exact ("get foo\r\n") ──────────────────────────
+    let keys1 = ["foo"]
+    let g1 = fm.mcx_get(keys1)
+    cki("get-ok", g1["ok"], 1)
+    cks("get-cmd", g1["cmd"], "get foo" + crlf)
+
+    // multi-key get
+    let keys2 = ["foo", "baz"]
+    let g2 = fm.mcx_get(keys2)
+    cks("get-multi-cmd", g2["cmd"], "get foo baz" + crlf)
+
+    // empty key list -> in-band error, not exit
+    let g3 = fm.mcx_get([])
+    cki("get-empty-ok", g3["ok"], 0)
+    cks("get-empty-cmd", g3["cmd"], "")
+
+    // ── 3. TEXT: mcx_delete / mcx_incr / mcx_decr byte-exact ────────────────
+    cks("delete-cmd", fm.mcx_delete("foo")["cmd"], "delete foo" + crlf)
+    cks("incr-cmd", fm.mcx_incr("n", 5)["cmd"], "incr n 5" + crlf)
+    cks("decr-cmd", fm.mcx_decr("n", 3)["cmd"], "decr n 3" + crlf)
+
+    // ── 4. KEY VALIDATION: space/newline rejected IN-BAND (never exit) ─────
+    cki("key-valid-plain", fm.mc_key_valid("foo"), 1)
+    cki("key-valid-space", fm.mc_key_valid("foo bar"), 0)
+    cki("key-valid-newline", fm.mc_key_valid("foo" + chr(10)), 0)
+    cki("key-valid-cr", fm.mc_key_valid("foo" + chr(13)), 0)
+    cki("key-valid-tab", fm.mc_key_valid("foo" + chr(9)), 0)
+    // Note: a NOVA `string` is C-string-shaped -- chr(0) inside a string
+    // literal/concat TRUNCATES the string at that point (see
+    // reference_nova_string_nul_truncation), so a NUL byte can never
+    // actually reach mc_key_valid via a `string` key in the first place.
+    // The mc_key_valid <=0x20 bound still covers it defensively should that
+    // ever change, but there is no observable string to test here.
+    cki("key-valid-empty", fm.mc_key_valid(""), 0)
+
+    // exactly 250 bytes = valid, 251 = invalid (memcached's real bound)
+    let k250 = ""
+    let i = 0
+    while i < 250
+        k250 = k250 + "a"
+        i = i + 1
+    cki("key-valid-250", fm.mc_key_valid(k250), 1)
+    let k251 = k250 + "a"
+    cki("key-valid-251", fm.mc_key_valid(k251), 0)
+
+    let bad_set = fm.mcx_set("bad key", 0, 0, "x")
+    cki("set-bad-key-ok", bad_set["ok"], 0)
+    cks("set-bad-key-cmd", bad_set["cmd"], "")
+    cks("set-bad-key-error-nonempty", bad_set["error"], "invalid key")
+
+    let bad_get_batch = fm.mcx_get(["good", "bad " + "key"])
+    cki("get-bad-key-in-batch-ok", bad_get_batch["ok"], 0)
+
+    let bad_delete = fm.mcx_delete("k" + chr(10))
+    cki("delete-bad-key-ok", bad_delete["ok"], 0)
+
+    // ── 5. BINARY: GET request header byte-exact ────────────────────────────
+    // magic=0x80 opcode=0x00(GET) key_len=3("foo") extras_len=0 data_type=0
+    // vbucket=0 total_body=3 opaque=0x00000001 cas=0
+    let getf = fm.mcb_get("foo", 1)
+    cki("bin-get-ok", getf["ok"], 1)
+    let frame_g = getf["frame"]
+    cki("bin-get-framelen", bytes_len(frame_g), 27)   // 24 header + 3 key
+    let want_get_header = pk.pack_u8(128)
+    want_get_header = bytes_concat(want_get_header, pk.pack_u8(0))
+    want_get_header = bytes_concat(want_get_header, pk.pack_u16_be(3))
+    want_get_header = bytes_concat(want_get_header, pk.pack_u8(0))
+    want_get_header = bytes_concat(want_get_header, pk.pack_u8(0))
+    want_get_header = bytes_concat(want_get_header, pk.pack_u16_be(0))
+    want_get_header = bytes_concat(want_get_header, pk.pack_u32_be(3))
+    want_get_header = bytes_concat(want_get_header, pk.pack_u32_be(1))
+    want_get_header = bytes_concat(want_get_header, pk.pack_u64_be(0))
+    let got_get_header = bytes_slice(frame_g, 0, 24)
+    ckb("bin-get-header-byte-exact", got_get_header, want_get_header)
+    // spot-check the raw magic/opcode bytes directly too
+    cki("bin-get-magic-byte", bytes_get(frame_g, 0) & 0xFF, 128)
+    cki("bin-get-opcode-byte", bytes_get(frame_g, 1) & 0xFF, 0)
+
+    // parse it back
+    let hdr_g = fm.mcb_parse_header(frame_g)
+    cki("bin-get-parsed-ok", hdr_g["ok"], 1)
+    cki("bin-get-parsed-magic", hdr_g["magic"], 128)
+    cki("bin-get-parsed-opcode", hdr_g["opcode"], 0)
+    cki("bin-get-parsed-keylen", hdr_g["key_len"], 3)
+    cki("bin-get-parsed-totalbody", hdr_g["total_body"], 3)
+    cki("bin-get-parsed-opaque", hdr_g["opaque"], 1)
+
+    // bad key on binary GET -> in-band error, not exit
+    let bad_bin_get = fm.mcb_get("foo bar", 1)
+    cki("bin-get-badkey-ok", bad_bin_get["ok"], 0)
+
+    // ── 6. BINARY: SET + round-trip an embedded 0x00 byte through value ─────
+    let val = bytes_create(5)
+    bytes_set(val, 0, ord("h"))
+    bytes_set(val, 1, ord("i"))
+    bytes_set(val, 2, 0)                 // embedded NUL
+    bytes_set(val, 3, ord("!"))
+    bytes_set(val, 4, 255)               // full high byte too
+
+    let setf = fm.mcb_set("mykey", val, 42, 3600, 7, 0)
+    cki("bin-set-ok", setf["ok"], 1)
+    let frame_s = setf["frame"]
+    // 24 header + 8 extras + 5 key("mykey") + 5 value
+    cki("bin-set-framelen", bytes_len(frame_s), 42)
+
+    let hdr_s = fm.mcb_parse_header(frame_s)
+    cki("bin-set-parsed-opcode", hdr_s["opcode"], 1)
+    cki("bin-set-parsed-extraslen", hdr_s["extras_len"], 8)
+    cki("bin-set-parsed-keylen", hdr_s["key_len"], 5)
+    cki("bin-set-parsed-totalbody", hdr_s["total_body"], 18)
+    cki("bin-set-parsed-opaque", hdr_s["opaque"], 7)
+
+    let resp_s = fm.mcb_parse_response(frame_s)
+    cki("bin-set-resp-ok", resp_s["ok"], 1)
+    cks("bin-set-resp-key", resp_s["key"], "mykey")
+    let got_val = resp_s["value"]
+    cki("bin-set-resp-value-len", bytes_len(got_val), 5)
+    ckb("bin-set-resp-value-byte-exact-incl-nul", got_val, val)
+    // explicit embedded-NUL spot check
+    cki("bin-set-resp-value-byte2-is-nul", bytes_get(got_val, 2), 0)
+    cki("bin-set-resp-value-byte4-is-0xff", bytes_get(got_val, 4) & 0xFF, 255)
+
+    // flags round-trip via the extras field
+    let flags_rt = pk.unpack_u32_be(resp_s["extras"], 0)
+    cki("bin-set-flags-roundtrip", flags_rt, 42)
+    let exptime_rt = pk.unpack_u32_be(resp_s["extras"], 4)
+    cki("bin-set-exptime-roundtrip", exptime_rt, 3600)
+
+    // u32 boundary: flags = 4294967295 (max u32) round-trips bit-exact
+    let val2 = bytes_create(1)
+    bytes_set(val2, 0, 1)
+    let setf2 = fm.mcb_set("bkey", val2, 4294967295, 0, 0, 0)
+    let resp2 = fm.mcb_parse_response(setf2["frame"])
+    let flags_max = pk.unpack_u32_be(resp2["extras"], 0)
+    cki("bin-set-flags-u32-max-roundtrip", flags_max, 4294967295)
+
+    // bad key on binary SET -> in-band error
+    let bad_bin_set = fm.mcb_set("k" + chr(9) + "y", val, 0, 0, 0, 0)
+    cki("bin-set-badkey-ok", bad_bin_set["ok"], 0)
+    cks("bin-set-badkey-frame-empty", str(bytes_len(bad_bin_set["frame"])), "0")
+
+    // ── 7. BINARY: GET response parsing (mcb_parse_get_response) ───────────
+    // Build a synthetic success GET RESPONSE frame by hand: magic=0x81,
+    // opcode=0x00, extras=4 bytes flags(u32 BE)=99, key_len=0 (responses
+    // usually omit the key), value="xyz".
+    let resp_extras = pk.pack_u32_be(99)
+    let resp_value = bytes_create(3)
+    bytes_set(resp_value, 0, ord("x"))
+    bytes_set(resp_value, 1, ord("y"))
+    bytes_set(resp_value, 2, ord("z"))
+    let resp_total = 4 + 0 + 3
+    let resp_header = fm.mcb_header(fm.MC_MAGIC_RESP(), fm.MC_OP_GET(), 0, 4, 0, 0, resp_total, 5, 0)
+    let resp_frame = bytes_concat(resp_header, resp_extras)
+    resp_frame = bytes_concat(resp_frame, resp_value)
+
+    let parsed = fm.mcb_parse_get_response(resp_frame)
+    cki("bin-getresp-ok", parsed["ok"], 1)
+    cki("bin-getresp-flags", parsed["flags"], 99)
+    let pv = parsed["value"]
+    cki("bin-getresp-value-len", bytes_len(pv), 3)
+    cks("bin-getresp-value-str", bytes_to_str(pv), "xyz")
+
+    // non-zero status (e.g. key not found = 0x0001) -> in-band error, not exit
+    let notfound_header = fm.mcb_header(fm.MC_MAGIC_RESP(), fm.MC_OP_GET(), 0, 0, 0, 1, 0, 5, 0)
+    let notfound = fm.mcb_parse_get_response(notfound_header)
+    cki("bin-getresp-notfound-ok", notfound["ok"], 0)
+
+    // ── 8. MALFORMED / TRUNCATED input never crashes, always in-band error ──
+    cki("parse-header-empty", fm.mcb_parse_header(bytes_create(0))["ok"], 0)
+    cki("parse-header-short", fm.mcb_parse_header(bytes_create(10))["ok"], 0)
+
+    let bad_magic = bytes_create(24)
+    let z = 0
+    while z < 24
+        bytes_set(bad_magic, z, 0)
+        z = z + 1
+    cki("parse-header-badmagic", fm.mcb_parse_header(bad_magic)["ok"], 0)
+
+    // header claims total_body bigger than the buffer actually holds
+    let lying_header = fm.mcb_header(128, 0, 3, 0, 0, 0, 999, 0, 0)
+    let lying_frame = bytes_concat(lying_header, str_to_bytes("foo"))
+    let lying_parsed = fm.mcb_parse_response(lying_frame)
+    cki("parse-response-truncated-ok", lying_parsed["ok"], 0)
+
+    // header claims extras+key exceed total_body (internally inconsistent)
+    let incons_header = fm.mcb_header(128, 1, 5, 8, 0, 0, 5, 0, 0)
+    let incons_frame = bytes_concat(incons_header, bytes_create(5))
+    let incons_parsed = fm.mcb_parse_response(incons_frame)
+    cki("parse-response-inconsistent-ok", incons_parsed["ok"], 0)
+
+    // ── 9. EMPTY value round-trips cleanly (no crash on zero-length value) ──
+    let empty_val = bytes_create(0)
+    let setf_empty = fm.mcb_set("ek", empty_val, 0, 0, 0, 0)
+    cki("bin-set-empty-ok", setf_empty["ok"], 1)
+    let resp_empty = fm.mcb_parse_response(setf_empty["frame"])
+    cki("bin-set-empty-resp-ok", resp_empty["ok"], 1)
+    cki("bin-set-empty-value-len", bytes_len(resp_empty["value"]), 0)
+
+    print("PASS forge_memcached")

@@ -1,0 +1,406 @@
+// ============================================================================
+// forge_memcached -- Memcached client codec (no live sockets; pure builders +
+// parsers, same shape as every other forge_* wire-protocol module).
+// ============================================================================
+//
+// TWO PROTOCOLS, ONE MODULE:
+//
+//   TEXT protocol -- delegates the wire-format math to std/net/memcache_text
+//   (already exists, byte-exact vs. the memcached protocol.txt reference) and
+//   adds the ONE thing that module deliberately leaves out: key validation.
+//   memcached keys may not contain whitespace or control chars (the ASCII
+//   protocol is space/CRLF-delimited -- a key with an embedded space or
+//   newline would inject a second command into the stream). The mcx_* here
+//   validate first and return an IN-BAND {"ok":0,"error":...} result instead
+//   of ever building a malformed command or calling exit().
+//
+//   BINARY protocol -- the 24-byte fixed header (magic/opcode/key-len/
+//   extras-len/data-type/vbucket-or-status/total-body-len/opaque/cas) plus
+//   extras+key+value. Values are `bytes`, not `string` -- NOVA strings are
+//   C-string-shaped (a 0x00 byte truncates them; see
+//   reference_nova_string_nul_truncation), so the binary path is what makes
+//   memcached values ACTUALLY binary-safe end to end.
+//
+// Reference: https://github.com/memcached/memcached/blob/master/doc/protocol-binary.txt
+//            https://github.com/memcached/memcached/blob/master/doc/protocol.txt
+//
+// PUBLIC API
+// ── text (validated wrappers around std/net/memcache_text) ─────────────────
+//   mc_key_valid(key) -> int                  1 if key is 1..250 bytes with no
+//                                              byte <= 0x20 (space + all controls,
+//                                              which covers CR/LF/TAB/NUL)
+//   mcx_set(key,flags,exptime,data) -> dict    {"ok","cmd","error"}
+//   mcx_get(keys: list) -> dict                {"ok","cmd","error"}
+//   mcx_delete(key) -> dict                    {"ok","cmd","error"}
+//   mcx_incr(key,n) -> dict                    {"ok","cmd","error"}
+//   mcx_decr(key,n) -> dict                    {"ok","cmd","error"}
+//   (mc_parse_value / mc_parse_reply from std/net/memcache_text are re-usable
+//    directly -- parsing untrusted server replies never needs key validation)
+//
+// ── binary (24-byte header; values are `bytes`) ─────────────────────────────
+//   header layout, ALL multi-byte fields BIG ENDIAN:
+//     byte 0      magic            u8   0x80 request / 0x81 response
+//     byte 1      opcode           u8
+//     bytes 2-3   key length       u16
+//     byte 4      extras length    u8
+//     byte 5      data type        u8   (always 0x00, "raw bytes")
+//     bytes 6-7   vbucket id (req) / status (resp)   u16
+//     bytes 8-11  total body length u32  (= extras_len + key_len + value_len)
+//     bytes 12-15 opaque           u32
+//     bytes 16-23 CAS              u64
+//
+//   mcb_header(magic,opcode,key_len,extras_len,data_type,vbs,total_body,
+//              opaque,cas) -> bytes            raw 24-byte header builder
+//   mcb_parse_header(b: bytes) -> dict          parse any 24-byte header
+//   mcb_get(key,opaque) -> dict                 {"ok","frame","error"} GET request
+//   mcb_set(key,value:bytes,flags,exptime,opaque,cas) -> dict   SET request frame
+//   mcb_delete(key,opaque) -> dict              {"ok","frame","error"} DELETE request
+//   mcb_parse_response(b: bytes) -> dict        generic response/request parser:
+//     {"ok","opcode","status","opaque","cas","extras":bytes,"key":string,
+//      "value":bytes,"error"}
+//   mcb_parse_get_response(b: bytes) -> dict    GET response -> {"ok","flags","value":bytes,"error"}
+//
+// DESIGN NOTES
+//   * All builders validate the key and return {"ok":0,...,"error":"..."} on
+//     failure -- NEVER exit(1). A library never aborts the process on bad
+//     input; only the caller decides what to do with an error.
+//   * bytes_slice() (used throughout the binary parser) already clamps its
+//     bounds and copies into a fresh buffer (see nova_rt_bytes_slice) -- so
+//     parsing a short/truncated/adversarial buffer never reads out of bounds
+//     and callers can't alias the parser's internal buffers.
+//   * Opcodes/magics exposed as MC_* functions (not top-level consts -- NOVA
+//     convention for this codebase) so callers don't have to memorize hex.
+//
+// LEAF dependencies: std/net/memcache_text (text protocol), std/encoding/pack
+// (u8/u16/u32/u64 big-endian pack/unpack -- the byte-order math for the
+// binary header is written ONCE there, reused here rather than re-inlined).
+// ============================================================================
+
+import std/net/memcache_text
+import std/encoding/pack as pk
+
+// ── magic bytes / opcodes ───────────────────────────────────────────────────
+
+fn MC_MAGIC_REQ() -> int
+    128                                   // 0x80
+
+fn MC_MAGIC_RESP() -> int
+    129                                   // 0x81
+
+fn MC_OP_GET() -> int
+    0                                     // 0x00
+
+fn MC_OP_SET() -> int
+    1                                     // 0x01
+
+fn MC_OP_ADD() -> int
+    2                                     // 0x02
+
+fn MC_OP_REPLACE() -> int
+    3                                     // 0x03
+
+fn MC_OP_DELETE() -> int
+    4                                     // 0x04
+
+fn MC_OP_INCREMENT() -> int
+    5                                     // 0x05
+
+fn MC_OP_DECREMENT() -> int
+    6                                     // 0x06
+
+fn MC_OP_NOOP() -> int
+    10                                    // 0x0a
+
+// ── key validation (shared by text + binary builders) ──────────────────────
+//
+// Real memcached keys are whitespace/CRLF-delimited on the wire (text
+// protocol) and length-prefixed but still restricted (binary protocol). A key
+// must be 1..250 bytes and contain no byte <= 0x20 -- that single bound
+// rejects space (0x20), TAB (0x09), CR (0x0D), LF (0x0A) and NUL (0x00) in
+// one pass, which is exactly the set of bytes that could inject a second
+// command/line into a text-protocol stream.
+fn mc_key_valid(key: string) -> int
+    let n = len(key)
+    if n == 0 or n > 250
+        return 0
+    let i = 0
+    while i < n
+        let o = ord(slice(key, i, i + 1))
+        if o <= 32
+            return 0
+        i = i + 1
+    1
+
+// ── text protocol: validated wrappers around std/net/memcache_text ─────────
+
+// mcx_set: validated "set" command builder.
+//   ok=1 -> "cmd" holds "set <key> <flags> <exptime> <bytes>\r\n<data>\r\n"
+//   ok=0 -> "cmd"="" , "error" explains why (bad input never reaches
+//           mc_set / never becomes a wire command).
+fn mcx_set(key: string, flags: int, exptime: int, data: string) -> dict
+    let out = {}
+    if mc_key_valid(key) == 0
+        out["ok"] = 0
+        out["cmd"] = ""
+        out["error"] = "invalid key"
+        return out
+    out["ok"] = 1
+    out["cmd"] = mc_set(key, flags, exptime, data)
+    out["error"] = ""
+    out
+
+// mcx_get: validated "get" command builder for one or more keys.
+// Rejects the whole batch (no partial command) if ANY key is invalid, or if
+// the key list is empty.
+fn mcx_get(keys: list) -> dict
+    let out = {}
+    let n = len(keys)
+    if n == 0
+        out["ok"] = 0
+        out["cmd"] = ""
+        out["error"] = "no keys"
+        return out
+    let i = 0
+    while i < n
+        if mc_key_valid(keys[i]) == 0
+            out["ok"] = 0
+            out["cmd"] = ""
+            out["error"] = "invalid key"
+            return out
+        i = i + 1
+    out["ok"] = 1
+    out["cmd"] = mc_get(keys)
+    out["error"] = ""
+    out
+
+// mcx_delete: validated "delete" command builder.
+fn mcx_delete(key: string) -> dict
+    let out = {}
+    if mc_key_valid(key) == 0
+        out["ok"] = 0
+        out["cmd"] = ""
+        out["error"] = "invalid key"
+        return out
+    out["ok"] = 1
+    out["cmd"] = mc_delete(key)
+    out["error"] = ""
+    out
+
+// mcx_incr: validated "incr" command builder.
+fn mcx_incr(key: string, n: int) -> dict
+    let out = {}
+    if mc_key_valid(key) == 0
+        out["ok"] = 0
+        out["cmd"] = ""
+        out["error"] = "invalid key"
+        return out
+    out["ok"] = 1
+    out["cmd"] = mc_incr(key, n)
+    out["error"] = ""
+    out
+
+// mcx_decr: validated "decr" command builder.
+fn mcx_decr(key: string, n: int) -> dict
+    let out = {}
+    if mc_key_valid(key) == 0
+        out["ok"] = 0
+        out["cmd"] = ""
+        out["error"] = "invalid key"
+        return out
+    out["ok"] = 1
+    out["cmd"] = mc_decr(key, n)
+    out["error"] = ""
+    out
+
+// ── binary protocol ──────────────────────────────────────────────────────
+
+// mcb_header: build the raw 24-byte binary-protocol header. Every multi-byte
+// field is written big-endian via std/encoding/pack (network byte order --
+// the byte-splitting math lives there once, not re-inlined per field here).
+fn mcb_header(magic: int, opcode: int, key_len: int, extras_len: int, data_type: int, vbucket_or_status: int, total_body: int, opaque: int, cas: int) -> any
+    let h = pk.pack_u8(magic)
+    h = bytes_concat(h, pk.pack_u8(opcode))
+    h = bytes_concat(h, pk.pack_u16_be(key_len))
+    h = bytes_concat(h, pk.pack_u8(extras_len))
+    h = bytes_concat(h, pk.pack_u8(data_type))
+    h = bytes_concat(h, pk.pack_u16_be(vbucket_or_status))
+    h = bytes_concat(h, pk.pack_u32_be(total_body))
+    h = bytes_concat(h, pk.pack_u32_be(opaque))
+    h = bytes_concat(h, pk.pack_u64_be(cas))
+    h
+
+// mcb_parse_header: parse any 24-byte binary header (request or response --
+// the layout is identical; only the meaning of bytes 6-7 differs, exposed
+// as "vbucket_or_status" so the caller interprets it per frame direction).
+// Never crashes on a short/malformed buffer: returns {"ok":0,"error":...}.
+fn mcb_parse_header(b: any) -> dict
+    let out = {}
+    out["ok"] = 0
+    out["magic"] = 0
+    out["opcode"] = 0
+    out["key_len"] = 0
+    out["extras_len"] = 0
+    out["data_type"] = 0
+    out["vbucket_or_status"] = 0
+    out["total_body"] = 0
+    out["opaque"] = 0
+    out["cas"] = 0
+    out["error"] = ""
+    if bytes_len(b) < 24
+        out["error"] = "header too short (need 24 bytes)"
+        return out
+    let magic = pk.unpack_u8(b, 0)
+    if magic != MC_MAGIC_REQ() and magic != MC_MAGIC_RESP()
+        out["error"] = "bad magic byte"
+        return out
+    out["ok"] = 1
+    out["magic"] = magic
+    out["opcode"] = pk.unpack_u8(b, 1)
+    out["key_len"] = pk.unpack_u16_be(b, 2)
+    out["extras_len"] = pk.unpack_u8(b, 4)
+    out["data_type"] = pk.unpack_u8(b, 5)
+    out["vbucket_or_status"] = pk.unpack_u16_be(b, 6)
+    out["total_body"] = pk.unpack_u32_be(b, 8)
+    out["opaque"] = pk.unpack_u32_be(b, 12)
+    out["cas"] = pk.unpack_u64_be(b, 16)
+    out
+
+// mcb_get: build a binary GET request frame (header + key, no extras/value).
+fn mcb_get(key: string, opaque: int) -> dict
+    let out = {}
+    if mc_key_valid(key) == 0
+        out["ok"] = 0
+        out["frame"] = bytes_create(0)
+        out["error"] = "invalid key"
+        return out
+    let klen = len(key)
+    let header = mcb_header(MC_MAGIC_REQ(), MC_OP_GET(), klen, 0, 0, 0, klen, opaque, 0)
+    let frame = bytes_concat(header, str_to_bytes(key))
+    out["ok"] = 1
+    out["frame"] = frame
+    out["error"] = ""
+    out
+
+// mcb_set: build a binary SET request frame. `value` is `bytes` (binary
+// safe -- may contain 0x00). Extras = flags(u32 BE) + exptime(u32 BE), 8
+// bytes, per the memcached binary-protocol SET layout.
+fn mcb_set(key: string, value: any, flags: int, exptime: int, opaque: int, cas: int) -> dict
+    let out = {}
+    if mc_key_valid(key) == 0
+        out["ok"] = 0
+        out["frame"] = bytes_create(0)
+        out["error"] = "invalid key"
+        return out
+    let klen = len(key)
+    let vlen = bytes_len(value)
+    let extras_len = 8
+    let extras = bytes_concat(pk.pack_u32_be(flags), pk.pack_u32_be(exptime))
+    let total_body = extras_len + klen + vlen
+    let header = mcb_header(MC_MAGIC_REQ(), MC_OP_SET(), klen, extras_len, 0, 0, total_body, opaque, cas)
+    let frame = bytes_concat(header, extras)
+    frame = bytes_concat(frame, str_to_bytes(key))
+    frame = bytes_concat(frame, value)
+    out["ok"] = 1
+    out["frame"] = frame
+    out["error"] = ""
+    out
+
+// mcb_delete: build a binary DELETE request frame (header + key only).
+fn mcb_delete(key: string, opaque: int) -> dict
+    let out = {}
+    if mc_key_valid(key) == 0
+        out["ok"] = 0
+        out["frame"] = bytes_create(0)
+        out["error"] = "invalid key"
+        return out
+    let klen = len(key)
+    let header = mcb_header(MC_MAGIC_REQ(), MC_OP_DELETE(), klen, 0, 0, 0, klen, opaque, 0)
+    let frame = bytes_concat(header, str_to_bytes(key))
+    out["ok"] = 1
+    out["frame"] = frame
+    out["error"] = ""
+    out
+
+// mcb_parse_response: parse ANY binary frame (request or response -- same
+// layout) into header fields + extras/key/value. `value` stays `bytes`
+// (never coerced through a string) so an embedded 0x00 is preserved exactly.
+// Defensively re-clamps total_body/extras/key lengths against the actual
+// buffer size before slicing -- a malformed/truncated/adversarial length
+// field can never drive an out-of-bounds read; it just yields an in-band
+// error instead.
+fn mcb_parse_response(b: any) -> dict
+    let hdr = mcb_parse_header(b)
+    let out = {}
+    out["ok"] = 0
+    out["opcode"] = 0
+    out["status"] = 0
+    out["opaque"] = 0
+    out["cas"] = 0
+    out["extras"] = bytes_create(0)
+    out["key"] = ""
+    out["value"] = bytes_create(0)
+    out["error"] = ""
+    if hdr["ok"] == 0
+        out["error"] = hdr["error"]
+        return out
+
+    let extras_len = hdr["extras_len"]
+    let key_len = hdr["key_len"]
+    let total_body = hdr["total_body"]
+    let avail = bytes_len(b) - 24
+
+    // Reject an internally-inconsistent or truncated frame in-band rather
+    // than trusting attacker-controlled length fields.
+    if total_body < 0 or extras_len < 0 or key_len < 0
+        out["error"] = "negative length field"
+        return out
+    if extras_len + key_len > total_body
+        out["error"] = "extras+key exceed total body"
+        return out
+    if total_body > avail
+        out["error"] = "truncated frame (declared " + str(total_body) + " bytes, have " + str(avail) + ")"
+        return out
+
+    let value_len = total_body - extras_len - key_len
+    let extras = bytes_slice(b, 24, 24 + extras_len)
+    let key_start = 24 + extras_len
+    let key_bytes = bytes_slice(b, key_start, key_start + key_len)
+    let value_start = key_start + key_len
+    let value = bytes_slice(b, value_start, value_start + value_len)
+
+    out["ok"] = 1
+    out["opcode"] = hdr["opcode"]
+    out["status"] = hdr["vbucket_or_status"]
+    out["opaque"] = hdr["opaque"]
+    out["cas"] = hdr["cas"]
+    out["extras"] = extras
+    out["key"] = bytes_to_str(key_bytes)
+    out["value"] = value
+    out["error"] = ""
+    out
+
+// mcb_parse_get_response: parse a binary GET response specifically --
+// extras is 4 bytes of flags (u32 BE), value is the binary-safe data.
+// A non-success status (per binary protocol, 0x0000 = no error) or a parse
+// failure both come back as {"ok":0,...,"error":...} -- never an abort.
+fn mcb_parse_get_response(b: any) -> dict
+    let r = mcb_parse_response(b)
+    let out = {}
+    out["ok"] = 0
+    out["flags"] = 0
+    out["value"] = bytes_create(0)
+    out["error"] = ""
+    if r["ok"] == 0
+        out["error"] = r["error"]
+        return out
+    if r["status"] != 0
+        out["error"] = "status " + str(r["status"])
+        return out
+    let flags = 0
+    if bytes_len(r["extras"]) >= 4
+        flags = pk.unpack_u32_be(r["extras"], 0)
+    out["ok"] = 1
+    out["flags"] = flags
+    out["value"] = r["value"]
+    out["error"] = ""
+    out
