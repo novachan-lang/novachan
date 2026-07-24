@@ -1,0 +1,75 @@
+// Adversarial verification probe for std/encoding/thrift.
+// Independently re-derives expected bytes and attacks truncated/malformed
+// buffers that the builder's own KAT did not cover.
+import std/encoding/thrift
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn main()
+    // ── PROBE A: message buffer containing ONLY the 4-byte VERSION_1|CALL
+    // header (no name, no seqid, no struct body at all). Per the module's
+    // OWN documented contract ("ok=0 ... on a too-short buffer"), this
+    // should be rejected (ok=0). Does it actually get rejected?
+    let hdr_only = bytes_create(4)
+    bytes_set(hdr_only, 0, 0x80)
+    bytes_set(hdr_only, 1, 0x01)
+    bytes_set(hdr_only, 2, 0x00)
+    bytes_set(hdr_only, 3, 0x01)
+    let rA = thrift_decode_message(hdr_only)
+    print("PROBE_A ok=" + str(rA["ok"]) + " name='" + rA["name"] + "' seqid=" + str(rA["seqid"]) + " fields_len=" + str(len(rA["fields"])))
+
+    // ── PROBE B: header + a declared name-length of 100 but ZERO actual
+    // name bytes present (buffer ends right after the length prefix).
+    let hdr_badname = bytes_create(8)
+    bytes_set(hdr_badname, 0, 0x80)
+    bytes_set(hdr_badname, 1, 0x01)
+    bytes_set(hdr_badname, 2, 0x00)
+    bytes_set(hdr_badname, 3, 0x01)
+    bytes_set(hdr_badname, 4, 0x00)
+    bytes_set(hdr_badname, 5, 0x00)
+    bytes_set(hdr_badname, 6, 0x00)
+    bytes_set(hdr_badname, 7, 0x64)   // declared len = 100, but buffer ends here
+    let rB = thrift_decode_message(hdr_badname)
+    print("PROBE_B ok=" + str(rB["ok"]) + " name='" + rB["name"] + "' seqid=" + str(rB["seqid"]) + " fields_len=" + str(len(rB["fields"])))
+
+    // ── PROBE C: full valid header+name+seqid, but the struct body is
+    // completely absent (buffer ends right after seqid -- no STOP byte at
+    // all). thrift_decode_struct's own doc says this degrades gracefully at
+    // the STRUCT level (documented), but does the MESSAGE-level `ok` still
+    // wrongly claim success for a request that never actually completed?
+    let name = str_to_bytes("ping")
+    let hdr_nobody = bytes_create(0)
+    hdr_nobody = bytes_concat(hdr_nobody, hdr_only)
+    hdr_nobody = bytes_concat(hdr_nobody, pack_i32_be_local(4))
+    hdr_nobody = bytes_concat(hdr_nobody, name)
+    hdr_nobody = bytes_concat(hdr_nobody, pack_i32_be_local(1))
+    // no struct body / no STOP byte appended at all
+    let rC = thrift_decode_message(hdr_nobody)
+    print("PROBE_C ok=" + str(rC["ok"]) + " name='" + rC["name"] + "' seqid=" + str(rC["seqid"]) + " fields_len=" + str(len(rC["fields"])) + " next_pos=" + str(rC["next_pos"]))
+
+    // ── PROBE D: does a genuinely well-formed, FULL message with an empty
+    // struct still decode correctly (sanity control)?
+    let full = thrift_encode_message("ping", tmt_call(), 1, [])
+    let rD = thrift_decode_message(full)
+    cki("full_msg_ok", rD["ok"], 1)
+    cks("full_msg_name", rD["name"], "ping")
+
+    print("thrift adversarial probe: done")
+
+fn pack_i32_be_local(v: int) -> any
+    let b = bytes_create(4)
+    bytes_set(b, 0, (v >> 24) & 0xFF)
+    bytes_set(b, 1, (v >> 16) & 0xFF)
+    bytes_set(b, 2, (v >> 8) & 0xFF)
+    bytes_set(b, 3, v & 0xFF)
+    b

@@ -1,0 +1,163 @@
+// Independent adversarial probe for std/encoding/thrift's
+// thrift_decode_message truncation-error contract (RE-VERIFICATION of a
+// reported-fixed HIGH defect: a message truncated right after the 4-byte
+// version/type header must report ok=0, never fabricate name=""/seqid=0 as
+// a "successful" decode). This probe is written independently of the
+// existing thriftkat.nova KAT 12 and targets exact byte-boundary cases plus
+// a negative-name-length attack that KAT 12 does not cover.
+import std/encoding/thrift
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn main()
+    // ── Case A: empty buffer ─────────────────────────────────────────────
+    let empty = bytes_create(0)
+    let da = thrift_decode_message(empty)
+    cki("empty_buf_ok", da["ok"], 0)
+
+    // ── Case B: exactly 4 bytes (header only, valid VERSION_1|CALL) — the
+    // exact defect: previously ok=1 with fabricated name="", seqid=0.
+    let hdr4 = bytes_create(4)
+    bytes_set(hdr4, 0, 0x80)
+    bytes_set(hdr4, 1, 0x01)
+    bytes_set(hdr4, 2, 0x00)
+    bytes_set(hdr4, 3, 0x01)
+    let db = thrift_decode_message(hdr4)
+    cki("hdr4_only_ok", db["ok"], 0)
+    cks("hdr4_only_name_default", db["name"], "")
+    cki("hdr4_only_seqid_default", db["seqid"], 0)
+    cki("hdr4_only_fields_empty", len(db["fields"]), 0)
+
+    // ── Case C: exactly 7 bytes — one byte short of the 8 needed to safely
+    // read the 4-byte name-length prefix at offset 4.
+    let seven = bytes_create(7)
+    bytes_set(seven, 0, 0x80)
+    bytes_set(seven, 1, 0x01)
+    bytes_set(seven, 2, 0x00)
+    bytes_set(seven, 3, 0x01)
+    bytes_set(seven, 4, 0x00)
+    bytes_set(seven, 5, 0x00)
+    bytes_set(seven, 6, 0x00)
+    let dc = thrift_decode_message(seven)
+    cki("seven_bytes_ok", dc["ok"], 0)
+
+    // ── Case D: exactly 8 bytes with name_len=0 encoded — the prefix is
+    // fully present, but 0 name bytes + 4 seqid bytes still need 4 more
+    // bytes that are not there (name_end=8, need blen>=12).
+    let eight = bytes_create(8)
+    bytes_set(eight, 0, 0x80)
+    bytes_set(eight, 1, 0x01)
+    bytes_set(eight, 2, 0x00)
+    bytes_set(eight, 3, 0x01)
+    bytes_set(eight, 4, 0x00)
+    bytes_set(eight, 5, 0x00)
+    bytes_set(eight, 6, 0x00)
+    bytes_set(eight, 7, 0x00)
+    let dd = thrift_decode_message(eight)
+    cki("namelen_zero_no_seqid_ok", dd["ok"], 0)
+
+    // ── Case E: boundary — name_len=0, blen=11 (one byte short of the 12
+    // needed for name_end(8)+4 seqid bytes). Must still be ok=0 (off-by-one
+    // check on the `<` vs `<=` in `blen < name_end + 4`).
+    let eleven = bytes_create(11)
+    bytes_set(eleven, 0, 0x80)
+    bytes_set(eleven, 1, 0x01)
+    bytes_set(eleven, 2, 0x00)
+    bytes_set(eleven, 3, 0x01)
+    bytes_set(eleven, 4, 0x00)
+    bytes_set(eleven, 5, 0x00)
+    bytes_set(eleven, 6, 0x00)
+    bytes_set(eleven, 7, 0x00)
+    bytes_set(eleven, 8, 0x00)
+    bytes_set(eleven, 9, 0x00)
+    bytes_set(eleven, 10, 0x00)
+    let de = thrift_decode_message(eleven)
+    cki("namelen_zero_blen11_ok", de["ok"], 0)
+
+    // ── Case F: boundary — name_len=0, blen=12 exactly (name_end+4 == blen).
+    // This is the minimal COMPLETE message (empty name, seqid=0, no struct
+    // body / STOP byte). Must be ok=1 — the bounds check must not reject
+    // exactly-sufficient input, and the struct decode of 0 remaining bytes
+    // must not read out of bounds (thrift_decode_struct's `while cur<blen`
+    // guard covers pos==blen).
+    let twelve = bytes_create(12)
+    bytes_set(twelve, 0, 0x80)
+    bytes_set(twelve, 1, 0x01)
+    bytes_set(twelve, 2, 0x00)
+    bytes_set(twelve, 3, 0x03)
+    bytes_set(twelve, 4, 0x00)
+    bytes_set(twelve, 5, 0x00)
+    bytes_set(twelve, 6, 0x00)
+    bytes_set(twelve, 7, 0x00)
+    bytes_set(twelve, 8, 0x00)
+    bytes_set(twelve, 9, 0x00)
+    bytes_set(twelve, 10, 0x00)
+    bytes_set(twelve, 11, 0x2A)
+    let df = thrift_decode_message(twelve)
+    cki("namelen_zero_blen12_ok", df["ok"], 1)
+    cks("namelen_zero_blen12_name", df["name"], "")
+    cki("namelen_zero_blen12_seqid", df["seqid"], 42)
+    cki("namelen_zero_blen12_fields_empty", len(df["fields"]), 0)
+
+    // ── Case G: negative name_len attack — declares name_len = -1
+    // (0xFFFFFFFF) trying to make `blen < name_end + 4` wrap/pass via
+    // pointer arithmetic on a naive implementation. Must be rejected
+    // directly by the `name_len < 0` guard, not merely by the length
+    // check happening to also catch it.
+    let neg = bytes_create(8)
+    bytes_set(neg, 0, 0x80)
+    bytes_set(neg, 1, 0x01)
+    bytes_set(neg, 2, 0x00)
+    bytes_set(neg, 3, 0x01)
+    bytes_set(neg, 4, 0xFF)
+    bytes_set(neg, 5, 0xFF)
+    bytes_set(neg, 6, 0xFF)
+    bytes_set(neg, 7, 0xFF)
+    let dg = thrift_decode_message(neg)
+    cki("negative_namelen_ok", dg["ok"], 0)
+
+    // ── Case H: huge (but positive) name_len that vastly exceeds the actual
+    // buffer — must reject cleanly (not attempt to allocate/slice gigabytes
+    // or read out of bounds).
+    let huge = bytes_create(8)
+    bytes_set(huge, 0, 0x80)
+    bytes_set(huge, 1, 0x01)
+    bytes_set(huge, 2, 0x00)
+    bytes_set(huge, 3, 0x01)
+    bytes_set(huge, 4, 0x7F)
+    bytes_set(huge, 5, 0xFF)
+    bytes_set(huge, 6, 0xFF)
+    bytes_set(huge, 7, 0xFF)
+    let dh = thrift_decode_message(huge)
+    cki("huge_namelen_ok", dh["ok"], 0)
+
+    // ── Case I: wrong version tag with otherwise-plausible full message —
+    // must be rejected at the version check before any name/seqid parsing
+    // is even attempted (defense-in-depth: version check must dominate).
+    let fullmsg = thrift_encode_message("valid", tmt_call(), 1, [])
+    // corrupt the version's low byte (offset 1) so vtag != 0x8001.
+    bytes_set(fullmsg, 1, 0x02)
+    let di = thrift_decode_message(fullmsg)
+    cki("bad_version_full_len_ok", di["ok"], 0)
+
+    // ── Case J: sanity control — a genuinely complete, well-formed message
+    // must still decode correctly (the hardening must not have broken the
+    // happy path).
+    let good = thrift_encode_message("session_open", tmt_reply(), 4242, [thrift_field_string(1, "tok")])
+    let dj = thrift_decode_message(good)
+    cki("control_ok", dj["ok"], 1)
+    cks("control_name", dj["name"], "session_open")
+    cki("control_seqid", dj["seqid"], 4242)
+    cki("control_fields_len", len(dj["fields"]), 1)
+
+    print("thrift_msg_trunc_probe: ALL PASS")

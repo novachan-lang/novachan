@@ -1,0 +1,295 @@
+// ============================================================================
+// INDEPENDENT ADVERSARIAL PROBE — std/net/dns facade (dns.nova)
+// ============================================================================
+// Non-fatal diagnostic harness: every check prints PASS/FAIL and continues
+// (does not exit(1) on the first failure) so we get a full picture in one run.
+// ============================================================================
+import std/net/dns
+import std/net/dns_question
+import std/net/dns_header
+import std/net/dns_rr
+import std/net/dns_rdata_soa
+import std/net/dns_rdata_a
+import std/net/dns_rdata_txt
+
+let g_fail = [0]
+
+fn note_fail()
+    g_fail[0] = g_fail[0] + 1
+
+fn eqi(label: string, got: int, want: int)
+    if got == want
+        print("PASS " + label)
+    else
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        note_fail()
+
+fn eqs(label: string, got: string, want: string)
+    if got == want
+        print("PASS " + label)
+    else
+        print("FAIL " + label + ": got=[" + got + "] want=[" + want + "]")
+        note_fail()
+
+fn info(label: string, val: string)
+    print("INFO " + label + " = " + val)
+
+fn main()
+    // ── Probe 1: reserved length-byte pattern (0x40, 0b01xxxxxx) in an RR's
+    // owner NAME field. RFC 1035 length bytes must have top two bits == 00
+    // (label 0..63) or == 11 (pointer). Top bits 01/10 are RESERVED and MUST
+    // be treated as malformed. dns_question.nova's _dq_name_decode explicitly
+    // rejects this ("if (b0 & 0xC0) != 0: return error"); dns_rdata_mx.nova /
+    // dns_rdata_soa.nova / dns_name.nova reject it too (they check `b0 & 0xFF
+    // > 63`, which is true for 0x40). dns_rr.nova's _rr_name_decode instead
+    // does `llen = b0 & 0x3F` BEFORE checking anything — 0x40 & 0x3F == 0, so
+    // it is silently treated as a *terminator* (root name), consuming only
+    // 1 byte instead of being rejected. This desyncs the field offsets for
+    // TYPE/CLASS/TTL/RDLENGTH that follow (still bounds-safe, but wrong).
+    let m1 = bytes(0)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x09)   // id=9
+    m1 = bytes_append(m1, 0x80)
+    m1 = bytes_append(m1, 0x00)   // flags QR=1
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)   // qdcount=0
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x01)   // ancount=1
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    // RR at offset 12: NAME starts with reserved pattern 0x40 (should be REJECTED)
+    m1 = bytes_append(m1, 0x40)   // reserved length-byte (0b01000000)
+    m1 = bytes_append(m1, 0x41)
+    m1 = bytes_append(m1, 0x42)
+    m1 = bytes_append(m1, 0x43)
+    m1 = bytes_append(m1, 0x00)   // TYPE=A(1)
+    m1 = bytes_append(m1, 0x01)
+    m1 = bytes_append(m1, 0x00)   // CLASS=IN
+    m1 = bytes_append(m1, 0x01)
+    m1 = bytes_append(m1, 0x00)   // TTL
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x3C)
+    m1 = bytes_append(m1, 0x00)   // RDLENGTH=4
+    m1 = bytes_append(m1, 0x04)
+    m1 = bytes_append(m1, 1)
+    m1 = bytes_append(m1, 2)
+    m1 = bytes_append(m1, 3)
+    m1 = bytes_append(m1, 4)
+
+    let dec1 = dns_decode_message(m1)
+    let ans1 = dec1["answers"]
+    info("p1.answers.count", str(len(ans1)))
+    if len(ans1) > 0
+        let rec1 = ans1[0]
+        info("p1.name", rec1["name"])
+        info("p1.type", str(rec1["type"]))
+        // RFC-correct expectation: a reserved-pattern length byte is malformed
+        // and the RR (or at least the name) must be rejected, not silently
+        // reinterpreted as a root name with the remaining bytes shifted.
+        eqi("p1.reserved-length-byte should be REJECTED (name empty AND type NOT 0x4142)", rec1["type"], -999)
+    else
+        print("PASS p1.reserved-length-byte: RR safely rejected (no partial/garbled record surfaced)")
+
+    // ── Probe 2: 129-hop compression-pointer chain must be REJECTED (capped
+    // at 128), never loop/hang/crash.
+    let m2 = bytes(0)
+    // Build 130 two-byte pointer cells, cell i points to cell i+1, last cell
+    // points to itself's own offset+2 out of range intentionally would be
+    // caught by "cur>=mlen"; instead make a genuine self-referential loop:
+    // every pointer points to offset 0 (itself), which must terminate via
+    // the jump cap, not hang.
+    m2 = bytes_append(m2, 0xC0)
+    m2 = bytes_append(m2, 0x00)   // pointer to offset 0 == itself -> infinite loop unless capped
+    let name_res2 = dns_question_decode(m2, 0)
+    let rec2 = name_res2[0]
+    eqs("p2.self-referential-pointer-loop safely rejected", rec2["name"], "")
+    print("PASS p2.no-hang: reached this line, so the 128-jump cap terminated the loop")
+
+    // ── Probe 3: SOA (and by extension MX/NS/CNAME/PTR) typed-RDATA decoding
+    // does not respect the RR's declared RDLENGTH boundary — it is only
+    // bounded by the TOTAL message length. Build a SELF-CONSISTENT message
+    // (RDLENGTH matches actual bytes present, so RR-level framing/position
+    // tracking is honest) where RR#1 is a SOA whose RDLENGTH is only 5 bytes
+    // (too short to hold even one real domain name + 5 u32s), followed by
+    // RR#2 (a real A record) and some trailing padding so there are enough
+    // TOTAL bytes in the message for dns_soa_decode to read past RR#1's own
+    // 5-byte RDATA window into RR#2's raw bytes and beyond, without erroring.
+    let m3 = bytes(0)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x0A)   // id=10
+    m3 = bytes_append(m3, 0x80)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)   // qdcount=0
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x02)   // ancount=2 (SOA with a too-short-but-honest rdlength, then a real A record)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    // RR#1: SOA, RDLENGTH=5, and EXACTLY 5 bytes of RDATA present (honest framing).
+    // The 5 bytes: 0x00 (root MNAME) 0x00 (root RNAME) + 3 stray bytes — nowhere
+    // near enough for 5 real u32 fields, so a spec-conformant decoder MUST NOT
+    // be able to produce a "successful" SOA record from this RR at all.
+    m3 = bytes_append(m3, 0x00)   // NAME = root
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x06)   // TYPE=SOA
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x01)   // CLASS=IN
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x3C)   // TTL=60
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x05)   // RDLENGTH = 5 (matches what actually follows)
+    m3 = bytes_append(m3, 0x00)   // RDATA byte0: root MNAME
+    m3 = bytes_append(m3, 0x00)   // RDATA byte1: root RNAME
+    m3 = bytes_append(m3, 0xAA)   // RDATA byte2..4: 3 stray bytes (not a full u32 set)
+    m3 = bytes_append(m3, 0xBB)
+    m3 = bytes_append(m3, 0xCC)
+    // RR#2: a real, correctly-framed A record right after RR#1's declared 5 bytes.
+    m3 = bytes_append(m3, 0x00)   // NAME = root
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x01)   // TYPE=A
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x01)   // CLASS=IN
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x3C)   // TTL=60
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x04)   // RDLENGTH=4
+    m3 = bytes_append(m3, 9)
+    m3 = bytes_append(m3, 9)
+    m3 = bytes_append(m3, 9)
+    m3 = bytes_append(m3, 9)
+    // Trailing padding so dns_soa_decode has enough TOTAL bytes to complete
+    // an (incorrect) 20-byte numeric read past RR#1's true boundary.
+    let pad3 = 0
+    while pad3 < 30
+        m3 = bytes_append(m3, 0xEE)
+        pad3 = pad3 + 1
+
+    let dec3 = dns_decode_message(m3)
+    let ans3 = dec3["answers"]
+    eqi("p3.answers.count (RR-level framing driven by RDLENGTH, not by typed decoder)", len(ans3), 2)
+    if len(ans3) == 2
+        eqi("p3.rr0.rdlength (raw framing honest, matches declared 5)", ans3[0]["rdlength"], 5)
+        let a_typed3 = ans3[1]["rdata_typed"]
+        eqs("p3.rr1(A after short-rdlength SOA).rdata_typed (proves RR2 not corrupted)", a_typed3, "9.9.9.9")
+        let soa_typed3 = ans3[0]["rdata_typed"]
+        info("p3.rr0.rdata_typed_is_dict(5-byte RDLENGTH cannot legitimately hold a SOA)", str(is_dict(soa_typed3)))
+        if is_dict(soa_typed3)
+            info("p3.rr0.soa_typed.mname (built from only 2 of the 5 declared RDATA bytes)", soa_typed3["mname"])
+            info("p3.rr0.soa_typed.serial (READS PAST the 5-byte RDLENGTH into RR#2's raw bytes+padding)", str(soa_typed3["serial"]))
+            info("p3.rr0.soa_typed.minimum (last u32 — proves the full 20-byte numeric block was read from foreign bytes)", str(soa_typed3["minimum"]))
+
+    // ── Probe 4: binary-safe TXT round-trip incl. embedded 0x00 and control
+    // bytes — a control char in one TXT character-string must not merge with
+    // or inject a second character-string.
+    let txt_bin = bytes(0)
+    txt_bin = bytes_append(txt_bin, 3)
+    txt_bin = bytes_append(txt_bin, 0x41)
+    txt_bin = bytes_append(txt_bin, 0x00)   // embedded NUL byte inside a TXT string
+    txt_bin = bytes_append(txt_bin, 0x42)
+    let txt_dec = dns_txt_decode(txt_bin)
+    eqi("p4.txt.count", len(txt_dec), 1)
+    if len(txt_dec) == 1
+        info("p4.txt[0].len(may truncate at embedded NUL per NOVA string semantics)", str(len(txt_dec[0])))
+
+    // ── Probe 5: label-length boundary — exactly 63 bytes must be ACCEPTED,
+    // 64 must be REJECTED (never exit).
+    let lbl63 = ""
+    let i5 = 0
+    while i5 < 63
+        lbl63 = lbl63 + "a"
+        i5 = i5 + 1
+    let lbl64 = lbl63 + "a"
+    let q63 = dns_question_encode(lbl63 + ".com", 1, 1)
+    eqi("p5.label63.accepted", bytes_len(q63), 63 + 1 + 4 + 5)
+    let q64 = dns_question_encode(lbl64 + ".com", 1, 1)
+    eqi("p5.label64.rejected", bytes_len(q64), 0)
+    print("PASS p5.no-exit: reached this line after both boundary encodes")
+
+    // ── Probe 6: header round-trip at the full u16 boundary values.
+    let hdr6 = {"id": 0xFFFF, "qr": 1, "opcode": 15, "aa": 1, "tc": 1, "rd": 1, "ra": 1, "rcode": 15, "qdcount": 0xFFFF, "ancount": 0xFFFF, "nscount": 0xFFFF, "arcount": 0xFFFF}
+    let w6 = dns_header_encode(hdr6)
+    let d6 = dns_header_decode(w6, 0)
+    let h6 = d6[0]
+    eqi("p6.id.max", h6["id"], 0xFFFF)
+    eqi("p6.qdcount.max", h6["qdcount"], 0xFFFF)
+    eqi("p6.ancount.max", h6["ancount"], 0xFFFF)
+
+    // ── Probe 7: header claims ancount=0xFFFF but the buffer ends right
+    // after the header — must terminate immediately, not hang/loop 65535
+    // times, and must not crash.
+    let m7 = bytes(0)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x0B)
+    m7 = bytes_append(m7, 0x80)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0xFF)
+    m7 = bytes_append(m7, 0xFF)   // ancount = 65535, but zero bytes follow
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    let dec7 = dns_decode_message(m7)
+    eqi("p7.huge-ancount-no-data.answers", len(dec7["answers"]), 0)
+    print("PASS p7.no-hang: huge ancount with truncated buffer returned promptly")
+
+    // ── Probe 8: sub-header-length buffers (0..11 bytes) never crash.
+    let k8 = 0
+    let sum8 = 0
+    while k8 <= 11
+        let mm8 = bytes_slice(m1, 0, k8)
+        let dd8 = dns_decode_message(mm8)
+        sum8 = sum8 + len(dd8["answers"])
+        k8 = k8 + 1
+    eqi("p8.no-crash.answers-always-empty(truncated<12)", sum8, 0)
+
+    // ── Probe 9: control character embedded in a domain label must NOT be
+    // interpretable as a second label / frame boundary (length-prefixed
+    // wire format, not delimiter-based — a literal 0x2E "." byte inside a
+    // decoded label range must stay opaque data, not re-split the name).
+    // craft a label containing a raw '.' byte (0x2E) INSIDE the wire label
+    // content directly (bypassing the string-splitting encoder) to check the
+    // DECODER treats it as opaque data, not a structural delimiter.
+    let m9 = bytes(0)
+    m9 = bytes_append(m9, 3)
+    m9 = bytes_append(m9, 0x61)   // 'a'
+    m9 = bytes_append(m9, 0x2E)   // '.' embedded INSIDE a 3-byte label
+    m9 = bytes_append(m9, 0x62)   // 'b'
+    m9 = bytes_append(m9, 0)      // terminator
+    m9 = bytes_append(m9, 0x00)
+    m9 = bytes_append(m9, 0x01)   // QTYPE=A
+    m9 = bytes_append(m9, 0x00)
+    m9 = bytes_append(m9, 0x01)   // QCLASS=IN
+    let q9 = dns_question_decode(m9, 0)
+    let rec9 = q9[0]
+    info("p9.decoded.name", rec9["name"])
+    // Re-encode the decoded name and compare wire bytes to the ORIGINAL wire
+    // bytes. If the textual dotted representation is lossy (a single 3-byte
+    // label containing a literal '.' is indistinguishable from two 1-byte
+    // labels "a" and "b"), the round trip will silently change the wire
+    // structure (label count/boundaries), not just cosmetically.
+    let requeue9 = dns_question_encode(rec9["name"], 1, 1)
+    let orig_qbytes9 = bytes_slice(m9, 0, 9)
+    eqi("p9.requeue.len", bytes_len(requeue9), bytes_len(orig_qbytes9))
+    let same9 = true
+    let ci9 = 0
+    while ci9 < bytes_len(orig_qbytes9)
+        if bytes_get(requeue9, ci9) != bytes_get(orig_qbytes9, ci9)
+            same9 = false
+        ci9 = ci9 + 1
+    if same9
+        print("PASS p9.roundtrip.wire-bytes-identical (single label w/ literal dot preserved)")
+    else
+        print("FYI p9.roundtrip.wire-bytes-DIFFER: embedded '.' inside a label is textually indistinguishable from a label boundary (single 3-byte label 'a.b' re-encodes as two 1-byte labels) -- NOT memory-unsafe, but the string round-trip does not preserve original wire framing for labels containing a literal dot byte")
+
+    print("DONE adv_dns_facade_verify fail_count=" + str(g_fail[0]))

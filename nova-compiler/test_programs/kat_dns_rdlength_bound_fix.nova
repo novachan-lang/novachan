@@ -1,0 +1,285 @@
+// ============================================================================
+// KAT for std/net/dns — RDLENGTH-window + reserved-NAME-byte + binary-safe
+// TXT fix verification (FIX TASK: std/net/dns).
+// ============================================================================
+// Proves three previously-confirmed defects are gone:
+//   (1) HIGH:   typed RDATA decoders (SOA/MX/NS/CNAME/PTR) were bounded only
+//               by the total message length, not by the RR's own RDLENGTH —
+//               a too-small RDLENGTH let them read past their own RDATA
+//               window and fabricate a plausible record from a following
+//               RR's bytes / trailing padding. Fixed via
+//               dns_soa_decode_bounded / dns_mx_decode / dns_name_rdata_decode_bounded
+//               all enforcing [rdata_start, rdata_start+rdlength).
+//   (2) MEDIUM: dns_rr.nova's owner-NAME decoder masked the length byte to
+//               6 bits BEFORE checking the reserved 0x40..0xBF pattern, so a
+//               reserved byte was silently treated as a root-name terminator
+//               and desynced every following field. Fixed by checking
+//               (b0 & 0xC0) != 0 BEFORE masking (mirrors dns_question.nova),
+//               plus dns_rr_decode now rejects a NAME decode that failed to
+//               advance at all instead of misparsing TYPE/CLASS/TTL/RDLENGTH
+//               from the still-unconsumed NAME bytes.
+//   (3) MEDIUM: dns_txt_decode returned each TXT character-string as a NOVA
+//               `string`, which NUL-truncates binary content. Fixed by
+//               returning `bytes` per character-string (binary-safe).
+// ============================================================================
+import std/net/dns
+import std/net/dns_question
+import std/net/dns_header
+import std/net/dns_rdata_soa
+import std/net/dns_rdata_txt
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        exit(1)
+
+fn ckb_byte(label: string, b: bytes, i: int, want: int)
+    let got = bytes_get(b, i)
+    if got != want
+        print("FAIL " + label + " byte[" + str(i) + "]: got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn main()
+    // ── (1) SOA RR whose RDLENGTH is too small for a real SOA record ────────
+    // header: qdcount=0, ancount=2 — RR#1 is a SOA with an HONEST RDLENGTH=5
+    // (matches the actual byte count present: not remotely enough for two
+    // domain names + five u32 fields), followed immediately by RR#2, a real
+    // A record, then generous trailing padding. Before the fix,
+    // dns_soa_decode (unbounded) would read straight through RR#2's bytes
+    // and the padding to fabricate a full 20-byte numeric SOA tail from
+    // foreign data. After the fix, RR#1's rdata_typed must be an EMPTY dict
+    // (malformed — rejected, never fabricated) and RR#2 must decode exactly
+    // as if RR#1 had never been touched (proving the bound didn't leak).
+    let m1 = bytes(0)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x64)   // id=0x0064
+    m1 = bytes_append(m1, 0x80)
+    m1 = bytes_append(m1, 0x00)   // flags QR=1
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)   // qdcount=0
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x02)   // ancount=2
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    // RR#1: SOA, RDLENGTH=5 (honest — exactly 5 bytes of RDATA follow)
+    m1 = bytes_append(m1, 0x00)   // NAME = root
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x06)   // TYPE=SOA(6)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x01)   // CLASS=IN
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x3C)   // TTL=60
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x05)   // RDLENGTH=5
+    m1 = bytes_append(m1, 0x00)   // RDATA byte0: root MNAME
+    m1 = bytes_append(m1, 0x00)   // RDATA byte1: root RNAME
+    m1 = bytes_append(m1, 0xAA)   // RDATA byte2..4: 3 stray bytes
+    m1 = bytes_append(m1, 0xBB)
+    m1 = bytes_append(m1, 0xCC)
+    // RR#2: real A record right after RR#1's declared 5 bytes
+    m1 = bytes_append(m1, 0x00)   // NAME = root
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x01)   // TYPE=A(1)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x01)   // CLASS=IN
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x3C)   // TTL=60
+    m1 = bytes_append(m1, 0x00)
+    m1 = bytes_append(m1, 0x04)   // RDLENGTH=4
+    m1 = bytes_append(m1, 9)
+    m1 = bytes_append(m1, 9)
+    m1 = bytes_append(m1, 9)
+    m1 = bytes_append(m1, 9)
+    // Generous trailing padding — enough TOTAL message bytes for an
+    // unbounded decoder to complete a fabricated 20-byte numeric read.
+    let pad = 0
+    while pad < 30
+        m1 = bytes_append(m1, 0xEE)
+        pad = pad + 1
+
+    let dec1 = dns_decode_message(m1)
+    let ans1 = dec1["answers"]
+    cki("soa.rdlbound.answers.count", len(ans1), 2)
+    cki("soa.rdlbound.rr0.rdlength", ans1[0]["rdlength"], 5)
+    let soa_typed = ans1[0]["rdata_typed"]
+    cki("soa.rdlbound.rr0.rdata_typed.rejected(no serial key)", contains(soa_typed, "serial"), 0)
+    cki("soa.rdlbound.rr0.rdata_typed.rejected(no mname key)", contains(soa_typed, "mname"), 0)
+    // RR#2 must be completely unaffected by RR#1's malformed RDATA.
+    let a_typed = ans1[1]["rdata_typed"]
+    cks("soa.rdlbound.rr1.uncorrupted", a_typed, "9.9.9.9")
+
+    // Direct leaf-level proof: dns_soa_decode_bounded itself rejects the
+    // too-small window (rdata_start=12, rdlength=5) without needing the
+    // full-message facade.
+    let direct_soa = dns_soa_decode_bounded(m1, 12, 5)
+    let direct_soa_rec = direct_soa[0]
+    cki("soa.rdlbound.direct.rejected(no serial key)", contains(direct_soa_rec, "serial"), 0)
+    cki("soa.rdlbound.direct.next_pos_unchanged", direct_soa[1], 12)
+
+    // Sanity: a HONEST RDLENGTH (real, full-size SOA) still decodes fully —
+    // proves the bound rejects only genuinely-too-small windows, not valid
+    // records (no regression to the happy path).
+    let real_soa_rdata = dns_soa_encode("ns.example.com", "root.example.com", 2024010101, 7200, 3600, 1209600, 3600)
+    let real_soa_len = bytes_len(real_soa_rdata)
+    let wrapped = bytes(0)
+    wrapped = bytes_concat(wrapped, real_soa_rdata)
+    let ok_soa = dns_soa_decode_bounded(wrapped, 0, real_soa_len)
+    let ok_soa_rec = ok_soa[0]
+    cks("soa.rdlbound.honest.mname", ok_soa_rec["mname"], "ns.example.com")
+    cki("soa.rdlbound.honest.serial", ok_soa_rec["serial"], 2024010101)
+    cki("soa.rdlbound.honest.next_pos", ok_soa[1], real_soa_len)
+
+    // ── (2) NAME starting with a reserved length-byte pattern (0x40) ────────
+    // Top two bits == 01 (reserved, RFC 1035 §4.1.4 only defines 00=label
+    // and 11=pointer) MUST be rejected, not silently reinterpreted as a
+    // zero-length root-name terminator (0x40 & 0x3F == 0).
+    let m2 = bytes(0)
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x65)   // id=0x0065
+    m2 = bytes_append(m2, 0x80)
+    m2 = bytes_append(m2, 0x00)   // flags QR=1
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x00)   // qdcount=0
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x01)   // ancount=1
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x00)
+    // RR at offset 12: NAME begins with reserved pattern 0x40 (0b01000000)
+    m2 = bytes_append(m2, 0x40)
+    m2 = bytes_append(m2, 0x41)
+    m2 = bytes_append(m2, 0x42)
+    m2 = bytes_append(m2, 0x43)
+    m2 = bytes_append(m2, 0x00)   // TYPE=A(1)
+    m2 = bytes_append(m2, 0x01)
+    m2 = bytes_append(m2, 0x00)   // CLASS=IN
+    m2 = bytes_append(m2, 0x01)
+    m2 = bytes_append(m2, 0x00)   // TTL
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x00)
+    m2 = bytes_append(m2, 0x3C)
+    m2 = bytes_append(m2, 0x00)   // RDLENGTH=4
+    m2 = bytes_append(m2, 0x04)
+    m2 = bytes_append(m2, 1)
+    m2 = bytes_append(m2, 2)
+    m2 = bytes_append(m2, 3)
+    m2 = bytes_append(m2, 4)
+
+    let dec2 = dns_decode_message(m2)
+    let ans2 = dec2["answers"]
+    // The whole RR must be safely dropped — never surfaced with a garbled
+    // name/type/rdlength read starting mid-NAME.
+    cki("name.reserved.rejected.answers.count", len(ans2), 0)
+
+    // A NAME beginning with the OTHER reserved pattern (0x80, top bits 10)
+    // must be rejected the same way.
+    let m2c = bytes(0)
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x67)   // id=0x0067
+    m2c = bytes_append(m2c, 0x80)
+    m2c = bytes_append(m2c, 0x00)   // flags QR=1
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x00)   // qdcount=0
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x01)   // ancount=1
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x00)
+    // RR at offset 12: NAME begins with reserved pattern 0x80 (0b10000000)
+    m2c = bytes_append(m2c, 0x80)
+    m2c = bytes_append(m2c, 0x41)
+    m2c = bytes_append(m2c, 0x42)
+    m2c = bytes_append(m2c, 0x43)
+    m2c = bytes_append(m2c, 0x00)   // TYPE=A(1)
+    m2c = bytes_append(m2c, 0x01)
+    m2c = bytes_append(m2c, 0x00)   // CLASS=IN
+    m2c = bytes_append(m2c, 0x01)
+    m2c = bytes_append(m2c, 0x00)   // TTL
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x00)
+    m2c = bytes_append(m2c, 0x3C)
+    m2c = bytes_append(m2c, 0x00)   // RDLENGTH=4
+    m2c = bytes_append(m2c, 0x04)
+    m2c = bytes_append(m2c, 1)
+    m2c = bytes_append(m2c, 2)
+    m2c = bytes_append(m2c, 3)
+    m2c = bytes_append(m2c, 4)
+    let dec2c = dns_decode_message(m2c)
+    let ans2c = dec2c["answers"]
+    cki("name.reserved80.rejected.answers.count", len(ans2c), 0)
+
+    // ── (3) TXT record with an embedded 0x00 round-trips fully ──────────────
+    // Direct leaf-level proof (binary-safe dns_txt_decode).
+    let txt_bin = bytes(0)
+    txt_bin = bytes_append(txt_bin, 5)      // length=5
+    txt_bin = bytes_append(txt_bin, 0x41)   // 'A'
+    txt_bin = bytes_append(txt_bin, 0x00)   // embedded NUL
+    txt_bin = bytes_append(txt_bin, 0x42)   // 'B'
+    txt_bin = bytes_append(txt_bin, 0x00)   // embedded NUL
+    txt_bin = bytes_append(txt_bin, 0x43)   // 'C'
+    let txt_dec = dns_txt_decode(txt_bin)
+    cki("txt.nul.count", len(txt_dec), 1)
+    let txt_elem = txt_dec[0]
+    cki("txt.nul.len", bytes_len(txt_elem), 5)
+    ckb_byte("txt.nul", txt_elem, 0, 0x41)
+    ckb_byte("txt.nul", txt_elem, 1, 0x00)
+    ckb_byte("txt.nul", txt_elem, 2, 0x42)
+    ckb_byte("txt.nul", txt_elem, 3, 0x00)
+    ckb_byte("txt.nul", txt_elem, 4, 0x43)
+
+    // Full-message facade proof: TXT RR's rdata_typed (via dns_decode_message)
+    // carries the embedded NUL through intact too.
+    let m3 = bytes(0)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x66)   // id=0x0066
+    m3 = bytes_append(m3, 0x80)
+    m3 = bytes_append(m3, 0x00)   // flags QR=1
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)   // qdcount=0
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x01)   // ancount=1
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)   // NAME = root
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x10)   // TYPE=TXT(16)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x01)   // CLASS=IN
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x00)
+    m3 = bytes_append(m3, 0x3C)   // TTL=60
+    let txt_rdlen = bytes_len(txt_bin)
+    m3 = bytes_append(m3, (txt_rdlen >> 8) & 0xFF)
+    m3 = bytes_append(m3, txt_rdlen & 0xFF)   // RDLENGTH
+    m3 = bytes_concat(m3, txt_bin)
+
+    let dec3 = dns_decode_message(m3)
+    let ans3 = dec3["answers"]
+    cki("txt.facade.answers.count", len(ans3), 1)
+    let facade_typed = ans3[0]["rdata_typed"]
+    cki("txt.facade.typed.count", len(facade_typed), 1)
+    let facade_elem = facade_typed[0]
+    cki("txt.facade.typed.len", bytes_len(facade_elem), 5)
+    ckb_byte("txt.facade", facade_elem, 0, 0x41)
+    ckb_byte("txt.facade", facade_elem, 1, 0x00)
+    ckb_byte("txt.facade", facade_elem, 2, 0x42)
+    ckb_byte("txt.facade", facade_elem, 3, 0x00)
+    ckb_byte("txt.facade", facade_elem, 4, 0x43)
+
+    print("PASS dns_rdlength_bound_fix")

@@ -1,0 +1,334 @@
+// ============================================================================
+// INDEPENDENT ADVERSARIAL RE-VERIFICATION PROBE — std/net/dns
+// ============================================================================
+// Written from scratch (not derived from the fixer's own KAT/adversarial
+// files) to independently re-derive and attack the three claimed defects:
+//   (1) HIGH: typed RDATA decoders bounded only by total message length,
+//       not by the RR's own RDLENGTH -- attacked here for MX (type 15) and
+//       CNAME (type 5, via the shared NAME-rdata bounded decoder), which the
+//       fixer's own kat_dns_rdlength_bound_fix.nova did NOT cover (it only
+//       exercised SOA). Also attacks the "boundary off by one" case: a name
+//       whose local decode would finish exactly ONE byte past the declared
+//       RDLENGTH.
+//   (2) MEDIUM: dns_rr.nova NAME decoder must reject reserved length-byte
+//       patterns (0x40..0xBF) BEFORE masking -- attacked here with the
+//       reserved byte appearing as the SECOND label (after one valid label),
+//       not just as the very first byte (which is all the fixer's own tests
+//       exercised), and via a direct call to the leaf module (not just the
+//       full-message facade) to pin down exactly which layer rejects it.
+//   (3) MEDIUM: TXT character-strings must be `bytes`, not `string` -- this
+//       probe asserts the runtime TYPE via type_of(), not merely that the
+//       byte VALUES survive, since a "string that happens to still have the
+//       right length in this NOVA build" would not actually prove the type
+//       was fixed.
+// Also probes a case NOT mentioned in the fix report: an RDLENGTH-bounded
+// name that legitimately uses a COMPRESSION POINTER to a name whose target
+// lies entirely outside the RDATA window (into the message's own Question
+// section, which is copy-book legal per RFC 1035 -- pointer targets are not
+// required to lie inside the pointing record's own RDATA) -- this must still
+// be ACCEPTED (bounding must only constrain LOCAL/non-jumped bytes).
+//
+// Harness style: non-fatal, tallies failures, prints DONE with fail_count so
+// _run1.ps1's PASS/exit=0 gate plus a grep for fail_count=0 both confirm.
+// ============================================================================
+import std/net/dns
+import std/net/dns_rr
+import std/net/dns_rdata_mx
+import std/net/dns_rdata_txt
+import std/net/dns_question
+import std/net/dns_header
+
+let g_fail = [0]
+
+fn note_fail()
+    g_fail[0] = g_fail[0] + 1
+
+fn eqi(label: string, got: int, want: int)
+    if got == want
+        print("PASS " + label)
+    else
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        note_fail()
+
+fn eqs(label: string, got: string, want: string)
+    if got == want
+        print("PASS " + label)
+    else
+        print("FAIL " + label + ": got=[" + got + "] want=[" + want + "]")
+        note_fail()
+
+fn eqb(label: string, got: bytes, want: bytes)
+    let n1 = bytes_len(got)
+    let n2 = bytes_len(want)
+    if n1 != n2
+        print("FAIL " + label + ": len got=" + str(n1) + " want=" + str(n2))
+        note_fail()
+        return
+    let i = 0
+    let same = true
+    while i < n1
+        if bytes_get(got, i) != bytes_get(want, i)
+            same = false
+        i = i + 1
+    if same
+        print("PASS " + label)
+    else
+        print("FAIL " + label + ": byte mismatch")
+        note_fail()
+
+// Append a big-endian u16 to out.
+fn u16(out: bytes, v: int) -> bytes
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Build a 12-byte header: QR=1, all counts as given.
+fn hdr(id: int, ancount: int) -> bytes
+    let m = bytes(0)
+    m = u16(m, id)
+    m = bytes_append(m, 0x80)
+    m = bytes_append(m, 0x00)
+    m = u16(m, 0)          // qdcount
+    m = u16(m, ancount)    // ancount
+    m = u16(m, 0)          // nscount
+    m = u16(m, 0)          // arcount
+    m
+
+// A root-owner RR header (NAME=root) up to and including RDLENGTH, given
+// type and rdlength; caller appends rdata bytes after.
+fn rr_head(rtype: int, rdlength: int) -> bytes
+    let m = bytes(0)
+    m = bytes_append(m, 0x00)      // NAME = root
+    m = u16(m, rtype)
+    m = u16(m, 1)                  // CLASS=IN
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x3C)      // TTL=60
+    m = u16(m, rdlength)
+    m
+
+fn a_record() -> bytes
+    let m = rr_head(1, 4)
+    m = bytes_append(m, 9)
+    m = bytes_append(m, 9)
+    m = bytes_append(m, 9)
+    m = bytes_append(m, 9)
+    m
+
+fn pad(n: int) -> bytes
+    let m = bytes(0)
+    let i = 0
+    while i < n
+        m = bytes_append(m, 0xEE)
+        i = i + 1
+    m
+
+fn main()
+    // ── (1a) MX: RDLENGTH one byte short of the real encoded size ───────────
+    // exchange="ab" -> name wire = [2,'a','b',0] (4 bytes). Full MX rdata =
+    // 2(pref) + 4(name) = 6 bytes. Declare RDLENGTH=5 (missing the
+    // terminating 0x00) so the honest local name decode cannot complete
+    // inside the declared window, followed by a real A RR + padding so an
+    // unbounded decoder WOULD have enough total bytes to fabricate a result.
+    let mx_rdata_full = dns_mx_encode(7, "ab")
+    eqi("setup.mx_rdata_full.len==6", bytes_len(mx_rdata_full), 6)
+    let m1 = hdr(1, 2)
+    m1 = bytes_concat(m1, rr_head(15, 5))          // MX, RDLENGTH=5 (short by 1)
+    m1 = bytes_concat(m1, bytes_slice(mx_rdata_full, 0, 5))  // only first 5 bytes present
+    m1 = bytes_concat(m1, a_record())
+    m1 = bytes_concat(m1, pad(20))
+    let dec1 = dns_decode_message(m1)
+    let ans1 = dec1["answers"]
+    eqi("mx.short_rdlength.answers.count", len(ans1), 2)
+    if len(ans1) == 2
+        let mx_typed = ans1[0]["rdata_typed"]
+        eqi("mx.short_rdlength.rejected.pref==0", mx_typed["pref"], 0)
+        eqs("mx.short_rdlength.rejected.exchange==empty", mx_typed["exchange"], "")
+        let a_typed1 = ans1[1]["rdata_typed"]
+        eqs("mx.short_rdlength.rr2_uncorrupted", a_typed1, "9.9.9.9")
+    // Direct leaf-level confirmation, isolating dns_mx_decode from the facade.
+    let direct_mx = dns_mx_decode(m1, 12 + 11, 5)
+    let direct_mx_rec = direct_mx[0]
+    eqi("mx.short_rdlength.direct.pref==0", direct_mx_rec["pref"], 0)
+    eqi("mx.short_rdlength.direct.next_pos_unchanged", direct_mx[1], 12 + 11)
+    // Sanity: the FULL honest RDLENGTH=6 must decode correctly (no
+    // regression on the happy path / off-by-one in the other direction).
+    let mok = hdr(1, 1)
+    mok = bytes_concat(mok, rr_head(15, 6))
+    mok = bytes_concat(mok, mx_rdata_full)
+    let decok = dns_decode_message(mok)
+    let ansok = decok["answers"]
+    eqi("mx.honest_rdlength.answers.count", len(ansok), 1)
+    if len(ansok) == 1
+        let okt = ansok[0]["rdata_typed"]
+        eqi("mx.honest_rdlength.pref", okt["pref"], 7)
+        eqs("mx.honest_rdlength.exchange", okt["exchange"], "ab")
+
+    // ── (1b) CNAME (type 5): RDLENGTH one byte short ────────────────────────
+    let cname_full = dns_name_rdata_encode("ab")   // [2,'a','b',0] = 4 bytes
+    eqi("setup.cname_full.len==4", bytes_len(cname_full), 4)
+    let m2 = hdr(2, 2)
+    m2 = bytes_concat(m2, rr_head(5, 3))           // CNAME, RDLENGTH=3 (short by 1)
+    m2 = bytes_concat(m2, bytes_slice(cname_full, 0, 3))
+    m2 = bytes_concat(m2, a_record())
+    m2 = bytes_concat(m2, pad(20))
+    let dec2 = dns_decode_message(m2)
+    let ans2 = dec2["answers"]
+    eqi("cname.short_rdlength.answers.count", len(ans2), 2)
+    if len(ans2) == 2
+        let cn_typed = ans2[0]["rdata_typed"]
+        eqs("cname.short_rdlength.rejected.empty_string", cn_typed, "")
+        let a_typed2 = ans2[1]["rdata_typed"]
+        eqs("cname.short_rdlength.rr2_uncorrupted", a_typed2, "9.9.9.9")
+
+    // ── (1c) Compression pointer INTO the Question section (legal, and lies
+    // entirely OUTSIDE the pointing RR's own RDATA window) must still be
+    // ACCEPTED by the bounded decoder -- proves the fix bounds only the
+    // LOCAL (non-jumped) byte consumption, not the jump target, matching
+    // RFC 1035 §4.1.4 (pointers may reference any prior offset in the
+    // message, and after a jump the "used bytes" counter for the *local*
+    // stream is exactly the pointer's 2 bytes).
+    let m3 = bytes(0)
+    m3 = hdr(3, 1)
+    // Question: qname="zz" (single label), QTYPE=A, QCLASS=IN, starting at
+    // offset 12.
+    let qenc3 = dns_question_encode("zz", 1, 1)
+    m3 = bytes_concat(m3, qenc3)
+    // header claims qdcount=0 above (we only cared about ancount) but we
+    // still physically wrote a question record before the RR so the pointer
+    // target at offset 12 is valid decodable name data ("zz").
+    let rr3_start = bytes_len(m3)
+    m3 = bytes_concat(m3, rr_head(5, 2))    // CNAME, RDLENGTH=2 (just a pointer)
+    m3 = bytes_append(m3, 0xC0)
+    m3 = bytes_append(m3, 0x0C)             // pointer -> offset 12 ("zz")
+    // qdcount in header is 0 so dns_decode_message won't parse "questions",
+    // but the RR section starts right after the header (pos=12) per our
+    // hdr() + manual layout -- so we must decode starting where we placed
+    // the RR, not rely on the facade's own qdcount-driven pos. Directly
+    // exercise the bounded decoder instead, which is the actual unit under
+    // test for the RDLENGTH-window fix.
+    let direct_ptr = dns_name_rdata_decode_bounded(m3, rr3_start + 11, 2)
+    eqs("cname.pointer_outside_window.accepted.name", direct_ptr[0], "zz")
+    eqi("cname.pointer_outside_window.next_pos", direct_ptr[1], rr3_start + 11 + 2)
+
+    // ── (2a) Reserved length byte (0x40) as the SECOND label, after one
+    // valid label -- not just as the very first NAME byte. Must be rejected
+    // by the leaf decoder AND the whole RR dropped by dns_rr_decode (not
+    // misparsed from a resynced offset).
+    let name_mid = bytes(0)
+    name_mid = bytes_append(name_mid, 3)
+    name_mid = bytes_append(name_mid, 0x61)  // 'a'
+    name_mid = bytes_append(name_mid, 0x62)  // 'b'
+    name_mid = bytes_append(name_mid, 0x63)  // 'c'
+    name_mid = bytes_append(name_mid, 0x40)  // reserved length byte (2nd label)
+    name_mid = bytes_append(name_mid, 0x78)
+    name_mid = bytes_append(name_mid, 0x79)
+    name_mid = bytes_append(name_mid, 0x7A)
+    name_mid = bytes_append(name_mid, 0x00)
+    let m4 = hdr(4, 1)
+    let rr4_start = bytes_len(m4)
+    m4 = bytes_concat(m4, name_mid)
+    m4 = u16(m4, 1)     // TYPE=A
+    m4 = u16(m4, 1)     // CLASS=IN
+    m4 = bytes_append(m4, 0x00)
+    m4 = bytes_append(m4, 0x00)
+    m4 = bytes_append(m4, 0x00)
+    m4 = bytes_append(m4, 0x3C)
+    m4 = u16(m4, 4)
+    m4 = bytes_append(m4, 1)
+    m4 = bytes_append(m4, 2)
+    m4 = bytes_append(m4, 3)
+    m4 = bytes_append(m4, 4)
+    // Direct leaf call: dns_rr_decode must reject the ENTIRE RR (next_pos
+    // unchanged), not just silently emit a truncated/garbled name.
+    let direct_rr4 = dns_rr_decode(m4, rr4_start)
+    let direct_rr4_rec = direct_rr4[0]
+    eqi("name.mid_reserved.direct_rr.next_pos_unchanged", direct_rr4[1], rr4_start)
+    eqi("name.mid_reserved.direct_rr.empty_dict(no name key)", contains(direct_rr4_rec, "name"), 0)
+    // Full-message facade: RR must be dropped entirely (no garbled partial
+    // record surfaced with e.g. name="abc" and misparsed type/rdata).
+    let dec4 = dns_decode_message(m4)
+    eqi("name.mid_reserved.facade.answers.count", len(dec4["answers"]), 0)
+
+    // ── (2b) Sanity: reserved-pattern check does not false-positive on a
+    // legitimate max-length label (llen=63, top bits correctly 00).
+    let lbl63 = bytes(0)
+    lbl63 = bytes_append(lbl63, 63)
+    let ci = 0
+    while ci < 63
+        lbl63 = bytes_append(lbl63, 0x61)
+        ci = ci + 1
+    lbl63 = bytes_append(lbl63, 0)
+    let rr5 = _rr_probe_decode_name_via_rr(lbl63)
+    eqi("name.label63.not_falsely_rejected.len", len(rr5), 63)
+
+    // ── (3) TXT character-strings must be `bytes` at the TYPE level, not
+    // merely byte-value-compatible. A `string`-typed return with the same
+    // apparent content would still be a latent NUL-truncation hazard on any
+    // future embedded-NUL input even if THIS particular probe used no NUL.
+    let txt_in = bytes(0)
+    txt_in = bytes_append(txt_in, 4)
+    txt_in = bytes_append(txt_in, 0x00)   // embedded NUL as the FIRST byte
+    txt_in = bytes_append(txt_in, 0x51)
+    txt_in = bytes_append(txt_in, 0x00)   // second embedded NUL
+    txt_in = bytes_append(txt_in, 0x52)
+    let txt_out = dns_txt_decode(txt_in)
+    eqi("txt.leading_nul.count", len(txt_out), 1)
+    if len(txt_out) == 1
+        let elem = txt_out[0]
+        eqs("txt.leading_nul.runtime_type_is_bytes", type_of(elem), "bytes")
+        eqi("txt.leading_nul.full_len_preserved", bytes_len(elem), 4)
+        let want_elem = bytes(0)
+        want_elem = bytes_append(want_elem, 0x00)
+        want_elem = bytes_append(want_elem, 0x51)
+        want_elem = bytes_append(want_elem, 0x00)
+        want_elem = bytes_append(want_elem, 0x52)
+        eqb("txt.leading_nul.bytes_exact", elem, want_elem)
+
+    // ── (3b) Multiple TXT character-strings, one all-NUL, one empty,
+    // through the FULL message facade (not just the leaf).
+    let txt_multi = bytes(0)
+    txt_multi = bytes_append(txt_multi, 0)          // empty character-string
+    txt_multi = bytes_append(txt_multi, 2)
+    txt_multi = bytes_append(txt_multi, 0x00)
+    txt_multi = bytes_append(txt_multi, 0x00)       // all-NUL character-string
+    let m6 = hdr(6, 1)
+    m6 = bytes_concat(m6, rr_head(16, bytes_len(txt_multi)))
+    m6 = bytes_concat(m6, txt_multi)
+    let dec6 = dns_decode_message(m6)
+    let ans6 = dec6["answers"]
+    eqi("txt.multi.facade.answers.count", len(ans6), 1)
+    if len(ans6) == 1
+        let typed6 = ans6[0]["rdata_typed"]
+        eqi("txt.multi.facade.strings.count", len(typed6), 2)
+        if len(typed6) == 2
+            eqi("txt.multi.facade.elem0.len(empty)", bytes_len(typed6[0]), 0)
+            eqi("txt.multi.facade.elem1.len(all_nul)", bytes_len(typed6[1]), 2)
+            eqs("txt.multi.facade.elem1.type_is_bytes", type_of(typed6[1]), "bytes")
+
+    print("DONE adv_dns_rdlbound_reserved_txt_probe fail_count=" + str(g_fail[0]))
+    if g_fail[0] > 0
+        exit(1)
+
+// Helper for probe 2b: wrap a raw name-wire blob in a minimal root-A RR
+// (NAME=<blob>) and decode via dns_rr_decode, returning the decoded name.
+fn _rr_probe_decode_name_via_rr(name_wire: bytes) -> string
+    let m = bytes(0)
+    m = bytes_concat(m, name_wire)
+    m = u16(m, 1)
+    m = u16(m, 1)
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x3C)
+    m = u16(m, 4)
+    m = bytes_append(m, 1)
+    m = bytes_append(m, 2)
+    m = bytes_append(m, 3)
+    m = bytes_append(m, 4)
+    let r = dns_rr_decode(m, 0)
+    let rec = r[0]
+    if contains(rec, "name")
+        return rec["name"]
+    return ""

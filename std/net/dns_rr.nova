@@ -33,6 +33,10 @@
 //     Decodes a possibly-compressed name from msg at pos.
 //     Follows pointer chains (capped at 128 hops to prevent loops).
 //     Returns ["", pos] on malformed input.
+//     A length byte whose top two bits are the RESERVED pattern (01 or 10 —
+//     i.e. 0x40..0xBF minus the 0xC0..0xFF pointer range) is rejected
+//     BEFORE the low 6 bits are masked off, matching dns_question.nova.
+//     Masking first would silently reinterpret e.g. 0x40 as a terminator.
 //
 // GOTCHAS:
 //   * >> is arithmetic in NOVA; always mask results with & 0xFF / & 0xFFFF / & 0xFFFFFFFF.
@@ -109,7 +113,14 @@ fn _rr_name_decode(msg: bytes, pos: int) -> list
             if hops > 128
                 return ["", pos]
         else
-            // Label or terminator
+            // Label or terminator. Reserved length-byte patterns (top two
+            // bits == 01 or 10) MUST be rejected BEFORE masking — masking
+            // first would silently reinterpret e.g. 0x40 (0b01000000) as
+            // llen=0 (a terminator/root name), desyncing every field that
+            // follows it (TYPE/CLASS/TTL/RDLENGTH). Mirrors the correct
+            // check order in dns_question.nova's _dq_name_decode.
+            if (b0 & 0xC0) != 0
+                return ["", pos]
             let llen = b0 & 0x3F
             if llen == 0
                 // Terminator
@@ -174,6 +185,14 @@ fn dns_rr_decode(msg: bytes, pos: int) -> list
     let name_res = _rr_name_decode(msg, pos)
     let rr_name = name_res[0]
     let cur = name_res[1]
+    // A NAME decode that did not advance at all is _rr_name_decode's failure
+    // sentinel (["", pos]) — every successful decode (root/label/pointer)
+    // consumes at least 1 byte, so cur<=pos is unambiguous malformed input.
+    // Without this check a rejected NAME (e.g. a reserved 0x40..0xBF length
+    // byte) would silently fall through and have TYPE/CLASS/TTL/RDLENGTH
+    // misparsed starting from the still-unconsumed NAME bytes.
+    if cur <= pos
+        return [empty, pos]
     // Need at least 10 more bytes: TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
     if cur + 10 > mlen
         return [empty, pos]

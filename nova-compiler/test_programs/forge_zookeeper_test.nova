@@ -1,0 +1,431 @@
+// KAT: forge_zookeeper -- ZooKeeper jute wire-protocol codec. Byte-exact ConnectRequest; byte-exact
+// GetData request (RequestHeader + path + watch); jute buffer round-trip with an embedded 0x00 byte
+// (binary-safe) and a null (-1) buffer; frame length-prefix round-trip; Create/SetData/Delete/Exists
+// request encode verified by walking the bytes back with the public read primitives; ReplyHeader + Stat +
+// GetDataResponse/SetDataResponse parse against hand-built reply bytes; int32/int64 boundary round-trips
+// incl. negative and near-i64-extreme values; empty/whitespace/long-buffer round-trips; a control-char
+// (non-NUL) path proven not to desync the following field; malformed length fields (negative-not(-1),
+// overrunning) proven to degrade in-band rather than crash.
+import forge_zookeeper
+
+fn main()
+    // ================================================================================================
+    // 1. ConnectRequest byte-exact: protocolVersion=0, lastZxidSeen=0, timeOut=30000, sessionId=0,
+    //    passwd=empty buffer.
+    // ================================================================================================
+    let empty_passwd = bytes(0)
+    let creq = zk_connect_request(0, 0, 30000, 0, empty_passwd)
+    let cframe = zk_frame(creq)
+    if bytes_len(cframe) != 32
+        print("FAIL: ConnectRequest frame length")
+        exit(1)
+    if zk_frame_len(cframe) != 28
+        print("FAIL: ConnectRequest zk_frame_len")
+        exit(1)
+    // length prefix 00 00 00 1C
+    if bytes_get(cframe, 0) != 0 or bytes_get(cframe, 1) != 0 or bytes_get(cframe, 2) != 0 or bytes_get(cframe, 3) != 28
+        print("FAIL: ConnectRequest length prefix bytes")
+        exit(1)
+    // protocolVersion (4..7) = 0
+    let i = 4
+    while i < 8
+        if bytes_get(cframe, i) != 0
+            print("FAIL: ConnectRequest protocolVersion byte " + str(i))
+            exit(1)
+        i = i + 1
+    // lastZxidSeen (8..15) = 0
+    i = 8
+    while i < 16
+        if bytes_get(cframe, i) != 0
+            print("FAIL: ConnectRequest lastZxidSeen byte " + str(i))
+            exit(1)
+        i = i + 1
+    // timeOut (16..19) = 30000 = 0x00 00 75 30
+    if bytes_get(cframe, 16) != 0 or bytes_get(cframe, 17) != 0 or bytes_get(cframe, 18) != 0x75 or bytes_get(cframe, 19) != 0x30
+        print("FAIL: ConnectRequest timeOut bytes")
+        exit(1)
+    // sessionId (20..27) = 0
+    i = 20
+    while i < 28
+        if bytes_get(cframe, i) != 0
+            print("FAIL: ConnectRequest sessionId byte " + str(i))
+            exit(1)
+        i = i + 1
+    // passwd len (28..31) = 0
+    if bytes_get(cframe, 28) != 0 or bytes_get(cframe, 29) != 0 or bytes_get(cframe, 30) != 0 or bytes_get(cframe, 31) != 0
+        print("FAIL: ConnectRequest passwd length bytes")
+        exit(1)
+
+    // ConnectResponse parse round-trip (protocolVersion 0, timeOut 30000, sessionId 999, passwd null)
+    let cresp_body = zk_wr_int(0)
+    cresp_body = bytes_concat(cresp_body, zk_wr_int(30000))
+    cresp_body = bytes_concat(cresp_body, zk_wr_long(999))
+    cresp_body = bytes_concat(cresp_body, zk_wr_buffer(null))
+    let cresp = zk_parse_connect_response(cresp_body, 0)
+    if cresp[0] != 0 or cresp[1] != 30000 or cresp[2] != 999 or cresp[3] != null or cresp[4] != 20
+        print("FAIL: ConnectResponse parse round-trip")
+        exit(1)
+
+    // ================================================================================================
+    // 2. GetData request byte-exact: RequestHeader xid=1 type=4 + path "/a" + watch=false.
+    // ================================================================================================
+    if zk_op_get_data() != 4
+        print("FAIL: zk_op_get_data constant")
+        exit(1)
+    let ghdr = zk_request_header(1, zk_op_get_data())
+    let gbody = zk_get_data_request("/a", false)
+    let gframe = zk_frame_request(ghdr, gbody)
+    if bytes_len(gframe) != 19
+        print("FAIL: GetData frame length")
+        exit(1)
+    if zk_frame_len(gframe) != 15
+        print("FAIL: GetData zk_frame_len")
+        exit(1)
+    // 0..3 length=15, 4..7 xid=1, 8..11 type=4, 12..15 path-len=2, 16='/', 17='a', 18=watch(0)
+    let expect = [0, 0, 0, 15, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 2, 0x2F, 0x61, 0]
+    i = 0
+    while i < 19
+        if bytes_get(gframe, i) != expect[i]
+            print("FAIL: GetData frame byte " + str(i) + " = " + str(bytes_get(gframe, i)) + " want " + str(expect[i]))
+            exit(1)
+        i = i + 1
+    // parse it back
+    let gpayload = bytes_slice(gframe, 4, 19)
+    let ghr = zk_parse_request_header(gpayload, 0)
+    if ghr[0] != 1 or ghr[1] != 4
+        print("FAIL: GetData RequestHeader parse")
+        exit(1)
+    let gpr = zk_rd_ustring(gpayload, ghr[2])
+    if gpr[0] != "/a"
+        print("FAIL: GetData path parse")
+        exit(1)
+    let gwatch = zk_rd_bool(gpayload, gpr[1])
+    if gwatch != false
+        print("FAIL: GetData watch parse")
+        exit(1)
+    if gpr[1] + 1 != bytes_len(gpayload)
+        print("FAIL: GetData parse did not consume exactly the payload")
+        exit(1)
+
+    // ================================================================================================
+    // 3. jute buffer with an embedded 0x00 byte (binary-safe) + a null (-1) buffer.
+    // ================================================================================================
+    let bin = bytes(0)
+    bin = bytes_append(bin, 0x41)
+    bin = bytes_append(bin, 0x00)
+    bin = bytes_append(bin, 0x42)
+    let benc = zk_wr_buffer(bin)
+    if bytes_len(benc) != 7
+        print("FAIL: buffer(A\\0B) encoded length")
+        exit(1)
+    let bexpect = [0, 0, 0, 3, 0x41, 0x00, 0x42]
+    i = 0
+    while i < 7
+        if bytes_get(benc, i) != bexpect[i]
+            print("FAIL: buffer(A\\0B) byte " + str(i))
+            exit(1)
+        i = i + 1
+    let bdec = zk_rd_buffer(benc, 0)
+    if bdec[1] != 7 or bytes_len(bdec[0]) != 3
+        print("FAIL: buffer(A\\0B) decode shape")
+        exit(1)
+    if bytes_get(bdec[0], 0) != 0x41 or bytes_get(bdec[0], 1) != 0x00 or bytes_get(bdec[0], 2) != 0x42
+        print("FAIL: buffer(A\\0B) decode content (embedded 0x00 corrupted)")
+        exit(1)
+
+    let nullenc = zk_wr_buffer(null)
+    if bytes_len(nullenc) != 4
+        print("FAIL: null buffer encoded length")
+        exit(1)
+    if bytes_get(nullenc, 0) != 255 or bytes_get(nullenc, 1) != 255 or bytes_get(nullenc, 2) != 255 or bytes_get(nullenc, 3) != 255
+        print("FAIL: null buffer should be 0xFFFFFFFF")
+        exit(1)
+    let nulldec = zk_rd_buffer(nullenc, 0)
+    if nulldec[0] != null or nulldec[1] != 4
+        print("FAIL: null buffer decode")
+        exit(1)
+
+    // string-input convenience path of zk_wr_buffer must match the explicit-bytes path.
+    let strbuf = zk_wr_buffer("hi")
+    let rawbuf = zk_wr_buffer(str_to_bytes("hi"))
+    if bytes_len(strbuf) != bytes_len(rawbuf) or bytes_len(strbuf) != 6
+        print("FAIL: zk_wr_buffer(string) vs zk_wr_buffer(bytes) length mismatch")
+        exit(1)
+    i = 0
+    while i < 6
+        if bytes_get(strbuf, i) != bytes_get(rawbuf, i)
+            print("FAIL: zk_wr_buffer(string) vs zk_wr_buffer(bytes) byte " + str(i))
+            exit(1)
+        i = i + 1
+
+    // ================================================================================================
+    // 4. round-trip the frame length prefix.
+    // ================================================================================================
+    let fr = zk_frame(gbody)
+    if zk_frame_len(fr) != bytes_len(gbody)
+        print("FAIL: zk_frame_len roundtrip vs payload length")
+        exit(1)
+    if bytes_len(fr) != 4 + bytes_len(gbody)
+        print("FAIL: zk_frame total length")
+        exit(1)
+    if zk_frame_len(bytes(0)) != 0 - 1
+        print("FAIL: zk_frame_len on empty buffer should be -1 (no crash)")
+        exit(1)
+    if zk_frame_len(bytes_append(bytes_append(bytes(0), 1), 2)) != 0 - 1
+        print("FAIL: zk_frame_len on a 2-byte (short) buffer should be -1 (no crash)")
+        exit(1)
+
+    // ================================================================================================
+    // 5. Create / SetData / Delete / Exists request encode + round-trip via public read primitives.
+    // ================================================================================================
+    let acl = [[31, "world", "anyone"]]
+    let cdata = bytes(0)
+    cdata = bytes_append(cdata, 0x78)
+    cdata = bytes_append(cdata, 0x79)
+    cdata = bytes_append(cdata, 0x7A)
+    let crbody = zk_create_request("/c", cdata, acl, zk_flag_persistent())
+    // path(4+2) + data(4+3) + acl-count(4) + acl[perms(4)+scheme(4+5)+id(4+6)] + flags(4)
+    //   = 6 + 7 + 4 + (4+9+10) + 4 = 6+7+4+23+4 = 44
+    if bytes_len(crbody) != 44
+        print("FAIL: Create request encoded length = " + str(bytes_len(crbody)))
+        exit(1)
+    let crp = zk_rd_ustring(crbody, 0)
+    if crp[0] != "/c"
+        print("FAIL: Create request path round-trip")
+        exit(1)
+    let crd = zk_rd_buffer(crbody, crp[1])
+    if bytes_len(crd[0]) != 3 or bytes_get(crd[0], 0) != 0x78 or bytes_get(crd[0], 1) != 0x79 or bytes_get(crd[0], 2) != 0x7A
+        print("FAIL: Create request data round-trip")
+        exit(1)
+    let cra = zk_rd_acl_vector(crbody, crd[1])
+    if len(cra[0]) != 1
+        print("FAIL: Create request acl vector count")
+        exit(1)
+    let acl0 = cra[0][0]
+    if acl0[0] != 31 or acl0[1] != "world" or acl0[2] != "anyone"
+        print("FAIL: Create request acl entry round-trip")
+        exit(1)
+    let crf = zk_rd_int(crbody, cra[1])
+    if crf != 0
+        print("FAIL: Create request flags round-trip")
+        exit(1)
+    if cra[1] + 4 != bytes_len(crbody)
+        print("FAIL: Create request parse did not consume exactly the body")
+        exit(1)
+
+    // CreateResponse parse.
+    let cresp_body2 = zk_wr_ustring("/c0000000001")
+    let crr = zk_parse_create_response(cresp_body2, 0)
+    if crr[0] != "/c0000000001"
+        print("FAIL: CreateResponse parse")
+        exit(1)
+
+    // SetData
+    let sdata = bytes(0)
+    sdata = bytes_append(sdata, 9)
+    sdata = bytes_append(sdata, 8)
+    let sdbody = zk_set_data_request("/c", sdata, 3)
+    let sdp = zk_rd_ustring(sdbody, 0)
+    let sdd = zk_rd_buffer(sdbody, sdp[1])
+    let sdv = zk_rd_int(sdbody, sdd[1])
+    if sdp[0] != "/c" or bytes_len(sdd[0]) != 2 or bytes_get(sdd[0], 0) != 9 or bytes_get(sdd[0], 1) != 8 or sdv != 3
+        print("FAIL: SetData request round-trip")
+        exit(1)
+    if sdd[1] + 4 != bytes_len(sdbody)
+        print("FAIL: SetData request parse did not consume exactly the body")
+        exit(1)
+
+    // Delete
+    let delbody = zk_delete_request("/c", 3)
+    let delp = zk_rd_ustring(delbody, 0)
+    let delv = zk_rd_int(delbody, delp[1])
+    if delp[0] != "/c" or delv != 3
+        print("FAIL: Delete request round-trip")
+        exit(1)
+
+    // Exists
+    let exbody = zk_exists_request("/c", true)
+    let exp2 = zk_rd_ustring(exbody, 0)
+    let exw = zk_rd_bool(exbody, exp2[1])
+    if exp2[0] != "/c" or exw != true
+        print("FAIL: Exists request round-trip")
+        exit(1)
+
+    // ================================================================================================
+    // 6. ReplyHeader + Stat + GetDataResponse/SetDataResponse parse against hand-built reply bytes.
+    // ================================================================================================
+    let rhbytes = zk_wr_int(42)
+    rhbytes = bytes_concat(rhbytes, zk_wr_long(123456789))
+    rhbytes = bytes_concat(rhbytes, zk_wr_int(0))
+    let rh = zk_parse_reply_header(rhbytes, 0)
+    if rh[0] != 42 or rh[1] != 123456789 or rh[2] != 0 or rh[3] != 16
+        print("FAIL: ReplyHeader parse")
+        exit(1)
+
+    let statbytes = zk_wr_long(100)              // czxid
+    statbytes = bytes_concat(statbytes, zk_wr_long(200))     // mzxid
+    statbytes = bytes_concat(statbytes, zk_wr_long(1000))    // ctime
+    statbytes = bytes_concat(statbytes, zk_wr_long(2000))    // mtime
+    statbytes = bytes_concat(statbytes, zk_wr_int(3))        // version
+    statbytes = bytes_concat(statbytes, zk_wr_int(1))        // cversion
+    statbytes = bytes_concat(statbytes, zk_wr_int(0))        // aversion
+    statbytes = bytes_concat(statbytes, zk_wr_long(555))     // ephemeralOwner
+    statbytes = bytes_concat(statbytes, zk_wr_int(3))        // dataLength
+    statbytes = bytes_concat(statbytes, zk_wr_int(0))        // numChildren
+    statbytes = bytes_concat(statbytes, zk_wr_long(300))     // pzxid
+    if bytes_len(statbytes) != 68
+        print("FAIL: hand-built Stat length")
+        exit(1)
+    let str2 = zk_rd_stat(statbytes, 0)
+    let stat = str2[0]
+    if stat["czxid"] != 100 or stat["mzxid"] != 200 or stat["ctime"] != 1000 or stat["mtime"] != 2000
+        print("FAIL: Stat zxid/time fields")
+        exit(1)
+    if stat["version"] != 3 or stat["cversion"] != 1 or stat["aversion"] != 0
+        print("FAIL: Stat version fields")
+        exit(1)
+    if stat["ephemeralOwner"] != 555 or stat["dataLength"] != 3 or stat["numChildren"] != 0 or stat["pzxid"] != 300
+        print("FAIL: Stat remaining fields")
+        exit(1)
+    if str2[1] != 68
+        print("FAIL: Stat parse next_off")
+        exit(1)
+
+    // GetDataResponse => data(buffer) + Stat
+    let gdrbytes = zk_wr_buffer(cdata)
+    gdrbytes = bytes_concat(gdrbytes, statbytes)
+    let gdr = zk_parse_get_data_response(gdrbytes, 0)
+    if bytes_len(gdr[0]) != 3 or bytes_get(gdr[0], 0) != 0x78 or bytes_get(gdr[0], 1) != 0x79 or bytes_get(gdr[0], 2) != 0x7A
+        print("FAIL: GetDataResponse data field")
+        exit(1)
+    if gdr[1]["czxid"] != 100
+        print("FAIL: GetDataResponse stat field")
+        exit(1)
+    if gdr[2] != bytes_len(gdrbytes)
+        print("FAIL: GetDataResponse next_off")
+        exit(1)
+
+    // SetDataResponse => Stat only
+    let sdr = zk_parse_set_data_response(statbytes, 0)
+    if sdr[0]["mzxid"] != 200 or sdr[1] != 68
+        print("FAIL: SetDataResponse parse")
+        exit(1)
+
+    // ExistsResponse => Stat only (err==0 path)
+    let exr = zk_parse_exists_response(statbytes, 0)
+    if exr[0]["pzxid"] != 300 or exr[1] != 68
+        print("FAIL: ExistsResponse parse")
+        exit(1)
+
+    // ================================================================================================
+    // 7. int32 / int64 boundary round-trips.
+    // ================================================================================================
+    let i32cases = [0, 1, 127, 128, 255, 256, 2147483647, 0 - 1, 0 - 2147483648]
+    i = 0
+    while i < len(i32cases)
+        let v = i32cases[i]
+        if zk_rd_int(zk_wr_int(v), 0) != v
+            print("FAIL: zk_wr_int/zk_rd_int round-trip of " + str(v))
+            exit(1)
+        i = i + 1
+    if bytes_len(zk_wr_int(0)) != 4
+        print("FAIL: zk_wr_int always emits 4 bytes")
+        exit(1)
+
+    let i64max = 9223372036854775807
+    let i64near_min = (0 - 9223372036854775807) - 1
+    let i64cases = [0, 1, 4294967296, i64max, 0 - 1, 0 - 9876543210, i64near_min]
+    i = 0
+    while i < len(i64cases)
+        let v = i64cases[i]
+        if zk_rd_long(zk_wr_long(v), 0) != v
+            print("FAIL: zk_wr_long/zk_rd_long round-trip of " + str(v))
+            exit(1)
+        i = i + 1
+    if bytes_len(zk_wr_long(0)) != 8
+        print("FAIL: zk_wr_long always emits 8 bytes")
+        exit(1)
+
+    // boolean
+    if zk_rd_bool(zk_wr_bool(true), 0) != true or zk_rd_bool(zk_wr_bool(false), 0) != false
+        print("FAIL: zk_wr_bool/zk_rd_bool round-trip")
+        exit(1)
+
+    // ================================================================================================
+    // 8. empty / whitespace / long-buffer round-trips.
+    // ================================================================================================
+    let eu = zk_rd_ustring(zk_wr_ustring(""), 0)
+    if eu[0] != "" or eu[1] != 4
+        print("FAIL: empty ustring round-trip")
+        exit(1)
+    let wu = zk_rd_ustring(zk_wr_ustring(" "), 0)
+    if wu[0] != " "
+        print("FAIL: whitespace ustring round-trip")
+        exit(1)
+
+    let eb = zk_rd_buffer(zk_wr_buffer(bytes(0)), 0)
+    if bytes_len(eb[0]) != 0 or eb[1] != 4
+        print("FAIL: empty buffer round-trip")
+        exit(1)
+
+    // "max-width" representative: a 600-byte buffer, byte-for-byte round-trip.
+    let big = bytes(0)
+    i = 0
+    while i < 600
+        big = bytes_append(big, i & 0xFF)
+        i = i + 1
+    let bigdec = zk_rd_buffer(zk_wr_buffer(big), 0)
+    if bytes_len(bigdec[0]) != 600
+        print("FAIL: 600-byte buffer round-trip length")
+        exit(1)
+    i = 0
+    while i < 600
+        if bytes_get(bigdec[0], i) != (i & 0xFF)
+            print("FAIL: 600-byte buffer round-trip byte " + str(i))
+            exit(1)
+        i = i + 1
+
+    // ================================================================================================
+    // 9. injection: a control char (non-NUL) inside a path must not desync the following field.
+    // ================================================================================================
+    let ctrlpath = "/a\nb\tc"
+    let ihdr = zk_request_header(2, zk_op_get_data())
+    let ibody = zk_get_data_request(ctrlpath, true)
+    let iframe = zk_frame_request(ihdr, ibody)
+    let ipayload = bytes_slice(iframe, 4, bytes_len(iframe))
+    let ihr = zk_parse_request_header(ipayload, 0)
+    let ipp = zk_rd_ustring(ipayload, ihr[2])
+    let iw = zk_rd_bool(ipayload, ipp[1])
+    if ihr[0] != 2 or ihr[1] != zk_op_get_data() or ipp[0] != ctrlpath or iw != true
+        print("FAIL: control-char path desynced the frame")
+        exit(1)
+    if ipp[1] + 1 != bytes_len(ipayload)
+        print("FAIL: control-char path parse did not consume exactly the payload")
+        exit(1)
+
+    // ================================================================================================
+    // 10. malformed length fields degrade in-band; never exit(1) on bad input.
+    // ================================================================================================
+    // buffer length = -5 (negative, not the -1 null sentinel) -> treated as empty, no crash.
+    let badbuf = zk_wr_int(0 - 5)
+    let baddec = zk_rd_buffer(badbuf, 0)
+    if baddec[0] == null or bytes_len(baddec[0]) != 0 or baddec[1] != 4
+        print("FAIL: negative-not-(-1) buffer length should degrade to empty, not crash")
+        exit(1)
+
+    // buffer length = 1000000 but only 3 bytes actually follow -> clamps to what's available.
+    let shortbuf = zk_wr_int(1000000)
+    shortbuf = bytes_concat(shortbuf, bin)               // 3 bytes follow ("A\0B")
+    let shortdec = zk_rd_buffer(shortbuf, 0)
+    if bytes_len(shortdec[0]) != 3 or shortdec[1] != bytes_len(shortbuf)
+        print("FAIL: overrunning buffer length should clamp to available bytes")
+        exit(1)
+
+    // ustring length = -3 (negative) -> degrades to empty string, no crash.
+    let baduspref = zk_wr_int(0 - 3)
+    let badus = zk_rd_ustring(baduspref, 0)
+    if badus[0] != "" or badus[1] != 4
+        print("FAIL: negative ustring length should degrade to empty string, not crash")
+        exit(1)
+
+    print("PASS forge_zookeeper (ConnectRequest byte-exact, GetData request byte-exact, buffer with embedded 0x00 + null buffer, frame length-prefix round-trip, Create/SetData/Delete/Exists round-trip, ReplyHeader+Stat+GetData/SetDataResponse parse, int32/int64 boundary round-trips, empty/whitespace/600-byte buffer round-trip, control-char path no-desync, malformed-length in-band degrade)")

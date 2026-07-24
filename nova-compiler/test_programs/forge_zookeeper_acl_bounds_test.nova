@@ -1,0 +1,74 @@
+// KAT: forge_zookeeper -- zk_rd_acl_vector right-side (overrun) bounds discipline.
+// Proves the fix for: an ACL-vector count field that vastly overstates the bytes actually present must NOT
+// drive the parser into manufacturing phantom entries / reading past the buffer (matches the same
+// avail-clamp discipline zk_rd_buffer/zk_rd_ustring already had). Also proves a well-formed ACL vector
+// still decodes correctly after the clamp was added (no false-positive clamp on real data).
+import forge_zookeeper
+
+fn main()
+    // ============================================================================================
+    // 1. Overrun: count field claims 300000 ACL entries but ZERO bytes actually follow the count.
+    //    Must clamp to 0 entries (avail=0 -> max_entries=0), not manufacture 300000 phantom entries.
+    // ============================================================================================
+    let hugecount = zk_wr_int(300000)   // ONLY the 4-byte count field on the wire; no ACL bytes follow
+    let hugedec = zk_rd_acl_vector(hugecount, 0)
+    if len(hugedec[0]) != 0
+        print("FAIL: huge ACL count over 0 backing bytes should clamp to 0 entries, got " + str(len(hugedec[0])))
+        exit(1)
+    if hugedec[1] != 4
+        print("FAIL: huge ACL count over 0 backing bytes should not advance next_off past the count field, got " + str(hugedec[1]))
+        exit(1)
+    print("OK: huge ACL count (300000) over 0 backing bytes clamps to 0 entries, next_off stays at count field end")
+
+    // ============================================================================================
+    // 2. Overrun with SOME backing data: count claims 1000 entries but only enough bytes for exactly
+    //    2 real (minimal, zero-length-string) ACL entries (2 * 12 = 24 bytes) follow. Must clamp to
+    //    2 entries -- not read past the 24 bytes into garbage, not crash.
+    // ============================================================================================
+    let two_entries = bytes(0)
+    let k = 0
+    while k < 24
+        two_entries = bytes_append(two_entries, 0)
+        k = k + 1
+    let overbuf = bytes_concat(zk_wr_int(1000), two_entries)
+    let overdec = zk_rd_acl_vector(overbuf, 0)
+    if len(overdec[0]) != 2
+        print("FAIL: count=1000 over 24 backing bytes (2 minimal entries) should clamp to 2 entries, got " + str(len(overdec[0])))
+        exit(1)
+    if overdec[1] != bytes_len(overbuf)
+        print("FAIL: count=1000 over exactly-2-entries-worth of bytes should consume exactly the buffer, got next_off=" + str(overdec[1]) + " want " + str(bytes_len(overbuf)))
+        exit(1)
+    print("OK: count=1000 over 24 backing bytes clamps to 2 entries and consumes exactly the buffer")
+
+    // ============================================================================================
+    // 3. Well-formed ACL vector (real Create-request shape) still decodes correctly -- the added
+    //    clamp must not false-positive on legitimate, fully-backed data.
+    // ============================================================================================
+    let acl = [[31, "world", "anyone"], [0, "auth", "u"]]
+    let cdata = bytes(0)
+    cdata = bytes_append(cdata, 1)
+    let crbody = zk_create_request("/wf", cdata, acl, 0)
+    let crp = zk_rd_ustring(crbody, 0)
+    let crd = zk_rd_buffer(crbody, crp[1])
+    let cra = zk_rd_acl_vector(crbody, crd[1])
+    if len(cra[0]) != 2
+        print("FAIL: well-formed 2-entry ACL vector should still decode 2 entries, got " + str(len(cra[0])))
+        exit(1)
+    let a0 = cra[0][0]
+    let a1 = cra[0][1]
+    if a0[0] != 31 or a0[1] != "world" or a0[2] != "anyone"
+        print("FAIL: well-formed ACL vector entry 0 mismatch")
+        exit(1)
+    if a1[0] != 0 or a1[1] != "auth" or a1[2] != "u"
+        print("FAIL: well-formed ACL vector entry 1 mismatch")
+        exit(1)
+    let crf = zk_rd_int(crbody, cra[1])
+    if crf != 0
+        print("FAIL: well-formed ACL vector parse did not leave next_off at the trailing flags field")
+        exit(1)
+    if cra[1] + 4 != bytes_len(crbody)
+        print("FAIL: well-formed ACL vector parse did not consume exactly up to the flags field")
+        exit(1)
+    print("OK: well-formed 2-entry ACL vector still decodes correctly after adding the overrun clamp")
+
+    print("PASS forge_zookeeper_acl_bounds (huge count over 0 bytes clamps to 0, huge count over partial bytes clamps to available entries, well-formed vector unaffected)")

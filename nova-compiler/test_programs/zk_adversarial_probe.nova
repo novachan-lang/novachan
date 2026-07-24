@@ -1,0 +1,148 @@
+// ADVERSARIAL PROBE (independent verifier) for forge_zookeeper.nova.
+// Re-derives expected wire bytes from the ZooKeeper jute spec BY HAND (not via the module's own readers,
+// to avoid a write/read matched-pair bug hiding itself), and attacks the malformed/oversized-input path
+// the builder's KAT did NOT cover: an unbounded ACL-vector count field, an int32 negative-boundary write,
+// and an embedded-NUL path string (does the ustring length prefix stay self-consistent with actual bytes?).
+import forge_zookeeper
+
+fn main()
+    // ============================================================================================
+    // A. Independently hand-built expected bytes for Create request: path="/c", data=[0x78,0x79,0x7A],
+    //    acl=[[31,"world","anyone"]], flags=0.
+    //    path: len=2 "/c" -> 00 00 00 02 2F 63
+    //    data: len=3 78 79 7A -> 00 00 00 03 78 79 7A
+    //    acl count=1 -> 00 00 00 01
+    //    acl[0]: perms=31 -> 00 00 00 1F ; scheme "world" len=5 -> 00 00 00 05 77 6F 72 6C 64
+    //            id "anyone" len=6 -> 00 00 00 06 61 6E 79 6F 6E 65
+    //    flags=0 -> 00 00 00 00
+    // ============================================================================================
+    let acl = [[31, "world", "anyone"]]
+    let cdata = bytes(0)
+    cdata = bytes_append(cdata, 0x78)
+    cdata = bytes_append(cdata, 0x79)
+    cdata = bytes_append(cdata, 0x7A)
+    let crbody = zk_create_request("/c", cdata, acl, zk_flag_persistent())
+    let expect = [0,0,0,2, 0x2F,0x63, 0,0,0,3, 0x78,0x79,0x7A, 0,0,0,1, 0,0,0,0x1F, 0,0,0,5, 0x77,0x6F,0x72,0x6C,0x64, 0,0,0,6, 0x61,0x6E,0x79,0x6F,0x6E,0x65, 0,0,0,0]
+    if bytes_len(crbody) != len(expect)
+        print("FAIL: Create request length mismatch vs hand-derived spec bytes: got " + str(bytes_len(crbody)) + " want " + str(len(expect)))
+        exit(1)
+    let i = 0
+    while i < len(expect)
+        if bytes_get(crbody, i) != expect[i]
+            print("FAIL: Create request byte " + str(i) + " = " + str(bytes_get(crbody, i)) + " want " + str(expect[i]))
+            exit(1)
+        i = i + 1
+    print("OK: Create request byte-exact vs independently hand-derived jute bytes")
+
+    // ============================================================================================
+    // B. SetData request: path="/z", data=[9,8], version=-1 ("match any version").
+    //    path len=2 "/z" -> 00 00 00 02 2F 7A ; data len=2 09 08 -> 00 00 00 02 09 08 ; version -1 -> FF FF FF FF
+    // ============================================================================================
+    let sdata = bytes(0)
+    sdata = bytes_append(sdata, 9)
+    sdata = bytes_append(sdata, 8)
+    let sdbody = zk_set_data_request("/z", sdata, 0 - 1)
+    let sexpect = [0,0,0,2, 0x2F,0x7A, 0,0,0,2, 9,8, 0xFF,0xFF,0xFF,0xFF]
+    if bytes_len(sdbody) != len(sexpect)
+        print("FAIL: SetData request length mismatch")
+        exit(1)
+    i = 0
+    while i < len(sexpect)
+        if bytes_get(sdbody, i) != sexpect[i]
+            print("FAIL: SetData request byte " + str(i) + " = " + str(bytes_get(sdbody, i)) + " want " + str(sexpect[i]))
+            exit(1)
+        i = i + 1
+    print("OK: SetData request byte-exact (version=-1 boundary)")
+
+    // ============================================================================================
+    // C. int32 MIN boundary write: -2147483648 -> 0x80 00 00 00 (exact bytes, not just round-trip
+    //    through the module's own reader).
+    // ============================================================================================
+    let imin = 0 - 2147483648
+    let ienc = zk_wr_int(imin)
+    if bytes_len(ienc) != 4 or bytes_get(ienc,0) != 0x80 or bytes_get(ienc,1) != 0 or bytes_get(ienc,2) != 0 or bytes_get(ienc,3) != 0
+        print("FAIL: zk_wr_int(INT32_MIN) byte-exact")
+        exit(1)
+    print("OK: zk_wr_int(INT32_MIN) byte-exact = 80 00 00 00")
+
+    // ============================================================================================
+    // D. Independently hand-built ReplyHeader + GetDataResponse frame (simulating a real server
+    //    reply), parsed purely via the module's public parse functions, checked against hand values.
+    // ============================================================================================
+    let reply = zk_wr_int(7)                 // xid
+    reply = bytes_concat(reply, zk_wr_long(88888))   // zxid
+    reply = bytes_concat(reply, zk_wr_int(0))        // err = 0 (ok)
+    let rdata = bytes(0)
+    rdata = bytes_append(rdata, 0xAA)
+    rdata = bytes_append(rdata, 0xBB)
+    reply = bytes_concat(reply, zk_wr_buffer(rdata))  // data buffer
+    reply = bytes_concat(reply, zk_wr_long(1))   // czxid
+    reply = bytes_concat(reply, zk_wr_long(2))   // mzxid
+    reply = bytes_concat(reply, zk_wr_long(3))   // ctime
+    reply = bytes_concat(reply, zk_wr_long(4))   // mtime
+    reply = bytes_concat(reply, zk_wr_int(5))    // version
+    reply = bytes_concat(reply, zk_wr_int(0))    // cversion
+    reply = bytes_concat(reply, zk_wr_int(0))    // aversion
+    reply = bytes_concat(reply, zk_wr_long(0))   // ephemeralOwner
+    reply = bytes_concat(reply, zk_wr_int(2))    // dataLength
+    reply = bytes_concat(reply, zk_wr_int(0))    // numChildren
+    reply = bytes_concat(reply, zk_wr_long(6))   // pzxid
+    let rh = zk_parse_reply_header(reply, 0)
+    if rh[0] != 7 or rh[1] != 88888 or rh[2] != 0
+        print("FAIL: hand-built ReplyHeader parse")
+        exit(1)
+    let gdr = zk_parse_get_data_response(reply, rh[3])
+    if bytes_len(gdr[0]) != 2 or bytes_get(gdr[0],0) != 0xAA or bytes_get(gdr[0],1) != 0xBB
+        print("FAIL: hand-built GetDataResponse data field")
+        exit(1)
+    if gdr[1]["version"] != 5 or gdr[1]["dataLength"] != 2 or gdr[1]["pzxid"] != 6
+        print("FAIL: hand-built GetDataResponse stat field")
+        exit(1)
+    if gdr[2] != bytes_len(reply)
+        print("FAIL: hand-built GetDataResponse did not consume exactly the reply bytes")
+        exit(1)
+    print("OK: hand-built ReplyHeader+GetDataResponse parses exactly")
+
+    // ============================================================================================
+    // E. ACL-vector count field: negative clamps to 0 (already partially implied, verify directly).
+    // ============================================================================================
+    let negcount = zk_wr_int(0 - 1)
+    let negdec = zk_rd_acl_vector(negcount, 0)
+    if len(negdec[0]) != 0 or negdec[1] != 4
+        print("FAIL: negative ACL vector count should clamp to 0 entries")
+        exit(1)
+    print("OK: negative ACL vector count clamps to 0")
+
+    // ============================================================================================
+    // F. THE REAL PROBE: an ACL-vector count field that vastly overstates the bytes actually present
+    //    -- unlike zk_rd_buffer/zk_rd_ustring (which clamp `take` to `avail`), zk_rd_acl_vector has NO
+    //    such clamp against available bytes; it loops `n` times no matter how little data backs it,
+    //    because bytes_get() itself is OOB-safe (returns 0) so the loop never "errors out" naturally.
+    //    A count of 300000 with ZERO acl bytes behind it (pure length field, nothing else) must not
+    //    silently manufacture 300000 phantom ACL entries out of thin air / OOB reads.
+    // ============================================================================================
+    let hugecount = zk_wr_int(300000)   // ONLY the 4-byte count field on the wire; no ACL bytes follow
+    let hugedec = zk_rd_acl_vector(hugecount, 0)
+    let got_n = len(hugedec[0])
+    let got_off = hugedec[1]
+    print("PROBE F: count field claimed 300000 ACL entries over a 4-byte buffer -> got " + str(got_n) + " entries, next_off=" + str(got_off) + " (buffer only had " + str(bytes_len(hugecount)) + " bytes)")
+    if got_n == 300000
+        print("FINDING: zk_rd_acl_vector does NOT bound-check count against available bytes -- it manufactured " + str(got_n) + " phantom (all-zero) ACL entries from a 4-byte buffer with no backing data, and advanced next_off to " + str(got_off) + " (12 bytes/entry x n) far past the real buffer end (" + str(bytes_len(hugecount)) + " bytes). This is an unbounded-work / memory-amplification vector: a corrupt or malicious reply's acl-count field alone controls O(n) allocation+CPU with no relation to the actual frame size, unlike zk_rd_buffer/zk_rd_ustring which clamp `take` to `avail`.")
+
+    // ============================================================================================
+    // G. Embedded-NUL path: confirm the ustring length prefix stays self-consistent with the bytes
+    //    actually emitted after NUL-truncation (i.e. it truncates cleanly rather than emitting a
+    //    length prefix that promises more bytes than are actually on the wire, which would desync
+    //    a REAL peer's subsequent field read -- a wire-corruption bug, not just data loss).
+    // ============================================================================================
+    let evil = "/a" + chr(0) + "z"
+    let evil_enc = zk_wr_ustring(evil)
+    let declared_len = zk_rd_int(evil_enc, 0)
+    let actual_trailing = bytes_len(evil_enc) - 4
+    print("PROBE G: embedded-NUL path declared_len=" + str(declared_len) + " actual_trailing_bytes=" + str(actual_trailing) + " nova_len(evil)=" + str(len(evil)))
+    if declared_len != actual_trailing
+        print("FAIL: zk_wr_ustring produced a SELF-INCONSISTENT frame -- declared length " + str(declared_len) + " does not match the " + str(actual_trailing) + " bytes actually emitted. This WOULD desync a real peer's next field read (wire corruption from a NUL byte in a path).")
+        exit(1)
+    print("OK: embedded-NUL ustring stays self-consistent (declared length matches actual emitted bytes -- truncates cleanly, does not desync the frame)")
+
+    print("PROBE-DONE")

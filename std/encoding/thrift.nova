@@ -1,0 +1,626 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/thrift
+// ============================================================================
+// Apache Thrift TBinaryProtocol (STRICT, "binary protocol") codec — the wire
+// format thrift.apache.org generated code (any target language) produces
+// when TBinaryProtocol is selected, and the format literally every Thrift
+// transport (Kafka, Cassandra's original API, Scribe/HBase-style RPC,
+// Finagle's ThriftMux) is built on top of.
+//
+// WIRE FORMAT (Apache Thrift TBinaryProtocol.java, STRICT_WRITE):
+//
+//   MESSAGE  = header(i32 BE, version<<16 | 0 | message_type)
+//              + name   (i32 BE len + UTF-8 bytes)
+//              + seqid  (i32 BE)
+//              + STRUCT                                  (the message body)
+//
+//     header = 0x80010000 | (message_type & 0xFF)   (VERSION_1, strict write)
+//     message_type: CALL=1 REPLY=2 EXCEPTION=3 ONEWAY=4
+//
+//   STRUCT   = field* + STOP(0x00 byte)
+//   FIELD    = type_byte(i8) + field_id(i16 BE) + VALUE
+//
+//   VALUE, by type_byte:
+//     BOOL(2)    1 byte, 0x00/0x01
+//     BYTE(3)    1 byte, signed
+//     DOUBLE(4)  8 bytes BE, IEEE-754 bit pattern (float_to_bits/float_from_bits)
+//     I16(6)     2 bytes BE, signed
+//     I32(8)     4 bytes BE, signed
+//     I64(10)    8 bytes BE, signed
+//     STRING(11) i32 BE len + raw bytes (Thrift has ONE wire type for both
+//                text strings and binary blobs — see STRING SAFETY below)
+//     STRUCT(12) nested STRUCT (recursive)
+//     MAP(13)    key_type(i8) + value_type(i8) + size(i32 BE) + (key,value)*size
+//     SET(14)    elem_type(i8) + size(i32 BE) + elem*size          (LIST-shaped)
+//     LIST(15)   elem_type(i8) + size(i32 BE) + elem*size
+//
+//   All multi-byte integers are BIG-ENDIAN two's-complement (network order —
+//   the OPPOSITE endianness from this codebase's std/encoding/bson, which is
+//   LE per the BSON spec; do not mix the two mentally).
+//
+// REUSE. Built entirely on std/encoding/pack for the big-endian fixed-width
+// integer byte math (pack_u8/pack_i8/pack_i16_be/pack_i32_be/pack_i64_be and
+// the unpack_* counterparts) — no byte-shift arithmetic is reimplemented
+// here. float_to_bits/float_from_bits (NOVA builtins, same ones bson.nova
+// uses) provide the IEEE-754 double <-> i64 bit reinterpret.
+//
+// THE FIELD-TYPE PROBLEM (why encoding needs explicit typed builders).
+//   Thrift's IDL assigns every struct field a FIXED wire width chosen at
+//   compile time (byte vs i16 vs i32 vs i64, or bool vs int for a 0/1
+//   value) — but NOVA's `any`/`int` values carry no width, and
+//   type_of(true) == "int" (see reference_nova_string_nul_truncation /
+//   the codebase-wide bool-int ambiguity also documented in bson.nova and
+//   std/data/msgpack). A generic "infer the wire type from the NOVA value"
+//   encoder therefore CANNOT know whether an int field should be BYTE, I16,
+//   I32, or I64, nor whether a 0/1 int means BOOL or literal integer 1.
+//   This module resolves it the same way real Thrift generated code does:
+//   the CALLER states the field's wire type explicitly, via one typed
+//   builder per TType (thrift_field_i16, thrift_field_bool, ...). DECODE
+//   has no such ambiguity — the wire always carries an explicit type byte
+//   per field/element — so decode is fully generic.
+//
+// STRING SAFETY (checklist item 1 — binary 0x00 must never go through
+// bytes_to_str). Thrift's wire format uses the SAME type (STRING, 11) for
+// both text method-arguments and raw binary blobs; there is no separate
+// "binary" TType on the wire. To stay binary-safe unconditionally, a
+// decoded STRING field's value is always returned as NOVA `bytes` — NEVER
+// auto-converted to a NOVA string (which is C-string-shaped and would
+// silently truncate at an embedded 0x00, see
+// reference_nova_string_nul_truncation). Callers who know a given field is
+// text call thrift_str(fieldValue) to get a NOVA string. thrift_field_string
+// (the ENCODE-side builder) accepts either a NOVA string or `bytes` and
+// dispatches on type_of, so callers never have to convert by hand on the
+// way in. The MESSAGE NAME (part of the fixed message header, always a
+// method identifier, never arbitrary binary) is the one place this module
+// decodes straight to a NOVA string — with the same defensive length
+// clamping as every other length-prefixed read.
+//
+// PUBLIC API
+//   Type-code constants (0-arg fns — NOVA's module system only exports
+//   `fn` across an import boundary, not top-level `let`, same convention
+//   std/encoding/protobuf uses for its wire-type constants):
+//     tt_stop() tt_bool() tt_byte() tt_double() tt_i16() tt_i32() tt_i64()
+//     tt_string() tt_struct() tt_map() tt_set() tt_list()
+//   Message-type constants:
+//     tmt_call() tmt_reply() tmt_exception() tmt_oneway()
+//
+//   Field builders (each returns a normalized field record
+//   {"id":int,"ttype":int,"value":any} consumed by thrift_encode_struct):
+//     thrift_field_bool(id, v)      v: any int/bool, 0 -> FALSE, else TRUE
+//     thrift_field_byte(id, v)      v: int, wraps to signed 8-bit on encode
+//     thrift_field_i16(id, v)       v: int, wraps to signed 16-bit on encode
+//     thrift_field_i32(id, v)       v: int, wraps to signed 32-bit on encode
+//     thrift_field_i64(id, v)       v: int (NOVA int IS 64-bit, no wrap)
+//     thrift_field_double(id, v)    v: float
+//     thrift_field_string(id, v)    v: string OR bytes (auto-dispatched)
+//     thrift_field_struct(id, fs)   fs: list of field records (nested struct)
+//     thrift_field_list(id, etype, items)   etype: a tt_*() code; items: list
+//     thrift_field_set(id, etype, items)    same shape as list on the wire
+//     thrift_field_map(id, ktype, vtype, pairs)  pairs: list of [k, v]
+//       Elements/keys/values of container fields whose type is itself
+//       STRUCT/LIST/SET/MAP must be shaped exactly like this module's own
+//       decode output for that type (a fields-list for STRUCT; a
+//       {"etype","items"} dict for LIST/SET; a {"ktype","vtype","pairs"}
+//       dict for MAP) — the encoder/decoder are symmetric and recursive.
+//
+//   Struct-level:
+//     thrift_encode_struct(fields) -> bytes
+//     thrift_decode_struct(b, pos) -> [fields, next_pos]
+//     thrift_struct_get(fields, id) -> field record, or `null` if absent
+//       (per codebase convention, `null` reads back as raw 0 — check
+//       type_of(result) == "dict" before trusting a "found" result, or just
+//       compare against a variable you know is not itself the record)
+//
+//   Message-level:
+//     thrift_encode_message(name, mtype, seqid, fields) -> bytes
+//     thrift_decode_message(b) -> dict:
+//       {"ok":0|1, "mtype":int, "name":string, "seqid":int,
+//        "fields":list, "next_pos":int}
+//       ok=0 on a too-short buffer or an unrecognized (non-VERSION_1)
+//       header — see NEVER-EXIT-ON-BAD-INPUT below; the dict's other keys
+//       still hold safe defaults so a caller that skips the ok check
+//       degrades gracefully instead of reading garbage.
+//
+//   thrift_str(v) -> string   convenience: bytes -> bytes_to_str(v),
+//                              string -> v unchanged, anything else -> str(v)
+//
+// NEVER EXIT(1) ON BAD INPUT (checklist item 9). Every decode path in this
+// module is defensive-clamp style (same technique as std/encoding/protobuf's
+// pb_read_len_delim / pb_decode_fixed32_field): declared lengths/sizes are
+// clamped to what is actually available in the buffer before a single byte
+// is read, bytes_get/bytes_slice (the NOVA runtime primitives underneath)
+// are themselves bounds-checked and return a safe zero/empty result rather
+// than reading out of bounds, and every decode loop carries a
+// stagnation guard (if the cursor fails to advance, the loop stops instead
+// of spinning forever). A truncated or malformed buffer therefore always
+// degrades to a partial/best-effort result — it is the CALLER's choice
+// whether to treat that as fatal, never this library's.
+//
+// SYMBOL COLLISION GUARD: all private helpers are prefixed _th_.
+//
+// Depends on: std/encoding/pack (pack_u8/pack_i8/pack_i16_be/pack_i32_be/
+// pack_i64_be, unpack_u8/unpack_i8/unpack_i16_be/unpack_i32_be/
+// unpack_i64_be/unpack_u32_be). No other dependencies.
+// ============================================================================
+
+import std/encoding/pack
+
+// ── wire type-code constants ────────────────────────────────────────────────
+
+fn tt_stop() -> int
+    0
+
+fn tt_bool() -> int
+    2
+
+fn tt_byte() -> int
+    3
+
+fn tt_double() -> int
+    4
+
+fn tt_i16() -> int
+    6
+
+fn tt_i32() -> int
+    8
+
+fn tt_i64() -> int
+    10
+
+fn tt_string() -> int
+    11
+
+fn tt_struct() -> int
+    12
+
+fn tt_map() -> int
+    13
+
+fn tt_set() -> int
+    14
+
+fn tt_list() -> int
+    15
+
+// ── message-type constants ──────────────────────────────────────────────────
+
+fn tmt_call() -> int
+    1
+
+fn tmt_reply() -> int
+    2
+
+fn tmt_exception() -> int
+    3
+
+fn tmt_oneway() -> int
+    4
+
+// STRICT header version marker (Apache Thrift TBinaryProtocol.VERSION_1),
+// occupies the top 16 bits of the 32-bit message header.
+fn _th_version1() -> int
+    0x80010000
+
+// ── string/convenience helper ───────────────────────────────────────────────
+
+fn thrift_str(v: any) -> string
+    if type_of(v) == "bytes"
+        return bytes_to_str(v)
+    if type_of(v) == "string"
+        return v
+    str(v)
+
+// ── encode: leaf/container value writer (generic — used by fields AND by
+// list/set/map elements recursively) ────────────────────────────────────────
+
+// _th_enc_string_or_bytes: STRING TType (11) — i32 BE len + raw payload
+// bytes. Accepts either a NOVA string or `bytes`; binary-safe either way
+// (never routes through a C-string-shaped intermediate for a `bytes` input).
+fn _th_enc_string_or_bytes(v: any) -> any
+    let payload = bytes_create(0)
+    if type_of(v) == "bytes"
+        payload = v
+    else
+        payload = str_to_bytes(v)
+    let out = pack_i32_be(bytes_len(payload))
+    bytes_concat(out, payload)
+
+// _th_enc_container_items: encode `items` back-to-back, each as `etype`.
+fn _th_enc_container_items(etype: int, items: any) -> any
+    let out = bytes_create(0)
+    let n = len(items)
+    let i = 0
+    while i < n
+        out = bytes_concat(out, _th_encode_value(etype, items[i]))
+        i = i + 1
+    out
+
+// _th_encode_value: encode the VALUE portion only (no type byte, no field
+// id) for `ttype`. Recursive for STRUCT/LIST/SET/MAP. An unrecognized
+// ttype encodes to an empty buffer — a documented safe fallback rather than
+// a crash (mirrors bson.nova's "unsupported types stay null" policy).
+fn _th_encode_value(ttype: int, value: any) -> any
+    if ttype == tt_bool()
+        let bv = 0
+        if value != 0
+            bv = 1
+        return pack_u8(bv)
+    if ttype == tt_byte()
+        return pack_i8(value)
+    if ttype == tt_i16()
+        return pack_i16_be(value)
+    if ttype == tt_i32()
+        return pack_i32_be(value)
+    if ttype == tt_i64()
+        return pack_i64_be(value)
+    if ttype == tt_double()
+        return pack_i64_be(float_to_bits(value))
+    if ttype == tt_string()
+        return _th_enc_string_or_bytes(value)
+    if ttype == tt_struct()
+        return thrift_encode_struct(value)
+    if ttype == tt_list() or ttype == tt_set()
+        let etype = value["etype"]
+        let items = value["items"]
+        let out = pack_u8(etype)
+        out = bytes_concat(out, pack_i32_be(len(items)))
+        return bytes_concat(out, _th_enc_container_items(etype, items))
+    if ttype == tt_map()
+        let ktype = value["ktype"]
+        let vtype = value["vtype"]
+        let pairs = value["pairs"]
+        let out = pack_u8(ktype)
+        out = bytes_concat(out, pack_u8(vtype))
+        out = bytes_concat(out, pack_i32_be(len(pairs)))
+        let n = len(pairs)
+        let i = 0
+        while i < n
+            let kv = pairs[i]
+            out = bytes_concat(out, _th_encode_value(ktype, kv[0]))
+            out = bytes_concat(out, _th_encode_value(vtype, kv[1]))
+            i = i + 1
+        return out
+    bytes_create(0)
+
+// _th_encode_field: type_byte + field_id(i16 BE) + value, for one field.
+fn _th_encode_field(f: any) -> any
+    let out = pack_u8(f["ttype"])
+    out = bytes_concat(out, pack_i16_be(f["id"]))
+    bytes_concat(out, _th_encode_value(f["ttype"], f["value"]))
+
+// ── field builders ───────────────────────────────────────────────────────────
+
+fn thrift_field_bool(id: int, v: any) -> any
+    let bv = 0
+    if v != 0
+        bv = 1
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_bool()
+    d["value"] = bv
+    d
+
+fn thrift_field_byte(id: int, v: int) -> any
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_byte()
+    d["value"] = v
+    d
+
+fn thrift_field_i16(id: int, v: int) -> any
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_i16()
+    d["value"] = v
+    d
+
+fn thrift_field_i32(id: int, v: int) -> any
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_i32()
+    d["value"] = v
+    d
+
+fn thrift_field_i64(id: int, v: int) -> any
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_i64()
+    d["value"] = v
+    d
+
+fn thrift_field_double(id: int, v: float) -> any
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_double()
+    d["value"] = v
+    d
+
+fn thrift_field_string(id: int, v: any) -> any
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_string()
+    d["value"] = v
+    d
+
+fn thrift_field_struct(id: int, fields: any) -> any
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_struct()
+    d["value"] = fields
+    d
+
+fn thrift_field_list(id: int, etype: int, items: any) -> any
+    let c = {}
+    c["etype"] = etype
+    c["items"] = items
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_list()
+    d["value"] = c
+    d
+
+fn thrift_field_set(id: int, etype: int, items: any) -> any
+    let c = {}
+    c["etype"] = etype
+    c["items"] = items
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_set()
+    d["value"] = c
+    d
+
+fn thrift_field_map(id: int, ktype: int, vtype: int, pairs: any) -> any
+    let c = {}
+    c["ktype"] = ktype
+    c["vtype"] = vtype
+    c["pairs"] = pairs
+    let d = {}
+    d["id"] = id
+    d["ttype"] = tt_map()
+    d["value"] = c
+    d
+
+// ── struct-level encode ─────────────────────────────────────────────────────
+
+// thrift_encode_struct: field* + STOP(0x00).
+fn thrift_encode_struct(fields: any) -> any
+    let out = bytes_create(0)
+    let n = len(fields)
+    let i = 0
+    while i < n
+        out = bytes_concat(out, _th_encode_field(fields[i]))
+        i = i + 1
+    bytes_append(out, tt_stop())
+
+// ── decode: generic value reader (bounds-defensive, never OOB, never
+// exit(1) — see module header) ──────────────────────────────────────────────
+
+// _th_dec_len_bytes: i32 BE declared length + raw payload bytes, clamped to
+// what is actually present in `b` (a truncated/negative/huge declared
+// length degrades to a truncated payload instead of an out-of-bounds read
+// or a runaway allocation). Returns [bytes_value, next_pos].
+fn _th_dec_len_bytes(b: any, pos: int) -> any
+    let blen = bytes_len(b)
+    let declared = unpack_i32_be(b, pos)
+    let data_start = pos + 4
+    let avail = blen - data_start
+    if avail < 0
+        avail = 0
+    let take = declared
+    if take < 0
+        take = 0
+    if take > avail
+        take = avail
+    let payload = bytes_slice(b, data_start, data_start + take)
+    let result = [payload, data_start + take]
+    result
+
+// _th_dec_container_items: decode `count` back-to-back elements of `etype`
+// starting at `pos`. Stagnation-guarded: if a decode step fails to advance
+// the cursor (only possible via an unrecognized nested ttype — see
+// _th_decode_value's fallback), the loop stops instead of spinning forever.
+fn _th_dec_container_items(etype: int, count: int, b: any, pos: int) -> any
+    let items = []
+    let cur = pos
+    let i = 0
+    while i < count
+        let before = cur
+        let r = _th_decode_value(etype, b, cur)
+        push(items, r[0])
+        cur = r[1]
+        if cur <= before
+            break
+        i = i + 1
+    let result = [items, cur]
+    result
+
+// _th_decode_value: decode the VALUE portion only for `ttype` at `pos`.
+// Returns [value, next_pos]. Recursive for STRUCT/LIST/SET/MAP. An
+// unrecognized ttype returns [null, pos] (NO cursor advance) — every caller
+// of this function checks for that stagnation and stops rather than looping.
+fn _th_decode_value(ttype: int, b: any, pos: int) -> any
+    let blen = bytes_len(b)
+    if ttype == tt_bool()
+        let v = unpack_u8(b, pos)
+        let bv = 0
+        if v != 0
+            bv = 1
+        return [bv, pos + 1]
+    if ttype == tt_byte()
+        return [unpack_i8(b, pos), pos + 1]
+    if ttype == tt_i16()
+        return [unpack_i16_be(b, pos), pos + 2]
+    if ttype == tt_i32()
+        return [unpack_i32_be(b, pos), pos + 4]
+    if ttype == tt_i64()
+        return [unpack_i64_be(b, pos), pos + 8]
+    if ttype == tt_double()
+        return [float_from_bits(unpack_i64_be(b, pos)), pos + 8]
+    if ttype == tt_string()
+        return _th_dec_len_bytes(b, pos)
+    if ttype == tt_struct()
+        return thrift_decode_struct(b, pos)
+    if ttype == tt_list() or ttype == tt_set()
+        let etype = unpack_u8(b, pos)
+        let declared = unpack_i32_be(b, pos + 1)
+        let cur = pos + 5
+        let avail = blen - cur
+        if avail < 0
+            avail = 0
+        let n = declared
+        if n < 0
+            n = 0
+        if n > avail
+            n = avail
+        let r = _th_dec_container_items(etype, n, b, cur)
+        let d = {}
+        d["etype"] = etype
+        d["items"] = r[0]
+        return [d, r[1]]
+    if ttype == tt_map()
+        let ktype = unpack_u8(b, pos)
+        let vtype = unpack_u8(b, pos + 1)
+        let declared = unpack_i32_be(b, pos + 2)
+        let cur = pos + 6
+        let avail = blen - cur
+        if avail < 0
+            avail = 0
+        let n = declared
+        if n < 0
+            n = 0
+        if n > avail
+            n = avail
+        let pairs = []
+        let i = 0
+        while i < n
+            let before = cur
+            let kr = _th_decode_value(ktype, b, cur)
+            cur = kr[1]
+            let vr = _th_decode_value(vtype, b, cur)
+            cur = vr[1]
+            push(pairs, [kr[0], vr[0]])
+            if cur <= before
+                break
+            i = i + 1
+        let d = {}
+        d["ktype"] = ktype
+        d["vtype"] = vtype
+        d["pairs"] = pairs
+        return [d, cur]
+    let result = [null, pos]
+    result
+
+// ── struct-level decode ─────────────────────────────────────────────────────
+
+// thrift_decode_struct: decode field* + STOP starting at `pos`. Returns
+// [fields, next_pos] where `fields` is a list of {"id","ttype","value"}
+// records, symmetric with thrift_field_*'s output shape. Never reads past
+// `b`'s length; a missing STOP (truncated struct) or an unrecognized type
+// byte simply ends the struct early with whatever fields were already
+// decoded, rather than crashing.
+fn thrift_decode_struct(b: any, pos: int) -> any
+    let blen = bytes_len(b)
+    let fields = []
+    let cur = pos
+    while cur < blen
+        let ttype = unpack_u8(b, cur)
+        if ttype == tt_stop()
+            cur = cur + 1
+            break
+        let known = ttype == tt_bool() or ttype == tt_byte() or ttype == tt_double() or ttype == tt_i16() or ttype == tt_i32() or ttype == tt_i64() or ttype == tt_string() or ttype == tt_struct() or ttype == tt_map() or ttype == tt_set() or ttype == tt_list()
+        if not known
+            break
+        if cur + 3 > blen
+            break
+        let fid = unpack_i16_be(b, cur + 1)
+        let before = cur
+        let r = _th_decode_value(ttype, b, cur + 3)
+        let fld = {}
+        fld["id"] = fid
+        fld["ttype"] = ttype
+        fld["value"] = r[0]
+        push(fields, fld)
+        cur = r[1]
+        if cur <= before
+            break
+    let result = [fields, cur]
+    result
+
+// thrift_struct_get: linear lookup of the first field with `id` in a
+// decoded (or hand-built) fields list. Returns the field record, or `null`
+// if absent — per codebase convention a bare `null` reads back as raw 0
+// (reference_nova_return_null_mistag), so check type_of(result) == "dict"
+// before trusting a "found" result if `id` 0 is itself a plausible field id.
+fn thrift_struct_get(fields: any, id: int) -> any
+    let n = len(fields)
+    let i = 0
+    let result = null
+    while i < n
+        if fields[i]["id"] == id
+            result = fields[i]
+        i = i + 1
+    result
+
+// ── message-level encode/decode ─────────────────────────────────────────────
+
+// thrift_encode_message: STRICT TBinaryProtocol message — header + name +
+// seqid + struct body.
+fn thrift_encode_message(name: string, mtype: int, seqid: int, fields: any) -> any
+    let header = _th_version1() | (mtype & 0xFF)
+    let out = pack_u32_be(header)
+    let nb = str_to_bytes(name)
+    out = bytes_concat(out, pack_i32_be(bytes_len(nb)))
+    out = bytes_concat(out, nb)
+    out = bytes_concat(out, pack_i32_be(seqid))
+    bytes_concat(out, thrift_encode_struct(fields))
+
+// thrift_decode_message: decode a STRICT TBinaryProtocol message from `b`
+// (offset 0). Returns {"ok","mtype","name","seqid","fields","next_pos"}.
+// ok=0 (with safe-default other fields) on a too-short buffer or a header
+// that is not VERSION_1 STRICT — this module does not implement the legacy
+// non-versioned message format (documented scope limit, not a silent gap);
+// per NEVER-EXIT-ON-BAD-INPUT this is reported in-band, never a crash/exit.
+fn thrift_decode_message(b: any) -> any
+    let blen = bytes_len(b)
+    let result = {}
+    result["ok"] = 0
+    result["mtype"] = 0
+    result["name"] = ""
+    result["seqid"] = 0
+    result["fields"] = []
+    result["next_pos"] = 0
+    if blen < 4
+        return result
+    let header = unpack_u32_be(b, 0)
+    let vtag = (header >> 16) & 0xFFFF
+    if vtag != 0x8001
+        return result
+    let mtype = header & 0xFF
+    // The name-length i32 prefix itself must be fully present before it is
+    // safe to read (unpack_i32_be on a too-short buffer silently yields 0,
+    // which previously masqueraded as a valid empty name instead of an error).
+    if blen < 8
+        return result
+    let name_len = unpack_i32_be(b, 4)
+    if name_len < 0
+        return result
+    let name_start = 8
+    let name_end = name_start + name_len
+    // The full name payload AND the trailing 4-byte seqid must both be
+    // present — a message truncated anywhere in between is an error, not a
+    // clamped/zero-padded default.
+    if blen < name_end + 4
+        return result
+    let name = bytes_to_str(bytes_slice(b, name_start, name_end))
+    let cur = name_end
+    let seqid = unpack_i32_be(b, cur)
+    cur = cur + 4
+    let sr = thrift_decode_struct(b, cur)
+    result["ok"] = 1
+    result["mtype"] = mtype
+    result["name"] = name
+    result["seqid"] = seqid
+    result["fields"] = sr[0]
+    result["next_pos"] = sr[1]
+    result

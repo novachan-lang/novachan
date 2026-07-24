@@ -1,0 +1,234 @@
+// ============================================================================
+// NOVA Standard Library — std/net/dns
+// ============================================================================
+// Top-level DNS (RFC 1035) message facade: builds queries, decodes full
+// messages, and resolves TYPED RDATA (A/AAAA/CNAME/NS/PTR/MX/SOA/TXT) with
+// compression-pointer following — on top of the leaf codecs already in
+// std/net/dns_header, std/net/dns_question, std/net/dns_rr, std/net/dns_types,
+// std/net/dns_rdata_a, std/net/dns_rdata_mx, std/net/dns_rdata_soa,
+// std/net/dns_rdata_txt.
+//
+// Everything below the header/question/RR wire framing is REUSED, not
+// reimplemented: this module owns exactly two things the leaf modules don't
+// provide — (1) a single-call query builder, and (2) a full-message decode
+// that resolves each RR's RDATA into a typed value using the record's
+// ABSOLUTE position in the message (required because RDATA fields like
+// CNAME/NS/PTR/MX/SOA names may carry RFC 1035 §4.1.4 compression pointers
+// that reference offsets anywhere earlier in the message — a pointer target
+// is meaningless once RDATA has been sliced out of its parent message, so
+// typed decoding must happen in the SAME pass that walks the message, before
+// position information is lost).
+//
+// PUBLIC API:
+//
+//   dns_encode_query(qname: string, qtype: int, qclass: int, id: int, rd: int) -> bytes
+//     Build a complete standard DNS query message: 12-byte header (QR=0,
+//     OPCODE=0, RD=rd, qdcount=1, all other counts 0) + one Question
+//     (qname/qtype/qclass).  Returns bytes(0) if qname has an invalid label
+//     (empty interior label or a label longer than 63 bytes) — NEVER exits.
+//
+//   dns_decode_message(b: bytes) -> dict
+//     Parse a full DNS message from wire bytes.  Returns:
+//       {"header": dict, "questions": list, "answers": list,
+//        "authority": list, "additional": list}
+//     "header" keys: id, qr, opcode, aa, tc, rd, ra, rcode,
+//                    qdcount, ancount, nscount, arcount.
+//     "questions" elements: {"name","type","class"}.
+//     RR-section (answers/authority/additional) elements:
+//       {"name","type","class","ttl","rdlength","rdata","rdata_typed"}
+//       "rdata"       — raw RDATA bytes (always present, binary-safe).
+//       "rdata_typed" — decoded value per QTYPE:
+//         A (1)      -> string  "1.2.3.4"
+//         NS (2)     -> string  domain name
+//         CNAME (5)  -> string  domain name
+//         SOA (6)    -> dict {"mname","rname","serial","refresh","retry","expire","minimum"}
+//         PTR (12)   -> string  domain name
+//         MX (15)    -> dict {"pref","exchange"}
+//         TXT (16)   -> list of BYTES character-strings (binary-safe; NOT
+//                       string — a character-string may contain 0x00)
+//         AAAA (28)  -> string  canonical IPv6
+//         other      -> bytes (same as "rdata", verbatim — never crashes on
+//                       an unknown/unsupported QTYPE)
+//     On truncated/malformed input, returns whatever sections were fully
+//     decoded before the point of failure — never crashes, never exits.
+//
+//   dns_decode_answers(b: bytes) -> list
+//     Shorthand: dns_decode_message(b)["answers"].
+//
+// DESIGN NOTES:
+//   * All private helpers are prefixed _dns_ to avoid symbol collisions.
+//   * Section RR decoding is one pass: dns_rr_decode(msg,pos) gives us
+//     [rec, next_pos] where next_pos is the offset immediately after RDATA.
+//     Since RDATA is always the LAST field of an RR (RFC 1035 §4.1.3), the
+//     absolute start offset of RDATA is exactly `next_pos - rdlength` — this
+//     lets us re-enter compression-pointer-aware name/RDATA decoders at the
+//     correct absolute message position without re-parsing the RR header.
+//   * Unknown QTYPEs never fail decoding of the surrounding message — the
+//     record is still returned with "rdata" (raw bytes) and "rdata_typed"
+//     falling back to the same raw bytes.
+//   * A label longer than 63 bytes, or an empty interior label, is REJECTED
+//     by returning bytes(0)/an error sentinel — this library NEVER calls
+//     exit() on malformed/adversarial input; only a caller (e.g. a KAT test)
+//     may choose to abort.
+//
+// WAVE — imports: std/net/dns_header, std/net/dns_question, std/net/dns_rr,
+//                  std/net/dns_rdata_a, std/net/dns_rdata_mx,
+//                  std/net/dns_rdata_soa, std/net/dns_rdata_txt.
+// ============================================================================
+
+import std/net/dns_header
+import std/net/dns_question
+import std/net/dns_rr
+import std/net/dns_rdata_a
+import std/net/dns_rdata_mx
+import std/net/dns_rdata_soa
+import std/net/dns_rdata_txt
+
+// ── Private: dispatch one RR's RDATA to its typed decoder ───────────────────
+//
+// msg         — full message bytes (needed for compression-pointer targets)
+// rtype       — RR TYPE field
+// rdata       — the already-sliced raw RDATA bytes for this RR
+// rdata_start — ABSOLUTE offset in msg where this RR's RDATA begins
+// rdlength    — RDATA byte length (from the RR header)
+//
+// Returns an `any`-typed decoded value; falls back to the raw rdata bytes
+// for any QTYPE this module doesn't have a specific decoder for. Never
+// crashes: every underlying decoder is itself bounds-checked and returns a
+// safe empty/zero result on malformed input, which we pass through as-is.
+fn _dns_typed_rdata(msg: bytes, rtype: int, rdata: bytes, rdata_start: int, rdlength: int) -> any
+    if rtype == 1
+        // A
+        return dns_a_decode(rdata)
+    if rtype == 28
+        // AAAA
+        return dns_aaaa_decode(rdata)
+    if rtype == 2 or rtype == 5 or rtype == 12
+        // NS, CNAME, PTR — single compressible domain name, bounded to this
+        // RR's own declared RDLENGTH window (never read into a following
+        // RR's bytes when RDLENGTH is too small for the name).
+        let nr = dns_name_rdata_decode_bounded(msg, rdata_start, rdlength)
+        return nr[0]
+    if rtype == 15
+        // MX — dns_mx_decode is itself RDLENGTH-bounded.
+        let mr = dns_mx_decode(msg, rdata_start, rdlength)
+        return mr[0]
+    if rtype == 6
+        // SOA — bounded to this RR's own declared RDLENGTH window.
+        let sr = dns_soa_decode_bounded(msg, rdata_start, rdlength)
+        return sr[0]
+    if rtype == 16
+        // TXT — no compression, decodes straight from the sliced bytes
+        return dns_txt_decode(rdata)
+    // Unknown/unsupported QTYPE: hand back the raw bytes untouched.
+    rdata
+
+// ── Private: decode one RR section (answers / authority / additional) ──────
+//
+// Decodes `count` consecutive RRs starting at byte offset `pos` in `msg`,
+// attaching "rdata_typed" to each while position information is still live.
+// Returns [list_of_typed_rr_dicts, next_pos]. Stops early (without erroring)
+// on any malformed/truncated RR — the caller gets whatever decoded cleanly.
+fn _dns_decode_rr_section(msg: bytes, pos: int, count: int) -> list
+    let mlen = bytes_len(msg)
+    let out = []
+    let i = 0
+    let cur = pos
+    let ok = true
+    while i < count and ok
+        if cur >= mlen
+            ok = false
+        else
+            let rr = dns_rr_decode(msg, cur)
+            let rec = rr[0]
+            let nxt = rr[1]
+            if nxt <= cur or not contains(rec, "type")
+                ok = false
+            else
+                let rtype = rec["type"]
+                let rdlength = rec["rdlength"]
+                let rdata = rec["rdata"]
+                let rdata_start = nxt - rdlength
+                let typed = _dns_typed_rdata(msg, rtype, rdata, rdata_start, rdlength)
+                let full = {"name": rec["name"], "type": rtype, "class": rec["class"], "ttl": rec["ttl"], "rdlength": rdlength, "rdata": rdata, "rdata_typed": typed}
+                out.push(full)
+                cur = nxt
+                i = i + 1
+    [out, cur]
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// dns_encode_query: build a complete standard DNS query message (header + one
+// Question). QR=0, OPCODE=0 (QUERY), RD=rd, qdcount=1, all other counts 0.
+// Returns bytes(0) on an invalid qname (label >63 bytes / empty interior
+// label) — never exits.
+//
+// dns_encode_query("example.com", 1, 1, 0x1234, 1)
+//   -> 12-byte header ++ 17-byte question == 29 bytes total
+fn dns_encode_query(qname: string, qtype: int, qclass: int, id: int, rd: int) -> bytes
+    let hdr_d = {"id": id, "qr": 0, "opcode": 0, "aa": 0, "tc": 0, "rd": rd, "ra": 0, "rcode": 0, "qdcount": 1, "ancount": 0, "nscount": 0, "arcount": 0}
+    let out = dns_header_encode(hdr_d)
+    let qenc = dns_question_encode(qname, qtype, qclass)
+    if bytes_len(qenc) == 0
+        return bytes(0)
+    bytes_concat(out, qenc)
+
+// dns_decode_message: parse a full DNS message from wire bytes.
+// Returns {"header","questions","answers","authority","additional"} — see
+// module header comment for the full shape. Never crashes; returns whatever
+// was fully decoded on truncated/malformed input.
+fn dns_decode_message(b: bytes) -> dict
+    let mlen = bytes_len(b)
+    let empty_hdr = {}
+    let bare = {"header": empty_hdr, "questions": [], "answers": [], "authority": [], "additional": []}
+    if mlen < 12
+        return bare
+
+    let hres = dns_header_decode(b, 0)
+    let hdr = hres[0]
+    let pos = hres[1]
+    if not contains(hdr, "id")
+        return bare
+
+    let qdcount = hdr["qdcount"]
+    let ancount = hdr["ancount"]
+    let nscount = hdr["nscount"]
+    let arcount = hdr["arcount"]
+
+    // ── Questions ────────────────────────────────────────────────────────────
+    let questions = []
+    let qi = 0
+    let qok = true
+    while qi < qdcount and qok
+        if pos >= mlen
+            qok = false
+        else
+            let qr = dns_question_decode(b, pos)
+            let qrec = qr[0]
+            let qnxt = qr[1]
+            if qnxt <= pos
+                qok = false
+            else
+                questions.push(qrec)
+                pos = qnxt
+                qi = qi + 1
+
+    // ── Answer / authority / additional (typed RDATA) ───────────────────────
+    let ans_r = _dns_decode_rr_section(b, pos, ancount)
+    let answers = ans_r[0]
+    pos = ans_r[1]
+
+    let au_r = _dns_decode_rr_section(b, pos, nscount)
+    let authority = au_r[0]
+    pos = au_r[1]
+
+    let ad_r = _dns_decode_rr_section(b, pos, arcount)
+    let additional = ad_r[0]
+    pos = ad_r[1]
+
+    {"header": hdr, "questions": questions, "answers": answers, "authority": authority, "additional": additional}
+
+// dns_decode_answers: shorthand — parse b and return only the (typed) answers list.
+fn dns_decode_answers(b: bytes) -> list
+    let m = dns_decode_message(b)
+    m["answers"]

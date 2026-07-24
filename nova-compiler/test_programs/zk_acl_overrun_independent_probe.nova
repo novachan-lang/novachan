@@ -1,0 +1,141 @@
+// INDEPENDENT adversarial probe (re-verification pass) for forge_zookeeper's zk_rd_acl_vector overrun
+// clamp. Written from scratch against the RE-DERIVED spec, not copied from the sibling KATs already in
+// this tree (forge_zookeeper_acl_bounds_test.nova / zk_adversarial_probe.nova) -- different buffer shapes,
+// different assertions, different threat scenario (malicious GetACLResponse with a Stat trailer).
+//
+// JUTE SPEC (Zookeeper.jute) RE-DERIVED:
+//   vector<ACL> = int count + count * ACL, ACL = int perms + Id, Id = ustring scheme + ustring id.
+//   ustring = int len + len UTF-8 bytes. Minimum on-wire size of ONE ACL entry (both strings empty) is
+//   perms(4) + scheme-len(4) + id-len(4) = 12 bytes. So for ANY buffer with `avail` bytes remaining after
+//   the count field, no more than floor(avail/12) whole ACL entries can possibly be backed by real data --
+//   a decoder that trusts a larger on-wire count is doing unbounded/attacker-controlled work (and, absent
+//   per-field clamps elsewhere, could walk past the buffer). The correct fix is exactly this bound.
+//
+// THREAT MODEL: the ZK server is untrusted (compromised / buggy / MITM'd) and returns a GetACLResponse
+// whose ACL-vector count field lies about how many entries follow. A conformant client library must
+// (1) never crash or read out of bounds, (2) never do work proportional to the LIED count (DoS), and
+// (3) never let the lie corrupt the parse position (next_off) past the real buffer, which would desync
+// every field the caller reads afterward (e.g. the trailing Stat in a real GetACLResponse).
+import forge_zookeeper
+
+fn main()
+    // ============================================================================================
+    // PROBE 1: count claims far more entries than the ENTIRE rest of the buffer could hold, with a
+    // Stat-shaped trailer present (68 bytes, the real wire size of a ZK Stat) right after enough bytes
+    // for a few genuine minimal ACL entries. This is the realistic "malicious GetACLResponse" shape:
+    // the attacker only needs to corrupt the ACL count field; the Stat bytes are otherwise legitimate.
+    // Assert: next_off never exceeds the buffer length (no OOB / no desync past the real data), and the
+    // number of entries actually decoded is bounded by floor(avail/12) regardless of the lied count.
+    // ============================================================================================
+    let real_entries = bytes(0)     // 2 genuine minimal ACL entries = 24 bytes of zero bytes
+    let z = 0
+    while z < 24
+        real_entries = bytes_append(real_entries, 0)
+        z = z + 1
+    let stat_trailer = bytes(0)     // 68 bytes standing in for a real Stat record (distinct fill byte)
+    let t = 0
+    while t < 68
+        stat_trailer = bytes_append(stat_trailer, 170)   // 0xAA filler, easy to spot if mis-consumed
+        t = t + 1
+    let payload = bytes_concat(real_entries, stat_trailer)
+    let lied_buf = bytes_concat(zk_wr_int(9999999), payload)   // count field LIES: claims ~10M entries
+    let total_len = bytes_len(lied_buf)
+    let avail1 = total_len - 4
+    let max_allowed = avail1 / 12
+    let dec1 = zk_rd_acl_vector(lied_buf, 0)
+    if dec1[1] > total_len
+        print("FAIL P1: next_off " + str(dec1[1]) + " overran buffer length " + str(total_len))
+        exit(1)
+    if len(dec1[0]) > max_allowed
+        print("FAIL P1: decoded " + str(len(dec1[0])) + " entries, more than the " + str(max_allowed) + " the buffer could possibly back")
+        exit(1)
+    if len(dec1[0]) < 1
+        print("FAIL P1: buffer genuinely backs several entries, decoder should not have clamped to zero")
+        exit(1)
+    print("OK P1: lied count 9999999 over a " + str(avail1) + "-byte trailer clamps to " + str(len(dec1[0])) + " entries (bound=" + str(max_allowed) + "), next_off=" + str(dec1[1]) + " <= buffer len " + str(total_len))
+
+    // ============================================================================================
+    // PROBE 2: non-multiple-of-12 remainder. avail deliberately NOT a clean multiple of the 12-byte
+    // minimum entry size, to check the bound uses floor division (not round-up, which would let the
+    // decoder claim an entry the buffer cannot actually back) and never crosses total_len.
+    // ============================================================================================
+    let odd_tail = bytes(0)
+    let w = 0
+    while w < 29                      // 29 = 2*12 + 5 leftover bytes (not enough for a 3rd minimal entry)
+        odd_tail = bytes_append(odd_tail, 0)
+        w = w + 1
+    let odd_buf = bytes_concat(zk_wr_int(500), odd_tail)
+    let odd_total = bytes_len(odd_buf)
+    let odd_avail = odd_total - 4
+    let odd_bound = odd_avail / 12    // NOVA integer division truncates toward zero == floor for avail>=0
+    let dec2 = zk_rd_acl_vector(odd_buf, 0)
+    if len(dec2[0]) != odd_bound
+        print("FAIL P2: 29-byte (non-multiple-of-12) trailer should clamp to floor(29/12)=" + str(odd_bound) + " entries, got " + str(len(dec2[0])))
+        exit(1)
+    if dec2[1] > odd_total
+        print("FAIL P2: next_off " + str(dec2[1]) + " overran buffer length " + str(odd_total))
+        exit(1)
+    print("OK P2: 29-byte odd-remainder trailer clamps to floor-division bound " + str(odd_bound) + " entries, no overrun")
+
+    // ============================================================================================
+    // PROBE 3: count field itself sits PAST the end of the buffer (off beyond bytes_len(b)). The count
+    // read degrades to 0 (bytes_get is bounds-checked in the runtime), and avail goes negative -- must
+    // clamp to 0 entries, not underflow into a huge unsigned bound or crash.
+    // ============================================================================================
+    let tiny = zk_wr_int(7)     // only 4 bytes total in the whole buffer
+    let dec3 = zk_rd_acl_vector(tiny, 100)   // off=100 is nowhere near the 4 real bytes
+    if len(dec3[0]) != 0
+        print("FAIL P3: off past end of buffer should decode 0 entries, got " + str(len(dec3[0])))
+        exit(1)
+    print("OK P3: off=100 into a 4-byte buffer decodes 0 entries (no underflow/crash)")
+
+    // ============================================================================================
+    // PROBE 4: INT32_MAX count (2147483647 -- the largest value the on-wire signed int can express
+    // without going negative) over a small legitimate buffer. Confirms the clamp handles the largest
+    // possible positive lie, not just "conveniently large" test values, with no integer overflow in the
+    // avail/12 bound computation.
+    // ============================================================================================
+    let small_tail = bytes(0)
+    let s = 0
+    while s < 12                       // exactly 1 minimal entry's worth
+        small_tail = bytes_append(small_tail, 0)
+        s = s + 1
+    let maxint_buf = bytes_concat(zk_wr_int(2147483647), small_tail)
+    let dec4 = zk_rd_acl_vector(maxint_buf, 0)
+    if len(dec4[0]) != 1
+        print("FAIL P4: INT32_MAX count over exactly-1-entry buffer should clamp to 1, got " + str(len(dec4[0])))
+        exit(1)
+    if dec4[1] != bytes_len(maxint_buf)
+        print("FAIL P4: INT32_MAX count over exactly-1-entry buffer should consume exactly the buffer, got next_off=" + str(dec4[1]))
+        exit(1)
+    print("OK P4: INT32_MAX (2147483647) lied count over a 1-entry buffer clamps to 1 entry, consumes exactly the buffer")
+
+    // ============================================================================================
+    // PROBE 5: legitimate, NON-minimal ACL vector (real scheme/id text, entries > 12 bytes each) still
+    // decodes fully and correctly -- proves the avail/12 bound (a conservative MINIMUM entry size) never
+    // false-positive-clamps real traffic where entries are larger than the minimum.
+    // ============================================================================================
+    let real_acl = [[31, "digest", "alice:secret"], [1, "world", "anyone"], [0, "ip", "10.0.0.1"]]
+    let vec_bytes = zk_wr_acl_vector(real_acl)
+    let dec5 = zk_rd_acl_vector(vec_bytes, 0)
+    if len(dec5[0]) != 3
+        print("FAIL P5: legitimate 3-entry (non-minimal) ACL vector should decode all 3 entries, got " + str(len(dec5[0])))
+        exit(1)
+    let e0 = dec5[0][0]
+    let e1 = dec5[0][1]
+    let e2 = dec5[0][2]
+    if e0[0] != 31 or e0[1] != "digest" or e0[2] != "alice:secret"
+        print("FAIL P5: entry 0 mismatch")
+        exit(1)
+    if e1[0] != 1 or e1[1] != "world" or e1[2] != "anyone"
+        print("FAIL P5: entry 1 mismatch")
+        exit(1)
+    if e2[0] != 0 or e2[1] != "ip" or e2[2] != "10.0.0.1"
+        print("FAIL P5: entry 2 mismatch")
+        exit(1)
+    if dec5[1] != bytes_len(vec_bytes)
+        print("FAIL P5: legitimate non-minimal vector should consume exactly the buffer, got next_off=" + str(dec5[1]) + " want " + str(bytes_len(vec_bytes)))
+        exit(1)
+    print("OK P5: legitimate 3-entry non-minimal ACL vector round-trips exactly (no false-positive clamp)")
+
+    print("PROBE-DONE zk_acl_overrun_independent (lied count over Stat-shaped trailer bounded+no-desync, odd-remainder floor bound, off-past-end safe, INT32_MAX lie bounded, real non-minimal vector unaffected)")

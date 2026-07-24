@@ -1,0 +1,408 @@
+// forge_zookeeper -- pure-NOVA Apache ZooKeeper wire-protocol client codec over raw TCP (reuses tcp_* the
+// same way forge_kafka / forge_pg / forge_mysql do). ZooKeeper's serialization is "jute": everything
+// BIG-ENDIAN, no varints, no compact encoding -- the simplest of the wire protocols this fleet has built.
+//
+// JUTE PRIMITIVES (see Zookeeper.jute in the ZK source tree):
+//   int      -> 4 bytes, signed, big-endian
+//   long     -> 8 bytes, signed, big-endian
+//   boolean  -> 1 byte, 0 = false, nonzero = true (we always write exactly 1)
+//   buffer   -> int len + `len` raw bytes; len == -1 means a NULL buffer (no bytes follow) -- this is
+//               ZooKeeper's binary-safe field (znode data, ACLs' opaque id, session passwd) and is the
+//               ONLY jute primitive this module round-trips through NOVA `bytes` (never `string`), so an
+//               embedded 0x00 byte is preserved exactly.
+//   ustring  -> int len (UTF-8 BYTE length, not char count) + `len` UTF-8 bytes. Used for text fields
+//               (paths, ACL scheme/id). Built on NOVA `string`, so it inherits NOVA's C-string-shaped
+//               storage -- an embedded 0x00 would truncate (reference_nova_string_nul_truncation). That's
+//               fine: znode PATHS and ACL scheme/id are UTF-8 text by protocol contract, never arbitrary
+//               binary; arbitrary binary belongs in a `buffer` field, which this module keeps 0x00-safe.
+//   vector<T>-> int count + `count` back-to-back T items, no per-item length/delimiter.
+//
+// FRAMING. Every request AND every response on the wire is a 4-byte big-endian length prefix followed by
+// that many bytes of payload (the "record" -- for a normal op this is RequestHeader+body or
+// ReplyHeader+body; the very first packet after connecting, ConnectRequest/ConnectResponse, has NO
+// RequestHeader/ReplyHeader -- it IS the record). This module names that shared piece `zk_frame`.
+//
+// WHY NOT std/encoding/pack: pack.nova's format-driven pack_fmt/unpack_fmt call exit(1) on a bad format
+// string or a short buffer -- exactly the "abort the whole process on malformed input" behavior this
+// library must NOT have (a library decodes a corrupt/truncated wire frame and returns an in-band error
+// signal; only the caller decides whether that's fatal). Its named per-width helpers (pack_u32_be etc.)
+// don't exit(1), but forge_kafka already established the proven, self-contained shift+mask idiom for this
+// exact class of module (nullable -1 sentinels, defensive length clamping) -- this module reuses THAT
+// idiom directly rather than mixing two byte-codec styles in one file.
+//
+// SCOPE: ConnectRequest/ConnectResponse, RequestHeader/ReplyHeader, and the five data ops named in the
+// spec (Create, GetData, SetData, Delete, Exists) plus Stat and ACL -- the complete read/write path for a
+// minimal ZK client. Auth/multi/watch-event ops are out of scope for this cut (documented, not silent).
+
+// ---- op type constants (RequestHeader.type) -------------------------------------------------------------
+fn zk_op_notification() -> int
+    0
+fn zk_op_create() -> int
+    1
+fn zk_op_delete() -> int
+    2
+fn zk_op_exists() -> int
+    3
+fn zk_op_get_data() -> int
+    4
+fn zk_op_set_data() -> int
+    5
+fn zk_op_get_acl() -> int
+    6
+fn zk_op_set_acl() -> int
+    7
+fn zk_op_get_children() -> int
+    8
+fn zk_op_sync() -> int
+    9
+fn zk_op_ping() -> int
+    11
+fn zk_op_get_children2() -> int
+    12
+fn zk_op_auth() -> int
+    100
+fn zk_op_set_watches() -> int
+    101
+fn zk_op_create_session() -> int
+    0 - 10
+fn zk_op_close_session() -> int
+    0 - 11
+fn zk_op_error() -> int
+    0 - 1
+
+// CreateRequest.flags (znode creation mode).
+fn zk_flag_persistent() -> int
+    0
+fn zk_flag_ephemeral() -> int
+    1
+fn zk_flag_sequence() -> int
+    2
+fn zk_flag_ephemeral_sequential() -> int
+    3
+
+// ---- big-endian integer codecs --------------------------------------------------------------------------
+// Shift+mask extraction is sign-agnostic (see forge_kafka's kf_be32/kf_be64 for the same argument): bits
+// (8*k .. 8*k+7) of a 64-bit two's-complement value never depend on how the shift fills vacated high bits,
+// so this is correct for negative n (e.g. zk_op_close_session = -11) without overflow-prone offset math.
+fn zk_wr_int(n: int) -> any
+    let b = bytes(0)
+    b = bytes_append(b, (n >> 24) & 255)
+    b = bytes_append(b, (n >> 16) & 255)
+    b = bytes_append(b, (n >> 8) & 255)
+    b = bytes_append(b, n & 255)
+    b
+
+fn zk_wr_long(n: int) -> any
+    let b = bytes(0)
+    b = bytes_append(b, (n >> 56) & 255)
+    b = bytes_append(b, (n >> 48) & 255)
+    b = bytes_append(b, (n >> 40) & 255)
+    b = bytes_append(b, (n >> 32) & 255)
+    b = bytes_append(b, (n >> 24) & 255)
+    b = bytes_append(b, (n >> 16) & 255)
+    b = bytes_append(b, (n >> 8) & 255)
+    b = bytes_append(b, n & 255)
+    b
+
+// boolean -> exactly 1 byte. Any truthy NOVA value (bool `true`, or a nonzero int since type_of(true) ==
+// "int" internally) writes 0x01; falsy (`false` / 0) writes 0x00.
+fn zk_wr_bool(v) -> any
+    let b = bytes(0)
+    if v
+        return bytes_append(b, 1)
+    bytes_append(b, 0)
+
+// Unsigned 32-bit read (0..4294967295) -- fits an i64 with room to spare.
+fn _zk_rd_u32(b, off: int) -> int
+    (bytes_get(b, off) * 16777216) + (bytes_get(b, off + 1) * 65536) + (bytes_get(b, off + 2) * 256) + bytes_get(b, off + 3)
+
+// Signed 32-bit read (RequestHeader.type, error codes, buffer/vector lengths use -1 as a sentinel).
+fn zk_rd_int(b, off: int) -> int
+    let u = _zk_rd_u32(b, off)
+    if u >= 2147483648
+        return u - 4294967296
+    u
+
+// Signed 64-bit read, built by shift-or across all 8 bytes -- the accumulator is exactly 64 bits wide, so
+// this naturally lands on the correct two's-complement result (positive or negative) with no separate
+// unsigned-then-rebase step (mirrors forge_kafka's kf_rd_i64).
+fn zk_rd_long(b, off: int) -> int
+    let v = 0
+    let i = 0
+    while i < 8
+        v = (v << 8) | bytes_get(b, off + i)
+        i = i + 1
+    v
+
+// -> bool. Any nonzero byte counts as true (matches the C ZK client's `*(char*)p != 0` reading).
+fn zk_rd_bool(b, off: int) -> bool
+    bytes_get(b, off) != 0
+
+// ---- buffer (nullable, binary-safe) ---------------------------------------------------------------------
+// v may be: null (writes length -1, no bytes), a `bytes` handle (written as-is, embedded 0x00 preserved),
+// or a `string` (UTF-8-encoded first -- convenience for callers building a text payload as a znode value).
+fn zk_wr_buffer(v) -> any
+    if v == null
+        return zk_wr_int(0 - 1)
+    let bs = v
+    if type_of(v) == "string"
+        bs = str_to_bytes(v)
+    bytes_concat(zk_wr_int(bytes_len(bs)), bs)
+
+// -> [bytes_or_null, next_off]. Defensive: any length < -1 (corrupt frame) is treated as an empty buffer
+// rather than fed to a negative-size slice; a length that overruns the available bytes is CLAMPED to what
+// remains (bytes_slice itself clamps `end` at the buffer boundary, so this can never read out of bounds --
+// it only prevents `next_off` from running past the real data and desyncing the rest of the parse).
+fn zk_rd_buffer(b, off: int) -> any
+    let n = zk_rd_int(b, off)
+    let start = off + 4
+    if n == (0 - 1)
+        return [null, start]
+    if n < 0
+        return [bytes(0), start]
+    let avail = bytes_len(b) - start
+    if avail < 0
+        avail = 0
+    let take = n
+    if take > avail
+        take = avail
+    [bytes_slice(b, start, start + take), start + take]
+
+// ---- ustring (UTF-8 text, byte-length-prefixed) ---------------------------------------------------------
+fn zk_wr_ustring(s: string) -> any
+    let sb = str_to_bytes(s)
+    bytes_concat(zk_wr_int(bytes_len(sb)), sb)
+
+// -> [string, next_off]. Same defensive length clamp as zk_rd_buffer -- a negative or overrunning length
+// in a corrupt/truncated frame degrades to an empty/truncated string instead of crashing the caller.
+fn zk_rd_ustring(b, off: int) -> any
+    let n = zk_rd_int(b, off)
+    let start = off + 4
+    if n < 0
+        return ["", start]
+    let avail = bytes_len(b) - start
+    if avail < 0
+        avail = 0
+    let take = n
+    if take > avail
+        take = avail
+    [bytes_to_str(bytes_slice(b, start, start + take)), start + take]
+
+// ---- Id / ACL --------------------------------------------------------------------------------------------
+// Id => scheme(ustring) id(ustring). ACL => perms(int) id(Id).
+fn zk_wr_acl(perms: int, scheme: string, id: string) -> any
+    let out = zk_wr_int(perms)
+    out = bytes_concat(out, zk_wr_ustring(scheme))
+    bytes_concat(out, zk_wr_ustring(id))
+
+// -> [[perms, scheme, id], next_off]
+fn zk_rd_acl(b, off: int) -> any
+    let perms = zk_rd_int(b, off)
+    let sr = zk_rd_ustring(b, off + 4)
+    let ir = zk_rd_ustring(b, sr[1])
+    [[perms, sr[0], ir[0]], ir[1]]
+
+// vector<ACL> -> int count + count * ACL. `acls` = list of [perms: int, scheme: string, id: string].
+fn zk_wr_acl_vector(acls: list) -> any
+    let out = zk_wr_int(len(acls))
+    let i = 0
+    while i < len(acls)
+        let a = acls[i]
+        out = bytes_concat(out, zk_wr_acl(a[0], a[1], a[2]))
+        i = i + 1
+    out
+
+// -> [list_of_[perms,scheme,id], next_off]. Count is clamped to >= 0 so a corrupt negative count can never
+// drive the loop into misparsing the rest of the buffer as ACL entries. Same right-side (overrun) bounds
+// discipline as zk_rd_buffer/zk_rd_ustring: the count is ALSO clamped against the bytes actually remaining
+// in `b` (avail = bytes_len(b) - p), using the minimum possible on-wire size of one ACL entry
+// (perms:4 + scheme-ustring:4 + id-ustring:4 = 12 bytes). Without this, a huge/corrupt count with little or
+// no backing data would loop `n` times manufacturing phantom all-empty ACL entries (zk_rd_ustring/zk_rd_int
+// degrade in-band rather than crash, so nothing "errors out" naturally) -- an unbounded-work / memory-
+// amplification vector driven entirely by an attacker-controlled length field.
+fn zk_rd_acl_vector(b, off: int) -> any
+    let n = zk_rd_int(b, off)
+    if n < 0
+        n = 0
+    let p = off + 4
+    let avail = bytes_len(b) - p
+    if avail < 0
+        avail = 0
+    let max_entries = avail / 12
+    if n > max_entries
+        n = max_entries
+    let out = []
+    let i = 0
+    while i < n
+        let r = zk_rd_acl(b, p)
+        push(out, r[0])
+        p = r[1]
+        i = i + 1
+    [out, p]
+
+// ---- Stat (returned by GetData/SetData/Exists/Create2) --------------------------------------------------
+// Stat => czxid(long) mzxid(long) ctime(long) mtime(long) version(int) cversion(int) aversion(int)
+//         ephemeralOwner(long) dataLength(int) numChildren(int) pzxid(long)
+fn zk_rd_stat(b, off: int) -> any
+    let czxid = zk_rd_long(b, off)
+    let mzxid = zk_rd_long(b, off + 8)
+    let ctime = zk_rd_long(b, off + 16)
+    let mtime = zk_rd_long(b, off + 24)
+    let version = zk_rd_int(b, off + 32)
+    let cversion = zk_rd_int(b, off + 36)
+    let aversion = zk_rd_int(b, off + 40)
+    let ephemeral_owner = zk_rd_long(b, off + 44)
+    let data_length = zk_rd_int(b, off + 52)
+    let num_children = zk_rd_int(b, off + 56)
+    let pzxid = zk_rd_long(b, off + 60)
+    let stat = {}
+    stat["czxid"] = czxid
+    stat["mzxid"] = mzxid
+    stat["ctime"] = ctime
+    stat["mtime"] = mtime
+    stat["version"] = version
+    stat["cversion"] = cversion
+    stat["aversion"] = aversion
+    stat["ephemeralOwner"] = ephemeral_owner
+    stat["dataLength"] = data_length
+    stat["numChildren"] = num_children
+    stat["pzxid"] = pzxid
+    [stat, off + 68]
+
+// ---- ConnectRequest / ConnectResponse (no RequestHeader/ReplyHeader -- these ARE the record) ------------
+// ConnectRequest => protocolVersion(int) lastZxidSeen(long) timeOut(int) sessionId(long) passwd(buffer)
+fn zk_connect_request(protocol_version: int, last_zxid_seen: int, timeout_ms: int, session_id: int, passwd) -> any
+    let b = zk_wr_int(protocol_version)
+    b = bytes_concat(b, zk_wr_long(last_zxid_seen))
+    b = bytes_concat(b, zk_wr_int(timeout_ms))
+    b = bytes_concat(b, zk_wr_long(session_id))
+    bytes_concat(b, zk_wr_buffer(passwd))
+
+// ConnectResponse => protocolVersion(int) timeOut(int) sessionId(long) passwd(buffer)
+// -> [protocol_version, timeout_ms, session_id, passwd_or_null, next_off]
+fn zk_parse_connect_response(b, off: int) -> any
+    let protocol_version = zk_rd_int(b, off)
+    let timeout_ms = zk_rd_int(b, off + 4)
+    let session_id = zk_rd_long(b, off + 8)
+    let pr = zk_rd_buffer(b, off + 16)
+    [protocol_version, timeout_ms, session_id, pr[0], pr[1]]
+
+// ---- RequestHeader / ReplyHeader ---------------------------------------------------------------------
+// RequestHeader => xid(int) type(int)
+fn zk_request_header(xid: int, op_type: int) -> any
+    bytes_concat(zk_wr_int(xid), zk_wr_int(op_type))
+
+// -> [xid, type, next_off]
+fn zk_parse_request_header(b, off: int) -> any
+    let xid = zk_rd_int(b, off)
+    let op_type = zk_rd_int(b, off + 4)
+    [xid, op_type, off + 8]
+
+// ReplyHeader => xid(int) zxid(long) err(int)
+fn zk_parse_reply_header(b, off: int) -> any
+    let xid = zk_rd_int(b, off)
+    let zxid = zk_rd_long(b, off + 4)
+    let err = zk_rd_int(b, off + 12)
+    [xid, zxid, err, off + 16]
+
+// ---- Create (op 1) ----------------------------------------------------------------------------------
+// CreateRequest => path(ustring) data(buffer) acl(vector<ACL>) flags(int)
+// `acl` = list of [perms: int, scheme: string, id: string].
+fn zk_create_request(path: string, data, acl: list, flags: int) -> any
+    let b = zk_wr_ustring(path)
+    b = bytes_concat(b, zk_wr_buffer(data))
+    b = bytes_concat(b, zk_wr_acl_vector(acl))
+    bytes_concat(b, zk_wr_int(flags))
+
+// CreateResponse => path(ustring). -> [path, next_off]
+fn zk_parse_create_response(b, off: int) -> any
+    zk_rd_ustring(b, off)
+
+// ---- GetData (op 4) ---------------------------------------------------------------------------------
+// GetDataRequest => path(ustring) watch(boolean)
+fn zk_get_data_request(path: string, watch: bool) -> any
+    bytes_concat(zk_wr_ustring(path), zk_wr_bool(watch))
+
+// GetDataResponse => data(buffer) stat(Stat). -> [data_or_null, stat, next_off]
+fn zk_parse_get_data_response(b, off: int) -> any
+    let dr = zk_rd_buffer(b, off)
+    let sr = zk_rd_stat(b, dr[1])
+    [dr[0], sr[0], sr[1]]
+
+// ---- SetData (op 5) ---------------------------------------------------------------------------------
+// SetDataRequest => path(ustring) data(buffer) version(int)  (version -1 = "match any version")
+fn zk_set_data_request(path: string, data, version: int) -> any
+    let b = zk_wr_ustring(path)
+    b = bytes_concat(b, zk_wr_buffer(data))
+    bytes_concat(b, zk_wr_int(version))
+
+// SetDataResponse => stat(Stat). -> [stat, next_off]
+fn zk_parse_set_data_response(b, off: int) -> any
+    zk_rd_stat(b, off)
+
+// ---- Delete (op 2) ----------------------------------------------------------------------------------
+// DeleteRequest => path(ustring) version(int). DeleteResponse has an empty body (only the ReplyHeader).
+fn zk_delete_request(path: string, version: int) -> any
+    bytes_concat(zk_wr_ustring(path), zk_wr_int(version))
+
+// ---- Exists (op 3) ----------------------------------------------------------------------------------
+// ExistsRequest => path(ustring) watch(boolean)
+fn zk_exists_request(path: string, watch: bool) -> any
+    bytes_concat(zk_wr_ustring(path), zk_wr_bool(watch))
+
+// ExistsResponse => stat(Stat) -- ONLY present when ReplyHeader.err == 0 (a "no such node" reply carries
+// err = -101 and NO stat body; callers must check the ReplyHeader err before calling this). -> [stat, next_off]
+fn zk_parse_exists_response(b, off: int) -> any
+    zk_rd_stat(b, off)
+
+// ---- outer 4-byte length-prefixed framing (shared by every request AND response) --------------------
+fn zk_frame(payload) -> any
+    bytes_concat(zk_wr_int(bytes_len(payload)), payload)
+
+// Read the leading int32 length prefix of a frame (defensively: a frame shorter than 4 bytes reads as -1,
+// never crashes on an out-of-range bytes_get -- bytes_get itself already returns 0 for an OOB index).
+fn zk_frame_len(b) -> int
+    if bytes_len(b) < 4
+        return 0 - 1
+    zk_rd_int(b, 0)
+
+// Frame a full request: 4-byte length prefix + header + body.
+fn zk_frame_request(header, body) -> any
+    zk_frame(bytes_concat(header, body))
+
+// ---- TCP transport ----------------------------------------------------------------------------------
+fn zk_connect(host: string, port: int) -> any
+    tcp_connect(host, port)
+
+fn zk_close(sock)
+    tcp_close(sock)
+
+fn zk_send(sock, framed_bytes)
+    tcp_send_bytes(sock, framed_bytes)
+
+fn _zk_recv_at_least(sock: int, buf, need: int) -> any
+    while bytes_len(buf) < need
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return buf
+        buf = bytes_concat(buf, chunk)
+    buf
+
+// Read one full length-prefixed frame off the wire -> [payload_bytes, leftover_buf]. `payload_bytes`
+// excludes the 4-byte length prefix (it is either a ConnectResponse body, or ReplyHeader+op-body -- the
+// caller knows which, based on connection state, and parses accordingly). A short read / closed connection
+// before a full frame arrives returns [null, buf] rather than throwing -- in-band failure, per the
+// never-exit(1)-on-bad-input contract.
+fn zk_recv_frame(sock: int, buf) -> any
+    buf = _zk_recv_at_least(sock, buf, 4)
+    if bytes_len(buf) < 4
+        return [null, buf]
+    let size = zk_rd_int(buf, 0)
+    if size < 0
+        return [null, bytes_slice(buf, 4, bytes_len(buf))]
+    let total = 4 + size
+    buf = _zk_recv_at_least(sock, buf, total)
+    if bytes_len(buf) < total
+        return [null, buf]
+    let payload = bytes_slice(buf, 4, total)
+    [payload, bytes_slice(buf, total, bytes_len(buf))]

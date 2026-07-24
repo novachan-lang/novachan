@@ -1,0 +1,346 @@
+// ============================================================================
+// KAT for std/net/dns (top-level facade)
+// ============================================================================
+// Vectors:
+//   (1) Question-encode exact bytes for "example.com" QTYPE A, QCLASS IN:
+//       07 65 78 61 6D 70 6C 65 03 63 6F 6D 00 00 01 00 01  (17 bytes)
+//   (2) dns_encode_query builds a full query message: 12-byte header + the
+//       17-byte question above == 29 bytes, with correct header fields.
+//   (3) Decode a response containing an A record (4-byte IP) AND a name that
+//       uses an RFC 1035 §4.1.4 compression POINTER back to the question name.
+//   (4) A label > 63 bytes is REJECTED (bytes(0)/empty), never exit(1).
+//   (5) Round-trip every DNS header flag field (qr/opcode/aa/tc/rd/ra/rcode).
+//   (6) Typed RDATA for CNAME resolves a compressed name; unknown QTYPE falls
+//       back to raw rdata bytes without crashing.
+// ============================================================================
+import std/net/dns
+import std/net/dns_question
+import std/net/dns_header
+import std/net/dns_rdata_soa
+import std/net/dns_rdata_a
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        exit(1)
+
+fn ckb_byte(label: string, b: bytes, i: int, want: int)
+    let got = bytes_get(b, i)
+    if got != want
+        print("FAIL " + label + " byte[" + str(i) + "]: got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn main()
+    // ── (1) Question encode: exact byte-for-byte match ──────────────────────
+    let q_wire = dns_question_encode("example.com", 1, 1)
+    cki("q1.len", bytes_len(q_wire), 17)
+    let expect1 = [0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x03, 0x63, 0x6F, 0x6D, 0x00, 0x00, 0x01, 0x00, 0x01]
+    let i1 = 0
+    while i1 < 17
+        ckb_byte("q1", q_wire, i1, expect1[i1])
+        i1 = i1 + 1
+
+    // ── (2) Full query message via dns_encode_query ─────────────────────────
+    let query = dns_encode_query("example.com", 1, 1, 0x1234, 1)
+    cki("query.len", bytes_len(query), 29)
+    // Header: ID
+    ckb_byte("query.id.hi", query, 0, 0x12)
+    ckb_byte("query.id.lo", query, 1, 0x34)
+    // Header: flags — QR=0, OPCODE=0, RD=1 -> 0x0100
+    ckb_byte("query.flags.hi", query, 2, 0x01)
+    ckb_byte("query.flags.lo", query, 3, 0x00)
+    // Header: qdcount=1, ancount=0, nscount=0, arcount=0
+    ckb_byte("query.qdcount.hi", query, 4, 0x00)
+    ckb_byte("query.qdcount.lo", query, 5, 0x01)
+    ckb_byte("query.ancount.hi", query, 6, 0x00)
+    ckb_byte("query.ancount.lo", query, 7, 0x00)
+    ckb_byte("query.nscount.hi", query, 8, 0x00)
+    ckb_byte("query.nscount.lo", query, 9, 0x00)
+    ckb_byte("query.arcount.hi", query, 10, 0x00)
+    ckb_byte("query.arcount.lo", query, 11, 0x00)
+    // Question section starts at byte 12 and must match vector (1) exactly.
+    let i2 = 0
+    while i2 < 17
+        ckb_byte("query.question", query, 12 + i2, expect1[i2])
+        i2 = i2 + 1
+    // Decoding the query we just built must round-trip through dns_decode_message.
+    let qmsg = dns_decode_message(query)
+    let qhdr = qmsg["header"]
+    cki("query.decode.id", qhdr["id"], 0x1234)
+    cki("query.decode.rd", qhdr["rd"], 1)
+    cki("query.decode.qdcount", qhdr["qdcount"], 1)
+    let qq = qmsg["questions"]
+    cki("query.decode.qcount", len(qq), 1)
+    cks("query.decode.qname", qq[0]["name"], "example.com")
+    cki("query.decode.qtype", qq[0]["type"], 1)
+
+    // ── (3) Response: A record + a compressed-pointer name ──────────────────
+    // Build by hand: header (id=0xABCD, QR=1, RD=1, RA=1, ancount=1) +
+    // question (example.com A IN, 17 bytes at offset 12..28) +
+    // one answer RR whose NAME is a compression POINTER to offset 12 (the
+    // question's QNAME), TYPE=A(1), CLASS=IN(1), TTL=300, RDLENGTH=4,
+    // RDATA = 93.184.216.34 (example.com's real A record, as a KAT vector).
+    let resp = bytes(0)
+    // header: id
+    resp = bytes_append(resp, 0xAB)
+    resp = bytes_append(resp, 0xCD)
+    // flags: QR=1(bit15) RD=1(bit8) RA=1(bit7) -> 0x8000 | 0x0100 | 0x0080 = 0x8180
+    resp = bytes_append(resp, 0x81)
+    resp = bytes_append(resp, 0x80)
+    // qdcount=1
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // ancount=1
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // nscount=0, arcount=0
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x00)
+    // question: example.com A IN (offset 12..28, 17 bytes)
+    resp = bytes_concat(resp, q_wire)
+    // answer RR: NAME = pointer to offset 12 (0xC0 0x0C)
+    resp = bytes_append(resp, 0xC0)
+    resp = bytes_append(resp, 0x0C)
+    // TYPE=A(1)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // CLASS=IN(1)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    // TTL=300 (0x0000012C)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x01)
+    resp = bytes_append(resp, 0x2C)
+    // RDLENGTH=4
+    resp = bytes_append(resp, 0x00)
+    resp = bytes_append(resp, 0x04)
+    // RDATA = 93.184.216.34
+    resp = bytes_append(resp, 93)
+    resp = bytes_append(resp, 184)
+    resp = bytes_append(resp, 216)
+    resp = bytes_append(resp, 34)
+
+    let dec = dns_decode_message(resp)
+    let dhdr = dec["header"]
+    cki("resp.id", dhdr["id"], 0xABCD)
+    cki("resp.qr", dhdr["qr"], 1)
+    cki("resp.rd", dhdr["rd"], 1)
+    cki("resp.ra", dhdr["ra"], 1)
+    cki("resp.ancount", dhdr["ancount"], 1)
+    let dans = dec["answers"]
+    cki("resp.answers.count", len(dans), 1)
+    let a0 = dans[0]
+    // The compressed pointer must resolve to the exact question name.
+    cks("resp.answer.name", a0["name"], "example.com")
+    cki("resp.answer.type", a0["type"], 1)
+    cki("resp.answer.ttl", a0["ttl"], 300)
+    cki("resp.answer.rdlength", a0["rdlength"], 4)
+    let rdata = a0["rdata"]
+    ckb_byte("resp.rdata0", rdata, 0, 93)
+    ckb_byte("resp.rdata1", rdata, 1, 184)
+    ckb_byte("resp.rdata2", rdata, 2, 216)
+    ckb_byte("resp.rdata3", rdata, 3, 34)
+    // Typed RDATA must be the dotted-quad string.
+    cks("resp.answer.rdata_typed", a0["rdata_typed"], "93.184.216.34")
+
+    // ── (4) Label > 63 bytes is REJECTED, never exit(1) ─────────────────────
+    let long_label = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"  // 65 'a's
+    cki("longlabel.len", len(long_label), 65)
+    let bad_q = dns_question_encode(long_label + ".com", 1, 1)
+    cki("badlabel.question", bytes_len(bad_q), 0)
+    let bad_query = dns_encode_query(long_label + ".com", 1, 1, 1, 1)
+    cki("badlabel.query", bytes_len(bad_query), 0)
+    // An empty interior label ("a..b.com") is also rejected the same way.
+    let bad_q2 = dns_question_encode("a..b.com", 1, 1)
+    cki("emptylabel.question", bytes_len(bad_q2), 0)
+    // Program did NOT exit — reaching here proves in-band rejection worked.
+    print("label-reject: no crash, no exit")
+
+    // ── (5) Round-trip every header flag field ───────────────────────────────
+    let flags_hdr = {"id": 0x5555, "qr": 1, "opcode": 15, "aa": 1, "tc": 1, "rd": 1, "ra": 1, "rcode": 15, "qdcount": 0, "ancount": 0, "nscount": 0, "arcount": 0}
+    let flags_wire = dns_header_encode(flags_hdr)
+    let flags_dec = dns_header_decode(flags_wire, 0)
+    let fh = flags_dec[0]
+    cki("flags.id", fh["id"], 0x5555)
+    cki("flags.qr", fh["qr"], 1)
+    cki("flags.opcode", fh["opcode"], 15)
+    cki("flags.aa", fh["aa"], 1)
+    cki("flags.tc", fh["tc"], 1)
+    cki("flags.rd", fh["rd"], 1)
+    cki("flags.ra", fh["ra"], 1)
+    cki("flags.rcode", fh["rcode"], 15)
+    // And the all-zero case (clean QUERY defaults).
+    let zero_hdr = {"id": 0, "qr": 0, "opcode": 0, "aa": 0, "tc": 0, "rd": 0, "ra": 0, "rcode": 0, "qdcount": 0, "ancount": 0, "nscount": 0, "arcount": 0}
+    let zero_wire = dns_header_encode(zero_hdr)
+    let zero_dec = dns_header_decode(zero_wire, 0)
+    let zh = zero_dec[0]
+    cki("zero.qr", zh["qr"], 0)
+    cki("zero.opcode", zh["opcode"], 0)
+    cki("zero.rcode", zh["rcode"], 0)
+
+    // ── (6) Typed RDATA: CNAME via compression pointer + unknown QTYPE ──────
+    // Build: header (ancount=1) + question (target.example.com CNAME IN) +
+    // answer RR: NAME=pointer(12), TYPE=CNAME(5), RDATA = pointer(12) itself
+    // (i.e. CNAME target == the question's own name, exercising the RDATA
+    // compression-pointer path specifically, not just the RR NAME path).
+    let cname_q = dns_question_encode("target.example.com", 5, 1)
+    let msg2 = bytes(0)
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x01)   // id=1
+    msg2 = bytes_append(msg2, 0x80)
+    msg2 = bytes_append(msg2, 0x00)   // flags: QR=1
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x01)   // qdcount=1
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x01)   // ancount=1
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x00)   // nscount=0
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x00)   // arcount=0
+    msg2 = bytes_concat(msg2, cname_q)
+    // answer RR
+    msg2 = bytes_append(msg2, 0xC0)
+    msg2 = bytes_append(msg2, 0x0C)   // NAME -> pointer to offset 12
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x05)   // TYPE=CNAME(5)
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x01)   // CLASS=IN
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x3C)   // TTL=60
+    msg2 = bytes_append(msg2, 0x00)
+    msg2 = bytes_append(msg2, 0x02)   // RDLENGTH=2 (a bare pointer)
+    msg2 = bytes_append(msg2, 0xC0)
+    msg2 = bytes_append(msg2, 0x0C)   // RDATA = pointer to offset 12 (self-name)
+
+    let dec2 = dns_decode_message(msg2)
+    let ans2 = dec2["answers"]
+    cki("cname.ans.count", len(ans2), 1)
+    cks("cname.rdata_typed", ans2[0]["rdata_typed"], "target.example.com")
+
+    // Unknown QTYPE (999) falls back to raw rdata bytes, never crashes.
+    let unk = bytes(0)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x02)   // id=2
+    unk = bytes_append(unk, 0x80)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)   // qdcount=0
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x01)   // ancount=1
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)   // NAME = root
+    unk = bytes_append(unk, 0x03)
+    unk = bytes_append(unk, 0xE7)   // TYPE=999
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x01)   // CLASS=IN
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x00)   // TTL=0
+    unk = bytes_append(unk, 0x00)
+    unk = bytes_append(unk, 0x02)   // RDLENGTH=2
+    unk = bytes_append(unk, 0xDE)
+    unk = bytes_append(unk, 0xAD)   // opaque RDATA
+
+    let dec3 = dns_decode_message(unk)
+    let ans3 = dec3["answers"]
+    cki("unk.ans.count", len(ans3), 1)
+    let unk_rdata = ans3[0]["rdata_typed"]
+    cki("unk.rdata_typed.len", bytes_len(unk_rdata), 2)
+    ckb_byte("unk.rdata_typed0", unk_rdata, 0, 0xDE)
+    ckb_byte("unk.rdata_typed1", unk_rdata, 1, 0xAD)
+
+    // ── (7) Authority-section decoding + AAAA/SOA/TXT typed RDATA ───────────
+    // header: qdcount=0, ancount=0, nscount=1 (SOA in AUTHORITY), arcount=1
+    // (AAAA in ADDITIONAL) — exercises _dns_decode_rr_section for sections
+    // OTHER than "answers", proving position-tracking is section-generic.
+    let m7 = bytes(0)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x03)   // id=3
+    m7 = bytes_append(m7, 0x80)
+    m7 = bytes_append(m7, 0x00)   // flags QR=1
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)   // qdcount=0
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)   // ancount=0
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x01)   // nscount=1
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x01)   // arcount=1
+    // authority RR: NAME=root, TYPE=SOA(6), CLASS=IN, TTL=3600, RDLENGTH=?, RDATA=SOA
+    let soa_rdata = dns_soa_encode("ns.example.com", "root.example.com", 2024010101, 7200, 3600, 1209600, 3600)
+    m7 = bytes_append(m7, 0x00)   // NAME = root
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x06)   // TYPE=SOA(6)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x01)   // CLASS=IN
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x0E)
+    m7 = bytes_append(m7, 0x10)   // TTL=3600
+    let soa_len = bytes_len(soa_rdata)
+    m7 = bytes_append(m7, (soa_len >> 8) & 0xFF)
+    m7 = bytes_append(m7, soa_len & 0xFF)
+    m7 = bytes_concat(m7, soa_rdata)
+    // additional RR: NAME=root, TYPE=AAAA(28), CLASS=IN, TTL=60, RDLENGTH=16, RDATA=::1
+    let aaaa_rdata = dns_aaaa_encode("::1")
+    m7 = bytes_append(m7, 0x00)   // NAME = root
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x1C)   // TYPE=AAAA(28)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x01)   // CLASS=IN
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x3C)   // TTL=60
+    m7 = bytes_append(m7, 0x00)
+    m7 = bytes_append(m7, 0x10)   // RDLENGTH=16
+    m7 = bytes_concat(m7, aaaa_rdata)
+
+    let dec7 = dns_decode_message(m7)
+    let auth7 = dec7["authority"]
+    let add7 = dec7["additional"]
+    cki("m7.authority.count", len(auth7), 1)
+    cki("m7.additional.count", len(add7), 1)
+    let soa_typed = auth7[0]["rdata_typed"]
+    cks("m7.soa.mname", soa_typed["mname"], "ns.example.com")
+    cks("m7.soa.rname", soa_typed["rname"], "root.example.com")
+    cki("m7.soa.serial", soa_typed["serial"], 2024010101)
+    cki("m7.soa.refresh", soa_typed["refresh"], 7200)
+    cki("m7.soa.minimum", soa_typed["minimum"], 3600)
+    cks("m7.aaaa.typed", add7[0]["rdata_typed"], "::1")
+
+    // ── (8) Truncated / malformed input never crashes, never exits ──────────
+    let empty_msg = bytes(0)
+    let dec8a = dns_decode_message(empty_msg)
+    cki("trunc.empty.answers", len(dec8a["answers"]), 0)
+    cki("trunc.empty.questions", len(dec8a["questions"]), 0)
+
+    let short_hdr = bytes_slice(query, 0, 5)   // only 5 of 12 header bytes
+    let dec8b = dns_decode_message(short_hdr)
+    cki("trunc.shorthdr.answers", len(dec8b["answers"]), 0)
+
+    // Full header + qdcount claims 1 question but body is truncated mid-name.
+    let trunc_q = bytes_slice(query, 0, 15)   // header(12) + 3 bytes of the question
+    let dec8c = dns_decode_message(trunc_q)
+    cki("trunc.midquestion.qcount", len(dec8c["questions"]), 0)
+
+    // Header claims ancount=1 but there are zero answer bytes present.
+    let trunc_ans = bytes_slice(resp, 0, 12 + 17)   // header + question only, RR bytes missing
+    let dec8d = dns_decode_message(trunc_ans)
+    cki("trunc.noanswer.ancount", len(dec8d["answers"]), 0)
+
+    print("PASS dns_wire_facade")

@@ -14,7 +14,10 @@
 //   dns_mx_decode(msg: bytes, pos: int, rdlength: int) -> list
 //     Decode MX rdata starting at msg[pos] for rdlength bytes.
 //     Returns [{"pref": <int>, "exchange": <string>}, next_pos].
-//     Follows compression pointers in msg. On malformed input returns
+//     Follows compression pointers in msg. The EXCHANGE name's local
+//     (non-jumped) byte consumption is bounded to the declared rdlength
+//     window [pos, pos+rdlength) — a name that is not fully framed within
+//     its own RR's RDLENGTH is malformed. On malformed input returns
 //     [{"pref": 0, "exchange": ""}, pos].
 //
 //   dns_name_rdata_encode(name: string) -> bytes
@@ -27,6 +30,22 @@
 //     Decode a single NAME rdata from msg[pos].
 //     Returns [name_string, next_pos].
 //     Follows compression pointers. On malformed input returns ["", pos].
+//     NOTE: this is the general-purpose, UNBOUNDED codec (matches
+//     dns_name_rdata_encode's own uncompressed output, and is used for
+//     decoding a standalone name blob with no surrounding RR framing).
+//     Callers that have an RR's declared RDLENGTH (i.e. NS/CNAME/PTR typed
+//     RDATA decoding inside a full message) MUST use
+//     dns_name_rdata_decode_bounded instead, so a too-small RDLENGTH cannot
+//     cause the decoder to read past its own RDATA window and fabricate a
+//     name from unrelated bytes elsewhere in the message.
+//
+//   dns_name_rdata_decode_bounded(msg: bytes, pos: int, rdlength: int) -> list
+//     Decode a single NAME rdata (NS/CNAME/PTR) bounded by the RR's own
+//     declared RDLENGTH window [pos, pos+rdlength). Returns
+//     [name_string, next_pos]. If the name's local (non-jumped) byte
+//     consumption would exceed rdlength — RDLENGTH too small for even one
+//     legitimate name — returns ["", pos]: never fabricates a name from
+//     bytes outside this RR's own RDATA window.
 //
 // DESIGN NOTES:
 //   - LEAF module — imports NOTHING (Wave 1 self-contained).
@@ -143,8 +162,11 @@ fn dns_mx_encode(pref: int, exchange: string) -> bytes
 
 // dns_mx_decode: decode MX rdata from msg[pos] spanning rdlength bytes.
 // Returns [{"pref": <int>, "exchange": <string>}, next_pos].
-// Follows compression pointers within msg. On malformed input:
-//   [{"pref": 0, "exchange": ""}, pos].
+// Follows compression pointers within msg, but the EXCHANGE name's local
+// (non-jumped) byte consumption is bounded to [pos, pos+rdlength) — a
+// name that does not fit its own RR's declared RDLENGTH is malformed and
+// must never be resolved from bytes belonging to a following RR. On
+// malformed input: [{"pref": 0, "exchange": ""}, pos].
 fn dns_mx_decode(msg: bytes, pos: int, rdlength: int) -> list
     let mlen = bytes_len(msg)
     let empty = {"pref": 0, "exchange": ""}
@@ -152,8 +174,7 @@ fn dns_mx_decode(msg: bytes, pos: int, rdlength: int) -> list
         return [empty, pos]
     if pos + rdlength > mlen
         return [empty, pos]
-    if pos + 1 >= mlen
-        return [empty, pos]
+    let limit = pos + rdlength
     let hi = bytes_get(msg, pos)
     let lo = bytes_get(msg, pos + 1)
     let pref = (hi << 8) | lo
@@ -161,6 +182,8 @@ fn dns_mx_decode(msg: bytes, pos: int, rdlength: int) -> list
     let nd = _mx_name_decode(msg, name_pos)
     let exchange = nd[0]
     let next_pos = nd[1]
+    if next_pos <= name_pos or next_pos > limit
+        return [empty, pos]
     let rec = {"pref": pref, "exchange": exchange}
     [rec, next_pos]
 
@@ -176,5 +199,27 @@ fn dns_name_rdata_encode(name: string) -> bytes
 // dns_name_rdata_decode: decode a single-name rdata from msg[pos].
 // Returns [name_string, next_pos].
 // Follows compression pointers. On malformed input returns ["", pos].
+// UNBOUNDED — see module header note; use dns_name_rdata_decode_bounded
+// when decoding NS/CNAME/PTR typed RDATA inside a full message where an
+// RR's declared RDLENGTH is available.
 fn dns_name_rdata_decode(msg: bytes, pos: int) -> list
     _mx_name_decode(msg, pos)
+
+// dns_name_rdata_decode_bounded: decode a single-name rdata (NS/CNAME/PTR)
+// bounded by the RR's own declared RDLENGTH window [pos, pos+rdlength).
+// Returns [name_string, next_pos]. If the name's local (non-jumped) byte
+// consumption would exceed rdlength, OR pos+rdlength itself runs past the
+// end of msg, returns ["", pos] — a record that does not fit its own
+// RDLENGTH is malformed; this never reads past the declared RDATA window
+// to fabricate a name from an adjacent RR's bytes.
+fn dns_name_rdata_decode_bounded(msg: bytes, pos: int, rdlength: int) -> list
+    let mlen = bytes_len(msg)
+    if rdlength < 0 or pos + rdlength > mlen
+        return ["", pos]
+    let limit = pos + rdlength
+    let nd = _mx_name_decode(msg, pos)
+    let name = nd[0]
+    let next_pos = nd[1]
+    if next_pos <= pos or next_pos > limit
+        return ["", pos]
+    [name, next_pos]
