@@ -40,6 +40,16 @@ runtime soundness bug: **nova_rt_eq string branch `strcmp`s a large-int operand 
 (CVE-class; exact one-branch fix recorded in memory `project-20day-sprint-execution-model`) — batch into the
 next reconverge with the `if cond then <stmt>` one-line sugar.
 
+**★★★★ ROOT-GAP CLOSING NIGHT (2026-07-25):** 4 root compiler gaps closed, all reconverged + both-mode green:
+`3d63b8b1` bare Result/Option -> polymorphic sum (#1, made the high-level toolkit DEEP); `84ba7ed7` match on
+any-typed/module Option maps Some/None -> sum tag (imported Option no longer crashes); `8bf0041a` hygienic
+synth-method locals (trait >=2-types-at-top-level compiles); `fa9bde44` a fn's `let` shadows a top-level
+`let` VARIABLE, not a global fn (module-scope type leak). Plus a COMPLETE high-level std/core (all KAT-gated):
+seq(+map/filter/flat_map)/dict/list/num/str/result/opt/sort + a capstone demo composing 7 modules end-to-end.
+**REMAINING (XL, need supervised focus):** module-level non-scalar STORAGE (top-level list/dict/struct vars
+don't propagate into fns at runtime -- per-process-tree true globals; a const-store shortcut raced concurrency,
+reverted); L11 #32 (symbol namespacing). See memory `project-highlevel-capability-gap`.
+
 **★★★ COMPILER + HIGH-LEVEL CORE (2026-07-24 cont.):** `f3f22b56` nova_rt_eq str-vs-large-int crash fix
 (CVE-class, reconverged); `00dc85bb` one-line `if cond then <stmt>` sugar; **`3d63b8b1` THE #1 HIGH-LEVEL
 FIX — bare `Result`/`Option` annotation is now a POLYMORPHIC SUM (was `nt_struct`), so reusable
