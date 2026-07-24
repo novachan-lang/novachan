@@ -1,0 +1,217 @@
+// KAT for forge_mongodb -- OP_MSG (opcode 2013) build/parse over the wire, reusing std/encoding/bson.
+// Every check helper exits(1) IMMEDIATELY on failure (same idiom as bsonkat.nova / _cbor_rfc8949_kat.nova).
+import forge_mongodb
+import std/encoding/bson
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn ckf(label: string, got: float, want: float)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn ckn(label: string, got: any)
+    if got != null
+        print("FAIL " + label + ": expected null")
+        exit(1)
+    print("PASS " + label)
+
+// tiny LE int32 writer, local to this test file, used ONLY to hand-build a synthetic server reply that
+// forge_mongodb never emits itself (a nonzero responseTo) -- exercises the decode path independently of
+// the module's own encoder.
+fn _t_put_i32_le(b, v: int) -> any
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out
+
+fn main()
+    // ── KAT 1: build OP_MSG for {"find":"c","$db":"t"}, assert header byte-exact ───────────────────────
+    let cmd = {}
+    cmd["find"] = "c"
+    cmd["$db"] = "t"
+    let request_id = 7
+    let wire = mongo_op_msg_encode(cmd, request_id)
+
+    // embedded BSON doc must round-trip exactly against a direct bson_encode of the same document.
+    let expected_doc_bytes = bson_encode(cmd)
+    let expected_total = 16 + 4 + 1 + bytes_len(expected_doc_bytes)
+
+    cki("wire_len", bytes_len(wire), expected_total)
+
+    // messageLength (bytes 0..4, LE)
+    let msg_len_bytes = bytes_slice(wire, 0, 4)
+    let want_msg_len = _t_put_i32_le(bytes(0), expected_total)
+    cki("hdr_messageLength_b0", bytes_get(msg_len_bytes, 0), bytes_get(want_msg_len, 0))
+    cki("hdr_messageLength_b1", bytes_get(msg_len_bytes, 1), bytes_get(want_msg_len, 1))
+    cki("hdr_messageLength_b2", bytes_get(msg_len_bytes, 2), bytes_get(want_msg_len, 2))
+    cki("hdr_messageLength_b3", bytes_get(msg_len_bytes, 3), bytes_get(want_msg_len, 3))
+
+    // requestID (bytes 4..8, LE) == 7
+    cki("hdr_requestID_b0", bytes_get(wire, 4), 7)
+    cki("hdr_requestID_b1", bytes_get(wire, 5), 0)
+    cki("hdr_requestID_b2", bytes_get(wire, 6), 0)
+    cki("hdr_requestID_b3", bytes_get(wire, 7), 0)
+
+    // responseTo (bytes 8..12, LE) == 0 (this is a request)
+    cki("hdr_responseTo_b0", bytes_get(wire, 8), 0)
+    cki("hdr_responseTo_b1", bytes_get(wire, 9), 0)
+    cki("hdr_responseTo_b2", bytes_get(wire, 10), 0)
+    cki("hdr_responseTo_b3", bytes_get(wire, 11), 0)
+
+    // opCode (bytes 12..16, LE) == 2013 = 0x000007DD
+    cki("hdr_opCode_b0", bytes_get(wire, 12), 0xDD)
+    cki("hdr_opCode_b1", bytes_get(wire, 13), 0x07)
+    cki("hdr_opCode_b2", bytes_get(wire, 14), 0x00)
+    cki("hdr_opCode_b3", bytes_get(wire, 15), 0x00)
+
+    // flagBits (bytes 16..20, LE) == 0
+    cki("flagBits_b0", bytes_get(wire, 16), 0)
+    cki("flagBits_b1", bytes_get(wire, 17), 0)
+    cki("flagBits_b2", bytes_get(wire, 18), 0)
+    cki("flagBits_b3", bytes_get(wire, 19), 0)
+
+    // section kind byte (offset 20) == 0x00 (Body)
+    cki("section_kind", bytes_get(wire, 20), 0x00)
+
+    // embedded BSON doc (offset 21..end) round-trips exactly against bson_encode(cmd)
+    let embedded = bytes_slice(wire, 21, bytes_len(wire))
+    cki("embedded_doc_len", bytes_len(embedded), bytes_len(expected_doc_bytes))
+    let i = 0
+    let n_embedded = bytes_len(embedded)
+    while i < n_embedded
+        cki("embedded_doc_b" + str(i), bytes_get(embedded, i), bytes_get(expected_doc_bytes, i))
+        i = i + 1
+
+    // ── KAT 2: mongo_op_msg_decode(wire) recovers the exact fields ─────────────────────────────────────
+    let parsed = mongo_op_msg_decode(wire)
+    cki("parsed_messageLength", parsed["messageLength"], expected_total)
+    cki("parsed_requestID", parsed["requestID"], request_id)
+    cki("parsed_responseTo", parsed["responseTo"], 0)
+    cki("parsed_opCode", parsed["opCode"], 2013)
+    cki("parsed_flagBits", parsed["flagBits"], 0)
+    cks("parsed_doc_find", parsed["doc"]["find"], "c")
+    cks("parsed_doc_db", parsed["doc"]["$db"], "t")
+    cki("parsed_docs_len", len(parsed["docs"]), 1)
+    cki("parsed_docSequences_len", len(keys(parsed["docSequences"])), 0)
+
+    // ── KAT 3: parse a SYNTHETIC server reply OP_MSG (hand-built, independent of the encoder) ──────────
+    // Server reply semantics: requestID = server's own id (99), responseTo = the CLIENT's request id (7)
+    // that this reply answers -- forge_mongodb's own encoder never emits a nonzero responseTo (it only
+    // builds requests), so this exercises the decode path on a shape the encoder cannot itself produce.
+    let reply_doc = {}
+    reply_doc["ok"] = 1.0
+    reply_doc["n"] = 3
+    let reply_doc_bytes = bson_encode(reply_doc)
+    let reply_section = bytes_append(bytes(0), 0)
+    reply_section = bytes_concat(reply_section, reply_doc_bytes)
+    let reply_body = _t_put_i32_le(bytes(0), 0)
+    reply_body = bytes_concat(reply_body, reply_section)
+    let reply_total = 16 + bytes_len(reply_body)
+    let reply_hdr = _t_put_i32_le(bytes(0), reply_total)
+    reply_hdr = bytes_concat(reply_hdr, _t_put_i32_le(bytes(0), 99))
+    reply_hdr = bytes_concat(reply_hdr, _t_put_i32_le(bytes(0), 7))
+    reply_hdr = bytes_concat(reply_hdr, _t_put_i32_le(bytes(0), 2013))
+    let reply_wire = bytes_concat(reply_hdr, reply_body)
+
+    let reply_parsed = mongo_op_msg_decode(reply_wire)
+    cki("reply_requestID", reply_parsed["requestID"], 99)
+    cki("reply_responseTo", reply_parsed["responseTo"], 7)
+    cki("reply_opCode", reply_parsed["opCode"], 2013)
+    ckf("reply_doc_ok", reply_parsed["doc"]["ok"], 1.0)
+    cki("reply_doc_n", reply_parsed["doc"]["n"], 3)
+
+    // ── KAT 4: empty command document {} round-trips (BSON empty-doc edge case) ────────────────────────
+    let empty_cmd = {}
+    let empty_wire = mongo_op_msg_encode(empty_cmd, 1)
+    let empty_parsed = mongo_op_msg_decode(empty_wire)
+    cki("empty_doc_nkeys", len(keys(empty_parsed["doc"])), 0)
+    cki("empty_wire_len", bytes_len(empty_wire), 16 + 4 + 1 + 5)
+
+    // ── KAT 5: message with ZERO sections decodes to doc=null / docs=[] instead of crashing ────────────
+    let zero_sec_body = _t_put_i32_le(bytes(0), 0)
+    let zero_sec_total = 16 + bytes_len(zero_sec_body)
+    let zero_sec_hdr = _t_put_i32_le(bytes(0), zero_sec_total)
+    zero_sec_hdr = bytes_concat(zero_sec_hdr, _t_put_i32_le(bytes(0), 1))
+    zero_sec_hdr = bytes_concat(zero_sec_hdr, _t_put_i32_le(bytes(0), 0))
+    zero_sec_hdr = bytes_concat(zero_sec_hdr, _t_put_i32_le(bytes(0), 2013))
+    let zero_sec_wire = bytes_concat(zero_sec_hdr, zero_sec_body)
+    let zero_sec_parsed = mongo_op_msg_decode(zero_sec_wire)
+    ckn("zero_section_doc", zero_sec_parsed["doc"])
+    cki("zero_section_docs_len", len(zero_sec_parsed["docs"]), 0)
+
+    // ── KAT 6: flagBits checksumPresent (bit0) -- trailing 4 bytes excluded from section parsing ───────
+    let cs_doc = {}
+    cs_doc["ping"] = 1
+    let cs_doc_bytes = bson_encode(cs_doc)
+    let cs_section = bytes_append(bytes(0), 0)
+    cs_section = bytes_concat(cs_section, cs_doc_bytes)
+    let cs_body = _t_put_i32_le(bytes(0), 1)
+    cs_body = bytes_concat(cs_body, cs_section)
+    // 4 dummy checksum bytes appended AFTER the section, counted in messageLength but excluded from
+    // section parsing by the checksumPresent (flagBits bit0) logic.
+    cs_body = bytes_append(cs_body, 0xAA)
+    cs_body = bytes_append(cs_body, 0xBB)
+    cs_body = bytes_append(cs_body, 0xCC)
+    cs_body = bytes_append(cs_body, 0xDD)
+    let cs_total = 16 + bytes_len(cs_body)
+    let cs_hdr = _t_put_i32_le(bytes(0), cs_total)
+    cs_hdr = bytes_concat(cs_hdr, _t_put_i32_le(bytes(0), 5))
+    cs_hdr = bytes_concat(cs_hdr, _t_put_i32_le(bytes(0), 0))
+    cs_hdr = bytes_concat(cs_hdr, _t_put_i32_le(bytes(0), 2013))
+    let cs_wire = bytes_concat(cs_hdr, cs_body)
+    let cs_parsed = mongo_op_msg_decode(cs_wire)
+    cki("checksum_flagBits", cs_parsed["flagBits"], 1)
+    cki("checksum_doc_ping", cs_parsed["doc"]["ping"], 1)
+    cki("checksum_docs_len", len(cs_parsed["docs"]), 1)
+
+    // ── KAT 7: kind-0x01 document-sequence section parses into docSequences[identifier] ────────────────
+    let seq_d0 = {}
+    seq_d0["_id"] = 1
+    let seq_d1 = {}
+    seq_d1["_id"] = 2
+    let seq_ident_bytes = str_to_bytes("documents")
+    let seq_ident = bytes_append(seq_ident_bytes, 0)
+    let seq_docs_bytes = bytes_concat(bson_encode(seq_d0), bson_encode(seq_d1))
+    let seq_inner = bytes_concat(seq_ident, seq_docs_bytes)
+    let seq_size = 4 + bytes_len(seq_inner)
+    let seq_section = bytes_append(bytes(0), 1)
+    seq_section = bytes_concat(seq_section, _t_put_i32_le(bytes(0), seq_size))
+    seq_section = bytes_concat(seq_section, seq_inner)
+    let seq_body = _t_put_i32_le(bytes(0), 0)
+    seq_body = bytes_concat(seq_body, seq_section)
+    let seq_total = 16 + bytes_len(seq_body)
+    let seq_hdr = _t_put_i32_le(bytes(0), seq_total)
+    seq_hdr = bytes_concat(seq_hdr, _t_put_i32_le(bytes(0), 9))
+    seq_hdr = bytes_concat(seq_hdr, _t_put_i32_le(bytes(0), 0))
+    seq_hdr = bytes_concat(seq_hdr, _t_put_i32_le(bytes(0), 2013))
+    let seq_wire = bytes_concat(seq_hdr, seq_body)
+    let seq_parsed = mongo_op_msg_decode(seq_wire)
+    ckn("seq_primary_doc", seq_parsed["doc"])
+    cki("seq_docs_len", len(seq_parsed["docs"]), 0)
+    let seq_list = seq_parsed["docSequences"]["documents"]
+    cki("seq_list_len", len(seq_list), 2)
+    cki("seq_list_0_id", seq_list[0]["_id"], 1)
+    cki("seq_list_1_id", seq_list[1]["_id"], 2)
+
+    // ── KAT 8: requestID at the int32 width boundary (2147483647) round-trips through encode+decode ───
+    let bound_doc = {}
+    bound_doc["ping"] = 1
+    let bound_wire = mongo_op_msg_encode(bound_doc, 2147483647)
+    let bound_parsed = mongo_op_msg_decode(bound_wire)
+    cki("bound_requestID", bound_parsed["requestID"], 2147483647)
+
+    print("mongodb OP_MSG KAT: ALL PASS")

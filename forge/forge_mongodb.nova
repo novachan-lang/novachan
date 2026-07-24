@@ -1,0 +1,312 @@
+// forge_mongodb -- pure-NOVA MongoDB client speaking the modern wire protocol OP_MSG (opcode 2013) over raw
+// TCP. REUSES std/encoding/bson for every BSON document on the wire (never reimplements BSON encoding).
+//
+// OP_MSG WIRE LAYOUT (MongoDB wire protocol, opcode 2013)
+//   MsgHeader (16 bytes, all int32 LE):
+//     messageLength   total byte length of the WHOLE message, including this header
+//     requestID       client-chosen id for this message; echoed back as responseTo on the reply
+//     responseTo      0 on a request; the request's requestID on a reply
+//     opCode          2013 for OP_MSG
+//   flagBits          uint32 LE. bit0 (0x1) = checksumPresent (trailing crc32c uint32). bit1 (0x2) =
+//                     moreToCome (streaming, not used by this client). Other bits reserved/exhaustAllowed.
+//   sections          one or more sections until messageLength (minus a trailing checksum if present):
+//     kind 0x00 (Body)              -- exactly one BSON document, no length prefix of its own beyond the
+//                                      document's own leading int32 (BSON documents are self-delimiting)
+//     kind 0x01 (Document Sequence) -- int32 size (includes itself) + cstring identifier + BSON documents
+//                                      packed back-to-back until `size` bytes are consumed
+//   checksumBytes     uint32 LE CRC-32C of the message, present only if flagBits bit0 is set. This client
+//                     never sets bit0 on encode and does not verify it on decode (documented limitation --
+//                     no crc32c implementation is wired in here; see LIMITATIONS below).
+//
+// A MongoDB *command* is just a BSON document sent as the single kind-0x00 section of an OP_MSG, with a
+// mandatory "$db" field naming the target database (e.g. {"find":"c","$db":"t"} runs `find` on db "t",
+// collection "c"). The server's reply is another OP_MSG whose kind-0x00 body document always carries an
+// "ok" field (1.0/1 success, 0.0/0 failure) plus command-specific fields ("errmsg" on failure, "cursor" on
+// most read commands, etc).
+//
+// PUBLIC API
+//   mongo_op_msg_encode(doc, request_id)  -> bytes   build a complete OP_MSG wire message for `doc`
+//                                                     (single kind-0x00 section, flagBits=0, responseTo=0)
+//   mongo_op_msg_decode(b)                -> dict    parse a complete OP_MSG wire message (header + body)
+//     returns {"messageLength","requestID","responseTo","opCode","flagBits","doc","docs","docSequences"}
+//     "doc"          -> the FIRST kind-0x00 section's BSON document (null if the message had none)
+//     "docs"         -> list of every kind-0x00 section's document, in wire order (usually just one)
+//     "docSequences" -> dict identifier -> list of documents, for any kind-0x01 sections (rare on replies)
+//   mongo_connect(host, port)             -> Result<sock, string>   open a TCP connection
+//   mongo_close(sock)                                                close it
+//   mongo_command(sock, db, doc)          -> Result<dict, string>   send `doc` as a command against `db`
+//     (auto-fills "$db" if absent via a DEFENSIVE COPY -- never mutates the caller's dict), reads the full
+//     framed reply, validates responseTo echoes the request, and inspects the reply's "ok" field --
+//     ok(reply_doc) on success, err("mongodb: ...") on a transport failure OR a server-reported command
+//     failure (ok:0, errmsg surfaced).
+//
+// EDGE CASES HANDLED
+//   - binary safety: every function operates on `bytes` end-to-end; BSON string/embedded-doc decoding is
+//     delegated entirely to std/encoding/bson, which already documents+handles the NUL-in-string limit.
+//   - defensive copies: mongo_command never mutates the caller's command dict (see _mg_with_db).
+//   - boundary clamps: mongo_op_msg_decode bounds-checks the header, flagBits, and every section (kind
+//     byte, document-sequence size, cstring identifier) against the buffer length before reading; a
+//     malformed/truncated message fails loudly (print + exit(1)) rather than reading out of bounds --
+//     the same convention std/encoding/bson uses for the identical reason.
+//   - round-trip: encode(doc) then decode(...).doc == doc for empty {}, single-field, and multi-field
+//     documents (see the KAT for the exact vectors exercised, incl. int32/int64 width boundaries which are
+//     BSON's own concern and already covered by std/encoding/bson's KAT).
+//   - empty/missing: an empty command document ({} -> 5-byte BSON doc) round-trips; a message with zero
+//     kind-0x00 sections decodes to doc=null / docs=[] instead of crashing.
+//   - width boundaries: message framing uses the same LE int32 writer/reader shape as std/encoding/bson's
+//     own i32/i64 helpers (duplicated here, not imported, because std/encoding/bson keeps those private
+//     with an `_bs_` prefix -- the same "small wire-protocol helper duplicated per module" precedent as
+//     forge_mysql's `_my_p4`/`_my_u` and forge_pg's `pg_be32`).
+//   - null/0 vs bool/int: the reply's "ok" field is read via type_of (float OR int, both accepted; NOVA's
+//     bool/int ambiguity means a `true`/`false` there would also read as int 0/1 -- MongoDB itself always
+//     sends ok as a numeric double or int32, never a BSON bool, so this is not a real-world ambiguity).
+//
+// LIMITATIONS (documented, not silently ignored)
+//   - No OP_MSG checksum (flagBits bit0 / crc32c) support: never set on encode, not verified on decode.
+//     MongoDB does not require it (opt-in, negotiated via `hello`'s helloOk); a client that never sets it
+//     is fully spec-compliant, and no live server test in this sandbox needs it.
+//   - No SCRAM-SHA-256 auth, TLS, or cursor `getMore` iteration -- this module is the wire-protocol layer
+//     (frame a command, get a reply document back), matching the scope of this task. A future pass can
+//     layer auth (mirroring forge_pg's pg_scram_*) and cursor iteration on top without touching this file.
+//   - No live MongoDB server exercised the connect/command path in this sandbox (network unavailable at
+//     build time); mongo_connect/mongo_command reuse the SAME framing/parsing code the KAT proves
+//     byte-exact against synthetic wire vectors, so the wire-format logic itself IS verified, but the live
+//     round trip through a real `mongod` is a known open item, tracked exactly like forge_mysql's own
+//     "LIVE vs 5.7.36" verification was tracked before it ran.
+//
+// IMPLEMENTATION NOTES
+//   - All private helpers prefixed `_mg_` to avoid link collisions.
+//   - Single-exit style (trailing expression, no early `return null` mixed with `return value`) throughout.
+//   - No multi-line list/dict literals (NOVA parser limitation).
+import std/encoding/bson
+
+// OP_MSG opcode (wire protocol constant).
+fn _mg_opcode() -> int
+    2013
+
+// ── little-endian int32 writer/reader (duplicated small helper -- see header note) ─────────────────────
+
+fn _mg_put_i32_le(b, v: int) -> any
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out
+
+fn _mg_read_i32_le(b, pos: int) -> int
+    let b0 = bytes_get(b, pos) & 0xFF
+    let b1 = bytes_get(b, pos + 1) & 0xFF
+    let b2 = bytes_get(b, pos + 2) & 0xFF
+    let b3 = bytes_get(b, pos + 3) & 0xFF
+    let u = ((b3 << 24) | (b2 << 16)) | ((b1 << 8) | b0)
+    let result = u
+    if u >= 2147483648
+        result = u - 4294967296
+    result
+
+// cstring reader bounded by `limit` -- returns [string, next_pos]. Used only for a document-sequence
+// (kind 0x01) identifier; std/encoding/bson's own cstring reader is private (`_bs_read_cstring`).
+fn _mg_read_cstring(b, pos: int, limit: int) -> any
+    let cur = pos
+    while cur < limit and bytes_get(b, cur) != 0
+        cur = cur + 1
+    let s = bytes_to_str(bytes_slice(b, pos, cur))
+    let next = cur + 1
+    if next > limit
+        next = limit
+    [s, next]
+
+// ── encode ────────────────────────────────────────────────────────────────────────────────────────────
+
+// mongo_op_msg_encode: build a complete OP_MSG wire message carrying `doc` as its single kind-0x00
+// (Body) section. flagBits = 0 (no checksum, no moreToCome), responseTo = 0 (this is a request).
+// messageLength is computed from the actual assembled byte length and backpatched into the header --
+// never guessed or hardcoded.
+fn mongo_op_msg_encode(doc, request_id: int) -> any
+    let section = bytes_append(bytes(0), 0)
+    section = bytes_concat(section, bson_encode(doc))
+    let body = _mg_put_i32_le(bytes(0), 0)
+    body = bytes_concat(body, section)
+    let total = 16 + bytes_len(body)
+    let hdr = _mg_put_i32_le(bytes(0), total)
+    hdr = bytes_concat(hdr, _mg_put_i32_le(bytes(0), request_id))
+    hdr = bytes_concat(hdr, _mg_put_i32_le(bytes(0), 0))
+    hdr = bytes_concat(hdr, _mg_put_i32_le(bytes(0), _mg_opcode()))
+    bytes_concat(hdr, body)
+
+// ── decode ────────────────────────────────────────────────────────────────────────────────────────────
+
+// mongo_op_msg_decode: parse a complete OP_MSG message (header + flagBits + sections) starting at offset
+// 0 of `b`. Tolerates trailing bytes after messageLength (a caller reading off a stream may have more
+// buffered than one message). Every read is bounds-checked against `b`'s actual length first; a
+// truncated/invalid message reports the problem and exits cleanly (print + exit(1)), matching
+// std/encoding/bson's convention for the identical reason.
+fn mongo_op_msg_decode(b) -> any
+    let n = bytes_len(b)
+    if n < 16
+        print("mongo_op_msg_decode: truncated header (" + str(n) + " bytes)")
+        exit(1)
+    let total = _mg_read_i32_le(b, 0)
+    if total < 16
+        print("mongo_op_msg_decode: invalid messageLength " + str(total))
+        exit(1)
+    if total > n
+        print("mongo_op_msg_decode: messageLength " + str(total) + " exceeds buffer (" + str(n) + " bytes)")
+        exit(1)
+    let request_id = _mg_read_i32_le(b, 4)
+    let response_to = _mg_read_i32_le(b, 8)
+    let op_code = _mg_read_i32_le(b, 12)
+    if op_code != _mg_opcode()
+        print("mongo_op_msg_decode: expected opCode 2013 (OP_MSG), got " + str(op_code))
+        exit(1)
+    if total < 20
+        print("mongo_op_msg_decode: message too short for flagBits (" + str(total) + " bytes)")
+        exit(1)
+    let flag_bits = _mg_read_i32_le(b, 16)
+    let checksum_present = flag_bits & 1
+    let sections_end = total
+    if checksum_present != 0
+        sections_end = total - 4
+    let pos = 20
+    let primary_doc = null
+    let docs = []
+    let doc_sequences = {}
+    while pos < sections_end
+        let kind = bytes_get(b, pos)
+        pos = pos + 1
+        if kind == 0
+            let dr = bson_decode_at(b, pos)
+            let d = dr[0]
+            pos = dr[1]
+            if pos > sections_end
+                print("mongo_op_msg_decode: kind-0 section exceeds message bound")
+                exit(1)
+            push(docs, d)
+            if primary_doc == null
+                primary_doc = d
+        else if kind == 1
+            if pos + 4 > sections_end
+                print("mongo_op_msg_decode: truncated document-sequence size at " + str(pos))
+                exit(1)
+            let seq_start = pos
+            let size = _mg_read_i32_le(b, pos)
+            if size < 5
+                print("mongo_op_msg_decode: invalid document-sequence size " + str(size))
+                exit(1)
+            let seq_end = seq_start + size
+            if seq_end > sections_end
+                print("mongo_op_msg_decode: document-sequence exceeds message bound")
+                exit(1)
+            pos = pos + 4
+            let cr = _mg_read_cstring(b, pos, seq_end)
+            let ident = cr[0]
+            pos = cr[1]
+            let seqdocs = []
+            while pos < seq_end
+                let dr2 = bson_decode_at(b, pos)
+                push(seqdocs, dr2[0])
+                pos = dr2[1]
+            if pos != seq_end
+                print("mongo_op_msg_decode: document-sequence body did not consume exactly `size` bytes")
+                exit(1)
+            doc_sequences[ident] = seqdocs
+        else
+            print("mongo_op_msg_decode: unsupported section kind byte " + str(kind))
+            exit(1)
+    let result = {}
+    result["messageLength"] = total
+    result["requestID"] = request_id
+    result["responseTo"] = response_to
+    result["opCode"] = op_code
+    result["flagBits"] = flag_bits
+    result["doc"] = primary_doc
+    result["docs"] = docs
+    result["docSequences"] = doc_sequences
+    result
+
+// ── connection / command layer ───────────────────────────────────────────────────────────────────────
+
+// mongo_connect: open a plain TCP connection to a mongod/mongos. ok(sock) or err(reason).
+fn mongo_connect(host: string, port: int) -> any
+    let sock = tcp_connect(host, port)
+    if sock < 0
+        return err("mongodb: cannot connect to " + host + ":" + str(port))
+    ok(sock)
+
+// mongo_close: release the socket.
+fn mongo_close(sock: int)
+    tcp_close(sock)
+
+// _mg_with_db: return a NEW dict equal to `doc` plus "$db" -> db (DEFENSIVE COPY -- never mutates the
+// caller's dict; a command doc that already carries "$db" is returned as an unmodified copy).
+fn _mg_with_db(doc, db: string) -> any
+    let out = {}
+    let ks = keys(doc)
+    let i = 0
+    while i < len(ks)
+        out[ks[i]] = doc[ks[i]]
+        i = i + 1
+    if contains(doc, "$db") == 0
+        out["$db"] = db
+    out
+
+fn _mg_recv_at_least(sock: int, buf, need: int) -> any
+    let b = buf
+    while bytes_len(b) < need
+        let chunk = tcp_recv_bytes(sock)
+        if bytes_len(chunk) == 0
+            return b
+        b = bytes_concat(b, chunk)
+    b
+
+// _mg_read_reply: read exactly one framed OP_MSG off `sock` (length-prefixed: first read the 16-byte
+// header to learn messageLength, then read the rest) and decode it. ok(decoded_dict) or err(reason).
+fn _mg_read_reply(sock: int) -> any
+    let buf = bytes(0)
+    buf = _mg_recv_at_least(sock, buf, 4)
+    if bytes_len(buf) < 4
+        return err("mongodb: connection closed before response header")
+    let total = _mg_read_i32_le(buf, 0)
+    if total < 16
+        return err("mongodb: invalid response messageLength " + str(total))
+    buf = _mg_recv_at_least(sock, buf, total)
+    if bytes_len(buf) < total
+        return err("mongodb: connection closed mid-response (" + str(bytes_len(buf)) + " of " + str(total) + " bytes)")
+    ok(mongo_op_msg_decode(bytes_slice(buf, 0, total)))
+
+// mongo_command: send `command_doc` (a BSON-encodable dict, e.g. {"find":"c"}) as a command against
+// database `db`, wait for the framed reply, and return the reply's body document. Auto-fills "$db" via a
+// defensive copy. Validates the reply's responseTo echoes this request's id (guards against a desynced
+// stream). Inspects the reply's "ok" field (accepting both float 1.0/0.0 and int 1/0 -- MongoDB sends
+// either depending on server version) -- err(errmsg) if the server reported failure, ok(reply_doc) on
+// success.
+fn mongo_command(sock: int, db: string, command_doc) -> any
+    let doc = _mg_with_db(command_doc, db)
+    let request_id = random_int(1, 2147483647)
+    let wire = mongo_op_msg_encode(doc, request_id)
+    tcp_send_bytes(sock, wire)
+    let rr = _mg_read_reply(sock)
+    if is_err(rr)
+        return rr
+    let reply = unwrap(rr)
+    if reply["responseTo"] != request_id
+        return err("mongodb: reply responseTo " + str(reply["responseTo"]) + " does not match request " + str(request_id))
+    let rdoc = reply["doc"]
+    if rdoc == null
+        return err("mongodb: reply had no body document")
+    let okf = 0.0
+    if contains(rdoc, "ok")
+        let okval = rdoc["ok"]
+        if type_of(okval) == "float"
+            okf = okval
+        else if type_of(okval) == "int"
+            okf = okval * 1.0
+    else
+        okf = 1.0
+    if okf < 0.5
+        let msg = "mongodb: command failed"
+        if contains(rdoc, "errmsg")
+            msg = "mongodb: " + str(rdoc["errmsg"])
+        return err(msg)
+    ok(rdoc)
