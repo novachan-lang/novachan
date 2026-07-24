@@ -11,6 +11,37 @@ verify current status first (this doc is a snapshot; some may have moved), then 
 
 Legend: **[rt]** runtime · **[cc]** compiler · **[fg]** Forge/lib · **[std]** stdlib · **[tool]** toolchain · **[lang]** language/compiler feature. Effort S/M/L/XL.
 
+---
+
+## LEDGER — Phase-1 breadth extension (Sonnet-5 fleet, build→independent-adversary-verify), 2026-07-24
+Each library ships with a KAT **and** passed a from-scratch adversarial re-derivation from its authoritative
+spec (default REJECT). This is Track-B breadth running parallel to the compiler critical path below — NOT a
+substitute for it. **40 libraries / 21 commits.** The independent-adversary gate caught 30+ real pre-ship bugs
+(HPACK header-fabrication, Avro i64 zigzag, BSON null/0 conflation, ASN.1 multi-byte OID, DNS RDLENGTH
+over-read, Thrift truncation-as-success, plist sentinel collision + an any==int crash, NSQ exit-on-bad-input).
+
+| Batch | Libraries | Commit(s) |
+|---|---|---|
+| 1–2 | cbor, pdf, mqtt, nats, png-encoder, otlp, toml | `de343277` `c7a21d8d` |
+| 3–4 | csv, amqp, smtp, s3+sigv4, yaml, kafka, dataframe, ini, uri | `a6de4823` `ae480d18` `9bf1ea61` `e7d6c8c4` |
+| 5–6 | protobuf, http2+HPACK, websocket-client, java-properties, bson, mongodb, grpc, avro, prometheus, statsd | `d710a7c5` `0eb85008` `1af41ffe` `5b97eb68` |
+| 7–8 | cassandra, jsonpath, etcd, ndjson, stomp, influxdb, ubjson, asn1, nsq | `1b62a4b7` `c8ca3dbc` `e3cd6a50` |
+| 9 | memcached, dns, thrift, zookeeper, plist | `e6189f69` `072ec340` `6da41c57` |
+| 10 | coap, stun, ntp, radius | `48779a05` |
+| compiler | L8 structural operators, float_to_bits builtin, h2_preface collision fix | `82929a1f` `97c7bfdd` `c8dcc99d` |
+
+**Pending fix-cycle:** ldap (batch-10 REJECT — decoder validates ASN.1 tags only at CHOICE points, accepts
+malformed messages); bson+ubjson (same name-only sentinel collision plist just fixed, MED).
+
+**★ STATUS HONESTY (2026-07-24):** breadth (Track B) is running well ahead; the **50-task critical path below
+is compiler/runtime (Blocks A/B/E = 26/50) and remains the gating work** — per the plan's own "soundness →
+… → presentation" order. Next Opus focus = Block A #1 (RC leak) + Block E #32 (L11), plus a newly root-caused
+runtime soundness bug: **nova_rt_eq string branch `strcmp`s a large-int operand as `char*` → process crash**
+(CVE-class; exact one-branch fix recorded in memory `project-20day-sprint-execution-model`) — batch into the
+next reconverge with the `if cond then <stmt>` one-line sugar.
+
+---
+
 ## BLOCK A — Wave B: RC completeness (memory-SAFE leaks; production bar) — do FIRST with Wave C
 | # | Task | Area | Effort | Notes / blocking |
 |---|---|---|---|---|
