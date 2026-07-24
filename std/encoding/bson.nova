@@ -1,0 +1,470 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/bson
+// ============================================================================
+// BSON (Binary JSON, bsonspec.org) encoder + decoder for the core element
+// types used by MongoDB and the BSON wire format.
+//
+// A BSON DOCUMENT on the wire is:
+//   int32 total_length (LE, includes itself + the trailing 0x00)
+//   element*
+//   0x00                                             (document terminator)
+//
+// An ELEMENT is:
+//   byte type_code
+//   cstring key                                      (UTF-8 bytes + 0x00)
+//   value                                             (shape depends on type_code)
+//
+// An ARRAY is wire-identical to a document whose keys are the decimal string
+// indices "0","1","2",... in order.
+//
+// SUPPORTED TYPE CODES (this module)
+//   0x01  double            8 bytes LE IEEE-754 (via float_to_bits/float_from_bits)
+//   0x02  string             int32 LE (len incl. trailing NUL) + UTF-8 bytes + 0x00
+//   0x03  embedded document  a nested BSON document (self-contained, recursive)
+//   0x04  array               a nested BSON "document" with numeric-string keys
+//   0x05  binary              int32 LE length + 1 subtype byte (always 0x00 on
+//                             encode) + raw bytes
+//   0x08  boolean             1 byte, 0x00 / 0x01
+//   0x0A  null                (no bytes)
+//   0x10  int32               4 bytes LE two's complement
+//   0x12  int64               8 bytes LE two's complement
+//
+// PUBLIC API
+//   bson_encode(doc)          -> bytes   encode a NOVA dict as a top-level BSON document
+//   bson_decode(b)            -> dict    decode a top-level BSON document from bytes
+//   bson_decode_at(b, pos)    -> [dict, next_pos]   decode a document starting at pos
+//                                                     (for reading a stream of docs)
+//   bson_bool(v)              -> wrapper  force explicit BSON boolean (0x08) — see below
+//   bson_long(v)              -> wrapper  force explicit BSON int64 (0x12) — see below
+//
+// VALUE MAPPING (bson_encode, dispatched via type_of(v))
+//   float  -> double (0x01)
+//   string -> string (0x02)
+//   dict   -> embedded document (0x03), recursively encoded
+//   list   -> array (0x04), recursively encoded, index order preserved exactly
+//             (arrays are encoded from a NOVA list so element ORDER is always
+//             exact — it never depends on hash/dict iteration order)
+//   bytes  -> binary (0x05), subtype 0x00, binary-safe end to end
+//   null   -> null (0x0A)
+//   int    -> int32 (0x10) if it fits in a signed 32-bit range, else int64 (0x12)
+//   other (e.g. struct) -> null (0x0A), documented safe fallback
+//
+// THE BOOL/INT AMBIGUITY (fundamental NOVA limitation, not a module bug).
+//   type_of(true) == "int" in NOVA — booleans are unboxed ints and are
+//   INDISTINGUISHABLE from a plain int at runtime once passed through an
+//   `any`-typed value. A generic encoder therefore cannot tell "the user
+//   wrote true" from "the user wrote the int 1". Plain document fields that
+//   hold a NOVA bool are encoded as int32 0/1 (same policy as this
+//   codebase's std/data/msgpack module for the identical reason).
+//   To force a real BSON boolean (0x08), wrap the field value with
+//   bson_bool(v) before inserting it into the document, e.g.:
+//     let d = {}
+//     d["active"] = bson_bool(true)
+//   This uses a reserved-key wrapper dict {"$bsonBool": 0|1} — the same
+//   technique MongoDB's own Extended JSON uses for its ambiguous scalar
+//   types ($numberLong, $binary, ...). A real document field that happens
+//   to be a SINGLE-KEY dict literally named "$bsonBool" would collide with
+//   this; that tradeoff is accepted and documented, exactly as MongoDB
+//   accepts it for its own $-prefixed Extended JSON keys.
+//   bson_long(v) is the equivalent forcing wrapper for int64 (0x12) — use
+//   it when a small-magnitude value must still be written as a MongoDB
+//   Long rather than the default magnitude-based int32/int64 choice.
+//
+// DECODE mapping
+//   double -> NOVA float ; string -> NOVA string ; embedded doc -> NOVA dict
+//   (recursive) ; array -> NOVA list (index order restored from the numeric
+//   keys, NOT from dict iteration order — see _bs_decode_array) ; binary ->
+//   NOVA bytes (subtype byte is read and then dropped — decode always
+//   returns the payload as `bytes`, so bson_decode(bson_encode(x)) stays
+//   symmetric under type_of) ; bool -> NOVA int 0/1 ; null -> NOVA null ;
+//   int32/int64 -> NOVA int.
+//
+// STRING NUL LIMITATION (documented, matches reference_nova_string_nul_
+// truncation): a BSON string (0x02) value is technically free to contain an
+// embedded 0x00 byte on the wire. NOVA's `string` type is C-string-shaped
+// and cannot represent that — decoding truncates at the first embedded NUL.
+// This is a NOVA language limitation, not specific to this module; anyone
+// who needs binary-safe payloads that may contain 0x00 must use the binary
+// type (0x05, NOVA `bytes`), never the string type.
+//
+// SAFETY / MALFORMED INPUT
+//   Every decode path bounds-checks against the buffer length before
+//   reading — declared lengths (document/array total, string length, binary
+//   length) are validated to fit inside the buffer before any byte is read.
+//   On a truncated or otherwise invalid buffer, decode reports the problem
+//   and exits cleanly (print + exit(1), the established pack_fmt/unpack_fmt
+//   convention in this codebase) rather than reading out of bounds.
+//
+// IMPLEMENTATION NOTES
+//   • LEAF module — imports nothing.
+//   • All private helpers prefixed _bs_ to avoid link collisions.
+//   • bytes_append/bytes_concat/bytes_slice each return a NEW bytes handle
+//     — always reassign, never assume in-place mutation.
+//   • Single-exit style (a trailing expression / one `return`) throughout to
+//     avoid the NOVA early-return mistag bug.
+//   • No multi-line list/dict literals (NOVA parser limitation).
+// ============================================================================
+
+// ── little-endian integer byte writers ──────────────────────────────────────
+
+fn _bs_put_i32_le(b, v) -> any
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    return out
+
+fn _bs_put_i64_le(b, v) -> any
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 32) & 0xFF)
+    out = bytes_append(out, (v >> 40) & 0xFF)
+    out = bytes_append(out, (v >> 48) & 0xFF)
+    out = bytes_append(out, (v >> 56) & 0xFF)
+    return out
+
+// ── little-endian integer byte readers ──────────────────────────────────────
+
+fn _bs_read_i32_le(b, pos) -> int
+    let b0 = bytes_get(b, pos) & 0xFF
+    let b1 = bytes_get(b, pos + 1) & 0xFF
+    let b2 = bytes_get(b, pos + 2) & 0xFF
+    let b3 = bytes_get(b, pos + 3) & 0xFF
+    let u = ((b3 << 24) | (b2 << 16)) | ((b1 << 8) | b0)
+    let result = u
+    if u >= 2147483648
+        result = u - 4294967296
+    return result
+
+fn _bs_read_i64_le(b, pos) -> int
+    let b0 = bytes_get(b, pos) & 0xFF
+    let b1 = bytes_get(b, pos + 1) & 0xFF
+    let b2 = bytes_get(b, pos + 2) & 0xFF
+    let b3 = bytes_get(b, pos + 3) & 0xFF
+    let b4 = bytes_get(b, pos + 4) & 0xFF
+    let b5 = bytes_get(b, pos + 5) & 0xFF
+    let b6 = bytes_get(b, pos + 6) & 0xFF
+    let b7 = bytes_get(b, pos + 7) & 0xFF
+    // NOVA ints are 64-bit two's complement, so the recomposed unsigned
+    // pattern already IS the correct signed value — no fold needed (same
+    // reasoning as std/encoding/pack's unpack_i64_le).
+    return (((b7 << 56) | (b6 << 48)) | ((b5 << 40) | (b4 << 32))) | (((b3 << 24) | (b2 << 16)) | ((b1 << 8) | b0))
+
+// ── cstring (NUL-terminated key) reader, bounded by `limit` ────────────────
+// Returns [string, next_pos]. Defensive: if no NUL is found before `limit`,
+// stops at `limit` rather than scanning past the caller's bound.
+fn _bs_read_cstring(b, pos, limit) -> any
+    let bound = limit
+    let cur = pos
+    while cur < bound and bytes_get(b, cur) != 0
+        cur = cur + 1
+    let sub = bytes_slice(b, pos, cur)
+    let s = bytes_to_str(sub)
+    let next = cur + 1
+    if next > bound
+        next = bound
+    let result = [s, next]
+    return result
+
+// ── encode: leaf value writers ──────────────────────────────────────────────
+
+fn _bs_cstring(s) -> any
+    let sb = str_to_bytes(s)
+    return bytes_append(sb, 0)
+
+// BSON string (0x02): int32 LE (len incl. trailing NUL) + UTF-8 bytes + 0x00.
+fn _bs_enc_string(s) -> any
+    let sb = str_to_bytes(s)
+    let slen = bytes_len(sb)
+    let out = _bs_put_i32_le(bytes_create(0), slen + 1)
+    out = bytes_concat(out, sb)
+    out = bytes_append(out, 0)
+    return out
+
+// BSON binary (0x05): int32 LE length + 1 subtype byte (0x00 generic) + raw bytes.
+fn _bs_enc_binary(bv) -> any
+    let blen = bytes_len(bv)
+    let out = _bs_put_i32_le(bytes_create(0), blen)
+    out = bytes_append(out, 0)
+    out = bytes_concat(out, bv)
+    return out
+
+// BSON array (0x04): wire-identical to a document with keys "0","1",... in
+// the EXACT order of the NOVA list (never dict-iteration-order dependent).
+fn _bs_enc_array(lst) -> any
+    let n = len(lst)
+    let body = bytes_create(0)
+    let i = 0
+    while i < n
+        body = bytes_concat(body, _bs_encode_element(str(i), lst[i]))
+        i = i + 1
+    let total = bytes_len(body) + 5
+    let out = _bs_put_i32_le(bytes_create(0), total)
+    out = bytes_concat(out, body)
+    out = bytes_append(out, 0)
+    return out
+
+// _bs_type_and_value: dispatch v -> [type_code, value_bytes].
+fn _bs_type_and_value(v) -> any
+    let tb = 0x0A
+    let vb = bytes_create(0)
+    // Use type_of, NOT `v != null`: NOVA represents null as 0, so `0 != null` is FALSE -> an int 0 or
+    // float 0.0 would silently fall through to the null (0x0A) branch (CVE-class silent data corruption).
+    if type_of(v) != "null"
+        let t = type_of(v)
+        if t == "float"
+            tb = 0x01
+            vb = _bs_put_i64_le(bytes_create(0), float_to_bits(v))
+        else if t == "string"
+            tb = 0x02
+            vb = _bs_enc_string(v)
+        else if t == "list"
+            tb = 0x04
+            vb = _bs_enc_array(v)
+        else if t == "bytes"
+            tb = 0x05
+            vb = _bs_enc_binary(v)
+        else if t == "dict"
+            let ks = keys(v)
+            if len(ks) == 1 and ks[0] == "$bsonBool"
+                tb = 0x08
+                let bv = v["$bsonBool"]
+                let bbyte = 0
+                if bv != 0
+                    bbyte = 1
+                vb = bytes_append(bytes_create(0), bbyte)
+            else if len(ks) == 1 and ks[0] == "$numberLong"
+                tb = 0x12
+                vb = _bs_put_i64_le(bytes_create(0), v["$numberLong"])
+            else if len(ks) == 1 and ks[0] == "$bsonNull"
+                // Explicit BSON null (0x0A). A BARE `null` value in a dict is stored by NOVA as raw 0 and is
+                // therefore indistinguishable from int 0, so it encodes as int32(0); use bson_null() to emit
+                // a true BSON null. (Same reserved-sentinel technique as $bsonBool / $numberLong above.)
+                tb = 0x0A
+                vb = bytes_create(0)
+            else
+                tb = 0x03
+                vb = bson_encode(v)
+        else if t == "int"
+            if v >= -2147483648 and v <= 2147483647
+                tb = 0x10
+                vb = _bs_put_i32_le(bytes_create(0), v)
+            else
+                tb = 0x12
+                vb = _bs_put_i64_le(bytes_create(0), v)
+            // unsupported types (e.g. struct) fall through and stay 0x0A/null,
+            // a documented safe fallback rather than a crash.
+    let result = [tb, vb]
+    return result
+
+// _bs_encode_element: type byte + cstring key + value, for one document field.
+fn _bs_encode_element(key, v) -> any
+    let tv = _bs_type_and_value(v)
+    let out = bytes_create(0)
+    out = bytes_append(out, tv[0])
+    out = bytes_concat(out, _bs_cstring(key))
+    out = bytes_concat(out, tv[1])
+    return out
+
+// bson_encode: encode a NOVA dict as a complete top-level BSON document.
+// Field order follows keys(doc); for single-field documents (the byte-exact
+// spec examples) this is unambiguous. For multi-field documents the byte
+// layout follows whatever order keys(doc) yields — decode is always
+// order-faithful to whatever was actually written on the wire.
+fn bson_encode(doc) -> any
+    let ks = keys(doc)
+    let n = len(ks)
+    let body = bytes_create(0)
+    let i = 0
+    while i < n
+        let k = ks[i]
+        body = bytes_concat(body, _bs_encode_element(k, doc[k]))
+        i = i + 1
+    let total = bytes_len(body) + 5
+    let out = _bs_put_i32_le(bytes_create(0), total)
+    out = bytes_concat(out, body)
+    out = bytes_append(out, 0)
+    return out
+
+// ── decode ───────────────────────────────────────────────────────────────────
+
+// _bs_decode_element: decode one element (type byte + cstring key + value)
+// starting at `pos`, bounded by `end` (the exclusive end of the enclosing
+// document/array). Returns [key, value, next_pos].
+fn _bs_decode_element(b, pos, end) -> any
+    let t = bytes_get(b, pos)
+    let cur = pos + 1
+    let ck = _bs_read_cstring(b, cur, end)
+    let key = ck[0]
+    cur = ck[1]
+    let val = null
+
+    if t == 0x01
+        if cur + 8 > end
+            print("bson_decode: truncated double at " + str(cur))
+            exit(1)
+        val = float_from_bits(_bs_read_i64_le(b, cur))
+        cur = cur + 8
+    else if t == 0x02
+        if cur + 4 > end
+            print("bson_decode: truncated string length at " + str(cur))
+            exit(1)
+        let slen = _bs_read_i32_le(b, cur)
+        cur = cur + 4
+        if slen < 1
+            print("bson_decode: invalid string length " + str(slen))
+            exit(1)
+        if cur + slen > end
+            print("bson_decode: truncated string data at " + str(cur))
+            exit(1)
+        let sub = bytes_slice(b, cur, cur + slen - 1)
+        val = bytes_to_str(sub)
+        cur = cur + slen
+    else if t == 0x03
+        let sub = _bs_decode_document(b, cur)
+        val = sub[0]
+        cur = sub[1]
+        if cur > end
+            print("bson_decode: nested document exceeds parent bound")
+            exit(1)
+    else if t == 0x04
+        let sub = _bs_decode_array(b, cur)
+        val = sub[0]
+        cur = sub[1]
+        if cur > end
+            print("bson_decode: nested array exceeds parent bound")
+            exit(1)
+    else if t == 0x05
+        if cur + 4 > end
+            print("bson_decode: truncated binary length at " + str(cur))
+            exit(1)
+        let blen = _bs_read_i32_le(b, cur)
+        cur = cur + 4
+        if blen < 0
+            print("bson_decode: invalid binary length " + str(blen))
+            exit(1)
+        if cur + 1 + blen > end
+            print("bson_decode: truncated binary data at " + str(cur))
+            exit(1)
+        cur = cur + 1
+        val = bytes_slice(b, cur, cur + blen)
+        cur = cur + blen
+    else if t == 0x08
+        if cur + 1 > end
+            print("bson_decode: truncated bool at " + str(cur))
+            exit(1)
+        val = bytes_get(b, cur) & 0xFF
+        cur = cur + 1
+    else if t == 0x0A
+        val = null
+    else if t == 0x10
+        if cur + 4 > end
+            print("bson_decode: truncated int32 at " + str(cur))
+            exit(1)
+        val = _bs_read_i32_le(b, cur)
+        cur = cur + 4
+    else if t == 0x12
+        if cur + 8 > end
+            print("bson_decode: truncated int64 at " + str(cur))
+            exit(1)
+        val = _bs_read_i64_le(b, cur)
+        cur = cur + 8
+    else
+        print("bson_decode: unsupported BSON type byte " + str(t))
+        exit(1)
+
+    let result = [key, val, cur]
+    return result
+
+// _bs_decode_document: decode a document starting at `pos`. Returns
+// [dict, next_pos]. Validates the declared length against the buffer before
+// reading a single element — a truncated/invalid length exits cleanly
+// rather than reading out of bounds.
+fn _bs_decode_document(b, pos) -> any
+    let n = bytes_len(b)
+    if pos + 4 > n
+        print("bson_decode: truncated document header at " + str(pos))
+        exit(1)
+    let total = _bs_read_i32_le(b, pos)
+    if total < 5
+        print("bson_decode: invalid document length " + str(total))
+        exit(1)
+    let end = pos + total
+    if end > n
+        print("bson_decode: document length exceeds buffer")
+        exit(1)
+    let cur = pos + 4
+    let d = {}
+    while cur < end - 1
+        let el = _bs_decode_element(b, cur, end)
+        d[el[0]] = el[1]
+        cur = el[2]
+    let result = [d, end]
+    return result
+
+// _bs_decode_array: decode a BSON array (wire-identical to a document with
+// numeric-string keys) into a NOVA list. Index order is restored by parsing
+// each key back to an int — this is intentionally independent of NOVA
+// dict-iteration order, which is not guaranteed to be insertion order.
+fn _bs_decode_array(b, pos) -> any
+    let sub = _bs_decode_document(b, pos)
+    let d = sub[0]
+    let end = sub[1]
+    let ks = keys(d)
+    let n = len(ks)
+    let arr = []
+    let i = 0
+    while i < n
+        arr.push(null)
+        i = i + 1
+    i = 0
+    while i < n
+        let idx = parse_int(ks[i])
+        if idx >= 0 and idx < n
+            arr[idx] = d[ks[i]]
+        i = i + 1
+    let result = [arr, end]
+    return result
+
+// bson_decode_at: decode a document starting at byte offset `pos` in `b`.
+// Returns [dict, next_pos] — useful for reading a stream/sequence of
+// concatenated top-level BSON documents.
+fn bson_decode_at(b, pos) -> any
+    return _bs_decode_document(b, pos)
+
+// bson_decode: decode a single top-level BSON document from `b` (offset 0).
+fn bson_decode(b) -> any
+    let sub = _bs_decode_document(b, 0)
+    return sub[0]
+
+// ── explicit-type wrapper constructors (bool/int64 disambiguation) ─────────
+
+// bson_bool(v): wrap v so _bs_type_and_value encodes it as an explicit BSON
+// boolean (0x08) rather than the default int32 0/1. See header comment for
+// why this is necessary (type_of(true) == "int" in NOVA).
+fn bson_bool(v) -> any
+    let d = {}
+    let bbit = 0
+    if v != 0
+        bbit = 1
+    d["$bsonBool"] = bbit
+    return d
+
+// bson_long(v): wrap v so _bs_type_and_value always encodes it as BSON
+// int64 (0x12), overriding the default magnitude-based int32/int64 choice.
+fn bson_long(v) -> any
+    let d = {}
+    d["$numberLong"] = v
+    return d
+
+// bson_null(): wrap a true BSON null (0x0A). A bare `null` value in ANY container position -- a dict field,
+// an array element, or a nested-document field -- is stored by NOVA as raw 0 (indistinguishable from int 0)
+// and therefore encodes as int32(0); pass bson_null() (usable in all three positions) for a real BSON null.
+fn bson_null() -> any
+    let d = {}
+    d["$bsonNull"] = 1
+    return d
