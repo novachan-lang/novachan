@@ -1,0 +1,207 @@
+// INDEPENDENT ADVERSARIAL PROBE for std/net/snmp.nova — does NOT reuse the
+// builder's KAT. Re-derives expected bytes from RFC 1157/3416 + X.690
+// independently and attacks: nested (non-outer) lying length, long-form
+// length boundary (127/128), empty community, sign preservation on
+// version/request-id, i64 extremes, mid-varbind truncation, exact
+// off-by-one length boundary, multi-byte version, negative GetBulk fields,
+// and repeated reject-without-crash (process must stay alive).
+//
+// KAT INTEGRITY: fails is a local int threaded explicitly through check()'s
+// return value in main() -- NOT a shared-list counter.
+
+import std/net/snmp
+import std/encoding/asn1
+import std/encoding/hex
+
+fn check(name: string, cond: bool, fails: int) -> int
+    if cond
+        print("PASS " + name)
+        return fails
+    else
+        print("FAIL " + name)
+        return fails + 1
+
+fn main()
+    let fails = 0
+
+    // ── 1. Nested lying length: outer message + version + community are
+    // valid, but the VARBIND's OID TLV inside the PDU declares a length that
+    // overruns the actual varbind content. Must reject in-band, not just at
+    // the outer layer.
+    let good_pdu = snmp_encode_pdu(snmp_pdu_get_request(), 1, 0, 0, [snmp_encode_varbind("1.3.6.1.2.1.1.1.0", snmp_value_null())])
+    // Manually corrupt: locate the varbind's OID TLV length byte and inflate it.
+    // Structure: ...A0 19 02 01 01 02 01 00 02 01 00 30 0E 30 0C 06 08 <oid8> 05 00
+    // find offset of "06 08" (oid tag+len) inside good_pdu bytes.
+    let plen = bytes_len(good_pdu)
+    let oid_len_pos = -1
+    let k = 0
+    while k < plen - 1
+        if bytes_get(good_pdu, k) == 0x06 and bytes_get(good_pdu, k + 1) == 0x08
+            oid_len_pos = k + 1
+        k = k + 1
+    fails = check("probe_found_oid_len_byte", oid_len_pos > 0, fails)
+    let corrupted_pdu = bytes_create(plen)
+    let ci = 0
+    while ci < plen
+        bytes_set(corrupted_pdu, ci, bytes_get(good_pdu, ci))
+        ci = ci + 1
+    // inflate declared OID content length from 8 to 100 (lies about content present)
+    bytes_set(corrupted_pdu, oid_len_pos, 100)
+    let ver_tlv = asn1_encode_integer(snmp_version_v2c())
+    let comm_tlv = asn1_encode_octet_string(hex_decode("7075626c6963"))
+    let msgc = bytes_concat(ver_tlv, comm_tlv)
+    msgc = bytes_concat(msgc, corrupted_pdu)
+    let corrupted_msg = asn1_write_tlv(asn1_tag_sequence(), msgc)
+    let dcorrupt = snmp_decode_message(corrupted_msg)
+    fails = check("nested_lying_oid_length_rejected", dcorrupt["ok"] == false, fails)
+    fails = check("nested_lying_still_has_error", dcorrupt["error"] != "", fails)
+
+    // ── 2. Long-form length boundary: a community string of exactly 128
+    // bytes forces DER long-form length (0x81 0x80) instead of short-form.
+    // Verify round trip AND the exact length-encoding bytes.
+    let comm128 = ""
+    let bi = 0
+    while bi < 128
+        comm128 = comm128 + "x"
+        bi = bi + 1
+    let req128 = snmp_encode_get_request(snmp_version_v2c(), comm128, 1, ["1.3.6.1.2.1.1.1.0"])
+    // community TLV starts right after version TLV (02 01 01 = 3 bytes), at
+    // outer-content offset 3 -> but outer TLV header itself is variable-width
+    // too since total content > 127. Just decode instead of hand-indexing.
+    let d128 = snmp_decode_message(req128)
+    fails = check("long_form_len128_decode_ok", d128["ok"] == true, fails)
+    fails = check("long_form_len128_community_len", bytes_len(d128["community_bytes"]) == 128, fails)
+    fails = check("long_form_len128_community_str", d128["community"] == comm128, fails)
+    // Independently verify the community TLV's length bytes are DER long-form
+    // 0x81 0x80 (128 = 0x80, needs 1 length byte, so long-form marker 0x81).
+    let comm_tag_pos = -1
+    let sp = 0
+    while sp < bytes_len(req128) - 1
+        if bytes_get(req128, sp) == 0x04 and bytes_get(req128, sp + 1) == 0x81
+            comm_tag_pos = sp
+        sp = sp + 1
+    fails = check("long_form_len128_uses_0x81_marker", comm_tag_pos >= 0, fails)
+    if comm_tag_pos >= 0
+        fails = check("long_form_len128_len_byte_is_0x80", bytes_get(req128, comm_tag_pos + 2) == 0x80, fails)
+
+    // Boundary just below: 127-byte community must use SHORT form (single
+    // length byte, no 0x81 marker directly preceding it as a length-of-length).
+    let comm127 = ""
+    let bj = 0
+    while bj < 127
+        comm127 = comm127 + "y"
+        bj = bj + 1
+    let req127 = snmp_encode_get_request(snmp_version_v2c(), comm127, 1, ["1.3.6.1.2.1.1.1.0"])
+    let d127 = snmp_decode_message(req127)
+    fails = check("short_form_len127_decode_ok", d127["ok"] == true, fails)
+    fails = check("short_form_len127_community_len", bytes_len(d127["community_bytes"]) == 127, fails)
+    // find "04 7F" (tag=OCTET STRING, short-form length 127=0x7F) present
+    let found_short = false
+    let sq = 0
+    while sq < bytes_len(req127) - 1
+        if bytes_get(req127, sq) == 0x04 and bytes_get(req127, sq + 1) == 0x7F
+            found_short = true
+        sq = sq + 1
+    fails = check("short_form_len127_uses_0x7F_direct", found_short, fails)
+
+    // ── 3. Empty community string round trip (zero-length OCTET STRING).
+    let req_emptycomm = snmp_encode_get_request(snmp_version_v2c(), "", 1, ["1.3.6.1.2.1.1.1.0"])
+    let d_emptycomm = snmp_decode_message(req_emptycomm)
+    fails = check("empty_community_decode_ok", d_emptycomm["ok"] == true, fails)
+    fails = check("empty_community_len0", bytes_len(d_emptycomm["community_bytes"]) == 0, fails)
+    fails = check("empty_community_str_empty", d_emptycomm["community"] == "", fails)
+
+    // ── 4. i64 extremes on request-id: max i64 and a large negative value
+    // (request-id field is a generic INTEGER container in this codec; must
+    // round-trip byte-exact two's-complement regardless of RFC's narrower
+    // Integer32 constraint -- the codec itself is generic).
+    let maxi64 = 9223372036854775807
+    let req_max = snmp_encode_get_request(snmp_version_v2c(), "public", maxi64, ["1.3.6.1.2.1.1.1.0"])
+    let d_max = snmp_decode_message(req_max)
+    fails = check("i64_max_roundtrip", d_max["request_id"] == maxi64, fails)
+
+    let negid = -12345
+    let req_neg = snmp_encode_get_request(snmp_version_v2c(), "public", negid, ["1.3.6.1.2.1.1.1.0"])
+    let d_neg = snmp_decode_message(req_neg)
+    fails = check("negative_request_id_roundtrip", d_neg["request_id"] == negid, fails)
+
+    // ── 5. Negative version round trip (generic container, no range check).
+    let req_negver = snmp_encode_get_request(-1, "public", 1, ["1.3.6.1.2.1.1.1.0"])
+    let d_negver = snmp_decode_message(req_negver)
+    fails = check("negative_version_roundtrip", d_negver["version"] == -1, fails)
+
+    // ── 6. Multi-byte version value (300 needs 2 content bytes: 0x01 0x2C).
+    let req_ver300 = snmp_encode_get_request(300, "public", 1, ["1.3.6.1.2.1.1.1.0"])
+    let d_ver300 = snmp_decode_message(req_ver300)
+    fails = check("multibyte_version_roundtrip", d_ver300["version"] == 300, fails)
+
+    // ── 7. Mid-structure truncation: valid outer/version/community/PDU
+    // header, but chop off mid-way through the variable-bindings so the
+    // varbind-list SEQUENCE claims more than remains. Must reject cleanly.
+    let full_getreq = snmp_encode_get_request(snmp_version_v2c(), "public", 1, ["1.3.6.1.2.1.1.1.0"])
+    let fulllen = bytes_len(full_getreq)
+    // chop off the last 3 bytes only (still has SEQUENCE/varbind headers
+    // claiming content that's no longer fully present)
+    let mid_trunc = bytes_slice(full_getreq, 0, fulllen - 3)
+    let d_midtrunc = snmp_decode_message(mid_trunc)
+    fails = check("mid_varbind_truncation_rejected", d_midtrunc["ok"] == false, fails)
+
+    // ── 8. Exact boundary: outer SEQUENCE length declares EXACTLY
+    // (buflen - header) remaining -- must be ACCEPTED (not off-by-one
+    // rejected). full_getreq itself is exactly self-consistent, so decoding
+    // it whole must succeed (already covered) -- now test slicing exactly
+    // one byte short of the true end must FAIL, and the exact true length
+    // must PASS (already proven by d_max etc succeeding). Explicit off-by-one:
+    let one_short = bytes_slice(full_getreq, 0, fulllen - 1)
+    let d_one_short = snmp_decode_message(one_short)
+    fails = check("exact_off_by_one_short_rejected", d_one_short["ok"] == false, fails)
+    let exact = bytes_slice(full_getreq, 0, fulllen)
+    let d_exact = snmp_decode_message(exact)
+    fails = check("exact_full_length_accepted", d_exact["ok"] == true, fails)
+
+    // ── 9. GetBulkRequest with negative non-repeaters/max-repetitions --
+    // must not crash, round-trips the raw (unclamped) signed values since
+    // this codec is a generic three-INTEGER PDU, not a validating one.
+    let bulk_neg = snmp_encode_get_bulk_request(snmp_version_v2c(), "public", 1, -1, -1, ["1.3.6.1.2.1.2.2"])
+    let d_bulk_neg = snmp_decode_message(bulk_neg)
+    fails = check("bulk_negative_fields_decode_ok", d_bulk_neg["ok"] == true, fails)
+    fails = check("bulk_negative_non_repeaters", d_bulk_neg["error_status"] == -1, fails)
+    fails = check("bulk_negative_max_repetitions", d_bulk_neg["error_index"] == -1, fails)
+
+    // ── 10. Repeated malformed-input rejects in a row -- process must
+    // survive ALL of them (sentinel checks after each).
+    let garbage1 = bytes_create(1)
+    bytes_set(garbage1, 0, 0xFF)
+    let dg1 = snmp_decode_message(garbage1)
+    fails = check("garbage1_rejected_alive", dg1["ok"] == false, fails)
+
+    let garbage2 = bytes_create(3)
+    bytes_set(garbage2, 0, 0x30)
+    bytes_set(garbage2, 1, 0xFF)
+    bytes_set(garbage2, 2, 0x08)
+    let dg2 = snmp_decode_message(garbage2)
+    fails = check("garbage2_rejected_alive", dg2["ok"] == false, fails)
+
+    // long-form length claiming nb=9 (>8, must be rejected per DER: no int64
+    // can hold a 9-byte-or-wider length) -- construct 0x30 0x89 (nb=9) plus
+    // filler; asn1_decode_length rejects nb>8 with [-1,...].
+    let garbage3 = bytes_create(2)
+    bytes_set(garbage3, 0, 0x30)
+    bytes_set(garbage3, 1, 0x89)
+    let dg3 = snmp_decode_message(garbage3)
+    fails = check("nb_gt8_length_rejected_alive", dg3["ok"] == false, fails)
+
+    // indefinite-length form (0x80) is BER-only, invalid DER -- must reject,
+    // not hang or crash trying to scan for an end-of-contents marker.
+    let garbage4 = bytes_create(2)
+    bytes_set(garbage4, 0, 0x30)
+    bytes_set(garbage4, 1, 0x80)
+    let dg4 = snmp_decode_message(garbage4)
+    fails = check("indefinite_length_rejected_alive", dg4["ok"] == false, fails)
+
+    fails = check("probe_still_alive_at_end", true, fails)
+
+    if fails == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(fails))

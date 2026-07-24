@@ -1,0 +1,538 @@
+// ============================================================================
+// NOVA Standard Library — std/net/snmp
+// ============================================================================
+// SNMP v1/v2c (RFC 1157 / RFC 1901-1905) message codec, built ON TOP OF
+// std/encoding/asn1's BER/DER TLV layer — this module does NOT reimplement
+// tag/length/value framing; it only knows the SNMP-specific ASN.1 GRAMMAR
+// (which tags nest inside which SEQUENCEs, plus SNMP's own APPLICATION-class
+// value types) and drives asn1's generic TLV reader/writer through it.
+//
+// GRAMMAR (RFC 1157 §4.1, RFC 3416 §3 for v2c PDU/error-code extensions):
+//   Message ::= SEQUENCE {
+//        version    INTEGER,       -- tag 0x02: 0 = v1, 1 = v2c
+//        community  OCTET STRING,  -- tag 0x04
+//        data       PDUs }         -- CHOICE, context-tagged (see below)
+//
+//   PDU ::= [APPLICATION-class-via-context-tag] SEQUENCE {
+//        request-id   INTEGER,                       -- tag 0x02
+//        error-status INTEGER,                        -- tag 0x02 (0=noError)
+//        error-index  INTEGER,                        -- tag 0x02
+//        variable-bindings SEQUENCE OF VarBind }       -- tag 0x30
+//   For GetBulkRequest (RFC 3416 §4), the SAME three-INTEGER shape is reused
+//   with different field semantics: error-status slot -> non-repeaters,
+//   error-index slot -> max-repetitions. The wire shape is byte-identical;
+//   only the caller's interpretation differs, so one PDU builder
+//   (snmp_encode_pdu) serves both.
+//
+//   VarBind ::= SEQUENCE { name OBJECT IDENTIFIER, value ObjectSyntax }
+//
+//   PDU context tags (class=context(2), constructed, tag-number = choice
+//   index — encoded as 0xA0 | tag_number, i.e. 0x20 constructed | 0x80
+//   context | tag_number):
+//        GetRequest      [0]  0xA0
+//        GetNextRequest  [1]  0xA1
+//        GetResponse     [2]  0xA2
+//        SetRequest      [3]  0xA3
+//        GetBulkRequest  [5]  0xA5   (v2c only)
+//        Trap-v2         [7]  0xA7   (v2c only; v1 Trap-PDU [4]/0xA4 not
+//                                     implemented — v1 traps use a different
+//                                     PDU shape (enterprise/agent-addr/
+//                                     generic-trap/specific-trap/timestamp)
+//                                     from Get/Set/Response and are out of
+//                                     scope for this module)
+//
+//   ObjectSyntax value types this module encodes/decodes:
+//        INTEGER        0x02  (universal primitive, from asn1)
+//        OCTET STRING   0x04  (universal primitive, from asn1)
+//        NULL           0x05  (universal primitive, from asn1)
+//        OBJECT IDENTIFIER 0x06 (universal primitive, from asn1)
+//        Counter32      0x41  ([APPLICATION 1], RFC 1155 §3.2.3.3)
+//        Gauge32        0x42  ([APPLICATION 2])
+//        TimeTicks      0x43  ([APPLICATION 3])
+//   Counter32/Gauge32/TimeTicks share INTEGER's exact CONTENT encoding
+//   (X.690 §8.4 defers APPLICATION-class primitives to the same minimal
+//   two's-complement big-endian rule as universal INTEGER) — only the tag
+//   byte differs. They are semantically UNSIGNED 32-bit (0..2^32-1): on
+//   encode, a negative input is clamped to 0 and the value is masked to 32
+//   bits (real counters/gauges/timeticks wrap at 2^32, they never go
+//   negative), matching how a live agent would report them.
+//
+// REUSE. asn1_write_tlv/asn1_read_tlv/asn1_decode_length/asn1_encode_length
+// (the TLV+BER-length engine), asn1_encode_integer/asn1_encode_octet_string/
+// asn1_encode_null/asn1_encode_oid/asn1_tag_sequence/asn1_tag_integer/
+// asn1_tag_octet_string/asn1_tag_null/asn1_tag_oid are used AS-IS from
+// std/encoding/asn1 — not reimplemented. Counter32/Gauge32/TimeTicks reuse
+// asn1_encode_integer's minimal-two's-complement trim exactly (call it, then
+// retag byte 0) rather than re-deriving the trim algorithm — the same
+// technique std/net/ldap.nova uses for ENUMERATED-over-INTEGER.
+//
+// SAFETY MODEL (untrusted-network input — SNMP agents/managers receive UDP
+// datagrams from the network by design). std/encoding/asn1's TLV reader
+// bounds-checks every individual byte access (bytes_get/bytes_slice never
+// read past a buffer's allocated size), so a malformed packet can never
+// crash the process at the byte-access level. But byte-safety alone is not
+// PROTOCOL safety: a length field can be individually in-bounds-per-access
+// yet still LIE (declare more content than actually remains in the buffer)
+// — an attacker-controlled "declare a huge OCTET STRING but supply no
+// bytes" framing must fail cleanly, not be trusted. _snmp_safe_tlv is the
+// single choke point that adds this check: after asn1_decode_length returns
+// [declared_len, content_start], it independently verifies
+// content_start + declared_len does not exceed bytes_len(buf) (overflow-safe
+// — declared_len can be up to 2^64-1 per BER long-form, so the sum can wrap
+// an int64) BEFORE trusting the slice. Every decode entry point in this
+// module routes through it exclusively; none call asn1_read_tlv directly on
+// untrusted input. No decode path ever exits/aborts the process — every
+// failure returns an in-band dict with "ok": false and "error": string.
+//
+// BINARY-SAFE FIELDS. community and OCTET STRING varbind values are binary
+// per X.690 (NUL is ordinary content, never a terminator — NOVA `string` is
+// C-string-backed and truncates at NUL, see
+// reference_nova_string_nul_truncation). Every such field is returned BOTH
+// ways: `community`/`value_str... via bytes_to_str` for ergonomic use, AND
+// `community_bytes`/`value_bytes` (exact bytes) for a NUL-containing or
+// otherwise binary payload. Encode functions that take community as `string`
+// go through bytes_append_str (copies the declared length, not strlen), so a
+// NUL-free literal round-trips correctly either way.
+//
+// PUBLIC API:
+//   Version constants: snmp_version_v1() snmp_version_v2c()
+//   PDU tag constants: snmp_pdu_get_request() snmp_pdu_get_next_request()
+//     snmp_pdu_get_response() snmp_pdu_set_request() snmp_pdu_get_bulk_request()
+//     snmp_pdu_trap_v2()
+//   Application-type tag constants: snmp_tag_counter32() snmp_tag_gauge32()
+//     snmp_tag_timeticks()
+//   Error-status constants (RFC 1157 §4.1.1 + RFC 1905 v2c extensions):
+//     snmp_err_no_error() snmp_err_too_big() snmp_err_no_such_name()
+//     snmp_err_bad_value() snmp_err_read_only() snmp_err_gen_err()
+//
+//   Value TLV builders (-> bytes, a single value TLV):
+//     snmp_value_integer(n) snmp_value_octet_string(b) snmp_value_null()
+//     snmp_value_oid(dotted) snmp_value_counter32(n) snmp_value_gauge32(n)
+//     snmp_value_timeticks(n)
+//
+//   Structure builders:
+//     snmp_encode_varbind(oid: string, value_tlv: bytes) -> bytes
+//     snmp_encode_pdu(pdu_tag, request_id, error_status, error_index,
+//                     varbinds: list<bytes>) -> bytes
+//     snmp_encode_message(version, community: string, pdu_bytes: bytes) -> bytes
+//
+//   Convenience full-message builders (-> bytes, ready to send over UDP/161):
+//     snmp_encode_get_request(version, community, request_id, oids: list<string>) -> bytes
+//     snmp_encode_get_next_request(version, community, request_id, oids: list<string>) -> bytes
+//     snmp_encode_get_bulk_request(version, community, request_id,
+//                                  non_repeaters, max_repetitions, oids: list<string>) -> bytes
+//     snmp_encode_get_response(version, community, request_id, error_status,
+//                              error_index, varbinds: list<bytes>) -> bytes
+//     snmp_encode_set_request(version, community, request_id, varbinds: list<bytes>) -> bytes
+//     snmp_encode_trap_v2(version, community, request_id, varbinds: list<bytes>) -> bytes
+//
+//   Decode (-> dict; ALWAYS returns in-band, NEVER exits/aborts on bad
+//   input; "ok": bool signals success, "error": string carries the reason):
+//     snmp_decode_message(buf: bytes) -> dict
+//        { ok, version, community, community_bytes, pdu_tag, request_id,
+//          error_status, error_index, varbinds: list<dict>, error }
+//     each varbind dict:
+//        { ok, oid: string, value_tag: int, value_type: string
+//              ("integer"|"octet_string"|"null"|"oid"|"counter32"|
+//               "gauge32"|"timeticks"|"unknown"),
+//          value_int: int, value_bytes: bytes, value_oid: string, error }
+// ============================================================================
+
+import std/encoding/asn1
+
+// ── version constants ──────────────────────────────────────────────────────
+fn snmp_version_v1() -> int
+    0
+fn snmp_version_v2c() -> int
+    1
+
+// ── PDU context-tag constants (RFC 1157 §4.1, RFC 3416 §4) ─────────────────
+fn snmp_pdu_get_request() -> int
+    0xA0
+fn snmp_pdu_get_next_request() -> int
+    0xA1
+fn snmp_pdu_get_response() -> int
+    0xA2
+fn snmp_pdu_set_request() -> int
+    0xA3
+fn snmp_pdu_get_bulk_request() -> int
+    0xA5
+fn snmp_pdu_trap_v2() -> int
+    0xA7
+
+// ── application-type tag constants (RFC 1155 §3.2.3.3) ─────────────────────
+fn snmp_tag_counter32() -> int
+    0x41
+fn snmp_tag_gauge32() -> int
+    0x42
+fn snmp_tag_timeticks() -> int
+    0x43
+
+// ── error-status constants (RFC 1157 §4.1.1, extended by RFC 1905 §3 for v2c) ──
+fn snmp_err_no_error() -> int
+    0
+fn snmp_err_too_big() -> int
+    1
+fn snmp_err_no_such_name() -> int
+    2
+fn snmp_err_bad_value() -> int
+    3
+fn snmp_err_read_only() -> int
+    4
+fn snmp_err_gen_err() -> int
+    5
+
+// ── private: string -> bytes (binary-safe: bytes_append_str copies the
+// declared length, not strlen — mirrors std/net/ldap's _ldap_str_to_bytes) ──
+fn _snmp_str_to_bytes(s) -> any
+    let b = bytes_create(0)
+    b = bytes_append_str(b, s)
+    return b
+
+// ── private: bounds-checked TLV read. Wraps asn1_read_tlv/asn1_decode_length
+// with an EXTRA check they do not perform themselves: that the declared
+// content length actually fits inside the remaining buffer (protects against
+// a truncated buffer or a hostile over-long length field being silently
+// accepted as if valid — see module header SAFETY MODEL). Returns
+// [tag: int, content: bytes, next_pos: int, ok: bool]. On any failure, ok is
+// false; callers never trust next_pos/content when ok is false. Mirrors
+// std/net/ldap's _ldap_safe_tlv exactly (same hardening, same contract). ──
+fn _snmp_safe_tlv(buf, pos) -> list
+    let buflen = bytes_len(buf)
+    if pos < 0 or pos >= buflen
+        return [-1, bytes_create(0), pos, false]
+    let tag = bytes_get(buf, pos) & 0xFF
+    let lpos = pos + 1
+    if lpos >= buflen
+        return [tag, bytes_create(0), lpos, false]
+    let lr = asn1_decode_length(buf, lpos)
+    let clen = lr[0]
+    let cstart = lr[1]
+    if clen < 0
+        return [tag, bytes_create(0), cstart, false]
+    if cstart < 0 or cstart > buflen
+        return [tag, bytes_create(0), cstart, false]
+    let cend = cstart + clen
+    // cend < cstart catches int64 wraparound from a huge BER long-form
+    // length (up to 8 bytes -> up to 2^64-1, which overflows a signed i64).
+    if cend < cstart or cend > buflen
+        return [tag, bytes_create(0), cstart, false]
+    let content = bytes_slice(buf, cstart, cend)
+    if bytes_len(content) != clen
+        return [tag, content, cend, false]
+    return [tag, content, cend, true]
+
+// ── private: minimal two's-complement content -> int. Mirrors
+// asn1_decode_integer's content-parsing exactly (INTEGER, and the
+// APPLICATION-class Counter32/Gauge32/TimeTicks share the identical content
+// encoding per X.690 §8.4), kept local so it can be reused across all four
+// tags without asn1_decode_integer's tag-mismatch warning print firing. ───
+fn _snmp_int_from_content(content) -> int
+    let clen = bytes_len(content)
+    if clen == 0
+        return 0
+    let b0 = bytes_get(content, 0) & 0xFF
+    let val = 0
+    if (b0 & 0x80) != 0
+        val = -1
+    let i = 0
+    while i < clen
+        let byte = bytes_get(content, i) & 0xFF
+        val = (val << 8) | byte
+        i = i + 1
+    return val
+
+// ── private: OBJECT IDENTIFIER content -> dotted string. Mirrors
+// asn1_decode_oid's arc-parsing body exactly, but operates directly on an
+// already-bounds-checked content span (not a raw buf+pos) so it composes
+// with _snmp_safe_tlv instead of re-deriving TLV framing. ──────────────────
+fn _snmp_oid_from_content(content) -> string
+    let clen = bytes_len(content)
+    if clen == 0
+        return ""
+    let combined = 0
+    let i = 0
+    while i < clen
+        let byte = bytes_get(content, i) & 0xFF
+        combined = (combined << 7) | (byte & 0x7F)
+        i = i + 1
+        if (byte & 0x80) == 0
+            break
+    let arc1 = combined / 40
+    if arc1 > 2
+        arc1 = 2
+    let arc2 = combined - 40 * arc1
+    let result = str(arc1) + "." + str(arc2)
+    let val = 0
+    while i < clen
+        let byte = bytes_get(content, i) & 0xFF
+        val = (val << 7) | (byte & 0x7F)
+        if (byte & 0x80) == 0
+            result = result + "." + str(val)
+            val = 0
+        i = i + 1
+    return result
+
+// ── value TLV builders ──────────────────────────────────────────────────
+fn snmp_value_integer(n) -> any
+    return asn1_encode_integer(n)
+
+fn snmp_value_octet_string(b) -> any
+    return asn1_encode_octet_string(b)
+
+fn snmp_value_null() -> any
+    return asn1_encode_null()
+
+fn snmp_value_oid(dotted) -> any
+    return asn1_encode_oid(dotted)
+
+// Counter32/Gauge32/TimeTicks: unsigned 32-bit. Negative input clamped to 0,
+// value masked to 32 bits (matches real counter/gauge/timeticks wraparound
+// semantics) BEFORE reusing asn1_encode_integer's trim + retagging byte 0.
+fn _snmp_value_unsigned32(n, tag) -> any
+    let v = n
+    if v < 0
+        v = 0
+    v = v & 0xFFFFFFFF
+    let tlv = asn1_encode_integer(v)
+    bytes_set(tlv, 0, tag)
+    return tlv
+
+fn snmp_value_counter32(n) -> any
+    return _snmp_value_unsigned32(n, snmp_tag_counter32())
+
+fn snmp_value_gauge32(n) -> any
+    return _snmp_value_unsigned32(n, snmp_tag_gauge32())
+
+fn snmp_value_timeticks(n) -> any
+    return _snmp_value_unsigned32(n, snmp_tag_timeticks())
+
+// ── structure builders ─────────────────────────────────────────────────
+fn snmp_encode_varbind(oid, value_tlv) -> any
+    let oid_tlv = asn1_encode_oid(oid)
+    let content = bytes_concat(oid_tlv, value_tlv)
+    return asn1_write_tlv(asn1_tag_sequence(), content)
+
+fn snmp_encode_pdu(pdu_tag, request_id, error_status, error_index, varbinds) -> any
+    let reqid_tlv = asn1_encode_integer(request_id)
+    let errstat_tlv = asn1_encode_integer(error_status)
+    let errindex_tlv = asn1_encode_integer(error_index)
+    let vb_content = bytes_create(0)
+    let i = 0
+    while i < len(varbinds)
+        vb_content = bytes_concat(vb_content, varbinds[i])
+        i = i + 1
+    let vbs_tlv = asn1_write_tlv(asn1_tag_sequence(), vb_content)
+    let content = bytes_concat(reqid_tlv, errstat_tlv)
+    content = bytes_concat(content, errindex_tlv)
+    content = bytes_concat(content, vbs_tlv)
+    return asn1_write_tlv(pdu_tag, content)
+
+fn snmp_encode_message(version, community, pdu_bytes) -> any
+    let ver_tlv = asn1_encode_integer(version)
+    let comm_tlv = asn1_encode_octet_string(_snmp_str_to_bytes(community))
+    let content = bytes_concat(ver_tlv, comm_tlv)
+    content = bytes_concat(content, pdu_bytes)
+    return asn1_write_tlv(asn1_tag_sequence(), content)
+
+// private: build a list of NULL-valued varbinds from an OID list — the
+// standard shape for a Get/GetNext request (the manager asks for a value,
+// it doesn't supply one).
+fn _snmp_null_varbinds(oids) -> list
+    let varbinds = []
+    let i = 0
+    while i < len(oids)
+        push(varbinds, snmp_encode_varbind(oids[i], snmp_value_null()))
+        i = i + 1
+    return varbinds
+
+// ── convenience full-message builders ──────────────────────────────────
+fn snmp_encode_get_request(version, community, request_id, oids) -> any
+    let pdu = snmp_encode_pdu(snmp_pdu_get_request(), request_id, 0, 0, _snmp_null_varbinds(oids))
+    return snmp_encode_message(version, community, pdu)
+
+fn snmp_encode_get_next_request(version, community, request_id, oids) -> any
+    let pdu = snmp_encode_pdu(snmp_pdu_get_next_request(), request_id, 0, 0, _snmp_null_varbinds(oids))
+    return snmp_encode_message(version, community, pdu)
+
+// GetBulkRequest (RFC 3416 §4, v2c only): error-status slot is repurposed as
+// non-repeaters, error-index slot as max-repetitions — same three-INTEGER
+// wire shape as every other PDU, snmp_encode_pdu is reused as-is.
+fn snmp_encode_get_bulk_request(version, community, request_id, non_repeaters, max_repetitions, oids) -> any
+    let pdu = snmp_encode_pdu(snmp_pdu_get_bulk_request(), request_id, non_repeaters, max_repetitions, _snmp_null_varbinds(oids))
+    return snmp_encode_message(version, community, pdu)
+
+fn snmp_encode_get_response(version, community, request_id, error_status, error_index, varbinds) -> any
+    let pdu = snmp_encode_pdu(snmp_pdu_get_response(), request_id, error_status, error_index, varbinds)
+    return snmp_encode_message(version, community, pdu)
+
+fn snmp_encode_set_request(version, community, request_id, varbinds) -> any
+    let pdu = snmp_encode_pdu(snmp_pdu_set_request(), request_id, 0, 0, varbinds)
+    return snmp_encode_message(version, community, pdu)
+
+fn snmp_encode_trap_v2(version, community, request_id, varbinds) -> any
+    let pdu = snmp_encode_pdu(snmp_pdu_trap_v2(), request_id, 0, 0, varbinds)
+    return snmp_encode_message(version, community, pdu)
+
+// ── decode ──────────────────────────────────────────────────────────────
+
+// private: decode one already-TLV-unwrapped VarBind's content (name OID +
+// value ObjectSyntax) into a typed dict. Dispatches on the value's tag byte;
+// an unrecognized tag is reported as "unknown" with raw bytes preserved
+// (never dropped, never crashes) rather than rejected outright, since a v1/
+// v2c PDU may legally carry other ObjectSyntax alternatives (e.g. IpAddress
+// [APPLICATION 0]/0x40, Opaque [APPLICATION 4]/0x44) this module doesn't
+// specifically type but must not choke on.
+fn _snmp_decode_varbind(content) -> dict
+    let entry = {}
+    entry["ok"] = false
+    entry["oid"] = ""
+    entry["value_tag"] = -1
+    entry["value_type"] = ""
+    entry["value_int"] = 0
+    entry["value_bytes"] = bytes_create(0)
+    entry["value_oid"] = ""
+    entry["error"] = ""
+
+    let oidr = _snmp_safe_tlv(content, 0)
+    if oidr[3] == false
+        entry["error"] = "malformed or truncated varbind name"
+        return entry
+    if oidr[0] != asn1_tag_oid()
+        entry["error"] = "varbind name is not OBJECT IDENTIFIER (tag 0x" + hex(oidr[0]) + ")"
+        return entry
+    entry["oid"] = _snmp_oid_from_content(oidr[1])
+
+    let valr = _snmp_safe_tlv(content, oidr[2])
+    if valr[3] == false
+        entry["error"] = "malformed or truncated varbind value"
+        return entry
+    let vtag = valr[0]
+    let vcontent = valr[1]
+    entry["value_tag"] = vtag
+
+    if vtag == asn1_tag_integer()
+        entry["value_type"] = "integer"
+        entry["value_int"] = _snmp_int_from_content(vcontent)
+    else if vtag == asn1_tag_octet_string()
+        entry["value_type"] = "octet_string"
+        entry["value_bytes"] = vcontent
+    else if vtag == asn1_tag_null()
+        entry["value_type"] = "null"
+    else if vtag == asn1_tag_oid()
+        entry["value_type"] = "oid"
+        entry["value_oid"] = _snmp_oid_from_content(vcontent)
+    else if vtag == snmp_tag_counter32()
+        entry["value_type"] = "counter32"
+        entry["value_int"] = _snmp_int_from_content(vcontent)
+    else if vtag == snmp_tag_gauge32()
+        entry["value_type"] = "gauge32"
+        entry["value_int"] = _snmp_int_from_content(vcontent)
+    else if vtag == snmp_tag_timeticks()
+        entry["value_type"] = "timeticks"
+        entry["value_int"] = _snmp_int_from_content(vcontent)
+    else
+        entry["value_type"] = "unknown"
+        entry["value_bytes"] = vcontent
+
+    entry["ok"] = true
+    return entry
+
+// snmp_decode_message: parses a full SNMP Message (version + community +
+// PDU + variable-bindings). Returns a dict; "ok" is false (with "error" set)
+// on ANY malformed or truncated input — this function never aborts the
+// process on bad input, and every field access is routed through
+// _snmp_safe_tlv so a lying/over-long length field is rejected in-band.
+fn snmp_decode_message(buf) -> dict
+    let result = {}
+    result["ok"] = false
+    result["version"] = -1
+    result["community"] = ""
+    result["community_bytes"] = bytes_create(0)
+    result["pdu_tag"] = -1
+    result["request_id"] = 0
+    result["error_status"] = 0
+    result["error_index"] = 0
+    result["varbinds"] = []
+    result["error"] = ""
+
+    let outer = _snmp_safe_tlv(buf, 0)
+    if outer[3] == false
+        result["error"] = "malformed SNMP message: truncated or invalid outer TLV"
+        return result
+    if outer[0] != asn1_tag_sequence()
+        result["error"] = "not a SEQUENCE (outer tag 0x" + hex(outer[0]) + ")"
+        return result
+    let content = outer[1]
+
+    let verr = _snmp_safe_tlv(content, 0)
+    if verr[3] == false
+        result["error"] = "malformed or truncated version"
+        return result
+    result["version"] = _snmp_int_from_content(verr[1])
+
+    let commr = _snmp_safe_tlv(content, verr[2])
+    if commr[3] == false
+        result["error"] = "malformed or truncated community"
+        return result
+    if commr[0] != asn1_tag_octet_string()
+        result["error"] = "community is not OCTET STRING (tag 0x" + hex(commr[0]) + ")"
+        return result
+    result["community_bytes"] = commr[1]
+    result["community"] = bytes_to_str(commr[1])
+
+    let pdur = _snmp_safe_tlv(content, commr[2])
+    if pdur[3] == false
+        result["error"] = "malformed or truncated PDU"
+        return result
+    result["pdu_tag"] = pdur[0]
+    let pdu_content = pdur[1]
+
+    let ridr = _snmp_safe_tlv(pdu_content, 0)
+    if ridr[3] == false
+        result["error"] = "malformed or truncated request-id"
+        return result
+    result["request_id"] = _snmp_int_from_content(ridr[1])
+
+    let esr = _snmp_safe_tlv(pdu_content, ridr[2])
+    if esr[3] == false
+        result["error"] = "malformed or truncated error-status"
+        return result
+    result["error_status"] = _snmp_int_from_content(esr[1])
+
+    let eir = _snmp_safe_tlv(pdu_content, esr[2])
+    if eir[3] == false
+        result["error"] = "malformed or truncated error-index"
+        return result
+    result["error_index"] = _snmp_int_from_content(eir[1])
+
+    let vbsr = _snmp_safe_tlv(pdu_content, eir[2])
+    if vbsr[3] == false
+        result["error"] = "malformed or truncated variable-bindings"
+        return result
+    if vbsr[0] != asn1_tag_sequence()
+        result["error"] = "variable-bindings is not a SEQUENCE (tag 0x" + hex(vbsr[0]) + ")"
+        return result
+
+    let varbinds = []
+    let vb_content = vbsr[1]
+    let vb_pos = 0
+    let vb_len = bytes_len(vb_content)
+    while vb_pos < vb_len
+        let vbr = _snmp_safe_tlv(vb_content, vb_pos)
+        if vbr[3] == false
+            result["error"] = "malformed or truncated variable-binding entry"
+            return result
+        if vbr[0] != asn1_tag_sequence()
+            result["error"] = "variable-binding entry is not a SEQUENCE (tag 0x" + hex(vbr[0]) + ")"
+            return result
+        let entry = _snmp_decode_varbind(vbr[1])
+        if entry["ok"] == false
+            result["error"] = "variable-binding entry: " + entry["error"]
+            return result
+        push(varbinds, entry)
+        vb_pos = vbr[2]
+    result["varbinds"] = varbinds
+
+    result["ok"] = true
+    return result

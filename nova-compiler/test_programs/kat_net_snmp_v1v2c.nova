@@ -1,0 +1,277 @@
+// KAT for std/net/snmp.nova — SNMP v1/v2c (RFC 1157 / RFC 1901-1905) message
+// codec on top of std/encoding/asn1's BER/DER TLV layer.
+//
+// Covers: byte-exact v2c GetRequest encode against an independently
+// hand-derived wire vector (sysDescr.0 GET), exact context-tag bytes for
+// every PDU type, GetResponse decode round-trip binding an OCTET STRING
+// value, Counter32/Gauge32/TimeTicks application-type round-trip, GetBulk
+// non-repeaters/max-repetitions reuse, and the mandatory edge-case
+// checklist: binary 0x00 in community/OCTET STRING value, empty OID list,
+// int-width boundaries (127/128, 255/256, 2^31, 2^32-1), truncated buffer,
+// over-long/lying length field, wrong outer tag, and never-exit-on-bad-input.
+//
+// KAT INTEGRITY: pass/fail count is threaded explicitly through `check`'s
+// return value and a local `fails` variable in main() — NOT a shared list
+// captured by a helper fn (that pattern silently fails to propagate).
+
+import std/net/snmp
+import std/encoding/asn1
+import std/encoding/hex
+
+fn check(name: string, cond: bool, fails: int) -> int
+    if cond
+        print("PASS " + name)
+        return fails
+    else
+        print("FAIL " + name)
+        return fails + 1
+
+fn main()
+    let fails = 0
+
+    // ── 1. byte-exact v2c GetRequest: community "public", request-id 1,
+    // single OID 1.3.6.1.2.1.1.1.0 (sysDescr.0), NULL value.
+    // Expected wire bytes hand-derived independently from X.690 + RFC 1157:
+    //   30 26                                   outer SEQUENCE, len 0x26=38
+    //     02 01 01                              version INTEGER 1 (v2c)
+    //     04 06 70 75 62 6C 69 63                community OCTET STRING "public"
+    //     A0 19                                  GetRequest PDU, len 0x19=25
+    //       02 01 01                             request-id INTEGER 1
+    //       02 01 00                             error-status INTEGER 0
+    //       02 01 00                             error-index INTEGER 0
+    //       30 0E                                 variable-bindings SEQUENCE, len 14
+    //         30 0C                               VarBind SEQUENCE, len 12
+    //           06 08 2B 06 01 02 01 01 01 00     OID 1.3.6.1.2.1.1.1.0
+    //                                             (2B = 40*1+3, then 6,1,2,1,1,1,0)
+    //           05 00                             NULL value
+    let getreq = snmp_encode_get_request(snmp_version_v2c(), "public", 1, ["1.3.6.1.2.1.1.1.0"])
+    let spec = [0x30,0x26,0x02,0x01,0x01,0x04,0x06,0x70,0x75,0x62,0x6C,0x69,0x63,
+        0xA0,0x19,0x02,0x01,0x01,0x02,0x01,0x00,0x02,0x01,0x00,0x30,0x0E,0x30,0x0C,
+        0x06,0x08,0x2B,0x06,0x01,0x02,0x01,0x01,0x01,0x00,0x05,0x00]
+    let ev = bytes_create(len(spec))
+    let i = 0
+    while i < len(spec)
+        bytes_set(ev, i, spec[i])
+        i = i + 1
+    let got_hex = hex_encode(getreq)
+    let want_hex = hex_encode(ev)
+    fails = check("getrequest_len_40", bytes_len(getreq) == 40, fails)
+    fails = check("getrequest_bytes_exact", got_hex == want_hex, fails)
+    print("  got : " + got_hex)
+    print("  want: " + want_hex)
+
+    // ── 2. exact tag bytes ──────────────────────────────────────────────
+    fails = check("outer_tag_0x30", bytes_get(getreq, 0) == 0x30, fails)
+    fails = check("getrequest_pdu_tag_0xA0_exact", bytes_get(getreq, 13) == 0xA0, fails)
+    fails = check("pdu_tag_const_0xA0", snmp_pdu_get_request() == 0xA0, fails)
+    fails = check("pdu_tag_const_0xA1", snmp_pdu_get_next_request() == 0xA1, fails)
+    fails = check("pdu_tag_const_0xA2", snmp_pdu_get_response() == 0xA2, fails)
+    fails = check("pdu_tag_const_0xA3", snmp_pdu_set_request() == 0xA3, fails)
+    fails = check("pdu_tag_const_0xA5", snmp_pdu_get_bulk_request() == 0xA5, fails)
+    fails = check("pdu_tag_const_0xA7", snmp_pdu_trap_v2() == 0xA7, fails)
+    fails = check("app_tag_counter32_0x41", snmp_tag_counter32() == 0x41, fails)
+    fails = check("app_tag_gauge32_0x42", snmp_tag_gauge32() == 0x42, fails)
+    fails = check("app_tag_timeticks_0x43", snmp_tag_timeticks() == 0x43, fails)
+
+    // ── 3. GetRequest decode round-trip ──────────────────────────────────
+    let dget = snmp_decode_message(getreq)
+    fails = check("getreq_decode_ok", dget["ok"] == true, fails)
+    fails = check("getreq_version", dget["version"] == snmp_version_v2c(), fails)
+    fails = check("getreq_community", dget["community"] == "public", fails)
+    fails = check("getreq_pdu_tag", dget["pdu_tag"] == snmp_pdu_get_request(), fails)
+    fails = check("getreq_request_id", dget["request_id"] == 1, fails)
+    fails = check("getreq_error_status", dget["error_status"] == 0, fails)
+    fails = check("getreq_error_index", dget["error_index"] == 0, fails)
+    let gvbs = dget["varbinds"]
+    fails = check("getreq_one_varbind", len(gvbs) == 1, fails)
+    fails = check("getreq_varbind_oid", gvbs[0]["oid"] == "1.3.6.1.2.1.1.1.0", fails)
+    fails = check("getreq_varbind_type_null", gvbs[0]["value_type"] == "null", fails)
+
+    // ── 4. GetResponse decode round-trip binding an OCTET STRING value
+    // (sysDescr.0 = "NOVA Agent") -- exercises the value-type dispatch for
+    // the string case, not just NULL.
+    let descr_bytes = bytes_create(0)
+    descr_bytes = bytes_append_str(descr_bytes, "NOVA Agent")
+    let vb1 = snmp_encode_varbind("1.3.6.1.2.1.1.1.0", snmp_value_octet_string(descr_bytes))
+    let getresp = snmp_encode_get_response(snmp_version_v2c(), "public", 42, 0, 0, [vb1])
+    fails = check("getresponse_pdu_tag_0xA2_exact", bytes_get(getresp, 13) == 0xA2, fails)
+    let dresp = snmp_decode_message(getresp)
+    fails = check("getresp_decode_ok", dresp["ok"] == true, fails)
+    fails = check("getresp_pdu_tag", dresp["pdu_tag"] == snmp_pdu_get_response(), fails)
+    fails = check("getresp_request_id", dresp["request_id"] == 42, fails)
+    let rvbs = dresp["varbinds"]
+    fails = check("getresp_one_varbind", len(rvbs) == 1, fails)
+    fails = check("getresp_varbind_oid", rvbs[0]["oid"] == "1.3.6.1.2.1.1.1.0", fails)
+    fails = check("getresp_varbind_type_octet_string", rvbs[0]["value_type"] == "octet_string", fails)
+    fails = check("getresp_varbind_value_bytes_exact", bytes_to_str(rvbs[0]["value_bytes"]) == "NOVA Agent", fails)
+
+    // ── 5. Counter32/Gauge32/TimeTicks application-type round-trip,
+    // including a value with the high bit of its top byte set (needs the
+    // DER pad byte, exercises unsigned-vs-signed boundary at 2^31/2^32-1).
+    let vb_c32 = snmp_encode_varbind("1.3.6.1.2.1.2.2.1.10.1", snmp_value_counter32(4294967295))
+    let vb_g32 = snmp_encode_varbind("1.3.6.1.2.1.2.2.1.5.1", snmp_value_gauge32(2147483648))
+    let vb_tt = snmp_encode_varbind("1.3.6.1.2.1.1.3.0", snmp_value_timeticks(12345))
+    let apptypes_resp = snmp_encode_get_response(snmp_version_v2c(), "public", 7, 0, 0, [vb_c32, vb_g32, vb_tt])
+    let dapp = snmp_decode_message(apptypes_resp)
+    fails = check("apptypes_decode_ok", dapp["ok"] == true, fails)
+    let avbs = dapp["varbinds"]
+    fails = check("apptypes_three_varbinds", len(avbs) == 3, fails)
+    fails = check("counter32_type", avbs[0]["value_type"] == "counter32", fails)
+    fails = check("counter32_max_u32", avbs[0]["value_int"] == 4294967295, fails)
+    fails = check("gauge32_type", avbs[1]["value_type"] == "gauge32", fails)
+    fails = check("gauge32_2pow31", avbs[1]["value_int"] == 2147483648, fails)
+    fails = check("timeticks_type", avbs[2]["value_type"] == "timeticks", fails)
+    fails = check("timeticks_value", avbs[2]["value_int"] == 12345, fails)
+    // Counter32 negative-input clamp to 0, and wraparound masking to 32 bits.
+    let c32_tlv = snmp_value_counter32(-5)
+    let vb_clamped = snmp_encode_varbind("1.3.6.1.2.1.2.2.1.10.2", c32_tlv)
+    let clamp_resp = snmp_encode_get_response(snmp_version_v2c(), "public", 8, 0, 0, [vb_clamped])
+    let dclamp = snmp_decode_message(clamp_resp)
+    fails = check("counter32_negative_clamped_to_zero", dclamp["varbinds"][0]["value_int"] == 0, fails)
+    let c32_wrap_tlv = snmp_value_counter32(4294967296 + 100)
+    let vb_wrap = snmp_encode_varbind("1.3.6.1.2.1.2.2.1.10.3", c32_wrap_tlv)
+    let wrap_resp = snmp_encode_get_response(snmp_version_v2c(), "public", 9, 0, 0, [vb_wrap])
+    let dwrap = snmp_decode_message(wrap_resp)
+    fails = check("counter32_wraps_to_32bit", dwrap["varbinds"][0]["value_int"] == 100, fails)
+
+    // ── 6. GetBulkRequest: error-status/error-index slots reused as
+    // non-repeaters/max-repetitions -- verify they decode into those exact
+    // wire positions (same field slots, different semantic label).
+    let bulkreq = snmp_encode_get_bulk_request(snmp_version_v2c(), "public", 5, 0, 10, ["1.3.6.1.2.1.2.2"])
+    fails = check("bulkreq_pdu_tag_0xA5_exact", bytes_get(bulkreq, 13) == 0xA5, fails)
+    let dbulk = snmp_decode_message(bulkreq)
+    fails = check("bulkreq_decode_ok", dbulk["ok"] == true, fails)
+    fails = check("bulkreq_pdu_tag", dbulk["pdu_tag"] == snmp_pdu_get_bulk_request(), fails)
+    fails = check("bulkreq_non_repeaters", dbulk["error_status"] == 0, fails)
+    fails = check("bulkreq_max_repetitions", dbulk["error_index"] == 10, fails)
+
+    // ── 7. v1 GetRequest (version=0) and SetRequest -- version dispatch and
+    // SetRequest tag exactness.
+    let v1req = snmp_encode_get_request(snmp_version_v1(), "public", 2, ["1.3.6.1.2.1.1.5.0"])
+    let dv1 = snmp_decode_message(v1req)
+    fails = check("v1_version_decodes_zero", dv1["version"] == 0, fails)
+    let setreq = snmp_encode_set_request(snmp_version_v2c(), "private", 3, [snmp_encode_varbind("1.3.6.1.2.1.1.6.0", snmp_value_integer(5))])
+    fails = check("setreq_pdu_tag_0xA3_exact", bytes_get(setreq, 14) == 0xA3, fails)
+    let dset = snmp_decode_message(setreq)
+    fails = check("setreq_decode_ok", dset["ok"] == true, fails)
+    fails = check("setreq_pdu_tag", dset["pdu_tag"] == snmp_pdu_set_request(), fails)
+    fails = check("setreq_varbind_type_integer", dset["varbinds"][0]["value_type"] == "integer", fails)
+    fails = check("setreq_varbind_int_value", dset["varbinds"][0]["value_int"] == 5, fails)
+
+    // ── 8. Trap-v2 with sysUpTime.0 (TimeTicks) + snmpTrapOID.0 (OID) --
+    // OID-typed VALUE (not just OID-typed NAME) round-trip.
+    let trap_vb1 = snmp_encode_varbind("1.3.6.1.2.1.1.3.0", snmp_value_timeticks(999))
+    let trap_vb2 = snmp_encode_varbind("1.3.6.1.6.3.1.1.4.1.0", snmp_value_oid("1.3.6.1.4.1.99999.1"))
+    let trap = snmp_encode_trap_v2(snmp_version_v2c(), "public", 6, [trap_vb1, trap_vb2])
+    fails = check("trapv2_pdu_tag_0xA7_exact", bytes_get(trap, 13) == 0xA7, fails)
+    let dtrap = snmp_decode_message(trap)
+    fails = check("trapv2_decode_ok", dtrap["ok"] == true, fails)
+    fails = check("trapv2_two_varbinds", len(dtrap["varbinds"]) == 2, fails)
+    fails = check("trapv2_varbind2_type_oid", dtrap["varbinds"][1]["value_type"] == "oid", fails)
+    fails = check("trapv2_varbind2_value_oid", dtrap["varbinds"][1]["value_oid"] == "1.3.6.1.4.1.99999.1", fails)
+
+    // ── 9. EDGE CASE: binary 0x00 inside community string -- must survive
+    // as `bytes`, not truncate as `string`.
+    let comm_bin = bytes_create(5)
+    bytes_set(comm_bin, 0, 0x70)
+    bytes_set(comm_bin, 1, 0x00)
+    bytes_set(comm_bin, 2, 0x71)
+    bytes_set(comm_bin, 3, 0x00)
+    bytes_set(comm_bin, 4, 0x72)
+    // build the message manually via snmp_encode_message (community param is
+    // `string`-typed on the ergonomic path -- use asn1's octet-string TLV
+    // directly to inject the true binary community for this edge case).
+    let pdu_bin = snmp_encode_pdu(snmp_pdu_get_request(), 1, 0, 0, [snmp_encode_varbind("1.3.6.1.2.1.1.1.0", snmp_value_null())])
+    let ver_tlv_bin = asn1_encode_integer(snmp_version_v2c())
+    let comm_tlv_bin = asn1_encode_octet_string(comm_bin)
+    let msgc = bytes_concat(ver_tlv_bin, comm_tlv_bin)
+    msgc = bytes_concat(msgc, pdu_bin)
+    let msg_bin = asn1_write_tlv(asn1_tag_sequence(), msgc)
+    let dbin = snmp_decode_message(msg_bin)
+    fails = check("binary_community_decode_ok", dbin["ok"] == true, fails)
+    fails = check("binary_community_bytes_len5", bytes_len(dbin["community_bytes"]) == 5, fails)
+    fails = check("binary_community_byte1_is_zero", bytes_get(dbin["community_bytes"], 1) == 0x00, fails)
+    fails = check("binary_community_byte3_is_zero", bytes_get(dbin["community_bytes"], 3) == 0x00, fails)
+
+    // ── 10. EDGE CASE: binary 0x00 inside an OCTET STRING varbind value.
+    let val_bin = bytes_create(4)
+    bytes_set(val_bin, 0, 0xDE)
+    bytes_set(val_bin, 1, 0x00)
+    bytes_set(val_bin, 2, 0xBE)
+    bytes_set(val_bin, 3, 0xEF)
+    let vb_bin = snmp_encode_varbind("1.3.6.1.2.1.1.1.0", snmp_value_octet_string(val_bin))
+    let resp_bin = snmp_encode_get_response(snmp_version_v2c(), "public", 1, 0, 0, [vb_bin])
+    let dvbin = snmp_decode_message(resp_bin)
+    fails = check("binary_value_len4", bytes_len(dvbin["varbinds"][0]["value_bytes"]) == 4, fails)
+    fails = check("binary_value_byte1_zero", bytes_get(dvbin["varbinds"][0]["value_bytes"], 1) == 0x00, fails)
+    fails = check("binary_value_byte3_0xEF", bytes_get(dvbin["varbinds"][0]["value_bytes"], 3) == 0xEF, fails)
+
+    // ── 11. EDGE CASE: empty OID list -- zero varbinds, no crash.
+    let empty_req = snmp_encode_get_request(snmp_version_v2c(), "public", 1, [])
+    let dempty = snmp_decode_message(empty_req)
+    fails = check("empty_varbinds_decode_ok", dempty["ok"] == true, fails)
+    fails = check("empty_varbinds_zero_len", len(dempty["varbinds"]) == 0, fails)
+
+    // ── 12. EDGE CASE: int-width boundaries on request-id: 127/128, 255/256,
+    // 2^31-1, 2^32-1 (all must round-trip byte-exact through DER minimal
+    // two's-complement INTEGER encode/decode).
+    let widths = [127, 128, 255, 256, 2147483647, 4294967295]
+    let wi = 0
+    while wi < len(widths)
+        let w = widths[wi]
+        let wreq = snmp_encode_get_request(snmp_version_v2c(), "public", w, ["1.3.6.1.2.1.1.1.0"])
+        let dwreq = snmp_decode_message(wreq)
+        fails = check("int_width_" + str(w), dwreq["request_id"] == w, fails)
+        wi = wi + 1
+
+    // ── 13. EDGE CASE: truncated buffer -- outer TLV claims more content
+    // than is actually present. Must reject in-band, never crash/exit.
+    let truncated = bytes_slice(getreq, 0, 10)
+    let dtrunc = snmp_decode_message(truncated)
+    fails = check("truncated_rejected_not_crashed", dtrunc["ok"] == false, fails)
+    fails = check("truncated_has_error", dtrunc["error"] != "", fails)
+
+    // ── 14. EDGE CASE: over-long/lying length field -- outer SEQUENCE
+    // declares a length far exceeding the actual buffer.
+    let lying = bytes_create(4)
+    bytes_set(lying, 0, 0x30)
+    bytes_set(lying, 1, 0x7F)
+    bytes_set(lying, 2, 0x02)
+    bytes_set(lying, 3, 0x01)
+    let dlying = snmp_decode_message(lying)
+    fails = check("lying_length_rejected_not_crashed", dlying["ok"] == false, fails)
+
+    // ── 15. EDGE CASE: completely empty buffer -- no crash.
+    let dempty_buf = snmp_decode_message(bytes_create(0))
+    fails = check("empty_buffer_rejected_not_crashed", dempty_buf["ok"] == false, fails)
+
+    // ── 16. EDGE CASE: wrong outer tag (not a SEQUENCE) rejected cleanly.
+    let wrong_outer = bytes_create(2)
+    bytes_set(wrong_outer, 0, 0x04)
+    bytes_set(wrong_outer, 1, 0x00)
+    let dwrong = snmp_decode_message(wrong_outer)
+    fails = check("wrong_outer_tag_rejected", dwrong["ok"] == false, fails)
+
+    // ── 17. EDGE CASE: unrecognized value tag (e.g. IpAddress 0x40) decoded
+    // as "unknown" with raw bytes preserved, never dropped or crashed.
+    let ipaddr_content = bytes_create(4)
+    bytes_set(ipaddr_content, 0, 192)
+    bytes_set(ipaddr_content, 1, 168)
+    bytes_set(ipaddr_content, 2, 1)
+    bytes_set(ipaddr_content, 3, 1)
+    let ipaddr_tlv = asn1_write_tlv(0x40, ipaddr_content)
+    let vb_unknown = snmp_encode_varbind("1.3.6.1.2.1.4.20.1.1", ipaddr_tlv)
+    let unk_resp = snmp_encode_get_response(snmp_version_v2c(), "public", 1, 0, 0, [vb_unknown])
+    let dunk = snmp_decode_message(unk_resp)
+    fails = check("unknown_value_tag_decode_ok", dunk["ok"] == true, fails)
+    fails = check("unknown_value_type_label", dunk["varbinds"][0]["value_type"] == "unknown", fails)
+    fails = check("unknown_value_bytes_preserved_len4", bytes_len(dunk["varbinds"][0]["value_bytes"]) == 4, fails)
+
+    // ── 18. EDGE CASE: still alive after every reject case above --
+    // explicit sentinel that no path exited/aborted the process.
+    fails = check("still_alive_after_all_rejects", true, fails)
+
+    if fails == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(fails))
