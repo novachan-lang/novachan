@@ -1,0 +1,455 @@
+// ============================================================================
+// NOVA Standard Library — std/net/radius
+// ============================================================================
+// RFC 2865 — RADIUS (Remote Authentication Dial-In User Service) packet codec.
+//
+// WIRE LAYOUT — header (20 bytes, all multi-byte fields big-endian):
+//   Byte  0    : Code          — 1=Access-Request 2=Access-Accept 3=Access-Reject
+//                                 4=Accounting-Request (RFC 2866)
+//   Byte  1    : Identifier    — matches request/response pairs
+//   Bytes 2-3  : Length (u16)  — TOTAL packet length including this header;
+//                                 valid range 20..4096 (RFC 2865 §3)
+//   Bytes 4-19 : Authenticator — 16 bytes. For Access-Request this is the
+//                                 "Request Authenticator" used as the seed
+//                                 for User-Password encryption (§5.2).
+//   Bytes 20.. : Attributes    — zero or more TLVs (see below)
+//
+// ATTRIBUTE (TLV) LAYOUT:
+//   Byte  0    : Type          — e.g. 1=User-Name 2=User-Password 4=NAS-IP-Address
+//   Byte  1    : Length        — INCLUDES this 2-byte Type+Length header, so
+//                                 the value itself is (Length - 2) bytes.
+//                                 Valid range 2..255 (value 0..253 bytes).
+//   Bytes 2..  : Value         — (Length - 2) bytes
+//
+// USER-PASSWORD ENCRYPTION (RFC 2865 §5.2) — a stream cipher keyed by a shared
+// secret and chained off the Request Authenticator:
+//   b1 = MD5(secret + RequestAuthenticator);  c1 = p1 XOR b1
+//   b2 = MD5(secret + c1);                    c2 = p2 XOR b2
+//   ...
+//   bi = MD5(secret + c(i-1));                ci = pi XOR bi
+// where p1..pn are consecutive 16-byte blocks of the password, zero-padded up
+// to a 16-byte boundary, and c1..cn concatenated is the attribute value.
+//
+// PUBLIC API:
+//   radius_code_name(num: int) -> string
+//   radius_attr_type_name(num: int) -> string
+//
+//   radius_encode(h: dict) -> bytes
+//     h keys: "code" (int), "identifier" (int), "authenticator" (bytes, must
+//     be exactly 16 bytes), "attrs" (bytes, optional — a pre-concatenated
+//     blob of attribute TLVs, e.g. built with bytes_concat + radius_attr_*).
+//     Returns the full wire packet with a correctly computed Length field.
+//     Returns bytes(0) (rejected IN-BAND, never exit(1)) if authenticator is
+//     not exactly 16 bytes, or if 20+len(attrs) would exceed 4096.
+//
+//   radius_decode_header(b: bytes) -> dict
+//     Returns {} on any structural violation (b shorter than 20 bytes, or a
+//     declared Length outside 20..4096). Never crashes, never exit(1).
+//     On success: {"code","identifier","length","authenticator"}.
+//
+//   radius_decode(b: bytes) -> dict
+//     Full packet decode. Returns {} if the header is invalid (see above).
+//     Attribute parsing is bounded to min(declared Length, actual buffer
+//     length): an attribute whose own Length field would read past that
+//     bound stops parsing right there (already-parsed attrs are kept, no
+//     over-read, no crash) — this rejects both a corrupt Length field AND an
+//     attacker appending a second frame after a valid packet.
+//     On success: {"code","identifier","length","authenticator","attrs"}
+//     where "attrs" is a list of {"type":int,"value":bytes}.
+//
+//   radius_attr_encode(atype: int, value: bytes) -> bytes
+//     Generic TLV encode. Returns bytes(0) (rejected in-band) if
+//     bytes_len(value) > 253 (the Length byte cannot represent more).
+//
+//   radius_attr_decode_all(b: bytes, start: int, end: int) -> list
+//     Walks TLVs in b[start, end), bounded to BOTH `end` and bytes_len(b).
+//     Stops (without reading out of bounds) at the first structurally
+//     invalid or overrunning attribute.
+//
+//   radius_attr_user_name(name: string) -> bytes            — Type 1, text
+//   radius_attr_nas_ip_address(ip4: bytes) -> bytes          — Type 4, 4 bytes
+//     Returns bytes(0) if ip4 is not exactly 4 bytes.
+//   radius_attr_nas_ip_address_str(dotted: string) -> bytes  — convenience:
+//     parses a dotted-quad (via std/net/ip ipv4_parse) and encodes Type 4.
+//     Returns bytes(0) on an invalid dotted-quad.
+//
+//   radius_user_password_encrypt(password: bytes, authenticator: bytes,
+//                                 secret: string) -> bytes
+//     RFC 2865 §5.2. authenticator MUST be exactly 16 bytes. Password is
+//     zero-padded up to the next 16-byte boundary (empty password -> one
+//     16-byte zero block). Returns bytes(0) (rejected in-band) if
+//     authenticator is not 16 bytes, or the padded password would exceed
+//     240 bytes (the most a single User-Password attribute value can carry:
+//     253-byte Length cap minus the 2-byte TLV header, rounded down to a
+//     16-byte multiple).
+//
+//   radius_user_password_decrypt_raw(encrypted: bytes, authenticator: bytes,
+//                                     secret: string) -> bytes
+//     Inverse of encrypt. Returns the full zero-padded plaintext (always a
+//     16-byte multiple). Returns bytes(0) if authenticator is not 16 bytes,
+//     or encrypted is empty or not a multiple of 16 bytes.
+//
+//   radius_user_password_decrypt(encrypted: bytes, authenticator: bytes,
+//                                 secret: string) -> bytes
+//     Convenience: decrypt_raw with trailing zero-padding stripped. By RFC
+//     2865 convention the User-Password value is a text credential and is
+//     never itself zero-padded, so trailing 0x00 bytes are assumed to be the
+//     encryption padding and are removed to recover the original password
+//     exactly. (If a password could legitimately end in 0x00 bytes, use
+//     decrypt_raw and strip padding yourself using the known original
+//     length — that ambiguity is inherent to RFC 2865, not this codec.)
+//
+//   radius_md5_hex(s: string) -> string
+//     Debug/verification helper: hex digest of the module's internal MD5
+//     over the UTF-8/ASCII bytes of s. Exposed so the RFC 1321 MD5 engine
+//     that powers User-Password encryption can be independently checked
+//     against published test vectors.
+//
+// LEAF except for one optional cross-import: radius_attr_nas_ip_address_str
+// reuses std/net/ip's ipv4_parse instead of re-implementing dotted-quad
+// parsing (avoids a second, possibly-diverging IPv4-string parser in std).
+// ============================================================================
+
+import std/net/ip
+
+// ── private: RFC 1321 MD5, operating directly on `bytes` (binary-safe) ─────
+// Same algorithm/constants as every other MD5 in this codebase (public-domain,
+// RFC 1321) — kept as a private module-local copy because std/ must not
+// depend on forge/ (forge is layered ON TOP of std, never the reverse), and
+// no std/crypto module currently exposes MD5 (it is legacy/insecure and only
+// needed here for RFC 2865's mandated User-Password keystream).
+
+fn _radius_rotl32(x, n) -> int
+    ((x << n) | (x >> (32 - n))) & 4294967295
+
+fn _radius_md5(data) -> bytes
+    let k = [0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391]
+    let s = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
+    let ml = bytes_len(data)
+    let m = bytes(0)
+    let i = 0
+    while i < ml
+        m = bytes_append(m, bytes_get(data, i) & 0xFF)
+        i = i + 1
+    m = bytes_append(m, 128)
+    while (bytes_len(m) % 64) != 56
+        m = bytes_append(m, 0)
+    let bitlen = ml * 8
+    let j = 0
+    while j < 8
+        m = bytes_append(m, (bitlen >> (j * 8)) & 255)
+        j = j + 1
+    let a0 = 0x67452301
+    let b0 = 0xefcdab89
+    let c0 = 0x98badcfe
+    let d0 = 0x10325476
+    let nchunks = bytes_len(m) / 64
+    let c = 0
+    while c < nchunks
+        let base = c * 64
+        let w = []
+        let t = 0
+        while t < 16
+            let o = base + t * 4
+            let w0 = bytes_get(m, o) & 0xFF
+            let w1 = bytes_get(m, o + 1) & 0xFF
+            let w2 = bytes_get(m, o + 2) & 0xFF
+            let w3 = bytes_get(m, o + 3) & 0xFF
+            push(w, (w0 | (w1 << 8) | (w2 << 16) | (w3 << 24)) & 4294967295)
+            t = t + 1
+        let a = a0
+        let b = b0
+        let cc = c0
+        let d = d0
+        let r = 0
+        while r < 64
+            let f = 0
+            let g = 0
+            if r < 16
+                f = (b & cc) | ((b ^ 4294967295) & d)
+                g = r
+            else
+                if r < 32
+                    f = (d & b) | ((d ^ 4294967295) & cc)
+                    g = (5 * r + 1) % 16
+                else
+                    if r < 48
+                        f = b ^ cc ^ d
+                        g = (3 * r + 5) % 16
+                    else
+                        f = cc ^ (b | (d ^ 4294967295))
+                        g = (7 * r) % 16
+            f = (f + a + k[r] + w[g]) & 4294967295
+            a = d
+            d = cc
+            cc = b
+            b = (b + _radius_rotl32(f, s[r])) & 4294967295
+            r = r + 1
+        a0 = (a0 + a) & 4294967295
+        b0 = (b0 + b) & 4294967295
+        c0 = (c0 + cc) & 4294967295
+        d0 = (d0 + d) & 4294967295
+        c = c + 1
+    let out = bytes(0)
+    let hs = [a0, b0, c0, d0]
+    let q = 0
+    while q < 4
+        let hv = hs[q]
+        out = bytes_append(out, hv & 255)
+        out = bytes_append(out, (hv >> 8) & 255)
+        out = bytes_append(out, (hv >> 16) & 255)
+        out = bytes_append(out, (hv >> 24) & 255)
+        q = q + 1
+    out
+
+fn _radius_hex_of_bytes(b) -> string
+    let digs = "0123456789abcdef"
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let v = bytes_get(b, i) & 0xFF
+        out = out + char_at(digs, (v >> 4) & 15) + char_at(digs, v & 15)
+        i = i + 1
+    out
+
+// radius_md5_hex: debug/verification helper — see module doc.
+fn radius_md5_hex(s: string) -> string
+    _radius_hex_of_bytes(_radius_md5(str_to_bytes(s)))
+
+// ── name lookups ─────────────────────────────────────────────────────────
+
+fn radius_code_name(num: int) -> string
+    if num == 1
+        return "Access-Request"
+    if num == 2
+        return "Access-Accept"
+    if num == 3
+        return "Access-Reject"
+    if num == 4
+        return "Accounting-Request"
+    ""
+
+fn radius_attr_type_name(num: int) -> string
+    if num == 1
+        return "User-Name"
+    if num == 2
+        return "User-Password"
+    if num == 4
+        return "NAS-IP-Address"
+    ""
+
+// ── header encode/decode ────────────────────────────────────────────────
+
+// radius_encode: dict -> full wire packet (header + attrs), Length computed.
+// See module doc for keys / rejection rules.
+fn radius_encode(h) -> bytes
+    let code = 0
+    if contains(h, "code")
+        code = h["code"]
+    let identifier = 0
+    if contains(h, "identifier")
+        identifier = h["identifier"]
+    let authenticator = bytes(0)
+    if contains(h, "authenticator")
+        authenticator = h["authenticator"]
+    let attrs = bytes(0)
+    if contains(h, "attrs")
+        attrs = h["attrs"]
+    if bytes_len(authenticator) != 16
+        return bytes(0)                         // reject: authenticator must be exactly 16 bytes
+    let attrs_len = bytes_len(attrs)
+    let total = 20 + attrs_len
+    if total > 4096
+        return bytes(0)                         // reject: packet would exceed RFC 2865 max length
+    let out = bytes(0)
+    out = bytes_append(out, code & 0xFF)
+    out = bytes_append(out, identifier & 0xFF)
+    out = bytes_append(out, (total >> 8) & 0xFF)
+    out = bytes_append(out, total & 0xFF)
+    let i = 0
+    while i < 16
+        out = bytes_append(out, bytes_get(authenticator, i) & 0xFF)
+        i = i + 1
+    out = bytes_concat(out, attrs)
+    out
+
+// radius_decode_header: bytes -> dict. Returns {} on any structural
+// violation (see module doc). Never over-reads, never exit(1).
+fn radius_decode_header(b) -> dict
+    let empty = {}
+    if bytes_len(b) < 20
+        return empty
+    let code = bytes_get(b, 0) & 0xFF
+    let identifier = bytes_get(b, 1) & 0xFF
+    let length = ((bytes_get(b, 2) & 0xFF) << 8) | (bytes_get(b, 3) & 0xFF)
+    if length < 20 or length > 4096
+        return empty
+    let authenticator = bytes_slice(b, 4, 20)
+    {"code": code, "identifier": identifier, "length": length, "authenticator": authenticator}
+
+// ── attribute encode/decode ─────────────────────────────────────────────
+
+// radius_attr_encode: generic TLV encode. Returns bytes(0) if the value is
+// too long to fit a single attribute (Length byte caps value at 253 bytes).
+fn radius_attr_encode(atype, value) -> bytes
+    let vlen = bytes_len(value)
+    if vlen > 253
+        return bytes(0)
+    let out = bytes(0)
+    out = bytes_append(out, atype & 0xFF)
+    out = bytes_append(out, (vlen + 2) & 0xFF)
+    out = bytes_concat(out, value)
+    out
+
+// radius_attr_decode_all: walk TLVs in b[start, end), bounded to BOTH `end`
+// and the actual buffer length. Stops without over-reading at the first
+// structurally invalid (Length < 2) or overrunning attribute; everything
+// parsed before that point is returned. Never crashes, never exit(1).
+fn radius_attr_decode_all(b, start, end) -> list
+    let out = []
+    let buflen = bytes_len(b)
+    let hard_end = end
+    if hard_end > buflen
+        hard_end = buflen
+    let off = start
+    let go = 1
+    while off + 2 <= hard_end and go == 1
+        let atype = bytes_get(b, off) & 0xFF
+        let alen = bytes_get(b, off + 1) & 0xFF
+        if alen < 2
+            go = 0                              // malformed: Length must include the 2-byte header itself
+        else
+            if off + alen > hard_end
+                go = 0                           // overrun: rejected in-band, no read past hard_end
+            else
+                let value = bytes_slice(b, off + 2, off + alen)
+                push(out, {"type": atype, "value": value})
+                off = off + alen
+    out
+
+// radius_decode: full packet decode. See module doc.
+fn radius_decode(b) -> dict
+    let hdr = radius_decode_header(b)
+    if not contains(hdr, "code")
+        return {}
+    let declared = hdr["length"]
+    let buflen = bytes_len(b)
+    let end = declared
+    if end > buflen
+        end = buflen                            // never trust a declared Length beyond what actually arrived
+    let attrs = radius_attr_decode_all(b, 20, end)
+    {"code": hdr["code"], "identifier": hdr["identifier"], "length": declared, "authenticator": hdr["authenticator"], "attrs": attrs}
+
+// ── specific attributes ─────────────────────────────────────────────────
+
+// User-Name (Type 1) — text attribute.
+fn radius_attr_user_name(name: string) -> bytes
+    radius_attr_encode(1, str_to_bytes(name))
+
+// NAS-IP-Address (Type 4) — exactly 4 bytes, network byte order.
+// Returns bytes(0) if ip4 is not exactly 4 bytes long.
+fn radius_attr_nas_ip_address(ip4) -> bytes
+    if bytes_len(ip4) != 4
+        return bytes(0)
+    radius_attr_encode(4, ip4)
+
+// Convenience: dotted-quad string -> NAS-IP-Address attribute.
+// Returns bytes(0) on an invalid dotted-quad (reuses std/net/ip's parser).
+fn radius_attr_nas_ip_address_str(dotted: string) -> bytes
+    let n = ipv4_parse(dotted)
+    if n < 0
+        return bytes(0)
+    let ip4 = bytes(0)
+    ip4 = bytes_append(ip4, (n >> 24) & 0xFF)
+    ip4 = bytes_append(ip4, (n >> 16) & 0xFF)
+    ip4 = bytes_append(ip4, (n >> 8) & 0xFF)
+    ip4 = bytes_append(ip4, n & 0xFF)
+    radius_attr_encode(4, ip4)
+
+// ── User-Password (Type 2) encryption — RFC 2865 §5.2 ──────────────────
+
+// radius_user_password_encrypt: see module doc for the exact algorithm and
+// rejection rules.
+fn radius_user_password_encrypt(password, authenticator, secret: string) -> bytes
+    if bytes_len(authenticator) != 16
+        return bytes(0)
+    let secret_bytes = str_to_bytes(secret)
+    let plen = bytes_len(password)
+    let pad_len = plen
+    if pad_len == 0
+        pad_len = 16
+    else
+        if (pad_len % 16) != 0
+            pad_len = pad_len + (16 - (pad_len % 16))
+    if pad_len > 240
+        return bytes(0)                         // reject: would not fit a single User-Password attribute
+    let padded = bytes(0)
+    let i = 0
+    while i < pad_len
+        if i < plen
+            padded = bytes_append(padded, bytes_get(password, i) & 0xFF)
+        else
+            padded = bytes_append(padded, 0)
+        i = i + 1
+    let out = bytes(0)
+    let prev = authenticator
+    let nblocks = pad_len / 16
+    let blk = 0
+    while blk < nblocks
+        let md5_input = bytes_concat(secret_bytes, prev)
+        let b = _radius_md5(md5_input)
+        let cblock = bytes(0)
+        let k = 0
+        while k < 16
+            let pbyte = bytes_get(padded, blk * 16 + k) & 0xFF
+            let bbyte = bytes_get(b, k) & 0xFF
+            cblock = bytes_append(cblock, pbyte ^ bbyte)
+            k = k + 1
+        out = bytes_concat(out, cblock)
+        prev = cblock
+        blk = blk + 1
+    out
+
+// radius_user_password_decrypt_raw: inverse of encrypt, full padded output.
+fn radius_user_password_decrypt_raw(encrypted, authenticator, secret: string) -> bytes
+    if bytes_len(authenticator) != 16
+        return bytes(0)
+    let elen = bytes_len(encrypted)
+    let go = 1
+    if elen == 0
+        go = 0
+    else
+        if (elen % 16) != 0
+            go = 0
+    if go == 0
+        return bytes(0)
+    let secret_bytes = str_to_bytes(secret)
+    let out = bytes(0)
+    let prev = authenticator
+    let nblocks = elen / 16
+    let blk = 0
+    while blk < nblocks
+        let md5_input = bytes_concat(secret_bytes, prev)
+        let b = _radius_md5(md5_input)
+        let cblock = bytes_slice(encrypted, blk * 16, blk * 16 + 16)
+        let pblock = bytes(0)
+        let k = 0
+        while k < 16
+            let cbyte = bytes_get(cblock, k) & 0xFF
+            let bbyte = bytes_get(b, k) & 0xFF
+            pblock = bytes_append(pblock, cbyte ^ bbyte)
+            k = k + 1
+        out = bytes_concat(out, pblock)
+        prev = cblock
+        blk = blk + 1
+    out
+
+// radius_user_password_decrypt: decrypt_raw + strip trailing zero padding.
+// See module doc for the padding-ambiguity caveat.
+fn radius_user_password_decrypt(encrypted, authenticator, secret: string) -> bytes
+    let raw = radius_user_password_decrypt_raw(encrypted, authenticator, secret)
+    let n = bytes_len(raw)
+    while n > 0 and (bytes_get(raw, n - 1) & 0xFF) == 0
+        n = n - 1
+    bytes_slice(raw, 0, n)

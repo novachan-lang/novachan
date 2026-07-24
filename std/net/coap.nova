@@ -1,0 +1,296 @@
+// ============================================================================
+// NOVA Standard Library — std/net/coap
+// ============================================================================
+// RFC 7252 — CoAP full message wire codec (header + token + options + payload).
+//
+// A complete CoAP message on the wire is:
+//   [4-byte fixed header] [0..8 token bytes] [options, delta-encoded]
+//   [0xFF payload marker + payload bytes]   (marker+payload OMITTED if no payload)
+//
+// This module is the top-level codec that assembles/disassembles a full
+// message.  It REUSES the existing leaf codecs rather than re-implementing
+// their wire format:
+//   std/net/coap_msg  — 4-byte fixed header + token (Ver/Type/TKL/Code/MID)
+//   std/net/coap_opt  — option delta+length TLV encoding/decoding
+//
+// PUBLIC API:
+//
+//   coap_encode(ver, msg_type, code, msg_id, token_bytes, options, payload) -> dict
+//     ver         — protocol version (always 1 per RFC 7252)
+//     msg_type    — CON=0, NON=1, ACK=2, RST=3
+//     code        — CoAP code byte, e.g. 0x01=GET, 0x02=POST, 0x45=2.05 Content
+//     msg_id      — 16-bit message ID
+//     token_bytes — list of ints 0..255, length 0..8
+//     options     — list of [number, value_bytes] pairs, value_bytes = list
+//                   of ints 0..255. MUST be sorted ascending by number
+//                   (repeated option numbers, e.g. multiple Uri-Path
+//                   segments, are allowed — equal numbers are fine, only
+//                   a DECREASE is rejected).
+//     payload     — bytes (pass bytes(0) for "no payload")
+//     Returns {"ok":1, "error":"", "bytes": bytes} on success.
+//     Returns {"ok":0, "error": string, "bytes": bytes(0)} on invalid input
+//     (token too long, options not ascending). NEVER aborts the process —
+//     the caller decides what to do with a rejected message.
+//
+//   coap_decode(b: bytes) -> dict
+//     Parses a full CoAP message from wire bytes.
+//     Returns {"ok":1, "error":"", "ver","type","code","msg_id",
+//              "token": list<int>, "options": list of [number, value_bytes],
+//              "payload": bytes}
+//     Returns {"ok":0, "error": string, ...safe zero/empty defaults...} on
+//     any malformed input (too short, reserved TKL 9..15, truncated token,
+//     malformed option TLV, truncated option value, or a payload marker
+//     followed by zero payload bytes). Every read is bounds-checked against
+//     BOTH the field's declared length and the actual buffer length — never
+//     an out-of-bounds read, never a process abort.
+//
+// DESIGN NOTES:
+//   * Reuses coap_msg (header+token) and coap_opt (option TLV) verbatim —
+//     no re-implementation of their wire logic.
+//   * Adds a dedicated structural pre-validation pass over the option
+//     region (_coap_validate_options) before calling coap_opt_decode.
+//     This closes a real gap in the raw nibble decoder: a nibble value of
+//     15 that is NOT part of the full 0xFF payload marker byte (e.g. header
+//     byte 0xF3 — delta-nibble=15, length-nibble=3) is reserved by RFC 7252
+//     §3.1 and MUST be treated as a message format error. Left unchecked,
+//     the raw decoder would silently misinterpret it as an extended-length-14
+//     encoding (reading 2 bogus "extension" bytes) instead of rejecting the
+//     message — a silent-wrong-answer bug, not a crash, but exactly the kind
+//     of parser confusion that enables request smuggling. Pre-validating the
+//     whole option region turns that into a clean in-band rejection.
+//   * A TKL (token length) of 9..15 is RFC-reserved and rejected in-band
+//     (never truncated/guessed).
+//   * WAVE 2 — imports: std/net/coap_msg, std/net/coap_opt
+// ============================================================================
+
+import std/net/coap_msg
+import std/net/coap_opt
+
+// ── Private: bytes <-> int-list conversion ──────────────────────────────────
+// The leaf codecs (coap_msg, coap_opt) operate on plain int-lists ("byte-lists").
+// This module's public surface uses `bytes` per spec; these helpers bridge
+// the two representations. Both are simple bounds-driven copies (O(n)).
+
+fn _coap_bytes_to_list(b)
+    let out = []
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        push(out, bytes_get(b, i))
+        i = i + 1
+    out
+
+fn _coap_list_to_bytes(l)
+    let out = bytes(0)
+    let n = len(l)
+    let i = 0
+    while i < n
+        out = bytes_append(out, l[i] & 0xFF)
+        i = i + 1
+    out
+
+// ── Private: structural validation of the option region ─────────────────────
+//
+// Walks the option TLV sequence starting at `pos` in int-list `bl` (whose
+// total length is `blen`) WITHOUT extracting any values — pure bounds/format
+// check. Stops at the payload marker (0xFF) or end of buffer.
+//
+// Rejects (returns [0, pos]) on:
+//   - a header byte whose delta-nibble or length-nibble is 15 while the
+//     byte as a whole is NOT the payload marker (0xFF) — RFC 7252 §3.1
+//     reserves 15 exclusively for the marker.
+//   - a 13/14 extended-delta or extended-length nibble whose extension
+//     byte(s) run past the end of the buffer (truncated header).
+//   - a declared option value length that runs past the end of the buffer
+//     (truncated value) — this is the "bound every read to the declared
+//     length AND the actual buffer" check.
+//
+// Returns [1, next_pos] on success, where next_pos is the position of the
+// payload marker (or blen if none) — same contract as coap_opt_decode's
+// second return value, so callers can safely proceed to the real decode.
+fn _coap_validate_options(bl, pos, blen)
+    let ok = 1
+    let running = 1
+    while running == 1
+        if pos >= blen
+            running = 0
+        if running == 1
+            let hdr = bl[pos]
+            if hdr == 0xFF
+                running = 0
+            if running == 1
+                let dn = (hdr >> 4) & 0xF
+                let ln = hdr & 0xF
+                if dn == 15
+                    ok = 0
+                    running = 0
+                if ln == 15 and running == 1
+                    ok = 0
+                    running = 0
+                if running == 1
+                    pos = pos + 1
+                    // Extended delta bytes
+                    if dn == 13
+                        if pos >= blen
+                            ok = 0
+                            running = 0
+                        else
+                            pos = pos + 1
+                    if running == 1 and dn == 14
+                        if pos + 1 >= blen
+                            ok = 0
+                            running = 0
+                        else
+                            pos = pos + 2
+                    // Extended length bytes + resolve declared value length
+                    let vlen = ln
+                    if running == 1 and ln == 13
+                        if pos >= blen
+                            ok = 0
+                            running = 0
+                        else
+                            vlen = bl[pos] + 13
+                            pos = pos + 1
+                    if running == 1 and ln == 14
+                        if pos + 1 >= blen
+                            ok = 0
+                            running = 0
+                        else
+                            vlen = ((bl[pos] << 8) | bl[pos + 1]) + 269
+                            pos = pos + 2
+                    // Declared value length must fit in what remains
+                    if running == 1
+                        if pos + vlen > blen
+                            ok = 0
+                            running = 0
+                        else
+                            pos = pos + vlen
+    [ok, pos]
+
+// ── Private: validate options are ascending (delta encoding requires it) ────
+// Equal consecutive numbers ARE allowed (repeatable options, e.g. multiple
+// Uri-Path segments each carry option number 11 with delta 0). Only a
+// decrease is invalid — it would encode as a negative delta.
+fn _coap_options_ascending(options)
+    let ok = 1
+    let prev_num = -1
+    let i = 0
+    let n = len(options)
+    while i < n
+        let onum = options[i][0]
+        if onum < 0
+            ok = 0
+        if onum < prev_num
+            ok = 0
+        prev_num = onum
+        i = i + 1
+    ok
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// coap_encode: build a complete CoAP wire message.
+//
+// Returns {"ok":1,"error":"","bytes":<wire bytes>} on success, or
+// {"ok":0,"error":<reason>,"bytes":bytes(0)} on invalid input — never aborts.
+//
+// Examples (RFC 7252 byte-exact):
+//   coap_encode(1, 0, 0x01, 0x1234, [], [], bytes(0))
+//     -> bytes: 40 01 12 34                       (GET, no token, no options)
+//   coap_encode(1, 0, 0x01, 0x1234, [0xAB, 0xCD], [], bytes(0))
+//     -> bytes: 42 01 12 34 AB CD                 (GET, 2-byte token)
+//   coap_encode(1, 0, 0x01, 0x1234, [], [[11, [ord("t"),ord("e"),ord("m"),ord("p")]]], bytes(0))
+//     -> bytes: 40 01 12 34 B4 74 65 6D 70         (Uri-Path "temp", opt 11, delta 11)
+//   coap_encode(1, 2, 0x45, 0x1234, [], [], str_to_bytes("42"))
+//     -> bytes: 60 45 12 34 FF 34 32               (2.05 Content, payload "42")
+fn coap_encode(ver, msg_type, code, msg_id, token_bytes, options, payload)
+    let empty_bytes = bytes(0)
+    if len(token_bytes) > 8
+        return {"ok": 0, "error": "token length exceeds 8 bytes", "bytes": empty_bytes}
+    if _coap_options_ascending(options) == 0
+        return {"ok": 0, "error": "options must be sorted ascending by number", "bytes": empty_bytes}
+
+    let out = coap_msg(ver, msg_type, code, msg_id, token_bytes)
+    let opt_wire = coap_opt_encode(options)
+    let oi = 0
+    let on = len(opt_wire)
+    while oi < on
+        push(out, opt_wire[oi])
+        oi = oi + 1
+
+    let plen = bytes_len(payload)
+    if plen > 0
+        push(out, 0xFF)
+        let pi = 0
+        while pi < plen
+            push(out, bytes_get(payload, pi) & 0xFF)
+            pi = pi + 1
+
+    {"ok": 1, "error": "", "bytes": _coap_list_to_bytes(out)}
+
+// coap_decode: parse a complete CoAP wire message.
+//
+// Returns {"ok":1,"error":"","ver","type","code","msg_id","token","options","payload"}
+// on success, or {"ok":0,"error":<reason>, ...safe defaults...} on any
+// malformed input. Every field read is bounds-checked against both its
+// declared length and the actual buffer — malformed input is rejected
+// in-band, never a crash or an out-of-bounds read.
+//
+// Round-trips with coap_encode: coap_decode(coap_encode(...)["bytes"]) recovers
+// the same ver/type/code/msg_id/token/options/payload.
+fn coap_decode(b)
+    let blen = bytes_len(b)
+    let fail = {"ok": 0, "error": "", "ver": 0, "type": 0, "code": 0, "msg_id": 0, "token": [], "options": [], "payload": bytes(0)}
+
+    if blen < 4
+        fail["error"] = "message shorter than 4-byte fixed header"
+        return fail
+
+    let bl = _coap_bytes_to_list(b)
+    let byte0 = bl[0]
+    let tkl = byte0 & 0xF
+
+    // RFC 7252: TKL values 9..15 are reserved — a receiver MUST treat the
+    // message as malformed.
+    if tkl > 8
+        fail["error"] = "reserved token length (TKL 9..15)"
+        return fail
+
+    // Token must be fully present in the buffer (bound to declared length
+    // AND actual buffer — a short buffer is a truncation, not a silent
+    // shorter token).
+    if 4 + tkl > blen
+        fail["error"] = "truncated token"
+        return fail
+
+    let hdr = coap_msg_decode(bl)
+    let ver = hdr["ver"]
+    let mtype = hdr["type"]
+    let code = hdr["code"]
+    let mid = hdr["msg_id"]
+    let token = hdr["token"]
+
+    let opt_start = 4 + tkl
+    let val = _coap_validate_options(bl, opt_start, blen)
+    let val_ok = val[0]
+    if val_ok == 0
+        fail["error"] = "malformed CoAP option (reserved nibble 15 or truncated field)"
+        return fail
+
+    let dec = coap_opt_decode(bl, opt_start, 0)
+    let options = dec[0]
+    let opt_end = dec[1]
+
+    let payload = bytes(0)
+    if opt_end < blen
+        if bl[opt_end] == 0xFF
+            if opt_end + 1 >= blen
+                fail["error"] = "payload marker present with zero-length payload"
+                return fail
+            payload = bytes_slice(b, opt_end + 1, blen)
+        else
+            // Should be unreachable given _coap_validate_options passed, but
+            // defend anyway rather than trust the invariant blindly.
+            fail["error"] = "unexpected trailing bytes without payload marker"
+            return fail
+
+    {"ok": 1, "error": "", "ver": ver, "type": mtype, "code": code, "msg_id": mid, "token": token, "options": options, "payload": payload}

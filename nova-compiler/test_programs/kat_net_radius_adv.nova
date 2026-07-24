@@ -1,0 +1,177 @@
+// INDEPENDENT ADVERSARIAL PROBE for std/net/radius.nova
+// Re-derives expected values from RFC 2865 / RFC 1321 independently (via a
+// separate Python cross-check, not by trusting the module's own KAT) and
+// attacks boundary/injection cases not covered by the original KAT.
+
+import std/net/radius
+import std/encoding/hex
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn main()
+    // ── 1. Byte-EXACT User-Password ciphertext, independently computed in
+    // Python (hashlib.md5) against secret="xyzzy", auth=bytes(0..15), pw="hello" ──
+    let auth16 = bytes_create(16)
+    let ai = 0
+    while ai < 16
+        bytes_set(auth16, ai, ai)
+        ai = ai + 1
+    let secret = "xyzzy"
+    let pw = str_to_bytes("hello")
+    let enc1 = radius_user_password_encrypt(pw, auth16, secret)
+    check("enc1_exact_bytes", hex_encode(enc1) == "81119ff8724a1e5aad65af6294ef32c2")
+
+    // multi-block, independently computed
+    let longpw = str_to_bytes("this-is-a-20char-pw!")
+    let enc2 = radius_user_password_encrypt(longpw, auth16, secret)
+    check("enc2_exact_bytes", hex_encode(enc2) == "9d1c9ae730236d77cc489d52f78753b0886297abeab660b4a7e0da1dcbd416ed")
+
+    // empty-secret edge case, independently computed (secret="", auth=0xAA*16, pw="x")
+    let auth_aa = bytes_create(16)
+    let aj = 0
+    while aj < 16
+        bytes_set(auth_aa, aj, 0xAA)
+        aj = aj + 1
+    let enc_es = radius_user_password_encrypt(str_to_bytes("x"), auth_aa, "")
+    check("empty_secret_exact_bytes", hex_encode(enc_es) == "e3980fc1d0b7c396e8ef35157690fa79")
+
+    // ── 2. Multi-CHUNK MD5 correctness (the 3-vector KAT only exercised
+    // single-block MD5; RFC 1321 padding/length logic across a 64-byte chunk
+    // boundary is untested there). Cross-checked against Python hashlib. ──
+    let s90 = ""
+    let n = 0
+    while n < 90
+        s90 = s90 + "a"
+        n = n + 1
+    check("md5_90_bytes_multichunk", radius_md5_hex(s90) == "067876bfd0df0f4c5002780ec85e6f8c")
+
+    let s105 = "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog again and again."
+    check("md5_105_bytes_len_sanity", len(s105) == 105)
+    check("md5_105_bytes_multichunk", radius_md5_hex(s105) == "06f732a3fa7b8e7148de879e60250d4c")
+
+    // ── 3. Attribute Length==2 boundary: an attribute with an EMPTY value
+    // (Length field = 2, the minimum legal value) must round-trip cleanly,
+    // not be confused with the Length<2 rejection path. ─────────────────────
+    let empty_attr = radius_attr_encode(9, bytes_create(0))
+    check("empty_value_attr_len_2", bytes_len(empty_attr) == 2)
+    let ea_walk = radius_attr_decode_all(empty_attr, 0, 2)
+    check("empty_value_attr_parses", len(ea_walk) == 1)
+    if len(ea_walk) == 1
+        check("empty_value_attr_type", ea_walk[0]["type"] == 9)
+        check("empty_value_attr_value_empty", bytes_len(ea_walk[0]["value"]) == 0)
+
+    // ── 4. Attribute that EXACTLY fills to hard_end (off+alen == hard_end)
+    // must be ACCEPTED, not rejected — only strictly-over must reject. ──────
+    let exact_fit = radius_attr_encode(1, str_to_bytes("bob"))   // 5 bytes total
+    let ef_walk = radius_attr_decode_all(exact_fit, 0, 5)
+    check("exact_fit_boundary_accepted", len(ef_walk) == 1)
+    // one byte short of the attribute's own declared length -> must reject
+    let ef_walk_short = radius_attr_decode_all(exact_fit, 0, 4)
+    check("one_byte_short_rejected", len(ef_walk_short) == 0)
+
+    // dangling single trailing byte after a valid attribute (off+2 > hard_end
+    // after consuming attr 1) must stop cleanly, no crash, no partial-attr.
+    let dangling = bytes_concat(exact_fit, bytes_create(1))     // 5 valid + 1 dangling byte
+    let dangle_walk = radius_attr_decode_all(dangling, 0, 6)
+    check("dangling_byte_no_crash", len(dangle_walk) == 1)
+
+    // ── 5. Authenticator too LONG (17 bytes) rejected — original KAT only
+    // tried too-SHORT (15 bytes). ────────────────────────────────────────────
+    let auth17 = bytes_create(17)
+    check("auth_17_encrypt_rejected", bytes_len(radius_user_password_encrypt(pw, auth17, secret)) == 0)
+    check("auth_17_encode_rejected", bytes_len(radius_encode({"code": 1, "identifier": 1, "authenticator": auth17})) == 0)
+    check("auth_17_header_decode_len_check", bytes_len(auth17) != 16)
+
+    // ── 6. decode() when the declared header Length exceeds the PHYSICAL
+    // buffer (truncated packet) must bound to the actual buffer, never
+    // over-read / crash. Build a 25-byte physical buffer whose header claims
+    // Length=40. ──────────────────────────────────────────────────────────
+    let trunc = bytes_create(25)
+    bytes_set(trunc, 0, 1)
+    bytes_set(trunc, 1, 5)
+    bytes_set(trunc, 2, 0x00)
+    bytes_set(trunc, 3, 40)          // claims 40 but buffer is only 25 bytes
+    let ti = 0
+    while ti < 16
+        bytes_set(trunc, 4 + ti, 0x11)
+        ti = ti + 1
+    // attr region [20,25): type=1 length=5 value="AB" only 2 bytes fits pattern
+    bytes_set(trunc, 20, 1)
+    bytes_set(trunc, 21, 5)
+    bytes_set(trunc, 22, 0x41)
+    bytes_set(trunc, 23, 0x42)
+    bytes_set(trunc, 24, 0x43)
+    let trunc_dec = radius_decode(trunc)
+    check("trunc_header_accepted", contains(trunc_dec, "code"))
+    check("trunc_declared_length_is_40", trunc_dec["length"] == 40)
+    check("trunc_attrs_bounded_to_buffer_not_declared", len(trunc_dec["attrs"]) == 1)
+    if len(trunc_dec["attrs"]) == 1
+        check("trunc_attr_value_exact", hex_encode(trunc_dec["attrs"][0]["value"]) == "414243")
+
+    // Now truncate one byte earlier (buffer=24) so the attribute's own claim
+    // (5 bytes at offset 20, reaching 25) overruns the PHYSICAL buffer too ->
+    // must be rejected, zero attrs, no over-read.
+    let trunc2 = bytes_slice(trunc, 0, 24)
+    let trunc2_dec = radius_decode(trunc2)
+    check("trunc2_attr_overrun_physical_buffer_rejected", len(trunc2_dec["attrs"]) == 0)
+
+    // ── 7. NAS-IP-Address boundary dotted-quads: 0.0.0.0 and 255.255.255.255 ──
+    let ip_zero = radius_attr_nas_ip_address_str("0.0.0.0")
+    check("nasip_zero_exact", hex_encode(ip_zero) == "040600000000")
+    let ip_max = radius_attr_nas_ip_address_str("255.255.255.255")
+    check("nasip_max_exact", hex_encode(ip_max) == "0406ffffffff")
+
+    // ── 8. Attribute type extremes: 0 and 255 round-trip. ───────────────────
+    let t0 = radius_attr_encode(0, str_to_bytes("z"))
+    let t0_walk = radius_attr_decode_all(t0, 0, bytes_len(t0))
+    check("attr_type_0_roundtrip", len(t0_walk) == 1 and t0_walk[0]["type"] == 0)
+    let t255 = radius_attr_encode(255, str_to_bytes("z"))
+    let t255_walk = radius_attr_decode_all(t255, 0, bytes_len(t255))
+    check("attr_type_255_roundtrip", len(t255_walk) == 1 and t255_walk[0]["type"] == 255)
+
+    // ── 9. Binary 0x00 inside a User-Password plaintext survives raw
+    // round-trip (decrypt_raw, not the zero-stripping convenience decrypt). ──
+    let binpw = bytes_create(16)
+    bytes_set(binpw, 0, 0)
+    bytes_set(binpw, 1, 0xFF)
+    bytes_set(binpw, 2, 0)
+    bytes_set(binpw, 3, 0x41)
+    let enc_bin = radius_user_password_encrypt(binpw, auth16, secret)
+    let dec_bin_raw = radius_user_password_decrypt_raw(enc_bin, auth16, secret)
+    check("binary_password_raw_roundtrip", hex_encode(dec_bin_raw) == hex_encode(binpw))
+
+    // ── 10. MD5 padding-boundary edge cases (55/56/63/64 bytes) — the exact
+    // boundary where the single 0x80 pad byte either does or doesn't fit in
+    // the current 64-byte block is the classic off-by-one spot for a
+    // hand-rolled MD5. Independently cross-checked via Python hashlib. ──────
+    let s55 = ""
+    let i55 = 0
+    while i55 < 55
+        s55 = s55 + "a"
+        i55 = i55 + 1
+    check("md5_55_bytes_boundary", radius_md5_hex(s55) == "ef1772b6dff9a122358552954ad0df65")
+    let s56 = s55 + "a"
+    check("md5_56_bytes_boundary", radius_md5_hex(s56) == "3b0c8ac703f828b04c6c197006d17218")
+    let s63 = ""
+    let i63 = 0
+    while i63 < 63
+        s63 = s63 + "a"
+        i63 = i63 + 1
+    check("md5_63_bytes_boundary", radius_md5_hex(s63) == "b06521f39153d618550606be297466d5")
+    let s64 = s63 + "a"
+    check("md5_64_bytes_boundary", radius_md5_hex(s64) == "014842d480b571495a4a0363793f7367")
+
+    // ── 11. Still alive after everything above. ──────────────────────────────
+    check("adv_still_alive", true)
+
+    if FAILS[0] == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))

@@ -1,0 +1,259 @@
+import std/net/stun
+import std/net/ip
+
+fn main()
+    // ── A: XOR-MAPPED-ADDRESS boundary vectors, independently hand-derived ────
+    // port=1, addr=0.0.0.1 (0x00000001)
+    // xport = 0x0001 ^ 0x2112 = 0x2113
+    // xaddr = 0x00000001 ^ 0x2112A442 = 0x2112A443
+    let xmaA = stun_attr_xor_mapped_address_encode(1, 1)
+    let wantA = [0x00, 0x01, 0x21, 0x13, 0x21, 0x12, 0xA4, 0x43]
+    let iA = 0
+    while iA < 8
+        let g = bytes_get(xmaA, iA)
+        let w = wantA[iA]
+        if g != w
+            print("FAIL A byte["+str(iA)+"]: got "+str(g)+" want "+str(w))
+            exit(1)
+        iA = iA + 1
+
+    // port=65535 (0xFFFF), addr=255.255.255.255 (0xFFFFFFFF)
+    // xport = 0xFFFF ^ 0x2112 = 0xDEED
+    // xaddr = 0xFFFFFFFF ^ 0x2112A442 = 0xDEED5BBD
+    let xmaB = stun_attr_xor_mapped_address_encode(65535, 0xFFFFFFFF)
+    let wantB = [0x00, 0x01, 0xDE, 0xED, 0xDE, 0xED, 0x5B, 0xBD]
+    let iB = 0
+    while iB < 8
+        let g = bytes_get(xmaB, iB)
+        let w = wantB[iB]
+        if g != w
+            print("FAIL B byte["+str(iB)+"]: got "+str(g)+" want "+str(w))
+            exit(1)
+        iB = iB + 1
+    // Round trip decode of the max-boundary vector
+    let decB = stun_attr_xor_mapped_address_decode(xmaB)
+    if decB["port"] != 65535
+        print("FAIL B decode port: got "+str(decB["port"])+" want 65535")
+        exit(1)
+    if decB["addr"] != 0xFFFFFFFF
+        print("FAIL B decode addr: got "+str(decB["addr"])+" want "+str(0xFFFFFFFF))
+        exit(1)
+    if decB["ip"] != "255.255.255.255"
+        print("FAIL B decode ip: got "+decB["ip"]+" want 255.255.255.255")
+        exit(1)
+
+    // port=0, addr=0.0.0.0 minimal boundary
+    let xmaC = stun_attr_xor_mapped_address_encode(0, 0)
+    let decC = stun_attr_xor_mapped_address_decode(xmaC)
+    if decC["port"] != 0
+        print("FAIL C decode port: got "+str(decC["port"])+" want 0")
+        exit(1)
+    if decC["ip"] != "0.0.0.0"
+        print("FAIL C decode ip: got "+decC["ip"]+" want 0.0.0.0")
+        exit(1)
+
+    // ── D: Message-Length not a multiple of 4 -> MUST be rejected per RFC 5389 ─
+    // Build a header claiming Message-Length=6 followed by 6 arbitrary bytes.
+    let badD = bytes(0)
+    badD = bytes_append(badD, 0x00)
+    badD = bytes_append(badD, 0x01)
+    badD = bytes_append(badD, 0x00)
+    badD = bytes_append(badD, 0x06)  // Message-Length = 6 (NOT multiple of 4)
+    badD = bytes_append(badD, 0x21)
+    badD = bytes_append(badD, 0x12)
+    badD = bytes_append(badD, 0xA4)
+    badD = bytes_append(badD, 0x42)
+    let kD = 0
+    while kD < 12
+        badD = bytes_append(badD, 0)
+        kD = kD + 1
+    // now append 6 attribute bytes (total buffer 20+6=26, matches declared window physically)
+    badD = bytes_append(badD, 0x00)
+    badD = bytes_append(badD, 0x01)
+    badD = bytes_append(badD, 0x00)
+    badD = bytes_append(badD, 0x02)
+    badD = bytes_append(badD, 0xAA)
+    badD = bytes_append(badD, 0xBB)
+    if bytes_len(badD) != 26
+        print("FAIL D setup: got len "+str(bytes_len(badD))+" want 26")
+        exit(1)
+    let decD = stun_decode(badD)
+    if contains(decD, "type")
+        print("FAIL D: non-multiple-of-4 Message-Length was NOT rejected (attrs="+str(len(decD["attrs"]))+")")
+        exit(1)
+
+    // ── E: injection — legit message followed by bytes that look like a second
+    //      forged STUN frame; decode must only see the FIRST message's attrs,
+    //      never smuggle/parse the trailing injected frame's data as part of
+    //      the first message's attribute list.
+    let txnE = bytes(12)
+    let tE = 0
+    while tE < 12
+        bytes_set(txnE, tE, tE + 1)
+        tE = tE + 1
+    let valE = bytes(0)
+    valE = bytes_append(valE, 0x11)
+    valE = bytes_append(valE, 0x22)
+    valE = bytes_append(valE, 0x33)
+    valE = bytes_append(valE, 0x44)
+    let attrsE = [[0x0001, valE]]
+    let legitE = stun_encode(STUN_BINDING_REQUEST(), txnE, attrsE)
+    // legit message: 20 + (4+4) = 28 bytes, Message-Length=8
+    if bytes_len(legitE) != 28
+        print("FAIL E setup: got len "+str(bytes_len(legitE))+" want 28")
+        exit(1)
+    // Append a forged "second frame": another full Binding Request header +
+    // a bogus attribute, all appended directly after the legit message with
+    // NO Message-Length change on the first message.
+    let forged = bytes(0)
+    forged = bytes_append(forged, 0x00)
+    forged = bytes_append(forged, 0x01)
+    forged = bytes_append(forged, 0x00)
+    forged = bytes_append(forged, 0x04)
+    forged = bytes_append(forged, 0x21)
+    forged = bytes_append(forged, 0x12)
+    forged = bytes_append(forged, 0xA4)
+    forged = bytes_append(forged, 0x42)
+    let fT = 0
+    while fT < 12
+        forged = bytes_append(forged, 0xEE)
+        fT = fT + 1
+    forged = bytes_append(forged, 0x00)
+    forged = bytes_append(forged, 0x99)
+    forged = bytes_append(forged, 0x00)
+    forged = bytes_append(forged, 0x00)
+    let combined = bytes_concat(legitE, forged)
+    let decE = stun_decode(combined)
+    if contains(decE, "type") == false
+        print("FAIL E: legit prefix message was rejected entirely")
+        exit(1)
+    let attrsOutE = decE["attrs"]
+    if len(attrsOutE) != 1
+        print("FAIL E: attrs count got "+str(len(attrsOutE))+" want 1 (forged frame leaked in)")
+        exit(1)
+    let a0E = attrsOutE[0]
+    if a0E[0] != 0x0001
+        print("FAIL E: attr type got "+str(a0E[0])+" want 1 (forged frame's attr type leaked)")
+        exit(1)
+    if bytes_len(a0E[1]) != 4
+        print("FAIL E: attr value len got "+str(bytes_len(a0E[1]))+" want 4")
+        exit(1)
+    if bytes_get(a0E[1], 0) != 0x11 or bytes_get(a0E[1], 3) != 0x44
+        print("FAIL E: attr value bytes corrupted / forged data leaked")
+        exit(1)
+    // decode must report Message-Length = 8 (the FIRST message's own length),
+    // not 8+36 — confirming the forged frame is not part of the parsed result.
+    if decE["length"] != 8
+        print("FAIL E: decoded length got "+str(decE["length"])+" want 8 (forged frame bytes must not be counted)")
+        exit(1)
+
+    // ── F: binary 0x00 inside transaction-id and attribute value round-trips ──
+    let txnF = bytes(12)
+    bytes_set(txnF, 0, 0x00)
+    bytes_set(txnF, 1, 0x00)
+    bytes_set(txnF, 2, 0xFF)
+    let vF = 3
+    while vF < 12
+        bytes_set(txnF, vF, 0x00)
+        vF = vF + 1
+    let valF = bytes(0)
+    valF = bytes_append(valF, 0x00)
+    valF = bytes_append(valF, 0x00)
+    valF = bytes_append(valF, 0x00)
+    let attrsF = [[0x0022, valF]]
+    let msgF = stun_encode(STUN_BINDING_REQUEST(), txnF, attrsF)
+    let decF = stun_decode(msgF)
+    if contains(decF, "type") == false
+        print("FAIL F: NUL-containing message failed to decode")
+        exit(1)
+    let txnOutF = decF["txn_id"]
+    if bytes_len(txnOutF) != 12
+        print("FAIL F: txn_id len got "+str(bytes_len(txnOutF))+" want 12")
+        exit(1)
+    if bytes_get(txnOutF, 0) != 0x00 or bytes_get(txnOutF, 2) != 0xFF
+        print("FAIL F: txn_id bytes corrupted around NUL")
+        exit(1)
+    let attrsOutF = decF["attrs"]
+    let aF = attrsOutF[0]
+    if bytes_len(aF[1]) != 3
+        print("FAIL F: attr value len got "+str(bytes_len(aF[1]))+" want 3")
+        exit(1)
+    if bytes_get(aF[1], 0) != 0x00 or bytes_get(aF[1], 1) != 0x00 or bytes_get(aF[1], 2) != 0x00
+        print("FAIL F: NUL attr value corrupted")
+        exit(1)
+
+    // ── G: zero-length attribute value round-trips (type present, len 0) ──────
+    let attrsG = [[0x1234, bytes(0)]]
+    let msgG = stun_encode(STUN_BINDING_REQUEST(), txnF, attrsG)
+    // header(20) + type(2)+len(2)+value(0)+pad(0) = 24
+    if bytes_len(msgG) != 24
+        print("FAIL G: msg len got "+str(bytes_len(msgG))+" want 24")
+        exit(1)
+    let decG = stun_decode(msgG)
+    let attrsOutG = decG["attrs"]
+    if len(attrsOutG) != 1
+        print("FAIL G: attrs count got "+str(len(attrsOutG))+" want 1")
+        exit(1)
+    let aG = attrsOutG[0]
+    if aG[0] != 0x1234
+        print("FAIL G: attr type got "+str(aG[0])+" want "+str(0x1234))
+        exit(1)
+    if bytes_len(aG[1]) != 0
+        print("FAIL G: attr value len got "+str(bytes_len(aG[1]))+" want 0")
+        exit(1)
+
+    // ── H: attribute header claims a TLV header that overruns the message's
+    //      own window by exactly 1 byte (pos+4 > end boundary) -> rejected ────
+    let badH = bytes(0)
+    badH = bytes_append(badH, 0x00)
+    badH = bytes_append(badH, 0x01)
+    badH = bytes_append(badH, 0x00)
+    badH = bytes_append(badH, 0x03)  // Message-Length = 3 (also non-mult-4, but
+                                       // specifically: window has only 3 bytes,
+                                       // not even enough for a 4-byte TLV header)
+    badH = bytes_append(badH, 0x21)
+    badH = bytes_append(badH, 0x12)
+    badH = bytes_append(badH, 0xA4)
+    badH = bytes_append(badH, 0x42)
+    let kH = 0
+    while kH < 12
+        badH = bytes_append(badH, 0)
+        kH = kH + 1
+    badH = bytes_append(badH, 0xAA)
+    badH = bytes_append(badH, 0xBB)
+    badH = bytes_append(badH, 0xCC)
+    if bytes_len(badH) != 23
+        print("FAIL H setup: got len "+str(bytes_len(badH))+" want 23")
+        exit(1)
+    let decH = stun_decode(badH)
+    if contains(decH, "type")
+        print("FAIL H: truncated TLV header window was NOT rejected")
+        exit(1)
+
+    // ── I: MAPPED-ADDRESS independent hand vector: port=8080, 172.16.0.5 ──────
+    let addrI = ipv4_parse("172.16.0.5")
+    if addrI != 0xAC100005
+        print("FAIL I ipv4_parse: got "+str(addrI)+" want "+str(0xAC100005))
+        exit(1)
+    let maI = stun_attr_mapped_address_encode(8080, addrI)
+    let wantI = [0x00, 0x01, 0x1F, 0x90, 0xAC, 0x10, 0x00, 0x05]
+    let iI = 0
+    while iI < 8
+        let g = bytes_get(maI, iI)
+        let w = wantI[iI]
+        if g != w
+            print("FAIL I byte["+str(iI)+"]: got "+str(g)+" want "+str(w))
+            exit(1)
+        iI = iI + 1
+
+    // ── J: stun_encode total attr area exceeding 0xFFFF is rejected (sentinel) ─
+    // Build one attribute whose value alone is 0x10000 (65536) bytes -> encode
+    // must reject (bytes_len(value) > 0xFFFF) rather than truncate/wrap/crash.
+    let bigval = bytes(65536)
+    let attrsJ = [[0x0001, bigval]]
+    let encJ = stun_encode(STUN_BINDING_REQUEST(), txnF, attrsJ)
+    if bytes_len(encJ) != 0
+        print("FAIL J: oversized attribute value was not rejected (got len "+str(bytes_len(encJ))+")")
+        exit(1)
+
+    print("PASS _stun_adv_probe")

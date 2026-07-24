@@ -1,0 +1,337 @@
+// ============================================================================
+// NOVA Standard Library — std/net/stun
+// ============================================================================
+// RFC 5389 — STUN (Session Traversal Utilities for NAT) message codec.
+//
+// STUN header (20 bytes, all multi-byte fields big-endian):
+//   Bytes  0-1  : Message-Type   (u16) — method + class bits
+//   Bytes  2-3  : Message-Length (u16) — byte length of ALL attributes
+//                                        (MUST be a multiple of 4)
+//   Bytes  4-7  : Magic-Cookie   (u32) — always 0x2112A442
+//   Bytes  8-19 : Transaction-ID (96 bits / 12 bytes)
+//
+// Well-known Message-Type values:
+//   0x0001 = Binding Request
+//   0x0101 = Binding Success Response
+//   0x0111 = Binding Error Response
+//
+// Attributes are TLV, each padded with zero bytes to a 4-byte boundary:
+//   Type   (u16 BE)
+//   Length (u16 BE) — VALUE length, measured BEFORE padding
+//   Value  (Length bytes, followed by 0..3 zero pad bytes)
+//
+// MAPPED-ADDRESS (0x0001), IPv4 only (8 bytes):
+//   Byte 0    : 0 (reserved)
+//   Byte 1    : family — 0x01 = IPv4
+//   Bytes 2-3 : port (u16 BE)
+//   Bytes 4-7 : IPv4 address (u32 BE)
+//
+// XOR-MAPPED-ADDRESS (0x0020), IPv4 only (8 bytes) — RFC 5389 §15.2:
+//   Byte 0    : 0 (reserved)
+//   Byte 1    : family — 0x01 = IPv4
+//   Bytes 2-3 : X-Port    = port XOR high-16-bits-of-magic-cookie (0x2112)
+//   Bytes 4-7 : X-Address = address XOR full 32-bit magic cookie (0x2112A442)
+//   (IPv6 additionally XORs with the 96-bit transaction ID — not implemented
+//   here; this module is IPv4-only, matching MAPPED-ADDRESS scope above.)
+//
+// PUBLIC API:
+//   stun_encode(msg_type: int, txn_id: bytes, attrs: list) -> bytes
+//     attrs is a list of [attr_type: int, value: bytes] pairs, already
+//     encoded (e.g. via stun_attr_mapped_address_encode /
+//     stun_attr_xor_mapped_address_encode). Attributes are emitted in the
+//     given order, each TLV-wrapped and zero-padded to a 4-byte boundary.
+//     txn_id MUST be exactly 12 bytes.
+//     Returns the full wire message (20-byte header + attributes).
+//     ERROR SENTINEL: returns bytes(0) (empty bytes) if txn_id is not
+//     exactly 12 bytes, or if the total attribute area would exceed 65535
+//     bytes (cannot fit in the u16 Message-Length field). Never aborts.
+//
+//   stun_decode(b: bytes) -> dict
+//     Decodes a STUN message. Returns:
+//       {"type": int, "length": int, "cookie": int, "txn_id": bytes,
+//        "attrs": list of [attr_type: int, value: bytes]}
+//     ERROR SENTINEL: returns {} (empty dict) on ANY malformation —
+//     short buffer (<20 bytes), Message-Length that would overrun the
+//     supplied buffer, or an attribute whose declared length/padding
+//     overruns the message's attribute window. Every read is bounded to
+//     BOTH the declared Message-Length window AND the actual buffer size,
+//     so a hostile length field can never drive an out-of-bounds read or
+//     let one attribute's payload smuggle a second forged frame past the
+//     declared window. Never aborts.
+//
+//   stun_find_attr(attrs: list, attr_type: int) -> bytes
+//     Returns the value bytes of the first attribute in `attrs` (as
+//     returned by stun_decode) matching attr_type, or bytes(0) if absent.
+//
+//   stun_attr_mapped_address_encode(port: int, addr: int) -> bytes
+//     Encodes an 8-byte MAPPED-ADDRESS value. `addr` is a 32-bit host-order
+//     IPv4 integer (e.g. from std/net/ip.ipv4_parse). Port and addr are
+//     masked to their field widths — out-of-range values wrap, never crash.
+//
+//   stun_attr_mapped_address_decode(value: bytes) -> dict
+//     Decodes a MAPPED-ADDRESS value. Returns {"family","port","addr","ip"}
+//     where "ip" is the dotted-quad string. Returns {} if value is shorter
+//     than 8 bytes.
+//
+//   stun_attr_xor_mapped_address_encode(port: int, addr: int) -> bytes
+//     Encodes an 8-byte XOR-MAPPED-ADDRESS value (IPv4). `addr` is a
+//     32-bit host-order IPv4 integer.
+//
+//   stun_attr_xor_mapped_address_decode(value: bytes) -> dict
+//     Decodes an XOR-MAPPED-ADDRESS value, UN-XORing port and address back
+//     to their real values. Returns {"family","port","addr","ip"}.
+//     Returns {} if value is shorter than 8 bytes.
+//
+// Constants:
+//   STUN_MAGIC_COOKIE, STUN_BINDING_REQUEST, STUN_BINDING_SUCCESS_RESPONSE,
+//   STUN_BINDING_ERROR_RESPONSE, STUN_ATTR_MAPPED_ADDRESS,
+//   STUN_ATTR_XOR_MAPPED_ADDRESS, STUN_FAMILY_IPV4
+//
+// DEPENDS ON: std/net/ip (ipv4_format — dotted-quad rendering of decoded
+//   addresses). No other dependencies.
+// ============================================================================
+
+import std/net/ip
+
+// ── Constants ──────────────────────────────────────────────────────────────
+
+fn STUN_MAGIC_COOKIE()
+    0x2112A442
+
+fn STUN_BINDING_REQUEST()
+    0x0001
+
+fn STUN_BINDING_SUCCESS_RESPONSE()
+    0x0101
+
+fn STUN_BINDING_ERROR_RESPONSE()
+    0x0111
+
+fn STUN_ATTR_MAPPED_ADDRESS()
+    0x0001
+
+fn STUN_ATTR_XOR_MAPPED_ADDRESS()
+    0x0020
+
+fn STUN_FAMILY_IPV4()
+    0x01
+
+// ── Private helpers ───────────────────────────────────────────────────────
+
+// Read a big-endian u16 from b at position i (caller ensures bounds).
+fn _stun_r16(b, i)
+    ((bytes_get(b, i) << 8) | bytes_get(b, i + 1)) & 0xFFFF
+
+// Read a big-endian u32 from b at position i (caller ensures bounds).
+fn _stun_r32(b, i)
+    let hi = (bytes_get(b, i) << 24) | (bytes_get(b, i + 1) << 16)
+    let lo = (bytes_get(b, i + 2) << 8) | bytes_get(b, i + 3)
+    (hi | lo) & 0xFFFFFFFF
+
+// Append a big-endian u16 to out; return new bytes.
+fn _stun_w16(out, v)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append a big-endian u32 to out; return new bytes.
+fn _stun_w32(out, v)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// Append every byte of src onto out; return out.
+fn _stun_append_bytes(out, src)
+    let i = 0
+    let n = bytes_len(src)
+    while i < n
+        out = bytes_append(out, bytes_get(src, i))
+        i = i + 1
+    out
+
+// TLV-wrap one attribute: type(u16) + length(u16) + value + zero-pad to 4.
+// `value` may be any length 0..65535; caller (stun_encode) has already
+// validated this bound. Returns the TLV bytes.
+fn _stun_attr_tlv(attr_type, value)
+    let out = bytes(0)
+    let vlen = bytes_len(value)
+    out = _stun_w16(out, attr_type & 0xFFFF)
+    out = _stun_w16(out, vlen & 0xFFFF)
+    out = _stun_append_bytes(out, value)
+    let pad = (4 - (vlen % 4)) % 4
+    let p = 0
+    while p < pad
+        out = bytes_append(out, 0)
+        p = p + 1
+    out
+
+// ── Public API — message-level codec ────────────────────────────────────
+
+// stun_encode: encode a full STUN message (header + attributes).
+//
+// attrs is a list of [attr_type, value_bytes] pairs, in emission order.
+// txn_id MUST be exactly 12 bytes (RFC 5389 §6).
+//
+// Example (Binding Request, no attributes, RFC 5389 §10 sample transaction
+// ID b7 e7 a7 01 bc 34 d6 86 fa 87 df ae):
+//   stun_encode(0x0001, txn_id_bytes, [])
+//   => 00 01 00 00 21 12 A4 42 <12-byte txn_id>
+fn stun_encode(msg_type, txn_id, attrs)
+    let err = bytes(0)
+    if bytes_len(txn_id) != 12
+        return err
+    // Build the attribute area first so we know Message-Length up front,
+    // and so we can reject before emitting anything if any single value
+    // is too long to represent (defensive; TLV length field is u16).
+    let attr_area = bytes(0)
+    let i = 0
+    let n = len(attrs)
+    while i < n
+        let pair = attrs[i]
+        let value = pair[1]
+        if bytes_len(value) > 0xFFFF
+            return err
+        attr_area = bytes_concat(attr_area, _stun_attr_tlv(pair[0], value))
+        i = i + 1
+    let msg_length = bytes_len(attr_area)
+    if msg_length > 0xFFFF
+        return err
+    let out = bytes(0)
+    out = _stun_w16(out, msg_type & 0xFFFF)
+    out = _stun_w16(out, msg_length & 0xFFFF)
+    out = _stun_w32(out, STUN_MAGIC_COOKIE())
+    out = _stun_append_bytes(out, txn_id)
+    out = bytes_concat(out, attr_area)
+    out
+
+// stun_decode: decode a STUN message from wire bytes.
+//
+// Returns {} (empty dict) on ANY malformed input — this includes a buffer
+// shorter than the 20-byte header, a Message-Length that would read past
+// the end of the supplied buffer, or an attribute (length or padding)
+// that would read past the declared attribute window. This module NEVER
+// reads outside [0, bytes_len(b)) and never aborts on bad input.
+//
+// Example:
+//   stun_decode(hex_bytes_of("000100002112A442" + "<12-byte-txnid-hex>"))
+//   => {"type":1, "length":0, "cookie":0x2112A442, "txn_id":<12 bytes>,
+//       "attrs":[]}
+fn stun_decode(b)
+    let empty = {}
+    let blen = bytes_len(b)
+    if blen < 20
+        return empty
+    let msg_type = _stun_r16(b, 0)
+    let msg_length = _stun_r16(b, 2)
+    let cookie = _stun_r32(b, 4)
+    let txn_id = bytes_slice(b, 8, 20)
+    let end = 20 + msg_length
+    // Bound to the ACTUAL buffer: a lying/oversized Message-Length can
+    // never drive a read past bytes_len(b).
+    if end > blen
+        return empty
+    let attrs = []
+    let pos = 20
+    let ok = 1
+    while pos < end and ok == 1
+        if pos + 4 > end
+            // Not enough room left in the declared window for a TLV header.
+            ok = 0
+        else
+            let atype = _stun_r16(b, pos)
+            let alen = _stun_r16(b, pos + 2)
+            let vstart = pos + 4
+            let vend = vstart + alen
+            let pad = (4 - (alen % 4)) % 4
+            let npos = vend + pad
+            // Bound to the declared attribute WINDOW (end), not just the
+            // physical buffer — this is what stops one attribute's length
+            // field from smuggling bytes belonging to a forged second
+            // frame past the message's own declared boundary.
+            if vend > end or npos > end
+                ok = 0
+            else
+                let aval = bytes_slice(b, vstart, vend)
+                push(attrs, [atype, aval])
+                pos = npos
+    if ok == 0
+        return empty
+    if pos != end
+        // Trailing bytes that don't form a complete attribute — the
+        // declared Message-Length disagrees with the actual attribute
+        // stream. Reject rather than silently drop data.
+        return empty
+    {"type": msg_type, "length": msg_length, "cookie": cookie, "txn_id": txn_id, "attrs": attrs}
+
+// stun_find_attr: return the value bytes of the first attribute matching
+// attr_type in a decoded attrs list, or bytes(0) if not present.
+fn stun_find_attr(attrs, attr_type)
+    let i = 0
+    let n = len(attrs)
+    while i < n
+        let pair = attrs[i]
+        if pair[0] == attr_type
+            return pair[1]
+        i = i + 1
+    bytes(0)
+
+// ── Public API — MAPPED-ADDRESS (0x0001), IPv4 ──────────────────────────
+
+// stun_attr_mapped_address_encode: build an 8-byte MAPPED-ADDRESS value.
+// `addr` is a 32-bit host-order IPv4 integer (see std/net/ip.ipv4_parse).
+//
+// Example: port=32853, addr=ipv4_parse("192.168.1.1")
+//   => 00 01 80 55 C0 A8 01 01
+fn stun_attr_mapped_address_encode(port, addr)
+    let out = bytes(0)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, STUN_FAMILY_IPV4())
+    out = _stun_w16(out, port & 0xFFFF)
+    out = _stun_w32(out, addr & 0xFFFFFFFF)
+    out
+
+// stun_attr_mapped_address_decode: decode an 8-byte MAPPED-ADDRESS value.
+// Returns {} if value is shorter than 8 bytes (never reads past its end).
+fn stun_attr_mapped_address_decode(value)
+    let empty = {}
+    if bytes_len(value) < 8
+        return empty
+    let family = bytes_get(value, 1)
+    let port = _stun_r16(value, 2)
+    let addr = _stun_r32(value, 4)
+    {"family": family, "port": port, "addr": addr, "ip": ipv4_format(addr)}
+
+// ── Public API — XOR-MAPPED-ADDRESS (0x0020), IPv4 ──────────────────────
+
+// stun_attr_xor_mapped_address_encode: build an 8-byte XOR-MAPPED-ADDRESS
+// value (IPv4). `addr` is a 32-bit host-order IPv4 integer.
+//
+// Example (RFC 5389 §10 style): port=32853 (0x8055), addr=192.168.1.1:
+//   X-Port    = 0x8055 XOR 0x2112 = 0xA147
+//   X-Address = 0xC0A80101 XOR 0x2112A442 = 0xE1BAA543
+//   => 00 01 A1 47 E1 BA A5 43
+fn stun_attr_xor_mapped_address_encode(port, addr)
+    let xport = (port & 0xFFFF) ^ ((STUN_MAGIC_COOKIE() >> 16) & 0xFFFF)
+    let xaddr = (addr & 0xFFFFFFFF) ^ STUN_MAGIC_COOKIE()
+    let out = bytes(0)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, STUN_FAMILY_IPV4())
+    out = _stun_w16(out, xport & 0xFFFF)
+    out = _stun_w32(out, xaddr & 0xFFFFFFFF)
+    out
+
+// stun_attr_xor_mapped_address_decode: decode an 8-byte XOR-MAPPED-ADDRESS
+// value, un-XORing back to the real port/address. Returns {} if value is
+// shorter than 8 bytes (never reads past its end).
+fn stun_attr_xor_mapped_address_decode(value)
+    let empty = {}
+    if bytes_len(value) < 8
+        return empty
+    let family = bytes_get(value, 1)
+    let xport = _stun_r16(value, 2)
+    let xaddr = _stun_r32(value, 4)
+    let port = xport ^ ((STUN_MAGIC_COOKIE() >> 16) & 0xFFFF)
+    let addr = xaddr ^ STUN_MAGIC_COOKIE()
+    {"family": family, "port": port & 0xFFFF, "addr": addr & 0xFFFFFFFF, "ip": ipv4_format(addr & 0xFFFFFFFF)}

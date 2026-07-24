@@ -1,0 +1,232 @@
+// INDEPENDENT ADVERSARIAL PROBE for std/net/coap (RFC 7252)
+// Attacks paths NOT covered by the builder's own KAT:
+//  - ln==15 alone (delta nibble != 15) rejected
+//  - extended-delta nibble 13 and 14 round trip (RFC Fig.8 byte order)
+//  - extended-length nibble 13 and 14 round trip, INCLUDING both extended
+//    delta AND extended length together in the SAME option (order bug class)
+//  - TKL == 8 (max legal) boundary round trip
+//  - truncated extended-delta (1-byte and 2-byte) rejected, no crash
+//  - oversized declared 2-byte extended length vs tiny buffer -> rejected,
+//    no over-read / no crash (injection-class attack)
+//  - empty buffer (blen=0) decode -> rejected, no crash
+//  - binary 0x00 bytes inside token AND payload round-trip intact (never
+//    routed through a C-string function)
+//  - msg_id boundary 0xFFFF and 0x0000
+//  - code byte boundary 0xFF
+//  - two repeated option numbers where the SECOND carries an extended delta
+
+import std/net/coap
+
+fn cki(label, got, want)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn ckb(label, got, want)
+    let n = len(want)
+    if bytes_len(got) != n
+        print("FAIL " + label + " len: got=" + str(bytes_len(got)) + " want=" + str(n))
+        exit(1)
+    let i = 0
+    while i < n
+        if bytes_get(got, i) != want[i]
+            print("FAIL " + label + " byte[" + str(i) + "]: got=" + str(bytes_get(got, i)) + " want=" + str(want[i]))
+            exit(1)
+        i = i + 1
+
+fn mkbytes(lst)
+    let out = bytes(0)
+    let i = 0
+    let n = len(lst)
+    while i < n
+        out = bytes_append(out, lst[i])
+        i = i + 1
+    out
+
+fn main()
+    // ── 1. ln==15 alone (dn != 15) must be rejected too — header 0x0F ────────
+    let raw_0f = mkbytes([0x40, 0x01, 0x12, 0x34, 0x0F])
+    let d_0f = coap_decode(raw_0f)
+    cki("ln15_alone_rejected", d_0f["ok"], 0)
+
+    // header 0x3F (dn=3, ln=15)
+    let raw_3f = mkbytes([0x40, 0x01, 0x12, 0x34, 0x3F])
+    let d_3f = coap_decode(raw_3f)
+    cki("ln15_mid_rejected", d_3f["ok"], 0)
+
+    // ── 2. Extended delta nibble 13 (delta 13..268), e.g. delta = 100 ────────
+    // header nibble dn=13, extra byte = 100-13 = 87 = 0x57; ln=0 (empty value)
+    let opts_d13 = [[100, []]]
+    let e_d13 = coap_encode(1, 0, 0x01, 1, [], opts_d13, bytes(0))
+    cki("d13_enc_ok", e_d13["ok"], 1)
+    ckb("d13_wire", e_d13["bytes"], [0x40, 0x01, 0x00, 0x01, 0xD0, 0x57])
+    let dd13 = coap_decode(e_d13["bytes"])
+    cki("d13_dec_ok", dd13["ok"], 1)
+    let od13 = dd13["options"]
+    cki("d13_opt_num", od13[0][0], 100)
+
+    // ── 3. Extended delta nibble 14 (delta >= 269), e.g. delta = 300 ─────────
+    // ext = 300-269 = 31 = 0x001F -> hi=0x00 lo=0x1F ; header nibble dn=14, ln=0
+    let opts_d14 = [[300, []]]
+    let e_d14 = coap_encode(1, 0, 0x01, 1, [], opts_d14, bytes(0))
+    cki("d14_enc_ok", e_d14["ok"], 1)
+    ckb("d14_wire", e_d14["bytes"], [0x40, 0x01, 0x00, 0x01, 0xE0, 0x00, 0x1F])
+    let dd14 = coap_decode(e_d14["bytes"])
+    cki("d14_dec_ok", dd14["ok"], 1)
+    cki("d14_opt_num", dd14["options"][0][0], 300)
+
+    // ── 4. Extended length nibble 13 (value length 13..268) — value len 20 ───
+    let val20 = []
+    let vi = 0
+    while vi < 20
+        push(val20, 65 + (vi % 26))
+        vi = vi + 1
+    let opts_l13 = [[11, val20]]
+    let e_l13 = coap_encode(1, 0, 0x01, 1, [], opts_l13, bytes(0))
+    cki("l13_enc_ok", e_l13["ok"], 1)
+    // header: delta=11 (nibble 11 direct), length=20 -> nibble 13, extra=20-13=7
+    ckb("l13_hdr", bytes_slice(e_l13["bytes"], 4, 6), [0xBD, 0x07])
+    let dl13 = coap_decode(e_l13["bytes"])
+    cki("l13_dec_ok", dl13["ok"], 1)
+    let l13val = dl13["options"][0][1]
+    cki("l13_val_len", len(l13val), 20)
+    cki("l13_val0", l13val[0], 65)
+    cki("l13_val19", l13val[19], 65 + (19 % 26))
+
+    // ── 5. Extended length nibble 14 (value length >= 269) — value len 300 ───
+    let val300 = []
+    let vj = 0
+    while vj < 300
+        push(val300, vj % 256)
+        vj = vj + 1
+    let opts_l14 = [[11, val300]]
+    let e_l14 = coap_encode(1, 0, 0x01, 1, [], opts_l14, bytes(0))
+    cki("l14_enc_ok", e_l14["ok"], 1)
+    // header: delta=11 direct nibble; length=300 -> nibble14, ext = 300-269=31 = 0x001F
+    ckb("l14_hdr", bytes_slice(e_l14["bytes"], 4, 7), [0xBE, 0x00, 0x1F])
+    let dl14 = coap_decode(e_l14["bytes"])
+    cki("l14_dec_ok", dl14["ok"], 1)
+    let l14val = dl14["options"][0][1]
+    cki("l14_val_len", len(l14val), 300)
+    cki("l14_val0", l14val[0], 0)
+    cki("l14_val299", l14val[299], 299 % 256)
+
+    // ── 6. BOTH extended delta (nibble14) AND extended length (nibble14) in
+    //    the SAME option — tests RFC Fig.8 byte ORDER (delta-ext BEFORE
+    //    length-ext) end to end, the class of bug most likely to silently
+    //    swap bytes and still "look" plausible.
+    let bigval = []
+    let vk = 0
+    while vk < 280
+        push(bigval, (vk * 3) % 256)
+        vk = vk + 1
+    let opts_both = [[500, bigval]]
+    let e_both = coap_encode(1, 0, 0x01, 1, [], opts_both, str_to_bytes("tail"))
+    cki("both_enc_ok", e_both["ok"], 1)
+    // header nibble = (14<<4)|14 = 0xEE ; delta-ext = 500-269=231=0x00E7 (hi=0,lo=0xE7)
+    // length-ext = 280-269=11=0x000B (hi=0,lo=0x0B)
+    ckb("both_hdr", bytes_slice(e_both["bytes"], 4, 9), [0xEE, 0x00, 0xE7, 0x00, 0x0B])
+    let d_both = coap_decode(e_both["bytes"])
+    cki("both_dec_ok", d_both["ok"], 1)
+    cki("both_opt_num", d_both["options"][0][0], 500)
+    let bv = d_both["options"][0][1]
+    cki("both_val_len", len(bv), 280)
+    cki("both_val0", bv[0], 0)
+    cki("both_val279", bv[279], (279 * 3) % 256)
+    let bpay = d_both["payload"]
+    cki("both_pay_len", bytes_len(bpay), 4)
+    cki("both_pay0", bytes_get(bpay, 0), ord("t"))
+
+    // ── 7. TKL == 8 (max legal) round trip ────────────────────────────────────
+    let tok8 = [1, 2, 3, 4, 5, 6, 7, 8]
+    let e_tok8 = coap_encode(1, 0, 0x01, 1, tok8, [], bytes(0))
+    cki("tok8_enc_ok", e_tok8["ok"], 1)
+    ckb("tok8_wire", e_tok8["bytes"], [0x48, 0x01, 0x00, 0x01, 1, 2, 3, 4, 5, 6, 7, 8])
+    let d_tok8 = coap_decode(e_tok8["bytes"])
+    cki("tok8_dec_ok", d_tok8["ok"], 1)
+    cki("tok8_len", len(d_tok8["token"]), 8)
+    cki("tok8_last", d_tok8["token"][7], 8)
+
+    // ── 8. Truncated extended-delta 1-byte (dn=13, no extension byte follows) ─
+    let trunc_d13 = mkbytes([0x40, 0x01, 0x12, 0x34, 0xD0])
+    let dt13 = coap_decode(trunc_d13)
+    cki("trunc_d13_rejected", dt13["ok"], 0)
+
+    // ── 9. Truncated extended-delta 2-byte (dn=14, only 1 ext byte present) ───
+    let trunc_d14 = mkbytes([0x40, 0x01, 0x12, 0x34, 0xE0, 0x00])
+    let dt14 = coap_decode(trunc_d14)
+    cki("trunc_d14_rejected", dt14["ok"], 0)
+
+    // ── 10. Oversized declared 2-byte extended length vs tiny buffer:
+    //    header nibble ln=14 declares (0xFFFF)+269 = 66004 byte value, but
+    //    only 2 bytes of "value" follow. MUST reject, MUST NOT crash/over-read.
+    let inject = mkbytes([0x40, 0x01, 0x12, 0x34, 0x0E, 0xFF, 0xFF, 0xAA, 0xBB])
+    let dinj = coap_decode(inject)
+    cki("oversized_len_rejected", dinj["ok"], 0)
+
+    // ── 11. Empty buffer decode — no crash ────────────────────────────────────
+    let empty = bytes(0)
+    let dempty = coap_decode(empty)
+    cki("empty_rejected", dempty["ok"], 0)
+
+    // ── 12. Binary 0x00 bytes inside token AND payload survive round-trip
+    //     intact (never silently truncated as if C-string) ────────────────────
+    let tok_nul = [0x00, 0xFF, 0x00]
+    let pay_nul = mkbytes([0x41, 0x00, 0x42, 0x00, 0x00, 0x43])
+    let e_nul = coap_encode(1, 0, 0x01, 1, tok_nul, [], pay_nul)
+    cki("nul_enc_ok", e_nul["ok"], 1)
+    let d_nul = coap_decode(e_nul["bytes"])
+    cki("nul_dec_ok", d_nul["ok"], 1)
+    let nt = d_nul["token"]
+    cki("nul_tok_len", len(nt), 3)
+    cki("nul_tok0", nt[0], 0x00)
+    cki("nul_tok1", nt[1], 0xFF)
+    cki("nul_tok2", nt[2], 0x00)
+    let np = d_nul["payload"]
+    cki("nul_pay_len", bytes_len(np), 6)
+    cki("nul_pay0", bytes_get(np, 0), 0x41)
+    cki("nul_pay1", bytes_get(np, 1), 0x00)
+    cki("nul_pay3", bytes_get(np, 3), 0x00)
+    cki("nul_pay4", bytes_get(np, 4), 0x00)
+    cki("nul_pay5", bytes_get(np, 5), 0x43)
+
+    // ── 13. msg_id boundary 0xFFFF and 0x0000 ─────────────────────────────────
+    let e_midmax = coap_encode(1, 0, 0x01, 0xFFFF, [], [], bytes(0))
+    ckb("midmax_wire", e_midmax["bytes"], [0x40, 0x01, 0xFF, 0xFF])
+    let d_midmax = coap_decode(e_midmax["bytes"])
+    cki("midmax_dec", d_midmax["msg_id"], 0xFFFF)
+
+    let e_midzero = coap_encode(1, 0, 0x01, 0x0000, [], [], bytes(0))
+    ckb("midzero_wire", e_midzero["bytes"], [0x40, 0x01, 0x00, 0x00])
+    let d_midzero = coap_decode(e_midzero["bytes"])
+    cki("midzero_dec", d_midzero["msg_id"], 0x0000)
+
+    // ── 14. code byte boundary 0xFF (7.31 style / reserved-but-wire-legal) ────
+    let e_codemax = coap_encode(1, 0, 0xFF, 1, [], [], bytes(0))
+    ckb("codemax_wire", e_codemax["bytes"], [0x40, 0xFF, 0x00, 0x01])
+    let d_codemax = coap_decode(e_codemax["bytes"])
+    cki("codemax_dec", d_codemax["code"], 0xFF)
+
+    // ── 15. Repeated option number where the SECOND carries an extended delta
+    //     jump afterward: opt 11 (delta 11), then opt 11 again (delta 0), then
+    //     opt 400 (delta 389 -> extended nibble 14, ext = 389-269=120=0x0078)
+    let rep_then_ext = [[11, [ord("a")]], [11, [ord("b")]], [400, [ord("c")]]]
+    let e_rte = coap_encode(1, 0, 0x01, 1, [], rep_then_ext, bytes(0))
+    cki("rte_enc_ok", e_rte["ok"], 1)
+    let d_rte = coap_decode(e_rte["bytes"])
+    cki("rte_dec_ok", d_rte["ok"], 1)
+    let rte_opts = d_rte["options"]
+    cki("rte_len", len(rte_opts), 3)
+    cki("rte_num0", rte_opts[0][0], 11)
+    cki("rte_num1", rte_opts[1][0], 11)
+    cki("rte_num2", rte_opts[2][0], 400)
+    cki("rte_val2", rte_opts[2][1][0], ord("c"))
+
+    // ── 16. Declared TKL=9 in wire header with a full 9 bytes actually present
+    //    (buffer NOT short) — still RFC-reserved, must still be rejected
+    //    (proves rejection is about the RESERVED value, not just truncation).
+    let tkl9_full = mkbytes([0x49, 0x01, 0x00, 0x01, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    let d_tkl9_full = coap_decode(tkl9_full)
+    cki("tkl9_full_rejected", d_tkl9_full["ok"], 0)
+
+    print("PASS _coap_adv_probe")

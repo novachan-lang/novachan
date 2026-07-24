@@ -1,0 +1,151 @@
+// KAT for std/net/coap — RFC 7252 full CoAP message wire codec.
+import std/net/coap
+
+fn cki(label, got, want)
+    if got != want
+        print("FAIL coap " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn ckb(label, got, want)
+    // Compare a `bytes` value against a list of expected int byte values.
+    let n = len(want)
+    if bytes_len(got) != n
+        print("FAIL coap " + label + " len: got=" + str(bytes_len(got)) + " want=" + str(n))
+        exit(1)
+    let i = 0
+    while i < n
+        if bytes_get(got, i) != want[i]
+            print("FAIL coap " + label + " byte[" + str(i) + "]: got=" + str(bytes_get(got, i)) + " want=" + str(want[i]))
+            exit(1)
+        i = i + 1
+
+fn main()
+    // ── Vector 1: GET, Ver1/CON/TKL0, Code 0.01=GET, MID 0x1234, no token/options
+    //    -> 40 01 12 34
+    let r1 = coap_encode(1, 0, 0x01, 0x1234, [], [], bytes(0))
+    cki("v1_ok", r1["ok"], 1)
+    ckb("v1", r1["bytes"], [0x40, 0x01, 0x12, 0x34])
+
+    // ── Vector 2: same but with a 2-byte token 0xAB 0xCD
+    //    -> 42 01 12 34 AB CD
+    let r2 = coap_encode(1, 0, 0x01, 0x1234, [0xAB, 0xCD], [], bytes(0))
+    cki("v2_ok", r2["ok"], 1)
+    ckb("v2", r2["bytes"], [0x42, 0x01, 0x12, 0x34, 0xAB, 0xCD])
+
+    // ── Vector 3: GET with Uri-Path option "temp" (opt 11, delta 11 from 0)
+    //    first option byte = (11<<4)|4 = 0xB4, then "temp" = 74 65 6D 70
+    //    -> 40 01 12 34 B4 74 65 6D 70
+    let temp_val = [ord("t"), ord("e"), ord("m"), ord("p")]
+    let r3 = coap_encode(1, 0, 0x01, 0x1234, [], [[11, temp_val]], bytes(0))
+    cki("v3_ok", r3["ok"], 1)
+    ckb("v3", r3["bytes"], [0x40, 0x01, 0x12, 0x34, 0xB4, 0x74, 0x65, 0x6D, 0x70])
+
+    // ── Vector 4: 2.05 Content response (code 0x45) with payload "42" after 0xFF
+    //    Ver1/ACK(2)/TKL0, code=0x45, MID 0x1234
+    //    byte0 = (1<<6)|(2<<4)|0 = 0x60
+    //    -> 60 45 12 34 FF 34 32
+    let r4 = coap_encode(1, 2, 0x45, 0x1234, [], [], str_to_bytes("42"))
+    cki("v4_ok", r4["ok"], 1)
+    ckb("v4", r4["bytes"], [0x60, 0x45, 0x12, 0x34, 0xFF, 0x34, 0x32])
+
+    // ── Round-trip: header + token + options + payload, decode recovers all ──
+    let opts_rt = [[11, temp_val], [12, [0x2D]]]
+    let r5 = coap_encode(1, 0, 0x01, 0xBEEF, [0x9A], opts_rt, str_to_bytes("hi"))
+    cki("v5_ok", r5["ok"], 1)
+    let d5 = coap_decode(r5["bytes"])
+    cki("rt_ok",     d5["ok"],     1)
+    cki("rt_ver",    d5["ver"],    1)
+    cki("rt_type",   d5["type"],   0)
+    cki("rt_code",   d5["code"],   0x01)
+    cki("rt_mid",    d5["msg_id"], 0xBEEF)
+    let rt_tok = d5["token"]
+    cki("rt_tok_len", len(rt_tok), 1)
+    cki("rt_tok0",    rt_tok[0],   0x9A)
+    let rt_opts = d5["options"]
+    cki("rt_opts_len", len(rt_opts), 2)
+    let rt_opt0 = rt_opts[0]
+    cki("rt_opt0_num", rt_opt0[0], 11)
+    let rt_opt0_val = rt_opt0[1]
+    cki("rt_opt0_val_len", len(rt_opt0_val), 4)
+    cki("rt_opt0_val0", rt_opt0_val[0], ord("t"))
+    let rt_opt1 = rt_opts[1]
+    cki("rt_opt1_num", rt_opt1[0], 12)
+    let rt_pay = d5["payload"]
+    cki("rt_pay_len", bytes_len(rt_pay), 2)
+    cki("rt_pay0", bytes_get(rt_pay, 0), ord("h"))
+    cki("rt_pay1", bytes_get(rt_pay, 1), ord("i"))
+
+    // ── Round-trip with an empty everything (bare 4-byte header) ─────────────
+    let r6 = coap_encode(1, 3, 0, 0x0000, [], [], bytes(0))
+    let d6 = coap_decode(r6["bytes"])
+    cki("bare_ok",   d6["ok"],   1)
+    cki("bare_type", d6["type"], 3)
+    cki("bare_toklen", len(d6["token"]), 0)
+    cki("bare_optlen", len(d6["options"]), 0)
+    cki("bare_paylen", bytes_len(d6["payload"]), 0)
+
+    // ── EDGE CASE: TKL > 8 must be rejected in encode (no crash) ─────────────
+    let bad_tok = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    let renc_bad = coap_encode(1, 0, 0x01, 1, bad_tok, [], bytes(0))
+    cki("enc_tkl9_rejected", renc_bad["ok"], 0)
+    cki("enc_tkl9_empty_bytes", bytes_len(renc_bad["bytes"]), 0)
+
+    // ── EDGE CASE: TKL of 9 in the wire header must be rejected in decode ────
+    // byte0 = (1<<6)|(0<<4)|9 = 0x49 ; TKL=9 is RFC-reserved (max is 8)
+    let bad_hdr = bytes_append(bytes_append(bytes_append(bytes_append(bytes(0), 0x49), 0x01), 0x00), 0x01)
+    let dbad = coap_decode(bad_hdr)
+    cki("dec_tkl9_rejected", dbad["ok"], 0)
+
+    // ── EDGE CASE: declared TKL exceeds actual buffer (truncated token) ──────
+    // byte0 TKL=4 but only 1 byte follows the 4-byte header instead of 4
+    let trunc_tok = bytes_append(bytes_append(bytes_append(bytes_append(bytes_append(bytes(0), 0x44), 0x01), 0x00), 0x01), 0xAA)
+    let dtrunc = coap_decode(trunc_tok)
+    cki("dec_trunc_token_rejected", dtrunc["ok"], 0)
+
+    // ── EDGE CASE: message shorter than 4-byte fixed header ──────────────────
+    let too_short = bytes_append(bytes_append(bytes(0), 0x40), 0x01)
+    let dshort = coap_decode(too_short)
+    cki("dec_too_short_rejected", dshort["ok"], 0)
+
+    // ── EDGE CASE: malformed option — delta nibble 15 without being 0xFF ─────
+    // header 0xF3 (dn=15,ln=3) immediately after the 4-byte header, no token.
+    let mal = bytes_append(bytes_append(bytes_append(bytes_append(bytes_append(bytes(0), 0x40), 0x01), 0x12), 0x34), 0xF3)
+    let dmal = coap_decode(mal)
+    cki("dec_malformed_nibble15_rejected", dmal["ok"], 0)
+
+    // ── EDGE CASE: option with declared value length past end of buffer ──────
+    // header byte 0xB4 (delta=11, len=4 "temp") but only 2 bytes follow.
+    let mal2raw = bytes_append(bytes_append(bytes_append(bytes_append(bytes_append(bytes_append(bytes(0), 0x40), 0x01), 0x12), 0x34), 0xB4), 0x74)
+    let mal2 = bytes_append(mal2raw, 0x65)
+    let dmal2 = coap_decode(mal2)
+    cki("dec_option_overlength_rejected", dmal2["ok"], 0)
+
+    // ── EDGE CASE: payload marker present but zero-length payload ────────────
+    let markeronly = bytes_append(bytes_append(bytes_append(bytes_append(bytes_append(bytes(0), 0x40), 0x01), 0x12), 0x34), 0xFF)
+    let dmarker = coap_decode(markeronly)
+    cki("dec_zero_payload_after_marker_rejected", dmarker["ok"], 0)
+
+    // ── EDGE CASE: a genuine 0xFF payload marker byte in the option stream is
+    //    correctly recognized as the marker, NOT misparsed as a delta=15
+    //    option header (already covered by vector 4 and the round trip, but
+    //    check explicitly with an option present before it).
+    let withopt = coap_encode(1, 0, 0x01, 1, [], [[11, [ord("a")]]], str_to_bytes("z"))
+    let dwithopt = coap_decode(withopt["bytes"])
+    cki("marker_after_option_ok", dwithopt["ok"], 1)
+    cki("marker_after_option_optlen", len(dwithopt["options"]), 1)
+    cki("marker_after_option_paylen", bytes_len(dwithopt["payload"]), 1)
+
+    // ── EDGE CASE: options not sorted ascending is rejected on encode ────────
+    let bad_opts = [[12, [1]], [11, [2]]]
+    let renc_unsorted = coap_encode(1, 0, 0x01, 1, [], bad_opts, bytes(0))
+    cki("enc_unsorted_opts_rejected", renc_unsorted["ok"], 0)
+
+    // ── EDGE CASE: repeated option numbers (delta 0) ARE allowed (e.g. two
+    //    Uri-Path segments) — must NOT be rejected as "unsorted".
+    let rep_opts = [[11, [ord("a")]], [11, [ord("b")]]]
+    let renc_rep = coap_encode(1, 0, 0x01, 1, [], rep_opts, bytes(0))
+    cki("enc_repeated_opt_num_allowed", renc_rep["ok"], 1)
+    let drep = coap_decode(renc_rep["bytes"])
+    cki("dec_repeated_opt_num_len", len(drep["options"]), 2)
+
+    print("PASS _coap_full_test")

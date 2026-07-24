@@ -1,0 +1,253 @@
+// KAT for std/net/radius.nova — RADIUS (RFC 2865) packet codec.
+//
+// Covers: byte-exact header + Length field, byte-exact User-Name TLV
+// (01 05 62 6F 62 = type1 len5 "bob"), full-packet encode/decode round-trip,
+// RFC 2865 §5.2 User-Password encryption (single-block + multi-block +
+// round-trip decrypt), and the mandatory edge-case checklist: binary/empty
+// values, boundary widths (attr Length 253/254, packet Length 20/4096),
+// wrong-length authenticator/NAS-IP rejected in-band, an attribute Length
+// that overruns the declared packet Length (simulating an attacker-appended
+// second frame) rejected without any over-read, and never-exit-on-bad-input.
+//
+// The MD5 engine that powers User-Password encryption is independently
+// checked against the published RFC 1321 test vectors (radius_md5_hex),
+// the same vectors already gated elsewhere in this codebase for
+// forge_crypto's MD5 — so the crypto core is verifiable byte-for-byte
+// without transcribing an unverifiable "RFC 2865 worked example" by hand.
+
+import std/net/radius
+import std/encoding/hex
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn main()
+    // ── 1. MD5 engine cross-checked against published RFC 1321 vectors ─────
+    check("md5_empty", radius_md5_hex("") == "d41d8cd98f00b204e9800998ecf8427e")
+    check("md5_abc", radius_md5_hex("abc") == "900150983cd24fb0d6963f7d28e17f72")
+    check("md5_message_digest", radius_md5_hex("message digest") == "f96b697d7cb7938d525a2f31aaf161d0")
+
+    // ── 2. byte-exact User-Name TLV: 01 05 62 6F 62 = type1 len5 "bob" ─────
+    let un = radius_attr_user_name("bob")
+    check("username_len_5", bytes_len(un) == 5)
+    check("username_bytes_exact", hex_encode(un) == "0105626f62")
+
+    // ── 3. byte-exact header + Length field for a full Access-Request ──────
+    // code=1 (Access-Request), identifier=7, authenticator = bytes 0x00..0x0F,
+    // attrs = User-Name("bob") + NAS-IP-Address("192.168.1.1")
+    let auth16 = bytes_create(16)
+    let ai = 0
+    while ai < 16
+        bytes_set(auth16, ai, ai)
+        ai = ai + 1
+    let nasip = radius_attr_nas_ip_address_str("192.168.1.1")
+    check("nasip_len_6", bytes_len(nasip) == 6)
+    check("nasip_bytes_exact", hex_encode(nasip) == "0406c0a80101")
+
+    let attrs = bytes_concat(un, nasip)
+    check("attrs_len_11", bytes_len(attrs) == 11)
+
+    let pkt = radius_encode({"code": 1, "identifier": 7, "authenticator": auth16, "attrs": attrs})
+    // total = 20 (header) + 11 (attrs) = 31 = 0x001F
+    check("pkt_len_31", bytes_len(pkt) == 31)
+    check("pkt_code_byte", bytes_get(pkt, 0) == 1)
+    check("pkt_identifier_byte", bytes_get(pkt, 1) == 7)
+    check("pkt_length_hi", bytes_get(pkt, 2) == 0x00)
+    check("pkt_length_lo", bytes_get(pkt, 3) == 0x1F)
+    check("pkt_authenticator_byte0", bytes_get(pkt, 4) == 0)
+    check("pkt_authenticator_byte15", bytes_get(pkt, 19) == 15)
+    check("pkt_attrs_region_exact", hex_encode(bytes_slice(pkt, 20, 31)) == "0105626f62" + "0406c0a80101")
+
+    // ── 4. full round-trip decode ───────────────────────────────────────────
+    let dec = radius_decode(pkt)
+    check("dec_has_code", contains(dec, "code"))
+    check("dec_code", dec["code"] == 1)
+    check("dec_identifier", dec["identifier"] == 7)
+    check("dec_length", dec["length"] == 31)
+    check("dec_authenticator_exact", hex_encode(dec["authenticator"]) == hex_encode(auth16))
+    let dattrs = dec["attrs"]
+    check("dec_attrs_count_2", len(dattrs) == 2)
+    check("dec_attr0_type", dattrs[0]["type"] == 1)
+    check("dec_attr0_value", hex_encode(dattrs[0]["value"]) == hex_encode(str_to_bytes("bob")))
+    check("dec_attr1_type", dattrs[1]["type"] == 4)
+    check("dec_attr1_value", hex_encode(dattrs[1]["value"]) == "c0a80101")
+    check("code_name", radius_code_name(1) == "Access-Request")
+    check("code_name_unknown", radius_code_name(99) == "")
+    check("attr_type_name", radius_attr_type_name(2) == "User-Password")
+
+    // ── 5. User-Password encryption (RFC 2865 §5.2), single block ──────────
+    let secret = "xyzzy"
+    let pw = str_to_bytes("hello")
+    let enc1 = radius_user_password_encrypt(pw, auth16, secret)
+    check("pw_enc_len_16", bytes_len(enc1) == 16)
+    check("pw_enc_not_plaintext", hex_encode(enc1) != hex_encode(pw))   // sanity: actually encrypted
+    let dec1 = radius_user_password_decrypt(enc1, auth16, secret)
+    check("pw_roundtrip_exact", hex_encode(dec1) == hex_encode(pw))
+    check("pw_roundtrip_str", bytes_to_str(dec1) == "hello")
+
+    // wrong secret must NOT recover the same plaintext
+    let dec1_wrong = radius_user_password_decrypt(enc1, auth16, "wrongsecret")
+    check("pw_wrong_secret_diverges", bytes_to_str(dec1_wrong) != "hello")
+
+    // wrong authenticator must NOT recover the same plaintext
+    let auth_other = bytes_create(16)
+    let dec1_wrongauth = radius_user_password_decrypt(enc1, auth_other, secret)
+    check("pw_wrong_auth_diverges", bytes_to_str(dec1_wrongauth) != "hello")
+
+    // ── 6. multi-block password (RFC 2865 keystream chaining, 2 blocks) ────
+    let longpw = str_to_bytes("this-is-a-20char-pw!")   // 21 bytes -> pads to 32
+    let enc2 = radius_user_password_encrypt(longpw, auth16, secret)
+    check("pw_enc_multiblock_len_32", bytes_len(enc2) == 32)
+    let dec2 = radius_user_password_decrypt(enc2, auth16, secret)
+    check("pw_multiblock_roundtrip", bytes_to_str(dec2) == "this-is-a-20char-pw!")
+
+    // ── 7. EDGE CASE: exact 16-byte password (no padding needed) ───────────
+    let exact16 = str_to_bytes("exactlysixteenb.")   // 16 chars in the boundary block
+    let enc3 = radius_user_password_encrypt(exact16, auth16, secret)
+    check("pw_exact16_len", bytes_len(enc3) == 16)
+    let dec3_raw = radius_user_password_decrypt_raw(enc3, auth16, secret)
+    check("pw_exact16_raw_roundtrip", hex_encode(dec3_raw) == hex_encode(exact16))
+
+    // ── 8. EDGE CASE: empty password (pads to one 16-byte zero block) ──────
+    let emptypw = bytes_create(0)
+    let enc4 = radius_user_password_encrypt(emptypw, auth16, secret)
+    check("pw_empty_enc_len_16", bytes_len(enc4) == 16)
+    let dec4 = radius_user_password_decrypt(enc4, auth16, secret)
+    check("pw_empty_roundtrip", bytes_len(dec4) == 0)
+
+    // ── 9. EDGE CASE: oversized password rejected in-band (never exit 1) ───
+    let toolong = bytes_create(241)
+    let enc5 = radius_user_password_encrypt(toolong, auth16, secret)
+    check("pw_oversized_rejected", bytes_len(enc5) == 0)
+
+    // ── 10. EDGE CASE: wrong-length authenticator rejected in-band ─────────
+    let bad_auth = bytes_create(15)
+    check("pw_bad_auth_len_rejected", bytes_len(radius_user_password_encrypt(pw, bad_auth, secret)) == 0)
+    check("pw_bad_auth_len_decrypt_rejected", bytes_len(radius_user_password_decrypt_raw(enc1, bad_auth, secret)) == 0)
+
+    // ── 11. EDGE CASE: malformed encrypted value (not a multiple of 16) ────
+    let bad_enc = bytes_create(10)
+    check("pw_bad_enc_width_rejected", bytes_len(radius_user_password_decrypt_raw(bad_enc, auth16, secret)) == 0)
+
+    // ── 12. EDGE CASE: attr value length boundary (253 ok, 254 rejected) ───
+    let val253 = bytes_create(253)
+    let attr253 = radius_attr_encode(1, val253)
+    check("attr_253_ok", bytes_len(attr253) == 255)
+    let val254 = bytes_create(254)
+    let attr254 = radius_attr_encode(1, val254)
+    check("attr_254_rejected", bytes_len(attr254) == 0)
+
+    // ── 13. EDGE CASE: NAS-IP-Address wrong length / bad dotted-quad ───────
+    let bad_ip = bytes_create(3)
+    check("nasip_wrong_len_rejected", bytes_len(radius_attr_nas_ip_address(bad_ip)) == 0)
+    check("nasip_bad_dotted_rejected", bytes_len(radius_attr_nas_ip_address_str("999.1.1.1")) == 0)
+    check("nasip_bad_dotted2_rejected", bytes_len(radius_attr_nas_ip_address_str("not.an.ip")) == 0)
+
+    // ── 14. EDGE CASE: authenticator wrong length in radius_encode ─────────
+    check("encode_bad_auth_rejected", bytes_len(radius_encode({"code": 1, "identifier": 1, "authenticator": bad_auth, "attrs": attrs})) == 0)
+
+    // ── 15. EDGE CASE: header decode boundaries (short buffer, Length 20/4096) ─
+    let too_short = bytes_create(19)
+    check("header_too_short_rejected", not contains(radius_decode_header(too_short), "code"))
+    let empty_buf = bytes_create(0)
+    check("header_empty_rejected", not contains(radius_decode_header(empty_buf), "code"))
+
+    // Length == 20 exactly (header only, no attrs) must be accepted.
+    let min_pkt = radius_encode({"code": 2, "identifier": 3, "authenticator": auth16})
+    check("min_pkt_len_20", bytes_len(min_pkt) == 20)
+    let min_hdr = radius_decode_header(min_pkt)
+    check("min_pkt_accepted", contains(min_hdr, "code"))
+    check("min_pkt_length_field_20", min_hdr["length"] == 20)
+
+    // Length == 19 (one below minimum) must be rejected: craft by hand.
+    let len19 = bytes_create(20)
+    bytes_set(len19, 0, 1)
+    bytes_set(len19, 1, 1)
+    bytes_set(len19, 2, 0x00)
+    bytes_set(len19, 3, 19)
+    check("length_19_rejected", not contains(radius_decode_header(len19), "code"))
+
+    // Length == 4096 (max) accepted; 4097 rejected.
+    let len4096 = bytes_create(20)
+    bytes_set(len4096, 0, 1)
+    bytes_set(len4096, 1, 1)
+    bytes_set(len4096, 2, (4096 >> 8) & 0xFF)
+    bytes_set(len4096, 3, 4096 & 0xFF)
+    check("length_4096_accepted", contains(radius_decode_header(len4096), "code"))
+    let len4097 = bytes_create(20)
+    bytes_set(len4097, 0, 1)
+    bytes_set(len4097, 1, 1)
+    bytes_set(len4097, 2, (4097 >> 8) & 0xFF)
+    bytes_set(len4097, 3, 4097 & 0xFF)
+    check("length_4097_rejected", not contains(radius_decode_header(len4097), "code"))
+
+    // encode() itself must reject a total that would exceed 4096.
+    let huge_attrs = bytes_create(4090)
+    check("encode_over_4096_rejected", bytes_len(radius_encode({"code": 1, "identifier": 1, "authenticator": auth16, "attrs": huge_attrs})) == 0)
+
+    // ── 16. EDGE CASE (INJECTION): an attribute Length that overruns the
+    // declared packet Length is rejected in-band, with NO over-read — even
+    // when the PHYSICAL buffer has extra bytes appended after it (simulating
+    // an attacker tacking a second frame onto a valid packet). ──────────────
+    // header: code=1 id=99 length=25 (20 header + 5-byte attr region),
+    // authenticator = 0xAA * 16.
+    let inj_auth = bytes_create(16)
+    let ji = 0
+    while ji < 16
+        bytes_set(inj_auth, ji, 0xAA)
+        ji = ji + 1
+    let inj = bytes_create(40)
+    bytes_set(inj, 0, 1)
+    bytes_set(inj, 1, 99)
+    bytes_set(inj, 2, 0x00)
+    bytes_set(inj, 3, 25)
+    let ki = 0
+    while ki < 16
+        bytes_set(inj, 4 + ki, 0xAA)
+        ki = ki + 1
+    // attr region [20,25): type=1, length=10 (claims a value reaching offset 30,
+    // but the declared packet Length only allows up to offset 25)
+    bytes_set(inj, 20, 1)
+    bytes_set(inj, 21, 10)
+    bytes_set(inj, 22, 0x41)
+    bytes_set(inj, 23, 0x42)
+    bytes_set(inj, 24, 0x43)
+    // bytes [25,40) = attacker-appended "second frame" garbage
+    let gi = 25
+    while gi < 40
+        bytes_set(inj, gi, 0xFF)
+        gi = gi + 1
+    let inj_dec = radius_decode(inj)
+    check("injection_header_ok", contains(inj_dec, "code"))
+    check("injection_declared_length_25", inj_dec["length"] == 25)
+    check("injection_attr_overrun_rejected_no_attrs", len(inj_dec["attrs"]) == 0)
+
+    // Direct attr-walk check too: same rejection, and it must not silently
+    // wander into the garbage region even though the buffer physically has it.
+    let direct_attrs = radius_attr_decode_all(inj, 20, 25)
+    check("injection_direct_walk_empty", len(direct_attrs) == 0)
+
+    // ── 17. EDGE CASE: attribute Length < 2 (structurally invalid) rejected ─
+    let badlen = bytes_create(22)
+    bytes_set(badlen, 0, 1)
+    bytes_set(badlen, 1, 1)
+    bytes_set(badlen, 2, 0x00)
+    bytes_set(badlen, 3, 22)
+    bytes_set(badlen, 20, 5)
+    bytes_set(badlen, 21, 1)      // Length=1 < 2 -> structurally invalid
+    let badlen_attrs = radius_attr_decode_all(badlen, 20, 22)
+    check("attr_length_lt2_rejected", len(badlen_attrs) == 0)
+
+    // ── 18. EDGE CASE: still alive after every malformed-input path above ──
+    check("still_alive_after_all_rejects", true)
+
+    if FAILS[0] == 0
+        print("ALL PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))

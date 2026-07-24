@@ -1,0 +1,168 @@
+import std/net/ntp
+import std/net/ntppkt
+
+fn main()
+    // ── A1: u32 boundary round-trip — 0xFFFFFFFF must decode as a positive
+    //    4294967295, never sign-extend/overflow negative (classic BE-u32 bug) ─
+    let hmax = {"li": 0, "vn": 4, "mode": 4, "stratum": 255, "poll": 0, "precision": 0,
+        "root_delay": 0xFFFFFFFF, "root_dispersion": 0xFFFFFFFF, "reference_id": 0xFFFFFFFF,
+        "ref_sec": 0xFFFFFFFF, "ref_frac": 0xFFFFFFFF,
+        "org_sec": 0xFFFFFFFF, "org_frac": 0xFFFFFFFF,
+        "rx_sec": 0xFFFFFFFF, "rx_frac": 0xFFFFFFFF,
+        "tx_sec": 0xFFFFFFFF, "tx_frac": 0xFFFFFFFF}
+    let emax = ntp_encode(hmax)
+    if bytes_len(emax) != 48
+        print("FAIL A1 length: got "+str(bytes_len(emax)))
+        exit(1)
+    let dmax = ntp_decode(emax)
+    if dmax["root_delay"] != 4294967295
+        print("FAIL A1 root_delay: got "+str(dmax["root_delay"]))
+        exit(1)
+    if dmax["reference_id"] != 4294967295
+        print("FAIL A1 reference_id: got "+str(dmax["reference_id"]))
+        exit(1)
+    if dmax["tx_sec"] != 4294967295
+        print("FAIL A1 tx_sec: got "+str(dmax["tx_sec"]))
+        exit(1)
+    if dmax["tx_frac"] != 4294967295
+        print("FAIL A1 tx_frac: got "+str(dmax["tx_frac"]))
+        exit(1)
+    // stratum is u8 — 255/256 boundary
+    if dmax["stratum"] != 255
+        print("FAIL A1 stratum: got "+str(dmax["stratum"]))
+        exit(1)
+
+    // ── A2: stratum 256 must wrap to a valid byte (mask), not corrupt adjacent
+    //    fields (poll/precision) — cross-field injection check ────────────────
+    let hwrap = {"li": 0, "vn": 4, "mode": 3, "stratum": 256, "poll": 7, "precision": 9}
+    let ewrap = ntp_encode(hwrap)
+    let dwrap = ntp_decode(ewrap)
+    if dwrap["stratum"] != 0
+        print("FAIL A2 stratum wrap: got "+str(dwrap["stratum"])+" want 0 (256 & 0xFF)")
+        exit(1)
+    if dwrap["poll"] != 7
+        print("FAIL A2 poll cross-contamination: got "+str(dwrap["poll"]))
+        exit(1)
+    if dwrap["precision"] != 9
+        print("FAIL A2 precision cross-contamination: got "+str(dwrap["precision"]))
+        exit(1)
+
+    // ── A3: flags byte all-ones — li/vn/mode extraction must mask correctly
+    //    (0xFF -> li=3,vn=7,mode=7) ──────────────────────────────────────────
+    let hflags = {"li": 3, "vn": 7, "mode": 7}
+    let eflags = ntp_encode(hflags)
+    let b0 = bytes_get(eflags, 0)
+    if b0 != 0xFF
+        print("FAIL A3 flags byte: got "+str(b0)+" want 255")
+        exit(1)
+    let dflags = ntp_decode(eflags)
+    if dflags["li"] != 3
+        print("FAIL A3 li: got "+str(dflags["li"]))
+        exit(1)
+    if dflags["vn"] != 7
+        print("FAIL A3 vn: got "+str(dflags["vn"]))
+        exit(1)
+    if dflags["mode"] != 7
+        print("FAIL A3 mode: got "+str(dflags["mode"]))
+        exit(1)
+
+    // ── A4: negative poll/precision (real-world NTP precision e.g. -20) —
+    //    two's-complement byte packing must be correct (-20 & 0xFF = 0xEC) ───
+    let hneg = {"li": 0, "vn": 4, "mode": 4, "poll": 0 - 20, "precision": 0 - 6}
+    let eneg = ntp_encode(hneg)
+    let pb = bytes_get(eneg, 2)
+    if pb != 0xEC
+        print("FAIL A4 poll byte: got "+str(pb)+" want 236 (0xEC, -20 two's complement)")
+        exit(1)
+    let prb = bytes_get(eneg, 3)
+    if prb != 0xFA
+        print("FAIL A4 precision byte: got "+str(prb)+" want 250 (0xFA, -6 two's complement)")
+        exit(1)
+
+    // ── A5: no over-read / no frame injection — a buffer LONGER than 48 bytes
+    //    (trailing garbage that could look like a second frame) must still
+    //    decode ONLY the first 48 bytes, ignore the rest ───────────────────
+    let base = ntp_request()
+    let padded = base
+    let pi = 0
+    while pi < 100
+        padded = bytes_append(padded, 0xAA)
+        pi = pi + 1
+    let plen = bytes_len(padded)
+    if plen != 148
+        print("FAIL A5 padded length: got "+str(plen))
+        exit(1)
+    let pparsed = ntp_parse(padded)
+    if pparsed["ok"] != 1
+        print("FAIL A5 padded parse ok: got "+str(pparsed["ok"]))
+        exit(1)
+    if pparsed["mode"] != 3
+        print("FAIL A5 padded mode (trailing garbage leaked in): got "+str(pparsed["mode"]))
+        exit(1)
+    // reference_id must be 0 (from the original 48-byte request), not
+    // polluted by the 0xAA padding bytes.
+    if pparsed["reference_id"] != 0
+        print("FAIL A5 padded reference_id polluted: got "+str(pparsed["reference_id"]))
+        exit(1)
+
+    // ── A6: boundary just under the minimum — 47 bytes of non-zero content
+    //    must still be rejected purely on length, not content ────────────────
+    let b47 = bytes(47)
+    let bi = 0
+    while bi < 47
+        bytes_set(b47, bi, 0xFF)
+        bi = bi + 1
+    let p47 = ntp_parse(b47)
+    if p47["ok"] != 0
+        print("FAIL A6: 47-byte non-zero buffer must return ok=0, got "+str(p47["ok"]))
+        exit(1)
+
+    // ── A7: NTP epoch clamp exact boundary (u32 max), off-by-one both sides ──
+    let boundary_unix = 4294967295 - 2208988800
+    let at_max = ntp_epoch_unix_to_ntp(boundary_unix)
+    if at_max != 4294967295
+        print("FAIL A7 at-max: got "+str(at_max)+" want 4294967295")
+        exit(1)
+    let over_max = ntp_epoch_unix_to_ntp(boundary_unix + 1)
+    if over_max != 4294967295
+        print("FAIL A7 over-max clamp: got "+str(over_max)+" want 4294967295 (clamped)")
+        exit(1)
+    let under_zero = ntp_epoch_unix_to_ntp(0 - 2208988801)
+    if under_zero != 0
+        print("FAIL A7 under-zero clamp: got "+str(under_zero)+" want 0")
+        exit(1)
+    let at_zero = ntp_epoch_unix_to_ntp(0 - 2208988800)
+    if at_zero != 0
+        print("FAIL A7 at-zero boundary: got "+str(at_zero)+" want 0")
+        exit(1)
+
+    // ── A8: fraction exactly 1.0 must clamp strictly below scale, never wrap
+    //    to 0 (would silently corrupt a timestamp to "no fraction") ──────────
+    let frac_one = ntp_frac_from_seconds(1.0)
+    if frac_one == 0
+        print("FAIL A8: frac(1.0) wrapped to 0")
+        exit(1)
+    if frac_one >= 4294967296
+        print("FAIL A8: frac(1.0) not clamped below scale: got "+str(frac_one))
+        exit(1)
+
+    // ── A9: bytes(0) / truly empty buffer via ntp_decode directly (not just
+    //    the wrapper) — must return an empty dict, never crash ──────────────
+    let empty_direct = ntp_decode(bytes(0))
+    if len(empty_direct) != 0
+        print("FAIL A9: ntp_decode(empty) should return empty dict got len="+str(len(empty_direct)))
+        exit(1)
+
+    // ── A10: root_dispersion / root_delay independent — writing max to one
+    //    must not bleed into the other (adjacent 4-byte field boundary) ──────
+    let hbleed = {"root_delay": 0xFFFFFFFF, "root_dispersion": 0}
+    let ebleed = ntp_encode(hbleed)
+    let dbleed = ntp_decode(ebleed)
+    if dbleed["root_dispersion"] != 0
+        print("FAIL A10 bleed: root_dispersion got "+str(dbleed["root_dispersion"])+" want 0")
+        exit(1)
+    if dbleed["reference_id"] != 0
+        print("FAIL A10 bleed: reference_id got "+str(dbleed["reference_id"])+" want 0")
+        exit(1)
+
+    print("PASS _ntp_adversary_probe")

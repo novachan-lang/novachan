@@ -1,0 +1,195 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ntp
+// ============================================================================
+// NTP/SNTP (RFC 5905) client-facing helpers: epoch conversion, fraction
+// conversion, and ready-to-send/ready-to-parse packet builders.
+//
+// The raw 48-byte wire codec (bit-exact flags packing, bounds-checked
+// decode) already exists in std/net/ntppkt — this module REUSES it rather
+// than re-implementing the byte layout. This module adds the pieces the
+// low-level codec deliberately leaves out: Unix<->NTP epoch conversion,
+// NTP fraction<->fractional-seconds conversion, and convenience builders/
+// parsers for the common client-request / server-response flow.
+//
+// Wire format (delegated to std/net/ntppkt, RFC 5905 Figure 8):
+//   Byte 0     : LI(2 bits) | VN(3 bits) | Mode(3 bits)
+//                Client request: LI=0, VN=4, Mode=3 -> 0x23
+//                Server reply:                 Mode=4
+//   Byte 1     : Stratum
+//   Byte 2     : Poll     (signed log2-seconds exponent, stored raw)
+//   Byte 3     : Precision(signed log2-seconds exponent, stored raw)
+//   Bytes 4-7  : Root Delay      (u32 BE, 16.16 fixed point)
+//   Bytes 8-11 : Root Dispersion (u32 BE, 16.16 fixed point)
+//   Bytes 12-15: Reference ID    (u32 BE)
+//   Bytes 16-23: Reference  Timestamp (u32 seconds BE + u32 fraction BE)
+//   Bytes 24-31: Originate  Timestamp (u32 seconds BE + u32 fraction BE)
+//   Bytes 32-39: Receive    Timestamp (u32 seconds BE + u32 fraction BE)
+//   Bytes 40-47: Transmit   Timestamp (u32 seconds BE + u32 fraction BE)
+//
+// NTP timestamps count seconds since 1900-01-01 00:00:00 UTC (the "NTP
+// epoch"). Unix time counts seconds since 1970-01-01 00:00:00 UTC. The
+// NTP epoch is exactly 2208988800 seconds before the Unix epoch (RFC 5905
+// §6, Table 1 note): ntp_seconds = unix_seconds + 2208988800.
+//
+// PUBLIC API:
+//   ntp_epoch_unix_to_ntp(unix_sec: int) -> int
+//     Unix epoch seconds -> NTP epoch seconds. Clamped to the u32 range
+//     [0, 4294967295] (defensive: never emits a field that would silently
+//     wrap when written to the 32-bit wire slot).
+//
+//   ntp_epoch_ntp_to_unix(ntp_sec: int) -> int
+//     NTP epoch seconds -> Unix epoch seconds. May be negative (dates
+//     before 1970-01-01 are valid, representable Unix timestamps).
+//
+//   ntp_frac_from_seconds(frac_seconds: float) -> int
+//     Fractional seconds in [0.0, 1.0) -> 32-bit NTP fraction field.
+//     Input is clamped to [0.0, 1.0) first (defensive against caller
+//     passing a whole+fraction value or a negative number by mistake).
+//
+//   ntp_frac_to_seconds(frac: int) -> float
+//     32-bit NTP fraction field -> fractional seconds in [0.0, 1.0).
+//     Input is masked to 32 bits first (defensive against garbage/negative
+//     input — never produces an out-of-range float).
+//
+//   ntp_request() -> bytes
+//     Canonical 48-byte SNTP client request: LI=0, VN=4, Mode=3 (0x23),
+//     every other field zero. Byte-identical to RFC 5905's minimal client
+//     request.
+//
+//   ntp_request_at(unix_sec: int) -> bytes
+//     Same as ntp_request() but with the Transmit Timestamp field set to
+//     the given Unix time (fraction = 0). Useful for round-trip/offset
+//     tests where the client stamps its own send time.
+//
+//   ntp_parse(b: bytes) -> dict
+//     Safe, bounds-checked parse of any 48-byte NTP packet (request or
+//     reply). Returns {"ok": 0} in-band (never crashes, never exits) if
+//     b is shorter than 48 bytes — no read is ever attempted past a short
+//     buffer. On success returns {"ok": 1, "li", "vn", "mode", "stratum",
+//     "poll", "precision", "root_delay", "root_dispersion", "reference_id",
+//     "ref_sec","ref_frac","ref_unix", "org_sec","org_frac","org_unix",
+//     "rx_sec","rx_frac","rx_unix", "tx_sec","tx_frac","tx_unix"} where the
+//     "*_unix" keys are the corresponding timestamp converted to Unix
+//     epoch seconds (integer part only; via ntp_epoch_ntp_to_unix).
+//
+// REUSES: std/net/ntppkt (ntp_encode / ntp_decode — the bit-exact 48-byte
+// wire codec). Does NOT re-implement flag packing or field layout.
+// ============================================================================
+
+import std/net/ntppkt
+
+// ── Constants ─────────────────────────────────────────────────────────────
+
+// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
+let _NTP_EPOCH_OFFSET = 2208988800
+
+// Largest value that fits in an unsigned 32-bit wire field.
+let _NTP_U32_MAX = 4294967295
+
+// 2^32 as a float — the NTP fraction field's implicit scale (1 unit = 1/2^32 s).
+fn _ntp_frac_scale() -> float
+    let v = 4294967296.0
+    v
+
+// ── Epoch conversion ─────────────────────────────────────────────────────────
+
+// ntp_epoch_unix_to_ntp(unix_sec) -> int
+// Convert Unix epoch seconds to NTP epoch seconds, clamped to the u32
+// wire range so callers can never accidentally emit a wrapped/negative
+// 32-bit seconds field.
+fn ntp_epoch_unix_to_ntp(unix_sec: int) -> int
+    let ntp_sec = unix_sec + _NTP_EPOCH_OFFSET
+    if ntp_sec < 0
+        return 0
+    if ntp_sec > _NTP_U32_MAX
+        return _NTP_U32_MAX
+    ntp_sec
+
+// ntp_epoch_ntp_to_unix(ntp_sec) -> int
+// Convert NTP epoch seconds back to Unix epoch seconds. The result MAY be
+// negative — Unix timestamps before 1970-01-01 are valid and meaningful
+// (e.g. an NTP seconds field of 0 correctly maps to -2208988800, the Unix
+// representation of 1900-01-01).
+fn ntp_epoch_ntp_to_unix(ntp_sec: int) -> int
+    ntp_sec - _NTP_EPOCH_OFFSET
+
+// ── Fraction conversion ───────────────────────────────────────────────────────
+
+// ntp_frac_from_seconds(frac_seconds) -> int
+// Convert a fractional-seconds value into the 32-bit NTP fraction field.
+// Clamps the input to [0.0, 1.0) first so a caller mistake (e.g. passing
+// the whole timestamp instead of just its fractional part, or a negative
+// value) can never overflow/underflow the 32-bit field.
+fn ntp_frac_from_seconds(frac_seconds: float) -> int
+    let f = frac_seconds
+    if f < 0.0
+        f = 0.0
+    if f >= 1.0
+        f = 1.0 - (1.0 / _ntp_frac_scale())
+    let scaled = f * _ntp_frac_scale()
+    let rounded = scaled + 0.5
+    let out = int(rounded)
+    if out < 0
+        out = 0
+    if out > _NTP_U32_MAX
+        out = _NTP_U32_MAX
+    out
+
+// ntp_frac_to_seconds(frac) -> float
+// Convert a 32-bit NTP fraction field into fractional seconds in
+// [0.0, 1.0). Masks to 32 bits first — defensive against a caller passing
+// a negative or out-of-range int (e.g. a raw sign-extended byte read).
+fn ntp_frac_to_seconds(frac: int) -> float
+    let m = frac & _NTP_U32_MAX
+    let mf = m * 1.0
+    let result = mf / _ntp_frac_scale()
+    result
+
+// ── Packet builders ───────────────────────────────────────────────────────────
+
+// ntp_request() -> bytes
+// Canonical 48-byte SNTP client request (RFC 5905): LI=0 (no warning),
+// VN=4 (NTPv4), Mode=3 (client) -> flags byte 0x23. Every other field
+// (stratum, poll, precision, root delay/dispersion, reference id, all
+// four timestamps) is zero, matching the minimal request a client sends
+// when it has no prior state.
+fn ntp_request() -> bytes
+    ntp_encode({"li": 0, "vn": 4, "mode": 3})
+
+// ntp_request_at(unix_sec) -> bytes
+// Same 48-byte client request as ntp_request(), but with the Transmit
+// Timestamp field stamped to the given Unix time (fraction = 0). This is
+// the timestamp a real client would record as "when I sent this request",
+// used later to compute round-trip delay from the server's reply.
+fn ntp_request_at(unix_sec: int) -> bytes
+    let tx_sec = ntp_epoch_unix_to_ntp(unix_sec)
+    ntp_encode({"li": 0, "vn": 4, "mode": 3, "tx_sec": tx_sec, "tx_frac": 0})
+
+// ── Packet parser ─────────────────────────────────────────────────────────────
+
+// ntp_parse(b) -> dict
+// Bounds-checked parse of a 48-byte NTP packet (request or reply). If b is
+// shorter than 48 bytes this NEVER reads past the buffer and NEVER exits —
+// it returns {"ok": 0} in-band so the caller decides how to handle a
+// truncated/malformed datagram (e.g. a spoofed or corrupted UDP reply).
+fn ntp_parse(b: bytes) -> dict
+    if bytes_len(b) < 48
+        return {"ok": 0}
+    let d = ntp_decode(b)
+    if len(d) == 0
+        return {"ok": 0}
+    let ref_sec = d["ref_sec"]
+    let org_sec = d["org_sec"]
+    let rx_sec  = d["rx_sec"]
+    let tx_sec  = d["tx_sec"]
+    {
+        "ok": 1,
+        "li": d["li"], "vn": d["vn"], "mode": d["mode"],
+        "stratum": d["stratum"], "poll": d["poll"], "precision": d["precision"],
+        "root_delay": d["root_delay"], "root_dispersion": d["root_dispersion"],
+        "reference_id": d["reference_id"],
+        "ref_sec": ref_sec, "ref_frac": d["ref_frac"], "ref_unix": ntp_epoch_ntp_to_unix(ref_sec),
+        "org_sec": org_sec, "org_frac": d["org_frac"], "org_unix": ntp_epoch_ntp_to_unix(org_sec),
+        "rx_sec": rx_sec, "rx_frac": d["rx_frac"], "rx_unix": ntp_epoch_ntp_to_unix(rx_sec),
+        "tx_sec": tx_sec, "tx_frac": d["tx_frac"], "tx_unix": ntp_epoch_ntp_to_unix(tx_sec)
+    }

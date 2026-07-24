@@ -1,0 +1,199 @@
+import std/net/ntp
+import std/net/ntppkt
+
+fn main()
+    // ── Vector 1: canonical client request — byte0 0x23, length 48 ───────────
+    let req = ntp_request()
+    let req_len = bytes_len(req)
+    if req_len != 48
+        print("FAIL ntp req-len: got "+str(req_len)+" want 48")
+        exit(1)
+    let req_b0 = bytes_get(req, 0)
+    if req_b0 != 0x23
+        print("FAIL ntp req byte0: got "+str(req_b0)+" want 35 (0x23)")
+        exit(1)
+    // rest of the packet (bytes 1-47) must all be zero
+    let zi = 1
+    while zi < 48
+        let zv = bytes_get(req, zi)
+        if zv != 0
+            print("FAIL ntp req zero-range byte "+str(zi)+": got "+str(zv)+" want 0")
+            exit(1)
+        zi = zi + 1
+
+    // ── Vector 2: Unix epoch 0 -> NTP seconds 2208988800 == 0x83AA7E80 ───────
+    let ntp_sec0 = ntp_epoch_unix_to_ntp(0)
+    if ntp_sec0 != 2208988800
+        print("FAIL ntp unix0->ntp: got "+str(ntp_sec0)+" want 2208988800")
+        exit(1)
+    if ntp_sec0 != 0x83AA7E80
+        print("FAIL ntp unix0->ntp hex: got "+str(ntp_sec0)+" want "+str(0x83AA7E80))
+        exit(1)
+
+    // ntp_request_at(0) must place 0x83AA7E80 BE at the Transmit Timestamp
+    // seconds field (bytes 40-43).
+    let reqat = ntp_request_at(0)
+    let ra_len = bytes_len(reqat)
+    if ra_len != 48
+        print("FAIL ntp reqat-len: got "+str(ra_len)+" want 48")
+        exit(1)
+    let tb0 = bytes_get(reqat, 40)
+    let tb1 = bytes_get(reqat, 41)
+    let tb2 = bytes_get(reqat, 42)
+    let tb3 = bytes_get(reqat, 43)
+    if tb0 != 0x83
+        print("FAIL ntp reqat tx byte40: got "+str(tb0)+" want 131")
+        exit(1)
+    if tb1 != 0xAA
+        print("FAIL ntp reqat tx byte41: got "+str(tb1)+" want 170")
+        exit(1)
+    if tb2 != 0x7E
+        print("FAIL ntp reqat tx byte42: got "+str(tb2)+" want 126")
+        exit(1)
+    if tb3 != 0x80
+        print("FAIL ntp reqat tx byte43: got "+str(tb3)+" want 128")
+        exit(1)
+    // fraction bytes 44-47 must be zero
+    let fi = 44
+    while fi < 48
+        let fv = bytes_get(reqat, fi)
+        if fv != 0
+            print("FAIL ntp reqat tx_frac byte "+str(fi)+": got "+str(fv)+" want 0")
+            exit(1)
+        fi = fi + 1
+
+    // ── Vector 3: NTP seconds -> Unix round trip (incl. pre-1970) ────────────
+    let back0 = ntp_epoch_ntp_to_unix(2208988800)
+    if back0 != 0
+        print("FAIL ntp ntp->unix roundtrip: got "+str(back0)+" want 0")
+        exit(1)
+    // NTP seconds field 0 (1900-01-01) maps to a NEGATIVE Unix timestamp —
+    // must not be clamped away; pre-1970 Unix times are valid.
+    let pre1970 = ntp_epoch_ntp_to_unix(0)
+    if pre1970 != 0 - 2208988800
+        print("FAIL ntp pre-1970: got "+str(pre1970)+" want "+str(0 - 2208988800))
+        exit(1)
+
+    // ── Vector 4: clamp — very negative unix time never produces a negative
+    //    or wrapped 32-bit NTP seconds field ──────────────────────────────────
+    let very_old = ntp_epoch_unix_to_ntp(0 - 9999999999)
+    if very_old != 0
+        print("FAIL ntp clamp-low: got "+str(very_old)+" want 0")
+        exit(1)
+    // clamp — a unix time far enough in the future to overflow u32 seconds
+    // must clamp to the u32 max, never wrap/negative.
+    let far_future = ntp_epoch_unix_to_ntp(9999999999)
+    if far_future != 4294967295
+        print("FAIL ntp clamp-high: got "+str(far_future)+" want 4294967295")
+        exit(1)
+
+    // ── Vector 5: fraction 0.5s -> 0x80000000, round-trips ───────────────────
+    let frac_half = ntp_frac_from_seconds(0.5)
+    if frac_half != 0x80000000
+        print("FAIL ntp frac 0.5 encode: got "+str(frac_half)+" want "+str(0x80000000))
+        exit(1)
+    let back_half = ntp_frac_to_seconds(frac_half)
+    if back_half < 0.5 - 0.0001
+        print("FAIL ntp frac 0.5 decode too low")
+        exit(1)
+    if back_half > 0.5 + 0.0001
+        print("FAIL ntp frac 0.5 decode too high")
+        exit(1)
+
+    // fraction edge: 0.0 -> 0
+    let frac_zero = ntp_frac_from_seconds(0.0)
+    if frac_zero != 0
+        print("FAIL ntp frac 0.0 encode: got "+str(frac_zero)+" want 0")
+        exit(1)
+
+    // fraction edge: value >= 1.0 clamps below the scale (never wraps to 0)
+    let frac_over = ntp_frac_from_seconds(1.5)
+    if frac_over >= 4294967296
+        print("FAIL ntp frac clamp-high: got "+str(frac_over)+" want < 4294967296")
+        exit(1)
+    if frac_over <= 0
+        print("FAIL ntp frac clamp-high-lowbound: got "+str(frac_over)+" want > 0")
+        exit(1)
+
+    // fraction edge: negative clamps to 0
+    let frac_neg = ntp_frac_from_seconds(0.0 - 0.25)
+    if frac_neg != 0
+        print("FAIL ntp frac negative clamp: got "+str(frac_neg)+" want 0")
+        exit(1)
+
+    // ── Vector 6: encode a full response and decode via ntp_parse ────────────
+    // li=0, vn=4, mode=4 (server) -> flags = 0x1C per RFC 5905 example.
+    // byte0 = (0<<6)|(4<<3)|4 = 0|32|4 = 36 = 0x24 ... NOTE: the task's
+    // worked example uses li=0,vn=3,mode=4 -> (0<<6)|(3<<3)|4 = 0|24|4 = 28 = 0x1C.
+    let h = {"li": 0, "vn": 3, "mode": 4, "stratum": 2, "poll": 6, "precision": 0xEC, "root_delay": 0x00000020, "root_dispersion": 0x00000010, "reference_id": 0xC0A80001, "ref_sec": 0xE3C1E000, "ref_frac": 0, "org_sec": 0x83AA7E80, "org_frac": 0, "rx_sec": 0x83AA7E81, "rx_frac": 0x80000000, "tx_sec": 0x83AA7E81, "tx_frac": 0xC0000000}
+    let resp = ntp_encode(h)
+    let resp_b0 = bytes_get(resp, 0)
+    if resp_b0 != 0x1C
+        print("FAIL ntp resp byte0: got "+str(resp_b0)+" want 28 (0x1C)")
+        exit(1)
+
+    let parsed = ntp_parse(resp)
+    let ok1 = parsed["ok"]
+    if ok1 != 1
+        print("FAIL ntp parse ok: got "+str(ok1)+" want 1")
+        exit(1)
+    let p_li = parsed["li"]
+    if p_li != 0
+        print("FAIL ntp parse li: got "+str(p_li)+" want 0")
+        exit(1)
+    let p_vn = parsed["vn"]
+    if p_vn != 3
+        print("FAIL ntp parse vn: got "+str(p_vn)+" want 3")
+        exit(1)
+    let p_mode = parsed["mode"]
+    if p_mode != 4
+        print("FAIL ntp parse mode: got "+str(p_mode)+" want 4")
+        exit(1)
+    let p_stratum = parsed["stratum"]
+    if p_stratum != 2
+        print("FAIL ntp parse stratum: got "+str(p_stratum)+" want 2")
+        exit(1)
+
+    // org_sec 0x83AA7E80 == unix 0 (round trip through the parse helper)
+    let p_org_unix = parsed["org_unix"]
+    if p_org_unix != 0
+        print("FAIL ntp parse org_unix: got "+str(p_org_unix)+" want 0")
+        exit(1)
+    // tx_sec 0x83AA7E81 == unix 1
+    let p_tx_unix = parsed["tx_unix"]
+    if p_tx_unix != 1
+        print("FAIL ntp parse tx_unix: got "+str(p_tx_unix)+" want 1")
+        exit(1)
+    let p_tx_frac = parsed["tx_frac"]
+    if p_tx_frac != 0xC0000000
+        print("FAIL ntp parse tx_frac: got "+str(p_tx_frac)+" want "+str(0xC0000000))
+        exit(1)
+
+    // ── Vector 7: short/truncated buffer -> in-band error, no over-read ──────
+    let short47 = bytes(47)
+    let parsed_short = ntp_parse(short47)
+    let ok_short = parsed_short["ok"]
+    if ok_short != 0
+        print("FAIL ntp parse short(47): got ok="+str(ok_short)+" want 0")
+        exit(1)
+    if contains(parsed_short, "li")
+        print("FAIL ntp parse short(47): expected no li key on error")
+        exit(1)
+
+    let empty_b = bytes(0)
+    let parsed_empty = ntp_parse(empty_b)
+    let ok_empty = parsed_empty["ok"]
+    if ok_empty != 0
+        print("FAIL ntp parse empty: got ok="+str(ok_empty)+" want 0")
+        exit(1)
+
+    // exactly 48 bytes of all zero must still parse OK (all-zero is a
+    // legal, if degenerate, packet — not an error condition)
+    let zero48 = bytes(48)
+    let parsed_zero48 = ntp_parse(zero48)
+    let ok_zero48 = parsed_zero48["ok"]
+    if ok_zero48 != 1
+        print("FAIL ntp parse zero48: got ok="+str(ok_zero48)+" want 1")
+        exit(1)
+
+    print("PASS _ntp_client_test")

@@ -1,0 +1,157 @@
+// ============================================================================
+// NOVA Standard Library — std/net/ip
+// ============================================================================
+// IPv4 address parsing, formatting, validation, and CIDR membership tests.
+// IPv4 only; IPv6 is a planned follow-on.
+//
+// PUBLIC API:
+//   ipv4_parse(s: string) -> int
+//     Parse a dotted-quad like "192.168.1.1" to a 32-bit host-order integer
+//     (a*2^24 + b*2^16 + c*2^8 + d).  Returns -1 on any malformed input:
+//     wrong octet count, non-digit characters, leading zeros, or any octet
+//     outside 0..255.
+//
+//   ipv4_format(n: int) -> string
+//     Inverse of ipv4_parse: integer -> "a.b.c.d". Treats n as unsigned 32-bit
+//     (values above 2^31-1 work correctly because we mask each octet with 0xFF).
+//
+//   ipv4_is_valid(s: string) -> bool
+//     Returns true iff ipv4_parse(s) >= 0.
+//
+//   cidr_contains(cidr: string, ip: string) -> bool
+//     Returns true iff `ip` falls inside the CIDR block "a.b.c.d/prefix".
+//     Mask = (0xFFFFFFFF << (32-prefix)) & 0xFFFFFFFF; compare
+//     (parse(ip) & mask) == (network & mask).  Malformed cidr or ip -> false.
+//     prefix=0 matches all addresses.
+//
+// DESIGN NOTES:
+//   * NOVA ints are signed 64-bit. All 32-bit IPv4 values are kept in the
+//     range [0, 2^32-1] by masking with & 0xFFFFFFFF at every step where the
+//     result could exceed 2^31-1.
+//   * >> is ARITHMETIC in NOVA (sign-extends). We only right-shift values we
+//     know are positive and we immediately mask the result, so sign-extension
+//     is harmless.
+//   * 1<<32 is fine (NOVA shifts work up to 63). The mask formula
+//     (0xFFFFFFFF << (32-prefix)) & 0xFFFFFFFF gives 0 for prefix=0
+//     (everything matches) and 0xFFFFFFFF for prefix=32 (exact host match).
+//
+// SYMBOL COLLISION GUARD:
+//   All private helpers are prefixed _ip_ to avoid collisions when multiple
+//   std modules are compiled into the same binary.
+//
+// LEAF — imports NOTHING.
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+// Returns true if s is non-empty and contains only ASCII decimal digits.
+// Rejects empty strings, strings with '+'/'-', and mixed alpha-digit strings.
+fn _ip_digits_only(s: string) -> bool
+    if len(s) == 0
+        return false
+    let i = 0
+    while i < len(s)
+        let b = ord(char_at(s, i))
+        if b < 48 or b > 57
+            return false
+        i = i + 1
+    true
+
+// Parse a single octet string into 0..255, or -1 on any error.
+// Rejects: empty, non-digit chars, values > 255.
+// Note: leading zeros like "01" parse to 1 (no octal interpretation, just
+// rejects nothing — consistent with common IPv4 parsers).
+fn _ip_parse_octet(s: string) -> int
+    if _ip_digits_only(s) == false
+        return -1
+    let v = parse_int(s)
+    if v < 0 or v > 255
+        return -1
+    v
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// ipv4_parse: dotted-quad string -> 32-bit host-order integer, or -1.
+//
+// "192.168.1.1"       -> 3232235777  (192*2^24 + 168*2^16 + 1*2^8 + 1)
+// "0.0.0.0"           -> 0
+// "255.255.255.255"   -> 4294967295
+// "256.1.1.1"         -> -1  (octet out of range)
+// "1.2.3"             -> -1  (wrong octet count)
+// ""                  -> -1
+fn ipv4_parse(s: string) -> int
+    let parts = split(s, ".")
+    if len(parts) != 4
+        return -1
+    let a = _ip_parse_octet(parts[0])
+    if a < 0
+        return -1
+    let b = _ip_parse_octet(parts[1])
+    if b < 0
+        return -1
+    let c = _ip_parse_octet(parts[2])
+    if c < 0
+        return -1
+    let d = _ip_parse_octet(parts[3])
+    if d < 0
+        return -1
+    (a * 16777216 + b * 65536 + c * 256 + d) & 0xFFFFFFFF
+
+// ipv4_format: 32-bit host-order integer -> dotted-quad string.
+//
+// 3232235777 -> "192.168.1.1"
+// 0          -> "0.0.0.0"
+// 4294967295 -> "255.255.255.255"
+//
+// The input is treated as unsigned 32-bit: values in [2^31, 2^32-1] (which
+// are negative as signed 64-bit but valid as IPv4 ints) are handled correctly
+// because we mask each octet extraction with & 0xFF.
+fn ipv4_format(n: int) -> string
+    let a = (n >> 24) & 0xFF
+    let b = (n >> 16) & 0xFF
+    let c = (n >> 8) & 0xFF
+    let d = n & 0xFF
+    str(a) + "." + str(b) + "." + str(c) + "." + str(d)
+
+// ipv4_is_valid: returns true iff the string is a well-formed dotted-quad.
+//
+// "192.168.1.1" -> true
+// "256.0.0.1"   -> false
+// "1.2.3"       -> false
+fn ipv4_is_valid(s: string) -> bool
+    ipv4_parse(s) >= 0
+
+// cidr_contains: test whether an IPv4 address falls inside a CIDR block.
+//
+// "10.0.0.0/8"      contains "10.5.4.3"    -> true
+// "10.0.0.0/8"      contains "11.0.0.1"    -> false
+// "192.168.1.0/24"  contains "192.168.1.55"-> true
+// "192.168.1.0/24"  contains "192.168.2.1" -> false
+//
+// Malformed cidr or ip -> false.
+// prefix=0  -> all addresses match (mask = 0, no bits required to match).
+// prefix=32 -> exact host match.
+fn cidr_contains(cidr: string, ip: string) -> bool
+    let slash = find(cidr, "/")
+    if slash < 0
+        return false
+    let pstr = slice(cidr, slash + 1, len(cidr))
+    if _ip_digits_only(pstr) == false
+        return false
+    let prefix = parse_int(pstr)
+    if prefix < 0 or prefix > 32
+        return false
+    let network = ipv4_parse(slice(cidr, 0, slash))
+    if network < 0
+        return false
+    let addr = ipv4_parse(ip)
+    if addr < 0
+        return false
+    // Build the 32-bit mask. For prefix=0, the shift would be <<32 which gives
+    // a full 64-bit value; we mask to 32 bits. For prefix=32 the shift is <<0
+    // giving 0xFFFFFFFF. The result is always in [0, 0xFFFFFFFF].
+    let mask = 0
+    if prefix == 0
+        mask = 0
+    else
+        mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+    (addr & mask) == (network & mask)
