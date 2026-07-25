@@ -15771,6 +15771,23 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                         if dest != ""
                             rt[dest] = "str"
                         return IrInst(op, dest, typ, args, "nova_rt_any_to_str", num, effect, line)
+                if value == "nova_rt_any_to_str" and len(args) == 1
+                    // String interpolation "{x}" lowers directly to any_to_str. A RAW scalar
+                    // (statically "float"/"bool", not boxed) read by any_to_str is misrendered:
+                    // a float's IEEE-754 bits print as an int ("{150.0}" -> 4639481672377565184),
+                    // a bool prints 1/0 instead of true/false. Specialize to the typed stringify
+                    // exactly as str() does (int_to_str -> float_to_str/bool_to_str above), at zero
+                    // alloc cost. A BOXED float/bool arrives typed "any" and correctly stays on the
+                    // any_to_str path (which handles NOVA_BOX_FLOAT / NOVA_BOX_BOOL itself).
+                    let a2s_type = ir_reg_type(rt, args[0])
+                    if a2s_type == "float"
+                        if dest != ""
+                            rt[dest] = "str"
+                        return IrInst(op, dest, typ, args, "nova_rt_float_to_str", num, effect, line)
+                    if a2s_type == "bool"
+                        if dest != ""
+                            rt[dest] = "str"
+                        return IrInst(op, dest, typ, args, "nova_rt_bool_to_str", num, effect, line)
                 if value == "nova_rt_to_float" and len(args) == 1
                     let f_arg_type = ir_reg_type(rt, args[0])
                     if f_arg_type == "float"
@@ -16214,7 +16231,7 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                 let handled = false
                 match ti
                     IrInst(op, dest, typ, args, value, num, effect, line) =>
-                        if op == "call" and contains(fpt, value) and len(args) > 0
+                        if op == "call" and contains(fpt, value) and len(args) > 0 and value != "nova_rt_format_one"
                             let pm = fpt[value]
                             let new_args = []
                             let ai = 0
@@ -16258,6 +16275,22 @@ fn ir_infer_block(rt: dict, st: dict, frt: dict, fpt: dict, block: IrBlock) -> I
                                 rt["@wbox@"] = bxc + 1
                                 push(new_insts, IrInst("call", bxr, ir_type_any(), [args[1]], "nova_rt_box_float", 0, "pure", line))
                                 push(new_insts, IrInst(op, dest, typ, [args[0], bxr], value, num, effect, line))
+                                handled = true
+                        else if op == "call" and value == "nova_rt_format_one" and len(args) == 2
+                            // Format-spec interpolation "{x:.2f}" -> format_one(val, spec) is an
+                            // `any`-widen point: format_one uses nova_is_likely_float(val), which is
+                            // box-tag-authoritative, so a RAW float (statically "float") is not
+                            // recognized and its double bits are cast as an int ("{150.0:.2f}" ->
+                            // 4639481672377565184.00). Box it so format_one unboxes a NOVA_BOX_FLOAT.
+                            // Guard on static "float" so an already-boxed `any` operand is not re-boxed.
+                            if ir_reg_type(rt, args[0]) == "float"
+                                let fbc = 0
+                                if contains(rt, "@wbox@")
+                                    fbc = rt["@wbox@"]
+                                let fbr = "%wbox" + str(fbc)
+                                rt["@wbox@"] = fbc + 1
+                                push(new_insts, IrInst("call", fbr, ir_type_any(), [args[0]], "nova_rt_box_float", 0, "pure", line))
+                                push(new_insts, IrInst(op, dest, typ, [fbr, args[1]], value, num, effect, line))
                                 handled = true
                         else if op == "dyn_call" and len(args) >= 1
                             // dyn_call args (after the closure/callee at [0]) are passed to a
