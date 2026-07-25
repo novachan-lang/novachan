@@ -1,7 +1,11 @@
-# PROJECT_STATE — the ONE live plan (read first, update every commit)
+# PROJECT_STATE — ⚠️ SUPERSEDED, see EXECUTION_STATE.md
 
-Governed by `OPERATING_MODEL.md`. Every other *_PLAN/*_STATE/*_ROADMAP/*_GAPS doc is REFERENCE or
-HISTORICAL — this is the single source of truth for "where are we and what's next."
+> **The master-plan live tracker is `NOVA_DESIGN/EXECUTION_STATE.md`** (the master plan designates it).
+> Read + tick THAT, not this. This file was a competing tracker created 2026-07-25 and drifted — it is
+> kept only as a snapshot of that session's work + the ledger audit. Do NOT update it going forward.
+
+---
+_(snapshot below — historical)_
 
 _Last updated: 2026-07-25._
 

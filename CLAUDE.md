@@ -13,8 +13,10 @@ The creator is a Java developer building this solo. The vision is real. The comm
 We lose time to drift, re-discovering stale state, and hopping tasks — not to hard problems. This is
 the fix, and it is not optional. Full detail: `NOVA_DESIGN/OPERATING_MODEL.md`.
 
-1. **Read `NOVA_DESIGN/PROJECT_STATE.md` first — it is the ONE live plan.** Every other
-   `*_PLAN`/`*_STATE`/`*_ROADMAP`/`*_GAPS` doc is reference/historical. Do NOT spawn new plan files.
+1. **Read `NOVA_DESIGN/EXECUTION_STATE.md` first — it is THE live tracker of master-plan position**
+   (the master plan `NOVA_MASTER_PLAN_2026_07_10.md` designates it: per-task status + "Current focus" =
+   where we are / last done / next). TICK it in the SAME commit as any work. Every other
+   `*_PLAN`/`*_STATE`/`*_ROADMAP`/`*_GAPS` doc (incl. PROJECT_STATE) is reference. Do NOT create competing trackers.
 2. **Verify before acting.** Grep the live code to confirm a task's status before starting — docs
    drift, code does not (this session: "160×C" was really 1.7×; 4 "missing" items were already done).
 3. **Execute the plan; don't deliberate.** Do the top dependency-unblocked item. Deliberate/ask the

@@ -23,11 +23,26 @@
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
 - Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
 
-## Current focus
-- **Stream 2 (ACTIVE — 30-task batch): JDK-scale `std/` breadth.** Goal ~200k+ lines; std/ barely started.
-  Marching genuine KAT-gated non-native-shadow modules; ONE full-CI arc per ~30 modules.
-- Stream 1 (parallel, sequential): **CORE_GAP 0.11 = ✅ DONE** (`bfc55fba`+`29e380c1`, re-verified). Next = **Wave B #6
-  MOVE-on-insert** (leak confirmed 2001, gated `_move6_insert_leak_test`; XL/UAF-prone — borrow-builtins must stay rc-inc).
+## Current focus — UPDATED 2026-07-25 (position reconciled; this file IS the master-plan tracker)
+**Where we are:** Phase 0-A soundness ✅ DONE. Stdlib breadth ✅ (std/ tree + 100-task campaign). Phase **0-C
+runtime/platform reach = the ACTIVE front** — recently landed: module non-scalar globals (GAP 5 `ccb70ba6`),
+Windows TLS server (`3c1f746d`), signals+file-perms (`2ce90c6d`), HTTP redirects+cookies (`e11935a3`), pkg
+lockfile (`dcd8fae8`), REPL fix (`2543df3c`). Also this session: OPERATING_MODEL + NOVA_LANGUAGE_FEATURES.md.
+
+**Last done:** #9 Windows TLS server (`3c1f746d`) — HTTPS on Windows, verified encrypted round-trip.
+
+**Next — the honest decision (strategic vs tactical):**
+- **STRATEGIC (the plan's real heart — LOCK-NOW, blocks frameworks):** **LOCK-4 sized/unsigned + f32/f16** (the
+  "#1 risk", unblocks 6 frameworks — the widest ABI/type change, do before the frameworks need it) · LOCK-5
+  safepoint preemption+kill · LOCK-7 constant-time crypto · LOCK-1 full `@mod__fn` mangling (detection done).
+- **TACTICAL 0-C leftovers:** ALPN server · FD_SETSIZE (Linux) · ARM fibers · TLS netpoller-for-concurrency.
+- **0-B RC completeness:** Wave-B #6/#7/#8 leaks — memory-SAFE, so lower urgency; UAF-adjacent = attended/supervised cycle.
+
+**RECOMMENDATION:** the plan's foundation-first doctrine says do the **LOCK-NOW** decisions before more breadth —
+**LOCK-4 sized numerics** is the highest-leverage next (most frameworks unblocked). Tactical 0-C items are useful
+but not the strategic bottleneck.
+
+*(historical) Stream 2 std/ breadth + Wave-B #6 were the prior focus.*
 
 ## Stream 1 — compiler/runtime (Opus) — status
 | Item | Phase | Tier | Status | Commit |
@@ -39,7 +54,7 @@
 | type_of() returned "int" for float/bool/null (can't discriminate scalars) | 0-A | C | ✅ DONE `38927788` (compile-time fold _eval_type_of for static types + runtime NOVA_MEM_BOX kind-check for any-boxed float/null; reconverged, both-mode 1531/0. RESIDUAL: any-bool stays "int" — bools stored raw in containers, low-sev) | 38927788 |
 | HOF float-ABI: typed-float arg to a fn-VALUE (dyn_call) transmitted RAW → misread as int (ap_f(dblf,3.5)=9.23e18) | 0-A | B | ✅ DONE `687f41d4` (box float args at dyn_call in ir_infer_block; reconverged gen5==gen6, both-mode 1530/0). This was the "int-from-list-elem→corrupt-float" (#1 braille) root; that + #9/#10 HOF reports resolved. Other ~8 fleet-reported "bugs" = FALSE ALARMS (repro-first triage, see [[project_codegen_bugs_from_stdlib_fleet]]) | 687f41d4 |
 | module-level `let X=<scalar literal>` read 0/"" inside fns | 0-A | A | ✅ DONE (scalar consts) via backend-agnostic AST pre-pass `inline_module_consts` — inlines int/float/str/bool module consts into reading fns (local-shadow-safe); reconverged | 1f141de9 |
-| module-level NON-scalar/non-literal/MUTABLE globals still per-fn copies | 0-A | B(XL) | ⬜ REMAINS (rarer) — true-globals `@nova_g_X` storage-model change in the active ire_line backend (SSA-style; deep) + keep cg/emit byte-identical. Workaround: init inside a fn. | |
+| module-level NON-scalar/non-literal/MUTABLE globals still per-fn copies | 0-A | B(XL) | ✅ DONE `ccb70ba6` (GAP 5) — self-contained top-level `let cache={}`/`[]`/`channel()` baked into the const-store (const_set prologue, const_get at every use — named fns/lambdas/nova_main); capture-exclusion fixed the green_scale_test N>1 race. Reconverged, both-mode 0-FAIL, N>1 clean. | ccb70ba6 |
 | ~~floor()/ceil() boxed-float corrupts layout~~ | 0-A | — | ❌ NOT A BUG — nova_rt_floor returns clean `(int64_t)floor(x)`, typed int. Agent misdiagnosed; float_to_int helped an unrelated float-slot issue. | |
 | multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ⬜ NEW (whole import yields 0 symbols; use single-line/if-chain; found via calendar) | |
 | trait-conformance sig type-check (LOCK-3) | 0-A | A | ✅ DONE (gen4-verified; reconverge at arc) | (batch 1) |
@@ -52,12 +67,19 @@
 | RC: push/closure/reassign leaks (MOVE-on-insert) | 0-B | A | ⬜ Wave-B #6 NEXT (leak CONFIRMED 2001; gated `_move6_insert_leak_test` 83650843; design=MOVE owned-temps only, borrow-builtins stay rc-inc=the 0.10 UAF) | |
 | RC cycle collector | 0-B | A(XL) | ⬜ | |
 | ARM aarch64 fibers | 0-C | B | ⬜ | |
-| N>1 per-carrier I/O | 0-C | B | ⬜ | |
-| ALPN + Windows TLS server | 0-C | B | ⬜ | |
-| FD_SETSIZE Linux guard | 0-C | B | ⬜ | |
-| safepoint preemption + kill (LOCK-5) | 0-C | A(XL) | ⬜ | |
-| constant-time `@ct` + `Secret<T>` (LOCK-7) | 0-C | A | ⬜ | |
-| module namespacing `@mod__fn` (LOCK-1) | ceil | A | ⬜ | |
+| N>1 per-carrier I/O | 0-C | B | 🔄 goal met via single-poller (S-a/S-b/S-c); literal per-carrier shard not done (see ledger #6 audit) | |
+| **Windows TLS server** (of "ALPN + Windows TLS server") | 0-C | B | ✅ DONE `3c1f746d` — SChannel server: PFX cert load (dyn crypt32) + INBOUND cred + AcceptSecurityContext handshake + encrypted I/O; `tls_connect_insecure` (curl -k). Verified encrypted round-trip (gate [CI 2e3]). FOLLOW-ON: netpoller integration for concurrent HTTPS (blocking I/O today = sequential). | 3c1f746d |
+| **ALPN server** (of "ALPN + Windows TLS server") | 0-C | B | ⬜ REMAINS — pass SEC_APPLICATION_PROTOCOLS into AcceptSecurityContext + query negotiated proto (client ALPN already done `69c74b27`). Low-leverage until an h2 server consumes it. | |
+| **S1 signal handling** (SIGINT/SIGTERM/SIGHUP) | 0-C | B | ✅ DONE `2ce90c6d` — shutdown already existed; added SIGHUP reload channel (`reload_requested`). | 2ce90c6d |
+| **S5 file perms/symlinks** (chmod/umask/symlink/readlink) | 0-C | B | ✅ DONE `2ce90c6d` — runtime builtins, POSIX-primary. KAT `_kat_perms`. | 2ce90c6d |
+| **S2 HTTP-client redirects+cookies** | 0-C(forge) | B | ✅ DONE `e11935a3`+ — http_get_follow (301/302/303/307/308 + relative-Location) + cookie jar (http_get_session). | e11935a3 |
+| **T-Pkg lockfile** (reproducible installs) | toolchain | B | ✅ DONE `dcd8fae8` — nova install honors+writes nova.lock. | dcd8fae8 |
+| **T-REPL** (broken by compiler relocation) | toolchain | B | ✅ FIXED+GATED `2543df3c` — stale runtime path repaired; `_test_repl.ps1` in CI. | 2543df3c |
+| FD_SETSIZE Linux guard | 0-C | B | ⬜ (Linux-only; can't verify on this Windows box) | |
+| safepoint preemption + kill (LOCK-5) | 0-C | A(XL) | ⬜ — STRATEGIC (blocks Mesh/Reactor) | |
+| constant-time `@ct` + `Secret<T>` (LOCK-7) | 0-C | A | ⬜ — STRATEGIC (Forge crypto already -O2-vulnerable) | |
+| sized/unsigned numerics + f32/f16 (LOCK-4) | ceil | A(XL) | ⬜ — **STRATEGIC #1 RISK** (unblocks 6 frameworks; widest ABI/type change) | |
+| module namespacing `@mod__fn` (LOCK-1) | ceil | A | 🔄 Phase-1 collision DETECTION done `724dad65` (two modules same-name → clear error); full mangling deferred (map in L11_NAMESPACING_MAP.md). | 724dad65 |
 | sized/unsigned numerics + f32 (LOCK-4) | ceil | A(XL) | ⬜ | |
 | annotations→codegen (LOCK-2) | ceil | A(XL) | ⬜ | |
 | macros/comptime | ceil | A(XL) | ⬜ | |

@@ -11,12 +11,15 @@ state accurate). Nothing below is optional; it is how we avoid wasting the one b
 ---
 
 ## 1. The single source of truth — kill the fragmentation
-- **`NOVA_DESIGN/PROJECT_STATE.md` is the ONE live plan.** It holds: the current campaign, the
-  dependency-ordered next items with VERIFIED status, and how features relate. Read it FIRST every
-  session. Update it in the SAME commit as any work. Nothing is "done" until it is reflected there.
-- **Every other `*_PLAN` / `*_STATE` / `*_ROADMAP` / `*_GAPS` doc is REFERENCE or HISTORICAL.** Do
-  not treat them as the live plan. Do not spawn a new plan file for a new idea — append to
-  PROJECT_STATE or link a focused design note that PROJECT_STATE points to. One entry point, always.
+- **`NOVA_DESIGN/EXECUTION_STATE.md` is THE live tracker of master-plan position** (the master plan
+  — `NOVA_MASTER_PLAN_2026_07_10.md` — designates it; it holds the per-task Stream-1/Stream-2 status +
+  "Current focus" = where we are / last done / next). **Read it FIRST every session; TICK it in the SAME
+  commit as any work.** Nothing is "done" until it is ticked there. This is the answer to "where are we
+  in the master plan." (A prior mistake: a second tracker `PROJECT_STATE.md` was spun up and drifted from
+  EXECUTION_STATE — DO NOT create competing trackers; EXECUTION_STATE is authoritative.)
+- **Every other `*_PLAN` / `*_STATE` / `*_ROADMAP` / `*_GAPS` doc is REFERENCE or HISTORICAL** (incl.
+  PROJECT_STATE.md, now a pointer to EXECUTION_STATE). Do not treat them as the live plan; do not spawn a
+  new plan file. The master plan doc is the strategy + the LOCK-NOW sequence; EXECUTION_STATE is the position.
 
 ## 2. State-First Protocol (anti-forget, anti-re-discovery) — MANDATORY every session
 1. Read PROJECT_STATE.md + this file.
