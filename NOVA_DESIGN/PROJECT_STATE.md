@@ -33,8 +33,11 @@ Forge framework. Remaining work is targeted gaps + ecosystem, not foundations.
 Verdicts from the 2026-07-25 fleet audit (18 agents against live code):
 
 **Do-now, bounded, verifiable on this Windows box:**
-- **#30 REPL** — mostly done; wire `_test_repl.ps1` into CI (gate-existing). Small. ← NEXT
-- (#26 pkg-manager lockfile — DONE, see above. Follow-on: transitive resolution + a registry = larger.)
+- **#16 HTTP-client redirects** — 3 bounded sub-cycles (redirect-follow, cookie jar, proxy). Needs a
+  loopback test. ← NEXT
+- (#26 pkg-lock — DONE. #30 REPL — DONE: verify-before-act found it was BROKEN, not gate-existing —
+  a stale `output/nova_runtime.c` link path from the compiler relocation; fixed with robust
+  resolution in `repl.nova` + wired `_test_repl.ps1` into nova_ci as gate `[CI 2e2/3]`.)
 - **#16 HTTP-client redirects** — 3 bounded sub-cycles (redirect-follow, cookie jar, proxy). Needs a
   loopback test.
 

@@ -65,6 +65,10 @@ Write-Host "`n[CI 2e/3] #30 interpreter gate (nova eval tree-walks expressions, 
 & .\_s30_eval_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2e (nova eval interpreter) ==="; exit 1 }
 
+Write-Host "`n[CI 2e2/3] #30 REPL gate (interactive shell compiles+links+runs a line end-to-end)..."
+& .\_test_repl.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2e2 (REPL end-to-end) ==="; exit 1 }
+
 Write-Host "`n[CI 2f/3] #31 heap-profiler gate (NOVA_HEAP_PROFILE per-tag breakdown)..."
 & .\_s31_heap_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2f (heap profiler) ==="; exit 1 }
