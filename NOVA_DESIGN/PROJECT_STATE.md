@@ -33,8 +33,10 @@ Forge framework. Remaining work is targeted gaps + ecosystem, not foundations.
 Verdicts from the 2026-07-25 fleet audit (18 agents against live code):
 
 **Do-now, bounded, verifiable on this Windows box:**
-- **#16 HTTP-client redirects** — 3 bounded sub-cycles (redirect-follow, cookie jar, proxy). Needs a
-  loopback test. ← NEXT
+- **#16 HTTP-client redirects** — sub-cycle 1 (redirect-FOLLOW) DONE: `http_get_follow(url, max)` +
+  `is_redirect` in forge/forge_http_client.nova (follows 301/302/303/307/308 via Location, budget
+  guard); KAT `_kat_http_redirect` (loopback 302→200). REMAINING: sub-cycle 2 cookie jar, sub-cycle 3
+  proxy/CONNECT, + relative-Location resolution. ← NEXT (sub-cycle 2)
 - (#26 pkg-lock — DONE. #30 REPL — DONE: verify-before-act found it was BROKEN, not gate-existing —
   a stale `output/nova_runtime.c` link path from the compiler relocation; fixed with robust
   resolution in `repl.nova` + wired `_test_repl.ps1` into nova_ci as gate `[CI 2e2/3]`.)

@@ -12,6 +12,13 @@
 // path (plaintext honours `timeout_ms`), and a bytes body for binary downloads.
 // ══════════════════════════════════════════════════════════════════════════════
 
+// forge_otel (pure payload construction, no I/O -- see forge_otel.nova) supplies the full OTLP
+// ExportTraceServiceRequest builder (kind/attributes/status/resource/scope). otlp_spans_json below is
+// the legacy simple-span entry point (trace_id/span_id/name/start_ns/end_ns only, no resource
+// attributes or instrumentation scope name) that this file's callers already use; it now rides
+// forge_otel instead of duplicating the resourceSpans/scopeSpans/spans JSON assembly.
+import forge_otel
+
 extern fn nova_rt_tls_upgrade(sock: int, host: string, verify: int) -> int
 extern fn nova_rt_tls_send_bytes(handle: int, b: bytes) -> int
 extern fn nova_rt_tls_recv_bytes(handle: int) -> bytes
@@ -210,6 +217,30 @@ fn http_get(url: string) -> Result<HttpResponse>
 fn http_get_h(url: string, headers: dict) -> Result<HttpResponse>
     http_request("GET", url, headers, "")
 
+// True for the redirect status codes that carry a Location header to follow.
+fn is_redirect(status: int) -> bool
+    status == 301 or status == 302 or status == 303 or status == 307 or status == 308
+
+// GET `url`, following up to `max` redirects (301/302/303/307/308 via Location) and returning the
+// FINAL response. Absolute Location URLs are followed as-is; relative-Location resolution + a cookie
+// jar are tracked follow-ons (#16 sub-cycles 2-3). Returns the first transport Err, or an Err once
+// the redirect budget is exhausted (loop guard against redirect cycles).
+fn http_get_follow(url: string, max: int) -> Result<HttpResponse>
+    let cur = url
+    let hops = 0
+    while hops <= max
+        match http_request("GET", cur, {}, "")
+            Ok(resp) =>
+                let loc = resp_header(resp, "location")
+                if is_redirect(resp.status) and len(loc) > 0
+                    cur = loc
+                    hops = hops + 1
+                else
+                    return ok(resp)
+            Err(e) =>
+                return err(e)
+    err("http_get_follow: exceeded {max} redirects starting at {url}")
+
 fn http_post(url: string, body: string) -> Result<HttpResponse>
     http_request("POST", url, {}, body)
 
@@ -323,30 +354,13 @@ fn sse_close(s)
 
 // ── OTLP span exporter (OTLP/HTTP) — rides the outbound client (D7r.3/obs) ─────────────────────────────
 // Export tracing spans to an OpenTelemetry collector over OTLP/HTTP (POST <endpoint>/v1/traces). Each span
-// is a dict {trace_id (hex), span_id (hex), name, start_ns, end_ns}. Built as the OTLP protobuf-JSON mapping
-// (resourceSpans -> scopeSpans -> spans) via json_stringify (correct escaping); nanos are strings (int64
-// precision). This is the egress behind "automatic OTel" -- the trace propagation now has somewhere to go.
+// is a dict {trace_id (hex), span_id (hex), name, start_ns, end_ns} -- the legacy simple shape; use
+// forge_otel.otel_export_request directly for kind/attributes/status/resource-attributes/scope-name.
+// Built as the OTLP protobuf-JSON mapping (resourceSpans -> scopeSpans -> spans) via forge_otel (which
+// uses json_stringify internally for correct escaping); nanos are strings (int64 precision). This is the
+// egress behind "automatic OTel" -- the trace propagation now has somewhere to go.
 fn otlp_spans_json(spans: list) -> string
-    let out = []
-    let i = 0
-    while i < len(spans)
-        let sp = spans[i]
-        let o = {}
-        o["traceId"] = sp["trace_id"]
-        o["spanId"] = sp["span_id"]
-        o["name"] = sp["name"]
-        o["kind"] = 2
-        o["startTimeUnixNano"] = str(sp["start_ns"])
-        o["endTimeUnixNano"] = str(sp["end_ns"])
-        push(out, o)
-        i = i + 1
-    let scope = {}
-    scope["spans"] = out
-    let rs = {}
-    rs["scopeSpans"] = [scope]
-    let root = {}
-    root["resourceSpans"] = [rs]
-    json_stringify(root)
+    forge_otel.otel_export_request(spans, {}, "")
 
 // POST the spans to an OTLP/HTTP collector. endpoint is the base (e.g. "http://localhost:4318"); the
 // standard traces path /v1/traces is appended. Returns the collector's HTTP response.
