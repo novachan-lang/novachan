@@ -77,7 +77,9 @@ $new_tests = @(
     '_s5_escape_canary',
     '_kwfield_test',
     '_fair_sleep_io',
-    '_kat_interp_float'
+    '_kat_interp_float',
+    '_kat_generic_annot',
+    '_kat_result_float'
 )
 
 # Phase 9 + domain stdlib modules (sorted_map, regex, crc32, math3d, ecs, etc.)
