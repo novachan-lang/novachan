@@ -19450,6 +19450,29 @@ int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) {
     return (int64_t)(uintptr_t)c;
 }
 
+/* nova_rt_tls_connect_insecure: like tls_connect but SKIPS server-cert validation
+   (SCH_CRED_MANUAL_CRED_VALIDATION) — the `curl -k` equivalent for self-signed / internal / dev
+   TLS servers. Insecure by design; use only on trusted networks or for testing. */
+int64_t nova_rt_tls_connect_insecure(int64_t host_val, int64_t port_val) {
+    const char* host = (const char*)(uintptr_t)host_val;
+    if (!host) return 0;
+    int64_t tcp = nova_rt_tcp_connect(host_val, port_val);
+    if (tcp <= 0) return 0;
+    NovaTlsConn* c = (NovaTlsConn*)calloc(1, sizeof(NovaTlsConn));
+    if (!c) { nova_rt_tcp_close(tcp); return 0; }
+    c->sock = (NOVA_SOCKET)tcp;
+    strncpy(c->host, host, sizeof(c->host) - 1);
+    SCHANNEL_CRED sc; memset(&sc, 0, sizeof(sc));
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;   /* skip auto-validation */
+    TimeStamp ts;
+    SECURITY_STATUS ss = AcquireCredentialsHandleA(NULL, (SEC_CHAR*)UNISP_NAME_A, SECPKG_CRED_OUTBOUND,
+                                                   NULL, &sc, NULL, NULL, &c->cred, &ts);
+    if (ss != SEC_E_OK) { nova_rt_tcp_close(tcp); free(c); return 0; }
+    if (!nova_tls_handshake(c)) { FreeCredentialsHandle(&c->cred); nova_rt_tcp_close(tcp); free(c); return 0; }
+    return (int64_t)(uintptr_t)c;
+}
+
 /* nova_rt_tls_connect_alpn: like tls_connect but offers ALPN protocols (comma-separated, e.g.
    "h2,http/1.1"). Query the negotiated protocol with nova_rt_tls_alpn. A malformed offer falls
    back to a plain (no-ALPN) handshake. This is the enabling primitive for h2/gRPC over TLS. */
@@ -19490,11 +19513,136 @@ int64_t nova_rt_tls_alpn(int64_t handle) {
 }
 
 /* Server-side TLS requires a certificate; not yet implemented (honest stub). */
-int64_t nova_rt_tls_listen(int64_t port_val, int64_t cert_path_val, int64_t key_path_val) {
-    (void)port_val; (void)cert_path_val; (void)key_path_val;
-    return 0; /* TLS server not implemented — needs cert provisioning */
+/* ── TLS SERVER (SChannel, #9) ─────────────────────────────────────────────────────────────────
+   Server-side TLS. crypt32.dll is loaded DYNAMICALLY (not linked — avoids adding -lcrypt32 to ~339
+   link sites) to import a server cert from a PFX; an INBOUND SChannel credential then drives the
+   AcceptSecurityContext handshake (inbound mirror of the client's InitializeSecurityContext loop).
+   cert_path = a .pfx file, key_path = its password ("" if none). crypt32 is kept loaded so the
+   duplicated cert context stays valid for the program lifetime. */
+typedef struct { NOVA_SOCKET lsock; CredHandle cred; PCCERT_CONTEXT cert; } NovaTlsServer;
+
+typedef HCERTSTORE (WINAPI *nova_PFXImportCertStore)(CRYPT_DATA_BLOB*, LPCWSTR, DWORD);
+typedef PCCERT_CONTEXT (WINAPI *nova_CertEnumCertificatesInStore)(HCERTSTORE, PCCERT_CONTEXT);
+typedef BOOL (WINAPI *nova_CertGetCertificateContextProperty)(PCCERT_CONTEXT, DWORD, void*, DWORD*);
+typedef PCCERT_CONTEXT (WINAPI *nova_CertDuplicateCertificateContext)(PCCERT_CONTEXT);
+typedef BOOL (WINAPI *nova_CertCloseStore)(HCERTSTORE, DWORD);
+
+static PCCERT_CONTEXT nova_load_server_cert(const char* pfx_path, const char* password) {
+    HMODULE crypt = LoadLibraryA("crypt32.dll");   /* kept loaded — cert context needs it alive */
+    if (!crypt) return NULL;
+    nova_PFXImportCertStore pPfx = (nova_PFXImportCertStore)(void*)GetProcAddress(crypt, "PFXImportCertStore");
+    nova_CertEnumCertificatesInStore pEnum = (nova_CertEnumCertificatesInStore)(void*)GetProcAddress(crypt, "CertEnumCertificatesInStore");
+    nova_CertGetCertificateContextProperty pProp = (nova_CertGetCertificateContextProperty)(void*)GetProcAddress(crypt, "CertGetCertificateContextProperty");
+    nova_CertDuplicateCertificateContext pDup = (nova_CertDuplicateCertificateContext)(void*)GetProcAddress(crypt, "CertDuplicateCertificateContext");
+    nova_CertCloseStore pClose = (nova_CertCloseStore)(void*)GetProcAddress(crypt, "CertCloseStore");
+    if (!pPfx || !pEnum || !pProp || !pDup || !pClose) return NULL;
+
+    FILE* f = fopen(pfx_path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 4*1024*1024) { fclose(f); return NULL; }
+    BYTE* buf = (BYTE*)malloc((size_t)sz);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, (size_t)sz, f); fclose(f);
+    if ((long)rd != (size_t)sz) { free(buf); return NULL; }
+
+    CRYPT_DATA_BLOB blob; blob.cbData = (DWORD)sz; blob.pbData = buf;
+    wchar_t wpass[512]; wpass[0] = 0;
+    if (password && *password) MultiByteToWideChar(CP_UTF8, 0, password, -1, wpass, 511);
+    HCERTSTORE store = pPfx(&blob, wpass, CRYPT_USER_KEYSET | CRYPT_EXPORTABLE);
+    memset(buf, 0, (size_t)sz); free(buf);   /* scrub PFX bytes from memory */
+    if (!store) return NULL;
+
+    PCCERT_CONTEXT found = NULL; PCCERT_CONTEXT it = NULL;
+    while ((it = pEnum(store, it)) != NULL) {
+        DWORD cb = 0;
+        if (pProp(it, CERT_KEY_PROV_INFO_PROP_ID, NULL, &cb)) { found = pDup(it); break; }
+    }
+    pClose(store, 0);
+    return found;
 }
-int64_t nova_rt_tls_accept(int64_t listen_handle) { (void)listen_handle; return 0; }
+
+int64_t nova_rt_tls_listen(int64_t port_val, int64_t cert_path_val, int64_t key_path_val) {
+    const char* pfx = (const char*)(uintptr_t)cert_path_val;
+    const char* pass = (const char*)(uintptr_t)key_path_val;
+    if (!pfx) { nova_set_error("tls_listen: null cert path"); return 0; }
+    PCCERT_CONTEXT cert = nova_load_server_cert(pfx, pass ? pass : "");
+    if (!cert) { nova_set_error("tls_listen: could not load server cert from PFX"); return 0; }
+
+    nova_wsa_init();   /* the server socket may be the process's first socket op (WSANOTINITIALISED otherwise) */
+    NOVA_SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) { nova_set_error("tls_listen: socket() failed"); return 0; }
+    BOOL yes = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((unsigned short)port_val);
+    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0) { NOVA_CLOSE_SOCKET(s); nova_set_error("tls_listen: bind failed"); return 0; }
+    if (listen(s, 16) != 0) { NOVA_CLOSE_SOCKET(s); nova_set_error("tls_listen: listen failed"); return 0; }
+
+    SCHANNEL_CRED sc; memset(&sc, 0, sizeof(sc));
+    sc.dwVersion = SCHANNEL_CRED_VERSION;
+    sc.cCreds = 1; sc.paCred = &cert;
+    NovaTlsServer* srv = (NovaTlsServer*)calloc(1, sizeof(NovaTlsServer));
+    if (!srv) { NOVA_CLOSE_SOCKET(s); nova_set_error("tls_listen: OOM"); return 0; }
+    TimeStamp ts;
+    SECURITY_STATUS ss = AcquireCredentialsHandleA(NULL, (SEC_CHAR*)UNISP_NAME_A, SECPKG_CRED_INBOUND,
+                                                   NULL, &sc, NULL, NULL, &srv->cred, &ts);
+    if (ss != SEC_E_OK) { NOVA_CLOSE_SOCKET(s); free(srv); nova_set_error("tls_listen: AcquireCredentialsHandle (inbound) failed"); return 0; }
+    srv->lsock = s; srv->cert = cert;
+    return (int64_t)(uintptr_t)srv;
+}
+
+/* Server handshake loop (inbound AcceptSecurityContext) — mirror of nova_tls_handshake. */
+static int nova_tls_server_handshake(NovaTlsConn* c, CredHandle* cred) {
+    SECURITY_STATUS ss;
+    DWORD flags = ASC_REQ_SEQUENCE_DETECT | ASC_REQ_REPLAY_DETECT |
+                  ASC_REQ_CONFIDENTIALITY | ASC_REQ_ALLOCATE_MEMORY | ASC_REQ_STREAM;
+    DWORD outFlags = 0; int first = 1;
+    c->enc_len = 0;
+    for (;;) {
+        int n = recv(c->sock, c->enc + c->enc_len, (int)(sizeof(c->enc) - c->enc_len), 0);
+        if (n <= 0) return 0;
+        c->enc_len += n;
+        SecBuffer inBuf[2];
+        inBuf[0].pvBuffer = c->enc; inBuf[0].cbBuffer = (DWORD)c->enc_len; inBuf[0].BufferType = SECBUFFER_TOKEN;
+        inBuf[1].pvBuffer = NULL;   inBuf[1].cbBuffer = 0;                 inBuf[1].BufferType = SECBUFFER_EMPTY;
+        SecBufferDesc inDesc; inDesc.ulVersion = SECBUFFER_VERSION; inDesc.cBuffers = 2; inDesc.pBuffers = inBuf;
+        SecBuffer outBuf; outBuf.pvBuffer = NULL; outBuf.BufferType = SECBUFFER_TOKEN; outBuf.cbBuffer = 0;
+        SecBufferDesc outDesc; outDesc.ulVersion = SECBUFFER_VERSION; outDesc.cBuffers = 1; outDesc.pBuffers = &outBuf;
+        ss = AcceptSecurityContext(cred, first ? NULL : &c->ctxt, &inDesc, flags, 0,
+                                   &c->ctxt, &outDesc, &outFlags, NULL);
+        first = 0;
+        if (ss == SEC_E_INCOMPLETE_MESSAGE) continue;
+        if (outBuf.cbBuffer && outBuf.pvBuffer) {
+            nova_tls_send_all_sock(c->sock, (char*)outBuf.pvBuffer, (int)outBuf.cbBuffer);
+            FreeContextBuffer(outBuf.pvBuffer);
+        }
+        if (inBuf[1].BufferType == SECBUFFER_EXTRA && inBuf[1].cbBuffer > 0) {
+            memmove(c->enc, c->enc + (c->enc_len - (int)inBuf[1].cbBuffer), inBuf[1].cbBuffer);
+            c->enc_len = (int)inBuf[1].cbBuffer;
+        } else { c->enc_len = 0; }
+        if (ss == SEC_E_OK) break;
+        if (ss == SEC_I_CONTINUE_NEEDED) continue;
+        if (FAILED(ss)) return 0;
+    }
+    if (QueryContextAttributesA(&c->ctxt, SECPKG_ATTR_STREAM_SIZES, &c->sizes) != SEC_E_OK) return 0;
+    c->handshook = 1;
+    return 1;
+}
+
+int64_t nova_rt_tls_accept(int64_t listen_handle) {
+    NovaTlsServer* srv = (NovaTlsServer*)(uintptr_t)listen_handle;
+    if (!srv) return 0;
+    NOVA_SOCKET cs = accept(srv->lsock, NULL, NULL);
+    if (cs == INVALID_SOCKET) { nova_set_error("tls_accept: accept() failed"); return 0; }
+    NovaTlsConn* c = (NovaTlsConn*)calloc(1, sizeof(NovaTlsConn));   /* c->cred stays zeroed; srv owns the cred */
+    if (!c) { NOVA_CLOSE_SOCKET(cs); return 0; }
+    c->sock = cs;
+    if (!nova_tls_server_handshake(c, &srv->cred)) {
+        NOVA_CLOSE_SOCKET(cs); free(c); nova_set_error("tls_accept: TLS handshake failed"); return 0;
+    }
+    return (int64_t)(uintptr_t)c;
+}
 
 /* nova_rt_tls_send: encrypt + send one TLS record. Returns plaintext bytes sent. */
 int64_t nova_rt_tls_send(int64_t handle, int64_t data_val) {
@@ -19777,6 +19925,11 @@ int64_t nova_rt_tls_connect(int64_t host_val, int64_t port_val) {
     if (!C) { SSL_free(ssl); SSL_CTX_free(ctx); NOVA_CLOSE_SOCKET((NOVA_SOCKET)fd); return 0; }
     C->fd = (int)fd; C->ssl = ssl; C->ctx = ctx; C->own_ctx = 1;
     return (int64_t)(uintptr_t)C;
+}
+
+/* OpenSSL tls_connect already does NO peer verification (see above), so insecure == the same. */
+int64_t nova_rt_tls_connect_insecure(int64_t host_val, int64_t port_val) {
+    return nova_rt_tls_connect(host_val, port_val);
 }
 
 /* nova_rt_tls_connect_alpn (OpenSSL): like tls_connect but offers ALPN protocols (comma-separated,

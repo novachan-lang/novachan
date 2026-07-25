@@ -47,7 +47,16 @@ Verdicts from the 2026-07-25 fleet audit (18 agents against live code):
 efforts (below) — each a focused multi-hour deliverable, not a quick win. Do them one focused push at
 a time to the FULL-ARC gate; do NOT fragment/rush (esp. crypto).
 
-**#9 Windows TLS server — NEXT focused push (highest value, verifiable on Windows).** Precise scope
+**#9 Windows TLS server — ✅ DONE (verified end-to-end).** NOVA can now serve HTTPS on Windows:
+`nova_load_server_cert` (PFX via dynamically-loaded crypt32), `tls_listen` (INBOUND SChannel credential),
+`tls_accept` + `AcceptSecurityContext` handshake, encrypted `tls_recv/send`. Bonus: `tls_connect_insecure`
+(the `curl -k` equivalent; Win skips validation, Linux already did). Gate `[CI 2e3]` `_test_tls_server.ps1`
+= self-signed PFX → NOVA server → .NET TLS client → encrypted round-trip (TLS_SERVER_OK). Reconverged +
+both-mode green. FOLLOW-ON: the server uses BLOCKING sockets, so it's sequential (one connection at a
+time) and would starve a co-located green task — netpoller integration (mirror http_accept's non-blocking
++ yield) is needed for high-concurrency HTTPS. A dedicated sequential TLS server works today.
+
+(historical scope, now done) Precise scope
 (one cohesive deliverable): (1) `nova_load_server_cert(pfx_path, password)` -> PCCERT_CONTEXT via
 PFXImportCertStore + find-cert-with-private-key; (2) `tls_listen(port, pfx, pass)` -> listen socket +
 AcquireCredentialsHandle SECPKG_CRED_INBOUND with the cert (mirror the client at nova_runtime.c:19436

@@ -69,6 +69,10 @@ Write-Host "`n[CI 2e2/3] #30 REPL gate (interactive shell compiles+links+runs a 
 & .\_test_repl.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2e2 (REPL end-to-end) ==="; exit 1 }
 
+Write-Host "`n[CI 2e3/3] #9 Windows TLS server gate (SChannel server: PFX cert + inbound handshake + encrypted round-trip via a .NET TLS client)..."
+& .\_test_tls_server.ps1
+if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2e3 (TLS server round-trip) ==="; exit 1 }
+
 Write-Host "`n[CI 2f/3] #31 heap-profiler gate (NOVA_HEAP_PROFILE per-tag breakdown)..."
 & .\_s31_heap_check.ps1
 if ($LASTEXITCODE -ne 0) { Write-Host "`n=== CI FAILED at stage 2f (heap profiler) ==="; exit 1 }
