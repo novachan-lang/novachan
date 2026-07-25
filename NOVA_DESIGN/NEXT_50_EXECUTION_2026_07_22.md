@@ -40,6 +40,16 @@ runtime soundness bug: **nova_rt_eq string branch `strcmp`s a large-int operand 
 (CVE-class; exact one-branch fix recorded in memory `project-20day-sprint-execution-model`) — batch into the
 next reconverge with the `if cond then <stmt>` one-line sugar.
 
+**★★★★★ GAP 5 CLOSED (2026-07-25) — MODULE-LEVEL NON-SCALAR STORAGE `ccb70ba6`:** a top-level
+`let cache = {}` / `[...]` / `channel()` is now ONE shared instance that NAMED FUNCTIONS read +
+mutate (was a zero-init per-fn copy). Bakes a SELF-CONTAINED non-scalar top-level init into the
+const-store (built once in the nova_main prologue; every use loads the shared handle via const_get).
+The const-store shortcut RACED green_scale_test before — root cause found: a spawned closure CAPTURED
+the baked var, slot_load'd a non-existent slot (garbage), and make_closure ref-counted it → hang;
+FIX = exclude baked vars from filter_captures. Gated: reconverge gen5==gen6, both-mode 0 FAIL, N>1
+clean @ 4/8 carriers (the race), perf C-level. See memory `project-module-level-storage`. REMAINING
+XL gap: L11 module namespacing (#32).
+
 **★★★★ ROOT-GAP CLOSING NIGHT (2026-07-25):** 4 root compiler gaps closed, all reconverged + both-mode green:
 `3d63b8b1` bare Result/Option -> polymorphic sum (#1, made the high-level toolkit DEEP); `84ba7ed7` match on
 any-typed/module Option maps Some/None -> sum tag (imported Option no longer crashes); `8bf0041a` hygienic
