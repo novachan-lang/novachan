@@ -43,9 +43,25 @@ Verdicts from the 2026-07-25 fleet audit (18 agents against live code):
 - **#16 HTTP-client redirects** — 3 bounded sub-cycles (redirect-follow, cookie jar, proxy). Needs a
   loopback test.
 
-**Do-now, high-value, but NOT self-verifiable here (Linux/ARM/OpenSSL runtime):**
-- **#9 Windows TLS server** — SChannel server handshake; HTTPS on the dev's own OS. Verifiable on
-  Windows, large.
+**Bounded quick-wins: ALL MARCHED this session** (#12/#18/#26/#30/#16). Remaining = large cohesive
+efforts (below) — each a focused multi-hour deliverable, not a quick win. Do them one focused push at
+a time to the FULL-ARC gate; do NOT fragment/rush (esp. crypto).
+
+**#9 Windows TLS server — NEXT focused push (highest value, verifiable on Windows).** Precise scope
+(one cohesive deliverable): (1) `nova_load_server_cert(pfx_path, password)` -> PCCERT_CONTEXT via
+PFXImportCertStore + find-cert-with-private-key; (2) `tls_listen(port, pfx, pass)` -> listen socket +
+AcquireCredentialsHandle SECPKG_CRED_INBOUND with the cert (mirror the client at nova_runtime.c:19436
+but INBOUND + paCred); (3) `tls_accept` -> accept TCP + server AcceptSecurityContext handshake loop
+(server variant of nova_tls_handshake); (4) reuse tls_send/recv (context-based); (5) integration test:
+PowerShell New-SelfSignedCertificate -> Export-PfxCertificate, spawn NOVA TLS server, tls_connect
+client, verify a byte round-trips. RED arc (runtime C -> reconverge + both-mode + ASAN).
+**CRITICAL DESIGN (verified 2026-07-25):** the cert APIs (PFXImportCertStore, CertEnumCertificatesInStore,
+CertGetCertificateContextProperty, CertDuplicateCertificateContext, CertCloseStore, CertFreeCertificateContext)
+live in crypt32.lib, which is NOT linked at ANY of the ~339 link sites (all link -lws2_32/-ladvapi32/
+-lkernel32 only). DO NOT add -lcrypt32 (339-site cross-cutting change) — instead LoadLibrary("crypt32.dll")
++ GetProcAddress the ~6 cert fns at tls_listen time, keeping #9 a SELF-CONTAINED nova_runtime.c change
+(zero build-script edits). Server conn's NovaTlsConn.cred stays zeroed (srv owns the INBOUND cred) — check
+tls_close handles a zeroed CredHandle. Handshake mirror = nova_tls_handshake @19349 but AcceptSecurityContextA.
 - **#10 Linux epoll wiring** — CVE-class select() FD_SETSIZE stack corruption; the epoll poller is
   already built, needs wiring into the default path. Linux-only to verify.
 - **#5 ARM/aarch64 fiber asm** — ~30-40 lines naked asm; can't execute aarch64 here.
