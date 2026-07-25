@@ -19,8 +19,8 @@ Forge framework. Remaining work is targeted gaps + ecosystem, not foundations.
   capture-exclusion. Memory: `project-module-level-storage`.
 - **L11 Phase 1 collision detection** (`724dad65`) — two modules exporting the same name → clear
   error (namespace now SOUND). Full mangling (Phase 2) DEFERRED, low ROI; map in `L11_NAMESPACING_MAP.md`.
-- **#12 signal SIGHUP-reload** + **#18 file perms/symlinks** (chmod/umask/symlink/readlink) — CI
-  gating (commit pending green).
+- **#12 signal SIGHUP-reload** + **#18 file perms/symlinks** (chmod/umask/symlink/readlink) — DONE,
+  gated (reconverge + both-mode + N>1 all green). KATs `_kat_signals` / `_kat_perms`.
 - Perf ground-truth: float arrays are **~1.7×C** (not the stale "160×"); closing to 1.0×C is a
   foundational effort (SSA repr tracking) — parked deliberately.
 

@@ -8158,8 +8158,21 @@ static void nova_file_ensure_init(void);   /* defined in the file-handle section
 #include <signal.h>
 #endif
 static volatile sig_atomic_t nova_shutdown_flag = 0;
+/* SIGHUP is the daemon "reload config" convention (nginx et al.) -- a DISTINCT, re-armable signal, NOT
+   shutdown. Kept separate so a service can reload on SIGHUP while still draining on SIGINT/SIGTERM.
+   POSIX-only (Windows has no SIGHUP); the flag simply never sets there. */
+static volatile sig_atomic_t nova_reload_flag = 0;
 static void nova_signal_handler(int sig) {
+#ifdef SIGHUP
+    if (sig == SIGHUP) {
+        nova_reload_flag = 1;                  /* SIGHUP -> reload request (re-armable; not a shutdown) */
+        static const char rm[] = "\nlevel=INFO event=reload detail=\"SIGHUP received; reload requested\"\n";
+        { ssize_t _w = write(2, rm, sizeof(rm) - 1); (void)_w; }
+        return;
+    }
+#else
     (void)sig;
+#endif
     if (nova_shutdown_flag) { _exit(130); }   /* 2nd signal -> forceful exit (stays killable) */
     nova_shutdown_flag = 1;                    /* 1st signal -> request graceful drain */
     static const char m[] = "\nlevel=WARN event=shutdown detail=\"signal received; draining (signal again to force quit)\"\n";
@@ -8172,10 +8185,19 @@ static void nova_signal_handler(int sig) {
 static void nova_install_signal_handlers(void) {
     signal(SIGINT, nova_signal_handler);
     signal(SIGTERM, nova_signal_handler);
+#ifdef SIGHUP
+    signal(SIGHUP, nova_signal_handler);       /* reload channel, distinct from shutdown */
+#endif
 }
 /* user-facing builtin: 1 once a shutdown signal has arrived. Poll it in server/accept/event loops to break
    out and drain (close connections, finish in-flight work) instead of being hard-killed. */
 int64_t nova_rt_shutdown_requested(void) { return nova_shutdown_flag ? 1 : 0; }
+/* user-facing builtin: 1 once since the last poll a SIGHUP has arrived; CONSUMES it (re-armable) so a
+   reload loop handles each SIGHUP exactly once and a later SIGHUP re-triggers. Always 0 on Windows/wasm. */
+int64_t nova_rt_reload_requested(void) {
+    if (nova_reload_flag) { nova_reload_flag = 0; return 1; }
+    return 0;
+}
 
 void nova_rt_init(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -13748,6 +13770,67 @@ int64_t nova_rt_rename_path(int64_t src_val, int64_t dst_val) {
     }
 #endif
     return 1;
+}
+
+/* #18 file perms / symlinks. POSIX-primary. Windows: chmod maps to the read-only bit only, umask via
+   _umask, symlink needs Developer Mode/admin, readlink is unsupported (POSIX reparse is nontrivial). */
+int64_t nova_rt_chmod(int64_t path_val, int64_t mode) {
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) { nova_set_error("chmod: null path"); return 0; }
+#ifdef _WIN32
+    /* Windows _chmod only tracks the write bit. Use the fixed CRT constant values directly
+       (_S_IREAD=0x0100, _S_IWRITE=0x0080) -- the _S_* macros are not exposed by every Win header set. */
+    int wmode = (mode & 0200) ? (0x0100 | 0x0080) : 0x0100;
+    if (_chmod(p, wmode) != 0) { nova_set_error("chmod: failed"); return 0; }
+#else
+    if (chmod(p, (mode_t)mode) != 0) {
+        char e[512]; snprintf(e, sizeof(e), "chmod '%s': %s", p, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
+}
+int64_t nova_rt_umask(int64_t mask) {   /* returns the PREVIOUS mask (POSIX + Windows _umask both do) */
+#ifdef _WIN32
+    return (int64_t)_umask((int)mask);
+#else
+    return (int64_t)umask((mode_t)mask);
+#endif
+}
+int64_t nova_rt_symlink(int64_t target_val, int64_t link_val) {
+    const char* t = (const char*)(uintptr_t)target_val;
+    const char* l = (const char*)(uintptr_t)link_val;
+    if (!t || !l) { nova_set_error("symlink: null path"); return 0; }
+#ifdef _WIN32
+    /* 0x2 = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE (Developer Mode); file (not dir) symlink. */
+    if (!CreateSymbolicLinkA(l, t, 0x2)) { nova_set_error("symlink: failed (needs Developer Mode or admin on Windows)"); return 0; }
+#else
+    if (symlink(t, l) != 0) {
+        char e[512]; snprintf(e, sizeof(e), "symlink '%s' -> '%s': %s", l, t, strerror(errno));
+        nova_set_error(e); return 0;
+    }
+#endif
+    return 1;
+}
+int64_t nova_rt_readlink(int64_t path_val) {   /* returns the link target as an RC-identity NOVA string ("" on error) */
+    const char* p = (const char*)(uintptr_t)path_val;
+    if (!p) { nova_set_error("readlink: null path"); return (int64_t)(uintptr_t)""; }
+#ifdef _WIN32
+    nova_set_error("readlink: not supported on Windows");
+    return (int64_t)(uintptr_t)"";
+#else
+    char buf[4096];
+    ssize_t n = readlink(p, buf, sizeof(buf) - 1);
+    if (n < 0) {
+        char e[512]; snprintf(e, sizeof(e), "readlink '%s': %s", p, strerror(errno));
+        nova_set_error(e); return (int64_t)(uintptr_t)"";
+    }
+    char* result = (char*)nova_heap_alloc((size_t)n + 1, NOVA_MEM_RAW);
+    if (!result) return (int64_t)(uintptr_t)"";
+    memcpy(result, buf, (size_t)n);
+    result[n] = '\0';
+    return (int64_t)(uintptr_t)result;
+#endif
 }
 
 int64_t nova_rt_copy_file(int64_t src_val, int64_t dst_val) {
