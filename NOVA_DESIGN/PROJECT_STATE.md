@@ -23,14 +23,18 @@ Forge framework. Remaining work is targeted gaps + ecosystem, not foundations.
   gated (reconverge + both-mode + N>1 all green). KATs `_kat_signals` / `_kat_perms`.
 - Perf ground-truth: float arrays are **~1.7×C** (not the stale "160×"); closing to 1.0×C is a
   foundational effort (SSA repr tracking) — parked deliberately.
+- **#26 pkg-manager lockfile** — `nova install` now honors `nova.lock` (reproducible, npm-ci-style)
+  + writes it otherwise, via real `lockfile_read/write`. Gated (reconverge + both-mode). KAT `_kat_pkg_lock`.
+- **`NOVA_LANGUAGE_FEATURES.md`** — the authoritative high-level feature reference (137 features,
+  verified). THIS is the coding standard: write NOVA from it (interpolation, comprehensions, pipe,
+  HOF, `match`, `Result`/`?`/`??`, UFCS) — not hand-rolled loops. Referenced from OPERATING_MODEL §9.
 
 ## Next items — dependency-ordered, VERIFY before starting (grep the live code)
 Verdicts from the 2026-07-25 fleet audit (18 agents against live code):
 
 **Do-now, bounded, verifiable on this Windows box:**
-- **#26 pkg-manager wiring** — `nova install` flat-downloads direct deps; it must use the (real)
-  `pkg_resolve` + write/read `nova.lock` for reproducible installs. Highest ecosystem value.
-- **#30 REPL** — mostly done; wire `_test_repl.ps1` into CI (gate-existing). Small.
+- **#30 REPL** — mostly done; wire `_test_repl.ps1` into CI (gate-existing). Small. ← NEXT
+- (#26 pkg-manager lockfile — DONE, see above. Follow-on: transitive resolution + a registry = larger.)
 - **#16 HTTP-client redirects** — 3 bounded sub-cycles (redirect-follow, cookie jar, proxy). Needs a
   loopback test.
 
