@@ -16543,8 +16543,11 @@ int64_t nova_rt_call_by_name(int64_t name_val, int64_t args_handle) {
 static int64_t g_const_cache[NOVA_MAX_CONSTS];
 int64_t nova_rt_const_set(int64_t id, int64_t handle) {
     if (id < 0 || id >= NOVA_MAX_CONSTS) return handle;
+    int64_t old = g_const_cache[id];
+    if (old == handle) return handle;   /* idempotent: no RC churn on same handle */
+    if (old != 0) nova_rc_dec(old);     /* module-state reassignment: release the replaced value */
     g_const_cache[id] = handle;
-    nova_rc_inc(handle);          /* permanent program-lifetime reference */
+    nova_rc_inc(handle);                 /* program-lifetime reference (module state / immutable const) */
     return handle;
 }
 int64_t nova_rt_const_get(int64_t id) {
