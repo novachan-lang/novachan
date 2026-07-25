@@ -36,6 +36,14 @@ state accurate). Nothing below is optional; it is how we avoid wasting the one b
   adversarial verification + memory note. Build gen4 and KAT FIRST (cheap failure) before reconverge.
 - Kill-on-timeout every binary run. Revert anything that does not reconverge or regresses. Never
   ship a crash or a silent-wrong.
+- **PACE — batch the gate, don't serialize it (≈3× faster).** The reconverge (~9 min) + both-mode
+  regression (~10 min) is the price of byte-identical self-hosting; do NOT pay it once per item.
+  Instead: verify each RED change in the FAST inner loop (build gen4 + its KAT, ~2-3 min), accumulate
+  several changes, then run ONE reconverge+CI for the whole batch, then make the individual commits.
+  Pure-NOVA (stdlib/forge/repl.nova) changes NEVER reconverge — KAT only. A runtime-only change to a
+  NICHE function the compiler doesn't call while self-compiling (TLS, perms, signals) can skip the
+  3-pass fixpoint (`-SkipReconverge`, regression-only) — but a change to a CORE runtime function
+  (string/list/dict/RC) still needs the full reconverge. Run the fleet DURING the gate so it isn't idle.
 
 ## 4. Agents / the fleet — breadth fans out, depth stays solo
 - **Fan out the fleet (Sonnet) for BREADTH:** auditing N items, implementing N independent modules,
