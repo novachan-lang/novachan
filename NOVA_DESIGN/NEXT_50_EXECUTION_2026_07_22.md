@@ -1,5 +1,17 @@
 # NEXT 50 TASKS — sequenced execution plan (2026-07-22)
 
+> **★ LEDGER AUDIT 2026-07-25** (18-agent fleet, verified against live code). STALE-DONE (close label,
+> do NOT re-attempt): #6 (N>1 I/O solved via single-poller S-a/S-b/S-c), #21 (casefold/graphemes gated),
+> #27 (nova doc — phase10_doc_test gated), #28 (property-test gated). DEFER: #1/#2/#3 RC leaks are
+> MEMORY-SAFE (leak-only, never UAF) + regression-pinned — bundle into ONE supervised RC-ownership cycle,
+> not standalone (shared root: drop provably-owned call-arg temporaries; UAF-adjacent). #19 unix-sockets,
+> #23 tz, #29 profiler, #31 installer (needs signing cert) = large/XL. DO-NOW tractable+verifiable here:
+> **#26 pkg-manager** (resolver+lockfile+cycle-detect already built & gated — only CLI wiring missing; bounded,
+> highest ecosystem value), #9 Windows-TLS-server, #16 HTTP-client redirects (3 sub-cycles), #30 REPL polish.
+> DO-NOW but NOT self-verifiable on this Windows box (Linux/ARM/OpenSSL runtime): #5 ARM fiber asm, #10 Linux
+> epoll wiring (CVE-class, code already built), #8 ALPN-server. Marching #26 next.
+
+
 Source of truth = `NOVA_MASTER_PLAN_2026_07_10.md` §5 (Waves A/B/C) + §6 (Phase 0–6) + §4.A (language
 ceilings L1–L13). The stdlib 100-task campaign delivered PHASE-1 breadth; this list is what the plan
 sequences **next**. The governing rule holds: *soundness → correctness-edge → ecosystem → declarative
@@ -96,13 +108,13 @@ one shortcut reverted for a concurrency race); L11 #32.
 ## BLOCK C — Phase 1: stdlib correctness-edge (self-contained; daily value)
 | # | Task | Area | Effort | Notes |
 |---|---|---|---|---|
-| 12 | S1 signal handling (SIGINT/SIGTERM/SIGHUP graceful shutdown) — **MISSING** (only `std/os/signalname` = names, not handlers; needs runtime C) — deploy/container blocker | [rt] | M | attended (runtime) |
+| 12 | S1 signal handling (SIGINT/SIGTERM/SIGHUP) — **✅ DONE** (ledger was stale). SIGINT/SIGTERM graceful shutdown already existed (`nova_signal_handler` + `shutdown_requested()` builtin + 2nd-signal force-exit). Added the missing **SIGHUP = distinct re-armable RELOAD channel** (nginx-style): `nova_reload_flag` + `nova_rt_reload_requested()` builtin (consumes/re-arms), POSIX-only (`#ifdef SIGHUP`; 0 on Win/wasm). KAT `_kat_signals` gated. | [rt] | M | done |
 | 13 | D4 signed bignum — **✅ EXISTS+GATED** (`std/numeric/bignum` tracked; verify signed-completeness) | [fg] | M | finance/crypto base |
 | 14 | D2 BigDecimal — **✅ EXISTS+GATED** (`std/numeric/decimal` tracked + `_decimal_test` in manifest; verify completeness) | [fg] | L | after #13 |
 | 15 | Argon2id password hashing — **✅ DONE** (`std/crypto/argon2id` tracked + `_argon2id_test` gated) | [fg] | M | best-practice storage |
 | 16 | S2 HTTP-client redirects/cookies/proxy — **EXISTS-UNGATED** (`forge/forge_http_client` tracked, no gated test; needs a live/mock-server KAT) | [fg] | M | attended (network test) |
 | 17 | S3 sync primitives — **✅ DONE** (`std/sync/mutex`+`semaphore` tracked; `_sync_test` gated single-threaded; added `_syncmutex_test` verifying mutual exclusion under N=1 AND N=4 contention) | [rt] | M | |
-| 18 | S5 file perms/symlinks (chmod/umask/symlink/readlink) — **MISSING** (needs runtime C) | [rt] | M | attended (runtime) |
+| 18 | S5 file perms/symlinks — **✅ DONE** — `chmod`/`umask`/`symlink`/`readlink` builtins (runtime C, POSIX-primary; Windows: chmod→read-only bit, `_umask`, symlink needs Dev Mode, readlink unsupported). KAT `_kat_perms` gated (cross-platform: chmod/umask verified, symlink/readlink graceful). | [rt] | M | done |
 | 19 | S6 unix domain sockets — genuinely MISSING (runtime; Win AF_UNIX+netpoller caveat) | [rt] | M | |
 | 20 | D9 binary pack/unpack — **✅ DONE** (`std/encoding/pack` tracked + `_pack_test` gated) | [std] | M | |
 | 21 | D6 casefold + graphemes (Unicode) — partial (`std/text/casefold`, `graphemex` now gated) | [fg] | L | also gives `str_eq_canon` |
