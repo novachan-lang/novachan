@@ -1,0 +1,163 @@
+// KAT for std/media/canvas — the 2D immediate-mode RGBA raster canvas.
+//
+// Coverage:
+//   1. canvas_new error cases (w<=0, h<=0, dimension > 1e9) return err(...).
+//   2. Build an 8x8 canvas with a KNOWN pattern:
+//        fill (background) -> rect OUTLINE -> diagonal line -> filled rect,
+//      drawn in that order (later ops overwrite earlier ones), then assert the
+//      exact RGBA of hand-computed pixels via canvas_get.
+//   3. Off-canvas canvas_get returns [0,0,0,0]; off-canvas canvas_set is a safe
+//      no-op; on-canvas set/get round-trips exactly.
+//   4. canvas_blit copies a source canvas onto a destination, clipped at the edge.
+//   5. PNG ROUND-TRIP: canvas_to_png -> png_decode reproduces the canvas buffer
+//      byte-for-byte (dims, channels, and every pixel byte).
+//
+// Prints "CANVAS KAT PASS" iff every check holds, else prints each mismatch.
+import std/media/canvas
+import std/media/png
+
+// Exact byte-for-byte equality of two `bytes` values.
+fn bytes_eq(a, e)
+    if bytes_len(a) != bytes_len(e)
+        return 0
+    let ok = 1
+    let i = 0
+    while i < bytes_len(a)
+        if bytes_get(a, i) != bytes_get(e, i)
+            ok = 0
+        i = i + 1
+    return ok
+
+// Check one pixel's RGBA against expected. Returns "" on match, else a message.
+fn px_check(c, x, y, er, eg, eb, ea)
+    let p = canvas_get(c, x, y)
+    if p[0] != er or p[1] != eg or p[2] != eb or p[3] != ea
+        return "pixel (" + str(x) + "," + str(y) + ") got [" + str(p[0]) + "," + str(p[1]) + "," + str(p[2]) + "," + str(p[3]) + "] want [" + str(er) + "," + str(eg) + "," + str(eb) + "," + str(ea) + "]"
+    return ""
+
+// True iff canvas_new(w,h) returns an Err (used by the invalid-dimension cases).
+fn new_is_err(w, h)
+    match canvas_new(w, h)
+        Ok(v) =>
+            return 0
+        Err(e) =>
+            return 1
+
+fn main()
+    let fails = []
+
+    // ── Test 1: invalid dimensions must err (never crash) ─────────────────
+    if new_is_err(0, 8) == 0
+        push(fails, "canvas_new(0,8) should err")
+    if new_is_err(8, 0) == 0
+        push(fails, "canvas_new(8,0) should err")
+    if new_is_err(8, -3) == 0
+        push(fails, "canvas_new(8,-3) should err")
+    if new_is_err(2000000000, 8) == 0
+        push(fails, "canvas_new(2e9,8) should err")
+
+    // ── Test 2: build the 8x8 known pattern ───────────────────────────────
+    match canvas_new(8, 8)
+        Ok(c) =>
+            // (a) background: opaque dark grey everywhere
+            canvas_fill(c, 10, 20, 30, 255)
+            // (b) red rectangle OUTLINE, box (1,1) size 6x6 -> edges x/y in {1..6}
+            canvas_rect(c, 1, 1, 6, 6, 200, 0, 0, 255)
+            // (c) green diagonal line (0,0)->(7,7): plots (i,i) for i in 0..7
+            canvas_line(c, 0, 0, 7, 7, 0, 255, 0, 255)
+            // (d) blue FILLED rect (2,2) size 3x2 -> x in [2,5), y in [2,4)
+            canvas_fill_rect(c, 2, 2, 3, 2, 0, 0, 255, 255)
+
+            // Hand-computed final colors (drawing order resolves overlaps):
+            //   [x, y, r, g, b, a]
+            let checks = [
+                [0, 0, 0, 255, 0, 255],     // line start, green (not in rect/fill)
+                [7, 7, 0, 255, 0, 255],     // line end, green
+                [5, 5, 0, 255, 0, 255],     // diagonal interior green (outside fill)
+                [6, 1, 200, 0, 0, 255],     // rect corner (top+right edge), red
+                [1, 6, 200, 0, 0, 255],     // rect corner (left+bottom edge), red
+                [3, 1, 200, 0, 0, 255],     // rect top edge, red (not on diagonal)
+                [2, 2, 0, 0, 255, 255],     // blue fill (overwrote diagonal here)
+                [4, 3, 0, 0, 255, 255],     // blue fill
+                [3, 3, 0, 0, 255, 255],     // blue fill (overwrote diagonal here)
+                [0, 7, 10, 20, 30, 255],    // untouched background
+                [7, 0, 10, 20, 30, 255]     // untouched background
+            ]
+            let ci = 0
+            while ci < len(checks)
+                let ck = checks[ci]
+                let m = px_check(c, ck[0], ck[1], ck[2], ck[3], ck[4], ck[5])
+                if m != ""
+                    push(fails, m)
+                ci = ci + 1
+
+            // ── Test 3: off-canvas safety ─────────────────────────────────
+            let og = canvas_get(c, -1, 0)
+            if og[0] != 0 or og[1] != 0 or og[2] != 0 or og[3] != 0
+                push(fails, "off-canvas get(-1,0) should be [0,0,0,0]")
+            let og2 = canvas_get(c, 8, 0)
+            if og2[0] != 0 or og2[1] != 0 or og2[2] != 0 or og2[3] != 0
+                push(fails, "off-canvas get(8,0) should be [0,0,0,0]")
+
+            // ── Test 5: PNG round-trip (canvas_to_png -> png_decode) ──────
+            let png = canvas_to_png(c)
+            match png_decode(png)
+                Ok(d) =>
+                    if d["width"] != 8
+                        push(fails, "round-trip width " + str(d["width"]) + " != 8")
+                    if d["height"] != 8
+                        push(fails, "round-trip height " + str(d["height"]) + " != 8")
+                    if d["channels"] != 4
+                        push(fails, "round-trip channels " + str(d["channels"]) + " != 4")
+                    if bytes_eq(d["pixels"], c["pixels"]) == 0
+                        push(fails, "round-trip pixel bytes differ from canvas buffer")
+                Err(e) =>
+                    push(fails, "png_decode(canvas_to_png) failed: " + e)
+        Err(e) =>
+            push(fails, "canvas_new(8,8) failed: " + e)
+
+    // ── Test 3b: set no-op off-canvas + exact on-canvas set/get ───────────
+    match canvas_new(4, 4)
+        Ok(sc) =>
+            canvas_set(sc, -5, 2, 9, 9, 9, 9)      // off-canvas: must not affect / not crash
+            canvas_set(sc, 100, 100, 9, 9, 9, 9)   // off-canvas
+            canvas_set(sc, 1, 1, 50, 60, 70, 80)   // on-canvas
+            let sp = canvas_get(sc, 1, 1)
+            if sp[0] != 50 or sp[1] != 60 or sp[2] != 70 or sp[3] != 80
+                push(fails, "on-canvas set/get failed")
+            // a neighbour the off-canvas sets must NOT have touched stays transparent
+            let sp0 = canvas_get(sc, 2, 2)
+            if sp0[0] != 0 or sp0[1] != 0 or sp0[2] != 0 or sp0[3] != 0
+                push(fails, "off-canvas set corrupted an in-bounds pixel")
+        Err(e) =>
+            push(fails, "canvas_new(4,4) failed: " + e)
+
+    // ── Test 4: blit with edge clipping ───────────────────────────────────
+    match canvas_new(2, 2)
+        Ok(src) =>
+            canvas_fill(src, 1, 2, 3, 4)
+            match canvas_new(4, 4)
+                Ok(dst) =>
+                    canvas_fill(dst, 0, 0, 0, 255)
+                    // place src top-left at (3,3): only dst(3,3) is in-bounds; the
+                    // other three src pixels fall off the edge and are clipped away.
+                    canvas_blit(dst, src, 3, 3)
+                    let bp = canvas_get(dst, 3, 3)
+                    if bp[0] != 1 or bp[1] != 2 or bp[2] != 3 or bp[3] != 4
+                        push(fails, "blit clipped-corner pixel wrong")
+                    let bg = canvas_get(dst, 0, 0)
+                    if bg[0] != 0 or bg[1] != 0 or bg[2] != 0 or bg[3] != 255
+                        push(fails, "blit bled outside its region")
+                Err(e) =>
+                    push(fails, "blit: canvas_new(4,4) dst failed")
+        Err(e) =>
+            push(fails, "blit: canvas_new(2,2) src failed")
+
+    // ── Report ────────────────────────────────────────────────────────────
+    if len(fails) == 0
+        print("CANVAS KAT PASS")
+    else
+        let i = 0
+        while i < len(fails)
+            print("MISMATCH: " + fails[i])
+            i = i + 1

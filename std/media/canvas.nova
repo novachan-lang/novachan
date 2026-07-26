@@ -1,0 +1,387 @@
+// ============================================================================
+// NOVA Standard Library — std/media/canvas
+// ============================================================================
+// A small immediate-mode 2D raster canvas over an RGBA8 pixel buffer.
+//
+// REPRESENTATION
+//   A canvas is a dict { "width", "height", "pixels" } where `pixels` is a
+//   `bytes` value of exactly width*height*4 bytes, row-major, 4 bytes/pixel
+//   (R, G, B, A in that order). Pixel (x, y) occupies byte offset
+//   (y*width + x)*4 .. +3.
+//
+//   `bytes` is used (never `str`) because pixel data is binary and may contain
+//   0x00 (a NUL would truncate a NOVA string). The buffer is REFERENCE-semantic,
+//   so every drawing op mutates the one buffer the canvas dict holds — no copy.
+//
+// INITIAL STATE
+//   canvas_new fills the buffer with TRANSPARENT BLACK (0, 0, 0, 0). This is the
+//   zero-cost default (bytes_create zero-fills) and matches the HTML5 <canvas>
+//   convention. For an opaque background call canvas_fill(c, 0,0,0,255).
+//
+// SAFETY MODEL (every public op is total — it never crashes / never exits)
+//   * Every indexed pixel write goes through ONE bounds-checked writer
+//     (_canvas_put / _canvas_store4). x,y outside [0,width) x [0,height) is a
+//     silent no-op — never an out-of-bounds access.
+//   * canvas_new bounds each dimension to (0, 1e9] BEFORE computing width*height*4,
+//     so the size product cannot overflow i64 (a real prior CVE class in image
+//     decoders). It also verifies the allocation actually succeeded, returning
+//     err(...) on OOM instead of a canvas whose buffer can't hold its pixels.
+//   * canvas_line clamps endpoints to a safe range and Cohen–Sutherland-clips to
+//     the canvas rectangle, so the Bresenham loop is bounded by the canvas size
+//     (no unbounded DoS from pathological huge coordinates) and the intersection
+//     arithmetic cannot overflow i64.
+//   * canvas_circle refuses radii larger than the whole canvas (which could at
+//     most graze it) so the midpoint loop cannot be driven to a DoS hang.
+//
+// PUBLIC API
+//   canvas_new(w, h) -> Result
+//     ok({width, height, pixels}) for a fresh transparent-black canvas.
+//     err(msg) if w<=0 or h<=0, if w>1e9 or h>1e9, or on allocation failure.
+//
+//   canvas_set(c, x, y, r, g, b, a)
+//     Set one pixel. Off-canvas (x,y) is a silent no-op (clamped). r,g,b,a are
+//     masked to 8 bits.
+//
+//   canvas_get(c, x, y) -> list
+//     Return [r, g, b, a] for a pixel. Off-canvas returns [0, 0, 0, 0].
+//
+//   canvas_fill(c, r, g, b, a)
+//     Fill the whole canvas with one color.
+//
+//   canvas_fill_rect(c, x, y, w, h, r, g, b, a)
+//     Filled axis-aligned rectangle, clipped to the canvas bounds.
+//
+//   canvas_line(c, x0, y0, x1, y1, r, g, b, a)
+//     Bresenham line, clipped to the canvas bounds.
+//
+//   canvas_rect(c, x, y, w, h, r, g, b, a)
+//     Rectangle OUTLINE (the four edges of the w*h box at (x,y)), clipped.
+//
+//   canvas_circle(c, cx, cy, radius, r, g, b, a)
+//     Midpoint-circle OUTLINE centered at (cx,cy), clipped. radius<0 is a no-op.
+//
+//   canvas_blit(dst, src, x, y)
+//     Copy (overwrite) the whole `src` canvas onto `dst` with its top-left at
+//     (x,y), clipped to dst's bounds.
+//
+//   canvas_to_png(c) -> bytes
+//     Encode the canvas as a PNG (RGBA8) via png_encode_rgba. Returns the full
+//     PNG file bytes.
+//
+// PRIVATE HELPERS are all prefixed `_canvas_` to avoid link collisions.
+// ============================================================================
+import std/media/png
+
+// ── Private: clamp v into the inclusive range [lo, hi] ───────────────────────
+fn _canvas_clamp(v, lo, hi)
+    let r = v
+    if r < lo
+        r = lo
+    if r > hi
+        r = hi
+    return r
+
+// ── Private: write one RGBA pixel's 4 bytes at byte offset idx ────────────────
+// bytes_set is itself bounds-checked and masks to 8 bits, so a stray idx is a
+// safe no-op — but callers only ever pass an in-bounds idx.
+fn _canvas_store4(px, idx, r, g, b, a)
+    bytes_set(px, idx, r & 0xFF)
+    bytes_set(px, idx + 1, g & 0xFF)
+    bytes_set(px, idx + 2, b & 0xFF)
+    bytes_set(px, idx + 3, a & 0xFF)
+    return 0
+
+// ── Private: bounds-checked single-pixel write into a raw canvas buffer ───────
+// (x,y) outside [0,cw) x [0,ch) is a silent no-op. idx = (y*cw + x)*4 cannot
+// overflow: cw,ch <= 1e9 and x<cw, y<ch => idx < 4e18 < i64 max.
+fn _canvas_put(px, cw, ch, x, y, r, g, b, a)
+    if x < 0 or y < 0 or x >= cw or y >= ch
+        return 0
+    _canvas_store4(px, (y * cw + x) * 4, r, g, b, a)
+    return 0
+
+// ── Private: plot a point and its four sign reflections about (cx,cy) ─────────
+// Called twice (once with dx,dy and once with dy,dx swapped) to cover a circle's
+// eight-way symmetry from ONE set of sign combinations — no copy-paste.
+fn _canvas_put4(px, cw, ch, cx, cy, dx, dy, r, g, b, a)
+    _canvas_put(px, cw, ch, cx + dx, cy + dy, r, g, b, a)
+    _canvas_put(px, cw, ch, cx - dx, cy + dy, r, g, b, a)
+    _canvas_put(px, cw, ch, cx + dx, cy - dy, r, g, b, a)
+    _canvas_put(px, cw, ch, cx - dx, cy - dy, r, g, b, a)
+    return 0
+
+// ── Private: copy one RGBA pixel (4 bytes) from spx[sidx..] to dpx[didx..] ─────
+fn _canvas_copy4(dpx, didx, spx, sidx)
+    bytes_set(dpx, didx, bytes_get(spx, sidx))
+    bytes_set(dpx, didx + 1, bytes_get(spx, sidx + 1))
+    bytes_set(dpx, didx + 2, bytes_get(spx, sidx + 2))
+    bytes_set(dpx, didx + 3, bytes_get(spx, sidx + 3))
+    return 0
+
+// ── canvas_new ────────────────────────────────────────────────────────────────
+// Create a fresh transparent-black RGBA canvas. Bounds each dimension BEFORE the
+// size multiply so width*height*4 cannot overflow i64, then verifies allocation.
+fn canvas_new(w, h) -> Result
+    if w <= 0 or h <= 0
+        return err("canvas_new: width and height must be positive")
+    if w > 1000000000 or h > 1000000000
+        return err("canvas_new: dimensions exceed the 1e9-per-side limit")
+    // Safe: w,h in [1, 1e9] => w*h <= 1e18, *4 <= 4e18 < i64 max (~9.22e18).
+    let size = w * h * 4
+    let px = bytes_create(size)
+    // Defense-in-depth: bytes_create returns a 0-length buffer on OOM. Never hand
+    // back a canvas whose pixel buffer can't hold width*height*4 bytes.
+    if bytes_len(px) != size
+        return err("canvas_new: pixel buffer allocation failed")
+    return ok({"width": w, "height": h, "pixels": px})
+
+// ── canvas_set ────────────────────────────────────────────────────────────────
+// Set one pixel; off-canvas is a silent no-op (clamped), never OOB.
+fn canvas_set(c, x, y, r, g, b, a)
+    _canvas_put(c["pixels"], c["width"], c["height"], x, y, r, g, b, a)
+    return 0
+
+// ── canvas_get ────────────────────────────────────────────────────────────────
+// Return [r, g, b, a] for a pixel; off-canvas returns [0, 0, 0, 0].
+fn canvas_get(c, x, y) -> list
+    let cw = c["width"]
+    let ch = c["height"]
+    if x < 0 or y < 0 or x >= cw or y >= ch
+        return [0, 0, 0, 0]
+    let px = c["pixels"]
+    let idx = (y * cw + x) * 4
+    return [bytes_get(px, idx), bytes_get(px, idx + 1), bytes_get(px, idx + 2), bytes_get(px, idx + 3)]
+
+// ── canvas_fill ─────────────────────────────────────────────────────────────
+// Fill the entire canvas with one RGBA color.
+fn canvas_fill(c, r, g, b, a)
+    let cw = c["width"]
+    let ch = c["height"]
+    if cw <= 0 or ch <= 0
+        return 0
+    let px = c["pixels"]
+    let n = cw * ch
+    let i = 0
+    while i < n
+        _canvas_store4(px, i * 4, r, g, b, a)
+        i = i + 1
+    return 0
+
+// ── canvas_fill_rect ──────────────────────────────────────────────────────────
+// Filled axis-aligned rectangle at (x,y) of size w*h, clipped to the canvas.
+// The clipped span is computed with _canvas_clamp so a huge/overflowing x+w or
+// y+h collapses to an empty (safe) range rather than a runaway loop.
+fn canvas_fill_rect(c, x, y, w, h, r, g, b, a)
+    if w <= 0 or h <= 0
+        return 0
+    let cw = c["width"]
+    let ch = c["height"]
+    if cw <= 0 or ch <= 0
+        return 0
+    let px = c["pixels"]
+    let x0 = _canvas_clamp(x, 0, cw)
+    let y0 = _canvas_clamp(y, 0, ch)
+    let x1 = _canvas_clamp(x + w, 0, cw)
+    let y1 = _canvas_clamp(y + h, 0, ch)
+    let yy = y0
+    while yy < y1
+        let rowbase = yy * cw
+        let xx = x0
+        while xx < x1
+            _canvas_store4(px, (rowbase + xx) * 4, r, g, b, a)
+            xx = xx + 1
+        yy = yy + 1
+    return 0
+
+// ── Private: outcode for Cohen–Sutherland against rect [0,xmax] x [0,ymax] ─────
+// Bits: 1 = left (x<0), 2 = right (x>xmax), 4 = below (y<0), 8 = above (y>ymax).
+fn _canvas_outcode(x, y, xmax, ymax)
+    let code = 0
+    if x < 0
+        code = code | 1
+    else if x > xmax
+        code = code | 2
+    if y < 0
+        code = code | 4
+    else if y > ymax
+        code = code | 8
+    return code
+
+// ── Private: Bresenham line between two IN-BOUNDS endpoints ───────────────────
+// Every plot goes through the bounds-checked _canvas_put. Endpoints are supplied
+// pre-clipped, so the step count is bounded by |dx|+|dy| <= cw+ch.
+fn _canvas_bresenham(px, cw, ch, x0, y0, x1, y1, r, g, b, a)
+    let dx = x1 - x0
+    if dx < 0
+        dx = 0 - dx
+    let dy = y1 - y0
+    if dy < 0
+        dy = 0 - dy
+    let sx = -1
+    if x0 < x1
+        sx = 1
+    let sy = -1
+    if y0 < y1
+        sy = 1
+    let err = dx - dy
+    let ax = x0
+    let ay = y0
+    let running = 1
+    while running == 1
+        _canvas_put(px, cw, ch, ax, ay, r, g, b, a)
+        if ax == x1 and ay == y1
+            running = 0
+        else
+            let e2 = 2 * err
+            if e2 > (0 - dy)
+                err = err - dy
+                ax = ax + sx
+            if e2 < dx
+                err = err + dx
+                ay = ay + sy
+    return 0
+
+// ── canvas_line ───────────────────────────────────────────────────────────────
+// Bresenham line from (x0,y0) to (x1,y1), Cohen–Sutherland-clipped to the canvas.
+// Endpoints are first clamped to +/-1.5e9 (far outside any real canvas, whose max
+// side is 1e9) so the clip intersection products stay < i64 max; then the segment
+// is clipped to [0,cw-1] x [0,ch-1] so Bresenham only walks the visible portion.
+fn canvas_line(c, x0, y0, x1, y1, r, g, b, a)
+    let cw = c["width"]
+    let ch = c["height"]
+    if cw <= 0 or ch <= 0
+        return 0
+    let px = c["pixels"]
+    let ax = _canvas_clamp(x0, -1500000000, 1500000000)
+    let ay = _canvas_clamp(y0, -1500000000, 1500000000)
+    let bx = _canvas_clamp(x1, -1500000000, 1500000000)
+    let by = _canvas_clamp(y1, -1500000000, 1500000000)
+    let xmax = cw - 1
+    let ymax = ch - 1
+    let c0 = _canvas_outcode(ax, ay, xmax, ymax)
+    let c1 = _canvas_outcode(bx, by, xmax, ymax)
+    let accept = 0
+    let running = 1
+    while running == 1
+        if (c0 | c1) == 0
+            accept = 1
+            running = 0
+        else if (c0 & c1) != 0
+            running = 0
+        else
+            // Pick the endpoint that is outside; anchor the parametric intersection
+            // at (ax,ay). Whichever branch is taken, the anchor is constrained
+            // (either the matching-bit outside point, or fully inside when c0==0),
+            // which keeps every product below i64 max. Divisors are non-zero: a
+            // point outside on an edge whose opposite endpoint is not also outside
+            // on that edge guarantees a spanning delta.
+            let cout = c0
+            if cout == 0
+                cout = c1
+            let nx = 0
+            let ny = 0
+            if (cout & 8) != 0
+                nx = ax + (bx - ax) * (ymax - ay) / (by - ay)
+                ny = ymax
+            else if (cout & 4) != 0
+                nx = ax + (bx - ax) * (0 - ay) / (by - ay)
+                ny = 0
+            else if (cout & 2) != 0
+                ny = ay + (by - ay) * (xmax - ax) / (bx - ax)
+                nx = xmax
+            else
+                ny = ay + (by - ay) * (0 - ax) / (bx - ax)
+                nx = 0
+            if cout == c0
+                ax = nx
+                ay = ny
+                c0 = _canvas_outcode(ax, ay, xmax, ymax)
+            else
+                bx = nx
+                by = ny
+                c1 = _canvas_outcode(bx, by, xmax, ymax)
+    if accept == 1
+        _canvas_bresenham(px, cw, ch, ax, ay, bx, by, r, g, b, a)
+    return 0
+
+// ── canvas_rect ───────────────────────────────────────────────────────────────
+// Rectangle OUTLINE: the four edges of the w*h box at (x,y). Each edge is a
+// clipped canvas_line, so off-canvas portions are handled safely. A 1x1 box
+// collapses to a single pixel (all four edges coincide) — harmless.
+fn canvas_rect(c, x, y, w, h, r, g, b, a)
+    if w <= 0 or h <= 0
+        return 0
+    let x1 = x + w - 1
+    let y1 = y + h - 1
+    canvas_line(c, x, y, x1, y, r, g, b, a)
+    canvas_line(c, x, y1, x1, y1, r, g, b, a)
+    canvas_line(c, x, y, x, y1, r, g, b, a)
+    canvas_line(c, x1, y, x1, y1, r, g, b, a)
+    return 0
+
+// ── canvas_circle ─────────────────────────────────────────────────────────────
+// Midpoint-circle OUTLINE centered at (cx,cy). radius<0 is a no-op. A radius
+// larger than the whole canvas can at most graze it, so such pathological values
+// are refused to keep the O(radius) loop from becoming a DoS hang.
+fn canvas_circle(c, cx, cy, radius, r, g, b, a)
+    if radius < 0
+        return 0
+    let cw = c["width"]
+    let ch = c["height"]
+    if cw <= 0 or ch <= 0
+        return 0
+    let px = c["pixels"]
+    if radius > cw + ch + 16
+        return 0
+    if radius == 0
+        _canvas_put(px, cw, ch, cx, cy, r, g, b, a)
+        return 0
+    let x = 0
+    let y = radius
+    let d = 3 - 2 * radius
+    while x <= y
+        _canvas_put4(px, cw, ch, cx, cy, x, y, r, g, b, a)
+        _canvas_put4(px, cw, ch, cx, cy, y, x, r, g, b, a)
+        if d < 0
+            d = d + 4 * x + 6
+        else
+            d = d + 4 * (x - y) + 10
+            y = y - 1
+        x = x + 1
+    return 0
+
+// ── canvas_blit ───────────────────────────────────────────────────────────────
+// Copy (overwrite) every pixel of `src` onto `dst`, placing src's top-left at
+// (x,y) in dst. Clipped to dst's bounds — only in-range destination pixels are
+// written. Cost is O(src.width * src.height) (the real work), never driven by a
+// bad offset (out-of-range destination pixels are skipped, never OOB).
+fn canvas_blit(dst, src, x, y)
+    let dw = dst["width"]
+    let dh = dst["height"]
+    if dw <= 0 or dh <= 0
+        return 0
+    let sw = src["width"]
+    let sh = src["height"]
+    if sw <= 0 or sh <= 0
+        return 0
+    let dpx = dst["pixels"]
+    let spx = src["pixels"]
+    let sy = 0
+    while sy < sh
+        let ty = y + sy
+        if ty >= 0 and ty < dh
+            let sx = 0
+            while sx < sw
+                let tx = x + sx
+                if tx >= 0 and tx < dw
+                    _canvas_copy4(dpx, (ty * dw + tx) * 4, spx, (sy * sw + sx) * 4)
+                sx = sx + 1
+        sy = sy + 1
+    return 0
+
+// ── canvas_to_png ─────────────────────────────────────────────────────────────
+// Encode the canvas as a complete RGBA8 PNG file. Delegates to png_encode_rgba,
+// which returns the full PNG bytes (signature ++ IHDR ++ IDAT ++ IEND). The
+// pixel buffer is exactly width*height*4 bytes by construction.
+fn canvas_to_png(c) -> bytes
+    return png_encode_rgba(c["width"], c["height"], c["pixels"])
