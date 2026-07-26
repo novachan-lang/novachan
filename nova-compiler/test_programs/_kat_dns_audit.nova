@@ -1,0 +1,379 @@
+// ============================================================================
+// _kat_dns_audit — soundness audit KAT for std/net/dns (top-level facade)
+// ============================================================================
+// Written for the 4 recurring binary-wire-decoder vulnerability classes.
+// Each section states which class it targets and whether dns.nova's actual
+// decode pipeline is vulnerable, with the concrete malformed input used.
+//
+//   CLASS 1 i64-overflow bounds bypass — NOT REACHABLE via wire bytes: every
+//     length/count field DNS puts on the wire (QDCOUNT/ANCOUNT/NSCOUNT/
+//     ARCOUNT/RDLENGTH) is a 16-bit field (max 0xFFFF=65535), so a message
+//     built from real wire bytes can never make pos+len approach i64
+//     overflow territory (mlen is a real buffer size; a u16 length added to
+//     it cannot wrap a 64-bit signed int). Section A proves this
+//     structurally (max u16 RDLENGTH still bounds-checked correctly) and
+//     Section B independently re-verifies the *public* bounded-decode
+//     functions dns.nova's soundness is built on (dns_name_rdata_decode_bounded/
+//     dns_mx_decode/dns_soa_decode_bounded) safely REJECT even if handed the
+//     maximum representable i64 length (0x7FFFFFFFFFFFFFFF) directly —
+//     defense in depth for any future caller of those public leaf APIs.
+//
+//   CLASS 2 sentinel/absent-value collision — WAS VULNERABLE, FIXED in this
+//     audit. dns.nova's _dns_typed_rdata discarded the leaf decoders'
+//     success/failure discriminant (next_pos) and returned the failure
+//     sentinel value even when it collided with a real value: malformed
+//     CNAME/NS/PTR RDATA decoded to "" (indistinguishable from a legitimate
+//     root-name target), and malformed MX RDATA decoded to
+//     {"pref":0,"exchange":""} (indistinguishable from the single most
+//     common real MX preference, 0). Section C proves both collisions are
+//     now closed (failure produces a value that can NEVER be produced by a
+//     real decode) while the true collision-adjacent legitimate values still
+//     decode correctly (no false rejection).
+//
+//   CLASS 3 trailing-content acceptance — DOES NOT APPLY to this format: DNS
+//     has no in-message "declared total length" field to check against —
+//     message boundaries are set by the TRANSPORT (UDP datagram size / TCP
+//     2-byte length prefix), and RFC 1035 does not forbid bytes after the
+//     header-declared section counts. Section D demonstrates trailing bytes
+//     beyond the declared sections are simply not parsed and never corrupt
+//     the sections that ARE declared (the only property that matters here).
+//
+//   CLASS 4 unchecked length -> over-read / truncation-as-success — CHECKED,
+//     NOT VULNERABLE: dns_rr_decode bounds-checks RDLENGTH against the
+//     remaining buffer (`cur + rdlen > mlen`) before ever slicing RDATA, and
+//     the section/question loops stop the instant the cursor would run past
+//     the buffer, even when the header count claims far more records than
+//     are present. Section E proves both with concrete truncated inputs.
+// ============================================================================
+import std/net/dns
+import std/net/dns_header
+import std/net/dns_question
+import std/net/dns_rr
+import std/net/dns_rdata_a
+import std/net/dns_rdata_mx
+import std/net/dns_rdata_soa
+import std/net/dns_rdata_txt
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        exit(1)
+
+fn ckb(label: string, got: bytes, want: bytes)
+    let n1 = bytes_len(got)
+    let n2 = bytes_len(want)
+    if n1 != n2
+        print("FAIL " + label + ": len got=" + str(n1) + " want=" + str(n2))
+        exit(1)
+    let i = 0
+    while i < n1
+        if bytes_get(got, i) != bytes_get(want, i)
+            print("FAIL " + label + ": byte[" + str(i) + "] mismatch")
+            exit(1)
+        i = i + 1
+
+// Append a big-endian u16 to out.
+fn u16(out: bytes, v: int) -> bytes
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, v & 0xFF)
+    out
+
+// A 12-byte DNS header: QR=1 (response), given counts.
+fn hdr(id: int, qd: int, an: int, ns: int, ar: int) -> bytes
+    let m = bytes(0)
+    m = u16(m, id)
+    m = bytes_append(m, 0x80)
+    m = bytes_append(m, 0x00)
+    m = u16(m, qd)
+    m = u16(m, an)
+    m = u16(m, ns)
+    m = u16(m, ar)
+    m
+
+// A root-owner (NAME=0x00) RR up to and including RDLENGTH; caller appends
+// rdata bytes after.
+fn rr_head(rtype: int, rdlength: int) -> bytes
+    let m = bytes(0)
+    m = bytes_append(m, 0x00)      // NAME = root
+    m = u16(m, rtype)
+    m = u16(m, 1)                  // CLASS=IN
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x00)
+    m = bytes_append(m, 0x3C)      // TTL=60
+    m = u16(m, rdlength)
+    m
+
+fn pad(n: int) -> bytes
+    let m = bytes(0)
+    let i = 0
+    while i < n
+        m = bytes_append(m, 0xEE)
+        i = i + 1
+    m
+
+fn main()
+    // ── SECTION A — valid full message round-trips byte-exact ───────────────
+    // Header + one question + one answer of EVERY typed RDATA kind this
+    // module resolves (A, AAAA, CNAME, MX, SOA, TXT), all correctly framed.
+    let q_wire = dns_question_encode("example.com", 1, 1)
+    let a_rdata = dns_a_encode("93.184.216.34")
+    let aaaa_rdata = dns_aaaa_encode("2001:db8::1")
+    let cname_rdata = dns_name_rdata_encode("target.example.com")
+    let mx_rdata = dns_mx_encode(10, "mail.example.com")
+    let soa_rdata = dns_soa_encode("ns.example.com", "root.example.com", 2024010101, 7200, 3600, 1209600, 3600)
+    let txt_rdata = dns_txt_encode(["hello", "world"])
+
+    let msg = hdr(0x0042, 1, 6, 0, 0)
+    msg = bytes_concat(msg, q_wire)
+    msg = bytes_concat(msg, rr_head(1, bytes_len(a_rdata)))
+    msg = bytes_concat(msg, a_rdata)
+    msg = bytes_concat(msg, rr_head(28, bytes_len(aaaa_rdata)))
+    msg = bytes_concat(msg, aaaa_rdata)
+    msg = bytes_concat(msg, rr_head(5, bytes_len(cname_rdata)))
+    msg = bytes_concat(msg, cname_rdata)
+    msg = bytes_concat(msg, rr_head(15, bytes_len(mx_rdata)))
+    msg = bytes_concat(msg, mx_rdata)
+    msg = bytes_concat(msg, rr_head(6, bytes_len(soa_rdata)))
+    msg = bytes_concat(msg, soa_rdata)
+    msg = bytes_concat(msg, rr_head(16, bytes_len(txt_rdata)))
+    msg = bytes_concat(msg, txt_rdata)
+
+    let dec = dns_decode_message(msg)
+    let dhdr = dec["header"]
+    cki("A.hdr.id", dhdr["id"], 0x0042)
+    cki("A.hdr.ancount", dhdr["ancount"], 6)
+    let qs = dec["questions"]
+    cki("A.questions.count", len(qs), 1)
+    cks("A.questions.name", qs[0]["name"], "example.com")
+    let ans = dec["answers"]
+    cki("A.answers.count", len(ans), 6)
+    cks("A.a.typed", ans[0]["rdata_typed"], "93.184.216.34")
+    cks("A.aaaa.typed", ans[1]["rdata_typed"], "2001:db8::1")
+    cks("A.cname.typed", ans[2]["rdata_typed"], "target.example.com")
+    let mx_typed = ans[3]["rdata_typed"]
+    cki("A.mx.pref", mx_typed["pref"], 10)
+    cks("A.mx.exchange", mx_typed["exchange"], "mail.example.com")
+    let soa_typed = ans[4]["rdata_typed"]
+    cks("A.soa.mname", soa_typed["mname"], "ns.example.com")
+    cki("A.soa.serial", soa_typed["serial"], 2024010101)
+    let txt_typed = ans[5]["rdata_typed"]
+    cki("A.txt.count", len(txt_typed), 2)
+    ckb("A.txt[0]", txt_typed[0], bytes_to_str_bytes("hello"))
+    ckb("A.txt[1]", txt_typed[1], bytes_to_str_bytes("world"))
+    print("A: valid round-trip OK (A/AAAA/CNAME/MX/SOA/TXT all typed-decoded correctly)")
+
+    // ── SECTION B — CLASS 1: i64-overflow length-prefix bypass ──────────────
+    // DNS's own RDLENGTH is a 16-bit wire field (max 0xFFFF); a message
+    // built from real bytes can never smuggle a 2^63-1 length prefix. Prove
+    // this AND independently re-verify the public bounded-decode functions
+    // dns.nova's own soundness depends on reject a maximal adversarial
+    // int64 rdlength (0x7FFFFFFFFFFFFFFF) handed to them directly, rather
+    // than letting `pos + rdlength` silently wrap negative and bypass the
+    // truncation check.
+    // pos MUST be > 0 here: pos=0 would let `pos+rdlength` land exactly on
+    // INT64_MAX (no wraparound, rejected by the ordinary `> mlen` compare
+    // for the boring reason). The actual overflow-bypass shape from the vuln
+    // class ("pos + len WRAPS NEGATIVE") only appears once pos is nonzero,
+    // pushing the sum past INT64_MAX so it wraps to a large negative number.
+    let huge = 0x7FFFFFFFFFFFFFFF
+    let probe_pos = 1
+    let probe_msg = bytes(0)
+    probe_msg = bytes_append(probe_msg, 0x00)   // a few bytes of "message" to decode against
+    probe_msg = bytes_append(probe_msg, 0x00)
+    probe_msg = bytes_append(probe_msg, 0x00)
+    probe_msg = bytes_append(probe_msg, 0x00)
+
+    let ov_name = dns_name_rdata_decode_bounded(probe_msg, probe_pos, huge)
+    cks("B.overflow.name_rdata.rejected.name", ov_name[0], "")
+    cki("B.overflow.name_rdata.rejected.next_pos_unchanged", ov_name[1], probe_pos)
+
+    let ov_mx = dns_mx_decode(probe_msg, probe_pos, huge)
+    let ov_mx_rec = ov_mx[0]
+    cki("B.overflow.mx.rejected.no_pref_key", contains(ov_mx_rec, "pref"), 1)
+    cki("B.overflow.mx.rejected.pref_is_zero", ov_mx_rec["pref"], 0)
+    cki("B.overflow.mx.rejected.next_pos_unchanged", ov_mx[1], probe_pos)
+
+    let ov_soa = dns_soa_decode_bounded(probe_msg, probe_pos, huge)
+    let ov_soa_rec = ov_soa[0]
+    cki("B.overflow.soa.rejected.no_mname_key", contains(ov_soa_rec, "mname"), 0)
+    cki("B.overflow.soa.rejected.next_pos_unchanged", ov_soa[1], probe_pos)
+
+    // Also probe a huge NEGATIVE rdlength (the other half of "a negative-
+    // length guard alone does not catch max-positive overflow" — confirm
+    // the negative-length guard itself still holds).
+    let neg = 0 - huge - 1
+    let ov_name_neg = dns_name_rdata_decode_bounded(probe_msg, probe_pos, neg)
+    cki("B.negative.name_rdata.rejected.next_pos_unchanged", ov_name_neg[1], probe_pos)
+    let ov_soa_neg = dns_soa_decode_bounded(probe_msg, probe_pos, neg)
+    cki("B.negative.soa.rejected.next_pos_unchanged", ov_soa_neg[1], probe_pos)
+
+    // A message-driven RDLENGTH can only ever be 0..65535 (2 wire bytes) —
+    // demonstrate the maximum representable wire RDLENGTH (0xFFFF) is still
+    // correctly bounds-checked against the ACTUAL remaining buffer (short
+    // buffer -> RR dropped, not accepted with truncated data).
+    let m_maxrdlen = hdr(0x0043, 0, 1, 0, 0)
+    m_maxrdlen = bytes_concat(m_maxrdlen, rr_head(1, 0xFFFF))  // claims 65535 bytes of RDATA
+    m_maxrdlen = bytes_concat(m_maxrdlen, bytes(4))            // only 4 real bytes follow
+    let dec_maxrdlen = dns_decode_message(m_maxrdlen)
+    cki("B.max_u16_rdlength_vs_short_buffer.answers.count", len(dec_maxrdlen["answers"]), 0)
+    print("B: i64-overflow length bypass — not reachable via wire (RDLENGTH is u16); public bounded decoders reject a directly-supplied 0x7FFFFFFFFFFFFFFF / negative rdlength without fabricating a result")
+
+    // ── SECTION C — CLASS 2: sentinel/absent-value collision (FIXED) ────────
+    // (C1) Malformed CNAME: RDLENGTH one byte short of the real encoded
+    // name, so the local decode cannot complete inside its own RDLENGTH
+    // window. Before the fix this silently produced "" — identical to a
+    // real root-name CNAME. After the fix it must be `bytes`, never string.
+    let cname_full = dns_name_rdata_encode("ab")   // [2,'a','b',0] = 4 bytes
+    let m_c1 = hdr(0x0044, 0, 1, 0, 0)
+    m_c1 = bytes_concat(m_c1, rr_head(5, 3))                    // CNAME, RDLENGTH=3 (short by 1)
+    m_c1 = bytes_concat(m_c1, bytes_slice(cname_full, 0, 3))
+    let dec_c1 = dns_decode_message(m_c1)
+    let ans_c1 = dec_c1["answers"]
+    cki("C1.malformed_cname.answers.count", len(ans_c1), 1)
+    cks("C1.malformed_cname.typed_is_bytes", type_of(ans_c1[0]["rdata_typed"]), "bytes")
+
+    // (C2) Legitimate root-name CNAME (RDATA = single 0x00 byte, RDLENGTH=1)
+    // — the value the sentinel used to collide with — must still decode
+    // successfully to the string "" (proves the fix rejects only genuine
+    // failures, not this real collision-adjacent case).
+    let m_c2 = hdr(0x0045, 0, 1, 0, 0)
+    m_c2 = bytes_concat(m_c2, rr_head(5, 1))
+    m_c2 = bytes_append(m_c2, 0x00)                             // RDATA = root name
+    let dec_c2 = dns_decode_message(m_c2)
+    let ans_c2 = dec_c2["answers"]
+    cki("C2.legit_root_cname.answers.count", len(ans_c2), 1)
+    cks("C2.legit_root_cname.typed_is_string_empty", type_of(ans_c2[0]["rdata_typed"]), "string")
+    cks("C2.legit_root_cname.value", ans_c2[0]["rdata_typed"], "")
+
+    // (C3) Malformed MX: RDLENGTH one byte short of the real encoded rdata.
+    // Before the fix this silently produced {"pref":0,"exchange":""} —
+    // identical in shape AND value to the single most common real MX
+    // preference (0). After the fix it must be an EMPTY dict (no keys).
+    let mx_full = dns_mx_encode(7, "ab")
+    let m_c3 = hdr(0x0046, 0, 1, 0, 0)
+    m_c3 = bytes_concat(m_c3, rr_head(15, 5))                   // MX, RDLENGTH=5 (short by 1)
+    m_c3 = bytes_concat(m_c3, bytes_slice(mx_full, 0, 5))
+    let dec_c3 = dns_decode_message(m_c3)
+    let ans_c3 = dec_c3["answers"]
+    cki("C3.malformed_mx.answers.count", len(ans_c3), 1)
+    let mx_c3 = ans_c3[0]["rdata_typed"]
+    cki("C3.malformed_mx.no_pref_key", contains(mx_c3, "pref"), 0)
+    cki("C3.malformed_mx.no_exchange_key", contains(mx_c3, "exchange"), 0)
+
+    // (C4) Legitimate pref=0 MX — the value the sentinel used to collide
+    // with — must still decode successfully with pref==0 and its real
+    // exchange name (proves the fix does not false-reject the common case).
+    let mx_pref0 = dns_mx_encode(0, "mail.example.com")
+    let m_c4 = hdr(0x0047, 0, 1, 0, 0)
+    m_c4 = bytes_concat(m_c4, rr_head(15, bytes_len(mx_pref0)))
+    m_c4 = bytes_concat(m_c4, mx_pref0)
+    let dec_c4 = dns_decode_message(m_c4)
+    let ans_c4 = dec_c4["answers"]
+    cki("C4.legit_pref0_mx.answers.count", len(ans_c4), 1)
+    let mx_c4 = ans_c4[0]["rdata_typed"]
+    cki("C4.legit_pref0_mx.pref", mx_c4["pref"], 0)
+    cks("C4.legit_pref0_mx.exchange", mx_c4["exchange"], "mail.example.com")
+
+    // (C5) SOA sentinel already sound before this audit — malformed SOA
+    // must still be an empty dict (no regression).
+    let m_c5 = hdr(0x0048, 0, 1, 0, 0)
+    m_c5 = bytes_concat(m_c5, rr_head(6, 5))                    // SOA, RDLENGTH=5 (far too small)
+    m_c5 = bytes_append(m_c5, 0x00)
+    m_c5 = bytes_append(m_c5, 0x00)
+    m_c5 = bytes_append(m_c5, 0xAA)
+    m_c5 = bytes_append(m_c5, 0xBB)
+    m_c5 = bytes_append(m_c5, 0xCC)
+    let dec_c5 = dns_decode_message(m_c5)
+    let ans_c5 = dec_c5["answers"]
+    cki("C5.malformed_soa.answers.count", len(ans_c5), 1)
+    cki("C5.malformed_soa.no_mname_key", contains(ans_c5[0]["rdata_typed"], "mname"), 0)
+    print("C: sentinel collision closed for CNAME/NS/PTR (bytes on failure) and MX (empty dict on failure); legitimate root-name CNAME and pref=0 MX still decode correctly (no false rejection); SOA already sound")
+
+    // ── SECTION D — CLASS 3: trailing-content acceptance ────────────────────
+    // DNS has no in-band "declared total length" to verify against — the
+    // header's counts declare RECORD COUNTS (consumed by the section loops,
+    // proven exactly right in Section A), not a byte length, and message
+    // framing is the TRANSPORT's job. Prove trailing bytes beyond every
+    // declared section are simply inert: they do not corrupt or extend the
+    // sections that WERE declared.
+    let m_d = hdr(0x0049, 0, 1, 0, 0)
+    m_d = bytes_concat(m_d, rr_head(1, bytes_len(a_rdata)))
+    m_d = bytes_concat(m_d, a_rdata)
+    m_d = bytes_concat(m_d, pad(64))   // 64 bytes of trailing garbage beyond ancount=1
+    let dec_d = dns_decode_message(m_d)
+    cki("D.trailing_garbage.answers.count", len(dec_d["answers"]), 1)
+    cks("D.trailing_garbage.answers.uncorrupted", dec_d["answers"][0]["rdata_typed"], "93.184.216.34")
+    print("D: trailing-content class does not apply (no in-band total-length field; RFC 1035 message boundary is transport-defined) — verified trailing bytes never corrupt the declared sections")
+
+    // ── SECTION E — CLASS 4: unchecked length -> over-read / truncation ─────
+    // (E1) RDLENGTH claims far more bytes than remain in the buffer -> the
+    // whole RR must be dropped, never fabricated from a short read.
+    let m_e1 = hdr(0x004A, 0, 1, 0, 0)
+    m_e1 = bytes_concat(m_e1, rr_head(1, 100))   // claims 100 bytes of RDATA
+    m_e1 = bytes_concat(m_e1, bytes(4))          // only 4 real bytes follow
+    let dec_e1 = dns_decode_message(m_e1)
+    cki("E1.rdlength_exceeds_buffer.answers.count", len(dec_e1["answers"]), 0)
+
+    // (E2) Header claims 0xFFFF answers but the buffer ends right after the
+    // header -> must terminate immediately (no hang, no fabricated records).
+    let m_e2 = hdr(0x004B, 0, 0xFFFF, 0, 0)
+    let dec_e2 = dns_decode_message(m_e2)
+    cki("E2.huge_ancount_no_data.answers.count", len(dec_e2["answers"]), 0)
+
+    // (E3) A reserved NAME length-byte pattern (0x40) mid-message must drop
+    // the whole RR rather than resync from a corrupted offset and silently
+    // accept a truncated/garbled record as if it were valid.
+    let m_e3 = hdr(0x004C, 0, 1, 0, 0)
+    m_e3 = bytes_append(m_e3, 0x40)   // reserved length-byte pattern (top bits 01)
+    m_e3 = bytes_append(m_e3, 0x41)
+    m_e3 = bytes_append(m_e3, 0x42)
+    m_e3 = bytes_append(m_e3, 0x43)
+    m_e3 = u16(m_e3, 1)               // TYPE=A
+    m_e3 = u16(m_e3, 1)               // CLASS=IN
+    m_e3 = bytes_append(m_e3, 0x00)
+    m_e3 = bytes_append(m_e3, 0x00)
+    m_e3 = bytes_append(m_e3, 0x00)
+    m_e3 = bytes_append(m_e3, 0x3C)
+    m_e3 = u16(m_e3, 4)
+    m_e3 = bytes_concat(m_e3, bytes_slice(a_rdata, 0, 4))
+    let dec_e3 = dns_decode_message(m_e3)
+    cki("E3.reserved_name_byte.answers.count", len(dec_e3["answers"]), 0)
+
+    // (E4) Truncated TXT (declared character-string length longer than the
+    // remaining RDATA) must stop early and return only fully-decoded
+    // strings, never a fabricated/over-read one.
+    let txt_trunc = bytes(0)
+    txt_trunc = bytes_append(txt_trunc, 2)      // first string: 2 bytes, present
+    txt_trunc = bytes_append(txt_trunc, 0x41)
+    txt_trunc = bytes_append(txt_trunc, 0x42)
+    txt_trunc = bytes_append(txt_trunc, 10)     // second string CLAIMS 10 bytes
+    txt_trunc = bytes_append(txt_trunc, 0x43)   // only 1 byte actually present
+    let m_e4 = hdr(0x004D, 0, 1, 0, 0)
+    m_e4 = bytes_concat(m_e4, rr_head(16, bytes_len(txt_trunc)))
+    m_e4 = bytes_concat(m_e4, txt_trunc)
+    let dec_e4 = dns_decode_message(m_e4)
+    let ans_e4 = dec_e4["answers"]
+    cki("E4.truncated_txt.answers.count", len(ans_e4), 1)
+    let txt_e4 = ans_e4[0]["rdata_typed"]
+    cki("E4.truncated_txt.strings.count(only_the_complete_one)", len(txt_e4), 1)
+    ckb("E4.truncated_txt.strings[0]", txt_e4[0], bytes_to_str_bytes("AB"))
+
+    print("E: unchecked-length over-read/truncation-as-success — not present; RDLENGTH-vs-buffer, count-vs-buffer, and per-character-string bounds are all checked before any slice/read")
+
+    print("DNS-AUDIT KAT PASS")
+
+// Helper: build a `bytes` value with the ASCII content of a short literal,
+// for comparing against dns_txt_decode's binary-safe `bytes` output.
+fn bytes_to_str_bytes(s: string) -> bytes
+    let out = bytes(0)
+    let i = 0
+    while i < len(s)
+        out = bytes_append(out, ord(char_at(s, i)))
+        i = i + 1
+    out

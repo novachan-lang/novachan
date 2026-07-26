@@ -1,0 +1,287 @@
+// _kat_http2_audit — SOUNDNESS AUDIT of std/net/http2's binary wire decoder
+// against the 4 recurring decoder-vulnerability classes:
+//
+//   1. i64-OVERFLOW BOUNDS BYPASS   ("if pos+len > n" wraps negative)
+//   2. SENTINEL / ABSENT-VALUE COLLISION
+//   3. TRAILING-CONTENT ACCEPTANCE  (declared TLV not fully/exactly consumed)
+//   4. UNCHECKED LENGTH -> OVER-READ / truncation-as-success
+//
+// SCOPE: http2.nova has two decode paths that read attacker-controlled input:
+//   h2_frame_header_decode (fixed 9-byte structure; the only "length" it
+//   reads — the 24-bit frame-length field — is itself masked to 3 bytes, so
+//   it can never exceed 0xFFFFFF; the bounds check `pos+9 > bytes_len(b)`
+//   uses a CONSTANT addend, immune to overflow) and h2_hpack_int_decode
+//   (RFC 7541 §5.1 variable-length integer — the one place in this module
+//   that reconstructs an attacker-controlled MAGNITUDE from a chain of
+//   continuation bytes, functionally equivalent to a length prefix since
+//   every real caller — e.g. forge_grpc's HPACK string-length decode — uses
+//   the returned value directly as a length in its own `pos + len > n`
+//   bounds check).
+//
+// REAL BUG FOUND & FIXED in h2_hpack_int_decode (std/net/http2.nova):
+//
+//   CLASS 1 (i64-overflow bounds bypass), via an unsound continuation-byte
+//   cap. The decoder capped continuation bytes at 10 with a doc comment
+//   claiming "10 bytes covers values far beyond any real HTTP/2 use and
+//   still leaves headroom before 64-bit overflow of the accumulator" — that
+//   claim was FALSE. The reconstruction `value = value + (byte&0x7F) *
+//   (1<<m)` uses m = 0,7,14,...,63 across the 10 allowed continuation bytes;
+//   the 9th/10th terms (127*2^56 ≈ 9.15e18, 127*2^63 ≈ 1.17e21) individually
+//   approach or vastly exceed i64::MAX (~9.22e18). An attacker-crafted
+//   continuation sequence that terminates normally (clears the continuation
+//   bit) within the 10-byte cap — so `bad` never gets set — could therefore
+//   silently overflow/wrap the accumulator to a corrupted value (including a
+//   negative one) while still returning it as a "successful" decode
+//   (verified below: encoding int64::MAX = 0x7FFFFFFFFFFFFFFF legitimately
+//   needs 9 continuation bytes, comfortably inside the old 10-byte cap).
+//   A caller trusting that returned value as a length in overflow-sensitive
+//   arithmetic (`pos + len > buf_len`, exactly forge_grpc's
+//   _grpc_hpack_decode_string) would have that check defeated by the wrapped
+//   value — identical in effect to a raw i64-overflow length-prefix bypass.
+//
+//   FIX: the continuation-byte cap is now 6, the largest cap PROVABLY unable
+//   to overflow the accumulator even in the worst adversarial case (every
+//   mantissa byte = 127): max sum ≈ 4.4e12, six orders of magnitude below
+//   i64::MAX. 6 continuation bytes still comfortably covers every real
+//   HTTP/2 value (32-bit SETTINGS/window-size values need <=5; the codebase's
+//   existing 2^32-1 test vector needs exactly 5) — proven not to reject any
+//   legitimate value below. This also closes a CLASS 2 (sentinel collision)
+//   risk: pre-fix, an overflow-wrapped "successful" value could coincide
+//   with the -1 error sentinel by chance; post-fix, the reconstructed value
+//   is provably always in [0, ~4.4e12], so -1 can only ever mean genuine
+//   failure (the explicit `bad` path).
+//
+// CLASS 3 (trailing-content) VERDICT: not applicable / by design, proven
+// below. h2_conn_preface_check is documented and implemented as a PREFIX
+// check ("b starts with exactly the connection preface"), which is the
+// CORRECT contract — RFC 7540 §3.5 says the server MAY reply with a SETTINGS
+// frame right after the preface, so real traffic always has more bytes
+// following it; requiring exact-length match would reject every real
+// connection. h2_frame_header_decode likewise never claims to consume a
+// frame's payload — it reports `length` and `pos+9` for the CALLER to slice
+// the payload separately (an HTTP/2 connection is an open-ended stream of
+// frames, not a single closed TLV) — proven by decoding two back-to-back
+// frame headers out of one buffer with position tracking staying exact.
+//
+// CLASS 4 (unchecked length -> over-read): checked and sound. Every read in
+// h2_frame_header_decode is behind a single constant-addend bounds check
+// before any byte is touched. Every read in h2_hpack_int_decode's
+// continuation loop is behind a per-iteration `i >= bytes_len(b)` check
+// BEFORE the read. Both proven against truncated/negative/past-end inputs
+// below.
+import std/net/http2
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn ckb(label: string, got: bool, want: bool)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn main()
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 1 — VALID ROUND-TRIP (a rich message must decode unchanged)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 1a. Connection preface: fixed 24 bytes, self-check passes.
+    let preface = h2_conn_preface()
+    cki("rt_preface_len", bytes_len(preface), 24)
+    ckb("rt_preface_selfcheck", h2_conn_preface_check(preface), true)
+
+    // 1b. Frame header round trip (non-trivial field values in every slot).
+    let fh_enc = h2_frame_header_encode(500000, 1, 5, 123456789)
+    let fh_dec = h2_frame_header_decode(fh_enc, 0)
+    let fh_hdr = fh_dec[0]
+    cki("rt_fh_length", fh_hdr["length"], 500000)
+    cki("rt_fh_type", fh_hdr["type"], 1)
+    cki("rt_fh_flags", fh_hdr["flags"], 5)
+    cki("rt_fh_reserved", fh_hdr["reserved"], 0)
+    cki("rt_fh_stream_id", fh_hdr["stream_id"], 123456789)
+    cki("rt_fh_next_pos", fh_dec[1], 9)
+
+    // 1c. HPACK integer round trip across cusp/boundary AND real-world values.
+    let e10 = h2_hpack_int_encode(10, 5)
+    cki("rt_hp_10", h2_hpack_int_decode(e10, 0, 5)[0], 10)
+    let e31 = h2_hpack_int_encode(31, 5)  // == max_prefix exactly -> forces continuation
+    cki("rt_hp_31_cusp", h2_hpack_int_decode(e31, 0, 5)[0], 31)
+    let e127 = h2_hpack_int_encode(127, 7)  // == max_prefix exactly for 7-bit
+    cki("rt_hp_127_cusp", h2_hpack_int_decode(e127, 0, 7)[0], 127)
+    let e128 = h2_hpack_int_encode(128, 7)
+    cki("rt_hp_128", h2_hpack_int_decode(e128, 0, 7)[0], 128)
+    let e255 = h2_hpack_int_encode(255, 8)  // == max_prefix exactly for 8-bit
+    cki("rt_hp_255_cusp", h2_hpack_int_decode(e255, 0, 8)[0], 255)
+    let ebig = h2_hpack_int_encode(1000000, 7)
+    cki("rt_hp_1000000", h2_hpack_int_decode(ebig, 0, 7)[0], 1000000)
+    let e32max = h2_hpack_int_encode(4294967295, 7)  // 2^32-1, real SETTINGS/window-size ceiling
+    cki("rt_hp_2pow32minus1", h2_hpack_int_decode(e32max, 0, 7)[0], 4294967295)
+
+    // 1d. Static table lookup: exact match, name-only match (negated), no match.
+    cki("rt_static_exact_match", h2_static_lookup(":method", "GET"), 2)
+    cki("rt_static_name_only_match", h2_static_lookup(":path", "/custom"), 0 - 4)
+    cki("rt_static_no_match", h2_static_lookup("x-not-in-table", "v"), 0)
+
+    // 1e. Full assembled message: frame header + HPACK int payload, chained
+    // decode must land on the exact next position at every step (no drift).
+    let msg = bytes_concat(h2_frame_header_encode(2, 4, 0, 0), h2_hpack_int_encode(200, 8))
+    let m1 = h2_frame_header_decode(msg, 0)
+    cki("rt_msg_fh_next", m1[1], 9)
+    let m2 = h2_hpack_int_decode(msg, m1[1], 8)
+    cki("rt_msg_hp_value", m2[0], 200)
+    cki("rt_msg_hp_next_is_end", m2[1], bytes_len(msg))
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 2 — CLASS 1: i64-overflow bounds bypass (the real bug)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 2a. THE literal case the audit calls out: encode int64::MAX
+    // (0x7FFFFFFFFFFFFFFF = 9223372036854775807) as an HPACK integer and
+    // decode it back. A legitimate encoding of this magnitude needs 9
+    // continuation bytes (inside the OLD 10-byte cap, outside the NEW
+    // 6-byte cap) — must now be REJECTED, never silently accepted/corrupted.
+    let e_i64max = h2_hpack_int_encode(9223372036854775807, 7)
+    let d_i64max = h2_hpack_int_decode(e_i64max, 0, 7)
+    cki("c1_i64max_length_prefix_rejected", d_i64max[0], 0 - 1)
+
+    // 2b. Adversarial padding crafted to actually walk the accumulator
+    // through overflow territory under the OLD rules: first byte forces
+    // continuation (mantissa == max_prefix), 9 more continuation bytes each
+    // with the maximum mantissa (127), then a terminator — 10 continuation
+    // bytes total, exactly at the old (unsound) cap. Must be REJECTED.
+    let adv = bytes(11)
+    bytes_set(adv, 0, 0xFF)   // first byte: masked to 127 (7-bit prefix) -> forces continuation
+    let ai = 1
+    while ai <= 9
+        bytes_set(adv, ai, 0xFF)   // continuation bit set, mantissa 127
+        ai = ai + 1
+    bytes_set(adv, 10, 0x01)   // terminator: continuation bit clear, mantissa 1
+    let d_adv = h2_hpack_int_decode(adv, 0, 7)
+    cki("c1_adversarial_10cont_overflow_rejected", d_adv[0], 0 - 1)
+
+    // 2c. Exact boundary PROOF: a value needing exactly 6 continuation
+    // bytes (the new, sound cap) must still be ACCEPTED — the fix must not
+    // over-reject legitimate large values.
+    let e6 = h2_hpack_int_encode(100000000000, 7)
+    let cont6 = bytes_len(e6) - 1
+    cki("c1_boundary_needs_exactly_6_continuation_bytes", cont6, 6)
+    let d6 = h2_hpack_int_decode(e6, 0, 7)
+    cki("c1_boundary_6bytes_accepted", d6[0], 100000000000)
+
+    // 2d. One byte past the sound boundary: take the accepted 6-continuation
+    // encoding above, turn its terminator into a 7th continuation byte, and
+    // append a new terminator — must now be REJECTED purely by the cap,
+    // proving 6 is the exact, enforced cutoff (not an approximation).
+    let padded = bytes(0)
+    let pi = 0
+    while pi < bytes_len(e6) - 1
+        padded = bytes_append(padded, bytes_get(e6, pi))
+        pi = pi + 1
+    padded = bytes_append(padded, bytes_get(e6, bytes_len(e6) - 1) | 0x80)
+    padded = bytes_append(padded, 0x00)
+    let d_over = h2_hpack_int_decode(padded, 0, 7)
+    cki("c1_7_continuation_bytes_rejected", d_over[0], 0 - 1)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 3 — CLASS 2: sentinel / absent-value collision
+    // ════════════════════════════════════════════════════════════════════
+
+    // 3a. The largest ACCEPTED value (from 2c) must be a genuine large
+    // POSITIVE number, never negative — proves the accumulator can no
+    // longer wrap into the -1 error-sentinel's territory for accepted input.
+    if d6[0] < 0
+        print("FAIL c2_accepted_value_never_negative")
+        exit(1)
+    print("PASS c2_accepted_value_never_negative")
+
+    // 3b. A frame header whose fields are ALL literally zero (the value
+    // that "looks like" an absent/uninitialized sentinel) must still decode
+    // to a real 5-key dict, never collide with the {} truncation sentinel.
+    let fh_zero_enc = h2_frame_header_encode(0, 0, 0, 0)
+    let fh_zero_dec = h2_frame_header_decode(fh_zero_enc, 0)
+    cki("c2_allzero_header_not_empty_sentinel", len(keys(fh_zero_dec[0])), 5)
+    cki("c2_allzero_header_length_field", fh_zero_dec[0]["length"], 0)
+
+    // 3c. Static table name/value: index 1 (":authority") EXISTS but has no
+    // predefined value -> h2_static_value(1) == "" is legitimate, NOT "index
+    // out of range". Callers must (and can) disambiguate via h2_static_name,
+    // proven directly: name(1) is non-empty (valid index), name(999) IS
+    // empty (genuinely out of range) — the two "" cases are distinguishable.
+    cks("c2_static_value1_no_predefined_value", h2_static_value(1), "")
+    if h2_static_name(1) == ""
+        print("FAIL c2_static_name1_should_be_nonempty")
+        exit(1)
+    print("PASS c2_static_name1_should_be_nonempty")
+    cks("c2_static_name_outofrange_is_empty", h2_static_name(999), "")
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 4 — CLASS 3: trailing-content acceptance (verdict: by design)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 4a. Preface check must still pass with real trailing content appended
+    // (a SETTINGS frame, exactly what a real client sends) — rejecting this
+    // would break every real HTTP/2 connection; RFC 7540 §3.5 mandates more
+    // bytes follow the preface.
+    let settings_frame = h2_frame_header_encode(0, 4, 0, 0)
+    let preface_plus = bytes_concat(preface, settings_frame)
+    ckb("c3_preface_allows_legit_trailing_frame", h2_conn_preface_check(preface_plus), true)
+
+    // 4b. Truncated preface (23 of 24 bytes) must still be rejected — the
+    // "prefix, not exact" contract doesn't mean "any subset."
+    let preface_short = bytes_slice(preface, 0, 23)
+    ckb("c3_preface_truncated_rejected", h2_conn_preface_check(preface_short), false)
+
+    // 4c. Two back-to-back frame headers decoded out of ONE buffer: position
+    // tracking must land EXACTLY at the second header's start (proves
+    // h2_frame_header_decode's caller-driven "next frame" boundary is exact,
+    // not fuzzy — no silently-skipped or silently-absorbed trailing bytes).
+    let hdrA = h2_frame_header_encode(3, 0, 0, 1)   // DATA, 3-byte payload
+    let payloadA = bytes(3)
+    let hdrB = h2_frame_header_encode(0, 4, 0, 0)   // SETTINGS, empty
+    let two_frames = bytes_concat(bytes_concat(hdrA, payloadA), hdrB)
+    let decA = h2_frame_header_decode(two_frames, 0)
+    let bodyA_end = decA[1] + decA[0]["length"]
+    let decB = h2_frame_header_decode(two_frames, bodyA_end)
+    cki("c3_second_frame_type_exact", decB[0]["type"], 4)
+    cki("c3_second_frame_next_pos_is_buffer_end", decB[1], bytes_len(two_frames))
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 5 — CLASS 4: unchecked length -> over-read / truncation
+    // ════════════════════════════════════════════════════════════════════
+
+    // 5a. Frame header decode on buffers shorter than 9 bytes, at several
+    // sizes, must all return the {} sentinel — never read past the end.
+    cki("c4_fh_0bytes_rejected", len(keys(h2_frame_header_decode(bytes(0), 0)[0])), 0)
+    cki("c4_fh_1byte_rejected", len(keys(h2_frame_header_decode(bytes(1), 0)[0])), 0)
+    cki("c4_fh_8bytes_rejected", len(keys(h2_frame_header_decode(bytes(8), 0)[0])), 0)
+    cki("c4_fh_9bytes_accepted", len(keys(h2_frame_header_decode(bytes(9), 0)[0])), 5)
+
+    // 5b. Frame header decode: negative pos and past-end pos both rejected.
+    cki("c4_fh_negative_pos_rejected", len(keys(h2_frame_header_decode(bytes(9), 0 - 1)[0])), 0)
+    cki("c4_fh_past_end_pos_rejected", len(keys(h2_frame_header_decode(bytes(9), 1)[0])), 0)
+
+    // 5c. HPACK decode on an empty buffer must reject, not read a phantom
+    // in-bounds-checked-to-zero byte as a value.
+    cki("c4_hp_empty_buffer_rejected", h2_hpack_int_decode(bytes(0), 0, 7)[0], 0 - 1)
+
+    // 5d. HPACK decode: first byte signals "more bytes follow" but the
+    // buffer ends right there (truncated continuation) — must reject.
+    let trunc = bytes(1)
+    bytes_set(trunc, 0, 0x7F)   // 7-bit prefix, first byte == max_prefix -> continuation required
+    cki("c4_hp_truncated_continuation_rejected", h2_hpack_int_decode(trunc, 0, 7)[0], 0 - 1)
+
+    // 5e. HPACK decode: pos exactly at bytes_len(b) (one past the last
+    // valid index) and pos negative — both rejected, not OOB-read.
+    cki("c4_hp_pos_at_end_rejected", h2_hpack_int_decode(e10, bytes_len(e10), 5)[0], 0 - 1)
+    cki("c4_hp_pos_negative_rejected", h2_hpack_int_decode(e10, 0 - 1, 5)[0], 0 - 1)
+
+    print("HTTP2-AUDIT KAT PASS")

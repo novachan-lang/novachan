@@ -1,0 +1,387 @@
+// _kat_cbor_audit — SOUNDNESS AUDIT of std/data/cbor's binary wire decoder
+// against the 4 recurring decoder-vulnerability classes:
+//
+//   1. i64-OVERFLOW BOUNDS BYPASS   ("if pos+len > n" wraps negative)
+//   2. SENTINEL / ABSENT-VALUE COLLISION
+//   3. TRAILING-CONTENT ACCEPTANCE  (declared TLV not fully/exactly consumed)
+//   4. UNCHECKED LENGTH -> OVER-READ / truncation-as-success
+//
+// REAL BUGS FOUND & FIXED in _cb_decode_item (std/data/cbor.nova):
+//
+//   (i) CLASS 1 + 4 (the headline bug): the decoder had ZERO validation of
+//   the CBOR argument (`arg`) against the bytes actually remaining before
+//   using it to bound a read/slice loop for major 2 (byte string), major 3
+//   (text string), major 4 (array) and major 5 (map). A byte/text-string
+//   length near i64 max (the 8-byte-argument encoding of 2^63-1 =
+//   0x7FFFFFFFFFFFFFFF) drove a `while bi < arg` loop that would try to
+//   iterate ~9.2e18 times -- an unbounded-time hang / denial of service
+//   (bytes_get is itself bounds-checked and returns 0 out of range, so this
+//   never crashed or read wild memory -- it just never finished). The same
+//   argument encoding as all-0xFF (2^64-1) wraps to -1 in NOVA's defined
+//   64-bit wraparound arithmetic; with no `arg >= 0` guard, that negative
+//   length was accepted and silently treated as an empty item while
+//   REWINDING the cursor backward (`cur = cur + arg` with arg = -1),
+//   desynchronizing any enclosing array/map/stream decode. A length that
+//   merely overran the remaining buffer (without any overflow) was also
+//   accepted: bytes_get's internal bounds check silently supplies 0 for
+//   every out-of-range byte, so a truncated string/array/map decoded as
+//   "successful" with phantom zero content instead of being rejected --
+//   textbook truncation-as-success. The same gap applied to the 1/2/4/8
+//   trailing bytes that encode a wide argument itself (info 24/25/26/27):
+//   with no bounds check there either, a length whose OWN extension bytes
+//   were truncated silently read as 0 instead of being rejected. Also, the
+//   two reserved/indefinite-length info nibbles CBOR defines (28-30
+//   reserved, 31 = indefinite-length) were not handled -- `done_arg` simply
+//   stayed unset and `arg` silently defaulted to 0, again "succeeding" with
+//   a wrong, corrupting cursor instead of being rejected.
+//
+//   FIX: every length/count-bearing decode is now validated with the
+//   overflow-safe form `arg >= 0 and arg <= n - cur` (n = bytes_len(b))
+//   BEFORE it drives any loop -- never `cur + arg > n`, which is exactly the
+//   form that overflows/wraps for an attacker-chosen arg near i64 max. The
+//   argument-extension bytes (24/25/26/27) are only read if
+//   `n - cur >= width`. Any info nibble that doesn't resolve an argument
+//   (28-31) leaves `done_arg == 0`, which is now checked and rejected. For
+//   major 4/5 the recursive/sibling sub-decode's returned next_pos is
+//   checked after every element/pair and the whole container decode is
+//   aborted (not silently masked) the instant a nested item fails --
+//   otherwise a huge claimed count could still spin the outer while loop
+//   once per (immediately-failing) iteration.
+//
+//   (ii) CLASS 2-adjacent: major 6 (tag) and unsupported major-7 subtypes
+//   (float16/32/64, undefined, simple(n)) were silently decoded as CBOR
+//   null with a WRONG, non-advanced-past-the-real-payload cursor (for major
+//   6) or a cursor that WAS correctly advanced but with the real payload
+//   silently discarded (for major-7 floats) -- either way colliding with,
+//   and indistinguishable from, a genuine CBOR null (0xf6) decode. FIX:
+//   these are now explicit rejections (done_val stays 0), never coerced to
+//   null.
+//
+//   Sentinel used throughout: cb_decode_at / _cb_decode_item return
+//   [null, -1] on any error -- next_pos == -1 is unambiguous because a
+//   valid next_pos is always >= 0 (matches the convention already used by
+//   asn1_parse.nova's TLV readers in this same directory). cb_decode (bare
+//   `-> any`) returns null on error, same as it returns for a genuine CBOR
+//   null -- a residual, DOCUMENTED ambiguity of that convenience wrapper
+//   (see cb_decode's doc comment); callers needing an unambiguous signal
+//   must use cb_decode_at and check next_pos < 0, verified below.
+//
+// CLASS 3 (trailing-content) VERDICT: not applicable / by design. cb_decode
+// is explicitly documented as decoding "the first CBOR item" and
+// cb_decode_at is a random-access/streaming primitive (a buffer may
+// legitimately hold a sequence of independent top-level CBOR items, e.g. a
+// CBOR sequence per RFC 8742). Under-consuming at the TOP level is the
+// intended contract, proven below: decoding one item out of a two-item
+// stream advances next_pos to EXACTLY that item's own length, never
+// bleeding into or silently dropping the next item.
+import std/data/cbor
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+// ckbytes: assert two `bytes` values are exactly equal (length + content).
+fn ckbytes(label: string, got: any, want: any)
+    let gl = bytes_len(got)
+    let wl = bytes_len(want)
+    if gl != wl
+        print("FAIL " + label + "_len: got " + str(gl) + " want " + str(wl))
+        exit(1)
+    let i = 0
+    while i < wl
+        let gb = bytes_get(got, i)
+        let wb = bytes_get(want, i)
+        if gb != wb
+            print("FAIL " + label + "_b" + str(i) + ": got " + str(gb) + " want " + str(wb))
+            exit(1)
+        i = i + 1
+    print("PASS " + label)
+
+fn main()
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 1 — VALID ROUND-TRIP (a rich message must decode unchanged)
+    // ════════════════════════════════════════════════════════════════════
+    let msg = {}
+    msg["id"] = 12345
+    msg["name"] = "nova-cbor"
+    msg["tags"] = ["alpha", "beta", "gamma"]
+    msg["nested"] = {"x": 1, "y": 0 - 2}
+    let payload = bytes(0)
+    payload = bytes_append(payload, 0)
+    payload = bytes_append(payload, 255)
+    payload = bytes_append(payload, 7)
+    msg["blob"] = payload
+
+    let enc = cb_encode(msg)
+    let dec = cb_decode(enc)
+    cki("rt_id", dec["id"], 12345)
+    cks("rt_name", dec["name"], "nova-cbor")
+    let dtags = dec["tags"]
+    cki("rt_tags_len", len(dtags), 3)
+    cks("rt_tags_0", dtags[0], "alpha")
+    cks("rt_tags_1", dtags[1], "beta")
+    cks("rt_tags_2", dtags[2], "gamma")
+    let dnested = dec["nested"]
+    cki("rt_nested_x", dnested["x"], 1)
+    cki("rt_nested_y", dnested["y"], 0 - 2)
+    let dblob = dec["blob"]
+    cki("rt_blob_len", bytes_len(dblob), 3)
+    cki("rt_blob_0", bytes_get(dblob, 0), 0)
+    cki("rt_blob_1", bytes_get(dblob, 1), 255)
+    cki("rt_blob_2", bytes_get(dblob, 2), 7)
+
+    // Re-encoding the decoded value must reproduce the EXACT original bytes
+    // (dict key insertion order is preserved through both encode and
+    // decode) -- proves the fix changed nothing about valid-input behavior.
+    let re_enc = cb_encode(dec)
+    ckbytes("rt_byte_exact", re_enc, enc)
+
+    // Boundary control: a 1-byte-length-extension (info=24) string with the
+    // declared length EXACTLY matching the real payload (arg == n-cur, the
+    // fix's `<=` boundary) must still round-trip, not off-by-one reject.
+    let s24 = "123456789012345678901234"
+    cki("boundary_s24_len_check", len(s24), 24)
+    let s24_dec = cb_decode(cb_encode(s24))
+    cks("boundary_s24_roundtrip", s24_dec, s24)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 2 — CLASS 1: i64-overflow bounds bypass
+    // ════════════════════════════════════════════════════════════════════
+
+    // 2a. Byte string (major 2) declaring the 8-byte argument
+    // 0x7FFFFFFFFFFFFFFF (2^63-1) -- the exact value that overflows a naive
+    // `cur + arg > n` bounds check -- with only the 9-byte header present
+    // (zero real content bytes). Pre-fix this drove a `while bi < arg` loop
+    // toward ~9.2e18 iterations (an effectively unbounded hang). Must
+    // reject immediately -- the check happens BEFORE the loop starts, so
+    // this call returning at all (let alone fast) is the proof.
+    let s2a = bytes_create(9)
+    bytes_set(s2a, 0, 0x5B)  // major 2, info 27 (8-byte length)
+    bytes_set(s2a, 1, 0x7F)
+    bytes_set(s2a, 2, 0xFF)
+    bytes_set(s2a, 3, 0xFF)
+    bytes_set(s2a, 4, 0xFF)
+    bytes_set(s2a, 5, 0xFF)
+    bytes_set(s2a, 6, 0xFF)
+    bytes_set(s2a, 7, 0xFF)
+    bytes_set(s2a, 8, 0xFF)
+    let d2a = cb_decode_at(s2a, 0)
+    cki("c1_bstr_i64max_rejected", d2a[1], 0 - 1)
+
+    // 2b. Same shape, declaring 0xFFFFFFFFFFFFFFFF (2^64-1), which wraps to
+    // -1 under NOVA's defined 64-bit wraparound arithmetic. A negative-arg
+    // guard must fire -- without it, `bi < arg` (0 < -1) is false so the
+    // loop wouldn't hang, but the decoder would accept it as a valid
+    // EMPTY item and then REWIND the cursor backward (`cur = cur + arg`),
+    // corrupting position tracking for anything decoded afterward.
+    let s2b = bytes_create(9)
+    bytes_set(s2b, 0, 0x5B)
+    bytes_set(s2b, 1, 0xFF)
+    bytes_set(s2b, 2, 0xFF)
+    bytes_set(s2b, 3, 0xFF)
+    bytes_set(s2b, 4, 0xFF)
+    bytes_set(s2b, 5, 0xFF)
+    bytes_set(s2b, 6, 0xFF)
+    bytes_set(s2b, 7, 0xFF)
+    bytes_set(s2b, 8, 0xFF)
+    let d2b = cb_decode_at(s2b, 0)
+    cki("c1_bstr_negwrap_rejected", d2b[1], 0 - 1)
+
+    // 2c. Array (major 4) declaring an element COUNT of 0x7FFFFFFFFFFFFFFF
+    // via the same 8-byte argument encoding, 9-byte buffer (zero elements
+    // actually present). Must reject before entering the element loop --
+    // proves the same overflow-safe bound protects the COUNT-bearing majors
+    // (4 array, 5 map), not just the byte-length-bearing ones (2, 3).
+    let s2c = bytes_create(9)
+    bytes_set(s2c, 0, 0x9B)  // major 4, info 27
+    bytes_set(s2c, 1, 0x7F)
+    bytes_set(s2c, 2, 0xFF)
+    bytes_set(s2c, 3, 0xFF)
+    bytes_set(s2c, 4, 0xFF)
+    bytes_set(s2c, 5, 0xFF)
+    bytes_set(s2c, 6, 0xFF)
+    bytes_set(s2c, 7, 0xFF)
+    bytes_set(s2c, 8, 0xFF)
+    let d2c = cb_decode_at(s2c, 0)
+    cki("c1_arr_i64max_rejected", d2c[1], 0 - 1)
+
+    // 2d. Map (major 5), same trick.
+    let s2d = bytes_create(9)
+    bytes_set(s2d, 0, 0xBB)  // major 5, info 27
+    bytes_set(s2d, 1, 0x7F)
+    bytes_set(s2d, 2, 0xFF)
+    bytes_set(s2d, 3, 0xFF)
+    bytes_set(s2d, 4, 0xFF)
+    bytes_set(s2d, 5, 0xFF)
+    bytes_set(s2d, 6, 0xFF)
+    bytes_set(s2d, 7, 0xFF)
+    bytes_set(s2d, 8, 0xFF)
+    let d2d = cb_decode_at(s2d, 0)
+    cki("c1_map_i64max_rejected", d2d[1], 0 - 1)
+
+    // 2e. Array with the all-0xFF (negative-wrap) count -- must reject, not
+    // silently accept a "0-element" array while rewinding the cursor.
+    let s2e = bytes_create(9)
+    bytes_set(s2e, 0, 0x9B)
+    bytes_set(s2e, 1, 0xFF)
+    bytes_set(s2e, 2, 0xFF)
+    bytes_set(s2e, 3, 0xFF)
+    bytes_set(s2e, 4, 0xFF)
+    bytes_set(s2e, 5, 0xFF)
+    bytes_set(s2e, 6, 0xFF)
+    bytes_set(s2e, 7, 0xFF)
+    bytes_set(s2e, 8, 0xFF)
+    let d2e = cb_decode_at(s2e, 0)
+    cki("c1_arr_negwrap_rejected", d2e[1], 0 - 1)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 3 — CLASS 2: sentinel / absent-value collision
+    // ════════════════════════════════════════════════════════════════════
+
+    // A genuine CBOR null must decode with an UNAMBIGUOUS success signal
+    // (next_pos != -1) via cb_decode_at, even though cb_decode's bare `any`
+    // return also happens to be null for both "real null" and "error".
+    let null_pair = cb_decode_at(cb_encode_null(), 0)
+    if null_pair[1] == 0 - 1
+        print("FAIL c2_real_null_not_error_sentinel")
+        exit(1)
+    print("PASS c2_real_null_not_error_sentinel")
+    if null_pair[0] != null
+        print("FAIL c2_real_null_value")
+        exit(1)
+    print("PASS c2_real_null_value")
+
+    // A malformed/truncated input must produce the -1 sentinel -- clearly
+    // distinguishable from the real-null case above via cb_decode_at, which
+    // is exactly the API a caller needing to distinguish must use.
+    let bad_pair = cb_decode_at(bytes(0), 0)
+    cki("c2_malformed_is_error_sentinel", bad_pair[1], 0 - 1)
+    if bad_pair[0] != null
+        print("FAIL c2_malformed_value_is_null")
+        exit(1)
+    print("PASS c2_malformed_value_is_null")
+
+    // Unsupported major 6 (tag) must be REJECTED, not silently decoded as
+    // null with a wrong cursor (the pre-fix behavior this class of bug
+    // describes: an unrecognized encoding colliding with the null
+    // sentinel). tag(0) wrapping int(1): buffer = [0xC0, 0x01].
+    let s3tag = bytes_create(2)
+    bytes_set(s3tag, 0, 0xC0)
+    bytes_set(s3tag, 1, 0x01)
+    let d3tag = cb_decode_at(s3tag, 0)
+    cki("c2_tag_rejected_not_null_collision", d3tag[1], 0 - 1)
+
+    // Unsupported major-7 float32 (info 26) must be REJECTED, not silently
+    // decoded as null while discarding the real payload. Encodes float
+    // 1.0f = 0x3F800000: buffer = [0xFA, 0x3F, 0x80, 0x00, 0x00].
+    let s3f = bytes_create(5)
+    bytes_set(s3f, 0, 0xFA)
+    bytes_set(s3f, 1, 0x3F)
+    bytes_set(s3f, 2, 0x80)
+    bytes_set(s3f, 3, 0x00)
+    bytes_set(s3f, 4, 0x00)
+    let d3f = cb_decode_at(s3f, 0)
+    cki("c2_float32_rejected_not_null_collision", d3f[1], 0 - 1)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 4 — CLASS 3: trailing-content acceptance (verdict: by design)
+    // ════════════════════════════════════════════════════════════════════
+    let item1 = cb_encode(42)
+    let item2 = cb_encode("hi")
+    let stream = bytes_concat(item1, item2)
+    let p1 = cb_decode_at(stream, 0)
+    cki("c3_first_val", p1[0], 42)
+    cki("c3_first_next_pos_exact", p1[1], bytes_len(item1))
+    let p2 = cb_decode_at(stream, p1[1])
+    cks("c3_second_val", p2[0], "hi")
+    cki("c3_second_next_pos_exact", p2[1], bytes_len(stream))
+    // cb_decode intentionally decodes only the first item and ignores
+    // trailing bytes -- documented streaming contract, not a bug.
+    cki("c3_cb_decode_first_only", cb_decode(stream), 42)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 5 — CLASS 4: unchecked length -> over-read / truncation-as-
+    // success (the headline bug, more shapes)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 5a. Empty buffer entirely: pre-fix, bytes_get(b,0) on an empty bytes
+    // value returns 0 (the runtime's own OOB-safe default), which pre-fix
+    // decoded as a "successful" CBOR unsigned int 0. Must now be rejected.
+    let s5a = bytes(0)
+    let d5a_at = cb_decode_at(s5a, 0)
+    cki("c4_empty_buffer_rejected", d5a_at[1], 0 - 1)
+    let d5a_dec = cb_decode(s5a)
+    if d5a_dec != null
+        print("FAIL c4_empty_buffer_cb_decode_null")
+        exit(1)
+    print("PASS c4_empty_buffer_cb_decode_null")
+
+    // 5b. 1-byte-length text string (info=24) declaring length 24 with only
+    // 2 real payload bytes present. Pre-fix this silently produced a
+    // 2-character "phantom-padded" string result (2 real chars + 22 NUL
+    // chars read via bytes_get's OOB-safe 0) instead of being rejected.
+    let s5b = bytes_create(4)
+    bytes_set(s5b, 0, 0x78)  // major 3, info 24
+    bytes_set(s5b, 1, 24)    // declared length = 24
+    bytes_set(s5b, 2, 0x41)  // 'A'
+    bytes_set(s5b, 3, 0x42)  // 'B'
+    let d5b = cb_decode_at(s5b, 0)
+    cki("c4_truncated_text_rejected", d5b[1], 0 - 1)
+
+    // 5c. Truncated 4-byte argument-extension itself (info=26) with ZERO of
+    // the 4 required extension bytes present. Pre-fix this read 4 phantom
+    // zero bytes via bytes_get's OOB-safe default, silently producing
+    // arg=0 and "successfully" decoding as unsigned int 0.
+    let s5c = bytes_create(1)
+    bytes_set(s5c, 0, 0x1A)  // major 0, info 26 (needs 4 more bytes -- none present)
+    let d5c = cb_decode_at(s5c, 0)
+    cki("c4_truncated_arg_ext4_rejected", d5c[1], 0 - 1)
+
+    // 5d. Truncated 2-byte argument-extension (info=25) with only 1 of the
+    // 2 required bytes present.
+    let s5d = bytes_create(2)
+    bytes_set(s5d, 0, 0x19)  // major 0, info 25 (needs 2 more bytes -- only 1 present)
+    bytes_set(s5d, 1, 0x01)
+    let d5d = cb_decode_at(s5d, 0)
+    cki("c4_truncated_arg_ext2_rejected", d5d[1], 0 - 1)
+
+    // 5e. Reserved info nibble 28 (not indefinite-length, just unassigned)
+    // under major 0. Pre-fix, none of the info==24/25/26/27 branches
+    // matched, so `arg` silently defaulted to its initial value 0 and the
+    // byte "successfully" decoded as unsigned int 0.
+    let s5e = bytes_create(1)
+    bytes_set(s5e, 0, 0x1C)  // major 0, info 28 (reserved)
+    let d5e = cb_decode_at(s5e, 0)
+    cki("c4_reserved_info28_rejected", d5e[1], 0 - 1)
+
+    // 5f. Indefinite-length marker (info 31) under major 3 (text string).
+    // This decoder does not implement RFC 8949's indefinite-length
+    // streaming chunks; pre-fix this silently decoded as an EMPTY string
+    // with the cursor left pointing at the byte immediately after the
+    // marker -- i.e. at the START of what should have been the first
+    // indefinite-length chunk -- corrupting any subsequent element in an
+    // enclosing array/map. Proven directly: an array of 2 items where item
+    // 0 is this malformed marker and item 1 is a normal encoded int(42)
+    // must reject the WHOLE array, never return a partially-decoded
+    // result or silently skip to decoding item 1 as if it were item 0.
+    let s5f = bytes_create(4)
+    bytes_set(s5f, 0, 0x82)  // major 4 (array), info 2 -- 2 elements
+    bytes_set(s5f, 1, 0x7F)  // element 0: major 3, info 31 (indefinite -- malformed)
+    bytes_set(s5f, 2, 0x18)  // element 1 would-be: major 0, info 24
+    bytes_set(s5f, 3, 42)    //   ... value 42
+    let d5f = cb_decode_at(s5f, 0)
+    cki("c4_indefinite_in_array_rejects_whole_array", d5f[1], 0 - 1)
+    if d5f[0] != null
+        print("FAIL c4_indefinite_in_array_value_is_null")
+        exit(1)
+    print("PASS c4_indefinite_in_array_value_is_null")
+
+    print("CBOR-AUDIT KAT PASS")

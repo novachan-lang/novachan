@@ -21,6 +21,22 @@
 //   Major 5  — map (encode only); NOVA dict -> CBOR map.
 //   Major 7  — simple values: false (0xf4), true (0xf5), null (0xf6).
 //
+// DECODE ERROR HANDLING (security-relevant)
+//   The decoder validates every length/count argument against the bytes
+//   actually remaining in the input BEFORE using it to slice or loop —
+//   comparing as `arg > n - cur` (never `cur + arg > n`, which can overflow
+//   and wrap negative for an attacker-chosen arg near i64 max, e.g. the
+//   8-byte-argument encoding of 2^63-1).  Truncated input, a length/count
+//   that overruns the buffer, and unsupported encodings (major-6 tags,
+//   major-7 floats/undefined/simple(n), the reserved/indefinite-length info
+//   nibbles 28-31) are all REJECTED rather than silently mis-decoded.
+//   cb_decode_at returns [null, -1] on any such error — next_pos == -1 is
+//   the error sentinel (a valid next_pos is always >= 0).  cb_decode (which
+//   returns a bare `any`) returns null on error, the same value CBOR's own
+//   null (0xf6) decodes to; callers that must distinguish "the message
+//   legitimately contained null" from "decode failed" should use
+//   cb_decode_at(b, 0) and check pair[1] < 0 instead.
+//
 // NOVA TYPE NOTE
 //   type_of(true) == "int" (booleans are unboxed ints in NOVA).  cb_encode
 //   therefore treats plain ints as CBOR unsigned/negative integers.  Use
@@ -37,6 +53,9 @@
 //   - Single-exit style throughout (avoids the NOVA early-return mistag bug).
 //   - No multi-line list/dict literals (NOVA parser limitation).
 //   - Brace characters via chr(123)/chr(125) to avoid string interpolation.
+//   - _cb_decode_item bounds-checks every attacker-controlled length/count
+//     against bytes_len(b) before it drives a read loop or slice; see
+//     "DECODE ERROR HANDLING" above.
 // ============================================================================
 
 // ── Private: encode a CBOR "head" (major type + argument) ────────────────────
@@ -104,6 +123,18 @@ fn _cb_enc_str(s: string) -> any
         i = i + 1
     return out
 
+// _cb_enc_bytes: encode a NOVA `bytes` value as a CBOR byte string (major 2).
+// Binary-safe — NUL and any other byte value pass through unchanged, unlike
+// text strings which go through NOVA's C-string representation.
+fn _cb_enc_bytes(bv: any) -> any
+    let n = bytes_len(bv)
+    let out = _cb_head(2, n)
+    let i = 0
+    while i < n
+        out = bytes_append(out, bytes_get(bv, i))
+        i = i + 1
+    return out
+
 // _cb_enc_list: encode a NOVA list as CBOR array (major 4).
 // Each element is recursively encoded.
 fn _cb_enc_list(arr: any) -> any
@@ -138,6 +169,7 @@ fn _cb_enc_dict(d: any) -> any
 //
 //   int     -> CBOR unsigned int (major 0) or negative int (major 1)
 //   string  -> CBOR text string (major 3)
+//   bytes   -> CBOR byte string (major 2), binary-safe
 //   list    -> CBOR array (major 4), elements recursively encoded
 //   dict    -> CBOR map (major 5), string keys + recursively encoded values
 //   other   -> CBOR null (0xf6) as a safe fallback
@@ -160,9 +192,12 @@ fn cb_encode(v) -> any
             if t == "dict"
                 result = _cb_enc_dict(v)
             else
-                // int (including bool=0/1): encode as CBOR integer
-                // For CBOR null/true/false use cb_encode_null / cb_encode_bool.
-                result = _cb_enc_int(v)
+                if t == "bytes"
+                    result = _cb_enc_bytes(v)
+                else
+                    // int (including bool=0/1): encode as CBOR integer
+                    // For CBOR null/true/false use cb_encode_null / cb_encode_bool.
+                    result = _cb_enc_int(v)
     return result
 
 // cb_encode_bool: encode a NOVA bool as CBOR simple value (major 7).
@@ -198,120 +233,226 @@ fn _cb_read_uint(b: any, pos: int, n: int) -> int
 // _cb_decode_item: decode one CBOR item starting at byte position `pos` in
 // bytes value `b`.  Returns a two-element NOVA list: [decoded_value, next_pos].
 //
+// SOUNDNESS: every attacker-controlled length/count (`arg`) is validated
+// against the bytes actually remaining — `n - cur` (n = bytes_len(b)) —
+// BEFORE it is used to bound a read/slice loop.  This is deliberately never
+// written as `cur + arg > n`: for an 8-byte CBOR argument, arg can be as
+// large as 2^64-1, and `cur + arg` on NOVA's wrapping 64-bit int would
+// overflow and wrap negative for an arg near i64 max (e.g. 2^63-1 =
+// 0x7FFFFFFFFFFFFFFF), making a naive `> n` overflow check pass and a
+// truncation slip through.  `arg > n - cur` cannot overflow: n and cur are
+// always small, non-negative, buffer-derived offsets.
+//
+// On any malformed/truncated/unsupported input this returns [null, -1] —
+// next_pos == -1 is the error sentinel (a valid next_pos is always >= 0),
+// matching the convention used by asn1_parse.nova's TLV readers in this
+// same directory.  The major-4/5 loops below check every recursive/sibling
+// sub-decode for this sentinel and stop immediately rather than looping on
+// (or masking) a nested failure.
+//
 // This is the core recursive decoder.  It handles:
 //   Major 0  — unsigned int
 //   Major 1  — negative int
+//   Major 2  — byte string (binary-safe, returned as a NOVA `bytes` value)
 //   Major 3  — text string
 //   Major 4  — array (recursive)
+//   Major 5  — map (recursive; keys become NOVA dict keys)
 //   Major 7  — simple: false(20)/true(21)/null(22) in info field
+// Major 6 (tag), major-7 floats/undefined/simple(n), and the reserved/
+// indefinite-length info nibbles (28-31) are not supported and are
+// rejected — never silently mis-decoded as null with a corrupted position.
 fn _cb_decode_item(b: any, pos: int) -> list
-    let initial = bytes_get(b, pos)
-    let major = (initial >> 5) & 7
-    let info = initial & 31
-    let cur = pos + 1
+    let n = bytes_len(b)
     let result = []
-
-    // Determine the argument value and advance cur past any additional bytes.
-    let arg = 0
-    let done_arg = 0
-    if info < 24
-        arg = info
-        done_arg = 1
-    else
-        if done_arg == 0
-            if info == 24
-                arg = bytes_get(b, cur)
-                cur = cur + 1
-                done_arg = 1
-    if done_arg == 0
-        if info == 25
-            arg = _cb_read_uint(b, cur, 2)
-            cur = cur + 2
-            done_arg = 1
-    if done_arg == 0
-        if info == 26
-            arg = _cb_read_uint(b, cur, 4)
-            cur = cur + 4
-            done_arg = 1
-    if done_arg == 0
-        if info == 27
-            arg = _cb_read_uint(b, cur, 8)
-            cur = cur + 8
-            done_arg = 1
-
-    // Decode by major type.
     let val = null
-    let done_val = 0
+    let cur = -1
+    let ok = 0
 
-    if major == 0
-        val = arg
-        done_val = 1
-    if done_val == 0
-        if major == 1
-            val = 0 - 1 - arg
-            done_val = 1
-    if done_val == 0
-        if major == 3
-            let s = ""
-            let si = 0
-            while si < arg
-                s = s + chr(bytes_get(b, cur + si))
-                si = si + 1
-            cur = cur + arg
-            val = s
-            done_val = 1
-    if done_val == 0
-        if major == 4
-            let arr = []
-            let ai = 0
-            while ai < arg
-                let sub = _cb_decode_item(b, cur)
-                arr.push(sub[0])
-                cur = sub[1]
-                ai = ai + 1
-            val = arr
-            done_val = 1
-    if done_val == 0
-        if major == 5
-            let d = {}
-            let mi = 0
-            while mi < arg
-                let ksub = _cb_decode_item(b, cur)
-                cur = ksub[1]
-                let vsub = _cb_decode_item(b, cur)
-                cur = vsub[1]
-                d[ksub[0]] = vsub[0]
-                mi = mi + 1
-            val = d
-            done_val = 1
-    if done_val == 0
-        if major == 7
-            // Simple values: info 20=false, 21=true, 22=null
-            if info == 20
-                val = 0
+    if pos >= 0
+        if pos < n
+            ok = 1
+
+    if ok == 1
+        let initial = bytes_get(b, pos)
+        let major = (initial >> 5) & 7
+        let info = initial & 31
+        cur = pos + 1
+
+        // Determine the argument value and advance cur past any additional
+        // bytes — only if those bytes actually exist in the buffer.  A
+        // length/count whose extension bytes overrun the buffer, or a
+        // reserved/indefinite-length info nibble (28-31, unhandled below),
+        // leaves done_arg == 0 and is rejected just below.
+        let arg = 0
+        let done_arg = 0
+        if info < 24
+            arg = info
+            done_arg = 1
+        else
+            if info == 24
+                if n - cur >= 1
+                    arg = bytes_get(b, cur)
+                    cur = cur + 1
+                    done_arg = 1
+        if done_arg == 0
+            if info == 25
+                if n - cur >= 2
+                    arg = _cb_read_uint(b, cur, 2)
+                    cur = cur + 2
+                    done_arg = 1
+        if done_arg == 0
+            if info == 26
+                if n - cur >= 4
+                    arg = _cb_read_uint(b, cur, 4)
+                    cur = cur + 4
+                    done_arg = 1
+        if done_arg == 0
+            if info == 27
+                if n - cur >= 8
+                    arg = _cb_read_uint(b, cur, 8)
+                    cur = cur + 8
+                    done_arg = 1
+
+        if done_arg == 0
+            ok = 0
+            cur = -1
+        else
+            // Decode by major type.
+            let done_val = 0
+
+            if major == 0
+                val = arg
                 done_val = 1
-            else
-                if info == 21
-                    val = 1
+            if done_val == 0
+                if major == 1
+                    val = 0 - 1 - arg
                     done_val = 1
-                else
-                    val = null
-                    done_val = 1
+            if done_val == 0
+                if major == 2
+                    if arg >= 0
+                        if arg <= n - cur
+                            let bv = bytes(0)
+                            let bi = 0
+                            while bi < arg
+                                bv = bytes_append(bv, bytes_get(b, cur + bi))
+                                bi = bi + 1
+                            cur = cur + arg
+                            val = bv
+                            done_val = 1
+            if done_val == 0
+                if major == 3
+                    if arg >= 0
+                        if arg <= n - cur
+                            let s = ""
+                            let si = 0
+                            while si < arg
+                                s = s + chr(bytes_get(b, cur + si))
+                                si = si + 1
+                            cur = cur + arg
+                            val = s
+                            done_val = 1
+            if done_val == 0
+                if major == 4
+                    if arg >= 0
+                        if arg <= n - cur
+                            let arr = []
+                            let ai = 0
+                            let cont = 1
+                            while cont == 1
+                                if ai >= arg
+                                    cont = 0
+                                else
+                                    let sub = _cb_decode_item(b, cur)
+                                    let sub_next = sub[1]
+                                    if sub_next < 0
+                                        cont = 0
+                                        cur = -1
+                                    else
+                                        arr.push(sub[0])
+                                        cur = sub_next
+                                        ai = ai + 1
+                            if cur >= 0
+                                val = arr
+                                done_val = 1
+            if done_val == 0
+                if major == 5
+                    if arg >= 0
+                        if arg <= n - cur
+                            let d = {}
+                            let mi = 0
+                            let cont = 1
+                            while cont == 1
+                                if mi >= arg
+                                    cont = 0
+                                else
+                                    let ksub = _cb_decode_item(b, cur)
+                                    let k_next = ksub[1]
+                                    if k_next < 0
+                                        cont = 0
+                                        cur = -1
+                                    else
+                                        cur = k_next
+                                        let vsub = _cb_decode_item(b, cur)
+                                        let v_next = vsub[1]
+                                        if v_next < 0
+                                            cont = 0
+                                            cur = -1
+                                        else
+                                            d[ksub[0]] = vsub[0]
+                                            cur = v_next
+                                            mi = mi + 1
+                            if cur >= 0
+                                val = d
+                                done_val = 1
+            if done_val == 0
+                if major == 7
+                    // Simple values: info 20=false, 21=true, 22=null.
+                    // Other major-7 subtypes (floats 25/26/27, undefined 23,
+                    // simple(n) 24) are not supported — done_val stays 0 and
+                    // the input is rejected below, never silently coerced
+                    // to null.
+                    if info == 20
+                        val = 0
+                        done_val = 1
+                    else
+                        if info == 21
+                            val = 1
+                            done_val = 1
+                        else
+                            if info == 22
+                                val = null
+                                done_val = 1
+
+            if done_val == 0
+                ok = 0
+                cur = -1
+
+    if ok == 0
+        val = null
+        cur = -1
 
     result.push(val)
     result.push(cur)
     return result
 
 // cb_decode_at: decode one CBOR item starting at byte offset `pos` in `b`.
-// Returns a two-element list: [decoded_value, next_position].
+// Returns a two-element list: [decoded_value, next_position].  On malformed,
+// truncated, or unsupported input returns [null, -1] — next_position == -1
+// is the unambiguous error sentinel (a valid next_position is always >= 0).
+// Callers that must detect failure MUST check pair[1] < 0.
 //
 // Examples:
 //   cb_decode_at(cb_encode(42), 0)  -> [42, 1]
 //   cb_decode_at(cb_encode("hi"), 0) -> ["hi", 4]
+//   cb_decode_at(<truncated bytes>, 0) -> [null, -1]
 fn cb_decode_at(b: any, pos: int) -> list
     return _cb_decode_item(b, pos)
 
 // cb_decode: decode the first CBOR item from bytes `b` and return its value.
+// On malformed/truncated/unsupported input returns null — the same value
+// CBOR's own null (0xf6) decodes to.  Callers that must distinguish "the
+// message legitimately contained null" from "decode failed" cannot do so
+// through this bare-value API; use cb_decode_at(b, 0) and check pair[1] < 0.
 //
 // Examples:
 //   cb_decode(cb_encode(42))         -> 42

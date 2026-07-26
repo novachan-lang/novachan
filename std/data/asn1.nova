@@ -34,6 +34,12 @@
 //     Return the decoded content length from a DER TLV value starting at
 //     byte index 1.  Handles short form (< 0x80) and long form
 //     (0x81 = 1 additional length byte, 0x82 = 2 additional length bytes).
+//     Bounds-checked: returns -1 if the length-field bytes themselves are
+//     truncated (buffer too short to hold the declared form), if the
+//     control byte is the BER indefinite-length marker (0x80, invalid in
+//     DER), or if the control byte requests an unsupported long form
+//     (0x83+ — this decoder only supports lengths up to 65535).  -1 can
+//     never collide with a real decoded length (always 0..65535).
 //
 // PRIVATE helpers:
 //   _asn_bytes(s) -> bytes   — convert a string to bytes via str_to_bytes
@@ -59,6 +65,14 @@
 //   asn_length(asn_encode_octetstring(_asn_bytes("ABC"))) == 3
 //   asn_encode_sequence([asn_encode_int(1), asn_encode_int(2)])
 //     == [48, 6, 2, 1, 1, 2, 1, 2]
+//   Malformed-input rejection (see nova-compiler/test_programs/_kat_asn1_audit.nova):
+//   asn_length([0x02])                   == -1  (no length byte at all)
+//   asn_length([0x02, 0x81])             == -1  (0x81 form, missing byte)
+//   asn_length([0x02, 0x82, 0xFF])       == -1  (0x82 form, 1 of 2 bytes)
+//   asn_length([0x02, 0x80])             == -1  (BER indefinite length)
+//   asn_length([0x02, 0x88, ...8 bytes]) == -1  (unsupported wide long-form —
+//     the closest reachable analog of a 2^63-1-style oversized length claim;
+//     this format's long form tops out at 2 bytes / a 65535 max length)
 // ============================================================================
 
 // _asn_bytes: convert string to bytes (convenience wrapper).
@@ -166,16 +180,37 @@ fn asn_tag(b: any) -> int
 // Reads the length field starting at byte index 1 (immediately after the tag).
 // Handles:
 //   Short form (byte < 0x80): length = that byte.
-//   Long form 0x81: length = next byte.
-//   Long form 0x82: length = (next byte << 8) | byte after that.
+//   Long form 0x81: length = next byte (requires that byte to be present).
+//   Long form 0x82: length = (next byte << 8) | byte after that (requires
+//     both bytes to be present).
+//   Anything else (0x80 indefinite-length marker, or 0x83+ which this
+//     minimal decoder does not support) is rejected.
+//
+// SOUNDNESS: bounds-checked against the ACTUAL buffer length (bytes_len(b))
+// before every read past byte index 1.  A truncated header — the length-form
+// control byte at index 1 claims 1 or 2 more bytes than the buffer actually
+// holds — is REJECTED (-1), never silently decoded from an out-of-range read
+// (nova_rt_bytes_get clamps out-of-range reads to 0, which previously made a
+// truncated/malformed header decode as a bogus-but-plausible length instead
+// of being rejected).  -1 is returned for every malformed/truncated/
+// unsupported case; it can never collide with a legitimately decoded length
+// (always 0..65535 by construction below), so it is an unambiguous error
+// sentinel — unlike 0, which is also a valid DER content length.
 fn asn_length(b: any) -> int
-    let first = bytes_get(b, 1)
-    let result = first
-    if first == 129
-        result = bytes_get(b, 2)
-    else
-        if first == 130
-            let hi = bytes_get(b, 2)
-            let lo = bytes_get(b, 3)
-            result = hi * 256 + lo
+    let total = bytes_len(b)
+    let result = -1
+    if total >= 2
+        let first = bytes_get(b, 1)
+        if first < 128
+            result = first
+        else
+            if first == 129
+                if total >= 3
+                    result = bytes_get(b, 2)
+            else
+                if first == 130
+                    if total >= 4
+                        let hi = bytes_get(b, 2)
+                        let lo = bytes_get(b, 3)
+                        result = hi * 256 + lo
     result

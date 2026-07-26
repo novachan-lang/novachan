@@ -1,0 +1,339 @@
+// _kat_avro_audit — independent soundness AUDIT KAT for std/encoding/avro.
+//
+// Hunts the 4 recurring binary-decoder vulnerability classes against every
+// DECODE path in avro.nova that reads a length/count/size from untrusted
+// input and then slices/indexes the buffer:
+//
+//   1. i64-OVERFLOW BOUNDS BYPASS  (`pos+len>n` wraps negative on a huge len)
+//   2. SENTINEL / ABSENT-VALUE COLLISION
+//   3. TRAILING-CONTENT ACCEPTANCE (declared length not fully verified)
+//   4. UNCHECKED LENGTH -> OVER-READ / truncation-as-success
+//
+// CONCLUSION (see audit report): av_decode_bytes/av_decode_string already
+// use the OVERFLOW-SAFE comparison form (`take > avail`, a direct compare
+// against the actual remaining-byte count -- never `pos + declared_len`), so
+// class 1 cannot bypass the bounds clamp even at the maximal length prefix
+// 0x7FFFFFFFFFFFFFFF (2^63-1). Class 2 does not apply to this module's
+// design (av_decode_null's sentinel is never confused with real data because
+// Avro's null type carries zero wire bytes; av_decode_union returns the RAW
+// unclamped branch index alongside the dispatched value specifically so a
+// corrupt branch is never silently indistinguishable from a valid one).
+// Class 3 does not apply to record/union (Avro's grammar declares no
+// envelope length for them to under/over-consume); array/map/record decoders
+// verifiably stop exactly at the grammar boundary and never absorb trailing
+// bytes into the decoded value. Class 4's OVER-READ half is fully closed
+// (bounds-checked before every slice); its "truncated payload returned as a
+// bounded, non-fabricated result" half is a pre-existing, DELIBERATE,
+// already-KAT-tested (see _avro_kat_test.nova test_bytes) convention shared
+// byte-for-byte with std/encoding/protobuf's pb_read_len_delim, which this
+// module's own header cites as its model -- changing it would require
+// migrating the entire dec(buf,pos)->[value,next_pos] composition contract
+// used by av_decode_array/map/record/union to Result, which is a wholesale
+// redesign, not a minimal fix, so it is left as-is and re-proven safe here.
+//
+// No code change to avro.nova was required; this file is the proof.
+import std/encoding/avro
+
+// ── generic helpers ─────────────────────────────────────────────────────────
+
+fn _kaa_bytes_eq(a, b) -> int
+    let la = bytes_len(a)
+    let lb = bytes_len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if bytes_get(a, i) != bytes_get(b, i)
+            return 0
+        i = i + 1
+    1
+
+fn _kaa_make_bytes(lst) -> any
+    let buf = bytes_create(0)
+    let i = 0
+    while i < len(lst)
+        buf = bytes_append(buf, lst[i])
+        i = i + 1
+    buf
+
+fn ci(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+fn cs(label: string, got: string, want: string) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + got + " want=" + want)
+        exit(1)
+    0
+
+fn cb(label, got, want_list) -> int
+    let want = _kaa_make_bytes(want_list)
+    if _kaa_bytes_eq(got, want) == 0
+        print("FAIL " + label + ": got len=" + str(bytes_len(got)) + " want len=" + str(len(want_list)))
+        exit(1)
+    0
+
+// wrapper so av_decode_union can be threaded through av_decode_record as a
+// plain fn(buf,pos)->[value,next_pos] decoder (av_decode_union itself
+// returns the 3-element [idx,value,next_pos] -- callers compose their own
+// adapter exactly like this, matching the module's documented usage style).
+fn _kaa_dec_union_null_string(buf: any, pos: int) -> list
+    let decoders = []
+    push(decoders, av_decode_null)
+    push(decoders, av_decode_string)
+    let r = av_decode_union(buf, pos, decoders)
+    [r[1], r[2]]
+
+fn _kaa_dec_array_long(buf: any, pos: int) -> list
+    av_decode_array(buf, pos, av_decode_long)
+
+fn _kaa_dec_map_long(buf: any, pos: int) -> list
+    av_decode_map(buf, pos, av_decode_long)
+
+// ── (a) VALID MESSAGE ROUND-TRIPS UNCHANGED ─────────────────────────────────
+// One record touching every primitive and complex type together, mimicking
+// a real schema. Proves encode->decode reproduces every field exactly AND
+// that decoding consumes precisely the encoded byte count (no more, no
+// less) -- the positive control every rejection test below is contrasted
+// against.
+
+fn test_valid_roundtrip_unchanged()
+    let raw = _kaa_make_bytes([0x00, 0xFF, 0x10, 0x00])
+    let pairs = []
+    push(pairs, ["x", 1])
+    push(pairs, ["y", 2])
+
+    let fields = []
+    push(fields, av_encode_long(123456789))
+    push(fields, av_encode_string("NOVA rocks"))
+    push(fields, av_encode_bytes(raw))
+    push(fields, av_encode_array([7, 8, 9], av_encode_long))
+    push(fields, av_encode_map(pairs, av_encode_long))
+    push(fields, av_encode_union(1, av_encode_string("chosen")))
+    let enc = av_encode_record(fields)
+
+    let decoders = []
+    push(decoders, av_decode_long)
+    push(decoders, av_decode_string)
+    push(decoders, av_decode_bytes)
+    push(decoders, _kaa_dec_array_long)
+    push(decoders, _kaa_dec_map_long)
+    push(decoders, _kaa_dec_union_null_string)
+    let dr = av_decode_record(enc, 0, decoders)
+    let vals = dr[0]
+
+    ci("valid.long", vals[0], 123456789)
+    cs("valid.string", vals[1], "NOVA rocks")
+    if _kaa_bytes_eq(vals[2], raw) == 0
+        print("FAIL valid.bytes: content mismatch")
+        exit(1)
+    let arr = vals[3]
+    ci("valid.array.len", len(arr), 3)
+    ci("valid.array[0]", arr[0], 7)
+    ci("valid.array[1]", arr[1], 8)
+    ci("valid.array[2]", arr[2], 9)
+    let mp = vals[4]
+    ci("valid.map.len", len(mp), 2)
+    cs("valid.map[0].k", mp[0][0], "x")
+    ci("valid.map[0].v", mp[0][1], 1)
+    cs("valid.map[1].k", mp[1][0], "y")
+    ci("valid.map[1].v", mp[1][1], 2)
+    cs("valid.union.val", vals[5], "chosen")
+    // FULL consumption: nothing left over, nothing missing.
+    ci("valid.fully_consumed", dr[1], bytes_len(enc))
+
+// ── CLASS 1: i64-overflow bounds bypass ─────────────────────────────────────
+// The classic bug shape: `if pos + declared_len > n` wraps negative for a
+// huge declared_len, silently skipping the truncation check. First prove
+// the hazard is real in raw arithmetic, then prove av_decode_bytes's actual
+// comparison form (`take > avail`, no addition before the compare) is
+// immune to it at the literal maximal value named by the audit.
+
+fn test_class1_overflow_hazard_is_real_in_raw_arithmetic()
+    // pos=10, declared_len=2^63-1: the BUGGY form `pos+declared_len` wraps
+    // to a large NEGATIVE i64 (two's-complement overflow), which would make
+    // `wrapped > n` FALSE for any real buffer length n -- silently bypassing
+    // the truncation check if avro.nova used this form. It does not (see
+    // below) but this pins down that the hazard itself is genuine.
+    let pos = 10
+    let declared_len = 9223372036854775807
+    let wrapped = pos + declared_len
+    if wrapped >= 0
+        print("FAIL class1.hazard_precondition: wrapped did not overflow negative, got=" + str(wrapped))
+        exit(1)
+    0
+
+fn test_class1_max_length_prefix_bytes()
+    // declared length = 9223372036854775807 (0x7FFFFFFFFFFFFFFF), encoded
+    // as a real Avro `long` length prefix (zigzag+LEB128, 10 bytes: FE FF
+    // FF FF FF FF FF FF FF 01 -- same byte-exact vector independently
+    // verified in _avro_zigzag_indep_verify_test / _avro_kat_test), followed
+    // by only 3 actual payload bytes.
+    let len_prefix = _kaa_make_bytes([0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+    let short_payload = _kaa_make_bytes([0xAA, 0xBB, 0xCC])
+    let buf = bytes_concat(len_prefix, short_payload)
+    ci("class1.buf_len", bytes_len(buf), 13)
+
+    let dr = av_decode_bytes(buf, 0)
+    let got = dr[0]
+    // must never fabricate data past the real buffer end, never OOB-read,
+    // and never advance pos past the true buffer length.
+    ci("class1.bytes.clamped_len", bytes_len(got), 3)
+    ci("class1.bytes.next_pos_bounded", dr[1], 13)
+    if _kaa_bytes_eq(got, short_payload) == 0
+        print("FAIL class1.bytes.content: fabricated/garbage payload instead of the real 3 bytes")
+        exit(1)
+
+    // string delegates to av_decode_bytes -- same guarantee must hold.
+    let ds = av_decode_string(buf, 0)
+    ci("class1.string.next_pos_bounded", ds[1], 13)
+    ci("class1.string.len_bounded", len(ds[0]), 3)
+
+fn test_class1_min_i64_declared_len_clamps_to_zero()
+    // Raw unsigned code 0xFFFFFFFFFFFFFFFF (all ten LEB128 groups, byte
+    // pattern FF*9 01) zigzag-decodes to i64 MIN (-9223372036854775808) --
+    // the most negative possible declared_len. Must clamp to an EMPTY
+    // payload (take<0 -> take=0), not underflow/wrap into a huge positive
+    // slice width.
+    let len_prefix = _kaa_make_bytes([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+    let dr = av_decode_bytes(len_prefix, 0)
+    ci("class1.negmin.clamped_len", bytes_len(dr[0]), 0)
+    ci("class1.negmin.next_pos", dr[1], 10)
+
+fn test_class1_huge_block_count_no_phantom_items()
+    // The block-count field of array()/map() is itself an Avro `long` --
+    // an attacker can declare a block of 2^63-1 items with zero item bytes
+    // behind it. The stale-position guard must stop at the first failed
+    // item read, not spin or fabricate ~9.2e18 phantom entries.
+    let mega_count = av_encode_long(9223372036854775807)
+    let dr = av_decode_array(mega_count, 0, av_decode_long)
+    ci("class1.megacount.items_len", len(dr[0]), 0)
+    ci("class1.megacount.pos_bounded", dr[1], bytes_len(mega_count))
+
+// ── CLASS 2: sentinel / absent-value collision ──────────────────────────────
+// av_decode_null's [0,pos] sentinel must never be confused with a REAL
+// decoded value, and a corrupt/out-of-range union branch index must remain
+// distinguishable from a legitimate branch 0 -- prove both via the RAW
+// (unclamped) index the module deliberately returns for this purpose.
+
+fn test_class2_null_sentinel_not_confused_with_real_false()
+    // union[null, boolean], branch=1 (boolean), value=false(0) -- the
+    // decoded VALUE (0) is bit-identical to av_decode_null's sentinel (0),
+    // but the BRANCH INDEX (not the value) is what a caller uses to know
+    // which type was decoded, so there is no collision.
+    let decoders = []
+    push(decoders, av_decode_null)
+    push(decoders, av_decode_boolean)
+    let enc = av_encode_union(1, av_encode_boolean(0))
+    let dr = av_decode_union(enc, 0, decoders)
+    ci("class2.branch_is_boolean_not_null", dr[0], 1)
+    ci("class2.boolean_false_value", dr[1], 0)
+
+fn test_class2_corrupt_branch_distinguishable_from_real_branch0()
+    let decoders = []
+    push(decoders, av_decode_null)
+    push(decoders, av_decode_long)
+    // corrupt: branch index -1 on the wire (zigzag(-1)=1 -> single byte 0x01)
+    let corrupt = _kaa_make_bytes([0x01, 0x02])
+    let dr_corrupt = av_decode_union(corrupt, 0, decoders)
+    // legitimate: branch index 0 (null)
+    let legit = av_encode_union(0, av_encode_null())
+    let dr_legit = av_decode_union(legit, 0, decoders)
+    // both dispatch to decoder[0] (clamped), but the RAW index the caller
+    // actually inspects for validity is NOT the same -- -1 vs 0 -- so a
+    // caller checking `idx < 0` correctly rejects the corrupt one without
+    // ever mistaking it for the legitimate branch-0 message.
+    ci("class2.corrupt.raw_idx", dr_corrupt[0], -1)
+    ci("class2.legit.raw_idx", dr_legit[0], 0)
+    if dr_corrupt[0] == dr_legit[0]
+        print("FAIL class2.collision: corrupt and legit branch indices are indistinguishable")
+        exit(1)
+
+// ── CLASS 3: trailing-content acceptance ────────────────────────────────────
+// After decoding a self-terminating structure, extra bytes appended past
+// its true grammar boundary must NOT be silently absorbed into next_pos --
+// the caller must still be able to see (and reject) them.
+
+fn test_class3_array_trailing_bytes_not_absorbed()
+    let clean = av_encode_array([10, 20, 30], av_encode_long)
+    let trailing = _kaa_make_bytes([0xDE, 0xAD, 0xBE, 0xEF])
+    let combined = bytes_concat(clean, trailing)
+    let dr = av_decode_array(combined, 0, av_decode_long)
+    ci("class3.array.items_len", len(dr[0]), 3)
+    ci("class3.array.stops_at_true_boundary", dr[1], bytes_len(clean))
+    ci("class3.array.trailing_untouched", bytes_len(combined) - dr[1], 4)
+
+fn test_class3_record_trailing_bytes_not_absorbed()
+    let fields = []
+    push(fields, av_encode_boolean(1))
+    push(fields, av_encode_long(99))
+    let clean = av_encode_record(fields)
+    let trailing = _kaa_make_bytes([0xCA, 0xFE, 0xBA, 0xBE, 0x01])
+    let combined = bytes_concat(clean, trailing)
+    let decoders = []
+    push(decoders, av_decode_boolean)
+    push(decoders, av_decode_long)
+    let dr = av_decode_record(combined, 0, decoders)
+    ci("class3.record.field0", dr[0][0], 1)
+    ci("class3.record.field1", dr[0][1], 99)
+    ci("class3.record.stops_at_true_boundary", dr[1], bytes_len(clean))
+    ci("class3.record.trailing_untouched", bytes_len(combined) - dr[1], 5)
+    // A caller that expects EXACT-length messages (Avro records/arrays have
+    // no self-declared envelope length, so this is the caller's own policy
+    // check, not the module's job) can now correctly reject:
+    if dr[1] == bytes_len(combined)
+        print("FAIL class3.reject_check: caller could not detect trailing bytes")
+        exit(1)
+
+// ── CLASS 4: unchecked length -> over-read / truncation-as-success ─────────
+// Bounds MUST be checked before every slice (no OOB, ever) -- verified at
+// a moderate truncation (not just the extreme value already covered in
+// class 1) plus an exact off-by-one boundary.
+
+fn test_class4_moderate_truncation_bounded_not_fabricated()
+    // declared length 500, only 4 bytes actually follow.
+    let len_prefix = av_encode_long(500)
+    let short_payload = _kaa_make_bytes([0x01, 0x02, 0x03, 0x04])
+    let buf = bytes_concat(len_prefix, short_payload)
+    let dr = av_decode_bytes(buf, 0)
+    ci("class4.moderate.clamped_len", bytes_len(dr[0]), 4)
+    ci("class4.moderate.pos_bounded", dr[1], bytes_len(buf))
+    if _kaa_bytes_eq(dr[0], short_payload) == 0
+        print("FAIL class4.moderate.content mismatch")
+        exit(1)
+
+fn test_class4_exact_off_by_one_boundary()
+    // declared length 5, exactly 4 bytes available (short by exactly 1).
+    let len_prefix = av_encode_long(5)
+    let payload4 = _kaa_make_bytes([0x11, 0x22, 0x33, 0x44])
+    let buf = bytes_concat(len_prefix, payload4)
+    let dr = av_decode_bytes(buf, 0)
+    ci("class4.offbyone.clamped_len", bytes_len(dr[0]), 4)
+    ci("class4.offbyone.pos_bounded", dr[1], bytes_len(buf))
+    // and the exact-fit case (declared==available) must NOT be clamped at
+    // all -- a regression guard against an off-by-one in the clamp itself.
+    let len_prefix2 = av_encode_long(4)
+    let buf2 = bytes_concat(len_prefix2, payload4)
+    let dr2 = av_decode_bytes(buf2, 0)
+    ci("class4.exactfit.len", bytes_len(dr2[0]), 4)
+    if _kaa_bytes_eq(dr2[0], payload4) == 0
+        print("FAIL class4.exactfit.content mismatch")
+        exit(1)
+
+fn main()
+    test_valid_roundtrip_unchanged()
+    test_class1_overflow_hazard_is_real_in_raw_arithmetic()
+    test_class1_max_length_prefix_bytes()
+    test_class1_min_i64_declared_len_clamps_to_zero()
+    test_class1_huge_block_count_no_phantom_items()
+    test_class2_null_sentinel_not_confused_with_real_false()
+    test_class2_corrupt_branch_distinguishable_from_real_branch0()
+    test_class3_array_trailing_bytes_not_absorbed()
+    test_class3_record_trailing_bytes_not_absorbed()
+    test_class4_moderate_truncation_bounded_not_fabricated()
+    test_class4_exact_off_by_one_boundary()
+    print("AVRO-AUDIT KAT PASS")
+
+main()

@@ -1,0 +1,285 @@
+// _kat_thrift_audit — SOUNDNESS AUDIT of std/encoding/thrift's binary wire
+// decoder against the 4 recurring decoder-vulnerability classes:
+//
+//   1. i64-OVERFLOW BOUNDS BYPASS   ("if pos+len > n" wraps negative)
+//   2. SENTINEL / ABSENT-VALUE COLLISION
+//   3. TRAILING-CONTENT ACCEPTANCE  (declared TLV not fully/exactly consumed)
+//   4. UNCHECKED LENGTH -> OVER-READ / truncation-as-success
+//
+// REAL BUG FOUND & FIXED (class 4): _th_decode_value's LIST/SET/MAP branches
+// clamped the declared ELEMENT/PAIR *COUNT* against the raw *BYTES* actually
+// remaining (`if n > avail: n = avail`), implicitly assuming 1 byte per
+// element. For any element wider than 1 byte (I16/I32/I64/DOUBLE/STRING/
+// STRUCT/nested LIST/SET/MAP -- i.e. everything except BOOL/BYTE) this
+// under-counted the true capacity: e.g. a declared LIST<I64> (8 bytes/elem)
+// with only `avail` bytes left could still fabricate up to `avail` phantom
+// I64 elements (an 8x over-count), running the decode cursor past the
+// list's true end and silently consuming/misinterpreting whatever buffer
+// content followed (sibling fields, the STOP byte, ...) as if it belonged
+// to the corrupted list, and returning a `next_pos` that could exceed the
+// buffer's own length entirely. Not a memory-safety hole (bytes_get/
+// bytes_slice are themselves bounds-checked -- see nova_rt_bytes_get) but a
+// genuine "unchecked length -> over-read / fabricated-success" decoder bug:
+// crafted/corrupted input desynchronizes the rest of the struct instead of
+// being bounded to what could plausibly be real data.
+// FIX: std/encoding/thrift.nova's `_th_min_elem_width(ttype)` returns the
+// MINIMUM wire-byte cost of one instance of a TType (1 for BOOL/BYTE/STRUCT,
+// 2 for I16, 4 for I32/STRING, 8 for I64/DOUBLE, 5 for LIST/SET, 6 for MAP);
+// the LIST/SET count is now clamped to `avail / ew` and the MAP pair count
+// to `avail / (key_width + value_width)`, instead of raw `avail`. Pure
+// internal tightening: same [value,next_pos]/[fields,next_pos] return
+// shapes, same public API, zero caller-facing change for well-formed input
+// (avail is always >= declared*width for genuinely-encoded data, so this
+// clamp never engages on valid input -- see the CONTROL cases below).
+//
+// CLASS 1 (i64-overflow bounds bypass) VERDICT: NOT APPLICABLE / not
+// vulnerable, and independently verified below. TBinaryProtocol's wire
+// format only ever carries i32 BE length/count prefixes (STRING byte-len,
+// message name byte-len, LIST/SET element count, MAP pair count) -- there
+// is no i64-width declared length anywhere in this format, so a
+// 2^63-1/0x7FFFFFFFFFFFFFFF-style length prefix cannot even be expressed on
+// the wire; the maximum representable declared length/count is i32 max
+// (0x7FFFFFFF = 2147483647). Every length-consuming site (_th_dec_len_bytes
+// for STRING, the LIST/SET/MAP branches of _th_decode_value, and
+// thrift_decode_message's name-length check) already uses the
+// overflow-safe SUBTRACTION form -- `avail = blen - pos` (clamped >= 0),
+// then `if declared > avail: declared = avail` -- never the wrap-prone
+// ADDITION form `if pos + declared > blen`. Since blen/pos are real (small)
+// buffer offsets and declared is capped at i32 max (~2.1e9), nothing here
+// is anywhere near int64's ~9.2e18 range, so no wraparound is possible even
+// at the maximum representable value. Proven with the literal i32-max value
+// at both a struct-field STRING site and the message-header name-length
+// site below.
+//
+// CLASS 2 (sentinel collision) VERDICT: not vulnerable. thrift_struct_get's
+// "absent" sentinel is a bare `null` (which reads back as raw int 0 per
+// codebase convention), while a "found" result is always a `{"id",
+// "ttype","value"}` dict -- a structurally different runtime value that can
+// never collide with the int-0 sentinel, even for field id 0 or a field
+// whose VALUE happens to be 0. Proven below.
+//
+// CLASS 3 (trailing-content acceptance) VERDICT: not vulnerable at the
+// message-framing level (the only place this format has content that could
+// be silently over/under-consumed against a caller's expectation): decoding
+// one message out of a buffer containing two concatenated messages advances
+// `next_pos` to EXACTLY the first message's own length, never absorbing any
+// byte belonging to the next message. (Thrift's LIST/SET/MAP/STRUCT bodies
+// have no separate declared BYTE length to cross-check post-decode -- they
+// are self-delimiting by element count / STOP byte, so there is no
+// "declared TLV not fully consumed" check that could apply to them; this is
+// a structural property of the format, not a gap in this decoder.)
+import std/encoding/thrift
+import std/encoding/pack
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn ckf(label: string, got: float, want: float)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn main()
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 1 — VALID ROUND-TRIP (a rich message must decode unchanged)
+    // ════════════════════════════════════════════════════════════════════
+    let fields1 = [thrift_field_i32(1, 0 - 12345), thrift_field_string(2, "hello thrift"), thrift_field_list(3, tt_i32(), [10, 20, 30]), thrift_field_map(4, tt_string(), tt_i32(), [["x", 1], ["y", 2]]), thrift_field_struct(5, [thrift_field_bool(1, 1), thrift_field_double(2, 2.5)])]
+    let msg1 = thrift_encode_message("compute", tmt_call(), 777, fields1)
+    let d1 = thrift_decode_message(msg1)
+    cki("rt_ok", d1["ok"], 1)
+    cks("rt_name", d1["name"], "compute")
+    cki("rt_mtype", d1["mtype"], tmt_call())
+    cki("rt_seqid", d1["seqid"], 777)
+    cki("rt_next_pos_exact", d1["next_pos"], bytes_len(msg1))
+    let rf1 = d1["fields"]
+    cki("rt_fields_len", len(rf1), 5)
+    cki("rt_i32", rf1[0]["value"], 0 - 12345)
+    cks("rt_string", thrift_str(rf1[1]["value"]), "hello thrift")
+    let rlist = rf1[2]["value"]
+    cki("rt_list_len", len(rlist["items"]), 3)
+    cki("rt_list_0", rlist["items"][0], 10)
+    cki("rt_list_1", rlist["items"][1], 20)
+    cki("rt_list_2", rlist["items"][2], 30)
+    let rmap = rf1[3]["value"]
+    cki("rt_map_len", len(rmap["pairs"]), 2)
+    cks("rt_map_k0", thrift_str(rmap["pairs"][0][0]), "x")
+    cki("rt_map_v0", rmap["pairs"][0][1], 1)
+    cks("rt_map_k1", thrift_str(rmap["pairs"][1][0]), "y")
+    cki("rt_map_v1", rmap["pairs"][1][1], 2)
+    let rstruct = rf1[4]["value"]
+    cki("rt_nested_bool", rstruct[0]["value"], 1)
+    ckf("rt_nested_double", rstruct[1]["value"], 2.5)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 2 — CLASS 1: i64-overflow bounds bypass (proof of absence)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 2a. Struct-level STRING field declaring the MAXIMUM representable i32
+    // length (0x7FFFFFFF = 2147483647) with only 3 real payload bytes
+    // present. Must clamp to the 3 real bytes -- never crash, never read
+    // out of bounds, never fabricate/allocate for the full declared length.
+    let s2a = bytes_create(10)
+    bytes_set(s2a, 0, 0x0B)  // tt_string
+    bytes_set(s2a, 1, 0x00)
+    bytes_set(s2a, 2, 0x01)  // field id 1
+    bytes_set(s2a, 3, 0x7F)
+    bytes_set(s2a, 4, 0xFF)
+    bytes_set(s2a, 5, 0xFF)
+    bytes_set(s2a, 6, 0xFF)  // declared len = 0x7FFFFFFF
+    bytes_set(s2a, 7, 0x41)  // 'A'
+    bytes_set(s2a, 8, 0x42)  // 'B'
+    bytes_set(s2a, 9, 0x43)  // 'C'
+    let d2a = thrift_decode_struct(s2a, 0)
+    let f2a = d2a[0]
+    cki("c1_maxlen_field_count", len(f2a), 1)
+    cks("c1_maxlen_clamped_payload", thrift_str(f2a[0]["value"]), "ABC")
+    cki("c1_maxlen_next_pos_no_overrun", d2a[1], 10)
+
+    // 2b. Same field, declaring -1 (0xFFFFFFFF) -- the negative-length
+    // guard (not the avail-clamp) must fire directly: payload must be
+    // empty, cursor must not retreat or misbehave.
+    let s2b = bytes_create(9)
+    bytes_set(s2b, 0, 0x0B)
+    bytes_set(s2b, 1, 0x00)
+    bytes_set(s2b, 2, 0x01)
+    bytes_set(s2b, 3, 0xFF)
+    bytes_set(s2b, 4, 0xFF)
+    bytes_set(s2b, 5, 0xFF)
+    bytes_set(s2b, 6, 0xFF)  // declared len = -1
+    bytes_set(s2b, 7, 0x58)
+    bytes_set(s2b, 8, 0x59)
+    let d2b = thrift_decode_struct(s2b, 0)
+    let f2b = d2b[0]
+    cki("c1_neglen_field_count", len(f2b), 1)
+    cki("c1_neglen_payload_empty", bytes_len(f2b[0]["value"]), 0)
+    cki("c1_neglen_next_pos", d2b[1], 7)
+
+    // 2c. Message-level name-length declaring i32-max in an 8-byte buffer
+    // (header only). `name_end = name_start + name_len` computes to
+    // ~2.1e9 -- nowhere near int64 wraparound range -- and the
+    // `blen < name_end + 4` check correctly rejects without ever touching
+    // memory beyond the real 8-byte buffer.
+    let s2c = bytes_create(8)
+    bytes_set(s2c, 0, 0x80)
+    bytes_set(s2c, 1, 0x01)
+    bytes_set(s2c, 2, 0x00)
+    bytes_set(s2c, 3, 0x01)
+    bytes_set(s2c, 4, 0x7F)
+    bytes_set(s2c, 5, 0xFF)
+    bytes_set(s2c, 6, 0xFF)
+    bytes_set(s2c, 7, 0xFF)
+    let d2c = thrift_decode_message(s2c)
+    cki("c1_msg_maxlen_rejected", d2c["ok"], 0)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 3 — CLASS 2: sentinel / absent-value collision
+    // ════════════════════════════════════════════════════════════════════
+    let s3 = thrift_encode_struct([thrift_field_i32(0, 555), thrift_field_i32(7, 0)])
+    let d3 = thrift_decode_struct(s3, 0)
+    let fields3 = d3[0]
+    let got_id0 = thrift_struct_get(fields3, 0)
+    cki("c2_id0_not_confused_with_absent", got_id0["value"], 555)
+    let got_valzero = thrift_struct_get(fields3, 7)
+    cki("c2_value_zero_field_found", got_valzero["value"], 0)
+    let got_missing = thrift_struct_get(fields3, 42)
+    cki("c2_missing_is_null_sentinel", got_missing == null, 1)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 4 — CLASS 3: trailing-content acceptance (message framing)
+    // ════════════════════════════════════════════════════════════════════
+    let msgA = thrift_encode_message("alpha", tmt_call(), 1, [thrift_field_i32(1, 111)])
+    let msgB = thrift_encode_message("beta", tmt_reply(), 2, [thrift_field_string(1, "second")])
+    let combined = bytes_concat(msgA, msgB)
+    let lenA = bytes_len(msgA)
+    let dA = thrift_decode_message(combined)
+    cki("c3_first_ok", dA["ok"], 1)
+    cks("c3_first_name", dA["name"], "alpha")
+    cki("c3_first_seqid", dA["seqid"], 1)
+    cki("c3_first_next_pos_exact_no_bleed", dA["next_pos"], lenA)
+    cki("c3_first_field_value", dA["fields"][0]["value"], 111)
+    let rest = bytes_slice(combined, dA["next_pos"], bytes_len(combined))
+    let dB = thrift_decode_message(rest)
+    cki("c3_second_ok", dB["ok"], 1)
+    cks("c3_second_name", dB["name"], "beta")
+    cki("c3_second_seqid", dB["seqid"], 2)
+    cks("c3_second_field_value", thrift_str(dB["fields"][0]["value"]), "second")
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 5 — CLASS 4: unchecked length -> over-read (THE REAL BUG)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 5a. LIST<I64> declaring the maximum i32 count (0x7FFFFFFF, 8 bytes/
+    // elem) with only 1 real trailing byte available. PRE-FIX this clamped
+    // the count to raw `avail` bytes (=1), fabricating 1 phantom I64
+    // element by reading 8 bytes starting past the declared list body --
+    // running the cursor to next_pos=16 on a 9-byte buffer (a 7-byte
+    // overrun past the buffer's own length). POST-FIX the count is clamped
+    // to avail/8 = 0: zero items, next_pos lands exactly on the buffer end.
+    let s5a = bytes_create(9)
+    bytes_set(s5a, 0, 0x0F)  // tt_list
+    bytes_set(s5a, 1, 0x00)
+    bytes_set(s5a, 2, 0x01)  // field id 1
+    bytes_set(s5a, 3, 0x0A)  // elem ttype = tt_i64
+    bytes_set(s5a, 4, 0x7F)
+    bytes_set(s5a, 5, 0xFF)
+    bytes_set(s5a, 6, 0xFF)
+    bytes_set(s5a, 7, 0xFF)  // declared count = 0x7FFFFFFF
+    bytes_set(s5a, 8, 0x00)  // STOP (the single real trailing byte)
+    let d5a = thrift_decode_struct(s5a, 0)
+    let f5a = d5a[0]
+    cki("c4_list_i64_field_count", len(f5a), 1)
+    cki("c4_list_i64_no_fabricated_items", len(f5a[0]["value"]["items"]), 0)
+    cki("c4_list_i64_next_pos_no_overrun", d5a[1], 9)
+
+    // 5b. MAP<STRING,I32> declaring the maximum i32 pair count (min pair
+    // width 4+4=8) with only 1 real trailing byte available. Same shape of
+    // bug, same fix: pairs clamped to avail/(key_w+val_w) = 0.
+    let s5b = bytes_create(10)
+    bytes_set(s5b, 0, 0x0D)  // tt_map
+    bytes_set(s5b, 1, 0x00)
+    bytes_set(s5b, 2, 0x02)  // field id 2
+    bytes_set(s5b, 3, 0x0B)  // ktype = tt_string
+    bytes_set(s5b, 4, 0x08)  // vtype = tt_i32
+    bytes_set(s5b, 5, 0x7F)
+    bytes_set(s5b, 6, 0xFF)
+    bytes_set(s5b, 7, 0xFF)
+    bytes_set(s5b, 8, 0xFF)  // declared pair count = 0x7FFFFFFF
+    bytes_set(s5b, 9, 0x00)  // STOP (the single real trailing byte)
+    let d5b = thrift_decode_struct(s5b, 0)
+    let f5b = d5b[0]
+    cki("c4_map_field_count", len(f5b), 1)
+    cki("c4_map_no_fabricated_pairs", len(f5b[0]["value"]["pairs"]), 0)
+    cki("c4_map_next_pos_no_overrun", d5b[1], 10)
+
+    // 5c/5d. CONTROLS — genuinely well-formed LIST<I64> and MAP<STRING,I32>
+    // (declared count/pairs matches real data exactly) must still decode
+    // completely and correctly: the tightened clamp must never reject or
+    // truncate legitimate data (avail is always >= declared*width for
+    // honestly-encoded input, so `n > max_n` never engages here).
+    let sC = thrift_encode_struct([thrift_field_list(1, tt_i64(), [1000000007, 42])])
+    let dC = thrift_decode_struct(sC, 0)
+    let listC = dC[0][0]["value"]
+    cki("c4_control_list_i64_len", len(listC["items"]), 2)
+    cki("c4_control_list_i64_0", listC["items"][0], 1000000007)
+    cki("c4_control_list_i64_1", listC["items"][1], 42)
+
+    let sD = thrift_encode_struct([thrift_field_map(1, tt_string(), tt_i32(), [["k1", 11], ["k2", 22]])])
+    let dD = thrift_decode_struct(sD, 0)
+    let mapD = dD[0][0]["value"]
+    cki("c4_control_map_len", len(mapD["pairs"]), 2)
+    cks("c4_control_map_k0", thrift_str(mapD["pairs"][0][0]), "k1")
+    cki("c4_control_map_v0", mapD["pairs"][0][1], 11)
+    cks("c4_control_map_k1", thrift_str(mapD["pairs"][1][0]), "k2")
+    cki("c4_control_map_v1", mapD["pairs"][1][1], 22)
+
+    print("THRIFT-AUDIT KAT PASS")

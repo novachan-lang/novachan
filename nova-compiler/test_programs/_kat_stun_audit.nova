@@ -1,0 +1,237 @@
+// _kat_stun_audit.nova — soundness audit KAT for std/net/stun.nova.
+//
+// Proves (or disproves) each of the 4 recurring decoder vulnerability classes
+// against stun_decode / stun_find_attr / stun_has_attr, PLUS a byte-exact
+// valid round-trip. See per-section comments for the exact malformed input
+// used for each class and why it must be rejected.
+
+import std/net/stun
+import std/net/ip
+
+// Build a 20-byte STUN header: msg_type, DECLARED Message-Length (attacker-
+// controlled — may lie about the real attribute bytes that follow), the
+// real magic cookie, and an all-zero transaction id.
+fn _hdr(mtype, mlen)
+    let out = bytes(0)
+    out = bytes_append(out, (mtype >> 8) & 0xFF)
+    out = bytes_append(out, mtype & 0xFF)
+    out = bytes_append(out, (mlen >> 8) & 0xFF)
+    out = bytes_append(out, mlen & 0xFF)
+    out = bytes_append(out, 0x21)
+    out = bytes_append(out, 0x12)
+    out = bytes_append(out, 0xA4)
+    out = bytes_append(out, 0x42)
+    let k = 0
+    while k < 12
+        out = bytes_append(out, 0)
+        k = k + 1
+    out
+
+// Build a raw attribute TLV header+value where the declared length field
+// (`declared_len`) need NOT match bytes_len(valbytes) — lets us forge a
+// TLV whose header claims far more (or less) value data than is actually
+// supplied, exactly what a hostile peer would send.
+fn _tlv_lying(atype, declared_len, valbytes)
+    let out = bytes(0)
+    out = bytes_append(out, (atype >> 8) & 0xFF)
+    out = bytes_append(out, atype & 0xFF)
+    out = bytes_append(out, (declared_len >> 8) & 0xFF)
+    out = bytes_append(out, declared_len & 0xFF)
+    let i = 0
+    let n = bytes_len(valbytes)
+    while i < n
+        out = bytes_append(out, bytes_get(valbytes, i))
+        i = i + 1
+    out
+
+fn main()
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 1 — valid message round-trips byte-exact / field-exact
+    // ══════════════════════════════════════════════════════════════════════
+    let txn = bytes(12)
+    let t = 0
+    while t < 12
+        bytes_set(txn, t, t + 100)
+        t = t + 1
+    let addr = ipv4_parse("203.0.113.7")
+    if addr != 0xCB007107
+        print("FAIL setup: ipv4_parse got "+str(addr))
+        exit(1)
+    let xma = stun_attr_xor_mapped_address_encode(54321, addr)
+    let ma = stun_attr_mapped_address_encode(9000, addr)
+    let attrs1 = [[STUN_ATTR_XOR_MAPPED_ADDRESS(), xma], [STUN_ATTR_MAPPED_ADDRESS(), ma]]
+    let wire1 = stun_encode(STUN_BINDING_SUCCESS_RESPONSE(), txn, attrs1)
+    // header(20) + [type2+len2+val8]*2 attributes, no padding (8%4==0) = 20+12+12 = 44
+    if bytes_len(wire1) != 44
+        print("FAIL S1 wire len: got "+str(bytes_len(wire1))+" want 44")
+        exit(1)
+    let dec1 = stun_decode(wire1)
+    if contains(dec1, "type") == false
+        print("FAIL S1: valid message was rejected")
+        exit(1)
+    if dec1["type"] != STUN_BINDING_SUCCESS_RESPONSE()
+        print("FAIL S1 type mismatch")
+        exit(1)
+    if bytes_len(dec1["txn_id"]) != 12 or bytes_get(dec1["txn_id"], 0) != 100 or bytes_get(dec1["txn_id"], 11) != 111
+        print("FAIL S1 txn_id round-trip corrupted")
+        exit(1)
+    let attrsOut1 = dec1["attrs"]
+    if len(attrsOut1) != 2
+        print("FAIL S1 attr count: got "+str(len(attrsOut1))+" want 2")
+        exit(1)
+    let xback = stun_find_attr(attrsOut1, STUN_ATTR_XOR_MAPPED_ADDRESS())
+    let xdec = stun_attr_xor_mapped_address_decode(xback)
+    if xdec["ip"] != "203.0.113.7" or xdec["port"] != 54321
+        print("FAIL S1 xor-mapped round-trip: ip="+xdec["ip"]+" port="+str(xdec["port"]))
+        exit(1)
+    let mback = stun_find_attr(attrsOut1, STUN_ATTR_MAPPED_ADDRESS())
+    let mdec = stun_attr_mapped_address_decode(mback)
+    if mdec["ip"] != "203.0.113.7" or mdec["port"] != 9000
+        print("FAIL S1 mapped round-trip: ip="+mdec["ip"]+" port="+str(mdec["port"]))
+        exit(1)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 2 — CLASS 1: i64-overflow bounds bypass
+    // ══════════════════════════════════════════════════════════════════════
+    // STUN's Message-Length and per-attribute Length fields are BOTH wire
+    // u16s: _stun_r16 masks every read with `& 0xFFFF`, so the largest value
+    // an attacker can ever place in either field is 0xFFFF (65535) — there
+    // is no 64-bit length field in this format, so the textbook
+    // 0x7FFFFFFFFFFFFFFF-style wraparound payload cannot be constructed on
+    // the wire at all: `end = 20 + msg_length` maxes out at 65555 and
+    // `vend = vstart + alen` maxes out in the low hundred-thousands — both
+    // are astronomically far from i64 overflow (~9.2e18). We instead prove
+    // the decoder is safe at the MAXIMUM value the format can actually
+    // carry, at both the message level and the attribute level.
+
+    // 2a: Message-Length = 0xFFFF (max representable) on a buffer that is
+    // ONLY the 20-byte header (no attribute bytes at all) -> end=65555 must
+    // be compared against the REAL buffer length (20) and rejected, not
+    // wrap/underflow into a false "in bounds".
+    let bad2a = _hdr(STUN_BINDING_REQUEST(), 0xFFFF)
+    if bytes_len(bad2a) != 20
+        print("FAIL S2a setup: got len "+str(bytes_len(bad2a))+" want 20")
+        exit(1)
+    let dec2a = stun_decode(bad2a)
+    if contains(dec2a, "type")
+        print("FAIL S2a: max Message-Length (0xFFFF) over a 20-byte buffer was NOT rejected")
+        exit(1)
+
+    // 2b: attribute-level Length = 0xFFFF (max representable) declared
+    // inside a window that holds nothing but the 4-byte TLV header itself
+    // -> vend = vstart + 65535 must be rejected against the declared
+    // window, not just the physical buffer.
+    let hdr2b = _hdr(STUN_BINDING_REQUEST(), 4)
+    let tlv2b = _tlv_lying(0x0001, 0xFFFF, bytes(0))
+    let bad2b = bytes_concat(hdr2b, tlv2b)
+    if bytes_len(bad2b) != 24
+        print("FAIL S2b setup: got len "+str(bytes_len(bad2b))+" want 24")
+        exit(1)
+    let dec2b = stun_decode(bad2b)
+    if contains(dec2b, "type")
+        print("FAIL S2b: max attribute Length (0xFFFF) inside a 4-byte window was NOT rejected")
+        exit(1)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 3 — CLASS 2: sentinel / absent-value collision
+    // ══════════════════════════════════════════════════════════════════════
+    // stun_find_attr's "not found" sentinel is bytes(0) — indistinguishable
+    // from a genuinely PRESENT attribute whose value is itself zero-length
+    // (legal on the wire, e.g. ICE's USE-CANDIDATE flag attribute). Prove
+    // the collision exists in stun_find_attr, and prove stun_has_attr (the
+    // fix) disambiguates it correctly.
+    let PRESENT_EMPTY_TYPE = 0x9001
+    let ABSENT_TYPE = 0x9002
+    let attrs3 = [[PRESENT_EMPTY_TYPE, bytes(0)], [0x0001, ma]]
+    let wire3 = stun_encode(STUN_BINDING_REQUEST(), txn, attrs3)
+    let dec3 = stun_decode(wire3)
+    if contains(dec3, "type") == false
+        print("FAIL S3: message with a zero-length attribute was rejected")
+        exit(1)
+    let attrsOut3 = dec3["attrs"]
+    if len(attrsOut3) != 2
+        print("FAIL S3 attr count: got "+str(len(attrsOut3))+" want 2")
+        exit(1)
+    // The collision: both a truly-absent type and the present-but-empty
+    // type produce bytes_len==0 from stun_find_attr. This documents the
+    // known ambiguity (by design of the bytes(0) sentinel) rather than
+    // silently trusting it for a presence check.
+    let foundPresentEmpty = stun_find_attr(attrsOut3, PRESENT_EMPTY_TYPE)
+    let foundAbsent = stun_find_attr(attrsOut3, ABSENT_TYPE)
+    if bytes_len(foundPresentEmpty) != 0
+        print("FAIL S3: expected present-but-empty value to read back as len 0")
+        exit(1)
+    if bytes_len(foundAbsent) != 0
+        print("FAIL S3: expected absent-type lookup to read back as len 0")
+        exit(1)
+    // The fix: stun_has_attr tests presence directly and is NOT fooled by
+    // an empty value — it must report the empty-valued attribute as
+    // PRESENT and the truly-missing type as ABSENT.
+    if stun_has_attr(attrsOut3, PRESENT_EMPTY_TYPE) != 1
+        print("FAIL S3: stun_has_attr failed to detect a present zero-length attribute")
+        exit(1)
+    if stun_has_attr(attrsOut3, ABSENT_TYPE) != 0
+        print("FAIL S3: stun_has_attr false-positived on a truly absent type")
+        exit(1)
+    if stun_has_attr(attrsOut3, 0x0001) != 1
+        print("FAIL S3: stun_has_attr failed to detect a present non-empty attribute")
+        exit(1)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 4 — CLASS 3: trailing-content acceptance
+    // ══════════════════════════════════════════════════════════════════════
+    // One well-formed zero-length attribute (4-byte TLV, no padding) fully
+    // consumes bytes [20,24). The declared Message-Length window is 8
+    // (window [20,28)), leaving 4 "leftover" bytes [24,28) that are pure
+    // junk and do NOT form a valid next attribute (they decode as a bogus
+    // TLV header claiming a 0xFFFF-byte value). The declared window must
+    // be either FULLY consumed by well-formed attributes or the whole
+    // message rejected — junk trailing bytes must never be silently
+    // dropped and the message accepted anyway.
+    let hdr4 = _hdr(STUN_BINDING_REQUEST(), 8)
+    let goodAttr4 = _tlv_lying(0x1111, 0, bytes(0))  // type=0x1111 len=0, 4 bytes total
+    let junkTail4 = bytes(0)
+    junkTail4 = bytes_append(junkTail4, 0xFF)
+    junkTail4 = bytes_append(junkTail4, 0xFF)
+    junkTail4 = bytes_append(junkTail4, 0xFF)
+    junkTail4 = bytes_append(junkTail4, 0xFF)
+    let bad4 = bytes_concat(bytes_concat(hdr4, goodAttr4), junkTail4)
+    if bytes_len(bad4) != 28
+        print("FAIL S4 setup: got len "+str(bytes_len(bad4))+" want 28")
+        exit(1)
+    let dec4 = stun_decode(bad4)
+    if contains(dec4, "type")
+        print("FAIL S4: declared window with an unparsable junk tail was NOT rejected (trailing content silently accepted)")
+        exit(1)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SECTION 5 — CLASS 4: unchecked length -> over-read / truncation-as-success
+    // ══════════════════════════════════════════════════════════════════════
+    // 5a: Message-Length declares 40 attribute bytes follow, but the buffer
+    // physically ends right after the 20-byte header (0 bytes supplied) ->
+    // must be rejected, never treated as "0 attributes decoded, success".
+    let bad5a = _hdr(STUN_BINDING_REQUEST(), 40)
+    if bytes_len(bad5a) != 20
+        print("FAIL S5a setup: got len "+str(bytes_len(bad5a))+" want 20")
+        exit(1)
+    let dec5a = stun_decode(bad5a)
+    if contains(dec5a, "type")
+        print("FAIL S5a: Message-Length overrunning the physical buffer was NOT rejected")
+        exit(1)
+
+    // 5b: attribute-level Length declares 100 value bytes inside an 8-byte
+    // declared window (room only for the 4-byte TLV header itself, no
+    // value bytes physically present) -> must be rejected, not truncated
+    // to whatever bytes happen to exist.
+    let hdr5b = _hdr(STUN_BINDING_REQUEST(), 8)
+    let tlv5b = _tlv_lying(0x0001, 100, bytes(0))
+    let bad5b = bytes_concat(hdr5b, tlv5b)
+    if bytes_len(bad5b) != 24
+        print("FAIL S5b setup: got len "+str(bytes_len(bad5b))+" want 24")
+        exit(1)
+    let dec5b = stun_decode(bad5b)
+    if contains(dec5b, "type")
+        print("FAIL S5b: attribute Length overrunning its declared window was NOT rejected")
+        exit(1)
+
+    print("STUN-AUDIT KAT PASS")

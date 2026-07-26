@@ -1,0 +1,334 @@
+// _kat_messagepack_audit — independent decoder-soundness AUDIT KAT for
+// std/encoding/messagepack, hunting the 4 recurring wire-decoder vuln
+// classes (i64-overflow bounds bypass / sentinel collision / trailing-
+// content acceptance / unchecked-length over-read). Fail-fast idiom (each
+// check helper exit(1)s immediately with a labeled diagnostic) — proven
+// idiom used by messagepack_kat.nova / messagepack_adv_kat.nova.
+//
+// AUDIT FIX applied to std/encoding/messagepack.nova's _mp_fits(b,pos,want)
+// bounds primitive: `pos + want > n` (vulnerable form — a sufficiently
+// large attacker-controlled `want` wraps a 64-bit signed int, making the
+// comparison silently FALSE) -> `want > n - pos` (overflow-safe form; `pos`
+// is always a previously-validated cursor <= n at every call site, so
+// `n - pos` cannot itself underflow). This is the SAME arithmetic-overflow
+// class documented in other decoders in this codebase. See section (B)
+// below for why msgpack's own wire format caps `want` at 2^32-1 (there is
+// no 8-byte length field anywhere in the spec), so the classic
+// 0x7FFFFFFFFFFFFFFF attack value cannot be expressed on the wire here —
+// tested instead at the actual reachable maximum.
+import std/encoding/messagepack
+
+fn ckb(label: string, b: any, expected: list)
+    let blen = bytes_len(b)
+    let elen = len(expected)
+    if blen != elen
+        print("FAIL " + label + "_len: got " + str(blen) + " want " + str(elen))
+        exit(1)
+    let i = 0
+    while i < elen
+        let got = bytes_get(b, i)
+        let want = expected[i]
+        if got != want
+            print("FAIL " + label + "_b" + str(i) + ": got " + str(got) + " want " + str(want))
+            exit(1)
+        i = i + 1
+    print("PASS " + label + "_bytes")
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn ckf(label: string, got: float, want: float)
+    if got != want
+        print("FAIL " + label)
+        exit(1)
+    print("PASS " + label)
+
+fn ckerr(label: string, got: any)
+    if msgpack_is_error(got) != 1
+        print("FAIL " + label + ": expected an msgpack_error() sentinel, got type " + type_of(got))
+        exit(1)
+    print("PASS " + label)
+
+fn cknotnull(label: string, got: any)
+    if got == null
+        print("FAIL " + label + ": unexpectedly decoded to null")
+        exit(1)
+    print("PASS " + label)
+
+// mkbytes(vals): build a `bytes` buffer from a plain list of ints — one
+// entry per wire byte. Self-documents every hand-built malformed buffer
+// below as a literal byte sequence matching the msgpack format table.
+fn mkbytes(vals: list) -> any
+    let n = len(vals)
+    let b = bytes_create(n)
+    let i = 0
+    while i < n
+        bytes_set(b, i, vals[i])
+        i = i + 1
+    b
+
+// mkbytes_decode(vals): build+decode in one step, for the one-shot class-4
+// malformed-input checks below.
+fn mkbytes_decode(vals: list) -> any
+    msgpack_decode(mkbytes(vals))
+
+fn main()
+    print("PROGRESS start")
+
+    // ════════════════════════════════════════════════════════════════
+    // (A) VALID ROUND-TRIP — representative message covering every
+    //     scalar/container shape, must survive the audit fix unchanged
+    //     (the fix only changes _mp_fits's arithmetic FORM, not which
+    //     inputs pass/fail).
+    // ════════════════════════════════════════════════════════════════
+    let msg = {}
+    msg["name"] = "nova"
+    msg["count"] = 42
+    msg["negative"] = 0 - 17
+    msg["big"] = 4294967296                 // first value requiring uint64
+    msg["pi"] = 3.5
+    msg["tags"] = ["fast", "safe", "small"]
+    let nested = {}
+    nested["a"] = 1
+    nested["b"] = 2
+    msg["nested"] = nested
+    msg["blob"] = mkbytes([0xde, 0xad, 0xbe, 0xef])
+    msg["flag_true"] = msgpack_bool(1)
+    msg["flag_false"] = msgpack_bool(0)
+    msg["absent"] = msgpack_nil()
+
+    let wire = msgpack_encode(msg)
+    let back = msgpack_decode(wire)
+
+    cks("rt_name", back["name"], "nova")
+    cki("rt_count", back["count"], 42)
+    cki("rt_negative", back["negative"], 0 - 17)
+    cki("rt_big", back["big"], 4294967296)
+    ckf("rt_pi", back["pi"], 3.5)
+    cki("rt_tags_len", len(back["tags"]), 3)
+    cks("rt_tags_0", back["tags"][0], "fast")
+    cks("rt_tags_2", back["tags"][2], "small")
+    cki("rt_nested_a", back["nested"]["a"], 1)
+    cki("rt_nested_b", back["nested"]["b"], 2)
+    cki("rt_flag_true", back["flag_true"], 1)
+    cki("rt_flag_false", back["flag_false"], 0)
+    if back["absent"] != null
+        print("FAIL rt_absent: expected null")
+        exit(1)
+    print("PASS rt_absent")
+    let rtblob = back["blob"]
+    cki("rt_blob_len", bytes_len(rtblob), 4)
+    cki("rt_blob_0", bytes_get(rtblob, 0), 0xde)
+    cki("rt_blob_1", bytes_get(rtblob, 1), 0xad)
+    cki("rt_blob_2", bytes_get(rtblob, 2), 0xbe)
+    cki("rt_blob_3", bytes_get(rtblob, 3), 0xef)
+    print("PROGRESS roundtrip_done")
+
+    // ════════════════════════════════════════════════════════════════
+    // (B) CLASS 1 — i64-overflow bounds bypass. Checked against
+    //     _mp_fits(b,pos,want): naive `pos + want > n` wraps for a
+    //     sufficiently large `want`; hardened to `want > n - pos`.
+    //     NOT independently reachable at TRUE i64-overflow magnitude in
+    //     THIS format: every length-prefixed msgpack construct
+    //     (bin8/16/32, str8/16/32) caps its length field at 4 BYTES BIG-
+    //     ENDIAN -> max representable `want` = 4294967295 (2^32-1).
+    //     array/map declare an ELEMENT COUNT via the same <=4-byte fields,
+    //     never a byte length passed to _mp_fits. There is NO 8-byte
+    //     length field anywhere in the msgpack spec, so a literal
+    //     0x7FFFFFFFFFFFFFFF length prefix cannot be expressed on the
+    //     wire at all — proven instead at the actual reachable maximum,
+    //     confirming the hardened arithmetic still rejects it correctly
+    //     (zero behavior change vs. the pre-fix form at any reachable
+    //     magnitude).
+    // ════════════════════════════════════════════════════════════════
+
+    // bin32 declaring the maximum possible 4-byte length (0xFFFFFFFF =
+    // 4294967295) against a 5-byte buffer (format byte + length prefix,
+    // zero payload bytes).
+    let c1_bin32 = mkbytes([0xc6, 0xff, 0xff, 0xff, 0xff])
+    ckerr("class1_bin32_maxlen_no_payload", msgpack_decode(c1_bin32))
+
+    // str32, same shape.
+    let c1_str32 = mkbytes([0xdb, 0xff, 0xff, 0xff, 0xff])
+    ckerr("class1_str32_maxlen_no_payload", msgpack_decode(c1_str32))
+
+    // bin32 declaring 0x7FFFFFFF (largest length expressible as a
+    // positive i32 — the most "i64-overflow-flavored" value obtainable
+    // from a 4-byte field) against a buffer with SOME but far short of
+    // the declared payload.
+    let c1_bin32b = mkbytes([0xc6, 0x7f, 0xff, 0xff, 0xff, 0x01, 0x02, 0x03, 0x04])
+    ckerr("class1_bin32_0x7fffffff_insufficient_payload", msgpack_decode(c1_bin32b))
+
+    // array32 declaring count 0x7FFFFFFF with zero elements actually
+    // present — count is a loop bound, not a byte length, but must still
+    // fail closed on the very first (absent) element rather than reading
+    // past the buffer.
+    let c1_arr32 = mkbytes([0xdd, 0x7f, 0xff, 0xff, 0xff])
+    ckerr("class1_array32_hugecount_no_payload", msgpack_decode(c1_arr32))
+
+    // Same bin32-maxlen shape NESTED inside a fixarray element — proves
+    // the bounds-check choke point is honored on every recursive decode
+    // call, not just the top-level dispatch.
+    let c1_nested = mkbytes([0x91, 0xc6, 0xff, 0xff, 0xff, 0xff])
+    ckerr("class1_nested_in_array", msgpack_decode(c1_nested))
+    print("PROGRESS class1_done")
+
+    // ════════════════════════════════════════════════════════════════
+    // (C) CLASS 2 — sentinel / absent-value collision. $mpNil/$mpNilMagic,
+    //     $mpBool/$mpBoolMagic, $mpErr/$mpErrMagic are recognized ONLY on
+    //     an EXACT 2-key shape + type_of(magic)=="int" + exact magic-
+    //     constant match. A wire value using the same KEY NAMES but the
+    //     wrong magic (or a non-int / heap-shaped magic value, or an
+    //     extra 3rd key) must decode as an ordinary dict — never be
+    //     silently reinterpreted as null/bool/error, and must never
+    //     FAULT comparing an untyped magic value against the int
+    //     constant.
+    // ════════════════════════════════════════════════════════════════
+
+    // Wrong magic value, correct key names, exactly 2 keys: must round-
+    // trip as a plain 2-key dict, never collapse to null.
+    let hostile_nil = {}
+    hostile_nil["$mpNil"] = 1
+    hostile_nil["$mpNilMagic"] = 999
+    let whostile = msgpack_encode(hostile_nil)
+    cki("class2_wrongmagic_is_fixmap_byte", bytes_get(whostile, 0), 0x82)
+    let dhostile = msgpack_decode(whostile)
+    cknotnull("class2_wrongmagic_not_null", dhostile)
+    cki("class2_wrongmagic_field", dhostile["$mpNil"], 1)
+    cki("class2_wrongmagic_magic_field", dhostile["$mpNilMagic"], 999)
+
+    // Correct key names AND the exact correct magic constant, but a 3rd
+    // key present: the "EXACTLY 2 keys" guard must reject the collision.
+    // (Magic literal below matches _mp_nil_magic()'s own definition —
+    // "MSGPKNIL" read big-endian; this is a plain int literal duplicated
+    // from the module's public spec table, not a private-symbol import.)
+    let hostile3 = {}
+    hostile3["$mpNil"] = 1
+    hostile3["$mpNilMagic"] = 0x4D5347504B4E494C
+    hostile3["extra"] = 1
+    let ehostile3 = msgpack_encode(hostile3)
+    cki("class2_extrakey_is_fixmap3_byte", bytes_get(ehostile3, 0), 0x83)
+    let dhostile3 = msgpack_decode(ehostile3)
+    cknotnull("class2_extrakey_not_null", dhostile3)
+    cki("class2_extrakey_field", dhostile3["$mpNil"], 1)
+
+    // msgpack_is_error's own guard: wrong magic value -> never an error.
+    let hostile_err = {}
+    hostile_err["$mpErr"] = "not really an error"
+    hostile_err["$mpErrMagic"] = 123
+    cki("class2_err_wrongmagic_not_error", msgpack_is_error(hostile_err), 0)
+
+    // Type-guard: magic value is a LIST (heap-shaped, not int) — the
+    // `type_of(magic)=="int"` check must short-circuit BEFORE the
+    // equality compare, so this can never fault on a heap value.
+    let hostile_heap_magic = {}
+    hostile_heap_magic["$mpErr"] = "x"
+    hostile_heap_magic["$mpErrMagic"] = [1, 2, 3]
+    cki("class2_err_listmagic_not_error", msgpack_is_error(hostile_heap_magic), 0)
+    print("PASS class2_no_fault_on_heap_magic")
+
+    // Same type-guard exercised through the DICT magic-value shape and a
+    // full encode/decode round trip (proves the guard holds not just in
+    // the direct-call form above but also through the general map
+    // encoder/decoder dispatch path).
+    let hostile_dict_magic = {}
+    hostile_dict_magic["$mpNil"] = 1
+    hostile_dict_magic["$mpNilMagic"] = nested
+    let ehdm = msgpack_encode(hostile_dict_magic)
+    cki("class2_dictmagic_is_fixmap_byte", bytes_get(ehdm, 0), 0x82)
+    let dhdm = msgpack_decode(ehdm)
+    cknotnull("class2_dictmagic_not_null", dhdm)
+    print("PROGRESS class2_done")
+
+    // ════════════════════════════════════════════════════════════════
+    // (D) CLASS 3 — trailing-content acceptance. NOT APPLICABLE to
+    //     msgpack's own grammar in the "declared TLV length not fully
+    //     consumed" sense: containers (array/map) are ELEMENT-COUNT
+    //     delimited, not byte-length delimited — a container's end
+    //     position IS, by construction, wherever its count-th element
+    //     ends; there is no separate declared length a container could
+    //     leave partially unconsumed. bin/str payloads consume EXACTLY
+    //     their declared byte length (verified in class 4 below). The
+    //     only applicable question is whether msgpack_decode(b) demands
+    //     the WHOLE buffer be consumed by one top-level value — it does
+    //     NOT, intentionally: this mirrors std/encoding/bson.nova's own
+    //     bson_decode/bson_decode_at split ("useful for reading a
+    //     stream/sequence of concatenated top-level documents") already
+    //     established in this codebase, and matches real msgpack usage
+    //     (msgpack-rpc streams concatenate top-level values). Proven
+    //     here: decoding a buffer with one valid value plus a second
+    //     concatenated value still returns exactly the first value, and
+    //     the streaming primitive (msgpack_decode_at) reports a
+    //     next_pos short of the buffer end so a caller who WANTS strict
+    //     single-message semantics can detect/enforce it themselves.
+    // ════════════════════════════════════════════════════════════════
+    let onetwo = mkbytes([0x01, 0x02])       // fixint 1, then fixint 2
+    cki("class3_toplevel_returns_first_only", msgpack_decode(onetwo), 1)
+    let r_stream = msgpack_decode_at(onetwo, 0)
+    cki("class3_next_pos_short_of_end", r_stream[1], 1)
+    cki("class3_caller_can_detect_trailing_bytes", bytes_len(onetwo) - r_stream[1], 1)
+    let r_stream2 = msgpack_decode_at(onetwo, r_stream[1])
+    cki("class3_second_value_reachable_via_cursor", r_stream2[0], 2)
+    print("PROGRESS class3_done")
+
+    // ════════════════════════════════════════════════════════════════
+    // (E) CLASS 4 — unchecked length -> over-read / truncation-as-
+    //     success. Every length-prefixed decode path must REJECT when
+    //     (i) the declared payload length overruns the remaining buffer,
+    //     and (ii) the length PREFIX ITSELF is truncated (fewer than
+    //     1/2/4 bytes available), for every affected format byte —
+    //     never silently truncate-and-accept.
+    // ════════════════════════════════════════════════════════════════
+
+    // (i) declared length overruns remaining buffer, prefix fully present.
+    ckerr("class4_bin8_overrun", mkbytes_decode([0xc4, 10, 1, 2, 3]))
+    ckerr("class4_bin16_overrun", mkbytes_decode([0xc5, 0xff, 0xff, 1, 2]))
+    ckerr("class4_str8_overrun", mkbytes_decode([0xd9, 5, 0x61, 0x62]))
+    ckerr("class4_str16_overrun", mkbytes_decode([0xda, 0x01, 0x2c, 0x61]))
+    ckerr("class4_fixstr_overrun", mkbytes_decode([0xa5]))               // fixstr len=5, 0 payload bytes
+
+    // (ii) length PREFIX itself truncated (need N bytes, fewer present).
+    ckerr("class4_bin8_no_lenbyte", mkbytes_decode([0xc4]))              // need 1, have 0
+    ckerr("class4_bin16_lenbyte_short", mkbytes_decode([0xc5, 0x00]))    // need 2, have 1
+    ckerr("class4_bin32_lenbytes_short", mkbytes_decode([0xc6, 0x00, 0x00, 0x00])) // need 4, have 3
+    ckerr("class4_str16_lenbyte_short", mkbytes_decode([0xda, 0x00]))    // need 2, have 1
+    ckerr("class4_array16_lenbyte_short", mkbytes_decode([0xdc, 0x00]))  // need 2, have 1
+    ckerr("class4_map32_lenbytes_short", mkbytes_decode([0xdf, 0x00, 0x00])) // need 4, have 2
+
+    // fixed-width scalar fields (constant-addend bounds checks, e.g.
+    // pos+8) remain solid after the arithmetic-FORM edit to _mp_fits —
+    // these call sites were not touched but are re-verified here as a
+    // regression guard.
+    ckerr("class4_float64_truncated", mkbytes_decode([0xcb, 0x00, 0x00, 0x00]))
+    ckerr("class4_int64_truncated", mkbytes_decode([0xd3, 0x00, 0x00, 0x00, 0x00]))
+    ckerr("class4_uint32_truncated", mkbytes_decode([0xce, 0x00, 0x00]))
+
+    // container propagation: a truncated element INSIDE an array/map
+    // must abort and propagate the error for the whole container, never
+    // silently skip the bad element or read past the corrupted cursor.
+    let c4_arr = mkbytes([0x91, 0xd9, 5, 0x61])      // fixarray n=1 [ str8 len=5, 1 payload byte ]
+    ckerr("class4_truncated_elem_in_array", msgpack_decode(c4_arr))
+    let c4_map = mkbytes([0x81, 0xa1, 0x6b, 0xd2, 0x00, 0x00])  // fixmap {"k": int32(truncated)}
+    ckerr("class4_truncated_value_in_map", msgpack_decode(c4_map))
+
+    // completely empty buffer / out-of-range cursor: must be an in-band
+    // error, never a crash (bytes_get is never reached when pos is
+    // outside [0, n)).
+    let empty = bytes_create(0)
+    ckerr("class4_empty_buffer", msgpack_decode(empty))
+    let r_neg = msgpack_decode_at(onetwo, 0 - 1)
+    ckerr("class4_negative_pos_no_crash", r_neg[0])
+    let r_past = msgpack_decode_at(onetwo, 999)
+    ckerr("class4_pos_past_end_no_crash", r_past[0])
+    print("PROGRESS class4_done")
+
+    print("MESSAGEPACK-AUDIT KAT PASS")

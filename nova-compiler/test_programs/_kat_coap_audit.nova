@@ -1,0 +1,209 @@
+// _kat_coap_audit — dedicated SOUNDNESS AUDIT KAT for std/net/coap (RFC 7252).
+//
+// Hunts the 4 recurring binary-wire-decoder vulnerability classes against
+// coap_decode(), and proves the module's handling of each with concrete
+// byte-level inputs (not just static reasoning):
+//
+//   1. i64-OVERFLOW BOUNDS BYPASS — a `pos + len > n` check where `len` is
+//      attacker-controlled can wrap negative for len near i64::MAX, silently
+//      bypassing the truncation check. FINDING: CoAP's option TLV has NO
+//      field capable of encoding a length anywhere near i64 range — the
+//      length nibble is extended by AT MOST 2 bytes (RFC 7252 §3.1, nibble
+//      14), so the largest declarable value length is 0xFFFF + 269 = 65804,
+//      nowhere near i64::MAX. The `pos + vlen > blen` check in
+//      _coap_validate_options (coap.nova) can never wrap for any wire input.
+//      We still probe the MAXIMUM representable length (extension bytes
+//      0xFF 0xFF) against a short buffer, the closest analogue this format
+//      admits to the 2^63-1 attack, and confirm rejection.
+//   2. SENTINEL / ABSENT-VALUE COLLISION — a magic value standing in for
+//      "absent" that collides with a real value. FINDING: coap_decode uses
+//      a native ok:0/1 dict flag (never an in-band magic value) for
+//      success/failure, and every wire field (ver=0, type=0, code=0,
+//      msg_id=0, option number 0, tkl=0) is independently a REAL, legal
+//      value with its own explicit bounds check — none of them double as an
+//      "absent" sentinel. We prove an all-zero-fields message decodes
+//      ok=1 (not misread as "no message"), and that option number 0 /
+//      code 0 round-trip as ordinary data, not errors.
+//   3. TRAILING-CONTENT ACCEPTANCE — bytes beyond a fully-consumed grammar
+//      region silently ignored. FINDING: CoAP's only two "end" points are
+//      (a) the option region, which _coap_validate_options and
+//      coap_opt_decode walk identically and which coap_decode double-checks
+//      via the unreachable "unexpected trailing bytes" guard, and (b) the
+//      payload, which has NO independent length field — it is defined as
+//      everything from the 0xFF marker to the actual end of the buffer, so
+//      there is no "declared length" it could diverge from. We prove a
+//      dangling incomplete option header at the very end of the buffer
+//      (no room for its declared value) is rejected, not silently dropped.
+//   4. UNCHECKED LENGTH -> OVER-READ / TRUNCATION-AS-SUCCESS — a declared
+//      length not bounded against remaining buffer before slicing/indexing.
+//      FINDING: every length-bearing field (TKL, extended option delta,
+//      extended option length, payload) is bounds-checked against the
+//      ACTUAL buffer length before being used to slice/index — see
+//      coap.nova's `4 + tkl > blen`, `_coap_validate_options`'s
+//      `pos + vlen > blen`, and `opt_end + 1 >= blen`. We prove truncated
+//      token, truncated extended-length bytes, and truncated option value
+//      are all rejected (ok=0), never silently short-read.
+//
+// RESULT: no soundness bug found in std/net/coap.nova across any of the 4
+// classes — the module's own validate-then-decode double pass (documented
+// in its header) already closes every angle tested here. This KAT exists
+// to make that provable and regression-proof, not because a fix was needed.
+//
+// Covers both copies (std/net/coap.nova and nova-compiler/std/net/coap.nova
+// are byte-identical; this KAT compiles against the synced nova-compiler
+// copy per the standard build).
+
+import std/net/coap
+
+fn cki(label, got, want)
+    if got != want
+        print("FAIL coap-audit " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn ckb(label, got, want)
+    let n = len(want)
+    if bytes_len(got) != n
+        print("FAIL coap-audit " + label + " len: got=" + str(bytes_len(got)) + " want=" + str(n))
+        exit(1)
+    let i = 0
+    while i < n
+        if bytes_get(got, i) != want[i]
+            print("FAIL coap-audit " + label + " byte[" + str(i) + "]: got=" + str(bytes_get(got, i)) + " want=" + str(want[i]))
+            exit(1)
+        i = i + 1
+
+fn mkbytes(lst)
+    let out = bytes(0)
+    let i = 0
+    let n = len(lst)
+    while i < n
+        out = bytes_append(out, lst[i])
+        i = i + 1
+    out
+
+fn main()
+    // ═══ (a) VALID ROUND-TRIP — unchanged through encode -> decode ═══════════
+
+    // Byte-exact vector: GET, token [0x11,0x22,0x33], Uri-Path "hi" (opt 3),
+    // opt 7 empty value, payload "payload-body".
+    let tok = [0x11, 0x22, 0x33]
+    let opts = [[3, [ord("h"), ord("i")]], [7, []]]
+    let payload = str_to_bytes("payload-body")
+    let enc = coap_encode(1, 0, 0x01, 0xABCD, tok, opts, payload)
+    cki("rt_enc_ok", enc["ok"], 1)
+
+    let dec = coap_decode(enc["bytes"])
+    cki("rt_dec_ok", dec["ok"], 1)
+    cki("rt_ver", dec["ver"], 1)
+    cki("rt_type", dec["type"], 0)
+    cki("rt_code", dec["code"], 0x01)
+    cki("rt_mid", dec["msg_id"], 0xABCD)
+    let rt_tok = dec["token"]
+    cki("rt_tok_len", len(rt_tok), 3)
+    cki("rt_tok0", rt_tok[0], 0x11)
+    cki("rt_tok1", rt_tok[1], 0x22)
+    cki("rt_tok2", rt_tok[2], 0x33)
+    let rt_opts = dec["options"]
+    cki("rt_opts_len", len(rt_opts), 2)
+    cki("rt_opt0_num", rt_opts[0][0], 3)
+    cki("rt_opt0_vlen", len(rt_opts[0][1]), 2)
+    cki("rt_opt0_v0", rt_opts[0][1][0], ord("h"))
+    cki("rt_opt1_num", rt_opts[1][0], 7)
+    cki("rt_opt1_vlen", len(rt_opts[1][1]), 0)
+    let rt_pay = dec["payload"]
+    cki("rt_pay_len", bytes_len(rt_pay), 12)
+    cki("rt_pay0", bytes_get(rt_pay, 0), ord("p"))
+    cki("rt_pay11", bytes_get(rt_pay, 11), ord("y"))
+
+    // Small hand-verified byte-exact vector (RFC-style GET, no token/opts).
+    let simple = coap_encode(1, 0, 0x01, 0x1234, [], [], bytes(0))
+    ckb("simple_wire", simple["bytes"], [0x40, 0x01, 0x12, 0x34])
+    let dsimple = coap_decode(simple["bytes"])
+    cki("simple_dec_ok", dsimple["ok"], 1)
+
+    // ═══ CLASS 1 — i64-overflow bounds bypass ════════════════════════════════
+    // Closest analogue this format admits: maximum representable declared
+    // option-value length (2-byte extension, nibble 14, ext bytes 0xFF 0xFF
+    // => vlen = 0xFFFF + 269 = 65804) against a buffer with only 2 bytes of
+    // "value" actually present. `pos + vlen > blen` must reject — and since
+    // vlen here is nowhere near i64 range, there is no wraparound angle at
+    // all (this format structurally cannot encode a 2^63-scale length).
+    let c1_max_len = mkbytes([0x40, 0x01, 0x12, 0x34, 0x0E, 0xFF, 0xFF, 0xAA, 0xBB])
+    let dc1 = coap_decode(c1_max_len)
+    cki("c1_max_declared_len_rejected", dc1["ok"], 0)
+
+    // Same probe on the DELTA extension side (nibble 14, dn extension bytes
+    // 0xFF 0xFF) with a truncated length nibble immediately after — the
+    // largest delta jump the format can express, still must not desync
+    // pos math or accept truncated input.
+    let c1_max_delta_trunc = mkbytes([0x40, 0x01, 0x12, 0x34, 0xE0, 0xFF])
+    let dc1b = coap_decode(c1_max_delta_trunc)
+    cki("c1_max_delta_truncated_rejected", dc1b["ok"], 0)
+
+    // ═══ CLASS 2 — sentinel / absent-value collision ═════════════════════════
+    // All-zero message: ver=0,type=0,tkl=0,code=0,msg_id=0. Every field is
+    // independently a legal wire value (code 0 = 0.00 Empty message per RFC
+    // 7252 §4.1) — must decode ok=1, NOT be treated as "no message"/absent.
+    let c2_allzero = mkbytes([0x00, 0x00, 0x00, 0x00])
+    let dc2 = coap_decode(c2_allzero)
+    cki("c2_allzero_ok", dc2["ok"], 1)
+    cki("c2_allzero_ver", dc2["ver"], 0)
+    cki("c2_allzero_code", dc2["code"], 0)
+    cki("c2_allzero_mid", dc2["msg_id"], 0)
+    cki("c2_allzero_optlen", len(dc2["options"]), 0)
+    cki("c2_allzero_paylen", bytes_len(dc2["payload"]), 0)
+
+    // Option number 0 (delta 0 from start) with a real value must round-trip
+    // as ordinary data — not be mistaken for "no options present".
+    let c2_opts0 = [[0, [0xAA]]]
+    let ec2 = coap_encode(1, 0, 0x01, 1, [], c2_opts0, bytes(0))
+    cki("c2_opt0_enc_ok", ec2["ok"], 1)
+    let dc2b = coap_decode(ec2["bytes"])
+    cki("c2_opt0_dec_ok", dc2b["ok"], 1)
+    cki("c2_opt0_len", len(dc2b["options"]), 1)
+    cki("c2_opt0_num", dc2b["options"][0][0], 0)
+    cki("c2_opt0_val0", dc2b["options"][0][1][0], 0xAA)
+
+    // ═══ CLASS 3 — trailing-content acceptance ═══════════════════════════════
+    // Fully-consumed option region with NO marker and NO payload: opt_end
+    // must land exactly at blen and be accepted with an empty payload
+    // (nothing left over, nothing silently dropped).
+    let c3_full = mkbytes([0x40, 0x01, 0x12, 0x34, 0xB1, 0x41])
+    let dc3 = coap_decode(c3_full)
+    cki("c3_full_consume_ok", dc3["ok"], 1)
+    cki("c3_full_consume_paylen", bytes_len(dc3["payload"]), 0)
+
+    // Dangling incomplete option header at the very end of the buffer: a
+    // header byte declaring delta=0/len=4 with ZERO bytes of value
+    // remaining. Must be rejected, not silently truncated to a shorter
+    // option (which would be "trailing declared content" silently dropped).
+    let c3_dangling = mkbytes([0x40, 0x01, 0x12, 0x34, 0x04])
+    let dc3b = coap_decode(c3_dangling)
+    cki("c3_dangling_header_rejected", dc3b["ok"], 0)
+
+    // ═══ CLASS 4 — unchecked length -> over-read / truncation-as-success ════
+    // Truncated token: TKL=4 declared, only 2 bytes actually follow the
+    // 4-byte header.
+    let c4_tok = mkbytes([0x44, 0x01, 0x12, 0x34, 0xAA, 0xBB])
+    let dc4 = coap_decode(c4_tok)
+    cki("c4_truncated_token_rejected", dc4["ok"], 0)
+
+    // Truncated extended-length byte: header nibble ln=13 (1 extension byte
+    // expected) but the buffer ends right after the header byte.
+    let c4_extlen = mkbytes([0x40, 0x01, 0x12, 0x34, 0x0D])
+    let dc4b = coap_decode(c4_extlen)
+    cki("c4_truncated_extlen_rejected", dc4b["ok"], 0)
+
+    // Truncated option value: header declares len=5 direct nibble, only 3
+    // value bytes actually present.
+    let c4_val = mkbytes([0x40, 0x01, 0x12, 0x34, 0x05, 0x01, 0x02, 0x03])
+    let dc4c = coap_decode(c4_val)
+    cki("c4_truncated_value_rejected", dc4c["ok"], 0)
+
+    // Payload marker with declared-but-absent payload (zero bytes after
+    // 0xFF) must be rejected, not accepted as an empty payload.
+    let c4_marker = mkbytes([0x40, 0x01, 0x12, 0x34, 0xFF])
+    let dc4d = coap_decode(c4_marker)
+    cki("c4_marker_zero_payload_rejected", dc4d["ok"], 0)
+
+    print("COAP-AUDIT KAT PASS")

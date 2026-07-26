@@ -48,12 +48,20 @@
 //     On success: {"code","identifier","length","authenticator"}.
 //
 //   radius_decode(b: bytes) -> dict
-//     Full packet decode. Returns {} if the header is invalid (see above).
-//     Attribute parsing is bounded to min(declared Length, actual buffer
-//     length): an attribute whose own Length field would read past that
-//     bound stops parsing right there (already-parsed attrs are kept, no
-//     over-read, no crash) — this rejects both a corrupt Length field AND an
-//     attacker appending a second frame after a valid packet.
+//     Full packet decode. Returns {} if the header is invalid (see above),
+//     if the physical buffer is shorter than the declared header Length (a
+//     truncated receive — RFC 2865 §3 requires treating that as corrupt and
+//     discarding it, never accept-and-truncate), or if the attribute region
+//     b[20, declared Length) does not parse as a back-to-back run of
+//     well-formed TLVs that EXACTLY fills that region. A malformed or
+//     short attribute anywhere inside the declared Length invalidates the
+//     WHOLE packet — it is never silently dropped while the rest is kept
+//     (that would be trailing-content acceptance: the caller would see a
+//     "successful" decode missing an attribute, with no signal that the
+//     packet was actually corrupt). Bytes beyond the declared Length (e.g.
+//     an attacker-appended second frame, or transport-layer padding) are
+//     never inspected either way — only the declared region is graded.
+//     Never over-reads, never exit(1).
 //     On success: {"code","identifier","length","authenticator","attrs"}
 //     where "attrs" is a list of {"type":int,"value":bytes}.
 //
@@ -88,6 +96,12 @@
 //     Inverse of encrypt. Returns the full zero-padded plaintext (always a
 //     16-byte multiple). Returns bytes(0) if authenticator is not 16 bytes,
 //     or encrypted is empty or not a multiple of 16 bytes.
+//     This sentinel is COLLISION-FREE: every successfully-decrypted output
+//     is a positive multiple of 16 bytes (minimum 16), so bytes(0) can only
+//     ever mean "rejected malformed input" here — never a valid decrypt.
+//     Prefer this function over the convenience wrapper below when the
+//     caller must distinguish "input was malformed" from "input decrypted
+//     to an empty password".
 //
 //   radius_user_password_decrypt(encrypted: bytes, authenticator: bytes,
 //                                 secret: string) -> bytes
@@ -98,6 +112,14 @@
 //     exactly. (If a password could legitimately end in 0x00 bytes, use
 //     decrypt_raw and strip padding yourself using the known original
 //     length — that ambiguity is inherent to RFC 2865, not this codec.)
+//     SENTINEL WARNING: unlike decrypt_raw, this wrapper's bytes(0) is NOT
+//     collision-free — a genuinely empty recovered password (a real,
+//     successful decrypt) strips down to bytes(0) exactly like a rejected
+//     malformed input does. Do NOT use `bytes_len(result) == 0` on THIS
+//     function as an error check. Callers that must tell "malformed input"
+//     apart from "password was empty" should validate the input shape
+//     first (authenticator is 16 bytes, encrypted is a nonzero multiple of
+//     16) or call decrypt_raw directly.
 //
 //   radius_md5_hex(s: string) -> string
 //     Debug/verification helper: hex digest of the module's internal MD5
@@ -335,10 +357,25 @@ fn radius_decode(b) -> dict
         return {}
     let declared = hdr["length"]
     let buflen = bytes_len(b)
-    let end = declared
-    if end > buflen
-        end = buflen                            // never trust a declared Length beyond what actually arrived
-    let attrs = radius_attr_decode_all(b, 20, end)
+    if buflen < declared
+        return {}                               // truncated receive: fewer bytes arrived than the
+                                                 // header declares (RFC 2865 §3: treat as corrupt,
+                                                 // never accept-and-truncate)
+    let attrs = radius_attr_decode_all(b, 20, declared)
+    // Verify the attribute walk EXACTLY filled [20, declared) — reconstruct
+    // the offset it must have stopped at from the TLVs it actually returned
+    // (each returned attr consumed exactly 2 + len(value) bytes). If a
+    // malformed/short attribute anywhere in the region made the walker stop
+    // early, `consumed` falls short of `declared` and the whole packet is
+    // rejected — never silently accept a partial attribute list as success.
+    let consumed = 20
+    let ai = 0
+    let nattrs = len(attrs)
+    while ai < nattrs
+        consumed = consumed + 2 + bytes_len(attrs[ai]["value"])
+        ai = ai + 1
+    if consumed != declared
+        return {}
     {"code": hdr["code"], "identifier": hdr["identifier"], "length": declared, "authenticator": hdr["authenticator"], "attrs": attrs}
 
 // ── specific attributes ─────────────────────────────────────────────────

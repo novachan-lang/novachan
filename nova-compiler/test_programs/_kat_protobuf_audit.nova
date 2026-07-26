@@ -1,0 +1,301 @@
+// _kat_protobuf_audit.nova — Independent security audit KAT for
+// std/encoding/protobuf.nova.
+//
+// Hunts the 4 recurring binary-decoder vulnerability classes against every
+// decode path in std/encoding/protobuf that reads a length/count from
+// untrusted input and then indexes/slices the buffer:
+//   1. i64-overflow bounds bypass  (pos+len wraps negative, skipping a
+//      truncation check)
+//   2. sentinel / absent-value collision (a magic in-band value colliding
+//      with a real decoded value)
+//   3. trailing-content acceptance (declared length not fully verified
+//      consumed)
+//   4. unchecked length -> over-read / truncation-as-success
+//
+// CONCLUSION OF THE AUDIT (see inline comments per test): std/encoding/
+// protobuf.nova is SOUND against all 4 classes. pb_read_len_delim already
+// uses the overflow-safe SUBTRACTIVE form (avail = total - data_start; if
+// take > avail: take = avail) rather than the vulnerable ADDITIVE form
+// (if pos + len > n), so a 2^63-1 declared length can never wrap and can
+// never be honored past what is actually in the buffer. No sentinel value
+// this module returns can collide with a value a real encoder could ever
+// produce (field number 0 is invalid per the protobuf spec regardless of
+// how a decode arrives at it). This module implements no "parse a whole
+// fixed-grammar structure against a declared total" primitive, so class 3
+// does not apply to its own functions -- that responsibility is delegated
+// to the caller by design (consistent with std/encoding/avro and
+// std/encoding/thrift, which cite this exact module's pattern), and callers
+// CAN correctly detect non-full-consumption via `pos != total`. Every
+// bounds-clamped read is additionally backstopped by the C runtime itself
+// (nova_rt_bytes_get / nova_rt_bytes_slice both clamp out-of-range indices
+// to a safe empty/zero result rather than reading out of bounds), so even
+// the one internal inconsistency found (pb_decode_fixed32_field /
+// pb_decode_fixed64_field can return a next_pos that exceeds bytes_len(buf)
+// on a genuinely truncated fixed-width field, unlike pb_read_len_delim which
+// clamps) is memory-safe -- and is actually a *better* truncation signal for
+// a caller checking `pos == total`, so "fixing" it to clamp like
+// pb_read_len_delim would make that idiom WORSE (it is deliberately left
+// unclamped; verified below in section F/G rather than "fixed").
+//
+// No code change was needed in std/encoding/protobuf.nova. This KAT is the
+// proof: every malformed input below is traced against the actual arithmetic
+// in that file and asserted to be memory-safe and non-fabricating.
+import std/encoding/protobuf
+import std/encoding/varint
+import std/bits/zigzag
+
+// ── shared helpers (same idiom as _pbwire_kat.nova / _pbwire_adv_kat.nova) ──
+
+fn _pa_bytes_eq(a, b) -> int
+    let la = bytes_len(a)
+    let lb = bytes_len(b)
+    if la != lb
+        return 0
+    let i = 0
+    while i < la
+        if bytes_get(a, i) != bytes_get(b, i)
+            return 0
+        i = i + 1
+    1
+
+fn _pa_make_bytes(lst) -> any
+    let buf = bytes(0)
+    let i = 0
+    while i < len(lst)
+        buf = bytes_append(buf, lst[i])
+        i = i + 1
+    buf
+
+fn ckb(label, got, want_list) -> int
+    let want = _pa_make_bytes(want_list)
+    if _pa_bytes_eq(got, want) == 0
+        print("FAIL " + label + ": got len=" + str(bytes_len(got)) + " want len=" + str(bytes_len(want)))
+        exit(1)
+    0
+
+fn cki(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+// ── PART A: valid round-trip stays byte-exact and fully self-consistent ────
+// A realistic multi-field message covering every wire type must decode back
+// to exactly what was encoded, with `pos` landing exactly on the total
+// length -- proving the audit below finds no regression versus normal use.
+fn a_valid_roundtrip() -> int
+    let msg = bytes(0)
+    msg = bytes_concat(msg, pb_encode_varint_field(1, 42))
+    msg = bytes_concat(msg, pb_encode_string_field(2, "hello world"))
+    msg = bytes_concat(msg, pb_encode_sint_field(3, 0 - 12345))
+    msg = bytes_concat(msg, pb_encode_fixed32_field(4, 3405691582))
+    msg = bytes_concat(msg, pb_encode_fixed64_field(5, 0 - 1))
+    msg = bytes_concat(msg, pb_encode_bytes_field(6, _pa_make_bytes([0x00, 0xFF, 0x41])))
+    let total = bytes_len(msg)
+
+    let pos = 0
+    let tg1 = pb_read_tag(msg, pos)
+    cki("f1 num", tg1[0], 1)
+    let v1 = pb_read_varint(msg, tg1[2])
+    cki("f1 value", v1[0], 42)
+    pos = v1[1]
+
+    let d2 = pb_decode_string_field(msg, pos)
+    cki("f2 num", d2[0], 2)
+    if d2[1] != "hello world"
+        print("FAIL f2 value")
+        exit(1)
+    pos = d2[2]
+
+    let d3 = pb_decode_sint_field(msg, pos)
+    cki("f3 num", d3[0], 3)
+    cki("f3 value", d3[1], 0 - 12345)
+    pos = d3[2]
+
+    let d4 = pb_decode_fixed32_field(msg, pos)
+    cki("f4 num", d4[0], 4)
+    cki("f4 value", d4[1], 3405691582)
+    pos = d4[2]
+
+    let d5 = pb_decode_fixed64_field(msg, pos)
+    cki("f5 num", d5[0], 5)
+    cki("f5 value", d5[1], 0 - 1)
+    pos = d5[2]
+
+    let d6 = pb_decode_bytes_field(msg, pos)
+    cki("f6 num", d6[0], 6)
+    cki("f6 len", bytes_len(d6[1]), 3)
+    cki("f6[0]", bytes_get(d6[1], 0), 0x00)
+    cki("f6[1]", bytes_get(d6[1], 1), 0xFF)
+    cki("f6[2]", bytes_get(d6[1], 2), 0x41)
+    pos = d6[2]
+
+    cki("valid message fully consumed", pos, total)
+    0
+
+// ── PART B: CLASS 1 -- i64-overflow bounds bypass, raw primitive ───────────
+// Declared length = 2^63-1 (0x7FFFFFFFFFFFFFFF), the exact adversarial
+// vector: `pos + len` computed in raw int64 arithmetic WOULD wrap negative
+// (proven below), which is exactly the bug pattern that makes a naive
+// `if pos + len > n` check pass when it should fail. pb_read_len_delim uses
+// the safe subtractive form instead (avail = total - data_start; if take >
+// avail: take = avail), so it must never honor the declared length -- only
+// the bytes actually present.
+fn b_class1_i64_overflow_length_raw() -> int
+    let len_bytes = vi_encode(9223372036854775807)  // 2^63-1 varint prefix
+    let data_start = bytes_len(len_bytes)
+    let buf = bytes_concat(len_bytes, _pa_make_bytes([0xDE, 0xAD, 0xBE]))
+    let total = bytes_len(buf)
+
+    // Prove this vector is a genuine overflow trigger for the vulnerable
+    // additive pattern (pos + len), confirming we're testing the real bug,
+    // not a benign large number.
+    let would_wrap = data_start + 9223372036854775807
+    if would_wrap >= 0
+        print("FAIL precondition: pos+len should wrap negative for this vector")
+        exit(1)
+
+    let r = pb_read_len_delim(buf, 0)
+    cki("class1 payload clamped to actually-available bytes, not 2^63-1", bytes_len(r[0]), total - data_start)
+    cki("class1 next_pos never exceeds buffer length", r[1], total)
+    if r[1] > total
+        print("FAIL class1: pb_read_len_delim produced an out-of-bounds next_pos")
+        exit(1)
+    0
+
+// ── PART C: CLASS 1 variant -- declared length that decodes NEGATIVE ───────
+// All 64 bits set (the canonical raw two's-complement varint encoding of -1,
+// same byte pattern the module's own int64(-1) encoder produces) must be
+// caught by the `if take < 0: take = 0` guard, not just the `> avail` guard.
+fn c_class1_negative_length_all_bits_set() -> int
+    let len_bytes = _pa_make_bytes([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+    let lr = vi_decode(len_bytes, 0)
+    cki("class1b declared length decodes to -1", lr[0], 0 - 1)
+    let buf = bytes_concat(len_bytes, _pa_make_bytes([0x11, 0x22]))
+    let r = pb_read_len_delim(buf, 0)
+    cki("class1b negative length clamps payload to empty", bytes_len(r[0]), 0)
+    cki("class1b next_pos does not advance past the length prefix", r[1], bytes_len(len_bytes))
+    0
+
+// ── PART D: CLASS 1 -- the SAME 2^63-1 attack against the public typed
+// wrappers (pb_decode_bytes_field / pb_decode_string_field), which is what
+// real callers (forge_etcd, forge_grpc) actually use. ──────────────────────
+fn d_class1_typed_wrappers_inherit_the_clamp() -> int
+    let len_bytes = vi_encode(9223372036854775807)
+    let buf = bytes_concat(pb_encode_tag(9, pb_wire_len()), bytes_concat(len_bytes, _pa_make_bytes([0x58, 0x59, 0x5A])))
+    let total = bytes_len(buf)
+    let d = pb_decode_bytes_field(buf, 0)
+    cki("class1d bytes-wrapper num", d[0], 9)
+    cki("class1d bytes-wrapper payload clamped to 3, not 2^63-1", bytes_len(d[1]), 3)
+    cki("class1d bytes-wrapper next_pos == buffer end", d[2], total)
+
+    let buf2 = bytes_concat(pb_encode_tag(9, pb_wire_len()), bytes_concat(len_bytes, str_to_bytes("xyz")))
+    let d2 = pb_decode_string_field(buf2, 0)
+    if d2[1] != "xyz"
+        print("FAIL class1d string-wrapper clamped value")
+        exit(1)
+    cki("class1d string-wrapper next_pos == buffer end", d2[2], bytes_len(buf2))
+    0
+
+// ── PART E: CLASS 2 -- sentinel/absent-value collision ─────────────────────
+// pb_read_tag returns [0, 0, pos] both when the buffer is truncated (nothing
+// left to read) AND when a real 0x00 byte is present (an explicit, on-wire
+// "field 0" tag). Field number 0 is forbidden by the protobuf spec in BOTH
+// cases, so there is no legitimate encoder output this sentinel could ever
+// collide with. The two cases remain distinguishable anyway (via whether
+// next_pos actually advanced), so no information is even lost.
+fn e_class2_sentinel_no_collision() -> int
+    let short_buf = _pa_make_bytes([0x41, 0x42])
+    let tg_trunc = pb_read_tag(short_buf, 2)
+    cki("class2 truncated: field_num sentinel", tg_trunc[0], 0)
+    cki("class2 truncated: wiretype sentinel", tg_trunc[1], 0)
+    cki("class2 truncated: next_pos unchanged (0 bytes consumed)", tg_trunc[2], 2)
+
+    let explicit_zero = _pa_make_bytes([0x00, 0x99])
+    let tg_zero = pb_read_tag(explicit_zero, 0)
+    cki("class2 explicit tag=0x00: field_num", tg_zero[0], 0)
+    cki("class2 explicit tag=0x00: wiretype", tg_zero[1], 0)
+    cki("class2 explicit tag=0x00: DOES advance (distinguishable from truncation)", tg_zero[2], 1)
+    0
+
+// ── PART F: CLASS 3 -- trailing-content acceptance ──────────────────────────
+// std/encoding/protobuf implements no "declared-total -> parse -> verify
+// fully consumed" primitive (it is a per-FIELD framing library; that
+// responsibility is the caller's, same as std/encoding/avro / thrift). Prove
+// the caller CAN correctly detect trailing/unconsumed bytes using the
+// next_pos this module returns -- i.e. that class 3's mitigation is not lost
+// by this module's design, just relocated to where the grammar (the message
+// schema) is actually known.
+fn f_class3_caller_can_detect_trailing_content() -> int
+    let msg = pb_encode_varint_field(1, 7)
+    msg = bytes_concat(msg, _pa_make_bytes([0xAB]))  // 1 undeclared trailing byte
+    let total = bytes_len(msg)
+    let tg = pb_read_tag(msg, 0)
+    let vr = pb_read_varint(msg, tg[2])
+    let pos = vr[1]
+    if pos == total
+        print("FAIL class3 precondition: trailing byte must not be silently consumed")
+        exit(1)
+    cki("class3 caller detects the 1 unconsumed trailing byte", total - pos, 1)
+    0
+
+// ── PART G: CLASS 4 -- unchecked length -> over-read / truncation-as-success
+// pb_read_len_delim already bounds-checks (part B/C/D). Separately verify the
+// FIXED-WIDTH decoders (pb_decode_fixed32_field / pb_decode_fixed64_field,
+// which have no declared length at all -- I32/I64 always need exactly 4/8
+// raw bytes): a short buffer must never cause an out-of-bounds read, missing
+// bytes must read as 0 (documented contract), and any resulting next_pos --
+// even one that legitimately overshoots bytes_len(buf) on a genuinely
+// truncated field -- must remain safe when fed back into the runtime's own
+// bounds-checked primitives (defense in depth), never fabricating memory.
+fn g_class4_fixed_width_short_buffer_no_overread() -> int
+    let buf = _pa_make_bytes([0x0D, 0x7A])  // tag(field 1, I32) + only 1 body byte
+    let d = pb_decode_fixed32_field(buf, 0)
+    cki("class4 fixed32 short-buffer num", d[0], 1)
+    cki("class4 fixed32 short-buffer value (missing bytes read as 0)", d[1], 0x7A)
+    let overshoot = d[2]
+    let probe_slice = bytes_slice(buf, overshoot, overshoot + 10)
+    cki("class4 slicing an overshot pos returns empty, never OOB", bytes_len(probe_slice), 0)
+    cki("class4 getting an overshot pos returns safe 0, never OOB", bytes_get(buf, overshoot), 0)
+
+    let buf2 = _pa_make_bytes([0x09])  // tag(field 1, I64) only, zero body bytes
+    let d2 = pb_decode_fixed64_field(buf2, 0)
+    cki("class4 fixed64 zero-body value", d2[1], 0)
+    let probe2 = bytes_slice(buf2, d2[2], d2[2] + 10)
+    cki("class4 fixed64 overshot-pos slice safe", bytes_len(probe2), 0)
+
+    // Realistic (non-astronomical) oversized declared length: 1 MB claimed,
+    // 5 bytes actually present.
+    let len_bytes = vi_encode(1000000)
+    let buf3 = bytes_concat(len_bytes, _pa_make_bytes([1, 2, 3, 4, 5]))
+    let r3 = pb_read_len_delim(buf3, 0)
+    cki("class4 1MB-claim clamps to actual 5 bytes present", bytes_len(r3[0]), 5)
+    cki("class4 1MB-claim next_pos == buffer end", r3[1], bytes_len(buf3))
+    0
+
+// ── PART H: CLASS 4 -- pos WAY PAST buffer end fed straight into the
+// fixed-width decoders (not previously covered by _pbwire_adv_kat.nova,
+// which only exercised pb_read_tag / pb_read_len_delim at an out-of-range
+// pos). Must not crash; must return the documented safe-zero sentinel.
+fn h_class4_pos_past_end_fixed_decoders() -> int
+    let buf = _pa_make_bytes([0x41, 0x42, 0x43])
+    let d32 = pb_decode_fixed32_field(buf, 50)
+    cki("class4 fixed32 pos-past-end num", d32[0], 0)
+    cki("class4 fixed32 pos-past-end value", d32[1], 0)
+    let d64 = pb_decode_fixed64_field(buf, 50)
+    cki("class4 fixed64 pos-past-end num", d64[0], 0)
+    cki("class4 fixed64 pos-past-end value", d64[1], 0)
+    0
+
+// ── Entry point ───────────────────────────────────────────────────────────
+fn main() -> int
+    a_valid_roundtrip()
+    b_class1_i64_overflow_length_raw()
+    c_class1_negative_length_all_bits_set()
+    d_class1_typed_wrappers_inherit_the_clamp()
+    e_class2_sentinel_no_collision()
+    f_class3_caller_can_detect_trailing_content()
+    g_class4_fixed_width_short_buffer_no_overread()
+    h_class4_pos_past_end_fixed_decoders()
+    print("PROTOBUF-AUDIT KAT PASS")
+    0

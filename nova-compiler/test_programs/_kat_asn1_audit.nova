@@ -1,0 +1,215 @@
+// _kat_asn1_audit.nova — Independent security audit KAT for std/data/asn1.nova
+// (the minimal DER INTEGER/OCTET STRING/SEQUENCE encoder+header-decoder).
+//
+// Hunts the 4 recurring binary-decoder vulnerability classes against every
+// DECODE path in std/data/asn1 that reads a length/count from untrusted
+// input (the only such path is asn_length, which decodes the DER length
+// field starting at byte index 1 of a TLV value; asn_tag reads a single
+// fixed byte at index 0 and does no length-driven arithmetic):
+//   1. i64-overflow bounds bypass  (pos+len wraps negative, skipping a
+//      truncation check)
+//   2. sentinel / absent-value collision (a magic in-band value colliding
+//      with a real decoded value)
+//   3. trailing-content acceptance (declared length not fully verified
+//      consumed)
+//   4. unchecked length -> over-read / truncation-as-success
+//
+// CONCLUSION OF THE AUDIT:
+//   Classes 1-3 do not apply to this module's decode surface (see PART B/C/D
+//   for the trace proving why). Class 4 WAS REAL and IS NOW FIXED: asn_length
+//   read the length-field bytes at index 2 and/or 3 without first checking
+//   bytes_len(b) was large enough to actually contain them. Because
+//   nova_rt_bytes_get clamps an out-of-range index to a safe 0 rather than
+//   faulting, a truncated/malformed DER header did not crash -- it silently
+//   decoded to a plausible-looking (and in one case, entirely FABRICATED)
+//   length instead of being rejected:
+//     - 1-byte buffer (tag only, no length byte at all) decoded as length 0
+//       (a legitimate-looking empty TLV -- indistinguishable from a real
+//       zero-length OCTET STRING).
+//     - [tag, 0x82, 0xFF] (long-form-2 claimed, only 1 of 2 length bytes
+//       actually present) decoded as length 65280 (0xFF00) -- a length that
+//       was never actually encoded on the wire, fabricated purely from the
+//       missing byte being clamped to 0.
+//     - [tag, 0x80] (the BER indefinite-length marker, invalid in DER) and
+//       [tag, 0x88, ...] (an unsupported wide long-form -- the closest this
+//       2-byte-max format can get to a 2^63-1-style oversized length claim)
+//       both fell through to `result = first`, i.e. the raw 0x80/0x88
+//       CONTROL byte was returned as if it were a literal short-form length.
+//   FIX (std/data/asn1.nova, asn_length): validate bytes_len(b) is large
+//   enough for the declared form BEFORE reading past index 1, and reject
+//   (-1) the indefinite-length marker and any unsupported wide long-form.
+//   -1 can never collide with a real decoded length (always 0..65535 by
+//   construction), so it is an unambiguous, non-fabricating error sentinel.
+import std/data/asn1
+
+// ── shared helpers ───────────────────────────────────────────────────────
+fn _aa_make_bytes(lst) -> any
+    let buf = bytes(0)
+    let i = 0
+    while i < len(lst)
+        buf = bytes_append(buf, lst[i])
+        i = i + 1
+    buf
+
+fn cki(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+// ── PART A: valid round-trip stays byte-exact and decodes unchanged ───────
+fn a_valid_roundtrip() -> int
+    let i1 = asn_encode_int(1)
+    let i2 = asn_encode_int(300)
+    let octs = asn_encode_octetstring(str_to_bytes("hello world"))
+    let seq = asn_encode_sequence([i1, i2, octs])
+
+    // Byte-exact expected encoding:
+    //   INT 1   -> 02 01 01                       (3 bytes)
+    //   INT 300 -> 02 02 01 2C                     (4 bytes, 300 = 0x012C)
+    //   OCTSTR  -> 04 0B "hello world" (11 bytes)  (13 bytes)
+    //   total content = 3+4+13 = 20 -> SEQUENCE header 30 14 (0x14=20)
+    let want = _aa_make_bytes([0x30, 0x14,
+        0x02, 0x01, 0x01,
+        0x02, 0x02, 0x01, 0x2C,
+        0x04, 0x0B, 104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100])
+    cki("A valid seq total length", bytes_len(seq), bytes_len(want))
+    let n = bytes_len(want)
+    let k = 0
+    while k < n
+        cki("A valid seq byte[" + str(k) + "]", bytes_get(seq, k), bytes_get(want, k))
+        k = k + 1
+
+    // Header decode must reproduce exactly what was encoded.
+    cki("A asn_tag(seq) == SEQUENCE", asn_tag(seq), 48)
+    cki("A asn_length(seq) == 20", asn_length(seq), 20)
+    cki("A asn_tag(i2) == INTEGER", asn_tag(i2), 2)
+    cki("A asn_length(i2) == 2", asn_length(i2), 2)
+    cki("A asn_tag(octs) == OCTET STRING", asn_tag(octs), 4)
+    cki("A asn_length(octs) == 11", asn_length(octs), 11)
+    0
+
+// ── PART B: CLASS 1 -- i64-overflow bounds bypass ──────────────────────────
+// This module's only decode path (asn_length) never computes `pos + len`
+// against a buffer bound -- it reads at FIXED offsets (1, 2, 3) relative to
+// the start of the TLV, gated only by bytes_len(b) (see PART E). There is
+// no addition of an attacker-controlled length to a position anywhere in
+// this file, so the overflow-bypass pattern (`if pos + len > n` wrapping
+// negative for len = 0x7FFFFFFFFFFFFFFF) has no site to exist in.
+// Additionally, this format's length field physically CANNOT encode
+// anything close to 2^63-1: the long form here supports only 1 or 2
+// length-octets (0x81 / 0x82), capping the maximum representable length at
+// 65535. Prove both halves: the largest representable length round-trips
+// correctly, and any attempt to claim a wider form (the closest reachable
+// analog of an oversized-length attack in this format) is rejected outright
+// rather than silently truncated or misinterpreted.
+fn b_class1_not_applicable_and_max_length_sound() -> int
+    // Largest representable length (0x82 0xFF 0xFF == 65535) must decode
+    // exactly, with no overflow or truncation in the hi*256+lo computation.
+    let hdr_max = _aa_make_bytes([0x04, 0x82, 0xFF, 0xFF])
+    cki("B max representable length (65535) decodes exactly", asn_length(hdr_max), 65535)
+
+    // Closest reachable analog of a 2^63-1 / 0x7FFFFFFFFFFFFFFF oversized
+    // length prefix: a wide long-form control byte (0x88 = "8 length
+    // octets follow", which in a general BER decoder could encode up to
+    // 2^64-1) followed by 8 bytes of 0xFF. This decoder does not support
+    // forms beyond 0x82, so it must reject this outright, never silently
+    // reinterpret the control byte as a literal value (which is exactly
+    // what the pre-fix code did -- see the audit conclusion above).
+    let hdr_wide = _aa_make_bytes([0x04, 0x88, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    cki("B unsupported wide long-form (2^63-1 analog) rejected, not misread as literal 0x88", asn_length(hdr_wide), 0 - 1)
+    0
+
+// ── PART C: CLASS 2 -- sentinel / absent-value collision ───────────────────
+// std/data/asn1 encodes exactly three concrete types (INTEGER, OCTET
+// STRING, SEQUENCE) with no NULL/optional/absent-value variant and no
+// magic in-band marker for "no value" -- there is nothing here that a real
+// decoded value could collide with. The only sentinel this module produces
+// is asn_length's -1 error return (added by the class-4 fix below); prove
+// it is unambiguous by showing every legitimately decodable length is
+// non-negative (0..65535 by construction: short form is 0..127, the 1-byte
+// long form is 0..255, the 2-byte long form is 0..65535), so -1 can never
+// be produced by a well-formed input.
+fn c_class2_not_applicable_sentinel_unambiguous() -> int
+    cki("C short-form 0 decodes to 0, not confused with error", asn_length(_aa_make_bytes([0x04, 0x00])), 0)
+    cki("C short-form 127 (max short form) decodes correctly", asn_length(_aa_make_bytes([0x04, 0x7F])), 127)
+    cki("C long-form-1 max (0x81 0xFF == 255) decodes correctly", asn_length(_aa_make_bytes([0x04, 0x81, 0xFF])), 255)
+    0
+
+// ── PART D: CLASS 3 -- trailing-content acceptance ──────────────────────────
+// std/data/asn1 implements no "decode a whole structure and verify the
+// declared length was fully consumed" primitive -- asn_tag/asn_length only
+// decode the TLV HEADER fields (tag byte, length field); they never slice
+// or validate the CONTENT that follows. There is therefore no function in
+// this module that could accept trailing/extra content as part of a
+// bounded structure it claims to have fully parsed. (This mirrors the
+// documented, deliberate architecture of std/encoding/protobuf and
+// std/data/asn1_length: header/length decode is separated from
+// content-consumption, and content-consumption verification is the
+// caller's responsibility once it knows the surrounding grammar.) Prove a
+// caller CAN still detect trailing content using what this module exposes:
+// header_len + declared_length vs the actual buffer length.
+fn d_class3_not_applicable_caller_can_detect_trailing() -> int
+    let octs = asn_encode_octetstring(str_to_bytes("AB"))   // 04 02 41 42 (4 bytes)
+    let with_trailing = bytes_concat(octs, _aa_make_bytes([0x99]))  // +1 undeclared byte
+    let declared_len = asn_length(with_trailing)
+    let header_len = 2   // 1 tag byte + 1 short-form length byte
+    let declared_end = header_len + declared_len
+    let actual_total = bytes_len(with_trailing)
+    if declared_end == actual_total
+        print("FAIL D precondition: trailing byte must not be silently absorbed")
+        exit(1)
+    cki("D caller detects the 1 unconsumed trailing byte", actual_total - declared_end, 1)
+    0
+
+// ── PART E: CLASS 4 -- unchecked length -> over-read / truncation-as-success
+// THE REAL BUG (now fixed). Every truncated/malformed DER header below must
+// be REJECTED (-1), never silently decoded from an out-of-range read.
+fn e_class4_truncated_headers_rejected() -> int
+    // E1: completely empty buffer -- no tag, no length byte at all.
+    cki("E1 empty buffer rejected", asn_length(_aa_make_bytes([])), 0 - 1)
+
+    // E2: 1-byte buffer -- tag only, length byte entirely absent.
+    // PRE-FIX: bytes_get(b,1) clamped OOB to 0 -> silently decoded as
+    // "valid, length 0" (indistinguishable from a real empty TLV).
+    cki("E2 tag-only buffer (no length byte) rejected", asn_length(_aa_make_bytes([0x04])), 0 - 1)
+
+    // E3: [tag, 0x82] -- long-form-2 claimed, ZERO of the 2 length bytes
+    // present. PRE-FIX: hi=0, lo=0 (both OOB-clamped) -> silently 0.
+    cki("E3 0x82 form with 0 of 2 length bytes rejected", asn_length(_aa_make_bytes([0x04, 0x82])), 0 - 1)
+
+    // E4: [tag, 0x82, 0xFF] -- long-form-2 claimed, only 1 of 2 length
+    // bytes present. PRE-FIX: hi=255, lo=0 (OOB-clamped) -> FABRICATED a
+    // length of 65280 that was never actually on the wire.
+    cki("E4 0x82 form with 1 of 2 length bytes rejected (no fabricated length)", asn_length(_aa_make_bytes([0x04, 0x82, 0xFF])), 0 - 1)
+
+    // E5: [tag, 0x81] -- long-form-1 claimed, the 1 required length byte
+    // absent. PRE-FIX: bytes_get(b,2) OOB-clamped to 0 -> silently 0.
+    cki("E5 0x81 form with missing length byte rejected", asn_length(_aa_make_bytes([0x04, 0x81])), 0 - 1)
+
+    // E6: [tag, 0x80] -- BER indefinite-length marker, invalid in DER.
+    // PRE-FIX: first=128 fell through to `result = first` -> silently
+    // treated the CONTROL byte itself as a literal length of 128.
+    cki("E6 BER indefinite-length marker (0x80) rejected", asn_length(_aa_make_bytes([0x04, 0x80])), 0 - 1)
+
+    // E7: complete, well-formed headers at the truncation boundary must
+    // still decode correctly (the fix must not reject valid input).
+    cki("E7 0x81 form, byte present, decodes correctly", asn_length(_aa_make_bytes([0x04, 0x81, 0x80])), 128)
+    cki("E7 0x82 form, both bytes present, decodes correctly", asn_length(_aa_make_bytes([0x04, 0x82, 0x01, 0x00])), 256)
+
+    // E8: asn_tag on an empty buffer must stay memory-safe (single
+    // fixed-offset read, already backstopped by the runtime's own
+    // bounds-checked bytes_get -- verified here as a robustness check, not
+    // a regression this KAT is fixing).
+    cki("E8 asn_tag on empty buffer stays safe (no crash)", asn_tag(_aa_make_bytes([])), 0)
+    0
+
+// ── Entry point ─────────────────────────────────────────────────────────
+fn main() -> int
+    a_valid_roundtrip()
+    b_class1_not_applicable_and_max_length_sound()
+    c_class2_not_applicable_sentinel_unambiguous()
+    d_class3_not_applicable_caller_can_detect_trailing()
+    e_class4_truncated_headers_rejected()
+    print("ASN1-AUDIT KAT PASS")
+    0

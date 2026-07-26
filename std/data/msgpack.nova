@@ -10,8 +10,46 @@
 //
 // PUBLIC API
 //   mp_encode(v)             -> bytes   encode any NOVA value to MsgPack bytes
-//   mp_decode(b)             -> any     decode a MsgPack bytes value
-//   mp_decode_at(b, pos)     -> list    [decoded_value, next_pos] (for streaming)
+//   mp_decode(b)             -> Result  Ok(value) iff b holds EXACTLY one
+//                                        well-formed MessagePack value (any
+//                                        legitimate decoded value, including
+//                                        one that happens to be null/0/"");
+//                                        Err(message) for empty/truncated/
+//                                        malformed/unrecognized-format-byte
+//                                        input, or trailing bytes after the
+//                                        value — see SOUNDNESS AUDIT below.
+//   mp_decode_at(b, pos)     -> list    [decoded_value, next_pos] (for
+//                                        streaming multiple concatenated
+//                                        values). On malformed/truncated
+//                                        input at pos, returns [null, pos]
+//                                        (next_pos == pos, i.e. NO progress)
+//                                        — collision-free because every
+//                                        successful decode strictly advances
+//                                        next_pos > pos. Callers MUST check
+//                                        for next_pos == pos before trusting
+//                                        the decoded value.
+//
+// SOUNDNESS AUDIT (decoder hardening — see mp_decode_at/mp_decode below).
+// Before this revision, mp_decode_at performed ZERO bounds checking: every
+// length-prefixed read (fixstr, str8, uint8/16/32/64) trusted the declared
+// length against the buffer with no validation, and an unrecognized/
+// unsupported format byte (e.g. bin/ext/float32/float64/int8-16-32-64
+// signed/str16/str32/array16/array32/map16/map32/reserved 0xc1 — all
+// UNIMPLEMENTED by this module) silently decoded as nil (0xc0) and advanced
+// only 1 byte. Because the runtime's bytes_get clamps out-of-range reads to
+// 0 rather than trapping, a truncated or hostile buffer never crashed — it
+// silently produced a WRONG, zero-padded/misaligned value that mp_decode
+// returned as if it were a valid decode, and a malformed/unknown-format
+// buffer was INDISTINGUISHABLE from a legitimately encoded nil (a
+// class-2/class-4 collision: decode-error vs. legitimate-null and
+// truncation-as-success). mp_decode_at now bounds-checks every
+// length-prefixed read using the overflow-safe form `len > n - pos` (never
+// `pos + len > n`, which can wrap negative for an attacker-controlled len
+// near 2^63-1 and silently bypass the check), rejects any unrecognized
+// format byte, and propagates rejection through recursive fixarray/fixmap
+// elements. mp_decode additionally verifies the ENTIRE buffer was consumed
+// (rejects trailing content) and returns NOVA's native Result so a decode
+// failure can never be confused with a legitimately decoded value.
 //
 // SUPPORTED TYPES (encode + decode)
 //   null       -> 0xc0  (nil)
@@ -29,15 +67,18 @@
 //   dict  len<16  -> fixmap  (0x80|len, then alternating key bytes + value bytes)
 //     (dict keys are serialised as strings; keys() order is used)
 //
-// KNOWN-ANSWER TESTS (see _msgpack_test.nova):
+// KNOWN-ANSWER TESTS (see _msgpack_test.nova, _kat_msgpack_audit.nova):
 //   mp_encode(1)    -> first byte == 1   (positive fixint)
 //   mp_encode(127)  -> first byte == 127 (positive fixint, upper edge)
 //   mp_encode(-1)   -> first byte == 255 (0xff = 0xe0 | 0x1f negative fixint)
 //   mp_encode("a")  -> [161, 97]         (fixstr len=1, then 'a'=97)
 //   mp_encode([1,2,3]) -> [147, 1, 2, 3] (fixarray len=3, elements)
-//   mp_decode(mp_encode("hello")) == "hello"
-//   mp_decode(mp_encode([1,2,3])) == [1,2,3]
-//   let d={}; d["x"]=1; mp_decode(mp_encode(d))["x"] == 1
+//   match mp_decode(mp_encode("hello")): Ok(v) => v == "hello"
+//   match mp_decode(mp_encode([1,2,3])): Ok(v) => v == [1,2,3]
+//   let d={}; d["x"]=1
+//   match mp_decode(mp_encode(d)): Ok(v) => v["x"] == 1
+//   mp_decode(bytes(0)) is Err (empty buffer, was silently 0 pre-fix)
+//   mp_decode(mp_encode(1) + <extra byte>) is Err (trailing content)
 //
 // IMPLEMENTATION NOTES
 //   • All private helpers prefixed _mp_ to avoid link collisions.
@@ -236,94 +277,169 @@ fn _mp_read_str(b, pos, slen)
 // Decode one MsgPack value from bytes b starting at byte offset pos.
 // Returns a list: [decoded_value, next_pos].
 // This is the streaming/recursive primitive; mp_decode wraps it.
+//
+// Hardened (see SOUNDNESS AUDIT in the module header): every length-prefixed
+// read is bounds-checked against the buffer's actual remaining length BEFORE
+// it is performed, using the overflow-safe form `len > n - pos` for
+// variable (attacker-controlled) lengths and a constant addend (`pos + K >
+// n`) for fixed-size payloads — never the unsafe `pos + len > n`, which can
+// wrap negative and silently bypass the check. On ANY bounds violation, or
+// an unrecognized/unsupported format byte, this function REJECTS by
+// returning next_pos == pos (no progress) instead of a value — this is
+// collision-free (every successful decode strictly advances next_pos > pos)
+// and matches the same "stall means reject" idiom std/data/asn1_bool.nova
+// and std/data/asn1_length.nova already use for this exact
+// [value, next_pos] shape. The recursive fixarray/fixmap branches check
+// every child's next_pos for a stall and immediately propagate the
+// rejection to their own caller (rather than continuing to decode sibling
+// elements past malformed data, or returning a partially-built container).
 fn mp_decode_at(b, pos) -> any
-    let byte0 = bytes_get(b, pos)
+    let n = bytes_len(b)
     let result = null
-    let next = pos + 1
-    // Positive fixint: 0x00..0x7f
-    if byte0 >= 0 and byte0 <= 127
-        result = byte0
+    let next = pos
+    let bad = 0
+    if pos < 0 or pos >= n
+        // No byte available at pos: empty or truncated input.
+        bad = 1
     else
-        // Negative fixint: 0xe0..0xff
-        if byte0 >= 224
-            // Decode as signed: 0xe0..0xff -> -32..-1
-            result = byte0 - 256
+        let byte0 = bytes_get(b, pos)
+        next = pos + 1
+        // Positive fixint: 0x00..0x7f
+        if byte0 >= 0 and byte0 <= 127
+            result = byte0
         else
-            // fixstr: 0xa0..0xbf
-            if byte0 >= 160 and byte0 <= 191
-                let slen = byte0 - 160
-                result = _mp_read_str(b, pos + 1, slen)
-                next = pos + 1 + slen
+            // Negative fixint: 0xe0..0xff
+            if byte0 >= 224
+                // Decode as signed: 0xe0..0xff -> -32..-1
+                result = byte0 - 256
             else
-                // fixarray: 0x90..0x9f
-                if byte0 >= 144 and byte0 <= 159
-                    let alen = byte0 - 144
-                    let lst = []
-                    let cur = pos + 1
-                    let ai = 0
-                    while ai < alen
-                        let sub = mp_decode_at(b, cur)
-                        lst.push(sub[0])
-                        cur = sub[1]
-                        ai = ai + 1
-                    result = lst
-                    next = cur
-                else
-                    // fixmap: 0x80..0x8f
-                    if byte0 >= 128 and byte0 <= 143
-                        let mlen = byte0 - 128
-                        let d = {}
-                        let cur = pos + 1
-                        let mi = 0
-                        while mi < mlen
-                            let ksub = mp_decode_at(b, cur)
-                            let kval = ksub[0]
-                            let vcur = ksub[1]
-                            let vsub = mp_decode_at(b, vcur)
-                            let vval = vsub[0]
-                            cur = vsub[1]
-                            d[kval] = vval
-                            mi = mi + 1
-                        result = d
-                        next = cur
+                // fixstr: 0xa0..0xbf
+                if byte0 >= 160 and byte0 <= 191
+                    let slen = byte0 - 160
+                    if slen > n - next
+                        bad = 1
                     else
-                        // nil: 0xc0
-                        if byte0 == 192
-                            result = null
-                        else
-                            // false: 0xc2
-                            if byte0 == 194
-                                result = 0
+                        result = _mp_read_str(b, next, slen)
+                        next = next + slen
+                else
+                    // fixarray: 0x90..0x9f
+                    if byte0 >= 144 and byte0 <= 159
+                        let alen = byte0 - 144
+                        let lst = []
+                        let cur = next
+                        let ai = 0
+                        while ai < alen and bad == 0
+                            let sub = mp_decode_at(b, cur)
+                            let subnext = sub[1]
+                            if subnext == cur
+                                // element decode made no progress -> reject
+                                bad = 1
                             else
-                                // true: 0xc3
-                                if byte0 == 195
-                                    result = 1
+                                lst.push(sub[0])
+                                cur = subnext
+                            ai = ai + 1
+                        if bad == 0
+                            result = lst
+                            next = cur
+                    else
+                        // fixmap: 0x80..0x8f
+                        if byte0 >= 128 and byte0 <= 143
+                            let mlen = byte0 - 128
+                            let d = {}
+                            let cur = next
+                            let mi = 0
+                            while mi < mlen and bad == 0
+                                let ksub = mp_decode_at(b, cur)
+                                let kcur = ksub[1]
+                                if kcur == cur
+                                    bad = 1
                                 else
-                                    // uint8: 0xcc
-                                    if byte0 == 204
-                                        result = bytes_get(b, pos + 1)
-                                        next = pos + 2
+                                    let kval = ksub[0]
+                                    let vsub = mp_decode_at(b, kcur)
+                                    let vcur = vsub[1]
+                                    if vcur == kcur
+                                        bad = 1
                                     else
-                                        // uint16: 0xcd
-                                        if byte0 == 205
-                                            result = _mp_read_u16(b, pos + 1)
-                                            next = pos + 3
-                                        else
-                                            // uint32: 0xce
-                                            if byte0 == 206
-                                                result = _mp_read_u32(b, pos + 1)
-                                                next = pos + 5
+                                        let vval = vsub[0]
+                                        d[kval] = vval
+                                        cur = vcur
+                                mi = mi + 1
+                            if bad == 0
+                                result = d
+                                next = cur
+                        else
+                            // nil: 0xc0
+                            if byte0 == 192
+                                result = null
+                            else
+                                // false: 0xc2
+                                if byte0 == 194
+                                    result = 0
+                                else
+                                    // true: 0xc3
+                                    if byte0 == 195
+                                        result = 1
+                                    else
+                                        // uint8: 0xcc (constant addend pos+2 is overflow-safe)
+                                        if byte0 == 204
+                                            if pos + 2 > n
+                                                bad = 1
                                             else
-                                                // uint64: 0xcf
-                                                if byte0 == 207
-                                                    result = _mp_read_u64(b, pos + 1)
-                                                    next = pos + 9
+                                                result = bytes_get(b, next)
+                                                next = next + 1
+                                        else
+                                            // uint16: 0xcd (constant addend pos+3 is overflow-safe)
+                                            if byte0 == 205
+                                                if pos + 3 > n
+                                                    bad = 1
                                                 else
-                                                    // str8: 0xd9
-                                                    if byte0 == 217
-                                                        let slen = bytes_get(b, pos + 1)
-                                                        result = _mp_read_str(b, pos + 2, slen)
-                                                        next = pos + 2 + slen
+                                                    result = _mp_read_u16(b, next)
+                                                    next = next + 2
+                                            else
+                                                // uint32: 0xce (constant addend pos+5 is overflow-safe)
+                                                if byte0 == 206
+                                                    if pos + 5 > n
+                                                        bad = 1
+                                                    else
+                                                        result = _mp_read_u32(b, next)
+                                                        next = next + 4
+                                                else
+                                                    // uint64: 0xcf (constant addend pos+9 is overflow-safe)
+                                                    if byte0 == 207
+                                                        if pos + 9 > n
+                                                            bad = 1
+                                                        else
+                                                            result = _mp_read_u64(b, next)
+                                                            next = next + 8
+                                                    else
+                                                        // str8: 0xd9
+                                                        if byte0 == 217
+                                                            // length byte itself: constant addend, overflow-safe
+                                                            if pos + 2 > n
+                                                                bad = 1
+                                                            else
+                                                                let slen2 = bytes_get(b, next)
+                                                                let sp = next + 1
+                                                                if slen2 > n - sp
+                                                                    bad = 1
+                                                                else
+                                                                    result = _mp_read_str(b, sp, slen2)
+                                                                    next = sp + slen2
+                                                        else
+                                                            // Unrecognized/unsupported format byte: bin8/16/32,
+                                                            // ext8/16/32, float32/64, int8/16/32/64 (signed),
+                                                            // fixext1/2/4/8/16, str16/32, array16/32, map16/32,
+                                                            // and reserved 0xc1 are all UNIMPLEMENTED by this
+                                                            // module's supported subset (see header). REJECT --
+                                                            // never silently decode as null-and-advance-by-1,
+                                                            // which would be indistinguishable from a
+                                                            // legitimately encoded nil (0xc0) and would also
+                                                            // desynchronize every sibling/enclosing decode in
+                                                            // the same buffer.
+                                                            bad = 1
+    if bad == 1
+        result = null
+        next = pos
     let ret = []
     ret.push(result)
     ret.push(next)
@@ -331,7 +447,25 @@ fn mp_decode_at(b, pos) -> any
 
 // ── mp_decode ────────────────────────────────────────────────────────────────
 // Decode a complete MsgPack-encoded bytes value.
-// Returns the decoded NOVA value.
-fn mp_decode(b) -> any
+// Returns Result<any,string>: Ok(value) when b holds EXACTLY one
+// well-formed MessagePack value (any legitimate decoded value, including
+// one that happens to be null/0/"" — see SOUNDNESS AUDIT in the module
+// header), Err(message) for an empty buffer, malformed/truncated/
+// unrecognized-format-byte input, or trailing bytes after the decoded
+// value (b is documented as holding exactly one message; use
+// mp_decode_at directly to stream multiple concatenated values from one
+// buffer — that is its documented purpose and it is unaffected by this
+// trailing-content check).
+fn mp_decode(b) -> Result
+    let n = bytes_len(b)
+    if n == 0
+        return err("mp_decode: empty buffer")
     let pair = mp_decode_at(b, 0)
-    pair[0]
+    let next = pair[1]
+    if next == 0
+        return err("mp_decode: malformed, truncated, or unrecognized MessagePack data")
+    else
+        if next != n
+            return err("mp_decode: trailing content after value (consumed " + str(next) + " of " + str(n) + " bytes)")
+        else
+            return ok(pair[0])

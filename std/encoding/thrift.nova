@@ -420,17 +420,45 @@ fn _th_dec_len_bytes(b: any, pos: int) -> any
 // starting at `pos`. Stagnation-guarded: if a decode step fails to advance
 // the cursor (only possible via an unrecognized nested ttype — see
 // _th_decode_value's fallback), the loop stops instead of spinning forever.
+// Minimum wire bytes a single element of `ttype` can occupy. Used to bound an
+// attacker-declared container COUNT against the bytes actually present: a list
+// declaring N i64 needs >= 8*N bytes, so N <= avail/8 — clamping N to `avail`
+// (as if every element were 1 byte) let a declared count fabricate wide elements
+// out of a too-short buffer (the class-4 over-read this fix closes).
+fn _th_min_elem_width(ttype: int) -> int
+    if ttype == tt_bool() or ttype == tt_byte()
+        return 1
+    if ttype == tt_i16()
+        return 2
+    if ttype == tt_i32()
+        return 4
+    if ttype == tt_i64() or ttype == tt_double()
+        return 8
+    if ttype == tt_string()
+        return 4
+    if ttype == tt_struct()
+        return 1
+    if ttype == tt_list() or ttype == tt_set()
+        return 5
+    if ttype == tt_map()
+        return 6
+    return 1
+
 fn _th_dec_container_items(etype: int, count: int, b: any, pos: int) -> any
     let items = []
     let cur = pos
+    let n = bytes_len(b)
     let i = 0
     while i < count
         let before = cur
         let r = _th_decode_value(etype, b, cur)
-        push(items, r[0])
-        cur = r[1]
-        if cur <= before
+        let ncur = r[1]
+        // reject a fabricated element: an over-run (past buffer end) or a
+        // non-advancing decode ends the container instead of inventing content.
+        if ncur > n or ncur <= before
             break
+        push(items, r[0])
+        cur = ncur
         i = i + 1
     let result = [items, cur]
     result
@@ -471,8 +499,11 @@ fn _th_decode_value(ttype: int, b: any, pos: int) -> any
         let n = declared
         if n < 0
             n = 0
-        if n > avail
-            n = avail
+        let minw = _th_min_elem_width(etype)
+        if minw < 1
+            minw = 1
+        if n > avail / minw
+            n = avail / minw
         let r = _th_dec_container_items(etype, n, b, cur)
         let d = {}
         d["etype"] = etype
@@ -489,17 +520,25 @@ fn _th_decode_value(ttype: int, b: any, pos: int) -> any
         let n = declared
         if n < 0
             n = 0
-        if n > avail
-            n = avail
+        let pairw = _th_min_elem_width(ktype) + _th_min_elem_width(vtype)
+        if pairw < 1
+            pairw = 1
+        if n > avail / pairw
+            n = avail / pairw
         let pairs = []
         let i = 0
         while i < n
             let before = cur
             let kr = _th_decode_value(ktype, b, cur)
-            cur = kr[1]
-            let vr = _th_decode_value(vtype, b, cur)
-            cur = vr[1]
+            let kc = kr[1]
+            if kc > blen
+                break
+            let vr = _th_decode_value(vtype, b, kc)
+            let vc = vr[1]
+            if vc > blen
+                break
             push(pairs, [kr[0], vr[0]])
+            cur = vc
             if cur <= before
                 break
             i = i + 1

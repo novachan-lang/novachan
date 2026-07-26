@@ -1,0 +1,241 @@
+// SOUNDNESS AUDIT KAT for std/net/radius.nova — hunts the 4 recurring binary
+// wire-decoder vulnerability classes and proves the fix for the real finding.
+//
+// CLASS 1 (i64-overflow bounds bypass, `pos+len` wraps negative on a huge
+//   attacker length): RADIUS has no field wide enough to trigger this — the
+//   packet Length is a 2-byte field (max 0xFFFF=65535) and the attribute
+//   Length is a 1-byte field (max 0xFF=255), both extracted with `& 0xFF`
+//   masks, so no code path can ever see anything near 2^63. Proven below by
+//   feeding the maximum representable value of EACH field and confirming
+//   the existing bound (`length > 4096`, and the attribute-overrun check)
+//   rejects it — there is no wider field to smuggle a wrapping value through.
+//
+// CLASS 2 (sentinel/absent-value collision): radius_decode/_header use `{}`
+//   with a `contains(hdr,"code")` guard (never bare equality against the
+//   sentinel) so header decode is collision-free. radius_attr_encode /
+//   radius_attr_nas_ip_address / radius_user_password_encrypt /
+//   radius_user_password_decrypt_raw all use bytes(0) as a reject sentinel
+//   that is PROVEN collision-free below (every legitimate success output of
+//   each is non-empty). The one genuine ambiguity found: the convenience
+//   wrapper radius_user_password_decrypt CANNOT distinguish "malformed
+//   input rejected" from "input decrypted to a real empty password" (both
+//   collapse to bytes(0) after zero-stripping) — this is now called out
+//   explicitly in the module doc; decrypt_raw is the collision-free
+//   alternative for callers that need to tell the two apart, and its
+//   collision-freedom is proven below.
+//
+// CLASS 3 (trailing-content acceptance) + CLASS 4 (unchecked length ->
+//   truncation-as-success): THE REAL BUG. radius_decode used to (a) accept
+//   a packet whose physical buffer was SHORTER than its declared header
+//   Length (a truncated receive — RFC 2865 §3 says this must be treated as
+//   corrupt and discarded), and (b) accept a packet whose attribute region
+//   contained a malformed/short TLV, SILENTLY DROPPING that attribute and
+//   everything after it while still returning a "successful" decode dict.
+//   FIXED: radius_decode now (a) rejects outright when buflen < declared
+//   Length, and (b) reconstructs how many bytes the attribute walk actually
+//   consumed and rejects the WHOLE packet unless that exactly equals the
+//   declared Length. Proven below against all three trigger shapes.
+
+import std/net/radius
+import std/encoding/hex
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn main()
+    let auth16 = bytes_create(16)
+    let ai = 0
+    while ai < 16
+        bytes_set(auth16, ai, ai + 1)
+        ai = ai + 1
+
+    // ── (1) VALID round-trip: byte-exact, unchanged by the fix ─────────────
+    let un = radius_attr_user_name("bob")
+    let nasip = radius_attr_nas_ip_address_str("10.0.0.1")
+    let attrs = bytes_concat(un, nasip)
+    let pkt = radius_encode({"code": 1, "identifier": 42, "authenticator": auth16, "attrs": attrs})
+    check("valid_pkt_len_31", bytes_len(pkt) == 31)
+    let dec = radius_decode(pkt)
+    check("valid_pkt_accepted", contains(dec, "code"))
+    check("valid_pkt_code", dec["code"] == 1)
+    check("valid_pkt_identifier", dec["identifier"] == 42)
+    check("valid_pkt_length", dec["length"] == 31)
+    check("valid_pkt_auth_exact", hex_encode(dec["authenticator"]) == hex_encode(auth16))
+    let dattrs = dec["attrs"]
+    check("valid_pkt_attr_count_2", len(dattrs) == 2)
+    check("valid_pkt_attr0_value", bytes_to_str(dattrs[0]["value"]) == "bob")
+    check("valid_pkt_attr1_value", hex_encode(dattrs[1]["value"]) == "0a000001")
+    // header-only packet (no attrs) still round-trips
+    let minpkt = radius_encode({"code": 2, "identifier": 9, "authenticator": auth16})
+    let mindec = radius_decode(minpkt)
+    check("valid_header_only_accepted", contains(mindec, "code"))
+    check("valid_header_only_zero_attrs", len(mindec["attrs"]) == 0)
+
+    // ── (2) CLASS 1 — maximum representable value of EACH length field ─────
+    // Packet Length field maxed to 0xFFFF (65535) — the largest value a
+    // 2-byte field can carry; the format has nothing wider. Must reject
+    // (> 4096) exactly like any other out-of-range Length.
+    let maxlen_hdr = bytes_create(20)
+    bytes_set(maxlen_hdr, 0, 1)
+    bytes_set(maxlen_hdr, 1, 1)
+    bytes_set(maxlen_hdr, 2, 0xFF)
+    bytes_set(maxlen_hdr, 3, 0xFF)
+    check("class1_max_u16_length_rejected", not contains(radius_decode_header(maxlen_hdr), "code"))
+    check("class1_max_u16_length_decode_rejected", not contains(radius_decode(maxlen_hdr), "code"))
+    // Attribute Length byte maxed to 0xFF (255) — the largest value the
+    // 1-byte attribute Length field can carry — inside a packet whose
+    // declared Length only allows 4 bytes of attribute room. off+alen
+    // (20+255=275) must be compared soundly against hard_end (24), and it
+    // is (both are small ints; no field here can ever approach 2^63 to
+    // wrap `off+alen` negative — proven by construction, not just this case).
+    let maxattr = bytes_create(24)
+    bytes_set(maxattr, 0, 1)
+    bytes_set(maxattr, 1, 1)
+    bytes_set(maxattr, 2, 0x00)
+    bytes_set(maxattr, 3, 24)
+    bytes_set(maxattr, 20, 5)
+    bytes_set(maxattr, 21, 0xFF)     // Length=255, claims value reaching offset 275
+    let maxattr_walk = radius_attr_decode_all(maxattr, 20, 24)
+    check("class1_max_u8_attrlen_rejected_no_overread", len(maxattr_walk) == 0)
+    check("class1_max_u8_attrlen_decode_rejected", not contains(radius_decode(maxattr), "code"))
+
+    // ── (3) CLASS 2 — sentinel collision-freedom proofs ─────────────────────
+    // header decode: {} only ever seen via `contains`, success always has
+    // "code" present — proven by round-trip above plus explicit reject case.
+    check("class2_header_sentinel_distinct", not contains(radius_decode_header(bytes_create(19)), "code"))
+    // decrypt_raw: bytes(0) is provably collision-free — every legitimate
+    // output is >= 16 bytes, so bytes(0) can ONLY mean "rejected".
+    let secret = "s3cr3t"
+    let raw_empty_pw = radius_user_password_decrypt_raw(radius_user_password_encrypt(bytes_create(0), auth16, secret), auth16, secret)
+    check("class2_decrypt_raw_empty_pw_is_16_zero_bytes_not_bytes0", bytes_len(raw_empty_pw) == 16)
+    check("class2_decrypt_raw_bad_input_is_bytes0", bytes_len(radius_user_password_decrypt_raw(bytes_create(10), auth16, secret)) == 0)
+    // the convenience wrapper's documented AMBIGUITY: both collapse to
+    // bytes(0) — this is expected/documented, not a silent-wrong crash.
+    let wrap_empty_pw = radius_user_password_decrypt(radius_user_password_encrypt(bytes_create(0), auth16, secret), auth16, secret)
+    check("class2_decrypt_wrapper_empty_pw_is_bytes0", bytes_len(wrap_empty_pw) == 0)
+    check("class2_decrypt_wrapper_bad_input_is_also_bytes0", bytes_len(radius_user_password_decrypt(bytes_create(10), auth16, secret)) == 0)
+
+    // ── (4) CLASS 3+4 — THE REAL BUG, now fixed ─────────────────────────────
+    // (a) truncated receive: buffer physically shorter than declared Length.
+    let trunc = bytes_create(25)
+    bytes_set(trunc, 0, 1)
+    bytes_set(trunc, 1, 5)
+    bytes_set(trunc, 2, 0x00)
+    bytes_set(trunc, 3, 40)          // declares 40, buffer is only 25 bytes
+    let ti = 0
+    while ti < 16
+        bytes_set(trunc, 4 + ti, 0x11)
+        ti = ti + 1
+    bytes_set(trunc, 20, 1)
+    bytes_set(trunc, 21, 5)
+    bytes_set(trunc, 22, 0x41)
+    bytes_set(trunc, 23, 0x42)
+    bytes_set(trunc, 24, 0x43)
+    check("class4_truncated_receive_rejected", not contains(radius_decode(trunc), "code"))
+    // one byte short is still corrupt
+    let trunc_by1 = bytes_create(39)
+    bytes_set(trunc_by1, 0, 1)
+    bytes_set(trunc_by1, 1, 5)
+    bytes_set(trunc_by1, 2, 0x00)
+    bytes_set(trunc_by1, 3, 40)
+    check("class4_truncated_by_one_byte_rejected", not contains(radius_decode(trunc_by1), "code"))
+    // exact declared length is fine (sanity: not an off-by-one over-reject)
+    let exact40 = bytes_create(40)
+    bytes_set(exact40, 0, 1)
+    bytes_set(exact40, 1, 5)
+    bytes_set(exact40, 2, 0x00)
+    bytes_set(exact40, 3, 40)
+    let ei = 0
+    while ei < 16
+        bytes_set(exact40, 4 + ei, 0x22)
+        ei = ei + 1
+    // attrs region [20,40) = 20 bytes: one TLV type=9 length=20 filling exactly
+    bytes_set(exact40, 20, 9)
+    bytes_set(exact40, 21, 20)
+    let vi = 22
+    while vi < 40
+        bytes_set(exact40, vi, 0x5A)
+        vi = vi + 1
+    let exact40_dec = radius_decode(exact40)
+    check("class4_exact_declared_length_accepted", contains(exact40_dec, "code"))
+    if contains(exact40_dec, "code")
+        check("class4_exact_declared_length_attr_count_1", len(exact40_dec["attrs"]) == 1)
+
+    // (b) buflen == declared (no truncation) but a TLV inside the declared
+    // region overruns it — trailing-content acceptance: must reject the
+    // WHOLE packet, not silently drop the bad attribute and report success.
+    let overrun = bytes_create(24)
+    bytes_set(overrun, 0, 1)
+    bytes_set(overrun, 1, 5)
+    bytes_set(overrun, 2, 0x00)
+    bytes_set(overrun, 3, 24)
+    let oi = 0
+    while oi < 16
+        bytes_set(overrun, 4 + oi, 0x33)
+        oi = oi + 1
+    bytes_set(overrun, 20, 1)
+    bytes_set(overrun, 21, 5)     // claims value reaching offset 25; region ends at 24
+    bytes_set(overrun, 22, 0x41)
+    bytes_set(overrun, 23, 0x42)
+    check("class3_attr_overrun_within_region_rejects_whole_packet", not contains(radius_decode(overrun), "code"))
+
+    // (c) buflen > declared (attacker-appended second frame after a VALID
+    // packet) must still be accepted — the appended bytes are legitimately
+    // outside the declared region and must never be inspected.
+    let valid25 = bytes_create(25)
+    bytes_set(valid25, 0, 1)
+    bytes_set(valid25, 1, 5)
+    bytes_set(valid25, 2, 0x00)
+    bytes_set(valid25, 3, 25)
+    let vj = 0
+    while vj < 16
+        bytes_set(valid25, 4 + vj, 0x44)
+        vj = vj + 1
+    bytes_set(valid25, 20, 1)
+    bytes_set(valid25, 21, 5)     // exactly fills [20,25)
+    bytes_set(valid25, 22, 0x41)
+    bytes_set(valid25, 23, 0x42)
+    bytes_set(valid25, 24, 0x43)
+    let with_second_frame = bytes_concat(valid25, bytes_create(15))   // 15 bytes of trailing garbage
+    let sf_dec = radius_decode(with_second_frame)
+    check("class3_valid_pkt_with_trailing_appended_frame_still_accepted", contains(sf_dec, "code"))
+    if contains(sf_dec, "code")
+        check("class3_trailing_frame_ignored_not_parsed", len(sf_dec["attrs"]) == 1)
+
+    // (d) malformed attribute Length (< 2) inside the declared region: must
+    // reject the whole packet (previously silently truncated the attr list).
+    let badlen = bytes_create(22)
+    bytes_set(badlen, 0, 1)
+    bytes_set(badlen, 1, 1)
+    bytes_set(badlen, 2, 0x00)
+    bytes_set(badlen, 3, 22)
+    bytes_set(badlen, 20, 5)
+    bytes_set(badlen, 21, 1)      // Length=1 < 2, structurally invalid
+    check("class3_attr_lenlt2_rejects_whole_packet", not contains(radius_decode(badlen), "code"))
+    // radius_attr_decode_all itself (lower-level, still best-effort partial
+    // walk by contract) is unchanged: it still just stops, no crash.
+    check("attr_decode_all_lenlt2_stops_no_crash", len(radius_attr_decode_all(badlen, 20, 22)) == 0)
+
+    // (e) a single dangling trailing byte within the declared region (not
+    // even enough for a TLV header) must also reject the whole packet.
+    let dangle = bytes_create(21)
+    bytes_set(dangle, 0, 1)
+    bytes_set(dangle, 1, 1)
+    bytes_set(dangle, 2, 0x00)
+    bytes_set(dangle, 3, 21)
+    bytes_set(dangle, 20, 0xFF)    // 1 stray byte, not a full 2-byte TLV header
+    check("class3_dangling_byte_rejects_whole_packet", not contains(radius_decode(dangle), "code"))
+
+    // ── still alive after every malformed/adversarial input above ─────────
+    check("still_alive_after_all_attacks", true)
+
+    if FAILS[0] == 0
+        print("RADIUS-AUDIT KAT PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))
