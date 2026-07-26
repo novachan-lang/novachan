@@ -162,7 +162,7 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 | # | Task | Area | Effort | Notes |
 |---|---|---|---|---|
 | 47 | WASM productization (harden the wasm value-model target; FFI callbacks) — prereq for F1 | [cc/rt] | L | Wave-C-adjacent |
-| 48 | F5 image codecs + 2D canvas — 🔄 **PNG decode DONE 2026-07-26 `1ae4bec7`** (`png_decode`→Result, color types 0/2/6, all 5 filters incl. exact Paeth; adversary-verify caught+fixed a CVE-class int-overflow DoS; also fixed a deflatex builtin-shadow footgun). REMAINING: JPEG decode + 2D canvas draw | [fg] | L | unblocks charts/avatars |
+| 48 | F5 image codecs + 2D canvas — ✅ **DONE 2026-07-26** — PNG decode `1ae4bec7` (Result, types 0/2/6, exact Paeth; adversary caught+fixed a CVE-class int-overflow DoS + a deflatex builtin-shadow footgun); 2D canvas `7e1adc15` (line/rect/circle/fill/blit/to_png, Cohen-Sutherland clip, overflow-guarded); baseline JPEG decode `36b5e287` (gray+YCbCr, 4:4:4/4:2:0/4:2:2, restart, float IDCT; adversary caught+fixed silent-wrong-on-truncation). All independently adversary-verified, both-mode gated. | [fg] | L | unblocks charts/avatars |
 | 49 | F1 browser DOM/reactive UI — Prism-web (hybrid LiveView/WASM, same `view_fn` both sides) | [fg] | XL | THE adoption magnet; after #47 |
 | 50 | F2 native GUI — Prism-desktop (window + widgets via FFI callbacks + wgpu) | [fg] | XL | after FFI maturity + L7 |
 
