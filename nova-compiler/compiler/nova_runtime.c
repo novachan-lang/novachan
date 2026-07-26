@@ -12634,6 +12634,26 @@ int64_t nova_rt_set_from_list(int64_t list_handle) {
 }
 
 static int64_t nova_sort_by_closure;
+static int nova_sort_by_kind_g;   /* 0=int 1=float 2=string; set before the OOM qsort fallback */
+/* Compare two precomputed sort_by KEYS by kind, mirroring nova_rt_list_sort's element
+   comparators: 2=string (lexicographic by content -- was pointer-address = silent-wrong),
+   1=float (numeric via nova_elem_to_double -- was raw-bits/boxed-pointer order = garbage),
+   0=exact int64 (unchanged; preserves precise order for ints >= 2^53 doubles can't hold). */
+static int nova_sortby_key_cmp(int64_t ka, int64_t kb, int kind) {
+    if (kind == 2) {
+        const char* sa = (const char*)(uintptr_t)ka;
+        const char* sb = (const char*)(uintptr_t)kb;
+        if (!sa) return sb ? -1 : 0;
+        if (!sb) return 1;
+        return strcmp(sa, sb);
+    }
+    if (kind == 1) {
+        double da = nova_elem_to_double(ka);
+        double db = nova_elem_to_double(kb);
+        return (da > db) - (da < db);
+    }
+    return (ka > kb) - (ka < kb);
+}
 static int nova_sort_by_cmp(const void* a, const void* b) {
     int64_t va = *(const int64_t*)a;
     int64_t vb = *(const int64_t*)b;
@@ -12641,9 +12661,7 @@ static int nova_sort_by_cmp(const void* a, const void* b) {
     nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
     int64_t ka = fn(nova_sort_by_closure, va);
     int64_t kb = fn(nova_sort_by_closure, vb);
-    if (ka < kb) return -1;
-    if (ka > kb) return 1;
-    return 0;
+    return nova_sortby_key_cmp(ka, kb, nova_sort_by_kind_g);
 }
 
 /* STABLE merge sort by precomputed int64 keys (parallel value/key arrays). Stability
@@ -12653,14 +12671,14 @@ static int nova_sort_by_cmp(const void* a, const void* b) {
    the LEFT run on ties (k[j] < k[i] only takes the right), preserving input order for
    equal keys -> deterministic on every platform. */
 static void nova_stable_msort_kv(int64_t* v, int64_t* k, int64_t* tv, int64_t* tk,
-                                 int64_t lo, int64_t hi) {
+                                 int64_t lo, int64_t hi, int kind) {
     if (hi - lo <= 1) return;
     int64_t mid = lo + (hi - lo) / 2;
-    nova_stable_msort_kv(v, k, tv, tk, lo, mid);
-    nova_stable_msort_kv(v, k, tv, tk, mid, hi);
+    nova_stable_msort_kv(v, k, tv, tk, lo, mid, kind);
+    nova_stable_msort_kv(v, k, tv, tk, mid, hi, kind);
     int64_t i = lo, j = mid, t = lo;
     while (i < mid && j < hi) {
-        if (k[j] < k[i]) { tv[t] = v[j]; tk[t] = k[j]; j++; }   /* right strictly smaller */
+        if (nova_sortby_key_cmp(k[j], k[i], kind) < 0) { tv[t] = v[j]; tk[t] = k[j]; j++; }   /* right strictly smaller */
         else             { tv[t] = v[i]; tk[t] = k[i]; i++; }   /* tie or left smaller -> left (STABLE) */
         t++;
     }
@@ -12693,11 +12711,24 @@ int64_t nova_rt_sort_by(int64_t handle, int64_t closure) {
     if (!keys || !tmpv || !tmpk) {           /* OOM fallback: unstable qsort still sorts */
         free(keys); free(tmpv); free(tmpk);
         nova_sort_by_closure = closure;
+        /* kind from the first element's key (the keyfn is homogeneous) so the fallback also
+           compares string/float keys correctly, not as raw i64. */
+        int64_t k0 = fn(closure, result->data[0]);
+        nova_sort_by_kind_g = nova_elem_is_str(k0) ? 2 : (nova_elem_is_float(k0) ? 1 : 0);
         qsort(result->data, (size_t)n, sizeof(int64_t), nova_sort_by_cmp);
         return new_list;
     }
     for (int64_t i = 0; i < n; i++) keys[i] = fn(closure, result->data[i]);
-    nova_stable_msort_kv(result->data, keys, tmpv, tmpk, 0, n);
+    /* Select comparison by key kind (mirror nova_rt_list_sort): any string key -> lexicographic,
+       else any float key -> numeric, else exact int64. Was: always raw-i64 = silent-wrong for
+       string (pointer order) and float (boxed-pointer/bits order) keys. */
+    int kk_float = 0, kk_all_str = 1;
+    for (int64_t i = 0; i < n; i++) {
+        if (nova_elem_is_float(keys[i])) kk_float = 1;
+        if (!nova_elem_is_str(keys[i])) kk_all_str = 0;
+    }
+    int key_kind = kk_all_str ? 2 : (kk_float ? 1 : 0);
+    nova_stable_msort_kv(result->data, keys, tmpv, tmpk, 0, n, key_kind);
     free(keys); free(tmpv); free(tmpk);
     return new_list;
 }
