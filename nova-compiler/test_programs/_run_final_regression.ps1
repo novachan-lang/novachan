@@ -85,7 +85,8 @@ $new_tests = @(
     '_kat_opt_sugar',
     '_kat_l7_sized',
     '_kat_l7_wrap',
-    '_kat_l7_loop'
+    '_kat_l7_loop',
+    '_kat_l7_var'
 )
 
 # Phase 9 + domain stdlib modules (sorted_map, regex, crc32, math3d, ecs, etc.)
