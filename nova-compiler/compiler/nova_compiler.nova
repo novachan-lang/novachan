@@ -11244,6 +11244,36 @@ fn nt_int() -> NType
 fn nt_float() -> NType
     NType("float", "", [], 0)
 
+// LOCK-4 inc3a: sized/unsigned numerics carry their WIDTH in the NType `name` field
+// (kind "int"/"float", name "u8".."i64"/"usize"/"f32"; "" = default i64/f64). Encoding
+// width in `name` (unused for int/float) avoids adding an NType struct field, which would
+// churn the hundreds of `match NType(k,n,p,i)` sites. The default (name "") stays fully
+// compatible — the compiler + all existing code use only bare ints — so this is opt-in.
+fn nt_int_w(w: string) -> NType
+    NType("int", w, [], 0)
+
+fn nt_float_w(w: string) -> NType
+    NType("float", w, [], 0)
+
+// Width name of an int/float NType, or "" (default / non-numeric).
+fn _nt_num_width(t: NType) -> string
+    match t
+        NType(k, n, p, i) =>
+            if k == "int" or k == "float"
+                return n
+    ""
+
+// A sized suffix on an int-literal Expr value ("255#u8" -> "u8"), or "" if none.
+fn _int_lit_suffix(v: string) -> string
+    let h = find(v, "#")
+    if h == 0 - 1
+        return ""
+    slice(v, h + 1, len(v))
+
+// Is `w` a known sized-int width name (used to recognize sized annotations)?
+fn _is_sized_int_name(w: string) -> bool
+    w == "u8" or w == "u16" or w == "u32" or w == "u64" or w == "i8" or w == "i16" or w == "i32" or w == "i64" or w == "usize" or w == "isize"
+
 fn nt_string() -> NType
     NType("string", "", [], 0)
 
@@ -11714,7 +11744,15 @@ fn ti_unify_d(st: TiState, a: NType, b: NType, line: int, depth: int)
             match wb
                 NType(wbk, wbn, wbp, wbi) =>
                     if wak == wbk
-                        if wak == "int" or wak == "float" or wak == "string" or wak == "bool" or wak == "unit" or wak == "nothing" or wak == "any" or wak == "range"
+                        if wak == "int" or wak == "float"
+                            // LOCK-4 inc3a: numeric WIDTH compatibility. "" (default i64/f64) is
+                            // compatible with any sized width (a bare literal adopts the sized
+                            // context); two DIFFERENT explicit widths (u8 vs i32, f32 vs f64) is a
+                            // real type error — mixing widths is a footgun (C's implicit promotion CVEs).
+                            if wan != "" and wbn != "" and wan != wbn
+                                ti_error(st, "numeric width mismatch: " + wan + " vs " + wbn + " (convert explicitly, e.g. " + wbn + "(x))", line)
+                            return
+                        if wak == "string" or wak == "bool" or wak == "unit" or wak == "nothing" or wak == "any" or wak == "range"
                             return
                         if wak == "var"
                             if wai == wbi
@@ -12718,10 +12756,19 @@ fn ti_has_name(st: TiState, vname: string) -> int
 fn ti_ann_to_type(ann: string) -> NType
     if ann == "int" or ann == "Int"
         return nt_int()
-    // FFI integer width aliases — at NOVA's runtime every int is i64; the
-    // width annotation only affects ABI marshaling at the FFI boundary.
-    if ann == "i32" or ann == "int32" or ann == "i64" or ann == "int64" or ann == "u32" or ann == "uint32" or ann == "u64" or ann == "uint64" or ann == "isize" or ann == "usize"
-        return nt_int()
+    // LOCK-4 inc3a: sized-int annotations now carry their WIDTH in the type (u8..i64/usize/isize).
+    // A default int (bare literal or plain `int`, name "") stays fully compatible — only two
+    // DIFFERENT explicit widths mismatch (u8 vs i32). Long-forms normalize to the short width name.
+    if _is_sized_int_name(ann)
+        return nt_int_w(ann)
+    if ann == "int32"
+        return nt_int_w("i32")
+    if ann == "int64"
+        return nt_int_w("i64")
+    if ann == "uint32"
+        return nt_int_w("u32")
+    if ann == "uint64"
+        return nt_int_w("u64")
     if ann == "string" or ann == "str" or ann == "String" or ann == "Str"
         return nt_string()
     if ann == "float" or ann == "Float"
@@ -12984,6 +13031,11 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
     match expr
         Expr(tag, value, num, children, fields, eline) =>
             if tag == "int"
+                // LOCK-4 inc3a: a sized-suffix literal ("255#u8") types as the sized int;
+                // a bare literal stays the default int. Codegen uses `num` (unaffected).
+                let _il_sfx = _int_lit_suffix(value)
+                if _il_sfx != "" and _is_sized_int_name(_il_sfx)
+                    return nt_int_w(_il_sfx)
                 return nt_int()
             if tag == "float"
                 return nt_float()
