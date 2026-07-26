@@ -1,0 +1,153 @@
+// KAT for std/media/png png_decode (8-bit non-interlaced PNG decoder).
+//
+// Coverage:
+//   1. RGB  (color type 2, channels 3) round-trip via png_encode_rgb.
+//   2. RGBA (color type 6, channels 4) round-trip via png_encode_rgba.
+//   3. Grey (color type 0, channels 1) round-trip via png_encode_gray.
+//   4. A HAND-CONSTRUCTED literal PNG (2x5 RGB) whose five scanlines use ALL
+//      five filters (None/Sub/Up/Average/Paeth) with by-hand-computed filtered
+//      bytes and a known-answer original — this is the real un-filter test,
+//      independent of the encoder (which only ever emits filter 0).
+//   5. Malformed inputs must return err(...) and never crash.
+//
+// Prints "PNG-DECODE KAT PASS" iff every check holds, else prints each mismatch.
+import std/media/png
+
+// Build a `bytes` value from a list of int byte values (avoids the str_to_bytes
+// builtin entirely; binary-safe for 0x00).
+fn bytes_of(lst)
+    let b = bytes(0)
+    let i = 0
+    while i < len(lst)
+        b = bytes_append(b, lst[i])
+        i = i + 1
+    return b
+
+// Exact byte-for-byte equality of two `bytes` values.
+fn bytes_eq(a, e)
+    if bytes_len(a) != bytes_len(e)
+        return 0
+    let ok = 1
+    let i = 0
+    while i < bytes_len(a)
+        if bytes_get(a, i) != bytes_get(e, i)
+            ok = 0
+        i = i + 1
+    return ok
+
+// Wrap raw bytes in a minimal RFC 1950 zlib stream using ONE final RFC 1951
+// STORED (uncompressed) deflate block. Used to build the literal-PNG test input
+// without touching the module's private encoder helpers. The 4-byte Adler-32 is
+// a placeholder — the decoder stops at the final deflate block and never reads it.
+fn kat_zlib_stored(raw)
+    let out = bytes(0)
+    out = bytes_append(out, 0x78)         // zlib CMF (CM=8, CINFO=7)
+    out = bytes_append(out, 0x01)         // zlib FLG (FCHECK ok, no dict, level 0)
+    out = bytes_append(out, 0x01)         // deflate block header: BFINAL=1, BTYPE=00
+    let n = bytes_len(raw)
+    out = bytes_append(out, n & 0xFF)     // LEN  (u16 LE)
+    out = bytes_append(out, (n >> 8) & 0xFF)
+    let nlen = (~n) & 0xFFFF
+    out = bytes_append(out, nlen & 0xFF)  // NLEN (u16 LE)
+    out = bytes_append(out, (nlen >> 8) & 0xFF)
+    out = bytes_concat(out, raw)
+    out = bytes_append(out, 0)            // Adler-32 placeholder (ignored on decode)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, 0)
+    out = bytes_append(out, 0)
+    return out
+
+// Decode `res` and compare against the expected dims/channels/pixels. Returns ""
+// on success, or a descriptive mismatch string.
+fn check_decode(label, res: Result, ew, eh, ech, epix)
+    match res
+        Ok(v) =>
+            if v["width"] != ew
+                return label + ": width " + str(v["width"]) + " != " + str(ew)
+            if v["height"] != eh
+                return label + ": height " + str(v["height"]) + " != " + str(eh)
+            if v["channels"] != ech
+                return label + ": channels " + str(v["channels"]) + " != " + str(ech)
+            if bytes_eq(v["pixels"], epix) == 0
+                return label + ": pixel bytes mismatch"
+            return ""
+        Err(e) =>
+            return label + ": expected ok, got err: " + e
+
+// True iff decoding `data` yields an Err (used by the malformed-input cases).
+fn decode_is_err(data)
+    let r = 1
+    match png_decode(data)
+        Ok(v) =>
+            r = 0
+        Err(e) =>
+            r = 1
+    return r
+
+fn main()
+    let fails = []
+
+    // ── Test 1: RGB 2x2 round-trip ────────────────────────────────────────
+    let rgb = bytes_of([10,20,30, 40,50,60, 70,80,90, 100,110,120])
+    let m1 = check_decode("rgb2x2", png_decode(png_encode_rgb(2, 2, rgb)), 2, 2, 3, rgb)
+    if m1 != ""
+        push(fails, m1)
+
+    // ── Test 2: RGBA 2x2 round-trip (channels 4 path) ─────────────────────
+    let rgba = bytes_of([1,2,3,4, 5,6,7,8, 9,10,11,12, 13,14,15,16])
+    let m2 = check_decode("rgba2x2", png_decode(png_encode_rgba(2, 2, rgba)), 2, 2, 4, rgba)
+    if m2 != ""
+        push(fails, m2)
+
+    // ── Test 3: greyscale 2x3 round-trip (channels 1 path) ────────────────
+    let gray = bytes_of([0, 64, 128, 192, 255, 32])
+    let m3 = check_decode("gray2x3", png_decode(png_encode_gray(2, 3, gray)), 2, 3, 1, gray)
+    if m3 != ""
+        push(fails, m3)
+
+    // ── Test 4: literal PNG, 2x5 RGB, ALL FIVE filters ────────────────────
+    // Known-answer original pixels (row-major RGB), hand-picked:
+    let orig = bytes_of([5,10,15,20,25,30, 35,40,45,50,55,60, 65,70,75,80,85,90, 95,100,105,110,115,120, 125,130,135,140,145,150])
+    // Filtered scanlines (filter-type byte first), computed by hand:
+    //   row0 None(0):    raw pixels
+    //   row1 Sub(1):     x = orig - left(bpp=3)
+    //   row2 Up(2):      x = orig - above
+    //   row3 Average(3): x = orig - floor((left+above)/2)
+    //   row4 Paeth(4):   x = orig - paeth(left, above, upperleft)
+    let filtered = bytes_of([0, 5,10,15,20,25,30,  1, 35,40,45,15,15,15,  2, 30,30,30,30,30,30,  3, 63,65,68,23,23,23,  4, 30,30,30,15,15,15])
+    let idat = kat_zlib_stored(filtered)
+    let full = png_signature()
+    full = bytes_concat(full, png_write_chunk("IHDR", png_ihdr(2, 5, 8, 2)))
+    full = bytes_concat(full, png_write_chunk("IDAT", idat))
+    full = bytes_concat(full, png_write_chunk("IEND", bytes(0)))
+    let m4 = check_decode("literal-5filters", png_decode(full), 2, 5, 3, orig)
+    if m4 != ""
+        push(fails, m4)
+
+    // ── Test 5: malformed inputs must return err (never crash) ────────────
+    // (a) bad signature
+    if decode_is_err(bytes_of([1,2,3,4,5,6,7,8,9])) == 0
+        push(fails, "bad-sig: expected err, got ok")
+    // (b) unsupported color type 3 (indexed)
+    let bad_ct = png_signature()
+    bad_ct = bytes_concat(bad_ct, png_write_chunk("IHDR", png_ihdr(1, 1, 8, 3)))
+    bad_ct = bytes_concat(bad_ct, png_write_chunk("IDAT", kat_zlib_stored(bytes_of([0, 0]))))
+    bad_ct = bytes_concat(bad_ct, png_write_chunk("IEND", bytes(0)))
+    if decode_is_err(bad_ct) == 0
+        push(fails, "bad-colortype: expected err, got ok")
+    // (c) unsupported bit depth 16
+    let bad_bd = png_signature()
+    bad_bd = bytes_concat(bad_bd, png_write_chunk("IHDR", png_ihdr(1, 1, 16, 2)))
+    bad_bd = bytes_concat(bad_bd, png_write_chunk("IDAT", kat_zlib_stored(bytes_of([0, 0]))))
+    bad_bd = bytes_concat(bad_bd, png_write_chunk("IEND", bytes(0)))
+    if decode_is_err(bad_bd) == 0
+        push(fails, "bad-bitdepth: expected err, got ok")
+
+    // ── Report ────────────────────────────────────────────────────────────
+    if len(fails) == 0
+        print("PNG-DECODE KAT PASS")
+    else
+        let i = 0
+        while i < len(fails)
+            print("MISMATCH: " + fails[i])
+            i = i + 1
