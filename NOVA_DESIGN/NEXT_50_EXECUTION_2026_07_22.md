@@ -47,8 +47,14 @@ over-read, Thrift truncation-as-success, plist sentinel collision + an any==int 
 | 10 | coap, stun, ntp, radius | `48779a05` |
 | compiler | L8 structural operators, float_to_bits builtin, h2_preface collision fix | `82929a1f` `97c7bfdd` `c8dcc99d` |
 
-**Pending fix-cycle:** ldap (batch-10 REJECT — decoder validates ASN.1 tags only at CHOICE points, accepts
-malformed messages); bson+ubjson (same name-only sentinel collision plist just fixed, MED).
+**Fix-cycle RESOLVED 2026-07-27** (fleet Sonnet-dev + Opus-adversary, all CONFIRMED): ~~ldap~~ — the
+batch-10 ASN.1-tag issue was ALREADY fixed `af1b6a86` (stale tracking); the fleet's adversarial pass found
++ closed a NEW residual gap (BindRequest/BindResponse didn't verify their TLV was fully consumed → trailing
+bytes silently accepted). ~~bson~~ — sentinel-collision closed with the plist magic-marker pattern (2-key
+shape + fixed 64-bit constant + type_of guard) on bson_bool/bson_long. ~~ubjson~~ — migrated `ubjson_decode`
+to native `Result<any,string>` (a sum, never a dict → no value can collide with a decode-error); the adversary
+ALSO found an i64 integer-OVERFLOW bounds-check bypass (`sp+slen>n` wraps for 2^63-1 lengths) — fixed to the
+overflow-safe `slen>n-sp`. KATs `_kat_ldap_fix`/`_kat_bson_fix`/`_kat_ubjson_fix` (incl the overflow case).
 
 **★ STATUS HONESTY (2026-07-24):** breadth (Track B) is running well ahead; the **50-task critical path below
 is compiler/runtime (Blocks A/B/E = 26/50) and remains the gating work** — per the plan's own "soundness →

@@ -27,7 +27,8 @@ import std/encoding/pack
 // value/array/object grammar.
 //
 // TYPE MARKERS (draft-12 core set; this module implements ALL of them):
-//   Z null   T true   F false   C char(1 ASCII byte, DECODE ONLY — NOVA has
+//   Z null   N no-op (padding within a container; see NO-OP MARKER below)
+//   T true   F false   C char(1 ASCII byte, DECODE ONLY — NOVA has
 //   no separate char type; a 1-char value always ENCODES as S, matching every
 //   published UBJSON encoder and this module's own byte-exact KAT)
 //   i int8   U uint8   I int16   l int32   L int64
@@ -99,7 +100,60 @@ import std/encoding/pack
 // std/encoding/plist's plist_bool()/plist_null() use (_plist_bool_magic()/
 // _plist_null_magic()). A plain dict with sole key "$ubjsonBool" (any
 // value) now always encodes as an ordinary 1-entry UBJSON object, exactly
-// like any other user dict (see ubjson_kat_sentinel_collision_safe).
+// like any other user dict (see ubjson_kat_sentinel_collision_safe). The
+// SAME 2-key + magic-value technique guards the third wrapper this module
+// adds, ubjson_noop() (see NO-OP MARKER below): _ub_noop_magic() plays the
+// identical role as _ub_bool_magic()/_ub_null_magic().
+//
+// NO-OP MARKER (`N`, 0x4E). Per the UBJSON spec, No-Op is a zero-payload
+// value used purely as PADDING inside a container — "its use is entirely up
+// to the implementer" — and this module now implements it (closing a real
+// gap: the header previously claimed "this module implements ALL of them"
+// while omitting N entirely). ubjson_noop() produces the wrapper this
+// module's encoder recognizes as an explicit bare `N` byte (magic-guarded,
+// same as ubjson_bool()/ubjson_null()). On DECODE, an `N` encountered as an
+// ARRAY element is skipped — it contributes NO element to the decoded list,
+// exactly matching the spec's "padding, not data" semantics — so
+// `ubjson_decode(ubjson_encode([ubjson_noop(), 1]))` decodes to `[1]`, not
+// `[null, 1]`. An `N` is NOT accepted in an OBJECT's key-length position
+// (the spec never defines no-op-as-a-key; a byte there that is not one of
+// the five int markers is rejected as a malformed length prefix — see
+// _ub_decode_len — rather than silently treated as a disguised
+// zero-length key, which would be exactly the "accept a hostile input by
+// guessing what it probably meant" failure mode this module refuses to
+// have). A bare top-level `N` (the entire document is just one no-op byte)
+// decodes to Ok(null) — a defensible, documented edge, not a crash.
+//
+// DECODE-ERROR VS. LEGITIMATE-VALUE SAFETY (the actual defect this revision
+// closes). Before this fix, ubjson_decode(b) returned a plain NOVA value
+// (`any`) on EVERY call, malformed input included: a truncated int8 payload
+// silently produced int 0, an empty buffer silently produced int 0, a
+// hostile negative length prefix was silently clamped to an empty string.
+// Every one of those fallback values is ALSO a completely legitimate decode
+// result for well-formed input (`ubjson_encode(0)` decodes to that exact
+// same int 0; `ubjson_encode("")` decodes to that exact same ""). A caller
+// therefore had NO WAY to distinguish "the wire bytes were garbage" from
+// "the wire bytes legitimately encoded a zero/empty value" — precisely the
+// name-only "legitimate value indistinguishable from a not-found/error
+// sentinel" collision class std/encoding/plist.nova and std/encoding/bson.nova
+// document for their own bool/null wrapper dicts (see SENTINEL-KEY COLLISION
+// SAFETY above). The fix here goes one step further than plist's own
+// plist_error()/plist_is_error(): those are recognized by dict SHAPE (sole
+// key literally "$plistError"), which — like the pre-fix ubjson_bool()/
+// ubjson_null() — is ITSELF only a name-only match with no magic-value
+// guard, so a real decoded plist dict `{"$plistError": "oops"}` would
+// misreport as an error. ubjson_decode(b) now returns NOVA's native
+// `Result<any, string>` (`ok(v)` / `err(msg)`) instead of inventing another
+// dict-shaped sentinel: Result is a compiler-native polymorphic sum (see
+// NOVA_DESIGN/NOVA_LANGUAGE_FEATURES.md), never a `dict` value at all, so
+// there is no shape or key name a legitimate decoded document could ever
+// construct that collides with it — the collision class is closed
+// STRUCTURALLY, not by picking a "sufficiently unlikely" marker. Malformed/
+// truncated/hostile input is now REJECTED via `err(msg)` — never silently
+// guessed at — while every well-formed document (including one that
+// legitimately decodes to 0, "", or null) round-trips as `ok(value)`. See
+// ubjson_decode's own comment and the DECODE section below for exactly
+// which conditions are rejected.
 //
 // BINARY SAFETY (`bytes` values). UBJSON's core spec has no dedicated binary
 // blob marker (only the OPTIONAL container-optimization extension has one,
@@ -126,31 +180,50 @@ import std/encoding/pack
 // misread as a second frame boundary. (See ubjson_key_injection_kat below.)
 //
 // ADVERSARIAL-INPUT ROBUSTNESS (malformed/truncated/hostile streams never
-// crash and never hang):
+// crash, never hang, and are now REJECTED in-band rather than guessed at —
+// see DECODE-ERROR VS. LEGITIMATE-VALUE SAFETY above for why a defensive
+// fallback VALUE is no longer an acceptable outcome for bad input):
 //   * Every runtime bytes_get/bytes_slice call is bounds-safe by construction
 //     (nova_runtime.c clamps out-of-range reads to 0 / an empty slice — see
-//     nova_rt_bytes_get / nova_rt_bytes_slice) so a truncated multi-byte
-//     field decodes as 0 rather than reading out of bounds.
+//     nova_rt_bytes_get / nova_rt_bytes_slice), and every multi-byte scalar
+//     read is ALSO explicitly bounds-checked before it is attempted (see
+//     _ub_decode_at) — a truncated payload is rejected with err(...), never
+//     silently read as a zero-padded fake value.
 //   * A corrupt/negative length prefix (e.g. a hostile `i FF` = -1 in a
-//     string-length or key-length position) is CLAMPED to 0 by
-//     _ub_decode_len before it is ever used as an offset delta — this is the
-//     one place a data-controlled value could otherwise move the decode
-//     cursor BACKWARD and hang the decoder in an infinite loop; clamping to
-//     0 guarantees the cursor is always monotonically non-decreasing.
-//   * Array/object decoding loops on `cur < n and marker != close`, so a
-//     missing/omitted closing marker (truncated stream) terminates the loop
-//     at the buffer end rather than looping forever.
-//   * An unrecognized marker byte decodes as `null` and advances the cursor
-//     by exactly 1 byte (never 0), so unknown/future marker bytes can never
-//     stall the decoder either.
+//     string-length or key-length position) is REJECTED by _ub_decode_len,
+//     which also requires the byte AT the length position to be one of the
+//     five int markers (i/U/I/l/L) before ever decoding it — a hostile
+//     length slot that is itself another container/string/no-op marker
+//     (type confusion) is rejected the same way, never mis-parsed as a
+//     disguised length. This is also what keeps the decode cursor
+//     monotonically non-decreasing: a rejected length prefix stops the
+//     decode immediately rather than moving the cursor backward.
+//   * Array/object decoding loops on `cur < n and marker != close`; running
+//     off the end of the buffer WITHOUT having seen the closing marker is
+//     now an explicit err("...unterminated...") rather than a silent
+//     truncate-and-return.
+//   * An unrecognized marker byte is rejected with err(...) (never silently
+//     decoded as null-and-advance) — an unknown/future marker byte is
+//     genuinely malformed input for this module's grammar, not a value this
+//     module can safely guess the shape of.
 //
 // PUBLIC API
-//   ubjson_encode(v)      -> bytes   encode any NOVA value (int/float/bool*
-//                                     /string/list/dict/bytes/null) to UBJSON
-//   ubjson_decode(b)      -> any     decode a complete UBJSON buffer
-//   ubjson_bool(v)        -> any     force an explicit T/F marker (see above)
-//   ubjson_null()         -> any     force an explicit Z marker in a
-//                                     list/dict position (see above)
+//   ubjson_encode(v)      -> bytes    encode any NOVA value (int/float/bool*
+//                                      /string/list/dict/bytes/null/no-op*)
+//                                      to UBJSON
+//   ubjson_decode(b)      -> Result   Ok(value) for a well-formed buffer
+//                                      (any legitimate value, including one
+//                                      that is 0/""/null), Err(message) for
+//                                      ANY malformed/truncated/hostile input
+//                                      — see DECODE-ERROR VS. LEGITIMATE-
+//                                      VALUE SAFETY above; never exits,
+//                                      never crashes, never hangs, never
+//                                      silently guesses
+//   ubjson_bool(v)        -> any      force an explicit T/F marker (above)
+//   ubjson_null()         -> any      force an explicit Z marker in a
+//                                      list/dict position (see above)
+//   ubjson_noop()         -> any      force an explicit N marker (padding)
+//                                      in a list position (see NO-OP MARKER)
 //
 // COMPETITIVE NOTE. UBJSON's core design goal (per ubjson.org) is "JSON's
 // data model, binary-fast, remains diffable/browsable in a hex editor" — it
@@ -165,6 +238,8 @@ import std/encoding/pack
 // ── marker byte constants (named so call sites read as intent) ────────────
 fn _ub_m_null() -> int
     0x5A                             // 'Z'
+fn _ub_m_noop() -> int
+    0x4E                             // 'N' (no-op / padding, see header)
 fn _ub_m_true() -> int
     0x54                             // 'T'
 fn _ub_m_false() -> int
@@ -218,6 +293,11 @@ fn _ub_null_magic() -> int
     // wrapper.
     0x55424A534E554C4C
 
+fn _ub_noop_magic() -> int
+    // ASCII "UBJSNOOP" — same purpose as _ub_bool_magic()/_ub_null_magic(),
+    // for the no-op wrapper (see NO-OP MARKER in the header comment).
+    0x55424A534E4F4F50
+
 fn ubjson_bool(v) -> any
     let d = {}
     let bbit = 0
@@ -231,6 +311,12 @@ fn ubjson_null() -> any
     let d = {}
     d["$ubjsonNull"] = 1
     d["$ubjsonNullMagic"] = _ub_null_magic()
+    return d
+
+fn ubjson_noop() -> any
+    let d = {}
+    d["$ubjsonNoop"] = 1
+    d["$ubjsonNoopMagic"] = _ub_noop_magic()
     return d
 
 // ── encode: smallest-fits-the-value integer (marker + payload) ────────────
@@ -377,6 +463,11 @@ fn ubjson_encode(v) -> any
             if type_of(v["$ubjsonNullMagic"]) == "int"
                 if v["$ubjsonNullMagic"] == _ub_null_magic()
                     is_null_marker = 1
+        let is_noop_marker = 0
+        if len(ks) == 2 and contains(v, "$ubjsonNoop") and contains(v, "$ubjsonNoopMagic")
+            if type_of(v["$ubjsonNoopMagic"]) == "int"
+                if v["$ubjsonNoopMagic"] == _ub_noop_magic()
+                    is_noop_marker = 1
         if is_bool_marker == 1
             if v["$ubjsonBool"] != 0
                 out = bytes_append(bytes_create(0), _ub_m_true())
@@ -384,6 +475,8 @@ fn ubjson_encode(v) -> any
                 out = bytes_append(bytes_create(0), _ub_m_false())
         else if is_null_marker == 1
             out = bytes_append(bytes_create(0), _ub_m_null())
+        else if is_noop_marker == 1
+            out = bytes_append(bytes_create(0), _ub_m_noop())
         else
             out = _ub_encode_object(v)
     else if t == "int"
@@ -393,41 +486,85 @@ fn ubjson_encode(v) -> any
     // same catch-all policy bson.nova uses.
     out
 
-// ── decode: length prefix, clamped non-negative (see ADVERSARIAL note) ────
-// A length prefix is itself an optimized int (marker + payload), decoded by
-// the same path as any scalar int. Clamped to >= 0 so a hostile/corrupt
-// negative length (e.g. `i FF` = -1) can NEVER move the decode cursor
-// backward — the one input-controlled quantity that could otherwise hang
-// the decoder in an infinite loop.
+// ── decode: length prefix -> [len, next_pos, err] ──────────────────────────
+// A length prefix is itself a nested optimized-int VALUE (marker + payload),
+// but unlike a general value it is restricted to exactly one of the five
+// int markers (i/U/I/l/L) — checked EXPLICITLY, up front, before any attempt
+// to decode it as a number, rather than decoding through the general
+// `_ub_decode_at` dispatcher and inspecting the result afterward. That
+// up-front check is what closes two distinct hostile-input classes in one
+// place: (1) a length slot that is itself another container/string marker
+// (type confusion — an adversary nests `S` inside what should be an int
+// length) can never be mis-parsed as a number, and (2) the no-op marker `N`
+// can never be silently accepted as a disguised zero-length key (see NO-OP
+// MARKER in the header). Both are REJECTED via a non-empty error message,
+// not guessed at. A genuinely negative length (`i FF` = -1) is likewise
+// rejected, never clamped to 0 — see DECODE-ERROR VS. LEGITIMATE-VALUE
+// SAFETY in the header for why a silent fallback value is no longer an
+// acceptable outcome for bad input.
 fn _ub_decode_len(b, pos) -> list
-    let r = _ub_decode_at(b, pos)
-    let ln = r[0]
-    if ln < 0
-        ln = 0
-    [ln, r[1]]
+    let n = bytes_len(b)
+    let ln = 0
+    let next = pos
+    let errmsg = ""
+    if pos >= n
+        errmsg = "ubjson_decode: missing length prefix at " + str(pos)
+    else
+        let m = bytes_get(b, pos) & 0xFF
+        let is_int_marker = 0
+        if m == _ub_m_int8() or m == _ub_m_uint8() or m == _ub_m_int16() or m == _ub_m_int32() or m == _ub_m_int64()
+            is_int_marker = 1
+        if is_int_marker == 0
+            errmsg = "ubjson_decode: length prefix is not an int marker at " + str(pos)
+        else
+            let r = _ub_decode_at(b, pos)
+            if r[2] != ""
+                errmsg = r[2]
+                next = r[1]
+            else if r[0] < 0
+                errmsg = "ubjson_decode: negative length prefix at " + str(pos)
+                next = r[1]
+            else
+                ln = r[0]
+                next = r[1]
+    [ln, next, errmsg]
 
-// ── decode: one value at `pos` -> [value, next_pos] ────────────────────
-// SINGLE-EXIT by design (accumulate into `val`/`next`, one `[val, next]` at
-// the end) — NOT a chain of early `return`s. A function that returns
-// several DIFFERENT underlying value shapes (null/int/float/string/list/
-// dict) from different early-return points hit a real, reproduced NOVA
-// repr-mistagging bug during this module's own KAT (float32 1.5 round-
-// tripped as a raw pointer-sized int instead of 1.5 — classic symptom of
-// reference_nova_return_null_mistag's broader "mixed early returns" class,
-// same root cause bson.nova's decoder avoids via this identical single-exit
-// shape). True/false decode to plain int 1/0 (not a NOVA `true`/`false`
-// literal) for the same reason bson.nova's own bool decode does — NOVA
-// already can't distinguish `int` from `bool` via type_of, so there is no
-// information lost, and it keeps every `val` assignment in this function
-// the SAME family of representation (null/int/float/string/list/dict —
-// never a literal bool mixed in).
+// ── decode: one value at `pos` -> [value, next_pos, err] ───────────────────
+// SINGLE-EXIT by design (accumulate into `val`/`next`/`errmsg`, one final
+// `[val, next, errmsg]` at the end) — NOT a chain of early `return`s. A
+// function that returns several DIFFERENT underlying value shapes (null/
+// int/float/string/list/dict) from different early-return points hit a
+// real, reproduced NOVA repr-mistagging bug during this module's own KAT
+// (float32 1.5 round-tripped as a raw pointer-sized int instead of 1.5 —
+// classic symptom of reference_nova_return_null_mistag's broader "mixed
+// early returns" class, same root cause bson.nova's decoder avoids via this
+// identical single-exit shape). True/false decode to plain int 1/0 (not a
+// NOVA `true`/`false` literal) for the same reason bson.nova's own bool
+// decode does — NOVA already can't distinguish `int` from `bool` via
+// type_of, so there is no information lost.
+// `errmsg` non-empty means the input at/under `pos` was REJECTED as
+// malformed — `val`/`next` carry no meaning in that case, and every call
+// site in this module checks `errmsg` FIRST, before using `val`/`next`, and
+// short-circuits (propagates the same errmsg upward) rather than continuing
+// to decode sibling data past a rejected value.
 fn _ub_decode_at(b, pos) -> list
     let n = bytes_len(b)
     let val = null
     let next = pos
-    if pos < n
+    let errmsg = ""
+    if pos >= n
+        errmsg = "ubjson_decode: unexpected end of buffer at " + str(pos)
+    else
         let m = bytes_get(b, pos) & 0xFF
         if m == _ub_m_null()
+            val = null
+            next = pos + 1
+        else if m == _ub_m_noop()
+            // A lone/top-level no-op decodes to null (see NO-OP MARKER in
+            // the header) — an ARRAY skips `N` entirely before ever calling
+            // this function (see _ub_decode_array), so this branch only
+            // fires for a no-op that is NOT inside an array (e.g. the
+            // entire top-level document is a single `N` byte).
             val = null
             next = pos + 1
         else if m == _ub_m_true()
@@ -437,95 +574,192 @@ fn _ub_decode_at(b, pos) -> list
             val = 0
             next = pos + 1
         else if m == _ub_m_int8()
-            val = unpack_i8(b, pos + 1)
-            next = pos + 2
+            if pos + 2 > n
+                errmsg = "ubjson_decode: truncated int8 payload at " + str(pos)
+            else
+                val = unpack_i8(b, pos + 1)
+                next = pos + 2
         else if m == _ub_m_uint8()
-            val = unpack_u8(b, pos + 1)
-            next = pos + 2
+            if pos + 2 > n
+                errmsg = "ubjson_decode: truncated uint8 payload at " + str(pos)
+            else
+                val = unpack_u8(b, pos + 1)
+                next = pos + 2
         else if m == _ub_m_int16()
-            val = unpack_i16_be(b, pos + 1)
-            next = pos + 3
+            if pos + 3 > n
+                errmsg = "ubjson_decode: truncated int16 payload at " + str(pos)
+            else
+                val = unpack_i16_be(b, pos + 1)
+                next = pos + 3
         else if m == _ub_m_int32()
-            val = unpack_i32_be(b, pos + 1)
-            next = pos + 5
+            if pos + 5 > n
+                errmsg = "ubjson_decode: truncated int32 payload at " + str(pos)
+            else
+                val = unpack_i32_be(b, pos + 1)
+                next = pos + 5
         else if m == _ub_m_int64()
-            val = unpack_i64_be(b, pos + 1)
-            next = pos + 9
+            if pos + 9 > n
+                errmsg = "ubjson_decode: truncated int64 payload at " + str(pos)
+            else
+                val = unpack_i64_be(b, pos + 1)
+                next = pos + 9
         else if m == _ub_m_float32()
-            let bits = unpack_u32_be(b, pos + 1)
-            val = f32_from_bits(bits)
-            next = pos + 5
+            if pos + 5 > n
+                errmsg = "ubjson_decode: truncated float32 payload at " + str(pos)
+            else
+                let bits = unpack_u32_be(b, pos + 1)
+                val = f32_from_bits(bits)
+                next = pos + 5
         else if m == _ub_m_float64()
-            let bits2 = unpack_u64_be(b, pos + 1)
-            val = float_from_bits(bits2)
-            next = pos + 9
+            if pos + 9 > n
+                errmsg = "ubjson_decode: truncated float64 payload at " + str(pos)
+            else
+                let bits2 = unpack_u64_be(b, pos + 1)
+                val = float_from_bits(bits2)
+                next = pos + 9
         else if m == _ub_m_char()
-            // Single ASCII byte -> 1-char NOVA string. DECODE ONLY (see
-            // header): if the byte were 0x00 the resulting NOVA string
-            // would report len()==0 under the documented C-string-
-            // truncation limitation (reference_nova_string_nul_truncation)
-            // — a real UBJSON producer never emits a NUL `C` (the type is
-            // defined as printable ASCII), so this is a documented, not
-            // silently-wrong, edge.
-            val = chr(bytes_get(b, pos + 1) & 0xFF)
-            next = pos + 2
+            if pos + 2 > n
+                errmsg = "ubjson_decode: truncated char payload at " + str(pos)
+            else
+                // Single ASCII byte -> 1-char NOVA string. DECODE ONLY (see
+                // header): if the byte were 0x00 the resulting NOVA string
+                // would report len()==0 under the documented C-string-
+                // truncation limitation (reference_nova_string_nul_truncation)
+                // — a real UBJSON producer never emits a NUL `C` (the type
+                // is defined as printable ASCII), so this is a documented,
+                // not silently-wrong, edge.
+                val = chr(bytes_get(b, pos + 1) & 0xFF)
+                next = pos + 2
         else if m == _ub_m_string()
             let lr = _ub_decode_len(b, pos + 1)
-            let slen = lr[0]
-            let sp = lr[1]
-            let sb = bytes_slice(b, sp, sp + slen)
-            val = bytes_to_str(sb)
-            next = sp + slen
+            if lr[2] != ""
+                errmsg = lr[2]
+                next = lr[1]
+            else
+                let slen = lr[0]
+                let sp = lr[1]
+                if slen > n - sp
+                    errmsg = "ubjson_decode: truncated string data at " + str(sp)
+                    next = sp
+                else
+                    let sb = bytes_slice(b, sp, sp + slen)
+                    val = bytes_to_str(sb)
+                    next = sp + slen
         else if m == _ub_m_arr_open()
             let ar = _ub_decode_array(b, pos + 1)
             val = ar[0]
             next = ar[1]
+            errmsg = ar[2]
         else if m == _ub_m_obj_open()
             let ob = _ub_decode_object(b, pos + 1)
             val = ob[0]
             next = ob[1]
+            errmsg = ob[2]
         else
-            // Unknown/unsupported marker: defensive fallback (null, advance
-            // 1 byte so the cursor always makes forward progress — see
-            // ADVERSARIAL note).
-            val = null
-            next = pos + 1
-    [val, next]
+            // Unknown/unsupported marker byte: genuinely malformed input for
+            // this module's grammar — REJECTED, never accepted-and-guessed
+            // (see ADVERSARIAL-INPUT ROBUSTNESS in the header).
+            errmsg = "ubjson_decode: unrecognized marker byte " + str(m) + " at " + str(pos)
+    [val, next, errmsg]
 
-// ── decode: array body, starting just after '[' -> [list, next_pos] ───────
+// ── decode: array body, starting just after '[' -> [list, next_pos, err] ──
+// A bare no-op (`N`) element is PADDING, not data (see NO-OP MARKER in the
+// header): it is skipped before ever reaching `_ub_decode_at`, so it
+// contributes no element to `out`. Running off the end of the buffer
+// without having seen the closing `]` is a REJECT (non-empty errmsg), not a
+// silent truncate-and-return — see ADVERSARIAL-INPUT ROBUSTNESS. A rejected
+// element also stops the loop immediately (no attempt to keep decoding
+// siblings past malformed data).
 fn _ub_decode_array(b, pos) -> list
     let out = []
     let n = bytes_len(b)
     let cur = pos
-    while cur < n and (bytes_get(b, cur) & 0xFF) != _ub_m_arr_close()
-        let r = _ub_decode_at(b, cur)
-        push(out, r[0])
-        cur = r[1]
-    let next = cur
-    if cur < n
-        next = cur + 1                // skip ']'
-    [out, next]
+    let done = 0
+    let errmsg = ""
+    while done == 0
+        if cur >= n
+            errmsg = "ubjson_decode: unterminated array (missing ']') starting near " + str(pos)
+            done = 1
+        else
+            let mk = bytes_get(b, cur) & 0xFF
+            if mk == _ub_m_arr_close()
+                cur = cur + 1
+                done = 1
+            else if mk == _ub_m_noop()
+                cur = cur + 1
+            else
+                let r = _ub_decode_at(b, cur)
+                if r[2] != ""
+                    errmsg = r[2]
+                    done = 1
+                else
+                    push(out, r[0])
+                    cur = r[1]
+    [out, cur, errmsg]
 
-// ── decode: object body, starting just after '{' -> [dict, next_pos] ──────
+// ── decode: object body, starting just after '{' -> [dict, next_pos, err] ──
+// A key is a length-prefixed byte span with NO marker byte of its own (see
+// header) — `_ub_decode_len`'s up-front int-marker check (see above) is
+// what rejects a hostile/undefined byte (including `N` or a nested
+// container marker) sitting where a key length is expected, rather than
+// silently mis-reading it as a key of some guessed length (the UBJSON spec
+// never defines no-op-as-a-key). Running off the end of the buffer without
+// having seen the closing `}` is a REJECT, not a silent truncate-and-return.
 fn _ub_decode_object(b, pos) -> list
     let out = {}
     let n = bytes_len(b)
     let cur = pos
-    while cur < n and (bytes_get(b, cur) & 0xFF) != _ub_m_obj_close()
-        let lr = _ub_decode_len(b, cur)
-        let klen = lr[0]
-        let kp = lr[1]
-        let kb = bytes_slice(b, kp, kp + klen)
-        let k = bytes_to_str(kb)
-        let vr = _ub_decode_at(b, kp + klen)
-        out[k] = vr[0]
-        cur = vr[1]
-    let next = cur
-    if cur < n
-        next = cur + 1                // skip '}'
-    [out, next]
+    let done = 0
+    let errmsg = ""
+    while done == 0
+        if cur >= n
+            errmsg = "ubjson_decode: unterminated object (missing '}') starting near " + str(pos)
+            done = 1
+        else
+            let mk = bytes_get(b, cur) & 0xFF
+            if mk == _ub_m_obj_close()
+                cur = cur + 1
+                done = 1
+            else
+                let lr = _ub_decode_len(b, cur)
+                if lr[2] != ""
+                    errmsg = lr[2]
+                    done = 1
+                else
+                    let klen = lr[0]
+                    let kp = lr[1]
+                    if klen > n - kp
+                        errmsg = "ubjson_decode: truncated object key at " + str(kp)
+                        done = 1
+                    else
+                        let kb = bytes_slice(b, kp, kp + klen)
+                        let k = bytes_to_str(kb)
+                        let vr = _ub_decode_at(b, kp + klen)
+                        if vr[2] != ""
+                            errmsg = vr[2]
+                            done = 1
+                        else
+                            out[k] = vr[0]
+                            cur = vr[1]
+    [out, cur, errmsg]
 
 // ── decode: top-level entry point ───────────────────────────────────────
-fn ubjson_decode(b) -> any
+// ubjson_decode(b) -> Result: Ok(value) for a well-formed buffer (any
+// legitimate value, including one that happens to be 0/""/null — see
+// DECODE-ERROR VS. LEGITIMATE-VALUE SAFETY in the header), Err(message) for
+// ANY malformed/truncated/hostile input. This is the ONLY place a
+// dict-shaped/name-matched sentinel would have been tempting (the way
+// plist_error()/plist_is_error() are) and deliberately is not one: NOVA's
+// native Result is a compiler-native polymorphic sum, not a `dict`, so no
+// legitimately-decoded document — however it happens to be shaped, even
+// one with a field literally named like an error key — can ever be mistaken
+// for a decode failure. Never exits, never crashes, never hangs, never
+// silently guesses.
+fn ubjson_decode(b) -> Result
+    let n = bytes_len(b)
+    if n == 0
+        return err("ubjson_decode: empty buffer")
     let r = _ub_decode_at(b, 0)
-    r[0]
+    if r[2] != ""
+        return err(r[2])
+    return ok(r[0])

@@ -1,0 +1,212 @@
+// _kat_ldap_fix — targeted KAT for the batch-10 REJECT fix-cycle recovery of
+// std/net/ldap.nova.
+//
+// Batch-10's adversarial reviewer rejected the ldap codec because its BER
+// decoder validated the ASN.1 tag (class+number) ONLY at the two CHOICE
+// points (protocolOp's [APPLICATION n], the auth CHOICE) -- every other
+// structural field (messageID, version, name/DN, resultCode, matchedDN,
+// diagnosticMessage) was read through a tag-agnostic TLV reader, so a
+// wrongly-tagged (grammar-malformed) field silently decoded ok=true
+// (classic BER/DER type confusion). This KAT independently re-derives that
+// contract from the RFC 4511 spec (not copy-pasted from the existing
+// kat_net_ldap.nova / kat_net_ldap_adv_probe.nova / kat_net_ldap_adv_verify.nova):
+// a well-formed message decodes ok, and >= 3 DISTINCT classes of malformed
+// input (wrong outer tag, a length field that lies about the remaining
+// buffer, and an INTEGER tag substituted where the grammar requires a
+// SEQUENCE) are each independently rejected -- never accepted-and-guessed,
+// never crashed, never exited the process.
+//
+// Also exercises the trailing-content-in-declared-span hardening added
+// alongside this KAT: BindRequest/BindResponse's grammar (RFC 4511 §4.2/
+// §4.1.9) is a FIXED field list with no trailing extensions, so bytes left
+// over inside the op's own declared TLV length after the last expected
+// field is consumed must be rejected too (previously: silently ignored).
+//
+// NOTE ON SearchRequest: std/net/ldap.nova implements BindRequest/
+// BindResponse/UnbindRequest only (see module PUBLIC API) -- SearchRequest
+// has no encoder/decoder in this module, so the "well-formed round-trip"
+// checks below cover BOTH of the message kinds the module actually
+// supports (BindRequest AND BindResponse) instead.
+
+import std/net/ldap
+import std/encoding/asn1
+import std/encoding/hex
+
+// Sound fail-counting idiom (see module header of kat_net_ldap.nova): thread
+// a local return value through `fails`, never mutate a captured list from
+// inside a called fn (that pattern does not reliably propagate in NOVA).
+fn check(name: string, cond: bool) -> int
+    if cond
+        print("PASS " + name)
+        return 0
+    print("FAIL " + name)
+    return 1
+
+fn bytes_from_hex(h: string) -> any
+    return hex_decode(h)
+
+fn _str_bytes(s) -> any
+    let b = bytes_create(0)
+    b = bytes_append_str(b, s)
+    return b
+
+fn main()
+    let fails = 0
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 1. WELL-FORMED round-trips decode to ok(...) with the right fields.
+    // ═══════════════════════════════════════════════════════════════════
+
+    // 1a. BindRequest: messageID=42, version=3, DN, simple password.
+    let bindreq = ldap_encode_bind_request(42, 3, "cn=svc,ou=apps,dc=corp,dc=net", "hunter2")
+    let dreq = ldap_decode_bind_request(bindreq)
+    fails = fails + check("wellformed_bindreq_ok", dreq["ok"] == true)
+    fails = fails + check("wellformed_bindreq_msgid", dreq["message_id"] == 42)
+    fails = fails + check("wellformed_bindreq_version", dreq["version"] == 3)
+    fails = fails + check("wellformed_bindreq_dn", dreq["dn"] == "cn=svc,ou=apps,dc=corp,dc=net")
+    fails = fails + check("wellformed_bindreq_password", dreq["password"] == "hunter2")
+    fails = fails + check("wellformed_bindreq_error_empty", dreq["error"] == "")
+    fails = fails + check("wellformed_bindreq_optag", ldap_peek_op_tag(bindreq) == ldap_tag_bind_request())
+
+    // 1b. BindResponse: messageID=43, resultCode=success, matchedDN + diag.
+    let bindresp = ldap_encode_bind_response(43, ldap_result_success(), "dc=corp,dc=net", "welcome")
+    let dresp = ldap_decode_bind_response(bindresp)
+    fails = fails + check("wellformed_bindresp_ok", dresp["ok"] == true)
+    fails = fails + check("wellformed_bindresp_msgid", dresp["message_id"] == 43)
+    fails = fails + check("wellformed_bindresp_result_code", dresp["result_code"] == ldap_result_success())
+    fails = fails + check("wellformed_bindresp_matched_dn", dresp["matched_dn"] == "dc=corp,dc=net")
+    fails = fails + check("wellformed_bindresp_diag", dresp["diagnostic_message"] == "welcome")
+
+    // 1c. UnbindRequest round-trip (the third message kind this module owns).
+    let unbind = ldap_encode_unbind_request(44)
+    let dunbind = ldap_decode_unbind_request(unbind)
+    fails = fails + check("wellformed_unbind_ok", dunbind["ok"] == true)
+    fails = fails + check("wellformed_unbind_msgid", dunbind["message_id"] == 44)
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2. MALFORMED INPUT #1 — wrong outer tag. Take a genuinely well-formed
+    // BindRequest and flip only its outer tag byte from SEQUENCE (0x30) to
+    // SET (0x31) -- a real, distinct ASN.1 universal tag, still perfectly
+    // well-formed BER, just the wrong type for LDAPMessage. Must reject.
+    // ═══════════════════════════════════════════════════════════════════
+    let wrong_outer = bytes_slice(bindreq, 0, bytes_len(bindreq))
+    bytes_set(wrong_outer, 0, 0x31)
+    let dwrongouter = ldap_decode_bind_request(wrong_outer)
+    fails = fails + check("malformed1_wrong_outer_tag_rejected", dwrongouter["ok"] == false)
+    fails = fails + check("malformed1_wrong_outer_tag_has_error", dwrongouter["error"] != "")
+    fails = fails + check("malformed1_wrong_outer_tag_peek_neg1", ldap_peek_op_tag(wrong_outer) == -1)
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 3. MALFORMED INPUT #2 — truncated length: the outer SEQUENCE's length
+    // byte DECLARES more content than the buffer actually supplies (a lying
+    // / truncated length). Craft: SEQUENCE claiming 100 (0x64) content
+    // bytes, but only 4 real bytes follow the header. Must reject cleanly,
+    // no over-read (bytes_get/bytes_slice are bounds-checked at the
+    // runtime level, so the worst case is a rejected result, never a
+    // crash), never accepted as if it were a short-but-complete message.
+    // ═══════════════════════════════════════════════════════════════════
+    let lying_len = bytes_create(6)
+    bytes_set(lying_len, 0, 0x30)   // SEQUENCE, correct outer tag
+    bytes_set(lying_len, 1, 0x64)   // declares 100 bytes of content
+    bytes_set(lying_len, 2, 0x02)   // (real bytes that follow: a plausible
+    bytes_set(lying_len, 3, 0x01)   //  messageID INTEGER 1 ...)
+    bytes_set(lying_len, 4, 0x01)
+    bytes_set(lying_len, 5, 0x60)   // ... then protocolOp starts, then buffer ends
+    let dlying = ldap_decode_bind_request(lying_len)
+    fails = fails + check("malformed2_truncated_length_rejected", dlying["ok"] == false)
+    fails = fails + check("malformed2_truncated_length_has_error", dlying["error"] != "")
+    fails = fails + check("malformed2_truncated_length_peek_neg1", ldap_peek_op_tag(lying_len) == -1)
+
+    // Second variant: multi-byte BER long-form length (0x84 = "4 length
+    // bytes follow") whose encoded value (0x00100000 = 1048576) vastly
+    // exceeds the tiny buffer it is embedded in. Independently exercises
+    // the long-form path of the same "declared > remaining" defense.
+    let lying_len2 = bytes_create(10)
+    bytes_set(lying_len2, 0, 0x30)
+    bytes_set(lying_len2, 1, 0x84)
+    bytes_set(lying_len2, 2, 0x00)
+    bytes_set(lying_len2, 3, 0x10)
+    bytes_set(lying_len2, 4, 0x00)
+    bytes_set(lying_len2, 5, 0x00)
+    bytes_set(lying_len2, 6, 0x02)
+    bytes_set(lying_len2, 7, 0x01)
+    bytes_set(lying_len2, 8, 0x01)
+    bytes_set(lying_len2, 9, 0x60)
+    let dlying2 = ldap_decode_bind_request(lying_len2)
+    fails = fails + check("malformed2b_longform_lying_length_rejected", dlying2["ok"] == false)
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 4. MALFORMED INPUT #3 — wrong INTEGER tag where a SEQUENCE was
+    // required: substitute INTEGER (0x02) for the outer LDAPMessage's
+    // mandatory SEQUENCE tag (0x30). Built compositionally with asn1's own
+    // TLV primitives (not by poking a byte offset into an existing
+    // message), so this stays correct even if unrelated field widths
+    // change: an entirely well-formed BindRequest payload, just wrapped in
+    // an INTEGER TLV instead of a SEQUENCE TLV.
+    // ═══════════════════════════════════════════════════════════════════
+    let msgid_tlv = asn1_encode_integer(5)
+    let version_tlv = asn1_encode_integer(3)
+    let dn_tlv = asn1_encode_octet_string(_str_bytes("cn=x"))
+    let auth_tlv = asn1_write_tlv(ldap_tag_simple_auth(), _str_bytes("pw"))
+    let op_content = bytes_concat(version_tlv, dn_tlv)
+    op_content = bytes_concat(op_content, auth_tlv)
+    let op_tlv = asn1_write_tlv(ldap_tag_bind_request(), op_content)
+    let msg_content = bytes_concat(msgid_tlv, op_tlv)
+    // The bug: wrap in INTEGER (0x02) instead of SEQUENCE (0x30 == asn1_tag_sequence()).
+    let integer_not_sequence = asn1_write_tlv(asn1_tag_integer(), msg_content)
+    let dintnotseq = ldap_decode_bind_request(integer_not_sequence)
+    fails = fails + check("malformed3_integer_tag_where_sequence_required_rejected", dintnotseq["ok"] == false)
+    fails = fails + check("malformed3_integer_tag_where_sequence_required_has_error", dintnotseq["error"] != "")
+    // Control: the identical content wrapped correctly in SEQUENCE decodes ok.
+    let sequence_correct = asn1_write_tlv(asn1_tag_sequence(), msg_content)
+    let dctrl = ldap_decode_bind_request(sequence_correct)
+    fails = fails + check("malformed3_control_sequence_wrap_ok_true", dctrl["ok"] == true)
+    fails = fails + check("malformed3_control_msgid_5", dctrl["message_id"] == 5)
+
+    // The same substitution one level deeper: protocolOp itself carries
+    // INTEGER (0x02) instead of the [APPLICATION 0] BindRequest tag (0x60).
+    let op_as_integer = asn1_write_tlv(asn1_tag_integer(), op_content)
+    let msg_op_as_integer = bytes_concat(msgid_tlv, op_as_integer)
+    let wrapped = asn1_write_tlv(asn1_tag_sequence(), msg_op_as_integer)
+    let dopint = ldap_decode_bind_request(wrapped)
+    fails = fails + check("malformed3b_protocolop_integer_tag_rejected", dopint["ok"] == false)
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 5. Bonus: trailing/unexpected bytes inside a field's OWN declared
+    // content span (a distinct malformation class from the 3 above) --
+    // BindRequest's grammar is EXACTLY {version, name, authentication}; a
+    // 4th TLV squeezed into the same declared BindRequest length must be
+    // rejected, not silently ignored.
+    // ═══════════════════════════════════════════════════════════════════
+    let extra_tlv = asn1_write_tlv(0xA0, bytes_create(0))   // plausible but unaccounted-for field
+    let op_content_extra = bytes_concat(op_content, extra_tlv)
+    let op_tlv_extra = asn1_write_tlv(ldap_tag_bind_request(), op_content_extra)
+    let msg_content_extra = bytes_concat(msgid_tlv, op_tlv_extra)
+    let msg_extra = asn1_write_tlv(asn1_tag_sequence(), msg_content_extra)
+    let dextra = ldap_decode_bind_request(msg_extra)
+    fails = fails + check("bonus_trailing_content_in_bindrequest_rejected", dextra["ok"] == false)
+    fails = fails + check("bonus_trailing_content_in_bindrequest_has_error", dextra["error"] != "")
+
+    // BindResponse: same trailing-content check, independently exercised.
+    let rc_tlv = asn1_encode_integer(0)
+    bytes_set(rc_tlv, 0, ldap_tag_enumerated())
+    let mdn_tlv = asn1_encode_octet_string(_str_bytes(""))
+    let diag_tlv = asn1_encode_octet_string(_str_bytes(""))
+    let resp_content = bytes_concat(rc_tlv, mdn_tlv)
+    resp_content = bytes_concat(resp_content, diag_tlv)
+    resp_content = bytes_concat(resp_content, extra_tlv)
+    let resp_op = asn1_write_tlv(ldap_tag_bind_response(), resp_content)
+    let resp_msgid = asn1_encode_integer(6)
+    let resp_msg_content = bytes_concat(resp_msgid, resp_op)
+    let resp_msg = asn1_write_tlv(asn1_tag_sequence(), resp_msg_content)
+    let drespextra = ldap_decode_bind_response(resp_msg)
+    fails = fails + check("bonus_trailing_content_in_bindresponse_rejected", drespextra["ok"] == false)
+
+    // Process is still alive after every reject above -- never exit(1),
+    // never crashed, every malformed path returned in-band.
+    fails = fails + check("still_alive_after_all_rejects", true)
+
+    if fails == 0
+        print("LDAP-FIX KAT PASS")
+    else
+        print("FAILURES: " + str(fails))

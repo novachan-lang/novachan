@@ -1,0 +1,220 @@
+// KAT for the std/encoding/bson sentinel-collision fix (bson_bool/bson_long
+// wrapper dicts). Mirrors the fix already applied+verified for bson_null()
+// (see bsonkat.nova KAT 9 / bson_null_indep_verify.nova) — same collision-
+// proof pattern from std/encoding/plist.nova (SENTINEL-KEY COLLISION
+// SAFETY): a wrapper is recognized ONLY by an EXACT 2-key shape plus a
+// magic-constant match on the second key, never by a bare key-NAME match.
+//
+// BEFORE THE FIX: _bs_type_and_value recognized $bsonBool/$numberLong by
+// `len(ks) == 1 and ks[0] == "$bsonBool"` (and similarly for $numberLong)
+// alone. That made a GENUINE document field — e.g. exactly MongoDB's own
+// Extended JSON convention {"$numberLong": "123"}, whose value is a STRING,
+// not an int — indistinguishable from the wrapper sentinel: it would be
+// silently misencoded as a scalar BSON type instead of a real embedded
+// document (losing the field on round-trip), and the raw `any`-typed value
+// would be handed straight to int64 bit-ops / an any==int compare with no
+// type guard, which can fault on a non-int value (the same class of bug
+// class this codebase's Int/Pointer Soundness work closed for arithmetic —
+// this KAT independently exercises the comparison/bit-op path in
+// _bs_type_and_value specifically).
+//
+// Fail-fast style throughout (same idiom as bsonkat.nova / bson_null_indep_
+// verify.nova): every check helper exits(1) immediately with a labeled
+// message on failure. Reaching the final print with exit 0 is the only way
+// this KAT passes.
+import std/encoding/bson
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn ckty(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got type " + got + " want " + want)
+        exit(1)
+    print("PASS " + label)
+
+fn main()
+    // ── 1. Regression: the GENUINE wrappers still produce real BSON scalars.
+    let dtrue = {}
+    dtrue["f"] = bson_bool(1)
+    let etrue = bson_encode(dtrue)
+    cki("genuine_bool_true_typebyte", bytes_get(etrue, 4), 0x08)
+    cki("genuine_bool_true_valuebyte", bytes_get(etrue, 7), 0x01)
+    let dectrue = bson_decode(etrue)
+    cki("genuine_bool_true_decode", dectrue["f"], 1)
+
+    let dfalse = {}
+    dfalse["f"] = bson_bool(0)
+    let efalse = bson_encode(dfalse)
+    cki("genuine_bool_false_typebyte", bytes_get(efalse, 4), 0x08)
+    cki("genuine_bool_false_valuebyte", bytes_get(efalse, 7), 0x00)
+
+    let dlong = {}
+    dlong["n"] = bson_long(42)
+    let elong = bson_encode(dlong)
+    cki("genuine_long_typebyte", bytes_get(elong, 4), 0x12)
+    let declong = bson_decode(elong)
+    cki("genuine_long_decode", declong["n"], 42)
+
+    let dnull = {}
+    dnull["z"] = bson_null()
+    let enull = bson_encode(dnull)
+    cki("genuine_null_typebyte", bytes_get(enull, 4), 0x0A)
+    let decnull = bson_decode(enull)
+    if decnull["z"] != null
+        print("FAIL genuine_null_decode")
+        exit(1)
+    print("PASS genuine_null_decode")
+
+    // ── 2. THE COLLISION CASE (bool): a document whose value EQUALS the OLD
+    // name-only sentinel shape — a plain dict with SOLE key "$bsonBool",
+    // built WITHOUT bson_bool() — must round-trip as a REAL 1-field embedded
+    // document (type byte 0x03), never as a false BSON boolean (0x08).
+    let evil_bool = {}
+    evil_bool["$bsonBool"] = 1
+    let dcol1 = {}
+    dcol1["v"] = evil_bool
+    let ecol1 = bson_encode(dcol1)
+    cki("bool_collision_typebyte", bytes_get(ecol1, 4), 0x03)
+    let deccol1 = bson_decode(ecol1)
+    ckty("bool_collision_decoded_type", type_of(deccol1["v"]), "dict")
+    cki("bool_collision_field_value", deccol1["v"]["$bsonBool"], 1)
+
+    // Same collision shape but the field value is a STRING (a real value
+    // that "equals" what a hostile encoder might mistake for the sentinel
+    // in spirit) — must not crash, must round-trip exactly.
+    let evil_bool_str = {}
+    evil_bool_str["$bsonBool"] = "not-a-bit"
+    let dcol1b = {}
+    dcol1b["v"] = evil_bool_str
+    let ecol1b = bson_encode(dcol1b)
+    cki("bool_collision_str_typebyte", bytes_get(ecol1b, 4), 0x03)
+    let deccol1b = bson_decode(ecol1b)
+    cks("bool_collision_str_no_crash_field", deccol1b["v"]["$bsonBool"], "not-a-bit")
+
+    // ── 3. THE COLLISION CASE (long): MongoDB's OWN Extended JSON shape —
+    // {"$numberLong": "<decimal string>"} — built as genuine document data,
+    // NOT via bson_long(). The value is a STRING (exactly how real MongoDB
+    // Extended JSON represents it), which the OLD name-only check would
+    // have hand straight to int64 bit-ops (`v & 0xFF`) and crashed. Must
+    // round-trip as a real embedded document and must not crash.
+    let evil_long = {}
+    evil_long["$numberLong"] = "9223372036854775807"
+    let dcol2 = {}
+    dcol2["v"] = evil_long
+    let ecol2 = bson_encode(dcol2)
+    cki("long_collision_typebyte", bytes_get(ecol2, 4), 0x03)
+    let deccol2 = bson_decode(ecol2)
+    ckty("long_collision_decoded_type", type_of(deccol2["v"]), "dict")
+    cks("long_collision_field_value", deccol2["v"]["$numberLong"], "9223372036854775807")
+
+    // ── 4. "Key absent" vs "sentinel value": a dict carrying the value key
+    // but with the magic key ABSENT (not merely a different value — genuinely
+    // not present) must be reported as "not the marker" via contains(), not
+    // by reading NOVA's dict-missing-key-returns-0 default and risking that
+    // default being mistaken for a match. Encodes as a real document; the
+    // decoded document does NOT contain a "$bsonBoolMagic" key at all.
+    let absent_magic = {}
+    absent_magic["$bsonBool"] = 1
+    let dcol3 = {}
+    dcol3["v"] = absent_magic
+    let ecol3 = bson_encode(dcol3)
+    cki("absent_magic_typebyte", bytes_get(ecol3, 4), 0x03)
+    let deccol3 = bson_decode(ecol3)
+    if contains(deccol3["v"], "$bsonBoolMagic")
+        print("FAIL absent_magic_key_should_stay_absent")
+        exit(1)
+    print("PASS absent_magic_key_reported_as_absent")
+    cki("absent_magic_field_preserved", deccol3["v"]["$bsonBool"], 1)
+
+    // Right key names, WRONG magic value (present but mismatched) — also
+    // must fall through, and must not crash on the any==int compare.
+    let wrong_magic = {}
+    wrong_magic["$bsonBool"] = 1
+    wrong_magic["$bsonBoolMagic"] = 999
+    let dcol4 = {}
+    dcol4["v"] = wrong_magic
+    let ecol4 = bson_encode(dcol4)
+    cki("wrong_magic_typebyte", bytes_get(ecol4, 4), 0x03)
+    let deccol4 = bson_decode(ecol4)
+    cki("wrong_magic_field_preserved", deccol4["v"]["$bsonBool"], 1)
+    cki("wrong_magic_value_preserved", deccol4["v"]["$bsonBoolMagic"], 999)
+
+    // Right key names, magic key present but holding a NON-INT value — the
+    // exact "any==int crash on the sentinel path" case. Must not crash.
+    let nonint_magic = {}
+    nonint_magic["$numberLong"] = 5
+    nonint_magic["$numberLongMagic"] = "BSONLONG"
+    let dcol5 = {}
+    dcol5["v"] = nonint_magic
+    let ecol5 = bson_encode(dcol5)
+    cki("nonint_magic_typebyte", bytes_get(ecol5, 4), 0x03)
+    let deccol5 = bson_decode(ecol5)
+    cki("nonint_magic_field_preserved", deccol5["v"]["$numberLong"], 5)
+    cks("nonint_magic_value_preserved", deccol5["v"]["$numberLongMagic"], "BSONLONG")
+
+    // ── 5. Hand-built EXACT wrapper shape (right 2 keys + right magic,
+    // constructed by hand rather than via bson_bool()) DOES legitimately
+    // decode as the wrapped scalar type — proving the positive case still
+    // works, not just the negative collision cases.
+    let handbuilt = {}
+    handbuilt["$bsonBool"] = 1
+    handbuilt["$bsonBoolMagic"] = 0x42534F4E424F4F4C
+    let dhb = {}
+    dhb["v"] = handbuilt
+    let ehb = bson_encode(dhb)
+    cki("handbuilt_bool_typebyte", bytes_get(ehb, 4), 0x08)
+    let dechb = bson_decode(ehb)
+    cki("handbuilt_bool_decode", dechb["v"], 1)
+
+    // ── 6. Preserve round-trip for EVERY BSON element type this module
+    // supports, in ONE document, including the collision-shaped field
+    // alongside ordinary fields (nothing about the fix disturbs unrelated
+    // types).
+    let full = {}
+    full["dbl"] = 3.5
+    full["str"] = "hello"
+    full["doc"] = {"inner": 7}
+    full["arr"] = [1, 2, 3]
+    let blob = bytes_create(2)
+    bytes_set(blob, 0, 0xAB)
+    bytes_set(blob, 1, 0xCD)
+    full["bin"] = blob
+    full["flag"] = bson_bool(1)
+    full["nothing"] = bson_null()
+    full["big"] = bson_long(123456789012)
+    full["i32"] = 100
+    full["i64"] = 9999999999
+    full["collision"] = evil_bool
+    let efull = bson_encode(full)
+    let decfull = bson_decode(efull)
+    if decfull["dbl"] != 3.5
+        print("FAIL full_dbl")
+        exit(1)
+    cks("full_str", decfull["str"], "hello")
+    cki("full_doc_inner", decfull["doc"]["inner"], 7)
+    cki("full_arr_len", len(decfull["arr"]), 3)
+    cki("full_arr_1", decfull["arr"][1], 2)
+    cki("full_bin_len", bytes_len(decfull["bin"]), 2)
+    cki("full_bin_0", bytes_get(decfull["bin"], 0), 0xAB)
+    cki("full_flag", decfull["flag"], 1)
+    if decfull["nothing"] != null
+        print("FAIL full_nothing")
+        exit(1)
+    print("PASS full_nothing")
+    cki("full_big", decfull["big"], 123456789012)
+    cki("full_i32", decfull["i32"], 100)
+    cki("full_i64", decfull["i64"], 9999999999)
+    ckty("full_collision_type", type_of(decfull["collision"]), "dict")
+    cki("full_collision_field", decfull["collision"]["$bsonBool"], 1)
+
+    print("BSON-FIX KAT PASS")

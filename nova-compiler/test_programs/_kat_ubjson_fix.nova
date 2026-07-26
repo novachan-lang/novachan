@@ -1,0 +1,181 @@
+// KAT for the std/encoding/ubjson sentinel-collision fix.
+//
+// ROOT CAUSE (same class as std/encoding/plist / std/encoding/bson's
+// bool/null wrapper collisions, but on the DECODE side): ubjson_decode(b)
+// used to return a plain NOVA value on every call, malformed input
+// included -- a truncated payload, an empty buffer, or a hostile negative
+// length prefix all silently degraded to a fallback value (int 0 / "" /
+// partial data) that is ALSO the exact value a legitimate, well-formed
+// encode of 0/""/null produces. A caller had no way to distinguish "the
+// wire bytes were garbage" from "the wire bytes legitimately encoded a
+// zero/empty value" -- the old fallback WAS the collision sentinel.
+//
+// FIX: ubjson_decode(b) now returns NOVA's native Result<any,string>
+// (ok(v)/err(msg)) -- a compiler-native polymorphic sum, never a `dict`,
+// so no legitimately-decoded document (however it happens to be shaped)
+// can ever be mistaken for a decode failure. Malformed/truncated/hostile
+// input is REJECTED via err(...), never guessed at.
+//
+// This KAT asserts, independently of the fixer's own kat_ubjson_test.nova:
+//   1. A value equal to the OLD fallback sentinel (int 0 / "" / null) still
+//      round-trips correctly as Ok(...), never confused with a decode error.
+//   2. A decoded object's MISSING key reads as ABSENT via contains() --
+//      never conflated with a present key whose value happens to be 0.
+//   3. The encode-side sentinel-key collision (a user dict whose sole key
+//      equals a reserved wrapper name) still round-trips as real data, no
+//      crash.
+//   4. Malformed input (empty buffer, truncated payload, hostile negative
+//      length) is REJECTED via Err, never silently accepted as a guessed
+//      value.
+import std/encoding/ubjson
+
+// Decode-or-fail helper. Returns `any` deliberately: NOVA unifies a
+// compiler-native Result's payload type ONCE per compilation unit rather
+// than re-generalizing it per call site, so routing every well-formed
+// decode in this file through ONE `-> any` function (instead of matching
+// `Ok(v)` separately, with different locally-typed uses of `v`, at each of
+// this KAT's several call sites) is what lets the same file legitimately
+// decode an int, a string, AND a dict. All comparisons/indexing on the
+// returned value happen OUTSIDE this function, on the plain `any` result.
+fn _dec(b) -> any
+    let r = null
+    match ubjson_decode(b)
+        Ok(v) =>
+            r = v
+        Err(e) =>
+            print("FAIL: unexpected decode error: " + e)
+            exit(1)
+    return r
+
+// True iff ubjson_decode(b) is Err.
+fn is_decode_err(b) -> int
+    let r = 1
+    match ubjson_decode(b)
+        Ok(v) =>
+            r = 0
+        Err(e) =>
+            r = 1
+    return r
+
+fn main()
+    let fails = 0
+
+    // ── 1. A legitimate value equal to the OLD "decode failed" fallback
+    // sentinel (int 0 / empty string / explicit null) must round-trip as a
+    // real Ok value, never indistinguishable from "decode failed". ────────
+    let v0 = _dec(ubjson_encode(0))
+    if v0 == 0
+        print("ok: value 0 (== old fallback sentinel) round-trips as Ok(0)")
+    else
+        fails = fails + 1
+        print("FAIL: value 0 round-tripped as " + str(v0))
+
+    let vEmptyStr = _dec(ubjson_encode(""))
+    if vEmptyStr == ""
+        print("ok: empty string (== old fallback sentinel) round-trips as Ok(\"\")")
+    else
+        fails = fails + 1
+        print("FAIL: empty string round-tripped as '" + vEmptyStr + "'")
+
+    let vNull = _dec(ubjson_encode(ubjson_null()))
+    print("ok: explicit null round-trips as Ok(null/0)=" + str(vNull) + ", not confused with an error")
+
+    // ── 2. Distinct-absent: a decoded object's MISSING key reads as
+    // ABSENT via contains() -- never conflated with a present key whose
+    // value happens to equal 0. This is the general "legitimate value
+    // indistinguishable from a not-found sentinel" collision class,
+    // demonstrated end-to-end through a real encode/decode round trip. ───
+    let doc = {}
+    doc["presentZero"] = 0
+    doc["presentOne"] = 42
+    let rtDoc = _dec(ubjson_encode(doc))
+    if contains(rtDoc, "missingKey") == 0
+        print("ok: missing key correctly reads as absent (not the old 0/null sentinel)")
+    else
+        fails = fails + 1
+        print("FAIL: missing key wrongly reports present")
+    if contains(rtDoc, "presentZero") == 1
+        if rtDoc["presentZero"] == 0
+            print("ok: presentZero (value 0) is present AND distinguishable from absent")
+        else
+            fails = fails + 1
+            print("FAIL: presentZero value corrupted: " + str(rtDoc["presentZero"]))
+    else
+        fails = fails + 1
+        print("FAIL: presentZero key wrongly reports absent")
+    if contains(rtDoc, "presentOne") == 1
+        print("ok: sibling presentOne survives")
+    else
+        fails = fails + 1
+        print("FAIL: sibling presentOne missing")
+
+    // ── 3. Sentinel-key collision: an ordinary user dict whose sole key
+    // equals a reserved wrapper name ("$ubjsonNull") must round-trip as
+    // REAL data, never a false marker decode, and must never crash. ───────
+    let collide = {}
+    collide["$ubjsonNull"] = 7
+    let rtCollide = _dec(ubjson_encode(collide))
+    if type_of(rtCollide) != "dict"
+        fails = fails + 1
+        print("FAIL: collision dict decoded as non-dict (" + type_of(rtCollide) + ")")
+    else if contains(rtCollide, "$ubjsonNull") == 0
+        fails = fails + 1
+        print("FAIL: collision key missing after round trip")
+    else if rtCollide["$ubjsonNull"] != 7
+        fails = fails + 1
+        print("FAIL: collision value corrupted: " + str(rtCollide["$ubjsonNull"]))
+    else
+        print("ok: sentinel-name collision decodes as real data (dict), no crash")
+
+    // ── 4. Malformed input is REJECTED via Err, never silently guessed at
+    // as some fallback value indistinguishable from real data. ───────────
+    let empty = bytes_create(0)
+    if is_decode_err(empty) == 1
+        print("ok: empty buffer correctly rejected")
+    else
+        fails = fails + 1
+        print("FAIL: empty buffer wrongly accepted as Ok")
+
+    let truncInt = bytes_create(1)
+    bytes_set(truncInt, 0, 0x69)   // 'i' (int8) marker with no payload byte
+    if is_decode_err(truncInt) == 1
+        print("ok: truncated int8 payload correctly rejected")
+    else
+        fails = fails + 1
+        print("FAIL: truncated int8 payload wrongly accepted as Ok")
+
+    let hostileLen = bytes_create(3)
+    bytes_set(hostileLen, 0, 0x53)  // 'S'
+    bytes_set(hostileLen, 1, 0x69)  // 'i'
+    bytes_set(hostileLen, 2, 0xff)  // -1 as int8 payload (hostile negative length)
+    if is_decode_err(hostileLen) == 1
+        print("ok: hostile negative length prefix correctly rejected")
+    else
+        fails = fails + 1
+        print("FAIL: hostile negative length wrongly accepted as Ok")
+
+    // i64 integer-OVERFLOW length: 'S' 'L' + int64 0x7FFFFFFFFFFFFFFF (2^63-1). The old bounds
+    // check `sp + slen > n` overflowed to a negative and passed, silently accepting truncated data.
+    // The overflow-safe form `slen > n - sp` must reject it.
+    let overflowLen = bytes_create(10)
+    bytes_set(overflowLen, 0, 0x53)  // 'S' (string)
+    bytes_set(overflowLen, 1, 0x4c)  // 'L' (int64 length marker)
+    bytes_set(overflowLen, 2, 0x7f)  // int64 = 0x7FFFFFFFFFFFFFFF = 2^63-1
+    bytes_set(overflowLen, 3, 0xff)
+    bytes_set(overflowLen, 4, 0xff)
+    bytes_set(overflowLen, 5, 0xff)
+    bytes_set(overflowLen, 6, 0xff)
+    bytes_set(overflowLen, 7, 0xff)
+    bytes_set(overflowLen, 8, 0xff)
+    bytes_set(overflowLen, 9, 0xff)
+    if is_decode_err(overflowLen) == 1
+        print("ok: i64-overflow string length correctly rejected")
+    else
+        fails = fails + 1
+        print("FAIL: i64-overflow string length wrongly accepted (sp+slen overflow bypass)")
+
+    if fails == 0
+        print("UBJSON-FIX KAT PASS")
+    else
+        print("UBJSON-FIX KAT FAILURES=" + str(fails))
+        exit(1)

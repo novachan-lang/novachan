@@ -60,25 +60,36 @@
 //   bson_bool(v) before inserting it into the document, e.g.:
 //     let d = {}
 //     d["active"] = bson_bool(true)
-//   This uses a reserved-key wrapper dict {"$bsonBool": 0|1} — the same
-//   technique MongoDB's own Extended JSON uses for its ambiguous scalar
-//   types ($numberLong, $binary, ...). A real document field that happens
-//   to be a SINGLE-KEY dict literally named "$bsonBool" would collide with
-//   this; that tradeoff is accepted and documented, exactly as MongoDB
-//   accepts it for its own $-prefixed Extended JSON keys.
 //   bson_long(v) is the equivalent forcing wrapper for int64 (0x12) — use
 //   it when a small-magnitude value must still be written as a MongoDB
 //   Long rather than the default magnitude-based int32/int64 choice.
 //
-//   bson_null(v)'s wrapper is COLLISION-SAFE (unlike $bsonBool/$numberLong
-//   above): recognition requires the EXACT 2-key shape {"$bsonNull": _,
-//   "$bsonNullMagic": <fixed 64-bit constant>} with the magic value matching
-//   exactly, not merely a sole key named "$bsonNull" — see
-//   std/encoding/plist.nova's SENTINEL-KEY COLLISION SAFETY note, the same
-//   technique. An ordinary user dict {"$bsonNull": 1} (built without going
-//   through bson_null()) therefore always encodes as a real 1-entry embedded
-//   document (0x03), never as a false null — see the KAT
-//   `bson_null_sentinel_collision_safe`.
+// SENTINEL-KEY COLLISION SAFETY (bson_bool/bson_long/bson_null — ALL THREE
+//   wrappers). A naive version of the wrapper trick (recognize-by-sole-
+//   key-name alone, e.g. "a dict whose only key is literally the string
+//   \"$bsonBool\"") is UNSOUND: an ordinary user dict that happens to carry
+//   that exact sole key as GENUINE data — e.g. MongoDB's own Extended JSON
+//   convention {"$numberLong": "123"} (note: a STRING value there, not an
+//   int), built without going through bson_bool()/bson_long()/bson_null()
+//   at all — would be silently misencoded as the wrapped type instead of a
+//   real embedded document. Worse, the raw `any`-typed field value would
+//   then be handed straight to int64 bit-ops (bson_long: `v & 0xFF`, ...)
+//   or compared via `any == int` (bson_bool: `bv != 0`) with no type guard,
+//   which can fault when that value is a heap type (string/dict/list)
+//   rather than the int the real wrapper always produces.
+//   Every wrapper is therefore recognized by the SAME collision-proof rule
+//   std/encoding/plist.nova established (plist_bool()/plist_null()): the
+//   EXACT 2-key shape (the value key + a matching "...Magic" key, checked
+//   via `contains()` so an ABSENT magic key is never confused with NOVA's
+//   dict-missing-key default of 0) AND the magic key's value matching a
+//   fixed 64-bit constant EXACTLY, with a `type_of` guard before ever
+//   comparing that magic value against an int — never a key-name-only
+//   match. An ordinary user dict with the wrapper's key name (any value,
+//   including a string, a wrong magic value, or no magic key at all)
+//   always falls through to a real embedded document (0x03) and round-
+//   trips as that dict, never as the wrapped scalar type — see the KAT
+//   `bson_null_sentinel_collision_safe` (bson_null, pre-existing) and
+//   `_kat_bson_fix.nova` (bson_bool/bson_long, this fix).
 //
 // DECODE mapping
 //   double -> NOVA float ; string -> NOVA string ; embedded doc -> NOVA dict
@@ -239,17 +250,30 @@ fn _bs_type_and_value(v) -> any
             tb = 0x05
             vb = _bs_enc_binary(v)
         else if t == "dict"
-            let ks = keys(v)
-            if len(ks) == 1 and ks[0] == "$bsonBool"
+            if _bs_is_bool_marker(v) == 1
                 tb = 0x08
                 let bv = v["$bsonBool"]
                 let bbyte = 0
-                if bv != 0
-                    bbyte = 1
+                // Type-guard before the any==int compare: entry into this
+                // branch already proves the exact 2-key+magic shape, so bv
+                // IS an int for any real bson_bool() output — the guard is
+                // defensive belt-and-suspenders against a future producer
+                // of this exact shape that doesn't go through bson_bool().
+                if type_of(bv) == "int"
+                    if bv != 0
+                        bbyte = 1
                 vb = bytes_append(bytes_create(0), bbyte)
-            else if len(ks) == 1 and ks[0] == "$numberLong"
+            else if _bs_is_long_marker(v) == 1
                 tb = 0x12
-                vb = _bs_put_i64_le(bytes_create(0), v["$numberLong"])
+                let lv = v["$numberLong"]
+                if type_of(lv) == "int"
+                    vb = _bs_put_i64_le(bytes_create(0), lv)
+                else
+                    // Unreachable for a real bson_long() output (always
+                    // int) — defensive fallback so a hostile/malformed
+                    // producer of this exact 2-key+magic shape can never
+                    // drive the int64 bit-ops on a non-int value.
+                    vb = _bs_put_i64_le(bytes_create(0), 0)
             else if _bs_is_null_marker(v) == 1
                 // Explicit BSON null (0x0A). A BARE `null` value in a dict is stored by NOVA as raw 0 and is
                 // therefore indistinguishable from int 0, so it encodes as int32(0); use bson_null() to emit
@@ -454,7 +478,12 @@ fn bson_decode(b) -> any
     let sub = _bs_decode_document(b, 0)
     return sub[0]
 
-// ── explicit-type wrapper constructors (bool/int64 disambiguation) ─────────
+// ── explicit-type wrapper constructors (bool/int64/null disambiguation) ────
+// All three wrappers use the SAME collision-proof recognition rule as
+// std/encoding/plist.nova's plist_bool()/plist_null(): an EXACT 2-key shape
+// (the value key + a matching "...Magic" key) AND the magic key's value
+// matching a fixed 64-bit constant exactly — never a key-name-only match.
+// See SENTINEL-KEY COLLISION SAFETY in the header comment above.
 
 // bson_bool(v): wrap v so _bs_type_and_value encodes it as an explicit BSON
 // boolean (0x08) rather than the default int32 0/1. See header comment for
@@ -465,14 +494,65 @@ fn bson_bool(v) -> any
     if v != 0
         bbit = 1
     d["$bsonBool"] = bbit
+    d["$bsonBoolMagic"] = _bs_bool_magic()
     return d
+
+// _bs_bool_magic: fixed 64-bit magic constant carried on the SECOND key of
+// the bson_bool() sentinel dict, ASCII "BSONBOOL" read as a big-endian
+// 64-bit int — an arbitrary, human-recognizable constant an ordinary caller
+// would never happen to store as the value of a "$bsonBoolMagic" key by
+// coincidence. Same collision-hardening technique as _bs_null_magic() /
+// std/encoding/plist.nova's _plist_bool_magic().
+fn _bs_bool_magic() -> int
+    0x42534F4E424F4F4C
+
+// _bs_is_bool_marker: true iff `v` is exactly the bson_bool() sentinel — a
+// dict with EXACTLY 2 keys ("$bsonBool" and "$bsonBoolMagic") AND the magic
+// key's value matching _bs_bool_magic() exactly. Mirrors _bs_is_null_marker
+// below (see its comment for the full any==int fault rationale). A plain
+// user dict whose sole key is literally "$bsonBool" — 1 key, i.e. the magic
+// key is ABSENT, not merely mismatched — always fails the `contains()`
+// check and falls through to the ordinary embedded-document path.
+fn _bs_is_bool_marker(v: any) -> int
+    let ks = keys(v)
+    let result = 0
+    if len(ks) == 2 and contains(v, "$bsonBool") and contains(v, "$bsonBoolMagic")
+        if type_of(v["$bsonBoolMagic"]) == "int"
+            if v["$bsonBoolMagic"] == _bs_bool_magic()
+                result = 1
+    return result
 
 // bson_long(v): wrap v so _bs_type_and_value always encodes it as BSON
 // int64 (0x12), overriding the default magnitude-based int32/int64 choice.
 fn bson_long(v) -> any
     let d = {}
     d["$numberLong"] = v
+    d["$numberLongMagic"] = _bs_long_magic()
     return d
+
+// _bs_long_magic: fixed 64-bit magic constant carried on the SECOND key of
+// the bson_long() sentinel dict, ASCII "BSONLONG" read as a big-endian
+// 64-bit int. Same technique as _bs_bool_magic().
+fn _bs_long_magic() -> int
+    0x42534F4E4C4F4E47
+
+// _bs_is_long_marker: true iff `v` is exactly the bson_long() sentinel — a
+// dict with EXACTLY 2 keys ("$numberLong" and "$numberLongMagic") AND the
+// magic key's value matching _bs_long_magic() exactly (same type-guard
+// rationale as _bs_is_bool_marker). Critically, this also protects a
+// GENUINE document field shaped like MongoDB's own Extended JSON convention
+// {"$numberLong": "<decimal string>"} — that field is a STRING there, not
+// an int — from ever being handed to int64 bit-ops (`_bs_put_i64_le` does
+// `v & 0xFF`, `v >> 8`, ...) on a non-int value: under the old name-only
+// check that string would have matched and crashed encoding it as an int.
+fn _bs_is_long_marker(v: any) -> int
+    let ks = keys(v)
+    let result = 0
+    if len(ks) == 2 and contains(v, "$numberLong") and contains(v, "$numberLongMagic")
+        if type_of(v["$numberLongMagic"]) == "int"
+            if v["$numberLongMagic"] == _bs_long_magic()
+                result = 1
+    return result
 
 // _bs_null_magic: fixed 64-bit magic constant carried on the SECOND key of
 // the bson_null() sentinel dict, ASCII "BSONNULL" read as a big-endian
