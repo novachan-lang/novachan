@@ -25,3 +25,6 @@ any-float returns raw bits · imported builtin-name-collision method resolution 
 | # | Change | Plan task | Files | Type | Test at end (KAT) | Status |
 |---|--------|-----------|-------|------|-------------------|--------|
 | — | *(master baseline `a0569ef8` — everything up to here already gated/tested)* | — | — | — | — | ✅ GATED |
+| 1 | std/core/validate — Result validators (v_check/required/min_len/max_len/in_range/matches/all/errors/field) | higher-level stdlib (cap-gap) | std/core/validate.nova (+compiler copy) | lib | `_kat_validate` | UNTESTED (adversary CONFIRMED) |
+| 2 | std/core/tree — generic n-ary tree (t_map/fold/values/leaves/depth/count/find→Option) | higher-level stdlib | std/core/tree.nova (+copy) | lib | `_kat_tree` | UNTESTED (KAT green) |
+| 3 | std/text/template — dynamic {key} templating (tpl_render→Result/render_default/keys/fill) | higher-level stdlib | std/text/template.nova (+copy) | lib | `_kat_template` | UNTESTED — ⚠ adversary-verify ERRORED, self-KAT-verified only; SCRUTINIZE at end-test |
