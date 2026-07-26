@@ -29,11 +29,17 @@ runtime/platform reach = the ACTIVE front** — recently landed: module non-scal
 Windows TLS server (`3c1f746d`), signals+file-perms (`2ce90c6d`), HTTP redirects+cookies (`e11935a3`), pkg
 lockfile (`dcd8fae8`), REPL fix (`2543df3c`). Also this session: OPERATING_MODEL + NOVA_LANGUAGE_FEATURES.md.
 
-**Last done:** DOGFOOD CYCLE 1 — float/bool/format-spec **string-interpolation soundness** fix (see Stream-1
-row). A 5-app dogfooding fleet surfaced a CLUSTER of silent float-corruption bugs: `"{f}"`/`"{f:.2f}"`/`"{bool}"`
-rendered the raw IEEE-754 int64 bits (150.0 → 4639481672377565184). Root = a raw float reaching an `any`-widen
-point that failed to box it (the runtime invariant is "floats are ALWAYS boxed in `any` context"). This is 0-A
-soundness (silent wrong-result). Reconverged gen5==gen6, both-mode, KAT `_kat_interp_float`.
+**Last done (overnight dogfood-driven 0-A soundness campaign — 5 fixes across 4 gated batches):**
+`3f867230` interpolation float/bool/format-spec · `b5860bd6` Result/Option float payload + multi-arg generic
+annotation comma-drop · `4009d0eb` inline `catch e =>` · batch 4 (gating) closure-float-capture (R2 #13) + `T?`
+in struct-field/let (R2 #3). Two dogfooding fleets ran (round 1 = the float-boxing cluster; round 2 =
+generics/traits/closures/text/recursion/ADTs — see `project_dogfood_round2_gaps` memory). Unifying root of the
+float class = a raw float at an `any`-widen point that fails to box; the specific trap = `ir_collect_param_types`
+gives any-storing runtime fns a concrete-`float` fpt entry → the boxing branch wrongly skips them.
+**DEFERRED (delicate, fully diagnosed, NOT rushed — need focused sessions):** map/HOF lambda float corruption
+(root: untyped HOF lambda param → field_get typ=any; `ir_list_elem_struct` is the missing piece) + sum + the
+round-2 delicate cluster (enum/ADT unify, match-codegen soundness #7/#8, two runtime crashes #19/#20, trait-as-
+param #11). **STRATEGIC (owner's call): LOCK-4 sized/unsigned + f32/f16** — still the #1 plan item, XL.
 
 **DOGFOOD CAMPAIGN (active) — the same root recurs at several widen points; fixing in cycles:**
 - ✅ CYCLE 1: interpolation `any_to_str`/`format_one` (DONE `3f867230`).
@@ -82,6 +88,8 @@ but not the strategic bottleneck.
 | **DOGFOOD C3-F: `ok`/`err`/`some` float payload stored unboxed → match reads raw int64 bits** | 0-A | A | ✅ DONE (batch 2; reconverge + both-mode + KAT `_kat_result_float`) — `ok(9.99)` payload read as 4621813488089437307; context-sensitive (a 2nd Result fn conflict-merged `fpt["nova_rt_ok"]` to `any` and hid it). Fix: exclude ok/err/some from the fpt-boxing branch + box their raw-float payload in the combined any-store branch (same trap as `format_one`). | (batch 2) |
 | **DOGFOOD Cluster-B: multi-arg generic annotations drop the comma** | 0-A | C | ✅ DONE (batch 2; KAT `_kat_generic_annot`) — `Result<int,string>`→`Result<intstring>` ("expected intstring"), `dict<string,int>`→`dict<stringint>`. Comma tokenized `COMMA` but param(2582)/ret(2638)/alias(2763) generic-capture loops checked `DELIM` and dropped it; `Result<int>` (no comma) worked. Fix: 3× `DELIM`→`COMMA` (`ti_split_type_args` already split on the restored comma). | (batch 2) |
 | **DOGFOOD Cluster-C: inline `EXPR catch e => handler` fails to parse** | 0-A | C | ✅ DONE (batch 3; KAT `_kat_catch`) — the Pratt-parser inline-handler path never consumed the `=>` → "unexpected FAT_ARROW '=>'". Fix: consume the optional FAT_ARROW before parsing the handler (additive; `catch e handler` without arrow still works). Reconverge-safe. REMAINS: bare multi-line catch as implicit-return (deferred, narrow). | (batch 3) |
+| **DOGFOOD R2 #13: closure capturing a scalar FLOAT → raw int64 bits** | 0-A | A | ✅ DONE (batch 4; KAT `_kat_closure_float`) — `let rate=1.5; fn() rate` → 4609434218613702656. Captures are stored `any` + read back untyped inside the closure (same widen-point class). Fix: box a float capture at `make_closure` (~8688, guarded `ir_locals[cap]=="float"`; struct/int/string/list captures unchanged). Reconverge-safe. | (batch 4) |
+| **DOGFOOD R2 #3: `T?` optional sugar rejected in struct-field / `let` annotation** | 0-A | C | ✅ DONE (batch 4; KAT `_kat_opt_sugar`) — only param/return positions handled `?`; `x: int?` / `let x: int? = some(5)` gave spurious 'missing closing )'. Fix: capture the `?` suffix in the field-type (2 branches) + let-type parsers (mirrors param ~2594; `ti_ann_to_type_g`→Option). The `T?` path works e2e (does NOT hit the separate explicit-`Option<int>` unify bug, R2 #4). | (batch 4) |
 | module-level NON-scalar/non-literal/MUTABLE globals still per-fn copies | 0-A | B(XL) | ✅ DONE `ccb70ba6` (GAP 5) — self-contained top-level `let cache={}`/`[]`/`channel()` baked into the const-store (const_set prologue, const_get at every use — named fns/lambdas/nova_main); capture-exclusion fixed the green_scale_test N>1 race. Reconverged, both-mode 0-FAIL, N>1 clean. | ccb70ba6 |
 | ~~floor()/ceil() boxed-float corrupts layout~~ | 0-A | — | ❌ NOT A BUG — nova_rt_floor returns clean `(int64_t)floor(x)`, typed int. Agent misdiagnosed; float_to_int helped an unrelated float-slot issue. | |
 | multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ⬜ NEW (whole import yields 0 symbols; use single-line/if-chain; found via calendar) | |
