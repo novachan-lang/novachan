@@ -13204,7 +13204,10 @@ fn ti_infer_expr_inner(st: TiState, expr: Expr) -> NType
                             if rtag == "ident" and contains(st.ti_modules, rval)
                                 let mod_fns = st.ti_modules[rval]
                                 if contains(mod_fns, value)
-                                    let mfn_t = mod_fns[value]
+                                    // finding #4: freshen the module fn's type per call site so a
+                                    // polymorphic imported fn (now carrying generic vars) is NOT pinned
+                                    // by the first mod.func call. Non-generic types generalize to [] = no-op.
+                                    let mfn_t = ti_instantiate(st, ti_generalize(st, mod_fns[value]))
                                     let arg_types = []
                                     let mai = 1
                                     while mai < len(children)
@@ -14380,25 +14383,40 @@ fn ti_infer_program_named(stmts: list, source_lines: list, filename: string) -> 
                                             // preserves loose/gradually-typed code (an arg the inferer types
                                             // as `any` still unifies with a typed param) -> only a CONCRETE
                                             // mismatch is rejected.
+                                            // finding #4: type the imported fn's generic params through a
+                                            // fresh-var gmap (mirroring the same-file mechanism ~13481-13485)
+                                            // so a bare `T` / `Result<T,E>` param becomes a real type var,
+                                            // then register a POLYMORPHIC scheme (below) instead of ti_mono.
+                                            let mod_gnames = ti_extract_generics(man)
+                                            let mod_gmap = {}
+                                            for mgn in mod_gnames
+                                                mod_gmap[mgn] = ti_fresh(st)
                                             let mod_param_types = []
                                             for mp in mparams
                                                 match mp
                                                     Param(mpn, mpt, mpd) =>
                                                         if mpt != "" and mpt != "any"
-                                                            push(mod_param_types, ti_ann_to_type_g(st, mpt, {}))
+                                                            push(mod_param_types, ti_ann_to_type_g(st, mpt, mod_gmap))
                                                         else
                                                             push(mod_param_types, nt_any())
                                             let mod_ret_t = nt_any()
                                             match mexpr
                                                 Expr(mrt, mrv, mrn, mrc, mrf, mrl) =>
                                                     if mrt == "rettype" and mrv != "" and mrv != "any"
-                                                        mod_ret_t = ti_ann_to_type_g(st, mrv, {})
+                                                        mod_ret_t = ti_ann_to_type_g(st, mrv, mod_gmap)
                                             let fn_type = nt_fn(mod_param_types, mod_ret_t)
                                             if contains(fn_src_path, mname) and fn_src_path[mname] != mod_path
                                                 ti_error(st, "function '" + mname + "' is exported by two modules ('" + fn_src_mod[mname] + "' and '" + mod_alias + "') — NOVA modules share one flat namespace; rename one (e.g. prefix it with the module name)", msl)
                                             fn_src_path[mname] = mod_path
                                             fn_src_mod[mname] = mod_alias
-                                            ti_define(st, mname, ti_mono(fn_type))
+                                            // finding #4: generic imported fns get a POLYMORPHIC scheme
+                                            // (quantify the fresh generic vars, freshened per call site)
+                                            // exactly like same-file fns (13593-13595); non-generic stay mono.
+                                            if len(mod_gnames) > 0
+                                                let mod_resolved = ti_zonk(st, fn_type)
+                                                ti_define(st, mname, ti_generalize(st, mod_resolved))
+                                            else
+                                                ti_define(st, mname, ti_mono(fn_type))
                                             st.ti_min_arity[mname] = len(mparams)
                                             mod_fn_types[mname] = fn_type
                                             // L11/finding-#2: an imported `Type__method` fn must ALSO register in
