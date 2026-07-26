@@ -1,0 +1,826 @@
+// ============================================================================
+// NOVA Standard Library — std/media/jpeg
+// ============================================================================
+// BASELINE SEQUENTIAL DCT JFIF JPEG decoder.
+//
+// SCOPE (what this decoder supports — stated honestly)
+//   SUPPORTED:
+//     * Baseline sequential DCT, Huffman coded (SOF0 marker, 0xFFC0).
+//     * 8-bit sample precision.
+//     * 1-component grayscale  -> returns channels=1 (grey bytes).
+//     * 3-component YCbCr       -> returns channels=3 (RGB bytes, BT.601).
+//     * Chroma subsampling 4:4:4, 4:2:2, 4:2:0 (any Hi/Vi in 1..4 via a
+//       single interleaved scan). Chroma is upsampled by nearest-neighbour
+//       (box) replication — documented, exact for solid colour, and identical
+//       to full-res when 4:4:4.
+//     * Standard JFIF markers: SOI, APP0..APP15 (skipped), COM (skipped),
+//       DQT (8- and 16-bit quant tables, multiple per segment), SOF0,
+//       DHT (multiple tables per segment), DRI (restart interval), SOS,
+//       byte-stuffing (0xFF00 -> literal 0xFF), restart markers RST0..RST7,
+//       EOI.
+//
+//   NOT SUPPORTED (returns err(...), never crashes):
+//     * Progressive JPEG (SOF2) — err.
+//     * Extended sequential / lossless / differential / arithmetic coding
+//       (SOF1, SOF3, SOF5..SOF15, DAC) — err.
+//     * 12-bit precision — err.
+//     * 2- or 4-component (CMYK/YCCK) images — err.
+//     * Non-interleaved / multi-scan baseline (Ns != Nf) — err.
+//
+// PIPELINE
+//   markers -> DQT quant tables -> SOF0 frame -> DHT Huffman tables ->
+//   SOS scan header -> entropy decode MCUs (DC differential + AC RLE/zigzag,
+//   Huffman) -> dequantize -> inverse 8x8 DCT (separable float IDCT) ->
+//   level shift (+128) -> chroma upsample -> YCbCr->RGB -> pixels.
+//
+// INVERSE DCT
+//   Separable float IDCT. basis[u*8+x] = C(u)*cos((2x+1)*u*PI/16), C(0)=1/sqrt2.
+//   Row pass: tmp[v][x] = 0.5 * sum_u basis[u*8+x] * F[v*8+u]
+//   Col pass: f[y][x]   = 0.5 * sum_v basis[v*8+y] * tmp[v*8+x]
+//   then + 128, round, clamp 0..255. This is a correct (non-fast) reference
+//   IDCT; it matches an integer islow IDCT to within a couple of units.
+//
+// SECURITY
+//   * Dimensions come from the untrusted SOF0. Both are u16 (<= 65535) but are
+//     additionally capped at 16384/side and 16 megapixels TOTAL *before* any
+//     size multiply, so width*height*channels can never overflow i64 (max
+//     product < 8e8) and no oversized allocation is attempted. Component sample
+//     planes are separately capped at 64M samples.
+//   * Every table index (quant id 0..3, Huffman id 0..3, zigzag index) and
+//     every bitstream / bytes read is bounds-checked. Invalid Huffman codes,
+//     out-of-range coefficient runs and truncated streams all return err(...).
+//   * The decoder never calls exit() and never reads/writes out of bounds.
+//
+// PUBLIC API
+//   jpeg_decode(b) -> Result
+//     b is a `bytes` value holding a whole JPEG file. Returns
+//       ok({"width", "height", "channels", "pixels"})
+//     where channels is 1 (grey) or 3 (RGB) and pixels is a flat row-major
+//     `bytes` value (channels bytes/pixel). Returns err(msg) on any malformed
+//     or unsupported input.
+//
+// All private helpers are prefixed _jpg_ to avoid link collisions.
+// ============================================================================
+
+// ── Build a length-n int list of zeros ──────────────────────────────────────
+fn _jpg_zeros(n) -> list
+    let z = []
+    let i = 0
+    while i < n
+        push(z, 0)
+        i = i + 1
+    z
+
+// ── PI (module-level float constant via zero-arg fn, per NOVA float rules) ───
+fn _jpg_pi() -> float
+    let v = 3.14159265358979
+    v
+
+// ── Standard JPEG zigzag order: zigzag index -> natural raster index (0..63) ─
+fn _jpg_zigzag() -> list
+    let z = []
+    push(z, 0)
+    push(z, 1)
+    push(z, 8)
+    push(z, 16)
+    push(z, 9)
+    push(z, 2)
+    push(z, 3)
+    push(z, 10)
+    push(z, 17)
+    push(z, 24)
+    push(z, 32)
+    push(z, 25)
+    push(z, 18)
+    push(z, 11)
+    push(z, 4)
+    push(z, 5)
+    push(z, 12)
+    push(z, 19)
+    push(z, 26)
+    push(z, 33)
+    push(z, 40)
+    push(z, 48)
+    push(z, 41)
+    push(z, 34)
+    push(z, 27)
+    push(z, 20)
+    push(z, 13)
+    push(z, 6)
+    push(z, 7)
+    push(z, 14)
+    push(z, 21)
+    push(z, 28)
+    push(z, 35)
+    push(z, 42)
+    push(z, 49)
+    push(z, 56)
+    push(z, 57)
+    push(z, 50)
+    push(z, 43)
+    push(z, 36)
+    push(z, 29)
+    push(z, 22)
+    push(z, 15)
+    push(z, 23)
+    push(z, 30)
+    push(z, 37)
+    push(z, 44)
+    push(z, 51)
+    push(z, 58)
+    push(z, 59)
+    push(z, 52)
+    push(z, 45)
+    push(z, 38)
+    push(z, 31)
+    push(z, 39)
+    push(z, 46)
+    push(z, 53)
+    push(z, 60)
+    push(z, 61)
+    push(z, 54)
+    push(z, 47)
+    push(z, 55)
+    push(z, 62)
+    push(z, 63)
+    z
+
+// ── Precompute the IDCT cosine basis: basis[u*8+x] = C(u)*cos((2x+1)u*PI/16) ──
+fn _jpg_build_basis() -> list
+    let pi = _jpg_pi()
+    let b = []
+    let u = 0
+    while u < 8
+        let cu = 1.0
+        if u == 0
+            cu = 0.70710678118654752
+        let x = 0
+        while x < 8
+            let ang = (2.0 * (x * 1.0) + 1.0) * (u * 1.0) * pi / 16.0
+            let bv = cu * cos(ang)
+            push(b, bv)
+            x = x + 1
+        u = u + 1
+    b
+
+// ── Build a canonical Huffman decode table from BITS counts + symbol values ──
+// counts: 16 ints (counts[0] = number of length-1 codes .. counts[15] len-16).
+// vals:   the HUFFVAL symbol list (sum(counts) entries).
+// Returns [mincode, maxcode, valptr, vals], each of mincode/maxcode/valptr a
+// 17-entry list indexed by code length 1..16 (index 0 unused). maxcode[l] = -1
+// when no code of length l exists. (JPEG Annex F.2.2.3 derived tables.)
+fn _jpg_build_huff(counts, vals) -> list
+    let mincode = _jpg_zeros(17)
+    let maxcode = _jpg_zeros(17)
+    let valptr = _jpg_zeros(17)
+    let d = 1
+    while d <= 16
+        maxcode[d] = 0 - 1
+        d = d + 1
+    let code = 0
+    let p = 0
+    let l = 1
+    while l <= 16
+        let c = counts[l - 1]
+        if c > 0
+            valptr[l] = p
+            mincode[l] = code
+            code = code + c
+            maxcode[l] = code - 1
+            p = p + c
+        code = code << 1
+        l = l + 1
+    let tab = []
+    push(tab, mincode)
+    push(tab, maxcode)
+    push(tab, valptr)
+    push(tab, vals)
+    tab
+
+// ── Bit reader over the entropy-coded segment ────────────────────────────────
+// br is a mutable 5-list: [data(bytes), pos(int), curbyte(int), bitcnt(int),
+// marker(int)]. Bits are consumed MSB-first. Handles 0xFF00 byte-stuffing
+// (literal 0xFF) and latches any real marker (>0) or EOF (-1) in br[4], after
+// which further reads yield padding zero bits (bounded — callers stop by MCU
+// count / by returning err on invalid codes).
+fn _jpg_fill(br) -> int
+    if br[4] != 0
+        br[2] = 0
+        br[3] = 8
+        return 0
+    let data = br[0]
+    let pos = br[1]
+    let n = bytes_len(data)
+    if pos >= n
+        br[4] = 0 - 1
+        br[2] = 0
+        br[3] = 8
+        return 0
+    let bb = bytes_get(data, pos)
+    if bb == 255
+        let b2 = 0
+        if pos + 1 < n
+            b2 = bytes_get(data, pos + 1)
+        if b2 == 0
+            br[1] = pos + 2
+            br[2] = 255
+            br[3] = 8
+            return 0
+        else
+            br[4] = b2
+            br[2] = 0
+            br[3] = 8
+            return 0
+    br[1] = pos + 1
+    br[2] = bb
+    br[3] = 8
+    0
+
+fn _jpg_getbit(br) -> int
+    if br[3] == 0
+        _jpg_fill(br)
+    // Robustness (adversary-verify fix): once the stream is latched (marker OR EOF), every
+    // bit read is padding-zero. If a padding bit is CONSUMED as coefficient data, the decode
+    // is running past real entropy -> flag it so the post-MCU guard rejects the garbage. A
+    // valid file completes every code on real bits, so this only fires on truncated/corrupt
+    // input (the naive `br[4] != 0` at the guard mis-fires on a benign trailing-marker peek).
+    if br[4] != 0
+        br[5] = 1
+    let nb = br[3] - 1
+    br[3] = nb
+    let bit = (br[2] >> nb) & 1
+    bit
+
+fn _jpg_getbits(br, cnt) -> int
+    let v = 0
+    let i = 0
+    while i < cnt
+        let bit = _jpg_getbit(br)
+        v = (v << 1) | bit
+        i = i + 1
+    v
+
+// receive_and_extend (JPEG F.2.2.1): read s bits, sign-extend to a signed value.
+fn _jpg_extend(br, s) -> int
+    if s == 0
+        return 0
+    let v = _jpg_getbits(br, s)
+    let half = 1 << (s - 1)
+    if v < half
+        v = v - (1 << s) + 1
+    v
+
+// Decode one Huffman symbol; returns the symbol (0..255) or -1 on invalid code.
+fn _jpg_decode_huff(br, tab) -> int
+    let mincode = tab[0]
+    let maxcode = tab[1]
+    let valptr = tab[2]
+    let vals = tab[3]
+    let code = 0
+    let l = 0
+    let out = 0 - 1
+    let running = 1
+    while running == 1 and l < 16
+        l = l + 1
+        let bit = _jpg_getbit(br)
+        code = (code << 1) | bit
+        let mx = maxcode[l]
+        if mx >= 0
+            if code <= mx
+                let idx = valptr[l] + (code - mincode[l])
+                if idx < 0 or idx >= len(vals)
+                    running = 0
+                else
+                    out = vals[idx]
+                    running = 0
+    out
+
+// ── Separable float inverse DCT: 64 dequantized coeffs (natural order) ───────
+// -> 64 level-shifted, clamped 0..255 sample ints.
+fn _jpg_idct(coef, basis) -> list
+    let tmp = []
+    let i = 0
+    while i < 64
+        push(tmp, 0.0)
+        i = i + 1
+    let v = 0
+    while v < 8
+        let x = 0
+        while x < 8
+            let sum = 0.0
+            let u = 0
+            while u < 8
+                let bux = basis[u * 8 + x] * 1.0
+                let fvu = coef[v * 8 + u] * 1.0
+                let term = bux * fvu
+                sum = sum + term
+                u = u + 1
+            tmp[v * 8 + x] = 0.5 * sum
+            x = x + 1
+        v = v + 1
+    let out = _jpg_zeros(64)
+    let x2 = 0
+    while x2 < 8
+        let y = 0
+        while y < 8
+            let sum2 = 0.0
+            let vv = 0
+            while vv < 8
+                let bvy = basis[vv * 8 + y] * 1.0
+                let tvx = tmp[vv * 8 + x2] * 1.0
+                let term2 = bvy * tvx
+                sum2 = sum2 + term2
+                vv = vv + 1
+            let pixf = 0.5 * sum2 + 128.0
+            let iv = 0
+            if pixf <= 0.0
+                iv = 0
+            else if pixf >= 255.0
+                iv = 255
+            else
+                iv = int(pixf + 0.5)
+            out[y * 8 + x2] = iv
+            y = y + 1
+        x2 = x2 + 1
+    out
+
+// ── Decode ONE 8x8 block: DC + AC, dequantize, IDCT ─────────────────────────
+// Returns a 64-int sample list on success, or [] (len 0) on any decode error.
+// dc_pred[cidx] is updated in place (DC differential predictor).
+fn _jpg_decode_block(br, dctab, actab, qtab, zz, dc_pred, cidx, basis) -> list
+    let coef = _jpg_zeros(64)
+    let t = _jpg_decode_huff(br, dctab)
+    if t < 0
+        return []
+    if t > 15
+        return []
+    let diff = 0
+    if t > 0
+        diff = _jpg_extend(br, t)
+    let pred = dc_pred[cidx]
+    let dc = pred + diff
+    dc_pred[cidx] = dc
+    let q0 = qtab[0]
+    coef[0] = dc * q0
+    let k = 1
+    while k < 64
+        let rs = _jpg_decode_huff(br, actab)
+        if rs < 0
+            return []
+        let r = (rs >> 4) & 15
+        let s = rs & 15
+        if s == 0
+            if r == 15
+                k = k + 16
+            else
+                k = 64
+        else
+            k = k + r
+            if k > 63
+                return []
+            let acv = _jpg_extend(br, s)
+            let qk = qtab[k]
+            let nat = zz[k]
+            coef[nat] = acv * qk
+            k = k + 1
+    let samp = _jpg_idct(coef, basis)
+    samp
+
+// ── Copy an 8x8 sample block into a component plane at (col0,row0) ───────────
+fn _jpg_place(plane, pw, ph, col0, row0, samp) -> int
+    let yy = 0
+    while yy < 8
+        let py = row0 + yy
+        if py < ph
+            let xx = 0
+            while xx < 8
+                let px = col0 + xx
+                if px < pw
+                    let sval = samp[yy * 8 + xx]
+                    plane[py * pw + px] = sval
+                xx = xx + 1
+        yy = yy + 1
+    0
+
+// ── Restart resync: byte-align, skip to & consume the next RSTn marker ───────
+// Returns 1 if an RST0..RST7 marker was consumed, 2 if a different marker was
+// hit first, 0 on EOF. Clears any latched marker and buffered bits.
+fn _jpg_restart(br) -> int
+    br[2] = 0
+    br[3] = 0
+    let data = br[0]
+    let pos = br[1]
+    let n = bytes_len(data)
+    let found = 0
+    while pos + 1 < n and found == 0
+        let bb = bytes_get(data, pos)
+        if bb == 255
+            let m = bytes_get(data, pos + 1)
+            if m >= 208 and m <= 215
+                pos = pos + 2
+                found = 1
+            else if m == 0
+                pos = pos + 2
+            else
+                found = 2
+        else
+            pos = pos + 1
+    br[1] = pos
+    br[4] = 0
+    br[5] = 0   // a successful RST resync resumes VALID data; any benign latched-peek starvation is cleared
+    found
+
+// ── Clamp a float to an int in 0..255 (round-to-nearest) ─────────────────────
+fn _jpg_clampf(f) -> int
+    let v = 0
+    if f <= 0.0
+        v = 0
+    else if f >= 255.0
+        v = 255
+    else
+        v = int(f + 0.5)
+    v
+
+// ── jpeg_decode: decode a whole baseline JPEG file ──────────────────────────
+fn jpeg_decode(b) -> Result
+    let n = bytes_len(b)
+    if n < 2
+        return err("jpeg_decode: data too short")
+    if bytes_get(b, 0) != 255 or bytes_get(b, 1) != 216
+        return err("jpeg_decode: missing SOI marker (not a JPEG)")
+    // Quant tables (4 slots), Huffman DC/AC tables (4 slots each). Absent = [].
+    let qtables = []
+    let dc_tabs = []
+    let ac_tabs = []
+    let si0 = 0
+    while si0 < 4
+        push(qtables, [])
+        push(dc_tabs, [])
+        push(ac_tabs, [])
+        si0 = si0 + 1
+    let frame_ok = 0
+    let width = 0
+    let height = 0
+    let ncomp = 0
+    let comp_id = []
+    let comp_h = []
+    let comp_v = []
+    let comp_q = []
+    let restart_interval = 0
+    let p = 2
+    let done = 0
+    while done == 0 and p + 1 < n
+        let m0 = bytes_get(b, p)
+        if m0 != 255
+            p = p + 1
+        else
+            let mp = p + 1
+            while mp < n and bytes_get(b, mp) == 255
+                mp = mp + 1
+            if mp >= n
+                done = 1
+            else
+                let marker = bytes_get(b, mp)
+                p = mp + 1
+                if marker == 217
+                    done = 1
+                else if marker == 216
+                    p = p
+                else if marker >= 208 and marker <= 215
+                    p = p
+                else
+                    if p + 1 >= n
+                        return err("jpeg_decode: truncated segment length")
+                    let seglen = (bytes_get(b, p) << 8) | bytes_get(b, p + 1)
+                    if seglen < 2
+                        return err("jpeg_decode: invalid segment length")
+                    let segstart = p + 2
+                    let segend = p + seglen
+                    if segend > n
+                        return err("jpeg_decode: segment length exceeds file")
+                    if marker == 219
+                        // DQT — one or more quant tables
+                        let dp = segstart
+                        while dp < segend
+                            let pqtq = bytes_get(b, dp)
+                            dp = dp + 1
+                            let pq = (pqtq >> 4) & 15
+                            let tq = pqtq & 15
+                            if tq > 3
+                                return err("jpeg_decode: DQT table id out of range")
+                            let qt = _jpg_zeros(64)
+                            if pq == 0
+                                if dp + 64 > segend
+                                    return err("jpeg_decode: DQT (8-bit) truncated")
+                                let z = 0
+                                while z < 64
+                                    qt[z] = bytes_get(b, dp + z)
+                                    z = z + 1
+                                dp = dp + 64
+                            else if pq == 1
+                                if dp + 128 > segend
+                                    return err("jpeg_decode: DQT (16-bit) truncated")
+                                let z = 0
+                                while z < 64
+                                    let hi = bytes_get(b, dp + z * 2)
+                                    let lo = bytes_get(b, dp + z * 2 + 1)
+                                    qt[z] = (hi << 8) | lo
+                                    z = z + 1
+                                dp = dp + 128
+                            else
+                                return err("jpeg_decode: DQT invalid precision")
+                            qtables[tq] = qt
+                    else if marker == 196
+                        // DHT — one or more Huffman tables
+                        let hp = segstart
+                        while hp < segend
+                            let tcth = bytes_get(b, hp)
+                            hp = hp + 1
+                            let tc = (tcth >> 4) & 15
+                            let th = tcth & 15
+                            if th > 3
+                                return err("jpeg_decode: DHT table id out of range")
+                            if tc > 1
+                                return err("jpeg_decode: DHT table class out of range")
+                            if hp + 16 > segend
+                                return err("jpeg_decode: DHT counts truncated")
+                            let counts = []
+                            let total = 0
+                            let z = 0
+                            while z < 16
+                                let cc = bytes_get(b, hp + z)
+                                push(counts, cc)
+                                total = total + cc
+                                z = z + 1
+                            hp = hp + 16
+                            if total > 256
+                                return err("jpeg_decode: DHT symbol count invalid")
+                            if hp + total > segend
+                                return err("jpeg_decode: DHT symbols truncated")
+                            let vals = []
+                            let z2 = 0
+                            while z2 < total
+                                push(vals, bytes_get(b, hp + z2))
+                                z2 = z2 + 1
+                            hp = hp + total
+                            let tab = _jpg_build_huff(counts, vals)
+                            if tc == 0
+                                dc_tabs[th] = tab
+                            else
+                                ac_tabs[th] = tab
+                    else if marker == 221
+                        // DRI — restart interval
+                        if segend - segstart >= 2
+                            restart_interval = (bytes_get(b, segstart) << 8) | bytes_get(b, segstart + 1)
+                    else if marker == 192
+                        // SOF0 — baseline frame header
+                        if segend - segstart < 6
+                            return err("jpeg_decode: SOF0 header truncated")
+                        let precision = bytes_get(b, segstart)
+                        if precision != 8
+                            return err("jpeg_decode: only 8-bit precision supported")
+                        height = (bytes_get(b, segstart + 1) << 8) | bytes_get(b, segstart + 2)
+                        width = (bytes_get(b, segstart + 3) << 8) | bytes_get(b, segstart + 4)
+                        ncomp = bytes_get(b, segstart + 5)
+                        if width == 0 or height == 0
+                            return err("jpeg_decode: zero width or height")
+                        if width > 16384 or height > 16384
+                            return err("jpeg_decode: dimensions exceed 16384/side limit")
+                        if width * height > 16777216
+                            return err("jpeg_decode: image exceeds 16 megapixel limit")
+                        if ncomp != 1 and ncomp != 3
+                            return err("jpeg_decode: only 1 (grey) or 3 (YCbCr) components supported")
+                        if segend - segstart < 6 + ncomp * 3
+                            return err("jpeg_decode: SOF0 component data truncated")
+                        comp_id = []
+                        comp_h = []
+                        comp_v = []
+                        comp_q = []
+                        let ci = 0
+                        while ci < ncomp
+                            let base = segstart + 6 + ci * 3
+                            let cid = bytes_get(b, base)
+                            let hv = bytes_get(b, base + 1)
+                            let chh = (hv >> 4) & 15
+                            let cvv = hv & 15
+                            let cqq = bytes_get(b, base + 2)
+                            if chh < 1 or chh > 4 or cvv < 1 or cvv > 4
+                                return err("jpeg_decode: invalid component sampling factor")
+                            if cqq > 3
+                                return err("jpeg_decode: invalid quant-table selector in SOF0")
+                            push(comp_id, cid)
+                            push(comp_h, chh)
+                            push(comp_v, cvv)
+                            push(comp_q, cqq)
+                            ci = ci + 1
+                        frame_ok = 1
+                    else if marker == 194
+                        return err("jpeg_decode: progressive JPEG (SOF2) not supported")
+                    else if marker == 193
+                        return err("jpeg_decode: extended-sequential JPEG (SOF1) not supported")
+                    else if marker >= 195 and marker <= 207
+                        return err("jpeg_decode: unsupported SOF/DAC marker (lossless/arithmetic/differential)")
+                    else if marker == 218
+                        // SOS — scan header, then decode the entropy segment.
+                        if frame_ok == 0
+                            return err("jpeg_decode: SOS before SOF0")
+                        let ns = bytes_get(b, segstart)
+                        if ns != ncomp
+                            return err("jpeg_decode: only single interleaved scan supported")
+                        if segend - segstart < 1 + ns * 2 + 3
+                            return err("jpeg_decode: SOS header truncated")
+                        let scan_dc = _jpg_zeros(ncomp)
+                        let scan_ac = _jpg_zeros(ncomp)
+                        let sci = 0
+                        while sci < ns
+                            let cs = bytes_get(b, segstart + 1 + sci * 2)
+                            let tdta = bytes_get(b, segstart + 1 + sci * 2 + 1)
+                            let td = (tdta >> 4) & 15
+                            let ta = tdta & 15
+                            if td > 3 or ta > 3
+                                return err("jpeg_decode: scan Huffman selector out of range")
+                            let fnd = 0 - 1
+                            let fi = 0
+                            while fi < ncomp
+                                if comp_id[fi] == cs
+                                    fnd = fi
+                                fi = fi + 1
+                            if fnd < 0
+                                return err("jpeg_decode: scan references unknown component id")
+                            scan_dc[fnd] = td
+                            scan_ac[fnd] = ta
+                            sci = sci + 1
+                        let sspos = segstart + 1 + ns * 2
+                        let ss = bytes_get(b, sspos)
+                        let se = bytes_get(b, sspos + 1)
+                        let ahal = bytes_get(b, sspos + 2)
+                        if ss != 0 or se != 63 or ahal != 0
+                            return err("jpeg_decode: non-baseline scan (spectral selection / successive approx)")
+                        // Frame geometry.
+                        let hmax = 1
+                        let vmax = 1
+                        let gi = 0
+                        while gi < ncomp
+                            if comp_h[gi] > hmax
+                                hmax = comp_h[gi]
+                            if comp_v[gi] > vmax
+                                vmax = comp_v[gi]
+                            gi = gi + 1
+                        let mcu_w = 8 * hmax
+                        let mcu_h = 8 * vmax
+                        let mcus_x = (width + mcu_w - 1) / mcu_w
+                        let mcus_y = (height + mcu_h - 1) / mcu_h
+                        // Allocate component planes (size-guarded).
+                        let planes = []
+                        let plane_w = []
+                        let plane_h = []
+                        let pk = 0
+                        while pk < ncomp
+                            let pw = mcus_x * comp_h[pk] * 8
+                            let ph = mcus_y * comp_v[pk] * 8
+                            if pw * ph > 67108864
+                                return err("jpeg_decode: component plane exceeds size limit")
+                            let plane = _jpg_zeros(pw * ph)
+                            push(planes, plane)
+                            push(plane_w, pw)
+                            push(plane_h, ph)
+                            pk = pk + 1
+                        let zz = _jpg_zigzag()
+                        let basis = _jpg_build_basis()
+                        let br = []
+                        push(br, b)
+                        push(br, segend)
+                        push(br, 0)
+                        push(br, 0)
+                        push(br, 0)
+                        push(br, 0)   // br[5] = starved: 1 iff a padding bit was CONSUMED as coefficient data
+                        let dc_pred = _jpg_zeros(ncomp)
+                        let mcu_count = 0
+                        let my = 0
+                        while my < mcus_y
+                            let mx = 0
+                            while mx < mcus_x
+                                if restart_interval > 0 and mcu_count > 0
+                                    if (mcu_count % restart_interval) == 0
+                                        let rr = _jpg_restart(br)
+                                        if rr != 1
+                                            return err("jpeg_decode: restart marker resync failed")
+                                        let ri = 0
+                                        while ri < ncomp
+                                            dc_pred[ri] = 0
+                                            ri = ri + 1
+                                let c = 0
+                                while c < ncomp
+                                    let cmh = comp_h[c]
+                                    let cmv = comp_v[c]
+                                    let qtab = qtables[comp_q[c]]
+                                    let dctab = dc_tabs[scan_dc[c]]
+                                    let actab = ac_tabs[scan_ac[c]]
+                                    if len(qtab) == 0 or len(dctab) == 0 or len(actab) == 0
+                                        return err("jpeg_decode: scan references a missing quant/Huffman table")
+                                    let pw = plane_w[c]
+                                    let ph = plane_h[c]
+                                    let plane = planes[c]
+                                    let by = 0
+                                    while by < cmv
+                                        let bx = 0
+                                        while bx < cmh
+                                            let samp = _jpg_decode_block(br, dctab, actab, qtab, zz, dc_pred, c, basis)
+                                            if len(samp) != 64
+                                                return err("jpeg_decode: entropy decode error (invalid Huffman code or run)")
+                                            let col0 = (mx * cmh + bx) * 8
+                                            let row0 = (my * cmv + by) * 8
+                                            _jpg_place(plane, pw, ph, col0, row0, samp)
+                                            bx = bx + 1
+                                        by = by + 1
+                                    c = c + 1
+                                mcu_count = mcu_count + 1
+                                mx = mx + 1
+                            my = my + 1
+                        if br[5] == 1
+                            return err("jpeg_decode: truncated or corrupt entropy data (padding consumed during decode)")
+                        // Assemble output pixels.
+                        let channels = ncomp
+                        let outlen = width * height * channels
+                        let pixels = bytes_create(outlen)
+                        if ncomp == 1
+                            let pw0 = plane_w[0]
+                            let ph0 = plane_h[0]
+                            let plane0 = planes[0]
+                            let h0 = comp_h[0]
+                            let v0 = comp_v[0]
+                            let y = 0
+                            while y < height
+                                let x = 0
+                                while x < width
+                                    let cx = (x * h0) / hmax
+                                    let cy = (y * v0) / vmax
+                                    let gv = 0
+                                    if cx < pw0 and cy < ph0
+                                        gv = plane0[cy * pw0 + cx]
+                                    bytes_set(pixels, y * width + x, gv & 0xFF)
+                                    x = x + 1
+                                y = y + 1
+                        else
+                            let pwY = plane_w[0]
+                            let phY = plane_h[0]
+                            let planeY = planes[0]
+                            let pwB = plane_w[1]
+                            let phB = plane_h[1]
+                            let planeB = planes[1]
+                            let pwR = plane_w[2]
+                            let phR = plane_h[2]
+                            let planeR = planes[2]
+                            let hY = comp_h[0]
+                            let vY = comp_v[0]
+                            let hB = comp_h[1]
+                            let vB = comp_v[1]
+                            let hR = comp_h[2]
+                            let vR = comp_v[2]
+                            let y = 0
+                            while y < height
+                                let x = 0
+                                while x < width
+                                    let yx = (x * hY) / hmax
+                                    let yy2 = (y * vY) / vmax
+                                    let bx2 = (x * hB) / hmax
+                                    let byy = (y * vB) / vmax
+                                    let rx = (x * hR) / hmax
+                                    let ryy = (y * vR) / vmax
+                                    let yv = 0
+                                    if yx < pwY and yy2 < phY
+                                        yv = planeY[yy2 * pwY + yx]
+                                    let cbv = 128
+                                    if bx2 < pwB and byy < phB
+                                        cbv = planeB[byy * pwB + bx2]
+                                    let crv = 128
+                                    if rx < pwR and ryy < phR
+                                        crv = planeR[ryy * pwR + rx]
+                                    let yf = yv * 1.0
+                                    let cbc = cbv - 128
+                                    let crc = crv - 128
+                                    let cbf = cbc * 1.0
+                                    let crf = crc * 1.0
+                                    let rterm = 1.402 * crf
+                                    let rf = yf + rterm
+                                    let g1 = 0.344136 * cbf
+                                    let g2 = 0.714136 * crf
+                                    let gf = yf - g1 - g2
+                                    let bterm = 1.772 * cbf
+                                    let bf = yf + bterm
+                                    let rr = _jpg_clampf(rf)
+                                    let gg = _jpg_clampf(gf)
+                                    let bb2 = _jpg_clampf(bf)
+                                    let base = (y * width + x) * 3
+                                    bytes_set(pixels, base, rr)
+                                    bytes_set(pixels, base + 1, gg)
+                                    bytes_set(pixels, base + 2, bb2)
+                                    x = x + 1
+                                y = y + 1
+                        return ok({"width": width, "height": height, "channels": channels, "pixels": pixels})
+                    else
+                        // APPn (224..239), COM (254), or any other length-bearing
+                        // marker we don't need: skip its segment.
+                        p = p
+                    p = segend
+    err("jpeg_decode: no scan (SOS) marker found")
