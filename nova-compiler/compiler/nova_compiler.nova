@@ -1280,15 +1280,22 @@ fn parse_prefix(tokens: list, pos: int, pe: list) -> ParseResult
         // (full sized-type propagation + wrapping arithmetic is increment 2); a sized
         // literal that overflows its width is a clean parse error rather than a footgun.
         let _digits = val
+        let _isuf = ""
         let _hash = find(val, "#")
         if _hash != 0 - 1
             _digits = slice(val, 0, _hash)
-            let _suf = slice(val, _hash + 1, len(val))
-            let _mx = _num_suffix_max(_suf)
+            _isuf = slice(val, _hash + 1, len(val))
+            let _mx = _num_suffix_max(_isuf)
             if _mx >= 0 and int(_digits) > _mx
-                let _rc = syntax_error(tokens, pos, "integer literal '" + _digits + _suf + "' is out of range for " + _suf + " (max " + str(_mx) + ")", pe)
+                let _rc = syntax_error(tokens, pos, "integer literal '" + _digits + _isuf + "' is out of range for " + _isuf + " (max " + str(_mx) + ")", pe)
                 return ParseResult(Expr("int", "0", 0, [], [], ln), _rc)
-        ParseResult(Expr("int", _digits, int(_digits), [], [], ln), pos + 1)
+        // LOCK-4 inc3b: carry the sized suffix on the literal's `fields` list (NOT the value
+        // string, which many passes read as plain digits) so IR lowering can originate a
+        // width-typed const_int. Plain literals keep an empty fields list (unchanged).
+        let _iflds = []
+        if _isuf != ""
+            push(_iflds, _isuf)
+        ParseResult(Expr("int", _digits, int(_digits), [], _iflds, ln), pos + 1)
     else if kind == "FLOAT"
         let _fdigits = val
         let _fhash = find(val, "#")
@@ -7863,6 +7870,25 @@ fn llvm_escape_string(s: string) -> string
 fn ir_type_int() -> IrType
     IrType("int", "", [], 0)
 
+// LOCK-4 inc3b: an int IrType carrying a sized WIDTH in `name` (analog of nt_int_w at the
+// type-checker level). "" = default i64 (unchanged codegen; byte-identical + no perf cost).
+fn ir_type_int_w(w: string) -> IrType
+    IrType("int", w, [], 0)
+
+// Width (in bits) of a sized-int name; 64 for u64/i64/usize/isize/unknown (no masking needed).
+fn _width_bits(w: string) -> int
+    if w == "u8" or w == "i8"
+        return 8
+    if w == "u16" or w == "i16"
+        return 16
+    if w == "u32" or w == "i32"
+        return 32
+    64
+
+// Is the sized-int name unsigned (u8/u16/u32/u64/usize)? Signed otherwise (i8..isize).
+fn _width_is_unsigned(w: string) -> bool
+    len(w) > 0 and w[0] == "u"
+
 fn ir_type_str() -> IrType
     IrType("str", "", [], 0)
 
@@ -8178,7 +8204,15 @@ fn ir_lower_expr(b: IrBuilder, expr: Expr) -> string
                 b.ir_cur_line = eline
             if tag == "int"
                 let dest = ir_fresh_reg(b)
-                ir_emit_inst(b, "const_int", dest, ir_type_int(), [], str(num), num)
+                // LOCK-4 inc3b: a sized suffix literal carries its width on the Expr `fields`
+                // list; originate a width-typed const_int so downstream arithmetic wraps at width.
+                let _ilw = ""
+                if len(fields) > 0
+                    _ilw = fields[0]
+                if _ilw != "" and _is_sized_int_name(_ilw)
+                    ir_emit_inst(b, "const_int", dest, ir_type_int_w(_ilw), [], str(num), num)
+                else
+                    ir_emit_inst(b, "const_int", dest, ir_type_int(), [], str(num), num)
                 return dest
             else if tag == "str"
                 let dest = ir_fresh_reg(b)
@@ -15125,6 +15159,10 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
             if is_extern == 1 or len(blocks) == 0
                 return func
             let const_vals = {}
+            // LOCK-4 inc3b: which const registers carry a sized WIDTH (from a width-typed
+            // const_int). A sized operand makes the fold BAIL — the add/sub/mul is left in the
+            // stream so ir_infer_types propagates the width and the backend masks/wraps it.
+            let const_width = {}
             let new_blocks = []
             for block in blocks
                 match block
@@ -15142,6 +15180,8 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                                 IrInst(op, dest, typ, args, value, num, effect, line) =>
                                     if op == "const_int"
                                         const_vals[dest] = num
+                                        if typ.name != ""
+                                            const_width[dest] = typ.name
                                         push(new_insts, inst)
                                     else if op == "slot_store"
                                         slot_last[value] = args[0]
@@ -15165,7 +15205,9 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                                         else
                                             push(new_insts, inst)
                                     else if op == "add" and len(args) == 2
-                                        if contains(const_vals, args[0]) and contains(const_vals, args[1])
+                                        if contains(const_width, args[0]) or contains(const_width, args[1])
+                                            push(new_insts, inst)
+                                        else if contains(const_vals, args[0]) and contains(const_vals, args[1])
                                             match typ
                                                 IrType(tk, _, _, _) =>
                                                     if tk == "int" or tk == "any"
@@ -15185,7 +15227,9 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                                         else
                                             push(new_insts, inst)
                                     else if op == "sub" and len(args) == 2
-                                        if contains(const_vals, args[0]) and contains(const_vals, args[1])
+                                        if contains(const_width, args[0]) or contains(const_width, args[1])
+                                            push(new_insts, inst)
+                                        else if contains(const_vals, args[0]) and contains(const_vals, args[1])
                                             match typ
                                                 IrType(tk, _, _, _) =>
                                                     if tk == "int" or tk == "any"
@@ -15204,7 +15248,9 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                                         else
                                             push(new_insts, inst)
                                     else if op == "mul" and len(args) == 2
-                                        if contains(const_vals, args[0]) and contains(const_vals, args[1])
+                                        if contains(const_width, args[0]) or contains(const_width, args[1])
+                                            push(new_insts, inst)
+                                        else if contains(const_vals, args[0]) and contains(const_vals, args[1])
                                             match typ
                                                 IrType(tk, _, _, _) =>
                                                     if tk == "int" or tk == "any"
@@ -15230,7 +15276,9 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                                         else
                                             push(new_insts, inst)
                                     else if op == "div" and len(args) == 2
-                                        if contains(const_vals, args[0]) and contains(const_vals, args[1])
+                                        if contains(const_width, args[0]) or contains(const_width, args[1])
+                                            push(new_insts, inst)
+                                        else if contains(const_vals, args[0]) and contains(const_vals, args[1])
                                             match typ
                                                 IrType(tk, _, _, _) =>
                                                     if (tk == "int" or tk == "any") and const_vals[args[1]] != 0
@@ -15246,7 +15294,9 @@ fn ir_const_fold(func: IrFunction) -> IrFunction
                                         else
                                             push(new_insts, inst)
                                     else if op == "mod" and len(args) == 2
-                                        if contains(const_vals, args[0]) and contains(const_vals, args[1])
+                                        if contains(const_width, args[0]) or contains(const_width, args[1])
+                                            push(new_insts, inst)
+                                        else if contains(const_vals, args[0]) and contains(const_vals, args[1])
                                             match typ
                                                 IrType(tk, _, _, _) =>
                                                     if (tk == "int" or tk == "any") and const_vals[args[1]] != 0
@@ -15536,6 +15586,15 @@ fn ir_reg_type(reg_types: dict, reg: string) -> string
         return reg_types[reg]
     "any"
 
+// LOCK-4 inc3b: sized-int WIDTH of a register ("u8".."i64"/"usize", or "" = default i64).
+// Tracked in a parallel "@w@"-prefixed slot of the same reg_types dict so int arithmetic
+// can propagate + mask to width without changing the string-typed `rt` scheme.
+fn ir_reg_width(reg_types: dict, reg: string) -> string
+    let k = "@w@" + reg
+    if contains(reg_types, k)
+        return reg_types[k]
+    ""
+
 // Non-negativity tracking. A register/slot is "@nn@"-marked when proven to
 // hold a non-negative value, so list index access can skip the negative-index
 // (Python a[-1]) adjustment. Conservative: only const>=0 and add/mul of
@@ -15628,6 +15687,10 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                 rt[dest] = "int"
                 if num >= 0
                     rt["@nn@" + dest] = 1
+                // LOCK-4 inc3b: preserve a sized literal's width so downstream +/-/* wrap at width.
+                if typ.name != ""
+                    rt["@w@" + dest] = typ.name
+                    return IrInst(op, dest, ir_type_int_w(typ.name), args, value, num, effect, line)
                 return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
             else if op == "const_float"
                 rt[dest] = "float"
@@ -15651,6 +15714,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     return IrInst(op, dest, ir_type_float(), args, "L", num, effect, line)
                 if lt == "int" and rty == "int"
                     rt[dest] = "int"
+                    // LOCK-4 inc3b: propagate the sized width so the result wraps at width in the
+                    // backend (add/sub/mul). inc3a's unifier already rejects mixed widths, so at IR
+                    // level the non-default width simply wins; "" = default i64 (byte-identical codegen).
+                    let _wl = ir_reg_width(rt, args[0])
+                    let _wr = ir_reg_width(rt, args[1])
+                    let _wres = _wl
+                    if _wres == ""
+                        _wres = _wr
+                    if _wres != ""
+                        rt["@w@" + dest] = _wres
+                        return IrInst(op, dest, ir_type_int_w(_wres), args, value, num, effect, line)
                     return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
                 else if lt == "str" or rty == "str"
                     rt[dest] = "str"
@@ -15676,6 +15750,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     return IrInst(op, dest, ir_type_float(), args, "L", num, effect, line)
                 if lt == "int" and rty == "int"
                     rt[dest] = "int"
+                    // LOCK-4 inc3b: propagate the sized width so the result wraps at width in the
+                    // backend (add/sub/mul). inc3a's unifier already rejects mixed widths, so at IR
+                    // level the non-default width simply wins; "" = default i64 (byte-identical codegen).
+                    let _wl = ir_reg_width(rt, args[0])
+                    let _wr = ir_reg_width(rt, args[1])
+                    let _wres = _wl
+                    if _wres == ""
+                        _wres = _wr
+                    if _wres != ""
+                        rt["@w@" + dest] = _wres
+                        return IrInst(op, dest, ir_type_int_w(_wres), args, value, num, effect, line)
                     return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
                 if op == "mul" and len(args) == 2
                     if lt == "str" and rty == "int"
@@ -15699,6 +15784,11 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     return IrInst(op, dest, ir_type_float(), args, value, num, effect, line)
                 if lt == "int"
                     rt[dest] = "int"
+                    // LOCK-4 inc3b: `-x` of a sized value wraps at width (e.g. -(1u8) == 255u8).
+                    let _wn = ir_reg_width(rt, args[0])
+                    if _wn != ""
+                        rt["@w@" + dest] = _wn
+                        return IrInst(op, dest, ir_type_int_w(_wn), args, value, num, effect, line)
                     return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
                 // CORE_GAP 0.3: a neg of an `any` operand (e.g. a boxed float list element) is `any`,
                 // NOT int -- so print/str dispatch stays box-aware and the value isn't read as raw int.
@@ -15752,6 +15842,17 @@ fn ir_infer_one(rt: dict, st: dict, frt: dict, inst: IrInst) -> IrInst
                     return IrInst(op, dest, ir_type_str(), args, value, num, effect, line)
                 if lt == "int" and rty == "int"
                     rt[dest] = "int"
+                    // LOCK-4 inc3b: propagate the sized width so the result wraps at width in the
+                    // backend (add/sub/mul). inc3a's unifier already rejects mixed widths, so at IR
+                    // level the non-default width simply wins; "" = default i64 (byte-identical codegen).
+                    let _wl = ir_reg_width(rt, args[0])
+                    let _wr = ir_reg_width(rt, args[1])
+                    let _wres = _wl
+                    if _wres == ""
+                        _wres = _wr
+                    if _wres != ""
+                        rt["@w@" + dest] = _wres
+                        return IrInst(op, dest, ir_type_int_w(_wres), args, value, num, effect, line)
                     return IrInst(op, dest, ir_type_int(), args, value, num, effect, line)
                 rt[dest] = "int"
                 return IrInst(op, dest, ir_type_any(), args, value, num, effect, line)
@@ -17089,6 +17190,24 @@ fn ire_fresh_tmp(e: IrEmitter, prefix: string) -> string
     e.ire_tc = e.ire_tc + 1
     name
 
+// LOCK-4 inc3b: wrap a raw i64 arithmetic result to a sized WIDTH `w`. Unsigned (u8/u16/u32) ->
+// mask to the low `bits`; signed (i8/i16/i32) -> sign-extend from `bits` (shl then arithmetic shr).
+// bits>=64 (u64/i64/usize/isize) is a plain copy — identical to the default path, so no cost.
+// Emits `dest = <wrapped>`. `1 << bits` is safe here: bits is always < 64 in the masking branch.
+fn ire_emit_width_wrap(e: IrEmitter, dest: string, raw: string, w: string)
+    let bits = _width_bits(w)
+    if bits >= 64
+        ire_indent(e, dest + " = add i64 " + raw + ", 0")
+        return
+    if _width_is_unsigned(w)
+        let mask = (1 << bits) - 1
+        ire_indent(e, dest + " = and i64 " + raw + ", " + fmt_i64_decimal(mask))
+    else
+        let shift = 64 - bits
+        let sx = ire_fresh_tmp(e, "sx")
+        ire_indent(e, sx + " = shl i64 " + raw + ", " + fmt_i64_decimal(shift))
+        ire_indent(e, dest + " = ashr i64 " + sx + ", " + fmt_i64_decimal(shift))
+
 fn ire_line(e: IrEmitter, line: string)
     push(e.ire_out, line)
 
@@ -17189,7 +17308,12 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
-                            ire_indent(e, dest + " = add i64 " + args[0] + ", " + args[1])
+                            if tn == ""
+                                ire_indent(e, dest + " = add i64 " + args[0] + ", " + args[1])
+                            else
+                                let _wraw = ire_fresh_tmp(e, "wadd")
+                                ire_indent(e, _wraw + " = add i64 " + args[0] + ", " + args[1])
+                                ire_emit_width_wrap(e, dest, _wraw, tn)
                         else if tk == "str"
                             ire_indent(e, dest + " = call i64 @nova_rt_str_concat(i64 " + args[0] + ", i64 " + args[1] + ")")
                         else
@@ -17213,7 +17337,12 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
-                            ire_indent(e, dest + " = sub i64 " + args[0] + ", " + args[1])
+                            if tn == ""
+                                ire_indent(e, dest + " = sub i64 " + args[0] + ", " + args[1])
+                            else
+                                let _wraw = ire_fresh_tmp(e, "wsub")
+                                ire_indent(e, _wraw + " = sub i64 " + args[0] + ", " + args[1])
+                                ire_emit_width_wrap(e, dest, _wraw, tn)
                         else
                             ire_indent(e, dest + " = call i64 @nova_rt_sub(i64 " + args[0] + ", i64 " + args[1] + ")")
             else if op == "mul"
@@ -17235,7 +17364,12 @@ fn ire_emit_inst(e: IrEmitter, inst: IrInst)
                             ire_indent(e, dest + " = bitcast double " + rf + " to i64")
                             ire_mark_float(e, dest)   // Repr Inference: SSA temp, provably raw double bits
                         else if tk == "int"
-                            ire_indent(e, dest + " = mul i64 " + args[0] + ", " + args[1])
+                            if tn == ""
+                                ire_indent(e, dest + " = mul i64 " + args[0] + ", " + args[1])
+                            else
+                                let _wraw = ire_fresh_tmp(e, "wmul")
+                                ire_indent(e, _wraw + " = mul i64 " + args[0] + ", " + args[1])
+                                ire_emit_width_wrap(e, dest, _wraw, tn)
                         else
                             ire_indent(e, dest + " = call i64 @nova_rt_mul(i64 " + args[0] + ", i64 " + args[1] + ")")
             else if op == "div"
