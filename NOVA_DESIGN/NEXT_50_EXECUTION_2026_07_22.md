@@ -6,7 +6,12 @@
 > MEMORY-SAFE (leak-only, never UAF) + regression-pinned — bundle into ONE supervised RC-ownership cycle,
 > not standalone (shared root: drop provably-owned call-arg temporaries; UAF-adjacent). #19 unix-sockets,
 > #23 tz, #29 profiler, #31 installer (needs signing cert) = large/XL. DO-NOW tractable+verifiable here:
-> **#26 pkg-manager** (resolver+lockfile+cycle-detect already built & gated — only CLI wiring missing; bounded,
+> **#26 pkg-manager** — ⚠ CORRECTED 2026-07-27 (live-verified, prior claim was STALE): `nova install` +
+> `nova_pkg_install`/`nova_pkg_get`/`nova_pkg_download` + **lockfile** (`lockfile_read`/`lockfile_write`,
+> reproducible `nova.lock`) ARE built & wired. But there is **NO transitive resolver and NO cycle-detect** in
+> live code — install resolves only DIRECT deps from nova.toml; the `resolve_*` fns are all method/module
+> resolution, and no pkg-resolver KAT exists. So #26 is NOT "only CLI wiring": the transitive resolver +
+> cycle-detect must be BUILT (a reconverge-sensitive compiler change, hard to verify without a registry). (was: resolver+lockfile+cycle-detect already built & gated — only CLI wiring missing; bounded,
 > highest ecosystem value), #9 Windows-TLS-server, #16 HTTP-client redirects (3 sub-cycles), #30 REPL polish.
 > DO-NOW but NOT self-verifiable on this Windows box (Linux/ARM/OpenSSL runtime): #5 ARM fiber asm, #10 Linux
 > epoll wiring (CVE-class, code already built), #8 ALPN-server. Marching #26 next.

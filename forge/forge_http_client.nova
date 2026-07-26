@@ -232,16 +232,98 @@ fn url_origin(url: string) -> string
         return url
     slice(url, 0, host_start + slash)
 
-// Resolve a Location header against the request URL: absolute URLs pass through; a "/rooted" path
-// joins the base origin; anything else is treated as origin-relative. (Full RFC-3986 relative
-// resolution against the base PATH is a follow-on; this covers the redirects servers actually send.)
+// PATH portion of a URL (everything after scheme://host[:port]); "/" when there is none.
+fn url_path(url: string) -> string
+    let sep = find(url, "://")
+    if sep < 0
+        return "/"
+    let host_start = sep + 3
+    let rest = slice(url, host_start, len(url))
+    let slash = find(rest, "/")
+    if slash < 0
+        return "/"
+    slice(rest, slash, len(rest))
+
+// Base path with its last (file) segment removed, keeping the trailing "/" (RFC-3986 §5.3 merge
+// base). "/a/b/c" -> "/a/b/", "/a/" -> "/a/", "/x" or "" -> "/".
+fn _url_base_dir(path: string) -> string
+    let segs = split(path, "/")
+    if len(segs) <= 1
+        return "/"
+    let out = []
+    let i = 0
+    while i < len(segs) - 1
+        push(out, segs[i])
+        i = i + 1
+    let j = join(out, "/")
+    if len(j) == 0
+        return "/"
+    j + "/"
+
+// RFC-3986 §5.2.4 remove_dot_segments: drop "." , pop the previous segment on ".." , collapse
+// empty segments ("//"). Result always starts with "/"; a trailing slash is preserved when the
+// input ends in "/", "/." or "/..".
+fn _normalize_url_path(path: string) -> string
+    let trailing = ends_with(path, "/") or ends_with(path, "/.") or ends_with(path, "/..") or path == "." or path == ".."
+    let segs = split(path, "/")
+    let out = []
+    for p in segs
+        if p == ".."
+            if len(out) > 0
+                pop(out)
+        else if p != "" and p != "."
+            push(out, p)
+    let j = join(out, "/")
+    if len(j) == 0
+        return "/"
+    if trailing
+        return "/" + j + "/"
+    "/" + j
+
+// Resolve a Location header against the request URL per RFC-3986 §5 (the reference-resolution the
+// browser does). Handles: absolute URLs (pass through), protocol-relative "//host/path" (inherit the
+// base scheme), "/rooted" absolute-paths, and true PATH-RELATIVE refs ("page2", "../x", "./x")
+// resolved against the base path's directory with dot-segment normalization; a query/fragment on the
+// target is preserved, and a query/fragment-only ref ("?q=1") keeps the base path.
 fn resolve_location(base: string, loc: string) -> string
     if starts_with(loc, "http://") or starts_with(loc, "https://")
         return loc
     let origin = url_origin(base)
-    if starts_with(loc, "/")
-        return "{origin}{loc}"
-    "{origin}/{loc}"
+    if starts_with(loc, "//")
+        let sep = find(base, "://")
+        let scheme = "http"
+        if sep >= 0
+            scheme = slice(base, 0, sep)
+        return scheme + ":" + loc
+    // Split the ref into its path part and a query/fragment suffix.
+    let cut = len(loc)
+    let qp = find(loc, "?")
+    if qp >= 0 and qp < cut
+        cut = qp
+    let hp = find(loc, "#")
+    if hp >= 0 and hp < cut
+        cut = hp
+    let loc_path = slice(loc, 0, cut)
+    let loc_suffix = slice(loc, cut, len(loc))
+    // Base path with any of its own query/fragment stripped.
+    let bpath = url_path(base)
+    let bq = find(bpath, "?")
+    if bq >= 0
+        bpath = slice(bpath, 0, bq)
+    let bh = find(bpath, "#")
+    if bh >= 0
+        bpath = slice(bpath, 0, bh)
+    let merged = ""
+    if starts_with(loc_path, "/")
+        merged = loc_path
+    else if len(loc_path) == 0
+        merged = bpath
+        if len(merged) == 0
+            merged = "/"
+    else
+        merged = _url_base_dir(bpath) + loc_path
+    merged = _normalize_url_path(merged)
+    origin + merged + loc_suffix
 
 // GET `url`, following up to `max` redirects (301/302/303/307/308 via Location) and returning the
 // FINAL response. Absolute Location URLs are followed as-is; relative-Location resolution + a cookie
