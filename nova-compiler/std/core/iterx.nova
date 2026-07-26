@@ -1,0 +1,190 @@
+// ============================================================================
+// std/core/iterx — generic, eager iterator/sequence operations
+// ============================================================================
+// Written in NOVA's HIGH-LEVEL style: generic functions (`fn <T> ...`),
+// closures, list comprehensions (incl. the chained-`for` flat-map form and the
+// `A if C else B` ternary), `match` + `Option`, and `for i, x in xs` index/value
+// destructuring — NOT hand-rolled index `while`-loops. `position` is this
+// module's one foundational search primitive; `take_while`/`drop_while`/
+// `find_first` are all built ON TOP of it via `match` + a comprehension slice,
+// the same "compose from your own combinators" style as std/core/collect's
+// `interleave` (built from `zip_with`+`flatten`).
+//
+// Sibling modules: std/core/seq already has `seq_find`/`seq_any`/`seq_all`
+// returning `Result` (Err on no-match); this module answers the same questions
+// with `Option` (None on no-match) plus the *_by naming, since std/itertools
+// already claims the plain `any_by`-free `it_*` prefix for its own (non-generic)
+// aggregator surface (`it_windowed`/`it_chunked`/`itz_zip3`/`itz_enumerate`,
+// etc.) — this module does not duplicate those, it is the generic/closure-based
+// counterpart with a smaller, comprehension-driven implementation.
+//
+// COMPILER FINDING #1 (real, verified — not a style choice): NOVA has no
+// function overloading. A user-defined top-level function SILENTLY AND
+// UNCONDITIONALLY SHADOWS a builtin of the same name for every call site in
+// any unit where that name is in scope (defined locally OR pulled in by
+// `import`) — there is no dispatch by argument type/arity. Confirmed by
+// probe: defining `fn find(xs: list, pred) -> Option` (even non-generic)
+// breaks EVERY other use of the builtin `find(haystack: string, needle:
+// string) -> int` in the same compilation unit — `find("hello", "ll")` fails
+// to type-check with "container element types must match" once the user
+// `find` is in scope (verified in isolation and confirms full replacement,
+// not ambiguity). The same holds for the builtin `repeat(s: string, n: int)
+// -> string`. Consequently this module does NOT define top-level
+// `find`/`repeat` (that would silently break string search/repeat in any
+// file that imports it) — the requested operations are named `find_first`
+// and `replicate` instead. grep confirms no existing std/ module defines
+// top-level `find`/`repeat` either, i.e. this is an established, if
+// previously undocumented, convention. Every other name below (`take_while`,
+// `drop_while`, `position`, `count_by`, `all_by`, `any_by`, `range_step`,
+// `zip3`, `pairwise`, `intersperse`) was probed against the builtin registry
+// and the whole std/ tree first and is collision-free.
+//
+// COMPILER FINDING #2 (real, verified, higher-impact): a GENERIC function's
+// BARE scalar parameter — `fn <T> f(v: T, ...)`, where T is a direct
+// parameter type rather than nested in a container like `list<T>` — fails to
+// instantiate its type parameter when the function is called ACROSS A
+// MODULE-IMPORT BOUNDARY, even though the identical signature type-checks
+// and runs correctly when the function is defined and called in the SAME
+// file. Minimal repro: `fn <T> f(v: T, n: int) -> list<T>` compiles and runs
+// fine same-file; the moment it is moved to another module and called via
+// `import`, `f("x", 3)` fails with "type mismatch: expected T, found string".
+// `list<T>`-nested parameters (e.g. `xs: list<T>`) are unaffected — this is
+// std/core/collect and std/core/seq's proven, working cross-module pattern.
+// WORKAROUND (applied below, verified round-trip correct for both `string`
+// and `int` element types in the same imported call site): leave the bare-T
+// parameter UNANNOTATED — `fn <T> f(v, n: int) -> list<T>` — so T is inferred
+// from the return-type annotation and the body instead of the parameter.
+// Affects `replicate`'s `v` and `intersperse`'s `sep` below.
+//
+// API
+//   take_while(xs, pred)      -> list<T>   longest prefix where pred holds
+//   drop_while(xs, pred)      -> list<T>   xs with that prefix removed
+//   find_first(xs, pred)      -> Option    first x where pred(x); None if none
+//   position(xs, pred)        -> Option    first index i where pred(xs[i])
+//   count_by(xs, pred)        -> int       # of elements satisfying pred
+//   all_by(xs, pred)          -> bool      pred holds for every element
+//   any_by(xs, pred)          -> bool      pred holds for some element
+//   replicate(v, n)           -> list<T>   [v, v, ..., v] (n times; n<=0 -> [])
+//   range_step(lo, hi, step)  -> list<int> arithmetic progression, step != 0
+//   zip3(a, b, c)             -> list      triples, length = shortest input
+//   pairwise(xs)              -> list      overlapping adjacent [x[i],x[i+1]]
+//   intersperse(xs, sep)      -> list<T>   sep woven between every pair
+//
+// LEAF module — imports nothing (matches every other std/core/* module).
+// Non-mutating throughout: every combinator returns a fresh list.
+// ============================================================================
+
+// position: index of the first element satisfying pred, or None.
+// `for i, x in xs` auto-destructures a list into (index, value) — no manual
+// counter.
+fn <T> position(xs: list<T>, pred) -> Option
+    for i, x in xs
+        if pred(x)
+            return some(i)
+    return none()
+
+// find_first: the first element satisfying pred, or None. Built on `position`.
+fn <T> find_first(xs: list<T>, pred) -> Option
+    match position(xs, pred)
+        Some(i) =>
+            return some(xs[i])
+        None =>
+            return none()
+
+// take_while: the longest prefix for which pred holds. The prefix ends at the
+// first element where pred FAILS, i.e. `position(xs, not pred)`.
+fn <T> take_while(xs: list<T>, pred) -> list<T>
+    match position(xs, fn(x) not pred(x))
+        Some(i) =>
+            return [xs[j] for j in 0..i]
+        None =>
+            return [x for x in xs]
+
+// drop_while: xs with the take_while prefix removed (the two are complementary
+// slices of the same split point).
+fn <T> drop_while(xs: list<T>, pred) -> list<T>
+    match position(xs, fn(x) not pred(x))
+        Some(i) =>
+            return [xs[j] for j in i..len(xs)]
+        None =>
+            return []
+
+// count_by: number of elements satisfying pred — the size of the filtered list.
+fn <T> count_by(xs: list<T>, pred) -> int
+    return len(xs.filter(pred))
+
+// all_by / any_by: universal / existential quantifiers over a predicate.
+// Early-exit for-loops (the right tool for a quantifier — a comprehension
+// would build a whole list just to test its length).
+fn <T> all_by(xs: list<T>, pred) -> bool
+    for x in xs
+        if not pred(x)
+            return false
+    return true
+
+fn <T> any_by(xs: list<T>, pred) -> bool
+    for x in xs
+        if pred(x)
+            return true
+    return false
+
+// replicate: n copies of v (bounds-defensive: n<=0 -> []).
+// `v` is deliberately UNANNOTATED (not `v: T`) — see the COMPILER FINDING #2
+// note above the API table: a generic function's BARE scalar parameter (a
+// direct `T`, not nested in a container like `list<T>`) fails to instantiate
+// when the function is called across a module-import boundary, even though
+// the identical signature works same-file. Leaving the parameter unannotated
+// and inferring it from the `-> list<T>` return + body sidesteps the bug with
+// no loss of genericity (verified: correctly infers `T=string` and `T=int` at
+// different call sites in the same program, imported).
+fn <T> replicate(v, n: int) -> list<T>
+    if n <= 0
+        return []
+    return [v for i in 0..n]
+
+// range_step: the arithmetic progression starting at lo, stepping by step,
+// stopping before hi — generalizing `lo..hi` (which is fixed at step=1) to any
+// non-zero step. step > 0 climbs toward hi; step < 0 descends toward hi.
+// step == 0 or an empty direction (e.g. step>0 but hi<=lo) -> [].
+fn range_step(lo: int, hi: int, step: int) -> list<int>
+    if step == 0
+        return []
+    if step > 0
+        if hi <= lo
+            return []
+        let n = (hi - lo + step - 1) / step
+        return [lo + i * step for i in 0..n]
+    let up = -step
+    if hi >= lo
+        return []
+    let n = (lo - hi + up - 1) / up
+    return [lo + i * step for i in 0..n]
+
+// zip3: combine corresponding elements of three sequences into [a,b,c]
+// triples; length = the shortest input (matches `zip`'s truncation rule).
+fn <A, B, C> zip3(a: list<A>, b: list<B>, c: list<C>) -> list
+    let m = min(min(len(a), len(b)), len(c))
+    return [[a[i], b[i], c[i]] for i in 0..m]
+
+// pairwise: every overlapping adjacent pair [xs[i], xs[i+1]]. `windows(xs, 2)`
+// in all but name (std/core/collect owns the general-width version); this is
+// the specialized, dependency-free width-2 form for this leaf module.
+fn <T> pairwise(xs: list<T>) -> list
+    let n = len(xs)
+    if n < 2
+        return []
+    return [[xs[i], xs[i + 1]] for i in 0..(n - 1)]
+
+// intersperse: weave sep between every pair of consecutive elements
+// ([a,b,c],s -> [a,s,b,s,c]). Built as two comprehensions: first pair each
+// non-last element with [x, sep] and the last with just [x], then flatten one
+// level via the chained-`for` comprehension (the same flat-map idiom as
+// std/core/query's `Query.flat_map`). `sep` is deliberately UNANNOTATED for
+// the same cross-module bare-`T`-parameter reason as `replicate` above —
+// `xs: list<T>` (T nested in a container) is fine and stays annotated.
+fn <T> intersperse(xs: list<T>, sep) -> list<T>
+    let n = len(xs)
+    if n == 0
+        return []
+    let chunks = [[xs[i], sep] if i < n - 1 else [xs[i]] for i in 0..n]
+    return [y for chunk in chunks for y in chunk]

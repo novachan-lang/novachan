@@ -1,0 +1,218 @@
+// ============================================================================
+// std/core/result_ext — Result / Option combinators (map/and_then/collect)
+// ============================================================================
+// The batch-oriented sibling of std/core/result.nova and std/core/opt.nova:
+// covers the same map/and_then/unwrap_or family (kept here under distinct
+// r_/o_ names so importing this module never shadows theirs) PLUS the
+// combinators those two modules don't have: `r_or_else` (recover from Err),
+// `r_ok_option` / `o_ok_or` (convert between the two types), and the two
+// batch operators over `list<Result>` — `collect_results` (all-or-nothing,
+// short-circuiting) and `partition_results` (split, no short-circuit).
+//
+// NAMING — every public fn is `r_`/`o_`-prefixed, never bare `map`/`filter`/
+// `reduce`/`sum`: those names collide with the builtin HOF when this module
+// is imported and called first on a fresh receiver (a known compiler gap;
+// see std/core/query.nova's COMPILER NOTE for the canonical repro).
+//
+// GENERICS — WHY THIS MODULE USES BARE `Result`/`Option`, NOT `Result<T,E>`/
+// `Option<T>` (a real compiler gap found and isolated while writing this):
+//
+//   `Result<T,E>` / `Option<T>` as declared PARAMETER types on a generic
+//   function DO work — but only for calls resolved IN THE SAME FILE that
+//   declares the function. The instant such a function is put in a module
+//   and IMPORTED, the type parameter fails to freshen per call site: the
+//   checker reports `type mismatch: expected T, found int` (etc.) — as if
+//   the imported function's `T`/`E` were treated as a single unification
+//   variable pinned by the FIRST use rather than re-instantiated fresh at
+//   the call site, or possibly failed to seed a substitution at all.
+//   Reproduced with the SMALLEST possible cases (verified before writing
+//   this module; `_probe_result_generic.nova` = same-file, PASSES;
+//   `_probe_result_generic2.nova` = same-file with nested generics
+//   (`list<Result<T,E>>`, `Result<list<T>,E>`, error-type-changing
+//   `map_err`/`or_else`), also PASSES — so the mechanism is sound in
+//   principle, just not wired up across the import boundary):
+//     // in an IMPORTED module:
+//     fn <T, E> r_is_ok(r: Result<T, E>) -> bool
+//         match r
+//             Ok(v) => return true
+//             Err(e) => return false
+//     // at the call site, in a DIFFERENT file that imports the module:
+//     r_is_ok(ok(1))
+//     //   error[E1001]: type mismatch: expected T, found int
+//   The SAME failure reproduces for the plain (non-Result) case too — a
+//   bare bare-`T` PARAMETER (not wrapped in a container) on an imported
+//   generic function also fails to freshen:
+//     fn <T> f1(x: T) -> T           // FAILS when imported: f1(5) ->
+//                                    //   "expected T, found int"
+//     fn <T> f2(xs: list<T>) -> T    // WORKS when imported: T only ever
+//                                    //   appears wrapped in `list<T>`
+//   So the working boundary is precise: a type parameter that appears ONLY
+//   inside a `list<T>` (or similar container) parameter survives import
+//   (this is exactly the seq.nova / collect.nova pattern, and it is why
+//   THOSE modules' generics work when imported); a type parameter that is
+//   itself the direct/bare declared type of a parameter — whether spelled
+//   `x: T` directly or wrapped one level as `Result<T,E>` / `Option<T>` —
+//   does not. Every function below therefore keeps `Result`/`Option` bare
+//   (matching std/core/result.nova / opt.nova's existing, proven-safe
+//   convention) and spells a same-type default/attached-error parameter as
+//   `any` (e.g. `default: any`, matching `result_unwrap_or`'s existing
+//   precedent) rather than `default: T` — both because it is the honest
+//   type NOVA can currently express here, not a stylistic choice.
+//
+// API:
+//   Result:
+//     r_is_ok(r)               -> bool     true iff Ok
+//     r_map(r, f)                          apply f to Ok value; Err passes through
+//     r_map_err(r, f)                      apply f to Err value; Ok passes through
+//     r_and_then(r, f)                     chain: f(v) itself returns a Result
+//     r_or_else(r, f)                      recover: f(e) itself returns a Result
+//     r_unwrap_or(r, default)  -> any      Ok value, or `default` on Err
+//     r_ok_option(r)           -> Option   Ok(v)->Some(v), Err(_)->None
+//   Option:
+//     o_map(o, f)                          apply f to Some value; None passes through
+//     o_and_then(o, f)                     chain: f(v) itself returns an Option
+//     o_unwrap_or(o, default)  -> any      Some value, or `default` on None
+//     o_filter(o, pred)         -> Option  keep Some only if pred(v); else None
+//     o_ok_or(o, e)             -> Result  Some(v)->Ok(v), None->Err(e)
+//   Batch (list<Result>):
+//     collect_results(rs)      -> Result   all-or-nothing: first Err short-circuits
+//     partition_results(rs)    -> list     [oks, errs], every element inspected
+//
+// LEAF module — imports nothing.
+// ============================================================================
+
+// ── Result ───────────────────────────────────────────────────────────────────
+
+// is this Result an Ok?
+fn r_is_ok(r: Result) -> bool
+    match r
+        Ok(v) =>
+            return true
+        Err(e) =>
+            return false
+
+// map: apply f to the Ok value; Err passes through unchanged.
+fn r_map(r: Result, f) -> Result
+    match r
+        Ok(v) =>
+            return ok(f(v))
+        Err(e) =>
+            return err(e)
+
+// map_err: apply f to the Err value; Ok passes through unchanged.
+fn r_map_err(r: Result, f) -> Result
+    match r
+        Ok(v) =>
+            return ok(v)
+        Err(e) =>
+            return err(f(e))
+
+// and_then: chain a fallible step. f itself returns a Result — the standard
+// monadic bind, used to sequence operations that can each fail.
+fn r_and_then(r: Result, f) -> Result
+    match r
+        Ok(v) =>
+            return f(v)
+        Err(e) =>
+            return err(e)
+
+// or_else: recover from an Err by trying f(e), which itself returns a Result
+// (f may recover into Ok, or fail again). Ok passes through unchanged.
+fn r_or_else(r: Result, f) -> Result
+    match r
+        Ok(v) =>
+            return ok(v)
+        Err(e) =>
+            return f(e)
+
+// unwrap_or: the Ok value, or `default` on Err.
+fn r_unwrap_or(r: Result, default: any) -> any
+    match r
+        Ok(v) =>
+            return v
+        Err(e) =>
+            return default
+
+// ok_option: project a Result down to an Option, discarding the error detail.
+fn r_ok_option(r: Result) -> Option
+    match r
+        Ok(v) =>
+            return some(v)
+        Err(e) =>
+            return none()
+
+// ── Option ───────────────────────────────────────────────────────────────────
+
+// map: apply f to the Some value; None passes through unchanged.
+fn o_map(o: Option, f) -> Option
+    match o
+        Some(v) =>
+            return some(f(v))
+        None =>
+            return none()
+
+// and_then: chain a step that itself returns an Option (may itself yield None).
+fn o_and_then(o: Option, f) -> Option
+    match o
+        Some(v) =>
+            return f(v)
+        None =>
+            return none()
+
+// unwrap_or: the Some value, or `default` on None.
+fn o_unwrap_or(o: Option, default: any) -> any
+    match o
+        Some(v) =>
+            return v
+        None =>
+            return default
+
+// filter: keep the Some value only if pred(v) holds; otherwise None.
+fn o_filter(o: Option, pred) -> Option
+    match o
+        Some(v) =>
+            if pred(v)
+                return some(v)
+            return none()
+        None =>
+            return none()
+
+// ok_or: attach an error, turning a missing value into an explicit Err.
+fn o_ok_or(o: Option, e: any) -> Result
+    match o
+        Some(v) =>
+            return ok(v)
+        None =>
+            return err(e)
+
+// ── Batch: list<Result> ───────────────────────────────────────────────────────
+
+// collect_results: all-or-nothing. If every element is Ok, returns
+// Ok(list-of-values) in original order. The FIRST Err encountered
+// short-circuits immediately (remaining elements are never inspected) and
+// becomes the overall Err — this is why a plain `for` loop with an early
+// `return` is used rather than a comprehension (a comprehension cannot
+// short-circuit mid-build).
+fn collect_results(rs: list<Result>) -> Result
+    let out = []
+    for r in rs
+        match r
+            Ok(v) =>
+                push(out, v)
+            Err(e) =>
+                return err(e)
+    return ok(out)
+
+// partition_results: split into [oks, errs] — every Ok value and every Err
+// value, each in original relative order, with NO short-circuiting (every
+// element is inspected exactly once, unlike collect_results).
+fn partition_results(rs: list<Result>) -> list
+    let oks = []
+    let errs = []
+    for r in rs
+        match r
+            Ok(v) =>
+                push(oks, v)
+            Err(e) =>
+                push(errs, e)
+    return [oks, errs]
