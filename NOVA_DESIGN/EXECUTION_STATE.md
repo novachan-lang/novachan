@@ -44,10 +44,17 @@ soundness (silent wrong-result). Reconverged gen5==gen6, both-mode, KAT `_kat_in
 - ✅ CLUSTER B: `Result<int,string>`/`dict<K,V>` param/ret/alias annotations dropped the comma (tokenized `COMMA`
   but the 3 generic-capture loops checked `DELIM`; sites 2582/2638/2763). Fix (batch 2): 3× `DELIM`→`COMMA` (the
   downstream `ti_split_type_args` already split on the comma). KAT `_kat_generic_annot`.
-- ⬜ CYCLE 2: map/HOF — `map(fn(x) x.price)` / `map(named_float_fn)` return a RAW float unboxed (trampoline/lambda
-  float return not boxed; routing→`map_fbox` also fails). Delicate HOF-ABI; own cycle + adversarial verify. NEXT.
+- ⬜ CYCLE 2: map/HOF — ATTEMPTED + REVERTED (delicate; ROOT fully diagnosed, see memory
+  `project_dogfood_float_widen_boxing`). box-at-trampoline (gated on `frt[target]=="float"`) FIXES the named-fn
+  case D (`map(gp)`), but NOT the lambda case C (`map(fn(x) x.price)`): MEASURED `frt["__lambda_0"]=ABSENT` —
+  the untyped lambda param makes `x.price` a typ="any" field_get at lowering (index resolves globally, type is
+  lost), so the return analyzes "any". REAL FIX (scoped, invasive): type the HOF lambda param to the list element
+  struct type. KAT `_kat_hof_float.nova` written+kept (unregistered). NOT rushed overnight — needs a focused session.
 - ⬜ CYCLE 3-G: `sum([..for..])` over a comprehension returns a float / garbage-int (separate root, sum() typing).
-- ⏸ CLUSTER C: `EXPR catch e` as a bare implicit-return fails to parse (narrow; deferred — every doc uses let/return).
+- 🔄 CLUSTER C: catch parser. INLINE `EXPR catch e => handler` FIXED (batch 3) — the parser never consumed the
+  `=>` ("unexpected FAT_ARROW"); now consumes the optional FAT_ARROW in the inline handler path. KAT `_kat_catch`
+  (inline / multi-line / return+inline). REMAINS: bare multi-line catch as a function's implicit-return final
+  statement swallows the next fn (subtle fn-body/indent-block interaction) — narrow, deferred (use let/return).
 
 **Next — the honest decision (strategic vs tactical):**
 - **STRATEGIC (the plan's real heart — LOCK-NOW, blocks frameworks):** **LOCK-4 sized/unsigned + f32/f16** (the
@@ -74,6 +81,7 @@ but not the strategic bottleneck.
 | **DOGFOOD C1: float/bool/format-spec string interpolation → raw int64 bits** | 0-A | A | ✅ DONE (reconverged gen5==gen6, both-mode, KAT `_kat_interp_float`) — `"{150.0}"`→4639481672377565184, `"{f:.2f}"`, `"{true}"`→1 all silently wrong. Interpolation is an `any`-widen point that didn't box the raw float/bool. Fix: specialize `any_to_str(float)`→`float_to_str` + `(bool)`→`bool_to_str` in `ir_infer_one` (zero-alloc, mirrors str()/print()); box the float for `format_one` in `ir_infer_block` + **exclude `format_one` from the fpt-boxing branch** (it had recorded `fpt["nova_rt_format_one"]["0"]="float"` and wrongly skipped boxing under the "concrete-float ⇒ reads-raw-bits" rule — the same trap that hits `ok`/`err`). | (dogfood c1) |
 | **DOGFOOD C3-F: `ok`/`err`/`some` float payload stored unboxed → match reads raw int64 bits** | 0-A | A | ✅ DONE (batch 2; reconverge + both-mode + KAT `_kat_result_float`) — `ok(9.99)` payload read as 4621813488089437307; context-sensitive (a 2nd Result fn conflict-merged `fpt["nova_rt_ok"]` to `any` and hid it). Fix: exclude ok/err/some from the fpt-boxing branch + box their raw-float payload in the combined any-store branch (same trap as `format_one`). | (batch 2) |
 | **DOGFOOD Cluster-B: multi-arg generic annotations drop the comma** | 0-A | C | ✅ DONE (batch 2; KAT `_kat_generic_annot`) — `Result<int,string>`→`Result<intstring>` ("expected intstring"), `dict<string,int>`→`dict<stringint>`. Comma tokenized `COMMA` but param(2582)/ret(2638)/alias(2763) generic-capture loops checked `DELIM` and dropped it; `Result<int>` (no comma) worked. Fix: 3× `DELIM`→`COMMA` (`ti_split_type_args` already split on the restored comma). | (batch 2) |
+| **DOGFOOD Cluster-C: inline `EXPR catch e => handler` fails to parse** | 0-A | C | ✅ DONE (batch 3; KAT `_kat_catch`) — the Pratt-parser inline-handler path never consumed the `=>` → "unexpected FAT_ARROW '=>'". Fix: consume the optional FAT_ARROW before parsing the handler (additive; `catch e handler` without arrow still works). Reconverge-safe. REMAINS: bare multi-line catch as implicit-return (deferred, narrow). | (batch 3) |
 | module-level NON-scalar/non-literal/MUTABLE globals still per-fn copies | 0-A | B(XL) | ✅ DONE `ccb70ba6` (GAP 5) — self-contained top-level `let cache={}`/`[]`/`channel()` baked into the const-store (const_set prologue, const_get at every use — named fns/lambdas/nova_main); capture-exclusion fixed the green_scale_test N>1 race. Reconverged, both-mode 0-FAIL, N>1 clean. | ccb70ba6 |
 | ~~floor()/ceil() boxed-float corrupts layout~~ | 0-A | — | ❌ NOT A BUG — nova_rt_floor returns clean `(int64_t)floor(x)`, typed int. Agent misdiagnosed; float_to_int helped an unrelated float-slot issue. | |
 | multi-line list/dict literal in module body silently aborts module parse | 0-A | B | ⬜ NEW (whole import yields 0 symbols; use single-line/if-chain; found via calendar) | |
