@@ -1,0 +1,159 @@
+// ============================================================================
+// NOVA Standard Library — std/io/cursor
+// ============================================================================
+// A bounded, safe READER cursor over a native `bytes` buffer.
+//
+// This is the shared primitive the binary codecs (png/jpeg/cbor/protobuf/bson/
+// varint/...) each otherwise re-implement by hand: "read the next N bytes,
+// advance a position, and NEVER read past the end". The raw runtime primitive
+// `bytes_get(buf, i)` fails OPEN — an out-of-range index silently returns 0,
+// which is exactly the class of bug that produces truncated-file mis-parses and
+// silent data corruption. A Cursor closes that hole: every read is
+// bounds-checked and returns a `Result` — `ok(value)` on success, `err(msg)` on
+// over-read — so a malformed / truncated buffer surfaces as a first-class error
+// instead of a wrong answer or a crash.
+//
+// THE NOVA WAY
+//   Reads compose with the `?` operator: a reader that pulls a multi-field
+//   record just writes `let x = cur_u16be(c)?` per field, and the first
+//   over-read short-circuits the whole reader with a contextual error. See
+//   cur_read_tlv below for the canonical example.
+//
+// PUBLIC API
+//   cur_new(b: bytes)        -> Cursor           { data, pos } over b, pos = 0
+//   cur_remaining(c)         -> int              bytes left (>= 0)
+//   cur_eof(c)               -> bool             true when nothing remains
+//   cur_u8(c)                -> Result<int>      next byte, 0..255
+//   cur_u16be(c)/cur_u16le(c)-> Result<int>      next 2 bytes as u16 (BE / LE)
+//   cur_u32be(c)/cur_u32le(c)-> Result<int>      next 4 bytes as u32 (BE / LE)
+//   cur_bytes(c, n)          -> Result<bytes>    next n bytes as a fresh slice
+//   cur_varint(c)            -> Result<int>      unsigned LEB128, bounded (<=10 bytes)
+//   cur_skip(c, n)           -> Result<int>      advance n bytes, ok(n)
+//   cur_read_tlv(c)          -> Result<Tlv>      showcase: u8 tag, u16be len, len bytes
+//
+// SAFETY / SOUNDNESS
+//   * Every read routes through the single bounds-check+advance primitive
+//     `_cur_advance`, so there is exactly ONE place that can move `pos` and it
+//     never lets `pos` exceed `len` — the invariant `0 <= pos <= len` holds for
+//     the entire lifetime of a Cursor.
+//   * Negative lengths are rejected (a negative n would slip past `n > avail`
+//     and move the cursor BACKWARD — guarded explicitly).
+//   * `start + n` cannot overflow: after the check `n <= avail = len - start`,
+//     and the runtime caps a buffer at 2^40 bytes, so `start + n <= len < 2^40`.
+//   * cur_varint caps at 10 bytes (ceil(64/7)) so a malformed continuation run
+//     cannot spin — it errors "too long".
+//
+// LEAF — imports NOTHING.
+
+type Cursor
+    data: bytes
+    pos: int
+
+// A tag/length/value record — the shape codec framing reduces to; used by
+// cur_read_tlv to demonstrate `?`-chained reads.
+type Tlv
+    tag: int
+    length: int
+    value: bytes
+
+// ── Constructor & introspection ───────────────────────────────────────────────
+
+fn cur_new(b) -> Cursor
+    return Cursor(b, 0)
+
+fn cur_remaining(c) -> int
+    let r = bytes_len(c.data) - c.pos
+    return r if r > 0 else 0
+
+fn cur_eof(c) -> bool
+    return c.pos >= bytes_len(c.data)
+
+// ── The single bounds-check + advance primitive ───────────────────────────────
+// Reserves `n` bytes starting at the current position. On success advances the
+// cursor by n and returns ok(start) — the index the reserved run begins at. On
+// a negative length or an over-read it advances NOTHING and returns err. Every
+// public read is built on top of this, so bounds logic lives in exactly one place.
+fn _cur_advance(c, n) -> Result
+    if n < 0
+        return err("cursor: negative read length {n}")
+    let start = c.pos
+    let avail = bytes_len(c.data) - start
+    if n > avail
+        return err("cursor: over-read of {n} at pos {start} ({avail} remaining)")
+    c.pos = start + n
+    return ok(start)
+
+// ── The single fixed-width unsigned-int assembler ─────────────────────────────
+// Reads n bytes and folds them into an unsigned integer, MSB-first for big-
+// endian or LSB-first for little-endian. u16/u32 in both byte orders all route
+// through here — no per-width, per-endianness copy-paste. The fold
+// `(acc << 8) | b` walks the bytes most-significant-first; for little-endian we
+// simply reverse the byte list first (the low byte ends up last in the fold).
+fn _cur_read_uint(c, n, be) -> Result
+    let start = _cur_advance(c, n)?
+    let raw = [bytes_get(c.data, start + i) & 0xFF for i in 0..n]
+    let ordered = raw if be else reversed(raw)
+    let value = ordered.reduce(fn(acc, b) (acc << 8) | b, 0)
+    return ok(value)
+
+// ── Fixed-width reads ─────────────────────────────────────────────────────────
+
+fn cur_u8(c) -> Result
+    let start = _cur_advance(c, 1)?
+    return ok(bytes_get(c.data, start) & 0xFF)
+
+fn cur_u16be(c) -> Result
+    return _cur_read_uint(c, 2, true)
+
+fn cur_u16le(c) -> Result
+    return _cur_read_uint(c, 2, false)
+
+fn cur_u32be(c) -> Result
+    return _cur_read_uint(c, 4, true)
+
+fn cur_u32le(c) -> Result
+    return _cur_read_uint(c, 4, false)
+
+// ── Variable-width reads ──────────────────────────────────────────────────────
+
+// cur_bytes: return the next n bytes as a fresh, independent slice (a copy, so
+// later mutation of the source buffer cannot alias the returned value).
+fn cur_bytes(c, n) -> Result
+    let start = _cur_advance(c, n)?
+    return ok(bytes_slice(c.data, start, start + n))
+
+// cur_skip: advance past n bytes without materializing them; ok(n) on success.
+fn cur_skip(c, n) -> Result
+    let start = _cur_advance(c, n)?
+    return ok(n)
+
+// cur_varint: decode one unsigned LEB128 integer (7 payload bits per byte, high
+// bit = "more follows"). Bounded two ways: each byte is read through cur_u8, so
+// running off the end yields an over-read err; and the byte count is capped at
+// 10 (ceil(64/7)) so a runaway continuation run errors "too long" instead of
+// spinning. Payload bits accumulate LSB-first: byte i contributes bits at 7*i.
+fn cur_varint(c) -> Result
+    let value = 0
+    let shift = 0
+    let count = 0
+    let going = 1
+    while going == 1
+        let b = cur_u8(c)?
+        value = value | ((b & 0x7F) << shift)
+        shift = shift + 7
+        count = count + 1
+        if (b & 0x80) == 0
+            going = 0
+        else if count >= 10
+            return err("cursor: varint too long (>10 bytes) at pos {c.pos}")
+    return ok(value)
+
+// ── Showcase: reading a small record with `?` ─────────────────────────────────
+// A tag/length/value frame — one line per field, the first over-read
+// short-circuits the whole reader with a contextual error. This is the pattern
+// every binary codec's inner loop wants and the reason the cursor exists.
+fn cur_read_tlv(c) -> Result
+    let tag = cur_u8(c)?
+    let length = cur_u16be(c)?
+    let value = cur_bytes(c, length)?
+    return ok(Tlv(tag, length, value))

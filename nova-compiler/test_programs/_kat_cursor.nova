@@ -1,0 +1,96 @@
+// KAT for std/io/cursor — known-answer test.
+//
+// Buffer layout (12 bytes), each field with an exact expected value:
+//   [0]      0x2A                     -> cur_u8      = 42
+//   [1..2]   0x01 0x02  (big-endian)  -> cur_u16be   = 0x0102     = 258
+//   [3..6]   0x04 0x03 0x02 0x01 (LE) -> cur_u32le   = 0x01020304 = 16909060
+//   [7..8]   0xAC 0x02  (LEB128)      -> cur_varint  = 300
+//   [9..11]  0xDE 0xAD 0xBE           -> cur_bytes(3)= [222,173,190]
+// After the full read the cursor is at EOF; a further read MUST return err
+// (never crash, never a silent 0).
+
+import std/io/cursor
+
+type Rec
+    tag: int
+    a: int
+    b: int
+    v: int
+    body: bytes
+
+fn check(cond, msg)
+    if not cond
+        print("FAIL: " + msg)
+        exit(1)
+
+// Reads the whole record with the ? operator — the first over-read would
+// short-circuit the entire reader with a contextual error.
+fn read_record(c) -> Result
+    let tag = cur_u8(c)?
+    let a = cur_u16be(c)?
+    let b = cur_u32le(c)?
+    let v = cur_varint(c)?
+    let body = cur_bytes(c, 3)?
+    return ok(Rec(tag, a, b, v, body))
+
+fn verify_record(r)
+    check(r.tag == 42, "u8 tag == 42 (got {r.tag})")
+    check(r.a == 258, "u16be == 258 (got {r.a})")
+    check(r.b == 16909060, "u32le == 16909060 (got {r.b})")
+    check(r.v == 300, "varint == 300 (got {r.v})")
+    check(bytes_len(r.body) == 3, "bytes len == 3 (got {bytes_len(r.body)})")
+    check(bytes_get(r.body, 0) == 222, "body[0] == 222")
+    check(bytes_get(r.body, 1) == 173, "body[1] == 173")
+    check(bytes_get(r.body, 2) == 190, "body[2] == 190")
+
+fn fail_err(e)
+    print("FAIL: unexpected err from full read: " + e)
+    exit(1)
+
+fn bad_overread(v)
+    print("FAIL: over-read returned a value instead of err: " + str(v))
+    exit(1)
+
+fn main()
+    let raw = [0x2A, 0x01, 0x02, 0x04, 0x03, 0x02, 0x01, 0xAC, 0x02, 0xDE, 0xAD, 0xBE]
+    let buf = bytes(0)
+    for x in raw
+        buf = bytes_append(buf, x)
+
+    let c = cur_new(buf)
+    check(cur_remaining(c) == 12, "remaining starts at 12 (got {cur_remaining(c)})")
+    check(cur_eof(c) == false, "not eof at start")
+
+    // Read the full record via ?-chaining, then verify every field via match.
+    match read_record(c)
+        Ok(r) => verify_record(r)
+        Err(e) => fail_err(e)
+
+    // Cursor is now exhausted.
+    check(cur_remaining(c) == 0, "remaining == 0 after full read (got {cur_remaining(c)})")
+    check(cur_eof(c) == true, "eof after full read")
+
+    // Over-read at EOF must return err, not crash and not a silent 0.
+    match cur_u8(c)
+        Ok(v) => bad_overread(v)
+        Err(e) => check(true, "u8 over-read rejected")
+
+    // Multi-byte over-read on a short buffer must also err (4-byte read, 2 left).
+    let c2 = cur_new(buf)
+    let s = cur_skip(c2, 10)
+    check(is_ok(s), "skip 10 ok")
+    match cur_u32be(c2)
+        Ok(v) => bad_overread(v)
+        Err(e) => check(true, "u32be over-read rejected")
+
+    // Varint bounded: a run of continuation bytes with no terminator errs,
+    // it does not spin — build 11 x 0x80 (all "more follows").
+    let vbuf = bytes(0)
+    for i in 0..11
+        vbuf = bytes_append(vbuf, 0x80)
+    let c3 = cur_new(vbuf)
+    match cur_varint(c3)
+        Ok(v) => bad_overread(v)
+        Err(e) => check(true, "unterminated varint rejected")
+
+    print("CURSOR KAT PASS")

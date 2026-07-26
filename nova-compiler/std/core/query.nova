@@ -1,0 +1,214 @@
+// ============================================================================
+// std/core/query — fluent, GENERIC data-query / transform pipeline over a list
+// ============================================================================
+// A LINQ-style pipeline: wrap a list in a `Query`, chain transforms via UFCS,
+// then materialize with a terminal. Written in NOVA's HIGH-LEVEL style —
+// GENERICS (`type Query<T>` + `fn <T> ...` methods), comprehensions, closures,
+// `match` + Option — NOT hand-rolled index while-loops + any/type_of. A
+// while-loop is a last resort.
+//
+//   q_from(xs) -> Query<T>           wrap a list into a pipeline
+//
+//   TRANSFORMS (return a new Query; each builds a FRESH list — the source is
+//   never mutated; chainable via UFCS: x.where(...).map(...)...):
+//     .where(pred)      keep elements where pred(x) is truthy        -> Query<T>
+//     .map(f)           apply f to every element (T -> U)            -> Query<U>
+//     .flat_map(f)      map each element to a list, concatenate      -> Query<U>
+//     .sort_by(keyfn)   stable ascending sort by keyfn(x)            -> Query<T>
+//     .take(n)          first n (bounds-clamped: n<0 -> [], n>len->all)
+//     .drop(n)          all but the first n (bounds-clamped)
+//     .distinct()       dedup by structural ==, first-seen order preserved
+//
+//   TERMINALS (materialize the pipeline):
+//     .group_by(keyfn)  -> dict      keyfn(x) -> list of matching elements
+//     .reduce(f, init)  -> any       fold via f(acc, x), seeded with init
+//     .sum()            -> any       numeric sum (float-aware; empty -> 0)
+//     .count()          -> int       number of elements
+//     .first()          -> Option    Some(x0) or None on an empty pipeline
+//     .to_list()        -> list<T>   the materialized list
+//
+// GENERICS — this module is fully generic and the generic forms COMPILE and run:
+//   * `type Query<T>` is a generic struct (`items: list<T>`).
+//   * Every method is generic (`fn <T> Query.where(self: Query<T>, ...)`); the
+//     element-changing `.map`/`.flat_map` carry a second param `<T, U>` and
+//     honestly return `Query<U>` (a *new* element type, since the closure changes
+//     it). The fluent UFCS chain resolves each `Query__method` through the
+//     compiler's static struct-type tracking.
+//   * The private list->list helpers are generic where T flows through unchanged
+//     (`fn <T> _q_take(xs: list<T>, n) -> list<T>`) — the proven std/core/seq
+//     pattern. `.reduce`/`.sum` honestly return `any`: NOVA cannot infer a return
+//     type through an untyped closure, exactly as seq.nova documents.
+//
+// COMPILER NOTE (import + builtin-name collision) — a builtin-named method
+//   (.map/.sum/.reduce/.sort_by) invoked as the VERY FIRST call directly on a
+//   `q_from(...)` result fails to type-check WHEN THIS MODULE IS IMPORTED, e.g.
+//       q_from([1,2,3]).sum()
+//       = help: container element types must match ...
+//   Root cause: an imported type's methods are not registered in the importing
+//   unit's method table, so a builtin-named method on a *concretely* Query-typed
+//   receiver is mis-resolved to the builtin HOF (which wants a `list`) instead of
+//   `Query__sum`. Every other position works: start the chain with any
+//   non-builtin step (`.where`, the idiomatic filter) and .map/.sum/.reduce/
+//   .sort_by all resolve — that is exactly how real pipelines read. (Same-file,
+//   non-imported use has no such limitation.) Reported in compiler_findings.
+//
+// NOTES
+//   * `sum()` is float-aware and yields a float for a numeric list (e.g. 15.0).
+//   * `.where`/`.map`/`.group_by` take CLOSURES (`fn(x) ...`); `.reduce` takes
+//     `fn(acc, x) ...`; `.sort_by`/`.group_by` take a key function `fn(x) -> k`.
+//   * LEAF module — imports nothing.
+// ============================================================================
+
+type Query<T>
+    items: list<T>
+
+// q_from: wrap a list into a Query pipeline. Generic — element type T flows in.
+fn <T> q_from(xs: list<T>) -> Query<T>
+    return Query(xs)
+
+// ── Transforms (chainable) ───────────────────────────────────────────────────
+
+// where: keep elements satisfying pred. `[x for x in xs if pred(x)]`.
+fn <T> Query.where(self: Query<T>, pred) -> Query<T>
+    return Query([x for x in self.items if pred(x)])
+
+// map: apply f to every element (element type may change T -> U).
+fn <T, U> Query.map(self: Query<T>, f) -> Query<U>
+    return Query([f(x) for x in self.items])
+
+// flat_map: map each element to a list, then concatenate one level.
+// The chained-`for` comprehension IS the flat-map.
+fn <T, U> Query.flat_map(self: Query<T>, f) -> Query<U>
+    return Query([y for x in self.items for y in f(x)])
+
+// sort_by: stable ascending sort by keyfn(x). keyfn returns a comparable scalar
+// (int/float/string). Uses the module's own generic stable merge-sort — NOT the
+// builtin sort_by, whose key is int-only (it silently mis-orders string/float
+// keys). Key is computed exactly once per element.
+fn <T> Query.sort_by(self: Query<T>, keyfn) -> Query<T>
+    return Query(_q_sort_by(self.items, keyfn))
+
+// take: first n elements (bounds-clamped, overflow-safe via _q_clamp).
+fn <T> Query.take(self: Query<T>, n: int) -> Query<T>
+    return Query(_q_take(self.items, n))
+
+// drop: all but the first n elements (bounds-clamped).
+fn <T> Query.drop(self: Query<T>, n: int) -> Query<T>
+    return Query(_q_drop(self.items, n))
+
+// distinct: dedup by structural ==, first-seen order preserved (O(n) via a set).
+fn <T> Query.distinct(self: Query<T>) -> Query<T>
+    return Query(_q_distinct(self.items))
+
+// ── Terminals (materialize) ──────────────────────────────────────────────────
+
+// group_by: bucket elements by keyfn(x) into a dict key -> list.
+fn <T> Query.group_by(self: Query<T>, keyfn) -> dict
+    return _q_group_by(self.items, keyfn)
+
+// reduce: fold the pipeline via f(acc, x), seeded with init.
+fn <T> Query.reduce(self: Query<T>, f, init: any) -> any
+    return reduce(self.items, f, init)
+
+// sum: numeric sum of the elements (float-aware; empty -> 0).
+fn <T> Query.sum(self: Query<T>) -> any
+    return sum(self.items)
+
+// count: number of elements.
+fn <T> Query.count(self: Query<T>) -> int
+    return len(self.items)
+
+// first: the first element as an Option (None on an empty pipeline).
+fn <T> Query.first(self: Query<T>) -> Option
+    if len(self.items) == 0
+        return none()
+    return some(self.items[0])
+
+// to_list: the materialized list (each transform already produced a fresh list).
+fn <T> Query.to_list(self: Query<T>) -> list<T>
+    return self.items
+
+// ── Generic private helpers (element type T flows through unchanged) ─────────
+
+// _q_clamp: clamp v into [lo, hi]. Guards take/drop bounds (n<0 or n>len).
+fn _q_clamp(v: int, lo: int, hi: int) -> int
+    return max(lo, min(v, hi))
+
+fn <T> _q_take(xs: list<T>, n: int) -> list<T>
+    let hi = _q_clamp(n, 0, len(xs))
+    return [xs[i] for i in 0..hi]
+
+fn <T> _q_drop(xs: list<T>, n: int) -> list<T>
+    let lo = _q_clamp(n, 0, len(xs))
+    return [xs[i] for i in lo..len(xs)]
+
+fn <T> _q_distinct(xs: list<T>) -> list<T>
+    let seen = set_create()
+    let out = []
+    for x in xs
+        if not set_has(seen, x)
+            set_add(seen, x)
+            push(out, x)
+    return out
+
+fn <T> _q_group_by(xs: list<T>, keyfn) -> dict
+    let groups = {}
+    for x in xs
+        let k = keyfn(x)
+        if contains(groups, k)
+            push(groups[k], x)
+        else
+            groups[k] = [x]
+    return groups
+
+// ── Generic stable merge-sort by key (int / float / string keys) ─────────────
+
+// _q_key_lt: is key a strictly less than key b? Strings compare lexicographically
+// (mixed types fall back to str() form so a bad keyfn can never crash); numbers
+// compare after coercing BOTH to float (sound float-vs-float compare, not the
+// unsound float-vs-int form).
+fn _q_key_lt(a, b) -> bool
+    if type_of(a) == "string" or type_of(b) == "string"
+        return str(a) < str(b)
+    let af = a * 1.0
+    let bf = b * 1.0
+    return af < bf
+
+// _q_merge: stable two-pointer merge of two key-decorated lists ([key, value]).
+// Takes from the LEFT on ties (b.key < a.key is required to take from the right),
+// which is what makes the sort stable.
+fn _q_merge(a: list, b: list) -> list
+    let out = []
+    let i = 0
+    let j = 0
+    while i < len(a) and j < len(b)
+        if _q_key_lt(b[j][0], a[i][0])
+            push(out, b[j])
+            j = j + 1
+        else
+            push(out, a[i])
+            i = i + 1
+    while i < len(a)
+        push(out, a[i])
+        i = i + 1
+    while j < len(b)
+        push(out, b[j])
+        j = j + 1
+    return out
+
+// _q_msort: recursive merge-sort over key-decorated [key, value] pairs.
+fn _q_msort(pairs: list) -> list
+    let n = len(pairs)
+    if n <= 1
+        return pairs
+    let mid = n / 2
+    let left = _q_msort([pairs[i] for i in 0..mid])
+    let right = _q_msort([pairs[i] for i in mid..n])
+    return _q_merge(left, right)
+
+// _q_sort_by: decorate each element with keyfn(x) (computed once), stable-sort by
+// key, then undecorate. Generic over element type T; keys may be int/float/string.
+fn <T> _q_sort_by(xs: list<T>, keyfn) -> list<T>
+    let pairs = [[keyfn(x), x] for x in xs]
+    let sorted = _q_msort(pairs)
+    return [p[1] for p in sorted]
