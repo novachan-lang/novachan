@@ -101,7 +101,7 @@ one shortcut reverted for a concurrency race); L11 #32.
 | 6 | N>1 per-carrier I/O sharding + work-stealing — split global `nova_io_waiters`, kill `g_sched_lock` hot path | [rt] | L | more cores currently = slower I/O |
 | 7 | Safepoint preemption + `kill` — compiler-inserted yield-checks at loop back-edges; timer + doomed flag | [cc/rt] | XL (supervised) | #1 concurrency item; gates soft-realtime + Erlang-parity supervision |
 | 8 | ALPN on TLS accept path — enables h2/gRPC over TLS + browser HTTP/2 | [fg] | L | `grep -i alpn` = 0 today |
-| 9 | Windows TLS *server* — SChannel server handshake (`nova_rt_tls_listen/accept` are stubs) | [rt/fg] | L | HTTPS on the dev's own OS |
+| 9 | Windows TLS *server* — **✅ DONE `3c1f746d`** — SChannel INBOUND server: `nova_load_server_cert` (PFX via dynamically-loaded crypt32), `tls_listen` (SECPKG_CRED_INBOUND), `tls_accept` + `AcceptSecurityContext` handshake loop, encrypted `tls_recv/send`; bonus `tls_connect_insecure` (curl -k). Gate `[CI 2e3]` `_test_tls_server.ps1` = self-signed PFX → NOVA server → .NET TLS client → encrypted round-trip. Reconverged + both-mode. FOLLOW-ON: blocking sockets → sequential (netpoller integration for concurrent HTTPS). | [rt/fg] | L | HTTPS on the dev's own OS |
 | 10 | Linux FD_SETSIZE ≥1024 → `poll`/`epoll` netpoller (CVE-class stack corruption at high concurrency) | [rt] | M | |
 | 11 | DB fidelity — 🔄 NUL-safety MOSTLY DONE: **base32/TOTP ✅** (`7c6f6c99`: `base32_decode_bytes`; fixed ~7.5%-wrong-OTP). **Redis ✅** (`9266fa52`: forge_redis rewritten bytes-based end-to-end — `tcp_send_bytes`/`tcp_recv_bytes` + bulk-as-`bytes` via `bytes_slice` + text/`_bytes` API split; KAT `_redis_binsafe_test` NORMAL+FULLRC green). **PG-DataRow N/A** (forge_pg uses all-TEXT result format — PG never emits raw 0x00 in text values; changing to bytes would regress). **★ WHOLE CLUSTER ADVERSARIALLY AUDITED `ac3501a5` 2026-07-23** (37-agent ultracode workflow; caught+fixed 4 KAT-missed bugs: totp_secret encode NUL-truncation HIGH, orm_all int-as-list mem-safety HIGH, MySQL midnight-DATETIME MED, redis_get error-as-success MED; compiler float-bits + PG side clean). **orm_exec affected-rows ✅ DONE `c44508a1`** (Wave-C #7: PG `pg_cmd_affected`+`pg_exec_params`, MySQL `mysql_ok_affected`; all 3 backends return driver count; offline KATs both modes). TRACKED: `std/net/resp2._r2_parse_bulk` has same bulk-str `chr()` truncation (framing safe, value corrupt) — API-changing (`d["str"]`→bytes), no binary consumer today. | [fg/rt] | M | #11+#7 DB-fidelity cluster CLOSED (live-DB e2e pending server) |
 
@@ -112,7 +112,7 @@ one shortcut reverted for a concurrency race); L11 #32.
 | 13 | D4 signed bignum — **✅ EXISTS+GATED** (`std/numeric/bignum` tracked; verify signed-completeness) | [fg] | M | finance/crypto base |
 | 14 | D2 BigDecimal — **✅ EXISTS+GATED** (`std/numeric/decimal` tracked + `_decimal_test` in manifest; verify completeness) | [fg] | L | after #13 |
 | 15 | Argon2id password hashing — **✅ DONE** (`std/crypto/argon2id` tracked + `_argon2id_test` gated) | [fg] | M | best-practice storage |
-| 16 | S2 HTTP-client redirects/cookies/proxy — **EXISTS-UNGATED** (`forge/forge_http_client` tracked, no gated test; needs a live/mock-server KAT) | [fg] | M | attended (network test) |
+| 16 | S2 HTTP-client redirects/cookies/proxy — **🔄 redirects+cookies DONE `e11935a3`** — `http_get_follow(url,max)` follows 301/302/303/307/308 via Location (+ relative-Location resolve, budget guard); cookie jar `http_get_session` (absorb Set-Cookie → Cookie header across hops). KAT `_kat_http_redirect` (loopback 302→200). REMAINING: proxy/CONNECT tunnel. | [fg] | M | attended (network test) |
 | 17 | S3 sync primitives — **✅ DONE** (`std/sync/mutex`+`semaphore` tracked; `_sync_test` gated single-threaded; added `_syncmutex_test` verifying mutual exclusion under N=1 AND N=4 contention) | [rt] | M | |
 | 18 | S5 file perms/symlinks — **✅ DONE** — `chmod`/`umask`/`symlink`/`readlink` builtins (runtime C, POSIX-primary; Windows: chmod→read-only bit, `_umask`, symlink needs Dev Mode, readlink unsupported). KAT `_kat_perms` gated (cross-platform: chmod/umask verified, symlink/readlink graceful). | [rt] | M | done |
 | 19 | S6 unix domain sockets — genuinely MISSING (runtime; Win AF_UNIX+netpoller caveat) | [rt] | M | |
@@ -132,11 +132,11 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 |---|---|---|---|---|
 | 24 | T-ABI enforcement — do first; resolver/registry need it | [tool] | S | |
 | 25 | T-LSP inferer-backed hover/completion/refs/rename (replace regex text-scan) | [tool] | L | highest-leverage DevX win |
-| 26 | T-Pkg wire the (existing) transitive resolver + `nova.lock` into the CLI | [tool] | L | resolver exists, unwired |
+| 26 | T-Pkg wire the (existing) transitive resolver + `nova.lock` into the CLI — **🔄 lockfile DONE `dcd8fae8`** — `nova install` now honors `nova.lock` (reproducible, npm-ci-style) + writes it otherwise, via `lockfile_read/write`. Gated (reconverge + both-mode) KAT `_kat_pkg_lock`. REMAINING: full transitive-resolver CLI wiring (resolver `nova_pkg.nova` exists). | [tool] | L | resolver exists, unwired |
 | 27 | T-Doc `nova doc` generator (559 modules discoverable) — shares LSP TiState | [tool] | L | |
 | 28 | T-Test property-based + mocks + DB-rollback + per-fn ergonomics | [tool] | M | registry quality gate |
 | 29 | T-Profile sampling profiler | [tool] | L | |
-| 30 | T-REPL productization | [tool] | S | |
+| 30 | T-REPL productization — **✅ DONE `2543df3c`** — the REPL was BROKEN (stale `output/nova_runtime.c` path from the compiler relocation), not merely un-productized; fixed with robust runtime resolution in `repl.nova` (NOVA_RUNTIME override → first-existing of `../compiler|compiler|output|flat`) + wired `_test_repl.ps1` into nova_ci as gate `[CI 2e2/3]` (compiles+links+runs a line end-to-end: `6*7 → 42`). | [tool] | S | |
 | 31 | T-Install signed installer | [tool] | M | |
 
 ## BLOCK E — Phase 3: language ceilings (the declarative multiplier) — PURE COMPILER WORK
