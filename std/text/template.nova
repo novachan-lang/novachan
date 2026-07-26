@@ -15,8 +15,15 @@
 // ord(char_at(s,i)) — NEVER string-literal "{" comparisons, which would be
 // subject to NOVA's "{" interpolation rules.
 //
-// No external imports. Pure NOVA — no reconverge required.
+//   tpl_render(template, vars) -> Result   -- ok(rendered) | err("unknown key: <k>")
+//   tpl_render_default(template, vars, default) -> string  -- never errs
+//   tpl_keys(template) -> list             -- distinct {key} names, first-seen order
+//   tpl_fill(template, rows) -> list       -- render each row (list of dicts)
+//
+// Imports std/core/list (list_unique) for tpl_keys' dedup step.
 // ============================================================================
+
+import std/core/list
 
 // Scan `tmpl` for {{ ... }} placeholders.
 // Each placeholder inner text is trimmed; looked up in `vars`; missing = "".
@@ -57,3 +64,121 @@ fn template_render(tmpl, vars) -> string
             out = out + char_at(tmpl, i)
             i = i + 1
     out
+
+// ============================================================================
+// tpl_render / tpl_render_default / tpl_keys / tpl_fill
+// ============================================================================
+// A second, simpler single-brace {key} template style (Python str.format-ish),
+// distinct from the double-brace {{key}} Mustache engine above. Fallible by
+// default (tpl_render returns a Result — an unknown key is an error, not a
+// silent ""), with an explicit non-failing variant (tpl_render_default) for
+// callers who want a filled-in placeholder instead of a Result.
+//
+// Escaping: \{ and \} in the template TEXT emit a literal brace character
+// instead of opening/closing a placeholder. An unterminated "{..." (no
+// closing "}" before end of string) degrades to literal text rather than
+// erroring — bad input never crashes the parser.
+//
+// Brace/backslash detection: braces are matched via ord(char_at(s,i)) against
+// 123/125 (never a bare "{"/"}" string literal — a raw "{expr}" inside a
+// NOVA string literal is parsed as INTERPOLATION at compile time, and an
+// undefined identifier inside it silently becomes 0 instead of a compile
+// error — confirmed live). A literal backslash IS safely written as "\\"
+// (the same proven pattern std/automata/regex, std/data/yaml and
+// std/parsing/glob already use for backslash detection).
+// ============================================================================
+
+// PRIVATE: scan `template` into an ordered token list. Each token is a
+// 2-element list [kind, text]: kind "L" = literal text, kind "K" = a {key}
+// placeholder name. One left-to-right char scan with a nested while for the
+// key body — no unrolling, no duplicated blocks.
+fn _tpl_parse(template: string) -> list
+    let toks = []
+    let lit = ""
+    let i = 0
+    let n = len(template)
+    while i < n
+        let c = char_at(template, i)
+        if c == "\\" and i + 1 < n and (ord(char_at(template, i + 1)) == 123 or ord(char_at(template, i + 1)) == 125)
+            // \{ or \} — literal brace, consume both source chars
+            lit = lit + char_at(template, i + 1)
+            i = i + 2
+        else if ord(c) == 123
+            if len(lit) > 0
+                push(toks, ["L", lit])
+                lit = ""
+            let j = i + 1
+            let key = ""
+            let closed = false
+            while j < n and not closed
+                if ord(char_at(template, j)) == 125
+                    closed = true
+                else
+                    key = key + char_at(template, j)
+                    j = j + 1
+            if closed
+                push(toks, ["K", key])
+                i = j + 1
+            else
+                // unterminated placeholder — degrade to literal text
+                lit = lit + chr(123) + key
+                i = j
+        else
+            lit = lit + c
+            i = i + 1
+    if len(lit) > 0
+        push(toks, ["L", lit])
+    return toks
+
+// tpl_render(template, vars) -> Result
+// Substitutes every {key} with str(vars[key]); the FIRST key (in scan order)
+// missing from vars short-circuits the whole render with an Err — the
+// policy is "fail loud on typos", matching Result's role everywhere else in
+// NOVA (no silent wrong output).
+fn tpl_render(template: string, vars: dict) -> Result
+    let toks = _tpl_parse(template)
+    let out = ""
+    for tok in toks
+        match tok[0]
+            "L" =>
+                out = out + tok[1]
+            "K" =>
+                if not contains(vars, tok[1])
+                    return err("unknown key: " + tok[1])
+                out = out + str(vars[tok[1]])
+            _ =>
+                out = out + ""
+    return ok(out)
+
+// tpl_render_default(template, vars, default) -> string
+// Same substitution, but a missing key renders `default_val` instead of
+// erroring. Never fails — always returns a string.
+fn tpl_render_default(template: string, vars: dict, default_val: string) -> string
+    let toks = _tpl_parse(template)
+    let out = ""
+    for tok in toks
+        match tok[0]
+            "L" =>
+                out = out + tok[1]
+            "K" =>
+                if contains(vars, tok[1])
+                    out = out + str(vars[tok[1]])
+                else
+                    out = out + default_val
+            _ =>
+                out = out + ""
+    return out
+
+// tpl_keys(template) -> list
+// The distinct {key} names referenced in `template`, in first-seen order.
+fn tpl_keys(template: string) -> list
+    let toks = _tpl_parse(template)
+    let raw_keys = [tok[1] for tok in toks if tok[0] == "K"]
+    return list_unique(raw_keys)
+
+// tpl_fill(template, rows) -> list
+// Renders `template` once per row in `rows` (a list of dicts). Uses the
+// tpl_render_default policy per row (a key missing from a given row renders
+// as "" for that row) so one malformed row can never abort the whole batch.
+fn tpl_fill(template: string, rows: list) -> list
+    return rows.map(fn(row) tpl_render_default(template, row, ""))

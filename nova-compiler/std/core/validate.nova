@@ -1,0 +1,148 @@
+// ============================================================================
+// std/core/validate — composable validation combinators (Result-returning)
+// ============================================================================
+// Validation-as-values: every check here is a plain function that takes a
+// subject and returns a `Result` (Ok(value) | Err(message)) — never a bool,
+// never a thrown/exit-ing failure. That is what makes them COMPOSABLE: a
+// caller chains checks with `match`, batches them with `v_all`, or attaches
+// them to a dict field with `v_field`, all through the same Result shape used
+// by the rest of std/core (result.nova / result_ext.nova / opt.nova).
+//
+// GENERICS — bare `Result`, not `Result<T,E>`: this module is meant to be
+// imported, and an imported generic function whose declared type is the
+// BARE/direct type parameter (`Result<T,E>`, `Option<T>`, or a raw `x: T`)
+// fails to freshen per call site across the import boundary (reproduced and
+// documented in std/core/result_ext.nova's header). `Result` and `Option` here
+// are the concrete built-in sum types, not instantiated with a type param, so
+// every function below keeps params bare (`Result`, `list<Result>`, `any`)
+// exactly like result.nova / result_ext.nova / opt.nova.
+//
+// LEAF module — imports nothing (mirrors result_ext.nova's convention so it
+// has zero import-boundary risk of its own).
+//
+// API:
+//   v_check(value, pred, msg)     -> Result   ok(value) if pred(value) else err(msg)
+//   v_required(v)                 -> Result   err("required") if null, or an
+//                                              empty string/list/dict; else ok(v)
+//   v_min_len(s, n)                -> Result   ok(s) if len(s) >= n else err(...)
+//   v_max_len(s, n)                -> Result   ok(s) if len(s) <= n else err(...)
+//   v_in_range(n, lo, hi)          -> Result   ok(n) if lo <= n <= hi else err(...)
+//   v_matches(s, pred, msg)        -> Result   v_check specialised for a string
+//                                              subject (e.g. `fn(x) x matches "..."`)
+//   v_all(rs)                      -> Result   all-or-nothing over list<Result>:
+//                                              ok(list-of-values) if every element
+//                                              is Ok; the FIRST Err short-circuits
+//   v_errors(rs)                   -> list     every Err message, in order, no
+//                                              short-circuit; [] if all Ok
+//   v_field(d, key, validators)    -> Result   run every `fn(value) -> Result`
+//                                              validator against d[key] (missing
+//                                              key -> null); ok(value) if all
+//                                              pass, else the first failure's
+//                                              message prefixed with the key
+
+// ── base combinator ──────────────────────────────────────────────────────────
+
+// v_check: every other single-value validator below composes from this one.
+fn v_check(value: any, pred, msg: string) -> Result
+    return ok(value) if pred(value) else err(msg)
+
+// v_required: a value must be PRESENT and non-falsy. null always fails, and so
+// does an "empty" measurable container (string/list/dict of length 0).
+//
+// VERIFIED RUNTIME BEHAVIOR — 0 and false ALSO fail (same as null), and this
+// is not a design shortcut: NOVA's `any` representation gives an int 0, a
+// bool false, and null the IDENTICAL raw bit pattern with no distinguishing
+// runtime tag (unlike string/list/dict, which carry a heap type tag checkable
+// via the allocator). Confirmed by direct probe: `type_of(null)`,
+// `type_of(false)`, and `type_of(0)` all report `"int"` — there is no runtime
+// way to tell them apart once boxed as `any` — so `v == null` is unavoidably
+// true for a 0/false argument too. Rather than claim a distinction the
+// runtime cannot make, v_required embraces the same falsy-fails-required
+// convention as JS/Python truthiness-based validation: null, 0, false, "",
+// [], and {} all fail; any other value (including a non-zero int/float, or
+// `true`) passes.
+fn v_required(v: any) -> Result
+    if v == null
+        return err("required")
+    let t = type_of(v)
+    if t == "string" or t == "list" or t == "dict"
+        if len(v) == 0
+            return err("required")
+    return ok(v)
+
+// v_min_len / v_max_len: string length bounds, inclusive.
+fn v_min_len(s: string, n: int) -> Result
+    return ok(s) if len(s) >= n else err("must be at least {n} characters")
+
+fn v_max_len(s: string, n: int) -> Result
+    return ok(s) if len(s) <= n else err("must be at most {n} characters")
+
+// v_in_range: numeric bound, inclusive on both ends.
+fn v_in_range(n: any, lo: any, hi: any) -> Result
+    return ok(n) if n >= lo and n <= hi else err("must be between {lo} and {hi}")
+
+// v_matches: v_check specialised for a string subject — `pred` is typically a
+// closure built around the `matches` regex operator, e.g.
+// `v_matches(s, fn(x) x matches "^[0-9]+$", "must be numeric")`. Composes
+// v_check rather than duplicating its body.
+fn v_matches(s: string, pred, msg: string) -> Result
+    return v_check(s, pred, msg)
+
+// ── batch combinators over list<Result> ──────────────────────────────────────
+
+fn _v_is_err(r: Result) -> bool
+    match r
+        Ok(v) =>
+            return false
+        Err(e) =>
+            return true
+
+// Message of an Err Result. Only ever called after _v_is_err confirmed Err
+// (see v_errors), so the Ok arm is unreachable in practice; it still returns a
+// total value (null) rather than being partial.
+fn _v_err_msg(r: Result) -> any
+    match r
+        Ok(v) =>
+            return null
+        Err(e) =>
+            return e
+
+// v_all: all-or-nothing collect. Ok(list-of-values), in original order, if
+// every element of `rs` is Ok. The FIRST Err short-circuits immediately
+// (remaining elements are never inspected) and becomes the overall Err — this
+// is why it's a `for` loop with an early return rather than a comprehension (a
+// comprehension cannot short-circuit mid-build).
+fn v_all(rs: list<Result>) -> Result
+    let out = []
+    for r in rs
+        match r
+            Ok(v) =>
+                push(out, v)
+            Err(e) =>
+                return err(e)
+    return ok(out)
+
+// v_errors: every Err message, in original order; [] if every element is Ok.
+// Unlike v_all there is NO short-circuit — every element is inspected exactly
+// once — which is exactly what a comprehension models.
+fn v_errors(rs: list<Result>) -> list
+    return [_v_err_msg(r) for r in rs if _v_is_err(r)]
+
+// ── field-level composition ───────────────────────────────────────────────────
+
+// v_field: run every validator in `validators` (each a `fn(value) -> Result`)
+// against `d[key]` — a missing key reads as null, so `v_required` still
+// catches it rather than silently passing. Returns ok(value) if every
+// validator passes, else the first failing validator's message prefixed with
+// the field name for context (so a caller batching several v_field calls
+// through v_all/v_errors gets a message that names which field failed).
+fn v_field(d: dict, key: string, validators: list) -> Result
+    let value = null
+    if contains(d, key)
+        value = d[key]
+    let results = [validator(value) for validator in validators]
+    match v_all(results)
+        Ok(vs) =>
+            return ok(value)
+        Err(e) =>
+            return err("{key}: {e}")

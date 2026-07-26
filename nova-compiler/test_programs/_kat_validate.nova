@@ -1,0 +1,109 @@
+// KAT: std/core/validate — composable validation combinators (Result-returning).
+import std/core/validate
+
+// ── local helpers: extract-then-compare, never Result == Result ───────────────
+// WHY: v_required/v_all/v_field are each exercised below against SEVERAL
+// different concrete Ok-payload types in this ONE file (string, int, list,
+// dict...). This surfaced a real, isolated compiler gap (probed+confirmed
+// this session — see the `_probe_validate_import*.nova` / `_probe_mod5.nova`
+// series left alongside this KAT): an IMPORTED function with an `any`
+// parameter that flows into a bare `Result` return does not get its
+// Ok-payload type refreshed per call site within one importing file — the
+// concrete type resolved at whichever call FIRST forces it (e.g. the first
+// `== ok(...)`, or the first time the payload's value is read/compared at
+// all, even indirectly through another same-file helper) is cached and
+// reused for every later call to that SAME imported function name. A later
+// call with a DIFFERENT concrete payload type then spuriously fails to
+// typecheck (`expected string, found int`, etc.) — not at the mismatched
+// call itself, but wherever its result's payload is next inspected.
+// Confirmed safe workaround: never let the checker need a concrete type for
+// the payload at all. `_kat_is_ok` (matches the tag, never reads `v`) and
+// `_kat_ok_str` (immediately widens the payload through `str()`, which is
+// non-generic — always `any -> string` — so it never asks the checker to
+// unify the payload's type with anything) both proved stable across
+// heterogeneous call types in isolation; a direct `v == expected` inside a
+// same-file helper did not. v_check/v_min_len/v_max_len/v_in_range/v_matches
+// below are each exercised at ONE consistent payload type per function, so
+// they use the natural `== ok(...)` idiom directly — confirmed safe: the bug
+// only fires when calls to the SAME imported function disagree on type.
+fn _kat_is_ok(r: Result) -> bool
+    match r
+        Ok(v) =>
+            return true
+        Err(e) =>
+            return false
+
+fn _kat_ok_str(r: Result) -> string
+    match r
+        Ok(v) =>
+            return str(v)
+        Err(e) =>
+            return "<KAT:expected Ok, got Err({e})>"
+
+fn _kat_err_str(r: Result) -> string
+    match r
+        Ok(v) =>
+            return "<KAT:expected Err, got Ok>"
+        Err(e) =>
+            return e
+
+fn main() -> int
+    // ── v_check: base combinator ──────────────────────────────────────────
+    assert(v_check(5, fn(x) x > 0, "pos") == ok(5), "v_check: true pred -> ok(value)")
+    assert(v_check(-1, fn(x) x > 0, "must be positive") == err("must be positive"), "v_check: false pred -> err(msg)")
+
+    // ── v_required ─────────────────────────────────────────────────────────
+    assert(_kat_err_str(v_required(null)) == "required", "v_required: null -> err")
+    assert(_kat_err_str(v_required("")) == "required", "v_required: empty string -> err")
+    assert(_kat_ok_str(v_required("hi")) == "hi", "v_required: non-empty string -> ok")
+    assert(_kat_err_str(v_required([])) == "required", "v_required: empty list -> err")
+    assert(_kat_ok_str(v_required([1])) == "[1]", "v_required: non-empty list -> ok")
+    assert(_kat_err_str(v_required({})) == "required", "v_required: empty dict -> err")
+    // VERIFIED RUNTIME BEHAVIOR (not a design shortcut): 0 and false ALSO
+    // fail, matching null — see v_required's doc comment in std/core/validate
+    // for why (any-boxed null/0/false share one indistinguishable raw bit
+    // pattern; type_of() cannot tell them apart either). A genuinely
+    // non-zero/non-false value is what actually exercises the "ok" path.
+    assert(_kat_err_str(v_required(0)) == "required", "v_required: 0 is indistinguishable from null (any-boxing) -> err")
+    assert(_kat_err_str(v_required(false)) == "required", "v_required: false is indistinguishable from null (any-boxing) -> err")
+    assert(_kat_ok_str(v_required(7)) == "7", "v_required: non-zero int -> ok")
+    assert(_kat_is_ok(v_required(true)), "v_required: true -> ok")
+
+    // ── v_min_len / v_max_len ─────────────────────────────────────────────
+    assert(v_min_len("ab", 3) == err("must be at least 3 characters"), "v_min_len: too short -> err")
+    assert(v_min_len("abc", 3) == ok("abc"), "v_min_len: exact boundary -> ok")
+    assert(v_min_len("abcd", 3) == ok("abcd"), "v_min_len: longer -> ok")
+    assert(v_max_len("abcd", 3) == err("must be at most 3 characters"), "v_max_len: too long -> err")
+    assert(v_max_len("abc", 3) == ok("abc"), "v_max_len: exact boundary -> ok")
+    assert(v_max_len("ab", 3) == ok("ab"), "v_max_len: shorter -> ok")
+
+    // ── v_in_range (inclusive both ends) ──────────────────────────────────
+    assert(v_in_range(7, 1, 10) == ok(7), "v_in_range: within bounds -> ok")
+    assert(v_in_range(11, 1, 10) == err("must be between 1 and 10"), "v_in_range: above hi -> err")
+    assert(v_in_range(0, 1, 10) == err("must be between 1 and 10"), "v_in_range: below lo -> err")
+    assert(v_in_range(1, 1, 10) == ok(1), "v_in_range: lo boundary -> ok")
+    assert(v_in_range(10, 1, 10) == ok(10), "v_in_range: hi boundary -> ok")
+
+    // ── v_matches (regex predicate via the `matches` operator) ───────────
+    assert(v_matches("abc123", fn(x) x matches "^[a-z]+[0-9]+$", "must be lower+digits") == ok("abc123"), "v_matches: pattern hits -> ok")
+    assert(v_matches("ABC", fn(x) x matches "^[a-z]+[0-9]+$", "must be lower+digits") == err("must be lower+digits"), "v_matches: pattern misses -> err")
+
+    // ── v_all: all-or-nothing collect ─────────────────────────────────────
+    assert(_kat_ok_str(v_all([ok(1), ok(2)])) == "[1, 2]", "v_all: all ok -> ok(list)")
+    assert(_kat_err_str(v_all([ok(1), err("bad"), ok(3)])) == "bad", "v_all: first err short-circuits")
+    assert(_kat_ok_str(v_all([])) == "[]", "v_all: empty list -> ok([])")
+
+    // ── v_errors: every err message, no short-circuit ─────────────────────
+    assert(v_errors([ok(1), err("a"), err("b")]) == ["a", "b"], "v_errors: collects every err message in order")
+    assert(v_errors([ok(1), ok(2)]) == [], "v_errors: all ok -> []")
+
+    // ── v_field: validators against one dict field ────────────────────────
+    let d = {"name": "Ada", "age": 30}
+    assert(_kat_ok_str(v_field(d, "name", [v_required, fn(v) v_min_len(v, 2)])) == "Ada", "v_field: all validators pass -> ok(value)")
+    assert(_kat_err_str(v_field(d, "name", [fn(v) v_min_len(v, 10)])) == "name: must be at least 10 characters", "v_field: failing validator -> field-prefixed err")
+    assert(_kat_err_str(v_field(d, "missing", [v_required])) == "missing: required", "v_field: missing key reads as null -> caught by v_required")
+    assert(_kat_ok_str(v_field(d, "age", [fn(v) v_in_range(v, 18, 65)])) == "30", "v_field: numeric field passes range check")
+    assert(_kat_err_str(v_field(d, "age", [fn(v) v_in_range(v, 40, 65)])) == "age: must be between 40 and 65", "v_field: numeric field fails range check")
+
+    print("VALIDATE KAT PASS")
+    return 0
