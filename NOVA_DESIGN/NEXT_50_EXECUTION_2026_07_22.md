@@ -109,8 +109,8 @@ one shortcut reverted for a concurrency race); L11 #32.
 | # | Task | Area | Effort | Notes |
 |---|---|---|---|---|
 | 12 | S1 signal handling (SIGINT/SIGTERM/SIGHUP) — **✅ DONE** (ledger was stale). SIGINT/SIGTERM graceful shutdown already existed (`nova_signal_handler` + `shutdown_requested()` builtin + 2nd-signal force-exit). Added the missing **SIGHUP = distinct re-armable RELOAD channel** (nginx-style): `nova_reload_flag` + `nova_rt_reload_requested()` builtin (consumes/re-arms), POSIX-only (`#ifdef SIGHUP`; 0 on Win/wasm). KAT `_kat_signals` gated. | [rt] | M | done |
-| 13 | D4 signed bignum — **✅ EXISTS+GATED** (`std/numeric/bignum` tracked; verify signed-completeness) | [fg] | M | finance/crypto base |
-| 14 | D2 BigDecimal — **✅ EXISTS+GATED** (`std/numeric/decimal` tracked + `_decimal_test` in manifest; verify completeness) | [fg] | L | after #13 |
+| 13 | D4 signed bignum — **✅ DONE 2026-07-26 `4ae0d3cf`** (completeness-verified + adversary-CONFIRMED: signs already correct via a==q*b+r; div/mod/divmod on zero were silent-0 → now `Result` err; KAT `_kat_bignum_signed`) | [fg] | M | finance/crypto base |
+| 14 | D2 BigDecimal — **✅ DONE 2026-07-26 `4ae0d3cf`** (removed all exit(1) → `Result`; 7 rounding modes incl. banker's half-even sign-correct; adversary-CONFIRMED with independent KAT; `_kat_decimal_complete`) | [fg] | L | after #13 |
 | 15 | Argon2id password hashing — **✅ DONE** (`std/crypto/argon2id` tracked + `_argon2id_test` gated) | [fg] | M | best-practice storage |
 | 16 | S2 HTTP-client redirects/cookies/proxy — **🔄 redirects+cookies DONE `e11935a3`** — `http_get_follow(url,max)` follows 301/302/303/307/308 via Location (+ relative-Location resolve, budget guard); cookie jar `http_get_session` (absorb Set-Cookie → Cookie header across hops). KAT `_kat_http_redirect` (loopback 302→200). REMAINING: proxy/CONNECT tunnel. | [fg] | M | attended (network test) |
 | 17 | S3 sync primitives — **✅ DONE** (`std/sync/mutex`+`semaphore` tracked; `_sync_test` gated single-threaded; added `_syncmutex_test` verifying mutual exclusion under N=1 AND N=4 contention) | [rt] | M | |
@@ -146,7 +146,7 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 | 33 | ✅ **DONE 2026-07-22** — L12 multi-line collection literals (`[...]`/`{...}` newline-as-whitespace, list + dict) | [lang] | S | reconverged + both-mode arc 2694/0/33 |
 | 34 | ✅ **DONE 2026-07-22** — L13 keyword-as-variable diagnostic (rejects hard keywords {match,loop,type,unsafe}; contextual like `matches` stay usable) | [lang] | S | reconverged + negative-reject gate + arc 2695/0/33 |
 | 35 | L6 enforced immutability (`let` vs `let mut`, shallow; warn-then-error migration) | [lang] | M | correctness + alias analysis |
-| 36 | L7 sized/unsigned numerics + f32 — 🔄 **inc1+inc2 DONE 2026-07-22; inc3a DONE 2026-07-26 `bc5acb27`** (HM width-carrying types + width-mismatch checking; reconverged byte-identical, 2787/0 both-mode) — inc3b–d OPEN (wrapping arithmetic + real f32 storage + packed sized arrays) | [lang] | M | unblocks L5/embedded/wire/GPU |
+| 36 | L7 sized/unsigned numerics + f32 — 🔄 **inc1+inc2 + inc3a `bc5acb27` + inc3b `eb561abd` DONE 2026-07-26** (width-carrying types + width-mismatch checking + WRAPPING ARITHMETIC at width for direct expressions: `255u8+1==0`, `127i8+1==-128`, u16/u32 wrap, default int unchanged; reconverged byte-identical, 2791/0 both-mode) — inc3c (sized VARIABLES via slot-width-flow + TiState→IR bridge + real f32 storage) + inc3d (packed sized arrays) OPEN | [lang] | M | unblocks L5/embedded/wire/GPU |
 | 37 | 🔄 **index+iter DONE 2026-07-24** (`49f28f4f`..L8) — `obj[i]` / `obj[i]=v` / `for x in obj` dispatch to a struct's `index`/`index_set`/`iter` methods, ZERO annotations; + nested custom-index return-type resolution + arity-gate + LOUD-PANIC (not silent-wrong) on an unresolved struct at all 4 dynamic sites (also closed a pre-existing `for_kv` struct→NovaList wild read). 2-round independent adversarial verify (caught 4 silent-wrong + 1 CVE-class); reconverged 2722/0/34 both modes. `call`-overload = backlog. | [lang] | M | unblocks Cortex/Pulse |
 | 38 | L3 variance (inferred, surfaced only in errors) | [lang] | L | after trait-conformance (done); prereq L4 |
 | 39 | L1a annotations + built-in codegen hooks (Phase-1, 80% — `@route`/`@service`/`@Entity`/`@test`) | [lang] | L | after L11; **THE #1 lever** |
@@ -162,7 +162,7 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 | # | Task | Area | Effort | Notes |
 |---|---|---|---|---|
 | 47 | WASM productization (harden the wasm value-model target; FFI callbacks) — prereq for F1 | [cc/rt] | L | Wave-C-adjacent |
-| 48 | F5 image codecs + 2D canvas (PNG/JPEG decode + draw) — self-contained on `deflatex` + `bytes` | [fg] | L | unblocks charts/avatars |
+| 48 | F5 image codecs + 2D canvas — 🔄 **PNG decode DONE 2026-07-26 `1ae4bec7`** (`png_decode`→Result, color types 0/2/6, all 5 filters incl. exact Paeth; adversary-verify caught+fixed a CVE-class int-overflow DoS; also fixed a deflatex builtin-shadow footgun). REMAINING: JPEG decode + 2D canvas draw | [fg] | L | unblocks charts/avatars |
 | 49 | F1 browser DOM/reactive UI — Prism-web (hybrid LiveView/WASM, same `view_fn` both sides) | [fg] | XL | THE adoption magnet; after #47 |
 | 50 | F2 native GUI — Prism-desktop (window + widgets via FFI callbacks + wgpu) | [fg] | XL | after FFI maturity + L7 |
 

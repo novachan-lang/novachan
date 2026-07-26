@@ -56,7 +56,7 @@
 > | LOCK-1 | **Module symbol namespacing (`@mod__fn`)** | **9/9** | bare `@name` symbols collide across packages → ABI break if changed later. Do FIRST. |
 > | LOCK-2 | **Annotation → compile-time codegen hook (L1/L2)** | 8/9 | the imperative→declarative migration breaks every user if the hook shape changes. |
 > | LOCK-3 | **Trait-conformance signature type-check** | 7/9 | a live soundness hole gating every trait-based API. |
-> | LOCK-4 | **Sized/unsigned numerics + f32/f16 (NType width/signed + ABI + elem_kind)** 🔄 inc1+inc2+**inc3a DONE** (`bc5acb27`: HM width-carrying types + width-mismatch checking, reconverged); inc3b–d open (wrapping arith · f32 storage · packed arrays) | 6/9 | the widest representation change — **the #1 risk**; touches type system, ABI, arrays. |
+> | LOCK-4 | **Sized/unsigned numerics + f32/f16 (NType width/signed + ABI + elem_kind)** 🔄 inc1+inc2+**inc3a `bc5acb27`+inc3b `eb561abd` DONE** (width-carrying types + width-mismatch + wrapping arithmetic at width, reconverged 2791/0); inc3c (sized vars/slot-flow + f32 storage) · inc3d (packed arrays) open | 6/9 | the widest representation change — **the #1 risk**; touches type system, ABI, arrays. |
 > | LOCK-5 | **Safepoint preemption + `kill`** | 6/9 | Mesh supervision & Reactor frame-budget are fiction without it; scheduler-deep. |
 > | LOCK-6 | **`@cdecl` FFI callbacks** | 5/9 | Prism-desktop / Edge / Reactor are dead without it (also Forge-ALPN). |
 > | LOCK-7 | **Constant-time `@ct` + `secure_zero` + `@redact` (`Secret<T>`)** | Sentinel + Forge | Forge's LIVE crypto is already `-O2`-vulnerable; can't be bolted onto crypto after the fact. |
