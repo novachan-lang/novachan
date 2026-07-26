@@ -142,7 +142,7 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 ## BLOCK E — Phase 3: language ceilings (the declarative multiplier) — PURE COMPILER WORK
 | # | Task | Area | Effort | Notes / blocking |
 |---|---|---|---|---|
-| 32 | L11 module-symbol namespacing (`@mod__fn` mangling) — DO FIRST; hard link-error wall; prereq for L1 + registry | [lang] | M | |
+| 32 | L11 module-symbol namespacing — 🔄 **Phase 1 (correctness) DONE** (verified 2026-07-26): cross-module name collision is DETECTED as a clear compile error ("function 'X' is exported by two modules … rename one"; `fn_src_path`/`fn_src_mod` @nova_compiler.nova:14338-14400, guarded by module path) — the flat namespace no longer silently last-wins / link-errors. Phase 2 (unprefixed `seq.map`/`list.map` coexistence via per-module `@mod__fn` mangling) = XL, ERGONOMIC-only, ~30 resolution sites; DEFERRED per L11_NAMESPACING_MAP.md (not a soundness fix). Stdlib works today via `seq_map`-style prefixes. | [lang] | M | |
 | 33 | ✅ **DONE 2026-07-22** — L12 multi-line collection literals (`[...]`/`{...}` newline-as-whitespace, list + dict) | [lang] | S | reconverged + both-mode arc 2694/0/33 |
 | 34 | ✅ **DONE 2026-07-22** — L13 keyword-as-variable diagnostic (rejects hard keywords {match,loop,type,unsafe}; contextual like `matches` stay usable) | [lang] | S | reconverged + negative-reject gate + arc 2695/0/33 |
 | 35 | L6 enforced immutability (`let` vs `let mut`, shallow; warn-then-error migration) | [lang] | M | correctness + alias analysis |
