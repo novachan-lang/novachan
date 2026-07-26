@@ -119,7 +119,7 @@ one shortcut reverted for a concurrency race); L11 #32.
 | 20 | D9 binary pack/unpack — **✅ DONE** (`std/encoding/pack` tracked + `_pack_test` gated) | [std] | M | |
 | 21 | D6 casefold + graphemes (Unicode) — partial (`std/text/casefold`, `graphemex` now gated) | [fg] | L | also gives `str_eq_canon` |
 | 22 | D5 XML parser — **✅ DONE** (`std/text/xml` tracked + `_xmlparse_test` gated; added complementary `_xml_test` for node-shape/whitespace/null-safety) | [fg] | L | |
-| 23 | D1 IANA timezones — **MISSING** (no tz module; XL tz-database import) | [fg] | XL | attended (XL data) |
+| 23 | D1 IANA timezones — **🔄 PARTIAL (audit-corrected 2026-07-26; was falsely "MISSING")** — a real POSIX-TZ-rule DST engine EXISTS + gated (`std/time/tz.nova`: tz_offset_at/tz_to_local/tz_abbrev/tz_next_transition, 17 major IANA zones, modern era ~2007+; KAT `kat_tzdata_offsets` PASS). REMAINING for full XL scope: complete historical IANA tzdb (pre-2007 transitions, all ~350 zones, leap seconds) via a zoneinfo import. | [fg] | XL | attended (XL data) |
 
 ## BLOCK D — Phase 2: ecosystem connective tissue (each reuses the compiler's TiState)
 *Reconciliation signals (2026-07-22, need per-feature verification before ticking):* LSP shell + 14
