@@ -1,0 +1,223 @@
+// _kat_toml_parse_audit.nova — Independent security audit KAT for
+// std/data/toml.nova (the TOML v1.0 recursive-descent document parser).
+//
+// Hunts the 4 recurring text/config-parser vulnerability classes against
+// EVERY parse function in the module. Call graph (mutual recursion traced):
+//   toml_parse (loop, NOT recursive itself)
+//     -> _tm_read_key_path (loop, bounded by '.' count -- not recursive)
+//     -> _tm_parse_value  <---+  MUTUALLY RECURSIVE on '[' -- the ONLY
+//     -> _tm_parse_array  ----+  recursive structure in this module.
+//   (_tm_parse_basic_string / _tm_parse_literal_string / _tm_read_bare_key /
+//    _tm_read_bare_token / _tm_nav / _tm_assign / _tm_open_table are all
+//    single loops over their input, none call back into a parse function
+//    that could re-enter them -- confirmed NOT part of any recursion.)
+//
+// FINDING 1 (class 1, CRITICAL — DEEP-NESTING RECURSION DoS):
+//   _tm_parse_value -> _tm_parse_array -> _tm_parse_value ... recursed once
+//   per '[' with NO depth limit. "x = " + "["*20000 + "]"*20000 recursed
+//   20000 native stack-frame pairs deep -> stack overflow (crash/UB).
+//   FIX: _TM_MAX_DEPTH (1000) caps the recursion; past the cap,
+//   _tm_skip_balanced (a new, purely ITERATIVE bracket-balance skip) takes
+//   over, so arbitrarily deep further nesting costs O(1) extra stack. The
+//   over-cap subtree collapses to `[]` (a bounded, documented-safe
+//   fallback, same spirit as the pre-existing datetime-fallback and
+//   name-collision-fallback behaviour already in this module).
+//
+// FINDING 2 (class 2, CRITICAL — STRAY-DELIMITER INFINITE LOOP, found during
+//   this audit, NOT part of the task's example list but the same failure
+//   family): a single byte -- ']', '}', or ',' -- at a position where a key
+//   or a value was expected made TWO independent loops spin forever without
+//   ever advancing the cursor:
+//     - toml_parse("]") (or "}" / ",") hung. Root cause: _tm_read_key_path
+//       (via _tm_read_bare_key) returns "" without consuming when the byte
+//       isn't a valid bare-key/quote start, and _tm_parse_value (via
+//       _tm_read_bare_token) ALSO returns "" without consuming for the same
+//       byte (all three are in _tm_read_bare_token's own stop-set) -- so
+//       toml_parse's main loop re-read the identical byte on every
+//       iteration forever. A 1-BYTE input hangs the parser -- more easily
+//       triggered than the depth-DoS above (needs no depth at all).
+//     - toml_parse("x = [}]") hung the same way one level down: '}' isn't
+//       filtered by _tm_parse_array's own ']'/',' pre-checks (inline tables
+//       aren't a supported value type), so it reaches _tm_read_bare_token,
+//       which stops on '}' immediately without consuming -- _tm_parse_array
+//       re-read the same '}' forever.
+//   FIX: both toml_parse's statement loop and _tm_parse_array's element
+//   loop now assert >=1 byte of forward progress per iteration (comparing
+//   st["pos"] before/after the statement or element parse) and force-skip
+//   1 byte if none was made. This is a no-op on every valid statement/value
+//   (which always consumes >=1 byte), verified by the full pre-existing KAT
+//   suite (_toml_test, _toml_adv_test, _toml_big_int_test) staying green.
+//
+// CLASSES 2 (remaining forms), 3, 4 — audited, NOT independently buggy:
+//   - Unbalanced brackets / unterminated strings / truncated escapes: all
+//     pre-existing loops already terminate safely on EOF without the fixes
+//     above (every one checks `p >= n` before dereferencing); PART D below
+//     re-proves this post-fix.
+//   - "key with no value" (e.g. "x" alone, or "x =" at EOF): does not hang
+//     (the key itself always consumes >=1 byte when it's a valid bare/quoted
+//     key, which is the only way to reach a "no value" state without first
+//     hitting Finding 2's stray-delimiter case, now also fixed). Accepted
+//     as key="" / key=null -- LENIENT by pre-existing, documented design;
+//     this module has no Result/err channel (see module header). Not a
+//     memory-safety or resource-exhaustion issue, so left as-is per the
+//     "minimal, surgical fix" mandate -- flagged here for the record.
+//   - Class 3 (alias/anchor/reference blowup): does not apply -- TOML has
+//     no alias/anchor/reference syntax at all; this module implements none.
+//   - Class 4 (unbounded number/length): integers go through the runtime's
+//     shared parse_int (atoll) -- clamps rather than crashing, and is a
+//     runtime-wide, not toml-specific, concern (every stdlib module that
+//     calls parse_int shares it) -- out of scope for a module-local fix.
+//     Array/table element counts are simply the number of elements actually
+//     present in the input (one push per element consumed) -- O(input size),
+//     not a length-prefixed count that could be inflated independent of
+//     actual input size, so no pathological-blowup vector exists here.
+//
+// Both fixes are internal to private (`_tm_`-prefixed) helpers; toml_parse's
+// and toml_get's PUBLIC signatures are UNCHANGED -- no caller updates needed.
+import std/data/toml
+
+fn cki(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    0
+
+fn cks(label, got, want) -> int
+    if got != want
+        print("FAIL " + label + ": got=[" + got + "] want=[" + want + "]")
+        exit(1)
+    0
+
+// Build "x = " + '['*depth + ']'*depth via a growable buffer (O(1) amortized
+// per append) -- avoids O(depth^2) string-concat cost at depth=20000.
+fn _kta_deep_array_doc(depth) -> string
+    let ob = buffer()
+    let cb = buffer()
+    let i = 0
+    while i < depth
+        buf_append_char(ob, 91)
+        buf_append_char(cb, 93)
+        i = i + 1
+    "x = " + buf_to_str(ob) + buf_to_str(cb)
+
+// ── PART A: valid-input round-trip still works (regression guard) ─────────
+let q = chr(34)
+let nl = chr(10)
+let doc_a = "title = " + q + "NOVA" + q + nl
+doc_a = doc_a + "[db]" + nl
+doc_a = doc_a + "port = 5432" + nl
+doc_a = doc_a + "nested = [1, [2, 3], [4, [5, 6]]]" + nl
+doc_a = doc_a + "[[srv]]" + nl
+doc_a = doc_a + "ip = " + q + "10.0.0.1" + q
+let ra = toml_parse(doc_a)
+cks("A-title", ra["title"], "NOVA")
+cki("A-port", ra["db"]["port"], 5432)
+let nested_a = ra["db"]["nested"]
+cki("A-nested-len", len(nested_a), 3)
+cki("A-nested-1-len", len(nested_a[1]), 2)
+cki("A-nested-1-1", nested_a[1][1], 3)
+cki("A-nested-2-1-len", len(nested_a[2][1]), 2)
+cki("A-nested-2-1-1", nested_a[2][1][1], 6)
+cks("A-srv-ip", ra["srv"][0]["ip"], "10.0.0.1")
+
+// ── PART B: FINDING 1 — 20000-deep nested array must NOT crash/hang, and
+// must yield a bounded (not endlessly-growing) result ────────────────────
+let deep_doc = _kta_deep_array_doc(20000)
+let rb = toml_parse(deep_doc)
+// Reaching this line at all (without the harness's kill-on-timeout firing,
+// and without a native crash) IS the primary proof of no-hang/no-crash.
+cks("B-type", type_of(rb["x"]), "list")
+// The result must be a genuinely BOUNDED structure (the depth-cap fallback),
+// not a fully-materialized 20000-level tree. Walk down through the capped
+// levels and confirm every level is a 1-element (or empty) list -- sanity,
+// not an exhaustive 1000-level walk.
+let cursor = rb["x"]
+let walked = 0
+let walk_ok = 1
+while walked < 50
+    if type_of(cursor) != "list"
+        walk_ok = 0
+        walked = 50
+    else
+        if len(cursor) == 0
+            walked = 50
+        else
+            if len(cursor) != 1
+                walk_ok = 0
+                walked = 50
+            else
+                cursor = cursor[0]
+                walked = walked + 1
+cki("B-walk-bounded-shape", walk_ok, 1)
+
+// A second, independent deep case: deep nesting as the FIRST array element
+// (not the whole value) plus trailing sibling content, proving parsing
+// resumes correctly after the capped subtree and the rest of the document
+// still parses.
+let ob2 = buffer()
+let cb2 = buffer()
+let di2 = 0
+while di2 < 15000
+    buf_append_char(ob2, 91)
+    buf_append_char(cb2, 93)
+    di2 = di2 + 1
+let deep2 = "arr = [" + buf_to_str(ob2) + buf_to_str(cb2) + ", 99]" + nl
+deep2 = deep2 + "after = " + q + "ok" + q
+let rb2 = toml_parse(deep2)
+cks("B2-type", type_of(rb2["arr"]), "list")
+cki("B2-tail-preserved", rb2["arr"][1], 99)
+cks("B2-after-key-parsed", rb2["after"], "ok")
+
+// ── PART C: FINDING 2 — stray-delimiter inputs must NOT hang ──────────────
+// Each of these is a single reachable byte that previously spun forever.
+let rc1 = toml_parse("]")
+cks("C1-type", type_of(rc1), "dict")
+let rc2 = toml_parse("}")
+cks("C2-type", type_of(rc2), "dict")
+let rc3 = toml_parse(",")
+cks("C3-type", type_of(rc3), "dict")
+// Mixed run of stray delimiters (also stresses that the fix is O(n), not
+// O(n^2): each forced 1-byte skip does O(1) work).
+let sb = buffer()
+let si = 0
+while si < 6000
+    buf_append_char(sb, 93)
+    buf_append_char(sb, 125)
+    buf_append_char(sb, 44)
+    si = si + 1
+let rc4 = toml_parse(buf_to_str(sb))
+cks("C4-type", type_of(rc4), "dict")
+// Valid statements interleaved with stray delimiters must still parse the
+// valid parts correctly (the guard only skips the bad byte, nothing more).
+let doc_c5 = "a = 1" + nl + "]" + nl + "b = 2" + nl + "}" + nl + "c = 3"
+let rc5 = toml_parse(doc_c5)
+cki("C5-a", rc5["a"], 1)
+cki("C5-b", rc5["b"], 2)
+cki("C5-c", rc5["c"], 3)
+// The array-internal form of the same bug: '}' inside an array value.
+let rc6 = toml_parse("x = [}]")
+cks("C6-type", type_of(rc6["x"]), "list")
+let doc_c7 = "x = [1, }, 2, }, 3]"
+let rc7 = toml_parse(doc_c7)
+let arr_c7 = rc7["x"]
+cki("C7-has-1", arr_c7[0], 1)
+cki("C7-has-2-somewhere", contains(arr_c7, 2), 1)
+cki("C7-last-is-3", arr_c7[len(arr_c7) - 1], 3)
+
+// ── PART D: other class-2 malformed shapes -- already-safe pre-fix,
+// re-verified to still terminate cleanly (no crash/hang) post-fix ────────
+let rd1 = toml_parse("nums = [1, 2, 3")            // unterminated array
+cki("D1-len", len(rd1["nums"]), 3)
+let bs = chr(92)
+let rd2 = toml_parse("s = " + q + "abc" + bs)        // truncated trailing escape
+cks("D2-s", rd2["s"], "abc")
+let rd3 = toml_parse("s = " + q + "abc")             // unterminated string
+cks("D3-s", rd3["s"], "abc")
+let rd4 = toml_parse("x")                            // bare key, no '=', no value
+cks("D4-type", type_of(rd4), "dict")
+let rd5 = toml_parse("x =")                          // '=' with nothing after
+cks("D5-type", type_of(rd5), "dict")
+let rd6 = toml_parse("[a.b.c")                       // unterminated table header
+cks("D6-type", type_of(rd6), "dict")
+
+print("TOML-PARSE-AUDIT KAT PASS")

@@ -1,0 +1,331 @@
+// _kat_ini_parse_audit — SOUNDNESS AUDIT of std/data/ini.nova (INI config
+// file parser/writer) against the 4 recurring text/config-parser
+// vulnerability classes:
+//
+//   1. DEEP-NESTING RECURSION DoS
+//   2. MALFORMED ACCEPTANCE (silent mis-parse / data loss)
+//   3. PATHOLOGICAL BLOWUP (O(n^2)/O(2^n) on moderately-sized input)
+//   4. UNBOUNDED NUMBER/LENGTH
+//
+// CALL GRAPH (traced end-to-end, every _ini_* helper): ini_parse calls
+// _ini_split_lines once, then per-line calls _ini_strip_comment,
+// _ini_trim, _ini_index_of_sep, _ini_unquote, _ini_ensure_section,
+// _ini_set_key -- each a SINGLE top-level while loop (or O(1)), called
+// STRAIGHT-LINE (never from inside another _ini_* function, never
+// self-calling). ini_write calls _ini_write_value -> _ini_needs_quote,
+// same straight-line shape. Zero self-calls, zero mutual recursion
+// anywhere in the module.
+//
+// CLASS 1 VERDICT: not applicable structurally. INI is a flat, line-
+// oriented format with no bracket/nesting grammar (unlike JSON/sexpr/
+// YAML/TOML-arrays) -- there is no code path whose native call-stack
+// depth scales with input structure, so a stack-overflow-by-recursion-
+// depth vector is structurally impossible here regardless of how the
+// input is shaped. PART B below still feeds ~20000-deep/large adversarial
+// input (the closest INI analog to "20000x nested": a section-header line
+// wrapped in 20000 literal '[' / ']' characters, since INI has no actual
+// nesting to be 20000 deep IN) to empirically confirm no crash/hang and a
+// bounded, deterministic result -- required by the audit brief regardless
+// of the structural verdict.
+//
+// CLASS 3 -- REAL BUG FOUND & FIXED: every character-scanning loop in the
+// module (_ini_trim, _ini_strip_comment, _ini_index_of_sep, _ini_needs_quote,
+// _ini_split_lines, plus the inline section-header ']' search in ini_parse)
+// used char_at(s, i) with i incrementing in a while loop. char_at indexes
+// by Unicode CODEPOINT and rescans the string from byte 0 on EVERY call
+// (O(index) per call -- confirmed by reading nova_rt_char_at in
+// nova_runtime.c), so any `while i < n: char_at(s, i)... i = i + 1` loop is
+// O(n^2) overall. _ini_split_lines was the worst offender: its loop spans
+// the WHOLE FILE TEXT (not reset per line), so parsing an ordinary
+// multi-hundred-KB config file -- not even an adversarial one -- was
+// already unacceptably slow, and a larger file effectively hangs.
+// _ini_split_lines ALSO built each line via `cur = cur + char_at(text, i)`,
+// a SECOND independent O(n^2) source (nova_rt_str_concat is O(la+lb) with
+// no amortized headroom) compounding on top of the char_at cost.
+// ini_write had the milder form of the same anti-pattern
+// (`out = out + ...` per dict entry), O(entry-count^2).
+// FIX: every scan rewritten to str_to_bytes/bytes_get (O(1) random byte
+// access) and every accumulation to buffer()/buf_append_char/buf_append/
+// buf_to_str (O(1)-amortized append) -- the same idiom already established
+// in std/data/csv.nova's own prior audit fix. PART B/C below prove this at
+// 20000-200000-scale with a wall-clock bound tight enough that a
+// reintroduced O(n^2) would blow through it by orders of magnitude.
+//
+// CLASS 2 -- REAL BUG FOUND & FIXED (found while investigating class 3,
+// same root cause): char_at indexes by CODEPOINT while len()/slice() index
+// by raw BYTE offset. The module mixed the two index spaces throughout --
+// _ini_trim used len(s) (byte length) as the char_at (codepoint-index) scan
+// bound; the section-header/separator scans fed a char_at-derived codepoint
+// index straight into byte-offset slice() calls; _ini_unquote compared
+// char_at(s, len(s) - 1) against a closing quote using the same mismatched
+// index. For INI text containing multi-byte UTF-8 (an accented key, a CJK
+// section name, a quoted value like "café"), this silently corrupted
+// otherwise well-formed input: truncated/garbled multi-byte sequences,
+// keys/values split at the wrong byte offset, and -- the most user-visible
+// case -- ANY quoted value containing a multi-byte character failing to
+// have its surrounding quotes stripped at all (_ini_unquote's closing-quote
+// check landed past the last real codepoint and silently missed it). FIX:
+// the same str_to_bytes/bytes_get rewrite uses ONE consistent index space
+// (bytes) throughout, matching slice()'s semantics exactly, eliminating
+// this corruption as a side effect of the class-3 fix. PART D below proves
+// UTF-8 content now round-trips correctly.
+// Other class-2 shapes (unclosed section bracket, key with no separator,
+// unterminated quote) are audited and NOT independently buggy: every scan
+// already correctly bounds `i < n`, so none can loop forever, and this
+// module's public API returns a plain dict (not a Result) -- it has no
+// established error channel to route a "reject" through (same situation
+// independently found for std/data/toml.nova's own prior audit). These
+// inputs are accepted with deterministic, non-crashing, documented-lenient
+// behavior; PART E below re-proves this post-fix.
+//
+// CLASS 4 VERDICT: not applicable. ini.nova parses no numbers at all --
+// every value is always returned as a string -- and there is no repeat/
+// count field on the wire; section/key counts are 1:1 with the delimiters
+// actually present in the input, not a separate unchecked length prefix.
+//
+// Both fixes are internal to private (`_ini_`-prefixed) helpers plus
+// ini_write's internal accumulator; ini_parse's and ini_write's PUBLIC
+// signatures (text -> dict, dict -> string) are UNCHANGED -- no caller
+// updates needed.
+import std/data/ini
+
+fn cks(label, got, want)
+    if got != want
+        print("FAIL " + label + ": got='" + got + "' want='" + want + "'")
+        exit(1)
+
+fn cki(label, got, want)
+    if got != want
+        print("FAIL " + label + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+
+fn ck_bound(label, elapsed_ms, max_ms)
+    print(label + " elapsed_ms=" + str(elapsed_ms) + " (bound=" + str(max_ms) + ")")
+    if elapsed_ms > max_ms
+        print("FAIL " + label + ": took " + str(elapsed_ms) + "ms, bound was " + str(max_ms) + "ms (possible O(n^2) regression)")
+        exit(1)
+
+// ── PART A: valid-input round-trip still works (regression guard) ──────────
+fn part_a()
+    let nl = chr(10)
+    let text = "; c" + nl + "[db]" + nl + "host = localhost" + nl + "port=5432" + nl + "[app]" + nl + "name = " + chr(34) + "My App" + chr(34) + nl
+    let result = ini_parse(text)
+    cks("A-db-host", result["db"]["host"], "localhost")
+    cks("A-db-port", result["db"]["port"], "5432")
+    cks("A-app-name", result["app"]["name"], "My App")
+    let written = ini_write(result)
+    let reparsed = ini_parse(written)
+    cks("A-rt-db-host", reparsed["db"]["host"], "localhost")
+    cks("A-rt-app-name", reparsed["app"]["name"], "My App")
+    print("PART A PASS: valid-input parse + write/reparse round-trip")
+
+// ── PART B: CLASS 1 — ~20000-deep/large adversarial shape, proof of no
+// crash/hang and a bounded, deterministic result ────────────────────────────
+fn part_b()
+    // B1. A section-header line wrapped in 20000 literal '[' characters
+    // before the name and 20000 ']' characters after -- the INI analog to
+    // "20000x nested", even though INI has no real nesting grammar. Built
+    // via buffer() (O(1)-amortized) so building the FIXTURE itself isn't
+    // accidentally O(n^2).
+    let ob = buffer()
+    let cb = buffer()
+    let i = 0
+    while i < 20000
+        buf_append_char(ob, 91)
+        buf_append_char(cb, 93)
+        i = i + 1
+    let deep_header = buf_to_str(ob) + "Section" + buf_to_str(cb)
+    let start_b1 = time_ms()
+    let rb1 = ini_parse(deep_header)
+    let elapsed_b1 = time_ms() - start_b1
+    // Reaching this line at all (without the harness's kill-on-timeout
+    // firing, and without a native crash) IS the primary proof of
+    // no-hang/no-crash. type_of must be "dict" (a bounded result, not a
+    // 20000-level structure -- INI never nests, so the whole "Section" +
+    // trailing ']' run is captured as ONE flat section name up to the
+    // FIRST ']' per the module's own documented "find matching ']'" rule).
+    cks("B1-type", type_of(rb1), "dict")
+    ck_bound("B1-20000-bracket-header", elapsed_b1, 5000)
+
+    // B2. A single VERY long unbracketed line (~200000 bytes, no
+    // separator) -- the pattern most directly hit by the old
+    // char_at-in-a-loop + string-concat quadratic blowup, since every byte
+    // is a plain scan/copy with no escape logic at all. Must terminate
+    // fast and simply be silently skipped (no '='/':' -> no key stored),
+    // per this module's documented lenient behavior.
+    let big_line = repeat("x", 200000)
+    let start_b2 = time_ms()
+    let rb2 = ini_parse(big_line)
+    let elapsed_b2 = time_ms() - start_b2
+    cks("B2-type", type_of(rb2), "dict")
+    cki("B2-no-keys-stored", contains(rb2, ""), 0)
+    ck_bound("B2-200000-char-line", elapsed_b2, 5000)
+
+    // B3. A document with 20000 ordinary lines (an entirely realistic
+    // large-but-legitimate config file shape, not just adversarial) --
+    // proves the file-wide _ini_split_lines scan is O(n), not O(n^2).
+    let doc_buf = buffer()
+    let j = 0
+    while j < 20000
+        buf_append(doc_buf, "key" + str(j) + "=val" + str(j) + chr(10))
+        j = j + 1
+    let big_doc = buf_to_str(doc_buf)
+    let start_b3 = time_ms()
+    let rb3 = ini_parse(big_doc)
+    let elapsed_b3 = time_ms() - start_b3
+    cks("B3-first-key", rb3[""]["key0"], "val0")
+    cks("B3-last-key", rb3[""]["key19999"], "val19999")
+    ck_bound("B3-20000-line-doc", elapsed_b3, 5000)
+
+    // B4. ini_write with 20000 entries in one section -- proves the WRITE
+    // side per-entry concatenation is no longer O(entry-count^2).
+    let d = {}
+    let sec = {}
+    let k = 0
+    while k < 20000
+        sec["k" + str(k)] = "v" + str(k)
+        k = k + 1
+    d["big"] = sec
+    let start_b4 = time_ms()
+    let w4 = ini_write(d)
+    let elapsed_b4 = time_ms() - start_b4
+    let r4back = ini_parse(w4)
+    cks("B4-roundtrip-first", r4back["big"]["k0"], "v0")
+    cks("B4-roundtrip-last", r4back["big"]["k19999"], "v19999")
+    ck_bound("B4-20000-entry-write", elapsed_b4, 5000)
+
+    // B5. A single line with 20000 double-quote characters -- stresses
+    // _ini_strip_comment's in_quote toggle loop at scale (even count of
+    // quotes -> ends NOT in a quote span -> deterministic, no crash/hang).
+    let qb = buffer()
+    let q = 0
+    while q < 20000
+        buf_append_char(qb, 34)
+        q = q + 1
+    let quotes_line = "k=" + buf_to_str(qb) + " ; trailing comment"
+    let start_b5 = time_ms()
+    let rb5 = ini_parse(quotes_line)
+    let elapsed_b5 = time_ms() - start_b5
+    cks("B5-type", type_of(rb5), "dict")
+    ck_bound("B5-20000-quote-line", elapsed_b5, 5000)
+
+    print("PART B PASS: class-1 deep/large adversarial input bounded, no crash/hang")
+
+// ── PART C: CLASS 3 — direct proof the fix is O(n), not O(n^2), by
+// checking elapsed time does not blow up disproportionately with size ─────
+fn part_c()
+    let small = repeat("a=b" + chr(10), 500)
+    let start_small = time_ms()
+    ini_parse(small)
+    let elapsed_small = time_ms() - start_small
+
+    let large = repeat("a=b" + chr(10), 50000)
+    let start_large = time_ms()
+    ini_parse(large)
+    let elapsed_large = time_ms() - start_large
+    // 100x more lines. O(n) should cost roughly 100x (generously bounded at
+    // 400x to avoid flaking on a noisy machine); O(n^2) would cost ~10000x.
+    print("C-small(500)=" + str(elapsed_small) + "ms C-large(50000)=" + str(elapsed_large) + "ms")
+    let ratio_bound_ok = 1
+    if elapsed_small > 5
+        // only check the ratio when the small run is slow enough to be a
+        // meaningful denominator (avoids a 0ms/1ms noise-driven false FAIL)
+        if elapsed_large > elapsed_small * 400
+            ratio_bound_ok = 0
+    cki("C-scaling-not-quadratic", ratio_bound_ok, 1)
+    ck_bound("C-50000-line-doc-absolute", elapsed_large, 5000)
+    print("PART C PASS: parse time scales linearly, not quadratically")
+
+// ── PART D: CLASS 2 (UTF-8 correctness bug found alongside class 3) —
+// multi-byte content in keys, section names, and quoted values must not be
+// corrupted or fail to unquote ──────────────────────────────────────────────
+fn part_d()
+    let nl = chr(10)
+    let q = chr(34)
+    // café = 2-byte 'é' (U+00E9, UTF-8 bytes 0xC3 0xA9)
+    let cafe = "caf" + chr(195) + chr(169)
+    // D1. Multi-byte section name.
+    let text_d1 = chr(91) + cafe + chr(93) + nl + "k=v"
+    let rd1 = ini_parse(text_d1)
+    cki("D1-section-exists", contains(rd1, cafe), 1)
+    cks("D1-key-under-section", rd1[cafe]["k"], "v")
+
+    // D2. Multi-byte key name before '='.
+    let text_d2 = cafe + "=value"
+    let rd2 = ini_parse(text_d2)
+    cks("D2-value", rd2[""][cafe], "value")
+
+    // D3. Quoted value CONTAINING a multi-byte character must have its
+    // surrounding quotes stripped (the most user-visible pre-fix bug: the
+    // old codepoint/byte index mismatch left both literal quote chars
+    // attached instead of stripping them).
+    let text_d3 = "k=" + q + cafe + q
+    let rd3 = ini_parse(text_d3)
+    cks("D3-unquoted-value", rd3[""]["k"], cafe)
+
+    // D4. Full write/reparse round-trip with a multi-byte value that also
+    // needs quoting for an unrelated reason (trailing space) -- proves the
+    // byte-based _ini_needs_quote/_ini_unquote agree with each other.
+    let d4 = {}
+    let sec4 = {}
+    sec4["k"] = cafe + " "
+    d4["s"] = sec4
+    let w4 = ini_write(d4)
+    let r4 = ini_parse(w4)
+    cks("D4-roundtrip-trailing-space", r4["s"]["k"], cafe + " ")
+
+    // D5. Multi-byte content immediately before a comment marker must
+    // still correctly strip the trailing comment (byte-indexed
+    // _ini_strip_comment must not misplace the cut point).
+    let text_d5 = "k=" + cafe + " ; a comment"
+    let rd5 = ini_parse(text_d5)
+    cks("D5-value-before-comment", rd5[""]["k"], cafe)
+
+    print("PART D PASS: multi-byte UTF-8 content in section/key/value round-trips correctly")
+
+// ── PART E: CLASS 2 (other malformed shapes) — must remain deterministic,
+// non-crashing, documented-lenient behavior post-fix (regression guard) ────
+fn part_e()
+    // E1. Unclosed section header (no ']', runs to end of line/text) --
+    // accepted per documented lenient design: rest of line becomes the
+    // section name.
+    let re1 = ini_parse("[Section" + chr(10) + "k=v")
+    cki("E1-has-section", contains(re1, "Section"), 1)
+    cks("E1-key-value", re1["Section"]["k"], "v")
+
+    // E2. Key with no separator at all -- silently skipped (documented
+    // lenient behavior: no '='/':' means no key is stored), not a crash.
+    let re2 = ini_parse("justakeynoequals")
+    cki("E2-no-default-section", contains(re2, ""), 0)
+
+    // E3. Unterminated quoted value -- both literal quote-adjacent bytes
+    // are preserved verbatim (deterministic, documented-lenient: only a
+    // BOTH-ends-quoted value is unquoted).
+    let re3 = ini_parse("k=" + chr(34) + "unterminated")
+    cks("E3-value", re3[""]["k"], chr(34) + "unterminated")
+
+    // E4. Empty section brackets "[]" -- deterministic (sec name = "",
+    // reuses the default section slot); must not crash.
+    let re4 = ini_parse("[]" + chr(10) + "k=v")
+    cks("E4-value", re4[""]["k"], "v")
+
+    // E5. Blank/whitespace-only lines and comment-only lines interleaved
+    // with real content -- must not disturb parsing of the real lines.
+    let nl = chr(10)
+    let re5 = ini_parse("   " + nl + "; comment" + nl + "# also comment" + nl + "a=1" + nl + nl + "b=2")
+    cks("E5-a", re5[""]["a"], "1")
+    cks("E5-b", re5[""]["b"], "2")
+
+    // E6. Empty document.
+    let re6 = ini_parse("")
+    cks("E6-type", type_of(re6), "dict")
+
+    print("PART E PASS: other malformed shapes remain deterministic and non-crashing")
+
+fn main()
+    part_a()
+    part_b()
+    part_c()
+    part_d()
+    part_e()
+    print("INI-PARSE-AUDIT KAT PASS")

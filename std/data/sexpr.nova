@@ -12,25 +12,60 @@
 //   • list  -> NOVA list (whose elements are atoms or nested lists)
 //
 // PUBLIC API
-//   sx_parse(s)        -> any   parse string s to an atom (string) or list
+//   sx_parse(s)        -> Result  Ok(atom-string or list) for a well-formed
+//                                  single top-level sexp; Err(message) for
+//                                  malformed input — unterminated list
+//                                  (missing ')'), a stray ')' with no
+//                                  matching '(', trailing content after the
+//                                  top-level form, or nesting deeper than
+//                                  1000 levels (recursion-depth DoS guard).
 //   sx_write(tree)     -> string  serialise atom/list back to sexp string
 //   sx_is_atom(x)      -> int   1 if x is a string (atom), 0 if list
 //
 // EXAMPLES
-//   sx_parse("atom")            -> "atom"
-//   sx_parse("(a b c)")        -> ["a", "b", "c"]
-//   sx_parse("(a (b c) d)")    -> ["a", ["b", "c"], "d"]
-//   sx_parse("()")             -> []
+//   unwrap(sx_parse("atom"))            -> "atom"
+//   unwrap(sx_parse("(a b c)"))        -> ["a", "b", "c"]
+//   unwrap(sx_parse("(a (b c) d)"))    -> ["a", ["b", "c"], "d"]
+//   unwrap(sx_parse("()"))             -> []
+//   is_err(sx_parse("(a b"))           -> 1   (unterminated list)
+//   is_err(sx_parse("(a b))"))         -> 1   (trailing ')')
 //   sx_write(["a","b"])        -> "(a b)"
 //   sx_write(["+",["*","2","3"],"4"]) -> "(+ (* 2 3) 4)"
 //   sx_is_atom("x")            -> 1
 //   sx_is_atom(["x"])          -> 0
 //
+// SOUNDNESS AUDIT (parser hardening — see _sx_read_list/sx_parse below).
+// Before this revision _sx_read_list recursed once per nested '(' with NO
+// depth limit, so a crafted input with tens of thousands of nested "("
+// characters (trivial to construct, e.g. a corrupted/adversarial config
+// file) recursed the native call stack unbounded — a stack-overflow DoS.
+// Separately, sx_parse had no error channel at all (`-> any`): an
+// unterminated list ("(a b" with no closing paren), a stray ')' with no
+// matching '(', and trailing content after the top-level form
+// ("(a b) garbage") were all silently accepted and either truncated or
+// partially ignored instead of rejected — a config file corrupted or
+// truncated in transit would parse as if it were valid, with no signal to
+// the caller. Both classes are closed here: a decrementing depth budget
+// (1000 levels, matching this codebase's std/data/asn1_parse convention)
+// bounds recursion, and every rejection path now reports Err(message)
+// through the `ok`/`err` builtins instead of guessing.
+//
 // IMPLEMENTATION NOTES
 //   • All private helpers are prefixed _sx_ to avoid symbol collisions.
-//   • Position state is threaded as a single-element dict {"pos": int} so the
-//     recursive sub-parsers can advance the shared cursor.  NOVA has no
-//     mutable reference semantics — passing a dict is the idiomatic solution.
+//   • Position AND error state are threaded as a shared dict
+//     {"pos": int, "err": string} so the recursive sub-parsers can advance
+//     the shared cursor and signal failure to every enclosing call frame.
+//     NOVA has no mutable reference semantics — passing a dict is the
+//     idiomatic solution. Every _sx_read_list loop iteration checks
+//     st["err"] first and stops immediately once any frame (at any depth)
+//     has set it, so a failure detected deep in the recursion unwinds
+//     cleanly without doing further work or overwriting the message.
+//   • _sx_read_list threads a `depth` budget (starts at 1000, decremented
+//     per nesting level); hitting 0 sets st["err"] instead of recursing —
+//     this is a private helper (grepped: no external callers), so adding
+//     the parameter is not an API break.
+//   • `ok`/`err`/`is_ok`/`is_err`/`unwrap` are NOVA language builtins (not
+//     a std/core/result import), so this stays a LEAF module.
 //   • Single-exit style (let result = ...; ... return result) prevents the
 //     NOVA early-return mistag bug.
 //   • NO multi-line list/dict literals in module body (NOVA parser limitation).
@@ -99,33 +134,52 @@ fn _sx_read_atom(s, n, st)
 
 // _sx_read_list: parse a list starting AFTER the opening '('.
 // Reads elements until it sees a ')' at the current depth, then consumes it.
-// Returns a NOVA list of parsed elements (each is atom-string or sub-list).
-fn _sx_read_list(s, n, st)
+// `depth` is the remaining recursion budget (starts at 1000 from sx_parse,
+// decremented once per nested '('); reaching 0 sets st["err"] instead of
+// recursing further, bounding native stack usage on pathologically deep
+// input. If the input ends before a matching ')' is found, st["err"] is
+// set (unterminated list) rather than silently treating EOF as the end of
+// the list. Every iteration checks st["err"] first so a failure set at any
+// depth unwinds every enclosing frame without further work.
+// Returns a NOVA list of parsed elements (each is atom-string or sub-list);
+// the returned list is meaningless once st["err"] != "" — callers must
+// check st["err"] before trusting it.
+fn _sx_read_list(s, n, st, depth)
     let result = []
     let go = 1
     while go == 1
-        _sx_skip_ws(s, n, st)
-        let p = st["pos"]
-        if p >= n
-            // Unterminated list — treat as end.
+        if st["err"] != ""
             go = 0
         else
-            let ch = char_at(s, p)
-            let o = ord(ch)
-            if o == 41
-                // ')' — consume it and stop.
-                st["pos"] = p + 1
+            _sx_skip_ws(s, n, st)
+            let p = st["pos"]
+            if p >= n
+                // End of input before a matching ')' — malformed.
+                st["err"] = "sx_parse: unterminated list (missing ')')"
                 go = 0
             else
-                if o == 40
-                    // '(' — recurse into sub-list.
+                let ch = char_at(s, p)
+                let o = ord(ch)
+                if o == 41
+                    // ')' — consume it and stop.
                     st["pos"] = p + 1
-                    let sub = _sx_read_list(s, n, st)
-                    result.push(sub)
+                    go = 0
                 else
-                    // Atom character.
-                    let atom = _sx_read_atom(s, n, st)
-                    result.push(atom)
+                    if o == 40
+                        if depth <= 0
+                            // Recursion-depth cap reached — reject rather
+                            // than recurse further (DoS guard).
+                            st["err"] = "sx_parse: nesting too deep (exceeds 1000 levels)"
+                        else
+                            // '(' — recurse into sub-list.
+                            st["pos"] = p + 1
+                            let sub = _sx_read_list(s, n, st, depth - 1)
+                            if st["err"] == ""
+                                result.push(sub)
+                    else
+                        // Atom character.
+                        let atom = _sx_read_atom(s, n, st)
+                        result.push(atom)
     return result
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -134,33 +188,55 @@ fn _sx_read_list(s, n, st)
 //
 // Leading and trailing whitespace is ignored.  If the first non-space character
 // is '(' the result is a list (possibly nested); otherwise it is a string atom.
+// Exactly one top-level form is expected — any non-whitespace content left
+// over after it is malformed, as is an unterminated list, a stray ')' with
+// no matching '(', or nesting beyond 1000 levels deep.
 //
 // Examples:
-//   sx_parse("atom")         -> "atom"
-//   sx_parse("(a b c)")     -> ["a","b","c"]
-//   sx_parse("(a (b c) d)") -> ["a",["b","c"],"d"]
-//   sx_parse("()")          -> []
-fn sx_parse(s) -> any
+//   unwrap(sx_parse("atom"))         -> "atom"
+//   unwrap(sx_parse("(a b c)"))     -> ["a","b","c"]
+//   unwrap(sx_parse("(a (b c) d)")) -> ["a",["b","c"],"d"]
+//   unwrap(sx_parse("()"))          -> []
+//   is_err(sx_parse("(a b"))        -> 1
+fn sx_parse(s) -> Result
     let n = len(s)
     let st = {}
     st["pos"] = 0
+    st["err"] = ""
     _sx_skip_ws(s, n, st)
-    let result = null
+    let final_result = null
     let p = st["pos"]
     if p >= n
-        // Empty / all-whitespace input -> empty atom.
-        result = ""
+        // Empty / all-whitespace input -> empty atom (not malformed).
+        final_result = ok("")
     else
         let ch = char_at(s, p)
         let o = ord(ch)
-        if o == 40
-            // Opening '(' — parse a list.
-            st["pos"] = p + 1
-            result = _sx_read_list(s, n, st)
+        if o == 41
+            // Stray ')' with no matching '(' at top level.
+            final_result = err("sx_parse: unexpected ')' with no matching '('")
         else
-            // Atom.
-            result = _sx_read_atom(s, n, st)
-    return result
+            if o == 40
+                // Opening '(' — parse a list.
+                st["pos"] = p + 1
+                let parsed = _sx_read_list(s, n, st, 1000)
+                if st["err"] != ""
+                    final_result = err(st["err"])
+                else
+                    _sx_skip_ws(s, n, st)
+                    if st["pos"] < n
+                        final_result = err("sx_parse: trailing content after top-level form")
+                    else
+                        final_result = ok(parsed)
+            else
+                // Atom.
+                let atom = _sx_read_atom(s, n, st)
+                _sx_skip_ws(s, n, st)
+                if st["pos"] < n
+                    final_result = err("sx_parse: trailing content after top-level form")
+                else
+                    final_result = ok(atom)
+    return final_result
 
 // sx_write: serialise a NOVA sexp value back to a string.
 //

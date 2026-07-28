@@ -1,0 +1,211 @@
+// KAT — soundness audit for std/parsing/jsonpath (recursive-descent JSONPath
+// engine over dict/list values).
+//
+// Covers:
+//   1. DEEP-NESTING RECURSION DoS (the primary finding, now fixed):
+//      1a. a ~20000-level nested VALUE tree queried with ".." (drives
+//          _jp_descend_all / _jp_descend_key) must NOT crash / hang — must
+//          return a bounded (depth-capped) result.
+//      1b. a ~20000-segment chained PATH string (drives _jp_eval) must NOT
+//          crash / hang — must return a bounded result.
+//   2. MALFORMED-INPUT rejection: unbalanced/unterminated brackets, an
+//      unterminated quoted key, a bracket with no content, garbage tokens —
+//      each must come back as "no match" ([] / null), never a crash.
+//   3. Valid-input round-trip: existing correctness contract still holds.
+//
+// Prints "JSONPATH-PARSE-AUDIT KAT PASS" only if every check passes.
+import std/parsing/jsonpath
+
+fn _fail(tag, detail)
+    print("FAIL " + tag + " " + detail)
+    exit(1)
+
+fn main()
+    // ── 1a. Deep-nesting DoS: ~20000-level nested VALUE tree + ".." ────────
+    // Build {"x": {"x": {"x": ... 1 ... }}} 20000 levels deep, purely
+    // iteratively (no recursion in the test harness itself).
+    let v = {}
+    v["x"] = 1
+    let i = 0
+    while i < 20000
+        let w = {}
+        w["x"] = v
+        v = w
+        i = i + 1
+
+    // "$..*" forces _jp_descend_all to walk every level of the nested tree.
+    // Pre-fix this stack-overflows the process (verified: native "fault").
+    // Post-fix it must return promptly with a bounded (truncated) result —
+    // strictly more than a handful of entries (proves real traversal
+    // happened) but nowhere near 20000+ (proves the depth cap engaged).
+    let deep_all = jp_query(v, "$..*")
+    let deep_all_len = len(deep_all)
+    if deep_all_len < 100
+        _fail("deep_descend_all_too_small", "len=" + str(deep_all_len))
+    if deep_all_len > 5000
+        _fail("deep_descend_all_uncapped", "len=" + str(deep_all_len))
+
+    // "$..x" forces _jp_descend_key the same way.
+    let deep_key = jp_query(v, "$..x")
+    let deep_key_len = len(deep_key)
+    if deep_key_len < 100
+        _fail("deep_descend_key_too_small", "len=" + str(deep_key_len))
+    if deep_key_len > 5000
+        _fail("deep_descend_key_uncapped", "len=" + str(deep_key_len))
+
+    // ── 1b. Deep-nesting DoS: ~20000-segment chained PATH string ────────────
+    // A degenerate path with 20000 chained ".a" selectors drives _jp_eval
+    // recursion depth directly from attacker-controlled path text, with no
+    // dependency on the value shape at all.
+    let flat = {}
+    flat["a"] = 42
+    let p = "$"
+    let j = 0
+    while j < 20000
+        p = p + ".a"
+        j = j + 1
+    // Must return promptly (no crash/hang) — "a" only exists one level
+    // deep on `flat`, so after the first hop every subsequent ".a" step
+    // finds nothing and the result is legitimately empty; the guarantee
+    // under test is termination + no crash, not a particular value.
+    let chain_r = jp_query(flat, p)
+    if len(chain_r) != 0
+        _fail("chain_unexpected_match", "len=" + str(len(chain_r)))
+
+    // A second chained-path case where every segment DOES match, so the
+    // evaluator is forced to actually thread live results through all
+    // ~20000 recursive steps (not just fail fast at step 2).
+    let self_ref = {}
+    self_ref["a"] = self_ref
+    let p2 = "$"
+    let k = 0
+    while k < 20000
+        p2 = p2 + ".a"
+        k = k + 1
+    let chain2_r = jp_query(self_ref, p2)
+    // Bounded by the depth cap: must terminate, and must not silently
+    // "succeed" as if the full 20000-deep chain were honored.
+    let chain2_len = len(chain2_r)
+    if chain2_len > 1
+        _fail("chain2_unexpected_len", "len=" + str(chain2_len))
+
+    // ── 1c. Cyclic VALUE graph (class-3 pathological blowup): a list that
+    // contains itself. Without the depth cap, "$..*" would descend into the
+    // cycle forever (infinite recursion -> stack overflow, worse than the
+    // finite deep-nesting case). With the cap, it must still terminate
+    // promptly with a bounded result.
+    let cyc = []
+    push(cyc, cyc)
+    let cyc_r = jp_query(cyc, "$..*")
+    let cyc_len = len(cyc_r)
+    if cyc_len < 100
+        _fail("cyclic_descend_all_too_small", "len=" + str(cyc_len))
+    if cyc_len > 5000
+        _fail("cyclic_descend_all_uncapped", "len=" + str(cyc_len))
+
+    // ── 2. Malformed input must never crash, and its established contract
+    // ("returns whatever the last validly-lexed prefix matches; unterminated
+    // or empty brackets simply yield no extra token", per the header's
+    // documented "[] on empty/malformed path or no match" convention and the
+    // pre-existing adversarial probe's "no crash is the only hard
+    // requirement" note) must hold exactly — traced by hand below.
+
+    // 2a. Unterminated '[' with no closing bracket at all — the truncated
+    // bracket contributes no token (EOF hits before any content is read),
+    // so evaluation falls back to the valid "$.a" prefix. No crash; a
+    // deterministic, harmless result — never a phantom/wrong-type match.
+    let m1 = jp_query(flat, "$.a[")
+    if len(m1) != 1
+        _fail("malformed_unterminated_bracket", "len=" + str(len(m1)))
+    if m1[0] != 42
+        _fail("malformed_unterminated_bracket_val", "got=" + str(m1[0]))
+
+    // 2a2. Same shape, but the valid prefix itself matches nothing — proves
+    // the fallback is a genuine "evaluate what parsed", not a silent
+    // match-everything bug: [] in, [] out.
+    let m1b = jp_query(flat, "$.missing[")
+    if len(m1b) != 0
+        _fail("malformed_unterminated_bracket_on_miss", "len=" + str(len(m1b)))
+
+    // 2b. Unterminated single-quoted bracket key (no closing quote/bracket)
+    // — EOF terminates the key scan, so the accumulated chars still become
+    // a valid "key" token (as if the closing '\'' and ']' were present).
+    let m2 = jp_query(flat, "$['a")
+    if len(m2) != 1
+        _fail("malformed_unterminated_quote", "len=" + str(len(m2)))
+    if m2[0] != 42
+        _fail("malformed_unterminated_quote_val", "got=" + str(m2[0]))
+
+    // 2c. Empty brackets — no index, no key, nothing; the lexer sees ']'
+    // immediately and emits no token for the pair, so it is a no-op and
+    // evaluation again falls back to the valid "$.a" prefix.
+    let m3 = jp_query(flat, "$.a[]")
+    if len(m3) != 1
+        _fail("malformed_empty_brackets", "len=" + str(len(m3)))
+    if m3[0] != 42
+        _fail("malformed_empty_brackets_val", "got=" + str(m3[0]))
+
+    // 2d. Stray/garbage tokens the lexer does not recognize (should just be
+    // skipped, never crash, and should not spuriously match).
+    let m4 = jp_query(flat, "$.a!!!###")
+    if len(m4) != 1
+        _fail("malformed_garbage_suffix", "len=" + str(len(m4)))
+    if m4[0] != 42
+        _fail("malformed_garbage_suffix_val", "got=" + str(m4[0]))
+
+    // 2e. Dangling ".." at the very end of the path with nothing after it —
+    // must fall back to "collect all descendants", never crash.
+    let m5 = jp_query(flat, "$.a..")
+    if len(m5) < 1
+        _fail("malformed_trailing_dotdot", "len=" + str(len(m5)))
+
+    // 2f. Empty path string — documented contract: returns [].
+    let m6 = jp_query(flat, "")
+    if len(m6) != 0
+        _fail("malformed_empty_path", "len=" + str(len(m6)))
+
+    // 2g. jp_first on a path matching nothing must be null, not a crash.
+    let m7 = jp_first(flat, "$.nonexistent.deeply.nested.path")
+    if m7 != null
+        _fail("malformed_missing_path_first", "got=" + str(m7))
+
+    // ── 3. Valid-input round-trip (existing correctness contract) ──────────
+    let book0 = {}
+    book0["title"] = "A"
+    book0["price"] = 10
+    let book1 = {}
+    book1["title"] = "B"
+    book1["price"] = 20
+    let books = []
+    push(books, book0)
+    push(books, book1)
+    let store = {}
+    store["book"] = books
+    let root = {}
+    root["store"] = store
+
+    let rt1 = jp_first(root, "$.store.book[0].title")
+    if rt1 != "A"
+        _fail("roundtrip_first_title", "got=" + str(rt1))
+
+    let rt2 = jp_query(root, "$.store.book[*].price")
+    if len(rt2) != 2
+        _fail("roundtrip_wildcard_price_len", "len=" + str(len(rt2)))
+    if rt2[0] != 10
+        _fail("roundtrip_wildcard_price0", "got=" + str(rt2[0]))
+    if rt2[1] != 20
+        _fail("roundtrip_wildcard_price1", "got=" + str(rt2[1]))
+
+    let rt3 = jp_query(root, "$..title")
+    if len(rt3) != 2
+        _fail("roundtrip_recursive_title_len", "len=" + str(len(rt3)))
+    if rt3[0] != "A"
+        _fail("roundtrip_recursive_title0", "got=" + str(rt3[0]))
+    if rt3[1] != "B"
+        _fail("roundtrip_recursive_title1", "got=" + str(rt3[1]))
+
+    let rt4 = jp_first(root, "$.store.book[-1].price")
+    if rt4 != 20
+        _fail("roundtrip_negindex", "got=" + str(rt4))
+
+    print("JSONPATH-PARSE-AUDIT KAT PASS")

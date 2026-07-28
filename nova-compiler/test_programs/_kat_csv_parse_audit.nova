@@ -1,0 +1,270 @@
+// _kat_csv_parse_audit — SOUNDNESS AUDIT of std/data/csv.nova (RFC 4180
+// list<->text codec) against the 4 recurring text-parser vulnerability
+// classes:
+//
+//   1. DEEP-NESTING RECURSION DoS
+//   2. MALFORMED ACCEPTANCE (silent mis-parse / data loss)
+//   3. PATHOLOGICAL BLOWUP (O(n^2)/O(2^n) on moderately-sized input)
+//   4. UNBOUNDED NUMBER/LENGTH
+//
+// CLASS 1 VERDICT: not applicable structurally, and independently verified
+// below. csv_parse/_csv_escape_field/csv_write are each a SINGLE top-level
+// while loop with zero self-calls and zero mutual calls during element
+// traversal (csv_write calls _csv_escape_field straight-line, once per
+// field -- never nested/recursive). CSV itself has no bracket/nesting
+// grammar (unlike JSON/sexpr/YAML) so there is no code path whose native
+// call-stack depth scales with input structure -- a stack-overflow-by-
+// recursion-depth vector is structurally impossible here regardless of how
+// the input is shaped. SECTION 2 below still feeds large adversarially
+// -shaped input (a single field built from 20000 consecutive escape-pairs,
+// the closest CSV analog to "20000x nested") to empirically confirm no
+// crash/hang and a bounded wall-clock time.
+//
+// CLASS 3 — REAL BUG FOUND & FIXED: all three functions in the module built
+// output strings by repeated whole-string concatenation inside a loop
+// (`field = field + c` per character in csv_parse, `inner = inner + ch` per
+// character in _csv_escape_field, `result = result + chr(10) + line` per
+// ROW in csv_write). Each `+` reallocates and copies the ENTIRE prefix built
+// so far (nova_rt_str_concat is O(la+lb), no amortized headroom) -- O(n^2)
+// total cost. This is not just an adversarial-input concern: a single large
+// legitimate field (e.g. an embedded text blob in one CSV cell) or a
+// document with many rows (an entirely ordinary CSV shape) would hang
+// real callers. FIX: rewritten to use the runtime's NovaBuffer
+// (buffer()/buf_append_char()/buf_append()/buf_to_str(), O(1)-amortized
+// doubling append) in all three functions -- same output, O(n) total.
+// SECTION 2 below proves this at 20000-200000 element scale with a wall
+// -clock bound tight enough that a reintroduced O(n^2) would blow through
+// it by 100x-1000x, but loose enough not to flake on a slow machine.
+//
+// CLASS 2 — REAL BUG FOUND & FIXED: the trailing-flush heuristic used
+// `len(field) > 0 or len(row) > 0` as a proxy for "is there a pending
+// field/row to flush at EOF". This conflates "nothing was ever started"
+// with "a field was legitimately closed empty". A document consisting of
+// exactly one fully-closed EMPTY quoted field -- e.g. the 2-character
+// document `""`, valid RFC 4180 CSV, not even malformed -- left `field`
+// and `row` both empty at EOF, so the whole row was silently DROPPED
+// (csv_parse('""') returned [] instead of [[""]]). The same defect drops
+// a trailing row whose LAST field is an unterminated OR closed-empty quote
+// with nothing else in it. FIX: an explicit `saw_char` flag tracks "has any
+// character of the row currently being built been consumed since the last
+// completed row", independent of the accumulated field's string length.
+// SECTION 3 below proves the fix and also exercises the pre-existing
+// (unchanged, still-correct) leniency rules: an unterminated quoted field
+// WITH content is flushed with that content; a bare CR is dropped; a mid-
+// field stray quote is kept literal.
+//
+// CLASS 4 VERDICT: not applicable. csv.nova parses no numbers and has no
+// repeat/count field on the wire at all -- every "count" (row count, field
+// count) is simply how many delimiters the input actually contains, driven
+// 1:1 by input length, not by a separate unchecked length prefix. Nothing
+// to test.
+
+import std/data/csv
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got [" + got + "] want [" + want + "]")
+        exit(1)
+    print("PASS " + label)
+
+fn ck_bound(label: string, elapsed_ms: int, max_ms: int)
+    print(label + " elapsed_ms=" + str(elapsed_ms) + " (bound=" + str(max_ms) + ")")
+    if elapsed_ms > max_ms
+        print("FAIL " + label + ": took " + str(elapsed_ms) + "ms, bound was " + str(max_ms) + "ms (possible O(n^2) regression)")
+        exit(1)
+    print("PASS " + label + " (bounded)")
+
+fn main()
+    let q = chr(34)
+    let nl = chr(10)
+    let cr = chr(13)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 1 — VALID-INPUT ROUND-TRIP (the buffer refactor must preserve
+    // every existing semantic: quoted fields, embedded comma/CRLF, escaped
+    // quotes, empty fields, CRLF row terminators, no-trailing-newline).
+    // ════════════════════════════════════════════════════════════════════
+    let t1 = "name,age,bio" + nl + "Ann,30," + q + "loves " + q + q + "NOVA" + q + q + ", coding" + q + nl + "Bob,,25 " + cr + nl
+    let r1 = csv_parse(t1)
+    cki("s1_row_count", len(r1), 3)
+    cks("s1_header_0", r1[0][0], "name")
+    cks("s1_header_2", r1[0][2], "bio")
+    cks("s1_ann_bio", r1[1][2], "loves " + q + "NOVA" + q + ", coding")
+    cks("s1_bob_age", r1[2][1], "")
+    cks("s1_bob_bio", r1[2][2], "25 ")
+
+    let w1 = csv_write(r1)
+    let r1b = csv_parse(w1)
+    cki("s1_roundtrip_rows", len(r1b), len(r1))
+    let ri = 0
+    let rt_ok = 1
+    while ri < len(r1)
+        let ci = 0
+        while ci < len(r1[ri])
+            if r1b[ri][ci] != r1[ri][ci]
+                rt_ok = 0
+            ci = ci + 1
+        ri = ri + 1
+    cki("s1_roundtrip_exact", rt_ok, 1)
+
+    // Writer must not over-quote a plain field (byte-exact).
+    let w2 = csv_write([["plain", "fields"], ["no", "quoting"]])
+    cks("s1_writer_no_overquote", w2, "plain,fields" + nl + "no,quoting")
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 2 — CLASS 1 (deep/large adversarial shape, proof of no
+    // crash/hang) + CLASS 3 (pathological O(n^2) blowup, proof of bound)
+    // ════════════════════════════════════════════════════════════════════
+
+    // 2a. A single field built from 20000 CONSECUTIVE escape-pairs inside
+    // one quoted field -- the CSV analog to "20000x nested": the parser
+    // must correctly thread the escape/close decision 20000 times in a row
+    // with no depth counter, no crash, no stack growth, and (post-fix)
+    // O(n) time. Document = " + ("" * 20000) + " -> one field of exactly
+    // 20000 literal quote characters.
+    let t2a = q + repeat(q + q, 20000) + q
+    let start2a = time_ms()
+    let r2a = csv_parse(t2a)
+    let elapsed2a = time_ms() - start2a
+    cki("s2a_rows", len(r2a), 1)
+    cki("s2a_fields", len(r2a[0]), 1)
+    cki("s2a_field_len", len(r2a[0][0]), 20000)
+    cki("s2a_field_is_all_quotes", ord(char_at(r2a[0][0], 0)), 34)
+    cki("s2a_field_last_is_quote", ord(char_at(r2a[0][0], 19999)), 34)
+    ck_bound("s2a_20000_escape_pairs_parse", elapsed2a, 5000)
+
+    // 2b. A single 200000-character UNQUOTED field (the pattern most
+    // directly hit by `field = field + c` quadratic blowup, since every
+    // character is a plain append with no escape logic at all).
+    let big_field = repeat("x", 200000)
+    let start2b = time_ms()
+    let r2b = csv_parse(big_field)
+    let elapsed2b = time_ms() - start2b
+    cki("s2b_rows", len(r2b), 1)
+    cki("s2b_fields", len(r2b[0]), 1)
+    cki("s2b_field_len", len(r2b[0][0]), 200000)
+    ck_bound("s2b_200000_char_field_parse", elapsed2b, 5000)
+
+    // 2c. A single row with 20000 fields (comma-delimited).
+    let big_row_text = repeat("a,", 19999) + "a"
+    let start2c = time_ms()
+    let r2c = csv_parse(big_row_text)
+    let elapsed2c = time_ms() - start2c
+    cki("s2c_rows", len(r2c), 1)
+    cki("s2c_field_count", len(r2c[0]), 20000)
+    cks("s2c_first_field", r2c[0][0], "a")
+    cks("s2c_last_field", r2c[0][19999], "a")
+    ck_bound("s2c_20000_field_row_parse", elapsed2c, 5000)
+
+    // 2d. A document with 20000 rows (LF-terminated, no trailing phantom).
+    let big_doc = repeat("a" + nl, 20000)
+    let start2d = time_ms()
+    let r2d = csv_parse(big_doc)
+    let elapsed2d = time_ms() - start2d
+    cki("s2d_row_count", len(r2d), 20000)
+    cks("s2d_first_row_field", r2d[0][0], "a")
+    cks("s2d_last_row_field", r2d[19999][0], "a")
+    ck_bound("s2d_20000_row_doc_parse", elapsed2d, 5000)
+
+    // 2e. csv_write with 20000 rows -- proves the WRITE-side per-row
+    // concatenation (`result = result + ...`) is no longer O(row-count^2).
+    let many_rows = []
+    let bi = 0
+    while bi < 20000
+        push(many_rows, ["a", "b"])
+        bi = bi + 1
+    let start2e = time_ms()
+    let w2e = csv_write(many_rows)
+    let elapsed2e = time_ms() - start2e
+    let r2e_back = csv_parse(w2e)
+    cki("s2e_written_row_count", len(r2e_back), 20000)
+    cks("s2e_written_first_field", r2e_back[0][0], "a")
+    cks("s2e_written_last_field", r2e_back[19999][1], "b")
+    ck_bound("s2e_20000_row_write", elapsed2e, 5000)
+
+    // 2f. csv_write on a SINGLE field containing 20000 quote characters --
+    // stresses _csv_escape_field's own quadratic-append fix (doubling every
+    // quote: 1 open + 20000*2 doubled + 1 close = 40002 output chars for
+    // this one field) combined with the round-trip read back through
+    // csv_parse's escape-pairing to confirm exact byte recovery at scale.
+    let quotey_field = repeat(q, 20000)
+    let start2f = time_ms()
+    let w2f = csv_write([[quotey_field, "tail"]])
+    let elapsed2f = time_ms() - start2f
+    cki("s2f_escaped_len", len(w2f), 20000 * 2 + 2 + 1 + 4)
+    let r2f_back = csv_parse(w2f)
+    cki("s2f_field_recovered_len", len(r2f_back[0][0]), 20000)
+    cks("s2f_tail_field", r2f_back[0][1], "tail")
+    ck_bound("s2f_20000_quote_field_write", elapsed2f, 5000)
+
+    // ════════════════════════════════════════════════════════════════════
+    // SECTION 3 — CLASS 2: malformed / edge-case acceptance
+    // ════════════════════════════════════════════════════════════════════
+
+    // 3a. THE BUG: a document that is EXACTLY one closed, empty, quoted
+    // field ("") -- valid CSV, must parse to one row with one empty field,
+    // not be silently dropped to [].
+    let r3a = csv_parse(q + q)
+    cki("s3a_closed_empty_quoted_doc_rows", len(r3a), 1)
+    cki("s3a_closed_empty_quoted_doc_fields", len(r3a[0]), 1)
+    cks("s3a_closed_empty_quoted_doc_value", r3a[0][0], "")
+
+    // 3b. Same bug, trailing ROW position: a second row that is nothing but
+    // a closed empty quoted field must not vanish.
+    let r3b = csv_parse("a,b" + nl + q + q)
+    cki("s3b_rows", len(r3b), 2)
+    cki("s3b_row1_fields", len(r3b[1]), 1)
+    cks("s3b_row1_value", r3b[1][0], "")
+
+    // 3c. A LONE unterminated quote character as the ENTIRE document (opens
+    // a quoted field, hits EOF before any content or close) must still
+    // produce one row with one empty field, not silently vanish.
+    let r3c = csv_parse(q)
+    cki("s3c_rows", len(r3c), 1)
+    cks("s3c_value", r3c[0][0], "")
+
+    // 3d. Unterminated quote WITH content must still flush that content
+    // (pre-existing correct leniency, must survive the refactor).
+    let r3d = csv_parse("a," + q + "unterminated")
+    cki("s3d_rows", len(r3d), 1)
+    cki("s3d_fields", len(r3d[0]), 2)
+    cks("s3d_value", r3d[0][1], "unterminated")
+
+    // 3e. A mid-field stray quote (not the field's first character) is kept
+    // literal, never treated as quote-open (pre-existing rule).
+    let r3e = csv_parse("ab" + q + "cd,x")
+    cks("s3e_value", r3e[0][0], "ab" + q + "cd")
+    cks("s3e_second_field", r3e[0][1], "x")
+
+    // 3f. Trailing comma produces an explicit empty final field, not a
+    // dropped one.
+    let r3f = csv_parse("a,b,")
+    cki("s3f_fields", len(r3f[0]), 3)
+    cks("s3f_last_field", r3f[0][2], "")
+
+    // 3g. A document of only commas.
+    let r3g = csv_parse(",,,")
+    cki("s3g_fields", len(r3g[0]), 4)
+
+    // 3h. A trailing bare CR (no following LF) is dropped, not turned into
+    // a phantom field/row.
+    let r3h = csv_parse("a,b" + cr)
+    cki("s3h_rows", len(r3h), 1)
+    cki("s3h_fields", len(r3h[0]), 2)
+    cks("s3h_last_field", r3h[0][1], "b")
+
+    // 3i. Trailing newline must not create a phantom empty row.
+    let r3i = csv_parse("a,b" + nl)
+    cki("s3i_rows", len(r3i), 1)
+
+    // 3j. Empty document parses to [].
+    let r3j = csv_parse("")
+    cki("s3j_rows", len(r3j), 0)
+
+    print("CSV-PARSE-AUDIT KAT PASS")

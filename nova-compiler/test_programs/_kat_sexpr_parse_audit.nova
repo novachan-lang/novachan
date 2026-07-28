@@ -1,0 +1,211 @@
+// _kat_sexpr_parse_audit.nova — INDEPENDENT soundness audit KAT for
+// std/data/sexpr's text parser (sx_parse).
+//
+// Hunts the 4 recurring text-parser vulnerability classes against sx_parse
+// (the only parse entry point in std/data/sexpr; sx_write/sx_is_atom take
+// already-in-memory NOVA values, not untrusted text, so they are not a
+// parse-time attack surface):
+//
+//   1. DEEP-NESTING RECURSION DoS — _sx_read_list recursed once per nested
+//      '(' with NO depth limit; a crafted config file with tens of
+//      thousands of nested "(" characters recursed the native call stack
+//      unbounded (stack overflow = crash/UB). REAL BUG, FIXED: _sx_read_list
+//      now threads a 1000-level recursion budget (matching this codebase's
+//      std/data/asn1_parse convention); exceeding it rejects via Err
+//      instead of recursing further, so actual native recursion never
+//      exceeds ~1000 call frames regardless of how deep the input claims
+//      to be. This KAT feeding a 20000-deep input and completing (rather
+//      than being killed by the harness's mandatory kill-on-timeout, or
+//      crashing) IS the proof.
+//   2. MALFORMED ACCEPTANCE — sx_parse had NO error channel at all
+//      (`-> any`): an unterminated list (missing ')'), a stray ')' with no
+//      matching '(', and trailing content after the top-level form were
+//      all silently accepted (truncated or ignored) instead of rejected —
+//      a truncated/corrupted config file parsed as if it were valid, with
+//      no signal to the caller. REAL BUG, FIXED: sx_parse now returns
+//      Result and rejects all three.
+//   3. PATHOLOGICAL BLOWUP (alias/anchor/reference expansion) — NOT
+//      APPLICABLE. The sexpr grammar this module implements has no
+//      alias/anchor/backreference construct of any kind (no YAML-style
+//      "&x"/"*x", no reader macros, no includes) — every atom and list is
+//      read exactly once, directly from its own source text, so there is
+//      no expansion mechanism to blow up. Proven below with a
+//      wide-but-shallow input (thousands of sibling atoms, zero extra
+//      nesting) completing promptly and correctly.
+//   4. UNBOUNDED NUMBER/LENGTH — NOT APPLICABLE. sx_parse never parses a
+//      number (atoms are opaque strings, never interpreted as integers)
+//      and there is no repeat/count field anywhere in the grammar. Proven
+//      below with a numeric-looking atom far beyond i64 range that must
+//      still pass through unchanged as a string.
+//
+// LEXER GOTCHA (unrelated to std/data/sexpr itself, discovered while
+// writing this KAT): a string literal that is a lone/leading ')' with no
+// preceding '(' earlier in that same literal (e.g. ")", ")))" used
+// directly as `foo(")")`), when it appears as an argument inside a real
+// call's parens, can make the compiler's own indentation/continuation
+// lexer misreport "inconsistent indentation" for the rest of that logical
+// line -- it is not string-literal-aware. Every well-nested string with
+// '(' preceding its ')' (e.g. "(a b)") is unaffected, which is why
+// std/data/sexpr's OWN existing valid-input KAT (_sexpr_test.nova) never
+// hit this. Worked around below via chr(40)/chr(41) concatenation for the
+// handful of inputs that need a lone/leading ')'; this is a pre-existing
+// compiler lexer limitation, not a sexpr.nova defect, and is out of scope
+// to fix here (RED-tier compiler surgery needs its own reconverge pass).
+import std/data/sexpr
+
+fn fail(msg)
+    print("FAIL: " + msg)
+    exit(1)
+
+fn cki(label, got, want)
+    if got != want
+        fail(label + ": got=" + str(got) + " want=" + str(want))
+
+fn cks(label, got, want)
+    if got != want
+        fail(label + ": got=[" + got + "] want=[" + want + "]")
+
+// unwrap_ok: decode-or-fail helper for KNOWN-GOOD input. An Err here is
+// itself the failure being reported (a valid-input regression).
+fn unwrap_ok(s)
+    let v = null
+    match sx_parse(s)
+        Ok(r) =>
+            v = r
+        Err(e) =>
+            fail("expected Ok but got Err(" + e + ") for input [" + s + "]")
+    return v
+
+// is_rejected: 1 iff sx_parse(s) returns Err, 0 iff it returns Ok.
+fn is_rejected(s)
+    let r = 0
+    match sx_parse(s)
+        Ok(v) =>
+            r = 0
+        Err(e) =>
+            r = 1
+    return r
+
+// ── PART A: valid-input round-trip (pre-existing behaviour must survive) ──
+fn a_valid_roundtrip()
+    let list1 = unwrap_ok("(a b c)")
+    cki("A flat_len", len(list1), 3)
+    cks("A flat_0", list1[0], "a")
+    cks("A flat_1", list1[1], "b")
+    cks("A flat_2", list1[2], "c")
+
+    let list2 = unwrap_ok("(a (b c) d)")
+    cks("A nested_0", list2[0], "a")
+    let inner2 = list2[1]
+    cks("A nested_1_0", inner2[0], "b")
+    cks("A nested_1_1", inner2[1], "c")
+    cks("A nested_2", list2[2], "d")
+
+    let list3 = unwrap_ok("()")
+    cki("A empty_len", len(list3), 0)
+    cki("A empty_is_atom", sx_is_atom(list3), 0)
+
+    let atom4 = unwrap_ok("atom")
+    cks("A atom", atom4, "atom")
+    cki("A atom_is_atom", sx_is_atom(atom4), 1)
+
+    let rt = unwrap_ok("(f (g x) y)")
+    cks("A round_trip", sx_write(rt), "(f (g x) y)")
+
+    let rt2 = unwrap_ok("(a   b   c)")
+    cks("A round_trip_spaces", sx_write(rt2), "(a b c)")
+
+    print("PART A (valid round-trip) ok")
+
+// ── PART B: CLASS 1 — deep-nesting recursion DoS ───────────────────────────
+fn b_class1_deep_nesting_dos()
+    let op = chr(40)
+    let cp = chr(41)
+
+    // B1: ~20000 unmatched '(' — the exact mandated attack shape.
+    // Pre-fix this recursed ~20000 native stack frames deep -> crash/hang.
+    let deep_open = repeat(op, 20000)
+    if is_rejected(deep_open) == 0
+        fail("B1: 20000-deep unterminated nesting was NOT rejected")
+
+    // B2: same depth, but FULLY BALANCED (20000 opens + 20000 matching
+    // closes) — proves the cap fires going IN, before ever reaching the
+    // matching ')'s; a document that WOULD balance is still too deep.
+    let deep_balanced = repeat(op, 20000) + repeat(cp, 20000)
+    if is_rejected(deep_balanced) == 0
+        fail("B2: 20000-deep BALANCED nesting was NOT rejected")
+
+    // B3: a moderately deep but well-formed structure comfortably inside
+    // the cap must still parse correctly (the fix must not reject
+    // legitimate, merely-deep input) and round-trip byte-exact.
+    let src = repeat(op, 500) + "x" + repeat(cp, 500)
+    let parsed_ok = unwrap_ok(src)
+    cks("B3 bounded-deep round trip", sx_write(parsed_ok), src)
+
+    print("PART B (class 1: deep-nesting DoS) closed -- 20000-deep input rejected, no crash/hang")
+
+// ── PART C: CLASS 2 — malformed acceptance ──────────────────────────────────
+fn c_class2_malformed_acceptance()
+    let op = chr(40)
+    let cp = chr(41)
+
+    if is_rejected(op + "a b c") == 0
+        fail("C1: unterminated list '(a b c' was NOT rejected")
+    if is_rejected("(a (b c)") == 0
+        fail("C2: unterminated nested list was NOT rejected")
+    if is_rejected(cp) == 0
+        fail("C3: stray leading ')' was NOT rejected")
+    if is_rejected(cp + cp + cp) == 0
+        fail("C4: stray leading ')))' was NOT rejected")
+    if is_rejected(op + "a b" + cp + cp) == 0
+        fail("C5: trailing stray ')' after a valid list was NOT rejected")
+    if is_rejected("(a b) extra") == 0
+        fail("C6: trailing content after a valid list was NOT rejected")
+    if is_rejected("(a) (b)") == 0
+        fail("C7: two sibling top-level list forms was NOT rejected")
+    if is_rejected("atom garbage") == 0
+        fail("C8: two sibling top-level atoms was NOT rejected")
+
+    // Valid input must NOT be rejected (no over-eager false positives).
+    if is_rejected("(a b c)") == 1
+        fail("C9: valid flat list was wrongly rejected")
+    if is_rejected("atom") == 1
+        fail("C10: valid atom was wrongly rejected")
+    if is_rejected("()") == 1
+        fail("C11: valid empty list was wrongly rejected")
+    if is_rejected("") == 1
+        fail("C12: empty/whitespace-only input was wrongly rejected")
+
+    print("PART C (class 2: malformed acceptance) closed -- unbalanced/stray/trailing input rejected")
+
+// ── PART D: CLASS 3 — pathological blowup (alias/anchor expansion) ─────────
+// NOT APPLICABLE — see header. Proven with a wide-but-shallow input: 5000
+// sibling atoms in one flat list (zero extra nesting) must parse promptly
+// and correctly.
+fn d_class3_not_applicable_wide_input()
+    let op = chr(40)
+    let cp = chr(41)
+    let n_wide = 5000
+    let src = op + repeat("a ", n_wide) + cp
+    let wide = unwrap_ok(src)
+    cki("D wide flat list length", len(wide), n_wide)
+    cks("D wide flat list first elem", wide[0], "a")
+    cks("D wide flat list last elem", wide[n_wide - 1], "a")
+    print("PART D (class 3: pathological blowup) not applicable -- no alias/anchor mechanism exists; wide input parses fine")
+
+// ── PART E: CLASS 4 — unbounded number/length ───────────────────────────────
+// NOT APPLICABLE — see header. sx_parse never parses a number and has no
+// repeat/count field. Prove an atom that LOOKS like a huge number (far
+// beyond i64 range) still passes through as an unmodified, opaque string.
+fn e_class4_not_applicable_no_numeric_parse()
+    let huge_atom = unwrap_ok("99999999999999999999999999999999999999")
+    cks("E huge numeric-looking atom stays an opaque string", huge_atom, "99999999999999999999999999999999999999")
+    print("PART E (class 4: unbounded number/length) not applicable -- no numeric or count parsing exists")
+
+fn main()
+    a_valid_roundtrip()
+    b_class1_deep_nesting_dos()
+    c_class2_malformed_acceptance()
+    d_class3_not_applicable_wide_input()
+    e_class4_not_applicable_no_numeric_parse()
+    print("SEXPR-PARSE-AUDIT KAT PASS")
