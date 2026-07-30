@@ -1,0 +1,143 @@
+// forge_fleet_manager — IoT fleet management: assign devices to named groups,
+// move them between groups, and remove them from the fleet.
+//
+// STATE SHAPE (flat dict, no nesting):
+//   state["total"]                — int, current fleet size (present devices)
+//   state["groups"]                — string, comma-separated list of every
+//                                     group name ever used (may include groups
+//                                     that are currently empty)
+//   state["present_"+device_id]   — int, 1 if device_id is currently in the
+//                                     fleet, 0 if it was removed. There is no
+//                                     dict-delete builtin, so membership is a
+//                                     tri-state tracked explicitly: KEY ABSENT
+//                                     (never added) / 1 (present) / 0 (removed).
+//   state["group_"+device_id]     — string, device_id's current (or last, if
+//                                     removed) group name
+//   state["cnt_"+group]           — int, number of PRESENT devices in group
+//
+// flm_group_list reports only groups with cnt_ > 0, so a group that has been
+// fully vacated (all members removed or moved out) drops out of the listing
+// even though its name stays in state["groups"].
+//
+// LEAF MODULE — imports NOTHING; only NOVA builtins: contains/split/ok/err.
+
+// _flm_is_present(state, device_id) -> int  — PRIVATE. 1 if currently in fleet.
+fn _flm_is_present(state: dict, device_id: string) -> int
+    if contains(state, "present_" + device_id) == true
+        if state["present_" + device_id] == 1
+            return 1
+    0
+
+// _flm_register_group_name(state, group) -> dict — PRIVATE. Ensure `group` has
+// a counter and appears in state["groups"] exactly once.
+fn _flm_register_group_name(state: dict, group: string) -> dict
+    if contains(state, "cnt_" + group) == false
+        state["cnt_" + group] = 0
+        let toks = split(state["groups"], ",")
+        let found = 0
+        for t in toks
+            if t == group
+                found = 1
+        if found == 0
+            if state["groups"] == ""
+                state["groups"] = group
+            else
+                state["groups"] = state["groups"] + "," + group
+    state
+
+// flm_new() -> dict
+// Create an empty fleet manager.
+fn flm_new() -> dict
+    let state = {}
+    state["total"] = 0
+    state["groups"] = ""
+    state
+
+// flm_add_device(state, device_id, group) -> dict
+// Add device_id to the fleet under `group`. If the device is already present
+// in a different group, it is moved (old group's count decremented). Adding
+// to the SAME group it is already in is a no-op. A previously-removed device
+// re-added counts as a fresh addition (total incremented again).
+fn flm_add_device(state: dict, device_id: string, group: string) -> dict
+    let already = _flm_is_present(state, device_id)
+    if already == 1
+        let old = state["group_" + device_id]
+        if old == group
+            return state
+        state["cnt_" + old] = state["cnt_" + old] - 1
+    else
+        state["total"] = state["total"] + 1
+    state["present_" + device_id] = 1
+    state["group_" + device_id] = group
+    state = _flm_register_group_name(state, group)
+    state["cnt_" + group] = state["cnt_" + group] + 1
+    state
+
+// flm_group_count(state, group) -> int
+// Number of PRESENT devices currently in `group`. Unknown groups return 0.
+fn flm_group_count(state: dict, group: string) -> int
+    if contains(state, "cnt_" + group) == false
+        return 0
+    state["cnt_" + group]
+
+// flm_device_group(state, device_id) -> Result
+// Return ok(group_name) if device_id is currently in the fleet, else
+// err("device not in fleet").
+fn flm_device_group(state: dict, device_id: string) -> Result
+    if _flm_is_present(state, device_id) == 0
+        return err("device not in fleet")
+    ok(state["group_" + device_id])
+
+// flm_move(state, device_id, new_group) -> Result
+// Move a present device to `new_group`. Moving to its current group is a
+// no-op that still returns ok(state). err("device not in fleet") if absent.
+fn flm_move(state: dict, device_id: string, new_group: string) -> Result
+    if _flm_is_present(state, device_id) == 0
+        return err("device not in fleet")
+    let old = state["group_" + device_id]
+    if old == new_group
+        return ok(state)
+    state["cnt_" + old] = state["cnt_" + old] - 1
+    state["group_" + device_id] = new_group
+    state = _flm_register_group_name(state, new_group)
+    state["cnt_" + new_group] = state["cnt_" + new_group] + 1
+    ok(state)
+
+// flm_remove(state, device_id) -> Result
+// Remove a present device from the fleet (its group count and the fleet
+// total are decremented). err("device not in fleet") if it was never added
+// or was already removed.
+fn flm_remove(state: dict, device_id: string) -> Result
+    if _flm_is_present(state, device_id) == 0
+        return err("device not in fleet")
+    let old = state["group_" + device_id]
+    state["cnt_" + old] = state["cnt_" + old] - 1
+    state["present_" + device_id] = 0
+    state["total"] = state["total"] - 1
+    ok(state)
+
+// flm_total_devices(state) -> int
+// Current fleet size (devices present, not counting removed ones).
+fn flm_total_devices(state: dict) -> int
+    state["total"]
+
+// flm_group_list(state) -> string
+// Comma-separated list of group names that currently have at least one
+// present device. Returns "" if the fleet is empty or all groups are vacated.
+fn flm_group_list(state: dict) -> string
+    let toks = split(state["groups"], ",")
+    let out = ""
+    for t in toks
+        if t != ""
+            if contains(state, "cnt_" + t) == true
+                if state["cnt_" + t] > 0
+                    if out == ""
+                        out = t
+                    else
+                        out = out + "," + t
+    out
+
+// flm_has_device(state, device_id) -> int
+// Return 1 if device_id is currently present in the fleet, 0 otherwise.
+fn flm_has_device(state: dict, device_id: string) -> int
+    _flm_is_present(state, device_id)

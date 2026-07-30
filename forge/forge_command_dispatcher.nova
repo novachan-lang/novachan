@@ -1,0 +1,134 @@
+// forge_command_dispatcher — IoT command dispatch: queue commands per device,
+// hand them out FIFO via cd_next, and acknowledge delivery via cd_ack.
+//
+// STATE SHAPE (flat dict, no nesting):
+//   state["total_sent"]                 — int, commands sent across all devices
+//   state["total_acked"]                — int, commands acked across all devices
+//   state["device_count"]                — int, registered devices
+//   state["next_cmdseq"]                 — int, monotonic id generator
+//   state["reg_"+device_id]              — 1, presence = device registered
+//   state["sent_"+device_id]             — int, commands sent to this device
+//                                           (also the next free slot index)
+//   state["next_"+device_id]             — int, index of next command cd_next
+//                                           will hand out (FIFO delivery cursor)
+//   state["acked_"+device_id]            — int, commands acked for this device
+//   state["cmdname_"+device_id+"_"+idx]  — string, command name at slot idx
+//   state["payload_"+device_id+"_"+idx]  — string, payload at slot idx
+//   state["cmdid_"+device_id+"_"+idx]    — string, unique command id at slot idx
+//   state["ackflag_"+device_id+"_"+idx]  — int, 1 once acked, else 0
+//
+// "pending" = sent - acked (commands awaiting acknowledgement, regardless of
+// whether they have already been fetched via cd_next). cd_next only advances
+// a delivery cursor; the command remains pending until cd_ack is called —
+// this makes cd_next safe to call again after a lost/crashed delivery without
+// losing at-least-once semantics (the caller must still ack explicitly).
+//
+// LEAF MODULE — imports NOTHING; only NOVA builtins: contains/str/ok/err.
+
+// cd_new() -> dict
+// Create an empty command dispatcher.
+fn cd_new() -> dict
+    let state = {}
+    state["total_sent"] = 0
+    state["total_acked"] = 0
+    state["device_count"] = 0
+    state["next_cmdseq"] = 0
+    state
+
+// cd_register(state, device_id) -> dict
+// Register a device to receive commands. Re-registering an already-known
+// device is a no-op (does not reset its queue or counters).
+fn cd_register(state: dict, device_id: string) -> dict
+    if contains(state, "reg_" + device_id) == false
+        state["reg_" + device_id] = 1
+        state["sent_" + device_id] = 0
+        state["next_" + device_id] = 0
+        state["acked_" + device_id] = 0
+        state["device_count"] = state["device_count"] + 1
+    state
+
+// cd_send(state, device_id, command, payload) -> Result
+// Enqueue a command for device_id. Returns ok(command_id) — a unique string
+// id the caller must retain to later call cd_ack. err("device not registered")
+// if cd_register was never called for this device_id.
+fn cd_send(state: dict, device_id: string, command: string, payload: string) -> Result
+    if contains(state, "reg_" + device_id) == false
+        return err("device not registered")
+    let idx = state["sent_" + device_id]
+    let seq = state["next_cmdseq"] + 1
+    state["next_cmdseq"] = seq
+    let cmdid = "cmd" + str(seq)
+    let base = device_id + "_" + str(idx)
+    state["cmdname_" + base] = command
+    state["payload_" + base] = payload
+    state["cmdid_" + base] = cmdid
+    state["ackflag_" + base] = 0
+    state["sent_" + device_id] = idx + 1
+    state["total_sent"] = state["total_sent"] + 1
+    ok(cmdid)
+
+// cd_pending(state, device_id) -> Result
+// Return ok(count) of commands sent but not yet acked, or err("device not
+// registered").
+fn cd_pending(state: dict, device_id: string) -> Result
+    if contains(state, "reg_" + device_id) == false
+        return err("device not registered")
+    ok(state["sent_" + device_id] - state["acked_" + device_id])
+
+// cd_next(state, device_id) -> Result
+// Return the next undelivered command as ok("command_id|command|payload"), or
+// err("no pending commands") if the delivery cursor has caught up with the
+// send cursor. Advances the delivery cursor — call cd_ack once the device
+// confirms receipt.
+fn cd_next(state: dict, device_id: string) -> Result
+    if contains(state, "reg_" + device_id) == false
+        return err("device not registered")
+    let nxt = state["next_" + device_id]
+    let sent = state["sent_" + device_id]
+    if nxt >= sent
+        return err("no pending commands")
+    let base = device_id + "_" + str(nxt)
+    let cmdid = state["cmdid_" + base]
+    let cmdname = state["cmdname_" + base]
+    let payload = state["payload_" + base]
+    state["next_" + device_id] = nxt + 1
+    ok(cmdid + "|" + cmdname + "|" + payload)
+
+// cd_ack(state, device_id, command_id) -> Result
+// Mark a previously-sent, not-yet-acked command as acknowledged. Returns
+// ok(state) on success, err if the device is unknown or command_id does not
+// match any unacked command for that device (unknown id or double-ack).
+fn cd_ack(state: dict, device_id: string, command_id: string) -> Result
+    if contains(state, "reg_" + device_id) == false
+        return err("device not registered")
+    let sent = state["sent_" + device_id]
+    let i = 0
+    let found_idx = -1
+    while i < sent
+        let base = device_id + "_" + str(i)
+        if state["cmdid_" + base] == command_id
+            if state["ackflag_" + base] == 0
+                found_idx = i
+        i = i + 1
+    if found_idx == -1
+        return err("command not found or already acked")
+    let base2 = device_id + "_" + str(found_idx)
+    state["ackflag_" + base2] = 1
+    state["acked_" + device_id] = state["acked_" + device_id] + 1
+    state["total_acked"] = state["total_acked"] + 1
+    ok(state)
+
+// cd_total_sent(state) -> int
+// Total commands sent across all devices.
+fn cd_total_sent(state: dict) -> int
+    state["total_sent"]
+
+// cd_total_acked(state) -> int
+// Total commands acknowledged across all devices.
+fn cd_total_acked(state: dict) -> int
+    state["total_acked"]
+
+// cd_device_count(state) -> int
+// Number of registered devices.
+fn cd_device_count(state: dict) -> int
+    state["device_count"]

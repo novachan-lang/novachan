@@ -1,0 +1,144 @@
+// forge_rate_shield — Sentinel: DDoS / abuse rate protection.
+//
+// Per-client sliding-window request counting with two independent block
+// mechanisms:
+//   AUTO block  — set automatically when a client's request count within the
+//                 current window exceeds its threshold; clears when the
+//                 window rolls over (same tumbling-window idea as
+//                 forge_ratewin, but tracked per client with an explicit
+//                 block flag instead of just a counter).
+//   MANUAL block — set/cleared explicitly via rs_block/rs_unblock (an admin
+//                 override, e.g. after an out-of-band abuse report); persists
+//                 across window rollovers until explicitly unblocked.
+// A client is "blocked" (rs_is_blocked) if EITHER flag is set. rs_blocked_count
+// tracks the live number of currently-blocked distinct clients via an
+// edge-triggered counter (_rs_sync_block), not a linear rescan.
+//
+// This is a plain state-machine (dict reads/writes), not an actor — fine for
+// single-owner use (one process/request handler holding the shield handle);
+// concurrent callers from multiple carriers must serialize access themselves
+// (see forge_ratelimit for the actor pattern if that's needed instead).
+//
+// STATE SHAPE — single FLAT dict, no nested dicts, no lists-in-dicts:
+//   window_size                : int    — window length, same time unit as timestamps (e.g. ms)
+//   total_requests               : int    — all rs_request calls across all clients
+//   blocked_total                  : int    — live count of currently-blocked distinct clients
+//   req_count_<client>              : int    — requests seen in the client's CURRENT window
+//   window_start_<client>            : int    — timestamp the client's current window began
+//   threshold_<client>                : int    — max requests per window before auto-block (default 100)
+//   auto_block_<client>                : int    — 1 if currently auto-blocked (window-scoped)
+//   manual_block_<client>               : int    — 1 if currently manually blocked (persists across windows)
+//   counted_blocked_<client>             : int    — bookkeeping: 1 if this client is counted in blocked_total
+//
+// LEAF MODULE — imports NOTHING. Built-ins: contains.
+
+fn rs_new(window_size: int) -> dict
+    let s = {}
+    s["window_size"] = window_size
+    s["total_requests"] = 0
+    s["blocked_total"] = 0
+    s
+
+// Recompute blocked_total for one client after manual_block or auto_block
+// changed: an edge-triggered +1/-1 so blocked_total always equals the number
+// of distinct clients with (manual==1 or auto==1), without ever rescanning.
+fn _rs_sync_block(state: dict, client_id: string)
+    let mkey = "manual_block_" + client_id
+    let akey = "auto_block_" + client_id
+    let ckey = "counted_blocked_" + client_id
+    let manual = 0
+    if contains(state, mkey) == true
+        manual = state[mkey]
+    let auto = 0
+    if contains(state, akey) == true
+        auto = state[akey]
+    let combined = 0
+    if manual == 1 or auto == 1
+        combined = 1
+    let counted = 0
+    if contains(state, ckey) == true
+        counted = state[ckey]
+    if combined == 1 and counted == 0
+        state["blocked_total"] = state["blocked_total"] + 1
+        state[ckey] = 1
+    else if combined == 0 and counted == 1
+        state["blocked_total"] = state["blocked_total"] - 1
+        state[ckey] = 0
+
+// Record one request from client_id at timestamp (monotonic, caller-chosen
+// unit — must be consistent with window_size's unit). Rolls the client's
+// window over when timestamp - window_start >= window_size (clearing the
+// per-window request count and any AUTO block, but never the MANUAL block),
+// then increments the count and auto-blocks if the per-client threshold
+// (rs_set_threshold, default 100) is exceeded.
+fn rs_request(state: dict, client_id: string, timestamp: int)
+    let wkey = "window_start_" + client_id
+    let ws = timestamp
+    if contains(state, wkey) == true
+        ws = state[wkey]
+    else
+        state[wkey] = timestamp
+    let ckey = "req_count_" + client_id
+    let cur = 0
+    if contains(state, ckey) == true
+        cur = state[ckey]
+    if timestamp - ws >= state["window_size"]
+        state[wkey] = timestamp
+        cur = 0
+        let akey = "auto_block_" + client_id
+        if contains(state, akey) == true
+            state[akey] = 0
+            _rs_sync_block(state, client_id)
+    cur = cur + 1
+    state[ckey] = cur
+    state["total_requests"] = state["total_requests"] + 1
+    let tkey = "threshold_" + client_id
+    let threshold = 100
+    if contains(state, tkey) == true
+        threshold = state[tkey]
+    if cur > threshold
+        let akey2 = "auto_block_" + client_id
+        let was_auto = 0
+        if contains(state, akey2) == true
+            was_auto = state[akey2]
+        if was_auto == 0
+            state[akey2] = 1
+            _rs_sync_block(state, client_id)
+
+fn rs_is_blocked(state: dict, client_id: string) -> int
+    let mkey = "manual_block_" + client_id
+    let akey = "auto_block_" + client_id
+    let manual = 0
+    if contains(state, mkey) == true
+        manual = state[mkey]
+    let auto = 0
+    if contains(state, akey) == true
+        auto = state[akey]
+    if manual == 1 or auto == 1
+        return 1
+    0
+
+fn rs_set_threshold(state: dict, client_id: string, max_requests: int)
+    state["threshold_" + client_id] = max_requests
+
+fn rs_block(state: dict, client_id: string) -> Result
+    state["manual_block_" + client_id] = 1
+    _rs_sync_block(state, client_id)
+    ok(client_id)
+
+fn rs_unblock(state: dict, client_id: string) -> Result
+    state["manual_block_" + client_id] = 0
+    _rs_sync_block(state, client_id)
+    ok(client_id)
+
+fn rs_request_count(state: dict, client_id: string) -> int
+    let ckey = "req_count_" + client_id
+    if contains(state, ckey) == true
+        return state[ckey]
+    0
+
+fn rs_blocked_count(state: dict) -> int
+    state["blocked_total"]
+
+fn rs_total_requests(state: dict) -> int
+    state["total_requests"]

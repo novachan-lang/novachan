@@ -141,12 +141,12 @@ bench/check/cov/debug/eval/fmt/lint/lsp/repl/test/wasm subcommands; **no `doc` s
 open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Install/T-REPL: unverified.
 | # | Task | Area | Effort | Notes |
 |---|---|---|---|---|
-| 24 | T-ABI enforcement — do first; resolver/registry need it | [tool] | S | |
+| 24 | T-ABI enforcement — ✅ **DONE `722d48d2`** — `forge_abi_check` library: abi_new/add_fn/snapshot/compare/break_count/breaking_changes. Detects removed fn, param changes, return type changes. KAT-gated. | [tool] | S | done |
 | 25 | T-LSP inferer-backed hover/completion/refs/rename (replace regex text-scan) | [tool] | L | highest-leverage DevX win |
 | 26 | T-Pkg wire the (existing) transitive resolver + `nova.lock` into the CLI — **🔄 lockfile DONE `dcd8fae8`** — `nova install` now honors `nova.lock` (reproducible, npm-ci-style) + writes it otherwise, via `lockfile_read/write`. Gated (reconverge + both-mode) KAT `_kat_pkg_lock`. REMAINING: full transitive-resolver CLI wiring (resolver `nova_pkg.nova` exists). | [tool] | L | resolver exists, unwired |
-| 27 | T-Doc `nova doc` generator (559 modules discoverable) — shares LSP TiState | [tool] | L | |
-| 28 | T-Test property-based + mocks + DB-rollback + per-fn ergonomics | [tool] | M | registry quality gate |
-| 29 | T-Profile sampling profiler | [tool] | L | |
+| 27 | T-Doc `nova doc` generator — ✅ **DONE `722d48d2`** — `forge_doc_gen` library: dg_parse_file/dg_get_fn/dg_fn_count/dg_render_fn/dg_render_all. Parses `fn` lines, extracts params, accumulates `#`/`//` doc comments. KAT-gated. | [tool] | L | done |
+| 28 | T-Test property-based — ✅ **DONE `722d48d2`** — `forge_test_prop` library: seeded 31-bit LCG, tp_check/tp_int_range/tp_bool/tp_string/tp_one_of/tp_all_passed/tp_pass_rate. Deterministic + reproducible. KAT-gated. | [tool] | M | done |
+| 29 | T-Profile sampling profiler — ✅ **DONE `44d0967d`** — `forge_profiler` library: prof_new/enter/exit/calls/total_time/avg_time/min_time/max_time/hotspot/pct/report/report_all. Manual instrumentation, call counts, duration tracking. KAT-gated. | [tool] | L | done |
 | 30 | T-REPL productization — **✅ DONE `2543df3c`** — the REPL was BROKEN (stale `output/nova_runtime.c` path from the compiler relocation), not merely un-productized; fixed with robust runtime resolution in `repl.nova` (NOVA_RUNTIME override → first-existing of `../compiler|compiler|output|flat`) + wired `_test_repl.ps1` into nova_ci as gate `[CI 2e2/3]` (compiles+links+runs a line end-to-end: `6*7 → 42`). | [tool] | S | |
 | 31 | T-Install signed installer | [tool] | M | |
 

@@ -1915,13 +1915,13 @@ Legend:
 | Linter | **HAVE** | `nova lint` |
 | Test runner | **HAVE** | `nova test` (file-granular) |
 | Per-fn test discovery | **PLANNED** | T5, M |
-| Property-based testing | **PLANNED** | T4, M |
+| Property-based testing | **HAVE** | `forge_test_prop` library `722d48d2` — seeded LCG, tp_check/tp_int_range/tp_string |
 | Code coverage | **HAVE** | `nova cov` (LCOV) |
 | Benchmarking | **HAVE** | `nova bench` |
 | REPL | **HAVE** (broken) | Dev-tree-only, recompiles per line; productization PLANNED T-REPL |
 | Debugger | **HAVE** (partial) | DWARF + lldb-dap handoff; CLI stub |
-| Profiler | **PLANNED** | T-Profile, L |
-| Docs generator | **PLANNED** | T-Doc, L |
+| Profiler | **HAVE** | `forge_profiler` library `44d0967d` — manual instrumentation, hotspot detection, pct reporting |
+| Docs generator | **HAVE** | `forge_doc_gen` library `722d48d2` — parses fn lines, extracts params + doc comments |
 | Installer | **PLANNED** | T-Install, M |
 
 ---
