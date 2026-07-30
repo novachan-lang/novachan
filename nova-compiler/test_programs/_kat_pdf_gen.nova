@@ -1,0 +1,82 @@
+// KAT: forge_pdf -- generate a 1-page PDF with text+line+rect, verify structural correctness.
+import forge_pdf
+
+fn main()
+    let bs = chr(92)
+    // deliberately includes '(' ')' and a raw backslash to exercise PDF string-literal escaping
+    let raw_text = "Invoice #(1042) " + bs + " Total"
+
+    let doc = pdf_new()
+    doc = pdf_add_page(doc, 612, 792)
+    doc = pdf_set_font(doc, "Helvetica", 14)
+    doc = pdf_text(doc, 72, 720, raw_text)
+    doc = pdf_line(doc, 72, 700, 540, 700)
+    doc = pdf_rect(doc, 72, 600, 200, 50)
+
+    let pdf = pdf_render(doc)
+
+    // 1. starts with the PDF 1.4 header
+    let starts_ok = pdf[0] == "%" and pdf[1] == "P" and pdf[2] == "D" and pdf[3] == "F" and pdf[4] == "-" and pdf[5] == "1" and pdf[6] == "." and pdf[7] == "4"
+    assert(starts_ok, "starts with %PDF-1.4")
+
+    // 2. ends with %%EOF (no trailing content after it)
+    let n = len(pdf)
+    let tail = slice(pdf, n - 5, n)
+    assert_eq(tail, "%%EOF")
+
+    // 3. contains the escaped text string (parens/backslash escaped per PDF string-literal rules:
+    //    '(' -> '\(', ')' -> '\)', the raw '\' -> '\\')
+    let expected_escaped = "Invoice #" + bs + "(1042" + bs + ") " + bs + bs + " Total"
+    assert(contains(pdf, expected_escaped), "contains escaped text payload")
+
+    // 4. contains the line + rect operators
+    assert(contains(pdf, "72 700 m 540 700 l S"), "contains line operator")
+    assert(contains(pdf, "72 600 200 50 re S"), "contains rect operator")
+
+    // 5. at least one indirect object present ("N 0 obj") -- obj count > 0
+    let obj_count = 0
+    let k = 1
+    while k <= 20
+        if contains(pdf, str(k) + " 0 obj")
+            obj_count = obj_count + 1
+        k = k + 1
+    assert(obj_count > 0, "at least one object")
+    assert_eq(obj_count, 5)   // Catalog, Pages, Page, Contents, Font = 5 objects for a 1-page doc
+
+    // 6. structural landmarks: catalog, pages, xref, trailer, root ref
+    assert(contains(pdf, "/Type /Catalog"), "has Catalog")
+    assert(contains(pdf, "/Type /Pages"), "has Pages")
+    assert(contains(pdf, "/Type /Page"), "has Page")
+    assert(contains(pdf, "/Type /Font"), "has Font")
+    assert(contains(pdf, "xref"), "has xref table")
+    assert(contains(pdf, "trailer"), "has trailer")
+    assert(contains(pdf, "/Root 1 0 R"), "trailer points at Root 1 0 R")
+    assert(contains(pdf, "startxref"), "has startxref")
+
+    // 7. xref offsets are byte-accurate: every "N 0 obj" the xref table points at actually starts there
+    let lines = split(pdf, "\n")
+    let xref_ok = true
+    let li = 0
+    while li < len(lines)
+        if lines[li] == "xref"
+            // next line is "0 <count>", then count entries starting with the free-list head
+            let header = split(lines[li + 1], " ")
+            let count = parse_int(header[1])
+            let obj_num = 1
+            let ei = 0
+            while ei < count - 1
+                // li+2 is the mandatory free-list head entry ("0000000000 65535 f "); real
+                // object entries (in object-number order) start at li+3.
+                let entry = lines[li + 3 + ei]
+                let off_str = slice(entry, 0, 10)
+                let off = parse_int(off_str)
+                let expect_prefix = str(obj_num) + " 0 obj"
+                let actual = slice(pdf, off, off + len(expect_prefix))
+                if actual != expect_prefix
+                    xref_ok = false
+                obj_num = obj_num + 1
+                ei = ei + 1
+        li = li + 1
+    assert(xref_ok, "xref offsets are byte-accurate")
+
+    print("forge_pdf KAT PASS")

@@ -1,0 +1,121 @@
+// forge_azure -- Azure REST API client builder: OAuth2 client-credentials token requests against
+// Azure AD (Microsoft Entra ID) plus URL builders for the four REST-shaped Azure data services
+// (Blob Storage, Key Vault, Cosmos DB) and a SQL Database connection string. This is a pure request
+// BUILDER (mirrors forge_awssigv4's role for AWS) -- it hands back plain dicts describing the method,
+// URL, headers, and body; the caller sends them over whatever HTTP client is on hand (forge's http_*
+// or a raw socket). No network I/O lives here, so the module is trivially testable and has zero
+// transport dependencies.
+//
+// AUTH MODEL: Azure AD's OAuth2 client-credentials flow (RFC 6749 §4.4) trades a tenant-scoped
+// client_id/client_secret pair for a short-lived bearer access_token, which every subsequent Azure
+// REST call carries as `Authorization: Bearer <token>`. This is the same shape Google Cloud and AWS
+// STS use for service-to-service auth, but Azure's token endpoint is per-TENANT
+// (login.microsoftonline.com/{tenant_id}/...) rather than one global endpoint -- the tenant_id is
+// baked into the client so every token request is automatically scoped to the right directory.
+//
+// LEAF: no imports. The one piece of string-building logic (RFC 3986 percent-encoding) is hand-rolled
+// here rather than pulled from forge.nova's url_encode, to keep this module usable standalone (same
+// call this project made for forge_awssigv4) -- ASCII-safe like forge.nova's own _pct_encode.
+
+// ── percent-encoding (RFC 3986 unreserved set: A-Za-z0-9 - _ . ~) ──────────────────────────────────
+fn _az_hex2(n: int) -> string
+    let d = "0123456789ABCDEF"
+    char_at(d, (n >> 4) & 15) + char_at(d, n & 15)
+
+// PRIVATE: percent-encode a single URL path/query component -- every byte outside the unreserved set
+// becomes %XX (uppercase). Does NOT preserve '/' (see _az_path_encode for multi-segment paths).
+fn _az_pct_encode(s: string) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let c = s[i]
+        let o = ord(c)
+        if (o >= 65 and o <= 90) or (o >= 97 and o <= 122) or (o >= 48 and o <= 57) or o == 45 or o == 95 or o == 46 or o == 126
+            out = out + c
+        else
+            out = out + "%" + _az_hex2(o)
+        i = i + 1
+    out
+
+// PRIVATE: percent-encode a blob/object path that may itself contain '/' as a virtual-directory
+// separator (Azure Blob names commonly do, e.g. "logs/2026/07/30.txt") -- each '/'-delimited segment
+// is encoded independently and rejoined with a literal '/', so the separators survive while every
+// other reserved byte (space, '?', '#', ...) is still escaped.
+fn _az_path_encode(path: string) -> string
+    let segments = split(path, "/")
+    let out = ""
+    let i = 0
+    while i < len(segments)
+        if i > 0
+            out = out + "/"
+        out = out + _az_pct_encode(segments[i])
+        i = i + 1
+    out
+
+// ── client ───────────────────────────────────────────────────────────────────────────────────────
+// Build an Azure AD app-registration client descriptor: the tenant (directory) ID, the application's
+// client ID, and its client secret. Held as a plain dict (no opaque handle) so callers can inspect or
+// serialize it freely -- there's no live connection state to protect.
+fn azure_client(tenant_id: string, client_id: string, client_secret: string) -> dict
+    {"tenant_id": tenant_id, "client_id": client_id, "client_secret": client_secret}
+
+// ── OAuth2 client-credentials token request ─────────────────────────────────────────────────────
+// Build the token request for Azure AD v2's client-credentials grant (the standard machine-to-machine
+// flow -- no user, no browser redirect). Returns a dict {method, url, headers, body} ready to POST as-is:
+//   POST https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token
+//   Content-Type: application/x-www-form-urlencoded
+//   grant_type=client_credentials&client_id=...&client_secret=...&scope=https%3A%2F%2Fmanagement.azure.com%2F.default
+// The scope defaults to Azure Resource Manager's ".default" (every application-level permission
+// consented on the app registration) -- the common case for management-plane calls; a caller targeting
+// a different resource (Key Vault, Graph, a custom API) should build its own body from this dict's
+// pieces if it needs a non-ARM scope.
+fn azure_token_request(client: dict) -> dict
+    let tenant_id = client["tenant_id"]
+    let url = "https://login.microsoftonline.com/" + _az_pct_encode(tenant_id) + "/oauth2/v2.0/token"
+    let scope = "https://management.azure.com/.default"
+    let body = "grant_type=client_credentials"
+    body = body + "&client_id=" + _az_pct_encode(client["client_id"])
+    body = body + "&client_secret=" + _az_pct_encode(client["client_secret"])
+    body = body + "&scope=" + _az_pct_encode(scope)
+    let headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    {"method": "POST", "url": url, "headers": headers, "body": body}
+
+// ── authenticated request builder ───────────────────────────────────────────────────────────────
+// Build a bearer-authenticated request dict for any Azure REST call: attaches
+// `Authorization: Bearer <token>` (the header every Azure data-plane and management-plane API expects
+// once you hold an access token) and a JSON content type. Returns {method, url, headers, body} --
+// same shape as azure_token_request, so callers can dispatch both through one "send this dict" helper.
+fn azure_request(method: string, url: string, token: string, body: string) -> dict
+    let headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+    {"method": method, "url": url, "headers": headers, "body": body}
+
+// ── resource URL builders ───────────────────────────────────────────────────────────────────────
+
+// Azure Blob Storage object URL: https://{account}.blob.core.windows.net/{container}/{blob} --
+// the standard REST addressing scheme for the Blob service (see docs.microsoft.com/rest/api/storageservices
+// "Naming and Referencing Containers, Blobs, and Metadata"). `blob` may contain '/' path segments; each
+// segment is percent-encoded independently so the virtual-directory structure is preserved.
+fn azure_blob_url(account: string, container: string, blob: string) -> string
+    "https://" + account + ".blob.core.windows.net/" + _az_pct_encode(container) + "/" + _az_path_encode(blob)
+
+// Azure Key Vault secret URL: https://{vault}.vault.azure.net/secrets/{secret_name}?api-version=7.4 --
+// 7.4 is the current stable Key Vault Secrets REST API version as of this writing (GET on this URL
+// returns the LATEST version of the secret; a specific version would append another /{version} segment).
+fn azure_keyvault_url(vault: string, secret_name: string) -> string
+    "https://" + vault + ".vault.azure.net/secrets/" + _az_pct_encode(secret_name) + "?api-version=7.4"
+
+// Azure SQL Database connection string (ADO.NET / ODBC style) -- SQL Database speaks the TDS wire
+// protocol, not REST, so there is no HTTP URL to build; this returns the standard connection-string
+// form every Azure SQL client (sqlcmd, ODBC, JDBC-via-connection-string) accepts, with the secure
+// defaults Microsoft's own quick-start always recommends (Encrypt=true; a plaintext TDS connection to
+// a public endpoint is a credential-sniffing risk, so it is never the default here).
+fn azure_sql_url(server: string, database: string) -> string
+    "Server=tcp:" + server + ".database.windows.net,1433;Database=" + database + ";Encrypt=true;TrustServerCertificate=false;Connection Timeout=30;"
+
+// Azure Cosmos DB resource link: https://{account}.documents.azure.com/dbs/{database}/colls/{container}
+// -- the REST "self link" addressing scheme Cosmos DB's SQL API uses for a container resource (see
+// docs.microsoft.com/rest/api/cosmos-db/ "Cosmos DB Resource Model": every resource is addressed as
+// /dbs/{db}/colls/{coll}[/docs/{doc}] relative to the account's REST root).
+fn azure_cosmosdb_url(account: string, database: string, container: string) -> string
+    "https://" + account + ".documents.azure.com/dbs/" + _az_pct_encode(database) + "/colls/" + _az_pct_encode(container)

@@ -1,0 +1,90 @@
+// forge_gcp -- Google Cloud Platform REST API client BUILDER (service-account key parsing + endpoint URL
+// derivation + Authorization-bearing request construction). This is the REQUEST-BUILDER layer, not a full
+// HTTP client: gcp_request() returns a plain data value (method/url/headers/body) that the caller dispatches
+// over the wire by composing forge_http_client (or any transport) -- forge_gcp never opens a socket itself.
+//
+// GCP's OAuth2 story for service accounts is the RFC 7523 JWT-Bearer flow: sign a claim set with the
+// service account's RSA private key (RS256), POST it to token_uri, get back a bearer token. NOVA has no
+// RSA-sign primitive yet (forge_crypto has HMAC/AES/SHA but no RSA signing), so gcp_access_token() is an
+// explicit, documented PLACEHOLDER -- it returns the exact dict SHAPE a real exchange produces (token /
+// token_type / expires_in / scope / client_email / token_uri) with an empty token string, so callers get a
+// stable contract to build against today and exactly one call site to upgrade once RS256 signing lands.
+import forge_qs
+
+// PRIVATE: pull a string field out of a parsed-JSON dict, defaulting to "" if absent. json_parse silently
+// returns 0 for a missing key (NOVA gotcha) rather than erroring, so every field pull is contains()-guarded.
+fn _gcp_field(d: dict, key: string) -> string
+    if contains(d, key)
+        str(d[key])
+    else
+        ""
+
+// Parse a GCP service-account JSON key file (as downloaded from IAM & Admin -> Service Accounts -> Keys)
+// into a normalized dict carrying the fields every GCP REST call needs: type, project_id, private_key_id,
+// private_key, client_email, client_id, auth_uri, token_uri. Missing fields come back as "" rather than
+// throwing, so a partial/malformed key file degrades gracefully instead of crashing the caller.
+fn gcp_service_account(json_key_path: string) -> dict
+    let raw = read_file(json_key_path)
+    let parsed = json_parse(raw)
+    {
+        "type": _gcp_field(parsed, "type"),
+        "project_id": _gcp_field(parsed, "project_id"),
+        "private_key_id": _gcp_field(parsed, "private_key_id"),
+        "private_key": _gcp_field(parsed, "private_key"),
+        "client_email": _gcp_field(parsed, "client_email"),
+        "client_id": _gcp_field(parsed, "client_id"),
+        "auth_uri": _gcp_field(parsed, "auth_uri"),
+        "token_uri": _gcp_field(parsed, "token_uri")
+    }
+
+// PLACEHOLDER OAuth2 access-token issuer (RFC 7523 JWT-Bearer flow) for a parsed service account `sa`
+// (as returned by gcp_service_account) and a space-delimited `scopes` string (e.g.
+// "https://www.googleapis.com/auth/devstorage.read_write"). Returns the RESULT SHAPE of a real token
+// exchange -- token/token_type/expires_in/scope/client_email/token_uri -- with an empty `token`, because
+// minting a real one needs RS256-signing the JWT claim set with the service account's RSA private key and
+// POSTing it to token_uri over HTTP (compose forge_http_client once NOVA has an RSA-sign primitive). Every
+// field besides `token` is already correct and stable to build request pipelines against.
+fn gcp_access_token(sa: dict, scopes: string) -> dict
+    {
+        "token": "",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": scopes,
+        "client_email": _gcp_field(sa, "client_email"),
+        "token_uri": _gcp_field(sa, "token_uri"),
+        "note": "placeholder: real RS256 JWT-Bearer exchange not yet implemented (no RSA-sign primitive)"
+    }
+
+// Build a GCP REST request as a plain data dict: method, url, headers (Authorization: Bearer <token>, plus
+// Content-Type: application/json whenever a non-empty body is supplied), and the raw body string. `token`
+// is the bearer token STRING (e.g. an access_token["token"] value, or a real one once RS256 lands) -- not
+// the token dict itself, so this composes with any bearer-token source, not only gcp_access_token(). The
+// caller dispatches the returned dict with forge_http_client (or any transport) by reading its fields.
+fn gcp_request(method: string, url: string, token: string, body: string) -> dict
+    let headers = {"Authorization": "Bearer " + token}
+    if len(body) > 0
+        headers["Content-Type"] = "application/json"
+    {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "body": body
+    }
+
+// Cloud Storage JSON API object URL: GET/PUT/PATCH/DELETE a single object's metadata (or its media with
+// ?alt=media appended by the caller). Object names may contain "/" (GCS "directories" are a naming
+// convention, not real path segments) so the object component is percent-encoded with qs_encode -- a
+// literal "/" would otherwise be parsed as an extra URL path segment by the API, silently addressing the
+// wrong (or a nonexistent) object.
+fn gcp_storage_url(bucket: string, object_name: string) -> string
+    "https://storage.googleapis.com/storage/v1/b/" + qs_encode(bucket) + "/o/" + qs_encode(object_name)
+
+// Cloud Pub/Sub REST API topic resource URL: projects/{project}/topics/{topic}. Used for publish
+// (POST .../:publish), get, create (PUT), and delete on a topic.
+fn gcp_pubsub_url(project: string, topic: string) -> string
+    "https://pubsub.googleapis.com/v1/projects/" + qs_encode(project) + "/topics/" + qs_encode(topic)
+
+// BigQuery REST API (v2) dataset resource URL: projects/{project}/datasets/{dataset}. Used for get,
+// patch/update, and delete on a dataset (append "/tables/{table}" for table-level operations).
+fn gcp_bigquery_url(project: string, dataset: string) -> string
+    "https://bigquery.googleapis.com/bigquery/v2/projects/" + qs_encode(project) + "/datasets/" + qs_encode(dataset)

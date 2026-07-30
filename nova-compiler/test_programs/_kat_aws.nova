@@ -1,0 +1,120 @@
+// KAT for forge_aws -- AWS service-level request builders. Checks URL patterns and header shapes for
+// S3/SQS/SNS/Lambda/DynamoDB, and independently re-derives the aws_s3_put_headers Authorization value
+// with forge_awssigv4's primitives directly (a from-scratch recompute, not a re-assertion of the same
+// call) to prove the signing pipeline -- not just the string shape -- is correct.
+import forge_aws
+import forge_awssigv4
+
+fn main()
+    let creds = aws_credentials("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "us-east-1")
+    if creds["access_key"] != "AKIAIOSFODNN7EXAMPLE"
+        print("FAIL aws_credentials access_key")
+        exit(1)
+    if creds["region"] != "us-east-1"
+        print("FAIL aws_credentials region")
+        exit(1)
+
+    // --- S3 GET url ---
+    let get_url = aws_s3_get_url(creds, "examplebucket", "test.txt")
+    if get_url != "https://examplebucket.s3.us-east-1.amazonaws.com/test.txt"
+        print("FAIL aws_s3_get_url plain key: " + get_url)
+        exit(1)
+
+    // Key with a "/" and a space must percent-encode the space but keep the "/" as a path separator.
+    let get_url2 = aws_s3_get_url(creds, "examplebucket", "photos/my photo.jpg")
+    if get_url2 != "https://examplebucket.s3.us-east-1.amazonaws.com/photos/my%20photo.jpg"
+        print("FAIL aws_s3_get_url encoded key: " + get_url2)
+        exit(1)
+
+    // --- S3 PUT headers: shape + independently-recomputed Authorization ---
+    let put_headers = aws_s3_put_headers(creds, "examplebucket", "test.txt", "text/plain")
+    if put_headers["host"] != "examplebucket.s3.us-east-1.amazonaws.com"
+        print("FAIL aws_s3_put_headers host: " + put_headers["host"])
+        exit(1)
+    if put_headers["content-type"] != "text/plain"
+        print("FAIL aws_s3_put_headers content-type: " + put_headers["content-type"])
+        exit(1)
+    if put_headers["x-amz-content-sha256"] != "UNSIGNED-PAYLOAD"
+        print("FAIL aws_s3_put_headers payload-hash sentinel: " + put_headers["x-amz-content-sha256"])
+        exit(1)
+    let amz_date = put_headers["x-amz-date"]
+    if len(amz_date) != 16
+        print("FAIL aws_s3_put_headers x-amz-date length: " + amz_date)
+        exit(1)
+    if amz_date[8:9] != "T" or amz_date[15:16] != "Z"
+        print("FAIL aws_s3_put_headers x-amz-date shape: " + amz_date)
+        exit(1)
+    let date_stamp = amz_date[0:8]
+
+    // Independent recompute: build the SAME canonical request/string-to-sign/signature by hand from
+    // forge_awssigv4 primitives and compare against what aws_s3_put_headers produced.
+    let nl = chr(10)
+    let host = "examplebucket.s3.us-east-1.amazonaws.com"
+    let canonical_headers = "content-type:text/plain" + nl + "host:" + host + nl + "x-amz-content-sha256:UNSIGNED-PAYLOAD" + nl + "x-amz-date:" + amz_date + nl
+    let signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+    let creq = sigv4_canonical_request("PUT", "/test.txt", "", canonical_headers, signed_headers, "UNSIGNED-PAYLOAD")
+    let scope = sigv4_scope(date_stamp, "us-east-1", "s3")
+    let sts = sigv4_string_to_sign(amz_date, scope, creq)
+    let sig = sigv4_signature("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", date_stamp, "us-east-1", "s3", sts)
+    let expected_auth = sigv4_auth_header("AKIAIOSFODNN7EXAMPLE", scope, signed_headers, sig)
+    if put_headers["authorization"] != expected_auth
+        print("FAIL aws_s3_put_headers authorization mismatch")
+        print("  got: " + put_headers["authorization"])
+        print("  want:" + expected_auth)
+        exit(1)
+    if len(sig) != 64
+        print("FAIL signature hex length: " + str(len(sig)))
+        exit(1)
+
+    // --- SQS send body ---
+    let sqs_body = aws_sqs_send_body("https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue", "hello world & more")
+    let expected_sqs = "Action=SendMessage&MessageBody=hello%20world%20%26%20more&QueueUrl=https%3A%2F%2Fsqs.us-east-1.amazonaws.com%2F123456789012%2FMyQueue&Version=2012-11-05"
+    if sqs_body != expected_sqs
+        print("FAIL aws_sqs_send_body")
+        print("  got: " + sqs_body)
+        print("  want:" + expected_sqs)
+        exit(1)
+
+    // --- SNS publish body ---
+    let sns_body = aws_sns_publish_body("arn:aws:sns:us-east-1:123456789012:MyTopic", "hi there")
+    let expected_sns = "Action=Publish&Message=hi%20there&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A123456789012%3AMyTopic&Version=2010-03-31"
+    if sns_body != expected_sns
+        print("FAIL aws_sns_publish_body")
+        print("  got: " + sns_body)
+        print("  want:" + expected_sns)
+        exit(1)
+
+    // --- Lambda invoke url ---
+    let lam_url = aws_lambda_invoke_url(creds, "my-function")
+    if lam_url != "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations"
+        print("FAIL aws_lambda_invoke_url plain: " + lam_url)
+        exit(1)
+
+    let lam_url_arn = aws_lambda_invoke_url(creds, "arn:aws:lambda:us-east-1:123456789012:function:my-function")
+    let expected_lam_arn = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Afunction%3Amy-function/invocations"
+    if lam_url_arn != expected_lam_arn
+        print("FAIL aws_lambda_invoke_url arn: " + lam_url_arn)
+        exit(1)
+
+    // --- DynamoDB url + headers ---
+    let ddb_url = aws_dynamodb_url(creds)
+    if ddb_url != "https://dynamodb.us-east-1.amazonaws.com/"
+        print("FAIL aws_dynamodb_url: " + ddb_url)
+        exit(1)
+
+    let ddb_headers = aws_dynamodb_headers(creds, "PutItem")
+    if ddb_headers["host"] != "dynamodb.us-east-1.amazonaws.com"
+        print("FAIL aws_dynamodb_headers host: " + ddb_headers["host"])
+        exit(1)
+    if ddb_headers["content-type"] != "application/x-amz-json-1.0"
+        print("FAIL aws_dynamodb_headers content-type: " + ddb_headers["content-type"])
+        exit(1)
+    if ddb_headers["x-amz-target"] != "DynamoDB_20120810.PutItem"
+        print("FAIL aws_dynamodb_headers x-amz-target: " + ddb_headers["x-amz-target"])
+        exit(1)
+    // Must NOT claim a signature it cannot correctly compute without a real body.
+    if "authorization" in ddb_headers
+        print("FAIL aws_dynamodb_headers must not include an unsigned Authorization")
+        exit(1)
+
+    print("forge_aws KAT PASS")

@@ -1,0 +1,279 @@
+// forge_sentinel -- application-security primitives: secret redaction, password policy/strength/generation,
+// and free-text PII masking. Complements the hashing/HMAC/audit-chain helpers in `sentinel` (test_programs/
+// sentinel.nova) and the PBKDF2 password hash/verify in forge_auth.nova -- this module is about handling
+// secret VALUES safely (never let them leak into logs/JSON) and about vetting/producing passwords, not about
+// storing them. LEAF -- imports NOTHING (only builtins: str_to_bytes/bytes_get/bytes_len, secure_bytes,
+// log2/int_to_float, contains, chr/ord).
+//
+// Public API:
+//   secret_wrap(value)                                          -> Secret   (opaque, redacts on print/to_json)
+//   secret_unwrap(secret)                                       -> string   (the only way back to the raw value)
+//   password_policy(pw, min_len, req_upper, req_digit, req_spec) -> dict     (Result-style: ok / violations)
+//   password_strength(pw)                                       -> int      (0..4, length+class+entropy)
+//   generate_password(length)                                   -> string   (CSPRNG printable ASCII)
+//   mask_pii(text, pattern)                                     -> string   ("ssn" | "phone" | "card" | else)
+
+// ── Secret<T> (module-level) ──────────────────────────────────────────────────────────────────────────
+// A real Secret<T> as a compiler-level `@redact` primitive is future work (tracked in LOCK-7 Phase 2).
+// This is the library-level approximation: a one-field struct whose `show`/`to_json` are HAND-WRITTEN to
+// override the compiler-derived versions (see NOVA_LANGUAGE_FEATURES.md "Automatic structural show/print" --
+// "unless you define a same-named fn"), so `print(secret)`, `str(secret)`, and `secret.to_json()` all render
+// "***redacted***" instead of the payload. A plain dict CANNOT do this (a dict has no per-value show/to_json
+// hook to override), which is why secret_wrap returns a struct rather than the dict the summary line implies.
+type Secret
+    value: string
+
+// Overrides the compiler-derived Secret__show. Called by both print(secret) and str(secret).
+fn Secret.show() -> string
+    "Secret(***redacted***)"
+
+// Overrides the compiler-derived Secret__to_json. Called by secret.to_json() and json_stringify(secret).
+// Emits a JSON string literal (quoted) so a Secret embedded in a struct/dict serializes as a normal
+// JSON string value, not as an object -- callers see "***redacted***" instead of the plaintext.
+fn Secret.to_json() -> string
+    "\"***redacted***\""
+
+// secret_wrap(value) -> Secret: wrap a raw string so it can be carried around, printed, and logged without
+// ever exposing its contents by accident. The ONLY way to recover the raw value is secret_unwrap.
+fn secret_wrap(value: string) -> Secret
+    Secret(value)
+
+// secret_unwrap(secret) -> string: extract the raw value. Callers should hold the unwrapped value for the
+// shortest possible scope (e.g. immediately before using it in a DB connection string or an HTTP header).
+fn secret_unwrap(secret: Secret) -> string
+    secret.value
+
+// ── password_policy: hard accept/reject rules (distinct from password_strength's soft 0-4 score) ────────
+fn _pw_has_upper(pw: string) -> bool
+    let tb = str_to_bytes(pw)
+    let n = bytes_len(tb)
+    let i = 0
+    while i < n
+        let b = bytes_get(tb, i)
+        if b >= 65 and b <= 90
+            return true
+        i = i + 1
+    false
+
+fn _pw_has_lower(pw: string) -> bool
+    let tb = str_to_bytes(pw)
+    let n = bytes_len(tb)
+    let i = 0
+    while i < n
+        let b = bytes_get(tb, i)
+        if b >= 97 and b <= 122
+            return true
+        i = i + 1
+    false
+
+fn _pw_has_digit(pw: string) -> bool
+    let tb = str_to_bytes(pw)
+    let n = bytes_len(tb)
+    let i = 0
+    while i < n
+        let b = bytes_get(tb, i)
+        if b >= 48 and b <= 57
+            return true
+        i = i + 1
+    false
+
+// "Special" = any printable ASCII (33..126) that is not a letter or digit.
+fn _pw_has_special(pw: string) -> bool
+    let tb = str_to_bytes(pw)
+    let n = bytes_len(tb)
+    let i = 0
+    while i < n
+        let b = bytes_get(tb, i)
+        let is_alnum = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+        if b >= 33 and b <= 126 and not is_alnum
+            return true
+        i = i + 1
+    false
+
+// password_policy(pw, min_len, require_upper, require_digit, require_special) -> dict
+// Result-style report: {"ok": true, "violations": []} when every requested rule passes, else
+// {"ok": false, "violations": [...]} listing EVERY violated rule (not just the first) so a UI can show
+// them all at once, the way a registration form's live-validation checklist does.
+fn password_policy(pw: string, min_len: int, require_upper: bool, require_digit: bool, require_special: bool) -> dict
+    let violations = []
+    if len(pw) < min_len
+        push(violations, "too_short: need at least " + str(min_len) + " characters, got " + str(len(pw)))
+    if require_upper and not _pw_has_upper(pw)
+        push(violations, "missing_uppercase")
+    if require_digit and not _pw_has_digit(pw)
+        push(violations, "missing_digit")
+    if require_special and not _pw_has_special(pw)
+        push(violations, "missing_special")
+    if len(violations) == 0
+        return {"ok": true, "violations": []}
+    {"ok": false, "violations": violations}
+
+// ── password_strength: soft 0-4 score blending length, character-class diversity, AND an entropy
+// estimate (bits = length * log2(charset_size), then penalized for character repetition). This is a
+// distinct algorithm from forge_pwstrength.nova's password_strength (which is length+class only, no
+// entropy term) -- the two are NOT designed to be imported into the same file (NOVA emits module fns
+// under bare names, so two same-named fns collide at link time; this is the same constraint documented
+// for sentinel_csrf_token vs forge's csrf_token in test_programs/sentinel.nova). Pick one per file. ──────
+
+// PRIVATE: estimated charset size from which classes of character actually appear in pw.
+fn _ps_charset_size(pw: string) -> int
+    let size = 0
+    if _pw_has_lower(pw)
+        size = size + 26
+    if _pw_has_upper(pw)
+        size = size + 26
+    if _pw_has_digit(pw)
+        size = size + 10
+    if _pw_has_special(pw)
+        size = size + 32
+    size
+
+// PRIVATE: count of DISTINCT bytes present (catches "aaaaaaaa" and "abababab" style low-entropy
+// passwords that a pure class+length heuristic would otherwise over-score).
+fn _ps_distinct_count(pw: string) -> int
+    let seen = {}
+    let tb = str_to_bytes(pw)
+    let n = bytes_len(tb)
+    let i = 0
+    while i < n
+        let b = bytes_get(tb, i)
+        seen[str(b)] = 1
+        i = i + 1
+    len(keys(seen))
+
+// password_strength(pw) -> int: 0 (very weak) .. 4 (very strong).
+fn password_strength(pw: string) -> int
+    let n = len(pw)
+    if n == 0
+        return 0
+    let charset = _ps_charset_size(pw)
+    if charset == 0
+        return 0
+    let bits = int_to_float(n) * log2(int_to_float(charset))
+    // Repetition penalty: if fewer than half the characters are distinct, the charset-based estimate
+    // overstates real entropy (e.g. "aaaaaaaaaaaa" has charset=26 but almost no actual uncertainty).
+    // Scale bits by the distinct/length ratio in that case -- a crude but real entropy correction.
+    let distinct = _ps_distinct_count(pw)
+    if distinct * 2 < n
+        bits = bits * (int_to_float(distinct) / int_to_float(n))
+    let score = 0
+    if bits >= 80.0
+        score = 4
+    else if bits >= 60.0
+        score = 3
+    else if bits >= 36.0
+        score = 2
+    else if bits >= 28.0
+        score = 1
+    if n < 6
+        score = 0
+    score
+
+// ── generate_password: CSPRNG printable-ASCII password ────────────────────────────────────────────────
+// PRIVATE: the 94 printable, non-space ASCII characters (0x21 '!' .. 0x7E '~'), built by iterating codes
+// rather than a hand-typed literal so there is no risk of a mistyped/mis-escaped character in the set.
+fn _pwgen_charset() -> string
+    let out = ""
+    let c = 33
+    while c <= 126
+        out = out + chr(c)
+        c = c + 1
+    out
+
+// generate_password(length) -> string: `length` bytes of OS CSPRNG (secure_bytes), mapped onto the
+// printable-ASCII charset via REJECTION SAMPLING (draw a byte, accept only if it falls in the largest
+// multiple of the charset size that fits in 0..255, else redraw) -- this is what avoids the small modulo
+// bias that a plain `byte % 94` would introduce (256 is not a multiple of 94).
+fn generate_password(length: int) -> string
+    if length <= 0
+        return ""
+    let charset = _pwgen_charset()
+    let cs_n = len(charset)
+    let limit = (256 / cs_n) * cs_n
+    let out = ""
+    let count = 0
+    while count < length
+        let b = secure_bytes(1)
+        let v = bytes_get(b, 0)
+        if v < limit
+            out = out + charset[v % cs_n]
+            count = count + 1
+    out
+
+// ── mask_pii: replace digits inside recognized phone/SSN/card-shaped substrings with '*' ─────────────────
+// PRIVATE: mode -> {"connectors": allowed non-digit separator chars, "min": min digit count, "max": max
+// digit count} for a run to be considered a match. An unrecognized pattern name is treated fail-closed:
+// connectors="" and min=1/max=huge, which masks EVERY digit in the text -- safer to over-mask than to
+// silently pass PII through because of a typo'd mode string.
+fn _pii_mode(pattern: string) -> dict
+    if pattern == "ssn"
+        return {"connectors": "-", "min": 9, "max": 9}
+    if pattern == "phone"
+        return {"connectors": "-. ()+", "min": 10, "max": 11}
+    if pattern == "card"
+        return {"connectors": "- ", "min": 13, "max": 19}
+    {"connectors": "", "min": 1, "max": 1000000000}
+
+fn _pii_is_digit_byte(b: int) -> bool
+    b >= 48 and b <= 57
+
+fn _pii_is_connector_byte(b: int, connectors: string) -> bool
+    if len(connectors) == 0
+        return false
+    contains(connectors, chr(b))
+
+// PRIVATE: from `start` (which must be a digit), scan the maximal run of digit/connector bytes, TRIMMED
+// so the run ends on the last digit seen (a trailing connector with no digit after it is excluded).
+// Returns [run_end_exclusive, digit_count].
+fn _pii_scan_run(tb, start: int, n: int, connectors: string) -> list
+    let i = start
+    let last_digit_end = start
+    let digit_count = 0
+    while i < n
+        let b = bytes_get(tb, i)
+        if _pii_is_digit_byte(b)
+            digit_count = digit_count + 1
+            i = i + 1
+            last_digit_end = i
+        else if _pii_is_connector_byte(b, connectors)
+            i = i + 1
+        else
+            i = n + 1
+    [last_digit_end, digit_count]
+
+// mask_pii(text, pattern) -> string: pattern is one of "ssn" | "phone" | "card" (anything else masks
+// every digit in `text`, fail-closed). Non-digit separators (dashes, dots, spaces, parens) inside a
+// recognized run are preserved; only the digit characters themselves become '*', so "555-123-4567"
+// (mode "phone") becomes "***-***-****" -- the shape survives, the value does not.
+fn mask_pii(text: string, pattern: string) -> string
+    let mode = _pii_mode(pattern)
+    let connectors = mode["connectors"]
+    let min_d = mode["min"]
+    let max_d = mode["max"]
+    let tb = str_to_bytes(text)
+    let n = bytes_len(tb)
+    let out = ""
+    let i = 0
+    while i < n
+        let b = bytes_get(tb, i)
+        if _pii_is_digit_byte(b)
+            let scanned = _pii_scan_run(tb, i, n, connectors)
+            let run_end = scanned[0]
+            let digit_count = scanned[1]
+            if digit_count >= min_d and digit_count <= max_d
+                let j = i
+                while j < run_end
+                    let bj = bytes_get(tb, j)
+                    if _pii_is_digit_byte(bj)
+                        out = out + "*"
+                    else
+                        out = out + chr(bj)
+                    j = j + 1
+                i = run_end
+            else
+                out = out + chr(b)
+                i = i + 1
+        else
+            out = out + chr(b)
+            i = i + 1
+    out

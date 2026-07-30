@@ -1,0 +1,113 @@
+// _kat_ops -- known-answer test for forge/forge_ops.nova (Ops framework skeleton: IaC drift detection).
+import forge_ops
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn main()
+    // ── 1) ops_resource builds the plain {type, name, props} shape ──────────────────────────────────
+    let web1_desired = ops_resource("vm", "web1", {"size": "small", "region": "us-east"})
+    if web1_desired["type"] != "vm" or web1_desired["name"] != "web1"
+        _fail("ops_resource did not build expected type/name")
+    if web1_desired["props"]["size"] != "small"
+        _fail("ops_resource did not carry props through")
+
+    // ── 2) ops_diff: shallow added/removed/changed over two prop dicts ──────────────────────────────
+    let old_props = {"size": "medium", "region": "us-east"}
+    let new_props = {"size": "small", "region": "us-east", "az": "1a"}
+    let d = ops_diff(old_props, new_props)
+    if len(d["added"]) != 1 or d["added"][0] != "az"
+        _fail("ops_diff added set wrong: " + str(d["added"]))
+    if len(d["removed"]) != 0
+        _fail("ops_diff removed set should be empty: " + str(d["removed"]))
+    if not d["changed"].keys().contains("size")
+        _fail("ops_diff missed the changed 'size' key")
+    let size_pair = d["changed"]["size"]
+    if size_pair[0] != "medium" or size_pair[1] != "small"
+        _fail("ops_diff changed pair wrong: " + str(size_pair))
+    if d["changed"].keys().contains("region")
+        _fail("ops_diff should not report an unchanged key as changed")
+
+    // removed-key case
+    let d2 = ops_diff({"a": 1, "b": 2}, {"a": 1})
+    if len(d2["removed"]) != 1 or d2["removed"][0] != "b"
+        _fail("ops_diff removed-key case wrong: " + str(d2["removed"]))
+    if len(d2["added"]) != 0 or len(d2["changed"].keys()) != 0
+        _fail("ops_diff removed-key case should have no added/changed")
+
+    // ── 3) ops_plan: build a desired set vs a current set covering create/update/delete/no-op ────────
+    let desired = [
+        ops_resource("vm", "web1", {"size": "small", "region": "us-east"}),
+        ops_resource("vm", "web2", {"size": "small", "region": "us-east"}),
+        ops_resource("dns", "api", {"target": "1.2.3.4"}),
+    ]
+    let current = [
+        ops_resource("vm", "web1", {"size": "medium", "region": "us-east"}),
+        ops_resource("vm", "web2", {"size": "small", "region": "us-east"}),
+        ops_resource("vm", "old", {"size": "small", "region": "us-east"}),
+    ]
+    let plan = ops_plan(desired, current)
+    if len(plan) != 3
+        _fail("ops_plan expected 3 actions (update web1, create dns/api, delete vm/old), got " + str(len(plan)))
+
+    if plan[0]["action"] != "update" or plan[0]["resource"]["name"] != "web1"
+        _fail("ops_plan[0] should be update vm/web1, got " + str(plan[0]["action"]) + " " + plan[0]["resource"]["name"])
+    if not plan[0]["diff"]["changed"].keys().contains("size")
+        _fail("ops_plan update entry missing the size diff")
+
+    if plan[1]["action"] != "create" or plan[1]["resource"]["name"] != "api"
+        _fail("ops_plan[1] should be create dns/api, got " + str(plan[1]["action"]) + " " + plan[1]["resource"]["name"])
+    if len(plan[1]["diff"].keys()) != 0
+        _fail("ops_plan create entry diff should be empty")
+
+    if plan[2]["action"] != "delete" or plan[2]["resource"]["name"] != "old"
+        _fail("ops_plan[2] should be delete vm/old, got " + str(plan[2]["action"]) + " " + plan[2]["resource"]["name"])
+
+    // no-drift case: identical desired/current -> empty plan
+    let same = [ops_resource("vm", "steady", {"size": "small"})]
+    let no_plan = ops_plan(same, same)
+    if len(no_plan) != 0
+        _fail("ops_plan should produce no actions when desired == current, got " + str(len(no_plan)))
+
+    // ── 4) ops_apply_log: human-readable rendering, both empty and non-empty ────────────────────────
+    let empty_log = ops_apply_log([])
+    if empty_log != "No changes. Infrastructure is up to date."
+        _fail("ops_apply_log empty-plan message wrong: " + empty_log)
+
+    let log = ops_apply_log(plan)
+    if not log.contains("~ update vm/web1")
+        _fail("ops_apply_log missing the update line: " + log)
+    if not log.contains("size: medium -> small")
+        _fail("ops_apply_log missing the field-level diff line: " + log)
+    if not log.contains("+ create dns/api")
+        _fail("ops_apply_log missing the create line: " + log)
+    if not log.contains("- delete vm/old")
+        _fail("ops_apply_log missing the delete line: " + log)
+    if not log.contains("Plan: 1 to add, 1 to change, 1 to destroy.")
+        _fail("ops_apply_log totals line wrong: " + log)
+
+    // ── 5) ops_tag: non-mutating tag merge ───────────────────────────────────────────────────────────
+    let base = ops_resource("vm", "web3", {"size": "small"})
+    let tagged = ops_tag(base, {"env": "prod", "owner": "ops-team"})
+    if tagged["props"]["tags"]["env"] != "prod" or tagged["props"]["tags"]["owner"] != "ops-team"
+        _fail("ops_tag did not attach the expected tags")
+    if base["props"].keys().contains("tags")
+        _fail("ops_tag must not mutate the original resource")
+    let retagged = ops_tag(tagged, {"env": "staging"})
+    if retagged["props"]["tags"]["env"] != "staging" or retagged["props"]["tags"]["owner"] != "ops-team"
+        _fail("ops_tag re-tag should overwrite the changed key and preserve the others")
+
+    // ── 6) ops_depends: non-mutating dependency edge, idempotent ─────────────────────────────────────
+    let net = ops_resource("network", "vpc1", {})
+    let vm = ops_resource("vm", "web4", {"size": "small"})
+    let vm_dep = ops_depends(vm, net)
+    if len(vm_dep["props"]["depends_on"]) != 1 or vm_dep["props"]["depends_on"][0] != "network/vpc1"
+        _fail("ops_depends did not record the dependency edge: " + str(vm_dep["props"]["depends_on"]))
+    if vm["props"].keys().contains("depends_on")
+        _fail("ops_depends must not mutate the original resource")
+    let vm_dep2 = ops_depends(vm_dep, net)
+    if len(vm_dep2["props"]["depends_on"]) != 1
+        _fail("ops_depends should be idempotent for a repeated dependency, got " + str(vm_dep2["props"]["depends_on"]))
+
+    print("OPS KAT PASS")

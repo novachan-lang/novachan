@@ -1,0 +1,116 @@
+// _kat_sentinel_expand -- KAT for forge_sentinel's expansion: secret_wrap/unwrap, password_policy,
+// password_strength, generate_password, mask_pii. Specific known-answer checks, not just "it compiled".
+import forge_sentinel
+
+fn main()
+    // ── secret_wrap / secret_unwrap / redaction on print+to_json ────────────────────────────────────
+    let s = secret_wrap("hunter2-super-secret")
+    assert_eq(secret_unwrap(s), "hunter2-super-secret")
+
+    let shown = str(s)
+    if shown.contains("hunter2")
+        print("FAIL: str(secret) leaked the raw value: " + shown)
+        exit(1)
+    assert_eq(shown, "Secret(***redacted***)")
+
+    let jsoned = s.to_json()
+    if jsoned.contains("hunter2")
+        print("FAIL: secret.to_json() leaked the raw value: " + jsoned)
+        exit(1)
+    assert_eq(jsoned, "\"***redacted***\"")
+
+    // Different secret values must all redact identically (no partial leakage of length/content).
+    let s2 = secret_wrap("a-totally-different-and-much-longer-secret-value")
+    assert_eq(str(s2), "Secret(***redacted***)")
+    assert_eq(secret_unwrap(s2), "a-totally-different-and-much-longer-secret-value")
+
+    // ── password_policy ──────────────────────────────────────────────────────────────────────────────
+    let p_ok = password_policy("Str0ng!Pass", 8, true, true, true)
+    assert_eq(p_ok["ok"], true)
+    assert_eq(len(p_ok["violations"]), 0)
+
+    let p_short = password_policy("Ab1!", 8, true, true, true)
+    assert_eq(p_short["ok"], false)
+    if not p_short["violations"].any_match(fn(v) v.contains("too_short"))
+        print("FAIL: short password missing too_short violation")
+        exit(1)
+
+    let p_no_upper = password_policy("lowercase1!", 8, true, true, true)
+    assert_eq(p_no_upper["ok"], false)
+    assert(p_no_upper["violations"].contains("missing_uppercase"), "missing_uppercase flagged")
+
+    let p_no_digit = password_policy("NoDigitsHere!", 8, true, true, true)
+    assert_eq(p_no_digit["ok"], false)
+    assert(p_no_digit["violations"].contains("missing_digit"), "missing_digit flagged")
+
+    let p_no_special = password_policy("NoSpecial123", 8, true, true, true)
+    assert_eq(p_no_special["ok"], false)
+    assert(p_no_special["violations"].contains("missing_special"), "missing_special flagged")
+
+    // Multiple violations at once, all reported (not just the first).
+    let p_multi = password_policy("abc", 8, true, true, true)
+    assert_eq(p_multi["ok"], false)
+    if len(p_multi["violations"]) != 4
+        print("FAIL: expected 4 violations (short+upper+digit+special), got " + str(len(p_multi["violations"])))
+        exit(1)
+
+    // Relaxed policy (only length) accepts a password that would fail a strict one.
+    let p_relaxed = password_policy("justlowercase", 8, false, false, false)
+    assert_eq(p_relaxed["ok"], true)
+
+    // ── password_strength: monotonic-ish sanity + known buckets ─────────────────────────────────────
+    assert_eq(password_strength(""), 0)
+    assert_eq(password_strength("abc"), 0)
+    assert_eq(password_strength("aaaaaaaaaaaaaaaaaaaa"), 0)   // 20 same char -> repetition penalty -> weakest bucket
+
+    let weak = password_strength("password")
+    let strong = password_strength("xQ7!vR2#mK9$pL4@zT6&")
+    if strong <= weak
+        print("FAIL: expected long random mixed-class password to score higher than 'password' (weak=" + str(weak) + " strong=" + str(strong) + ")")
+        exit(1)
+    assert_eq(strong, 4)
+    if weak > 2
+        print("FAIL: 'password' should not score above 2, got " + str(weak))
+        exit(1)
+
+    // ── generate_password ────────────────────────────────────────────────────────────────────────────
+    let gp = generate_password(16)
+    assert_eq(len(gp), 16)
+    let gp_tb = str_to_bytes(gp)
+    let gi = 0
+    while gi < bytes_len(gp_tb)
+        let gb = bytes_get(gp_tb, gi)
+        if gb < 33 or gb > 126
+            print("FAIL: generate_password produced a non-printable-ASCII byte: " + str(gb))
+            exit(1)
+        gi = gi + 1
+    assert_eq(len(generate_password(0)), 0)
+    assert_eq(len(generate_password(32)), 32)
+
+    // Two independent generations of reasonable length should not collide (CSPRNG sanity, not a proof).
+    let gp_a = generate_password(24)
+    let gp_b = generate_password(24)
+    if gp_a == gp_b
+        print("FAIL: two independent generate_password(24) calls produced identical output")
+        exit(1)
+
+    // ── mask_pii ──────────────────────────────────────────────────────────────────────────────────────
+    assert_eq(mask_pii("SSN: 123-45-6789 on file", "ssn"), "SSN: ***-**-**** on file")
+    assert_eq(mask_pii("SSN 123456789 raw", "ssn"), "SSN ********* raw")
+    // Not exactly 9 digits -> not an SSN shape -> left untouched by "ssn" mode.
+    assert_eq(mask_pii("code 12345", "ssn"), "code 12345")
+
+    assert_eq(mask_pii("call 555-123-4567 today", "phone"), "call ***-***-**** today")
+    assert_eq(mask_pii("call (555) 123-4567 today", "phone"), "call (***) ***-**** today")
+    assert_eq(mask_pii("call +1 555 123 4567 today", "phone"), "call +* *** *** **** today")
+
+    assert_eq(mask_pii("card 4111-1111-1111-1111 exp", "card"), "card ****-****-****-**** exp")
+    assert_eq(mask_pii("card 4111111111111111 exp", "card"), "card **************** exp")
+
+    // Text with no digits at all is returned unchanged.
+    assert_eq(mask_pii("no numbers here", "ssn"), "no numbers here")
+
+    // Unknown pattern name -> fail-closed: mask every digit anywhere in the text.
+    assert_eq(mask_pii("order #4471 shipped on 2026-07-30", "unknown_mode"), "order #**** shipped on ****-**-**")
+
+    print("SENTINEL EXPAND KAT PASS")

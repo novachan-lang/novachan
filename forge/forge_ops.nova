@@ -1,0 +1,129 @@
+// forge_ops -- Ops framework skeleton: infrastructure-as-code drift detection. A "resource" is a plain dict
+// {type, name, props} describing a piece of infrastructure (a VM, a DNS record, a load balancer...). Given a
+// DESIRED set of resources and the CURRENT observed set, ops_plan diffs them into create/update/delete actions
+// (Terraform-style plan, but the state comparison lives entirely in NOVA -- no external state file format is
+// assumed here, callers supply "current" however they source it: a prior plan's apply result, a live API scan,
+// or a checked-in snapshot). This is the declarative-infra primitive other Ops modules (provisioners, state
+// backends, remote executors) build on top of. LEAF.
+
+// Declare one infrastructure resource. `type` is the resource kind ("vm", "dns_record", "lb", ...), `name` is
+// the unique identifier within that type, `props` is a dict of desired properties.
+fn ops_resource(kind: string, name: string, props: dict) -> dict
+    {"type": kind, "name": name, "props": props}
+
+// Shallow diff between two property dicts `a` (old/current) and `b` (new/desired). Returns
+// {"added": [keys only in b], "removed": [keys only in a], "changed": {key: [old, new]}} for keys present in
+// both whose values differ. Keys with an unchanged value are omitted entirely.
+fn ops_diff(a: dict, b: dict) -> dict
+    let added = []
+    let removed = []
+    let changed = {}
+    for k in b.keys()
+        if k not in a
+            push(added, k)
+        else if a[k] != b[k]
+            changed[k] = [a[k], b[k]]
+    for k in a.keys()
+        if k not in b
+            push(removed, k)
+    {"added": added, "removed": removed, "changed": changed}
+
+// A resource's identity key -- "type/name" -- used to match desired against current across the two lists.
+fn _ops_key(r: dict) -> string
+    r["type"] + "/" + r["name"]
+
+// Build a lookup dict: identity key -> resource, from a list of resource dicts.
+fn _ops_index(resources: list) -> dict
+    let idx = {}
+    for r in resources
+        idx[_ops_key(r)] = r
+    idx
+
+// Compute a plan: given DESIRED resources and CURRENT (observed) resources, return the list of actions needed
+// to reconcile current -> desired. Each entry is {"action": "create"|"update"|"delete", "resource": <the
+// desired or current resource dict>, "diff": <ops_diff result, empty dict for create/delete>}.
+// - present in desired, absent in current -> "create" (diff is empty -- nothing to compare against)
+// - present in both, props differ -> "update" (diff shows exactly what changed)
+// - present in both, props identical -> no plan entry (no drift, nothing to do)
+// - present in current, absent in desired -> "delete" (diff is empty)
+// Desired-side resources are processed first so create/update entries come before delete entries, matching the
+// natural apply order (bring new/changed things up before tearing old things down).
+fn ops_plan(desired_resources: list, current_resources: list) -> list
+    let current_idx = _ops_index(current_resources)
+    let seen = {}
+    let plan = []
+    for want in desired_resources
+        let key = _ops_key(want)
+        seen[key] = true
+        if key not in current_idx
+            push(plan, {"action": "create", "resource": want, "diff": {}})
+        else
+            let have = current_idx[key]
+            let d = ops_diff(have["props"], want["props"])
+            let has_drift = len(d["added"]) > 0 or len(d["removed"]) > 0 or len(d["changed"].keys()) > 0
+            if has_drift
+                push(plan, {"action": "update", "resource": want, "diff": d})
+    for have in current_resources
+        let key = _ops_key(have)
+        if key not in seen
+            push(plan, {"action": "delete", "resource": have, "diff": {}})
+    plan
+
+// Render a plan (as returned by ops_plan) into a human-readable multi-line summary, Terraform-plan-style:
+// one line per action plus a totals line. Returns "No changes. Infrastructure is up to date." when the plan
+// is empty.
+fn ops_apply_log(plan: list) -> string
+    if len(plan) == 0
+        return "No changes. Infrastructure is up to date."
+    let lines = []
+    let n_create = 0
+    let n_update = 0
+    let n_delete = 0
+    for entry in plan
+        let r = entry["resource"]
+        let key = _ops_key(r)
+        match entry["action"]
+            "create" => push(lines, "  + create " + key)
+            "delete" => push(lines, "  - delete " + key)
+            "update" =>
+                push(lines, "  ~ update " + key)
+                let d = entry["diff"]
+                for k in d["added"]
+                    push(lines, "      + " + k + " = " + str(r["props"][k]))
+                for k in d["removed"]
+                    push(lines, "      - " + k)
+                for k in d["changed"].keys()
+                    let pair = d["changed"][k]
+                    push(lines, "      ~ " + k + ": " + str(pair[0]) + " -> " + str(pair[1]))
+            _ => push(lines, "  ? " + entry["action"] + " " + key)
+        if entry["action"] == "create"
+            n_create += 1
+        else if entry["action"] == "update"
+            n_update += 1
+        else if entry["action"] == "delete"
+            n_delete += 1
+    push(lines, "")
+    push(lines, "Plan: {n_create} to add, {n_update} to change, {n_delete} to destroy.")
+    join(lines, "\n")
+
+// Add (merge) tags onto a resource's props under a reserved "tags" sub-dict. Non-mutating -- returns a NEW
+// resource dict; existing tag keys are overwritten by `tags`, others are preserved.
+fn ops_tag(resource: dict, tags: dict) -> dict
+    let props = resource["props"]
+    let existing_tags = props.get("tags", {})
+    let merged_tags = existing_tags.dict_merge(tags)
+    let new_props = {...props, "tags": merged_tags}
+    {"type": resource["type"], "name": resource["name"], "props": new_props}
+
+// Record that `resource` depends on `dependency` (dependency must be created/updated before resource, and
+// deleted after it). Stored as a list of "type/name" keys under the reserved "depends_on" prop. Non-mutating
+// -- returns a NEW resource dict; idempotent (adding the same dependency twice does not duplicate the entry).
+fn ops_depends(resource: dict, dependency: dict) -> dict
+    let props = resource["props"]
+    let existing = props.get("depends_on", [])
+    let dep_key = _ops_key(dependency)
+    let new_deps = existing
+    if dep_key not in existing
+        new_deps = [...existing, dep_key]
+    let new_props = {...props, "depends_on": new_deps}
+    {"type": resource["type"], "name": resource["name"], "props": new_props}

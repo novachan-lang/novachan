@@ -1,0 +1,136 @@
+// KAT for forge_gcp: service-account key parsing, placeholder token shape, request-builder headers, and
+// the three REST endpoint URL builders (Storage / Pub/Sub / BigQuery). Known-answer checks throughout.
+import forge_gcp
+
+fn main() -> int
+    let fails = 0
+    let q = chr(34)
+    let ocb = chr(123)
+    let ccb = chr(125)
+
+    // ---- gcp_service_account: parse a fake key file, verify every field round-trips ----
+    let key_path = "_kat_gcp_fake_key.json"
+    let kv_parts = [q + "type" + q + ": " + q + "service_account" + q, q + "project_id" + q + ": " + q + "nova-test-project" + q, q + "private_key_id" + q + ": " + q + "abc123deadbeef" + q, q + "private_key" + q + ": " + q + "-----BEGIN PRIVATE KEY-----FAKEKEYDATA-----END PRIVATE KEY-----" + q, q + "client_email" + q + ": " + q + "nova-sa@nova-test-project.iam.gserviceaccount.com" + q, q + "client_id" + q + ": " + q + "1234567890" + q, q + "auth_uri" + q + ": " + q + "https://accounts.google.com/o/oauth2/auth" + q, q + "token_uri" + q + ": " + q + "https://oauth2.googleapis.com/token" + q]
+    let fake_key = ocb + join(kv_parts, ",") + ccb
+    write_file(key_path, fake_key)
+    let sa = gcp_service_account(key_path)
+    remove_file(key_path)
+
+    if sa["type"] != "service_account"
+        print("FAIL sa.type=" + sa["type"])
+        fails = fails + 1
+    if sa["project_id"] != "nova-test-project"
+        print("FAIL sa.project_id=" + sa["project_id"])
+        fails = fails + 1
+    if sa["private_key_id"] != "abc123deadbeef"
+        print("FAIL sa.private_key_id=" + sa["private_key_id"])
+        fails = fails + 1
+    if sa["client_email"] != "nova-sa@nova-test-project.iam.gserviceaccount.com"
+        print("FAIL sa.client_email=" + sa["client_email"])
+        fails = fails + 1
+    if sa["client_id"] != "1234567890"
+        print("FAIL sa.client_id=" + sa["client_id"])
+        fails = fails + 1
+    if sa["auth_uri"] != "https://accounts.google.com/o/oauth2/auth"
+        print("FAIL sa.auth_uri=" + sa["auth_uri"])
+        fails = fails + 1
+    if sa["token_uri"] != "https://oauth2.googleapis.com/token"
+        print("FAIL sa.token_uri=" + sa["token_uri"])
+        fails = fails + 1
+    if find(sa["private_key"], "BEGIN PRIVATE KEY") < 0
+        print("FAIL sa.private_key missing PEM header")
+        fails = fails + 1
+
+    // ---- gcp_service_account: a missing/partial key file degrades to "" not a crash ----
+    let key_path2 = "_kat_gcp_partial_key.json"
+    write_file(key_path2, ocb + q + "type" + q + ": " + q + "service_account" + q + ccb)
+    let sa2 = gcp_service_account(key_path2)
+    remove_file(key_path2)
+    if sa2["client_email"] != ""
+        print("FAIL sa2.client_email should default to empty, got " + sa2["client_email"])
+        fails = fails + 1
+    if sa2["type"] != "service_account"
+        print("FAIL sa2.type=" + sa2["type"])
+        fails = fails + 1
+
+    // ---- gcp_access_token: placeholder shape ----
+    let scopes = "https://www.googleapis.com/auth/devstorage.read_write https://www.googleapis.com/auth/pubsub"
+    let tok = gcp_access_token(sa, scopes)
+    if tok["token"] != ""
+        print("FAIL tok.token should be placeholder-empty, got " + tok["token"])
+        fails = fails + 1
+    if tok["token_type"] != "Bearer"
+        print("FAIL tok.token_type=" + tok["token_type"])
+        fails = fails + 1
+    if tok["scope"] != scopes
+        print("FAIL tok.scope mismatch")
+        fails = fails + 1
+    if tok["client_email"] != sa["client_email"]
+        print("FAIL tok.client_email mismatch")
+        fails = fails + 1
+    if tok["token_uri"] != sa["token_uri"]
+        print("FAIL tok.token_uri mismatch")
+        fails = fails + 1
+    if tok["expires_in"] != 3600
+        print("FAIL tok.expires_in=" + str(tok["expires_in"]))
+        fails = fails + 1
+
+    // ---- gcp_request: Authorization header, and Content-Type only when body is non-empty ----
+    let req_no_body = gcp_request("GET", "https://storage.googleapis.com/storage/v1/b/mybucket/o", "TESTTOKEN123", "")
+    let h1 = req_no_body["headers"]
+    if h1["Authorization"] != "Bearer TESTTOKEN123"
+        print("FAIL req_no_body Authorization=" + h1["Authorization"])
+        fails = fails + 1
+    if contains(h1, "Content-Type")
+        print("FAIL req_no_body should have no Content-Type")
+        fails = fails + 1
+    if req_no_body["method"] != "GET"
+        print("FAIL req_no_body.method=" + req_no_body["method"])
+        fails = fails + 1
+
+    let pub_body = ocb + q + "messages" + q + ":[" + ocb + q + "data" + q + ":" + q + "aGVsbG8=" + q + ccb + "]" + ccb
+    let req_body = gcp_request("POST", "https://pubsub.googleapis.com/v1/projects/p/topics/t:publish", "TESTTOKEN123", pub_body)
+    let h2 = req_body["headers"]
+    if h2["Authorization"] != "Bearer TESTTOKEN123"
+        print("FAIL req_body Authorization=" + h2["Authorization"])
+        fails = fails + 1
+    if h2["Content-Type"] != "application/json"
+        print("FAIL req_body Content-Type=" + h2["Content-Type"])
+        fails = fails + 1
+    if req_body["body"] != pub_body
+        print("FAIL req_body.body mismatch")
+        fails = fails + 1
+
+    // ---- gcp_storage_url: plain object, nested "directory" object (percent-encoded "/"), spaces ----
+    let su1 = gcp_storage_url("mybucket", "file.txt")
+    if su1 != "https://storage.googleapis.com/storage/v1/b/mybucket/o/file.txt"
+        print("FAIL su1=" + su1)
+        fails = fails + 1
+
+    let su2 = gcp_storage_url("mybucket", "folder/sub/file.txt")
+    if su2 != "https://storage.googleapis.com/storage/v1/b/mybucket/o/folder%2Fsub%2Ffile.txt"
+        print("FAIL su2=" + su2)
+        fails = fails + 1
+
+    let su3 = gcp_storage_url("my-bucket-01", "a file with spaces.png")
+    if su3 != "https://storage.googleapis.com/storage/v1/b/my-bucket-01/o/a%20file%20with%20spaces.png"
+        print("FAIL su3=" + su3)
+        fails = fails + 1
+
+    // ---- gcp_pubsub_url ----
+    let pu = gcp_pubsub_url("nova-test-project", "orders-topic")
+    if pu != "https://pubsub.googleapis.com/v1/projects/nova-test-project/topics/orders-topic"
+        print("FAIL pu=" + pu)
+        fails = fails + 1
+
+    // ---- gcp_bigquery_url ----
+    let bu = gcp_bigquery_url("nova-test-project", "analytics_ds")
+    if bu != "https://bigquery.googleapis.com/bigquery/v2/projects/nova-test-project/datasets/analytics_ds"
+        print("FAIL bu=" + bu)
+        fails = fails + 1
+
+    if fails == 0
+        print("forge_gcp KAT PASS")
+    else
+        print("forge_gcp KAT FAILED: " + str(fails) + " failure(s)")
+    return 0

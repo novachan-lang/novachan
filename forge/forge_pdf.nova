@@ -1,0 +1,156 @@
+// forge_pdf -- pure-NOVA PDF 1.4 generation for business reports/invoices. No external library:
+// builds the object graph (Catalog/Pages/Page/Contents/Font) and a byte-accurate xref table by hand.
+// Builder pattern: pdf_new() -> add pages/text/lines/rects (each mutates+returns the SAME doc handle,
+// so calls chain: `pdf_text(pdf_add_page(pdf_new(), 612, 792), 72, 720, "Hello")`) -> pdf_render(doc)
+// produces the complete file content as a string, ready to write to a .pdf file.
+//
+// Object numbering: 1=Catalog, 2=Pages, then per page i (0-indexed): (3+2i)=Page, (4+2i)=Contents,
+// and finally one shared Font object after all pages. Coordinates are PDF user-space points
+// (origin bottom-left of the page, 72 units/inch -- e.g. US Letter is 612x792).
+//
+// "Verified by reasoning": a doc with one 612x792 page containing pdf_text/pdf_line/pdf_rect
+// renders a file that starts with "%PDF-1.4", ends with "%%EOF", and whose xref byte offsets point
+// at the literal "N 0 obj" bytes they claim to (checked by construction: every offset is captured via
+// len(out) immediately before that object's bytes are appended, so it can never drift).
+
+// Start a new empty document: no pages yet, default font Helvetica @ 12pt (applies to text added
+// after the NEXT pdf_set_font call, or immediately if pdf_text is used with no pdf_set_font at all).
+fn pdf_new() -> dict
+    let doc = {}
+    doc["pages"] = []
+    doc["cur_page"] = -1
+    doc["font_name"] = "Helvetica"
+    doc["font_size"] = 12
+    doc
+
+// Append a new page of size w x h (points) and make it the current page that pdf_text/pdf_line/
+// pdf_rect draw onto. Returns doc (mutated in place) so callers can chain.
+fn pdf_add_page(doc: dict, w, h) -> dict
+    let page = {}
+    page["w"] = w
+    page["h"] = h
+    page["content"] = ""
+    let pages = doc["pages"]
+    push(pages, page)
+    doc["pages"] = pages
+    doc["cur_page"] = len(pages) - 1
+    doc
+
+// Set the font used by SUBSEQUENT pdf_text calls (a single shared font resource for the whole
+// document -- name must be a standard PDF base-14 name, e.g. "Helvetica", "Times-Roman", "Courier").
+fn pdf_set_font(doc: dict, name: string, size) -> dict
+    doc["font_name"] = name
+    doc["font_size"] = size
+    doc
+
+// PRIVATE: escape a string for use inside a PDF literal string `(...)`: backslash and the two
+// parens must be backslash-escaped (order matters -- backslashes first, or the escaping backslashes
+// just inserted for '(' / ')' would themselves get doubled). Embedded CR/LF are turned into the
+// literal two-char sequences \r \n so a multi-line-looking input can never break stream syntax.
+fn _pdf_esc_text(s: string) -> string
+    let bs = chr(92)
+    let r = replace(s, bs, bs + bs)
+    r = replace(r, "(", bs + "(")
+    r = replace(r, ")", bs + ")")
+    r = replace(r, chr(13), bs + "r")
+    r = replace(r, chr(10), bs + "n")
+    r
+
+// PRIVATE: append a raw content-stream operator string to the CURRENT page's stream.
+fn _pdf_append_op(doc: dict, op: string)
+    let idx = doc["cur_page"]
+    let pages = doc["pages"]
+    let page = pages[idx]
+    page["content"] = page["content"] + op
+    pages[idx] = page
+    doc["pages"] = pages
+
+// Draw text at (x, y) using the document's current font/size (see pdf_set_font). Each call emits
+// its own BT..ET block, so text position is always absolute -- no accumulated Td offset state to
+// track between calls.
+fn pdf_text(doc: dict, x, y, text: string) -> dict
+    let esc_text = _pdf_esc_text(text)
+    let size = doc["font_size"]
+    let op = "BT /F1 " + str(size) + " Tf " + str(x) + " " + str(y) + " Td (" + esc_text + ") Tj ET\n"
+    _pdf_append_op(doc, op)
+    doc
+
+// Draw a straight stroked line from (x1,y1) to (x2,y2) on the current page.
+fn pdf_line(doc: dict, x1, y1, x2, y2) -> dict
+    let op = str(x1) + " " + str(y1) + " m " + str(x2) + " " + str(y2) + " l S\n"
+    _pdf_append_op(doc, op)
+    doc
+
+// Draw a stroked rectangle with lower-left corner (x,y) and size w x h on the current page.
+fn pdf_rect(doc: dict, x, y, w, h) -> dict
+    let op = str(x) + " " + str(y) + " " + str(w) + " " + str(h) + " re S\n"
+    _pdf_append_op(doc, op)
+    doc
+
+// Render the complete PDF 1.4 file content as a string: header, every object (Catalog, Pages,
+// each Page + its Contents stream, and the shared Font), the xref table, and the trailer. Byte
+// offsets in the xref table are captured live (len(out) right before each object is appended) so
+// they can never desync from the actual bytes -- this is the part that makes a hand-rolled xref
+// table trustworthy without a second offset-computation pass that could drift from the first.
+fn pdf_render(doc: dict) -> string
+    let pages = doc["pages"]
+    let n = len(pages)
+    let font_name = doc["font_name"]
+    if font_name == ""
+        font_name = "Helvetica"
+
+    // Object numbers: 1=Catalog, 2=Pages, 3..(2+2n)=Page/Contents pairs, (3+2n)=Font.
+    let font_num = 3 + n * 2
+
+    let out = "%PDF-1.4\n"
+    let offsets = []
+
+    // obj 1: Catalog
+    push(offsets, len(out))
+    out = out + "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+
+    // obj 2: Pages (kids = every page object number, in order)
+    let kid_refs = []
+    let i = 0
+    while i < n
+        push(kid_refs, str(3 + i * 2) + " 0 R")
+        i = i + 1
+    push(offsets, len(out))
+    out = out + "2 0 obj\n<< /Type /Pages /Kids [" + join(kid_refs, " ") + "] /Count " + str(n) + " >>\nendobj\n"
+
+    // per-page Page + Contents object pairs
+    i = 0
+    while i < n
+        let page = pages[i]
+        let page_num = 3 + i * 2
+        let content_num = page_num + 1
+        let content = page["content"]
+        let clen = len(content)
+
+        push(offsets, len(out))
+        out = out + str(page_num) + " 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + str(page["w"]) + " " + str(page["h"]) + "] /Contents " + str(content_num) + " 0 R /Resources << /Font << /F1 " + str(font_num) + " 0 R >> >> >>\nendobj\n"
+
+        push(offsets, len(out))
+        out = out + str(content_num) + " 0 obj\n<< /Length " + str(clen) + " >>\nstream\n" + content + "endstream\nendobj\n"
+
+        i = i + 1
+
+    // shared Font object
+    push(offsets, len(out))
+    out = out + str(font_num) + " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /" + font_name + " >>\nendobj\n"
+
+    let total_objs = font_num
+
+    // xref table: entry 0 is the mandatory free-list head; entries 1..total_objs are the offsets
+    // captured above, in object-number order (offsets list is already in that order by construction).
+    let xref_offset = len(out)
+    out = out + "xref\n0 " + str(total_objs + 1) + "\n"
+    out = out + "0000000000 65535 f \n"
+    let j = 0
+    while j < total_objs
+        let off = offsets[j]
+        out = out + "{off:010d}" + " 00000 n \n"
+        j = j + 1
+
+    out = out + "trailer\n<< /Size " + str(total_objs + 1) + " /Root 1 0 R >>\nstartxref\n" + str(xref_offset) + "\n%%EOF"
+    out

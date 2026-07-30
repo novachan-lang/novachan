@@ -1,0 +1,124 @@
+// forge_aws -- AWS service-level request builders on top of forge_awssigv4. Where forge_s3.nova and
+// forge_dynamodb.nova build FULLY-SIGNED requests once the caller already has a body in hand, forge_aws
+// is a lighter convenience layer: a single `creds` dict (access_key/secret_key/region) threads through
+// every helper, and each function returns just the PIECE a caller needs -- a URL string, a header dict,
+// or a form-encoded request body -- for composing HTTP calls to S3, SQS, SNS, Lambda, and DynamoDB.
+// Reuses forge_awssigv4's SigV4 primitives (sigv4_scope, sigv4_signature -- itself built on
+// sigv4_signing_key -- and sigv4_auth_header) for the one helper that needs a real Authorization header
+// (aws_s3_put_headers). Uses std/net/uri for RFC-3986 percent-encoding and std/time/strftime + the
+// time_ms() builtin to derive the two SigV4 clock strings from "now" when no explicit instant is given.
+import forge_awssigv4
+import std/net/uri
+import std/time/strftime
+
+// Bundle credentials once so every aws_* helper takes the SAME `creds` dict instead of three loose
+// strings each -- the convenience this whole module exists to provide.
+fn aws_credentials(access_key: string, secret_key: string, region: string) -> dict
+    let c = {}
+    c["access_key"] = access_key
+    c["secret_key"] = secret_key
+    c["region"] = region
+    c
+
+// PRIVATE: percent-encode an S3 object key path segment-by-segment, so a literal "/" in the key still
+// separates path segments (encoding it to "%2F" would instead address a DIFFERENT, non-existent object).
+fn _aws_encode_s3_path(key: string) -> string
+    let segments = split(key, "/")
+    let encoded = [uri_encode_component(seg) for seg in segments]
+    join(encoded, "/")
+
+// PRIVATE: the virtual-hosted-style S3 host for a bucket + region (matches forge_s3.s3_host).
+fn _aws_s3_host(bucket: string, region: string) -> string
+    bucket + ".s3." + region + ".amazonaws.com"
+
+// PRIVATE: current UTC instant as [amz_date "YYYYMMDDTHHMMSSZ", date_stamp "YYYYMMDD"] -- SigV4's two
+// clock-derived strings, both computed from the SAME epoch so they always describe the same instant.
+fn _aws_now_stamps() -> list
+    let epoch = time_ms() / 1000
+    [dt_strftime(epoch, "%Y%m%dT%H%M%SZ"), dt_strftime(epoch, "%Y%m%d")]
+
+// A plain (UNSIGNED) HTTPS URL for a GET on an S3 object. `creds` supplies the region only -- reading a
+// public or bucket-policy-permitted object needs no signature, so access_key/secret_key go unused here
+// (kept in the signature for a uniform aws_s3_* call shape; reach for aws_s3_put_headers when the
+// request DOES need an Authorization header). Path segments are percent-encoded individually so a
+// literal "/" in `key` still separates path segments instead of being folded into "%2F".
+fn aws_s3_get_url(creds: dict, bucket: string, key: string) -> string
+    "https://" + _aws_s3_host(bucket, creds["region"]) + "/" + _aws_encode_s3_path(key)
+
+// A fully SigV4-signed header set for an S3 PUT, WITHOUT requiring the body up front. Uses AWS's
+// documented "UNSIGNED-PAYLOAD" sentinel for x-amz-content-sha256 -- a real, S3-specific escape hatch:
+// unlike DynamoDB's JSON protocol, S3 explicitly accepts this literal value in place of a true payload
+// hash, so the request stays genuinely valid no matter what body the caller streams afterward. Returns
+// a dict: host, content-type, x-amz-date, x-amz-content-sha256, authorization -- ready to send with any
+// body under `content_type`.
+fn aws_s3_put_headers(creds: dict, bucket: string, key: string, content_type: string) -> dict
+    let region = creds["region"]
+    let host = _aws_s3_host(bucket, region)
+    let path = "/" + _aws_encode_s3_path(key)
+    let payload_hash = "UNSIGNED-PAYLOAD"
+    let stamps = _aws_now_stamps()
+    let amz_date = stamps[0]
+    let date_stamp = stamps[1]
+    let nl = chr(10)
+    let canonical_headers = "content-type:" + content_type + nl + "host:" + host + nl + "x-amz-content-sha256:" + payload_hash + nl + "x-amz-date:" + amz_date + nl
+    let signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+    let creq = sigv4_canonical_request("PUT", path, "", canonical_headers, signed_headers, payload_hash)
+    let scope = sigv4_scope(date_stamp, region, "s3")
+    let sts = sigv4_string_to_sign(amz_date, scope, creq)
+    let sig = sigv4_signature(creds["secret_key"], date_stamp, region, "s3", sts)
+    let out = {}
+    out["host"] = host
+    out["content-type"] = content_type
+    out["x-amz-date"] = amz_date
+    out["x-amz-content-sha256"] = payload_hash
+    out["authorization"] = sigv4_auth_header(creds["access_key"], scope, signed_headers, sig)
+    out
+
+// URL-encoded application/x-www-form-urlencoded body for the SQS Query API's SendMessage action --
+// POST this to `queue_url` with Content-Type: application/x-www-form-urlencoded. Params are in the
+// AWS-conventional alphabetical order (Action, MessageBody, QueueUrl, Version); order has no protocol
+// meaning for a form body (unlike a SigV4 canonical query string) but keeps this output deterministic.
+fn aws_sqs_send_body(queue_url: string, message_body: string) -> string
+    let parts = []
+    push(parts, "Action=SendMessage")
+    push(parts, "MessageBody=" + uri_encode_component(message_body))
+    push(parts, "QueueUrl=" + uri_encode_component(queue_url))
+    push(parts, "Version=2012-11-05")
+    join(parts, "&")
+
+// URL-encoded form body for the SNS Query API's Publish action -- POST to
+// "https://sns.<region>.amazonaws.com/" with Content-Type: application/x-www-form-urlencoded.
+fn aws_sns_publish_body(topic_arn: string, message: string) -> string
+    let parts = []
+    push(parts, "Action=Publish")
+    push(parts, "Message=" + uri_encode_component(message))
+    push(parts, "TopicArn=" + uri_encode_component(topic_arn))
+    push(parts, "Version=2010-03-31")
+    join(parts, "&")
+
+// The Lambda Invoke endpoint URL for a function name (bare name, qualified "name:alias", or a full
+// function ARN -- ':' and '/' both round-trip through percent-encoding unchanged). `creds` supplies
+// region only, matching aws_s3_get_url's uniform shape.
+fn aws_lambda_invoke_url(creds: dict, function_name: string) -> string
+    "https://lambda." + creds["region"] + ".amazonaws.com/2015-03-31/functions/" + uri_encode_component(function_name) + "/invocations"
+
+// The single DynamoDB regional endpoint URL -- every DynamoDB action (PutItem, GetItem, Query, ...)
+// POSTs to this SAME url; the action is selected by the X-Amz-Target header (see aws_dynamodb_headers),
+// never by the path.
+fn aws_dynamodb_url(creds: dict) -> string
+    "https://dynamodb." + creds["region"] + ".amazonaws.com/"
+
+// The pre-authorization header SHAPE for a DynamoDB action: host, content-type, x-amz-target (built as
+// "DynamoDB_20120810.<action>" -- pass the bare op name, e.g. "PutItem", "GetItem", "Query", matching
+// forge_dynamodb.nova's target strings). Deliberately does NOT include Authorization / x-amz-date /
+// x-amz-content-sha256: DynamoDB's JSON protocol (unlike S3) has no "UNSIGNED-PAYLOAD" escape hatch, so
+// a payload hash computed without the real JSON body would sign the WRONG request and DynamoDB would
+// reject it with SignatureDoesNotMatch -- a confidently-wrong Authorization header is worse than none.
+// Once the JSON body is built, sign the actual request with forge_dynamodb.dynamodb_request (which
+// takes the body and produces a real Authorization header from the TRUE payload hash).
+fn aws_dynamodb_headers(creds: dict, action: string) -> dict
+    let out = {}
+    out["host"] = "dynamodb." + creds["region"] + ".amazonaws.com"
+    out["content-type"] = "application/x-amz-json-1.0"
+    out["x-amz-target"] = "DynamoDB_20120810." + action
+    out
