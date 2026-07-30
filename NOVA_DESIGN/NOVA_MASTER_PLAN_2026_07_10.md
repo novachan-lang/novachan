@@ -59,7 +59,7 @@
 > | LOCK-4 | **Sized/unsigned numerics + f32/f16 (NType width/signed + ABI + elem_kind)** 🔄 inc1+inc2+**inc3a+inc3b (+crash-fix `19810c05`)+inc3c-part1a `fe6177a6` DONE** (width types + width-mismatch + wrapping arithmetic for direct-expr AND let-bound sized vars); inc3c-part2 (runtime-valued sized vars + f32 storage) · inc3d (packed arrays) open | 6/9 | the widest representation change — **the #1 risk**; touches type system, ABI, arrays. |
 > | LOCK-5 | **Safepoint preemption + `kill`** | 6/9 | Mesh supervision & Reactor frame-budget are fiction without it; scheduler-deep. |
 > | LOCK-6 | **`@cdecl` FFI callbacks** | 5/9 | Prism-desktop / Edge / Reactor are dead without it (also Forge-ALPN). |
-> | LOCK-7 | **Constant-time `@ct` + `secure_zero` + `@redact` (`Secret<T>`)** | Sentinel + Forge | Forge's LIVE crypto is already `-O2`-vulnerable; can't be bolted onto crypto after the fact. |
+> | LOCK-7 | **Constant-time `@ct` + `secure_zero` + `@redact` (`Secret<T>`)** ✅ `secure_zero` + `ct_eq` DONE `bab9fa57` (C runtime + compiler builtins + 5 userspace callsites; `@redact`/`Secret<T>` = Phase 2 annotation work) | Sentinel + Forge | Forge's LIVE crypto is already `-O2`-vulnerable; can't be bolted onto crypto after the fact. |
 > | LOCK-8/9 | **IR pointer address-space + GPU-buffer-as-Value + autodiff adjoint-rule table** | Cortex/Reactor | the GPU + training substrate; design-lock now, implement later. |
 > | LOCK-10/11/12 | **Const generics · struct-by-value FFI · Mesh wire-protocol + NodeRef** | Cortex/Reactor/Prism/Mesh | shape-checked tensors, native GUI/physics FFI, distribution identity. |
 >
@@ -1542,7 +1542,7 @@ gap is open.**
 - **[lib]** Argon2id (M) — password-storage best practice.
 - **[lib]** S2 HTTP-client redirects/cookies/proxy (M) · **[runtime]** S3 sync primitives (M) · S5 file
   perms/symlinks (M) · S6 unix sockets (M) · D9 binary pack/unpack (M).
-- **[lib]** D6 casefold + graphemes (L) · D5 XML parser (L) · D1 IANA timezones (XL).
+- **[lib]** ✅ D6 casefold + graphemes (L) `ee5dafbf` · ✅ D5 XML parser (L) · D1 IANA timezones (XL).
 - *Governing rule:* each is self-contained, avoids its drawback (see §4.B), and pays immediate daily value —
   no dependency on the language ceilings.
 

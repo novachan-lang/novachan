@@ -113,14 +113,13 @@ but not the strategic bottleneck.
 | **T-REPL** (broken by compiler relocation) | toolchain | B | ✅ FIXED+GATED `2543df3c` — stale runtime path repaired; `_test_repl.ps1` in CI. | 2543df3c |
 | FD_SETSIZE Linux guard | 0-C | B | ⬜ (Linux-only; can't verify on this Windows box) | |
 | safepoint preemption + kill (LOCK-5) | 0-C | A(XL) | ⬜ — STRATEGIC (blocks Mesh/Reactor) | |
-| constant-time `@ct` + `Secret<T>` (LOCK-7) | 0-C | A | ⬜ — STRATEGIC (Forge crypto already -O2-vulnerable) | |
-| sized/unsigned numerics + f32/f16 (LOCK-4) | ceil | A(XL) | ⬜ — **STRATEGIC #1 RISK** (unblocks 6 frameworks; widest ABI/type change) | |
+| constant-time `@ct` + `Secret<T>` (LOCK-7) | 0-C | A | ✅ `secure_zero` + `ct_eq` DONE `bab9fa57` (C runtime + compiler 4 sites + 5 callsites; `@redact`/`Secret<T>` = Phase 2) | bab9fa57 |
+| sized/unsigned numerics + f32/f16 (LOCK-4) | ceil | A(XL) | 🔄 inc1+inc2+inc3a+inc3b+inc3c-part1a DONE (`bc5acb27`..`fe6177a6`); inc3c-part2 (slot-flow for runtime-valued sized vars) ATTEMPTED but gen3 hangs — DEFERRED for deep investigation | |
 | module namespacing `@mod__fn` (LOCK-1) | ceil | A | 🔄 Phase-1 collision DETECTION done `724dad65` (two modules same-name → clear error); full mangling deferred (map in L11_NAMESPACING_MAP.md). | 724dad65 |
-| sized/unsigned numerics + f32 (LOCK-4) | ceil | A(XL) | ⬜ | |
 | annotations→codegen (LOCK-2) | ceil | A(XL) | ⬜ | |
 | macros/comptime | ceil | A(XL) | ⬜ | |
 | const generics · variance · assoc types | ceil | A | ⬜ | |
-| custom index/iter/call operators | ceil | A | ⬜ | |
+| custom index/iter/call operators (L8) | ceil | A | ✅ index+iter DONE `49f28f4f` (obj[i]/obj[i]=v/for x in obj → struct methods; call-overload backlog) | 49f28f4f |
 | enforced immutability `let mut` | ceil | A | ⬜ | |
 | `@cdecl` FFI callbacks (LOCK-6) + struct-by-value | ceil | A | ⬜ | |
 | monotonic type-id vtables | ceil | A | ⬜ | |

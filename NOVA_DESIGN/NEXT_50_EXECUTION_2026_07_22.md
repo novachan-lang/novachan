@@ -128,7 +128,7 @@ one shortcut reverted for a concurrency race); L11 #32.
 | 18 | S5 file perms/symlinks — **✅ DONE** — `chmod`/`umask`/`symlink`/`readlink` builtins (runtime C, POSIX-primary; Windows: chmod→read-only bit, `_umask`, symlink needs Dev Mode, readlink unsupported). KAT `_kat_perms` gated (cross-platform: chmod/umask verified, symlink/readlink graceful). | [rt] | M | done |
 | 19 | S6 unix domain sockets — genuinely MISSING (runtime; Win AF_UNIX+netpoller caveat) | [rt] | M | |
 | 20 | D9 binary pack/unpack — **✅ DONE** (`std/encoding/pack` tracked + `_pack_test` gated) | [std] | M | |
-| 21 | D6 casefold + graphemes (Unicode) — partial (`std/text/casefold`, `graphemex` now gated) | [fg] | L | also gives `str_eq_canon` |
+| 21 | D6 casefold + graphemes (Unicode) — ✅ **DONE `ee5dafbf`** — `std/text/casefold` expanded with full Unicode cf_fold/cf_eq/cf_contains/cf_starts_with/cf_ends_with (ß→ss, İ→i+dot, bytes_get O(1)); `std/text/grapheme` NEW with gr_split/gr_len/gr_at/gr_reverse (UAX-29 combining marks + ZWJ sequences). Both KAT-gated (`_kat_casefold`, `_kat_grapheme`), adversary-CONFIRMED. | [fg] | L | done |
 | 22 | D5 XML parser — **✅ DONE** (`std/text/xml` tracked + `_xmlparse_test` gated; added complementary `_xml_test` for node-shape/whitespace/null-safety) | [fg] | L | |
 | 23 | D1 IANA timezones — **🔄 PARTIAL (audit-corrected 2026-07-26; was falsely "MISSING")** — a real POSIX-TZ-rule DST engine EXISTS + gated (`std/time/tz.nova`: tz_offset_at/tz_to_local/tz_abbrev/tz_next_transition, 17 major IANA zones, modern era ~2007+; KAT `kat_tzdata_offsets` PASS). REMAINING for full XL scope: complete historical IANA tzdb (pre-2007 transitions, all ~350 zones, leap seconds) via a zoneinfo import. | [fg] | XL | attended (XL data) |
 
