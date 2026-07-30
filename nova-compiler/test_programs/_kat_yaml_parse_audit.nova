@@ -1,0 +1,376 @@
+// _kat_yaml_parse_audit.nova — INDEPENDENT soundness audit KAT for
+// std/data/yaml.nova's text parser (yaml_parse).
+//
+// Hunts the 4 recurring text-parser vulnerability classes against yaml_parse
+// (the only untrusted-text entry point in std/data/yaml; yaml_get walks an
+// already-in-memory NOVA value, not text, so it is not a parse-time attack
+// surface):
+//
+//   1. DEEP-NESTING RECURSION DoS — REAL BUG, FIXED. _y_block recursed into
+//      itself once per level of block nesting (a mapping key, or a sequence
+//      item's own key, whose value is itself a nested block) with NO depth
+//      limit. A crafted config with thousands of levels of nested mapping
+//      keys (each indented one column further than its parent -- ordinary,
+//      valid YAML indentation, no exotic syntax needed) recursed the native
+//      call stack unbounded -> stack overflow (crash/UB). FIXED: _y_block
+//      now threads a 1000-level recursion budget (_Y_MAX_DEPTH, matching
+//      this codebase's std/data/toml.nova and std/data/asn1_parse.nova
+//      convention). Past the cap, the nested block's boundary -- already
+//      computed iteratively, unconditionally, by _y_value_span/_y_child_end/
+//      _y_list_end to advance the caller's scan position -- is used to skip
+//      over it WITHOUT recursing; that key's value becomes null (the same
+//      convention already used for an ordinary dangling key). PART B proves
+//      actual native recursion never exceeds the cap regardless of how deep
+//      the input's indentation claims to go, AND that scanning correctly
+//      resumes at the right place afterward (a sibling key following the
+//      pathologically-deep value still parses correctly).
+//
+//      A NOTE ON SCALE (~20000 vs the depth used below): unlike a
+//      bracket-delimited grammar (sexpr's "(", JSON's "["), where each
+//      nesting level costs O(1) source bytes and 20000 levels is a trivial
+//      ~20KB payload, THIS grammar encodes nesting via indentation -- level
+//      k requires a column strictly greater than level k-1's, so the
+//      cheapest possible D-level input needs indentation summing to
+//      Omega(D^2) bytes (D lines, line k indented >= k columns). Reaching a
+//      literal 20000 levels this way needs on the order of D^2/2 =~ 2*10^8
+//      whitespace bytes (~190MB) of input, MEASURED (on this fix) to take
+//      well over a minute to construct+scan -- not because the fix doesn't
+//      work (the recursion cap fires identically regardless of nominal
+//      input depth), but because just READING that much input's leading
+//      whitespace to find each line's indentation is Omega(D^2) work
+//      inherent to indentation-based nesting (the same reason CPython hard-
+//      caps indentation depth at 100). Using the SAME 20000-scale input as
+//      the other audits in this campaign here would make this KAT itself
+//      the slow/flaky thing -- indistinguishable from a real hang under the
+//      harness's mandatory kill-on-timeout. PART B instead uses 3000 levels
+//      (3x _Y_MAX_DEPTH -- a decisive, unambiguous proof the cap fires
+//      long before any plausible native stack limit) sized to run in
+//      low-single-digit seconds; MEASURED on this fix: depth 2000 -> 0.52s,
+//      3000 -> 1.28s, 4000 -> 2.04s parse time (roughly quadratic, as the
+//      Omega(D^2) reasoning above predicts).
+//
+//   2. MALFORMED ACCEPTANCE — yaml_parse has NO error channel (`-> any`,
+//      a lenient best-effort parser by design -- see the module's own
+//      documented "SUBSET LIMITS"). "Rejected" is therefore proven as: the
+//      malformed construct is handled SAFELY (never crashes, never hangs,
+//      never gets silently mis-typed into a dangerously wrong VALUE) rather
+//      than via a boolean accept/reject signal. PART C exercises unbalanced
+//      quotes, a truncated escape, a dangling key, unsupported flow-style
+//      syntax, and stray document markers -- all handled as inert/harmless
+//      fallbacks, never a crash or a corrupted-looking value.
+//
+//   3. PATHOLOGICAL BLOWUP —
+//      (a) alias/anchor/reference expansion (YAML billion-laughs): NOT
+//          APPLICABLE. This module implements no anchor/alias mechanism at
+//          all (documented "SUBSET LIMITS"); `&x`/`*x` tokens are not
+//          special-cased anywhere in the source, so they parse as inert
+//          literal strings -- there is no expansion mechanism to blow up.
+//      (b) REAL BUG, FIXED (found during this audit, not in the original
+//          hunt list but squarely the same class): every character-scanning
+//          loop in this module (_y_indent, _y_strip_comment, _y_colon,
+//          _y_is_int_token, _y_is_float_token, _y_unescape_dq) walked its
+//          input via `char_at(s, i)` inside an i-incrementing while loop.
+//          char_at re-decodes UTF-8 from the START of the string on EVERY
+//          call (O(index) per call, not O(1)) -- an incrementing-index
+//          char_at loop is therefore O(L^2) per call, not O(L). Combined
+//          with the necessarily-large indent on a deeply-nested line, or
+//          simply with one very long line (no nesting needed at all), this
+//          was a genuine CPU-exhaustion blowup on "moderately-sized" input
+//          -- MEASURED pre-fix: a mere 2MB adversarial document (2000 lines
+//          of linearly-growing indent) took 2.1s to parse; the growth rate
+//          made even 4000 lines (~8MB) infeasible within any sane timeout.
+//          FIXED: every one of those loops now scans a pre-split chars(s)
+//          list (O(1) per index) instead of re-decoding from char_at each
+//          time -- true O(L) per line. _y_unescape_dq ALSO built its output
+//          via repeated string `+` (each `+` reallocates and copies the
+//          WHOLE accumulated-so-far result -- O(n) per char, O(n^2) total);
+//          fixed to accumulate chunks in a list and join() once (O(n)
+//          total). PART D proves a 240KB single-line double-quoted scalar
+//          (heavy escaping) and a 200000-byte single bare line now parse in
+//          well under a second (MEASURED: 163ms and 92ms respectively).
+//
+//   4. UNBOUNDED NUMBER/LENGTH — REAL BUG, FIXED. Any all-digit bare token
+//      (_y_is_int_token accepts any length) was passed to parse_int, whose
+//      underlying C primitive is atoll -- per the C standard, atoll's
+//      behavior on a value that cannot be represented as an i64 is
+//      UNDEFINED (unlike atof/strtod, which the standard requires to
+//      saturate to +/-infinity on overflow -- so no equivalent issue exists
+//      for _y_is_float_token/parse_float). A YAML document value like 40
+//      nines would overflow i64 and reach that undefined behavior. FIXED:
+//      swapped to parse_int_safe (this codebase's existing Result-returning
+//      strtoll-based primitive, used elsewhere for exactly this purpose --
+//      see nova_rt_parse_int_safe), falling back to this module's normal
+//      "can't confidently type it -> string" convention on overflow instead
+//      of ever reaching atoll's undefined behavior. PART E proves an
+//      overflowing literal safely becomes a string (unchanged, not
+//      corrupted/truncated/wrapped) while legitimate values AT the exact
+//      i64 boundary (+-9223372036854775807/-808) still parse as int.
+import std/data/yaml
+
+fn fail(msg)
+    print("FAIL: " + msg)
+    exit(1)
+
+fn cki(label, got, want)
+    if got != want
+        fail(label + ": got=" + str(got) + " want=" + str(want))
+
+fn cks(label, got, want)
+    if got != want
+        fail(label + ": got=[" + got + "] want=[" + want + "]")
+
+// ── PART A: valid-input round-trip (pre-existing behaviour must survive) ──
+fn a_valid_roundtrip()
+    let text = "name: NOVA\nversion: 1\nactive: true\ntags:\n  - a\n  - b\ndb:\n  host: localhost\n  port: 5432\n"
+    let r = yaml_parse(text)
+    cks("A name", r["name"], "NOVA")
+    cki("A version", r["version"], 1)
+    cki("A active", r["active"], true)
+    let tags = r["tags"]
+    cki("A tags len", len(tags), 2)
+    cks("A tags[1]", tags[1], "b")
+    let db = r["db"]
+    cks("A db.host", db["host"], "localhost")
+    cki("A db.port", db["port"], 5432)
+    cki("A yaml_get db.port", yaml_get(r, "db.port"), 5432)
+    cks("A yaml_get missing", yaml_get(r, "db.missing"), "")
+
+    // Same-indent block-sequence style (k8s/compose/Actions dominant form)
+    // and quoting/comment/type-inference edge cases must all be unaffected.
+    let text2 = "# top comment\nfloatv: 3.14\nnullv: null\ntildev: ~\nemptyv:\nsingleq: 'hi # not a comment'\ndoubleq: \"esc\\nline\"\nlist2:\n  - name: a\n    val: 1\n  - name: b\n    val: 2\n"
+    let r2 = yaml_parse(text2)
+    cks("A floatv type", type_of(r2["floatv"]), "float")
+    cki("A floatv value", r2["floatv"], 3.14)
+    cki("A nullv", r2["nullv"], null)
+    cki("A tildev", r2["tildev"], null)
+    cki("A emptyv", r2["emptyv"], null)
+    cks("A singleq", r2["singleq"], "hi # not a comment")
+    cks("A doubleq", r2["doubleq"], "esc\nline")
+    let list2 = r2["list2"]
+    cki("A list2 len", len(list2), 2)
+    cks("A list2[0].name", list2[0]["name"], "a")
+    cki("A list2[1].val", list2[1]["val"], 2)
+
+    print("PART A (valid round-trip) ok")
+
+// ── PART B: CLASS 1 — deep-nesting recursion DoS ───────────────────────────
+
+// walk_a: index ["a"] into `node`, `times` times (a real while loop, not
+// unrolled). Used to walk exactly to -- and one past -- the recursion cap.
+fn walk_a(node, times)
+    let cur = node
+    let i = 0
+    while i < times
+        cur = cur["a"]
+        i = i + 1
+    return cur
+
+fn build_nested_a_chain(depth)
+    let lines = []
+    let k = 0
+    while k < depth
+        push(lines, repeat(" ", k) + "a:")
+        k = k + 1
+    return join(lines, chr(10))
+
+fn b_class1_deep_nesting_dos()
+    // B1: 3000 levels of nested mapping keys (each indented 1 column deeper
+    // than its parent -- ordinary, valid YAML shape) followed by a shallow
+    // top-level SIBLING key. 3x the 1000-level cap: decisive proof the cap
+    // fires (this many genuinely-unbounded native stack frames, each
+    // carrying several locals and nested helper calls, would overflow any
+    // realistic default thread stack well before reaching depth 3000 if the
+    // fix were not in place), yet completes promptly (no hang/timeout-kill)
+    // because real recursion never exceeds ~1000 frames regardless of the
+    // 3000 nominal levels the indentation claims.
+    let depth = 3000
+    let chain = build_nested_a_chain(depth)
+    let doc = chain + chr(10) + "sibling: ok"
+    let r = yaml_parse(doc)
+
+    // Structure is bounded to EXACTLY _Y_MAX_DEPTH (1000) real nested dicts:
+    // walking ["a"] 1000 times still lands on a real dict (depth capped
+    // AT, not before, 1000); walking 1001 times lands on null (the value
+    // the parser assigned instead of recursing one level further).
+    let at_cap = walk_a(r, 1000)
+    cks("B1 depth==cap is still a real dict", type_of(at_cap), "dict")
+    let past_cap = walk_a(r, 1001)
+    cki("B1 depth==cap+1 is bounded to null (no further recursion)", past_cap, null)
+
+    // The scan position correctly resumes AFTER the pathologically-deep
+    // value: the top-level sibling key following it must still parse
+    // normally, proving the cap-skip (using the already-computed block
+    // boundary instead of recursing) doesn't corrupt subsequent parsing.
+    cks("B1 sibling key after capped-deep value parses correctly", r["sibling"], "ok")
+
+    // B2: a moderately deep but well WITHIN-cap structure (50 levels, a
+    // depth a real config could plausibly reach) must parse to FULL
+    // fidelity, not be nulled out -- the cap must not harm legitimately
+    // deep (but sane) documents. build_nested_a_chain's last line would be
+    // "<49 spaces>a:" with no value; build it manually here so the last
+    // line carries a real leaf value instead.
+    let lines50 = []
+    let k2 = 0
+    while k2 < 49
+        push(lines50, repeat(" ", k2) + "a:")
+        k2 = k2 + 1
+    push(lines50, repeat(" ", 49) + "a: leafvalue")
+    let doc50 = join(lines50, chr(10))
+    let r50 = yaml_parse(doc50)
+    let leaf = walk_a(r50, 49)
+    cks("B2 within-cap 50-level nesting preserves the real leaf value", leaf["a"], "leafvalue")
+
+    print("PART B (class 1: deep-nesting DoS) closed -- capped at " + str(1000) + ", " + str(depth) + "-level input completes without crash/hang")
+
+// ── PART C: CLASS 2 — malformed acceptance ──────────────────────────────────
+fn c_class2_malformed_acceptance()
+    // C1: unterminated double-quote -- never crashes; degrades to a plain
+    // (unquoted-looking) string rather than being treated as a valid quoted
+    // scalar or corrupting adjacent parsing.
+    let r1 = yaml_parse("k: \"unterminated")
+    cks("C1 unterminated double-quote stays a safe string, not silently dropped", r1["k"], "\"unterminated")
+
+    // C2: truncated backslash escape at the very end of a double-quoted
+    // scalar (the backslash has no following escape character at all).
+    let r2 = yaml_parse("k: \"trail" + chr(92) + "\"")
+    cks("C2 truncated trailing escape kept literal, no OOB/crash", r2["k"], "trail" + chr(92))
+
+    // C3: dangling key (no value, no nested block) -> null, not an error,
+    // not a crash, not a phantom value.
+    let r3 = yaml_parse("k:")
+    cki("C3 dangling key is null", r3["k"], null)
+
+    // C4: unsupported flow-style sequence/mapping (documented out of
+    // scope) must degrade to a harmless opaque string, never crash and
+    // never be silently misread as some OTHER typed value.
+    let r4 = yaml_parse("k: [1, 2, 3]")
+    cks("C4 unsupported flow-style sequence is an inert string, not misparsed", r4["k"], "[1, 2, 3]")
+    // NOTE: literal '{'/'}' in a NOVA double-quoted string source literal
+    // trigger compile-time string INTERPOLATION -- unrelated to yaml.nova,
+    // this is a NOVA language feature -- so the flow-mapping input/expected
+    // strings are built via chr(123)/chr(125) here to keep the braces
+    // literal instead of being parsed as an interpolation expression.
+    let ob = chr(123)
+    let cb = chr(125)
+    let r4b = yaml_parse("k: " + ob + "a: 1" + cb)
+    cks("C4b unsupported flow-style mapping is an inert string fallback", r4b["k"], ob + "a: 1" + cb)
+
+    // C5: stray YAML document markers ('---' / '...') -- unsupported multi-
+    // document syntax (documented out of scope); must not crash and must
+    // not corrupt sibling parsing.
+    let r5 = yaml_parse("---\nk: v\n...")
+    cks("C5 stray document markers don't corrupt sibling key parsing", r5["k"], "v")
+
+    // C6: totally empty input and whitespace/comment-only input -> {}.
+    cki("C6a empty input", type_of(yaml_parse("")), "dict")
+    cki("C6b comment-only input", type_of(yaml_parse("# just a comment\n")), "dict")
+
+    // C7: a key with an empty quoted string value must stay an empty
+    // string, not null (contrast with C3's true dangling key).
+    let r7 = yaml_parse("k: \"\"")
+    cks("C7 empty double-quoted value stays empty string, not null", r7["k"], "")
+
+    print("PART C (class 2: malformed acceptance) closed -- unbalanced/truncated/unsupported input handled safely, no crash/corruption")
+
+// ── PART D: CLASS 3 — pathological blowup ───────────────────────────────────
+fn d_class3_pathological_blowup()
+    // D1: alias/anchor NOT APPLICABLE -- no expansion mechanism exists;
+    // '&anchor' / '*alias' tokens parse as inert literal strings.
+    let rd1 = yaml_parse("a: &anchor value\nb: *alias\n")
+    cks("D1 '&anchor'-looking value is an inert literal string (no expansion)", rd1["a"], "&anchor value")
+    cks("D1 '*alias'-looking value is an inert literal string (no expansion)", rd1["b"], "*alias")
+
+    // D2: the REAL O(n^2) bug this audit found and fixed -- a large
+    // single-line double-quoted scalar with heavy escaping (the
+    // certificate/blob-pasted-into-a-config-value scenario) must parse
+    // promptly. Correctness (not just speed) is checked too.
+    let bs = chr(92)
+    let unit = "abcdefgh" + bs + "n" + bs + "t"       // source: abcdefgh\n\t (12 chars/unit)
+    let big = repeat(unit, 20000)                      // 240000 source chars
+    let t0 = time_ms()
+    let doc2 = "k: " + chr(34) + big + chr(34)
+    let r_d2 = yaml_parse(doc2)
+    let elapsed2 = time_ms() - t0
+    let outv = r_d2["k"]
+    cki("D2 large escaped scalar unescapes to expected length", len(outv), 200000)   // "abcdefgh"+\n+\t = 10 chars/unit x 20000
+    if elapsed2 > 10000
+        fail("D2 large escaped double-quoted scalar (240KB) took " + str(elapsed2) + "ms -- pathological blowup regression")
+
+    // D3: a single very long BARE line (no nesting, no quoting at all --
+    // proves the fix isn't just papering over the quoted-scalar path) must
+    // also parse promptly and preserve the value exactly.
+    let longval = repeat("x", 200000)
+    let t1 = time_ms()
+    let r_d3 = yaml_parse("k: " + longval)
+    let elapsed3 = time_ms() - t1
+    cki("D3 long bare-scalar line length preserved", len(r_d3["k"]), 200000)
+    if elapsed3 > 10000
+        fail("D3 long bare line (200000 chars) took " + str(elapsed3) + "ms -- pathological blowup regression")
+
+    // D4: wide-but-shallow (thousands of sibling keys, zero extra nesting)
+    // must also parse promptly and correctly -- confirms the fix didn't
+    // just move the cost from "deep" to "wide".
+    let wide_lines = []
+    let wi = 0
+    while wi < 4000
+        push(wide_lines, "k" + str(wi) + ": " + str(wi))
+        wi = wi + 1
+    let t2 = time_ms()
+    let r_d4 = yaml_parse(join(wide_lines, chr(10)))
+    let elapsed4 = time_ms() - t2
+    cki("D4 wide flat mapping: first key", r_d4["k0"], 0)
+    cki("D4 wide flat mapping: last key", r_d4["k3999"], 3999)
+    if elapsed4 > 10000
+        fail("D4 wide flat mapping (4000 keys) took " + str(elapsed4) + "ms -- pathological blowup regression")
+
+    print("PART D (class 3: pathological blowup) closed -- no alias/anchor expansion exists; large scalar/long-line/wide-mapping all parse in " + str(elapsed2 + elapsed3 + elapsed4) + "ms total (was: multi-second-per-2MB before the char_at/string-concat fix)")
+
+// ── PART E: CLASS 4 — unbounded number/length ───────────────────────────────
+fn e_class4_unbounded_number()
+    // E1: a decimal literal far beyond i64 range must NOT reach parse_int's
+    // underlying atoll (undefined behavior on overflow per the C standard)
+    // -- it must safely fall back to this module's normal string typing,
+    // UNCHANGED (not truncated/wrapped/corrupted).
+    let huge = "9999999999999999999999999999999999999999"   // 42 nines
+    let r1 = yaml_parse("k: " + huge)
+    cks("E1 type falls back to string on i64 overflow (never int UB)", type_of(r1["k"]), "string")
+    cks("E1 value preserved exactly, not truncated/wrapped", r1["k"], huge)
+
+    // E2: the negative case must behave the same way.
+    let hugeneg = "-9999999999999999999999999999999999999999"
+    let r2 = yaml_parse("k: " + hugeneg)
+    cks("E2 negative overflow also falls back to string", type_of(r2["k"]), "string")
+    cks("E2 negative overflow value preserved exactly", r2["k"], hugeneg)
+
+    // E3: values AT the exact i64 boundary must still parse as int (the
+    // fix must not be over-conservative and demote legitimate large ints,
+    // e.g. nanosecond epoch timestamps, which commonly reach 19 digits).
+    let r3 = yaml_parse("k: 9223372036854775807")
+    cks("E3 i64 max parses as int, not demoted to string", type_of(r3["k"]), "int")
+    cki("E3 i64 max value exact", r3["k"], 9223372036854775807)
+
+    let r4 = yaml_parse("k: -9223372036854775808")
+    cks("E4 i64 min parses as int, not demoted to string", type_of(r4["k"]), "int")
+
+    // E5: one past the positive boundary must be rejected back to string
+    // (proves the fix's Result-based check is precise, not merely a coarse
+    // digit-count heuristic).
+    let r5 = yaml_parse("k: 9223372036854775808")
+    cks("E5 one past i64 max correctly falls back to string", type_of(r5["k"]), "string")
+
+    // E6: float overflow is UNAFFECTED (parse_float/atof/strtod is
+    // well-defined on overflow -- saturates to +/-infinity per the C
+    // standard, unlike atoll) -- still parses as a (huge/infinite) float,
+    // never crashes.
+    let r6 = yaml_parse("k: 1.5e400")
+    cks("E6 float overflow stays float-typed (well-defined saturation)", type_of(r6["k"]), "float")
+
+    print("PART E (class 4: unbounded number/length) closed -- i64-overflow int literals safely fall back to string; boundary values still parse exactly")
+
+fn main()
+    a_valid_roundtrip()
+    b_class1_deep_nesting_dos()
+    c_class2_malformed_acceptance()
+    d_class3_pathological_blowup()
+    e_class4_unbounded_number()
+    print("YAML-PARSE-AUDIT KAT PASS")

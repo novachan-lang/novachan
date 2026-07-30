@@ -1,0 +1,105 @@
+// SOUNDNESS AUDIT KAT for forge_nats.nova.
+// Targets the specific bug classes hunted in this audit:
+//   1. i64-overflow bounds bypass in MSG "#bytes" parsing (_nt_parse_uint /
+//      _nt_parse_msg) -- a crafted huge digit-string must NOT wrap the
+//      accumulator into a value that bypasses the payload bounds check.
+//   2. Unchecked length -> over-read / truncation-as-success -- a MSG whose
+//      declared length exceeds the sane cap must be rejected, not silently
+//      accepted with a wrong/truncated payload.
+//   3. Deep-nesting recursion DoS -- N/A, this codec is iterative (documented,
+//      not separately tested here).
+//   4. Sentinel/absent-value collision -- a legitimate complete parse must
+//      never itself produce next_pos == -1 (the "need more data" sentinel).
+//   5. Trailing-content / malformed acceptance -- regression coverage that
+//      normal parsing still works byte-exact after the fix.
+import forge_nats
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn _expect_str(label: string, got: string, want: string)
+    if got != want
+        _fail(label + ": got [" + got + "] want [" + want + "]")
+
+fn _expect_int(label: string, got: int, want: int)
+    if got != want
+        _fail(label + ": got " + str(got) + " want " + str(want))
+
+fn main()
+    // ── 1. i64-overflow bounds bypass ─────────────────────────────────────
+    // "#bytes" = 20 nines massively overflows a 64-bit signed accumulator.
+    // Before the fix: _nt_parse_uint wrapped (NOVA ints wrap on overflow)
+    // into an attacker-influenced value that could itself be negative,
+    // making `need = after_line + plen + 2` wrap below bytes_len(b) and
+    // BYPASS the bounds check -- accepted as a "complete" MSG carrying a
+    // garbage length and a truncated/empty payload, silently desyncing the
+    // stream (subsequent bytes misparsed as new protocol lines).
+    // After the fix: _nt_parse_uint detects the overflow and returns -1;
+    // _nt_parse_msg treats plen<0 as a malformed header -- consumes ONLY
+    // the header line, never touches payload/bounds arithmetic with garbage.
+    let overflow_line = "MSG foo 1 99999999999999999999\r\n"
+    let overflow_frame = str_to_bytes(overflow_line + "XYZ\r\n")
+    let of_r = nats_parse_line(overflow_frame, 0)
+    let of_op = of_r[0]
+    _expect_str("overflow #bytes -> op empty (rejected, not MSG)", of_op["op"], "")
+    _expect_int("overflow #bytes -> next_pos == after header line only", of_r[1], len(overflow_line))
+    _expect_int("overflow #bytes -> len field is zero-value, not garbage", of_op["len"], 0)
+    _expect_int("overflow #bytes -> payload is empty, not garbage-sliced", bytes_len(of_op["payload"]), 0)
+
+    // Same overflow class on the sid token: must not wrap into a colliding
+    // small/negative value silently.
+    let sid_overflow_r = nats_parse_line(str_to_bytes("MSG foo 99999999999999999999 3\r\nabc\r\n"), 0)
+    _expect_int("overflow sid -> parsed as -1 sentinel (never a false small id)", sid_overflow_r[0]["sid"], 0 - 1)
+    _expect_str("overflow sid -> still recognized as MSG (only sid token overflowed)", sid_overflow_r[0]["op"], "MSG")
+
+    // ── 2. Unchecked-length: declared #bytes within i64 range but absurd
+    // (no overflow, would previously pass straight to the "need more data"
+    // wait-forever path, letting a hostile/buggy peer force the live client
+    // into unbounded buffer growth via _nt_read_unit's recv loop). Must be
+    // rejected outright (op empty, consumes only the header), NOT -1.
+    let huge_line = "MSG foo 1 5000000000\r\n"
+    let huge_r = nats_parse_line(str_to_bytes(huge_line), 0)
+    _expect_str("huge in-range #bytes -> rejected, not treated as MSG", huge_r[0]["op"], "")
+    _expect_int("huge in-range #bytes -> next_pos = after header (no wait-forever)", huge_r[1], len(huge_line))
+
+    // ── 3. Legitimate large-but-under-cap length that just isn't fully
+    // buffered yet must STILL correctly report "need more data" (-1), so the
+    // fix didn't overcorrect into rejecting valid slow-arriving frames.
+    let partial_line = "MSG foo 1 1000\r\n"
+    let partial_r = nats_parse_line(str_to_bytes(partial_line + "onlyafew"), 0)
+    _expect_int("under-cap but not-yet-buffered -> -1 (need more data)", partial_r[1], 0 - 1)
+    _expect_str("under-cap but not-yet-buffered -> op stays empty while waiting", partial_r[0]["op"], "")
+
+    // ── 4. Sentinel collision: a genuinely complete, valid parse must never
+    // produce next_pos == -1 (which the whole codec treats as "not enough
+    // data yet"). Exercise several ops.
+    let full = str_to_bytes("INFO \{\}\r\n")
+    let full_r = nats_parse_line(full, 0)
+    if full_r[1] == 0 - 1
+        _fail("valid INFO parse collided with -1 sentinel")
+    let msg_full = str_to_bytes("MSG foo 9 5\r\nhello\r\n")
+    let msg_full_r = nats_parse_line(msg_full, 0)
+    if msg_full_r[1] == 0 - 1
+        _fail("valid MSG parse collided with -1 sentinel")
+    _expect_int("valid MSG next_pos == full frame length", msg_full_r[1], bytes_len(msg_full))
+
+    // ── 5. Regression: normal byte-exact parsing still works after the fix,
+    // including the zero-length-payload edge case and a multi-frame chain.
+    _expect_int("zero-length payload MSG parses cleanly", nats_parse_line(str_to_bytes("MSG foo 1 0\r\n\r\n"), 0)[1], len("MSG foo 1 0\r\n\r\n"))
+
+    let chain = str_to_bytes("MSG a 1 3\r\nabc\r\n")
+    chain = bytes_concat(chain, str_to_bytes("MSG b 2 2\r\nxy\r\n"))
+    let c1 = nats_parse_line(chain, 0)
+    _expect_str("chain frame 1 op", c1[0]["op"], "MSG")
+    _expect_str("chain frame 1 payload", bytes_to_str(c1[0]["payload"]), "abc")
+    let c2 = nats_parse_line(chain, c1[1])
+    _expect_str("chain frame 2 op", c2[0]["op"], "MSG")
+    _expect_str("chain frame 2 payload", bytes_to_str(c2[0]["payload"]), "xy")
+    _expect_int("chain fully consumed", c2[1], bytes_len(chain))
+
+    // Regression on the builder side (untouched by this fix, sanity-checked
+    // so the audit KAT also proves nothing else regressed).
+    _expect_str("PUB builder unaffected", bytes_to_str(nats_pub("foo", str_to_bytes("hello"))), "PUB foo 5\r\nhello\r\n")
+
+    print("NATS-AUDIT KAT PASS")

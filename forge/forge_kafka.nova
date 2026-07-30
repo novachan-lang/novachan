@@ -83,8 +83,17 @@ fn kf_wr_nullable_string(s) -> any
     kf_wr_string(s)
 
 // -> [string, next_off]. Non-nullable (a -1 length here is a protocol violation of the caller's contract).
+// SOUNDNESS: `n` comes straight off the wire (any int16 value, including negative-but-not-(-1)
+// junk). Without clamping, `start + n` can land BEFORE `start` (e.g. n = -5), handing the caller a
+// next_off that moves the parse cursor BACKWARD. Every caller in this module (kf_parse_produce_response
+// / kf_parse_fetch_response) advances its own position purely from the returned next_off with no
+// independent monotonicity check, so a single malformed/hostile length field silently desynchronizes
+// the whole parse. Clamping n to >= 0 guarantees next_off is always >= start (forward progress),
+// matching the read as an empty string instead of corrupting the cursor.
 fn kf_rd_string(b, off: int) -> any
     let n = kf_rd_i16(b, off)
+    if n < 0
+        n = 0
     let start = off + 2
     [bytes_to_str(bytes_slice(b, start, start + n)), start + n]
 
@@ -93,6 +102,8 @@ fn kf_rd_nullable_string(b, off: int) -> any
     let n = kf_rd_i16(b, off)
     if n == 0 - 1
         return [null, off + 2]
+    if n < 0
+        n = 0
     let start = off + 2
     [bytes_to_str(bytes_slice(b, start, start + n)), start + n]
 
@@ -109,11 +120,15 @@ fn kf_wr_nullable_bytes(v) -> any
         return kf_wr_bytes(str_to_bytes(v))
     kf_wr_bytes(v)
 
-// -> [bytes_or_null, next_off].
+// -> [bytes_or_null, next_off]. SOUNDNESS: same negative-non-sentinel clamp as kf_rd_string above --
+// only -1 means null; any other negative length is malformed input and must not push next_off
+// backward past `start`.
 fn kf_rd_bytes(b, off: int) -> any
     let n = kf_rd_i32(b, off)
     if n == 0 - 1
         return [null, off + 4]
+    if n < 0
+        n = 0
     let start = off + 4
     [bytes_slice(b, start, start + n), start + n]
 
@@ -197,6 +212,19 @@ fn _kf_parse_message_set(b, off: int, end: int) -> any
         let msg_offset = kf_rd_i64(b, p)
         let msg_size = kf_rd_i32(b, p + 8)
         let mstart = p + 12
+        // SOUNDNESS: msg_size is an untrusted int32 taken straight off the wire and used to compute the
+        // NEXT loop position (`p = mstart + msg_size`). Without rejecting negative values here, a crafted
+        // record can make `p` non-monotonic: e.g. msg_size == -12 makes the new p equal the OLD p, so
+        // `while p + 12 <= end` never terminates -- a guaranteed infinite loop (100% CPU hang) from a
+        // single malicious/corrupted FetchResponse. A more negative msg_size drives p far below `off`;
+        // bytes_get/bytes_slice clamp out-of-range reads to 0 rather than crashing, so the loop keeps
+        // "succeeding" on fabricated zero-filled records while crawling p back up 12 bytes/iteration --
+        // up to ~2^31/12 (~179M) wasted iterations before it would ever reach `end`. Rejecting msg_size <
+        // 0 up front (same "malformed => stop like a truncated trailing message" contract as the
+        // overrun check below) guarantees p strictly increases by at least 12 every iteration, so the
+        // loop is hard-bounded by (end - off) / 12.
+        if msg_size < 0
+            return out
         if mstart + msg_size > end
             return out
         let kv_off = mstart + 6
@@ -232,16 +260,39 @@ fn kf_produce_request(acks: int, timeout_ms: int, topics: list) -> any
 
 // -> [topics, next_off]; topics = list of [name, partition_responses]; partition_responses = list of
 // [partition, error_code, base_offset].
+// SOUNDNESS: `n` (topic count) and `pn` (partition count) are untrusted int32 fields taken straight off
+// the wire, with NO relationship enforced to how much data actually remains in `b`. Every read this
+// function performs is individually bounds-safe (bytes_get/bytes_slice clamp out-of-range access to
+// 0/empty rather than crashing), so an attacker/corrupt broker cannot corrupt memory here -- but with
+// nothing else bounding the loops, a response that simply DECLARES e.g. n = 2000000000 topics on a
+// tiny buffer drives the parser through up to ~2^31 iterations of list/string allocation before the
+// (unreachable) real data runs out: a pure CPU/allocation-exhaustion DoS from a single malicious frame.
+// FIX: clamp each declared count to the maximum that the ACTUAL remaining bytes could possibly back,
+// using each entry's minimum wire footprint (topic >= 2-byte string-len + 4-byte partition-count = 6;
+// partition entry == fixed 14 bytes). Any well-formed response always has strictly MORE than the
+// minimum-footprint bytes per real entry, so this can never truncate legitimate data -- it only rejects
+// counts that are provably impossible given the bytes on hand.
 fn kf_parse_produce_response(b, off: int) -> any
+    let blen = bytes_len(b)
     let n = kf_rd_i32(b, off)
+    if n < 0
+        n = 0
     let p = off + 4
+    let max_topics = (blen - p) / 6
+    if n > max_topics
+        n = max_topics
     let topics = []
     let i = 0
     while i < n
         let nr = kf_rd_string(b, p)
         p = nr[1]
         let pn = kf_rd_i32(b, p)
+        if pn < 0
+            pn = 0
         p = p + 4
+        let max_parts = (blen - p) / 14
+        if pn > max_parts
+            pn = max_parts
         let prs = []
         let j = 0
         while j < pn
@@ -282,16 +333,39 @@ fn kf_fetch_request(replica_id: int, max_wait_ms: int, min_bytes: int, topics: l
 // -> [topics, next_off]; topics = list of [name, partition_responses]; partition_responses = list of
 // [partition, error_code, high_watermark, messages] where messages = list of [offset, key, value] and
 // key/value are raw `bytes` (or null) -- binary-safe, NOT UTF-8-decoded (see _kf_parse_message_set).
+// SOUNDNESS (see kf_parse_produce_response for the full rationale): `n`/`pn` are clamped to the maximum
+// count the remaining buffer could actually back (topic minimum 6 bytes, partition-entry-header minimum
+// 18 bytes: partition(4)+error(2)+high_watermark(8)+message_set_size(4)), closing the same
+// declared-count DoS. Additionally, `msize` (the per-partition message-set byte length) is itself an
+// untrusted int32: previously `p = mset_off + msize` trusted it blindly, so a negative or
+// past-buffer-end msize would either walk `p` BACKWARD (re-parsing/overlapping earlier data on every
+// subsequent iteration) or hand `_kf_parse_message_set` an `end` far beyond the real buffer. Clamping
+// `mset_end` to `mset_off` whenever msize is negative or would overrun `blen` keeps `p` monotonically
+// forward (advancing by exactly the fixed 18-byte header on malformed input, matching this module's
+// existing "malformed trailing content is silently truncated, not an error" contract) while leaving
+// well-formed responses byte-for-byte unaffected (a legitimate msize is always <= the real remaining
+// bytes, so the clamp never fires for real data).
 fn kf_parse_fetch_response(b, off: int) -> any
+    let blen = bytes_len(b)
     let n = kf_rd_i32(b, off)
+    if n < 0
+        n = 0
     let p = off + 4
+    let max_topics = (blen - p) / 6
+    if n > max_topics
+        n = max_topics
     let topics = []
     let i = 0
     while i < n
         let nr = kf_rd_string(b, p)
         p = nr[1]
         let pn = kf_rd_i32(b, p)
+        if pn < 0
+            pn = 0
         p = p + 4
+        let max_parts = (blen - p) / 18
+        if pn > max_parts
+            pn = max_parts
         let prs = []
         let j = 0
         while j < pn
@@ -300,9 +374,14 @@ fn kf_parse_fetch_response(b, off: int) -> any
             let hw = kf_rd_i64(b, p + 6)
             let msize = kf_rd_i32(b, p + 14)
             let mset_off = p + 18
-            let msgs = _kf_parse_message_set(b, mset_off, mset_off + msize)
+            let mset_end = mset_off + msize
+            if msize < 0
+                mset_end = mset_off
+            if mset_end > blen
+                mset_end = mset_off
+            let msgs = _kf_parse_message_set(b, mset_off, mset_end)
             push(prs, [partition, err, hw, msgs])
-            p = mset_off + msize
+            p = mset_end
             j = j + 1
         push(topics, [nr[0], prs])
         i = i + 1
@@ -335,6 +414,16 @@ fn kf_recv_response(sock: int, buf) -> any
     if bytes_len(buf) < 4
         return [0 - 1, bytes(0), buf]
     let size = kf_rd_i32(buf, 0)
+    // SOUNDNESS: a negative size prefix (corrupt/hostile peer) must be treated as malformed the same as
+    // a short read. Without this check, `total = 4 + size` can be < 4 (even negative); `bytes_slice`
+    // clamps a negative/backward range to empty, so the parse would fabricate a "successful" zero-length
+    // response with correlation_id 0 -- masking a corrupt frame as valid data (a malformed-input
+    // acceptance). Worse, the leftover-buffer slice `bytes_slice(buf, total, bytes_len(buf))` clamps the
+    // negative `start` back to 0, returning the ENTIRE original buffer as "leftover" -- i.e. zero bytes
+    // are ever consumed. A caller looping on kf_recv_response over the same socket would then reparse the
+    // identical corrupt prefix forever: an unbounded infinite-loop DoS at the framing layer.
+    if size < 0
+        return [0 - 1, bytes(0), buf]
     let total = 4 + size
     buf = _kf_recv_at_least(sock, buf, total)
     if bytes_len(buf) < total

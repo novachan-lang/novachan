@@ -15978,6 +15978,44 @@ int64_t nova_rt_pbkdf2_sha256(int64_t pw_val, int64_t salt_val, int64_t iters, i
     return result;
 }
 
+/* ── Security primitives (LOCK-7: constant-time + secure wipe) ────────────── */
+
+int64_t nova_rt_secure_zero(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    size_t len = strlen(s);
+    if (len == 0) return 0;
+#ifdef _WIN32
+    SecureZeroMemory((void*)(uintptr_t)str_handle, len);
+#elif defined(__STDC_LIB_EXT1__)
+    memset_s((void*)(uintptr_t)str_handle, len, 0, len);
+#else
+    volatile unsigned char* p = (volatile unsigned char*)(uintptr_t)str_handle;
+    for (size_t i = 0; i < len; i++) p[i] = 0;
+    __asm__ __volatile__("" ::: "memory");
+#endif
+    return 0;
+}
+
+#ifdef __clang__
+__attribute__((optnone, noinline))
+#elif defined(__GNUC__)
+__attribute__((optimize("O0"), noinline))
+#endif
+int64_t nova_rt_ct_eq(int64_t a_handle, int64_t b_handle) {
+    const char* a = (const char*)(uintptr_t)a_handle;
+    const char* b = (const char*)(uintptr_t)b_handle;
+    if (!a) a = "";
+    if (!b) b = "";
+    size_t la = strlen(a), lb = strlen(b);
+    volatile uint8_t diff = (la != lb) ? 1 : 0;
+    size_t len = la < lb ? la : lb;
+    for (size_t i = 0; i < len; i++) {
+        diff |= ((uint8_t)a[i] ^ (uint8_t)b[i]);
+    }
+    return diff == 0 ? 1 : 0;
+}
+
 /* ── Hex encode/decode ────────────────────────────────────────────────────── */
 
 int64_t nova_rt_hex_encode(int64_t input) {

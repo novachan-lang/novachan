@@ -1,0 +1,269 @@
+// _kat_xmlpath_parse_audit.nova — soundness audit KAT for std/data/xmlpath.nova
+// (the XPath-like slash-path query layer over std/text/xml's xml_parse).
+//
+// xmlpath.nova itself does no parsing of its own -- every private helper
+// (_xp_split_path, _xp_walk, _xp_node_tag/_children/_text, _xp_resolve) is a
+// plain iterative `while` loop over already-built dict/list values; none of
+// them call themselves or each other recursively. The ONLY parse function in
+// the call graph reachable from xmlpath's public API (xp_first / xp_all /
+// xp_count / xp_exists -> _xp_resolve -> xml_parse) is std/text/xml's
+// xml_parse, which IS real recursive descent: _xml_parse_element and
+// _xml_parse_children are MUTUALLY RECURSIVE, one native call-stack frame
+// pair per XML nesting level.
+//
+// CLASS 1 (DEEP-NESTING RECURSION DoS) -- REAL, FIXED (highest severity).
+//   Before this audit, that mutual recursion had NO depth limit: a
+//   ~20000-deep "<a><a>...</a></a>" document -- trivially craftable by any
+//   caller feeding untrusted XML into xp_first/xp_exists/etc. (e.g. an HTTP
+//   request body) -- recursed the native call stack ~20000 levels deep.
+//   That is a classic unbounded-recursion stack-overflow DoS (crash/UB).
+//   FIX (std/text/xml.nova): thread a `depth` counter through
+//   _xml_parse_element / _xml_parse_children (root == 1), capped at 1000.
+//   Past the cap, an element's own tag/attrs are still parsed (the
+//   well-formed prefix survives intact) but _xml_parse_children is never
+//   invoked for it -- native recursion cannot grow past ~1000 frames no
+//   matter how deep the input claims to be, and the truncated element is
+//   flagged with attrs["error"] = "max nesting depth exceeded".
+//
+// CLASS 2 (MALFORMED ACCEPTANCE) -- REAL, FIXED.
+//   Three malformed shapes were silently accepted as if well-formed, with NO
+//   signal anywhere in the returned tree:
+//     - mismatched closing tag: "<a><b>x</a>" -- the "</a>" closed <b> with
+//       ZERO name comparison (any "</...>" closed whatever was currently
+//       open, regardless of name).
+//     - unclosed element: EOF reached mid-document with no closing tag at
+//       all silently returned as if the element legitimately ended there.
+//     - unterminated attribute quote: a missing closing quote silently
+//       swallowed the REST OF THE ENTIRE DOCUMENT into one attribute value
+//       (including what looked like following child elements) with no
+//       signal that anything was wrong.
+//   FIX: all three now set attrs["error"] on the affected node -- the same
+//   established idiom xml_parse already used for "no root element" /
+//   "expected element" / "unexpected closing tag" -- instead of silently
+//   returning a tree that looks fully well-formed.
+//
+// CLASS 3 (PATHOLOGICAL BLOWUP / entity expansion) -- NOT APPLICABLE, verified.
+//   xml_parse expands exactly 5 FIXED predefined entities (&lt; &gt; &amp;
+//   &quot; &apos;), each to exactly 1 literal character, via a flat
+//   if/else-if chain with no table, no recursion, and no notion of a
+//   user-defined entity at all. <!DOCTYPE>/<!ENTITY> declarations are
+//   skipped by _xml_skip_decl (bracket-depth-tracked, never parsed into an
+//   expansion table), so any "&x;" that would reference such an entity is
+//   left VERBATIM. There is no expansion engine for a billion-laughs-style
+//   chain to abuse -- structurally impossible, not merely rate-limited.
+//
+// CLASS 4 (UNBOUNDED NUMBER/LENGTH) -- NOT APPLICABLE.
+//   This grammar has no length-prefixed or count-prefixed construct at all
+//   (no "repeat N times" field, no binary length header) -- every construct
+//   is delimiter-scanned (a matching quote, "-->", "]]>", "?>", ">"). No
+//   integer is ever parsed from untrusted input anywhere in this module, so
+//   there is no site for an i64-overflow-style unbounded-count bug to exist.
+//
+// CLASS 5 (CHAR-AT O(n^2) PERF-DoS) -- REAL, FIXED, IN xmlpath.nova ITSELF.
+//   _xp_split_path (xmlpath's OWN code, not xml.nova's) used to be
+//   `while i < n: c = char_at(path, i); seg = seg + c; i = i + 1`. char_at()
+//   decodes UTF-8 from byte offset 0 on EVERY call (nova_rt_char_at in
+//   nova_runtime.c: `size_t i = 0; while (i < len) { ...; if (idx==index)
+//   return ...; idx++ }` -- an O(index) rescan per call), so a single-pass
+//   loop that calls it once per index over the WHOLE path is O(n^2) total --
+//   the exact same bug class the ini.nova _ini_split_lines audit found and
+//   fixed. The `path` argument is exactly the kind of value real callers
+//   build from untrusted input (a URL segment, a query parameter used to
+//   select an XML field) -- an attacker-controlled long path string makes
+//   EVERY xmlpath public function (xp_first/xp_all/xp_count/xp_exists, all
+//   of which route through _xp_resolve -> _xp_split_path) pathologically
+//   slow, independent of the XML document size.
+//   FIX (std/data/xmlpath.nova): rewritten to str_to_bytes/bytes_get (O(1)
+//   random byte access) + buffer()/buf_append_char/buf_to_str (O(1)-
+//   amortized append) -- true O(n). Copying raw bytes instead of char_at's
+//   decoded codepoints still reconstructs multi-byte UTF-8 sequences
+//   byte-for-byte, because "/" (0x2F) can never appear as a UTF-8
+//   continuation or lead byte (those are always >= 0x80) -- PART F proves
+//   both the perf fix (a ~40000-char adversarial path returns promptly) and
+//   that multi-byte UTF-8 tag names in path segments still split correctly.
+//
+// All existing xmlpath.nova KAT vectors (see _xmlpath_test.nova) are
+// preserved verbatim in PART A to prove the fix does not disturb any valid
+// parse.
+
+import std/data/xmlpath
+import std/text/xml
+
+// O(log count) doubling builder for the deep-nesting stress input below.
+// NOTE: deliberately NOT std/core/str's str_repeat -- that helper builds via
+// a naive one-at-a-time `out = out + s` loop, which is O(count) concat calls
+// each re-copying the whole accumulated string (nova_fat_str_concat is
+// O(la+lb) per call, see nova_runtime.c) -- O(count^2) total. Confirmed by
+// direct measurement: str_repeat("<a>", 2000) is instant, str_repeat("<a>",
+// 20000) alone blows the 15s test-runner timeout (10x the count, ~100x the
+// quadratic cost). That is a pure test-harness performance concern in a
+// DIFFERENT module (std/core/str.nova), not a parser soundness issue, so it
+// is out of scope to fix here -- this local helper just avoids tripping over
+// it while still exercising the full 20000-deep xml_parse recursion path.
+fn build_repeat(unit: string, count: int) -> string
+    let result = ""
+    let piece = unit
+    let remaining = count
+    while remaining > 0
+        if remaining - (remaining / 2) * 2 == 1
+            result = result + piece
+        piece = piece + piece
+        remaining = remaining / 2
+    result
+
+fn cks(name: string, got: string, want: string)
+    if got != want
+        print("FAIL " + name + ": got='" + got + "' want='" + want + "'")
+        exit(1)
+    print("ok " + name)
+
+fn cki(name: string, got: int, want: int)
+    if got != want
+        print("FAIL " + name + ": got=" + str(got) + " want=" + str(want))
+        exit(1)
+    print("ok " + name)
+
+fn ckb(name: string, got: bool, want: bool)
+    let gi = 0
+    if got
+        gi = 1
+    let wi = 0
+    if want
+        wi = 1
+    if gi != wi
+        print("FAIL " + name + ": got=" + str(gi) + " want=" + str(wi))
+        exit(1)
+    print("ok " + name)
+
+// ── PART A: valid-input round-trip (unchanged spec vectors) ───────────────
+fn a_valid_roundtrip()
+    cks("A first_simple", xp_first("<a><b>hi</b></a>", "a/b"), "hi")
+    cks("A first_of_many", xp_first("<a><b>1</b><b>2</b></a>", "a/b"), "1")
+    let all_b = xp_all("<a><b>1</b><b>2</b></a>", "a/b")
+    cki("A all_len", len(all_b), 2)
+    cks("A all_0", all_b[0], "1")
+    cks("A all_1", all_b[1], "2")
+    cki("A count_3", xp_count("<r><i>x</i><i>y</i><i>z</i></r>", "r/i"), 3)
+    ckb("A exists_true", xp_exists("<a><b>x</b></a>", "a/b"), true)
+    ckb("A exists_false", xp_exists("<a><b>x</b></a>", "a/c"), false)
+    cks("A first_deep", xp_first("<a><b><c>deep</c></b></a>", "a/b/c"), "deep")
+
+// ── PART B: CLASS 1 -- deep-nesting recursion DoS, MANDATORY case ─────────
+fn b_class1_deep_nesting_capped()
+    let deep_open = build_repeat("<a>", 20000)
+    let deep_close = build_repeat("</a>", 20000)
+    let deep_xml = deep_open + deep_close
+
+    // Must return promptly (no crash, no hang) with a sane bounded result
+    // through xmlpath's OWN public API -- this is what a real caller uses.
+    ckb("B deep xp_exists(root)", xp_exists(deep_xml, "a"), true)
+    cki("B deep xp_count(root)", xp_count(deep_xml, "a"), 1)
+    cks("B deep xp_first(root) has no direct text", xp_first(deep_xml, "a"), "")
+
+    // Prove the cap ACTUALLY fired (not "got lucky" surviving 20000 native
+    // stack frames): parse directly and walk the first-child chain. An
+    // uncapped parse would have genuine structural nesting 20000 deep;
+    // capped, the chain must hit an explicit depth-cap error marker in well
+    // under 2000 steps, proving real recursion never grew anywhere near
+    // 20000 native frames.
+    let root = xml_parse(deep_xml)
+    cks("B deep root tag", root["tag"], "a")
+    let node = root
+    let steps = 0
+    let hit_cap = false
+    while steps < 2000 and len(node["children"]) > 0 and (not hit_cap)
+        node = node["children"][0]
+        steps = steps + 1
+        if xml_attr(node, "error") == "max nesting depth exceeded"
+            hit_cap = true
+    ckb("B deep nesting cap fired", hit_cap, true)
+    if steps >= 2000
+        print("FAIL B deep nesting cap: did not fire within 2000 steps (unbounded recursion regression)")
+        exit(1)
+    print("ok B deep nesting cap fired at step " + str(steps) + " (bounded, not 20000)")
+
+// ── PART C: CLASS 2 -- malformed acceptance, each case asserted rejected ──
+fn c_class2_malformed_rejected()
+    // C1: mismatched closing tag -- "</a>" used to silently close <b> with
+    // zero name check. Now flagged, without disturbing the still
+    // best-effort-recovered text extraction existing callers rely on.
+    let mism = xml_parse("<a><b>hi</a>")
+    let bnode = xml_find(mism, "b")
+    cks("C1 mismatched close flagged on <b>", xml_attr(bnode, "error"), "mismatched closing tag")
+    cks("C1 xp_first still recovers text", xp_first("<a><b>hi</a>", "a/b"), "hi")
+
+    // C2: unclosed element -- EOF reached with no closing tag anywhere.
+    let unclosed = xml_parse("<a><b>hi")
+    cks("C2 unclosed root flagged", xml_attr(unclosed, "error"), "unclosed element")
+    ckb("C2 xp_exists degrades safely", xp_exists("<a><b>hi", "a/b"), true)
+
+    // C3: unterminated attribute quote -- previously swallowed the rest of
+    // the document (including the apparent child elements) into one
+    // attribute value with no signal at all that anything was wrong.
+    let badattr = xml_parse("<a x=\"never closes><b>hi</b></a>")
+    cks("C3 unterminated quote flagged", xml_attr(badattr, "error"), "unterminated tag")
+
+    // C4: empty input -- pre-existing behavior, reverified unchanged.
+    let empty = xml_parse("")
+    cks("C4 empty input flagged", xml_attr(empty, "error"), "no root element")
+    cks("C4 xp_first on empty xml", xp_first("", "a"), "")
+
+    // C5: lone closing tag, no root at all -- pre-existing, reverified.
+    let lone = xml_parse("</a>")
+    cks("C5 lone closing tag flagged", xml_attr(lone, "error"), "unexpected closing tag")
+
+    // C6: wrong root tag via xmlpath's own API -- must degrade to
+    // empty/false/0, never crash or fabricate a match.
+    cks("C6 wrong root xp_first", xp_first("<a><b>hi</b></a>", "x/b"), "")
+    cki("C6 wrong root xp_count", xp_count("<a><b>hi</b></a>", "x/b"), 0)
+    ckb("C6 wrong root xp_exists", xp_exists("<a><b>hi</b></a>", "x/b"), false)
+
+// ── PART D: CLASS 3 -- pathological blowup / entity expansion ─────────────
+fn d_class3_entity_expansion_not_applicable()
+    // A DOCTYPE declaring a custom entity must NOT be expanded anywhere.
+    let dt = xml_parse("<?xml?><!DOCTYPE r [<!ENTITY x 'boom'>]><r>&x;ok</r>")
+    cks("D custom entity left verbatim", xml_text(dt), "&x;ok")
+    // The classic billion-laughs SHAPE (one entity referencing another
+    // entity many times) is likewise inert -- still just literal text,
+    // because there is no expansion table to chain through in the first
+    // place.
+    let bomb = xml_parse("<!DOCTYPE r [<!ENTITY a 'x'><!ENTITY b '&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;'>]><r>&b;</r>")
+    cks("D chained entity ref left verbatim", xml_text(bomb), "&b;")
+
+// ── PART E: CLASS 4 -- unbounded number/length ─────────────────────────────
+// See header: this grammar has no length/count-prefixed construct at all
+// (every scan is delimiter-bounded), so there is no site for an
+// i64-overflow-style bug to exist in. No runtime case needed -- the
+// architecture itself rules the class out.
+
+// ── PART F: CLASS 5 -- char_at O(n^2) perf-DoS in _xp_split_path ──────────
+fn f_class5_split_path_perf_and_utf8()
+    // F1: adversarial long path (~40000 bytes, no matching tag anywhere) must
+    // return promptly. Pre-fix this was O(n^2) via char_at's O(index) rescan
+    // per call -- ~40000 segments over a ~40000-char path is on the order of
+    // 10^9 char_at-internal steps, which reliably blows the test-runner's
+    // timeout. Post-fix (byte-indexed, O(n)) this completes instantly.
+    let long_path = build_repeat("z/", 20000) + "final"
+    cks("F1 long adversarial path -> no match, no hang", xp_first("<a><b>hi</b></a>", long_path), "")
+    cki("F1 long adversarial path count", xp_count("<a><b>hi</b></a>", long_path), 0)
+
+    // F2: multi-byte UTF-8 in a path segment must still split and match
+    // correctly under the byte-indexed rewrite -- "/" (0x2F) never collides
+    // with a UTF-8 continuation/lead byte (always >= 0x80), so raw-byte
+    // copying reconstructs the multi-byte tag name intact.
+    cks("F2 utf8 tag segment splits+matches", xp_first("<café><x>hi</x></café>", "café/x"), "hi")
+
+    // F3: leading/trailing/double slash still produce the same empty-segment
+    // safe-no-match behavior as before the rewrite (regression check).
+    cks("F3 leading slash no match", xp_first("<a><b>hi</b></a>", "/a/b"), "")
+    cks("F3 trailing slash no match on b (segment after b is empty)", xp_first("<a><b>hi</b></a>", "a/b/"), "")
+    cks("F3 double slash no match", xp_first("<a><b>hi</b></a>", "a//b"), "")
+    print("ok F class5 split-path perf+utf8")
+
+fn main()
+    a_valid_roundtrip()
+    b_class1_deep_nesting_capped()
+    c_class2_malformed_rejected()
+    d_class3_entity_expansion_not_applicable()
+    f_class5_split_path_perf_and_utf8()
+    print("XMLPATH-PARSE-AUDIT KAT PASS")

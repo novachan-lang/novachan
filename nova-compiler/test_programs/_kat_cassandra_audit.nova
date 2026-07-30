@@ -1,0 +1,211 @@
+// _kat_cassandra_audit — independent soundness-audit KAT for forge_cassandra.nova.
+//
+// Hunts the 5 proven-live vuln classes (i64-overflow bounds bypass, unchecked
+// length -> over-read, deep-nesting recursion DoS, sentinel/absent collision,
+// trailing-content/malformed acceptance) PLUS re-verifies the module's own
+// decode-side hardening did not regress from the encode-side fix applied here.
+//
+// REAL FINDING (fixed in forge_cassandra.nova, this audit):
+//   cql_string_encode/cql_long_string_encode/cql_string_map_encode/
+//   cql_bytes_encode/cql_frame_header_encode masked an oversized declared
+//   length with `& 0xFFFF` / `& 0xFFFFFFFF` instead of validating it. A string
+//   whose byte length is exactly 65536 (2^16) would encode a WIRE length
+//   prefix of 0x0000 ("empty string") while still writing the full 65536
+//   payload bytes after it — a decoder reads an empty string and then
+//   misinterprets the smuggled bytes as later frame fields. This is the
+//   production-side mirror of the over-read/malformed-acceptance decode bug
+//   classes this file is otherwise hardened against. FIX: validate-and-reject
+//   (return bytes_create(0), never a valid output) instead of mask-and-wrap,
+//   propagated through every composing encoder (string map entries, STARTUP/
+///  QUERY frame bodies) so a failure never produces a partially-corrupt frame.
+//
+// classes NOT independently re-provable here with a fast/safe KAT:
+//   the 32-bit-width guards (cql_long_string_encode > 0xFFFFFFFF bytes,
+//   cql_bytes_encode > 0x7FFFFFFF bytes, cql_frame_header_encode length >
+//   0xFFFFFFFF) require multi-GB buffers to trigger at the true boundary --
+//   verified by code inspection instead (see forge_cassandra.nova comments);
+//   the frame-header length upper boundary (0xFFFFFFFF, still valid) is
+//   exercised below and in the existing adv_cassandra_probe.nova.
+
+import forge_cassandra as cq
+import std/encoding/pack as pk
+
+fn _fail(msg: string)
+    print("FAIL: " + msg)
+
+fn _hex(b: bytes) -> string
+    let out = ""
+    let n = bytes_len(b)
+    let i = 0
+    while i < n
+        let v = bytes_get(b, i) & 0xFF
+        let hidig = v / 16
+        let lodig = v % 16
+        let digs = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+        out = out + digs[hidig] + digs[lodig]
+        i = i + 1
+    out
+
+// build a string of exactly n ASCII 'x' bytes, fast (doubling, ~log2(n) copies
+// instead of an O(n^2) char-by-char concat loop)
+fn _mkstr(n: int) -> string
+    let s = "x"
+    while len(s) < n
+        s = s + s
+    if len(s) > n
+        s = bytes_to_str(bytes_slice(str_to_bytes(s), 0, n))
+    s
+
+fn main()
+    let ok = 1
+
+    // ══ ENCODE-SIDE FIX: the smuggling vector, concretely reproduced ═══════
+
+    // ── A1. [string] at EXACTLY the 16-bit boundary (65535 bytes) must
+    //    still succeed and round-trip byte-exact (no regression from the fix)
+    let s_max = _mkstr(65535)
+    let s_max_enc = cq.cql_string_encode(s_max)
+    if bytes_len(s_max_enc) != 65537
+        ok = 0
+        _fail("A1: 65535-byte string encode should be 65537 bytes, got " + str(bytes_len(s_max_enc)))
+    if pk.unpack_u16_be(s_max_enc, 0) != 65535
+        ok = 0
+        _fail("A1: 65535-byte string length prefix wrong: got " + str(pk.unpack_u16_be(s_max_enc, 0)))
+    let s_max_dec = cq.cql_string_decode(s_max_enc, 0)
+    if s_max_dec[0] != s_max or s_max_dec[1] != 65537
+        ok = 0
+        _fail("A1: 65535-byte string round-trip failed")
+
+    // ── A2. [string] ONE byte past the boundary (65536 = 2^16) — this is the
+    //    exact value that, pre-fix, wrapped `n & 0xFFFF` to 0x0000 and would
+    //    have silently emitted a 0-length-prefixed frame with 65536 bytes of
+    //    smuggled payload after it. Post-fix it must be REJECTED cleanly.
+    let s_over = _mkstr(65536)
+    let s_over_enc = cq.cql_string_encode(s_over)
+    if bytes_len(s_over_enc) != 0
+        ok = 0
+        _fail("A2: 65536-byte string encode must be rejected (bytes_len 0), got " + str(bytes_len(s_over_enc)) + " -- SMUGGLING VECTOR NOT CLOSED")
+    // independent re-derivation of what the OLD buggy code would have produced,
+    // to document the vulnerability was real and is now actually closed (not
+    // just returning a differently-wrong result)
+    let old_buggy_prefix = 65536 & 0xFFFF
+    if old_buggy_prefix != 0
+        ok = 0
+        _fail("A2: sanity check on the masking arithmetic itself is wrong")
+
+    // ── A3. [string map] whose VALUE is oversized must fail the WHOLE map
+    //    (not silently contribute an empty entry while `count` still claims
+    //    2 entries present -- that would desync every entry after it) ──────
+    let m_evil = {"OK_KEY": "fine", "EVIL_KEY": s_over}
+    let m_evil_enc = cq.cql_string_map_encode(m_evil)
+    if bytes_len(m_evil_enc) != 0
+        ok = 0
+        _fail("A3: string map with oversized value must be rejected whole (bytes_len 0), got " + str(bytes_len(m_evil_enc)))
+
+    // ── A4. [string map] at the boundary (all entries <= 65535 bytes) must
+    //    still succeed and round-trip ─────────────────────────────────────
+    let m_ok = {"OK_KEY": "fine", "BIG_KEY": s_max}
+    let m_ok_enc = cq.cql_string_map_encode(m_ok)
+    if bytes_len(m_ok_enc) == 0
+        ok = 0
+        _fail("A4: string map with boundary-sized (legal) value should succeed")
+    let m_ok_dec = cq.cql_string_map_decode(m_ok_enc, 0)
+    if m_ok_dec[0]["BIG_KEY"] != s_max or m_ok_dec[0]["OK_KEY"] != "fine" or m_ok_dec[1] != bytes_len(m_ok_enc)
+        ok = 0
+        _fail("A4: boundary-sized string map round-trip failed")
+
+    // ── A5. cql_startup_frame propagates the failure: an oversized option
+    //    value must yield a fully-empty result (bytes_create(0)), never a
+    //    frame with a header that claims a body that was never written ─────
+    let bad_startup = cq.cql_startup_frame(0, {"CQL_VERSION": s_over})
+    if bytes_len(bad_startup) != 0
+        ok = 0
+        _fail("A5: startup frame with oversized option must be fully rejected, got " + str(bytes_len(bad_startup)) + " bytes")
+    // and the legitimate case still works end-to-end
+    let good_startup = cq.cql_startup_frame(0, {"CQL_VERSION": "3.0.0"})
+    if bytes_len(good_startup) != 31
+        ok = 0
+        _fail("A5: legitimate startup frame regressed, got " + str(bytes_len(good_startup)) + " bytes")
+
+    // ── A6. cql_query_body/frame still work correctly for a large-but-LEGAL
+    //    query (well under the 32-bit long-string bound) -- guards must not
+    //    false-positive on realistic large input ─────────────────────────
+    let big_query = _mkstr(100000)
+    let bq_body = cq.cql_query_body(big_query, cq.cql_consistency_num("ONE"))
+    if bytes_len(bq_body) != 100000 + 4 + 2 + 1
+        ok = 0
+        _fail("A6: large-but-legal query body wrong size: got " + str(bytes_len(bq_body)))
+    let bq_dec = cq.cql_long_string_decode(bq_body, 0)
+    if bq_dec[0] != big_query
+        ok = 0
+        _fail("A6: large-but-legal query text round-trip failed")
+
+    // ── A7. frame-header length field: 0xFFFFFFFF still valid (boundary),
+    //    0x100000000 (one past 32-bit max) must be rejected ────────────────
+    let hdr_ok = cq.cql_frame_header_encode(0x04, 0x00, 0, 0x08, 0xFFFFFFFF)
+    if bytes_len(hdr_ok) != 9
+        ok = 0
+        _fail("A7: frame header length=0xFFFFFFFF (valid boundary) should still succeed")
+    let hdr_bad = cq.cql_frame_header_encode(0x04, 0x00, 0, 0x08, 0x100000000)
+    if bytes_len(hdr_bad) != 0
+        ok = 0
+        _fail("A7: frame header length=0x100000000 (past 32-bit max) must be rejected, got " + str(bytes_len(hdr_bad)) + " bytes")
+    let hdr_neg = cq.cql_frame_header_encode(0x04, 0x00, 0, 0x08, -1)
+    if bytes_len(hdr_neg) != 0
+        ok = 0
+        _fail("A7: frame header negative length must be rejected")
+
+    // ══ DECODE-SIDE VULN CLASSES — re-verify no regression from the fix ═══
+
+    // ── B1. class 1/2 (bounds bypass / over-read): [long string] declares a
+    //    huge 32-bit length far exceeding the actual buffer -- must fail
+    //    bounds-safely, not attempt an oversized slice ───────────────────
+    let ls_huge = bytes_concat(pk.pack_u32_be(3000000000), str_to_bytes("onlyfewbytes"))
+    let ls_huge_dec = cq.cql_long_string_decode(ls_huge, 0)
+    if ls_huge_dec[1] != 0 or ls_huge_dec[0] != ""
+        ok = 0
+        _fail("B1: long-string huge declared length should fail bounds-safely, got pos=" + str(ls_huge_dec[1]))
+
+    // ── B2. class 1 (i64-overflow bounds bypass), specifically at the i32
+    //    boundary for [bytes]: n = 2147483647 (i32 max) with a tiny buffer
+    //    must fail bounds-safely without wraparound/crash ─────────────────
+    let bytes_i32max = bytes_concat(pk.pack_i32_be(2147483647), str_to_bytes("x"))
+    let bytes_i32max_dec = cq.cql_bytes_decode(bytes_i32max, 0)
+    if bytes_i32max_dec[1] != 0 or bytes_len(bytes_i32max_dec[0]) != 0 or bytes_i32max_dec[2] != 0
+        ok = 0
+        _fail("B2: bytes decode with n=i32max and tiny buffer should fail bounds-safely, got pos=" + str(bytes_i32max_dec[1]))
+
+    // ── B3. class 4 (sentinel/absent collision): encode_null() (n=-1) vs a
+    //    genuine empty payload (n=0) must decode to DISTINGUISHABLE results ─
+    let null_enc = cq.cql_bytes_encode_null()
+    let null_dec = cq.cql_bytes_decode(null_enc, 0)
+    let empty_enc = cq.cql_bytes_encode(bytes_create(0))
+    let empty_dec = cq.cql_bytes_decode(empty_enc, 0)
+    if null_dec[2] != 1
+        ok = 0
+        _fail("B3: null bytes should decode is_null=1")
+    if empty_dec[2] != 0
+        ok = 0
+        _fail("B3: genuine empty bytes should decode is_null=0 (not collide with null sentinel)")
+    if _hex(null_enc) == _hex(empty_enc)
+        ok = 0
+        _fail("B3: null and empty-payload wire encodings should NOT be byte-identical")
+
+    // ── B4. class 5 (trailing-content/malformed acceptance): a [string map]
+    //    with a declared count that requires MORE entries than actually
+    //    present in the buffer must fail wholesale, not partially accept ────
+    let partial_map = bytes_concat(pk.pack_u16_be(3), cq.cql_string_encode("only_one_entry_key"))
+    let partial_map2 = bytes_concat(partial_map, cq.cql_string_encode("only_one_entry_val"))
+    let partial_dec = cq.cql_string_map_decode(partial_map2, 0)
+    if partial_dec[1] != 0 or len(keys(partial_dec[0])) != 0
+        ok = 0
+        _fail("B4: string map declaring 3 entries but containing 1 must be rejected wholesale")
+
+    // ── B5. class 3 (deep-nesting recursion DoS): N/A -- this module has NO
+    //    recursive descent (frame/string/map/bytes decoding is all flat,
+    //    bounded-iteration). Documented, not independently testable here. ──
+
+    if ok == 1
+        print("CASSANDRA-AUDIT KAT PASS")
+    else
+        print("CASSANDRA-AUDIT KAT FAIL")

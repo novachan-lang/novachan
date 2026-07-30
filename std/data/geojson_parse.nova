@@ -18,13 +18,69 @@
 //   - Floats parsed with parse_float builtin.
 //   - Single-exit style throughout.
 //   - chr(34)='"', chr(91)='[', chr(93)=']', chr(44)=',', chr(58)=':'
+//   - No recursion anywhere: Point/LineString/Polygon coordinate shapes are
+//     each parsed by a fixed, hardcoded number of nested loop levels (at
+//     most 2: ring -> position -> float), never by a function calling back
+//     into a general-purpose recursive-descent parser. There is therefore
+//     no unbounded-input-depth stack-overflow surface in this module.
+//
+// AUDIT NOTE (text-parser soundness audit, same bug class as ini.nova /
+// commit eed85633): every character-scanning loop in this module previously
+// used char_at(s, i)/i=i+1 with n = len(s) as the loop bound. That produced
+// two compounding bugs, both proven with byte-level repros before fixing:
+//   (a) SILENT DATA CORRUPTION — len()/char_at() index by Unicode CODEPOINT,
+//       but slice() indexes/operates by raw BYTE offset. Every position this
+//       module computed (via the char_at-based scan) was a codepoint index,
+//       yet every one of those positions was fed straight into slice() as if
+//       it were a byte offset. For input containing so much as ONE
+//       multi-byte UTF-8 character anywhere before the "type"/"coordinates"
+//       fields (e.g. an accented "type" value, or any non-ASCII content
+//       elsewhere in the object — nothing "adversarial" is required), every
+//       slice() downstream of that character was misaligned by the
+//       accumulated extra-byte count. Reproduced concretely: {"type":"café",
+//       "coordinates":[1.5,2.5]} — expected type bytes [99,97,102,195,169]
+//       ("café"), actual extracted bytes [99,97,102,195] (truncated
+//       mid-codepoint, confirmed invalid UTF-8 via is_valid_utf8); and the
+//       coordinates, parsed via the same desynced positions, came back as
+//       [0.0, 0.0] instead of [1.5, 2.5] — a geometry parser silently
+//       returning plausible-looking but WRONG coordinates.
+//   (b) PATHOLOGICAL O(n^2) BLOWUP — char_at's cost is O(index) per call (it
+//       rescans the string from byte 0 decoding UTF-8 on every call), so any
+//       `while i < n: char_at(s, i)` loop is O(n^2) overall. An ordinary
+//       Polygon/LineString with a few thousand vertices (common for
+//       real-world administrative-boundary or GPS-track GeoJSON) was
+//       therefore quadratic-time to parse.
+//   Fix: every scan is byte-indexed via str_to_bytes/bytes_get/bytes_len
+//   (bytes_get is O(1) random access — restoring linear-time parsing and,
+//   as a side effect, eliminating the byte/codepoint desync since bytes_get
+//   and slice() now agree on ONE index space). Converting a string to bytes
+//   is itself O(length), so the FIRST fix attempt called str_to_bytes(s)
+//   inside _gp_find_close/_gp_parse_float_array — which are invoked ONCE PER
+//   COORDINATE from a parent loop — silently reintroducing O(n^2) (confirmed
+//   by timing: a 20000-point LineString parse did not return within 15s).
+//   The functions in the per-element hot loops (_gp_find_close,
+//   _gp_parse_float_array, _gp_parse_pos_array, _gp_parse_ring_array,
+//   _gp_read_number) therefore take a pre-converted (bts, n) byte buffer as
+//   parameters instead of re-deriving it from the string on every call; the
+//   conversion happens once per string extent scanned (once for the whole
+//   document, once more per Polygon ring — never once per element), which
+//   keeps total conversion work O(input size) instead of O(input size *
+//   element count). Verified with a 20000-point LineString parsing well
+//   within budget after this change. _gp_index_of/_gp_skip_ws/_gp_extract_str/
+//   _gp_coord_bracket_start are each called only a small constant number of
+//   times per parse (never inside a per-element loop), so they keep their
+//   original string-based signatures.
+//   None of this changed geojson_parse's public signature.
 // ============================================================================
 
-// ── Private: index_of ────────────────────────────────────────────────────────
-
+// ── Private: index_of (byte-offset based) ─────────────────────────────────────
+// Called a small constant number of times per parse (never inside a
+// per-element loop), so converting s/needle to bytes internally is fine.
 fn _gp_index_of(s, needle, pos) -> int
-    let sn = len(s)
-    let nn = len(needle)
+    let sb = str_to_bytes(s)
+    let sn = bytes_len(sb)
+    let nb = str_to_bytes(needle)
+    let nn = bytes_len(nb)
     let result = -1
     let i = pos
     let done = 0
@@ -32,7 +88,7 @@ fn _gp_index_of(s, needle, pos) -> int
         let matched = 1
         let j = 0
         while j < nn and matched == 1
-            if char_at(s, i + j) != char_at(needle, j)
+            if bytes_get(sb, i + j) != bytes_get(nb, j)
                 matched = 0
             j = j + 1
         if matched == 1
@@ -41,59 +97,63 @@ fn _gp_index_of(s, needle, pos) -> int
         i = i + 1
     result
 
-// ── Private: skip whitespace ─────────────────────────────────────────────────
-
+// ── Private: skip whitespace (byte-offset based) ──────────────────────────────
+// Called once per parse (not in a per-element loop).
 fn _gp_skip_ws(s, pos) -> int
-    let n = len(s)
+    let bts = str_to_bytes(s)
+    let n = bytes_len(bts)
     let i = pos
     let done = 0
     while i < n and done == 0
-        let c = char_at(s, i)
-        if c == " " or c == "\t" or c == "\n" or c == "\r"
+        let b = bytes_get(bts, i)
+        if b == 32 or b == 9 or b == 10 or b == 13
             i = i + 1
         else
             done = 1
     i
 
 // ── Private: extract string value after "key": ───────────────────────────────
-// Finds "key":" then reads until next unescaped '"'.
+// Finds "key":" then reads until next unescaped '"'. Called once per parse.
 fn _gp_extract_str(json, key) -> string
     let needle = chr(34) + key + chr(34) + ":" + chr(34)
     let result = ""
     let pos = _gp_index_of(json, needle, 0)
     if pos >= 0
-        let val_start = pos + len(needle)
+        let val_start = pos + bytes_len(str_to_bytes(needle))
         let end_pos = _gp_index_of(json, chr(34), val_start)
         if end_pos >= 0
             result = slice(json, val_start, end_pos)
     result
 
 // ── Private: find coordinates bracket after "coordinates": ───────────────────
-// Returns the index of the '[' that starts the coordinates value.
+// Returns the (byte-offset) index of the '[' that starts the coordinates
+// value. Called once per parse.
 fn _gp_coord_bracket_start(json) -> int
     let needle = chr(34) + "coordinates" + chr(34) + ":"
     let result = -1
     let pos = _gp_index_of(json, needle, 0)
     if pos >= 0
-        let after_colon = pos + len(needle)
+        let after_colon = pos + bytes_len(str_to_bytes(needle))
         let ws_end = _gp_skip_ws(json, after_colon)
-        if ws_end < len(json)
-            if char_at(json, ws_end) == "["
+        let bts = str_to_bytes(json)
+        if ws_end < bytes_len(bts)
+            if bytes_get(bts, ws_end) == 91
                 result = ws_end
     result
 
 // ── Private: parse a number token starting at pos ────────────────────────────
 // Reads digits, '.', '-', 'e', 'E', '+' until a non-number character.
-// Returns a list [float_value_as_string, next_pos].
-fn _gp_read_number(s, pos) -> list
-    let n = len(s)
+// Returns a list [float_value_as_string, next_pos]. Called once per
+// coordinate value from a parent loop — takes the PRE-CONVERTED (bts, n) so
+// it never re-derives bytes from the (potentially whole-document-sized) `s`.
+fn _gp_read_number(s, bts, n, pos) -> list
     let i = pos
     let done = 0
     while i < n and done == 0
-        let c = char_at(s, i)
-        if c == "-" or c == "+" or c == "." or c == "e" or c == "E"
+        let b = bytes_get(bts, i)
+        if b == 45 or b == 43 or b == 46 or b == 101 or b == 69
             i = i + 1
-        else if c >= "0" and c <= "9"
+        else if b >= 48 and b <= 57
             i = i + 1
         else
             done = 1
@@ -103,22 +163,22 @@ fn _gp_read_number(s, pos) -> list
     push(out, i)
     out
 
-// ── Private: parse a flat array of numbers [n, n, ...] ───────────────────────
-// Returns list of floats.
-fn _gp_parse_float_array(s, open_pos) -> list
+// ── Private: parse a flat array of numbers [n, n, ...] ────────────────────────
+// Returns list of floats. Called once per position from a parent loop (when
+// parsing a LineString/Polygon) — takes the pre-converted (bts, n).
+fn _gp_parse_float_array(s, bts, n, open_pos) -> list
     let result = []
-    let n = len(s)
     // open_pos points at '['; start after it
     let i = open_pos + 1
     let done = 0
     while done == 0 and i < n
-        let c = char_at(s, i)
-        if c == "]"
+        let b = bytes_get(bts, i)
+        if b == 93
             done = 1
-        else if c == " " or c == "\t" or c == "\n" or c == "\r" or c == ","
+        else if b == 32 or b == 9 or b == 10 or b == 13 or b == 44
             i = i + 1
-        else if c == "-" or (c >= "0" and c <= "9")
-            let pair = _gp_read_number(s, i)
+        else if b == 45 or (b >= 48 and b <= 57)
+            let pair = _gp_read_number(s, bts, n, i)
             let tok = pair[0]
             let next = pair[1]
             let fv = parse_float(tok)
@@ -128,20 +188,21 @@ fn _gp_parse_float_array(s, open_pos) -> list
             i = i + 1
     result
 
-// ── Private: find matching close bracket ─────────────────────────────────────
+// ── Private: find matching close bracket ──────────────────────────────────────
 // Starting at open_pos (which is '['), scan forward counting nesting.
-// Returns the index of the matching ']'.
-fn _gp_find_close(s, open_pos) -> int
-    let n = len(s)
+// Returns the index of the matching ']'. Called once per element from a
+// parent loop — takes the pre-converted (bts, n); pure byte scan, no slice()
+// needed so it doesn't need the string itself at all.
+fn _gp_find_close(bts, n, open_pos) -> int
     let depth = 0
     let i = open_pos
     let result = -1
     let done = 0
     while i < n and done == 0
-        let c = char_at(s, i)
-        if c == "["
+        let b = bytes_get(bts, i)
+        if b == 91
             depth = depth + 1
-        else if c == "]"
+        else if b == 93
             depth = depth - 1
             if depth == 0
                 result = i
@@ -150,21 +211,21 @@ fn _gp_find_close(s, open_pos) -> int
     result
 
 // ── Private: parse array-of-float-arrays [[n,n],[n,n],...] ───────────────────
-// Returns list of lists of floats.
-fn _gp_parse_pos_array(s, open_pos) -> list
+// Returns list of lists of floats. Reuses the SAME (bts, n) across every
+// point in the loop — this is what keeps LineString/Polygon parsing linear.
+fn _gp_parse_pos_array(s, bts, n, open_pos) -> list
     let result = []
-    let n = len(s)
     let i = open_pos + 1
     let done = 0
     while done == 0 and i < n
-        let c = char_at(s, i)
-        if c == "]"
+        let b = bytes_get(bts, i)
+        if b == 93
             done = 1
-        else if c == "["
+        else if b == 91
             // find close bracket for this sub-array
-            let close = _gp_find_close(s, i)
+            let close = _gp_find_close(bts, n, i)
             if close >= 0
-                let sub = _gp_parse_float_array(s, i)
+                let sub = _gp_parse_float_array(s, bts, n, i)
                 push(result, sub)
                 i = close + 1
             else
@@ -173,23 +234,27 @@ fn _gp_parse_pos_array(s, open_pos) -> list
             i = i + 1
     result
 
-// ── Private: parse array-of-rings [[[n,n],...]] ──────────────────────────────
-// Returns list of lists-of-lists of floats (one level deeper).
-fn _gp_parse_ring_array(s, open_pos) -> list
+// ── Private: parse array-of-rings [[[n,n],...]] ───────────────────────────────
+// Returns list of lists-of-lists of floats (one level deeper). Converts to
+// bytes ONCE PER RING (not once per point within a ring — _gp_parse_pos_array
+// reuses that same ring_bts/ring_n for every point in the ring), so total
+// conversion work stays proportional to total Polygon size, not point count.
+fn _gp_parse_ring_array(s, bts, n, open_pos) -> list
     let result = []
-    let n = len(s)
     let i = open_pos + 1
     let done = 0
     while done == 0 and i < n
-        let c = char_at(s, i)
-        if c == "]"
+        let b = bytes_get(bts, i)
+        if b == 93
             done = 1
-        else if c == "["
+        else if b == 91
             // find close bracket for this ring
-            let close = _gp_find_close(s, i)
+            let close = _gp_find_close(bts, n, i)
             if close >= 0
                 let ring_s = slice(s, i, close + 1)
-                let ring = _gp_parse_pos_array(ring_s, 0)
+                let ring_bts = str_to_bytes(ring_s)
+                let ring_n = bytes_len(ring_bts)
+                let ring = _gp_parse_pos_array(ring_s, ring_bts, ring_n, 0)
                 push(result, ring)
                 i = close + 1
             else
@@ -209,18 +274,22 @@ fn geojson_parse(json) -> dict
     let coord_start = _gp_coord_bracket_start(json)
     let coords = []
     if coord_start >= 0
+        // Convert ONCE here; every per-element helper below reuses this
+        // same (bts, n) instead of re-deriving it from `json` per call.
+        let bts = str_to_bytes(json)
+        let n = bytes_len(bts)
         if geom_type == "Point"
             // coordinates: [lon, lat]
-            coords = _gp_parse_float_array(json, coord_start)
+            coords = _gp_parse_float_array(json, bts, n, coord_start)
         else if geom_type == "LineString"
             // coordinates: [[lon,lat],[lon,lat],...]
-            coords = _gp_parse_pos_array(json, coord_start)
+            coords = _gp_parse_pos_array(json, bts, n, coord_start)
         else if geom_type == "Polygon"
             // coordinates: [[[lon,lat],...]]
-            coords = _gp_parse_ring_array(json, coord_start)
+            coords = _gp_parse_ring_array(json, bts, n, coord_start)
         else
             // Unknown type: try flat float array as best effort
-            coords = _gp_parse_float_array(json, coord_start)
+            coords = _gp_parse_float_array(json, bts, n, coord_start)
 
     result["coordinates"] = coords
     result

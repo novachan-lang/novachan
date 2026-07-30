@@ -74,9 +74,17 @@ fn amqp_longstr(s: string) -> any
 fn amqp_longstr_bytes(b) -> any
     bytes_concat(_amqp_be32(bytes_len(b)), b)
 
-// amqp_shortstr_decode / amqp_longstr_decode: return [string, next_offset].
+// amqp_shortstr_decode / amqp_longstr_decode: return [string, next_offset], or [] if the length
+// prefix (or the payload it declares) does not fit within `b` -- a truncated/malformed buffer must
+// be REJECTED, never silently decoded as a shorter-than-declared or zero-filled string (that would
+// desync every field that follows and hand the caller garbage as if it were valid wire data).
 fn amqp_shortstr_decode(b, off: int) -> any
+    let total = bytes_len(b)
+    if off < 0 or off >= total
+        return []
     let n = bytes_get(b, off)
+    if n > total - off - 1
+        return []
     let s = bytes_to_str(bytes_slice(b, off + 1, off + 1 + n))
     let r = []
     push(r, s)
@@ -84,7 +92,12 @@ fn amqp_shortstr_decode(b, off: int) -> any
     r
 
 fn amqp_longstr_decode(b, off: int) -> any
+    let total = bytes_len(b)
+    if off < 0 or off + 4 > total
+        return []
     let n = _amqp_rd_be32(b, off)
+    if n > total - off - 4
+        return []
     let s = bytes_to_str(bytes_slice(b, off + 4, off + 4 + n))
     let r = []
     push(r, s)
@@ -99,9 +112,17 @@ fn amqp_longstr_decode(b, off: int) -> any
 fn amqp_empty_table() -> any
     _amqp_be32(0)
 
-// amqp_table_skip: given a field-table starting at `off`, return the offset just past it.
+// amqp_table_skip: given a field-table starting at `off`, return the offset just past it, or -1 if
+// the 4-byte length prefix or the byte-length it declares does not fit within `b` (truncated/malformed
+// field-table -- must be rejected, not silently skipped past the end of the buffer).
 fn amqp_table_skip(b, off: int) -> int
-    off + 4 + _amqp_rd_be32(b, off)
+    let total = bytes_len(b)
+    if off < 0 or off + 4 > total
+        return -1
+    let tlen = _amqp_rd_be32(b, off)
+    if tlen > total - off - 4
+        return -1
+    off + 4 + tlen
 
 // ── frame + method-frame construction ────────────────────────────────────────────────────────────
 
@@ -177,15 +198,40 @@ fn amqp_parse_frame(f) -> any
 // ── Connection class (id 10) ─────────────────────────────────────────────────────────────────────
 
 // amqp_connection_start_decode: Connection.Start (server->client) args ->
-// {version_major, version_minor, mechanisms, locales}. server-properties field-table is skipped.
+// {ok, error, version_major, version_minor, mechanisms, locales}. server-properties field-table is
+// skipped. Every offset derived from wire-declared lengths (the field-table byte-length, the two
+// longstr lengths) is bounds-checked before use -- a truncated/malformed Start frame sets ok=false
+// with a diagnostic `error` instead of being silently accepted with zero-filled/truncated fields.
 fn amqp_connection_start_decode(args) -> dict
+    let result = {}
+    result["ok"] = false
+    result["error"] = ""
+    result["version_major"] = 0
+    result["version_minor"] = 0
+    result["mechanisms"] = ""
+    result["locales"] = ""
+    if bytes_len(args) < 2
+        result["error"] = "malformed Connection.Start: truncated before version fields"
+        return result
     let version_major = bytes_get(args, 0)
     let version_minor = bytes_get(args, 1)
     let pos = amqp_table_skip(args, 2)
+    if pos < 0
+        result["error"] = "malformed Connection.Start: truncated or invalid server-properties field-table"
+        return result
     let m = amqp_longstr_decode(args, pos)
+    if len(m) == 0
+        result["error"] = "malformed Connection.Start: truncated or invalid mechanisms longstr"
+        return result
     pos = m[1]
     let l = amqp_longstr_decode(args, pos)
-    let result = {}
+    if len(l) == 0
+        result["error"] = "malformed Connection.Start: truncated or invalid locales longstr"
+        return result
+    if l[1] != bytes_len(args)
+        result["error"] = "malformed Connection.Start: trailing/unexpected bytes after locales (consumed " + str(l[1]) + " of " + str(bytes_len(args)) + ")"
+        return result
+    result["ok"] = true
     result["version_major"] = version_major
     result["version_minor"] = version_minor
     result["mechanisms"] = m[0]
@@ -205,9 +251,22 @@ fn amqp_connection_startok(username: string, password: string) -> any
     args = bytes_concat(args, amqp_longstr_bytes(resp))
     bytes_concat(args, amqp_shortstr("en_US"))
 
-// amqp_connection_tune_decode: Connection.Tune (server->client) args -> {channel_max, frame_max, heartbeat}.
+// amqp_connection_tune_decode: Connection.Tune (server->client) args ->
+// {ok, error, channel_max, frame_max, heartbeat}. All three fields are FIXED-width (u16+u32+u16 = 8
+// bytes total), so a truncated args buffer must be rejected up front -- otherwise the three reads
+// below would each silently fall back to 0 (bounds-checked reads past the end of a buffer return 0)
+// and amqp_open would negotiate bogus tuning parameters instead of detecting the malformed frame.
 fn amqp_connection_tune_decode(args) -> dict
     let result = {}
+    result["ok"] = false
+    result["error"] = ""
+    result["channel_max"] = 0
+    result["frame_max"] = 0
+    result["heartbeat"] = 0
+    if bytes_len(args) != 8
+        result["error"] = "malformed Connection.Tune: expected exactly 8 bytes, got " + str(bytes_len(args))
+        return result
+    result["ok"] = true
     result["channel_max"] = _amqp_rd_be16(args, 0)
     result["frame_max"] = _amqp_rd_be32(args, 2)
     result["heartbeat"] = _amqp_rd_be16(args, 6)
@@ -227,9 +286,14 @@ fn amqp_connection_open(vhost: string) -> any
     bytes_append(args, 0)
 
 // amqp_connection_openok_decode: Connection.OpenOk (server->client) has one reserved shortstr
-// (deprecated known-hosts) and nothing else meaningful; returns 1 if well-formed, 0 otherwise.
+// (deprecated known-hosts) and nothing else meaningful; returns 1 if well-formed, 0 otherwise. The
+// shortstr's declared length must actually fit within `args` -- checking only that a length-prefix
+// byte is present (without validating what it declares) would accept a truncated frame as "well-formed".
 fn amqp_connection_openok_decode(args) -> int
     if bytes_len(args) < 1
+        return 0
+    let n = bytes_get(args, 0)
+    if n != bytes_len(args) - 1
         return 0
     1
 
@@ -240,9 +304,14 @@ fn amqp_channel_open() -> any
     amqp_shortstr("")
 
 // amqp_channel_openok_decode: Channel.OpenOk (server->client) has one reserved longstr (channel-id);
-// returns 1 if well-formed, 0 otherwise.
+// returns 1 if well-formed, 0 otherwise. The longstr's declared length must actually fit within
+// `args` -- checking only that the 4-byte length prefix is present would accept a frame whose
+// declared payload is longer than what's actually there.
 fn amqp_channel_openok_decode(args) -> int
     if bytes_len(args) < 4
+        return 0
+    let n = _amqp_rd_be32(args, 0)
+    if n != bytes_len(args) - 4
         return 0
     1
 
@@ -283,18 +352,44 @@ fn amqp_publish_frames(channel: int, exchange: string, routing_key: string, body
     bytes_concat(bytes_concat(f1, f2), f3)
 
 // amqp_basic_deliver_decode: Basic.Deliver (server->client) args ->
-// {consumer_tag, delivery_tag, redelivered, exchange, routing_key}.
+// {ok, error, consumer_tag, delivery_tag, redelivered, exchange, routing_key}. `delivery_tag` is what
+// a consumer echoes back on ack/nack -- silently returning a truncated-to-zero or otherwise wrong
+// value for a malformed frame (rather than rejecting it) would make the caller ack/nack the WRONG
+// message. Every sub-field decode is checked for failure before its offset is used to read the next.
 fn amqp_basic_deliver_decode(args) -> dict
+    let result = {}
+    result["ok"] = false
+    result["error"] = ""
+    result["consumer_tag"] = ""
+    result["delivery_tag"] = 0
+    result["redelivered"] = 0
+    result["exchange"] = ""
+    result["routing_key"] = ""
     let ct = amqp_shortstr_decode(args, 0)
+    if len(ct) == 0
+        result["error"] = "malformed Basic.Deliver: truncated or invalid consumer-tag shortstr"
+        return result
     let pos = ct[1]
+    if bytes_len(args) < pos + 9
+        result["error"] = "malformed Basic.Deliver: truncated before delivery-tag/redelivered"
+        return result
     let delivery_tag = _amqp_rd_be64(args, pos)
     pos = pos + 8
     let redelivered = bytes_get(args, pos) & 0x01
     pos = pos + 1
     let ex = amqp_shortstr_decode(args, pos)
+    if len(ex) == 0
+        result["error"] = "malformed Basic.Deliver: truncated or invalid exchange shortstr"
+        return result
     pos = ex[1]
     let rk = amqp_shortstr_decode(args, pos)
-    let result = {}
+    if len(rk) == 0
+        result["error"] = "malformed Basic.Deliver: truncated or invalid routing-key shortstr"
+        return result
+    if rk[1] != bytes_len(args)
+        result["error"] = "malformed Basic.Deliver: trailing/unexpected bytes after routing-key (consumed " + str(rk[1]) + " of " + str(bytes_len(args)) + ")"
+        return result
+    result["ok"] = true
     result["consumer_tag"] = ct[0]
     result["delivery_tag"] = delivery_tag
     result["redelivered"] = redelivered
@@ -355,6 +450,9 @@ fn amqp_open(host: string, port: int, vhost: string, username: string, password:
         tcp_close(sock)
         return err("amqp: expected Connection.Tune")
     let tune = amqp_connection_tune_decode(pf[4])
+    if tune["ok"] == false
+        tcp_close(sock)
+        return err("amqp: " + tune["error"])
     tcp_send_bytes(sock, amqp_method_frame(0, 10, 31, amqp_connection_tuneok(tune["channel_max"], tune["frame_max"], 0)))
     tcp_send_bytes(sock, amqp_method_frame(0, 10, 40, amqp_connection_open(vhost)))
     rd = _amqp_read_frame(sock, buf)

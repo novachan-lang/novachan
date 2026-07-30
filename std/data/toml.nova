@@ -61,6 +61,39 @@
 //     construct above) rather than rejected. This is a pre-existing,
 //     deliberate design choice, not something introduced by the audit.
 //
+// PERF AUDIT (O(n^2) DoS fix — see std/data/ini.nova for the same class of
+// bug and the proven fix): every scanning loop in this module previously
+// advanced a cursor with char_at(s, p)/ord(char_at(s, p)) and built output
+// strings via `buf = buf + char_at(s, p)`. char_at compiles to
+// nova_rt_char_at, which does strlen(s) plus a full UTF-8 re-decode from
+// byte 0 on EVERY call — so char_at(s, p) is O(p), and any
+// `while p < n: char_at(s, p); p = p + 1` loop is O(n^2) overall; a flat
+// 2000-line TOML document measured ~1.7s under the old code. Fixed by
+// computing `let bs = str_to_bytes(text)` / `let n = bytes_len(bs)` ONCE in
+// toml_parse and threading `bs` (for O(1) `bytes_get(bs, p)` scanning)
+// through every helper alongside the shared `st["pos"]` cursor, instead of
+// re-deriving a byte view per call. Output strings are now built either via
+// slice(s, start, end) (bare keys/tokens/literal-string bodies — a plain,
+// untransformed byte range, so a single O(len) copy) or via
+// buffer()/buf_append_char/buf_to_str (basic-string bodies, which need
+// per-byte escape processing) — both O(1)-amortized per byte, never
+// O(index) per byte. `s` (the original string) is still threaded alongside
+// `bs` wherever slice() is needed, since slice() operates on the original
+// string and its offsets are byte offsets — the SAME offsets `bs`/`bytes_get`
+// use, so no separate index space is introduced.
+//   As a side effect this also closes the same latent UTF-8 bug class
+// documented in std/data/ini.nova's audit note: char_at indexes by
+// Unicode CODEPOINT while len()/slice() index by raw BYTE offset, and the
+// pre-fix code used `len(text)` (a byte count) as the bound for a
+// char_at-based (codepoint-indexed) cursor — for input containing
+// multi-byte UTF-8, that mismatch could silently misplace scan boundaries.
+// The byte-based rewrite uses ONE consistent index space (bytes) throughout,
+// matching slice()'s semantics exactly, eliminating that class of bug here
+// too. Multi-byte UTF-8 content in string bodies is now copied byte-by-byte
+// (one loop iteration = one raw byte, via bytes_get/buf_append_char), which
+// reconstructs multi-byte sequences byte-for-byte since every byte in the
+// scan range is visited and copied in order.
+//
 // NOVA TYPING NOTE: `type_of(true) == "int"` (documented language gotcha —
 // booleans and integers share scalar representation), but `x == true` /
 // `x == false` comparisons on a bool-boxed value still evaluate correctly;
@@ -88,7 +121,7 @@
 // ============================================================================
 
 // _TM_MAX_DEPTH: safety cap on nested-array recursion depth (_tm_parse_value
-// <-> _tm_parse_array are mutually recursive on '[' — unbounded input like
+// <-> _tm_parse_array are mutually recursive on '[') — unbounded input like
 // "x = [[[[[...20000 times]]]]]" would otherwise recurse 1 native stack
 // frame pair per nesting level with no limit -> stack overflow. Past this
 // cap, _tm_skip_balanced (iterative, no recursion) takes over so arbitrarily
@@ -147,31 +180,35 @@ fn _tm_is_bare_key_char(o)
     return result
 
 // ── Skipping: whitespace, newlines, comments ─────────────────────────────────
+// These are pure cursor-advance scans (no output text produced), so they
+// only need the byte view `bs`/`n`, not the original string `s`.
 
 // _tm_skip_h: advance st["pos"] past horizontal whitespace only (does not
 // cross a newline — used mid-line, where a value stops at end of line).
-fn _tm_skip_h(s, n, st)
+// Byte-indexed (bytes_get is O(1) per call, unlike char_at — see PERF AUDIT
+// at top of file), so this is O(run length), never O(n) per call.
+fn _tm_skip_h(bs, n, st)
     let go = 1
     while go == 1
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            if _tm_is_hspace(ord(char_at(s, p))) == 1
+            if _tm_is_hspace(bytes_get(bs, p)) == 1
                 st["pos"] = p + 1
             else
                 go = 0
 
 // _tm_skip_to_eol: advance st["pos"] to just before the next '\n' (or EOF).
 // Used to discard a '#' comment; does not consume the newline itself.
-fn _tm_skip_to_eol(s, n, st)
+fn _tm_skip_to_eol(bs, n, st)
     let go = 1
     while go == 1
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            if ord(char_at(s, p)) == 10
+            if bytes_get(bs, p) == 10
                 go = 0
             else
                 st["pos"] = p + 1
@@ -179,14 +216,14 @@ fn _tm_skip_to_eol(s, n, st)
 // _tm_skip_ws_nl_comments: advance st["pos"] past any mix of whitespace,
 // newlines, and '#' line comments. Used between top-level statements and
 // (since arrays may span multiple lines) between array elements.
-fn _tm_skip_ws_nl_comments(s, n, st)
+fn _tm_skip_ws_nl_comments(bs, n, st)
     let go = 1
     while go == 1
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            let o = ord(char_at(s, p))
+            let o = bytes_get(bs, p)
             if _tm_is_hspace(o) == 1
                 st["pos"] = p + 1
             else
@@ -194,7 +231,7 @@ fn _tm_skip_ws_nl_comments(s, n, st)
                     st["pos"] = p + 1
                 else
                     if o == 35
-                        _tm_skip_to_eol(s, n, st)
+                        _tm_skip_to_eol(bs, n, st)
                     else
                         go = 0
 
@@ -203,15 +240,22 @@ fn _tm_skip_ws_nl_comments(s, n, st)
 // _tm_parse_basic_string: parse a double-quoted string body (pos must be just
 // AFTER the opening '"'). Handles \n \t \" \\ \r; any other escaped char is
 // kept literal (backslash dropped). Stops at the closing '"' or EOF.
-fn _tm_parse_basic_string(s, n, st)
-    let buf = ""
+// Byte-indexed (see PERF AUDIT at top of file): escape processing transforms
+// bytes (e.g. \n -> a literal newline byte), so the result can't be a plain
+// slice() of the input — it is accumulated in a buffer() and each byte
+// appended via buf_append_char (O(1)-amortized), never `buf = buf + c`
+// string concatenation (O(n^2) — see ini.nova's audit note for that class of
+// bug). Multi-byte UTF-8 content is copied through byte-by-byte, which
+// reconstructs it byte-for-byte since every byte in range is visited in order.
+fn _tm_parse_basic_string(bs, n, st)
+    let buf = buffer()
     let go = 1
     while go == 1
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            let o = ord(char_at(s, p))
+            let o = bytes_get(bs, p)
             if o == 34
                 st["pos"] = p + 1
                 go = 0
@@ -220,79 +264,87 @@ fn _tm_parse_basic_string(s, n, st)
                     st["pos"] = p + 1
                     let q = st["pos"]
                     if q < n
-                        let ec = char_at(s, q)
-                        let eo = ord(ec)
+                        let eo = bytes_get(bs, q)
                         st["pos"] = q + 1
                         if eo == 110
-                            buf = buf + chr(10)
+                            buf_append_char(buf, 10)
                         else
                             if eo == 116
-                                buf = buf + chr(9)
+                                buf_append_char(buf, 9)
                             else
                                 if eo == 34
-                                    buf = buf + chr(34)
+                                    buf_append_char(buf, 34)
                                 else
                                     if eo == 92
-                                        buf = buf + chr(92)
+                                        buf_append_char(buf, 92)
                                     else
                                         if eo == 114
-                                            buf = buf + chr(13)
+                                            buf_append_char(buf, 13)
                                         else
-                                            buf = buf + ec
+                                            buf_append_char(buf, eo)
                 else
-                    buf = buf + char_at(s, p)
+                    buf_append_char(buf, o)
                     st["pos"] = p + 1
-    return buf
+    return buf_to_str(buf)
 
 // _tm_parse_literal_string: parse a single-quoted string body (pos must be
 // just AFTER the opening "'"). No escape processing (TOML literal-string
-// semantics). Stops at the closing "'" or EOF.
-fn _tm_parse_literal_string(s, n, st)
-    let buf = ""
+// semantics). Stops at the closing "'" or EOF. Byte-indexed (see PERF AUDIT
+// at top of file): since no escape processing happens, the body is an exact
+// untransformed byte range of the original string, so it is captured with a
+// single slice(s, start, end) call (O(len), one copy) rather than
+// accumulating char-by-char. `s` is threaded alongside `bs` for this reason.
+fn _tm_parse_literal_string(s, bs, n, st)
+    let start = st["pos"]
+    let stop_pos = start
     let go = 1
     while go == 1
         let p = st["pos"]
         if p >= n
+            stop_pos = p
             go = 0
         else
-            if ord(char_at(s, p)) == 39
+            if bytes_get(bs, p) == 39
+                stop_pos = p
                 st["pos"] = p + 1
                 go = 0
             else
-                buf = buf + char_at(s, p)
                 st["pos"] = p + 1
-    return buf
+    return slice(s, start, stop_pos)
 
 // ── Bare tokens / scalar classification ──────────────────────────────────────
 
-// _tm_read_bare_key: read a run of bare-key characters.
-fn _tm_read_bare_key(s, n, st)
-    let buf = ""
+// _tm_read_bare_key: read a run of bare-key characters. Byte-indexed (see
+// PERF AUDIT at top of file); the run is an untransformed byte range, so it
+// is captured with a single slice(s, start, end) call.
+fn _tm_read_bare_key(s, bs, n, st)
+    let start = st["pos"]
     let go = 1
     while go == 1
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            let o = ord(char_at(s, p))
+            let o = bytes_get(bs, p)
             if _tm_is_bare_key_char(o) == 1
-                buf = buf + char_at(s, p)
                 st["pos"] = p + 1
             else
                 go = 0
-    return buf
+    return slice(s, start, st["pos"])
 
 // _tm_read_bare_token: read a value-position bareword — stops at horizontal
 // whitespace, newline, ',', ']', '}', '#', or EOF. Used for numbers/booleans.
-fn _tm_read_bare_token(s, n, st)
-    let buf = ""
+// Byte-indexed (see PERF AUDIT at top of file); the run is an untransformed
+// byte range, so it is captured with a single slice(s, start, end) call.
+fn _tm_read_bare_token(s, bs, n, st)
+    let start = st["pos"]
     let go = 1
     while go == 1
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            let o = ord(char_at(s, p))
+            let o = bytes_get(bs, p)
             let stop = 0
             if _tm_is_hspace(o) == 1
                 stop = 1
@@ -314,59 +366,68 @@ fn _tm_read_bare_token(s, n, st)
             if stop == 1
                 go = 0
             else
-                buf = buf + char_at(s, p)
                 st["pos"] = p + 1
-    return buf
+    return slice(s, start, st["pos"])
 
 // _tm_strip_underscores: remove '_' digit-group separators from a token.
+// `tok` is an already-extracted (bounded) token, not the whole document, but
+// is still scanned byte-indexed (str_to_bytes/bytes_get + buffer()
+// accumulation) rather than char_at/string-concat for the same reason as
+// every other scan in this file (see PERF AUDIT at top of file) — a
+// pathologically long non-numeric bareword must not become O(len^2).
 fn _tm_strip_underscores(tok)
-    let out = ""
-    let n = len(tok)
+    let tbs = str_to_bytes(tok)
+    let tn = bytes_len(tbs)
+    let out = buffer()
     let i = 0
-    while i < n
-        let c = char_at(tok, i)
-        if c != "_"
-            out = out + c
+    while i < tn
+        let b = bytes_get(tbs, i)
+        if b != 95
+            buf_append_char(out, b)
         i = i + 1
-    return out
+    return buf_to_str(out)
 
 // _tm_is_numeric: 1 if cleaned (underscore-stripped) token is a plain decimal
 // integer or float literal: optional leading sign, digits, optional single
 // '.', optional single exponent ('e'/'E', optional sign, digits).
+// Byte-indexed for the same reason as _tm_strip_underscores above.
 fn _tm_is_numeric(tok)
-    let n = len(tok)
+    let tbs = str_to_bytes(tok)
+    let tn = bytes_len(tbs)
     let result = 0
-    if n > 0
+    if tn > 0
         let i = 0
-        if char_at(tok, 0) == "-"
+        let b0 = bytes_get(tbs, 0)
+        if b0 == 45
             i = 1
         else
-            if char_at(tok, 0) == "+"
+            if b0 == 43
                 i = 1
-        if i < n
+        if i < tn
             let digits_seen = 0
             let dot_seen = 0
             let exp_seen = 0
             let ok = 1
-            while i < n
-                let c = char_at(tok, i)
-                if _tm_is_digit(ord(c)) == 1
+            while i < tn
+                let b = bytes_get(tbs, i)
+                if _tm_is_digit(b) == 1
                     digits_seen = 1
                     i = i + 1
                 else
-                    if c == "." and dot_seen == 0 and exp_seen == 0
+                    if b == 46 and dot_seen == 0 and exp_seen == 0
                         dot_seen = 1
                         i = i + 1
                     else
-                        if (c == "e" or c == "E") and exp_seen == 0 and digits_seen == 1
+                        if (b == 101 or b == 69) and exp_seen == 0 and digits_seen == 1
                             exp_seen = 1
                             i = i + 1
-                            if i < n
-                                if char_at(tok, i) == "+" or char_at(tok, i) == "-"
+                            if i < tn
+                                let bn = bytes_get(tbs, i)
+                                if bn == 43 or bn == 45
                                     i = i + 1
                         else
                             ok = 0
-                            i = n
+                            i = tn
             if ok == 1 and digits_seen == 1
                 result = 1
     return result
@@ -400,8 +461,10 @@ fn _tm_classify_scalar(tok)
 // so a pathologically deep tail of "[[[[...]]]]" past the cap is skipped in
 // O(remaining length) with O(1) added stack, instead of recursing further.
 // Correctly steps over quoted string bodies so a ']' or '[' inside a string
-// literal can't desync the bracket count, and over '#' comments.
-fn _tm_skip_balanced(s, n, st)
+// literal can't desync the bracket count, and over '#' comments. Byte-
+// indexed (see PERF AUDIT at top of file); `s` is threaded through only
+// because it calls _tm_parse_literal_string, which needs it for slice().
+fn _tm_skip_balanced(s, bs, n, st)
     let level = 1
     let go = 1
     while go == 1
@@ -409,14 +472,14 @@ fn _tm_skip_balanced(s, n, st)
         if p >= n
             go = 0
         else
-            let o = ord(char_at(s, p))
+            let o = bytes_get(bs, p)
             if o == 34
                 st["pos"] = p + 1
-                _tm_parse_basic_string(s, n, st)
+                _tm_parse_basic_string(bs, n, st)
             else
                 if o == 39
                     st["pos"] = p + 1
-                    _tm_parse_literal_string(s, n, st)
+                    _tm_parse_literal_string(s, bs, n, st)
                 else
                     if o == 91
                         level = level + 1
@@ -429,7 +492,7 @@ fn _tm_skip_balanced(s, n, st)
                                 go = 0
                         else
                             if o == 35
-                                _tm_skip_to_eol(s, n, st)
+                                _tm_skip_to_eol(bs, n, st)
                             else
                                 st["pos"] = p + 1
 
@@ -438,16 +501,16 @@ fn _tm_skip_balanced(s, n, st)
 // trailing comma inside the brackets (beyond the single-line array form the
 // task spec calls for — cheap and low-risk to support). `depth` is the
 // current array-nesting level (see _tm_parse_value / _TM_MAX_DEPTH).
-fn _tm_parse_array(s, n, st, depth)
+fn _tm_parse_array(s, bs, n, st, depth)
     let result = []
     let go = 1
     while go == 1
-        _tm_skip_ws_nl_comments(s, n, st)
+        _tm_skip_ws_nl_comments(bs, n, st)
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            let o = ord(char_at(s, p))
+            let o = bytes_get(bs, p)
             if o == 93
                 st["pos"] = p + 1
                 go = 0
@@ -455,7 +518,7 @@ fn _tm_parse_array(s, n, st, depth)
                 if o == 44
                     st["pos"] = p + 1
                 else
-                    let v = _tm_parse_value(s, n, st, depth)
+                    let v = _tm_parse_value(s, bs, n, st, depth)
                     push(result, v)
                     // Forward-progress guard: a value-position byte this
                     // parser doesn't recognise as starting any value (e.g.
@@ -472,29 +535,29 @@ fn _tm_parse_array(s, n, st, depth)
 // _tm_parse_value: parse a single TOML value at the current cursor position.
 // Dispatches on the first non-horizontal-whitespace character. `depth` is
 // the current array-nesting level (0 at top level); see _TM_MAX_DEPTH.
-fn _tm_parse_value(s, n, st, depth)
-    _tm_skip_h(s, n, st)
+fn _tm_parse_value(s, bs, n, st, depth)
+    _tm_skip_h(bs, n, st)
     let result = null
     let p = st["pos"]
     if p < n
-        let o = ord(char_at(s, p))
+        let o = bytes_get(bs, p)
         if o == 34
             st["pos"] = p + 1
-            result = _tm_parse_basic_string(s, n, st)
+            result = _tm_parse_basic_string(bs, n, st)
         else
             if o == 39
                 st["pos"] = p + 1
-                result = _tm_parse_literal_string(s, n, st)
+                result = _tm_parse_literal_string(s, bs, n, st)
             else
                 if o == 91
                     st["pos"] = p + 1
                     if depth >= _TM_MAX_DEPTH
-                        _tm_skip_balanced(s, n, st)
+                        _tm_skip_balanced(s, bs, n, st)
                         result = []
                     else
-                        result = _tm_parse_array(s, n, st, depth + 1)
+                        result = _tm_parse_array(s, bs, n, st, depth + 1)
                 else
-                    let tok = _tm_read_bare_token(s, n, st)
+                    let tok = _tm_read_bare_token(s, bs, n, st)
                     result = _tm_classify_scalar(tok)
     return result
 
@@ -503,28 +566,28 @@ fn _tm_parse_value(s, n, st, depth)
 // _tm_read_key_path: read a dotted key path ("a.b.c") into a list of segment
 // strings. A segment may be a bare key, a double-quoted string, or a
 // single-quoted (literal) string.
-fn _tm_read_key_path(s, n, st)
+fn _tm_read_key_path(s, bs, n, st)
     let segs = []
     let go = 1
     while go == 1
-        _tm_skip_h(s, n, st)
+        _tm_skip_h(bs, n, st)
         let p = st["pos"]
         let seg = ""
         if p < n
-            let o = ord(char_at(s, p))
+            let o = bytes_get(bs, p)
             if o == 34
                 st["pos"] = p + 1
-                seg = _tm_parse_basic_string(s, n, st)
+                seg = _tm_parse_basic_string(bs, n, st)
             else
                 if o == 39
                     st["pos"] = p + 1
-                    seg = _tm_parse_literal_string(s, n, st)
+                    seg = _tm_parse_literal_string(s, bs, n, st)
                 else
-                    seg = _tm_read_bare_key(s, n, st)
+                    seg = _tm_read_bare_key(s, bs, n, st)
         push(segs, seg)
-        _tm_skip_h(s, n, st)
+        _tm_skip_h(bs, n, st)
         let q = st["pos"]
-        if q < n and ord(char_at(s, q)) == 46
+        if q < n and bytes_get(bs, q) == 46
             st["pos"] = q + 1
         else
             go = 0
@@ -605,41 +668,46 @@ fn _tm_open_table(root, segs, is_array)
 // toml_parse: parse a whole TOML document into a nested dict. Top-level keys
 // (before any `[table]` header) go directly into the result; keys after a
 // `[table]`/`[[array]]` header go into that (possibly nested) table.
+// Byte-indexed: `bs`/`n` are computed ONCE here (str_to_bytes/bytes_len) and
+// threaded through every helper for O(1) cursor reads, instead of every
+// helper re-deriving a byte view (or worse, using char_at) per call — see
+// PERF AUDIT at top of file.
 fn toml_parse(text: string) -> dict
     let result = {}
     let current = result
-    let n = len(text)
+    let bs = str_to_bytes(text)
+    let n = bytes_len(bs)
     let st = {}
     st["pos"] = 0
     let go = 1
     while go == 1
-        _tm_skip_ws_nl_comments(text, n, st)
+        _tm_skip_ws_nl_comments(bs, n, st)
         let p = st["pos"]
         if p >= n
             go = 0
         else
-            let o = ord(char_at(text, p))
+            let o = bytes_get(bs, p)
             if o == 91
                 st["pos"] = p + 1
                 let is_array = 0
-                if st["pos"] < n and ord(char_at(text, st["pos"])) == 91
+                if st["pos"] < n and bytes_get(bs, st["pos"]) == 91
                     is_array = 1
                     st["pos"] = st["pos"] + 1
-                let segs = _tm_read_key_path(text, n, st)
-                _tm_skip_h(text, n, st)
-                if st["pos"] < n and ord(char_at(text, st["pos"])) == 93
+                let segs = _tm_read_key_path(text, bs, n, st)
+                _tm_skip_h(bs, n, st)
+                if st["pos"] < n and bytes_get(bs, st["pos"]) == 93
                     st["pos"] = st["pos"] + 1
                 if is_array == 1
-                    if st["pos"] < n and ord(char_at(text, st["pos"])) == 93
+                    if st["pos"] < n and bytes_get(bs, st["pos"]) == 93
                         st["pos"] = st["pos"] + 1
                 current = _tm_open_table(result, segs, is_array)
             else
-                let segs2 = _tm_read_key_path(text, n, st)
-                _tm_skip_h(text, n, st)
-                if st["pos"] < n and ord(char_at(text, st["pos"])) == 61
+                let segs2 = _tm_read_key_path(text, bs, n, st)
+                _tm_skip_h(bs, n, st)
+                if st["pos"] < n and bytes_get(bs, st["pos"]) == 61
                     st["pos"] = st["pos"] + 1
-                _tm_skip_h(text, n, st)
-                let val = _tm_parse_value(text, n, st, 0)
+                _tm_skip_h(bs, n, st)
+                let val = _tm_parse_value(text, bs, n, st, 0)
                 _tm_assign(current, segs2, val)
             // Forward-progress guard: a stray delimiter where a key/header
             // was expected (e.g. a bare ',' / ']' / '}' at statement
@@ -659,7 +727,7 @@ fn toml_parse(text: string) -> dict
 fn toml_get(config: dict, path: string) -> any
     let segs = split(path, ".")
     let node = config
-    let result = ""
+    let result: any = ""
     let ok = 1
     for seg in segs
         if ok == 1

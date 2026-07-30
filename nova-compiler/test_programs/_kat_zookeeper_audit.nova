@@ -1,0 +1,139 @@
+// _kat_zookeeper_audit.nova -- soundness audit KAT for forge/forge_zookeeper.nova.
+//
+// Hunted the 5 established vuln classes against every decoder in the module:
+//   1. i64-overflow bounds bypass (`pos+len>n` wrap)   -- all bounds checks here are subtraction-based
+//      (avail = bytes_len(b) - start; take = min(n, avail)), never addition-based, so there is nothing
+//      to wrap. Re-confirmed, not re-proven bit-for-bit here (zk_adversarial_probe already pins it).
+//   2. unchecked length -> over-read / resource exhaustion -- zk_rd_buffer/zk_rd_ustring/zk_rd_acl_vector
+//      all clamp to bytes actually available (already fixed pre-session, re-confirmed below). THE REAL
+//      FINDING: zk_recv_frame's outer 4-byte frame-length prefix had NO upper bound at all -- a
+//      malicious/misbehaving ZK peer could claim a frame up to ~2^31-1 bytes and force the client to
+//      accumulate unbounded memory (or hang) waiting for bytes that may trickle slowly or never arrive.
+//      FIXED: added _zk_max_frame_size() (8 MiB) cap, checked BEFORE the body read begins. Proven live
+//      below over a real TCP loopback connection.
+//   3. deep-nesting recursion DoS -- no recursive-descent parsing in this module (every decoder is a flat
+//      while-loop over a vector count, already bounds-clamped). Not applicable, nothing to fix.
+//   4. sentinel/absent-value collision -- zk_rd_buffer's null sentinel is exactly -1, matching zk_wr_buffer's
+//      write side 1:1; no other negative value is treated as null (n<0 && n!=-1 degrades to empty, not
+//      null) so there is no ambiguity between "absent" and a real short/zero-length value.
+//   5. trailing-content/malformed acceptance -- not applicable to a length-prefixed field codec (no
+//      terminator to spoof); frame-level malformed input (negative/oversized length) degrades in-band,
+//      never silently accepted as more data than actually arrived.
+import forge_zookeeper
+
+fn assert_true(cond: int, label: string)
+    if cond == 0
+        print("FAIL " + label)
+        exit(1)
+
+fn assert_eq_int(got: int, want: int, label: string)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+
+// ── A. regression-pin the already-fixed inner-field clamps (classes 1/2/4) ─────────────────────────────
+fn check_inner_clamps()
+    // zk_rd_buffer: declared length far exceeds the 6-byte buffer that actually backs it -> clamps to
+    // what's really there instead of over-reading or manufacturing phantom bytes.
+    let big_len = zk_wr_int(9999999)
+    let backing = bytes_append(bytes_append(big_len, 1), 2)  // only 2 real payload bytes follow the length
+    let r = zk_rd_buffer(backing, 0)
+    assert_eq_int(bytes_len(r[0]), 2, "zk_rd_buffer clamps declared-9999999 to actual 2 backing bytes")
+    assert_eq_int(r[1], bytes_len(backing), "zk_rd_buffer next_off stops at real buffer end, not declared length")
+
+    // zk_rd_buffer: -1 is the ONLY null sentinel; -2 is corrupt-but-not-null -> empty buffer, not null.
+    let null_r = zk_rd_buffer(zk_wr_int(0 - 1), 0)
+    let is_null = 0
+    if null_r[0] == null
+        is_null = 1
+    assert_true(is_null, "zk_rd_buffer(-1) decodes to null (sentinel)")
+    let neg2_r = zk_rd_buffer(zk_wr_int(0 - 2), 0)
+    let neg2_is_null = 0
+    if neg2_r[0] == null
+        neg2_is_null = 1
+    assert_true(1 - neg2_is_null, "zk_rd_buffer(-2) is NOT null -- no sentinel collision")
+    assert_eq_int(bytes_len(neg2_r[0]), 0, "zk_rd_buffer(-2) decodes to empty bytes, not a phantom value")
+
+    // zk_rd_ustring: same over-claim clamp.
+    let ubacking = bytes_append(zk_wr_int(500000), 65)  // declares 500000, only 1 real byte ('A') follows
+    let ur = zk_rd_ustring(ubacking, 0)
+    assert_eq_int(len(ur[0]), 1, "zk_rd_ustring clamps declared-500000 to actual 1 backing byte")
+
+    // zk_rd_acl_vector: count field wildly overstates entries actually backed by the buffer.
+    let acl_backing = zk_wr_int(1000000)   // ONLY the 4-byte count; zero ACL bytes follow
+    let ar = zk_rd_acl_vector(acl_backing, 0)
+    assert_eq_int(len(ar[0]), 0, "zk_rd_acl_vector(count=1000000, 0 backing bytes) manufactures 0 phantom entries")
+    assert_eq_int(ar[1], 4, "zk_rd_acl_vector next_off does not run past the real buffer")
+
+    print("OK: inner-field length decoders (buffer/ustring/acl-vector) all clamp to real backing bytes")
+
+// _zk_max_frame_size() is a private (`_`-prefixed) module symbol, not visible outside forge_zookeeper.nova
+// (same convention as forge_nsq's `_nsq_max_frame_size`) -- so this KAT pins the documented cap value here
+// (matches the module's own doc comment: "8388608" / 8 MiB) and drives zk_recv_frame with it directly.
+fn zk_expected_max_frame() -> int
+    8388608
+
+// ── B. THE LIVE FINDING -- zk_recv_frame must reject an over-cap length prefix WITHOUT waiting to
+//    accumulate the claimed size. The evil peer sends ONLY the 4-byte length prefix (cap+1), then blocks
+//    without sending another byte or closing -- if the client tried to honor that length, it would hang
+//    waiting for data that never arrives (a real memory-exhaustion/hang DoS). The client's zk_recv_frame
+//    call must return [null, ...] the moment it decodes the oversized length, before ever touching the
+//    body-length receive loop. Phase 2 re-uses the same listener for an ordinary small frame to prove the
+//    cap didn't collaterally break real traffic.
+fn zk_evil_server(srv: int, resume: any, done: any)
+    let conn1 = tcp_accept(srv)
+    let over = zk_wr_int(zk_expected_max_frame() + 1)   // 4 bytes total on the wire -- the "attack"
+    tcp_send_bytes(conn1, over)
+    recv(resume)              // proves the client already answered before we send anything else
+    tcp_close(conn1)
+
+    let conn2 = tcp_accept(srv)
+    let hdr = zk_request_header(42, zk_op_ping())
+    let framed = zk_frame_request(hdr, bytes(0))
+    tcp_send_bytes(conn2, framed)
+    tcp_close(conn2)
+    send(done, 1)
+
+fn check_recv_frame_cap()
+    let port = 19273
+    let srv = tcp_listen(port)
+    let srv_ok = 0
+    if srv >= 0
+        srv_ok = 1
+    assert_true(srv_ok, "tcp_listen succeeded")
+    let resume = channel()
+    let done = channel()
+    spawn zk_evil_server(srv, resume, done)
+
+    // Phase 1: oversized length prefix, no body bytes ever sent.
+    let c1 = tcp_connect("127.0.0.1", port)
+    let buf1 = bytes(0)
+    let r1 = zk_recv_frame(c1, buf1)
+    let r1_is_null = 0
+    if r1[0] == null
+        r1_is_null = 1
+    assert_true(r1_is_null, "over-cap length prefix rejected (returned null payload), not blocked")
+    print("OK: zk_recv_frame rejected an over-cap (" + str(zk_expected_max_frame() + 1) + " byte) length prefix without waiting for the body")
+    send(resume, 1)
+    tcp_close(c1)
+
+    // Phase 2: ordinary small frame still round-trips through the (now capped) reader.
+    let c2 = tcp_connect("127.0.0.1", port)
+    let buf2 = bytes(0)
+    let r2 = zk_recv_frame(c2, buf2)
+    let r2_is_null = 0
+    if r2[0] == null
+        r2_is_null = 1
+    assert_true(1 - r2_is_null, "ordinary small frame still parses after the cap fix")
+    let parsed = zk_parse_request_header(r2[0], 0)
+    assert_eq_int(parsed[0], 42, "round-tripped RequestHeader.xid")
+    assert_eq_int(parsed[1], zk_op_ping(), "round-tripped RequestHeader.type")
+    print("OK: ordinary in-cap frame still round-trips correctly (fix is not a false-positive reject)")
+    recv(done)
+    tcp_close(c2)
+    tcp_close(srv)
+
+fn main()
+    check_inner_clamps()
+    check_recv_frame_cap()
+    print("ZOOKEEPER-AUDIT KAT PASS")

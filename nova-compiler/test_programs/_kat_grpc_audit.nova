@@ -1,0 +1,196 @@
+// _kat_grpc_audit — soundness-audit regression KAT for forge/forge_grpc.nova.
+//
+// Targeted vuln classes (per audit — see forge_grpc.nova inline comments at the
+// fixed sites for full rationale):
+//
+//   (A) SENTINEL/ABSENT-VALUE COLLISION — grpc_client_parse_response() used to
+//       call the silent-zero parse_int() (atoi/atoll semantics) directly on the
+//       attacker/peer-controlled "grpc-status" HPACK trailer VALUE. A malformed,
+//       empty, or non-numeric grpc-status value would silently decode to 0 ==
+//       grpc_ok(), so a failed/malformed RPC response would be reported to the
+//       caller (e.g. forge_etcd.nova's etcd_parse_*_response, which forwards
+//       res["status"] verbatim and is checked by callers as "0 == success") as a
+//       SUCCESSFUL call. Fixed: parse_int_safe() + is_ok()/unwrap(); on parse
+//       failure `status` stays at its "no valid trailer seen" sentinel (-1),
+//       never coerced to 0.
+//
+//   (B) TRAILING-CONTENT / MALFORMED ACCEPTANCE — grpc_dispatch() (server-side
+//       unary dispatch) deframed only the FIRST message out of request_body and
+//       never checked that the deframe consumed the whole body. A unary gRPC
+//       request body must be EXACTLY one framed message; extra bytes appended
+//       after it (a stray/injected second frame, or attacker-appended junk) were
+//       silently discarded and the call proceeded as if the request were clean.
+//       Fixed: grpc_dispatch() now rejects with INVALID_ARGUMENT when
+//       next_off != len(request_body).
+//
+// Also re-covers the pre-existing bounds-safety contracts (grpc_deframe /
+// grpc_deframe_bytes malformed-frame sentinel, i64-safe length arithmetic) as a
+// non-regression check, since they sit right next to the fixed code paths.
+
+import forge_grpc
+import std/net/http2
+
+fn mkb(xs: list) -> bytes
+    let out = bytes(0)
+    let i = 0
+    while i < len(xs)
+        out = bytes_append(out, xs[i])
+        i = i + 1
+    out
+
+fn echo_handler(payload: list) -> list
+    payload
+
+fn main()
+    // ══════════════════════════════════════════════════════════════════════
+    // (A) SENTINEL/ABSENT-VALUE COLLISION — grpc-status trailer parsing
+    // ══════════════════════════════════════════════════════════════════════
+
+    // A1. Baseline (must still work): a genuinely well-formed "0" trailer IS OK.
+    let t_ok = []
+    push(t_ok, ["grpc-status", "0"])
+    push(t_ok, ["grpc-message", ""])
+    let tb_ok = grpc_hpack_encode_headers(t_ok)
+    let th_ok = h2_frame_header_encode(bytes_len(tb_ok), 1, 0x5, 1)
+    let resp_ok = bytes_concat(th_ok, tb_ok)
+    let parsed_ok = grpc_client_parse_response(resp_ok)
+    if parsed_ok["status"] != 0
+        print("FAIL A1: well-formed grpc-status=0 must parse as OK, got " + str(parsed_ok["status"]))
+        exit(1)
+
+    // A2. Baseline (must still work): a genuine non-zero status still decodes.
+    let t_nf = []
+    push(t_nf, ["grpc-status", "5"])
+    push(t_nf, ["grpc-message", "not found"])
+    let tb_nf = grpc_hpack_encode_headers(t_nf)
+    let th_nf = h2_frame_header_encode(bytes_len(tb_nf), 1, 0x5, 1)
+    let resp_nf = bytes_concat(th_nf, tb_nf)
+    let parsed_nf = grpc_client_parse_response(resp_nf)
+    if parsed_nf["status"] != 5
+        print("FAIL A2: well-formed grpc-status=5 must parse as 5, got " + str(parsed_nf["status"]))
+        exit(1)
+
+    // A3. THE BUG: a non-numeric grpc-status value ("abc") must NOT silently
+    // become 0 (OK). It must stay at the "no valid trailer" sentinel (-1).
+    let t_bad = []
+    push(t_bad, ["grpc-status", "abc"])
+    push(t_bad, ["grpc-message", "should not look like success"])
+    let tb_bad = grpc_hpack_encode_headers(t_bad)
+    let th_bad = h2_frame_header_encode(bytes_len(tb_bad), 1, 0x5, 1)
+    let resp_bad = bytes_concat(th_bad, tb_bad)
+    let parsed_bad = grpc_client_parse_response(resp_bad)
+    if parsed_bad["status"] == 0
+        print("FAIL A3: non-numeric grpc-status='abc' was silently accepted as OK (status==0) -- SENTINEL COLLISION")
+        exit(1)
+    if parsed_bad["status"] != -1
+        print("FAIL A3: non-numeric grpc-status='abc' should leave status at sentinel -1, got " + str(parsed_bad["status"]))
+        exit(1)
+
+    // A4. THE BUG, empty-string variant: an empty grpc-status value must not
+    // become 0 (OK) either (atoll("") == 0 is the classic silent-zero trap).
+    let t_empty = []
+    push(t_empty, ["grpc-status", ""])
+    push(t_empty, ["grpc-message", "empty status value"])
+    let tb_empty = grpc_hpack_encode_headers(t_empty)
+    let th_empty = h2_frame_header_encode(bytes_len(tb_empty), 1, 0x5, 1)
+    let resp_empty = bytes_concat(th_empty, tb_empty)
+    let parsed_empty = grpc_client_parse_response(resp_empty)
+    if parsed_empty["status"] == 0
+        print("FAIL A4: empty grpc-status value was silently accepted as OK (status==0) -- SENTINEL COLLISION")
+        exit(1)
+    if parsed_empty["status"] != -1
+        print("FAIL A4: empty grpc-status value should leave status at sentinel -1, got " + str(parsed_empty["status"]))
+        exit(1)
+
+    // A5. Trailing-garbage numeric value ("0x") must also not decode as 0.
+    let t_trail = []
+    push(t_trail, ["grpc-status", "0x"])
+    push(t_trail, ["grpc-message", "trailing junk after digit"])
+    let tb_trail = grpc_hpack_encode_headers(t_trail)
+    let th_trail = h2_frame_header_encode(bytes_len(tb_trail), 1, 0x5, 1)
+    let resp_trail = bytes_concat(th_trail, tb_trail)
+    let parsed_trail = grpc_client_parse_response(resp_trail)
+    if parsed_trail["status"] == 0
+        print("FAIL A5: grpc-status='0x' (trailing junk) was silently accepted as OK -- SENTINEL COLLISION")
+        exit(1)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // (B) TRAILING-CONTENT / MALFORMED ACCEPTANCE — grpc_dispatch()
+    // ══════════════════════════════════════════════════════════════════════
+
+    let smap = grpc_service_map()
+    smap = grpc_register(smap, "/echo.Echo/Say", echo_handler)
+
+    // B1. Baseline (must still work): a clean, exactly-one-message unary
+    // request body dispatches successfully.
+    let clean_body = grpc_frame([1, 2, 3])
+    let r_clean = grpc_dispatch(smap, "/echo.Echo/Say", clean_body)
+    if r_clean["status"] != 0
+        print("FAIL B1: clean unary request should dispatch OK, got status " + str(r_clean["status"]))
+        exit(1)
+    if r_clean["framed"] != [0, 0, 0, 0, 3, 1, 2, 3]
+        print("FAIL B1: clean unary request framed reply mismatch: " + str(r_clean["framed"]))
+        exit(1)
+
+    // B2. THE BUG: a request body with a valid frame PLUS trailing garbage
+    // bytes after it must be REJECTED, not silently dispatched while ignoring
+    // the extra bytes.
+    let dirty_body = grpc_frame([1, 2, 3])
+    push(dirty_body, 0xFF)
+    push(dirty_body, 0xEE)
+    let r_dirty = grpc_dispatch(smap, "/echo.Echo/Say", dirty_body)
+    if r_dirty["status"] == 0
+        print("FAIL B2: unary request with trailing bytes was silently dispatched as OK -- TRAILING-CONTENT ACCEPTANCE")
+        exit(1)
+    if r_dirty["status"] != 3
+        print("FAIL B2: unary request with trailing bytes should return INVALID_ARGUMENT(3), got " + str(r_dirty["status"]))
+        exit(1)
+    if len(r_dirty["framed"]) != 0
+        print("FAIL B2: rejected request must not produce a response frame")
+        exit(1)
+
+    // B3. Non-regression: still-malformed (too-short) frame is rejected too.
+    let short_body = [0, 0, 0]
+    let r_short = grpc_dispatch(smap, "/echo.Echo/Say", short_body)
+    if r_short["status"] != 3
+        print("FAIL B3: too-short request body should return INVALID_ARGUMENT(3), got " + str(r_short["status"]))
+        exit(1)
+
+    // B4. Non-regression: unknown method still returns UNIMPLEMENTED, checked
+    // BEFORE any deframing of the (irrelevant) body.
+    let r_unimpl = grpc_dispatch(smap, "/no.Such/Method", clean_body)
+    if r_unimpl["status"] != 12
+        print("FAIL B4: unknown method should return UNIMPLEMENTED(12), got " + str(r_unimpl["status"]))
+        exit(1)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Non-regression: bounds-safety on the raw list-based + bytes-native
+    // deframers (unchanged code paths adjacent to the fix sites).
+    // ══════════════════════════════════════════════════════════════════════
+
+    // list-based grpc_deframe: declared length running past end of buf.
+    let lying_list = [0, 0, 0, 0, 100, 1, 2, 3]
+    let d_lying = grpc_deframe(lying_list, 0)
+    if d_lying[2] != -1
+        print("FAIL: grpc_deframe should flag malformed on OOB declared length")
+        exit(1)
+
+    // bytes-native grpc_deframe_bytes: same check.
+    let lying_bytes = mkb([0, 0, 0, 0, 100, 1, 2, 3])
+    let d_lying_b = grpc_deframe_bytes(lying_bytes, 0)
+    if d_lying_b[2] != -1
+        print("FAIL: grpc_deframe_bytes should flag malformed on OOB declared length")
+        exit(1)
+
+    // round trip sanity: grpc_frame / grpc_deframe still agree (vector from
+    // the module header comment).
+    let f = grpc_frame([1, 2, 3])
+    if f != [0, 0, 0, 0, 3, 1, 2, 3]
+        print("FAIL: grpc_frame([1,2,3]) vector mismatch: " + str(f))
+        exit(1)
+    let d = grpc_deframe(f, 0)
+    if d[0] != [1, 2, 3] or d[1] != 8 or d[2] != 0
+        print("FAIL: grpc_deframe round trip mismatch: " + str(d))
+        exit(1)
+
+    print("GRPC-AUDIT KAT PASS")

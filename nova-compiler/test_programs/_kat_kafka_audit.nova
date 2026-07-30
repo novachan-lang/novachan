@@ -1,0 +1,201 @@
+// KAT: forge_kafka SOUNDNESS AUDIT -- regression-proves 5 fixes for adversarial/malformed wire input:
+//   1. kf_rd_string: a negative-but-not-(-1) int16 length no longer pushes next_off BACKWARD.
+//   2. kf_rd_nullable_string / kf_rd_bytes: same negative-length clamp (only -1 means null).
+//   3. _kf_parse_message_set: a negative MessageSize (e.g. -12, which previously left the parse
+//      position EXACTLY UNCHANGED -> a guaranteed infinite loop) is now rejected immediately.
+//   4. kf_parse_produce_response / kf_parse_fetch_response: a declared topic/partition count wildly
+//      exceeding what the buffer could possibly back (e.g. 2,000,000,000 topics in a 4-byte buffer) no
+//      longer drives the parser through up to 2^31 iterations -- it is clamped to what the remaining
+//      bytes can actually support and the loop terminates immediately.
+//   5. kf_parse_fetch_response: a per-partition message-set size (`msize`) that overruns the real
+//      buffer no longer walks the parse cursor to a bogus far-future offset -- it is clamped so the
+//      cursor stays exactly at the end of the real data.
+// Every case here either hangs (if unfixed) or returns wrong/corrupted offsets; a clean, fast PASS is
+// the regression proof. Legitimate-data round-trips are covered by forge_kafka_test.nova and are not
+// duplicated here.
+import forge_kafka
+
+// _kf_parse_message_set is module-private (leading underscore); exercise it only through the public
+// kf_parse_fetch_response entry point, which is exactly how real (malicious) wire traffic reaches it.
+// Wraps a raw MessageSet `mset` bytes blob in a minimal single-topic/single-partition FetchResponse and
+// returns the decoded messages list for that partition.
+fn wrap_fetch_msgs(mset)
+    let fr = bytes(0)
+    fr = bytes_concat(fr, kf_be32(1))
+    fr = bytes_concat(fr, kf_wr_string("t"))
+    fr = bytes_concat(fr, kf_be32(1))
+    fr = bytes_concat(fr, kf_be32(0))
+    fr = bytes_concat(fr, kf_be16(0))
+    fr = bytes_concat(fr, kf_be64(0))
+    fr = bytes_concat(fr, kf_be32(bytes_len(mset)))
+    fr = bytes_concat(fr, mset)
+    let parsed = kf_parse_fetch_response(fr, 0)
+    parsed[0][0][1][0][3]
+
+fn main()
+    // ---- (1) kf_rd_string: negative-but-not-(-1) length must not move next_off backward -------------
+    let b1 = kf_be16(0 - 5)
+    let r1 = kf_rd_string(b1, 0)
+    if r1[0] != ""
+        print("FAIL: kf_rd_string(-5) should decode as empty string, got \"" + r1[0] + "\"")
+        exit(1)
+    if r1[1] != 2
+        print("FAIL: kf_rd_string(-5) next_off should be off+2=2 (forward progress preserved), got " + str(r1[1]))
+        exit(1)
+
+    // ---- (2a) kf_rd_nullable_string: -1 is still null; any other negative is clamped, not backward ---
+    let b2 = kf_be16(0 - 1)
+    let r2 = kf_rd_nullable_string(b2, 0)
+    if r2[0] != null or r2[1] != 2
+        print("FAIL: kf_rd_nullable_string(-1) should still be the null sentinel")
+        exit(1)
+    let b3 = kf_be16(0 - 7)
+    let r3 = kf_rd_nullable_string(b3, 0)
+    if r3[0] != ""
+        print("FAIL: kf_rd_nullable_string(-7) should decode as empty string (not null), got \"" + str(r3[0]) + "\"")
+        exit(1)
+    if r3[1] != 2
+        print("FAIL: kf_rd_nullable_string(-7) next_off should be off+2=2, got " + str(r3[1]))
+        exit(1)
+
+    // ---- (2b) kf_rd_bytes: same clamp for the int32 length field ------------------------------------
+    let b4 = kf_be32(0 - 9)
+    let r4 = kf_rd_bytes(b4, 0)
+    if r4[0] == null
+        print("FAIL: kf_rd_bytes(-9) should decode as empty bytes (not null -- only -1 is the sentinel)")
+        exit(1)
+    if bytes_len(r4[0]) != 0
+        print("FAIL: kf_rd_bytes(-9) should decode zero-length bytes, got length " + str(bytes_len(r4[0])))
+        exit(1)
+    if r4[1] != 4
+        print("FAIL: kf_rd_bytes(-9) next_off should be off+4=4 (forward progress preserved), got " + str(r4[1]))
+        exit(1)
+
+    // ---- (3a) a message record with msg_size == -12 previously left `p` EXACTLY STATIONARY -----------
+    //     (mstart + msg_size == p + 12 - 12 == p), a guaranteed infinite loop inside
+    //     _kf_parse_message_set. Must now be rejected on the first record with zero entries returned.
+    let mset1 = bytes(0)
+    mset1 = bytes_concat(mset1, kf_be64(0))
+    mset1 = bytes_concat(mset1, kf_be32(0 - 12))
+    let out1 = wrap_fetch_msgs(mset1)
+    if len(out1) != 0
+        print("FAIL: fetch response with msg_size=-12 should decode zero messages, got " + str(len(out1)))
+        exit(1)
+
+    // ---- (3b) a large negative msg_size (would have driven p far below 0, then crawled back up ~2^31/12
+    //     wasted iterations) must also be rejected on the first record. ---------------------------------
+    let mset2 = bytes(0)
+    mset2 = bytes_concat(mset2, kf_be64(0))
+    mset2 = bytes_concat(mset2, kf_be32(0 - 2000000000))
+    let out2 = wrap_fetch_msgs(mset2)
+    if len(out2) != 0
+        print("FAIL: fetch response with msg_size=-2000000000 should decode zero messages, got " + str(len(out2)))
+        exit(1)
+
+    // ---- (3c) a valid record followed by a negative-msg_size record: the valid one must still be kept,
+    //     parsing must stop cleanly at the malformed one (no hang, no phantom trailing entries). ---------
+    let goodmsg = bytes(0)
+    // _kf_parse_message_set reads key/value starting at mstart+6 (skipping a 4-byte CRC + 1-byte magic +
+    // 1-byte attributes, matching _kf_message_bytes' real wire layout) -- the CRC value itself is never
+    // verified by the parser, so any 4 bytes serve as a placeholder here.
+    goodmsg = bytes_concat(goodmsg, kf_be32(0))
+    goodmsg = bytes_append(goodmsg, 0)
+    goodmsg = bytes_append(goodmsg, 0)
+    goodmsg = bytes_concat(goodmsg, kf_wr_nullable_bytes("gk"))
+    goodmsg = bytes_concat(goodmsg, kf_wr_nullable_bytes("gv"))
+    let mset3 = bytes(0)
+    mset3 = bytes_concat(mset3, kf_be64(0))
+    mset3 = bytes_concat(mset3, kf_be32(bytes_len(goodmsg)))
+    mset3 = bytes_concat(mset3, goodmsg)
+    mset3 = bytes_concat(mset3, kf_be64(1))
+    mset3 = bytes_concat(mset3, kf_be32(0 - 12))
+    let out3 = wrap_fetch_msgs(mset3)
+    if len(out3) != 1
+        print("FAIL: fetch response should keep the one valid record and stop at the malformed one, got " + str(len(out3)))
+        exit(1)
+    if bytes_to_str(out3[0][1]) != "gk" or bytes_to_str(out3[0][2]) != "gv"
+        print("FAIL: fetch response valid-record content corrupted")
+        exit(1)
+
+    // ---- (4a) kf_parse_produce_response: a declared topic count of 2 BILLION on a 4-byte buffer must
+    //     terminate INSTANTLY (clamped to what 0 remaining bytes can back = 0 topics), not iterate. ------
+    let hugebuf = kf_be32(2000000000)
+    let hugeparsed = kf_parse_produce_response(hugebuf, 0)
+    if len(hugeparsed[0]) != 0
+        print("FAIL: kf_parse_produce_response with a 2B-topic claim on 4 bytes should yield 0 topics, got " + str(len(hugeparsed[0])))
+        exit(1)
+    if hugeparsed[1] != 4
+        print("FAIL: kf_parse_produce_response next_off should stay at off+4=4, got " + str(hugeparsed[1]))
+        exit(1)
+
+    // ---- (4b) same attack against kf_parse_fetch_response --------------------------------------------
+    let hugebuf2 = kf_be32(2000000000)
+    let hugeparsed2 = kf_parse_fetch_response(hugebuf2, 0)
+    if len(hugeparsed2[0]) != 0
+        print("FAIL: kf_parse_fetch_response with a 2B-topic claim on 4 bytes should yield 0 topics, got " + str(len(hugeparsed2[0])))
+        exit(1)
+    if hugeparsed2[1] != 4
+        print("FAIL: kf_parse_fetch_response next_off should stay at off+4=4, got " + str(hugeparsed2[1]))
+        exit(1)
+
+    // ---- (4c) a legitimate topic (real bytes on the wire) but a 2-BILLION declared partition count with
+    //     nothing left in the buffer -- the topic itself must still parse, partitions must clamp to 0. ---
+    let pcbuf = bytes(0)
+    pcbuf = bytes_concat(pcbuf, kf_be32(1))
+    pcbuf = bytes_concat(pcbuf, kf_wr_string("t"))
+    pcbuf = bytes_concat(pcbuf, kf_be32(2000000000))
+    let pcparsed = kf_parse_produce_response(pcbuf, 0)
+    let pctopics = pcparsed[0]
+    if len(pctopics) != 1 or pctopics[0][0] != "t"
+        print("FAIL: kf_parse_produce_response should still parse the legitimate topic name")
+        exit(1)
+    if len(pctopics[0][1]) != 0
+        print("FAIL: kf_parse_produce_response partition count should clamp to 0 (no bytes back it), got " + str(len(pctopics[0][1])))
+        exit(1)
+    if pcparsed[1] != bytes_len(pcbuf)
+        print("FAIL: kf_parse_produce_response next_off should consume exactly the real buffer, got " + str(pcparsed[1]) + " expected " + str(bytes_len(pcbuf)))
+        exit(1)
+
+    // ---- (5) kf_parse_fetch_response: msize overrunning the real buffer must clamp the cursor to the
+    //     real end of data, not walk it out to a bogus far-future offset. -------------------------------
+    let msbuf = bytes(0)
+    msbuf = bytes_concat(msbuf, kf_be32(1))
+    msbuf = bytes_concat(msbuf, kf_wr_string("t"))
+    msbuf = bytes_concat(msbuf, kf_be32(1))
+    msbuf = bytes_concat(msbuf, kf_be32(0))
+    msbuf = bytes_concat(msbuf, kf_be16(0))
+    msbuf = bytes_concat(msbuf, kf_be64(0))
+    msbuf = bytes_concat(msbuf, kf_be32(9999999))
+    let msparsed = kf_parse_fetch_response(msbuf, 0)
+    let mstopics = msparsed[0]
+    if len(mstopics) != 1 or mstopics[0][0] != "t"
+        print("FAIL: kf_parse_fetch_response should still parse the legitimate topic name")
+        exit(1)
+    let msprs = mstopics[0][1]
+    if len(msprs) != 1
+        print("FAIL: kf_parse_fetch_response partition-response count mismatch, got " + str(len(msprs)))
+        exit(1)
+    if len(msprs[0][3]) != 0
+        print("FAIL: kf_parse_fetch_response messages should be empty (msize overruns the buffer), got " + str(len(msprs[0][3])))
+        exit(1)
+    if msparsed[1] != bytes_len(msbuf)
+        print("FAIL: kf_parse_fetch_response next_off should clamp to the real end of the buffer (" + str(bytes_len(msbuf)) + "), got " + str(msparsed[1]))
+        exit(1)
+
+    // ---- (6) kf_recv_response: a negative int32 size prefix must be treated as malformed (same sentinel
+    //     as a short read), MUST NOT consume any bytes from the leftover buffer, and must not fabricate a
+    //     "successful" correlation_id 0. Tested with no real socket I/O -- the buffer already holds >= 4
+    //     bytes so _kf_recv_at_least never calls tcp_recv_bytes; the dummy sock value is never touched.
+    let negsizebuf = kf_be32(0 - 1)
+    let recv1 = kf_recv_response(0, negsizebuf)
+    if recv1[0] != 0 - 1
+        print("FAIL: kf_recv_response(negative size) should return correlation_id sentinel -1, got " + str(recv1[0]))
+        exit(1)
+    if bytes_len(recv1[2]) != 4
+        print("FAIL: kf_recv_response(negative size) must not consume the leftover buffer, expected 4 bytes left, got " + str(bytes_len(recv1[2])))
+        exit(1)
+    if bytes_get(recv1[2], 0) != 255 or bytes_get(recv1[2], 1) != 255 or bytes_get(recv1[2], 2) != 255 or bytes_get(recv1[2], 3) != 255
+        print("FAIL: kf_recv_response(negative size) leftover buffer content corrupted")
+        exit(1)
+
+    print("KAFKA-AUDIT KAT PASS")

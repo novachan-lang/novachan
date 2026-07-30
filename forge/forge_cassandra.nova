@@ -70,6 +70,24 @@
 //   cql_opcode_name(op: int) -> string / cql_opcode_num(name: string) -> int
 //   cql_consistency_name(c: int) -> string / cql_consistency_num(name: string) -> int
 //
+// ENCODE FAILURE CONTRACT: every *_encode function whose input has a declared
+// wire width (cql_string_encode/cql_long_string_encode/cql_string_map_encode/
+// cql_bytes_encode/cql_frame_header_encode and everything built on top of them —
+// cql_startup_body/cql_startup_frame/cql_query_body/cql_query_frame) validates its
+// input against that width and returns bytes_create(0) (0 bytes) on failure,
+// instead of silently masking/wrapping an oversized length into the fixed-width
+// length prefix. A real encoding from any of these functions is NEVER 0 bytes
+// (the shortest is the 2-byte empty-[string]/empty-[string-map] encoding), so
+// `bytes_len(result) == 0` is an unambiguous in-band failure signal — callers
+// that accept untrusted/unbounded-size input (e.g. a query string or option
+// value sourced from a caller-supplied string) MUST check it. This closes a
+// silent frame-desync class: masking (e.g. `n & 0xFFFF`) on a length that
+// overflows the field turns an oversized value into a WRONG SMALLER declared
+// length while still writing the full oversized payload — a decoder then reads
+// a short/empty field and misinterprets the leftover bytes as later frame
+// fields, the production-side mirror of the over-read/malformed-acceptance bugs
+// this module's decoders are hardened against.
+//
 // LEAF w.r.t. protocol logic — imports only std/encoding/pack for BE int helpers.
 
 import std/encoding/pack as pk
@@ -78,13 +96,21 @@ import std/encoding/pack as pk
 
 // cql_frame_header_encode: build the 9-byte CQL native-protocol frame header.
 // version/flags/opcode masked to 8 bits; stream masked to 16 bits (two's-complement,
-// so a negative stream id round-trips correctly); length masked to 32 bits.
+// so a negative stream id round-trips correctly — that field is a client-chosen ID,
+// not a buffer length, so wraparound there is harmless by design).
+// `length` is DIFFERENT: it is the body byte-count and governs how many following
+// bytes a peer will read, so it must NEVER be silently masked/wrapped — a length
+// that does not fit the wire's 32-bit unsigned field is a genuine encode error, not
+// a value to truncate. Returns bytes_create(0) (0 bytes — never a valid header size,
+// which is always exactly 9) if length is negative or exceeds 0xFFFFFFFF.
 fn cql_frame_header_encode(version: int, flags: int, stream: int, opcode: int, length: int) -> bytes
+    if length < 0 or length > 0xFFFFFFFF
+        return bytes_create(0)
     let out = pk.pack_u8(version & 0xFF)
     out = bytes_concat(out, pk.pack_u8(flags & 0xFF))
     out = bytes_concat(out, pk.pack_u16_be(stream & 0xFFFF))
     out = bytes_concat(out, pk.pack_u8(opcode & 0xFF))
-    out = bytes_concat(out, pk.pack_u32_be(length & 0xFFFFFFFF))
+    out = bytes_concat(out, pk.pack_u32_be(length))
     out
 
 // cql_frame_header_decode: decode a 9-byte frame header from b at pos.
@@ -104,10 +130,23 @@ fn cql_frame_header_decode(b: bytes, pos: int) -> list
 
 // ── [string] : [short] byte-length + UTF-8 bytes ────────────────────────────
 
+// cql_string_encode: [short] byte-length + UTF-8 bytes. The length field is a
+// 16-bit wire quantity, so a string whose BYTE length exceeds 0xFFFF (65535) does
+// not fit it. The old code masked with `n & 0xFFFF`, which for n==65536 silently
+// wrote a 0x0000 ("empty string") length prefix followed by the full 65536-byte
+// payload — a decoder would read an empty string and then misinterpret those
+// smuggled bytes as subsequent frame fields (a self-inflicted frame-desync, the
+// production-side mirror of the over-read/malformed-acceptance decode bugs this
+// module is otherwise hardened against). FIX: validate and reject instead of
+// wrapping. Returns bytes_create(0) (0 bytes — never a valid encoding, which is
+// always >= 2 bytes even for the empty string) on oversized input; this is an
+// unambiguous in-band failure signal a caller can check via bytes_len(result)==0.
 fn cql_string_encode(s: string) -> bytes
     let sb = str_to_bytes(s)
     let n = bytes_len(sb)
-    bytes_concat(pk.pack_u16_be(n & 0xFFFF), sb)
+    if n > 0xFFFF
+        return bytes_create(0)
+    bytes_concat(pk.pack_u16_be(n), sb)
 
 // cql_string_decode: bounds-safe. Returns ["", pos] unchanged on truncation
 // (declared length prefix present but fewer than n bytes remain, or fewer than
@@ -123,10 +162,16 @@ fn cql_string_decode(b: bytes, pos: int) -> list
 
 // ── [long string] : [int] byte-length + UTF-8 bytes ─────────────────────────
 
+// cql_long_string_encode: [int] byte-length + UTF-8 bytes. Same class of bug as
+// cql_string_encode but at the 32-bit width — guarded the same way (see comment
+// there). Returns bytes_create(0) (never a valid encoding, always >= 4 bytes) if
+// the byte length exceeds 0xFFFFFFFF.
 fn cql_long_string_encode(s: string) -> bytes
     let sb = str_to_bytes(s)
     let n = bytes_len(sb)
-    bytes_concat(pk.pack_u32_be(n & 0xFFFFFFFF), sb)
+    if n > 0xFFFFFFFF
+        return bytes_create(0)
+    bytes_concat(pk.pack_u32_be(n), sb)
 
 fn cql_long_string_decode(b: bytes, pos: int) -> list
     if pos < 0 or pos + 4 > bytes_len(b)
@@ -142,16 +187,36 @@ fn cql_long_string_decode(b: bytes, pos: int) -> list
 // cql_string_map_encode: iteration order follows keys(m) — the caller controls
 // determinism by controlling insertion order (matches this codebase's existing
 // [string map]-shaped encoders, e.g. std/net/httpheaders).
+// Bounds/propagation, mirroring cql_string_encode's fix: the entry `count` is
+// itself a 16-bit field (masking it on overflow would desync count vs. actual
+// entries written — same bug class), and if ANY key/value fails to encode (e.g.
+// a value longer than 0xFFFF bytes) that failure must abort the WHOLE map, not
+// just silently contribute zero bytes for that one entry while `count` still
+// claims it is present (which would desync every entry after it). Returns
+// bytes_create(0) (never valid — a real encoding is always >= 2 bytes) on failure.
 fn cql_string_map_encode(m: dict) -> bytes
     let ks = keys(m)
     let n = len(ks)
-    let out = pk.pack_u16_be(n & 0xFFFF)
+    if n > 0xFFFF
+        return bytes_create(0)
+    let out = pk.pack_u16_be(n)
     let i = 0
-    while i < n
+    let ok = 1
+    while i < n and ok == 1
         let k = ks[i]
-        out = bytes_concat(out, cql_string_encode(k))
-        out = bytes_concat(out, cql_string_encode(m[k]))
+        let ke = cql_string_encode(k)
+        if bytes_len(ke) == 0
+            ok = 0
+        else
+            let ve = cql_string_encode(m[k])
+            if bytes_len(ve) == 0
+                ok = 0
+            else
+                out = bytes_concat(out, ke)
+                out = bytes_concat(out, ve)
         i = i + 1
+    if ok == 0
+        return bytes_create(0)
     out
 
 // cql_string_map_decode: bounds-safe. Stops and returns [{}, pos] unchanged as
@@ -188,8 +253,18 @@ fn cql_string_map_decode(b: bytes, pos: int) -> list
 
 // ── [bytes] : [int] n + n bytes (n == -1 means null) ────────────────────────
 
+// cql_bytes_encode: [int] n + n bytes. `n` is a SIGNED 32-bit field on the wire
+// (cql_bytes_decode reads it with unpack_i32_be so that -1 can mean null). A
+// payload of 2^31 bytes or more has no correct signed-32-bit representation: the
+// bit pattern would round-trip through unpack_i32_be as a NEGATIVE number (and if
+// it happened to land on -1, it would even collide with the null sentinel). Reject
+// rather than emit a length prefix that cannot decode back to the true size.
+// Returns bytes_create(0) (never valid — a real encoding is always >= 4 bytes) if
+// the payload does not fit in a signed 32-bit length.
 fn cql_bytes_encode(payload: bytes) -> bytes
     let n = bytes_len(payload)
+    if n < 0 or n > 0x7FFFFFFF
+        return bytes_create(0)
     bytes_concat(pk.pack_i32_be(n), payload)
 
 fn cql_bytes_encode_null() -> bytes
@@ -219,10 +294,18 @@ fn cql_startup_body(options: dict) -> bytes
 
 // cql_startup_frame: full request frame (version=0x04, flags=0x00, given stream,
 // opcode STARTUP). `options` typically {"CQL_VERSION": "3.0.0"} and optionally
-// "COMPRESSION".
+// "COMPRESSION". Propagates cql_startup_body's failure sentinel: a real
+// [string map] encoding is never 0 bytes (even {} encodes as a 2-byte count=0),
+// so a 0-byte body unambiguously means an option name/value failed to encode —
+// in that case return bytes_create(0) rather than emitting a header that claims
+// a body which was never actually written.
 fn cql_startup_frame(stream: int, options: dict) -> bytes
     let body = cql_startup_body(options)
+    if bytes_len(body) == 0
+        return bytes_create(0)
     let hdr = cql_frame_header_encode(0x04, 0x00, stream, 0x01, bytes_len(body))
+    if bytes_len(hdr) == 0
+        return bytes_create(0)
     bytes_concat(hdr, body)
 
 // ── QUERY (opcode 0x07) ──────────────────────────────────────────────────────
@@ -230,15 +313,26 @@ fn cql_startup_frame(stream: int, options: dict) -> bytes
 // cql_query_body: [long string query][short consistency][byte flags]. flags is
 // always 0x00 here (no bound values, no paging, no serial consistency, no
 // default-timestamp, no names-for-values) — the simplest legal v4 QUERY body.
+// Propagates cql_long_string_encode's failure sentinel: if the query text is too
+// large to fit its 32-bit length prefix, abort the whole body — appending the
+// consistency/flags bytes onto a failed (empty) qb would silently produce a body
+// that is missing its length-prefixed query field entirely, desyncing every byte
+// after it. Returns bytes_create(0) (never valid — always >= 7 bytes) on failure.
 fn cql_query_body(query: string, consistency: int) -> bytes
     let qb = cql_long_string_encode(query)
+    if bytes_len(qb) == 0
+        return bytes_create(0)
     let cb = pk.pack_u16_be(consistency & 0xFFFF)
     let fb = pk.pack_u8(0)
     bytes_concat(bytes_concat(qb, cb), fb)
 
 fn cql_query_frame(stream: int, query: string, consistency: int) -> bytes
     let body = cql_query_body(query, consistency)
+    if bytes_len(body) == 0
+        return bytes_create(0)
     let hdr = cql_frame_header_encode(0x04, 0x00, stream, 0x07, bytes_len(body))
+    if bytes_len(hdr) == 0
+        return bytes_create(0)
     bytes_concat(hdr, body)
 
 // ── OPTIONS (opcode 0x05) — empty body ───────────────────────────────────────

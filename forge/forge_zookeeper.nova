@@ -388,17 +388,30 @@ fn _zk_recv_at_least(sock: int, buf, need: int) -> any
         buf = bytes_concat(buf, chunk)
     buf
 
+// Sanity cap on a claimed frame length before buffering it. The wire length prefix is a jute `int`
+// (4-byte signed, so up to ~2^31-1 = ~2 GiB is a "valid" encoding). Without a cap, a malicious or
+// misbehaving peer (compromised/rogue ZK server, or a MITM on an unauthenticated connection) sends a
+// length prefix claiming an enormous frame and then trickles bytes slowly (or never closes the socket) --
+// `_zk_recv_at_least` has no other exit condition than "reached `need` bytes" or "peer closed", so it
+// would accumulate an attacker-controlled amount of memory indefinitely: a memory-exhaustion / hang DoS
+// driven entirely by one untrusted length field. ZooKeeper's own default max znode data size is 1 MiB
+// (`jute.maxbuffer`-governed); a real ReplyHeader+Stat+ACL+data record never approaches that. 8 MiB is a
+// generous cap that comfortably covers any legitimate record while closing the amplification vector --
+// same defensive pattern forge_nsq.nova already established for this exact bug class (`_nsq_max_frame_size`).
+fn _zk_max_frame_size() -> int
+    8388608
+
 // Read one full length-prefixed frame off the wire -> [payload_bytes, leftover_buf]. `payload_bytes`
 // excludes the 4-byte length prefix (it is either a ConnectResponse body, or ReplyHeader+op-body -- the
 // caller knows which, based on connection state, and parses accordingly). A short read / closed connection
-// before a full frame arrives returns [null, buf] rather than throwing -- in-band failure, per the
-// never-exit(1)-on-bad-input contract.
+// before a full frame arrives, OR a malformed/negative/oversized length prefix (see _zk_max_frame_size),
+// returns [null, buf] rather than throwing -- in-band failure, per the never-exit(1)-on-bad-input contract.
 fn zk_recv_frame(sock: int, buf) -> any
     buf = _zk_recv_at_least(sock, buf, 4)
     if bytes_len(buf) < 4
         return [null, buf]
     let size = zk_rd_int(buf, 0)
-    if size < 0
+    if size < 0 or size > _zk_max_frame_size()
         return [null, bytes_slice(buf, 4, bytes_len(buf))]
     let total = 4 + size
     buf = _zk_recv_at_least(sock, buf, total)

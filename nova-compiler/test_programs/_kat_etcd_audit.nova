@@ -1,0 +1,260 @@
+// _kat_etcd_audit.nova — Independent security audit KAT for forge/forge_etcd.nova.
+//
+// Hunts the 5 recurring decoder/parser vulnerability classes against every
+// decode path in forge_etcd.nova that reads a length/tag from untrusted
+// (server-controlled) wire bytes:
+//   1. i64-overflow bounds bypass   (pos+len wraps negative, skipping a
+//      truncation check)
+//   2. unchecked length -> over-read / truncation-as-success
+//   3. deep-nesting recursion DoS   (unbounded recursive descent)
+//   4. sentinel / absent-value collision (a magic in-band value colliding
+//      with a real decoded value)
+//   5. trailing-content / malformed acceptance (extra bytes ignored, invalid
+//      input silently accepted as if valid)
+//
+// AUDIT CONCLUSION (traced against the actual arithmetic in forge_etcd.nova,
+// proven below rather than asserted):
+//
+//   Class 1/2 (overflow bypass / over-read): forge_etcd.nova performs NO
+//   arithmetic bounds checks of its own ("pos + len > n" never appears in
+//   this file). Every length-delimited read goes through
+//   std/encoding/protobuf's pb_read_len_delim, which is already audited
+//   sound (see _kat_protobuf_audit.nova) — it clamps with the SUBTRACTIVE
+//   form (avail = total - data_start; take = min(declared_len, avail))
+//   which cannot wrap regardless of how large the attacker-declared length
+//   is. Section A below re-proves this end-to-end through forge_etcd's own
+//   decoders (not just the underlying primitive) with a declared length of
+//   ~2^64-1.
+//
+//   Class 3 (deep-nesting recursion DoS): forge_etcd.nova's message schema
+//   is FLAT — RangeResponse/PutResponse/DeleteRangeResponse embed
+//   ResponseHeader and mvccpb.KeyValue at exactly one level, and neither of
+//   those decoders recurses further (_etcd_decode_header and _etcd_decode_kv
+//   are leaf decoders: every branch is a straight-line varint/fixed skip,
+//   no call back into any *_decode_* function). There is no recursive
+//   descent in this file at all — every one of the 5 decode functions is a
+//   single iterative `while` loop. Class 3 does not apply structurally;
+//   verified by grep in this file (zero functions call themselves or form a
+//   call cycle) and confirmed operationally in section C (a kvs list with
+//   many entries decodes in a flat loop, not a growing call stack).
+//
+//   Class 4 (sentinel collision): the one real presence/absence distinction
+//   in this file (PutResponse.prev_kv: proto3 gives no other way to tell
+//   "absent" from "present but every field is its zero value") is already
+//   resolved with an explicit `has_prev_kv` BOOL flag driven by whether the
+//   field-2 TAG was seen at all — never by inspecting decoded content for a
+//   magic value. Section B proves the flag is keyed off tag-presence, not
+//   content, by round-tripping a PRESENT-but-zero-length embedded KeyValue
+//   (a real, valid wire encoding of "prev_kv was in fact overwritten with
+//   an entirely default KeyValue") and confirming it reads back as
+//   has_prev_kv == true, distinct from the true-absence case.
+//
+//   Class 5 (trailing/malformed acceptance): every decode loop in this file
+//   stops the scan (rather than looping or reading OOB) the instant a tag
+//   or value read fails to advance the position, and unrecognized field
+//   numbers are skipped per the wire type — this is CORRECT proto3
+//   forward-compatible behavior (protoc-generated code does the same:
+//   unknown fields are preserved/skipped, not rejected), not silent
+//   acceptance of a malformed encoding. Section C proves both halves: (a)
+//   an unknown field number interleaved between two known fields does not
+//   corrupt either known field's decode, and (b) a genuinely invalid wire
+//   type (3 = deprecated SGROUP) mid-message halts the scan and returns the
+//   fields decoded so far rather than crashing or fabricating data.
+//
+// NO CODE CHANGE was required in forge/forge_etcd.nova — this KAT is the
+// proof, exercising the actual functions with adversarial wire bytes.
+
+import forge_etcd as etcd
+
+let FAILS = [0]
+
+fn check(name: string, cond: bool)
+    if cond
+        print("PASS " + name)
+    else
+        print("FAIL " + name)
+        FAILS[0] = FAILS[0] + 1
+
+fn bytes_eq(a: any, b: any) -> bool
+    let na = bytes_len(a)
+    let nb = bytes_len(b)
+    if na != nb
+        return false
+    let i = 0
+    let ok = true
+    while i < na
+        if bytes_get(a, i) != bytes_get(b, i)
+            ok = false
+        i = i + 1
+    ok
+
+fn bi(ints: list) -> any
+    let out = bytes(0)
+    let i = 0
+    while i < len(ints)
+        out = bytes_append(out, ints[i])
+        i = i + 1
+    out
+
+fn main()
+    // ══════════════════════════════════════════════════════════════════
+    // A. i64-OVERFLOW BOUNDS BYPASS + UNCHECKED-LENGTH OVER-READ
+    // ══════════════════════════════════════════════════════════════════
+    // A1. A field-2 (kvs) LEN tag followed by the maximal 10-byte varint
+    // (bytes [0xFF×9, 0x01]) — the canonical raw two's-complement
+    // encoding of -1, i.e. the declared length reconstructs as a NEGATIVE
+    // int64 once all 64 bits are OR'd in (bit 63 set by the final byte).
+    // pb_read_len_delim's `if take < 0: take = 0` branch must catch this
+    // (a vulnerable "if pos + len > n" style check computed on a negative
+    // len could pass the comparison and read out of bounds); this proves
+    // it takes 0 bytes, not a fabricated/negative-width slice, and the
+    // outer scan still terminates cleanly instead of hanging.
+    let huge_len = bi([0x12, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x01, 0x41, 0x42])
+    check("huge_len_buf_size_13", bytes_len(huge_len) == 13)
+    let decoded_huge = etcd.etcd_decode_range_response(huge_len)
+    check("huge_declared_len_no_crash_kvs_1", len(decoded_huge["kvs"]) == 1)
+    check("huge_declared_len_kv_key_default_empty", bytes_len(decoded_huge["kvs"][0]["key"]) == 0)
+    check("huge_declared_len_kv_value_default_empty", bytes_len(decoded_huge["kvs"][0]["value"]) == 0)
+
+    // A2. The OTHER half of the same class: a 9-byte varint that decodes
+    // to a huge but genuinely POSITIVE declared length (0x7FFFFFFFFFFFFFFF
+    // = INT64_MAX, bit 63 clear — bytes [0xFF×8, 0x7F]) with only 1 real
+    // trailing byte. This exercises pb_read_len_delim's OTHER clamp
+    // branch (`if take > avail: take = avail`, avail computed as
+    // total - data_start, never as an addition that could wrap) rather
+    // than the negative-length branch A1 hit. Must still clamp to exactly
+    // the 1 available byte, never read past the buffer.
+    let huge_pos_len = bi([0x12, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x7F, 0x41])
+    check("huge_pos_len_buf_size_11", bytes_len(huge_pos_len) == 11)
+    let decoded_huge_pos = etcd.etcd_decode_range_response(huge_pos_len)
+    check("huge_pos_declared_len_no_crash_kvs_1", len(decoded_huge_pos["kvs"]) == 1)
+    check("huge_pos_declared_len_kv_key_default_empty", bytes_len(decoded_huge_pos["kvs"][0]["key"]) == 0)
+
+    // Same attack against PutResponse.prev_kv (field 2, also LEN).
+    let huge_len_put = bi([0x12, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x01, 0x61])
+    let decoded_huge_put = etcd.etcd_decode_put_response(huge_len_put)
+    check("huge_len_put_no_crash", decoded_huge_put["has_prev_kv"] == true)
+
+    // Same attack against DeleteRangeResponse.prev_kvs (field 3, also LEN).
+    let huge_len_del = bi([0x1A, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x01, 0x62, 0x63])
+    let decoded_huge_del = etcd.etcd_decode_delete_range_response(huge_len_del)
+    check("huge_len_del_no_crash_prev_kvs_1", len(decoded_huge_del["prev_kvs"]) == 1)
+
+    // Same attack against a ResponseHeader embedded in field 1 (LEN) of a
+    // RangeResponse — proves _etcd_decode_header inherits the same safety.
+    let huge_len_hdr = bi([0x0A, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x01, 0x64])
+    let decoded_huge_hdr = etcd.etcd_decode_range_response(huge_len_hdr)
+    check("huge_len_header_no_crash", decoded_huge_hdr["header"]["revision"] == 0)
+
+    // Declared length that is merely LARGER than the enclosing buffer (not
+    // near int64 max) — the more "ordinary" over-read shape — must clamp
+    // to exactly what's available, never read past it and never treat the
+    // truncated read as if it were the full declared length silently
+    // succeeding with fabricated trailing content. _etcd_decode_kv is
+    // private (module-internal), so this drives it the same way a real
+    // attacker would: through the public etcd_decode_range_response path,
+    // with the malformed KeyValue as the embedded field-2 payload.
+    // inner KV payload (4 bytes): field1 key tag=0x0A, declared len=100,
+    // but only "hi" (2 bytes) actually follow inside this inner buffer.
+    let inner_kv = bi([0x0A, 100, 0x68, 0x69])
+    let over_read = bytes_concat(bi([0x12, 0x04]), inner_kv)  // field2 LEN len=4 -> inner_kv
+    let decoded_over = etcd.etcd_decode_range_response(over_read)
+    check("over_read_kvs_len_1", len(decoded_over["kvs"]) == 1)
+    if len(decoded_over["kvs"]) == 1
+        check("over_read_key_clamped_to_2_bytes", bytes_len(decoded_over["kvs"][0]["key"]) == 2)
+        check("over_read_key_bytes_correct", bytes_eq(decoded_over["kvs"][0]["key"], bi([0x68, 0x69])))
+
+    // ══════════════════════════════════════════════════════════════════
+    // B. SENTINEL / ABSENT-VALUE COLLISION
+    // ══════════════════════════════════════════════════════════════════
+    // Truly absent prev_kv (field 2 never appears at all).
+    let truly_absent = bi([0x0A, 0x02, 0x18, 0x2A])  // just header{revision=42}
+    let absent_decoded = etcd.etcd_decode_put_response(truly_absent)
+    check("prevkv_truly_absent_flag_false", absent_decoded["has_prev_kv"] == false)
+
+    // Field 2 (prev_kv) TAG present but with a ZERO-LENGTH body — a
+    // legitimate wire encoding of "prev_kv is present and every one of its
+    // fields is the zero/default value" (e.g. an all-default KeyValue).
+    // A sentinel-based implementation keyed off "is prev_kv all zero?"
+    // would misreport this as absent; the flag-based implementation must
+    // correctly report PRESENT because the tag was seen.
+    let present_zero_body = bi([0x12, 0x00])  // tag=field2/LEN, len=0
+    let present_decoded = etcd.etcd_decode_put_response(present_zero_body)
+    check("prevkv_present_zero_body_flag_true", present_decoded["has_prev_kv"] == true)
+    check("prevkv_present_zero_body_key_empty", bytes_len(present_decoded["prev_kv"]["key"]) == 0)
+    // The two cases must be distinguishable by the caller (that's the
+    // entire point of has_prev_kv existing) even though prev_kv's decoded
+    // *content* is identical (all-default) in both.
+    check("prevkv_absent_vs_present_distinguishable", absent_decoded["has_prev_kv"] != present_decoded["has_prev_kv"])
+
+    // ══════════════════════════════════════════════════════════════════
+    // C. TRAILING-CONTENT / MALFORMED ACCEPTANCE  (+ flat-schema note for
+    //    class 3, deep-nesting recursion DoS — see header comment: this
+    //    module has no recursive descent to attack, proven by a many-kv
+    //    response decoding via one flat loop, not a growing call stack)
+    // ══════════════════════════════════════════════════════════════════
+    // An unknown field number (99, varint wiretype) interleaved between
+    // two KNOWN, valid fields must be skipped without corrupting either
+    // neighbor's decode — this is correct proto3 unknown-field handling,
+    // not a vulnerability, and this test proves it actually behaves that
+    // way rather than just being asserted. RangeRequest isn't decoded by
+    // this module (it's client encode-only), so this is driven through a
+    // decoded RESPONSE instead: interleave an unknown field between
+    // header (field 1) and count (field 4) in a RangeResponse.
+    // tag for field 99 wiretype 0 = (99<<3)|0 = 792 = 0b11000_1000 -> LEB128: byte0=(792&0x7F)|0x80=0x98, byte1=(792>>7)=6 -> 0x06
+    let hdr_field = bi([0x0A, 0x02, 0x18, 0x2A])   // field1 header{revision=42}
+    let unknown_resp_field = bi([0x98, 0x06, 0x07]) // field 99 varint=7 (unknown, must be skipped)
+    let count_field = bi([0x20, 0x03])              // field4 count=3
+    let resp_with_unknown = bytes_concat(bytes_concat(hdr_field, unknown_resp_field), count_field)
+    let decoded_unknown = etcd.etcd_decode_range_response(resp_with_unknown)
+    check("unknown_field_does_not_corrupt_header", decoded_unknown["header"]["revision"] == 42)
+    check("unknown_field_does_not_corrupt_count", decoded_unknown["count"] == 3)
+
+    // A genuinely invalid wire type (3 = deprecated SGROUP start) placed
+    // AFTER a valid field must halt the scan (per the module's documented
+    // "stop on anything it can't safely interpret" contract) and return
+    // the fields decoded so far — never crash, never silently skip past
+    // the malformed byte and resynchronize on garbage.
+    // field1 header{revision=42} valid, then a byte whose wire type is 3.
+    let bad_wiretype_tag = bi([0x1B])  // (3<<3)|3 = 0x1B: field=3, wiretype=3 (invalid/group)
+    let resp_bad_wiretype = bytes_concat(hdr_field, bad_wiretype_tag)
+    let decoded_bad = etcd.etcd_decode_range_response(resp_bad_wiretype)
+    check("invalid_wiretype_keeps_prior_valid_field", decoded_bad["header"]["revision"] == 42)
+    check("invalid_wiretype_does_not_fabricate_count", decoded_bad["count"] == 0)
+
+    // Many-kv response (proves flat iteration, not recursive descent —
+    // class 3 is structurally absent, this is the operational evidence):
+    // 50 KeyValue entries chained in one buffer, each field2/LEN wrapping
+    // a tiny KeyValue{key="k"}.
+    let one_kv = bi([0x12, 0x03, 0x0A, 0x01, 0x6B])  // field2 LEN len=3 -> {field1 key="k"}
+    let many = bytes(0)
+    let j = 0
+    while j < 50
+        many = bytes_concat(many, one_kv)
+        j = j + 1
+    let decoded_many = etcd.etcd_decode_range_response(many)
+    check("many_kvs_flat_decode_count_50", len(decoded_many["kvs"]) == 50)
+    if len(decoded_many["kvs"]) == 50
+        check("many_kvs_last_key_correct", bytes_eq(decoded_many["kvs"][49]["key"], bi([0x6B])))
+
+    // ══════════════════════════════════════════════════════════════════
+    // D. Baseline sanity: the well-formed KAT vectors from
+    //    forge_etcd_kv_kat.nova / forge_etcd_adv_probe.nova still hold —
+    //    an audit that only exercises attack inputs and never re-checks
+    //    the happy path could hide a fix that broke correctness.
+    // ══════════════════════════════════════════════════════════════════
+    let key_foo = str_to_bytes("foo")
+    let val_bar = str_to_bytes("bar")
+    let put_msg = etcd.etcd_put_message(key_foo, val_bar, 0)
+    check("sanity_put_message_byte_exact", bytes_eq(put_msg, bi([0x0A, 0x03, 0x66, 0x6F, 0x6F, 0x12, 0x03, 0x62, 0x61, 0x72])))
+    let rt_kv = bi([0x0A, 0x03, 0x66, 0x6F, 0x6F, 0x2A, 0x03, 0x62, 0x61, 0x72])
+    let rt_resp = bytes_concat(bi([0x12, 0x0A]), rt_kv)
+    let rt_decoded = etcd.etcd_decode_range_response(rt_resp)
+    check("sanity_roundtrip_kv_key", bytes_eq(rt_decoded["kvs"][0]["key"], key_foo))
+    check("sanity_roundtrip_kv_value", bytes_eq(rt_decoded["kvs"][0]["value"], val_bar))
+
+    // ── summary ──
+    if FAILS[0] == 0
+        print("ETCD-AUDIT KAT PASS")
+    else
+        print("FAILURES: " + str(FAILS[0]))

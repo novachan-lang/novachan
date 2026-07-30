@@ -1,0 +1,240 @@
+// _kat_uri_parse_audit — soundness/DoS audit KAT for std/net/uri.
+//
+// Hunts the 4 text-parser vuln classes against uri_parse/uri_build/query_parse:
+//   1. Deep-nesting recursion DoS   — PROVEN N/A (see note below) + empirically
+//      stress-tested with a ~20000x adversarial input under the harness's
+//      15s kill-on-timeout run budget.
+//   2. Malformed acceptance         — unbalanced brackets, bare delimiters,
+//      empty input, truncated authority; and the REAL bug this audit found
+//      and fixed: raw multi-byte UTF-8 silently corrupting the parse.
+//   3. Pathological O(n^2) blowup   — the SAME real bug's performance half:
+//      char_at() is a UTF-8 codepoint scan that restarts from byte 0 on
+//      EVERY call, so a char_at-per-position scan loop was O(n) per step
+//      -> O(n^2) total. Fixed by making the scanning helpers byte-indexed
+//      (bytes_get is O(1)). Proven here with a ~200,000-byte input that
+//      must parse in well under the timeout.
+//   4. Unbounded number/length      — N/A: uri_parse never parses an integer
+//      (port stays a string) and never expands/repeats based on an
+//      attacker-controlled count field. No finding.
+//
+// CLASS 1 STRUCTURAL NOTE (why there is no depth cap):
+//   uri_parse/uri_build/query_parse/_uri_parse_authority and every _uri_*
+//   helper are FLAT iterative scanners (while-loops over a byte index) —
+//   NONE of them call themselves or each other recursively, and RFC 3986's
+//   generic syntax (scheme ":" hier-part ["?" query] ["#" fragment]) has NO
+//   recursive/nesting production for a generic URI (unlike JSON/YAML/sexpr).
+//   The one bracket-aware code path (_uri_parse_authority's IPv6-literal
+//   detection) does a single linear forward scan for the first "]" after
+//   the leading "[" — it does not recursively match nested brackets. So
+//   there is structurally no call-stack that can grow with input depth;
+//   a depth cap has nothing to bound. This is verified empirically below
+//   with a 20000x-bracket adversarial host, not merely asserted.
+//
+// REAL BUG FOUND + FIXED BY THIS AUDIT (class 2 + class 3, same root cause):
+//   char_at(s, i) addresses a string by UTF-8 CODEPOINT; slice(s, a, b) and
+//   len(s) address it by BYTE offset. Before the fix, _uri_index_of /
+//   _uri_index_of_any / _uri_last_index_of scanned with char_at() and
+//   returned a CODEPOINT index that uri_parse then fed straight into
+//   slice() (which expects a BYTE index). For any URI containing a
+//   multi-byte UTF-8 character before a delimiter, this silently corrupted
+//   the parse: e.g. uri_parse("http://h/café?x=1") produced
+//   path="/caf<invalid-byte>" (é dropped, replaced with a dangling lead
+//   byte) and query="?x=1" (wrongly kept the leading '?'). Fixed by making
+//   every scanning helper operate on bytes_get()-indexed bytes throughout,
+//   so returned indices are always in the same space slice()/len() use.
+//   See _kat_utf8_* cases below — they reproduce the exact corruption and
+//   assert the CORRECT (fixed) result.
+import std/net/uri
+
+fn cks(label: string, got: string, want: string) -> int
+    if got != want
+        print("FAIL " + label + ": got='" + got + "' want='" + want + "'")
+        return 1
+    0
+
+fn ckb(label: string, cond: bool) -> int
+    if not cond
+        print("FAIL " + label)
+        return 1
+    0
+
+fn dget(d: dict, k: string) -> string
+    if contains(d, k)
+        return d[k]
+    "<<MISSING>>"
+
+fn main()
+    let failed = 0
+
+    // ========================================================================
+    // CLASS 1 — deep-nesting DoS: ~20000x adversarial bracket nesting in the
+    // authority position (the one bracket-aware code path). Must return
+    // (not crash, not hang) well within the harness's kill-on-timeout budget.
+    // ========================================================================
+    let deep_open = repeat("[", 20000)
+    let deep_close = repeat("]", 20000)
+    let deep_host_uri = "http://" + deep_open + "1" + deep_close + ":9/x"
+    let t0 = time_ms()
+    let dh = uri_parse(deep_host_uri)
+    let t1 = time_ms()
+    // No crash/hang is itself the assertion (the harness kills at 15s and
+    // reports a run failure if this hangs). Also sanity-check the result is
+    // well-formed: a dict was returned and every value is a plain string.
+    failed = failed + ckb("deep-brackets-scheme", dget(dh, "scheme") == "http")
+    failed = failed + ckb("deep-brackets-completed-fast", (t1 - t0) < 5000)
+    print("deep-brackets: " + str(t1 - t0) + "ms")
+
+    // 20000x nested-looking parens in a path segment (inert grammar-wise,
+    // but still an adversarial "looks recursive" shape) - must not crash.
+    // (chr(40)/chr(41) used instead of "("/")" string literals: a bare
+    // paren-character string literal as a call arg trips an unrelated
+    // lexer indentation-tracking quirk in this compiler build.)
+    let openp = chr(40)
+    let closep = chr(41)
+    let deep_parens = repeat(openp, 20000) + repeat(closep, 20000)
+    let dp = uri_parse("http://h/" + deep_parens + "?x=1")
+    failed = failed + ckb("deep-parens-host", dget(dp, "host") == "h")
+    failed = failed + ckb("deep-parens-query", dget(dp, "query") == "x=1")
+
+    // ========================================================================
+    // CLASS 3 — pathological O(n^2) blowup: a large (~200,000 byte) but
+    // entirely realistic-shaped URI (many path segments + many query pairs).
+    // Under the pre-fix char_at-per-step scan this is O(n^2) and would blow
+    // the harness's 15s run timeout by orders of magnitude; under the fix
+    // it is O(n) and must complete in well under a second.
+    // ========================================================================
+    let big_path = repeat("/seg", 20000)          // 80,000 bytes
+    let big_query = "k=v" + repeat("&k=v", 20000) // ~100,000 bytes
+    let big_uri = "https://user:pw@example.com:8443" + big_path + "?" + big_query + "#frag"
+    let t2 = time_ms()
+    let bu = uri_parse(big_uri)
+    let t3 = time_ms()
+    failed = failed + ckb("big-uri-completed-fast", (t3 - t2) < 5000)
+    print("big-uri (" + str(len(big_uri)) + " bytes): " + str(t3 - t2) + "ms")
+    failed = failed + cks("big-uri-scheme", dget(bu, "scheme"), "https")
+    failed = failed + cks("big-uri-host", dget(bu, "host"), "example.com")
+    failed = failed + cks("big-uri-port", dget(bu, "port"), "8443")
+    failed = failed + ckb("big-uri-path-len", len(dget(bu, "path")) == len(big_path))
+    failed = failed + cks("big-uri-fragment", dget(bu, "fragment"), "frag")
+    // round-trip a large input must also stay lossless and fast.
+    let t4 = time_ms()
+    let rebuilt = uri_build(bu)
+    let t5 = time_ms()
+    failed = failed + ckb("big-uri-roundtrip-fast", (t5 - t4) < 5000)
+    failed = failed + cks("big-uri-roundtrip", rebuilt, big_uri)
+
+    // large query_parse must also stay fast and correct (last-wins on 20001
+    // identical "k"->"v" pairs collapses to one entry).
+    let t6 = time_ms()
+    let bq = query_parse(big_query)
+    let t7 = time_ms()
+    failed = failed + ckb("big-query-completed-fast", (t7 - t6) < 5000)
+    failed = failed + cks("big-query-k", dget(bq, "k"), "v")
+
+    // ========================================================================
+    // CLASS 2 — malformed / adversarial input: never crash; graceful,
+    // bounded result every time.
+    // ========================================================================
+    // empty input
+    let m1 = uri_parse("")
+    failed = failed + cks("empty-scheme", dget(m1, "scheme"), "")
+    failed = failed + cks("empty-path", dget(m1, "path"), "")
+
+    // only delimiters, no content anywhere
+    let m2 = uri_parse("://@:#?")
+    failed = failed + ckb("only-delims-no-crash", contains(m2, "scheme"))
+
+    // unbalanced IPv6 bracket (no closing "]") — must degrade gracefully
+    // (whole remainder treated as host), not crash, not infinite-loop.
+    let m3 = uri_parse("http://[::1")
+    failed = failed + ckb("unbalanced-bracket-host-nonempty", len(dget(m3, "host")) > 0)
+    failed = failed + cks("unbalanced-bracket-host", dget(m3, "host"), "[::1")
+    failed = failed + cks("unbalanced-bracket-path", dget(m3, "path"), "")
+
+    // scheme with colon but no authority/path at all
+    let m4 = uri_parse("http:")
+    failed = failed + cks("bare-scheme-colon-scheme", dget(m4, "scheme"), "http")
+    failed = failed + cks("bare-scheme-colon-path", dget(m4, "path"), "")
+
+    // truncated percent-escape in query value — never crashes, passes through.
+    let m5 = query_parse("a=100%")
+    failed = failed + cks("truncated-pct-escape", dget(m5, "a"), "100%")
+
+    // key with no value and no '=' at all, mixed with a trailing '&'
+    let m6 = query_parse("flag&a=1&")
+    failed = failed + cks("bare-flag", dget(m6, "flag"), "")
+    failed = failed + cks("bare-flag-a", dget(m6, "a"), "1")
+
+    // userinfo containing '@'-adjacent colons plus an IPv6 host+port, all at
+    // once — exercises _uri_last_index_of twice (once for '@', once for the
+    // host:port colon) without desyncing byte offsets.
+    let m7 = uri_parse("https://u:p@[2001:db8::1]:443/x")
+    failed = failed + cks("combo-userinfo", dget(m7, "userinfo"), "u:p")
+    failed = failed + cks("combo-host", dget(m7, "host"), "[2001:db8::1]")
+    failed = failed + cks("combo-port", dget(m7, "port"), "443")
+
+    // ========================================================================
+    // CLASS 2 (the real bug) — raw multi-byte UTF-8 must NOT corrupt the
+    // parse. Reproduces the exact defect this audit found and fixed.
+    // ========================================================================
+    // multi-byte char in the path, before the query delimiter.
+    let u1 = uri_parse("http://h/café?x=1")
+    failed = failed + cks("utf8-path", dget(u1, "path"), "/café")
+    failed = failed + cks("utf8-query", dget(u1, "query"), "x=1")
+    failed = failed + cks("utf8-roundtrip", uri_build(u1), "http://h/café?x=1")
+
+    // multi-byte chars in the host itself, before the path/port.
+    let u2 = uri_parse("https://ünïcödé.example:8080/p?q=1#f")
+    failed = failed + cks("utf8-host", dget(u2, "host"), "ünïcödé.example")
+    failed = failed + cks("utf8-host-port", dget(u2, "port"), "8080")
+    failed = failed + cks("utf8-host-path", dget(u2, "path"), "/p")
+    failed = failed + cks("utf8-host-roundtrip", uri_build(u2), "https://ünïcödé.example:8080/p?q=1#f")
+
+    // multi-byte chars in userinfo, before '@' and before the host:port colon.
+    let u3 = uri_parse("https://üsér:pw@ex.com:443/x")
+    failed = failed + cks("utf8-userinfo", dget(u3, "userinfo"), "üsér:pw")
+    failed = failed + cks("utf8-userinfo-host", dget(u3, "host"), "ex.com")
+    failed = failed + cks("utf8-userinfo-port", dget(u3, "port"), "443")
+
+    // multi-byte chars in the fragment, and preceding a '#'.
+    let u4 = uri_parse("http://h/résumé#sécтion")
+    failed = failed + cks("utf8-frag-path", dget(u4, "path"), "/résumé")
+    failed = failed + cks("utf8-frag-fragment", dget(u4, "fragment"), "sécтion")
+    failed = failed + cks("utf8-frag-roundtrip", uri_build(u4), "http://h/résumé#sécтion")
+
+    // multi-byte chars ahead of the scheme-authority "//" detection itself
+    // (scheme is ASCII per RFC 3986, but the byte-vs-codepoint "//" check
+    // right after the scheme colon must still work for everything after it).
+    let u5 = uri_parse("x-app://ключ@host.example/файл?ключ=значение")
+    failed = failed + cks("utf8-scheme", dget(u5, "scheme"), "x-app")
+    failed = failed + cks("utf8-scheme-userinfo", dget(u5, "userinfo"), "ключ")
+    failed = failed + cks("utf8-scheme-host", dget(u5, "host"), "host.example")
+    failed = failed + cks("utf8-scheme-path", dget(u5, "path"), "/файл")
+    failed = failed + cks("utf8-scheme-query", dget(u5, "query"), "ключ=значение")
+
+    // ========================================================================
+    // Valid-input round-trip must still work end-to-end (parse -> build ->
+    // parse again is a stable fixpoint; query_parse decodes correctly).
+    // ========================================================================
+    let v1s = "https://user:pw@ex.com:8443/a/b?x=1&y=2#frag"
+    let v1 = uri_parse(v1s)
+    failed = failed + cks("valid-scheme", dget(v1, "scheme"), "https")
+    failed = failed + cks("valid-userinfo", dget(v1, "userinfo"), "user:pw")
+    failed = failed + cks("valid-host", dget(v1, "host"), "ex.com")
+    failed = failed + cks("valid-port", dget(v1, "port"), "8443")
+    failed = failed + cks("valid-path", dget(v1, "path"), "/a/b")
+    failed = failed + cks("valid-query", dget(v1, "query"), "x=1&y=2")
+    failed = failed + cks("valid-fragment", dget(v1, "fragment"), "frag")
+    failed = failed + cks("valid-roundtrip", uri_build(v1), v1s)
+    let v1_again = uri_parse(uri_build(v1))
+    failed = failed + cks("valid-fixpoint", uri_build(v1_again), v1s)
+    let vq = query_parse(dget(v1, "query"))
+    failed = failed + cks("valid-query-x", dget(vq, "x"), "1")
+    failed = failed + cks("valid-query-y", dget(vq, "y"), "2")
+    failed = failed + cks("valid-encode-decode", uri_decode_component(uri_encode_component("a b/c")), "a b/c")
+
+    if failed == 0
+        print("URI-PARSE-AUDIT KAT PASS")
+    else
+        print("URI-PARSE-AUDIT KAT FAILED " + str(failed))
+        exit(1)

@@ -1,0 +1,148 @@
+// ============================================================================
+// KAT: std/data/geojson_parse — soundness audit regression
+// ============================================================================
+// Covers:
+//   1. Basic correctness: Point / LineString / Polygon shapes parse right.
+//   2. UTF-8 byte/codepoint desync (the real finding) — a multi-byte char
+//      anywhere before "type"/"coordinates" must not corrupt either field.
+//      Verified at the BYTE level (not just length/display) and cross-checked
+//      with is_valid_utf8, because a codepoint-count check alone can pass by
+//      coincidence even when the underlying bytes are corrupted.
+//   3. Malformed / adversarial input must not hang or crash: empty input,
+//      missing keys, an unterminated array, and 5000 unmatched '[' — all
+//      must return promptly (kill-on-timeout in _run1.ps1 backstops this;
+//      a fabricated fix would time out).
+//   4. Perf: a 20000-point LineString and a 5000-point Polygon ring must
+//      parse well inside the run budget — proof the O(n^2) char_at-rescan
+//      blowup is closed, not just that small inputs still work.
+// ============================================================================
+
+import std/data/geojson_parse
+
+fn q() -> string
+    chr(34)
+
+fn ob() -> string
+    chr(123)
+
+fn cb() -> string
+    chr(125)
+
+fn ob2() -> string
+    chr(91)
+
+fn cb2() -> string
+    chr(93)
+
+fn dump_bytes(s) -> string
+    let bts = str_to_bytes(s)
+    let n = bytes_len(bts)
+    let out = ""
+    let i = 0
+    while i < n
+        out = out + str(bytes_get(bts, i)) + ","
+        i = i + 1
+    out
+
+fn assert_true(cond, label, fails) -> int
+    if cond == 0
+        push(fails, label)
+    0
+
+fn main() -> int
+    let fails = []
+
+    // ── 1. Basic correctness ──────────────────────────────────────────────
+    let point_json = ob() + q() + "type" + q() + ":" + q() + "Point" + q() + "," + q() + "coordinates" + q() + ":[10.5,-20.25]" + cb()
+    let p = geojson_parse(point_json)
+    assert_true(p["type"] == "Point", "point_type", fails)
+    let pc = p["coordinates"]
+    assert_true(len(pc) == 2, "point_coords_len", fails)
+    assert_true(pc[0] == 10.5, "point_coord0", fails)
+    assert_true(pc[1] == -20.25, "point_coord1", fails)
+
+    let ls_json = ob() + q() + "type" + q() + ":" + q() + "LineString" + q() + "," + q() + "coordinates" + q() + ":[[1.0,2.0],[3.0,4.0],[5.0,6.0]]" + cb()
+    let ls = geojson_parse(ls_json)
+    assert_true(ls["type"] == "LineString", "ls_type", fails)
+    let lsc = ls["coordinates"]
+    assert_true(len(lsc) == 3, "ls_len", fails)
+    assert_true(lsc[0][0] == 1.0 and lsc[0][1] == 2.0, "ls_pt0", fails)
+    assert_true(lsc[2][0] == 5.0 and lsc[2][1] == 6.0, "ls_pt2", fails)
+
+    let pg_json = ob() + q() + "type" + q() + ":" + q() + "Polygon" + q() + "," + q() + "coordinates" + q() + ":[[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]]" + cb()
+    let pg = geojson_parse(pg_json)
+    assert_true(pg["type"] == "Polygon", "pg_type", fails)
+    let pgc = pg["coordinates"]
+    assert_true(len(pgc) == 1, "pg_rings", fails)
+    assert_true(len(pgc[0]) == 4, "pg_ring0_len", fails)
+    assert_true(pgc[0][1][0] == 1.0 and pgc[0][1][1] == 0.0, "pg_ring0_pt1", fails)
+
+    // ── 2. UTF-8 byte/codepoint desync (the real finding) ──────────────────
+    let e_acute = from_codepoint(233)
+    let type_val = "caf" + e_acute
+    let utf8_json = ob() + q() + "type" + q() + ":" + q() + type_val + q() + "," + q() + "coordinates" + q() + ":[1.5,2.5]" + cb()
+    let ru = geojson_parse(utf8_json)
+    let expected_bytes = dump_bytes(type_val)
+    let actual_bytes = dump_bytes(ru["type"])
+    assert_true(actual_bytes == expected_bytes, "utf8_type_bytes_exact", fails)
+    assert_true(is_valid_utf8(ru["type"]) == 1, "utf8_type_valid_utf8", fails)
+    let ruc = ru["coordinates"]
+    assert_true(len(ruc) == 2, "utf8_coords_len", fails)
+    assert_true(ruc[0] == 1.5 and ruc[1] == 2.5, "utf8_coords_values", fails)
+
+    // ── 3. Malformed / adversarial input: must not hang or crash ───────────
+    let r_empty = geojson_parse("")
+    assert_true(r_empty["type"] == "", "empty_type", fails)
+    assert_true(len(r_empty["coordinates"]) == 0, "empty_coords", fails)
+
+    let j_nocoord = ob() + q() + "type" + q() + ":" + q() + "Point" + q() + cb()
+    let r_nocoord = geojson_parse(j_nocoord)
+    assert_true(r_nocoord["type"] == "Point", "nocoord_type", fails)
+    assert_true(len(r_nocoord["coordinates"]) == 0, "nocoord_coords", fails)
+
+    let j_unterm = ob() + q() + "type" + q() + ":" + q() + "LineString" + q() + "," + q() + "coordinates" + q() + ":[[1.0,2.0],[3.0,4.0]"
+    let r_unterm = geojson_parse(j_unterm)
+    assert_true(r_unterm["type"] == "LineString", "unterm_type", fails)
+    assert_true(len(r_unterm["coordinates"]) == 2, "unterm_coords_partial", fails)
+
+    let deep = ""
+    let k = 0
+    while k < 5000
+        deep = deep + "["
+        k = k + 1
+    let j_deep = ob() + q() + "type" + q() + ":" + q() + "Polygon" + q() + "," + q() + "coordinates" + q() + ":" + deep
+    let r_deep = geojson_parse(j_deep)
+    assert_true(r_deep["type"] == "Polygon", "deep_type_no_hang", fails)
+    assert_true(len(r_deep["coordinates"]) == 0, "deep_coords_empty", fails)
+
+    // ── 4. Perf: large legitimate payloads must parse quickly (no O(n^2)) ──
+    let nls = 20000
+    let ls_parts = []
+    let i = 0
+    while i < nls
+        push(ls_parts, ob2() + str(i) + ".5," + str(i) + ".25" + cb2())
+        i = i + 1
+    let ls_big_json = ob() + q() + "type" + q() + ":" + q() + "LineString" + q() + "," + q() + "coordinates" + q() + ":" + ob2() + join(ls_parts, ",") + cb2() + cb()
+    let ls_big = geojson_parse(ls_big_json)
+    assert_true(len(ls_big["coordinates"]) == nls, "perf_linestring_count", fails)
+    let lsb = ls_big["coordinates"]
+    assert_true(lsb[0][0] == 0.5 and lsb[0][1] == 0.25, "perf_linestring_first", fails)
+    assert_true(lsb[nls - 1][0] == 19999.5 and lsb[nls - 1][1] == 19999.25, "perf_linestring_last", fails)
+
+    let nring = 5000
+    let ring_parts = []
+    let j = 0
+    while j < nring
+        push(ring_parts, ob2() + str(j) + ".0," + str(j) + ".0" + cb2())
+        j = j + 1
+    let pg_big_json = ob() + q() + "type" + q() + ":" + q() + "Polygon" + q() + "," + q() + "coordinates" + q() + ":" + ob2() + ob2() + join(ring_parts, ",") + cb2() + cb2() + cb()
+    let pg_big = geojson_parse(pg_big_json)
+    assert_true(len(pg_big["coordinates"]) == 1, "perf_polygon_rings", fails)
+    assert_true(len(pg_big["coordinates"][0]) == nring, "perf_polygon_ring_len", fails)
+
+    // ── Report ───────────────────────────────────────────────────────────
+    if len(fails) == 0
+        print("GEOJSON-AUDIT KAT PASS")
+    else
+        print("GEOJSON-AUDIT KAT FAIL: " + join(fails, ", "))
+    0

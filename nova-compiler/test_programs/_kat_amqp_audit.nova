@@ -1,0 +1,155 @@
+// _kat_amqp_audit -- soundness-audit KAT for forge/forge_amqp.nova.
+// Proves: (a) well-formed frames still decode correctly (no false-positive rejections from the
+// audit fix), and (b) every malformed-input case the audit found is now REJECTED (ok=false / [] /
+// -1 / 0) instead of being silently accepted with truncated, zero-filled, or garbage field values.
+import forge_amqp
+
+fn _fail(msg: string)
+    print("FAIL " + msg)
+    exit(1)
+
+fn _bytes_from_ints(lst) -> any
+    let b = bytes(0)
+    let i = 0
+    while i < len(lst)
+        b = bytes_append(b, lst[i])
+        i = i + 1
+    b
+
+fn main()
+    // ── 1) POSITIVE: amqp_shortstr_decode / amqp_longstr_decode round-trip on well-formed input ─────
+    let ss = amqp_shortstr("hello")
+    let ssd = amqp_shortstr_decode(ss, 0)
+    if len(ssd) != 2 or ssd[0] != "hello" or ssd[1] != bytes_len(ss)
+        _fail("positive shortstr_decode round-trip broken")
+
+    let ls = amqp_longstr("world!")
+    let lsd = amqp_longstr_decode(ls, 0)
+    if len(lsd) != 2 or lsd[0] != "world!" or lsd[1] != bytes_len(ls)
+        _fail("positive longstr_decode round-trip broken")
+
+    // ── 2) NEGATIVE: shortstr_decode with a length prefix that overruns the buffer must be rejected,
+    //      not silently truncated to whatever bytes happen to exist. ──────────────────────────────────
+    let bad_ss = _bytes_from_ints([10, 65, 66, 67])   // declares 10 payload bytes, only 3 present
+    if len(amqp_shortstr_decode(bad_ss, 0)) != 0
+        _fail("SECURITY: amqp_shortstr_decode accepted a length prefix that overruns the buffer")
+
+    // ── 3) NEGATIVE: shortstr_decode with off pointing past the end of the buffer. ────────────────────
+    if len(amqp_shortstr_decode(_bytes_from_ints([1, 2, 3]), 5)) != 0
+        _fail("SECURITY: amqp_shortstr_decode accepted an out-of-range offset")
+
+    // ── 4) NEGATIVE: longstr_decode with a huge declared length (u32 length far exceeding the actual
+    //      buffer) must be rejected outright, not clamped/truncated-as-success. ───────────────────────
+    let bad_ls = _bytes_from_ints([0, 0, 0, 100, 1, 2, 3])   // declares 100 bytes, only 3 present
+    if len(amqp_longstr_decode(bad_ls, 0)) != 0
+        _fail("SECURITY: amqp_longstr_decode accepted a length prefix that overruns the buffer")
+
+    // ── 5) NEGATIVE: longstr_decode where even the 4-byte length prefix itself doesn't fit. ───────────
+    if len(amqp_longstr_decode(_bytes_from_ints([0, 0]), 0)) != 0
+        _fail("SECURITY: amqp_longstr_decode accepted a buffer too short for its own length prefix")
+
+    // ── 6) POSITIVE / NEGATIVE: amqp_table_skip ───────────────────────────────────────────────────────
+    let good_table = amqp_empty_table()   // [0,0,0,0]
+    if amqp_table_skip(good_table, 0) != 4
+        _fail("positive table_skip on empty table broken")
+    let bad_table = _bytes_from_ints([0, 0, 0, 50])   // declares 50-byte table body, none present
+    if amqp_table_skip(bad_table, 0) != -1
+        _fail("SECURITY: amqp_table_skip accepted a field-table length that overruns the buffer")
+
+    // ── 7) amqp_connection_tune_decode: exact-8-bytes required (spec: u16+u32+u16, nothing else) ──────
+    let good_tune = _bytes_from_ints([0, 10, 0, 1, 0, 0, 0, 30])   // channel_max=10 frame_max=65536 heartbeat=30
+    let gt = amqp_connection_tune_decode(good_tune)
+    if gt["ok"] != true or gt["channel_max"] != 10 or gt["frame_max"] != 65536 or gt["heartbeat"] != 30
+        _fail("positive Connection.Tune decode broken: " + str(gt["ok"]) + " " + str(gt["channel_max"]) + " " + str(gt["frame_max"]) + " " + str(gt["heartbeat"]))
+    let short_tune = _bytes_from_ints([0, 10, 0, 1, 0, 0, 0])   // 7 bytes, truncated
+    let st = amqp_connection_tune_decode(short_tune)
+    if st["ok"] != false
+        _fail("SECURITY: amqp_connection_tune_decode accepted a truncated (7-byte) args buffer")
+    let long_tune = _bytes_from_ints([0, 10, 0, 1, 0, 0, 0, 30, 99])   // 9 bytes, trailing garbage
+    let lt = amqp_connection_tune_decode(long_tune)
+    if lt["ok"] != false
+        _fail("SECURITY: amqp_connection_tune_decode accepted trailing/unexpected bytes")
+
+    // ── 8) amqp_connection_start_decode: malicious field-table length must abort the whole decode
+    //      instead of reading mechanisms/locales from garbage offsets. ─────────────────────────────────
+    let evil_start = _bytes_from_ints([0, 9])
+    evil_start = bytes_concat(evil_start, _bytes_from_ints([0, 0, 0, 200]))  // field-table claims 200 bytes, none present
+    let es = amqp_connection_start_decode(evil_start)
+    if es["ok"] != false
+        _fail("SECURITY: amqp_connection_start_decode accepted a malicious/overrunning server-properties field-table length")
+
+    // ── 9) amqp_connection_start_decode: well-formed round-trip (regression) ─────────────────────────
+    let good_start = _bytes_from_ints([0, 9])
+    good_start = bytes_concat(good_start, amqp_empty_table())
+    good_start = bytes_concat(good_start, amqp_longstr("PLAIN"))
+    good_start = bytes_concat(good_start, amqp_longstr("en_US"))
+    let gs = amqp_connection_start_decode(good_start)
+    if gs["ok"] != true or gs["version_major"] != 0 or gs["version_minor"] != 9 or gs["mechanisms"] != "PLAIN" or gs["locales"] != "en_US"
+        _fail("positive Connection.Start decode broken")
+    // trailing-content variant: one extra byte appended after a well-formed Start payload must be rejected
+    let trailing_start = bytes_append(good_start, 0xFF)
+    let ts = amqp_connection_start_decode(trailing_start)
+    if ts["ok"] != false
+        _fail("SECURITY: amqp_connection_start_decode accepted trailing/unexpected bytes after locales")
+
+    // ── 10) amqp_basic_deliver_decode: well-formed round-trip (regression) ───────────────────────────
+    let d = amqp_shortstr("tag1")
+    d = bytes_concat(d, _bytes_from_ints([0, 0, 0, 0, 0, 0, 1, 44]))
+    d = bytes_append(d, 0xFB)
+    d = bytes_concat(d, amqp_shortstr("e"))
+    d = bytes_concat(d, amqp_shortstr("rk"))
+    let dd = amqp_basic_deliver_decode(d)
+    if dd["ok"] != true or dd["consumer_tag"] != "tag1" or dd["delivery_tag"] != 300 or dd["redelivered"] != 1 or dd["exchange"] != "e" or dd["routing_key"] != "rk"
+        _fail("positive Basic.Deliver decode broken")
+
+    // ── 11) amqp_basic_deliver_decode: truncated right before delivery-tag must NOT silently return
+    //      delivery_tag=0 -- a caller acking/nacking based on a fabricated delivery_tag would act on
+    //      the WRONG message. ─────────────────────────────────────────────────────────────────────────
+    let d_trunc = amqp_shortstr("tag1")   // consumer-tag only, nothing else
+    let dt = amqp_basic_deliver_decode(d_trunc)
+    if dt["ok"] != false
+        _fail("SECURITY: amqp_basic_deliver_decode accepted a frame truncated before delivery-tag/redelivered")
+    if dt["delivery_tag"] != 0
+        _fail("amqp_basic_deliver_decode should report a neutral delivery_tag=0 on rejection, not a fabricated value")
+
+    // ── 12) amqp_basic_deliver_decode: trailing garbage after routing-key must be rejected ────────────
+    let d_trail = bytes_append(d, 0xAB)
+    let dtr = amqp_basic_deliver_decode(d_trail)
+    if dtr["ok"] != false
+        _fail("SECURITY: amqp_basic_deliver_decode accepted trailing/unexpected bytes after routing-key")
+
+    // ── 13) amqp_basic_deliver_decode: exchange shortstr length overruns the buffer ───────────────────
+    let d_bad_ex = amqp_shortstr("tag1")
+    d_bad_ex = bytes_concat(d_bad_ex, _bytes_from_ints([0, 0, 0, 0, 0, 0, 1, 44]))
+    d_bad_ex = bytes_append(d_bad_ex, 0)
+    d_bad_ex = bytes_concat(d_bad_ex, _bytes_from_ints([50, 1, 2]))   // exchange shortstr claims 50 bytes, 2 present
+    let dbe = amqp_basic_deliver_decode(d_bad_ex)
+    if dbe["ok"] != false
+        _fail("SECURITY: amqp_basic_deliver_decode accepted an exchange shortstr length that overruns the buffer")
+
+    // ── 14) amqp_connection_openok_decode / amqp_channel_openok_decode: positive + trailing-garbage ───
+    let good_conn_openok = amqp_shortstr("")
+    if amqp_connection_openok_decode(good_conn_openok) != 1
+        _fail("positive Connection.OpenOk decode broken")
+    if amqp_connection_openok_decode(bytes_append(good_conn_openok, 0xFF)) != 0
+        _fail("SECURITY: amqp_connection_openok_decode accepted trailing/unexpected bytes")
+
+    let good_chan_openok = amqp_longstr("")
+    if amqp_channel_openok_decode(good_chan_openok) != 1
+        _fail("positive Channel.OpenOk decode broken")
+    if amqp_channel_openok_decode(bytes_append(good_chan_openok, 0xFF)) != 0
+        _fail("SECURITY: amqp_channel_openok_decode accepted trailing/unexpected bytes")
+    let bad_chan_openok = _bytes_from_ints([0, 0, 0, 20, 1, 2])   // declares 20 bytes, 2 present
+    if amqp_channel_openok_decode(bad_chan_openok) != 0
+        _fail("SECURITY: amqp_channel_openok_decode accepted a longstr length that overruns the buffer")
+
+    // ── 15) amqp_parse_frame: i64-overflow bounds-bypass check -- max representable u32 size (from a
+    //      hostile server) must not wrap the `total < 7 + size + 1` bounds check negative on a 64-bit
+    //      int (it can't, since size is bounded to 2^32-1 << 2^63, but this locks the invariant in). ───
+    let huge_size_frame = _bytes_from_ints([1, 0, 0, 255, 255, 255, 255])   // type=1 channel=0 size=0xFFFFFFFF
+    if len(amqp_parse_frame(huge_size_frame)) != 0
+        _fail("SECURITY: amqp_parse_frame accepted a frame whose declared size vastly overruns the buffer")
+
+    print("AMQP-AUDIT KAT PASS")
+
+main()

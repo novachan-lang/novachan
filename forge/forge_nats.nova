@@ -98,16 +98,31 @@ fn _nt_range_to_str(b, start: int, end: int) -> string
 
 // _nt_parse_uint: parse a non-negative decimal integer from a token string.
 // Non-digit input contributes 0 (matches std/net/beanstalkd's _bn_parse_int).
+// Returns -1 if the digit string would overflow a 64-bit signed accumulator
+// -- callers MUST treat a negative result as "invalid", never as a real
+// length/id. Without this guard, a crafted MSG "#bytes" token (e.g. 20 nines)
+// wraps `acc` via signed overflow (NOVA int arithmetic wraps) into an
+// attacker-chosen value -- including negative -- that then bypasses the
+// payload bounds check in _nt_parse_msg (i64-overflow bounds-bypass class).
 fn _nt_parse_uint(s: string) -> int
     let n = len(s)
     let i = 0
     let acc = 0
+    let overflowed = 0
     while i < n
         let c = ord(char_at(s, i))
         if c >= 48 and c <= 57
-            acc = acc * 10 + (c - 48)
+            if overflowed == 0
+                let digit = c - 48
+                if acc > 922337203685477580 or (acc == 922337203685477580 and digit > 7)
+                    overflowed = 1
+                else
+                    acc = acc * 10 + digit
         i = i + 1
-    acc
+    if overflowed == 1
+        0 - 1
+    else
+        acc
 
 // _nt_empty_op: an op_dict with every field at its zero/empty value.
 fn _nt_empty_op() -> dict
@@ -121,6 +136,15 @@ fn _nt_empty_op() -> dict
     d["payload"] = bytes(0)
     d["msg"] = ""
     d
+
+// _nt_max_payload: sane upper bound on a single MSG's declared #bytes, so a
+// malicious/buggy peer can never force unbounded buffer growth by declaring
+// an astronomical (but not overflowed) length -- _nt_read_unit would
+// otherwise keep recv'ing forever trying to satisfy it. Mirrors forge_stomp's
+// _stm_max_body() (64 MiB), comfortably above NATS's real-world max_payload
+// (server default 1 MiB, operator-tunable).
+fn _nt_max_payload() -> int
+    67108864
 
 // _nt_parse_msg: parse a "MSG ..." header line (already CRLF-stripped) plus
 // its trailing payload out of b. after_line = offset of the byte right after
@@ -142,12 +166,26 @@ fn _nt_parse_msg(b, line: string, after_line: int) -> any
     else
         d["reply"] = tokens[3]
         plen = _nt_parse_uint(tokens[4])
-    d["len"] = plen
-    let need = after_line + plen + 2
-    if bytes_len(b) < need
+    // plen < 0 means the "#bytes" token overflowed i64 (see _nt_parse_uint) or
+    // was otherwise unparseable -- never trust it for arithmetic. plen above
+    // the sane cap is rejected outright so a peer can't force unbounded
+    // buffer growth. Both are treated as a malformed header: consume only the
+    // header line, same convention as an unrecognized protocol line
+    // (fallthrough case in nats_parse_line).
+    if plen < 0 or plen > _nt_max_payload()
+        return [_nt_empty_op(), after_line]
+    let blen = bytes_len(b)
+    // Overflow-safe bounds check: subtraction form -- NEVER `pos + len` --
+    // so a legitimate-looking plen can't wrap the "need" total negative and
+    // bypass the check (reference_decoder_soundness_bug_classes.md, class 1).
+    // blen and after_line are both real accumulated-buffer magnitudes (bounded
+    // well under i64 range by bytes_concat's own overflow guard), so this
+    // subtraction itself cannot overflow.
+    if plen > blen - after_line - 2
         return [_nt_empty_op(), 0 - 1]
+    d["len"] = plen
     d["payload"] = bytes_slice(b, after_line, after_line + plen)
-    [d, need]
+    [d, after_line + plen + 2]
 
 // ── Public: BUILDERS ─────────────────────────────────────────────────────────
 

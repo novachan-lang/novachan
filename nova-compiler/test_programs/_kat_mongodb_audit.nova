@@ -1,0 +1,143 @@
+// AUDIT KAT for forge_mongodb -- proves the fixes made during the 2026-07-30 soundness audit and
+// regression-guards the surrounding decode paths they touch. Every check helper exits(1) IMMEDIATELY on
+// failure (same idiom as mongodbkat.nova / bsonkat.nova).
+//
+// FINDINGS FIXED BY THIS AUDIT:
+//   (1) forge_mongodb.nova / mongo_op_msg_decode -- TRAILING-CONTENT/MALFORMED-ACCEPTANCE (vuln class 5):
+//       when flagBits' checksumPresent bit (bit0) was set on a message too short to actually hold the
+//       claimed trailing 4-byte checksum (total < 24), `sections_end = total - 4` could land BELOW the
+//       20-byte offset where section parsing starts. The `while pos < sections_end` loop would then never
+//       execute, and the function returned a "successful" decode (doc=null, docs=[]) for a malformed/
+//       inconsistent message instead of rejecting it. FIXED: an explicit `total < 24` guard now rejects
+//       (print + exit(1)) before computing sections_end. See KAT 1 below (valid boundary still round-
+//       trips) and the standalone adversarial probe mongo_adv_checksum_short_probe.nova (malformed case
+//       correctly exit(1)s -- not runnable from inside this KAT since exit(1) would abort the process
+//       before the PASS banner prints, same reason mongo_adv_trunc_probe.nova is its own file).
+//   (2) std/encoding/bson.nova -- DEEP-NESTING RECURSION DoS (vuln class 3): _bs_decode_document /
+//       _bs_decode_element / _bs_decode_array recurse into each other for every embedded document (0x03)
+//       or array (0x04) value with NO depth cap. forge_mongodb's mongo_command feeds a REMOTE SERVER'S
+//       reply bytes straight into bson_decode_at (via mongo_op_msg_decode) -- a malicious/compromised
+//       mongod (or a MITM on an unauthenticated connection, a documented existing limitation) could send
+//       a deeply-nested BSON document and stack-overflow the client. FIXED: a `depth` parameter now
+//       threads through the three mutually-recursive decode functions with a hard cap (_bs_max_depth() =
+//       4096, same value/technique as std/encoding/plist.nova's established `depth` guard) -- exceeding
+//       it is a clean print + exit(1) instead of a crash. See KAT 2 below (legitimate nesting well under
+//       the cap still decodes correctly) and the standalone adversarial probe
+//       mongo_adv_deepnest_probe.nova (nesting past the cap correctly exit(1)s).
+import forge_mongodb
+import std/encoding/bson
+
+fn cki(label: string, got: int, want: int)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn cks(label: string, got: string, want: string)
+    if got != want
+        print("FAIL " + label + ": got '" + got + "' want '" + want + "'")
+        exit(1)
+    print("PASS " + label)
+
+fn ckf(label: string, got: float, want: float)
+    if got != want
+        print("FAIL " + label + ": got " + str(got) + " want " + str(want))
+        exit(1)
+    print("PASS " + label)
+
+fn _t_put_i32_le(b, v: int) -> any
+    let out = b
+    out = bytes_append(out, v & 0xFF)
+    out = bytes_append(out, (v >> 8) & 0xFF)
+    out = bytes_append(out, (v >> 16) & 0xFF)
+    out = bytes_append(out, (v >> 24) & 0xFF)
+    out
+
+// Hand-build a BSON document of `depth` levels of embedded-document nesting, terminating in a leaf
+// {"leaf": 42}. Built ITERATIVELY (bottom-up, plain byte concatenation, no recursive calls) so this
+// helper itself never risks a native stack overflow regardless of how large `depth` is -- only the
+// DECODER's own recursion is under test here.
+fn _build_nested_doc(depth: int) -> any
+    let leaf_body = bytes_append(bytes(0), 0x10)
+    leaf_body = bytes_concat(leaf_body, str_to_bytes("leaf"))
+    leaf_body = bytes_append(leaf_body, 0)
+    leaf_body = _t_put_i32_le(leaf_body, 42)
+    let leaf_total = 4 + bytes_len(leaf_body) + 1
+    let cur = _t_put_i32_le(bytes(0), leaf_total)
+    cur = bytes_concat(cur, leaf_body)
+    cur = bytes_append(cur, 0)
+
+    let i = 0
+    while i < depth
+        let elem = bytes_append(bytes(0), 0x03)
+        elem = bytes_concat(elem, str_to_bytes("n"))
+        elem = bytes_append(elem, 0)
+        elem = bytes_concat(elem, cur)
+        let total = 4 + bytes_len(elem) + 1
+        let doc = _t_put_i32_le(bytes(0), total)
+        doc = bytes_concat(doc, elem)
+        doc = bytes_append(doc, 0)
+        cur = doc
+        i = i + 1
+    cur
+
+// Wrap a raw BSON document's bytes into a complete OP_MSG (single kind-0x00 section, flagBits=0).
+fn _wrap_op_msg(doc_bytes, request_id: int) -> any
+    let section = bytes_append(bytes(0), 0)
+    section = bytes_concat(section, doc_bytes)
+    let body = _t_put_i32_le(bytes(0), 0)
+    body = bytes_concat(body, section)
+    let total = 16 + bytes_len(body)
+    let hdr = _t_put_i32_le(bytes(0), total)
+    hdr = bytes_concat(hdr, _t_put_i32_le(bytes(0), request_id))
+    hdr = bytes_concat(hdr, _t_put_i32_le(bytes(0), 0))
+    hdr = bytes_concat(hdr, _t_put_i32_le(bytes(0), 2013))
+    bytes_concat(hdr, body)
+
+fn main()
+    // ── KAT 1: checksumPresent regression -- the FIX must not reject a VALID checksum-bearing message ──
+    // (total >= 24, the exact boundary this audit's fix introduced). Mirrors mongodbkat.nova's KAT 6 but
+    // pinned to the minimal legal boundary (a single 1-byte-key int32 field + 4 real checksum bytes).
+    let cs_doc = {}
+    cs_doc["p"] = 1
+    let cs_doc_bytes = bson_encode(cs_doc)
+    let cs_section = bytes_append(bytes(0), 0)
+    cs_section = bytes_concat(cs_section, cs_doc_bytes)
+    let cs_body = _t_put_i32_le(bytes(0), 1)
+    cs_body = bytes_concat(cs_body, cs_section)
+    cs_body = bytes_append(cs_body, 0xAA)
+    cs_body = bytes_append(cs_body, 0xBB)
+    cs_body = bytes_append(cs_body, 0xCC)
+    cs_body = bytes_append(cs_body, 0xDD)
+    let cs_total = 16 + bytes_len(cs_body)
+    let cs_hdr = _t_put_i32_le(bytes(0), cs_total)
+    cs_hdr = bytes_concat(cs_hdr, _t_put_i32_le(bytes(0), 5))
+    cs_hdr = bytes_concat(cs_hdr, _t_put_i32_le(bytes(0), 0))
+    cs_hdr = bytes_concat(cs_hdr, _t_put_i32_le(bytes(0), 2013))
+    let cs_wire = bytes_concat(cs_hdr, cs_body)
+    let cs_parsed = mongo_op_msg_decode(cs_wire)
+    cki("checksum_valid_boundary_flagBits", cs_parsed["flagBits"], 1)
+    cki("checksum_valid_boundary_doc_p", cs_parsed["doc"]["p"], 1)
+
+    // ── KAT 2: legitimate deep-but-bounded nesting (well under the new 4096-level cap) still decodes
+    //    correctly -- proves the DoS fix does not break real-world documents. ──────────────────────────
+    let nested_doc_bytes = _build_nested_doc(500)
+    let nested_wire = _wrap_op_msg(nested_doc_bytes, 11)
+    let nested_parsed = mongo_op_msg_decode(nested_wire)
+    cki("nested500_requestID", nested_parsed["requestID"], 11)
+    let d = nested_parsed["doc"]
+    let depth_walked = 0
+    while contains(d, "n")
+        d = d["n"]
+        depth_walked = depth_walked + 1
+    cki("nested500_depth_walked", depth_walked, 500)
+    cki("nested500_leaf_value", d["leaf"], 42)
+
+    // ── KAT 3: regression -- normal flat command round-trips exactly as before (baseline sanity) ───────
+    let cmd = {}
+    cmd["ping"] = 1
+    let wire = mongo_op_msg_encode(cmd, 1)
+    let parsed = mongo_op_msg_decode(wire)
+    cki("baseline_ping", parsed["doc"]["ping"], 1)
+
+    print("MONGODB-AUDIT KAT PASS")
