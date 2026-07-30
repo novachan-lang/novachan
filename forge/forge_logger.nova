@@ -1,0 +1,118 @@
+// forge_logger -- structured JSON logging for NOVA applications (Go's slog / Python's structlog
+// idiom): a logger carries a NAME, a minimum LEVEL filter, and a set of inherited context FIELDS.
+// Each log call emits one JSON line: {"ts":<epoch-ms>,"level":"...","logger":"...","msg":"...",
+// ...fields...}. Level filtering (debug < info < warn < error) is checked BEFORE formatting so a
+// suppressed call is free of the merge/escape/build work. `log_with` returns a child logger whose
+// fields are the parent's fields overlaid with the new ones (dict_merge, RHS wins) -- the standard
+// context-propagation pattern (`logger.With("request_id", id)` in slog). LEAF -- imports NOTHING.
+
+// PRIVATE: total ordering over the 4 levels for the min-level filter. Unknown strings fall back to
+// "info" (1) rather than silently passing everything or blocking everything.
+fn _log_level_num(level: string) -> int
+    if level == "debug"
+        0
+    else if level == "info"
+        1
+    else if level == "warn"
+        2
+    else if level == "error"
+        3
+    else
+        1
+
+// PRIVATE: JSON-escape a string body (no surrounding quotes). Operates over raw bytes (str_to_bytes
+// + bytes_get, O(1) per index) so it's O(n) total and passes multi-byte UTF-8 sequences through
+// untouched -- only '"', '\', and the C0 control range (<0x20) need escaping in a JSON string.
+fn _log_json_escape(s: string) -> string
+    let b = str_to_bytes(s)
+    let n = bytes_len(b)
+    let out = bytes(0)
+    let i = 0
+    while i < n
+        let c = bytes_get(b, i)
+        if c == 34
+            out = bytes_append(out, 92)
+            out = bytes_append(out, 34)
+        else if c == 92
+            out = bytes_append(out, 92)
+            out = bytes_append(out, 92)
+        else if c == 10
+            out = bytes_append(out, 92)
+            out = bytes_append(out, 110)
+        else if c == 13
+            out = bytes_append(out, 92)
+            out = bytes_append(out, 114)
+        else if c == 9
+            out = bytes_append(out, 92)
+            out = bytes_append(out, 116)
+        else if c < 32
+            out = bytes_concat(out, str_to_bytes(chr(92) + "u00{c:02x}"))
+        else
+            out = bytes_append(out, c)
+        i = i + 1
+    bytes_to_str(out)
+
+// PRIVATE: render one field value as a JSON value. Strings are quoted+escaped; everything else
+// (int, float, bool-as-int, etc.) is rendered via str() as a bare JSON number/literal token, the
+// same "coerce to its natural token" rule forge_logfmt uses for non-string values.
+fn _log_field_value_json(v: any) -> string
+    if type_of(v) == "string"
+        chr(34) + _log_json_escape(v) + chr(34)
+    else
+        str(v)
+
+// Create a logger: a name, a default min-level of "info", and no inherited fields.
+fn log_new(name: string) -> dict
+    {"name": name, "level": "info", "fields": {}}
+
+// Return a copy of `logger` with its min-level filter changed to `level` ("debug"/"info"/"warn"/
+// "error"). Non-mutating -- loggers are values, callers rebind: `let lg = log_set_level(lg, "debug")`.
+fn log_set_level(logger: dict, level: string) -> dict
+    {...logger, "level": level}
+
+// 1 if a call at `level` would pass `logger`'s min-level filter, 0 if it would be suppressed.
+fn log_should_log(logger: dict, level: string) -> int
+    1 if _log_level_num(level) >= _log_level_num(logger["level"]) else 0
+
+// Return a child logger that inherits `logger`'s fields overlaid with `fields` (new keys win on
+// collision) -- the context-propagation pattern for request-scoped/component-scoped loggers.
+fn log_with(logger: dict, fields: dict) -> dict
+    {...logger, "fields": dict_merge(logger["fields"], fields)}
+
+// PRIVATE: format one JSON log line -- fixed ts/level/logger/msg keys followed by the logger's
+// inherited fields merged with this call's fields (call-site fields win on collision).
+fn _log_entry(logger: dict, level: string, msg: string, fields: dict) -> string
+    let merged = dict_merge(logger["fields"], fields)
+    let ks = keys(merged)
+    let tail = ""
+    for k in ks
+        tail = tail + "," + chr(34) + _log_json_escape(k) + chr(34) + ":" + _log_field_value_json(merged[k])
+    let head = chr(123) + chr(34) + "ts" + chr(34) + ":" + str(time_ms())
+    head = head + "," + chr(34) + "level" + chr(34) + ":" + chr(34) + level + chr(34)
+    head = head + "," + chr(34) + "logger" + chr(34) + ":" + chr(34) + _log_json_escape(logger["name"]) + chr(34)
+    head = head + "," + chr(34) + "msg" + chr(34) + ":" + chr(34) + _log_json_escape(msg) + chr(34)
+    head + tail + chr(125)
+
+// Log at "debug". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
+fn log_debug(logger: dict, msg: string, fields: dict) -> string
+    if log_should_log(logger, "debug") == 0
+        return ""
+    _log_entry(logger, "debug", msg, fields)
+
+// Log at "info". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
+fn log_info(logger: dict, msg: string, fields: dict) -> string
+    if log_should_log(logger, "info") == 0
+        return ""
+    _log_entry(logger, "info", msg, fields)
+
+// Log at "warn". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
+fn log_warn(logger: dict, msg: string, fields: dict) -> string
+    if log_should_log(logger, "warn") == 0
+        return ""
+    _log_entry(logger, "warn", msg, fields)
+
+// Log at "error". Returns the formatted JSON line, or "" if suppressed by the logger's min-level.
+fn log_error(logger: dict, msg: string, fields: dict) -> string
+    if log_should_log(logger, "error") == 0
+        return ""
+    _log_entry(logger, "error", msg, fields)

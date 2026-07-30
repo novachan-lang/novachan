@@ -1,0 +1,110 @@
+import forge_logger
+
+fn tf(b: bool) -> string
+    if b
+        return "T"
+    "F"
+fn has(s: string, sub: string) -> string
+    if find(s, sub) >= 0
+        return "T"
+    "F"
+
+// test oracle only (mirrors the module's private level ordering; _log_level_num itself is not
+// reachable outside the module by NOVA's _prefix-is-private rule)
+fn _kat_level_num(level: string) -> int
+    if level == "debug"
+        0
+    else if level == "info"
+        1
+    else if level == "warn"
+        2
+    else if level == "error"
+        3
+    else
+        1
+
+fn main()
+    // -- level ordering, observed via log_should_log on freshly leveled loggers --
+    print("order_debug_lt_info=" + tf(log_should_log(log_set_level(log_new("p"), "debug"), "info") == 1))
+    print("order_info_blocks_debug=" + tf(log_should_log(log_set_level(log_new("p"), "info"), "debug") == 0))
+    print("order_warn_blocks_info=" + tf(log_should_log(log_set_level(log_new("p"), "warn"), "info") == 0))
+    print("order_error_blocks_warn=" + tf(log_should_log(log_set_level(log_new("p"), "error"), "warn") == 0))
+    print("order_unknown_acts_as_info=" + tf(log_should_log(log_set_level(log_new("p"), "bogus"), "debug") == 0))
+
+    // -- default logger is "info" --
+    let lg = log_new("svc")
+    print("default_should_debug=" + str(log_should_log(lg, "debug")))
+    print("default_should_info=" + str(log_should_log(lg, "info")))
+    print("default_should_warn=" + str(log_should_log(lg, "warn")))
+
+    // -- debug is suppressed at "info" level: log_debug returns "" --
+    let sup = log_debug(lg, "hidden", {})
+    print("suppressed_empty=" + tf(sup == ""))
+
+    // -- info passes and produces valid JSON-shaped output --
+    let line_info = log_info(lg, "hello world", {})
+    print("info_nonempty=" + tf(len(line_info) > 0))
+    print("info_has_brace_open=" + tf(char_at(line_info, 0) == chr(123)))
+    print("info_has_ts=" + has(line_info, chr(34) + "ts" + chr(34) + ":"))
+    print("info_has_level=" + has(line_info, chr(34) + "level" + chr(34) + ":" + chr(34) + "info" + chr(34)))
+    print("info_has_logger=" + has(line_info, chr(34) + "logger" + chr(34) + ":" + chr(34) + "svc" + chr(34)))
+    print("info_has_msg=" + has(line_info, chr(34) + "msg" + chr(34) + ":" + chr(34) + "hello world" + chr(34)))
+
+    // -- lower to "debug": now debug passes and produces the same shape --
+    let lg2 = log_set_level(lg, "debug")
+    print("debug_should_now=" + str(log_should_log(lg2, "debug")))
+    let line_dbg = log_debug(lg2, "now visible", {})
+    print("debug_nonempty=" + tf(len(line_dbg) > 0))
+    print("debug_has_level=" + has(line_dbg, chr(34) + "level" + chr(34) + ":" + chr(34) + "debug" + chr(34)))
+
+    // -- warn / error at default "info" logger both pass and tag correctly --
+    let line_warn = log_warn(lg, "careful", {})
+    print("warn_has_level=" + has(line_warn, chr(34) + "level" + chr(34) + ":" + chr(34) + "warn" + chr(34)))
+    let line_err = log_error(lg, "boom", {})
+    print("error_has_level=" + has(line_err, chr(34) + "level" + chr(34) + ":" + chr(34) + "error" + chr(34)))
+
+    // -- fields are merged into the JSON body --
+    let f1 = {}
+    f1["req_id"] = "abc123"
+    f1["retries"] = 3
+    let line_f = log_info(lg, "with fields", f1)
+    print("field_str=" + has(line_f, chr(34) + "req_id" + chr(34) + ":" + chr(34) + "abc123" + chr(34)))
+    print("field_num=" + has(line_f, chr(34) + "retries" + chr(34) + ":3"))
+
+    // -- child logger inherits parent fields (context propagation) --
+    let base = {}
+    base["service"] = "auth"
+    let child = log_with(lg, base)
+    let line_c1 = log_info(child, "child event", {})
+    print("child_inherits=" + has(line_c1, chr(34) + "service" + chr(34) + ":" + chr(34) + "auth" + chr(34)))
+    // grandchild adds its own field on top, parent field still present, and overriding a parent
+    // key at call-time wins over the inherited value
+    let extra = {}
+    extra["req_id"] = "xyz"
+    let line_c2 = log_info(child, "child event 2", extra)
+    print("child_and_call_field=" + tf(has(line_c2, chr(34) + "service" + chr(34) + ":" + chr(34) + "auth" + chr(34)) == "T" and has(line_c2, chr(34) + "req_id" + chr(34) + ":" + chr(34) + "xyz" + chr(34)) == "T"))
+    let override_fields = {}
+    override_fields["service"] = "override"
+    let child2 = log_with(child, override_fields)
+    let line_c3 = log_info(child2, "override test", {})
+    print("call_field_overrides_parent=" + has(line_c3, chr(34) + "service" + chr(34) + ":" + chr(34) + "override" + chr(34)))
+
+    // -- message/field-key JSON escaping: quote and backslash inside msg --
+    let tricky = "quote " + chr(34) + " and back " + chr(92) + " slash"
+    let line_esc = log_info(lg, tricky, {})
+    print("esc_quote=" + has(line_esc, chr(92) + chr(34)))
+    print("esc_backslash=" + has(line_esc, chr(92) + chr(92)))
+
+    // -- log_should_log correctness across all 16 (logger-level x call-level) combinations --
+    let levels = ["debug", "info", "warn", "error"]
+    let all_ok = true
+    for lvl_a in levels
+        let probe = log_set_level(log_new("p"), lvl_a)
+        for lvl_b in levels
+            let got = log_should_log(probe, lvl_b)
+            let want = 1 if _kat_level_num(lvl_b) >= _kat_level_num(lvl_a) else 0
+            if got != want
+                all_ok = false
+    print("should_log_matrix=" + tf(all_ok))
+
+    print("FORGE-LOGGER KAT PASS")

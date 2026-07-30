@@ -1,0 +1,79 @@
+// ============================================================================
+// std/core/retry — retry/backoff + circuit-breaker utilities
+// ============================================================================
+// Deterministic exponential backoff (no jitter) for resilient callers, plus a
+// minimal circuit-breaker state machine (closed -> open on threshold, reset
+// to closed on success). All functions are pure — config/state are plain
+// dicts, transitions return a NEW dict rather than mutating in place.
+
+// build a retry config: attempts up to max_attempts, delay doubling from
+// base_delay_ms each attempt, capped at max_delay_ms.
+fn retry_config(max_attempts: int, base_delay_ms: int, max_delay_ms: int) -> dict
+    return {
+        "max_attempts": max_attempts,
+        "base_delay_ms": base_delay_ms,
+        "max_delay_ms": max_delay_ms
+    }
+
+// delay (ms) before the given attempt number, using exponential backoff:
+// min(base_delay_ms * 2^attempt, max_delay_ms). Doubling stops as soon as it
+// would exceed max_delay_ms, so this never overflows for realistic configs.
+fn retry_delay(config: dict, attempt: int) -> int
+    let base = config["base_delay_ms"]
+    let max_delay = config["max_delay_ms"]
+    if attempt <= 0
+        return base if base < max_delay else max_delay
+    let delay = base
+    for i in 0..attempt
+        if delay >= max_delay
+            return max_delay
+        delay = delay * 2
+    return delay if delay < max_delay else max_delay
+
+// 1 if another attempt is allowed (attempt index is still below the cap).
+fn retry_should_retry(config: dict, attempt: int) -> int
+    return 1 if attempt < config["max_attempts"] else 0
+
+// the full sequence of delays for attempts 0 .. max_attempts-1.
+fn retry_delays(config: dict) -> list
+    return [retry_delay(config, i) for i in 0..config["max_attempts"]]
+
+// the prefix of retry_delays(config) whose running total still fits inside
+// budget_ms (a delay that would push the total over budget is dropped, and
+// scanning stops there since all later delays are >= it).
+fn retry_with_budget(config: dict, budget_ms: int) -> list
+    let delays = retry_delays(config)
+    let result = []
+    let total = 0
+    for d in delays
+        if total + d > budget_ms
+            break
+        result = [...result, d]
+        total = total + d
+    return result
+
+// new circuit breaker: closed, zero failures. `threshold` failures in a row
+// trips it open; `reset_ms` is carried for callers that implement their own
+// half-open timeout policy (this module stays wall-clock-free/pure).
+fn circuit_state_new(threshold: int, reset_ms: int) -> dict
+    return {
+        "threshold": threshold,
+        "reset_ms": reset_ms,
+        "failures": 0,
+        "state": "closed",
+        "last_failure": 0
+    }
+
+// record one failure; trips the circuit to "open" once failures >= threshold.
+fn circuit_record_failure(state: dict) -> dict
+    let failures = state["failures"] + 1
+    let next_state = "open" if failures >= state["threshold"] else state["state"]
+    return {...state, "failures": failures, "state": next_state, "last_failure": failures}
+
+// record a success: clears the failure count and closes the circuit.
+fn circuit_record_success(state: dict) -> dict
+    return {...state, "failures": 0, "state": "closed"}
+
+// 1 if the circuit is currently open (calls should be short-circuited).
+fn circuit_is_open(state: dict) -> int
+    return 1 if state["state"] == "open" else 0

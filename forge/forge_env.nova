@@ -1,0 +1,126 @@
+// forge_env -- typed environment-variable / config access (dotenv-style, but zero-file: reads the real
+// process environment via the `env` builtin). Every accessor is total: an absent or malformed variable
+// never crashes the caller, it falls back to the supplied default (or, for env_required/env_config, to a
+// Result so the caller decides). This is deliberate -- config code runs at startup, before any error
+// handler exists, so "throws on missing env var" is the wrong default; "explicit Result at the one place
+// that truly requires the value" is the NOVA way.
+//
+// LEAF module -- imports NOTHING (only built-ins: env, parse_int, lower, contains, keys).
+
+// _env_is_int -- PRIVATE. True iff s is a valid integer literal: optional leading '-', then >=1 digits.
+// O(n) single pass using string indexing (not char_at-in-a-loop, which is O(n^2)).
+fn _env_is_int(s: string) -> bool
+    let n = len(s)
+    if n == 0
+        return false
+    let start = 0
+    if s[0] == "-"
+        if n == 1
+            return false
+        start = 1
+    let i = start
+    while i < n
+        let c = s[i]
+        if c < "0" or c > "9"
+            return false
+        i = i + 1
+    true
+
+// env_get(key) -> string
+// Raw process env var lookup. "" if the variable is unset (the `env` builtin's own contract) -- this
+// function does not distinguish "unset" from "set to the empty string"; use env_required when that
+// distinction matters.
+fn env_get(key: string) -> string
+    env(key)
+
+// env_get_or(key, default_val) -> string
+// env_get, falling back to default_val when the variable is unset (or explicitly set to "").
+fn env_get_or(key: string, default_val: string) -> string
+    let v = env(key)
+    if v == ""
+        default_val
+    else
+        v
+
+// env_int(key, default_val) -> int
+// Parsed-int env var. Falls back to default_val when the variable is unset OR when its value is not a
+// well-formed integer literal (e.g. "abc", "3.14", "") -- a malformed override is treated the same as no
+// override, never a crash.
+fn env_int(key: string, default_val: int) -> int
+    let v = env(key)
+    if v == "" or not _env_is_int(v)
+        default_val
+    else
+        parse_int(v)
+
+// env_bool(key, default_val) -> int
+// Loosely-typed bool env var, returned as 0/1 (NOVA has no separate bool storage class for env values).
+// Case-insensitive "true" / "1" / "yes" -> 1. Anything else (including unset) -> default_val. This is a
+// deliberately narrow truthy set -- "on"/"y" etc. are NOT accepted, matching the common dotenv convention
+// and avoiding surprise matches on unrelated free-text values.
+fn env_bool(key: string, default_val: int) -> int
+    let v = lower(env(key))
+    if v == "true" or v == "1" or v == "yes"
+        1
+    else
+        default_val
+
+// env_required(key) -> Result<string>
+// ok(value) if the variable is set to a non-empty value; err("missing env: KEY") otherwise. The one
+// accessor that treats a missing variable as a real failure the caller must handle -- use it for config
+// that has no sane default (API keys, DB URLs, etc).
+fn env_required(key: string) -> Result<string>
+    let v = env(key)
+    if v == ""
+        err("missing env: " + key)
+    else
+        ok(v)
+
+// env_config(schema) -> Result<dict>
+// Load a whole typed config in one pass. `schema` is a list of dicts, one per variable:
+//   {"name": "PORT", "type": "int", "default": 8080, "required": false}
+// - "type" in {"int", "bool", "string"} (anything else is treated as "string").
+// - "default" is optional (treated as 0 / 0 / "" for int/bool/string when omitted).
+// - "required" is optional (treated as false when omitted); a required variable that is unset short-
+//   circuits the whole call with err("missing env: NAME") on the FIRST missing one encountered, in
+//   schema order -- fail fast, fail specific.
+// On success, returns ok(config) where config[name] holds the value coerced to the declared type (int,
+// 0/1 for bool, or string) for every entry in the schema.
+fn env_config(schema: list) -> Result<dict>
+    let out = {}
+    for entry in schema
+        let name = entry["name"]
+        let typ = entry["type"]
+        let required = false
+        if contains(entry, "required")
+            required = entry["required"]
+        let raw = env(name)
+        if raw == "" and required
+            return err("missing env: " + name)
+        if typ == "int"
+            let dflt = 0
+            if contains(entry, "default")
+                dflt = entry["default"]
+            out[name] = env_int(name, dflt)
+        else if typ == "bool"
+            let dflt = 0
+            if contains(entry, "default")
+                dflt = entry["default"]
+            out[name] = env_bool(name, dflt)
+        else
+            let dflt = ""
+            if contains(entry, "default")
+                dflt = entry["default"]
+            out[name] = env_get_or(name, dflt)
+    ok(out)
+
+// env_prefix(prefix, keys) -> dict
+// Batch-read several related env vars that share a name prefix, e.g. env_prefix("APP_", ["HOST","PORT"])
+// reads APP_HOST and APP_PORT. The RETURNED dict is keyed by the short (unprefixed) name -- {"HOST": ...,
+// "PORT": ...} -- so callers work with the same short names they passed in, regardless of the prefix.
+// Missing variables come back as "" (same contract as env_get); this function never fails.
+fn env_prefix(prefix: string, keys: list) -> dict
+    let out = {}
+    for k in keys
+        out[k] = env(prefix + k)
+    out
