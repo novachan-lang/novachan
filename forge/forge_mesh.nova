@@ -1,0 +1,118 @@
+// forge_mesh — Mesh distributed framework skeleton.
+// Ties together CRDTs (eventually-consistent state), consistent hashing (key-to-node),
+// and Raft (consensus) into a unified distributed application model.
+//
+// This is the configuration/topology layer — the wiring that tells a distributed
+// NOVA application how its nodes are organized, where keys live, and how state
+// replicates. Actual network transport uses forge_distributed (remote_spawn/channels).
+//
+// Public API:
+//   mesh_cluster(name, nodes)          -> cluster config dict
+//   mesh_add_node(cluster, node)       -> updated cluster
+//   mesh_remove_node(cluster, node)    -> updated cluster
+//   mesh_locate(cluster, key)          -> node_id that owns this key
+//   mesh_partition(cluster, keys)      -> dict {node_id: [keys owned]}
+//   mesh_rebalance_plan(old, new)      -> list of {key, from, to} moves
+//   mesh_health(cluster, statuses)     -> dict {healthy: [...], unhealthy: [...]}
+//   mesh_quorum(cluster)               -> int (majority threshold)
+//   mesh_replicas(cluster, key, n)     -> list of n nodes for this key (ring walk)
+
+import std/hash/consistent
+
+fn mesh_cluster(name: string, nodes: list) -> dict
+    let ring = ch_new(150)
+    let i = 0
+    while i < len(nodes)
+        ch_add(ring, nodes[i])
+        i = i + 1
+    {"name": name, "nodes": nodes, "ring": ring, "replicas": 3}
+
+fn mesh_add_node(cluster: dict, node: string) -> dict
+    let nodes = cluster["nodes"]
+    push(nodes, node)
+    ch_add(cluster["ring"], node)
+    cluster["nodes"] = nodes
+    cluster
+
+fn mesh_remove_node(cluster: dict, node: string) -> dict
+    let nodes = cluster["nodes"]
+    let out = []
+    let i = 0
+    while i < len(nodes)
+        if nodes[i] != node
+            push(out, nodes[i])
+        i = i + 1
+    ch_remove(cluster["ring"], node)
+    cluster["nodes"] = out
+    cluster
+
+fn mesh_locate(cluster: dict, key: string) -> string
+    ch_get(cluster["ring"], key)
+
+fn mesh_partition(cluster: dict, ks: list) -> dict
+    let result = {}
+    let i = 0
+    while i < len(ks)
+        let owner = ch_get(cluster["ring"], ks[i])
+        if owner != ""
+            if not contains(result, owner)
+                result[owner] = []
+            push(result[owner], ks[i])
+        i = i + 1
+    result
+
+fn mesh_rebalance_plan(old_cluster: dict, new_cluster: dict, ks: list) -> list
+    let moves = []
+    let i = 0
+    while i < len(ks)
+        let old_owner = ch_get(old_cluster["ring"], ks[i])
+        let new_owner = ch_get(new_cluster["ring"], ks[i])
+        if old_owner != new_owner
+            push(moves, {"key": ks[i], "from": old_owner, "to": new_owner})
+        i = i + 1
+    moves
+
+fn mesh_health(cluster: dict, statuses: dict) -> dict
+    let healthy = []
+    let unhealthy = []
+    let nodes = cluster["nodes"]
+    let i = 0
+    while i < len(nodes)
+        let n = nodes[i]
+        if contains(statuses, n)
+            if statuses[n] == "up"
+                push(healthy, n)
+            else
+                push(unhealthy, n)
+        else
+            push(unhealthy, n)
+        i = i + 1
+    {"healthy": healthy, "unhealthy": unhealthy}
+
+fn mesh_quorum(cluster: dict) -> int
+    len(cluster["nodes"]) / 2 + 1
+
+fn mesh_replicas(cluster: dict, key: string, n: int) -> list
+    let nodes = cluster["nodes"]
+    let total = len(nodes)
+    if n > total
+        n = total
+    let primary = mesh_locate(cluster, key)
+    if primary == ""
+        return []
+    let result = [primary]
+    let suffix = 1
+    while len(result) < n
+        let candidate = ch_get(cluster["ring"], "{key}:replica:{suffix}")
+        let already = 0
+        let j = 0
+        while j < len(result)
+            if result[j] == candidate
+                already = 1
+            j = j + 1
+        if already == 0
+            push(result, candidate)
+        suffix = suffix + 1
+        if suffix > total * 10
+            break
+    result

@@ -1,0 +1,227 @@
+// forge_raft — Raft consensus protocol state machine (Ongaro & Ousterhout, 2014).
+// Pure state-machine implementation — no I/O, no timers. The caller drives transitions
+// by feeding messages and timer events; the state machine returns actions (send messages,
+// apply log entries). This is the Mesh framework's consensus core.
+//
+// State: {"role": "follower"|"candidate"|"leader", "term": int, "voted_for": "",
+//         "log": [...], "commit_index": int, "node_id": str, "peers": [...],
+//         "votes_received": {...}, "next_index": {...}, "match_index": {...}}
+//
+// Public API:
+//   raft_new(node_id, peers)           -> state dict
+//   raft_timeout(state)                -> {state, messages} (election timeout fired)
+//   raft_receive_vote_request(state, msg)   -> {state, messages}
+//   raft_receive_vote_response(state, msg)  -> {state, messages}
+//   raft_receive_append(state, msg)         -> {state, messages}
+//   raft_receive_append_response(state, msg) -> {state, messages}
+//   raft_client_request(state, command)     -> {state, messages} (leader appends to log)
+//   raft_log_entry(term, command)      -> dict
+//   raft_committed_entries(state)      -> list of committed log entries
+
+fn raft_log_entry(term: int, command: string) -> dict
+    {"term": term, "command": command}
+
+fn raft_new(node_id: string, peers: list) -> dict
+    let next_idx = {}
+    let match_idx = {}
+    let i = 0
+    while i < len(peers)
+        next_idx[peers[i]] = 1
+        match_idx[peers[i]] = 0
+        i = i + 1
+    {"role": "follower", "term": 0, "voted_for": "", "log": [],
+     "commit_index": 0, "node_id": node_id, "peers": peers,
+     "votes_received": {}, "next_index": next_idx, "match_index": match_idx}
+
+fn _raft_result(state: dict, messages: list) -> dict
+    {"state": state, "messages": messages}
+
+fn _raft_become_candidate(state: dict) -> dict
+    let new_term = state["term"] + 1
+    let votes = {state["node_id"]: 1}
+    state["role"] = "candidate"
+    state["term"] = new_term
+    state["voted_for"] = state["node_id"]
+    state["votes_received"] = votes
+    state
+
+fn _raft_last_log_index(state: dict) -> int
+    len(state["log"])
+
+fn _raft_last_log_term(state: dict) -> int
+    let log = state["log"]
+    if len(log) == 0
+        return 0
+    log[len(log) - 1]["term"]
+
+fn _raft_become_leader(state: dict) -> dict
+    state["role"] = "leader"
+    let next_idx = {}
+    let match_idx = {}
+    let nli = _raft_last_log_index(state) + 1
+    let peers = state["peers"]
+    let i = 0
+    while i < len(peers)
+        next_idx[peers[i]] = nli
+        match_idx[peers[i]] = 0
+        i = i + 1
+    state["next_index"] = next_idx
+    state["match_index"] = match_idx
+    state
+
+fn _raft_majority(state: dict) -> int
+    (len(state["peers"]) + 1) / 2 + 1
+
+fn raft_timeout(state: dict) -> dict
+    state = _raft_become_candidate(state)
+    let msgs = []
+    let peers = state["peers"]
+    let i = 0
+    while i < len(peers)
+        push(msgs, {"type": "vote_request", "to": peers[i], "from": state["node_id"],
+                     "term": state["term"], "last_log_index": _raft_last_log_index(state),
+                     "last_log_term": _raft_last_log_term(state)})
+        i = i + 1
+    _raft_result(state, msgs)
+
+fn raft_receive_vote_request(state: dict, msg: dict) -> dict
+    let msgs = []
+    if msg["term"] > state["term"]
+        state["term"] = msg["term"]
+        state["role"] = "follower"
+        state["voted_for"] = ""
+    let grant = 0
+    if msg["term"] >= state["term"]
+        if state["voted_for"] == "" or state["voted_for"] == msg["from"]
+            if msg["last_log_term"] > _raft_last_log_term(state)
+                grant = 1
+            else
+                if msg["last_log_term"] == _raft_last_log_term(state)
+                    if msg["last_log_index"] >= _raft_last_log_index(state)
+                        grant = 1
+    if grant == 1
+        state["voted_for"] = msg["from"]
+    push(msgs, {"type": "vote_response", "to": msg["from"], "from": state["node_id"],
+                "term": state["term"], "granted": grant})
+    _raft_result(state, msgs)
+
+fn raft_receive_vote_response(state: dict, msg: dict) -> dict
+    if msg["term"] > state["term"]
+        state["term"] = msg["term"]
+        state["role"] = "follower"
+        state["voted_for"] = ""
+        return _raft_result(state, [])
+    if state["role"] != "candidate"
+        return _raft_result(state, [])
+    if msg["granted"] == 1
+        state["votes_received"][msg["from"]] = 1
+    let vote_count = len(keys(state["votes_received"]))
+    if vote_count >= _raft_majority(state)
+        state = _raft_become_leader(state)
+    _raft_result(state, [])
+
+fn raft_receive_append(state: dict, msg: dict) -> dict
+    if msg["term"] > state["term"]
+        state["term"] = msg["term"]
+        state["role"] = "follower"
+        state["voted_for"] = ""
+    if msg["term"] < state["term"]
+        return _raft_result(state, [{"type": "append_response", "to": msg["from"],
+                                      "from": state["node_id"], "term": state["term"],
+                                      "success": 0, "match_index": 0}])
+    state["role"] = "follower"
+    let prev_idx = msg["prev_log_index"]
+    let prev_term = msg["prev_log_term"]
+    let ok = 1
+    if prev_idx > 0
+        if prev_idx > len(state["log"])
+            ok = 0
+        else
+            if state["log"][prev_idx - 1]["term"] != prev_term
+                ok = 0
+    if ok == 0
+        return _raft_result(state, [{"type": "append_response", "to": msg["from"],
+                                      "from": state["node_id"], "term": state["term"],
+                                      "success": 0, "match_index": 0}])
+    let entries = msg["entries"]
+    let j = 0
+    while j < len(entries)
+        let idx = prev_idx + j + 1
+        if idx <= len(state["log"])
+            state["log"][idx - 1] = entries[j]
+        else
+            push(state["log"], entries[j])
+        j = j + 1
+    if msg["leader_commit"] > state["commit_index"]
+        let last = len(state["log"])
+        if msg["leader_commit"] < last
+            state["commit_index"] = msg["leader_commit"]
+        else
+            state["commit_index"] = last
+    let mi = prev_idx + len(entries)
+    _raft_result(state, [{"type": "append_response", "to": msg["from"],
+                           "from": state["node_id"], "term": state["term"],
+                           "success": 1, "match_index": mi}])
+
+fn raft_receive_append_response(state: dict, msg: dict) -> dict
+    if msg["term"] > state["term"]
+        state["term"] = msg["term"]
+        state["role"] = "follower"
+        state["voted_for"] = ""
+        return _raft_result(state, [])
+    if state["role"] != "leader"
+        return _raft_result(state, [])
+    if msg["success"] == 1
+        state["match_index"][msg["from"]] = msg["match_index"]
+        state["next_index"][msg["from"]] = msg["match_index"] + 1
+        // advance commit_index if majority have replicated
+        let log_len = len(state["log"])
+        let n = state["commit_index"] + 1
+        while n <= log_len
+            if state["log"][n - 1]["term"] == state["term"]
+                let count = 1
+                let peers = state["peers"]
+                let i = 0
+                while i < len(peers)
+                    if state["match_index"][peers[i]] >= n
+                        count = count + 1
+                    i = i + 1
+                if count >= _raft_majority(state)
+                    state["commit_index"] = n
+            n = n + 1
+    else
+        let ni = state["next_index"][msg["from"]]
+        if ni > 1
+            state["next_index"][msg["from"]] = ni - 1
+    _raft_result(state, [])
+
+fn raft_client_request(state: dict, command: string) -> dict
+    if state["role"] != "leader"
+        return _raft_result(state, [])
+    push(state["log"], raft_log_entry(state["term"], command))
+    let msgs = []
+    let peers = state["peers"]
+    let i = 0
+    while i < len(peers)
+        let ni = state["next_index"][peers[i]]
+        let entries = []
+        let j = ni - 1
+        while j < len(state["log"])
+            push(entries, state["log"][j])
+            j = j + 1
+        let prev_term = 0
+        if ni > 1
+            prev_term = state["log"][ni - 2]["term"]
+        push(msgs, {"type": "append_entries", "to": peers[i], "from": state["node_id"],
+                     "term": state["term"], "prev_log_index": ni - 1, "prev_log_term": prev_term,
+                     "entries": entries, "leader_commit": state["commit_index"]})
+        i = i + 1
+    _raft_result(state, msgs)
+
+fn raft_committed_entries(state: dict) -> list
+    let out = []
+    let i = 0
+    while i < state["commit_index"]
+        push(out, state["log"][i])
+        i = i + 1
+    out

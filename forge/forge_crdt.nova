@@ -1,0 +1,230 @@
+// forge_crdt — Conflict-free Replicated Data Types for the Mesh distributed framework.
+// CRDTs enable eventually-consistent shared state across distributed nodes without
+// coordination (no locks, no consensus for data ops). Each type has a merge(a, b)
+// that is commutative, associative, and idempotent — so any order/duplication of
+// messages converges to the same state.
+//
+// Implemented CRDTs:
+//   G-Counter  (grow-only counter — each node has its own slot; value = sum of slots)
+//   PN-Counter (positive-negative counter — pair of G-Counters)
+//   G-Set      (grow-only set — union-merge, elements never removed)
+//   OR-Set     (observed-remove set — add wins over concurrent remove; tag-based)
+//   LWW-Register (last-writer-wins register — timestamp-ordered)
+//   MV-Register  (multi-value register — concurrent writes produce all values)
+
+// ── G-Counter ──────────────────────────────────────────────────────────────────
+
+fn gctr_new() -> dict
+    {"_type": "gctr", "slots": {}}
+
+fn gctr_inc(c: dict, node_id: string, amount: int) -> dict
+    let slots = c["slots"]
+    let cur = 0
+    if contains(slots, node_id)
+        cur = slots[node_id]
+    let new_slots = {node_id: cur + amount, ...slots}
+    new_slots[node_id] = cur + amount
+    {"_type": "gctr", "slots": new_slots}
+
+fn gctr_value(c: dict) -> int
+    let total = 0
+    let keys_list = keys(c["slots"])
+    let i = 0
+    while i < len(keys_list)
+        total = total + c["slots"][keys_list[i]]
+        i = i + 1
+    total
+
+fn gctr_merge(a: dict, b: dict) -> dict
+    let merged = {}
+    let ka = keys(a["slots"])
+    let i = 0
+    while i < len(ka)
+        let k = ka[i]
+        merged[k] = a["slots"][k]
+        i = i + 1
+    let kb = keys(b["slots"])
+    i = 0
+    while i < len(kb)
+        let k = kb[i]
+        let bv = b["slots"][k]
+        if contains(merged, k)
+            if bv > merged[k]
+                merged[k] = bv
+        else
+            merged[k] = bv
+        i = i + 1
+    {"_type": "gctr", "slots": merged}
+
+// ── PN-Counter ─────────────────────────────────────────────────────────────────
+
+fn pnctr_new() -> dict
+    {"_type": "pnctr", "p": gctr_new(), "n": gctr_new()}
+
+fn pnctr_inc(c: dict, node_id: string, amount: int) -> dict
+    {"_type": "pnctr", "p": gctr_inc(c["p"], node_id, amount), "n": c["n"]}
+
+fn pnctr_dec(c: dict, node_id: string, amount: int) -> dict
+    {"_type": "pnctr", "p": c["p"], "n": gctr_inc(c["n"], node_id, amount)}
+
+fn pnctr_value(c: dict) -> int
+    gctr_value(c["p"]) - gctr_value(c["n"])
+
+fn pnctr_merge(a: dict, b: dict) -> dict
+    {"_type": "pnctr", "p": gctr_merge(a["p"], b["p"]), "n": gctr_merge(a["n"], b["n"])}
+
+// ── G-Set (grow-only set) ──────────────────────────────────────────────────────
+
+fn gset_new() -> dict
+    {"_type": "gset", "elems": {}}
+
+fn gset_add(s: dict, elem: string) -> dict
+    let elems = {elem: 1, ...s["elems"]}
+    elems[elem] = 1
+    {"_type": "gset", "elems": elems}
+
+fn gset_contains(s: dict, elem: string) -> int
+    contains(s["elems"], elem)
+
+fn gset_elements(s: dict) -> list
+    keys(s["elems"])
+
+fn gset_merge(a: dict, b: dict) -> dict
+    let merged = {}
+    let ka = keys(a["elems"])
+    let i = 0
+    while i < len(ka)
+        merged[ka[i]] = 1
+        i = i + 1
+    let kb = keys(b["elems"])
+    i = 0
+    while i < len(kb)
+        merged[kb[i]] = 1
+        i = i + 1
+    {"_type": "gset", "elems": merged}
+
+// ── OR-Set (observed-remove set) ───────────────────────────────────────────────
+// Each add tags the element with a unique id; remove removes only OBSERVED tags.
+// Concurrent add + remove: the new add's tag survives (add-wins semantics).
+
+fn orset_new() -> dict
+    {"_type": "orset", "entries": {}, "tag_counter": 0}
+
+fn orset_add(s: dict, elem: string, node_id: string) -> dict
+    let tc = s["tag_counter"] + 1
+    let tag = "{node_id}:{tc}"
+    let entries = s["entries"]
+    let existing = {}
+    if contains(entries, elem)
+        existing = entries[elem]
+    existing[tag] = 1
+    entries[elem] = existing
+    {"_type": "orset", "entries": entries, "tag_counter": tc}
+
+fn orset_remove(s: dict, elem: string) -> dict
+    let entries = s["entries"]
+    if contains(entries, elem)
+        entries[elem] = {}
+    {"_type": "orset", "entries": entries, "tag_counter": s["tag_counter"]}
+
+fn orset_contains(s: dict, elem: string) -> int
+    if contains(s["entries"], elem)
+        return len(keys(s["entries"][elem])) > 0
+    0
+
+fn orset_elements(s: dict) -> list
+    let out = []
+    let ks = keys(s["entries"])
+    let i = 0
+    while i < len(ks)
+        if len(keys(s["entries"][ks[i]])) > 0
+            push(out, ks[i])
+        i = i + 1
+    out
+
+fn orset_merge(a: dict, b: dict) -> dict
+    let merged = {}
+    let all_keys = {}
+    let ka = keys(a["entries"])
+    let i = 0
+    while i < len(ka)
+        all_keys[ka[i]] = 1
+        i = i + 1
+    let kb = keys(b["entries"])
+    i = 0
+    while i < len(kb)
+        all_keys[kb[i]] = 1
+        i = i + 1
+    let all_k = keys(all_keys)
+    i = 0
+    while i < len(all_k)
+        let elem = all_k[i]
+        let tags = {}
+        if contains(a["entries"], elem)
+            let at = keys(a["entries"][elem])
+            let j = 0
+            while j < len(at)
+                tags[at[j]] = 1
+                j = j + 1
+        if contains(b["entries"], elem)
+            let bt = keys(b["entries"][elem])
+            let j = 0
+            while j < len(bt)
+                tags[bt[j]] = 1
+                j = j + 1
+        merged[elem] = tags
+        i = i + 1
+    let tc = a["tag_counter"]
+    if b["tag_counter"] > tc
+        tc = b["tag_counter"]
+    {"_type": "orset", "entries": merged, "tag_counter": tc}
+
+// ── LWW-Register ───────────────────────────────────────────────────────────────
+
+fn lww_new(value: string, timestamp: int) -> dict
+    {"_type": "lww", "value": value, "ts": timestamp}
+
+fn lww_set(r: dict, value: string, timestamp: int) -> dict
+    if timestamp >= r["ts"]
+        return {"_type": "lww", "value": value, "ts": timestamp}
+    r
+
+fn lww_value(r: dict) -> string
+    r["value"]
+
+fn lww_merge(a: dict, b: dict) -> dict
+    if b["ts"] > a["ts"]
+        return b
+    a
+
+// ── MV-Register (multi-value) ──────────────────────────────────────────────────
+
+fn mvr_new() -> dict
+    {"_type": "mvr", "values": {}}
+
+fn mvr_set(r: dict, value: string, node_id: string, timestamp: int) -> dict
+    let tag = "{node_id}:{timestamp}"
+    {"_type": "mvr", "values": {tag: value}}
+
+fn mvr_values(r: dict) -> list
+    let out = []
+    let ks = keys(r["values"])
+    let i = 0
+    while i < len(ks)
+        push(out, r["values"][ks[i]])
+        i = i + 1
+    out
+
+fn mvr_merge(a: dict, b: dict) -> dict
+    let merged = {}
+    let ka = keys(a["values"])
+    let i = 0
+    while i < len(ka)
+        merged[ka[i]] = a["values"][ka[i]]
+        i = i + 1
+    let kb = keys(b["values"])
+    i = 0
+    while i < len(kb)
+        merged[kb[i]] = b["values"][kb[i]]
+        i = i + 1
+    {"_type": "mvr", "values": merged}
