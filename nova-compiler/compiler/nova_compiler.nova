@@ -4315,7 +4315,7 @@ fn parse_program(tokens: list, pe: list) -> list
             Stmt(stag, sn, se, sb, sp2, seb, sa, sl) =>
                 if stag != "error"
                     push(stmts, sr.stmt)
-    inline_module_consts(expand_derives(inject_service(inject_entity(inject_routes(inject_tests(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts))))), pe), pe)))))
+    inline_module_consts(expand_derives(inject_comptime(inject_service(inject_entity(inject_routes(inject_tests(inject_memo(inject_ensures(fuse_multiclause(_expand_destruct_list(_desugar_trail_fns(stmts))))), pe), pe))))))
 
 fn _to_lower_char(ch: string) -> string
     let lc = {}
@@ -4469,6 +4469,160 @@ fn inject_service(stmts: list) -> list
         push(out, s)
     for g in generated
         push(out, g)
+    out
+
+fn _ct_eval_expr(expr: any, env: dict, ct_fns: dict) -> any
+    match expr
+        Expr(tag, val, num, children, fields, ln) =>
+            if tag == "str"
+                return val
+            if tag == "int"
+                return num
+            if tag == "ident"
+                if contains(env, val) == true
+                    return env[val]
+                return 0
+            if tag == "binop"
+                let left = _ct_eval_expr(children[0], env, ct_fns)
+                let right = _ct_eval_expr(children[1], env, ct_fns)
+                if val == "+"
+                    if type_of(left) == "string"
+                        return left + right
+                    let il = int(str(left))
+                    let ir = int(str(right))
+                    return il + ir
+                if val == "-"
+                    let sl = int(str(left))
+                    let sr = int(str(right))
+                    return sl - sr
+                if val == "*"
+                    let ml = int(str(left))
+                    let mr = int(str(right))
+                    return ml * mr
+                if val == "/"
+                    let dl = int(str(left))
+                    let dr = int(str(right))
+                    if dr != 0
+                        return dl / dr
+                    return 0
+                if val == "=="
+                    if str(left) == str(right)
+                        return 1
+                    return 0
+                if val == "!="
+                    if str(left) != str(right)
+                        return 1
+                    return 0
+                if val == ">"
+                    let gl = int(str(left))
+                    let gr = int(str(right))
+                    if gl > gr
+                        return 1
+                    return 0
+                if val == "<"
+                    let ll = int(str(left))
+                    let lr = int(str(right))
+                    if ll < lr
+                        return 1
+                    return 0
+                return 0
+            if tag == "call"
+                if contains(ct_fns, val) == true
+                    let ct_fn = ct_fns[val]
+                    let fn_env = {}
+                    match ct_fn
+                        Stmt(ft, fn2, fe, fb, fp, feb, fa, fl) =>
+                            let pi = 0
+                            for p in fp
+                                match p
+                                    Param(pn, pt, pd) =>
+                                        if pi < len(children)
+                                            fn_env[pn] = _ct_eval_expr(children[pi], env, ct_fns)
+                                        pi = pi + 1
+                            return _ct_eval_body(fb, fn_env, ct_fns)
+                return 0
+    return 0
+
+fn _ct_eval_body(body: list, env: dict, ct_fns: dict) -> any
+    for s in body
+        match s
+            Stmt(tag, name, expr, sb, sp, seb, sa, sl) =>
+                if tag == "assign"
+                    env[name] = _ct_eval_expr(expr, env, ct_fns)
+                if tag == "return"
+                    return _ct_eval_expr(expr, env, ct_fns)
+                if tag == "if"
+                    let cond = _ct_eval_expr(expr, env, ct_fns)
+                    if cond != 0
+                        let r = _ct_eval_body(sb, env, ct_fns)
+                        if type_of(r) == "string" or r != 0
+                            return r
+                    else
+                        if len(seb) > 0
+                            let r2 = _ct_eval_body(seb, env, ct_fns)
+                            if type_of(r2) == "string" or r2 != 0
+                                return r2
+    return 0
+
+fn _ct_replace_expr(expr: any, ct_fns: dict) -> any
+    match expr
+        Expr(tag, val, num, children, fields, ln) =>
+            if tag == "call" and contains(ct_fns, val) == true
+                let env = {}
+                let result = _ct_eval_expr(expr, env, ct_fns)
+                if type_of(result) == "string"
+                    return Expr("str", result, 0, [], [], ln)
+                let int_str = str(result)
+                return Expr("int", int_str, int(int_str), [], [], ln)
+            if len(children) > 0
+                let nc = []
+                let ci = 0
+                while ci < len(children)
+                    push(nc, _ct_replace_expr(children[ci], ct_fns))
+                    ci = ci + 1
+                return Expr(tag, val, num, nc, fields, ln)
+            return expr
+    return expr
+
+fn _ct_replace_in_stmt(s: any, ct_fns: dict) -> any
+    match s
+        Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+            let new_expr = _ct_replace_expr(expr, ct_fns)
+            let new_body = []
+            let bi = 0
+            while bi < len(body)
+                push(new_body, _ct_replace_in_stmt(body[bi], ct_fns))
+                bi = bi + 1
+            let new_else = []
+            let ei = 0
+            while ei < len(else_body)
+                push(new_else, _ct_replace_in_stmt(else_body[ei], ct_fns))
+                ei = ei + 1
+            return Stmt(tag, name, new_expr, new_body, params, new_else, anns, sline)
+    return s
+
+fn inject_comptime(stmts: list) -> list
+    let ct_fns = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "fn"
+                    for an in anns
+                        match an
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ann" and av == "comptime"
+                                    ct_fns[name] = s
+    if len(ct_fns) == 0
+        return stmts
+    let out = []
+    for s in stmts
+        let is_ct = 0
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "fn" and contains(ct_fns, name) == true
+                    is_ct = 1
+        if is_ct == 0
+            push(out, _ct_replace_in_stmt(s, ct_fns))
     out
 
 // Module-level `let X = <scalar literal>` constant propagation. Module lets are NOT true
