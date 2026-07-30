@@ -1,0 +1,221 @@
+// forge_xlsx -- minimal XLSX (Office Open XML SpreadsheetML) generator. An .xlsx file is a ZIP
+// archive of XML parts; NOVA has no ZIP writer yet, so this module builds the individual XML parts
+// as strings (xlsx_to_xml -> dict of "path/in/zip" -> content) and leaves zipping the parts up as a
+// plain STORED/DEFLATEd archive to the caller (e.g. via a future forge_zip, or an external tool).
+//
+// Usage:
+//   let wb = xlsx_workbook_new()
+//   let s1 = xlsx_add_sheet(wb, "Sheet1")
+//   xlsx_set_cell(s1, 1, 1, "Name")
+//   xlsx_set_cell_number(s1, 1, 2, 42.0)
+//   let parts = xlsx_to_xml(wb)          // {"[Content_Types].xml": "...", "xl/workbook.xml": "...", ...}
+//
+// Model: a workbook holds sheets; a sheet holds cells (row, col are 1-based, matching the A1
+// notation Excel uses everywhere). String cells are deduplicated into ONE sharedStrings.xml table
+// at xlsx_to_xml time (the standard OOXML space optimization -- repeated header/label text is
+// stored once and referenced by index), so xlsx_set_cell never needs a workbook handle.
+// LEAF -- imports only std/core/sort (for a 2-key row,col cell ordering).
+import std/core/sort
+
+type XlsxCell
+    row: int      // 1-based
+    col: int      // 1-based
+    kind: string  // "s" = shared-string index lives in `value`'s dedup slot; "n" = numeric literal
+    value: string // kind=="s": the raw (unescaped) string text; kind=="n": the number rendered as text
+
+type XlsxSheet
+    name: string
+    cells: list   // list<XlsxCell>
+
+type XlsxWorkbook
+    sheets: list  // list<XlsxSheet>
+
+// A brand-new, empty workbook.
+fn xlsx_workbook_new() -> XlsxWorkbook
+    XlsxWorkbook([])
+
+// Add a new sheet named `name` to the workbook and return its handle. XLSX forbids
+// \ / ? * [ ] : in a sheet name (they are reserved for internal referencing syntax) -- replace
+// them with "_" so the generated file always opens cleanly. An empty name falls back to "Sheet".
+fn xlsx_add_sheet(wb: XlsxWorkbook, name: string) -> XlsxSheet
+    let sheet = XlsxSheet(_xlsx_safe_sheet_name(name), [])
+    wb.sheets.push(sheet)
+    sheet
+
+fn _xlsx_safe_sheet_name(name: string) -> string
+    let n = name
+    n = replace(n, "\\", "_")
+    n = replace(n, "/", "_")
+    n = replace(n, "?", "_")
+    n = replace(n, "*", "_")
+    n = replace(n, "[", "_")
+    n = replace(n, "]", "_")
+    n = replace(n, ":", "_")
+    if len(n) == 0
+        return "Sheet"
+    n
+
+// Set a text cell at (row, col), both 1-based (row 1 / col 1 == "A1"). Re-setting the same
+// (row, col) replaces the prior value rather than emitting a duplicate <c> for it.
+fn xlsx_set_cell(sheet: XlsxSheet, row: int, col: int, value: string)
+    sheet.cells = sheet.cells.filter(fn(c) not (c.row == row and c.col == col))
+    sheet.cells.push(XlsxCell(row, col, "s", value))
+
+// Set a numeric cell at (row, col), both 1-based.
+fn xlsx_set_cell_number(sheet: XlsxSheet, row: int, col: int, num: float)
+    sheet.cells = sheet.cells.filter(fn(c) not (c.row == row and c.col == col))
+    sheet.cells.push(XlsxCell(row, col, "n", str(num)))
+
+// Serialize the whole workbook to its OOXML parts: a dict of zip-entry-path -> XML text.
+// The caller is responsible for packaging these into an actual .xlsx (a ZIP archive) --
+// this module owns only the XML generation, not the ZIP container format.
+fn xlsx_to_xml(wb: XlsxWorkbook) -> dict
+    let shared = _xlsx_build_shared(wb)
+    let shared_list = shared["list"]
+    let shared_index = shared["index"]
+
+    let files = {}
+    files["_rels/.rels"] = _xlsx_rels_root()
+    files["[Content_Types].xml"] = _xlsx_content_types(len(wb.sheets))
+    files["xl/_rels/workbook.xml.rels"] = _xlsx_workbook_rels(len(wb.sheets))
+    files["xl/workbook.xml"] = _xlsx_workbook_xml(wb.sheets)
+    files["xl/sharedStrings.xml"] = _xlsx_shared_strings_xml(shared_list)
+
+    let i = 0
+    while i < len(wb.sheets)
+        let sheet = wb.sheets[i]
+        files["xl/worksheets/sheet" + str(i + 1) + ".xml"] = _xlsx_sheet_xml(sheet, shared_index)
+        i = i + 1
+
+    files
+
+// --- shared strings table --------------------------------------------------------------------
+
+// Scan every sheet's cells in workbook order and collect the DISTINCT string-kind cell values,
+// first-seen order (matches how Excel itself tends to lay out sharedStrings.xml). Returns
+// {"list": list<string> (index -> text), "index": dict<string,int> (text -> index)}.
+fn _xlsx_build_shared(wb: XlsxWorkbook) -> dict
+    let strs = []
+    let index = {}
+    for sheet in wb.sheets
+        for cell in sheet.cells
+            if cell.kind == "s"
+                if not index.contains(cell.value)
+                    index[cell.value] = len(strs)
+                    strs.push(cell.value)
+    {"list": strs, "index": index}
+
+// --- XML building blocks -----------------------------------------------------------------------
+
+fn _xlsx_q() -> string
+    chr(34)
+
+fn _xlsx_attr(name: string, value: string) -> string
+    " " + name + "=" + _xlsx_q() + value + _xlsx_q()
+
+fn _xlsx_decl() -> string
+    let q = _xlsx_q()
+    "<?xml version=" + q + "1.0" + q + " encoding=" + q + "UTF-8" + q + " standalone=" + q + "yes" + q + "?>"
+
+// Escape text-node content for XML: & < > (order matters -- & first, else the entities'
+// own '&' would get re-escaped).
+fn _xlsx_esc(s: string) -> string
+    let r = replace(s, "&", "&amp;")
+    r = replace(r, "<", "&lt;")
+    r = replace(r, ">", "&gt;")
+    r
+
+// Bijective base-26 column letters: 1 -> "A", 26 -> "Z", 27 -> "AA", 28 -> "AB", ...
+fn _xlsx_col_letters(col: int) -> string
+    let n = col
+    let out = ""
+    while n > 0
+        let rem = (n - 1) % 26
+        out = chr(65 + rem) + out
+        n = (n - 1) / 26
+    out
+
+// A1-style cell reference, e.g. (2, 3) -> "C2".
+fn _xlsx_cell_ref(row: int, col: int) -> string
+    _xlsx_col_letters(col) + str(row)
+
+// --- individual OOXML parts --------------------------------------------------------------------
+
+// _rels/.rels -- the package-level relationship that points at the workbook part.
+fn _xlsx_rels_root() -> string
+    let rel = "<Relationship" + _xlsx_attr("Id", "rId1") + _xlsx_attr("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument") + _xlsx_attr("Target", "xl/workbook.xml") + "/>"
+    _xlsx_decl() + "<Relationships" + _xlsx_attr("xmlns", "http://schemas.openxmlformats.org/package/2006/relationships") + ">" + rel + "</Relationships>"
+
+// [Content_Types].xml -- declares the MIME type of every part in the package.
+fn _xlsx_content_types(n_sheets: int) -> string
+    let out = "<Types" + _xlsx_attr("xmlns", "http://schemas.openxmlformats.org/package/2006/content-types") + ">"
+    out = out + "<Default" + _xlsx_attr("Extension", "rels") + _xlsx_attr("ContentType", "application/vnd.openxmlformats-package.relationships+xml") + "/>"
+    out = out + "<Default" + _xlsx_attr("Extension", "xml") + _xlsx_attr("ContentType", "application/xml") + "/>"
+    out = out + "<Override" + _xlsx_attr("PartName", "/xl/workbook.xml") + _xlsx_attr("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml") + "/>"
+    let i = 1
+    while i <= n_sheets
+        out = out + "<Override" + _xlsx_attr("PartName", "/xl/worksheets/sheet" + str(i) + ".xml") + _xlsx_attr("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml") + "/>"
+        i = i + 1
+    out = out + "<Override" + _xlsx_attr("PartName", "/xl/sharedStrings.xml") + _xlsx_attr("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml") + "/>"
+    out = out + "</Types>"
+    _xlsx_decl() + out
+
+// xl/_rels/workbook.xml.rels -- one relationship per worksheet plus one for sharedStrings.xml.
+fn _xlsx_workbook_rels(n_sheets: int) -> string
+    let out = "<Relationships" + _xlsx_attr("xmlns", "http://schemas.openxmlformats.org/package/2006/relationships") + ">"
+    let i = 1
+    while i <= n_sheets
+        out = out + "<Relationship" + _xlsx_attr("Id", "rId" + str(i)) + _xlsx_attr("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet") + _xlsx_attr("Target", "worksheets/sheet" + str(i) + ".xml") + "/>"
+        i = i + 1
+    out = out + "<Relationship" + _xlsx_attr("Id", "rId" + str(n_sheets + 1)) + _xlsx_attr("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings") + _xlsx_attr("Target", "sharedStrings.xml") + "/>"
+    out = out + "</Relationships>"
+    _xlsx_decl() + out
+
+// xl/workbook.xml -- the sheet list, each pointing at its worksheet part via r:id.
+fn _xlsx_workbook_xml(sheets: list) -> string
+    let out = "<workbook" + _xlsx_attr("xmlns", "http://schemas.openxmlformats.org/spreadsheetml/2006/main") + _xlsx_attr("xmlns:r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships") + "><sheets>"
+    let i = 0
+    while i < len(sheets)
+        let sheet = sheets[i]
+        out = out + "<sheet" + _xlsx_attr("name", _xlsx_esc(sheet.name)) + _xlsx_attr("sheetId", str(i + 1)) + " r:id=" + _xlsx_q() + "rId" + str(i + 1) + _xlsx_q() + "/>"
+        i = i + 1
+    out = out + "</sheets></workbook>"
+    _xlsx_decl() + out
+
+// xl/sharedStrings.xml -- the deduplicated string table, index order == list order.
+fn _xlsx_shared_strings_xml(strs: list) -> string
+    let n = len(strs)
+    let out = "<sst" + _xlsx_attr("xmlns", "http://schemas.openxmlformats.org/spreadsheetml/2006/main") + _xlsx_attr("count", str(n)) + _xlsx_attr("uniqueCount", str(n)) + ">"
+    for s in strs
+        out = out + "<si><t" + _xlsx_attr("xml:space", "preserve") + ">" + _xlsx_esc(s) + "</t></si>"
+    out = out + "</sst>"
+    _xlsx_decl() + out
+
+// xl/worksheets/sheetN.xml -- the actual grid: <row> elements grouped by row, each holding its
+// <c> cells sorted left-to-right. A string cell carries t="s" and its <v> holds the sharedStrings
+// INDEX (not the text itself); a number cell carries no `t` (numeric is the OOXML default) and
+// its <v> holds the literal number text.
+fn _xlsx_sheet_xml(sheet: XlsxSheet, shared_index: dict) -> string
+    let sorted_cells = sort_by(sheet.cells, fn(a, b) (a.row < b.row) or (a.row == b.row and a.col < b.col))
+    let n = len(sorted_cells)
+    let out = "<sheetData>"
+    let cur_row = -1
+    let i = 0
+    while i < n
+        let cell = sorted_cells[i]
+        if cell.row != cur_row
+            if cur_row != -1
+                out = out + "</row>"
+            out = out + "<row" + _xlsx_attr("r", str(cell.row)) + ">"
+            cur_row = cell.row
+        let ref = _xlsx_cell_ref(cell.row, cell.col)
+        if cell.kind == "s"
+            let idx = shared_index[cell.value]
+            out = out + "<c" + _xlsx_attr("r", ref) + _xlsx_attr("t", "s") + "><v>" + str(idx) + "</v></c>"
+        else
+            out = out + "<c" + _xlsx_attr("r", ref) + "><v>" + cell.value + "</v></c>"
+        i = i + 1
+    if cur_row != -1
+        out = out + "</row>"
+    out = out + "</sheetData>"
+    _xlsx_decl() + "<worksheet" + _xlsx_attr("xmlns", "http://schemas.openxmlformats.org/spreadsheetml/2006/main") + ">" + out + "</worksheet>"

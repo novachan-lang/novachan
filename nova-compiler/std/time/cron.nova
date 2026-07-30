@@ -1,136 +1,415 @@
 // ============================================================================
 // NOVA Standard Library — std/time/cron
-// Minimal cron expression matcher (5-field POSIX cron: minute hour dom month dow).
+// Standard 5-field cron expression parser, matcher, next-fire calculator, and
+// human-readable describer.  Pure integer arithmetic (via std/time/calendar
+// for calendar rollover), no libc calls.
 // ============================================================================
 //
 // PUBLIC API:
-//   cron_parse(expr)                        -> dict  keys: "min","hour","dom","month","dow"
-//   cron_field_matches(field, value) -> bool  field grammar: * | n | a,b,c | a-b | */n
-//   cron_matches(expr, minute, hour, dom, month, dow) -> bool
+//   cron_parse(expr)   -> dict   "minute","hour","day_of_month","month","day_of_week"
+//                                 each a SORTED, DEDUPED list<int> of valid values;
+//                                 also carries private bookkeeping keys
+//                                 "_dom_star" / "_dow_star" / "_valid" (bool).
+//   cron_matches(parsed, minute, hour, dom, month, dow) -> bool
+//   cron_next(parsed, year, month, day, hour, minute)   -> dict
+//                                 {"year","month","day","hour","minute"} of the
+//                                 next strictly-AFTER-given-instant fire time,
+//                                 or {} if the expression is unsatisfiable.
+//   cron_describe(expr) -> string  human-readable summary of the schedule.
 //
-// FIELD GRAMMAR:
-//   *        always matches
-//   */n      matches when value % n == 0
-//   a-b      matches when a <= value <= b
-//   a,b,...  matches when value equals any listed number
-//   n        matches when value == n
+// FIELD GRAMMAR (standard Vixie/POSIX cron, comma list of atoms per field):
+//   *        every value in range
+//   */n      every n-th value starting at the range floor
+//   a-b      inclusive range
+//   a-b/n    every n-th value within the inclusive range
+//   n        exact value
+//   a,b,c    union of any of the above atoms
+//   day_of_week additionally accepts 7 as an alias for Sunday (folded to 0).
+//
+// DOM/DOW "OR" QUIRK (matches real cron behavior):
+//   If EITHER day-of-month or day-of-week is the literal "*", the other field
+//   alone decides whether the day matches (ordinary AND, since "*" always
+//   matches). If BOTH are restricted (neither is "*"), a day matches if EITHER
+//   field matches (this is standard cron semantics, not a bug).
 //
 // EXAMPLES:
-//   cron_field_matches("*", 5)        -> true
-//   cron_field_matches("*/15", 30)    -> true
-//   cron_field_matches("10-20", 15)   -> true
-//   cron_field_matches("1,3,5", 3)    -> true
-//   cron_matches("0 12 * * *", 0, 12, 1, 1, 1) -> true
+//   let p = cron_parse("*/5 * * * *")
+//   cron_matches(p, 10, 9, 1, 1, 4)      -> true   (minute 10 is a multiple of 5)
+//   cron_describe("*/5 * * * *")          -> "every 5 minutes"
+//   cron_describe("0 3 * * 1-5")          -> "at 3:00 AM on weekdays"
 // ============================================================================
 
-// ── Private helpers ──────────────────────────────────────────────────────────
+import std/time/calendar
 
-// _cron_trim: strip a single leading/trailing space (fields from split won't
-// have extra whitespace if the input is well-formed, but guards anyway).
-fn _cron_trim(s) -> string
-    let n = len(s)
-    if n == 0
-        return s
-    let start = 0
-    let end_pos = n
-    if s[0:1] == " "
-        start = 1
-    if end_pos > start and s[end_pos - 1:end_pos] == " "
-        end_pos = end_pos - 1
-    s[start:end_pos]
+// ── Private: safe int parse with fallback ───────────────────────────────────
 
-// _cron_str_to_int: parse decimal integer string to int.
-// Delegates to native parse_int; returns -9999 for empty string (sentinel).
-fn _cron_str_to_int(s) -> int
-    let t = _cron_trim(s)
+fn _cron_int_or(s, dflt: int) -> int
+    let t = trim(s)
     if len(t) == 0
-        return -9999
-    parse_int(t)
+        return dflt
+    let r = parse_int_safe(t)
+    if is_ok(r)
+        return unwrap(r)
+    dflt
+
+// ── Private: expand one cron atom ("*", "*/n", "a-b", "a-b/n", "n") into a
+// list of concrete ints within [min_val, max_val]. Malformed atoms degrade
+// gracefully to the empty list rather than crashing.
+
+fn _cron_expand_item(item: string, min_val: int, max_val: int) -> list
+    let step = 1
+    let base = item
+    if contains(item, "/")
+        let parts = split(item, "/")
+        base = parts[0]
+        if len(parts) > 1
+            step = _cron_int_or(parts[1], 1)
+    if step <= 0
+        step = 1
+
+    let lo = min_val
+    let hi = max_val
+    if base == "*"
+        lo = min_val
+        hi = max_val
+    else if contains(base, "-")
+        let bp = split(base, "-")
+        if len(bp) >= 2
+            lo = _cron_int_or(bp[0], min_val)
+            hi = _cron_int_or(bp[1], max_val)
+        else
+            lo = min_val
+            hi = max_val
+    else
+        let v = _cron_int_or(base, min_val)
+        lo = v
+        hi = v
+
+    if lo < min_val
+        lo = min_val
+    if hi > max_val
+        hi = max_val
+
+    let result = []
+    if lo <= hi
+        let v = lo
+        while v <= hi
+            push(result, v)
+            v = v + step
+    result
+
+// ── Private: expand a full comma-separated field into a sorted, deduped list.
+
+fn _cron_expand_field(field: string, min_val: int, max_val: int) -> list
+    let items = split(field, ",")
+    let all = []
+    for it in items
+        let vals = _cron_expand_item(trim(it), min_val, max_val)
+        for v in vals
+            push(all, v)
+    let s = set_from_list(all)
+    let uniq = set_to_list(s)
+    uniq.sort()
+    uniq
+
+// day-of-week accepts 0..7, with 7 folded into 0 (Sunday alias).
+fn _cron_expand_dow(field: string) -> list
+    let raw = _cron_expand_field(field, 0, 7)
+    let folded = []
+    for v in raw
+        let vv = v
+        if vv == 7
+            vv = 0
+        push(folded, vv)
+    let s = set_from_list(folded)
+    let uniq = set_to_list(s)
+    uniq.sort()
+    uniq
 
 // ── PUBLIC API ────────────────────────────────────────────────────────────────
 
-// cron_parse: split a 5-field cron expression into a dict.
-// Fields: minute hour dom month dow (space-separated).
-// Returns dict with keys "min","hour","dom","month","dow".
-// Extra/missing fields are silently handled (missing fields default to "*").
-fn cron_parse(expr) -> dict
-    let parts = split(expr, " ")
+// cron_parse: parse a 5-field cron expression into a dict of expanded value
+// lists. An expression that doesn't split into exactly 5 whitespace-separated
+// fields parses as invalid (all fields empty, "_valid" = false) — callers
+// must check "_valid" (cron_matches/cron_next already do).
+fn cron_parse(expr: string) -> dict
+    let raw_fields = split(trim(expr), " ")
+    let clean = []
+    for f in raw_fields
+        if len(f) > 0
+            push(clean, f)
+
     let result = {}
-    let fmin = "*"
-    let fhour = "*"
-    let fdom = "*"
-    let fmonth = "*"
-    let fdow = "*"
-    if len(parts) > 0
-        fmin = _cron_trim(parts[0])
-    if len(parts) > 1
-        fhour = _cron_trim(parts[1])
-    if len(parts) > 2
-        fdom = _cron_trim(parts[2])
-    if len(parts) > 3
-        fmonth = _cron_trim(parts[3])
-    if len(parts) > 4
-        fdow = _cron_trim(parts[4])
-    result["min"] = fmin
-    result["hour"] = fhour
-    result["dom"] = fdom
-    result["month"] = fmonth
-    result["dow"] = fdow
+    if len(clean) != 5
+        result["minute"] = []
+        result["hour"] = []
+        result["day_of_month"] = []
+        result["month"] = []
+        result["day_of_week"] = []
+        result["_dom_star"] = false
+        result["_dow_star"] = false
+        result["_valid"] = false
+        return result
+
+    let f_min = clean[0]
+    let f_hour = clean[1]
+    let f_dom = clean[2]
+    let f_month = clean[3]
+    let f_dow = clean[4]
+
+    result["minute"] = _cron_expand_field(f_min, 0, 59)
+    result["hour"] = _cron_expand_field(f_hour, 0, 23)
+    result["day_of_month"] = _cron_expand_field(f_dom, 1, 31)
+    result["month"] = _cron_expand_field(f_month, 1, 12)
+    result["day_of_week"] = _cron_expand_dow(f_dow)
+    result["_dom_star"] = f_dom == "*"
+    result["_dow_star"] = f_dow == "*"
+    result["_valid"] = true
     result
 
-// cron_field_matches: evaluate one cron field string against a concrete integer value.
-// Supports: * | */n | a-b | a,b,c | n
-fn cron_field_matches(field, value) -> bool
-    // Wildcard — always matches.
-    if field == "*"
+// cron_matches: does the parsed schedule fire at this exact instant?
+// dow follows cron convention: 0=Sunday..6=Saturday (7 also accepted as Sunday).
+fn cron_matches(parsed, minute: int, hour: int, dom: int, month: int, dow: int) -> bool
+    if not parsed["_valid"]
+        return false
+    if not contains(parsed["minute"], minute)
+        return false
+    if not contains(parsed["hour"], hour)
+        return false
+    if not contains(parsed["month"], month)
+        return false
+
+    let dow_n = dow
+    if dow_n == 7
+        dow_n = 0
+
+    let dom_ok = contains(parsed["day_of_month"], dom)
+    let dow_ok = contains(parsed["day_of_week"], dow_n)
+    let dom_star = parsed["_dom_star"]
+    let dow_star = parsed["_dow_star"]
+
+    if dom_star and dow_star
         return true
+    if dom_star
+        return dow_ok
+    if dow_star
+        return dom_ok
+    dom_ok or dow_ok
 
-    // Step syntax */n — matches when value % n == 0.
-    if starts_with(field, "*/")
-        let step_s = slice(field, 2, len(field))
-        let step = _cron_str_to_int(step_s)
-        if step <= 0
-            return false
-        return value % step == 0
+// ── Private: does the calendar day (cy, cm, cd) satisfy month/dom/dow? ──────
 
-    // List syntax a,b,c — matches when value equals any element.
-    if contains(field, ",")
-        let elems = split(field, ",")
-        let i = 0
-        let matched = false
-        while i < len(elems) and not matched
-            let elem_v = _cron_str_to_int(elems[i])
-            if elem_v == value
-                matched = true
+fn _cron_day_matches(parsed, cy: int, cm: int, cd: int) -> bool
+    if not contains(parsed["month"], cm)
+        return false
+    let dow = cal_weekday(cy, cm, cd)
+    let dom_ok = contains(parsed["day_of_month"], cd)
+    let dow_ok = contains(parsed["day_of_week"], dow)
+    let dom_star = parsed["_dom_star"]
+    let dow_star = parsed["_dow_star"]
+    if dom_star and dow_star
+        return true
+    if dom_star
+        return dow_ok
+    if dow_star
+        return dom_ok
+    dom_ok or dow_ok
+
+// ── Private: advance (y, m, d) by exactly one calendar day. ────────────────
+
+fn _cron_advance_day(y: int, m: int, d: int) -> list
+    let dim = cal_days_in_month(y, m)
+    if d < dim
+        return [y, m, d + 1]
+    let nm = m + 1
+    let ny = y
+    if nm > 12
+        nm = 1
+        ny = y + 1
+    [ny, nm, 1]
+
+// ── Private: first (hour, minute) in the sorted lists strictly AFTER
+// (cur_hour, cur_minute). Returns [found(0/1), hour, minute].
+
+fn _cron_next_time_on_day(hours: list, minutes: list, cur_hour: int, cur_minute: int) -> list
+    for h in hours
+        if h > cur_hour
+            return [1, h, minutes[0]]
+        if h == cur_hour
+            for mi in minutes
+                if mi > cur_minute
+                    return [1, h, mi]
+    [0, 0, 0]
+
+// cron_next: the next fire time strictly after (year, month, day, hour, minute).
+// Returns {} if the schedule is malformed/unsatisfiable, or if none is found
+// within a ~4-year search bound (a well-formed cron always fires far sooner).
+fn cron_next(parsed, year: int, month: int, day: int, hour: int, minute: int) -> dict
+    if not parsed["_valid"]
+        return {}
+    let minutes = parsed["minute"]
+    let hours = parsed["hour"]
+    if len(minutes) == 0 or len(hours) == 0
+        return {}
+    if len(parsed["day_of_month"]) == 0 or len(parsed["month"]) == 0 or len(parsed["day_of_week"]) == 0
+        return {}
+
+    let dim0 = cal_days_in_month(year, month)
+    let cy = year
+    let cm = month
+    let cd = day
+    if cd > dim0
+        cd = dim0
+    if cd < 1
+        cd = 1
+
+    let max_days = 4 * 366 + 10
+    let day_idx = 0
+    while day_idx <= max_days
+        if _cron_day_matches(parsed, cy, cm, cd)
+            if day_idx == 0
+                let ht = _cron_next_time_on_day(hours, minutes, hour, minute)
+                if ht[0] == 1
+                    let out = {}
+                    out["year"] = cy
+                    out["month"] = cm
+                    out["day"] = cd
+                    out["hour"] = ht[1]
+                    out["minute"] = ht[2]
+                    return out
+            else
+                let out = {}
+                out["year"] = cy
+                out["month"] = cm
+                out["day"] = cd
+                out["hour"] = hours[0]
+                out["minute"] = minutes[0]
+                return out
+        let nxt = _cron_advance_day(cy, cm, cd)
+        cy = nxt[0]
+        cm = nxt[1]
+        cd = nxt[2]
+        day_idx = day_idx + 1
+    {}
+
+// ── Private: describe() helpers ─────────────────────────────────────────────
+
+fn _cron_is_full(lst: list, lo: int, hi: int) -> bool
+    let n = len(lst)
+    if n == 0
+        return false
+    if n != (hi - lo + 1)
+        return false
+    lst[0] == lo and lst[n - 1] == hi
+
+fn _cron_time_str(h: int, m: int) -> string
+    let ap = "AM"
+    let hh = h
+    if h == 0
+        hh = 12
+    else if h == 12
+        ap = "PM"
+    else if h > 12
+        hh = h - 12
+        ap = "PM"
+    let mm_s = str(m)
+    if m < 10
+        mm_s = "0" + mm_s
+    str(hh) + ":" + mm_s + " " + ap
+
+fn _cron_join_ints(lst: list) -> string
+    let strs = []
+    for v in lst
+        push(strs, str(v))
+    join(strs, ",")
+
+fn _cron_weekday_names(dows: list) -> list
+    let out = []
+    for d in dows
+        push(out, cal_weekday_name(d))
+    out
+
+fn _cron_join_names(names: list) -> string
+    let n = len(names)
+    if n == 0
+        return ""
+    if n == 1
+        return names[0]
+    let out = names[0]
+    let i = 1
+    while i < n - 1
+        out = out + ", " + names[i]
+        i = i + 1
+    out + " and " + names[n - 1]
+
+fn _cron_is_weekdays(dows: list) -> bool
+    len(dows) == 5 and dows[0] == 1 and dows[1] == 2 and dows[2] == 3 and dows[3] == 4 and dows[4] == 5
+
+fn _cron_is_weekends(dows: list) -> bool
+    len(dows) == 2 and dows[0] == 0 and dows[1] == 6
+
+// cron_describe: best-effort human-readable summary of a cron expression.
+fn cron_describe(expr: string) -> string
+    let parsed = cron_parse(expr)
+    if not parsed["_valid"]
+        return "invalid cron expression"
+
+    let minutes = parsed["minute"]
+    let hours = parsed["hour"]
+    let doms = parsed["day_of_month"]
+    let months = parsed["month"]
+    let dows = parsed["day_of_week"]
+
+    let min_full = _cron_is_full(minutes, 0, 59)
+    let hour_full = _cron_is_full(hours, 0, 23)
+    let dom_full = _cron_is_full(doms, 1, 31)
+    let month_full = _cron_is_full(months, 1, 12)
+    let dow_full = _cron_is_full(dows, 0, 6)
+
+    // "every N minutes" family — every other field unrestricted.
+    if hour_full and dom_full and month_full and dow_full
+        if min_full
+            return "every minute"
+        if len(minutes) == 1
+            return "at minute " + str(minutes[0]) + " past every hour"
+        let step = minutes[1] - minutes[0]
+        let uniform = true
+        let i = 1
+        while i < len(minutes)
+            if minutes[i] - minutes[i - 1] != step
+                uniform = false
             i = i + 1
-        return matched
+        if uniform and minutes[0] == 0 and step > 0
+            return "every " + str(step) + " minutes"
+        return "at minutes " + _cron_join_ints(minutes) + " past every hour"
 
-    // Range syntax a-b — matches when a <= value <= b.
-    if contains(field, "-")
-        let parts = split(field, "-")
-        if len(parts) < 2
-            return false
-        let lo = _cron_str_to_int(parts[0])
-        let hi = _cron_str_to_int(parts[1])
-        return value >= lo and value <= hi
+    // fixed single minute+hour ("clock time") family.
+    if len(minutes) == 1 and len(hours) == 1
+        let time_s = _cron_time_str(hours[0], minutes[0])
+        if dom_full and month_full and dow_full
+            return "daily at " + time_s
+        if dom_full and month_full and not dow_full
+            if _cron_is_weekdays(dows)
+                return "at " + time_s + " on weekdays"
+            if _cron_is_weekends(dows)
+                return "at " + time_s + " on weekends"
+            if len(dows) == 1
+                return "at " + time_s + " on " + cal_weekday_name(dows[0]) + "s"
+            return "at " + time_s + " on " + _cron_join_names(_cron_weekday_names(dows))
+        if not dom_full and month_full and dow_full
+            if len(doms) == 1
+                return "monthly on day " + str(doms[0]) + " at " + time_s
+            return "at " + time_s + " on days " + _cron_join_ints(doms) + " of the month"
+        if not month_full and dom_full and dow_full and len(months) == 1
+            return "yearly on " + cal_month_name(months[0]) + " at " + time_s
 
-    // Plain integer — exact match.
-    let exact = _cron_str_to_int(field)
-    exact == value
-
-// cron_matches: evaluate a full 5-field cron expression against concrete time components.
-// Parameters:
-//   expr   — cron expression string e.g. "0 12 * * *"
-//   minute — 0-59
-//   hour   — 0-23
-//   dom    — 1-31 (day of month)
-//   month  — 1-12
-//   dow    — 0-6 (day of week, 0=Sunday)
-fn cron_matches(expr, minute, hour, dom, month, dow) -> bool
-    let fields = cron_parse(expr)
-    let ok_min = cron_field_matches(fields["min"], minute)
-    let ok_hour = cron_field_matches(fields["hour"], hour)
-    let ok_dom = cron_field_matches(fields["dom"], dom)
-    let ok_month = cron_field_matches(fields["month"], month)
-    let ok_dow = cron_field_matches(fields["dow"], dow)
-    ok_min and ok_hour and ok_dom and ok_month and ok_dow
+    // generic fallback — always produces a valid, if plain, description.
+    let parts = []
+    push(parts, "minute " + _cron_join_ints(minutes))
+    push(parts, "hour " + _cron_join_ints(hours))
+    if not dom_full
+        push(parts, "day-of-month " + _cron_join_ints(doms))
+    if not month_full
+        push(parts, "month " + _cron_join_ints(months))
+    if not dow_full
+        push(parts, "day-of-week " + _cron_join_ints(dows))
+    "at " + join(parts, ", ")

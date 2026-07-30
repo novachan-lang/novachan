@@ -1,5 +1,10 @@
-// forge_svg -- minimal SVG element + document builders for server-side SVG generation (charts, badges, icons,
-// rendering a forge_identicon grid, sparklines). Compose primitives into an SVG string. LEAF -- imports NOTHING.
+// forge_svg -- SVG element + document builders for server-side SVG generation (charts, badges, icons,
+// rendering a forge_identicon grid, sparklines). Compose primitives into an SVG string. Built on the
+// primitives is a small charting layer: svg_bar_chart / svg_line_chart / svg_pie_chart / svg_scatter --
+// each takes `data: list<dict>` (items shaped {label, value} or {x, y} -- x/y falls back to value/index
+// when absent, so the same data list works across chart kinds) and `opts: dict` (optional "title",
+// "width", "height", "colors", "color"). Output is plain, dependency-free SVG that renders in any
+// browser or <img> tag with no client-side JS. LEAF -- imports NOTHING.
 
 fn _svg_q() -> string
     chr(34)
@@ -20,24 +25,394 @@ fn svg_line(x1: int, y1: int, x2: int, y2: int, stroke: string, width: int) -> s
 fn svg_text(x: int, y: int, content: string, fill: string) -> string
     "<text" + _svg_attr("x", str(x)) + _svg_attr("y", str(y)) + _svg_attr("fill", fill) + ">" + _svg_esc(content) + "</text>"
 
+// A polyline through `pts` (list of [x, y] int pairs), unfilled, stroked. Used by svg_line_chart for
+// the trend line itself (grid/axis stay as separate svg_line calls).
+fn svg_polyline(pts: list, stroke: string, width: int) -> string
+    let s = ""
+    let i = 0
+    while i < len(pts)
+        let p = pts[i]
+        if i > 0
+            s = s + " "
+        s = s + str(p[0]) + "," + str(p[1])
+        i = i + 1
+    "<polyline" + _svg_attr("points", s) + _svg_attr("fill", "none") + _svg_attr("stroke", stroke) + _svg_attr("stroke-width", str(width)) + "/>"
+
 fn _svg_esc(s: string) -> string
     let out = ""
+    let bts = str_to_bytes(s)
+    let n = len(bts)
     let i = 0
-    while i < len(s)
-        let c = char_at(s, i)
-        if c == "&"
+    while i < n
+        let c = bytes_get(bts, i)
+        if c == 38
             out = out + "&amp;"
         else
-            if c == "<"
+            if c == 60
                 out = out + "&lt;"
             else
-                if c == ">"
+                if c == 62
                     out = out + "&gt;"
                 else
-                    out = out + c
+                    out = out + chr(c)
         i = i + 1
     out
 
 // Wrap element markup in an <svg> root of the given size.
 fn svg_document(width: int, height: int, body: string) -> string
     "<svg" + _svg_attr("xmlns", "http://www.w3.org/2000/svg") + _svg_attr("width", str(width)) + _svg_attr("height", str(height)) + ">" + body + "</svg>"
+
+// ============================================================================
+// Charting layer
+// ============================================================================
+
+// The default categorical palette (Tableau-10-style): distinguishable on white and reasonably colorblind
+// friendly, used whenever opts has no "colors" list.
+fn _svg_default_colors() -> list
+    ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949", "#af7aa1", "#ff9da7", "#9c755f", "#bab0ac"]
+
+// PRIVATE: an int option from `opts`, tolerant of a float value (rounded), falling back to `default`
+// when the key is absent or holds a non-numeric value. Uses contains()+index (not .get with a
+// mismatched-type default) so a caller-supplied float never gets silently misread as an int.
+fn _svg_opt_int(opts: dict, key: string, default: int) -> int
+    if opts.contains(key)
+        let v = opts[key]
+        if is_int(v)
+            return v
+        if is_float(v)
+            return round(v)
+    default
+
+// PRIVATE: a string option from `opts`, falling back to `default` when absent or not a string.
+fn _svg_opt_str(opts: dict, key: string, default: string) -> string
+    if opts.contains(key)
+        let v = opts[key]
+        if is_string(v)
+            return v
+    default
+
+// PRIVATE: a list option from `opts` (e.g. "colors"), falling back to `default` when absent or not a list.
+fn _svg_opt_list(opts: dict, key: string, default: list) -> list
+    if opts.contains(key)
+        let v = opts[key]
+        if is_list(v)
+            return v
+    default
+
+// PRIVATE: a numeric field of a data item as a float, converting whatever numeric tag it actually
+// carries (int or float) via the generic float() builtin rather than trusting a typed default -- avoids
+// the "any" widen/read mismatch that a `.get(key, 0)` vs. an actual float value can hit.
+fn _svg_num(item: dict, key: string, fallback: float) -> float
+    if item.contains(key)
+        return float(item[key])
+    fallback
+
+// PRIVATE: a string field of a data item, falling back when absent.
+fn _svg_str(item: dict, key: string, fallback: string) -> string
+    if item.contains(key)
+        return str(item[key])
+    fallback
+
+// PRIVATE: an item's x coordinate for line/scatter charts -- explicit "x" if present, else its own
+// index in the series (so plain {value: n} data still plots as an evenly spaced series).
+fn _svg_item_x(item: dict, idx: int) -> float
+    if item.contains("x")
+        return _svg_num(item, "x", 0.0)
+    float(idx)
+
+// PRIVATE: an item's y coordinate for line/scatter charts -- explicit "y" if present, else "value"
+// (so the same {label, value} data used for bar/pie charts also plots on a line/scatter chart).
+fn _svg_item_y(item: dict) -> float
+    if item.contains("y")
+        return _svg_num(item, "y", 0.0)
+    _svg_num(item, "value", 0.0)
+
+// PRIVATE: a filled pie-wedge <path> from angle a0 to a1 (radians, 0 = +x axis, clockwise in SVG's
+// y-down space) around center (cx, cy) with radius r.
+fn _svg_pie_slice(cx: int, cy: int, r: int, a0: float, a1: float, fill: string) -> string
+    let x1 = float(cx) + float(r) * cos(a0)
+    let y1 = float(cy) + float(r) * sin(a0)
+    let x2 = float(cx) + float(r) * cos(a1)
+    let y2 = float(cy) + float(r) * sin(a1)
+    let large = 0
+    if a1 - a0 > pi()
+        large = 1
+    let d = "M " + str(cx) + " " + str(cy) + " L " + str(round(x1)) + " " + str(round(y1)) + " A " + str(r) + " " + str(r) + " 0 " + str(large) + " 1 " + str(round(x2)) + " " + str(round(y2)) + " Z"
+    "<path" + _svg_attr("d", d) + _svg_attr("fill", fill) + "/>"
+
+// Vertical bar chart. `data` items are {label, value}; `opts` may set "title", "width" (default 480),
+// "height" (default 320), "colors" (palette list, cycled per bar). The value range always spans at
+// least 0 (so a baseline is always drawn) and grows to include negative values if present. Renders
+// exactly one <rect> per data point.
+fn svg_bar_chart(data: list<dict>, opts: dict) -> string
+    let width = _svg_opt_int(opts, "width", 480)
+    let height = _svg_opt_int(opts, "height", 320)
+    let title = _svg_opt_str(opts, "title", "")
+    let colors = _svg_opt_list(opts, "colors", _svg_default_colors())
+    let n = len(data)
+
+    let top = 24
+    if title != ""
+        top = 48
+    let bottom = 44
+    let left = 50
+    let right = 20
+
+    let body = ""
+    if title != ""
+        body = body + svg_text(width / 2 - len(title) * 3, 24, title, "#222")
+    if n == 0
+        return svg_document(width, height, body)
+
+    let plot_w = width - left - right
+    let plot_h = height - top - bottom
+    if plot_w < 1
+        plot_w = 1
+    if plot_h < 1
+        plot_h = 1
+
+    // value range always includes 0 so there is always a baseline to draw bars from
+    let mn = 0.0
+    let mx = 0.0
+    for item in data
+        let v = _svg_num(item, "value", 0.0)
+        mn = min(mn, v)
+        mx = max(mx, v)
+    if mx == mn
+        mx = mn + 1.0
+    let span = mx - mn
+
+    let zero_y = float(top) + float(plot_h) - (0.0 - mn) / span * float(plot_h)
+    body = body + svg_line(left, round(zero_y), left + plot_w, round(zero_y), "#888", 1)
+    body = body + svg_line(left, top, left, top + plot_h, "#888", 1)
+
+    let slot_w = float(plot_w) / float(n)
+    let bar_w = round(slot_w * 0.7)
+    if bar_w < 1
+        bar_w = 1
+
+    for i, item in data
+        let v = _svg_num(item, "value", 0.0)
+        let label = _svg_str(item, "label", "")
+        let color = colors[i % len(colors)]
+
+        let val_y = float(top) + float(plot_h) - (v - mn) / span * float(plot_h)
+        let y_top = min(val_y, zero_y)
+        let y_bot = max(val_y, zero_y)
+        let bar_h = round(y_bot - y_top)
+        if bar_h < 0
+            bar_h = 0
+
+        let slot_x = float(left) + slot_w * float(i)
+        let bar_x = round(slot_x + (slot_w - float(bar_w)) / 2.0)
+
+        body = body + svg_rect(bar_x, round(y_top), bar_w, bar_h, color)
+        if label != ""
+            body = body + svg_text(bar_x + bar_w / 2 - len(label) * 3, top + plot_h + 16, label, "#333")
+
+    svg_document(width, height, body)
+
+// Line chart with point markers. `data` items are {x, y} or {label, value} (x defaults to the item's
+// index, y falls back to "value"). `opts` may set "title", "width", "height", "color". Draws one
+// <polyline> for the trend line plus exactly one <circle> per data point.
+fn svg_line_chart(data: list<dict>, opts: dict) -> string
+    let width = _svg_opt_int(opts, "width", 480)
+    let height = _svg_opt_int(opts, "height", 320)
+    let title = _svg_opt_str(opts, "title", "")
+    let color = _svg_opt_str(opts, "color", "#4e79a7")
+    let n = len(data)
+
+    let top = 24
+    if title != ""
+        top = 48
+    let bottom = 40
+    let left = 50
+    let right = 20
+
+    let body = ""
+    if title != ""
+        body = body + svg_text(width / 2 - len(title) * 3, 24, title, "#222")
+    if n == 0
+        return svg_document(width, height, body)
+
+    let plot_w = width - left - right
+    let plot_h = height - top - bottom
+    if plot_w < 1
+        plot_w = 1
+    if plot_h < 1
+        plot_h = 1
+
+    let xs = []
+    let ys = []
+    for i, item in data
+        push(xs, _svg_item_x(item, i))
+        push(ys, _svg_item_y(item))
+
+    let xmn = xs[0]
+    let xmx = xs[0]
+    let ymn = ys[0]
+    let ymx = ys[0]
+    for v in xs
+        xmn = min(xmn, v)
+        xmx = max(xmx, v)
+    for v in ys
+        ymn = min(ymn, v)
+        ymx = max(ymx, v)
+    if xmx == xmn
+        xmx = xmn + 1.0
+    if ymx == ymn
+        ymx = ymn + 1.0
+    let xspan = xmx - xmn
+    let yspan = ymx - ymn
+
+    // horizontal grid (fixed 4 divisions -- not data-driven, purely visual scaffolding)
+    let g = 0
+    while g <= 4
+        let gy = top + plot_h * g / 4
+        body = body + svg_line(left, gy, left + plot_w, gy, "#e6e6e6", 1)
+        g = g + 1
+    body = body + svg_line(left, top + plot_h, left + plot_w, top + plot_h, "#888", 1)
+    body = body + svg_line(left, top, left, top + plot_h, "#888", 1)
+
+    let pts = []
+    for i in 0..n
+        let px = left + round((xs[i] - xmn) / xspan * float(plot_w))
+        let py = top + plot_h - round((ys[i] - ymn) / yspan * float(plot_h))
+        push(pts, [px, py])
+    body = body + svg_polyline(pts, color, 2)
+
+    for p in pts
+        body = body + svg_circle(p[0], p[1], 3, color)
+
+    svg_document(width, height, body)
+
+// Pie chart with per-slice labels. `data` items are {label, value} (negative values clamp to 0). A
+// single non-zero slice renders as a full <circle>; two or more render as <path> wedges -- either way
+// exactly one shape element per data point with a value > 0.
+fn svg_pie_chart(data: list<dict>, opts: dict) -> string
+    let width = _svg_opt_int(opts, "width", 400)
+    let height = _svg_opt_int(opts, "height", 400)
+    let title = _svg_opt_str(opts, "title", "")
+    let colors = _svg_opt_list(opts, "colors", _svg_default_colors())
+    let n = len(data)
+
+    let top = 24
+    if title != ""
+        top = 48
+
+    let body = ""
+    if title != ""
+        body = body + svg_text(width / 2 - len(title) * 3, 24, title, "#222")
+    if n == 0
+        return svg_document(width, height, body)
+
+    let total = 0.0
+    for item in data
+        total = total + max(0.0, _svg_num(item, "value", 0.0))
+    if total <= 0.0
+        return svg_document(width, height, body)
+
+    // symmetric margin on every side (>= the 14px label offset below) so slice labels never
+    // clip the document edge, regardless of which side a slice's midpoint angle points toward
+    let margin = 26
+    let cx = width / 2
+    let cy = top + (height - top - margin) / 2
+    let avail_h = height - top - margin
+    let avail_w = width - margin * 2
+    let diameter = min(avail_h, avail_w)
+    let r = diameter / 2
+    if r < 8
+        r = 8
+
+    let nonzero = 0
+    for item in data
+        if _svg_num(item, "value", 0.0) > 0.0
+            nonzero = nonzero + 1
+
+    let angle = 0.0 - pi() / 2.0
+    for i, item in data
+        let v = max(0.0, _svg_num(item, "value", 0.0))
+        if v > 0.0
+            let color = colors[i % len(colors)]
+            let frac = v / total
+            let sweep = frac * 2.0 * pi()
+            let end_angle = angle + sweep
+            if nonzero == 1
+                body = body + svg_circle(cx, cy, r, color)
+            else
+                body = body + _svg_pie_slice(cx, cy, r, angle, end_angle, color)
+
+            let label = _svg_str(item, "label", "")
+            if label != ""
+                let mid = (angle + end_angle) / 2.0
+                let lx = float(cx) + (float(r) + 14.0) * cos(mid)
+                let ly = float(cy) + (float(r) + 14.0) * sin(mid)
+                body = body + svg_text(round(lx) - len(label) * 3, round(ly), label, "#333")
+
+            angle = end_angle
+
+    svg_document(width, height, body)
+
+// Scatter plot. `data` items are {x, y} or {label, value} (x defaults to index, y falls back to
+// "value"). `opts` may set "title", "width", "height", "color", "radius". Renders exactly one <circle>
+// per data point.
+fn svg_scatter(data: list<dict>, opts: dict) -> string
+    let width = _svg_opt_int(opts, "width", 480)
+    let height = _svg_opt_int(opts, "height", 320)
+    let title = _svg_opt_str(opts, "title", "")
+    let color = _svg_opt_str(opts, "color", "#e15759")
+    let radius = _svg_opt_int(opts, "radius", 4)
+    let n = len(data)
+
+    let top = 24
+    if title != ""
+        top = 48
+    let bottom = 40
+    let left = 50
+    let right = 20
+
+    let body = ""
+    if title != ""
+        body = body + svg_text(width / 2 - len(title) * 3, 24, title, "#222")
+    if n == 0
+        return svg_document(width, height, body)
+
+    let plot_w = width - left - right
+    let plot_h = height - top - bottom
+    if plot_w < 1
+        plot_w = 1
+    if plot_h < 1
+        plot_h = 1
+
+    let xs = []
+    let ys = []
+    for i, item in data
+        push(xs, _svg_item_x(item, i))
+        push(ys, _svg_item_y(item))
+
+    let xmn = xs[0]
+    let xmx = xs[0]
+    let ymn = ys[0]
+    let ymx = ys[0]
+    for v in xs
+        xmn = min(xmn, v)
+        xmx = max(xmx, v)
+    for v in ys
+        ymn = min(ymn, v)
+        ymx = max(ymx, v)
+    if xmx == xmn
+        xmx = xmn + 1.0
+    if ymx == ymn
+        ymx = ymn + 1.0
+    let xspan = xmx - xmn
+    let yspan = ymx - ymn
+
+    body = body + svg_line(left, top + plot_h, left + plot_w, top + plot_h, "#888", 1)
+    body = body + svg_line(left, top, left, top + plot_h, "#888", 1)
+
+    for i in 0..n
+        let px = left + round((xs[i] - xmn) / xspan * float(plot_w))
+        let py = top + plot_h - round((ys[i] - ymn) / yspan * float(plot_h))
+        body = body + svg_circle(px, py, radius, color)
+
+    svg_document(width, height, body)

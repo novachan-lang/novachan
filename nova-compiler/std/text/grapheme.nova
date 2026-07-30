@@ -1,0 +1,148 @@
+// ============================================================================
+// NOVA Standard Library — grapheme module
+// ============================================================================
+// WHAT: basic grapheme-CLUSTER awareness — the user-perceived "character",
+//   which can span MULTIPLE UTF-8 codepoints. "café" typed with a decomposed
+//   accent is 4 user-perceived characters ('c','a','f',"e+acute") but 5
+//   codepoints; a byte-index or codepoint-index walk over it is WRONG — it
+//   detaches the accent from its base letter and corrupts the text the
+//   instant you slice, count, or reverse it.
+//
+// SCOPE (V1, documented honestly — a practical subset, not full UAX-29):
+//   - ASCII                                  1 byte  = 1 grapheme
+//   - any well-formed 2/3/4-byte UTF-8 char  N bytes = 1 grapheme (no
+//     following combiner/ZWJ)
+//   - combining marks U+0300..U+036F (the combining diacriticals block —
+//     accents, umlauts, etc.) attach to the PRECEDING base character
+//   - ZWJ (U+200D) sequences: a zero-width joiner glues the codepoint that
+//     follows it onto the current cluster (the mechanism behind emoji like
+//     a ZWJ family / profession sequence)
+//   NOT handled (later extensions, see std/text/graphemex.nova for the
+//   fuller UAX-29 pass — GB3 CRLF, GB12/13 regional-indicator flag pairs,
+//   variation selectors, skin-tone modifiers): those are separate rules
+//   this module does not attempt. A malformed/truncated UTF-8 byte is
+//   passed through as its own 1-byte "grapheme" rather than corrupting or
+//   crashing — decoding here is always TOTAL.
+//
+// Public API:
+//   gr_len(s) -> int          // count of user-perceived characters
+//   gr_at(s, i) -> string     // the i-th grapheme cluster ("" if out of range)
+//   gr_split(s) -> list       // s broken into grapheme-cluster strings
+//   gr_reverse(s) -> string   // reverse by grapheme (never splits a cluster)
+//
+// Scanning strategy: str_to_bytes/bytes_get for O(1) random-access byte
+// scanning (the std/text convention — see casefold.nova's cf_fold audit
+// note), decoding just enough of each UTF-8 lead byte to know its width and,
+// for the lookahead codepoint, its value (needed to test combiner/ZWJ
+// membership). Cluster text is then cut out with NOVA's native s[start:end]
+// byte-range slice — no hand-rolled buffer needed since slicing already
+// copies exactly the right UTF-8 bytes.
+// ============================================================================
+
+// Number of bytes the UTF-8 sequence starting at bts[i] occupies. Validates
+// continuation bytes (0x80..0xBF) and that the sequence isn't truncated by
+// end-of-string; anything invalid or truncated is treated as a single raw
+// byte so decoding never over-reads and never loses data.
+fn _gr_char_len(bts, i: int, n: int) -> int
+    let b0 = bytes_get(bts, i)
+    if b0 < 128
+        return 1
+    if b0 >= 192 and b0 < 224 and i + 1 < n
+        let b1 = bytes_get(bts, i + 1)
+        if b1 >= 128 and b1 < 192
+            return 2
+        return 1
+    if b0 >= 224 and b0 < 240 and i + 2 < n
+        let b1 = bytes_get(bts, i + 1)
+        let b2 = bytes_get(bts, i + 2)
+        if b1 >= 128 and b1 < 192 and b2 >= 128 and b2 < 192
+            return 3
+        return 1
+    if b0 >= 240 and b0 < 248 and i + 3 < n
+        let b1 = bytes_get(bts, i + 1)
+        let b2 = bytes_get(bts, i + 2)
+        let b3 = bytes_get(bts, i + 3)
+        if b1 >= 128 and b1 < 192 and b2 >= 128 and b2 < 192 and b3 >= 128 and b3 < 192
+            return 4
+        return 1
+    return 1
+
+// Decode the codepoint value of the (already length-validated) UTF-8
+// sequence at bts[i], blen bytes long.
+fn _gr_decode_cp(bts, i: int, blen: int) -> int
+    let b0 = bytes_get(bts, i)
+    if blen == 1
+        return b0
+    if blen == 2
+        let b1 = bytes_get(bts, i + 1)
+        return ((b0 - 192) * 64) + (b1 - 128)
+    if blen == 3
+        let b1 = bytes_get(bts, i + 1)
+        let b2 = bytes_get(bts, i + 2)
+        return ((b0 - 224) * 4096) + ((b1 - 128) * 64) + (b2 - 128)
+    let b1 = bytes_get(bts, i + 1)
+    let b2 = bytes_get(bts, i + 2)
+    let b3 = bytes_get(bts, i + 3)
+    return ((b0 - 240) * 262144) + ((b1 - 128) * 4096) + ((b2 - 128) * 64) + (b3 - 128)
+
+// Combining diacritical marks (U+0300..U+036F) — attach to the previous
+// base character instead of starting a new grapheme.
+fn _gr_is_extend(cp: int) -> bool
+    cp >= 768 and cp <= 879
+
+// Zero-width joiner (U+200D) — glues the next codepoint onto this cluster.
+fn _gr_is_zwj(cp: int) -> bool
+    cp == 8205
+
+// Split s into a list of grapheme-cluster strings.
+fn gr_split(s: string) -> list
+    if len(s) == 0
+        return []
+    let bts = str_to_bytes(s)
+    let n = bytes_len(bts)
+    let out = []
+    let i = 0
+    while i < n
+        let start = i
+        let blen = _gr_char_len(bts, i, n)
+        i = i + blen
+        let scanning = true
+        while scanning and i < n
+            let blen2 = _gr_char_len(bts, i, n)
+            let cp2 = _gr_decode_cp(bts, i, blen2)
+            if _gr_is_extend(cp2)
+                i = i + blen2                 // absorb the combining mark
+            else if _gr_is_zwj(cp2)
+                i = i + blen2                 // consume the ZWJ itself
+                if i < n
+                    let blen3 = _gr_char_len(bts, i, n)
+                    i = i + blen3              // and the codepoint it joins
+            else
+                scanning = false
+        out.push(s[start:i])
+    out
+
+// Count of user-perceived characters (grapheme clusters), not bytes or
+// codepoints.
+fn gr_len(s: string) -> int
+    len(gr_split(s))
+
+// The idx-th user-perceived character. "" if idx is out of range (negative
+// or >= gr_len(s)) — never crashes on a bad index.
+fn gr_at(s: string, idx: int) -> string
+    let g = gr_split(s)
+    if idx < 0 or idx >= len(g)
+        return ""
+    g[idx]
+
+// Reverse s by grapheme cluster — a combining mark or ZWJ-joined sequence
+// stays attached to its base character (a naive byte or codepoint reverse
+// would detach it and corrupt the text).
+fn gr_reverse(s: string) -> string
+    let g = gr_split(s)
+    let out = ""
+    let i = len(g) - 1
+    while i >= 0
+        out = out + g[i]
+        i = i - 1
+    out

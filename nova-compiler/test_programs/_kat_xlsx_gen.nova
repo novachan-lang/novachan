@@ -1,0 +1,156 @@
+// _kat_xlsx_gen -- KAT for forge_xlsx: build a 2-sheet workbook, set string and numeric cells,
+// verify the generated XML parts contain correct A1-style cell references, correct shared-string
+// dedup/index wiring, and correct part-count wiring ([Content_Types].xml / workbook.xml.rels /
+// workbook.xml all agree on the sheet count).
+import forge_xlsx
+
+fn main()
+    let failures = 0
+
+    let wb = xlsx_workbook_new()
+    let s1 = xlsx_add_sheet(wb, "Sheet1")
+    let s2 = xlsx_add_sheet(wb, "Numbers")
+
+    // Sheet1: A1="Name" B1="Age" (strings), A2="Ann" B2 = 30 (number)
+    xlsx_set_cell(s1, 1, 1, "Name")
+    xlsx_set_cell(s1, 1, 2, "Age")
+    xlsx_set_cell(s1, 2, 1, "Ann")
+    xlsx_set_cell_number(s1, 2, 2, 30.0)
+    // "Name" reused at C1 -- must dedup to the SAME shared-string index as A1.
+    xlsx_set_cell(s1, 1, 3, "Name")
+    // overwrite B1 ("Age" -> "AgeYears") -- must replace, not duplicate, the <c r="B1">.
+    xlsx_set_cell(s1, 1, 2, "AgeYears")
+
+    // Numbers sheet: a lone float at column 27 (AA) to exercise the base-26 column-letter wrap.
+    xlsx_set_cell_number(s2, 5, 27, 3.14)
+    xlsx_set_cell(s2, 5, 1, "<tag> & \"quote\"")   // XML-injection-shaped text must come out escaped
+
+    let parts = xlsx_to_xml(wb)
+
+    // --- structural part presence -------------------------------------------------------------
+    let expect_keys = ["[Content_Types].xml", "xl/workbook.xml", "xl/sharedStrings.xml",
+        "xl/_rels/workbook.xml.rels", "_rels/.rels",
+        "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"]
+    for k in expect_keys
+        if not parts.contains(k)
+            print("MISSING PART: " + k)
+            failures = failures + 1
+
+    let ct = parts["[Content_Types].xml"]
+    let wbxml = parts["xl/workbook.xml"]
+    let rels = parts["xl/_rels/workbook.xml.rels"]
+    let shared = parts["xl/sharedStrings.xml"]
+    let sheet1 = parts["xl/worksheets/sheet1.xml"]
+    let sheet2 = parts["xl/worksheets/sheet2.xml"]
+
+    // --- [Content_Types].xml declares both worksheet parts + sharedStrings -------------------
+    if not ct.contains("/xl/worksheets/sheet1.xml")
+        print("content-types missing sheet1 override")
+        failures = failures + 1
+    if not ct.contains("/xl/worksheets/sheet2.xml")
+        print("content-types missing sheet2 override")
+        failures = failures + 1
+    if not ct.contains("sharedStrings")
+        print("content-types missing sharedStrings override")
+        failures = failures + 1
+
+    // --- xl/workbook.xml lists both sheets with rId1/rId2 -------------------------------------
+    if not wbxml.contains("<sheet name=" + chr(34) + "Sheet1" + chr(34))
+        print("workbook.xml missing Sheet1 entry")
+        failures = failures + 1
+    if not wbxml.contains("<sheet name=" + chr(34) + "Numbers" + chr(34))
+        print("workbook.xml missing Numbers entry")
+        failures = failures + 1
+    if not wbxml.contains("rId1")
+        print("workbook.xml missing rId1")
+        failures = failures + 1
+    if not wbxml.contains("rId2")
+        print("workbook.xml missing rId2")
+        failures = failures + 1
+
+    // --- xl/_rels/workbook.xml.rels: 2 worksheet rels + 1 sharedStrings rel, rId3 for shared --
+    if not rels.contains("worksheets/sheet1.xml")
+        print("rels missing sheet1 target")
+        failures = failures + 1
+    if not rels.contains("worksheets/sheet2.xml")
+        print("rels missing sheet2 target")
+        failures = failures + 1
+    if not rels.contains("rId3")
+        print("rels missing rId3 (sharedStrings relationship)")
+        failures = failures + 1
+    if not rels.contains("Target=" + chr(34) + "sharedStrings.xml" + chr(34))
+        print("rels missing sharedStrings.xml target")
+        failures = failures + 1
+
+    // --- shared strings: "Name" appears exactly ONCE (deduped across A1 sheet1 + C1 sheet1) ---
+    let name_count = len(split(shared, "<t xml:space=" + chr(34) + "preserve" + chr(34) + ">Name</t>")) - 1
+    if name_count != 1
+        print("expected exactly 1 'Name' <si>, got " + str(name_count))
+        failures = failures + 1
+    if not shared.contains("AgeYears")
+        print("shared strings missing overwritten AgeYears value")
+        failures = failures + 1
+    if shared.contains(">Age<")
+        print("shared strings still contains the OVERWRITTEN 'Age' text (overwrite semantics broken)")
+        failures = failures + 1
+    // injection-shaped text must be escaped, never raw
+    if shared.contains("<tag>")
+        print("XSS/injection: raw <tag> leaked unescaped into sharedStrings.xml")
+        failures = failures + 1
+    if not shared.contains("&lt;tag&gt; &amp; " + chr(34) + "quote" + chr(34))
+        print("shared strings: expected &lt;/&amp; escaped form not found")
+        failures = failures + 1
+
+    // --- sheet1.xml: correct A1 notation refs + t="s" on strings, none on the number ----------
+    if not sheet1.contains("<c r=" + chr(34) + "A1" + chr(34) + " t=" + chr(34) + "s" + chr(34) + ">")
+        print("sheet1 missing A1 string cell")
+        failures = failures + 1
+    if not sheet1.contains("<c r=" + chr(34) + "C1" + chr(34) + " t=" + chr(34) + "s" + chr(34) + ">")
+        print("sheet1 missing C1 string cell (dedup'd 'Name')")
+        failures = failures + 1
+    if not sheet1.contains("<c r=" + chr(34) + "B2" + chr(34) + "><v>30.0</v></c>")
+        print("sheet1 missing B2 numeric cell with value 30")
+        failures = failures + 1
+    if not sheet1.contains("<c r=" + chr(34) + "B1" + chr(34) + " t=" + chr(34) + "s" + chr(34) + ">")
+        print("sheet1 missing overwritten B1 cell")
+        failures = failures + 1
+    // rows must be grouped: exactly 2 <row> elements (row 1, row 2)
+    let row_count = len(split(sheet1, "<row ")) - 1
+    if row_count != 2
+        print("sheet1 expected 2 <row> groups, got " + str(row_count))
+        failures = failures + 1
+
+    // --- sheet2.xml: base-26 column-letter wrap (col 27 -> "AA") + float text ------------------
+    if not sheet2.contains("<c r=" + chr(34) + "AA5" + chr(34) + "><v>3.14</v></c>")
+        print("sheet2 missing AA5 numeric cell (base-26 column wrap broken)")
+        failures = failures + 1
+    if not sheet2.contains("<c r=" + chr(34) + "A5" + chr(34) + " t=" + chr(34) + "s" + chr(34) + ">")
+        print("sheet2 missing A5 string cell")
+        failures = failures + 1
+
+    // --- sanity on the well-known column-letter boundary cases (26 -> Z, 27 -> AA, 28 -> AB) ---
+    let wb2 = xlsx_workbook_new()
+    let sc = xlsx_add_sheet(wb2, "C")
+    xlsx_set_cell(sc, 1, 1, "a1")
+    xlsx_set_cell(sc, 1, 26, "z1")
+    xlsx_set_cell(sc, 1, 28, "ab1")
+    let sxml2 = xlsx_to_xml(wb2)["xl/worksheets/sheet1.xml"]
+    if not sxml2.contains("r=" + chr(34) + "Z1" + chr(34))
+        print("column-letter boundary: col 26 should be Z1")
+        failures = failures + 1
+    if not sxml2.contains("r=" + chr(34) + "AB1" + chr(34))
+        print("column-letter boundary: col 28 should be AB1")
+        failures = failures + 1
+
+    // --- edge case: an empty sheet must still produce a well-formed (empty) <sheetData/> -------
+    let wb3 = xlsx_workbook_new()
+    xlsx_add_sheet(wb3, "Empty")
+    let empty_xml = xlsx_to_xml(wb3)["xl/worksheets/sheet1.xml"]
+    if not empty_xml.contains("<sheetData></sheetData>")
+        print("empty sheet did not produce an empty <sheetData></sheetData>")
+        failures = failures + 1
+
+    if failures == 0
+        print("XLSX-GEN KAT PASS")
+    else
+        print(str(failures) + " FAILURES")

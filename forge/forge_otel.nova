@@ -69,6 +69,33 @@ fn otel_status(status: dict) -> dict
 // widened to JSON strings per the int64 rule). Optional, each defaulted and contains()-guarded:
 // kind (default 2/SERVER), attributes (default {} -> emits "attributes":[]), status (default
 // {"code":0} -> UNSET).
+// otel_event(ev) -> one OTLP span-event entry {"timeUnixNano":"..","name":..,"attributes":[...]}.
+// `ev` is the internal event shape produced by otel_span_add_event: {name, time_ns, attributes}.
+fn otel_event(ev: dict) -> dict
+    let attrs = {}
+    if contains(ev, "attributes")
+        attrs = ev["attributes"]
+    let o = {}
+    o["timeUnixNano"] = str(ev["time_ns"])
+    o["name"] = ev["name"]
+    o["attributes"] = otel_attributes(attrs)
+    o
+
+fn otel_events(events: list) -> list
+    let out = []
+    let i = 0
+    while i < len(events)
+        push(out, otel_event(events[i]))
+        i = i + 1
+    out
+
+// otel_span(span) -> one OTLP `spans[]` entry. Required fields: trace_id (16-byte/32-hex-char
+// string), span_id (8-byte/16-hex-char string), name, start_ns, end_ns (nanosecond epoch ints,
+// widened to JSON strings per the int64 rule). Optional, each defaulted and contains()-guarded:
+// kind (default 2/SERVER), attributes (default {} -> emits "attributes":[]), status (default
+// {"code":0} -> UNSET), parent_span_id (omitted entirely for a root span -- OTLP has no "root"
+// sentinel, the field is simply absent), events (omitted when there are none -- an empty
+// "events":[] on every leaf span would be pure noise in the export).
 fn otel_span(span: dict) -> dict
     let kind = 2
     if contains(span, "kind")
@@ -82,11 +109,19 @@ fn otel_span(span: dict) -> dict
     let o = {}
     o["traceId"] = span["trace_id"]
     o["spanId"] = span["span_id"]
+    if contains(span, "parent_span_id")
+        let psid = span["parent_span_id"]
+        if psid != ""
+            o["parentSpanId"] = psid
     o["name"] = span["name"]
     o["kind"] = kind
     o["startTimeUnixNano"] = str(span["start_ns"])
     o["endTimeUnixNano"] = str(span["end_ns"])
     o["attributes"] = otel_attributes(attrs)
+    if contains(span, "events")
+        let evs = span["events"]
+        if len(evs) > 0
+            o["events"] = otel_events(evs)
     o["status"] = otel_status(status)
     o
 
@@ -120,3 +155,215 @@ fn otel_export_request(spans: list, resource_attrs: dict, scope_name: string) ->
     let root = {}
     root["resourceSpans"] = [rs]
     json_stringify(root)
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// STATEFUL TRACER/SPAN API -- the everyday instrumentation surface. otel_span()/otel_attributes()/
+// otel_status()/otel_export_request() above are the pure OTLP wire-format SERIALIZERS; everything
+// below is the mutable tracer that accumulates completed spans and calls those serializers at export
+// time. Single-process, single-threaded (a Forge request handler, a batch job) -- there is no actor
+// here on purpose: a tracer is cheap, call-local state, not a shared registry (contrast
+// forge_obs's metrics_registry, which IS a shared actor because counters are cross-request).
+//
+// Trace/span id generation: 16 CSPRNG bytes -> 32 lowercase hex chars for a trace_id, 8 bytes -> 16
+// hex chars for a span_id (the W3C/OTel required widths). Built byte-by-byte via secure_bytes +
+// bytes_get rather than hex_encode(str) -- hex_encode operates on a NOVA string's bytes, and a NOVA
+// string is NUL-terminated, so a random byte string containing 0x00 would silently truncate (see
+// reference_nova_string_nul_truncation.md). Working on the `bytes` value directly sidesteps that.
+//
+// Parent/child linkage is IMPLICIT via a per-tracer active-span stack (like every mainstream OTel
+// SDK's "current span" context): otel_span_start pushes onto tracer["_stack"] and inherits trace_id +
+// parent_span_id from whatever is currently on top; otel_span_end pops by span_id (not blindly by
+// stack position) so out-of-order end() calls can't corrupt an ancestor's linkage. Call discipline is
+// still expected to nest (start A, start B, end B, end A) -- as in every OTel SDK -- but a caller that
+// slips (ends a span while descendants are still open) degrades gracefully rather than corrupting
+// state: the mis-ended span is removed from wherever it sits in the stack, everything else survives.
+
+// _otel_rand_hex(nbytes) -> nbytes CSPRNG bytes rendered as 2*nbytes lowercase hex chars.
+fn _otel_rand_hex(nbytes: int) -> string
+    let b = secure_bytes(nbytes)
+    let alpha = "0123456789abcdef"
+    let alpha_b = str_to_bytes(alpha)
+    let out = ""
+    let i = 0
+    while i < nbytes
+        let by = bytes_get(b, i)
+        out = out + chr(bytes_get(alpha_b, by / 16)) + chr(bytes_get(alpha_b, by % 16))
+        i = i + 1
+    out
+
+// _otel_is_hex(s, n) -> true iff s is exactly n lowercase/uppercase hex digits.
+fn _otel_is_hex(s: string, n: int) -> bool
+    if len(s) != n
+        return false
+    let bts = str_to_bytes(s)
+    let i = 0
+    while i < n
+        let o = bytes_get(bts, i)
+        let ok = (o >= 48 and o <= 57) or (o >= 97 and o <= 102) or (o >= 65 and o <= 70)
+        if ok == false
+            return false
+        i = i + 1
+    true
+
+// otel_tracer_create(service_name) -> a fresh tracer. Seeds the resource attributes with
+// "service.name" (the one OTLP resource attribute every backend expects for grouping) and uses the
+// service name as the instrumentation-scope name too, matching the common single-tracer-per-service
+// shape otel_export_request already assumes.
+fn otel_tracer_create(service_name: string) -> dict
+    let resource_attrs = {}
+    resource_attrs["service.name"] = service_name
+    let t = {}
+    t["service_name"] = service_name
+    t["resource_attrs"] = resource_attrs
+    t["scope_name"] = service_name
+    t["spans"] = []
+    t["_stack"] = []
+    t
+
+// otel_span_start(tracer, name) -> a new in-progress span, made the tracer's current span.
+// Root (no span currently active on this tracer): mints a fresh trace_id, parent_span_id = "".
+// Child (tracer has an active span): inherits its trace_id, parent_span_id = that span's span_id.
+// Default kind is 1/INTERNAL (an in-process operation) -- callers doing an inbound/outbound RPC span
+// should otel_span_set_attr the relevant semantic-convention keys and, if needed, override
+// span["kind"] directly (2 SERVER / 3 CLIENT / 4 PRODUCER / 5 CONSUMER per the header's SpanKind
+// table); a dedicated otel_span_start_kind is a tracked follow-up once a real call site needs it.
+fn otel_span_start(tracer, name: string) -> dict
+    let stack = tracer["_stack"]
+    let trace_id = _otel_rand_hex(16)
+    let parent_span_id = ""
+    if len(stack) > 0
+        let parent = stack[len(stack) - 1]
+        trace_id = parent["trace_id"]
+        parent_span_id = parent["span_id"]
+    let span = {}
+    span["_tracer"] = tracer
+    span["trace_id"] = trace_id
+    span["span_id"] = _otel_rand_hex(8)
+    span["parent_span_id"] = parent_span_id
+    span["name"] = name
+    span["kind"] = 1
+    span["start_ns"] = clock_ns()
+    span["end_ns"] = 0
+    span["attributes"] = {}
+    span["events"] = []
+    span["status"] = {"code": 0}
+    span["ended"] = 0
+    push(stack, span)
+    span
+
+// otel_span_set_attr(span, key, val) -> attach one attribute (string/int/float; NOVA's `any` cannot
+// distinguish bool from int, see otel_attr_value above). Mutates the span's live attribute dict in
+// place -- visible to otel_span_end because dicts are reference values in NOVA (a fetched nested
+// dict/list aliases the original, it is not a copy).
+fn otel_span_set_attr(span, key: string, val) -> int
+    let attrs = span["attributes"]
+    attrs[key] = val
+    0
+
+// otel_span_add_event(span, name, attrs) -> append a timestamped event (a log line pinned to this
+// span, e.g. "cache miss", "retrying"). attrs is a plain dict of event-scoped attributes ({} if none).
+fn otel_span_add_event(span, name: string, attrs: dict) -> int
+    let events = span["events"]
+    let ev = {}
+    ev["name"] = name
+    ev["time_ns"] = clock_ns()
+    ev["attributes"] = attrs
+    push(events, ev)
+    0
+
+// otel_span_set_status(span, code, msg) -> set the span's OTLP status (0 UNSET, 1 OK, 2 ERROR per the
+// header's StatusCode table). msg is optional context (e.g. an exception message); pass "" to omit
+// it -- an empty message is never emitted, matching otel_status's contains()-guarded read.
+fn otel_span_set_status(span, code: int, msg: string) -> int
+    let status = span["status"]
+    status["code"] = code
+    if msg != ""
+        status["message"] = msg
+    0
+
+// otel_span_end(span) -> close the span: stamps end_ns, removes it from the tracer's active-span
+// stack (wherever it sits -- see the out-of-order note above), and files a completed, export-ready
+// copy onto tracer["spans"]. Idempotent: ending an already-ended span is a no-op, so a `defer`-style
+// double-close (e.g. an explicit end() plus a cleanup-path end()) can't double-file the span.
+fn otel_span_end(span) -> int
+    if span["ended"] == 1
+        return 0
+    span["end_ns"] = clock_ns()
+    span["ended"] = 1
+    let tracer = span["_tracer"]
+    let stack = tracer["_stack"]
+    let target_id = span["span_id"]
+    let kept = []
+    let i = 0
+    while i < len(stack)
+        let s = stack[i]
+        if s["span_id"] != target_id
+            push(kept, s)
+        i = i + 1
+    tracer["_stack"] = kept
+    let completed = {}
+    completed["trace_id"] = span["trace_id"]
+    completed["span_id"] = span["span_id"]
+    let psid = span["parent_span_id"]
+    if psid != ""
+        completed["parent_span_id"] = psid
+    completed["name"] = span["name"]
+    completed["kind"] = span["kind"]
+    completed["start_ns"] = span["start_ns"]
+    completed["end_ns"] = span["end_ns"]
+    completed["attributes"] = span["attributes"]
+    let evs = span["events"]
+    if len(evs) > 0
+        completed["events"] = evs
+    completed["status"] = span["status"]
+    push(tracer["spans"], completed)
+    0
+
+// otel_context_inject(span) -> a single-entry {"traceparent": "..."} header dict per W3C Trace
+// Context: "00-<32-hex trace_id>-<16-hex span_id>-<2-hex flags>". Version is always "00" (the only
+// version this module speaks); flags is always "01" (sampled) -- this module always records, it never
+// samples out, so every propagated context is honestly marked sampled. Merge the result into the
+// caller's outbound request headers (e.g. `headers = headers.dict_merge(otel_context_inject(span))`).
+fn otel_context_inject(span) -> dict
+    let h = {}
+    h["traceparent"] = "00-" + span["trace_id"] + "-" + span["span_id"] + "-01"
+    h
+
+// otel_context_extract(headers) -> the inbound span context {"trace_id", "parent_span_id", "sampled"}
+// parsed from an inbound `traceparent` header, or {} if the header is missing or malformed (per the
+// W3C spec, a malformed traceparent is treated as "start a new trace", not an error). Validation
+// mirrors the wire grammar exactly: version(2hex)-traceid(32hex)-spanid(16hex)-flags(2hex), and
+// rejects the all-zero trace_id/span_id sentinels the spec reserves as invalid.
+fn otel_context_extract(headers: dict) -> dict
+    let empty = {}
+    if contains(headers, "traceparent") == false
+        return empty
+    let tp = headers["traceparent"]
+    let parts = split(tp, "-")
+    if len(parts) != 4
+        return empty
+    if _otel_is_hex(parts[0], 2) == false
+        return empty
+    if _otel_is_hex(parts[1], 32) == false
+        return empty
+    if _otel_is_hex(parts[2], 16) == false
+        return empty
+    if _otel_is_hex(parts[3], 2) == false
+        return empty
+    if parts[1] == "00000000000000000000000000000000"
+        return empty
+    if parts[2] == "0000000000000000"
+        return empty
+    let ctx = {}
+    ctx["trace_id"] = parts[1]
+    ctx["parent_span_id"] = parts[2]
+    ctx["sampled"] = parts[3] == "01"
+    ctx
+
+// otel_export_json(tracer) -> the full OTLP/HTTP JSON export body for every span this tracer has
+// completed so far (otel_span_end'd spans only -- an in-progress span is not exported, matching real
+// OTel exporters which only ship finished spans). Thin wrapper over otel_export_request using the
+// tracer's own resource attributes + scope name, so a Forge handler needs exactly this one call to
+// ship a batch: `post(collector_url + "/v1/traces", otel_export_json(tracer))`.
+fn otel_export_json(tracer) -> string
+    otel_export_request(tracer["spans"], tracer["resource_attrs"], tracer["scope_name"])

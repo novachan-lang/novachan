@@ -1,0 +1,124 @@
+// KAT for std/net/multipart — build a multipart body (2 text fields + 1
+// binary file), parse it back via BOTH the bytes API and the string
+// convenience API, and verify round-trip equality. Prints
+// "MULTIPART KAT PASS" iff every check succeeds.
+
+import std/net/multipart
+
+fn _bytes_from_list(codes: list) -> bytes
+    let out = bytes(0)
+    for c in codes
+        out = bytes_append(out, c)
+    out
+
+fn _bytes_eq(a, b) -> bool
+    let n = bytes_len(a)
+    if n != bytes_len(b)
+        return false
+    let i = 0
+    while i < n
+        if bytes_get(a, i) != bytes_get(b, i)
+            return false
+        i = i + 1
+    true
+
+fn main()
+    let ok = true
+
+    // ── 1. Build: 2 text fields (one with a quote-laden NAME) + 1 binary file
+    //    (payload includes an embedded NUL byte — proves genuine binary safety)
+    let b = mp_builder_new("TESTBOUNDARY123")
+    mp_add_field(b, "username", "alice")
+    mp_add_field(b, "she said \"hi\"", "42")
+    let file_codes = [72, 101, 108, 108, 111, 0, 87, 111, 114, 108, 100, 255, 1, 254]
+    let file_bytes = _bytes_from_list(file_codes)
+    mp_add_file(b, "avatar", "data.bin", "application/octet-stream", file_bytes)
+
+    let ct = mp_content_type(b)
+    if ct != "multipart/form-data; boundary=TESTBOUNDARY123"
+        print("FAIL: content-type mismatch: {ct}")
+        ok = false
+
+    let boundary = mp_extract_boundary(ct)
+    if boundary != "TESTBOUNDARY123"
+        print("FAIL: extract_boundary mismatch: {boundary}")
+        ok = false
+
+    // ── 2. Binary-safe round trip (mp_build_bytes / mp_parse_bytes) ─────────
+    let built = mp_build_bytes(b)
+    let parts = mp_parse_bytes(built, boundary)
+    if len(parts) != 3
+        print("FAIL: expected 3 parts, got {len(parts)}")
+        ok = false
+    else
+        let p0 = parts[0]
+        let p1 = parts[1]
+        let p2 = parts[2]
+
+        if p0["name"] != "username" or p0["filename"] != "" or p0["content_type"] != ""
+            print("FAIL: field 0 header mismatch")
+            ok = false
+        if bytes_to_str(p0["body"]) != "alice"
+            print("FAIL: field 0 body mismatch")
+            ok = false
+
+        if p1["name"] != "she said \"hi\""
+            let got_name = p1["name"]
+            print("FAIL: field 1 quoted-name round-trip mismatch: {got_name}")
+            ok = false
+        if bytes_to_str(p1["body"]) != "42"
+            print("FAIL: field 1 body mismatch")
+            ok = false
+
+        if p2["name"] != "avatar" or p2["filename"] != "data.bin" or p2["content_type"] != "application/octet-stream"
+            print("FAIL: file part header mismatch")
+            ok = false
+        if not _bytes_eq(p2["body"], file_bytes)
+            print("FAIL: file body binary round-trip mismatch (NUL byte lost?)")
+            ok = false
+
+    // ── 3. String convenience API round trip (ASCII-only builder) ───────────
+    let b2 = mp_builder_new("SIMPLEBOUND")
+    mp_add_field(b2, "a", "1")
+    mp_add_field(b2, "b", "two words")
+    mp_add_file(b2, "note", "note.txt", "text/plain", str_to_bytes("plain ascii content"))
+    let str_body = mp_build(b2)
+    let parts2 = mp_parse(str_body, "SIMPLEBOUND")
+    if len(parts2) != 3
+        print("FAIL: string API expected 3 parts, got {len(parts2)}")
+        ok = false
+    else
+        if parts2[0]["name"] != "a" or parts2[0]["body"] != "1"
+            print("FAIL: string API field a mismatch")
+            ok = false
+        if parts2[1]["name"] != "b" or parts2[1]["body"] != "two words"
+            print("FAIL: string API field b mismatch")
+            ok = false
+        if parts2[2]["name"] != "note" or parts2[2]["filename"] != "note.txt" or parts2[2]["content_type"] != "text/plain" or parts2[2]["body"] != "plain ascii content"
+            print("FAIL: string API file mismatch")
+            ok = false
+
+    // ── 4. Edge cases ─────────────────────────────────────────────────────
+    if len(mp_parse_bytes(bytes(0), "X")) != 0
+        print("FAIL: empty bytes body should parse to 0 parts")
+        ok = false
+    if len(mp_parse("", "X")) != 0
+        print("FAIL: empty string body should parse to 0 parts")
+        ok = false
+    if len(mp_parse_bytes(built, "")) != 0
+        print("FAIL: empty boundary should parse to 0 parts")
+        ok = false
+
+    let empty_builder = mp_builder_new("EMPTYB")
+    let empty_built = mp_build(empty_builder)
+    if empty_built != "--EMPTYB--\r\n"
+        print("FAIL: empty builder body mismatch: {empty_built}")
+        ok = false
+    if len(mp_parse(empty_built, "EMPTYB")) != 0
+        print("FAIL: empty builder parse should yield 0 parts")
+        ok = false
+
+    if ok
+        print("MULTIPART KAT PASS")
+    else
+        print("MULTIPART KAT FAIL")

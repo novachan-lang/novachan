@@ -1,0 +1,314 @@
+// ============================================================================
+// NOVA Standard Library — std/net/multipart
+// ============================================================================
+// RFC 2046 / RFC 7578 multipart/form-data builder AND parser. Framework-
+// independent (works over plain `string` or a raw `bytes` buffer read off a
+// socket) — Forge's HTTP server has its own Request-coupled multipart path;
+// this is the general-purpose primitive any NOVA program can reach for.
+//
+// PUBLIC API — build side:
+//   mp_builder_new(boundary: string) -> MpBuilder
+//     Start a builder. `boundary` is the caller-chosen delimiter token (must
+//     not appear inside any part's content) — generate one with a random hex
+//     string / ULID if you don't already have one.
+//   mp_add_field(builder, name: string, value: string)
+//     Append a plain text form field.
+//   mp_add_file(builder, name: string, filename: string, content_type: string, body: bytes)
+//     Append a file part. `body` is a `bytes` buffer so file content is
+//     BINARY-SAFE end to end (embedded NUL bytes survive) — this is why file
+//     content is typed `bytes` and not `string` (a NOVA `string` truncates at
+//     the first NUL byte, silently corrupting real binary uploads).
+//   mp_content_type(builder) -> string
+//     The exact "multipart/form-data; boundary=..." header to send alongside
+//     the body (always agrees with the boundary actually used).
+//   mp_build_bytes(builder) -> bytes
+//     The complete multipart body as a `bytes` buffer — binary-safe, use this
+//     for real file uploads / wire transmission (tcp_send_bytes, etc.).
+//   mp_build(builder) -> string
+//     Convenience wrapper around mp_build_bytes for text-only bodies (no part
+//     contains an embedded NUL byte). If ANY part's content can contain a NUL
+//     byte, use mp_build_bytes instead — this string form silently truncates
+//     at the first NUL like every other NOVA string.
+//
+// PUBLIC API — parse side:
+//   mp_extract_boundary(content_type_header: string) -> string
+//     Pull the boundary token out of a raw (case-preserved) Content-Type
+//     header value, e.g. "multipart/form-data; boundary=X" -> "X". Handles a
+//     quoted boundary and a trailing "; charset=..." parameter. "" if absent.
+//   mp_parse_bytes(body: bytes, boundary: string) -> list<dict>
+//     Binary-safe parse. Returns a list of
+//       {"name": string, "filename": string, "content_type": string, "body": bytes}
+//     `filename` is "" for a plain field. `content_type` is "" when the part
+//     did not declare one. Malformed/truncated input yields whatever complete
+//     parts were found before the point of failure (never crashes, never
+//     spins — parsing always terminates because the scan position strictly
+//     advances every iteration).
+//   mp_parse(body: string, boundary: string) -> list<dict>
+//     Convenience wrapper: same shape as mp_parse_bytes but "body" in each
+//     result dict is a `string`. Only use this when you already have the
+//     multipart body as a `string` (i.e. binary safety was already lost
+//     upstream, or you know every part is text) — for genuine binary content
+//     read the raw bytes off the wire and call mp_parse_bytes directly.
+//
+// FORMAT (per RFC 2046 §5.1.1 / RFC 7578):
+//   --BOUNDARY\r\n
+//   Content-Disposition: form-data; name="NAME"[; filename="FILENAME"]\r\n
+//   [Content-Type: TYPE\r\n]
+//   \r\n
+//   PAYLOAD\r\n
+//   --BOUNDARY\r\n
+//   ... (repeat per part) ...
+//   --BOUNDARY--\r\n
+//
+// DESIGN NOTES:
+//   * The delimiter a part's payload actually ends at is "\r\n--BOUNDARY" —
+//     the leading CRLF belongs to the delimiter, NOT the payload. Getting
+//     this backwards (splitting on a bare "--BOUNDARY" and keeping the CRLF
+//     inside the payload) is the single most common multipart parsing bug;
+//     mp_parse_bytes gets this right by searching for the CRLF-prefixed
+//     delimiter and slicing the payload to end exactly before it.
+//   * `name=` / `filename=` are RFC 2045 quoted-strings: a literal `"` or `\`
+//     inside the value must be backslash-escaped when building, and must be
+//     un-escaped when parsing. _mp_escape / _mp_read_quoted_value implement
+//     both directions so a field name containing a quote round-trips exactly.
+//   * A NUL byte inside a part's HEADER block (not its payload) is rejected
+//     (the scan stops there) — bytes_to_str is a C-string conversion, so a
+//     NUL there would silently truncate the header text and could smuggle a
+//     forged name/filename/content-type past a naive parser.
+//   * All byte-level scanning goes through str_to_bytes/bytes_get (never
+//     char_at in a loop) so it's O(n) instead of O(n^2).
+//
+// SYMBOL COLLISION GUARD: types are `Mp`-prefixed (MpBuilder/MpPart) — a bare
+// `Part`/`Builder` would collide with other modules that define those names
+// (e.g. Forge's own `type Part`). Private helpers are `_mp_`-prefixed.
+//
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// One accumulated part in a builder, or one decoded part from a parse.
+type MpPart
+    name: string
+    filename: string        // "" for a plain field (not a file)
+    content_type: string    // "" when unspecified
+    body: bytes              // binary-safe payload
+
+type MpBuilder
+    boundary: string
+    parts: list              // list<MpPart>
+
+// ── Build side ─────────────────────────────────────────────────────────────
+
+fn mp_builder_new(boundary: string) -> MpBuilder
+    MpBuilder(boundary, [])
+
+fn mp_add_field(builder: MpBuilder, name: string, value: string)
+    push(builder.parts, MpPart(name, "", "", str_to_bytes(value)))
+
+fn mp_add_file(builder: MpBuilder, name: string, filename: string, content_type: string, body: bytes)
+    push(builder.parts, MpPart(name, filename, content_type, body))
+
+fn mp_content_type(builder: MpBuilder) -> string
+    "multipart/form-data; boundary=" + builder.boundary
+
+// Backslash-escape '"' and '\' per RFC 2045 quoted-string, byte-level (no
+// char_at-in-a-loop).
+fn _mp_escape(s: string) -> string
+    let b = str_to_bytes(s)
+    let n = bytes_len(b)
+    let out = ""
+    let i = 0
+    while i < n
+        let c = bytes_get(b, i)
+        if c == 34 or c == 92
+            out = out + chr(92) + chr(c)
+        else
+            out = out + chr(c)
+        i = i + 1
+    out
+
+// Render one part's header block (Content-Disposition [+ Content-Type] +
+// the trailing blank line that separates headers from payload).
+fn _mp_part_header(part: MpPart) -> string
+    let crlf = chr(13) + chr(10)
+    let q = chr(34)
+    let cd = "Content-Disposition: form-data; name=" + q + _mp_escape(part.name) + q
+    if part.filename != ""
+        cd = cd + "; filename=" + q + _mp_escape(part.filename) + q
+    let hdr = cd + crlf
+    if part.content_type != ""
+        hdr = hdr + "Content-Type: " + part.content_type + crlf
+    hdr + crlf
+
+fn mp_build_bytes(builder: MpBuilder) -> bytes
+    let crlf = chr(13) + chr(10)
+    let dash_boundary = "--" + builder.boundary
+    let out = bytes(0)
+    for part in builder.parts
+        out = bytes_append_str(out, dash_boundary + crlf)
+        out = bytes_append_str(out, _mp_part_header(part))
+        out = bytes_concat(out, part.body)
+        out = bytes_append_str(out, crlf)
+    out = bytes_append_str(out, dash_boundary + "--" + crlf)
+    out
+
+fn mp_build(builder: MpBuilder) -> string
+    bytes_to_str(mp_build_bytes(builder))
+
+// ── Shared byte-scan helpers ─────────────────────────────────────────────────
+
+// The ASCII byte codes of an (ASCII) string, as a list — precomputed once so
+// a hot scan compares ints rather than re-slicing/allocating per position.
+fn _mp_str_codes(s: string) -> list
+    let b = str_to_bytes(s)
+    let n = bytes_len(b)
+    [bytes_get(b, i) for i in 0..n]
+
+// Naive substring search for an ASCII `needle` inside bytes `hay`, from byte
+// offset `start`. O(n*m) — fine for multipart delimiters (boundary tokens are
+// short) over realistic body sizes. Returns -1 if absent.
+fn _mp_bytes_find(hay: bytes, needle: string, start: int) -> int
+    let nc = _mp_str_codes(needle)
+    let m = len(nc)
+    let n = bytes_len(hay)
+    if m == 0
+        return start
+    let i = start
+    if i < 0
+        i = 0
+    while i + m <= n
+        let j = 0
+        let matched = true
+        while j < m and matched
+            if bytes_get(hay, i + j) != nc[j]
+                matched = false
+            j = j + 1
+        if matched
+            return i
+        i = i + 1
+    -1
+
+// True if any byte in hay[a, e) is NUL.
+fn _mp_bytes_has_nul(hay: bytes, a: int, e: int) -> bool
+    let i = a
+    while i < e
+        if bytes_get(hay, i) == 0
+            return true
+        i = i + 1
+    false
+
+// ── Parse side ────────────────────────────────────────────────────────────
+
+// Read an RFC 2045 quoted-string's contents starting right AFTER its opening
+// '"', un-escaping "\X" -> "X" along the way. Stops at the first unescaped
+// '"'. Byte-level scan (no char_at-in-a-loop).
+fn _mp_read_quoted_value(s: string, start: int) -> string
+    let b = str_to_bytes(s)
+    let n = bytes_len(b)
+    let out = ""
+    let i = start
+    while i < n
+        let c = bytes_get(b, i)
+        if c == 92 and i + 1 < n
+            out = out + chr(bytes_get(b, i + 1))
+            i = i + 2
+        else if c == 34
+            return out
+        else
+            out = out + chr(c)
+            i = i + 1
+    out
+
+// Read a quoted attribute (key="value", with proper un-escaping) out of a
+// part's header text. Returns "" if the attribute is absent.
+fn _mp_attr(hdr: string, key: string) -> string
+    let needle = key + "=" + chr(34)
+    let at = find(hdr, needle)
+    if at < 0
+        return ""
+    _mp_read_quoted_value(hdr, at + len(needle))
+
+// Content-Type of a single part's header text ("" if it declares none).
+fn _mp_part_content_type(hdr: string) -> string
+    let low = lower(hdr)
+    let at = find(low, "content-type:")
+    if at < 0
+        return ""
+    let s = at + len("content-type:")
+    let rest = slice(hdr, s, len(hdr))
+    let nl = find(rest, chr(13) + chr(10))
+    let e = nl
+    if e < 0
+        e = len(rest)
+    trim(slice(rest, 0, e))
+
+// Binary-safe multipart parse. See module header for the full contract.
+fn mp_parse_bytes(body: bytes, boundary: string) -> list
+    let parts = []
+    if bytes_len(body) == 0 or len(boundary) == 0
+        return parts
+    let dash_boundary = "--" + boundary
+    let mid = chr(13) + chr(10) + dash_boundary
+    let header_end_marker = chr(13) + chr(10) + chr(13) + chr(10)
+    let pos = _mp_bytes_find(body, dash_boundary, 0)
+    if pos < 0
+        return parts
+    pos = pos + len(dash_boundary)
+    let n = bytes_len(body)
+    // Guard bounds the loop even under adversarial/malformed input; the scan
+    // position strictly increases every real iteration so this never trips
+    // on well-formed data, however large.
+    let guard = 0
+    while guard < 1000000
+        guard = guard + 1
+        // A boundary token followed by "--" is the CLOSING delimiter.
+        if pos + 2 <= n and bytes_get(body, pos) == 45 and bytes_get(body, pos + 1) == 45
+            return parts
+        // Otherwise it must be followed by CRLF (another part follows).
+        if pos + 2 > n or bytes_get(body, pos) != 13 or bytes_get(body, pos + 1) != 10
+            return parts
+        let hstart = pos + 2
+        let hend = _mp_bytes_find(body, header_end_marker, hstart)
+        if hend < 0
+            return parts
+        // A NUL inside the header would truncate bytes_to_str and could
+        // smuggle a forged name/filename/content-type past the real one.
+        if _mp_bytes_has_nul(body, hstart, hend)
+            return parts
+        let hdr = bytes_to_str(bytes_slice(body, hstart, hend))
+        let payload_start = hend + 4
+        // The payload ends right before the NEXT "\r\n--BOUNDARY" delimiter —
+        // that leading CRLF belongs to the delimiter, not the payload.
+        let delim = _mp_bytes_find(body, mid, payload_start)
+        if delim < 0
+            return parts
+        let payload = bytes_slice(body, payload_start, delim)
+        push(parts, {"name": _mp_attr(hdr, "name"), "filename": _mp_attr(hdr, "filename"), "content_type": _mp_part_content_type(hdr), "body": payload})
+        pos = delim + len(mid)
+    parts
+
+// String convenience wrapper — see module header for when to prefer this vs
+// mp_parse_bytes.
+fn mp_parse(body: string, boundary: string) -> list
+    let raw = mp_parse_bytes(str_to_bytes(body), boundary)
+    let out = []
+    for p in raw
+        push(out, {"name": p["name"], "filename": p["filename"], "content_type": p["content_type"], "body": bytes_to_str(p["body"])})
+    out
+
+// Pull the boundary token out of a raw (case-preserved — boundaries are
+// case-sensitive) Content-Type header value. "" if absent.
+fn mp_extract_boundary(content_type_header: string) -> string
+    let key = "boundary="
+    let at = find(content_type_header, key)
+    if at < 0
+        return ""
+    let rest = slice(content_type_header, at + len(key), len(content_type_header))
+    let semi = find(rest, ";")
+    if semi >= 0
+        rest = slice(rest, 0, semi)
+    rest = trim(rest)
+    if len(rest) >= 2 and ord(char_at(rest, 0)) == 34
+        if ord(char_at(rest, len(rest) - 1)) == 34
+            return slice(rest, 1, len(rest) - 1)
+        return slice(rest, 1, len(rest))
+    rest

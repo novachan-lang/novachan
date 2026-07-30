@@ -1,0 +1,98 @@
+// KAT for the expanded forge_otel: stateful tracer/span lifecycle, W3C context propagation, and
+// OTLP JSON export -- on top of the existing pure wire-format serializers (covered separately by
+// forgeotelkat_test.nova, which this test must not regress).
+import forge_otel
+
+fn main()
+    // ── 1) tracer creation ──────────────────────────────────────────────────────────────────────
+    let tracer = otel_tracer_create("checkout-svc")
+
+    // ── 2) parent + child + sibling span tree ───────────────────────────────────────────────────
+    //   parent
+    //     ├── child1  (ends before child2 starts)
+    //     └── child2  (sibling of child1)
+    let parent = otel_span_start(tracer, "handle_request")
+    assert_eq(parent["parent_span_id"], "")
+    assert_eq(len(parent["trace_id"]), 32)
+    assert_eq(len(parent["span_id"]), 16)
+
+    otel_span_set_attr(parent, "http.method", "POST")
+    otel_span_set_attr(parent, "http.status_code", 200)
+    otel_span_add_event(parent, "request_received", {})
+
+    let child1 = otel_span_start(tracer, "db_query")
+    assert_eq(child1["trace_id"], parent["trace_id"])
+    assert_eq(child1["parent_span_id"], parent["span_id"])
+    otel_span_set_attr(child1, "db.statement", "SELECT 1")
+    otel_span_set_status(child1, 1, "")
+    otel_span_end(child1)
+
+    let child2 = otel_span_start(tracer, "cache_lookup")
+    assert_eq(child2["trace_id"], parent["trace_id"])
+    assert_eq(child2["parent_span_id"], parent["span_id"])
+    // sibling of child1, not a child of it
+    assert(child2["span_id"] != child1["span_id"], "sibling spans must have distinct span_ids")
+    otel_span_set_status(child2, 2, "cache backend unreachable")
+    otel_span_end(child2)
+
+    otel_span_set_status(parent, 1, "")
+    otel_span_end(parent)
+
+    // double-end is a no-op (idempotent close), must not double-file the span
+    otel_span_end(parent)
+
+    // ── 3) W3C traceparent context propagation ──────────────────────────────────────────────────
+    let parent2 = otel_span_start(tracer, "background_job")
+    let headers = otel_context_inject(parent2)
+    let tp = headers["traceparent"]
+    assert_eq(len(tp), 55)
+    let parts = split(tp, "-")
+    assert_eq(len(parts), 4)
+    assert_eq(parts[0], "00")
+    assert_eq(parts[1], parent2["trace_id"])
+    assert_eq(parts[2], parent2["span_id"])
+    assert_eq(parts[3], "01")
+
+    let ctx = otel_context_extract(headers)
+    assert_eq(ctx["trace_id"], parent2["trace_id"])
+    assert_eq(ctx["parent_span_id"], parent2["span_id"])
+    assert_eq(ctx["sampled"], true)
+
+    // malformed / absent traceparent -> {} (start a new trace, per W3C spec)
+    let bad = otel_context_extract({})
+    assert_eq(len(keys(bad)), 0)
+    let bad2 = otel_context_extract({"traceparent": "not-a-real-header"})
+    assert_eq(len(keys(bad2)), 0)
+
+    otel_span_end(parent2)
+
+    // ── 4) OTLP JSON export contains all 4 completed spans ──────────────────────────────────────
+    let out = otel_export_json(tracer)
+    assert(find(out, "\"resourceSpans\"") >= 0, "export must have resourceSpans")
+    assert(find(out, "\"service.name\"") >= 0, "export must carry the service.name resource attr")
+    assert(find(out, "\"checkout-svc\"") >= 0, "export must carry the tracer's service name")
+    assert(find(out, "\"" + parent["span_id"] + "\"") >= 0, "export must include the parent span")
+    assert(find(out, "\"" + child1["span_id"] + "\"") >= 0, "export must include child1")
+    assert(find(out, "\"" + child2["span_id"] + "\"") >= 0, "export must include child2")
+    assert(find(out, "\"" + parent2["span_id"] + "\"") >= 0, "export must include the background_job span")
+    assert(find(out, "\"parentSpanId\":\"" + parent["span_id"] + "\"") >= 0, "child spans must carry parentSpanId")
+    assert(find(out, "\"name\":\"db_query\"") >= 0, "export must carry span names")
+    assert(find(out, "\"db.statement\"") >= 0, "export must carry span attributes")
+    assert(find(out, "\"events\"") >= 0, "export must carry span events where present")
+    assert(find(out, "\"request_received\"") >= 0, "export must carry event names")
+    assert(find(out, "\"code\":2") >= 0, "export must carry the ERROR status on cache_lookup")
+    assert(find(out, "\"cache backend unreachable\"") >= 0, "export must carry the status message")
+
+    // exactly 4 completed spans filed (double-end of parent must not have double-filed it): count
+    // "spanId" markers by repeatedly slicing past each match (find has no start-index overload).
+    let sc = 0
+    let rest = out
+    while true
+        let p = find(rest, "\"spanId\":\"")
+        if p < 0
+            break
+        sc = sc + 1
+        rest = slice(rest, p + 10, len(rest))
+    assert_eq(sc, 4)
+
+    print("FORGE_OTEL_EXPAND KAT PASS")
