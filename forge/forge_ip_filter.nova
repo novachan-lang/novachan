@@ -1,93 +1,83 @@
-// forge_ip_filter — IP whitelist/blacklist filtering.
-// Allow/deny lists with CIDR-like prefix matching.
+// forge_ip_filter -- IP-based access filtering (Sentinel). Allow/deny lists of glob-style IP patterns
+// (e.g. "10.0.0.*", "192.168.1.1", "*"), matched via forge_wildcard. DENY WINS OVER ALLOW: an address
+// matching any deny pattern is denied even if it also matches an allow pattern. When the allow list is
+// non-empty it acts as a WHITELIST (an address must match at least one allow pattern to pass); when empty,
+// every address not explicitly denied is allowed. Flat-key dict state (no nested dicts/lists), matching
+// forge_session_store's convention -- state is mutated in place; callers do not need to reassign.
+import forge_wildcard
 
 fn ipf_new() -> dict
-    let f = {}
-    f["allow"] = []
-    f["deny"] = []
-    f["mode"] = "allow-all"
-    f["log"] = []
-    f
+    let s = {}
+    s["allow_count"] = 0
+    s["deny_count"] = 0
+    s["total_checks"] = 0
+    s["denied_count"] = 0
+    s["allowed_count"] = 0
+    s
 
-fn ipf_set_mode(f: dict, mode: string) -> dict
-    f["mode"] = mode
-    f
+// Append a pattern to the allow list. Fluent (returns state).
+fn ipf_allow(state: dict, ip_pattern: string) -> dict
+    let idx = int(state["allow_count"])
+    state["allow_" + str(idx)] = ip_pattern
+    state["allow_count"] = idx + 1
+    state
 
-fn ipf_allow(f: dict, ip: string) -> dict
-    push(f["allow"], ip)
-    f
+// Append a pattern to the deny list. Fluent (returns state).
+fn ipf_deny(state: dict, ip_pattern: string) -> dict
+    let idx = int(state["deny_count"])
+    state["deny_" + str(idx)] = ip_pattern
+    state["deny_count"] = idx + 1
+    state
 
-fn ipf_deny(f: dict, ip: string) -> dict
-    push(f["deny"], ip)
-    f
-
-fn _ipf_prefix_match(ip: string, pattern: string) -> int
-    if pattern == "*"
-        return 1
-    if ip == pattern
-        return 1
-    let plen = len(pattern)
-    if plen == 0
-        return 0
-    let last_char = pattern[plen - 1]
-    if last_char != "*"
-        return 0
-    let prefix = ""
+// PRIVATE: does `ip` match any of the `count` patterns stored under key prefix `prefix + "<index>"`?
+fn _ipf_matches_any(state: dict, prefix: string, count: int, ip: string) -> bool
     let i = 0
-    while i < plen - 1
-        prefix = prefix + pattern[i]
+    while i < count
+        let pattern = str(state[prefix + str(i)])
+        if wildcard_match(pattern, ip)
+            return true
         i = i + 1
-    if len(ip) < len(prefix)
-        return 0
-    let j = 0
-    while j < len(prefix)
-        if ip[j] != prefix[j]
-            return 0
-        j = j + 1
-    1
+    false
 
-fn _ipf_in_list(lst: list, ip: string) -> int
+// ipf_check(state, ip_address) -> Result: always ok("allowed") or ok("denied"). Deny list is checked
+// first (deny wins). If the allow list is non-empty, ip_address must also match one of its patterns.
+fn ipf_check(state: dict, ip_address: string) -> Result
+    state["total_checks"] = int(state["total_checks"]) + 1
+    let deny_n = int(state["deny_count"])
+    if _ipf_matches_any(state, "deny_", deny_n, ip_address)
+        state["denied_count"] = int(state["denied_count"]) + 1
+        return ok("denied")
+    let allow_n = int(state["allow_count"])
+    if allow_n == 0
+        state["allowed_count"] = int(state["allowed_count"]) + 1
+        return ok("allowed")
+    if _ipf_matches_any(state, "allow_", allow_n, ip_address)
+        state["allowed_count"] = int(state["allowed_count"]) + 1
+        return ok("allowed")
+    state["denied_count"] = int(state["denied_count"]) + 1
+    ok("denied")
+
+fn ipf_allow_count(state: dict) -> int
+    int(state["allow_count"])
+
+fn ipf_deny_count(state: dict) -> int
+    int(state["deny_count"])
+
+fn ipf_total_checks(state: dict) -> int
+    int(state["total_checks"])
+
+fn ipf_denied_count(state: dict) -> int
+    int(state["denied_count"])
+
+fn ipf_allowed_count(state: dict) -> int
+    int(state["allowed_count"])
+
+// 1 if ip_pattern is present (verbatim) in the allow list, else 0.
+fn ipf_has_allow(state: dict, ip_pattern: string) -> int
+    let n = int(state["allow_count"])
     let i = 0
-    while i < len(lst)
-        let matched = _ipf_prefix_match(ip, lst[i])
-        if matched == 1
+    while i < n
+        if str(state["allow_" + str(i)]) == ip_pattern
             return 1
         i = i + 1
     0
-
-fn ipf_check(f: dict, ip: string) -> dict
-    let denied = _ipf_in_list(f["deny"], ip)
-    if denied == 1
-        let entry = {}
-        entry["ip"] = ip
-        entry["action"] = "denied"
-        push(f["log"], entry)
-        let r = {}
-        r["filter"] = f
-        r["allowed"] = 0
-        return r
-    if f["mode"] == "allow-list"
-        let allowed = _ipf_in_list(f["allow"], ip)
-        if allowed != 1
-            let entry = {}
-            entry["ip"] = ip
-            entry["action"] = "denied"
-            push(f["log"], entry)
-            let r = {}
-            r["filter"] = f
-            r["allowed"] = 0
-            return r
-    let entry = {}
-    entry["ip"] = ip
-    entry["action"] = "allowed"
-    push(f["log"], entry)
-    let r = {}
-    r["filter"] = f
-    r["allowed"] = 1
-    r
-
-fn ipf_log(f: dict) -> list
-    f["log"]
-
-fn ipf_log_count(f: dict) -> int
-    len(f["log"])

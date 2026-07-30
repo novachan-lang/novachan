@@ -1,0 +1,107 @@
+// forge_metric_alert -- metric-based alerting with per-metric thresholds (Pulse). Each registered metric
+// carries an optional threshold rule (op in "gt"/"lt"/"gte"/"lte" against an int value); ma_record fires
+// an alert (and counts it) whenever the newly recorded value breaches the rule. Flat-key dict state (no
+// nested dicts/lists), matching forge_alert_engine's `int(...)`-cast-on-read convention -- state is
+// mutated in place; callers do not need to reassign.
+
+fn ma_new() -> dict
+    let s = {}
+    s["metric_count"] = 0
+    s["total_alerts"] = 0
+    s["total_records"] = 0
+    s
+
+// Register a metric for monitoring. Idempotent -- re-adding an already-registered metric resets its
+// alert count/threshold/latest value without double-counting metric_count.
+fn ma_add_metric(state: dict, metric_name: string) -> dict
+    let k = "mtr_" + metric_name + "_registered"
+    if contains(state, k) != true
+        state["metric_count"] = int(state["metric_count"]) + 1
+    state[k] = 1
+    state["mtr_" + metric_name + "_alert_count"] = 0
+    state["mtr_" + metric_name + "_has_threshold"] = 0
+    state["mtr_" + metric_name + "_latest_set"] = 0
+    state["mtr_" + metric_name + "_latest"] = 0
+    state
+
+fn _ma_registered(state: dict, metric_name: string) -> bool
+    let k = "mtr_" + metric_name + "_registered"
+    if contains(state, k) != true
+        return false
+    int(state[k]) == 1
+
+// ma_set_threshold(state, metric_name, op, value) -> Result: op must be one of "gt"/"lt"/"gte"/"lte".
+fn ma_set_threshold(state: dict, metric_name: string, op: string, value: int) -> Result
+    if not _ma_registered(state, metric_name)
+        return err("metric not registered: " + metric_name)
+    if op != "gt" and op != "lt" and op != "gte" and op != "lte"
+        return err("invalid operator: " + op)
+    state["mtr_" + metric_name + "_threshold"] = value
+    state["mtr_" + metric_name + "_op"] = op
+    state["mtr_" + metric_name + "_has_threshold"] = 1
+    ok(value)
+
+fn _ma_breach(op: string, value: int, threshold: int) -> bool
+    if op == "gt"
+        return value > threshold
+    if op == "lt"
+        return value < threshold
+    if op == "gte"
+        return value >= threshold
+    if op == "lte"
+        return value <= threshold
+    false
+
+// ma_record(state, metric_name, value) -> Result: ok(state) on success (fires+counts an alert if a
+// threshold is set and breached by `value`). Err if the metric was never registered.
+fn ma_record(state: dict, metric_name: string, value: int) -> Result
+    if not _ma_registered(state, metric_name)
+        return err("metric not registered: " + metric_name)
+    state["mtr_" + metric_name + "_latest"] = value
+    state["mtr_" + metric_name + "_latest_set"] = 1
+    state["total_records"] = int(state["total_records"]) + 1
+    if int(state["mtr_" + metric_name + "_has_threshold"]) == 1
+        let op = str(state["mtr_" + metric_name + "_op"])
+        let threshold = int(state["mtr_" + metric_name + "_threshold"])
+        if _ma_breach(op, value, threshold)
+            state["mtr_" + metric_name + "_alert_count"] = int(state["mtr_" + metric_name + "_alert_count"]) + 1
+            state["total_alerts"] = int(state["total_alerts"]) + 1
+    ok(state)
+
+fn ma_alert_count(state: dict, metric_name: string) -> Result
+    if not _ma_registered(state, metric_name)
+        return err("metric not registered: " + metric_name)
+    ok(int(state["mtr_" + metric_name + "_alert_count"]))
+
+fn ma_total_alerts(state: dict) -> int
+    int(state["total_alerts"])
+
+fn ma_latest_value(state: dict, metric_name: string) -> Result
+    if not _ma_registered(state, metric_name)
+        return err("metric not registered: " + metric_name)
+    if int(state["mtr_" + metric_name + "_latest_set"]) != 1
+        return err("no value recorded for metric: " + metric_name)
+    ok(int(state["mtr_" + metric_name + "_latest"]))
+
+fn ma_metric_count(state: dict) -> int
+    int(state["metric_count"])
+
+// ma_is_alerting(state, metric_name) -> Result: ok(1) if the latest recorded value currently breaches
+// the metric's threshold, ok(0) if not (no threshold set, or no value recorded yet, both count as 0).
+// Err only if the metric was never registered.
+fn ma_is_alerting(state: dict, metric_name: string) -> Result
+    if not _ma_registered(state, metric_name)
+        return err("metric not registered: " + metric_name)
+    if int(state["mtr_" + metric_name + "_has_threshold"]) != 1
+        return ok(0)
+    if int(state["mtr_" + metric_name + "_latest_set"]) != 1
+        return ok(0)
+    let op = str(state["mtr_" + metric_name + "_op"])
+    let threshold = int(state["mtr_" + metric_name + "_threshold"])
+    let value = int(state["mtr_" + metric_name + "_latest"])
+    if _ma_breach(op, value, threshold)
+        return ok(1)
+    ok(0)
+
+fn ma_total_records(state: dict) -> int
+    int(state["total_records"])

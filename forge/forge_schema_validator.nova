@@ -1,88 +1,113 @@
-// forge_schema_validator — Validate data against schemas (field rules).
+// forge_schema_validator — Data schema validation (named schemas, typed fields).
+// Schemas are registered by name; each field has a declared type
+// ("string"/"int"/"bool") and an optional required flag. Field values
+// are validated against the declared type via runtime type inspection.
+//
+// STATE SHAPE (flat dict, no nesting):
+//   state["schema_count"]                        — int, number of distinct schemas.
+//   state["fc_"+schema]                           — int, field count for `schema`.
+//   state["hasfield_"+schema+"_"+field]           — int, 1 if `field` is declared on `schema`.
+//   state["type_"+schema+"_"+field]               — string, declared type for `field`.
+//   state["req_"+schema+"_"+field]                — int, 1 if `field` is required.
+//   state["total_validations"]                    — int, total sv_validate_field calls.
+//   state["pass_count"]                            — int, sv_validate_field calls that passed.
 
+// sv_new() -> dict
+// Create an empty schema validator.
 fn sv_new() -> dict
     let s = {}
-    s["rules"] = {}
-    s["rule_count"] = 0
-    s["validations"] = 0
-    s["failures"] = 0
+    s["schema_count"] = 0
+    s["total_validations"] = 0
+    s["pass_count"] = 0
     s
 
-fn sv_require(s: dict, field: string, field_type: string) -> dict
-    let k = str(s["rule_count"])
-    s["rules"][k + "_field"] = field
-    s["rules"][k + "_type"] = field_type
-    s["rules"][k + "_required"] = 1
-    s["rules"][k + "_min"] = -1
-    s["rules"][k + "_max"] = -1
-    s["rule_count"] = s["rule_count"] + 1
-    s
+// sv_add_field(state, schema_name, field_name, field_type) -> dict
+// Declare `field_name` on `schema_name` with type "string"/"int"/"bool".
+// Registers the schema on first use. Re-adding a field updates its type
+// without changing its required flag or the field count.
+fn sv_add_field(state: dict, schema_name: string, field_name: string, field_type: string) -> dict
+    let sk = "fc_" + schema_name
+    if contains(state, sk) != true
+        state["schema_count"] = state["schema_count"] + 1
+        state[sk] = 0
+    let hf = "hasfield_" + schema_name + "_" + field_name
+    if contains(state, hf) != true
+        state[sk] = state[sk] + 1
+        state["req_" + schema_name + "_" + field_name] = 0
+    state[hf] = 1
+    state["type_" + schema_name + "_" + field_name] = field_type
+    state
 
-fn sv_optional(s: dict, field: string, field_type: string) -> dict
-    let k = str(s["rule_count"])
-    s["rules"][k + "_field"] = field
-    s["rules"][k + "_type"] = field_type
-    s["rules"][k + "_required"] = 0
-    s["rules"][k + "_min"] = -1
-    s["rules"][k + "_max"] = -1
-    s["rule_count"] = s["rule_count"] + 1
-    s
+// sv_field_count(state, schema_name) -> Result
+// ok(number of declared fields), or err if the schema was never registered.
+fn sv_field_count(state: dict, schema_name: string) -> Result
+    let sk = "fc_" + schema_name
+    if contains(state, sk) != true
+        return err("schema not found: " + schema_name)
+    ok(state[sk])
 
-fn sv_range(s: dict, field: string, min_val: int, max_val: int) -> dict
-    let k = str(s["rule_count"])
-    s["rules"][k + "_field"] = field
-    s["rules"][k + "_type"] = "int"
-    s["rules"][k + "_required"] = 1
-    s["rules"][k + "_min"] = min_val
-    s["rules"][k + "_max"] = max_val
-    s["rule_count"] = s["rule_count"] + 1
-    s
+// sv_has_schema(state, schema_name) -> int
+fn sv_has_schema(state: dict, schema_name: string) -> int
+    let sk = "fc_" + schema_name
+    if contains(state, sk) == true
+        return 1
+    0
 
-fn sv_check_field(s: dict, data: dict, idx: int) -> string
-    let k = str(idx)
-    let field = s["rules"][k + "_field"]
-    let required = s["rules"][k + "_required"]
-    let has = contains(data, field)
-    if has != true
-        if required == 1
-            return "missing:" + field
-        return ""
-    let min_val = s["rules"][k + "_min"]
-    let max_val = s["rules"][k + "_max"]
-    if min_val >= 0
-        let v = data[field]
-        if v < min_val
-            return "below_min:" + field
-        if max_val >= 0
-            if v > max_val
-                return "above_max:" + field
-    ""
+// sv_schema_count(state) -> int
+fn sv_schema_count(state: dict) -> int
+    state["schema_count"]
 
-fn sv_validate(s: dict, data: dict) -> dict
-    let result = {}
-    s["validations"] = s["validations"] + 1
-    let errors = 0
-    let first_error = ""
-    let i = 0
-    while i < s["rule_count"]
-        let err = sv_check_field(s, data, i)
-        if err != ""
-            errors = errors + 1
-            if first_error == ""
-                first_error = err
-        i = i + 1
-    if errors > 0
-        s["failures"] = s["failures"] + 1
-    result["valid"] = errors == 0
-    result["errors"] = errors
-    result["first_error"] = first_error
-    result["s"] = s
-    result
+// _sv_type_matches(expected, actual) -> bool — internal type-compatibility check.
+// Bools may surface as "bool" or, in untyped `any` contexts, as "int"
+// (NOVA boxes true/false through the same numeric path there) — accept
+// either for an expected "bool" field so genuine mismatches (e.g. a
+// string) are still caught.
+fn _sv_type_matches(expected: string, actual: string) -> bool
+    if expected == actual
+        return true
+    if expected == "bool"
+        if actual == "int"
+            return true
+    false
 
-fn sv_rule_count(s: dict) -> int
-    s["rule_count"]
+// sv_validate_field(state, schema_name, field_name, value) -> Result
+// Validate one field value against its declared type. ok(value) on
+// success, err on unknown schema/field or a type mismatch. Counts
+// toward sv_total_validations / sv_pass_count either way (except
+// unknown-schema/field, which is not counted as a validation attempt).
+fn sv_validate_field(state: dict, schema_name: string, field_name: string, value: any) -> Result
+    let hf = "hasfield_" + schema_name + "_" + field_name
+    if contains(state, hf) != true
+        return err("field not declared: " + schema_name + "." + field_name)
+    state["total_validations"] = state["total_validations"] + 1
+    let expected = state["type_" + schema_name + "_" + field_name]
+    let actual = type_of(value)
+    if _sv_type_matches(expected, actual) != true
+        return err("type mismatch for " + field_name + ": expected " + expected + " got " + actual)
+    state["pass_count"] = state["pass_count"] + 1
+    ok(value)
 
-fn sv_failure_rate(s: dict) -> int
-    if s["validations"] == 0
-        return 0
-    s["failures"] * 100 / s["validations"]
+// sv_is_required(state, schema_name, field_name) -> Result
+// ok(1) if required, ok(0) if optional, err if the field is undeclared.
+fn sv_is_required(state: dict, schema_name: string, field_name: string) -> Result
+    let hf = "hasfield_" + schema_name + "_" + field_name
+    if contains(state, hf) != true
+        return err("field not declared: " + schema_name + "." + field_name)
+    ok(state["req_" + schema_name + "_" + field_name])
+
+// sv_set_required(state, schema_name, field_name) -> Result
+// Mark a declared field required. ok(field_name), or err if undeclared.
+fn sv_set_required(state: dict, schema_name: string, field_name: string) -> Result
+    let hf = "hasfield_" + schema_name + "_" + field_name
+    if contains(state, hf) != true
+        return err("field not declared: " + schema_name + "." + field_name)
+    state["req_" + schema_name + "_" + field_name] = 1
+    ok(field_name)
+
+// sv_total_validations(state) -> int
+fn sv_total_validations(state: dict) -> int
+    state["total_validations"]
+
+// sv_pass_count(state) -> int
+fn sv_pass_count(state: dict) -> int
+    state["pass_count"]

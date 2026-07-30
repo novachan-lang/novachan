@@ -1,61 +1,84 @@
-// forge_token_store — Token storage with expiry.
+// forge_token_store -- secure token issuance/validation/revocation (Sentinel). Tracks per-token
+// user/scope/revoked state and per-user issuance counts under a flat-key dict (no nested dicts/lists),
+// matching forge_session_store's convention -- state is mutated in place; callers do not need to
+// reassign after Result-returning calls (only the fluent ts_issue needs reassignment for chaining).
 
-fn ts_new() -> dict
-    let t = {}
-    t["tokens"] = {}
-    t["expiry"] = {}
-    t["owners"] = {}
-    t["total_created"] = 0
-    t["total_expired"] = 0
-    t
+fn ts_new(default_ttl: int) -> dict
+    let s = {}
+    s["default_ttl"] = default_ttl
+    s["issued_count"] = 0
+    s["active_count"] = 0
+    s
 
-fn ts_store(t: dict, token: string, owner: string, expires_at: int) -> dict
-    t["tokens"][token] = 1
-    t["expiry"][token] = expires_at
-    t["owners"][token] = owner
-    t["total_created"] = t["total_created"] + 1
-    t
+// Issue (or re-issue) a token bound to user_id/scope. Re-issuing a REVOKED token_id un-revokes it and
+// counts as reactivation (active_count goes back up) without double-counting active_count if the token
+// was already active. issued_count and the per-user count increment on every issuance event.
+fn ts_issue(state: dict, token_id: string, user_id: string, scope: string) -> dict
+    let k_exists = "tok_" + token_id + "_exists"
+    let was_active = 0
+    if contains(state, k_exists)
+        if int(state[k_exists]) == 1
+            if int(state["tok_" + token_id + "_revoked"]) != 1
+                was_active = 1
+    state[k_exists] = 1
+    state["tok_" + token_id + "_user"] = user_id
+    state["tok_" + token_id + "_scope"] = scope
+    state["tok_" + token_id + "_revoked"] = 0
+    state["issued_count"] = int(state["issued_count"]) + 1
+    if was_active == 0
+        state["active_count"] = int(state["active_count"]) + 1
+    let uk = "tsu_" + user_id + "_count"
+    if contains(state, uk)
+        state[uk] = int(state[uk]) + 1
+    else
+        state[uk] = 1
+    state
 
-fn ts_validate(t: dict, token: string, now: int) -> dict
-    let result = {}
-    let has = contains(t["tokens"], token)
-    if has != true
-        result["valid"] = 0
-        result["reason"] = "not_found"
-        result["t"] = t
-        return result
-    if t["tokens"][token] == 0
-        result["valid"] = 0
-        result["reason"] = "revoked"
-        result["t"] = t
-        return result
-    if now > t["expiry"][token]
-        t["tokens"][token] = 0
-        t["total_expired"] = t["total_expired"] + 1
-        result["valid"] = 0
-        result["reason"] = "expired"
-        result["t"] = t
-        return result
-    result["valid"] = 1
-    result["owner"] = t["owners"][token]
-    result["reason"] = ""
-    result["t"] = t
-    result
+fn _ts_exists(state: dict, token_id: string) -> bool
+    contains(state, "tok_" + token_id + "_exists")
 
-fn ts_revoke(t: dict, token: string) -> dict
-    let has = contains(t["tokens"], token)
-    if has == true
-        t["tokens"][token] = 0
-    t
+// ts_validate(state, token_id) -> Result: ok("valid") if the token exists and is not revoked.
+fn ts_validate(state: dict, token_id: string) -> Result
+    if not _ts_exists(state, token_id)
+        return err("token not found: " + token_id)
+    if int(state["tok_" + token_id + "_revoked"]) == 1
+        return err("token revoked: " + token_id)
+    ok("valid")
 
-fn ts_owner(t: dict, token: string) -> string
-    let has = contains(t["owners"], token)
-    if has != true
-        return ""
-    t["owners"][token]
+// ts_revoke(state, token_id) -> Result: revokes an active token. Err if missing or already revoked.
+fn ts_revoke(state: dict, token_id: string) -> Result
+    if not _ts_exists(state, token_id)
+        return err("token not found: " + token_id)
+    if int(state["tok_" + token_id + "_revoked"]) == 1
+        return err("token already revoked: " + token_id)
+    state["tok_" + token_id + "_revoked"] = 1
+    state["active_count"] = int(state["active_count"]) - 1
+    ok(token_id)
 
-fn ts_total_created(t: dict) -> int
-    t["total_created"]
+fn ts_get_user(state: dict, token_id: string) -> Result
+    if not _ts_exists(state, token_id)
+        return err("token not found: " + token_id)
+    ok(str(state["tok_" + token_id + "_user"]))
 
-fn ts_total_expired(t: dict) -> int
-    t["total_expired"]
+fn ts_get_scope(state: dict, token_id: string) -> Result
+    if not _ts_exists(state, token_id)
+        return err("token not found: " + token_id)
+    ok(str(state["tok_" + token_id + "_scope"]))
+
+fn ts_is_revoked(state: dict, token_id: string) -> Result
+    if not _ts_exists(state, token_id)
+        return err("token not found: " + token_id)
+    ok(int(state["tok_" + token_id + "_revoked"]))
+
+fn ts_active_count(state: dict) -> int
+    int(state["active_count"])
+
+fn ts_total_issued(state: dict) -> int
+    int(state["issued_count"])
+
+// Total issuance events recorded for user_id (0 if the user has never had a token issued).
+fn ts_user_tokens(state: dict, user_id: string) -> int
+    let uk = "tsu_" + user_id + "_count"
+    if contains(state, uk)
+        return int(state[uk])
+    0
