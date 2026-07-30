@@ -4319,7 +4319,8 @@ fn parse_program(tokens: list, pe: list) -> list
     let _p1 = inject_routes(inject_tests(inject_memo(inject_ensures(_p0)), pe), pe)
     let _p2 = inject_entity(inject_service(inject_middleware(inject_inject(inject_deprecated(inject_comptime(_p1))))))
     let _p3 = inject_builder(inject_validate(inject_log(inject_retry(inject_timeout(inject_singleton(_p2))))))
-    inline_module_consts(expand_derives(_p3))
+    let _p4 = inject_observable(inject_async(inject_cache(inject_event(_p3))))
+    inline_module_consts(expand_derives(_p4))
 
 fn _to_lower_char(ch: string) -> string
     let lc = {}
@@ -4987,14 +4988,151 @@ fn inject_singleton(stmts: list) -> list
         push(out, g)
     out
 
-// Module-level `let X = <scalar literal>` constant propagation. Module lets are NOT true
-// shared globals in either backend (each fn that references one gets its own zero-init'd copy,
-// so only nova_main's own scope ever sees the initializer). Fixing that at the storage-model
-// level is XL and backend-specific; instead we inline scalar module CONSTANTS (int/float/str/bool)
-// into the functions that read them (proper constant propagation) — backend-agnostic, so both
-// backends stay byte-identical. A function that LOCALLY binds the name (param/let/assign/loop/
-// pattern) is skipped for that name (the local shadows the const). Non-literal / mutable module
-// lets are unchanged (rare; init them inside a fn).
+fn inject_observable(stmts: list) -> list
+    let types = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "type"
+                    for an in anns
+                        match an
+                            Expr(at, av, an2, ac, af, al) =>
+                                if (at == "ann" or at == "ann_with_arg") and av == "observable"
+                                    push(types, s)
+    if len(types) == 0
+        return stmts
+    let generated = []
+    for t in types
+        match t
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                let ln = sline
+                let is_body = [Stmt("return", "", Expr("int", "1", 1, [], [], ln), [], [], [], [], ln)]
+                push(generated, Stmt("fn", name + "__is_observable", null_expr(), is_body, [], [], [], ln))
+                let field_parts = []
+                for p in params
+                    match p
+                        Param(pn, pt, pd) =>
+                            push(field_parts, pn)
+                let fields_str = ""
+                let fi = 0
+                while fi < len(field_parts)
+                    if fi > 0
+                        fields_str = fields_str + ", "
+                    fields_str = fields_str + field_parts[fi]
+                    fi = fi + 1
+                let of_body = [Stmt("return", "", Expr("str", fields_str, 0, [], [], ln), [], [], [], [], ln)]
+                push(generated, Stmt("fn", name + "__observable_fields", null_expr(), of_body, [], [], [], ln))
+    let out = []
+    for s in stmts
+        push(out, s)
+    for g in generated
+        push(out, g)
+    out
+
+fn inject_async(stmts: list) -> list
+    let fns = []
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "fn"
+                    for an in anns
+                        match an
+                            Expr(at, av, an2, ac, af, al) =>
+                                if (at == "ann" or at == "ann_with_arg") and av == "async"
+                                    push(fns, s)
+    if len(fns) == 0
+        return stmts
+    let generated = []
+    for f in fns
+        match f
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                let ln = sline
+                let is_body = [Stmt("return", "", Expr("int", "1", 1, [], [], ln), [], [], [], [], ln)]
+                push(generated, Stmt("fn", name + "__is_async", null_expr(), is_body, [], [], [], ln))
+    let out = []
+    for s in stmts
+        push(out, s)
+    for g in generated
+        push(out, g)
+    out
+
+fn inject_cache(stmts: list) -> list
+    let fns = []
+    let fn_ttl = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "fn"
+                    for an in anns
+                        match an
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ann" and av == "cache"
+                                    push(fns, s)
+                                    fn_ttl[name] = 60
+                                else if at == "ann_with_arg" and av == "cache"
+                                    push(fns, s)
+                                    if len(ac) > 0
+                                        match ac[0]
+                                            Expr(pt, pv, pn2, pc, pf, pl) =>
+                                                fn_ttl[name] = int(pv)
+    if len(fns) == 0
+        return stmts
+    let generated = []
+    for f in fns
+        match f
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                let ln = sline
+                let is_body = [Stmt("return", "", Expr("int", "1", 1, [], [], ln), [], [], [], [], ln)]
+                push(generated, Stmt("fn", name + "__is_cached", null_expr(), is_body, [], [], [], ln))
+                let ttl = fn_ttl[name]
+                let ttl_str = str(ttl)
+                let ttl_body = [Stmt("return", "", Expr("int", ttl_str, ttl, [], [], ln), [], [], [], [], ln)]
+                push(generated, Stmt("fn", name + "__cache_ttl", null_expr(), ttl_body, [], [], [], ln))
+    let out = []
+    for s in stmts
+        push(out, s)
+    for g in generated
+        push(out, g)
+    out
+
+fn inject_event(stmts: list) -> list
+    let fns = []
+    let fn_events = {}
+    for s in stmts
+        match s
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                if tag == "fn"
+                    for an in anns
+                        match an
+                            Expr(at, av, an2, ac, af, al) =>
+                                if at == "ann" and av == "event"
+                                    push(fns, s)
+                                    fn_events[name] = name
+                                else if at == "ann_with_arg" and av == "event"
+                                    push(fns, s)
+                                    if len(ac) > 0
+                                        match ac[0]
+                                            Expr(pt, pv, pn2, pc, pf, pl) =>
+                                                fn_events[name] = pv
+    if len(fns) == 0
+        return stmts
+    let generated = []
+    for f in fns
+        match f
+            Stmt(tag, name, expr, body, params, else_body, anns, sline) =>
+                let ln = sline
+                let ev_name = fn_events[name]
+                let en_body = [Stmt("return", "", Expr("str", ev_name, 0, [], [], ln), [], [], [], [], ln)]
+                push(generated, Stmt("fn", name + "__event_name", null_expr(), en_body, [], [], [], ln))
+                let is_body = [Stmt("return", "", Expr("int", "1", 1, [], [], ln), [], [], [], [], ln)]
+                push(generated, Stmt("fn", name + "__is_event_handler", null_expr(), is_body, [], [], [], ln))
+    let out = []
+    for s in stmts
+        push(out, s)
+    for g in generated
+        push(out, g)
+    out
+
 fn _is_scalar_literal(e: Expr) -> int
     match e
         Expr(t, v, n, ch, f, ln) =>
@@ -6874,6 +7012,8 @@ fn resolve_runtime_fn(name: string) -> string
         "nova_rt_log_fn_entry"
     else if name == "log_fn_exit"
         "nova_rt_log_fn_exit"
+    else if name == "str_repeat"
+        "nova_rt_str_repeat"
     // Phase 7.5: FFI helpers
     else if name == "cstr_of"
         "nova_rt_cstr_of"
@@ -7929,6 +8069,7 @@ fn emit_runtime_declarations(cg: CodeGen)
     emit(cg, "declare void @nova_rt_deprecated_warn(i64, i64) nounwind")
     emit(cg, "declare void @nova_rt_log_fn_entry(i64) nounwind")
     emit(cg, "declare void @nova_rt_log_fn_exit(i64) nounwind")
+    emit(cg, "declare i64 @nova_rt_str_repeat(i64, i64) nounwind")
     // Phase 7.5: FFI helpers
     emit(cg, "declare i64 @nova_rt_cstr_of(i64) nounwind")
     emit(cg, "declare i64 @nova_rt_null_ptr() nounwind")
@@ -13229,6 +13370,7 @@ fn ti_build_stdlib_ext(reg: dict)
     reg["deprecated_warn"] = NTypeScheme([], nt_fn([nt_string(), nt_string()], nt_unit()))
     reg["log_fn_entry"] = NTypeScheme([], nt_fn([nt_string()], nt_unit()))
     reg["log_fn_exit"] = NTypeScheme([], nt_fn([nt_string()], nt_unit()))
+    reg["str_repeat"] = NTypeScheme([], nt_fn([nt_string(), nt_int()], nt_string()))
     // ── Phase 7.5: FFI helpers ────────────────────────────────────────────────
     reg["cstr_of"] = NTypeScheme([], nt_fn([nt_string()], nt_any()))
     reg["null_ptr"] = NTypeScheme([], nt_fn([], nt_any()))
@@ -20687,6 +20829,7 @@ fn compile_ir_core_named(source: string, base_dir: string, filename: string, tar
     ire_line(e, "declare void @nova_rt_deprecated_warn(i64, i64) nounwind")
     ire_line(e, "declare void @nova_rt_log_fn_entry(i64) nounwind")
     ire_line(e, "declare void @nova_rt_log_fn_exit(i64) nounwind")
+    ire_line(e, "declare i64 @nova_rt_str_repeat(i64, i64) nounwind")
     // Phase 7.5: FFI helpers
     ire_line(e, "declare i64 @nova_rt_cstr_of(i64) nounwind")
     ire_line(e, "declare i64 @nova_rt_null_ptr() nounwind")

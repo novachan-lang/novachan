@@ -18392,6 +18392,27 @@ void nova_rt_log_fn_exit(int64_t fn_name_val) {
     fflush(stderr);
 }
 
+/* ── str_repeat: repeat a string N times ─────────────────────────────────── */
+
+int64_t nova_rt_str_repeat(int64_t str_val, int64_t count) {
+    int64_t empty = (int64_t)(uintptr_t)nova_fat_str_create("", 0);
+    if (count <= 0 || !str_val) return empty;
+    const char* s = (const char*)(uintptr_t)str_val;
+    size_t slen = strlen(s);
+    if (slen == 0) return empty;
+    size_t total = slen * (size_t)count;
+    if (total / slen != (size_t)count) return empty;
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return empty;
+    for (int64_t i = 0; i < count; i++) {
+        memcpy(buf + i * slen, s, slen);
+    }
+    buf[total] = '\0';
+    char* result = nova_fat_str_create(buf, total);
+    free(buf);
+    return (int64_t)(uintptr_t)result;
+}
+
 /* ── Phase 7.5: FFI Helpers ───────────────────────────────────────────────── */
 
 /* nova_rt_create_string: Create a NOVA fat string from a null-terminated C string.
