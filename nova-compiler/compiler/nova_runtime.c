@@ -18378,6 +18378,20 @@ void nova_rt_deprecated_warn(int64_t fn_name_val, int64_t msg_val) {
     fflush(stderr);
 }
 
+/* ── @log annotation: function entry/exit tracing ─────────────────────────── */
+
+void nova_rt_log_fn_entry(int64_t fn_name_val) {
+    const char* fn = fn_name_val ? (const char*)(uintptr_t)fn_name_val : "(unknown)";
+    fprintf(stderr, "[NOVA LOG] ENTER %s\n", fn);
+    fflush(stderr);
+}
+
+void nova_rt_log_fn_exit(int64_t fn_name_val) {
+    const char* fn = fn_name_val ? (const char*)(uintptr_t)fn_name_val : "(unknown)";
+    fprintf(stderr, "[NOVA LOG] EXIT  %s\n", fn);
+    fflush(stderr);
+}
+
 /* ── Phase 7.5: FFI Helpers ───────────────────────────────────────────────── */
 
 /* nova_rt_create_string: Create a NOVA fat string from a null-terminated C string.
