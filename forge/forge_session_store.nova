@@ -52,3 +52,110 @@ fn session_store_stop(s)
     let env = {}
     env["op"] = "stop"
     send(s["req"], env)
+
+// ── ss_* API: a plain flat-dict session STORE with per-session data + TTL bookkeeping ──────────────
+// Distinct from the actor-based session_* API above (that one is unused elsewhere in the tree today;
+// kept for backward compatibility). This API is synchronous, single-owner-by-convention (the caller
+// holds `state` and threads it through calls) -- no channel/spawn, matching forge_header_map's style.
+// Keying scheme (flat dict, no nested dicts/lists per NOVA stdlib convention):
+//   "sx_<sid>_active"       -> 1 while the session is live, 0 after ss_destroy (tombstone, not deleted)
+//   "sx_<sid>_user"         -> the user_id string bound at ss_create
+//   "sx_<sid>_last_access"  -> last ss_touch timestamp (int)
+//   "sxd_<sid>_<key>"       -> per-session custom data value
+//   "su_<user_id>_count"    -> live session count for that user (for ss_user_sessions)
+//   "session_count"         -> total live sessions
+//   "default_ttl"           -> the TTL new sessions are conceptually created with (informational;
+//                              actual expiry enforcement is the caller's job via ss_touch + this TTL)
+
+// ss_new: create a fresh session store. default_ttl is seconds; stored for callers to consult when
+// deciding if a session (via its last_access) has expired.
+fn ss_new(default_ttl: int) -> dict
+    let s = {}
+    s["default_ttl"] = default_ttl
+    s["session_count"] = 0
+    s
+
+// ss_create: bind session_id -> user_id, marking it active. Re-creating an already-active session_id
+// rebinds its user_id without double-counting session_count/user counters.
+fn ss_create(state: dict, session_id: string, user_id: string) -> dict
+    let k_active = "sx_" + session_id + "_active"
+    let already_active = 0
+    if contains(state, k_active)
+        if state[k_active] == 1
+            already_active = 1
+    state[k_active] = 1
+    state["sx_" + session_id + "_user"] = user_id
+    state["sx_" + session_id + "_last_access"] = 0
+    if already_active == 0
+        state["session_count"] = state["session_count"] + 1
+        let uk = "su_" + user_id + "_count"
+        if contains(state, uk)
+            state[uk] = state[uk] + 1
+        else
+            state[uk] = 1
+    state
+
+// ss_is_valid: 1 if session_id exists and is currently active, else 0.
+fn ss_is_valid(state: dict, session_id: string) -> int
+    let k_active = "sx_" + session_id + "_active"
+    if contains(state, k_active) != true
+        return 0
+    if state[k_active] == 1
+        return 1
+    0
+
+// ss_get_user: the user_id bound to session_id, or Err if the session is missing/destroyed.
+fn ss_get_user(state: dict, session_id: string) -> Result
+    if ss_is_valid(state, session_id) != 1
+        return err("session not found: " + session_id)
+    ok(state["sx_" + session_id + "_user"])
+
+// ss_set_data: store a per-session key/value. Err if the session is missing/destroyed.
+fn ss_set_data(state: dict, session_id: string, key: string, value: string) -> Result
+    if ss_is_valid(state, session_id) != 1
+        return err("session not found: " + session_id)
+    state["sxd_" + session_id + "_" + key] = value
+    ok(value)
+
+// ss_get_data: read a per-session key. Err if the session is missing/destroyed, or if the key was
+// never set for this session.
+fn ss_get_data(state: dict, session_id: string, key: string) -> Result
+    if ss_is_valid(state, session_id) != 1
+        return err("session not found: " + session_id)
+    let dk = "sxd_" + session_id + "_" + key
+    if contains(state, dk) != true
+        return err("session data key not found: " + key)
+    ok(state[dk])
+
+// ss_destroy: tombstone the session (NOVA dicts cannot delete keys), decrementing session_count and
+// the owning user's live-session count. Err if the session was already missing/destroyed.
+fn ss_destroy(state: dict, session_id: string) -> Result
+    if ss_is_valid(state, session_id) != 1
+        return err("session not found: " + session_id)
+    let uid = state["sx_" + session_id + "_user"]
+    state["sx_" + session_id + "_active"] = 0
+    state["session_count"] = state["session_count"] - 1
+    let uk = "su_" + uid + "_count"
+    if contains(state, uk)
+        if state[uk] > 0
+            state[uk] = state[uk] - 1
+    ok(session_id)
+
+// ss_touch: update the last-access timestamp (caller-supplied clock value). Err if the session is
+// missing/destroyed.
+fn ss_touch(state: dict, session_id: string, timestamp: int) -> Result
+    if ss_is_valid(state, session_id) != 1
+        return err("session not found: " + session_id)
+    state["sx_" + session_id + "_last_access"] = timestamp
+    ok(timestamp)
+
+// ss_session_count: total number of currently-active sessions.
+fn ss_session_count(state: dict) -> int
+    state["session_count"]
+
+// ss_user_sessions: number of currently-active sessions bound to user_id (0 if the user has none).
+fn ss_user_sessions(state: dict, user_id: string) -> int
+    let uk = "su_" + user_id + "_count"
+    if contains(state, uk)
+        return state[uk]
+    0

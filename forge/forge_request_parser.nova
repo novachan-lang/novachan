@@ -1,0 +1,106 @@
+// forge_request_parser -- parse a raw HTTP/1.x request (as received off a socket) into a flat-dict
+// state: request line (method/path/version/query), headers, and body. Distinct from forge.nova's
+// Request record (built by the router for handler dispatch); this is the lower-level parser for code
+// that owns raw bytes directly (a hand-rolled listener, a proxy, a test harness). Headers are stored
+// flat under "h_<name>" keys, matching forge_header_map / forge_response_builder's convention -- no
+// nested dicts/lists. Reuses forge_qs for query-string decoding rather than re-implementing it.
+import forge_qs
+
+// rp_parse: split `raw_request` into a header block + body on the first blank line (CRLFCRLF), parse
+// the request line ("METHOD path HTTP/version"), split off the query string from the path, and parse
+// each "Name: value" header line (name/value trimmed). Err on an empty request or a malformed
+// (fewer than 3 space-separated tokens) request line.
+fn rp_parse(raw_request: string) -> Result
+    let crlf = chr(13) + chr(10)
+    let sep = crlf + crlf
+    let sep_idx = find(raw_request, sep)
+    let head_block = raw_request
+    let body = ""
+    if sep_idx >= 0
+        head_block = slice(raw_request, 0, sep_idx)
+        body = slice(raw_request, sep_idx + 4, len(raw_request))
+    let lines = split(head_block, crlf)
+    if len(lines) == 0
+        return err("empty request")
+    let request_line = lines[0]
+    if len(request_line) == 0
+        return err("empty request line")
+    let parts = split(request_line, " ")
+    if len(parts) < 3
+        return err("malformed request line: " + request_line)
+    let method = parts[0]
+    let full_path = parts[1]
+    let version = parts[2]
+    let path = full_path
+    let query = ""
+    let qidx = find(full_path, "?")
+    if qidx >= 0
+        path = slice(full_path, 0, qidx)
+        query = slice(full_path, qidx + 1, len(full_path))
+    let state = {}
+    state["method"] = method
+    state["path"] = path
+    state["version"] = version
+    state["query"] = query
+    state["body"] = body
+    state["header_count"] = 0
+    let i = 1
+    while i < len(lines)
+        let line = lines[i]
+        if len(line) > 0
+            let cidx = find(line, ":")
+            if cidx >= 0
+                let name = trim(slice(line, 0, cidx))
+                let value = trim(slice(line, cidx + 1, len(line)))
+                let nk = "h_" + name
+                if contains(state, nk) != true
+                    state["header_count"] = state["header_count"] + 1
+                state[nk] = value
+        i = i + 1
+    ok(state)
+
+// rp_method: the request method (e.g. "GET", "POST").
+fn rp_method(state: dict) -> string
+    state["method"]
+
+// rp_path: the request path, without the query string.
+fn rp_path(state: dict) -> string
+    state["path"]
+
+// rp_version: the HTTP version token (e.g. "HTTP/1.1").
+fn rp_version(state: dict) -> string
+    state["version"]
+
+// rp_get_header: the value of a request header, or Err if it was not present.
+fn rp_get_header(state: dict, name: string) -> Result
+    let nk = "h_" + name
+    if contains(state, nk) != true
+        return err("header not found: " + name)
+    ok(state[nk])
+
+// rp_body: the request body (everything after the header block's blank line).
+fn rp_body(state: dict) -> string
+    state["body"]
+
+// rp_query_string: the raw query string (everything after "?" in the request line), undecoded.
+fn rp_query_string(state: dict) -> string
+    state["query"]
+
+// rp_get_query: a decoded query parameter value (percent-decoded via forge_qs), or Err if the key is
+// not present in the query string.
+fn rp_get_query(state: dict, key: string) -> Result
+    let params = qs_parse(state["query"])
+    if contains(params, key) != true
+        return err("query param not found: " + key)
+    ok(params[key])
+
+// rp_header_count: the number of distinct headers parsed.
+fn rp_header_count(state: dict) -> int
+    state["header_count"]
+
+// rp_has_header: 1 if the header was present in the request, else 0.
+fn rp_has_header(state: dict, name: string) -> int
+    let nk = "h_" + name
+    if contains(state, nk) == true
+        return 1
+    0
