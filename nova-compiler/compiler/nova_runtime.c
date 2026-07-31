@@ -3050,6 +3050,56 @@ int64_t nova_rt_range_step(int64_t start, int64_t stop, int64_t step) {
     return result;
 }
 
+int64_t nova_rt_list_insert_at(int64_t handle, int64_t index, int64_t val) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (index < 0) index = 0;
+    if (index > l->size) index = l->size;
+    nova_rt_list_append(handle, 0);
+    for (int64_t i = l->size - 1; i > index; i--) l->data[i] = l->data[i-1];
+    l->data[index] = val;
+    return handle;
+}
+
+int64_t nova_rt_dict_to_list(int64_t handle) {
+    int64_t result = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_DICT) return result;
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    for (int64_t i = 0; i < d->size; i++) {
+        int64_t pair = nova_rt_list_create();
+        nova_rt_list_append(pair, d->keys[i]);
+        nova_rt_list_append(pair, d->vals[i]);
+        nova_rt_list_append(result, pair);
+    }
+    return result;
+}
+
+int64_t nova_rt_list_count_val(int64_t handle, int64_t val) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return 0;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t count = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (nova_rt_eq(l->data[i], val)) count++;
+    }
+    return count;
+}
+
+int64_t nova_rt_list_replace_at(int64_t handle, int64_t index, int64_t val) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (index < 0 || index >= l->size) return handle;
+    l->data[index] = val;
+    return handle;
+}
+
+int64_t nova_rt_list_swap(int64_t handle, int64_t i, int64_t j) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return handle;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (i < 0 || i >= l->size || j < 0 || j >= l->size) return handle;
+    int64_t tmp = l->data[i]; l->data[i] = l->data[j]; l->data[j] = tmp;
+    return handle;
+}
+
 int64_t nova_rt_str_split_n(int64_t s, int64_t delim, int64_t max_count) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
