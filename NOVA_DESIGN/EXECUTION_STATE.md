@@ -83,6 +83,8 @@ See memory `[[builtin-needs-type-tag-check]]`, `[[novadict-dense-layout]]`,
   read "unknown" as "float". Now only a KNOWN float type takes the float variant; unknown routes to
   `nova_rt_sum_any`, which decides from `elem_kind` at runtime and returns a self-describing value
   (raw int, or BOXED float). Float comprehensions still correctly yield floats.
+- ✅ `2a720dd6` **CYCLE 3-G part 2 — `min()`/`max()` over a comprehension had the same bug** (1.0/5.0
+  instead of 1/5). Same root, same fix: `nova_rt_list_min_any`/`nova_rt_list_max_any`.
 - 🔄 **L8 call-overload — root cause identified, partially working.** `obj(args)` → `Struct__call`
   works when the callee's type is already resolved (`let d: Doubler = ...`, a param, a field).
   It does NOT work for `let d = Doubler(3)` because at constrain time the callee is still an

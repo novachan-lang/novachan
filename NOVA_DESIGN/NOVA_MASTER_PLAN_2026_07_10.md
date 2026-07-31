@@ -28,9 +28,9 @@
 > is exactly what the earlier oscillating attempt lacked. KAT 11/11; default int unchanged.
 > **GAP-1 labeled break/continue ✅ `7e9b4e11`** — codegen was in tree but the parser rejected every labeled
 > loop as "empty body" (body-indent measured from the keyword's column, which sits right of the label).
-> **CYCLE 3-G ✅ `3e56c6e1`** — `sum()` over a comprehension returned a float because the dispatch read
-> "unknown element type" as "float"; unknown now routes to a runtime `elem_kind` dispatch returning a
-> self-describing value. **L8 call-overload 🔄** — works when the callee's type is already resolved; the
+> **CYCLE 3-G ✅ `3e56c6e1` + `2a720dd6`** — `sum()`/`min()`/`max()` over a comprehension returned floats
+> because the dispatch read "unknown element type" as "float"; unknown now routes to a runtime `elem_kind`
+> dispatch returning a self-describing value (raw int, or BOXED float). **L8 call-overload 🔄** — works when the callee's type is already resolved; the
 > `let d = Doubler(3)` case needs DEFERRED call constraints (measured: callee is still a type var at
 > constrain time). *Dev-mode: compile-checked + KAT-gated; full both-mode regression batched.*
 >
