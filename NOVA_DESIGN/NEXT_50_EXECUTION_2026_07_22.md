@@ -258,4 +258,9 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 **Rapid-dev session 6 (fn_ptr intrinsic + fleet 5 + 17 builtins):**
 - `b20fbb62` fn_ptr("name") compiler intrinsic (LOCK-6 Phase 1) + fleet 5: 6 stdlib modules (skyline/systematic_sampling/longest_palindromic_subseq/soundex_refined/continued_fraction/chunked_reader) — 96/96 KAT + 17 new builtins (1099 total: str_byte_at/len, str_chars_list, str_remove_char, list_cumsum/reverse_copy/repeat_val/of_range/adjacent_pairs, dict_sorted_by_value, math_abs_float, list_product_float, dict_keys_count, str_is_printable, list_to_string, str_char_code, list_flatten_n)
 
-**Total builtins: 1099.** 1790+ stdlib modules. LOCK-6 Phase 1 (fn_ptr intrinsic) DONE — foundation for @cdecl FFI callbacks. Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
+- `901d748a` 7 builtins (1106) — str_from_char_code, str_replace_n, str_index_of_last, list_split_at, math_round_to, str_remove_prefix_all, list_group_consecutive
+- `5cdf6beb` fleet 6: 6 stdlib modules (nsum/largest_rectangle/fft/miller_rabin/pii_mask/mru_cache) — 108/108 KAT + 9 builtins (1115 total)
+- `568c6ad0` 8 builtins (1123) — list_every_nth, dict_values_sorted, list_running_max/min, str_repeat_n, list_pairs_to_dict, list_uncons, list_tails
+- `39e87db1` 7 builtins (1130) — str_split_chars, list_prefixes/suffixes, list_zip_pairs, list_without_index, str_remove_whitespace, list_count_eq
+
+**Total builtins: 1130.** 1800+ stdlib modules. LOCK-6 Phase 1 (fn_ptr intrinsic) DONE. Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
