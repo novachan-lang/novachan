@@ -24259,6 +24259,97 @@ int64_t nova_rt_str_is_empty(int64_t val) {
     return (!s || s[0] == '\0') ? 1 : 0;
 }
 
+/* nova_rt_str_index_of: find first occurrence of needle, return index or -1 */
+int64_t nova_rt_str_index_of(int64_t haystack_val, int64_t needle_val) {
+    const char* h = (const char*)(uintptr_t)haystack_val;
+    const char* n = (const char*)(uintptr_t)needle_val;
+    if (!h || !n) return -1;
+    const char* p = strstr(h, n);
+    if (!p) return -1;
+    return (int64_t)(p - h);
+}
+
+/* nova_rt_str_last_index_of: find last occurrence of needle, return index or -1 */
+int64_t nova_rt_str_last_index_of(int64_t haystack_val, int64_t needle_val) {
+    const char* h = (const char*)(uintptr_t)haystack_val;
+    const char* n = (const char*)(uintptr_t)needle_val;
+    if (!h || !n) return -1;
+    size_t nlen = strlen(n);
+    if (nlen == 0) return (int64_t)strlen(h);
+    int64_t last = -1;
+    const char* p = h;
+    while ((p = strstr(p, n)) != NULL) {
+        last = (int64_t)(p - h);
+        p++;
+    }
+    return last;
+}
+
+/* nova_rt_dict_entries: return list of [key, value] pairs */
+int64_t nova_rt_dict_entries(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t r = nova_rt_list_new();
+    if (!d) return r;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int64_t pair = nova_rt_list_new();
+            nova_rt_list_append(pair, d->keys[i]);
+            nova_rt_list_append(pair, d->vals[i]);
+            nova_rt_list_append(r, pair);
+        }
+    }
+    return r;
+}
+
+/* nova_rt_list_sort_desc: sort list in descending order (integers) */
+int64_t nova_rt_list_sort_desc(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return handle;
+    int64_t r = nova_rt_list_new();
+    NovaList* rl = (NovaList*)(uintptr_t)r;
+    for (int64_t i = 0; i < l->size; i++) {
+        nova_rt_list_append(r, l->data[i]);
+    }
+    for (int64_t i = 0; i < rl->size - 1; i++) {
+        for (int64_t j = i + 1; j < rl->size; j++) {
+            if (rl->data[j] > rl->data[i]) {
+                int64_t tmp = rl->data[i];
+                rl->data[i] = rl->data[j];
+                rl->data[j] = tmp;
+            }
+        }
+    }
+    return r;
+}
+
+/* nova_rt_str_is_palindrome: true if string reads same forwards and backwards */
+int64_t nova_rt_str_is_palindrome(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s) return 1;
+    size_t len = strlen(s);
+    if (len <= 1) return 1;
+    size_t i = 0, j = len - 1;
+    while (i < j) {
+        if (s[i] != s[j]) return 0;
+        i++; j--;
+    }
+    return 1;
+}
+
+/* nova_rt_list_rotate_right: rotate list right by n positions */
+int64_t nova_rt_list_rotate_right(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return handle;
+    int64_t r = nova_rt_list_new();
+    int64_t sz = l->size;
+    int64_t shift = ((n % sz) + sz) % sz;
+    for (int64_t i = 0; i < sz; i++) {
+        int64_t src = (i - shift + sz) % sz;
+        nova_rt_list_append(r, l->data[src]);
+    }
+    return r;
+}
+
 int64_t c_test_fill_triple(int64_t* t) {
     if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
     return 0;
