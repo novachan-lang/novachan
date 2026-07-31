@@ -27641,3 +27641,163 @@ int64_t nova_rt_list_to_set_list(int64_t handle) {
     return out;
 }
 
+/* nova_rt_dict_values_count: count distinct values in a dict */
+int64_t nova_rt_dict_values_count(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int64_t* vals_arr = NULL;
+    int64_t count = 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int found = 0;
+            for (int64_t j = 0; j < count; j++) {
+                if (vals_arr[j] == d->vals[i]) { found = 1; break; }
+            }
+            if (!found) {
+                int64_t* tmp = (int64_t*)realloc(vals_arr, (size_t)(count + 1) * sizeof(int64_t));
+                if (!tmp) { free(vals_arr); return count; }
+                vals_arr = tmp;
+                vals_arr[count++] = d->vals[i];
+            }
+        }
+    }
+    free(vals_arr);
+    return count;
+}
+
+/* nova_rt_str_remove_suffix_all: repeatedly remove suffix until no match */
+int64_t nova_rt_str_remove_suffix_all(int64_t str_handle, int64_t suffix_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* suffix = (const char*)(uintptr_t)suffix_handle;
+    if (!s || !suffix) return str_handle;
+    size_t suf_len = strlen(suffix);
+    if (suf_len == 0) return str_handle;
+    char* buf = strdup(s);
+    if (!buf) return str_handle;
+    size_t blen = strlen(buf);
+    while (blen >= suf_len && memcmp(buf + blen - suf_len, suffix, suf_len) == 0) {
+        buf[blen - suf_len] = 0;
+        blen -= suf_len;
+    }
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_zip_with_index: zip list with 0-based indices → list of [index, value] pairs */
+int64_t nova_rt_list_zip_with_index(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t pair = (int64_t)(uintptr_t)nova_rt_list_create();
+        nova_rt_list_append(pair, i);
+        nova_rt_list_append(pair, l->data[i]);
+        nova_rt_list_append(out, pair);
+    }
+    return out;
+}
+
+/* nova_rt_list_flatten_all: recursively flatten nested lists */
+int64_t nova_rt_list_flatten_all(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t val = l->data[i];
+        int tag = (int)(val & 7);
+        if (tag == 3) {
+            int64_t sub = nova_rt_list_flatten_all(val);
+            NovaList* sl = (NovaList*)(uintptr_t)sub;
+            if (sl) {
+                for (int64_t j = 0; j < sl->size; j++) {
+                    nova_rt_list_append(out, sl->data[j]);
+                }
+            }
+        } else {
+            nova_rt_list_append(out, val);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_str_capitalize_words: capitalize first letter of each word */
+int64_t nova_rt_str_capitalize_words(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    int word_start = 1;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') {
+            buf[i] = s[i];
+            word_start = 1;
+        } else if (word_start) {
+            buf[i] = (char)toupper((unsigned char)s[i]);
+            word_start = 0;
+        } else {
+            buf[i] = s[i];
+        }
+    }
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_partition_at: split list at index → [left, right] */
+int64_t nova_rt_list_partition_at(int64_t handle, int64_t idx) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t left = (int64_t)(uintptr_t)nova_rt_list_create();
+    int64_t right = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) {
+        nova_rt_list_append(out, left);
+        nova_rt_list_append(out, right);
+        return out;
+    }
+    if (idx < 0) idx = 0;
+    if (idx > l->size) idx = l->size;
+    for (int64_t i = 0; i < idx && i < l->size; i++) {
+        nova_rt_list_append(left, l->data[i]);
+    }
+    for (int64_t i = idx; i < l->size; i++) {
+        nova_rt_list_append(right, l->data[i]);
+    }
+    nova_rt_list_append(out, left);
+    nova_rt_list_append(out, right);
+    return out;
+}
+
+/* nova_rt_str_word_at: get the nth word (0-based) from a string */
+int64_t nova_rt_str_word_at(int64_t str_handle, int64_t n) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return nova_rt_create_string("");
+    int64_t word_idx = 0;
+    const char* start = NULL;
+    int in_word = 0;
+    for (const char* p = s; ; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == 0) {
+            if (in_word) {
+                if (word_idx == n) {
+                    size_t len = (size_t)(p - start);
+                    char* buf = (char*)malloc(len + 1);
+                    if (!buf) return nova_rt_create_string("");
+                    memcpy(buf, start, len);
+                    buf[len] = 0;
+                    int64_t result = nova_rt_create_string(buf);
+                    free(buf);
+                    return result;
+                }
+                word_idx++;
+                in_word = 0;
+            }
+            if (*p == 0) break;
+        } else {
+            if (!in_word) { start = p; in_word = 1; }
+        }
+    }
+    return nova_rt_create_string("");
+}
+
