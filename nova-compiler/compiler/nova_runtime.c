@@ -27926,3 +27926,119 @@ int64_t nova_rt_str_pad_center(int64_t str_handle, int64_t width, int64_t pad_ha
     return result;
 }
 
+/* nova_rt_str_trim_chars: trim specific chars from both ends */
+int64_t nova_rt_str_trim_chars(int64_t str_handle, int64_t chars_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* chars = (const char*)(uintptr_t)chars_handle;
+    if (!s || !chars || !*chars) return str_handle;
+    size_t len = strlen(s);
+    size_t start = 0, end = len;
+    while (start < len && strchr(chars, s[start])) start++;
+    while (end > start && strchr(chars, s[end - 1])) end--;
+    if (start == 0 && end == len) return str_handle;
+    size_t rlen = end - start;
+    char* buf = (char*)malloc(rlen + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s + start, rlen);
+    buf[rlen] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_unique_count: count distinct elements in a list */
+int64_t nova_rt_list_unique_count(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t count = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        int found = 0;
+        for (int64_t j = 0; j < i; j++) {
+            if (l->data[j] == l->data[i]) { found = 1; break; }
+        }
+        if (!found) count++;
+    }
+    return count;
+}
+
+/* nova_rt_list_head: get first n elements */
+int64_t nova_rt_list_head(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0) return out;
+    for (int64_t i = 0; i < n && i < l->size; i++) {
+        nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
+/* nova_rt_list_tail_n: get last n elements */
+int64_t nova_rt_list_tail_n(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || n <= 0) return out;
+    int64_t start = l->size - n;
+    if (start < 0) start = 0;
+    for (int64_t i = start; i < l->size; i++) {
+        nova_rt_list_append(out, l->data[i]);
+    }
+    return out;
+}
+
+/* nova_rt_list_max_consecutive: max consecutive equal elements */
+int64_t nova_rt_list_max_consecutive(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return 0;
+    int64_t max_run = 1, cur_run = 1;
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] == l->data[i - 1]) {
+            cur_run++;
+            if (cur_run > max_run) max_run = cur_run;
+        } else {
+            cur_run = 1;
+        }
+    }
+    return max_run;
+}
+
+/* nova_rt_str_remove_consecutive: remove consecutive duplicate chars */
+int64_t nova_rt_str_remove_consecutive(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    buf[0] = s[0];
+    size_t j = 1;
+    for (size_t i = 1; i < len; i++) {
+        if (s[i] != s[i - 1]) buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_str_overlay: overlay a string at position */
+int64_t nova_rt_str_overlay(int64_t str_handle, int64_t overlay_handle, int64_t pos) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    const char* ov = (const char*)(uintptr_t)overlay_handle;
+    if (!s) return str_handle;
+    if (!ov) return str_handle;
+    int64_t slen = (int64_t)strlen(s);
+    int64_t ovlen = (int64_t)strlen(ov);
+    if (pos < 0) pos = 0;
+    if (pos > slen) pos = slen;
+    int64_t rlen = pos + ovlen;
+    if (slen > rlen) rlen = slen;
+    char* buf = (char*)malloc((size_t)rlen + 1);
+    if (!buf) return str_handle;
+    memcpy(buf, s, (size_t)slen);
+    if (rlen > slen) memset(buf + slen, ' ', (size_t)(rlen - slen));
+    memcpy(buf + pos, ov, (size_t)ovlen);
+    buf[rlen] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
