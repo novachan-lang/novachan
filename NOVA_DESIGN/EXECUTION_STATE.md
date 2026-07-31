@@ -23,7 +23,49 @@
 - Tick ✅ in THIS file + the master plan as each task lands. `std/`=stdlib home; `forge/`=framework only. Production-grade always.
 - Anti-dup: NEVER shadow a NATIVE builtin (deque/pq/lru/ringbuf/…); forge-overlap is OK (std/ is the canonical stdlib home).
 
-## Current focus — UPDATED 2026-07-31 (rapid-dev session: language ceilings + gaps)
+## Current focus — UPDATED 2026-08-01 (rapid-dev: BUILTIN SOUNDNESS CAMPAIGN)
+
+**⚠️ READ FIRST — the builtin mass-production era is OVER; it was shipping broken code.**
+
+Adding ~1300 builtins by modelling each new function on its neighbour propagated defects
+wholesale. A 3-lens audit fleet + measured before/after proof found them. Status: ✅ ALL FIXED.
+
+- ✅ `08b03d37` **dense-dict iteration — 59 builtins read uninitialized heap.** `NovaDict` is DENSE
+  (`keys/vals[0..size-1]`, compacted); 59 builtins iterated `i < d->cap` using `hashes[i] != 0` as an
+  occupancy sentinel. Reads uninit memory + treats garbage as live entries; and the sentinel is
+  invalid anyway (FNV-1a/`nova_rt_hash` can return 0 → drops a live entry). Now bound by `d->size`.
+- ✅ `e25932b1` **duplicate LLVM `declare` — EVERY compiled program failed to link.** 10 duplicates
+  across both backends; LLVM rejects a redeclared function and the declare block goes into every
+  emitted program. `nova_rt_to_float` had CONFLICTING attributes (`nounwind` vs `nounwind readnone`).
+  **Hidden for weeks by dev-mode's deferred reconverge.** Also hardened `_bootstrap_reconverge.ps1`,
+  which checked only `Test-Path` after linking — a failed link left a STALE exe in place and let the
+  next pass run the WRONG compiler, reporting a bogus "DIVERGED" instead of the real error.
+- ✅ `e67ee810` **builtin soundness sweep — 8 of 10 probe classes SEGFAULTED before it.** Measured
+  with an isolated probe per case against pre-fix vs post-fix runtime:
+  `flatten_map([1,2,3])` CRASH139→ok (elements read as ptrs 0x1/0x2/0x3) · `truncate_ellipsis(s,-5)`
+  CRASH127→ok (`buf[-5]=0` heap **underflow**) · `str_mul`/`repeat_each` CRASH139→ok (`len*n` wrapped
+  size_t) · `dict_to_query_string` 9KB key CRASH139→ok · `pad_both(null,null)` CRASH139→ok ·
+  `list_sum_int(42)`, `max_by_abs("str")` CRASH139→ok (wrong-type handle).
+  Root cause: all 173 `nova_mem_find_tag` checks sit before line ~19765; the builtin region (24000+)
+  had **ZERO** across 239 functions, using a NULL-only guard that stops a literal null but not a
+  valid handle of the wrong type. Fixed via checked accessors (`nova_as_list`/`nova_as_dict`) +
+  `nova_str_safe` over 511 casts, plus 14 arithmetic fixes (overflow-checked sizing, clamped negative
+  lengths, `INT64_MIN` negation UB in gcd/lcm/max_by_abs/min_by_abs).
+  **NEW STANDING GATE:** `_run_builtin_soundness.ps1` — links straight against the runtime, needs no
+  compiler, so it runs even mid-reconverge. Run after touching any builtin.
+- ✅ `92e91cd5`/`541ac463` builtin batches 27-28 (16 new, **1305 total**)
+
+**RULE GOING FORWARD:** builtin count is NOT a goal. Every new builtin must verify the accessor +
+size-arithmetic contract against the actual struct definition, never against the adjacent function.
+See memory `[[builtin-needs-type-tag-check]]`, `[[novadict-dense-layout]]`,
+`[[duplicate-declare-breaks-all-links]]`.
+
+**NEXT (the real critical path — resume here):** LOCK-4 inc3c-part2 (sized numerics, #1 risk) ·
+Wave-B #6 RC leak (MOVE-on-insert) · LOCK-6 Phase 2 (`@cdecl`) · LOCK-5 (safepoint+kill).
+
+---
+
+## Previous focus — 2026-07-31 (rapid-dev session: language ceilings + gaps)
 **Where we are:** Phase 0-A soundness ✅ DONE. Stdlib breadth ✅. Phase 3 **language ceilings** making rapid
 progress — L6, L1a Phase-1, L2a Phase-1+2 all DONE. All 4 appendix gaps CLOSED (for-in-channel, labeled
 break/continue [deferred gen3], numeric separators [already existed], unicode escapes).

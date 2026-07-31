@@ -4,6 +4,21 @@
 > [`EXECUTION_STATE.md`](EXECUTION_STATE.md)** (updated every commit). This banner is refreshed as backlog
 > items land, so the plan stays an accurate picture. Execution began **2026-07-11**.
 >
+> **✅ BUILTIN SOUNDNESS CAMPAIGN DONE (2026-08-01)** — the mass-produced builtins were NOT
+> production-grade, and the fix is landed. Three defect classes, each *measured*, not argued:
+> **(1)** `08b03d37` dense-dict — 59 builtins iterated `i < d->cap` with `hashes[i]!=0` as an occupancy
+> test; `NovaDict` is DENSE, so they read uninitialized heap and processed garbage as live entries.
+> **(2)** `e25932b1` **10 duplicate LLVM `declare`s made EVERY compiled program fail to link** — LLVM
+> rejects a redeclared function and the declare block is emitted into every program; one had CONFLICTING
+> attributes (`nounwind` vs `readnone`). Hidden for weeks by deferred reconverge, and *masked* by a
+> reconverge script that reported a bogus "DIVERGED" when a link silently failed (both fixed).
+> **(3)** `e67ee810` builtin soundness sweep — **8 of 10 probe classes segfaulted before it, all pass now**
+> (`flatten_map([1,2,3])` read elements as pointers 0x1/0x2/0x3; `truncate_ellipsis(s,-5)` wrote `buf[-5]`,
+> a heap underflow at a caller-controlled offset). Cause: all 173 `nova_mem_find_tag` checks sit before
+> line ~19765 — the builtin region had **zero** across 239 functions. 511 casts routed through checked
+> accessors + 14 arithmetic fixes. **New standing gate:** `_run_builtin_soundness.ps1` (no compiler needed).
+> **Builtins: 1305.** *Builtin count is no longer a goal — see `EXECUTION_STATE.md` for the rule.*
+>
 > **DONE + reconverged/certified (`gen5==gen6`, regression both modes):**
 > - **Phase-0 Wave-A soundness** — 0.11 float-return guard · `1<<64` shift-UB · **LOCK-3** trait-signature
 >   conformance · enum-payload typing · float-enum-payload codegen unbox. *(commits `bfc55fba`→`29e380c1`)*
