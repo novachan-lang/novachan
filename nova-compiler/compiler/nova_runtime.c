@@ -2035,6 +2035,60 @@ int64_t nova_rt_trim(int64_t s) {
     return (int64_t)(uintptr_t)result;
 }
 
+int64_t nova_rt_trim_left(int64_t s) {
+    const char* str = nova_str_safe(s);
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
+    size_t len = strlen(str);
+    char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!result) return 0;
+    memcpy(result, str, len + 1);
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_trim_right(int64_t s) {
+    const char* str = nova_str_safe(s);
+    size_t len = strlen(str);
+    while (len > 0 && (str[len-1] == ' ' || str[len-1] == '\t' || str[len-1] == '\n' || str[len-1] == '\r')) len--;
+    char* result = (char*)nova_heap_alloc(len + 1, NOVA_MEM_RAW);
+    if (!result) return 0;
+    memcpy(result, str, len);
+    result[len] = '\0';
+    return (int64_t)(uintptr_t)result;
+}
+
+int64_t nova_rt_math_clamp(int64_t val, int64_t lo, int64_t hi) {
+    if (val < lo) return lo;
+    if (val > hi) return hi;
+    return val;
+}
+
+int64_t nova_rt_math_lerp(int64_t a_val, int64_t b_val, int64_t t_val) {
+    double a, b, t;
+    memcpy(&a, &a_val, sizeof(double));
+    memcpy(&b, &b_val, sizeof(double));
+    memcpy(&t, &t_val, sizeof(double));
+    double result = a + (b - a) * t;
+    int64_t out;
+    memcpy(&out, &result, sizeof(int64_t));
+    return out;
+}
+
+int64_t nova_rt_list_unique(int64_t handle) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return nova_rt_list_create();
+    NovaList* src = (NovaList*)(uintptr_t)handle;
+    int64_t out = nova_rt_list_create();
+    for (int64_t i = 0; i < src->size; i++) {
+        int64_t v = src->data[i];
+        int found = 0;
+        NovaList* dst = (NovaList*)(uintptr_t)out;
+        for (int64_t j = 0; j < dst->size; j++) {
+            if (nova_rt_eq(v, dst->data[j])) { found = 1; break; }
+        }
+        if (!found) nova_rt_list_append(out, v);
+    }
+    return out;
+}
+
 int64_t nova_rt_split(int64_t s, int64_t delim) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
@@ -4120,6 +4174,128 @@ int64_t nova_rt_json_stringify(int64_t val) {
     JsonBuf b;
     jbuf_init(&b);
     json_stringify_value(&b, val, 0);
+    jbuf_char(&b, '\0');
+    char* tracked = (char*)nova_heap_alloc((size_t)b.len, NOVA_MEM_RAW);
+    if (tracked) memcpy(tracked, b.buf, (size_t)b.len);
+    free(b.buf);
+    return (int64_t)(uintptr_t)tracked;
+}
+
+/* ── Pretty-print JSON ──────────────────────────────────────────────────────
+   Same structural walk as json_stringify_value but emits indented, multi-line
+   JSON (2-space indent, newlines after {/[/, space after :). */
+
+static void jbuf_newline_indent(JsonBuf* b, int indent) {
+    jbuf_char(b, '\n');
+    for (int i = 0; i < indent; i++) { jbuf_char(b, ' '); jbuf_char(b, ' '); }
+}
+
+static void json_pretty_value(JsonBuf* b, int64_t val, int depth, int indent) {
+    if (depth > 32) { jbuf_append(b, "null", 4); return; }
+
+    void* ptr = (void*)(uintptr_t)val;
+    NovaMemTag tag = nova_mem_find_tag(ptr);
+    if (tag == NOVA_MEM_BOX) {
+        NovaBox* bx = (NovaBox*)ptr;
+        if (bx->kind == NOVA_BOX_NULL) {
+            jbuf_append(b, "null", 4);
+        } else if (bx->kind == NOVA_BOX_BOOL) {
+            if (bx->payload) jbuf_append(b, "true", 4);
+            else jbuf_append(b, "false", 5);
+        } else {
+            double dv; memcpy(&dv, &bx->payload, sizeof(dv));
+            char fb[40]; snprintf(fb, sizeof(fb), "%.15g", dv);
+            jbuf_append(b, fb, (int64_t)strlen(fb));
+        }
+        return;
+    }
+    if (tag == NOVA_MEM_DICT) {
+        NovaDict* d = (NovaDict*)ptr;
+        if (d->size == 0) { jbuf_append(b, "{}", 2); return; }
+        jbuf_char(b, '{');
+        for (int64_t i = 0; i < d->size; i++) {
+            if (i > 0) jbuf_char(b, ',');
+            jbuf_newline_indent(b, indent + 1);
+            json_stringify_str(b, (const char*)(uintptr_t)d->keys[i]);
+            jbuf_append(b, ": ", 2);
+            json_pretty_value(b, d->vals[i], depth + 1, indent + 1);
+        }
+        jbuf_newline_indent(b, indent);
+        jbuf_char(b, '}');
+        return;
+    }
+    if (tag == NOVA_MEM_LIST) {
+        nova_list_deopt(val);
+        NovaList* l = (NovaList*)ptr;
+        if (l->size == 0) { jbuf_append(b, "[]", 2); return; }
+        jbuf_char(b, '[');
+        for (int64_t i = 0; i < l->size; i++) {
+            if (i > 0) jbuf_char(b, ',');
+            jbuf_newline_indent(b, indent + 1);
+            json_pretty_value(b, l->data[i], depth + 1, indent + 1);
+        }
+        jbuf_newline_indent(b, indent);
+        jbuf_char(b, ']');
+        return;
+    }
+    if (tag == NOVA_MEM_BYTES) {
+        NovaBytes* bb = (NovaBytes*)ptr;
+        char tmp[48];
+        int n = snprintf(tmp, sizeof(tmp), "\"<bytes:%lld>\"", (long long)bb->size);
+        jbuf_append(b, tmp, (int64_t)n);
+        return;
+    }
+    if (tag == NOVA_MEM_RAW) {
+        json_stringify_str(b, (const char*)ptr);
+        return;
+    }
+    if (tag == NOVA_MEM_STRUCT) {
+        int64_t _shash = ((const int64_t*)ptr)[0];
+        int _sfc = nova_struct_meta_fcount(_shash);
+        if (_sfc > 0) {
+            const int64_t* slots = (const int64_t*)ptr;
+            jbuf_char(b, '{');
+            for (int _si = 0; _si < _sfc; _si++) {
+                if (_si > 0) jbuf_char(b, ',');
+                jbuf_newline_indent(b, indent + 1);
+                const char* _fn = nova_struct_meta_fname(_shash, _si);
+                json_stringify_str(b, _fn ? _fn : "");
+                jbuf_append(b, ": ", 2);
+                int64_t _fv = slots[_si + 1];
+                const char* _ft = nova_struct_meta_ftype(_shash, _si);
+                if (_ft && strcmp(_ft, "bool") == 0) {
+                    if (_fv) jbuf_append(b, "true", 4); else jbuf_append(b, "false", 5);
+                } else if (_ft && strcmp(_ft, "float") == 0 &&
+                           nova_mem_find_tag((void*)(uintptr_t)_fv) != NOVA_MEM_BOX) {
+                    double _dv; memcpy(&_dv, &_fv, sizeof(_dv));
+                    char _fb[40]; snprintf(_fb, sizeof(_fb), "%.15g", _dv);
+                    jbuf_append(b, _fb, (int64_t)strlen(_fb));
+                } else {
+                    json_pretty_value(b, _fv, depth + 1, indent + 1);
+                }
+            }
+            jbuf_newline_indent(b, indent);
+            jbuf_char(b, '}');
+            return;
+        }
+    }
+    if ((uint64_t)val > 0x10000 && nova_is_readable_str(ptr)) {
+        unsigned char c = *(unsigned char*)ptr;
+        if (c == 0 || (c >= 0x20 && c < 0x7F)) {
+            json_stringify_str(b, (const char*)ptr);
+            return;
+        }
+    }
+    char nbuf[32];
+    snprintf(nbuf, sizeof(nbuf), "%lld", (long long)val);
+    jbuf_append(b, nbuf, (int64_t)strlen(nbuf));
+}
+
+int64_t nova_rt_json_stringify_pretty(int64_t val) {
+    JsonBuf b;
+    jbuf_init(&b);
+    json_pretty_value(&b, val, 0, 0);
+    jbuf_char(&b, '\n');
     jbuf_char(&b, '\0');
     char* tracked = (char*)nova_heap_alloc((size_t)b.len, NOVA_MEM_RAW);
     if (tracked) memcpy(tracked, b.buf, (size_t)b.len);
