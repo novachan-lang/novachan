@@ -24307,6 +24307,208 @@ int64_t nova_rt_list_rotate_right(int64_t handle, int64_t n) {
     return r;
 }
 
+/* nova_rt_list_last_index_of: find last index of value */
+int64_t nova_rt_list_last_index_of(int64_t handle, int64_t val) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l) return -1;
+    for (int64_t i = l->size - 1; i >= 0; i--) {
+        if (l->data[i] == val) return i;
+    }
+    return -1;
+}
+
+/* nova_rt_str_normalize_whitespace: collapse all whitespace (tabs, newlines, etc.) to single spaces + trim */
+int64_t nova_rt_str_normalize_whitespace(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen + 1);
+    if (!buf) return val;
+    size_t j = 0;
+    int in_space = 1;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+            if (!in_space && j > 0) { buf[j++] = ' '; in_space = 1; }
+        } else {
+            buf[j++] = (char)c;
+            in_space = 0;
+        }
+    }
+    if (j > 0 && buf[j-1] == ' ') j--;
+    buf[j] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_dict_values_list: return list of all dict values */
+int64_t nova_rt_dict_values_list(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (!d) return result;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            nova_rt_list_append(result, d->vals[i]);
+        }
+    }
+    return result;
+}
+
+/* nova_rt_list_has_duplicates: true if any element appears more than once */
+int64_t nova_rt_list_has_duplicates(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        for (int64_t j = i + 1; j < l->size; j++) {
+            if (l->data[i] == l->data[j]) return 1;
+        }
+    }
+    return 0;
+}
+
+/* nova_rt_str_reverse_words: reverse word order in a string */
+int64_t nova_rt_str_reverse_words(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return nova_rt_create_string((void*)"");
+    int64_t words = nova_rt_str_words(val);
+    NovaList* wl = (NovaList*)(uintptr_t)words;
+    if (!wl || wl->size == 0) return nova_rt_create_string((void*)"");
+    int64_t result = (int64_t)(uintptr_t)"";
+    for (int64_t i = wl->size - 1; i >= 0; i--) {
+        if (i < wl->size - 1) {
+            result = nova_rt_str_concat_safe(result, nova_rt_create_string((void*)" "));
+        }
+        result = nova_rt_str_concat_safe(result, wl->data[i]);
+    }
+    return result;
+}
+
+/* nova_rt_str_char_count: count occurrences of a character (by string of length 1) */
+int64_t nova_rt_str_char_count(int64_t val, int64_t ch_val) {
+    const char* s = (const char*)(uintptr_t)val;
+    const char* ch = (const char*)(uintptr_t)ch_val;
+    if (!s || !ch || !ch[0]) return 0;
+    char target = ch[0];
+    int64_t count = 0;
+    for (size_t i = 0; s[i]; i++) {
+        if (s[i] == target) count++;
+    }
+    return count;
+}
+
+/* nova_rt_list_second: get second element */
+int64_t nova_rt_list_second(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size < 2) return 0;
+    return l->data[1];
+}
+
+/* nova_rt_list_third: get third element */
+int64_t nova_rt_list_third(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size < 3) return 0;
+    return l->data[2];
+}
+
+/* nova_rt_str_is_url: basic URL check (starts with http:// or https://) */
+int64_t nova_rt_str_is_url(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s) return 0;
+    if (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0) return 1;
+    return 0;
+}
+
+/* nova_rt_str_is_email: basic email check (contains @ with text before and after) */
+int64_t nova_rt_str_is_email(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return 0;
+    const char* at = strchr(s, '@');
+    if (!at || at == s || !at[1]) return 0;
+    const char* dot = strchr(at + 1, '.');
+    if (!dot || dot == at + 1 || !dot[1]) return 0;
+    return 1;
+}
+
+/* nova_rt_list_median: median of sorted integer list */
+int64_t nova_rt_list_median(int64_t handle) {
+    int64_t sorted = nova_rt_list_sort(handle);
+    NovaList* l = (NovaList*)(uintptr_t)sorted;
+    if (!l || l->size == 0) return 0;
+    if (l->size % 2 == 1) return l->data[l->size / 2];
+    return (l->data[l->size / 2 - 1] + l->data[l->size / 2]) / 2;
+}
+
+/* nova_rt_str_escape_html: escape <>&" for HTML */
+int64_t nova_rt_str_escape_html(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return val;
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen * 6 + 1);
+    if (!buf) return val;
+    size_t j = 0;
+    for (size_t i = 0; i < slen; i++) {
+        switch (s[i]) {
+            case '<': memcpy(buf+j, "&lt;", 4); j += 4; break;
+            case '>': memcpy(buf+j, "&gt;", 4); j += 4; break;
+            case '&': memcpy(buf+j, "&amp;", 5); j += 5; break;
+            case '"': memcpy(buf+j, "&quot;", 6); j += 6; break;
+            default: buf[j++] = s[i]; break;
+        }
+    }
+    buf[j] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_str_unescape_html: unescape HTML entities */
+int64_t nova_rt_str_unescape_html(int64_t val) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || !s[0]) return val;
+    size_t slen = strlen(s);
+    char* buf = (char*)malloc(slen + 1);
+    if (!buf) return val;
+    size_t j = 0;
+    for (size_t i = 0; i < slen; i++) {
+        if (s[i] == '&') {
+            if (strncmp(s+i, "&lt;", 4) == 0) { buf[j++] = '<'; i += 3; }
+            else if (strncmp(s+i, "&gt;", 4) == 0) { buf[j++] = '>'; i += 3; }
+            else if (strncmp(s+i, "&amp;", 5) == 0) { buf[j++] = '&'; i += 4; }
+            else if (strncmp(s+i, "&quot;", 6) == 0) { buf[j++] = '"'; i += 5; }
+            else buf[j++] = s[i];
+        } else {
+            buf[j++] = s[i];
+        }
+    }
+    buf[j] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_dict_swap: swap two keys' values */
+int64_t nova_rt_dict_swap(int64_t handle, int64_t key_a, int64_t key_b) {
+    int64_t va = nova_rt_dict_get(handle, key_a);
+    int64_t vb = nova_rt_dict_get(handle, key_b);
+    nova_rt_dict_set(handle, key_a, vb);
+    nova_rt_dict_set(handle, key_b, va);
+    return handle;
+}
+
+/* nova_rt_list_cycle: repeat list n times -> new list */
+int64_t nova_rt_list_cycle(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (!l || n <= 0) return result;
+    for (int64_t rep = 0; rep < n; rep++) {
+        for (int64_t i = 0; i < l->size; i++) {
+            nova_rt_list_append(result, l->data[i]);
+        }
+    }
+    return result;
+}
+
 /* nova_rt_str_surround: wrap string with prefix and suffix */
 int64_t nova_rt_str_surround(int64_t val, int64_t pre_val, int64_t suf_val) {
     const char* s = (const char*)(uintptr_t)val;
