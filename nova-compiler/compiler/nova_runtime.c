@@ -29451,3 +29451,134 @@ int64_t nova_rt_list_count_where_gt(int64_t handle, int64_t threshold) {
         if (l->data[i] > threshold) count++;
     return count;
 }
+
+/* nova_rt_str_remove_vowels: remove all vowels from string */
+int64_t nova_rt_str_remove_vowels(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c != 'a' && c != 'e' && c != 'i' && c != 'o' && c != 'u')
+            buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_str_title_to_slug: title case to kebab-case slug */
+int64_t nova_rt_str_title_to_slug(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len * 2 + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == ' ') { buf[j++] = '-'; continue; }
+        if (s[i] >= 'A' && s[i] <= 'Z') buf[j++] = (char)(s[i] + 32);
+        else buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_windows_sum: sliding window sums of size k */
+int64_t nova_rt_list_windows_sum(int64_t handle, int64_t k) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || k <= 0 || k > l->size) return out;
+    int64_t sum = 0;
+    for (int64_t i = 0; i < k; i++) sum += l->data[i];
+    nova_rt_list_append(out, sum);
+    for (int64_t i = k; i < l->size; i++) {
+        sum += l->data[i] - l->data[i - k];
+        nova_rt_list_append(out, sum);
+    }
+    return out;
+}
+
+/* nova_rt_dict_values_unique: list of unique values in dict */
+int64_t nova_rt_dict_values_unique(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            NovaList* ol = (NovaList*)(uintptr_t)out;
+            int found = 0;
+            for (int64_t j = 0; j < ol->size; j++)
+                if (ol->data[j] == d->vals[i]) { found = 1; break; }
+            if (!found) nova_rt_list_append(out, d->vals[i]);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_dict_has_all_keys: check if dict contains all keys in list */
+int64_t nova_rt_dict_has_all_keys(int64_t dict_handle, int64_t keys_handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)dict_handle;
+    NovaList* keys = (NovaList*)(uintptr_t)keys_handle;
+    if (!d || !keys) return 0;
+    for (int64_t i = 0; i < keys->size; i++) {
+        int found = 0;
+        for (int64_t j = 0; j < d->cap; j++) {
+            if (d->hashes[j] != 0) {
+                const char* dk = (const char*)(uintptr_t)d->keys[j];
+                const char* rk = (const char*)(uintptr_t)keys->data[i];
+                if (dk && rk && strcmp(dk, rk) == 0) { found = 1; break; }
+            }
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
+/* nova_rt_list_is_palindrome: check if list reads same forwards and backwards */
+int64_t nova_rt_list_is_palindrome(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return 1;
+    for (int64_t i = 0; i < l->size / 2; i++)
+        if (l->data[i] != l->data[l->size - 1 - i]) return 0;
+    return 1;
+}
+
+/* nova_rt_str_to_words: split string into list of words by spaces */
+int64_t nova_rt_str_to_words(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!s) return out;
+    size_t len = strlen(s);
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && s[i] == ' ') i++;
+        if (i >= len) break;
+        size_t start = i;
+        while (i < len && s[i] != ' ') i++;
+        char* word = (char*)malloc(i - start + 1);
+        if (!word) break;
+        memcpy(word, s + start, i - start);
+        word[i - start] = 0;
+        nova_rt_list_append(out, nova_rt_create_string(word));
+        free(word);
+    }
+    return out;
+}
+
+/* nova_rt_list_replace_all: replace all occurrences of old with new */
+int64_t nova_rt_list_replace_all(int64_t handle, int64_t old_val, int64_t new_val) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    for (int64_t i = 0; i < l->size; i++)
+        nova_rt_list_append(out, l->data[i] == old_val ? new_val : l->data[i]);
+    return out;
+}
