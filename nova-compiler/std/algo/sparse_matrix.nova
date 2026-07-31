@@ -1,0 +1,239 @@
+// ============================================================================
+// NOVA Standard Library — std/algo/sparse_matrix
+// ============================================================================
+// Compressed Sparse Row (CSR) matrix — the standard storage format for
+// sparse numeric matrices where most entries are zero (graph adjacency/
+// weight matrices, finite-element stiffness matrices, one-hot feature
+// matrices). Storing only the non-zero entries turns an O(rows*cols) dense
+// representation into O(nnz), and turns matrix-vector product from
+// O(rows*cols) into O(nnz) — the single most important operation CSR exists
+// to accelerate (iterative solvers, PageRank-style graph propagation, and
+// sparse neural layers are all dominated by repeated mat-vec products).
+//
+// INTEGER-ONLY BY DESIGN: this module stores int values, not float. Sparse
+// numeric workloads are frequently integer (adjacency counts, weighted
+// graphs with integer weights, histograms) and staying integer sidesteps
+// the any-widening float-boxing hazard documented elsewhere in this stdlib
+// for generic containers. Callers needing floating-point sparse matrices
+// should scale to a fixed-point integer representation.
+//
+// REPRESENTATION (a dict for reference semantics, mirroring this stdlib's
+// convention for mutable structures — see std/collections/deque.nova):
+//   {"csr_rows": int, "csr_cols": int,
+//    "csr_data": list<int>,      -- non-zero values, row-major, each row's
+//                                   slice sorted ascending by column
+//    "csr_col_idx": list<int>,   -- column index for each entry in csr_data
+//    "csr_row_ptr": list<int>}   -- length rows+1; row r's entries occupy
+//                                   csr_data[csr_row_ptr[r] .. csr_row_ptr[r+1])
+//
+// This is the textbook CSR layout (Saad, "Iterative Methods for Sparse
+// Linear Systems", §3.4) — identical to scipy.sparse.csr_matrix's internal
+// arrays (data/indices/indptr), just NOVA-native.
+//
+// PUBLIC API:
+//   csr_new(rows, cols)          -> matrix (all zero)
+//   csr_from_dense(dense)        -> matrix  (dense: list<list<int>>)
+//   csr_to_dense(m)              -> list<list<int>>
+//   csr_get(m, r, c)             -> int
+//   csr_set(m, r, c, v)          -> unit   (v==0 removes any stored entry)
+//   csr_nnz(m)                   -> int    (total stored non-zeros)
+//   csr_row_nnz(m, r)            -> int    (non-zeros in row r)
+//   csr_transpose(m)             -> matrix
+//   csr_mul_vec(m, vec)          -> list<int>   (matrix-vector product)
+//
+// COMPLEXITY: csr_get/csr_set are O(row width) (linear scan within the row,
+// which for typical sparse rows is small); csr_mul_vec is O(nnz); csr_set
+// that inserts/removes an entry shifts O(nnz) elements (CSR is not designed
+// for frequent structural mutation — build via csr_from_dense when possible).
+//
+// SYMBOL COLLISION GUARD: all helpers prefixed _csr_.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// csr_new: an all-zero rows x cols matrix.
+fn csr_new(rows, cols)
+    let m = {}
+    m["csr_rows"] = rows
+    m["csr_cols"] = cols
+    m["csr_data"] = []
+    m["csr_col_idx"] = []
+    let rp = []
+    let i = 0
+    while i <= rows
+        rp.push(0)
+        i = i + 1
+    m["csr_row_ptr"] = rp
+    return m
+
+// csr_from_dense: build a CSR matrix from a dense list<list<int>>, skipping
+// zero entries. All rows must have equal length (= the matrix's column count).
+fn csr_from_dense(dense)
+    let rows = len(dense)
+    let cols = 0
+    if rows > 0
+        cols = len(dense[0])
+    let m = csr_new(rows, cols)
+    let data = m["csr_data"]
+    let col_idx = m["csr_col_idx"]
+    let row_ptr = m["csr_row_ptr"]
+    let count = 0
+    let r = 0
+    while r < rows
+        let row = dense[r]
+        let c = 0
+        while c < cols
+            let v = row[c]
+            if v != 0
+                data.push(v)
+                col_idx.push(c)
+                count = count + 1
+            c = c + 1
+        row_ptr[r + 1] = count
+        r = r + 1
+    return m
+
+// csr_to_dense: materialize the full dense list<list<int>> (zeros filled in).
+fn csr_to_dense(m)
+    let rows = m["csr_rows"]
+    let cols = m["csr_cols"]
+    let data = m["csr_data"]
+    let col_idx = m["csr_col_idx"]
+    let row_ptr = m["csr_row_ptr"]
+    let out = []
+    let r = 0
+    while r < rows
+        let row = []
+        let c = 0
+        while c < cols
+            row.push(0)
+            c = c + 1
+        let k = row_ptr[r]
+        let kend = row_ptr[r + 1]
+        while k < kend
+            row[col_idx[k]] = data[k]
+            k = k + 1
+        out.push(row)
+        r = r + 1
+    return out
+
+// _csr_find_in_row: locate column c within row r's stored (sorted) slice.
+// Returns {"csr_found":bool, "csr_pos":int} — csr_pos is the exact index
+// when found, or the sorted insertion point when not found.
+fn _csr_find_in_row(m, r, c)
+    let row_ptr = m["csr_row_ptr"]
+    let col_idx = m["csr_col_idx"]
+    let k = row_ptr[r]
+    let kend = row_ptr[r + 1]
+    let done = 0
+    while k < kend and done == 0
+        if col_idx[k] >= c
+            done = 1
+        else
+            k = k + 1
+    let out = {}
+    if k < kend and col_idx[k] == c
+        out["csr_found"] = true
+    else
+        out["csr_found"] = false
+    out["csr_pos"] = k
+    return out
+
+// csr_get: value at (r, c); 0 if no entry is stored there.
+fn csr_get(m, r, c)
+    let f = _csr_find_in_row(m, r, c)
+    let result = 0
+    if f["csr_found"] == true
+        let data = m["csr_data"]
+        result = data[f["csr_pos"]]
+    return result
+
+// _csr_remove_at: delete lst[pos] in place, preserving order.
+fn _csr_remove_at(lst, pos)
+    let before = list_slice(lst, 0, pos)
+    let after = list_slice(lst, pos + 1, len(lst))
+    let rebuilt = list_concat(before, after)
+    let i = 0
+    while i < len(rebuilt)
+        lst[i] = rebuilt[i]
+        i = i + 1
+    lst.pop()
+    return 0
+
+// csr_set: store v at (r, c). v==0 removes any existing stored entry there
+// (CSR never stores explicit zeros); a non-zero v updates an existing entry
+// in place or inserts a new one at the correct sorted position within row r.
+fn csr_set(m, r, c, v)
+    let f = _csr_find_in_row(m, r, c)
+    let data = m["csr_data"]
+    let col_idx = m["csr_col_idx"]
+    let row_ptr = m["csr_row_ptr"]
+    let rows = m["csr_rows"]
+    if f["csr_found"] == true
+        if v == 0
+            let pos = f["csr_pos"]
+            _csr_remove_at(data, pos)
+            _csr_remove_at(col_idx, pos)
+            let rr = r + 1
+            while rr <= rows
+                row_ptr[rr] = row_ptr[rr] - 1
+                rr = rr + 1
+        else
+            data[f["csr_pos"]] = v
+    else
+        if v != 0
+            let pos = f["csr_pos"]
+            insert(data, pos, v)
+            insert(col_idx, pos, c)
+            let rr = r + 1
+            while rr <= rows
+                row_ptr[rr] = row_ptr[rr] + 1
+                rr = rr + 1
+    return 0
+
+// csr_nnz: total number of stored non-zero entries.
+fn csr_nnz(m)
+    return len(m["csr_data"])
+
+// csr_row_nnz: number of stored non-zero entries in row r.
+fn csr_row_nnz(m, r)
+    let row_ptr = m["csr_row_ptr"]
+    return row_ptr[r + 1] - row_ptr[r]
+
+// csr_transpose: return a new matrix that is m transposed (rows/cols swapped).
+// Implemented via dense round-trip for simplicity/correctness; this module
+// targets moderate-size sparse matrices, not billion-entry graphs.
+fn csr_transpose(m)
+    let dense = csr_to_dense(m)
+    let rows = m["csr_rows"]
+    let cols = m["csr_cols"]
+    let tdense = []
+    let c = 0
+    while c < cols
+        let trow = []
+        let r = 0
+        while r < rows
+            trow.push(dense[r][c])
+            r = r + 1
+        tdense.push(trow)
+        c = c + 1
+    return csr_from_dense(tdense)
+
+// csr_mul_vec: sparse matrix-vector product m * vec. vec must have length
+// == m's column count; the result has length == m's row count.
+fn csr_mul_vec(m, vec)
+    let rows = m["csr_rows"]
+    let data = m["csr_data"]
+    let col_idx = m["csr_col_idx"]
+    let row_ptr = m["csr_row_ptr"]
+    let out = []
+    let r = 0
+    while r < rows
+        let total = 0
+        let k = row_ptr[r]
+        let kend = row_ptr[r + 1]
+        while k < kend
+            total = total + data[k] * vec[col_idx[k]]
+            k = k + 1
+        out.push(total)
+        r = r + 1
+    return out

@@ -1,0 +1,311 @@
+// ============================================================================
+// NOVA Standard Library — std/data/json_patch
+// ============================================================================
+// RFC 6902 JSON Patch — apply a sequence of "add"/"remove"/"replace"/"move"/
+// "copy"/"test" operations to an already-parsed JSON value (a NOVA
+// dict/list/string/int/float/bool/null tree, e.g. the output of json_parse).
+//
+// This module operates on the PARSED value model, not on JSON text — it
+// composes with std/data/jsonpointer (RFC 6901) conceptually but does not
+// import it, because JSON Patch's add/remove/replace need PARENT+KEY
+// navigation (to mutate in place), not jp_get's read-only leaf resolution.
+// Path tokens are escaped/unescaped per RFC 6901 exactly as jsonpointer does
+// ("~1" -> "/", then "~0" -> "~").
+//
+// EACH OPERATION is a dict with at least {"op": string, "path": string},
+// plus "value" (add/replace/test) or "from" (move/copy):
+//   {"op":"add",     "path":"/a/b", "value": <any>}
+//   {"op":"remove",  "path":"/a/b"}
+//   {"op":"replace", "path":"/a/b", "value": <any>}
+//   {"op":"move",    "path":"/a/b", "from":"/x/y"}
+//   {"op":"copy",    "path":"/a/b", "from":"/x/y"}
+//   {"op":"test",    "path":"/a/b", "value": <any>}
+//
+// PATH SEMANTICS (RFC 6902 §4):
+//   For a dict step, the token is a plain key (created if absent, for "add").
+//   For a list step, the token is a base-10 index, OR "-" (append, "add"
+//   only) meaning "after the last element".
+//   The ROOT itself may be the target: path == "" replaces/tests the whole
+//   document (add/replace set jp["jsp_doc"] directly; remove is illegal on
+//   the root per RFC 6902 and reported as an error).
+//
+// PUBLIC API:
+//   jsp_apply(doc: any, patch: list<op>) -> {"jsp_ok":bool, "jsp_doc":any, "jsp_err":string}
+//     Applies every op in order. On the FIRST failing op, stops and returns
+//     jsp_ok=false with the document state as of just before that op, and
+//     jsp_err describing what failed. All prior ops in the patch remain
+//     applied (RFC 6902 leaves atomicity/rollback to the caller — this
+//     mirrors most real implementations' "apply what you can, report where
+//     it broke" behavior; callers wanting all-or-nothing should deep-copy
+//     doc before calling and discard it on jsp_ok==false).
+//   jsp_op(op, path, value) -> op dict   (convenience constructor for
+//     add/replace/test; use jsp_op_from for move/copy)
+//   jsp_op_from(op, path, from) -> op dict  (convenience for move/copy)
+//   jsp_op_remove(path) -> op dict
+//
+// SYMBOL COLLISION GUARD: all helpers prefixed _jsp_ (public API: jsp_).
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// ── Path handling ────────────────────────────────────────────────────────────
+
+// _jsp_unescape: reverse RFC-6901 token escaping. Order matters: "~1"->"/"
+// FIRST, then "~0"->"~" (reversing would corrupt "~01").
+fn _jsp_unescape(token)
+    let s = replace(token, "~1", "/")
+    return replace(s, "~0", "~")
+
+// _jsp_tokens: split a pointer "/a/b/0" into unescaped tokens ["a","b","0"].
+// "" (root pointer) yields an empty token list. Returns null if the pointer
+// is non-empty and doesn't start with "/".
+fn _jsp_tokens(path)
+    let result = null
+    if len(path) == 0
+        result = []
+    else
+        if path[0] == "/"
+            let parts = split(path, "/")
+            let toks = []
+            let i = 1
+            while i < len(parts)
+                toks.push(_jsp_unescape(parts[i]))
+                i = i + 1
+            result = toks
+    return result
+
+// _jsp_parse_index: strict non-negative decimal index, or -1 if invalid.
+fn _jsp_parse_index(token)
+    let n = len(token)
+    let result = -1
+    if n > 0 and ord(token[0]) != 45
+        result = 0
+        let i = 0
+        let ok = 1
+        while i < n and ok == 1
+            let c = ord(token[i])
+            if c < 48 or c > 57
+                ok = 0
+                result = -1
+            else
+                result = result * 10 + (c - 48)
+            i = i + 1
+    return result
+
+// _jsp_get: resolve tokens against root for read-only access (used by "test"
+// and to fetch the source value for "move"/"copy"). Returns
+// {"jsp_found":bool, "jsp_val":any}.
+fn _jsp_get(root, tokens)
+    let node = root
+    let found = 1
+    let i = 0
+    let n = len(tokens)
+    while i < n and found == 1
+        let tok = tokens[i]
+        let kind = type_of(node)
+        if kind == "dict"
+            if contains(node, tok) == 1
+                node = node[tok]
+            else
+                found = 0
+        else
+            if kind == "list"
+                let idx = _jsp_parse_index(tok)
+                if idx >= 0 and idx < len(node)
+                    node = node[idx]
+                else
+                    found = 0
+            else
+                found = 0
+        i = i + 1
+    let out = {}
+    out["jsp_found"] = found == 1
+    out["jsp_val"] = node
+    return out
+
+// ── Mutating primitives ──────────────────────────────────────────────────────
+// Each takes the ROOT and the full token list, navigates to the PARENT of
+// the final token, and applies the edit there. Returns an error string, or
+// "" on success.
+
+fn _jsp_set_at(root, tokens, value)
+    let err = ""
+    if len(tokens) == 0
+        err = "cannot add/replace the document root via a non-root op"
+    else
+        let parent_toks = list_slice(tokens, 0, len(tokens) - 1)
+        let last = tokens[len(tokens) - 1]
+        let g = _jsp_get(root, parent_toks)
+        if g["jsp_found"] == false
+            err = "parent path not found"
+        else
+            let parent = g["jsp_val"]
+            let kind = type_of(parent)
+            if kind == "dict"
+                parent[last] = value
+            else
+                if kind == "list"
+                    if last == "-"
+                        parent.push(value)
+                    else
+                        let idx = _jsp_parse_index(last)
+                        if idx < 0 or idx > len(parent)
+                            err = "list index out of range"
+                        else
+                            insert(parent, idx, value)
+                else
+                    err = "parent is not a container"
+    return err
+
+fn _jsp_replace_at(root, tokens, value)
+    let err = ""
+    if len(tokens) == 0
+        err = "replace at root is not supported by this API"
+    else
+        let parent_toks = list_slice(tokens, 0, len(tokens) - 1)
+        let last = tokens[len(tokens) - 1]
+        let g = _jsp_get(root, parent_toks)
+        if g["jsp_found"] == false
+            err = "parent path not found"
+        else
+            let parent = g["jsp_val"]
+            let kind = type_of(parent)
+            if kind == "dict"
+                if contains(parent, last) == 0
+                    err = "key does not exist for replace"
+                else
+                    parent[last] = value
+            else
+                if kind == "list"
+                    let idx = _jsp_parse_index(last)
+                    if idx < 0 or idx >= len(parent)
+                        err = "list index out of range"
+                    else
+                        parent[idx] = value
+                else
+                    err = "parent is not a container"
+    return err
+
+fn _jsp_remove_at(root, tokens)
+    let err = ""
+    if len(tokens) == 0
+        err = "cannot remove the document root"
+    else
+        let parent_toks = list_slice(tokens, 0, len(tokens) - 1)
+        let last = tokens[len(tokens) - 1]
+        let g = _jsp_get(root, parent_toks)
+        if g["jsp_found"] == false
+            err = "parent path not found"
+        else
+            let parent = g["jsp_val"]
+            let kind = type_of(parent)
+            if kind == "dict"
+                if contains(parent, last) == 0
+                    err = "key does not exist for remove"
+                else
+                    del(parent, last)
+            else
+                if kind == "list"
+                    let idx = _jsp_parse_index(last)
+                    if idx < 0 or idx >= len(parent)
+                        err = "list index out of range"
+                    else
+                        let before = list_slice(parent, 0, idx)
+                        let after = list_slice(parent, idx + 1, len(parent))
+                        let rebuilt = list_concat(before, after)
+                        let ri = 0
+                        while ri < len(rebuilt)
+                            if ri < len(parent)
+                                parent[ri] = rebuilt[ri]
+                            ri = ri + 1
+                        let popn = len(parent) - len(rebuilt)
+                        let pn = 0
+                        while pn < popn
+                            parent.pop()
+                            pn = pn + 1
+                else
+                    err = "parent is not a container"
+    return err
+
+// ── Op application ───────────────────────────────────────────────────────────
+
+fn _jsp_apply_one(doc, op)
+    let err = ""
+    let kind = op["op"]
+    let toks = _jsp_tokens(op["path"])
+    if toks == null
+        err = "malformed path"
+    else
+        if kind == "add"
+            err = _jsp_set_at(doc, toks, op["value"])
+        else
+            if kind == "replace"
+                err = _jsp_replace_at(doc, toks, op["value"])
+            else
+                if kind == "remove"
+                    err = _jsp_remove_at(doc, toks)
+                else
+                    if kind == "test"
+                        let g = _jsp_get(doc, toks)
+                        if g["jsp_found"] == false
+                            err = "test target path not found"
+                        else
+                            if str(g["jsp_val"]) != str(op["value"])
+                                err = "test failed: value mismatch"
+                    else
+                        if kind == "move" or kind == "copy"
+                            let from_toks = _jsp_tokens(op["from"])
+                            if from_toks == null
+                                err = "malformed 'from' path"
+                            else
+                                let g2 = _jsp_get(doc, from_toks)
+                                if g2["jsp_found"] == false
+                                    err = "'from' path not found"
+                                else
+                                    let v = g2["jsp_val"]
+                                    if kind == "move"
+                                        err = _jsp_remove_at(doc, from_toks)
+                                    if err == ""
+                                        err = _jsp_set_at(doc, toks, v)
+                        else
+                            err = "unknown op: " + kind
+    return err
+
+// jsp_apply: apply a full patch (list of ops) to doc, in order.
+fn jsp_apply(doc, patch)
+    let ok = true
+    let err = ""
+    let i = 0
+    let n = len(patch)
+    while i < n and ok == true
+        let e = _jsp_apply_one(doc, patch[i])
+        if e != ""
+            ok = false
+            err = "op " + str(i) + " (" + patch[i]["op"] + "): " + e
+        i = i + 1
+    let out = {}
+    out["jsp_ok"] = ok
+    out["jsp_doc"] = doc
+    out["jsp_err"] = err
+    return out
+
+// ── Convenience constructors ─────────────────────────────────────────────────
+
+fn jsp_op(kind, path, value)
+    let o = {}
+    o["op"] = kind
+    o["path"] = path
+    o["value"] = value
+    return o
+
+fn jsp_op_from(kind, path, from)
+    let o = {}
+    o["op"] = kind
+    o["path"] = path
+    o["from"] = from
+    return o
+
+fn jsp_op_remove(path)
+    let o = {}
+    o["op"] = "remove"
+    o["path"] = path
+    return o

@@ -1,0 +1,314 @@
+// ============================================================================
+// NOVA Standard Library — std/encoding/bech32
+// ============================================================================
+// Bech32 / Bech32m (BIP-0173 / BIP-0350) — the checksummed, human-readable
+// encoding used by Bitcoin SegWit addresses (bc1..., bc1p...) and adopted
+// elsewhere (Lightning invoices, Nostr npub/nsec keys) precisely because its
+// checksum construction (a BCH code over GF(1024)) can detect any single
+// substitution of up to 4 characters and any two-character transposition —
+// properties plain Base58Check does not guarantee for human-typed input.
+//
+// THE TWO VARIANTS — constant matters (BIP-0350 rationale):
+//   Bech32  (const = 1)          — original SegWit v0 addresses.
+//   Bech32m (const = 0x2bc830a3) — SegWit v1+ (Taproot) addresses. Bech32m
+//   exists because the original Bech32 constant has a blind spot: appending
+//   or stripping trailing "q" characters can still checksum-validate on
+//   certain payloads. BIP-0350 fixes this with a different XOR constant.
+//   Both variants share every other step (charset, HRP expansion, polymod).
+//
+// PUBLIC API:
+//   bch_encode(hrp: string, data: bytes) -> string          (Bech32,  const=1)
+//   bch_decode(s: string) -> {"bch_ok":bool,"bch_hrp":string,"bch_data":bytes}
+//   bch_encode_m(hrp: string, data: bytes) -> string         (Bech32m, const=0x2bc830a3)
+//   bch_decode_m(s: string) -> {"bch_ok":bool,"bch_hrp":string,"bch_data":bytes}
+//
+// `data` is the raw payload as 8-bit bytes; internally it is regrouped into
+// 5-bit words (per BIP-0173 §convertbits) before checksumming/charset
+// mapping, and regrouped back to 8-bit bytes on decode. This mirrors how
+// SegWit programs are actually carried (witness version + regrouped program
+// bytes) while keeping the module's public surface binary-safe (bytes in,
+// bytes out) rather than exposing raw 5-bit "word" lists to callers.
+//
+// ARITHMETIC HAZARD — >> IS ARITHMETIC IN NOVA:
+//   Every intermediate is masked (&0x1F, &0xFF, &0x3FFFFFFF, ...) immediately
+//   after any shift, exactly like std/hash/murmur3_32.nova, to guard against
+//   sign-extension on values that must be treated as unsigned.
+//
+// SYMBOL COLLISION GUARD: all helpers prefixed _bch_.
+// LEAF — imports NOTHING.
+// ============================================================================
+
+fn _bch_charset() -> string
+    "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+// _bch_charval: index of char c (0..31) in the charset, or -1 if not present.
+fn _bch_charval(c) -> int
+    let cs = _bch_charset()
+    let i = 0
+    let n = len(cs)
+    let result = -1
+    while i < n
+        if cs[i] == c
+            result = i
+        i = i + 1
+    return result
+
+// _bch_polymod: the BCH checksum core over a list of 5-bit values.
+// GEN are the fixed generator constants from BIP-0173.
+fn _bch_polymod(values) -> int
+    let gen0 = 0x3b6a57b2
+    let gen1 = 0x26508e6d
+    let gen2 = 0x1ea119fa
+    let gen3 = 0x3d4233dd
+    let gen4 = 0x2a1462b3
+    let chk = 1
+    let i = 0
+    let n = len(values)
+    while i < n
+        let v = values[i]
+        let b = (chk >> 25) & 0x1F
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        if ((b >> 0) & 1) == 1
+            chk = chk ^ gen0
+        if ((b >> 1) & 1) == 1
+            chk = chk ^ gen1
+        if ((b >> 2) & 1) == 1
+            chk = chk ^ gen2
+        if ((b >> 3) & 1) == 1
+            chk = chk ^ gen3
+        if ((b >> 4) & 1) == 1
+            chk = chk ^ gen4
+        i = i + 1
+    return chk & 0x3FFFFFFF
+
+// _bch_hrp_expand: BIP-0173's HRP expansion — high 3 bits of each HRP byte,
+// a zero separator, then the low 5 bits of each HRP byte. This folds the
+// human-readable part into the checksum so e.g. "bc" vs "tb" addresses
+// can never cross-validate.
+fn _bch_hrp_expand(hrp) -> list
+    let out = []
+    let n = len(hrp)
+    let i = 0
+    while i < n
+        let b = ord(hrp[i])
+        out.push((b >> 5) & 0x07)
+        i = i + 1
+    out.push(0)
+    let j = 0
+    while j < n
+        let b2 = ord(hrp[j])
+        out.push(b2 & 0x1F)
+        j = j + 1
+    return out
+
+// _bch_verify_checksum: true iff polymod(expand(hrp) ++ data) == const.
+fn _bch_verify_checksum(hrp, data, k) -> int
+    let values = _bch_hrp_expand(hrp)
+    let i = 0
+    while i < len(data)
+        values.push(data[i])
+        i = i + 1
+    let pm = _bch_polymod(values)
+    if pm == k
+        return 1
+    return 0
+
+// _bch_create_checksum: 6 five-bit checksum values for hrp+data under const k.
+fn _bch_create_checksum(hrp, data, k) -> list
+    let values = _bch_hrp_expand(hrp)
+    let i = 0
+    while i < len(data)
+        values.push(data[i])
+        i = i + 1
+    values.push(0)
+    values.push(0)
+    values.push(0)
+    values.push(0)
+    values.push(0)
+    values.push(0)
+    let pm = _bch_polymod(values) ^ k
+    let out = []
+    let j = 0
+    while j < 6
+        let shift = 5 * (5 - j)
+        out.push((pm >> shift) & 0x1F)
+        j = j + 1
+    return out
+
+// _bch_convertbits: regroup a list of ints from `frombits`-wide words to
+// `tobits`-wide words (MSB-first), per BIP-0173. Returns null if any input
+// word doesn't fit in `frombits`, or (when pad==0) leftover bits are lost
+// or nonzero. `pad`: 1/0.
+fn _bch_convertbits(data, frombits, tobits, pad) -> any
+    let acc = 0
+    let bits = 0
+    let ret = []
+    let maxv = (1 << tobits) - 1
+    let max_acc = (1 << (frombits + tobits - 1)) - 1
+    let ok = 1
+    let i = 0
+    let n = len(data)
+    while i < n and ok == 1
+        let value = data[i]
+        if value < 0 or (value >> frombits) != 0
+            ok = 0
+        else
+            acc = ((acc << frombits) | value) & max_acc
+            bits = bits + frombits
+            while bits >= tobits
+                bits = bits - tobits
+                ret.push((acc >> bits) & maxv)
+        i = i + 1
+    let result = null
+    if ok == 1
+        if pad == 1
+            if bits > 0
+                ret.push((acc << (tobits - bits)) & maxv)
+            result = ret
+        else
+            let leftover_bad = 0
+            if bits >= frombits
+                leftover_bad = 1
+            if ((acc << (tobits - bits)) & maxv) != 0
+                leftover_bad = 1
+            if leftover_bad == 0
+                result = ret
+    return result
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// _bch_encode_core: shared encode logic for both variants.
+fn _bch_encode_core(hrp, data, k) -> string
+    let words = _bch_convertbits(_bch_bytes_to_words(data), 8, 5, 1)
+    let checksum = _bch_create_checksum(hrp, words, k)
+    let cs = _bch_charset()
+    let out = hrp + "1"
+    let i = 0
+    while i < len(words)
+        out = out + cs[words[i]]
+        i = i + 1
+    let j = 0
+    while j < len(checksum)
+        out = out + cs[checksum[j]]
+        j = j + 1
+    return out
+
+// _bch_bytes_to_words: helper converting a `bytes` value into a plain list
+// of ints (0..255) so the generic convertbits() can operate on it.
+fn _bch_bytes_to_words(data) -> list
+    let out = []
+    let n = bytes_len(data)
+    let i = 0
+    while i < n
+        out.push(bytes_get(data, i) & 0xFF)
+        i = i + 1
+    return out
+
+// bch_encode: Bech32 (const=1) encode hrp + raw payload bytes.
+fn bch_encode(hrp, data) -> string
+    return _bch_encode_core(hrp, data, 1)
+
+// bch_encode_m: Bech32m (const=0x2bc830a3) encode hrp + raw payload bytes.
+fn bch_encode_m(hrp, data) -> string
+    return _bch_encode_core(hrp, data, 0x2bc830a3)
+
+// _bch_decode_core: shared decode logic. Returns the standard result dict.
+fn _bch_decode_core(s, k) -> any
+    let result = {}
+    result["bch_ok"] = false
+    result["bch_hrp"] = ""
+    result["bch_data"] = bytes(0)
+
+    let n = len(s)
+    // Reject mixed-case (BIP-0173 mandates all-lower or all-upper on the wire).
+    let has_lower = 0
+    let has_upper = 0
+    let has_bad_range = 0
+    let i0 = 0
+    while i0 < n
+        let cc = ord(s[i0])
+        if cc < 33 or cc > 126
+            has_bad_range = 1
+        if cc >= 97 and cc <= 122
+            has_lower = 1
+        if cc >= 65 and cc <= 90
+            has_upper = 1
+        i0 = i0 + 1
+
+    if n < 8 or n > 90 or has_bad_range == 1 or (has_lower == 1 and has_upper == 1)
+        return result
+
+    let lower = s
+    if has_upper == 1
+        lower = _bch_lower_ascii(s)
+
+    // Find the LAST '1' separator (HRP may itself legally contain '1's).
+    let pos = -1
+    let pi = 0
+    while pi < len(lower)
+        if lower[pi] == "1"
+            pos = pi
+        pi = pi + 1
+
+    if pos < 1 or pos + 7 > len(lower)
+        return result
+
+    let hrp = slice(lower, 0, pos)
+    let data_part = slice(lower, pos + 1, len(lower))
+
+    // Validate every data-part char is in the charset.
+    let dvals = []
+    let dj = 0
+    let dok = 1
+    while dj < len(data_part) and dok == 1
+        let v = _bch_charval(data_part[dj])
+        if v < 0
+            dok = 0
+        else
+            dvals.push(v)
+        dj = dj + 1
+
+    if dok == 0
+        return result
+
+    if _bch_verify_checksum(hrp, dvals, k) == 0
+        return result
+
+    let payload_words = list_slice(dvals, 0, len(dvals) - 6)
+    let payload_bytes_list = _bch_convertbits(payload_words, 5, 8, 0)
+    if payload_bytes_list == null
+        return result
+
+    let out_bytes = bytes(0)
+    let bi = 0
+    while bi < len(payload_bytes_list)
+        out_bytes = bytes_append(out_bytes, payload_bytes_list[bi])
+        bi = bi + 1
+
+    result["bch_ok"] = true
+    result["bch_hrp"] = hrp
+    result["bch_data"] = out_bytes
+    return result
+
+// _bch_lower_ascii: lowercase an ASCII string (bech32 charset is ASCII-only).
+fn _bch_lower_ascii(s) -> string
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n
+        let b = ord(s[i])
+        if b >= 65 and b <= 90
+            out = out + chr(b + 32)
+        else
+            out = out + s[i]
+        i = i + 1
+    return out
+
+// bch_decode: Bech32 (const=1) decode. bch_ok=false on any malformed input
+// or checksum failure.
+fn bch_decode(s) -> any
+    return _bch_decode_core(s, 1)
+
+// bch_decode_m: Bech32m (const=0x2bc830a3) decode.
+fn bch_decode_m(s) -> any
+    return _bch_decode_core(s, 0x2bc830a3)

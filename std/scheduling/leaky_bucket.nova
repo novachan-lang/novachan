@@ -1,0 +1,99 @@
+// ============================================================================
+// NOVA Standard Library — std/scheduling/leaky_bucket
+// ============================================================================
+// Leaky bucket traffic shaper — a rate-limiting algorithm distinct from the
+// token-bucket limiters already in this stdlib (std/net/rate_limit.nova,
+// std/util/ratelimiter.nova, std/control/ratelimit.nova). Where a token
+// bucket accumulates capacity that can be spent in a burst, a leaky bucket
+// models a queue of fixed capacity that DRAINS ("leaks") at a constant
+// rate: admitted work raises the fill level, time lowers it, and any
+// request that would push the level over capacity is rejected outright.
+// This yields strictly smoothed, non-bursty output — the classic use case
+// is traffic *shaping* (e.g. ATM/frame-relay network policing, outbound
+// API call pacing) where token-bucket's burst allowance is undesirable.
+//
+// DETERMINISTIC BY DESIGN: exactly like std/util/circuitbreaker.nova, time
+// is an explicit integer argument (`now`) supplied by the caller on every
+// operation, never read from a clock internally. This makes the module
+// fully deterministic and trivially testable — no sleeps, no flakiness.
+//
+// MODEL:
+//   level  — current fill, in the same integer units as `amount`/`capacity`.
+//   leak_rate — units drained per unit of elapsed time.
+//   On every operation, elapsed time since the last update leaks the bucket
+//   down (never below 0) BEFORE the new request is evaluated:
+//     level = max(0, level - leak_rate * (now - last_time))
+//   A request of `amount` units is admitted iff level + amount <= capacity;
+//   if admitted, level increases by amount. Otherwise it is rejected and
+//   the bucket is left at its (already-leaked) level — a rejected request
+//   never partially fills the bucket.
+//
+// PUBLIC API:
+//   lkb_new(capacity, leak_rate)     -> bucket   (level=0)
+//   lkb_allow(b, now, amount)        -> bool     (leaks, then admits or rejects)
+//   lkb_level(b, now)                -> int      (level after leaking to `now`,
+//                                                   WITHOUT admitting anything —
+//                                                   also commits the leak, i.e.
+//                                                   safe to call as a pure "peek
+//                                                   forward in time" probe)
+//   lkb_capacity(b)                  -> int
+//   lkb_reset(b)                     -> unit     (level=0, last_time=0)
+//
+// SYMBOL COLLISION GUARD: all helpers prefixed _lkb_ (public API: lkb_).
+// LEAF — imports NOTHING.
+// ============================================================================
+
+// _lkb_leak: drain b's level for elapsed time since b's last_time, clamped
+// at 0, then advance last_time to `now`. Mutates b in place.
+// Precondition: now >= b's last recorded time (monotonic caller clock);
+// if now is earlier, treated as no elapsed time (no leak, no time rewind).
+fn _lkb_leak(b, now)
+    let last = b["lkb_last_time"]
+    if now > last
+        let elapsed = now - last
+        let drained = b["lkb_leak_rate"] * elapsed
+        let level = b["lkb_level"] - drained
+        if level < 0
+            level = 0
+        b["lkb_level"] = level
+        b["lkb_last_time"] = now
+    return 0
+
+// lkb_new: create a bucket with the given capacity and leak (drain) rate,
+// both in the caller's chosen integer units. Starts empty at time 0.
+fn lkb_new(capacity, leak_rate)
+    let b = {}
+    b["lkb_capacity"] = capacity
+    b["lkb_leak_rate"] = leak_rate
+    b["lkb_level"] = 0
+    b["lkb_last_time"] = 0
+    return b
+
+// lkb_allow: leak the bucket up to `now`, then admit `amount` units iff
+// doing so would not exceed capacity. Returns true (admitted, level raised
+// by amount) or false (rejected, level unchanged from its leaked value).
+fn lkb_allow(b, now, amount)
+    _lkb_leak(b, now)
+    let result = false
+    if b["lkb_level"] + amount <= b["lkb_capacity"]
+        b["lkb_level"] = b["lkb_level"] + amount
+        result = true
+    return result
+
+// lkb_level: current fill level after leaking forward to `now` (this DOES
+// commit the leak/time-advance, so calling it repeatedly with increasing
+// `now` values is the correct way to "check in" on a bucket between
+// admission decisions).
+fn lkb_level(b, now)
+    _lkb_leak(b, now)
+    return b["lkb_level"]
+
+// lkb_capacity: the bucket's fixed capacity.
+fn lkb_capacity(b)
+    return b["lkb_capacity"]
+
+// lkb_reset: empty the bucket and reset its clock to 0.
+fn lkb_reset(b)
+    b["lkb_level"] = 0
+    b["lkb_last_time"] = 0
+    return 0
