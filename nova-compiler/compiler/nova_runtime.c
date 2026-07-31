@@ -26239,6 +26239,266 @@ int64_t nova_rt_dict_merge_with(int64_t a, int64_t b, int64_t closure) {
     return out;
 }
 
+/* --- Batch 3: split-lines, join, levenshtein, sorted, dict reduce, cross product --- */
+
+int64_t nova_rt_str_split_lines(int64_t val) {
+    const char* s = nova_str(val);
+    int64_t out = nova_rt_list_create(8);
+    const char* start = s;
+    while (*s) {
+        if (*s == '\n') {
+            size_t len = (size_t)(s - start);
+            if (len > 0 && start[len-1] == '\r') len--;
+            char* buf = (char*)malloc(len + 1);
+            if (buf) { memcpy(buf, start, len); buf[len] = '\0'; nova_rt_list_append(out, nova_rt_create_string(buf)); free(buf); }
+            start = s + 1;
+        }
+        s++;
+    }
+    if (s > start) {
+        size_t len = (size_t)(s - start);
+        char* buf = (char*)malloc(len + 1);
+        if (buf) { memcpy(buf, start, len); buf[len] = '\0'; nova_rt_list_append(out, nova_rt_create_string(buf)); free(buf); }
+    }
+    return out;
+}
+
+int64_t nova_rt_str_join_with(int64_t handle, int64_t sep) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_create_string("");
+    const char* sep_str = nova_str(sep);
+    size_t sep_len = strlen(sep_str);
+    size_t total = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        total += strlen(nova_str(l->data[i]));
+        if (i > 0) total += sep_len;
+    }
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return nova_rt_create_string("");
+    char* p = buf;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (i > 0) { memcpy(p, sep_str, sep_len); p += sep_len; }
+        const char* s = nova_str(l->data[i]);
+        size_t slen = strlen(s);
+        memcpy(p, s, slen); p += slen;
+    }
+    *p = '\0';
+    int64_t r = nova_rt_create_string(buf);
+    free(buf);
+    return r;
+}
+
+int64_t nova_rt_str_levenshtein(int64_t a, int64_t b) {
+    const char* sa = nova_str(a);
+    const char* sb = nova_str(b);
+    size_t la = strlen(sa), lb = strlen(sb);
+    if (la == 0) return (int64_t)lb;
+    if (lb == 0) return (int64_t)la;
+    if (la > 1000) la = 1000;
+    if (lb > 1000) lb = 1000;
+    int64_t* prev = (int64_t*)malloc((lb + 1) * sizeof(int64_t));
+    int64_t* curr = (int64_t*)malloc((lb + 1) * sizeof(int64_t));
+    if (!prev || !curr) { free(prev); free(curr); return (int64_t)(la > lb ? la : lb); }
+    for (size_t j = 0; j <= lb; j++) prev[j] = (int64_t)j;
+    for (size_t i = 1; i <= la; i++) {
+        curr[0] = (int64_t)i;
+        for (size_t j = 1; j <= lb; j++) {
+            int64_t cost = (sa[i-1] == sb[j-1]) ? 0 : 1;
+            int64_t del = prev[j] + 1;
+            int64_t ins = curr[j-1] + 1;
+            int64_t rep = prev[j-1] + cost;
+            int64_t m = del < ins ? del : ins;
+            curr[j] = m < rep ? m : rep;
+        }
+        int64_t* tmp = prev; prev = curr; curr = tmp;
+    }
+    int64_t result = prev[lb];
+    free(prev); free(curr);
+    return result;
+}
+
+int64_t nova_rt_list_is_sorted(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size <= 1) return 1;
+    for (int64_t i = 1; i < l->size; i++) {
+        if (l->data[i] < l->data[i-1]) return 0;
+    }
+    return 1;
+}
+
+int64_t nova_rt_dict_reduce(int64_t handle, int64_t init, int64_t closure) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return init;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn3)(int64_t, int64_t, int64_t, int64_t);
+    nova_fn3 fn = (nova_fn3)(uintptr_t)rec[0];
+    int64_t acc = init;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            acc = fn(closure, acc, d->keys[i], d->vals[i]);
+        }
+    }
+    return acc;
+}
+
+int64_t nova_rt_dict_map_entries(int64_t handle, int64_t closure) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return nova_rt_dict_create();
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
+    int64_t out = nova_rt_list_create(d->size);
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int64_t pair = nova_rt_list_create(2);
+            nova_rt_list_append(pair, d->keys[i]);
+            nova_rt_list_append(pair, d->vals[i]);
+            int64_t result = fn(closure, d->keys[i], d->vals[i]);
+            nova_rt_list_append(out, result);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_cross_product(int64_t a, int64_t b) {
+    NovaList* la = (NovaList*)(uintptr_t)a;
+    NovaList* lb = (NovaList*)(uintptr_t)b;
+    if (!la || !lb) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(la->size * lb->size);
+    for (int64_t i = 0; i < la->size; i++) {
+        for (int64_t j = 0; j < lb->size; j++) {
+            int64_t pair = nova_rt_list_create(2);
+            nova_rt_list_append(pair, la->data[i]);
+            nova_rt_list_append(pair, lb->data[j]);
+            nova_rt_list_append(out, pair);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_running_sum(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(l->size);
+    int64_t sum = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        sum += l->data[i];
+        nova_rt_list_append(out, sum);
+    }
+    return out;
+}
+
+int64_t nova_rt_list_cumulative_max(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size == 0) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(l->size);
+    int64_t mx = l->data[0];
+    for (int64_t i = 0; i < l->size; i++) {
+        if (l->data[i] > mx) mx = l->data[i];
+        nova_rt_list_append(out, mx);
+    }
+    return out;
+}
+
+int64_t nova_rt_str_char_frequency(int64_t val) {
+    const char* s = nova_str(val);
+    int64_t out = nova_rt_dict_create();
+    while (*s) {
+        char buf[2] = { *s, '\0' };
+        int64_t key = nova_rt_create_string(buf);
+        int64_t existing = nova_rt_dict_get(out, key);
+        if (existing == 0) {
+            nova_rt_dict_set(out, key, 1);
+        } else {
+            nova_rt_dict_set(out, key, existing + 1);
+        }
+        s++;
+    }
+    return out;
+}
+
+int64_t nova_rt_dict_min_by(int64_t handle, int64_t closure) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d || d->size == 0) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
+    int64_t best_key = 0;
+    int64_t best_score = 0;
+    int first = 1;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int64_t score = fn(closure, d->keys[i], d->vals[i]);
+            if (first || score < best_score) {
+                best_key = d->keys[i];
+                best_score = score;
+                first = 0;
+            }
+        }
+    }
+    return best_key;
+}
+
+int64_t nova_rt_dict_max_by(int64_t handle, int64_t closure) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d || d->size == 0) return 0;
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)rec[0];
+    int64_t best_key = 0;
+    int64_t best_score = 0;
+    int first = 1;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int64_t score = fn(closure, d->keys[i], d->vals[i]);
+            if (first || score > best_score) {
+                best_key = d->keys[i];
+                best_score = score;
+                first = 0;
+            }
+        }
+    }
+    return best_key;
+}
+
+int64_t nova_rt_list_sliding_pairs(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    if (!l || l->size < 2) return nova_rt_list_create(0);
+    int64_t out = nova_rt_list_create(l->size - 1);
+    for (int64_t i = 0; i < l->size - 1; i++) {
+        int64_t pair = nova_rt_list_create(2);
+        nova_rt_list_append(pair, l->data[i]);
+        nova_rt_list_append(pair, l->data[i+1]);
+        nova_rt_list_append(out, pair);
+    }
+    return out;
+}
+
+int64_t nova_rt_dict_to_sorted_list(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d || d->size == 0) return nova_rt_list_create(0);
+    int64_t keys_list = nova_rt_list_create(d->size);
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) nova_rt_list_append(keys_list, d->keys[i]);
+    }
+    NovaList* kl = (NovaList*)(uintptr_t)keys_list;
+    for (int64_t i = 0; i < kl->size - 1; i++) {
+        for (int64_t j = 0; j < kl->size - 1 - i; j++) {
+            if (kl->data[j] > kl->data[j+1]) {
+                int64_t t = kl->data[j]; kl->data[j] = kl->data[j+1]; kl->data[j+1] = t;
+            }
+        }
+    }
+    int64_t out = nova_rt_list_create(kl->size);
+    for (int64_t i = 0; i < kl->size; i++) {
+        int64_t pair = nova_rt_list_create(2);
+        nova_rt_list_append(pair, kl->data[i]);
+        nova_rt_list_append(pair, nova_rt_dict_get(handle, kl->data[i]));
+        nova_rt_list_append(out, pair);
+    }
+    return out;
+}
+
 int64_t c_test_fill_triple(int64_t* t) {
     if (t) { t[0] = 1; t[1] = 2; t[2] = 3; }
     return 0;
