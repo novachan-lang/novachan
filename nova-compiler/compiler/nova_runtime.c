@@ -28522,3 +28522,113 @@ int64_t nova_rt_str_split_every(int64_t str_handle, int64_t n) {
     }
     return out;
 }
+
+/* nova_rt_str_hamming_distance: count positions where chars differ (equal-length strings) */
+int64_t nova_rt_str_hamming_distance(int64_t ha, int64_t hb) {
+    const char* a = (const char*)(uintptr_t)ha;
+    const char* b = (const char*)(uintptr_t)hb;
+    if (!a || !b) return -1;
+    size_t la = strlen(a), lb = strlen(b);
+    if (la != lb) return -1;
+    int64_t count = 0;
+    for (size_t i = 0; i < la; i++) {
+        if (a[i] != b[i]) count++;
+    }
+    return count;
+}
+
+/* nova_rt_list_dot_product: dot product of two int lists */
+int64_t nova_rt_list_dot_product(int64_t ha, int64_t hb) {
+    NovaList* a = (NovaList*)(uintptr_t)ha;
+    NovaList* b = (NovaList*)(uintptr_t)hb;
+    if (!a || !b) return 0;
+    int64_t n = a->size < b->size ? a->size : b->size;
+    int64_t sum = 0;
+    for (int64_t i = 0; i < n; i++) {
+        sum += a->data[i] * b->data[i];
+    }
+    return sum;
+}
+
+/* nova_rt_dict_symmetric_diff: keys in a XOR b */
+int64_t nova_rt_dict_symmetric_diff(int64_t ha, int64_t hb) {
+    NovaDict* a = (NovaDict*)(uintptr_t)ha;
+    NovaDict* b = (NovaDict*)(uintptr_t)hb;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (a) {
+        for (int64_t i = 0; i < a->cap; i++) {
+            if (a->hashes[i] != 0) {
+                int64_t v = nova_rt_dict_get((int64_t)(uintptr_t)b, a->keys[i]);
+                if (v == 0 && !nova_rt_dict_has_key((int64_t)(uintptr_t)b, a->keys[i])) {
+                    nova_rt_dict_set(out, a->keys[i], a->vals[i]);
+                }
+            }
+        }
+    }
+    if (b) {
+        for (int64_t i = 0; i < b->cap; i++) {
+            if (b->hashes[i] != 0) {
+                int64_t v = nova_rt_dict_get((int64_t)(uintptr_t)a, b->keys[i]);
+                if (v == 0 && !nova_rt_dict_has_key((int64_t)(uintptr_t)a, b->keys[i])) {
+                    nova_rt_dict_set(out, b->keys[i], b->vals[i]);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/* nova_rt_str_is_consonant: check if single char is a consonant */
+int64_t nova_rt_str_is_consonant(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s || !*s || s[1] != 0) return 0;
+    char c = (char)tolower((unsigned char)s[0]);
+    if (c < 'a' || c > 'z') return 0;
+    return (c != 'a' && c != 'e' && c != 'i' && c != 'o' && c != 'u') ? 1 : 0;
+}
+
+/* nova_rt_list_mismatch: index of first mismatch between two lists, -1 if identical */
+int64_t nova_rt_list_mismatch(int64_t ha, int64_t hb) {
+    NovaList* a = (NovaList*)(uintptr_t)ha;
+    NovaList* b = (NovaList*)(uintptr_t)hb;
+    if (!a || !b) return 0;
+    int64_t n = a->size < b->size ? a->size : b->size;
+    for (int64_t i = 0; i < n; i++) {
+        if (a->data[i] != b->data[i]) return i;
+    }
+    if (a->size != b->size) return n;
+    return -1;
+}
+
+/* nova_rt_str_remove_digits: remove all digit characters */
+int64_t nova_rt_str_remove_digits(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9') buf[j++] = s[i];
+    }
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_dict_values_sum: sum all values in dict (assumed int) */
+int64_t nova_rt_dict_values_sum(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    if (!d) return 0;
+    int64_t sum = 0;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) sum += d->vals[i];
+    }
+    return sum;
+}
+
+/* nova_rt_list_weighted_sum: sum of a[i] * b[i] for two lists */
+int64_t nova_rt_list_weighted_sum(int64_t ha, int64_t hb) {
+    return nova_rt_list_dot_product(ha, hb);
+}
