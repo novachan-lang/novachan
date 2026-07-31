@@ -2242,6 +2242,58 @@ int64_t nova_rt_str_is_space(int64_t s) {
     return 1;
 }
 
+int64_t nova_rt_str_is_upper(int64_t s) {
+    const char* str = nova_str_safe(s);
+    if (*str == '\0') return 0;
+    int has_letter = 0;
+    while (*str) {
+        if (*str >= 'a' && *str <= 'z') return 0;
+        if (*str >= 'A' && *str <= 'Z') has_letter = 1;
+        str++;
+    }
+    return has_letter ? 1 : 0;
+}
+
+int64_t nova_rt_str_is_lower(int64_t s) {
+    const char* str = nova_str_safe(s);
+    if (*str == '\0') return 0;
+    int has_letter = 0;
+    while (*str) {
+        if (*str >= 'A' && *str <= 'Z') return 0;
+        if (*str >= 'a' && *str <= 'z') has_letter = 1;
+        str++;
+    }
+    return has_letter ? 1 : 0;
+}
+
+int64_t nova_rt_list_flat_map(int64_t handle, int64_t closure) {
+    int64_t out = nova_rt_list_create();
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return out;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn1)(int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)closure;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t sub = fn(l->data[i]);
+        if (nova_mem_find_tag((void*)(uintptr_t)sub) == NOVA_MEM_LIST) {
+            NovaList* sl = (NovaList*)(uintptr_t)sub;
+            for (int64_t j = 0; j < sl->size; j++) nova_rt_list_append(out, sl->data[j]);
+        } else {
+            nova_rt_list_append(out, sub);
+        }
+    }
+    return out;
+}
+
+int64_t nova_rt_list_reduce(int64_t handle, int64_t init, int64_t closure) {
+    if (nova_mem_find_tag((void*)(uintptr_t)handle) != NOVA_MEM_LIST) return init;
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    typedef int64_t (*nova_fn2)(int64_t, int64_t);
+    nova_fn2 fn = (nova_fn2)(uintptr_t)closure;
+    int64_t acc = init;
+    for (int64_t i = 0; i < l->size; i++) acc = fn(acc, l->data[i]);
+    return acc;
+}
+
 int64_t nova_rt_split(int64_t s, int64_t delim) {
     const char* str = nova_str_safe(s);
     const char* d = nova_str_safe(delim);
