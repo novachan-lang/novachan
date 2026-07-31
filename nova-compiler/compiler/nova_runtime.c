@@ -28988,3 +28988,142 @@ int64_t nova_rt_str_rot13(int64_t str_handle) {
     free(buf);
     return result;
 }
+
+/* nova_rt_str_atoi: parse string to integer, return 0 on failure */
+int64_t nova_rt_str_atoi(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return 0;
+    return (int64_t)atoll(s);
+}
+
+/* nova_rt_str_caesar_cipher: shift each letter by n positions */
+int64_t nova_rt_str_caesar_cipher(int64_t str_handle, int64_t shift) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    int sh = (int)(((shift % 26) + 26) % 26);
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] >= 'a' && s[i] <= 'z') buf[i] = (char)((s[i] - 'a' + sh) % 26 + 'a');
+        else if (s[i] >= 'A' && s[i] <= 'Z') buf[i] = (char)((s[i] - 'A' + sh) % 26 + 'A');
+        else buf[i] = s[i];
+    }
+    buf[len] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_list_pairwise_diff: list of a[i+1] - a[i] */
+int64_t nova_rt_list_pairwise_diff(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l || l->size < 2) return out;
+    for (int64_t i = 0; i < l->size - 1; i++)
+        nova_rt_list_append(out, l->data[i + 1] - l->data[i]);
+    return out;
+}
+
+/* nova_rt_str_slug: lowercase, replace non-alnum with hyphens, collapse consecutive */
+int64_t nova_rt_str_slug(int64_t str_handle) {
+    const char* s = (const char*)(uintptr_t)str_handle;
+    if (!s) return str_handle;
+    size_t len = strlen(s);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return str_handle;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            buf[j++] = c;
+        } else if (c >= 'A' && c <= 'Z') {
+            buf[j++] = (char)(c + 32);
+        } else {
+            if (j > 0 && buf[j - 1] != '-') buf[j++] = '-';
+        }
+    }
+    if (j > 0 && buf[j - 1] == '-') j--;
+    buf[j] = 0;
+    int64_t result = nova_rt_create_string(buf);
+    free(buf);
+    return result;
+}
+
+/* nova_rt_dict_group_by_value_len: group keys by string length of value repr */
+int64_t nova_rt_dict_group_by_value_len(int64_t handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%lld", (long long)d->vals[i]);
+            size_t vlen = strlen(buf);
+            char key[32];
+            snprintf(key, sizeof(key), "%zu", vlen);
+            int64_t key_s = nova_rt_create_string(key);
+            int64_t existing = nova_rt_dict_get(out, key_s);
+            if (existing == 0) {
+                int64_t lst = (int64_t)(uintptr_t)nova_rt_list_create();
+                nova_rt_list_append(lst, d->keys[i]);
+                nova_rt_dict_set(out, key_s, lst);
+            } else {
+                nova_rt_list_append(existing, d->keys[i]);
+            }
+        }
+    }
+    return out;
+}
+
+/* nova_rt_str_is_anagram: check if two strings are anagrams (case-insensitive) */
+int64_t nova_rt_str_is_anagram(int64_t a_handle, int64_t b_handle) {
+    const char* a = (const char*)(uintptr_t)a_handle;
+    const char* b = (const char*)(uintptr_t)b_handle;
+    if (!a || !b) return 0;
+    int counts[26] = {0};
+    for (size_t i = 0; a[i]; i++) {
+        char c = a[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c >= 'a' && c <= 'z') counts[c - 'a']++;
+    }
+    for (size_t i = 0; b[i]; i++) {
+        char c = b[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c >= 'a' && c <= 'z') counts[c - 'a']--;
+    }
+    for (int i = 0; i < 26; i++) if (counts[i] != 0) return 0;
+    return 1;
+}
+
+/* nova_rt_dict_remove_keys: remove a list of keys from dict, return new dict */
+int64_t nova_rt_dict_remove_keys(int64_t dict_handle, int64_t keys_handle) {
+    NovaDict* d = (NovaDict*)(uintptr_t)dict_handle;
+    NovaList* keys = (NovaList*)(uintptr_t)keys_handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_dict_create();
+    if (!d) return out;
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->hashes[i] != 0) {
+            int skip = 0;
+            if (keys) {
+                for (int64_t j = 0; j < keys->size; j++) {
+                    const char* dk = (const char*)(uintptr_t)d->keys[i];
+                    const char* rk = (const char*)(uintptr_t)keys->data[j];
+                    if (dk && rk && strcmp(dk, rk) == 0) { skip = 1; break; }
+                }
+            }
+            if (!skip) nova_rt_dict_set(out, d->keys[i], d->vals[i]);
+        }
+    }
+    return out;
+}
+
+/* nova_rt_list_sample_indices: list of first N indices [0..N-1] */
+int64_t nova_rt_list_sample_indices(int64_t handle, int64_t n) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t out = (int64_t)(uintptr_t)nova_rt_list_create();
+    if (!l) return out;
+    int64_t lim = n < l->size ? n : l->size;
+    for (int64_t i = 0; i < lim; i++) nova_rt_list_append(out, i);
+    return out;
+}
