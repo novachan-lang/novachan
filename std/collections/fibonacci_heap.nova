@@ -1,0 +1,295 @@
+// ============================================================================
+// NOVA Standard Library — std/collections/fibonacci_heap
+// ============================================================================
+// Fibonacci heap — a mergeable min-heap with O(1) amortized insert/decrease-key
+// and O(log n) amortized extract-min. This is the one classic heap variant
+// NOT already covered by the many other heap modules in std/collections
+// (binaryheap, binomialheap, pairingheap, leftistheap, skewheap, weakheap,
+// daryheap, radixheap, minmaxheap, intervalheap, indexedpq) — decrease-key
+// on those is O(log n); a Fibonacci heap's is O(1) amortized, which is the
+// whole reason algorithms like Dijkstra/Prim are asymptotically O(E + V log V)
+// rather than O(E log V).
+//
+// Nodes are stored in a flat list `h["nodes"]`, addressed by integer id
+// (their index). Every cross-reference (parent/child/left/right) is an id,
+// with -1 meaning "none". Sibling lists (the root list, and each node's
+// child list) are circular doubly-linked lists threaded through "left"/"right".
+//
+// Node dict fields:
+//   "key" (number), "val" (any), "parent" (id), "child" (id, one representative),
+//   "left" (id), "right" (id), "degree" (int), "mark" (0/1)
+//
+// Heap dict fields:
+//   "nodes" (list of node dicts), "min" (id of the minimum root, -1 if empty),
+//   "n" (live node count)
+//
+// Public API
+//   fh_new()                    -> heap
+//   fh_insert(h, key, val)      -> int   (opaque node id; use with decrease_key/delete)
+//   fh_is_empty(h)              -> bool
+//   fh_size(h)                  -> int
+//   fh_min_key(h)               -> number  (precondition: not empty)
+//   fh_min_val(h)                -> any     (precondition: not empty)
+//   fh_extract_min(h)           -> any     (removes + returns the min val)
+//   fh_decrease_key(h, id, newkey) -> unit (no-op if newkey > current key)
+//   fh_delete(h, id)            -> unit    (remove an arbitrary live node)
+//
+// Contract: `id` values returned by fh_insert are only valid while the node
+// remains in the heap (i.e. has not yet been extracted/deleted) — the same
+// contract as every array-backed heap; using a stale id is undefined.
+// ============================================================================
+
+fn _fh_new_node(key, val) -> dict
+    let nd = {}
+    nd["key"] = key
+    nd["val"] = val
+    nd["parent"] = -1
+    nd["child"] = -1
+    nd["left"] = -1
+    nd["right"] = -1
+    nd["degree"] = 0
+    nd["mark"] = 0
+    return nd
+
+fn fh_new() -> dict
+    let h = {}
+    h["nodes"] = []
+    h["min"] = -1
+    h["n"] = 0
+    return h
+
+fn fh_is_empty(h) -> bool
+    return h["n"] == 0
+
+fn fh_size(h) -> int
+    return h["n"]
+
+fn fh_min_key(h)
+    let mn = h["nodes"][h["min"]]
+    return mn["key"]
+
+fn fh_min_val(h)
+    let mn = h["nodes"][h["min"]]
+    return mn["val"]
+
+// _fh_root_add: splice node `id` (assumed detached) into the root circular
+// list. Handles the empty-heap case by making it the sole root.
+fn _fh_root_add(h, id)
+    if h["min"] == -1
+        let x = h["nodes"][id]
+        x["left"] = id
+        x["right"] = id
+        h["min"] = id
+    else
+        let mn = h["min"]
+        let mnNode = h["nodes"][mn]
+        let mnRight = mnNode["right"]
+        let x = h["nodes"][id]
+        x["left"] = mn
+        x["right"] = mnRight
+        mnNode["right"] = id
+        let rNode = h["nodes"][mnRight]
+        rNode["left"] = id
+
+fn fh_insert(h, key, val) -> int
+    let id = len(h["nodes"])
+    let nd = _fh_new_node(key, val)
+    push(h["nodes"], nd)
+    _fh_root_add(h, id)
+    let cur = h["nodes"][id]
+    let mn = h["nodes"][h["min"]]
+    if cur["key"] < mn["key"]
+        h["min"] = id
+    h["n"] = h["n"] + 1
+    return id
+
+// _fh_link: make y a child of x. Precondition: y.key >= x.key, and y is
+// currently a root (about to be detached from the root list).
+fn _fh_link(h, y, x)
+    let yNode = h["nodes"][y]
+    let yl = yNode["left"]
+    let yr = yNode["right"]
+    let ylNode = h["nodes"][yl]
+    let yrNode = h["nodes"][yr]
+    ylNode["right"] = yr
+    yrNode["left"] = yl
+
+    yNode["parent"] = x
+    let xNode = h["nodes"][x]
+    if xNode["child"] == -1
+        xNode["child"] = y
+        yNode["left"] = y
+        yNode["right"] = y
+    else
+        let c = xNode["child"]
+        let cNode = h["nodes"][c]
+        let cr = cNode["right"]
+        let crNode = h["nodes"][cr]
+        yNode["left"] = c
+        yNode["right"] = cr
+        cNode["right"] = y
+        crNode["left"] = y
+    xNode["degree"] = xNode["degree"] + 1
+    yNode["mark"] = 0
+
+// _fh_consolidate: merge root-list trees until every root has a unique
+// degree, then recompute h["min"] from the surviving roots.
+fn _fh_consolidate(h)
+    let roots = []
+    let start = h["min"]
+    let cur = start
+    let first = true
+    while first or cur != start
+        push(roots, cur)
+        first = false
+        let curNode = h["nodes"][cur]
+        cur = curNode["right"]
+
+    let active = {}
+    let ri = 0
+    while ri < len(roots)
+        active[str(roots[ri])] = 1
+        ri = ri + 1
+
+    // Degree can never exceed the total number of nodes ever allocated.
+    let maxDeg = len(h["nodes"]) + 2
+    let A = []
+    let ai = 0
+    while ai < maxDeg
+        push(A, -1)
+        ai = ai + 1
+
+    let idx = 0
+    while idx < len(roots)
+        let w = roots[idx]
+        if active[str(w)] == 1
+            let x = w
+            let xNode = h["nodes"][x]
+            let d = xNode["degree"]
+            while d < len(A) and A[d] != -1
+                let y = A[d]
+                let yNode = h["nodes"][y]
+                let xNode2 = h["nodes"][x]
+                if yNode["key"] < xNode2["key"]
+                    let tmp = x
+                    x = y
+                    y = tmp
+                active[str(y)] = 0
+                _fh_link(h, y, x)
+                A[d] = -1
+                d = d + 1
+                xNode = h["nodes"][x]
+            A[d] = x
+        idx = idx + 1
+
+    h["min"] = -1
+    let j = 0
+    while j < len(A)
+        if A[j] != -1
+            let rid = A[j]
+            let rNode = h["nodes"][rid]
+            rNode["left"] = rid
+            rNode["right"] = rid
+            if h["min"] == -1
+                h["min"] = rid
+            else
+                _fh_root_add(h, rid)
+                let rNode2 = h["nodes"][rid]
+                let mnNode = h["nodes"][h["min"]]
+                if rNode2["key"] < mnNode["key"]
+                    h["min"] = rid
+        j = j + 1
+
+fn fh_extract_min(h)
+    let z = h["min"]
+    let zNode = h["nodes"][z]
+    if zNode["child"] != -1
+        let c0 = zNode["child"]
+        let deg = zNode["degree"]
+        let kids = []
+        let kc = c0
+        let ki = 0
+        while ki < deg
+            push(kids, kc)
+            let kcNode = h["nodes"][kc]
+            kc = kcNode["right"]
+            ki = ki + 1
+        let m = 0
+        while m < len(kids)
+            let cid = kids[m]
+            let cidNode = h["nodes"][cid]
+            cidNode["parent"] = -1
+            cidNode["mark"] = 0
+            _fh_root_add(h, cid)
+            m = m + 1
+
+    let zNode2 = h["nodes"][z]
+    if zNode2["left"] == z
+        h["min"] = -1
+    else
+        let zl = zNode2["left"]
+        let zr = zNode2["right"]
+        let zlNode = h["nodes"][zl]
+        let zrNode = h["nodes"][zr]
+        zlNode["right"] = zr
+        zrNode["left"] = zl
+        h["min"] = zr
+
+    h["n"] = h["n"] - 1
+    let retval = zNode2["val"]
+    if h["min"] != -1
+        _fh_consolidate(h)
+    return retval
+
+// _fh_cut: detach x from parent p's child list and add x to the root list.
+fn _fh_cut(h, x, p)
+    let xNode = h["nodes"][x]
+    let xl = xNode["left"]
+    let xr = xNode["right"]
+    let pNode = h["nodes"][p]
+    if xl == x
+        pNode["child"] = -1
+    else
+        let xlNode = h["nodes"][xl]
+        let xrNode = h["nodes"][xr]
+        xlNode["right"] = xr
+        xrNode["left"] = xl
+        if pNode["child"] == x
+            pNode["child"] = xr
+    pNode["degree"] = pNode["degree"] - 1
+
+    xNode["parent"] = -1
+    xNode["mark"] = 0
+    xNode["left"] = x
+    xNode["right"] = x
+    _fh_root_add(h, x)
+
+fn _fh_cascading_cut(h, y)
+    let yNode = h["nodes"][y]
+    let p = yNode["parent"]
+    if p != -1
+        if yNode["mark"] == 0
+            yNode["mark"] = 1
+        else
+            _fh_cut(h, y, p)
+            _fh_cascading_cut(h, p)
+
+fn fh_decrease_key(h, id, newkey)
+    let nd = h["nodes"][id]
+    if newkey > nd["key"]
+        return
+    nd["key"] = newkey
+    let p = nd["parent"]
+    if p != -1
+        let pNode = h["nodes"][p]
+        if nd["key"] < pNode["key"]
+            _fh_cut(h, id, p)
+            _fh_cascading_cut(h, p)
+    let mnNode = h["nodes"][h["min"]]
+    if nd["key"] < mnNode["key"]
+        h["min"] = id
+
+// fh_delete: remove an arbitrary live node from the heap.
+fn fh_delete(h, id)
+    fh_decrease_key(h, id, -1000000000000)
+    fh_extract_min(h)

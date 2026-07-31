@@ -24307,6 +24307,168 @@ int64_t nova_rt_list_rotate_right(int64_t handle, int64_t n) {
     return r;
 }
 
+/* nova_rt_str_surround: wrap string with prefix and suffix */
+int64_t nova_rt_str_surround(int64_t val, int64_t pre_val, int64_t suf_val) {
+    const char* s = (const char*)(uintptr_t)val;
+    const char* pre = (const char*)(uintptr_t)pre_val;
+    const char* suf = (const char*)(uintptr_t)suf_val;
+    if (!s) s = "";
+    if (!pre) pre = "";
+    if (!suf) suf = "";
+    size_t slen = strlen(s), plen = strlen(pre), suflen = strlen(suf);
+    char* buf = (char*)malloc(plen + slen + suflen + 1);
+    if (!buf) return val;
+    memcpy(buf, pre, plen);
+    memcpy(buf + plen, s, slen);
+    memcpy(buf + plen + slen, suf, suflen);
+    buf[plen + slen + suflen] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_list_pairwise: [[a,b],[b,c],[c,d],...] from [a,b,c,d,...] */
+int64_t nova_rt_list_pairwise(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_list_create();
+    if (!l || l->size < 2) return result;
+    for (int64_t i = 0; i < l->size - 1; i++) {
+        int64_t pair = nova_rt_list_create();
+        nova_rt_list_append(pair, l->data[i]);
+        nova_rt_list_append(pair, l->data[i + 1]);
+        nova_rt_list_append(result, pair);
+    }
+    return result;
+}
+
+/* nova_rt_str_chop: remove last n characters */
+int64_t nova_rt_str_chop(int64_t val, int64_t n) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || n <= 0) return val;
+    size_t slen = strlen(s);
+    if ((size_t)n >= slen) return nova_rt_create_string((void*)"");
+    size_t newlen = slen - (size_t)n;
+    char* buf = (char*)malloc(newlen + 1);
+    if (!buf) return val;
+    memcpy(buf, s, newlen);
+    buf[newlen] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_list_tally: count occurrences of each element -> dict */
+int64_t nova_rt_list_tally(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_dict_create();
+    if (!l) return result;
+    for (int64_t i = 0; i < l->size; i++) {
+        int64_t cur = nova_rt_dict_get(result, l->data[i]);
+        nova_rt_dict_set(result, l->data[i], cur + 1);
+    }
+    return result;
+}
+
+/* nova_rt_str_excerpt: take first n chars + "..." if longer */
+int64_t nova_rt_str_excerpt(int64_t val, int64_t n) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || n <= 0) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    if ((size_t)n >= slen) return val;
+    char* buf = (char*)malloc((size_t)n + 4);
+    if (!buf) return val;
+    memcpy(buf, s, (size_t)n);
+    buf[n] = '.'; buf[n+1] = '.'; buf[n+2] = '.'; buf[n+3] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_list_span: split list at first element not matching predicate -> [matching, rest] */
+int64_t nova_rt_list_span(int64_t handle, int64_t closure) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t left = nova_rt_list_create();
+    int64_t right = nova_rt_list_create();
+    if (!l) {
+        int64_t result = nova_rt_list_create();
+        nova_rt_list_append(result, left);
+        nova_rt_list_append(result, right);
+        return result;
+    }
+    int64_t* rec = (int64_t*)(uintptr_t)closure;
+    typedef int64_t (*nova_fn1)(int64_t, int64_t);
+    nova_fn1 fn = (nova_fn1)(uintptr_t)rec[0];
+    int64_t split = 0;
+    for (int64_t i = 0; i < l->size; i++) {
+        if (!split && fn(closure, l->data[i])) {
+            nova_rt_list_append(left, l->data[i]);
+        } else {
+            split = 1;
+            nova_rt_list_append(right, l->data[i]);
+        }
+    }
+    int64_t result = nova_rt_list_create();
+    nova_rt_list_append(result, left);
+    nova_rt_list_append(result, right);
+    return result;
+}
+
+/* nova_rt_str_mask: replace all but last n chars with mask_char */
+int64_t nova_rt_str_mask(int64_t val, int64_t n, int64_t mask_val) {
+    const char* s = (const char*)(uintptr_t)val;
+    const char* mc = (const char*)(uintptr_t)mask_val;
+    if (!s || !s[0]) return val;
+    char mask_char = (mc && mc[0]) ? mc[0] : '*';
+    size_t slen = strlen(s);
+    if (n < 0) n = 0;
+    char* buf = (char*)malloc(slen + 1);
+    if (!buf) return val;
+    size_t visible = (size_t)n;
+    if (visible > slen) visible = slen;
+    size_t masked = slen - visible;
+    for (size_t i = 0; i < masked; i++) buf[i] = mask_char;
+    memcpy(buf + masked, s + masked, visible);
+    buf[slen] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
+/* nova_rt_list_frequencies: same as list_tally but returns percentages (integer 0-100) */
+int64_t nova_rt_list_frequencies(int64_t handle) {
+    NovaList* l = (NovaList*)(uintptr_t)handle;
+    int64_t result = nova_rt_dict_create();
+    if (!l || l->size == 0) return result;
+    int64_t tally = nova_rt_list_tally(handle);
+    NovaDict* td = (NovaDict*)(uintptr_t)tally;
+    if (!td) return result;
+    for (int64_t i = 0; i < td->cap; i++) {
+        if (td->hashes[i] != 0) {
+            int64_t pct = (td->vals[i] * 100) / l->size;
+            nova_rt_dict_set(result, td->keys[i], pct);
+        }
+    }
+    return result;
+}
+
+/* nova_rt_str_mul: repeat string n times */
+int64_t nova_rt_str_mul(int64_t val, int64_t n) {
+    const char* s = (const char*)(uintptr_t)val;
+    if (!s || n <= 0) return nova_rt_create_string((void*)"");
+    size_t slen = strlen(s);
+    if (slen == 0 || n == 1) return val;
+    size_t total = slen * (size_t)n;
+    char* buf = (char*)malloc(total + 1);
+    if (!buf) return val;
+    for (int64_t i = 0; i < n; i++) {
+        memcpy(buf + i * slen, s, slen);
+    }
+    buf[total] = '\0';
+    int64_t r = nova_rt_create_string((void*)buf);
+    free(buf);
+    return r;
+}
+
 /* nova_rt_dict_keys_sorted: return sorted list of dict keys */
 int64_t nova_rt_dict_keys_sorted(int64_t handle) {
     int64_t keys = nova_rt_dict_keys(handle);
