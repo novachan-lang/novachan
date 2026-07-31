@@ -218,5 +218,16 @@ open. **No `abi_check`/`abi_hash`** found → T-ABI likely open. T-Profile/T-Ins
 - `ce8c439c` 4 mutable collection builtins: clear, dict_clear, extend, list_filled
 - `913dfbbc` 3 functional builtins: list_min_by, list_max_by, list_sum_by
 - `d04ad7c6` html_escape/unescape (XSS-safe entity encoding)
+- `39bc1cde` 3 builtins: str_split_n, dict_invert, list_flatten_deep
+- `e728dfd7` 3 builtins: list_compact, list_zip_with, list_scan
+- `efb9dd24` 2 builtins: str_truncate, list_interpose
+- `587f99ee` 6 stdlib modules (math/statistics, graph/directed, automata/state_machine, pipeline/transform, schedule/cron, metrics/counter) — 76/76 KAT
+- `fd48b1a8` 7 builtins: math_sign, list_rotate, list_frequency, str_is_numeric, list_reject, dict_select_keys, dict_reject_keys
+- `1a6cd9e4` 6 builtins: str_is_blank, str_remove_all, str_count_lines, list_sorted_by, list_transpose, dict_map_keys
+- `a0e2a24d` 6 builtins: list_sum_float, list_average, list_each_cons, list_to_dict, to_hex, from_hex
+- `4235279f` 6 builtins: str_between, list_without, list_product, clamp_float, lerp_float, list_shuffle
+- `ab6c95fa` 4 new stdlib modules (adt/validated, adt/either, collections/deque, text/template_engine) + extended sortedlist/multimap — 55/55 KAT
+- `d763cd2d` 6 builtins: timestamp_ms, str_hash, dict_count, list_dedup, list_nth, list_zip_longest
+- `258bdb36` 6 builtins: list_take_while, list_drop_while, list_slice_from, dict_zip, str_escape, range_step
 
-**Recommended focus:** Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
+**Total builtins: 872.** Recommended focus: Block A (#1 RC leak shared root) + remaining LOCK decisions (LOCK-4 sized numerics is the strategic bottleneck). Most breadth work is DONE; the critical path is compiler/runtime foundation.
